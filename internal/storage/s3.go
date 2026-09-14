@@ -174,8 +174,13 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 		u.Concurrency = multipartConcurrency
 	})
 
-	// Sanitize prefix: strip leading /, reject .., ensure trailing / if non-empty
-	prefix := SanitizeS3Prefix(cfg.Prefix)
+	// Validate the prefix rather than repairing it. A prefix that cannot form
+	// usable keys must stop the backend from being built: the old fallback was
+	// the bucket root, which is a different location, not a safe default.
+	prefix, err := ValidateS3Prefix(cfg.Prefix)
+	if err != nil {
+		return nil, err
+	}
 
 	backend := &S3Backend{
 		client:    client,
@@ -215,6 +220,10 @@ func (b *S3Backend) Write(ctx context.Context, path string, data []byte) error {
 // WriteReader writes data from a reader to S3
 // For files larger than 100MB, uses multipart upload to avoid OOM
 func (b *S3Backend) WriteReader(ctx context.Context, path string, reader io.Reader, size int64) error {
+	key, err := b.prefixedKey(path)
+	if err != nil {
+		return err
+	}
 	start := time.Now()
 
 	// Determine content type
@@ -230,9 +239,9 @@ func (b *S3Backend) WriteReader(ctx context.Context, path string, reader io.Read
 	}
 
 	// For small files with known size, use simple PutObject
-	_, err := b.client.PutObject(ctx, &s3.PutObjectInput{
+	_, err = b.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:        aws.String(b.bucket),
-		Key:           aws.String(b.prefixedKey(path)),
+		Key:           aws.String(key),
 		Body:          reader,
 		ContentLength: aws.Int64(size),
 		ContentType:   aws.String(contentType),
@@ -264,9 +273,13 @@ func (b *S3Backend) WriteReader(ctx context.Context, path string, reader io.Read
 // writeMultipart handles multipart upload for large files
 // This streams data in 16MB chunks without loading the entire file into memory
 func (b *S3Backend) writeMultipart(ctx context.Context, path string, reader io.Reader, size int64, contentType string, start time.Time) error {
-	_, err := b.uploader.Upload(ctx, &s3.PutObjectInput{
+	key, err := b.prefixedKey(path)
+	if err != nil {
+		return err
+	}
+	_, err = b.uploader.Upload(ctx, &s3.PutObjectInput{
 		Bucket:      aws.String(b.bucket),
-		Key:         aws.String(b.prefixedKey(path)),
+		Key:         aws.String(key),
 		Body:        reader,
 		ContentType: aws.String(contentType),
 	})
@@ -304,9 +317,13 @@ func (b *S3Backend) writeMultipart(ctx context.Context, path string, reader io.R
 
 // Read reads data from S3
 func (b *S3Backend) Read(ctx context.Context, path string) ([]byte, error) {
+	key, err := b.prefixedKey(path)
+	if err != nil {
+		return nil, err
+	}
 	result, err := b.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(b.bucket),
-		Key:    aws.String(b.prefixedKey(path)),
+		Key:    aws.String(key),
 	})
 	if err != nil {
 		recordStorageError(ctx, err)
@@ -334,9 +351,13 @@ func (b *S3Backend) Read(ctx context.Context, path string) ([]byte, error) {
 
 // ReadTo reads data from S3 and writes to a writer
 func (b *S3Backend) ReadTo(ctx context.Context, path string, writer io.Writer) error {
+	key, err := b.prefixedKey(path)
+	if err != nil {
+		return err
+	}
 	result, err := b.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(b.bucket),
-		Key:    aws.String(b.prefixedKey(path)),
+		Key:    aws.String(key),
 	})
 	if err != nil {
 		recordStorageError(ctx, err)
@@ -365,9 +386,13 @@ func (b *S3Backend) ReadTo(ctx context.Context, path string, writer io.Writer) e
 // writer. Uses an HTTP Range header to skip already-transferred bytes.
 // offset=0 fetches the full object (no Range header sent).
 func (b *S3Backend) ReadToAt(ctx context.Context, path string, writer io.Writer, offset int64) error {
+	key, err := b.prefixedKey(path)
+	if err != nil {
+		return err
+	}
 	input := &s3.GetObjectInput{
 		Bucket: aws.String(b.bucket),
-		Key:    aws.String(b.prefixedKey(path)),
+		Key:    aws.String(key),
 	}
 	if offset > 0 {
 		input.Range = aws.String(fmt.Sprintf("bytes=%d-", offset))
@@ -398,9 +423,13 @@ func (b *S3Backend) ReadToAt(ctx context.Context, path string, writer io.Writer,
 
 // StatFile returns the byte size of the S3 object at path, or -1 if not found.
 func (b *S3Backend) StatFile(ctx context.Context, path string) (int64, error) {
+	key, err := b.prefixedKey(path)
+	if err != nil {
+		return 0, err
+	}
 	result, err := b.client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(b.bucket),
-		Key:    aws.String(b.prefixedKey(path)),
+		Key:    aws.String(key),
 	})
 	if err != nil {
 		if isNotFoundError(err) {
@@ -419,6 +448,11 @@ func (b *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 	var objects []string
 	var continuationToken *string
 
+	fullPrefix, err := b.prefixedListPrefix(prefix)
+	if err != nil {
+		return nil, err
+	}
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -426,7 +460,7 @@ func (b *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 
 		result, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 			Bucket:            aws.String(b.bucket),
-			Prefix:            aws.String(b.prefixedKey(prefix)),
+			Prefix:            aws.String(fullPrefix),
 			ContinuationToken: continuationToken,
 		})
 		if err != nil {
@@ -437,6 +471,19 @@ func (b *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 			if obj.Key != nil {
 				// Strip prefix so callers see paths relative to the logical root
 				key := strings.TrimPrefix(*obj.Key, b.prefix)
+				// A listing must never hand back a key this backend would
+				// refuse (#743). Object stores carry "directory marker"
+				// objects whose key ends in a separator, created by consoles
+				// and sync tools, and Arc's own callers feed List output
+				// straight into Read, Exists and Delete. Returning one turns
+				// every such consumer into a failure: restore drops the file
+				// and still reports success, compaction's "already gone" skip
+				// becomes a hard error, and manifest recovery retries a
+				// permanent error forever. They are not data, so they are
+				// skipped rather than reported.
+				if ValidateKey(key) != nil {
+					continue
+				}
 				objects = append(objects, key)
 			}
 		}
@@ -452,9 +499,13 @@ func (b *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 
 // Delete deletes an object from S3
 func (b *S3Backend) Delete(ctx context.Context, path string) error {
-	_, err := b.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+	key, err := b.prefixedKey(path)
+	if err != nil {
+		return err
+	}
+	_, err = b.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(b.bucket),
-		Key:    aws.String(b.prefixedKey(path)),
+		Key:    aws.String(key),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to delete from S3: %w", err)
@@ -485,11 +536,23 @@ func (b *S3Backend) DeleteBatch(ctx context.Context, paths []string) error {
 		}
 
 		batch := paths[i:end]
-		objects := make([]types.ObjectIdentifier, len(batch))
-		for j, path := range batch {
-			objects[j] = types.ObjectIdentifier{
-				Key: aws.String(b.prefixedKey(path)),
+		// Best-effort per key rather than all-or-nothing. Two callers
+		// (backup/manager.go, compaction/job.go) return this error with no
+		// per-file fallback, so failing the whole batch on one bad key would
+		// make a backup permanently undeletable and leave compaction inputs
+		// beside their output forever. The keys come from List, so they are
+		// whatever is in the bucket, not only what Arc wrote.
+		objects := make([]types.ObjectIdentifier, 0, len(batch))
+		for _, p := range batch {
+			key, kerr := b.prefixedKey(p)
+			if kerr != nil {
+				nonFatalErrs = append(nonFatalErrs, kerr)
+				continue
 			}
+			objects = append(objects, types.ObjectIdentifier{Key: aws.String(key)})
+		}
+		if len(objects) == 0 {
+			continue
 		}
 
 		output, err := b.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
@@ -541,9 +604,13 @@ func (b *S3Backend) DeleteBatch(ctx context.Context, paths []string) error {
 
 // Exists checks if an object exists in S3
 func (b *S3Backend) Exists(ctx context.Context, path string) (bool, error) {
-	_, err := b.client.HeadObject(ctx, &s3.HeadObjectInput{
+	key, err := b.prefixedKey(path)
+	if err != nil {
+		return false, err
+	}
+	_, err = b.client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(b.bucket),
-		Key:    aws.String(b.prefixedKey(path)),
+		Key:    aws.String(key),
 	})
 	if err != nil {
 		// Check if it's a "not found" error
@@ -573,40 +640,75 @@ func isNotFoundError(err error) bool {
 		strings.Contains(errStr, "404")
 }
 
-// SanitizeS3Prefix cleans and validates an S3 path prefix.
-// Returns empty string if prefix is empty (no-op), otherwise ensures trailing /.
-// Only allows alphanumeric characters, hyphens, underscores, dots, and slashes.
-func SanitizeS3Prefix(prefix string) string {
+// ValidateS3Prefix checks a configured bucket prefix and returns it with a
+// trailing separator.
+//
+// It validates rather than rewrites. The previous SanitizeS3Prefix repaired its
+// input, and the damage was on its SUCCESS path, not its failure path:
+//
+//	"/"      -> "/"      every key then starts with "/", which MinIO folds away
+//	"a//b"   -> "a//b/"  every write 400s with XMinioInvalidObjectName
+//	"."      -> "./"     every write 400s with XMinioInvalidResourceName
+//	"a/..b"  -> ""       a legitimate prefix silently becomes the BUCKET ROOT
+//
+// The last is the worst of them: "" is not a safe fallback, it is a different
+// and much larger location, so a typo relocated an entire deployment without a
+// word. The ".." rejection that caused it was also a raw substring match, the
+// same class this repo removed for keys in #741.
+//
+// An empty prefix is legitimate and means the bucket root was chosen
+// deliberately.
+func ValidateS3Prefix(prefix string) (string, error) {
 	prefix = strings.TrimSpace(prefix)
 	if prefix == "" {
-		return ""
+		return "", nil
 	}
-	// Strip leading slash
-	prefix = strings.TrimLeft(prefix, "/")
-	// Reject path traversal
-	if strings.Contains(prefix, "..") {
-		return ""
+	// Reuse the key contract, which already rejects leading "/", "." and ".."
+	// segments, empty interior segments, backslash and NUL. A trailing
+	// separator is what a prefix is for, so strip it before checking and add
+	// it back after.
+	if err := ValidateListPrefix(prefix); err != nil {
+		return "", fmt.Errorf("storage prefix %q is not usable: %w", prefix, err)
 	}
-	// Reject unsafe characters (defense-in-depth against SQL injection
-	// since prefixes are interpolated into DuckDB read_parquet() calls)
+	// Defence in depth against SQL injection: the prefix is interpolated into
+	// DuckDB read_parquet() calls, so keep the character allowlist the old
+	// implementation had.
 	for _, c := range prefix {
 		switch {
 		case (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'):
 		case c == '/' || c == '-' || c == '_' || c == '.':
 		default:
-			return ""
+			return "", fmt.Errorf("storage prefix %q contains an unsupported character %q", prefix, c)
 		}
 	}
-	// Ensure trailing slash
 	if !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
-	return prefix
+	return prefix, nil
 }
 
-// prefixedKey prepends the configured prefix to an S3 object key
-func (b *S3Backend) prefixedKey(path string) string {
-	return b.prefix + path
+// prefixedKey validates a storage key and prepends the configured prefix.
+//
+// Returning an error is what makes the contract hold: a new method that builds
+// an S3 key has to deal with it, rather than silently passing an unvalidated
+// string to the SDK. Note this is not a total chokepoint. Arc's READ path does
+// not go through Backend at all: storage/util.go builds an s3:// URI that
+// DuckDB's read_parquet consumes, and iceberg-go writes metadata through its
+// own FileIO. Both are out of scope here (#746).
+func (b *S3Backend) prefixedKey(key string) (string, error) {
+	if err := ValidateKey(key); err != nil {
+		return "", err
+	}
+	return b.prefix + key, nil
+}
+
+// prefixedListPrefix is prefixedKey for enumeration, where "" and a trailing
+// separator are legitimate and cannot name an object.
+func (b *S3Backend) prefixedListPrefix(prefix string) (string, error) {
+	if err := ValidateListPrefix(prefix); err != nil {
+		return "", err
+	}
+	return b.prefix + prefix, nil
 }
 
 // Close closes the S3 backend (no-op for S3)
@@ -648,66 +750,6 @@ func (b *S3Backend) GetSecretKey() string {
 	return b.secretKey
 }
 
-// GetS3Path returns the S3 URI for a path
-func (b *S3Backend) GetS3Path(path string) string {
-	return fmt.Sprintf("s3://%s/%s%s", b.bucket, b.prefix, path)
-}
-
-// GetQueryPath generates S3 path patterns for time-based query pruning
-// This enables DuckDB to efficiently scan only relevant partitions
-//
-// Examples:
-//   - GetQueryPath("mydb", "cpu", 2025, 11, 0, 0)   → "s3://bucket/mydb/cpu/2025/11/*/*/*.parquet" (all November)
-//   - GetQueryPath("mydb", "cpu", 2025, 11, 25, 0) → "s3://bucket/mydb/cpu/2025/11/25/*/*.parquet" (specific day)
-//   - GetQueryPath("mydb", "cpu", 2025, 11, 25, 16) → "s3://bucket/mydb/cpu/2025/11/25/16/*.parquet" (specific hour)
-func (b *S3Backend) GetQueryPath(database, measurement string, year, month, day, hour int) string {
-	if hour > 0 {
-		// Specific hour
-		return fmt.Sprintf("s3://%s/%s%s/%s/%04d/%02d/%02d/%02d/*.parquet",
-			b.bucket, b.prefix, database, measurement, year, month, day, hour)
-	} else if day > 0 {
-		// Specific day, all hours
-		return fmt.Sprintf("s3://%s/%s%s/%s/%04d/%02d/%02d/*/*.parquet",
-			b.bucket, b.prefix, database, measurement, year, month, day)
-	} else if month > 0 {
-		// Specific month, all days and hours
-		return fmt.Sprintf("s3://%s/%s%s/%s/%04d/%02d/*/*/*.parquet",
-			b.bucket, b.prefix, database, measurement, year, month)
-	} else {
-		// Entire year
-		return fmt.Sprintf("s3://%s/%s%s/%s/%04d/*/*/*/*.parquet",
-			b.bucket, b.prefix, database, measurement, year)
-	}
-}
-
-// GetQueryPathRange generates S3 path pattern for a time range
-// This is useful for queries like "WHERE time BETWEEN start AND end"
-func (b *S3Backend) GetQueryPathRange(database, measurement string, startTime, endTime time.Time) []string {
-	var paths []string
-
-	// Generate one path per UTC calendar day covering the range. Arc's
-	// partition directories are UTC dates (ingestion, pruning, and the query
-	// engine's pinned session zone all agree), so the inputs are normalized
-	// to UTC first: anchoring to a caller's local zone would skip the
-	// trailing UTC partition for west-of-UTC ranges and add a spurious
-	// leading one (#690 follow-up). AddDate keeps day-stepping calendar-
-	// correct, which in UTC is also DST-proof (#321).
-	startYear, startMonth, startDay := startTime.UTC().Date()
-	current := time.Date(startYear, startMonth, startDay, 0, 0, 0, 0, time.UTC)
-	endYear, endMonth, endDay := endTime.UTC().Date()
-	end := time.Date(endYear, endMonth, endDay, 0, 0, 0, 0, time.UTC).AddDate(0, 0, 1)
-
-	for current.Before(end) {
-		path := fmt.Sprintf("s3://%s/%s%s/%s/%04d/%02d/%02d/*/*.parquet",
-			b.bucket, b.prefix, database, measurement,
-			current.Year(), int(current.Month()), current.Day())
-		paths = append(paths, path)
-		current = current.AddDate(0, 0, 1)
-	}
-
-	return paths
-}
-
 // Type returns the storage type identifier
 func (b *S3Backend) Type() string {
 	return "s3"
@@ -736,7 +778,10 @@ func (b *S3Backend) ListDirectories(ctx context.Context, prefix string) ([]strin
 		prefix = prefix + "/"
 	}
 
-	fullPrefix := b.prefixedKey(prefix)
+	fullPrefix, err := b.prefixedListPrefix(prefix)
+	if err != nil {
+		return nil, err
+	}
 
 	var dirs []string
 	var continuationToken *string
@@ -784,6 +829,11 @@ func (b *S3Backend) ListObjects(ctx context.Context, prefix string) ([]ObjectInf
 	var objects []ObjectInfo
 	var continuationToken *string
 
+	fullPrefix, err := b.prefixedListPrefix(prefix)
+	if err != nil {
+		return nil, err
+	}
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -791,7 +841,7 @@ func (b *S3Backend) ListObjects(ctx context.Context, prefix string) ([]ObjectInf
 
 		result, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 			Bucket:            aws.String(b.bucket),
-			Prefix:            aws.String(b.prefixedKey(prefix)),
+			Prefix:            aws.String(fullPrefix),
 			ContinuationToken: continuationToken,
 		})
 		if err != nil {
@@ -800,9 +850,13 @@ func (b *S3Backend) ListObjects(ctx context.Context, prefix string) ([]ObjectInf
 
 		for _, obj := range result.Contents {
 			if obj.Key != nil {
-				info := ObjectInfo{
-					Path: strings.TrimPrefix(*obj.Key, b.prefix),
+				key := strings.TrimPrefix(*obj.Key, b.prefix)
+				// See List: a listing never returns a key the backend would
+				// refuse (#743).
+				if ValidateKey(key) != nil {
+					continue
 				}
+				info := ObjectInfo{Path: key}
 				if obj.Size != nil {
 					info.Size = *obj.Size
 				}
@@ -811,6 +865,74 @@ func (b *S3Backend) ListObjects(ctx context.Context, prefix string) ([]ObjectInf
 				}
 				objects = append(objects, info)
 			}
+		}
+
+		if result.IsTruncated == nil || !*result.IsTruncated {
+			break
+		}
+		continuationToken = result.NextContinuationToken
+	}
+
+	return objects, nil
+}
+
+// ListUnusable implements UnusableLister.
+//
+// Returns exactly what ListObjects drops, so the two partition the bucket.
+//
+// Unlike the local backend this does NOT exclude ".part" keys. S3 does not
+// stage writes and does not implement StagingInspector, so a ".part" object
+// here is an ordinary committed object that #744's reserved suffix made
+// unaddressable, and this is its only escape hatch.
+func (b *S3Backend) ListUnusable(ctx context.Context, prefix string) ([]UnusableObject, error) {
+	var objects []UnusableObject
+	var continuationToken *string
+
+	fullPrefix, err := b.prefixedListPrefix(prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		result, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(b.bucket),
+			Prefix:            aws.String(fullPrefix),
+			ContinuationToken: continuationToken,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to list S3 objects: %w", err)
+		}
+
+		for _, obj := range result.Contents {
+			if obj.Key == nil {
+				continue
+			}
+			key := strings.TrimPrefix(*obj.Key, b.prefix)
+			reason := ValidateKey(key)
+			if reason == nil {
+				continue // ListObjects returns it
+			}
+			var size int64
+			if obj.Size != nil {
+				size = *obj.Size
+			}
+			// A zero-length key ending in a separator is a directory marker,
+			// written by consoles and sync tools rather than by Arc, and holds
+			// no data. This is a heuristic, not a guarantee: a trailing-slash
+			// key CAN hold bytes on S3, which is why the size is part of the
+			// test rather than the suffix alone.
+			if size == 0 && strings.HasSuffix(key, "/") {
+				continue
+			}
+			info := UnusableObject{Path: key, Size: size, Err: reason}
+			if obj.LastModified != nil {
+				info.LastModified = *obj.LastModified
+			}
+			objects = append(objects, info)
 		}
 
 		if result.IsTruncated == nil || !*result.IsTruncated {

@@ -21,11 +21,18 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster/raft"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
 
 const defaultReconciliationInterval = 5 * time.Minute
+
+// maxQuarantineLogPaths bounds the set of paths remembered for log
+// deduplication of permanently unusable keys (#747). A healthy cluster keeps
+// this set empty; the cap exists so a manifest full of bad entries costs a
+// bounded amount of memory rather than one map entry per distinct path.
+const maxQuarantineLogPaths = 1024
 
 // Fetcher is the contract the puller uses to download a single file from a
 // peer. It's an interface rather than a concrete type so the puller can be
@@ -208,6 +215,7 @@ type Puller struct {
 	totalPeerLookupFailure atomic.Int64 // no candidate peers available
 	totalBadOffsetServer   atomic.Int64 // server rejected resume offset (AckCodeBadOffset)
 	totalBadOffsetBackend  atomic.Int64 // backend can't append (ErrResumeNotSupported)
+	totalInvalidPath       atomic.Int64 // entry path is permanently unusable (storage.ErrInvalidPath)
 
 	// Catch-up metrics (Phase 3). Populated by RunCatchUp and read via Stats.
 	catchupStartedAt     atomic.Int64 // unix seconds; 0 if never started
@@ -242,6 +250,18 @@ type Puller struct {
 	catchupFailedPaths  map[string]struct{}
 	catchupDroppedPaths map[string]struct{}
 	catchupInflight     atomic.Int64
+
+	// quarantinedPaths holds paths already logged as permanently unusable, so
+	// the Error line is emitted once per path per process rather than once per
+	// arrival (#747). The same path is re-offered by three independent sources
+	// — the reactive FSM callback, the startup catch-up walker and the periodic
+	// reconciler — and none of them can know another already reported it.
+	//
+	// Bounded by maxQuarantineLogPaths. Past the cap the set stops growing and
+	// every arrival logs again: noisier, but a log flood is recoverable and an
+	// unbounded map on a path an adversary with Raft write access could feed is
+	// not. Shares inflightMu with the sets above.
+	quarantinedPaths map[string]struct{}
 
 	// catchupFailed / catchupDropped count failures and drops scoped to the
 	// catch-up batch only. FullyCaughtUp uses these (not the cumulative
@@ -314,6 +334,7 @@ func New(cfg Config) (*Puller, error) {
 		catchupPaths:        make(map[string]struct{}),
 		catchupFailedPaths:  make(map[string]struct{}),
 		catchupDroppedPaths: make(map[string]struct{}),
+		quarantinedPaths:    make(map[string]struct{}),
 		catchupFinished:     make(chan struct{}),
 		logger:              cfg.Logger.With().Str("component", "file-puller").Logger(),
 	}, nil
@@ -385,6 +406,26 @@ func (p *Puller) finishEntry(path string, source enqueueSource, failed, succeede
 		p.removeCatchUpTagLocked(path)
 	}
 	p.removeInflightOnlyLocked(path)
+}
+
+// markQuarantinedForLog records that a path has been reported as permanently
+// unusable and returns true only for the first caller to do so, so the Error
+// line is emitted once per path per process (#747).
+//
+// Returns true unconditionally once the set is at maxQuarantineLogPaths: the
+// choice there is between repeating a log line and growing a map without a
+// bound, and only one of those is recoverable.
+func (p *Puller) markQuarantinedForLog(path string) bool {
+	p.inflightMu.Lock()
+	defer p.inflightMu.Unlock()
+	if _, ok := p.quarantinedPaths[path]; ok {
+		return false
+	}
+	if len(p.quarantinedPaths) >= maxQuarantineLogPaths {
+		return true
+	}
+	p.quarantinedPaths[path] = struct{}{}
+	return true
 }
 
 // markCatchUp records that a path is being enqueued by the catch-up walker
@@ -688,6 +729,7 @@ func (p *Puller) Stats() map[string]int64 {
 		"peer_lookup_failure":                p.totalPeerLookupFailure.Load(),
 		"bad_offset_server":                  p.totalBadOffsetServer.Load(),
 		"bad_offset_backend":                 p.totalBadOffsetBackend.Load(),
+		"invalid_path":                       p.totalInvalidPath.Load(),
 		"queue_depth":                        int64(len(p.queue)),
 		"inflight_count":                     p.inflightCount.Load(),
 		"catchup_started_at":                 p.catchupStartedAt.Load(),
@@ -805,6 +847,12 @@ func (p *Puller) CatchUpStatus() map[string]int64 {
 		"failed":      p.totalFailed.Load(),
 		"dropped":     p.totalDropped.Load(),
 
+		// Subset of "failed" whose cause is permanent: the manifest entry names
+		// a key no storage backend can address (#747). Surfaced here because it
+		// lands in the query gate's 503 body, and "invalid_path > 0" is the one
+		// reason a red gate will never go green on its own.
+		"invalid_path": p.totalInvalidPath.Load(),
+
 		// Catch-up-batch-scoped counters (added in 26.06.1 for the query
 		// gate). Non-zero means the gate is closed for a reason FullyCaughtUp
 		// can attribute to the cold-start batch specifically.
@@ -892,6 +940,35 @@ func (p *Puller) processEntry(log zerolog.Logger, request *pullRequest) {
 		if statErr == nil && localSize == entry.SizeBytes {
 			p.totalSkippedLocal.Add(1)
 			succeeded = true // File is already here — same as a fresh pull from the gate's perspective.
+			return
+		}
+		if errors.Is(statErr, storage.ErrInvalidPath) {
+			// Permanent (#747). This is the first backend call an entry makes,
+			// and every later one — WriteReader, the partial-file stat, the
+			// delete of a corrupt partial — fails identically on the same key.
+			// Without this branch the worker fetches the whole file body from a
+			// peer and then fails writing it, once per candidate peer, once per
+			// attempt, on every catch-up walk and every reconciliation pass,
+			// forever.
+			//
+			// failed stays TRUE deliberately. The file really is absent, the
+			// read path is a glob so a query over that partition silently
+			// returns fewer rows, and an operator who enabled
+			// query.gate_on_catchup asked for a 503 over exactly that. An entry
+			// no peer holds is equally unsatisfiable and reds the gate today;
+			// this one gets no exemption. What the quarantine removes is the
+			// wasted peer traffic and the retry storm, not the signal.
+			p.totalInvalidPath.Add(1)
+			p.totalFailed.Add(1)
+			metrics.Get().IncStorageInvalidPathQuarantined()
+			failed = true
+			if p.markQuarantinedForLog(entry.Path) {
+				log.Error().
+					Err(statErr).
+					Str("path", entry.Path).
+					Str("origin_node_id", entry.OriginNodeID).
+					Msg("Manifest entry names a storage key no backend can address; not pulling it from any peer. It cannot be replicated here and, if the query gate is enabled, it holds the gate closed until the entry is removed from the cluster manifest AND this node is restarted: only a successful pull of the same path clears the catch-up failure, and this one can never succeed")
+			}
 			return
 		}
 
@@ -1091,6 +1168,13 @@ func (p *Puller) writeFileTail(ctx context.Context, entry *raft.FileEntry, r io.
 // Note: for backends that do not implement AppendingBackend, writeFileTail will
 // return ErrResumeNotSupported when called with a non-zero offset. This is
 // intentional — the puller increments bad_offset_backend and retries from zero.
+//
+// statErr here can no longer be storage.ErrInvalidPath, and the (0, nil) return
+// is therefore not ambiguous between "no partial" and "unusable key": the same
+// key already went through StatFile at the top of processEntry, which
+// quarantines and returns before any of this runs (#747). The same invariant is
+// why deleteFile below cannot be called with an unusable key. Both are pinned
+// by a test asserting the backend sees no Delete for a quarantined entry.
 func (p *Puller) tryResumeFromPartial(log zerolog.Logger, entry *raft.FileEntry) (int64, hash.Hash) {
 	statCtx, statCancel := context.WithTimeout(p.ctx, 5*time.Second)
 	partial, statErr := p.cfg.Backend.StatFile(statCtx, entry.Path)

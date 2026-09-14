@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -211,6 +212,14 @@ func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
 			"error": "Database name is required",
 		})
 	}
+	// The name becomes a storage path prefix below. Validating it here turns a
+	// malformed one into a 400 at the boundary rather than a 500 from the
+	// storage layer refusing the key it was built into (#741).
+	if !isSafeStoragePathSegment(name) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("invalid database name %q", name),
+		})
+	}
 
 	ctx := context.Background()
 
@@ -248,6 +257,14 @@ func (h *DatabasesHandler) handleListMeasurements(c *fiber.Ctx) error {
 	if name == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "Database name is required",
+		})
+	}
+	// The name becomes a storage path prefix below. Validating it here turns a
+	// malformed one into a 400 at the boundary rather than a 500 from the
+	// storage layer refusing the key it was built into (#741).
+	if !isSafeStoragePathSegment(name) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("invalid database name %q", name),
 		})
 	}
 
@@ -313,6 +330,14 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	if name == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "Database name is required",
+		})
+	}
+	// The name becomes a storage path prefix below. Validating it here turns a
+	// malformed one into a 400 at the boundary rather than a 500 from the
+	// storage layer refusing the key it was built into (#741).
+	if !isSafeStoragePathSegment(name) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("invalid database name %q", name),
 		})
 	}
 
@@ -386,6 +411,13 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		}
 	}
 
+	// Reclaim staged partials under this prefix. They are invisible to List by
+	// design (#744), so nothing else would find them, and a leftover one also
+	// keeps the directory non-empty so RemoveDirectory below fails. The
+	// common source is an upload that failed after staging bytes, whose final
+	// key never existed, so the loop above never saw it.
+	deletedCount += reclaimStagedPartials(ctx, h.storage, name+"/", h.logger)
+
 	// Also delete the .arc-database marker file (not included in List due to hidden file filter)
 	markerPath := name + "/.arc-database"
 	if err := h.storage.Delete(ctx, markerPath); err == nil {
@@ -435,6 +467,34 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 }
 
 // Helper functions
+
+// isSafeStoragePathSegment reports whether name can be used as one segment of a
+// storage key by an API caller.
+//
+// The storage half is storage.ValidateKeySegment, the contract every Backend
+// enforces, rather than a private re-spelling of it (#746). Only the
+// leading-dot rule is local, and it stays local deliberately: it is an API
+// visibility rule, not a property of the key contract. Arc's own storage root
+// holds dot-prefixed entries (`.arc-database` markers, and the query layer's
+// `.arc-invalid-quoted-identifier` sentinel), so the storage layer must keep
+// accepting them while the API declines to name them.
+//
+// Deliberately looser than isValidDatabaseName, which governs what a NEW
+// database may be called. Directories already in the storage root were not all
+// created through that route: an edge-sync hub writes each spoke's namespace
+// there, and validateSpokeID permits a leading digit, interior dots and up to
+// 128 bytes. Those directories are listed by GET /api/v1/databases, so gating
+// the per-name routes on the create-time rule would return 400 for something
+// the list endpoint just reported.
+//
+// Note this carries no glob rule. A caller whose name reaches a DuckDB path
+// needs storage.ValidateGlobSafe as well; see handleDelete.
+func isSafeStoragePathSegment(name string) bool {
+	if strings.HasPrefix(name, ".") {
+		return false
+	}
+	return storage.ValidateKeySegment(name) == nil
+}
 
 func isValidDatabaseName(name string) bool {
 	n := len(name)
@@ -716,4 +776,34 @@ func (h *DatabasesHandler) dropIcebergCatalog(ctx context.Context, name string) 
 	} else {
 		h.logger.Info().Str("database", name).Msg("Iceberg catalog artifacts removed for dropped database")
 	}
+}
+
+// reclaimStagedPartials deletes write-staging partials under prefix and returns
+// how many were removed.
+//
+// Staged partials do not appear in List: a listing must never return a key the
+// backend would refuse (#743), and the staging suffix is reserved (#744). That
+// makes them unreachable through the ordinary delete loop, so a prefix-wide
+// delete has to ask for them explicitly or they survive the database that owned
+// them. Backends that do not stage have none, which is why a failed type
+// assertion is simply zero.
+func reclaimStagedPartials(ctx context.Context, backend storage.Backend, prefix string, logger zerolog.Logger) int {
+	si, ok := backend.(storage.StagingInspector)
+	if !ok {
+		return 0
+	}
+	staged, err := si.ListStaged(ctx, prefix)
+	if err != nil {
+		logger.Warn().Err(err).Str("prefix", prefix).Msg("Could not list staged partials to reclaim")
+		return 0
+	}
+	var removed int
+	for _, obj := range staged {
+		if err := si.DeleteStaged(ctx, obj.Path); err != nil {
+			logger.Warn().Err(err).Str("key", obj.Path).Msg("Failed to reclaim staged partial")
+			continue
+		}
+		removed++
+	}
+	return removed
 }

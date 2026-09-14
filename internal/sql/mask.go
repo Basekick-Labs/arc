@@ -588,12 +588,16 @@ func equalFoldASCII(a, b string) bool {
 // where the path comes from user-controlled inputs (database header,
 // measurement name, manifest entries).
 //
-// SECURITY: This is the single source of truth for DuckDB string-
-// literal escaping in the API layer. Sites that interpolate paths
-// must call this helper. See internal/api/query.go convertSQL* and
-// buildReadParquetExpr for the call sites.
+// SECURITY: This is the single source of truth for DuckDB string-literal
+// escaping. Sites that interpolate paths must call this helper or
+// QuoteStringLiteral.
 func EscapeStringLiteral(s string) string {
 	return strings.ReplaceAll(s, "'", "''")
+}
+
+// QuoteStringLiteral escapes a string and wraps it in DuckDB single quotes.
+func QuoteStringLiteral(s string) string {
+	return "'" + EscapeStringLiteral(s) + "'"
 }
 
 // dollarQuoteTag reports whether a dollar-quote opener starts at sql[i] and, if

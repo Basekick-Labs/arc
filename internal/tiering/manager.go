@@ -429,6 +429,12 @@ func (m *Manager) GetStatus(ctx context.Context) (*StatusResponse, error) {
 	coldStats.Backend = m.config.Cold.Backend
 	status.Tiers["cold"] = coldStats
 
+	quarantined, err := m.metadata.CountQuarantinedFiles(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to count quarantined files: %w", err)
+	}
+	status.QuarantinedFiles = quarantined
+
 	// Scheduler status
 	status.Scheduler = m.scheduler.Status()
 

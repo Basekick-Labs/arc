@@ -788,7 +788,10 @@ func wrapSourceMeasurement(query, database, measurement, readParquetExpr string)
 // the window START (bucket-start convention), so only startTime is needed.
 func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *ContinuousQuery, query string, startTime, _ time.Time) (int64, error) {
 	// Build storage path for source measurement (supports local, S3, Azure)
-	measurementPath := storage.GetStoragePath(h.storage, cq.Database, cq.SourceMeasurement)
+	measurementPath, err := storage.GetStoragePath(h.storage, cq.Database, cq.SourceMeasurement)
+	if err != nil {
+		return 0, fmt.Errorf("continuous query %q has an unusable source: %w", cq.Name, err)
+	}
 
 	// Extract CTE names to avoid replacing them with read_parquet paths
 	cteNames := extractCTENames(query)

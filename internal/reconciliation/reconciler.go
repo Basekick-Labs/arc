@@ -299,6 +299,20 @@ type Run struct {
 	SkippedGrace        int `json:"skipped_grace"`
 	SkippedRecheck      int `json:"skipped_recheck"`
 
+	// SkippedTransient counts entries a sweep passed over because a storage
+	// call failed in a way that may succeed later (a throttle, a timeout, an
+	// expired credential). The next run retries them, and that is what the
+	// summary log for this bucket says.
+	//
+	// SkippedInvalidPath counts entries passed over because the storage call
+	// returned storage.ErrInvalidPath, which is permanent (#747): the key names
+	// nothing any backend can address, so no later run can do better. Kept
+	// apart from SkippedTransient precisely because "retry next run" is true of
+	// one and false of the other, and a run report that merges them tells an
+	// operator to wait for a convergence that will never happen.
+	SkippedTransient   int `json:"skipped_transient"`
+	SkippedInvalidPath int `json:"skipped_invalid_path"`
+
 	// Bounded samples for operator visibility
 	OrphanManifestSample []string `json:"orphan_manifest_sample,omitempty"`
 	OrphanStorageSample  []string `json:"orphan_storage_sample,omitempty"`
@@ -660,6 +674,7 @@ func (r *Reconciler) finalizeRun(run *Run) {
 		Int("manifest_deletes", run.ManifestDeletes).
 		Int("storage_deletes", run.StorageDeletes).
 		Int("skipped_grace", run.SkippedGrace).
+		Int("skipped_invalid_path", run.SkippedInvalidPath).
 		Dur("duration", duration)
 	if run.Aborted {
 		logEv = logEv.Str("abort_reason", string(run.AbortReason))
@@ -674,27 +689,31 @@ func (r *Reconciler) finalizeRun(run *Run) {
 	// queryable on the same shape.
 	if run.Aborted {
 		r.emitAudit("reconcile.run_aborted", run, map[string]string{
-			"run_id":           run.ID,
-			"backend_kind":     string(run.BackendKind),
-			"abort_reason":    string(run.AbortReason),
-			"abort_message":   run.AbortMessage,
-			"manifest_deletes": strconv.Itoa(run.ManifestDeletes),
-			"storage_deletes":  strconv.Itoa(run.StorageDeletes),
-			"walk_partial":    boolStr(run.WalkPartial),
-			"cap_hit":         boolStr(run.CapHit),
-			"duration_ms":     strconv.FormatInt(duration.Milliseconds(), 10),
+			"run_id":               run.ID,
+			"backend_kind":         string(run.BackendKind),
+			"abort_reason":         string(run.AbortReason),
+			"abort_message":        run.AbortMessage,
+			"manifest_deletes":     strconv.Itoa(run.ManifestDeletes),
+			"storage_deletes":      strconv.Itoa(run.StorageDeletes),
+			"skipped_transient":    strconv.Itoa(run.SkippedTransient),
+			"skipped_invalid_path": strconv.Itoa(run.SkippedInvalidPath),
+			"walk_partial":         boolStr(run.WalkPartial),
+			"cap_hit":              boolStr(run.CapHit),
+			"duration_ms":          strconv.FormatInt(duration.Milliseconds(), 10),
 		})
 	} else {
 		r.emitAudit("reconcile.run_completed", run, map[string]string{
-			"run_id":           run.ID,
-			"backend_kind":     string(run.BackendKind),
-			"manifest_deletes": strconv.Itoa(run.ManifestDeletes),
-			"storage_deletes":  strconv.Itoa(run.StorageDeletes),
-			"skipped_grace":    strconv.Itoa(run.SkippedGrace),
-			"skipped_recheck":  strconv.Itoa(run.SkippedRecheck),
-			"walk_partial":     boolStr(run.WalkPartial),
-			"cap_hit":          boolStr(run.CapHit),
-			"duration_ms":      strconv.FormatInt(duration.Milliseconds(), 10),
+			"run_id":               run.ID,
+			"backend_kind":         string(run.BackendKind),
+			"manifest_deletes":     strconv.Itoa(run.ManifestDeletes),
+			"storage_deletes":      strconv.Itoa(run.StorageDeletes),
+			"skipped_grace":        strconv.Itoa(run.SkippedGrace),
+			"skipped_recheck":      strconv.Itoa(run.SkippedRecheck),
+			"skipped_transient":    strconv.Itoa(run.SkippedTransient),
+			"skipped_invalid_path": strconv.Itoa(run.SkippedInvalidPath),
+			"walk_partial":         boolStr(run.WalkPartial),
+			"cap_hit":              boolStr(run.CapHit),
+			"duration_ms":          strconv.FormatInt(duration.Milliseconds(), 10),
 		})
 	}
 

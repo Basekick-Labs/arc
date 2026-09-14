@@ -125,7 +125,16 @@ func (h *MsgPackHandler) SetRouter(router *cluster.Router) {
 	h.router = router
 }
 
-// extractMeasurements extracts unique measurement names from decoded msgpack records
+// extractMeasurements extracts unique measurement names from decoded msgpack records.
+//
+// An empty name is collected rather than skipped, so the caller's
+// isValidMeasurementName check rejects it. Skipping it used to mean a record
+// with "m": "" passed validation and reached the writer, which builds
+// "{database}//{year}/..." from it. filepath.Join silently collapsed the empty
+// segment and the rows landed a directory level up, under the database itself.
+// Since #741 the storage backend refuses that key instead, and a refused flush
+// keeps its data in the WAL and retries forever, so one such record would wedge
+// the buffer permanently.
 func (h *MsgPackHandler) extractMeasurements(records interface{}) []string {
 	seen := make(map[string]struct{})
 
@@ -133,20 +142,14 @@ func (h *MsgPackHandler) extractMeasurements(records interface{}) []string {
 	extract = func(v interface{}) {
 		switch r := v.(type) {
 		case *models.Record:
-			if r.Measurement != "" {
-				seen[r.Measurement] = struct{}{}
-			}
+			seen[r.Measurement] = struct{}{}
 		case *models.ColumnarRecord:
-			if r.Measurement != "" {
-				seen[r.Measurement] = struct{}{}
-			}
+			seen[r.Measurement] = struct{}{}
 		case *ingest.TypedColumnarRecord:
 			// Typed decode fast path — MUST be listed here: a record type
 			// missing from this switch silently skips measurement-name
 			// validation and RBAC for its writes.
-			if r.Measurement != "" {
-				seen[r.Measurement] = struct{}{}
-			}
+			seen[r.Measurement] = struct{}{}
 		case []interface{}:
 			for _, item := range r {
 				extract(item)

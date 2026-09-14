@@ -2,6 +2,7 @@ package reconciliation
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -196,6 +197,34 @@ func (r *Reconciler) applyStorageDeletes(
 	bd storage.BatchDeleter,
 	hasBatchDelete bool,
 ) int {
+	// Classify permanently unusable keys BEFORE the batch call, not after it.
+	// DeleteBatch aggregates per-key failures with errors.Join on every
+	// backend, so one bad key in a chunk of up to a thousand fails the whole
+	// batch and drops every member to the per-file path. The deletes still
+	// happen there, so this is not a correctness problem, but re-issuing a
+	// thousand individual deletes on every run because of one key is exactly
+	// the wasted work #747 is about.
+	if len(paths) > 0 {
+		usable := make([]string, 0, len(paths))
+		for _, p := range paths {
+			if err := storage.ValidateKey(p); err != nil {
+				r.noteInvalidPath(run, "delete", p, err)
+				continue
+			}
+			usable = append(usable, p)
+		}
+		if len(usable) != len(paths) {
+			r.logger.Error().
+				Int("invalid_paths", len(paths)-len(usable)).
+				Int("batch_size", len(paths)).
+				Msg("Reconciliation: orphan files have permanently unusable storage keys, skipped and NOT retried. Arc cannot delete them, because every path to them addresses the same key; remove them with the storage provider's own tooling")
+		}
+		paths = usable
+		if len(paths) == 0 {
+			return 0
+		}
+	}
+
 	if hasBatchDelete && len(paths) > 1 {
 		if err := bd.DeleteBatch(ctx, paths); err != nil {
 			// Batch delete failures fall through to per-file delete so
@@ -210,11 +239,29 @@ func (r *Reconciler) applyStorageDeletes(
 	}
 	applied := 0
 	deleteErrCount := 0
+	invalidPathCount := 0
 	var deleteLastErr error
+	var invalidLastErr error
 	for _, p := range paths {
 		if err := r.storage.Delete(ctx, p); err != nil {
+			if errors.Is(err, storage.ErrInvalidPath) {
+				// Defence in depth. The pre-filter above should have removed
+				// these, so reaching here means a backend refused a key
+				// ValidateKey accepts; classify it the same way rather than
+				// spinning on it every run.
+				//
+				// Note this is the PER-FILE error, never the batch error: that
+				// one is an errors.Join, so it matches ErrInvalidPath when a
+				// single member is bad, and quarantining on it would discard
+				// every valid delete in the batch.
+				invalidPathCount++
+				invalidLastErr = err
+				r.noteInvalidPath(run, "delete", p, err)
+				continue
+			}
 			deleteErrCount++
 			deleteLastErr = err
+			run.SkippedTransient++
 			run.Errors = appendBounded(run.Errors, fmt.Sprintf("delete %q: %v", p, err), 32)
 			continue
 		}
@@ -226,6 +273,13 @@ func (r *Reconciler) applyStorageDeletes(
 			Int("batch_failed_deletes", deleteErrCount).
 			Int("batch_size", len(paths)).
 			Msg("Reconciliation: storage.Delete failures — affected files will retry on next run")
+	}
+	if invalidPathCount > 0 {
+		r.logger.Error().
+			Err(invalidLastErr).
+			Int("batch_invalid_paths", invalidPathCount).
+			Int("batch_size", len(paths)).
+			Msg("Reconciliation: orphan files have permanently unusable storage keys, skipped and NOT retried. Arc cannot delete them, because every path to them addresses the same key; remove them with the storage provider's own tooling")
 	}
 	return applied
 }

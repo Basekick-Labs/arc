@@ -47,7 +47,10 @@ func manualS3Backend(t *testing.T, prefix string) storage.Backend {
 func TestManualS3_PruneTierPaths_PrefixedBackend(t *testing.T) {
 	backend := manualS3Backend(t, "tenant1/")
 	p := NewPartitionPruner(zerolog.Nop())
-	glob := storage.GetStoragePath(backend, "db", "cpu")
+	glob, err := storage.GetStoragePath(backend, "db", "cpu")
+	if err != nil {
+		t.Fatalf("GetStoragePath: %v", err)
+	}
 
 	// In-range: hours 14-15 exist on 03-15; hour 16 does not.
 	paths, outcome := p.PruneTierPaths(context.Background(), glob, "db", "cpu",
@@ -82,7 +85,10 @@ func TestManualS3_PruneTierPaths_PrefixedBackend(t *testing.T) {
 func TestManualS3_PruneTierPaths_EmptyPrefixBackend(t *testing.T) {
 	backend := manualS3Backend(t, "")
 	p := NewPartitionPruner(zerolog.Nop())
-	glob := storage.GetStoragePath(backend, "db", "mem")
+	glob, err := storage.GetStoragePath(backend, "db", "mem")
+	if err != nil {
+		t.Fatalf("GetStoragePath: %v", err)
+	}
 
 	paths, outcome := p.PruneTierPaths(context.Background(), glob, "db", "mem",
 		tierRange(t, "2024-03-15T14:00:00Z", "2024-03-15T15:00:00Z"), backend, false)

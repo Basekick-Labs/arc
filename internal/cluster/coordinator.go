@@ -9,9 +9,7 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"path"
 	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,6 +23,7 @@ import (
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/license"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/wal"
 	"github.com/rs/zerolog"
@@ -105,6 +104,12 @@ type Coordinator struct {
 	// large compaction cycles.
 	deleteQueue chan deleteRequest
 	deleteWg    sync.WaitGroup
+
+	// fetchInvalidPathCount counts inbound fetch requests refused because the
+	// path is permanently unusable (#747). Its only job is to rate-limit the
+	// log line; the alertable number is the storage_invalid_path_quarantined
+	// metric.
+	fetchInvalidPathCount atomic.Int64
 
 	// nonceCache tracks recently seen nonces for replay protection on
 	// HMAC-authenticated messages: the join/heartbeat/leave handshake,
@@ -738,7 +743,22 @@ func (c *Coordinator) runDeleteWorker() {
 			// Delete all items in the batch.
 			for _, item := range batch {
 				delCtx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
-				if err := c.storage.Delete(delCtx, item.path); err != nil {
+				if err := c.storage.Delete(delCtx, item.path); errors.Is(err, storage.ErrInvalidPath) {
+					// Permanent (#747). This queue is fire-and-forget, so the
+					// item is already out of the work set and nothing retries
+					// it; what changes is the diagnosis. A Warn here is
+					// indistinguishable from a backend hiccup, and an operator
+					// reading it would wait for a convergence that cannot
+					// happen: the local copy stays on disk forever, and no
+					// sweep can remove it either, because every path to it
+					// addresses the same unusable key.
+					metrics.Get().IncStorageInvalidPathQuarantined()
+					c.logger.Error().
+						Err(err).
+						Str("path", item.path).
+						Str("reason", item.reason).
+						Msg("Phase 4 local delete worker: the key is permanently unusable, so this local copy can never be removed by Arc and needs operator action")
+				} else if err != nil {
 					c.logger.Warn().
 						Err(err).
 						Str("path", item.path).
@@ -1757,6 +1777,35 @@ func (c *Coordinator) handleFetchFile(conn net.Conn, req *protocol.FetchFileRequ
 	exists, existsErr := backend.Exists(existsCtx, sanitized)
 	existsCancel()
 	if existsErr != nil {
+		if errors.Is(existsErr, storage.ErrInvalidPath) {
+			// Permanent (#747): this key names nothing this backend can
+			// address, and it will name nothing on the next request either.
+			// AckCodeBackend reads as a transient peer-side fault, which is the
+			// wrong thing to tell a puller about a condition no retry changes.
+			// AckCodeInvalidPath already carries exactly this meaning — it is
+			// what sanitizeFetchPath returns above — so the two rejections that
+			// mean "this path is not addressable" answer alike.
+			//
+			// Peer-fallback behaviour is unchanged: isFileNotOnPeerAck treats
+			// AckCodeBackend and AckCodeInvalidPath identically. Only the
+			// diagnosis the operator reads changes.
+			metrics.Get().IncStorageInvalidPathQuarantined()
+			// Rate-limited on powers of two, the same shape the puller uses for
+			// queue-full drops. This is the one site driven by an inbound
+			// request rather than by our own work set, so a peer still running
+			// a pre-#747 binary retries the same entry forever and would
+			// otherwise write one Error line per request here.
+			if n := c.fetchInvalidPathCount.Add(1); n&(n-1) == 0 {
+				c.logger.Error().
+					Err(existsErr).
+					Str("peer", remoteAddr).
+					Str("path", sanitized).
+					Int64("total_invalid_path_fetches", n).
+					Msg("FetchFile: refusing a manifest path the storage backend cannot address; answering invalid_path rather than a retryable backend error. A peer repeating this is running a binary that does not yet quarantine the entry")
+			}
+			c.sendFetchError(conn, protocol.AckCodeInvalidPath, "path is not addressable by this backend")
+			return
+		}
 		c.logger.Warn().
 			Err(existsErr).
 			Str("path", sanitized).
@@ -1885,35 +1934,29 @@ func (c *Coordinator) sendReplicationSyncError(conn net.Conn, reason string) {
 }
 
 // sanitizeFetchPath validates a path supplied in a MsgFetchFile request.
-// Returns the cleaned path on success or an error describing the violation.
+// Returns the path on success or an error describing the violation.
 //
-// The storage backend treats paths as relative to its base directory. We
-// reject:
-//   - absolute paths ("/etc/passwd")
-//   - path traversal ("..", "foo/../bar")
-//   - null bytes (defense against C-string truncation bugs)
-//   - empty paths
-//   - paths that path.Clean changes (indicates funky input)
+// This is storage.ValidateKey, the contract the backend itself enforces, and
+// not a local re-spelling of it (#746). The previous implementation was
+// believed to be stricter than the contract because it required
+// path.Clean(p) == p. It was the opposite. Clean-idempotence is IMPLIED by the
+// contract, which already rejects "//", "." and ".." segments and a trailing
+// separator, so the check added nothing, while the surrounding code missed a
+// backslash (which Azure treats as a separator, so "a\b" and "a/b" are one
+// blob), the 1024-byte key bound and the 255-byte segment bound. Measured over
+// a corpus, it accepted 289 keys the contract rejects and rejected none that it
+// accepts.
+//
+// The path still flows to backend.Exists and backend.ReadTo below, which
+// enforce the same rule, so this is not the only gate. It is worth keeping as
+// its own step because it rejects before the manifest lookup and answers with
+// AckCodeInvalidPath, which tells a retrying peer the failure is permanent
+// rather than a transient backend error.
 func sanitizeFetchPath(p string) (string, error) {
-	if p == "" {
-		return "", fmt.Errorf("empty path")
+	if err := storage.ValidateKey(p); err != nil {
+		return "", err
 	}
-	if strings.ContainsRune(p, 0) {
-		return "", fmt.Errorf("path contains null byte")
-	}
-	if strings.HasPrefix(p, "/") {
-		return "", fmt.Errorf("absolute path not allowed")
-	}
-	// path.Clean also rejects traversal; verify the cleaned form is unchanged.
-	cleaned := path.Clean(p)
-	if cleaned != p {
-		return "", fmt.Errorf("path must be pre-cleaned (got %q, clean is %q)", p, cleaned)
-	}
-	// After Clean, ".." as a prefix means an attempt to escape.
-	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
-		return "", fmt.Errorf("path traversal not allowed")
-	}
-	return cleaned, nil
+	return p, nil
 }
 
 // GetRegistry returns the node registry.

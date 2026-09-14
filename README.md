@@ -450,13 +450,15 @@ Thanks to everyone who has contributed code to Arc:
 - [@SAY-5](https://github.com/SAY-5) (Sai Asish Y) — MQTT nil-guard hardening (handlers + manager) with regression coverage
 - [@mvanhorn](https://github.com/mvanhorn) (Matt Van Horn) — backup/restore concurrency fix: atomic admission guard so competing operations get 409 instead of silently queuing
 - [@bferanmi806-sketch](https://github.com/bferanmi806-sketch) (Enoch) — Iceberg reliability series (#663–#667): version hints published only after metadata copies land, reconcile-interval validation at config load, unreadable-database skip during reconciliation, SQLite WAL/SHM 0600 hardening, empty-measurement negative caching; compaction job-history retention fix (#679); periodic file replication reconciliation with readiness-safe self-healing (#697)
-- [@Thundercloud12](https://github.com/Thundercloud12) (Keerthan Poojary) — Azure not-found error detection via errors.As, covering joined multi-errors (#670)
+- [@Thundercloud12](https://github.com/Thundercloud12) (Keerthan Poojary) — Azure not-found error detection via errors.As, covering joined multi-errors (#670); PREPARE/EXECUTE blocked by the read-SQL validator as defense-in-depth (#767); MQTT restart TOCTOU fix with nil-placeholder slot reservation and 409 on concurrent restart (#766)
 - [@atirna](https://github.com/atirna) (Atirna) — live SQLite backup/restore safety: VACUUM INTO snapshots for backups, rename-swap restores with stale sidecar removal, restart-required signaling (#678, #689); WAL chunking for oversized wide-row payloads with offset-based zero-copy splitting (#696); Helm startup probe protecting long WAL replay from liveness crash loops (#700)
 - [@mah1104ahm](https://github.com/mah1104ahm) (M Ahmed) — bounded local storage directory cache (#674), tier-cache expiry pruning (#675), MQTT shutdown unsubscribe awaits with persisted subscription status (#673), pre-26.06.1 token upgrade runbook (#672)
 - [@copacabanaservice01](https://github.com/copacabanaservice01) — calendar-day S3 range path generation across DST transitions (#690)
 - [@be-student](https://github.com/be-student) — extracted the Arrow IPC stream loop into a testable helper with leak-checked regression coverage for disconnects, cancellation, and decimal-cast cleanup (#706)
 - [@MrBeldum](https://github.com/MrBeldum) (Daniel) — configured query timeout applied to the measurement endpoint, with request-scoped cancellation and 504 handling on both query paths (#701)
 - [@pujitha24](https://github.com/pujitha24) (Pujitha Paladugu) — tiered query routing pushed into SQL instead of filtering file metadata in Go (#707), replicate-sync handshake now authenticating the binary-framing capability flag (#715)
+- [@lecodev-26](https://github.com/lecodev-26) — numeric MessagePack host coercion logged at debug level, with an allocation-free log path verified under parallel ingest (#769)
+- [@efegokdemir](https://github.com/efegokdemir) (Efe) — one shared DuckDB string-literal quoting helper across the query, delete, retention and parallel-executor paths, replacing four drifting copies (#780); retention now reports data files its listings hide, with one inventory pass per policy and no abort on an invalid measurement name (#775)
 
 And a thank-you to community members whose bug reports drove fixes:
 

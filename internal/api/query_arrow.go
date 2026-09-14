@@ -511,7 +511,19 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 
 	// Convert SQL to storage paths (with caching)
 	// If headerDB is set, uses optimized path that skips db.table regex patterns
-	convertedSQL, _ := h.getTransformedSQL(c.Context(), req.SQL, headerDB)
+	//
+	// The rejection must be answered HERE, before the arcx hook and before
+	// ArrowQueryContext: once either commits to SetBodyStreamWriter the status
+	// code is already on the wire, and the only way left to report a failure is
+	// a trailer the client may not read.
+	convertedSQL, _, err := h.getTransformedSQL(c.Context(), req.SQL, headerDB)
+	if err != nil {
+		m.IncQueryErrors()
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   err.Error(),
+		})
+	}
 
 	h.logger.Debug().
 		Str("original_sql", sqlutil.ForLog(req.SQL)).

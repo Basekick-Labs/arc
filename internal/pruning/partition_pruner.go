@@ -192,8 +192,13 @@ var (
 	relativeEndSubtractUnquotedPattern   = regexp.MustCompile(`(?i)time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)\b`)
 	relativeEndAddUnquotedPattern        = regexp.MustCompile(`(?i)time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)\b`)
 
-	// Pattern to parse storage paths
-	storagePathPattern = regexp.MustCompile(`(.+)/([^/]+)/([^/]+)/\*\*/\*\.parquet$`)
+	// Pattern to parse storage paths.
+	//
+	// The root group is `(.*)`, not `(.+)`: a LocalBackend rooted at "/" has a
+	// storage root of "/", so its glob is "/db/cpu/**/*.parquet" and there is
+	// nothing before the leading separator for `(.+)` to consume. That failed to
+	// match, and a glob that does not parse is a glob that never gets pruned.
+	storagePathPattern = regexp.MustCompile(`(.*)/([^/]+)/([^/]+)/\*\*/\*\.parquet$`)
 )
 
 // GlobCacheTTL is the default TTL for glob result caching (30 seconds)
@@ -600,6 +605,25 @@ func (p *PartitionPruner) GeneratePartitionPaths(ctx context.Context, basePath, 
 		return nil
 	}
 
+	// Validate here as well as at storage.GetStoragePath, because this is a
+	// genuinely separate entry point rather than a second check on the same
+	// value (#746). Whenever pruning fires, GetStoragePath's glob is DISCARDED:
+	// OptimizeTablePath parses it back into (basePath, database, measurement)
+	// and the loop below re-concatenates the string DuckDB actually reads. So
+	// the segments arriving here have been through a regex round-trip, and
+	// PruneTierPaths passes them in from extractDBMeasurementFromPath, which
+	// has its own take-the-last-two-components fallback. Returning nil makes
+	// the caller fall back to the unpruned glob, which is the same safe
+	// behaviour as exceeding the path cap below.
+	if storage.ValidateKeySegment(database) != nil || storage.ValidateGlobSafe(database) != nil ||
+		storage.ValidateKeySegment(measurement) != nil || storage.ValidateGlobSafe(measurement) != nil {
+		p.logger.Warn().
+			Str("database", database).
+			Str("measurement", measurement).
+			Msg("Not generating partition paths for names that are not usable path segments")
+		return nil
+	}
+
 	// Detect if this is a remote path (S3/Azure) - use string concatenation instead of filepath.Join
 	// because filepath.Join will mangle URLs like s3://bucket to s3:/bucket
 	isRemote := strings.HasPrefix(basePath, "s3://") || strings.HasPrefix(basePath, "azure://")
@@ -760,7 +784,7 @@ func (p *PartitionPruner) OptimizeTablePath(ctx context.Context, originalPath, s
 	}
 
 	// Filter out non-existent paths (works for both local and S3/Azure storage)
-	partitionPaths = p.filterExistingPaths(partitionPaths)
+	partitionPaths = p.filterExistingPaths(partitionPaths, basePath)
 	if len(partitionPaths) == 0 {
 		p.logger.Info().Msg("No data exists for time range, using fallback")
 		p.partitionCache.set(cacheKey, originalPath, false)
@@ -838,7 +862,7 @@ func parseDateTime(timeStr string) (time.Time, error) {
 // filterExistingPaths filters out paths that don't have any matching files
 // Uses a TTL cache to avoid repeated expensive filesystem operations
 // Handles both local and remote (S3/Azure) paths
-func (p *PartitionPruner) filterExistingPaths(paths []string) []string {
+func (p *PartitionPruner) filterExistingPaths(paths []string, basePath string) []string {
 	if len(paths) == 0 {
 		return paths
 	}
@@ -846,7 +870,7 @@ func (p *PartitionPruner) filterExistingPaths(paths []string) []string {
 	// Check if this is remote storage (S3/Azure)
 	firstPath := paths[0]
 	if strings.HasPrefix(firstPath, "s3://") || strings.HasPrefix(firstPath, "azure://") {
-		return p.filterExistingRemotePaths(paths)
+		return p.filterExistingRemotePaths(paths, basePath)
 	}
 
 	// Local path filtering using filepath.Glob
@@ -893,8 +917,12 @@ func (p *PartitionPruner) filterExistingLocalPaths(paths []string) []string {
 	return existingPaths
 }
 
-// filterExistingRemotePaths filters S3/Azure paths by checking which directories exist
-func (p *PartitionPruner) filterExistingRemotePaths(paths []string) []string {
+// filterExistingRemotePaths filters S3/Azure paths by checking which directories exist.
+//
+// basePath is the storage root the paths were generated against
+// ("s3://bucket/prefix"), and is what turns a full URL back into the
+// backend-relative key a listing needs. See extractStoragePrefix.
+func (p *PartitionPruner) filterExistingRemotePaths(paths []string, basePath string) []string {
 	if p.storage == nil {
 		// No storage backend configured - return all paths and let DuckDB handle errors
 		p.logger.Debug().Msg("No storage backend configured, skipping remote path filtering")
@@ -960,7 +988,15 @@ func (p *PartitionPruner) filterExistingRemotePaths(paths []string) []string {
 		}
 
 		// Cache miss - call ListDirectories once for this parent
-		storagePrefix := p.extractStoragePrefix(parentDir)
+		storagePrefix, ok := p.extractStoragePrefix(parentDir, basePath)
+		if !ok {
+			// Listing with an unresolvable prefix would scan the wrong key
+			// space (or, with "", the entire bucket) and report every child
+			// absent. Assume all exist, the same fail-open the listing-error
+			// branch below takes.
+			parentChildren[parentDir] = nil
+			continue
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		subdirs, err := lister.ListDirectories(ctx, storagePrefix)
 		cancel()
@@ -1017,7 +1053,12 @@ func (p *PartitionPruner) filterExistingRemotePaths(paths []string) []string {
 		// For day-level paths (5 segments: db/measurement/year/month/day),
 		// verify .parquet files exist directly at that level (not in subdirs).
 		// This prevents "No files found" errors when daily compaction hasn't run yet.
-		prefix := p.extractStoragePrefix(dir + "/")
+		prefix, ok := p.extractStoragePrefix(dir+"/", basePath)
+		if !ok {
+			// Cannot resolve: keep the path rather than judging it empty.
+			existingPaths = append(existingPaths, path)
+			continue
+		}
 		if parts := strings.Split(strings.Trim(prefix, "/"), "/"); len(parts) == 5 {
 			// Check cache first for day-level file existence
 			cacheKey := "remote:dayfiles:" + prefix
@@ -1064,24 +1105,47 @@ func (p *PartitionPruner) filterExistingRemotePaths(paths []string) []string {
 	return existingPaths
 }
 
-// extractStoragePrefix converts an S3/Azure URL to a storage prefix
-// e.g., s3://bucket/db/measurement/2025/ -> db/measurement/2025/
-func (p *PartitionPruner) extractStoragePrefix(url string) string {
-	// Remove protocol prefix
-	if strings.HasPrefix(url, "s3://") {
-		url = strings.TrimPrefix(url, "s3://")
-		// Remove bucket name (first path component)
-		if idx := strings.Index(url, "/"); idx != -1 {
-			return url[idx+1:]
-		}
-	} else if strings.HasPrefix(url, "azure://") {
-		url = strings.TrimPrefix(url, "azure://")
-		// Remove container name (first path component)
-		if idx := strings.Index(url, "/"); idx != -1 {
-			return url[idx+1:]
-		}
+// extractStoragePrefix converts a full S3/Azure URL into the backend-relative
+// prefix a listing call needs, given the storage root those URLs were built
+// against.
+//
+// It trims basePath rather than just the scheme and bucket, and that is the fix
+// (#746). A backend configured with storage.s3_prefix = "tenant" has a root of
+// "s3://bucket/tenant", and List/ListDirectories prepend "tenant/" themselves.
+// Stripping only "s3://bucket/" left the prefix attached, so the listing ran
+// against "tenant/tenant/..." and came back EMPTY WITH NO ERROR. Every
+// partition was then judged absent, filterExistingPaths returned nothing, and
+// OptimizeTablePath fell back to the unpruned glob: single-tier partition
+// pruning was silently dead on every prefixed-S3 deployment. Results stayed
+// correct, cost did not.
+//
+// tier_pruning.go documents this exact hazard and filterTierRemotePaths already
+// avoids it the same way, by trimming the tier's own root URL. Only the
+// single-tier path was left doing scheme-and-bucket surgery.
+//
+// Deriving the root from the caller rather than from the backend's concrete
+// type is deliberate: the tiered path filters against a DIFFERENT backend than
+// p.storage, and a root parsed from the glob is correct for any backend,
+// including ones that only implement the interface.
+func (p *PartitionPruner) extractStoragePrefix(url, basePath string) (string, bool) {
+	root := strings.TrimSuffix(basePath, "/") + "/"
+	if rel, ok := strings.CutPrefix(url, root); ok {
+		return rel, true
 	}
-	return url
+	// Not under the root we were given. Every path reaching here is built as
+	// basePath + "/" + ... by GeneratePartitionPaths, so this is unreachable
+	// from the only caller and means the glob and the generated paths have
+	// diverged.
+	//
+	// Returning a scheme-and-bucket-stripped prefix here, which is what this
+	// did before #746, would be the WORST answer available: the backend
+	// re-prefixes it, so the listing would run against some other key space and
+	// confidently report every partition absent. Return "" instead, which the
+	// caller treats as "cannot verify" and falls back to the unpruned glob.
+	// That is what filterTierRemotePaths already does for the same situation.
+	p.logger.Warn().Str("url", url).Str("base_path", basePath).
+		Msg("Partition path is not under the storage root it was generated from; skipping existence filtering")
+	return "", false
 }
 
 // InvalidateGlobCache clears the glob cache

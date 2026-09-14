@@ -15,6 +15,7 @@ import (
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/license"
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	_ "github.com/mattn/go-sqlite3"
@@ -84,14 +85,39 @@ type ExecuteRetentionRequest struct {
 
 // ExecuteRetentionResponse represents the result of executing a policy
 type ExecuteRetentionResponse struct {
-	PolicyID             int64    `json:"policy_id"`
-	PolicyName           string   `json:"policy_name"`
-	DeletedCount         int64    `json:"deleted_count"`
-	FilesDeleted         int      `json:"files_deleted"`
+	PolicyID     int64  `json:"policy_id"`
+	PolicyName   string `json:"policy_name"`
+	DeletedCount int64  `json:"deleted_count"`
+	FilesDeleted int    `json:"files_deleted"`
+	// SkippedFiles counts files whose stored key could not be resolved to a
+	// readable path, so they were neither examined nor deleted and never will
+	// be. Omitted when zero, which is every healthy deployment.
+	SkippedFiles         int      `json:"skipped_files,omitempty"`
+	SkippedReason        string   `json:"skipped_reason,omitempty"`
 	ExecutionTimeMs      float64  `json:"execution_time_ms"`
 	DryRun               bool     `json:"dry_run"`
 	CutoffDate           string   `json:"cutoff_date"`
 	AffectedMeasurements []string `json:"affected_measurements"`
+}
+
+const retentionSkippedReason = "unaddressable storage files cannot be read or deleted"
+const retentionUnusableSampleCap = 32
+
+type unusableSample struct {
+	key string
+	err error
+}
+
+type unusableByMeasurement struct {
+	counts       map[string]int
+	samples      map[string][]unusableSample
+	orphans      int
+	orphanSample []unusableSample
+}
+
+type retentionDiscovery struct {
+	measurements []string
+	unusable     unusableByMeasurement
 }
 
 // RetentionExecution represents an execution history record
@@ -153,7 +179,51 @@ func NewRetentionHandler(storage storage.Backend, duckdb *database.DuckDB, cfg *
 		return nil, fmt.Errorf("failed to initialize retention tables: %w", err)
 	}
 
+	h.warnUnusablePolicies()
+
 	return h, nil
+}
+
+// warnUnusablePolicies reports stored policies whose database or measurement
+// name cannot form a storage prefix (#741).
+//
+// Create and update validate both fields now, but rows written before that do
+// not disappear, and the scheduler replays them forever. Without this the only
+// signal is a listing error buried in a scheduled run hours later, attributed
+// to storage rather than to the policy.
+func (h *RetentionHandler) warnUnusablePolicies() {
+	// Inactive rows are included: a disabled policy with a broken name is one
+	// toggle away from failing, and the point is to report it before then.
+	rows, err := h.db.Query(`SELECT name, database, measurement FROM retention_policies`)
+	if err != nil {
+		h.logger.Warn().Err(err).Msg("Could not check stored retention policies against the current name rules")
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var name, database string
+		var measurement sql.NullString
+		if err := rows.Scan(&name, &database, &measurement); err != nil {
+			// Skip the row rather than returning: one unreadable row must not
+			// hide every offender after it.
+			h.logger.Warn().Err(err).Msg("Could not read a stored retention policy")
+			continue
+		}
+		// Both fields are reported, not just the first: a policy can be broken
+		// in both and fixing one would leave it still failing.
+		if !isSafeStoragePathSegment(database) {
+			h.logger.Warn().Str("policy", name).Str("database", database).
+				Msg("Retention policy has an unusable database name and will fail every run; update or delete it")
+		}
+		if measurement.Valid && measurement.String != "" && !isSafeStoragePathSegment(measurement.String) {
+			h.logger.Warn().Str("policy", name).Str("measurement", measurement.String).
+				Msg("Retention policy has an unusable measurement name and will fail every run; update or delete it")
+		}
+	}
+	if err := rows.Err(); err != nil {
+		h.logger.Warn().Err(err).Msg("Could not finish checking stored retention policies")
+	}
 }
 
 // SetCoordinator wires the cluster coordinator for manifest updates.
@@ -260,6 +330,20 @@ func (h *RetentionHandler) handleCreate(c *fiber.Ctx) error {
 	if req.Database == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "database is required"})
 	}
+	// Both fields are concatenated into a storage prefix by
+	// getMeasurementsToProcess and deleteOldFiles, and the row is replayed by
+	// the scheduler forever, so an unvalidated one is a policy that fails on
+	// every run long after the request that created it (#741).
+	if !isSafeStoragePathSegment(req.Database) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("invalid database name %q: may not be empty, contain a separator, or start with a dot", req.Database),
+		})
+	}
+	if req.Measurement != nil && *req.Measurement != "" && !isSafeStoragePathSegment(*req.Measurement) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("invalid measurement name %q: may not contain a separator or start with a dot", *req.Measurement),
+		})
+	}
 	if req.RetentionDays <= 0 {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "retention_days must be greater than 0"})
 	}
@@ -341,10 +425,21 @@ func (h *RetentionHandler) handleUpdate(c *fiber.Ctx) error {
 		})
 	}
 
-	// Validate
+	// Validate. Update writes both name fields verbatim, so it can put a row
+	// into exactly the state create now refuses (#741).
 	if req.RetentionDays <= req.BufferDays {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "retention_days must be greater than buffer_days",
+		})
+	}
+	if !isSafeStoragePathSegment(req.Database) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("invalid database name %q: may not be empty, contain a separator, or start with a dot", req.Database),
+		})
+	}
+	if req.Measurement != nil && *req.Measurement != "" && !isSafeStoragePathSegment(*req.Measurement) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("invalid measurement name %q: may not contain a separator or start with a dot", *req.Measurement),
 		})
 	}
 
@@ -431,10 +526,11 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 		Msg("Executing scheduled retention policy")
 
 	// Get measurements to process
-	measurements, err := h.getMeasurementsToProcess(ctx, policy)
+	discovery, err := h.getMeasurementsToProcess(ctx, policy)
 	if err != nil {
 		return nil, fmt.Errorf("failed to discover measurements: %w", err)
 	}
+	measurements := discovery.measurements
 
 	h.logger.Info().Strs("measurements", measurements).Msg("Processing measurements")
 
@@ -444,13 +540,16 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 	// Execute retention for each measurement
 	var totalDeleted int64
 	var totalFilesDeleted int
+	var totalSkipped int
 
 	for _, measurement := range measurements {
-		deleted, filesDeleted, err := h.deleteOldFiles(ctx, policy.Database, measurement, cutoffDate, false, fmt.Sprintf("retention:%d", policyID))
+		deleted, filesDeleted, skipped, err := h.deleteOldFiles(ctx, policy.Database, measurement, cutoffDate, false, fmt.Sprintf("retention:%d", policyID))
 		// Accumulate before error check: deleteOldFiles returns partial progress
 		// on abort so the execution record reflects all completed work accurately.
 		totalDeleted += deleted
 		totalFilesDeleted += filesDeleted
+		totalSkipped += skipped
+		totalSkipped += discovery.unusable.counts[measurement]
 		if err != nil {
 			h.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to process measurement")
 			// Abort on any error — manifest failures are non-transient (Raft quorum loss)
@@ -461,6 +560,7 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 			return nil, fmt.Errorf("retention aborted for policy %d: %w", policyID, err)
 		}
 	}
+	totalSkipped += discovery.unusable.orphans
 
 	// Clear DuckDB parquet metadata/data cache and release memory back to OS.
 	h.duckdb.ClearHTTPCache()
@@ -468,9 +568,20 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 
 	executionTime := float64(time.Since(start).Milliseconds())
 
-	// Record execution completion
+	// Record execution completion. A run that could not resolve some files did
+	// not do what the policy asks, so it must not be recorded as a clean
+	// "completed": the whole failure mode #746 fixed was retention reporting
+	// success while deleting nothing.
 	if executionID > 0 {
-		h.recordExecutionComplete(executionID, "completed", totalDeleted, executionTime, "")
+		status, detail := "completed", ""
+		if totalSkipped > 0 {
+			status = "completed_with_errors"
+			detail = fmt.Sprintf("%d %s; see the log for the keys", totalSkipped, retentionSkippedReason)
+			h.logger.Error().Int("skipped_files", totalSkipped).Str("database", policy.Database).
+				Strs("sample", formatUnusableSamples(discovery.unusable)).
+				Msg("Retention could not resolve some files; their data will never age out")
+		}
+		h.recordExecutionComplete(executionID, status, totalDeleted, executionTime, detail)
 	}
 
 	h.logger.Info().
@@ -484,6 +595,8 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 		PolicyName:           policy.Name,
 		DeletedCount:         totalDeleted,
 		FilesDeleted:         totalFilesDeleted,
+		SkippedFiles:         totalSkipped,
+		SkippedReason:        skippedReason(totalSkipped),
 		ExecutionTimeMs:      executionTime,
 		DryRun:               false,
 		CutoffDate:           cutoffDate.Format(time.RFC3339),
@@ -584,12 +697,13 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 		Msg("Executing retention policy")
 
 	// Get measurements to process
-	measurements, err := h.getMeasurementsToProcess(c.Context(), policy)
+	discovery, err := h.getMeasurementsToProcess(c.Context(), policy)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to discover measurements: " + err.Error(),
 		})
 	}
+	measurements := discovery.measurements
 
 	h.logger.Info().Strs("measurements", measurements).Msg("Processing measurements")
 
@@ -602,9 +716,12 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 	// Execute retention for each measurement
 	var totalDeleted int64
 	var totalFilesDeleted int
+	var totalSkipped int
 
 	for _, measurement := range measurements {
-		deleted, filesDeleted, err := h.deleteOldFiles(c.Context(), policy.Database, measurement, cutoffDate, req.DryRun, fmt.Sprintf("retention:%d", policyID))
+		deleted, filesDeleted, skipped, err := h.deleteOldFiles(c.Context(), policy.Database, measurement, cutoffDate, req.DryRun, fmt.Sprintf("retention:%d", policyID))
+		totalSkipped += skipped
+		totalSkipped += discovery.unusable.counts[measurement]
 		totalDeleted += deleted
 		totalFilesDeleted += filesDeleted
 		if err != nil {
@@ -617,6 +734,7 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 			})
 		}
 	}
+	totalSkipped += discovery.unusable.orphans
 
 	// Clear DuckDB parquet metadata/data cache — dry runs also populate the cache via
 	// read_parquet calls in getFileMaxTimeAndRowCount, so always clear regardless of dry run.
@@ -625,14 +743,27 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 
 	executionTime := float64(time.Since(start).Milliseconds())
 
-	// Record execution completion
+	// Record execution completion. See runPolicy: a run that could not resolve
+	// some files is not a clean "completed".
+	var skipDetail string
+	if totalSkipped > 0 {
+		skipDetail = fmt.Sprintf("%d %s; see the log for the keys", totalSkipped, retentionSkippedReason)
+		h.logger.Error().Int("skipped_files", totalSkipped).Str("database", policy.Database).
+			Strs("sample", formatUnusableSamples(discovery.unusable)).
+			Msg("Retention could not resolve some files; their data will never age out")
+	}
 	if !req.DryRun && executionID > 0 {
-		h.recordExecutionComplete(executionID, "completed", totalDeleted, executionTime, "")
+		status := "completed"
+		if totalSkipped > 0 {
+			status = "completed_with_errors"
+		}
+		h.recordExecutionComplete(executionID, status, totalDeleted, executionTime, skipDetail)
 	}
 
 	h.logger.Info().
 		Int64("deleted_count", totalDeleted).
 		Int("files_deleted", totalFilesDeleted).
+		Int("skipped_files", totalSkipped).
 		Float64("execution_time_ms", executionTime).
 		Msg("Retention policy execution completed")
 
@@ -641,6 +772,8 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 		PolicyName:           policy.Name,
 		DeletedCount:         totalDeleted,
 		FilesDeleted:         totalFilesDeleted,
+		SkippedFiles:         totalSkipped,
+		SkippedReason:        skipDetail,
 		ExecutionTimeMs:      executionTime,
 		DryRun:               req.DryRun,
 		CutoffDate:           cutoffDate.Format(time.RFC3339),
@@ -753,28 +886,70 @@ func (h *RetentionHandler) getPolicies() ([]RetentionPolicy, error) {
 
 // getMeasurementsToProcess gets measurements for a policy
 // Supports all storage backends: local, S3, and Azure
-func (h *RetentionHandler) getMeasurementsToProcess(ctx context.Context, policy *RetentionPolicy) ([]string, error) {
-	if policy.Measurement != nil && *policy.Measurement != "" {
-		return []string{*policy.Measurement}, nil
+func (h *RetentionHandler) getMeasurementsToProcess(ctx context.Context, policy *RetentionPolicy) (retentionDiscovery, error) {
+	prefix := policy.Database + "/"
+	pinned := policy.Measurement != nil && *policy.Measurement != ""
+	if pinned {
+		prefix += *policy.Measurement + "/"
 	}
 
-	// Get all measurements in database by listing storage with database prefix
-	prefix := policy.Database + "/"
 	files, err := h.storage.List(ctx, prefix)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list files: %w", err)
+		return retentionDiscovery{}, fmt.Errorf("failed to list files: %w", err)
 	}
 
-	// Extract unique measurement names from file paths
-	// Files are stored as: database/measurement/YYYY/MM/DD/HH/file.parquet
 	measurementSet := make(map[string]struct{})
+	if pinned {
+		measurementSet[*policy.Measurement] = struct{}{}
+	}
 	for _, f := range files {
-		// Remove database prefix
 		relPath := strings.TrimPrefix(f, prefix)
-		// Get first path component (measurement name)
-		parts := strings.SplitN(relPath, "/", 2)
-		if len(parts) > 0 && parts[0] != "" && !strings.HasPrefix(parts[0], ".") {
-			measurementSet[parts[0]] = struct{}{}
+		if !pinned {
+			parts := strings.SplitN(relPath, "/", 2)
+			if len(parts) > 0 && parts[0] != "" && !strings.HasPrefix(parts[0], ".") {
+				measurementSet[parts[0]] = struct{}{}
+			}
+		}
+	}
+
+	accounting := unusableByMeasurement{
+		counts:  make(map[string]int),
+		samples: make(map[string][]unusableSample),
+	}
+	if lister, ok := h.storage.(storage.UnusableLister); ok {
+		unusable, err := lister.ListUnusable(ctx, prefix)
+		if err != nil {
+			h.logger.Warn().Err(err).Str("prefix", prefix).
+				Msg("Could not list unusable files during retention measurement discovery")
+		} else {
+			for _, f := range unusable {
+				if !strings.HasSuffix(strings.ToLower(f.Path), ".parquet") {
+					continue
+				}
+				measurement := ""
+				if pinned {
+					measurement = *policy.Measurement
+				}
+				if !pinned {
+					relPath := strings.TrimPrefix(f.Path, prefix)
+					parts := strings.SplitN(relPath, "/", 2)
+					if len(parts) == 0 || parts[0] == "" ||
+						strings.HasPrefix(parts[0], ".") ||
+						storage.ValidateKeySegment(parts[0]) != nil {
+						accounting.orphans++
+						if len(accounting.orphanSample) < retentionUnusableSampleCap {
+							accounting.orphanSample = append(accounting.orphanSample, unusableSample{key: f.Path, err: f.Err})
+						}
+						continue
+					}
+					measurement = parts[0]
+				}
+				measurementSet[measurement] = struct{}{}
+				accounting.counts[measurement]++
+				if len(accounting.samples[measurement]) < retentionUnusableSampleCap {
+					accounting.samples[measurement] = append(accounting.samples[measurement], unusableSample{key: f.Path, err: f.Err})
+				}
+			}
 		}
 	}
 
@@ -783,18 +958,47 @@ func (h *RetentionHandler) getMeasurementsToProcess(ctx context.Context, policy 
 		measurements = append(measurements, m)
 	}
 
-	return measurements, nil
+	return retentionDiscovery{measurements: measurements, unusable: accounting}, nil
+}
+
+func formatUnusableSamples(accounting unusableByMeasurement) []string {
+	samples := make([]string, 0, retentionUnusableSampleCap)
+	appendSample := func(sample unusableSample) {
+		if len(samples) == retentionUnusableSampleCap {
+			return
+		}
+		samples = append(samples, fmt.Sprintf("%s: %v", sample.key, sample.err))
+	}
+	for _, measurementSamples := range accounting.samples {
+		for _, sample := range measurementSamples {
+			appendSample(sample)
+		}
+	}
+	for _, sample := range accounting.orphanSample {
+		appendSample(sample)
+	}
+	return samples
 }
 
 // deleteOldFiles deletes Parquet files where ALL rows are older than cutoffDate
 // Supports all storage backends: local, S3, and Azure
-func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measurement string, cutoffDate time.Time, dryRun bool, reason string) (int64, int, error) {
+// deleteOldFiles removes files older than cutoffDate for one measurement.
+//
+// The third return is the number of files that had to be skipped because their
+// stored key cannot be resolved to a readable path. It is reported separately
+// from an error because the rest of the measurement still processed correctly,
+// and separately from "deleted nothing" because a skip is permanent: the caller
+// surfaces it so a policy that can never fully apply does not keep recording
+// clean runs.
+func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measurement string, cutoffDate time.Time, dryRun bool, reason string) (int64, int, int, error) {
 	// List all files for this measurement using storage backend
 	prefix := database + "/" + measurement + "/"
 	files, err := h.storage.List(ctx, prefix)
 	if err != nil {
-		return 0, 0, fmt.Errorf("failed to list files: %w", err)
+		return 0, 0, 0, fmt.Errorf("failed to list files: %w", err)
 	}
+
+	var skipped int
 
 	// Filter to only parquet files
 	var parquetFiles []string
@@ -812,7 +1016,17 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 	var eligibleRows []int64   // row counts parallel to eligiblePaths
 
 	for _, relativePath := range parquetFiles {
-		fullPath := h.buildParquetPath(relativePath)
+		fullPath, err := readParquetPath(h.storage, relativePath)
+		if err != nil {
+			// Counted, not just logged. A file that can never be resolved is
+			// skipped on every future run too, so its data never ages out; if
+			// only a Warn recorded that, the policy would keep reporting
+			// "completed, 0 deleted" forever, which is precisely the shape of
+			// the bug this function was fixed for (#746).
+			skipped++
+			h.logger.Warn().Err(err).Str("file", relativePath).Msg("Unusable storage path; file can never be processed by retention")
+			continue
+		}
 
 		maxTime, rowCount, err := h.getFileMaxTimeAndRowCount(ctx, fullPath)
 		if err != nil {
@@ -839,7 +1053,7 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 	}
 
 	if dryRun || len(eligiblePaths) == 0 {
-		return deletedRows, deletedFiles, nil
+		return deletedRows, deletedFiles, skipped, nil
 	}
 
 	// Process in chunks of 1000: update manifest first, then delete from storage.
@@ -888,7 +1102,7 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 					if len(deletedFilePaths) > 0 {
 						h.cleanupEmptyDirectories(ctx, deletedFilePaths)
 					}
-					return deletedRows, deletedFiles, fmt.Errorf("failed to update cluster manifest: %w", err)
+					return deletedRows, deletedFiles, skipped, fmt.Errorf("failed to update cluster manifest: %w", err)
 				}
 			}
 		}
@@ -910,7 +1124,35 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 		h.cleanupEmptyDirectories(ctx, deletedFilePaths)
 	}
 
-	return deletedRows, deletedFiles, nil
+	return deletedRows, deletedFiles, skipped, nil
+}
+
+func skippedReason(skipped int) string {
+	if skipped == 0 {
+		return ""
+	}
+	return retentionSkippedReason
+}
+
+// readParquetPath resolves a storage key to a path that can be interpolated
+// into DuckDB's read_parquet().
+//
+// Two rules, and they are separate on purpose. storage.ObjectURI applies the
+// key contract, which is what makes the URI name the object the backend
+// actually wrote (the prefix bug in #746). ValidateGlobSafe is applied HERE
+// rather than inside ObjectURI because it is a property of this sink: DuckDB
+// treats "*", "?", "[" and "{" in a path as pattern operators, so one file's
+// key would silently expand to many, while the same key handed to a literal
+// reader such as iceberg-go or os.Open is fine.
+func readParquetPath(backend storage.Backend, key string) (string, error) {
+	uri, err := storage.ObjectURI(backend, key)
+	if err != nil {
+		return "", err
+	}
+	if err := storage.ValidateGlobSafe(uri); err != nil {
+		return "", err
+	}
+	return uri, nil
 }
 
 // getFileMaxTimeAndRowCount reads a Parquet file to get max time and row count
@@ -918,10 +1160,7 @@ func (h *RetentionHandler) getFileMaxTimeAndRowCount(ctx context.Context, filePa
 	// Use the shared DuckDB connection to avoid memory retention from temporary connections
 	db := h.duckdb.DB()
 
-	// read_parquet() does not support parameterized queries, so escape single
-	// quotes in the path to prevent SQL injection via crafted file paths.
-	safePath := strings.ReplaceAll(filePath, "'", "''")
-	query := fmt.Sprintf("SELECT MAX(time) as max_time, COUNT(*) as cnt FROM read_parquet('%s')", safePath)
+	query := fmt.Sprintf("SELECT MAX(time) as max_time, COUNT(*) as cnt FROM read_parquet(%s)", sqlutil.QuoteStringLiteral(filePath))
 	row := db.QueryRowContext(ctx, query)
 
 	var maxTime time.Time
@@ -956,21 +1195,6 @@ func (h *RetentionHandler) recordExecutionComplete(executionID int64, status str
 	`, status, deletedCount, durationMs, errorMessage, executionID)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to record execution complete")
-	}
-}
-
-// buildParquetPath returns the full path for DuckDB to read a parquet file
-// based on the storage backend type
-func (h *RetentionHandler) buildParquetPath(relativePath string) string {
-	switch b := h.storage.(type) {
-	case *storage.S3Backend:
-		return "s3://" + b.GetBucket() + "/" + relativePath
-	case *storage.AzureBlobBackend:
-		return "azure://" + b.GetContainer() + "/" + relativePath
-	case *storage.LocalBackend:
-		return filepath.Join(b.GetBasePath(), relativePath)
-	default:
-		return relativePath
 	}
 }
 

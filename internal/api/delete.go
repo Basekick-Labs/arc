@@ -44,12 +44,6 @@ var errManifestFailure = errors.New("cluster manifest update failed")
 // Matches compaction's row group size to limit DuckDB's internal write buffer per group.
 const parquetRowGroupSize = 122880
 
-// escapeDuckDBPath escapes single quotes in a path for safe interpolation into
-// DuckDB read_parquet() calls, which do not support parameterized queries.
-func escapeDuckDBPath(path string) string {
-	return strings.ReplaceAll(path, "'", "''")
-}
-
 // fileMetadata returns the byte size and hex-encoded SHA-256 of the file at path.
 func fileMetadata(path string) (sizeBytes int64, sha256hex string, err error) {
 	f, err := os.Open(path)
@@ -259,15 +253,26 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 
-	// Reject path traversal in database/measurement names — these values are
-	// concatenated directly into storage prefixes and DuckDB paths.
-	if strings.ContainsAny(req.Database, "/\\") || strings.Contains(req.Database, "..") {
+	// These values are concatenated into storage prefixes and DuckDB paths, so
+	// they must be usable as one path segment. isSafeStoragePathSegment is the
+	// same rule the database endpoints apply, rather than a fourth local
+	// spelling of it (#746): the previous check here rejected any ".."
+	// SUBSTRING, so it refused "a..b", which every other layer accepts and
+	// which names exactly one directory. That is the raw-substring shape #737
+	// and #741 were each fixed for.
+	//
+	// ValidateGlobSafe is applied alongside it because these names end up in a
+	// DuckDB read_parquet() path, where "*" and friends are pattern operators
+	// rather than characters. Without it the request is accepted here and dies
+	// several layers down at path resolution, and the query endpoints reject
+	// the same name cleanly: one name, two verdicts at two depths.
+	if !isSafeStoragePathSegment(req.Database) || storage.ValidateGlobSafe(req.Database) != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{
 			Success: false,
 			Error:   "database name contains invalid characters",
 		})
 	}
-	if strings.ContainsAny(req.Measurement, "/\\") || strings.Contains(req.Measurement, "..") {
+	if !isSafeStoragePathSegment(req.Measurement) || storage.ValidateGlobSafe(req.Measurement) != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{
 			Success: false,
 			Error:   "measurement name contains invalid characters",
@@ -545,12 +550,20 @@ func (h *DeleteHandler) findAffectedFiles(ctx context.Context, database, measure
 	// Filter for parquet files and convert to query paths
 	var parquetFiles []fileInfo
 	for _, f := range files {
-		if strings.HasSuffix(strings.ToLower(f), ".parquet") {
-			parquetFiles = append(parquetFiles, fileInfo{
-				queryPath:    h.getQueryPath(f),
-				relativePath: f,
-			})
+		if !strings.HasSuffix(strings.ToLower(f), ".parquet") {
+			continue
 		}
+		queryPath, err := readParquetPath(h.storage, f)
+		if err != nil {
+			// A delete must not silently leave matching rows behind, so an
+			// unusable key aborts rather than being skipped: the caller reports
+			// how many rows it removed, and skipping would make that a lie.
+			return nil, fmt.Errorf("listed file %q has no usable storage path: %w", f, err)
+		}
+		parquetFiles = append(parquetFiles, fileInfo{
+			queryPath:    queryPath,
+			relativePath: f,
+		})
 	}
 
 	if len(parquetFiles) == 0 {
@@ -593,9 +606,7 @@ func (h *DeleteHandler) countMatchingRowsInFiles(ctx context.Context, files []fi
 		if i > 0 {
 			pathList.WriteString(", ")
 		}
-		pathList.WriteString("'")
-		pathList.WriteString(escapeDuckDBPath(f.queryPath))
-		pathList.WriteString("'")
+		pathList.WriteString(sqlutil.QuoteStringLiteral(f.queryPath))
 	}
 	pathList.WriteString("]")
 
@@ -665,7 +676,7 @@ func (h *DeleteHandler) countMatchingRowsIndividually(ctx context.Context, files
 	db := h.db.DB()
 
 	for _, f := range files {
-		query := fmt.Sprintf("SELECT COUNT(*) FROM read_parquet('%s') WHERE %s", escapeDuckDBPath(f.queryPath), whereClause)
+		query := fmt.Sprintf("SELECT COUNT(*) FROM read_parquet(%s) WHERE %s", sqlutil.QuoteStringLiteral(f.queryPath), whereClause)
 		var count int64
 		if err := db.QueryRowContext(ctx, query).Scan(&count); err != nil {
 			h.logger.Warn().Err(err).Str("file", f.relativePath).Msg("Failed to count matching rows, skipping file")
@@ -699,8 +710,8 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 		SELECT
 			COUNT(*) as total,
 			COUNT(*) FILTER (WHERE NOT (%s)) as remaining
-		FROM read_parquet('%s')`,
-		whereClause, escapeDuckDBPath(queryPath))
+		FROM read_parquet(%s)`,
+		whereClause, sqlutil.QuoteStringLiteral(queryPath))
 
 	if err := db.QueryRowContext(ctx, countQuery).Scan(&rowsBefore, &rowsAfter); err != nil {
 		return 0, fmt.Errorf("failed to count rows: %w", err)
@@ -782,13 +793,13 @@ func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, _, where
 	// database-wide setting is false.
 	copyQuery := fmt.Sprintf(`
 		COPY (
-			SELECT * FROM read_parquet('%s') WHERE NOT (%s)
-		) TO '%s' (
+			SELECT * FROM read_parquet(%s) WHERE NOT (%s)
+		) TO %s (
 			FORMAT PARQUET,
 			COMPRESSION ZSTD,
 			COMPRESSION_LEVEL 3,
 			ROW_GROUP_SIZE %d
-		)`, escapeDuckDBPath(filePath), whereClause, escapeDuckDBPath(tempFile), parquetRowGroupSize)
+		)`, sqlutil.QuoteStringLiteral(filePath), whereClause, sqlutil.QuoteStringLiteral(tempFile), parquetRowGroupSize)
 
 	if err := database.ExecPreservingInsertionOrder(ctx, db, copyQuery); err != nil {
 		os.Remove(tempFile)
@@ -858,13 +869,13 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 	// database-wide setting is false.
 	copyQuery := fmt.Sprintf(`
 		COPY (
-			SELECT * FROM read_parquet('%s') WHERE NOT (%s)
-		) TO '%s' (
+			SELECT * FROM read_parquet(%s) WHERE NOT (%s)
+		) TO %s (
 			FORMAT PARQUET,
 			COMPRESSION ZSTD,
 			COMPRESSION_LEVEL 3,
 			ROW_GROUP_SIZE %d
-		)`, escapeDuckDBPath(s3Path), whereClause, escapeDuckDBPath(tempPath), parquetRowGroupSize)
+		)`, sqlutil.QuoteStringLiteral(s3Path), whereClause, sqlutil.QuoteStringLiteral(tempPath), parquetRowGroupSize)
 
 	if err := database.ExecPreservingInsertionOrder(ctx, db, copyQuery); err != nil {
 		return 0, nil, fmt.Errorf("failed to write filtered data: %w", err)
@@ -914,20 +925,6 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 		Msg("Rewrote S3 file")
 
 	return deleted, &s3RewriteResult{sizeBytes: sizeBytes, sha256: sha256hex}, nil
-}
-
-// getQueryPath converts a storage-relative path to a DuckDB-compatible path
-func (h *DeleteHandler) getQueryPath(relativePath string) string {
-	switch backend := h.storage.(type) {
-	case *storage.LocalBackend:
-		return filepath.Join(backend.GetBasePath(), relativePath)
-	case *storage.S3Backend:
-		return fmt.Sprintf("s3://%s/%s%s", backend.GetBucket(), backend.GetPrefix(), relativePath)
-	case *storage.AzureBlobBackend:
-		return fmt.Sprintf("azure://%s/%s", backend.GetContainer(), relativePath)
-	default:
-		return relativePath
-	}
 }
 
 // isRemoteBackend returns true if the storage backend requires a remote rewrite

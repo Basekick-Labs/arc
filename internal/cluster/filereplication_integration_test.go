@@ -33,6 +33,7 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/basekick-labs/arc/internal/config"
+	"github.com/basekick-labs/arc/internal/storage"
 	hraft "github.com/hashicorp/raft"
 	"github.com/rs/zerolog"
 )
@@ -70,7 +71,17 @@ func newMemBackend() *memBackend {
 	return &memBackend{files: make(map[string][]byte)}
 }
 
+// memCheckKey mirrors the validation every production backend applies. Without
+// it this double is more permissive than local, S3 and Azure, and the
+// permanent-error branch in handleFetchFile could not be exercised at all.
+func memCheckKey(path string) error {
+	return storage.ValidateKey(path)
+}
+
 func (m *memBackend) Write(ctx context.Context, path string, data []byte) error {
+	if err := memCheckKey(path); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cp := make([]byte, len(data))
@@ -80,6 +91,9 @@ func (m *memBackend) Write(ctx context.Context, path string, data []byte) error 
 }
 
 func (m *memBackend) WriteReader(ctx context.Context, path string, reader io.Reader, size int64) error {
+	if err := memCheckKey(path); err != nil {
+		return err
+	}
 	data, err := io.ReadAll(reader)
 	if err != nil {
 		return err
@@ -91,6 +105,9 @@ func (m *memBackend) WriteReader(ctx context.Context, path string, reader io.Rea
 }
 
 func (m *memBackend) Read(ctx context.Context, path string) ([]byte, error) {
+	if err := memCheckKey(path); err != nil {
+		return nil, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	data, ok := m.files[path]
@@ -101,6 +118,9 @@ func (m *memBackend) Read(ctx context.Context, path string) ([]byte, error) {
 }
 
 func (m *memBackend) ReadTo(ctx context.Context, path string, writer io.Writer) error {
+	if err := memCheckKey(path); err != nil {
+		return err
+	}
 	data, err := m.Read(ctx, path)
 	if err != nil {
 		return err
@@ -110,15 +130,24 @@ func (m *memBackend) ReadTo(ctx context.Context, path string, writer io.Writer) 
 }
 
 func (m *memBackend) List(ctx context.Context, prefix string) ([]string, error) {
+	if err := storage.ValidateListPrefix(prefix); err != nil {
+		return nil, err
+	}
 	return nil, nil
 }
 func (m *memBackend) Delete(ctx context.Context, path string) error {
+	if err := memCheckKey(path); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.files, path)
 	return nil
 }
 func (m *memBackend) Exists(ctx context.Context, path string) (bool, error) {
+	if err := memCheckKey(path); err != nil {
+		return false, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	_, ok := m.files[path]
@@ -128,6 +157,9 @@ func (m *memBackend) Close() error       { return nil }
 func (m *memBackend) Type() string       { return "mem" }
 func (m *memBackend) ConfigJSON() string { return "{}" }
 func (m *memBackend) ReadToAt(_ context.Context, path string, w io.Writer, offset int64) error {
+	if err := memCheckKey(path); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	data, ok := m.files[path]
 	m.mu.Unlock()
@@ -141,6 +173,9 @@ func (m *memBackend) ReadToAt(_ context.Context, path string, w io.Writer, offse
 	return err
 }
 func (m *memBackend) StatFile(_ context.Context, path string) (int64, error) {
+	if err := memCheckKey(path); err != nil {
+		return -1, err
+	}
 	m.mu.Lock()
 	data, ok := m.files[path]
 	m.mu.Unlock()
@@ -150,6 +185,9 @@ func (m *memBackend) StatFile(_ context.Context, path string) (int64, error) {
 	return int64(len(data)), nil
 }
 func (m *memBackend) AppendReader(_ context.Context, path string, r io.Reader, _ int64) error {
+	if err := memCheckKey(path); err != nil {
+		return err
+	}
 	tail, err := io.ReadAll(r)
 	if err != nil {
 		return err

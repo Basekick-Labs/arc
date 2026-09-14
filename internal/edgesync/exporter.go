@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
 
@@ -154,6 +156,42 @@ func (e *Exporter) Export(ctx context.Context, dest string, limit int) (*ExportR
 	skipped := 0
 	for _, entry := range entries {
 		present, existsErr := e.writer.backend.Exists(ctx, entry.Path)
+		if errors.Is(existsErr, storage.ErrInvalidPath) {
+			// The keep-on-error rule above is about TRANSIENT errors, and this
+			// one is permanent (#747): no backend can address this key, so the
+			// copy below would fail, and a copy failure aborts the whole export
+			// rather than one entry. Nothing in this path caps attempts, so the
+			// next export re-selects the same row and aborts again, the exact
+			// wedge the comment above was written to prevent, on exactly the
+			// air-gapped box where hand-editing SQLite is not an option.
+			//
+			// Skipped is terminal here and RequeueFailed will not resurrect it,
+			// which is right rather than a gap. The only real remedy for an
+			// unusable key is renaming the object in storage, and a renamed
+			// object has a NEW key: discovery tracks it as a fresh pending row
+			// and exports it normally. The row left behind names a spelling
+			// that no longer exists, so resurrecting it would only re-wedge the
+			// export.
+			metrics.Get().IncStorageInvalidPathQuarantined()
+			if markErr := e.ledger.MarkSkipped(ctx, e.hubID, entry.Path,
+				"source key is permanently unusable by the storage backend"); markErr != nil {
+				// Cannot record the skip, so keeping it would wedge the export.
+				// Drop it from THIS bundle instead: the ledger still lists it as
+				// unexported, so the next run retries the mark rather than
+				// silently forgetting the file.
+				//
+				// Not counted into skipped: that number is reported to the
+				// operator as work the ledger now reflects, and here it does
+				// not. Same choice the vanished-file arm below makes.
+				e.logger.Error().Err(markErr).Str("path", entry.Path).
+					Msg("Could not mark a permanently unusable source skipped; excluding it from this bundle so the export can proceed")
+				continue
+			}
+			skipped++
+			e.logger.Error().Err(existsErr).Str("path", entry.Path).
+				Msg("Export source names a storage key no backend can address; marked skipped so the bundle can be written. The row is out of the export set and needs operator action")
+			continue
+		}
 		if existsErr != nil || present {
 			alive = append(alive, entry)
 			continue

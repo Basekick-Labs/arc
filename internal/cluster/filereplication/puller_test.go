@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster/raft"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
 
@@ -20,6 +21,12 @@ import (
 
 // fakeBackend is an in-memory storage.Backend used by the puller tests. Only
 // the methods the puller calls are implemented; the rest panic.
+//
+// Every key-taking method enforces storage.ValidateKey, as local, S3 and Azure
+// all do. Without it this double would be MORE PERMISSIVE than any production
+// backend: it would store and stat keys no real backend accepts, which makes
+// the permanent-error branch added for #747 dead code under test and lets a
+// puller test "pass" on a path that can only fail in production.
 type fakeBackend struct {
 	mu    sync.Mutex
 	files map[string][]byte
@@ -35,7 +42,17 @@ func newFakeBackend() *fakeBackend {
 	return &fakeBackend{files: make(map[string][]byte)}
 }
 
+// checkKey mirrors the validation every production backend applies before it
+// touches an object, so errors.Is(err, storage.ErrInvalidPath) behaves here
+// exactly as it does against a real backend.
+func checkKey(path string) error {
+	return storage.ValidateKey(path)
+}
+
 func (f *fakeBackend) Write(ctx context.Context, path string, data []byte) error {
+	if err := checkKey(path); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.writeErr != nil {
@@ -48,6 +65,9 @@ func (f *fakeBackend) Write(ctx context.Context, path string, data []byte) error
 }
 
 func (f *fakeBackend) WriteReader(ctx context.Context, path string, reader io.Reader, size int64) error {
+	if err := checkKey(path); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	writeErr := f.writeErr
 	f.mu.Unlock()
@@ -89,6 +109,9 @@ func (f *fakeBackend) WriteReader(ctx context.Context, path string, reader io.Re
 }
 
 func (f *fakeBackend) Read(ctx context.Context, path string) ([]byte, error) {
+	if err := checkKey(path); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	data, ok := f.files[path]
@@ -99,6 +122,9 @@ func (f *fakeBackend) Read(ctx context.Context, path string) ([]byte, error) {
 }
 
 func (f *fakeBackend) ReadTo(ctx context.Context, path string, writer io.Writer) error {
+	if err := checkKey(path); err != nil {
+		return err
+	}
 	// Fall back to staging file so tryResumeFromPartial can hash a partial prefix.
 	f.mu.Lock()
 	data, ok := f.files[path]
@@ -114,6 +140,9 @@ func (f *fakeBackend) ReadTo(ctx context.Context, path string, writer io.Writer)
 }
 
 func (f *fakeBackend) ReadToAt(ctx context.Context, path string, writer io.Writer, offset int64) error {
+	if err := checkKey(path); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	data, ok := f.files[path]
 	if !ok {
@@ -131,6 +160,9 @@ func (f *fakeBackend) ReadToAt(ctx context.Context, path string, writer io.Write
 }
 
 func (f *fakeBackend) StatFile(ctx context.Context, path string) (int64, error) {
+	if err := checkKey(path); err != nil {
+		return -1, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if data, ok := f.files[path]; ok {
@@ -144,6 +176,9 @@ func (f *fakeBackend) StatFile(ctx context.Context, path string) (int64, error) 
 }
 
 func (f *fakeBackend) AppendReader(ctx context.Context, path string, reader io.Reader, appendSize int64) error {
+	if err := checkKey(path); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	writeErr := f.writeErr
 	f.mu.Unlock()
@@ -169,6 +204,9 @@ func (f *fakeBackend) AppendReader(ctx context.Context, path string, reader io.R
 }
 
 func (f *fakeBackend) Delete(ctx context.Context, path string) error {
+	if err := checkKey(path); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.files, path)
@@ -182,6 +220,9 @@ func (f *fakeBackend) List(ctx context.Context, prefix string) ([]string, error)
 }
 
 func (f *fakeBackend) Exists(ctx context.Context, path string) (bool, error) {
+	if err := checkKey(path); err != nil {
+		return false, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.forceExists != nil {

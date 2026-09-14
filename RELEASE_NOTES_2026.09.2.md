@@ -73,6 +73,13 @@ OSS deployments were not exposed to a new risk.
 Full technical detail will accompany the corresponding security advisory once it
 is published. Responsibly reported by **[@rexpository](https://github.com/rexpository)**.
 
+### PREPARE and EXECUTE are rejected by the read-SQL validator ([#739](https://github.com/Basekick-Labs/arc/issues/739))
+
+`PREPARE` and `EXECUTE`, DuckDB's indirect-execution statements, are now blocked up front by the read-SQL validator on every user query endpoint. They were not exploitable before this change — the single-statement rule already rejects the two-statement chain — so this is defense-in-depth in case the statement splitter is ever relaxed. As with the other blocked keywords, a column literally named `prepare` or `execute` must be double-quoted.
+
+Contributed by [@Thundercloud12](https://github.com/Thundercloud12) in [#767](https://github.com/Basekick-Labs/arc/pull/767).
+
+
 
 ### Dependency bump: Apache Thrift 0.23.0 → 0.24.0 ([GHSA-8wv5-x4w7-5gww](https://github.com/advisories/GHSA-8wv5-x4w7-5gww))
 
@@ -207,6 +214,51 @@ the cache immediately and was never affected; only passive expiry was.
 Full technical detail will accompany the corresponding security advisory once it
 is published. Responsibly reported by **[@rexpository](https://github.com/rexpository)**.
 
+### Investigated: per-tenant scoping of the DuckDB sandbox ([#641](https://github.com/Basekick-Labs/arc/issues/641))
+
+No behaviour change in this release. Recorded here because the investigation
+settled a question that had been open since the sandbox shipped, and the answer
+constrains anything built on top of it.
+
+Arc locks DuckDB down once at startup: it sets `allowed_directories` to every
+prefix the deployment needs, then sets `enable_external_access = false`. The
+allowlist is therefore the union of all tenants' directories for the life of the
+process, so an attacker who got past the read-SQL validator would be bounded by
+the deployment, not by the database their token can read. #641 asked whether the
+allowlist could be narrowed per query to close that gap.
+
+It cannot, on the handle Arc runs queries through. Measured against DuckDB
+1.5.5: `allowed_directories` is GLOBAL-only (there is no session or connection
+scope, so two concurrent queries on one handle cannot see different allowlists),
+it is immutable once external access is off, and the lockdown is deliberately
+one-way. It also cannot be set in the connection string, and no LOCAL-scope
+setting in 1.5.5 affects file access. The only mechanism that gives two queries
+different filesystem scopes is a second DuckDB instance.
+
+Routing queries to per-scope instances was designed and rejected. The decisive
+problem is that the routing key could only come from the same SQL reference
+extractor the threat model assumes has already been defeated: a query written as
+`read_parquet('...')` yields no table references at all, so the queries the
+feature exists to contain are exactly the ones that would produce no key. The
+supporting costs were also severe, since DuckDB's thread count and memory limit
+are both per instance, and Arc's S3 and Azure credential refreshers are keyed by
+secret name in a way that would let a second instance silently stop the first
+one's refresher.
+
+`lock_configuration` was evaluated as cheap hardening in the same pass and
+rejected for a concrete reason: it blocks the `parquet_metadata_cache` toggle
+that Arc performs after every delete, compaction, and retention pass to drop
+cached metadata pointing at deleted files, and DuckDB 1.5.5 offers no
+lock-immune substitute.
+
+The full analysis, including the measurements and the enforcement point that is
+worth building instead (a Go-side assertion that every path literal in the
+rewritten SQL is one Arc emitted, tracked in
+[#764](https://github.com/Basekick-Labs/arc/issues/764)), is in
+`docs/progress/2026-09-12-duckdb-sandbox-scoping.md`. The DuckDB constraints the
+decision rests on are pinned by tests, so a future DuckDB bump that lifts one
+fails the build rather than leaving the note quietly wrong.
+
 ## Upgrade notes
 
 1. **Clustered Enterprise deployments require a coordinated restart.** The
@@ -227,7 +279,37 @@ is published. Responsibly reported by **[@rexpository](https://github.com/rexpos
    spoke fails to start until its ID is changed. See *Edge-sync spoke IDs can
    no longer collide with another spoke's namespace* below. The hub names any
    stored ID in that state at startup.
-3. **Query response envelopes gained two optional keys** (`rows_capped`,
+3. **A misconfigured `storage.s3_prefix` now stops startup instead of silently
+   using the bucket root.** If Arc previously started with a prefix containing
+   `..`, a space, or any character outside `[A-Za-z0-9/._-]`, it was writing to
+   the top of the bucket rather than under that prefix, and it will now refuse
+   to boot until the value is corrected. Check the prefix before upgrading: the
+   data is wherever it was actually being written, not where the config says.
+4. **A few malformed names are now refused where they were previously
+   accepted and quietly rewritten** (see *Local storage rejects malformed paths
+   instead of rewriting them* below). Three are operator-visible: a retention
+   policy whose database or measurement name contains a separator or is empty
+   is rejected on create and on update, and existing ones are named in the log
+   at startup; an MQTT subscription whose database or topic-mapping target is
+   not a usable name now fails at startup; and an edge-sync spoke may no longer
+   sync a path with a dot-prefixed segment such as `db/./cpu/x.parquet`. Note
+   that `PUT /api/v1/retention/:id` replaces the whole row, so a request that
+   omits `database` is now a 400 rather than silently storing an empty name,
+   which used to make that policy enumerate every database.
+5. **Retention will delete a backlog on its first run if you use an S3 prefix.**
+   If `storage.s3_prefix` is set, retention has been deleting nothing at all
+   since v26.03.2 (see *Retention deleted nothing on S3 deployments with a
+   configured prefix* below), while reporting every run as completed. After
+   upgrading, the first run of each policy will remove everything already past
+   its cutoff, which on a long-running deployment can be most of the data in the
+   affected measurements. This is the policy doing what it was configured to do,
+   but it is not a small delete and it is not reversible. Before upgrading,
+   check what each policy would remove with a dry run
+   (`POST /api/v1/retention/:id/execute` with `{"dry_run": true}`, which is now
+   accurate where it previously reported zero), and confirm the retention window
+   is still the one you want. Deployments on local storage, on Azure, or on S3
+   without a prefix are unaffected: retention has been working correctly there.
+6. **Query response envelopes gained two optional keys** (`rows_capped`,
    `row_cap`), emitted only when an Enterprise governance row cap truncated
    the result. Conforming JSON and msgpack decoders are unaffected: the keys
    are absent from every uncapped response, and a capped msgpack envelope
@@ -251,6 +333,567 @@ one listing per tier on purpose, because hourly deletes its inputs before
 daily runs.
 
 Contributed by [@alexeymoskalev-devops](https://github.com/alexeymoskalev-devops) in [#789](https://github.com/Basekick-Labs/arc/pull/789).
+
+### Retention reports files hidden by storage listings ([#771](https://github.com/Basekick-Labs/arc/issues/771))
+
+Retention already had a skipped-file counter, but since #744 normal listing no
+longer returns a key that `readParquetPath` rejects, the counter stopped being
+fed and remained zero. Retention now reports those files, including keys
+rejected by the storage contract; they remain untouched, while dry-run and real
+executions report the same skipped-file count and reason.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#775](https://github.com/Basekick-Labs/arc/pull/775).
+
+### DuckDB path quoting uses one shared escaping helper ([#752](https://github.com/Basekick-Labs/arc/issues/752))
+
+DuckDB path interpolation now uses one shared string-literal quoting helper
+across query, delete, retention, and parallel execution paths, preserving the
+existing escaping behavior for paths containing single quotes.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#780](https://github.com/Basekick-Labs/arc/pull/780).
+
+### Numeric MessagePack host values are logged when coerced ([#768](https://github.com/Basekick-Labs/arc/issues/768))
+
+The MessagePack decoder accepts a numeric `host` and coerces it to `host_<num>`.
+That behaviour is unchanged, but the coercion now emits a debug-level log line
+naming the resulting host, so a misconfigured client can be spotted without
+changing ingest behaviour. The log reuses the string already built for the
+return value, so the cost with debug disabled is not measurable under parallel
+ingest.
+
+Contributed by [@lecodev-26](https://github.com/lecodev-26) in [#769](https://github.com/Basekick-Labs/arc/pull/769).
+
+### A restore no longer reports success while dropping files ([#762](https://github.com/Basekick-Labs/arc/issues/762))
+
+A restore could finish with `status: completed` while having written only part
+of the backup. Every per-file failure in the data copy was logged and skipped:
+a backup object that could not be read, a temp file that could not be created,
+and a write into the live data store that failed all looked the same and none
+of them was counted. A backup whose objects had gone missing after it was
+written listed short, so every listed file restored and the restore also
+reported success. Backup had the accounting for this (the skipped-file count,
+the "will be incomplete" warning, the guard against too much loss); restore,
+the side where the gap costs data, had none of it.
+
+What changes:
+
+- **A restore that could not restore every data file now ends `failed`**, with
+  an error saying so and, on the status endpoint, `skipped_files` (backup
+  objects that could not be read), `missing_files` (files the manifest
+  inventoried that backup storage no longer holds), and `skipped_sample` (up to
+  32 of the unreadable paths). The files that could be restored are written
+  first and stay in place, so a recovery from a damaged backup still gets
+  everything that can be read. There is no tolerated fraction: backup tolerates
+  a few unreadable files because compaction or retention can remove one between
+  listing and copy, and nothing removes objects under a backup while it is
+  being restored, so every gap on restore is damage.
+- **A failed write into data storage now aborts the restore** instead of being
+  skipped, and the staging partial it leaves behind is removed. A restore onto
+  a full or read-only volume previously reported `completed`.
+- A temp-file failure is told apart from an unreadable backup object even
+  though both surface from the same read call, so a full temp filesystem aborts
+  the restore rather than counting as skipped objects.
+- **Data files the backup holds under names its listing hides are reported,
+  not silently left behind.** An object store returns dot-prefixed keys
+  (`._foo.parquet` debris from a sync tool, for example) and the backup copied
+  them, but the local backup store's listing hides dot-prefixed names, so the
+  restore could never see them. They are now counted as `unaddressable_files`
+  with an `unaddressable_sample`, and the error says to rename them in the
+  backup and re-run, which recovers them. They are told apart from files that
+  are genuinely gone (`missing_files`).
+- **Restoring a backup that was itself incomplete is announced** at the start
+  and reported as `backup_skipped_files` and `backup_unaddressable_files` on the
+  status endpoint, so a gap that predates the restore is not mistaken for one it
+  caused.
+- The backup manifest's `skipped_files` now counts data files only, the same
+  population as `total_files`, so a restore can compare the two; Iceberg
+  warehouse metadata that could not be read at backup time is recorded
+  separately as `skipped_metadata_files`. Previously both were folded together,
+  and a restore comparing them would have let one missing data file per
+  metadata skip go undetected.
+
+### TOCTOU race in MQTT subscription restart ([#301](https://github.com/Basekick-Labs/arc/issues/301))
+
+`RestartSubscription` now reserves the subscription slot with a nil-placeholder before
+releasing the manager lock, preventing concurrent start or restart operations from
+launching duplicate subscribers while configuration is loaded and the new subscriber starts.
+A start or restart that lands during an in-flight restart now receives `409 Conflict`,
+and the previous subscriber's disconnect no longer runs under the manager lock.
+
+Contributed by [@Thundercloud12](https://github.com/Thundercloud12) in [#766](https://github.com/Basekick-Labs/arc/pull/766).
+
+### Tiering no longer retries an unusable storage key every cycle ([#758](https://github.com/Basekick-Labs/arc/issues/758))
+
+[#747](https://github.com/Basekick-Labs/arc/issues/747) taught compaction,
+reconciliation, replication and edge-sync export to quarantine a storage key no
+backend can address instead of retrying it, and left tiering for a follow-up.
+This is that follow-up.
+
+The tiering migration is cron-driven and recomputes its candidate set from the
+SQLite file index on every cycle, with no failure backoff, no skip list and no
+attempt cap. A hot file whose key the storage contract refuses (one written
+under a folded name by a pre-[#741](https://github.com/Basekick-Labs/arc/issues/741)
+Arc, indexed by the pre-migration scan because local listings do not filter
+such keys) failed the copy with the same permanent error every night, stayed in
+the hot tier, was re-selected the next night, and wrote a fresh failed-migration
+row into the history table each time, forever. Reconciliation had the smaller
+version of the same loop: a cold row with such a key failed its hot existence
+check on every pass for the 48 hours the reconcile window covers.
+
+Both sites now recognise the permanent error, log once at Error, count it in
+`arc_storage_invalid_path_quarantined_total`, and **quarantine the file index
+row**. Because the work set is rebuilt from SQLite every cycle, the quarantine
+is persisted on the row (`tier_files.quarantined_at` and `quarantine_reason`,
+added on first open of an existing database) rather than remembered in memory,
+so it survives restarts and the nightly rescan. A quarantined row keeps its tier
+and its file: on local storage the file is a real data file inside the
+partition glob and the query path still serves it, so the index keeps saying it
+exists in hot. Only the two work-set queries, migration candidates and
+recently-migrated reconciliation, stop returning it.
+
+What the operator sees:
+
+- The cycle that discovers the condition reports one failed migration and
+  writes one failed-migration history row, and the next cycle reports none.
+- `GET /api/v1/tiering/status` gains `quarantined_files`, which should be zero.
+- `GET /api/v1/tiering/files` shows `quarantined_at` and `quarantine_reason` on
+  affected rows.
+
+Nothing clears a quarantine, deliberately. The only remedy for a permanently
+unusable key is renaming the object in storage, and a renamed object has a new
+key that the next scan registers as a fresh row and migrates normally.
+
+Quarantine is decided on `storage.ErrInvalidPath` alone. A transient copy or
+existence-check failure keeps the row in the work set and is retried next cycle
+as before, and each site carries a test that pins that, because widening the
+rule to "any failure" would retire a file from tiering on a network blip. The
+streaming copy also now reports the permanent error whichever side of the pipe
+fails first, since which goroutine wins that race is not deterministic and the
+classification must not depend on it. The tiering test double now enforces the
+storage key contract like the production backends, so these branches are not
+dead code under test.
+
+### A backup no longer reports success while silently omitting files ([#756](https://github.com/Basekick-Labs/arc/issues/756))
+
+A backup could finish, report success, and be missing data files that exist in
+storage, with nothing anywhere saying so.
+
+Listings deliberately hide a file whose key does not follow the storage key
+rules, because handing that key back turns every read that follows into a
+failure. On local storage those hidden files are not debris: they are real
+Parquet files holding real rows, and the query path still returns those rows,
+because it matches files on the filesystem rather than going through the storage
+layer. So the file was queryable and invisible at the same time.
+
+Backup inventories what a listing returns, and everything that exists to make an
+incomplete backup visible (the skipped-file count, the "backup will be
+incomplete" warning, and the guard that fails a backup when too much of it could
+not be read) counts only files that were inventoried and then failed to copy. A
+file the listing never returned reached none of them. Before the listings
+started filtering, the same file failed loudly when the backup tried to read it,
+and was counted.
+
+Two shapes produce such a file, and both are what an older Arc wrote rather than
+anything you can create today: a filename containing a backslash, which is a
+legal filename on Linux and refused because Azure treats it as a separator, and
+a path longer than the key limit, which is reachable by nesting.
+
+What changes:
+
+- A backup now reports these files: a count and a sample of their paths in the
+  backup manifest, a warning naming them, and a metric
+  (`arc_storage_unaddressable_files_total`) so it is visible without reading a
+  manifest. The message says to rename them, which is what actually recovers the
+  data.
+- **A backup whose data files are all unaddressable now fails.** It previously
+  reported success over a backup containing nothing, because the guard that
+  catches a partial backup divides by the number of files it inventoried, and
+  that number was zero.
+- Storage backends gained a way to enumerate what a listing hid, which is what
+  makes any of the above possible. This is the counterpart the previous release
+  already established for write-staging partials, which were hidden from
+  listings and given their own way to be found; the key-rule drop had no
+  equivalent.
+
+The enumeration is defined as what a full listing sees and the ordinary listing
+does not return, rather than by re-checking the key rules. That distinction
+found a second case: a file whose name begins with a dot passes the key rules
+and is writable and readable through the storage layer, yet listings skip it, so
+it was missing from backups too. Checking the rules again would never have
+reported it.
+
+Nothing about which files are queryable changes, and a healthy deployment
+reports nothing.
+
+### Cleanup and replication loops no longer retry an unusable storage key forever ([#747](https://github.com/Basekick-Labs/arc/issues/747))
+
+[#743](https://github.com/Basekick-Labs/arc/issues/743) made a refused storage
+key report a permanent, identifiable error, and documented that a loop meeting
+one should quarantine the entry rather than retry it. Nothing acted on that yet,
+and the loops the note was written about kept treating it as a passing I/O
+failure.
+
+A key gets into this state by being stored, not by being typed. The cluster
+manifest's own validator is looser than the storage contract on purpose: it runs
+inside Raft `Apply`, which includes log replay, so tightening it would make a
+node refuse an entry an older binary accepted and two versions would build
+different state from one log. The gap that leaves is exactly six spellings, and
+compaction manifests and edge-sync ledger rows are persisted state that can
+carry one written by an earlier version.
+
+What each loop did with such an entry, and does now:
+
+- **Peer file replication** fetched the whole file body from a peer and only
+  then failed writing it, once per candidate peer, once per attempt, on every
+  catch-up walk and every reconciliation pass. The entry is now recognised at
+  the first backend call and no peer is contacted. Its test suite runs in 3
+  seconds where it took 108 before, which is the retry storm made visible.
+
+  The reader's query gate stays **closed** for that entry, deliberately. The
+  file really is absent, the read path is a glob so a query over that partition
+  would just return fewer rows, and `query.gate_on_catchup` exists to turn that
+  silence into a 503. An entry no peer holds is equally unsatisfiable and holds
+  the gate today; this one gets no exemption. Puller stats and the 503 body
+  gained an `invalid_path` key so the reason is legible.
+
+- **Compaction manifest recovery** could not delete the manifest and could not
+  confirm the output, so it reprocessed it every cycle and its input files were
+  held out of compaction indefinitely. The manifest is now parked alongside
+  itself with a `.quarantined` suffix, which takes it out of the recovery work
+  set and releases its inputs while keeping the record of what it described.
+  It is parked rather than deleted because the inputs may already be gone: the
+  only binary that could have written such a manifest is one whose upload and
+  source deletion both succeeded.
+
+- **A compaction job** failed outright when one of its inputs had an unusable
+  key, every cycle, because the "already compacted, skip it" escape hatch is
+  gated on an existence check that fails the same way. That input is now
+  skipped and the rest of the partition is compacted. The skipped file is not
+  deleted and its manifest entry is not dropped.
+
+- **Reconciliation** counted these as transient in a bucket whose log line
+  promises "next run retries". Both sweeps now separate the two, and a run
+  report carries `skipped_transient` and `skipped_invalid_path` as separate
+  numbers, because waiting helps with one and never helps with the other. The
+  entries are reported, not deleted: these sweeps issue the irreversible
+  operations, and on an object store an object can sit under the literal key
+  where the listing filter hides it, so absence is unobservable here rather
+  than established.
+
+- **Air-gap bundle export** kept the entry on an existence-check error, by a
+  rule written for transient failures, and the copy then aborted the entire
+  export rather than one file. Nothing on that path caps attempts, so a single
+  unusable file stopped all telemetry leaving the site permanently, on the
+  deployment least able to receive a visit. It is now marked skipped.
+
+- Serving a peer fetch for such a path answered `backend`, which reads as a
+  transient fault on the peer; it now answers `invalid_path`, which is the code
+  that already meant this. Peer-fallback behaviour is unchanged.
+
+- The Phase 4 local delete worker never retried, so nothing was stuck there, but
+  it logged a permanent condition at the same level as a backend hiccup. It now
+  says plainly that the local copy can never be removed by Arc.
+
+A new counter, `arc_storage_invalid_path_quarantined_total`, aggregates every
+one of these. It matters more than most: after this change there is no retry
+storm, no growing error log and no stuck queue to notice, so the counter and the
+per-site Error lines are the whole signal. It should sit at zero.
+
+**Azure batch deletes were also unsafe** and are fixed here, because the test
+that pins the contract is what exposed it. `DeleteBatch` was the one key-taking
+method on any backend that never validated its input, and on Azure a backslash
+is a path separator, so a batch carrying `a\b.parquet` deleted the unrelated
+blob `a/b.parquet`. Bad keys are now collected and reported the way S3 already
+did, without failing the rest of the batch.
+
+**A five-byte window in this release's own manifest fix is closed here too.**
+The manifest filename fix above generates a hashed name once the filename passes
+255 bytes, but the key validator subtracts the write-staging suffix and refuses
+anything over 250, so a job id of 246 to 250 characters produced a filename the
+generator considered fine and every write refused: the manifest write failed and
+that partition's compaction failed on every cycle, which is exactly the failure
+that fix removed. The limits the validator actually enforces are now exported,
+so a caller that builds a key bounds it by the same number the backend checks.
+Neither the window nor the fix ever appeared in a release.
+
+One asymmetry is left in place and tracked separately: local listings do not
+filter unusable keys the way S3 and Azure have since #743. Filtering them there
+would be consistent, but on local these are real data files rather than the
+object stores' directory markers, and silently omitting them from a backup is
+worse than the listing being inconsistent. That trade-off deserves its own
+decision rather than a drive-by.
+
+### A write could destroy an already-acknowledged write ([#744](https://github.com/Basekick-Labs/arc/issues/744))
+
+Local storage stages every streamed write at `{key}.part` and renames it into
+place on success. The staging file of key `x` was therefore the same file as the
+committed object `x.part`, and the two destroyed each other.
+
+Writing `x.parquet.part` returned success. The next write of `x.parquet` opened
+its staging file with truncate, wiped the committed object, and renamed it away,
+so the first key stopped existing. Three further orderings were worse: a
+committed `x.part` with no `x` present made size and range reads report the
+wrong object's bytes while existence checks said it was absent, which could make
+the cluster puller skip replicating a file that is not there; and an append
+could rename a committed object over an unrelated third key.
+
+The staging suffix is now reserved, so no key can name a staging file, and the
+callers that legitimately need a partial (edge-sync resume, backup cleanup)
+address it through an explicit interface rather than by spelling the suffix
+themselves. Staged partials are also hidden from listings, because a listing
+must never return a key the backend would refuse, and a new listing method
+exists so an abandoned partial can still be reclaimed rather than becoming
+invisible and permanent.
+
+This needed a key ending in `.part`, which Arc's own writers never produce, so
+it was reachable only by restoring a backup that contained an orphaned staging
+file.
+
+Two consequences worth knowing. Deleting a database now also reclaims any
+staged partial underneath it, which a failed upload could previously leave
+behind indefinitely, and which also kept the directory from being removed. And
+because the reservation applies to every backend so that a key stays portable,
+an object literally named `something.part` that already exists in an S3 bucket
+or Azure container is no longer readable or deletable through Arc. Arc cannot
+have written one, since only local storage stages; remove it with your provider's
+own tooling if you have one.
+
+### Compaction manifests no longer exceed the storage key limit ([#744](https://github.com/Basekick-Labs/arc/issues/744))
+
+A compaction manifest filename repeated the partition path that its job id
+already contained, and the database three times over. With a 30-character
+database and a 60-character measurement that produced a 270-byte filename, past
+the 255-byte limit a path component can have, so writing the manifest failed and
+compaction for that partition failed on every cycle. At the longest permitted
+names it reached 508 bytes.
+
+The filename is now the job id alone, which is already unique and already
+carries the partition. Nothing reads these names, so manifests written by an
+earlier version are still found and recovered, and no migration is needed.
+
+### Retention deleted nothing on S3 deployments with a configured prefix ([#746](https://github.com/Basekick-Labs/arc/issues/746))
+
+If `storage.s3_prefix` was set, retention never deleted a single file.
+
+Retention lists the files for a measurement, then asks DuckDB for each file's
+maximum timestamp to decide whether it is past the cutoff. It built that file's
+URL as `s3://{bucket}/{key}` and left the configured prefix out, while every
+write goes under the prefix. So the URL named an object that does not exist,
+the read failed, and the per-file error handler logged a warning and moved on to
+the next file. Every file took that path, so nothing was ever eligible.
+
+Nothing said so. The policy run then recorded itself as `completed` with a
+deleted count of zero, which is also what the API and the execution history
+reported, so an operator checking whether retention was working saw a series of
+successful runs. The only symptom was data that never aged out, and one
+`Failed to read file metadata` line per file per cycle.
+
+Live since **v26.03.2**, when the prefix option was added. That change updated
+the identical URL builder in the delete path and did not update this one.
+Unprefixed S3, Azure and local deployments were never affected.
+
+The root cause was that the same builder existed in several places by hand.
+There is now one, `storage.ObjectURI`, which every component that reads the
+object store directly goes through, so a backend's prefix cannot be honoured in
+one place and forgotten in another. See the upgrade note above before
+upgrading: the first cycle after this fix will delete everything that
+accumulated while retention was doing nothing.
+
+### Partition pruning silently stopped working on S3 deployments with a configured prefix ([#746](https://github.com/Basekick-Labs/arc/issues/746))
+
+Also only with `storage.s3_prefix` set, and from the same cause in the opposite
+direction.
+
+Partition pruning narrows a time-bounded query to the hour and day directories
+it needs, then checks which of them exist before handing the list to DuckDB.
+Converting a directory URL back into something it could list stripped the
+scheme and the bucket but not the configured prefix, and the listing call adds
+the prefix itself. The listing therefore ran against `prefix/prefix/...` and
+came back empty **with no error**, so every partition was judged absent and the
+query fell back to scanning the measurement's full glob.
+
+Results stayed correct throughout; only the optimisation was lost. On a large
+measurement that is the difference between reading one hour and reading
+everything, so affected deployments should see time-bounded queries get faster
+after upgrading.
+
+Tiered queries were not affected: per-tier pruning already trimmed the tier's
+own root and carries a comment describing this exact hazard. Only the
+single-tier path was doing scheme-and-bucket surgery. It now trims the storage
+root it parsed out of the measurement's own glob, the same way the tiered path
+does, and a test pins that the parsed root and the URL builder agree. A URL that
+does not sit under that root no longer falls back to stripping the scheme: that
+produced a prefix the backend would re-prefix and list against some other key
+space, reporting every partition absent with full confidence. Existence
+filtering is skipped instead, so the query falls back to the full glob.
+
+### The query path now validates database and measurement names against the storage key contract ([#746](https://github.com/Basekick-Labs/arc/issues/746))
+
+No operator-visible behaviour changes here for valid names. This closes the
+structural gap the two fixes above came out of.
+
+The previous release made the key rule a property of every storage backend
+(#743). That covers writes. Reads never go through a backend at all: Arc builds
+an `s3://` or `azure://` URL and hands it to DuckDB, which reads the object
+store itself, and the Iceberg exporter hands paths to its own file layer the
+same way. A name that a backend would refuse could therefore still reach the
+object store through a query.
+
+Reads now go through the same contract, plus one rule that writes do not need.
+A key containing `*`, `?`, `[` or `{` names exactly one object to a write, so
+the contract accepts it; interpolated into a query it is a pattern, and
+`cpu*` would read every measurement whose name starts with `cpu`. Read paths
+reject those characters, writes still accept them.
+
+A name that cannot be turned into a path now fails the query with an explicit
+error. The alternative, substituting a path that matches nothing, would have
+been reported to the client as a successful query over an empty table, because
+Arc deliberately treats "no files matched" as an empty result rather than an
+error. Listing endpoints, whose names come from enumerating storage rather than
+from a request, leave the displayed path empty instead of failing the listing.
+
+Also in this change, all of it internal:
+
+- The five separate implementations of "is this name safe as a path" are
+  reconciled. They disagreed with each other: the cluster file-fetch validator
+  was believed to be stricter than the contract and was measurably looser,
+  accepting backslashes and over-long keys the contract refuses, and the delete
+  endpoint refused any name containing `..` anywhere, so a measurement called
+  `a..b` could be written and queried but not deleted from. They now share one
+  rule, with the two deliberate divergences documented and pinned by a test:
+  the Raft manifest validator stays looser because it runs during log replay
+  and tightening it would make different versions of Arc build different state
+  from one log, and the HTTP API additionally hides dot-prefixed names, which is
+  a display rule rather than a storage one.
+- Retention now reports when it had to skip a file whose stored path it cannot
+  read, instead of counting the run as a clean success. Such a file is skipped
+  on every future run too, so its data never ages out, and that is exactly the
+  silent shape of the prefix bug above.
+- The documented list of ways a list prefix is allowed to be looser than an
+  object key was one entry out of date, and is now checked by a test rather
+  than only stated in a comment.
+- Three unused S3 URL builders were removed rather than left as further copies
+  of the builder above.
+
+### Every storage backend now enforces the same key contract ([#743](https://github.com/Basekick-Labs/arc/issues/743))
+
+The previous release made local storage refuse malformed keys
+([#741](https://github.com/Basekick-Labs/arc/issues/741)). It was the only
+backend that did, so one key behaved three ways, and the fix's own comment
+claimed a guarantee that held for one implementation out of three.
+
+The rule is now a property of the `Backend` interface, enforced by local, S3 and
+Azure alike. What it guarantees is that two different keys can never name one
+object, which is the property whose absence produced #574, #737 and #741.
+
+**It also fixes a collision #741 introduced.** `"coll"` and `"coll/"` resolved
+to the same local file: two keys, one object, and the first write silently lost.
+The exemption existed because list prefixes legitimately end in a separator, and
+applying a prefix rule to keys is what broke it. Keys and list prefixes are now
+validated separately, so `""` and a trailing separator remain valid for
+enumeration and are refused for a key.
+
+Behaviour on the object stores, all measured against a live MinIO and Azurite
+rather than reasoned about:
+
+- A leading separator is refused. MinIO silently strips it, so `/a/x` and `a/x`
+  were one object there, while S3 and Azure keep them apart. One key, three
+  outcomes.
+- A backslash is refused, because Azure treats it as a separator: `a\b` and
+  `a/b` are **one blob**.
+- `.` and `..` segments and empty interior segments are refused locally now,
+  with a message naming the key. MinIO already rejected all three, but as a
+  remote 400 describing an S3 API error rather than the key at fault. Azure
+  stored them literally.
+- Keys that merely contain dots, such as `a..b` or `..foo`, are accepted
+  everywhere and stored under the name asked for.
+
+**The S3 prefix is validated rather than repaired.** The old sanitiser's damage
+was on its success path: `/` stayed `/`, `a//b` became `a//b/` and `.` became
+`./`, each of which made every write fail against MinIO, while `a/..b` was
+silently replaced with the empty string. That last one is not a safe fallback,
+it is the bucket root, so a typo relocated an entire deployment without a word.
+A prefix that cannot form usable keys now stops the backend from starting.
+
+A listing also never returns a key the backend would then refuse. Object stores
+carry "directory marker" objects whose key ends in a separator, written by
+consoles and sync tools rather than by Arc, and Arc feeds listings straight into
+reads and deletes in a dozen places. Returning one would have been worse than
+the original problem: a restore would skip the file and still report success.
+Those entries are filtered out of listings, so what a listing returns is always
+usable.
+
+A MinIO service is wired into CI for this. Every behaviour above is a property
+of the servers rather than of any mock, no unit test could have found them, and
+the directory-marker case was found only by writing one through the raw S3 API
+and watching a read of it fail.
+
+### Local storage rejects malformed paths instead of rewriting them ([#741](https://github.com/Basekick-Labs/arc/issues/741))
+
+The local storage backend used to repair the paths it was given: every `..` was
+replaced with `_` and NUL bytes were stripped, with a comment saying this
+prevented directory traversal. It did not. Containment was enforced separately,
+by resolving the path and checking it still sat under the storage root.
+
+What the rewrite did do was make two different keys able to name one file.
+`a..b` and `a_b` were the same location, and so were `..foo` and `_foo`. That
+is the root of two bugs already fixed in this release: the edge-sync source
+path ([#574](https://github.com/Basekick-Labs/arc/pull/574)) and the edge-sync
+spoke ID ([#737](https://github.com/Basekick-Labs/arc/issues/737)). Each was
+closed by teaching one caller not to send `..`, which left the next caller to
+rediscover it.
+
+A malformed path is now refused rather than quietly turned into a different
+one, so the mapping from key to file is one-to-one for every caller at once.
+Refused: absolute paths, any `.` or `..` segment, an empty interior segment
+such as `a//b`, NUL bytes, and backslashes. Still accepted, and now stored under
+the name actually asked for: filenames that merely contain dots, such as `a..b`
+or `..foo`.
+
+The check got cheaper as a side effect. Once a path is known to be clean and
+relative, the three `path/filepath` calls that followed it were redundant: one
+normalised input proven not to need it, one re-resolved an already absolute
+path, and one recomputed a containment property that now holds by construction.
+Validation is a single pass with no allocation, and the containment proof moved
+into a property test rather than being paid for on every call.
+
+```
+                          before      after
+BenchmarkValidatePath      605 ns/op   110 ns/op   1 alloc, unchanged
+BenchmarkValidatePathDeep  757 ns/op   150 ns/op   1 alloc, unchanged
+```
+
+In proportion: about 0.06% of a 4 MiB Parquet write, and roughly half of a bare
+existence check. It matters in the stat-heavy loops that reconciliation and
+tiering run, and is noise on the ingest path. Nothing gets slower and the
+allocation count is unchanged, which is the part that matters under
+concurrency.
+
+Two audits back the change. Instrumenting the backend and running the full test
+suite found no path anywhere in Arc that the rewrite altered, and none that
+normalisation altered either. Both are evidence rather than proof: neither can
+see a path built from stored operator configuration or from an ingest field the
+validators happened to skip, and review found one of each.
+
+So the surfaces that build a storage key from a name now validate it. Retention
+policies reject a malformed database or measurement on create and on update, and
+any already stored that can no longer resolve is named at startup. The per-name
+database routes return 400 rather than letting the storage layer refuse the key
+later. A MessagePack record with an empty measurement name is refused instead of
+being skipped by the validator and reaching the writer, and MQTT does the same,
+including for the database its topic mappings select. An empty measurement used
+to produce `{database}//{year}/...`, which normalisation collapsed so the rows
+landed a level up, under the database itself.
+
+The `mqtt.subscriptions` config is now validated at load: a subscription whose
+database, or whose topic-mapping target, is not a usable name fails at startup
+rather than at the first flush.
+
+If you have a deployment that stored data under a folded name, that file is now
+addressed by its real name and the folded spelling no longer reaches it. The one
+known way to be in that state is an edge-sync spoke registered before
+[#737](https://github.com/Basekick-Labs/arc/issues/737), which the hub already
+names at startup.
 
 ### Edge-sync spoke IDs can no longer collide with another spoke's namespace ([#737](https://github.com/Basekick-Labs/arc/issues/737))
 

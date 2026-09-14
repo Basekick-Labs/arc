@@ -45,6 +45,48 @@ jobs:
       - name: Test (race)
         run: go test -tags=duckdb_arrow -race ./...
 
+      # The storage key contract (#743) is a property of real object stores,
+      # not of a mock: MinIO folds a leading slash so "/a/x" and "a/x" are one
+      # object, and Azure treats a backslash as a separator. Neither is
+      # reproducible in a unit test, and both were found only by probing a live
+      # server. Without this step the contract is asserted rather than enforced.
+      #
+      # docker run, not a service container: quay.io/minio/minio needs the
+      # arguments `server /data`, and services have no way to supply arguments
+      # after the image.
+      - name: Start MinIO
+        run: |
+          docker run -d --name arc-ci-minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            quay.io/minio/minio server /data
+          # Poll rather than sleep: the first test would otherwise race startup.
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:9000/minio/health/live >/dev/null; then
+              echo "MinIO ready after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become ready"; docker logs arc-ci-minio; exit 1
+
+      - name: Create MinIO bucket
+        run: |
+          docker run --rm --network host --entrypoint sh quay.io/minio/mc -c \
+            "mc alias set ci http://localhost:9000 minioadmin minioadmin && mc mb -p ci/arctest"
+
+      # A separate tag set means a separate compile of the module. That is the
+      # cost of covering this at all, and it is not run with -race: the tests
+      # are I/O against a local server, so the detector adds build time without
+      # adding signal.
+      - name: Test against real object storage
+        env:
+          ARC_TEST_S3_BUCKET: arctest
+          ARC_TEST_S3_ENDPOINT: http://localhost:9000
+        run: go test -tags="duckdb_arrow objectstore" ./internal/storage/
+
+      - name: Stop MinIO
+        if: always()
+        run: docker rm -f arc-ci-minio || true
+
       # fasthttp runs body-stream writers on a bare goroutine with no recovery,
       # so a panic in one crashes the process rather than failing the request
       # (#717). Every writer must go through QueryHandler.safeStream. arcx_hook.go

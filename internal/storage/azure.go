@@ -150,12 +150,56 @@ func NewAzureBlobBackend(cfg *AzureBlobConfig, logger zerolog.Logger) (*AzureBlo
 }
 
 // Write writes data to Azure Blob Storage
+// blobKey validates a storage key before it becomes a blob name.
+//
+// Azure has no prefix concept, so the key IS the blob name, and it needs the
+// same contract the other backends enforce (#743). One rule matters especially
+// here: Azure treats a backslash as a path separator, so "a\\b" and "a/b" are
+// ONE blob. ValidateKey rejects backslash for that reason.
+func (b *AzureBlobBackend) blobKey(key string) (string, error) {
+	if err := ValidateKey(key); err != nil {
+		return "", err
+	}
+	return key, nil
+}
+
+// partitionValidKeys splits a batch into the keys that satisfy the storage
+// contract and one error per key that does not.
+//
+// DeleteBatch was the only key-taking method on any backend that reached the
+// service without validating, and on Azure that is not merely a missed
+// rejection: a backslash IS a path separator there, verified against Azurite in
+// #743, so "a\b.parquet" and "a/b.parquet" are ONE blob and a batch carrying
+// the first would delete the second. Nothing else in the codebase can make a
+// delete address a different object than the caller named.
+//
+// Rejections are collected rather than fatal, matching S3: callers such as
+// compaction and the reconciler submit whole batches with no per-file fallback,
+// so failing the batch on one key would leave every other file undeleted
+// forever. Split out as a function because AzureBlobBackend cannot be built
+// without live credentials, and this behaviour deserves a test that needs none.
+func partitionValidKeys(batch []string) (usable []string, rejected []error) {
+	usable = make([]string, 0, len(batch))
+	for _, path := range batch {
+		if err := ValidateKey(path); err != nil {
+			rejected = append(rejected, err)
+			continue
+		}
+		usable = append(usable, path)
+	}
+	return usable, rejected
+}
+
 func (b *AzureBlobBackend) Write(ctx context.Context, path string, data []byte) error {
 	return b.WriteReader(ctx, path, bytes.NewReader(data), int64(len(data)))
 }
 
 // WriteReader writes data from a reader to Azure Blob Storage
 func (b *AzureBlobBackend) WriteReader(ctx context.Context, path string, reader io.Reader, size int64) error {
+	key, err := b.blobKey(path)
+	if err != nil {
+		return err
+	}
 	start := time.Now()
 
 	// Determine content type
@@ -164,9 +208,9 @@ func (b *AzureBlobBackend) WriteReader(ctx context.Context, path string, reader 
 		contentType = "application/vnd.apache.parquet"
 	}
 
-	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlockBlobClient(path)
+	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlockBlobClient(key)
 
-	_, err := blobClient.UploadStream(ctx, reader, &azblob.UploadStreamOptions{
+	_, err = blobClient.UploadStream(ctx, reader, &azblob.UploadStreamOptions{
 		HTTPHeaders: &blob.HTTPHeaders{
 			BlobContentType: &contentType,
 		},
@@ -203,7 +247,11 @@ func (b *AzureBlobBackend) WriteReader(ctx context.Context, path string, reader 
 
 // Read reads data from Azure Blob Storage
 func (b *AzureBlobBackend) Read(ctx context.Context, path string) ([]byte, error) {
-	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(path)
+	key, err := b.blobKey(path)
+	if err != nil {
+		return nil, err
+	}
+	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(key)
 
 	resp, err := blobClient.DownloadStream(ctx, nil)
 	if err != nil {
@@ -232,7 +280,11 @@ func (b *AzureBlobBackend) Read(ctx context.Context, path string) ([]byte, error
 
 // ReadTo reads data from Azure Blob Storage and writes to a writer
 func (b *AzureBlobBackend) ReadTo(ctx context.Context, path string, writer io.Writer) error {
-	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(path)
+	key, err := b.blobKey(path)
+	if err != nil {
+		return err
+	}
+	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(key)
 
 	resp, err := blobClient.DownloadStream(ctx, nil)
 	if err != nil {
@@ -262,7 +314,11 @@ func (b *AzureBlobBackend) ReadTo(ctx context.Context, path string, writer io.Wr
 // offset and writes to writer. Uses blob.HTTPRange to skip already-transferred
 // bytes. offset=0 fetches the full blob without a Range header.
 func (b *AzureBlobBackend) ReadToAt(ctx context.Context, path string, writer io.Writer, offset int64) error {
-	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(path)
+	key, err := b.blobKey(path)
+	if err != nil {
+		return err
+	}
+	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(key)
 
 	var opts *blob.DownloadStreamOptions
 	if offset > 0 {
@@ -296,7 +352,11 @@ func (b *AzureBlobBackend) ReadToAt(ctx context.Context, path string, writer io.
 
 // StatFile returns the byte size of the Azure blob at path, or -1 if not found.
 func (b *AzureBlobBackend) StatFile(ctx context.Context, path string) (int64, error) {
-	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(path)
+	key, err := b.blobKey(path)
+	if err != nil {
+		return 0, err
+	}
+	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(key)
 
 	resp, err := blobClient.GetProperties(ctx, nil)
 	if err != nil {
@@ -313,6 +373,10 @@ func (b *AzureBlobBackend) StatFile(ctx context.Context, path string) (int64, er
 
 // List lists blobs with the given prefix
 func (b *AzureBlobBackend) List(ctx context.Context, prefix string) ([]string, error) {
+	if err := ValidateListPrefix(prefix); err != nil {
+		return nil, err
+	}
+
 	var blobs []string
 
 	containerClient := b.client.ServiceClient().NewContainerClient(b.containerName)
@@ -332,6 +396,11 @@ func (b *AzureBlobBackend) List(ctx context.Context, prefix string) ([]string, e
 
 		for _, blobItem := range page.Segment.BlobItems {
 			if blobItem.Name != nil {
+				// See S3Backend.List: a listing never returns a key this
+				// backend would refuse (#743).
+				if ValidateKey(*blobItem.Name) != nil {
+					continue
+				}
 				blobs = append(blobs, *blobItem.Name)
 			}
 		}
@@ -342,9 +411,13 @@ func (b *AzureBlobBackend) List(ctx context.Context, prefix string) ([]string, e
 
 // Delete deletes a blob from Azure Blob Storage
 func (b *AzureBlobBackend) Delete(ctx context.Context, path string) error {
-	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(path)
+	key, err := b.blobKey(path)
+	if err != nil {
+		return err
+	}
+	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(key)
 
-	_, err := blobClient.Delete(ctx, nil)
+	_, err = blobClient.Delete(ctx, nil)
 	if err != nil {
 		// Check if it's a "not found" error - that's okay
 		if isAzureNotFoundError(err) {
@@ -385,10 +458,17 @@ func (b *AzureBlobBackend) DeleteBatch(ctx context.Context, paths []string) erro
 			return fmt.Errorf("failed to create Azure batch builder: %w", err)
 		}
 
-		for _, path := range batch {
-			if err := bb.Delete(path, nil); err != nil {
-				return fmt.Errorf("failed to add delete to Azure batch for %q: %w", path, err)
+		usable, rejected := partitionValidKeys(batch)
+		nonFatalErrs = append(nonFatalErrs, rejected...)
+		for _, key := range usable {
+			if err := bb.Delete(key, nil); err != nil {
+				return fmt.Errorf("failed to add delete to Azure batch for %q: %w", key, err)
 			}
+		}
+		if len(usable) == 0 {
+			// Every key in this batch was refused; there is nothing to submit
+			// and SubmitBatch rejects an empty builder.
+			continue
 		}
 
 		resp, err := containerClient.SubmitBatch(ctx, bb, nil)
@@ -428,9 +508,13 @@ func (b *AzureBlobBackend) DeleteBatch(ctx context.Context, paths []string) erro
 
 // Exists checks if a blob exists in Azure Blob Storage
 func (b *AzureBlobBackend) Exists(ctx context.Context, path string) (bool, error) {
-	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(path)
+	key, err := b.blobKey(path)
+	if err != nil {
+		return false, err
+	}
+	blobClient := b.client.ServiceClient().NewContainerClient(b.containerName).NewBlobClient(key)
 
-	_, err := blobClient.GetProperties(ctx, nil)
+	_, err = blobClient.GetProperties(ctx, nil)
 	if err != nil {
 		if isAzureNotFoundError(err) {
 			return false, nil
@@ -548,6 +632,11 @@ func (b *AzureBlobBackend) ListObjects(ctx context.Context, prefix string) ([]Ob
 
 		for _, blobItem := range page.Segment.BlobItems {
 			if blobItem.Name != nil {
+				// See S3Backend.List: a listing never returns a key this
+				// backend would refuse (#743).
+				if ValidateKey(*blobItem.Name) != nil {
+					continue
+				}
 				info := ObjectInfo{
 					Path: *blobItem.Name,
 				}
@@ -561,6 +650,62 @@ func (b *AzureBlobBackend) ListObjects(ctx context.Context, prefix string) ([]Ob
 				}
 				objects = append(objects, info)
 			}
+		}
+	}
+
+	return objects, nil
+}
+
+// ListUnusable implements UnusableLister.
+//
+// Returns exactly what ListObjects drops, so the two partition the container.
+// Like S3 and unlike local, ".part" blobs are reported: Azure does not stage
+// writes and does not implement StagingInspector, so such a blob is an ordinary
+// committed object that #744's reserved suffix made unaddressable.
+func (b *AzureBlobBackend) ListUnusable(ctx context.Context, prefix string) ([]UnusableObject, error) {
+	var objects []UnusableObject
+
+	containerClient := b.client.ServiceClient().NewContainerClient(b.containerName)
+	pager := containerClient.NewListBlobsFlatPager(&container.ListBlobsFlatOptions{
+		Prefix: &prefix,
+	})
+
+	for pager.More() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list Azure blobs: %w", err)
+		}
+
+		for _, blobItem := range page.Segment.BlobItems {
+			if blobItem.Name == nil {
+				continue
+			}
+			reason := ValidateKey(*blobItem.Name)
+			if reason == nil {
+				continue // ListObjects returns it
+			}
+			info := UnusableObject{Path: *blobItem.Name, Err: reason}
+			if blobItem.Properties != nil {
+				if blobItem.Properties.ContentLength != nil {
+					info.Size = *blobItem.Properties.ContentLength
+				}
+				if blobItem.Properties.LastModified != nil {
+					info.LastModified = *blobItem.Properties.LastModified
+				}
+			}
+			// Zero-length directory-marker blob. Heuristic, same as S3: the
+			// suffix alone is not proof, so the size is part of the test.
+			// Note ADLS Gen2 hierarchical-namespace directories do NOT carry a
+			// trailing separator, but they also pass ValidateKey, so they never
+			// reach here.
+			if info.Size == 0 && strings.HasSuffix(info.Path, "/") {
+				continue
+			}
+			objects = append(objects, info)
 		}
 	}
 

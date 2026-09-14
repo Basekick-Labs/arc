@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/rs/zerolog"
 )
 
@@ -196,7 +197,7 @@ func (e *ParallelExecutor) buildPartitionQuery(template, path, options string) s
 	// Build read_parquet expression for this partition. Escape single quotes:
 	// DuckDB read_parquet() paths cannot be parameterized, so the path is
 	// interpolated into a SQL string literal. (options is program-built.)
-	readParquet := fmt.Sprintf("read_parquet('%s', %s)", strings.ReplaceAll(path, "'", "''"), options)
+	readParquet := fmt.Sprintf("read_parquet(%s, %s)", sqlutil.QuoteStringLiteral(path), options)
 
 	// Replace placeholder in template
 	return strings.Replace(template, "{PARTITION_PATH}", readParquet, 1)
