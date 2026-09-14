@@ -318,6 +318,10 @@ fails the build rather than leaving the note quietly wrong.
    with `governance.enabled = true` and a `max_rows_per_query` policy can see
    them at all.
 
+7. **Edge-sync spoke IDs containing `:` must be re-registered before upgrade.**
+   See *Edge-sync spoke IDs no longer create manifest-invalid keys* below;
+   existing files remain under the old namespace.
+
 ## Bug fixes
 
 ### Backup no longer skips temp-file write failures ([#779](https://github.com/Basekick-Labs/arc/issues/779))
@@ -326,6 +330,27 @@ Backup now treats failures writing its temporary file as fatal instead of
 misclassifying them as unreadable source files and counting them as skipped.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#784](https://github.com/Basekick-Labs/arc/pull/784).
+
+### Metadata cache invalidation is ordered with cache fills ([#344](https://github.com/Basekick-Labs/arc/issues/344))
+
+Removed the redundant `MetadataStore` mutex that duplicated the serialization
+provided by the SQLite connection pool. Tier-cache fills are now ordered against
+invalidation with a generation counter, preventing stale query results from
+being stored after an invalidation.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#777](https://github.com/Basekick-Labs/arc/pull/777).
+
+### Edge-sync spoke IDs no longer create manifest-invalid keys ([#751](https://github.com/Basekick-Labs/arc/issues/751))
+
+Spoke IDs containing a colon, such as `rocket:01`, are now rejected during
+registration and input validation because the resulting storage key would be
+refused by the cluster manifest path validator.
+
+A spoke registered with a colon before this version is refused after upgrade:
+the hub rejects its syncs and the spoke will not start. Re-register it under a
+new ID; files already written under the old namespace stay where they are.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#776](https://github.com/Basekick-Labs/arc/pull/776).
 
 ### Retention reports files hidden by storage listings ([#771](https://github.com/Basekick-Labs/arc/issues/771))
 
