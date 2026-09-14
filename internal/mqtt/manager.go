@@ -80,6 +80,11 @@ func (m *SubscriptionManager) Start(ctx context.Context) error {
 
 	for _, sub := range subscriptions {
 		m.mu.Lock()
+		if _, exists := m.subscribers[sub.ID]; exists {
+			m.mu.Unlock()
+			m.logger.Warn().Str("id", sub.ID).Msg("Auto-start skipped: subscription already starting or running")
+			continue
+		}
 		m.subscribers[sub.ID] = nil
 		m.mu.Unlock()
 

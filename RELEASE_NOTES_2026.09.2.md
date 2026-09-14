@@ -320,6 +320,17 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### MQTT startSubscriber validates reservation before installing live subscriber ([#770](https://github.com/Basekick-Labs/arc/issues/770))
+
+`startSubscriber` now performs a compare-and-swap check under the manager lock after
+connecting, ensuring the reservation placeholder is still present and unmodified before
+installing the running subscriber. If a concurrent `Delete` or `Shutdown` cleared the
+reservation while the subscriber was connecting, the live subscriber is immediately stopped
+to prevent leaking broker connections and ingest writers. In addition, boot-time auto-start
+now uniformly reserves the slot placeholder and cleans up on failure.
+
+Contributed by [@Thundercloud12](https://github.com/Thundercloud12) in [#788](https://github.com/Basekick-Labs/arc/pull/788).
+
 ### Retention reports files hidden by storage listings ([#771](https://github.com/Basekick-Labs/arc/issues/771))
 
 Retention already had a skipped-file counter, but since #744 normal listing no
@@ -407,17 +418,6 @@ A start or restart that lands during an in-flight restart now receives `409 Conf
 and the previous subscriber's disconnect no longer runs under the manager lock.
 
 Contributed by [@Thundercloud12](https://github.com/Thundercloud12) in [#766](https://github.com/Basekick-Labs/arc/pull/766).
-
-### MQTT startSubscriber validates reservation before installing live subscriber ([#770](https://github.com/Basekick-Labs/arc/issues/770))
-
-`startSubscriber` now performs a compare-and-swap check under the manager lock after
-connecting, ensuring the reservation placeholder is still present and unmodified before
-installing the running subscriber. If a concurrent `Delete` or `Shutdown` cleared the
-reservation while the subscriber was connecting, the live subscriber is immediately stopped
-to prevent leaking broker connections and ingest writers. In addition, boot-time auto-start
-now uniformly reserves the slot placeholder and cleans up on failure.
-
-Contributed by [@Thundercloud12](https://github.com/Thundercloud12).
 
 ### Tiering no longer retries an unusable storage key every cycle ([#758](https://github.com/Basekick-Labs/arc/issues/758))
 

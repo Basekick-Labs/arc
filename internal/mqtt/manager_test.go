@@ -417,3 +417,40 @@ func TestManager_Start_PlaceholderCleanedOnFailure(t *testing.T) {
 		t.Errorf("status = %q, want %q", got.Status, StatusError)
 	}
 }
+
+// TestManager_Start_SkipsExistingSubscriber verifies that if a subscriber is
+// already installed or starting in the slot, Start will not overwrite it (#770).
+func TestManager_Start_SkipsExistingSubscriber(t *testing.T) {
+	mgr := newTestManager(t)
+	ctx := context.Background()
+
+	sub := &Subscription{
+		Name:      "auto-start-sub-existing",
+		Broker:    "tcp://localhost:1883",
+		ClientID:  "test-client-existing",
+		Topics:    []string{"sensors/#"},
+		QoS:       1,
+		Database:  "iot",
+		AutoStart: true,
+	}
+	sub.SetDefaults()
+	if err := mgr.repo.Create(ctx, sub); err != nil {
+		t.Fatalf("repo.Create: %v", err)
+	}
+
+	// Pre-install an existing subscriber in the slot.
+	existingSub := &Subscriber{}
+	mgr.subscribers[sub.ID] = existingSub
+
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("mgr.Start: %v", err)
+	}
+
+	mgr.mu.RLock()
+	cur := mgr.subscribers[sub.ID]
+	mgr.mu.RUnlock()
+
+	if cur != existingSub {
+		t.Fatalf("subscribers[%s] was overwritten; got %p, want %p", sub.ID, cur, existingSub)
+	}
+}
