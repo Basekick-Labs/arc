@@ -379,6 +379,11 @@ streamLoop:
 func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	start := time.Now()
 	m := metrics.Get()
+	// Counted here, at the same point as the JSON path (executeQuery), so that
+	// arc_query_requests_total covers both query endpoints. Without it the
+	// Arrow path incremented only arc_query_errors_total, so errors/requests
+	// could exceed 1 — or divide by zero — on an Arrow-only workload (#801).
+	m.IncQueryRequests()
 
 	// Parse request body
 	var req QueryRequest
@@ -757,6 +762,14 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		if rowCapReached(governanceMaxRows, totalRows) {
 			trailers.set(arrowRowsCappedTrailer, strconv.Itoa(governanceMaxRows))
 		}
+
+		// Mirror the JSON path's completion accounting (executeQuery). Without
+		// it the Arrow endpoint counted only its failures, so a successful
+		// Arrow query was invisible to every query counter and Arrow
+		// throughput could not be graphed at all (#801).
+		m.IncQuerySuccess()
+		m.IncQueryRows(totalRows)
+		m.RecordQueryLatency(time.Since(start).Microseconds())
 
 		h.logger.Info().
 			Int64("row_count", totalRows).
