@@ -52,6 +52,26 @@ var ErrNoLeaderKnown = errors.New("forward apply: no leader currently known")
 // just left the registry mid-flight). Caller should retry.
 var ErrLeaderUnreachable = errors.New("forward apply: leader address not in registry")
 
+// ErrForwardRejected is matched (errors.Is) by a leader's explicit rejection
+// of a forwarded command. The concrete error is a *ForwardRejectedError,
+// whose Code tells whether the rejection is definitive (auth, unknown node,
+// command type not allowed) or a Raft apply failure that a retry against the
+// current leader may clear.
+var ErrForwardRejected = errors.New("forward apply")
+
+// ForwardRejectedError is a leader's error ack to a forwarded command.
+type ForwardRejectedError struct {
+	Code    protocol.ForwardApplyCode
+	Message string
+}
+
+func (e *ForwardRejectedError) Error() string {
+	return fmt.Sprintf("forward apply: leader rejected (code=%s): %s", e.Code, e.Message)
+}
+
+// Is lets errors.Is(err, ErrForwardRejected) match.
+func (e *ForwardRejectedError) Is(target error) bool { return target == ErrForwardRejected }
+
 // forwardApplyTimeout bounds a single dial+send+recv round-trip to the
 // leader. 5 seconds is generous enough for slow networks and a Raft
 // quorum-commit on the leader side, while short enough that a stuck
@@ -95,8 +115,8 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 		return c.raftNode.Apply(cmd, forwardApplyTimeout)
 	}
 
-	leaderNode, ok := c.registry.Get(leaderID)
-	if !ok || leaderNode.Address == "" {
+	leaderAddr := c.leaderCoordinatorAddress(leaderID)
+	if leaderAddr == "" {
 		return fmt.Errorf("%w: leader_id=%s", ErrLeaderUnreachable, leaderID)
 	}
 
@@ -134,7 +154,7 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 	// dial + TLS handshake costs on the flush hot path. On any
 	// send/receive error, the connection is closed and the next call
 	// dials fresh (lazy reconnect).
-	conn, err := c.getOrDialLeader(ctx, leaderID, leaderNode.Address)
+	conn, err := c.getOrDialLeader(ctx, leaderID, leaderAddr)
 	if err != nil {
 		return fmt.Errorf("forward apply: %w", err)
 	}
@@ -195,7 +215,7 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 		if ack.Code == protocol.ForwardCodeNotLeader {
 			return fmt.Errorf("forward apply: %w", ErrNoLeaderKnown)
 		}
-		return fmt.Errorf("forward apply: leader rejected (code=%s): %s", ack.Code, ack.Error)
+		return &ForwardRejectedError{Code: ack.Code, Message: ack.Error}
 	}
 	return nil
 }
@@ -464,7 +484,11 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		cmd.Type == clusterraft.CommandDeleteMeasurementPermission ||
 		cmd.Type == clusterraft.CommandAddTokenToTeam ||
 		cmd.Type == clusterraft.CommandRemoveTokenFromTeam
-	if !isManifest && !isAuth && !isRBAC {
+	// A barrier mutates nothing, so any node the registry knows may forward
+	// one; the reader role, which the capability gate below would refuse for
+	// manifest writes, is exactly the node that needs it (#799).
+	isBarrier := cmd.Type == clusterraft.CommandBarrier
+	if !isManifest && !isAuth && !isRBAC && !isBarrier {
 		c.logger.Warn().
 			Str("requesting_node", req.NodeID).
 			Int("cmd_type", int(cmd.Type)).
@@ -570,4 +594,31 @@ func (c *Coordinator) sendForwardApplyError(conn net.Conn, reqNonce string, code
 	}, forwardApplyTimeout); err != nil {
 		c.logger.Debug().Err(err).Msg("ForwardApply: failed to send error ack")
 	}
+}
+
+// leaderCoordinatorAddress resolves the leader's coordinator address from the
+// in-memory registry, falling back to the FSM node table. A freshly restarted
+// follower's registry is refilled by the join flow (skipped once Raft already
+// knows a leader) and by AddNode entries replayed from the log (never fired
+// by a snapshot restore), so on the restart path the registry can be empty.
+// The FSM node table has the address as soon as the node's state is back:
+// immediately after a snapshot restore, or once the leader's replication
+// resumes for a node restarted from its log alone. Callers on the restart
+// path retry until then (#799).
+func (c *Coordinator) leaderCoordinatorAddress(leaderID string) string {
+	if c.registry != nil {
+		if node, ok := c.registry.Get(leaderID); ok && node.Address != "" {
+			return node.Address
+		}
+	}
+	fsm := c.raftFSM
+	if fsm == nil && c.raftNode != nil {
+		fsm = c.raftNode.FSM()
+	}
+	if fsm != nil {
+		if info, ok := fsm.GetNode(leaderID); ok && info.Address != "" {
+			return info.Address
+		}
+	}
+	return ""
 }

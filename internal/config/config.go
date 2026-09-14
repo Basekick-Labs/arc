@@ -664,7 +664,7 @@ type ClusterConfig struct {
 	// These control the startup walker and the repeatable manifest rechecks
 	// that keep a node in sync with the cluster manifest.
 	ReplicationCatchUpEnabled                bool    // Master switch for the catch-up walker. Emergency off-switch for pathologically large manifests. (default: true)
-	ReplicationCatchUpBarrierTimeoutMs       int     // Raft barrier timeout before walking the manifest — ensures the local FSM has applied every committed entry. (default: 10000)
+	ReplicationCatchUpBarrierTimeoutMs       int     // Bound on the pre-walk sync: the leader's Barrier, or on followers the forwarded barrier round trip plus the wait for it to apply locally (default: 30000; 0 or unset means the default, #799)
 	ReplicationCatchUpQueueHighWater         float64 // Queue-depth fraction above which the walker pauses enqueueing. Keeps the walker from racing workers on large manifests. (default: 0.8)
 	ReplicationReconciliationIntervalSeconds int     // Seconds between periodic manifest rechecks. (default: 300)
 
@@ -1718,7 +1718,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.replication_retry_max_attempts", 3)    // 3 immediate retries
 	// Peer file replication catch-up (Enterprise Phase 3)
 	v.SetDefault("cluster.replication_catchup_enabled", true)                // Walk the manifest on startup to reconcile missing files
-	v.SetDefault("cluster.replication_catchup_barrier_timeout_ms", 10000)    // 10s Raft barrier before walking
+	v.SetDefault("cluster.replication_catchup_barrier_timeout_ms", 30000)    // 30s: must outlast the leader's post-outage replication backoff (up to ~10s) plus a snapshot install (#799)
 	v.SetDefault("cluster.replication_catchup_queue_high_water", 0.8)        // Pause walker when queue is >80% full
 	v.SetDefault("cluster.replication_reconciliation_interval_seconds", 300) // Periodic manifest recheck interval
 	v.SetDefault("cluster.query_gate_on_catchup", false)                     // Off by default; opt-in correctness gate (#392)

@@ -98,7 +98,7 @@ cluster:
     serveTimeoutMs: 120000         # body-stream timeout (origin side)
     catchup:
       enabled: true                # walk the manifest on startup to close gaps
-      barrierTimeoutMs: 10000      # Raft barrier wait before walking
+      barrierTimeoutMs: 30000      # Pre-walk sync with the leader; must outlast the leader's post-outage replication backoff (~10s) (#799)
 
 # -----------------------------------------------------------------------------
 # Storage mode: "shared" or "local"
