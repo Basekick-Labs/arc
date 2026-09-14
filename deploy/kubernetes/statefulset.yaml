@@ -57,6 +57,19 @@ spec:
               value: ":9200"
             - name: ARC_CLUSTER_RAFT_ADVERTISE_ADDR
               value: "$(POD_NAME).arc-writer-headless.arc.svc.cluster.local:9200"
+            # Storage — set explicitly so data lands on the mounted volume.
+            # The default (./data/arc) is relative to the container working
+            # directory and is NOT guaranteed to be under the PVC mount.
+            - name: ARC_STORAGE_BACKEND
+              value: "local"
+            - name: ARC_STORAGE_LOCAL_PATH
+              value: "/app/data/storage"
+            # WAL — off by default in the binary. Without it, a crash loses
+            # every record buffered since the last flush.
+            - name: ARC_WAL_ENABLED
+              value: "true"
+            - name: ARC_WAL_DIRECTORY
+              value: "/app/data/wal"
             # License
             - name: ARC_LICENSE_KEY
               valueFrom:
@@ -149,6 +162,19 @@ spec:
               value: "$(POD_NAME).arc-reader-headless.arc.svc.cluster.local:9100"
             - name: ARC_CLUSTER_REPLICATION_ENABLED
               value: "true"
+            # Storage — set explicitly so data lands on the mounted volume.
+            # The default (./data/arc) is relative to the container working
+            # directory and is NOT guaranteed to be under the PVC mount.
+            - name: ARC_STORAGE_BACKEND
+              value: "local"
+            - name: ARC_STORAGE_LOCAL_PATH
+              value: "/app/data/storage"
+            # WAL — off by default in the binary. Without it, a crash loses
+            # every record buffered since the last flush.
+            - name: ARC_WAL_ENABLED
+              value: "true"
+            - name: ARC_WAL_DIRECTORY
+              value: "/app/data/wal"
             # License
             - name: ARC_LICENSE_KEY
               valueFrom:

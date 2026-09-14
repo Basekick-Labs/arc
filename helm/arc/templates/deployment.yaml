@@ -5,9 +5,7 @@ metadata:
   labels:
     {{- include "arc.labels" . | nindent 4 }}
 spec:
-  {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
-  {{- end }}
   strategy:
     {{- toYaml .Values.updateStrategy | nindent 4 }}
   selector:
@@ -47,6 +45,15 @@ spec:
               value: {{ .Values.arc.storageBackend | quote }}
             - name: ARC_STORAGE_LOCAL_PATH
               value: "/app/data/arc"
+            # The binary defaults wal.enabled to false. Without a WAL a crash
+            # loses every record buffered since the last flush (up to
+            # ingest.max_buffer_size records, or max_buffer_age_ms of data,
+            # per active buffer). The chart enables it by default and puts the
+            # WAL on the same volume as the data.
+            - name: ARC_WAL_ENABLED
+              value: {{ .Values.arc.wal.enabled | quote }}
+            - name: ARC_WAL_DIRECTORY
+              value: {{ .Values.arc.wal.directory | quote }}
             {{- with .Values.arc.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
