@@ -818,11 +818,31 @@ func main() {
 	}
 	shutdownCoordinator.Register("arrow-buffer", arrowBuffer, shutdown.PriorityBuffer)
 
-	// After ArrowBuffer flushes (priority 30) but before WAL closes (priority 40),
-	// purge WAL files since all data has been flushed to storage.
-	// This prevents recovery from replaying already-persisted data on next startup.
+	// Purge WAL files after ArrowBuffer has flushed (priority 30) and before the
+	// WAL writer closes (priority 40), so recovery does not replay data that is
+	// already persisted.
+	//
+	// This MUST be registered as a component, not a hook: the coordinator runs
+	// every hook before any component (see Coordinator.Shutdown), so a hook at
+	// priority 35 would run BEFORE the arrow-buffer component at 30 and purge
+	// the WAL while the data was still only in memory.
+	//
+	// The purge is additionally gated on the flush having actually succeeded.
+	// Purging after a failed flush (an object-store outage, expired
+	// credentials, a flush timeout) destroys the only remaining copy of that
+	// data — a graceful SIGTERM would lose records that a SIGKILL would have
+	// preserved (#803). Retaining a WAL that turns out to be redundant costs
+	// one idempotent replay on the next start; the periodic maintenance purge
+	// reclaims it afterwards.
 	if walWriter != nil {
-		shutdownCoordinator.RegisterHook("wal-purge", func(ctx context.Context) error {
+		shutdownCoordinator.Register("wal-purge", shutdownFunc(func() error {
+			if !arrowBuffer.CloseFlushedCleanly() {
+				log.Error().
+					Msg("Retaining WAL files: buffer flush did not complete cleanly on shutdown. " +
+						"Unflushed records remain in the WAL and will be replayed on next startup. " +
+						"Investigate the buffer flush errors logged above before clearing the WAL directory.")
+				return nil
+			}
 			deleted, err := walWriter.PurgeAll()
 			if err != nil {
 				log.Error().Err(err).Msg("Failed to purge WAL files on shutdown")
@@ -832,7 +852,7 @@ func main() {
 				log.Info().Int("deleted", deleted).Msg("Purged WAL files after clean buffer flush")
 			}
 			return nil
-		}, 35) // Between PriorityBuffer(30) and PriorityWAL(40)
+		}), 35) // Between PriorityBuffer(30) and PriorityWAL(40)
 	}
 
 	// Run WAL recovery NOW that ArrowBuffer is ready
@@ -3947,6 +3967,15 @@ func runCompactSubcommand(args []string) {
 		os.Exit(1)
 	}
 }
+
+// shutdownFunc adapts a plain func() error to shutdown.Shutdownable, so a
+// cleanup step can be ordered among components rather than hooks. The
+// coordinator runs every hook before any component, so ordering a step
+// relative to a registered component (e.g. after the arrow-buffer flush at
+// PriorityBuffer) requires registering it as a component too.
+type shutdownFunc func() error
+
+func (f shutdownFunc) Close() error { return f() }
 
 // writerClusterGate implements scheduler.WriterGate (satisfies both
 // scheduler.RetentionClusterGate and scheduler.CQClusterGate aliases).

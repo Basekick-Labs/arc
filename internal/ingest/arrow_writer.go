@@ -851,6 +851,27 @@ type ArrowBuffer struct {
 	// never closed; workers exit on b.ctx.Done()).
 	closing atomic.Bool
 
+	// closeFlushClean records whether Close()'s final flush persisted every
+	// buffered record. False until Close() completes successfully, so callers
+	// that read it early (or after a shutdown that never reached Close) treat
+	// the data as unflushed. Read via CloseFlushedCleanly; the shutdown WAL
+	// purge uses it to avoid deleting the only copy of unflushed data (#803).
+	closeFlushClean atomic.Bool
+
+	// walOnlyRecords counts records that left the in-memory buffers without
+	// reaching storage and therefore exist only in the WAL: enqueue rejections
+	// (tryEnqueueFlush's three fallback paths) and tasks still queued when
+	// Close() cancels the flush workers. It is the async counterpart to the
+	// synchronous flush errors Close() collects, and CloseFlushedCleanly
+	// requires it to be zero — purging the WAL while it is non-zero destroys
+	// the only copy of those records (#803).
+	walOnlyRecords atomic.Int64
+
+	// closeFailed latches true the first time a Close observes data that did
+	// not reach storage, so a subsequent Close cannot report a clean flush and
+	// re-enable the shutdown WAL purge (#803).
+	closeFailed atomic.Bool
+
 	// Sort key configuration (for multi-column sorting)
 	sortKeysConfig  map[string][]string // measurement -> sort keys
 	defaultSortKeys []string            // default sort keys
@@ -1575,6 +1596,7 @@ func (b *ArrowBuffer) tryEnqueueFlush(
 			Int("records", totalBuffered).
 			Msg("Flush queue send skipped: buffer is closing (data preserved in WAL)")
 		metrics.Get().IncWALRecordsPreserved(int64(totalBuffered))
+		b.walOnlyRecords.Add(int64(totalBuffered))
 		return flushSkipClosing
 	}
 	select {
@@ -1593,6 +1615,7 @@ func (b *ArrowBuffer) tryEnqueueFlush(
 			Int("records", totalBuffered).
 			Msg("Flush queue send aborted: ArrowBuffer ctx canceled (data preserved in WAL)")
 		metrics.Get().IncWALRecordsPreserved(int64(totalBuffered))
+		b.walOnlyRecords.Add(int64(totalBuffered))
 		return flushCtxCanceled
 	default:
 		flushCancel()
@@ -1603,6 +1626,7 @@ func (b *ArrowBuffer) tryEnqueueFlush(
 			Msg("Flush queue full - data preserved in WAL for recovery")
 		b.totalErrors.Add(1)
 		metrics.Get().IncWALRecordsPreserved(int64(totalBuffered))
+		b.walOnlyRecords.Add(int64(totalBuffered))
 		return flushQueueFull
 	}
 }
@@ -3717,7 +3741,9 @@ func (b *ArrowBuffer) FlushAll(ctx context.Context) error {
 //  2. Cancel b.ctx so flush workers exit via the <-b.ctx.Done() arm of
 //     their select. Data already enqueued is dropped in favor of WAL
 //     replay — that's the correct trade-off given a graceful shutdown
-//     should be quick.
+//     should be quick. Those records are counted into walOnlyRecords
+//     (see the drain after wg.Wait) so CloseFlushedCleanly reports
+//     false and the shutdown WAL purge is skipped (#803).
 //  3. We deliberately do NOT close(b.flushQueue). Workers exit on ctx
 //     cancellation; closing the channel would re-introduce the
 //     send-on-closed-channel race the closing flag was added to fix.
@@ -3738,7 +3764,47 @@ func (b *ArrowBuffer) Close() error {
 	// Wait for all workers to finish (they exit via b.ctx.Done())
 	b.wg.Wait()
 
+	// Account for flush tasks still sitting in the queue when the workers
+	// exited. Those records were already removed from shard.buffers at enqueue
+	// time, so the synchronous loop below will not see them: without this
+	// drain they would be invisible to CloseFlushedCleanly and the shutdown
+	// WAL purge would delete the only copy of them (#803).
+	//
+	// Workers have returned, so no one else receives from the queue; a
+	// non-blocking drain is race-free here.
+	abandoned := 0
+drain:
+	for {
+		select {
+		case task, ok := <-b.flushQueue:
+			if !ok {
+				// Not reachable today (see point 3 above: the queue is never
+				// closed), but a labelled break keeps this loop terminating if
+				// that ever changes — a bare break would only exit the select.
+				break drain
+			}
+			b.queueDepth.Add(-1)
+			abandoned += task.recordCount
+			b.walOnlyRecords.Add(int64(task.recordCount))
+			task.cancel() // release the task's timeout context
+		default:
+			break drain
+		}
+	}
+	if abandoned > 0 {
+		b.logger.Warn().
+			Int("records", abandoned).
+			Msg("Flush tasks abandoned on close; records remain in the WAL and will be replayed on next startup")
+		metrics.Get().IncWALRecordsPreserved(int64(abandoned))
+	}
+
 	b.logger.Info().Msg("All flush workers stopped, flushing remaining buffers")
+
+	// Collect per-buffer flush failures rather than only logging them: the
+	// shutdown WAL purge must not run when any buffer failed to reach storage
+	// (#803).
+	var flushErrs []error
+	totalBuffers := 0
 
 	// Flush all remaining buffers in all shards
 	for shardIdx := range b.shards {
@@ -3752,17 +3818,20 @@ func (b *ArrowBuffer) Close() error {
 		for key := range shard.buffers {
 			keys = append(keys, key)
 		}
+		totalBuffers += len(keys)
 
 		for _, key := range keys {
 			parts := splitBufferKey(key)
 			if len(parts) != 2 {
 				b.logger.Error().Str("buffer_key", key).Msg("Invalid buffer key format during close")
+				flushErrs = append(flushErrs, fmt.Errorf("invalid buffer key format: %q", key))
 				continue
 			}
 
 			flushCtx, flushCancel := context.WithTimeout(context.Background(), b.flushTimeout)
 			if err := b.flushBufferLocked(flushCtx, shard, key, parts[0], parts[1]); err != nil {
 				b.logger.Error().Err(err).Str("buffer_key", key).Msg("Failed to flush buffer during close")
+				flushErrs = append(flushErrs, fmt.Errorf("buffer %q: %w", key, err))
 			}
 			flushCancel()
 			// flushBufferLocked returns with the lock held (re-acquires after I/O)
@@ -3771,12 +3840,62 @@ func (b *ArrowBuffer) Close() error {
 		shard.mu.Unlock()
 	}
 
+	// Record whether every record reached durable storage. The WAL purge on
+	// shutdown consults this via CloseFlushedCleanly: purging the WAL after a
+	// failed flush destroys the only remaining copy of that data (#803).
+	//
+	// "Clean" requires three things, not just the synchronous flush:
+	//   - no synchronous flush returned an error (flushErrs)
+	//   - no records were dropped to WAL-replay, either rejected at enqueue or
+	//     abandoned in the queue above (walOnlyRecords)
+	//   - no earlier async flush failed (hasFlushFailure) — the same signal the
+	//     WAL maintenance loop already trusts
+	//
+	// The flag is latching: once a Close observes lost data it stays false for
+	// the lifetime of the buffer. closeFailed guards that, so a second Close
+	// (which finds no buffers left and no new errors) cannot report clean and
+	// re-enable the purge — a repeat call cannot un-lose already-lost data.
+	if len(flushErrs) > 0 || b.walOnlyRecords.Load() > 0 || b.hasFlushFailure.Load() {
+		b.closeFailed.Store(true)
+	}
+	b.closeFlushClean.Store(!b.closeFailed.Load())
+
 	b.logger.Info().
 		Int64("total_records_written", b.totalRecordsWritten.Load()).
 		Int64("total_flushes", b.totalFlushes.Load()).
+		Int("failed_buffers", len(flushErrs)).
 		Msg("ArrowBuffer closed")
 
+	if len(flushErrs) > 0 {
+		return fmt.Errorf("ArrowBuffer close flushed %d of %d buffers: %w",
+			totalBuffers-len(flushErrs), totalBuffers, errors.Join(flushErrs...))
+	}
+
 	return nil
+}
+
+// CloseFlushedCleanly reports whether every record this buffer accepted
+// reached durable storage by the time Close() finished.
+//
+// It accounts for all three ways a record can fail to land:
+//   - a synchronous flush error during Close()
+//   - a record dropped to WAL-replay, either rejected at enqueue
+//     (tryEnqueueFlush) or abandoned in the flush queue when Close() cancelled
+//     the workers
+//   - an earlier asynchronous flush failure (HasFlushFailure)
+//
+// It returns false until Close() has run to completion, so a caller that
+// consults it before Close() (or when Close() never ran, e.g. a shutdown that
+// timed out before reaching the buffer component) conservatively treats the
+// data as unflushed. It is latching: once false due to lost data it never
+// returns true again for this buffer.
+//
+// That bias is deliberate. The only consumer is the shutdown WAL purge, and
+// retaining a WAL that turns out to be redundant costs one idempotent replay,
+// whereas purging a WAL that was still needed is unrecoverable data loss
+// (#803).
+func (b *ArrowBuffer) CloseFlushedCleanly() bool {
+	return b.closeFlushClean.Load()
 }
 
 // GetStats returns buffer statistics

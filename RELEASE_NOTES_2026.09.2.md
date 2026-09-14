@@ -321,8 +321,62 @@ fails the build rather than leaving the note quietly wrong.
 7. **Edge-sync spoke IDs containing `:` must be re-registered before upgrade.**
    See *Edge-sync spoke IDs no longer create manifest-invalid keys* below;
    existing files remain under the old namespace.
+8. **A shutdown that cannot flush every buffer now exits with code 1.**
+   Previously it exited 0 regardless. Container runtimes will show the
+   container as errored rather than cleanly stopped, and the exit is
+   accompanied by a `Retaining WAL files: ...` log line. The data is safe — it
+   stays in the WAL and replays on the next start — but operators who alert on
+   container exit codes will see a new signal. See *A graceful shutdown could
+   delete the WAL that still held unflushed data* below. Pod restart behaviour
+   is unchanged (both charts use the Kubernetes default `restartPolicy:
+   Always`).
 
 ## Bug fixes
+
+### A graceful shutdown could delete the WAL that still held unflushed data ([#803](https://github.com/Basekick-Labs/arc/issues/803))
+
+**Any deployment running with `wal.enabled = true` should upgrade.** On shutdown, Arc
+flushes its in-memory buffers and then purges the WAL, on the premise that everything
+is now durable in Parquet. Two defects broke that premise, and together they could lose
+data on a *clean* `SIGTERM` that a hard `SIGKILL` would have preserved.
+
+First, the purge step ran in the wrong order. It was registered as a shutdown *hook*,
+but the coordinator runs every hook before any component, and the buffer flush is a
+*component* — so the WAL was deleted before the flush it was supposed to follow. The
+in-code comment claiming it ran "after ArrowBuffer flushes" described an ordering that
+never happened.
+
+Second, `ArrowBuffer.Close()` logged per-buffer flush failures and then returned
+success unconditionally, so nothing downstream could tell that records had not reached
+storage.
+
+The window is small but lands at the worst moment: a rolling restart or node drain
+during an object-store outage, expired storage credentials, or a flush timeout. Every
+Kubernetes rollout, eviction and drain issues `SIGTERM`, so this is reachable during
+routine operations, not only during incidents.
+
+The purge now runs after the flush, and only when the flush actually succeeded. It
+accounts for all three ways a record can fail to land: a synchronous flush error, a
+record dropped to WAL-replay (rejected at enqueue or abandoned in the flush queue when
+the workers are cancelled), and an earlier asynchronous flush failure. When any of
+those occurred, Arc keeps the WAL and logs:
+
+```
+Retaining WAL files: buffer flush did not complete cleanly on shutdown.
+Unflushed records remain in the WAL and will be replayed on next startup.
+```
+
+The retained WAL replays on the next start and is reclaimed by the periodic WAL
+maintenance sweep once the backend recovers, so this does not grow without bound. A
+healthy shutdown still purges exactly as before.
+
+**Behaviour change — new non-zero exit code.** A shutdown that could not flush every
+buffer now exits **1** instead of 0, because `Close()` reports the failure it
+previously swallowed. Container runtimes will show the container as errored rather than
+cleanly stopped. This is intentional: a shutdown that could not persist its data should
+not report success. Both Helm charts leave `restartPolicy` at the Kubernetes default of
+`Always`, so pod restart behaviour is unchanged; operators alerting on container exit
+codes should expect this signal to accompany the `Retaining WAL files` log line.
 
 ### Removing a manifest entry reopens the replication query gate without a restart ([#759](https://github.com/Basekick-Labs/arc/issues/759), [#795](https://github.com/Basekick-Labs/arc/issues/795))
 
