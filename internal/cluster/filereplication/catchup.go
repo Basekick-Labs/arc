@@ -256,7 +256,6 @@ func (p *Puller) walkManifest(ctx context.Context, fetch func(cursor string, lim
 				return result
 			}
 
-			marked := false
 			if startup {
 				// Fast-path self-origin entries so Enqueue does not create a
 				// catch-up tag for a file this node already owns.
@@ -265,7 +264,7 @@ func (p *Puller) walkManifest(ctx context.Context, fetch func(cursor string, lim
 					p.catchupSkippedLocal.Add(1)
 					continue
 				}
-				marked = p.markCatchUp(entry.Path)
+				p.markCatchUp(entry.Path)
 			}
 
 			source := enqueueSourceReconciliation
@@ -281,12 +280,10 @@ func (p *Puller) walkManifest(ctx context.Context, fetch func(cursor string, lim
 				case enqueueResultSkippedSelf, enqueueResultSkippedDuplicate:
 					p.catchupSkippedLocal.Add(1)
 				case enqueueResultDropped:
-					if marked {
-						// No worker will remove a tag when the queue rejects the
-						// entry, so compensate for the pre-enqueue mark.
-						p.unmarkCatchUp(entry.Path)
-					}
-					p.recordCatchUpDrop(entry.Path)
+					// enqueue's drop branch already removed the pre-enqueue tag
+					// and recorded the catch-up drop in the same critical section,
+					// so the count stays exact against a concurrent manifest
+					// delete (#795). Nothing to compensate here.
 				}
 			} else {
 				switch enqueueStatus {

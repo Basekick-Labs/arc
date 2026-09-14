@@ -146,6 +146,20 @@ type Config struct {
 	// walk. A nil gate allows reconciliation unconditionally.
 	ReconciliationGate func() bool
 
+	// ManifestHas reports whether path is still in the cluster manifest. The
+	// puller consults it before each pull attempt and before recording a
+	// catch-up failure or drop, so an entry deleted from the manifest
+	// (retention, compaction, the reconciliation sweep, an operator) while its
+	// pull was queued or in flight is dropped from the catch-up batch instead
+	// of counted against the query gate (#759, #795). It is never invoked with
+	// inflightMu held. nil means "always present", today's behaviour.
+	//
+	// Path membership only, not entry identity: a path deleted and
+	// re-registered with a new checksum while the old pull is in flight still
+	// reads as present; that stale pull fails its checksum and the path heals
+	// on the next successful pull, as before.
+	ManifestHas func(path string) bool
+
 	// Logger receives structured log output.
 	Logger zerolog.Logger
 }
@@ -211,6 +225,7 @@ type Puller struct {
 	totalPulled            atomic.Int64 // successful pulls
 	totalFailed            atomic.Int64 // gave up after retries
 	totalDropped           atomic.Int64 // queue full
+	totalSkippedGone       atomic.Int64 // deleted from the manifest while queued or in flight
 	totalChecksumMismatch  atomic.Int64 // bytes didn't match manifest SHA256
 	totalPeerLookupFailure atomic.Int64 // no candidate peers available
 	totalBadOffsetServer   atomic.Int64 // server rejected resume offset (AckCodeBadOffset)
@@ -242,7 +257,8 @@ type Puller struct {
 	// catchupFailedPaths holds catch-up paths whose pull permanently gave up
 	// after retries. catchupDroppedPaths holds catch-up paths the walker
 	// could not enqueue because the queue was full. Both are tracked so a
-	// later successful pull after the underlying issue clears can decrement the
+	// later successful pull after the underlying issue clears, or the entry
+	// being deleted from the manifest (OnManifestDelete), can decrement the
 	// corresponding scoped counter and let the gate self-heal without a process
 	// restart. All three sets share inflightMu with the in-flight map,
 	// which keeps finish/tag bookkeeping atomic.
@@ -267,8 +283,9 @@ type Puller struct {
 	// catch-up batch only. FullyCaughtUp uses these (not the cumulative
 	// totalFailed / totalDropped) so transient steady-state failures don't
 	// keep the gate red forever. Both self-heal when a later startup, reactive,
-	// or reconciliation pull succeeds for the affected path — see
-	// clearCatchUpFailure / clearCatchUpDrop.
+	// or reconciliation pull succeeds for the affected path, or when the entry
+	// leaves the manifest — see clearCatchUpFailure / clearCatchUpDrop and
+	// OnManifestDelete.
 	catchupFailed  atomic.Int64
 	catchupDropped atomic.Int64
 
@@ -391,11 +408,19 @@ func (p *Puller) removeCatchUpTagLocked(path string) {
 // the worker removes its in-flight entry. Reconciliation failures stay outside
 // startup bookkeeping, while any successful pull can heal a prior path failure
 // or drop.
-func (p *Puller) finishEntry(path string, source enqueueSource, failed, succeeded bool) {
+//
+// stillWanted is the caller's ManifestHas verdict, taken outside this lock. A
+// failure is recorded only for an entry the manifest still contains: one that
+// was deleted while the pull was queued or in flight can never be pulled and
+// must not hold the query gate (#795). The two orderings against a concurrent
+// delete both converge: if the delete lands after the check, OnManifestDelete
+// either removed the tag before we got here (nothing recorded) or clears the
+// failure right after it was recorded.
+func (p *Puller) finishEntry(path string, source enqueueSource, failed, succeeded, stillWanted bool) {
 	p.inflightMu.Lock()
 	defer p.inflightMu.Unlock()
 
-	if failed && source != enqueueSourceReconciliation && p.isCatchUpPathLocked(path) {
+	if failed && stillWanted && source != enqueueSourceReconciliation && p.isCatchUpPathLocked(path) {
 		p.recordCatchUpFailureLocked(path)
 	}
 	if succeeded {
@@ -437,8 +462,9 @@ func (p *Puller) markQuarantinedForLog(path string) bool {
 //
 // Returns true when this call actually added the tag (and incremented
 // catchupInflight). Returns false when the path was already tagged
-// (idempotent re-mark). RunCatchUp uses the return value to compensate
-// the increment if Enqueue ends up dropping the entry.
+// (idempotent re-mark). When Enqueue then drops the entry, its drop branch
+// removes the tag itself, in the same critical section that records the
+// catch-up drop, so the walker has nothing to compensate.
 func (p *Puller) markCatchUp(path string) bool {
 	p.inflightMu.Lock()
 	defer p.inflightMu.Unlock()
@@ -451,9 +477,9 @@ func (p *Puller) markCatchUp(path string) bool {
 }
 
 // unmarkCatchUp removes a catch-up tag and decrements catchupInflight.
-// Called by RunCatchUp to compensate when Enqueue drops an entry that was
-// pre-marked: with no inflight slot taken, no future inflightRemove will
-// run for this path, so the tag would otherwise leak.
+// Enqueue's drop branch does this itself for a pre-marked entry the queue
+// rejects, so production code no longer calls it; kept for tests that
+// build catch-up state by hand.
 func (p *Puller) unmarkCatchUp(path string) {
 	p.inflightMu.Lock()
 	defer p.inflightMu.Unlock()
@@ -501,8 +527,9 @@ func (p *Puller) recordCatchUpFailureLocked(path string) {
 
 // clearCatchUpFailure decrements the catch-up failure counter if the given
 // path was previously recorded as failed. Called from processEntry's success
-// path so any successful pull, including reconciliation, can heal the gate
-// without a process restart. No-op if the path was not previously failed.
+// path, so any successful pull, including reconciliation, can heal the gate
+// without a process restart, and from OnManifestDelete when the entry leaves
+// the manifest. No-op if the path was not previously failed.
 func (p *Puller) clearCatchUpFailure(path string) {
 	p.inflightMu.Lock()
 	defer p.inflightMu.Unlock()
@@ -518,10 +545,11 @@ func (p *Puller) clearCatchUpFailureLocked(path string) {
 }
 
 // recordCatchUpDrop adds a path to the dropped-catch-up set and increments
-// the catch-up drop counter. Called from RunCatchUp when the queue is full
-// and the walker can't enqueue an entry — there's no inflight slot to
-// later decrement, so we track the path here and rely on a reactive FSM
-// callback to eventually pull it. Idempotent.
+// the catch-up drop counter. The Locked variant is called from enqueue's
+// drop branch when the queue rejects a walker entry — there's no inflight
+// slot to later decrement, so we track the path here and rely on a reactive
+// FSM callback, a later pull, or the entry leaving the manifest to clear it.
+// Idempotent. This wrapper is used by tests.
 func (p *Puller) recordCatchUpDrop(path string) {
 	p.inflightMu.Lock()
 	defer p.inflightMu.Unlock()
@@ -537,9 +565,10 @@ func (p *Puller) recordCatchUpDropLocked(path string) {
 }
 
 // clearCatchUpDrop decrements the catch-up drop counter if the given path was
-// previously recorded as dropped. Called from processEntry's success path so
+// previously recorded as dropped. Called from processEntry's success path, so
 // any successful pull, including reconciliation, can heal the gate without a
-// process restart. No-op if the path was not previously dropped.
+// process restart, and from OnManifestDelete when the entry leaves the
+// manifest. No-op if the path was not previously dropped.
 func (p *Puller) clearCatchUpDrop(path string) {
 	p.inflightMu.Lock()
 	defer p.inflightMu.Unlock()
@@ -552,6 +581,124 @@ func (p *Puller) clearCatchUpDropLocked(path string) {
 	}
 	delete(p.catchupDroppedPaths, path)
 	p.catchupDropped.Add(-1)
+}
+
+// manifestHas is the nil-safe wrapper around cfg.ManifestHas. Fail-open: no
+// hook means "present", which is today's behaviour. Must not be called with
+// inflightMu held: the coordinator's hook takes the FSM read lock, and a
+// manifest page fetch can hold the FSM write lock for a full key sort.
+func (p *Puller) manifestHas(path string) bool {
+	return p.cfg.ManifestHas == nil || p.cfg.ManifestHas(path)
+}
+
+// forgetCatchUpPathLocked drops every trace of path from the catch-up batch:
+// a recorded failure, a recorded drop, the catch-up tag, and the once-per-
+// process quarantine log marker (so a re-registered bad path logs again). Each
+// step is membership-guarded, so it composes with the worker's own later
+// finishEntry without double-decrementing. Reports what it actually removed so
+// callers log only real changes.
+func (p *Puller) forgetCatchUpPathLocked(path string) (hadFailure, hadDrop, hadTag bool) {
+	_, hadFailure = p.catchupFailedPaths[path]
+	_, hadDrop = p.catchupDroppedPaths[path]
+	_, hadTag = p.catchupPaths[path]
+	p.clearCatchUpFailureLocked(path)
+	p.clearCatchUpDropLocked(path)
+	p.removeCatchUpTagLocked(path)
+	delete(p.quarantinedPaths, path)
+	return hadFailure, hadDrop, hadTag
+}
+
+// OnManifestDelete is the FSM delete callback's hook (#759, #795). Removing an
+// entry from the cluster manifest is the operator's remedy for a file no peer
+// can serve, and retention, compaction and the reconciliation sweep remove
+// entries the same way; from this node's point of view the pull is no longer
+// wanted, so nothing about it may hold the query gate.
+//
+// Removing the catch-up tag, not only the recorded failure, is what makes the
+// timing safe: if the pull is still queued or in flight, the worker's deferred
+// finishEntry finds no tag and records nothing, and the gate reopens now
+// rather than after the remaining retries. The in-flight slot itself is left
+// to the worker, which owns it and checks ManifestHas before its next attempt.
+//
+// A delete that lands before the walker has tagged the entry (the walker can
+// wait minutes mid-page at queue high water) finds nothing here; that ordering
+// is covered by ManifestHas in processEntry, finishEntry and enqueue's drop
+// branch.
+//
+// Called synchronously on the Raft apply goroutine and must not block: it only
+// takes inflightMu, whose holders are all map-only sections. Safe on a stopped
+// puller.
+func (p *Puller) OnManifestDelete(path string) {
+	p.inflightMu.Lock()
+	hadFailure, hadDrop, hadTag := p.forgetCatchUpPathLocked(path)
+	p.inflightMu.Unlock()
+
+	switch {
+	case hadFailure || hadDrop:
+		p.logger.Info().
+			Str("path", path).
+			Bool("cleared_failure", hadFailure).
+			Bool("cleared_drop", hadDrop).
+			Int64("catchup_failed", p.catchupFailed.Load()).
+			Int64("catchup_dropped", p.catchupDropped.Load()).
+			Msg("Manifest entry deleted; its catch-up failure no longer holds the query gate")
+	case hadTag:
+		p.logger.Debug().
+			Str("path", path).
+			Msg("Manifest entry deleted while its catch-up pull was pending; dropped from the catch-up batch")
+	}
+}
+
+// pruneStaleCatchUpState clears recorded catch-up failures and drops for paths
+// the manifest no longer contains. OnManifestDelete does this synchronously
+// for every delete that goes through the log, but a follower that restores
+// from a Raft snapshot rebuilds its manifest with no callbacks at all, so
+// anything recorded for a path absent from the snapshot would hold the gate
+// red until restart. Runs on every periodic reconciliation tick, before the
+// eligibility gate. Lookups happen outside inflightMu; each clear is
+// membership-guarded, so a path OnManifestDelete already handled cannot be
+// decremented twice. A path re-recorded between the lookup and the clear is
+// cleared with the stale verdict; the FSM callback or the next tick settles it.
+func (p *Puller) pruneStaleCatchUpState() {
+	if p.cfg.ManifestHas == nil {
+		return
+	}
+	p.inflightMu.Lock()
+	candidates := make([]string, 0, len(p.catchupFailedPaths)+len(p.catchupDroppedPaths))
+	for path := range p.catchupFailedPaths {
+		candidates = append(candidates, path)
+	}
+	for path := range p.catchupDroppedPaths {
+		if _, dup := p.catchupFailedPaths[path]; !dup {
+			candidates = append(candidates, path)
+		}
+	}
+	p.inflightMu.Unlock()
+
+	pruned := 0
+	var sample string
+	for _, path := range candidates {
+		if p.manifestHas(path) {
+			continue
+		}
+		p.inflightMu.Lock()
+		hadFailure, hadDrop, _ := p.forgetCatchUpPathLocked(path)
+		p.inflightMu.Unlock()
+		if hadFailure || hadDrop {
+			pruned++
+			if sample == "" {
+				sample = path
+			}
+		}
+	}
+	if pruned > 0 {
+		p.logger.Info().
+			Int("pruned", pruned).
+			Str("sample_path", sample).
+			Int64("catchup_failed", p.catchupFailed.Load()).
+			Int64("catchup_dropped", p.catchupDropped.Load()).
+			Msg("Cleared catch-up failures for entries no longer in the cluster manifest")
+	}
 }
 
 // Start launches the worker pool. Safe to call multiple times — subsequent
@@ -617,6 +764,7 @@ func (p *Puller) startPeriodicReconciliation(fetch func(cursor string, limit int
 			case <-ctx.Done():
 				return
 			case <-timer.C:
+				p.pruneStaleCatchUpState()
 				if !p.reconciliationAllowed() {
 					p.recheckGated.Add(1)
 					p.logger.Info().
@@ -694,10 +842,26 @@ func (p *Puller) enqueue(entry *raft.FileEntry, source enqueueSource) enqueueRes
 		// Queue full — release the inflight slot so a future retry can
 		// re-enqueue this path, and count the drop. A periodic request must
 		// not clear startup catch-up tags while releasing its own slot.
+		//
+		// Only the walker's own drop touches catch-up state: the pre-enqueue
+		// tag is removed and the catch-up drop recorded in the same critical
+		// section, only while the tag is still present and only for an entry
+		// the manifest still contains. That keeps catchup_dropped exact against
+		// a concurrent manifest delete: delete first, the tag is gone and
+		// nothing is recorded; delete after, OnManifestDelete clears the record
+		// (#795). ManifestHas is evaluated before taking the lock. A reactive
+		// drop leaves a pending walker tag alone: such a tag exists only inside
+		// the walker's mark→enqueue window, and the walker's own enqueue always
+		// resolves it (a worker's finishEntry, or this branch).
+		stillWanted := source != enqueueSourceCatchUp || p.manifestHas(entry.Path)
 		p.inflightMu.Lock()
 		p.removeInflightOnlyLocked(entry.Path)
-		if source != enqueueSourceReconciliation {
+		if source == enqueueSourceCatchUp {
+			_, tagged := p.catchupPaths[entry.Path]
 			p.removeCatchUpTagLocked(entry.Path)
+			if tagged && stillWanted {
+				p.recordCatchUpDropLocked(entry.Path)
+			}
 		}
 		p.inflightMu.Unlock()
 		dropped := p.totalDropped.Add(1)
@@ -722,6 +886,7 @@ func (p *Puller) Stats() map[string]int64 {
 		"skipped_self":                       p.totalSkippedSelf.Load(),
 		"skipped_local":                      p.totalSkippedLocal.Load(),
 		"skipped_dup":                        p.totalSkippedDup.Load(),
+		"skipped_gone":                       p.totalSkippedGone.Load(),
 		"pulled":                             p.totalPulled.Load(),
 		"failed":                             p.totalFailed.Load(),
 		"dropped":                            p.totalDropped.Load(),
@@ -777,11 +942,14 @@ func (p *Puller) CatchUpCompleted() bool {
 // "no pulls are happening anywhere right now."
 //
 // Self-heal: catchupFailed and catchupDropped both decrement when a later
-// successful pull resolves a previously-affected path, so transient peer
-// outages or queue-saturation events during catch-up don't require a process
-// restart to clear the gate. Periodic reconciliation cannot create or remove
-// startup tags, and its failures cannot reopen readiness, but its successful
-// pulls can heal existing path state. The puller tracks affected paths in
+// successful pull resolves a previously-affected path, or when the entry is
+// deleted from the cluster manifest (OnManifestDelete, fired by the FSM on
+// every node; pruneStaleCatchUpState covers snapshot restores, which fire no
+// callbacks), so transient peer outages, queue-saturation events, and entries
+// no peer can serve don't require a process restart to clear the gate.
+// Periodic reconciliation cannot create or remove startup tags, and its
+// failures cannot reopen readiness, but its successful pulls can heal
+// existing path state. The puller tracks affected paths in
 // catchupFailedPaths and catchupDroppedPaths; worker success calls
 // clearCatchUpFailure and clearCatchUpDrop (both are no-ops when the path was
 // never recorded).
@@ -852,6 +1020,9 @@ func (p *Puller) CatchUpStatus() map[string]int64 {
 		// lands in the query gate's 503 body, and "invalid_path > 0" is the one
 		// reason a red gate will never go green on its own.
 		"invalid_path": p.totalInvalidPath.Load(),
+		// Pulls abandoned because their entry left the manifest: the one reason a
+		// catchup_inflight drop has no matching pulled/failed (#795).
+		"skipped_gone": p.totalSkippedGone.Load(),
 
 		// Catch-up-batch-scoped counters (added in 26.06.1 for the query
 		// gate). Non-zero means the gate is closed for a reason FullyCaughtUp
@@ -923,11 +1094,29 @@ func (p *Puller) processEntry(log zerolog.Logger, request *pullRequest) {
 	// one lock. A reactive pull may already be in flight when RunCatchUp starts,
 	// so the walker can add the tag after this worker began processing it.
 	defer func() {
-		p.finishEntry(entry.Path, request.source, failed, succeeded)
+		// ManifestHas is consulted outside inflightMu (see manifestHas) and
+		// only when there is a failure to record.
+		stillWanted := !failed || p.manifestHas(entry.Path)
+		p.finishEntry(entry.Path, request.source, failed, succeeded, stillWanted)
 	}()
 
 	for attempt := 1; attempt <= p.cfg.RetryMaxAttempts; attempt++ {
 		if p.ctx.Err() != nil {
+			return
+		}
+
+		// The manifest can drop this entry while it sits in the queue or
+		// between attempts (retention, compaction, the reconciliation sweep,
+		// an operator). Stop pulling: the bytes are unwanted, every peer will
+		// answer not-found, and a failure here must not count against the
+		// query gate. Neither failed nor succeeded is set, so finishEntry only
+		// releases the tag and the inflight slot (#795).
+		if !p.manifestHas(entry.Path) {
+			p.totalSkippedGone.Add(1)
+			log.Debug().
+				Str("path", entry.Path).
+				Int("attempt", attempt).
+				Msg("Manifest entry deleted while its pull was pending; skipping")
 			return
 		}
 
@@ -967,7 +1156,7 @@ func (p *Puller) processEntry(log zerolog.Logger, request *pullRequest) {
 					Err(statErr).
 					Str("path", entry.Path).
 					Str("origin_node_id", entry.OriginNodeID).
-					Msg("Manifest entry names a storage key no backend can address; not pulling it from any peer. It cannot be replicated here and, if the query gate is enabled, it holds the gate closed until the entry is removed from the cluster manifest AND this node is restarted: only a successful pull of the same path clears the catch-up failure, and this one can never succeed")
+					Msg("Manifest entry names a storage key no backend can address; not pulling it from any peer. It cannot be replicated here and, if the query gate is enabled, it holds the gate closed until the entry is removed from the cluster manifest, and reopens as soon as it is. Nothing removes an unaddressable key automatically: retention cannot read it and the reconciliation sweep only reports it; the operator delete endpoint is tracked in #794")
 			}
 			return
 		}
@@ -996,6 +1185,21 @@ func (p *Puller) processEntry(log zerolog.Logger, request *pullRequest) {
 			}
 			err := p.pullOnce(log, entry, peerAddr, attempt)
 			if err == nil {
+				// The entry may have left the manifest while the bytes were in
+				// transit. This node's own delete worker may already have
+				// unlinked the path (500 ms grace after the FSM callback), and
+				// the finalize rename above would resurrect it as an orphan the
+				// read glob serves. Remove it and count the pull as abandoned;
+				// neither failed nor succeeded, so finishEntry only releases.
+				if !p.manifestHas(entry.Path) {
+					p.totalSkippedGone.Add(1)
+					p.deleteFile(log, entry.Path)
+					log.Debug().
+						Str("path", entry.Path).
+						Str("peer", peerAddr).
+						Msg("Manifest entry deleted while its pull was in transit; local copy removed")
+					return
+				}
 				p.totalPulled.Add(1)
 				log.Info().
 					Str("path", entry.Path).
