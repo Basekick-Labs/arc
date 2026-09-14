@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -38,6 +39,61 @@ func newTestReceiver(t *testing.T) (*Receiver, storage.Backend) {
 }
 
 const testPath = "metrics/cpu/2026/08/07/14/cpu_123.parquet"
+
+func syncPathWithLength(n int) string {
+	const suffix = ".parquet"
+	const finalSegmentLen = 200
+	segments := (n - finalSegmentLen) / 2
+	finalLen := n - 2*segments
+	return strings.Repeat("a/", segments) +
+		strings.Repeat("f", finalLen-len(suffix)) + suffix
+}
+
+func TestReceiver_SourcePathBudgetMatchesStoredKeys(t *testing.T) {
+	ctx := context.Background()
+	r, backend := newTestReceiver(t)
+	spokeID := strings.Repeat("s", MaxSpokeIDLen)
+	maxLen := sourcePathMaxLen(spokeID)
+	validPath := syncPathWithLength(maxLen)
+	oversizedPath := syncPathWithLength(maxLen + 1)
+	digest := sha256Hex(nil)
+
+	for name, p := range map[string]string{
+		"namespaced": NamespacedPath(spokeID, validPath),
+		"staging":    stagingPathFor(spokeID, validPath),
+	} {
+		if err := storage.ValidateKey(p); err != nil {
+			t.Fatalf("%s key validation: %v", name, err)
+		}
+	}
+
+	if err := validateSyncPathForSpoke(spokeID, validPath); err != nil {
+		t.Fatalf("longest valid source path: %v", err)
+	}
+	if runtime.GOOS != "darwin" {
+		res, err := r.Receive(ctx, spokeID, validPath, digest, 0, 0, bytes.NewReader(nil))
+		if err != nil {
+			t.Fatalf("longest valid source path receive: %v", err)
+		}
+		if res.Outcome != OutcomeCommitted {
+			t.Fatalf("longest valid source path outcome = %q, want %q", res.Outcome, OutcomeCommitted)
+		}
+		if exists, err := backend.Exists(ctx, NamespacedPath(spokeID, validPath)); err != nil {
+			t.Fatalf("check longest valid source path: %v", err)
+		} else if !exists {
+			t.Fatal("longest valid source path was not committed")
+		}
+	} else {
+		// macOS cannot represent this exact key once the temporary backend
+		// directory is included in the absolute filesystem path.
+		t.Log("skipping physical max-length LocalBackend write on darwin")
+	}
+	if _, err := r.Receive(ctx, spokeID, oversizedPath, digest, 0, 0, bytes.NewReader(nil)); err == nil {
+		t.Fatal("source path one byte over budget was accepted")
+	} else if errors.Is(err, ErrReceiveInternal) {
+		t.Fatalf("oversized source path became an internal error: %v", err)
+	}
+}
 
 func TestReceiver_CommitsVerifiedFile(t *testing.T) {
 	ctx := context.Background()
@@ -329,6 +385,8 @@ func TestReceiver_RejectsMaliciousSpokeIDs(t *testing.T) {
 		{"traversal", ".."},
 		{"separator", "rocket/../other"},
 		{"backslash", "rocket\\other"},
+		{"colon", "rocket:01"},
+		{"colon in short ID", "a:b"},
 		{"dot prefix", ".sync-staging"},
 		{"NUL byte", "rocket\x00-01"},
 		// #737: accepted by every other check, but the local backend folds
@@ -346,6 +404,16 @@ func TestReceiver_RejectsMaliciousSpokeIDs(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if _, err := r.Receive(ctx, tt.id, testPath, sha256Hex(content), int64(len(content)), 0, bytes.NewReader(content)); err == nil {
 				t.Errorf("spoke ID %q was accepted", tt.id)
+			}
+		})
+	}
+}
+
+func TestValidateSpokeIDAcceptsExistingIDs(t *testing.T) {
+	for _, id := range []string{"rocket-01", "rocket_01", "edge01", "Rocket East"} {
+		t.Run(id, func(t *testing.T) {
+			if err := validateSpokeID(id); err != nil {
+				t.Errorf("spoke ID %q was rejected: %v", id, err)
 			}
 		})
 	}

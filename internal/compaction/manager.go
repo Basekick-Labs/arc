@@ -414,6 +414,12 @@ func (m *Manager) FindCandidates(ctx context.Context) ([]Candidate, error) {
 
 	m.logger.Info().Msg("Scanning for compaction candidates")
 
+	tiers := enabledTiers(m.Tiers)
+	if len(tiers) == 0 {
+		m.logger.Info().Int("candidates", 0).Msg("Found compaction candidates")
+		return nil, nil
+	}
+
 	// Discover all databases. Namespace expansion here too, so the
 	// candidates listing endpoint previews the same partitions a cycle
 	// would actually process (#619 review F4).
@@ -434,24 +440,20 @@ func (m *Manager) FindCandidates(ctx context.Context) ([]Candidate, error) {
 			continue
 		}
 
-		// Find candidates for each measurement across all tiers
+		// Find candidates for each measurement across all tiers. Nothing
+		// changes the store between tiers here, so one listing serves them
+		// all (#316).
 		for _, meas := range measurements {
-			for _, tier := range m.Tiers {
-				if !tier.IsEnabled() {
-					continue
-				}
-
-				tierCandidates, err := tier.FindCandidates(ctx, database, meas)
-				if err != nil {
-					m.logger.Error().Err(err).
-						Str("database", database).
-						Str("measurement", meas).
-						Str("tier", tier.GetTierName()).
-						Msg("Failed to find candidates")
-					continue
-				}
-
-				candidates = append(candidates, tierCandidates...)
+			objects, err := m.StorageBackend.List(ctx, measurementPrefix(database, meas))
+			if err != nil {
+				m.logger.Error().Err(err).
+					Str("database", database).
+					Str("measurement", meas).
+					Msg("Failed to list measurement objects")
+				continue
+			}
+			for _, tier := range tiers {
+				candidates = append(candidates, tier.FindCandidatesFromListing(database, meas, objects)...)
 			}
 		}
 	}
@@ -903,6 +905,11 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 	totalCandidates := 0
 	totalErrors := 0
 
+	// Listings are deliberately NOT shared across tiers here, unlike in
+	// FindCandidates: hourly jobs delete their inputs and write their
+	// `_compacted` outputs, and the cycle waits for the whole tier before
+	// daily starts, so a listing taken for hourly is stale by the time daily
+	// would read it. Each tier lists the measurement itself (#316).
 	for _, tier := range m.Tiers {
 		if !tier.IsEnabled() {
 			continue
@@ -1434,4 +1441,15 @@ func (l *LockManager) IsLocked(key string) bool {
 	defer l.mu.Unlock()
 
 	return l.locks[key]
+}
+
+// enabledTiers returns the enabled tiers, in order.
+func enabledTiers(tiers []Tier) []Tier {
+	var out []Tier
+	for _, tier := range tiers {
+		if tier.IsEnabled() {
+			out = append(out, tier)
+		}
+	}
+	return out
 }

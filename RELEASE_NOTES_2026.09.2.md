@@ -318,6 +318,10 @@ fails the build rather than leaving the note quietly wrong.
    with `governance.enabled = true` and a `max_rows_per_query` policy can see
    them at all.
 
+7. **Edge-sync spoke IDs containing `:` must be re-registered before upgrade.**
+   See *Edge-sync spoke IDs no longer create manifest-invalid keys* below;
+   existing files remain under the old namespace.
+
 ## Bug fixes
 
 ### MQTT startSubscriber validates reservation before installing live subscriber ([#770](https://github.com/Basekick-Labs/arc/issues/770))
@@ -330,6 +334,62 @@ to prevent leaking broker connections and ingest writers. In addition, boot-time
 now uniformly reserves the slot placeholder and cleans up on failure.
 
 Contributed by [@Thundercloud12](https://github.com/Thundercloud12) in [#788](https://github.com/Basekick-Labs/arc/pull/788).
+
+### Edge-sync rejects source paths that exceed the hub storage budget ([#757](https://github.com/Basekick-Labs/arc/issues/757))
+
+The hub now accounts for spoke namespace and staging prefixes before accepting an edge-sync source path, returning a client error instead of retryable 503 responses for paths it cannot store.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#783](https://github.com/Basekick-Labs/arc/pull/783).
+
+### Backup no longer skips temp-file write failures ([#779](https://github.com/Basekick-Labs/arc/issues/779))
+
+Backup now treats failures writing its temporary file as fatal instead of
+misclassifying them as unreadable source files and counting them as skipped.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#784](https://github.com/Basekick-Labs/arc/pull/784).
+
+### Remaining DuckDB string-literal escaping uses the shared helper ([#781](https://github.com/Basekick-Labs/arc/issues/781))
+
+The remaining compaction and database DuckDB string-literal escaping now uses
+the shared `sqlutil` helper. Compaction no longer incorrectly doubles ordinary
+backslashes in standard DuckDB string literals.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#782](https://github.com/Basekick-Labs/arc/pull/782).
+
+### The compaction candidates preview lists each measurement once ([#316](https://github.com/Basekick-Labs/arc/issues/316))
+
+`GET /api/v1/compaction/candidates` asked every enabled compaction tier for
+its candidates, and each tier listed the same `database/measurement/` prefix
+in the object store itself, so with hourly and daily enabled every measurement
+was listed twice per call. On a bucket with many files the listing is the
+expensive part of the request. The tiers can now scan a listing the caller
+already holds, and the preview lists each measurement once and hands the
+result to every tier. The scheduled compaction cycle is unchanged: it keeps
+one listing per tier on purpose, because hourly deletes its inputs before
+daily runs.
+
+Contributed by [@alexeymoskalev-devops](https://github.com/alexeymoskalev-devops) in [#789](https://github.com/Basekick-Labs/arc/pull/789).
+
+### Metadata cache invalidation is ordered with cache fills ([#344](https://github.com/Basekick-Labs/arc/issues/344))
+
+Removed the redundant `MetadataStore` mutex that duplicated the serialization
+provided by the SQLite connection pool. Tier-cache fills are now ordered against
+invalidation with a generation counter, preventing stale query results from
+being stored after an invalidation.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#777](https://github.com/Basekick-Labs/arc/pull/777).
+
+### Edge-sync spoke IDs no longer create manifest-invalid keys ([#751](https://github.com/Basekick-Labs/arc/issues/751))
+
+Spoke IDs containing a colon, such as `rocket:01`, are now rejected during
+registration and input validation because the resulting storage key would be
+refused by the cluster manifest path validator.
+
+A spoke registered with a colon before this version is refused after upgrade:
+the hub rejects its syncs and the spoke will not start. Re-register it under a
+new ID; files already written under the old namespace stay where they are.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#776](https://github.com/Basekick-Labs/arc/pull/776).
 
 ### Retention reports files hidden by storage listings ([#771](https://github.com/Basekick-Labs/arc/issues/771))
 

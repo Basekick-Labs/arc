@@ -296,9 +296,9 @@ func TestRestore_MetadataSkipsDoNotMaskMissingDataFiles(t *testing.T) {
 // not a skipped object. The temp file is opened read-only so its writes fail.
 func TestRestore_TempWriteFailureIsFatalNotSkipped(t *testing.T) {
 	backupDir, backupID, _ := makeRestorableBackup(t, 3)
-	orig := createRestoreTemp
-	t.Cleanup(func() { createRestoreTemp = orig })
-	createRestoreTemp = func() (*os.File, error) {
+	orig := createTempFile
+	t.Cleanup(func() { createTempFile = orig })
+	createTempFile = func(pattern string) (*os.File, error) {
 		p := filepath.Join(t.TempDir(), "ro.parquet")
 		if err := os.WriteFile(p, nil, 0o600); err != nil {
 			return nil, err
