@@ -338,6 +338,26 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Shutdown no longer deadlocks when a manifest delete is applied while the coordinator stops ([#797](https://github.com/Basekick-Labs/arc/issues/797))
+
+`Coordinator.Stop` holds the coordinator lock for its whole body, including stopping the Raft node,
+and Raft's shutdown waits for its apply goroutine to finish. The FSM delete callback that unlinks a
+replicated file locally ran on that goroutine and took the same lock to read the storage backend, so a
+`DeleteFile` or batch delete (retention, compaction, the reconciliation sweep) applied while the node
+was stopping blocked the apply goroutine on the lock, the Raft shutdown waited on it, and `Stop` never
+returned: the process hung until its supervisor killed it. Any node with `replication_enabled` (writers
+and compactors run the puller too) could hit it, most likely during a retention window; on nodes with
+writer or compactor failover enabled the hang showed up earlier, inside the failover manager's stop,
+because its Raft futures wait on the same blocked goroutine.
+
+The callback now uses the storage backend and delete queue captured when it was registered (both are
+set once, before the callbacks exist) and takes no coordinator lock. FSM callbacks run on the Raft apply
+goroutine that shutdown waits on and must take neither the coordinator lock nor the Raft node's; that
+contract is now documented where they are registered, and a test holds the coordinator lock while
+applying every command type wired in the cluster package to enforce it. `Stop` also unregisters the
+file callbacks once Raft is joined, so an in-process restart cannot replay a delete into a queue the
+previous run had closed.
+
 ### `server.shutdown_timeout` was parsed and then ignored ([#805](https://github.com/Basekick-Labs/arc/issues/805))
 
 The key was documented, defaulted, read into config, and plumbed into the HTTP server config — and then never used. Three separate shutdown budgets hardcoded 30 seconds instead, so an operator who raised the value to give a slow object store more room to flush got no effect at all.
@@ -403,7 +423,6 @@ The default `cluster.replication_catchup_barrier_timeout_ms` moves from 10000 to
 longer than ~10 s the leader's replication to the returning follower backs off for up to 10.24 s, and
 the old default expired at that edge. On timeout the node proceeds as before and logs its applied,
 commit and last log index.
-## Bug fixes
 ### Buffer, audit and MQTT metrics that were exported but never populated ([#802](https://github.com/Basekick-Labs/arc/issues/802))
 
 Several metrics were exported at `/metrics` with HELP and TYPE strings and then never incremented, so they scraped as a permanent `0`. That is worse than an absent metric: a panel built on one looks healthy rather than broken. These are now wired.
