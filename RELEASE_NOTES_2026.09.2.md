@@ -338,6 +338,25 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Iceberg export on an edge-sync hub produced one garbage table per spoke ([#634](https://github.com/Basekick-Labs/arc/issues/634))
+
+**Affects hubs only** — a node receiving edge-sync data with `iceberg.enabled = true`.
+
+A hub stores received data one level deeper than local data: `{spoke_id}/{db}/{measurement}/{y}/{m}/{d}/{h}/*.parquet`. The Iceberg walk read the top two directory levels as `(database, measurement)`, so a spoke `rocket-01` holding database `factory` was discovered as **one** measurement named `factory` in a database named `rocket-01`.
+
+Every Parquet file from **every** measurement under that spoke then landed in a single file list, and their schemas were unioned. Either the union failed on a cross-measurement type collision — logging an error every pass, forever — or it succeeded and minted a catalog table `arc_rocket-01.factory` mixing all measurements into one franken-schema. Hub compaction then churned those file sets, snapshotting the garbage every cycle.
+
+Compaction learned to expand spoke namespaces in 26.09.1 ([#619](https://github.com/Basekick-Labs/arc/issues/619)); the Iceberg source never got the same treatment. It does now: spoke namespaces expand into `{spoke}/{db}` pseudo-databases with their real measurements, so received data exports as the tables it actually is.
+
+The separator is mapped to `.` in the Iceberg namespace (`arc_rocket-01.factory`), because the SQL catalog names namespace directories `<namespace>.db` and an unsanitized slash would nest that directory one level deeper than the warehouse walk expects — feeding the exporter's own metadata back in as a user database. A real Arc database name cannot contain a `.`, so there is no collision with a genuine database.
+
+If the spoke lookup fails, spoke namespaces are **skipped** for that pass rather than exported un-expanded: exporting them wrong mints catalog tables that then have to be cleaned up by hand, so skipping is the cheaper failure.
+
+<Callout type="warn" title="Existing hubs may already have garbage tables">
+If you ran `iceberg.enabled` on a hub before this release, the catalog may contain a table per spoke namespace (`arc_<spoke>.<db>`) whose schema is a union of unrelated measurements. Those tables are not repaired automatically — drop them, and the next reconcile pass will create the correct per-measurement tables.
+</Callout>
+
+
 ### Iceberg export reported successful snapshot expiry as failure, and published dangling metadata ([#632](https://github.com/Basekick-Labs/arc/issues/632))
 
 **Anyone running `iceberg.enabled = true` should upgrade.** Once a table's history exceeded `iceberg.retain_snapshots`, every reconcile pass logged

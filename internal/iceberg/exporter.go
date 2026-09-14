@@ -128,8 +128,22 @@ func NewExporter(db *sql.DB, backend storage.Backend, warehouse, nsPrefix string
 
 // tableIdent maps an Arc (database, measurement) to an Iceberg table identifier under the
 // exporter namespace. Namespace = "<nsPrefix>_<database>" so multiple Arc databases coexist.
+//
+// An edge-sync spoke pseudo-database is "{spoke}/{db}" (#634). The separator is mapped to "."
+// so the namespace stays a single path token: the SQL catalog names namespace directories
+// "<namespace>.db", and an unsanitized slash would nest that directory one level deeper than
+// the warehouse walk expects — which isWarehouseDir would then fail to recognise, feeding the
+// exporter's own metadata back in as a user database. "." is safe because a real Arc database
+// name cannot contain one (letter-first, then [A-Za-z0-9_-]), so "rocket-01/telemetry" can
+// never collide with a real database. Same mapping compaction uses for job IDs (#619).
 func (e *Exporter) tableIdent(database, measurement string) icetable.Identifier {
-	return icetable.Identifier{e.nsPrefix + "_" + database, measurement}
+	return icetable.Identifier{e.nsPrefix + "_" + sanitizeNamespaceDB(database), measurement}
+}
+
+// sanitizeNamespaceDB maps a database name to a single path-safe namespace token.
+// Plain names pass through unchanged; spoke pseudo-databases lose their separator.
+func sanitizeNamespaceDB(database string) string {
+	return strings.ReplaceAll(database, "/", ".")
 }
 
 // ArcSchema describes the typed columns of one measurement, as derived from a Parquet file's

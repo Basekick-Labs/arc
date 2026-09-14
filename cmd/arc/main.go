@@ -3229,6 +3229,15 @@ func main() {
 		// #639 item 3: database deletion clears the Iceberg catalog too.
 		databasesHandler.SetIcebergDropper(exporter)
 		icebergSource := iceberg.NewStorageWalkSource(storageBackend, cfg.Iceberg.NamespacePrefix, logger.Get("iceberg"))
+		// On an edge-sync hub, received data lives one level deeper
+		// ({spoke}/{db}/{meas}/…), so the walk must expand spoke namespaces or
+		// it exports {spoke}/{db} as a single table unioning every measurement
+		// beneath it (#634). Same expander the compaction manager uses (#619);
+		// nil on a non-hub, where the walk is already at the right depth.
+		if spokeRegistry != nil {
+			icebergSource.SetNamespaceExpander(receivedNamespaces(spokeRegistry))
+			log.Info().Msg("Iceberg export will expand edge-sync spoke namespaces into per-measurement tables")
+		}
 		// Writer gate: in cluster mode reuse the compaction gate; nil in OSS (single node, always
 		// runs). SINGLE-WRITER REQUIREMENT: the reconciler writes version-hint.text / v<N>.json
 		// to the shared warehouse non-transactionally, so exactly one node must run it. The
