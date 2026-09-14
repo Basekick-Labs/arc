@@ -1001,6 +1001,39 @@ func (b *ArrowBuffer) ResetFlushFailure() {
 
 // markFlushFailure records that buffered data could not be persisted and must
 // be recovered from WAL.
+// publishBufferMetrics mirrors the buffer's internal counters into the
+// exported metrics. The buffer has always tracked these; they were simply
+// never published, leaving arc_buffer_flushes_total, records_written,
+// records_buffered and queue_depth permanently zero (#802).
+//
+// Called after a flush completes and whenever the flush queue depth changes.
+// All reads are atomic loads and the sets are atomic stores, so this adds no
+// locking to the flush path.
+func (b *ArrowBuffer) publishBufferMetrics() {
+	m := metrics.Get()
+	m.SetBufferFlushes(b.totalFlushes.Load())
+	m.SetBufferRecordsWritten(b.totalRecordsWritten.Load())
+	m.SetBufferQueueDepth(b.queueDepth.Load())
+	m.SetBufferErrors(b.totalErrors.Load())
+	m.SetBufferRecordsBuffered(b.currentBufferedRecords())
+}
+
+// currentBufferedRecords sums the records sitting in every shard's buffers.
+// This is the backpressure signal operators actually want: records accepted
+// but not yet written to storage.
+func (b *ArrowBuffer) currentBufferedRecords() int64 {
+	var total int64
+	for shardIdx := range b.shards {
+		shard := b.shards[shardIdx]
+		shard.mu.RLock()
+		for _, n := range shard.bufferRecordCounts {
+			total += int64(n)
+		}
+		shard.mu.RUnlock()
+	}
+	return total
+}
+
 func (b *ArrowBuffer) markFlushFailure() {
 	b.totalErrors.Add(1)
 	b.hasFlushFailure.Store(true)
@@ -1143,6 +1176,10 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 	// Start background flush
 	buffer.wg.Add(1)
 	go buffer.periodicFlush()
+
+	// Publish buffer gauges on a fixed cadence (#802)
+	buffer.wg.Add(1)
+	go buffer.metricsSampler()
 
 	buffer.logger.Info().
 		Int("max_buffer_size", cfg.MaxBufferSize).
@@ -1601,7 +1638,8 @@ func (b *ArrowBuffer) tryEnqueueFlush(
 	}
 	select {
 	case b.flushQueue <- task:
-		b.queueDepth.Add(1)
+		depth := b.queueDepth.Add(1)
+		metrics.Get().SetBufferQueueDepth(depth)
 		b.logger.Info().
 			Str("buffer_key", bufferKey).
 			Int("total_records", totalBuffered).
@@ -2421,6 +2459,33 @@ func (b *ArrowBuffer) tryBoolZeroCopy(col []interface{}) ([]bool, bool) {
 // periodicFlush runs in the background and flushes old buffers.
 // It uses a self-adjusting timer that fires exactly when the oldest buffer is due
 // to expire, eliminating the phase-misalignment lag of a fixed-period ticker.
+// metricsSampler refreshes the buffer gauges on a fixed cadence.
+//
+// The counters (flushes, records written) can be published when a flush
+// completes, but arc_buffer_records_buffered is a live gauge: it must reflect
+// records sitting in the buffer *right now*. Publishing it only after a flush
+// would always report 0, because the flush is what empties the buffer — which
+// is exactly the backpressure case an operator needs to see (#802).
+//
+// One second is fine-grained enough to catch a growing backlog and coarse
+// enough that the shard scan (a read-lock per shard over a small map) is
+// irrelevant next to ingest work.
+func (b *ArrowBuffer) metricsSampler() {
+	defer b.wg.Done()
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-b.ctx.Done():
+			return
+		case <-ticker.C:
+			b.publishBufferMetrics()
+		}
+	}
+}
+
 func (b *ArrowBuffer) periodicFlush() {
 	defer b.wg.Done()
 
@@ -2557,7 +2622,7 @@ func (b *ArrowBuffer) flushWorker(workerID int) {
 				// Channel closed during shutdown
 				return
 			}
-			b.queueDepth.Add(-1)
+			metrics.Get().SetBufferQueueDepth(b.queueDepth.Add(-1))
 
 			b.logger.Debug().
 				Int("worker_id", workerID).
@@ -2700,6 +2765,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 
 		b.totalRecordsWritten.Add(int64(recordCount))
 		b.totalFlushes.Add(1)
+		b.publishBufferMetrics()
 
 		flushDuration := time.Since(startTime)
 		msgType := getFlushMessageType(flushType)
@@ -2799,6 +2865,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 
 	b.totalRecordsWritten.Add(int64(totalWritten))
 	b.totalFlushes.Add(int64(len(hourBuckets)))
+	b.publishBufferMetrics()
 
 	flushDuration := time.Since(startTime)
 	msgType := getFlushMessageType(flushType)

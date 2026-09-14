@@ -361,6 +361,23 @@ longer than ~10 s the leader's replication to the returning follower backs off f
 the old default expired at that edge. On timeout the node proceeds as before and logs its applied,
 commit and last log index.
 ## Bug fixes
+### Buffer, audit and MQTT metrics that were exported but never populated ([#802](https://github.com/Basekick-Labs/arc/issues/802))
+
+Several metrics were exported at `/metrics` with HELP and TYPE strings and then never incremented, so they scraped as a permanent `0`. That is worse than an absent metric: a panel built on one looks healthy rather than broken. These are now wired.
+
+**Ingest backpressure is observable for the first time.** `arc_buffer_records_buffered`, `arc_buffer_flushes_total`, `arc_buffer_records_written_total` and `arc_buffer_queue_depth` now carry real values. `arc_buffer_records_buffered` is the one to watch: records accepted but not yet written to storage. It is published by a one-second sampler rather than on flush completion, because a flush is what empties the buffer — publishing only there would report `0` in exactly the backlog case an operator needs to see.
+
+**Audit events can no longer be lost silently.** `internal/audit` did not reference the metrics package at all, while `LogEvent` drops events when its queue is full. For a compliance feature, undetectable loss is the worst failure mode. Three paths are now instrumented:
+
+- **New metric `arc_audit_events_dropped_total`** counts events discarded before they were ever queued. These never reach the writer, so they cannot be counted as write errors — they needed their own counter.
+- `arc_audit_write_errors_total` now counts events that failed to persist, **by batch size**: a failed transaction loses every event in the batch, so counting a single error would understate the loss.
+- `arc_audit_events_total` counts events that actually committed.
+
+If you run audit logging for compliance, alert on `arc_audit_events_dropped_total > 0`. The audit queue is currently a fixed 1000 events with no configuration key, so a sustained non-zero value means audit events are being lost faster than they can be written and needs investigation rather than tuning.
+
+**`arc_mqtt_decode_errors_total`** now increments when a payload parses as neither MessagePack nor JSON. Previously every decode failure was folded into `arc_mqtt_messages_failed_total`, which also covers write failures, so a publisher sending malformed payloads was indistinguishable from a storage problem.
+
+Two groups remain unwired after this release and still read `0`: the DuckDB pool gauges (`arc_db_connections_open`, `arc_db_connections_in_use`, `arc_db_queries_total`, and the `pool` block of `GET /api/v1/metrics/query-pool`), tracked in [#809](https://github.com/Basekick-Labs/arc/issues/809); and `arc_replication_sequence_gaps_total`, which needs gap detection in the replication receiver rather than a wiring change, tracked in [#810](https://github.com/Basekick-Labs/arc/issues/810).
 
 ### A graceful shutdown could delete the WAL that still held unflushed data ([#803](https://github.com/Basekick-Labs/arc/issues/803))
 
