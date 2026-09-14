@@ -33,11 +33,11 @@ const tierCacheTTL = 30 * time.Second
 type MetadataStore struct {
 	db     *sql.DB
 	logger zerolog.Logger
-	mu     sync.RWMutex
 
 	// Cache for GetTiersForMeasurement - keyed by "database/measurement"
-	tierCache   map[string]*tierCacheEntry
-	tierCacheMu sync.RWMutex
+	tierCache    map[string]*tierCacheEntry
+	tierCacheGen uint64
+	tierCacheMu  sync.RWMutex
 }
 
 // NewMetadataStore creates a new metadata store using the provided SQLite connection
@@ -133,14 +133,12 @@ func (s *MetadataStore) invalidateTierCache(database, measurement string) {
 	cacheKey := database + "/" + measurement
 	s.tierCacheMu.Lock()
 	delete(s.tierCache, cacheKey)
+	s.tierCacheGen++
 	s.tierCacheMu.Unlock()
 }
 
 // RecordFile records a new file in the metadata store
 func (s *MetadataStore) RecordFile(ctx context.Context, file *FileMetadata) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	query := `
 		INSERT INTO tier_files (path, database, measurement, partition_time, tier, size_bytes, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -176,9 +174,6 @@ func (s *MetadataStore) RecordFile(ctx context.Context, file *FileMetadata) erro
 
 // GetFile retrieves file metadata by path
 func (s *MetadataStore) GetFile(ctx context.Context, path string) (*FileMetadata, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	query := `
 		SELECT ` + tierFileColumns + `
 		FROM tier_files
@@ -191,9 +186,6 @@ func (s *MetadataStore) GetFile(ctx context.Context, path string) (*FileMetadata
 
 // GetFilesInTier retrieves all files in a specific tier
 func (s *MetadataStore) GetFilesInTier(ctx context.Context, tier Tier) ([]FileMetadata, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	query := `
 		SELECT ` + tierFileColumns + `
 		FROM tier_files
@@ -214,9 +206,6 @@ func (s *MetadataStore) GetFilesInTier(ctx context.Context, tier Tier) ([]FileMe
 // Quarantined rows are excluded: this is the migration candidate query, and a
 // quarantined file is one tiering has established it can never act on (#758).
 func (s *MetadataStore) GetFilesOlderThan(ctx context.Context, tier Tier, maxAge time.Duration) ([]FileMetadata, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	cutoff := time.Now().UTC().Add(-maxAge)
 
 	query := `
@@ -239,9 +228,6 @@ func (s *MetadataStore) GetFilesOlderThan(ctx context.Context, tier Tier, maxAge
 // Used by reconciliation to limit the working set to recently-migrated files.
 // Quarantined rows are excluded for the same reason as in GetFilesOlderThan.
 func (s *MetadataStore) GetRecentlyMigratedFiles(ctx context.Context, tier Tier, window time.Duration) ([]FileMetadata, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	cutoff := time.Now().UTC().Add(-window)
 
 	query := `
@@ -262,9 +248,6 @@ func (s *MetadataStore) GetRecentlyMigratedFiles(ctx context.Context, tier Tier,
 
 // GetFilesByDatabase retrieves all files for a specific database
 func (s *MetadataStore) GetFilesByDatabase(ctx context.Context, database string) ([]FileMetadata, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	query := `
 		SELECT ` + tierFileColumns + `
 		FROM tier_files
@@ -286,9 +269,6 @@ func (s *MetadataStore) GetFilesByDatabase(ctx context.Context, database string)
 // clause instead of being applied client-side, so SQLite's indexes on
 // database/tier/partition_time can prune rows before they reach Go.
 func (s *MetadataStore) GetFilesForQuery(ctx context.Context, database, measurement string, startTime, endTime *time.Time) ([]FileMetadata, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	query := `
 		SELECT ` + tierFileColumns + `
 		FROM tier_files
@@ -323,9 +303,6 @@ func (s *MetadataStore) GetFilesForQuery(ctx context.Context, database, measurem
 // GetAllDatabases returns all unique database names from the tier metadata.
 // This includes databases that may only have data in cold storage.
 func (s *MetadataStore) GetAllDatabases(ctx context.Context) ([]string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	query := `SELECT DISTINCT database FROM tier_files ORDER BY database`
 
 	rows, err := s.db.QueryContext(ctx, query)
@@ -353,9 +330,6 @@ func (s *MetadataStore) GetAllDatabases(ctx context.Context) ([]string, error) {
 // GetTiersForDatabase returns which tiers have data for a specific database.
 // Returns a slice of tier names (e.g., ["hot"], ["cold"], or ["hot", "cold"]).
 func (s *MetadataStore) GetTiersForDatabase(ctx context.Context, database string) ([]string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	query := `SELECT DISTINCT tier FROM tier_files WHERE database = ? ORDER BY tier`
 
 	rows, err := s.db.QueryContext(ctx, query, database)
@@ -383,9 +357,6 @@ func (s *MetadataStore) GetTiersForDatabase(ctx context.Context, database string
 // GetMeasurementsByDatabase returns all unique measurements for a database from the tier metadata.
 // This includes measurements that may only have data in cold storage.
 func (s *MetadataStore) GetMeasurementsByDatabase(ctx context.Context, database string) ([]string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	query := `SELECT DISTINCT measurement FROM tier_files WHERE database = ? ORDER BY measurement`
 
 	rows, err := s.db.QueryContext(ctx, query, database)
@@ -412,9 +383,6 @@ func (s *MetadataStore) GetMeasurementsByDatabase(ctx context.Context, database 
 
 // UpdateTier updates the tier for a file
 func (s *MetadataStore) UpdateTier(ctx context.Context, path string, newTier Tier) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	// Get database/measurement for cache invalidation
 	var database, measurement string
 	lookupQuery := `SELECT database, measurement FROM tier_files WHERE path = ?`
@@ -446,9 +414,6 @@ func (s *MetadataStore) UpdateTier(ctx context.Context, path string, newTier Tie
 
 // DeleteFile removes a file from the metadata store
 func (s *MetadataStore) DeleteFile(ctx context.Context, path string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	// Get database/measurement for cache invalidation before delete
 	var database, measurement string
 	lookupQuery := `SELECT database, measurement FROM tier_files WHERE path = ?`
@@ -483,9 +448,6 @@ func (s *MetadataStore) DeleteFile(ctx context.Context, path string) error {
 // reason are kept, so the record says when tiering first established the
 // condition rather than when it last looked.
 func (s *MetadataStore) QuarantineFile(ctx context.Context, path, reason string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	query := `
 		UPDATE tier_files
 		SET quarantined_at = COALESCE(quarantined_at, ?),
@@ -510,9 +472,6 @@ func (s *MetadataStore) QuarantineFile(ctx context.Context, path, reason string)
 // oldest mark first. This is the operator's list of files tiering has given
 // up on and that need a rename by hand.
 func (s *MetadataStore) GetQuarantinedFiles(ctx context.Context) ([]FileMetadata, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	query := `
 		SELECT ` + tierFileColumns + `
 		FROM tier_files
@@ -533,9 +492,6 @@ func (s *MetadataStore) GetQuarantinedFiles(ctx context.Context) ([]FileMetadata
 // Reported on the tiering status endpoint so the condition is visible without
 // reading the metrics endpoint; it should be zero.
 func (s *MetadataStore) CountQuarantinedFiles(ctx context.Context) (int64, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	var n int64
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tier_files WHERE quarantined_at IS NOT NULL`).Scan(&n); err != nil {
 		return 0, fmt.Errorf("failed to count quarantined files: %w", err)
@@ -545,9 +501,6 @@ func (s *MetadataStore) CountQuarantinedFiles(ctx context.Context) (int64, error
 
 // RecordMigration records a migration attempt
 func (s *MetadataStore) RecordMigration(ctx context.Context, record *MigrationRecord) (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	query := `
 		INSERT INTO tier_migrations (file_path, database, from_tier, to_tier, size_bytes, started_at, completed_at, error)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -572,9 +525,6 @@ func (s *MetadataStore) RecordMigration(ctx context.Context, record *MigrationRe
 
 // CompleteMigration marks a migration as completed
 func (s *MetadataStore) CompleteMigration(ctx context.Context, migrationID int64, err error) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	var errorMsg *string
 	if err != nil {
 		msg := err.Error()
@@ -603,9 +553,6 @@ func (s *MetadataStore) CompleteMigration(ctx context.Context, migrationID int64
 
 // GetTierStats returns statistics for each tier
 func (s *MetadataStore) GetTierStats(ctx context.Context) (map[Tier]TierStats, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	query := `
 		SELECT tier, COUNT(*) as file_count, COALESCE(SUM(size_bytes), 0) as total_bytes
 		FROM tier_files
@@ -649,7 +596,7 @@ func (s *MetadataStore) GetTierStats(ctx context.Context) (map[Tier]TierStats, e
 func (s *MetadataStore) GetTiersForMeasurement(ctx context.Context, database, measurement string) (map[Tier]bool, error) {
 	cacheKey := database + "/" + measurement
 
-	// Check cache first (with separate lock to avoid blocking other operations)
+	// Check cache first (with separate lock to avoid blocking other operations).
 	s.tierCacheMu.RLock()
 	if entry, ok := s.tierCache[cacheKey]; ok && time.Now().Before(entry.expiresAt) {
 		// Cache hit - return a copy to avoid mutation
@@ -660,12 +607,10 @@ func (s *MetadataStore) GetTiersForMeasurement(ctx context.Context, database, me
 		s.tierCacheMu.RUnlock()
 		return result, nil
 	}
+	cacheGen := s.tierCacheGen
 	s.tierCacheMu.RUnlock()
 
 	// Cache miss - query database
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	query := `
 		SELECT DISTINCT tier
 		FROM tier_files
@@ -678,41 +623,49 @@ func (s *MetadataStore) GetTiersForMeasurement(ctx context.Context, database, me
 	}
 	defer rows.Close()
 
-	tiers := make(map[Tier]bool)
+	var tiers []Tier
 	for rows.Next() {
 		var tierStr string
 		if err := rows.Scan(&tierStr); err != nil {
 			return nil, fmt.Errorf("failed to scan tier: %w", err)
 		}
-		tiers[TierFromString(tierStr)] = true
+		tiers = append(tiers, TierFromString(tierStr))
 	}
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating tiers: %w", err)
 	}
 
-	// Update cache
-	s.tierCacheMu.Lock()
-	s.pruneExpiredTierCache(time.Now())
-	s.tierCache[cacheKey] = &tierCacheEntry{
-		tiers:     tiers,
-		expiresAt: time.Now().Add(tierCacheTTL),
-	}
-	s.tierCacheMu.Unlock()
+	s.storeTierCacheIfUnchanged(cacheKey, tiers, cacheGen)
 
 	// Return a copy
 	result := make(map[Tier]bool, len(tiers))
-	for k, v := range tiers {
-		result[k] = v
+	for _, tier := range tiers {
+		result[tier] = true
 	}
 	return result, nil
 }
 
+func (s *MetadataStore) storeTierCacheIfUnchanged(key string, tiers []Tier, gen uint64) {
+	s.tierCacheMu.Lock()
+	defer s.tierCacheMu.Unlock()
+	if s.tierCacheGen != gen {
+		return
+	}
+
+	s.pruneExpiredTierCache(time.Now())
+	cachedTiers := make(map[Tier]bool, len(tiers))
+	for _, tier := range tiers {
+		cachedTiers[tier] = true
+	}
+	s.tierCache[key] = &tierCacheEntry{
+		tiers:     cachedTiers,
+		expiresAt: time.Now().Add(tierCacheTTL),
+	}
+}
+
 // GetRecentMigrations returns recent migration records
 func (s *MetadataStore) GetRecentMigrations(ctx context.Context, limit int) ([]MigrationRecord, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	query := `
 		SELECT id, file_path, database, from_tier, to_tier, size_bytes, started_at, completed_at, error
 		FROM tier_migrations
@@ -768,8 +721,7 @@ func (s *MetadataStore) GetRecentMigrations(ctx context.Context, limit int) ([]M
 
 // CleanupOldMigrations deletes migration records older than retentionDays.
 // A retentionDays of 0 or less is a no-op (keep all records).
-// Does not acquire the MetadataStore mutex — only uses the thread-safe s.db,
-// so concurrent reads (e.g. GetTiersForMeasurement) are not blocked.
+// Uses s.db directly; SQLite handles locking between concurrent operations.
 //
 // The cutoff is resolved to a single MAX(id) up front, then deletes are batched
 // (1000 rows per transaction) by primary key to avoid re-scanning on the
