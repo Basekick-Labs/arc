@@ -119,6 +119,15 @@ func defaultReq(body []byte) syncReq {
 	}
 }
 
+func syncPathWithLength(n int) string {
+	const suffix = ".parquet"
+	const finalSegmentLen = 200
+	segments := (n - finalSegmentLen) / 2
+	finalLen := n - 2*segments
+	return strings.Repeat("a/", segments) +
+		strings.Repeat("f", finalLen-len(suffix)) + suffix
+}
+
 func (r syncReq) do(t *testing.T, rig *syncTestRig) *http.Response {
 	t.Helper()
 
@@ -186,6 +195,31 @@ func TestEdgeSyncHandler_CommitsAuthenticatedUpload(t *testing.T) {
 	}
 	if !bytes.Equal(stored, body) {
 		t.Error("stored content differs from the upload")
+	}
+}
+
+func TestEdgeSyncHandler_RejectsSourcePathsOverStorageBudget(t *testing.T) {
+	maxLen := storage.MaxUsableKeyLen - (len(edgesync.StagingPrefix) + 2 + len(testSpokeID))
+	for _, tc := range []struct {
+		name       string
+		path       string
+		wantStatus int
+	}{
+		{"over budget", syncPathWithLength(maxLen + 1), fiber.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newSyncTestRig(t)
+			req := defaultReq(nil)
+			req.path = tc.path
+			resp := req.do(t, rig)
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%v", resp.StatusCode, tc.wantStatus, decodeBody(t, resp))
+			}
+			if resp.StatusCode == fiber.StatusServiceUnavailable {
+				t.Fatal("oversized source path returned 503")
+			}
+		})
 	}
 }
 

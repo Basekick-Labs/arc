@@ -324,6 +324,12 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Edge-sync rejects source paths that exceed the hub storage budget ([#757](https://github.com/Basekick-Labs/arc/issues/757))
+
+The hub now accounts for spoke namespace and staging prefixes before accepting an edge-sync source path, returning a client error instead of retryable 503 responses for paths it cannot store.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#783](https://github.com/Basekick-Labs/arc/pull/783).
+
 ### Backup no longer skips temp-file write failures ([#779](https://github.com/Basekick-Labs/arc/issues/779))
 
 Backup now treats failures writing its temporary file as fatal instead of
