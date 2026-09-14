@@ -408,6 +408,17 @@ and the previous subscriber's disconnect no longer runs under the manager lock.
 
 Contributed by [@Thundercloud12](https://github.com/Thundercloud12) in [#766](https://github.com/Basekick-Labs/arc/pull/766).
 
+### MQTT startSubscriber validates reservation before installing live subscriber ([#770](https://github.com/Basekick-Labs/arc/issues/770))
+
+`startSubscriber` now performs a compare-and-swap check under the manager lock after
+connecting, ensuring the reservation placeholder is still present and unmodified before
+installing the running subscriber. If a concurrent `Delete` or `Shutdown` cleared the
+reservation while the subscriber was connecting, the live subscriber is immediately stopped
+to prevent leaking broker connections and ingest writers. In addition, boot-time auto-start
+now uniformly reserves the slot placeholder and cleans up on failure.
+
+Contributed by [@Thundercloud12](https://github.com/Thundercloud12).
+
 ### Tiering no longer retries an unusable storage key every cycle ([#758](https://github.com/Basekick-Labs/arc/issues/758))
 
 [#747](https://github.com/Basekick-Labs/arc/issues/747) taught compaction,

@@ -79,7 +79,17 @@ func (m *SubscriptionManager) Start(ctx context.Context) error {
 	m.logger.Info().Int("count", len(subscriptions)).Msg("Found auto-start subscriptions")
 
 	for _, sub := range subscriptions {
+		m.mu.Lock()
+		m.subscribers[sub.ID] = nil
+		m.mu.Unlock()
+
 		if err := m.startSubscriber(sub); err != nil {
+			m.mu.Lock()
+			if m.subscribers[sub.ID] == nil {
+				delete(m.subscribers, sub.ID)
+			}
+			m.mu.Unlock()
+
 			m.logger.Error().
 				Err(err).
 				Str("id", sub.ID).
@@ -508,6 +518,12 @@ func (m *SubscriptionManager) startSubscriber(sub *Subscription) error {
 	}
 
 	m.mu.Lock()
+	cur, reserved := m.subscribers[sub.ID]
+	if !reserved || cur != nil {
+		m.mu.Unlock()
+		_ = subscriber.Stop()
+		return ErrSubscriptionNotRunning
+	}
 	m.subscribers[sub.ID] = subscriber
 	m.mu.Unlock()
 
