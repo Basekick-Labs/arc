@@ -324,6 +324,14 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Remaining DuckDB string-literal escaping uses the shared helper ([#781](https://github.com/Basekick-Labs/arc/issues/781))
+
+The remaining compaction and database DuckDB string-literal escaping now uses
+the shared `sqlutil` helper. Compaction no longer incorrectly doubles ordinary
+backslashes in standard DuckDB string literals.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#782](https://github.com/Basekick-Labs/arc/pull/782).
+
 ### The compaction candidates preview lists each measurement once ([#316](https://github.com/Basekick-Labs/arc/issues/316))
 
 `GET /api/v1/compaction/candidates` asked every enabled compaction tier for

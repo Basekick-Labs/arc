@@ -16,6 +16,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/metrics"
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
@@ -26,18 +27,12 @@ import (
 // retrying can never succeed.
 var errNoTimeColumn = errors.New("no 'time' column in any input file")
 
-// escapeSQLString escapes single quotes for safe use in DuckDB SQL string literals.
-// This prevents SQL injection when interpolating configuration values.
-func escapeSQLString(s string) string {
-	return strings.ReplaceAll(s, "'", "''")
+func escapeSQLPath(path string) string {
+	return sqlutil.EscapeStringLiteral(path)
 }
 
-// escapeSQLPath escapes file paths for safe SQL interpolation in DuckDB queries.
-// This prevents SQL injection attacks from malicious filenames containing quotes or backslashes.
-func escapeSQLPath(path string) string {
-	path = strings.ReplaceAll(path, "\\", "\\\\")
-	path = strings.ReplaceAll(path, "'", "''")
-	return path
+func escapeSQLString(s string) string {
+	return sqlutil.EscapeStringLiteral(s)
 }
 
 // validateParquetFile checks if a file is a valid Parquet file by checking magic bytes.
@@ -720,14 +715,14 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	// Build file list for DuckDB with escaped paths to prevent SQL injection
 	var fileListSQL string
 	if len(validLocalPaths) == 1 {
-		fileListSQL = fmt.Sprintf("'%s'", escapeSQLPath(validLocalPaths[0]))
+		fileListSQL = sqlutil.QuoteStringLiteral(validLocalPaths[0])
 	} else {
 		fileListSQL = "["
 		for i, f := range validLocalPaths {
 			if i > 0 {
 				fileListSQL += ", "
 			}
-			fileListSQL += fmt.Sprintf("'%s'", escapeSQLPath(f))
+			fileListSQL += sqlutil.QuoteStringLiteral(f)
 		}
 		fileListSQL += "]"
 	}
@@ -849,8 +844,7 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 
 	// Log dedup metrics when rows were removed
 	if dedupBranch && rowsBefore > 0 {
-		escapedOutput := escapeSQLPath(outputFile)
-		rowsAfter, _ := countParquetRows(ctx, db, fmt.Sprintf("['%s']", escapedOutput))
+		rowsAfter, _ := countParquetRows(ctx, db, fmt.Sprintf("[%s]", sqlutil.QuoteStringLiteral(outputFile)))
 		if rowsAfter > 0 && rowsAfter < rowsBefore {
 			deduped := rowsBefore - rowsAfter
 			j.logger.Info().
