@@ -626,7 +626,7 @@ func (c *Coordinator) Stop() error {
 	close(c.stopCh)
 
 	// Cancel the coordinator-wide context so in-flight handlers
-	// (handleFetchFile, onFileDeleted's deferred local delete, catch-up
+	// (handleFetchFile, the Phase 4 delete workers, catch-up
 	// walker, etc.) observe shutdown and drop out of their waits. c.cancel
 	// may be nil in tests that construct a bare Coordinator without
 	// calling Start, so guard it.
@@ -673,6 +673,19 @@ func (c *Coordinator) Stop() error {
 	if c.raftNode != nil {
 		if err := c.raftNode.Stop(); err != nil {
 			c.logger.Error().Err(err).Msg("Error stopping Raft node")
+		}
+	}
+
+	// Raft is joined: no callback can be running. Unregister the file
+	// callbacks before closing the queue they captured. The FSM object
+	// outlives this Stop, and an in-process Start restarts Raft (which
+	// replays the log into the same FSM) before startFilePullerLocked
+	// registers fresh closures; without this a replayed delete would send
+	// on the closed queue (#797). SetFileCallbacks takes only the FSM's own
+	// lock.
+	if c.raftNode != nil {
+		if fsm := c.raftNode.FSM(); fsm != nil {
+			fsm.SetFileCallbacks(nil, nil)
 		}
 	}
 
@@ -2593,6 +2606,32 @@ func (c *Coordinator) startFilePullerLocked() error {
 	if fsm == nil {
 		return fmt.Errorf("Raft FSM not available")
 	}
+
+	// Initialize the delete-worker pool BEFORE building the callbacks. The
+	// callbacks fire synchronously from Raft apply — if a DeleteFile
+	// command arrived between SetFileCallbacks and queue init, the onDelete
+	// closure would send to a nil channel.
+	if c.deleteQueue == nil {
+		c.deleteQueue = make(chan deleteRequest, deleteQueueSize)
+		for i := 0; i < deleteWorkerCount; i++ {
+			c.deleteWg.Add(1)
+			go c.runDeleteWorker()
+		}
+	}
+
+	// CONTRACT for every FSM callback (#797): they run synchronously on the
+	// Raft apply goroutine, which Node.Stop waits on (hashicorp/raft's
+	// Shutdown joins runFSM) while Coordinator.Stop holds c.mu and Node.Stop
+	// holds n.mu. A callback that takes c.mu, or calls any Node method other
+	// than FSM() and Barrier() (they all take n.mu), deadlocks shutdown
+	// whenever an entry is applied while the node is stopping. So the
+	// closures capture everything they need up front: the backend is set
+	// once, before Start (SetStorageBackend), and the queue is created just
+	// above, closed only after Raft is joined, and unregistered from the FSM
+	// before that (Stop), so a closure never outlives its queue. Neither
+	// callback may block.
+	backend := c.storage
+	deleteQueue := c.deleteQueue
 	onRegister := func(entry *raft.FileEntry) {
 		// Called synchronously from applyRegisterFile. Must NOT block — the
 		// FSM apply goroutine is on the Raft hot path. Enqueue is non-blocking
@@ -2601,11 +2640,12 @@ func (c *Coordinator) startFilePullerLocked() error {
 	}
 	onDelete := func(path string, reason string) {
 		// Phase 4: the callback runs synchronously from applyDeleteFile on
-		// the Raft apply hot path. It MUST NOT block. We spawn a goroutine
-		// with a short grace delay so in-flight queries scanning the old
-		// file can finish, then call backend.Delete. On non-local backends
-		// (S3, Azure) the compactor that issued DeleteFile has already
-		// removed the shared object, so the local-side Delete is a no-op.
+		// the Raft apply hot path. It MUST NOT block. It hands the path to
+		// the bounded delete-worker pool, which waits a short grace period
+		// so in-flight queries scanning the old file can finish and then
+		// calls backend.Delete. On non-local backends (S3, Azure) the
+		// compactor that issued DeleteFile has already removed the shared
+		// object, so there is no local-side action.
 		//
 		// First, and on every backend type: an entry that leaves the manifest
 		// must stop holding this node's query gate. A catch-up pull that
@@ -2614,12 +2654,6 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// the puller's own lock; puller is non-nil by construction above.
 		puller.OnManifestDelete(path)
 
-		c.mu.RLock()
-		backend := c.storage
-		c.mu.RUnlock()
-		if backend == nil {
-			return
-		}
 		// Local backends need an actual local unlink; shared backends
 		// don't — they're already deleted cluster-wide by the compactor's
 		// StorageBackend.Delete in deleteOldFiles.
@@ -2637,23 +2671,12 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// file stays in the manifest, and Phase 3 catch-up reconciles it
 		// on the next restart.
 		select {
-		case c.deleteQueue <- deleteRequest{path: path, reason: reason}:
+		case deleteQueue <- deleteRequest{path: path, reason: reason}:
 		default:
 			c.logger.Warn().
 				Str("path", path).
 				Str("reason", reason).
 				Msg("Phase 4 local delete queue full; dropping (will reconcile on restart)")
-		}
-	}
-	// Initialize the delete-worker pool BEFORE registering FSM callbacks.
-	// The callbacks fire synchronously from Raft apply — if a DeleteFile
-	// command arrives between SetFileCallbacks and queue init, the
-	// onDelete closure would send to a nil channel.
-	if c.deleteQueue == nil {
-		c.deleteQueue = make(chan deleteRequest, deleteQueueSize)
-		for i := 0; i < deleteWorkerCount; i++ {
-			c.deleteWg.Add(1)
-			go c.runDeleteWorker()
 		}
 	}
 
