@@ -324,6 +324,13 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Backup no longer skips temp-file write failures ([#779](https://github.com/Basekick-Labs/arc/issues/779))
+
+Backup now treats failures writing its temporary file as fatal instead of
+misclassifying them as unreadable source files and counting them as skipped.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#784](https://github.com/Basekick-Labs/arc/pull/784).
+
 ### Remaining DuckDB string-literal escaping uses the shared helper ([#781](https://github.com/Basekick-Labs/arc/issues/781))
 
 The remaining compaction and database DuckDB string-literal escaping now uses
