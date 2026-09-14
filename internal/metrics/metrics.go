@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"database/sql"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -91,10 +92,28 @@ type Metrics struct {
 	authCacheMisses   atomic.Int64
 	authFailuresTotal atomic.Int64
 
-	// DuckDB connection pool
+	// DuckDB connection pool.
+	//
+	// The gauges are sampled from sql.DBStats when metrics are read, not
+	// pushed on state change — see SetDBPoolStats. The saturation signal is
+	// dbWaitCount/dbWaitSeconds, NOT the in-use/open ratio: a pool sitting at
+	// 4-of-4 with zero waits is healthy, while any sustained wait growth means
+	// queries are actually blocking on a connection (#809).
+	dbConnectionsMax   atomic.Int64
 	dbConnectionsOpen  atomic.Int64
 	dbConnectionsInUse atomic.Int64
 	dbConnectionsIdle  atomic.Int64
+	dbWaitCount        atomic.Int64 // Cumulative connections waited for
+	dbWaitMicros       atomic.Int64 // Cumulative time blocked waiting, microseconds
+	// dbQueriesTotal and dbQueryErrorsTotal are NOT wired, deliberately.
+	//
+	// Counting them at the DuckDB wrapper (DuckDB.Query/QueryContext/Exec)
+	// misses the hot path: the query handler runs through
+	// query.ParallelExecutor, which holds the raw *sql.DB and never passes
+	// through those wrappers. A counter named "total" that silently omits most
+	// queries is the failure mode #801 was filed for, so it is better absent
+	// than partial. Use arc_query_requests_total / arc_query_errors_total,
+	// which are counted at every API entry point (#809).
 	dbQueriesTotal     atomic.Int64
 	dbQueryErrorsTotal atomic.Int64
 
@@ -374,11 +393,26 @@ func (m *Metrics) IncAuthCacheMiss() { m.authCacheMisses.Add(1) }
 func (m *Metrics) IncAuthFailures()  { m.authFailuresTotal.Add(1) }
 
 // Database Metrics
-func (m *Metrics) SetDBConnectionsOpen(count int64)  { m.dbConnectionsOpen.Store(count) }
-func (m *Metrics) SetDBConnectionsInUse(count int64) { m.dbConnectionsInUse.Store(count) }
-func (m *Metrics) SetDBConnectionsIdle(count int64)  { m.dbConnectionsIdle.Store(count) }
-func (m *Metrics) IncDBQueries()                     { m.dbQueriesTotal.Add(1) }
-func (m *Metrics) IncDBQueryErrors()                 { m.dbQueryErrorsTotal.Add(1) }
+
+// SetDBPoolStats records a sql.DBStats sample from the DuckDB connection pool.
+//
+// Taken as one call rather than a setter per field so a single sample lands
+// coherently: separate setters would let a scrape observe OpenConnections from
+// one instant and InUse from another, producing in-use > open. Called from the
+// metrics handlers at read time (see api.Server.SetDBStats) — sql.DBStats is a
+// cheap mutex-guarded read, and the values are only meaningful at the moment
+// they are observed, so sampling on demand beats a background ticker.
+func (m *Metrics) SetDBPoolStats(st sql.DBStats) {
+	m.dbConnectionsMax.Store(int64(st.MaxOpenConnections))
+	m.dbConnectionsOpen.Store(int64(st.OpenConnections))
+	m.dbConnectionsInUse.Store(int64(st.InUse))
+	m.dbConnectionsIdle.Store(int64(st.Idle))
+	m.dbWaitCount.Store(st.WaitCount)
+	m.dbWaitMicros.Store(st.WaitDuration.Microseconds())
+}
+
+func (m *Metrics) IncDBQueries()     { m.dbQueriesTotal.Add(1) }
+func (m *Metrics) IncDBQueryErrors() { m.dbQueryErrorsTotal.Add(1) }
 
 // Audit Metrics
 //
@@ -594,7 +628,10 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"auth_failures_total": m.authFailuresTotal.Load(),
 
 		// Database
+		"db_connections_max":    m.dbConnectionsMax.Load(),
 		"db_connections_open":   m.dbConnectionsOpen.Load(),
+		"db_wait_count":         m.dbWaitCount.Load(),
+		"db_wait_micros":        m.dbWaitMicros.Load(),
 		"db_connections_in_use": m.dbConnectionsInUse.Load(),
 		"db_connections_idle":   m.dbConnectionsIdle.Load(),
 		"db_queries_total":      m.dbQueriesTotal.Load(),
@@ -874,18 +911,33 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_auth_cache_misses_total counter\n"...)
 	b = appendMetric(b, "arc_auth_cache_misses_total", float64(m.authCacheMisses.Load()))
 
-	// Database metrics
-	b = append(b, "# HELP arc_db_connections_open Open database connections\n"...)
+	// Database metrics (DuckDB connection pool, sampled at scrape time)
+	b = append(b, "# HELP arc_db_connections_max Maximum open connections the pool allows\n"...)
+	b = append(b, "# TYPE arc_db_connections_max gauge\n"...)
+	b = appendMetric(b, "arc_db_connections_max", float64(m.dbConnectionsMax.Load()))
+
+	b = append(b, "# HELP arc_db_connections_open Open database connections, in use plus idle\n"...)
 	b = append(b, "# TYPE arc_db_connections_open gauge\n"...)
 	b = appendMetric(b, "arc_db_connections_open", float64(m.dbConnectionsOpen.Load()))
 
-	b = append(b, "# HELP arc_db_connections_in_use Database connections in use\n"...)
+	b = append(b, "# HELP arc_db_connections_in_use Database connections currently in use\n"...)
 	b = append(b, "# TYPE arc_db_connections_in_use gauge\n"...)
 	b = appendMetric(b, "arc_db_connections_in_use", float64(m.dbConnectionsInUse.Load()))
 
-	b = append(b, "# HELP arc_db_queries_total Total database queries\n"...)
-	b = append(b, "# TYPE arc_db_queries_total counter\n"...)
-	b = appendMetric(b, "arc_db_queries_total", float64(m.dbQueriesTotal.Load()))
+	b = append(b, "# HELP arc_db_connections_idle Database connections currently idle\n"...)
+	b = append(b, "# TYPE arc_db_connections_idle gauge\n"...)
+	b = appendMetric(b, "arc_db_connections_idle", float64(m.dbConnectionsIdle.Load()))
+
+	// Pool saturation. These, not the in-use/open ratio, are the signal that
+	// the pool is too small: a pool at max with zero waits is simply busy,
+	// while sustained wait growth means queries are blocking on a connection.
+	b = append(b, "# HELP arc_db_wait_count_total Cumulative number of times a query waited for a connection\n"...)
+	b = append(b, "# TYPE arc_db_wait_count_total counter\n"...)
+	b = appendMetric(b, "arc_db_wait_count_total", float64(m.dbWaitCount.Load()))
+
+	b = append(b, "# HELP arc_db_wait_seconds_total Cumulative time queries spent blocked waiting for a connection\n"...)
+	b = append(b, "# TYPE arc_db_wait_seconds_total counter\n"...)
+	b = appendMetric(b, "arc_db_wait_seconds_total", float64(m.dbWaitMicros.Load())/1000000.0)
 
 	// Audit metrics
 	b = append(b, "# HELP arc_audit_events_total Total audit log events\n"...)

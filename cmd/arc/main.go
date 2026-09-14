@@ -1849,6 +1849,10 @@ func main() {
 	// when the knob is set). In-memory reads from the credential refresher —
 	// never a live S3/Azure probe from the probe path.
 	server.SetStorageStatus(db.StorageCredentialStatus, cfg.Server.StorageCredentialsFailReady)
+	// DuckDB pool telemetry. Sampled by the metrics handlers at read time; the
+	// server holds no database handle of its own, so it needs this source
+	// wired the same way the storage status is (#809).
+	server.SetDBStats(db.Stats)
 	if cfg.Server.StorageCredentialsFailReady && cfg.Cluster.Enabled && cfg.Cluster.Role == string(cluster.RoleWriter) {
 		log.Warn().Msg("server.storage_credentials_fail_ready is set on a writer: expired S3 credentials will drain this node from the LB even though ingest is unaffected by credential expiry; intended for reader pools")
 	}

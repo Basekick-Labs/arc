@@ -349,6 +349,30 @@ It is being removed rather than implemented, because a silent gap **cannot occur
 An exported counter that can never change value is worse than no counter: an alert built on it is permanently green and asserts a guarantee the code never checked. Removing it is the honest option.
 
 The signal operators actually need for replication health is **lag**, not gaps — the delta between what the writer has produced and what the receiver has applied. That is tracked separately.
+### DuckDB connection-pool metrics are populated ([#809](https://github.com/Basekick-Labs/arc/issues/809))
+
+`arc_db_connections_open` and `arc_db_connections_in_use` were exported and never set, so they read `0` forever and the `pool` block of `GET /api/v1/metrics/query-pool` reported zeros. Any "is DuckDB saturated?" panel built on `connections_in_use / connections_open` was dividing zero by zero.
+
+They are now sampled from `sql.DBStats` when metrics are read, along with three that were not exported at all:
+
+```
+arc_db_connections_max        # pool limit (database.max_connections)
+arc_db_connections_open       # in use + idle
+arc_db_connections_in_use
+arc_db_connections_idle
+arc_db_wait_count_total       # cumulative waits for a connection
+arc_db_wait_seconds_total     # cumulative time blocked waiting
+```
+
+**Alert on waits, not on the in-use ratio.** The saturation signal is `arc_db_wait_count_total`: a pool sitting at its limit with zero waits is simply busy, while sustained wait growth means queries are actually blocking on a connection.
+
+```
+rate(arc_db_wait_count_total[5m]) > 0
+```
+
+Sampling happens at read time rather than on a background ticker — `sql.DBStats` is a point-in-time snapshot that is only meaningful when observed — and all three metrics endpoints refresh it, so the JSON and Prometheus surfaces agree.
+
+**`arc_db_queries_total` and `arc_db_query_errors_total` have been removed** rather than wired. Counting them at the `DuckDB.Query`/`Exec` wrappers would have missed the hot path: the query handler runs through `query.ParallelExecutor`, which holds the raw `*sql.DB` and never passes through those wrappers. A counter named "total" that silently omits most queries is the same failure mode as the Arrow under-counting fixed above, so it is better absent than partial. Use `arc_query_requests_total` and `arc_query_errors_total`, which are counted at every API entry point.
 
 
 ### Shutdown no longer deadlocks when a manifest delete is applied while the coordinator stops ([#797](https://github.com/Basekick-Labs/arc/issues/797))
@@ -453,6 +477,7 @@ If you run audit logging for compliance, alert on `arc_audit_events_dropped_tota
 **`arc_mqtt_decode_errors_total`** now increments when a payload parses as neither MessagePack nor JSON. Previously every decode failure was folded into `arc_mqtt_messages_failed_total`, which also covers write failures, so a publisher sending malformed payloads was indistinguishable from a storage problem.
 
 One group remains unwired after this release and still reads `0`: the DuckDB pool gauges (`arc_db_connections_open`, `arc_db_connections_in_use`, `arc_db_queries_total`, and the `pool` block of `GET /api/v1/metrics/query-pool`), tracked in [#809](https://github.com/Basekick-Labs/arc/issues/809).
+The remaining unwired metrics are addressed separately in this release: the DuckDB pool gauges are now populated ([#809](https://github.com/Basekick-Labs/arc/issues/809)) and `arc_replication_sequence_gaps_total` has been removed ([#810](https://github.com/Basekick-Labs/arc/issues/810)) — both below.
 
 ### A graceful shutdown could delete the WAL that still held unflushed data ([#803](https://github.com/Basekick-Labs/arc/issues/803))
 
