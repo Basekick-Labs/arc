@@ -338,6 +338,20 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### The Arrow query endpoint counted its failures but not its requests ([#801](https://github.com/Basekick-Labs/arc/issues/801))
+
+`POST /api/v1/query/arrow` incremented `arc_query_errors_total` on failure but never `arc_query_requests_total` or `arc_query_success_total`. Three consequences, all of which land on the first dashboard anyone builds:
+
+- **The obvious error-rate expression was unbounded.** `rate(arc_query_errors_total[5m]) / rate(arc_query_requests_total[5m])` counted Arrow failures in the numerator with no Arrow traffic in the denominator, so on an Arrow-heavy deployment the ratio could exceed 1 — or divide by zero if no JSON queries ever ran.
+- **Arrow throughput was not observable at all.** No counter moved on a successful Arrow query.
+- `arc_query_success_total + arc_query_errors_total` did not equal `arc_query_requests_total`, so none of the three was safe as a denominator.
+
+Arrow is the path performance-sensitive clients are steered to, so this was under-counting the majority of query traffic in exactly the deployments most likely to be monitored closely.
+
+The endpoint now counts requests at entry, and success, rows and latency on completion, matching the JSON path. Verified on a running binary: one successful and one failing Arrow query move the counters to `requests 2, success 1, errors 1`, where the same sequence previously produced `requests 0, success 0, errors 1`.
+
+All four query entry points (`/api/v1/query`, `/api/v1/query/msgpack`, `/api/v1/query/:measurement`, `/api/v1/query/arrow`) now count requests consistently.
+
 ### Readers no longer walk a half-replayed manifest at startup ([#799](https://github.com/Basekick-Labs/arc/issues/799))
 
 Before walking the cluster manifest for its startup catch-up, a node waited on a Raft barrier so the
