@@ -82,13 +82,16 @@ type ServerConfig struct {
 	// IPv6 via IPv4-mapped addresses). Set to a specific address
 	// (e.g. "127.0.0.1", "::1", "192.0.2.10") to restrict the bind.
 	// Explicit "0.0.0.0" forces IPv4-only.
-	Host            string
-	Port            int
-	ReadTimeout     time.Duration
-	WriteTimeout    time.Duration
-	IdleTimeout     time.Duration
-	ShutdownTimeout time.Duration
-	MaxPayloadSize  int64 // Maximum request payload size in bytes
+	Host           string
+	Port           int
+	ReadTimeout    time.Duration
+	WriteTimeout   time.Duration
+	IdleTimeout    time.Duration
+	MaxPayloadSize int64 // Maximum request payload size in bytes
+	// NOTE: there is deliberately no ShutdownTimeout here. Shutdown takes its
+	// budget as a parameter (see Server.Shutdown); a struct field was set by
+	// callers and never read, which made server.shutdown_timeout look wired
+	// when it was not (#805).
 	// TLS Configuration
 	TLSEnabled  bool
 	TLSCertFile string
@@ -107,12 +110,11 @@ type ServerConfig struct {
 // DefaultServerConfig returns default server configuration
 func DefaultServerConfig() *ServerConfig {
 	return &ServerConfig{
-		Port:            8000,
-		ReadTimeout:     30 * time.Second,
-		WriteTimeout:    30 * time.Second,
-		IdleTimeout:     120 * time.Second,
-		ShutdownTimeout: 30 * time.Second,
-		MaxPayloadSize:  1024 * 1024 * 1024, // 1GB default
+		Port:           8000,
+		ReadTimeout:    30 * time.Second,
+		WriteTimeout:   30 * time.Second,
+		IdleTimeout:    120 * time.Second,
+		MaxPayloadSize: 1024 * 1024 * 1024, // 1GB default
 	}
 }
 
