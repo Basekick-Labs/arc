@@ -3,6 +3,8 @@ package mqtt
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"path/filepath"
 	"testing"
 
@@ -247,5 +249,208 @@ func TestManager_RestartSubscription_PlaceholderCleanedOnStartFailure(t *testing
 
 	if err := mgr.RestartSubscription(ctx, sub.ID); errors.Is(err, ErrSubscriptionAlreadyRunning) {
 		t.Fatalf("second restart rejected as already running: %v", err)
+	}
+}
+
+// newMockMQTTBroker creates an in-process TCP listener that responds to MQTT
+// 3.1.1 CONNECT, SUBSCRIBE, and UNSUBSCRIBE control packets, allowing live Subscribers
+// to connect and disconnect in sub-millisecond tests without a real broker.
+func newMockMQTTBroker(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 4096)
+				for {
+					n, err := c.Read(buf)
+					if err != nil || n == 0 {
+						return
+					}
+					pktType := buf[0] & 0xF0
+					switch pktType {
+					case 0x10: // CONNECT -> reply CONNACK
+						_, _ = c.Write([]byte{0x20, 0x02, 0x00, 0x00})
+					case 0x80: // SUBSCRIBE -> reply SUBACK
+						if n >= 4 {
+							_, _ = c.Write([]byte{0x90, 0x03, buf[2], buf[3], 0x01})
+						}
+					case 0xA0: // UNSUBSCRIBE -> reply UNSUBACK
+						if n >= 4 {
+							_, _ = c.Write([]byte{0xB0, 0x02, buf[2], buf[3]})
+						}
+					case 0xC0: // PINGREQ -> reply PINGRESP
+						_, _ = c.Write([]byte{0xD0, 0x00})
+					case 0xE0: // DISCONNECT
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+
+	return fmt.Sprintf("tcp://%s", ln.Addr().String())
+}
+
+// TestManager_StartSubscriber_AbortsIfReservationDeleted verifies that if
+// Delete or Shutdown removes the placeholder while startSubscriber is connecting,
+// startSubscriber aborts, stops the live subscriber, and does not install it
+// into the subscribers map (#770).
+func TestManager_StartSubscriber_AbortsIfReservationDeleted(t *testing.T) {
+	mgr := newTestManager(t)
+	brokerURL := newMockMQTTBroker(t)
+
+	sub := &Subscription{
+		ID:       "sub-cas-del",
+		Name:     "test-sub-del",
+		Broker:   brokerURL,
+		ClientID: "test-client-del",
+		Topics:   []string{"sensors/#"},
+		QoS:      1,
+		Database: "iot",
+	}
+	sub.SetDefaults()
+
+	// Simulate reservation having been deleted while startSubscriber was connecting.
+	// Slot is missing from subscribers map.
+	err := mgr.startSubscriber(sub)
+	if !errors.Is(err, ErrSubscriptionNotRunning) {
+		t.Fatalf("expected ErrSubscriptionNotRunning, got %v", err)
+	}
+
+	mgr.mu.RLock()
+	installed, exists := mgr.subscribers[sub.ID]
+	mgr.mu.RUnlock()
+
+	if exists || installed != nil {
+		t.Fatalf("orphaned subscriber was installed into subscribers map despite missing reservation")
+	}
+}
+
+// TestManager_StartSubscriber_AbortsIfReservationReplaced verifies that if
+// another subscriber is present in the slot when startSubscriber attempts to
+// install, it aborts, stops the new subscriber, and preserves the existing one (#770).
+func TestManager_StartSubscriber_AbortsIfReservationReplaced(t *testing.T) {
+	mgr := newTestManager(t)
+	brokerURL := newMockMQTTBroker(t)
+
+	sub := &Subscription{
+		ID:       "sub-cas-replaced",
+		Name:     "test-sub-replaced",
+		Broker:   brokerURL,
+		ClientID: "test-client-rep",
+		Topics:   []string{"sensors/#"},
+		QoS:      1,
+		Database: "iot",
+	}
+	sub.SetDefaults()
+
+	existing := &Subscriber{id: sub.ID, config: sub, logger: zerolog.Nop()}
+	mgr.mu.Lock()
+	mgr.subscribers[sub.ID] = existing
+	mgr.mu.Unlock()
+
+	err := mgr.startSubscriber(sub)
+	if !errors.Is(err, ErrSubscriptionNotRunning) {
+		t.Fatalf("expected ErrSubscriptionNotRunning, got %v", err)
+	}
+
+	mgr.mu.RLock()
+	current := mgr.subscribers[sub.ID]
+	mgr.mu.RUnlock()
+
+	if current != existing {
+		t.Fatalf("existing subscriber was overwritten: got %v, want %v", current, existing)
+	}
+}
+
+// TestManager_Start_PlaceholderCleanedOnFailure verifies that during boot
+// auto-start, if startSubscriber fails, the reserved slot is cleaned up and
+// status is set to StatusError (#770).
+func TestManager_Start_PlaceholderCleanedOnFailure(t *testing.T) {
+	mgr := newTestManager(t)
+	ctx := context.Background()
+
+	sub := &Subscription{
+		Name:       "auto-start-sub",
+		Broker:     "ssl://localhost:8883",
+		ClientID:   "test-client-auto",
+		Topics:     []string{"sensors/#"},
+		QoS:        1,
+		Database:   "iot",
+		AutoStart:  true,
+		TLSEnabled: true,
+		TLSCAPath:  filepath.Join(t.TempDir(), "nonexistent-ca.pem"),
+	}
+	sub.SetDefaults()
+	if err := mgr.repo.Create(ctx, sub); err != nil {
+		t.Fatalf("repo.Create: %v", err)
+	}
+
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("mgr.Start: %v", err)
+	}
+
+	mgr.mu.RLock()
+	_, exists := mgr.subscribers[sub.ID]
+	mgr.mu.RUnlock()
+
+	if exists {
+		t.Fatal("placeholder left in subscribers map after failed auto-start; subscription would be locked out")
+	}
+
+	got, err := mgr.repo.Get(ctx, sub.ID)
+	if err != nil || got == nil {
+		t.Fatalf("repo.Get: %v", err)
+	}
+	if got.Status != StatusError {
+		t.Errorf("status = %q, want %q", got.Status, StatusError)
+	}
+}
+
+// TestManager_Start_SkipsExistingSubscriber verifies that if a subscriber is
+// already installed or starting in the slot, Start will not overwrite it (#770).
+func TestManager_Start_SkipsExistingSubscriber(t *testing.T) {
+	mgr := newTestManager(t)
+	ctx := context.Background()
+
+	sub := &Subscription{
+		Name:      "auto-start-sub-existing",
+		Broker:    "tcp://localhost:1883",
+		ClientID:  "test-client-existing",
+		Topics:    []string{"sensors/#"},
+		QoS:       1,
+		Database:  "iot",
+		AutoStart: true,
+	}
+	sub.SetDefaults()
+	if err := mgr.repo.Create(ctx, sub); err != nil {
+		t.Fatalf("repo.Create: %v", err)
+	}
+
+	// Pre-install an existing subscriber in the slot.
+	existingSub := &Subscriber{}
+	mgr.subscribers[sub.ID] = existingSub
+
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("mgr.Start: %v", err)
+	}
+
+	mgr.mu.RLock()
+	cur := mgr.subscribers[sub.ID]
+	mgr.mu.RUnlock()
+
+	if cur != existingSub {
+		t.Fatalf("subscribers[%s] was overwritten; got %p, want %p", sub.ID, cur, existingSub)
 	}
 }

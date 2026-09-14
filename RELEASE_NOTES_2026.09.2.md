@@ -324,6 +324,17 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### MQTT startSubscriber validates reservation before installing live subscriber ([#770](https://github.com/Basekick-Labs/arc/issues/770))
+
+`startSubscriber` now performs a compare-and-swap check under the manager lock after
+connecting, ensuring the reservation placeholder is still present and unmodified before
+installing the running subscriber. If a concurrent `Delete` or `Shutdown` cleared the
+reservation while the subscriber was connecting, the live subscriber is immediately stopped
+to prevent leaking broker connections and ingest writers. In addition, boot-time auto-start
+now uniformly reserves the slot placeholder and cleans up on failure.
+
+Contributed by [@Thundercloud12](https://github.com/Thundercloud12) in [#788](https://github.com/Basekick-Labs/arc/pull/788).
+
 ### Edge-sync rejects source paths that exceed the hub storage budget ([#757](https://github.com/Basekick-Labs/arc/issues/757))
 
 The hub now accounts for spoke namespace and staging prefixes before accepting an edge-sync source path, returning a client error instead of retryable 503 responses for paths it cannot store.
