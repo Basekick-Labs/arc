@@ -499,14 +499,18 @@ func (p *Puller) recordCatchUpFailureLocked(path string) {
 	p.catchupFailed.Add(1)
 }
 
-// clearCatchUpFailure decrements the catch-up failure counter if the given
-// path was previously recorded as failed. Called from processEntry's success
-// path so any successful pull, including reconciliation, can heal the gate
-// without a process restart. No-op if the path was not previously failed.
-func (p *Puller) clearCatchUpFailure(path string) {
+// ClearCatchUpFailure decrements the catch-up failure counter if the given
+// path was previously recorded as failed. Called when an entry is deleted from
+// the manifest or pulled successfully so the gate can self-heal without a process
+// restart (#759). No-op if the path was not previously failed.
+func (p *Puller) ClearCatchUpFailure(path string) {
 	p.inflightMu.Lock()
 	defer p.inflightMu.Unlock()
 	p.clearCatchUpFailureLocked(path)
+}
+
+func (p *Puller) clearCatchUpFailure(path string) {
+	p.ClearCatchUpFailure(path)
 }
 
 func (p *Puller) clearCatchUpFailureLocked(path string) {
@@ -536,14 +540,18 @@ func (p *Puller) recordCatchUpDropLocked(path string) {
 	p.catchupDropped.Add(1)
 }
 
-// clearCatchUpDrop decrements the catch-up drop counter if the given path was
-// previously recorded as dropped. Called from processEntry's success path so
-// any successful pull, including reconciliation, can heal the gate without a
-// process restart. No-op if the path was not previously dropped.
-func (p *Puller) clearCatchUpDrop(path string) {
+// ClearCatchUpDrop decrements the catch-up drop counter if the given path was
+// previously recorded as dropped. Called when an entry is deleted from the
+// manifest or pulled successfully so the gate can self-heal without a process
+// restart (#759). No-op if the path was not previously dropped.
+func (p *Puller) ClearCatchUpDrop(path string) {
 	p.inflightMu.Lock()
 	defer p.inflightMu.Unlock()
 	p.clearCatchUpDropLocked(path)
+}
+
+func (p *Puller) clearCatchUpDrop(path string) {
+	p.ClearCatchUpDrop(path)
 }
 
 func (p *Puller) clearCatchUpDropLocked(path string) {
@@ -552,6 +560,21 @@ func (p *Puller) clearCatchUpDropLocked(path string) {
 	}
 	delete(p.catchupDroppedPaths, path)
 	p.catchupDropped.Add(-1)
+}
+
+// RecordCatchUpFailureForTest exposes recordCatchUpFailure for integration tests.
+func (p *Puller) RecordCatchUpFailureForTest(path string) {
+	p.recordCatchUpFailure(path)
+}
+
+// RecordCatchUpDropForTest exposes recordCatchUpDrop for integration tests.
+func (p *Puller) RecordCatchUpDropForTest(path string) {
+	p.recordCatchUpDrop(path)
+}
+
+// SetCatchUpCompletedAtForTest exposes catchupCompletedAt for integration tests.
+func (p *Puller) SetCatchUpCompletedAtForTest(t time.Time) {
+	p.catchupCompletedAt.Store(t.Unix())
 }
 
 // Start launches the worker pool. Safe to call multiple times — subsequent

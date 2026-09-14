@@ -74,6 +74,7 @@ func (h *ClusterHandler) RegisterRoutes(app *fiber.App) {
 		filesGroup.Use(auth.RequireAdmin(h.authManager))
 	}
 	filesGroup.Get("", h.handleGetFiles)
+	filesGroup.Delete("", h.handleDeleteFile)
 
 	removeGroup := app.Group("/api/v1/cluster/nodes/:id")
 	if h.authManager != nil {
@@ -402,4 +403,52 @@ func paginateSlice(files []*clusterraft.FileEntry, cursor string, limit int) ([]
 		nextCursor = files[end-1].Path
 	}
 	return files[start:end], nextCursor
+}
+
+// handleDeleteFile removes a file from the cluster-wide manifest via Raft consensus.
+// Query parameters:
+//   - path (required): relative storage path of the file entry in the manifest.
+//   - reason (optional, default "operator"): reason recorded in audit logs and Raft payloads.
+func (h *ClusterHandler) handleDeleteFile(c *fiber.Ctx) error {
+	if h.coordinator == nil {
+		return h.respondNotEnabled(c)
+	}
+
+	path := c.Query("path")
+	if path == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   "path query parameter is required",
+		})
+	}
+
+	// Verify file exists in cluster manifest
+	if _, exists := h.coordinator.GetFileEntry(path); !exists {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"success": false,
+			"error":   "file not found in cluster manifest",
+			"path":    path,
+		})
+	}
+
+	reason := c.Query("reason")
+	if reason == "" {
+		reason = "operator"
+	}
+
+	if err := h.coordinator.DeleteFileFromManifest(path, reason); err != nil {
+		h.logger.Error().Err(err).Str("path", path).Msg("Failed to delete file from cluster manifest")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
+			"error":   err.Error(),
+		})
+	}
+
+	h.logger.Info().Str("path", path).Str("reason", reason).Msg("File removed from cluster manifest via API")
+
+	return c.JSON(fiber.Map{
+		"success": true,
+		"message": "file removed from cluster manifest",
+		"path":    path,
+	})
 }

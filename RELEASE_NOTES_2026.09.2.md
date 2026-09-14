@@ -609,6 +609,16 @@ object stores' directory markers, and silently omitting them from a backup is
 worse than the listing being inconsistent. That trade-off deserves its own
 decision rather than a drive-by.
 
+### Manifest deletion reopens query gate without restarting and DELETE /api/v1/cluster/files ([#759](https://github.com/Basekick-Labs/arc/issues/759))
+
+When a manifest entry could never be pulled (either because no peer held it or because its key was invalid under [#747](https://github.com/Basekick-Labs/arc/issues/747)), `catchupFailedPaths` held the query gate closed (`FullyCaughtUp() == false`) for the remaining lifetime of the process. Previously, removing the offending entry from the cluster manifest did not notify the replication puller, requiring a process restart to reopen the query gate.
+
+In addition, there was previously no HTTP endpoint to remove a cluster manifest entry by storage path.
+
+This is now resolved:
+- `DELETE /api/v1/cluster/files?path=<path>&reason=<reason>` is added to the cluster management API under admin authentication, allowing operators to remove unpullable or invalid manifest entries directly via Raft consensus.
+- The Raft FSM delete callback (`onDelete` in `internal/cluster/coordinator.go`) is wired to `puller.ClearCatchUpFailure(path)` and `puller.ClearCatchUpDrop(path)`. Removing an unpullable entry immediately clears the failure counter and allows the query gate to self-heal and reopen without a process restart.
+
 ### A write could destroy an already-acknowledged write ([#744](https://github.com/Basekick-Labs/arc/issues/744))
 
 Local storage stages every streamed write at `{key}.part` and renames it into

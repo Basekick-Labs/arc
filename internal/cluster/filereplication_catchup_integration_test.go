@@ -348,3 +348,69 @@ func sliceFetcher(entries []*raft.FileEntry) func(cursor string, limit int) ([]*
 		return entries[start:end], nextCursor, nil
 	}
 }
+
+// TestPhase3CatchUpManifestDeleteHealsGate tests Issue #759:
+// When a manifest entry fails catch-up permanently (e.g. no peer holds it or invalid path),
+// the query gate is closed (FullyCaughtUp() is false).
+// Removing the file entry from the cluster manifest triggers onDelete, which clears
+// the failure from the puller and allows the query gate to self-heal without a process restart.
+func TestPhase3CatchUpManifestDeleteHealsGate(t *testing.T) {
+	const (
+		originID = "writer-1"
+		readerID = "reader-1"
+	)
+
+	originBackend := newMemBackend()
+	originFSM := raft.NewClusterFSM(zerolog.Nop())
+	const path = "testdb/cpu/2026/04/11/18/unpullable.parquet"
+	rawEntries := []raft.FileEntry{
+		makeFileEntry(path, []byte("ghost bytes"), originID),
+	}
+	// Manifest has the file, but originBackend DOES NOT have the file.
+	entries := seedMultipleFilesInFSM(t, originFSM, rawEntries)
+
+	origin := startOriginServer(t, originBackend, originFSM, "catchup-secret", "test-cluster", originID)
+	defer origin.stop()
+
+	puller, _, stop := buildCatchUpPuller(t, readerID, []string{origin.addr()})
+	defer stop()
+
+	// Wire FSM delete callback to puller, matching Coordinator.startFilePullerLocked.
+	originFSM.SetFileCallbacks(nil, func(deletedPath, reason string) {
+		puller.ClearCatchUpFailure(deletedPath)
+		puller.ClearCatchUpDrop(deletedPath)
+	})
+
+	// Run catch-up with the missing file.
+	puller.RunCatchUp(context.Background(), sliceFetcher(entries))
+
+	stats := waitForCatchUp(t, puller, 1)
+	if stats["failed"] != 1 {
+		t.Fatalf("failed: got %d, want 1", stats["failed"])
+	}
+	if puller.FullyCaughtUp() {
+		t.Fatalf("FullyCaughtUp: got true, want false while catchup_failed > 0")
+	}
+
+	// Operator deletes the unpullable entry from the manifest via Raft command.
+	delPayload, err := json.Marshal(raft.DeleteFilePayload{Path: path, Reason: "operator"})
+	if err != nil {
+		t.Fatalf("marshal DeleteFilePayload: %v", err)
+	}
+	delCmd, err := json.Marshal(raft.Command{Type: raft.CommandDeleteFile, Payload: delPayload})
+	if err != nil {
+		t.Fatalf("marshal Command: %v", err)
+	}
+	if res := originFSM.Apply(&hraft.Log{Index: uint64(len(entries) + 1), Data: delCmd}); res != nil {
+		t.Fatalf("originFSM.Apply delete: %v", res)
+	}
+
+	// Verify the gate has self-healed without restarting.
+	if !puller.FullyCaughtUp() {
+		t.Fatalf("FullyCaughtUp: got false, want true after deleting manifest entry")
+	}
+	newStats := puller.Stats()
+	if newStats["catchup_failed"] != 0 {
+		t.Fatalf("catchup_failed: got %d, want 0 after delete", newStats["catchup_failed"])
+	}
+}

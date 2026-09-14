@@ -26,6 +26,7 @@ import (
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/wal"
+	hraft "github.com/hashicorp/raft"
 	"github.com/rs/zerolog"
 )
 
@@ -2470,6 +2471,21 @@ func (c *Coordinator) SetStorageBackend(backend storage.Backend) {
 	c.storage = backend
 }
 
+// SetRaftFSM sets the Raft FSM reference for testing and coordinator setup.
+func (c *Coordinator) SetRaftFSM(fsm *raft.ClusterFSM) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.raftFSM = fsm
+}
+
+// NewTestCoordinator creates a minimal Coordinator with an FSM for unit tests.
+func NewTestCoordinator(fsm *raft.ClusterFSM) *Coordinator {
+	return &Coordinator{
+		raftFSM: fsm,
+		logger:  zerolog.Nop(),
+	}
+}
+
 // startFilePullerLocked constructs the puller, wires the FSM callback, and
 // starts the worker pool. Caller must hold c.mu (Start holds it through the
 // entire body).
@@ -2587,6 +2603,14 @@ func (c *Coordinator) startFilePullerLocked() error {
 		puller.Enqueue(entry)
 	}
 	onDelete := func(path string, reason string) {
+		// When an entry is removed from the manifest, clear any recorded
+		// catch-up failure or drop for that path. This allows the query gate
+		// to self-heal without requiring a process restart (#759).
+		if puller != nil {
+			puller.ClearCatchUpFailure(path)
+			puller.ClearCatchUpDrop(path)
+		}
+
 		// Phase 4: the callback runs synchronously from applyDeleteFile on
 		// the Raft apply hot path. It MUST NOT block. We spawn a goroutine
 		// with a short grace delay so in-flight queries scanning the old
@@ -3353,6 +3377,22 @@ func (c *Coordinator) RegisterFileInManifest(file raft.FileEntry) error {
 // Non-leader callers no longer silently drop the command.
 func (c *Coordinator) DeleteFileFromManifest(path, reason string) error {
 	if c.raftNode == nil {
+		if c.raftFSM != nil {
+			payload, err := json.Marshal(raft.DeleteFilePayload{Path: path, Reason: reason})
+			if err != nil {
+				return fmt.Errorf("delete file from manifest: marshal payload: %w", err)
+			}
+			cmd := &raft.Command{Type: raft.CommandDeleteFile, Payload: payload}
+			data, err := json.Marshal(cmd)
+			if err != nil {
+				return fmt.Errorf("delete file from manifest: marshal command: %w", err)
+			}
+			if res := c.raftFSM.Apply(&hraft.Log{Index: 1, Data: data}); res != nil {
+				if applyErr, ok := res.(error); ok && applyErr != nil {
+					return fmt.Errorf("delete file from manifest: apply: %w", applyErr)
+				}
+			}
+		}
 		return nil
 	}
 
