@@ -1,8 +1,10 @@
 package iceberg
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -383,4 +385,125 @@ func currentSnapshotID(ctx context.Context, t *testing.T, exp *Exporter) int64 {
 		return 0
 	}
 	return snap.SnapshotID
+}
+
+// TestExpireSnapshotsAfterArcDeletedSupersededFiles reproduces the production
+// ordering that #632 exposed: Arc deletes a superseded Parquet file from disk
+// (compaction, retention, the delete API) and only afterwards does the exporter
+// expire the snapshots that still reference it.
+//
+// iceberg-go's ExpireSnapshots runs orphan deletion as a POST-COMMIT hook, so
+// the catalog commit lands first and the hook then tries to os.Remove files Arc
+// has already removed. With WithPostCommit at its default (true), every one of
+// those ENOENTs is joined into the error returned by Commit — from a commit
+// that actually succeeded. The exporter read that as failure, logged "snapshot
+// history grows until it recovers", and returned the PRE-expire table, so
+// version-hint.text published metadata listing snapshots whose manifest-list
+// files the hook had just deleted.
+//
+// TestExpireSnapshotsAndPruneVersions above cannot catch this: it leaves every
+// file on disk, so the hook always succeeds. The deletion below is the whole
+// point of this test.
+func TestExpireSnapshotsAfterArcDeletedSupersededFiles(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", filepath.Join(root, "arc.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const retain = 2
+	// Capture exporter logs: the false "commit failed" ERROR is the
+	// operator-visible half of #632, and it fires forever once history churns.
+	var logBuf bytes.Buffer
+	exp, err := NewExporter(db, backend, "file://"+root, "arc", retain, zerolog.New(&logBuf))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	base := int64(1_700_000_000_000_000)
+	var sc ArcSchema
+
+	// Each pass registers a fresh file as the table's only content, which
+	// supersedes the previous one, and then deletes the superseded file from
+	// disk exactly as compaction would.
+	var prev string
+	for i := 0; i < 6; i++ {
+		f := filepath.Join(root, "db", "cpu", "2023", "11", "14", "22", fmt.Sprintf("f%d.parquet", i))
+		writeArcStyleParquet(t, f, base+int64(i)*1000, 5)
+		if i == 0 {
+			sc, _ = SchemaFromParquet(f)
+		}
+		if err := exp.ReconcileMeasurement(ctx, "db", "cpu", sc, []FileRef{{PhysicalPath: fileURI(f)}}); err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+		// Arc owns the data-file lifecycle: the superseded file is gone from
+		// storage before the next pass expires the snapshot that referenced it.
+		if prev != "" {
+			if err := os.Remove(prev); err != nil {
+				t.Fatalf("removing superseded file %s: %v", prev, err)
+			}
+		}
+		prev = f
+	}
+
+	// A commit that succeeded must not be reported as failed. Before the fix
+	// this fired on every pass after history exceeded `retain`, masking genuine
+	// expiry failures behind permanent noise.
+	if logs := logBuf.String(); strings.Contains(logs, "ExpireSnapshots commit failed") {
+		t.Errorf("expiry logged a false commit failure (#632):\n%s", logs)
+	}
+
+	lt, err := exp.EnsureTable(ctx, "db", "cpu", sc)
+	if err != nil {
+		t.Fatalf("EnsureTable: %v", err)
+	}
+
+	// Expiry must actually cap history. Before the fix the exporter returned
+	// the pre-expire table on every pass, so this grew without bound.
+	if n := len(lt.Metadata().Snapshots()); n > retain+1 {
+		t.Errorf("snapshot count = %d, want <= %d: expiry is not being applied (#632)", n, retain+1)
+	}
+
+	// version-hint.text must name a metadata file that exists, and that
+	// metadata must not reference a manifest list the post-commit hook deleted.
+	metaDir := filepath.Join(root, "arc_db.db", "cpu", "metadata")
+	hint, err := os.ReadFile(filepath.Join(metaDir, "version-hint.text"))
+	if err != nil {
+		t.Fatalf("version-hint.text missing: %v", err)
+	}
+	hv := strings.TrimSpace(string(hint))
+	hintedMeta := filepath.Join(metaDir, "v"+hv+".metadata.json")
+	if _, err := os.Stat(hintedMeta); err != nil {
+		t.Fatalf("version-hint points at v%s but that metadata is missing: %v", hv, err)
+	}
+
+	// Every snapshot the published metadata still advertises must have its
+	// manifest list on disk. A dangling entry here is the reader-visible
+	// symptom of #632: directory readers doing snapshot listing or time travel
+	// resolve the hint, then fail on a missing manifest list.
+	raw, err := os.ReadFile(hintedMeta)
+	if err != nil {
+		t.Fatalf("reading hinted metadata: %v", err)
+	}
+	var meta struct {
+		Snapshots []struct {
+			SnapshotID   int64  `json:"snapshot-id"`
+			ManifestList string `json:"manifest-list"`
+		} `json:"snapshots"`
+	}
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		t.Fatalf("parsing hinted metadata: %v", err)
+	}
+	for _, sn := range meta.Snapshots {
+		p := strings.TrimPrefix(sn.ManifestList, "file://")
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("published metadata advertises snapshot %d whose manifest list is missing: %s (#632)", sn.SnapshotID, p)
+		}
+	}
 }

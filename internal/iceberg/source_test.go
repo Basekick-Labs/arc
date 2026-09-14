@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -176,5 +177,105 @@ func TestIsDataFile(t *testing.T) {
 		if got := isDataFile(tt.path); got != tt.want {
 			t.Errorf("isDataFile(%q) = %v, want %v", tt.path, got, tt.want)
 		}
+	}
+}
+
+// TestMeasurementsExpandsSpokeNamespaces covers the edge-sync hub layout (#634).
+//
+// A hub stores received data one level deeper than local data:
+// {spoke_id}/{db}/{meas}/{y}/{m}/{d}/{h}/*.parquet. Walked flat, {spoke}/{db}
+// reads as (database, measurement), so every measurement under a spoke's
+// database is unioned into one table with a franken-schema — or fails schema
+// union outright on a cross-measurement type collision and logs an error every
+// pass forever.
+//
+// With the expander wired, each real measurement becomes its own table under a
+// {spoke}/{db} pseudo-database.
+func TestMeasurementsExpandsSpokeNamespaces(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A local database, which must keep its normal two-level shape.
+	if err := backend.Write(ctx, "localdb/cpu/2026/07/14/15/f.parquet", []byte("PAR1")); err != nil {
+		t.Fatal(err)
+	}
+	// A hub spoke namespace: rocket-01 holds database "factory" with two measurements.
+	for _, p := range []string{
+		"rocket-01/factory/cpu/2026/07/14/15/a.parquet",
+		"rocket-01/factory/mem/2026/07/14/15/b.parquet",
+	} {
+		if err := backend.Write(ctx, p, []byte("PAR1")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	src := NewStorageWalkSource(backend, "arc", zerolog.Nop())
+	src.SetNamespaceExpander(func(context.Context) (map[string]struct{}, error) {
+		return map[string]struct{}{"rocket-01": {}}, nil
+	})
+
+	ms, err := src.Measurements(ctx)
+	if err != nil {
+		t.Fatalf("Measurements: %v", err)
+	}
+
+	got := map[string]bool{}
+	for _, m := range ms {
+		got[m.Database+"|"+m.Measurement] = true
+	}
+
+	// The spoke's real measurements, under a {spoke}/{db} pseudo-database.
+	for _, want := range []string{"rocket-01/factory|cpu", "rocket-01/factory|mem"} {
+		if !got[want] {
+			t.Errorf("missing %q; got %+v (#634)", want, ms)
+		}
+	}
+	// The local database is untouched by expansion.
+	if !got["localdb|cpu"] {
+		t.Errorf("local database lost by expansion; got %+v", ms)
+	}
+	// The un-expanded shape must NOT appear: that is the garbage table.
+	if got["rocket-01|factory"] {
+		t.Errorf("spoke namespace exported un-expanded as (rocket-01, factory) — every measurement would union into one table (#634)")
+	}
+}
+
+// TestMeasurementsExpanderFailureSkipsSpokes pins the fail-safe direction: if
+// the spoke lookup fails, spoke namespaces are skipped for the pass rather than
+// exported un-expanded. Exporting them wrong mints catalog tables that have to
+// be cleaned up by hand, so skipping is the cheaper failure (#634).
+func TestMeasurementsExpanderFailureSkipsSpokes(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.Write(ctx, "localdb/cpu/2026/07/14/15/f.parquet", []byte("PAR1")); err != nil {
+		t.Fatal(err)
+	}
+
+	src := NewStorageWalkSource(backend, "arc", zerolog.Nop())
+	src.SetNamespaceExpander(func(context.Context) (map[string]struct{}, error) {
+		return nil, fmt.Errorf("registry unavailable")
+	})
+
+	ms, err := src.Measurements(ctx)
+	if err != nil {
+		t.Fatalf("Measurements must not fail when the spoke lookup does: %v", err)
+	}
+	// A lookup failure must not lose ordinary databases.
+	found := false
+	for _, m := range ms {
+		if m.Database == "localdb" && m.Measurement == "cpu" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("local database dropped after an expander error; got %+v", ms)
 	}
 }

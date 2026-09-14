@@ -338,6 +338,50 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Iceberg export on an edge-sync hub produced one garbage table per spoke ([#634](https://github.com/Basekick-Labs/arc/issues/634))
+
+**Affects hubs only** — a node receiving edge-sync data with `iceberg.enabled = true`.
+
+A hub stores received data one level deeper than local data: `{spoke_id}/{db}/{measurement}/{y}/{m}/{d}/{h}/*.parquet`. The Iceberg walk read the top two directory levels as `(database, measurement)`, so a spoke `rocket-01` holding database `factory` was discovered as **one** measurement named `factory` in a database named `rocket-01`.
+
+Every Parquet file from **every** measurement under that spoke then landed in a single file list, and their schemas were unioned. Either the union failed on a cross-measurement type collision — logging an error every pass, forever — or it succeeded and minted a catalog table `arc_rocket-01.factory` mixing all measurements into one franken-schema. Hub compaction then churned those file sets, snapshotting the garbage every cycle.
+
+Compaction learned to expand spoke namespaces in 26.09.1 ([#619](https://github.com/Basekick-Labs/arc/issues/619)); the Iceberg source never got the same treatment. It does now: spoke namespaces expand into `{spoke}/{db}` pseudo-databases with their real measurements, so received data exports as the tables it actually is.
+
+The separator is mapped to `.` in the Iceberg namespace (`arc_rocket-01.factory`), because the SQL catalog names namespace directories `<namespace>.db` and an unsanitized slash would nest that directory one level deeper than the warehouse walk expects — feeding the exporter's own metadata back in as a user database. A real Arc database name cannot contain a `.`, so there is no collision with a genuine database.
+
+If the spoke lookup fails, spoke namespaces are **skipped** for that pass rather than exported un-expanded: exporting them wrong mints catalog tables that then have to be cleaned up by hand, so skipping is the cheaper failure.
+
+<Callout type="warn" title="Existing hubs may already have garbage tables">
+If you ran `iceberg.enabled` on a hub before this release, the catalog may contain a table per spoke namespace (`arc_<spoke>.<db>`) whose schema is a union of unrelated measurements. Those tables are not repaired automatically — drop them, and the next reconcile pass will create the correct per-measurement tables.
+</Callout>
+
+
+### Iceberg export reported successful snapshot expiry as failure, and published dangling metadata ([#632](https://github.com/Basekick-Labs/arc/issues/632))
+
+**Anyone running `iceberg.enabled = true` should upgrade.** Once a table's history exceeded `iceberg.retain_snapshots`, every reconcile pass logged
+
+```
+Iceberg ExpireSnapshots commit failed (non-fatal) — snapshot history grows until it recovers
+```
+
+from a commit that had actually **succeeded**, and published a `version-hint.text` pointing at metadata that still listed snapshots whose manifest-list files had just been deleted. A directory reader doing snapshot listing or time travel then failed on the missing files, and a measurement that went quiet kept that partially-dangling hint indefinitely.
+
+iceberg-go runs orphan deletion for an expiry as a **post-commit hook**: the catalog commit lands, then it removes the expiring snapshots' manifest lists, manifests, and any data files they referenced, joining every failure into the error `Commit` returns. In Arc, files leave a table precisely *because Arc already deleted them* — compaction, retention, the delete API — so the hook reported `ENOENT` for files that were supposed to be gone, and the error list grew every pass as each expiring manifest carried entries for every file ever removed.
+
+Arc now passes `WithPostCommit(false)`, so the exporter expires snapshots in the catalog and leaves file deletion to Arc.
+
+<Callout type="warn" title="The exporter no longer holds delete authority over your data files">
+This is the more important half of the fix. With the previous default, iceberg-go could physically `os.Remove` Arc's **primary Parquet data files** during expiry. Any future listing bug that transiently omitted live files for `retain` generations would have turned into silent deletion of customer data by the export subsystem.
+
+Arc owns the data-file lifecycle. The exporter must never delete data files, and now cannot.
+</Callout>
+
+The residue is expired metadata files no longer referenced by any snapshot. `pruneOldVersionFiles` already bounds the `v<N>.metadata.json` copies; the rest is small and bounded by `retain`.
+
+The existing expiry test could not catch this because it left every Parquet file on disk, so the post-commit hook always succeeded. The regression test added here deletes each superseded file **before** the pass that expires the snapshot referencing it — the production order — and asserts both symptoms: no false "commit failed" log, and no published snapshot whose manifest list is missing from disk.
+
+
 ### Removed: `arc_replication_sequence_gaps_total` ([#810](https://github.com/Basekick-Labs/arc/issues/810))
 
 **This metric has been removed.** If you scrape it, drop it from your dashboards and alerts — it has read `0` on every Arc since it was introduced.

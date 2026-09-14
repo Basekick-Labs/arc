@@ -36,6 +36,21 @@ type StorageWalkSource struct {
 	resolver *PathResolver
 	nsPrefix string // Iceberg namespace prefix; warehouse dirs "<nsPrefix>_*.db" are excluded
 	logger   zerolog.Logger
+
+	// namespaceExpander, when set, returns the top-level directories that are
+	// edge-sync spoke namespaces rather than databases (#634). A hub stores
+	// received data at {spoke_id}/{db}/{meas}/…, one level deeper than local
+	// data, so without expansion the walk reads {spoke}/{db} as
+	// (database, measurement) and unions every measurement under it into a
+	// single franken-table. Mirrors the compaction manager's expander (#619).
+	namespaceExpander func(ctx context.Context) (map[string]struct{}, error)
+}
+
+// SetNamespaceExpander installs edge-sync spoke-namespace expansion (#634).
+// Wired on a hub so received data is exported as the tables it actually is
+// instead of one garbage table per spoke namespace.
+func (s *StorageWalkSource) SetNamespaceExpander(fn func(ctx context.Context) (map[string]struct{}, error)) {
+	s.namespaceExpander = fn
 }
 
 // NewStorageWalkSource builds a storage-walking file-set source. nsPrefix is the exporter's
@@ -77,6 +92,11 @@ func (s *StorageWalkSource) Measurements(ctx context.Context) ([]Measurement, er
 		return nil, fmt.Errorf("list databases: %w", err)
 	}
 	// ListDirectories returns base names (not prefixed paths) and already skips hidden dirs.
+	// Expand edge-sync spoke namespaces into {spoke}/{db} pseudo-databases
+	// before walking, so their measurements are discovered at the right depth
+	// (#634).
+	dbs = s.expandNamespaces(ctx, dl, dbs)
+
 	var out []Measurement
 	for _, db := range dbs {
 		db = strings.Trim(db, "/")
@@ -98,6 +118,58 @@ func (s *StorageWalkSource) Measurements(ctx context.Context) ([]Measurement, er
 		}
 	}
 	return out, nil
+}
+
+// expandNamespaces replaces registered edge-sync spoke namespaces in a
+// top-level directory list with {spoke}/{child} pseudo-databases (#634),
+// mirroring what the compaction manager does for the same layout (#619).
+//
+// A hub stores received data one level deeper than local data:
+// {spoke_id}/{db}/{meas}/{y}/{m}/{d}/{h}/*.parquet. Walked flat, {spoke}/{db}
+// reads as (database, measurement) and every measurement underneath is unioned
+// into one table with a franken-schema — or fails schema union on a
+// cross-measurement type collision and logs an error every pass forever.
+//
+// A bare spoke directory yields nothing on its own once expanded, so it is
+// dropped. Expander errors are fail-safe: spoke directories are SKIPPED for
+// this pass rather than exported unexpanded, because exporting them wrong
+// mints catalog tables that then have to be cleaned up by hand.
+func (s *StorageWalkSource) expandNamespaces(ctx context.Context, dl dirLister, dirs []string) []string {
+	if s.namespaceExpander == nil {
+		return dirs
+	}
+	spokes, err := s.namespaceExpander(ctx)
+	if err != nil {
+		s.logger.Warn().Err(err).
+			Msg("Iceberg reconcile: spoke-namespace lookup failed; skipping received namespaces this pass (fail-safe)")
+		spokes = nil
+	}
+	if len(spokes) == 0 {
+		return dirs
+	}
+
+	out := make([]string, 0, len(dirs))
+	for _, d := range dirs {
+		name := strings.Trim(d, "/")
+		if _, isSpoke := spokes[name]; !isSpoke {
+			out = append(out, d)
+			continue
+		}
+		children, err := dl.ListDirectories(ctx, name+"/")
+		if err != nil {
+			s.logger.Warn().Err(err).Str("spoke", name).
+				Msg("Iceberg reconcile: could not list a spoke namespace; skipping it this pass")
+			continue
+		}
+		for _, child := range children {
+			child = strings.Trim(child, "/")
+			if child == "" {
+				continue
+			}
+			out = append(out, name+"/"+child)
+		}
+	}
+	return out
 }
 
 // Files lists the current .parquet files for a measurement and resolves them to URIs.
