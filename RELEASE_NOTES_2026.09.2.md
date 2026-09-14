@@ -351,6 +351,24 @@ Arrow is the path performance-sensitive clients are steered to, so this was unde
 The endpoint now counts requests at entry, and success, rows and latency on completion, matching the JSON path. Verified on a running binary: one successful and one failing Arrow query move the counters to `requests 2, success 1, errors 1`, where the same sequence previously produced `requests 0, success 0, errors 1`.
 
 All four query entry points (`/api/v1/query`, `/api/v1/query/msgpack`, `/api/v1/query/:measurement`, `/api/v1/query/arrow`) now count requests consistently.
+### Deployment artifacts: wrong storage variable, no-op autoscaling values, and no WAL ([#804](https://github.com/Basekick-Labs/arc/issues/804))
+
+Three defects in the shipped Kubernetes manifests and the OSS Helm chart. Each is small on its own; together they meant a user following our own deployment files could run without a write-ahead log, or write data outside the persistent volume.
+
+**`ARC_STORAGE_BASE_PATH` was not a real setting.** `deploy/kubernetes-local/statefulset.yaml` set it on both the writer and the reader, but no such config key exists — the correct name is `ARC_STORAGE_LOCAL_PATH` (`storage.local_path`). The variable was silently ignored and Arc used its default `./data/arc`, relative to the container working directory, so whether data landed on the mounted PVC was incidental. Fixed in both StatefulSets.
+
+**`deploy/kubernetes/` set no storage path and no WAL at all**, relying on binary defaults for both. Both are now explicit and point under the volume mount.
+
+**The OSS Helm chart now enables the WAL.** `wal.enabled` defaults to `false` in the binary for backwards compatibility, and the chart did not override it — so `helm install arc` produced a deployment with no write-ahead log, where a crash loses every record buffered since the last flush. Every shipped Docker Compose file already set `ARC_WAL_ENABLED=true`; the chart omitting it was an oversight. It is now on by default and configurable:
+
+```yaml
+arc:
+  wal:
+    enabled: true
+    directory: /app/data/wal
+```
+
+**The OSS chart's `autoscaling` values have been removed.** They were never backed by a `HorizontalPodAutoscaler` template: setting `autoscaling.enabled=true` only dropped `replicas` from the Deployment, leaving a single replica with nothing managing it. Horizontal scaling of a single OSS Arc is not viable in any case — the default `Recreate` strategy over a ReadWriteOnce PVC prevents replicas from sharing the volume. Scaling out requires shared object storage with Arc Enterprise clustering, where readers are separate StatefulSets. Existing values files that set `autoscaling.*` keep rendering; the keys are simply ignored, as they were in practice before.
 
 ### Readers no longer walk a half-replayed manifest at startup ([#799](https://github.com/Basekick-Labs/arc/issues/799))
 

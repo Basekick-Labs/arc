@@ -67,8 +67,14 @@ spec:
             # Storage - LOCAL filesystem
             - name: ARC_STORAGE_BACKEND
               value: "local"
-            - name: ARC_STORAGE_BASE_PATH
+            - name: ARC_STORAGE_LOCAL_PATH
               value: "/app/data/storage"
+            # WAL — off by default in the binary. Without it, a crash loses
+            # every record buffered since the last flush.
+            - name: ARC_WAL_ENABLED
+              value: "true"
+            - name: ARC_WAL_DIRECTORY
+              value: "/app/data/wal"
             # Enable WAL replication to readers
             - name: ARC_CLUSTER_REPLICATION_ENABLED
               value: "true"
@@ -165,8 +171,14 @@ spec:
             # Storage - LOCAL filesystem
             - name: ARC_STORAGE_BACKEND
               value: "local"
-            - name: ARC_STORAGE_BASE_PATH
+            - name: ARC_STORAGE_LOCAL_PATH
               value: "/app/data/storage"
+            # WAL — off by default in the binary. Without it, a crash loses
+            # every record buffered since the last flush.
+            - name: ARC_WAL_ENABLED
+              value: "true"
+            - name: ARC_WAL_DIRECTORY
+              value: "/app/data/wal"
             # Reader MUST have replication enabled to receive data
             - name: ARC_CLUSTER_REPLICATION_ENABLED
               value: "true"

@@ -83,6 +83,13 @@ arc:
     contents: ""
   # Storage backend: local, s3, minio
   storageBackend: local
+  # Write-ahead log. The Arc binary defaults this to false for backwards
+  # compatibility; the chart turns it on, because without it a crash or a
+  # SIGKILL loses every record buffered since the last flush. The directory
+  # lives under the same mount as the data so the WAL survives a pod restart.
+  wal:
+    enabled: true
+    directory: /app/data/wal
   # Additional environment variables
   env: []
     # - name: ARC_AUTH_ENABLED
@@ -98,11 +105,18 @@ persistence:
   size: 10Gi
   # existingClaim: ""
 
-autoscaling:
-  enabled: false
-  minReplicas: 1
-  maxReplicas: 10
-  targetCPUUtilizationPercentage: 80
+# NOTE: there is deliberately no `autoscaling` block here.
+#
+# This chart previously exposed autoscaling.enabled/minReplicas/maxReplicas,
+# but shipped no HorizontalPodAutoscaler template. Setting enabled=true only
+# removed `replicas` from the Deployment, leaving one replica with nothing
+# managing it — the values silently did nothing.
+#
+# Horizontal scaling of a single OSS Arc is not viable anyway: the default
+# updateStrategy is Recreate over a ReadWriteOnce PVC (see the comment at the
+# top of this file), so replicas cannot share the volume. Scaling out requires
+# shared object storage plus Arc Enterprise clustering, where readers are
+# separate StatefulSets — see the arc-enterprise chart.
 
 volumes: []
 volumeMounts: []
