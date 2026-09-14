@@ -2544,6 +2544,7 @@ func (c *Coordinator) startFilePullerLocked() error {
 		return candidates
 	})
 
+	raftNode := c.raftNode // set once in NewCoordinator; the gate at Start guarantees non-nil here
 	pullerCfg := filereplication.Config{
 		SelfNodeID:             c.localNode.ID,
 		Backend:                c.storage,
@@ -2557,7 +2558,19 @@ func (c *Coordinator) startFilePullerLocked() error {
 		CatchUpQueueHighWater:  c.cfg.ReplicationCatchUpQueueHighWater,
 		ReconciliationInterval: time.Duration(c.cfg.ReplicationReconciliationIntervalSeconds) * time.Second,
 		ReconciliationGate:     c.canRunFileReconciliation,
-		Logger:                 c.logger,
+		// Lets the puller stop pulling, and stop counting against the query
+		// gate, an entry that left the manifest while its pull was queued or
+		// in flight (#759, #795). Read lock on the FSM; the FSM never holds
+		// its lock while calling back into the puller, so no cycle.
+		ManifestHas: func(path string) bool {
+			fsm := raftNode.FSM()
+			if fsm == nil {
+				return true
+			}
+			_, ok := fsm.GetFile(path)
+			return ok
+		},
+		Logger: c.logger,
 	}
 
 	puller, err := filereplication.New(pullerCfg)
@@ -2593,6 +2606,14 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// file can finish, then call backend.Delete. On non-local backends
 		// (S3, Azure) the compactor that issued DeleteFile has already
 		// removed the shared object, so the local-side Delete is a no-op.
+		//
+		// First, and on every backend type: an entry that leaves the manifest
+		// must stop holding this node's query gate. A catch-up pull that
+		// failed for it is forgotten, and one still queued or in flight is
+		// dropped from the catch-up batch (#759, #795). Map-only work under
+		// the puller's own lock; puller is non-nil by construction above.
+		puller.OnManifestDelete(path)
+
 		c.mu.RLock()
 		backend := c.storage
 		c.mu.RUnlock()

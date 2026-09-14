@@ -324,6 +324,37 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Removing a manifest entry reopens the replication query gate without a restart ([#759](https://github.com/Basekick-Labs/arc/issues/759), [#795](https://github.com/Basekick-Labs/arc/issues/795))
+
+With `cluster.query_gate_on_catchup` enabled, a reader whose startup catch-up could not pull a
+manifest entry (a file no peer holds, or a key no backend can address) answered 503 to every
+query until the process was restarted. The catch-up failure could only be cleared by a later
+successful pull of the same path, and for those entries there never is one. Removing the entry
+from the cluster manifest, which is what retention, compaction and the reconciliation sweep do
+and is the remedy for a file no node holds, changed nothing on the reader.
+
+The FSM delete callback now tells the puller the entry is gone. A recorded catch-up failure or
+drop for that path is cleared and the gate reopens immediately. A pull still queued or in flight
+for it is dropped from the catch-up batch (the tag is removed in the same critical section, and
+the worker checks manifest membership before every attempt and before counting a failure), so
+the delete cannot race the pull into a permanent red gate: this covers a delete that lands
+mid-pull and, because the catch-up walker can wait minutes inside a page at queue high water,
+one that lands before the walker has even tagged the entry. Queue-full drops use the same
+membership check, and a follower that restores from a Raft snapshot (which fires no delete
+callbacks) has any stale failures pruned within one periodic reconciliation interval
+(`cluster.replication_reconciliation_interval_seconds`, default 5 minutes). Retention,
+compaction or a reconciliation sweep deleting entries while a reader is still catching up no
+longer strands that reader either. The catch-up status in the 503 body and on `/api/v1/cluster`
+gains `skipped_gone`, the count of pulls abandoned because their entry left the manifest.
+
+What removes an entry: for a file no node holds, the Phase 5 reconciliation sweep on the origin
+writer (`reconciliation.enabled`, or `POST /api/v1/reconciliation/trigger?dry_run=false&act=true`).
+A key no backend can address has no automated remover yet: retention cannot read it and the sweep
+only reports it, so that class still needs the operator delete endpoint tracked in
+[#794](https://github.com/Basekick-Labs/arc/issues/794); once it lands, the same self-heal applies.
+
+Groundwork by [@Thundercloud12](https://github.com/Thundercloud12) in [#790](https://github.com/Basekick-Labs/arc/pull/790); the mid-pull ordering was found and reproduced live while reviewing it.
+
 ### MQTT startSubscriber validates reservation before installing live subscriber ([#770](https://github.com/Basekick-Labs/arc/issues/770))
 
 `startSubscriber` now performs a compare-and-swap check under the manager lock after
