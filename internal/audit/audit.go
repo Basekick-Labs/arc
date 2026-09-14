@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/config"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
 
@@ -178,6 +179,10 @@ func (l *Logger) LogEvent(event *AuditEvent) {
 	select {
 	case l.eventCh <- event:
 	default:
+		// The event never reaches the writer, so it cannot be counted as a
+		// write error. Track it separately: an audit trail with silent gaps is
+		// worse than one that reports them (#802).
+		metrics.Get().IncAuditEventsDropped()
 		l.logger.Warn().Str("event_type", event.EventType).Msg("Audit event channel full, dropping event")
 	}
 }
@@ -227,6 +232,8 @@ func (l *Logger) flushBatch(batch []*AuditEvent) {
 
 	tx, err := l.db.Begin()
 	if err != nil {
+		// The whole batch is lost, so count every event in it (#802).
+		metrics.Get().AddAuditWriteErrors(int64(len(batch)))
 		l.logger.Error().Err(err).Int("batch_size", len(batch)).Msg("Failed to begin audit batch transaction")
 		return
 	}
@@ -237,11 +244,13 @@ func (l *Logger) flushBatch(batch []*AuditEvent) {
 	`)
 	if err != nil {
 		tx.Rollback()
+		metrics.Get().AddAuditWriteErrors(int64(len(batch)))
 		l.logger.Error().Err(err).Msg("Failed to prepare audit insert statement")
 		return
 	}
 	defer stmt.Close()
 
+	failed := 0
 	for _, event := range batch {
 		var detailJSON string
 		if len(event.Detail) > 0 {
@@ -265,12 +274,25 @@ func (l *Logger) flushBatch(batch []*AuditEvent) {
 			detailJSON,
 		)
 		if err != nil {
+			failed++
 			l.logger.Error().Err(err).Str("event_type", event.EventType).Msg("Failed to insert audit event")
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
+		// Commit failure discards the entire batch, including rows that
+		// inserted cleanly, so the whole batch counts as lost (#802).
+		metrics.Get().AddAuditWriteErrors(int64(len(batch)))
 		l.logger.Error().Err(err).Int("batch_size", len(batch)).Msg("Failed to commit audit batch")
+		return
+	}
+
+	// Committed: everything except the rows that failed to insert is durable.
+	if failed > 0 {
+		metrics.Get().AddAuditWriteErrors(int64(failed))
+	}
+	if persisted := len(batch) - failed; persisted > 0 {
+		metrics.Get().AddAuditEvents(int64(persisted))
 	}
 }
 

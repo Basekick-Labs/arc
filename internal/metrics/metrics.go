@@ -108,8 +108,9 @@ type Metrics struct {
 	mqttReconnects       atomic.Int64
 
 	// Audit metrics
-	auditEventsTotal atomic.Int64
-	auditWriteErrors atomic.Int64
+	auditEventsTotal   atomic.Int64
+	auditWriteErrors   atomic.Int64
+	auditEventsDropped atomic.Int64 // Events discarded before queueing (channel full)
 
 	// WAL metrics
 	walRecordsPreserved  atomic.Int64 // Records preserved in WAL for recovery (flush failures)
@@ -370,8 +371,20 @@ func (m *Metrics) IncDBQueries()                     { m.dbQueriesTotal.Add(1) }
 func (m *Metrics) IncDBQueryErrors()                 { m.dbQueryErrorsTotal.Add(1) }
 
 // Audit Metrics
-func (m *Metrics) IncAuditEvents()      { m.auditEventsTotal.Add(1) }
-func (m *Metrics) IncAuditWriteErrors() { m.auditWriteErrors.Add(1) }
+//
+// The batch variants exist because audit events are written in batches: a
+// failed transaction loses every event in the batch, not one, so counting a
+// single error would understate the loss (#802).
+func (m *Metrics) IncAuditEvents()             { m.auditEventsTotal.Add(1) }
+func (m *Metrics) AddAuditEvents(n int64)      { m.auditEventsTotal.Add(n) }
+func (m *Metrics) IncAuditWriteErrors()        { m.auditWriteErrors.Add(1) }
+func (m *Metrics) AddAuditWriteErrors(n int64) { m.auditWriteErrors.Add(n) }
+
+// IncAuditEventsDropped counts audit events discarded before they were ever
+// queued, because the event channel was full. These never reach the writer, so
+// they are invisible to auditWriteErrors — and an audit trail with silent gaps
+// is worse than one that reports them (#802).
+func (m *Metrics) IncAuditEventsDropped() { m.auditEventsDropped.Add(1) }
 
 // MQTT Metrics
 func (m *Metrics) IncMQTTMessagesReceived()         { m.mqttMessagesReceived.Add(1) }
@@ -579,8 +592,9 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"db_query_errors_total": m.dbQueryErrorsTotal.Load(),
 
 		// Audit
-		"audit_events_total": m.auditEventsTotal.Load(),
-		"audit_write_errors": m.auditWriteErrors.Load(),
+		"audit_events_total":   m.auditEventsTotal.Load(),
+		"audit_write_errors":   m.auditWriteErrors.Load(),
+		"audit_events_dropped": m.auditEventsDropped.Load(),
 
 		// MQTT
 		"mqtt_messages_received": m.mqttMessagesReceived.Load(),
@@ -870,9 +884,13 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_audit_events_total counter\n"...)
 	b = appendMetric(b, "arc_audit_events_total", float64(m.auditEventsTotal.Load()))
 
-	b = append(b, "# HELP arc_audit_write_errors_total Total audit log write errors\n"...)
+	b = append(b, "# HELP arc_audit_write_errors_total Total audit log events that failed to persist\n"...)
 	b = append(b, "# TYPE arc_audit_write_errors_total counter\n"...)
 	b = appendMetric(b, "arc_audit_write_errors_total", float64(m.auditWriteErrors.Load()))
+
+	b = append(b, "# HELP arc_audit_events_dropped_total Audit events discarded before queueing because the event channel was full\n"...)
+	b = append(b, "# TYPE arc_audit_events_dropped_total counter\n"...)
+	b = appendMetric(b, "arc_audit_events_dropped_total", float64(m.auditEventsDropped.Load()))
 
 	// MQTT metrics
 	b = append(b, "# HELP arc_mqtt_messages_received_total Total MQTT messages received\n"...)

@@ -358,6 +358,49 @@ applying every command type wired in the cluster package to enforce it. `Stop` a
 file callbacks once Raft is joined, so an in-process restart cannot replay a delete into a queue the
 previous run had closed.
 
+### `server.shutdown_timeout` was parsed and then ignored ([#805](https://github.com/Basekick-Labs/arc/issues/805))
+
+The key was documented, defaulted, read into config, and plumbed into the HTTP server config — and then never used. Three separate shutdown budgets hardcoded 30 seconds instead, so an operator who raised the value to give a slow object store more room to flush got no effect at all.
+
+That budget is load-bearing for durability: when it expires, the coordinator skips the remaining shutdown steps, and a buffer flush that has not finished is abandoned. Raising `terminationGracePeriodSeconds` in Kubernetes without a matching Arc setting simply gave the pod longer to sit idle after Arc had already given up at 30 seconds.
+
+The coordinator budget and the HTTP drain now both derive from `server.shutdown_timeout`. A non-positive value is rejected with a warning and falls back to the 30-second default, rather than cancelling the shutdown context immediately and skipping every step.
+
+The unused `ShutdownTimeout` field has been removed from `api.ServerConfig`. `Server.Shutdown` takes its budget as a parameter; the field was assigned by callers and read by nothing, which is what made the key look wired when it was not.
+
+
+### The Arrow query endpoint counted its failures but not its requests ([#801](https://github.com/Basekick-Labs/arc/issues/801))
+
+`POST /api/v1/query/arrow` incremented `arc_query_errors_total` on failure but never `arc_query_requests_total` or `arc_query_success_total`. Three consequences, all of which land on the first dashboard anyone builds:
+
+- **The obvious error-rate expression was unbounded.** `rate(arc_query_errors_total[5m]) / rate(arc_query_requests_total[5m])` counted Arrow failures in the numerator with no Arrow traffic in the denominator, so on an Arrow-heavy deployment the ratio could exceed 1 — or divide by zero if no JSON queries ever ran.
+- **Arrow throughput was not observable at all.** No counter moved on a successful Arrow query.
+- `arc_query_success_total + arc_query_errors_total` did not equal `arc_query_requests_total`, so none of the three was safe as a denominator.
+
+Arrow is the path performance-sensitive clients are steered to, so this was under-counting the majority of query traffic in exactly the deployments most likely to be monitored closely.
+
+The endpoint now counts requests at entry, and success, rows and latency on completion, matching the JSON path. Verified on a running binary: one successful and one failing Arrow query move the counters to `requests 2, success 1, errors 1`, where the same sequence previously produced `requests 0, success 0, errors 1`.
+
+All four query entry points (`/api/v1/query`, `/api/v1/query/msgpack`, `/api/v1/query/:measurement`, `/api/v1/query/arrow`) now count requests consistently.
+### Deployment artifacts: wrong storage variable, no-op autoscaling values, and no WAL ([#804](https://github.com/Basekick-Labs/arc/issues/804))
+
+Three defects in the shipped Kubernetes manifests and the OSS Helm chart. Each is small on its own; together they meant a user following our own deployment files could run without a write-ahead log, or write data outside the persistent volume.
+
+**`ARC_STORAGE_BASE_PATH` was not a real setting.** `deploy/kubernetes-local/statefulset.yaml` set it on both the writer and the reader, but no such config key exists — the correct name is `ARC_STORAGE_LOCAL_PATH` (`storage.local_path`). The variable was silently ignored and Arc used its default `./data/arc`, relative to the container working directory, so whether data landed on the mounted PVC was incidental. Fixed in both StatefulSets.
+
+**`deploy/kubernetes/` set no storage path and no WAL at all**, relying on binary defaults for both. Both are now explicit and point under the volume mount.
+
+**The OSS Helm chart now enables the WAL.** `wal.enabled` defaults to `false` in the binary for backwards compatibility, and the chart did not override it — so `helm install arc` produced a deployment with no write-ahead log, where a crash loses every record buffered since the last flush. Every shipped Docker Compose file already set `ARC_WAL_ENABLED=true`; the chart omitting it was an oversight. It is now on by default and configurable:
+
+```yaml
+arc:
+  wal:
+    enabled: true
+    directory: /app/data/wal
+```
+
+**The OSS chart's `autoscaling` values have been removed.** They were never backed by a `HorizontalPodAutoscaler` template: setting `autoscaling.enabled=true` only dropped `replicas` from the Deployment, leaving a single replica with nothing managing it. Horizontal scaling of a single OSS Arc is not viable in any case — the default `Recreate` strategy over a ReadWriteOnce PVC prevents replicas from sharing the volume. Scaling out requires shared object storage with Arc Enterprise clustering, where readers are separate StatefulSets. Existing values files that set `autoscaling.*` keep rendering; the keys are simply ignored, as they were in practice before.
+
 ### Readers no longer walk a half-replayed manifest at startup ([#799](https://github.com/Basekick-Labs/arc/issues/799))
 
 Before walking the cluster manifest for its startup catch-up, a node waited on a Raft barrier so the
@@ -380,6 +423,23 @@ The default `cluster.replication_catchup_barrier_timeout_ms` moves from 10000 to
 longer than ~10 s the leader's replication to the returning follower backs off for up to 10.24 s, and
 the old default expired at that edge. On timeout the node proceeds as before and logs its applied,
 commit and last log index.
+### Buffer, audit and MQTT metrics that were exported but never populated ([#802](https://github.com/Basekick-Labs/arc/issues/802))
+
+Several metrics were exported at `/metrics` with HELP and TYPE strings and then never incremented, so they scraped as a permanent `0`. That is worse than an absent metric: a panel built on one looks healthy rather than broken. These are now wired.
+
+**Ingest backpressure is observable for the first time.** `arc_buffer_records_buffered`, `arc_buffer_flushes_total`, `arc_buffer_records_written_total` and `arc_buffer_queue_depth` now carry real values. `arc_buffer_records_buffered` is the one to watch: records accepted but not yet written to storage. It is published by a one-second sampler rather than on flush completion, because a flush is what empties the buffer — publishing only there would report `0` in exactly the backlog case an operator needs to see.
+
+**Audit events can no longer be lost silently.** `internal/audit` did not reference the metrics package at all, while `LogEvent` drops events when its queue is full. For a compliance feature, undetectable loss is the worst failure mode. Three paths are now instrumented:
+
+- **New metric `arc_audit_events_dropped_total`** counts events discarded before they were ever queued. These never reach the writer, so they cannot be counted as write errors — they needed their own counter.
+- `arc_audit_write_errors_total` now counts events that failed to persist, **by batch size**: a failed transaction loses every event in the batch, so counting a single error would understate the loss.
+- `arc_audit_events_total` counts events that actually committed.
+
+If you run audit logging for compliance, alert on `arc_audit_events_dropped_total > 0`. The audit queue is currently a fixed 1000 events with no configuration key, so a sustained non-zero value means audit events are being lost faster than they can be written and needs investigation rather than tuning.
+
+**`arc_mqtt_decode_errors_total`** now increments when a payload parses as neither MessagePack nor JSON. Previously every decode failure was folded into `arc_mqtt_messages_failed_total`, which also covers write failures, so a publisher sending malformed payloads was indistinguishable from a storage problem.
+
+Two groups remain unwired after this release and still read `0`: the DuckDB pool gauges (`arc_db_connections_open`, `arc_db_connections_in_use`, `arc_db_queries_total`, and the `pool` block of `GET /api/v1/metrics/query-pool`), tracked in [#809](https://github.com/Basekick-Labs/arc/issues/809); and `arc_replication_sequence_gaps_total`, which needs gap detection in the replication receiver rather than a wiring change, tracked in [#810](https://github.com/Basekick-Labs/arc/issues/810).
 
 ### A graceful shutdown could delete the WAL that still held unflushed data ([#803](https://github.com/Basekick-Labs/arc/issues/803))
 
