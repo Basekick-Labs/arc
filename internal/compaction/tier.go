@@ -170,6 +170,14 @@ type Tier interface {
 	// FindCandidates finds partitions that are candidates for compaction at this tier level
 	FindCandidates(ctx context.Context, database, measurement string) ([]Candidate, error)
 
+	// FindCandidatesFromListing is FindCandidates over an already-fetched
+	// listing of the database/measurement/ prefix (as returned by
+	// storage.Backend.List for measurementPrefix). It does no I/O, so a
+	// caller holding one listing can run several tiers on it instead of
+	// listing the store once per tier (#316). Objects outside the prefix
+	// are ignored.
+	FindCandidatesFromListing(database, measurement string, objects []string) []Candidate
+
 	// ShouldCompact determines if a partition should be compacted based on tier-specific criteria
 	ShouldCompact(files []string, partitionTime time.Time) bool
 
@@ -187,6 +195,12 @@ type Tier interface {
 
 	// GetStats returns tier statistics
 	GetStats() map[string]interface{}
+}
+
+// measurementPrefix is the storage prefix every object of one measurement
+// lives under, and the prefix the tier scanners parse partitions relative to.
+func measurementPrefix(database, measurement string) string {
+	return database + "/" + measurement + "/"
 }
 
 // BaseTier provides common functionality for all compaction tiers
@@ -300,4 +314,19 @@ func (t *BaseTier) ShouldCompactByFileSuffix(
 	}
 
 	return false
+}
+
+// listObjects lists every object of one measurement — the input both
+// FindCandidates and, via the manager, FindCandidatesFromListing work from.
+func (b *BaseTier) listObjects(ctx context.Context, database, measurement string) ([]string, error) {
+	objects, err := b.StorageBackend.List(ctx, measurementPrefix(database, measurement))
+	if err != nil {
+		return nil, err
+	}
+	b.Logger.Debug().
+		Str("database", database).
+		Str("measurement", measurement).
+		Int("object_count", len(objects)).
+		Msg("Listed storage objects")
+	return objects, nil
 }
