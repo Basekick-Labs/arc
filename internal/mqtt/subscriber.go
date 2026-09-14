@@ -395,6 +395,11 @@ func (s *Subscriber) decodePayload(topic string, payload []byte) ([]interface{},
 		return records, nil
 	}
 
+	// Neither format parsed. Counted separately from IncMQTTMessagesFailed,
+	// which covers every processing failure including write errors: this one
+	// isolates malformed payloads, so an operator can tell a publisher sending
+	// garbage from a storage problem (#802).
+	metrics.Get().IncMQTTDecodeErrors()
 	return nil, fmt.Errorf("failed to decode payload as MessagePack or JSON")
 }
 
