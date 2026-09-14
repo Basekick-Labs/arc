@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"sync/atomic"
 
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
@@ -20,18 +19,16 @@ import (
 const (
 	// Initial buffer size for the pool (256KB covers most payloads)
 	initialBufferSize = 256 * 1024
-	// Maximum buffer size to return to pool (1MB) - larger buffers are discarded
-	// This prevents memory accumulation from occasional large payloads
-	maxPooledBufferSize = 1024 * 1024
 )
 
-// Track oversized buffer discards for monitoring
-var decompBufferDiscards atomic.Int64
-
-// GetDecompBufferDiscards returns the count of oversized buffers not returned to pool
-func GetDecompBufferDiscards() int64 {
-	return decompBufferDiscards.Load()
-}
+// NOTE: there is deliberately no oversized-buffer discard guard or counter
+// here (#817). The cap constant, the package-local discard counter and its
+// exported accessor were left behind when the per-handler pooled codecs were
+// replaced by decompressGzipPooled / decompressZstdPooled — see the comment
+// above msgPackStats. decompressBufferPool is never Get() from at runtime, so
+// no buffer can be discarded and nothing could increment them. If a pooled
+// decompression path returns, add the guard and its counter in the same
+// change, so the metric never ships ahead of the behaviour it reports.
 
 // Pool for decompression buffers - reduces GC pressure under high load
 var decompressBufferPool = sync.Pool{

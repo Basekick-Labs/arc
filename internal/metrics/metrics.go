@@ -139,8 +139,11 @@ type Metrics struct {
 	walFailedWrites      atomic.Int64 // Write failures to WAL file
 	walOversizedPayloads atomic.Int64 // Payloads rejected for exceeding the single-entry cap even after chunking (#677)
 
-	// Decompression pool metrics
-	decompBufferDiscards atomic.Int64 // Oversized buffers not returned to pool
+	// NOTE: no decompression-pool discard counter here (#817). The pooled
+	// codecs it belonged to were replaced by decompressGzipPooled /
+	// decompressZstdPooled; internal/api's decompressBufferPool is never
+	// Get() from at runtime, so no buffer can be discarded. If a pooled
+	// decompression path returns, add the guard and its counter together.
 
 	// Governance metrics
 	governanceRateLimited    atomic.Int64 // Queries rejected by rate limiting
@@ -454,7 +457,6 @@ func (m *Metrics) IncWALFailedWrites()                { m.walFailedWrites.Add(1)
 func (m *Metrics) IncWALOversizedPayloads()           { m.walOversizedPayloads.Add(1) }
 
 // Decompression Pool Metrics
-func (m *Metrics) IncDecompBufferDiscards() { m.decompBufferDiscards.Add(1) }
 
 // Governance Metrics
 func (m *Metrics) IncGovernanceRateLimited()           { m.governanceRateLimited.Add(1) }
@@ -660,7 +662,6 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"wal_oversized_payloads": m.walOversizedPayloads.Load(),
 
 		// Decompression Pool
-		"decomp_buffer_discards": m.decompBufferDiscards.Load(),
 
 		// Governance
 		"governance_rate_limited_total":    m.governanceRateLimited.Load(),
@@ -1005,11 +1006,6 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_oversized_payloads_total Payloads rejected for exceeding the single-entry cap even after chunking\n"...)
 	b = append(b, "# TYPE arc_wal_oversized_payloads_total counter\n"...)
 	b = appendMetric(b, "arc_wal_oversized_payloads_total", float64(m.walOversizedPayloads.Load()))
-
-	// Decompression pool metrics
-	b = append(b, "# HELP arc_decomp_buffer_discards_total Oversized decompression buffers not returned to pool\n"...)
-	b = append(b, "# TYPE arc_decomp_buffer_discards_total counter\n"...)
-	b = appendMetric(b, "arc_decomp_buffer_discards_total", float64(m.decompBufferDiscards.Load()))
 
 	// Governance metrics
 	b = append(b, "# HELP arc_governance_rate_limited_total Queries rejected by rate limiting\n"...)

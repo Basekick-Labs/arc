@@ -373,6 +373,15 @@ rate(arc_db_wait_count_total[5m]) > 0
 Sampling happens at read time rather than on a background ticker — `sql.DBStats` is a point-in-time snapshot that is only meaningful when observed — and all three metrics endpoints refresh it, so the JSON and Prometheus surfaces agree.
 
 **`arc_db_queries_total` and `arc_db_query_errors_total` have been removed** rather than wired. Counting them at the `DuckDB.Query`/`Exec` wrappers would have missed the hot path: the query handler runs through `query.ParallelExecutor`, which holds the raw `*sql.DB` and never passes through those wrappers. A counter named "total" that silently omits most queries is the same failure mode as the Arrow under-counting fixed above, so it is better absent than partial. Use `arc_query_requests_total` and `arc_query_errors_total`, which are counted at every API entry point.
+### Removed: `arc_decomp_buffer_discards_total` ([#817](https://github.com/Basekick-Labs/arc/issues/817))
+
+**This metric has been removed.** If you scrape it, drop it — it has always read `0`.
+
+It counted "oversized decompression buffers not returned to the pool", a standard guard for a `sync.Pool` of variable-size buffers. That guard was never reached: the per-handler pooled codecs it belonged to were replaced by the package-level `decompressGzipPooled` / `decompressZstdPooled`, and the buffer pool they left behind is never taken from at runtime. With nothing drawing a buffer, nothing could discard one.
+
+Also removed alongside it: a second, package-local discard counter with an exported `GetDecompBufferDiscards()` accessor, and the unused `maxPooledBufferSize` threshold the guard would have used.
+
+The `sync.Pool` and `PooledBuffer` themselves stay — they are documented in the code as deliberately retained for a future pooled path, and their `Release()` idempotency is still covered by tests. Only the metrics go, because an exported counter that can never move reports health it never checked.
 
 
 ### Shutdown no longer deadlocks when a manifest delete is applied while the coordinator stops ([#797](https://github.com/Basekick-Labs/arc/issues/797))
