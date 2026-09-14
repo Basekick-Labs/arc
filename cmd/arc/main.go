@@ -73,6 +73,11 @@ const uploadSubdirName = "arc-uploads"
 // at the same instant its MAC would be rejected as stale.
 const cacheInvalidateHMACTolerance = security.HMACTimestampTolerance
 
+// defaultShutdownTimeout is the fallback graceful-shutdown budget used when
+// server.shutdown_timeout is missing or non-positive. It matches the key's
+// own default (internal/config/config.go, setDefaults).
+const defaultShutdownTimeout = 30 * time.Second
+
 // applyLicenseCoreLimits enforces lic.MaxCores on every execution surface —
 // Go runtime (GOMAXPROCS), DuckDB native threads (cfg.Database.ThreadCount is
 // the REAL DuckDB enforcement; GOMAXPROCS does not bound CGo threads), and
@@ -273,8 +278,27 @@ func main() {
 		Int("interval_seconds", cfg.Metrics.TimeseriesIntervalSeconds).
 		Msg("Timeseries metrics collector initialized")
 
-	// Initialize shutdown coordinator
-	shutdownCoordinator := shutdown.New(30*time.Second, logger.Get("shutdown"))
+	// Initialize shutdown coordinator.
+	//
+	// The budget comes from server.shutdown_timeout (default 30s). It bounds
+	// the whole graceful shutdown: when it expires, the coordinator skips the
+	// remaining hooks and components, so a buffer flush that has not finished
+	// is abandoned. Operators who raise terminationGracePeriodSeconds to give
+	// a slow object store more room need this key to move with it — it was
+	// previously parsed and then ignored in favour of a hardcoded 30s (#805).
+	//
+	// Guard against a non-positive value: viper returns 0 for an unset or
+	// malformed key, and a zero budget would cancel the context immediately,
+	// skipping every hook and component including the buffer flush.
+	shutdownTimeout := time.Duration(cfg.Server.ShutdownTimeout) * time.Second
+	if shutdownTimeout <= 0 {
+		log.Warn().
+			Int("configured", cfg.Server.ShutdownTimeout).
+			Dur("using", defaultShutdownTimeout).
+			Msg("server.shutdown_timeout must be positive; falling back to the default")
+		shutdownTimeout = defaultShutdownTimeout
+	}
+	shutdownCoordinator := shutdown.New(shutdownTimeout, logger.Get("shutdown"))
 
 	// Opt-in pprof on a localhost listener (no-op unless ARC_DEBUG_PPROF=1).
 	// Replaces the previous behaviour where pprof was unconditionally
@@ -1790,16 +1814,15 @@ func main() {
 
 	// Initialize HTTP server
 	serverConfig := &api.ServerConfig{
-		Host:            cfg.Server.Host,
-		Port:            cfg.Server.Port,
-		ReadTimeout:     time.Duration(cfg.Server.ReadTimeout) * time.Second,
-		WriteTimeout:    time.Duration(cfg.Server.WriteTimeout) * time.Second,
-		IdleTimeout:     time.Duration(cfg.Server.IdleTimeout) * time.Second,
-		ShutdownTimeout: time.Duration(cfg.Server.ShutdownTimeout) * time.Second,
-		MaxPayloadSize:  cfg.Server.MaxPayloadSize,
-		TLSEnabled:      cfg.Server.TLSEnabled,
-		TLSCertFile:     cfg.Server.TLSCertFile,
-		TLSKeyFile:      cfg.Server.TLSKeyFile,
+		Host:           cfg.Server.Host,
+		Port:           cfg.Server.Port,
+		ReadTimeout:    time.Duration(cfg.Server.ReadTimeout) * time.Second,
+		WriteTimeout:   time.Duration(cfg.Server.WriteTimeout) * time.Second,
+		IdleTimeout:    time.Duration(cfg.Server.IdleTimeout) * time.Second,
+		MaxPayloadSize: cfg.Server.MaxPayloadSize,
+		TLSEnabled:     cfg.Server.TLSEnabled,
+		TLSCertFile:    cfg.Server.TLSCertFile,
+		TLSKeyFile:     cfg.Server.TLSKeyFile,
 	}
 	if telemetryCollector != nil {
 		// Only a live collector (typed nil would be a non-nil interface).
@@ -3690,16 +3713,17 @@ func main() {
 	}, 5)
 
 	// Register HTTP server shutdown hook (first to stop accepting new
-	// requests). The 30-second arg is the HTTP server's INTERNAL drain
-	// timeout — independent of shutdownCoordinator's own 30-second
-	// budget. If the coordinator ctx expires before this hook completes,
-	// the coordinator skips remaining hooks; the internal timeout is a
-	// best-effort upper bound on this hook's slice of that budget. The
-	// debug-pprof hook (registered earlier in main, same priority) uses
-	// srv.Close() instead of Shutdown(ctx) to avoid letting a long
-	// /debug/pprof/profile?seconds=N capture starve this hook.
+	// requests). The arg is the HTTP server's INTERNAL drain timeout —
+	// independent of shutdownCoordinator's own budget, though both now derive
+	// from server.shutdown_timeout (#805), so raising that key gives the drain
+	// and the overall shutdown the same extra room. If the coordinator ctx
+	// expires before this hook completes, the coordinator skips remaining
+	// hooks; the internal timeout is a best-effort upper bound on this hook's
+	// slice of that budget. The debug-pprof hook (registered earlier in main,
+	// same priority) uses srv.Close() instead of Shutdown(ctx) to avoid
+	// letting a long /debug/pprof/profile?seconds=N capture starve this hook.
 	shutdownCoordinator.RegisterHook("http-server", func(ctx context.Context) error {
-		return server.Shutdown(30 * time.Second)
+		return server.Shutdown(shutdownTimeout)
 	}, shutdown.PriorityHTTPServer)
 
 	// Mark /ready=200 so the load balancer (Pattern 2 multi-writer) starts

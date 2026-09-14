@@ -338,6 +338,17 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### `server.shutdown_timeout` was parsed and then ignored ([#805](https://github.com/Basekick-Labs/arc/issues/805))
+
+The key was documented, defaulted, read into config, and plumbed into the HTTP server config — and then never used. Three separate shutdown budgets hardcoded 30 seconds instead, so an operator who raised the value to give a slow object store more room to flush got no effect at all.
+
+That budget is load-bearing for durability: when it expires, the coordinator skips the remaining shutdown steps, and a buffer flush that has not finished is abandoned. Raising `terminationGracePeriodSeconds` in Kubernetes without a matching Arc setting simply gave the pod longer to sit idle after Arc had already given up at 30 seconds.
+
+The coordinator budget and the HTTP drain now both derive from `server.shutdown_timeout`. A non-positive value is rejected with a warning and falls back to the 30-second default, rather than cancelling the shutdown context immediately and skipping every step.
+
+The unused `ShutdownTimeout` field has been removed from `api.ServerConfig`. `Server.Shutdown` takes its budget as a parameter; the field was assigned by callers and read by nothing, which is what made the key look wired when it was not.
+
+
 ### The Arrow query endpoint counted its failures but not its requests ([#801](https://github.com/Basekick-Labs/arc/issues/801))
 
 `POST /api/v1/query/arrow` incremented `arc_query_errors_total` on failure but never `arc_query_requests_total` or `arc_query_success_total`. Three consequences, all of which land on the first dashboard anyone builds:
