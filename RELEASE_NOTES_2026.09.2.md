@@ -338,6 +338,19 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Removed: `arc_replication_sequence_gaps_total` ([#810](https://github.com/Basekick-Labs/arc/issues/810))
+
+**This metric has been removed.** If you scrape it, drop it from your dashboards and alerts — it has read `0` on every Arc since it was introduced.
+
+It was announced in 26.03.1 alongside a claim that "receivers now log a warning with gap details when non-consecutive sequences are received." That detection was never implemented: nothing in the replication receiver has ever checked for a gap, and nothing ever incremented the counter.
+
+It is being removed rather than implemented, because a silent gap **cannot occur** on a replication connection. The receiver requires each checkpoint's `LastSequence` to equal exactly what it has applied, and both ends carry a cumulative SHA-256 over every payload since the handshake — a skipped entry diverges the hashes. Either check drops the connection, and checkpoints are emitted every 1024 entries, so the blast radius is bounded. Failing closed at the receive path is strictly stronger than a counter scraped after the fact.
+
+An exported counter that can never change value is worse than no counter: an alert built on it is permanently green and asserts a guarantee the code never checked. Removing it is the honest option.
+
+The signal operators actually need for replication health is **lag**, not gaps — the delta between what the writer has produced and what the receiver has applied. That is tracked separately.
+
+
 ### Shutdown no longer deadlocks when a manifest delete is applied while the coordinator stops ([#797](https://github.com/Basekick-Labs/arc/issues/797))
 
 `Coordinator.Stop` holds the coordinator lock for its whole body, including stopping the Raft node,
@@ -439,7 +452,7 @@ If you run audit logging for compliance, alert on `arc_audit_events_dropped_tota
 
 **`arc_mqtt_decode_errors_total`** now increments when a payload parses as neither MessagePack nor JSON. Previously every decode failure was folded into `arc_mqtt_messages_failed_total`, which also covers write failures, so a publisher sending malformed payloads was indistinguishable from a storage problem.
 
-Two groups remain unwired after this release and still read `0`: the DuckDB pool gauges (`arc_db_connections_open`, `arc_db_connections_in_use`, `arc_db_queries_total`, and the `pool` block of `GET /api/v1/metrics/query-pool`), tracked in [#809](https://github.com/Basekick-Labs/arc/issues/809); and `arc_replication_sequence_gaps_total`, which needs gap detection in the replication receiver rather than a wiring change, tracked in [#810](https://github.com/Basekick-Labs/arc/issues/810).
+One group remains unwired after this release and still reads `0`: the DuckDB pool gauges (`arc_db_connections_open`, `arc_db_connections_in_use`, `arc_db_queries_total`, and the `pool` block of `GET /api/v1/metrics/query-pool`), tracked in [#809](https://github.com/Basekick-Labs/arc/issues/809).
 
 ### A graceful shutdown could delete the WAL that still held unflushed data ([#803](https://github.com/Basekick-Labs/arc/issues/803))
 

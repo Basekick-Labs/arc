@@ -136,7 +136,17 @@ type Metrics struct {
 
 	// Replication metrics
 	replicationEntriesDroppedTotal atomic.Int64 // Total replication entries dropped due to full buffer
-	replicationSequenceGapsTotal   atomic.Int64 // Total number of missing replication entries detected via sequence gaps
+	//
+	// There is deliberately no sequence-gap counter here (#810). A gap cannot
+	// occur silently on a replication connection: the receiver requires each
+	// checkpoint's LastSequence to equal exactly what it has applied, and both
+	// ends carry a cumulative SHA-256 over every payload, so a skipped entry
+	// diverges the hashes. Either check drops the connection
+	// (internal/cluster/replication/receiver.go). Failing closed at the
+	// receive path is strictly stronger than a counter scraped after the fact
+	// — the same shape as Kafka's OutOfOrderSequenceException or Raft's
+	// prevLogIndex rejection. The signal operators actually need here is
+	// replication LAG, which is tracked separately.
 
 	// Cluster FSM security metrics (Enterprise only — only mutated when
 	// the Raft FSM is constructed, which is gated by cluster.enabled +
@@ -424,8 +434,7 @@ func (m *Metrics) IncQueryMgmtCancelled()            { m.queryMgmtCancelledTotal
 func (m *Metrics) SetQueryMgmtHistorySize(n int64)   { m.queryMgmtHistorySize.Store(n) }
 
 // Replication Metrics
-func (m *Metrics) IncReplicationEntriesDropped()      { m.replicationEntriesDroppedTotal.Add(1) }
-func (m *Metrics) IncReplicationSequenceGaps(n int64) { m.replicationSequenceGapsTotal.Add(n) }
+func (m *Metrics) IncReplicationEntriesDropped() { m.replicationEntriesDroppedTotal.Add(1) }
 
 // IncClusterManifestRejectedPaths increments the cluster FSM
 // path-rejection counter. Called from internal/cluster/raft/fsm.go
@@ -629,7 +638,6 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 
 		// Replication
 		"replication_entries_dropped_total": m.replicationEntriesDroppedTotal.Load(),
-		"replication_sequence_gaps_total":   m.replicationSequenceGapsTotal.Load(),
 
 		// Cluster FSM security (Enterprise)
 		"cluster_manifest_rejected_paths_total":  m.clusterManifestRejectedPathsTotal.Load(),
@@ -985,10 +993,6 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_replication_entries_dropped_total Total replication entries dropped due to full buffer\n"...)
 	b = append(b, "# TYPE arc_replication_entries_dropped_total counter\n"...)
 	b = appendMetric(b, "arc_replication_entries_dropped_total", float64(m.replicationEntriesDroppedTotal.Load()))
-
-	b = append(b, "# HELP arc_replication_sequence_gaps_total Total sequence gaps detected on replication receivers\n"...)
-	b = append(b, "# TYPE arc_replication_sequence_gaps_total counter\n"...)
-	b = appendMetric(b, "arc_replication_sequence_gaps_total", float64(m.replicationSequenceGapsTotal.Load()))
 
 	// Cluster FSM security metrics (Enterprise — see GHSA-f85q-mvg8-qf37)
 	b = append(b, "# HELP arc_cluster_manifest_rejected_paths_total Total manifest path proposals refused by the cluster FSM. Non-zero growth indicates a peer/snapshot/log entry proposed a path validation refused (URL scheme, absolute, parent-traversal, NUL, oversize).\n"...)
