@@ -321,8 +321,36 @@ fails the build rather than leaving the note quietly wrong.
 7. **Edge-sync spoke IDs containing `:` must be re-registered before upgrade.**
    See *Edge-sync spoke IDs no longer create manifest-invalid keys* below;
    existing files remain under the old namespace.
+8. **Clustered upgrade order: writers before readers.** A follower's startup catch-up now forwards a
+   barrier command through the Raft leader ([#799](https://github.com/Basekick-Labs/arc/issues/799)). A
+   leader running an older release rejects the command and the reader falls back to the previous
+   behaviour (walking a possibly stale manifest) until the leader is upgraded. Upgrade the writer
+   nodes, which are the leader candidates, first.
 
 ## Bug fixes
+
+### Readers no longer walk a half-replayed manifest at startup ([#799](https://github.com/Basekick-Labs/arc/issues/799))
+
+Before walking the cluster manifest for its startup catch-up, a node waited on a Raft barrier so the
+walk would see every committed entry. That barrier is leader-only: on a follower it returned at once,
+the node logged "proceeding against possibly-stale manifest", and on every reader restart with
+unapplied log behind it the walk ran before the replay. Entries that landed a moment later were
+pulled outside the gated batch, so with `cluster.query_gate_on_catchup` enabled a reader could answer
+queries while still missing files the manifest listed.
+
+A follower now forwards a no-op barrier entry through the leader, using the same authenticated path
+as every forwarded manifest write, and waits until its own FSM has applied it. Raft applies the log in
+order, so once the barrier is visible locally the whole backlog before it is too, and only then does
+the walk start; the query gate stays closed meanwhile. The leader keeps using Raft's own barrier. The
+barrier map is part of FSM snapshots, so a follower that catches up by snapshot install resolves the
+wait immediately. The leader's coordinator address is now also resolved from the FSM node table when a
+freshly restarted follower's in-memory registry does not have it yet, which also removes a latent
+post-restart failure for every other forwarded write.
+
+The default `cluster.replication_catchup_barrier_timeout_ms` moves from 10000 to 30000: after an outage
+longer than ~10 s the leader's replication to the returning follower backs off for up to 10.24 s, and
+the old default expired at that edge. On timeout the node proceeds as before and logs its applied,
+commit and last log index.
 
 ### Removing a manifest entry reopens the replication query gate without a restart ([#759](https://github.com/Basekick-Labs/arc/issues/759), [#795](https://github.com/Basekick-Labs/arc/issues/795))
 

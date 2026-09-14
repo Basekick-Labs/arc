@@ -2690,8 +2690,10 @@ func (c *Coordinator) startFilePullerLocked() error {
 }
 
 // runCatchUpOnce is the Phase 3 startup reconciliation walker. It waits for
-// a leader + a Raft barrier so the local FSM reflects every committed entry,
-// then hands the full manifest to the puller.
+// a leader, then for the local FSM to reflect every entry the leader had
+// committed (Raft's Barrier on the leader, a forwarded barrier entry on a
+// follower: waitForManifestSync, #799), then hands the full manifest to the
+// puller.
 //
 // Called exactly once per Coordinator lifetime. The sync.Once guard means
 // repeated Start/Stop cycles in tests do NOT re-run catch-up — a fresh walk
@@ -2702,10 +2704,11 @@ func (c *Coordinator) startFilePullerLocked() error {
 // drift the startup walker can't see (orphan-storage on shared backends,
 // orphan-manifest entries from partial-failure scenarios).
 //
-// Errors from WaitForLeader and Barrier are logged as warnings and the
+// Errors from WaitForLeader and from the sync are logged as warnings and the
 // walker proceeds against a possibly-stale FSM snapshot. A partial walk is
 // strictly better than no walk — the reactive FSM callback path catches
-// any entries the walker missed as they apply.
+// any entries the walker missed as they apply. When no leader was found the
+// sync is skipped outright rather than retried for another timeout.
 func (c *Coordinator) runCatchUpOnce() {
 	c.catchupOnce.Do(func() {
 		c.mu.RLock()
@@ -2720,26 +2723,38 @@ func (c *Coordinator) runCatchUpOnce() {
 		// Wait for a leader. On failure we still proceed — a follower with a
 		// non-empty FSM is a valid catch-up candidate against cluster state
 		// it already has locally, even if no leader is currently elected.
+		leaderKnown := true
 		if err := raftNode.WaitForLeader(30 * time.Second); err != nil {
+			leaderKnown = false
 			c.logger.Warn().
 				Err(err).
 				Msg("Catch-up: no leader after 30s, proceeding against possibly-stale manifest")
 		}
 
-		// Barrier: wait for the local FSM to apply everything up to the
-		// current commit index. Without this, GetAllFiles() on a freshly
-		// joined node may see a half-replayed manifest. On a lagging
-		// follower the barrier may time out — same degraded-but-useful
-		// fallback as above.
+		// Sync: wait for the local FSM to apply everything the leader had
+		// committed when we got here. Without this a restarted node walks a
+		// half-replayed manifest and the entries that land afterwards are
+		// pulled outside the gated batch (#799). On the leader this is
+		// Raft's own Barrier; on a follower it is a barrier entry forwarded
+		// through the leader and observed in the local FSM. On failure we
+		// still proceed — degraded but useful, same as the leader fallback.
 		barrierTimeout := time.Duration(c.cfg.ReplicationCatchUpBarrierTimeoutMs) * time.Millisecond
 		if barrierTimeout <= 0 {
-			barrierTimeout = 10 * time.Second
+			barrierTimeout = 30 * time.Second
 		}
-		if err := raftNode.Barrier(barrierTimeout); err != nil {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if !leaderKnown {
+			c.logger.Warn().Msg("Catch-up: skipping the leader sync, no leader to sync with")
+		} else if err := c.waitForManifestSync(ctx, raftNode, barrierTimeout); err != nil {
 			c.logger.Warn().
 				Err(err).
 				Dur("timeout", barrierTimeout).
-				Msg("Catch-up: Raft barrier timed out, proceeding against possibly-stale manifest")
+				Uint64("applied_index", raftNode.AppliedIndex()).
+				Uint64("commit_index", raftNode.CommitIndex()).
+				Uint64("last_index", raftNode.LastIndex()).
+				Msg("Catch-up: could not sync the manifest with the leader in time, proceeding against possibly-stale manifest")
 		}
 
 		fsm := raftNode.FSM()
@@ -2749,12 +2764,9 @@ func (c *Coordinator) runCatchUpOnce() {
 		}
 		c.logger.Info().Msg("Catch-up: starting paginated manifest walk")
 
-		// Derive a context from c.ctx (or Background if c.ctx is nil, which
-		// happens in tests that bypass Start). The walker honors cancellation
-		// so shutdown doesn't block on a large catch-up.
-		if ctx == nil {
-			ctx = context.Background()
-		}
+		// ctx derives from c.ctx (Background when nil, tests that bypass
+		// Start). The walker honors cancellation so shutdown doesn't block
+		// on a large catch-up.
 		// fsm is captured in the closure below. The Raft FSM pointer is
 		// stable for the lifetime of the node — hashicorp/raft never
 		// replaces the FSM instance once set. The nil guard above ensures
@@ -2763,6 +2775,99 @@ func (c *Coordinator) runCatchUpOnce() {
 			return fsm.GetFilesPaginated(cursor, limit)
 		})
 	})
+}
+
+// waitForManifestSync blocks until this node's FSM has applied every log
+// entry the leader had committed when the call was made, or until timeout
+// or ctx expires (#799).
+//
+// Leader: Raft's Barrier does exactly that. Follower: hashicorp/raft answers
+// a follower's Barrier with ErrNotLeader at once, so instead the follower
+// forwards a CommandBarrier carrying a fresh token through the leader (the
+// same authenticated path every forwarded manifest write uses) and then
+// polls its own FSM for the token. Raft applies the log in order on every
+// node, so once the token is visible locally the whole backlog that preceded
+// it has been applied too. The forward is retried until the deadline: right
+// after a restart the leader's coordinator address may not be known yet, and
+// the leader's replication to us may be in its post-outage backoff (up to
+// ~10 s), which is why the default timeout is 30 s. Each attempt is itself
+// bounded by the forward path's round-trip deadline (forwardApplyTimeout), so
+// a silent leader costs at most one extra round trip past the timeout, and
+// ctx cancellation is observed between attempts. A leader that rejects the
+// command (an older binary, unknown node) ends the wait immediately; the
+// caller proceeds exactly as before this change. ctx must be non-nil.
+//
+// A follower that catches up by snapshot install never applies the barrier
+// entry itself, but the barrier map is part of the snapshot, so a snapshot
+// taken after the barrier committed carries the token as well.
+func (c *Coordinator) waitForManifestSync(ctx context.Context, raftNode *raft.Node, timeout time.Duration) error {
+	if raftNode == nil {
+		return errors.New("raft not available")
+	}
+	if raftNode.IsLeader() {
+		if err := raftNode.Barrier(timeout); err != nil {
+			return fmt.Errorf("leader barrier: %w", err)
+		}
+		return nil
+	}
+	fsm := raftNode.FSM()
+	if fsm == nil {
+		return errors.New("raft FSM not available")
+	}
+	token, err := security.GenerateNonce()
+	if err != nil {
+		return fmt.Errorf("barrier token: %w", err)
+	}
+	payload, err := json.Marshal(raft.BarrierPayload{Token: token, NodeID: c.localNode.ID})
+	if err != nil {
+		return fmt.Errorf("barrier payload: %w", err)
+	}
+	cmd := &raft.Command{Type: raft.CommandBarrier, Payload: payload}
+
+	start := time.Now()
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	// Forward, retrying transient failures (no leader known yet, leader
+	// address not yet in the registry or FSM, dial/round-trip errors, a
+	// Raft apply that failed because leadership moved) until the deadline.
+	// An auth or invalid-command rejection is definitive and ends the wait.
+	var lastErr error
+	for {
+		lastErr = c.forwardApplyToLeader(waitCtx, cmd)
+		if lastErr == nil {
+			break
+		}
+		var rejected *ForwardRejectedError
+		if errors.As(lastErr, &rejected) && rejected.Code != protocol.ForwardCodeApplyFailed {
+			return fmt.Errorf("follower barrier not accepted by the leader: %w", lastErr)
+		}
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf("follower barrier: could not reach the leader before the deadline: %w", lastErr)
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+
+	// The leader has applied the barrier; wait for it to reach this node.
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if idx, ok := fsm.BarrierApplied(token); ok {
+			c.logger.Info().
+				Uint64("barrier_index", idx).
+				Uint64("applied_index", raftNode.AppliedIndex()).
+				Uint64("last_index", raftNode.LastIndex()).
+				Dur("elapsed", time.Since(start)).
+				Msg("Catch-up: manifest synced through the leader's barrier")
+			return nil
+		}
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf("follower barrier: applied on the leader but not seen locally before the deadline (leader replication backoff, snapshot install, or partition)")
+		case <-ticker.C:
+		}
+	}
 }
 
 // ReplicationCatchUpStatus returns the puller's replication and catch-up stats as a

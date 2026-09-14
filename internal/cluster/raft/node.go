@@ -466,6 +466,41 @@ func (n *Node) FSM() *ClusterFSM {
 	return n.fsm
 }
 
+// AppliedIndex is the last log index handed to the FSM (hashicorp/raft's
+// definition: dispatched, not necessarily finished). LastIndex is the last
+// index in the local log, CommitIndex the last index known committed on this
+// node (min of the leader's commit index and the local log). Diagnostics
+// only: a follower whose log is behind cannot tell from these alone how far
+// behind the leader it is.
+func (n *Node) AppliedIndex() uint64 {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.raft == nil {
+		return 0
+	}
+	return n.raft.AppliedIndex()
+}
+
+// CommitIndex reports the last index this node knows to be committed.
+func (n *Node) CommitIndex() uint64 {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.raft == nil {
+		return 0
+	}
+	return n.raft.CommitIndex()
+}
+
+// LastIndex reports the last index in the local log.
+func (n *Node) LastIndex() uint64 {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.raft == nil {
+		return 0
+	}
+	return n.raft.LastIndex()
+}
+
 // WaitForLeader blocks until a leader is elected or timeout.
 func (n *Node) WaitForLeader(timeout time.Duration) error {
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -497,10 +532,9 @@ func (n *Node) WaitForLeader(timeout time.Duration) error {
 // backlog of log entries to apply before walking the manifest, so catch-up
 // doesn't run against a stale view of the cluster's files.
 //
-// Followers can call Barrier too — it waits until local apply catches up to
-// the follower's own commit index, not the leader's. On timeout (e.g.
-// follower far behind the leader), Barrier returns an error and the caller
-// is expected to fall through to its best-effort behavior.
+// Leader only. hashicorp/raft answers a follower's Barrier with ErrNotLeader
+// immediately, without waiting for anything; followers use the forwarded
+// CommandBarrier instead (Coordinator.waitForManifestSync, #799).
 func (n *Node) Barrier(timeout time.Duration) error {
 	if n.raft == nil {
 		return fmt.Errorf("raft not started")

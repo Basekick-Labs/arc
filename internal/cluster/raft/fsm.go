@@ -118,6 +118,14 @@ const (
 	CommandAddTokenToTeam
 	// CommandRemoveTokenFromTeam revokes a token's membership in a team.
 	CommandRemoveTokenFromTeam
+	// CommandBarrier is a no-op entry a follower forwards through the leader
+	// so it can tell when its own FSM has applied everything the leader had
+	// committed before it (#799). Raft applies the log in order on every
+	// node, so once the follower sees the barrier's token it has applied the
+	// whole backlog that preceded it. Mutates no cluster state; only the
+	// bounded token→index map. Appended last: CommandType values are wire
+	// numbers and the ones above must not move.
+	CommandBarrier
 )
 
 // Command represents a command to be applied to the FSM.
@@ -198,6 +206,22 @@ type DeleteFilePayload struct {
 	Path   string `json:"path"`
 	Reason string `json:"reason,omitempty"` // "retention", "compaction", "manual"
 }
+
+// BarrierPayload is the payload for CommandBarrier. Token is chosen by the
+// node that wants to observe the barrier; NodeID is informational.
+type BarrierPayload struct {
+	Token  string `json:"token"`
+	NodeID string `json:"node_id,omitempty"`
+}
+
+const (
+	// MaxBarrierTokenLen bounds a token any authenticated peer can forward.
+	// security.GenerateNonce produces 64 hex characters; keep headroom.
+	MaxBarrierTokenLen = 128
+	// maxBarriers bounds the token→index map; older barriers are evicted
+	// first. A restarted follower needs only its own, most recent token.
+	maxBarriers = 256
+)
 
 // UpdateFilePayload is the payload for CommandUpdateFile.
 type UpdateFilePayload struct {
@@ -312,6 +336,10 @@ type FSMSnapshot struct {
 	Roles                  map[int64]*RoleEntry                  `json:"roles,omitempty"`
 	MeasurementPermissions map[int64]*MeasurementPermissionEntry `json:"measurement_permissions,omitempty"`
 	TokenMemberships       map[int64]*TokenMembershipEntry       `json:"token_memberships,omitempty"`
+	// Barriers: CommandBarrier token → log index (#799). A deterministic
+	// function of the log, so every node's snapshot agrees. Older binaries
+	// ignore the field.
+	Barriers map[string]uint64 `json:"barriers,omitempty"`
 }
 
 // ClusterFSM implements the raft.FSM interface for cluster state management.
@@ -461,6 +489,13 @@ type ClusterFSM struct {
 	// reason. Phase A.1: Cluster Auth Convergence (RBAC).
 	rejectedRBAC atomic.Int64
 
+	// barriers maps CommandBarrier tokens to the log index they were applied
+	// at (#799). barrierOrder is the eviction queue, oldest first. Part of
+	// the snapshot, so a follower that catches up by snapshot install still
+	// sees a token that committed before the snapshot.
+	barriers     map[string]uint64
+	barrierOrder []string
+
 	// Callbacks for state changes
 	onNodeAdded         func(*NodeInfo)
 	onNodeRemoved       func(string)
@@ -510,6 +545,7 @@ type ClusterFSM struct {
 func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 	return &ClusterFSM{
 		nodes:          make(map[string]*NodeInfo),
+		barriers:       make(map[string]uint64),
 		files:          make(map[string]*FileEntry),
 		filesByDB:      make(map[string]map[string]struct{}),
 		tokens:         make(map[int64]*TokenEntry),
@@ -832,10 +868,61 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.applyAddTokenToTeam(cmd.Payload, log.Index)
 	case CommandRemoveTokenFromTeam:
 		return f.applyRemoveTokenFromTeam(cmd.Payload, log.Index)
+	case CommandBarrier:
+		return f.applyBarrier(cmd.Payload, log.Index)
 
 	default:
 		return fmt.Errorf("unknown command type: %d", cmd.Type)
 	}
+}
+
+// applyBarrier records the barrier token at the index it was applied. No
+// callbacks, no manifest change, keysCache untouched.
+func (f *ClusterFSM) applyBarrier(payload []byte, logIndex uint64) interface{} {
+	var p BarrierPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal barrier payload: %w", err)
+	}
+	if p.Token == "" {
+		return fmt.Errorf("barrier: token is required")
+	}
+	if len(p.Token) > MaxBarrierTokenLen {
+		return fmt.Errorf("barrier: token longer than %d bytes", MaxBarrierTokenLen)
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.recordBarrierLocked(p.Token, logIndex)
+	return nil
+}
+
+func (f *ClusterFSM) recordBarrierLocked(token string, logIndex uint64) {
+	if f.barriers == nil {
+		f.barriers = make(map[string]uint64)
+	}
+	// A token re-applied after a lost ack keeps its first index: that is
+	// the position every node agrees on, and it keeps replay and snapshot
+	// restore (which orders by index) in agreement.
+	if _, dup := f.barriers[token]; dup {
+		return
+	}
+	f.barrierOrder = append(f.barrierOrder, token)
+	f.barriers[token] = logIndex
+	for len(f.barrierOrder) > maxBarriers {
+		oldest := f.barrierOrder[0]
+		f.barrierOrder = f.barrierOrder[1:]
+		delete(f.barriers, oldest)
+	}
+}
+
+// BarrierApplied reports whether a CommandBarrier carrying token has been
+// applied on this node, and at which log index. Used by the startup catch-up
+// walk on followers (#799).
+func (f *ClusterFSM) BarrierApplied(token string) (uint64, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	idx, ok := f.barriers[token]
+	return idx, ok
 }
 
 func (f *ClusterFSM) applyAddNode(payload []byte) interface{} {
@@ -1882,8 +1969,14 @@ func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 		tokenMemberships[id] = &entryCopy
 	}
 
+	barriers := make(map[string]uint64, len(f.barriers))
+	for token, idx := range f.barriers {
+		barriers[token] = idx
+	}
+
 	return &fsmSnapshot{
 		nodes:                  nodes,
+		barriers:               barriers,
 		primaryWriterID:        f.primaryWriterID,
 		activeCompactorID:      f.activeCompactorID,
 		files:                  files,
@@ -2133,8 +2226,27 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		restoredMemberships[id] = entry
 	}
 
+	// Barriers: keep the map, rebuild the eviction order by index so a
+	// restored node evicts in the same order a replaying node would.
+	restoredBarriers := make(map[string]uint64, len(snapshot.Barriers))
+	restoredOrder := make([]string, 0, len(snapshot.Barriers))
+	for token, idx := range snapshot.Barriers {
+		if token == "" || len(token) > MaxBarrierTokenLen {
+			continue
+		}
+		restoredBarriers[token] = idx
+		restoredOrder = append(restoredOrder, token)
+	}
+	sort.Slice(restoredOrder, func(i, j int) bool { return restoredBarriers[restoredOrder[i]] < restoredBarriers[restoredOrder[j]] })
+	for len(restoredOrder) > maxBarriers {
+		delete(restoredBarriers, restoredOrder[0])
+		restoredOrder = restoredOrder[1:]
+	}
+
 	f.mu.Lock()
 	f.nodes = snapshot.Nodes
+	f.barriers = restoredBarriers
+	f.barrierOrder = restoredOrder
 	f.primaryWriterID = snapshot.PrimaryWriterID
 	f.activeCompactorID = snapshot.ActiveCompactorID
 	f.files = restoredFiles
@@ -2443,6 +2555,7 @@ type fsmSnapshot struct {
 	roles                  map[int64]*RoleEntry
 	measurementPermissions map[int64]*MeasurementPermissionEntry
 	tokenMemberships       map[int64]*TokenMembershipEntry
+	barriers               map[string]uint64
 }
 
 // Persist writes the snapshot to the given sink.
@@ -2458,6 +2571,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 		Roles:                  s.roles,
 		MeasurementPermissions: s.measurementPermissions,
 		TokenMemberships:       s.tokenMemberships,
+		Barriers:               s.barriers,
 	}
 
 	data, err := json.Marshal(snapshot)
