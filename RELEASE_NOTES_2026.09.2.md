@@ -344,6 +344,22 @@ Parent-side compaction cleanup now removes only the exact JobID-owned temp direc
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#786](https://github.com/Basekick-Labs/arc/pull/786).
 
+### Iceberg export fails when storage hides data files ([#760](https://github.com/Basekick-Labs/arc/issues/760))
+
+Iceberg export now checks the storage backend's unusable-object enumeration and
+fails a measurement when a Parquet data file is hidden from normal listings. The
+reconciler logs an `Error` on every reconcile pass until the operator renames the
+named files, and the table stays at the last published snapshot instead of
+silently dropping rows that Arc's query path can still read.
+
+Renaming the named files unblocks export, and the next reconcile pass publishes
+that table again. The local Iceberg path performs a second directory walk per
+measurement per pass to find these hidden files, which is the safe fallback; a
+single combined walk is the future optimization if reconcile time becomes an
+issue.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#785](https://github.com/Basekick-Labs/arc/pull/785).
+
 ### Iceberg export on an edge-sync hub produced one garbage table per spoke ([#634](https://github.com/Basekick-Labs/arc/issues/634))
 
 **Affects hubs only** — a node receiving edge-sync data with `iceberg.enabled = true`.
