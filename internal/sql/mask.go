@@ -98,8 +98,8 @@ func MaskStringLiterals(sql string, hasQuotes bool) (string, []StringMask) {
 		// whole construct collapses to one placeholder (GHSA-wmjj-g8xc-6hwr).
 		if (ch == 'e' || ch == 'E') && i+1 < len(sql) && sql[i+1] == '\'' && !isIdentifierByte(prevByte(sql, i)) {
 			start := i
-			i++ // move onto the opening quote
-			i = scanQuoted(sql, i, '\'')
+			i += 2 // move past the E and the opening quote
+			i = skipEscString(sql, i)
 			original := sql[start:i]
 			placeholder := fmt.Sprintf("__STR_%d__", maskIndex)
 			maskIndex++
@@ -112,29 +112,21 @@ func MaskStringLiterals(sql string, hasQuotes bool) (string, []StringMask) {
 		if ch == '\'' || ch == '"' {
 			quote := ch
 			start := i
-			i++ // Move past opening quote
 
-			// Find the closing quote, handling escaped quotes
-			for i < len(sql) {
-				if sql[i] == quote {
-					// Check if it's an escaped quote ('' or "")
-					if i+1 < len(sql) && sql[i+1] == quote {
-						i += 2 // Skip escaped quote
-						continue
-					}
-					// Also handle backslash escaping (\' or \")
-					if i > 0 && sql[i-1] == '\\' {
-						i++
-						continue
-					}
-					break // Found closing quote
-				}
-				i++
-			}
-
-			// Include the closing quote if found
-			if i < len(sql) {
-				i++
+			// SECURITY: scan to the closing quote by DuckDB's rules, which are
+			// NOT the same for the three quoted forms. In a plain '…' string and
+			// in a "…" identifier the ONLY escape is the doubled quote; a
+			// backslash is an ordinary character. Only E'…' honours backslash,
+			// and it is consumed by the branch above. Treating `\'` as an escape
+			// here made the scan run past the real closing quote and swallow
+			// everything up to the next one, so a value ending in a backslash
+			// hid the rest of the statement from every consumer of the masked
+			// form — including the keyword, table-position and file-I/O gates,
+			// which then passed SQL that DuckDB parsed quite differently.
+			if quote == '\'' {
+				i = skipStdString(sql, i+1)
+			} else {
+				i = skipQuotedIdent(sql, i+1)
 			}
 
 			// Extract the full quoted token and create a placeholder.
@@ -631,28 +623,6 @@ func dollarQuoteTag(sql string, i int) (string, bool) {
 		return "", false
 	}
 	return sql[i+1 : j], true
-}
-
-// scanQuoted returns the index just past the literal whose opening quote sits at
-// sql[i], handling doubled (”) and backslash escapes. If the literal is
-// unterminated it returns len(sql).
-func scanQuoted(sql string, i int, quote byte) int {
-	i++ // move past the opening quote
-	for i < len(sql) {
-		if sql[i] == quote {
-			if i+1 < len(sql) && sql[i+1] == quote {
-				i += 2
-				continue
-			}
-			if i > 0 && sql[i-1] == '\\' {
-				i++
-				continue
-			}
-			return i + 1
-		}
-		i++
-	}
-	return len(sql)
 }
 
 // isIdentifierByte reports whether c can appear inside an unquoted SQL identifier.

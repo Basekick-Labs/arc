@@ -7,15 +7,15 @@ import "strings"
 // the values are gone. This is the log-side counterpart of the slow-query log's
 // masking precedent, with one deliberate difference:
 //
-// It does NOT reuse MaskStringLiterals. That scanner treats backslash as an
-// escape inside plain '...' strings; DuckDB does not (backslash is a literal
-// character there — only E'...' strings honor it). Reusing it would mean a
-// value legitimately ending in `\` (a Windows path, a regex) shifts every
-// subsequent literal boundary and logs alternating literal CONTENTS in the
-// clear — an under-mask leak on benign input. The scanner below follows
-// DuckDB's actual rules. MaskStringLiterals itself is left untouched: it is
-// hardened round-trip code on the query-rewrite path, and its escape rule is
-// load-bearing there.
+// It does not reuse MaskStringLiterals, because the two want different output:
+// this one keeps the statement's shape and drops the values, while the masker
+// replaces each literal with a placeholder it can substitute back. They do
+// share the literal scanners below, so both follow DuckDB's rules: in a plain
+// '...' string and a "..." identifier only the doubled quote escapes, and a
+// backslash is an ordinary character; only E'...' honours backslash. The
+// masker used to treat backslash as an escape everywhere, which shifted every
+// later literal boundary after a value ending in `\` — an under-mask leak
+// here, and a gate bypass on the query-rewrite path.
 //
 // Rules:
 //   - '...'   standard string: only ” escapes a quote; backslash is literal.

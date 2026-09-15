@@ -63,6 +63,27 @@ This rides on the existing telemetry channel and the existing switch: `telemetry
 
 ## Security fixes
 
+### String-literal boundary hardening in the read-SQL gates
+
+The scanner that masks string literals before the read-SQL gates run applied one
+escape rule to all three of DuckDB's quoted forms. DuckDB does not: in a plain
+`'…'` string and a `"…"` identifier the only escape is the doubled quote, and a
+backslash is an ordinary character; only `E'…'` honours a backslash. A value
+ending in a backslash therefore shifted every later literal boundary, so part of
+a statement could be hidden from the keyword, table-position and file-I/O gates
+while DuckDB parsed and executed it in full. The scanner now follows DuckDB's
+rules for each form, and the two scanners in the package are shared so they
+cannot drift apart again.
+
+Impact was bounded by the DuckDB sandbox's storage-root allowlist throughout:
+files outside the configured storage root were refused by the sandbox
+regardless. RBAC-enabled multi-tenant deployments are the ones that should
+upgrade; the slow-query log path already used a DuckDB-exact scanner and was
+never affected.
+
+Full technical detail will accompany the corresponding security advisory once it
+is published. Found during internal review.
+
 ### RBAC table-reference deduplication preserves case ([#750](https://github.com/Basekick-Labs/arc/issues/750))
 
 Simple table references (`FROM table`) and JOIN table references (`JOIN table`) now preserve identifier case in deduplication keys during RBAC permission extraction. Previously, the deduplication key folded table names to lowercase while the downstream RBAC pattern matcher evaluated case-sensitively against case-sensitive storage backends. A query referencing measurements differing only by case (e.g., `SELECT * FROM cpu WHERE x IN (SELECT y FROM CPU)`) folded both references into one, authorizing the query if the principal had access to only one of the spellings. Both references are now checked against permissions independently.
