@@ -344,7 +344,7 @@ fails the build rather than leaving the note quietly wrong.
 
 This restores endpoint parity for dashboard clients that infer numeric columns from JSON values; null, row-cap, truncation, and timestamp behavior is unchanged.
 
-Contributed by [@TayfurYldz](https://github.com/TayfurYldz) in [#PR](https://github.com/Basekick-Labs/arc/pull/PR).
+Contributed by [@TayfurYldz](https://github.com/TayfurYldz) in [#831](https://github.com/Basekick-Labs/arc/pull/831).
 
 ### Iceberg export on an edge-sync hub produced one garbage table per spoke ([#634](https://github.com/Basekick-Labs/arc/issues/634))
 
