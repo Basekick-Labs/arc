@@ -344,6 +344,18 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Iceberg export kept serving deleted rows after a partial row-level delete ([#633](https://github.com/Basekick-Labs/arc/issues/633))
+
+**Affects `iceberg.enabled = true` deployments that use `POST /api/v1/delete`.**
+
+A delete whose WHERE clause matches only some rows of a Parquet file rewrites that file in place: same path, fewer rows, smaller size. The Iceberg reconciler detected changes by file path alone, so the rewritten file was never re-registered and the Iceberg manifest kept the original `record_count` and `file_size_in_bytes` for good. Engines that answer `COUNT(*)` from manifest statistics kept counting the deleted rows, and engines that trust `file_size_in_bytes` for split planning could fail on the shorter file. A full-file match, which removes the file outright, was already handled.
+
+The reconciler now compares path **and size** against the manifest. A rewritten file is dropped and re-registered in one commit, so readers of the current snapshot never see it absent (only time travel to the intermediate snapshot does, until it expires), and the manifest picks up the new row count, size and column bounds within one reconcile interval. Files that already changed before this release are re-registered on the first pass after upgrade, with no operator action.
+
+Re-registering a path needs Iceberg manifest merging: iceberg-go carries every removed file's `DELETED` manifest entry forever and refuses to add such a path again, whether it was rewritten in place or restored from a backup. For the commit that re-registers such a path Arc enables `commit.manifest-merge.enabled` (with `commit.manifest.min-count-to-merge=2` and a 1 GiB `commit.manifest.target-size-bytes`), which rewrites the table's manifests into one and drops the stale entries, then switches it back off in the same transaction (the two auxiliary keys stay on the table and are inert while merging is off). Ordinary passes are unchanged: one overwrite snapshot per pass, no merge. A pass that re-registers files leaves one merged manifest the size of the table's live file list in the metadata directory, and every later removal pass rewrites that manifest minus the removed entries until they age out; like every superseded manifest, none of it is reclaimed yet ([#835](https://github.com/Basekick-Labs/arc/issues/835)). The reconciler also stats every listed file on every pass now, since the size is part of the change key; on local storage that is tens of milliseconds per hundred thousand files.
+
+Known limit: a rewrite that produces a file of exactly the same byte size at the same path is still invisible to the reconciler.
+
 ### JSON query endpoints return DECIMAL values as numbers ([#818](https://github.com/Basekick-Labs/arc/issues/818))
 
 `POST /api/v1/query` now keeps DuckDB DECIMAL results numeric instead of changing their wire type depending on which JSON query path served the request. The Arrow-backed JSON writer normalizes decimal batches with the same schema/cast path already used by Arrow IPC and msgpack, so common aggregate results such as `SUM(integer)` and `AVG(...)` no longer fall through to quoted strings. The database/sql fallback now recognizes `duckdb.Decimal` directly instead of JSON-marshalling the driver struct into an object cell.

@@ -66,7 +66,7 @@ func TestReconcile_HintFailureIsReported(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	files := []FileRef{{PhysicalPath: fileURI(f)}}
+	files := []FileRef{refOf(t, f)}
 
 	// First pass creates the table and publishes normally.
 	hintOK, err := exp.ReconcileMeasurementWithHint(ctx, "mydb", "cpu", sc, files)
@@ -130,7 +130,7 @@ func TestReconcile_ConvergedPassRepublishesHint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	files := []FileRef{{PhysicalPath: fileURI(f)}}
+	files := []FileRef{refOf(t, f)}
 
 	if _, err := exp.ReconcileMeasurementWithHint(ctx, "mydb", "cpu", sc, files); err != nil {
 		t.Fatalf("first reconcile: %v", err)
@@ -179,7 +179,7 @@ func TestWriteVersionHint_MetadataFailurePreservesOldHint(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if hintOK, err := exp.ReconcileMeasurementWithHint(ctx, "mydb", "cpu", sc, []FileRef{{PhysicalPath: fileURI(f1)}}); err != nil || !hintOK {
+	if hintOK, err := exp.ReconcileMeasurementWithHint(ctx, "mydb", "cpu", sc, []FileRef{refOf(t, f1)}); err != nil || !hintOK {
 		t.Fatalf("first reconcile: hintOK=%v err=%v", hintOK, err)
 	}
 	hintPath := filepath.Join(root, "arc_mydb.db", "cpu", "metadata", "version-hint.text")

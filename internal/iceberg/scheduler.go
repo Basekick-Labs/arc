@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -312,12 +313,15 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 	return true, nil
 }
 
-// fingerprint hashes the sorted union of the data-file paths and local-file paths. Any add,
-// remove, or compaction changes the set and thus the hash; an unchanged set hashes identically.
+// fingerprint hashes the sorted union of the data files (path + size) and the local-file
+// paths. Any add, remove, or compaction changes the set and thus the hash; an unchanged set
+// hashes identically. Size is part of the key because the delete API's partial-match branch
+// rewrites a file IN PLACE (same path, fewer rows, #633): with paths alone that measurement
+// looked unchanged forever and the Iceberg manifest kept describing the old content.
 func fingerprint(files []FileRef, localFiles []string) string {
 	parts := make([]string, 0, len(files)+len(localFiles))
 	for _, f := range files {
-		parts = append(parts, f.PhysicalPath)
+		parts = append(parts, f.PhysicalPath+"\x00"+strconv.FormatInt(f.SizeBytes, 10))
 	}
 	parts = append(parts, localFiles...)
 	sort.Strings(parts)

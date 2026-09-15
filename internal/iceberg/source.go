@@ -2,7 +2,9 @@ package iceberg
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -249,12 +251,55 @@ func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([
 			// exported table with no other signal.
 			return nil, nil, fmt.Errorf("listed file %q has no usable storage path: %w", p, err)
 		}
-		files = append(files, FileRef{PhysicalPath: uri})
-		if lp := s.resolver.LocalPath(p); lp != "" {
+		lp := s.resolver.LocalPath(p)
+		size, present, err := s.statSize(ctx, p, lp)
+		if err != nil {
+			return nil, nil, fmt.Errorf("stat listed file %q: %w", p, err)
+		}
+		if !present {
+			// Removed between the listing and the stat (retention, compaction, the
+			// delete API). It is not on storage, so it is not in this pass's set;
+			// leaving it out of BOTH slices keeps the schema derivation from
+			// opening a path that no longer exists. The next pass converges.
+			s.logger.Debug().Str("file", p).Msg("Iceberg reconcile: file vanished after listing; skipping it this pass")
+			continue
+		}
+		files = append(files, FileRef{PhysicalPath: uri, SizeBytes: size})
+		if lp != "" {
 			local = append(local, lp)
 		}
 	}
 	return files, local, nil
+}
+
+// statSize returns the file's current byte size, which the reconciler needs
+// because a file rewritten in place keeps its path (#633): the delete API's
+// partial-match branch renames a smaller file over the original, and only the
+// size tells that content apart from what the Iceberg manifest describes.
+// present=false means the file is gone. Local files are stat'ed directly; any
+// other backend answers through StatFile (Iceberg export is local-only, so
+// that branch only serves wrapped backends in tests — note LocalBackend.StatFile
+// reports a ".part" staging file's size when the final file is absent, which
+// os.Stat on the final path does not).
+func (s *StorageWalkSource) statSize(ctx context.Context, key, localPath string) (size int64, present bool, err error) {
+	if localPath != "" {
+		st, err := os.Stat(localPath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return 0, false, nil
+			}
+			return 0, false, err
+		}
+		return st.Size(), true, nil
+	}
+	size, err = s.backend.StatFile(ctx, key)
+	if err != nil {
+		return 0, false, err
+	}
+	if size < 0 {
+		return 0, false, nil
+	}
+	return size, true, nil
 }
 
 // isDataFile reports whether a storage key is an Arc data file to export. Only .parquet is

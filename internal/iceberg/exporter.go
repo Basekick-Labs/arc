@@ -2,8 +2,8 @@
 // external engines (Spark, Trino, Snowflake, DuckDB) can read Arc's data directly, without
 // changing Arc's ingest write path. It is a periodic *reconciler*: it diffs Arc's durable
 // file set (the storage backend walk) against the current Iceberg table state and commits the
-// delta via iceberg-go's ReplaceDataFiles (register/deregister existing Parquet by path — no
-// data rewrite). Because it is driven by Arc's durable storage — not a transient event stream —
+// delta via iceberg-go's ReplaceDataFiles and AddFiles (register/deregister existing Parquet
+// by path — no data rewrite). Because it is driven by Arc's durable storage — not a transient event stream —
 // a failed or missed commit self-heals on the next reconcile tick.
 //
 // Verified in Phase 0/0b: iceberg-go v0.6.0 + the mattn sqlite3 catalog registers Arc's
@@ -37,7 +37,10 @@ import (
 
 // FileRef is one Arc data file as the reconciler sees it, decoupled from the durable source
 // (tiering tier_files in OSS, Raft manifest in cluster). PhysicalPath is the fully-qualified
-// location iceberg-go reads (file://… local, s3://bucket/prefix/… cold).
+// location iceberg-go reads (file://… local, s3://bucket/prefix/… cold). SizeBytes is the
+// file's current size on storage; together with the path it is the reconcile key, because a
+// file rewritten in place keeps its path (the delete API's partial-match branch, #633) and
+// only the size distinguishes the new content from the manifest entry registered for the old.
 type FileRef struct {
 	PhysicalPath string
 	SizeBytes    int64
@@ -397,22 +400,33 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 	}
 	hintOK = !e.hintFailed()
 
-	want := make(map[string]struct{}, len(current))
+	want := make(map[string]int64, len(current))
 	for _, f := range current {
-		want[f.PhysicalPath] = struct{}{}
+		want[f.PhysicalPath] = f.SizeBytes
 	}
 	have, err := e.tableDataFiles(ctx, tbl)
 	if err != nil {
 		return false, fmt.Errorf("read current iceberg data files: %w", err)
 	}
 
-	var toAdd []string
-	for p := range want {
-		if _, ok := have[p]; !ok {
+	// The diff key is (path, size). A path on both sides with a different size is a file
+	// rewritten in place — the delete API's partial-match branch renames a smaller file over
+	// the original (#633). The manifest entry still describes the old content (record_count,
+	// file_size_in_bytes, column bounds), so external engines keep counting deleted rows and
+	// can mis-plan reads against the shorter file. Such a path is dropped and re-registered
+	// in the same commit.
+	var toAdd, toRemove, rewritten []string
+	for p, size := range want {
+		haveSize, ok := have[p]
+		switch {
+		case !ok:
+			toAdd = append(toAdd, p)
+		case haveSize != size:
+			rewritten = append(rewritten, p)
+			toRemove = append(toRemove, p)
 			toAdd = append(toAdd, p)
 		}
 	}
-	var toRemove []string
 	for p := range have {
 		if _, ok := want[p]; !ok {
 			toRemove = append(toRemove, p)
@@ -429,10 +443,10 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 		return e.writeVersionHint(ctx, tbl) && hintOK, nil
 	}
 
-	// ReplaceDataFiles is the metadata-only primitive that both drops files by path and adds
-	// files by path in one snapshot — exactly the reconcile diff. (Transaction.Delete is a
-	// ROW-level predicate that rewrites partially-matching files — wrong here; we drop whole
-	// files that Arc already removed from storage.) When only adding, filesToDelete is empty.
+	// Metadata-only: files are dropped and added by path in one commit. (Transaction.Delete
+	// is a ROW-level predicate that rewrites partially-matching files — wrong here; we drop
+	// whole files that Arc already removed from storage.) A rewritten path appears in both
+	// lists and is removed before it is added, inside the same transaction.
 	committed, skipped, err := e.replaceDataFilesResilient(ctx, tbl, toRemove, toAdd, database, measurement)
 	if err != nil {
 		return false, err
@@ -453,50 +467,100 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 	e.pruneOldVersionFiles(ctx, committed)
 	e.logger.Info().
 		Str("database", database).Str("measurement", measurement).
-		Int("added", len(toAdd)).Int("removed", len(toRemove)).
+		Int("added", len(toAdd)-len(rewritten)).Int("removed", len(toRemove)-len(rewritten)).
+		Int("reregistered", len(rewritten)).
 		Bool("hint_published", hintOK).
 		Msg("Reconciled Iceberg table")
 	return hintOK, nil
 }
 
-// replaceDataFilesResilient applies the add/remove diff, tolerating files that iceberg-go
-// cannot partition-map. iceberg-go infers each file's day() partition value from its Parquet
-// time min/max and ERRORS ("more than one value for partition field") when a single file's
-// data straddles a UTC-day boundary (rare: backfill or a flush crossing midnight). Left
-// unhandled, one such file fails ReplaceDataFiles and wedges the whole measurement's export
-// on every pass forever. So: try the batch first (the common case, one commit); if it fails,
-// fall back to adding files one at a time, skipping (and returning) any single file that can't
-// be partitioned. Removes are always applied. Returns the committed table + skipped file paths.
+// replaceDataFilesResilient applies the reconcile diff in ONE commit. The ordinary pass is a
+// single ReplaceDataFiles (one overwrite snapshot for removes and adds together, or a plain
+// append when nothing is removed), exactly as before #633. It tolerates two iceberg-go
+// refusals:
+//
+//   - Partition inference. iceberg-go infers each file's day() partition value from its
+//     Parquet time min/max and ERRORS ("more than one value for partition field") when one
+//     file's data straddles a UTC-day boundary (rare: backfill or a flush crossing midnight).
+//     Left unhandled, one such file wedges the whole measurement's export on every pass. The
+//     fallback adds files one at a time and skips (and returns) the ones that can't be mapped.
+//
+//   - Stale DELETED history ("cannot add files that are already referenced by table").
+//     iceberg-go v0.6.0 carries every removed file's DELETED manifest entry in all later
+//     snapshots and checks new adds against those entries too, so a path that ever left the
+//     table can never come back: an in-place rewrite (#633), a backup restore of a key that
+//     had been removed, or history from before this release. For those adds the transaction
+//     enables Iceberg manifest merging (commit.manifest-merge.enabled) and retries with the
+//     duplicate check off: the merge-append rewrites the manifests keeping DELETED entries
+//     only of its own snapshot, so the stale entries are gone once the commit lands and a later
+//     removal of the path sees exactly one entry again. Such a pass lands as two snapshots in
+//     the one commit (the removes as an overwrite, then the merged append), so readers of the
+//     current snapshot never see the path absent; only time travel to the intermediate
+//     snapshot does, until it expires. The property is switched back off in the same
+//     transaction — see manifestMergeOn for why it must not stay on.
+//
+// Returns the committed table and the paths skipped for partition reasons.
 func (e *Exporter) replaceDataFilesResilient(ctx context.Context, tbl *icetable.Table, toRemove, toAdd []string, database, measurement string) (*icetable.Table, []string, error) {
-	// Fast path: try the whole batch in one commit.
 	txn := tbl.NewTransaction()
-	if err := txn.ReplaceDataFiles(ctx, toRemove, toAdd, nil); err == nil {
-		committed, cerr := txn.Commit(ctx)
-		if cerr != nil {
-			return nil, nil, fmt.Errorf("iceberg commit (add=%d remove=%d): %w", len(toAdd), len(toRemove), cerr)
+	// ReplaceDataFiles validates both lists against the current snapshot before it stages
+	// anything, so on the "already referenced" refusal the transaction is still clean and can
+	// be re-driven as remove-then-merged-add.
+	err := txn.ReplaceDataFiles(ctx, toRemove, toAdd, nil)
+	if isAlreadyReferencedError(err) {
+		err = nil
+		if len(toRemove) > 0 {
+			err = txn.ReplaceDataFiles(ctx, toRemove, nil, nil)
 		}
-		return committed, nil, nil
-	} else if !isPartitionInferenceError(err) {
-		// A non-partition error is a real failure — surface it (don't silently skip).
-		return nil, nil, fmt.Errorf("iceberg ReplaceDataFiles (add=%d remove=%d): %w", len(toAdd), len(toRemove), err)
+		if err == nil {
+			err = e.addFilesMerging(ctx, txn, toAdd, database, measurement)
+		}
 	}
+	if err != nil {
+		if !isPartitionInferenceError(err) {
+			return nil, nil, fmt.Errorf("iceberg ReplaceDataFiles (add=%d remove=%d): %w", len(toAdd), len(toRemove), err)
+		}
+		// The staged transaction is dropped: iceberg-go already wrote its manifests to the
+		// warehouse, and nothing reclaims them (same residue as before this change; see
+		// expireSnapshots). The property toggle lives only in the dropped transaction.
+		return e.replaceDataFilesOneByOne(ctx, tbl, toRemove, toAdd, database, measurement)
+	}
+	committed, err := txn.Commit(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("iceberg commit (add=%d remove=%d): %w", len(toAdd), len(toRemove), err)
+	}
+	return committed, nil, nil
+}
 
-	// Slow path: at least one file can't be partition-mapped. Apply removes + add files one at
-	// a time so good files still export and only the straddling file(s) are skipped.
-	txn = tbl.NewTransaction()
+// replaceDataFilesOneByOne is the partition-inference fallback: a fresh transaction with the
+// removes, then one AddFiles per file so a straddling file is skipped instead of failing the
+// batch. Files refused for stale DELETED history are collected and added in ONE merged step at
+// the end (each merged add rewrites the manifest set, so they must not go one by one).
+func (e *Exporter) replaceDataFilesOneByOne(ctx context.Context, tbl *icetable.Table, toRemove, toAdd []string, database, measurement string) (*icetable.Table, []string, error) {
+	txn := tbl.NewTransaction()
 	if len(toRemove) > 0 {
 		if err := txn.ReplaceDataFiles(ctx, toRemove, nil, nil); err != nil {
 			return nil, nil, fmt.Errorf("iceberg remove-only (remove=%d): %w", len(toRemove), err)
 		}
 	}
-	var skipped []string
+	var skipped, referenced []string
 	for _, f := range toAdd {
-		if err := txn.AddFiles(ctx, []string{f}, nil, false); err != nil {
-			if isPartitionInferenceError(err) {
-				skipped = append(skipped, f)
-				continue
-			}
+		err := txn.AddFiles(ctx, []string{f}, nil, false)
+		switch {
+		case err == nil:
+		case isPartitionInferenceError(err):
+			skipped = append(skipped, f)
+		case isAlreadyReferencedError(err):
+			referenced = append(referenced, f)
+		default:
 			return nil, nil, fmt.Errorf("iceberg AddFiles(%s): %w", f, err)
+		}
+	}
+	if len(referenced) > 0 {
+		// A straddling file is never registered, so it never carries DELETED history: a
+		// partition error here is not expected, and if it ever happens the pass fails like
+		// any other add error and is retried next tick.
+		if err := e.addFilesMerging(ctx, txn, referenced, database, measurement); err != nil {
+			return nil, nil, fmt.Errorf("iceberg add with merge (files=%d): %w", len(referenced), err)
 		}
 	}
 	committed, err := txn.Commit(ctx)
@@ -504,6 +568,63 @@ func (e *Exporter) replaceDataFilesResilient(ctx context.Context, tbl *icetable.
 		return nil, nil, fmt.Errorf("iceberg commit (resilient, skipped=%d): %w", len(skipped), err)
 	}
 	return committed, skipped, nil
+}
+
+// addFilesMerging adds paths that iceberg-go refused as "already referenced" (stale DELETED
+// history) by enabling manifest merging for this transaction only and adding with the
+// duplicate check off. The reconcile diff is the authority on the live file set (it comes from
+// PlanFiles, which yields live entries only), so the check can only be tripped by DELETED
+// history — including the removal staged one call earlier in this same transaction, which is
+// the rewrite case. The toggle is staged metadata: a dropped transaction leaves the table as it was.
+func (e *Exporter) addFilesMerging(ctx context.Context, txn *icetable.Transaction, paths []string, database, measurement string) error {
+	if err := txn.SetProperties(manifestMergeOn()); err != nil {
+		return fmt.Errorf("enable manifest merge: %w", err)
+	}
+	if err := txn.AddFiles(ctx, paths, nil, true); err != nil {
+		return err // keep the partition-inference identity for the caller
+	}
+	if err := txn.SetProperties(manifestMergeOff()); err != nil {
+		return fmt.Errorf("disable manifest merge: %w", err)
+	}
+	e.logger.Info().
+		Str("database", database).Str("measurement", measurement).Int("files", len(paths)).
+		Msg("Iceberg: re-registered paths that still had DELETED manifest history (merged manifests for this commit)")
+	return nil
+}
+
+// manifestMergeOn is the property set that makes iceberg-go's append use its merge producer
+// for the commit in flight: merge whenever the new manifest shares a bin with at least one
+// existing one, and make the bin big enough (1 GiB, ~3M entries) that every manifest of the
+// table lands in it — a manifest alone in a bin is never rewritten, and a stale DELETED-only
+// manifest left alone would make the next removal of that path fail. The merged manifest
+// keeps DELETED entries only of the snapshot being written, which is what sheds the history.
+//
+// It is enabled per transaction, never left on the table: with merging on, every append
+// commit would rewrite the whole manifest set (O(files) of metadata per pass), and Arc expires
+// snapshots without deleting their orphaned manifests (see expireSnapshots), so that residue
+// would grow without bound and be copied into every backup. Merging once still has a tail:
+// the table's live file list then sits in one manifest, and every later removal pass rewrites
+// that manifest minus the removed entries until they age out (#835). iceberg-go v0.6.0 has no
+// RemoveProperties on a transaction, so manifestMergeOff resets only the enabled flag; the
+// min-count and target-size keys stay on the table and are inert while merging is off.
+func manifestMergeOn() iceberg.Properties {
+	return iceberg.Properties{
+		icetable.ManifestMergeEnabledKey:    "true",
+		icetable.ManifestMinMergeCountKey:   "2",
+		icetable.ManifestTargetSizeBytesKey: "1073741824",
+	}
+}
+
+// manifestMergeOff restores the default (fast-append) producer for later commits.
+func manifestMergeOff() iceberg.Properties {
+	return iceberg.Properties{icetable.ManifestMergeEnabledKey: "false"}
+}
+
+// isAlreadyReferencedError reports iceberg-go's refusal to add a path that some manifest entry
+// of the current snapshot already names — including entries with status DELETED, which is the
+// case this package has to tolerate (see replaceDataFilesResilient).
+func isAlreadyReferencedError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "cannot add files that are already referenced by table")
 }
 
 // isPartitionInferenceError reports whether an error is iceberg-go's day()-partition
@@ -548,7 +669,10 @@ func (e *Exporter) expireSnapshots(ctx context.Context, tbl *icetable.Table, dat
 	//
 	// The residue is expired metadata files (manifest lists, manifests) that are no
 	// longer referenced. pruneOldVersionFiles already bounds the v<N>.metadata.json
-	// copies; the rest is small and bounded by `retain`.
+	// copies; the rest is one manifest list plus one small manifest per commit — except
+	// a commit that re-registered rewritten paths, which leaves a merged manifest the
+	// size of the table's live file list behind (see manifestMergeOn). Nothing reclaims
+	// those files today.
 	if err := txn.ExpireSnapshots(
 		icetable.WithRetainLast(e.retain),
 		icetable.WithOlderThan(0),
@@ -570,8 +694,9 @@ func (e *Exporter) expireSnapshots(ctx context.Context, tbl *icetable.Table, dat
 // pruneOldVersionFiles keeps only the newest `retain` v<M>.metadata.json copies and deletes
 // the rest. iceberg-go prunes its own NNNNN-*.metadata.json (via delete-after-commit) but does
 // not know about the v<N> copies we write for directory-based readers, so we prune them here.
-// Scan-based (not arithmetic) so it's robust to non-contiguous version numbers — each reconcile
-// commits twice (ReplaceDataFiles + ExpireSnapshots), so versions advance by more than one.
+// Scan-based (not arithmetic) so it's robust to non-contiguous version numbers — a reconcile
+// pass commits more than once (the file-set commit, then ExpireSnapshots), so versions advance
+// by more than one.
 // Best-effort; never deletes the current version.
 func (e *Exporter) pruneOldVersionFiles(ctx context.Context, tbl *icetable.Table) {
 	if e.backend == nil || e.retain <= 0 {
@@ -869,12 +994,13 @@ func (e *Exporter) parseVersionAndMetaDir(metaLoc string) (version, dirKey strin
 	return strconv.Itoa(n), path.Dir(rel), true
 }
 
-// tableDataFiles returns the set of LIVE physical data-file paths in the table's current
-// snapshot. Uses Scan().PlanFiles, which resolves the current snapshot's live files honoring
-// deletes across snapshots — NOT AllManifests, which returns manifests from superseded
-// snapshots too and would report files a later ReplaceDataFiles has already dropped.
-func (e *Exporter) tableDataFiles(ctx context.Context, tbl *icetable.Table) (map[string]struct{}, error) {
-	out := make(map[string]struct{})
+// tableDataFiles returns the LIVE physical data-file paths in the table's current snapshot,
+// each with the file_size_in_bytes its manifest entry recorded at registration. Uses
+// Scan().PlanFiles, which resolves the current snapshot's live files honoring deletes across
+// snapshots — NOT AllManifests, which returns manifests from superseded snapshots too and
+// would report files a later removal has already dropped.
+func (e *Exporter) tableDataFiles(ctx context.Context, tbl *icetable.Table) (map[string]int64, error) {
+	out := make(map[string]int64)
 	if tbl.CurrentSnapshot() == nil {
 		return out, nil // empty table
 	}
@@ -883,7 +1009,7 @@ func (e *Exporter) tableDataFiles(ctx context.Context, tbl *icetable.Table) (map
 		return nil, err
 	}
 	for _, task := range tasks {
-		out[task.File.FilePath()] = struct{}{}
+		out[task.File.FilePath()] = task.File.FileSizeBytes()
 	}
 	return out, nil
 }
