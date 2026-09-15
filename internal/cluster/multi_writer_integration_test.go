@@ -111,8 +111,22 @@ func TestForwardApplyToLeader_UsesCallerDeadline(t *testing.T) {
 	if err == nil {
 		t.Fatal("forwardApplyToLeader() unexpectedly succeeded without an acknowledgement")
 	}
+	// forwardApplyToLeader sets the socket deadline from ctx's wall-clock
+	// deadline directly (manifestApplyTimeout), so the read can time out at
+	// that instant before context's own timer goroutine has flipped ctx.Err().
+	// Both are runtime timers with the same `when`; their order is not
+	// guaranteed, and under -race the gap was long enough to fail CI. Give the
+	// context a moment to catch up rather than asserting synchronously; the
+	// lower bound on elapsed keeps the "not early" half of the contract.
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+	}
 	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		t.Fatalf("caller context error = %v; want context.DeadlineExceeded (call returned early with: %v)", ctx.Err(), err)
+	}
+	if elapsed < 90*time.Millisecond {
+		t.Fatalf("forwardApplyToLeader() returned after %v, before the caller's 100ms deadline (error: %v)", elapsed, err)
 	}
 	if elapsed >= time.Second {
 		t.Fatalf("forwardApplyToLeader() took %v; caller's 100ms deadline was not enforced promptly", elapsed)
