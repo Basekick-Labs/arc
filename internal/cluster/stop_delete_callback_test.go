@@ -8,8 +8,10 @@ package cluster
 // real Stop with a delete applied inside its locked window.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"testing"
 	"time"
 
@@ -114,6 +116,21 @@ func TestFSMCallbacks_ApplyWhileCoordinatorLockHeld(t *testing.T) {
 		"RemoveNode":      func() error { return raftNode.RemoveNode("x", 5*time.Second) },
 		"PromoteWriter":   func() error { return raftNode.PromoteWriter("reader-1", "", 5*time.Second) },
 		"AssignCompactor": func() error { return raftNode.AssignCompactor("reader-1", "", 5*time.Second) },
+		// A snapshot restore fires the AddNode callback for every restored
+		// node (#807); at startup it runs inside raft.NewRaft with c.mu and
+		// n.mu held by Start, so it is bound by the same contract. Called
+		// directly on the FSM: the restore path is what is under test.
+		"Restore": func() error {
+			snap := raft.FSMSnapshot{Nodes: map[string]*raft.NodeInfo{
+				"restored-1": {ID: "restored-1", Role: string(RoleWriter), Address: "127.0.0.1:2", State: string(StateHealthy)},
+				"restored-2": {ID: "restored-2", Role: string(RoleReader), Address: "127.0.0.1:3", State: string(StateHealthy)},
+			}}
+			js, err := json.Marshal(snap)
+			if err != nil {
+				return err
+			}
+			return raftNode.FSM().Restore(io.NopCloser(bytes.NewReader(js)))
+		},
 	}
 
 	type result struct {
