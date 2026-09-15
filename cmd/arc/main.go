@@ -3648,19 +3648,34 @@ func main() {
 		// resolves to the same file. Only when Iceberg is enabled: otherwise the
 		// catalog does not exist and there is nothing to copy.
 		icebergCatalogDBPath := ""
+		icebergWarehousePath := ""
 		if cfg.Iceberg.Enabled {
 			icebergCatalogDBPath = cfg.Iceberg.CatalogDBPath
 			if icebergCatalogDBPath == "" {
 				icebergCatalogDBPath = cfg.Auth.DBPath
 			}
+			// The warehouse may live outside the storage root, where the data
+			// listing cannot see it; the backup manager walks it itself (#637).
+			rawWarehouse := cfg.Iceberg.Warehouse
+			if rawWarehouse == "" {
+				rawWarehouse = iceberg.DefaultWarehouse(storageBackend)
+			}
+			if p, ok := iceberg.LocalWarehousePath(rawWarehouse); ok {
+				icebergWarehousePath = p
+			} else {
+				log.Warn().Str("warehouse", rawWarehouse).
+					Msg("iceberg.warehouse is not a local path; backups cannot include its table metadata")
+			}
 		}
 		backupManager, err := backup.NewManager(&backup.ManagerConfig{
-			DataStorage:          storageBackend,
-			BackupPath:           cfg.Backup.LocalPath,
-			SQLiteDBPath:         cfg.Auth.DBPath,
-			IcebergCatalogDBPath: icebergCatalogDBPath,
-			ConfigPath:           "arc.toml",
-			Logger:               logger.Get("backup"),
+			DataStorage:            storageBackend,
+			BackupPath:             cfg.Backup.LocalPath,
+			SQLiteDBPath:           cfg.Auth.DBPath,
+			IcebergCatalogDBPath:   icebergCatalogDBPath,
+			IcebergWarehousePath:   icebergWarehousePath,
+			IcebergNamespacePrefix: cfg.Iceberg.NamespacePrefix,
+			ConfigPath:             "arc.toml",
+			Logger:                 logger.Get("backup"),
 		})
 		if err != nil {
 			log.Error().Err(err).Msg("Failed to initialize backup manager")

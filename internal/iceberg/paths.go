@@ -111,3 +111,27 @@ func (r *PathResolver) LocalPath(relativeKey string) string {
 	}
 	return path
 }
+
+// LocalWarehousePath converts a configured iceberg.warehouse into the absolute
+// local directory it names: a file:// URI or a bare path (relative ones resolve
+// against the working directory, like storage.local_path). ok is false for any
+// other scheme, which no local backend can address.
+func LocalWarehousePath(raw string) (string, bool) {
+	p := strings.TrimSpace(raw)
+	if p == "" {
+		return "", false
+	}
+	if strings.HasPrefix(p, "file://") {
+		p = strings.TrimPrefix(p, "file://")
+	} else if strings.Contains(p, "://") {
+		return "", false
+	}
+	if p == "" {
+		return "", false
+	}
+	abs, err := filepath.Abs(filepath.FromSlash(p))
+	if err != nil {
+		return "", false
+	}
+	return filepath.Clean(abs), true
+}
