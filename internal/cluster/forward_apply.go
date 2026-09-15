@@ -391,15 +391,15 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	// Authorization: ensure the requesting node's role is allowed to
 	// mutate the file manifest. Only writers (CanIngest — flush path)
 	// and compactors (CanCompact — compaction bridge) legitimately
-	// forward RegisterFile/DeleteFile commands. Unknown nodes (not in
-	// registry) are also rejected — if we can't verify the role, we
-	// don't allow the mutation.
-	peerNode, knownPeer := c.registry.Get(req.NodeID)
+	// forward RegisterFile/DeleteFile commands. Unknown nodes (in
+	// neither the FSM node table nor the registry) are also rejected —
+	// if we can't verify the role, we don't allow the mutation.
+	peerNode, knownPeer := c.forwardingPeer(req.NodeID)
 	if !knownPeer {
 		c.logger.Warn().
 			Str("peer", remoteAddr).
 			Str("requesting_node", req.NodeID).
-			Msg("ForwardApply rejected: node not found in registry")
+			Msg("ForwardApply rejected: node not found in the FSM node table or the registry")
 		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, "unknown node")
 		return
 	}
@@ -597,6 +597,48 @@ func (c *Coordinator) sendForwardApplyError(conn net.Conn, reqNonce string, code
 	}, forwardApplyTimeout); err != nil {
 		c.logger.Debug().Err(err).Msg("ForwardApply: failed to send error ack")
 	}
+}
+
+// forwardingPeer resolves the node behind a forwarded command, for the role
+// gate in handleForwardApply. The Raft FSM node table is consulted first: it
+// is Raft-committed data written by the authenticated join, it survives a
+// restart (a snapshot restore puts it back before the first request), and it
+// is at least as current as the registry, which is refilled from it through
+// the FSM callbacks. The in-memory registry is consulted only when the node
+// table has no entry, as defence in depth: forwarding needs Raft, and with
+// Raft the leader's registry is filled from the node table, so a node in the
+// registry but not in the table is not a state this handler meets.
+//
+// Before #807 the handler consulted only the registry, which a snapshot
+// restore does not refill (Restore fires no AddNode callback, and a follower
+// whose discovery ran after Raft already knew the leader never re-joins), so
+// a leader restarted from a snapshot rejected every forwarded write as an
+// unknown node until something triggered a join.
+func (c *Coordinator) forwardingPeer(nodeID string) (*Node, bool) {
+	fsm := c.raftFSM
+	if fsm == nil && c.raftNode != nil {
+		fsm = c.raftNode.FSM()
+	}
+	if fsm != nil {
+		if info, ok := fsm.GetNode(nodeID); ok {
+			// The registry lookup clones the node, so only pay for it when
+			// the Debug line it feeds is enabled.
+			if e := c.logger.Debug(); e.Enabled() && c.registry != nil {
+				if _, inRegistry := c.registry.Get(nodeID); !inRegistry {
+					e.Str("requesting_node", nodeID).
+						Str("role", info.Role).
+						Msg("ForwardApply: node resolved from the FSM node table; it is not in the registry")
+				}
+			}
+			return nodeFromRaftInfo(info), true
+		}
+	}
+	if c.registry != nil {
+		if node, ok := c.registry.Get(nodeID); ok {
+			return node, true
+		}
+	}
+	return nil, false
 }
 
 // leaderCoordinatorAddress resolves the leader's coordinator address from the

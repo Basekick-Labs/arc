@@ -285,7 +285,14 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	if cfg.Config.RaftDataDir != "" {
 		c.raftFSM = raft.NewClusterFSM(cfg.Logger)
 
-		// Set up FSM callbacks to sync with local registry
+		// Set up FSM callbacks to sync with local registry.
+		//
+		// Lock contract: these run on the Raft FSM goroutine, from Apply
+		// and from Restore. Stop joins that goroutine while holding c.mu
+		// (#797), and the startup restore runs inside raft.NewRaft, which
+		// Start calls with c.mu AND the raft node's n.mu write-held. So a
+		// callback must take neither c.mu nor any raft.Node method (they
+		// take n.mu); the registry has its own lock and is all they touch.
 		c.raftFSM.SetCallbacks(
 			func(n *raft.NodeInfo) { c.onRaftNodeAdded(n) },
 			func(id string) { c.onRaftNodeRemoved(id) },
@@ -1417,11 +1424,12 @@ func (c *Coordinator) sendLeaderRedirect(conn net.Conn, req *protocol.JoinReques
 	leaderID := c.raftNode.LeaderID()
 	leaderRaftAddr := c.raftNode.LeaderAddr()
 
-	// Try to find the leader's coordinator address from registry
-	leaderCoordAddr := ""
-	if leaderNode, exists := c.registry.Get(leaderID); exists {
-		leaderCoordAddr = leaderNode.Address
-	}
+	// The leader's coordinator address comes from the registry, falling
+	// back to the FSM node table: a follower restarted from a snapshot has
+	// an empty registry until the leader's next AddNode, and a redirect
+	// with an empty address makes the joiner fail with "no valid leader
+	// address" (#807).
+	leaderCoordAddr := c.leaderCoordinatorAddress(leaderID)
 
 	// Signed over the request's nonce: this names the address the joiner
 	// dials next and hands its next signed join request to, so an
@@ -2342,11 +2350,25 @@ func (c *Coordinator) registerSelfInFSMWhenLeader() {
 		Msg("Bootstrap leader registered self in FSM")
 }
 
-func (c *Coordinator) onRaftNodeAdded(n *raft.NodeInfo) {
+// nodeFromRaftInfo builds the registry's view of a node from its FSM record.
+// Used by the AddNode callback (log replay and snapshot restore alike) and by
+// the forwarded-command role gate when the registry has no entry (#807).
+// WriterState is carried too: after a snapshot restore it is the only record
+// of which writer is primary, the PromoteWriter entries having been compacted
+// away; on the replay path it is the zero value and changes nothing.
+func nodeFromRaftInfo(n *raft.NodeInfo) *Node {
 	node := NewNode(n.ID, n.Name, ParseRole(n.Role), n.ClusterName)
 	node.SetAddresses(n.Address, n.APIAddress)
 	node.SetVersion(n.Version)
 	node.UpdateState(NodeState(n.State))
+	if n.WriterState != "" {
+		node.SetWriterState(WriterState(n.WriterState))
+	}
+	return node
+}
+
+func (c *Coordinator) onRaftNodeAdded(n *raft.NodeInfo) {
+	node := nodeFromRaftInfo(n)
 
 	if err := c.registry.Register(node); err != nil {
 		c.logger.Error().Err(err).Str("node_id", n.ID).Msg("Failed to register node from Raft")
