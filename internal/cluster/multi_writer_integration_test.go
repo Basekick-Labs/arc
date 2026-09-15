@@ -57,21 +57,19 @@ func TestForwardApplyToLeader_UsesCallerDeadline(t *testing.T) {
 		t.Skip("requires a real Raft follower")
 	}
 
-	raftAddrs := allocFreePorts(t, 2)
-	raftAddrA, raftAddrB := raftAddrs[0], raftAddrs[1]
-	raftA := startRaftNode(t, "forward-leader", raftAddrA, true)
+	// forwardApplyToLeader consults Raft only for LeaderID(): "" means no
+	// leader, the local node's ID means apply locally, anything else means
+	// forward to that node's coordinator address from the registry. A single
+	// bootstrapped node whose ID differs from the coordinator's local node ID
+	// gives a leader that never changes; a two-voter cluster with 500 ms
+	// lease and heartbeat timeouts can lose its leader for a moment on a
+	// loaded runner, and the resulting ErrNoLeaderKnown returned before the
+	// caller's deadline is what made this test flake in CI.
+	raftA := startRaftNode(t, "forward-leader", allocFreePort(t), true)
 	defer func() { _ = raftA.Stop() }()
 	if err := raftA.WaitForLeader(10 * time.Second); err != nil {
 		t.Fatalf("leader election: %v", err)
 	}
-	raftB := startRaftNode(t, "forward-follower", raftAddrB, false)
-	defer func() { _ = raftB.Stop() }()
-	if err := raftA.AddVoter("forward-follower", raftAddrB, 10*time.Second); err != nil {
-		t.Fatalf("add follower: %v", err)
-	}
-	waitFor(t, 10*time.Second, func() bool {
-		return raftB.LeaderID() == "forward-leader"
-	}, "follower to recognize leader")
 
 	fakeLeader, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -99,7 +97,7 @@ func TestForwardApplyToLeader_UsesCallerDeadline(t *testing.T) {
 	c := &Coordinator{
 		cfg:       &config.ClusterConfig{SharedSecret: "test-cluster-secret-32-bytes-long!", ClusterName: "test-cluster"},
 		registry:  registry,
-		raftNode:  raftB,
+		raftNode:  raftA, // reports "forward-leader", which is not our local node
 		localNode: local,
 		logger:    zerolog.Nop(),
 		ctx:       context.Background(),
@@ -114,7 +112,7 @@ func TestForwardApplyToLeader_UsesCallerDeadline(t *testing.T) {
 		t.Fatal("forwardApplyToLeader() unexpectedly succeeded without an acknowledgement")
 	}
 	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		t.Fatalf("caller context error = %v; want context.DeadlineExceeded", ctx.Err())
+		t.Fatalf("caller context error = %v; want context.DeadlineExceeded (call returned early with: %v)", ctx.Err(), err)
 	}
 	if elapsed >= time.Second {
 		t.Fatalf("forwardApplyToLeader() took %v; caller's 100ms deadline was not enforced promptly", elapsed)
