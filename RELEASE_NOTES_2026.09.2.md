@@ -344,6 +344,12 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### The arcx engine's three response stream writers now recover from panics ([#717](https://github.com/Basekick-Labs/arc/issues/717))
+
+**Affects only builds made with the `arcx_engine` tag, which no release ships.**
+
+The earlier fix for this issue (below, under "A panic while streaming a response no longer crashes the server") wrapped every streaming response writer that ships, and left the three writers in the arcx serve path (Arrow IPC, MessagePack, JSON) unwrapped because they build only under the `arcx_engine` tag, which no CI job can compile-check. They are wrapped now, with the same wrapper and the same disposition: a panic is logged, counted as a query error, and, for the MessagePack and JSON writers, fails the query's registry entry so it does not stay listed as running. The Arrow IPC writer has no entry to fail, because that endpoint registers the query only after the arcx hook declines. The CI guard that requires every body-stream writer to go through the wrapper no longer exempts that file; the change was compile-checked locally against the arcx library.
+
 ### Arrow IPC queries were invisible to query management and slow-query logging ([#309](https://github.com/Basekick-Labs/arc/issues/309))
 
 **Affects `POST /api/v1/query/arrow` on deployments with `query_management.enabled = true` or `query.slow_query_threshold_ms > 0`.**
