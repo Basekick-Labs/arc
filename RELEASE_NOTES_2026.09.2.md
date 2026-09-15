@@ -344,6 +344,19 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### JSON query endpoints return DECIMAL values as numbers ([#818](https://github.com/Basekick-Labs/arc/issues/818))
+
+`POST /api/v1/query` now keeps DuckDB DECIMAL results numeric instead of changing their wire type depending on which JSON query path served the request. The Arrow-backed JSON writer normalizes decimal batches with the same schema/cast path already used by Arrow IPC and msgpack, so common aggregate results such as `SUM(integer)` and `AVG(...)` no longer fall through to quoted strings. The database/sql fallback now recognizes `duckdb.Decimal` directly instead of JSON-marshalling the driver struct into an object cell.
+
+This restores endpoint parity for dashboard clients that infer numeric columns from JSON values; null, row-cap, truncation, and timestamp behavior is unchanged.
+
+Decimal columns are cast the same way as on the Arrow and msgpack endpoints: scale-zero decimals become 64-bit
+integers and scaled decimals become doubles. A `DECIMAL(38,0)` result outside the int64 range therefore ends the
+response with `truncated: true` and a `decimal cast failed` reason, as it already does on msgpack, instead of a
+quoted string.
+
+Contributed by [@TayfurYldz](https://github.com/TayfurYldz) in [#831](https://github.com/Basekick-Labs/arc/pull/831).
+
 ### Manifest applies respect caller cancellation and deadlines ([#394](https://github.com/Basekick-Labs/arc/issues/394))
 
 Manifest register/delete operations and the current compaction batch apply path

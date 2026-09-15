@@ -8,11 +8,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"testing"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/basekick-labs/arc/internal/database"
@@ -196,6 +198,55 @@ func TestStreamArrowJSON_BasicTypes(t *testing.T) {
 	}
 	if row0[3].(bool) != true {
 		t.Errorf("row[0][3] expected true, got %v", row0[3])
+	}
+}
+
+func TestStreamArrowJSON_DecimalsAreNumbers(t *testing.T) {
+	alloc := memory.NewGoAllocator()
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "total", Type: &arrow.Decimal128Type{Precision: 38, Scale: 0}},
+		{Name: "price", Type: &arrow.Decimal128Type{Precision: 10, Scale: 2}},
+	}, nil)
+
+	totalB := array.NewDecimal128Builder(alloc, &arrow.Decimal128Type{Precision: 38, Scale: 0})
+	defer totalB.Release()
+	totalB.Append(decimal128.FromI64(3))
+	totalB.Append(decimal128.FromI64(-7))
+
+	priceB := array.NewDecimal128Builder(alloc, &arrow.Decimal128Type{Precision: 10, Scale: 2})
+	defer priceB.Release()
+	priceB.Append(decimal128.FromI64(123))
+	priceB.Append(decimal128.FromI64(4550))
+
+	totalArr := totalB.NewArray()
+	defer totalArr.Release()
+	priceArr := priceB.NewArray()
+	defer priceArr.Release()
+
+	batch := array.NewRecord(schema, []arrow.Array{totalArr, priceArr}, 2)
+	reader := newSimpleRecordReader(schema, []arrow.Record{batch})
+	data, rowCount := arrowStreamToBytes(reader, 0, nil)
+	if rowCount != 2 {
+		t.Fatalf("rowCount = %d, want 2", rowCount)
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatalf("invalid JSON: %v\noutput: %s", err, string(data))
+	}
+	rows := result["data"].([]interface{})
+	want := [][]float64{{3, 1.23}, {-7, 45.5}}
+	for i, row := range rows {
+		values := row.([]interface{})
+		for j, expected := range want[i] {
+			got, ok := values[j].(float64)
+			if !ok {
+				t.Fatalf("data[%d][%d] has type %T (%v), want JSON number", i, j, values[j], values[j])
+			}
+			if math.Abs(got-expected) > 0.0001 {
+				t.Errorf("data[%d][%d] = %v, want %v", i, j, got, expected)
+			}
+		}
 	}
 }
 

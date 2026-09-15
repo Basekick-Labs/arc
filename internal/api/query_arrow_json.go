@@ -262,6 +262,14 @@ func streamArrowJSON(
 	timestamp string,
 ) (int, error) {
 	schema := reader.Schema()
+	// Keep the JSON endpoint aligned with the Arrow IPC and msgpack paths:
+	// DuckDB represents ordinary SUM/AVG results as decimals, but
+	// writeArrowValue has no decimal case and would otherwise serialize them
+	// through ValueStr as JSON strings.
+	castInfo := normalizeDecimalSchema(schema)
+	if castInfo != nil {
+		schema = castInfo.schema
+	}
 	fields := schema.Fields()
 	numCols := len(fields)
 
@@ -279,6 +287,7 @@ func streamArrowJSON(
 
 	rowCount := 0
 	var streamErr error
+	capped := false
 
 batchLoop:
 	for reader.Next() {
@@ -298,15 +307,29 @@ batchLoop:
 			break
 		}
 
+		var casted arrow.Record
+		if castInfo != nil {
+			var err error
+			casted, err = castDecimalBatch(batch, castInfo)
+			if err != nil {
+				streamErr = fmt.Errorf("decimal cast failed at row %d: %w", rowCount, err)
+				break batchLoop
+			}
+			batch = casted
+		}
+
 		nRows := int(batch.NumRows())
 		cols := make([]arrow.Array, numCols)
 		for c := 0; c < numCols; c++ {
 			cols[c] = batch.Column(c)
 		}
 
+		stop := false
 		for row := 0; row < nRows; row++ {
 			if governanceMaxRows > 0 && rowCount >= governanceMaxRows {
-				goto done
+				capped = true
+				stop = true
+				break
 			}
 
 			if rowCount > 0 {
@@ -335,19 +358,25 @@ batchLoop:
 				// (not Error) for this expected ops noise.
 				if err := w.Flush(); err != nil {
 					streamErr = fmt.Errorf("stream flush failed at row %d: %w: %w", rowCount, errClientDisconnected, err)
-					break batchLoop
+					stop = true
+					break
 				}
 			}
 		}
+		if casted != nil {
+			casted.Release()
+		}
+		if stop {
+			break batchLoop
+		}
 	}
 
-	if streamErr == nil {
+	if streamErr == nil && !capped {
 		if err := reader.Err(); err != nil {
 			streamErr = fmt.Errorf("arrow reader error after %d rows: %w", rowCount, err)
 		}
 	}
 
-done:
 	// --- Write envelope close ---
 	// Emit a valid JSON document regardless of whether streamErr is set
 	// (headers are already committed). Caller logs/metrics the error.
