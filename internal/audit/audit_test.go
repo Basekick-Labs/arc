@@ -3,10 +3,13 @@ package audit
 import (
 	"context"
 	"database/sql"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/config"
+	"github.com/gofiber/fiber/v2"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog"
 )
@@ -243,5 +246,46 @@ func TestQueryWithLimitAndOffset(t *testing.T) {
 	}
 	if len(entries) != 2 {
 		t.Fatalf("expected 2 entries with offset, got %d", len(entries))
+	}
+}
+
+func TestMiddleware_HandlerSuppliedDetail(t *testing.T) {
+	l := newTestLogger(t)
+	l.Start()
+	defer l.Stop()
+
+	app := fiber.New()
+	app.Use(Middleware(l, false))
+	app.Delete("/api/v1/cluster/files", func(c *fiber.Ctx) error {
+		c.Locals(DetailLocalsKey, map[string]string{
+			"path":   "db/cpu/f1.parquet",
+			"reason": "operator",
+		})
+		return c.SendStatus(fiber.StatusOK)
+	})
+
+	req := httptest.NewRequest("DELETE", "/api/v1/cluster/files", nil)
+	resp, err := app.Test(req, 1000)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	// Wait for logger batch flush
+	time.Sleep(1500 * time.Millisecond)
+
+	entries, err := l.Query(context.Background(), &QueryFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if !strings.Contains(entries[0].Detail, "db/cpu/f1.parquet") || !strings.Contains(entries[0].Detail, "operator") {
+		t.Fatalf("expected detail to contain path and reason, got %q", entries[0].Detail)
 	}
 }

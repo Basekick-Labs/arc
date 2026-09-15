@@ -1,9 +1,14 @@
 package api
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"sort"
 	"strconv"
+	"time"
 
+	"github.com/basekick-labs/arc/internal/audit"
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
 	clusterraft "github.com/basekick-labs/arc/internal/cluster/raft"
@@ -14,7 +19,9 @@ import (
 
 // Input validation constants
 const (
-	maxNodeIDLength = 256
+	maxNodeIDLength    = 256
+	maxDeletePathLen   = 4096
+	maxDeleteReasonLen = 256
 )
 
 // validRoles defines the valid role filter values.
@@ -35,12 +42,20 @@ var validStates = map[string]bool{
 	"leaving":   true,
 }
 
+// clusterFilesCoordinator is the minimal coordinator interface required for
+// cluster file management operations (lookup and deletion).
+type clusterFilesCoordinator interface {
+	GetFileEntry(path string) (*clusterraft.FileEntry, bool)
+	DeleteFileFromManifest(ctx context.Context, path, reason string) error
+}
+
 // ClusterHandler handles cluster management API endpoints.
 type ClusterHandler struct {
-	coordinator   *cluster.Coordinator
-	authManager   *auth.AuthManager
-	licenseClient *license.Client
-	logger        zerolog.Logger
+	coordinator      *cluster.Coordinator
+	filesCoordinator clusterFilesCoordinator
+	authManager      *auth.AuthManager
+	licenseClient    *license.Client
+	logger           zerolog.Logger
 }
 
 // NewClusterHandler creates a new cluster handler.
@@ -51,11 +66,16 @@ func NewClusterHandler(
 	licenseClient *license.Client,
 	logger zerolog.Logger,
 ) *ClusterHandler {
+	var fc clusterFilesCoordinator
+	if coordinator != nil {
+		fc = coordinator
+	}
 	return &ClusterHandler{
-		coordinator:   coordinator,
-		authManager:   authManager,
-		licenseClient: licenseClient,
-		logger:        logger.With().Str("component", "cluster-handler").Logger(),
+		coordinator:      coordinator,
+		filesCoordinator: fc,
+		authManager:      authManager,
+		licenseClient:    licenseClient,
+		logger:           logger.With().Str("component", "cluster-handler").Logger(),
 	}
 }
 
@@ -74,6 +94,7 @@ func (h *ClusterHandler) RegisterRoutes(app *fiber.App) {
 		filesGroup.Use(auth.RequireAdmin(h.authManager))
 	}
 	filesGroup.Get("", h.handleGetFiles)
+	filesGroup.Delete("", h.handleDeleteFile)
 
 	removeGroup := app.Group("/api/v1/cluster/nodes/:id")
 	if h.authManager != nil {
@@ -223,6 +244,7 @@ func (h *ClusterHandler) handleGetHealth(c *fiber.Ctx) error {
 // respondNotEnabled returns a response indicating clustering is not enabled.
 func (h *ClusterHandler) respondNotEnabled(c *fiber.Ctx) error {
 	response := fiber.Map{
+		"success": false,
 		"enabled": false,
 		"mode":    "standalone",
 	}
@@ -402,4 +424,120 @@ func paginateSlice(files []*clusterraft.FileEntry, cursor string, limit int) ([]
 		nextCursor = files[end-1].Path
 	}
 	return files[start:end], nextCursor
+}
+
+// handleDeleteFile removes a file entry from the cluster-wide manifest via Raft consensus
+// and triggers cluster-wide deletion.
+//
+// WARNING: On nodes with local storage, removing the manifest entry enqueues a physical
+// deletion (via the delete worker pool) that unlinks the file from disk on every node.
+// On shared storage backends (S3, Azure), the physical object is left orphaned until
+// cleaned up by the reconciliation sweeper.
+//
+// Query parameters:
+//   - path (required, max 4096 bytes): relative storage path of the file entry in the manifest.
+//   - confirm (required): must be "true" to confirm this destructive operation.
+//   - reason (optional, default "operator", max 256 chars): reason recorded in audit logs and Raft payloads.
+func (h *ClusterHandler) handleDeleteFile(c *fiber.Ctx) error {
+	if h.filesCoordinator == nil {
+		return h.respondNotEnabled(c)
+	}
+
+	path := c.Query("path")
+	if path == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   "path query parameter is required",
+		})
+	}
+	if len(path) > maxDeletePathLen {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   fmt.Sprintf("path exceeds maximum length of %d characters", maxDeletePathLen),
+		})
+	}
+
+	if c.Query("confirm") != "true" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   "confirmation required: add ?confirm=true to delete the file from cluster manifest and storage",
+		})
+	}
+
+	reason := c.Query("reason")
+	if reason == "" {
+		reason = "operator"
+	} else if len(reason) > maxDeleteReasonLen {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   fmt.Sprintf("reason exceeds maximum length of %d characters", maxDeleteReasonLen),
+		})
+	}
+
+	// Look up by exact string in cluster manifest; 404 if absent.
+	// NOTE: We deliberately do not validate the path format upfront (#794 item 5 correction).
+	// This allows operators to remove corrupted or unaddressable keys (e.g. malformed paths
+	// from older Arc releases) that retention and reconciliation cannot delete.
+	if _, exists := h.filesCoordinator.GetFileEntry(path); !exists {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"success": false,
+			"error":   "file not found in cluster manifest",
+			"path":    path,
+		})
+	}
+
+	// Classify unaddressable keys for audit details and warning logs
+	isUnaddressable := clusterraft.ValidateManifestPath(path) != nil
+
+	ctx, cancel := context.WithTimeout(c.Context(), 30*time.Second)
+	defer cancel()
+
+	if err := h.filesCoordinator.DeleteFileFromManifest(ctx, path, reason); err != nil {
+		if errors.Is(err, clusterraft.ErrManifestApply) {
+			c.Set(fiber.HeaderRetryAfter, "1")
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"success": false,
+				"error":   "cluster manifest update unavailable; retry later",
+			})
+		}
+		h.logger.Error().Err(err).Str("path", path).Msg("Failed to delete file from cluster manifest")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
+			"error":   err.Error(),
+		})
+	}
+
+	// Record audit detail in locals for audit middleware to persist
+	auditDetail := map[string]string{
+		"path":   path,
+		"reason": reason,
+	}
+	if isUnaddressable {
+		auditDetail["unaddressable_key"] = "true"
+	}
+	c.Locals(audit.DetailLocalsKey, auditDetail)
+
+	var nodeID string
+	if h.coordinator != nil {
+		if node := h.coordinator.GetLocalNode(); node != nil {
+			nodeID = node.ID
+		}
+	}
+
+	logEvent := h.logger.Warn().
+		Str("path", path).
+		Str("reason", reason)
+	if nodeID != "" {
+		logEvent = logEvent.Str("node_id", nodeID)
+	}
+	if isUnaddressable {
+		logEvent = logEvent.Bool("unaddressable_key", true)
+	}
+	logEvent.Msg("File removed from cluster manifest and deleted cluster-wide")
+
+	return c.JSON(fiber.Map{
+		"success": true,
+		"message": "file removed from cluster manifest and deleted cluster-wide",
+		"path":    path,
+	})
 }
