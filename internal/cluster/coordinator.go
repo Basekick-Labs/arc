@@ -3463,16 +3463,22 @@ func (c *Coordinator) UpdateNodeStateViaRaft(nodeID string, state NodeState) err
 //
 // On forwarding failure (no leader known, leader unreachable, or the
 // leader rejects the apply), the error is returned and the caller can
-// retry. The forwarding path is bounded by forwardApplyTimeout so a
-// stuck leader doesn't block the writer flush hot path indefinitely.
-func (c *Coordinator) RegisterFileInManifest(file raft.FileEntry) error {
+// retry. The caller deadline bounds the pre-apply cancellation check,
+// leader-side enqueue timeout, follower dial, and follower send/receive;
+// the Raft future.Error() commit wait retains existing Raft semantics.
+func (c *Coordinator) RegisterFileInManifest(ctx context.Context, file raft.FileEntry) error {
 	if c.raftNode == nil {
 		// Standalone mode — no manifest needed
 		return nil
 	}
+	ctx, cancel := c.manifestContext(ctx)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return errors.Join(raft.ErrManifestApply, fmt.Errorf("register file in manifest: %w", err))
+	}
 
 	if c.raftNode.IsLeader() {
-		if err := c.raftNode.RegisterFile(file, 5*time.Second); err != nil {
+		if err := c.raftNode.RegisterFile(file, manifestApplyTimeout(ctx)); err != nil {
 			return errors.Join(raft.ErrManifestApply, fmt.Errorf("register file in manifest: %w", err))
 		}
 		return nil
@@ -3487,9 +3493,7 @@ func (c *Coordinator) RegisterFileInManifest(file raft.FileEntry) error {
 	}
 	cmd := &raft.Command{Type: raft.CommandRegisterFile, Payload: payload}
 
-	forwardCtx, cancel := context.WithTimeout(c.ctxOrBackground(), forwardApplyTimeout)
-	defer cancel()
-	if err := c.forwardApplyToLeader(forwardCtx, cmd); err != nil {
+	if err := c.forwardApplyToLeader(ctx, cmd); err != nil {
 		return errors.Join(raft.ErrManifestApply, fmt.Errorf("register file in manifest (forwarded): %w", err))
 	}
 	return nil
@@ -3500,13 +3504,18 @@ func (c *Coordinator) RegisterFileInManifest(file raft.FileEntry) error {
 //
 // Phase 4: same leader-forwarding semantics as RegisterFileInManifest.
 // Non-leader callers no longer silently drop the command.
-func (c *Coordinator) DeleteFileFromManifest(path, reason string) error {
+func (c *Coordinator) DeleteFileFromManifest(ctx context.Context, path, reason string) error {
 	if c.raftNode == nil {
 		return nil
 	}
+	ctx, cancel := c.manifestContext(ctx)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return errors.Join(raft.ErrManifestApply, fmt.Errorf("delete file from manifest: %w", err))
+	}
 
 	if c.raftNode.IsLeader() {
-		if err := c.raftNode.DeleteFile(path, reason, 5*time.Second); err != nil {
+		if err := c.raftNode.DeleteFile(path, reason, manifestApplyTimeout(ctx)); err != nil {
 			return errors.Join(raft.ErrManifestApply, fmt.Errorf("delete file from manifest: %w", err))
 		}
 		return nil
@@ -3519,9 +3528,7 @@ func (c *Coordinator) DeleteFileFromManifest(path, reason string) error {
 	}
 	cmd := &raft.Command{Type: raft.CommandDeleteFile, Payload: payload}
 
-	forwardCtx, cancel := context.WithTimeout(c.ctxOrBackground(), forwardApplyTimeout)
-	defer cancel()
-	if err := c.forwardApplyToLeader(forwardCtx, cmd); err != nil {
+	if err := c.forwardApplyToLeader(ctx, cmd); err != nil {
 		return errors.Join(raft.ErrManifestApply, fmt.Errorf("delete file from manifest (forwarded): %w", err))
 	}
 	return nil
@@ -3533,12 +3540,27 @@ func (c *Coordinator) DeleteFileFromManifest(path, reason string) error {
 // peer protocol. This reduces Raft traffic for compaction manifests from
 // O(N) log entries to 1.
 func (c *Coordinator) BatchFileOpsInManifest(ops []raft.BatchFileOp) error {
+	ctx, cancel := context.WithTimeout(c.ctxOrBackground(), forwardApplyTimeout)
+	defer cancel()
+	return c.BatchFileOpsInManifestContext(ctx, ops)
+}
+
+// BatchFileOpsInManifestContext applies a batch using the caller's context.
+// The context bounds pre-apply cancellation, leader-side enqueue timeout,
+// follower dial, and follower send/receive. The Raft future.Error() commit
+// wait retains existing Raft semantics.
+func (c *Coordinator) BatchFileOpsInManifestContext(ctx context.Context, ops []raft.BatchFileOp) error {
 	if c.raftNode == nil {
 		return nil
 	}
+	ctx, cancel := c.manifestContext(ctx)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return errors.Join(raft.ErrManifestApply, fmt.Errorf("batch file ops in manifest: %w", err))
+	}
 
 	if c.raftNode.IsLeader() {
-		if err := c.raftNode.BatchFileOps(ops, 5*time.Second); err != nil {
+		if err := c.raftNode.BatchFileOps(ops, manifestApplyTimeout(ctx)); err != nil {
 			return errors.Join(raft.ErrManifestApply, fmt.Errorf("batch file ops in manifest: %w", err))
 		}
 		return nil
@@ -3551,12 +3573,41 @@ func (c *Coordinator) BatchFileOpsInManifest(ops []raft.BatchFileOp) error {
 	}
 	cmd := &raft.Command{Type: raft.CommandBatchFileOps, Payload: payload}
 
-	forwardCtx, cancel := context.WithTimeout(c.ctxOrBackground(), forwardApplyTimeout)
-	defer cancel()
-	if err := c.forwardApplyToLeader(forwardCtx, cmd); err != nil {
+	if err := c.forwardApplyToLeader(ctx, cmd); err != nil {
 		return errors.Join(raft.ErrManifestApply, fmt.Errorf("batch file ops in manifest (forwarded): %w", err))
 	}
 	return nil
+}
+
+func (c *Coordinator) manifestContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if c.ctx == nil {
+		return ctx, func() {}
+	}
+	if err := c.ctx.Err(); err != nil {
+		return c.ctx, func() {}
+	}
+	merged, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(c.ctx, cancel)
+	return merged, func() {
+		stop()
+		cancel()
+	}
+}
+
+func manifestApplyTimeout(ctx context.Context) time.Duration {
+	timeout := forwardApplyTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining < timeout {
+			timeout = remaining
+		}
+	}
+	if timeout <= 0 {
+		return 1 * time.Nanosecond
+	}
+	return timeout
 }
 
 // ctxOrBackground returns the coordinator's lifecycle context if it has

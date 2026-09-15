@@ -344,7 +344,44 @@ fails the build rather than leaving the note quietly wrong.
 
 This restores endpoint parity for dashboard clients that infer numeric columns from JSON values; null, row-cap, truncation, and timestamp behavior is unchanged.
 
+Decimal columns are cast the same way as on the Arrow and msgpack endpoints: scale-zero decimals become 64-bit
+integers and scaled decimals become doubles. A `DECIMAL(38,0)` result outside the int64 range therefore ends the
+response with `truncated: true` and a `decimal cast failed` reason, as it already does on msgpack, instead of a
+quoted string.
+
 Contributed by [@TayfurYldz](https://github.com/TayfurYldz) in [#831](https://github.com/Basekick-Labs/arc/pull/831).
+
+### Manifest applies respect caller cancellation and deadlines ([#394](https://github.com/Basekick-Labs/arc/issues/394))
+
+Manifest register/delete operations and the current compaction batch apply path
+now preserve caller deadline budgets. The caller deadline bounds the
+pre-apply cancellation check, leader-side enqueue timeout, follower dial, and
+follower send/receive. The Raft `future.Error()` commit wait retains existing
+Raft semantics.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#787](https://github.com/Basekick-Labs/arc/pull/787).
+
+### Compaction cleanup removes only the owning job's temp directory ([#749](https://github.com/Basekick-Labs/arc/issues/749))
+
+Parent-side compaction cleanup now removes only the exact JobID-owned temp directory, so it can no longer sweep another concurrent job whose names collapse to the same underscore prefix. If parent cleanup itself fails, the leftover is retained for `CleanupOrphanedTempDirs` to remove on the next startup instead of being hidden by a broad prefix sweep.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#786](https://github.com/Basekick-Labs/arc/pull/786).
+
+### Iceberg export fails when storage hides data files ([#760](https://github.com/Basekick-Labs/arc/issues/760))
+
+Iceberg export now checks the storage backend's unusable-object enumeration and
+fails a measurement when a Parquet data file is hidden from normal listings. The
+reconciler logs an `Error` on every reconcile pass until the operator renames the
+named files, and the table stays at the last published snapshot instead of
+silently dropping rows that Arc's query path can still read.
+
+Renaming the named files unblocks export, and the next reconcile pass publishes
+that table again. The local Iceberg path performs a second directory walk per
+measurement per pass to find these hidden files, which is the safe fallback; a
+single combined walk is the future optimization if reconcile time becomes an
+issue.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#785](https://github.com/Basekick-Labs/arc/pull/785).
 
 ### Iceberg export on an edge-sync hub produced one garbage table per spoke ([#634](https://github.com/Basekick-Labs/arc/issues/634))
 
@@ -682,7 +719,6 @@ the hub rejects its syncs and the spoke will not start. Re-register it under a
 new ID; files already written under the old namespace stay where they are.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#776](https://github.com/Basekick-Labs/arc/pull/776).
-
 ### Retention reports files hidden by storage listings ([#771](https://github.com/Basekick-Labs/arc/issues/771))
 
 Retention already had a skipped-file counter, but since #744 normal listing no
