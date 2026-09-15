@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -216,4 +217,27 @@ func TestValidateCQQueryRejectsUnsafeSQL(t *testing.T) {
 		t.Errorf("blank query should defer to required-field check, got: %v", err)
 	}
 	_ = strings.TrimSpace
+}
+
+func TestDeleteWhereIgnoresDangerousTokensInsideStringLiterals(t *testing.T) {
+	h := &DeleteHandler{}
+	keywords := []string{"drop", "delete", "insert", "update", "exec", "execute", "union", "select", "create", "alter", "copy", "attach", "detach", "load", "install", "pragma", "call", "set"}
+	for _, keyword := range keywords {
+		where := fmt.Sprintf("host = '%s'", keyword)
+		if _, err := h.validateWhereClause(where); err != nil {
+			t.Errorf("FALSE POSITIVE: DELETE rejected literal %q: %v", where, err)
+		}
+	}
+	valid := []string{`host = E'drop'`, `host = $$drop$$`, `note = 'a;b--c'`}
+	for _, where := range valid {
+		if _, err := h.validateWhereClause(where); err != nil {
+			t.Errorf("FALSE POSITIVE: DELETE rejected literal %q: %v", where, err)
+		}
+	}
+	invalid := []string{`1=1); DROP TABLE x --`, `host = 'a' OR 1=1; DROP TABLE x`, `host = 'a'; -- comment`}
+	for _, where := range invalid {
+		if _, err := h.validateWhereClause(where); err == nil {
+			t.Errorf("DELETE accepted dangerous syntax outside literal: %q", where)
+		}
+	}
 }
