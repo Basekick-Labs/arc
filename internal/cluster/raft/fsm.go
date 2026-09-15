@@ -2243,8 +2243,29 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		restoredOrder = restoredOrder[1:]
 	}
 
+	// Nodes: a `null` entry would deserialize to a nil pointer and panic
+	// the first GetNode or the callbacks below, bricking the boot, so it is
+	// refused the way a nil manifest entry is. A nil map (a snapshot with
+	// no nodes key) becomes an empty one so applyAddNode can write to it.
+	// The copies for the AddNode callback are taken here, before the map
+	// becomes f.nodes, so the delivery loop below touches nothing shared.
+	restoredNodes := make(map[string]*NodeInfo, len(snapshot.Nodes))
+	nodesToDeliver := make([]*NodeInfo, 0, len(snapshot.Nodes))
+	for id, node := range snapshot.Nodes {
+		if node == nil {
+			f.logger.Error().
+				Str("node_id", id).
+				Str("source", "snapshot").
+				Msg("node entry is nil during snapshot restore — entry refused, not added to the node table")
+			continue
+		}
+		restoredNodes[id] = node
+		nodeCopy := *node
+		nodesToDeliver = append(nodesToDeliver, &nodeCopy)
+	}
+
 	f.mu.Lock()
-	f.nodes = snapshot.Nodes
+	f.nodes = restoredNodes
 	f.barriers = restoredBarriers
 	f.barrierOrder = restoredOrder
 	f.primaryWriterID = snapshot.PrimaryWriterID
@@ -2334,10 +2355,11 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		teamSet[id] = struct{}{}
 	}
 	f.keysCache = nil // invalidate sorted-key cache after snapshot restore
+	onNodeAdded := f.onNodeAdded
 	f.mu.Unlock()
 
 	f.logger.Info().
-		Int("node_count", len(snapshot.Nodes)).
+		Int("node_count", len(nodesToDeliver)).
 		Int("file_count", len(snapshot.Files)).
 		Int("token_count", len(snapshot.Tokens)).
 		Int("organization_count", len(restoredOrgs)).
@@ -2348,6 +2370,22 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		Str("primary_writer", snapshot.PrimaryWriterID).
 		Str("active_compactor", snapshot.ActiveCompactorID).
 		Msg("FSM restored from snapshot")
+
+	// Deliver every restored node to the AddNode callback, as a log replay
+	// of the same membership would have (#807). Restore used to fire no
+	// callback, so a node restarted from a snapshot kept an in-memory
+	// registry that knew only itself: a leader rejected every forwarded
+	// write as an unknown node and heartbeated nobody, and a follower
+	// answered joins with no leader address, until a join happened to
+	// refill it. Copies are delivered so a callback cannot alter the table.
+	// The callback runs on the FSM goroutine, at startup inside NewRaft with
+	// the coordinator's and the raft node's locks held by the caller, so it
+	// must stay registry-only (see the SetCallbacks site in the coordinator).
+	if onNodeAdded != nil {
+		for _, node := range nodesToDeliver {
+			onNodeAdded(node)
+		}
+	}
 
 	return nil
 }

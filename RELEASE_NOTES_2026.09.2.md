@@ -344,6 +344,14 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### A leader restarted from a Raft snapshot rejected every forwarded write as an unknown node ([#807](https://github.com/Basekick-Labs/arc/issues/807))
+
+Cluster nodes forward writes they cannot apply themselves to the Raft leader: manifest registration from a standby writer, the compaction bridge, token and RBAC changes, and the startup barrier. The leader authorised the forwarding node through its in-memory node registry only. That registry is filled by the join flow and by node-added entries replayed from the Raft log; a snapshot restore fills the FSM node table directly and fires no such callback. So a leader that restarted from a snapshot knew only itself, and since a follower whose peer discovery ran after Raft already knew the leader never re-joins, every forwarded write from such a follower was rejected with `unknown node` until something triggered a join. A write on the follower still returned success, because ingestion is local, but its file never reached the manifest and was invisible to the rest of the cluster. The same empty registry made the restarted leader heartbeat nobody, so followers marked it unhealthy, and made a restarted follower answer join requests with an empty leader address.
+
+The leader now resolves the forwarding node from the Raft FSM node table, which is Raft-committed data written by the authenticated join and is restored with the snapshot; the registry is consulted only when the table has no entry, as defence in depth. The role gate is unchanged: a reader in the node table is still refused for manifest commands, and a node in neither store is still rejected. A snapshot restore now also delivers every restored node to the same callback a log replay would, so the registry, the leader's heartbeats, node listings, the file puller's origin lookup and the join redirect all see the membership again without a re-join. Restored node entries carry the writer state, so the registry and the writer-failover manager know the primary writer after a restore as well. A `null` node entry in a snapshot is refused and logged instead of crashing the node at boot, and a snapshot with no nodes leaves a writable table.
+
+Reproduced on the enterprise-local compose cluster: after stopping every node and restarting all of them without seeds, token creation on a follower failed with HTTP 500 and a follower's flushed file never appeared in the leader's manifest; with the fix both succeed and every node lists the full membership.
+
 ### Iceberg export registered a compacted file next to the files it replaced ([#638](https://github.com/Basekick-Labs/arc/issues/638))
 
 **Affects `iceberg.enabled = true` deployments with compaction running.**
