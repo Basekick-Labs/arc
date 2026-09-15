@@ -63,6 +63,12 @@ This rides on the existing telemetry channel and the existing switch: `telemetry
 
 ## Security fixes
 
+### RBAC table-reference deduplication preserves case ([#750](https://github.com/Basekick-Labs/arc/issues/750))
+
+Simple table references (`FROM table`) and JOIN table references (`JOIN table`) now preserve identifier case in deduplication keys during RBAC permission extraction. Previously, the deduplication key folded table names to lowercase while the downstream RBAC pattern matcher evaluated case-sensitively against case-sensitive storage backends. A query referencing measurements differing only by case (e.g., `SELECT * FROM cpu WHERE x IN (SELECT y FROM CPU)`) folded both references into one, authorizing the query if the principal had access to only one of the spellings. Both references are now checked against permissions independently.
+
+Contributed by [@Thundercloud12](https://github.com/Thundercloud12) in [#832](https://github.com/Basekick-Labs/arc/pull/832).
+
 ### Read-SQL validator hardening ([GHSA-w6w2-x8xv-q8x2](https://github.com/Basekick-Labs/arc/security/advisories/GHSA-w6w2-x8xv-q8x2))
 
 Closes a read-path validator bypass on RBAC-enabled multi-tenant deployments, in

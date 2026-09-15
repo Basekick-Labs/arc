@@ -844,3 +844,103 @@ func TestExecuteQuery_ShowTables_HeaderDBScoped(t *testing.T) {
 			resp.StatusCode, string(bodyBytes))
 	}
 }
+
+// TestExtractTableReferences_PreservesCaseInDedup verifies that extractTableReferences
+// does not fold table names to lowercase when deduplicating simple and JOIN table
+// references. If case were folded in the dedup key, a query referencing both "cpu"
+// and "CPU" would only extract one reference, skipping permission checks for the other.
+func TestExtractTableReferences_PreservesCaseInDedup(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want []TableReference
+	}{
+		{
+			name: "subquery differing only by case",
+			sql:  "SELECT * FROM cpu WHERE x IN (SELECT y FROM CPU)",
+			want: []TableReference{
+				{Database: "default", Measurement: "cpu"},
+				{Database: "default", Measurement: "CPU"},
+			},
+		},
+		{
+			name: "join differing only by case",
+			sql:  "SELECT * FROM cpu JOIN CPU ON cpu.id = CPU.id",
+			want: []TableReference{
+				{Database: "default", Measurement: "cpu"},
+				{Database: "default", Measurement: "CPU"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractTableReferences(tt.sql, nil)
+			if len(got) != len(tt.want) {
+				t.Fatalf("expected %d table references, got %d: %+v", len(tt.want), len(got), got)
+			}
+			for _, wantRef := range tt.want {
+				found := false
+				for _, gotRef := range got {
+					if gotRef.Database == wantRef.Database && gotRef.Measurement == wantRef.Measurement {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("missing expected reference %s.%s; got: %+v", wantRef.Database, wantRef.Measurement, got)
+				}
+			}
+		})
+	}
+}
+
+// TestQueryRBAC_CaseSensitiveTableDedup verifies the end-to-end RBAC gate:
+// when a user is granted read access to "default.cpu" but denied "default.CPU",
+// a query referencing both measurements must check both and be denied (403).
+// If the dedup key folded case, only one measurement would be checked and the
+// query would bypass authorization for the ungranted measurement.
+func TestQueryRBAC_CaseSensitiveTableDedup(t *testing.T) {
+	rbac := &mockRBACChecker{
+		enabled:            true,
+		allowAll:           false,
+		allowedDBs:         map[string]bool{"default": true},
+		deniedMeasurements: map[string]bool{"default.CPU": true},
+		deniedReason:       "no read permission for default.CPU",
+	}
+	app := setupQueryRBACTest(t, rbac, tokenMiddleware(1, "cpu-reader"))
+
+	queries := []struct {
+		name string
+		sql  string
+	}{
+		{
+			name: "subquery with mixed-case measurement",
+			sql:  "SELECT * FROM cpu WHERE x IN (SELECT y FROM CPU)",
+		},
+		{
+			name: "join with mixed-case measurement",
+			sql:  "SELECT * FROM cpu JOIN CPU ON cpu.id = CPU.id",
+		},
+	}
+
+	for _, tc := range queries {
+		t.Run(tc.name, func(t *testing.T) {
+			body := strings.NewReader(`{"sql": "` + tc.sql + `"}`)
+			req := httptest.NewRequest("POST", "/api/v1/query/estimate", body)
+			req.Header.Set("Content-Type", "application/json")
+
+			resp, err := app.Test(req, -1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != fiber.StatusForbidden {
+				bodyBytes, _ := io.ReadAll(resp.Body)
+				t.Fatalf("%s: expected 403 Forbidden (case-distinct table must be checked), got %d: %s",
+					tc.name, resp.StatusCode, string(bodyBytes))
+			}
+		})
+	}
+}
