@@ -510,6 +510,14 @@ func (m *SubscriptionManager) GetAllStats(ctx context.Context) ([]*SubscriptionS
 
 // startSubscriber creates and starts a subscriber
 func (m *SubscriptionManager) startSubscriber(sub *Subscription) error {
+	// Rows loaded from SQLite may predate the storage-segment rule or have
+	// been edited there. Refuse to run one whose targets cannot be written,
+	// so the subscription shows an error status instead of running and
+	// dropping every message (#300). onMessage keeps its own check as the
+	// last line.
+	if err := validateStorageTargets(sub); err != nil {
+		return fmt.Errorf("subscription targets cannot be written: %w", err)
+	}
 	subscriber := NewSubscriber(
 		sub,
 		m.arrowBuffer,
