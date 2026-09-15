@@ -395,6 +395,19 @@ func sanitizeDBForName(database string) string {
 	return strings.ReplaceAll(database, "/", ".")
 }
 
+// cleanupSubprocessTempDir removes the exact working directory owned by a
+// subprocess. The JobID validation prevents an empty or path-like ID from
+// resolving to the temp-directory base or escaping it.
+func cleanupSubprocessTempDir(tempDirectory, jobID string) error {
+	if tempDirectory == "" {
+		return errors.New("cannot cleanup subprocess temp directory with an empty base directory")
+	}
+	if err := validateJobID(jobID); err != nil {
+		return fmt.Errorf("cannot cleanup subprocess temp directory: %w", err)
+	}
+	return os.RemoveAll(jobTempDir(tempDirectory, jobID))
+}
+
 // notifyCompactedOutput invokes the compacted-output observer, if any.
 func (m *Manager) notifyCompactedOutput(storageKey string) {
 	if storageKey == "" {
@@ -477,9 +490,6 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 
 	// Build subprocess config. JobID is generated here (not inside NewJob)
 	// so the parent and subprocess agree on the completion-manifest filename.
-	// The format matches NewJob's default to stay consistent with the
-	// existing temp-dir naming scheme used by CleanupOrphanedTempDirs (which
-	// removes non-reserved subdirectories wholesale and does not parse this).
 	//
 	// BatchNumber is included because sibling batches of one partition differ
 	// in nothing else: same database, same partition path, and a wall-clock
@@ -555,19 +565,16 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 	// Always clean up temp directories for this partition after subprocess completes.
 	// The subprocess has its own defer cleanup, but if it crashes or gets OOM-killed,
 	// the defer never runs. This ensures cleanup happens from the parent process.
-	// Job temp dirs are named: {database}_{partition_path_with_underscores}_{timestamp}
-	partitionPrefix := sanitizeDBForName(candidate.Database) + "_" + strings.ReplaceAll(candidate.PartitionPath, "/", "_") + "_"
-	if entries, readErr := os.ReadDir(config.TempDirectory); readErr == nil {
-		for _, entry := range entries {
-			if entry.IsDir() && strings.HasPrefix(entry.Name(), partitionPrefix) {
-				dirPath := filepath.Join(config.TempDirectory, entry.Name())
-				if removeErr := os.RemoveAll(dirPath); removeErr != nil {
-					m.logger.Debug().Err(removeErr).Str("dir", entry.Name()).Msg("Failed to cleanup subprocess temp directory")
-				} else {
-					m.logger.Debug().Str("dir", entry.Name()).Msg("Cleaned up subprocess temp directory")
-				}
-			}
-		}
+	// The parent already generated config.JobID, so remove only that exact
+	// job-owned directory and never infer identity from partition names.
+	if removeErr := cleanupSubprocessTempDir(config.TempDirectory, config.JobID); removeErr != nil {
+		m.logger.Debug().Err(removeErr).
+			Str("dir", jobTempDir(config.TempDirectory, config.JobID)).
+			Msg("Failed to cleanup subprocess temp directory")
+	} else {
+		m.logger.Debug().
+			Str("dir", jobTempDir(config.TempDirectory, config.JobID)).
+			Msg("Cleaned up subprocess temp directory")
 	}
 
 	// Update metrics. Cache invalidation is gated on FilesCompacted > 0, not
