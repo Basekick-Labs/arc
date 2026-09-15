@@ -1254,7 +1254,7 @@ func extractTableReferences(sql string, identNames map[string]string) []TableRef
 				continue
 			}
 
-			key := "default." + table
+			key := "default." + tableName
 			if !seen[key] {
 				seen[key] = true
 				refs = append(refs, TableReference{
@@ -1296,7 +1296,7 @@ func extractTableReferences(sql string, identNames map[string]string) []TableRef
 				continue
 			}
 
-			key := "default." + table
+			key := "default." + tableName
 			if !seen[key] {
 				seen[key] = true
 				refs = append(refs, TableReference{
