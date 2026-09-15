@@ -188,6 +188,8 @@ func (s *StorageWalkSource) LocalFiles(ctx context.Context, m Measurement) ([]st
 	return local, err
 }
 
+const unusableSampleCap = 32
+
 // FilesAndLocal lists the measurement's Parquet files ONCE and returns both the iceberg-readable
 // URIs and the on-disk local paths, so the reconciler doesn't pay for two identical backend
 // List() calls per measurement per pass. The two slices are aligned only in the sense that every
@@ -195,6 +197,41 @@ func (s *StorageWalkSource) LocalFiles(ctx context.Context, m Measurement) ([]st
 // is non-local. Files() and LocalFiles() delegate here for callers that need just one view.
 func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([]FileRef, []string, error) {
 	prefix := m.Database + "/" + m.Measurement + "/"
+	if ul, ok := s.backend.(storage.UnusableLister); ok {
+		// Enumerate hidden files first: a hidden-to-usable rename between the
+		// two passes may cause a spurious refusal, but never a silent omission.
+		unusable, err := ul.ListUnusable(ctx, prefix)
+		if err != nil {
+			return nil, nil, fmt.Errorf("check hidden files for %s/%s: %w", m.Database, m.Measurement, err)
+		}
+		var hiddenData []storage.UnusableObject
+		for _, obj := range unusable {
+			if isDataFile(obj.Path) {
+				hiddenData = append(hiddenData, obj)
+			}
+		}
+		if len(hiddenData) > 0 {
+			sampleCount := len(hiddenData)
+			if sampleCount > unusableSampleCap {
+				sampleCount = unusableSampleCap
+			}
+			samples := make([]string, 0, sampleCount)
+			for i, obj := range hiddenData {
+				if i >= unusableSampleCap {
+					break
+				}
+				reason := "unknown reason"
+				if obj.Err != nil {
+					reason = obj.Err.Error()
+				}
+				samples = append(samples, fmt.Sprintf("%s: %s", obj.Path, reason))
+			}
+			return nil, nil, fmt.Errorf(
+				"refusing Iceberg export for %s/%s: %d data file(s) are hidden from the normal storage listing, so publishing the table would be incomplete; rename the files, and the next reconcile pass will publish. Sample(s): %s",
+				m.Database, m.Measurement, len(hiddenData), strings.Join(samples, "; "),
+			)
+		}
+	}
 	paths, err := s.backend.List(ctx, prefix)
 	if err != nil {
 		return nil, nil, fmt.Errorf("list files for %s/%s: %w", m.Database, m.Measurement, err)

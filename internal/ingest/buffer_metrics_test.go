@@ -85,9 +85,15 @@ func TestBufferMetrics_RecordsBufferedTracksUnflushedData(t *testing.T) {
 
 // TestBufferMetrics_FlushCountersMove pins that the flush counters are
 // published at all. Before #802 they were exported and never set.
+//
+// The published value is this buffer's own lifetime count, not a process-wide
+// running total: SetBufferFlushes stores rather than adds, which is correct
+// because cmd/arc/main.go:839 constructs exactly one ArrowBuffer. So the
+// assertion compares against the buffer's internal counters rather than
+// against a snapshot taken before it was created. An earlier test in this
+// package leaves its own (higher) count in the metrics singleton, so a
+// before/after delta on the global would be testing test-execution order.
 func TestBufferMetrics_FlushCountersMove(t *testing.T) {
-	before := snapshotInt(t, "buffer_flushes_total")
-
 	buf := NewArrowBuffer(bufferMetricsConfig(), &mockStorageBackend{}, zerolog.New(io.Discard))
 
 	// Cross MaxBufferSize so a flush fires.
@@ -101,10 +107,20 @@ func TestBufferMetrics_FlushCountersMove(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	if got := snapshotInt(t, "buffer_flushes_total"); got <= before {
-		t.Fatalf("buffer_flushes_total did not advance (%d -> %d) after a flush (#802)", before, got)
+	// The buffer actually flushed, so there is something to publish.
+	wantFlushes := buf.totalFlushes.Load()
+	wantWritten := buf.totalRecordsWritten.Load()
+	if wantFlushes == 0 {
+		t.Fatal("precondition: the buffer recorded no flushes, so the test cannot observe publication")
 	}
-	if snapshotInt(t, "buffer_records_written") == 0 {
-		t.Fatal("buffer_records_written is 0 after a flush wrote records (#802)")
+	if wantWritten == 0 {
+		t.Fatal("precondition: the buffer wrote no records, so the test cannot observe publication")
+	}
+
+	if got := snapshotInt(t, "buffer_flushes_total"); got != wantFlushes {
+		t.Fatalf("buffer_flushes_total = %d, want %d: the buffer's flush count is not published (#802)", got, wantFlushes)
+	}
+	if got := snapshotInt(t, "buffer_records_written"); got != wantWritten {
+		t.Fatalf("buffer_records_written = %d, want %d: the buffer's written count is not published (#802)", got, wantWritten)
 	}
 }
