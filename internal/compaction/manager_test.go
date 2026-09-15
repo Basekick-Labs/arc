@@ -3,6 +3,8 @@ package compaction
 import (
 	"context"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -608,6 +610,85 @@ func TestManager_CleanupOrphanedTempDirs_NonExistentDir(t *testing.T) {
 	// Should not error when directory doesn't exist
 	if err := manager.CleanupOrphanedTempDirs(); err != nil {
 		t.Errorf("CleanupOrphanedTempDirs should not error on non-existent dir, got: %v", err)
+	}
+}
+
+func TestCleanupSubprocessTempDirUsesExactJobID(t *testing.T) {
+	tempDirectory := t.TempDir()
+	databaseA := "a"
+	partitionA := "a/a_a_cpu/2026/09/12/14"
+	databaseB := "a_a"
+	partitionB := "a_a/cpu/2026/09/12/14"
+	oldPrefixA := sanitizeDBForName(databaseA) + "_" + strings.ReplaceAll(partitionA, "/", "_") + "_"
+	oldPrefixB := sanitizeDBForName(databaseB) + "_" + strings.ReplaceAll(partitionB, "/", "_") + "_"
+	if oldPrefixA != "a_a_a_a_cpu_2026_09_12_14_" || oldPrefixA != oldPrefixB {
+		t.Fatalf("collision setup does not reproduce the old common prefix: %q, %q", oldPrefixA, oldPrefixB)
+	}
+	oldPrefix := oldPrefixA
+	jobA := oldPrefix + "job-a"
+	jobB := oldPrefix + "job-b"
+
+	// These are the two names from #749. Their database and partition
+	// spellings produced the same prefix under the old HasPrefix sweep:
+	// a + a/a_a_cpu/2026/09/12/14 and a_a + a_a/cpu/2026/09/12/14.
+	jobADir := filepath.Join(tempDirectory, jobA)
+	jobBDir := filepath.Join(tempDirectory, jobB)
+	if err := os.MkdirAll(jobADir, 0755); err != nil {
+		t.Fatalf("failed to create job A directory: %v", err)
+	}
+	if err := os.MkdirAll(jobBDir, 0755); err != nil {
+		t.Fatalf("failed to create job B directory: %v", err)
+	}
+	sentinel := filepath.Join(jobBDir, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("job B is still running"), 0644); err != nil {
+		t.Fatalf("failed to create job B sentinel: %v", err)
+	}
+
+	if err := cleanupSubprocessTempDir(tempDirectory, jobA); err != nil {
+		t.Fatalf("cleanupSubprocessTempDir failed: %v", err)
+	}
+
+	if _, err := os.Stat(jobADir); !os.IsNotExist(err) {
+		t.Fatalf("job A directory still exists or returned an unexpected error: %v", err)
+	}
+	if _, err := os.Stat(jobBDir); err != nil {
+		t.Fatalf("job B directory was removed by job A cleanup: %v", err)
+	}
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("job B sentinel was removed by job A cleanup: %v", err)
+	}
+}
+
+func TestCleanupSubprocessTempDirRemovesJobTempDir(t *testing.T) {
+	tempDirectory := t.TempDir()
+	jobID := "database_partition_123_b1"
+	jobDirectory := jobTempDir(tempDirectory, jobID)
+	if err := os.MkdirAll(jobDirectory, 0755); err != nil {
+		t.Fatalf("failed to create job directory: %v", err)
+	}
+
+	if err := cleanupSubprocessTempDir(tempDirectory, jobID); err != nil {
+		t.Fatalf("cleanupSubprocessTempDir failed: %v", err)
+	}
+	if _, err := os.Stat(jobDirectory); !os.IsNotExist(err) {
+		t.Fatalf("job directory still exists or returned an unexpected error: %v", err)
+	}
+}
+
+func TestCleanupSubprocessTempDirRejectsUnsafeJobID(t *testing.T) {
+	tempDirectory := t.TempDir()
+	sentinel := filepath.Join(tempDirectory, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("base"), 0644); err != nil {
+		t.Fatalf("failed to create base sentinel: %v", err)
+	}
+
+	for _, jobID := range []string{"", ".", "..", "../other"} {
+		if err := cleanupSubprocessTempDir(tempDirectory, jobID); err == nil {
+			t.Errorf("cleanupSubprocessTempDir(%q) succeeded, want error", jobID)
+		}
+	}
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("base temp directory was modified by unsafe cleanup: %v", err)
 	}
 }
 

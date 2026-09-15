@@ -338,6 +338,12 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Compaction cleanup removes only the owning job's temp directory ([#749](https://github.com/Basekick-Labs/arc/issues/749))
+
+Parent-side compaction cleanup now removes only the exact JobID-owned temp directory, so it can no longer sweep another concurrent job whose names collapse to the same underscore prefix. If parent cleanup itself fails, the leftover is retained for `CleanupOrphanedTempDirs` to remove on the next startup instead of being hidden by a broad prefix sweep.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#786](https://github.com/Basekick-Labs/arc/pull/786).
+
 ### Iceberg export fails when storage hides data files ([#760](https://github.com/Basekick-Labs/arc/issues/760))
 
 Iceberg export now checks the storage backend's unusable-object enumeration and
@@ -690,7 +696,6 @@ the hub rejects its syncs and the spoke will not start. Re-register it under a
 new ID; files already written under the old namespace stay where they are.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#776](https://github.com/Basekick-Labs/arc/pull/776).
-
 ### Retention reports files hidden by storage listings ([#771](https://github.com/Basekick-Labs/arc/issues/771))
 
 Retention already had a skipped-file counter, but since #744 normal listing no

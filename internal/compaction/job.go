@@ -261,6 +261,10 @@ func NewJob(cfg *JobConfig) *Job {
 	}
 }
 
+func jobTempDir(tempDirectory, jobID string) string {
+	return filepath.Join(tempDirectory, jobID)
+}
+
 // clusterMode reports whether this job should write a Phase 4 completion
 // manifest. True iff CompletionDir was set in the JobConfig (which only
 // happens in clustered Enterprise deployments). OSS jobs have CompletionDir
@@ -306,7 +310,7 @@ func (j *Job) Run(ctx context.Context) error {
 	}
 
 	// Create temp directory for this job using configured base path
-	tempDir := filepath.Join(j.TempDirectory, j.JobID)
+	tempDir := jobTempDir(j.TempDirectory, j.JobID)
 	if err := os.MkdirAll(tempDir, 0700); err != nil {
 		return j.fail(fmt.Errorf("failed to create temp directory: %w", err))
 	}
