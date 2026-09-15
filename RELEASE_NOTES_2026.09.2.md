@@ -344,6 +344,12 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Cluster shutdown no longer holds the coordinator and Raft locks while it waits for its subsystems ([#813](https://github.com/Basekick-Labs/arc/issues/813))
+
+Stopping a clustered node joined every subsystem — the file puller, the writer and compactor failover managers, the Raft node, the delete worker — while holding the coordinator's lock, and the Raft node's own `Stop` held its lock across the Raft shutdown, which waits for the goroutine that applies entries to the FSM. Anything on one of those joined goroutines that took either lock deadlocked the shutdown, and a deadlocked shutdown hook hangs the whole process until the supervisor kills it. #797 fixed one such caller, the FSM delete callback, and left the structure in place with a contract comment and a test that guards the FSM callbacks only; a puller gate check had already been working around it with a try-lock.
+
+`Coordinator.Stop` now takes its lock only to flip state, close its channels and snapshot the subsystem pointers, joins them with the lock released, and takes it again briefly to clear the fields. The Raft node's `Stop` releases its lock around the shutdown as well and keeps the instance in place, so callers that read it during the join get the shutting-down instance's answers (not leader, `ErrRaftShutdown`) rather than a block. A second `Stop` during the join returns at once and a `Start` during it is refused as already running; the coordinator remains single-use. The failover managers are still joined before the Raft node stops, because they read Raft through calls that take its lock; that ordering is now written down. The FSM-callback contract stays in force (callbacks run under both locks during the startup snapshot restore) and is guarded by the existing test plus two new ones that hold a callback inside the Raft join while it takes the coordinator lock and while it reads the Raft node.
+
 ### Iceberg export registered a compacted file next to the files it replaced ([#638](https://github.com/Basekick-Labs/arc/issues/638))
 
 **Affects `iceberg.enabled = true` deployments with compaction running.**
