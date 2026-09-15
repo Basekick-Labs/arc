@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -452,5 +453,43 @@ func TestManager_Start_SkipsExistingSubscriber(t *testing.T) {
 
 	if cur != existingSub {
 		t.Fatalf("subscribers[%s] was overwritten; got %p, want %p", sub.ID, cur, existingSub)
+	}
+}
+
+// TestManager_StartSubscriber_RejectsInvalidPersistedTargets (regression,
+// #300): a row whose database or topic-mapping target is not a valid storage
+// segment (edited in SQLite, or written before the rule existed) must not
+// start; Start records the error on the row instead of running a subscriber
+// that drops every message.
+func TestManager_StartSubscriber_RejectsInvalidPersistedTargets(t *testing.T) {
+	mgr := newTestManager(t)
+	base := func(id string) *Subscription {
+		sub := &Subscription{
+			ID:       id,
+			Name:     "test-" + id,
+			Broker:   "tcp://127.0.0.1:1",
+			ClientID: "client-" + id,
+			Topics:   []string{"sensors/#"},
+			QoS:      1,
+			Database: "iot",
+		}
+		sub.SetDefaults()
+		return sub
+	}
+	badMapping := base("bad-mapping")
+	badMapping.TopicMapping = map[string]string{"sensors/a": "../other-db"}
+	badDatabase := base("bad-db")
+	badDatabase.Database = "a/b"
+	for _, sub := range []*Subscription{badMapping, badDatabase} {
+		err := mgr.startSubscriber(sub)
+		if err == nil || !strings.Contains(err.Error(), "cannot be written") {
+			t.Fatalf("%s: startSubscriber = %v, want a targets-cannot-be-written error", sub.ID, err)
+		}
+		mgr.mu.RLock()
+		_, installed := mgr.subscribers[sub.ID]
+		mgr.mu.RUnlock()
+		if installed {
+			t.Fatalf("%s: a subscriber was installed despite invalid targets", sub.ID)
+		}
 	}
 }

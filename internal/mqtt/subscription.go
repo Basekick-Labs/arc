@@ -191,17 +191,8 @@ func (s *Subscription) Validate() error {
 	if s.Database == "" {
 		return errors.New("database is required")
 	}
-	// Both the subscription database and every topic-mapping target become the
-	// first segment of a storage key. This is the one ingest surface with no
-	// HTTP handler in front of it to validate them, so a mapping value like
-	// "" or "../x" would otherwise reach the writer directly (#741).
-	if !isValidStorageSegment(s.Database) {
-		return fmt.Errorf("database %q must start with a letter and contain only alphanumeric characters, underscores, or hyphens", s.Database)
-	}
-	for topic, db := range s.TopicMapping {
-		if !isValidStorageSegment(db) {
-			return fmt.Errorf("topic mapping %q targets database %q, which must start with a letter and contain only alphanumeric characters, underscores, or hyphens", topic, db)
-		}
+	if err := validateStorageTargets(s); err != nil {
+		return err
 	}
 
 	// Path traversal check for TLS certificate paths
@@ -320,9 +311,53 @@ func ValidateCreateRequest(req *CreateSubscriptionRequest) error {
 		ConnectTimeoutSeconds: req.ConnectTimeoutSeconds,
 		ReconnectMaxSeconds:   req.ReconnectMaxSeconds,
 		CleanSession:          req.CleanSession,
+		// The mapping targets are storage-key segments like Database; leaving
+		// them out here let a create request carry a value the update path
+		// would refuse (#300).
+		TopicMapping: req.TopicMapping,
 	}
 	s.SetDefaults()
 	return s.Validate()
+}
+
+// validateStorageTargets checks the subscription database and every
+// topic-mapping target. Both become the first segment of a storage key, and
+// this is the one ingest surface with no HTTP handler in front of it to
+// validate them, so a value like "" or "../x" would otherwise reach the writer
+// directly (#741, #300). Shared by Validate (create and update) and by
+// startSubscriber, which loads rows from SQLite that may predate the rule or
+// have been edited there.
+func validateStorageTargets(s *Subscription) error {
+	if !isValidStorageSegment(s.Database) {
+		return fmt.Errorf("database %q must start with a letter and contain only alphanumeric characters, underscores, or hyphens", s.Database)
+	}
+	for topic, db := range s.TopicMapping {
+		if !isValidStorageSegment(db) {
+			return fmt.Errorf("topic mapping %q targets database %q, which must start with a letter and contain only alphanumeric characters, underscores, or hyphens", topic, db)
+		}
+	}
+	return nil
+}
+
+// isValidMeasurementSegment mirrors the HTTP write path's measurement rule
+// (internal/api isValidMeasurementName): letter first, then letters, digits,
+// underscore or hyphen, at most 128 bytes. The measurement is publisher
+// controlled, so it is checked per record before it reaches the buffer.
+func isValidMeasurementSegment(s string) bool {
+	if len(s) == 0 || len(s) > 128 {
+		return false
+	}
+	c := s[0]
+	if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		c = s[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // isValidStorageSegment reports whether s is safe as a single path segment in a

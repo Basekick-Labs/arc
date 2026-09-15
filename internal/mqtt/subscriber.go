@@ -25,13 +25,16 @@ const unsubscribeTimeout = time.Second
 
 // Subscriber handles MQTT connection and message processing for a single subscription
 type Subscriber struct {
-	id             string
-	config         *Subscription
-	client         pahomqtt.Client
-	arrowBuffer    *ingest.ArrowBuffer
-	logger         zerolog.Logger
-	encryptor      PasswordEncryptor
-	onStatusChange func(id string, status SubscriptionStatus, errMsg string)
+	id     string
+	config *Subscription
+	// invalidDatabaseLogged remembers database values already reported by
+	// onMessage so a persistent misconfiguration logs once, not per message.
+	invalidDatabaseLogged sync.Map
+	client                pahomqtt.Client
+	arrowBuffer           *ingest.ArrowBuffer
+	logger                zerolog.Logger
+	encryptor             PasswordEncryptor
+	onStatusChange        func(id string, status SubscriptionStatus, errMsg string)
 
 	// Runtime state. mu guards the lifecycle fields (running, connectedSince),
 	// which change only on connect/start/stop — not on the message hot path.
@@ -351,6 +354,25 @@ func (s *Subscriber) onMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 		}
 	}
 
+	// The database becomes the first segment of the storage key with no HTTP
+	// handler in front of it. Creation and update validate it, but the
+	// subscription is persisted in SQLite and can predate that rule or be
+	// edited there, so the last check is here: a message bound for a database
+	// name that is not a valid storage segment is dropped and counted rather
+	// than written under a path no query can address (#300). Logged once per
+	// offending value; the counter and metric move on every message.
+	if !isValidStorageSegment(database) {
+		s.messagesFailed.Add(1)
+		metrics.Get().IncMQTTMessagesFailed()
+		if _, seen := s.invalidDatabaseLogged.LoadOrStore(database, struct{}{}); !seen {
+			s.logger.Error().
+				Str("topic", msg.Topic()).
+				Str("database", database).
+				Msg("Dropping MQTT messages: the mapped database is not a valid storage segment (letters, digits, underscore, hyphen; letter first); fix the subscription's database or topic_mapping")
+		}
+		return
+	}
+
 	// Decode and write message
 	if err := s.processMessage(msg.Topic(), msg.Payload(), database); err != nil {
 		s.messagesFailed.Add(1)
@@ -475,6 +497,15 @@ func (s *Subscriber) mapToRecord(m map[string]interface{}) (*models.Record, erro
 		record.Measurement = meas
 	} else {
 		record.Measurement = "mqtt" // Default measurement
+	}
+	// The measurement is the second storage-key segment and comes from the
+	// publisher. A value like "../x" is accepted into the buffer and refused by
+	// the storage key contract at flush, which latches the buffer's
+	// flush-failure state; "a/b" is written under a mis-partitioned path no
+	// query can address. Refuse it here, as a decode error, the same way the
+	// HTTP write path refuses it before the buffer (#300).
+	if !isValidMeasurementSegment(record.Measurement) {
+		return nil, fmt.Errorf("measurement %q must start with a letter and contain only alphanumeric characters, underscores, or hyphens (at most 128 characters)", record.Measurement)
 	}
 
 	// Extract timestamp - Arc uses microseconds internally

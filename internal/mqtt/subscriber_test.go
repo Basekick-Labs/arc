@@ -168,3 +168,76 @@ func TestWaitForUnsubscribe(t *testing.T) {
 		})
 	}
 }
+
+// fakeMessage is the minimal paho Message onMessage reads.
+type fakeMessage struct {
+	topic   string
+	payload []byte
+}
+
+func (m fakeMessage) Duplicate() bool   { return false }
+func (m fakeMessage) Qos() byte         { return 0 }
+func (m fakeMessage) Retained() bool    { return false }
+func (m fakeMessage) Topic() string     { return m.topic }
+func (m fakeMessage) MessageID() uint16 { return 0 }
+func (m fakeMessage) Payload() []byte   { return m.payload }
+func (m fakeMessage) Ack()              {}
+
+// TestOnMessage_DropsMessageForInvalidDatabase (regression, #300): a message
+// whose resolved database is not a valid storage segment is dropped and
+// counted before decoding. The subscriber here has no buffer, so reaching the
+// write path would dereference nil: the test passing without a panic is the
+// proof that the guard returned first. The payload is valid JSON on purpose,
+// so a decode failure cannot be what stops it.
+func TestOnMessage_DropsMessageForInvalidDatabase(t *testing.T) {
+	payload := []byte(`{"m":"cpu","v":1}`)
+	cases := map[string]*Subscription{
+		"mapped_traversal": {ID: "s", Name: "s", Database: "iot", TopicMapping: map[string]string{"sensors/a": "../other-db"}},
+		"mapped_slash":     {ID: "s", Name: "s", Database: "iot", TopicMapping: map[string]string{"sensors/a": "a/b"}},
+		"default_invalid":  {ID: "s", Name: "s", Database: "../x"},
+	}
+	for name, cfg := range cases {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("onMessage reached the write path with an invalid database (panic: %v)", r)
+				}
+			}()
+			// No buffer and no ctx on purpose: the guard must return before
+			// either is touched.
+			s := &Subscriber{id: "s", config: cfg, logger: zerolog.Nop()}
+			s.onMessage(nil, fakeMessage{topic: "sensors/a", payload: payload})
+			s.onMessage(nil, fakeMessage{topic: "sensors/a", payload: payload})
+			if got := s.messagesFailed.Load(); got != 2 {
+				t.Fatalf("messagesFailed = %d, want 2", got)
+			}
+			if got := s.messagesReceived.Load(); got != 2 {
+				t.Fatalf("messagesReceived = %d, want 2 (received is counted before the drop)", got)
+			}
+		})
+	}
+}
+
+// TestMapToRecord_RejectsInvalidMeasurement (regression, #300): the measurement
+// is publisher controlled and becomes the second storage-key segment. A name
+// the storage key contract would refuse at flush, or that would split into two
+// segments, is refused as a decode error before it reaches the buffer.
+func TestMapToRecord_RejectsInvalidMeasurement(t *testing.T) {
+	s := &Subscriber{id: "s", config: &Subscription{ID: "s", Name: "s", Database: "iot"}, logger: zerolog.Nop()}
+	for _, good := range []string{"cpu", "cpu_load-1", "C"} {
+		if _, err := s.mapToRecord(map[string]interface{}{"m": good, "v": 1.0}); err != nil {
+			t.Errorf("measurement %q rejected: %v", good, err)
+		}
+	}
+	if rec, err := s.mapToRecord(map[string]interface{}{"v": 1.0}); err != nil || rec.Measurement != "mqtt" {
+		t.Errorf("default measurement: rec=%+v err=%v", rec, err)
+	}
+	for _, bad := range []string{"../x", "a/b", "1abc", "a b", "a\\b", string(make([]byte, 129))} {
+		if _, err := s.mapToRecord(map[string]interface{}{"m": bad, "v": 1.0}); err == nil {
+			t.Errorf("measurement %q accepted", bad)
+		}
+		if _, err := s.mapToRecord(map[string]interface{}{"measurement": bad, "v": 1.0}); err == nil {
+			t.Errorf("measurement (long key) %q accepted", bad)
+		}
+	}
+}
