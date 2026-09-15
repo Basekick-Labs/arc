@@ -134,10 +134,15 @@ type Coordinator struct {
 
 	// State
 	running bool
-	ctx     context.Context
-	cancel  context.CancelFunc
-	stopCh  chan struct{}
-	mu      sync.RWMutex
+	// stopping marks the window in which Stop has released c.mu to join the
+	// subsystems (#813). running stays true until the joins are done, so a
+	// concurrent Start is refused as "already running" and a second Stop
+	// returns at once instead of closing stopCh twice.
+	stopping bool
+	ctx      context.Context
+	cancel   context.CancelFunc
+	stopCh   chan struct{}
+	mu       sync.RWMutex
 
 	logger zerolog.Logger
 }
@@ -616,106 +621,102 @@ func (c *Coordinator) broadcastLeave() {
 }
 
 func (c *Coordinator) Stop() error {
-	// Broadcast leave BEFORE acquiring the lock — broadcastLeave() does
-	// network I/O with per-peer timeouts and must not block the mutex.
+	// A second Stop, concurrent or later, must neither re-broadcast the
+	// leave nor re-enter the joins.
+	c.mu.RLock()
+	active := c.running && !c.stopping
+	c.mu.RUnlock()
+	if !active {
+		return nil
+	}
 	c.broadcastLeave()
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if !c.running {
+	if !c.running || c.stopping {
+		c.mu.Unlock()
 		return nil
 	}
-
+	c.stopping = true
 	c.logger.Info().Msg("Stopping cluster coordinator...")
-
-	// Signal all goroutines to stop
 	close(c.stopCh)
-
-	// Cancel the coordinator-wide context so in-flight handlers
-	// (handleFetchFile, the Phase 4 delete workers, catch-up
-	// walker, etc.) observe shutdown and drop out of their waits. c.cancel
-	// may be nil in tests that construct a bare Coordinator without
-	// calling Start, so guard it.
 	if c.cancel != nil {
 		c.cancel()
 	}
+	// Snapshot the subsystems under the lock and join them WITHOUT it
+	// (#813). Every join below waits for goroutines that may call back into
+	// this coordinator: the puller's scheduler gate takes c.mu, the failover
+	// managers read Raft, and Raft's shutdown joins the FSM apply goroutine,
+	// whose callbacks used to take c.mu (#797). Holding c.mu across a join
+	// deadlocks shutdown the moment one of them does.
+	//
+	// The puller pointer is cleared now so readers see "no puller" during
+	// the join, as they do after it. deleteQueue stays set until the worker
+	// has exited: the worker reads the field, and the close below happens
+	// only after the Raft join has retired every callback that could still
+	// send on it.
+	puller := c.puller
+	c.puller = nil
+	writerFailover := c.writerFailoverMgr
+	compactorFailover := c.compactorFailoverMgr
+	raftNode := c.raftNode
+	deleteQueue := c.deleteQueue
+	healthChecker := c.healthChecker
+	listener := c.listener
+	c.mu.Unlock()
 
-	// Stop the peer file puller BEFORE Raft. The puller is a Raft FSM
-	// callback consumer — once Raft stops, new applyRegisterFile calls
-	// won't fire anyway, but in-flight pulls need to be cancelled promptly
-	// so their workers can join before we tear down the listener.
-	if c.puller != nil {
-		c.puller.Stop()
-		c.puller = nil
+	// Close the cached leader connection so any in-flight forward fails
+	// fast rather than waiting on a dying leader.
+	c.closeForwardConn()
+
+	if puller != nil {
+		puller.Stop()
 	}
 
-	// Close the cached leader-forwarding connection.
-	c.forwardConnMu.Lock()
-	if c.forwardConn != nil {
-		c.forwardConn.Close()
-		c.forwardConn = nil
-		c.forwardConnLeader = ""
-	}
-	c.forwardConnMu.Unlock()
-
-	// Stop writer failover manager
-	if c.writerFailoverMgr != nil {
-		if err := c.writerFailoverMgr.Stop(); err != nil {
+	// The failover managers are joined BEFORE the Raft node stops so a
+	// failover tick cannot propose a promotion into a Raft instance that is
+	// going down. Before #813 this order was also what kept them from
+	// deadlocking on n.mu (their IsLeader and Apply calls take it, and
+	// Node.Stop held it across the shutdown); keep the order either way.
+	if writerFailover != nil {
+		if err := writerFailover.Stop(); err != nil {
 			c.logger.Error().Err(err).Msg("Error stopping writer failover manager")
 		}
 	}
-
-	// Stop compactor failover manager (Phase 5)
-	if c.compactorFailoverMgr != nil {
-		if err := c.compactorFailoverMgr.Stop(); err != nil {
+	if compactorFailover != nil {
+		if err := compactorFailover.Stop(); err != nil {
 			c.logger.Error().Err(err).Msg("Error stopping compactor failover manager")
 		}
 	}
 
-	// Stop Raft node BEFORE closing the delete queue. The onDelete
-	// callback fires synchronously from the Raft FSM apply path — if
-	// we close the channel while Raft is still running, a late
-	// DeleteFile commit would send to a closed channel and panic.
-	if c.raftNode != nil {
-		if err := c.raftNode.Stop(); err != nil {
+	if raftNode != nil {
+		if err := raftNode.Stop(); err != nil {
 			c.logger.Error().Err(err).Msg("Error stopping Raft node")
 		}
-	}
-
-	// Raft is joined: no callback can be running. Unregister the file
-	// callbacks before closing the queue they captured. The FSM object
-	// outlives this Stop, and an in-process Start restarts Raft (which
-	// replays the log into the same FSM) before startFilePullerLocked
-	// registers fresh closures; without this a replayed delete would send
-	// on the closed queue (#797). SetFileCallbacks takes only the FSM's own
-	// lock.
-	if c.raftNode != nil {
-		if fsm := c.raftNode.FSM(); fsm != nil {
+		// Raft is joined: no callback can still be running, so the file
+		// callbacks can be unregistered and their queue closed below.
+		if fsm := raftNode.FSM(); fsm != nil {
 			fsm.SetFileCallbacks(nil, nil)
 		}
 	}
 
-	// Now safe to close the delete queue — Raft is stopped, no more
-	// FSM callbacks will fire.
-	if c.deleteQueue != nil {
-		close(c.deleteQueue)
+	if deleteQueue != nil {
+		close(deleteQueue)
 		c.deleteWg.Wait()
-		c.deleteQueue = nil
 	}
 
-	// Stop health checker
-	c.healthChecker.Stop()
-
-	// Close listener
-	if c.listener != nil {
-		c.listener.Close()
+	if healthChecker != nil {
+		healthChecker.Stop()
+	}
+	if listener != nil {
+		listener.Close()
 	}
 
-	// Mark local node as leaving
+	c.mu.Lock()
+	c.deleteQueue = nil
 	c.localNode.UpdateState(StateLeaving)
-
 	c.running = false
+	c.stopping = false
+	c.mu.Unlock()
 
 	c.logger.Info().Msg("Cluster coordinator stopped")
 	return nil
@@ -2007,13 +2008,16 @@ func (c *Coordinator) IsRunning() bool {
 // per-node concern, so every clustered role may run it; current membership,
 // lifecycle, and health state gate the work.
 func (c *Coordinator) canRunFileReconciliation() bool {
-	// Stop holds c.mu while it waits for the puller scheduler to exit. Do not
-	// block on that lock from the scheduler's gate check, or shutdown can
-	// deadlock waiting for this goroutine.
+	// Stop used to hold c.mu while it waited for the puller scheduler to
+	// exit, so blocking on that lock from the scheduler's gate check could
+	// deadlock shutdown. Since #813 Stop holds the lock only for microseconds
+	// and joins the puller without it; the TryRLock stays as belt and braces
+	// (a tick that lands in that instant is refused, not queued), and the
+	// stopping flag refuses a tick that lands inside the join.
 	if !c.mu.TryRLock() {
 		return false
 	}
-	running := c.running
+	running := c.running && !c.stopping
 	registry := c.registry
 	localNode := c.localNode
 	localNodeID := ""
@@ -2641,17 +2645,18 @@ func (c *Coordinator) startFilePullerLocked() error {
 		}
 	}
 
-	// CONTRACT for every FSM callback (#797): they run synchronously on the
-	// Raft apply goroutine, which Node.Stop waits on (hashicorp/raft's
-	// Shutdown joins runFSM) while Coordinator.Stop holds c.mu and Node.Stop
-	// holds n.mu. A callback that takes c.mu, or calls any Node method other
-	// than FSM() and Barrier() (they all take n.mu), deadlocks shutdown
-	// whenever an entry is applied while the node is stopping. So the
-	// closures capture everything they need up front: the backend is set
-	// once, before Start (SetStorageBackend), and the queue is created just
-	// above, closed only after Raft is joined, and unregistered from the FSM
-	// before that (Stop), so a closure never outlives its queue. Neither
-	// callback may block.
+	// CONTRACT for every FSM callback (#797, #813): they run synchronously
+	// on the Raft apply goroutine. Since #813 neither Coordinator.Stop nor
+	// Node.Stop holds its lock across the Raft join, but the STARTUP restore
+	// still runs inside raft.NewRaft while Start holds c.mu and Node.Start
+	// holds n.mu (#807), and the contract is what keeps the next subsystem
+	// stopped under a lock from deadlocking too. So a callback must not take
+	// c.mu or call a Node method other than FSM() and Barrier() (they take
+	// n.mu), and the closures capture everything they need up front: the
+	// backend is set once, before Start (SetStorageBackend), and the queue
+	// is created just above, closed only after Raft is joined, and
+	// unregistered from the FSM before that (Stop), so a closure never
+	// outlives its queue. Neither callback may block.
 	backend := c.storage
 	deleteQueue := c.deleteQueue
 	onRegister := func(entry *raft.FileEntry) {
