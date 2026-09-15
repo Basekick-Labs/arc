@@ -480,7 +480,8 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 		return false, fmt.Errorf("WHERE clause is required. To delete all data, use WHERE clause '1=1' with confirm=true")
 	}
 
-	whereUpper := strings.ToUpper(strings.TrimSpace(where))
+	maskedWhere, _ := sqlutil.MaskStringLiterals(where, sqlutil.HasQuotes(where))
+	whereUpper := strings.ToUpper(strings.TrimSpace(maskedWhere))
 
 	// Remove "WHERE" prefix if present
 	if strings.HasPrefix(whereUpper, "WHERE ") {
@@ -496,7 +497,7 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 
 	// Check for dangerous SQL keywords using word boundaries to avoid false positives
 	// on column names like "offset" (contains SET), "payload" (contains LOAD), "dataset" (contains SET)
-	if match := dangerousKeywordPattern.FindString(where); match != "" {
+	if match := dangerousKeywordPattern.FindString(maskedWhere); match != "" {
 		return false, fmt.Errorf("WHERE clause contains forbidden keyword: %s", strings.ToUpper(match))
 	}
 
