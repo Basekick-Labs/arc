@@ -194,6 +194,14 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	progress.TotalBytes = manifest.TotalSizeBytes
 	m.setProgress(progress)
 
+	// An unreadable outside-root Iceberg warehouse fails the backup now, not
+	// after every data file was copied.
+	if err := m.preflightIcebergWarehouse(); err != nil {
+		progress.Status = "failed"
+		progress.Error = err.Error()
+		return nil, err
+	}
+
 	// ── 2. Copy parquet files ───────────────────────────────────────────
 	if err := m.copyDataFiles(ctx, backupID, parquetFiles, progress); err != nil {
 		progress.Status = "failed"
@@ -206,31 +214,13 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	// (data files) for a restore to compare them.
 	dataSkipped := atomic.LoadInt64(&progress.SkippedFiles)
 
-	// ── 2b. Copy Iceberg warehouse metadata (if any) ────────────────────
-	// Same copy mechanism + path preservation as data files, so restore round-trips them to
-	// their original locations and the SQLite catalog's metadata pointers still resolve. The
-	// referenced parquet data is already copied above; only the Iceberg metadata is added here.
-	if len(icebergMetaFiles) > 0 {
-		if err := m.copyDataFiles(ctx, backupID, icebergMetaFiles, progress); err != nil {
-			progress.Status = "failed"
-			progress.Error = err.Error()
-			return nil, err
-		}
-		m.logger.Info().Int("files", len(icebergMetaFiles)).Msg("Backed up Iceberg warehouse metadata")
-	}
-
-	// Evaluate the skip ratio once, over every file group above.
-	if err := m.checkSkipRatio(progress, len(parquetFiles)+len(icebergMetaFiles)); err != nil {
-		progress.Status = "failed"
-		progress.Error = err.Error()
-		return nil, err
-	}
-
-	// Record files that could never be copied because no listing returns them.
-	// The fatal case was decided before any copying began.
-	m.recordUnaddressable(manifest, unaddressable, len(parquetFiles))
-
 	// ── 3. Copy SQLite metadata ─────────────────────────────────────────
+	// Snapshotted BEFORE the Iceberg warehouse metadata below, on purpose: a
+	// reconcile commit writes a new metadata file and only then points the
+	// catalog row at it, so a catalog snapshotted after the file copy could
+	// reference a file the backup never held (#637). Snapshotting the rows
+	// first means every referenced file already existed, immutable, when its
+	// row was written, and is copied by the passes that follow.
 	if opts.IncludeMetadata && m.sqliteDBPath != "" {
 		if err := m.backupSQLite(ctx, backupID); err != nil {
 			m.logger.Warn().Err(err).Msg("Failed to backup SQLite database")
@@ -255,6 +245,63 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 		}
 	}
 
+	// ── 3b. Copy Iceberg warehouse metadata under the storage root ──────
+	// Same copy mechanism + path preservation as data files, so restore round-trips them to
+	// their original locations and the SQLite catalog's metadata pointers still resolve. The
+	// referenced parquet data is already copied above; only the Iceberg metadata is added here.
+	if len(icebergMetaFiles) > 0 {
+		if err := m.copyDataFiles(ctx, backupID, icebergMetaFiles, progress); err != nil {
+			progress.Status = "failed"
+			progress.Error = err.Error()
+			return nil, err
+		}
+		m.logger.Info().Int("files", len(icebergMetaFiles)).Msg("Backed up Iceberg warehouse metadata")
+	}
+
+	// ── 3c. Copy an Iceberg warehouse that lives OUTSIDE the storage root ─
+	// The listing above cannot see it, so it is walked on the filesystem and
+	// stored under <backupID>/iceberg/<rel>; restore writes it back into the
+	// node's configured warehouse (#637).
+	var warehouseFiles int
+	var warehouseSkipped int64
+	if m.icebergWarehouse != "" {
+		whFiles, err := m.listIcebergWarehouseFiles()
+		if err != nil {
+			progress.Status = "failed"
+			progress.Error = err.Error()
+			return nil, err
+		}
+		info := &IcebergWarehouseInfo{Path: m.icebergWarehouse, ConfiguredPath: m.icebergWarehouseConfigured, FileCount: int64(len(whFiles))}
+		for _, f := range whFiles {
+			info.SizeBytes += f.size
+		}
+		progress.TotalFiles += int64(len(whFiles))
+		m.setProgress(progress)
+		skipped, err := m.copyIcebergWarehouse(ctx, backupID, whFiles, progress)
+		if err != nil {
+			progress.Status = "failed"
+			progress.Error = err.Error()
+			return nil, err
+		}
+		info.SkippedFiles = skipped
+		warehouseSkipped = skipped
+		manifest.IcebergWarehouse = info
+		warehouseFiles = len(whFiles)
+		m.logger.Info().Int("files", len(whFiles)).Str("warehouse", m.icebergWarehouse).
+			Msg("Backed up Iceberg warehouse metadata from outside the storage root")
+	}
+
+	// Evaluate the skip ratio once, over every file group above.
+	if err := m.checkSkipRatio(progress, len(parquetFiles)+len(icebergMetaFiles)+warehouseFiles); err != nil {
+		progress.Status = "failed"
+		progress.Error = err.Error()
+		return nil, err
+	}
+
+	// Record files that could never be copied because no listing returns them.
+	// The fatal case was decided before any copying began.
+	m.recordUnaddressable(manifest, unaddressable, len(parquetFiles))
+
 	// ── 4. Copy config ──────────────────────────────────────────────────
 	if opts.IncludeConfig && m.configPath != "" {
 		if err := m.backupConfig(ctx, backupID); err != nil {
@@ -269,7 +316,7 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	// does not claim contents the backup does not actually hold. Data-file and
 	// Iceberg-metadata skips are recorded separately (see dataSkipped above).
 	manifest.SkippedFiles = dataSkipped
-	manifest.SkippedMetadataFiles = atomic.LoadInt64(&progress.SkippedFiles) - dataSkipped
+	manifest.SkippedMetadataFiles = atomic.LoadInt64(&progress.SkippedFiles) - dataSkipped - warehouseSkipped
 
 	manifestData, err := MarshalManifest(manifest)
 	if err != nil {

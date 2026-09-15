@@ -113,6 +113,19 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 		}
 	}
 
+	// ── 2b. Restore an Iceberg warehouse that lived outside the storage root
+	// Tied to either flag: the catalog rows (metadata) and the data files both
+	// depend on these metadata files, so restoring one without them leaves the
+	// tables unloadable (#637).
+	if opts.RestoreData || opts.RestoreMetadata {
+		catalogRestored := opts.RestoreMetadata && manifest.HasMetadata
+		if err := m.restoreIcebergWarehouse(ctx, opts.BackupID, manifest, progress, catalogRestored); err != nil {
+			progress.Status = "failed"
+			progress.Error = err.Error()
+			return nil, err
+		}
+	}
+
 	// ── 3. Restore SQLite metadata ──────────────────────────────────────
 	if opts.RestoreMetadata && manifest.HasMetadata {
 		if err := m.restoreSQLite(ctx, opts.BackupID); err != nil {
@@ -138,6 +151,24 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 	skipped := atomic.LoadInt64(&progress.SkippedFiles)
 	missing := progress.MissingFiles
 	unaddressable := progress.UnaddressableFiles
+	// A catalog staged for a node that runs Iceberg but had nowhere to put the
+	// warehouse files is guaranteed unloadable after restart; "completed" would
+	// turn that into a surprise. A node with Iceberg off keeps the Warn only:
+	// its catalog rows are inert.
+	if progress.IcebergWarehouseFilesSkipped > 0 && m.icebergEnabled && opts.RestoreMetadata && manifest.HasMetadata {
+		source := ""
+		if manifest.IcebergWarehouse != nil {
+			source = manifest.IcebergWarehouse.ConfiguredPath
+			if source == "" {
+				source = manifest.IcebergWarehouse.Path
+			}
+		}
+		err := fmt.Errorf("restore incomplete: %d Iceberg warehouse files were not restored because this node's iceberg.warehouse is under its storage root while the backup's was %s; set iceberg.warehouse to that path and run the restore again", progress.IcebergWarehouseFilesSkipped, source)
+		progress.Status = "failed"
+		progress.Error = err.Error()
+		m.logger.Error().Str("backup_id", opts.BackupID).Int64("iceberg_warehouse_files_skipped", progress.IcebergWarehouseFilesSkipped).Msg("Restore incomplete")
+		return nil, err
+	}
 	if skipped+missing+unaddressable > 0 {
 		var parts []string
 		if skipped > 0 {
