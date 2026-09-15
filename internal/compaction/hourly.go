@@ -36,8 +36,10 @@ func NewHourlyTier(cfg *HourlyTierConfig) *HourlyTier {
 		cfg.MinAgeHours = 1
 	}
 	if cfg.MinFiles == 0 {
-		// 10 files: ingestion flushes ~every 6 min, so 10 files ≈ 1 hour of data.
-		// Below this threshold compaction overhead outweighs the read-time savings.
+		// 10 files: minimum input-file threshold for an hourly compaction pass.
+		// Ingest flushes when it reaches 50,000 rows or 5 seconds have elapsed,
+		// whichever comes first. Actual files per hour depend on ingest rate and
+		// schema changes.
 		cfg.MinFiles = 10
 	}
 	tier := &HourlyTier{
