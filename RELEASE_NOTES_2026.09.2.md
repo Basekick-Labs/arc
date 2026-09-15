@@ -2,6 +2,16 @@
 
 > **Status:** Planned — October 2026 patch release.
 
+## New: administrative cluster file deletion (`DELETE /api/v1/cluster/files`) ([#830](https://github.com/Basekick-Labs/arc/pull/830))
+
+A new administrative endpoint `DELETE /api/v1/cluster/files?path=...&confirm=true` allows cluster operators to remove an entry from the cluster-wide Raft manifest.
+
+**Destructive behavior:** removing a manifest entry via Raft triggers physical file deletion across the cluster. On nodes using local storage, the FSM delete callback enqueues physical deletion through the delete worker pool, unlinking the local file on every node. On shared backends (S3, Azure), the physical object remains until swept by the reconciliation cleaner. Because this operation permanently unlinks local data, the endpoint requires explicit confirmation via `?confirm=true` (rejecting with `400 Bad Request` if omitted).
+
+The endpoint looks up entries by exact path (capped at 4096 bytes) and returns `404 Not Found` if absent. This allows operators to remove corrupted or unaddressable keys (e.g. malformed paths from older Arc releases) that retention and reconciliation sweeps cannot reach; when an unaddressable key is removed, it is flagged with `unaddressable_key=true` in audit logs and warnings. The endpoint also enforces a 256-character limit on the optional `reason` parameter (defaulting to `"operator"`), logs deletions at `Warn` level with node identification, and returns `503 Service Unavailable` with a `Retry-After: 1` header when Raft consensus or leader forwarding is temporarily unavailable.
+
+Contributed by [@Thundercloud12](https://github.com/Thundercloud12) in [#830](https://github.com/Basekick-Labs/arc/pull/830).
+
 ## New (experimental): file-level time pruning for high-frequency ingest (`query.file_time_pruning`)
 
 **This feature is experimental in 26.09.2**: it ships disabled by default behind
