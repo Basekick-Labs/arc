@@ -338,6 +338,14 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### JSON query endpoints return DECIMAL values as numbers ([#818](https://github.com/Basekick-Labs/arc/issues/818))
+
+`POST /api/v1/query` now keeps DuckDB DECIMAL results numeric instead of changing their wire type depending on which JSON query path served the request. The Arrow-backed JSON writer normalizes decimal batches with the same schema/cast path already used by Arrow IPC and msgpack, so common aggregate results such as `SUM(integer)` and `AVG(...)` no longer fall through to quoted strings. The database/sql fallback now recognizes `duckdb.Decimal` directly instead of JSON-marshalling the driver struct into an object cell.
+
+This restores endpoint parity for dashboard clients that infer numeric columns from JSON values; null, row-cap, truncation, and timestamp behavior is unchanged.
+
+Contributed by [@TayfurYldz](https://github.com/TayfurYldz) in [#PR](https://github.com/Basekick-Labs/arc/pull/PR).
+
 ### Iceberg export on an edge-sync hub produced one garbage table per spoke ([#634](https://github.com/Basekick-Labs/arc/issues/634))
 
 **Affects hubs only** — a node receiving edge-sync data with `iceberg.enabled = true`.

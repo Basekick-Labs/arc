@@ -8,10 +8,12 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"math/big"
 	"testing"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/database"
+	duckdb "github.com/duckdb/duckdb-go/v2"
 )
 
 // mockRowScanner simulates *sql.Rows for testing streamTypedJSON.
@@ -153,6 +155,39 @@ func TestStreamTypedJSON_BasicTypes(t *testing.T) {
 	}
 	if row0[4].(string) != "2024-01-15T10:30:00Z" {
 		t.Errorf("row[0][4] expected timestamp, got %v", row0[4])
+	}
+}
+
+func TestStreamTypedJSON_DecimalsAreNumbers(t *testing.T) {
+	scanner := &mockRowScanner{
+		rows: [][]interface{}{
+			{duckdb.Decimal{Width: 38, Scale: 0, Value: big.NewInt(42)}, duckdb.Decimal{Width: 10, Scale: 2, Value: big.NewInt(123)}},
+			{duckdb.Decimal{Width: 38, Scale: 0, Value: big.NewInt(-7)}, duckdb.Decimal{Width: 10, Scale: 2, Value: big.NewInt(4550)}},
+		},
+	}
+
+	data, rowCount := streamToBytes([]string{"total", "price"}, []colType{colFloat64, colFloat64}, scanner, 0, nil)
+	if rowCount != 2 {
+		t.Fatalf("rowCount = %d, want 2", rowCount)
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatalf("invalid JSON: %v\noutput: %s", err, string(data))
+	}
+	rows := result["data"].([]interface{})
+	want := [][]float64{{42, 1.23}, {-7, 45.5}}
+	for i, row := range rows {
+		values := row.([]interface{})
+		for j, expected := range want[i] {
+			got, ok := values[j].(float64)
+			if !ok {
+				t.Fatalf("data[%d][%d] has type %T (%v), want JSON number", i, j, values[j], values[j])
+			}
+			if math.Abs(got-expected) > 0.0001 {
+				t.Errorf("data[%d][%d] = %v, want %v", i, j, got, expected)
+			}
+		}
 	}
 }
 

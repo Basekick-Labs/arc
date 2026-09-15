@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/database"
+	duckdb "github.com/duckdb/duckdb-go/v2"
 )
 
 // colType represents a simplified column type for fast JSON serialization.
@@ -324,6 +325,11 @@ func writeJSONValue(w *bufio.Writer, scratch []byte, val interface{}, ct colType
 			} else {
 				w.WriteString("null")
 			}
+		case duckdb.Decimal:
+			// duckdb-go scans DECIMAL values into Decimal rather than float64.
+			// String renders the exact base-10 value, so write it directly as a
+			// JSON number instead of falling back to marshaling the struct.
+			w.WriteString(v.String())
 		default:
 			scratch = writeFallbackJSON(w, scratch, v)
 		}
