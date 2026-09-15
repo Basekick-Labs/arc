@@ -344,6 +344,16 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Iceberg export registered a compacted file next to the files it replaced ([#638](https://github.com/Basekick-Labs/arc/issues/638))
+
+**Affects `iceberg.enabled = true` deployments with compaction running.**
+
+Compaction uploads the compacted file into the partition before it deletes the source files, which is the right order for Arc's own crash safety. A reconcile pass that listed the partition in that window registered the compacted file and every source it replaced in one snapshot, so external readers saw roughly twice the rows for that hour or day until a later pass removed the sources: up to two reconcile intervals at the default, and in steady state with compaction running across many measurements it happened regularly.
+
+The reconciler now reads compaction's crash-recovery manifests before it stats a partition's files and leaves out any compacted output whose manifest still exists and at least one of whose source files is still present. The output is registered on the pass after the compaction has replaced its sources, in one snapshot with the sources' removal, which is the transition Arc's own file set makes. The order of the reads is what makes this safe: compaction deletes its manifest only after every source is gone, or after it has removed an output it could not keep, so a manifest that is absent means the sources vanish from the same pass, and a manifest that is present means the output is held back. A compaction that commits in the few milliseconds between the manifest read and the file stats leaves that partition out for one pass (an empty snapshot if it is the measurement's only partition), refilled on the next. The state is consulted per measurement on every pass, fresh from storage, so a compaction that starts mid-pass is seen. The lookup is wired even when compaction is disabled, since a manifest from an earlier run can still be in storage.
+
+One under-count remains, bounded by the compaction schedule: if a compaction deletes some sources and fails on the rest, its output stays hidden while the surviving sources are exported, until the next compaction cycle's recovery finishes the job (with compaction disabled no recovery runs, and the partition stays that way until compaction is re-enabled or the manifest is removed by hand). That replaces a double count with a short, bounded under-count. A manifest that cannot be parsed is ignored and reported once, since it names nothing; recovery deletes it.
+
 ### MQTT ingest accepted database and measurement names that are not valid storage segments ([#300](https://github.com/Basekick-Labs/arc/issues/300))
 
 **Affects `mqtt.enabled = true` deployments.**
