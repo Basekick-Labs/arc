@@ -344,6 +344,14 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### MQTT ingest accepted database and measurement names that are not valid storage segments ([#300](https://github.com/Basekick-Labs/arc/issues/300))
+
+**Affects `mqtt.enabled = true` deployments.**
+
+A subscription's `database`, every `topic_mapping` target, and each message's measurement become segments of a storage key, and the MQTT path is the one ingest surface with no HTTP handler in front of it to check them. 26.09.1 accepted any string for all three. The storage-key rule added for [#741](https://github.com/Basekick-Labs/arc/issues/741) in this release covered subscription updates but not creates, because the create-request validator built its temporary subscription without the topic mapping, and nothing covered the measurement, which the publisher controls. What happened depended on the shape: a target or measurement containing a slash was written under a mis-partitioned path no query can address; one containing `..`, or empty, was accepted into the buffer and refused at flush by the storage key contract, which latches the buffer's flush-failure state (WAL retained, non-clean shutdown) until the subscription or publisher is fixed. The storage layer's containment check held throughout; this was a data-integrity gap, not a traversal.
+
+Create requests now validate mapping targets with the same rule as `database`, and a subscription whose persisted targets fail the rule (a row edited in SQLite, or one written before the rule) no longer starts: it is left in the `error` status with the reason on the row. The subscriber also re-checks the resolved database on every message and drops one bound for an invalid name before decoding it, counted in `messages_failed` and the MQTT failed-messages metric, with one error log per offending value per subscriber run. A measurement that fails the HTTP write path's rule (letter first, then letters, digits, underscore or hyphen, at most 128 characters) is refused as a decode error and never reaches the buffer.
+
 ### Backups skipped an Iceberg warehouse outside the storage root, and a restore then wedged every reconcile pass ([#637](https://github.com/Basekick-Labs/arc/issues/637))
 
 **Affects `iceberg.enabled = true` deployments whose `iceberg.warehouse` points outside `storage.local_path`.**

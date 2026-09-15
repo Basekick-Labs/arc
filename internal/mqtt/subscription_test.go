@@ -108,6 +108,43 @@ func TestSubscription_Validate(t *testing.T) {
 			modify:  func(s *Subscription) { s.Database = "" },
 			wantErr: true,
 		},
+		// The database and every topic-mapping target become the first
+		// segment of a storage key (#300).
+		{
+			name:    "database_with_slash",
+			modify:  func(s *Subscription) { s.Database = "a/b" },
+			wantErr: true,
+		},
+		{
+			name:    "database_traversal",
+			modify:  func(s *Subscription) { s.Database = "../other-db" },
+			wantErr: true,
+		},
+		{
+			name:    "database_leading_digit",
+			modify:  func(s *Subscription) { s.Database = "1iot" },
+			wantErr: true,
+		},
+		{
+			name:    "mapping_valid",
+			modify:  func(s *Subscription) { s.TopicMapping = map[string]string{"sensors/a": "iot-a", "sensors/b": "iot_b"} },
+			wantErr: false,
+		},
+		{
+			name:    "mapping_traversal",
+			modify:  func(s *Subscription) { s.TopicMapping = map[string]string{"sensors/a": "../other-db"} },
+			wantErr: true,
+		},
+		{
+			name:    "mapping_absolute",
+			modify:  func(s *Subscription) { s.TopicMapping = map[string]string{"sensors/a": "/etc/passwd"} },
+			wantErr: true,
+		},
+		{
+			name:    "mapping_empty_target",
+			modify:  func(s *Subscription) { s.TopicMapping = map[string]string{"sensors/a": ""} },
+			wantErr: true,
+		},
 		{
 			name:    "path_traversal_cert",
 			modify:  func(s *Subscription) { s.TLSCertPath = "../etc/passwd" },
@@ -268,5 +305,33 @@ func TestValidateBrokerURL(t *testing.T) {
 				t.Errorf("validateBrokerURL(%q) error = %v, wantErr %v", tt.url, err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// TestValidateCreateRequest_TopicMappingValidated (regression, #300): the
+// create-request validator used to build its temporary Subscription without
+// the topic mapping, so a create request could carry a mapping target the
+// update path would refuse.
+func TestValidateCreateRequest_TopicMappingValidated(t *testing.T) {
+	base := func() *CreateSubscriptionRequest {
+		return &CreateSubscriptionRequest{
+			Name:     "test-sub",
+			Broker:   "tcp://localhost:1883",
+			ClientID: "test-client",
+			Topics:   []string{"sensors/#"},
+			Database: "iot",
+		}
+	}
+	good := base()
+	good.TopicMapping = map[string]string{"sensors/a": "iot-a"}
+	if err := ValidateCreateRequest(good); err != nil {
+		t.Fatalf("valid mapping rejected: %v", err)
+	}
+	for _, bad := range []string{"../other-db", "a/b", "/etc/passwd", "", "1iot", "a\\b"} {
+		req := base()
+		req.TopicMapping = map[string]string{"sensors/a": bad}
+		if err := ValidateCreateRequest(req); err == nil {
+			t.Errorf("create request with topic_mapping target %q was accepted", bad)
+		}
 	}
 }
