@@ -344,6 +344,18 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Arrow IPC queries were invisible to query management and slow-query logging ([#309](https://github.com/Basekick-Labs/arc/issues/309))
+
+**Affects `POST /api/v1/query/arrow` on deployments with `query_management.enabled = true` or `query.slow_query_threshold_ms > 0`.**
+
+The Arrow endpoint had caught up with the JSON endpoint on RBAC, query governance, the row-cap trailer and the cluster catch-up gate, but not on the query registry or slow-query logging. An Arrow query never appeared in `GET /api/v1/queries/active` or `/history`, could not be cancelled through `DELETE /api/v1/queries/:id`, carried no `X-Arc-Query-ID` header, and never counted as slow no matter how long it ran.
+
+The Arrow endpoint now registers every query, returns `X-Arc-Query-ID`, derives its execution context from the registry so a cancel reaches DuckDB, and records the same dispositions as the JSON endpoint: completed with the row count, failed with the sanitized cause, timed out, or cancelled, with the governance row cap noted in history. Because DuckDB materializes an Arrow result before streaming, a cancel that lands during execution ends the request with `500 Query cancelled`; only a cancel during the short streaming phase ends it as a truncated Arrow stream with the truncation trailer. `query.slow_query_threshold_ms` now covers Arrow queries and moves `arc_slow_queries_total`, and a deadline that fires mid-stream now counts in `arc_query_timeouts_total`, which only the pre-stream timeout did before.
+
+Giving the Arrow endpoint the same dispositions exposed an ordering bug on the JSON endpoint: its error branches released the timeout context before reading the cause, which turned every plain execution failure into `context canceled` and filed it as "already cancelled", leaving the registry entry listed as running forever. Both JSON branches now read the cause first.
+
+Two things did not change: a client that hangs up during execution does not stop DuckDB on either endpoint (the registry cancel and the timeout are the levers), and an Arrow query against a measurement with no files still returns `500` and lands in history as failed, where the JSON endpoint returns an empty result.
+
 ### MQTT ingest accepted database and measurement names that are not valid storage segments ([#300](https://github.com/Basekick-Labs/arc/issues/300))
 
 **Affects `mqtt.enabled = true` deployments.**

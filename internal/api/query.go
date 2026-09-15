@@ -1726,14 +1726,20 @@ localProcessing:
 			parallelInfo.ReadParquetOptions,
 		)
 		if err != nil {
+			// Read the cause before releasing the timeout context: cancelTimeout
+			// turns execCtx.Err() into Canceled for every failure, which filed a
+			// plain execution error as "already cancelled" and left the registry
+			// entry running forever (#309, found while giving the Arrow path the
+			// same dispositions).
+			ctxErr := execCtx.Err()
 			if cancelTimeout != nil {
 				cancelTimeout()
 			}
 			m.IncQueryErrors()
 			if h.queryRegistry != nil && queryID != "" {
-				if execCtx.Err() == context.DeadlineExceeded {
+				if ctxErr == context.DeadlineExceeded {
 					h.queryRegistry.TimedOut(queryID)
-				} else if execCtx.Err() == context.Canceled {
+				} else if ctxErr == context.Canceled {
 					// Already marked as cancelled by Cancel() — no-op
 				} else {
 					h.queryRegistry.Fail(queryID, "Parallel query execution failed")
@@ -2047,6 +2053,9 @@ localProcessing:
 		}
 
 		if err != nil {
+			// Same ordering fix as the parallel path above: the cause must be read
+			// before cancel() turns it into Canceled.
+			ctxErr := ctx.Err()
 			if cancel != nil {
 				cancel()
 			}
@@ -2071,7 +2080,7 @@ localProcessing:
 
 			m.IncQueryErrors()
 			// Check if it was a timeout
-			if effectiveTimeout > 0 && ctx.Err() == context.DeadlineExceeded {
+			if effectiveTimeout > 0 && ctxErr == context.DeadlineExceeded {
 				m.IncQueryTimeouts()
 				if h.queryRegistry != nil && queryID != "" {
 					h.queryRegistry.TimedOut(queryID)
@@ -2085,7 +2094,7 @@ localProcessing:
 				})
 			}
 			if h.queryRegistry != nil && queryID != "" {
-				if ctx.Err() == context.Canceled {
+				if ctxErr == context.Canceled {
 					// Already marked as cancelled by Cancel() — no-op
 				} else {
 					h.queryRegistry.Fail(queryID, "Query execution failed")
