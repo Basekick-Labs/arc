@@ -140,27 +140,24 @@ func skipQuotedIdent(sql string, i int) int {
 
 // scanDollarQuote matches $tag$...$tag$ starting at i (sql[i] == '$'). Returns
 // (index past the closing delimiter, tag length, true) on a match.
+// It shares dollarQuoteTag with the masker so the two entry points cannot
+// disagree about what opens a dollar quote; they used to, on a digit-leading
+// tag and on a `$` that continues an identifier.
 func scanDollarQuote(sql string, i int) (int, int, bool) {
-	n := len(sql)
-	j := i + 1
-	for j < n && identChar(sql[j]) {
-		j++
-	}
-	if j >= n || sql[j] != '$' {
+	tag, ok := dollarQuoteTag(sql, i)
+	if !ok {
 		return 0, 0, false
 	}
-	delim := sql[i : j+1] // "$tag$" (or "$$")
-	body := j + 1
+	delim := "$" + tag + "$"
+	body := i + len(delim)
 	end := strings.Index(sql[body:], delim)
 	if end < 0 {
-		return n, len(delim) - 2, true // unterminated: consume the rest
+		return len(sql), len(tag), true // unterminated: consume the rest
 	}
-	return body + end + len(delim), len(delim) - 2, true
+	return body + end + len(delim), len(tag), true
 }
 
-func identChar(c byte) bool {
-	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
-}
+func identChar(c byte) bool { return isIdentifierByte(c) }
 
 // prevByte is shared with mask.go.
 

@@ -11,9 +11,10 @@ func TestForLogMasksLiterals(t *testing.T) {
 			`SELECT v FROM cpu WHERE host = '...'`},
 		// Doubled-quote escape stays inside ONE literal.
 		{`WHERE note = 'It''s secret'`, `WHERE note = '...'`},
-		// THE BACKSLASH CASE (the shared masker's leak): backslash is a literal
-		// char in standard strings, so the first literal ends at the next quote
-		// and the second literal's content must NOT surface.
+		// THE BACKSLASH CASE: backslash is a literal char in standard strings,
+		// so the first literal ends at the next quote and the second literal's
+		// content must NOT surface. This scanner always got that right; the
+		// masker did not, until it was moved onto these same scanners.
 		{`WHERE a = 'x\' AND password = 'secret123'`,
 			`WHERE a = '...' AND password = '...'`},
 		// E-strings DO honor backslash: \' stays inside.

@@ -931,10 +931,11 @@ func (h *QueryHandler) logSlowQuery(sql string, start time.Time, rowCount int, t
 		return
 	}
 	metrics.Get().IncSlowQueries()
-	// ForLog (DuckDB-exact literal scanner) supersedes the older
-	// MaskStringLiterals here: the round-trip masker treats backslash as an
-	// escape in plain strings, which DuckDB does not — a value ending in `\`
-	// would shift literal boundaries and log the NEXT literal in the clear.
+	// ForLog is used rather than the round-trip masker because the two want
+	// different output: this one keeps the statement's shape and drops the
+	// values, while the masker produces placeholders it can substitute back.
+	// Both follow DuckDB's literal rules and share the scanners that implement
+	// them.
 	h.logger.Warn().
 		Str("sql", sqlutil.ForLog(sql)).
 		Float64("execution_time_ms", float64(elapsed.Milliseconds())).
@@ -2578,31 +2579,58 @@ func fromClauseTerminator(word string) bool {
 }
 
 // ioDenylistNormalise produces the form of the SQL the I/O-function denylist is
-// matched against. Unlike the general ValidateSQLRequest normalisation, it
-// strips identifier quoting (`"` and backtick) BEFORE masking so that a
-// quoted-identifier function call — `"parquet_scan"(...)`, “ `read_parquet`(...) “,
-// which DuckDB executes identically to the unquoted form — is exposed to the
-// regex rather than hidden inside a masked string. Single-quoted string literals
-// are still masked (so a literal value such as 'read_csv failed' is not matched)
-// and comments are stripped (so a name interleaved with a comment cannot hide).
+// matched against. A quoted-identifier function call — `"parquet_scan"(...)`,
+// which DuckDB executes identically to the unquoted form — has to reach the
+// regex as a bareword rather than sit hidden inside a placeholder, while
+// single-quoted values (a literal such as 'read_csv failed') stay masked and
+// comments are stripped, so a name interleaved with one cannot hide.
 //
-// Stripping `"`/backtick can only ever expose an identifier (DuckDB uses `'`
-// for strings and `"`/backtick for identifiers), never the body of a string
-// literal, so this cannot unmask a genuine string. In the pathological case of
-// a `'` inside a `"..."` identifier the subsequent literal-masking may mis-pair
-// quotes. For the I/O-function DENYLIST consumer that errs toward showing MORE
-// text (fail-closed), never less. NOTE: this output is ALSO consumed by
-// stringLiteralInTablePosition (the replacement-scan check), for which the same
-// mis-pairing can instead hide a placeholder from table-position detection
-// (fail-OPEN for that consumer). That is not exploitable: a `'` inside a
-// `"..."` identifier means the attacker's own SQL is mis-quoted, so DuckDB does
-// not parse the intended replacement scan either — no foreign read results.
+// SECURITY: the identifier quotes are removed AFTER masking, by resolving the
+// identifier placeholders the masker hands back. Removing them first, as this
+// did before, promoted a `'` living inside a `"..."` identifier into a literal
+// opener, and the masker then paired it with the next quote in the statement —
+// swallowing a genuine call. The old note here reasoned that could not matter
+// because the attacker's own SQL would be mis-quoted too; it does, because
+// DuckDB reads the quoted identifier as a name and parses the rest normally.
+// Only names that are already legal bare identifiers are substituted back:
+// anything else is not a name DuckDB resolves from a bareword, and splicing it
+// in would put a quote back into the text the gates scan.
 func ioDenylistNormalise(sql string) string {
-	stripped := strings.NewReplacer(`"`, "", "`", "").Replace(sql)
-	features := scanSQLFeatures(stripped)
-	masked, _ := sqlutil.MaskStringLiterals(stripped, features.hasQuotes)
+	features := scanSQLFeatures(sql)
+	masked, masks := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
+	for placeholder, name := range sqlutil.IdentifierNames(masks) {
+		if isBareIdentifier(name) {
+			masked = strings.ReplaceAll(masked, placeholder, name)
+		}
+	}
+	// Backticks are DuckDB's other identifier quote and the masker does not
+	// treat them as one, so they are dropped here; a backtick inside a string
+	// literal is already behind a placeholder and is not touched.
+	masked = strings.ReplaceAll(masked, "`", "")
 	masked = stripSQLComments(masked, features.hasDashComment || features.hasBlockComment)
 	return masked
+}
+
+// isBareIdentifier reports whether name could have been written without quotes,
+// which is the only case where exposing it as a bareword matches what DuckDB
+// would resolve.
+func isBareIdentifier(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == '_':
+		case c >= '0' && c <= '9':
+			if i == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // ioTableFunctionPattern matches a call to any DuckDB function that reads from

@@ -17,14 +17,14 @@ func TestMaskStringLiterals_LiteralBoundariesFollowDuckDB(t *testing.T) {
 		masks  int
 	}{
 		{
-			// The trailing lone quote is unterminated, so it masks to end of
-			// input (fail closed). What matters is that the table-position
-			// literal in the middle is its own placeholder and no longer
-			// hidden inside the first one.
+			// The trailing quote sits in a comment, which is copied through
+			// whole, so it opens nothing. What matters is that the
+			// table-position literal in the middle is its own placeholder and
+			// no longer hidden inside the first one.
 			name:   "plain literal ending in a backslash ends at its own quote",
 			sql:    `WHERE host = '\' UNION ALL SELECT * FROM '/other/x.parquet' -- '`,
-			masked: `WHERE host = __STR_0__ UNION ALL SELECT * FROM __STR_1__ -- __STR_2__`,
-			masks:  3,
+			masked: `WHERE host = __STR_0__ UNION ALL SELECT * FROM __STR_1__ -- '`,
+			masks:  2,
 		},
 		{
 			name:   "windows path value does not shift the next literal",
@@ -61,6 +61,43 @@ func TestMaskStringLiterals_LiteralBoundariesFollowDuckDB(t *testing.T) {
 			sql:    `WHERE note = $$a\$$ AND x = 1`,
 			masked: `WHERE note = __STR_0__ AND x = 1`,
 			masks:  1,
+		},
+		{
+			// A quote inside a comment used to open a literal that ran to the
+			// next quote, swallowing the newline the comment stripper needs to
+			// find the comment's end; the stripper then deleted everything to
+			// the end of the statement and the gates saw none of it.
+			name:   "a quote in a line comment opens nothing",
+			sql:    "SELECT 0 -- '\nUNION ALL SELECT * FROM read_parquet('/other/x.parquet')",
+			masked: "SELECT 0 -- '\nUNION ALL SELECT * FROM read_parquet(__STR_0__)",
+			masks:  1,
+		},
+		{
+			name:   "a quote in a block comment opens nothing",
+			sql:    `SELECT 0 /* ' */ UNION ALL SELECT * FROM read_parquet('/other/x.parquet')`,
+			masked: `SELECT 0 /* ' */ UNION ALL SELECT * FROM read_parquet(__STR_0__)`,
+			masks:  1,
+		},
+		{
+			// DuckDB accepts `$` inside an unquoted identifier, so `t$$$` is one
+			// name. Reading its second and third `$` as a dollar-quote opener
+			// found no closing tag and masked the rest of the statement away.
+			name:   "a dollar run continuing an identifier opens nothing",
+			sql:    `SELECT * FROM cpu AS t$$$ UNION ALL SELECT * FROM read_parquet('/other/x.parquet')`,
+			masked: `SELECT * FROM cpu AS t$$$ UNION ALL SELECT * FROM read_parquet(__STR_0__)`,
+			masks:  1,
+		},
+		{
+			name:   "a real dollar-quoted literal is still masked",
+			sql:    `SELECT * FROM cpu WHERE note = $tag$body$tag$ AND x = 1`,
+			masked: `SELECT * FROM cpu WHERE note = __STR_0__ AND x = 1`,
+			masks:  1,
+		},
+		{
+			name:   "a quote inside a quoted identifier stays inside it",
+			sql:    `SELECT 1 AS "a'b", read_parquet('/other/x.parquet')`,
+			masked: `SELECT 1 AS __IDENT_0__, read_parquet(__STR_1__)`,
+			masks:  2,
 		},
 	}
 	for _, tc := range cases {
