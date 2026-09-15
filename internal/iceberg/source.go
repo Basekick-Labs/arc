@@ -37,7 +37,10 @@ type StorageWalkSource struct {
 	backend  storage.Backend
 	resolver *PathResolver
 	nsPrefix string // Iceberg namespace prefix; warehouse dirs "<nsPrefix>_*.db" are excluded
-	logger   zerolog.Logger
+	// pendingOutputs, when set, names compaction outputs whose sources still
+	// exist; they are excluded from the file set (#638).
+	pendingOutputs func(ctx context.Context, prefix string) (map[string]struct{}, error)
+	logger         zerolog.Logger
 
 	// namespaceExpander, when set, returns the top-level directories that are
 	// edge-sync spoke namespaces rather than databases (#634). A hub stores
@@ -46,6 +49,16 @@ type StorageWalkSource struct {
 	// (database, measurement) and unions every measurement under it into a
 	// single franken-table. Mirrors the compaction manager's expander (#619).
 	namespaceExpander func(ctx context.Context) (map[string]struct{}, error)
+}
+
+// SetPendingOutputs installs the lookup for compaction outputs that are not
+// yet committed under a "{database}/{measurement}/" prefix (see
+// compaction.ManifestManager.PendingOutputsUnder). Those keys are left out of
+// the file set so a reconcile pass that lands between a compaction's upload
+// and its source deletion does not register the compacted file next to the
+// raws it replaces (#638). nil means no compaction state to consult.
+func (s *StorageWalkSource) SetPendingOutputs(fn func(ctx context.Context, prefix string) (map[string]struct{}, error)) {
+	s.pendingOutputs = fn
 }
 
 // SetNamespaceExpander installs edge-sync spoke-namespace expansion (#634).
@@ -102,8 +115,8 @@ func (s *StorageWalkSource) Measurements(ctx context.Context) ([]Measurement, er
 	var out []Measurement
 	for _, db := range dbs {
 		db = strings.Trim(db, "/")
-		if db == "" || s.isWarehouseDir(db) {
-			continue // skip empty + the exporter's own warehouse namespace dirs
+		if db == "" || s.isWarehouseDir(db) || db == compactionStateDir {
+			continue // skip empty, the exporter's own warehouse namespace dirs, and compaction's state dir
 		}
 		measurements, err := dl.ListDirectories(ctx, db+"/")
 		if err != nil {
@@ -238,10 +251,30 @@ func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([
 	if err != nil {
 		return nil, nil, fmt.Errorf("list files for %s/%s: %w", m.Database, m.Measurement, err)
 	}
+	// Read the compaction state AFTER the listing and BEFORE the stat loop.
+	// The order is what makes this race-free: a compaction deletes its
+	// manifest only after every source file is gone, so a manifest absent here
+	// means the sources were deleted before the stats below, which drop them;
+	// a manifest present here means its output is excluded. Reading before the
+	// listing would miss an upload that lands in between; reading after the
+	// stats would let a compaction that finishes in between leave both the
+	// (already registered) raws and its output in the set (#638).
+	var pending map[string]struct{}
+	if s.pendingOutputs != nil {
+		pending, err = s.pendingOutputs(ctx, prefix)
+		if err != nil {
+			return nil, nil, fmt.Errorf("pending compaction outputs for %s/%s: %w", m.Database, m.Measurement, err)
+		}
+	}
 	var files []FileRef
 	var local []string
+	excluded := 0
 	for _, p := range paths {
 		if !isDataFile(p) {
+			continue
+		}
+		if _, skip := pending[filepath.ToSlash(p)]; skip {
+			excluded++
 			continue
 		}
 		uri, err := s.resolver.Resolve(p)
@@ -268,6 +301,10 @@ func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([
 		if lp != "" {
 			local = append(local, lp)
 		}
+	}
+	if excluded > 0 {
+		s.logger.Debug().Str("database", m.Database).Str("measurement", m.Measurement).Int("excluded", excluded).
+			Msg("Iceberg reconcile: compaction outputs still replacing their sources are left out of this pass")
 	}
 	return files, local, nil
 }
@@ -301,6 +338,11 @@ func (s *StorageWalkSource) statSize(ctx context.Context, key, localPath string)
 	}
 	return size, true, nil
 }
+
+// compactionStateDir is compaction.ManifestBasePath, spelled here so this
+// package does not import internal/compaction: it is a top-level directory of
+// the storage root that holds crash-recovery manifests, not a database.
+const compactionStateDir = "_compaction_state"
 
 // isDataFile reports whether a storage key is an Arc data file to export. Only .parquet is
 // exported; vortex is a separate (shelved) format and Iceberg's data files are Parquet.

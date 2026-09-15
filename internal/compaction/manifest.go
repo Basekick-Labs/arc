@@ -73,6 +73,11 @@ type ManifestManager struct {
 	manifestCacheMu   sync.RWMutex
 	manifestCacheTime time.Time
 	cacheTTL          time.Duration
+
+	// unparseableLogged records manifest paths PendingOutputsUnder already
+	// reported as unparseable, so a lingering bad file logs once, not once per
+	// measurement per reconcile pass.
+	unparseableLogged sync.Map
 }
 
 // NewManifestManager creates a new manifest manager
@@ -597,4 +602,79 @@ func (m *ManifestManager) IsFileInManifest(ctx context.Context, filePath string)
 	}
 	_, exists := files[filePath]
 	return exists, nil
+}
+
+// PendingOutputsUnder returns the storage keys of compaction outputs that are
+// not yet committed and lie under prefix (a "{database}/{measurement}/" storage
+// prefix): every manifest under _compaction_state/ whose OutputPath starts with
+// the prefix and at least one of whose InputFiles still exists.
+//
+// The Iceberg exporter (#638) uses it to keep a compacted file out of the
+// exported table until the compaction has replaced its sources: the job
+// uploads the output before it deletes the inputs, and a pass listing the
+// partition in between would otherwise register both, doubling the rows for
+// external readers. An output whose inputs are all gone is committed for the
+// exporter's purposes even if the manifest lingers (deletion failed, or the
+// hub has not marked its receipts yet), so it is not excluded — otherwise a
+// bookkeeping failure would turn into an export outage.
+//
+// Fresh listing and reads every call, never manifestCache: manifests are
+// written and deleted by the compaction subprocess's own ManifestManager, so
+// the parent's cache can be 30 s stale, and staleness here is exactly the
+// window this exists to close. A manifest listed but gone by the time it is
+// read was deleted by a compaction that just committed; that is the normal
+// case and is treated as absent. A storage read failure is returned, so the
+// caller fails closed on a transient outage. A manifest that reads but does
+// not parse (a zero-length file left by a crash before the rename was
+// durable) is skipped and reported once per path: recovery treats such a
+// manifest as carrying no information and deletes it, and failing every
+// measurement on every pass until then — or forever, when compaction is
+// disabled and recovery never runs — would be an outage over a file that
+// names nothing.
+//
+// Keys are compared in slash form: OutputPath is written with filepath.Join,
+// the listing the exporter compares against is ToSlash'ed.
+func (m *ManifestManager) PendingOutputsUnder(ctx context.Context, prefix string) (map[string]struct{}, error) {
+	manifests, err := m.ListManifests(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]struct{})
+	for _, path := range manifests {
+		data, err := m.backend.Read(ctx, path)
+		if err != nil {
+			exists, existsErr := m.backend.Exists(ctx, path)
+			if existsErr == nil && !exists {
+				continue // deleted between the listing and the read: committed
+			}
+			return nil, fmt.Errorf("read compaction manifest %s: %w", path, err)
+		}
+		var manifest Manifest
+		if err := json.Unmarshal(data, &manifest); err != nil {
+			if _, seen := m.unparseableLogged.LoadOrStore(path, struct{}{}); !seen {
+				m.logger.Error().Err(err).Str("manifest", path).
+					Msg("Compaction manifest cannot be parsed; the Iceberg export ignores it (compaction's next recovery cycle deletes it — delete it by hand if compaction is disabled)")
+			}
+			continue
+		}
+		output := filepath.ToSlash(manifest.OutputPath)
+		if !strings.HasPrefix(output, prefix) {
+			continue
+		}
+		pending := false
+		for _, input := range manifest.InputFiles {
+			exists, err := m.backend.Exists(ctx, filepath.ToSlash(input))
+			if err != nil {
+				return nil, fmt.Errorf("check compaction input %s: %w", input, err)
+			}
+			if exists {
+				pending = true
+				break
+			}
+		}
+		if pending {
+			out[output] = struct{}{}
+		}
+	}
+	return out, nil
 }

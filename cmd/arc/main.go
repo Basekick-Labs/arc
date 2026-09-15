@@ -3233,6 +3233,13 @@ func main() {
 		// #639 item 3: database deletion clears the Iceberg catalog too.
 		databasesHandler.SetIcebergDropper(exporter)
 		icebergSource := iceberg.NewStorageWalkSource(storageBackend, cfg.Iceberg.NamespacePrefix, logger.Get("iceberg"))
+		// A compacted file is exported only once its compaction has replaced
+		// the sources; until then the crash-recovery manifest names it (#638).
+		// Read through a manager of its own rather than the compaction
+		// manager's: compaction may be disabled while a manifest from an
+		// earlier run still sits in storage, and the reads must be fresh.
+		icebergSource.SetPendingOutputs(compaction.NewManifestManager(storageBackend, logger.Get("compaction")).PendingOutputsUnder)
+		log.Info().Msg("Iceberg export leaves in-flight compaction outputs out of the table until their sources are deleted")
 		// On an edge-sync hub, received data lives one level deeper
 		// ({spoke}/{db}/{meas}/…), so the walk must expand spoke namespaces or
 		// it exports {spoke}/{db} as a single table unioning every measurement
