@@ -23,9 +23,10 @@ type Manifest struct {
 	// in SkippedMetadataFiles. (Backups written before that split folded both
 	// into this field.)
 	SkippedFiles int64 `json:"skipped_files,omitempty"`
-	// SkippedMetadataFiles counts Iceberg warehouse metadata files that were
-	// listed but could not be read at copy time. They are copied under data/
-	// but are not part of TotalFiles.
+	// SkippedMetadataFiles counts Iceberg warehouse metadata files under the
+	// storage root that were listed but could not be read at copy time. They
+	// are copied under data/ but are not part of TotalFiles. Skips from an
+	// outside-root warehouse are in IcebergWarehouse.SkippedFiles.
 	SkippedMetadataFiles int64 `json:"skipped_metadata_files,omitempty"`
 	// UnaddressableFiles counts data files that exist in source storage but
 	// that no listing returns, because their key fails the storage key rules.
@@ -43,6 +44,27 @@ type Manifest struct {
 	// false the catalog either lives in the shared database or does not exist.
 	HasIcebergCatalog bool `json:"has_iceberg_catalog,omitempty"`
 	HasConfig         bool `json:"has_config"`
+	// IcebergWarehouse describes Iceberg table metadata copied from a
+	// warehouse that lives OUTSIDE the data storage root, stored under
+	// <backup_id>/iceberg/. Nil when Iceberg export is off or the warehouse is
+	// under the root, where its metadata travels with the data listing (#637).
+	IcebergWarehouse *IcebergWarehouseInfo `json:"iceberg_warehouse,omitempty"`
+}
+
+// IcebergWarehouseInfo records the outside-root Iceberg warehouse a backup
+// carries. ConfiguredPath is the source node's iceberg.warehouse as an
+// absolute path, which is the spelling the catalog's metadata locations use;
+// Path is that directory with symlinks resolved, which is what was walked. A
+// restore resolves the tables only when ConfiguredPath, evaluated on the
+// target node, lands in the directory the files are written to.
+type IcebergWarehouseInfo struct {
+	Path           string `json:"path"`
+	ConfiguredPath string `json:"configured_path,omitempty"`
+	FileCount      int64  `json:"file_count"`
+	SizeBytes      int64  `json:"size_bytes"`
+	// SkippedFiles counts warehouse files that were walked but could not be
+	// read at copy time. They are not included in SkippedMetadataFiles.
+	SkippedFiles int64 `json:"skipped_files,omitempty"`
 }
 
 // DatabaseInfo describes a single database within a backup.
@@ -97,13 +119,17 @@ type Progress struct {
 	// backup's own manifest: files it already lacked when it was taken, so the
 	// operator can tell a gap that predates the restore from one it caused.
 	// Restore only.
-	BackupSkippedFiles       int64      `json:"backup_skipped_files,omitempty"`
-	BackupUnaddressableFiles int64      `json:"backup_unaddressable_files,omitempty"`
-	TotalBytes               int64      `json:"total_bytes"`
-	ProcessedBytes           int64      `json:"processed_bytes"`
-	StartedAt                time.Time  `json:"started_at"`
-	CompletedAt              *time.Time `json:"completed_at,omitempty"`
-	Error                    string     `json:"error,omitempty"`
+	BackupSkippedFiles int64 `json:"backup_skipped_files,omitempty"`
+	// IcebergWarehouseFilesSkipped counts backup objects under iceberg/ that a
+	// restore left out because this node has no Iceberg warehouse outside its
+	// storage root to put them in (the log names the fix).
+	IcebergWarehouseFilesSkipped int64      `json:"iceberg_warehouse_files_skipped,omitempty"`
+	BackupUnaddressableFiles     int64      `json:"backup_unaddressable_files,omitempty"`
+	TotalBytes                   int64      `json:"total_bytes"`
+	ProcessedBytes               int64      `json:"processed_bytes"`
+	StartedAt                    time.Time  `json:"started_at"`
+	CompletedAt                  *time.Time `json:"completed_at,omitempty"`
+	Error                        string     `json:"error,omitempty"`
 }
 
 // MarshalManifest serializes a manifest to JSON.

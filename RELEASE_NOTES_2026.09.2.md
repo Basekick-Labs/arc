@@ -344,6 +344,18 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Backups skipped an Iceberg warehouse outside the storage root, and a restore then wedged every reconcile pass ([#637](https://github.com/Basekick-Labs/arc/issues/637))
+
+**Affects `iceberg.enabled = true` deployments whose `iceberg.warehouse` points outside `storage.local_path`.**
+
+Backup found Iceberg table metadata only by filtering the data-storage listing, which cannot see a warehouse that lives elsewhere. The backup completed and reported success while carrying catalog rows whose metadata locations pointed at files it never copied. Restored on a fresh host, the reconciler loaded each catalog row, failed to open the missing metadata, fell through to creating the table, wrote a fresh metadata file into the warehouse and then hit the catalog's primary key. That repeated on every pass, forever, and left another orphan metadata file behind each time.
+
+Backup now walks an outside-root warehouse itself and stores its table metadata under `<backup_id>/iceberg/`, recorded in the manifest as `iceberg_warehouse` (source path, file count, bytes). The walk copies only Arc's own layout, `<namespace_prefix>_<db>.db/<table>/metadata/`, so a warehouse that happens to contain the storage root or the backup directory does not sweep other files in, and it walks the symlink-resolved directory so a symlinked warehouse is not silently backed up as empty. Restore writes those files back into this node's configured `iceberg.warehouse` whenever data or metadata is restored. The manifest also records the source's configured spelling (`configured_path`), and the restore warns when that spelling, evaluated on the target, does not land in the directory being written: the catalog stores absolute paths, so the target's `iceberg.warehouse` has to be the backup's path (a symlink from that path works). A node running Iceberg with no such warehouse fails the restore when it would otherwise stage a catalog that cannot load; a node with Iceberg off skips the files, counts them as `iceberg_warehouse_files_skipped` on the status endpoint, and completes.
+
+The SQLite snapshot is now taken before the Iceberg metadata is copied, so a reconcile commit that lands during a long backup no longer leaves a catalog row pointing at a file the backup does not hold; the remaining window is `iceberg.retain_snapshots + 1` commits on one table between the snapshot and the copy, which iceberg-go's delete-after-commit needs before it removes the snapshotted version. Restart promptly after a restore that includes Iceberg: the catalog is applied on the next start, and a reconciler still running against the old catalog can expire metadata the restore just wrote.
+
+The reconciler no longer falls through to table creation when a catalog row exists but cannot be loaded. A missing metadata file now fails that measurement's reconcile with an error that names the table, the cause, and the two ways out: restore the warehouse files, or delete the row from the `iceberg_tables` SQLite table so the table is recreated. Nothing is written to the warehouse in that state.
+
 ### Iceberg export kept serving deleted rows after a partial row-level delete ([#633](https://github.com/Basekick-Labs/arc/issues/633))
 
 **Affects `iceberg.enabled = true` deployments that use `POST /api/v1/delete`.**

@@ -26,6 +26,19 @@ type Manager struct {
 	// The catalog holds every Iceberg table's schema and snapshot pointers, so a
 	// backup without it restores data whose tables no longer resolve.
 	icebergCatalogDBPath string
+	// icebergWarehouse is the resolved local directory of an Iceberg warehouse
+	// that lies OUTSIDE the data storage root, or "" when there is none or it
+	// is under the root (where the data listing already covers it). See
+	// configureIcebergWarehouse.
+	icebergWarehouse string
+	// icebergWarehouseConfigured is the configured spelling (absolute, not
+	// symlink-resolved) of the same directory — the one the catalog's metadata
+	// locations are built from. icebergEnabled records that Iceberg export is
+	// on at all, so a restore can tell "no warehouse to write to" apart from
+	// "Iceberg is off here and the catalog rows are inert".
+	icebergWarehouseConfigured string
+	icebergEnabled             bool
+	icebergNSPrefix            string
 
 	logger zerolog.Logger
 	mu     sync.Mutex // serializes backup/restore operations
@@ -41,8 +54,16 @@ type ManagerConfig struct {
 	// equal to SQLiteDBPath, when the catalog lives in the shared database —
 	// it is then already covered by the shared-database backup.
 	IcebergCatalogDBPath string
-	ConfigPath           string
-	Logger               zerolog.Logger
+	// IcebergWarehousePath is the local directory of the Iceberg warehouse
+	// (iceberg.warehouse with its file:// scheme stripped) when Iceberg export
+	// is enabled; empty otherwise. The manager works out whether it needs its
+	// own copy pass (#637).
+	IcebergWarehousePath string
+	// IcebergNamespacePrefix is iceberg.namespace_prefix (default "arc"); the
+	// warehouse walk copies only <prefix>_*.db namespace directories.
+	IcebergNamespacePrefix string
+	ConfigPath             string
+	Logger                 zerolog.Logger
 }
 
 // NewManager creates a new backup manager.
@@ -67,14 +88,16 @@ func NewManager(cfg *ManagerConfig) (*Manager, error) {
 		icebergCatalog = ""
 	}
 
-	return &Manager{
+	m := &Manager{
 		dataStorage:          cfg.DataStorage,
 		backupStorage:        backupBackend,
 		sqliteDBPath:         cfg.SQLiteDBPath,
 		icebergCatalogDBPath: icebergCatalog,
 		configPath:           cfg.ConfigPath,
 		logger:               cfg.Logger.With().Str("component", "backup-manager").Logger(),
-	}, nil
+	}
+	m.configureIcebergWarehouse(cfg)
+	return m, nil
 }
 
 // sameFilePath reports whether two configured paths refer to the same file,

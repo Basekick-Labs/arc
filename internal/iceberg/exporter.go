@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
@@ -189,6 +190,9 @@ func (e *Exporter) tableExists(ctx context.Context, database, measurement string
 // Schema evolution (a measurement gaining a column) is handled by the reconciler re-deriving
 // the schema; EnsureTable here is create-or-load. Evolving an existing table's schema is a
 // follow-up (Iceberg supports UpdateSchema) — flagged in the plan, not in v1's create path.
+//
+// A catalog row that exists but cannot be loaded (its metadata file is missing or unreadable)
+// is an error, never a create: see the load gate below (#637).
 func (e *Exporter) EnsureTable(ctx context.Context, database, measurement string, sc ArcSchema) (*icetable.Table, error) {
 	ident := e.tableIdent(database, measurement)
 	ns := icetable.Identifier{ident[0]}
@@ -198,11 +202,24 @@ func (e *Exporter) EnsureTable(ctx context.Context, database, measurement string
 		return nil, fmt.Errorf("create namespace %v: %w", ns, err)
 	}
 
-	if tbl, err := e.catalog.LoadTable(ctx, ident); err == nil {
+	tbl, err := e.catalog.LoadTable(ctx, ident)
+	if err == nil {
 		// Table exists — evolve its schema to cover any new columns in `sc` (Arc's
 		// per-measurement schema can grow over time). Missing columns are added as optional,
 		// so older narrow files stay compatible. No-op when already a superset.
 		return e.evolveSchema(ctx, tbl, sc)
+	}
+	if !errors.Is(err, icecatalog.ErrNoSuchTable) {
+		// The catalog has a row for this table but the table cannot be loaded. Falling
+		// through to CreateTable used to write a fresh metadata file into the warehouse and
+		// then fail on the catalog's primary key — on every pass, forever, leaving another
+		// orphan file each time (#637: a backup restored without its outside-root warehouse).
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("iceberg table %v is in the catalog but its metadata file is missing: %w; "+
+				"if this node was restored from a backup, restore the Iceberg warehouse files too (iceberg.warehouse), "+
+				"otherwise delete the table's row from the iceberg_tables SQLite table and the reconciler recreates it", ident, err)
+		}
+		return nil, fmt.Errorf("iceberg table %v is in the catalog but cannot be loaded: %w", ident, err)
 	}
 
 	// Build the Iceberg schema with stable field IDs (1..N).
@@ -240,7 +257,7 @@ func (e *Exporter) EnsureTable(ctx context.Context, database, measurement string
 		}))
 	}
 
-	tbl, err := e.catalog.CreateTable(ctx, ident, schema, createOpts...)
+	tbl, err = e.catalog.CreateTable(ctx, ident, schema, createOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("create iceberg table %v: %w", ident, err)
 	}
