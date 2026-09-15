@@ -85,6 +85,12 @@ type Node struct {
 
 	mu      sync.RWMutex
 	running bool
+	// stopping is set for the window in which Stop has released mu to join
+	// the Raft instance (#813). Start refuses to rebuild over the open
+	// transport and stores while it is set; running stays true until the
+	// join has completed so every accessor keeps answering from the live,
+	// shutting-down instance.
+	stopping bool
 
 	logger zerolog.Logger
 }
@@ -130,7 +136,7 @@ func (n *Node) Start() error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	if n.running {
+	if n.running || n.stopping {
 		return fmt.Errorf("raft node already running")
 	}
 
@@ -304,17 +310,30 @@ func (n *Node) Start() error {
 // Stop stops the Raft node.
 func (n *Node) Stop() error {
 	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	if !n.running {
+	if !n.running || n.stopping {
+		n.mu.Unlock()
 		return nil
 	}
+	n.stopping = true
+	ra := n.raft
+	n.mu.Unlock()
 
-	// Shutdown Raft
-	future := n.raft.Shutdown()
-	if err := future.Error(); err != nil {
+	// Shut Raft down WITHOUT holding mu (#813). Shutdown().Error() joins the
+	// Raft goroutines, including the one applying entries to the FSM; an FSM
+	// callback (or anything else on those goroutines) that reads this node
+	// through an accessor takes mu, so holding it here deadlocked shutdown.
+	// The fields stay set: hashicorp flips the state to Shutdown before
+	// returning the future, so IsLeader/State answer from that state, Apply
+	// and Barrier fail with ErrRaftShutdown (or ErrLeadershipLost for an
+	// entry the leader loop had already accepted), configuration changes
+	// fail with ErrRaftShutdown, and configuration reads still answer from
+	// the in-memory configuration while the join is in progress.
+	if err := ra.Shutdown().Error(); err != nil {
 		n.logger.Error().Err(err).Msg("Error shutting down Raft")
 	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
 
 	// Close stores
 	if n.logStore != nil {
@@ -328,6 +347,7 @@ func (n *Node) Stop() error {
 	}
 
 	n.running = false
+	n.stopping = false
 
 	n.logger.Info().Msg("Raft node stopped")
 	return nil
