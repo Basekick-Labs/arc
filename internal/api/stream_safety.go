@@ -30,16 +30,15 @@ import (
 // in flight: a second panic here would either kill the process or, being the
 // most recent value, replace the root cause in the log.
 //
-
 // Every body stream in this package goes through this wrapper, whether it is
 // installed with SetBodyStreamWriter directly or through
 // setBodyStreamWithTrailers (#729). CI greps for both, plus the underlying
 // NewStreamReader, and fails on any that does not mention safeStream.
 //
-// One exception, deliberate and excluded from that grep: the three writers in
-// arcx_hook.go. They build only under the arcx_engine tag, which no CI or
-// release build uses, so they cannot be compile-checked here. They are
-// genuinely unwrapped, and tracked separately.
+// That includes the three writers in arcx_hook.go (#717). They build only
+// under the arcx_engine tag, which no CI or release build uses, so the grep is
+// the only automated check they get; they are compile-checked by hand against
+// the arcx library before changes there merge.
 func (h *QueryHandler) safeStream(stream string, onPanic func(), sw func(*bufio.Writer)) func(*bufio.Writer) {
 	return func(w *bufio.Writer) {
 		defer func() {

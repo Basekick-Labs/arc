@@ -127,7 +127,13 @@ func (h *QueryHandler) tryArcxRouterArrow(c *fiber.Ctx, execCtx context.Context,
 	// Capture the fasthttp RequestCtx before the async callback; the pooled Fiber
 	// *Ctx is recycled after this handler returns (the UAF trap).
 	fctx := c.Context()
-	fctx.SetBodyStreamWriter(func(w *bufio.Writer) {
+	// safeStream: fasthttp runs this on a bare goroutine, so an unrecovered
+	// panic (an FFI reader fault, an encoder bug) would take the process down
+	// rather than fail the request (#717). The resources are released by the
+	// deferred block below, which runs on the way out of a panic too. No
+	// registry disposition is needed: the Arrow endpoint registers the query
+	// only after this hook declines (query_arrow.go), so nothing is listed.
+	fctx.SetBodyStreamWriter(h.safeStream("arcx_serve_arrow_ipc", nil, func(w *bufio.Writer) {
 		// The async writer OWNS cancel — it runs AFTER the handler returns, so the caller must
 		// NOT cancel eagerly (that would cancel execCtx while we're still streaming → the
 		// select below breaks immediately → schema-only + spurious "cancel mid-stream").
@@ -194,7 +200,7 @@ func (h *QueryHandler) tryArcxRouterArrow(c *fiber.Ctx, execCtx context.Context,
 			m.IncQueryRows(int64(rows))
 			m.RecordQueryLatency(time.Since(start).Microseconds())
 		}
-	})
+	}))
 	return true
 }
 
@@ -273,7 +279,13 @@ func (h *QueryHandler) serveArcxResult(
 			return true // we produced the (error) response
 		}
 		c.Set(fiber.HeaderContentType, msgpackContentType)
-		c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
+		c.Context().SetBodyStreamWriter(h.safeStream("arcx_serve_msgpack", func() {
+			// A panic skips the dispositions below, leaving the query
+			// registered as running forever (#717).
+			if onFail != nil {
+				onFail("stream writer panicked")
+			}
+		}, func(w *bufio.Writer) {
 			defer func() {
 				for _, b := range batches {
 					b.Release()
@@ -301,7 +313,7 @@ func (h *QueryHandler) serveArcxResult(
 			}
 			h.logGovernanceRowCap("msgpack", convertedSQL, tokenID, tokenName, governanceMaxRows, int64(rowCount))
 			h.logSlowQuery(convertedSQL, start, rowCount, tokenName)
-		})
+		}))
 		return true
 	}
 
@@ -310,7 +322,13 @@ func (h *QueryHandler) serveArcxResult(
 	// the row count; we check reader.Err() after it to catch a mid-stream engine error
 	// (else a truncated result serves as success — gotcha #4).
 	c.Set("Content-Type", "application/json")
-	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
+	c.Context().SetBodyStreamWriter(h.safeStream("arcx_serve_json", func() {
+		// A panic skips the dispositions below, leaving the query registered
+		// as running forever (#717).
+		if onFail != nil {
+			onFail("stream writer panicked")
+		}
+	}, func(w *bufio.Writer) {
 		defer func() {
 			if cancel != nil {
 				cancel()
@@ -362,7 +380,7 @@ func (h *QueryHandler) serveArcxResult(
 			h.logSlowQuery(convertedSQL, start, rc, tokenName)
 		}
 		w.Flush()
-	})
+	}))
 	return true
 }
 
