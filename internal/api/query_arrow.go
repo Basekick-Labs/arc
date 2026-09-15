@@ -536,20 +536,28 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		Str("header_db", headerDB).
 		Msg("Executing Arrow query")
 
-	// Create context with timeout if configured
-	// Use context.Background() instead of c.UserContext() because SetBodyStreamWriter
-	// runs asynchronously after the handler returns, and c.UserContext() would be cancelled
-	// Note: We don't use defer cancel() here because the streaming callback runs after
-	// this handler returns - cancel is called inside the callback after rows are consumed
+	// Captured here, before the stream writer commits: the pooled fiber.Ctx is
+	// recycled by the time the stream closure runs, so reading the token out of
+	// it there would be a use-after-free. The registry entry below needs them too.
+	tokenName := getTokenName(c)
+	tokenID := getTokenID(c)
+
 	// A governance policy's MaxDuration overrides the global timeout (#702).
 	effectiveTimeout := h.queryTimeout
 	if governanceTimeout > 0 {
 		effectiveTimeout = governanceTimeout
 	}
-	ctx := context.Background()
-	var cancel context.CancelFunc
+	// The arcx hook gets its own context: its serve path (built into no shipped
+	// binary) streams asynchronously and owns that cancel. When the hook
+	// declines, the pair is released and the real execution context is built
+	// below, after the query is registered, so that DELETE /api/v1/queries/:id
+	// cancels the DuckDB read the same way it does for POST /api/v1/query (#309).
+	// No defer cancel(): the streaming callback runs after this handler returns
+	// and calls cancel itself once the rows are consumed.
+	hookCtx := context.Background()
+	var hookCancel context.CancelFunc
 	if effectiveTimeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, effectiveTimeout)
+		hookCtx, hookCancel = context.WithTimeout(hookCtx, effectiveTimeout)
 	}
 
 	// arcx router hook (Arrow-IPC variant). In serve mode a green shape is
@@ -564,26 +572,78 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// (via ctx) apply to an arcx-served response, but the MaxRows cap is
 	// enforced only by the DuckDB IPC loop below — the experimental arcx
 	// serve path streams uncapped until it learns to take a row cap.
-	if h.tryArcxRouterArrow(c, ctx, cancel, req.SQL, headerDB, convertedSQL) {
+	if h.tryArcxRouterArrow(c, hookCtx, hookCancel, req.SQL, headerDB, convertedSQL) {
 		return nil
+	}
+	if hookCancel != nil {
+		hookCancel()
+	}
+
+	// Register with the query registry, as executeQuery does, so the query is
+	// listed by GET /api/v1/queries/active and can be cancelled. The parent is
+	// c.UserContext() for parity with the JSON path only: nothing in Arc sets a
+	// user context, so it is context.Background() and fasthttp never cancels it
+	// on a client hangup — during execution the registry cancel and the timeout
+	// are the only levers that stop DuckDB. The header is set now because no
+	// header may be written once the stream writer is installed (#729).
+	var queryID string
+	baseCtx := context.Background()
+	if h.queryRegistry != nil {
+		var queryCtx context.Context
+		queryID, queryCtx = h.queryRegistry.Register(c.UserContext(), req.SQL, tokenID, tokenName, c.IP(), false, 0)
+		c.Set("X-Arc-Query-ID", queryID)
+		baseCtx = queryCtx
+	}
+	ctx := baseCtx
+	var cancel context.CancelFunc
+	switch {
+	case effectiveTimeout > 0:
+		ctx, cancel = context.WithTimeout(baseCtx, effectiveTimeout)
+	case queryID != "":
+		// No timeout, but a registry cancel must still propagate and the
+		// release helper expects a cancel to call.
+		ctx, cancel = context.WithCancel(baseCtx)
 	}
 
 	// Execute query using DuckDB's native Arrow API — returns record batches
 	// directly from DuckDB's internal columnar chunks, no row-by-row scanning.
 	reader, conn, err := h.db.ArrowQueryContext(ctx, convertedSQL)
 	if err != nil {
+		// Read the cause before releasing the context: cancel() below turns
+		// ctx.Err() into Canceled for every failure, which would misfile a
+		// plain execution error as an operator cancel.
+		ctxErr := ctx.Err()
 		if cancel != nil {
 			cancel()
 		}
-		if effectiveTimeout > 0 && ctx.Err() == context.DeadlineExceeded {
+		if effectiveTimeout > 0 && ctxErr == context.DeadlineExceeded {
 			m.IncQueryTimeouts()
+			if h.queryRegistry != nil && queryID != "" {
+				h.queryRegistry.TimedOut(queryID)
+			}
 			h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(req.SQL)).Dur("timeout", effectiveTimeout).Msg("Arrow query timed out")
 			return c.Status(fiber.StatusGatewayTimeout).JSON(fiber.Map{
 				"success": false,
 				"error":   "Query timed out",
 			})
 		}
+		if ctxErr == context.Canceled {
+			// Cancelled through the registry (DELETE /api/v1/queries/:id), which
+			// already recorded the disposition. go-duckdb materializes the Arrow
+			// result inside QueryContext, so an operator cancel that lands during
+			// execution — the common case for a long query — surfaces here as an
+			// error return, not as a mid-stream break with a truncation trailer.
+			m.IncQueryErrors()
+			h.logger.Warn().Str("sql", sqlutil.ForLog(req.SQL)).Str("query_id", queryID).Msg("Arrow query cancelled")
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"success": false,
+				"error":   "Query cancelled",
+			})
+		}
 		m.IncQueryErrors()
+		if h.queryRegistry != nil && queryID != "" {
+			h.queryRegistry.Fail(queryID, sqlutil.SanitizeErrText(err.Error()))
+		}
 		h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(req.SQL)).Msg("Arrow query execution failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,
@@ -612,12 +672,6 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// stream writer returns.
 	fctx := c.Context()
 	respHeader := &fctx.Response.Header
-
-	// Captured before the stream writer commits: the pooled fiber.Ctx is
-	// recycled by the time the closure runs, so reading the token out of it
-	// there is the same use-after-free the comment above describes.
-	tokenName := getTokenName(c)
-	tokenID := getTokenID(c)
 
 	// Declare the execution-time trailer in the response head before
 	// SetBodyStreamWriter runs so the `Trailer:` response header is
@@ -693,6 +747,11 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		// panicked on its way out still reports the error.
 		poisonArrowStream(streamW, h.logger)
 		trailers.setIfAbsent(arrowStreamTruncatedTrailer, "stream writer panicked")
+		// Nothing reaps active registry entries, so a panicking query would
+		// otherwise stay listed as running forever (#717 shape, executeQuery).
+		if h.queryRegistry != nil && queryID != "" {
+			h.queryRegistry.Fail(queryID, "stream writer panicked")
+		}
 	}, func(w *bufio.Writer) {
 		// Registered before anything that can panic, so it runs exactly once
 		// whether the writer returns normally or unwinds (#733).
@@ -722,9 +781,28 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		// on the success path only, because a failed body is poisoned and
 		// must not be advertised as valid up to the cap.
 		h.logGovernanceRowCap("arrow_ipc", convertedSQL, tokenID, tokenName, governanceMaxRows, totalRows)
+		// Recorded before the disposition, on both paths, for the same reason
+		// as the log line above: a capped-then-truncated result must show the
+		// cap in history (#724).
+		if h.queryRegistry != nil && queryID != "" {
+			h.queryRegistry.RecordRowCap(queryID, reachedRowCap(governanceMaxRows, totalRows))
+		}
 
 		if streamErr != nil {
 			m.IncQueryErrors()
+			// Disposition, mirroring executeQuery: a deadline that fires
+			// mid-stream is a timeout (and counts as one — the pre-stream
+			// branch above already did, this path never had it); everything
+			// else is a failure with the sanitized cause. After a registry
+			// cancel the entry is already in history and Fail is a no-op.
+			if errors.Is(streamErr, context.DeadlineExceeded) {
+				m.IncQueryTimeouts()
+				if h.queryRegistry != nil && queryID != "" {
+					h.queryRegistry.TimedOut(queryID)
+				}
+			} else if h.queryRegistry != nil && queryID != "" {
+				h.queryRegistry.Fail(queryID, sqlutil.SanitizeErrText(streamErr.Error()))
+			}
 			// Per-handler client-disconnect counter (#426). Lets operators
 			// dashboard the rate without log-scraping. Only fires on
 			// client-side events (disconnect / deadline / context-cancel)
@@ -767,6 +845,9 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		// it the Arrow endpoint counted only its failures, so a successful
 		// Arrow query was invisible to every query counter and Arrow
 		// throughput could not be graphed at all (#801).
+		if h.queryRegistry != nil && queryID != "" {
+			h.queryRegistry.Complete(queryID, int(totalRows))
+		}
 		m.IncQuerySuccess()
 		m.IncQueryRows(totalRows)
 		m.RecordQueryLatency(time.Since(start).Microseconds())
@@ -775,6 +856,8 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			Int64("row_count", totalRows).
 			Int64("execution_time_ms", execMs).
 			Msg("Arrow streaming query completed")
+		// query.slow_query_threshold_ms covered only the JSON path until #309.
+		h.logSlowQuery(convertedSQL, start, int(totalRows), tokenName)
 	})
 
 	return nil
