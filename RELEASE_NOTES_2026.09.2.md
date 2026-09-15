@@ -344,6 +344,8 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+Delete API WHERE validation no longer rejects forbidden SQL keywords or punctuation when they occur only inside string literals ([#834](https://github.com/Basekick-Labs/arc/issues/834)).
+
 ### Arrow IPC queries were invisible to query management and slow-query logging ([#309](https://github.com/Basekick-Labs/arc/issues/309))
 
 **Affects `POST /api/v1/query/arrow` on deployments with `query_management.enabled = true` or `query.slow_query_threshold_ms > 0`.**
