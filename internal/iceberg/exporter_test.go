@@ -103,7 +103,7 @@ func TestReconcile_AddIdempotentSupersede(t *testing.T) {
 		t.Fatalf("time field = %+v, want timestamptz", got)
 	}
 
-	tbl := func() map[string]struct{} {
+	tbl := func() map[string]int64 {
 		lt, err := exp.EnsureTable(ctx, "mydb", "cpu", sc)
 		if err != nil {
 			t.Fatalf("EnsureTable: %v", err)
@@ -116,7 +116,7 @@ func TestReconcile_AddIdempotentSupersede(t *testing.T) {
 	}
 
 	// 1. add f1
-	if err := exp.ReconcileMeasurement(ctx, "mydb", "cpu", sc, []FileRef{{PhysicalPath: fileURI(f1)}}); err != nil {
+	if err := exp.ReconcileMeasurement(ctx, "mydb", "cpu", sc, []FileRef{refOf(t, f1)}); err != nil {
 		t.Fatalf("reconcile add f1: %v", err)
 	}
 	files := tbl()
@@ -126,7 +126,7 @@ func TestReconcile_AddIdempotentSupersede(t *testing.T) {
 	snapAfterAdd := currentSnapshotID(ctx, t, exp)
 
 	// 2. reconcile same set -> no-op, no new snapshot
-	if err := exp.ReconcileMeasurement(ctx, "mydb", "cpu", sc, []FileRef{{PhysicalPath: fileURI(f1)}}); err != nil {
+	if err := exp.ReconcileMeasurement(ctx, "mydb", "cpu", sc, []FileRef{refOf(t, f1)}); err != nil {
 		t.Fatalf("reconcile idempotent: %v", err)
 	}
 	if got := currentSnapshotID(ctx, t, exp); got != snapAfterAdd {
@@ -134,7 +134,7 @@ func TestReconcile_AddIdempotentSupersede(t *testing.T) {
 	}
 
 	// 3. supersede: f1 gone, f2 present (hourly -> daily)
-	if err := exp.ReconcileMeasurement(ctx, "mydb", "cpu", sc, []FileRef{{PhysicalPath: fileURI(f2)}}); err != nil {
+	if err := exp.ReconcileMeasurement(ctx, "mydb", "cpu", sc, []FileRef{refOf(t, f2)}); err != nil {
 		t.Fatalf("reconcile supersede: %v", err)
 	}
 	files = tbl()
@@ -207,7 +207,7 @@ func TestReconcile_DayStraddlingFileSkipped(t *testing.T) {
 	// Reconcile both files. The straddling one must be skipped, the good one exported —
 	// and crucially this must NOT return an error (the measurement is not wedged).
 	if err := exp.ReconcileMeasurement(ctx, "db", "cpu", sc,
-		[]FileRef{{PhysicalPath: fileURI(good)}, {PhysicalPath: fileURI(bad)}}); err != nil {
+		[]FileRef{refOf(t, good), refOf(t, bad)}); err != nil {
 		t.Fatalf("reconcile with straddling file returned error (should skip, not fail): %v", err)
 	}
 	lt, _ := exp.EnsureTable(ctx, "db", "cpu", sc)
@@ -276,7 +276,7 @@ func TestReconcile_SchemaEvolution(t *testing.T) {
 
 	// 1. Create the table from the NARROW schema (first file only).
 	narrowSc, _ := SchemaFromParquet(narrow)
-	if err := exp.ReconcileMeasurement(ctx, "mydb", "cpu", narrowSc, []FileRef{{PhysicalPath: fileURI(narrow)}}); err != nil {
+	if err := exp.ReconcileMeasurement(ctx, "mydb", "cpu", narrowSc, []FileRef{refOf(t, narrow)}); err != nil {
 		t.Fatalf("reconcile narrow: %v", err)
 	}
 
@@ -286,7 +286,7 @@ func TestReconcile_SchemaEvolution(t *testing.T) {
 		t.Fatalf("UnionSchema: %v", err)
 	}
 	if err := exp.ReconcileMeasurement(ctx, "mydb", "cpu", unionSc,
-		[]FileRef{{PhysicalPath: fileURI(narrow)}, {PhysicalPath: fileURI(wide)}}); err != nil {
+		[]FileRef{refOf(t, narrow), refOf(t, wide)}); err != nil {
 		t.Fatalf("reconcile wide (schema evolution): %v", err)
 	}
 
@@ -333,7 +333,7 @@ func TestExpireSnapshotsAndPruneVersions(t *testing.T) {
 		if i == 0 {
 			sc, _ = SchemaFromParquet(f)
 		}
-		if err := exp.ReconcileMeasurement(ctx, "db", "cpu", sc, []FileRef{{PhysicalPath: fileURI(f)}}); err != nil {
+		if err := exp.ReconcileMeasurement(ctx, "db", "cpu", sc, []FileRef{refOf(t, f)}); err != nil {
 			t.Fatalf("reconcile %d: %v", i, err)
 		}
 	}
@@ -439,7 +439,7 @@ func TestExpireSnapshotsAfterArcDeletedSupersededFiles(t *testing.T) {
 		if i == 0 {
 			sc, _ = SchemaFromParquet(f)
 		}
-		if err := exp.ReconcileMeasurement(ctx, "db", "cpu", sc, []FileRef{{PhysicalPath: fileURI(f)}}); err != nil {
+		if err := exp.ReconcileMeasurement(ctx, "db", "cpu", sc, []FileRef{refOf(t, f)}); err != nil {
 			t.Fatalf("reconcile %d: %v", i, err)
 		}
 		// Arc owns the data-file lifecycle: the superseded file is gone from
