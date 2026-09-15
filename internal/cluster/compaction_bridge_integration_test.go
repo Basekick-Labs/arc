@@ -82,7 +82,7 @@ func (c *fsmCoordinator) setForwardingFailure(err error) {
 
 func (c *fsmCoordinator) LocalNodeID() string { return c.nodeID }
 
-func (c *fsmCoordinator) RegisterFileInManifest(file raft.FileEntry) error {
+func (c *fsmCoordinator) RegisterFileInManifest(ctx context.Context, file raft.FileEntry) error {
 	if ff := c.getForwardingFailure(); ff != nil {
 		return ff
 	}
@@ -104,7 +104,7 @@ func (c *fsmCoordinator) RegisterFileInManifest(file raft.FileEntry) error {
 	return nil
 }
 
-func (c *fsmCoordinator) DeleteFileFromManifest(path, reason string) error {
+func (c *fsmCoordinator) DeleteFileFromManifest(ctx context.Context, path, reason string) error {
 	if ff := c.getForwardingFailure(); ff != nil {
 		return ff
 	}
@@ -146,6 +146,10 @@ func (c *fsmCoordinator) BatchFileOpsInManifest(ops []raft.BatchFileOp) error {
 		}
 	}
 	return nil
+}
+
+func (c *fsmCoordinator) BatchFileOpsInManifestContext(ctx context.Context, ops []raft.BatchFileOp) error {
+	return c.BatchFileOpsInManifest(ops)
 }
 
 // waitFSMHasFile polls the FSM until it contains the given path or the

@@ -107,7 +107,7 @@ DrainLoop:
 	for time.Now().Before(drainDeadline) {
 		select {
 		case reg := <-r.queue:
-			r.process(reg)
+			r.process(context.Background(), reg)
 			drained++
 		default:
 			break DrainLoop
@@ -163,12 +163,12 @@ func (r *CoordinatorFileRegistrar) worker() {
 		case <-r.ctx.Done():
 			return
 		case reg := <-r.queue:
-			r.process(reg)
+			r.process(r.ctx, reg)
 		}
 	}
 }
 
-func (r *CoordinatorFileRegistrar) process(reg fileRegistration) {
+func (r *CoordinatorFileRegistrar) process(ctx context.Context, reg fileRegistration) {
 	entry := raft.FileEntry{
 		Path:          reg.path,
 		SHA256:        reg.sha256,
@@ -181,7 +181,7 @@ func (r *CoordinatorFileRegistrar) process(reg fileRegistration) {
 		CreatedAt:     time.Now().UTC(),
 	}
 
-	if err := r.coordinator.RegisterFileInManifest(entry); err != nil {
+	if err := r.coordinator.RegisterFileInManifest(ctx, entry); err != nil {
 		r.totalApplyErrs.Add(1)
 		r.logger.Debug().
 			Err(err).

@@ -194,7 +194,7 @@ func TestManifestDelete_ReopensGateAfterFailedCatchUp(t *testing.T) {
 		t.Fatal("precondition: gate must be red with a failed catch-up pull")
 	}
 
-	if err := c.DeleteFileFromManifest(path, "test: no peer holds it"); err != nil {
+	if err := c.DeleteFileFromManifest(context.Background(), path, "test: no peer holds it"); err != nil {
 		t.Fatalf("DeleteFileFromManifest: %v", err)
 	}
 	// Apply is synchronous through the FSM, so the callback has already run.
@@ -239,7 +239,7 @@ func TestManifestDelete_ReopensGateWhilePullInflight(t *testing.T) {
 		t.Fatal("precondition: gate must be red while the tagged pull is in flight")
 	}
 
-	if err := c.DeleteFileFromManifest(path, "test: deleted mid-pull"); err != nil {
+	if err := c.DeleteFileFromManifest(context.Background(), path, "test: deleted mid-pull"); err != nil {
 		t.Fatalf("DeleteFileFromManifest: %v", err)
 	}
 	if !c.puller.FullyCaughtUp() {

@@ -2,12 +2,45 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/rs/zerolog"
 )
+
+func TestRegisterFileInManifest_CancelledCoordinatorContext(t *testing.T) {
+	lifecycleCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	raftNode, err := raft.NewNode(&raft.NodeConfig{
+		NodeID:   "test-node",
+		DataDir:  t.TempDir(),
+		BindAddr: "127.0.0.1:0",
+		Logger:   zerolog.Nop(),
+	}, nil)
+	if err != nil {
+		t.Fatalf("raft.NewNode: %v", err)
+	}
+	defer func() { _ = raftNode.Stop() }()
+
+	c := &Coordinator{
+		cfg:       &config.ClusterConfig{},
+		raftNode:  raftNode,
+		localNode: NewNode("test-node", "test-node", RoleWriter, "test-cluster"),
+		logger:    zerolog.Nop(),
+		ctx:       lifecycleCtx,
+	}
+
+	err = c.RegisterFileInManifest(context.Background(), raft.FileEntry{Path: "data/file.parquet"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RegisterFileInManifest() error = %v; want context.Canceled", err)
+	}
+	if !errors.Is(err, raft.ErrManifestApply) {
+		t.Fatalf("RegisterFileInManifest() error = %v; want raft.ErrManifestApply", err)
+	}
+}
 
 // TestIsPrimaryWriter_LegacyMode pins the pre-Pattern-2 behavior of
 // IsPrimaryWriter(): when cfg.SharedStorageMode is false (today's

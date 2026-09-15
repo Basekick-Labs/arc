@@ -2168,8 +2168,8 @@ func main() {
 		var registerFile func(context.Context, *edgesync.ReceivedFile) error
 		if clusterCoordinator != nil {
 			coord := clusterCoordinator
-			registerFile = func(_ context.Context, f *edgesync.ReceivedFile) error {
-				return coord.RegisterFileInManifest(clusterraft.FileEntry{
+			registerFile = func(ctx context.Context, f *edgesync.ReceivedFile) error {
+				return coord.RegisterFileInManifest(ctx, clusterraft.FileEntry{
 					Path:        f.Path,
 					SHA256:      f.SHA256,
 					SizeBytes:   f.SizeBytes,
@@ -2425,7 +2425,7 @@ func main() {
 			var flushManifest func(context.Context, []*edgesync.ReceivedFile) error
 			if clusterCoordinator != nil {
 				coord := clusterCoordinator
-				flushManifest = func(_ context.Context, files []*edgesync.ReceivedFile) error {
+				flushManifest = func(ctx context.Context, files []*edgesync.ReceivedFile) error {
 					ops := make([]clusterraft.BatchFileOp, 0, len(files))
 					for _, f := range files {
 						payload, err := json.Marshal(clusterraft.RegisterFilePayload{
@@ -2455,7 +2455,7 @@ func main() {
 							Payload: payload,
 						})
 					}
-					return coord.BatchFileOpsInManifest(ops)
+					return coord.BatchFileOpsInManifestContext(ctx, ops)
 				}
 			}
 

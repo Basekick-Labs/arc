@@ -338,6 +338,16 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Manifest applies respect caller cancellation and deadlines ([#394](https://github.com/Basekick-Labs/arc/issues/394))
+
+Manifest register/delete operations and the current compaction batch apply path
+now preserve caller deadline budgets. The caller deadline bounds the
+pre-apply cancellation check, leader-side enqueue timeout, follower dial, and
+follower send/receive. The Raft `future.Error()` commit wait retains existing
+Raft semantics.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#787](https://github.com/Basekick-Labs/arc/pull/787).
+
 ### Compaction cleanup removes only the owning job's temp directory ([#749](https://github.com/Basekick-Labs/arc/issues/749))
 
 Parent-side compaction cleanup now removes only the exact JobID-owned temp directory, so it can no longer sweep another concurrent job whose names collapse to the same underscore prefix. If parent cleanup itself fails, the leftover is retained for `CleanupOrphanedTempDirs` to remove on the next startup instead of being hidden by a broad prefix sweep.

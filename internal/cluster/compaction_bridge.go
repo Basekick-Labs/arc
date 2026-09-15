@@ -48,9 +48,9 @@ import (
 // pulls back to the compactor that produced the output.
 type bridgeCoordinator interface {
 	LocalNodeID() string
-	RegisterFileInManifest(file raft.FileEntry) error
-	DeleteFileFromManifest(path, reason string) error
-	BatchFileOpsInManifest(ops []raft.BatchFileOp) error
+	RegisterFileInManifest(ctx context.Context, file raft.FileEntry) error
+	DeleteFileFromManifest(ctx context.Context, path, reason string) error
+	BatchFileOpsInManifestContext(ctx context.Context, ops []raft.BatchFileOp) error
 }
 
 // CompactionBridge adapts a bridgeCoordinator to compaction.ManifestBridge.
@@ -99,7 +99,7 @@ func (b *CompactionBridge) RegisterCompactedFile(ctx context.Context, file compa
 		CreatedAt:    file.CreatedAt,
 	}
 
-	if err := b.coord.RegisterFileInManifest(entry); err != nil {
+	if err := b.coord.RegisterFileInManifest(ctx, entry); err != nil {
 		// Map known leader-resolution errors to ErrNotLeader so the
 		// watcher recognizes them as transient retry conditions and
 		// keeps the completion manifest on disk for the next poll.
@@ -123,7 +123,7 @@ func (b *CompactionBridge) DeleteCompactedSource(ctx context.Context, path, reas
 		return err
 	}
 
-	if err := b.coord.DeleteFileFromManifest(path, reason); err != nil {
+	if err := b.coord.DeleteFileFromManifest(ctx, path, reason); err != nil {
 		if isTransientLeaderError(err) {
 			return fmt.Errorf("delete compacted source: %w", compaction.ErrNotLeader)
 		}
@@ -200,7 +200,7 @@ func (b *CompactionBridge) BatchFileOps(ctx context.Context, registers []compact
 		return nil
 	}
 
-	if err := b.coord.BatchFileOpsInManifest(ops); err != nil {
+	if err := b.coord.BatchFileOpsInManifestContext(ctx, ops); err != nil {
 		if isTransientLeaderError(err) {
 			return fmt.Errorf("batch file ops: %w", compaction.ErrNotLeader)
 		}
