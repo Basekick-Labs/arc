@@ -1,11 +1,14 @@
 package cluster
 
-// Shutdown vs FSM callbacks (#797). Coordinator.Stop holds c.mu while it stops
-// the Raft node, and Raft's shutdown joins the apply goroutine, so an FSM
-// callback that takes c.mu (or a Node method that takes n.mu) deadlocks the
-// process whenever an entry is applied while the node is stopping. Two tests:
-// an invariant that holds c.mu and applies every wired command type, and the
-// real Stop with a delete applied inside its locked window.
+// Shutdown vs FSM callbacks (#797, #813). Raft's shutdown joins the apply
+// goroutine, and until #813 Coordinator.Stop held c.mu (and Node.Stop n.mu)
+// across that join, so an FSM callback that took either lock deadlocked the
+// process whenever an entry was applied while the node was stopping. Stop
+// no longer holds the locks across the join, but the callback contract
+// stays: the startup snapshot restore runs inside raft.NewRaft with both
+// locks held (#807). Two tests: an invariant that holds c.mu and applies
+// every wired command type plus a restore, and the real Stop with a delete
+// applied while it is joining the puller.
 
 import (
 	"bytes"
@@ -90,10 +93,11 @@ func registerTestFile(t *testing.T, raftNode *raft.Node, path string) {
 }
 
 // Every command type that reaches a wired callback must apply while the
-// coordinator holds its write lock: that is exactly the state Stop is in when
-// it joins the Raft node, and a callback that needs c.mu there is a shutdown
-// deadlock. Completion is what matters; a command may legitimately return an
-// FSM error (e.g. promoting an unknown node).
+// coordinator holds its write lock: that is the state the startup restore
+// runs in (#807), it was the state Stop joined the Raft node in before #813,
+// and a callback that needs c.mu there is a deadlock. Completion is what
+// matters; a command may legitimately return an FSM error (e.g. promoting an
+// unknown node).
 func TestFSMCallbacks_ApplyWhileCoordinatorLockHeld(t *testing.T) {
 	c, raftNode := newShutdownRig(t, allocFreePort(t), 1000) // peer port closed: pulls fail fast
 	const f1, f2, f3 = "testdb/cpu/2026/09/14/21/lock-1.parquet", "testdb/cpu/2026/09/14/21/lock-2.parquet", "testdb/cpu/2026/09/14/21/lock-3.parquet"
@@ -173,11 +177,12 @@ collect:
 	}
 }
 
-// The real Stop with a delete applied inside its locked window. A pull in
-// flight against a peer that never answers keeps puller.Stop, and therefore
-// c.mu, held for the fetch timeout; a DeleteFile committed in that window is
-// applied on the Raft goroutine Stop is about to join. Before #797 this hung
-// forever; the test then reports the deadlock and leaks the rig on purpose.
+// The real Stop with a delete applied while it is joining the puller. A pull
+// in flight against a peer that never answers keeps puller.Stop (and, before
+// #813, c.mu) held for the fetch timeout; a DeleteFile committed in that
+// window is applied on the Raft goroutine Stop is about to join. Before #797
+// this hung forever; the test then reports the deadlock and leaks the rig on
+// purpose.
 func TestStop_DoesNotDeadlockOnDeleteAppliedDuringShutdown(t *testing.T) {
 	peer := startHangingOrigin(t)
 	c, raftNode := newShutdownRig(t, peer.addr(), 2000)
@@ -211,7 +216,7 @@ func TestStop_DoesNotDeadlockOnDeleteAppliedDuringShutdown(t *testing.T) {
 	go func() { deleteDone <- raftNode.DeleteFile(path, "test: applied during shutdown", 5*time.Second) }()
 	// The delete must apply (callback included) while Stop is inside the
 	// puller join; only then release the hung fetch so Stop can move on to
-	// joining the Raft node. (Left alone, the fetch holds the lock for the
+	// joining the Raft node. (Left alone, the fetch holds the join for the
 	// protocol's 15 s header timeout regardless of the fetch timeout, #796.)
 	// Pre-fix the callback blocks here and this wait times out; the release
 	// then lets Stop reach the Raft join, where it deadlocks.

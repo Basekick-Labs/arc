@@ -672,9 +672,11 @@ func (c *Coordinator) Stop() error {
 		puller.Stop()
 	}
 
-	// The failover managers call IsLeader and Apply on the Raft node, which
-	// take its lock, so they are joined BEFORE the Raft node stops; keep
-	// this order.
+	// The failover managers are joined BEFORE the Raft node stops so a
+	// failover tick cannot propose a promotion into a Raft instance that is
+	// going down. Before #813 this order was also what kept them from
+	// deadlocking on n.mu (their IsLeader and Apply calls take it, and
+	// Node.Stop held it across the shutdown); keep the order either way.
 	if writerFailover != nil {
 		if err := writerFailover.Stop(); err != nil {
 			c.logger.Error().Err(err).Msg("Error stopping writer failover manager")
@@ -2006,13 +2008,16 @@ func (c *Coordinator) IsRunning() bool {
 // per-node concern, so every clustered role may run it; current membership,
 // lifecycle, and health state gate the work.
 func (c *Coordinator) canRunFileReconciliation() bool {
-	// Stop holds c.mu while it waits for the puller scheduler to exit. Do not
-	// block on that lock from the scheduler's gate check, or shutdown can
-	// deadlock waiting for this goroutine.
+	// Stop used to hold c.mu while it waited for the puller scheduler to
+	// exit, so blocking on that lock from the scheduler's gate check could
+	// deadlock shutdown. Since #813 Stop holds the lock only for microseconds
+	// and joins the puller without it; the TryRLock stays as belt and braces
+	// (a tick that lands in that instant is refused, not queued), and the
+	// stopping flag refuses a tick that lands inside the join.
 	if !c.mu.TryRLock() {
 		return false
 	}
-	running := c.running
+	running := c.running && !c.stopping
 	registry := c.registry
 	localNode := c.localNode
 	localNodeID := ""

@@ -103,8 +103,11 @@ func TestNodeStop_ReturnsWhileAnFSMCallbackReadsRaftState(t *testing.T) {
 	if node.IsLeader() {
 		t.Error("IsLeader() true after Stop")
 	}
-	// A restart on the same node is still refused only while stopping; after
-	// Stop returned it is allowed, as before.
+	// A restart on the same node is refused only while stopping; after Stop
+	// returned it is allowed, as before. The gated callback is removed first:
+	// the log replay fires AddNode again, and a parked callback would hang
+	// the final Stop.
+	fsm.SetCallbacks(nil, nil, nil)
 	if err := node.Start(); err != nil {
 		t.Fatalf("Start after Stop: %v", err)
 	}

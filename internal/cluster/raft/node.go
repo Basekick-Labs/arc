@@ -323,9 +323,11 @@ func (n *Node) Stop() error {
 	// callback (or anything else on those goroutines) that reads this node
 	// through an accessor takes mu, so holding it here deadlocked shutdown.
 	// The fields stay set: hashicorp flips the state to Shutdown before
-	// returning the future, so IsLeader/State answer correctly and Apply,
-	// Barrier and the configuration calls return ErrRaftShutdown while the
-	// join is in progress.
+	// returning the future, so IsLeader/State answer from that state, Apply
+	// and Barrier fail with ErrRaftShutdown (or ErrLeadershipLost for an
+	// entry the leader loop had already accepted), configuration changes
+	// fail with ErrRaftShutdown, and configuration reads still answer from
+	// the in-memory configuration while the join is in progress.
 	if err := ra.Shutdown().Error(); err != nil {
 		n.logger.Error().Err(err).Msg("Error shutting down Raft")
 	}
