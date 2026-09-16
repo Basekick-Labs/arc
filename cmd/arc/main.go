@@ -1519,6 +1519,31 @@ func main() {
 					os.Exit(1)
 				}
 
+				// Bootstrapping on a role that does not vote hands the new
+				// cluster the exact failure #862 is about. Note what it does
+				// NOT do: the bootstrap configuration omits Suffrage, and
+				// ServerSuffrage's zero value is Voter, so a bootstrapping
+				// reader IS a voter and IS elected. It then holds leadership
+				// while failing the role half of IsPrimaryWriter, so no node
+				// passes the gate and every singleton task stops — with no
+				// second voter that could ever take leadership away from it.
+				//
+				// Refused at startup because nothing recovers from it on its
+				// own. Only reachable from a hand-rolled configuration: the
+				// Helm chart sets ARC_CLUSTER_RAFT_BOOTSTRAP only in the
+				// writer entrypoint, only on writer-0, and the default
+				// cluster.role (standalone) ingests and therefore votes.
+				//
+				// Gated on RaftDataDir because without it there is no Raft
+				// node at all, so raft_bootstrap means nothing and refusing to
+				// start would be gratuitous.
+				if cfg.Cluster.RaftBootstrap && cfg.Cluster.RaftDataDir != "" &&
+					!cluster.ParseRole(cfg.Cluster.Role).VotesInElections() {
+					log.Error().Str("role", cfg.Cluster.Role).Msg("cluster.raft_bootstrap requires a role that participates in Raft elections")
+					log.Error().Msg("Only nodes that accept writes vote (writer, standalone). Bootstrap the cluster on one of those, or set ARC_CLUSTER_RAFT_BOOTSTRAP=false on this node and let it join an existing cluster")
+					os.Exit(1)
+				}
+
 				var err error
 				clusterCoordinator, err = cluster.NewCoordinator(&cluster.CoordinatorConfig{
 					Config:        &cfg.Cluster,

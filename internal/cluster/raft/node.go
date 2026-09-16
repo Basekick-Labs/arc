@@ -3,6 +3,7 @@ package raft
 import (
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -440,6 +441,78 @@ func (n *Node) AddVoter(nodeID, addr string, timeout time.Duration) error {
 	return future.Error()
 }
 
+// AddNonvoter adds a non-voting member to the cluster. It replicates the log
+// and serves reads, but never campaigns and cannot be elected.
+//
+// NOTE, and this is why DemoteVoter exists below: AddNonvoter on a server that
+// is ALREADY a voter does not demote it. hashicorp/raft's nextConfiguration
+// only updates the address in that case and leaves Suffrage untouched. Adding
+// an existing voter as a non-voter is therefore a silent no-op on suffrage.
+func (n *Node) AddNonvoter(nodeID, addr string, timeout time.Duration) error {
+	n.mu.RLock()
+	ra := n.raft
+	n.mu.RUnlock()
+
+	if ra == nil {
+		return fmt.Errorf("raft not initialized")
+	}
+
+	future := ra.AddNonvoter(raft.ServerID(nodeID), raft.ServerAddress(addr), 0, timeout)
+	return future.Error()
+}
+
+// ErrCannotDemoteSelf is returned when a demotion would target this node.
+//
+// raft.DefaultConfig() sets ShutdownOnRemove, and a demotion to non-voter
+// trips the same stepDown path as a removal, so a leader that demotes itself
+// shuts its own Raft instance down. Arc's wrapper would keep running=true and
+// n.raft non-nil, so IsLeader() would quietly return false, Apply would return
+// ErrRaftShutdown, and Start() would refuse to rebuild: a silent zombie that
+// only a process restart fixes.
+//
+// The guard is here rather than in the caller because the consequence is
+// unrecoverable and a convention in the caller erodes.
+var ErrCannotDemoteSelf = errors.New("refusing to demote this node: a leader that demotes itself shuts down its own Raft instance")
+
+// DemoteVoter turns a voting member into a non-voter. Unlike AddNonvoter this
+// actually changes Suffrage.
+func (n *Node) DemoteVoter(nodeID string, timeout time.Duration) error {
+	n.mu.RLock()
+	ra := n.raft
+	localID := n.cfg.NodeID
+	n.mu.RUnlock()
+
+	if ra == nil {
+		return fmt.Errorf("raft not initialized")
+	}
+	if nodeID == localID {
+		return ErrCannotDemoteSelf
+	}
+
+	future := ra.DemoteVoter(raft.ServerID(nodeID), 0, timeout)
+	return future.Error()
+}
+
+// LeadershipTransferToServer hands leadership to a named server.
+//
+// The target MUST be a current Voter in the latest configuration, not merely a
+// node whose role would vote: hashicorp/raft's timeoutNow sets the target to
+// Candidate without checking its suffrage, so transferring to a non-voter
+// makes it campaign with no vote and leaves the cluster leaderless until some
+// real voter's election timeout fires. Callers pick from GetConfiguration.
+func (n *Node) LeadershipTransferToServer(nodeID, addr string) error {
+	n.mu.RLock()
+	ra := n.raft
+	n.mu.RUnlock()
+
+	if ra == nil {
+		return fmt.Errorf("raft not initialized")
+	}
+
+	future := ra.LeadershipTransferToServer(raft.ServerID(nodeID), raft.ServerAddress(addr))
+	return future.Error()
+}
+
 // RemoveServer removes a member from the cluster.
 func (n *Node) RemoveServer(nodeID string, timeout time.Duration) error {
 	n.mu.RLock()
@@ -556,10 +629,18 @@ func (n *Node) WaitForLeader(timeout time.Duration) error {
 // immediately, without waiting for anything; followers use the forwarded
 // CommandBarrier instead (Coordinator.waitForManifestSync, #799).
 func (n *Node) Barrier(timeout time.Duration) error {
-	if n.raft == nil {
+	// Copy n.raft under the lock like every other accessor, then block on the
+	// future outside it. This read used to be unsynchronised, which raced
+	// Stop(); harmless while nothing called it on a hot path, but the voter
+	// reconcile does.
+	n.mu.RLock()
+	ra := n.raft
+	n.mu.RUnlock()
+
+	if ra == nil {
 		return fmt.Errorf("raft not started")
 	}
-	return n.raft.Barrier(timeout).Error()
+	return ra.Barrier(timeout).Error()
 }
 
 // AddNode adds a node to the cluster state via Raft.
@@ -726,7 +807,15 @@ func (n *Node) LeaderCh() <-chan bool {
 // membership-dependent actions — a test stopping the leader, an operator
 // draining a node — must check every node's own view, not the leader's.
 func (n *Node) ConfigurationServerIDs() ([]string, error) {
-	future := n.raft.GetConfiguration()
+	n.mu.RLock()
+	ra := n.raft
+	n.mu.RUnlock()
+
+	if ra == nil {
+		return nil, fmt.Errorf("raft not initialized")
+	}
+
+	future := ra.GetConfiguration()
 	if err := future.Error(); err != nil {
 		return nil, err
 	}

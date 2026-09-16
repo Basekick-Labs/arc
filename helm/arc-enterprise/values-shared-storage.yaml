@@ -47,8 +47,8 @@ writer:
   #   replicas: 1 — single writer (lowest cost, NOT highly available: this
   #                 pattern suppresses Raft writer promotion on purpose, so
   #                 a writer loss stops ingest until an operator restores it)
-  #   replicas: 2 — REFUSED by _validation.tpl: one failure consumes the
-  #                 only spare, and no writer can be drained for an upgrade
+  #   replicas: 2 — REFUSED by _validation.tpl: writers are the Raft voters,
+  #                 so one failure leaves no quorum as well as no spare
   replicas: 3
   persistence:
     size: 20Gi                               # WAL only; bucket holds Parquet

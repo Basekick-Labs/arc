@@ -25,7 +25,7 @@ helm install arc-ent helm/arc-enterprise \
 
 This deploys:
 - 1 MinIO pod (bundled S3-compatible storage)
-- 1 writer, 2 readers, 1 compactor
+- 3 writers, 2 readers, 1 compactor
 - Each Arc pod points at the MinIO bucket as shared storage
 
 The chart refuses to install if any of the required credentials are missing
@@ -43,7 +43,7 @@ helm install arc-ent helm/arc-enterprise \
 
 This deploys:
 - No MinIO
-- 1 writer, 2 readers, 1 compactor, each with its own PersistentVolume
+- 3 writers, 2 readers, 1 compactor, each with its own PersistentVolume
 - Peer-to-peer file replication keeps nodes in sync
 
 ## Choosing a Pattern
@@ -198,11 +198,11 @@ automatically by the chart (see `templates/_helpers.tpl`). This:
 
 #### Local storage (Pattern 1) — `storage.mode: local`
 
-Each writer pod owns its own PersistentVolume. This pattern runs in
-**single-writer + multi-reader** mode: one writer takes ingest and the readers
-replicate its WAL. Arc's writer-failover controller elects the primary writer
+Each writer pod owns its own PersistentVolume. One writer takes ingest at a
+time, because the data is not shared and a second active writer would hold rows
+no other node can see. Arc's writer-failover controller elects that primary
 among the nodes whose role is `writer`; readers are **not** promotion
-candidates today, so give the cluster more than one writer replica if you want
+candidates today, so give the cluster three writer replicas if you want
 it to survive losing one. (Pattern 1 multi-writer — per-shard writer ownership
 — is a future initiative; see the multi-writer plan doc.)
 
@@ -234,22 +234,32 @@ This is why the default is 3 rather than 1. One writer is a development
 shape: it cannot fail over, and it leaves the cluster with a single point of
 failure for ingest.
 
-| writer.replicas | Ingest HA | Spare after one loss |
-|-----------------|-----------|----------------------|
-| 1 | none | none |
-| 2 | yes (LB / promotion) | **none — chart rejects this** |
-| **3** | **yes** | **yes** |
-| 5 | yes | yes (survives two losses) |
+| writer.replicas | Ingest HA | Spare after one loss | Raft quorum survives one loss |
+|-----------------|-----------|----------------------|-------------------------------|
+| 1 | none | none | no (sole voter) |
+| 2 | yes (LB / promotion) | **none — chart rejects this** | **no** |
+| **3** | **yes** | **yes** | **yes** |
+| 5 | yes | yes (survives two losses) | yes (survives two) |
 
 The chart rejects `writer.replicas=2` (see `templates/_validation.tpl`) for
 the reason in the table: the second writer is the only spare, so the first
 failure consumes it.
 
-Raft quorum is a separate, cluster-wide property and is **not** governed by
-the writer count today: every node that joins the cluster becomes a Raft
-voter regardless of its role, so reader pods carry quorum too. Size the
-voting membership for an odd count if you care about Raft tolerance; size
-`writer.replicas` for ingest availability.
+**Raft quorum follows `writer.replicas` in this chart.** Only nodes that accept
+writes vote, so in a deployment of writers, readers and a compactor the voters
+are the writer pods; the others replicate the log and see all cluster state but
+never campaign. Three writers therefore tolerate one loss on both counts at
+once, ingest and Raft, which is why three is the number in both patterns. Two
+writers means two voters, so losing one leaves no leader and cluster-wide state
+changes stop until it returns. Scaling readers does not help, and before this
+release it silently did: readers were voters, so a two-writer cluster kept its
+leader through a writer loss while its ingest redundancy was already gone.
+
+Two caveats. Nodes left at the default role (`standalone`) also accept writes
+and so also vote, though this chart never deploys one. And a cluster upgraded
+in place keeps any node that did not shut down gracefully as a voter until it
+is removed and re-joined, so the voter set converges over a rolling restart
+rather than at the moment of upgrade.
 
 Arc itself checks this at runtime. A cluster running below three writer-role
 nodes logs a rate-limited warning naming the count and the remediation, in

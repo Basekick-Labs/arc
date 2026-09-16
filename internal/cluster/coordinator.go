@@ -26,6 +26,7 @@ import (
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/wal"
+	hraft "github.com/hashicorp/raft"
 	"github.com/rs/zerolog"
 )
 
@@ -1332,6 +1333,21 @@ func (c *Coordinator) handlePeerConnection(conn net.Conn) {
 	}
 }
 
+// suffrageName renders a Raft suffrage for logs. Kept local so the cluster
+// package does not leak hashicorp/raft's enum into log-parsing contracts.
+func suffrageName(s hraft.ServerSuffrage) string {
+	switch s {
+	case hraft.Voter:
+		return "voter"
+	case hraft.Nonvoter:
+		return "nonvoter"
+	case hraft.Staging:
+		return "staging"
+	default:
+		return "unknown"
+	}
+}
+
 // handleJoinRequest processes a join request from a new node.
 func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest) {
 	c.logger.Info().
@@ -1432,14 +1448,63 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 	node.SetVersion(req.Version)
 	node.UpdateState(StateHealthy)
 
-	// Add to Raft cluster if configured
+	// Add to Raft cluster if configured.
+	//
+	// Suffrage follows the role: only nodes that can ingest vote (#862). A
+	// reader or compactor that could win leadership stalls every singleton
+	// task in shared-storage mode, because IsPrimaryWriter is "Raft leader AND
+	// RoleWriter" and no node then satisfies both halves. Non-voters still
+	// replicate the log and see all cluster state; they just never campaign.
+	//
+	// node.Role rather than req.Role: it has been through ParseRole, and #848
+	// has already refused anything unrecognised, so this cannot silently
+	// disenfranchise a role the capabilities table does not know.
+	//
+	// NOTE for an existing cluster: this fixes the suffrage a server gets when
+	// it is added, not the suffrage it already has. AddNonvoter on a server
+	// that is already a Voter updates its address and leaves Suffrage alone
+	// (hashicorp/raft nextConfiguration), so a reader recorded as a voter
+	// before this change stays one across restarts and re-joins. Converging
+	// existing membership needs DemoteVoter, which is wrapped here but not yet
+	// driven by anything.
 	if c.raftNode != nil {
-		// First add as a Raft voter
-		if err := c.raftNode.AddVoter(req.NodeID, req.RaftAddr, 10*time.Second); err != nil {
-			c.logger.Error().Err(err).Str("node_id", req.NodeID).Msg("Failed to add voter to Raft")
-			c.sendJoinError(conn, req, fmt.Sprintf("failed to add to Raft cluster: %v", err))
+		votes := node.Role.VotesInElections()
+		var addErr error
+		if votes {
+			addErr = c.raftNode.AddVoter(req.NodeID, req.RaftAddr, 10*time.Second)
+		} else {
+			addErr = c.raftNode.AddNonvoter(req.NodeID, req.RaftAddr, 10*time.Second)
+		}
+		if addErr != nil {
+			c.logger.Error().Err(addErr).
+				Str("node_id", req.NodeID).
+				Str("role", string(node.Role)).
+				Bool("voter", votes).
+				Msg("Failed to add node to Raft")
+			c.sendJoinError(conn, req, fmt.Sprintf("failed to add to Raft cluster: %v", addErr))
 			return
 		}
+		// Report the suffrage the node ACTUALLY has, not the one we asked
+		// for. AddNonvoter on a server that is already a voter updates its
+		// address and leaves Suffrage alone, so on a cluster upgraded in
+		// place a legacy reader-voter re-added here is still a voter. Logging
+		// the request would tell an operator auditing the voter set exactly
+		// the opposite of the truth.
+		actual := "unknown"
+		if cfg, cfgErr := c.raftNode.GetConfiguration(); cfgErr == nil {
+			for _, srv := range cfg.Servers {
+				if string(srv.ID) == req.NodeID {
+					actual = suffrageName(srv.Suffrage)
+					break
+				}
+			}
+		}
+		c.logger.Info().
+			Str("node_id", req.NodeID).
+			Str("role", string(node.Role)).
+			Bool("requested_voter", votes).
+			Str("suffrage", actual).
+			Msg("Node added to Raft membership")
 
 		// Then add node info to FSM
 		nodeInfo := &raft.NodeInfo{
@@ -2254,17 +2319,16 @@ func (c *Coordinator) MayAcceptIngest() bool {
 
 func (c *Coordinator) IsPrimaryWriter() bool {
 	// Pattern 2 multi-writer: singleton tasks gate on Raft leader AND
-	// RoleWriter. The role check is load-bearing — every joining node
-	// becomes a Raft voter regardless of role (coordinator.go AddVoter
-	// path), so a RoleReader or RoleCompactor can be elected leader.
-	// Without the role check, that node's scheduler would treat itself
-	// as the singleton runner and execute retention/CQ/delete against
-	// the shared bucket — exactly the duplicate-singleton hazard the
-	// gate is supposed to prevent (since the actual writer nodes also
-	// have schedulers and would also try to run the work). Defensive
-	// nil-checks: raftNode==nil means clustering isn't wired (returns
-	// false, fail-closed); localNode==nil shouldn't happen post-
-	// construction but we guard anyway.
+	// RoleWriter. The role check is still load-bearing even though only
+	// ingest-capable nodes vote now (#862): standalone nodes vote too, and a
+	// cluster upgraded in place keeps any reader that was already recorded as
+	// a voter until its membership converges. Without the role check such a
+	// node's scheduler would treat itself as the singleton runner and execute
+	// retention/CQ/delete against the shared bucket — exactly the
+	// duplicate-singleton hazard the gate prevents, since the real writers
+	// also have schedulers and would also run the work. Defensive nil-checks:
+	// raftNode==nil means clustering isn't wired (returns false, fail-closed);
+	// localNode==nil shouldn't happen post-construction but we guard anyway.
 	if c.cfg.SharedStorageMode {
 		if c.raftNode == nil || !c.raftNode.IsLeader() {
 			return false
