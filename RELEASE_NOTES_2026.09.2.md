@@ -360,6 +360,12 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Shutdown ran its hooks in an order that depended on the configuration ([#854](https://github.com/Basekick-Labs/arc/issues/854))
+
+Shutdown hooks carry a priority and run from lowest to highest, but the sort reordered hooks that shared a priority. Ten of them share one, so their relative order depended on how many unrelated lower-priority hooks happened to be registered, which varies with the configuration: the same binary shut down in a different order standalone than in a cluster, and the comment in the code describing the intended order was true only by accident.
+
+The sort is now stable, so hooks of equal priority run in the order they were registered, and the same applies to components. The cluster-gated schedulers — hourly and daily compaction, continuous queries, retention and reconciliation — also move to their own priority ahead of the cluster coordinator, because each of them asks the coordinator whether it may run. They now quiesce before it stops, rather than possibly after it.
+
 ### A heartbeat from a node the cluster has forgotten is no longer discarded in silence ([#849](https://github.com/Basekick-Labs/arc/issues/849))
 
 A node that believes it is a cluster member sends heartbeats to its peers. If a peer has no record of it, the heartbeat was dropped and acknowledged anyway, so neither side could tell: the sender saw a healthy acknowledgement, the receiver logged nothing, and the state persisted until some other operation failed. That is why a node which left the cluster and never re-joined stayed invisible until a forwarded write was rejected.
