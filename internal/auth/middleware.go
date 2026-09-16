@@ -33,6 +33,9 @@ func DefaultMiddlewareConfig() MiddlewareConfig {
 		PublicRoutes: []string{
 			"/health",
 			"/ready",
+			// The write-pool health check, for the same reason as /ready: a
+			// load balancer cannot authenticate.
+			"/ready/write",
 			"/api/v1/auth/verify",
 		},
 		PublicPrefixes: []string{

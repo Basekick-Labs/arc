@@ -1870,7 +1870,7 @@ func main() {
 		// call it without an auth token after compaction. Access is gated by
 		// HMAC-SHA256 validation in the handler (see handleCacheInvalidate); the
 		// receiver refuses every request when cluster.shared_secret is empty.
-		middlewareConfig.PublicRoutes = append(middlewareConfig.PublicRoutes, "/health", "/ready", "/api/v1/auth/verify", api.CacheInvalidatePath)
+		middlewareConfig.PublicRoutes = append(middlewareConfig.PublicRoutes, "/health", "/ready", "/ready/write", "/api/v1/auth/verify", api.CacheInvalidatePath)
 		// /metrics stays public — Prometheus scrapers expect it. It is
 		// already in auth.DefaultMiddlewareConfig().PublicPrefixes, so no
 		// further append is needed here. /debug/pprof is intentionally NOT
@@ -3454,6 +3454,13 @@ func main() {
 	// Register Cluster handler (always register, shows status even if clustering not enabled)
 	clusterHandler := api.NewClusterHandler(clusterCoordinator, authManager, licenseClient, logger.Get("cluster-api"))
 	clusterHandler.RegisterRoutes(server.GetApp())
+
+	// /ready/write answers whether a load balancer should send writes here.
+	// Without a coordinator the node is the whole deployment, so the default
+	// (accept whenever ready) is already right and nothing is wired.
+	if clusterCoordinator != nil {
+		server.SetWriteReadiness(clusterCoordinator.MayAcceptIngest)
+	}
 
 	// MQTT API handlers are registered unconditionally. Both MQTTHandler
 	// (stats/health) and MQTTSubscriptionHandler (CRUD/lifecycle) nil-guard

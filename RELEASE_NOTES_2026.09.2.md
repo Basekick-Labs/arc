@@ -59,6 +59,16 @@ Readers replicate the write-ahead log and serve queries, but they are never prom
 
 Existing installs are unaffected until they next apply their own values. An install that deliberately wants a single writer, for development or a single-node deployment, can still set the count to one.
 
+## New: a write-pool health check at `GET /ready/write` ([#857](https://github.com/Basekick-Labs/arc/issues/857))
+
+`/ready` answers whether a node is healthy, and every healthy node answers it, readers included. A load balancer's write pool pointed at it therefore sends writes to nodes that can only proxy them onward, which makes those nodes responsible for carrying other nodes' ingest.
+
+`GET /ready/write` answers the narrower question: should writes be sent here. It returns 200 on a node that accepts ingest and 503 otherwise, with a body naming which. In shared-storage mode every healthy writer answers 200, because that is the whole point of the pattern. In local-storage mode only the elected primary writer does. Readers and compactors never do, and a single-node deployment always does. One load-balancer configuration is therefore correct in both patterns.
+
+It is unauthenticated, like `/ready`, and strictly narrower: anything that makes a node unready for traffic also makes it unready for writes, so a node draining on expired storage credentials or still replaying its write-ahead log is not a write target either. Point the write pool at `/ready/write` and leave query pools and Kubernetes probes on `/ready`, whose meaning is unchanged.
+
+Writes that arrive at a node which is not a write target are still accepted and proxied, as before. This endpoint lets a load balancer avoid that hop rather than changing what happens without one.
+
 ## Changed: telemetry now reports the arcli installations an instance served
 
 Arc's opt-out telemetry gains a `clients` section describing the [arcli](https://github.com/Basekick-Labs/arcli) installations that talked to this instance since the last successful report. arcli sends a random per-installation UUID and its version with each request. Arc counts an installation only on a request that succeeded (a status below 400) and, when authentication is configured, that carried a valid token, so unauthenticated endpoints such as `/health` never contribute. It then reports, per installation, the id, the version, and the time it was last seen, plus a count and a `truncated` flag once more than 256 distinct installations have been seen between reports. The section is omitted entirely when no arcli client was seen.
