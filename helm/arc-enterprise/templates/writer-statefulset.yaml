@@ -44,7 +44,7 @@ spec:
               containerPort: 9200
           env:
             {{- include "arc-enterprise.commonClusterEnv" . | nindent 12 }}
-            {{- include "arc-enterprise.writerRaftEnv" . | nindent 12 }}
+            {{- include "arc-enterprise.raftEnv" . | nindent 12 }}
             {{- include "arc-enterprise.writerWalEnv" . | nindent 12 }}
             - name: ARC_CLUSTER_ROLE
               value: "writer"

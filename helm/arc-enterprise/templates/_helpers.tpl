@@ -301,9 +301,18 @@ them. See docs/progress/2026-05-26-multi-writer-pattern2.md.
 {{- end }}
 
 {{/*
-Raft-specific env vars — only for writers (they run Raft consensus).
+Raft env vars. EVERY role runs Raft, not just writers: readers and the
+compactor join as members too, and a node that cannot stand up a Raft
+transport falls back to standalone mode and silently leaves the cluster.
+The "only for writers" belief this comment used to state is what shipped
+#870, and the reader gap before it.
+
+Binding explicitly on every role also removes a hidden coupling: without
+it the non-writer roles took cluster.raft_bind_addr from Arc's own default,
+which happens to be the same ":9200" the writer sets here. The two were
+equal only because the default was never changed.
 */}}
-{{- define "arc-enterprise.writerRaftEnv" -}}
+{{- define "arc-enterprise.raftEnv" -}}
 - name: ARC_CLUSTER_RAFT_BIND_ADDR
   value: ":9200"
 {{- end }}

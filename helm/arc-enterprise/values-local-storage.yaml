@@ -22,7 +22,13 @@ minio:
   enabled: false
 
 writer:
-  replicas: 1
+  # Three, the same as the chart default and the shared-storage preset.
+  # Readers are never promotion candidates, so writer-role pods are the whole
+  # failover pool: one cannot survive a writer loss at all, and two has no
+  # spare left once a single failure is absorbed. Arc warns while a cluster
+  # sits below three (#856). This preset was still shipping 1, so following
+  # the Pattern 1 guide silently overrode the new default back down.
+  replicas: 3
   persistence:
     size: 50Gi                                 # local Parquet + WAL
 
