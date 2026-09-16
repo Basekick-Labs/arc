@@ -53,6 +53,12 @@ literals (e.g. a log-search `LIKE '%INTERVAL 5 MINUTE%'`) and identifiers such a
 `interval2` can never be misread as time bounds; compound quoted intervals like
 `'1 day 12 hours'` remain unpruned (never mis-pruned as their first component).
 
+### The Helm chart now deploys three writers by default
+
+Readers replicate the write-ahead log and serve queries, but they are never promoted to writer, so the failover pool is made of writer-role nodes. A deployment with one writer therefore cannot fail over, and two has no failure tolerance because a Raft quorum of two needs both nodes, which the chart already refused. The writer default moves from one to three, which is the minimum for high availability in both deployment patterns: on shared storage all three take ingest behind the load balancer, and on local storage one is elected primary while the other two stand by.
+
+Existing installs are unaffected until they next apply their own values. An install that deliberately wants a single writer, for development or a single-node deployment, can still set the count to one.
+
 ## Changed: telemetry now reports the arcli installations an instance served
 
 Arc's opt-out telemetry gains a `clients` section describing the [arcli](https://github.com/Basekick-Labs/arcli) installations that talked to this instance since the last successful report. arcli sends a random per-installation UUID and its version with each request. Arc counts an installation only on a request that succeeded (a status below 400) and, when authentication is configured, that carried a valid token, so unauthenticated endpoints such as `/health` never contribute. It then reports, per installation, the id, the version, and the time it was last seen, plus a count and a `truncated` flag once more than 256 distinct installations have been seen between reports. The section is omitted entirely when no arcli client was seen.
