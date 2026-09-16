@@ -168,11 +168,13 @@ writer:
   # crossed mid-recovery kill-loops the pod, the exact failure the probe
   # prevents. Default 30 (5 minutes).
   startupProbeFailureThreshold: 30
-  replicas: 3                      # 3 is the minimum for HA in BOTH patterns: 2 has no failure
-                                   # tolerance (a Raft quorum of 2 stalls on a single-pod loss) and
-                                   # 1 cannot fail over at all. Readers are never promoted, so the
-                                   # failover pool is made of writer-role pods. Drop to 1 only for a
-                                   # single-node or development install, where HA is not expected.
+  replicas: 3                      # 3 is the minimum for HA in BOTH patterns. Readers are never
+                                   # promoted, so writer-role pods are the entire redundancy pool:
+                                   # 1 cannot survive a writer loss at all, and 2 has no spare left
+                                   # once a single failure is absorbed — nor can a writer be drained
+                                   # for a rolling upgrade without dropping to one. Arc logs a
+                                   # warning below 3 (#856). Drop to 1 only for a single-node or
+                                   # development install, where HA is not expected.
   resources:
     requests: { cpu: 500m, memory: 1Gi }
     limits:   { cpu: 4000m, memory: 8Gi }

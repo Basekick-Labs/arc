@@ -41,13 +41,15 @@ writer:
   # writes across all healthy writer pods, and each writer PUTs to the
   # shared bucket independently. Singleton background tasks (retention,
   # CQ, delete) run on whichever pod is the cluster Raft leader.
-  #   replicas: 1 — single writer (lowest cost; LB still routes through
-  #                 the Service so client URLs work identically to multi)
-  #   replicas: 3 — HA + horizontal scale (Raft quorum tolerates 1 failure;
-  #                 LB routes writes round-robin across all healthy pods)
-  #   replicas: 2 — REFUSED by _validation.tpl (no failure tolerance — a
-  #                 quorum of 2 stalls Raft writes on any single-pod loss)
-  replicas: 1
+  #   replicas: 3 — the default, and the minimum for HA: the LB routes
+  #                 writes round-robin across all healthy pods, and losing
+  #                 one still leaves a spare. Arc logs a warning below 3.
+  #   replicas: 1 — single writer (lowest cost, NOT highly available: this
+  #                 pattern suppresses Raft writer promotion on purpose, so
+  #                 a writer loss stops ingest until an operator restores it)
+  #   replicas: 2 — REFUSED by _validation.tpl: one failure consumes the
+  #                 only spare, and no writer can be drained for an upgrade
+  replicas: 3
   persistence:
     size: 20Gi                               # WAL only; bucket holds Parquet
 

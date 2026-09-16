@@ -55,7 +55,7 @@ literals (e.g. a log-search `LIKE '%INTERVAL 5 MINUTE%'`) and identifiers such a
 
 ### The Helm chart now deploys three writers by default
 
-Readers replicate the write-ahead log and serve queries, but they are never promoted to writer, so the failover pool is made of writer-role nodes. A deployment with one writer therefore cannot fail over, and two has no failure tolerance because a Raft quorum of two needs both nodes, which the chart already refused. The writer default moves from one to three, which is the minimum for high availability in both deployment patterns: on shared storage all three take ingest behind the load balancer, and on local storage one is elected primary while the other two stand by.
+Readers replicate the write-ahead log and serve queries, but they are never promoted to writer, so the failover pool is made of writer-role nodes. A deployment with one writer therefore cannot fail over, and two absorbs exactly one failure before it is down to a single writer with no spare left and no pod that can be drained for a rolling upgrade, which is why the chart already refused it. The writer default moves from one to three, which is the minimum for high availability in both deployment patterns: on shared storage all three take ingest behind the load balancer, and on local storage one is elected primary while the other two stand by. The shared-storage example overlay moves to three as well, so following the Pattern 2 guide no longer silently overrides the new default back to one.
 
 Existing installs are unaffected until they next apply their own values. An install that deliberately wants a single writer, for development or a single-node deployment, can still set the count to one.
 
@@ -365,6 +365,14 @@ fails the build rather than leaving the note quietly wrong.
    nodes, which are the leader candidates, first.
 
 ## Bug fixes
+
+### A cluster with too few writers now says so instead of failing silently later ([#856](https://github.com/Basekick-Labs/arc/issues/856))
+
+Arc's clustering documentation described the local-storage pattern as one writer plus several readers and called the readers the failover pool. They are not. Promotion only ever considers writer-role nodes, and nothing changes a node's role at runtime, so in that topology the loss of the single writer stopped ingest until an operator intervened. The chart, the example overlay and the documentation now all call for three writer-role nodes, and Arc no longer waits for the outage to tell you.
+
+A cluster running below three writer-role nodes now logs a rate-limited warning that names the count and the fix. The count is by role rather than by health, because this is a statement about how the cluster was deployed and not about who happens to be up. The warning is suppressed for the first minute after start, so a cluster that is still forming does not warn on every boot, and it is silent again the moment a third writer joins. A single-node install never warns at all: it has no redundancy of any kind and its operator knows that. The topology this exists for is the one that looks highly available, several nodes of which exactly one is a writer.
+
+Both deployment patterns get it, with the right explanation for each. With local storage and failover enabled the message explains that readers are never promotion candidates. With shared storage it explains that Raft promotion is deliberately suppressed in that pattern, so the load balancer's backend count is the only thing standing between a writer crash and an ingest outage.
 
 ### Shutdown ran its hooks in an order that depended on the configuration ([#854](https://github.com/Basekick-Labs/arc/issues/854))
 

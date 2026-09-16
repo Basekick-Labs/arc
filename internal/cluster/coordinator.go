@@ -380,10 +380,22 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 				c.onWriterPromoted(newPrimaryID, oldPrimaryID)
 			})
 
+			// Arm the redundancy warning from exactly the condition that
+			// makes failover real, so a cluster without it stays silent.
+			c.healthChecker.EnableWriterRedundancyWarning(writerRedundancyFailover)
+
 			c.logger.Info().Msg("Writer failover manager initialized")
 		}
 	} else if cfg.Config.FailoverEnabled && cfg.Config.SharedStorageMode {
 		c.logger.Info().Msg("Writer failover suppressed: cluster.shared_storage_mode=true (Pattern 2 multi-writer; LB handles writer-crash failover)")
+	}
+
+	// Pattern 2 gets the redundancy warning too, and does not depend on
+	// FailoverEnabled: promotion is suppressed in shared-storage mode, so the
+	// only thing standing between a writer crash and an ingest outage is how
+	// many writer backends the load balancer has (#856).
+	if cfg.Config.SharedStorageMode {
+		c.healthChecker.EnableWriterRedundancyWarning(writerRedundancyLoadBalanced)
 	}
 
 	// Initialize compactor failover manager (Phase 5) — reuses the same
