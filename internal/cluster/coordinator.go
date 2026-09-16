@@ -129,7 +129,8 @@ type Coordinator struct {
 	unknownHeartbeatSeen map[string]time.Time
 
 	forwardConn       net.Conn
-	forwardConnLeader string // nodeID of the leader this conn is dialed to
+	forwardConnLeader string    // nodeID of the leader this conn is dialed to
+	forwardConnUsedAt time.Time // last successful handout, for the idle refresh
 	forwardConnMu     sync.Mutex
 	forwardMu         sync.Mutex // Phase 4: serializes round-trips on forwardConn
 
