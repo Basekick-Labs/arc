@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/signal"
+	"sort"
 	"sync"
 	"syscall"
 	"time"
@@ -218,24 +219,24 @@ func (c *Coordinator) TriggerShutdown() {
 }
 
 // Simple bubble sort for small slices
+// sortComponentsByPriority is sortHooksByPriority for components, and had the
+// same defect.
 func sortComponentsByPriority(components []namedComponent) {
-	for i := 0; i < len(components); i++ {
-		for j := i + 1; j < len(components); j++ {
-			if components[j].priority < components[i].priority {
-				components[i], components[j] = components[j], components[i]
-			}
-		}
-	}
+	sort.SliceStable(components, func(i, j int) bool {
+		return components[i].priority < components[j].priority
+	})
 }
 
+// sortHooksByPriority orders hooks by ascending priority, and keeps hooks of
+// EQUAL priority in the order they were registered. The previous selection
+// sort reordered equal keys, so the relative order of the ten hooks that share
+// PriorityCompaction depended on how many lower-priority hooks happened to be
+// registered — which varies with configuration, so the same binary shut down
+// in a different order in OSS and in a cluster (#854).
 func sortHooksByPriority(hooks []namedHook) {
-	for i := 0; i < len(hooks); i++ {
-		for j := i + 1; j < len(hooks); j++ {
-			if hooks[j].priority < hooks[i].priority {
-				hooks[i], hooks[j] = hooks[j], hooks[i]
-			}
-		}
-	}
+	sort.SliceStable(hooks, func(i, j int) bool {
+		return hooks[i].priority < hooks[j].priority
+	})
 }
 
 // Priorities for common components (use these as guidelines)
@@ -244,7 +245,12 @@ const (
 	PriorityIngest     = 20 // Stop ingestion
 	PriorityBuffer     = 30 // Flush buffers
 	PriorityWAL        = 40 // Flush WAL
-	PriorityCompaction = 50 // Stop compaction
+	// PriorityScheduler stops the tick-driven schedulers that ask the cluster
+	// coordinator whether they may run — compaction, continuous queries,
+	// retention, reconciliation. They quiesce BEFORE the coordinator they
+	// depend on, so a tick in flight never finds it gone (#854).
+	PriorityScheduler  = 45 // Stop cluster-gated schedulers
+	PriorityCompaction = 50 // Stop compaction and the cluster coordinator
 	PriorityTelemetry  = 60 // Send final telemetry
 	PriorityAuth       = 70 // Auth manager
 	PriorityStorage    = 80 // Storage backends
