@@ -42,4 +42,29 @@ var (
 
 	// ErrCoreLimitExceeded indicates adding this node would exceed the licensed core limit.
 	ErrCoreLimitExceeded = errors.New("cluster core limit exceeded")
+
+	// ErrCompactorFailoverInProgress indicates a compactor lease change is
+	// already running, so a manual assignment would race it.
+	ErrCompactorFailoverInProgress = errors.New("a compactor lease change is already in progress")
+
+	// ErrCompactorLeaseNotManaged indicates this cluster has no compactor
+	// failover manager and no lease, so assigning one would switch every
+	// node from the static role check to a lease nothing maintains.
+	ErrCompactorLeaseNotManaged = errors.New("this cluster does not manage a compactor lease")
+
+	// ErrAlreadyCompactorLeaseHolder indicates the target already holds the
+	// lease, so the assignment would be a no-op reported as a move.
+	ErrAlreadyCompactorLeaseHolder = errors.New("node already holds the compactor lease")
+
+	// ErrCannotHoldCompactorLease indicates the target's role may not hold
+	// the compactor lease (readers have no write access to storage).
+	ErrCannotHoldCompactorLease = errors.New("this node role cannot hold the compactor lease")
+
+	// ErrNodeNotHealthy indicates the target node is not in a healthy state.
+	ErrNodeNotHealthy = errors.New("node is not healthy")
+
+	// ErrClusterRaftNotConfigured indicates clustering is enabled but no Raft
+	// data directory was configured, so there is no consensus layer to apply
+	// a topology change through.
+	ErrClusterRaftNotConfigured = errors.New("clustering is not configured with Raft")
 )

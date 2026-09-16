@@ -448,6 +448,30 @@ Nothing stopped it afterwards either. The callback that shuts a compaction sched
 
 The check now runs on every tick, which is what the cluster-operations rule in this repository has always required and what the retention, continuous-query, Iceberg and reconciliation schedulers already did. A lease change now takes effect without a restart, which is the other half of the same rule.
 
+### The compactor lease never moved to a dedicated compactor, and there was no way to move it by hand ([#876](https://github.com/Basekick-Labs/arc/issues/876))
+
+The other half of the fix above. A cluster hands the compactor lease to the best candidate it can see when it first assigns one, and prefers a node whose role is `compactor` — but if no such node is visible at that moment it falls back to a writer, and there it stayed. The lease was only ever moved again when its holder became *unhealthy*. A healthy writer kept it for the life of the cluster.
+
+Two ordinary routes into that state. The compactor pod is slower to join than the leader's first assignment tick, which is a race it loses on most cold starts. Or you upgrade past the chart fix below, which is the first time a compactor pod ever joined at all — so every existing chart cluster has a writer holding the lease precisely because no compactor was ever visible. In both cases a node provisioned for compaction, with its own CPU and memory budget and its own volume, sat idle while a writer compacted on top of ingest.
+
+There was no operator lever either. An internal manual-failover function existed and had its own unit test, but nothing routed to it: no endpoint, no CLI verb, no config. The only way to move the lease was to make the holder unhealthy — restarting a node that is also taking writes.
+
+Three things change.
+
+**The lease now moves to a dedicated compactor on its own.** When a writer holds it and a node whose role is `compactor` has been healthy for six consecutive checks (a minute at the default interval), the lease is handed over once. The sustained window is what stops a compactor that flaps between healthy and unhealthy from attracting the lease, and a cooldown bounds how often it can move at all. Nothing else is preempted: the lease never moves between two writers, and never off a dedicated compactor.
+
+**`POST /api/v1/cluster/compactor/assign` hands it to a node you name.** Admin-only, body `{"node_id": "..."}`. The target is explicit and required, which is deliberately the opposite of the writer hand-over endpoint — there, clearing the designation is what lets the cluster elect, while here the automatic choice landing in the wrong place is the whole problem, so picking for you would reproduce it. Readers are refused, as are unhealthy nodes, a node that already holds the lease, and a request to a node that is not the Raft leader. Writers are accepted: automatic failover has always been able to hand the lease to a writer, and must, or a cluster whose only compactor dies stops compacting entirely.
+
+Note that this is an override with an expiry, not a permanent setting. Automatic preemption is suppressed for the cooldown the response reports (`preemption_suppressed_seconds`), and after that the lease returns to a dedicated compactor if one is healthy. To keep compaction off a node for good, change that node's role or remove it from the cluster.
+
+**The lease is visible.** `GET /api/v1/cluster` now carries an `active_compactor` block — who holds it, whether that node is a dedicated compactor, and whether it is still in the registry at all — and every node in `/api/v1/cluster/nodes` carries `is_active_compactor`. Previously the only record of a lease assignment was a log line written once, at the moment it happened.
+
+One smaller fix came out of the same work: the initial assignment of the lease at cluster start armed the *failover* cooldown, so a compactor that died shortly after a cluster came up waited out a window meant for damping repeated failovers — after an event where nothing failed and nothing was lost. Assignments and failovers are now accounted separately.
+
+Two limitations worth knowing, neither introduced here. A node removed from the cluster while it holds the lease shuts its Raft down before it applies the removal, so it never learns it lost the lease and keeps compacting until the process is stopped — stop it, don't just remove the node. And the lease is not released when its holder is removed; it moves on about thirty seconds later, once the holder reads as unhealthy. Releasing it immediately sounds like an improvement and is not: an empty lease means "no lease" to every consumer, which puts the cluster back into the state where each node decides for itself whether to compact, and on a cluster with no failover manager it would stay there.
+
+`cluster.failover_cooldown` now also sets how long an operator override of the compactor lease lasts, at ten times its value — 600 seconds at the 60-second default. Setting it to `0` means the default, not "no cooldown". The assign endpoint can answer `409` while an automatic lease change is already in flight; retry.
+
 ### Every writer ran retention and continuous queries when automatic failover was off ([#872](https://github.com/Basekick-Labs/arc/issues/872))
 
 On local storage, retention, continuous queries and deletes are meant to run on one writer. Deciding which one requires a promotion through Raft, and nothing issued one unless writer failover was both enabled and licensed. With no promotion, every writer-role node considered itself the primary and ran all of it. Three writers meant three nodes executing the same continuous queries and the same deletes.
