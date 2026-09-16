@@ -386,6 +386,15 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 		c.logger.Info().Msg("Writer failover suppressed: cluster.shared_storage_mode=true (Pattern 2 multi-writer; LB handles writer-crash failover)")
 	}
 
+	// Arm the writer-redundancy warning (#856). Every cluster shape wants it,
+	// but for different reasons, so the mode picks the remediation text. It is
+	// armed here, after the block above, because it keys off whether the
+	// failover manager was actually built rather than off the flag that asks
+	// for one — the flag can be set on a cluster that has no Raft or no
+	// writer_failover license, and then nothing promotes anything.
+	c.healthChecker.enableWriterRedundancyWarning(writerRedundancyModeFor(
+		cfg.Config.SharedStorageMode, c.writerFailoverMgr != nil))
+
 	// Initialize compactor failover manager (Phase 5) — reuses the same
 	// FailoverEnabled toggle and license gate as writer failover.
 	if cfg.Config.FailoverEnabled && c.raftNode != nil {

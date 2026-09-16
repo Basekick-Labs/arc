@@ -28,7 +28,7 @@ anything else (type, minimum) is caught by values.schema.json first.
 */}}
 {{- define "arc-enterprise.validate.writerReplicas" -}}
 {{- if eq (int .Values.writer.replicas) 2 -}}
-{{- fail "writer.replicas=2 offers no failure tolerance (a quorum of 2 requires both pods — a single failure stalls Raft writes). Use 1 (dev) or 3+ (HA)." -}}
+{{- fail "writer.replicas=2 offers no failure tolerance: one writer loss consumes the only spare, and no writer can be drained for a rolling upgrade without dropping to a single writer. Use 1 (dev) or 3+ (HA)." -}}
 {{- end -}}
 {{- end }}
 
