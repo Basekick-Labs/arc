@@ -360,6 +360,14 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Shutdown now stops replication, and stopping it cannot deadlock ([#853](https://github.com/Basekick-Labs/arc/issues/853))
+
+Shutting a node down never stopped its replication sender or receiver. They exited only when the shared context was cancelled and were never waited for, so a receiver could still be applying entries while the write-ahead log and the in-memory buffer were being closed underneath it, since every shutdown hook runs before any component is closed. Both are now stopped and joined as part of the coordinator's shutdown, before the Raft node goes down, and the wait for the receiver is bounded so a peer that stops answering cannot hold a shutdown open.
+
+`StopReplication` also held the coordinator's lock while waiting for those goroutines to finish, and the receiver's own goroutines take that lock to apply an entry. It had no callers, so the deadlock was never reached, but it is the shape that 26.09.2 removed from the shutdown path and it is now removed here too: the lock is held only to take a reference, and the waiting happens outside it.
+
+One related crash is fixed. The write-ahead log's replication hook calls into the sender for every appended entry, and stopping replication used to clear that reference, so any write still in flight during shutdown would have dereferenced nothing. The hook is now detached before the sender stops, the reference is left in place, and the sender itself refuses work once stopped.
+
 ### A heartbeat from a node the cluster has forgotten is no longer discarded in silence ([#849](https://github.com/Basekick-Labs/arc/issues/849))
 
 A node that believes it is a cluster member sends heartbeats to its peers. If a peer has no record of it, the heartbeat was dropped and acknowledged anyway, so neither side could tell: the sender saw a healthy acknowledgement, the receiver logged nothing, and the state persisted until some other operation failed. That is why a node which left the cluster and never re-joined stayed invisible until a forwarded write was rejected.
