@@ -998,14 +998,14 @@ func TestLooksLikeManagedPath(t *testing.T) {
 		path string
 		want bool
 	}{
-		{"db/m/2026/04/27/12/file.parquet", true},          // canonical 7-segment
-		{"db/m/2026/04/27/12/sub/file.parquet", true},      // 8 segments — fine
-		{"db/m/file.parquet", false},                       // too short
-		{"db/m/2026/04/27/file.parquet", false},            // 6 segments — too short
-		{"db/m/2026/04/27/12/", false},                     // empty trailing segment
-		{"../etc/passwd/2026/04/27/12/x.parquet", false},   // .. segment
-		{"db/m/./27/04/12/x.parquet", false},               // . segment
-		{"//m/2026/04/27/12/file.parquet", false},          // empty leading segment
+		{"db/m/2026/04/27/12/file.parquet", true},        // canonical 7-segment
+		{"db/m/2026/04/27/12/sub/file.parquet", true},    // 8 segments — fine
+		{"db/m/file.parquet", false},                     // too short
+		{"db/m/2026/04/27/file.parquet", false},          // 6 segments — too short
+		{"db/m/2026/04/27/12/", false},                   // empty trailing segment
+		{"../etc/passwd/2026/04/27/12/x.parquet", false}, // .. segment
+		{"db/m/./27/04/12/x.parquet", false},             // . segment
+		{"//m/2026/04/27/12/file.parquet", false},        // empty leading segment
 	}
 	for _, c := range cases {
 		got := looksLikeManagedPath(c.path)

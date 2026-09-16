@@ -307,4 +307,3 @@ func TestCQScheduler_ClusterGate_FailoverTransition(t *testing.T) {
 		t.Error("after failover gate should return IsPrimaryWriter=true without restart")
 	}
 }
-

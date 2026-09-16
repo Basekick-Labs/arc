@@ -50,8 +50,8 @@ var ErrNotLeader = errors.New("compaction bridge: not the Raft leader")
 // The bridge converts CompactedFile to raft.FileEntry inside the cluster
 // package, keeping the compaction package free of any raft.* imports.
 type CompactedFile struct {
-	Path          string    // storage-relative path
-	SHA256        string    // hex-encoded 64 chars
+	Path          string // storage-relative path
+	SHA256        string // hex-encoded 64 chars
 	SizeBytes     int64
 	Database      string
 	Measurement   string
@@ -120,10 +120,11 @@ type CompletionWatcherConfig struct {
 // pending manifests via the ManifestBridge. Run one per compactor node.
 //
 // Lifecycle:
-//   w := NewCompletionWatcher(cfg)
-//   w.Start(ctx)  // kicks off the poll loop in a background goroutine
-//   ...
-//   w.Stop()      // signals stop, waits for the loop to drain one final poll
+//
+//	w := NewCompletionWatcher(cfg)
+//	w.Start(ctx)  // kicks off the poll loop in a background goroutine
+//	...
+//	w.Stop()      // signals stop, waits for the loop to drain one final poll
 //
 // The watcher is safe to Start/Stop multiple times. It is NOT safe for
 // concurrent Start calls from different goroutines.

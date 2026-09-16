@@ -106,7 +106,7 @@ func TestComputeDiff_BothKindsMixed(t *testing.T) {
 	storage := []objectRecord{
 		{path: "db/m/a.parquet", lastModified: now.Add(-2 * time.Hour)},
 		{path: "db/m/c.parquet", lastModified: now.Add(-2 * time.Hour)},
-		{path: "db/m/orphan.parquet", lastModified: now.Add(-48 * time.Hour)}, // missing from manifest
+		{path: "db/m/orphan.parquet", lastModified: now.Add(-48 * time.Hour)},  // missing from manifest
 		{path: "db/m/young.parquet", lastModified: now.Add(-30 * time.Minute)}, // grace skip
 	}
 	d := computeDiff(manifest, storage, now, 24*time.Hour)
