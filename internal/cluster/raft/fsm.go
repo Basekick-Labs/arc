@@ -932,6 +932,15 @@ func (f *ClusterFSM) applyAddNode(payload []byte) interface{} {
 	}
 
 	f.mu.Lock()
+	// A re-join replaces the record wholesale, and the join payload carries no
+	// writer state, so a writer that merely restarted used to come back
+	// undesignated while primaryWriterID still named it. The failover manager
+	// then saw no primary, took the failover branch, and excluded the only
+	// writer from selection: the cluster never regained a primary and every
+	// singleton task stayed off (#850). Keep the table self-consistent.
+	if p.Node.WriterState == "" && f.primaryWriterID == p.Node.ID && p.Node.Role == "writer" {
+		p.Node.WriterState = "primary"
+	}
 	f.nodes[p.Node.ID] = &p.Node
 	callback := f.onNodeAdded
 	f.mu.Unlock()
@@ -1033,10 +1042,18 @@ func (f *ClusterFSM) applyPromoteWriter(payload []byte) interface{} {
 	}
 
 	f.mu.Lock()
-	// Validate the node exists and is a writer
-	if node, exists := f.nodes[p.NodeID]; exists && node.Role != "writer" {
+	// Validate the node exists and is a writer. Both checks happen before any
+	// mutation: demoting the old primary and then refusing the new one left
+	// the table with a standby old primary and a designation naming a node
+	// that is not there, which no callback ever announces.
+	newNode, exists := f.nodes[p.NodeID]
+	if !exists {
 		f.mu.Unlock()
-		return fmt.Errorf("promote writer: node %s has role %s, expected writer", p.NodeID, node.Role)
+		return fmt.Errorf("node %s not found", p.NodeID)
+	}
+	if newNode.Role != "writer" {
+		f.mu.Unlock()
+		return fmt.Errorf("promote writer: node %s has role %s, expected writer", p.NodeID, newNode.Role)
 	}
 
 	// Warn if OldPrimaryID doesn't match actual primary (informational only — FSM uses its own tracking)
@@ -1054,17 +1071,10 @@ func (f *ClusterFSM) applyPromoteWriter(payload []byte) interface{} {
 	}
 
 	// Promote new primary
-	newNode, exists := f.nodes[p.NodeID]
-	if exists {
-		newNode.WriterState = "primary"
-	}
+	newNode.WriterState = "primary"
 	f.primaryWriterID = p.NodeID
 	callback := f.onWriterPromoted
 	f.mu.Unlock()
-
-	if !exists {
-		return fmt.Errorf("node %s not found", p.NodeID)
-	}
 
 	f.logger.Info().
 		Str("new_primary", p.NodeID).

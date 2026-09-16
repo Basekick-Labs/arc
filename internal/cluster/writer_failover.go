@@ -157,12 +157,24 @@ func (m *WriterFailoverManager) checkPrimaryHealth() {
 	if primary == nil {
 		// No primary — check if there are any writers at all
 		writers := m.cfg.Registry.GetWriters()
-		if len(writers) > 0 && m.primaryID != "" {
-			// We had a primary but it's gone — trigger failover
-			m.consecutiveFails++
-			if m.consecutiveFails >= m.cfg.UnhealthyThreshold {
-				m.triggerFailoverLocked()
-			}
+		if len(writers) == 0 {
+			return
+		}
+		if m.primaryID == "" {
+			// No primary has ever existed in this cluster: elect one.
+			// Without this the manager deadlocks at boot — the failover
+			// branch below needs a previous primary to fail over FROM, and
+			// nothing else ever issues CommandPromoteWriter, so every node
+			// stayed WriterState-less and IsPrimaryWriter() was false
+			// cluster-wide, silently disabling the retention and CQ
+			// schedulers and the delete/retention/CQ endpoints (#850).
+			m.tryInitialElectionLocked()
+			return
+		}
+		// We had a primary but it's gone — trigger failover
+		m.consecutiveFails++
+		if m.consecutiveFails >= m.cfg.UnhealthyThreshold {
+			m.triggerFailoverLocked()
 		}
 		return
 	}
@@ -210,6 +222,62 @@ func (m *WriterFailoverManager) HandleWriterUnhealthy(node *Node) {
 	}
 }
 
+// tryInitialElectionLocked elects the first primary writer of a cluster that
+// has never had one (must hold lock). It is the writer-side counterpart of
+// CompactorFailoverManager.tryInitialAssignment and mirrors it: the same
+// in-progress guard, the same asynchronous Raft apply so the health-check loop
+// is never blocked, and the same completion bookkeeping.
+//
+// Only the Raft leader reaches here (checkPrimaryHealth returns early
+// otherwise), so exactly one node elects. An election is not a failover: there
+// is no old primary to demote, no cooldown to respect on the way in, and none
+// armed on the way out — see completeElection. A failing election therefore
+// retries on the next tick rather than backing off, which is what the
+// compactor's initial assignment does too; each attempt costs one Raft apply
+// bounded by FailoverTimeout, so a quorum outage logs at most one error per
+// timeout rather than per tick.
+func (m *WriterFailoverManager) tryInitialElectionLocked() {
+	if m.failoverInProg {
+		return
+	}
+	newPrimaryID := m.selectNewPrimary("")
+	if newPrimaryID == "" {
+		return
+	}
+	m.failoverInProg = true
+	m.logger.Info().
+		Str("node_id", newPrimaryID).
+		Msg("Electing initial primary writer")
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		err := m.cfg.RaftNode.PromoteWriter(newPrimaryID, "", m.cfg.FailoverTimeout)
+		if err != nil {
+			m.logger.Error().Err(err).
+				Str("node_id", newPrimaryID).
+				Msg("Failed to elect the initial primary writer")
+		}
+		m.completeElection(newPrimaryID, err == nil)
+	}()
+}
+
+// completeElection finishes an initial election. It is deliberately NOT
+// completeFailover: that arms the failover cooldown unconditionally, and an
+// election happening at boot would then swallow a genuine writer failure for
+// the whole cooldown period. An election is not a failover and nothing was
+// lost, so there is nothing to back off from.
+// It deliberately does not invoke onFailoverComplete either: that callback
+// announces a failover, and no failover happened.
+func (m *WriterFailoverManager) completeElection(newPrimaryID string, success bool) {
+	m.mu.Lock()
+	m.failoverInProg = false
+	if success {
+		m.primaryID = newPrimaryID
+		m.consecutiveFails = 0
+	}
+	m.mu.Unlock()
+}
+
 // triggerFailoverLocked initiates failover (must hold lock).
 func (m *WriterFailoverManager) triggerFailoverLocked() {
 	// Check cooldown
@@ -230,17 +298,21 @@ func (m *WriterFailoverManager) triggerFailoverLocked() {
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
-		m.executeFailover(oldPrimary)
+		m.executeFailover(oldPrimary, true)
 	}()
 }
 
 // executeFailover performs the actual failover operation.
-func (m *WriterFailoverManager) executeFailover(oldPrimaryID string) {
+func (m *WriterFailoverManager) executeFailover(oldPrimaryID string, allowSelf bool) {
 	ctx, cancel := context.WithTimeout(m.ctx, m.cfg.FailoverTimeout)
 	defer cancel()
 
-	// Select best standby
-	newPrimaryID := m.selectNewPrimary(oldPrimaryID)
+	// allowSelf: the old primary is still a candidate when it is healthy and
+	// alone, which is how a writer that lost its designation to a restart gets
+	// it back instead of deadlocking. An operator-requested failover never
+	// takes that path — being asked to move off a node and then landing back
+	// on it is not a failover.
+	newPrimaryID := m.selectPrimary(oldPrimaryID, allowSelf)
 	if newPrimaryID == "" {
 		m.logger.Error().
 			Str("old_primary", oldPrimaryID).
@@ -291,6 +363,22 @@ func (m *WriterFailoverManager) executeFailover(oldPrimaryID string) {
 // selectNewPrimary picks the best standby writer to promote.
 // Prefers standby writers; falls back to any healthy writer excluding the failed primary.
 func (m *WriterFailoverManager) selectNewPrimary(excludeNodeID string) string {
+	return m.selectPrimary(excludeNodeID, false)
+}
+
+// selectPrimary picks a writer to promote. It excludes excludeNodeID, the
+// primary being failed away from, unless allowSelf is set and no other
+// candidate exists.
+//
+// allowSelf exists because "no primary" does not always mean the primary
+// died. A writer that merely restarted re-joins with a payload that carries
+// no writer state, which clears its designation; the manager then looks for
+// someone to fail over TO and, in the single-writer topology this feature
+// documents, finds nobody, because the only candidate is the node it just
+// excluded. The cluster would sit with no primary forever. GetWriters already
+// filters to healthy nodes, so re-selecting the excluded node can never
+// resurrect a dead one.
+func (m *WriterFailoverManager) selectPrimary(excludeNodeID string, allowSelf bool) string {
 	// GetStandbyWriters and GetWriters already filter for healthy nodes
 	for _, node := range m.cfg.Registry.GetStandbyWriters() {
 		if node.ID != excludeNodeID {
@@ -300,6 +388,13 @@ func (m *WriterFailoverManager) selectNewPrimary(excludeNodeID string) string {
 	for _, node := range m.cfg.Registry.GetWriters() {
 		if node.ID != excludeNodeID {
 			return node.ID
+		}
+	}
+	if allowSelf && excludeNodeID != "" {
+		for _, node := range m.cfg.Registry.GetWriters() {
+			if node.ID == excludeNodeID {
+				return node.ID
+			}
 		}
 	}
 	return ""
@@ -345,8 +440,11 @@ func (m *WriterFailoverManager) TriggerManualFailover() error {
 		Str("current_primary", primary.ID).
 		Msg("Manual writer failover initiated")
 
+	// Tracked on the WaitGroup like the other two, so Stop joins it.
+	m.wg.Add(1)
 	go func() {
-		m.executeFailover(primary.ID)
+		defer m.wg.Done()
+		m.executeFailover(primary.ID, false)
 	}()
 
 	return nil

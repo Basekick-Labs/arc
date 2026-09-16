@@ -2070,7 +2070,7 @@ func (c *Coordinator) GetRole() NodeRole {
 //     wins the election would run retention/CQ/delete.
 //
 //     Leader-change semantics: each scheduler (retention, CQ, delete,
-//     reconciliation) checks IsPrimaryWriter() ONCE at the start of each
+//     delete endpoints) checks IsPrimaryWriter() ONCE at the start of each
 //     tick and runs all work for that tick if true. A leader change
 //     mid-tick will let the demoted node complete its current tick's
 //     work; the new leader's next tick picks up from there. This is
@@ -2378,6 +2378,30 @@ func (c *Coordinator) onRaftNodeAdded(n *raft.NodeInfo) {
 	if err := c.registry.Register(node); err != nil {
 		c.logger.Error().Err(err).Str("node_id", n.ID).Msg("Failed to register node from Raft")
 	}
+	// A snapshot restore replays the membership without firing a promotion
+	// callback, so the writer state the FSM carries has to reach the local
+	// node here or this node would forget it was the primary across a
+	// restart (#850). Mirrored unconditionally, including the empty value:
+	// the FSM record is authoritative, and applyAddNode now preserves a live
+	// designation across a re-join, so an empty value here means this node
+	// genuinely holds none and must not keep claiming one.
+	c.setLocalWriterState(n.ID, WriterState(n.WriterState))
+}
+
+// setLocalWriterState mirrors a writer-state change onto c.localNode when the
+// id names this node.
+//
+// SECURITY of the invariant, not of access: Registry.Get hands out a CLONE, so
+// onWriterPromoted below updates a copy and re-registers it, replacing the map
+// entry. c.localNode is a different object, and it is the one
+// Coordinator.IsPrimaryWriter consults through GetLocalNode(). Before #850 the
+// promotion therefore never reached the gate: the registry said "primary" while
+// the node's own scheduler gate said "not primary" and silently skipped every
+// tick.
+func (c *Coordinator) setLocalWriterState(nodeID string, state WriterState) {
+	if c.localNode != nil && nodeID == c.localNode.ID {
+		c.localNode.SetWriterState(state)
+	}
 }
 
 // onRaftNodeRemoved is called when a node is removed via Raft consensus.
@@ -2408,6 +2432,7 @@ func (c *Coordinator) onWriterPromoted(newPrimaryID, oldPrimaryID string) {
 			oldNode.SetWriterState(WriterStateStandby)
 			c.registry.Register(oldNode)
 		}
+		c.setLocalWriterState(oldPrimaryID, WriterStateStandby)
 	}
 
 	// Promote new primary in registry
@@ -2415,6 +2440,8 @@ func (c *Coordinator) onWriterPromoted(newPrimaryID, oldPrimaryID string) {
 		newNode.SetWriterState(WriterStatePrimary)
 		c.registry.Register(newNode)
 	}
+	// The registry entry is a clone; the gate reads c.localNode (#850).
+	c.setLocalWriterState(newPrimaryID, WriterStatePrimary)
 
 	c.logger.Info().
 		Str("new_primary", newPrimaryID).
