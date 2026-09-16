@@ -63,6 +63,22 @@ This rides on the existing telemetry channel and the existing switch: `telemetry
 
 ## Security fixes
 
+### Read-SQL gate hardening: quoted-construct boundaries
+
+Closes a read-path gate bypass in the same family as the earlier quoted-name and
+replacement-scan hardening. The scanner the read-SQL gates depend on could
+disagree with DuckDB about where a quoted construct ends, so part of a statement
+could reach the engine without having been gated. Four spellings are fixed and
+pinned by tests, and the scanners behind them are now shared so the two entry
+points cannot drift apart again.
+
+The DuckDB sandbox's storage-root allowlist bounded impact throughout: files
+outside the configured storage root were refused regardless. RBAC-enabled
+multi-tenant deployments are the ones that should upgrade.
+
+Full technical detail will accompany the corresponding security advisory once it
+is published. Found during internal review.
+
 ### RBAC table-reference deduplication preserves case ([#750](https://github.com/Basekick-Labs/arc/issues/750))
 
 Simple table references (`FROM table`) and JOIN table references (`JOIN table`) now preserve identifier case in deduplication keys during RBAC permission extraction. Previously, the deduplication key folded table names to lowercase while the downstream RBAC pattern matcher evaluated case-sensitively against case-sensitive storage backends. A query referencing measurements differing only by case (e.g., `SELECT * FROM cpu WHERE x IN (SELECT y FROM CPU)`) folded both references into one, authorizing the query if the principal had access to only one of the spellings. Both references are now checked against permissions independently.

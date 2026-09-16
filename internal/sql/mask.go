@@ -54,6 +54,44 @@ func MaskStringLiterals(sql string, hasQuotes bool) (string, []StringMask) {
 	for i < len(sql) {
 		ch := sql[i]
 
+		// SECURITY: comments are copied through whole, so a quote inside one
+		// cannot open a literal here. This scanner runs BEFORE the comment
+		// stripper that the gates use, and a `'` in a comment used to open a
+		// literal that ran to the next quote — swallowing the newline the
+		// stripper needs to find a line comment's end. The stripper then
+		// deleted from `--` to the end of the statement, so whatever followed
+		// never reached the keyword, table-position or file-I/O gates, while
+		// DuckDB, which ends the comment at the newline, parsed and ran it.
+		//
+		// Block comments are scanned to the FIRST `*/`, which is what the
+		// stripper does. DuckDB nests them, so its comment can only end later
+		// than this one does: the difference is always text this scanner
+		// treats as code and DuckDB does not, which costs a refusal at worst
+		// and can never hide code from a gate.
+		if ch == '-' && i+1 < len(sql) && sql[i+1] == '-' {
+			j := i
+			for j < len(sql) && sql[j] != '\n' {
+				j++
+			}
+			result.WriteString(sql[i:j])
+			i = j
+			continue
+		}
+		if ch == '/' && i+1 < len(sql) && sql[i+1] == '*' {
+			j := i + 2
+			for j+1 < len(sql) && !(sql[j] == '*' && sql[j+1] == '/') {
+				j++
+			}
+			if j+1 < len(sql) {
+				j += 2
+			} else {
+				j = len(sql)
+			}
+			result.WriteString(sql[i:j])
+			i = j
+			continue
+		}
+
 		// SECURITY: dollar-quoted strings ($tag$…$tag$). DuckDB accepts these
 		// wherever a single-quoted literal is legal — including table position,
 		// where the string triggers a replacement scan that reads the file
@@ -98,8 +136,8 @@ func MaskStringLiterals(sql string, hasQuotes bool) (string, []StringMask) {
 		// whole construct collapses to one placeholder (GHSA-wmjj-g8xc-6hwr).
 		if (ch == 'e' || ch == 'E') && i+1 < len(sql) && sql[i+1] == '\'' && !isIdentifierByte(prevByte(sql, i)) {
 			start := i
-			i++ // move onto the opening quote
-			i = scanQuoted(sql, i, '\'')
+			i += 2 // move past the E and the opening quote
+			i = skipEscString(sql, i)
 			original := sql[start:i]
 			placeholder := fmt.Sprintf("__STR_%d__", maskIndex)
 			maskIndex++
@@ -112,29 +150,22 @@ func MaskStringLiterals(sql string, hasQuotes bool) (string, []StringMask) {
 		if ch == '\'' || ch == '"' {
 			quote := ch
 			start := i
-			i++ // Move past opening quote
 
-			// Find the closing quote, handling escaped quotes
-			for i < len(sql) {
-				if sql[i] == quote {
-					// Check if it's an escaped quote ('' or "")
-					if i+1 < len(sql) && sql[i+1] == quote {
-						i += 2 // Skip escaped quote
-						continue
-					}
-					// Also handle backslash escaping (\' or \")
-					if i > 0 && sql[i-1] == '\\' {
-						i++
-						continue
-					}
-					break // Found closing quote
-				}
-				i++
-			}
-
-			// Include the closing quote if found
-			if i < len(sql) {
-				i++
+			// SECURITY: scan to the closing quote by DuckDB's rules, which are
+			// NOT the same for the three quoted forms. In a plain '…' string and
+			// in a "…" identifier the ONLY escape is the doubled quote; a
+			// backslash is an ordinary character. Only E'…' honours backslash,
+			// and it is consumed by the branch above; the fourth form,
+			// $tag$…$tag$, has no escape at all. Treating `\'` as an escape
+			// here made the scan run past the real closing quote and swallow
+			// everything up to the next one, so a value ending in a backslash
+			// hid the rest of the statement from every consumer of the masked
+			// form — including the keyword, table-position and file-I/O gates,
+			// which then passed SQL that DuckDB parsed quite differently.
+			if quote == '\'' {
+				i = skipStdString(sql, i+1)
+			} else {
+				i = skipQuotedIdent(sql, i+1)
 			}
 
 			// Extract the full quoted token and create a placeholder.
@@ -612,47 +643,34 @@ func dollarQuoteTag(sql string, i int) (string, bool) {
 	if i >= len(sql) || sql[i] != '$' {
 		return "", false
 	}
-	// A `$` immediately following an identifier character is part of that
-	// identifier (or a positional parameter), not a quote opener.
-	if isIdentifierByte(prevByte(sql, i)) {
+	// SECURITY: a `$` that continues an identifier is part of that identifier
+	// (or a positional parameter), not a quote opener — and DuckDB accepts `$`
+	// itself inside an unquoted identifier, so the run has to be walked back,
+	// not just the single preceding byte. `t$$$` is one name; reading its
+	// second and third `$` as an opener found no closing tag and masked the
+	// rest of the statement into one placeholder, hiding it from every gate
+	// while DuckDB parsed the name and ran what followed.
+	j := i - 1
+	for j >= 0 && sql[j] == '$' {
+		j--
+	}
+	if j >= 0 && isIdentifierByte(sql[j]) {
 		return "", false
 	}
-	j := i + 1
-	for j < len(sql) && sql[j] != '$' {
-		c := sql[j]
+	k := i + 1
+	for k < len(sql) && sql[k] != '$' {
+		c := sql[k]
 		isAlpha := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
 		isDigit := c >= '0' && c <= '9'
-		if !isAlpha && !(isDigit && j > i+1) {
+		if !isAlpha && !(isDigit && k > i+1) {
 			return "", false
 		}
-		j++
+		k++
 	}
-	if j >= len(sql) {
+	if k >= len(sql) {
 		return "", false
 	}
-	return sql[i+1 : j], true
-}
-
-// scanQuoted returns the index just past the literal whose opening quote sits at
-// sql[i], handling doubled (”) and backslash escapes. If the literal is
-// unterminated it returns len(sql).
-func scanQuoted(sql string, i int, quote byte) int {
-	i++ // move past the opening quote
-	for i < len(sql) {
-		if sql[i] == quote {
-			if i+1 < len(sql) && sql[i+1] == quote {
-				i += 2
-				continue
-			}
-			if i > 0 && sql[i-1] == '\\' {
-				i++
-				continue
-			}
-			return i + 1
-		}
-		i++
-	}
-	return len(sql)
+	return sql[i+1 : k], true
 }
 
 // isIdentifierByte reports whether c can appear inside an unquoted SQL identifier.
