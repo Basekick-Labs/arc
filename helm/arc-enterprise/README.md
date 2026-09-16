@@ -208,7 +208,7 @@ it to survive losing one. (Pattern 1 multi-writer — per-shard writer ownership
 
 ```yaml
 writer:
-  replicas: 2                              # one is elected primary, the other can take over
+  replicas: 3                              # see "Why 3?" below — same answer in both patterns
 reader:
   replicas: 3                              # readers serve queries and replicate the WAL
 cluster:
@@ -216,16 +216,22 @@ cluster:
     enabled: true                          # automatic writer + compactor failover
 ```
 
-#### Why 3 writers? (shared-storage Pattern 2)
+#### Why 3 writers? (both patterns)
 
 Three writers buy you **two** HA properties at once:
 
-1. **LB-side HA**: a writer crash is routed around by the Service; with 3
-   writers you tolerate one failure on the ingestion side and still have
-   2 healthy writers serving traffic.
+1. **Ingest HA**: a writer crash is routed around by the Service. In
+   shared-storage mode the surviving writers keep taking traffic; in local
+   storage mode the surviving writers are the failover pool, and one of them
+   is promoted. Readers are **not** promotion candidates in either mode, so
+   the pool is made of writer-role pods or it does not exist.
 2. **Raft quorum**: cluster-wide state (manifest, tokens, RBAC) and
    singleton-task ownership (retention/CQ/delete) gate on the cluster Raft
    leader. With 3 writers Raft tolerates 1 failure and still elects a leader.
+
+This is why the default is 3 rather than 1. One writer is a development
+shape: it cannot fail over, and it leaves the cluster with a single point of
+failure for both ingest and cluster state.
 
 | writer.replicas | Quorum | Ingest HA | Raft HA |
 |-----------------|--------|-----------|---------|
