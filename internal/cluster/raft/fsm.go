@@ -2275,6 +2275,18 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	}
 
 	f.mu.Lock()
+	// Nodes the snapshot no longer carries have to be announced as removed,
+	// or every consumer of the callbacks keeps them forever: the registry
+	// would go on listing a node the cluster dropped, heartbeating it and
+	// offering it as a peer (#847). At a startup restore the previous table
+	// is empty, so this is naturally a no-op.
+	var removedNodes []string
+	for id := range f.nodes {
+		if _, stillThere := restoredNodes[id]; !stillThere {
+			removedNodes = append(removedNodes, id)
+		}
+	}
+	sort.Strings(removedNodes) // deterministic delivery order
 	f.nodes = restoredNodes
 	f.barriers = restoredBarriers
 	f.barrierOrder = restoredOrder
@@ -2366,6 +2378,7 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	}
 	f.keysCache = nil // invalidate sorted-key cache after snapshot restore
 	onNodeAdded := f.onNodeAdded
+	onNodeRemoved := f.onNodeRemoved
 	f.mu.Unlock()
 
 	f.logger.Info().
@@ -2394,6 +2407,15 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	if onNodeAdded != nil {
 		for _, node := range nodesToDeliver {
 			onNodeAdded(node)
+		}
+	}
+	// Removals after the adds: a node that is both dropped and re-added under
+	// the same id is not a thing the table can express, so the order only has
+	// to be stable, and announcing what exists before what does not keeps a
+	// consumer from briefly holding neither.
+	if onNodeRemoved != nil {
+		for _, id := range removedNodes {
+			onNodeRemoved(id)
 		}
 	}
 
