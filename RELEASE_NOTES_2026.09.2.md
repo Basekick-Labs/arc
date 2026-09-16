@@ -366,6 +366,14 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### Shutdown now stops replication, and stopping it cannot deadlock ([#853](https://github.com/Basekick-Labs/arc/issues/853))
+
+Shutting a node down never stopped its replication sender or receiver. They exited only when the shared context was cancelled and were never waited for, so a receiver could still be applying entries while the write-ahead log and the in-memory buffer were being closed underneath it, since every shutdown hook runs before any component is closed. Both are now stopped and joined as part of the coordinator's shutdown, before the Raft node goes down, and the wait for the receiver is bounded so a peer that stops answering cannot hold a shutdown open.
+
+`StopReplication` also held the coordinator's lock while waiting for those goroutines to finish, and the receiver's own goroutines take that lock to apply an entry. It had no callers, so the deadlock was never reached, but it is the shape that 26.09.2 removed from the shutdown path and it is now removed here too: the lock is held only to take a reference, and the waiting happens outside it.
+
+One related crash is fixed. The write-ahead log's replication hook calls into the sender for every appended entry, and stopping replication used to clear that reference, so any write still in flight during shutdown would have dereferenced nothing. The hook is now detached before the sender stops, the reference is left in place, and the sender itself refuses work once stopped.
+
 ### Shutdown ran its hooks in an order that depended on the configuration ([#854](https://github.com/Basekick-Labs/arc/issues/854))
 
 Shutdown hooks carry a priority and run from lowest to highest, but the sort reordered hooks that shared a priority. Ten of them share one, so their relative order depended on how many unrelated lower-priority hooks happened to be registered, which varies with the configuration: the same binary shut down in a different order standalone than in a cluster, and the comment in the code describing the intended order was true only by accident.

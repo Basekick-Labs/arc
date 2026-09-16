@@ -344,8 +344,12 @@ func (s *Sender) RemoveReader(readerID string) {
 // Replicate queues a WAL entry for replication to all readers.
 // This is called by the WAL writer via the replication hook.
 // It is non-blocking - entries are dropped if the buffer is full.
+// Replicate is nil-receiver safe. The WAL replication hook closes over the
+// coordinator and calls this for every appended entry; shutdown stops the
+// sender while the WAL is still open, so a nil or stopped sender has to be a
+// no-op rather than a panic in the ingest path (#853).
 func (s *Sender) Replicate(entry *ReplicateEntry) {
-	if !s.running.Load() {
+	if s == nil || !s.running.Load() {
 		return
 	}
 
