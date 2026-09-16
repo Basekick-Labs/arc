@@ -33,14 +33,18 @@ jobs:
           cache: true
 
       # Gated as of #875. The debt this used to wait on — eight files in
-      # compaction, reconciliation and scheduler — is cleared, and CLAUDE.md
-      # has always told contributors this must be clean, so leaving it
-      # ungated trained people to ignore the output.
+      # compaction, reconciliation and scheduler — is cleared, and the project
+      # instructions have always told contributors this must be clean, so
+      # leaving it ungated trained people to ignore the output.
+      #
+      # Whole repo, not just ./internal ./cmd: pkg/ and scripts/ are Go too,
+      # they are clean today, so covering them is free now and closes the hole
+      # permanently. It also matches `make fmt`, which formats the whole tree.
       - name: Format
         run: |
-          unformatted=$(gofmt -l ./internal ./cmd)
+          unformatted=$(gofmt -l .)
           if [ -n "$unformatted" ]; then
-            echo "These files are not gofmt-clean. Run: gofmt -w ./internal ./cmd"
+            echo "These files are not gofmt-clean. Run: gofmt -w ."
             echo "$unformatted"
             exit 1
           fi
