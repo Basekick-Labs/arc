@@ -376,6 +376,22 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### The Helm chart's compactor pod never joined the cluster ([#870](https://github.com/Basekick-Labs/arc/issues/870))
+
+Every Arc node joins Raft, whatever its role. The Enterprise chart gave the compactor pod a coordinator address but no Raft address, so its Raft transport refused an address it could not advertise, the coordinator failed to start, and the node carried on in standalone mode. The pod passed its health checks the whole time.
+
+The damage was not that the compactor sat idle. It was that it kept working, alone. A node outside the cluster falls back to its configured role for the decision of whether to compact, and its role says yes, so it compacted the shared bucket on its own schedule while the node actually holding the compactor lease compacted it too. Two compactors on one bucket is the duplicate-output hazard the single-compactor design exists to prevent. That ends here.
+
+Readers shipped with the same gap once and were fixed. The compactor was never given the same treatment, and the helper that carries the Raft settings still described them as writer-only, which is the belief that produced both. It now applies to every role, so each one binds its Raft port explicitly instead of relying on a default that merely happened to match. A rendered-template check in CI asserts that every clustered role carries a Raft address, against the default values and both deployment presets.
+
+The local-storage preset also still asked for a single writer, so following the Pattern 1 guide silently overrode the new default of three back down to one. It now matches.
+
+**Upgrading:** applying the new chart restarts the compactor pod, after which it joins the cluster for the first time and stops compacting behind the cluster's back.
+
+It will not immediately start compacting on the cluster's behalf either. The compactor lease is deliberately never preempted: whichever node holds it keeps it until it becomes unhealthy. On an existing cluster that node is a writer, chosen precisely because no compactor was visible. So after the upgrade the dedicated compactor pod idles while a writer continues to do the work. Nothing is lost and nothing is duplicated, but the node you provisioned for compaction is not doing it. To hand the lease over, restart the writer that holds it. That node is named in the `Compactor lease assigned` log line on the Raft leader, which is the only place it is reported: no endpoint exposes the current holder today. Tracked as [#876](https://github.com/Basekick-Labs/arc/issues/876).
+
+Two things this does **not** change in the chart's default shared-storage mode, contrary to what you might expect. Compacted files are still not registered in the Raft manifest, because that path is gated on peer replication, which shared storage does not use. And the "No compactor elected" warning was never firing there for the same reason, so its absence is not evidence of anything.
+
 ### An unlimited Enterprise license rejected every cluster join ([#869](https://github.com/Basekick-Labs/arc/issues/869))
 
 Licenses on the unlimited tier carry a core limit of `-1`. The cluster join validator treated only `0` as unlimited, so it compared every joining node's core count against `-1`, found it larger, and refused. The seed node ran alone, every other node retried forever, and the log said "cluster core limit exceeded ... license limit=-1". A cluster on that tier could never form. Single-node deployments were unaffected, which is why this survived: the check only runs when a second node tries to join.

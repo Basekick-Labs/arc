@@ -38,8 +38,11 @@ spec:
               containerPort: 8000
             - name: coordinator
               containerPort: 9100
+            - name: raft
+              containerPort: 9200
           env:
             {{- include "arc-enterprise.commonClusterEnv" . | nindent 12 }}
+            {{- include "arc-enterprise.raftEnv" . | nindent 12 }}
             - name: ARC_CLUSTER_ROLE
               value: "reader"
             - name: ARC_CLUSTER_ADVERTISE_ADDR

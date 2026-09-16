@@ -110,3 +110,39 @@ jobs:
             echo "$unwrapped"
             exit 1
           fi
+
+  # A rendered-template check, in its own job because it needs helm and not Go.
+  # It is fast and has no build step, so it reports long before Build & Test.
+  chart:
+    name: Enterprise chart
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned: this gate parses rendered manifest text and relies on the
+      # chart's schema validation, so an unpinned helm makes the check
+      # whatever shipped that morning.
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      # Every Arc pod joins Raft, whatever its role. A role whose pod has no
+      # advertisable Raft address falls back to standalone mode and is
+      # invisible to the cluster while looking healthy. Readers shipped that
+      # way once and were fixed; the compactor shipped that way until #870.
+      #
+      # Both presets, not just the default values: they are what the
+      # deployment guides tell operators to use.
+      - name: Every clustered role can join Raft (default values)
+        run: bash scripts/test_cluster_raft_env.sh helm/arc-enterprise
+
+      - name: Every clustered role can join Raft (local storage preset)
+        run: |
+          bash scripts/test_cluster_raft_env.sh helm/arc-enterprise writer,reader,compactor \
+            -f helm/arc-enterprise/values-local-storage.yaml
+
+      - name: Every clustered role can join Raft (shared storage preset)
+        run: |
+          bash scripts/test_cluster_raft_env.sh helm/arc-enterprise writer,reader,compactor \
+            -f helm/arc-enterprise/values-shared-storage.yaml
