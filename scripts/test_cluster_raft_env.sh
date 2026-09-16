@@ -16,7 +16,13 @@ set -euo pipefail
 
 chart="${1:-helm/arc-enterprise}"
 expected="${2:-writer,reader,compactor}"
-shift 2 2>/dev/null || true
+# Shift one at a time. `shift 2` fails outright when fewer than two arguments
+# were given, and swallowing that failure leaves the arguments in place, so
+# "$@" below passed the chart path to helm a second time as a positional
+# argument. CI calls this with exactly one argument; local runs used none or
+# three, so both arities I tested worked and the one that shipped did not.
+if [ $# -gt 0 ]; then shift; fi
+if [ $# -gt 0 ]; then shift; fi
 
 manifest=$(mktemp)
 trap 'rm -f "$manifest"' EXIT
