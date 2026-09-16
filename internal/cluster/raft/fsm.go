@@ -501,6 +501,7 @@ type ClusterFSM struct {
 	onNodeRemoved       func(string)
 	onNodeUpdated       func(*NodeInfo)
 	onWriterPromoted    func(newPrimaryID, oldPrimaryID string)
+	onWriterDemoted     func(nodeID string)
 	onCompactorAssigned func(newCompactorID, oldCompactorID string)
 	onFileRegistered    func(*FileEntry)
 	onFileDeleted       func(path string, reason string)
@@ -643,6 +644,17 @@ func (f *ClusterFSM) SetCallbacks(onAdded func(*NodeInfo), onRemoved func(string
 	f.onNodeAdded = onAdded
 	f.onNodeRemoved = onRemoved
 	f.onNodeUpdated = onUpdated
+}
+
+// SetWriterDemotedCallback sets the callback for writer demotion events.
+//
+// Registry-only, like the other FSM callbacks: it runs on the Raft FSM
+// goroutine, including inside raft.NewRaft during a restore, so it must not
+// take the coordinator or Raft node locks (#797, #813).
+func (f *ClusterFSM) SetWriterDemotedCallback(cb func(nodeID string)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onWriterDemoted = cb
 }
 
 // SetWriterPromotedCallback sets the callback for writer promotion events.
@@ -965,6 +977,15 @@ func (f *ClusterFSM) applyRemoveNode(payload []byte) interface{} {
 
 	f.mu.Lock()
 	delete(f.nodes, p.NodeID)
+	// Removing the designated primary has to release the designation, or the
+	// record names a node that no longer exists and the election — which only
+	// runs when nothing is designated — never fires again. Removing the dead
+	// primary is the obvious operator move, and before this it wedged the
+	// cluster: no primary, no retention, no continuous queries, no deletes,
+	// and nothing saying why (#872).
+	if f.primaryWriterID == p.NodeID {
+		f.primaryWriterID = ""
+	}
 	callback := f.onNodeRemoved
 	f.mu.Unlock()
 
@@ -1103,18 +1124,37 @@ func (f *ClusterFSM) applyDemoteWriter(payload []byte) interface{} {
 	if exists {
 		node.WriterState = "standby"
 	}
+	// Clear the designation whether or not the node record survives: a
+	// hand-over of a primary that has since been removed must still leave the
+	// cluster free to elect, and the caller reads this field to decide.
+	cleared := false
 	if f.primaryWriterID == p.NodeID {
 		f.primaryWriterID = ""
+		cleared = true
 	}
+	callback := f.onWriterDemoted
 	f.mu.Unlock()
+
+	f.logger.Info().
+		Str("node_id", p.NodeID).
+		Bool("was_primary", cleared).
+		Bool("node_known", exists).
+		Msg("Writer demoted to standby")
+
+	// Announce it. A promotion has always had a callback; a demotion never
+	// did, because until now one only ever happened as the back half of a
+	// promotion, which announced itself. As a standalone operator action it
+	// has to carry its own news: without this the demoted node's registry
+	// entry and its own localNode still say "primary", so it goes on running
+	// retention, continuous queries and deletes, and the leader still sees a
+	// live primary so no election is ever triggered (#872).
+	if callback != nil {
+		callback(p.NodeID)
+	}
 
 	if !exists {
 		return fmt.Errorf("node %s not found", p.NodeID)
 	}
-
-	f.logger.Info().
-		Str("node_id", p.NodeID).
-		Msg("Writer demoted to standby")
 
 	return nil
 }

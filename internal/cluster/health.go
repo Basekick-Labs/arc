@@ -50,10 +50,11 @@ const (
 	// per-node storage, one primary writer, replacement by Raft promotion.
 	// The promotion pool is writer-role nodes only.
 	writerRedundancyFailover
-	// writerRedundancyNoFailover is Pattern 1 with no failover manager —
-	// cluster.failover_enabled off, no Raft, or a license without the
-	// writer_failover feature. Nothing promotes anything here, which makes a
-	// thin writer count worse rather than better, so this mode warns too.
+	// writerRedundancyNoFailover is Pattern 1 without AUTOMATIC failover —
+	// cluster.failover_enabled off, or a license without the writer_failover
+	// feature. A primary is still elected (#872); what this cluster does not
+	// get is a replacement chosen for it when that primary dies, which makes a
+	// thin writer count worse rather than better.
 	writerRedundancyNoFailover
 	// writerRedundancyLoadBalanced is Pattern 2: shared object storage, N
 	// equivalent writers behind a load balancer. Writer promotion is
@@ -359,19 +360,20 @@ func writerRedundancyMessage(mode writerRedundancyMode, writers, voters int) str
 			"Run three nodes with ARC_CLUSTER_ROLE=writer." + quorum
 
 	case writerRedundancyNoFailover:
-		// No failover manager means no CommandPromoteWriter is ever issued,
-		// and IsPrimaryWriter then treats EVERY writer-role node as primary.
-		// So more writers is not a fix here on its own — enabling failover is
-		// the first step, and adding writers without it makes each of them a
-		// singleton runner.
-		return "This cluster has fewer than three writer-role nodes and no writer " +
-			"failover: nothing promotes a replacement, and readers are never " +
-			"promotion candidates, so losing a writer stops ingest until an " +
-			"operator intervenes. Set cluster.failover_enabled=true (Enterprise, " +
-			"requires the writer_failover feature) and run three nodes with " +
-			"ARC_CLUSTER_ROLE=writer. Do not add writers without enabling it: " +
-			"with no failover manager every writer-role node treats itself as " +
-			"the primary for retention, continuous queries and deletes." + quorum
+		// A primary IS elected here — that stopped being conditional on the
+		// licence in #872. What this cluster does not get is a replacement
+		// chosen for it when that primary dies, so more writers is not the
+		// whole fix: enabling automatic failover is, and until then losing the
+		// primary means an operator has to hand the role over by hand.
+		return "This cluster has fewer than three writer-role nodes and no " +
+			"automatic writer failover: one primary is elected, but nothing " +
+			"will choose a replacement when it goes, and readers are never " +
+			"promotion candidates. Losing the primary stops retention, " +
+			"continuous queries and deletes until an operator hands the role " +
+			"over with POST /api/v1/cluster/writers/{id}/demote. Set " +
+			"cluster.failover_enabled=true (Enterprise, requires the " +
+			"writer_failover feature) and run three nodes with " +
+			"ARC_CLUSTER_ROLE=writer." + quorum
 
 	default: // writerRedundancyFailover
 		if writers < 2 {

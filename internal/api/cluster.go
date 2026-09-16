@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"sort"
 	"strconv"
 
@@ -80,6 +81,90 @@ func (h *ClusterHandler) RegisterRoutes(app *fiber.App) {
 		removeGroup.Use(auth.RequireAdmin(h.authManager))
 	}
 	removeGroup.Delete("", h.handleRemoveNode)
+
+	// Admin-only: hands the primary-writer role off a node so the cluster
+	// elects a new one. Deliberately NOT gated on the writer_failover licence
+	// — that feature is AUTOMATIC failover, and this is the manual recovery a
+	// cluster without it needs (#872).
+	writerGroup := app.Group("/api/v1/cluster/writers/:id")
+	if h.authManager != nil {
+		writerGroup.Use(auth.RequireAdmin(h.authManager))
+	}
+	writerGroup.Post("/demote", h.handleDemoteWriter)
+}
+
+// handleDemoteWriter hands the primary-writer role off the named node.
+//
+// The caller does not choose a successor, and should not: clearing the
+// designation is what lets the cluster's own election run, and it already
+// applies the selection rules. On a cluster with automatic failover this is a
+// way to drain a writer deliberately; on one without, it is the only way to
+// recover after the primary is gone for good.
+func (h *ClusterHandler) handleDemoteWriter(c *fiber.Ctx) error {
+	// Validate the input before anything else, so a malformed request is
+	// rejected the same way whether or not this node is clustered.
+	nodeID := c.Params("id")
+	if len(nodeID) == 0 || len(nodeID) > maxNodeIDLength {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   "invalid node ID",
+		})
+	}
+
+	// Deliberately NOT respondNotEnabled, which the read endpoints use: it
+	// answers 200 with enabled=false, which is right for "describe yourself"
+	// and wrong for "do this". A caller checking the status code would read it
+	// as a hand-over that happened.
+	if h.coordinator == nil {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"success": false,
+			"error":   "clustering is not enabled on this node, so there is no primary writer to hand over",
+		})
+	}
+
+	newPrimary, err := h.coordinator.DemoteWriterViaRaft(nodeID)
+	if err != nil {
+		// A wrong target is the operator's mistake to see and correct, not a
+		// server fault: it names which node the cluster actually has on
+		// record. Not being the leader is a 409 for the same reason — retry
+		// against the leader.
+		status := fiber.StatusInternalServerError
+		switch {
+		case errors.Is(err, cluster.ErrNotPrimaryWriter):
+			status = fiber.StatusConflict
+		case errors.Is(err, cluster.ErrNotLeaderForTopology):
+			status = fiber.StatusConflict
+		}
+		if status == fiber.StatusInternalServerError {
+			h.logger.Error().Err(err).Str("node_id", nodeID).Msg("Failed to hand over the primary writer")
+		}
+		return c.Status(status).JSON(fiber.Map{
+			"success": false,
+			"error":   err.Error(),
+		})
+	}
+
+	h.logger.Info().
+		Str("node_id", nodeID).
+		Str("new_primary", newPrimary).
+		Msg("Primary writer handed over via API")
+
+	// Report who took it, so the operator does not have to go looking — and
+	// say plainly when nobody did, which is the single-writer case.
+	if newPrimary == "" {
+		return c.JSON(fiber.Map{
+			"success":     true,
+			"node_id":     nodeID,
+			"new_primary": nil,
+			"message":     "primary writer designation released, but no other writer was available to take it — this cluster has no primary until one is",
+		})
+	}
+	return c.JSON(fiber.Map{
+		"success":     true,
+		"node_id":     nodeID,
+		"new_primary": newPrimary,
+		"message":     "primary writer handed over",
+	})
 }
 
 // handleGetStatus returns the overall cluster status.
