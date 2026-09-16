@@ -56,6 +56,10 @@ type Server struct {
 	// reorderings safe). In-memory reads only — /health never probes S3.
 	storageStatus func() map[string]database.StorageTierStatus
 
+	// mayAcceptIngest backs /ready/write. Nil means "this node takes writes
+	// whenever it is ready", which is right for a single-node deployment.
+	mayAcceptIngest func() bool
+
 	// dbStats supplies the DuckDB connection-pool snapshot for the metrics
 	// endpoints (#809). Nil when no database is wired, e.g. a test server or
 	// an OSS standalone that never calls SetDBStats — sampleDBStats guards it.
@@ -221,6 +225,7 @@ func (s *Server) RegisterRoutes() {
 
 	// Readiness check (for Kubernetes)
 	s.app.Get("/ready", s.readyHandler)
+	s.app.Get("/ready/write", s.readyWriteHandler)
 
 	// Metrics endpoint (Prometheus format)
 	s.app.Get("/metrics", s.metricsHandler)
@@ -256,6 +261,47 @@ func (s *Server) RegisterLogsRoute(authManager *auth.AuthManager) {
 // SetLicenseStatus wires the /health "license" field source.
 func (s *Server) SetLicenseStatus(fn func() license.LicenseHealth) {
 	s.licenseStatus = fn
+}
+
+// readyWriteHandler answers whether a load balancer should route WRITES to
+// this node, which is not the same question as /ready. A reader is ready and
+// must not be in a write pool; in local-storage mode only the elected primary
+// writer should be; in shared-storage mode every healthy writer should be.
+//
+// It is strictly narrower than /ready: anything that makes this node unready
+// makes it unready for writes too, so the readiness checks run first and this
+// endpoint can only subtract. A node draining on expired storage credentials,
+// or still replaying its write-ahead log, is not a write target.
+func (s *Server) readyWriteHandler(c *fiber.Ctx) error {
+	if problem := s.readinessProblem(); problem != nil {
+		body := fiber.Map{
+			"status": "not_ready",
+			"time":   time.Now().UTC().Format(time.RFC3339),
+			"reason": problem.reason,
+		}
+		if problem.tier != "" {
+			body["tier"] = problem.tier
+		}
+		return c.Status(fiber.StatusServiceUnavailable).JSON(body)
+	}
+	if s.mayAcceptIngest != nil && !s.mayAcceptIngest() {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"status": "not_write_target",
+			"time":   time.Now().UTC().Format(time.RFC3339),
+			"reason": "this node does not accept writes in its current cluster role; route writes to a writer",
+		})
+	}
+	return c.JSON(fiber.Map{
+		"status": "ready",
+		"time":   time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// SetWriteReadiness wires the predicate behind /ready/write: whether writes
+// should be routed to this node. Left unset — OSS, or any non-clustered
+// deployment — the node accepts writes whenever it is ready at all.
+func (s *Server) SetWriteReadiness(fn func() bool) {
+	s.mayAcceptIngest = fn
 }
 
 // SetStorageStatus wires the per-tier storage credential status source
@@ -347,15 +393,20 @@ func (s *Server) healthHandler(c *fiber.Ctx) error {
 //     check /health for liveness ("is the process alive") and /ready
 //     for traffic-routing decisions ("should requests go here right
 //     now").
-func (s *Server) readyHandler(c *fiber.Ctx) error {
-	if !s.ready.Load() {
-		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-			"status": "not_ready",
-			"time":   time.Now().UTC().Format(time.RFC3339),
-			"reason": "server is starting up or shutting down; load balancer should not route traffic here",
-		})
-	}
+//
+// notReady describes why this node is not ready, for both readiness endpoints.
+type notReady struct {
+	reason string
+	tier   string
+}
 
+// readinessProblem returns the reason this node is not ready, or nil. Shared
+// by /ready and /ready/write so the two cannot drift: everything that makes a
+// node unready makes it unready for writes too.
+func (s *Server) readinessProblem() *notReady {
+	if !s.ready.Load() {
+		return &notReady{reason: "server is starting up or shutting down; load balancer should not route traffic here"}
+	}
 	// Opt-in (#603): drain this node while storage credentials are expired.
 	// Checked after the ready flag — this can only remove readiness. Only
 	// "expired" qualifies; see SetStorageStatus.
@@ -365,14 +416,24 @@ func (s *Server) readyHandler(c *fiber.Ctx) error {
 		// expired.
 		for _, tier := range []string{"hot", "cold"} {
 			if ts, ok := st[tier]; ok && ts.State == database.CredStateExpired {
-				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-					"status": "not_ready",
-					"time":   time.Now().UTC().Format(time.RFC3339),
-					"reason": "storage_credentials_expired",
-					"tier":   tier,
-				})
+				return &notReady{reason: "storage_credentials_expired", tier: tier}
 			}
 		}
+	}
+	return nil
+}
+
+func (s *Server) readyHandler(c *fiber.Ctx) error {
+	if problem := s.readinessProblem(); problem != nil {
+		body := fiber.Map{
+			"status": "not_ready",
+			"time":   time.Now().UTC().Format(time.RFC3339),
+			"reason": problem.reason,
+		}
+		if problem.tier != "" {
+			body["tier"] = problem.tier
+		}
+		return c.Status(fiber.StatusServiceUnavailable).JSON(body)
 	}
 
 	uptime := time.Since(startTime).Seconds()

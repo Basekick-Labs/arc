@@ -671,6 +671,8 @@ func (c *Coordinator) Stop() error {
 	// send on it.
 	puller := c.puller
 	c.puller = nil
+	replicationSender := c.replicationSender
+	replicationReceiver := c.replicationReceiver
 	writerFailover := c.writerFailoverMgr
 	compactorFailover := c.compactorFailoverMgr
 	raftNode := c.raftNode
@@ -702,6 +704,12 @@ func (c *Coordinator) Stop() error {
 			c.logger.Error().Err(err).Msg("Error stopping compactor failover manager")
 		}
 	}
+
+	// Replication is joined before Raft: the receiver applies entries through
+	// the ingest handler, and its goroutines were previously left running on
+	// the shared context alone, so a receiver still draining could write into
+	// a WAL and an Arrow buffer that shutdown was already closing (#853).
+	c.stopReplicationSubsystems(replicationSender, replicationReceiver)
 
 	if raftNode != nil {
 		if err := raftNode.Stop(); err != nil {
@@ -2170,6 +2178,33 @@ func (c *Coordinator) GetRole() NodeRole {
 //  3. Pattern 1 single-writer with failover manager: the failover manager
 //     issues CommandPromoteWriter to elect one writer as primary; only that
 //     node returns true. Same as today.
+//
+// MayAcceptIngest reports whether writes should be sent to this node. It is
+// what a load balancer's write pool needs, and it is NOT IsPrimaryWriter:
+// in shared-storage mode every healthy writer accepts writes, while
+// IsPrimaryWriter names the single node that runs singleton work, so pointing
+// a write pool at that would collapse an N-writer cluster onto one node.
+//
+//   - a role that cannot ingest never accepts writes
+//   - shared storage: every writer accepts, the pattern's whole premise
+//   - standalone: accepts, it is the whole deployment
+//   - no failover manager: any writer accepts, which is the same fallback
+//     IsPrimaryWriter uses when no promotion can ever happen
+//   - otherwise: only the elected primary
+func (c *Coordinator) MayAcceptIngest() bool {
+	node := c.GetLocalNode()
+	if node == nil {
+		return false
+	}
+	if !node.Role.GetCapabilities().CanIngest {
+		return false
+	}
+	if c.cfg.SharedStorageMode || node.Role == RoleStandalone || c.writerFailoverMgr == nil {
+		return true
+	}
+	return node.IsPrimaryWriter()
+}
+
 func (c *Coordinator) IsPrimaryWriter() bool {
 	// Pattern 2 multi-writer: singleton tasks gate on Raft leader AND
 	// RoleWriter. The role check is load-bearing — every joining node
@@ -3343,22 +3378,63 @@ func rowsToColumns(rows []map[string]interface{}) map[string][]interface{} {
 }
 
 // StopReplication stops WAL replication.
-func (c *Coordinator) StopReplication() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// replicationStopTimeout bounds how long shutdown waits for the replication
+// receiver. Its connect path does not observe the context, so a Stop that
+// races a dial can otherwise wait for the protocol's own timeouts — the kind
+// of shutdown stall #813 existed to remove.
+const replicationStopTimeout = 5 * time.Second
 
+func (c *Coordinator) StopReplication() {
+	// The joins happen OUTSIDE c.mu. The receiver's goroutines apply entries
+	// through the ingest handler, which takes c.mu.RLock, so joining them
+	// under the write lock deadlocks — the shape #813 removed from Stop.
+	c.mu.Lock()
 	if c.cancel != nil {
 		c.cancel()
 	}
+	sender := c.replicationSender
+	receiver := c.replicationReceiver
+	c.mu.Unlock()
 
-	if c.replicationSender != nil {
-		c.replicationSender.Stop()
-		c.replicationSender = nil
+	c.stopReplicationSubsystems(sender, receiver)
+}
+
+// stopReplicationSubsystems stops the sender and receiver without holding
+// c.mu. The fields are deliberately NOT cleared: the WAL replication hook
+// closes over the coordinator and calls Replicate for every appended entry,
+// so a nil field would be dereferenced by any write still in flight. A
+// stopped sender already refuses the work.
+func (c *Coordinator) stopReplicationSubsystems(sender *replication.Sender, receiver *replication.Receiver) {
+	// Unhook the WAL first, so nothing new is handed to a sender that is on
+	// its way down.
+	if c.walWriter != nil {
+		c.walWriter.SetReplicationHook(nil)
 	}
-
-	if c.replicationReceiver != nil {
-		c.replicationReceiver.Stop()
-		c.replicationReceiver = nil
+	if sender != nil {
+		if err := sender.Stop(); err != nil {
+			c.logger.Error().Err(err).Msg("Error stopping replication sender")
+		}
+	}
+	if receiver == nil {
+		return
+	}
+	// The receiver's connect path is not context-aware, so a Stop that races
+	// a dial can wait for the protocol's timeouts. Bound it: a shutdown must
+	// not sit here, and the goroutines exit on their own once the context is
+	// cancelled.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := receiver.Stop(); err != nil {
+			c.logger.Error().Err(err).Msg("Error stopping replication receiver")
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(replicationStopTimeout):
+		c.logger.Warn().
+			Dur("waited", replicationStopTimeout).
+			Msg("Replication receiver did not stop in time; continuing shutdown without it")
 	}
 }
 

@@ -59,6 +59,16 @@ Readers replicate the write-ahead log and serve queries, but they are never prom
 
 Existing installs are unaffected until they next apply their own values. An install that deliberately wants a single writer, for development or a single-node deployment, can still set the count to one.
 
+## New: a write-pool health check at `GET /ready/write` ([#857](https://github.com/Basekick-Labs/arc/issues/857))
+
+`/ready` answers whether a node is healthy, and every healthy node answers it, readers included. A load balancer's write pool pointed at it therefore sends writes to nodes that can only proxy them onward, which makes those nodes responsible for carrying other nodes' ingest.
+
+`GET /ready/write` answers the narrower question: should writes be sent here. It returns 200 on a node that accepts ingest and 503 otherwise, with a body naming which. In shared-storage mode every healthy writer answers 200, because that is the whole point of the pattern. In local-storage mode only the elected primary writer does. Readers and compactors never do, and a single-node deployment always does. One load-balancer configuration is therefore correct in both patterns.
+
+It is unauthenticated, like `/ready`, and strictly narrower: anything that makes a node unready for traffic also makes it unready for writes, so a node draining on expired storage credentials or still replaying its write-ahead log is not a write target either. Point the write pool at `/ready/write` and leave query pools and Kubernetes probes on `/ready`, whose meaning is unchanged.
+
+Writes that arrive at a node which is not a write target are still accepted and proxied, as before. This endpoint lets a load balancer avoid that hop rather than changing what happens without one.
+
 ## Changed: telemetry now reports the arcli installations an instance served
 
 Arc's opt-out telemetry gains a `clients` section describing the [arcli](https://github.com/Basekick-Labs/arcli) installations that talked to this instance since the last successful report. arcli sends a random per-installation UUID and its version with each request. Arc counts an installation only on a request that succeeded (a status below 400) and, when authentication is configured, that carried a valid token, so unauthenticated endpoints such as `/health` never contribute. It then reports, per installation, the id, the version, and the time it was last seen, plus a count and a `truncated` flag once more than 256 distinct installations have been seen between reports. The section is omitted entirely when no arcli client was seen.
@@ -375,6 +385,14 @@ A cluster running below three writer-role nodes now logs a rate-limited warning 
 The deficit has to hold for two minutes before anything is logged. That covers the two ways a healthy cluster passes through a low writer count on its way somewhere else. A cluster is short of writers for the first seconds of its life while peers are still joining. And a rolling upgrade cycles one writer at a time, and a leaving node tells its peers to drop it, so a correct three-writer cluster walks through two writers on every node, every time. A single-node install never warns at all: it has no redundancy of any kind and its operator knows that. The shape this exists for is the one that looks highly available, several nodes of which exactly one is a writer.
 
 Every cluster mode gets the warning, with the right explanation for each. With local storage and failover enabled, the message explains that readers are never promotion candidates. With shared storage, that writer promotion is deliberately suppressed in that pattern, so the load balancer's backend count is the only thing between a writer crash and an ingest outage. With local storage and no failover manager, because the flag is off or the license does not carry the feature, it says that nothing promotes anything, and it warns against adding writers without first enabling failover: with no failover manager every writer-role node considers itself the primary for retention, continuous queries and deletes.
+
+### Shutdown now stops replication, and stopping it cannot deadlock ([#853](https://github.com/Basekick-Labs/arc/issues/853))
+
+Shutting a node down never stopped its replication sender or receiver. They exited only when the shared context was cancelled and were never waited for, so a receiver could still be applying entries while the write-ahead log and the in-memory buffer were being closed underneath it, since every shutdown hook runs before any component is closed. Both are now stopped and joined as part of the coordinator's shutdown, before the Raft node goes down, and the wait for the receiver is bounded so a peer that stops answering cannot hold a shutdown open.
+
+`StopReplication` also held the coordinator's lock while waiting for those goroutines to finish, and the receiver's own goroutines take that lock to apply an entry. It had no callers, so the deadlock was never reached, but it is the shape that 26.09.2 removed from the shutdown path and it is now removed here too: the lock is held only to take a reference, and the waiting happens outside it.
+
+One related crash is fixed. The write-ahead log's replication hook calls into the sender for every appended entry, and stopping replication used to clear that reference, so any write still in flight during shutdown would have dereferenced nothing. The hook is now detached before the sender stops, the reference is left in place, and the sender itself refuses work once stopped.
 
 ### Shutdown ran its hooks in an order that depended on the configuration ([#854](https://github.com/Basekick-Labs/arc/issues/854))
 
