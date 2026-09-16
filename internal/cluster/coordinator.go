@@ -90,8 +90,13 @@ type Coordinator struct {
 	// WAL Replication (Phase 3.3)
 	replicationSender   *replication.Sender   // Writer only: sends entries to readers
 	replicationReceiver *replication.Receiver // Reader only: receives entries from writer
-	walWriter           *wal.Writer           // Reference to local WAL for replication hook
-	ingestBuffer        *ingest.ArrowBuffer   // Reader only: applies replicated entries to local buffer
+	// replicationRetarget pokes replicationTargetLoop to re-evaluate which
+	// writer this node should stream from. Depth 1: a poke while one is
+	// already pending is dropped, because the pending evaluation will read
+	// the same (latest) registry state anyway.
+	replicationRetarget chan struct{}
+	walWriter           *wal.Writer         // Reference to local WAL for replication hook
+	ingestBuffer        *ingest.ArrowBuffer // Reader only: applies replicated entries to local buffer
 
 	// Peer file replication (Enterprise Phase 2)
 	// storage is the local storage backend — used both by the fetch handler
@@ -313,13 +318,14 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	}
 
 	c := &Coordinator{
-		cfg:           cfg.Config,
-		licenseClient: cfg.LicenseClient,
-		registry:      registry,
-		localNode:     localNode,
-		tlsConfig:     tlsCfg,
-		stopCh:        make(chan struct{}),
-		logger:        logger,
+		cfg:                 cfg.Config,
+		licenseClient:       cfg.LicenseClient,
+		registry:            registry,
+		localNode:           localNode,
+		tlsConfig:           tlsCfg,
+		stopCh:              make(chan struct{}),
+		replicationRetarget: make(chan struct{}, 1),
+		logger:              logger,
 	}
 
 	if tlsCfg != nil {
@@ -2874,6 +2880,11 @@ func (c *Coordinator) onWriterPromoted(newPrimaryID, oldPrimaryID string) {
 		Str("new_primary", newPrimaryID).
 		Str("old_primary", oldPrimaryID).
 		Msg("Writer promotion applied to registry")
+
+	// The set of writers with live entries to stream just changed. Ask the
+	// replication target loop to re-point. No-op on a writer, which runs a
+	// Sender and no loop.
+	c.pokeReplicationRetarget()
 }
 
 // onWriterDemoted is the FSM callback fired when a CommandDemoteWriter is
@@ -2897,6 +2908,19 @@ func (c *Coordinator) onWriterDemoted(nodeID string) {
 	c.logger.Info().
 		Str("node_id", nodeID).
 		Msg("Writer demotion applied to registry")
+
+	// Demotion is its own trigger, not just the other half of a promotion:
+	// HandOver with no eligible candidate issues DemoteWriter alone, and with
+	// automatic failover off the cluster can then sit with no primary at all.
+	// A replica attached to the node just demoted has to re-evaluate, and only
+	// this callback tells it to.
+	//
+	// Note what it re-evaluates TO in that state: applyDemoteWriter clears the
+	// FSM's primary record, so no node is designated, every writer accepts
+	// again, and the replica settles on the deterministic fallback. That is the
+	// intended outcome — with no primary there is no better answer — not the
+	// accept-side check failing to bite.
+	c.pokeReplicationRetarget()
 }
 
 // onCompactorAssigned is the FSM callback fired when a CommandAssignCompactor
@@ -3509,56 +3533,274 @@ func (c *Coordinator) StartReplication() error {
 			Msg("Replication sender started (writer mode)")
 
 	} else {
-		// Reader: start receiver to get entries from writer
-		writerAddr := c.findWriterAddr()
-		if writerAddr == "" {
-			c.logger.Warn().Msg("No writer found for replication, will retry when writer joins")
-			// Start a goroutine to wait for writer and then start receiver
-			go c.waitForWriterAndStartReceiver()
-			return nil
-		}
-
-		if err := c.startReceiverWithAddr(writerAddr); err != nil {
-			return err
-		}
+		// Reader/compactor: replicationTargetLoop owns the receiver's entire
+		// lifecycle. It attaches on its first pass and re-points whenever the
+		// cluster's primary writer changes.
+		//
+		// Making it the single owner is what keeps the invariant simple: one
+		// goroutine decides the target, stops the old receiver and installs
+		// the new one, so "two live receivers" is not a state the code can
+		// reach. The previous shape — an inline start here, or a
+		// wait-for-a-writer goroutine when no writer was visible yet — was not
+		// racy, because the two were mutually exclusive and neither ever
+		// re-targeted. It simply had nowhere to put a re-target.
+		go c.replicationTargetLoop()
 	}
 
 	return nil
 }
 
-// findWriterAddr finds a healthy writer node's coordinator address.
+// designatedPrimaryWriterID returns the primary writer the CLUSTER has on
+// record, or "" when none has ever been designated.
+//
+// This is the durable Raft record, not Registry.GetPrimaryWriter, which filters
+// on health and so goes nil the moment the primary dies. The distinction
+// matters here for the same reason it does in writer_failover.go: "nobody has
+// been designated yet" is a booting cluster, while "someone else is designated"
+// is a settled one.
+func (c *Coordinator) designatedPrimaryWriterID() string {
+	if c.raftNode == nil {
+		return ""
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return ""
+	}
+	return fsm.GetPrimaryWriterID()
+}
+
+// findWriterAddr returns the coordinator address of the writer this node should
+// replicate from.
+//
+// The designated primary is preferred. In local-storage mode (Pattern 1) only
+// the primary ingests, so a standby writer's Sender has nothing to stream:
+// attaching to one means receiving no live entries at all, which is #885. The
+// old implementation ranged the registry map and took the first healthy writer,
+// so with the three-writer default it picked a standby roughly two times in
+// three.
+//
+// The primary is identified from the FSM's durable record, NOT from
+// Registry.GetPrimaryWriter. That is deliberate, and it is the same
+// discriminator AcceptReplicationConnection uses on the writer side. The
+// registry's view filters on health, so it goes nil the moment the primary
+// looks unhealthy; the FSM's keeps naming whoever was promoted until something
+// demotes them. If the two sides disagreed, a replica whose registry had gone
+// nil would fall back to some other writer — whose FSM still names the old
+// primary, and which therefore refuses it. Replication would be dark for the
+// whole failover window, and permanently on a cluster whose automatic failover
+// is off. Reading the same record on both sides makes that disagreement
+// impossible rather than unlikely.
+//
+// Attaching to a designated primary that is currently unhealthy is the right
+// behaviour, not a bug: there is nowhere else with live entries to get, the
+// dial simply fails and retries, and a promotion re-targets us.
+//
+// The fallback covers the states where no primary is designated at all:
+// Pattern 2, where none ever is, and Pattern 1 before its first election. It is
+// ordered by node ID rather than by map iteration so that repeated calls return
+// the same answer — the target loop compares its choice against the live
+// receiver's address, and a fallback that reshuffled would tear down a working
+// stream on most ticks.
 func (c *Coordinator) findWriterAddr() string {
-	nodes := c.registry.GetByRole(RoleWriter)
-	for _, node := range nodes {
-		if node.State == StateHealthy && node.ID != c.localNode.ID {
+	// The self-check is load-bearing for the same reason it always was: a node
+	// must never be handed its own address to dial. Unreachable today, since
+	// writers take the Sender branch in StartReplication, but a future role
+	// change would otherwise make this a self-connect loop.
+	if designated := c.designatedPrimaryWriterID(); designated != "" && designated != c.localNode.ID {
+		if node, ok := c.registry.Get(designated); ok && node.Address != "" {
 			return node.Address
 		}
+		// The registry does not have it. A primary that merely goes unhealthy
+		// stays in the registry, but one that is removed — an eviction, or a
+		// restart this node has not re-discovered yet — is gone from it while
+		// the FSM still designates it. Resolve the address from the FSM, which
+		// is where the designation came from and which keeps the record.
+		//
+		// Falling through to the fallback here is NOT an option: every writer
+		// checks this same designation before accepting, so any other writer
+		// refuses us, and we would reconnect into that refusal every interval.
+		// Observed on a live cluster before this branch existed — a reader that
+		// lost its primary hammered a standby with a rejected handshake every
+		// five seconds while the primary was up and serving.
+		if c.raftNode != nil {
+			if fsm := c.raftNode.FSM(); fsm != nil {
+				if info, ok := fsm.GetNode(designated); ok && info.Address != "" {
+					return info.Address
+				}
+			}
+		}
+		// Designated but unresolvable anywhere. There is no other node with
+		// live entries to stream, so hold rather than attach somewhere that
+		// will refuse.
+		c.logger.Debug().
+			Str("designated_primary", designated).
+			Msg("Designated primary writer has no known address; holding the current replication target")
+		return ""
+	}
+
+	var fallback *Node
+	for _, node := range c.registry.GetByRole(RoleWriter) {
+		if node.State != StateHealthy || node.ID == c.localNode.ID {
+			continue
+		}
+		if fallback == nil || node.ID < fallback.ID {
+			fallback = node
+		}
+	}
+	if fallback != nil {
+		return fallback.Address
 	}
 	return ""
 }
 
-// waitForWriterAndStartReceiver waits for a writer node to appear and starts the receiver.
-func (c *Coordinator) waitForWriterAndStartReceiver() {
-	ticker := time.NewTicker(5 * time.Second)
+// replicationRetargetInterval is how often a replica re-checks that it is still
+// streaming from the cluster's designated primary writer.
+//
+// The promotion and demotion callbacks cover hand-overs that happen while this
+// node is already attached. The ticker covers the case they cannot: a replica
+// joining a cluster that elected its primary BEFORE it joined never sees a
+// promotion event, and the join response carries no WriterState (see
+// protocol.NodeInfo), so its first selection necessarily falls back to an
+// arbitrary writer. Pod restarts outnumber live hand-overs, which makes this
+// ticker the load-bearing trigger rather than the backstop it looks like.
+//
+// Five seconds, matching the interval the old wait-for-a-writer loop polled at,
+// so a replica that starts before any writer is registered attaches as quickly
+// as it used to. A tick is a registry read and a string compare, so the rate
+// costs nothing; what makes it safe to run this often is that findWriterAddr is
+// deterministic, and a re-target therefore happens only when the answer has
+// genuinely changed.
+const replicationRetargetInterval = 5 * time.Second
+
+// replicationTargetLoop owns the replication receiver on a reader or compactor:
+// it attaches to a writer and re-points when the cluster's primary changes.
+//
+// Single owner by construction. Every trigger — both FSM callbacks and the
+// ticker — is a non-blocking poke on the depth-1 replicationRetarget channel,
+// so a burst of promotions coalesces into one re-evaluation instead of racing
+// several receiver swaps against each other.
+func (c *Coordinator) replicationTargetLoop() {
+	// Snapshot the context under the lock. StartReplication may have
+	// installed it moments ago, and it is never replaced afterwards.
+	c.mu.RLock()
+	ctx := c.ctx
+	c.mu.RUnlock()
+	if ctx == nil {
+		// Unreachable in production: Start() sets c.ctx, and StartReplication
+		// holds c.mu across the `go` that launches this. A coordinator built
+		// by a test without Start would otherwise leak this goroutine forever,
+		// so bail rather than substitute a context that never cancels.
+		c.logger.Warn().Msg("Replication target loop started without a coordinator context; not running")
+		return
+	}
+
+	ticker := time.NewTicker(replicationRetargetInterval)
 	defer ticker.Stop()
 
 	for {
+		c.reevaluateReplicationTarget(ctx)
+
 		select {
-		case <-c.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			writerAddr := c.findWriterAddr()
-			if writerAddr != "" {
-				c.mu.Lock()
-				if c.replicationReceiver == nil {
-					if err := c.startReceiverWithAddr(writerAddr); err != nil {
-						c.logger.Error().Err(err).Msg("Failed to start replication receiver")
-					}
-				}
-				c.mu.Unlock()
-				return
-			}
+		case <-c.replicationRetarget:
 		}
+	}
+}
+
+// pokeReplicationRetarget asks replicationTargetLoop to re-evaluate which
+// writer this node should stream from.
+//
+// Safe to call from an FSM callback: it takes no lock, touches no raft node and
+// never blocks, which is what the registry-only callback contract (#797, #813)
+// requires of anything running on the Raft Apply goroutine. A poke dropped
+// because one is already pending loses nothing — the pending evaluation reads
+// the same latest registry state. A nil channel (a Coordinator built by a test
+// without NewCoordinator) is never ready, so this takes the default and is a
+// no-op rather than a block.
+func (c *Coordinator) pokeReplicationRetarget() {
+	select {
+	case c.replicationRetarget <- struct{}{}:
+	default:
+	}
+}
+
+// reevaluateReplicationTarget points the receiver at the writer this node
+// should be streaming from, replacing the current receiver when it is attached
+// somewhere else.
+func (c *Coordinator) reevaluateReplicationTarget(ctx context.Context) {
+	want := c.findWriterAddr()
+	if want == "" {
+		// Keep whatever we have. A writer that just went unhealthy is usually
+		// about to come back or be replaced, and tearing down a live stream to
+		// attach to nothing helps no one.
+		c.logger.Debug().Msg("No writer available for replication; keeping the current target")
+		return
+	}
+
+	c.mu.RLock()
+	current := c.replicationReceiver
+	c.mu.RUnlock()
+
+	if current != nil && current.WriterAddr() == want {
+		return
+	}
+
+	// Stop the old receiver OUTSIDE c.mu.
+	//
+	// receiveLoop can be parked inside applyEntry -> the replication ingest
+	// handler -> c.mu.RLock(). Receiver.Stop() waits for that goroutine, so
+	// holding c.mu.Lock() across it blocks the RLock the receiver is waiting
+	// on and deadlocks the process. That is the #813/#853 shape that
+	// stop_lock_seam_test.go exists to keep out.
+	//
+	// Note this replaces the Receiver rather than re-pointing the existing one.
+	// The sequence space is per-writer-process, so a receiver carrying its old
+	// high-water mark into a new writer's space rejects every entry that writer
+	// sends (#887). A fresh Receiver starts at zero, which is the only safe
+	// state to meet an unrelated sequence space in.
+	if current != nil {
+		c.logger.Info().
+			Str("from", current.WriterAddr()).
+			Str("to", want).
+			Msg("Re-targeting WAL replication to a new writer")
+		if err := current.Stop(); err != nil {
+			c.logger.Warn().Err(err).Msg("Error stopping the previous replication receiver")
+		}
+	}
+
+	select {
+	case <-ctx.Done():
+		return
+	default:
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// What makes it safe to install a receiver after releasing the lock is not
+	// this pointer comparison — neither Stop() nor StopReplication() ever
+	// writes c.replicationReceiver (stopReplicationSubsystems says so
+	// explicitly: "The fields are deliberately NOT cleared"), so the comparison
+	// cannot fail. It is that both shutdown paths call c.cancel() while holding
+	// c.mu. By the time we hold it, a shutdown that started has already
+	// cancelled c.ctx, so the receiver we create below is born with a cancelled
+	// context and its connectionLoop returns on its first select. The
+	// comparison stays as a cheap assertion of the single-owner invariant.
+	if c.replicationReceiver != current {
+		return
+	}
+	c.replicationReceiver = nil
+	if err := c.startReceiverWithAddr(want); err != nil {
+		// startReceiverWithAddr publishes c.replicationReceiver before it
+		// starts, so on error we clear it again: leaving a non-started
+		// receiver whose WriterAddr() already equals `want` would make every
+		// later pass short-circuit as "already attached" and never retry.
+		c.replicationReceiver = nil
+		c.logger.Error().Err(err).
+			Str("writer_addr", want).
+			Msg("Failed to start replication receiver; will retry on the next pass")
 	}
 }
 
@@ -3795,13 +4037,54 @@ func (c *Coordinator) AcceptReplicationConnection(conn net.Conn, syncReq *replic
 	c.mu.RUnlock()
 
 	if sender == nil {
-		// Not a writer or replication not enabled
-		errMsg := &replication.ReplicateError{
-			Code:    replication.ErrCodeNotWriter,
-			Message: "This node is not configured as a writer",
-		}
-		replication.WriteError(conn, errMsg)
+		// Not a writer or replication not enabled. Unreachable in practice —
+		// handleReplicateSync makes the same check first — but it must still
+		// close the connection and answer in the handshake's own message type,
+		// for the reasons spelled out on the primary check below.
+		c.sendReplicationSyncError(conn, "this node is not configured as a writer with replication enabled")
 		return fmt.Errorf("replication connection rejected: not a writer")
+	}
+
+	// Defence in depth for #885: in local-storage mode only the primary writer
+	// ingests, so only it has entries to stream. A reader that reaches a
+	// standby would hold a connection open that never carries an entry, and
+	// look healthy doing it. Refusing makes the wrong attachment
+	// self-correcting — the reader logs the rejection and its target loop
+	// re-evaluates — rather than leaving it parked on a node that went standby
+	// while it was connected.
+	//
+	// The discriminator is the CLUSTER's record of who the primary is, not this
+	// node's view of whether it is the primary. Those differ at exactly the
+	// moment that matters: during bootstrap, before any CommandPromoteWriter
+	// has been applied, every writer fails IsPrimaryWriter, so gating on it
+	// refused the first connection of every cluster start and cost a reconnect
+	// interval of replication before it healed. Asking "has anyone been
+	// designated, and is it someone else?" answers no during bootstrap and
+	// admits the reader.
+	//
+	// Pattern 2 is exempt by construction — every writer ingests there and none
+	// is ever designated primary, so this check would refuse every legitimate
+	// connection.
+	if !c.cfg.SharedStorageMode {
+		if designated := c.designatedPrimaryWriterID(); designated != "" && designated != c.localNode.ID {
+			c.logger.Warn().
+				Str("reader_id", syncReq.ReaderID).
+				Str("designated_primary", designated).
+				Msg("Replication sync rejected: another node is the designated primary writer, so this node has no entries to stream")
+			// Must be sendReplicationSyncError, not replication.WriteError.
+			// handlePeerConnection hands this connection to us
+			// (closeConn = false, "Sender takes ownership"), so a rejection
+			// path that does not close leaks the socket: the reader closes its
+			// end and ours parks in CLOSE_WAIT holding an fd, once per
+			// reconnect interval, for the life of the process. And
+			// WriteError's MsgReplicateError is not a type the handshake
+			// reader decodes — protocol.ReceiveMessage would fail with
+			// "unknown message type" rather than surface the reason, which is
+			// the same defect the success path's two-phase accept was written
+			// to fix.
+			c.sendReplicationSyncError(conn, "this node is not the designated primary writer")
+			return fmt.Errorf("replication connection rejected: not the primary writer")
+		}
 	}
 
 	// Two-phase accept: prepare the reader (validates + derives session

@@ -324,7 +324,18 @@ func (s *Sender) AcceptReader(conn net.Conn, readerID, handshakeNonce string, la
 // in the coordinator (see PrepareReader doc).
 func (s *Sender) CurrentSequenceAndCanResume(lastKnownSeq uint64) (uint64, bool) {
 	currentSeq := s.sequence.Load()
-	canResume := lastKnownSeq == 0 || lastKnownSeq >= currentSeq-uint64(s.cfg.BufferSize)
+	// Guard the subtraction: currentSeq-BufferSize underflows to ~1.8e19 while
+	// the writer is younger than one buffer's worth of entries, which made
+	// canResume false for exactly the connections most likely to want it — a
+	// freshly restarted writer (#887).
+	//
+	// Nothing branches on the result today: CanResume is carried to the
+	// receiver and logged there, and the sender has no replay-from-buffer path
+	// (BufferSize is the entryChan capacity, and reader.lastAck feeds only lag
+	// stats). This is fixed so the value is not wrong the day something reads
+	// it, not because something does.
+	window := uint64(s.cfg.BufferSize)
+	canResume := lastKnownSeq == 0 || currentSeq <= window || lastKnownSeq >= currentSeq-window
 	return currentSeq, canResume
 }
 
