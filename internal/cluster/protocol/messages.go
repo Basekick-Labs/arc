@@ -142,7 +142,7 @@ type JoinRequest struct {
 	NodeName    string `json:"node_name"`
 	Role        string `json:"role"`
 	ClusterName string `json:"cluster_name"`
-	RaftAddr    string `json:"raft_addr"`  // Raft transport address for AddVoter
+	RaftAddr    string `json:"raft_addr"`  // Raft transport address; the leader adds the node as a voter or a non-voter depending on its role (#862)
 	APIAddr     string `json:"api_addr"`   // HTTP API address
 	CoordAddr   string `json:"coord_addr"` // Coordinator address (for peer communication)
 	Version     string `json:"version"`
