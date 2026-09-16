@@ -17,6 +17,10 @@ var excludedPaths = map[string]bool{
 	"/api/v1/ready": true,
 }
 
+// DetailLocalsKey is the Fiber locals key used by handlers to supply custom
+// key-value metadata to be attached to AuditEvent.Detail.
+const DetailLocalsKey = "audit_detail"
+
 // Middleware returns a Fiber middleware that logs auditable requests
 func Middleware(logger *Logger, includeReads bool) fiber.Handler {
 	return func(c *fiber.Ctx) error {
@@ -72,6 +76,11 @@ func Middleware(logger *Logger, includeReads bool) fiber.Handler {
 		event.Measurement = c.Get("x-arc-measurement")
 		if event.Measurement == "" {
 			event.Measurement = c.Params("measurement")
+		}
+
+		// Extract handler-supplied audit detail from Fiber locals if present
+		if d, ok := c.Locals(DetailLocalsKey).(map[string]string); ok {
+			event.Detail = d
 		}
 
 		logger.LogEvent(event)
