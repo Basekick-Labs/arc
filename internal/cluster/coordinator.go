@@ -1443,6 +1443,14 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 	// node.Role rather than req.Role: it has been through ParseRole, and #848
 	// has already refused anything unrecognised, so this cannot silently
 	// disenfranchise a role the capabilities table does not know.
+	//
+	// NOTE for an existing cluster: this fixes the suffrage a server gets when
+	// it is added, not the suffrage it already has. AddNonvoter on a server
+	// that is already a Voter updates its address and leaves Suffrage alone
+	// (hashicorp/raft nextConfiguration), so a reader recorded as a voter
+	// before this change stays one across restarts and re-joins. Converging
+	// existing membership needs DemoteVoter, which is wrapped here but not yet
+	// driven by anything.
 	if c.raftNode != nil {
 		votes := node.Role.VotesInElections()
 		var addErr error
