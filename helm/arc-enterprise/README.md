@@ -225,24 +225,36 @@ Three writers buy you **two** HA properties at once:
    storage mode the surviving writers are the failover pool, and one of them
    is promoted. Readers are **not** promotion candidates in either mode, so
    the pool is made of writer-role pods or it does not exist.
-2. **Raft quorum**: cluster-wide state (manifest, tokens, RBAC) and
-   singleton-task ownership (retention/CQ/delete) gate on the cluster Raft
-   leader. With 3 writers Raft tolerates 1 failure and still elects a leader.
+2. **A spare that survives the first failure**: two writers absorb exactly
+   one loss and leave you with a single writer, no promotion candidate, and
+   no pod you can drain for a rolling upgrade. Three keeps a spare after the
+   first failure.
 
 This is why the default is 3 rather than 1. One writer is a development
 shape: it cannot fail over, and it leaves the cluster with a single point of
-failure for both ingest and cluster state.
+failure for ingest.
 
-| writer.replicas | Quorum | Ingest HA | Raft HA |
-|-----------------|--------|-----------|---------|
-| 1 | 1 | none | none |
-| 2 | 2 | yes (LB) | **no** (no failure tolerance — chart rejects this) |
-| **3** | **2** | **yes** | **yes (tolerates 1 failure)** |
-| 5 | 3 | yes | yes (tolerates 2 failures) |
+| writer.replicas | Ingest HA | Spare after one loss |
+|-----------------|-----------|----------------------|
+| 1 | none | none |
+| 2 | yes (LB / promotion) | **none — chart rejects this** |
+| **3** | **yes** | **yes** |
+| 5 | yes | yes (survives two losses) |
 
-The chart rejects `writer.replicas=2` (see `templates/_validation.tpl`)
-because a Raft quorum of 2 requires both pods to be reachable — a single
-failure leaves the cluster without a leader, so singleton tasks pause.
+The chart rejects `writer.replicas=2` (see `templates/_validation.tpl`) for
+the reason in the table: the second writer is the only spare, so the first
+failure consumes it.
+
+Raft quorum is a separate, cluster-wide property and is **not** governed by
+the writer count today: every node that joins the cluster becomes a Raft
+voter regardless of its role, so reader pods carry quorum too. Size the
+voting membership for an odd count if you care about Raft tolerance; size
+`writer.replicas` for ingest availability.
+
+Arc itself checks this at runtime. A cluster running below three writer-role
+nodes logs a rate-limited warning naming the count and the remediation, in
+every cluster mode. The deficit has to hold for two minutes first, so a
+rolling upgrade does not trip it.
 
 Only the pod with ordinal `-0` bootstraps Raft on first install; the other
 writers join via the seed list.
