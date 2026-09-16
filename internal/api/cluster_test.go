@@ -691,4 +691,3 @@ func TestClusterHandler_DeleteFile_PersistedAudit_400And403(t *testing.T) {
 		t.Fatal("did not find persisted audit log entry with status 400")
 	}
 }
-
