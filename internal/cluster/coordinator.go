@@ -141,6 +141,25 @@ type Coordinator struct {
 
 	// State
 	running bool
+	// discoveryAttempts counts discovery ticks that actually ran, so only the
+	// first logs at Info. See discoverPeers.
+	discoveryAttempts atomic.Int64
+
+	// joinedOnce latches once a join handshake has succeeded in THIS process.
+	// It is what ends peer discovery, replacing a check on whether Raft knows
+	// a leader — which ended discovery for a node the cluster had forgotten,
+	// one second after its only attempt failed for want of a leader (#858).
+	//
+	// Deliberately "have I joined", not "does the cluster list me": a node an
+	// operator removed on purpose must stay removed, and re-deriving
+	// membership every tick would undo that within five seconds.
+	joinedOnce atomic.Bool
+
+	// leaving is set before Stop broadcasts its leave, so a discovery tick
+	// in that window cannot re-join the cluster this node is leaving. It is
+	// separate from stopping, which Stop sets only after the broadcast.
+	leaving atomic.Bool
+
 	// stopping marks the window in which Stop has released c.mu to join the
 	// subsystems (#813). running stays true until the joins are done, so a
 	// concurrent Start is refused as "already running" and a second Stop
@@ -518,11 +537,13 @@ func (c *Coordinator) Start() error {
 		}
 		c.logger.Info().Msg("Raft consensus started")
 
-		// If we're bootstrapping, register ourselves in the FSM once we become leader
-		// This ensures the leader is known to all nodes that join later
-		if c.cfg.RaftBootstrap {
-			go c.registerSelfInFSMWhenLeader()
-		}
+		// Re-announce ourselves in cluster state if we take leadership at
+		// startup. Not only when bootstrapping: a node that restarts and wins
+		// its own election never runs peer discovery — a leader has nobody to
+		// join — so this is the only thing that puts it back in every peer's
+		// registry. That is #858's worst case, and it is deterministic in a
+		// cluster whose only voter is the node being restarted.
+		go c.registerSelfInFSMWhenLeader()
 	}
 
 	// Wire the peer file replication puller (Enterprise Phase 2). This runs
@@ -667,6 +688,18 @@ func (c *Coordinator) Stop() error {
 	active := c.running && !c.stopping
 	c.mu.RUnlock()
 	if !active {
+		return nil
+	}
+	// Set before the broadcast, and with a compare-and-swap.
+	//
+	// Before, because discoveryLoop is still running here and stopping is not
+	// set until after the broadcast, so a tick landing inside broadcastLeave
+	// could otherwise re-join the cluster this node is leaving.
+	//
+	// Compare-and-swap, because the check above is an RLock read that is not
+	// atomic with the broadcast below, so two concurrent Stops both reached
+	// it and both broadcast. The comment there has always claimed otherwise.
+	if !c.leaving.CompareAndSwap(false, true) {
 		return nil
 	}
 	c.broadcastLeave()
@@ -972,15 +1005,60 @@ func (c *Coordinator) discoveryLoop() {
 	}
 }
 
+// discoveryShouldRun decides whether peer discovery attempts a join this tick.
+//
+//   - joined: a join handshake has already succeeded in this process. Latched,
+//     so discovery stops. Deliberately "have I joined" and not "does the
+//     cluster list me": a node an operator removed on purpose must stay
+//     removed, and re-deriving membership every tick would undo that.
+//   - leaving: Stop has begun. A tick inside the leave broadcast must not
+//     re-join the cluster this node is on its way out of.
+//   - isLeader: a leader has nobody to join. Skipping also keeps a bootstrap
+//     node with seeds from dialling peers to be redirected to itself. Not
+//     latched, so a node that loses leadership resumes trying. A node that
+//     TAKES leadership re-announces itself through
+//     registerSelfInFSMWhenLeader instead, which is the other half of #858.
+//
+// Note what is NOT a condition: whether Raft currently knows a leader. That
+// used to be the whole check, and it is #858. LeaderAddr is in-memory and
+// empty at process start, so discovery did run on a fresh boot — but a node
+// restarting into a cluster it was still configured in learns the leader
+// within about a second and then never tried again. Its one attempt fell
+// inside the leaderless window its own departure created and failed for want
+// of a leader to redirect to.
+func discoveryShouldRun(joined, leaving, isLeader bool) bool {
+	return !joined && !leaving && !isLeader
+}
+
 // discoverPeers attempts to discover peer nodes from seeds and join the cluster.
 func (c *Coordinator) discoverPeers() {
-	// If we're already part of a Raft cluster with a leader, skip discovery
-	if c.raftNode != nil && c.raftNode.LeaderAddr() != "" {
+	// Discovery ends when a join has actually succeeded, not when Raft
+	// happens to know a leader.
+	//
+	// The old check was LeaderAddr() != "". LeaderAddr is in-memory and empty
+	// at process start, so discovery did run on a fresh boot — but a node
+	// restarting into a cluster it is still configured in learns the leader
+	// within about a second, and from then on every tick returned here. A
+	// node whose peers had dropped it on its way out therefore got exactly
+	// one attempt, during the leaderless window its own departure created,
+	// and it failed with "no valid leader address". Nothing tried again, so
+	// the rest of the cluster never saw it (#858).
+	isLeader := c.raftNode != nil && c.raftNode.IsLeader()
+	if !discoveryShouldRun(c.joinedOnce.Load(), c.leaving.Load(), isLeader) {
 		return
 	}
 
-	c.logger.Info().
-		Int("seed_count", len(c.cfg.Seeds)).
+	// First attempt at Info, the rest at Debug. Discovery now runs until a
+	// join succeeds rather than until a leader is known, so a node that can
+	// never join — a rotated shared secret, a firewalled coordinator port, a
+	// refused join — would otherwise emit several lines every five seconds
+	// indefinitely. The same shape is already rate-limited for unknown
+	// heartbeats.
+	ev := c.logger.Debug()
+	if c.discoveryAttempts.Add(1) == 1 {
+		ev = c.logger.Info()
+	}
+	ev.Int("seed_count", len(c.cfg.Seeds)).
 		Strs("seeds", c.cfg.Seeds).
 		Msg("Starting peer discovery")
 
@@ -995,6 +1073,15 @@ func (c *Coordinator) discoverPeers() {
 			Str("seed", seed).
 			Msg("Attempting to connect to seed node")
 
+		// Re-check per seed: a single tick can outlast broadcastLeave, because
+		// tryJoinViaSeed allows 5s to dial and 10s to read, doubled across a
+		// leader redirect, against a broadcast that finishes in about two.
+		// Without this, a join that started before Stop completes after it and
+		// re-adds this node to the configuration it just left.
+		if c.leaving.Load() {
+			return
+		}
+
 		if err := c.tryJoinViaSeed(seed); err != nil {
 			c.logger.Warn().
 				Err(err).
@@ -1003,7 +1090,15 @@ func (c *Coordinator) discoverPeers() {
 			continue
 		}
 
-		// Successfully joined
+		// A join that completed while this node is leaving must not latch or
+		// be reported as success: Stop is already past its broadcast.
+		if c.leaving.Load() {
+			return
+		}
+
+		// Successfully joined. Latch, so the loop stops dialling — and so that
+		// a later operator removal is not undone by the next tick.
+		c.joinedOnce.Store(true)
 		c.logger.Info().
 			Str("seed", seed).
 			Msg("Successfully joined cluster via seed")
@@ -2577,11 +2672,18 @@ func (c *Coordinator) registerSelfInFSMWhenLeader() {
 		return
 	}
 
-	// Check if we're already in the FSM (e.g., from a previous run with snapshot)
-	if _, exists := c.raftFSM.GetNode(c.localNode.ID); exists {
-		c.logger.Debug().Msg("Already registered in FSM")
-		return
-	}
+	// Deliberately NOT short-circuited on "already in the FSM".
+	//
+	// That check used to skip the re-announcement whenever the FSM already
+	// held this node, which is precisely the state a restarting leader is in:
+	// its own record survived because the peer that would have removed it was
+	// never leader. Being in the FSM was never the question — #858 is a
+	// divergence between the FSM and every OTHER node's registry, and only an
+	// applied AddNode repairs that, through the onNodeAdded callback.
+	//
+	// The cost is one Raft entry per process start on whichever node takes
+	// leadership, and applyAddNode is idempotent in effect (it replaces the
+	// record, preserving a live primary designation, #850).
 
 	// Register ourselves in the FSM
 	nodeInfo := &raft.NodeInfo{
@@ -2689,7 +2791,7 @@ func (c *Coordinator) onRaftNodeRemoved(nodeID string) {
 		// that the cluster no longer considers this node a member.
 		c.logger.Warn().
 			Str("node_id", nodeID).
-			Msg("Cluster state no longer lists this node; keeping the local registry entry, but this node is not a member until it re-joins")
+			Msg("Cluster state no longer lists this node; keeping the local registry entry, but this node is not a member. Peer discovery does not re-derive membership, deliberately, so that an operator's removal stays removed — restart this process to re-join")
 		return
 	}
 	c.registry.Unregister(nodeID)

@@ -388,6 +388,20 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### A node that left gracefully and restarted was never listed again ([#858](https://github.com/Basekick-Labs/arc/issues/858))
+
+Restart a cluster's Raft leader with a normal shutdown and it came back healthy, serving, and invisible. It listed every node; every other node listed everything except it. Nothing recovered from that. On local storage the detached node also kept its primary-writer designation across the restart and went on running retention and continuous queries the rest of the cluster had moved past.
+
+Two things combined. A node broadcasts a leave on shutdown and each peer drops it from its local list, but the removal from shared cluster state happens only on the leader. When the departing node is itself the leader, no peer is leader at that moment, so nothing removes it from shared state while every peer has already dropped it locally.
+
+The node should then re-announce itself on restart, and that is the part that failed. Peer discovery stopped as soon as Raft knew who the leader was. A node restarting into a cluster it was still configured in learns that within about a second, so it got one attempt, and that attempt fell inside the leaderless window its own departure had created. It failed for want of a leader to talk to, and nothing tried again.
+
+Discovery now stops when a join has actually succeeded rather than when a leader happens to be known. The choice is deliberately "have I joined" and not "does the cluster list me": a node an operator has removed on purpose must stay removed, and re-deriving membership every few seconds would quietly undo that. As a side effect it fixes a removal that was already being undone, since a removed follower keeps a live Raft whose leader pointer clears on the next timeout.
+
+Discovery alone is not enough, because a node that takes leadership has nobody to join. That is not a corner case: where the restarting node is the cluster's only voter, which is the shape of a single-writer deployment, it wins its own election every time. So a node that takes leadership at startup now re-announces itself in cluster state, where before it skipped that whenever its own record was still present, which is exactly when it is needed. Both paths are verified on three-node and two-node clusters of real binaries, including by removing each fix and watching the cluster stay broken.
+
+A node also no longer re-joins the cluster it is in the middle of leaving, which the previous condition prevented by accident and this one has to prevent deliberately, including for a join already in flight when the shutdown begins.
+
 ### A reader or compactor could win Raft leadership and stall every singleton task ([#862](https://github.com/Basekick-Labs/arc/issues/862))
 
 On shared storage, retention, continuous queries and deletes run on the node that is both the Raft leader and a writer. The role half of that is deliberate: a reader must never run them against the shared bucket. But every node that joined became a Raft voter regardless of its role, so a reader or the compactor could be elected leader. When that happened the leader failed the role half and every writer failed the leader half, so **no node in the cluster passed the gate** and all of that work simply stopped, with nothing to force leadership back to a writer.
