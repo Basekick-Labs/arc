@@ -392,6 +392,12 @@ It will not immediately start compacting on the cluster's behalf either. The com
 
 Two things this does **not** change in the chart's default shared-storage mode, contrary to what you might expect. Compacted files are still not registered in the Raft manifest, because that path is gated on peer replication, which shared storage does not use. And the "No compactor elected" warning was never firing there for the same reason, so its absence is not evidence of anything.
 
+### An unlimited Enterprise license rejected every cluster join ([#869](https://github.com/Basekick-Labs/arc/issues/869))
+
+Licenses on the unlimited tier carry a core limit of `-1`. The cluster join validator treated only `0` as unlimited, so it compared every joining node's core count against `-1`, found it larger, and refused. The seed node ran alone, every other node retried forever, and the log said "cluster core limit exceeded ... license limit=-1". A cluster on that tier could never form. Single-node deployments were unaffected, which is why this survived: the check only runs when a second node tries to join.
+
+Any non-positive limit now means unlimited, which is what the rest of Arc already assumed. The startup clamp that pins GOMAXPROCS, DuckDB threads and flush workers to the licensed core count returns early on a non-positive limit, and the cluster status endpoint only reports remaining cores when the limit is positive. The join validator was the sole outlier.
+
 ### A cluster with too few writers now says so instead of failing silently later ([#856](https://github.com/Basekick-Labs/arc/issues/856))
 
 Arc's clustering documentation described the local-storage pattern as one writer plus several readers and called the readers the failover pool. They are not. Promotion only ever considers writer-role nodes, and nothing changes a node's role at runtime, so in that topology the loss of the single writer stopped ingest until an operator intervened. The chart, the example overlay and the documentation now all call for three writer-role nodes, and Arc no longer waits for the outage to tell you.

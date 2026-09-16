@@ -2365,6 +2365,31 @@ func validateClusteringLicense(client *license.Client) error {
 	return nil
 }
 
+// coreLimitError applies the cluster-wide core policy: it returns the error a
+// join must fail with, or nil to admit the node.
+//
+// The whole policy lives here, error message included, so it can be tested.
+// The method below is a wrapper that supplies the two numbers — neither of
+// which the policy needs to know how to obtain.
+//
+// A NON-POSITIVE maxCores means unlimited. The unlimited tier mints -1, not 0,
+// and the rest of Arc already agrees: the startup clamp in cmd/arc/main.go
+// returns early on a non-positive limit, and the cluster-status handler only
+// reports remaining cores when the limit is positive. This was the one place
+// that read only 0 as unlimited, so `projectedTotal > -1` held for every node
+// and every join on an unlimited license was rejected (#869).
+func coreLimitError(maxCores, currentTotal, coreCount int) error {
+	if maxCores <= 0 {
+		return nil
+	}
+	projectedTotal := currentTotal + coreCount
+	if projectedTotal > maxCores {
+		return fmt.Errorf("%w: current cluster cores=%d, new node cores=%d, projected total=%d, license limit=%d",
+			ErrCoreLimitExceeded, currentTotal, coreCount, projectedTotal, maxCores)
+	}
+	return nil
+}
+
 // validateCoreLimitForJoin checks if adding a node with the given core count
 // would exceed the license MaxCores limit for the entire cluster.
 // Returns nil if the join is allowed, or an error if it would exceed the limit.
@@ -2378,15 +2403,17 @@ func (c *Coordinator) validateCoreLimitForJoin(nodeID string, coreCount int) err
 		return ErrLicenseRequired
 	}
 
-	// MaxCores=0 means unlimited
-	if lic.MaxCores == 0 {
-		c.logger.Debug().
-			Str("node_id", nodeID).
-			Int("core_count", coreCount).
-			Msg("Unlimited license tier - skipping core limit validation")
-		return nil
-	}
+	return c.checkCoreLimit(lic.MaxCores, nodeID, coreCount)
+}
 
+// checkCoreLimit is validateCoreLimitForJoin with the license already read.
+//
+// Split out so it can be tested: license.Client keeps its license in an
+// unexported field with no exported way to set one, so a test cannot build a
+// Coordinator that reports a given MaxCores. Everything below this line is
+// reachable from a test; everything above it is two nil checks and a field
+// read.
+func (c *Coordinator) checkCoreLimit(maxCores int, nodeID string, coreCount int) error {
 	// Get current total cores from FSM
 	currentTotal := 0
 	if c.raftFSM != nil {
@@ -2398,20 +2425,16 @@ func (c *Coordinator) validateCoreLimitForJoin(nodeID string, coreCount int) err
 		}
 	}
 
-	// Calculate what the total would be after adding this node
-	projectedTotal := currentTotal + coreCount
-
-	if projectedTotal > lic.MaxCores {
-		return fmt.Errorf("%w: current cluster cores=%d, new node cores=%d, projected total=%d, license limit=%d",
-			ErrCoreLimitExceeded, currentTotal, coreCount, projectedTotal, lic.MaxCores)
+	if err := coreLimitError(maxCores, currentTotal, coreCount); err != nil {
+		return err
 	}
 
 	c.logger.Info().
 		Str("node_id", nodeID).
 		Int("node_cores", coreCount).
 		Int("current_total", currentTotal).
-		Int("projected_total", projectedTotal).
-		Int("license_max", lic.MaxCores).
+		Int("projected_total", currentTotal+coreCount).
+		Int("license_max", maxCores).
 		Msg("Core limit validation passed")
 
 	return nil
