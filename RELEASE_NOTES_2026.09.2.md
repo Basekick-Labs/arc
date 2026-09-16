@@ -360,6 +360,11 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### A node dropped from the cluster stayed in every other node's list after a snapshot restore ([#847](https://github.com/Basekick-Labs/arc/issues/847))
+
+Each node keeps an in-memory view of cluster membership that the health checker, the heartbeat fan-out, the node listings and the file puller read. A Raft snapshot restore replaces the authoritative node table wholesale, and since 26.09.2 it announces the nodes it brings back, but it said nothing about the ones the snapshot no longer carried. A node that had been removed from the cluster therefore stayed in that view indefinitely on any node that restored from a later snapshot: it was health-checked, offered as a replication peer and listed by the API, until the process restarted.
+
+The restore now announces those removals as well. A first restore on a fresh node announces none, because there was no previous membership to differ from. A removal naming the local node is ignored rather than applied, since a node should not evict itself from its own view; it is logged as a warning instead, which also gives a node an operator-visible signal when it is deliberately removed from a cluster.
 ### The first forwarded write after an idle period failed once ([#851](https://github.com/Basekick-Labs/arc/issues/851))
 
 A node that is not the Raft leader forwards writes it cannot apply itself — manifest registration, token and RBAC changes, the startup barrier — over a connection it keeps open between commands. The leader closes that connection after thirty seconds with nothing on it, and the client found out only by writing into a dead socket, so the command failed with a broken pipe. Callers with their own retry loop recovered quietly; a single-shot caller did not, so creating a token on a follower that had been idle returned 500 and succeeded on the next attempt.

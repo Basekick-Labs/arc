@@ -2407,6 +2407,20 @@ func (c *Coordinator) setLocalWriterState(nodeID string, state WriterState) {
 
 // onRaftNodeRemoved is called when a node is removed via Raft consensus.
 func (c *Coordinator) onRaftNodeRemoved(nodeID string) {
+	// Never evict ourselves from our own registry. A node learns it was
+	// removed from the cluster by other means; dropping the local entry here
+	// would leave this process without the node every local lookup expects,
+	// and a snapshot restore that predates our join would trigger exactly
+	// that (#847).
+	if c.localNode != nil && nodeID == c.localNode.ID {
+		// Warn rather than drop it quietly: this also fires when an operator
+		// removes this node on purpose, and then it is the only local sign
+		// that the cluster no longer considers this node a member.
+		c.logger.Warn().
+			Str("node_id", nodeID).
+			Msg("Cluster state no longer lists this node; keeping the local registry entry, but this node is not a member until it re-joins")
+		return
+	}
 	c.registry.Unregister(nodeID)
 }
 
