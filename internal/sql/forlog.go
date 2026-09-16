@@ -7,15 +7,15 @@ import "strings"
 // the values are gone. This is the log-side counterpart of the slow-query log's
 // masking precedent, with one deliberate difference:
 //
-// It does NOT reuse MaskStringLiterals. That scanner treats backslash as an
-// escape inside plain '...' strings; DuckDB does not (backslash is a literal
-// character there — only E'...' strings honor it). Reusing it would mean a
-// value legitimately ending in `\` (a Windows path, a regex) shifts every
-// subsequent literal boundary and logs alternating literal CONTENTS in the
-// clear — an under-mask leak on benign input. The scanner below follows
-// DuckDB's actual rules. MaskStringLiterals itself is left untouched: it is
-// hardened round-trip code on the query-rewrite path, and its escape rule is
-// load-bearing there.
+// It does not reuse MaskStringLiterals, because the two want different output:
+// this one keeps the statement's shape and drops the values, while the masker
+// replaces each literal with a placeholder it can substitute back. They do
+// share the literal scanners below, so both follow DuckDB's rules: in a plain
+// '...' string and a "..." identifier only the doubled quote escapes, and a
+// backslash is an ordinary character; only E'...' honours backslash. The
+// masker used to treat backslash as an escape everywhere, which shifted every
+// later literal boundary after a value ending in `\` — an under-mask leak
+// here, and a gate bypass on the query-rewrite path.
 //
 // Rules:
 //   - '...'   standard string: only ” escapes a quote; backslash is literal.
@@ -140,27 +140,24 @@ func skipQuotedIdent(sql string, i int) int {
 
 // scanDollarQuote matches $tag$...$tag$ starting at i (sql[i] == '$'). Returns
 // (index past the closing delimiter, tag length, true) on a match.
+// It shares dollarQuoteTag with the masker so the two entry points cannot
+// disagree about what opens a dollar quote; they used to, on a digit-leading
+// tag and on a `$` that continues an identifier.
 func scanDollarQuote(sql string, i int) (int, int, bool) {
-	n := len(sql)
-	j := i + 1
-	for j < n && identChar(sql[j]) {
-		j++
-	}
-	if j >= n || sql[j] != '$' {
+	tag, ok := dollarQuoteTag(sql, i)
+	if !ok {
 		return 0, 0, false
 	}
-	delim := sql[i : j+1] // "$tag$" (or "$$")
-	body := j + 1
+	delim := "$" + tag + "$"
+	body := i + len(delim)
 	end := strings.Index(sql[body:], delim)
 	if end < 0 {
-		return n, len(delim) - 2, true // unterminated: consume the rest
+		return len(sql), len(tag), true // unterminated: consume the rest
 	}
-	return body + end + len(delim), len(delim) - 2, true
+	return body + end + len(delim), len(tag), true
 }
 
-func identChar(c byte) bool {
-	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
-}
+func identChar(c byte) bool { return isIdentifierByte(c) }
 
 // prevByte is shared with mask.go.
 

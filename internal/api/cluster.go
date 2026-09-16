@@ -247,10 +247,16 @@ func (h *ClusterHandler) respondNotEnabled(c *fiber.Ctx) error {
 // nodeToMap converts a Node to a map for JSON serialization.
 func (h *ClusterHandler) nodeToMap(node *cluster.Node) map[string]interface{} {
 	return map[string]interface{}{
-		"id":             node.ID,
-		"name":           node.Name,
-		"role":           node.Role,
-		"state":          node.GetState(),
+		"id":    node.ID,
+		"name":  node.Name,
+		"role":  node.Role,
+		"state": node.GetState(),
+		// Which writer is the primary is what gates every singleton task
+		// (retention, CQ, delete). It was absent here, so an operator had no
+		// way to see that no node held it — which is how #850 stayed hidden.
+		// Empty for readers, compactors, and for writers in shared-storage
+		// mode, where there is no primary/standby distinction.
+		"writer_state":   node.GetWriterState(),
 		"address":        node.Address,
 		"api_address":    node.APIAddress,
 		"cluster_name":   node.ClusterName,

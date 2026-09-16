@@ -198,18 +198,19 @@ automatically by the chart (see `templates/_helpers.tpl`). This:
 
 #### Local storage (Pattern 1) — `storage.mode: local`
 
-Each writer pod owns its own PersistentVolume. In current Arc Enterprise
-v26.06.x this pattern still runs in **single-writer + multi-reader** mode:
-one writer takes ingest, readers replicate the WAL and can be promoted on
-writer failure via Arc's writer-failover controller. (Pattern 1 multi-writer
-— per-shard writer ownership — is a future initiative; see the multi-writer
-plan doc.)
+Each writer pod owns its own PersistentVolume. This pattern runs in
+**single-writer + multi-reader** mode: one writer takes ingest and the readers
+replicate its WAL. Arc's writer-failover controller elects the primary writer
+among the nodes whose role is `writer`; readers are **not** promotion
+candidates today, so give the cluster more than one writer replica if you want
+it to survive losing one. (Pattern 1 multi-writer — per-shard writer ownership
+— is a future initiative; see the multi-writer plan doc.)
 
 ```yaml
 writer:
-  replicas: 1                              # one active writer
+  replicas: 2                              # one is elected primary, the other can take over
 reader:
-  replicas: 3                              # readers double as failover pool
+  replicas: 3                              # readers serve queries and replicate the WAL
 cluster:
   failover:
     enabled: true                          # automatic writer + compactor failover

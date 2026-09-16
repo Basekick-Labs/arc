@@ -63,6 +63,22 @@ This rides on the existing telemetry channel and the existing switch: `telemetry
 
 ## Security fixes
 
+### Read-SQL gate hardening: quoted-construct boundaries
+
+Closes a read-path gate bypass in the same family as the earlier quoted-name and
+replacement-scan hardening. The scanner the read-SQL gates depend on could
+disagree with DuckDB about where a quoted construct ends, so part of a statement
+could reach the engine without having been gated. Four spellings are fixed and
+pinned by tests, and the scanners behind them are now shared so the two entry
+points cannot drift apart again.
+
+The DuckDB sandbox's storage-root allowlist bounded impact throughout: files
+outside the configured storage root were refused regardless. RBAC-enabled
+multi-tenant deployments are the ones that should upgrade.
+
+Full technical detail will accompany the corresponding security advisory once it
+is published. Found during internal review.
+
 ### RBAC table-reference deduplication preserves case ([#750](https://github.com/Basekick-Labs/arc/issues/750))
 
 Simple table references (`FROM table`) and JOIN table references (`JOIN table`) now preserve identifier case in deduplication keys during RBAC permission extraction. Previously, the deduplication key folded table names to lowercase while the downstream RBAC pattern matcher evaluated case-sensitively against case-sensitive storage backends. A query referencing measurements differing only by case (e.g., `SELECT * FROM cpu WHERE x IN (SELECT y FROM CPU)`) folded both references into one, authorizing the query if the principal had access to only one of the spellings. Both references are now checked against permissions independently.
@@ -343,6 +359,26 @@ fails the build rather than leaving the note quietly wrong.
    nodes, which are the leader candidates, first.
 
 ## Bug fixes
+
+### No primary writer was ever elected, so retention and continuous queries silently never ran ([#850](https://github.com/Basekick-Labs/arc/issues/850))
+
+**Affects clusters with `cluster.failover_enabled=true` and `cluster.shared_storage_mode=false`, which is the Enterprise Helm chart's default for local-storage deployments.**
+
+Singleton work — the retention and continuous-query schedulers, and the non-dry-run retention, CQ and delete endpoints — is gated on `IsPrimaryWriter()`. With writer failover enabled, that gate was false on every node in the cluster, forever, so retention never deleted anything, continuous queries never ran, and those endpoints answered 503 `is not primary writer`. Nothing logged an error, because each node simply believed it was not the writer. Turning failover off avoided it, since the gate then falls back to a plain role check.
+
+Two defects combined. The writer failover manager could only fail over *from* an existing primary: its health check triggered a promotion only when it had already recorded one, and nothing else ever issued a promotion, so the first one could never happen. That is fixed by electing an initial primary when a cluster has none, mirroring what the compactor manager already did for its own lease. Second, the promotion updated the node registry, which hands out copies, while the gate reads the coordinator's own node object, so even a promotion that did happen never reached it. The promotion and the snapshot-restore path now both update that object.
+
+Shared-storage multi-writer clusters (`cluster.shared_storage_mode=true`) were never affected: writer failover is suppressed there by design and the gate keys off Raft leadership instead.
+
+A writer that simply restarted also used to lose the designation, because a re-join replaces the node's cluster record and the join payload carries no writer state. The cluster then had a primary it could not name, and in a single-writer deployment it never recovered one, because the only candidate was the node the failover logic had just excluded. The node table now keeps the designation across a re-join, and a healthy writer that is the only candidate can be re-elected rather than skipped.
+
+One behaviour changes as a result. A write that arrives at a reader is proxied to a writer, and with no primary ever designated those proxied writes were spread across all healthy writers. They now go to the elected primary, which is what Pattern 1 intends, since only that node should be ingesting. Writers still serve their own traffic directly, and shared-storage clusters are unaffected.
+
+This changes how two replicated commands are applied, so upgrade a cluster fully rather than leaving it mixed-version for long: an old binary elected as Raft leader will not elect a primary, and a new one will once it takes over.
+
+`GET /api/v1/cluster/nodes` now reports each node's `writer_state`, which it did not before. That absence is a large part of why this went unnoticed: there was no way to ask the cluster which node held the primary role. `GET /api/v1/cluster/local` reports the same field for the node serving the request, and that is the one the scheduler gate actually reads.
+
+Two known gaps remain and are tracked separately. Readers are still not promotion candidates ([#856](https://github.com/Basekick-Labs/arc/issues/856)), so a cluster needs more than one writer-role node to survive losing one; the Enterprise Helm chart's Pattern 1 example is corrected accordingly. And a load balancer still has no way to target the elected primary, because `/ready` does not distinguish roles ([#857](https://github.com/Basekick-Labs/arc/issues/857)).
 
 ### Cluster shutdown no longer holds the coordinator and Raft locks while it waits for its subsystems ([#813](https://github.com/Basekick-Labs/arc/issues/813))
 
