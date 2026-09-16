@@ -388,6 +388,38 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### WAL replication attached to an arbitrary writer, not the primary ([#885](https://github.com/Basekick-Labs/arc/issues/885))
+
+A replica chose which writer to stream WAL entries from by walking the node registry and taking the first healthy writer it found. It never looked at whether that writer was the primary. In local-storage mode only the primary ingests, so a standby writer's replication sender has nothing to send: a replica attached to one received no live entries at all, silently, for as long as it stayed attached. With this release's three-writer default that was roughly two replicas in three.
+
+This was never data loss. Flushed Parquet reaches every node through the Raft file manifest and the peer-pull path, independently of the WAL stream, so an affected replica was stale by about one flush interval (`ingest.max_buffer_age_ms`, five seconds by default) plus pull latency rather than missing rows. What it lost was the live window the WAL stream exists to provide.
+
+A replica now prefers the designated primary and falls back to any healthy writer only when no primary exists — the same preference, in the same order, that write routing already made. It also re-evaluates that choice: on a writer promotion, on a writer demotion, and on a periodic re-check. The re-check is the one that matters most in practice. A replica that joins a cluster which elected its primary *before* it joined never sees a promotion event at all, because the join response carries no writer state, so its first choice is necessarily the fallback; the periodic pass is what upgrades it. Restarts outnumber live hand-overs.
+
+Re-targeting replaces the receiver rather than re-pointing the existing one, for the reason in the next note.
+
+### A writer restart wedged WAL replication until the sequence caught up ([#887](https://github.com/Basekick-Labs/arc/issues/887))
+
+Replication entries carry a sequence number, and a receiver enforces that it strictly advances — a repeated or backwards sequence means a replay or a misbehaving writer, and the connection is dropped. But that sequence is an in-memory counter that restarts at zero every time a writer process starts, while the receiver's high-water mark deliberately survives reconnects.
+
+So a writer restart put the two permanently out of step. The receiver, holding a mark from the writer's previous process, rejected the first entry of the new one, dropped the connection, reconnected, and rejected it again — a loop that applied nothing at all until the restarted writer had emitted more entries than its predecessor ever had. On a low-rate deployment that is hours. The replica stayed on the file-manifest path throughout, so again this was staleness rather than loss, but it was unbounded staleness and nothing in the logs named a cause beyond a repeating sequence warning.
+
+A receiver now reconciles with the writer's sequence space during the handshake: if the writer reports a position below the receiver's mark, the receiver rewinds to match. A writer that is merely *ahead* — the ordinary "we missed entries while disconnected" case — leaves the mark alone. The strict-advance check is a within-connection replay defence and is unchanged; what protects entries across connections is the per-connection session key, which is derived fresh from a new handshake nonce every time and so does not depend on the sequence at all.
+
+This is also what makes the re-targeting above safe. Pointing a receiver at a different writer walks into exactly the same mismatch, since no two writers share a sequence space, which is why a re-target builds a new receiver instead of re-using the old one.
+
+A related arithmetic fault is fixed alongside it: the writer's "can this reader resume" calculation subtracted the replication buffer size from the current sequence without guarding the underflow, so it reported false for every connection made before the writer had emitted one buffer's worth of entries — precisely the freshly-restarted writer this note is about. The value is reported in logs and read by no decision today; the fix is so that it stays correct when something does read it.
+
+### A demoted writer kept accepting replication connections
+
+Nothing checked, when a reader asked a writer to stream to it, whether that writer was the primary. A writer that had been demoted still had a running sender, so it accepted the connection and held it open without ever sending an entry.
+
+In local-storage mode a writer now refuses replication sync when the cluster has designated *another* node as primary, naming that node in the refusal. The condition is deliberately that narrow. A cluster that has designated nobody — one still starting up, or one where a hand-over found no eligible successor — accepts as before, because there is no basis on which to prefer one writer over another and refusing would leave a starting cluster unable to replicate at all.
+
+Both sides now read the same record to decide this: the replica picks its source from the cluster's durable designation rather than from its own health-filtered view of the registry. Those two answers diverge exactly when the primary looks unhealthy, and a replica acting on the second would have been refused by every writer acting on the first. The same applies when the primary has dropped out of the replica's registry entirely — evicted, or restarted and not yet re-discovered — so the address is resolved from the cluster record too, rather than falling back to a writer that is certain to turn the replica away.
+
+Shared-storage clusters are unaffected: every writer there ingests and none is designated primary, so the check is not applied.
+
 ### Two nodes could compact the same data at once
 
 Compaction checked whether this node was allowed to compact when its scheduler started, and never again. That check runs before the cluster coordinator exists, so it fell back to the node's configured role: a node whose role is compactor armed its schedule unconditionally, whether or not it actually held the compactor lease.

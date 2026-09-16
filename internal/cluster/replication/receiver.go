@@ -81,9 +81,30 @@ type ReceiverConfig struct {
 // Receiver receives WAL entries from the writer node and applies them locally.
 // It runs on reader nodes to maintain data consistency with the writer.
 type Receiver struct {
-	cfg     *ReceiverConfig
-	conn    net.Conn
-	lastSeq atomic.Uint64 // Last received sequence
+	cfg  *ReceiverConfig
+	conn net.Conn
+	// lastSeq is the highest sequence this receiver has applied. It is
+	// deliberately NOT reset on reconnect: within one writer process the
+	// sequence space is continuous, and the strict-advance check in
+	// receiveLoop is the intra-connection replay defence.
+	//
+	// The space is per-writer-PROCESS, not global. Sender.sequence is an
+	// in-memory counter that restarts at zero on every writer start and is
+	// never persisted, so a writer restart moves the space backwards. connect()
+	// detects that from the handshake's CurrentSequence and rewinds lastSeq to
+	// match; without the rewind every subsequent entry fails the advance check
+	// and the stream wedges permanently (#887).
+	//
+	// Re-targeting to a DIFFERENT writer is not handled here — the coordinator
+	// builds a fresh Receiver for that, so lastSeq starts at zero and there is
+	// nothing to rewind.
+	//
+	// Rewinding costs nothing security-wise, and the reason is specifically
+	// that the handshake nonce is chosen by the RECEIVER (see connect()): the
+	// session key is HKDF(shared secret, that nonce), so a peer cannot make
+	// this connection reuse an earlier connection's key, and entries captured
+	// earlier never verify here no matter what lastSeq holds.
+	lastSeq atomic.Uint64
 	mu      sync.Mutex
 	logger  zerolog.Logger
 
@@ -322,9 +343,32 @@ func (r *Receiver) connect() error {
 		return fmt.Errorf("sync rejected: %s", syncAck.Error)
 	}
 
-	// Handshake accepted — derive the per-connection session key from
-	// the same nonce both sides agreed on. Used to verify per-entry
-	// MAC tags and periodic checkpoint HMACs.
+	// Handshake accepted. Before anything streams, reconcile our sequence
+	// mark with the writer's space.
+	//
+	// The writer reports CurrentSequence from its in-memory counter, read
+	// before it publishes us to its broadcast map (AcceptReplicationConnection),
+	// so the first entry we receive is guaranteed to be strictly greater than
+	// this value. If it is BELOW our mark the writer is in a new sequence
+	// space — it restarted — and holding our old mark would reject every entry
+	// it sends, drop the connection, and repeat forever (#887). Rewind to the
+	// writer's position.
+	//
+	// We do not touch lastSeq when the writer is ahead: that is the ordinary
+	// "we missed entries while disconnected" case, and the advance check
+	// handles it correctly as-is.
+	if prev := r.lastSeq.Load(); syncAck.CurrentSequence < prev {
+		r.lastSeq.Store(syncAck.CurrentSequence)
+		r.logger.Info().
+			Str("writer_addr", r.cfg.WriterAddr).
+			Uint64("previous_last_seq", prev).
+			Uint64("writer_current_seq", syncAck.CurrentSequence).
+			Msg("Replication sequence space moved backwards (writer restart or re-target); rewinding to the writer's position")
+	}
+
+	// Derive the per-connection session key from the same nonce both sides
+	// agreed on. Used to verify per-entry MAC tags and periodic checkpoint
+	// HMACs.
 	sessionKey, err := security.DeriveReplicationSessionKey(r.cfg.SharedSecret, nonce)
 	if err != nil {
 		conn.Close()
@@ -770,6 +814,14 @@ func (r *Receiver) ackLoop(ctx context.Context) {
 // IsConnected returns whether the receiver is connected to the writer.
 func (r *Receiver) IsConnected() bool {
 	return r.connected.Load()
+}
+
+// WriterAddr returns the writer address this receiver streams from. It is
+// fixed for the receiver's lifetime: re-targeting constructs a NEW Receiver
+// rather than mutating this, because the sequence space is per-writer-process
+// and lastSeq must start fresh for the new peer (see lastSeq, and #887).
+func (r *Receiver) WriterAddr() string {
+	return r.cfg.WriterAddr
 }
 
 // LastSequence returns the last received sequence number.
