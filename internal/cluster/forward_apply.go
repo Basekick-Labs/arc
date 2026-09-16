@@ -153,7 +153,7 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 	// dial + TLS handshake costs on the flush hot path. On any
 	// send/receive error, the connection is closed and the next call
 	// dials fresh (lazy reconnect).
-	conn, err := c.getOrDialLeader(ctx, leaderID, leaderAddr)
+	conn, reused, err := c.getOrDialLeader(ctx, leaderID, leaderAddr)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return fmt.Errorf("forward apply: %w", errors.Join(err, ctxErr))
@@ -164,55 +164,30 @@ func (c *Coordinator) forwardApplyToLeader(ctx context.Context, cmd *clusterraft
 	c.forwardMu.Lock()
 	defer c.forwardMu.Unlock()
 
-	// Keep the shared connection bounded by the caller's remaining budget.
-	roundTripDeadline := time.Now().Add(manifestApplyTimeout(ctx))
-	if deadline, ok := ctx.Deadline(); ok && deadline.Before(roundTripDeadline) {
-		roundTripDeadline = deadline
-	}
-	_ = conn.SetDeadline(roundTripDeadline)
-
-	if err := protocol.SendMessage(conn, &protocol.Message{
-		Type:    protocol.MsgForwardApply,
-		Payload: req,
-	}, manifestApplyTimeout(ctx)); err != nil {
-		c.closeForwardConn() // stale — next call redials
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return fmt.Errorf("forward apply: send: %w", errors.Join(err, ctxErr))
+	ack, err := c.forwardApplyRoundTrip(ctx, conn, req)
+	if err != nil && reused && errors.Is(err, errForwardSendFailed) && ctx.Err() == nil {
+		// The cached connection was already dead when we wrote to it, which
+		// is what a leader that closed an idle connection looks like from
+		// here. A send failure is the ONE failure a retry is safe for: the
+		// leader either received nothing or a partial frame it cannot parse,
+		// so it cannot have applied the command. A receive failure is never
+		// retried — the leader may have applied it and only the ack was lost.
+		//
+		// The same signed request is replayed deliberately. If the first send
+		// did reach the leader after all, its nonce cache refuses the
+		// duplicate and this call fails, which is the right answer; a fresh
+		// nonce would apply the command twice.
+		c.closeForwardConn()
+		fresh, _, dialErr := c.getOrDialLeader(ctx, leaderID, leaderAddr)
+		if dialErr == nil {
+			c.logger.Debug().
+				Str("leader_id", leaderID).
+				Msg("ForwardApply: cached leader connection was stale; retried on a fresh one")
+			ack, err = c.forwardApplyRoundTrip(ctx, fresh, req)
 		}
-		return fmt.Errorf("forward apply: send: %w", err)
 	}
-
-	ackMsg, err := protocol.ReceiveMessage(conn, manifestApplyTimeout(ctx))
 	if err != nil {
-		c.closeForwardConn()
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return fmt.Errorf("forward apply: receive ack: %w", errors.Join(err, ctxErr))
-		}
-		return fmt.Errorf("forward apply: receive ack: %w", err)
-	}
-	if ackMsg.Type != protocol.MsgForwardApplyAck {
-		c.closeForwardConn()
-		return fmt.Errorf("forward apply: unexpected ack type: %v", ackMsg.Type)
-	}
-	ack, ok := ackMsg.Payload.(*protocol.ForwardApplyAck)
-	if !ok {
-		c.closeForwardConn()
-		return fmt.Errorf("forward apply: ack payload has wrong type: %T", ackMsg.Payload)
-	}
-	// Authenticate the ack BEFORE reading anything it says.
-	//
-	// Order is load-bearing. Status and Code drive caller behaviour: an
-	// unsigned {Status:"error", Code:"not_leader"} maps to ErrNoLeaderKnown
-	// and is retried as a transient leadership change, and an
-	// {Code:"apply_failed", Error:"... already exists"} is read by
-	// ensureFirstToken as "bootstrap already done". Branching first would let
-	// an on-path attacker pick either outcome.
-	if err := c.checkForwardAck(ack, req.Nonce); err != nil {
-		// Unlike a protocol-level rejection below, a bad MAC means the peer
-		// on the other end of this pooled connection is not trusted — drop it
-		// rather than reuse it for the next command.
-		c.closeForwardConn()
-		return fmt.Errorf("forward apply: %w", err)
+		return err
 	}
 
 	if ack.Status != "ok" {
@@ -264,17 +239,98 @@ func (c *Coordinator) signForwardAck(ack *protocol.ForwardApplyAck, reqNonce str
 	)
 }
 
+// forwardConnIdleTimeout is how long the LEADER keeps a forwarded-apply
+// connection open with no message on it (see handleForwardApplyLoop). After
+// that it closes the connection, and a client that still has it cached
+// discovers this only by writing into a dead socket.
+const forwardConnIdleTimeout = 30 * time.Second
+
+// forwardConnIdleRefresh is when the CLIENT stops trusting its cached
+// connection. It sits comfortably below the leader's timeout, so the common
+// case — a cluster that forwards nothing for a while and then forwards one
+// command — never races the close at all. The retry in forwardApplyToLeader
+// covers what is left: a leader that closed the connection for another reason,
+// or one that restarted.
+const forwardConnIdleRefresh = 20 * time.Second
+
+// errForwardSendFailed marks a failure to put the request on the wire. It is
+// the only forwarding failure a retry can be safe for; see the retry in
+// forwardApplyToLeader.
+var errForwardSendFailed = errors.New("send failed")
+
+// forwardApplyRoundTrip writes one forwarded command and reads its ack. Any
+// error closes the cached connection so the next call dials fresh. A send
+// failure is wrapped in errForwardSendFailed so the caller can tell it apart
+// from a failure whose command may already have been applied.
+func (c *Coordinator) forwardApplyRoundTrip(ctx context.Context, conn net.Conn, req *protocol.ForwardApplyRequest) (*protocol.ForwardApplyAck, error) {
+	// Keep the shared connection bounded by the caller's remaining budget.
+	roundTripDeadline := time.Now().Add(manifestApplyTimeout(ctx))
+	if deadline, ok := ctx.Deadline(); ok && deadline.Before(roundTripDeadline) {
+		roundTripDeadline = deadline
+	}
+	_ = conn.SetDeadline(roundTripDeadline)
+
+	if err := protocol.SendMessage(conn, &protocol.Message{
+		Type:    protocol.MsgForwardApply,
+		Payload: req,
+	}, manifestApplyTimeout(ctx)); err != nil {
+		c.closeForwardConn() // stale — next call redials
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("forward apply: send: %w", errors.Join(err, errForwardSendFailed, ctxErr))
+		}
+		return nil, fmt.Errorf("forward apply: send: %w", errors.Join(err, errForwardSendFailed))
+	}
+
+	ackMsg, err := protocol.ReceiveMessage(conn, manifestApplyTimeout(ctx))
+	if err != nil {
+		c.closeForwardConn()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("forward apply: receive ack: %w", errors.Join(err, ctxErr))
+		}
+		return nil, fmt.Errorf("forward apply: receive ack: %w", err)
+	}
+	if ackMsg.Type != protocol.MsgForwardApplyAck {
+		c.closeForwardConn()
+		return nil, fmt.Errorf("forward apply: unexpected ack type: %v", ackMsg.Type)
+	}
+	ack, ok := ackMsg.Payload.(*protocol.ForwardApplyAck)
+	if !ok {
+		c.closeForwardConn()
+		return nil, fmt.Errorf("forward apply: ack payload has wrong type: %T", ackMsg.Payload)
+	}
+	if err := c.checkForwardAck(ack, req.Nonce); err != nil {
+		c.closeForwardConn()
+		return nil, fmt.Errorf("forward apply: %w", err)
+	}
+	return ack, nil
+}
+
 // getOrDialLeader returns the cached leader connection if it's still open
 // and pointed at the right leader, or dials a new one. The dial happens
 // outside the mutex so a slow/unresponsive leader doesn't block all
 // concurrent forwarders waiting for the lock.
-func (c *Coordinator) getOrDialLeader(ctx context.Context, leaderID, leaderAddr string) (net.Conn, error) {
+// It reports whether the connection it returns was reused, which is what
+// tells the caller a send failure might just be a connection the leader has
+// already closed.
+func (c *Coordinator) getOrDialLeader(ctx context.Context, leaderID, leaderAddr string) (net.Conn, bool, error) {
 	// Fast path: check for a cached connection under a short lock.
 	c.forwardConnMu.Lock()
 	if c.forwardConn != nil && c.forwardConnLeader == leaderID {
-		conn := c.forwardConn
-		c.forwardConnMu.Unlock()
-		return conn, nil
+		// Do not hand back a connection the leader has probably closed: it
+		// drops one that has carried no message for forwardConnIdleTimeout,
+		// and the only way to discover that here is to write into a dead
+		// socket and fail the caller's command (#851). Callers with a retry
+		// loop recovered; a single-shot caller such as a token creation
+		// returned 500 to the user.
+		if time.Since(c.forwardConnUsedAt) < forwardConnIdleRefresh {
+			conn := c.forwardConn
+			c.forwardConnUsedAt = time.Now()
+			c.forwardConnMu.Unlock()
+			return conn, true, nil
+		}
+		c.forwardConn.Close()
+		c.forwardConn = nil
+		c.forwardConnLeader = ""
 	}
 	// Need a new connection — close stale one if any, then unlock
 	// BEFORE dialing so we don't hold the lock during network I/O.
@@ -289,7 +345,7 @@ func (c *Coordinator) getOrDialLeader(ctx context.Context, leaderID, leaderAddr 
 	dialTimeout := manifestApplyTimeout(ctx)
 	conn, err := security.Dial("tcp", leaderAddr, dialTimeout, c.tlsConfig)
 	if err != nil {
-		return nil, fmt.Errorf("dial leader %s (%s): %w", leaderID, leaderAddr, err)
+		return nil, false, fmt.Errorf("dial leader %s (%s): %w", leaderID, leaderAddr, err)
 	}
 
 	// Store the new connection. If another goroutine raced and stored
@@ -300,8 +356,9 @@ func (c *Coordinator) getOrDialLeader(ctx context.Context, leaderID, leaderAddr 
 		// Another goroutine won the race — close our new conn, use theirs.
 		conn.Close()
 		existing := c.forwardConn
+		c.forwardConnUsedAt = time.Now()
 		c.forwardConnMu.Unlock()
-		return existing, nil
+		return existing, true, nil
 	}
 	// We won (or leader changed again) — store ours.
 	if c.forwardConn != nil {
@@ -309,8 +366,9 @@ func (c *Coordinator) getOrDialLeader(ctx context.Context, leaderID, leaderAddr 
 	}
 	c.forwardConn = conn
 	c.forwardConnLeader = leaderID
+	c.forwardConnUsedAt = time.Now()
 	c.forwardConnMu.Unlock()
-	return conn, nil
+	return conn, false, nil
 }
 
 // closeForwardConn closes the cached leader connection (if any) so the
@@ -323,6 +381,7 @@ func (c *Coordinator) closeForwardConn() {
 		c.forwardConn.Close()
 		c.forwardConn = nil
 		c.forwardConnLeader = ""
+		c.forwardConnUsedAt = time.Time{}
 	}
 }
 
@@ -560,8 +619,8 @@ func (c *Coordinator) handleForwardApplyLoop(conn net.Conn, firstReq *protocol.F
 	// A read timeout (30s idle) prevents leaked connections if the client
 	// disappears without closing cleanly.
 	for {
-		_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-		msg, err := protocol.ReceiveMessage(conn, 30*time.Second)
+		_ = conn.SetReadDeadline(time.Now().Add(forwardConnIdleTimeout))
+		msg, err := protocol.ReceiveMessage(conn, forwardConnIdleTimeout)
 		if err != nil {
 			// EOF or timeout — client closed or went idle. Normal lifecycle.
 			return
