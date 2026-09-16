@@ -490,7 +490,12 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 				RaftFSM:         c.raftFSM,
 				FailoverTimeout: time.Duration(cfg.Config.FailoverTimeoutSeconds) * time.Second,
 				CooldownPeriod:  time.Duration(cfg.Config.FailoverCooldownSeconds) * time.Second,
-				Logger:          cfg.Logger,
+				// PreemptCooldown is deliberately NOT set here. It derives
+				// from CooldownPeriod inside NewCompactorFailoverManager, so
+				// the rule lives in exactly one place; setting it here too
+				// would be two copies of one policy that agree only until
+				// someone edits one of them.
+				Logger: cfg.Logger,
 			})
 
 			// Wire FSM compactor assignment callback.
@@ -2507,6 +2512,10 @@ func (c *Coordinator) Status() map[string]interface{} {
 	puller := c.puller
 	c.mu.RUnlock()
 
+	// Read the lease once, not once per node: GetActiveCompactorID takes the
+	// FSM lock and this loop runs over every node in the cluster.
+	activeCompactorID := c.GetActiveCompactorID()
+
 	nodes := c.registry.GetAll()
 	nodeList := make([]map[string]interface{}, 0, len(nodes))
 	for _, node := range nodes {
@@ -2520,6 +2529,11 @@ func (c *Coordinator) Status() map[string]interface{} {
 			"version":        node.Version,
 			"last_heartbeat": node.GetLastHeartbeat(),
 			"stats":          node.GetStats(),
+			// Which node holds the compactor lease was previously visible
+			// only in a log line emitted once, at assignment time. An
+			// operator asking "why is my dedicated compactor idle?" had
+			// nothing to read (#876).
+			"is_active_compactor": activeCompactorID != "" && node.ID == activeCompactorID,
 		})
 	}
 
@@ -2540,6 +2554,16 @@ func (c *Coordinator) Status() map[string]interface{} {
 	if puller != nil {
 		status["replication_catchup_status"] = puller.CatchUpStatus()
 	}
+
+	// The compactor lease, and specifically whether it sits on a node that
+	// was deployed to compact. That distinction is the whole of #876: a
+	// cluster with an idle dedicated compactor and a writer doing the work
+	// looks identical to a healthy one from every other field here.
+	leaseStatus := c.compactorLeaseStatus(activeCompactorID)
+	if preempt := c.compactorPreemptStatus(); preempt != nil {
+		leaseStatus["preemption"] = preempt
+	}
+	status["active_compactor"] = leaseStatus
 
 	// Add Raft status if configured (Phase 3)
 	if c.raftNode != nil {
@@ -2974,6 +2998,16 @@ func (c *Coordinator) GetActiveCompactorID() string {
 		return ""
 	}
 	return c.raftFSM.GetActiveCompactorID()
+}
+
+// CompactorPreemptCooldown reports how long an operator assignment of the
+// compactor lease suppresses automatic preemption. Zero when this cluster has
+// no compactor failover manager, in which case nothing preempts anyway.
+func (c *Coordinator) CompactorPreemptCooldown() time.Duration {
+	if c.compactorFailoverMgr == nil {
+		return 0
+	}
+	return c.compactorFailoverMgr.PreemptCooldown()
 }
 
 // GetRouter returns the request router.
@@ -4261,6 +4295,136 @@ func (c *Coordinator) DemoteWriterViaRaft(nodeID string) (string, error) {
 		Str("new_primary", newPrimary).
 		Msg("Primary writer handed over by an operator")
 	return newPrimary, nil
+}
+
+// compactorLeaseStatus describes the compactor lease for the status endpoint.
+//
+// The holder is looked up in the registry rather than assumed present: a
+// holder that is dead or has been removed is exactly the state an operator is
+// debugging, so that case reports the ID with present=false rather than
+// omitting the block or guessing a role.
+func (c *Coordinator) compactorLeaseStatus(activeCompactorID string) map[string]interface{} {
+	if activeCompactorID == "" {
+		return map[string]interface{}{
+			"assigned": false,
+		}
+	}
+	out := map[string]interface{}{
+		"assigned": true,
+		"node_id":  activeCompactorID,
+	}
+	node, ok := c.registry.Get(activeCompactorID)
+	if !ok {
+		out["present"] = false
+		return out
+	}
+	out["present"] = true
+	out["role"] = string(node.Role)
+	out["state"] = string(node.GetState())
+	// is_dedicated is the field #876 asks for by name: a false here on a
+	// cluster that also lists a healthy compactor node is the bug.
+	out["is_dedicated"] = node.Role == RoleCompactor
+	return out
+}
+
+// compactorPreemptStatus describes progress toward handing the lease to a
+// dedicated compactor.
+//
+// Without this the operator question the whole change exists to answer — "my
+// compactor is idle, why has the lease not moved yet?" — has no answer in the
+// API. The counter and the cooldown are the two things that hold it back, so
+// both are reported.
+func (c *Coordinator) compactorPreemptStatus() map[string]interface{} {
+	if c.compactorFailoverMgr == nil {
+		return nil
+	}
+	return c.compactorFailoverMgr.PreemptStatus()
+}
+
+// AssignCompactorViaRaft hands the compactor lease to a named node at an
+// operator's request. Returns the node that held it before.
+//
+// Must be called on the leader.
+func (c *Coordinator) AssignCompactorViaRaft(nodeID string) (string, error) {
+	if c.raftNode == nil {
+		// A supported configuration (coordinator.go warns about it at
+		// startup), so this is the operator's state to see and correct, not a
+		// server fault — it must not fall through to a 500 and an Error log
+		// on every call, which is what an unwrapped error here would do.
+		return "", ErrClusterRaftNotConfigured
+	}
+	if !c.raftNode.IsLeader() {
+		return "", ErrNotLeaderForTopology
+	}
+
+	mgr := c.compactorFailoverMgr
+	if mgr == nil {
+		// No manager means nothing maintains the lease. Whether that makes
+		// this request safe depends entirely on whether the cluster is
+		// already in lease mode, because compactionClusterGate switches from
+		// the static role check to the lease the moment it is non-empty.
+		//
+		//   no lease  -> refuse. Setting one would flip every node onto a
+		//                lease nothing can ever move again.
+		//   a lease   -> allow. The cluster is ALREADY in that state, most
+		//                likely pinned to a node that is gone with its
+		//                licence lapsed, and this endpoint is then the only
+		//                thing that can recover it.
+		if c.GetActiveCompactorID() == "" {
+			return "", ErrCompactorLeaseNotManaged
+		}
+		return c.assignCompactorUnmanaged(nodeID)
+	}
+
+	oldCompactorID, err := mgr.AssignTo(nodeID)
+	if err != nil {
+		return "", err
+	}
+	c.logger.Info().
+		Str("old_compactor", oldCompactorID).
+		Str("new_compactor", nodeID).
+		Msg("Compactor lease assigned by an operator")
+	return oldCompactorID, nil
+}
+
+// assignCompactorUnmanaged applies the lease change without a failover
+// manager. Only reachable when the cluster is already in lease mode, which is
+// the recovery case described in AssignCompactorViaRaft.
+//
+// It repeats the manager's target validation rather than sharing AssignTo,
+// because AssignTo's other half — serialising against an in-flight automatic
+// failover — is meaningless when there is nothing running to race. Two
+// concurrent operator calls are likewise unserialised here and the last write
+// wins; that is acceptable for a manual recovery lever on a cluster that by
+// definition has no automatic lease movement to collide with.
+func (c *Coordinator) assignCompactorUnmanaged(nodeID string) (string, error) {
+	node, ok := c.registry.Get(nodeID)
+	if !ok {
+		return "", fmt.Errorf("%w: %q", ErrNodeNotFound, nodeID)
+	}
+	if !canHoldCompactorLease(node.Role) {
+		return "", fmt.Errorf("%w: %q has role %q", ErrCannotHoldCompactorLease, nodeID, node.Role)
+	}
+	if node.GetState() != StateHealthy {
+		return "", fmt.Errorf("%w: %q is %s", ErrNodeNotHealthy, nodeID, node.GetState())
+	}
+	current := c.GetActiveCompactorID()
+	if current == nodeID {
+		return "", fmt.Errorf("%w: %q", ErrAlreadyCompactorLeaseHolder, nodeID)
+	}
+
+	timeout := time.Duration(c.cfg.FailoverTimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	if err := c.raftNode.AssignCompactor(nodeID, current, timeout); err != nil {
+		return "", fmt.Errorf("failed to assign the compactor lease to %s: %w", nodeID, err)
+	}
+	c.logger.Warn().
+		Str("old_compactor", current).
+		Str("new_compactor", nodeID).
+		Msg("Compactor lease assigned by an operator on a cluster with no compactor failover manager — nothing will move this lease automatically if the holder fails")
+	return current, nil
 }
 
 // Must be called on the leader.

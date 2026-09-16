@@ -91,6 +91,99 @@ func (h *ClusterHandler) RegisterRoutes(app *fiber.App) {
 		writerGroup.Use(auth.RequireAdmin(h.authManager))
 	}
 	writerGroup.Post("/demote", h.handleDemoteWriter)
+
+	// Admin-only: hands the compactor lease to a named node. Unlike the
+	// writer hand-over above, the target is explicit and required — the
+	// automatic choice landing in the wrong place is exactly what this
+	// endpoint exists to override (#876).
+	compactorGroup := app.Group("/api/v1/cluster/compactor")
+	if h.authManager != nil {
+		compactorGroup.Use(auth.RequireAdmin(h.authManager))
+	}
+	compactorGroup.Post("/assign", h.handleAssignCompactor)
+}
+
+// assignCompactorRequest is the body of POST /api/v1/cluster/compactor/assign.
+type assignCompactorRequest struct {
+	NodeID string `json:"node_id"`
+}
+
+// handleAssignCompactor hands the compactor lease to a named node.
+//
+// This is the operator lever #876 found missing: the lease is only ever moved
+// automatically, and only when its holder is unhealthy or a dedicated
+// compactor has been idle for long enough to preempt it. Neither covers "move
+// compaction off this node right now".
+func (h *ClusterHandler) handleAssignCompactor(c *fiber.Ctx) error {
+	var req assignCompactorRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   "request body must be JSON with a node_id field",
+		})
+	}
+	if len(req.NodeID) == 0 || len(req.NodeID) > maxNodeIDLength {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   "invalid node ID",
+		})
+	}
+
+	// Deliberately NOT respondNotEnabled, which answers 200 with
+	// enabled=false. That is right for "describe yourself" and wrong for
+	// "do this" — a caller checking the status code would read it as an
+	// assignment that happened.
+	if h.coordinator == nil {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"success": false,
+			"error":   "clustering is not enabled on this node, so there is no compactor lease to assign",
+		})
+	}
+
+	oldCompactor, err := h.coordinator.AssignCompactorViaRaft(req.NodeID)
+	if err != nil {
+		status := fiber.StatusInternalServerError
+		switch {
+		case errors.Is(err, cluster.ErrNodeNotFound):
+			status = fiber.StatusNotFound
+		case errors.Is(err, cluster.ErrNotLeaderForTopology),
+			errors.Is(err, cluster.ErrClusterRaftNotConfigured),
+			errors.Is(err, cluster.ErrCompactorFailoverInProgress),
+			errors.Is(err, cluster.ErrCompactorLeaseNotManaged),
+			errors.Is(err, cluster.ErrAlreadyCompactorLeaseHolder),
+			errors.Is(err, cluster.ErrCannotHoldCompactorLease),
+			errors.Is(err, cluster.ErrNodeNotHealthy):
+			status = fiber.StatusConflict
+		}
+		if status == fiber.StatusInternalServerError {
+			h.logger.Error().Err(err).Str("node_id", req.NodeID).Msg("Failed to assign the compactor lease")
+		}
+		return c.Status(status).JSON(fiber.Map{
+			"success": false,
+			"error":   err.Error(),
+		})
+	}
+
+	h.logger.Info().
+		Str("node_id", req.NodeID).
+		Str("old_compactor", oldCompactor).
+		Msg("Compactor lease assigned via API")
+
+	resp := fiber.Map{
+		"success":       true,
+		"node_id":       req.NodeID,
+		"old_compactor": oldCompactor,
+		"message":       "compactor lease assigned",
+	}
+	// Say how long the choice survives. Automatic preemption hands the lease
+	// to a dedicated compactor, so an operator who deliberately put it on a
+	// writer needs to know this is an override with an expiry rather than a
+	// permanent setting — and that changing the node's role is the permanent
+	// version.
+	if d := h.coordinator.CompactorPreemptCooldown(); d > 0 {
+		resp["preemption_suppressed_seconds"] = int(d.Seconds())
+	}
+	return c.JSON(resp)
 }
 
 // handleDemoteWriter hands the primary-writer role off the named node.
@@ -217,6 +310,9 @@ func (h *ClusterHandler) handleGetNodes(c *fiber.Ctx) error {
 	registry := h.coordinator.GetRegistry()
 	nodes := registry.GetAll()
 
+	// Read once for the whole list, not once per node.
+	activeCompactor := h.activeCompactorID()
+
 	nodeList := make([]map[string]interface{}, 0, len(nodes))
 	for _, node := range nodes {
 		// Filter by role if specified
@@ -229,7 +325,7 @@ func (h *ClusterHandler) handleGetNodes(c *fiber.Ctx) error {
 			continue
 		}
 
-		nodeList = append(nodeList, h.nodeToMap(node))
+		nodeList = append(nodeList, h.nodeToMapWithLease(node, activeCompactor))
 	}
 
 	return c.JSON(fiber.Map{
@@ -331,6 +427,20 @@ func (h *ClusterHandler) respondNotEnabled(c *fiber.Ctx) error {
 
 // nodeToMap converts a Node to a map for JSON serialization.
 func (h *ClusterHandler) nodeToMap(node *cluster.Node) map[string]interface{} {
+	return h.nodeToMapWithLease(node, h.activeCompactorID())
+}
+
+// activeCompactorID reads the compactor lease once, for callers that map more
+// than one node. GetActiveCompactorID takes the FSM lock, so re-reading it
+// per node in a loop would take it once per cluster member.
+func (h *ClusterHandler) activeCompactorID() string {
+	if h.coordinator == nil {
+		return ""
+	}
+	return h.coordinator.GetActiveCompactorID()
+}
+
+func (h *ClusterHandler) nodeToMapWithLease(node *cluster.Node, activeCompactorID string) map[string]interface{} {
 	return map[string]interface{}{
 		"id":    node.ID,
 		"name":  node.Name,
@@ -351,6 +461,10 @@ func (h *ClusterHandler) nodeToMap(node *cluster.Node) map[string]interface{} {
 		"last_heartbeat": node.GetLastHeartbeat(),
 		"failed_checks":  node.GetFailedChecks(),
 		"stats":          node.GetStats(),
+		// Who holds the compactor lease was previously observable only in a
+		// log line written once, at assignment time, so "my dedicated
+		// compactor is idle" had no answer in the API (#876).
+		"is_active_compactor": activeCompactorID != "" && node.ID == activeCompactorID,
 	}
 }
 
