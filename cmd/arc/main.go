@@ -1373,7 +1373,7 @@ func main() {
 			shutdownCoordinator.RegisterHook("hourly-compaction-scheduler", func(ctx context.Context) error {
 				hourlyScheduler.Stop()
 				return nil
-			}, shutdown.PriorityCompaction)
+			}, shutdown.PriorityScheduler)
 
 			log.Info().
 				Str("schedule", cfg.Compaction.HourlySchedule).
@@ -1401,7 +1401,7 @@ func main() {
 			shutdownCoordinator.RegisterHook("daily-compaction-scheduler", func(ctx context.Context) error {
 				dailyScheduler.Stop()
 				return nil
-			}, shutdown.PriorityCompaction)
+			}, shutdown.PriorityScheduler)
 
 			log.Info().
 				Str("schedule", cfg.Compaction.DailySchedule).
@@ -1530,7 +1530,10 @@ func main() {
 					} else {
 						shutdownCoordinator.RegisterHook("cluster-coordinator", func(ctx context.Context) error {
 							return clusterCoordinator.Stop()
-						}, shutdown.PriorityCompaction) // Stop before compaction
+							// Stops AFTER the schedulers that ask it whether they may
+							// run (PriorityScheduler), so a tick in flight never finds
+							// the coordinator gone.
+						}, shutdown.PriorityCompaction)
 
 						localNode := clusterCoordinator.GetLocalNode()
 						capabilities := localNode.GetCapabilities()
@@ -3325,7 +3328,7 @@ func main() {
 					shutdownCoordinator.RegisterHook("cq-scheduler", func(ctx context.Context) error {
 						cqScheduler.Stop()
 						return nil
-					}, shutdown.PriorityCompaction)
+					}, shutdown.PriorityScheduler)
 					cqHandler.SetScheduler(cqScheduler)
 					log.Info().Int("job_count", cqScheduler.JobCount()).Msg("CQ scheduler started")
 				}
@@ -3363,7 +3366,7 @@ func main() {
 					shutdownCoordinator.RegisterHook("retention-scheduler", func(ctx context.Context) error {
 						retentionScheduler.Stop()
 						return nil
-					}, shutdown.PriorityCompaction)
+					}, shutdown.PriorityScheduler)
 					log.Info().Str("schedule", cfg.Scheduler.RetentionSchedule).Msg("Retention scheduler started")
 				}
 			}
@@ -3431,7 +3434,7 @@ func main() {
 				shutdownCoordinator.RegisterHook("reconciliation-scheduler", func(ctx context.Context) error {
 					reconciliationScheduler.Stop()
 					return nil
-				}, shutdown.PriorityCompaction)
+				}, shutdown.PriorityScheduler)
 				log.Info().Str("schedule", cfg.Reconciliation.Schedule).
 					Str("backend_kind", string(recCfg.BackendKind)).
 					Bool("dry_run_only", cfg.Reconciliation.ManifestOnlyDryRun).
