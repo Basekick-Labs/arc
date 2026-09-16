@@ -388,6 +388,16 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### Compaction dropped the implicit "time" sort key when a custom sort key was configured ([#792](https://github.com/Basekick-Labs/arc/issues/792))
+
+Ingest sorts each flush by the configured sort keys with `time` appended last, so rows land in `(configured-keys..., time)` order within a file. Compaction rebuilds long-lived files from many such inputs and is meant to preserve that order — the comment above the `ORDER BY` call site says so directly — but `Manager.GetSortKeys` returned the configured keys unchanged, without appending `time`. With any custom `ingest.sort_keys` or `ingest.default_sort_keys` configured, compacted files were re-sorted by the configured columns only, and rows within each group landed in whatever order the multi-file `read_parquet(..., union_by_name=true)` scan produced, not time order.
+
+The visible effect is narrower query pruning on compacted data: `time` row-group min/max statistics widen once the intra-group time ordering is lost, so DuckDB skips fewer row groups on time-filtered queries. The default configuration (`default_sort_keys = "time"`) was unaffected, since `["time"]` was already the same list with or without the append.
+
+`GetSortKeys` now appends `time` the same way ingest's `getSortKeys` in `arrow_writer.go` already does, so compaction and ingest agree on sort order again.
+
+Contributed by [@pujitha24](https://github.com/pujitha24) in [#890](https://github.com/Basekick-Labs/arc/pull/890).
+
 ### WAL replication attached to an arbitrary writer, not the primary ([#885](https://github.com/Basekick-Labs/arc/issues/885))
 
 A replica chose which writer to stream WAL entries from by walking the node registry and taking the first healthy writer it found. It never looked at whether that writer was the primary. In local-storage mode only the primary ingests, so a standby writer's replication sender has nothing to send: a replica attached to one received no live entries at all, silently, for as long as it stayed attached. With this release's three-writer default that was roughly two replicas in three.
