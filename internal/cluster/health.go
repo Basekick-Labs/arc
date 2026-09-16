@@ -320,11 +320,11 @@ func (h *HealthChecker) checkWriterRedundancy(mode writerRedundancyMode) {
 // checkWriterRedundancy. Split out so the wording is unit-testable without
 // running a health loop.
 //
-// Every claim here has to hold for the code as it ships. In particular it does
-// NOT say that two writers lose Raft quorum: today every node that joins
-// becomes a voter regardless of role (coordinator.go AddVoter), so readers
-// carry quorum too. What is true everywhere is that the second writer is the
-// only spare, and one failure consumes it.
+// Every claim here has to hold for the code as it ships. Two writers DO now
+// lose Raft quorum when one dies: since #862 only nodes that can ingest vote,
+// so a two-writer cluster has two voters and needs both. That sentence was
+// false before #862, when readers were voters and carried quorum through a
+// writer loss, and these messages deliberately avoided it. It is true now.
 func writerRedundancyMessage(mode writerRedundancyMode, writers int) string {
 	switch mode {
 	case writerRedundancyLoadBalanced:
@@ -334,10 +334,11 @@ func writerRedundancyMessage(mode writerRedundancyMode, writers int) string {
 				"so a writer loss takes ingest down until an operator restores it. " +
 				"Run three nodes with ARC_CLUSTER_ROLE=writer behind the load balancer."
 		}
-		return "Shared-storage mode has only two writer-role nodes: losing one " +
+		return "Shared-storage mode has only two writer-role nodes: writers are " +
+			"the Raft voters, so losing one leaves no quorum and no leader, and " +
+			"the singleton work that gates on the leader stops with it. It also " +
 			"leaves a single writer behind the load balancer with no remaining " +
-			"redundancy, and no node can be taken out for a rolling upgrade. " +
-			"Run three nodes with ARC_CLUSTER_ROLE=writer."
+			"redundancy. Run three nodes with ARC_CLUSTER_ROLE=writer."
 
 	case writerRedundancyNoFailover:
 		// No failover manager means no CommandPromoteWriter is ever issued,
@@ -362,8 +363,9 @@ func writerRedundancyMessage(mode writerRedundancyMode, writers int) string {
 				"operator intervenes. Run three nodes with ARC_CLUSTER_ROLE=writer."
 		}
 		return "Writer failover is enabled but the cluster has only two writer-role " +
-			"nodes: one failover consumes the only spare and leaves a single writer " +
-			"with nothing left to promote. Run three nodes with ARC_CLUSTER_ROLE=writer."
+			"nodes: writers are the Raft voters, so losing one leaves no quorum, and " +
+			"a promotion cannot be issued without a leader to issue it. Run three " +
+			"nodes with ARC_CLUSTER_ROLE=writer."
 	}
 }
 

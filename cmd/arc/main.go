@@ -1519,6 +1519,22 @@ func main() {
 					os.Exit(1)
 				}
 
+				// Bootstrapping on a role that does not vote makes the first
+				// node of a new cluster an ineligible leader by construction:
+				// it is the only server, it is a non-voter, and Raft never
+				// elects anyone (#862). Nothing recovers from that on its own,
+				// so refuse it at startup rather than let the cluster hang.
+				//
+				// Only reachable from a hand-rolled configuration: the Helm
+				// chart sets ARC_CLUSTER_RAFT_BOOTSTRAP only in the writer
+				// entrypoint, only on writer-0, and the default cluster.role
+				// (standalone) ingests and therefore votes.
+				if cfg.Cluster.RaftBootstrap && !cluster.ParseRole(cfg.Cluster.Role).VotesInElections() {
+					log.Error().Str("role", cfg.Cluster.Role).Msg("cluster.raft_bootstrap requires a role that participates in Raft elections")
+					log.Error().Msg("Only nodes that accept writes vote (writer, standalone). Bootstrap the cluster on one of those, or set ARC_CLUSTER_RAFT_BOOTSTRAP=false on this node and let it join an existing cluster")
+					os.Exit(1)
+				}
+
 				var err error
 				clusterCoordinator, err = cluster.NewCoordinator(&cluster.CoordinatorConfig{
 					Config:        &cfg.Cluster,

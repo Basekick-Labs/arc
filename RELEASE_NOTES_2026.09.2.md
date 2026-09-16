@@ -382,6 +382,18 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### A reader or compactor could win Raft leadership and stall every singleton task ([#862](https://github.com/Basekick-Labs/arc/issues/862))
+
+On shared storage, retention, continuous queries and deletes run on the node that is both the Raft leader and a writer. The role half of that is deliberate: a reader must never run them against the shared bucket. But every node that joined became a Raft voter regardless of its role, so a reader or the compactor could be elected leader. When that happened the leader failed the role half and every writer failed the leader half, so **no node in the cluster passed the gate** and all of that work simply stopped, with nothing to force leadership back to a writer.
+
+Suffrage now follows the role. Nodes that accept writes vote, which is writers and standalone nodes. Readers and compactors join as non-voting members: they replicate the log and see all cluster state exactly as before, they just never campaign and cannot be elected. Compaction is unaffected either way, because it gates on the compactor lease rather than on writer state.
+
+Arc also refuses to start a node that is asked to bootstrap a new cluster on a role that does not vote. That node would be the only server in the cluster and an ineligible leader by construction, so the cluster would never elect anyone and nothing would recover from it.
+
+**This corrects new clusters.** A node that is already recorded as a voter stays one until something changes it, so an existing cluster keeps the voters it has until every node has been through a join on this version. Converging an existing cluster's membership is tracked separately.
+
+**Quorum is now a property of the nodes that can ingest.** Three writers survive losing one, which is the documented shape for both patterns and what the charts have asked for since the writer default moved to three. A cluster with a single writer makes that writer the only voter: it is always the leader, but losing it takes Raft's quorum with it, so token and permission writes and cluster reconfiguration stop too, where previously the readers would have kept Raft alive. That is the intended trade. A cluster that cannot ingest should not be reporting itself as healthy, and it is the same conclusion the writer-redundancy warning reaches from the promotion side.
+
 ### A node role Arc does not recognise is no longer silently treated as standalone ([#848](https://github.com/Basekick-Labs/arc/issues/848))
 
 `ParseRole` answers "what role should this node have", and for an unset value standalone is the right answer. That made it the wrong function for the two callers asking "is this a role at all", because a typo and a deliberate standalone became the same node.

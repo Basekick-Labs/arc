@@ -154,23 +154,30 @@ func TestWriterRedundancy_MessageIsModeSpecific(t *testing.T) {
 	}
 }
 
-// Regression guard for a claim that was in the first draft of this warning and
-// is NOT true of the shipped code: every node that joins becomes a Raft voter
-// regardless of role (coordinator.go AddVoter), so a two-writer cluster does
-// not lose quorum when one writer dies — readers carry the quorum. If #862
-// ever narrows the voter set, this test is the place to revisit the wording.
-func TestWriterRedundancy_MessageDoesNotClaimQuorumLoss(t *testing.T) {
+// The messages say two writers lose Raft quorum, and since #862 that is true:
+// only nodes that can ingest vote, so a two-writer cluster has two voters and
+// needs both. Before #862 readers were voters and carried quorum through a
+// writer loss, the claim was false, and this test asserted its absence.
+//
+// It is kept, inverted, because the claim is only true while the voter set is
+// what #862 made it. If a future change gives any non-ingesting role a vote,
+// this fails and the wording has to be revisited rather than quietly rotting.
+func TestWriterRedundancy_TwoWriterMessagesExplainTheQuorumLoss(t *testing.T) {
 	modes := []writerRedundancyMode{
 		writerRedundancyFailover,
-		writerRedundancyNoFailover,
 		writerRedundancyLoadBalanced,
 	}
 	for _, mode := range modes {
-		for writers := 0; writers < writersForHA; writers++ {
-			msg := strings.ToLower(writerRedundancyMessage(mode, writers))
-			if strings.Contains(msg, "quorum") {
-				t.Errorf("mode=%d writers=%d message claims quorum loss, which the current voter set does not support: %s", mode, writers, msg)
-			}
+		msg := strings.ToLower(writerRedundancyMessage(mode, 2))
+		if !strings.Contains(msg, "quorum") {
+			t.Errorf("mode=%d two-writer message should explain the quorum loss: %s", mode, msg)
+		}
+	}
+
+	// The claim is only sound because non-ingesting roles do not vote.
+	for _, r := range AllRoles() {
+		if r.VotesInElections() != r.GetCapabilities().CanIngest {
+			t.Fatalf("role %q votes independently of whether it ingests; the two-writer quorum claim no longer holds", r)
 		}
 	}
 }

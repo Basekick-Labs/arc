@@ -69,6 +69,28 @@ func (r NodeRole) GetCapabilities() RoleCapabilities {
 	}
 }
 
+// VotesInElections reports whether a node with this role should be a Raft
+// VOTER rather than a non-voting member.
+//
+// The rule is: a node votes iff it can ingest. Writers and standalone nodes
+// vote; readers and compactors replicate the log and serve their own work but
+// never campaign (#862).
+//
+// Why CanIngest and not CanCoordinate, which sounds like the right field:
+// CanCoordinate is false for RoleStandalone, and standalone is the DEFAULT
+// cluster.role. A CanCoordinate predicate would leave a default-configured
+// cluster with zero voters, which hashicorp/raft rejects outright.
+//
+// Call this on a ParseRole-normalised role, never on a raw string cast. The
+// capabilities table's default branch returns the zero value, so an unknown
+// role would NOT vote, while ParseRole maps the same input to standalone,
+// which does. They disagree on exactly the input a migration meets — a record
+// written before role validation — and the safe answer there is to keep the
+// vote, not to silently strip it.
+func (r NodeRole) VotesInElections() bool {
+	return r.GetCapabilities().CanIngest
+}
+
 // String returns the string representation of the role.
 func (r NodeRole) String() string {
 	return string(r)

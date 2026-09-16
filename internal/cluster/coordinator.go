@@ -1432,14 +1432,39 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 	node.SetVersion(req.Version)
 	node.UpdateState(StateHealthy)
 
-	// Add to Raft cluster if configured
+	// Add to Raft cluster if configured.
+	//
+	// Suffrage follows the role: only nodes that can ingest vote (#862). A
+	// reader or compactor that could win leadership stalls every singleton
+	// task in shared-storage mode, because IsPrimaryWriter is "Raft leader AND
+	// RoleWriter" and no node then satisfies both halves. Non-voters still
+	// replicate the log and see all cluster state; they just never campaign.
+	//
+	// node.Role rather than req.Role: it has been through ParseRole, and #848
+	// has already refused anything unrecognised, so this cannot silently
+	// disenfranchise a role the capabilities table does not know.
 	if c.raftNode != nil {
-		// First add as a Raft voter
-		if err := c.raftNode.AddVoter(req.NodeID, req.RaftAddr, 10*time.Second); err != nil {
-			c.logger.Error().Err(err).Str("node_id", req.NodeID).Msg("Failed to add voter to Raft")
-			c.sendJoinError(conn, req, fmt.Sprintf("failed to add to Raft cluster: %v", err))
+		votes := node.Role.VotesInElections()
+		var addErr error
+		if votes {
+			addErr = c.raftNode.AddVoter(req.NodeID, req.RaftAddr, 10*time.Second)
+		} else {
+			addErr = c.raftNode.AddNonvoter(req.NodeID, req.RaftAddr, 10*time.Second)
+		}
+		if addErr != nil {
+			c.logger.Error().Err(addErr).
+				Str("node_id", req.NodeID).
+				Str("role", string(node.Role)).
+				Bool("voter", votes).
+				Msg("Failed to add node to Raft")
+			c.sendJoinError(conn, req, fmt.Sprintf("failed to add to Raft cluster: %v", addErr))
 			return
 		}
+		c.logger.Info().
+			Str("node_id", req.NodeID).
+			Str("role", string(node.Role)).
+			Bool("voter", votes).
+			Msg("Node added to Raft membership")
 
 		// Then add node info to FSM
 		nodeInfo := &raft.NodeInfo{
