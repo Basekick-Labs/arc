@@ -1,5 +1,7 @@
 package cluster
 
+import "strings"
+
 // NodeRole represents the role of a node in the cluster.
 // Each role has specific capabilities that determine what operations the node can perform.
 type NodeRole string
@@ -98,6 +100,32 @@ func ParseRole(role string) NodeRole {
 		return r
 	}
 	return RoleStandalone
+}
+
+// ParseRoleStrict parses a role string and reports whether it was recognised.
+//
+// It is ParseRole without the fallback. ParseRole answers "what role should
+// this node have", and standalone is the right answer for an unset value; that
+// makes it wrong for the two callers that need to answer "is this a role at
+// all", because a typo and a deliberate standalone become the same node. An
+// empty string is not recognised here either: the caller that wants the
+// unset-means-standalone default has to say so.
+func ParseRoleStrict(role string) (NodeRole, bool) {
+	r := NodeRole(role)
+	if !r.IsValid() {
+		return "", false
+	}
+	return r, true
+}
+
+// RoleNames renders the valid roles for an operator-facing error message, so
+// the set is spelled once rather than in every message that lists it.
+func RoleNames() string {
+	names := make([]string, 0, len(AllRoles()))
+	for _, r := range AllRoles() {
+		names = append(names, string(r))
+	}
+	return strings.Join(names, ", ")
 }
 
 // AllRoles returns all valid node roles.

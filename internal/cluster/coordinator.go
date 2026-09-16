@@ -177,6 +177,30 @@ type CoordinatorConfig struct {
 	WarnIfNoCompactor bool
 }
 
+// ResolveRole turns a configured cluster.role string into a NodeRole, or
+// refuses it.
+//
+// NewCoordinator used to do this inline as ParseRole followed by !role.IsValid(),
+// which could never fire: ParseRole falls back to standalone for anything it
+// does not recognise, and standalone is valid. So `ARC_CLUSTER_ROLE=writter`
+// started a node that reported itself as standalone — which still ingests, so
+// nothing looked broken — while the operator's intended writer silently was
+// not one, and in shared-storage mode would never pass IsPrimaryWriter.
+//
+// An empty value keeps meaning standalone: that is the documented default for
+// cluster.role, and an operator who never set the key must still get a node.
+// Anything else has to be a role we know (#848).
+func ResolveRole(configured string) (NodeRole, error) {
+	if configured == "" {
+		return RoleStandalone, nil
+	}
+	role, ok := ParseRoleStrict(configured)
+	if !ok {
+		return "", fmt.Errorf("%w: %q (valid roles: %s)", ErrInvalidRole, configured, RoleNames())
+	}
+	return role, nil
+}
+
 // NewCoordinator creates a new cluster coordinator.
 // Returns an error if the license is invalid or missing the clustering feature.
 func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
@@ -186,9 +210,9 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	}
 
 	// Validate role
-	role := ParseRole(cfg.Config.Role)
-	if !role.IsValid() {
-		return nil, fmt.Errorf("%w: %s", ErrInvalidRole, cfg.Config.Role)
+	role, err := ResolveRole(cfg.Config.Role)
+	if err != nil {
+		return nil, err
 	}
 
 	// Generate node ID if not provided
@@ -1360,6 +1384,29 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 		}
 	}
 
+	// Validate the role the joiner presents.
+	//
+	// The role was stored as sent, and ParseRole maps anything unrecognised —
+	// including the empty string — to standalone, whose capabilities include
+	// CanIngest. So a joiner presenting a bogus role ended up in the registry
+	// and the FSM as an ingest-capable node, passing the manifest-command role
+	// gate in handleForwardApply and appearing in listings with a role no
+	// operator configured (#848).
+	//
+	// Checked before the leader redirect because it is a property of the
+	// request alone: bouncing it to the leader only to be refused there wastes
+	// a round trip. Empty is refused too — a joining node always sends the
+	// role it parsed from its own config, and that config has a default, so an
+	// empty role on the wire never comes from a node running this code.
+	if !ValidRole(req.Role) {
+		c.logger.Warn().
+			Str("node_id", req.NodeID).
+			Str("role", req.Role).
+			Msg("Join rejected: unrecognised node role")
+		c.sendJoinError(conn, req, fmt.Sprintf("unrecognised node role %q (valid roles: %s)", req.Role, RoleNames()))
+		return
+	}
+
 	// Check if we're the leader
 	if c.raftNode != nil && !c.raftNode.IsLeader() {
 		// Redirect to leader
@@ -2501,6 +2548,9 @@ func (c *Coordinator) registerSelfInFSMWhenLeader() {
 // WriterState is carried too: after a snapshot restore it is the only record
 // of which writer is primary, the PromoteWriter entries having been compacted
 // away; on the replay path it is the zero value and changes nothing.
+// Does not validate or log the role itself: it is a free function with no
+// logger, and its callers are better placed. onRaftNodeAdded warns about an
+// unrecognised role before calling this.
 func nodeFromRaftInfo(n *raft.NodeInfo) *Node {
 	node := NewNode(n.ID, n.Name, ParseRole(n.Role), n.ClusterName)
 	node.SetAddresses(n.Address, n.APIAddress)
@@ -2513,6 +2563,24 @@ func nodeFromRaftInfo(n *raft.NodeInfo) *Node {
 }
 
 func (c *Coordinator) onRaftNodeAdded(n *raft.NodeInfo) {
+	// Roles are validated at join now, but a cluster formed before #848 can
+	// still carry an unrecognised one in the FSM, and this is where it
+	// arrives: log replay and snapshot restore both come through here with
+	// the record as it was written. ParseRole keeps treating it as
+	// standalone, because dropping an existing member during a restore is
+	// worse than carrying it, but say so rather than absorb it in silence.
+	//
+	// A JoinResponse peer list cannot carry one: sendJoinSuccess serialises
+	// from registry Nodes, whose roles have already been through ParseRole.
+	// A check there would be another one that can never fire, which is the
+	// shape #848 exists to remove.
+	if !ValidRole(n.Role) {
+		c.logger.Warn().
+			Str("node_id", n.ID).
+			Str("role", n.Role).
+			Msg("Cluster state carries an unrecognised node role; treating it as standalone. It predates role validation at join (#848)")
+	}
+
 	node := nodeFromRaftInfo(n)
 
 	if err := c.registry.Register(node); err != nil {
