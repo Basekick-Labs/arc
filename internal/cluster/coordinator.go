@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -477,6 +478,14 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	// electing the first primary is not a licensed capability (#872).
 	c.healthChecker.enableWriterRedundancyWarning(writerRedundancyModeFor(
 		cfg.Config.SharedStorageMode, c.autoFailover))
+
+	// #880: arm the voter-set warning whenever there is a Raft node. Not
+	// gated on a licence or on failover — reporting that a reader holds a
+	// vote is not a paid capability, and the cluster shapes that have this
+	// problem are precisely the ones upgraded from before #862.
+	if c.raftNode != nil {
+		c.healthChecker.SetVoterMismatchProbe(c.voterMismatchCount)
+	}
 
 	// Initialize compactor failover manager (Phase 5) — reuses the same
 	// FailoverEnabled toggle and license gate as writer failover.
@@ -1604,8 +1613,9 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 	// that is already a Voter updates its address and leaves Suffrage alone
 	// (hashicorp/raft nextConfiguration), so a reader recorded as a voter
 	// before this change stays one across restarts and re-joins. Converging
-	// existing membership needs DemoteVoter, which is wrapped here but not yet
-	// driven by anything.
+	// existing membership needs DemoteVoter, which
+	// POST /api/v1/cluster/voters/converge drives (#880); nothing converges
+	// automatically, deliberately.
 	if c.raftNode != nil {
 		votes := node.Role.VotesInElections()
 		var addErr error
@@ -2568,7 +2578,7 @@ func (c *Coordinator) Status() map[string]interface{} {
 	// Add Raft status if configured (Phase 3)
 	if c.raftNode != nil {
 		raftStats := c.raftNode.Stats()
-		status["raft"] = map[string]interface{}{
+		raftStatus := map[string]interface{}{
 			"enabled":     true,
 			"is_leader":   c.raftNode.IsLeader(),
 			"leader_addr": c.raftNode.LeaderAddr(),
@@ -2576,6 +2586,14 @@ func (c *Coordinator) Status() map[string]interface{} {
 			"state":       c.raftNode.State().String(),
 			"stats":       raftStats,
 		}
+		// #880: the voter set against the role-based rule. Before this the
+		// only record of a server's suffrage was inside raft.stats'
+		// latest_configuration, an opaque fmt.Sprintf dump, so a reader still
+		// holding a vote from before #862 was invisible in practice.
+		if membership := c.raftMembershipStatus(); membership != nil {
+			raftStatus["membership"] = membership
+		}
+		status["raft"] = raftStatus
 	} else {
 		status["raft"] = map[string]interface{}{
 			"enabled": false,
@@ -2602,6 +2620,661 @@ func (c *Coordinator) Status() map[string]interface{} {
 	}
 
 	return status
+}
+
+// --- #880: Raft voter-set convergence -------------------------------------
+
+// serverRoleResolution is one server's role as the cluster records it, and
+// where that record came from.
+type serverRoleResolution struct {
+	role     NodeRole
+	resolved bool
+}
+
+// resolveServerRole answers "what role does the cluster believe this Raft
+// server has", reading the FSM node table first and the registry second.
+//
+// The ordering is load-bearing and the reason is not the obvious one. It is
+// NOT that the registry can be empty — a snapshot restore now delivers every
+// restored node to the AddNode callback, so a snapshot-restored leader has a
+// populated registry. It is that nodeFromRaftInfo runs the role through
+// ParseRole, which maps anything unrecognised — and the empty string — to
+// standalone. So the registry LAUNDERS exactly the input this tool exists to
+// find: a legacy record carrying a role Arc no longer recognises would come
+// back as "standalone", which votes, and would be reported as matching.
+//
+// A node present in the FSM with an unrecognised role therefore resolves to
+// NOT-resolved rather than falling through to the registry. Falling through
+// would reintroduce the laundering this ordering exists to avoid.
+//
+// #848 refuses an unrecognised role from a live joiner and from local config,
+// but historical FSM and snapshot records are never revalidated — see the
+// warning in onRaftNodeAdded — so this state is reachable on exactly the
+// pre-#862 clusters this feature targets.
+// roleIndex is a snapshot of both role sources, taken once per operation.
+//
+// resolveServerRole used to read them per server, which meant taking the FSM
+// lock once for every member of the cluster on an endpoint anyone can call.
+// Status() already has a precedent against exactly that two functions above:
+// "Read the lease once, not once per node".
+type roleIndex struct {
+	fsmRoles map[string]string // node ID -> RAW role string, unnormalised
+	regRoles map[string]NodeRole
+}
+
+func (c *Coordinator) newRoleIndex() roleIndex {
+	idx := roleIndex{fsmRoles: map[string]string{}, regRoles: map[string]NodeRole{}}
+	if c.raftNode != nil {
+		if fsm := c.raftNode.FSM(); fsm != nil {
+			for _, n := range fsm.GetAllNodes() {
+				idx.fsmRoles[n.ID] = n.Role
+			}
+		}
+	}
+	for _, n := range c.registry.GetAll() {
+		idx.regRoles[n.ID] = n.Role
+	}
+	return idx
+}
+
+func (idx roleIndex) resolve(nodeID string) serverRoleResolution {
+	if raw, ok := idx.fsmRoles[nodeID]; ok {
+		if role, ok := ParseRoleStrict(raw); ok {
+			return serverRoleResolution{role: role, resolved: true}
+		}
+		return serverRoleResolution{}
+	}
+	if role, ok := idx.regRoles[nodeID]; ok && role.IsValid() {
+		return serverRoleResolution{role: role, resolved: true}
+	}
+	return serverRoleResolution{}
+}
+
+func (c *Coordinator) resolveServerRole(nodeID string) serverRoleResolution {
+	if c.raftNode != nil {
+		if fsm := c.raftNode.FSM(); fsm != nil {
+			if info, ok := fsm.GetNode(nodeID); ok {
+				// ParseRoleStrict, not ParseRole: the capabilities table's
+				// default branch returns the zero value, so an unknown role
+				// does NOT vote, while ParseRole maps it to standalone, which
+				// does. They disagree on precisely the migration input, and
+				// the safe answer is to report it rather than pick a side.
+				// The empty string is unresolved for the same reason: it is a
+				// legitimate "unset" for local config and a corrupt record on
+				// a foreign node.
+				if role, ok := ParseRoleStrict(info.Role); ok {
+					return serverRoleResolution{role: role, resolved: true}
+				}
+				return serverRoleResolution{}
+			}
+		}
+	}
+	if node, ok := c.registry.Get(nodeID); ok {
+		if node.Role.IsValid() {
+			return serverRoleResolution{role: node.Role, resolved: true}
+		}
+	}
+	return serverRoleResolution{}
+}
+
+// raftMembershipStatus reports the Raft configuration against the role-based
+// suffrage rule (#862), so an operator can see a legacy voter that the rule
+// would not grant today.
+//
+// Returns nil when there is no Raft node, so the caller omits the block
+// rather than publishing an empty one.
+//
+// On the field names: raft.stats already publishes latest_configuration (an
+// opaque fmt.Sprintf dump that happens to contain each server's suffrage) and
+// num_peers, which hashicorp documents as the number of OTHER voting servers,
+// excluding this node. This block's job is to make that string structured;
+// the count is therefore called voting_servers and includes self, and the
+// difference from num_peers is exactly one when this node votes. A field
+// called voter_count sitting next to num_peers and disagreeing with it by one
+// is a support ticket, not a feature.
+func (c *Coordinator) raftMembershipStatus() map[string]interface{} {
+	if c.raftNode == nil {
+		return nil
+	}
+	cfg, err := c.raftNode.GetConfiguration()
+	if err != nil {
+		return map[string]interface{}{
+			"error": err.Error(),
+			// Still say whose view failed, so the operator knows which node to
+			// look at.
+			"view":    "local",
+			"view_of": c.localNode.ID,
+		}
+	}
+
+	out := c.membershipFromConfig(cfg)
+	out["view"] = "local"
+	out["view_of"] = c.localNode.ID
+	out["is_leader"] = c.raftNode.IsLeader()
+	return out
+}
+
+// membershipFromConfig is the comparison itself, separated so it can be driven
+// against configurations a test supplies. Every interesting shape here needs a
+// voter that should not be one, and manufacturing that on a live rig means two
+// real voters — which flakes on CI, and which cannot express the dead-majority
+// case at all without killing the test's own cluster.
+func (c *Coordinator) membershipFromConfig(cfg hraft.Configuration) map[string]interface{} {
+	servers := make([]map[string]interface{}, 0, len(cfg.Servers))
+	voting, mismatches, unresolved := 0, 0, 0
+	idx := c.newRoleIndex()
+
+	for _, srv := range cfg.Servers {
+		id := string(srv.ID)
+		isVoter := srv.Suffrage == hraft.Voter
+		if isVoter {
+			voting++
+		}
+
+		entry := map[string]interface{}{
+			"id":       id,
+			"suffrage": suffrageName(srv.Suffrage),
+		}
+
+		res := idx.resolve(id)
+		if !res.resolved {
+			// Never a mismatch: a server whose role the cluster cannot name is
+			// not evidence that it should not vote. Demoting on this basis is
+			// how a converge would remove quorum.
+			unresolved++
+			entry["role"] = nil
+			entry["resolved"] = false
+			servers = append(servers, entry)
+			continue
+		}
+
+		shouldVote := res.role.VotesInElections()
+		expected := "nonvoter"
+		if shouldVote {
+			expected = "voter"
+		}
+		matches := shouldVote == isVoter
+		if !matches {
+			mismatches++
+		}
+		entry["role"] = string(res.role)
+		entry["resolved"] = true
+		entry["expected"] = expected
+		entry["matches"] = matches
+		servers = append(servers, entry)
+	}
+
+	// The caller stamps the view. GetConfiguration returns this node's own
+	// latest configuration with no round trip, and "latest" may be an entry
+	// that is not yet committed: a follower's answer can lag the leader's and
+	// can name a configuration that is later truncated, so the block says
+	// whose view it is and only the leader's is authoritative.
+	return map[string]interface{}{
+		"servers":        servers,
+		"voting_servers": voting,
+		"mismatches":     mismatches,
+		"unresolved":     unresolved,
+	}
+}
+
+// voterMismatchCount reports how many Raft servers hold a suffrage the
+// role-based rule would not grant, and whether the local node is the leader.
+// Used by the health loop's rate-limited warning.
+func (c *Coordinator) voterMismatchCount() (mismatches int, isLeader bool) {
+	if c.raftNode == nil {
+		return 0, false
+	}
+	if !c.raftNode.IsLeader() {
+		return 0, false
+	}
+	cfg, err := c.raftNode.GetConfiguration()
+	if err != nil {
+		return 0, true
+	}
+	return c.countDemotableMismatches(cfg), true
+}
+
+// VoterConvergeResult describes what converging the Raft voter set onto the
+// role-based rule would do, or did.
+type VoterConvergeResult struct {
+	DryRun              bool              `json:"dry_run"`
+	WouldDemote         []string          `json:"would_demote,omitempty"`
+	Demoted             []string          `json:"demoted,omitempty"`
+	Failed              map[string]string `json:"failed,omitempty"`
+	Skipped             []string          `json:"skipped,omitempty"`
+	VotingServersBefore int               `json:"voting_servers_before"`
+	VotingServersAfter  int               `json:"voting_servers_after"`
+	SelfMismatch        bool              `json:"self_mismatch"`
+	// LeadershipMovedTo is set only when leadership ACTUALLY moved;
+	// WouldMoveLeadershipTo is the dry-run preview. Two fields rather than
+	// one, because a past-tense name on a plan is a lie a JSON consumer
+	// cannot detect.
+	LeadershipMovedTo     string   `json:"leadership_moved_to,omitempty"`
+	WouldMoveLeadershipTo string   `json:"would_move_leadership_to,omitempty"`
+	Notes                 []string `json:"notes,omitempty"`
+}
+
+// voterConvergeTimeout bounds the WHOLE operation — the barrier and every
+// demotion together.
+//
+// Both halves need it. Barrier(timeout)'s own timeout bounds only the enqueue;
+// the future's Error() then blocks with no deadline at all, unblocking only on
+// apply, leadership loss or shutdown. The same is true of a configuration
+// change future. Without an outer deadline this endpoint can outlive the
+// handler's context.
+const voterConvergeTimeout = 20 * time.Second
+
+// ConvergeVoters demotes Raft servers whose suffrage the role-based rule
+// (#862) would not grant them today. It NEVER promotes.
+//
+// Promotion is the dangerous direction and is deliberately absent: adding a
+// voter raises the quorum requirement, and if the promoted node is down or
+// lagging the entry never commits, no further membership change is possible,
+// and the sole leader steps down — with no RecoverCluster or peers.json path
+// out of it. The asymmetry that makes demote-only tolerable is that the
+// mistake is self-repairing in the other direction: AddVoter on an existing
+// non-voter DOES promote, so a node wrongly demoted whose role votes gets its
+// vote back on its next restart or re-join.
+//
+// Demotion is not automatically safe either, which is the correction this
+// carries: a configuration change takes effect the moment it is dispatched and
+// commitment is recomputed over the NEW voter set, so removing a LIVE voter
+// from a set whose survivors are dead strands the entry forever. Every
+// demotion is therefore gated on the liveness of the voter set it would leave
+// behind.
+func (c *Coordinator) ConvergeVoters(dryRun, allowSingleVoter bool) (*VoterConvergeResult, error) {
+	if c.raftNode == nil {
+		return nil, ErrClusterRaftNotConfigured
+	}
+	if !c.raftNode.IsLeader() {
+		return nil, ErrNotLeaderForTopology
+	}
+
+	deadline := time.Now().Add(voterConvergeTimeout)
+
+	// Barrier so the FSM has applied its backlog before any role is read.
+	//
+	// It is NOT a guarantee that the FSM matches the configuration: the Raft
+	// configuration is not FSM state, and the join path applies AddVoter
+	// before writing the FSM node record, so an "in the configuration, not yet
+	// in the FSM" window is structural. The barrier narrows it; treating such
+	// a server as unresolved-and-skipped is what actually handles it.
+	if err := c.barrierWithin(time.Until(deadline)); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrVoterConvergeNotReady, err)
+	}
+
+	cfg, err := c.raftNode.GetConfiguration()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read the Raft configuration: %w", err)
+	}
+	return c.convergeWithConfig(cfg, dryRun, allowSingleVoter, deadline)
+}
+
+// convergeWithConfig is everything after the preconditions, split out so tests
+// can drive it against a configuration they construct. See
+// membershipFromConfig for why that matters.
+func (c *Coordinator) convergeWithConfig(cfg hraft.Configuration, dryRun, allowSingleVoter bool, deadline time.Time) (*VoterConvergeResult, error) {
+	plan := c.planVoterConverge(cfg)
+	result := &VoterConvergeResult{
+		DryRun:              dryRun,
+		Failed:              map[string]string{},
+		Skipped:             plan.skipped,
+		Notes:               plan.notes,
+		SelfMismatch:        plan.selfMismatch,
+		VotingServersBefore: len(plan.voters),
+	}
+	planned := plan.planned
+	voters := plan.voters
+	localID := c.localNode.ID
+
+	// Secondary sanity guard: a wholesale-unknown view is a bug in this code
+	// or a cluster mid-restore, not a cluster of readers. It is NOT the safety
+	// property — that is the liveness check below.
+	if len(cfg.Servers) > 0 && plan.resolved*2 < len(cfg.Servers) {
+		return nil, fmt.Errorf("%w: only %d of %d servers could be resolved to a role",
+			ErrVoterConvergeUnsafe, plan.resolved, len(cfg.Servers))
+	}
+
+	// Self first: converging the others while the leader is itself a
+	// mismatched voter leaves IsPrimaryWriter matching nobody, which is the
+	// condition #880 exists to clear. Reporting success there would be a lie.
+	if result.SelfMismatch {
+		target := c.leadershipTransferTarget(cfg, localID)
+		if target == "" {
+			return nil, fmt.Errorf("%w: this node holds a vote its role does not grant, and no other voting-role voter is available to take leadership", ErrVoterConvergeNeedsLeadershipMove)
+		}
+		if dryRun {
+			// Validate the plan even here, or the preview promises demotions
+			// the real run would refuse — on precisely the legacy cluster
+			// shape this feature exists for.
+			if _, err := c.checkConvergeSafety(voters, planned, allowSingleVoter); err != nil {
+				return nil, err
+			}
+			// NOT LeadershipMovedTo: nothing moved. A past-tense field in a
+			// dry run is indistinguishable from the real thing to anything
+			// parsing the JSON.
+			result.WouldMoveLeadershipTo = target
+			result.WouldDemote = planned
+			// The leader's own vote is revoked by the re-run and is not in
+			// planned, so count it too — otherwise the preview under-reports
+			// the reduction it is previewing.
+			result.VotingServersAfter = len(voters) - len(planned) - 1
+			result.Notes = append(result.Notes,
+				fmt.Sprintf("this node (%s) holds a vote its role does not grant; a real run moves leadership to %s first, then must be re-run against the new leader, which also revokes this node's vote", localID, target))
+			return result, nil
+		}
+		if err := c.raftNode.LeadershipTransferToServer(target, c.raftServerAddr(cfg, target)); err != nil {
+			return nil, fmt.Errorf("%w: failed to move leadership to %s: %v", ErrVoterConvergeNeedsLeadershipMove, target, err)
+		}
+		result.LeadershipMovedTo = target
+		return result, ErrVoterConvergeLeadershipMoved
+	}
+
+	if len(planned) == 0 {
+		result.VotingServersAfter = len(voters)
+		return result, nil
+	}
+
+	// The safety property. Applied per demotion, against the set each one
+	// would leave behind.
+	remaining, err := c.checkConvergeSafety(voters, planned, allowSingleVoter)
+	if err != nil {
+		return nil, err
+	}
+
+	result.VotingServersAfter = len(remaining)
+	if dryRun {
+		result.WouldDemote = planned
+		return result, nil
+	}
+
+	// The plan was validated as a sequence of PREFIXES: the set left after
+	// planned[0..i]. A failure mid-loop breaks that assumption — skipping a
+	// dead node's demotion while going on to demote a healthy one produces a
+	// subset nobody checked, and that is exactly how the guard is defeated.
+	// So: re-validate against the set that actually remains before every
+	// demotion, and stop at the first failure rather than continuing.
+	//
+	// Stopping is also what this repository's cluster-operations rule
+	// requires — a failed membership change is not transient, and continuing
+	// past it is how orphan state is created.
+	live := append([]string(nil), voters...)
+	for _, id := range planned {
+		if time.Now().After(deadline) {
+			result.Failed[id] = "converge deadline exceeded"
+			break
+		}
+		if !c.raftNode.IsLeader() {
+			result.Failed[id] = "no longer the leader"
+			break
+		}
+		// Health is re-read here, not reused from the plan: a voter can die
+		// between planning and the last demotion, which reproduces the same
+		// unrecoverable configuration with no failure at all.
+		if _, err := c.checkConvergeSafety(live, []string{id}, allowSingleVoter); err != nil {
+			result.Failed[id] = err.Error()
+			break
+		}
+		if err := c.demoteWithin(id, time.Until(deadline)); err != nil {
+			// Including ErrEnqueueTimeout, which means the change was never
+			// enqueued and therefore did NOT happen. Reporting it as done
+			// would make this response lie — and continuing would demote the
+			// next node against a voter set this loop can no longer predict.
+			result.Failed[id] = err.Error()
+			break
+		}
+		live = removeString(live, id)
+		result.Demoted = append(result.Demoted, id)
+	}
+	result.VotingServersAfter = result.VotingServersBefore - len(result.Demoted)
+
+	// The issue is explicit that there must be no FLOOR on demotions — a
+	// cluster that genuinely has two ingest-capable nodes must be allowed to
+	// converge — but equally explicit that dropping below the documented
+	// three should be said out loud.
+	if result.VotingServersAfter < writersForHA && len(result.Demoted) > 0 {
+		msg := fmt.Sprintf("this cluster now has %d Raft voters; %d is the documented minimum for tolerating the loss of one", result.VotingServersAfter, writersForHA)
+		result.Notes = append(result.Notes, msg)
+		c.logger.Warn().
+			Int("voting_servers", result.VotingServersAfter).
+			Int("recommended", writersForHA).
+			Msg("Raft voter set converged below the recommended number of voters")
+	}
+	return result, nil
+}
+
+// barrierWithin runs a Raft barrier under a caller-supplied deadline.
+//
+// Needed because Barrier(timeout) bounds only the enqueue: its future's
+// Error() blocks with no deadline, returning only on apply, leadership loss or
+// shutdown. The goroutine may outlive this call; the channel is buffered so it
+// cannot block when it finishes.
+func (c *Coordinator) barrierWithin(d time.Duration) error {
+	if d <= 0 {
+		return fmt.Errorf("no time left for a Raft barrier")
+	}
+	done := make(chan error, 1)
+	go func() { done <- c.raftNode.Barrier(d) }()
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return fmt.Errorf("Raft barrier did not complete within %s", d)
+	}
+}
+
+// demoteWithin revokes a vote under a caller-supplied deadline.
+//
+// DemoteVoter's own timeout bounds only the enqueue — requestConfigChange uses
+// it for the select on the change channel, and the returned future's Error()
+// then blocks with no deadline, unblocking only on commit, leadership loss or
+// shutdown. That is the same trap barrierWithin exists for, and the comment on
+// voterConvergeTimeout says so; the first cut then applied the fix to the
+// barrier alone, so a single demotion could outrun the whole budget and the
+// handler's own write timeout.
+func (c *Coordinator) demoteWithin(nodeID string, d time.Duration) error {
+	if d <= 0 {
+		return fmt.Errorf("no time left to revoke %s's vote", nodeID)
+	}
+	done := make(chan error, 1)
+	go func() { done <- c.raftNode.DemoteVoter(nodeID, d) }()
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		// The change may still land after this returns, so the caller must
+		// treat it as "unknown", stop, and re-read the configuration — which
+		// is what stopping on the first failure achieves.
+		return fmt.Errorf("revoking %s's vote did not complete within %s", nodeID, d)
+	}
+}
+
+// leadershipTransferTarget picks a server to hand leadership to.
+//
+// The target must be a CURRENT Voter, not merely a node whose role votes:
+// timeoutNow sets the target to Candidate without checking its suffrage, so
+// transferring to a non-voter leaves the cluster leaderless until some real
+// voter times out. It must also be healthy, and its role must vote, or the
+// transfer just moves the same problem.
+func (c *Coordinator) leadershipTransferTarget(cfg hraft.Configuration, excludeID string) string {
+	best := ""
+	for _, srv := range cfg.Servers {
+		id := string(srv.ID)
+		if id == excludeID || srv.Suffrage != hraft.Voter {
+			continue
+		}
+		res := c.resolveServerRole(id)
+		if !res.resolved || !res.role.VotesInElections() {
+			continue
+		}
+		if node, ok := c.registry.Get(id); !ok || node.GetState() != StateHealthy {
+			continue
+		}
+		if best == "" || id < best {
+			best = id
+		}
+	}
+	return best
+}
+
+func (c *Coordinator) raftServerAddr(cfg hraft.Configuration, nodeID string) string {
+	for _, srv := range cfg.Servers {
+		if string(srv.ID) == nodeID {
+			return string(srv.Address)
+		}
+	}
+	return ""
+}
+
+// countHealthyVoters counts how many of the given servers are currently
+// healthy. The local node counts as healthy — it is the one running this.
+//
+// "Healthy" here is Arc's own health check, which is an approximation of what
+// actually matters: whether the server can acknowledge a Raft log entry. A
+// node reachable over Arc's health path but partitioned at the Raft transport
+// counts toward the majority and should not. The leader has the better signal
+// in its per-peer replication state; using it would tighten this guard and is
+// the obvious next step if this ever proves too permissive. It is not too
+// LOOSE in the common case — a node that is down fails both checks.
+func (c *Coordinator) countHealthyVoters(ids []string) int {
+	n := 0
+	for _, id := range ids {
+		if id == c.localNode.ID {
+			n++
+			continue
+		}
+		if node, ok := c.registry.Get(id); ok && node.GetState() == StateHealthy {
+			n++
+		}
+	}
+	return n
+}
+
+func removeString(in []string, drop string) []string {
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if s != drop {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// countDemotableMismatches counts servers holding a vote their role does not
+// grant — that is, only the direction converge can act on.
+//
+// A node whose role votes but which is recorded as a non-voter is the OTHER
+// direction: this endpoint never promotes, and the join path re-promotes it
+// anyway, so warning about it would be an alarm whose remedy is a no-op — and
+// the warning's own text ("nodes that cannot ingest still hold a vote") would
+// be false for it. The status block still REPORTS both directions; only the
+// alarm is narrowed.
+func (c *Coordinator) countDemotableMismatches(cfg hraft.Configuration) int {
+	idx := c.newRoleIndex()
+	n := 0
+	for _, srv := range cfg.Servers {
+		if srv.Suffrage != hraft.Voter {
+			continue
+		}
+		if res := idx.resolve(string(srv.ID)); res.resolved && !res.role.VotesInElections() {
+			n++
+		}
+	}
+	return n
+}
+
+// voterConvergePlan is what a converge would do, computed from a Raft
+// configuration alone. Separated from ConvergeVoters so the decision can be
+// tested against synthetic configurations — a rig with two real voters flakes
+// on CI, and every interesting case here needs a voter that should not be one.
+type voterConvergePlan struct {
+	voters       []string // current voters, in configuration order
+	planned      []string // voters to demote, sorted
+	skipped      []string // servers whose role neither source could name
+	notes        []string
+	selfMismatch bool // this node holds a vote its role does not grant
+	resolved     int  // servers whose role WAS resolved
+}
+
+// planVoterConverge compares a Raft configuration against the role-based rule.
+// Pure with respect to Raft: it reads roles and nothing else.
+func (c *Coordinator) planVoterConverge(cfg hraft.Configuration) voterConvergePlan {
+	plan := voterConvergePlan{}
+	localID := c.localNode.ID
+	idx := c.newRoleIndex()
+
+	for _, srv := range cfg.Servers {
+		id := string(srv.ID)
+		isVoter := srv.Suffrage == hraft.Voter
+		if isVoter {
+			plan.voters = append(plan.voters, id)
+		}
+		res := idx.resolve(id)
+		if !res.resolved {
+			plan.skipped = append(plan.skipped, id)
+			continue
+		}
+		plan.resolved++
+		if res.role.VotesInElections() == isVoter {
+			continue
+		}
+		if !isVoter {
+			// Role says it should vote and it does not. Not ours to fix: the
+			// node repairs itself on its next join, because AddVoter on an
+			// existing non-voter DOES promote. Promotion from here is the
+			// dangerous direction and is deliberately absent.
+			plan.notes = append(plan.notes,
+				fmt.Sprintf("%s does not vote but its role %q does; its next re-join will promote it, which this endpoint deliberately does not do", id, res.role))
+			continue
+		}
+		if id == localID {
+			// The headline case on a pre-#862 cluster, where every joiner was
+			// AddVoter'd regardless of role: the leader itself is a reader.
+			plan.selfMismatch = true
+			continue
+		}
+		plan.planned = append(plan.planned, id)
+	}
+	sort.Strings(plan.planned)
+	return plan
+}
+
+// checkConvergeSafety returns the voter set left after applying every planned
+// demotion, or an error naming the first one that would be unsafe.
+//
+// This is the correction that matters. A Raft configuration change takes
+// effect the moment it is dispatched — setLatestConfiguration and
+// commitment.setConfiguration are applied immediately, and commitment is then
+// computed over the NEW voter set, as is the leader lease. So demoting a LIVE
+// voter out of a set whose survivors are DEAD strands the entry: it can never
+// commit, no further membership change is possible, and the leader steps down
+// on lease timeout. hashicorp/raft's only guard is refusing a configuration
+// with zero voters.
+//
+// "Demote-only is safe because only promotion raises the quorum requirement"
+// is therefore false, and counting how many servers resolved to a role does
+// not cover it: a server missing from the FSM node table is disproportionately
+// a stale or dead entry, which is exactly the population that must not be
+// counted on for quorum.
+func (c *Coordinator) checkConvergeSafety(voters, planned []string, allowSingleVoter bool) ([]string, error) {
+	remaining := append([]string(nil), voters...)
+	for _, id := range planned {
+		next := removeString(remaining, id)
+		if len(next) == 1 && !allowSingleVoter {
+			return nil, fmt.Errorf("%w: demoting %s would leave a single voter; if that node then dies no other can ever campaign and the cluster cannot elect a leader, with no recovery path. Re-send with allow_single_voter=true if that is intended",
+				ErrVoterConvergeUnsafe, id)
+		}
+		if healthy := c.countHealthyVoters(next); healthy*2 <= len(next) {
+			return nil, fmt.Errorf("%w: demoting %s would leave %d of %d voters healthy, which is not a majority — the configuration change could never commit and the cluster would lose its leader permanently",
+				ErrVoterConvergeUnsafe, id, healthy, len(next))
+		}
+		remaining = next
+	}
+	return remaining, nil
 }
 
 // generateNodeID generates a unique node ID with sufficient entropy.

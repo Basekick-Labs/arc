@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -163,6 +164,138 @@ func (h *ClusterHandler) RegisterRoutes(app *fiber.App) {
 		compactorGroup.Use(auth.RequireAdmin(h.authManager))
 	}
 	compactorGroup.Post("/assign", h.handleAssignCompactor)
+
+	// Admin-only: converge the Raft voter set onto the role-based rule
+	// (#880). Named "converge" rather than "reconcile" because
+	// internal/reconciliation is already the manifest-vs-storage reconciler,
+	// and an operator reading a log line should not have to work out which
+	// one fired.
+	votersGroup := app.Group("/api/v1/cluster/voters")
+	if h.authManager != nil {
+		votersGroup.Use(auth.RequireAdmin(h.authManager))
+	}
+	votersGroup.Post("/converge", h.handleConvergeVoters)
+}
+
+// convergeVotersRequest is the body of POST /api/v1/cluster/voters/converge.
+//
+// dry_run is a *bool so that "absent" is distinguishable from "false". Absent
+// means a dry run: this endpoint changes Raft membership, and the failure mode
+// of an unintended demotion is a cluster that cannot elect a leader, which
+// Arc cannot recover from. Acting requires saying so.
+type convergeVotersRequest struct {
+	DryRun           *bool `json:"dry_run"`
+	AllowSingleVoter bool  `json:"allow_single_voter"`
+}
+
+// parseConvergeRequest reads the request body, defaulting to a DRY RUN.
+//
+// Separated from the handler so the default is testable on its own: a handler
+// test with no coordinator refuses before it ever reaches this, so it asserts
+// nothing about the parse — which is how the first version of that test came
+// to pass no matter what this returned.
+//
+// An absent, empty or unparseable body all mean "plan, do not act". This
+// endpoint changes Raft membership, and the failure mode of an unintended
+// demotion is a cluster that cannot elect a leader with no recovery path, so
+// the safe reading of an instruction Arc cannot parse is to not follow it.
+func parseConvergeRequest(body []byte) (dryRun, allowSingleVoter bool) {
+	if len(body) == 0 {
+		return true, false
+	}
+	var req convergeVotersRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		return true, false
+	}
+	if req.DryRun != nil {
+		dryRun = *req.DryRun
+	} else {
+		dryRun = true
+	}
+	return dryRun, req.AllowSingleVoter
+}
+
+// convergeIsPartial reports whether a converge stopped part-way.
+//
+// A partial result is not a success. Converge stops at the first failed
+// revocation, so a populated Failed map means the voter set is somewhere
+// between where it was and where it was asked to be, and the caller has to
+// look before deciding what to do next.
+func convergeIsPartial(result *cluster.VoterConvergeResult) bool {
+	return result != nil && len(result.Failed) > 0
+}
+
+// handleConvergeVoters demotes Raft servers holding a suffrage the role-based
+// rule would not grant them today.
+//
+// #862 made suffrage follow the role at join time and left existing clusters
+// alone, because AddNonvoter on an existing voter is a no-op on suffrage. This
+// is the operator lever that converges one, and it only ever demotes.
+func (h *ClusterHandler) handleConvergeVoters(c *fiber.Ctx) error {
+	dryRun, allowSingleVoter := parseConvergeRequest(c.Body())
+	req := convergeVotersRequest{AllowSingleVoter: allowSingleVoter}
+	_ = req
+
+	if h.coordinator == nil {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"success": false,
+			"error":   "clustering is not enabled on this node, so there is no Raft voter set to converge",
+		})
+	}
+
+	result, err := h.coordinator.ConvergeVoters(dryRun, allowSingleVoter)
+	if err != nil {
+		if errors.Is(err, cluster.ErrVoterConvergeLeadershipMoved) {
+			// Not a failure in the sense of "nothing happened" — the first
+			// necessary step did happen — but success:false is correct,
+			// because the thing the caller asked for is not finished.
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"success":             false,
+				"leadership_moved_to": result.LeadershipMovedTo,
+				"error":               err.Error(),
+				"message":             "this node held a vote its role does not grant, so leadership was moved first; re-run this request against the new leader to finish converging",
+			})
+		}
+		status := fiber.StatusInternalServerError
+		switch {
+		case errors.Is(err, cluster.ErrNotLeaderForTopology),
+			errors.Is(err, cluster.ErrClusterRaftNotConfigured),
+			errors.Is(err, cluster.ErrVoterConvergeUnsafe),
+			errors.Is(err, cluster.ErrVoterConvergeNeedsLeadershipMove):
+			status = fiber.StatusConflict
+		case errors.Is(err, cluster.ErrVoterConvergeNotReady):
+			status = fiber.StatusServiceUnavailable
+		}
+		if status == fiber.StatusInternalServerError {
+			h.logger.Error().Err(err).Msg("Failed to converge the Raft voter set")
+		}
+		return c.Status(status).JSON(fiber.Map{
+			"success": false,
+			"error":   err.Error(),
+		})
+	}
+
+	if !dryRun {
+		ev := h.logger.Info()
+		if len(result.Failed) > 0 {
+			ev = h.logger.Warn()
+		}
+		ev.
+			Strs("demoted", result.Demoted).
+			Strs("skipped", result.Skipped).
+			Int("failed", len(result.Failed)).
+			Int("voting_servers_before", result.VotingServersBefore).
+			Int("voting_servers_after", result.VotingServersAfter).
+			Msg("Raft voter set converge finished")
+	}
+	if convergeIsPartial(result) {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"success": false,
+			"result":  result,
+			"error":   "converge stopped at the first failed demotion; inspect raft.membership and re-run",
+		})
+	}
+	return c.JSON(fiber.Map{"success": true, "result": result})
 }
 
 // assignCompactorRequest is the body of POST /api/v1/cluster/compactor/assign.

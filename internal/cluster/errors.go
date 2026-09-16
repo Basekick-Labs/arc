@@ -63,6 +63,24 @@ var (
 	// ErrNodeNotHealthy indicates the target node is not in a healthy state.
 	ErrNodeNotHealthy = errors.New("node is not healthy")
 
+	// ErrVoterConvergeUnsafe indicates converging the voter set would risk
+	// quorum, so nothing was changed.
+	ErrVoterConvergeUnsafe = errors.New("converging the voter set would risk quorum")
+
+	// ErrVoterConvergeNotReady indicates the Raft barrier did not complete, so
+	// roles could not be read against an applied FSM.
+	ErrVoterConvergeNotReady = errors.New("cluster state is not settled enough to converge the voter set")
+
+	// ErrVoterConvergeNeedsLeadershipMove indicates this node holds a vote its
+	// own role does not grant, so leadership has to move before it can be
+	// demoted.
+	ErrVoterConvergeNeedsLeadershipMove = errors.New("leadership must move before this node's vote can be revoked")
+
+	// ErrVoterConvergeLeadershipMoved is returned when leadership was
+	// transferred and the caller must re-run against the new leader. It is not
+	// a failure.
+	ErrVoterConvergeLeadershipMoved = errors.New("leadership moved; re-run against the new leader")
+
 	// ErrClusterRaftNotConfigured indicates clustering is enabled but no Raft
 	// data directory was configured, so there is no consensus layer to apply
 	// a topology change through.

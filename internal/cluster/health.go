@@ -37,6 +37,21 @@ const writersForHA = 3
 // cluster really is running without a spare at that point.
 const writerRedundancySustainPeriod = 2 * time.Minute
 
+// voterMismatchSustainPeriod is how long a Raft suffrage mismatch must persist
+// before the first warning.
+//
+// A mismatch is briefly NORMAL on every join: the coordinator calls AddVoter /
+// AddNonvoter first and writes the FSM node record afterwards, so between
+// those two the server is in the Raft configuration with no role the cluster
+// can name. That resolves as "unresolved" rather than as a mismatch, but a
+// snapshot restore or a log replay can also move a role record after the
+// configuration, and warning inside that window would fire on healthy joins.
+//
+// Its OWN clock, deliberately, not writerDeficitSince: that field is
+// single-goroutine state owned by checkWriterRedundancy, and a second consumer
+// sharing it would make each condition reset the other's sustain window.
+const voterMismatchSustainPeriod = 2 * time.Minute
+
 // writerRedundancyMode selects which deployment shape the writer-redundancy
 // warning describes. They lose writer availability for different reasons, so
 // each gets its own remediation text.
@@ -107,6 +122,26 @@ type HealthChecker struct {
 	warnIfNoCompactor        bool
 	lastNoCompactorWarnAt    atomic.Int64 // unix nanos; throttles "no compactor elected"
 	lastMultiCompactorWarnAt atomic.Int64 // unix nanos; throttles "multiple compactors elected"
+
+	// #880: rate-limited warning when the Raft voter set disagrees with the
+	// role-based suffrage rule. voterMismatchProbe is nil outside cluster
+	// mode; the coordinator wires it only when a Raft node exists, and the
+	// probe itself answers false for is_leader on a follower so only the
+	// leader warns.
+	//
+	// Its OWN slot. The two compactor warnings above have separate timers for
+	// a stated reason — sharing one lets whichever warning loses the CAS race
+	// silence the other for the whole interval — and that reason applies here
+	// exactly as much. A voter mismatch must not be able to mute #856's
+	// writer-redundancy warning, or vice versa.
+	voterMismatchProbe      func() (int, bool)
+	lastVoterMismatchWarnAt atomic.Int64 // unix nanos; throttles "voter set disagrees with roles"
+
+	// voterMismatchSince is when the voter set first disagreed with the
+	// roles, or the zero time when it does not. Only checkVoterMismatch
+	// touches it, and only from the single checkLoop goroutine, so it needs
+	// no synchronisation. See voterMismatchSustainPeriod.
+	voterMismatchSince time.Time
 
 	// Phase 5: raftFSM is set when compactor failover is configured. When
 	// non-nil, checkCompactorElected also checks the FSM's activeCompactorID
@@ -266,6 +301,62 @@ func (h *HealthChecker) checkAllNodes() {
 	if mode := writerRedundancyMode(h.writerRedundancy.Load()); mode != writerRedundancyOff {
 		h.checkWriterRedundancy(mode)
 	}
+	// #880: rate-limited warning when the Raft voter set still disagrees with
+	// the role-based rule. nil outside cluster mode.
+	if h.voterMismatchProbe != nil {
+		h.checkVoterMismatch()
+	}
+}
+
+// SetVoterMismatchProbe wires the check that compares the Raft configuration
+// against the role-based suffrage rule (#880).
+//
+// A function rather than the Raft node itself: the health checker needs one
+// number and a leadership answer, not a Raft handle, and keeping it that way
+// means this file gains no dependency on the configuration API.
+func (h *HealthChecker) SetVoterMismatchProbe(probe func() (int, bool)) {
+	h.voterMismatchProbe = probe
+}
+
+// checkVoterMismatch warns when servers hold a Raft suffrage the role-based
+// rule would not grant them today (#880).
+//
+// #862 made suffrage follow the role at JOIN time and deliberately left
+// existing clusters alone, because AddNonvoter on a server that is already a
+// voter updates its address and leaves Suffrage untouched. Most nodes converge
+// anyway, through the graceful-leave path; a node killed ungracefully, one
+// whose leave found no leader, and the departing leader itself do not. Nothing
+// reported that, which is the gap this fills — the suffrage was observable
+// only inside raft.stats' latest_configuration, an opaque string.
+func (h *HealthChecker) checkVoterMismatch() {
+	mismatches, isLeader := h.voterMismatchProbe()
+	if !isLeader {
+		// Followers stay silent. Every node would otherwise log the same
+		// cluster-wide condition, and a follower's configuration view can lag
+		// or name an uncommitted entry.
+		h.voterMismatchSince = time.Time{}
+		return
+	}
+	if mismatches == 0 {
+		h.voterMismatchSince = time.Time{}
+		h.lastVoterMismatchWarnAt.Store(0)
+		return
+	}
+	if h.voterMismatchSince.IsZero() {
+		h.voterMismatchSince = time.Now()
+	}
+	if time.Since(h.voterMismatchSince) < voterMismatchSustainPeriod {
+		return
+	}
+	if !h.claimWarnSlot(&h.lastVoterMismatchWarnAt) {
+		return
+	}
+	h.logger.Warn().
+		Int("mismatched_servers", mismatches).
+		Msg("Raft voter set disagrees with node roles: nodes that cannot ingest still hold a vote, " +
+			"so a reader or compactor can win leadership and stall every singleton task. " +
+			"Inspect raft.membership on GET /api/v1/cluster, then converge with " +
+			"POST /api/v1/cluster/voters/converge.")
 }
 
 // checkWriterRedundancy warns when the cluster has fewer writer-role nodes
