@@ -92,8 +92,8 @@ func TestWriterRedundancy_WarnsBelowThreeInEveryMode(t *testing.T) {
 		{"failover/two writers", writerRedundancyFailover, 2, true, "only two"},
 		{"failover/three writers", writerRedundancyFailover, 3, false, ""},
 		{"failover/four writers", writerRedundancyFailover, 4, false, ""},
-		{"no-failover/one writer", writerRedundancyNoFailover, 1, true, "no writer failover"},
-		{"no-failover/two writers", writerRedundancyNoFailover, 2, true, "no writer failover"},
+		{"no-failover/one writer", writerRedundancyNoFailover, 1, true, "no automatic writer failover"},
+		{"no-failover/two writers", writerRedundancyNoFailover, 2, true, "no automatic writer failover"},
 		{"no-failover/three writers", writerRedundancyNoFailover, 3, false, ""},
 		{"shared-storage/zero writers", writerRedundancyLoadBalanced, 0, true, "fewer than two"},
 		{"shared-storage/one writer", writerRedundancyLoadBalanced, 1, true, "fewer than two"},
@@ -144,10 +144,22 @@ func TestWriterRedundancy_MessageIsModeSpecific(t *testing.T) {
 	if !strings.Contains(noFailover, "cluster.failover_enabled=true") {
 		t.Errorf("the no-failover message should name the flag to set, got: %s", noFailover)
 	}
-	// Without a failover manager IsPrimaryWriter treats every writer-role node
-	// as primary, so "add more writers" alone is actively bad advice there.
-	if !strings.Contains(noFailover, "treats itself as") {
-		t.Errorf("the no-failover message should warn about multiple self-declared primaries, got: %s", noFailover)
+	// This message used to warn that every writer-role node treats itself as
+	// primary, which was true until #872 elected one regardless of the flag.
+	// What it must say now is the opposite: a primary exists, and nothing will
+	// replace it. Asserting the old wording is absent keeps the two from
+	// drifting back together.
+	if strings.Contains(noFailover, "treats itself as") {
+		t.Errorf("the no-failover message still warns about multiple self-declared primaries, which #872 fixed: %s", noFailover)
+	}
+	if !strings.Contains(noFailover, "one primary is elected") {
+		t.Errorf("the no-failover message should say a primary IS elected, got: %s", noFailover)
+	}
+	if !strings.Contains(noFailover, "nothing will choose a replacement") {
+		t.Errorf("the no-failover message should say no replacement is coming, got: %s", noFailover)
+	}
+	if !strings.Contains(noFailover, "demote") {
+		t.Errorf("the no-failover message should name the manual hand-over, got: %s", noFailover)
 	}
 	if failover == shared || failover == noFailover || shared == noFailover {
 		t.Error("the three modes should not share one message")

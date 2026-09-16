@@ -44,7 +44,7 @@ func TestMayAcceptIngest_ByRoleAndMode(t *testing.T) {
 		{name: "reader never takes writes", role: RoleReader, want: false},
 		{name: "compactor never takes writes", role: RoleCompactor, want: false},
 		{name: "standalone is the whole deployment", role: RoleStandalone, want: true},
-		{name: "writer without a failover manager", role: RoleWriter, want: true},
+		{name: "writer with no Raft, so no failover manager", role: RoleWriter, want: true},
 		{name: "shared storage: every writer takes writes", role: RoleWriter, shared: true, withFailover: false, want: true},
 		{name: "shared storage: a non-leader writer still takes writes", role: RoleWriter, shared: true, withFailover: true, want: true},
 		{name: "shared storage: a reader still does not", role: RoleReader, shared: true, want: false},

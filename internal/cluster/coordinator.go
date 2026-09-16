@@ -72,6 +72,13 @@ type Coordinator struct {
 	// Writer failover (Phase 3)
 	writerFailoverMgr *WriterFailoverManager
 
+	// autoFailover records whether this cluster may REPLACE a primary writer
+	// that has gone away — the flag and the writer_failover licence together.
+	// Distinct from writerFailoverMgr != nil, which is now true for any
+	// local-storage cluster with Raft because electing the FIRST primary is
+	// not a licensed capability (#872).
+	autoFailover bool
+
 	// Compactor failover (Phase 5)
 	compactorFailoverMgr *CompactorFailoverManager
 
@@ -407,37 +414,63 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	// CommandPromoteWriter has nothing meaningful to do. Load-balancer
 	// retry handles writer-crash failover instead. See
 	// docs/progress/2026-05-26-multi-writer-pattern2.md.
-	if cfg.Config.FailoverEnabled && c.raftNode != nil && !cfg.Config.SharedStorageMode {
-		if cfg.LicenseClient == nil || !cfg.LicenseClient.CanUseWriterFailover() {
-			c.logger.Warn().Msg("Writer failover enabled but license does not include writer_failover feature — failover disabled")
-		} else {
-			c.writerFailoverMgr = NewWriterFailoverManager(&WriterFailoverConfig{
-				Registry:        registry,
-				RaftNode:        c.raftNode,
-				FailoverTimeout: time.Duration(cfg.Config.FailoverTimeoutSeconds) * time.Second,
-				CooldownPeriod:  time.Duration(cfg.Config.FailoverCooldownSeconds) * time.Second,
-				Logger:          cfg.Logger,
-			})
-
-			// Wire FSM writer promotion callback to update registry
-			c.raftFSM.SetWriterPromotedCallback(func(newPrimaryID, oldPrimaryID string) {
-				c.onWriterPromoted(newPrimaryID, oldPrimaryID)
-			})
-
-			c.logger.Info().Msg("Writer failover manager initialized")
+	if c.raftNode != nil && !cfg.Config.SharedStorageMode {
+		// Built whenever local storage has Raft, not only when failover is
+		// enabled and licensed. It is a goroutine on every node whose loop
+		// returns unless this node is the Raft leader, so there is no cost to
+		// having it — and without it nothing ever issues CommandPromoteWriter,
+		// so IsPrimaryWriter falls back to "any writer is primary" and every
+		// writer runs retention, continuous queries and deletes at once (#872).
+		//
+		// What the flag and the licence gate is REPLACING a primary that has
+		// gone away, which is the capability the activation server names
+		// "Automatic writer failover". Electing the first one is not that.
+		c.autoFailover = cfg.Config.FailoverEnabled &&
+			cfg.LicenseClient != nil && cfg.LicenseClient.CanUseWriterFailover()
+		if cfg.Config.FailoverEnabled && !c.autoFailover {
+			c.logger.Warn().Msg("Writer failover enabled but license does not include writer_failover feature — a primary writer is still elected, but no replacement will be chosen automatically")
 		}
+
+		c.writerFailoverMgr = NewWriterFailoverManager(&WriterFailoverConfig{
+			Registry:        registry,
+			RaftNode:        c.raftNode,
+			AutoFailover:    c.autoFailover,
+			FailoverTimeout: time.Duration(cfg.Config.FailoverTimeoutSeconds) * time.Second,
+			CooldownPeriod:  time.Duration(cfg.Config.FailoverCooldownSeconds) * time.Second,
+			Logger:          cfg.Logger,
+		})
+
+		// Wire FSM writer promotion callback to update registry
+		c.raftFSM.SetWriterPromotedCallback(func(newPrimaryID, oldPrimaryID string) {
+			c.onWriterPromoted(newPrimaryID, oldPrimaryID)
+		})
+		// And demotion, which a hand-over issues on its own with no promotion
+		// following it.
+		c.raftFSM.SetWriterDemotedCallback(func(nodeID string) {
+			c.onWriterDemoted(nodeID)
+		})
+
+		c.logger.Info().
+			Bool("auto_failover", c.autoFailover).
+			Msg("Writer primary election initialized")
 	} else if cfg.Config.FailoverEnabled && cfg.Config.SharedStorageMode {
 		c.logger.Info().Msg("Writer failover suppressed: cluster.shared_storage_mode=true (Pattern 2 multi-writer; LB handles writer-crash failover)")
+	} else if cfg.Config.FailoverEnabled {
+		// Local storage, failover asked for, but no Raft to elect through.
+		// Nothing promotes anything, so every writer-role node still considers
+		// itself the primary — the shape #872 fixes everywhere else. Say so,
+		// rather than leave the operator with a flag that reads as honoured.
+		c.logger.Warn().Msg("cluster.failover_enabled is set but cluster.raft_data_dir is empty, so no primary writer can be elected and every writer-role node will run retention, continuous queries and deletes")
 	}
 
 	// Arm the writer-redundancy warning (#856). Every cluster shape wants it,
 	// but for different reasons, so the mode picks the remediation text. It is
-	// armed here, after the block above, because it keys off whether the
-	// failover manager was actually built rather than off the flag that asks
-	// for one — the flag can be set on a cluster that has no Raft or no
-	// writer_failover license, and then nothing promotes anything.
+	// armed here, after the block above, because it keys off whether this
+	// cluster can actually REPLACE a writer — not off whether the manager
+	// exists, which is now true for any local-storage cluster with Raft, since
+	// electing the first primary is not a licensed capability (#872).
 	c.healthChecker.enableWriterRedundancyWarning(writerRedundancyModeFor(
-		cfg.Config.SharedStorageMode, c.writerFailoverMgr != nil))
+		cfg.Config.SharedStorageMode, c.autoFailover))
 
 	// Initialize compactor failover manager (Phase 5) — reuses the same
 	// FailoverEnabled toggle and license gate as writer failover.
@@ -2406,6 +2439,12 @@ func (c *Coordinator) MayAcceptIngest() bool {
 	if !node.Role.GetCapabilities().CanIngest {
 		return false
 	}
+	// Local storage with Raft: only the primary takes ingest, because the data
+	// is not shared and a write landing on a standby is invisible to everyone
+	// else. Since #872 a primary is elected on any such cluster, so this now
+	// reports not-ready on standby writers where a cluster with failover off
+	// used to report every writer ready — which was consistent with it also
+	// running the singleton work everywhere, and both were wrong.
 	if c.cfg.SharedStorageMode || node.Role == RoleStandalone || c.writerFailoverMgr == nil {
 		return true
 	}
@@ -2835,6 +2874,29 @@ func (c *Coordinator) onWriterPromoted(newPrimaryID, oldPrimaryID string) {
 		Str("new_primary", newPrimaryID).
 		Str("old_primary", oldPrimaryID).
 		Msg("Writer promotion applied to registry")
+}
+
+// onWriterDemoted is the FSM callback fired when a CommandDemoteWriter is
+// applied. It mirrors the demotion into the local registry and, when the node
+// named is this one, into c.localNode — which is what IsPrimaryWriter reads.
+//
+// Without it a hand-over changed only the Raft record: the demoted node went
+// on believing it was primary and kept running retention, continuous queries
+// and deletes, while the leader still saw a live primary in its registry and
+// so never elected a replacement (#872).
+func (c *Coordinator) onWriterDemoted(nodeID string) {
+	if node, exists := c.registry.Get(nodeID); exists {
+		node.SetWriterState(WriterStateStandby)
+		if err := c.registry.Register(node); err != nil {
+			c.logger.Warn().Err(err).Str("node_id", nodeID).Msg("Failed to record writer demotion in the registry")
+		}
+	}
+	// The registry entry is a clone; the gate reads c.localNode (#850).
+	c.setLocalWriterState(nodeID, WriterStateStandby)
+
+	c.logger.Info().
+		Str("node_id", nodeID).
+		Msg("Writer demotion applied to registry")
 }
 
 // onCompactorAssigned is the FSM callback fired when a CommandAssignCompactor
@@ -3855,6 +3917,69 @@ func (c *Coordinator) LeaderAddr() string {
 }
 
 // AddNodeViaRaft adds a node to the cluster via Raft consensus.
+// ErrNotLeaderForTopology is returned when a topology command reaches a node
+// that is not the Raft leader. Topology commands are deliberately not
+// forwarded, so the caller has to retry against the leader.
+var ErrNotLeaderForTopology = errors.New("not the leader")
+
+// ErrNotPrimaryWriter is returned when a hand-over names a node that is not
+// the writer the cluster currently has on record as primary.
+var ErrNotPrimaryWriter = errors.New("node is not the current primary writer")
+
+// DemoteWriterViaRaft hands the primary-writer role off a node, so the cluster
+// chooses a new one.
+//
+// This is the MANUAL half of writer failover, and it is deliberately not gated
+// on the writer_failover licence. That feature is "Automatic writer failover":
+// having a replacement chosen for you when a primary dies. Choosing one
+// yourself is how an operator recovers a cluster that does not have it, and
+// without this such a cluster is stuck — the FSM record still names the dead
+// primary, so nothing elects (#872).
+//
+// Demoting clears primaryWriterID in the FSM, which is exactly the condition
+// the election reads: the next tick on the leader sees no designated primary
+// and elects one. So this is a hand-over, not merely a demotion; the caller
+// does not name a successor and should not, because the election already
+// applies the selection rules.
+func (c *Coordinator) DemoteWriterViaRaft(nodeID string) (string, error) {
+	if c.raftNode == nil {
+		return "", fmt.Errorf("clustering is not configured with Raft")
+	}
+	if !c.raftNode.IsLeader() {
+		return "", ErrNotLeaderForTopology
+	}
+
+	// Refuse anything that is not the node actually on record. Demoting a
+	// standby is a no-op that looks like it worked, and demoting a node that
+	// the cluster does not consider primary would leave the real primary in
+	// place while the operator believes they handed it over.
+	designated := ""
+	if fsm := c.raftNode.FSM(); fsm != nil {
+		designated = fsm.GetPrimaryWriterID()
+	}
+	if designated == "" {
+		return "", fmt.Errorf("%w: no primary writer is currently designated", ErrNotPrimaryWriter)
+	}
+	if designated != nodeID {
+		return "", fmt.Errorf("%w: the primary writer is %q", ErrNotPrimaryWriter, designated)
+	}
+
+	if c.writerFailoverMgr == nil {
+		return "", fmt.Errorf("this cluster does not elect a primary writer (shared-storage mode or no Raft)")
+	}
+
+	newPrimary, err := c.writerFailoverMgr.HandOver(nodeID)
+	if err != nil {
+		return "", err
+	}
+
+	c.logger.Info().
+		Str("old_primary", nodeID).
+		Str("new_primary", newPrimary).
+		Msg("Primary writer handed over by an operator")
+	return newPrimary, nil
+}
+
 // Must be called on the leader.
 func (c *Coordinator) AddNodeViaRaft(node *Node) error {
 	if c.raftNode == nil {
