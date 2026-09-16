@@ -22,8 +22,10 @@ type measurementState struct {
 }
 
 // WriterGate gates the reconciler to a single node in cluster mode. nil means "no gate,
-// allow" (OSS/standalone — single node, always runs). Mirrors compaction's ClusterGate:
-// CanRun is checked every tick (not once at Start) so failover takes effect without restart.
+// allow" (OSS/standalone — single node, always runs). CanRun is checked every
+// tick (not once at Start) so a lease change takes effect without a restart.
+// Compaction's ClusterGate now does the same; it used to check only at Start,
+// which is how two nodes ended up compacting the same partitions.
 type WriterGate interface {
 	// CanRun reports whether the local node may run the Iceberg reconcile pass.
 	CanRun() bool
