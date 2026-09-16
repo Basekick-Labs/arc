@@ -360,6 +360,12 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### The first forwarded write after an idle period failed once ([#851](https://github.com/Basekick-Labs/arc/issues/851))
+
+A node that is not the Raft leader forwards writes it cannot apply itself — manifest registration, token and RBAC changes, the startup barrier — over a connection it keeps open between commands. The leader closes that connection after thirty seconds with nothing on it, and the client found out only by writing into a dead socket, so the command failed with a broken pipe. Callers with their own retry loop recovered quietly; a single-shot caller did not, so creating a token on a follower that had been idle returned 500 and succeeded on the next attempt.
+
+The client now stops trusting a cached connection before the leader's timeout can have closed it, and redials instead. That is the fix. There is also a narrow retry for the minority of closes that surface while writing rather than while waiting: measured on loopback, a leader's graceful close lets the write succeed about nine times in ten and fails the read instead. Only a failure to put the request on the wire is retried, because the leader cannot have applied a command it never received; a failure while waiting for the acknowledgement is never retried, since the command may have been applied and only the reply lost. The retry replays the same signed request, so a first attempt that did land is refused by the leader as a duplicate rather than applied twice. A caller that passes no deadline of its own gives the retry a fresh budget, so in that case a forwarded command can take about twice as long as before in the worst case.
+
 ### No primary writer was ever elected, so retention and continuous queries silently never ran ([#850](https://github.com/Basekick-Labs/arc/issues/850))
 
 **Affects clusters with `cluster.failover_enabled=true` and `cluster.shared_storage_mode=false`, which is the Enterprise Helm chart's default for local-storage deployments.**

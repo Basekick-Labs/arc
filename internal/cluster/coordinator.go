@@ -124,7 +124,8 @@ type Coordinator struct {
 	// per-command dial + TLS overhead. Lazily reconnected on error or
 	// leader change.
 	forwardConn       net.Conn
-	forwardConnLeader string // nodeID of the leader this conn is dialed to
+	forwardConnLeader string    // nodeID of the leader this conn is dialed to
+	forwardConnUsedAt time.Time // last successful handout, for the idle refresh
 	forwardConnMu     sync.Mutex
 	forwardMu         sync.Mutex // Phase 4: serializes round-trips on forwardConn
 
