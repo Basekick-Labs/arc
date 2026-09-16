@@ -273,9 +273,9 @@ func (h *HealthChecker) checkAllNodes() {
 // The count is by ROLE, not by health, because this is a statement about how
 // the cluster was deployed and not about who happens to be up. A writer that
 // is down right now already surfaces: the health checker logs it becoming
-// unhealthy and then dead, and in Pattern 1 the failover manager acts on it.
-// A cluster that was only ever given one writer produces no event at all,
-// which is the gap this fills.
+// unhealthy and then dead, and where a failover manager exists it acts on it
+// too. A cluster that was only ever given one writer produces no event at
+// all, which is the gap this fills.
 func (h *HealthChecker) checkWriterRedundancy(mode writerRedundancyMode) {
 	// A one-node cluster is a development or single-node install. It has no
 	// redundancy of any kind and its operator knows it, so telling them once a
