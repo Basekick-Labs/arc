@@ -13,6 +13,8 @@ spec:
       port: 8000
     - name: coordinator
       port: 9100
+    - name: raft
+      port: 9200
   selector:
     {{- include "arc-enterprise.roleSelectorLabels" (dict "ctx" . "role" "compactor") | nindent 4 }}
 {{- end }}
