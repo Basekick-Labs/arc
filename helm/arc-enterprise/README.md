@@ -247,13 +247,14 @@ failure consumes it.
 
 Raft quorum is a separate, cluster-wide property and is **not** governed by
 the writer count today: every node that joins the cluster becomes a Raft
-voter regardless of its role, so readers and the compactor carry quorum too.
-Size the cluster for an odd total node count if you care about Raft
-tolerance; size `writer.replicas` for ingest availability.
+voter regardless of its role, so reader pods carry quorum too. Size the
+voting membership for an odd count if you care about Raft tolerance; size
+`writer.replicas` for ingest availability.
 
 Arc itself checks this at runtime. A cluster running below three writer-role
 nodes logs a rate-limited warning naming the count and the remediation, in
-both patterns.
+every cluster mode. The deficit has to hold for two minutes first, so a
+rolling upgrade does not trip it.
 
 Only the pod with ordinal `-0` bootstraps Raft on first install; the other
 writers join via the seed list.

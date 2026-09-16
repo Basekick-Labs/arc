@@ -173,7 +173,7 @@ writer:
                                    # 1 cannot survive a writer loss at all, and 2 has no spare left
                                    # once a single failure is absorbed — nor can a writer be drained
                                    # for a rolling upgrade without dropping to one. Arc logs a
-                                   # warning below 3 (#856). Drop to 1 only for a single-node or
+                                   # warning while a cluster sits below 3 (#856). Drop to 1 only for a single-node or
                                    # development install, where HA is not expected.
   resources:
     requests: { cpu: 500m, memory: 1Gi }
