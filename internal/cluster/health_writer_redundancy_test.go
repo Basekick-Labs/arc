@@ -131,9 +131,9 @@ func TestWriterRedundancy_WarnsBelowThreeInEveryMode(t *testing.T) {
 // Each shape loses writer availability for a different reason, so an operator
 // must not be told to wait for a promotion that will never be issued.
 func TestWriterRedundancy_MessageIsModeSpecific(t *testing.T) {
-	failover := writerRedundancyMessage(writerRedundancyFailover, 1)
-	noFailover := writerRedundancyMessage(writerRedundancyNoFailover, 1)
-	shared := writerRedundancyMessage(writerRedundancyLoadBalanced, 1)
+	failover := writerRedundancyMessage(writerRedundancyFailover, 1, 1)
+	noFailover := writerRedundancyMessage(writerRedundancyNoFailover, 1, 1)
+	shared := writerRedundancyMessage(writerRedundancyLoadBalanced, 1, 1)
 
 	if !strings.Contains(failover, "readers are never promotion candidates") {
 		t.Errorf("Pattern 1 message should explain readers are not candidates, got: %s", failover)
@@ -154,31 +154,58 @@ func TestWriterRedundancy_MessageIsModeSpecific(t *testing.T) {
 	}
 }
 
-// The messages say two writers lose Raft quorum, and since #862 that is true:
-// only nodes that can ingest vote, so a two-writer cluster has two voters and
-// needs both. Before #862 readers were voters and carried quorum through a
-// writer loss, the claim was false, and this test asserted its absence.
+// The quorum sentence is conditional, and these pin both directions.
 //
-// It is kept, inverted, because the claim is only true while the voter set is
-// what #862 made it. If a future change gives any non-ingesting role a vote,
-// this fails and the wording has to be revisited rather than quietly rotting.
-func TestWriterRedundancy_TwoWriterMessagesExplainTheQuorumLoss(t *testing.T) {
+// It is appended only when the cluster's ingest-capable node count is thin,
+// because those are the nodes that vote (#862). A two-writer cluster that also
+// runs a standalone node has three voters and a real quorum margin, and telling
+// its operator otherwise would be false.
+//
+// The previous version of this test asserted the messages never contain
+// "quorum", because before #862 readers were voters and the claim was wrong in
+// the other direction. Keeping it inverted rather than deleting it means a
+// change that re-enfranchises a non-ingesting role has something to fail.
+func TestWriterRedundancy_QuorumSentenceMatchesTheVoterCount(t *testing.T) {
 	modes := []writerRedundancyMode{
 		writerRedundancyFailover,
+		writerRedundancyNoFailover,
 		writerRedundancyLoadBalanced,
 	}
 	for _, mode := range modes {
-		msg := strings.ToLower(writerRedundancyMessage(mode, 2))
-		if !strings.Contains(msg, "quorum") {
-			t.Errorf("mode=%d two-writer message should explain the quorum loss: %s", mode, msg)
+		// Two writers and nothing else that ingests: two voters, no margin.
+		thin := strings.ToLower(writerRedundancyMessage(mode, 2, 2))
+		if !strings.Contains(thin, "quorum") {
+			t.Errorf("mode=%d with %d voters should explain the quorum loss: %s", mode, 2, thin)
+		}
+
+		// Two writers plus a standalone node: three voters, quorum survives a
+		// writer loss, so the sentence must not appear.
+		withSpare := strings.ToLower(writerRedundancyMessage(mode, 2, writersForHA))
+		if strings.Contains(withSpare, "quorum") {
+			t.Errorf("mode=%d with %d voters must NOT claim a quorum loss: %s", mode, writersForHA, withSpare)
 		}
 	}
+}
 
-	// The claim is only sound because non-ingesting roles do not vote.
+// The quorum sentence is only sound while the voter set is the ingest-capable
+// set. This is the guard the previous version of the test above was reaching
+// for and did not achieve: it compared VotesInElections against its own
+// definition, which is true by construction.
+func TestWriterRedundancy_QuorumClaimRestsOnTheVoterRule(t *testing.T) {
 	for _, r := range AllRoles() {
-		if r.VotesInElections() != r.GetCapabilities().CanIngest {
-			t.Fatalf("role %q votes independently of whether it ingests; the two-writer quorum claim no longer holds", r)
+		votes := r.VotesInElections()
+		ingests := r.GetCapabilities().CanIngest
+		if votes != ingests {
+			t.Errorf("role %q votes=%v but ingests=%v; the quorum sentence assumes the two sets are identical", r, votes, ingests)
 		}
+	}
+	// Spelled out so a change to the capabilities table, not just to
+	// VotesInElections, fails here too.
+	if RoleReader.VotesInElections() || RoleCompactor.VotesInElections() {
+		t.Error("a non-ingesting role votes; the quorum sentence no longer follows from the writer count")
+	}
+	if !RoleWriter.VotesInElections() || !RoleStandalone.VotesInElections() {
+		t.Error("an ingesting role does not vote; a cluster could be left unable to elect")
 	}
 }
 

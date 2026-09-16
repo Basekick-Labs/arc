@@ -245,15 +245,21 @@ The chart rejects `writer.replicas=2` (see `templates/_validation.tpl`) for
 the reason in the table: the second writer is the only spare, so the first
 failure consumes it.
 
-**Raft quorum is now governed by `writer.replicas`.** Only nodes that accept
-writes vote, so the voters are the writer pods; readers and the compactor
-replicate the log and see all cluster state but never campaign. Three writers
-therefore tolerate one loss on both counts at once — ingest and Raft — which is
-why three is the number in both patterns. Two writers means two voters, so
-losing one leaves no leader and cluster-wide state changes stop until it
-returns. Scaling readers does not help, and before this release it silently did:
-readers were voters, so a two-writer cluster kept its leader through a writer
-loss while ingest redundancy was already gone.
+**Raft quorum follows `writer.replicas` in this chart.** Only nodes that accept
+writes vote, so in a deployment of writers, readers and a compactor the voters
+are the writer pods; the others replicate the log and see all cluster state but
+never campaign. Three writers therefore tolerate one loss on both counts at
+once, ingest and Raft, which is why three is the number in both patterns. Two
+writers means two voters, so losing one leaves no leader and cluster-wide state
+changes stop until it returns. Scaling readers does not help, and before this
+release it silently did: readers were voters, so a two-writer cluster kept its
+leader through a writer loss while its ingest redundancy was already gone.
+
+Two caveats. Nodes left at the default role (`standalone`) also accept writes
+and so also vote, though this chart never deploys one. And a cluster upgraded
+in place keeps any node that did not shut down gracefully as a voter until it
+is removed and re-joined, so the voter set converges over a rolling restart
+rather than at the moment of upgrade.
 
 Arc itself checks this at runtime. A cluster running below three writer-role
 nodes logs a rate-limited warning naming the count and the remediation, in

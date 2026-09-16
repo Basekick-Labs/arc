@@ -299,6 +299,12 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Upgrade notes
 
+### A node asked to bootstrap Raft on a non-writing role now exits at startup
+
+`cluster.raft_bootstrap` has been a no-op on any node that already had Raft state, so setting it everywhere rather than on one node was harmless and some deployments do exactly that. From this release, a node with `cluster.raft_bootstrap=true` and a role that does not accept writes logs the reason and exits, because bootstrapping on such a role hands the new cluster the precise failure this release fixes: that node is elected, then fails the writer half of every singleton-task check, and there is no second voter that could take leadership away from it.
+
+Set `ARC_CLUSTER_RAFT_BOOTSTRAP=true` only on the node that bootstraps, and only on one that accepts writes. Arc's own Helm chart and Compose files already do. The check does not fire when `cluster.raft_data_dir` is empty, since there is no Raft node to bootstrap.
+
 ### A clustered node with an unrecognised `cluster.role` now exits at startup
 
 Previously a typo such as `ARC_CLUSTER_ROLE=Reader` or `writter` started the node as standalone, and in a cluster it joined as one. From this release that node logs the offending value and exits, so a misconfigured pod crash-loops visibly instead of serving from an isolated registry. See the entry under Bug fixes for why exiting is the safer failure.
@@ -390,7 +396,9 @@ Suffrage now follows the role. Nodes that accept writes vote, which is writers a
 
 Arc also refuses to start a node that is asked to bootstrap a new cluster on a role that does not vote. That node would be the only server in the cluster and an ineligible leader by construction, so the cluster would never elect anyone and nothing would recover from it.
 
-**This corrects new clusters only.** A node already recorded as a voter stays one, and re-joining does not change that: adding a server that is already a voter as a non-voter updates its address and leaves its suffrage alone. So an existing cluster keeps exactly the voters it has, including its readers, until a membership reconcile converges it. That is tracked separately, and deliberately so: the promotion half of such a reconcile is the one path that can leave a cluster permanently leaderless, and Arc has no cluster-recovery path to undo it.
+**Most of an existing cluster converges on its own, and the rest does not.** A node that shuts down gracefully broadcasts a leave, and the leader removes it from the Raft configuration, so its next start is a fresh join that gets the correct suffrage. A rolling upgrade is a rolling restart, so it converges most of the cluster as a side effect.
+
+What stays behind: a node terminated ungracefully, one whose leave arrived while there was no leader to process it, and the leader itself, since nobody else is leader at that moment to remove it. Those keep their vote indefinitely, because adding a server that is already a voter as a non-voter updates its address and leaves its suffrage untouched. The manual fix is to remove the node through the cluster API and let it re-join. Converging automatically is [#880](https://github.com/Basekick-Labs/arc/issues/880), and it is deliberately separate: the promotion half of such a reconcile is the one path that can leave a cluster permanently leaderless, and Arc has no cluster-recovery path to undo that.
 
 **Quorum is now a property of the nodes that can ingest.** Three writers survive losing one, which is the documented shape for both patterns and what the charts have asked for since the writer default moved to three. A cluster with a single writer makes that writer the only voter: it is always the leader, but losing it takes Raft's quorum with it, so token and permission writes and cluster reconfiguration stop too, where previously the readers would have kept Raft alive. That is the intended trade. A cluster that cannot ingest should not be reporting itself as healthy, and it is the same conclusion the writer-redundancy warning reaches from the promotion side.
 

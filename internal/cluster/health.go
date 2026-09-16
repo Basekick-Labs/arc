@@ -287,6 +287,13 @@ func (h *HealthChecker) checkWriterRedundancy(mode writerRedundancyMode) {
 	}
 
 	writers := h.registry.CountByRole(RoleWriter)
+	// Counted separately because they are different questions. Writer-role
+	// nodes are the failover pool, which is what the threshold is about.
+	// Ingest-capable nodes are the voters, which is what the quorum sentence
+	// is about, and standalone nodes are in the second set but not the first —
+	// so a two-writer cluster that also runs a standalone node still has a
+	// quorum margin and must not be told otherwise (#862).
+	voters := h.registry.CountIngestCapable()
 	if writers >= writersForHA {
 		h.writerDeficitSince = time.Time{}
 		// Release the cooldown so a later regression is not muted by a stale
@@ -313,7 +320,8 @@ func (h *HealthChecker) checkWriterRedundancy(mode writerRedundancyMode) {
 	h.logger.Warn().
 		Int("writer_nodes", writers).
 		Int("writer_nodes_recommended", writersForHA).
-		Msg(writerRedundancyMessage(mode, writers))
+		Int("voting_nodes", voters).
+		Msg(writerRedundancyMessage(mode, writers, voters))
 }
 
 // writerRedundancyMessage builds the operator-facing text for
@@ -325,20 +333,30 @@ func (h *HealthChecker) checkWriterRedundancy(mode writerRedundancyMode) {
 // so a two-writer cluster has two voters and needs both. That sentence was
 // false before #862, when readers were voters and carried quorum through a
 // writer loss, and these messages deliberately avoided it. It is true now.
-func writerRedundancyMessage(mode writerRedundancyMode, writers int) string {
+func writerRedundancyMessage(mode writerRedundancyMode, writers, voters int) string {
+	// Only say the quorum part when it is true of THIS cluster. Voters are the
+	// ingest-capable nodes, so a cluster with standalone nodes alongside its
+	// writers can be thin on writers and still hold quorum. And a cluster
+	// upgraded in place keeps any reader that never left gracefully as a
+	// voter, which this count does not see — so the sentence is written as a
+	// consequence of the configured roles, not as a promise about the current
+	// Raft configuration.
+	quorum := ""
+	if voters < writersForHA {
+		quorum = " Nodes that accept writes are also the cluster's Raft voters, so this leaves no quorum margin either."
+	}
 	switch mode {
 	case writerRedundancyLoadBalanced:
 		if writers < 2 {
 			return "Shared-storage mode has fewer than two writer-role nodes: " +
 				"writer promotion is deliberately suppressed in this pattern, " +
 				"so a writer loss takes ingest down until an operator restores it. " +
-				"Run three nodes with ARC_CLUSTER_ROLE=writer behind the load balancer."
+				"Run three nodes with ARC_CLUSTER_ROLE=writer behind the load balancer." + quorum
 		}
-		return "Shared-storage mode has only two writer-role nodes: writers are " +
-			"the Raft voters, so losing one leaves no quorum and no leader, and " +
-			"the singleton work that gates on the leader stops with it. It also " +
+		return "Shared-storage mode has only two writer-role nodes: losing one " +
 			"leaves a single writer behind the load balancer with no remaining " +
-			"redundancy. Run three nodes with ARC_CLUSTER_ROLE=writer."
+			"redundancy, and no node can be taken out for a rolling upgrade. " +
+			"Run three nodes with ARC_CLUSTER_ROLE=writer." + quorum
 
 	case writerRedundancyNoFailover:
 		// No failover manager means no CommandPromoteWriter is ever issued,
@@ -353,19 +371,19 @@ func writerRedundancyMessage(mode writerRedundancyMode, writers int) string {
 			"requires the writer_failover feature) and run three nodes with " +
 			"ARC_CLUSTER_ROLE=writer. Do not add writers without enabling it: " +
 			"with no failover manager every writer-role node treats itself as " +
-			"the primary for retention, continuous queries and deletes."
+			"the primary for retention, continuous queries and deletes." + quorum
 
 	default: // writerRedundancyFailover
 		if writers < 2 {
 			return "Writer failover is enabled but the cluster has fewer than two " +
 				"writer-role nodes: readers are never promotion candidates, so a " +
 				"writer loss cannot be failed over and ingest stops until an " +
-				"operator intervenes. Run three nodes with ARC_CLUSTER_ROLE=writer."
+				"operator intervenes. Run three nodes with ARC_CLUSTER_ROLE=writer." + quorum
 		}
 		return "Writer failover is enabled but the cluster has only two writer-role " +
-			"nodes: writers are the Raft voters, so losing one leaves no quorum, and " +
-			"a promotion cannot be issued without a leader to issue it. Run three " +
-			"nodes with ARC_CLUSTER_ROLE=writer."
+			"nodes: one failover consumes the only spare and leaves a single writer " +
+			"with nothing left to promote. Run three nodes with " +
+			"ARC_CLUSTER_ROLE=writer." + quorum
 	}
 }
 
