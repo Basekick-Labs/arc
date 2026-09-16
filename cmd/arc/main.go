@@ -1497,6 +1497,28 @@ func main() {
 				// secret now fails closed regardless of which cluster features
 				// are enabled.
 
+				// An unrecognised cluster.role is the same class of mistake as
+				// an empty shared secret: an operator typo in a cluster key,
+				// where continuing does more damage than stopping (#848).
+				//
+				// It has to be fatal HERE rather than relying on
+				// NewCoordinator's error, because that error is not fatal — it
+				// falls through to standalone mode a few lines below. A node
+				// that silently stops clustering is worse than the bug this
+				// fixes: it also loses the file registrar, which is wired only
+				// on the success path, so it would keep writing Parquet that
+				// never enters the Raft manifest and is invisible to readers
+				// and to compaction.
+				if _, roleErr := cluster.ResolveRole(cfg.Cluster.Role); roleErr != nil {
+					// The offending value goes in a structured field, not in
+					// the error: installErrSanitizer masks quoted spans in
+					// every logged error, deliberately and globally, so a %q
+					// value in the error text reaches the operator as "...".
+					log.Error().Str("role", cfg.Cluster.Role).Msg("cluster.role is not a role Arc recognises")
+					log.Error().Msgf("Set ARC_CLUSTER_ROLE to one of: %s (or leave it unset for standalone)", cluster.RoleNames())
+					os.Exit(1)
+				}
+
 				var err error
 				clusterCoordinator, err = cluster.NewCoordinator(&cluster.CoordinatorConfig{
 					Config:        &cfg.Cluster,

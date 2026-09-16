@@ -299,6 +299,12 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Upgrade notes
 
+### A clustered node with an unrecognised `cluster.role` now exits at startup
+
+Previously a typo such as `ARC_CLUSTER_ROLE=Reader` or `writter` started the node as standalone, and in a cluster it joined as one. From this release that node logs the offending value and exits, so a misconfigured pod crash-loops visibly instead of serving from an isolated registry. See the entry under Bug fixes for why exiting is the safer failure.
+
+Check `cluster.role` on every node before upgrading a cluster. The accepted values are `standalone`, `writer`, `reader` and `compactor`, and leaving the key unset means `standalone`. Nodes that joined an older cluster with a role it did not recognise are unaffected on the wire, because every Arc build has always sent its own already-parsed role, but that node will not start again until its own configuration is corrected.
+
 1. **Clustered Enterprise deployments require a coordinated restart.** The
    coordinator handshake **and the replicate-sync handshake** wire formats
    changed (see *Cluster hardening* and *Replicate-sync now authenticates
@@ -375,6 +381,20 @@ fails the build rather than leaving the note quietly wrong.
    nodes, which are the leader candidates, first.
 
 ## Bug fixes
+
+### A node role Arc does not recognise is no longer silently treated as standalone ([#848](https://github.com/Basekick-Labs/arc/issues/848))
+
+`ParseRole` answers "what role should this node have", and for an unset value standalone is the right answer. That made it the wrong function for the two callers asking "is this a role at all", because a typo and a deliberate standalone became the same node.
+
+Starting a node with `ARC_CLUSTER_ROLE=writter` produced a node reporting itself as standalone. Standalone ingests, so nothing looked broken, and the writer the operator thought they had was not one: in shared-storage mode it would never pass the primary-writer gate, and it did not count toward the writer redundancy the chart and the new warning both ask for. The coordinator did carry a check for this, but it could never fire, because the fallback had already turned the typo into a valid role.
+
+A clustered node now exits on an unrecognised role, naming the value and listing the ones it accepts. Exiting rather than logging, because the alternative is worse than the bug: the coordinator's own error is not fatal, it falls through to standalone mode, and a node that quietly stops clustering also loses its file registrar. It would keep writing Parquet that never enters the Raft manifest, invisible to readers and to compaction. This matches the shared secret, which has failed the same way for the same reason since 26.06.2.
+
+The same fallback applied to the role a joining node presents. It was stored as sent, so a node that holds the cluster shared secret and presents a role nobody configured was recorded as ingest-capable, passed the manifest-command role gate, and appeared in listings with a role no operator had chosen. The join is now refused. This is not a trust-boundary fix, since such a node already holds the shared secret; it is the difference between a cluster whose recorded roles mean something and one whose roles are whatever was sent.
+
+Nodes always send their own already-parsed role, so a cluster upgrading from an older build is unaffected, including one where a node was misconfigured: that node has been running as standalone and says so.
+
+A role that a cluster recorded before this change is still accepted, because dropping an existing member during a restore would be worse than carrying it, but it is now logged rather than absorbed in silence. That happens where such a record actually arrives, which is Raft log replay and snapshot restore.
 
 ### An unlimited Enterprise license rejected every cluster join ([#869](https://github.com/Basekick-Labs/arc/issues/869))
 
