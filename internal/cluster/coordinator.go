@@ -2169,6 +2169,33 @@ func (c *Coordinator) GetRole() NodeRole {
 //  3. Pattern 1 single-writer with failover manager: the failover manager
 //     issues CommandPromoteWriter to elect one writer as primary; only that
 //     node returns true. Same as today.
+//
+// MayAcceptIngest reports whether writes should be sent to this node. It is
+// what a load balancer's write pool needs, and it is NOT IsPrimaryWriter:
+// in shared-storage mode every healthy writer accepts writes, while
+// IsPrimaryWriter names the single node that runs singleton work, so pointing
+// a write pool at that would collapse an N-writer cluster onto one node.
+//
+//   - a role that cannot ingest never accepts writes
+//   - shared storage: every writer accepts, the pattern's whole premise
+//   - standalone: accepts, it is the whole deployment
+//   - no failover manager: any writer accepts, which is the same fallback
+//     IsPrimaryWriter uses when no promotion can ever happen
+//   - otherwise: only the elected primary
+func (c *Coordinator) MayAcceptIngest() bool {
+	node := c.GetLocalNode()
+	if node == nil {
+		return false
+	}
+	if !node.Role.GetCapabilities().CanIngest {
+		return false
+	}
+	if c.cfg.SharedStorageMode || node.Role == RoleStandalone || c.writerFailoverMgr == nil {
+		return true
+	}
+	return node.IsPrimaryWriter()
+}
+
 func (c *Coordinator) IsPrimaryWriter() bool {
 	// Pattern 2 multi-writer: singleton tasks gate on Raft leader AND
 	// RoleWriter. The role check is load-bearing — every joining node

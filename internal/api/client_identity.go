@@ -59,7 +59,7 @@ func clientIdentity(rec ClientRecorder, authRequired bool) fiber.Handler {
 func isUnauthenticatedRoute(p string) bool {
 	p = strings.ToLower(path.Clean("/" + p))
 	switch p {
-	case "/health", "/ready", "/api/v1/auth/verify":
+	case "/health", "/ready", "/ready/write", "/api/v1/auth/verify":
 		return true
 	}
 	return strings.HasPrefix(p, "/metrics") || strings.HasPrefix(p, "/api/v1/metrics")
