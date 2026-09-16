@@ -42,10 +42,10 @@ type Scheduler struct {
 	// paths and by existing tests that predate Phase 4.
 	clusterGate ClusterGate
 
-	cron       *cron.Cron
-	running    bool
-	roleGated  bool // true when Start found CanCompact=false; used by Status
-	stopCh     chan struct{}
+	cron      *cron.Cron
+	running   bool
+	roleGated bool // true when Start found CanCompact=false; used by Status
+	stopCh    chan struct{}
 
 	logger zerolog.Logger
 	mu     sync.Mutex

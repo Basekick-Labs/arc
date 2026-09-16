@@ -282,12 +282,12 @@ const (
 // Run is a single reconcile-cycle summary. Held in the reconciler's ring
 // buffer of recent runs and surfaced via Status().
 type Run struct {
-	ID         string    `json:"id"`
-	StartedAt  time.Time `json:"started_at"`
-	FinishedAt time.Time `json:"finished_at"`
-	DryRun     bool      `json:"dry_run"`
+	ID          string      `json:"id"`
+	StartedAt   time.Time   `json:"started_at"`
+	FinishedAt  time.Time   `json:"finished_at"`
+	DryRun      bool        `json:"dry_run"`
 	BackendKind BackendKind `json:"backend_kind"`
-	Role       string    `json:"role"`
+	Role        string      `json:"role"`
 
 	// Counts
 	ManifestFileCount   int `json:"manifest_file_count"`
@@ -499,8 +499,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, dryRun bool) (*Run, error) {
 	defer cancel()
 
 	run := &Run{
-		ID:          uuid.NewString(),
-		StartedAt:   time.Now().UTC(),
+		ID:        uuid.NewString(),
+		StartedAt: time.Now().UTC(),
 		// Honor the caller's dryRun exactly. The cron path
 		// (scheduler.tick) already passes cfg.ManifestOnlyDryRun, so the
 		// safety policy is enforced upstream. OR'ing it back in here

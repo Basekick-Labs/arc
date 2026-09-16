@@ -180,17 +180,17 @@ func (s *Scheduler) Status() map[string]interface{} {
 
 	cfg := s.reconciler.cfg
 	out := map[string]interface{}{
-		"enabled":              cfg.Enabled,
-		"running":              running,
-		"schedule":             s.schedule,
-		"backend_kind":         string(cfg.BackendKind),
-		"grace_window":         cfg.GraceWindow.String(),
-		"clock_skew_allowance": cfg.ClockSkewAllowance.String(),
-		"max_run_duration":     cfg.MaxRunDuration.String(),
-		"max_manifest_size":    cfg.MaxManifestSize,
-		"max_deletes_per_run":  cfg.MaxDeletesPerRun,
+		"enabled":               cfg.Enabled,
+		"running":               running,
+		"schedule":              s.schedule,
+		"backend_kind":          string(cfg.BackendKind),
+		"grace_window":          cfg.GraceWindow.String(),
+		"clock_skew_allowance":  cfg.ClockSkewAllowance.String(),
+		"max_run_duration":      cfg.MaxRunDuration.String(),
+		"max_manifest_size":     cfg.MaxManifestSize,
+		"max_deletes_per_run":   cfg.MaxDeletesPerRun,
 		"manifest_only_dry_run": cfg.ManifestOnlyDryRun,
-		"in_flight":            s.reconciler.IsRunning(),
+		"in_flight":             s.reconciler.IsRunning(),
 	}
 	if running {
 		out["next_run"] = s.nextRun().UTC().Format(time.RFC3339)

@@ -37,10 +37,10 @@ type RetentionScheduler struct {
 	clusterGate      RetentionClusterGate
 	schedule         string // Cron schedule (e.g., "0 3 * * *" = 3am daily)
 	cron             *cron.Cron
-	running    bool
-	runningJob bool // true while a retention cycle is in progress; prevents overlap
-	mu         sync.Mutex
-	logger     zerolog.Logger
+	running          bool
+	runningJob       bool // true while a retention cycle is in progress; prevents overlap
+	mu               sync.Mutex
+	logger           zerolog.Logger
 }
 
 // RetentionSchedulerConfig holds configuration for the retention scheduler
