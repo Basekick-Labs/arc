@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -740,4 +741,56 @@ func TestSetOnCompactionCompleteConcurrent(t *testing.T) {
 
 	close(start)
 	wg.Wait()
+}
+
+// TestManager_GetSortKeys_AppendsTime verifies that GetSortKeys always ends
+// with "time", mirroring the ingest path's getSortKeys in arrow_writer.go.
+// Before this fix, compaction dropped the implicit "time" column that ingest
+// appends, so compacted files lost time ordering within each sort group
+// whenever a custom sort key was configured (https://github.com/Basekick-Labs/arc/issues/792).
+func TestManager_GetSortKeys_AppendsTime(t *testing.T) {
+	manager, _, cleanup := setupTestManager(t)
+	defer cleanup()
+
+	manager.SortKeysConfig = map[string][]string{
+		"cpu": {"host"},
+	}
+	manager.DefaultSortKeys = []string{"region"}
+
+	tests := []struct {
+		name        string
+		measurement string
+		want        []string
+	}{
+		{"measurement-specific config gets time appended", "cpu", []string{"host", "time"}},
+		{"default config gets time appended", "mem", []string{"region", "time"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := manager.GetSortKeys(tt.measurement)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("GetSortKeys(%q) = %v, want %v", tt.measurement, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestManager_GetSortKeys_TimeAlreadyPresent verifies legacy configs that
+// already list "time" explicitly are left untouched (no duplicate appended).
+func TestManager_GetSortKeys_TimeAlreadyPresent(t *testing.T) {
+	manager, _, cleanup := setupTestManager(t)
+	defer cleanup()
+
+	manager.SortKeysConfig = map[string][]string{
+		"cpu": {"host", "time"},
+	}
+	manager.DefaultSortKeys = []string{"time"}
+
+	if got := manager.GetSortKeys("cpu"); !reflect.DeepEqual(got, []string{"host", "time"}) {
+		t.Errorf("GetSortKeys(cpu) = %v, want [host time]", got)
+	}
+	if got := manager.GetSortKeys("mem"); !reflect.DeepEqual(got, []string{"time"}) {
+		t.Errorf("GetSortKeys(mem) = %v, want [time]", got)
+	}
 }

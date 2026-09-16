@@ -1198,14 +1198,28 @@ func (m *Manager) listMeasurements(ctx context.Context, database string) ([]stri
 
 // GetSortKeys returns sort keys for a measurement.
 // Checks measurement-specific config first, then falls back to default.
+// Always ensures "time" is the last sort key, mirroring the ingest path's
+// getSortKeys in arrow_writer.go, so compacted files keep the same time
+// ordering within each sort group that ingest established.
 func (m *Manager) GetSortKeys(measurement string) []string {
 	// Check measurement-specific config
-	if keys, exists := m.SortKeysConfig[measurement]; exists {
-		return keys
+	var keys []string
+	if measurementKeys, exists := m.SortKeysConfig[measurement]; exists {
+		keys = measurementKeys
+	} else {
+		keys = m.DefaultSortKeys
 	}
 
-	// Use default (e.g., ["time"])
-	return m.DefaultSortKeys
+	// Always ensure "time" is the last sort key.
+	// Skip adding if already present (legacy configs may include it explicitly).
+	for _, k := range keys {
+		if k == "time" {
+			return keys
+		}
+	}
+
+	// Append "time" - users configure ADDITIONAL sort keys only.
+	return append(keys, "time")
 }
 
 // filterCandidateFiles removes files that are tracked by manifests from a candidate.
