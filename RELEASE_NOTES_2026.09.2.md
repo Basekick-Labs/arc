@@ -388,6 +388,14 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### Two nodes could compact the same data at once
+
+Compaction checked whether this node was allowed to compact when its scheduler started, and never again. That check runs before the cluster coordinator exists, so it fell back to the node's configured role: a node whose role is compactor armed its schedule unconditionally, whether or not it actually held the compactor lease.
+
+Nothing stopped it afterwards either. The callback that shuts a compaction schedule down fires only on the node that *held* the lease and lost it, so a node that never held it was never told. On any cluster where a writer took the lease — which is every cluster where the compactor was slower to join, and every existing one after the fix above — the dedicated compactor and the lease-holding writer both compacted the same partitions, producing two sets of outputs over the same rows and registering both.
+
+The check now runs on every tick, which is what the cluster-operations rule in this repository has always required and what the retention, continuous-query, Iceberg and reconciliation schedulers already did. A lease change now takes effect without a restart, which is the other half of the same rule.
+
 ### Every writer ran retention and continuous queries when automatic failover was off ([#872](https://github.com/Basekick-Labs/arc/issues/872))
 
 On local storage, retention, continuous queries and deletes are meant to run on one writer. Deciding which one requires a promotion through Raft, and nothing issued one unless writer failover was both enabled and licensed. With no promotion, every writer-role node considered itself the primary and ran all of it. Three writers meant three nodes executing the same continuous queries and the same deletes.
@@ -454,7 +462,7 @@ A role that a cluster recorded before this change is still accepted, because dro
 
 Every Arc node joins Raft, whatever its role. The Enterprise chart gave the compactor pod a coordinator address but no Raft address, so its Raft transport refused an address it could not advertise, the coordinator failed to start, and the node carried on in standalone mode. The pod passed its health checks the whole time.
 
-The damage was not that the compactor sat idle. It was that it kept working, alone. A node outside the cluster falls back to its configured role for the decision of whether to compact, and its role says yes, so it compacted the shared bucket on its own schedule while the node actually holding the compactor lease compacted it too. Two compactors on one bucket is the duplicate-output hazard the single-compactor design exists to prevent. That ends here.
+The damage was not that the compactor sat idle. It was that it kept working, alone. A node outside the cluster falls back to its configured role for the decision of whether to compact, and its role says yes, so it compacted the shared bucket on its own schedule while the node actually holding the compactor lease compacted it too. Two compactors on one bucket is the duplicate-output hazard the single-compactor design exists to prevent. Joining the cluster ends the part where it compacts from outside; the entry below ends the part where it compacts from inside without holding the lease.
 
 Readers shipped with the same gap once and were fixed. The compactor was never given the same treatment, and the helper that carries the Raft settings still described them as writer-only, which is the belief that produced both. It now applies to every role, so each one binds its Raft port explicitly instead of relying on a default that merely happened to match. A rendered-template check in CI asserts that every clustered role carries a Raft address, against the default values and both deployment presets.
 
@@ -462,7 +470,7 @@ The local-storage preset also still asked for a single writer, so following the 
 
 **Upgrading:** applying the new chart restarts the compactor pod, after which it joins the cluster for the first time and stops compacting behind the cluster's back.
 
-It will not immediately start compacting on the cluster's behalf either. The compactor lease is deliberately never preempted: whichever node holds it keeps it until it becomes unhealthy. On an existing cluster that node is a writer, chosen precisely because no compactor was visible. So after the upgrade the dedicated compactor pod idles while a writer continues to do the work. Nothing is lost and nothing is duplicated, but the node you provisioned for compaction is not doing it. To hand the lease over, restart the writer that holds it. That node is named in the `Compactor lease assigned` log line on the Raft leader, which is the only place it is reported: no endpoint exposes the current holder today. Tracked as [#876](https://github.com/Basekick-Labs/arc/issues/876).
+It will not immediately start compacting on the cluster's behalf either. The compactor lease is deliberately never preempted: whichever node holds it keeps it until it becomes unhealthy. On an existing cluster that node is a writer, chosen precisely because no compactor was visible. So after the upgrade a writer continues to do the work. Until the fix below, the compactor pod did not idle while that happened — it compacted too, which is the duplicate-output problem in a second form. That is fixed; what remains is that the node you provisioned for compaction is not the one doing the work. To hand the lease over, restart the writer that holds it. That node is named in the `Compactor lease assigned` log line on the Raft leader, which is the only place it is reported: no endpoint exposes the current holder today. Tracked as [#876](https://github.com/Basekick-Labs/arc/issues/876).
 
 Two things this does **not** change in the chart's default shared-storage mode, contrary to what you might expect. Compacted files are still not registered in the Raft manifest, because that path is gated on peer replication, which shared storage does not use. And the "No compactor elected" warning was never firing there for the same reason, so its absence is not evidence of anything.
 

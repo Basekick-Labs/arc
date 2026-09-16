@@ -181,6 +181,33 @@ func (s *Scheduler) Stop() {
 
 // runCompaction runs one compaction cycle
 func (s *Scheduler) runCompaction() {
+	// Re-check the gate on EVERY tick, not only in Start().
+	//
+	// Start() runs before the cluster coordinator exists (main.go starts the
+	// schedulers, then builds the coordinator, then wires it into the gate),
+	// so at that moment CanCompact falls back to the static role capability
+	// and a compactor node arms its cron unconditionally. If the compactor
+	// lease then sits on another node — which is the normal state on a
+	// cluster where a writer took it while the compactor was still joining —
+	// nothing stopped this cron, because the lose-the-lease callback only
+	// fires on the node that HELD it. Two nodes then compacted the same
+	// partitions into two outputs, both registered in the manifest: the
+	// duplicate-output hazard the single-compactor lease exists to prevent.
+	//
+	// This is also what CLAUDE.md's cluster-ops rule requires — the gate
+	// belongs in the execution path so a lease change takes effect without a
+	// restart — and this scheduler is the file that rule cites as the
+	// reference pattern.
+	s.mu.Lock()
+	gate := s.clusterGate
+	s.mu.Unlock()
+	if gate != nil && !gate.CanCompact() {
+		s.logger.Debug().
+			Str("role", gate.Role()).
+			Msg("Scheduled compaction skipped: this node does not hold the compactor lease")
+		return
+	}
+
 	startTime := time.Now()
 	s.logger.Info().Msg("Triggering scheduled compaction")
 
