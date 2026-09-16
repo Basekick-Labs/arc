@@ -123,6 +123,11 @@ type Coordinator struct {
 	// leader for forwarding commands. Reused across calls to avoid
 	// per-command dial + TLS overhead. Lazily reconnected on error or
 	// leader change.
+	// unknownHeartbeatSeen rate-limits the warning for heartbeats from nodes
+	// this one has no record of (#849).
+	unknownHeartbeatMu   sync.Mutex
+	unknownHeartbeatSeen map[string]time.Time
+
 	forwardConn       net.Conn
 	forwardConnLeader string    // nodeID of the leader this conn is dialed to
 	forwardConnUsedAt time.Time // last successful handout, for the idle refresh
@@ -1488,6 +1493,65 @@ func (c *Coordinator) sendJoinSuccess(conn net.Conn, req *protocol.JoinRequest) 
 }
 
 // handleHeartbeat processes a heartbeat from a peer.
+// unknownHeartbeatWarnInterval is the minimum gap between warnings about the
+// same absent node, and unknownHeartbeatWarnCap bounds how many distinct node
+// ids are tracked. Node ids are derived from hostname and pid, so a peer that
+// restarts repeatedly mints new ones; the map is fed by the network and must
+// not grow without limit.
+const (
+	unknownHeartbeatWarnInterval = 60 * time.Second
+	unknownHeartbeatWarnCap      = 256
+)
+
+// warnUnknownHeartbeat reports, at most once a minute per node, that a peer is
+// heartbeating a cluster that has no record of it. Warn rather than Debug on
+// purpose: debug logging is off in production, which is exactly why this state
+// went unnoticed. It never blocks the heartbeat path.
+func (c *Coordinator) warnUnknownHeartbeat(nodeID, peer string) {
+	metrics.Get().IncClusterHeartbeatUnknownNode()
+
+	now := time.Now()
+	c.unknownHeartbeatMu.Lock()
+	if c.unknownHeartbeatSeen == nil {
+		c.unknownHeartbeatSeen = make(map[string]time.Time)
+	}
+	last, seen := c.unknownHeartbeatSeen[nodeID]
+	if seen && now.Sub(last) < unknownHeartbeatWarnInterval {
+		c.unknownHeartbeatMu.Unlock()
+		return
+	}
+	if !seen && len(c.unknownHeartbeatSeen) >= unknownHeartbeatWarnCap {
+		// Full of ids that have not repeated within the interval: drop the
+		// oldest rather than grow, and rather than stop warning.
+		oldestID, oldest := "", now
+		for id, t := range c.unknownHeartbeatSeen {
+			if t.Before(oldest) {
+				oldestID, oldest = id, t
+			}
+		}
+		delete(c.unknownHeartbeatSeen, oldestID)
+	}
+	c.unknownHeartbeatSeen[nodeID] = now
+	c.unknownHeartbeatMu.Unlock()
+
+	c.logger.Warn().
+		Str("node_id", nodeID).
+		Str("peer", peer).
+		Msg("Heartbeat from a node this cluster has no record of; its heartbeats are being discarded. It believes it is a member and needs to re-join")
+}
+
+// remoteAddrOf is nil-safe so the warning above can name the peer without
+// risking the heartbeat path.
+func remoteAddrOf(conn net.Conn) string {
+	if conn == nil {
+		return ""
+	}
+	if addr := conn.RemoteAddr(); addr != nil {
+		return addr.String()
+	}
+	return ""
+}
+
 func (c *Coordinator) handleHeartbeat(conn net.Conn, hb *protocol.Heartbeat) {
 	// Validate shared secret if configured. A heartbeat mutates the sender's
 	// recorded liveness and self-reported state, so it is authenticated like
@@ -1514,7 +1578,15 @@ func (c *Coordinator) handleHeartbeat(conn net.Conn, hb *protocol.Heartbeat) {
 
 	// Update the real node's LastHeartbeat and self-reported state in the
 	// registry (not a clone).
-	c.registry.RecordHeartbeat(hb.NodeID, NodeStats{})
+	if !c.registry.RecordHeartbeat(hb.NodeID, NodeStats{}) {
+		// The sender believes it is in a cluster this node has no record of,
+		// so its heartbeats land nowhere. It is still acknowledged, because
+		// nothing on the sending side handles a negative ack and changing
+		// that is a wire change — but the condition is announced now. It used
+		// to be discarded in silence, which is why a node that left and never
+		// re-joined was invisible until a forwarded write failed (#849).
+		c.warnUnknownHeartbeat(hb.NodeID, remoteAddrOf(conn))
+	}
 	c.registry.UpdateNodeState(hb.NodeID, NodeState(hb.State))
 
 	// Send acknowledgment

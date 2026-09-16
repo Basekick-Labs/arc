@@ -204,6 +204,13 @@ type Metrics struct {
 	// command type so operators can see "create vs update vs revoke"
 	// distribution; clusterAuthRejectedTotal counts applier-side
 	// validation refusals. Phase A: Cluster Auth Convergence.
+	// clusterHeartbeatsUnknownNodeTotal counts heartbeats received from a
+	// node this one has no record of. A non-zero growth rate means a peer
+	// believes it is in a cluster that has forgotten it, which is the state
+	// behind a node that left and never re-joined. The node id is in the log
+	// line, not here: the metrics package has no dynamic labels.
+	clusterHeartbeatsUnknownNodeTotal atomic.Int64
+
 	clusterAuthApplyCreateTotal atomic.Int64
 	clusterAuthApplyUpdateTotal atomic.Int64
 	clusterAuthApplyRevokeTotal atomic.Int64
@@ -495,6 +502,8 @@ func (m *Metrics) SetStorageUnaddressableFiles(n int64) {
 // Token command. apply_* counts successful applies per type;
 // IncClusterAuthRejected counts applier-side validation refusals.
 // Phase A: Cluster Auth Convergence.
+func (m *Metrics) IncClusterHeartbeatUnknownNode() { m.clusterHeartbeatsUnknownNodeTotal.Add(1) }
+
 func (m *Metrics) IncClusterAuthApplyCreate() { m.clusterAuthApplyCreateTotal.Add(1) }
 func (m *Metrics) IncClusterAuthApplyUpdate() { m.clusterAuthApplyUpdateTotal.Add(1) }
 func (m *Metrics) IncClusterAuthApplyRevoke() { m.clusterAuthApplyRevokeTotal.Add(1) }
@@ -683,6 +692,8 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"storage_unaddressable_files":            m.storageUnaddressableFiles.Load(),
 
 		// Cluster Auth (Enterprise, Phase A)
+		"cluster_heartbeats_unknown_node_total": m.clusterHeartbeatsUnknownNodeTotal.Load(),
+
 		"cluster_auth_apply_create_total": m.clusterAuthApplyCreateTotal.Load(),
 		"cluster_auth_apply_update_total": m.clusterAuthApplyUpdateTotal.Load(),
 		"cluster_auth_apply_revoke_total": m.clusterAuthApplyRevokeTotal.Load(),
@@ -1061,6 +1072,9 @@ func (m *Metrics) PrometheusFormat() string {
 	// (they all apply the same Raft log). rejected_total counts applier-
 	// side validation refusals; non-zero growth is the security alerting
 	// signal that something is proposing invalid tokens.
+	b = append(b, "# HELP arc_cluster_heartbeats_unknown_node_total Heartbeats received from a node absent from this node's registry.\n"...)
+	b = append(b, "# TYPE arc_cluster_heartbeats_unknown_node_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_heartbeats_unknown_node_total", float64(m.clusterHeartbeatsUnknownNodeTotal.Load()))
 	b = append(b, "# HELP arc_cluster_auth_apply_create_total Total CommandCreateToken applies on this node.\n"...)
 	b = append(b, "# TYPE arc_cluster_auth_apply_create_total counter\n"...)
 	b = appendMetric(b, "arc_cluster_auth_apply_create_total", float64(m.clusterAuthApplyCreateTotal.Load()))

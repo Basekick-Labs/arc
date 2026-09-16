@@ -360,6 +360,11 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Bug fixes
 
+### A heartbeat from a node the cluster has forgotten is no longer discarded in silence ([#849](https://github.com/Basekick-Labs/arc/issues/849))
+
+A node that believes it is a cluster member sends heartbeats to its peers. If a peer has no record of it, the heartbeat was dropped and acknowledged anyway, so neither side could tell: the sender saw a healthy acknowledgement, the receiver logged nothing, and the state persisted until some other operation failed. That is why a node which left the cluster and never re-joined stayed invisible until a forwarded write was rejected.
+
+Such a heartbeat is now counted in `arc_cluster_heartbeats_unknown_node_total` and logged as a warning naming the node, at most once a minute per node and with a bound on how many nodes are tracked, since node identifiers change when a peer restarts. Alert on a non-zero growth rate: it means a node is heartbeating a cluster that has forgotten it and needs to re-join. The heartbeat is still acknowledged, because nothing on the sending side acts on a refusal today and changing that would be a protocol change.
 ### A node dropped from the cluster stayed in every other node's list after a snapshot restore ([#847](https://github.com/Basekick-Labs/arc/issues/847))
 
 Each node keeps an in-memory view of cluster membership that the health checker, the heartbeat fan-out, the node listings and the file puller read. A Raft snapshot restore replaces the authoritative node table wholesale, and since 26.09.2 it announces the nodes it brings back, but it said nothing about the ones the snapshot no longer carried. A node that had been removed from the cluster therefore stayed in that view indefinitely on any node that restored from a later snapshot: it was health-checked, offered as a replication peer and listed by the API, until the process restarted.
