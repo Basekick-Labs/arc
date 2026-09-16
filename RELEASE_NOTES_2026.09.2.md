@@ -448,6 +448,33 @@ Nothing stopped it afterwards either. The callback that shuts a compaction sched
 
 The check now runs on every tick, which is what the cluster-operations rule in this repository has always required and what the retention, continuous-query, Iceberg and reconciliation schedulers already did. A lease change now takes effect without a restart, which is the other half of the same rule.
 
+### An upgraded cluster could keep a reader or compactor voting in Raft, with nothing reporting it ([#880](https://github.com/Basekick-Labs/arc/issues/880))
+
+Arc now grants a Raft vote only to nodes that can accept writes, so a reader or compactor cannot win leadership and stall every task that runs on exactly one node. That rule applies when a node **joins**. It does not change a vote a node already holds, because adding a server that is already a voter as a non-voter updates its address and leaves its suffrage alone — that is how the underlying Raft library works, deliberately.
+
+Most clusters converge anyway. A node that shuts down gracefully announces it, the leader drops it from the Raft configuration, and its next start is a clean add with the right suffrage; a rolling upgrade does that for most of a cluster as a side effect. What does not converge is a node killed ungracefully, a node whose departure arrived while there was no leader to process it, the departing leader itself, and any node re-added while it was still in the configuration.
+
+So a cluster could sit indefinitely with a reader holding a vote, and there was nothing to look at: the only record of a server's suffrage was inside a diagnostic string in the Raft statistics block.
+
+**`GET /api/v1/cluster` now reports the voter set.** A new `raft.membership` block lists every server with its suffrage and the role the cluster has on record for it; where that role is one Arc recognises, it also carries the suffrage the role calls for and whether the two agree. A server whose role cannot be determined — an entry left by a version that recorded something Arc no longer knows, or one present in the Raft configuration but in no node record — is reported as unresolved, with no verdict attached, and is never acted on. The block also carries counts of voting servers, disagreements and unresolved entries, and names the node it came from, because a follower's view of the Raft configuration can lag the leader's.
+
+When disagreements persist, the leader now says so in the log, once a minute, pointing at the endpoint below.
+
+**`POST /api/v1/cluster/voters/converge` fixes it.** Admin-only. It plans by default: send `{"dry_run": false}` to act. It only ever **revokes** votes, never grants them — granting one raises the number of nodes that must agree before anything can change, and if the newly-voting node is down or behind, nothing can commit, no further membership change is possible, and the cluster loses its leader with no way back. Revoking is safe in the other direction because it is self-repairing: a node that should vote gets its vote back the next time it joins.
+
+Revoking is not automatically safe either, and the endpoint refuses rather than guesses:
+
+- It will not revoke a vote if doing so would leave the remaining voters without a healthy majority. A configuration change takes effect the moment it is made, so removing a live voter from a group whose survivors are down strands the change permanently — it can never be agreed, and the cluster cannot elect a leader again.
+- It will not drop a cluster to a single voter unless you say so explicitly with `{"allow_single_voter": true}`. One voter works until that node dies, after which nothing can ever elect a leader.
+- A server whose role the cluster cannot determine is reported and left alone. Those entries are disproportionately nodes that are already gone, which is exactly what must not be counted on for a majority.
+- If the node you call is itself voting when its role says it should not — which is common on a cluster upgraded from before the rule existed, where every node was given a vote regardless of role — it hands leadership to a node whose role does vote and tells you to re-run against the new leader. Without that step it would revoke everyone else's vote, report success, and leave the cluster in the state you were trying to fix.
+
+If a revocation fails, the endpoint stops there rather than continuing down the list, and reports what it did and what it did not. Carrying on would apply the remaining changes to a voter set that was never checked, which is the one way the safety rules above can be defeated.
+
+An unreadable or absent request body is treated as a dry run rather than rejected: the safe reading of an unclear instruction to change cluster membership is to not change it.
+
+Convergence is deliberately never automatic. Doing it on its own when a node takes leadership was considered and rejected for this release: it is the kind of change that is safest when an operator chooses the moment, can see the plan first, and is watching when it lands.
+
 ### The compactor lease never moved to a dedicated compactor, and there was no way to move it by hand ([#876](https://github.com/Basekick-Labs/arc/issues/876))
 
 The other half of the fix above. A cluster hands the compactor lease to the best candidate it can see when it first assigns one, and prefers a node whose role is `compactor` — but if no such node is visible at that moment it falls back to a writer, and there it stayed. The lease was only ever moved again when its holder became *unhealthy*. A healthy writer kept it for the life of the cluster.
