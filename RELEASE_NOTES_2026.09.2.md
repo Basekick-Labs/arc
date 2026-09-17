@@ -398,6 +398,18 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+
+### Backup destination keys exceeding the storage limit (#761)
+
+A source file can have a valid storage key that becomes too long when the
+backup ID and `/data/` prefix are added. Backups now skip these files with
+an explicit warning, include them in the manifest's skipped-file count,
+and apply the existing skip-ratio safeguard. Other backup-storage write
+failures remain fatal.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#ARC761_PR_NUMBER](https://github.com/Basekick-Labs/arc/pull/ARC761_PR_NUMBER).
+
+
 ### Peer file fetches now respect the overall timeout ([#796](https://github.com/Basekick-Labs/arc/issues/796))
 
 The configured `cluster.replication_fetch_timeout_ms` did not reliably bound a file fetch. Reading the acknowledgement header could replace the context deadline with a longer timeout, and the subsequent body transfer could block indefinitely if a peer stopped sending data.
