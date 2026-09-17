@@ -177,67 +177,92 @@ collect:
 	}
 }
 
-// The real Stop with a delete applied while it is joining the puller. A pull
-// in flight against a peer that never answers keeps puller.Stop (and, before
-// #813, c.mu) held for the fetch timeout; a DeleteFile committed in that
-// window is applied on the Raft goroutine Stop is about to join. Before #797
-// this hung forever; the test then reports the deadlock and leaks the rig on
-// purpose.
+// A file deletion must be applicable after shutdown starts but before Raft
+// stops. Hold the forward-connection lock to pause Stop after it releases
+// c.mu and before it joins the puller and Raft. This keeps the ordering
+// deterministic even when a cancelled fetch now terminates immediately (#796).
 func TestStop_DoesNotDeadlockOnDeleteAppliedDuringShutdown(t *testing.T) {
 	peer := startHangingOrigin(t)
 	c, raftNode := newShutdownRig(t, peer.addr(), 2000)
 	const path = "testdb/cpu/2026/09/14/21/stop.parquet"
-	registerTestFile(t, raftNode, path) // reactive pull -> connects to the peer and hangs
+	registerTestFile(t, raftNode, path)
+
 	select {
 	case <-peer.connected:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the reader never connected to the peer")
 	}
 
+	// Stop calls closeForwardConn after releasing c.mu but before stopping
+	// the puller or Raft. Holding this lock keeps Raft available for the
+	// deletion without relying on how long a cancelled fetch takes to exit.
+	c.forwardConnMu.Lock()
+	gateHeld := true
+	releaseGate := func() {
+		if gateHeld {
+			gateHeld = false
+			c.forwardConnMu.Unlock()
+		}
+	}
+	defer releaseGate()
+
 	stopDone := make(chan error, 1)
 	start := time.Now()
 	go func() { stopDone <- c.Stop() }()
 
-	// Wait until Stop is joining the puller (it is waiting on the hung
-	// fetch). Since #813 Stop holds c.mu only for microseconds, so the
-	// signal is the puller pointer it clears before the join, not the lock.
-	joining := false
-	for i := 0; i < 600 && !joining; i++ {
-		if c.ReplicationCatchUpStatus() != nil {
-			time.Sleep(5 * time.Millisecond)
-			continue
+	// Observe the real shutdown transition under the coordinator lock.
+	stopping := false
+	for i := 0; i < 600; i++ {
+		c.mu.RLock()
+		stopping = c.stopping
+		c.mu.RUnlock()
+		if stopping {
+			break
 		}
-		joining = true
+		time.Sleep(5 * time.Millisecond)
 	}
-	if !joining {
-		t.Fatal("Stop never reached the puller join")
+	if !stopping {
+		t.Fatal("Stop never entered the shutdown phase")
 	}
+
+	select {
+	case err := <-stopDone:
+		t.Fatalf("Stop returned before the shutdown gate was released: %v", err)
+	default:
+	}
+
+	// Apply the command while shutdown is in progress, c.mu is released,
+	// and the Raft node has not started its shutdown.
 	deleteDone := make(chan error, 1)
-	go func() { deleteDone <- raftNode.DeleteFile(path, "test: applied during shutdown", 5*time.Second) }()
-	// The delete must apply (callback included) while Stop is inside the
-	// puller join; only then release the hung fetch so Stop can move on to
-	// joining the Raft node. (Left alone, the fetch holds the join for the
-	// protocol's 15 s header timeout regardless of the fetch timeout, #796.)
-	// Pre-fix the callback blocks here and this wait times out; the release
-	// then lets Stop reach the Raft join, where it deadlocks.
+	go func() {
+		deleteDone <- raftNode.DeleteFile(
+			path, "test: applied during shutdown", 5*time.Second,
+		)
+	}()
+
 	select {
 	case err := <-deleteDone:
 		if err != nil {
 			t.Fatalf("DeleteFile during shutdown: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Log("delete did not apply within 5s while Stop was joining the puller (expected only on the pre-fix code)")
+		t.Fatal("DeleteFile did not apply during shutdown")
 	}
+
+	// Let Stop join the remaining subsystems. Release the peer too, so
+	// the test remains valid against the older, slower cancellation path.
 	peer.releaseAll()
+	releaseGate()
 
 	select {
 	case err := <-stopDone:
 		if err != nil {
 			t.Fatalf("Stop: %v", err)
 		}
-		t.Logf("Stop returned after %s with a delete applied inside its puller join", time.Since(start))
+		t.Logf("Stop returned after %s with a delete applied during shutdown",
+			time.Since(start))
 	case <-time.After(15 * time.Second):
-		t.Fatalf("Stop did not return within 15s: the FSM delete callback is blocked on the coordinator lock while Raft shutdown waits for it (#797); rig leaked on purpose")
+		t.Fatal("Stop deadlocked after a file deletion during shutdown")
 	}
 }
 
