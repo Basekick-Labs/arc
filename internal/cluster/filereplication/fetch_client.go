@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
+	"os"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster/protocol"
@@ -103,19 +105,57 @@ func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.Fi
 
 	// Step 1: dial. Use security.Dial which wraps tls.DialWithDialer if TLS
 	// is configured, otherwise falls back to plain net.DialTimeout.
-	conn, err := security.Dial("tcp", peerAddr, f.DialTimeout, f.TLSConfig)
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	deadline, hasDeadline := ctx.Deadline()
+	dialTimeout := f.DialTimeout
+	if dialTimeout <= 0 {
+		dialTimeout = 10 * time.Second
+	}
+	if hasDeadline {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return 0, context.DeadlineExceeded
+		}
+		if remaining < dialTimeout {
+			dialTimeout = remaining
+		}
+	}
+
+	conn, err := security.Dial("tcp", peerAddr, dialTimeout, f.TLSConfig)
 	if err != nil {
 		return 0, fmt.Errorf("dial %s: %w", peerAddr, err)
 	}
 	defer conn.Close()
 
-	// Honor any deadline the context carries. If there's no deadline we use
-	// a tight default — the Puller always passes a bounded context, so this
-	// fallback is only defensive in case a caller wires Fetch directly.
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-	} else {
-		_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
+	// Keep the overall deadline in force for the entire fetch.
+	if !hasDeadline {
+		deadline = time.Now().Add(60 * time.Second)
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		return 0, fmt.Errorf("set fetch deadline: %w", err)
+	}
+
+	// A context cancelled without a deadline must also unblock network I/O.
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+	})
+	defer stopCancel()
+
+	// Context cancellation can close the connection before ctx.Err() is
+	// observable. An expired socket deadline can likewise fire first.
+	// Preserve the context error when either event caused the I/O failure.
+	fetchIOError := func(err error) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if hasDeadline && !time.Now().Before(deadline) &&
+			errors.Is(err, os.ErrDeadlineExceeded) {
+			return context.DeadlineExceeded
+		}
+		return err
 	}
 
 	// Step 2: build and send the MsgFetchFile request. The HMAC binds the
@@ -139,18 +179,41 @@ func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.Fi
 		HMAC:       mac,
 		ByteOffset: byteOffset,
 	}
+	sendTimeout := 10 * time.Second
+	if remaining := time.Until(deadline); remaining <= 0 {
+		return 0, context.DeadlineExceeded
+	} else if remaining < sendTimeout {
+		sendTimeout = remaining
+	}
+
 	if err := protocol.SendMessage(conn, &protocol.Message{
 		Type:    protocol.MsgFetchFile,
 		Payload: req,
-	}, 10*time.Second); err != nil {
-		return 0, fmt.Errorf("send fetch request: %w", err)
+	}, sendTimeout); err != nil {
+		return 0, fmt.Errorf("send fetch request: %w", fetchIOError(err))
 	}
 
 	// Step 3: read the ack header. The header is a framed protocol message,
 	// but the body that follows is NOT framed — we'll switch to raw reads.
-	ackMsg, err := protocol.ReceiveMessage(conn, f.ResponseHeaderTimeout)
+	headerTimeout := f.ResponseHeaderTimeout
+	if remaining := time.Until(deadline); remaining <= 0 {
+		return 0, context.DeadlineExceeded
+	} else if remaining < headerTimeout {
+		headerTimeout = remaining
+	}
+
+	ackMsg, err := protocol.ReceiveMessage(conn, headerTimeout)
 	if err != nil {
-		return 0, fmt.Errorf("receive ack header: %w", err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, fmt.Errorf("receive ack header: %w", ctxErr)
+		}
+		return 0, fmt.Errorf("receive ack header: %w", fetchIOError(err))
+	}
+
+	// ReceiveMessage clears its temporary read deadline. Restore the
+	// overall deadline before reading the unframed file body.
+	if err := conn.SetReadDeadline(deadline); err != nil {
+		return 0, fmt.Errorf("restore fetch read deadline: %w", fetchIOError(err))
 	}
 	if ackMsg.Type != protocol.MsgFetchFileAck {
 		return 0, fmt.Errorf("unexpected ack type: %v (wanted MsgFetchFileAck)", ackMsg.Type)
@@ -204,7 +267,10 @@ func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.Fi
 	mw := io.MultiWriter(dst, hasher)
 	written, err := io.CopyN(mw, conn, ack.SizeBytes)
 	if err != nil {
-		return written, fmt.Errorf("stream body: %w (wrote %d of %d tail bytes)", err, written, ack.SizeBytes)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return written, fmt.Errorf("stream body: %w (wrote %d of %d tail bytes)", ctxErr, written, ack.SizeBytes)
+		}
+		return written, fmt.Errorf("stream body: %w (wrote %d of %d tail bytes)", fetchIOError(err), written, ack.SizeBytes)
 	}
 
 	// Step 5: verify the computed hash matches the expected whole-file hash.

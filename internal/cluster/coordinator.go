@@ -3732,14 +3732,22 @@ func (c *Coordinator) startFilePullerLocked() error {
 		return fmt.Errorf("peer replication requires ARC_CLUSTER_SHARED_SECRET to be set")
 	}
 
+	// The header and body share the configured per-fetch budget.
+	// Match the puller's default when the cluster config omits it.
+	fetchTimeout := time.Duration(c.cfg.ReplicationFetchTimeoutMs) * time.Millisecond
+	if fetchTimeout <= 0 {
+		fetchTimeout = filereplication.DefaultConfig().FetchTimeout
+	}
+
 	// Build the fetch client. Reuses cluster TLS (PR #382) so peer transfers
 	// run under the cluster PKI, not the public API cert.
 	fetchClient, err := filereplication.NewFetchClient(filereplication.FetchClient{
-		SelfNodeID:   c.localNode.ID,
-		ClusterName:  c.cfg.ClusterName,
-		SharedSecret: c.cfg.SharedSecret,
-		TLSConfig:    c.tlsConfig,
-		DialTimeout:  10 * time.Second,
+		SelfNodeID:            c.localNode.ID,
+		ClusterName:           c.cfg.ClusterName,
+		SharedSecret:          c.cfg.SharedSecret,
+		TLSConfig:             c.tlsConfig,
+		DialTimeout:           10 * time.Second,
+		ResponseHeaderTimeout: fetchTimeout,
 	})
 	if err != nil {
 		return fmt.Errorf("build fetch client: %w", err)
@@ -3800,7 +3808,7 @@ func (c *Coordinator) startFilePullerLocked() error {
 		Workers:                c.cfg.ReplicationPullWorkers,
 		QueueSize:              c.cfg.ReplicationQueueSize,
 		RetryMaxAttempts:       c.cfg.ReplicationRetryMaxAttempts,
-		FetchTimeout:           time.Duration(c.cfg.ReplicationFetchTimeoutMs) * time.Millisecond,
+		FetchTimeout:           fetchTimeout,
 		RetryInitialBackoff:    500 * time.Millisecond,
 		CatchUpQueueHighWater:  c.cfg.ReplicationCatchUpQueueHighWater,
 		ReconciliationInterval: time.Duration(c.cfg.ReplicationReconciliationIntervalSeconds) * time.Second,

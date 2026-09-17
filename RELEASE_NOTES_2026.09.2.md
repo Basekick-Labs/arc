@@ -398,6 +398,14 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### Peer file fetches now respect the overall timeout ([#796](https://github.com/Basekick-Labs/arc/issues/796))
+
+The configured `cluster.replication_fetch_timeout_ms` did not reliably bound a file fetch. Reading the acknowledgement header could replace the context deadline with a longer timeout, and the subsequent body transfer could block indefinitely if a peer stopped sending data.
+
+Fetches now keep the overall deadline effective across the request, acknowledgement and body transfer. Cancelling the fetch also closes the connection to unblock stalled network reads. The coordinator derives the acknowledgement timeout from the configured fetch budget, and regression tests cover stalled headers, partial bodies and cancellation.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#899](https://github.com/Basekick-Labs/arc/pull/899).
+
 ### Compaction preserves files with identical basenames ([#826](https://github.com/Basekick-Labs/arc/issues/826))
 
 Daily compaction previously downloaded files from different hour partitions using only their basenames. Identically named files could overwrite one another, potentially duplicating some rows and losing others.
