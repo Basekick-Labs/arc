@@ -23,23 +23,21 @@ import (
 
 const seqTestSecret = "sequence-space-test-shared-secret"
 
-// youngWriter starts a Sender that has already emitted `emitted` entries in
-// this process, and serves exactly one replication connection on a real
-// listener. It returns the address to dial.
+// youngWriter seeds a Sender's sequence without queuing entries, and serves
+// exactly one replication connection on a real listener. It returns the
+// address to dial.
 //
 // It mirrors Coordinator.AcceptReplicationConnection's ordering deliberately:
 // CurrentSequence is read, the ack is written, and only then is the reader
-// published to the broadcast map — which is what guarantees the first entry a
-// reader sees is strictly greater than the sequence it was told.
-func youngWriter(t *testing.T, sender *Sender, emitted int) (addr string, activated <-chan struct{}) {
+// published to the broadcast map. With no pending entries, only entries
+// explicitly replicated after activation can reach this reader.
+func youngWriter(t *testing.T, sender *Sender, sequence uint64) (addr string, activated <-chan struct{}) {
 	t.Helper()
 
-	for i := 0; i < emitted; i++ {
-		sender.Replicate(&ReplicateEntry{
-			TimestampUS: uint64(time.Now().UnixMicro()),
-			Payload:     []byte("warmup"),
-		})
-	}
+	// Replicate queues entries asynchronously. Warmup entries could otherwise
+	// remain queued until the reader connects and advance its mark before the
+	// handshake assertion, or be mistaken for the first post-restart entry.
+	sender.sequence.Store(sequence)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
