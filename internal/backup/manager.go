@@ -119,6 +119,11 @@ func sameFilePath(a, b string) bool {
 	return resolve(a) == resolve(b)
 }
 
+// backupDataKeyHeadroom reserves the 31-byte generated backup ID and "/data/".
+// A source key may fit storage.MaxUsableKeyLen while its backup destination does
+// not. Keep this reservation in sync with generateBackupID.
+const backupDataKeyHeadroom = len("backup-20060102-150405-12345678/data/")
+
 // generateBackupID creates a unique backup identifier.
 func generateBackupID() string {
 	now := time.Now().UTC()

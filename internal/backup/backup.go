@@ -19,9 +19,10 @@ import (
 
 // errBackupRead marks a failure reading the SOURCE file from data storage.
 //
-// Only source-read failures are skippable: the file may legitimately have been
-// deleted by compaction or retention between the listing and the copy, and
-// aborting the whole backup for that benign race would be wrong.
+// Source-read failures are skippable: the file may legitimately have been
+// deleted by compaction or retention between listing and copy. The other
+// explicitly skippable case is an overlong destination key, checked before
+// streaming in copyDataFiles.
 //
 // Every other failure — temp file creation, seek, backup-storage write — is
 // fatal. Those indicate a broken environment (no temp space, unwritable or
@@ -32,7 +33,7 @@ import (
 // mode added here later is fatal by default until someone marks it skippable.
 var errBackupRead = errors.New("backup source read failed")
 
-// maxSkipRatio is the fraction of data files that may be skipped before the
+// maxSkipRatio is the fraction of inventoried files that may be skipped before the
 // backup is treated as failed rather than merely incomplete.
 //
 // Skipping exists to tolerate one narrow race: a file removed by compaction or
@@ -347,8 +348,8 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 
 // copyDataFiles copies parquet files from data storage to backup storage.
 //
-// Files whose source cannot be read are skipped (see errBackupRead) and added to
-// progress.SkippedFiles. Every other failure aborts the backup immediately.
+// Source-read failures and overlong backup destination keys are skipped and
+// counted in progress.SkippedFiles. Every other failure aborts immediately.
 //
 // The skip-ratio check is NOT applied here, because CreateBackup calls this more
 // than once (data files, then Iceberg warehouse metadata) and the ratio is only
@@ -366,6 +367,19 @@ func (m *Manager) copyDataFiles(ctx context.Context, backupID string, files []st
 		}
 
 		destPath := fmt.Sprintf("%s/data/%s", backupID, obj.Path)
+		// A legal source key can exceed the storage limit once the backup
+		// prefix is added. This predictable case is skippable; actual
+		// backup-storage write failures must still abort the run.
+		if len(destPath) > storage.MaxUsableKeyLen {
+			skipped++
+			m.logger.Warn().
+				Str("path", obj.Path).
+				Int("destination_key_bytes", len(destPath)).
+				Int("maximum_key_bytes", storage.MaxUsableKeyLen).
+				Msg("Backup destination key too long; skipping")
+			continue
+		}
+
 		written, err := m.streamBackupFile(ctx, obj.Path, destPath)
 		if err != nil {
 			// Only a source-read failure is skippable — the file may have been
@@ -520,7 +534,7 @@ func sampleUnaddressable(objs []storage.UnusableObject) []string {
 	return out
 }
 
-// checkSkipRatio fails the backup when too large a fraction of it was unreadable.
+// checkSkipRatio fails the backup when too large a fraction of its files was skipped.
 //
 // Skipping tolerates one specific thing: a file removed by compaction or retention
 // between the listing and the copy. That race touches a handful of files at the
@@ -538,7 +552,7 @@ func (m *Manager) checkSkipRatio(progress *Progress, totalFiles int) error {
 		return nil
 	}
 	if float64(skipped) > maxSkipRatio*float64(totalFiles) {
-		return fmt.Errorf("backup failed: %d of %d files were unreadable (>%.0f%%), source storage may be degraded",
+		return fmt.Errorf("backup failed: %d of %d files skipped (>%.0f%%); source storage may be degraded or backup destination keys may be too long",
 			skipped, totalFiles, maxSkipRatio*100)
 	}
 	return nil
