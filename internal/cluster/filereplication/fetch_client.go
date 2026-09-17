@@ -103,8 +103,10 @@ func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.Fi
 		return 0, fmt.Errorf("fetch: byteOffset=0 but prefixHasher is non-nil")
 	}
 
-	// Step 1: dial. Use security.Dial which wraps tls.DialWithDialer if TLS
-	// is configured, otherwise falls back to plain net.DialTimeout.
+	// Step 1: dial. Use security.DialContext, which wraps tls.Dialer.DialContext
+	// if TLS is configured (otherwise plain net.Dialer.DialContext), so a
+	// cancelled ctx interrupts a stalled TCP dial or TLS handshake instead of
+	// only being noticed after connection establishment finishes or times out.
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -124,8 +126,11 @@ func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.Fi
 		}
 	}
 
-	conn, err := security.Dial("tcp", peerAddr, dialTimeout, f.TLSConfig)
+	conn, err := security.DialContext(ctx, "tcp", peerAddr, dialTimeout, f.TLSConfig)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, fmt.Errorf("dial %s: %w", peerAddr, ctxErr)
+		}
 		return 0, fmt.Errorf("dial %s: %w", peerAddr, err)
 	}
 	defer conn.Close()
