@@ -398,6 +398,14 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### Compaction preserves files with identical basenames ([#826](https://github.com/Basekick-Labs/arc/issues/826))
+
+Daily compaction previously downloaded files from different hour partitions using only their basenames. Identically named files could overwrite one another, potentially duplicating some rows and losing others.
+
+Temporary input filenames now include the download index, and exclusive file creation prevents accidental overwrites. Regression tests cover filename collisions, existing temporary files, and real Parquet compaction preserving rows from both hour partitions.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#898](https://github.com/Basekick-Labs/arc/pull/898).
+
 ### Replication sequence tests no longer depend on warmup delivery timing
 
 The sequence handshake tests now initialize the sender's sequence directly instead of queuing warmup entries. Pending warmup entries could reach a newly connected reader and advance its sequence before the assertion, causing intermittent CI failures on unrelated changes. The restart test still verifies delivery of a real entry after the handshake; production replication behavior is unchanged.

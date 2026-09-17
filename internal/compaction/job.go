@@ -592,10 +592,12 @@ func (j *Job) downloadSingleFile(ctx context.Context, tempDir string, index int,
 	default:
 	}
 
-	localPath := filepath.Join(tempDir, filepath.Base(fileKey))
+	// The input index makes each download path unique even when source keys
+	// from different partitions have identical basenames.
+	localPath := filepath.Join(tempDir, fmt.Sprintf("%d_%s", index, filepath.Base(fileKey)))
 
-	// Create local file for streaming
-	file, err := os.Create(localPath)
+	// Never truncate an existing input if a temporary path is reused.
+	file, err := os.OpenFile(localPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0666)
 	if err != nil {
 		return downloadResult{index: index, err: fmt.Errorf("failed to create %s: %w", localPath, err)}
 	}
