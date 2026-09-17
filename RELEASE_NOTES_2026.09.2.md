@@ -398,6 +398,16 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### Audit events retain their request data until the background write
+
+Audit middleware now copies request-backed strings before enqueueing an event,
+including handler-provided detail keys and values. Reusing Fiber request buffers
+can no longer overwrite an earlier event's method, path, IP address, database,
+measurement, or user agent while it waits for the background writer. A deterministic
+regression mutates the original buffers after the request completes.
+
+Contributed by [@0utsights](https://github.com/0utsights) in [#871](https://github.com/Basekick-Labs/arc/pull/871).
+
 ### Compaction dropped the implicit "time" sort key when a custom sort key was configured ([#792](https://github.com/Basekick-Labs/arc/issues/792))
 
 Ingest sorts each flush by the configured sort keys with `time` appended last, so rows land in `(configured-keys..., time)` order within a file. Compaction rebuilds long-lived files from many such inputs and is meant to preserve that order — the comment above the `ORDER BY` call site says so directly — but `Manager.GetSortKeys` returned the configured keys unchanged, without appending `time`. With any custom `ingest.sort_keys` or `ingest.default_sort_keys` configured, compacted files were re-sorted by the configured columns only, and rows within each group landed in whatever order the multi-file `read_parquet(..., union_by_name=true)` scan produced, not time order.
