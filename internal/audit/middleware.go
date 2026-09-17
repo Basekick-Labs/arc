@@ -6,6 +6,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/utils"
 )
 
 // excludedPaths are never audited
@@ -32,11 +33,13 @@ func Middleware(logger *Logger, includeReads bool) fiber.Handler {
 		}
 
 		// Skip GET requests unless includeReads is enabled
-		method := c.Method()
+		method := utils.CopyString(c.Method())
 		if !includeReads && method == "GET" {
 			return c.Next()
 		}
 
+		// Retain the original path even if a handler rewrites it.
+		path = utils.CopyString(path)
 		start := time.Now()
 
 		// Execute the handler
@@ -52,8 +55,8 @@ func Middleware(logger *Logger, includeReads bool) fiber.Handler {
 			Method:     method,
 			Path:       path,
 			StatusCode: statusCode,
-			IPAddress:  c.IP(),
-			UserAgent:  truncate(c.Get("User-Agent"), 256),
+			IPAddress:  utils.CopyString(c.IP()),
+			UserAgent:  utils.CopyString(truncate(c.Get("User-Agent"), 256)),
 			DurationMs: duration.Milliseconds(),
 		}
 
@@ -73,14 +76,21 @@ func Middleware(logger *Logger, includeReads bool) fiber.Handler {
 			event.Database = c.Query("db")
 		}
 
+		event.Database = utils.CopyString(event.Database)
+
 		event.Measurement = c.Get("x-arc-measurement")
 		if event.Measurement == "" {
 			event.Measurement = c.Params("measurement")
 		}
 
+		event.Measurement = utils.CopyString(event.Measurement)
+
 		// Extract handler-supplied audit detail from Fiber locals if present
-		if d, ok := c.Locals(DetailLocalsKey).(map[string]string); ok {
-			event.Detail = d
+		if detail, ok := c.Locals(DetailLocalsKey).(map[string]string); ok && len(detail) > 0 {
+			event.Detail = make(map[string]string, len(detail))
+			for key, value := range detail {
+				event.Detail[utils.CopyString(key)] = utils.CopyString(value)
+			}
 		}
 
 		logger.LogEvent(event)
