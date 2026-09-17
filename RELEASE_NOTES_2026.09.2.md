@@ -404,6 +404,8 @@ The configured `cluster.replication_fetch_timeout_ms` did not reliably bound a f
 
 Fetches now keep the overall deadline effective across the request, acknowledgement and body transfer. Cancelling the fetch also closes the connection to unblock stalled network reads. The coordinator derives the acknowledgement timeout from the configured fetch budget, and regression tests cover stalled headers, partial bodies and cancellation.
 
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#899](https://github.com/Basekick-Labs/arc/pull/899).
+
 ### Compaction dropped the implicit "time" sort key when a custom sort key was configured ([#792](https://github.com/Basekick-Labs/arc/issues/792))
 
 Ingest sorts each flush by the configured sort keys with `time` appended last, so rows land in `(configured-keys..., time)` order within a file. Compaction rebuilds long-lived files from many such inputs and is meant to preserve that order — the comment above the `ORDER BY` call site says so directly — but `Manager.GetSortKeys` returned the configured keys unchanged, without appending `time`. With any custom `ingest.sort_keys` or `ingest.default_sort_keys` configured, compacted files were re-sorted by the configured columns only, and rows within each group landed in whatever order the multi-file `read_parquet(..., union_by_name=true)` scan produced, not time order.
