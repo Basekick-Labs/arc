@@ -407,7 +407,7 @@ an explicit warning, include them in the manifest's skipped-file count,
 and apply the existing skip-ratio safeguard. Other backup-storage write
 failures remain fatal.
 
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#ARC761_PR_NUMBER](https://github.com/Basekick-Labs/arc/pull/ARC761_PR_NUMBER).
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#903](https://github.com/Basekick-Labs/arc/pull/903).
 
 
 ### Peer file fetches now respect the overall timeout ([#796](https://github.com/Basekick-Labs/arc/issues/796))
