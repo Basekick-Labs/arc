@@ -398,6 +398,14 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### Compaction preserves files with identical basenames ([#826](https://github.com/Basekick-Labs/arc/issues/826))
+
+Daily compaction previously downloaded files from different hour partitions using only their basenames. Identically named files could overwrite one another, potentially duplicating some rows and losing others.
+
+Temporary input filenames now include the download index, and exclusive file creation prevents accidental overwrites. Regression tests cover filename collisions, existing temporary files, and real Parquet compaction preserving rows from both hour partitions.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#898](https://github.com/Basekick-Labs/arc/pull/898).
+
 ### Compaction dropped the implicit "time" sort key when a custom sort key was configured ([#792](https://github.com/Basekick-Labs/arc/issues/792))
 
 Ingest sorts each flush by the configured sort keys with `time` appended last, so rows land in `(configured-keys..., time)` order within a file. Compaction rebuilds long-lived files from many such inputs and is meant to preserve that order — the comment above the `ORDER BY` call site says so directly — but `Manager.GetSortKeys` returned the configured keys unchanged, without appending `time`. With any custom `ingest.sort_keys` or `ingest.default_sort_keys` configured, compacted files were re-sorted by the configured columns only, and rows within each group landed in whatever order the multi-file `read_parquet(..., union_by_name=true)` scan produced, not time order.
