@@ -1186,14 +1186,23 @@ func (b *LocalBackend) ListStaged(ctx context.Context, prefix string) ([]ObjectI
 		if relErr != nil {
 			return nil
 		}
+		// Reported WITHOUT the suffix: the caller addresses a partial by
+		// the key it belongs to, never by the staging spelling.
+		key := strings.TrimSuffix(filepath.ToSlash(rel), PartSuffix)
+		// stagedPath applies the same validation DeleteStaged will apply to
+		// this key. A partial whose stripped key fails it (a legacy partial
+		// of a key that is illegal today) must not be reported here: nothing
+		// could ever delete it, and reclaimStagedPartials would just log the
+		// same refusal on every run forever. ListUnusable reports it instead.
+		if _, err := b.stagedPath(key); err != nil {
+			return nil
+		}
 		info, infoErr := d.Info()
 		if infoErr != nil {
 			return nil
 		}
 		results = append(results, ObjectInfo{
-			// Reported WITHOUT the suffix: the caller addresses a partial by
-			// the key it belongs to, never by the staging spelling.
-			Path:         strings.TrimSuffix(filepath.ToSlash(rel), PartSuffix),
+			Path:         key,
 			Size:         info.Size(),
 			LastModified: info.ModTime(),
 		})
