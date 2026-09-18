@@ -398,6 +398,17 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### Experimental arcx Arrow IPC streams signal writer panics
+
+When the experimental arcx Arrow IPC stream writer panics, the response now
+includes an invalid Arrow IPC message marker and an `Arc-Stream-Truncated`
+trailer. Clients can detect the incomplete result instead of accepting a
+stream that ends at a batch boundary as complete. The standard DuckDB Arrow
+path is unchanged.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir)
+for [#846](https://github.com/Basekick-Labs/arc/issues/846).
+
 ### Peer file fetches now respect the overall timeout ([#796](https://github.com/Basekick-Labs/arc/issues/796))
 
 The configured `cluster.replication_fetch_timeout_ms` did not reliably bound a file fetch. Reading the acknowledgement header could replace the context deadline with a longer timeout, and the subsequent body transfer could block indefinitely if a peer stopped sending data.
