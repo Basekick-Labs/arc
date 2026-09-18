@@ -133,7 +133,23 @@ func (h *QueryHandler) tryArcxRouterArrow(c *fiber.Ctx, execCtx context.Context,
 	// deferred block below, which runs on the way out of a panic too. No
 	// registry disposition is needed: the Arrow endpoint registers the query
 	// only after this hook declines (query_arrow.go), so nothing is listed.
-	fctx.SetBodyStreamWriter(h.safeStream("arcx_serve_arrow_ipc", nil, func(w *bufio.Writer) {
+	// Register the trailer before committing the response. Its value must be
+	// published by the connection goroutine, not the async stream writer.
+	if err := fctx.Response.Header.AddTrailer(arrowStreamTruncatedTrailer); err != nil {
+		arrowTrailerWarnOnce.Do(func() {
+			h.logger.Warn().Err(err).Str("trailer", arrowStreamTruncatedTrailer).
+				Msg("Failed to register arcx Arrow truncation trailer")
+		})
+	}
+	trailers := newResponseTrailers()
+
+	// A recovered panic must not leave a decodable but incomplete stream.
+	var streamW *bufio.Writer
+	h.setBodyStreamWithTrailers(fctx, "arcx_serve_arrow_ipc", trailers, func() {
+		poisonArrowStream(streamW, h.logger)
+		trailers.setIfAbsent(arrowStreamTruncatedTrailer, "stream writer panicked")
+	}, func(w *bufio.Writer) {
+		streamW = w
 		// The async writer OWNS cancel — it runs AFTER the handler returns, so the caller must
 		// NOT cancel eagerly (that would cancel execCtx while we're still streaming → the
 		// select below breaks immediately → schema-only + spurious "cancel mid-stream").
@@ -200,7 +216,7 @@ func (h *QueryHandler) tryArcxRouterArrow(c *fiber.Ctx, execCtx context.Context,
 			m.IncQueryRows(int64(rows))
 			m.RecordQueryLatency(time.Since(start).Microseconds())
 		}
-	}))
+	})
 	return true
 }
 

@@ -429,6 +429,17 @@ predate that fix and #978.
 
 ## Bug fixes
 
+## Experimental arcx Arrow IPC streams signal writer panics ([#846](https://github.com/Basekick-Labs/arc/issues/846))
+
+When the experimental arcx Arrow IPC stream writer panics, the response now
+includes an invalid Arrow IPC message marker and an `Arc-Stream-Truncated`
+trailer. Clients can detect the incomplete result instead of accepting a
+stream that ends at a batch boundary as complete. The standard DuckDB Arrow
+path is unchanged.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir)
+for [#846](https://github.com/Basekick-Labs/arc/issues/846).
+
 ### Arc no longer overrides DuckDB's own container-aware memory and thread limits for the query engine ([#1026](https://github.com/Basekick-Labs/arc/issues/1026))
 
 **If you run Arc in a container with a memory limit, this changes how much memory DuckDB is allowed, and you should read on.**
