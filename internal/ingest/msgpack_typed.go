@@ -108,6 +108,8 @@ func (d *MessagePackDecoder) tryDecodeColumnarTyped(data []byte) (*TypedColumnar
 
 	var (
 		measurement    string
+		tagKeys        []string
+		haveTagKeys    bool
 		haveM, haveCol bool
 		typed          map[string]interface{}
 		validity       map[string][]bool
@@ -149,6 +151,32 @@ func (d *MessagePackDecoder) tryDecodeColumnarTyped(data []byte) (*TypedColumnar
 			}
 			typed, validity, numRecords, sanitized = t, v, n, s
 			haveCol = true
+		case "tag_keys":
+			if haveTagKeys {
+				return nil, false
+			}
+			haveTagKeys = true
+
+			code, err := dec.PeekCode()
+			if err != nil || !isArrayCode(code) {
+				return nil, false
+			}
+			n, err := dec.DecodeArrayLen()
+			if err != nil || n > 256 {
+				return nil, false
+			}
+			tagKeys = make([]string, 0, n)
+			for i := 0; i < n; i++ {
+				code, err := dec.PeekCode()
+				if err != nil || !isStrCode(code) {
+					return nil, false
+				}
+				tag, err := dec.DecodeString()
+				if err != nil {
+					return nil, false
+				}
+				tagKeys = append(tagKeys, tag)
+			}
 		default:
 			if err := dec.Skip(); err != nil {
 				return nil, false
@@ -184,9 +212,10 @@ func (d *MessagePackDecoder) tryDecodeColumnarTyped(data []byte) (*TypedColumnar
 	}
 
 	batch := &TypedColumnBatch{
-		Data:      typed,
-		Validity:  validity,
-		Signature: getColumnSignature(typed),
+		Data:       typed,
+		Validity:   validity,
+		TagColumns: tagKeys,
+		Signature:  getColumnSignature(typed),
 	}
 	return &TypedColumnarRecord{
 		Measurement: measurement,
