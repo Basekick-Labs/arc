@@ -398,6 +398,14 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### ListStaged reported partials its own DeleteStaged refused ([#772](https://github.com/Basekick-Labs/arc/issues/772))
+
+`ListStaged` walked for `*.part` files and reported the stripped key to callers, but `DeleteStaged` resolves that key through the same validation `ValidateKey` applies to every other key. A partial left behind by an older Arc version could belong to a key that is illegal under today's contract (for example one containing a backslash), so `ListStaged` reported it and `DeleteStaged` then refused it. `reclaimStagedPartials`, which `DROP DATABASE` uses to clean up abandoned partials, pipes one directly into the other, so it logged a warning for that file on every run and never reclaimed it.
+
+`ListStaged` now applies the same validation `DeleteStaged` applies before reporting an entry, so every key it returns is one `DeleteStaged` will accept. `DeleteStaged` still cannot remove a partial with an illegal key, but it is no longer silently mishandled: it now surfaces through `ListUnusable`, which reports exactly what the ordinary listings drop, instead of being reported by `ListStaged` and refused on every reclaim attempt.
+
+Contributed by [@pujitha24](https://github.com/pujitha24) in [#PR](https://github.com/Basekick-Labs/arc/pull/PR).
+
 ### Peer file fetches now respect the overall timeout ([#796](https://github.com/Basekick-Labs/arc/issues/796))
 
 The configured `cluster.replication_fetch_timeout_ms` did not reliably bound a file fetch. Reading the acknowledgement header could replace the context deadline with a longer timeout, and the subsequent body transfer could block indefinitely if a peer stopped sending data.

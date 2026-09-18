@@ -173,6 +173,46 @@ func TestStagedPartialOfANowReservedKeyIsReclaimable(t *testing.T) {
 	}
 }
 
+// TestListStagedOmitsWhatDeleteStagedWouldRefuse covers #772. A partial can
+// belong to a key that fails validateKeyBody outright (not merely the
+// reserved-suffix case TestStagedPartialOfANowReservedKeyIsReclaimable
+// covers), such as one containing a backslash. ListStaged must not report a
+// key DeleteStaged then refuses, or reclaimStagedPartials logs the same
+// warning on every run and never reclaims the file. ListUnusable is where
+// such a file is reported instead.
+func TestListStagedOmitsWhatDeleteStagedWouldRefuse(t *testing.T) {
+	dir := t.TempDir()
+	b, _ := NewLocalBackend(dir, zerolog.Nop())
+	ctx := context.Background()
+
+	// Written behind the backend's back, as an older version could have left
+	// it: a backslash is a plain filesystem character, but validateKeyBody
+	// refuses it because Azure treats it as a path separator.
+	if err := os.MkdirAll(filepath.Join(dir, "db"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	illegalPath := filepath.Join(dir, "db", "weird\\name"+PartSuffix)
+	if err := os.WriteFile(illegalPath, []byte("ORPHAN"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	staged, err := b.ListStaged(ctx, "db/")
+	if err != nil {
+		t.Fatalf("ListStaged: %v", err)
+	}
+	if len(staged) != 0 {
+		t.Fatalf("ListStaged = %+v, want none: DeleteStaged refuses every one of these keys", staged)
+	}
+
+	unusable, err := b.ListUnusable(ctx, "db/")
+	if err != nil {
+		t.Fatalf("ListUnusable: %v", err)
+	}
+	if len(unusable) != 1 || unusable[0].Path != "db/weird\\name.part" {
+		t.Fatalf("ListUnusable = %+v, want the one file ListStaged dropped", unusable)
+	}
+}
+
 // TestKeyLengthLeavesRoomForTheStagingSuffix pins that a key the contract
 // accepts can actually be written. At exactly the segment limit the staging
 // file overflowed the filesystem's own limit and the write failed.
