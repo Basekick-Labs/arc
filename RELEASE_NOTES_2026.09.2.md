@@ -2,6 +2,17 @@
 
 > **Status:** Planned — October 2026 patch release.
 
+## New: MessagePack binary columns in Parquet ([#440](https://github.com/Basekick-Labs/arc/issues/440))
+
+Columnar MessagePack ingest now accepts binary values and stores them as Arrow
+Binary / Parquet BYTE_ARRAY without converting their bytes to UTF-8 text.
+Nulls and valid empty byte sequences remain distinct. Binary columns are
+supported through buffer merging, sorting and hour-partition splitting.
+
+The typed MessagePack fast path continues to fall back to the generic decoder
+for binary payloads. This change does not emit GeoParquet metadata, declare
+geometry types, configure DuckDB extensions or add spatial indexes.
+
 ## New: administrative cluster file deletion (`DELETE /api/v1/cluster/files`) ([#830](https://github.com/Basekick-Labs/arc/pull/830))
 
 A new administrative endpoint `DELETE /api/v1/cluster/files?path=...&confirm=true` allows cluster operators to remove an entry from the cluster-wide Raft manifest.
