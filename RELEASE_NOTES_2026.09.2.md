@@ -398,6 +398,16 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### Correct stale-manifest recovery documentation ([#750](https://github.com/Basekick-Labs/arc/issues/750))
+
+Correct documentation that claimed compaction manifests older than seven
+days were automatically deleted. Age only triggers a warning; recovery
+still validates the output and follows its normal cleanup and retry rules.
+A regression test confirms that an eight-day-old manifest with a valid
+output still completes input cleanup. Runtime behaviour is unchanged.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#921](https://github.com/Basekick-Labs/arc/pull/921).
+
 ### Peer file fetches now respect the overall timeout ([#796](https://github.com/Basekick-Labs/arc/issues/796))
 
 The configured `cluster.replication_fetch_timeout_ms` did not reliably bound a file fetch. Reading the acknowledgement header could replace the context deadline with a longer timeout, and the subsequent body transfer could block indefinitely if a peer stopped sending data.
