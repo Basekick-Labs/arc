@@ -412,7 +412,7 @@ and the lock is released. Single-file operations retain their existing
 validation and callback behavior. A regression test reproduces intermediate
 visibility before the fix and verifies the completed manifest after it.
 
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#__PR_NUMBER__](https://github.com/Basekick-Labs/arc/pull/__PR_NUMBER__).
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#910](https://github.com/Basekick-Labs/arc/pull/910).
 
 ### Peer file fetches now respect the overall timeout ([#796](https://github.com/Basekick-Labs/arc/issues/796))
 
