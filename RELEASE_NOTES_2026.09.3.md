@@ -561,6 +561,16 @@ predate that fix and #978.
 
 ## Bug fixes
 
+### Reclaim unreferenced Iceberg manifest metadata ([#835](https://github.com/Basekick-Labs/arc/issues/835))
+
+Following successful Iceberg snapshot publication, reclaim manifest-list and
+manifest Avro metadata files that are over seven days old and not referenced
+by current or retained catalog metadata. If references cannot be read or
+listings change, skip cleanup; this sweep never deletes Parquet data files.
+The separate live manifest-list growth finding remains open.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#923](https://github.com/Basekick-Labs/arc/pull/923).
+
 ### A node that rejoins through a Raft snapshot now removes the replicas the cluster deleted while it was away ([#962](https://github.com/Basekick-Labs/arc/issues/962))
 
 On a per-node-storage cluster every node unlinks its local copy of a file when
