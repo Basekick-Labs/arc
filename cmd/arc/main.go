@@ -1278,6 +1278,7 @@ func main() {
 			StorageBackend:   storageBackend,
 			LockManager:      lockManager,
 			MaxConcurrent:    cfg.Compaction.MaxConcurrent,
+			CycleTimeout:     cfg.Compaction.CycleTimeout,
 			MaxFilesPerBatch: cfg.Compaction.MaxFilesPerBatch,
 			// Per-subprocess DuckDB bounds. Config resolves the "auto"
 			// sentinels at load time: memory_limit defaults to
