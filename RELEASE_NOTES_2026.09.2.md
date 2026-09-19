@@ -478,8 +478,7 @@ and kept out of `databases`. They stay inside `total_files` and
 every Parquet object it finds, and an anchor left out of it would have
 hidden a missing data file. Restore is unchanged: it copies every object
 under `data/` back, anchors included. Backups written before this release
-restore the same way. Compaction's recovery manifests under
-`_compaction_state/` are still not backed up; that is tracked as #930.
+restore the same way.
 
 ### Empty time ranges can be answered from the schema anchor (experimental, [#928](https://github.com/Basekick-Labs/arc/issues/928))
 
@@ -512,6 +511,48 @@ measurement passes through this node's ingest: a cluster whose nodes have
 separate storage and receive each other's files by replication, or a restore
 into an existing measurement, can leave a column unregistered on the
 receiving node, so keep the flag off there or rebuild after such events.
+
+### A restore no longer serves compacted rows twice ([#930](https://github.com/Basekick-Labs/arc/issues/930))
+
+A compaction job writes its crash-recovery manifest under
+`_compaction_state/`, uploads the compacted output, deletes the input files,
+and only then deletes the manifest. Backups copied Parquet files and Iceberg
+metadata but never those manifests, so a backup whose listing fell between
+the upload and the input deletion held both the output and its inputs with
+nothing to reconcile them. A restore put both back, and every row of that
+partition was served twice, permanently.
+
+Backups now copy the compaction state (manifests and parked `.quarantined`
+manifests) before the data files. The order matters: a job that finishes
+during the copy then leaves the backup with the manifest and the output,
+which recovery completes, never with the output and the inputs and no
+manifest. A manifest that cannot be read while it still exists fails the
+backup rather than being skipped, for the same reason. The state is reported
+in the backup manifest's `compaction_state_files` and counted with the other
+auxiliary files, not in `total_files`.
+
+The restore reconciles the state itself rather than waiting for a
+compaction cycle, because a cycle may be disabled on the restored node or may
+race the restore. Before copying, it reads the backed-up manifests and does
+not restore the inputs of any manifest whose output the backup holds intact
+(present, and of the size the manifest recorded); the restore progress
+reports them as `consumed_inputs_skipped` and the restored manifests as
+`compaction_state_restored`. The next compaction cycle finds the output,
+tolerates the absent inputs, fires the receipt hooks and retires the
+manifest. A manifest whose output the backup does not hold, or holds
+damaged, keeps its inputs, and recovery deletes the manifest (and a damaged
+output) so compaction retries. If metadata was restored as well, restart
+before that cycle so the staged metadata is applied first; on an edge sync
+hub, a cycle that runs before the output has landed retires the manifest
+without marking receipts, which the hub's discovery then covers. A restored
+manifest older than seven days logs compaction's stale warning once when
+processed; that is expected after a restore.
+
+This applies to backups taken with this release; a mid-compaction backup
+taken by an earlier release has no manifest to reconcile with. Restoring a
+mid-compaction backup onto a store that has since compacted the same
+partition again is a separate, pre-existing duplication that no manifest
+covers.
 
 ### Peer file fetches now respect the overall timeout ([#796](https://github.com/Basekick-Labs/arc/issues/796))
 

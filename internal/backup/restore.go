@@ -2,6 +2,7 @@ package backup
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -221,11 +222,24 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifes
 		return fmt.Errorf("failed to list backup data files: %w", err)
 	}
 
-	// Every object under data/ is restored to its original key, including
-	// the field schema anchors under _schema/ (#927); they are counted in
-	// TotalFiles like any other .parquet object, so the present-vs-inventoried
-	// arithmetic below needs no special case for them.
-	progress.TotalFiles = int64(len(files))
+	// Reconcile compaction state before copying anything (#930). A backup
+	// taken between a compaction job's output upload and its input deletion
+	// holds both; restoring both would serve every row of that partition
+	// twice, until a compaction cycle's recovery deleted the inputs, and
+	// forever if compaction is disabled on the restored node or a cycle
+	// raced the restore. So the backed-up manifests are read first, and the
+	// inputs of every manifest whose output the backup holds are simply not
+	// restored: the restored store then looks exactly like a job that
+	// finished, and recovery on the next cycle finds the output, tolerates
+	// the absent inputs, fires the receipt hooks and deletes the manifest. A
+	// manifest whose output the backup does NOT hold keeps its inputs: that
+	// is a job that never uploaded, and recovery deletes the manifest so
+	// compaction retries. Every restore order is safe this way, because the
+	// inputs never land. Every other object under data/, the field schema
+	// anchors under _schema/ (#927) included, is restored to its original
+	// key.
+	skipInputs := m.consumedInputsInBackup(ctx, dataPrefix, files)
+	progress.TotalFiles = int64(len(files) - len(skipInputs))
 	progress.TotalBytes = manifest.TotalSizeBytes
 
 	// Three ways the listing can under-represent what the manifest promised,
@@ -313,6 +327,10 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifes
 		if destPath == "" || destPath == srcPath {
 			continue
 		}
+		if skipInputs[destPath] {
+			atomic.AddInt64(&progress.ConsumedInputsSkipped, 1)
+			continue
+		}
 
 		// Stream via temp file to avoid loading entire Parquet file into memory
 		bytesWritten, err := m.streamRestoreFile(ctx, srcPath, destPath)
@@ -333,6 +351,9 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifes
 
 		atomic.AddInt64(&progress.ProcessedFiles, 1)
 		atomic.AddInt64(&progress.ProcessedBytes, bytesWritten)
+		if isCompactionState(destPath) && strings.HasSuffix(destPath, ".json") {
+			atomic.AddInt64(&progress.CompactionStateRestored, 1)
+		}
 		// Republish so /status polling sees live counters — published Progress
 		// values are immutable snapshots, not the struct being mutated here.
 		m.setProgress(progress)
@@ -345,7 +366,90 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifes
 		}
 	}
 
+	if n := atomic.LoadInt64(&progress.CompactionStateRestored); n > 0 || len(skipInputs) > 0 {
+		m.logger.Info().
+			Int64("compaction_manifests_restored", n).
+			Int64("consumed_inputs_skipped", atomic.LoadInt64(&progress.ConsumedInputsSkipped)).
+			Msg("Compaction recovery state restored. Inputs already replaced by a backed-up compacted output were not restored; the next compaction cycle completes each restored manifest. If metadata was restored too, restart before that cycle so the staged metadata is applied first; a hub's receipt marks made earlier would be overwritten by the swap. A manifest older than seven days logs a stale warning when processed; that is expected after a restore")
+	}
+
 	return nil
+}
+
+// restoredManifest is the subset of compaction.Manifest the restore needs,
+// decoded here so this package does not import compaction.
+type restoredManifest struct {
+	OutputPath string   `json:"output_path"`
+	OutputSize int64    `json:"output_size"`
+	InputFiles []string `json:"input_files"`
+}
+
+// consumedInputsInBackup reads every recovery manifest in the backup and
+// returns the destination keys of the inputs that must not be restored: those
+// of each manifest whose compacted output the backup holds INTACT, meaning
+// present and of the size the manifest recorded. The size check is what
+// keeps a damaged backup from becoming data loss: recovery deletes an output
+// whose size is wrong (a short copy) together with its manifest, so if the
+// inputs had been left out the partition's rows would be gone; restoring the
+// inputs instead lets recovery take its short-output branch and keep them. A
+// manifest that cannot be read or decoded, or an output whose size cannot be
+// established, contributes nothing (its inputs are restored, and recovery
+// decides later), logged once.
+func (m *Manager) consumedInputsInBackup(ctx context.Context, dataPrefix string, files []string) map[string]bool {
+	present := make(map[string]bool, len(files))
+	var manifests []string
+	for _, f := range files {
+		dest := filepath.ToSlash(strings.TrimPrefix(f, dataPrefix))
+		present[dest] = true
+		if isCompactionState(dest) && strings.HasSuffix(dest, ".json") {
+			manifests = append(manifests, f)
+		}
+	}
+	lister, canSize := m.backupStorage.(storage.ObjectLister)
+	skip := make(map[string]bool)
+	for _, src := range manifests {
+		data, err := m.backupStorage.Read(ctx, src)
+		if err != nil {
+			m.logger.Warn().Err(err).Str("manifest", src).Msg("Cannot read a backed-up compaction manifest; its inputs are restored and left to recovery")
+			continue
+		}
+		var mf restoredManifest
+		if err := json.Unmarshal(data, &mf); err != nil || mf.OutputPath == "" {
+			m.logger.Warn().Err(err).Str("manifest", src).Msg("Cannot decode a backed-up compaction manifest; its inputs are restored and left to recovery")
+			continue
+		}
+		output := filepath.ToSlash(mf.OutputPath)
+		if !present[output] {
+			continue // the job never uploaded: restore its inputs, recovery retries
+		}
+		if !canSize || !m.backupObjectHasSize(ctx, lister, dataPrefix+output, mf.OutputSize) {
+			m.logger.Warn().Str("manifest", src).Str("output", output).Int64("expected_size", mf.OutputSize).
+				Msg("Backed-up compacted output is not intact or cannot be sized; its inputs are restored and recovery will discard the output")
+			continue
+		}
+		for _, in := range mf.InputFiles {
+			in = filepath.ToSlash(in)
+			if present[in] {
+				skip[in] = true
+			}
+		}
+	}
+	return skip
+}
+
+// backupObjectHasSize reports whether the backup object at key has exactly
+// size bytes. Any listing failure is "no".
+func (m *Manager) backupObjectHasSize(ctx context.Context, lister storage.ObjectLister, key string, size int64) bool {
+	objects, err := lister.ListObjects(ctx, key)
+	if err != nil {
+		return false
+	}
+	for _, o := range objects {
+		if filepath.ToSlash(o.Path) == filepath.ToSlash(key) {
+			return o.Size == size
+		}
+	}
+	return false
 }
 
 // streamRestoreFile streams a file from backup storage to data storage via a temp file,

@@ -51,10 +51,13 @@ func TestBackupRestore_SchemaAnchorsAreAuxiliaryIssue927(t *testing.T) {
 			t.Errorf("%s not in backup: %v", k, err)
 		}
 	}
-	// Compaction recovery manifests are still not backed up (#930): pinned
-	// so a change there is deliberate.
-	if ok, _ := backupStore.Exists(ctx, m.BackupID+"/data/"+manifestKey); ok {
-		t.Fatal("compaction state unexpectedly backed up; update #930 and this test")
+	// Compaction recovery state is backed up too (#930), outside the data
+	// inventory.
+	if ok, _ := backupStore.Exists(ctx, m.BackupID+"/data/"+manifestKey); !ok {
+		t.Fatal("compaction state not backed up")
+	}
+	if m.CompactionStateFiles != 1 {
+		t.Fatalf("compaction_state_files=%d", m.CompactionStateFiles)
 	}
 
 	// Restore brings the anchors back byte for byte.

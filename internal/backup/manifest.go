@@ -23,9 +23,11 @@ type Manifest struct {
 	// in SkippedMetadataFiles. (Backups written before that split folded both
 	// into this field.)
 	SkippedFiles int64 `json:"skipped_files,omitempty"`
-	// SkippedMetadataFiles counts Iceberg warehouse metadata files under the
-	// storage root that were listed but could not be read at copy time. They
-	// are copied under data/ but are not part of TotalFiles. Skips from an
+	// SkippedMetadataFiles counts auxiliary files under the storage root
+	// (Iceberg warehouse metadata, compaction recovery state) that were listed
+	// but could not be read at copy time. They are copied under data/ but are
+	// not part of TotalFiles. A compaction manifest whose job finished between
+	// the listing and the copy is the expected case. Skips from an
 	// outside-root warehouse are in IcebergWarehouse.SkippedFiles.
 	SkippedMetadataFiles int64 `json:"skipped_metadata_files,omitempty"`
 	// AuxiliaryFiles counts Parquet objects under a reserved root directory
@@ -35,6 +37,12 @@ type Manifest struct {
 	// but they belong to no database and are absent from Databases (#927).
 	// Manifests written before this field read it as zero.
 	AuxiliaryFiles int64 `json:"auxiliary_files,omitempty"`
+	// CompactionStateFiles counts the objects under _compaction_state/ that
+	// were listed for this backup (#930): the crash-recovery manifests a
+	// restore uses to avoid restoring both a compacted output and the inputs
+	// it replaced, plus parked (.quarantined) manifests. Copied under data/,
+	// not part of TotalFiles. Manifests written before this field read zero.
+	CompactionStateFiles int64 `json:"compaction_state_files,omitempty"`
 	// UnaddressableFiles counts data files that exist in source storage but
 	// that no listing returns, because their key fails the storage key rules.
 	// They were never inventoried and could not be copied, so when this is
@@ -118,6 +126,14 @@ type Progress struct {
 	// SkippedSample names up to unaddressableSampleCap of the backup objects a
 	// restore could not read. Restore only.
 	SkippedSample []string `json:"skipped_sample,omitempty"`
+	// Restore only (#930). ConsumedInputsSkipped counts input files the
+	// backup held alongside the compacted output that replaced them, per a
+	// backed-up recovery manifest; they were deliberately not restored, so
+	// the restored store serves each row once. CompactionStateRestored counts
+	// recovery manifests (.json) put back; the next compaction cycle deletes
+	// each after firing its receipt hooks.
+	ConsumedInputsSkipped   int64 `json:"consumed_inputs_skipped,omitempty"`
+	CompactionStateRestored int64 `json:"compaction_state_restored,omitempty"`
 	// MissingFiles counts data files the backup's manifest inventoried that
 	// are neither listed nor unaddressable in backup storage: they are gone.
 	// Restore only.
