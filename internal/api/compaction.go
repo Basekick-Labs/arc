@@ -135,6 +135,9 @@ func (h *CompactionHandler) getCandidates(c *fiber.Ctx) error {
 // Query parameters:
 //   - tier=hourly,daily (optional, defaults to all enabled tiers)
 //   - database=mydb (optional, defaults to all databases)
+//   - measurement=cpu (optional; requires database)
+//
+// The manual cycle uses the configured compaction.cycle_timeout budget.
 func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 	if h.manager == nil {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
@@ -150,6 +153,21 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 		})
 	}
 
+	// Fiber query strings may alias pooled request memory. Clone values
+	// retained by the asynchronous worker before returning from this handler.
+	dbParam = strings.Clone(dbParam)
+	measurementParam := strings.Clone(c.Query("measurement", ""))
+	if measurementParam != "" && dbParam == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "measurement requires database",
+		})
+	}
+	if measurementParam != "" && !isValidMeasurementName(measurementParam) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Invalid measurement name",
+		})
+	}
+
 	// Parse tier parameter (comma-separated list)
 	tierParam := c.Query("tier", "")
 	var tierNames []string
@@ -160,7 +178,7 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 		for _, part := range parts {
 			tier := strings.TrimSpace(part)
 			if tier != "" {
-				tierNames = append(tierNames, tier)
+				tierNames = append(tierNames, strings.Clone(tier))
 			}
 		}
 	}
@@ -174,7 +192,12 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 		}
 	}
 
-	logEvent := h.logger.Info().Strs("tiers", tierNames)
+	logEvent := h.logger.Info().
+		Strs("tiers", tierNames).
+		Dur("cycle_timeout", h.manager.CycleTimeout)
+	if measurementParam != "" {
+		logEvent = logEvent.Str("measurement", measurementParam)
+	}
 	if dbParam != "" {
 		logEvent = logEvent.Str("database", dbParam)
 	}
@@ -192,13 +215,15 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 
 	// Trigger compaction asynchronously
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), h.manager.CycleTimeout)
 		defer cancel()
 
 		start := time.Now()
 		var cycleID int64
 		var err error
-		if dbParam != "" {
+		if measurementParam != "" {
+			cycleID, err = h.manager.RunCompactionCycleForMeasurement(ctx, dbParam, measurementParam, tierNames)
+		} else if dbParam != "" {
 			cycleID, err = h.manager.RunCompactionCycleForDatabase(ctx, dbParam, tierNames)
 		} else {
 			cycleID, err = h.manager.RunCompactionCycleForTiers(ctx, tierNames)
@@ -229,6 +254,9 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 	}
 	if dbParam != "" {
 		resp["database"] = dbParam
+	}
+	if measurementParam != "" {
+		resp["measurement"] = measurementParam
 	}
 	return c.JSON(resp)
 }

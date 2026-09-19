@@ -18,6 +18,20 @@ import (
 // ErrCycleAlreadyRunning is returned when attempting to start a compaction cycle while one is already in progress
 var ErrCycleAlreadyRunning = errors.New("compaction cycle already running")
 
+// cycleOutcome records only eligible batches actually discovered during
+// this cycle. Unvisited measurements are never counted as unstarted work.
+type cycleOutcome struct {
+	CycleID         int64
+	Status          string
+	Discovered      int64
+	Started         int64
+	Succeeded       int64
+	Failed          int64
+	Interrupted     int64
+	Unstarted       int64
+	DiscoveryErrors int64
+}
+
 // Manager orchestrates compaction jobs across all measurements
 type Manager struct {
 	StorageBackend  storage.Backend
@@ -32,9 +46,10 @@ type Manager struct {
 	// range by NewManager.
 	MaxFilesPerBatch int
 	MaxConcurrent    int
-	TempDirectory    string // Temp directory for compaction files
-	MemoryLimit      string // DuckDB memory limit for EACH subprocess (e.g., "8GB")
-	Threads          int    // DuckDB thread count for EACH subprocess (0 = DuckDB default: all cores)
+	CycleTimeout     time.Duration // Shared budget for scheduled and manual cycles
+	TempDirectory    string        // Temp directory for compaction files
+	MemoryLimit      string        // DuckDB memory limit for EACH subprocess (e.g., "8GB")
+	Threads          int           // DuckDB thread count for EACH subprocess (0 = DuckDB default: all cores)
 	// Phase 4: local-disk directory where compaction subprocesses write
 	// completion manifests for the parent-side CompletionWatcher to pick
 	// up. Empty means "OSS mode, no completion-manifest handoff". Set by
@@ -57,11 +72,12 @@ type Manager struct {
 	cycleID      atomic.Int64
 
 	// Metrics
-	totalJobsCompleted  int
-	totalJobsFailed     int
-	totalFilesCompacted int
-	totalBytesSaved     int64
-	totalManifestsRecov int // Number of manifests recovered
+	totalJobsCompleted   int
+	totalJobsFailed      int
+	totalJobsInterrupted int
+	totalFilesCompacted  int
+	totalBytesSaved      int64
+	totalManifestsRecov  int // Number of manifests recovered
 
 	// Callback invoked after a successful compaction job (in parent process).
 	// Used to invalidate DuckDB and query caches after files are deleted.
@@ -100,8 +116,13 @@ type Manager struct {
 	// it as already-delivered content that must never sync (issue #610).
 	onCompactedOutput func(storageKey string)
 
-	logger zerolog.Logger
-	mu     sync.Mutex
+	// Nil in production. Deterministic cycle tests may inject a batch
+	// runner without starting an external compaction subprocess.
+	compactBatchForTest func(context.Context, Candidate) error
+
+	lastCycle cycleOutcome
+	logger    zerolog.Logger
+	mu        sync.Mutex
 }
 
 // ManagerConfig holds configuration for creating a compaction manager
@@ -115,6 +136,7 @@ type ManagerConfig struct {
 	// clampFilesPerBatch.
 	MaxFilesPerBatch int
 	MaxConcurrent    int
+	CycleTimeout     time.Duration       // Zero selects the backward-compatible 30m default
 	TempDirectory    string              // Temp directory for compaction files
 	MemoryLimit      string              // DuckDB memory limit for EACH subprocess (e.g., "8GB")
 	Threads          int                 // DuckDB thread count for EACH subprocess (0 = DuckDB default: all cores)
@@ -136,6 +158,9 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	}
 	if cfg.MaxConcurrent == 0 {
 		cfg.MaxConcurrent = 2
+	}
+	if cfg.CycleTimeout <= 0 {
+		cfg.CycleTimeout = 30 * time.Minute
 	}
 	// Clamp the batch size once here rather than per-partition, so an
 	// out-of-range configured value produces exactly one warning at startup.
@@ -166,6 +191,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		MinFiles:         cfg.MinFiles,
 		MaxFilesPerBatch: maxFilesPerBatch,
 		MaxConcurrent:    cfg.MaxConcurrent,
+		CycleTimeout:     cfg.CycleTimeout,
 		TempDirectory:    cfg.TempDirectory,
 		MemoryLimit:      cfg.MemoryLimit,
 		Threads:          cfg.Threads,
@@ -582,7 +608,9 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 	// no-time-column skip) changed nothing on storage, and dropping the parquet
 	// metadata + query caches for it would cost every in-flight query a cold
 	// re-read — every cycle, for a partition that skips every cycle.
-	jobSucceeded := err == nil && result.Success
+	jobSucceeded := err == nil && result != nil && result.Success
+	jobInterrupted := errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded)
 	shouldInvalidateCache := jobSucceeded && result.FilesCompacted > 0
 
 	m.mu.Lock()
@@ -590,6 +618,8 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 		m.totalJobsCompleted++
 		m.totalFilesCompacted += result.FilesCompacted
 		m.totalBytesSaved += (result.BytesBefore - result.BytesAfter)
+	} else if jobInterrupted {
+		m.totalJobsInterrupted++
 	} else {
 		m.totalJobsFailed++
 	}
@@ -827,9 +857,21 @@ func (m *Manager) RunCompactionCycleForDatabase(ctx context.Context, database st
 	return m.runCycleInternal(ctx, []string{database}, tierNames)
 }
 
+// RunCompactionCycleForMeasurement restricts discovery to one measurement.
+func (m *Manager) RunCompactionCycleForMeasurement(ctx context.Context, database, measurement string, tierNames []string) (int64, error) {
+	if database == "" || measurement == "" {
+		return 0, fmt.Errorf("database and measurement are required")
+	}
+	return m.runCycleInternalFiltered(ctx, []string{database}, tierNames, measurement)
+}
+
 // runCycleInternal is the shared implementation for compaction cycles.
 // If filterDatabases is non-nil, only those databases are compacted; otherwise all databases are discovered.
 func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string, tierNames []string) (int64, error) {
+	return m.runCycleInternalFiltered(ctx, filterDatabases, tierNames, "")
+}
+
+func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases []string, tierNames []string, filterMeasurement string) (cycleID int64, runErr error) {
 	// Prevent concurrent compaction cycles using atomic compare-and-swap
 	if !m.cycleRunning.CompareAndSwap(false, true) {
 		m.logger.Warn().Msg("Compaction cycle already running, skipping")
@@ -837,7 +879,81 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 	}
 	defer m.cycleRunning.Store(false)
 
-	cycleID := m.cycleID.Add(1)
+	cycleID = m.cycleID.Add(1)
+
+	var active sync.WaitGroup
+	var discovered atomic.Int64
+	var started atomic.Int64
+	var succeeded atomic.Int64
+	var failed atomic.Int64
+	var interrupted atomic.Int64
+	var discoveryErrors atomic.Int64
+
+	// This finalizer also covers every early return. Active workers finish
+	// before the cycle is recorded and before cycleRunning is released.
+	defer func() {
+		active.Wait()
+
+		if cause := ctx.Err(); cause != nil && !errors.Is(runErr, cause) {
+			if runErr == nil {
+				runErr = cause
+			} else {
+				runErr = errors.Join(runErr, cause)
+			}
+		}
+
+		if runErr == nil && (failed.Load() > 0 || discoveryErrors.Load() > 0) {
+			runErr = fmt.Errorf(
+				"compaction cycle: %d batch failures, %d discovery failures",
+				failed.Load(), discoveryErrors.Load(),
+			)
+		}
+
+		status := "completed"
+		switch {
+		case errors.Is(runErr, context.DeadlineExceeded):
+			status = "timed_out"
+		case errors.Is(runErr, context.Canceled):
+			status = "cancelled"
+		case runErr != nil:
+			status = "failed"
+		}
+
+		outcome := cycleOutcome{
+			CycleID:         cycleID,
+			Status:          status,
+			Discovered:      discovered.Load(),
+			Started:         started.Load(),
+			Succeeded:       succeeded.Load(),
+			Failed:          failed.Load(),
+			Interrupted:     interrupted.Load(),
+			DiscoveryErrors: discoveryErrors.Load(),
+		}
+		outcome.Unstarted = outcome.Discovered - outcome.Started
+
+		m.mu.Lock()
+		m.lastCycle = outcome
+		m.mu.Unlock()
+
+		event := m.logger.Info()
+		if runErr != nil {
+			event = m.logger.Warn()
+		}
+		event.Err(runErr).
+			Int64("cycle_id", cycleID).
+			Str("status", status).
+			Int64("discovered_batches", outcome.Discovered).
+			Int64("started_batches", outcome.Started).
+			Int64("succeeded_batches", outcome.Succeeded).
+			Int64("failed_batches", outcome.Failed).
+			Int64("interrupted_batches", outcome.Interrupted).
+			Int64("unstarted_batches", outcome.Unstarted).
+			Int64("discovery_errors", outcome.DiscoveryErrors).
+			Msg("Compaction cycle finished")
+	}()
+	if err := ctx.Err(); err != nil {
+		return cycleID, err
+	}
 
 	// Require explicit tier names
 	if len(tierNames) == 0 {
@@ -858,6 +974,9 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 	if m.ManifestManager != nil {
 		recovered, err := m.ManifestManager.RecoverOrphanedManifests(ctx, m.notifyCompactedOutput, m.notifyConsumedInputs)
 		if err != nil {
+			if ctx.Err() != nil {
+				return cycleID, ctx.Err()
+			}
 			m.logger.Warn().Err(err).Msg("Manifest recovery encountered errors")
 		}
 		if recovered > 0 {
@@ -893,12 +1012,26 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 	}
 
 	databases = m.expandNamespaces(ctx, databases)
+	if err := ctx.Err(); err != nil {
+		return cycleID, err
+	}
 
 	// Build database -> measurements map to avoid repeated lookups
 	dbMeasurements := make(map[string][]string)
 	for _, database := range databases {
+		if err := ctx.Err(); err != nil {
+			return cycleID, err
+		}
+		if filterMeasurement != "" {
+			dbMeasurements[database] = []string{filterMeasurement}
+			continue
+		}
 		measurements, err := m.listMeasurements(ctx, database)
 		if err != nil {
+			if ctx.Err() != nil {
+				return cycleID, ctx.Err()
+			}
+			discoveryErrors.Add(1)
 			m.logger.Error().Err(err).
 				Str("database", database).
 				Msg("Failed to list measurements")
@@ -909,15 +1042,15 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 
 	// Process tiers sequentially to maintain hierarchy (hourly -> daily)
 	// This ensures lower tiers complete before higher tiers run
-	totalCandidates := 0
-	totalErrors := 0
-
 	// Listings are deliberately NOT shared across tiers here, unlike in
 	// FindCandidates: hourly jobs delete their inputs and write their
 	// `_compacted` outputs, and the cycle waits for the whole tier before
 	// daily starts, so a listing taken for hourly is stale by the time daily
 	// would read it. Each tier lists the measurement itself (#316).
 	for _, tier := range m.Tiers {
+		if err := ctx.Err(); err != nil {
+			return cycleID, err
+		}
 		if !tier.IsEnabled() {
 			continue
 		}
@@ -943,8 +1076,10 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 		sem := make(chan struct{}, m.MaxConcurrent)
 		var wg sync.WaitGroup
 		var tierCandidateCount int
-		var errCount int
-		var errMu sync.Mutex
+		tierStartStarted := started.Load()
+		tierStartSucceeded := succeeded.Load()
+		tierStartFailed := failed.Load()
+		tierStartInterrupted := interrupted.Load()
 
 		for _, database := range databases {
 			measurements := dbMeasurements[database]
@@ -964,6 +1099,11 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 
 				candidates, err := tier.FindCandidates(ctx, database, meas)
 				if err != nil {
+					if ctx.Err() != nil {
+						wg.Wait()
+						return cycleID, ctx.Err()
+					}
+					discoveryErrors.Add(1)
 					m.logger.Error().Err(err).
 						Str("database", database).
 						Str("measurement", meas).
@@ -974,6 +1114,10 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 
 				// Process this measurement's candidates immediately
 				for _, candidate := range candidates {
+					if err := ctx.Err(); err != nil {
+						wg.Wait()
+						return cycleID, err
+					}
 					// A slash-carrying database is by construction a
 					// pseudo-database from the namespace expander — received
 					// data the delivery gate must not defer (#619 F2).
@@ -982,7 +1126,16 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 					}
 
 					// Filter out files that are tracked by manifests (pending compaction)
-					filteredCandidate, shouldProcess := m.filterCandidateFiles(ctx, candidate)
+					filteredCandidate, shouldProcess, manifestErr := m.filterCandidateFilesWithError(ctx, candidate)
+					if err := ctx.Err(); err != nil {
+						wg.Wait()
+						return cycleID, err
+					}
+					if manifestErr != nil {
+						// The candidate stays excluded. Record genuine manifest
+						// failures without counting expired-context errors.
+						discoveryErrors.Add(1)
+					}
 					if !shouldProcess {
 						m.logger.Debug().
 							Str("partition", candidate.PartitionPath).
@@ -996,6 +1149,10 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 					// the design, not a failure — the partition compacts
 					// once its files have synced.
 					filteredCandidate, shouldProcess = m.filterSyncEligibility(ctx, filteredCandidate, tier)
+					if err := ctx.Err(); err != nil {
+						wg.Wait()
+						return cycleID, err
+					}
 					if !shouldProcess {
 						continue
 					}
@@ -1012,20 +1169,54 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 					}
 
 					tierCandidateCount += len(batches)
+					discovered.Add(int64(len(batches)))
 
+					// Capacity acquisition must not outlive the cycle budget.
+					select {
+					case sem <- struct{}{}:
+					case <-ctx.Done():
+						wg.Wait()
+						return cycleID, ctx.Err()
+					}
+					// If both select arms were ready, cancellation still wins
+					// before a new worker can be launched.
+					if err := ctx.Err(); err != nil {
+						<-sem
+						wg.Wait()
+						return cycleID, err
+					}
 					wg.Add(1)
-					sem <- struct{}{} // Acquire semaphore
+					active.Add(1)
 
 					// Run all batches for the same partition sequentially within a single goroutine.
 					// This prevents race conditions where batch N tries to compact files that were
 					// already deleted by batch N-1. Different partitions can still run in parallel.
 					go func(partitionBatches []Candidate, partition string) {
 						defer wg.Done()
+						defer active.Done()
 						defer func() { <-sem }() // Release semaphore
 
 						for _, batch := range partitionBatches {
-							// Use adaptive compaction with automatic batch splitting on failure
-							if err := m.compactFilesAdaptively(ctx, batch, batch.Files, 0, ""); err != nil {
+							if ctx.Err() != nil {
+								return
+							}
+							// Count a batch only when its execution actually starts.
+							started.Add(1)
+
+							var err error
+							if m.compactBatchForTest != nil {
+								err = m.compactBatchForTest(ctx, batch)
+							} else {
+								err = m.compactFilesAdaptively(ctx, batch, batch.Files, 0, "")
+							}
+
+							if err != nil {
+								if errors.Is(err, context.Canceled) ||
+									errors.Is(err, context.DeadlineExceeded) {
+									interrupted.Add(1)
+									return
+								}
+								failed.Add(1)
 								m.logger.Error().Err(err).
 									Str("partition", batch.PartitionPath).
 									Str("tier", tierName).
@@ -1033,10 +1224,10 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 									Int("total_batches", batch.TotalBatches).
 									Int64("cycle_id", cycleID).
 									Msg("Compaction failed")
-								errMu.Lock()
-								errCount++
-								errMu.Unlock()
-								// Continue with next batch - don't fail entire partition
+								// Continue after genuine failures, preserving existing
+								// per-partition batch behavior.
+							} else {
+								succeeded.Add(1)
 							}
 						}
 					}(batches, candidate.PartitionPath)
@@ -1047,6 +1238,9 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 
 		// Wait for all jobs in this tier to complete before moving to next tier
 		wg.Wait()
+		if err := ctx.Err(); err != nil {
+			return cycleID, err
+		}
 
 		if tierCandidateCount == 0 {
 			m.logger.Info().
@@ -1056,25 +1250,21 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 			continue
 		}
 
-		totalCandidates += tierCandidateCount
-		totalErrors += errCount
+		tierStarted := started.Load() - tierStartStarted
 
 		m.logger.Info().
 			Int64("cycle_id", cycleID).
 			Str("tier", tierName).
-			Int("total", tierCandidateCount).
-			Int("succeeded", tierCandidateCount-errCount).
-			Int("failed", errCount).
+			Int("discovered", tierCandidateCount).
+			Int64("started", tierStarted).
+			Int64("succeeded", succeeded.Load()-tierStartSucceeded).
+			Int64("failed", failed.Load()-tierStartFailed).
+			Int64("interrupted", interrupted.Load()-tierStartInterrupted).
+			Int64("unstarted", int64(tierCandidateCount)-tierStarted).
 			Msg("Tier processing complete")
 	}
 
-	m.logger.Info().
-		Int64("cycle_id", cycleID).
-		Int("total_candidates", totalCandidates).
-		Int("total_succeeded", totalCandidates-totalErrors).
-		Int("total_failed", totalErrors).
-		Msg("Compaction cycle complete")
-
+	// The finalizer records the terminal outcome and complete counters.
 	return cycleID, nil
 }
 
@@ -1224,19 +1414,33 @@ func (m *Manager) GetSortKeys(measurement string) []string {
 
 // filterCandidateFiles removes files that are tracked by manifests from a candidate.
 // Returns the filtered candidate and whether it should still be processed.
-func (m *Manager) filterCandidateFiles(ctx context.Context, candidate Candidate) (Candidate, bool) {
+// filterCandidateFiles preserves the existing two-value helper API.
+func (m *Manager) filterCandidateFiles(
+	ctx context.Context, candidate Candidate,
+) (Candidate, bool) {
+	filtered, ok, _ := m.filterCandidateFilesWithError(ctx, candidate)
+	return filtered, ok
+}
+
+func (m *Manager) filterCandidateFilesWithError(ctx context.Context, candidate Candidate) (Candidate, bool, error) {
+	if ctx.Err() != nil {
+		return candidate, false, ctx.Err()
+	}
 	if m.ManifestManager == nil {
-		return candidate, len(candidate.Files) > 0
+		return candidate, len(candidate.Files) > 0, nil
 	}
 
 	filesInManifests, err := m.ManifestManager.GetFilesInManifests(ctx)
 	if err != nil {
+		if ctx.Err() != nil {
+			return candidate, false, ctx.Err()
+		}
 		m.logger.Warn().Err(err).Msg("Failed to get files in manifests, skipping partition to avoid re-compaction")
-		return candidate, false
+		return candidate, false, err
 	}
 
 	if len(filesInManifests) == 0 {
-		return candidate, len(candidate.Files) > 0
+		return candidate, len(candidate.Files) > 0, nil
 	}
 
 	// Filter out files that are in manifests
@@ -1261,7 +1465,7 @@ func (m *Manager) filterCandidateFiles(ctx context.Context, candidate Candidate)
 	candidate.Files = filteredFiles
 	candidate.FileCount = len(filteredFiles)
 
-	return candidate, len(filteredFiles) > 0
+	return candidate, len(filteredFiles) > 0, nil
 }
 
 // Stats returns compaction statistics
@@ -1272,12 +1476,24 @@ func (m *Manager) Stats() map[string]interface{} {
 	stats := map[string]interface{}{
 		"total_jobs_completed":    m.totalJobsCompleted,
 		"total_jobs_failed":       m.totalJobsFailed,
+		"total_jobs_interrupted":  m.totalJobsInterrupted,
 		"total_files_compacted":   m.totalFilesCompacted,
 		"total_bytes_saved":       m.totalBytesSaved,
 		"total_bytes_saved_mb":    float64(m.totalBytesSaved) / 1024 / 1024,
 		"total_manifests_recover": m.totalManifestsRecov,
 		"cycle_running":           m.cycleRunning.Load(),
 		"current_cycle_id":        m.cycleID.Load(),
+		"last_cycle": map[string]interface{}{
+			"cycle_id":            m.lastCycle.CycleID,
+			"status":              m.lastCycle.Status,
+			"discovered_batches":  m.lastCycle.Discovered,
+			"started_batches":     m.lastCycle.Started,
+			"succeeded_batches":   m.lastCycle.Succeeded,
+			"failed_batches":      m.lastCycle.Failed,
+			"interrupted_batches": m.lastCycle.Interrupted,
+			"unstarted_batches":   m.lastCycle.Unstarted,
+			"discovery_errors":    m.lastCycle.DiscoveryErrors,
+		},
 	}
 
 	// Add recent jobs (last 10)

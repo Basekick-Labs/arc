@@ -88,6 +88,16 @@ default_sort_keys = ""
 [compaction]
 enabled = true
 
+# Maximum wall-clock budget for ONE scheduled or manual compaction cycle.
+# Default: 30m. Positive Go duration syntax: 90s, 30m, 2h, 2h15m.
+# Environment override: ARC_COMPACTION_CYCLE_TIMEOUT=2h
+# Zero, negative and malformed durations are rejected at startup.
+# This changes neither peak memory usage nor concurrency/threads/batch size;
+# a larger timeout does not guarantee completion of arbitrary workloads.
+# Overlapping scheduled ticks are skipped; a manual trigger during a running
+# cycle returns HTTP 409. No second cycle runs concurrently in one manager.
+# cycle_timeout = "30m"
+
 # Hourly
 hourly_enabled = true
 hourly_schedule = "5 * * * *"

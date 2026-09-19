@@ -398,6 +398,17 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### Configurable compaction cycle budget and cancellation ([#915](https://github.com/Basekick-Labs/arc/issues/915))
+
+Scheduled and manual compaction use the same configurable cycle deadline
+(`compaction.cycle_timeout`, default `30m`). Cancellation stops new work,
+waits for active workers and records separate completed, failed, interrupted
+and discovered-but-unstarted batch counts. Manual execution supports
+`POST /api/v1/compaction/trigger?database=db&measurement=cpu`, with `tier`
+remaining optional. The measurement filter requires a valid database.
+Increasing the deadline does not reduce peak memory demand or guarantee
+completion.
+
 ### Peer file fetches now respect the overall timeout ([#796](https://github.com/Basekick-Labs/arc/issues/796))
 
 The configured `cluster.replication_fetch_timeout_ms` did not reliably bound a file fetch. Reading the acknowledgement header could replace the context deadline with a longer timeout, and the subsequent body transfer could block indefinitely if a peer stopped sending data.

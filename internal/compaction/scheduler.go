@@ -209,9 +209,11 @@ func (s *Scheduler) runCompaction() {
 	}
 
 	startTime := time.Now()
-	s.logger.Info().Msg("Triggering scheduled compaction")
+	s.logger.Info().
+		Dur("cycle_timeout", s.manager.CycleTimeout).
+		Msg("Triggering scheduled compaction")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), s.manager.CycleTimeout)
 	defer cancel()
 
 	cycleID, err := s.manager.RunCompactionCycleForTiers(ctx, s.tierNames)
