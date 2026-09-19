@@ -398,6 +398,16 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### Tiering namespace extraction rejects backslashes ([#750](https://github.com/Basekick-Labs/arc/issues/750))
+
+Query path extraction previously converted backslashes to forward slashes,
+potentially selecting tiering paths for a different database or measurement.
+Extraction now rejects those invalid paths without changing their identity.
+Regression tests cover invalid and valid relative, absolute, S3 and Azure
+paths.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#917](https://github.com/Basekick-Labs/arc/pull/917).
+
 ### Peer file fetches now respect the overall timeout ([#796](https://github.com/Basekick-Labs/arc/issues/796))
 
 The configured `cluster.replication_fetch_timeout_ms` did not reliably bound a file fetch. Reading the acknowledgement header could replace the context deadline with a longer timeout, and the subsequent body transfer could block indefinitely if a peer stopped sending data.
