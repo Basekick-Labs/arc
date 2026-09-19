@@ -398,6 +398,14 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### Clarify compaction database-name sanitization ([#750](https://github.com/Basekick-Labs/arc/issues/750))
+
+Correct the documentation of sanitizeDBForName: replacing slashes with dots
+produces a path-safe token, not a unique database identity. Spoke identifiers
+may contain dots, so distinct pseudo-database names can produce the same
+token. Add a regression test documenting this collision. Runtime behaviour
+is unchanged.
+
 ### Peer file fetches now respect the overall timeout ([#796](https://github.com/Basekick-Labs/arc/issues/796))
 
 The configured `cluster.replication_fetch_timeout_ms` did not reliably bound a file fetch. Reading the acknowledgement header could replace the context deadline with a longer timeout, and the subsequent body transfer could block indefinitely if a peer stopped sending data.

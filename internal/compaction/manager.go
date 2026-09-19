@@ -382,15 +382,15 @@ func (m *Manager) expandNamespaces(ctx context.Context, databases []string) []st
 	return out
 }
 
-// sanitizeDBForName maps a database name to a single path-safe token for
-// job IDs (which also name temp directories and cluster completion-manifest
-// files — validateJobID REJECTS path separators, and an unsanitized slash
-// would fail every spoke-namespace compaction post-upload in cluster mode).
-// The slash maps to "." — a character no legal Arc database name may
-// contain (letter-first, then [A-Za-z0-9_-]), so a pseudo-database
-// "rocket-01/telemetry" can never collide with a real database named
-// "rocket-01_telemetry" in any name this produces. Plain names pass
-// through unchanged.
+// sanitizeDBForName replaces slashes with dots so the database portion of
+// a job ID is one path segment. Job IDs also name temporary directories and
+// completion-manifest files; validateJobID rejects path separators.
+//
+// This is NOT a unique database encoding. Spoke IDs may contain dots, so
+// "rocket.01/telemetry" and "rocket/01.telemetry" both become
+// "rocket.01.telemetry". Never use this token alone as a database identity.
+// Manager-generated job IDs also include the folded partition path, which
+// differs for this example. The original database name is not changed.
 func sanitizeDBForName(database string) string {
 	return strings.ReplaceAll(database, "/", ".")
 }

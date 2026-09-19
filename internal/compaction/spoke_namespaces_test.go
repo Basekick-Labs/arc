@@ -141,8 +141,8 @@ func TestIsHourLevelFile(t *testing.T) {
 	}
 }
 
-// Sanitized names are collision-free against legal database names and carry
-// no path separators (cluster completion manifests REJECT them).
+// Sanitized names contain no path separators, but the slash-to-dot mapping
+// is not injective for pseudo-database names. Document both properties.
 func TestSanitizeDBForName(t *testing.T) {
 	if got := sanitizeDBForName("telemetry"); got != "telemetry" {
 		t.Errorf("plain = %q", got)
@@ -151,9 +151,18 @@ func TestSanitizeDBForName(t *testing.T) {
 	if got != "rocket-01.telemetry" {
 		t.Errorf("pseudo = %q", got)
 	}
-	// "." is illegal in database names, so no legal database can collide.
+	// This ordinary database differs; that alone does not establish
+	// uniqueness across all pseudo-database names.
 	if got == sanitizeDBForName("rocket-01_telemetry") {
-		t.Error("sanitized pseudo collides with a legal database name")
+		t.Error("sanitized pseudo collides with this ordinary database")
+	}
+
+	// Dotted spoke identifiers demonstrate why the sanitized token must
+	// never be used as the sole database identity.
+	a := sanitizeDBForName("rocket.01/telemetry")
+	b := sanitizeDBForName("rocket/01.telemetry")
+	if a != "rocket.01.telemetry" || a != b {
+		t.Fatalf("expected documented collision, got %q and %q", a, b)
 	}
 }
 
