@@ -398,6 +398,19 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### Fallback compaction job IDs support spoke namespaces ([#750](https://github.com/Basekick-Labs/arc/issues/750))
+
+When a compaction job was created without an explicit JobID, its fallback ID
+included the raw database name. Edge-sync pseudo-databases contain a slash,
+so the generated ID failed completion-manifest validation and could create
+an unintended nested temporary directory.
+
+Fallback IDs now use the existing database-name sanitiser. The original
+database value and explicitly supplied JobIDs remain unchanged. Regression
+tests cover spoke namespaces, ordinary databases and caller-supplied IDs.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#__PR_NUMBER__](https://github.com/Basekick-Labs/arc/pull/__PR_NUMBER__).
+
 ### Peer file fetches now respect the overall timeout ([#796](https://github.com/Basekick-Labs/arc/issues/796))
 
 The configured `cluster.replication_fetch_timeout_ms` did not reliably bound a file fetch. Reading the acknowledgement header could replace the context deadline with a longer timeout, and the subsequent body transfer could block indefinitely if a peer stopped sending data.
