@@ -13,6 +13,8 @@ The typed MessagePack fast path continues to fall back to the generic decoder
 for binary payloads. This change does not emit GeoParquet metadata, declare
 geometry types, configure DuckDB extensions or add spatial indexes.
 
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#916](https://github.com/Basekick-Labs/arc/pull/916).
+
 ## New: administrative cluster file deletion (`DELETE /api/v1/cluster/files`) ([#830](https://github.com/Basekick-Labs/arc/pull/830))
 
 A new administrative endpoint `DELETE /api/v1/cluster/files?path=...&confirm=true` allows cluster operators to remove an entry from the cluster-wide Raft manifest.
