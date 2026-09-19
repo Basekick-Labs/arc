@@ -398,6 +398,15 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### Reclaim unreferenced Iceberg manifest metadata ([#835](https://github.com/Basekick-Labs/arc/issues/835))
+
+Following successful Iceberg snapshot publication, reclaim manifest-list and
+manifest Avro metadata files that are over seven days old and not referenced
+by the catalog metadata or any retained metadata JSON version. If references
+cannot be read or listings change, cleanup is skipped; Parquet data files are
+never deleted by this sweep. The separate live-manifest-list growth finding
+in #835 remains open.
+
 ### Peer file fetches now respect the overall timeout ([#796](https://github.com/Basekick-Labs/arc/issues/796))
 
 The configured `cluster.replication_fetch_timeout_ms` did not reliably bound a file fetch. Reading the acknowledgement header could replace the context deadline with a longer timeout, and the subsequent body transfer could block indefinitely if a peer stopped sending data.

@@ -457,7 +457,11 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 		// Already converged — no new snapshot. Still republish the discovery
 		// files: a previous pass may have committed the snapshot but failed to
 		// write them, and this is the path that pass's retry lands on.
-		return e.writeVersionHint(ctx, tbl) && hintOK, nil
+		hintOK = e.writeVersionHint(ctx, tbl) && hintOK
+		if hintOK {
+			e.sweepOrphanManifestMetadata(ctx, tbl, database, measurement)
+		}
+		return hintOK, nil
 	}
 
 	// Metadata-only: files are dropped and added by path in one commit. (Transaction.Delete
@@ -476,12 +480,17 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 			Int("skipped", len(skipped)).Strs("files", skipped).
 			Msg("Iceberg: skipped files that could not be partition-mapped (day-straddling time range)")
 	}
-	// Expire old snapshots (+ orphaned manifests/data) so snapshot history and metadata don't
+	// Expire old snapshots without granting iceberg-go permission to delete Arc data files.
 	// grow unbounded. Best-effort — a failure here doesn't undo the successful reconcile; the
 	// next pass retries. Returns the possibly-newer table so version-hint points at it.
 	committed = e.expireSnapshots(ctx, committed, database, measurement)
 	hintOK = e.writeVersionHint(ctx, committed) && !e.hintFailed()
 	e.pruneOldVersionFiles(ctx, committed)
+	// A successful hint must be published before reclaiming metadata: retained
+	// directory-reader versions and current catalog snapshots are swept together.
+	if hintOK {
+		e.sweepOrphanManifestMetadata(ctx, committed, database, measurement)
+	}
 	e.logger.Info().
 		Str("database", database).Str("measurement", measurement).
 		Int("added", len(toAdd)-len(rewritten)).Int("removed", len(toRemove)-len(rewritten)).
