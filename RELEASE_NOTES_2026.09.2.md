@@ -409,7 +409,7 @@ Fallback IDs now use the existing database-name sanitiser. The original
 database value and explicitly supplied JobIDs remain unchanged. Regression
 tests cover spoke namespaces, ordinary databases and caller-supplied IDs.
 
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#__PR_NUMBER__](https://github.com/Basekick-Labs/arc/pull/__PR_NUMBER__).
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#912](https://github.com/Basekick-Labs/arc/pull/912).
 
 ### Peer file fetches now respect the overall timeout ([#796](https://github.com/Basekick-Labs/arc/issues/796))
 
