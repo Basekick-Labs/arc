@@ -67,7 +67,7 @@ type ManifestManager struct {
 	logger  zerolog.Logger
 	mu      sync.Mutex
 
-	// Cache of manifest paths to input files for quick lookup during candidate filtering
+	// Cache of manifest paths to input and output files for candidate filtering
 	// Key: manifest path, Value: set of input file paths
 	manifestCache     map[string]map[string]struct{}
 	manifestCacheMu   sync.RWMutex
@@ -523,7 +523,7 @@ func (m *ManifestManager) quarantineManifest(ctx context.Context, manifestPath, 
 	return nil
 }
 
-// GetFilesInManifests returns a set of all input files currently tracked by manifests.
+// GetFilesInManifests returns all input and output files tracked by manifests.
 // This is used to exclude files from compaction candidate scans.
 func (m *ManifestManager) GetFilesInManifests(ctx context.Context) (map[string]struct{}, error) {
 	m.manifestCacheMu.RLock()
@@ -575,7 +575,9 @@ func (m *ManifestManager) GetFilesInManifests(ctx context.Context) (map[string]s
 			files[f] = struct{}{}
 			result[f] = struct{}{}
 		}
-		// Also add output file to prevent re-compaction
+		// Protect the output in both the rebuilt result and the cache.
+		// Otherwise the next lookup forgets it until the cache expires.
+		files[manifest.OutputPath] = struct{}{}
 		result[manifest.OutputPath] = struct{}{}
 		newCache[manifestPath] = files
 	}
