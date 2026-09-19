@@ -215,8 +215,8 @@ func TestRecovery_MarkFailureKeepsManifest(t *testing.T) {
 
 	// Marks fail: the manifest must survive.
 	failing := func([]string) error { return errors.New("sqlite busy") }
-	if _, err := mm.RecoverOrphanedManifests(ctx, nil, failing); err != nil {
-		t.Fatalf("recover: %v", err)
+	if _, err := mm.RecoverOrphanedManifests(ctx, nil, failing); err == nil {
+		t.Fatal("recovery must report failed receipt marking")
 	}
 	if present, _ := backend.Exists(ctx, mpath); !present {
 		t.Fatal("manifest deleted despite a failed receipt mark; the marks are lost forever")

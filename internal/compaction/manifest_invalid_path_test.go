@@ -249,8 +249,8 @@ func TestRecoverManifestKeepsManifestOnTransientError(t *testing.T) {
 		t.Fatalf("WriteManifest: %v", err)
 	}
 
-	if _, err := mm.RecoverOrphanedManifests(ctx, nil, nil); err != nil {
-		t.Fatalf("RecoverOrphanedManifests: %v", err)
+	if _, err := mm.RecoverOrphanedManifests(ctx, nil, nil); err == nil {
+		t.Fatal("recovery must report transient existence-check failure")
 	}
 
 	remaining, err := mm.ListManifests(ctx)
@@ -309,8 +309,8 @@ func TestRecoverManifestCountsTransientInputDeleteFailure(t *testing.T) {
 		marked = true
 		return nil
 	})
-	if err != nil {
-		t.Fatalf("RecoverOrphanedManifests: %v", err)
+	if err == nil {
+		t.Fatal("recovery must report transient input deletion failure")
 	}
 	if recovered != 0 {
 		t.Fatalf("recovered = %d, want 0 for a transient input delete failure", recovered)

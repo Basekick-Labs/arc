@@ -290,27 +290,34 @@ func (m *Manager) SetOnCompactedOutput(fn func(storageKey string)) {
 // A hook error defers the whole candidate: the fail-safe direction is to
 // compact nothing rather than risk consuming undelivered rows.
 func (m *Manager) filterSyncEligibility(ctx context.Context, candidate Candidate, tier Tier) (Candidate, bool) {
+	filtered, eligible, _ := m.filterSyncEligibilityWithError(ctx, candidate, tier)
+	return filtered, eligible
+}
+
+func (m *Manager) filterSyncEligibilityWithError(ctx context.Context, candidate Candidate, tier Tier) (Candidate, bool, error) {
 	if candidate.SyncExempt {
 		// Expander-produced spoke-namespace candidates: received data is
 		// never owed upstream (the node's own sync discovery excludes these
 		// namespaces for exactly that reason), so the delivery gate does not
 		// apply — without this bypass a dual-role node would defer every
 		// received partition forever (#619 review F2).
-		return candidate, true
+		return candidate, true, nil
 	}
 	m.mu.Lock()
 	fn := m.syncEligibility
 	m.mu.Unlock()
 	if fn == nil {
-		return candidate, true
+		return candidate, true, nil
 	}
 
 	eligible, err := fn(ctx, candidate.Files)
 	if err != nil {
-		m.logger.Warn().Err(err).
-			Str("partition", candidate.PartitionPath).
-			Msg("Sync eligibility lookup failed; deferring this partition (fail-safe)")
-		return candidate, false
+		if ctx.Err() == nil {
+			m.logger.Warn().Err(err).
+				Str("partition", candidate.PartitionPath).
+				Msg("Sync eligibility lookup failed; deferring this partition (fail-safe)")
+		}
+		return candidate, false, err
 	}
 
 	kept := make([]string, 0, len(candidate.Files))
@@ -329,11 +336,11 @@ func (m *Manager) filterSyncEligibility(ctx context.Context, candidate Candidate
 			Msg("Edge sync deferral: files await delivery before compaction")
 	}
 	if len(kept) < tier.GetMinFiles() {
-		return candidate, false
+		return candidate, false, nil
 	}
 	candidate.Files = kept
 	candidate.FileCount = len(kept)
-	return candidate, true
+	return candidate, true, nil
 }
 
 // SetNamespaceExpander installs the hub's spoke-namespace expansion (#619).
@@ -609,8 +616,7 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 	// metadata + query caches for it would cost every in-flight query a cold
 	// re-read — every cycle, for a partition that skips every cycle.
 	jobSucceeded := err == nil && result != nil && result.Success
-	jobInterrupted := errors.Is(err, context.Canceled) ||
-		errors.Is(err, context.DeadlineExceeded)
+	jobInterrupted := ctx.Err() != nil && errors.Is(err, ctx.Err())
 	shouldInvalidateCache := jobSucceeded && result.FilesCompacted > 0
 
 	m.mu.Lock()
@@ -769,6 +775,12 @@ func (m *Manager) compactFilesAdaptively(ctx context.Context, candidate Candidat
 		return nil
 	}
 
+	// Cancellation is not a recoverable resource failure. Preserve the
+	// cause without logging a failed batch or allocating split retries.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+
 	// Extract stderr from error message for classification
 	// Error format from RunJobInSubprocess: "subprocess failed: %w (stderr: %s)"
 	errStderr := stderr
@@ -911,9 +923,9 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 
 		status := "completed"
 		switch {
-		case errors.Is(runErr, context.DeadlineExceeded):
+		case errors.Is(ctx.Err(), context.DeadlineExceeded):
 			status = "timed_out"
-		case errors.Is(runErr, context.Canceled):
+		case errors.Is(ctx.Err(), context.Canceled):
 			status = "cancelled"
 		case runErr != nil:
 			status = "failed"
@@ -969,24 +981,6 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 	}
 	logEvent.Msg("Starting compaction cycle")
 
-	// Run manifest recovery before starting new compactions
-	// This ensures interrupted compactions from previous cycles are completed
-	if m.ManifestManager != nil {
-		recovered, err := m.ManifestManager.RecoverOrphanedManifests(ctx, m.notifyCompactedOutput, m.notifyConsumedInputs)
-		if err != nil {
-			if ctx.Err() != nil {
-				return cycleID, ctx.Err()
-			}
-			m.logger.Warn().Err(err).Msg("Manifest recovery encountered errors")
-		}
-		if recovered > 0 {
-			m.mu.Lock()
-			m.totalManifestsRecov += recovered
-			m.mu.Unlock()
-			m.logger.Info().Int("recovered", recovered).Msg("Recovered orphaned compaction manifests")
-		}
-	}
-
 	// Build tier filter map for quick lookup
 	tierFilter := make(map[string]bool)
 	for _, name := range tierNames {
@@ -1014,6 +1008,35 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 	databases = m.expandNamespaces(ctx, databases)
 	if err := ctx.Err(); err != nil {
 		return cycleID, err
+	}
+
+	recoveryDatabases := databases
+	if filterDatabases == nil {
+		recoveryDatabases = nil
+	}
+	recoveryTiers := make([]string, 0, len(tierNames))
+	for _, tier := range m.Tiers {
+		if tier.IsEnabled() && tierFilter[tier.GetTierName()] {
+			recoveryTiers = append(recoveryTiers, tier.GetTierName())
+		}
+	}
+	// Run manifest recovery before starting new compactions
+	// This ensures interrupted compactions from previous cycles are completed
+	if m.ManifestManager != nil {
+		recovered, err := m.ManifestManager.recoverOrphanedManifests(ctx, recoveryScope{Databases: recoveryDatabases, Measurement: filterMeasurement, Tiers: recoveryTiers}, m.notifyCompactedOutput, m.notifyConsumedInputs)
+		if recovered > 0 {
+			m.mu.Lock()
+			m.totalManifestsRecov += recovered
+			m.mu.Unlock()
+			m.logger.Info().Int("recovered", recovered).Msg("Recovered orphaned compaction manifests")
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				return cycleID, ctx.Err()
+			}
+			discoveryErrors.Add(1)
+			m.logger.Warn().Err(err).Msg("Manifest recovery encountered errors")
+		}
 	}
 
 	// Build database -> measurements map to avoid repeated lookups
@@ -1148,7 +1171,10 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 					// the tier's MinFiles on what remains. Deferring here is
 					// the design, not a failure — the partition compacts
 					// once its files have synced.
-					filteredCandidate, shouldProcess = m.filterSyncEligibility(ctx, filteredCandidate, tier)
+					filteredCandidate, shouldProcess, eligibilityErr := m.filterSyncEligibilityWithError(ctx, filteredCandidate, tier)
+					if eligibilityErr != nil && ctx.Err() == nil {
+						discoveryErrors.Add(1)
+					}
 					if err := ctx.Err(); err != nil {
 						wg.Wait()
 						return cycleID, err
@@ -1211,8 +1237,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 							}
 
 							if err != nil {
-								if errors.Is(err, context.Canceled) ||
-									errors.Is(err, context.DeadlineExceeded) {
+								if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
 									interrupted.Add(1)
 									return
 								}

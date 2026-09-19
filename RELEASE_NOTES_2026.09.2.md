@@ -405,7 +405,11 @@ Scheduled and manual compaction use the same configurable cycle deadline
 waits for active workers and records separate completed, failed, interrupted
 and discovered-but-unstarted batch counts. Manual execution supports
 `POST /api/v1/compaction/trigger?database=db&measurement=cpu`, with `tier`
-remaining optional. The measurement filter requires a valid database.
+remaining optional. The measurement filter requires a valid database and applies to manifest
+recovery as well as new candidate discovery. Recovery and eligibility failures
+now fail the cycle, while completed recovery progress survives cancellation.
+Unreadable recovery manifests remain protected, and normal cancellation does
+not enter the adaptive retry path or emit misleading batch-failure logs.
 Increasing the deadline does not reduce peak memory demand or guarantee
 completion.
 

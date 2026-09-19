@@ -239,7 +239,9 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 		}
 		logger := logCtx.Logger()
 
-		if err != nil {
+		if ctx.Err() != nil {
+			logger.Info().Err(ctx.Err()).Msg("Manual compaction interrupted")
+		} else if err != nil {
 			logger.Error().Err(err).Msg("Manual compaction failed")
 		} else {
 			logger.Info().Msg("Manual compaction completed")

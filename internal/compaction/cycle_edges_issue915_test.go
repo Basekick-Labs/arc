@@ -3,6 +3,7 @@ package compaction
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,7 +23,7 @@ type manifestBackendIssue915 struct {
 func (b *manifestBackendIssue915) List(
 	ctx context.Context, prefix string,
 ) ([]string, error) {
-	if prefix != ManifestBasePath+"/" {
+	if !strings.HasPrefix(prefix, ManifestBasePath+"/") {
 		return b.Backend.List(ctx, prefix)
 	}
 

@@ -2,6 +2,7 @@ package compaction
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -218,7 +219,14 @@ func (s *Scheduler) runCompaction() {
 
 	cycleID, err := s.manager.RunCompactionCycleForTiers(ctx, s.tierNames)
 	if err != nil {
-		s.logger.Error().Err(err).Int64("cycle_id", cycleID).Msg("Scheduled compaction failed")
+		switch {
+		case errors.Is(err, ErrCycleAlreadyRunning):
+			s.logger.Info().Msg("Scheduled compaction skipped: a cycle is already running")
+		case ctx.Err() != nil:
+			s.logger.Info().Err(ctx.Err()).Int64("cycle_id", cycleID).Dur("duration", time.Since(startTime)).Msg("Scheduled compaction interrupted")
+		default:
+			s.logger.Error().Err(err).Int64("cycle_id", cycleID).Dur("duration", time.Since(startTime)).Msg("Scheduled compaction failed")
+		}
 		return
 	}
 

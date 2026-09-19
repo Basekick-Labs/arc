@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -222,6 +223,57 @@ func (m *ManifestManager) ListManifests(ctx context.Context) ([]string, error) {
 	return manifests, nil
 }
 
+// recoveryScope limits mutations, including recovery, to the selected scope.
+// A nil slice means unrestricted; a non-nil empty slice selects nothing.
+type recoveryScope struct {
+	Databases   []string
+	Measurement string
+	Tiers       []string
+}
+
+func (scope recoveryScope) matches(manifest *Manifest) bool {
+	return (scope.Databases == nil || slices.Contains(scope.Databases, manifest.Database)) &&
+		(scope.Tiers == nil || slices.Contains(scope.Tiers, manifest.Tier)) &&
+		(scope.Measurement == "" || scope.Measurement == manifest.Measurement)
+}
+
+func (m *ManifestManager) recoveryManifestPaths(ctx context.Context, scope recoveryScope) ([]string, error) {
+	if (scope.Databases != nil && len(scope.Databases) == 0) || (scope.Tiers != nil && len(scope.Tiers) == 0) {
+		return nil, nil
+	}
+	// The on-disk layout can narrow by tier and database before reading
+	// metadata. Measurement is stored in each manifest, not its path.
+	if scope.Tiers == nil {
+		return m.ListManifests(ctx)
+	}
+	var paths []string
+	for _, tier := range scope.Tiers {
+		prefixes := []string{filepath.Join(ManifestBasePath, tier) + "/"}
+		if scope.Databases != nil {
+			prefixes = nil
+			for _, database := range scope.Databases {
+				prefixes = append(prefixes, filepath.Join(ManifestBasePath, tier, database)+"/")
+			}
+		}
+		for _, prefix := range prefixes {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			objects, err := m.backend.List(ctx, prefix)
+			if err != nil {
+				return nil, fmt.Errorf("failed to list recovery manifests: %w", err)
+			}
+			for _, path := range objects {
+				if strings.HasSuffix(path, ".json") {
+					paths = append(paths, path)
+				}
+			}
+		}
+	}
+	slices.Sort(paths)
+	return slices.Compact(paths), nil
+}
+
 // RecoverOrphanedManifests finds and processes orphaned manifests from interrupted compactions.
 // Returns the number of manifests recovered and any error encountered.
 // onKeptOutput, when non-nil, receives the storage key of every compacted
@@ -237,53 +289,58 @@ func (m *ManifestManager) ListManifests(ctx context.Context) ([]string, error) {
 // Fired BEFORE the manifest is deleted; a returned ERROR keeps the manifest
 // so the next recovery pass re-fires the marks (consumers are idempotent) —
 // deleting it despite a failed mark would silently lose them (B1).
-func (m *ManifestManager) RecoverOrphanedManifests(ctx context.Context, onKeptOutput func(storageKey string), onConsumedInputs func(inputs []string) error) (int, error) {
-	manifests, err := m.ListManifests(ctx)
+func (m *ManifestManager) RecoverOrphanedManifests(ctx context.Context, onKeptOutput func(string), onConsumedInputs func([]string) error) (int, error) {
+	return m.recoverOrphanedManifests(ctx, recoveryScope{}, onKeptOutput, onConsumedInputs)
+}
+
+func (m *ManifestManager) recoverOrphanedManifests(ctx context.Context, scope recoveryScope, onKeptOutput func(string), onConsumedInputs func([]string) error) (recovered int, recoveryErr error) {
+	defer func() {
+		// A cancellation may arrive after some manifests were completed.
+		if recovered > 0 {
+			metrics.Get().IncCompactionManifestsRecovered(int64(recovered))
+		}
+	}()
+	paths, err := m.recoveryManifestPaths(ctx, scope)
 	if err != nil {
-		// ListManifests already describes the failure.
 		return 0, err
 	}
-
-	if len(manifests) == 0 {
-		return 0, nil
-	}
-
-	m.logger.Info().Int("count", len(manifests)).Msg("Found orphaned manifests, starting recovery")
-
-	var recovered int
-	for _, manifestPath := range manifests {
-		select {
-		case <-ctx.Done():
-			return recovered, ctx.Err()
-		default:
+	for _, path := range paths {
+		if err := ctx.Err(); err != nil {
+			return recovered, errors.Join(recoveryErr, err)
 		}
-
-		if err := m.recoverManifest(ctx, manifestPath, onKeptOutput, onConsumedInputs); err != nil {
-			m.logger.Error().Err(err).Str("manifest", manifestPath).Msg("Failed to recover manifest")
+		manifest, err := m.ReadManifest(ctx, path)
+		if err == nil && !scope.matches(manifest) {
+			continue
+		}
+		if err == nil {
+			err = m.recoverLoadedManifest(ctx, path, manifest, onKeptOutput, onConsumedInputs)
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				return recovered, errors.Join(recoveryErr, err, ctx.Err())
+			}
+			m.logger.Error().Err(err).Str("manifest", path).Msg("Failed to recover manifest; retaining recovery state")
+			recoveryErr = errors.Join(recoveryErr, fmt.Errorf("recover %s: %w", path, err))
 			continue
 		}
 		recovered++
 	}
-
-	m.logger.Info().Int("recovered", recovered).Int("total", len(manifests)).Msg("Manifest recovery complete")
-
-	// Track recovery metrics
-	if recovered > 0 {
-		metrics.Get().IncCompactionManifestsRecovered(int64(recovered))
-	}
-
-	return recovered, nil
+	return recovered, recoveryErr
 }
 
 // recoverManifest processes a single orphaned manifest
 func (m *ManifestManager) recoverManifest(ctx context.Context, manifestPath string, onKeptOutput func(storageKey string), onConsumedInputs func(inputs []string) error) error {
 	manifest, err := m.ReadManifest(ctx, manifestPath)
 	if err != nil {
-		// If we can't read the manifest, delete it and let compaction retry
-		m.logger.Warn().Err(err).Str("manifest", manifestPath).Msg("Cannot read manifest, deleting")
-		return m.DeleteManifest(ctx, manifestPath)
+		return err
 	}
+	return m.recoverLoadedManifest(ctx, manifestPath, manifest, onKeptOutput, onConsumedInputs)
+}
 
+func (m *ManifestManager) recoverLoadedManifest(ctx context.Context, manifestPath string, manifest *Manifest, onKeptOutput func(string), onConsumedInputs func([]string) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// Check for stale manifests - older than ManifestMaxAge likely indicate a deeper problem
 	manifestAge := time.Since(manifest.CreatedAt)
 	isStale := manifestAge > ManifestMaxAge
@@ -381,6 +438,9 @@ func (m *ManifestManager) recoverManifest(ctx context.Context, manifestPath stri
 
 	var deleteErrors int
 	for _, inputFile := range manifest.InputFiles {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := m.backend.Delete(ctx, inputFile); err != nil {
 			if errors.Is(err, storage.ErrInvalidPath) {
 				// Permanent: this input cannot be deleted by this key, now or
@@ -564,10 +624,14 @@ func (m *ManifestManager) GetFilesInManifests(ctx context.Context) (map[string]s
 	result := make(map[string]struct{})
 
 	for _, manifestPath := range manifests {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		manifest, err := m.ReadManifest(ctx, manifestPath)
 		if err != nil {
-			m.logger.Warn().Err(err).Str("manifest", manifestPath).Msg("Failed to read manifest for cache")
-			continue
+			// An incomplete cache could expose inputs of an in-flight job.
+			// Keep the previous cache untouched and fail closed this cycle.
+			return nil, fmt.Errorf("read manifest for cache %s: %w", manifestPath, err)
 		}
 
 		files := make(map[string]struct{})
@@ -575,7 +639,8 @@ func (m *ManifestManager) GetFilesInManifests(ctx context.Context) (map[string]s
 			files[f] = struct{}{}
 			result[f] = struct{}{}
 		}
-		// Also add output file to prevent re-compaction
+		// Also protect outputs on both a cache miss and a cache hit.
+		files[manifest.OutputPath] = struct{}{}
 		result[manifest.OutputPath] = struct{}{}
 		newCache[manifestPath] = files
 	}
