@@ -398,6 +398,15 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### Fixed: distinct Arrow schemas no longer share a cache entry ([#750](https://github.com/Basekick-Labs/arc/issues/750))
+
+The ingest schema cache now uses deterministic, length-prefixed column identities
+instead of ambiguous slice formatting. It includes decimal precision/scale and
+canonicalises column and tag ordering, preventing stale Arrow types or metadata
+when a measurement's schema changes.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#913](https://github.com/Basekick-Labs/arc/pull/913).
+
 ### Peer file fetches now respect the overall timeout ([#796](https://github.com/Basekick-Labs/arc/issues/796))
 
 The configured `cluster.replication_fetch_timeout_ms` did not reliably bound a file fetch. Reading the acknowledgement header could replace the context deadline with a longer timeout, and the subsequent body transfer could block indefinitely if a peer stopped sending data.
