@@ -27,6 +27,10 @@ import (
 // response writer's panic path (#716). Production always uses the real one.
 var streamArrowIPCFunc = streamArrowIPC
 
+// arcxArrowDispatch is replaceable in tests so the experimental hand-off
+// can be exercised without the native arcx engine.
+var arcxArrowDispatch = (*QueryHandler).tryArcxRouterArrow
+
 // releaseArrowStreamResourcesFunc indirects the cleanup so tests can count how
 // many times it runs (#733). Production always uses the real one.
 var releaseArrowStreamResourcesFunc = releaseArrowStreamResources
@@ -547,62 +551,69 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	if governanceTimeout > 0 {
 		effectiveTimeout = governanceTimeout
 	}
-	// The arcx hook gets its own context: its serve path (built into no shipped
-	// binary) streams asynchronously and owns that cancel. When the hook
-	// declines, the pair is released and the real execution context is built
-	// below, after the query is registered, so that DELETE /api/v1/queries/:id
-	// cancels the DuckDB read the same way it does for POST /api/v1/query (#309).
-	// No defer cancel(): the streaming callback runs after this handler returns
-	// and calls cancel itself once the rows are consumed.
-	hookCtx := context.Background()
-	var hookCancel context.CancelFunc
-	if effectiveTimeout > 0 {
-		hookCtx, hookCancel = context.WithTimeout(hookCtx, effectiveTimeout)
-	}
-
-	// arcx router hook (Arrow-IPC variant). In serve mode a green shape is
-	// streamed as Arrow IPC by arcx (its most natural output); shadow mode
-	// compares off to the side and returns false. No-op stub without the
-	// arcx_engine tag — stock Arc unaffected. Uses ctx (background-derived, safe
-	// in the async writer), not c.UserContext().
-	// Pass `cancel` INTO the hook — the arcx serve path streams asynchronously in
-	// SetBodyStreamWriter (after this returns), so it owns calling cancel when the stream
-	// finishes. Calling cancel() here would cancel execCtx mid-stream → truncate to schema-only.
-	// Governance note (#702): rate limit, quota, and the policy timeout
-	// (via ctx) apply to an arcx-served response, but the MaxRows cap is
-	// enforced only by the DuckDB IPC loop below — the experimental arcx
-	// serve path streams uncapped until it learns to take a row cap.
-	if h.tryArcxRouterArrow(c, hookCtx, hookCancel, req.SQL, headerDB, convertedSQL) {
-		return nil
-	}
-	if hookCancel != nil {
-		hookCancel()
-	}
-
-	// Register with the query registry, as executeQuery does, so the query is
-	// listed by GET /api/v1/queries/active and can be cancelled. The parent is
-	// c.UserContext() for parity with the JSON path only: nothing in Arc sets a
-	// user context, so it is context.Background() and fasthttp never cancels it
-	// on a client hangup — during execution the registry cancel and the timeout
-	// are the only levers that stop DuckDB. The header is set now because no
-	// header may be written once the stream writer is installed (#729).
+	// Register before choosing an engine. An arcx-served query must have
+	// the same query ID, cancellation context and history as a DuckDB query.
+	// The registry must not be completed here: streaming starts after this
+	// handler returns, so the stream writer owns the terminal disposition.
 	var queryID string
 	baseCtx := context.Background()
 	if h.queryRegistry != nil {
 		var queryCtx context.Context
-		queryID, queryCtx = h.queryRegistry.Register(c.UserContext(), req.SQL, tokenID, tokenName, c.IP(), false, 0)
+		queryID, queryCtx = h.queryRegistry.Register(
+			c.UserContext(), req.SQL, tokenID, tokenName, c.IP(), false, 0,
+		)
 		c.Set("X-Arc-Query-ID", queryID)
 		baseCtx = queryCtx
 	}
+
 	ctx := baseCtx
 	var cancel context.CancelFunc
 	switch {
 	case effectiveTimeout > 0:
 		ctx, cancel = context.WithTimeout(baseCtx, effectiveTimeout)
 	case queryID != "":
-		// No timeout, but a registry cancel must still propagate and the
-		// release helper expects a cancel to call.
 		ctx, cancel = context.WithCancel(baseCtx)
+	}
+
+	// The arcx hook may install an asynchronous stream writer. A successful
+	// hand-off transfers ownership of cancel and registry disposition to it.
+	// A decline falls through to DuckDB with the SAME context and query ID.
+	var arcxOnComplete func(int)
+	var arcxOnFail func(string)
+	if h.queryRegistry != nil && queryID != "" {
+		arcxOnComplete = func(rows int) {
+			h.queryRegistry.Complete(queryID, rows)
+		}
+		arcxOnFail = func(message string) {
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				h.queryRegistry.TimedOut(queryID)
+			} else {
+				h.queryRegistry.Fail(queryID, sqlutil.SanitizeErrText(message))
+			}
+		}
+	}
+
+	// A synchronous panic is caught here, before Fiber's recover middleware.
+	// Without this guard its registry entry would remain running forever.
+	arcxHandled := func() bool {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				if arcxOnFail != nil {
+					arcxOnFail("arcx hook panicked")
+				}
+				if cancel != nil {
+					cancel()
+				}
+				panic(recovered)
+			}
+		}()
+		return arcxArrowDispatch(
+			h, c, ctx, cancel, req.SQL, headerDB, convertedSQL,
+			arcxOnComplete, arcxOnFail,
+		)
+	}()
+	if arcxHandled {
+		return nil
 	}
 
 	// Execute query using DuckDB's native Arrow API — returns record batches
