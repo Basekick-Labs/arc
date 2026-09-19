@@ -1,5 +1,9 @@
 # Arc v2026.09.2 Release Notes
 
+## Fixed: query path separator interpretation (#750)
+
+Tiered-query path inspection no longer converts backslashes into directory separators. Paths containing a backslash cannot be used to derive a different database or measurement during tier selection. Existing forward-slash paths retain their behaviour.
+
 > **Status:** Planned — October 2026 patch release.
 
 ## New: administrative cluster file deletion (`DELETE /api/v1/cluster/files`) ([#830](https://github.com/Basekick-Labs/arc/pull/830))
