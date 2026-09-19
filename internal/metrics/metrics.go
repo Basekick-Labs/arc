@@ -157,7 +157,12 @@ type Metrics struct {
 	queryMgmtHistorySize    atomic.Int64 // Completed queries in history buffer (gauge)
 
 	// Replication metrics
-	replicationEntriesDroppedTotal atomic.Int64 // Total replication entries dropped due to full buffer
+	replicationEntriesDroppedTotal atomic.Int64
+
+	// The active writer supplies peer samples on demand. No historical
+	// peer IDs or unbounded time series are retained in the collector.
+	replicationLagMu       sync.RWMutex
+	replicationLagProvider *replicationLagRegistration // Total replication entries dropped due to full buffer
 	//
 	// There is deliberately no sequence-gap counter here (#810). A gap cannot
 	// occur silently on a replication connection: the receiver requires each
@@ -1049,6 +1054,18 @@ func (m *Metrics) PrometheusFormat() string {
 	b = appendMetric(b, "arc_query_mgmt_history_size", float64(m.queryMgmtHistorySize.Load()))
 
 	// Replication metrics
+	b = append(b, "# HELP arc_replication_lag_entries Current outstanding writer entries per active reader\n"...)
+	b = append(b, "# TYPE arc_replication_lag_entries gauge\n"...)
+	b = append(b, "# HELP arc_replication_lag_seconds Age of oldest unacknowledged WAL entry per active reader; omitted when its timestamp is unavailable\n"...)
+	b = append(b, "# TYPE arc_replication_lag_seconds gauge\n"...)
+
+	for _, sample := range m.replicationLagSamples() {
+		b = appendReplicationLagMetric(b, "arc_replication_lag_entries", sample.Peer, float64(sample.Entries))
+		if sample.HasSeconds {
+			b = appendReplicationLagMetric(b, "arc_replication_lag_seconds", sample.Peer, sample.Seconds)
+		}
+	}
+
 	b = append(b, "# HELP arc_replication_entries_dropped_total Total replication entries dropped due to full buffer\n"...)
 	b = append(b, "# TYPE arc_replication_entries_dropped_total counter\n"...)
 	b = appendMetric(b, "arc_replication_entries_dropped_total", float64(m.replicationEntriesDroppedTotal.Load()))

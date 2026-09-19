@@ -120,6 +120,14 @@ func (r *ReaderConnection) Discard() {
 	}
 }
 
+// replicationTimestamp is a bounded history entry indexed by the
+// writer's sequence number. An overwritten slot is never treated as
+// belonging to a different sequence.
+type replicationTimestamp struct {
+	sequence  uint64
+	timestamp uint64
+}
+
 // Sender streams WAL entries to connected reader nodes.
 // It runs on the writer node and pushes entries as they arrive.
 type Sender struct {
@@ -135,6 +143,15 @@ type Sender struct {
 	cancelFunc context.CancelFunc
 	running    atomic.Bool
 	wg         sync.WaitGroup
+
+	// Original WAL timestamps for the most recent BufferSize entries.
+	// The ring is bounded independently of the number of historical peers.
+	timestampMu sync.RWMutex
+	timestamps  []replicationTimestamp
+
+	// The registration belongs to this Sender's lifetime. Unregistering
+	// cannot accidentally remove a newer sender's registration.
+	unregisterLag func()
 
 	// Stats
 	totalEntriesReceived atomic.Int64
@@ -156,10 +173,11 @@ func NewSender(cfg *SenderConfig) *Sender {
 	}
 
 	return &Sender{
-		cfg:       cfg,
-		readers:   make(map[string]*ReaderConnection),
-		entryChan: make(chan *ReplicateEntry, cfg.BufferSize),
-		logger:    cfg.Logger.With().Str("component", "replication-sender").Logger(),
+		cfg:        cfg,
+		readers:    make(map[string]*ReaderConnection),
+		entryChan:  make(chan *ReplicateEntry, cfg.BufferSize),
+		timestamps: make([]replicationTimestamp, cfg.BufferSize),
+		logger:     cfg.Logger.With().Str("component", "replication-sender").Logger(),
 	}
 }
 
@@ -167,6 +185,10 @@ func NewSender(cfg *SenderConfig) *Sender {
 func (s *Sender) Start(ctx context.Context) error {
 	s.ctx, s.cancelFunc = context.WithCancel(ctx)
 	s.running.Store(true)
+
+	// Metrics are collected at scrape time from the live reader map, so
+	// disconnected peers never leave stale gauge series behind.
+	s.unregisterLag = metrics.Get().RegisterReplicationLagProvider(s.replicationLagSamples)
 
 	// Start entry distribution goroutine
 	s.wg.Add(1)
@@ -186,6 +208,8 @@ func (s *Sender) Stop() error {
 	}
 
 	s.running.Store(false)
+	s.unregisterLag()
+	s.unregisterLag = nil
 	s.cancelFunc()
 
 	// Close all reader connections
@@ -352,6 +376,24 @@ func (s *Sender) RemoveReader(readerID string) {
 	}
 }
 
+// removeReaderIfCurrent is used by connection-owned cleanup paths.
+// An old receive loop or failed broadcast must not remove a replacement
+// connection registered under the same reader ID.
+func (s *Sender) removeReaderIfCurrent(reader *ReaderConnection) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if current, ok := s.readers[reader.id]; ok && current == reader {
+		reader.cancelFunc()
+		reader.conn.Close()
+		delete(s.readers, reader.id)
+
+		s.logger.Info().
+			Str("reader_id", reader.id).
+			Msg("Reader removed from replication")
+	}
+}
+
 // Replicate queues a WAL entry for replication to all readers.
 // This is called by the WAL writer via the replication hook.
 // It is non-blocking - entries are dropped if the buffer is full.
@@ -371,7 +413,17 @@ func (s *Sender) Replicate(entry *ReplicateEntry) {
 	// Non-blocking send to entry channel
 	select {
 	case s.entryChan <- entry:
-		// Entry queued successfully
+		// Retain the original timestamp only for accepted entries.
+		// Missing/dropped/evicted entries produce no seconds sample,
+		// rather than a fabricated age.
+		s.timestampMu.Lock()
+		index := entry.Sequence % uint64(len(s.timestamps))
+		if s.timestamps[index].sequence <= entry.Sequence {
+			s.timestamps[index] = replicationTimestamp{
+				sequence: entry.Sequence, timestamp: entry.TimestampUS,
+			}
+		}
+		s.timestampMu.Unlock()
 	default:
 		// Buffer full, drop entry
 		s.totalEntriesDropped.Add(1)
@@ -422,7 +474,7 @@ func (s *Sender) broadcastEntry(entry *ReplicateEntry) {
 				Msg("Failed to send entry to reader")
 
 			// Remove failed reader
-			s.RemoveReader(reader.id)
+			s.removeReaderIfCurrent(reader)
 		}
 	}
 }
@@ -572,7 +624,7 @@ func (s *Sender) emitCheckpointLocked(reader *ReaderConnection, lastSeq uint64) 
 // receiveLoop handles incoming messages from a reader (mainly acks).
 func (s *Sender) receiveLoop(reader *ReaderConnection) {
 	defer s.wg.Done()
-	defer s.RemoveReader(reader.id)
+	defer s.removeReaderIfCurrent(reader)
 
 	for {
 		select {
@@ -637,20 +689,77 @@ func (s *Sender) CurrentSequence() uint64 {
 	return s.sequence.Load()
 }
 
+// replicationLagSamples observes only currently connected readers.
+//
+// Entries is the writer's sequence minus the last acknowledged sequence,
+// saturated at zero across sequence-space resets. Seconds is the age of
+// the oldest unacknowledged entry's original WAL timestamp. It is zero
+// when caught up, and omitted if that timestamp was dropped, evicted,
+// invalid, or in the future. In particular, idle caught-up connections
+// never accumulate artificial age.
+func (s *Sender) replicationLagSamples() []metrics.ReplicationLagSample {
+	current := s.sequence.Load()
+	nowUS := time.Now().UnixMicro()
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	samples := make([]metrics.ReplicationLagSample, 0, len(s.readers))
+	for id, reader := range s.readers {
+		ack := reader.lastAck.Load()
+		sample := metrics.ReplicationLagSample{Peer: id}
+
+		if current > ack {
+			sample.Entries = current - ack
+
+			// ack+1 cannot overflow here because ack < current.
+			oldest := ack + 1
+			s.timestampMu.RLock()
+			slot := s.timestamps[oldest%uint64(len(s.timestamps))]
+			s.timestampMu.RUnlock()
+
+			if slot.sequence == oldest &&
+				slot.timestamp > 0 &&
+				nowUS > 0 &&
+				slot.timestamp <= uint64(nowUS) {
+				sample.Seconds = float64(uint64(nowUS)-slot.timestamp) / 1_000_000
+				sample.HasSeconds = true
+			}
+		} else {
+			sample.HasSeconds = true
+			sample.Seconds = 0
+		}
+
+		samples = append(samples, sample)
+	}
+	return samples
+}
+
 // Stats returns sender statistics.
 func (s *Sender) Stats() map[string]interface{} {
 	s.mu.RLock()
 	readerStats := make([]map[string]interface{}, 0, len(s.readers))
 	for id, reader := range s.readers {
 		lastSend := time.Unix(0, reader.lastSendTime.Load())
+		currentSeq := s.sequence.Load()
+		lastAck := reader.lastAck.Load()
+
+		// A reader's acknowledgment may be ahead of the writer's
+		// in-memory sequence after a sequence-space reset. Saturate
+		// rather than underflowing uint64.
+		var lag uint64
+		if currentSeq > lastAck {
+			lag = currentSeq - lastAck
+		}
+
 		readerStats = append(readerStats, map[string]interface{}{
 			"reader_id":      id,
-			"last_ack_seq":   reader.lastAck.Load(),
+			"last_ack_seq":   lastAck,
 			"entries_sent":   reader.entriesSent.Load(),
 			"bytes_sent":     reader.bytesSent.Load(),
 			"last_send_time": lastSend.Format(time.RFC3339),
 			"errors":         reader.errors.Load(),
-			"lag":            s.sequence.Load() - reader.lastAck.Load(),
+			"lag":            lag,
 		})
 	}
 	s.mu.RUnlock()
