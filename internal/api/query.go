@@ -3323,8 +3323,32 @@ func shouldSkipTableConversion(table string) bool {
 // or: {database}/{measurement}/**/*.parquet (relative path)
 // The key insight: database/measurement are always followed by year directories (4-digit numbers)
 func (h *QueryHandler) extractDBMeasurementFromPath(path string) (database, measurement string) {
-	// Normalize path separators
-	path = strings.ReplaceAll(path, "\\", "/")
+	// Backslashes are forbidden in storage keys. A local backend may,
+	// however, have native separators in its trusted root on Windows.
+	if strings.Contains(path, `\`) {
+		local, ok := h.storage.(*storage.LocalBackend)
+		if !ok {
+			return "", ""
+		}
+
+		root := local.GetBasePath()
+		if !strings.HasSuffix(root, string(filepath.Separator)) {
+			root += string(filepath.Separator)
+		}
+
+		// Only the exact local root may contain native separators. Never
+		// normalise a backslash in the database, measurement or file key.
+		if !strings.HasPrefix(path, root) {
+			return "", ""
+		}
+		keyPath := strings.TrimPrefix(path, root)
+		if strings.Contains(keyPath, `\`) {
+			return "", ""
+		}
+
+		// The remaining suffix contains no backslashes; parse it using '/'.
+		path = keyPath
+	}
 
 	// Remove any s3:// or azure:// prefix and bucket name
 	if strings.Contains(path, "://") {

@@ -398,6 +398,13 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### Query path extraction no longer folds backslashes ([#750](https://github.com/Basekick-Labs/arc/issues/750))
+
+Query tier selection no longer converts backslashes in storage keys into path
+separators, which could incorrectly identify a different database or
+measurement. Native separators are permitted only within a trusted local
+storage root; the key portion must retain its slash-separated identity.
+
 ### Peer file fetches now respect the overall timeout ([#796](https://github.com/Basekick-Labs/arc/issues/796))
 
 The configured `cluster.replication_fetch_timeout_ms` did not reliably bound a file fetch. Reading the acknowledgement header could replace the context deadline with a longer timeout, and the subsequent body transfer could block indefinitely if a peer stopped sending data.
