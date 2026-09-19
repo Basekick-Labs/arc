@@ -171,9 +171,15 @@ func TestPullerQuarantineIsIdempotentAcrossReenqueues(t *testing.T) {
 	const rounds = 50
 	for i := 0; i < rounds; i++ {
 		p.Enqueue(makeEntry(invalidEntryPath, "writer-1", 128))
-		// Wait for this arrival to settle before the next, so the inflight
-		// dedup does not silently collapse them into one.
-		waitStats(t, p, func(s map[string]int64) bool { return s["invalid_path"] >= int64(i+1) })
+		// Wait for both the counter and the worker's in-flight slot to
+		// settle. The counter increments before deferred slot cleanup;
+		// observing it alone can make the next arrival a duplicate.
+		stats := waitStats(t, p, func(s map[string]int64) bool {
+			return s["invalid_path"] >= int64(i+1) && s["inflight_count"] == 0
+		})
+		if stats["invalid_path"] < int64(i+1) || stats["inflight_count"] != 0 {
+			t.Fatalf("arrival %d did not settle: %+v", i+1, stats)
+		}
 	}
 
 	stats := waitStats(t, p, func(s map[string]int64) bool { return s["invalid_path"] == rounds })
