@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -28,17 +29,26 @@ const (
 // ManifestBasePath is the base directory for storing compaction manifests
 const ManifestBasePath = "_compaction_state"
 
-// ManifestQuarantineSuffix is appended to a manifest whose contents name a
-// storage key no backend can address (#747). ListManifests selects on a
-// ".json" suffix, so a parked manifest leaves the recovery work set and stops
-// excluding its inputs from compaction, while the record of which output and
-// inputs were involved survives for an operator to act on.
+// ManifestQuarantineSuffix is appended to a manifest recovery can never act
+// on: one whose contents name a storage key no backend can address (#747),
+// or one whose body does not decode at all (#915). ListManifests selects on
+// a ".json" suffix, so a parked manifest leaves the recovery work set and
+// stops excluding its inputs from compaction, while the record of which
+// output and inputs were involved (or, for an undecodable body, at least the
+// path naming the tier, database and job) survives for an operator to act on.
 const ManifestQuarantineSuffix = ".quarantined"
 
 // ManifestMaxAge is the maximum age for manifests before they're considered stale.
 // Manifests older than this are deleted during recovery - they likely indicate
 // a deeper problem that requires investigation.
 const ManifestMaxAge = 7 * 24 * time.Hour // 7 days
+
+// ErrManifestUnparseable marks a manifest whose bytes were read but do not
+// decode. It is distinct from a read failure on purpose: a read failure is
+// transient and the manifest must be retained, while an undecodable body
+// (typically a zero-length file left by a crash before the rename was
+// durable) will never decode on any later pass.
+var ErrManifestUnparseable = errors.New("compaction manifest cannot be parsed")
 
 // Manifest tracks the state of a compaction operation for crash recovery.
 // If a pod crashes after uploading the compacted file but before deleting
@@ -74,9 +84,10 @@ type ManifestManager struct {
 	manifestCacheTime time.Time
 	cacheTTL          time.Duration
 
-	// unparseableLogged records manifest paths PendingOutputsUnder already
-	// reported as unparseable, so a lingering bad file logs once, not once per
-	// measurement per reconcile pass.
+	// unparseableLogged records manifest paths already reported as
+	// unparseable, so a lingering bad file logs once per site rather than
+	// once per measurement per pass. PendingOutputsUnder keys by bare path,
+	// GetFilesInManifests by "cache:"+path; their messages differ.
 	unparseableLogged sync.Map
 }
 
@@ -103,9 +114,11 @@ func NewManifestManager(backend storage.Backend, logger zerolog.Logger) *Manifes
 // 270-byte filename, which the storage key contract refuses, so WriteManifest
 // failed and compaction for that partition failed on every cycle (#744).
 //
-// Nothing parses this name. ListManifests filters on the ".json" suffix and
-// recoverManifest drives every decision off the unmarshalled body, so the
-// format is free to change and old manifests stay discoverable.
+// Nothing parses this name for recovery decisions. ListManifests filters on
+// the ".json" suffix and recovery drives every decision off the unmarshalled
+// body, so the format is free to change and old manifests stay discoverable.
+// The one exception is manifestPathDatabase, which reads the database segment
+// back out of the path for a manifest whose body cannot be decoded.
 //
 // The hash fallback covers the remaining tail: at the maximum permitted
 // database (64) and measurement (128) lengths even the jobID alone exceeds the
@@ -185,7 +198,7 @@ func (m *ManifestManager) ReadManifest(ctx context.Context, manifestPath string)
 
 	var manifest Manifest
 	if err := json.Unmarshal(data, &manifest); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal manifest %s: %w", manifestPath, err)
+		return nil, fmt.Errorf("failed to unmarshal manifest %s: %w: %w", manifestPath, ErrManifestUnparseable, err)
 	}
 
 	return &manifest, nil
@@ -222,6 +235,65 @@ func (m *ManifestManager) ListManifests(ctx context.Context) ([]string, error) {
 	return manifests, nil
 }
 
+// recoveryScope limits mutations, including recovery, to the selected
+// database and measurement. A nil Databases slice means unrestricted; a
+// non-nil empty slice selects nothing. Databases holds the names the cycle
+// iterates, so for a spoke namespace it is the expanded pseudo-database
+// ("spoke/child"), which is also what the job writes into the manifest.
+//
+// Recovery is deliberately NOT scoped by tier. Each scheduler runs a single
+// tier, so a tier-scoped recovery would leave a daily orphan waiting for the
+// daily tick (up to a day, or forever once that tier is disabled) while its
+// output and inputs coexist in the partition. #915 asks manual targeting to
+// isolate a database/measurement, not a tier, and orphans are few, so every
+// cycle recovers across all tiers as it did before the scope existed.
+type recoveryScope struct {
+	Databases   []string
+	Measurement string
+}
+
+func (scope recoveryScope) matches(manifest *Manifest) bool {
+	return (scope.Databases == nil || slices.Contains(scope.Databases, manifest.Database)) &&
+		(scope.Measurement == "" || scope.Measurement == manifest.Measurement)
+}
+
+// matchesPath is the database-only check for a manifest whose body cannot be
+// decoded: the measurement lives in the body, the database in the path.
+func (scope recoveryScope) matchesPath(manifestPath string) bool {
+	return scope.Databases == nil || slices.Contains(scope.Databases, manifestPathDatabase(manifestPath))
+}
+
+// manifestPathDatabase returns the database segment(s) of a manifest path,
+// "_compaction_state/{tier}/{database}/{name}.json", where database may itself
+// contain a slash for a spoke pseudo-database. Empty when the path does not
+// have that shape.
+func manifestPathDatabase(manifestPath string) string {
+	rest, ok := strings.CutPrefix(filepath.ToSlash(manifestPath), ManifestBasePath+"/")
+	if !ok {
+		return ""
+	}
+	_, rest, ok = strings.Cut(rest, "/") // drop the tier
+	if !ok {
+		return ""
+	}
+	i := strings.LastIndex(rest, "/")
+	if i < 0 {
+		return ""
+	}
+	return rest[:i]
+}
+
+func (m *ManifestManager) recoveryManifestPaths(ctx context.Context, scope recoveryScope) ([]string, error) {
+	if scope.Databases != nil && len(scope.Databases) == 0 {
+		return nil, nil
+	}
+	// Every manifest is listed and matched on its metadata. Orphans are
+	// bounded by crashed jobs, so the read cost of the unselected ones is
+	// small, and a single listing is what every other reader of this prefix
+	// does.
+	return m.ListManifests(ctx)
+}
+
 // RecoverOrphanedManifests finds and processes orphaned manifests from interrupted compactions.
 // Returns the number of manifests recovered and any error encountered.
 // onKeptOutput, when non-nil, receives the storage key of every compacted
@@ -237,53 +309,74 @@ func (m *ManifestManager) ListManifests(ctx context.Context) ([]string, error) {
 // Fired BEFORE the manifest is deleted; a returned ERROR keeps the manifest
 // so the next recovery pass re-fires the marks (consumers are idempotent) —
 // deleting it despite a failed mark would silently lose them (B1).
-func (m *ManifestManager) RecoverOrphanedManifests(ctx context.Context, onKeptOutput func(storageKey string), onConsumedInputs func(inputs []string) error) (int, error) {
-	manifests, err := m.ListManifests(ctx)
+func (m *ManifestManager) RecoverOrphanedManifests(ctx context.Context, onKeptOutput func(string), onConsumedInputs func([]string) error) (int, error) {
+	return m.recoverOrphanedManifests(ctx, recoveryScope{}, onKeptOutput, onConsumedInputs)
+}
+
+func (m *ManifestManager) recoverOrphanedManifests(ctx context.Context, scope recoveryScope, onKeptOutput func(string), onConsumedInputs func([]string) error) (recovered int, recoveryErr error) {
+	defer func() {
+		// A cancellation may arrive after some manifests were completed.
+		if recovered > 0 {
+			metrics.Get().IncCompactionManifestsRecovered(int64(recovered))
+		}
+	}()
+	paths, err := m.recoveryManifestPaths(ctx, scope)
 	if err != nil {
-		// ListManifests already describes the failure.
 		return 0, err
 	}
-
-	if len(manifests) == 0 {
-		return 0, nil
-	}
-
-	m.logger.Info().Int("count", len(manifests)).Msg("Found orphaned manifests, starting recovery")
-
-	var recovered int
-	for _, manifestPath := range manifests {
-		select {
-		case <-ctx.Done():
-			return recovered, ctx.Err()
-		default:
+	for _, path := range paths {
+		if err := ctx.Err(); err != nil {
+			return recovered, errors.Join(recoveryErr, err)
 		}
-
-		if err := m.recoverManifest(ctx, manifestPath, onKeptOutput, onConsumedInputs); err != nil {
-			m.logger.Error().Err(err).Str("manifest", manifestPath).Msg("Failed to recover manifest")
+		manifest, err := m.ReadManifest(ctx, path)
+		if errors.Is(err, ErrManifestUnparseable) {
+			// The body will never decode on a later pass either, so retaining
+			// it would hold this file in the work set forever, and because
+			// GetFilesInManifests must fail closed on anything it cannot read,
+			// every candidate on the node would be skipped until an operator
+			// found it. Park it under the quarantine suffix instead: that
+			// removes it from the ".json" work set like a delete would, but
+			// keeps the path, which is the only pointer to the partition an
+			// operator should inspect. Only the database can be honored for
+			// scope here; the measurement lives in the undecodable body.
+			if !scope.matchesPath(path) {
+				continue
+			}
+			if parkErr := m.parkUnparseableManifest(ctx, path, err); parkErr != nil {
+				if ctx.Err() != nil {
+					return recovered, errors.Join(recoveryErr, parkErr, ctx.Err())
+				}
+				m.logger.Error().Err(parkErr).Str("manifest", path).Msg("Failed to park unparseable manifest; retrying next cycle")
+				recoveryErr = errors.Join(recoveryErr, fmt.Errorf("park %s: %w", path, parkErr))
+			}
+			// Not counted in recovered: nothing was recovered, only removed
+			// from the work set. (An invalid-output-key park below still
+			// counts, as it did before this branch existed.)
+			continue
+		}
+		if err == nil && !scope.matches(manifest) {
+			continue
+		}
+		if err == nil {
+			err = m.recoverLoadedManifest(ctx, path, manifest, onKeptOutput, onConsumedInputs)
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				return recovered, errors.Join(recoveryErr, err, ctx.Err())
+			}
+			m.logger.Error().Err(err).Str("manifest", path).Msg("Failed to recover manifest; retaining recovery state")
+			recoveryErr = errors.Join(recoveryErr, fmt.Errorf("recover %s: %w", path, err))
 			continue
 		}
 		recovered++
 	}
-
-	m.logger.Info().Int("recovered", recovered).Int("total", len(manifests)).Msg("Manifest recovery complete")
-
-	// Track recovery metrics
-	if recovered > 0 {
-		metrics.Get().IncCompactionManifestsRecovered(int64(recovered))
-	}
-
-	return recovered, nil
+	return recovered, recoveryErr
 }
 
-// recoverManifest processes a single orphaned manifest
-func (m *ManifestManager) recoverManifest(ctx context.Context, manifestPath string, onKeptOutput func(storageKey string), onConsumedInputs func(inputs []string) error) error {
-	manifest, err := m.ReadManifest(ctx, manifestPath)
-	if err != nil {
-		// If we can't read the manifest, delete it and let compaction retry
-		m.logger.Warn().Err(err).Str("manifest", manifestPath).Msg("Cannot read manifest, deleting")
-		return m.DeleteManifest(ctx, manifestPath)
+func (m *ManifestManager) recoverLoadedManifest(ctx context.Context, manifestPath string, manifest *Manifest, onKeptOutput func(string), onConsumedInputs func([]string) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-
 	// Check for stale manifests - older than ManifestMaxAge likely indicate a deeper problem
 	manifestAge := time.Since(manifest.CreatedAt)
 	isStale := manifestAge > ManifestMaxAge
@@ -381,6 +474,9 @@ func (m *ManifestManager) recoverManifest(ctx context.Context, manifestPath stri
 
 	var deleteErrors int
 	for _, inputFile := range manifest.InputFiles {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := m.backend.Delete(ctx, inputFile); err != nil {
 			if errors.Is(err, storage.ErrInvalidPath) {
 				// Permanent: this input cannot be deleted by this key, now or
@@ -460,17 +556,8 @@ func quarantinePathFor(manifestPath string) (string, error) {
 
 // quarantineManifest parks a manifest whose contents name a permanently
 // unusable storage key, so recovery stops retrying work that cannot succeed
-// (#747) without discarding the record of what the manifest described.
-//
-// Parking is a copy followed by a delete rather than a rename, because the
-// Backend interface has no rename. The copy re-reads the raw bytes instead of
-// re-marshalling the parsed struct so a manifest written by a different version
-// keeps any fields this binary does not know about.
-//
-// Ordering matters and is deliberate: write the parked copy FIRST, and only
-// delete the original once it lands. A crash between the two leaves both, and
-// the next recovery pass re-parks idempotently. The reverse order could lose
-// the manifest entirely.
+// (#747) without discarding the record of what the manifest described. The
+// copy-then-delete mechanics and their ordering live in parkManifestCopy.
 //
 // A failure here returns an error, which keeps the manifest for the next cycle.
 // That is right for the transient case (the backend is down). The one way it
@@ -496,15 +583,8 @@ func (m *ManifestManager) quarantineManifest(ctx context.Context, manifestPath, 
 		return nil
 	}
 
-	raw, err := m.backend.Read(ctx, manifestPath)
-	if err != nil {
-		return fmt.Errorf("quarantine manifest %s: read: %w", manifestPath, err)
-	}
-	if err := m.backend.Write(ctx, parkedPath, raw); err != nil {
-		return fmt.Errorf("quarantine manifest %s: park to %s: %w", manifestPath, parkedPath, err)
-	}
-	if err := m.DeleteManifest(ctx, manifestPath); err != nil {
-		return fmt.Errorf("quarantine manifest %s: remove original after parking: %w", manifestPath, err)
+	if err := m.parkManifestCopy(ctx, manifestPath, parkedPath); err != nil {
+		return err
 	}
 
 	// Counted here, not on entry: every step above can fail transiently, and
@@ -520,6 +600,66 @@ func (m *ManifestManager) quarantineManifest(ctx context.Context, manifestPath, 
 		Str("output", badKey).
 		Msg("Compaction manifest names an output key no storage backend can address; parked instead of retried. Its inputs are no longer held back from compaction. The output may still exist and still be served by the query path even though storage cannot address it: on Azure a backslash key IS the separator-spelled blob, and on local disk it is a normal filename inside the partition glob. Check that partition for duplicate rows")
 
+	return nil
+}
+
+// parkManifestCopy is the copy-then-delete that moves a manifest out of the
+// ".json" work set while keeping its raw bytes under parkedPath. It is a copy
+// rather than a rename because the Backend interface has no rename, and it
+// copies the raw bytes rather than re-marshalling so a manifest written by a
+// different version keeps fields this binary does not know about. Write
+// first, delete second: a crash between the two leaves both, and the next
+// pass re-parks idempotently, whereas the reverse order could lose the record.
+func (m *ManifestManager) parkManifestCopy(ctx context.Context, manifestPath, parkedPath string) error {
+	raw, err := m.backend.Read(ctx, manifestPath)
+	if err != nil {
+		return fmt.Errorf("quarantine manifest %s: read: %w", manifestPath, err)
+	}
+	if err := m.backend.Write(ctx, parkedPath, raw); err != nil {
+		return fmt.Errorf("quarantine manifest %s: park to %s: %w", manifestPath, parkedPath, err)
+	}
+	if err := m.DeleteManifest(ctx, manifestPath); err != nil {
+		return fmt.Errorf("quarantine manifest %s: remove original after parking: %w", manifestPath, err)
+	}
+	return nil
+}
+
+// parkUnparseableManifest parks a manifest whose body does not decode. The
+// bytes are copied as-is (a zero-length file parks as a zero-length file) so
+// whatever an operator can still learn from them survives, and the parked
+// name keeps the tier, database and job ID that GenerateManifestPath encodes,
+// which is the only remaining pointer to the partition to inspect.
+//
+// It is parked rather than deleted because the manifest's absence is not
+// proof that nothing happened: LocalBackend never fsyncs, so after a power
+// loss the manifest can be empty while the output rename and some input
+// unlinks that followed it are already journaled. A decodable manifest would
+// repair either state (delete a short output, finish the input deletes); an
+// undecodable one cannot, and the log line plus the parked path are what an
+// operator has to go on.
+func (m *ManifestManager) parkUnparseableManifest(ctx context.Context, manifestPath string, cause error) error {
+	parkedPath, err := quarantinePathFor(manifestPath)
+	if err != nil {
+		// Unreachable in practice (quarantinePathFor hashes overlong names).
+		// The alternative to handling it is a file that blocks every cycle.
+		if delErr := m.DeleteManifest(ctx, manifestPath); delErr != nil {
+			return delErr
+		}
+		m.logger.Error().
+			Err(cause).
+			Str("manifest", manifestPath).
+			AnErr("park_error", err).
+			Msg("Compaction manifest cannot be parsed and could not be parked under any name; deleted it so compaction can proceed. This line is the only surviving record of the path")
+		return nil
+	}
+	if err := m.parkManifestCopy(ctx, manifestPath, parkedPath); err != nil {
+		return err
+	}
+	m.logger.Error().
+		Err(cause).
+		Str("manifest", manifestPath).
+		Str("parked_to", parkedPath).
+		Msg("Compaction manifest cannot be parsed; parked so it no longer blocks compaction. Its inputs are no longer held back. If the crash it records happened after the output upload, that partition may hold a short output or both the output and its inputs: check it for a zero-length _compacted file and for duplicate rows")
 	return nil
 }
 
@@ -564,10 +704,27 @@ func (m *ManifestManager) GetFilesInManifests(ctx context.Context) (map[string]s
 	result := make(map[string]struct{})
 
 	for _, manifestPath := range manifests {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		manifest, err := m.ReadManifest(ctx, manifestPath)
-		if err != nil {
-			m.logger.Warn().Err(err).Str("manifest", manifestPath).Msg("Failed to read manifest for cache")
+		if errors.Is(err, ErrManifestUnparseable) {
+			// Names no input this binary can act on, and recovery parks it on
+			// the next cycle whose database scope includes it (a scheduled
+			// cycle is unscoped). Failing closed on it would skip every
+			// candidate on the node until then. Logged once per path; the key
+			// is prefixed so PendingOutputsUnder's own once-per-path message
+			// is not suppressed by this one.
+			if _, seen := m.unparseableLogged.LoadOrStore("cache:"+manifestPath, struct{}{}); !seen {
+				m.logger.Warn().Err(err).Str("manifest", manifestPath).
+					Msg("Compaction manifest cannot be parsed; candidate filtering ignores it until recovery parks it")
+			}
 			continue
+		}
+		if err != nil {
+			// A transient read failure hides inputs of an in-flight job.
+			// Keep the previous cache untouched and fail closed this cycle.
+			return nil, fmt.Errorf("read manifest for cache %s: %w", manifestPath, err)
 		}
 
 		files := make(map[string]struct{})
@@ -575,7 +732,8 @@ func (m *ManifestManager) GetFilesInManifests(ctx context.Context) (map[string]s
 			files[f] = struct{}{}
 			result[f] = struct{}{}
 		}
-		// Also add output file to prevent re-compaction
+		// Also protect outputs on both a cache miss and a cache hit.
+		files[manifest.OutputPath] = struct{}{}
 		result[manifest.OutputPath] = struct{}{}
 		newCache[manifestPath] = files
 	}
@@ -626,11 +784,10 @@ func (m *ManifestManager) IsFileInManifest(ctx context.Context, filePath string)
 // case and is treated as absent. A storage read failure is returned, so the
 // caller fails closed on a transient outage. A manifest that reads but does
 // not parse (a zero-length file left by a crash before the rename was
-// durable) is skipped and reported once per path: recovery treats such a
-// manifest as carrying no information and deletes it, and failing every
-// measurement on every pass until then — or forever, when compaction is
-// disabled and recovery never runs — would be an outage over a file that
-// names nothing.
+// durable) is skipped and reported once per path: recovery parks such a
+// manifest under ManifestQuarantineSuffix, and failing every measurement on
+// every pass until then (or forever, when compaction is disabled and
+// recovery never runs) would be an outage over a file that names nothing.
 //
 // Keys are compared in slash form: OutputPath is written with filepath.Join,
 // the listing the exporter compares against is ToSlash'ed.
@@ -653,7 +810,7 @@ func (m *ManifestManager) PendingOutputsUnder(ctx context.Context, prefix string
 		if err := json.Unmarshal(data, &manifest); err != nil {
 			if _, seen := m.unparseableLogged.LoadOrStore(path, struct{}{}); !seen {
 				m.logger.Error().Err(err).Str("manifest", path).
-					Msg("Compaction manifest cannot be parsed; the Iceberg export ignores it (compaction's next recovery cycle deletes it — delete it by hand if compaction is disabled)")
+					Msg("Compaction manifest cannot be parsed; the Iceberg export ignores it (compaction's next recovery cycle parks it under the .quarantined suffix; park or delete it by hand if compaction is disabled)")
 			}
 			continue
 		}

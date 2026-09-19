@@ -398,6 +398,26 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### Configurable compaction cycle budget and cancellation ([#915](https://github.com/Basekick-Labs/arc/issues/915))
+
+Scheduled and manual compaction use the same configurable cycle deadline
+(`compaction.cycle_timeout`, default `30m`). Cancellation stops new work,
+waits for active workers and records separate completed, failed, interrupted
+and discovered-but-unstarted batch counts. Manual execution supports
+`POST /api/v1/compaction/trigger?database=db&measurement=cpu`, with `tier`
+remaining optional. The measurement filter requires a valid database and applies to manifest
+recovery as well as new candidate discovery; recovery spans every tier
+regardless of which tier the cycle runs. Recovery and eligibility failures
+now fail the cycle, while completed recovery progress survives cancellation.
+A manifest that cannot be read is retained and fails the cycle closed; a
+manifest that reads but cannot be decoded (for example a zero-length file
+left by a crash) is parked under the `.quarantined` suffix so it stops
+blocking compaction, and candidate filtering ignores it until then. Normal
+cancellation does not enter the adaptive retry path or emit misleading
+batch-failure logs.
+Increasing the deadline does not reduce peak memory demand or guarantee
+completion.
+
 ### Peer file fetches now respect the overall timeout ([#796](https://github.com/Basekick-Labs/arc/issues/796))
 
 The configured `cluster.replication_fetch_timeout_ms` did not reliably bound a file fetch. Reading the acknowledgement header could replace the context deadline with a longer timeout, and the subsequent body transfer could block indefinitely if a peer stopped sending data.
@@ -692,7 +712,7 @@ Compaction uploads the compacted file into the partition before it deletes the s
 
 The reconciler now reads compaction's crash-recovery manifests before it stats a partition's files and leaves out any compacted output whose manifest still exists and at least one of whose source files is still present. The output is registered on the pass after the compaction has replaced its sources, in one snapshot with the sources' removal, which is the transition Arc's own file set makes. The order of the reads is what makes this safe: compaction deletes its manifest only after every source is gone, or after it has removed an output it could not keep, so a manifest that is absent means the sources vanish from the same pass, and a manifest that is present means the output is held back. A compaction that commits in the few milliseconds between the manifest read and the file stats leaves that partition out for one pass (an empty snapshot if it is the measurement's only partition), refilled on the next. The state is consulted per measurement on every pass, fresh from storage, so a compaction that starts mid-pass is seen. The lookup is wired even when compaction is disabled, since a manifest from an earlier run can still be in storage.
 
-One under-count remains, bounded by the compaction schedule: if a compaction deletes some sources and fails on the rest, its output stays hidden while the surviving sources are exported, until the next compaction cycle's recovery finishes the job (with compaction disabled no recovery runs, and the partition stays that way until compaction is re-enabled or the manifest is removed by hand). That replaces a double count with a short, bounded under-count. A manifest that cannot be parsed is ignored and reported once, since it names nothing; recovery deletes it.
+One under-count remains, bounded by the compaction schedule: if a compaction deletes some sources and fails on the rest, its output stays hidden while the surviving sources are exported, until the next compaction cycle's recovery finishes the job (with compaction disabled no recovery runs, and the partition stays that way until compaction is re-enabled or the manifest is removed by hand). That replaces a double count with a short, bounded under-count. A manifest that cannot be parsed is ignored and reported once, since it names nothing; recovery parks it under the `.quarantined` suffix.
 
 ### Arrow IPC queries were invisible to query management and slow-query logging ([#309](https://github.com/Basekick-Labs/arc/issues/309))
 

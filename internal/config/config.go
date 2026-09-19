@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/viper"
 )
@@ -149,18 +150,19 @@ type AuthConfig struct {
 }
 
 type CompactionConfig struct {
-	Enabled                   bool   // Enable compaction
-	HourlySchedule            string // Cron schedule for hourly compaction (default: "5 * * * *")
-	DailySchedule             string // Cron schedule for daily compaction (default: "0 3 * * *")
-	HourlyEnabled             bool   // Enable hourly tier
-	DailyEnabled              bool   // Enable daily tier
-	HourlyMinAgeHours         int    // Minimum age for hourly compaction (default: 1)
-	HourlyMinFiles            int    // Minimum files for hourly compaction (default: 10)
-	DailyMinAgeHours          int    // Minimum age for daily compaction (default: 24)
-	DailyMinFiles             int    // Minimum files for daily compaction (default: 12)
-	DailySkipFileAgeCheckDays int    // Skip file creation time check for partitions older than N days (default: 7)
-	MaxConcurrent             int    // Max concurrent compaction jobs (default: 2)
-	TempDirectory             string // Temporary directory for compaction files (default: ./data/compaction)
+	Enabled                   bool          // Enable compaction
+	HourlySchedule            string        // Cron schedule for hourly compaction (default: "5 * * * *")
+	DailySchedule             string        // Cron schedule for daily compaction (default: "0 3 * * *")
+	HourlyEnabled             bool          // Enable hourly tier
+	DailyEnabled              bool          // Enable daily tier
+	HourlyMinAgeHours         int           // Minimum age for hourly compaction (default: 1)
+	HourlyMinFiles            int           // Minimum files for hourly compaction (default: 10)
+	DailyMinAgeHours          int           // Minimum age for daily compaction (default: 24)
+	DailyMinFiles             int           // Minimum files for daily compaction (default: 12)
+	DailySkipFileAgeCheckDays int           // Skip file creation time check for partitions older than N days (default: 7)
+	MaxConcurrent             int           // Max concurrent compaction jobs (default: 2)
+	CycleTimeout              time.Duration // Maximum duration of one compaction cycle (default: 30m)
+	TempDirectory             string        // Temporary directory for compaction files (default: ./data/compaction)
 
 	// MemoryLimit is the DuckDB memory limit applied to EACH compaction
 	// subprocess. Empty (the default) means auto-derive: database.memory_limit
@@ -776,6 +778,15 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("invalid query.s3_cache_size: %w", err)
 	}
 
+	// Compaction cycle budget uses Go duration syntax, e.g. 30m, 2h or 90s.
+	cycleTimeout, err := time.ParseDuration(v.GetString("compaction.cycle_timeout"))
+	if err != nil || cycleTimeout <= 0 {
+		return nil, fmt.Errorf(
+			"invalid compaction.cycle_timeout %q: must be a positive Go duration",
+			v.GetString("compaction.cycle_timeout"),
+		)
+	}
+
 	// Build config from Viper (which includes defaults + env vars)
 	cfg := &Config{
 		Server: ServerConfig{
@@ -902,6 +913,7 @@ func Load() (*Config, error) {
 			DailyMinFiles:               v.GetInt("compaction.daily_min_files"),
 			DailySkipFileAgeCheckDays:   v.GetInt("compaction.daily_skip_file_age_check_days"),
 			MaxConcurrent:               v.GetInt("compaction.max_concurrent"),
+			CycleTimeout:                cycleTimeout,
 			MaxFilesPerBatch:            v.GetInt("compaction.max_files_per_batch"),
 			TempDirectory:               v.GetString("compaction.temp_directory"),
 			MemoryLimit:                 v.GetString("compaction.memory_limit"),
@@ -1579,6 +1591,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.daily_min_files", 12)                 // 12 files minimum
 	v.SetDefault("compaction.daily_skip_file_age_check_days", 7)   // Skip file age check for partitions older than 7 days
 	v.SetDefault("compaction.max_concurrent", 2)                   // 2 concurrent jobs
+	v.SetDefault("compaction.cycle_timeout", "30m")                // Maximum duration per cycle
 	v.SetDefault("compaction.max_files_per_batch", 30)             // 30 files per DuckDB read_parquet() call; valid range [2, 500]
 	v.SetDefault("compaction.temp_directory", "./data/compaction") // Temp directory for compaction files
 	v.SetDefault("compaction.memory_limit", "")                    // "" = auto: database.memory_limit / max_concurrent (see CompactionConfig.MemoryLimit)
