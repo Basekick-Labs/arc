@@ -44,8 +44,11 @@ func ArrowTypeFromDuckDB(name string) (arrow.DataType, bool) {
 	if strings.HasPrefix(n, "DECIMAL(") && strings.HasSuffix(n, ")") {
 		parts := strings.Split(strings.TrimSuffix(strings.TrimPrefix(n, "DECIMAL("), ")"), ",")
 		if len(parts) == 2 {
-			p, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
-			s, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+			// Parsed as 32-bit values (the Arrow field width) so the
+			// conversion below is bounded by construction; DECIMAL allows
+			// at most 38 digits and the scale cannot exceed the precision.
+			p, err1 := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 32)
+			s, err2 := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 32)
 			if err1 == nil && err2 == nil && p > 0 && p <= 38 && s >= 0 && s <= p {
 				return &arrow.Decimal128Type{Precision: int32(p), Scale: int32(s)}, true
 			}
