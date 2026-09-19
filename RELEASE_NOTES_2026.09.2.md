@@ -462,11 +462,24 @@ read by every node and re-read on a short TTL, so a field added on one node
 binds on the others within a minute; each node keeps the copy DuckDB reads
 under its upload directory. `_schema/` is a reserved root directory:
 compaction, reconciliation, tiering, edge sync and the Iceberg exporter skip
-it. Backups copy it with the rest of the storage root, inventoried as a
-database named `_schema`, so a restore of a single database does not carry
-that database's anchors; the next query bootstraps them. A node that
-receives Parquet files from a peer rather than through its own ingest path
-also relies on bootstrap for those measurements.
+it. Backups copy it with the rest of the storage root and restore it with
+the data. A node that receives Parquet files from a peer rather than
+through its own ingest path relies on bootstrap for those measurements.
+
+### Backups no longer list the schema anchor directory as a database ([#927](https://github.com/Basekick-Labs/arc/issues/927))
+
+The field schema anchors under `_schema/` (#914) are Parquet objects, so a
+backup inventoried them as a database named `_schema` with one
+"measurement" per real database: a bogus entry in the manifest, in
+`GET /api/v1/backups` and in the database count. They are now recorded as
+auxiliary files, reported in the manifest's new `auxiliary_files` count,
+and kept out of `databases`. They stay inside `total_files` and
+`total_size_bytes` on purpose: the restore compares that count against
+every Parquet object it finds, and an anchor left out of it would have
+hidden a missing data file. Restore is unchanged: it copies every object
+under `data/` back, anchors included. Backups written before this release
+restore the same way. Compaction's recovery manifests under
+`_compaction_state/` are still not backed up; that is tracked as #930.
 
 ### Empty time ranges can be answered from the schema anchor (experimental, [#928](https://github.com/Basekick-Labs/arc/issues/928))
 

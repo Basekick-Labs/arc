@@ -221,6 +221,10 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifes
 		return fmt.Errorf("failed to list backup data files: %w", err)
 	}
 
+	// Every object under data/ is restored to its original key, including
+	// the field schema anchors under _schema/ (#927); they are counted in
+	// TotalFiles like any other .parquet object, so the present-vs-inventoried
+	// arithmetic below needs no special case for them.
 	progress.TotalFiles = int64(len(files))
 	progress.TotalBytes = manifest.TotalSizeBytes
 
