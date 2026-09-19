@@ -167,6 +167,20 @@ enabled = false
 # default_max_rows_per_query = 0
 
 # -----------------------------------------------------------------------------
+# Automatic network spoke sync (#828). Disabled unless the network spoke is
+# explicitly enabled with its hub URL, IDs and environment-only credentials.
+# Bundle export remains manual and is not started by this scheduler.
+#
+# [edge_sync.spoke]
+# enabled = false
+# sync_interval = "5m"         # Interval after a completed scheduled pass
+# sync_retry_interval = "30s"  # Initial retry delay; exponential up to interval
+#
+# Environment overrides:
+# ARC_EDGE_SYNC_SPOKE_SYNC_INTERVAL
+# ARC_EDGE_SYNC_SPOKE_SYNC_RETRY_INTERVAL
+#
+# -----------------------------------------------------------------------------
 # Telemetry
 # -----------------------------------------------------------------------------
 [telemetry]
