@@ -1014,16 +1014,13 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 	if filterDatabases == nil {
 		recoveryDatabases = nil
 	}
-	recoveryTiers := make([]string, 0, len(tierNames))
-	for _, tier := range m.Tiers {
-		if tier.IsEnabled() && tierFilter[tier.GetTierName()] {
-			recoveryTiers = append(recoveryTiers, tier.GetTierName())
-		}
-	}
-	// Run manifest recovery before starting new compactions
-	// This ensures interrupted compactions from previous cycles are completed
+	// Run manifest recovery before starting new compactions. This ensures
+	// interrupted compactions from previous cycles are completed. Recovery
+	// honors the manual database/measurement scope but spans every tier: see
+	// recoveryScope for why a tier-scoped recovery is wrong for the
+	// single-tier schedulers.
 	if m.ManifestManager != nil {
-		recovered, err := m.ManifestManager.recoverOrphanedManifests(ctx, recoveryScope{Databases: recoveryDatabases, Measurement: filterMeasurement, Tiers: recoveryTiers}, m.notifyCompactedOutput, m.notifyConsumedInputs)
+		recovered, err := m.ManifestManager.recoverOrphanedManifests(ctx, recoveryScope{Databases: recoveryDatabases, Measurement: filterMeasurement}, m.notifyCompactedOutput, m.notifyConsumedInputs)
 		if recovered > 0 {
 			m.mu.Lock()
 			m.totalManifestsRecov += recovered

@@ -96,10 +96,12 @@ enabled = true
 # a larger timeout does not guarantee completion of arbitrary workloads.
 # Overlapping scheduled ticks are skipped; a manual trigger during a running
 # cycle returns HTTP 409. No second cycle runs concurrently in one manager.
-# Manual targeting (also scopes recovery):
+# Manual targeting (database/measurement also scope manifest recovery; every
+# cycle recovers orphans of all tiers, whichever tier it runs):
 # POST /api/v1/compaction/trigger?database=db&measurement=cpu&tier=hourly
 # measurement requires database. Failed recovery/eligibility lookups fail the
-# cycle; valid delivery deferrals do not. Unreadable manifests stay protected.
+# cycle; valid delivery deferrals do not. A manifest that cannot be read is
+# retained; one that cannot be decoded is parked as *.quarantined.
 # cycle_timeout = "30m"
 
 # Hourly
