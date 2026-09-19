@@ -2,6 +2,15 @@
 
 > **Status:** Planned — November 2026 patch release.
 
+## Compaction database-name sanitization is documented as non-unique ([#750](https://github.com/Basekick-Labs/arc/issues/750))
+
+The `sanitizeDBForName` comment now explains that replacing slashes with dots
+produces a path-safe token, not a unique database identity: spoke IDs may
+contain dots, so distinct pseudo-database names can collide. A regression test
+documents the collision; runtime behavior is unchanged.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#920](https://github.com/Basekick-Labs/arc/pull/920).
+
 ## Compaction dedup metrics count Parquet rows correctly ([#1015](https://github.com/Basekick-Labs/arc/issues/1015))
 
 Deduplication row counts now come from DuckDB's `parquet_file_metadata`, where
