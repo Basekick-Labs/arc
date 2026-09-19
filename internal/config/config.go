@@ -490,6 +490,13 @@ type QueryConfig struct {
 	StableSchemaBootstrap bool
 	// StableSchemaBootstrapMaxFiles caps the footers one bootstrap reads.
 	StableSchemaBootstrapMaxFiles int
+	// EmptyRangeAnchorScan (EXPERIMENTAL, 26.09.2, #928) answers a time range
+	// proven to hold no data from the measurement's field schema anchor alone
+	// instead of scanning the whole measurement. Needs StableSchema and a
+	// complete anchor; the proof requires a plain single-table query with
+	// bare time bounds, a range of at most 7 days, a standard partition
+	// layout, and fresh verified listings. Opt-in while experimental.
+	EmptyRangeAnchorScan bool
 }
 
 // LicenseConfig holds configuration for enterprise license validation
@@ -989,6 +996,7 @@ func Load() (*Config, error) {
 			StableSchema:                  v.GetBool("query.stable_schema"),
 			StableSchemaBootstrap:         v.GetBool("query.stable_schema_bootstrap"),
 			StableSchemaBootstrapMaxFiles: v.GetInt("query.stable_schema_bootstrap_max_files"),
+			EmptyRangeAnchorScan:          v.GetBool("query.empty_range_anchor_scan"),
 			EnableS3Cache:                 v.GetBool("query.enable_s3_cache"),
 			S3CacheSize:                   s3CacheSize,
 			S3CacheTTLSeconds:             v.GetInt("query.s3_cache_ttl_seconds"),
@@ -1667,6 +1675,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("query.stable_schema", true)                    // #914: range-independent field binding via _schema/ anchors
 	v.SetDefault("query.stable_schema_bootstrap", true)          // Build anchors for pre-26.09.2 measurements on first query
 	v.SetDefault("query.stable_schema_bootstrap_max_files", 500) // Footers sampled per bootstrap (newest days, compacted files first)
+	v.SetDefault("query.empty_range_anchor_scan", false)         // EXPERIMENTAL (26.09.2, #928), opt-in
 	v.SetDefault("query.enable_s3_cache", false)                 // Disabled by default (opt-in feature)
 	v.SetDefault("query.s3_cache_size", "128MB")                 // 128MB cache (256 blocks × 512KB)
 	v.SetDefault("query.s3_cache_ttl_seconds", 3600)             // 1 hour

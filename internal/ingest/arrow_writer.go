@@ -1220,7 +1220,7 @@ func (b *ArrowBuffer) SetWAL(wal WALWriter) {
 // buffer writes. Implemented by fieldschema.Registry; an interface so ingest
 // tests can observe registrations without a storage-backed registry.
 type FieldSchemaRegistrar interface {
-	Ensure(ctx context.Context, database, measurement string, schema *arrow.Schema, tagColumns []string) error
+	EnsureFile(ctx context.Context, database, measurement string, schema *arrow.Schema, tagColumns []string, storageKey string) error
 }
 
 // SetFieldSchema installs the field schema registrar (#914).
@@ -1231,11 +1231,11 @@ func (b *ArrowBuffer) SetFieldSchema(r FieldSchemaRegistrar) {
 // registerFieldSchema folds a just-written file's schema into the
 // measurement's anchor. The file is already durable; a registry failure is
 // logged and never fails the flush.
-func (b *ArrowBuffer) registerFieldSchema(ctx context.Context, database, measurement string, schema *arrow.Schema, tagColumns []string) {
+func (b *ArrowBuffer) registerFieldSchema(ctx context.Context, database, measurement string, schema *arrow.Schema, tagColumns []string, storageKey string) {
 	if b.fieldSchema == nil || schema == nil {
 		return
 	}
-	if err := b.fieldSchema.Ensure(ctx, database, measurement, schema, tagColumns); err != nil {
+	if err := b.fieldSchema.EnsureFile(ctx, database, measurement, schema, tagColumns, storageKey); err != nil {
 		b.logger.Warn().Err(err).
 			Str("database", database).
 			Str("measurement", measurement).
@@ -2799,7 +2799,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
 			return fmt.Errorf("failed to write to storage: %w", err)
 		}
-		b.registerFieldSchema(ctx, database, measurement, fileSchema, sorted.TagColumns)
+		b.registerFieldSchema(ctx, database, measurement, fileSchema, sorted.TagColumns, storagePath)
 
 		// Register file in tiering metadata for query routing
 		b.registerFileInTiering(ctx, database, measurement, storagePath, minTime, int64(len(parquetData)), parquetSumHex)
@@ -2879,7 +2879,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
 			return fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err)
 		}
-		b.registerFieldSchema(ctx, database, measurement, fileSchema, sorted.TagColumns)
+		b.registerFieldSchema(ctx, database, measurement, fileSchema, sorted.TagColumns, storagePath)
 
 		written = append(written, tieringEntry{
 			storagePath: storagePath,

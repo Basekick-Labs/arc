@@ -2916,6 +2916,14 @@ func main() {
 		queryHandler.SetAuthAndRBAC(authManager, rbacManager)
 	}
 	queryHandler.SetFieldSchema(fieldSchemaRegistry)
+	if cfg.Query.EmptyRangeAnchorScan {
+		if cfg.Query.StableSchema {
+			queryHandler.SetEmptyRangeAnchorScan(true)
+			log.Info().Msg("Empty-range anchor scan enabled (query.empty_range_anchor_scan, experimental)")
+		} else {
+			log.Warn().Msg("query.empty_range_anchor_scan ignored: it requires query.stable_schema")
+		}
+	}
 	if cfg.Query.FileTimePruning {
 		queryHandler.SetFileTimePruning(true, time.Duration(cfg.Query.FileTimePruningMarginSeconds)*time.Second)
 	}

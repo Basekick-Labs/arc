@@ -640,6 +640,7 @@ type QueryHandler struct {
 	storage            storage.Backend
 	pruner             *pruning.PartitionPruner
 	fieldSchema        *fieldschema.Registry // nil or disabled: SQL is built exactly as before #914
+	emptyRangeAnchor   bool                  // #928: answer a proven-empty range from a complete anchor alone
 	queryCache         *database.QueryCache
 	logger             zerolog.Logger
 	authManager        *auth.AuthManager
@@ -1121,6 +1122,30 @@ func (h *QueryHandler) SetTieringManager(manager *tiering.Manager) {
 // of failing.
 func (h *QueryHandler) SetFieldSchema(r *fieldschema.Registry) {
 	h.fieldSchema = r
+}
+
+// SetEmptyRangeAnchorScan enables answering a proven-empty time range from
+// the measurement's schema anchor alone instead of scanning the whole
+// measurement (#928). Requires the field schema registry; experimental.
+func (h *QueryHandler) SetEmptyRangeAnchorScan(enabled bool) {
+	h.emptyRangeAnchor = enabled
+}
+
+// pruneWithAnchor runs partition pruning for one table reference. When the
+// empty-range shortcut is on and the measurement's anchor is complete, the
+// pruner is asked for a proof; a proven-empty range is answered by the
+// anchor alone. Returns the read_parquet expression to use when that
+// happened, or "" with the pruner's usual result otherwise.
+func (h *QueryHandler) pruneWithAnchor(ctx context.Context, path, originalSQL, keyword, anchor, options, database, measurement string) (string, interface{}, bool) {
+	if h.emptyRangeAnchor && anchor != "" && h.fieldSchema.IsComplete(database, measurement) {
+		optimized, was, empty := h.pruner.OptimizeTablePathVerdict(ctx, path, originalSQL)
+		if empty {
+			return readParquetExpr(keyword, "", []string{anchor}, options), nil, false
+		}
+		return "", optimized, was
+	}
+	optimized, was := h.pruner.OptimizeTablePath(ctx, path, originalSQL)
+	return "", optimized, was
 }
 
 // anchorFor returns the local anchor path for a measurement, or "" when
@@ -3380,7 +3405,10 @@ func (h *QueryHandler) buildReadParquetExpr(ctx context.Context, path, originalS
 	anchor := h.anchorFor(ctx, anchorDB, anchorMeas)
 
 	// Apply partition pruning
-	optimizedPath, wasOptimized := h.pruner.OptimizeTablePath(ctx, path, originalSQL)
+	emptyExpr, optimizedPath, wasOptimized := h.pruneWithAnchor(ctx, path, originalSQL, keyword, anchor, options, anchorDB, anchorMeas)
+	if emptyExpr != "" {
+		return emptyExpr
+	}
 
 	if wasOptimized {
 		// Check if it's a list of paths or a single path
@@ -3442,7 +3470,11 @@ func (h *QueryHandler) buildReadParquetExprForParallel(ctx context.Context, path
 	anchor := h.anchorFor(ctx, anchorDB, anchorMeas)
 
 	// Apply partition pruning
-	optimizedPath, wasOptimized := h.pruner.OptimizeTablePath(ctx, path, originalSQL)
+	emptyExpr, optimizedPath, wasOptimized := h.pruneWithAnchor(ctx, path, originalSQL, keyword, anchor, options, anchorDB, anchorMeas)
+	if emptyExpr != "" {
+		// An anchor-only scan is one tiny file; never fanned out.
+		return emptyExpr, nil
+	}
 
 	if wasOptimized {
 		if pathList, ok := optimizedPath.([]string); ok {

@@ -164,6 +164,12 @@ enabled = false
 # queues one on demand; GET .../schema shows the registered fields.
 # stable_schema_bootstrap = true
 # stable_schema_bootstrap_max_files = 500
+# EXPERIMENTAL (#928): answer a time range proven to hold no data from the
+# measurement's schema anchor alone instead of scanning the whole measurement.
+# Applies to plain single-table queries with bare time bounds over at most 7
+# days, on measurements whose anchor is complete; everything else keeps the
+# full scan. Requires stable_schema. Opt-in while experimental.
+# empty_range_anchor_scan = false
 
 # Slow query logging threshold in milliseconds (0 = disabled)
 # Queries exceeding this threshold emit a WARN log and increment arc_slow_queries_total
