@@ -561,6 +561,17 @@ predate that fix and #978.
 
 ## Bug fixes
 
+### Atomic visibility for Raft manifest batches ([#447](https://github.com/Basekick-Labs/arc/issues/447))
+
+A batch of file registrations, deletions and updates previously released the
+Raft manifest lock between operations. Concurrent readers and file callbacks
+could observe an intermediate state with compaction inputs removed before the
+output was registered. All file mutations in a batch now execute under one
+write lock, and callbacks run in their original order after the completed
+batch is visible and the lock is released.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#910](https://github.com/Basekick-Labs/arc/pull/910).
+
 ### A delete-API rewrite after a writer failover now names the node that holds the new bytes ([#976](https://github.com/Basekick-Labs/arc/issues/976))
 
 The delete API rewrites a Parquet file in place on the primary writer and

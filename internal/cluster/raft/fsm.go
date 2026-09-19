@@ -1168,10 +1168,8 @@ func (f *ClusterFSM) applyRegisterFile(payload []byte, logIndex uint64) interfac
 }
 
 // applyRegisterFileStruct is the struct-taking variant of applyRegisterFile.
-// applyBatchFileOps calls this directly after unmarshalling the payload
-// once in its pre-validation pass, avoiding a second unmarshal in the
-// apply loop. Non-batch callers go through applyRegisterFile, which
-// unmarshals + dispatches here.
+// Single-op callers validate here; batch callers use the shared locked
+// mutation helper after validating every operation up front.
 func (f *ClusterFSM) applyRegisterFileStruct(p RegisterFilePayload, logIndex uint64) interface{} {
 	// Validate the path BEFORE any state mutation. See GHSA-f85q-mvg8-qf37:
 	// historically the only check was empty-string, which let an attacker
@@ -1190,10 +1188,20 @@ func (f *ClusterFSM) applyRegisterFileStruct(p RegisterFilePayload, logIndex uin
 		return fmt.Errorf("register file: created_at is required")
 	}
 
-	// Stamp the LSN from the Raft log index (deterministic across all nodes)
-	p.File.LSN = logIndex
-
 	f.mu.Lock()
+	emit := f.applyRegisterFileLocked(p, logIndex)
+	f.mu.Unlock()
+
+	if emit != nil {
+		emit()
+	}
+	return nil
+}
+
+// applyRegisterFileLocked mutates the manifest with f.mu already held.
+// Its returned event must be delivered only after unlocking.
+func (f *ClusterFSM) applyRegisterFileLocked(p RegisterFilePayload, logIndex uint64) func() {
+	p.File.LSN = logIndex
 	entry := p.File
 	// If the file was already registered under a different database (unlikely
 	// but possible if an operator moves a file across databases), remove the
@@ -1216,23 +1224,22 @@ func (f *ClusterFSM) applyRegisterFileStruct(p RegisterFilePayload, logIndex uin
 	idx[entry.Path] = struct{}{}
 	f.keysCache = nil // invalidate sorted-key cache
 	callback := f.onFileRegistered
-	f.mu.Unlock()
+	return func() {
 
-	f.logger.Debug().
-		Str("path", entry.Path).
-		Str("database", entry.Database).
-		Str("measurement", entry.Measurement).
-		Str("origin", entry.OriginNodeID).
-		Int64("size_bytes", entry.SizeBytes).
-		Uint64("lsn", entry.LSN).
-		Msg("File registered in cluster manifest")
+		f.logger.Debug().
+			Str("path", entry.Path).
+			Str("database", entry.Database).
+			Str("measurement", entry.Measurement).
+			Str("origin", entry.OriginNodeID).
+			Int64("size_bytes", entry.SizeBytes).
+			Uint64("lsn", entry.LSN).
+			Msg("File registered in cluster manifest")
 
-	if callback != nil {
-		entryCopy := entry
-		callback(&entryCopy)
+		if callback != nil {
+			entryCopy := entry
+			callback(&entryCopy)
+		}
 	}
-
-	return nil
 }
 
 func (f *ClusterFSM) applyDeleteFile(payload []byte) interface{} {
@@ -1244,14 +1251,26 @@ func (f *ClusterFSM) applyDeleteFile(payload []byte) interface{} {
 }
 
 // applyDeleteFileStruct is the struct-taking variant of applyDeleteFile.
-// applyBatchFileOps calls this directly after unmarshalling once during
-// pre-validation, avoiding a second unmarshal in the apply loop.
+// Single-op callers validate here; batch callers use the shared locked
+// mutation helper after validating every operation up front.
 func (f *ClusterFSM) applyDeleteFileStruct(p DeleteFilePayload) interface{} {
 	if p.Path == "" {
 		return fmt.Errorf("delete file: path is required")
 	}
 
 	f.mu.Lock()
+	emit := f.applyDeleteFileLocked(p)
+	f.mu.Unlock()
+
+	if emit != nil {
+		emit()
+	}
+	return nil
+}
+
+// applyDeleteFileLocked mutates the manifest with f.mu already held.
+// Its returned event must be delivered only after unlocking.
+func (f *ClusterFSM) applyDeleteFileLocked(p DeleteFilePayload) func() {
 	existing, existed := f.files[p.Path]
 	delete(f.files, p.Path)
 	if existed {
@@ -1265,23 +1284,22 @@ func (f *ClusterFSM) applyDeleteFileStruct(p DeleteFilePayload) interface{} {
 	}
 	f.keysCache = nil // invalidate sorted-key cache
 	callback := f.onFileDeleted
-	f.mu.Unlock()
+	return func() {
 
-	if !existed {
-		// Idempotent — deletion of a non-existent file is a no-op
-		return nil
+		if !existed {
+			// Idempotent — deletion of a non-existent file is a no-op
+			return
+		}
+
+		f.logger.Debug().
+			Str("path", p.Path).
+			Str("reason", p.Reason).
+			Msg("File removed from cluster manifest")
+
+		if callback != nil {
+			callback(p.Path, p.Reason)
+		}
 	}
-
-	f.logger.Debug().
-		Str("path", p.Path).
-		Str("reason", p.Reason).
-		Msg("File removed from cluster manifest")
-
-	if callback != nil {
-		callback(p.Path, p.Reason)
-	}
-
-	return nil
 }
 
 func (f *ClusterFSM) applyUpdateFile(payload []byte, logIndex uint64) interface{} {
@@ -1293,8 +1311,8 @@ func (f *ClusterFSM) applyUpdateFile(payload []byte, logIndex uint64) interface{
 }
 
 // applyUpdateFileStruct is the struct-taking variant of applyUpdateFile.
-// applyBatchFileOps calls this directly after unmarshalling once during
-// pre-validation, avoiding a second unmarshal in the apply loop.
+// Single-op callers validate here; batch callers use the shared locked
+// mutation helper after validating every operation up front.
 func (f *ClusterFSM) applyUpdateFileStruct(p UpdateFilePayload, logIndex uint64) interface{} {
 	// Same validation as applyRegisterFile — an attacker who can submit
 	// Update commands could otherwise insert a new manifest entry at a
@@ -1317,15 +1335,20 @@ func (f *ClusterFSM) applyUpdateFileStruct(p UpdateFilePayload, logIndex uint64)
 		return fmt.Errorf("update file: created_at is required")
 	}
 
-	// Stamp the LSN from the current Raft log index so consumers that
-	// watch f.files for "did this entry change" can detect the update.
-	// Without this, an Update that mutates an existing entry would
-	// leave the LSN at its registration-time value, and downstream
-	// consumers (e.g. compaction watchers) couldn't distinguish a
-	// fresh state from a stale one.
-	p.File.LSN = logIndex
-
 	f.mu.Lock()
+	emit := f.applyUpdateFileLocked(p, logIndex)
+	f.mu.Unlock()
+
+	if emit != nil {
+		emit()
+	}
+	return nil
+}
+
+// applyUpdateFileLocked mutates the manifest with f.mu already held.
+// Its returned event must be delivered only after unlocking.
+func (f *ClusterFSM) applyUpdateFileLocked(p UpdateFilePayload, logIndex uint64) func() {
+	p.File.LSN = logIndex
 	entry := p.File
 	// If the database changed (defensive), remove the old secondary index entry first.
 	if old, existed := f.files[entry.Path]; existed && old.Database != entry.Database {
@@ -1347,23 +1370,22 @@ func (f *ClusterFSM) applyUpdateFileStruct(p UpdateFilePayload, logIndex uint64)
 	}
 	f.keysCache = nil // invalidate sorted-key cache
 	callback := f.onFileRegistered
-	f.mu.Unlock()
+	return func() {
 
-	f.logger.Debug().
-		Str("path", entry.Path).
-		Int64("size_bytes", entry.SizeBytes).
-		Str("sha256", entry.SHA256).
-		Msg("File updated in cluster manifest")
+		f.logger.Debug().
+			Str("path", entry.Path).
+			Int64("size_bytes", entry.SizeBytes).
+			Str("sha256", entry.SHA256).
+			Msg("File updated in cluster manifest")
 
-	// Trigger onFileRegistered so reader nodes detect the content change and
-	// pull the updated file from the writer. The file path is the same but the
-	// content (and checksum) changed, so readers must re-fetch it.
-	if callback != nil {
-		entryCopy := entry
-		callback(&entryCopy)
+		// Trigger onFileRegistered so reader nodes detect the content change and
+		// pull the updated file from the writer. The file path is the same but the
+		// content (and checksum) changed, so readers must re-fetch it.
+		if callback != nil {
+			entryCopy := entry
+			callback(&entryCopy)
+		}
 	}
-
-	return nil
 }
 
 func (f *ClusterFSM) applyAssignCompactor(payload []byte) interface{} {
@@ -1416,7 +1438,7 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 	// We store each decoded Register/Update payload in parallel slots
 	// (decoded[i]) so the apply loop below can call the *Struct apply
 	// variants directly without re-unmarshalling. Each payload is
-	// decoded exactly once; Delete ops keep nil decoded slots.
+	// decoded exactly once; all operation types retain decoded payloads.
 	decoded := make([]any, len(p.Ops))
 	for i, op := range p.Ops {
 		switch op.Type {
@@ -1487,38 +1509,46 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 		}
 	}
 
-	// Apply loop. Each *Struct call re-validates path + CreatedAt that
-	// the pre-pass above already passed for the same payload — that's
-	// intentional defense-in-depth (two cheap checks vs. one JSON
-	// unmarshal), and it lets the *Struct functions stand on their
-	// own when called outside the batch path (single-op Register /
-	// Update from internal/cluster/raft/node.go).
+	// Every payload has already passed the complete pre-validation pass.
+	// Hold a single write lock across the entire mutation sequence, so
+	// readers see either the old manifest or the fully applied batch.
+	// Capture callbacks while locked, but invoke them only after unlocking:
+	// callbacks may themselves read the FSM or enqueue follow-up work.
+	f.mu.Lock()
+	events := make([]func(), 0, len(p.Ops))
 	for i, op := range p.Ops {
-		var result interface{}
+		var emit func()
 		switch op.Type {
 		case CommandRegisterFile:
-			result = f.applyRegisterFileStruct(decoded[i].(RegisterFilePayload), logIndex)
+			emit = f.applyRegisterFileLocked(
+				decoded[i].(RegisterFilePayload), logIndex,
+			)
 		case CommandDeleteFile:
-			result = f.applyDeleteFileStruct(decoded[i].(DeleteFilePayload))
+			emit = f.applyDeleteFileLocked(
+				decoded[i].(DeleteFilePayload),
+			)
 		case CommandUpdateFile:
-			result = f.applyUpdateFileStruct(decoded[i].(UpdateFilePayload), logIndex)
+			emit = f.applyUpdateFileLocked(
+				decoded[i].(UpdateFilePayload), logIndex,
+			)
 		default:
-			// Unreachable: pre-pass at lines above rejects unsupported
-			// op types. Kept for type-completeness so the switch isn't
-			// missing the default arm.
-			return fmt.Errorf("batch file ops: op[%d] unsupported type: %d", i, op.Type)
+			// Unreachable after pre-validation. Do not retain the lock
+			// on this defensive error path.
+			f.mu.Unlock()
+			return fmt.Errorf(
+				"batch file ops: op[%d] unsupported type: %d",
+				i, op.Type,
+			)
 		}
-		// apply*FileStruct return nil on success or an error on failure
-		// — they never return a non-nil non-error value. The type-assert
-		// is defensive: if any handler is ever refactored to return
-		// something unexpected, we propagate it as an error rather than
-		// silently ignoring it.
-		if result != nil {
-			if err, ok := result.(error); ok {
-				return fmt.Errorf("batch file ops: op[%d] (type=%d): %w", i, op.Type, err)
-			}
-			return fmt.Errorf("batch file ops: op[%d] (type=%d): unexpected non-error result: %v", i, op.Type, result)
+		if emit != nil {
+			events = append(events, emit)
 		}
+	}
+	f.mu.Unlock()
+
+	// Preserve callback order and skip callbacks for idempotent deletes.
+	for _, emit := range events {
+		emit()
 	}
 	return nil
 }
