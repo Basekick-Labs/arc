@@ -212,6 +212,11 @@ func (r *Reconciler) derivePrefixes(ctx context.Context, manifest []*ObjectKey) 
 			return out
 		}
 		d := dirs[i]
+		if storage.IsReservedRootDir(d) {
+			// _compaction_state, _schema and dot-prefixed dirs are Arc's
+			// own state, not databases with orphans to find.
+			continue
+		}
 		if inspected >= r.cfg.MaxRootWalkDatabases {
 			out.partial = true
 			r.logger.Warn().
@@ -299,6 +304,11 @@ func (r *Reconciler) listPrefix(ctx context.Context, prefix string) ([]objectRec
 	return out, nil
 }
 
+// schemaAnchorDir is fieldschema.AnchorBasePath, spelled here so this
+// package does not depend on the registry: the zero-row field schema
+// anchors under it are Parquet files but never data (#914).
+const schemaAnchorDir = "_schema"
+
 // isParquetCandidate filters the storage walk to only the file kinds the
 // reconciler is allowed to act on. We deliberately ignore:
 //
@@ -322,7 +332,7 @@ func isParquetCandidate(p string) bool {
 		return false
 	}
 	for _, seg := range strings.Split(p, "/") {
-		if seg == "_compaction_state" {
+		if seg == "_compaction_state" || seg == schemaAnchorDir {
 			return false
 		}
 	}

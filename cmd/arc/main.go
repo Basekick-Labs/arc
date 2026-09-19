@@ -29,6 +29,7 @@ import (
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/edgesync"
+	"github.com/basekick-labs/arc/internal/fieldschema"
 	"github.com/basekick-labs/arc/internal/fips"
 	"github.com/basekick-labs/arc/internal/governance"
 	"github.com/basekick-labs/arc/internal/iceberg"
@@ -841,6 +842,33 @@ func main() {
 		arrowBuffer.SetWAL(walWriter)
 	}
 	shutdownCoordinator.Register("arrow-buffer", arrowBuffer, shutdown.PriorityBuffer)
+
+	// Measurement field schema registry (#914). Ingest folds every flushed
+	// file's schema into the measurement's stored anchor under _schema/;
+	// the query rewriter lists a local copy of that anchor first in every
+	// read_parquet so fields bind independently of the selected time range.
+	// The local copies live under the upload dir, which is inside DuckDB's
+	// allowed_directories.
+	fieldSchemaRegistry := fieldschema.New(storageBackend, db.DB(), fieldschema.Options{
+		Enabled:           cfg.Query.StableSchema,
+		Bootstrap:         cfg.Query.StableSchemaBootstrap,
+		BootstrapMaxFiles: cfg.Query.StableSchemaBootstrapMaxFiles,
+		LocalDir:          uploadDir,
+	}, logger.Get("fieldschema"))
+	fieldSchemaCtx, cancelFieldSchema := context.WithCancel(context.Background())
+	fieldSchemaRegistry.Start(fieldSchemaCtx)
+	shutdownCoordinator.Register("field-schema", shutdownFunc(func() error {
+		cancelFieldSchema()
+		fieldSchemaRegistry.Stop()
+		return nil
+	}), shutdown.PriorityBuffer)
+	arrowBuffer.SetFieldSchema(fieldSchemaRegistry)
+	if cfg.Query.StableSchema {
+		log.Info().
+			Bool("bootstrap", cfg.Query.StableSchemaBootstrap).
+			Int("bootstrap_max_files", cfg.Query.StableSchemaBootstrapMaxFiles).
+			Msg("Stable measurement field schema enabled (query.stable_schema)")
+	}
 
 	// Purge WAL files after ArrowBuffer has flushed (priority 30) and before the
 	// WAL writer closes (priority 40), so recovery does not replay data that is
@@ -2887,6 +2915,7 @@ func main() {
 	if authManager != nil && rbacManager != nil {
 		queryHandler.SetAuthAndRBAC(authManager, rbacManager)
 	}
+	queryHandler.SetFieldSchema(fieldSchemaRegistry)
 	if cfg.Query.FileTimePruning {
 		queryHandler.SetFileTimePruning(true, time.Duration(cfg.Query.FileTimePruningMarginSeconds)*time.Second)
 	}
@@ -3219,6 +3248,7 @@ func main() {
 
 	// Register Databases handler
 	databasesHandler := api.NewDatabasesHandler(storageBackend, &cfg.Delete, authManager, logger.Get("databases"))
+	databasesHandler.SetFieldSchema(fieldSchemaRegistry)
 	databasesHandler.RegisterRoutes(server.GetApp())
 
 	// Register Debug handler — admin-auth memory diagnostics
@@ -3336,6 +3366,9 @@ func main() {
 	if cfg.ContinuousQuery.Enabled {
 		var err error
 		cqHandler, err = api.NewContinuousQueryHandler(db, storageBackend, arrowBuffer, &cfg.ContinuousQuery, authManager, logger.Get("cq"))
+		if err == nil {
+			cqHandler.SetFieldSchema(fieldSchemaRegistry)
+		}
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize continuous query handler")
 		}

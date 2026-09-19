@@ -152,6 +152,19 @@ enabled = false
 # Query
 # -----------------------------------------------------------------------------
 [query]
+# Stable measurement field schema (26.09.2, #914). Every measurement keeps a
+# zero-row Parquet "anchor" under _schema/ listing every field it was ever
+# written with; queries list it first so a field absent from the files in a
+# narrow time range binds as a typed NULL column instead of a Binder Error,
+# and SELECT * has the same columns over any range. Ingest maintains it.
+# stable_schema = true
+# Build anchors for measurements written before 26.09.2 in the background on
+# first query, from at most this many file footers (newest days first,
+# compacted files preferred). POST /api/v1/databases/{db}/measurements/{m}/schema/rebuild
+# queues one on demand; GET .../schema shows the registered fields.
+# stable_schema_bootstrap = true
+# stable_schema_bootstrap_max_files = 500
+
 # Slow query logging threshold in milliseconds (0 = disabled)
 # Queries exceeding this threshold emit a WARN log and increment arc_slow_queries_total
 # slow_query_threshold_ms = 1000
