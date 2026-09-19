@@ -600,10 +600,17 @@ func (w *ArrowWriter) inferSchema(columns map[string]interface{}, tagColumns []s
 // dedupTime, when true, marks the file with arc:dedup_time so compaction dedups on time even with no tags.
 // decimalCols optionally maps column names to DecimalSpec for Decimal128 type inference.
 func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement string, columns map[string]interface{}, validity map[string][]bool, tagColumns []string, dedupTime bool, decimalCols map[string]config.DecimalSpec) ([]byte, error) {
+	data, _, err := w.writeParquetColumnarWithSchema(ctx, measurement, columns, validity, tagColumns, dedupTime, decimalCols)
+	return data, err
+}
+
+// writeParquetColumnarWithSchema is WriteParquetColumnar returning the Arrow
+// schema the file was written with, for field schema registration (#914).
+func (w *ArrowWriter) writeParquetColumnarWithSchema(ctx context.Context, measurement string, columns map[string]interface{}, validity map[string][]bool, tagColumns []string, dedupTime bool, decimalCols map[string]config.DecimalSpec) ([]byte, *arrow.Schema, error) {
 	// Get or infer schema (with caching)
 	schema, err := w.getSchema(measurement, columns, tagColumns, dedupTime, decimalCols)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get schema: %w", err)
+		return nil, nil, fmt.Errorf("failed to get schema: %w", err)
 	}
 
 	// Create Arrow arrays from columns
@@ -630,7 +637,7 @@ func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement stri
 	for i, field := range schema.Fields() {
 		col, ok := columns[field.Name]
 		if !ok {
-			return nil, fmt.Errorf("column %s not found in data", field.Name)
+			return nil, nil, fmt.Errorf("column %s not found in data", field.Name)
 		}
 
 		// Get validity bitmap for this column (nil means all valid)
@@ -646,7 +653,7 @@ func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement stri
 			if intCol, ok := col.([]int64); ok {
 				builder.AppendValues(intCol, colValidity)
 			} else {
-				return nil, fmt.Errorf("column %s: expected []int64, got %T", field.Name, col)
+				return nil, nil, fmt.Errorf("column %s: expected []int64, got %T", field.Name, col)
 			}
 			arrays[i] = builder.NewArray()
 
@@ -659,7 +666,7 @@ func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement stri
 				tsValues := int64SliceToTimestamps(intCol)
 				builder.AppendValues(tsValues, colValidity)
 			} else {
-				return nil, fmt.Errorf("column %s: expected []int64 for timestamp, got %T", field.Name, col)
+				return nil, nil, fmt.Errorf("column %s: expected []int64 for timestamp, got %T", field.Name, col)
 			}
 			arrays[i] = builder.NewArray()
 
@@ -669,7 +676,7 @@ func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement stri
 			if floatCol, ok := col.([]float64); ok {
 				builder.AppendValues(floatCol, colValidity)
 			} else {
-				return nil, fmt.Errorf("column %s: expected []float64, got %T", field.Name, col)
+				return nil, nil, fmt.Errorf("column %s: expected []float64, got %T", field.Name, col)
 			}
 			arrays[i] = builder.NewArray()
 
@@ -679,7 +686,7 @@ func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement stri
 			if strCol, ok := col.([]string); ok {
 				builder.AppendValues(strCol, colValidity)
 			} else {
-				return nil, fmt.Errorf("column %s: expected []string, got %T", field.Name, col)
+				return nil, nil, fmt.Errorf("column %s: expected []string, got %T", field.Name, col)
 			}
 			arrays[i] = builder.NewArray()
 
@@ -689,7 +696,7 @@ func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement stri
 			if boolCol, ok := col.([]bool); ok {
 				builder.AppendValues(boolCol, colValidity)
 			} else {
-				return nil, fmt.Errorf("column %s: expected []bool, got %T", field.Name, col)
+				return nil, nil, fmt.Errorf("column %s: expected []bool, got %T", field.Name, col)
 			}
 			arrays[i] = builder.NewArray()
 
@@ -700,16 +707,17 @@ func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement stri
 			if decCol, ok := col.([]decimal128.Num); ok {
 				builder.AppendValues(decCol, colValidity)
 			} else {
-				return nil, fmt.Errorf("column %s: expected []decimal128.Num, got %T", field.Name, col)
+				return nil, nil, fmt.Errorf("column %s: expected []decimal128.Num, got %T", field.Name, col)
 			}
 			arrays[i] = builder.NewArray()
 
 		default:
-			return nil, fmt.Errorf("unsupported Arrow type for column %s: %s", field.Name, field.Type.Name())
+			return nil, nil, fmt.Errorf("unsupported Arrow type for column %s: %s", field.Name, field.Type.Name())
 		}
 	}
 
-	return w.writeRecordToParquet(schema, arrays)
+	data, err := w.writeRecordToParquet(schema, arrays)
+	return data, schema, err
 }
 
 // writeRecordToParquet writes Arrow arrays to Parquet bytes
@@ -819,6 +827,11 @@ type ArrowBuffer struct {
 
 	// Optional tiering manager for registering files in tier metadata
 	tieringManager *tiering.Manager
+
+	// Optional measurement field schema registrar (#914). Every flushed
+	// file's schema is folded into the measurement's stored anchor so the
+	// query path binds fields independently of the selected time range.
+	fieldSchema FieldSchemaRegistrar
 
 	// Optional file registrar for cluster-wide file manifest (Enterprise peer replication)
 	// Set by cmd/arc/main.go when clustering + peer replication is enabled.
@@ -1203,6 +1216,33 @@ func (b *ArrowBuffer) SetWAL(wal WALWriter) {
 
 // SetTieringManager sets the tiering manager for automatic file registration.
 // When set, newly written parquet files are automatically registered in tiering metadata.
+// FieldSchemaRegistrar receives the Arrow schema of every Parquet file the
+// buffer writes. Implemented by fieldschema.Registry; an interface so ingest
+// tests can observe registrations without a storage-backed registry.
+type FieldSchemaRegistrar interface {
+	Ensure(ctx context.Context, database, measurement string, schema *arrow.Schema, tagColumns []string) error
+}
+
+// SetFieldSchema installs the field schema registrar (#914).
+func (b *ArrowBuffer) SetFieldSchema(r FieldSchemaRegistrar) {
+	b.fieldSchema = r
+}
+
+// registerFieldSchema folds a just-written file's schema into the
+// measurement's anchor. The file is already durable; a registry failure is
+// logged and never fails the flush.
+func (b *ArrowBuffer) registerFieldSchema(ctx context.Context, database, measurement string, schema *arrow.Schema, tagColumns []string) {
+	if b.fieldSchema == nil || schema == nil {
+		return
+	}
+	if err := b.fieldSchema.Ensure(ctx, database, measurement, schema, tagColumns); err != nil {
+		b.logger.Warn().Err(err).
+			Str("database", database).
+			Str("measurement", measurement).
+			Msg("Field schema registration failed; the file is written and registration retries on the next flush")
+	}
+}
+
 func (b *ArrowBuffer) SetTieringManager(tm *tiering.Manager) {
 	b.tieringManager = tm
 	b.logger.Info().Msg("Tiering manager enabled for ArrowBuffer - files will be auto-registered")
@@ -2742,7 +2782,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		// Single hour - sort once and write one file
 		sorted := sortTypedColumnBatchByKeys(merged, sortKeys)
 
-		parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, sorted.Data, sorted.Validity, sorted.TagColumns, sorted.DedupTime, decimalCols)
+		parquetData, fileSchema, err := b.writer.writeParquetColumnarWithSchema(ctx, measurement, sorted.Data, sorted.Validity, sorted.TagColumns, sorted.DedupTime, decimalCols)
 		if err != nil {
 			return fmt.Errorf("failed to write Parquet: %w", err)
 		}
@@ -2759,6 +2799,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
 			return fmt.Errorf("failed to write to storage: %w", err)
 		}
+		b.registerFieldSchema(ctx, database, measurement, fileSchema, sorted.TagColumns)
 
 		// Register file in tiering metadata for query routing
 		b.registerFileInTiering(ctx, database, measurement, storagePath, minTime, int64(len(parquetData)), parquetSumHex)
@@ -2821,7 +2862,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		sorted := sortTypedColumnBatchByKeys(hourBatch, sortKeys)
 
 		// Write Parquet file for this hour
-		parquetData, err := b.writer.WriteParquetColumnar(ctx, measurement, sorted.Data, sorted.Validity, sorted.TagColumns, sorted.DedupTime, decimalCols)
+		parquetData, fileSchema, err := b.writer.writeParquetColumnarWithSchema(ctx, measurement, sorted.Data, sorted.Validity, sorted.TagColumns, sorted.DedupTime, decimalCols)
 		if err != nil {
 			return fmt.Errorf("failed to write Parquet for hour %d: %w", hourID, err)
 		}
@@ -2838,6 +2879,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
 			return fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err)
 		}
+		b.registerFieldSchema(ctx, database, measurement, fileSchema, sorted.TagColumns)
 
 		written = append(written, tieringEntry{
 			storagePath: storagePath,

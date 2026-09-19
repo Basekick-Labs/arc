@@ -478,6 +478,18 @@ type QueryConfig struct {
 	// FileTimePruningMarginSeconds widens the keep-window below the query's
 	// lower bound to absorb writer clock skew (default 300).
 	FileTimePruningMarginSeconds int
+	// StableSchema (26.09.2, #914) lists a measurement's zero-row field
+	// schema anchor first in every read_parquet, so a field absent from
+	// the files a time range selects binds as a typed NULL column instead of
+	// failing. Anchors live under _schema/ on the storage backend and are
+	// maintained by ingest.
+	StableSchema bool
+	// StableSchemaBootstrap builds the anchor of a measurement that has
+	// data but no anchor yet (written before 26.09.2) in the background the
+	// first time it is queried, from a bounded sample of its files.
+	StableSchemaBootstrap bool
+	// StableSchemaBootstrapMaxFiles caps the footers one bootstrap reads.
+	StableSchemaBootstrapMaxFiles int
 }
 
 // LicenseConfig holds configuration for enterprise license validation
@@ -970,13 +982,16 @@ func Load() (*Config, error) {
 			Enabled: v.GetBool("mqtt.enabled"),
 		},
 		Query: QueryConfig{
-			Timeout:                      v.GetInt("query.timeout"),
-			SlowQueryThresholdMs:         v.GetInt("query.slow_query_threshold_ms"),
-			FileTimePruning:              v.GetBool("query.file_time_pruning"),
-			FileTimePruningMarginSeconds: v.GetInt("query.file_time_pruning_margin_seconds"),
-			EnableS3Cache:                v.GetBool("query.enable_s3_cache"),
-			S3CacheSize:                  s3CacheSize,
-			S3CacheTTLSeconds:            v.GetInt("query.s3_cache_ttl_seconds"),
+			Timeout:                       v.GetInt("query.timeout"),
+			SlowQueryThresholdMs:          v.GetInt("query.slow_query_threshold_ms"),
+			FileTimePruning:               v.GetBool("query.file_time_pruning"),
+			FileTimePruningMarginSeconds:  v.GetInt("query.file_time_pruning_margin_seconds"),
+			StableSchema:                  v.GetBool("query.stable_schema"),
+			StableSchemaBootstrap:         v.GetBool("query.stable_schema_bootstrap"),
+			StableSchemaBootstrapMaxFiles: v.GetInt("query.stable_schema_bootstrap_max_files"),
+			EnableS3Cache:                 v.GetBool("query.enable_s3_cache"),
+			S3CacheSize:                   s3CacheSize,
+			S3CacheTTLSeconds:             v.GetInt("query.s3_cache_ttl_seconds"),
 		},
 		License: LicenseConfig{
 			Enabled:  v.GetBool("license.enabled"),
@@ -1645,13 +1660,16 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("mqtt.enabled", false) // Feature toggle only - disabled by default
 
 	// Query defaults
-	v.SetDefault("query.timeout", 300)                          // 5 minute query timeout (0 = no timeout)
-	v.SetDefault("query.slow_query_threshold_ms", 0)            // Disabled by default (0 = no slow query logging)
-	v.SetDefault("query.file_time_pruning", false)              // EXPERIMENTAL (26.09.2), opt-in; planned default-on in 27.01.1 (#659)
-	v.SetDefault("query.file_time_pruning_margin_seconds", 300) // Writer clock-skew allowance
-	v.SetDefault("query.enable_s3_cache", false)                // Disabled by default (opt-in feature)
-	v.SetDefault("query.s3_cache_size", "128MB")                // 128MB cache (256 blocks × 512KB)
-	v.SetDefault("query.s3_cache_ttl_seconds", 3600)            // 1 hour
+	v.SetDefault("query.timeout", 300)                           // 5 minute query timeout (0 = no timeout)
+	v.SetDefault("query.slow_query_threshold_ms", 0)             // Disabled by default (0 = no slow query logging)
+	v.SetDefault("query.file_time_pruning", false)               // EXPERIMENTAL (26.09.2), opt-in; planned default-on in 27.01.1 (#659)
+	v.SetDefault("query.file_time_pruning_margin_seconds", 300)  // Writer clock-skew allowance
+	v.SetDefault("query.stable_schema", true)                    // #914: range-independent field binding via _schema/ anchors
+	v.SetDefault("query.stable_schema_bootstrap", true)          // Build anchors for pre-26.09.2 measurements on first query
+	v.SetDefault("query.stable_schema_bootstrap_max_files", 500) // Footers sampled per bootstrap (newest days, compacted files first)
+	v.SetDefault("query.enable_s3_cache", false)                 // Disabled by default (opt-in feature)
+	v.SetDefault("query.s3_cache_size", "128MB")                 // 128MB cache (256 blocks × 512KB)
+	v.SetDefault("query.s3_cache_ttl_seconds", 3600)             // 1 hour
 
 	// License defaults (Enterprise features)
 	// Note: Server URL and validation interval are hardcoded in internal/license/client.go

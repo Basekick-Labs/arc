@@ -418,6 +418,56 @@ batch-failure logs.
 Increasing the deadline does not reduce peak memory demand or guarantee
 completion.
 
+### Measurement fields bind the same over every time range ([#914](https://github.com/Basekick-Labs/arc/issues/914))
+
+A field that no Parquet file in the queried time range carried failed to bind
+(`Binder Error: Referenced column "x" not found`), while the same projection
+over a wider range succeeded with NULLs. Arc rewrites `FROM measurement` into
+`read_parquet(<selected files>, union_by_name=true)`, so DuckDB only ever saw
+the selected files' columns, and a Grafana panel worked or broke depending on
+the zoom level. Empty ranges fell back to the whole measurement and advertised
+every column, which made runtime schema discovery misleading as well.
+
+Every measurement now has a registered field schema: a zero-row Parquet
+"anchor" stored at `_schema/{database}/{measurement}.parquet`, maintained by
+ingest on every flush (HTTP, MQTT, WAL replay, replicated ingest entries and
+the import API all go through it) and listed first in every `read_parquet` the
+query path emits, including the parallel partition path, tiered queries and
+continuous queries. A registered field absent from the selected files binds
+as a typed NULL column, `SELECT *` has the same columns in the same order over
+any range, an empty range returns zero rows with the full schema, and an
+unknown field still raises a Binder Error. The plan stays a single Parquet
+scan with projection and filter pushdown.
+
+The anchor records the narrowest type seen for a field (BOOLEAN below
+TINYINT below SMALLINT below INTEGER below BIGINT below FLOAT below DOUBLE
+below VARCHAR, DECIMAL below DOUBLE, a DECIMAL with smaller precision and
+scale below a larger one, TIMESTAMP below TIMESTAMPTZ); a pair DuckDB cannot
+order, such as BIGINT against DECIMAL, is recorded as BOOLEAN, which DuckDB
+promotes to every other type. Either way the anchor never changes what a
+query binds where files carry the column; DuckDB keeps promoting per query
+where files disagree, and conflicting writes are logged. Fields are only
+ever added; deleting a database deletes its anchors, and nothing else
+removes one (a measurement emptied by retention keeps its anchor).
+
+Measurements written before this release get an anchor in the background the
+first time they are queried, built from a bounded sample of their files
+(`query.stable_schema_bootstrap`, `query.stable_schema_bootstrap_max_files`,
+default 500, newest days first, compacted files preferred). Until it exists,
+queries behave as before. `GET /api/v1/databases/{db}/measurements/{m}/schema`
+returns the registered fields and types; `POST .../schema/rebuild` (admin)
+queues a rebuild. `query.stable_schema = false` restores the previous SQL
+byte for byte. The stored anchors are shared state on the storage backend,
+read by every node and re-read on a short TTL, so a field added on one node
+binds on the others within a minute; each node keeps the copy DuckDB reads
+under its upload directory. `_schema/` is a reserved root directory:
+compaction, reconciliation, tiering, edge sync and the Iceberg exporter skip
+it. Backups copy it with the rest of the storage root, inventoried as a
+database named `_schema`, so a restore of a single database does not carry
+that database's anchors; the next query bootstraps them. A node that
+receives Parquet files from a peer rather than through its own ingest path
+also relies on bootstrap for those measurements.
+
 ### Peer file fetches now respect the overall timeout ([#796](https://github.com/Basekick-Labs/arc/issues/796))
 
 The configured `cluster.replication_fetch_timeout_ms` did not reliably bound a file fetch. Reading the acknowledgement header could replace the context deadline with a longer timeout, and the subsequent body transfer could block indefinitely if a peer stopped sending data.

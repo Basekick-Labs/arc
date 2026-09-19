@@ -1314,7 +1314,9 @@ func (m *Manager) listDatabases(ctx context.Context) ([]string, error) {
 		// Filter out hidden directories and special directories
 		databases := make([]string, 0, len(dirs))
 		for _, dir := range dirs {
-			if dir != "" && !strings.HasPrefix(dir, ".") && dir != "compaction" {
+			// Reserved root directories (_compaction_state, _schema, dot
+			// prefixed) are Arc's own state, never databases.
+			if dir != "" && !storage.IsReservedRootDir(dir) && dir != "compaction" {
 				databases = append(databases, dir)
 			}
 		}
@@ -1335,7 +1337,7 @@ func (m *Manager) listDatabases(ctx context.Context) ([]string, error) {
 		if len(parts) >= 2 {
 			database := parts[0]
 			// Skip hidden directories and special files
-			if database != "" && !strings.HasPrefix(database, ".") && database != "compaction" {
+			if database != "" && !storage.IsReservedRootDir(database) && database != "compaction" {
 				databaseSet[database] = struct{}{}
 			}
 		}

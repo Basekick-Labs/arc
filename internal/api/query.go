@@ -19,6 +19,7 @@ import (
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/database"
+	"github.com/basekick-labs/arc/internal/fieldschema"
 	"github.com/basekick-labs/arc/internal/governance"
 	"github.com/basekick-labs/arc/internal/license"
 	"github.com/basekick-labs/arc/internal/metrics"
@@ -638,6 +639,7 @@ type QueryHandler struct {
 	db                 *database.DuckDB
 	storage            storage.Backend
 	pruner             *pruning.PartitionPruner
+	fieldSchema        *fieldschema.Registry // nil or disabled: SQL is built exactly as before #914
 	queryCache         *database.QueryCache
 	logger             zerolog.Logger
 	authManager        *auth.AuthManager
@@ -1112,6 +1114,172 @@ func (h *QueryHandler) SetTieringManager(manager *tiering.Manager) {
 	h.tieringManager = manager
 }
 
+// SetFieldSchema installs the measurement field schema registry (#914).
+// When set and enabled, every read_parquet the rewriter emits for a
+// measurement lists the measurement's zero-row schema anchor first, so a
+// field absent from the selected files binds as a typed NULL column instead
+// of failing.
+func (h *QueryHandler) SetFieldSchema(r *fieldschema.Registry) {
+	h.fieldSchema = r
+}
+
+// anchorFor returns the local anchor path for a measurement, or "" when
+// there is none. It never blocks on a bootstrap.
+func (h *QueryHandler) anchorFor(ctx context.Context, database, measurement string) string {
+	if h.fieldSchema == nil || database == "" || measurement == "" {
+		return ""
+	}
+	path, ok := h.fieldSchema.Resolve(ctx, database, measurement)
+	if !ok {
+		return ""
+	}
+	return path
+}
+
+// readParquetExpr renders `<keyword> read_parquet(<paths>, <options>)`. With
+// an anchor the path list is [anchor, paths...]; with a single path and no
+// anchor it is the bare path, exactly as before #914.
+func readParquetExpr(keyword, anchor string, paths []string, options string) string {
+	if anchor == "" && len(paths) == 1 {
+		return keyword + " read_parquet(" + quotePath(paths[0]) + ", " + options + ")"
+	}
+	var sb strings.Builder
+	sb.WriteString(keyword)
+	sb.WriteString(" read_parquet([")
+	n := 0
+	if anchor != "" {
+		sb.WriteString(quotePath(anchor))
+		n++
+	}
+	for _, p := range paths {
+		if n > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(quotePath(p))
+		n++
+	}
+	sb.WriteString("], ")
+	sb.WriteString(options)
+	sb.WriteString(")")
+	return sb.String()
+}
+
+// getMeasurementSchema serves GET /api/v1/databases/:database/measurements/:measurement/schema.
+func (h *QueryHandler) getMeasurementSchema(c *fiber.Ctx) error {
+	database, measurement, ok := h.schemaRouteParams(c)
+	if !ok {
+		return nil
+	}
+	if err := h.checkMeasurementPermission(c, database, measurement, "read"); err != nil {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": err.Error()})
+	}
+	if h.fieldSchema == nil || !h.fieldSchema.Enabled() {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"error": "Field schema registry is disabled (query.stable_schema)",
+		})
+	}
+	fields, ok, err := h.fieldSchema.Fields(c.Context(), database, measurement)
+	if err != nil {
+		h.logger.Warn().Err(err).Str("database", database).Str("measurement", measurement).Msg("Field schema lookup failed")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "Field schema unavailable: " + err.Error(),
+		})
+	}
+	if !ok {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"error": "No registered field schema for this measurement yet; it is built by ingest, or by POST .../schema/rebuild",
+		})
+	}
+	return c.JSON(fiber.Map{
+		"database":    database,
+		"measurement": measurement,
+		"fields":      fields,
+	})
+}
+
+// rebuildMeasurementSchema serves POST /api/v1/databases/:database/measurements/:measurement/schema/rebuild.
+func (h *QueryHandler) rebuildMeasurementSchema(c *fiber.Ctx) error {
+	database, measurement, ok := h.schemaRouteParams(c)
+	if !ok {
+		return nil
+	}
+	if h.fieldSchema == nil || !h.fieldSchema.Enabled() {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"error": "Field schema registry is disabled (query.stable_schema)",
+		})
+	}
+	switch h.fieldSchema.Rebuild(database, measurement) {
+	case fieldschema.RebuildAlreadyRunning:
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"error": "A rebuild for this measurement is already queued or running",
+		})
+	case fieldschema.RebuildQueueFull:
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "The rebuild queue is full; retry later",
+		})
+	case fieldschema.RebuildUnavailable:
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "Schema rebuild is unavailable on this node",
+		})
+	}
+	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
+		"status":      "queued",
+		"database":    database,
+		"measurement": measurement,
+	})
+}
+
+// schemaRouteParams validates the route's database and measurement. It
+// writes the 400 itself and returns ok=false, because c.JSON returns a nil
+// error on success and a handler cannot tell "responded" from "fine" by the
+// error alone. Names are gated on the per-name storage-segment rule rather
+// than the create-time rule, like the other per-name routes: a spoke
+// pseudo-database or a name an older release accepted must still resolve.
+// Neither name reaches a DuckDB path: the registry keys storage objects by
+// them and hashes them for the local anchor file.
+func (h *QueryHandler) schemaRouteParams(c *fiber.Ctx) (string, string, bool) {
+	database := strings.Clone(c.Params("database"))
+	measurement := strings.Clone(c.Params("measurement"))
+	if !isSafeStoragePathSegment(database) {
+		_ = c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid database name"})
+		return "", "", false
+	}
+	if !isSafeStoragePathSegment(measurement) {
+		_ = c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid measurement name"})
+		return "", "", false
+	}
+	return database, measurement, true
+}
+
+// missingAnchor reports whether a "No files found" error names one of this
+// process's materialized field schema anchors rather than a data glob. A
+// data glob matching nothing is an empty measurement and answers an empty
+// result; a missing anchor is a local file that was removed under a cached
+// SQL transform, and answering an empty result for it would be a wrong
+// answer. The transform cache is dropped so the next attempt re-resolves
+// (and re-materializes) the anchor, and the error is surfaced.
+func (h *QueryHandler) missingAnchor(err error) bool {
+	if err == nil || h.fieldSchema == nil {
+		return false
+	}
+	msg := err.Error()
+	start := strings.Index(msg, "No files found that match the pattern \"")
+	if start < 0 {
+		return false
+	}
+	rest := msg[start+len("No files found that match the pattern \""):]
+	end := strings.Index(rest, "\"")
+	if end < 0 {
+		return false
+	}
+	if !h.fieldSchema.IsLocalAnchorPath(rest[:end]) {
+		return false
+	}
+	h.queryCache.Invalidate()
+	h.logger.Warn().Str("anchor", rest[:end]).Msg("Field schema anchor missing on disk; SQL transform cache dropped so the next query re-materializes it")
+	return true
+}
+
 // SetGovernance sets the governance manager and license client for query rate limiting and quotas.
 func (h *QueryHandler) SetGovernance(manager *governance.Manager, lc *license.Client) {
 	h.governanceManager = manager
@@ -1480,6 +1648,13 @@ func (h *QueryHandler) RegisterRoutes(app *fiber.App) {
 	app.Post("/api/v1/query/msgpack", readAuth, h.checkReplicationReady, h.executeQueryMsgPack)
 	app.Post("/api/v1/query/estimate", readAuth, h.checkReplicationReady, h.estimateQuery)
 	app.Get("/api/v1/measurements", readAuth, h.checkReplicationReady, h.listMeasurements)
+	// Registered field schema of a measurement (#914): the columns and types
+	// every query binds for it regardless of time range. Read auth plus the
+	// per-measurement RBAC check, like every other measurement-scoped read.
+	app.Get("/api/v1/databases/:database/measurements/:measurement/schema", readAuth, h.checkReplicationReady, h.getMeasurementSchema)
+	// Rebuild the registered schema from a bounded sample of the
+	// measurement's files (merging, never dropping a field). Admin only.
+	app.Post("/api/v1/databases/:database/measurements/:measurement/schema/rebuild", withAdminAuth(h.authManager), h.rebuildMeasurementSchema)
 	app.Get("/api/v1/query/:measurement", readAuth, h.checkReplicationReady, h.queryMeasurement)
 	h.registerArrowRoutes(app, readAuth)
 
@@ -1725,6 +1900,7 @@ localProcessing:
 			parallelInfo.Paths,
 			parallelInfo.QueryTemplate,
 			parallelInfo.ReadParquetOptions,
+			parallelInfo.AnchorPath,
 		)
 		if err != nil {
 			// Read the cause before releasing the timeout context: cancelTimeout
@@ -2063,7 +2239,7 @@ localProcessing:
 			// Check if this is a "no files found" error — treat as empty result, not an error.
 			// This happens when querying a measurement that has no data on storage yet
 			// (e.g., new measurement, or DuckDB's httpfs cache is stale).
-			if isNoFilesFoundError(err) {
+			if isNoFilesFoundError(err) && !h.missingAnchor(err) {
 				h.logger.Info().Str("sql", sqlutil.ForLog(req.SQL)).Msg("No files found for measurement, returning empty result")
 				m.IncQuerySuccess()
 				if h.queryRegistry != nil && queryID != "" {
@@ -3092,6 +3268,9 @@ type ParallelQueryInfo struct {
 	QueryTemplate string
 	// ReadParquetOptions are the options to pass to read_parquet
 	ReadParquetOptions string
+	// AnchorPath, when set, is listed before every partition path so each
+	// per-partition scan binds the measurement's full field schema (#914).
+	AnchorPath string
 }
 
 // replaceTableRefs rewrites every match of re in sql using fn.
@@ -3197,6 +3376,8 @@ func (h *QueryHandler) buildReadParquetExpr(ctx context.Context, path, originalS
 
 	// Fall back to single-tier behavior (original logic)
 	options := buildReadParquetOptions()
+	anchorDB, anchorMeas := h.extractDBMeasurementFromPath(path)
+	anchor := h.anchorFor(ctx, anchorDB, anchorMeas)
 
 	// Apply partition pruning
 	optimizedPath, wasOptimized := h.pruner.OptimizeTablePath(ctx, path, originalSQL)
@@ -3205,24 +3386,15 @@ func (h *QueryHandler) buildReadParquetExpr(ctx context.Context, path, originalS
 		// Check if it's a list of paths or a single path
 		if pathList, ok := optimizedPath.([]string); ok {
 			// Multiple paths - use DuckDB array syntax
-			var pathsStr strings.Builder
-			pathsStr.WriteString("[")
-			for i, p := range pathList {
-				if i > 0 {
-					pathsStr.WriteString(", ")
-				}
-				pathsStr.WriteString(quotePath(p))
-			}
-			pathsStr.WriteString("]")
 			h.logger.Info().Int("partition_count", len(pathList)).Str("keyword", keyword).Msg("Partition pruning: Using targeted paths")
-			return keyword + " read_parquet(" + pathsStr.String() + ", " + options + ")"
+			return readParquetExpr(keyword, anchor, pathList, options)
 		} else if pathStr, ok := optimizedPath.(string); ok {
 			h.logger.Info().Str("optimized_path", pathStr).Str("keyword", keyword).Msg("Partition pruning: Using optimized path")
-			return keyword + " read_parquet(" + quotePath(pathStr) + ", " + options + ")"
+			return readParquetExpr(keyword, anchor, []string{pathStr}, options)
 		}
 	}
 
-	return keyword + " read_parquet(" + quotePath(path) + ", " + options + ")"
+	return readParquetExpr(keyword, anchor, []string{path}, options)
 }
 
 // buildReadParquetExprForMeasurement builds a read_parquet expression for a database/measurement pair.
@@ -3266,6 +3438,8 @@ func (h *QueryHandler) buildReadParquetExprForParallel(ctx context.Context, path
 	// NOT be fanned out one-DuckDB-query-per-file by the parallel executor —
 	// its elements are individual small files, not hour partitions.
 	ctx, volatile := pruning.WithVolatileResult(ctx)
+	anchorDB, anchorMeas := h.extractDBMeasurementFromPath(path)
+	anchor := h.anchorFor(ctx, anchorDB, anchorMeas)
 
 	// Apply partition pruning
 	optimizedPath, wasOptimized := h.pruner.OptimizeTablePath(ctx, path, originalSQL)
@@ -3283,28 +3457,20 @@ func (h *QueryHandler) buildReadParquetExprForParallel(ctx context.Context, path
 				return keyword + " {PARTITION_PATH}", &ParallelQueryInfo{
 					Paths:              pathList,
 					ReadParquetOptions: options,
+					AnchorPath:         anchor,
 				}
 			}
 
 			// Fall back to standard array syntax if parallel not recommended
-			var pathsStr strings.Builder
-			pathsStr.WriteString("[")
-			for i, p := range pathList {
-				if i > 0 {
-					pathsStr.WriteString(", ")
-				}
-				pathsStr.WriteString(quotePath(p))
-			}
-			pathsStr.WriteString("]")
 			h.logger.Info().Int("partition_count", len(pathList)).Str("keyword", keyword).Msg("Partition pruning: Using targeted paths")
-			return keyword + " read_parquet(" + pathsStr.String() + ", " + options + ")", nil
+			return readParquetExpr(keyword, anchor, pathList, options), nil
 		} else if pathStr, ok := optimizedPath.(string); ok {
 			h.logger.Info().Str("optimized_path", pathStr).Str("keyword", keyword).Msg("Partition pruning: Using optimized path")
-			return keyword + " read_parquet(" + quotePath(pathStr) + ", " + options + ")", nil
+			return readParquetExpr(keyword, anchor, []string{pathStr}, options), nil
 		}
 	}
 
-	return keyword + " read_parquet(" + quotePath(path) + ", " + options + ")", nil
+	return readParquetExpr(keyword, anchor, []string{path}, options), nil
 }
 
 // shouldSkipTableConversion returns true if the table name should not be converted to a storage path
@@ -3439,7 +3605,7 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 			Str("measurement", measurement).
 			Msg("Failed to query tier metadata, falling back to hot tier only")
 		// Fall back to hot tier only on error
-		return keyword + " read_parquet(" + quotePath(h.getStoragePath(ctx, database, measurement)) + ", " + options + ")"
+		return readParquetExpr(keyword, h.anchorFor(ctx, database, measurement), []string{h.getStoragePath(ctx, database, measurement)}, options)
 	}
 
 	// If no metadata found, fall back to hot tier (data might not be registered yet)
@@ -3448,7 +3614,7 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 			Str("database", database).
 			Str("measurement", measurement).
 			Msg("No tier metadata found, using hot tier")
-		return keyword + " read_parquet(" + quotePath(h.getStoragePath(ctx, database, measurement)) + ", " + options + ")"
+		return readParquetExpr(keyword, h.anchorFor(ctx, database, measurement), []string{h.getStoragePath(ctx, database, measurement)}, options)
 	}
 
 	// Collect the full glob and backend for each tier that actually has data
@@ -3514,6 +3680,7 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 		return keyword + " (SELECT * WHERE 1=0)"
 	}
 
+	anchor := h.anchorFor(ctx, database, measurement)
 	if len(paths) == 1 {
 		// Single tier - use standard read_parquet
 		h.logger.Debug().
@@ -3521,7 +3688,7 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 			Str("measurement", measurement).
 			Str("path", paths[0]).
 			Msg("Single-tier query")
-		return keyword + " read_parquet(" + quotePath(paths[0]) + ", " + options + ")"
+		return readParquetExpr(keyword, anchor, paths, options)
 	}
 
 	// Multiple tiers: use read_parquet with a list of paths
@@ -3532,18 +3699,7 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 		Strs("paths", paths).
 		Msg("Building multi-tier query")
 
-	// Build path list: ['path1', 'path2']
-	var pathList strings.Builder
-	pathList.WriteString("[")
-	for i, p := range paths {
-		if i > 0 {
-			pathList.WriteString(", ")
-		}
-		pathList.WriteString(quotePath(p))
-	}
-	pathList.WriteString("]")
-
-	return keyword + fmt.Sprintf(" read_parquet(%s, %s)", pathList.String(), options)
+	return readParquetExpr(keyword, anchor, paths, options)
 }
 
 // convertSingleTableQuery is a fast path for simple single-table queries.

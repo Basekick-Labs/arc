@@ -9,6 +9,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/config"
+	"github.com/basekick-labs/arc/internal/fieldschema"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/gofiber/fiber/v2"
@@ -23,7 +24,12 @@ type DatabasesHandler struct {
 	authManager    *auth.AuthManager
 	logger         zerolog.Logger
 	icebergDropper IcebergCatalogDropper
+	fieldSchema    *fieldschema.Registry // optional, #914: anchors die with their database
 }
+
+// SetFieldSchema installs the field schema registry so deleting a database
+// also deletes its stored field schema anchors (#914).
+func (h *DatabasesHandler) SetFieldSchema(r *fieldschema.Registry) { h.fieldSchema = r }
 
 // CreateDatabaseRequest represents a request to create a new database
 type CreateDatabaseRequest struct {
@@ -417,6 +423,14 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	// common source is an upload that failed after staging bytes, whose final
 	// key never existed, so the loop above never saw it.
 	deletedCount += reclaimStagedPartials(ctx, h.storage, name+"/", h.logger)
+	if h.fieldSchema != nil {
+		// Best effort: a leftover anchor is inert (its measurement has no
+		// files) and is overwritten by the next ingest into a database of
+		// the same name.
+		if err := h.fieldSchema.DeleteDatabase(ctx, name); err != nil {
+			h.logger.Warn().Err(err).Str("database", name).Msg("Failed to delete field schema anchors with the database")
+		}
+	}
 
 	// Also delete the .arc-database marker file (not included in List due to hidden file filter)
 	markerPath := name + "/.arc-database"

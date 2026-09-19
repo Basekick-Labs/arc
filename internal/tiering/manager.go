@@ -496,6 +496,11 @@ func (m *Manager) ScanAndRegisterFiles(ctx context.Context) (*ScanResult, error)
 		if !strings.HasSuffix(obj.Path, ".parquet") {
 			continue
 		}
+		// Reserved roots hold Arc's own state (_schema anchors are Parquet
+		// but never tiered data); not a parse error.
+		if first, _, _ := strings.Cut(obj.Path, "/"); storage.IsReservedRootDir(first) {
+			continue
+		}
 
 		result.FilesScanned++
 
