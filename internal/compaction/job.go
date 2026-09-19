@@ -222,7 +222,7 @@ func NewJob(cfg *JobConfig) *Job {
 	jobID := cfg.JobID
 	if jobID == "" {
 		jobID = fmt.Sprintf("%s_%s_%d",
-			cfg.Database,
+			sanitizeDBForName(cfg.Database),
 			strings.ReplaceAll(cfg.PartitionPath, "/", "_"),
 			time.Now().UnixNano(),
 		)
