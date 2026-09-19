@@ -429,6 +429,15 @@ predate that fix and #978.
 
 ## Bug fixes
 
+### Query path extraction no longer folds backslashes ([#750](https://github.com/Basekick-Labs/arc/issues/750))
+
+Query tier selection no longer converts backslashes in storage keys into path
+separators, which could identify a different database or measurement. Native
+separators remain permitted only within a trusted local storage root; the key
+portion retains its slash-separated identity.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#918](https://github.com/Basekick-Labs/arc/pull/918).
+
 ## Experimental arcx Arrow IPC streams signal writer panics ([#846](https://github.com/Basekick-Labs/arc/issues/846))
 
 When the experimental arcx Arrow IPC stream writer panics, the response now
