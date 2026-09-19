@@ -468,6 +468,38 @@ that database's anchors; the next query bootstraps them. A node that
 receives Parquet files from a peer rather than through its own ingest path
 also relies on bootstrap for those measurements.
 
+### Empty time ranges can be answered from the schema anchor (experimental, [#928](https://github.com/Basekick-Labs/arc/issues/928))
+
+When partition pruning found no directory for a query's time range it fell
+back to the whole measurement glob, so an empty dashboard panel scanned every
+file of the measurement to return zero rows. With `query.empty_range_anchor_scan
+= true` (default off), a range proven empty is answered by scanning the
+measurement's field schema anchor alone: zero rows, the registered columns,
+and no data file opened.
+
+The proof is deliberately narrow, because the range the pruner extracts is a
+regular-expression reading of the WHERE clause and today's fallback is what
+keeps its imprecision harmless. It applies only to a single-table query
+(no JOIN, subquery, CTE or set operation) whose WHERE clause is a conjunction
+with both bounds stated as bare `time` comparisons against a literal or
+`NOW() +/- INTERVAL`, over at most 7 days, on a measurement whose directory
+holds year directories (a hub's spoke namespaces do not qualify), whose
+anchor is complete (created by ingest for a measurement that had no files
+yet, or bootstrapped from every file), and only after every generated
+partition directory was verified absent by listings no older than two
+seconds; any listing failure keeps the full scan. A proven-empty verdict is
+never cached. Everything outside those conditions behaves exactly as before.
+
+An anchor's completeness is recorded on the stored anchor. Anchors created
+before this release, or by ingest over files that predate the registry, are
+incomplete and keep the full scan; `POST .../schema/rebuild` on a measurement
+with at most `query.stable_schema_bootstrap_max_files` files reads every file
+and makes it complete. Completeness assumes every data file of the
+measurement passes through this node's ingest: a cluster whose nodes have
+separate storage and receive each other's files by replication, or a restore
+into an existing measurement, can leave a column unregistered on the
+receiving node, so keep the flag off there or rebuild after such events.
+
 ### Peer file fetches now respect the overall timeout ([#796](https://github.com/Basekick-Labs/arc/issues/796))
 
 The configured `cluster.replication_fetch_timeout_ms` did not reliably bound a file fetch. Reading the acknowledgement header could replace the context deadline with a longer timeout, and the subsequent body transfer could block indefinitely if a peer stopped sending data.

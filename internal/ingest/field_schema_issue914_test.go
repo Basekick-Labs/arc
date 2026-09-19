@@ -23,7 +23,7 @@ type recordingRegistrar struct {
 	}
 }
 
-func (r *recordingRegistrar) Ensure(_ context.Context, db, meas string, schema *arrow.Schema, tags []string) error {
+func (r *recordingRegistrar) EnsureFile(_ context.Context, db, meas string, schema *arrow.Schema, tags []string, _ string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var names []string

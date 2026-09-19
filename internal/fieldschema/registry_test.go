@@ -206,10 +206,19 @@ func TestBootstrapSamplesNewestDaysAndBacksOff(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	paths, err := r.sampleFiles(ctx, "db", "m")
+	paths, all, err := r.sampleFiles(ctx, "db", "m")
 	if err != nil {
 		t.Fatal(err)
 	}
+	if all {
+		t.Fatal("a capped sample must not claim to cover every file")
+	}
+	r.opts.BootstrapMaxFiles = 7
+	everything, all, err := r.sampleFiles(ctx, "db", "m")
+	if err != nil || !all || len(everything) != 7 {
+		t.Fatalf("under the cap every file is taken: all=%v n=%d err=%v", all, len(everything), err)
+	}
+	r.opts.BootstrapMaxFiles = 3
 	want := []string{"db/m/2026/03/01/00/y_daily.parquet", "db/m/2026/03/01/05/raw_e.parquet", "db/m/2026/01/02/00/x_compacted.parquet"}
 	if len(paths) != len(want) {
 		t.Fatalf("sample=%v", paths)

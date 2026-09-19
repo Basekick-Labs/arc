@@ -100,6 +100,8 @@ type entry struct {
 	measurement string
 
 	schema     *arrow.Schema // registered fields; nil when none are known
+	complete   bool          // stored anchor carries every field the files hold (#928)
+	pending    *arrow.Schema // schemas of files whose registration failed; merged on the next success
 	loaded     bool          // stored anchor consulted at least once
 	loadedAt   time.Time     // last read of the stored anchor
 	absent     bool          // stored anchor was absent at loadedAt
@@ -242,7 +244,7 @@ func (r *Registry) loadStored(ctx context.Context, e *entry) error {
 	}
 	e.loaded = true
 	e.loadedAt = r.now()
-	stored, err := DecodeAnchor(data)
+	stored, complete, err := DecodeAnchorComplete(data)
 	if err != nil {
 		// An undecodable anchor names nothing; treat it as absent so ingest
 		// rewrites it on the next schema change and bootstrap can rebuild it.
@@ -252,10 +254,39 @@ func (r *Registry) loadStored(ctx context.Context, e *entry) error {
 		return nil
 	}
 	e.absent = false
+	e.complete = complete
 	merged, _, conflicts := Merge(stored, e.schema)
 	r.logConflicts(e, conflicts)
 	e.schema = merged
 	return nil
+}
+
+// measurementHasNoFiles reports whether the measurement directory has no
+// children yet, which is what makes an anchor created by ingest complete:
+// every later file passes through Ensure. Unknown (no lister, or an error)
+// is reported as false, which only costs the empty-range shortcut.
+func (r *Registry) measurementHasNoFiles(ctx context.Context, database, measurement string) bool {
+	lister, ok := r.backend.(storage.DirectoryLister)
+	if !ok {
+		return false
+	}
+	dirs, err := lister.ListDirectories(ctx, database+"/"+measurement+"/")
+	if err != nil {
+		return false
+	}
+	return len(dirs) == 0
+}
+
+// IsComplete reports whether the measurement's anchor is known to carry
+// every field its files hold. No I/O: it reflects the last loaded state.
+func (r *Registry) IsComplete(database, measurement string) bool {
+	if !r.Enabled() {
+		return false
+	}
+	e := r.entry(database, measurement)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.schema != nil && e.complete
 }
 
 func (r *Registry) logConflicts(e *entry, conflicts []Conflict) {
@@ -275,6 +306,15 @@ func (r *Registry) logConflicts(e *entry, conflicts []Conflict) {
 // are logged and returned for tests only. The fast path (schema already
 // covered, stored anchor verified recently) does no I/O.
 func (r *Registry) Ensure(ctx context.Context, database, measurement string, schema *arrow.Schema, tagColumns []string) error {
+	return r.EnsureFile(ctx, database, measurement, schema, tagColumns, "")
+}
+
+// EnsureFile is Ensure for a file that was just written at storageKey. The
+// key lets a brand-new anchor be marked complete: when that file is the
+// measurement's only one, every later file passes through here too. An
+// empty key means the caller does not know, and the anchor starts
+// incomplete unless the measurement has no files at all.
+func (r *Registry) EnsureFile(ctx context.Context, database, measurement string, schema *arrow.Schema, tagColumns []string, storageKey string) error {
 	if !r.Enabled() {
 		return nil
 	}
@@ -288,15 +328,71 @@ func (r *Registry) Ensure(ctx context.Context, database, measurement string, sch
 	now := r.now()
 	if !e.loaded {
 		if err := r.loadStored(ctx, e); err != nil {
+			// This file's columns are not lost: they ride along with the
+			// next flush that gets through, which is what keeps a complete
+			// anchor complete.
+			e.pending, _, _ = Merge(e.pending, incoming)
 			r.logger.Warn().Err(err).Msg("Field schema anchor unavailable; will retry on the next flush")
 			return err
 		}
 		e.verifiedAt = now
 	}
+	if e.pending != nil {
+		incoming, _, _ = Merge(e.pending, incoming)
+	}
 	if e.schema != nil && !e.absent && Covers(e.schema, incoming) && now.Sub(e.verifiedAt) < r.opts.VerifyTTL {
 		return nil
 	}
-	return r.publishLocked(ctx, e, incoming)
+	var hint *bool
+	if e.absent && storageKey != "" {
+		// Creating the anchor: complete only when the written file is the
+		// measurement's only one. Decided before publishLocked's re-read
+		// so the (cheap) directory walk is not repeated on the slow path.
+		only := r.isOnlyFile(ctx, database, measurement, storageKey)
+		hint = &only
+	}
+	return r.publishLocked(ctx, e, incoming, hint)
+}
+
+// isOnlyFile reports whether storageKey is the only object under the
+// measurement, walking one directory level at a time so a large legacy
+// measurement costs four small listings, not a full one.
+func (r *Registry) isOnlyFile(ctx context.Context, database, measurement, storageKey string) bool {
+	lister, ok := r.backend.(storage.DirectoryLister)
+	if !ok {
+		return false
+	}
+	prefix := database + "/" + measurement + "/"
+	rest := strings.TrimPrefix(storageKey, prefix)
+	if rest == storageKey {
+		return false
+	}
+	segs := strings.Split(rest, "/")
+	if len(segs) < 2 {
+		return false
+	}
+	// Walk down to the written file's day directory, requiring a single
+	// child at every level; the day listing must then hold just the file.
+	dir := prefix
+	for i := 0; i < len(segs)-1 && i < 3; i++ {
+		children, err := lister.ListDirectories(ctx, dir)
+		if err != nil || len(children) != 1 {
+			return false
+		}
+		child := strings.TrimSuffix(children[0], "/")
+		if j := strings.LastIndex(child, "/"); j >= 0 {
+			child = child[j+1:]
+		}
+		if child != segs[i] {
+			return false
+		}
+		dir += segs[i] + "/"
+	}
+	keys, err := r.backend.List(ctx, dir)
+	if err != nil {
+		return false
+	}
+	return len(keys) == 1 && keys[0] == storageKey
 }
 
 // publishLocked re-reads the stored anchor, folds the cached view and the
@@ -306,14 +402,20 @@ func (r *Registry) Ensure(ctx context.Context, database, measurement string, sch
 // here puts it back. When the stored anchor is absent the cached view is NOT
 // resurrected: absence means the database was deleted, and the new anchor
 // starts from the incoming schema alone. Caller holds e.mu.
-func (r *Registry) publishLocked(ctx context.Context, e *entry, incoming *arrow.Schema) error {
+// completeHint, when non-nil, is the caller's knowledge about completeness
+// (a bootstrap that sampled every file); nil means "decide": a new anchor
+// is complete when the measurement has no files yet, an existing one keeps
+// its stored flag. Completeness is never taken away by a merge.
+func (r *Registry) publishLocked(ctx context.Context, e *entry, incoming *arrow.Schema, completeHint *bool) error {
 	cached := e.schema
 	e.schema = nil
 	if err := r.loadStored(ctx, e); err != nil {
 		e.schema = cached
+		e.pending, _, _ = Merge(e.pending, incoming)
 		r.logger.Warn().Err(err).Msg("Field schema anchor unavailable; will retry on the next flush")
 		return err
 	}
+	e.pending = nil
 	stored := e.schema
 	base := stored
 	var c1 []Conflict
@@ -324,10 +426,18 @@ func (r *Registry) publishLocked(ctx context.Context, e *entry, incoming *arrow.
 	r.logConflicts(e, append(c1, c2...))
 	e.schema = merged
 	e.verifiedAt = r.now()
-	if stored != nil && Fingerprint(stored) == Fingerprint(merged) {
+	complete := e.complete
+	switch {
+	case completeHint != nil && *completeHint:
+		complete = true
+	case stored == nil && completeHint == nil:
+		complete = r.measurementHasNoFiles(ctx, e.database, e.measurement)
+	}
+	if stored != nil && complete == e.complete && Fingerprint(stored) == Fingerprint(merged) {
 		return nil
 	}
-	data, err := EncodeAnchor(merged)
+	e.complete = complete
+	data, err := EncodeAnchorComplete(merged, complete)
 	if err != nil {
 		return err
 	}
@@ -626,7 +736,7 @@ func (r *Registry) runBootstrap(parent context.Context, e *entry) {
 		e.bootstrapFailures = 0
 	}
 
-	paths, err := r.sampleFiles(ctx, database, measurement)
+	paths, sampledAll, err := r.sampleFiles(ctx, database, measurement)
 	if err != nil {
 		finish(err)
 		return
@@ -656,9 +766,11 @@ func (r *Registry) runBootstrap(parent context.Context, e *entry) {
 		return
 	}
 	fields := make([]arrow.Field, 0, len(rows))
+	allMapped := len(uris) == len(paths)
 	for _, row := range rows {
 		t, ok := ArrowTypeFromDuckDB(row[1])
 		if !ok {
+			allMapped = false
 			r.logger.Warn().
 				Str("database", database).
 				Str("measurement", measurement).
@@ -674,8 +786,11 @@ func (r *Registry) runBootstrap(parent context.Context, e *entry) {
 		return
 	}
 	incoming := Normalize(arrow.NewSchema(fields, nil), nil)
+	// The anchor is complete only when every file was sampled and every
+	// field mapped; a partial sample may miss a column older files carry.
+	complete := sampledAll && allMapped
 	e.mu.Lock()
-	err = r.publishLocked(ctx, e, incoming)
+	err = r.publishLocked(ctx, e, incoming, &complete)
 	e.mu.Unlock()
 	if err == nil {
 		r.logger.Info().
@@ -691,13 +806,15 @@ func (r *Registry) runBootstrap(parent context.Context, e *entry) {
 // sampleFiles picks at most BootstrapMaxFiles keys under the measurement,
 // newest days first. Within a day it prefers daily then hourly compaction
 // outputs (each carries the union of its inputs' columns) and otherwise the
-// newest raw file of each hour.
-func (r *Registry) sampleFiles(ctx context.Context, database, measurement string) ([]string, error) {
+// newest raw file of each hour. all reports whether every Parquet file of
+// the measurement made it into the sample.
+func (r *Registry) sampleFiles(ctx context.Context, database, measurement string) (sample []string, all bool, err error) {
 	prefix := database + "/" + measurement + "/"
 	keys, err := r.backend.List(ctx, prefix)
 	if err != nil {
-		return nil, fmt.Errorf("fieldschema: list %s: %w", prefix, err)
+		return nil, false, fmt.Errorf("fieldschema: list %s: %w", prefix, err)
 	}
+	total := 0
 	type dayPick struct {
 		daily     []string
 		compacted []string
@@ -714,6 +831,7 @@ func (r *Registry) sampleFiles(ctx context.Context, database, measurement string
 		if strings.HasPrefix(base, ".") {
 			continue
 		}
+		total++
 		day := rest
 		hour := rest
 		if len(segs) >= 4 {
@@ -735,6 +853,18 @@ func (r *Registry) sampleFiles(ctx context.Context, database, measurement string
 				d.rawByHour[hour] = k
 			}
 		}
+	}
+	// When every file fits under the cap there is no reason to sample:
+	// take them all, which is also what makes the anchor complete.
+	if total <= r.opts.BootstrapMaxFiles {
+		all := make([]string, 0, total)
+		for _, k := range keys {
+			if strings.HasSuffix(k, ".parquet") && !strings.HasPrefix(filepath.Base(k), ".") {
+				all = append(all, k)
+			}
+		}
+		sort.Sort(sort.Reverse(sort.StringSlice(all)))
+		return all, true, nil
 	}
 	dayKeys := make([]string, 0, len(days))
 	for d := range days {
@@ -762,12 +892,14 @@ func (r *Registry) sampleFiles(ctx context.Context, database, measurement string
 		}
 		for _, p := range pick {
 			if len(out) >= r.opts.BootstrapMaxFiles {
-				return out, nil
+				return out, false, nil
 			}
 			out = append(out, p)
 		}
 	}
-	return out, nil
+	// Every file was considered; the sample is complete only when it holds
+	// them all (the per-hour raw pick drops older raw files of a busy hour).
+	return out, len(out) == total, nil
 }
 
 // duckDBDescribe returns a describeFunc over the query engine.

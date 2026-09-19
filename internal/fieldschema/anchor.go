@@ -37,12 +37,28 @@ func isAnchorPath(key string) bool {
 	return strings.HasPrefix(key, AnchorBasePath+"/")
 }
 
+// completeKey is the Parquet key-value metadata entry recording that an
+// anchor is known to carry every field the measurement's files hold (#928):
+// set when ingest created it for a measurement that had no files yet, or
+// when a bootstrap sampled every file with every type mapped. A stored
+// anchor without it is treated as incomplete.
+const completeKey = "arc:schema_complete"
+
 // EncodeAnchor writes a zero-row Parquet file carrying schema. The Parquet
 // footer is all that matters: DuckDB binds the columns and types from it and
 // union_by_name supplies NULLs for every other file.
 func EncodeAnchor(schema *arrow.Schema) ([]byte, error) {
+	return EncodeAnchorComplete(schema, false)
+}
+
+// EncodeAnchorComplete is EncodeAnchor with the completeness flag recorded.
+func EncodeAnchorComplete(schema *arrow.Schema, complete bool) ([]byte, error) {
 	if schema == nil || schema.NumFields() == 0 {
 		return nil, fmt.Errorf("fieldschema: refusing to encode an empty anchor")
+	}
+	if complete {
+		md := arrow.NewMetadata([]string{completeKey}, []string{"true"})
+		schema = arrow.NewSchema(schema.Fields(), &md)
 	}
 	mem := memory.DefaultAllocator
 	arrays := make([]arrow.Array, schema.NumFields())
@@ -79,18 +95,28 @@ func EncodeAnchor(schema *arrow.Schema) ([]byte, error) {
 // DecodeAnchor reads the Arrow schema back out of an anchor (or any Parquet
 // file). Metadata is dropped: the anchor carries columns and types only.
 func DecodeAnchor(data []byte) (*arrow.Schema, error) {
+	s, _, err := DecodeAnchorComplete(data)
+	return s, err
+}
+
+// DecodeAnchorComplete is DecodeAnchor also returning the completeness flag.
+func DecodeAnchorComplete(data []byte) (*arrow.Schema, bool, error) {
 	pf, err := file.NewParquetReader(bytes.NewReader(data))
 	if err != nil {
-		return nil, fmt.Errorf("fieldschema: open anchor: %w", err)
+		return nil, false, fmt.Errorf("fieldschema: open anchor: %w", err)
 	}
 	defer pf.Close()
 	fr, err := pqarrow.NewFileReader(pf, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
 	if err != nil {
-		return nil, fmt.Errorf("fieldschema: read anchor schema: %w", err)
+		return nil, false, fmt.Errorf("fieldschema: read anchor schema: %w", err)
 	}
 	s, err := fr.Schema()
 	if err != nil {
-		return nil, fmt.Errorf("fieldschema: decode anchor schema: %w", err)
+		return nil, false, fmt.Errorf("fieldschema: decode anchor schema: %w", err)
 	}
-	return stripMetadata(s), nil
+	complete := false
+	if v, ok := s.Metadata().GetValue(completeKey); ok && v == "true" {
+		complete = true
+	}
+	return stripMetadata(s), complete, nil
 }
