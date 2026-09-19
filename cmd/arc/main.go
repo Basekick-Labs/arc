@@ -2769,6 +2769,61 @@ func main() {
 		}
 		spokeHandler.RegisterRoutes(server.GetApp())
 
+		// Network scheduling starts only after the real ledger-backed
+		// compaction eligibility gate and the agent have been initialized.
+		// Bundle-only spokes never construct an agent and remain manual.
+		if syncAgent != nil {
+			var canRun func() bool
+			if clusterCoordinator != nil {
+				// The gate is evaluated on every attempt, not at startup.
+				canRun = clusterCoordinator.IsPrimaryWriter
+			}
+
+			spokeScheduler, err := edgesync.NewSpokeScheduler(edgesync.SpokeSchedulerConfig{
+				Agent:         syncAgent,
+				Interval:      cfg.EdgeSync.Spoke.SyncInterval,
+				RetryInterval: cfg.EdgeSync.Spoke.RetryInterval,
+				CanRun:        canRun,
+				Logger:        spokeLogger,
+				OnSuccess: func(at time.Time) {
+					metrics.Get().RecordEdgeSyncSpokeSuccess(at)
+				},
+				OnFailure: func() {
+					metrics.Get().IncEdgeSyncSpokePassFailures()
+				},
+			})
+			if err != nil {
+				log.Fatal().Err(err).Msg("Invalid edge sync scheduler configuration")
+			}
+
+			metrics.Get().EnableEdgeSyncSpokeScheduler()
+
+			schedulerCtx, schedulerCancel := context.WithCancel(context.Background())
+			schedulerDone := make(chan struct{})
+
+			go func() {
+				defer close(schedulerDone)
+				spokeScheduler.Run(schedulerCtx)
+			}()
+
+			// Shutdown hooks execute before DB/storage cleanup; scheduler
+			// priority also stops role checks before the cluster coordinator.
+			shutdownCoordinator.RegisterHook("edgesync-network-scheduler", func(ctx context.Context) error {
+				schedulerCancel()
+				select {
+				case <-schedulerDone:
+					return nil
+				case <-ctx.Done():
+					return fmt.Errorf("edge sync scheduler shutdown: %w", ctx.Err())
+				}
+			}, shutdown.PriorityScheduler)
+
+			spokeLogger.Info().
+				Dur("sync_interval", cfg.EdgeSync.Spoke.SyncInterval).
+				Dur("retry_interval", cfg.EdgeSync.Spoke.RetryInterval).
+				Msg("Automatic network spoke sync scheduled")
+		}
+
 		// Reports what is actually enabled: an air-gap-only spoke has no hub
 		// URL and no /run endpoint, so claiming both would send an operator
 		// looking for a route that returns 503.

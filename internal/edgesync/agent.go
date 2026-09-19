@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/storage"
@@ -28,6 +29,10 @@ const DefaultMaxAttempts = 5
 // able to exhaust its file descriptors.
 const MaxAllowedConcurrent = 64
 
+// ErrSyncAlreadyRunning prevents manual and scheduled passes from
+// modifying the same ledger concurrently.
+var ErrSyncAlreadyRunning = errors.New("edgesync: sync pass already running")
+
 // Agent runs one sync pass: discover local files, ask the hub what it is
 // missing, and stream those files to it.
 //
@@ -42,6 +47,10 @@ type Agent struct {
 	hubID     string
 	spokeID   string
 	logger    zerolog.Logger
+
+	// running is shared by all callers of Run, including manual requests
+	// and scheduled attempts. A rejected pass never touches the ledger.
+	running atomic.Bool
 
 	maxAttempts   int
 	maxConcurrent int
@@ -135,6 +144,10 @@ type RunResult struct {
 	// operator, not a retry, so they are surfaced rather than counted away.
 	Conflicts []Conflict
 
+	// HubContacted is true only after a reconcile response was validated.
+	// An empty backlog performs no network request.
+	HubContacted bool
+
 	Duration time.Duration
 }
 
@@ -200,6 +213,14 @@ func NewAgent(cfg AgentConfig) (*Agent, error) {
 // the hub is missing — newest first, so that if a contact window closes
 // mid-backlog the freshest telemetry has already landed.
 func (a *Agent) Run(ctx context.Context) (*RunResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !a.running.CompareAndSwap(false, true) {
+		return nil, ErrSyncAlreadyRunning
+	}
+	defer a.running.Store(false)
+
 	start := time.Now()
 	res := &RunResult{}
 
@@ -314,6 +335,7 @@ func (a *Agent) reconcileAndSend(ctx context.Context, pending []*LedgerEntry, re
 	if err := reconciled.Validate(); err != nil {
 		return fmt.Errorf("edgesync: hub returned an invalid reconcile result: %w", err)
 	}
+	res.HubContacted = true
 
 	// Files the hub already holds are advanced without sending a byte. This is
 	// the lost-ack path: a transfer that completed but whose acknowledgment
