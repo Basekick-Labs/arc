@@ -398,6 +398,22 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### Atomic visibility for Raft manifest batches ([#447](https://github.com/Basekick-Labs/arc/issues/447))
+
+A batch of file registrations, deletions and updates previously released the
+Raft manifest lock between operations. Concurrent readers and file callbacks
+could observe an intermediate state with some compaction source files removed
+but the compacted output not yet registered, potentially producing incomplete
+query results.
+
+All file mutations in a batch now execute under one manifest write lock.
+Callbacks run in their original order after the completed batch is visible
+and the lock is released. Single-file operations retain their existing
+validation and callback behavior. A regression test reproduces intermediate
+visibility before the fix and verifies the completed manifest after it.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#910](https://github.com/Basekick-Labs/arc/pull/910).
+
 ### Peer file fetches now respect the overall timeout ([#796](https://github.com/Basekick-Labs/arc/issues/796))
 
 The configured `cluster.replication_fetch_timeout_ms` did not reliably bound a file fetch. Reading the acknowledgement header could replace the context deadline with a longer timeout, and the subsequent body transfer could block indefinitely if a peer stopped sending data.
