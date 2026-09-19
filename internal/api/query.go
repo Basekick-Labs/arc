@@ -3323,8 +3323,11 @@ func shouldSkipTableConversion(table string) bool {
 // or: {database}/{measurement}/**/*.parquet (relative path)
 // The key insight: database/measurement are always followed by year directories (4-digit numbers)
 func (h *QueryHandler) extractDBMeasurementFromPath(path string) (database, measurement string) {
-	// Normalize path separators
-	path = strings.ReplaceAll(path, "\\", "/")
+	// Storage keys reject backslashes: Azure treats them as separators.
+	// Do not fold an invalid path into another tiering identity.
+	if strings.Contains(path, "\\") {
+		return "", ""
+	}
 
 	// Remove any s3:// or azure:// prefix and bucket name
 	if strings.Contains(path, "://") {
