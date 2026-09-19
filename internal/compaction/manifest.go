@@ -35,9 +35,9 @@ const ManifestBasePath = "_compaction_state"
 // inputs were involved survives for an operator to act on.
 const ManifestQuarantineSuffix = ".quarantined"
 
-// ManifestMaxAge is the maximum age for manifests before they're considered stale.
-// Manifests older than this are deleted during recovery - they likely indicate
-// a deeper problem that requires investigation.
+// ManifestMaxAge is the age at which recovery warns that a manifest may
+// require investigation. Age alone never deletes a manifest: recovery
+// still follows the normal output-validation and cleanup rules.
 const ManifestMaxAge = 7 * 24 * time.Hour // 7 days
 
 // Manifest tracks the state of a compaction operation for crash recovery.
@@ -284,7 +284,7 @@ func (m *ManifestManager) recoverManifest(ctx context.Context, manifestPath stri
 		return m.DeleteManifest(ctx, manifestPath)
 	}
 
-	// Check for stale manifests - older than ManifestMaxAge likely indicate a deeper problem
+	// Age is diagnostic only: warn, then process the manifest normally.
 	manifestAge := time.Since(manifest.CreatedAt)
 	isStale := manifestAge > ManifestMaxAge
 	if isStale {
