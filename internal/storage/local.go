@@ -401,19 +401,21 @@ func (b *LocalBackend) AppendReader(ctx context.Context, path string, reader io.
 		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to open staging file for append: %w", err)
 	}
-	defer file.Close()
-
-	written, err := io.Copy(file, reader)
-	if err != nil {
+	// Close exactly once on every path, including a failed copy. Closing
+	// before promotion also makes close errors visible to the caller.
+	written, copyErr := io.Copy(file, reader)
+	closeErr := file.Close()
+	if copyErr != nil {
 		metrics.Get().IncStorageErrors()
-		return fmt.Errorf("failed to append file data: %w", err)
+		return fmt.Errorf("failed to append file data: %w", copyErr)
+	}
+	if closeErr != nil {
+		metrics.Get().IncStorageErrors()
+		return fmt.Errorf("failed to close staging file: %w", closeErr)
 	}
 
-	// After appending, promote staging → final if we've received all expected bytes.
+	// Promote only after a successful copy and close.
 	if written == appendSize {
-		if err := file.Close(); err != nil {
-			return fmt.Errorf("failed to close staging file: %w", err)
-		}
 		if err := os.Rename(stagingPath, fullPath); err != nil {
 			metrics.Get().IncStorageErrors()
 			return fmt.Errorf("failed to promote staging file after append: %w", err)
