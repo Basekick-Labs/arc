@@ -398,6 +398,14 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### Compaction manifest cache retains output files ([#750](https://github.com/Basekick-Labs/arc/issues/750))
+
+After rebuilding the compaction manifest cache, the first lookup protected both the input files and the compacted output. Subsequent cached lookups returned only the inputs, leaving the output eligible for another compaction while its manifest was still present.
+
+The cache now retains the output alongside the inputs, so cold and warm lookups agree. A regression test reproduces the missing output on the second lookup before the fix and verifies all three lookups and `IsFileInManifest` after the fix.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#909](https://github.com/Basekick-Labs/arc/pull/909).
+
 ### Peer file fetches now respect the overall timeout ([#796](https://github.com/Basekick-Labs/arc/issues/796))
 
 The configured `cluster.replication_fetch_timeout_ms` did not reliably bound a file fetch. Reading the acknowledgement header could replace the context deadline with a longer timeout, and the subsequent body transfer could block indefinitely if a peer stopped sending data.
