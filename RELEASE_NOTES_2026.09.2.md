@@ -404,7 +404,7 @@ After rebuilding the compaction manifest cache, the first lookup protected both 
 
 The cache now retains the output alongside the inputs, so cold and warm lookups agree. A regression test reproduces the missing output on the second lookup before the fix and verifies all three lookups and `IsFileInManifest` after the fix.
 
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#__PR_NUMBER__](https://github.com/Basekick-Labs/arc/pull/__PR_NUMBER__).
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#909](https://github.com/Basekick-Labs/arc/pull/909).
 
 ### Peer file fetches now respect the overall timeout ([#796](https://github.com/Basekick-Labs/arc/issues/796))
 
