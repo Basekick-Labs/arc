@@ -157,6 +157,17 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 		manifest.TotalFiles++
 		manifest.TotalSizeBytes += obj.Size
 
+		// Parquet under a reserved root (the field schema anchors under
+		// _schema/, #914) is Arc's own state, not a database: it is copied
+		// and counted with the data files, because the restore compares
+		// TotalFiles against every .parquet object present and an anchor
+		// left out of the count would hide one missing data file, but it
+		// is kept out of the database inventory (#927).
+		if isReservedRootParquet(obj.Path) {
+			manifest.AuxiliaryFiles++
+			continue
+		}
+
 		db, meas := parseDBMeasurement(obj.Path)
 		di, exists := dbMap[db]
 		if !exists {
@@ -737,6 +748,16 @@ func isIcebergMetadata(p string) bool {
 
 // parseDBMeasurement extracts the database and measurement from a storage path.
 // Path format: {database}/{measurement}/{YYYY}/{MM}/{DD}/{HH}/{file}.parquet
+// isReservedRootParquet reports whether a data-file key sits under an
+// underscore-prefixed root directory, which Arc reserves for its own state
+// (see storage.IsReservedRootDir). Dot-prefixed roots are deliberately not
+// included: edge sync's unverified receive area lives there and its
+// treatment by backup is unchanged by #927.
+func isReservedRootParquet(path string) bool {
+	first, _, _ := strings.Cut(filepath.ToSlash(path), "/")
+	return strings.HasPrefix(first, "_")
+}
+
 func parseDBMeasurement(path string) (database, measurement string) {
 	path = filepath.ToSlash(path)
 	parts := strings.SplitN(path, "/", 3)

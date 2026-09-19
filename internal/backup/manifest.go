@@ -28,6 +28,13 @@ type Manifest struct {
 	// are copied under data/ but are not part of TotalFiles. Skips from an
 	// outside-root warehouse are in IcebergWarehouse.SkippedFiles.
 	SkippedMetadataFiles int64 `json:"skipped_metadata_files,omitempty"`
+	// AuxiliaryFiles counts Parquet objects under a reserved root directory
+	// (the field schema anchors under _schema/, #914) that were copied with
+	// the data files. They are inside TotalFiles and TotalSizeBytes, because
+	// the restore counts every .parquet object it finds against TotalFiles,
+	// but they belong to no database and are absent from Databases (#927).
+	// Manifests written before this field read it as zero.
+	AuxiliaryFiles int64 `json:"auxiliary_files,omitempty"`
 	// UnaddressableFiles counts data files that exist in source storage but
 	// that no listing returns, because their key fails the storage key rules.
 	// They were never inventoried and could not be copied, so when this is
