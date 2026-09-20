@@ -405,16 +405,17 @@ Scheduled and manual compaction use the same configurable cycle deadline
 waits for active workers and records separate completed, failed, interrupted
 and discovered-but-unstarted batch counts. Manual execution supports
 `POST /api/v1/compaction/trigger?database=db&measurement=cpu`, with `tier`
-remaining optional. The measurement filter requires a valid database and applies to manifest
-recovery as well as new candidate discovery; recovery spans every tier
-regardless of which tier the cycle runs. Recovery and eligibility failures
-now fail the cycle, while completed recovery progress survives cancellation.
-A manifest that cannot be read is retained and fails the cycle closed; a
-manifest that reads but cannot be decoded (for example a zero-length file
-left by a crash) is parked under the `.quarantined` suffix so it stops
-blocking compaction, and candidate filtering ignores it until then. Normal
-cancellation does not enter the adaptive retry path or emit misleading
-batch-failure logs.
+remaining optional. The measurement filter requires a valid database and
+applies to manifest recovery as well as new candidate discovery; recovery
+spans every tier regardless of which tier the cycle runs. Recovery and
+eligibility failures now fail the cycle, while completed recovery progress
+survives cancellation. A manifest that cannot be read is retained and fails
+the cycle closed; a manifest that reads but cannot be decoded (for example a
+zero-length file left by a crash) is parked under the `.quarantined` suffix
+so it stops blocking compaction, and candidate filtering ignores it until
+then (#926 counts those parks). Normal cancellation does not enter the
+adaptive retry path or emit misleading batch-failure logs.
+
 Increasing the deadline does not reduce peak memory demand or guarantee
 completion.
 
@@ -451,10 +452,11 @@ ever added; deleting a database deletes its anchors, and nothing else
 removes one (a measurement emptied by retention keeps its anchor).
 
 Measurements written before this release get an anchor in the background the
-first time they are queried, built from a bounded sample of their files
-(`query.stable_schema_bootstrap`, `query.stable_schema_bootstrap_max_files`,
-default 500, newest days first, compacted files preferred). Until it exists,
-queries behave as before. `GET /api/v1/databases/{db}/measurements/{m}/schema`
+first time they are queried, built from their files
+(`query.stable_schema_bootstrap`): every file when the measurement holds at
+most `query.stable_schema_bootstrap_max_files` of them (default 500),
+otherwise a sample of that size, newest days first, compacted files
+preferred. Until it exists, queries behave as before. `GET /api/v1/databases/{db}/measurements/{m}/schema`
 returns the registered fields and types; `POST .../schema/rebuild` (admin)
 queues a rebuild. `query.stable_schema = false` restores the previous SQL
 byte for byte. The stored anchors are shared state on the storage backend,
@@ -462,9 +464,10 @@ read by every node and re-read on a short TTL, so a field added on one node
 binds on the others within a minute; each node keeps the copy DuckDB reads
 under its upload directory. `_schema/` is a reserved root directory:
 compaction, reconciliation, tiering, edge sync and the Iceberg exporter skip
-it. Backups copy it with the rest of the storage root and restore it with
-the data. A node that receives Parquet files from a peer rather than
-through its own ingest path relies on bootstrap for those measurements.
+it. Backups copy it with the rest of the storage root, as auxiliary files
+outside the database inventory (#927), and restore it with the data. A node
+that receives Parquet files from a peer rather than through its own ingest
+path relies on bootstrap for those measurements.
 
 ### Parked unparseable compaction manifests are counted ([#926](https://github.com/Basekick-Labs/arc/issues/926))
 
@@ -492,9 +495,10 @@ auxiliary files, reported in the manifest's new `auxiliary_files` count,
 and kept out of `databases`. They stay inside `total_files` and
 `total_size_bytes` on purpose: the restore compares that count against
 every Parquet object it finds, and an anchor left out of it would have
-hidden a missing data file. Restore is unchanged: it copies every object
-under `data/` back, anchors included. Backups written before this release
-restore the same way.
+hidden a missing data file. Restore copies every object under `data/` back,
+anchors included; the one exception, compacted inputs a backed-up recovery
+manifest shows were already replaced by their output, is #930 below.
+Backups written before this release restore the same way.
 
 ### Empty time ranges can be answered from the schema anchor (experimental, [#928](https://github.com/Basekick-Labs/arc/issues/928))
 
@@ -544,8 +548,10 @@ during the copy then leaves the backup with the manifest and the output,
 which recovery completes, never with the output and the inputs and no
 manifest. A manifest that cannot be read while it still exists fails the
 backup rather than being skipped, for the same reason. The state is reported
-in the backup manifest's `compaction_state_files` and counted with the other
-auxiliary files, not in `total_files`.
+in the backup manifest's `compaction_state_files` and counted in the backup
+progress but not in `total_files`, which the restore compares against the
+Parquet objects it finds (the schema anchors of #927 are Parquet and stay
+inside that count; manifests are not).
 
 The restore reconciles the state itself rather than waiting for a
 compaction cycle, because a cycle may be disabled on the restored node or may
