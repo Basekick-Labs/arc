@@ -645,6 +645,7 @@ func (m *ManifestManager) parkUnparseableManifest(ctx context.Context, manifestP
 		if delErr := m.DeleteManifest(ctx, manifestPath); delErr != nil {
 			return delErr
 		}
+		metrics.Get().IncCompactionManifestParkedUnparseable()
 		m.logger.Error().
 			Err(cause).
 			Str("manifest", manifestPath).
@@ -655,6 +656,10 @@ func (m *ManifestManager) parkUnparseableManifest(ctx context.Context, manifestP
 	if err := m.parkManifestCopy(ctx, manifestPath, parkedPath); err != nil {
 		return err
 	}
+	// Counted here, after the copy and the delete both landed (#926): a
+	// failed park keeps the manifest for the next cycle and must not report
+	// a drop from the work set that did not happen.
+	metrics.Get().IncCompactionManifestParkedUnparseable()
 	m.logger.Error().
 		Err(cause).
 		Str("manifest", manifestPath).

@@ -466,6 +466,22 @@ it. Backups copy it with the rest of the storage root and restore it with
 the data. A node that receives Parquet files from a peer rather than
 through its own ingest path relies on bootstrap for those measurements.
 
+### Parked unparseable compaction manifests are counted ([#926](https://github.com/Basekick-Labs/arc/issues/926))
+
+Since #915, recovery parks a crash-recovery manifest whose body does not
+decode (typically a zero-length file left by a crash before the rename was
+durable) under the `.quarantined` suffix, so it stops holding back every
+compaction candidate on the node. The only signal was one Error log line.
+A new counter, `arc_compaction_manifests_parked_unparseable_total`
+(`compaction_manifests_parked_unparseable_total` in the JSON snapshot),
+increments once per successful park, after the parked copy and the delete
+both landed, never on a park that failed and will be retried. Growth means a
+manifest stopped blocking compaction without being completed: the parked
+file name gives the tier, database and job, and that partition should be
+checked for a zero-length `_compacted` output or for duplicate rows. The
+existing `arc_storage_invalid_path_quarantined_total` keeps counting the
+other park route, an output key no backend can address.
+
 ### Backups no longer list the schema anchor directory as a database ([#927](https://github.com/Basekick-Labs/arc/issues/927))
 
 The field schema anchors under `_schema/` (#914) are Parquet objects, so a
