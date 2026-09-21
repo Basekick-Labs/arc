@@ -469,6 +469,11 @@ outside the database inventory (#927), and restore it with the data. A node
 that receives Parquet files from a peer rather than through its own ingest
 path relies on bootstrap for those measurements.
 
+`scripts/range_schema_acceptance.py` runs the original reproducer (a late
+field inside one day, a field first written 59 days after the earlier day was
+compacted, a field that stops being written, daily compaction and restarts)
+against a native build; see `docs/testing/range-schema-26.09.2.md`.
+
 ### Parked unparseable compaction manifests are counted ([#926](https://github.com/Basekick-Labs/arc/issues/926))
 
 Since #915, recovery parks a crash-recovery manifest whose body does not
