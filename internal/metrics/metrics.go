@@ -86,6 +86,12 @@ type Metrics struct {
 	compactionBytesWritten       atomic.Int64
 	compactionManifestsRecovered atomic.Int64
 
+	// Scheduled spoke metrics are absent from exports until the network
+	// scheduler starts. A bundle-only or disabled spoke must not look healthy.
+	edgeSyncSpokeSchedulerEnabled atomic.Bool
+	edgeSyncSpokeLastSuccessUnix  atomic.Int64
+	edgeSyncSpokePassFailures     atomic.Int64
+
 	// Auth metrics
 	authRequestsTotal atomic.Int64
 	authCacheHits     atomic.Int64
@@ -408,6 +414,27 @@ func (m *Metrics) IncCompactionManifestsRecovered(count int64) {
 	m.compactionManifestsRecovered.Add(count)
 }
 
+// EnableEdgeSyncSpokeScheduler makes scheduled network metrics visible.
+// It is called only after the network scheduler has been constructed.
+func (m *Metrics) EnableEdgeSyncSpokeScheduler() {
+	m.edgeSyncSpokeSchedulerEnabled.Store(true)
+}
+
+// RecordEdgeSyncSpokeSuccess records a completed scheduled network pass.
+func (m *Metrics) RecordEdgeSyncSpokeSuccess(at time.Time) {
+	if m.edgeSyncSpokeSchedulerEnabled.Load() {
+		m.edgeSyncSpokeLastSuccessUnix.Store(at.Unix())
+	}
+}
+
+// IncEdgeSyncSpokePassFailures counts failed scheduled passes, excluding
+// skipped overlaps, role-gated attempts and shutdown cancellation.
+func (m *Metrics) IncEdgeSyncSpokePassFailures() {
+	if m.edgeSyncSpokeSchedulerEnabled.Load() {
+		m.edgeSyncSpokePassFailures.Add(1)
+	}
+}
+
 // Auth Metrics
 func (m *Metrics) IncAuthRequests()  { m.authRequestsTotal.Add(1) }
 func (m *Metrics) IncAuthCacheHit()  { m.authCacheHits.Add(1) }
@@ -568,7 +595,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
 
-	return map[string]interface{}{
+	snapshot := map[string]interface{}{
 		// Process info
 		"uptime_seconds": time.Since(m.startTime).Seconds(),
 
@@ -739,6 +766,12 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"cluster_rbac_rejected_total":                            m.clusterRBACRejectedTotal.Load(),
 		"cluster_rbac_cascade_rejected_total":                    m.clusterRBACCascadeRejectedTotal.Load(),
 	}
+	if m.edgeSyncSpokeSchedulerEnabled.Load() {
+		snapshot["edge_sync_spoke_scheduler_enabled"] = int64(1)
+		snapshot["edge_sync_spoke_last_success_timestamp_seconds"] = m.edgeSyncSpokeLastSuccessUnix.Load()
+		snapshot["edge_sync_spoke_pass_failures_total"] = m.edgeSyncSpokePassFailures.Load()
+	}
+	return snapshot
 }
 
 // PrometheusFormat returns metrics in Prometheus text exposition format
@@ -930,6 +963,21 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_compaction_manifests_recovered_total Compaction manifests recovered after crash\n"...)
 	b = append(b, "# TYPE arc_compaction_manifests_recovered_total counter\n"...)
 	b = appendMetric(b, "arc_compaction_manifests_recovered_total", float64(m.compactionManifestsRecovered.Load()))
+
+	// Scheduled spoke metrics are absent on disabled and bundle-only nodes.
+	if m.edgeSyncSpokeSchedulerEnabled.Load() {
+		b = append(b, "# HELP arc_edgesync_spoke_scheduler_enabled Whether automatic network spoke sync is enabled\n"...)
+		b = append(b, "# TYPE arc_edgesync_spoke_scheduler_enabled gauge\n"...)
+		b = appendMetric(b, "arc_edgesync_spoke_scheduler_enabled", 1)
+
+		b = append(b, "# HELP arc_edgesync_spoke_last_success_timestamp_seconds Unix timestamp of the last successfully completed scheduled pass, zero if none\n"...)
+		b = append(b, "# TYPE arc_edgesync_spoke_last_success_timestamp_seconds gauge\n"...)
+		b = appendMetric(b, "arc_edgesync_spoke_last_success_timestamp_seconds", float64(m.edgeSyncSpokeLastSuccessUnix.Load()))
+
+		b = append(b, "# HELP arc_edgesync_spoke_pass_failures_total Failed scheduled network sync passes\n"...)
+		b = append(b, "# TYPE arc_edgesync_spoke_pass_failures_total counter\n"...)
+		b = appendMetric(b, "arc_edgesync_spoke_pass_failures_total", float64(m.edgeSyncSpokePassFailures.Load()))
+	}
 
 	// Auth metrics
 	b = append(b, "# HELP arc_auth_requests_total Total authentication requests\n"...)

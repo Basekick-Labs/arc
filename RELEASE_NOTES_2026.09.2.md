@@ -2,6 +2,38 @@
 
 > **Status:** Planned — October 2026 patch release.
 
+## Automatic network spoke synchronization (#828)
+
+Enabled network spokes automatically run discover/reconcile/send passes.
+The default successful-pass interval is `5m`; failures retry from `30s`
+with exponential backoff bounded by the normal interval. Operators can
+override these via `edge_sync.spoke.sync_interval` and
+`edge_sync.spoke.sync_retry_interval`, or the corresponding
+`ARC_EDGE_SYNC_SPOKE_SYNC_INTERVAL` and
+`ARC_EDGE_SYNC_SPOKE_SYNC_RETRY_INTERVAL` environment variables.
+Both durations must be at least one second, and the retry interval must
+be shorter than the normal interval.
+
+Manual `POST /api/v1/spoke-sync/run` remains available. It shares an
+agent-level overlap guard with scheduled passes; concurrent manual
+requests return HTTP 409. Scheduled attempts recheck primary-writer
+eligibility, and shutdown cancels and joins the active pass before
+database cleanup. Bundle-only spokes do not run a network scheduler,
+and air-gap bundle export remains manual.
+
+When automatic network sync is enabled, Prometheus exposes
+`arc_edgesync_spoke_scheduler_enabled`,
+`arc_edgesync_spoke_last_success_timestamp_seconds` (zero until the first
+completed scheduled pass) and `arc_edgesync_spoke_pass_failures_total`.
+These series are absent from disabled and bundle-only instances.
+The success timestamp advances only after a validated hub reconcile
+response and a fully completed scheduled pass. Empty-backlog passes do
+not advance the timestamp and are not counted as failures.
+
+**Validation note:** Local package tests and build must pass before
+submission. A real binary smoke test with non-default intervals and a
+live integration test remain separate acceptance checks.
+
 ## New: administrative cluster file deletion (`DELETE /api/v1/cluster/files`) ([#830](https://github.com/Basekick-Labs/arc/pull/830))
 
 A new administrative endpoint `DELETE /api/v1/cluster/files?path=...&confirm=true` allows cluster operators to remove an entry from the cluster-wide Raft manifest.

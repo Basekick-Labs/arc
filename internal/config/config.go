@@ -358,6 +358,12 @@ type EdgeSyncSpokeConfig struct {
 	// value can leave a backlog undrainable.
 	BatchSize int
 
+	// SyncInterval is the delay after a successful scheduled pass.
+	SyncInterval time.Duration
+
+	// RetryInterval is the initial delay after an unsuccessful pass.
+	RetryInterval time.Duration
+
 	// DeferCompactionUntilSynced makes local compaction wait for edge sync:
 	// only files the ledger reports delivered (synced — on the air-gap path,
 	// acked) are eligible compaction inputs, and compacted outputs are
@@ -785,6 +791,26 @@ func Load() (*Config, error) {
 		// Config file not found is OK, use defaults
 	}
 
+	// Parse scheduler intervals before building Config so file and
+	// environment overrides use the same validated values.
+	syncInterval, err := time.ParseDuration(v.GetString("edge_sync.spoke.sync_interval"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid edge_sync.spoke.sync_interval: %w", err)
+	}
+	if syncInterval < time.Second {
+		return nil, fmt.Errorf("edge_sync.spoke.sync_interval must be at least 1s, got %s", syncInterval)
+	}
+
+	syncRetryInterval, err := time.ParseDuration(v.GetString("edge_sync.spoke.sync_retry_interval"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid edge_sync.spoke.sync_retry_interval: %w", err)
+	}
+	if syncRetryInterval < time.Second || syncRetryInterval >= syncInterval {
+		return nil, fmt.Errorf(
+			"edge_sync.spoke.sync_retry_interval must be at least 1s and shorter than sync_interval",
+		)
+	}
+
 	// Parse max payload size
 	maxPayloadSize, err := ParseSize(v.GetString("server.max_payload_size"))
 	if err != nil {
@@ -910,6 +936,8 @@ func Load() (*Config, error) {
 				MaxAttempts:                v.GetInt("edge_sync.spoke.max_attempts"),
 				MaxConcurrent:              v.GetInt("edge_sync.spoke.max_concurrent"),
 				BatchSize:                  v.GetInt("edge_sync.spoke.batch_size"),
+				SyncInterval:               syncInterval,
+				RetryInterval:              syncRetryInterval,
 				LedgerRetentionDays:        v.GetInt("edge_sync.spoke.ledger_retention_days"),
 				DeferCompactionUntilSynced: v.GetBool("edge_sync.spoke.defer_compaction_until_synced"),
 				Bundle: EdgeSyncBundleConfig{
@@ -1583,6 +1611,8 @@ func setDefaults(v *viper.Viper) {
 	// backlog in one reconcile") is an explicit opt-in; the agent splits and
 	// retries on a 413 either way, so no value can strand a backlog.
 	v.SetDefault("edge_sync.spoke.batch_size", 1000)
+	v.SetDefault("edge_sync.spoke.sync_interval", "5m")
+	v.SetDefault("edge_sync.spoke.sync_retry_interval", "30s")
 	v.SetDefault("edge_sync.spoke.ledger_retention_days", 90) // terminal (synced/skipped) rows; 0 = never prune
 	// true: compaction waits for delivery, outputs never sync (issue #610).
 	// A spoke with sync configured but never triggered will DEFER compaction
