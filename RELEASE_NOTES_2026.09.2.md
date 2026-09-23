@@ -2,6 +2,16 @@
 
 > **Status:** Planned — October 2026 patch release.
 
+## New: MessagePack columnar tag keys (#275)
+
+MessagePack columnar payloads now accept an optional `tag_keys` field to
+identify tag columns explicitly. Both generic and typed decoding preserve
+these names for downstream tag metadata and compaction deduplication.
+Payloads without `tag_keys` remain supported.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir)
+for [#275](https://github.com/Basekick-Labs/arc/issues/275).
+
 ## New: administrative cluster file deletion (`DELETE /api/v1/cluster/files`) ([#830](https://github.com/Basekick-Labs/arc/pull/830))
 
 A new administrative endpoint `DELETE /api/v1/cluster/files?path=...&confirm=true` allows cluster operators to remove an entry from the cluster-wide Raft manifest.

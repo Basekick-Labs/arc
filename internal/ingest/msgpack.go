@@ -191,6 +191,16 @@ func (d *MessagePackDecoder) mapToPayload(m map[string]interface{}) *models.MsgP
 		}
 	}
 
+	// Columnar tag keys explicitly distinguish tags from string fields.
+	if rawTagKeys, ok := m["tag_keys"].([]interface{}); ok {
+		payload.TagKeys = make([]string, 0, len(rawTagKeys))
+		for _, value := range rawTagKeys {
+			if tag, ok := value.(string); ok {
+				payload.TagKeys = append(payload.TagKeys, tag)
+			}
+		}
+	}
+
 	// Handle batch
 	if batch, ok := m["batch"]; ok {
 		if batchSlice, ok := batch.([]interface{}); ok {
@@ -279,6 +289,7 @@ func (d *MessagePackDecoder) decodeColumnar(payload *models.MsgPackPayload, rawD
 		Measurement: measurement,
 		Columnar:    true,
 		Columns:     payload.Columns,
+		TagColumns:  payload.TagKeys,
 		TimeUnit:    "us",    // microseconds
 		RawPayload:  rawData, // Zero-copy: store original msgpack bytes for WAL
 	}, nil
