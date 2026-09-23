@@ -2,6 +2,22 @@
 
 > **Status:** Planned — October 2026 patch release.
 
+## New: per-peer replication lag metrics ([#908](https://github.com/Basekick-Labs/arc/pull/908))
+
+Prometheus now exposes `arc_replication_lag_entries` and
+`arc_replication_lag_seconds` with a `peer` label for active WAL replication
+readers. Entry lag measures the writer sequence minus the reader's acknowledged
+position, without unsigned underflow. Time lag measures the age of the oldest
+unacknowledged entry's WAL timestamp and returns zero when caught up. If the
+timestamp is unavailable because its entry was dropped or evicted, the seconds
+sample is omitted rather than reporting a misleading value. Disconnected
+readers are removed from the emitted series. No replication protocol change
+is required.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#908](https://github.com/Basekick-Labs/arc/pull/908).
+
+
 ## New: administrative cluster file deletion (`DELETE /api/v1/cluster/files`) ([#830](https://github.com/Basekick-Labs/arc/pull/830))
 
 A new administrative endpoint `DELETE /api/v1/cluster/files?path=...&confirm=true` allows cluster operators to remove an entry from the cluster-wide Raft manifest.
