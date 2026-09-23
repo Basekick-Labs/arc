@@ -1927,6 +1927,16 @@ writer returns normally or unwinds, and matches what every other stream writer
 in Arc already did. It also covers a panic raised inside the panic handler
 itself, ahead of where the release used to sit, which would have stranded a
 pooled connection.
+### Experimental arcx Arrow IPC queries now appear in query management ([#731](https://github.com/Basekick-Labs/arc/issues/731))
+
+When the experimental arcx engine serves an Arrow IPC query, the request now
+receives an `X-Arc-Query-ID` and appears in active-query tracking and history.
+Registry cancellation propagates into execution. Success, failure, timeout
+and recovered panic paths dispose of the entry rather than leaving it running.
+A declined arcx request reuses the same entry when DuckDB takes over.
+
+The standard Arrow path continues to use its existing registry lifecycle.
+
 ### The measurement endpoint now appears in query management ([#731](https://github.com/Basekick-Labs/arc/issues/731))
 
 `GET /api/v1/query/:measurement` never registered with the query registry, so
