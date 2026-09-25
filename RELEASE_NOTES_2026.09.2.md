@@ -599,6 +599,14 @@ Fetches now keep the overall deadline effective across the request, acknowledgem
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#899](https://github.com/Basekick-Labs/arc/pull/899).
 
+### Peer file fetches ignored cancellation during TCP/TLS connection setup ([#901](https://github.com/Basekick-Labs/arc/issues/901))
+
+A follow-up to the fetch-timeout fix above: connection establishment itself was not context-aware. `FetchClient.Fetch` checked `ctx.Err()` and derived a bounded dial timeout, but dialed through `security.Dial`, which wraps `tls.DialWithDialer` for TLS. That performs the TLS handshake against a background context internally, so cancelling the caller's context could not interrupt a peer that accepted the TCP connection, received the ClientHello, and then never responded. The connection-close cancellation hook was also installed only after the dial succeeded, so it offered no protection during dialing. A cancelled fetch could hold its pull worker until the (up to ten-second, production-configured) dial timeout elapsed, delaying `Puller.Stop`, which cancels and joins its workers.
+
+`FetchClient` now dials through a new `security.DialContext`, which uses `net.Dialer.DialContext` for plain TCP and `tls.Dialer.DialContext` for TLS — the latter threads the context through to the handshake via `tls.Conn.HandshakeContext`, so a cancelled context now interrupts a stalled handshake instead of only being noticed after it. `security.Dial` is unchanged and still used by the other cluster-internal callers that don't need this.
+
+Contributed by [@pujitha24](https://github.com/pujitha24) in [#902](https://github.com/Basekick-Labs/arc/pull/902).
+
 ### Compaction preserves files with identical basenames ([#826](https://github.com/Basekick-Labs/arc/issues/826))
 
 Daily compaction previously downloaded files from different hour partitions using only their basenames. Identically named files could overwrite one another, potentially duplicating some rows and losing others.
