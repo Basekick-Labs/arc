@@ -106,8 +106,8 @@ back to "default" (the namespace default SA). Mirrors the common Helm pattern.
 {{- printf "%s-headless" (include "arc-enterprise.compactorName" .) | trunc 63 | trimSuffix "-" -}}
 {{- end }}
 
-{{- define "arc-enterprise.minioName" -}}
-{{- printf "%s-minio" (include "arc-enterprise.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- define "arc-enterprise.seaweedfsName" -}}
+{{- printf "%s-seaweedfs" (include "arc-enterprise.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end }}
 
 {{- define "arc-enterprise.licenseSecretName" -}}
@@ -134,11 +134,11 @@ back to "default" (the namespace default SA). Mirrors the common Helm pattern.
 {{- end -}}
 {{- end }}
 
-{{- define "arc-enterprise.minioSecretName" -}}
-{{- if .Values.minio.credentials.existingSecret -}}
-{{ .Values.minio.credentials.existingSecret }}
+{{- define "arc-enterprise.seaweedfsSecretName" -}}
+{{- if .Values.seaweedfs.credentials.existingSecret -}}
+{{ .Values.seaweedfs.credentials.existingSecret }}
 {{- else -}}
-{{ printf "%s-minio-creds" (include "arc-enterprise.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{ printf "%s-seaweedfs-creds" (include "arc-enterprise.fullname" .) | trunc 63 | trimSuffix "-" }}
 {{- end -}}
 {{- end }}
 
@@ -148,42 +148,31 @@ back to "default" (the namespace default SA). Mirrors the common Helm pattern.
 {{- if $creds.existingSecret -}}
 {{ $creds.existingSecret }}
 {{- else if and (eq .Values.storage.mode "shared") (not $shared.external) -}}
-{{- include "arc-enterprise.minioSecretName" . -}}
+{{- include "arc-enterprise.seaweedfsSecretName" . -}}
 {{- else -}}
 {{ printf "%s-object-storage" (include "arc-enterprise.fullname" .) | trunc 63 | trimSuffix "-" }}
 {{- end -}}
 {{- end }}
 
 {{/*
-Whether to render the bundled MinIO resources.
-Only true when storage.mode=shared AND storage.shared.external=false AND minio.enabled=true.
+Whether to render the bundled SeaweedFS resources.
+Only true when storage.mode=shared AND storage.shared.external=false AND seaweedfs.enabled=true.
 Always compare with `eq (include ...) "true"` — Helm returns the string "true".
 */}}
-{{- define "arc-enterprise.minioBundled" -}}
-{{- and (eq .Values.storage.mode "shared") (not .Values.storage.shared.external) .Values.minio.enabled -}}
+{{- define "arc-enterprise.seaweedfsBundled" -}}
+{{- and (eq .Values.storage.mode "shared") (not .Values.storage.shared.external) .Values.seaweedfs.enabled -}}
 {{- end }}
 
 {{/*
-True when the object-storage credentials come from the chart-managed MinIO
-Secret (root-user / root-password keys), false when they come from an
-operator-supplied external-S3 secret (access-key / secret-key keys).
-*/}}
-{{- define "arc-enterprise.useMinioCredKeys" -}}
-{{- if (($.Values.storage.shared | default dict).credentials | default dict).existingSecret -}}
-false
-{{- else if eq (include "arc-enterprise.minioBundled" .) "true" -}}
-true
-{{- else -}}
-false
-{{- end -}}
-{{- end }}
-
-{{/*
-S3 endpoint — auto-populate when using bundled MinIO, otherwise use whatever the operator configured.
+S3 endpoint — auto-populate when using bundled SeaweedFS, otherwise use whatever the operator configured.
+The bundled Secret uses the same access-key / secret-key keys as an
+operator-supplied external-S3 secret, so no per-source key mapping exists
+any more (the bundled MinIO of earlier releases had its own root-user /
+root-password keys).
 */}}
 {{- define "arc-enterprise.s3Endpoint" -}}
-{{- if eq (include "arc-enterprise.minioBundled" .) "true" -}}
-{{ printf "http://%s:9000" (include "arc-enterprise.minioName" .) }}
+{{- if eq (include "arc-enterprise.seaweedfsBundled" .) "true" -}}
+{{ printf "http://%s:8333" (include "arc-enterprise.seaweedfsName" .) }}
 {{- else -}}
 {{ .Values.storage.shared.endpoint }}
 {{- end -}}
@@ -358,12 +347,12 @@ Storage env vars — depends on storage.mode.
   valueFrom:
     secretKeyRef:
       name: {{ include "arc-enterprise.objectStorageSecretName" . }}
-      key: {{ if eq (include "arc-enterprise.useMinioCredKeys" .) "true" }}root-user{{ else }}access-key{{ end }}
+      key: access-key
 - name: ARC_STORAGE_S3_SECRET_KEY
   valueFrom:
     secretKeyRef:
       name: {{ include "arc-enterprise.objectStorageSecretName" . }}
-      key: {{ if eq (include "arc-enterprise.useMinioCredKeys" .) "true" }}root-password{{ else }}secret-key{{ end }}
+      key: secret-key
 {{- end }}
 - name: ARC_CLUSTER_REPLICATION_ENABLED
   value: "false"

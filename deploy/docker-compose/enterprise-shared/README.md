@@ -1,8 +1,8 @@
 # Arc Cluster — Docker Compose (Shared Storage / Pattern 2 multi-writer)
 
-A 3-writer + 1-reader Arc cluster with **Traefik v3.6** as the reverse proxy and **MinIO** for S3-compatible shared storage. Traefik uses the Docker provider — routing is defined per container via labels, so the setup load-balances automatically as you add or remove writers/readers.
+A 3-writer + 1-reader Arc cluster with **Traefik v3.6** as the reverse proxy and **SeaweedFS** for S3-compatible shared storage. Traefik uses the Docker provider — routing is defined per container via labels, so the setup load-balances automatically as you add or remove writers/readers.
 
-This compose runs in **Pattern 2 multi-writer mode** (`ARC_CLUSTER_SHARED_STORAGE_MODE=true`): all three writers accept writes concurrently and PUT to the same MinIO bucket. There is no "primary" writer to elect or fail over to — the load balancer (Traefik) picks any healthy writer for each request, and a writer crash is recovered by the next request landing on a surviving writer.
+This compose runs in **Pattern 2 multi-writer mode** (`ARC_CLUSTER_SHARED_STORAGE_MODE=true`): all three writers accept writes concurrently and PUT to the same SeaweedFS bucket. There is no "primary" writer to elect or fail over to — the load balancer (Traefik) picks any healthy writer for each request, and a writer crash is recovered by the next request landing on a surviving writer.
 
 ## Architecture
 
@@ -46,7 +46,7 @@ This compose runs in **Pattern 2 multi-writer mode** (`ARC_CLUSTER_SHARED_STORAG
                               │
                               ▼
                   ┌───────────────────────┐
-                  │    MinIO (S3)         │
+                  │   SeaweedFS (S3)      │
                   │   Shared Storage      │
                   │                       │
                   │  All writers PUT      │
@@ -72,24 +72,24 @@ This compose runs in **Pattern 2 multi-writer mode** (`ARC_CLUSTER_SHARED_STORAG
 1. Client sends write request to Traefik (port 8000)
 2. Traefik picks any healthy writer (round-robin across writers 1/2/3)
 3. **The receiving writer handles the request directly** — no forwarding, no "leader" gate; every writer is equivalent for ingestion in Pattern 2
-4. Writer buffers in its local Arrow buffer, then flushes Parquet files to MinIO (S3)
+4. Writer buffers in its local Arrow buffer, then flushes Parquet files to SeaweedFS (S3)
 5. Manifest entry registered via Raft (cluster-wide visibility on next snapshot/query)
 
 ```
-Client → Traefik → Writer{1,2,3} → MinIO (directly; no forwarding)
+Client → Traefik → Writer{1,2,3} → SeaweedFS (directly; no forwarding)
 ```
 
-Each writer's flushed Parquet files land in the same MinIO bucket under unique filenames (per-process nanosecond suffix, so concurrent flushes from different writers in the same hour partition cannot collide).
+Each writer's flushed Parquet files land in the same SeaweedFS bucket under unique filenames (per-process nanosecond suffix, so concurrent flushes from different writers in the same hour partition cannot collide).
 
 #### Queries
 
 1. Client sends query to Traefik (port 8000)
 2. Traefik routes `/api/v1/query` to readers
-3. Reader queries data directly from MinIO (S3)
+3. Reader queries data directly from SeaweedFS (S3)
 4. Results returned to client
 
 ```
-Client → Traefik → Reader1 → MinIO → Reader1 → Client
+Client → Traefik → Reader1 → SeaweedFS → Reader1 → Client
 ```
 
 **Note:** Writers can also serve queries. Traefik routes queries to readers to offload traffic from writers, but if a query hits a writer it will serve it directly — no forwarding needed since all nodes read from the same shared storage.
@@ -102,7 +102,7 @@ When a writer crashes:
 1. The writer pod's `/ready` endpoint stops responding (or returns 503).
 2. Traefik's docker-provider health check marks the writer unhealthy and stops routing to it within one poll cycle (~5-10 s).
 3. New writes route to the surviving writer(s). **No in-cluster failover action required.**
-4. In-flight buffer on the crashed writer — i.e. records that arrived in memory but had not yet been flushed to MinIO — is lost. Records that completed the MinIO PUT before the crash are durable.
+4. In-flight buffer on the crashed writer — i.e. records that arrived in memory but had not yet been flushed to SeaweedFS — is lost. Records that completed the S3 PUT before the crash are durable.
 5. On writer restart, the local WAL replays any un-flushed entries into the new Arrow buffer before `/ready` flips back to 200 and Traefik resumes routing.
 
 Singleton background tasks (retention, continuous queries, deletes) gate on the cluster Raft leader — if the leader writer crashes, Raft elects a new leader within ~1 s and those tasks resume on the new leader's next scheduler tick.
@@ -130,7 +130,7 @@ With 3 writers, the cluster can survive 1 writer failure on both the ingestion s
 Arc's Pattern 2 multi-writer uses two independent data planes:
 
 1. **Data (Parquet) → shared S3**
-   - Each writer flushes Parquet files to its own per-process filenames in the same MinIO bucket.
+   - Each writer flushes Parquet files to its own per-process filenames in the same SeaweedFS bucket.
    - All nodes (writers + readers) query directly from the bucket — no replication needed.
    - WAL is local-only and used solely for crash recovery (replay un-flushed records on writer restart). Not replicated peer-to-peer.
 
@@ -140,7 +140,7 @@ Arc's Pattern 2 multi-writer uses two independent data planes:
 
 **Benefits of Pattern 2 shared storage:**
 - **Stateless compute** — writer pods can be replaced without data migration; the bucket is the durable layer.
-- **Horizontal write scaling** — add more writers behind the LB to scale write throughput linearly (bounded by MinIO bandwidth).
+- **Horizontal write scaling** — add more writers behind the LB to scale write throughput linearly (bounded by object-store bandwidth).
 - **Horizontal read scaling** — add more readers; they share the bucket too.
 - **Trivial failover** — LB retry is the failover mechanism; no in-cluster promotion daemon.
 
@@ -150,8 +150,8 @@ Arc's Pattern 2 multi-writer uses two independent data planes:
 |---------|------|---------|
 | Traefik | 8000 | Client API (load balanced across writers/readers) |
 | Traefik dashboard | 8080 | Web UI (insecure; disable in production) |
-| MinIO API | 9000 | S3 API |
-| MinIO Console | 9001 | Web UI |
+| SeaweedFS S3 API | 8333 | S3 API |
+| SeaweedFS master UI | 9333 | Cluster/volume status |
 
 Internal ports (not exposed):
 - 8000: Arc HTTP API
@@ -185,7 +185,7 @@ curl -X POST "http://localhost:8000/api/v1/query" \
 
 | Scenario | What it tests |
 |---|---|
-| `base` (default) | Ingest N records via Traefik LB, query through reader, assert exact record count. Verifies LB round-robin, writer concurrency, MinIO durability, reader-can-see-writer-flushes. |
+| `base` (default) | Ingest N records via Traefik LB, query through reader, assert exact record count. Verifies LB round-robin, writer concurrency, object-store durability, reader-can-see-writer-flushes. |
 | `non-leader-crash` | Same as base, but `docker kill` a non-leader writer mid-ingest. Asserts: every HTTP-success record is queryable (durability invariant). In-flight buffer on the killed writer may be lost. |
 | `leader-crash` | Same as base, but kill the current Raft leader mid-ingest. Asserts: Raft elects a new leader within seconds; writes continue via LB to surviving writers; durability invariant holds. |
 
@@ -232,7 +232,7 @@ Run `docker compose up -d arc-reader2` and the new reader appears in Traefik's `
 
 ## Production Considerations
 
-1. **Use external S3** — replace MinIO with AWS S3 or other managed object storage
+1. **Use external S3** — replace SeaweedFS with AWS S3 or other managed object storage
 2. **External load balancer** — terminate TLS upstream (AWS ALB, GCP LB, Cloudflare) and forward to Traefik
 3. **Disable the Traefik dashboard** — remove `--api.insecure=true` and the `:8080` port mapping in production
 4. **Persistent storage** — ensure volumes are backed up

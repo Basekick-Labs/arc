@@ -18,7 +18,7 @@
 #   - all 3 writers come up healthy and serve /ready=200 after WAL replay
 #   - Traefik LB distributes writes across writers (Pattern 2: every writer
 #     accepts ingest, no leader-forwarding)
-#   - writers PUT to the shared MinIO bucket with non-colliding filenames
+#   - writers PUT to the shared SeaweedFS bucket with non-colliding filenames
 #   - reader queries pick up records flushed by all writers
 #   - HA via LB retry: a writer crash is recovered by /ready draining; the
 #     LB stops routing to it within one poll cycle
@@ -45,7 +45,7 @@ SCENARIO="${SCENARIO:-base}"
 RECORDS="${RECORDS:-1000}"
 TRAEFIK_URL="http://localhost:8000"
 # Database name includes a per-run epoch so re-running the smoke doesn't
-# collide with leftover state in the shared MinIO bucket (the bucket
+# collide with leftover state in the shared SeaweedFS bucket (the bucket
 # persists across `docker compose down -v` runs because volume-cleanup
 # only affects the per-writer SQLite/WAL dirs, not the object store).
 DATABASE="smoke_$(date +%s)"
@@ -170,18 +170,18 @@ log "tearing down any existing smoke containers"
 docker compose "${COMPOSE_FILES[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
 
 # Defensive: kill any orphaned containers from prior smoke runs that
-# share names with this compose's services (`minio`, `arc-writer1`, …).
+# share names with this compose's services (`seaweedfs`, `arc-writer1`, …).
 # `down --remove-orphans` only catches containers labelled for this
-# compose project; a stray minio left over from a different stack (the
+# compose project; a stray seaweedfs left over from a different stack (the
 # enterprise-local compose, a customer's own deployment, etc.) has its
-# own project label and would block our minio from starting with "name
+# own project label and would block our seaweedfs from starting with "name
 # already in use." Force-remove by name; ignore failures (the container
 # may not exist, which is fine).
-for stray in minio arc-traefik arc-writer1 arc-writer2 arc-writer3 arc-reader1; do
+for stray in seaweedfs arc-traefik arc-writer1 arc-writer2 arc-writer3 arc-reader1; do
   docker rm -f "$stray" >/dev/null 2>&1 || true
 done
 
-log "building + booting 3 writers + 1 reader + MinIO + Traefik"
+log "building + booting 3 writers + 1 reader + SeaweedFS + Traefik"
 docker compose "${COMPOSE_FILES[@]}" up -d --build
 
 # ---------- wait for readiness ----------

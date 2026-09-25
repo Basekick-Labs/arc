@@ -11,22 +11,22 @@ Multi-node Arc Enterprise deployment for Kubernetes with role separation (writer
 
 ## Quick Start
 
-### Pattern A — Shared Object Storage (bundled MinIO)
+### Pattern A — Shared Object Storage (bundled SeaweedFS)
 
 ```bash
 helm install arc-ent helm/arc-enterprise \
   -f helm/arc-enterprise/values-shared-storage.yaml \
   --set license.key=ARC-ENT-XXXX-XXXX-XXXX-XXXX \
   --set cluster.sharedSecret.value=$(openssl rand -hex 32) \
-  --set minio.credentials.rootUser=arcminio \
-  --set minio.credentials.rootPassword=$(openssl rand -hex 32) \
+  --set seaweedfs.credentials.accessKey=arcstore \
+  --set seaweedfs.credentials.secretKey=$(openssl rand -hex 32) \
   --namespace arc --create-namespace
 ```
 
 This deploys:
-- 1 MinIO pod (bundled S3-compatible storage)
+- 1 SeaweedFS pod (bundled S3-compatible storage)
 - 3 writers, 2 readers, 1 compactor
-- Each Arc pod points at the MinIO bucket as shared storage
+- Each Arc pod points at the SeaweedFS bucket as shared storage (created on first write)
 
 The chart refuses to install if any of the required credentials are missing
 — there are no weak defaults.
@@ -42,7 +42,7 @@ helm install arc-ent helm/arc-enterprise \
 ```
 
 This deploys:
-- No MinIO
+- No SeaweedFS
 - 3 writers, 2 readers, 1 compactor, each with its own PersistentVolume
 - Peer-to-peer file replication keeps nodes in sync
 
@@ -51,7 +51,7 @@ This deploys:
 | Use case | Recommended pattern |
 |----------|--------------------|
 | Cloud-native deployment on managed Kubernetes (EKS/GKE/AKS) | Shared |
-| Already running S3, MinIO, or Azure Blob in production | Shared |
+| Already running S3, SeaweedFS, MinIO, or Azure Blob in production | Shared |
 | Bare metal or on-prem Kubernetes | Local |
 | Air-gapped / edge / defense deployments | Local |
 | Need lowest possible query latency (local NVMe) | Local |
@@ -76,8 +76,8 @@ storage:
     credentials:
       existingSecret: arc-s3-credentials   # must contain access-key, secret-key
 
-minio:
-  enabled: false                           # don't deploy bundled MinIO
+seaweedfs:
+  enabled: false                           # don't deploy bundled SeaweedFS
 ```
 
 ### External S3 with IRSA (EKS — no static keys)
@@ -110,7 +110,7 @@ serviceAccount:
   annotations:
     eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/arc-s3
 
-minio:
+seaweedfs:
   enabled: false
 ```
 

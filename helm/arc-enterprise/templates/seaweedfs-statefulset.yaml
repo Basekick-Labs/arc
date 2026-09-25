@@ -1,0 +1,112 @@
+{{- if eq (include "arc-enterprise.seaweedfsBundled" .) "true" }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "arc-enterprise.seaweedfsName" . }}
+  labels:
+    {{- include "arc-enterprise.roleLabels" (dict "ctx" . "role" "seaweedfs") | nindent 4 }}
+spec:
+  serviceName: {{ include "arc-enterprise.seaweedfsName" . }}
+  replicas: {{ .Values.seaweedfs.replicas }}
+  selector:
+    matchLabels:
+      {{- include "arc-enterprise.roleSelectorLabels" (dict "ctx" . "role" "seaweedfs") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "arc-enterprise.roleLabels" (dict "ctx" . "role" "seaweedfs") | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      securityContext:
+        {{- toYaml .Values.seaweedfs.securityContext | nindent 8 }}
+      containers:
+        - name: seaweedfs
+          image: {{ .Values.seaweedfs.image | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            runAsNonRoot: true
+            runAsUser: {{ .Values.seaweedfs.securityContext.runAsUser }}
+          # The S3 identities file is rendered at startup from the Secret, so
+          # credentials.existingSecret works without the chart ever reading
+          # the Secret at template time. The $-references are expanded by the
+          # SHELL, not by kubelet ($(VAR) would land the secret values in the
+          # container's argv, visible in /proc/1/cmdline). Values containing
+          # `"` or `\` would break the rendered JSON — the documented
+          # generator, `openssl rand -hex 32`, cannot produce those. The
+          # gateway binds all interfaces explicitly: without -ip.bind the S3
+          # port listens only on the pod IP and a localhost probe is refused.
+          # Buckets are created on first authenticated write (the identity
+          # has Admin), so no init job is needed: Arc's first flush creates
+          # the bucket.
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              cat > /tmp/s3.json <<EOF
+              {"identities":[{"name":"arc","credentials":[{"accessKey":"$SEAWEEDFS_ACCESS_KEY","secretKey":"$SEAWEEDFS_SECRET_KEY"}],"actions":["Admin","Read","Write","List"]}]}
+              EOF
+              exec weed server -s3 -s3.port=8333 -s3.config=/tmp/s3.json \
+                -dir=/data -ip.bind=0.0.0.0 -disableHttp
+          env:
+            - name: SEAWEEDFS_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "arc-enterprise.seaweedfsSecretName" . }}
+                  key: access-key
+            - name: SEAWEEDFS_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "arc-enterprise.seaweedfsSecretName" . }}
+                  key: secret-key
+          ports:
+            - name: s3
+              containerPort: 8333
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            {{- toYaml .Values.seaweedfs.resources | nindent 12 }}
+          # /status on the S3 port answers 200 without authentication once
+          # the gateway is up (an unsigned data request would be 403, which
+          # an httpGet probe counts as failure).
+          readinessProbe:
+            httpGet:
+              path: /status
+              port: 8333
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /status
+              port: 8333
+            initialDelaySeconds: 30
+            periodSeconds: 10
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.seaweedfs.persistence.storageClass }}
+        storageClassName: {{ .Values.seaweedfs.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.seaweedfs.persistence.size | quote }}
+{{- end }}

@@ -592,7 +592,7 @@ jobs:
            optimized for IoT, observability, and analytics workloads.
            .
            Features: 9.47M records/sec ingestion, DuckDB SQL queries,
-           Parquet storage, S3/MinIO support.
+           Parquet storage, S3-compatible object storage support.
           Homepage: https://github.com/basekick-labs/arc
           EOF
 
@@ -762,7 +762,7 @@ jobs:
           optimized for IoT, observability, and analytics workloads.
 
           Features: 9.47M records/sec ingestion, DuckDB SQL queries,
-          Parquet storage, S3/MinIO support.
+          Parquet storage, S3-compatible object storage support.
 
           %prep
           %setup -q
@@ -941,7 +941,7 @@ jobs:
           pkgname=arc
           pkgver=${VERSION}
           pkgrel=1
-          pkgdesc="High-performance columnar analytical database built on DuckDB (Parquet storage, S3/MinIO support)"
+          pkgdesc="High-performance columnar analytical database built on DuckDB (Parquet storage, S3-compatible object storage support)"
           arch=('${ARCH}')
           url="https://github.com/basekick-labs/arc"
           license=('AGPL-3.0-only')
@@ -1582,7 +1582,7 @@ jobs:
           - ✅ Retention Policies (automatic data expiration)
           - ✅ Continuous Queries (real-time aggregations)
           - ✅ Delete API (selective data removal)
-          - ✅ S3/MinIO storage backend
+          - ✅ S3-compatible object storage backend
           - ✅ Arrow IPC query responses
 
           ## Quick Start

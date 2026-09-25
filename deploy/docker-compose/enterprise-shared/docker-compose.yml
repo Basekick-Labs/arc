@@ -1,7 +1,7 @@
 # =============================================================================
-# Arc Cluster — Shared Storage (MinIO)
+# Arc Cluster — Shared Storage (SeaweedFS)
 #
-# Writers, readers, and MinIO share a single S3-compatible bucket. Traefik
+# Writers, readers, and SeaweedFS share a single S3-compatible bucket. Traefik
 # acts as a dynamic reverse proxy via the Docker provider: routing is defined
 # per container via labels, so new writers/readers are load-balanced
 # automatically.
@@ -12,10 +12,8 @@ x-arc-common: &arc-common
   networks:
     - arc-cluster
   depends_on:
-    minio:
+    seaweedfs:
       condition: service_healthy
-    minio-init:
-      condition: service_completed_successfully
 
 x-arc-env: &arc-env
   # Cluster
@@ -25,20 +23,20 @@ x-arc-env: &arc-env
   ARC_CLUSTER_COORDINATOR_ADDR: ":9100"
   ARC_CLUSTER_RAFT_BIND_ADDR: ":9200"
   # Pattern 2 multi-writer: all RoleWriter nodes accept writes
-  # concurrently and PUT to the shared MinIO bucket. Writer failover
+  # concurrently and PUT to the shared bucket. Writer failover
   # is suppressed (LB does failover via retry). Singleton background
   # tasks (retention, CQ, delete) run on whichever node is the cluster
   # Raft leader. Requires Enterprise license with the
   # shared_storage_multi_writer feature.
   # See docs/progress/2026-05-26-multi-writer-pattern2.md.
   ARC_CLUSTER_SHARED_STORAGE_MODE: "true"
-  # Storage (MinIO)
+  # Storage (SeaweedFS)
   ARC_STORAGE_BACKEND: "s3"
   ARC_STORAGE_S3_BUCKET: "arc-data"
   ARC_STORAGE_S3_REGION: "us-east-1"
-  ARC_STORAGE_S3_ENDPOINT: "http://minio:9000"
-  ARC_STORAGE_S3_ACCESS_KEY: "minioadmin"
-  ARC_STORAGE_S3_SECRET_KEY: "minioadmin"
+  ARC_STORAGE_S3_ENDPOINT: "http://seaweedfs:8333"
+  ARC_STORAGE_S3_ACCESS_KEY: "arcadmin"
+  ARC_STORAGE_S3_SECRET_KEY: "arcadmin123"
   ARC_STORAGE_S3_FORCE_PATH_STYLE: "true"
   # License
   ARC_LICENSE_KEY: "${ARC_LICENSE_KEY}"
@@ -195,64 +193,50 @@ services:
       - arc-writer1
 
   # =============================================================================
-  # MinIO — S3-compatible shared storage
+  # SeaweedFS — S3-compatible shared storage
+  #
+  # `weed server -s3` runs master, volume server, filer and the S3 gateway
+  # in one process. The identities file is rendered at startup, and
+  # -ip.bind is required for the localhost healthcheck (without it the
+  # gateway listens only on the container IP). No bucket-init service:
+  # SeaweedFS creates the bucket on the first authenticated write, so
+  # Arc's first flush creates `arc-data` (the earlier bundled MinIO
+  # needed a one-shot mc container for this).
   # =============================================================================
-  minio:
-    image: minio/minio:latest
-    container_name: minio
-    command: server /data --console-address ":9001"
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.47
+    container_name: seaweedfs
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        cat > /etc/seaweedfs-s3.json <<EOF
+        {"identities":[{"name":"arc","credentials":[{"accessKey":"arcadmin","secretKey":"arcadmin123"}],"actions":["Admin","Read","Write","List"]}]}
+        EOF
+        exec weed server -s3 -s3.port=8333 -s3.config=/etc/seaweedfs-s3.json \
+          -dir=/data -ip.bind=0.0.0.0 -disableHttp
     ports:
-      - "9000:9000"
-      - "9001:9001"
-    environment:
-      MINIO_ROOT_USER: "minioadmin"
-      MINIO_ROOT_PASSWORD: "minioadmin"
+      - "8333:8333"             # S3 API (authenticated)
+      # The master status port is unauthenticated; bind it to loopback so it
+      # is reachable from this host only. Filer/volume/gRPC ports are not
+      # published at all, and -disableHttp closes the HTTP data planes.
+      - "127.0.0.1:9333:9333"   # master status (local only)
     volumes:
-      - minio-data:/data
+      - seaweedfs-data:/data
     networks:
       - arc-cluster
     healthcheck:
-      # Use MinIO's built-in HTTP health endpoint rather than `mc ready`.
-      # Both binaries ship in the current minio/minio image, but the HTTP
-      # path doesn't require an mc alias to be configured first and is
-      # more robust against future image trimming.
-      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      # /status on the S3 port answers 200 without authentication.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8333/status"]
       interval: 2s
       timeout: 5s
       retries: 30
-
-  # =============================================================================
-  # minio-init — one-shot bucket creation
-  #
-  # Runs after MinIO reports healthy, creates the `arc-data` bucket if
-  # it doesn't already exist, then exits. Arc writers fail their first
-  # S3 PUT silently if the bucket is missing (the HeadBucket warning is
-  # not fatal); without this init step the cluster boots cleanly but
-  # data writes never persist. Idempotent — re-running compose up does
-  # not affect an existing bucket.
-  # =============================================================================
-  minio-init:
-    image: minio/mc:latest
-    container_name: minio-init
-    depends_on:
-      minio:
-        condition: service_healthy
-    networks:
-      - arc-cluster
-    entrypoint: >-
-      /bin/sh -c "
-      mc alias set local http://minio:9000 minioadmin minioadmin &&
-      (mc mb --ignore-existing local/arc-data) &&
-      echo 'minio-init: bucket arc-data ready'
-      "
-    restart: "no"
 
 volumes:
   arc-writer1-data:
   arc-writer2-data:
   arc-writer3-data:
   arc-reader1-data:
-  minio-data:
+  seaweedfs-data:
 
 networks:
   arc-cluster:

@@ -1,0 +1,34 @@
+{{- /*
+  SeaweedFS's single-process `weed server` opens more than the S3 gateway:
+  master, volume and filer ports (HTTP and gRPC) listen on the pod IP, and
+  the gRPC planes accept unauthenticated administrative operations
+  (`-disableHttp` on the StatefulSet already closes the HTTP data planes).
+  The credentials the chart insists on only guard port 8333, so without a
+  NetworkPolicy any pod in the cluster could bypass them. This policy pins
+  ingress to the S3 port, from this release's pods only. It is enforced
+  only where the CNI implements NetworkPolicy — which is why the HTTP
+  planes are ALSO disabled at the process level rather than relying on
+  this alone.
+*/ -}}
+{{- if and (eq (include "arc-enterprise.seaweedfsBundled" .) "true") .Values.seaweedfs.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "arc-enterprise.seaweedfsName" . }}
+  labels:
+    {{- include "arc-enterprise.roleLabels" (dict "ctx" . "role" "seaweedfs") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "arc-enterprise.roleSelectorLabels" (dict "ctx" . "role" "seaweedfs") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "arc-enterprise.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8333
+{{- end }}
