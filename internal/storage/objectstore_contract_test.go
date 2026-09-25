@@ -7,11 +7,12 @@
 // slash, Azure treating a backslash as a separator) are properties of the
 // servers, not of any mock.
 //
-// Run with:
+// Run with (SeaweedFS stands in for S3; see .github/workflows/ci.yml for the
+// identities file that supplies the minioadmin credentials these tests use):
 //
-//	docker run -d --name arc-minio -p 9000:9000 \
-//	  -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-//	  quay.io/minio/minio server /data
+//	docker run -d --name arc-seaweedfs -p 9000:8333 \
+//	  -v /tmp/seaweed-s3.json:/etc/seaweedfs/s3.json:ro \
+//	  chrislusf/seaweedfs:4.47 server -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
 //	ARC_TEST_S3_BUCKET=arctest go test -tags='duckdb_arrow objectstore' ./internal/storage/
 //
 // CI does this in .github/workflows/ci.yml.
