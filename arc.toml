@@ -104,6 +104,21 @@ enabled = true
 # retained; one that cannot be decoded is parked as *.quarantined.
 # cycle_timeout = "30m"
 
+# Databases that scheduled cycles (and manual triggers without a database
+# scope) skip during candidate discovery. A trigger that names a database
+# (POST /api/v1/compaction/trigger?database=X) bypasses the list — combined,
+# the two give control over what gets compacted and in which order.
+# Exact, case-sensitive names — no globs, prefixes, or separator splitting.
+# On a hub, received spoke data is excluded as "spoke/db" (one
+# pseudo-database) or "spoke" (the whole namespace); the manual bypass works
+# at spoke granularity only (?database= takes plain database names).
+# Manifest recovery is never filtered: compactions a previous cycle already
+# started always complete. This key gates compaction only — retention,
+# tiering, and Iceberg export ignore it. Default: empty (nothing excluded).
+# Environment override (whitespace-separated; a name containing spaces
+# needs this TOML array): ARC_COMPACTION_EXCLUDE_DATABASES="staging imports"
+# exclude_databases = ["staging", "imports_backlog"]
+
 # Hourly
 hourly_enabled = true
 hourly_schedule = "5 * * * *"

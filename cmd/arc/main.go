@@ -1308,6 +1308,7 @@ func main() {
 			MaxConcurrent:    cfg.Compaction.MaxConcurrent,
 			CycleTimeout:     cfg.Compaction.CycleTimeout,
 			MaxFilesPerBatch: cfg.Compaction.MaxFilesPerBatch,
+			ExcludeDatabases: cfg.Compaction.ExcludeDatabases,
 			// Per-subprocess DuckDB bounds. Config resolves the "auto"
 			// sentinels at load time: memory_limit defaults to
 			// database.memory_limit / max_concurrent (so compaction's
