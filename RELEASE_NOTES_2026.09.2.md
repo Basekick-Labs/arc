@@ -89,6 +89,16 @@ Names match exactly and case-sensitively — no prefixes, no globs, no separator
 
 Things the list deliberately does not touch: manifest recovery, so a compaction that was interrupted mid-flight always completes even if its database has since been excluded — exclusion gates new work, never the completion of started work — and retention, tiering, and Iceberg export, which are separate systems with their own configuration: an excluded database still ages to cold storage and still exports. The default is an empty list, so existing deployments are unchanged. The key takes a TOML array (`exclude_databases = ["staging", "imports_backlog"]`) or a whitespace-separated environment override (`ARC_COMPACTION_EXCLUDE_DATABASES="staging imports_backlog"`).
 
+## Changed: the bundled object store is now SeaweedFS (MinIO retired its open-source images)
+
+MinIO has retired its open-source distribution — its container images no longer pull, and the successor product, AIStor, is commercial. Everything in this repository that deployed MinIO now deploys [SeaweedFS](https://github.com/seaweedfs/seaweedfs) (`chrislusf/seaweedfs:4.47`, pinned) instead: the enterprise Helm chart's bundled shared-storage tier, the `oss-s3` and `enterprise-shared` Compose stacks, and CI's object-storage contract step. None of this changes Arc itself: Arc speaks S3, and an **external** MinIO deployment you already run keeps working — `storage.backend = "minio"` remains an accepted alias of `s3`.
+
+Two behaviors improve with the swap. Buckets are created on the first authenticated write, so the Compose stacks lose their one-shot `mc` bucket-init container and the chart needs no manual bucket step — Arc's first flush creates the bucket (the startup log still prints one "could not verify bucket exists" warning before that flush; it is expected). And the chart-managed credentials Secret now uses the same `access-key`/`secret-key` keys as an operator-supplied external-S3 secret, so the two paths are no longer shaped differently.
+
+One caution the bundled MinIO never raised: SeaweedFS's credentials guard only the S3 port, while its single process also opens master, volume and filer ports. The chart therefore disables the HTTP data planes at the process level (`-disableHttp`) and ships a NetworkPolicy — default on, `seaweedfs.networkPolicy.enabled` — pinning ingress to the S3 port from the release's own pods, which also covers the gRPC planes wherever the CNI enforces NetworkPolicy. The Compose stacks publish only the authenticated S3 port to the host, plus the master status port bound to loopback.
+
+For the Helm chart this is a **breaking values change** — see Upgrade notes.
+
 ## Changed: telemetry now reports the arcli installations an instance served
 
 Arc's opt-out telemetry gains a `clients` section describing the [arcli](https://github.com/Basekick-Labs/arcli) installations that talked to this instance since the last successful report. arcli sends a random per-installation UUID and its version with each request. Arc counts an installation only on a request that succeeded (a status below 400) and, when authentication is configured, that carried a valid token, so unauthenticated endpoints such as `/health` never contribute. It then reports, per installation, the id, the version, and the time it was last seen, plus a count and a `truncated` flag once more than 256 distinct installations have been seen between reports. The section is omitted entirely when no arcli client was seen.
@@ -318,6 +328,12 @@ decision rests on are pinned by tests, so a future DuckDB bump that lifts one
 fails the build rather than leaving the note quietly wrong.
 
 ## Upgrade notes
+
+### The Helm chart's bundled MinIO is replaced by SeaweedFS (breaking values change)
+
+The `minio:` values block is renamed `seaweedfs:`, credentials are `seaweedfs.credentials.accessKey`/`secretKey` (previously `minio.credentials.rootUser`/`rootPassword`), the chart-managed Secret's keys are `access-key`/`secret-key`, and the in-cluster S3 service is `<release>-seaweedfs` on port 8333. The chart's schema now rejects any `minio.*` key outright — including old keys merged back in by `helm upgrade --reuse-values` — so the rename cannot be picked up silently: the upgrade fails until the values are renamed.
+
+Data on an existing bundled-MinIO PersistentVolume is **not migrated**: SeaweedFS cannot read MinIO's on-disk layout, and upgrading a bundled install renders a new, empty object store. Before switching, sync the bucket out and back (`aws s3 sync` against the old and new endpoints), or keep your data where it is by setting `storage.shared.external=true` with the old store's endpoint and credentials — external stores, including MinIO, remain fully supported. The Compose stacks have the same property (the `minio-data` volume is not read by the new `seaweedfs` service); they are development stacks, but sync the bucket first if the data matters.
 
 ### A node asked to bootstrap Raft on a non-writing role now exits at startup
 

@@ -1,0 +1,16 @@
+{{- if eq (include "arc-enterprise.seaweedfsBundled" .) "true" }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "arc-enterprise.seaweedfsName" . }}
+  labels:
+    {{- include "arc-enterprise.roleLabels" (dict "ctx" . "role" "seaweedfs") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: s3
+      port: 8333
+      targetPort: 8333
+  selector:
+    {{- include "arc-enterprise.roleSelectorLabels" (dict "ctx" . "role" "seaweedfs") | nindent 4 }}
+{{- end }}

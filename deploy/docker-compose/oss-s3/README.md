@@ -1,22 +1,24 @@
-# Arc OSS — Single Node, S3-Backed (bundled MinIO)
+# Arc OSS — Single Node, S3-Backed (bundled SeaweedFS)
 
-One Arc container backed by a bundled MinIO for S3-compatible storage. Still a single Arc node — just with object storage instead of a local disk. Swap MinIO for AWS S3 / R2 / Tigris / Azure by removing the `minio` service and pointing at your own endpoint.
+One Arc container backed by a bundled SeaweedFS for S3-compatible storage. Still a single Arc node — just with object storage instead of a local disk. Swap SeaweedFS for AWS S3 / R2 / Tigris / Azure by removing the `seaweedfs` service and pointing at your own endpoint.
+
+The `arc-data` bucket is created automatically on Arc's first write, so there is no bucket-init step. Arc logs one startup warning that it could not verify the bucket exists; that is expected before the first flush.
 
 ## Architecture
 
 ```
 ┌──────────────┐      ┌──────────────┐
-│     Arc      │─────▶│    MinIO     │
-│  (port 8000) │      │  (port 9000) │
+│     Arc      │─────▶│  SeaweedFS   │
+│  (port 8000) │      │  (port 8333) │
 └──────────────┘      └──────────────┘
 ```
 
 ## Usage
 
 ```bash
-# Optional: override the MinIO root credentials + pre-set the admin token
-export MINIO_ROOT_USER=arcminio
-export MINIO_ROOT_PASSWORD=$(openssl rand -hex 32)
+# Optional: override the SeaweedFS S3 credentials + pre-set the admin token
+export SEAWEEDFS_ACCESS_KEY=arcstore
+export SEAWEEDFS_SECRET_KEY=$(openssl rand -hex 32)
 export ARC_AUTH_BOOTSTRAP_TOKEN=$(openssl rand -hex 32)
 
 docker compose up -d
@@ -32,13 +34,19 @@ curl -X POST http://localhost:8000/api/v1/query \
   -H "Content-Type: application/json" \
   -d '{"sql": "SELECT * FROM mydb.cpu"}'
 
-# MinIO console — browse the bucket contents
-open http://localhost:9001
+# SeaweedFS master UI — cluster/volume status
+open http://localhost:9333
+
+# Browse the bucket contents with any S3 client (credentials default to
+# arcadmin/arcadmin123 unless you exported the overrides above):
+AWS_ACCESS_KEY_ID=${SEAWEEDFS_ACCESS_KEY:-arcadmin} \
+AWS_SECRET_ACCESS_KEY=${SEAWEEDFS_SECRET_KEY:-arcadmin123} \
+  aws --endpoint-url http://localhost:8333 s3 ls s3://arc-data/ --recursive
 ```
 
 ## Pointing at external S3 / R2 / Tigris / Azure
 
-1. Remove the `minio` service and the `depends_on.minio` block
+1. Remove the `seaweedfs` service and the `depends_on.seaweedfs` block
 2. Replace the `ARC_STORAGE_S3_*` values with your credentials and endpoint:
 
 ```yaml
