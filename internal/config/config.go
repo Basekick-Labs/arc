@@ -162,7 +162,13 @@ type CompactionConfig struct {
 	DailySkipFileAgeCheckDays int           // Skip file creation time check for partitions older than N days (default: 7)
 	MaxConcurrent             int           // Max concurrent compaction jobs (default: 2)
 	CycleTimeout              time.Duration // Maximum duration of one compaction cycle (default: 30m)
-	TempDirectory             string        // Temporary directory for compaction files (default: ./data/compaction)
+	// ExcludeDatabases lists databases that scheduled compaction cycles and
+	// unscoped manual triggers skip during candidate discovery. An
+	// explicitly scoped trigger (?database=X) bypasses the list — naming a
+	// database is operator intent. Names match exactly and case-sensitively;
+	// a hub excludes received spoke data as "spoke/db". (default: empty)
+	ExcludeDatabases []string
+	TempDirectory    string // Temporary directory for compaction files (default: ./data/compaction)
 
 	// MemoryLimit is the DuckDB memory limit applied to EACH compaction
 	// subprocess. Empty (the default) means auto-derive: database.memory_limit
@@ -932,6 +938,7 @@ func Load() (*Config, error) {
 			DailyMinFiles:               v.GetInt("compaction.daily_min_files"),
 			DailySkipFileAgeCheckDays:   v.GetInt("compaction.daily_skip_file_age_check_days"),
 			MaxConcurrent:               v.GetInt("compaction.max_concurrent"),
+			ExcludeDatabases:            v.GetStringSlice("compaction.exclude_databases"),
 			CycleTimeout:                cycleTimeout,
 			MaxFilesPerBatch:            v.GetInt("compaction.max_files_per_batch"),
 			TempDirectory:               v.GetString("compaction.temp_directory"),
@@ -1615,6 +1622,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.daily_skip_file_age_check_days", 7)   // Skip file age check for partitions older than 7 days
 	v.SetDefault("compaction.max_concurrent", 2)                   // 2 concurrent jobs
 	v.SetDefault("compaction.cycle_timeout", "30m")                // Maximum duration per cycle
+	v.SetDefault("compaction.exclude_databases", []string{})       // Databases skipped by scheduled cycles (scoped triggers bypass)
 	v.SetDefault("compaction.max_files_per_batch", 30)             // 30 files per DuckDB read_parquet() call; valid range [2, 500]
 	v.SetDefault("compaction.temp_directory", "./data/compaction") // Temp directory for compaction files
 	v.SetDefault("compaction.memory_limit", "")                    // "" = auto: database.memory_limit / max_concurrent (see CompactionConfig.MemoryLimit)
