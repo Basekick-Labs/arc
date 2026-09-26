@@ -335,14 +335,18 @@ func toInt64(v interface{}) (int64, bool) {
 		}
 		return int64(val), true
 	case float32:
-		// Bounds check required before conversion to int64
-		if val > float32(math.MaxInt64) || val < float32(math.MinInt64) {
+		// Use the exact half-open int64 range. Converting MaxInt64 to float32
+		// rounds it to 2^63, so comparing against float32(math.MaxInt64) would
+		// incorrectly allow that out-of-range value.
+		f := float64(val)
+		if math.IsNaN(f) || math.IsInf(f, 0) || f >= 1<<63 || f < -1<<63 {
 			return 0, false
 		}
 		return int64(val), true //nolint:gosec // Bounds checked above
 	case float64:
-		// Bounds check required before conversion to int64
-		if val > float64(math.MaxInt64) || val < float64(math.MinInt64) {
+		// The upper bound is exclusive because float64(math.MaxInt64) rounds
+		// to 2^63. Reject non-finite values before the integer conversion too.
+		if math.IsNaN(val) || math.IsInf(val, 0) || val >= 1<<63 || val < -1<<63 {
 			return 0, false
 		}
 		return int64(val), true //nolint:gosec // Bounds checked above

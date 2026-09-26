@@ -2,6 +2,13 @@
 
 > **Status:** Planned — October 2026 patch release.
 
+## Fixed: reject non-finite and rounded-out-of-range float conversions
+
+The integer conversion guard now rejects NaN, infinities, and float values at
+or beyond the exclusive `2^63` upper boundary. This closes a gap in the
+previous overflow fix, where converting `math.MaxInt64` to a floating-point
+type rounded it to `2^63` and allowed an invalid conversion.
+
 ## New: administrative cluster file deletion (`DELETE /api/v1/cluster/files`) ([#830](https://github.com/Basekick-Labs/arc/pull/830))
 
 A new administrative endpoint `DELETE /api/v1/cluster/files?path=...&confirm=true` allows cluster operators to remove an entry from the cluster-wide Raft manifest.
