@@ -26,7 +26,7 @@ helm install arc-ent helm/arc-enterprise \
 This deploys:
 - 1 SeaweedFS pod (bundled S3-compatible storage)
 - 3 writers, 2 readers, 1 compactor
-- Each Arc pod points at the SeaweedFS bucket as shared storage (created on first write)
+- Each Arc pod points at the SeaweedFS bucket as shared storage (created on the first write; reads before that return 500 until [#945](https://github.com/Basekick-Labs/arc/issues/945))
 
 The chart refuses to install if any of the required credentials are missing
 — there are no weak defaults.

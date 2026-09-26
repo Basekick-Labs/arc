@@ -2,7 +2,7 @@
 
 One Arc container backed by a bundled SeaweedFS for S3-compatible storage. Still a single Arc node — just with object storage instead of a local disk. Swap SeaweedFS for AWS S3 / R2 / Tigris / Azure by removing the `seaweedfs` service and pointing at your own endpoint.
 
-The `arc-data` bucket is created automatically on Arc's first write, so there is no bucket-init step. Arc logs one startup warning that it could not verify the bucket exists; that is expected before the first flush.
+A one-shot `seaweedfs-init` service pre-creates the `arc-data` bucket. SeaweedFS would create it on the first write anyway, but read-only API calls issued before any data is written would hit `NoSuchBucket` and answer 500 until [#945](https://github.com/Basekick-Labs/arc/issues/945) lands.
 
 ## Architecture
 
