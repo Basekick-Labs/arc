@@ -430,6 +430,14 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### Missing S3 buckets are empty on read paths ([#945](https://github.com/Basekick-Labs/arc/issues/945))
+
+S3 list operations now treat a missing bucket as an empty result, allowing fresh
+deployments to serve read requests before their first write while preserving
+permission and other storage errors.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir).
+
 ### Configurable compaction cycle budget and cancellation ([#915](https://github.com/Basekick-Labs/arc/issues/915))
 
 Scheduled and manual compaction use the same configurable cycle deadline
