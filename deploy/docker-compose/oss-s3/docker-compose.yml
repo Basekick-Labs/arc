@@ -6,10 +6,11 @@
 # the S3 code path locally, or as a stepping stone to Enterprise clustered
 # deployments that share a bucket across nodes.
 #
-# The bucket is created automatically on Arc's first write — SeaweedFS
-# creates buckets for authenticated writers, so there is no init container.
-# (Arc logs one startup warning that it could not verify the bucket exists;
-# that is expected before the first flush.)
+# A one-shot init pre-creates the bucket. SeaweedFS would create it on
+# Arc's first WRITE anyway, but a read-only call that lists storage before
+# anything was written (e.g. GET /api/v1/databases on a fresh stack) gets
+# NoSuchBucket and Arc answers 500 until #945 lands. (Arc also logs one
+# startup warning if it beat the init to the bucket; that is harmless.)
 #
 # To point at external S3 / R2 / Tigris / Azure, replace the SeaweedFS creds
 # and endpoint with your own values and remove the `seaweedfs` service.
@@ -40,6 +41,8 @@ services:
     depends_on:
       seaweedfs:
         condition: service_healthy
+      seaweedfs-init:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   # `weed server -s3` runs master, volume server, filer and the S3 gateway in
@@ -76,6 +79,31 @@ services:
       timeout: 3s
       retries: 12
     restart: unless-stopped
+
+  # =============================================================================
+  # seaweedfs-init — one-shot bucket creation
+  #
+  # SeaweedFS creates buckets on the first authenticated WRITE, but a
+  # read-only call that lists the bucket before anything has been written
+  # (e.g. GET /api/v1/databases on a fresh stack) gets NoSuchBucket and
+  # Arc answers 500. Pre-creating the bucket restores the old minio-init
+  # guarantee: every Arc endpoint works from the first request. weed shell
+  # talks to the master over gRPC, so it works with -disableHttp.
+  # Idempotent — re-creating an existing bucket is a no-op.
+  # =============================================================================
+  seaweedfs-init:
+    image: chrislusf/seaweedfs:4.47
+    container_name: seaweedfs-init
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        echo "s3.bucket.create -name arc-data" | weed shell -master seaweedfs:9333
+        echo "seaweedfs-init: bucket arc-data ready"
+    restart: "no"
+
 
 volumes:
   arc-data:

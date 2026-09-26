@@ -9,11 +9,17 @@
 
 x-arc-common: &arc-common
   image: ghcr.io/basekick-labs/arc:latest
+  # A killed node must come back: the README's crash semantics (step 5)
+  # promise that a restarted writer replays its WAL before serving again,
+  # and that promise needs both the restart and the WAL (below).
+  restart: unless-stopped
   networks:
     - arc-cluster
   depends_on:
     seaweedfs:
       condition: service_healthy
+    seaweedfs-init:
+      condition: service_completed_successfully
 
 x-arc-env: &arc-env
   # Cluster
@@ -38,6 +44,11 @@ x-arc-env: &arc-env
   ARC_STORAGE_S3_ACCESS_KEY: "arcadmin"
   ARC_STORAGE_S3_SECRET_KEY: "arcadmin123"
   ARC_STORAGE_S3_FORCE_PATH_STYLE: "true"
+  # WAL: without it, records a writer has acknowledged but not yet flushed
+  # die with the process — the README documents that a restarted writer
+  # replays them, which is only true with the WAL on (wal.enabled defaults
+  # to false). The leader-crash smoke asserts exactly this invariant.
+  ARC_WAL_ENABLED: "true"
   # License
   ARC_LICENSE_KEY: "${ARC_LICENSE_KEY}"
 
@@ -198,10 +209,9 @@ services:
   # `weed server -s3` runs master, volume server, filer and the S3 gateway
   # in one process. The identities file is rendered at startup, and
   # -ip.bind is required for the localhost healthcheck (without it the
-  # gateway listens only on the container IP). No bucket-init service:
-  # SeaweedFS creates the bucket on the first authenticated write, so
-  # Arc's first flush creates `arc-data` (the earlier bundled MinIO
-  # needed a one-shot mc container for this).
+  # gateway listens only on the container IP). The bucket is pre-created
+  # by the seaweedfs-init one-shot below — see its comment for why write-
+  # time auto-creation alone is not enough.
   # =============================================================================
   seaweedfs:
     image: chrislusf/seaweedfs:4.47
@@ -230,6 +240,33 @@ services:
       interval: 2s
       timeout: 5s
       retries: 30
+
+  # =============================================================================
+  # seaweedfs-init — one-shot bucket creation
+  #
+  # SeaweedFS creates buckets on the first authenticated WRITE, but a
+  # read-only call that lists the bucket before anything has been written
+  # (e.g. GET /api/v1/databases on a fresh stack) gets NoSuchBucket and
+  # Arc answers 500. Pre-creating the bucket restores the old minio-init
+  # guarantee: every Arc endpoint works from the first request. weed shell
+  # talks to the master over gRPC, so it works with -disableHttp.
+  # Idempotent — re-creating an existing bucket is a no-op.
+  # =============================================================================
+  seaweedfs-init:
+    image: chrislusf/seaweedfs:4.47
+    container_name: seaweedfs-init
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    networks:
+      - arc-cluster
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        echo "s3.bucket.create -name arc-data" | weed shell -master seaweedfs:9333
+        echo "seaweedfs-init: bucket arc-data ready"
+    restart: "no"
+
 
 volumes:
   arc-writer1-data:

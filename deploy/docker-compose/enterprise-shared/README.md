@@ -103,7 +103,8 @@ When a writer crashes:
 2. Traefik's docker-provider health check marks the writer unhealthy and stops routing to it within one poll cycle (~5-10 s).
 3. New writes route to the surviving writer(s). **No in-cluster failover action required.**
 4. In-flight buffer on the crashed writer — i.e. records that arrived in memory but had not yet been flushed to SeaweedFS — is lost. Records that completed the S3 PUT before the crash are durable.
-5. On writer restart, the local WAL replays any un-flushed entries into the new Arrow buffer before `/ready` flips back to 200 and Traefik resumes routing.
+5. On writer restart, the local WAL replays into the new Arrow buffer before `/ready` flips back to 200 and Traefik resumes routing. Replay is **at-least-once**: entries already flushed before the crash are re-ingested alongside the lost ones, and the resulting identical duplicates are removed when compaction next merges the partition (dedup keys on tags + time). Raw counts can therefore read high between a crash-recovery and the next compaction pass.
+6. This stack sets `restart: unless-stopped` so a writer that dies (OOM, panic) comes back on its own. Note Docker deliberately does not auto-restart a container you stop or kill by hand — after a manual `docker kill`, run `docker start <writer>` to trigger the WAL replay.
 
 Singleton background tasks (retention, continuous queries, deletes) gate on the cluster Raft leader — if the leader writer crashes, Raft elects a new leader within ~1 s and those tasks resume on the new leader's next scheduler tick.
 

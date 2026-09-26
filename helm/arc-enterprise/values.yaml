@@ -156,8 +156,10 @@ seaweedfs:
   credentials:
     # If existingSecret is set, must contain "access-key" and "secret-key".
     # When empty (and no existingSecret), the chart refuses to install —
-    # weak defaults are not acceptable for the data-lake tier. Buckets are
-    # created on Arc's first write; no manual bucket step is needed.
+    # weak defaults are not acceptable for the data-lake tier. The bucket
+    # is created on Arc's first WRITE (no manual step, unlike the old
+    # bundled MinIO); until then, read-only API calls that list storage
+    # return 500 (NoSuchBucket) — tracked as #945.
     existingSecret: ""
     accessKey: ""                  # REQUIRED — set at install time or via existingSecret
     secretKey: ""                  # REQUIRED — set at install time or via existingSecret
