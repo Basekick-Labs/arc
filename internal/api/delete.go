@@ -480,7 +480,8 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 		return false, fmt.Errorf("WHERE clause is required. To delete all data, use WHERE clause '1=1' with confirm=true")
 	}
 
-	whereUpper := strings.ToUpper(strings.TrimSpace(where))
+	maskedWhere, masks := sqlutil.MaskStringLiterals(where, sqlutil.HasQuotes(where))
+	whereUpper := strings.ToUpper(strings.TrimSpace(maskedWhere))
 
 	// Remove "WHERE" prefix if present
 	if strings.HasPrefix(whereUpper, "WHERE ") {
@@ -496,14 +497,22 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 
 	// Check for dangerous SQL keywords using word boundaries to avoid false positives
 	// on column names like "offset" (contains SET), "payload" (contains LOAD), "dataset" (contains SET)
-	if match := dangerousKeywordPattern.FindString(where); match != "" {
+	if match := dangerousKeywordPattern.FindString(maskedWhere); match != "" {
 		return false, fmt.Errorf("WHERE clause contains forbidden keyword: %s", strings.ToUpper(match))
 	}
 
 	// Reject filesystem-I/O table functions (see dangerousIOFunctionPattern).
 	// Matched against the identifier-quote-stripped form so the quoted spelling
 	// `"glob"(...)`, which DuckDB executes identically, cannot slip past.
-	ioCheck := strings.NewReplacer(`"`, "", "`", "").Replace(where)
+	ioCheck := maskedWhere
+	for _, mask := range masks {
+		if mask.Identifier {
+			// Keep quoted identifiers visible to the function-name check while
+			// leaving string-literal contents masked.
+			ioCheck = strings.ReplaceAll(ioCheck, mask.Placeholder, mask.Original)
+		}
+	}
+	ioCheck = strings.NewReplacer(`"`, "", "`", "").Replace(ioCheck)
 	if m := dangerousIOFunctionPattern.FindStringSubmatch(ioCheck); m != nil {
 		return false, fmt.Errorf("WHERE clause contains forbidden file I/O function: %s()", m[1])
 	}
