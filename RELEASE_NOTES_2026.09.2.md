@@ -442,7 +442,7 @@ S3 list operations treat a missing bucket as empty, and Azure List treats a
 missing container as empty. Other storage errors, including other 404 responses,
 remain errors.
 
-Contributed by [@efegokdemir](https://github.com/efegokdemir).
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#950](https://github.com/Basekick-Labs/arc/pull/950).
 
 ### A node restored with an empty data disk never got its own files back, and reconciliation could then delete them everywhere ([#959](https://github.com/Basekick-Labs/arc/issues/959), [#961](https://github.com/Basekick-Labs/arc/pull/961))
 
