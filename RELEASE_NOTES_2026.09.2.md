@@ -436,7 +436,7 @@ S3 list operations now treat a missing bucket as an empty result, allowing fresh
 deployments to serve read requests before their first write while preserving
 permission and other storage errors.
 
-Contributed by [@efegokdemir](https://github.com/efegokdemir).
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#950](https://github.com/Basekick-Labs/arc/pull/950).
 
 ### Configurable compaction cycle budget and cancellation ([#915](https://github.com/Basekick-Labs/arc/issues/915))
 
