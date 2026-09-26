@@ -335,6 +335,12 @@ The `minio:` values block is renamed `seaweedfs:`, credentials are `seaweedfs.cr
 
 Data on an existing bundled-MinIO PersistentVolume is **not migrated**: SeaweedFS cannot read MinIO's on-disk layout, and upgrading a bundled install renders a new, empty object store. Before switching, sync the bucket out and back (`aws s3 sync` against the old and new endpoints), or keep your data where it is by setting `storage.shared.external=true` with the old store's endpoint and credentials — external stores, including MinIO, remain fully supported. The Compose stacks have the same property (the `minio-data` volume is not read by the new `seaweedfs` service); they are development stacks, but sync the bucket first if the data matters.
 
+### Known behavior: WAL crash-recovery replay is at-least-once ([#948](https://github.com/Basekick-Labs/arc/issues/948))
+
+Not new in this release, but documented now because a live crash-recovery exercise made it precise. When a node with `wal.enabled=true` dies hard and restarts, recovery replays its whole active WAL file — including entries whose batches had already been flushed to Parquet before the crash. Nothing acknowledged is lost, but the already-durable entries are re-ingested.
+
+For tagged measurements the duplicates are exact copies and are removed the next time compaction merges the partition (dedup keys on tags + time), so queries can read high between the recovery and that pass. For measurements with no tags, compaction deliberately does not dedup — two tagless rows with one timestamp can be two legitimate events — so crash-recovery duplicates there currently persist. The window is bounded by WAL rotation (`wal.max_size_mb`, `wal.max_age`). [#948](https://github.com/Basekick-Labs/arc/issues/948) tracks flush-watermark checkpointing for 26.09.3, which replays only genuinely unflushed entries. Graceful shutdown is unaffected: it flushes and purges the WAL cleanly.
+
 ### A node asked to bootstrap Raft on a non-writing role now exits at startup
 
 `cluster.raft_bootstrap` has been a no-op on any node that already had Raft state, so setting it everywhere rather than on one node was harmless and some deployments do exactly that. From this release, a node with `cluster.raft_bootstrap=true` and a role that does not accept writes logs the reason and exits, because bootstrapping on such a role hands the new cluster the precise failure this release fixes: that node is elected, then fails the writer half of every singleton-task check, and there is no second voter that could take leadership away from it.
