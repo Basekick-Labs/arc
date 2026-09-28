@@ -52,6 +52,10 @@ type Manager struct {
 	// License client for feature gating
 	licenseClient *license.Client
 
+	// clusterGate, when non-nil, limits storage mutation to the primary
+	// writer and switches on the cold-tier metadata sync. See ManagerConfig.
+	clusterGate ClusterGate
+
 	// Components
 	migrator  *Migrator
 	scheduler *Scheduler
@@ -59,7 +63,10 @@ type Manager struct {
 
 	// State
 	running atomic.Bool
-	stopCh  chan struct{}
+	// cycleRunning serializes runCycle: a scheduled tick and a manual
+	// trigger must not overlap (see ErrMigrationCycleRunning).
+	cycleRunning atomic.Bool
+	stopCh       chan struct{}
 
 	logger zerolog.Logger
 	mu     sync.RWMutex
@@ -79,6 +86,14 @@ type ManagerConfig struct {
 
 	// License client
 	LicenseClient *license.Client
+
+	// ClusterGate, when non-nil, restricts storage mutation (migrate, delete,
+	// orphan reconciliation) to the primary writer. main.go wires it only in
+	// shared-storage mode: with per-node storage every node's metadata is
+	// authoritative for its own disk and there is nothing to gate. A non-nil
+	// gate also switches on the cold-tier metadata sync in ScanTiers, since
+	// other nodes' migrations are then visible only by listing cold storage.
+	ClusterGate ClusterGate
 
 	// Logger
 	Logger zerolog.Logger
@@ -126,6 +141,7 @@ func NewManager(cfg *ManagerConfig) (*Manager, error) {
 		policies:      policies,
 		config:        cfg.Config,
 		licenseClient: cfg.LicenseClient,
+		clusterGate:   cfg.ClusterGate,
 		stopCh:        make(chan struct{}),
 		logger:        logger,
 	}
@@ -203,41 +219,81 @@ func (m *Manager) IsRunning() bool {
 	return m.running.Load()
 }
 
-// RunMigrationCycle runs a single migration cycle
+// RunMigrationCycle runs a single migration cycle. On a node a cluster gate
+// excludes it syncs tier metadata and returns ErrMigrationRoleGated.
 func (m *Manager) RunMigrationCycle(ctx context.Context) error {
 	// Check license before each cycle
 	if !m.licenseClient.CanUseTieredStorage() {
 		m.logger.Warn().Msg("Valid license required - skipping migration cycle")
 		return nil
 	}
+	return m.runCycle(ctx)
+}
 
-	m.logger.Info().Msg("Starting migration cycle")
+// runCycle is RunMigrationCycle after the license check. Every node brings
+// its tier metadata in line with storage; only the primary writer (or an
+// ungated node) goes on to move and delete files.
+func (m *Manager) runCycle(ctx context.Context) error {
+	if !m.cycleRunning.CompareAndSwap(false, true) {
+		return ErrMigrationCycleRunning
+	}
+	defer m.cycleRunning.Store(false)
+
+	if m.roleGated() {
+		m.logger.Debug().Msg("Starting tiering cycle: metadata sync only, node is not the primary writer")
+	} else {
+		m.logger.Info().Msg("Starting migration cycle")
+	}
 	startTime := time.Now()
 
-	// Scan and register any new files before migration
-	scanResult, err := m.ScanAndRegisterFiles(ctx)
+	// Scan and register any new files before migration. The result is never
+	// nil: a cold sync that succeeded before the hot scan failed still
+	// changed what this node reads.
+	scanResult, err := m.ScanTiers(ctx)
 	if err != nil {
 		m.logger.Warn().Err(err).Msg("File scan failed, continuing with existing metadata")
 	} else {
 		m.logger.Info().
 			Int("scanned", scanResult.FilesScanned).
 			Int("registered", scanResult.FilesRegistered).
+			Int("cold_synced", scanResult.ColdSynced).
 			Msg("Pre-migration scan completed")
+	}
+
+	// Checked every cycle, not at Start: a leader change must take effect
+	// without a restart. A gated node stops here — the sync above is its
+	// whole job — but a sync that flipped rows changed which tiers this
+	// node reads for a measurement, so the query caches need the same
+	// invalidation a migration would trigger (#662).
+	if m.roleGated() {
+		m.notifyMigrationComplete(scanResult.ColdSynced, 0)
+		return ErrMigrationRoleGated
 	}
 
 	var totalMigrated int
 	var totalErrors int
+	var orphansFound, orphansDeleted, orphanErrors int
 
-	// Hot -> Cold migrations (2-tier system)
-	if m.coldBackend != nil && m.config.Cold.Enabled {
-		migrated, errors := m.migrator.MigrateTier(ctx, TierHot, TierCold)
-		totalMigrated += migrated
-		totalErrors += errors
+	// A primary whose cold listing just failed still holds whatever stale
+	// hot rows the sync would have flipped, so migrating now would select
+	// files that are already in cold and fail on every one of them; and
+	// reconciliation cannot verify cold copies against a backend that
+	// cannot be listed. Both wait for a cycle whose listing succeeds.
+	if m.clusterGate != nil && scanResult.ColdSyncFailed {
+		m.logger.Warn().Msg("Skipping migration and reconciliation this cycle: the cold tier could not be listed")
+		totalErrors++
+	} else {
+		// Hot -> Cold migrations (2-tier system)
+		if m.coldBackend != nil && m.config.Cold.Enabled {
+			migrated, errors := m.migrator.MigrateTier(ctx, TierHot, TierCold)
+			totalMigrated += migrated
+			totalErrors += errors
+		}
+
+		// Reconcile orphaned hot files (files tracked as cold but still in hot storage)
+		orphansFound, orphansDeleted, orphanErrors = m.migrator.ReconcileOrphanedFiles(ctx)
+		totalErrors += orphanErrors
 	}
-
-	// Reconcile orphaned hot files (files tracked as cold but still in hot storage)
-	orphansFound, orphansDeleted, orphanErrors := m.migrator.ReconcileOrphanedFiles(ctx)
-	totalErrors += orphanErrors
 	if orphansFound > 0 || orphanErrors > 0 {
 		m.logger.Info().
 			Int("found", orphansFound).
@@ -246,7 +302,9 @@ func (m *Manager) RunMigrationCycle(ctx context.Context) error {
 			Msg("Orphaned hot file reconciliation completed")
 	}
 
-	// Cleanup old migration history records
+	// Cleanup old migration history records. Reached only past the gate, so
+	// a node that never leads keeps whatever history it wrote before it was
+	// gated until it next leads; bounded by that history's size.
 	if err := m.cleanupOldMigrations(ctx); err != nil {
 		m.logger.Warn().Err(err).Msg("Migration history cleanup failed")
 	}
@@ -258,9 +316,25 @@ func (m *Manager) RunMigrationCycle(ctx context.Context) error {
 		Dur("duration", duration).
 		Msg("Migration cycle completed")
 
-	m.notifyMigrationComplete(totalMigrated, orphansDeleted)
+	// Cold rows the sync added or flipped count as moved from this node's
+	// point of view: they change which globs a query reads.
+	m.notifyMigrationComplete(totalMigrated+scanResult.ColdSynced, orphansDeleted)
 
 	return nil
+}
+
+// roleGated reports whether a cluster gate is wired and denies this node.
+func (m *Manager) roleGated() bool {
+	return m.clusterGate != nil && !m.clusterGate.IsPrimaryWriter()
+}
+
+// MigrationGate reports whether migration is role-gated on this node right
+// now and, when a gate is wired, the node's role for messages.
+func (m *Manager) MigrationGate() (gated bool, role string) {
+	if m.clusterGate == nil {
+		return false, ""
+	}
+	return !m.clusterGate.IsPrimaryWriter(), m.clusterGate.Role()
 }
 
 // notifyMigrationComplete fires the registered callback when a cycle changed
@@ -346,8 +420,14 @@ func (m *Manager) cleanupOldMigrations(ctx context.Context) error {
 	return nil
 }
 
-// TriggerMigration triggers a manual migration cycle
+// TriggerMigration triggers a manual migration cycle. A gated node refuses
+// up front rather than running the metadata sync and then declining: an
+// operator who hit a non-primary wants the answer now, and the scheduled
+// cycle already keeps every node's metadata converging.
 func (m *Manager) TriggerMigration(ctx context.Context) error {
+	if m.roleGated() {
+		return ErrMigrationRoleGated
+	}
 	return m.RunMigrationCycle(ctx)
 }
 
@@ -420,7 +500,9 @@ func (m *Manager) GetStatus(ctx context.Context) (*StatusResponse, error) {
 	// Hot tier
 	hotStats := tierStats[TierHot]
 	hotStats.Enabled = true
-	hotStats.Backend = "local"
+	// The hot tier is whatever the primary storage backend is; in
+	// shared-storage mode that is an object store, not local disk.
+	hotStats.Backend = m.hotBackend.Type()
 	status.Tiers["hot"] = hotStats
 
 	// Cold tier
@@ -457,6 +539,145 @@ type ScanResult struct {
 	FilesRegistered int `json:"files_registered"`
 	FilesSkipped    int `json:"files_skipped"`
 	Errors          int `json:"errors"`
+	// ColdSynced counts rows the cold-tier sync added or flipped to cold.
+	// Always zero without a cluster gate (see ScanTiers).
+	ColdSynced int `json:"cold_synced"`
+	// ColdSyncFailed is set when the cold tier could not be listed; the
+	// hot scan still ran, but rows this node holds for files other nodes
+	// moved are stale until a listing succeeds.
+	ColdSyncFailed bool `json:"cold_sync_failed,omitempty"`
+}
+
+// ScanTiers brings this node's tier metadata in line with storage: the cold
+// listing first (only when a cluster gate is wired — see
+// syncColdTierMetadata), then the hot scan, whose never-downgrade guard
+// (#683) must see the rows the cold pass flipped. The result is never nil,
+// so a caller can act on a partial pass when the hot scan fails.
+func (m *Manager) ScanTiers(ctx context.Context) (*ScanResult, error) {
+	result := &ScanResult{}
+	if m.clusterGate != nil && m.coldBackend != nil && m.config.Cold.Enabled {
+		synced, err := m.syncColdTierMetadata(ctx)
+		result.ColdSynced = synced
+		if err != nil {
+			// The hot scan still matters on its own: the primary migrates
+			// from hot rows and every node routes reads from them.
+			result.ColdSyncFailed = true
+			m.logger.Warn().Err(err).Msg("Cold tier metadata sync failed, continuing with hot scan")
+		}
+	}
+	hot, err := m.ScanAndRegisterFiles(ctx)
+	if err != nil {
+		return result, err
+	}
+	result.FilesScanned = hot.FilesScanned
+	result.FilesRegistered = hot.FilesRegistered
+	result.FilesSkipped = hot.FilesSkipped
+	result.Errors = hot.Errors
+	return result, nil
+}
+
+// syncColdTierMetadata makes this node's metadata reflect what is in cold
+// storage. In shared-storage mode only the primary writer migrates, but the
+// query layer routes each node from its OWN SQLite (buildMultiTierReadParquet
+// includes the cold tier only for measurements with a cold row here), so a
+// node that never migrated would never read the cold tier. Listing cold and
+// recording what is there is how every node — readers included — learns
+// about the primary's moves, and how a newly elected primary stops treating
+// already-migrated files as candidates.
+//
+// Rows are only ever added or flipped to cold. A cold row whose object is
+// gone is reported, never reverted, for the same reason the hot scan never
+// downgrades (#683): the object may be mid-move, and a hot copy is still
+// read through the hot glob. Returns how many rows changed.
+func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
+	lister, ok := m.coldBackend.(storage.ObjectLister)
+	if !ok {
+		return 0, fmt.Errorf("cold backend does not support ListObjects")
+	}
+	objects, err := lister.ListObjects(ctx, "")
+	if err != nil {
+		return 0, fmt.Errorf("failed to list cold objects: %w", err)
+	}
+
+	// One query for the cold row set, as the hot scan does. Skipping rows
+	// that are already cold is what keeps this pass from writing at all in
+	// steady state: every write invalidates the tier cache a query-serving
+	// node is using.
+	coldRows, err := m.metadata.GetFilesInTier(ctx, TierCold)
+	if err != nil {
+		return 0, fmt.Errorf("failed to load cold tier paths: %w", err)
+	}
+	unseen := make(map[string]bool, len(coldRows))
+	for _, f := range coldRows {
+		// A quarantined row's key is one no backend will list (#758), so
+		// it would show up as "missing" on every node, every cycle.
+		if f.QuarantinedAt != nil {
+			continue
+		}
+		unseen[f.Path] = true
+	}
+
+	synced, unparseable := 0, 0
+	for _, obj := range objects {
+		// Past the deadline every remaining upsert would fail and log; stop
+		// with what was recorded — the next cycle continues from there.
+		if err := ctx.Err(); err != nil {
+			return synced, err
+		}
+		if !strings.HasSuffix(obj.Path, ".parquet") {
+			continue
+		}
+		if first, _, _ := strings.Cut(obj.Path, "/"); storage.IsReservedRootDir(first) {
+			continue
+		}
+		if unseen[obj.Path] {
+			delete(unseen, obj.Path)
+			continue
+		}
+		info, err := m.parseFilePath(obj.Path)
+		if err != nil {
+			// Counted, not logged per file: a cold bucket shared with
+			// something else (an Iceberg warehouse, say) would fire on
+			// every object, every cycle.
+			unparseable++
+			continue
+		}
+		file := &FileMetadata{
+			Path:          obj.Path,
+			Database:      info.Database,
+			Measurement:   info.Measurement,
+			PartitionTime: info.PartitionTime,
+			SizeBytes:     obj.Size,
+			CreatedAt:     obj.LastModified,
+		}
+		if err := m.metadata.RecordColdFile(ctx, file, obj.LastModified); err != nil {
+			m.logger.Warn().Str("path", obj.Path).Err(err).Msg("Failed to record cold file, skipping")
+			continue
+		}
+		synced++
+	}
+
+	if len(unseen) > 0 {
+		sample := make([]string, 0, 5)
+		for p := range unseen {
+			if len(sample) == cap(sample) {
+				break
+			}
+			sample = append(sample, p)
+		}
+		m.logger.Warn().
+			Int("count", len(unseen)).
+			Strs("sample", sample).
+			Msg("Cold tier rows have no object in cold storage; left as-is (a hot copy, if any, is still read)")
+	}
+
+	// Debug: the cycle summary already reports cold_synced.
+	m.logger.Debug().
+		Int("objects", len(objects)).
+		Int("synced", synced).
+		Int("unparseable", unparseable).
+		Msg("Cold tier metadata sync completed")
+	return synced, nil
 }
 
 // ScanAndRegisterFiles scans the hot tier storage and registers all existing parquet files

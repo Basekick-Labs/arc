@@ -747,7 +747,7 @@ type ClusterConfig struct {
 	//     primary/standby distinction; LB does failover via retry).
 	//   - IsPrimaryWriter() returns "is Raft leader" instead of
 	//     singleton-writer semantics, so singleton background tasks
-	//     (retention, CQ, delete, reconciliation) run on whichever
+	//     (retention, CQ, delete, tiering migration, reconciliation) run on whichever
 	//     node currently holds the cluster Raft leadership.
 	//   - WAL replays un-flushed entries on writer restart for crash
 	//     recovery (S3 PUTs are durable; only in-memory buffer is at

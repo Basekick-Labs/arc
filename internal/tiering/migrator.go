@@ -523,8 +523,42 @@ func (m *Migrator) ReconcileOrphanedFiles(ctx context.Context) (orphansFound, de
 			continue
 		}
 
-		// Orphan found — file is in both hot and cold
+		// Orphan found — metadata says cold, but a hot copy is still there.
 		orphansFound++
+
+		// A cold row written by this node's own migration is proof of a cold
+		// copy; a cold row written by the shared-storage metadata sync is
+		// not. The sync records rows from a cold LISTING, which can catch an
+		// object the primary copied and then rolled back (MigrateFile
+		// deletes the cold object when its UpdateTier fails). Deleting the
+		// hot copy on such a row would lose the file, so require the cold
+		// object first; a row whose cold object is gone goes back to hot so
+		// the primary migrates it again instead of leaving a cold row that
+		// points at nothing.
+		coldBackend := m.manager.GetBackendForTier(TierCold)
+		if coldBackend == nil {
+			m.logger.Error().Str("path", file.Path).
+				Msg("Cold backend not available; keeping orphaned hot file since its cold copy cannot be verified")
+			failed++
+			continue
+		}
+		coldExists, err := coldBackend.Exists(ctx, file.Path)
+		if err != nil {
+			m.logger.Warn().Err(err).Str("path", file.Path).
+				Msg("Failed to check cold existence during reconciliation; keeping orphaned hot file")
+			failed++
+			continue
+		}
+		if !coldExists {
+			m.logger.Warn().Str("path", file.Path).
+				Msg("Cold row has no cold object; reverting it to hot so the file is migrated again rather than deleting the only copy")
+			if err := m.manager.metadata.UpdateTier(ctx, file.Path, TierHot); err != nil {
+				m.logger.Error().Err(err).Str("path", file.Path).Msg("Failed to revert cold row to hot")
+			}
+			failed++
+			continue
+		}
+
 		m.logger.Info().
 			Str("path", file.Path).
 			Str("database", file.Database).
