@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -126,6 +127,18 @@ func (h *TieringHandler) TriggerMigration(c *fiber.Ctx) error {
 		Msg("Manual migration triggered")
 
 	if err := h.manager.TriggerMigration(ctx); err != nil {
+		if errors.Is(err, tiering.ErrMigrationRoleGated) {
+			_, role := h.manager.MigrationGate()
+			h.logger.Info().Str("role", role).Msg("Manual migration rejected: node is not the primary writer")
+			status, body := migrationRoleGatedResponse(role)
+			return c.Status(status).JSON(body)
+		}
+		if errors.Is(err, tiering.ErrMigrationCycleRunning) {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"error":   "Migration cycle already running",
+				"message": "A migration cycle is already in progress on this node. Wait for it to complete.",
+			})
+		}
 		h.logger.Error().Err(err).Msg("Failed to trigger migration")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to trigger migration",
@@ -136,6 +149,18 @@ func (h *TieringHandler) TriggerMigration(c *fiber.Ctx) error {
 		"message": "Migration completed successfully",
 		"status":  "completed",
 	})
+}
+
+// migrationRoleGatedResponse is the answer to a manual migration on a node
+// the cluster gate excludes. 409: the request conflicts with the node's
+// current role rather than being malformed or unauthorized, and the same
+// request succeeds on the primary writer.
+func migrationRoleGatedResponse(role string) (int, fiber.Map) {
+	return fiber.StatusConflict, fiber.Map{
+		"error":   "Migration runs on the primary writer only; this node is not the primary writer",
+		"role":    role,
+		"message": "Retry against the primary writer, or wait for the scheduled cycle: this node keeps its tier metadata in sync on every tick.",
+	}
 }
 
 // GetStats returns migration statistics
@@ -168,7 +193,8 @@ func (h *TieringHandler) GetStats(c *fiber.Ctx) error {
 	})
 }
 
-// ScanFiles scans the hot tier storage and registers all existing files
+// ScanFiles registers every file in hot storage and, on a node with a
+// cluster gate, first learns which files other nodes moved to cold.
 // POST /api/v1/tiering/scan
 func (h *TieringHandler) ScanFiles(c *fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(c.Context(), 30*time.Minute)
@@ -176,7 +202,7 @@ func (h *TieringHandler) ScanFiles(c *fiber.Ctx) error {
 
 	h.logger.Info().Msg("Starting file scan via API")
 
-	result, err := h.manager.ScanAndRegisterFiles(ctx)
+	result, err := h.manager.ScanTiers(ctx)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to scan files")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{

@@ -274,7 +274,7 @@ Pattern 2 multi-writer: all RoleWriter pods accept writes
 concurrently and PUT to the shared object-storage bucket. Writer
 failover is suppressed (LB does failover via Kubernetes Service
 load-balancing + /ready). Singleton background tasks (retention,
-CQ, delete) run on whichever pod is the cluster Raft leader.
+CQ, delete, tiering migration) run on whichever pod is the cluster Raft leader.
 Requires Enterprise license with the shared_storage_multi_writer
 feature. Single-writer deployments (writer.replicas=1) with shared
 storage continue to work unchanged — Pattern 2 mode is a no-op for

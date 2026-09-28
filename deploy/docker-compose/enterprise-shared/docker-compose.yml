@@ -31,8 +31,8 @@ x-arc-env: &arc-env
   # Pattern 2 multi-writer: all RoleWriter nodes accept writes
   # concurrently and PUT to the shared bucket. Writer failover
   # is suppressed (LB does failover via retry). Singleton background
-  # tasks (retention, CQ, delete) run on whichever node is the cluster
-  # Raft leader. Requires Enterprise license with the
+  # tasks (retention, CQ, delete, tiering migration) run on whichever
+  # node is the cluster Raft leader. Requires Enterprise license with the
   # shared_storage_multi_writer feature.
   # See docs/progress/2026-05-26-multi-writer-pattern2.md.
   ARC_CLUSTER_SHARED_STORAGE_MODE: "true"

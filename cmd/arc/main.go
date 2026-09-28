@@ -763,33 +763,45 @@ func main() {
 	}
 
 	// Pattern 2 shared-storage multi-writer mode startup validation.
-	// Refuses to start under three conditions that would silently break
+	// Refuses to start under four conditions that would silently break
 	// the multi-writer invariant:
 	//
 	//   (a) cluster.enabled=false — without the cluster coordinator,
 	//       schedulers have a nil ClusterGate (see scheduler wiring in
-	//       cmd/arc/main.go) and singleton tasks (retention, CQ, delete)
-	//       run unconditionally. Two such "standalone" nodes pointed at
-	//       the same bucket would each run retention against the shared
-	//       data — duplicate deletes, duplicate writes. SharedStorageMode
-	//       is meaningless without clustering.
+	//       cmd/arc/main.go) and singleton tasks (retention, CQ, delete,
+	//       tiering migration) run unconditionally. Two such "standalone"
+	//       nodes pointed at the same bucket would each run retention
+	//       against the shared data — duplicate deletes, duplicate writes.
+	//       SharedStorageMode is meaningless without clustering.
 	//   (b) cfg.Storage.Backend == "local" — per-node filesystems can't
 	//       be shared across N writers. Writes would diverge silently.
-	//   (c) license lacks the shared_storage_multi_writer feature — this
+	//   (c) cluster.role resolves to standalone (the default when unset) —
+	//       a standalone-role node votes in Raft and can win leadership,
+	//       but IsPrimaryWriter in shared-storage mode requires the writer
+	//       role, so with a standalone leader NO node passes the gate and
+	//       every singleton task silently stops (the #862 hazard, for the
+	//       one role it left open).
+	//   (d) license lacks the shared_storage_multi_writer feature — this
 	//       is an Enterprise-tier capability that must be explicitly
 	//       licensed; running without the gate would be a license bypass.
 	//
-	// Order matters: cluster.enabled before backend before license, so
-	// the most upstream misconfig surfaces first.
+	// Order matters: cluster.enabled before backend before role before
+	// license, so the most upstream misconfig surfaces first. A role Arc
+	// does not recognise is left to the ResolveRole check further down.
 	if cfg.Cluster.SharedStorageMode {
 		if !cfg.Cluster.Enabled {
 			log.Fatal().
-				Msg("cluster.shared_storage_mode=true requires cluster.enabled=true; without the cluster coordinator there is no leader-election gate and singleton background tasks (retention, CQ, delete) would run on every node")
+				Msg("cluster.shared_storage_mode=true requires cluster.enabled=true; without the cluster coordinator there is no leader-election gate and singleton background tasks (retention, CQ, delete, tiering migration) would run on every node")
 		}
 		if cfg.Storage.Backend == "local" {
 			log.Fatal().
 				Str("backend", cfg.Storage.Backend).
 				Msg("cluster.shared_storage_mode=true requires an object-store backend (s3, minio, azure, or azblob); local-filesystem backend cannot be shared across writers")
+		}
+		if role, roleErr := cluster.ResolveRole(cfg.Cluster.Role); roleErr == nil && role == cluster.RoleStandalone {
+			log.Fatal().
+				Str("role", cfg.Cluster.Role).
+				Msg("cluster.shared_storage_mode=true requires cluster.role to be writer, reader or compactor; a standalone-role node can win Raft leadership but never passes the primary-writer gate, so retention, CQ, delete and tiering migration would run on no node")
 		}
 		if licenseClient == nil || !licenseClient.CanUseSharedStorageMultiWriter() {
 			log.Fatal().
@@ -3393,6 +3405,19 @@ func main() {
 		log.Info().Msg("Continuous queries DISABLED")
 	}
 
+	// Shared-storage mode without a running cluster coordinator: every
+	// singleton scheduler wired below (CQ, retention, tiering) would get a
+	// nil gate and run against the shared bucket as if this were the only
+	// node — the duplicate-singleton hazard the startup validation refuses
+	// for cluster.enabled=false. The coordinator is nil here despite
+	// cluster.enabled=true when the license lacks clustering or the
+	// coordinator failed to initialize or start; each of those logs
+	// "running in standalone mode", which is exactly wrong on a shared bucket.
+	if cfg.Cluster.SharedStorageMode && clusterCoordinator == nil {
+		log.Fatal().
+			Msg("cluster.shared_storage_mode=true but the cluster coordinator is not running (see the errors above); without it retention, CQ and tiering migration would run on this node unconditionally against the shared bucket")
+	}
+
 	// Initialize CQ Scheduler (Enterprise feature - requires valid license)
 	// Scheduler is enabled when continuous_query.enabled=true AND license allows it
 	var cqScheduler *scheduler.CQScheduler
@@ -3628,6 +3653,19 @@ func main() {
 					}
 				}
 
+				// Shared-storage mode: one hot bucket, N nodes. Only the
+				// Raft leader among the writers moves and deletes files
+				// (the gate retention and CQ use); every node still syncs
+				// its tier metadata each cycle because queries route from
+				// it. Per-node storage stays ungated on purpose: each
+				// node's metadata is authoritative for its own disk, and
+				// tiering has no manifest integration with which to
+				// coordinate replicas (tracked separately).
+				var tieringGate tiering.ClusterGate
+				if cfg.Cluster.SharedStorageMode && clusterCoordinator != nil {
+					tieringGate = newWriterClusterGate(clusterCoordinator)
+				}
+
 				// Create tiering manager
 				tieringManager, err = tiering.NewManager(&tiering.ManagerConfig{
 					HotBackend:    storageBackend,
@@ -3635,6 +3673,7 @@ func main() {
 					DB:            tieringDB,
 					Config:        &cfg.TieredStorage,
 					LicenseClient: licenseClient,
+					ClusterGate:   tieringGate,
 					Logger:        logger.Get("tiering"),
 				})
 				if err != nil {
@@ -4137,10 +4176,11 @@ type shutdownFunc func() error
 func (f shutdownFunc) Close() error { return f() }
 
 // writerClusterGate implements scheduler.WriterGate (satisfies both
-// scheduler.RetentionClusterGate and scheduler.CQClusterGate aliases).
-// Only the primary writer node runs scheduled mutations (retention, CQ) to
-// prevent duplicate writes. Lives in main.go to avoid a compile-time
-// dependency between the scheduler and cluster packages.
+// scheduler.RetentionClusterGate and scheduler.CQClusterGate aliases) and
+// tiering.ClusterGate. Only the primary writer node runs scheduled
+// mutations (retention, CQ, tiering migration) to prevent duplicate writes.
+// Lives in main.go to avoid a compile-time dependency between the
+// scheduler/tiering and cluster packages.
 type writerClusterGate struct {
 	coordinator *cluster.Coordinator
 }

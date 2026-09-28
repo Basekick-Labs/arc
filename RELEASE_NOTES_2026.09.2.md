@@ -430,6 +430,70 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### Tiering migration ran on every node of a shared-storage cluster, and nodes that never migrated could not see cold data ([#951](https://github.com/Basekick-Labs/arc/pull/951))
+
+In Pattern 2 (`cluster.shared_storage_mode = true`, one object-store bucket
+shared by every node), every scheduled singleton gates on the primary writer
+except tiering migration. Each node's 02:00 cycle listed the shared hot
+bucket, registered every file in its own metadata store, and raced the other
+nodes to copy the same daily files to cold and delete them from hot: N copies
+of every migration PUT, duplicate migration-history rows, "Failed to delete
+source file" warnings on every node but the winner, and on a losing node a
+row that still said `hot` for a file that now existed only in cold, retried
+every cycle.
+
+The second half of the problem was invisible. Each node routes queries from
+its own metadata, and a node only learned that a measurement had cold data by
+winning the migration race for one of that measurement's files. A node that
+never won — a reader, typically — silently dropped the cold tier from every
+query on that measurement.
+
+Migration now runs on the Raft leader among the writers, the same gate
+retention and continuous queries use, checked on every cycle so a leader
+change takes effect without a restart. Every node with a cold tier configured
+still runs a metadata sync each cycle: it lists the cold tier and records what
+the primary moved, so
+readers and standby writers keep including cold data in queries, and a newly
+elected primary does not re-migrate files its predecessor already moved. The
+sync stamps `migrated_at` from the cold object's own timestamp, so a fresh
+node joining a cluster with years of cold data does not spend two cycles
+re-checking all of it. `GET /api/v1/tiering/status` reports
+`scheduler.role_gated` on nodes that sync but never migrate, and
+`POST /api/v1/tiering/migrate` on such a node answers `409 Conflict` naming
+the node's role instead of running. `POST /api/v1/tiering/scan` runs the same
+sync and reports `cold_synced`. The status endpoint also names the hot tier's
+real backend instead of always `local`.
+
+Two limits are worth knowing. All nodes fire on the same cron minute, so a
+non-primary learns a cycle's moves on its next cycle; only a measurement's
+very first cold file is affected, for one cycle. And the sync only ever adds
+or flips rows to cold — a cold row whose object has since disappeared is
+reported in one warning; while the measurement has any hot row on that node
+the hot copy is still read, and the primary's reconciliation reverts such a
+row to hot (so the file is migrated again) when it finds the hot copy
+present, rather than treating the row as proof of a cold copy and deleting
+the only one. A cycle asked for while one is already running on the same
+node — a manual trigger during the scheduled cycle — answers `409 Conflict`
+instead of overlapping it, and a primary whose cold listing failed skips
+migration for that cycle rather than re-selecting files that are already in
+cold.
+
+Two startup refusals close the same hole for every gated task. A node in
+shared-storage mode whose `cluster.role` is unset or `standalone` now exits:
+such a node votes in Raft and can win leadership, but only a writer passes
+the primary-writer gate, so a standalone leader meant retention, continuous
+queries and deletes ran on no node (and tiering migration, now gated, would
+have joined them). And a node in shared-storage mode whose cluster
+coordinator is not running — the license lacks clustering, or the
+coordinator failed to initialize or start — now exits instead of continuing
+"in standalone mode": without the coordinator every gated task would run
+unconditionally against the shared bucket.
+
+Per-node storage clusters (Pattern 1) are deliberately not gated. There,
+tiering has no coordination with the file-replication manifest at all — a
+node that migrates and deletes its local copy has it pulled back from a peer
+within minutes — and a gate would not fix that. That is tracked separately.
+
 ### Configurable compaction cycle budget and cancellation ([#915](https://github.com/Basekick-Labs/arc/issues/915))
 
 Scheduled and manual compaction use the same configurable cycle deadline

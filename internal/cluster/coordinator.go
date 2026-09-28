@@ -2420,7 +2420,7 @@ func (c *Coordinator) GetRole() NodeRole {
 //     regardless of role; without it, a RoleReader or RoleCompactor that
 //     wins the election would run retention/CQ/delete.
 //
-//     Leader-change semantics: each scheduler (retention, CQ, delete,
+//     Leader-change semantics: each scheduler (retention, CQ, delete, tiering migration,
 //     delete endpoints) checks IsPrimaryWriter() ONCE at the start of each
 //     tick and runs all work for that tick if true. A leader change
 //     mid-tick will let the demoted node complete its current tick's

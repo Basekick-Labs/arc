@@ -2,6 +2,7 @@ package tiering
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -115,6 +116,9 @@ func (s *Scheduler) Status() *SchedulerStatus {
 	if s.running {
 		status.NextRun = s.getNextRun()
 	}
+	if s.manager != nil {
+		status.RoleGated = s.manager.roleGated()
+	}
 
 	return status
 }
@@ -137,7 +141,16 @@ func (s *Scheduler) runMigration() {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancel()
 
-	if err := s.manager.RunMigrationCycle(ctx); err != nil {
+	err := s.manager.RunMigrationCycle(ctx)
+	switch {
+	case errors.Is(err, ErrMigrationRoleGated):
+		// Expected on every non-primary node of a shared-storage cluster,
+		// every tick: the cycle synced this node's metadata and stopped.
+		_, role := s.manager.MigrationGate()
+		s.logger.Debug().Str("role", role).Msg("Scheduled migration cycle ran metadata sync only: node is not the primary writer")
+	case errors.Is(err, ErrMigrationCycleRunning):
+		s.logger.Warn().Msg("Scheduled migration cycle skipped: previous cycle still running")
+	case err != nil:
 		s.logger.Error().Err(err).Msg("Scheduled migration cycle failed")
 	}
 }
