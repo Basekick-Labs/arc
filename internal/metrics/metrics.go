@@ -189,6 +189,13 @@ type Metrics struct {
 	// this counter is the only place the condition is aggregated.
 	storageInvalidPathQuarantinedTotal atomic.Int64
 
+	// clusterLocalDeletePending is the number of manifest deletes a
+	// per-node-storage cluster node has been told about and has not yet
+	// unlinked locally. A gauge: it should return to zero within a grace
+	// period of every burst; a value that keeps climbing means the delete
+	// workers cannot keep up with retention or a compaction backlog.
+	clusterLocalDeletePending atomic.Int64
+
 	// compactionManifestsParkedUnparseableTotal counts crash-recovery
 	// manifests recovery parked because their body did not decode (#926): a
 	// zero-length file left by a crash before the rename was durable, or
@@ -503,6 +510,10 @@ func (m *Metrics) IncClusterManifestRejectedPaths() { m.clusterManifestRejectedP
 // to counting it here is a loop that retries the same key forever.
 func (m *Metrics) IncStorageInvalidPathQuarantined() { m.storageInvalidPathQuarantinedTotal.Add(1) }
 
+// SetClusterLocalDeletePending publishes how many manifest deletes are still
+// waiting for a local unlink on this node.
+func (m *Metrics) SetClusterLocalDeletePending(n int64) { m.clusterLocalDeletePending.Store(n) }
+
 // IncCompactionManifestParkedUnparseable records one crash-recovery manifest
 // parked because its body could not be decoded (#926). Call it after the
 // park succeeded; a park that fails transiently is retried next cycle and
@@ -707,8 +718,10 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"replication_entries_dropped_total": m.replicationEntriesDroppedTotal.Load(),
 
 		// Cluster FSM security (Enterprise)
-		"cluster_manifest_rejected_paths_total":         m.clusterManifestRejectedPathsTotal.Load(),
-		"storage_invalid_path_quarantined_total":        m.storageInvalidPathQuarantinedTotal.Load(),
+		"cluster_manifest_rejected_paths_total":  m.clusterManifestRejectedPathsTotal.Load(),
+		"storage_invalid_path_quarantined_total": m.storageInvalidPathQuarantinedTotal.Load(),
+		// Cluster local delete workers (per-node storage with replication)
+		"cluster_local_delete_pending":                  m.clusterLocalDeletePending.Load(),
 		"compaction_manifests_parked_unparseable_total": m.compactionManifestsParkedUnparseableTotal.Load(),
 		"storage_unaddressable_files":                   m.storageUnaddressableFiles.Load(),
 
@@ -1082,6 +1095,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_storage_invalid_path_quarantined_total Total entries dropped from a cleanup, reconciliation or replication work set because a storage key was permanently unusable. Non-zero growth means a stored key (compaction manifest, cluster manifest entry, edge-sync ledger row) names something no storage backend can address; the entry is no longer retried and needs operator action.\n"...)
 	b = append(b, "# TYPE arc_storage_invalid_path_quarantined_total counter\n"...)
 	b = appendMetric(b, "arc_storage_invalid_path_quarantined_total", float64(m.storageInvalidPathQuarantinedTotal.Load()))
+
+	b = append(b, "# HELP arc_cluster_local_delete_pending Manifest deletes this per-node-storage cluster node has been told about and has not yet unlinked locally. Returns to zero within a grace period of every burst; a value that keeps climbing means the delete workers cannot keep up with retention or a compaction backlog.\n"...)
+	b = append(b, "# TYPE arc_cluster_local_delete_pending gauge\n"...)
+	b = appendMetric(b, "arc_cluster_local_delete_pending", float64(m.clusterLocalDeletePending.Load()))
 
 	b = append(b, "# HELP arc_compaction_manifests_parked_unparseable_total Total compaction crash-recovery manifests parked under the .quarantined suffix because their body could not be decoded. Growth means a manifest stopped blocking compaction without being completed; the parked file name gives the tier, database and job, and that partition should be checked for a zero-length _compacted output or for duplicate rows.\n"...)
 	b = append(b, "# TYPE arc_compaction_manifests_parked_unparseable_total counter\n"...)

@@ -436,6 +436,40 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### A replica the manifest had dropped could stay on a node forever ([#958](https://github.com/Basekick-Labs/arc/pull/958))
+
+On a per-node-storage cluster with file replication, every node that applies
+a manifest delete unlinks its local copy of the file. The hand-off from the
+manifest to that unlink was a channel of 1024 slots with a non-blocking send:
+when it was full, the delete was dropped with a log line that promised a
+reconcile on restart — and nothing reconciles it, because startup catch-up
+only pulls what the manifest lists. Full was easy to reach. Each of the two
+delete workers takes one item and then waits out a 500 ms grace, while
+retention proposes deletes in chunks of 1000 with no pause and a compaction
+backlog applies dozens of completion manifests in one poll. A second loss sat
+at shutdown: stopping cancelled the coordinator's context before it closed the
+channel, so the item a worker was holding through its grace and everything
+still buffered were gone. The replica stayed on that node, and every read
+there read the file twice.
+
+Manifest deletes now go onto a pending list with no bound — it cannot outgrow
+the manifest the node already holds in memory, and the workers take the whole
+list every grace period — and the workers stop only when the node stops,
+after it has unregistered the manifest callbacks, so a stop drains everything
+that is pending. That drain is bounded at ten seconds, inside the default
+30-second `server.shutdown_timeout`; a disk that does not answer within it is
+reported at Error with the count still on disk, and a shutdown budget below
+about fifteen seconds can leave no time for the flush pass after a large
+drain. Before each unlink a worker asks the manifest whether it lists the path
+again and, if so, leaves the file alone. `arc_cluster_local_delete_pending`
+reports the backlog — entries not yet taken plus entries a worker holds — and
+should return to zero within a grace period of every burst; a value that
+keeps climbing means the workers are not keeping up. What remains: a crash,
+as opposed to a stop, loses the deletes pending at that instant, except the
+ones Raft re-applies on restart because they came after the last snapshot,
+which it does once the node has re-registered its manifest callbacks —
+usually all of them, since a lone node must first win an election.
+
 ### A measurement whose files had all moved to cold returned nothing to a query without a time range ([#954](https://github.com/Basekick-Labs/arc/pull/954))
 
 Compaction consumes a measurement's raw hour files, but tiering kept their
@@ -495,11 +529,9 @@ manifest entries for files that were already in cold before this release,
 once a row has been cold for an hour and the cold object exists with the
 recorded size, so replicas stop being re-pulled and restarts catch up; an
 upgraded cluster with thousands of such files takes about one second per 200
-on its first cycle. One thing nothing shipped here reclaims: a node whose
-unlink queue overflowed — it logs `local delete queue full; dropping` — keeps
-a replica the manifest no longer lists, and restart catch-up removes nothing;
-delete it by hand or with the reconciler (`reconciliation.enabled`), or that
-node reads the file twice.
+on its first cycle. The unlink queue that could overflow on a node and leave
+a replica behind is fixed in this release too; see "A replica the manifest
+had dropped could stay on a node forever" above.
 
 Two things follow for Pattern 1. First, a replicating per-node cluster is now
 gated like shared storage (#951): only the primary writer migrates, and every

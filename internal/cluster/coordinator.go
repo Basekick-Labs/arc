@@ -47,14 +47,22 @@ type deleteRequest struct {
 	reason string
 }
 
-// deleteQueueSize is the capacity of the buffered delete channel.
-// 1024 matches the puller's queue size — enough to absorb a full
-// compaction cycle's worth of source-file deletions without drops.
-const deleteQueueSize = 1024
-
-// deleteWorkerCount is the number of goroutines draining the delete queue.
-// 2 workers provide light parallelism without overwhelming local I/O.
+// deleteWorkerCount is the number of goroutines draining the pending local
+// deletes. 2 workers provide light parallelism without overwhelming local I/O.
 const deleteWorkerCount = 2
+
+// deleteGrace is how long a worker waits after the first pending delete
+// before unlinking a batch, so a query that has just globbed the file can
+// still open it. Paid once per batch, not per file.
+const deleteGrace = 500 * time.Millisecond
+
+// deleteStopDrainBound caps how long Stop waits for the workers to unlink
+// what is still pending. A var so a test can shorten it.
+var deleteStopDrainBound = 10 * time.Second
+
+// deletePendingWarnAt is the pending count at which enqueue logs once, so a
+// node whose workers are not keeping up is visible before its disk is.
+const deletePendingWarnAt = 10_000
 
 type Coordinator struct {
 	cfg           *config.ClusterConfig
@@ -111,13 +119,31 @@ type Coordinator struct {
 	// per coordinator lifetime, across repeated Start/Stop cycles in tests.
 	catchupOnce sync.Once
 
-	// deleteQueue is a bounded channel for local file deletions triggered
-	// by onFileDeleted FSM callbacks. Fixed workers drain the queue with a
-	// grace period before each delete. This replaces the earlier unbounded
-	// go func() pattern that could spawn thousands of goroutines during
-	// large compaction cycles.
-	deleteQueue chan deleteRequest
-	deleteWg    sync.WaitGroup
+	// deletePending holds the local deletes the FSM delete callback has
+	// handed over and the workers have not yet taken. A slice under its own
+	// mutex, unbounded on purpose: the bounded channel it replaces dropped
+	// the overflow, and a dropped local delete is a replica nothing ever
+	// reclaims. Every entry is a path the FSM listed a moment ago, and the
+	// workers take the whole slice every grace period, so the list holds
+	// at most the manifest churn of the time the workers are stuck; the
+	// Warn at deletePendingWarnAt makes that visible. deleteWake (one slot)
+	// nudges a parked worker; deleteStop, closed by Stop, is the only way a
+	// worker exits, so a stop drains everything that is pending.
+	// deleteInFlight counts the entries a worker has taken and not yet
+	// unlinked, so the gauge and the stop-bound Error report what is still
+	// on disk, not just what is still untaken.
+	deletePending   []deleteRequest
+	deletePendingMu sync.Mutex
+	deleteInFlight  atomic.Int64
+	deleteWake      chan struct{}
+	deleteStop      chan struct{}
+	// deleteWg is per Start: Stop's wait is bounded, and a WaitGroup that a
+	// later Start reused while that wait was still parked would panic.
+	deleteWg *sync.WaitGroup
+	// deleteManifestHas answers whether the manifest lists a path again; a
+	// worker skips such a path rather than unlink a file that is back. Nil
+	// before the puller starts and in tests: no check, unlink.
+	deleteManifestHas func(path string) bool
 
 	// fetchInvalidPathCount counts inbound fetch requests refused because the
 	// path is permanently unusable (#747). Its only job is to rate-limit the
@@ -776,10 +802,9 @@ func (c *Coordinator) Stop() error {
 	// deadlocks shutdown the moment one of them does.
 	//
 	// The puller pointer is cleared now so readers see "no puller" during
-	// the join, as they do after it. deleteQueue stays set until the worker
-	// has exited: the worker reads the field, and the close below happens
+	// the join, as they do after it. The delete workers are stopped below,
 	// only after the Raft join has retired every callback that could still
-	// send on it.
+	// add to their pending list.
 	puller := c.puller
 	c.puller = nil
 	replicationSender := c.replicationSender
@@ -787,7 +812,8 @@ func (c *Coordinator) Stop() error {
 	writerFailover := c.writerFailoverMgr
 	compactorFailover := c.compactorFailoverMgr
 	raftNode := c.raftNode
-	deleteQueue := c.deleteQueue
+	deleteStop := c.deleteStop
+	deleteWg := c.deleteWg
 	healthChecker := c.healthChecker
 	listener := c.listener
 	c.mu.Unlock()
@@ -833,9 +859,11 @@ func (c *Coordinator) Stop() error {
 		}
 	}
 
-	if deleteQueue != nil {
-		close(deleteQueue)
-		c.deleteWg.Wait()
+	// Raft is joined and the file callbacks are unregistered, so nothing can
+	// add a pending local delete from here on: the workers drain what is
+	// pending and exit. Bounded, so a disk that hangs cannot hang shutdown.
+	if deleteStop != nil {
+		c.stopDeleteWorkers(deleteStop, deleteWg)
 	}
 
 	if healthChecker != nil {
@@ -846,7 +874,8 @@ func (c *Coordinator) Stop() error {
 	}
 
 	c.mu.Lock()
-	c.deleteQueue = nil
+	c.deleteStop = nil
+	c.deleteWg = nil
 	c.localNode.UpdateState(StateLeaving)
 	c.running = false
 	c.stopping = false
@@ -856,78 +885,183 @@ func (c *Coordinator) Stop() error {
 	return nil
 }
 
-// runDeleteWorker is a single goroutine that drains the deleteQueue channel.
-// Each item gets a 500ms grace period (for in-flight queries to finish), then
-// a bounded backend.Delete call. The worker exits when the channel is closed
-// (Stop() closes it during shutdown).
-func (c *Coordinator) runDeleteWorker() {
-	defer c.deleteWg.Done()
-	for {
-		// Wait for the first item (or shutdown).
+// enqueueLocalDelete hands a manifest delete to the workers. Called from the
+// FSM delete callback on the Raft apply goroutine, so it takes only the
+// pending-list mutex, does no I/O and never blocks: append, publish the
+// depth, nudge a worker. Nothing is ever dropped here (see deletePending).
+func (c *Coordinator) enqueueLocalDelete(path, reason string) {
+	c.deletePendingMu.Lock()
+	c.deletePending = append(c.deletePending, deleteRequest{path: path, reason: reason})
+	n := len(c.deletePending)
+	wake := c.deleteWake
+	c.publishDeleteDepthLocked()
+	c.deletePendingMu.Unlock()
+	if n == deletePendingWarnAt {
+		c.logger.Warn().
+			Int("pending", n).
+			Msg("Local delete backlog is large; the delete workers are not keeping up with manifest deletes")
+	}
+	if wake != nil {
 		select {
-		case <-c.ctx.Done():
-			return
-		case req, ok := <-c.deleteQueue:
-			if !ok {
-				return
-			}
-			// Grace period: wait 500ms once, then drain all queued items
-			// without waiting. This amortizes the grace cost across a
-			// burst of deletions (e.g. compaction deleting 100 sources).
-			select {
-			case <-c.ctx.Done():
-				return
-			case <-time.After(500 * time.Millisecond):
-			}
-
-			// Collect the first item plus any others already queued.
-			batch := []deleteRequest{req}
-		drain:
-			for {
-				select {
-				case r, ok := <-c.deleteQueue:
-					if !ok {
-						break drain
-					}
-					batch = append(batch, r)
-				default:
-					break drain
-				}
-			}
-
-			// Delete all items in the batch.
-			for _, item := range batch {
-				delCtx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
-				if err := c.storage.Delete(delCtx, item.path); errors.Is(err, storage.ErrInvalidPath) {
-					// Permanent (#747). This queue is fire-and-forget, so the
-					// item is already out of the work set and nothing retries
-					// it; what changes is the diagnosis. A Warn here is
-					// indistinguishable from a backend hiccup, and an operator
-					// reading it would wait for a convergence that cannot
-					// happen: the local copy stays on disk forever, and no
-					// sweep can remove it either, because every path to it
-					// addresses the same unusable key.
-					metrics.Get().IncStorageInvalidPathQuarantined()
-					c.logger.Error().
-						Err(err).
-						Str("path", item.path).
-						Str("reason", item.reason).
-						Msg("Phase 4 local delete worker: the key is permanently unusable, so this local copy can never be removed by Arc and needs operator action")
-				} else if err != nil {
-					c.logger.Warn().
-						Err(err).
-						Str("path", item.path).
-						Str("reason", item.reason).
-						Msg("Phase 4 local delete worker: backend.Delete failed")
-				} else {
-					c.logger.Debug().
-						Str("path", item.path).
-						Str("reason", item.reason).
-						Msg("Phase 4 local delete worker: removed local copy")
-				}
-				cancel()
-			}
+		case wake <- struct{}{}:
+		default: // a nudge is already pending; the next swap takes this item too
 		}
+	}
+}
+
+// publishDeleteDepthLocked stores the gauge: entries not yet taken plus
+// entries taken and not yet unlinked. Called with deletePendingMu held so
+// two publishers cannot leave a stale value behind.
+func (c *Coordinator) publishDeleteDepthLocked() {
+	metrics.Get().SetClusterLocalDeletePending(int64(len(c.deletePending)) + c.deleteInFlight.Load())
+}
+
+// takePendingDeletes swaps the pending list out under the mutex — O(1) held
+// against the Raft apply goroutine — moving its entries to in-flight.
+func (c *Coordinator) takePendingDeletes() []deleteRequest {
+	c.deletePendingMu.Lock()
+	batch := c.deletePending
+	c.deletePending = nil
+	c.deleteInFlight.Add(int64(len(batch)))
+	c.publishDeleteDepthLocked()
+	c.deletePendingMu.Unlock()
+	return batch
+}
+
+// deleteDone retires one in-flight entry, unlinked or skipped.
+func (c *Coordinator) deleteDone() {
+	c.deleteInFlight.Add(-1)
+	c.deletePendingMu.Lock()
+	c.publishDeleteDepthLocked()
+	c.deletePendingMu.Unlock()
+}
+
+// startDeleteWorkers creates the wake and stop channels and the worker pool.
+// A no-op while workers from this Start exist. The workers capture the
+// manifest lookup here rather than read the field, so a worker that outlives
+// a timed-out drain never races a later Start's assignment.
+func (c *Coordinator) startDeleteWorkers() {
+	if c.deleteStop != nil {
+		return
+	}
+	wake := make(chan struct{}, 1)
+	stop := make(chan struct{})
+	wg := &sync.WaitGroup{}
+	has := c.deleteManifestHas
+	c.deletePendingMu.Lock()
+	c.deleteWake = wake
+	c.deletePendingMu.Unlock()
+	c.deleteStop = stop
+	c.deleteWg = wg
+	for i := 0; i < deleteWorkerCount; i++ {
+		wg.Add(1)
+		go c.runDeleteWorker(stop, wake, wg, has)
+	}
+}
+
+// stopDeleteWorkers closes stop and waits, bounded, for the workers to drain
+// the pending list. Past the bound it logs what is still on disk at Error —
+// the untaken entries plus the ones a stuck worker holds — and returns:
+// those deletes are the only thing a graceful stop can still lose, and only
+// when the disk itself is not answering. The waiting goroutine and the
+// stuck worker outlive the return until that Delete comes back.
+func (c *Coordinator) stopDeleteWorkers(stop chan struct{}, wg *sync.WaitGroup) {
+	close(stop)
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(deleteStopDrainBound):
+		c.deletePendingMu.Lock()
+		untaken := len(c.deletePending)
+		c.deletePendingMu.Unlock()
+		inFlight := c.deleteInFlight.Load()
+		c.logger.Error().
+			Int("pending_untaken", untaken).
+			Int64("in_flight", inFlight).
+			Int64("left_on_disk", int64(untaken)+inFlight).
+			Dur("bound", deleteStopDrainBound).
+			Msg("Local delete workers did not finish draining within the shutdown bound; those local copies stay on disk")
+	}
+}
+
+// runDeleteWorker drains the pending list. In steady state it waits for a
+// nudge, sits out one grace period so a query that just globbed a file can
+// still open it, takes the whole list and unlinks it. Once stop is closed it
+// skips the grace and keeps taking until the list is empty, then exits: Stop
+// has unregistered the FSM callbacks by then, so the list can only shrink.
+func (c *Coordinator) runDeleteWorker(stop <-chan struct{}, wake <-chan struct{}, wg *sync.WaitGroup, has func(string) bool) {
+	defer wg.Done()
+	for {
+		select {
+		case <-stop:
+			for {
+				batch := c.takePendingDeletes()
+				if len(batch) == 0 {
+					return
+				}
+				c.unlinkBatch(batch, has)
+			}
+		case <-wake:
+			select {
+			case <-stop:
+				// Stopping: no grace; the branch above drains.
+			case <-time.After(deleteGrace):
+			}
+			c.unlinkBatch(c.takePendingDeletes(), has)
+		}
+	}
+}
+
+// unlinkBatch removes each local copy. Deletes run against a fresh context,
+// not the coordinator's: that one is already cancelled during a stop, and
+// the drain is exactly when the unlinks must still happen. A path the
+// manifest lists again is skipped — Arc's own file names never repeat, so
+// this guards imports and restores, not a known race.
+func (c *Coordinator) unlinkBatch(batch []deleteRequest, has func(string) bool) {
+	for _, item := range batch {
+		c.unlinkOne(item, has)
+		c.deleteDone()
+	}
+}
+
+func (c *Coordinator) unlinkOne(item deleteRequest, has func(string) bool) {
+	if has != nil && has(item.path) {
+		c.logger.Debug().
+			Str("path", item.path).
+			Str("reason", item.reason).
+			Msg("Local delete skipped: the manifest lists the path again")
+		return
+	}
+	delCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	err := c.storage.Delete(delCtx, item.path)
+	cancel()
+	switch {
+	case errors.Is(err, storage.ErrInvalidPath):
+		// Permanent (#747). The item is out of the work set and nothing
+		// retries it; what matters is the diagnosis. A Warn here is
+		// indistinguishable from a backend hiccup, and an operator
+		// reading it would wait for a convergence that cannot happen:
+		// the local copy stays on disk forever, and no sweep can remove
+		// it either, because every path to it addresses the same
+		// unusable key.
+		metrics.Get().IncStorageInvalidPathQuarantined()
+		c.logger.Error().
+			Err(err).
+			Str("path", item.path).
+			Str("reason", item.reason).
+			Msg("Phase 4 local delete worker: the key is permanently unusable, so this local copy can never be removed by Arc and needs operator action")
+	case err != nil:
+		c.logger.Warn().
+			Err(err).
+			Str("path", item.path).
+			Str("reason", item.reason).
+			Msg("Phase 4 local delete worker: backend.Delete failed")
+	default:
+		c.logger.Debug().
+			Str("path", item.path).
+			Str("reason", item.reason).
+			Msg("Phase 4 local delete worker: removed local copy")
 	}
 }
 
@@ -3849,17 +3983,20 @@ func (c *Coordinator) startFilePullerLocked() error {
 		return fmt.Errorf("Raft FSM not available")
 	}
 
-	// Initialize the delete-worker pool BEFORE building the callbacks. The
-	// callbacks fire synchronously from Raft apply — if a DeleteFile
-	// command arrived between SetFileCallbacks and queue init, the onDelete
-	// closure would send to a nil channel.
-	if c.deleteQueue == nil {
-		c.deleteQueue = make(chan deleteRequest, deleteQueueSize)
-		for i := 0; i < deleteWorkerCount; i++ {
-			c.deleteWg.Add(1)
-			go c.runDeleteWorker()
+	// Start the delete workers BEFORE registering the callbacks, so a
+	// DeleteFile applied right after SetFileCallbacks finds a worker to
+	// nudge. Before each unlink a worker asks the manifest whether it lists
+	// the path again; a nil FSM cannot answer, and the manifest is what
+	// asked for the delete, so that reads as "not listed".
+	c.deleteManifestHas = func(path string) bool {
+		fsm := raftNode.FSM()
+		if fsm == nil {
+			return false
 		}
+		_, ok := fsm.GetFile(path)
+		return ok
 	}
+	c.startDeleteWorkers()
 
 	// CONTRACT for every FSM callback (#797, #813): they run synchronously
 	// on the Raft apply goroutine. Since #813 neither Coordinator.Stop nor
@@ -3869,12 +4006,12 @@ func (c *Coordinator) startFilePullerLocked() error {
 	// stopped under a lock from deadlocking too. So a callback must not take
 	// c.mu or call a Node method other than FSM() and Barrier() (they take
 	// n.mu), and the closures capture everything they need up front: the
-	// backend is set once, before Start (SetStorageBackend), and the queue
-	// is created just above, closed only after Raft is joined, and
-	// unregistered from the FSM before that (Stop), so a closure never
-	// outlives its queue. Neither callback may block.
+	// backend is set once, before Start (SetStorageBackend), and the
+	// pending-delete list lives on the coordinator behind its own mutex, so
+	// a callback that fires late appends harmlessly and Stop, which
+	// unregisters the callbacks before it stops the workers, drains it.
+	// Neither callback may block.
 	backend := c.storage
-	deleteQueue := c.deleteQueue
 	onRegister := func(entry *raft.FileEntry) {
 		// Called synchronously from applyRegisterFile. Must NOT block — the
 		// FSM apply goroutine is on the Raft hot path. Enqueue is non-blocking
@@ -3884,11 +4021,11 @@ func (c *Coordinator) startFilePullerLocked() error {
 	onDelete := func(path string, reason string) {
 		// Phase 4: the callback runs synchronously from applyDeleteFile on
 		// the Raft apply hot path. It MUST NOT block. It hands the path to
-		// the bounded delete-worker pool, which waits a short grace period
-		// so in-flight queries scanning the old file can finish and then
-		// calls backend.Delete. On non-local backends (S3, Azure) the
-		// compactor that issued DeleteFile has already removed the shared
-		// object, so there is no local-side action.
+		// the delete-worker pool, which waits a short grace period so
+		// in-flight queries scanning the old file can finish and then calls
+		// backend.Delete. On non-local backends (S3, Azure) the compactor
+		// that issued DeleteFile has already removed the shared object, so
+		// there is no local-side action.
 		//
 		// First, and on every backend type: an entry that leaves the manifest
 		// must stop holding this node's query gate. A catch-up pull that
@@ -3908,19 +4045,12 @@ func (c *Coordinator) startFilePullerLocked() error {
 				Msg("FSM delete observed; shared backend, no local action needed")
 			return
 		}
-		// Enqueue to the bounded delete-worker pool. Non-blocking send
-		// mirrors the puller's Enqueue pattern — if the queue is full we
-		// drop and log, same as Phase 2's file-pull overflow. The dropped
-		// file stays in the manifest, and Phase 3 catch-up reconciles it
-		// on the next restart.
-		select {
-		case deleteQueue <- deleteRequest{path: path, reason: reason}:
-		default:
-			c.logger.Warn().
-				Str("path", path).
-				Str("reason", reason).
-				Msg("Phase 4 local delete queue full; dropping (will reconcile on restart)")
-		}
+		// Hand it to the delete workers. Unlike the puller's Enqueue, this
+		// never drops: a pull that is dropped is re-discovered by the next
+		// catch-up walk, but a local delete that is dropped is a replica
+		// the manifest no longer lists and nothing walks — it stayed on
+		// disk forever, and every read here read the file twice.
+		c.enqueueLocalDelete(path, reason)
 	}
 
 	fsm.SetFileCallbacks(onRegister, onDelete)
@@ -3933,7 +4063,6 @@ func (c *Coordinator) startFilePullerLocked() error {
 		Int("workers", pullerCfg.Workers).
 		Int("queue_size", pullerCfg.QueueSize).
 		Int("delete_workers", deleteWorkerCount).
-		Int("delete_queue_size", deleteQueueSize).
 		Msg("Peer file replication puller started")
 
 	// Phase 3: kick off the one-shot catch-up walker in a background goroutine
