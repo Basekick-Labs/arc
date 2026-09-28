@@ -1,4 +1,4 @@
-package api
+package pruning
 
 // An unpruned tier is kept in a multi-tier read only if it holds a parquet
 // file; empty partition directories — what compaction and migration leave
@@ -25,7 +25,7 @@ func TestTierHasFiles(t *testing.T) {
 	dir := filepath.Join(root, "db1", "cpu", "2024", "03", "15", "19")
 	check := func(when string, wantHas, wantVerified bool) {
 		t.Helper()
-		if has, verified := tierHasFiles(ctx, backend, "db1", "cpu"); has != wantHas || verified != wantVerified {
+		if has, verified := TierHasFiles(ctx, backend, "db1", "cpu"); has != wantHas || verified != wantVerified {
 			t.Fatalf("%s: has=%v verified=%v, want (%v, %v)", when, has, verified, wantHas, wantVerified)
 		}
 	}
@@ -55,16 +55,16 @@ func TestTierHasFiles(t *testing.T) {
 
 	// A backend that cannot list directories is answered by one recursive
 	// listing instead.
-	if has, verified := tierHasFiles(ctx, noDirBackend{backend}, "db1", "cpu"); !has || !verified {
+	if has, verified := TierHasFiles(ctx, noDirBackend{backend}, "db1", "cpu"); !has || !verified {
 		t.Fatalf("non-listing backend with a file: has=%v verified=%v, want (true, true)", has, verified)
 	}
 
 	// A listing error leaves the question open, whether the walk or the
 	// recursive fallback hits it.
-	if has, verified := tierHasFiles(ctx, erringBackend{backend}, "db1", "cpu"); has || verified {
+	if has, verified := TierHasFiles(ctx, erringBackend{backend}, "db1", "cpu"); has || verified {
 		t.Fatalf("failing store: has=%v verified=%v, want (false, false)", has, verified)
 	}
-	if has, verified := tierHasFiles(ctx, noDirBackend{erringBackend{backend}}, "db1", "cpu"); has || verified {
+	if has, verified := TierHasFiles(ctx, noDirBackend{erringBackend{backend}}, "db1", "cpu"); has || verified {
 		t.Fatalf("failing non-listing store: has=%v verified=%v, want (false, false)", has, verified)
 	}
 }
@@ -81,7 +81,7 @@ func TestTierHasFiles_EmptyForestBeyondBudget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewLocalBackend: %v", err)
 	}
-	// 90 days of empty day/hour chains across four months: well past 64 listings.
+	// 92 empty day/hour chains across four months: well past 64 listings.
 	for month := 1; month <= 4; month++ {
 		for day := 1; day <= 23; day++ {
 			dir := filepath.Join(root, "db1", "cpu", "2024", fmtTwo(month), fmtTwo(day), "19")
@@ -90,7 +90,7 @@ func TestTierHasFiles_EmptyForestBeyondBudget(t *testing.T) {
 			}
 		}
 	}
-	if has, verified := tierHasFiles(ctx, backend, "db1", "cpu"); has || !verified {
+	if has, verified := TierHasFiles(ctx, backend, "db1", "cpu"); has || !verified {
 		t.Fatalf("empty forest: has=%v verified=%v, want (false, true) via the recursive fallback", has, verified)
 	}
 
@@ -100,7 +100,7 @@ func TestTierHasFiles_EmptyForestBeyondBudget(t *testing.T) {
 	if err := os.WriteFile(oldest, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if has, verified := tierHasFiles(ctx, backend, "db1", "cpu"); !has || !verified {
+	if has, verified := TierHasFiles(ctx, backend, "db1", "cpu"); !has || !verified {
 		t.Fatalf("file in the oldest chain: has=%v verified=%v, want (true, true)", has, verified)
 	}
 
@@ -109,7 +109,7 @@ func TestTierHasFiles_EmptyForestBeyondBudget(t *testing.T) {
 	if err := os.WriteFile(newest, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if has, verified := tierHasFiles(ctx, backend, "db1", "cpu"); !has || !verified {
+	if has, verified := TierHasFiles(ctx, backend, "db1", "cpu"); !has || !verified {
 		t.Fatalf("file in the newest chain: has=%v verified=%v, want (true, true)", has, verified)
 	}
 }
