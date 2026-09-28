@@ -430,7 +430,7 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
-### A measurement whose files had all moved to cold returned nothing to a query without a time range
+### A measurement whose files had all moved to cold returned nothing to a query without a time range ([#954](https://github.com/Basekick-Labs/arc/pull/954))
 
 Compaction consumes a measurement's raw hour files, but tiering kept their
 hot rows forever, so every multi-tier read of that measurement still
