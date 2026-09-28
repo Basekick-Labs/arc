@@ -430,7 +430,7 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
-### Tiered files now leave the cluster manifest, and replicating per-node clusters get the primary-writer gate
+### Tiered files now leave the cluster manifest, and replicating per-node clusters get the primary-writer gate ([#953](https://github.com/Basekick-Labs/arc/pull/953))
 
 Tiering never told the cluster file manifest when it moved a file to cold.
 On a per-node-storage cluster with file replication (Pattern 1) that made
