@@ -430,7 +430,7 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
-### Streaming uploads failed against plain-HTTP S3 endpoints
+### Streaming uploads failed against plain-HTTP S3 endpoints ([#952](https://github.com/Basekick-Labs/arc/pull/952))
 
 Uploads whose body the AWS SDK cannot rewind — the tiering migrator's
 streaming copy, an edge-sync hub receiving a file, a peer-replication pull
