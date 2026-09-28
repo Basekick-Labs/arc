@@ -430,7 +430,7 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
-### Tiering migration ran on every node of a shared-storage cluster, and nodes that never migrated could not see cold data
+### Tiering migration ran on every node of a shared-storage cluster, and nodes that never migrated could not see cold data ([#951](https://github.com/Basekick-Labs/arc/pull/951))
 
 In Pattern 2 (`cluster.shared_storage_mode = true`, one object-store bucket
 shared by every node), every scheduled singleton gates on the primary writer
