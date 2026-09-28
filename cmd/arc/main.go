@@ -3515,9 +3515,13 @@ func main() {
 	if cfg.Reconciliation.Enabled && clusterCoordinator != nil {
 		gate := newReconciliationClusterGate(clusterCoordinator, cfg.Storage.Backend)
 		recCfg := reconciliation.Config{
-			Enabled:                  true,
-			BackendKind:              reconciliationBackendKind(cfg.Storage.Backend),
-			LocalNodeID:              cfg.Cluster.NodeID,
+			Enabled:     true,
+			BackendKind: reconciliationBackendKind(cfg.Storage.Backend),
+			// The coordinator's id, not the raw config value: it generates
+			// one when cluster.node_id is unset, and it is what every
+			// producer of OriginNodeID stamps into manifest entries. The raw
+			// value left such a node without reconciliation at all (#957).
+			LocalNodeID:              clusterCoordinator.LocalNodeID(),
 			GraceWindow:              time.Duration(cfg.Reconciliation.GraceWindowSeconds) * time.Second,
 			ClockSkewAllowance:       time.Duration(cfg.Reconciliation.ClockSkewAllowanceSeconds) * time.Second,
 			PerPrefixTimeout:         time.Duration(cfg.Reconciliation.PerPrefixTimeoutSeconds) * time.Second,
@@ -4338,8 +4342,9 @@ func (g icebergWriterGate) CanRun() bool { return g.inner.CanCompact() }
 //   - Shared storage (S3, Azure, MinIO): one node sweeps the bucket. Both
 //     halves gate on IsActiveCompactor — reuses the failover-managed
 //     compactor lease as a single-sweeper election with no new state.
-//   - Local storage: every node walks its own disks; the per-file
-//     OriginNodeID filter inside the reconciler handles scoping.
+//   - Local storage: every node walks its own disk against the full
+//     manifest; inside the reconciler the per-file OriginNodeID scopes
+//     only the orphan-manifest direction to entries this node originated.
 //     BatchFileOpsInManifest leader-forwards on its own, so the
 //     manifest-sweep gate is also "always".
 //
