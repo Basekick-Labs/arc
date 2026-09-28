@@ -480,6 +480,24 @@ func (s *MetadataStore) DeleteFile(ctx context.Context, path string) error {
 	return nil
 }
 
+// DeleteFileInTier removes a file's row only if it is still in the given
+// tier, so a decision taken from a tier listing cannot delete a row that
+// changed tier meanwhile. Reports whether a row was removed.
+func (s *MetadataStore) DeleteFileInTier(ctx context.Context, path string, tier Tier) (bool, error) {
+	var database, measurement string
+	_ = s.db.QueryRowContext(ctx, `SELECT database, measurement FROM tier_files WHERE path = ? AND tier = ?`, path, string(tier)).Scan(&database, &measurement)
+
+	res, err := s.db.ExecContext(ctx, `DELETE FROM tier_files WHERE path = ? AND tier = ?`, path, string(tier))
+	if err != nil {
+		return false, fmt.Errorf("failed to delete file: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n > 0 && database != "" && measurement != "" {
+		s.invalidateTierCache(database, measurement)
+	}
+	return n > 0, nil
+}
+
 // QuarantineFile marks a file index row as one tiering must never act on
 // again (#758). The row stays, with its tier unchanged, so the query path and
 // the status endpoints keep describing what is actually on disk; only the
