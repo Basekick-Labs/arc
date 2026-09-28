@@ -430,6 +430,35 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### A measurement whose files had all moved to cold returned nothing to a query without a time range ([#954](https://github.com/Basekick-Labs/arc/pull/954))
+
+Compaction consumes a measurement's raw hour files, but tiering kept their
+hot rows forever, so every multi-tier read of that measurement still
+included the hot tier. Once tiering had moved the compacted daily files to
+cold too — the hot directory now empty — a query without a time range sent
+that empty hot glob to DuckDB as-is, DuckDB reported "no files", and the
+whole read came back with zero rows and no columns, cold data included; the
+same query with a time range worked, because per-tier partition pruning
+already drops a tier with no matching partitions. Reachable on any node in
+either deployment pattern as soon as every file of a measurement has
+migrated (found on #953's live run, where a per-node cluster can reach that
+state for the first time).
+
+Two changes. A tier that reaches DuckDB unpruned is first checked for a
+parquet file — empty partition directories, which compaction and migration
+leave behind, do not count — by walking the partition tree newest partition
+first, one listing per level (a `readdir` locally, one delimited listing on
+an object store) and stopping at the first file, with one recursive listing
+deciding when the walk finds nothing or runs out of budget on a forest of
+empty directories; a tier with no file is dropped, a listing that fails
+keeps the tier, as before, and a read that dropped a tier is never served
+from the query cache. And the hot scan now retires hot rows whose file
+the listing did not return — after a five-minute margin, so a file flushed
+around the scan is never retired — which also fixes the hot counts in
+`GET /api/v1/tiering/status` (`hot_retired` in the scan result) and stops a
+vanished file from ever being selected for migration. Cold and quarantined
+rows are never touched.
+
 ### Tiered files now leave the cluster manifest, and replicating per-node clusters get the primary-writer gate ([#953](https://github.com/Basekick-Labs/arc/pull/953))
 
 Tiering never told the cluster file manifest when it moved a file to cold.

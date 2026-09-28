@@ -3623,6 +3623,107 @@ func combineTierPruneResults(results []tierPruneResult) ([]string, int) {
 	return paths, prunedTiers
 }
 
+// tierWalkBudget caps the listings one tierHasFiles walk may issue; past it
+// the walk hands over to one recursive listing.
+const tierWalkBudget = 64
+
+// tierListTimeout bounds each listing the walk issues, as PruneTierPaths
+// bounds its own, so a hung object store fails the check open instead of
+// holding the query.
+const tierListTimeout = 5 * time.Second
+
+// partitionLeafDepth is the day level of {db}/{measurement}/Y/M/D[/H]: files
+// live there (daily outputs) and in the hour directories below it.
+const partitionLeafDepth = 3
+
+// tierHasFiles reports whether the tier's backend holds at least one parquet
+// file for the measurement, and whether that could be established.
+// Partition directories alone do not count: compaction and migration leave
+// empty year/month/day/hour directories behind — on a replicating reader
+// nothing ever prunes them — and an empty glob is exactly what turns a read
+// into "no files". The partition tree is walked newest partition first, one
+// listing per level (a readdir locally, one delimited LIST on an object
+// store), stopping at the first file: a live measurement resolves in four
+// listings. When the walk finds nothing, or runs out of budget on a forest
+// of empty directories, it falls back to one recursive listing of the
+// measurement — cheap precisely because the measurement is then (nearly)
+// empty, and immune to any listing that lags a just-flushed file. Only a
+// listing error leaves the question open, and the caller keeps the tier.
+func tierHasFiles(ctx context.Context, backend storage.Backend, database, measurement string) (has, verified bool) {
+	prefix := database + "/" + measurement + "/"
+	if lister, ok := backend.(storage.DirectoryLister); ok {
+		budget := tierWalkBudget
+		if has, verified := walkForParquet(ctx, backend, lister, prefix, 0, &budget); has {
+			return true, true
+		} else if !verified && budget > 0 {
+			// A listing failed; the recursive listing below would too.
+			return false, false
+		}
+	}
+	return listHasParquet(ctx, backend, prefix)
+}
+
+// listHasParquet answers with one recursive listing under prefix.
+func listHasParquet(ctx context.Context, backend storage.Backend, prefix string) (has, verified bool) {
+	lctx, cancel := context.WithTimeout(ctx, tierListTimeout)
+	defer cancel()
+	objects, err := backend.List(lctx, prefix)
+	if err != nil {
+		return false, false
+	}
+	for _, p := range objects {
+		if strings.HasSuffix(p, ".parquet") {
+			return true, true
+		}
+	}
+	return false, true
+}
+
+// walkForParquet descends the partition tree one listing per level, newest
+// partition first, and stops at the first parquet file. Directory names
+// come back bare from the local backend and as prefixes from object stores,
+// sorted ascending by both; each reduces to its last segment. Budget
+// exhaustion returns unverified with the budget at zero, which the caller
+// tells apart from a listing error.
+func walkForParquet(ctx context.Context, backend storage.Backend, lister storage.DirectoryLister, prefix string, depth int, budget *int) (has, verified bool) {
+	if *budget <= 0 || ctx.Err() != nil {
+		return false, false
+	}
+	*budget--
+	if depth == partitionLeafDepth {
+		return listHasParquet(ctx, backend, prefix)
+	}
+	lctx, cancel := context.WithTimeout(ctx, tierListTimeout)
+	dirs, err := lister.ListDirectories(lctx, prefix)
+	cancel()
+	if err != nil {
+		// Backends answer a missing prefix with an empty listing, not an
+		// error; an error is the store failing, and the tier stays in.
+		return false, false
+	}
+	verified = true
+	for i := len(dirs) - 1; i >= 0; i-- {
+		name := strings.TrimSuffix(dirs[i], "/")
+		if j := strings.LastIndex(name, "/"); j >= 0 {
+			name = name[j+1:]
+		}
+		if name == "" || name == "." {
+			continue
+		}
+		subHas, subVerified := walkForParquet(ctx, backend, lister, prefix+name+"/", depth+1, budget)
+		if subHas {
+			return true, true
+		}
+		if !subVerified {
+			verified = false
+			if *budget <= 0 {
+				return false, false
+			}
+		}
+	}
+	return false, verified
+}
+
 // buildMultiTierReadParquet builds a read_parquet expression that queries tiers with actual data.
 // Queries the tiering metadata to determine which tiers have files for this database/measurement,
 // then only includes paths for tiers that actually have data.
@@ -3692,13 +3793,43 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 		tierPaths, outcome := h.pruner.PruneTierPaths(ctx, src.glob, database, measurement, timeRange, src.backend, src.tier == tiering.TierHot)
 		results = append(results, tierPruneResult{glob: src.glob, paths: tierPaths, outcome: outcome})
 	}
+	// A tier that could not be pruned (no time range, or the cold end-only
+	// fallback) goes to DuckDB as its full glob. If that glob matches
+	// nothing — every file of the measurement has left the tier while its
+	// rows outlived them, as after compaction consumed the raw files and
+	// tiering moved the daily — DuckDB reports "no files" and the whole
+	// read returns nothing, cold data included. Verify such a tier holds a
+	// file at all before keeping it; a listing that cannot be trusted keeps
+	// the tier, as before. A transform that dropped a tier is volatile: the
+	// next flush into that tier must not wait out the cache TTL.
+	kept := results[:0]
+	droppedEmpty := 0
+	for i, r := range results {
+		if r.outcome == pruning.TierPruneFallback {
+			if has, verified := tierHasFiles(ctx, sources[i].backend, database, measurement); verified && !has {
+				h.logger.Debug().
+					Str("database", database).
+					Str("measurement", measurement).
+					Str("tier", string(sources[i].tier)).
+					Msg("Tier holds no files for this measurement; dropped from the read")
+				droppedEmpty++
+				continue
+			}
+		}
+		kept = append(kept, r)
+	}
+	results = kept
+	if droppedEmpty > 0 {
+		pruning.MarkVolatile(ctx)
+	}
+
 	paths, prunedTiers := combineTierPruneResults(results)
-	if prunedTiers > 0 {
+	if prunedTiers > 0 || droppedEmpty > 0 {
 		h.logger.Info().
 			Str("database", database).
 			Str("measurement", measurement).
 			Int("tiers", len(sources)).
-			Int("pruned_tiers", prunedTiers).
+			Int("pruned_tiers", prunedTiers+droppedEmpty).
 			Int("path_count", len(paths)).
 			Msg("Multi-tier partition pruning applied")
 	}

@@ -273,6 +273,7 @@ func (m *Manager) runCycle(ctx context.Context) error {
 		m.logger.Info().
 			Int("scanned", scanResult.FilesScanned).
 			Int("registered", scanResult.FilesRegistered).
+			Int("hot_retired", scanResult.HotRetired).
 			Int("cold_synced", scanResult.ColdSynced).
 			Msg("Pre-migration scan completed")
 	}
@@ -595,6 +596,9 @@ type ScanResult struct {
 	// hot scan still ran, but rows this node holds for files other nodes
 	// moved are stale until a listing succeeds.
 	ColdSyncFailed bool `json:"cold_sync_failed,omitempty"`
+	// HotRetired counts hot rows removed because their file is no longer
+	// in hot storage.
+	HotRetired int `json:"hot_retired"`
 }
 
 // ScanTiers brings this node's tier metadata in line with storage: the cold
@@ -631,6 +635,7 @@ func (m *Manager) scanTiers(ctx context.Context) (*ScanResult, []FileMetadata, e
 	result.FilesScanned = hot.FilesScanned
 	result.FilesRegistered = hot.FilesRegistered
 	result.FilesSkipped = hot.FilesSkipped
+	result.HotRetired = hot.HotRetired
 	result.Errors = hot.Errors
 	return result, coldRows, nil
 }
@@ -764,6 +769,7 @@ func (m *Manager) ScanAndRegisterFiles(ctx context.Context) (*ScanResult, error)
 	m.logger.Info().Msg("Starting file scan for tiering registration")
 
 	// List all objects in the storage root
+	listStart := time.Now()
 	objects, err := objectLister.ListObjects(ctx, "")
 	if err != nil {
 		return nil, fmt.Errorf("failed to list objects: %w", err)
@@ -850,14 +856,66 @@ func (m *Manager) ScanAndRegisterFiles(ctx context.Context) (*ScanResult, error)
 		}
 	}
 
+	result.HotRetired = m.retireVanishedHotRows(ctx, objects, listStart, result)
+
 	m.logger.Info().
 		Int("scanned", result.FilesScanned).
 		Int("registered", result.FilesRegistered).
 		Int("skipped", result.FilesSkipped).
+		Int("retired", result.HotRetired).
 		Int("errors", result.Errors).
 		Msg("File scan completed")
 
 	return result, nil
+}
+
+// retireVanishedHotRowMargin is how recently a hot row may have been created
+// and still be judged by a listing: a file flushed just before the listing
+// began may not be visible to it yet, and one flushed during the scan
+// registers after it. Neither is stale.
+const retireVanishedHotRowMargin = 5 * time.Minute
+
+// retireVanishedHotRows removes hot rows whose file the listing did not
+// return — compaction consumed it, retention or an operator removed it. A
+// stale hot row keeps the hot tier in every multi-tier read of its
+// measurement, and once the tier's glob matches nothing the whole read
+// comes back empty; it also keeps the tier counts wrong and lets
+// FindCandidates select a file that is not there. Cold rows are never
+// touched (#683) and quarantined rows keep their record (#758). Returns
+// how many rows were retired.
+func (m *Manager) retireVanishedHotRows(ctx context.Context, objects []storage.ObjectInfo, listStart time.Time, result *ScanResult) int {
+	hotRows, err := m.metadata.GetFilesInTier(ctx, TierHot)
+	if err != nil {
+		m.logger.Warn().Err(err).Msg("Failed to load hot rows; stale rows are retried next scan")
+		result.Errors++
+		return 0
+	}
+	seen := make(map[string]bool, len(objects))
+	for _, obj := range objects {
+		seen[obj.Path] = true
+	}
+	cutoff := listStart.Add(-retireVanishedHotRowMargin)
+	retired := 0
+	for _, row := range hotRows {
+		if seen[row.Path] || row.QuarantinedAt != nil || !row.CreatedAt.Before(cutoff) {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return retired
+		}
+		// Tier-conditional: a row that changed tier since the listing is
+		// not ours to remove.
+		removed, err := m.metadata.DeleteFileInTier(ctx, row.Path, TierHot)
+		if err != nil {
+			m.logger.Warn().Err(err).Str("path", row.Path).Msg("Failed to retire hot row for a vanished file")
+			result.Errors++
+			continue
+		}
+		if removed {
+			retired++
+		}
+	}
+	return retired
 }
 
 // filePathInfo holds parsed information from a file path
