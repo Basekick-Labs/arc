@@ -279,13 +279,22 @@ func (m *Migrator) MigrateFile(ctx context.Context, candidate MigrationCandidate
 		return fmt.Errorf("destination backend not available for tier: %s", candidate.TargetTier)
 	}
 
+	// The row's size is what the last scan recorded; a file rewritten in
+	// place since (the delete API does that) is longer or shorter, and an
+	// object-store destination now enforces the declared length. Ask the
+	// source, falling back to the row when it cannot say.
+	size := candidate.SizeBytes
+	if n, err := srcBackend.StatFile(ctx, candidate.Path); err == nil && n > 0 {
+		size = n
+	}
+
 	// Record migration start
 	record := &MigrationRecord{
 		FilePath:  candidate.Path,
 		Database:  candidate.Database,
 		FromTier:  candidate.CurrentTier,
 		ToTier:    candidate.TargetTier,
-		SizeBytes: candidate.SizeBytes,
+		SizeBytes: size,
 		StartedAt: startTime,
 	}
 	migrationID, err := m.manager.metadata.RecordMigration(ctx, record)
@@ -294,7 +303,7 @@ func (m *Migrator) MigrateFile(ctx context.Context, candidate MigrationCandidate
 	}
 
 	// Perform the migration using streaming to avoid loading entire files into memory
-	migrationErr := m.copyFileStreaming(ctx, srcBackend, dstBackend, candidate.Path, candidate.SizeBytes)
+	migrationErr := m.copyFileStreaming(ctx, srcBackend, dstBackend, candidate.Path, size)
 
 	if migrationErr != nil {
 		// Record failure
@@ -341,7 +350,7 @@ func (m *Migrator) MigrateFile(ctx context.Context, candidate MigrationCandidate
 		Str("path", candidate.Path).
 		Str("from", string(candidate.CurrentTier)).
 		Str("to", string(candidate.TargetTier)).
-		Int64("size_bytes", candidate.SizeBytes).
+		Int64("size_bytes", size).
 		Dur("duration", duration).
 		Msg("File migrated successfully")
 
@@ -437,18 +446,22 @@ func (m *Migrator) copyFileStreaming(ctx context.Context, src, dst StreamingBack
 	}()
 
 	// Wait for both operations to complete. The first error to arrive is the
-	// one reported, except that a permanent ErrInvalidPath wins over whatever
-	// arrived first: which side fails first is a goroutine race (the pipe
-	// closes with the reader's error, and the writer may report that or its
-	// own), and the caller branches on errors.Is to quarantine the candidate
-	// (#758), so the classification must not depend on the ordering.
+	// one reported, except that a classified error wins over whatever arrived
+	// first: which side fails first is a goroutine race (the pipe closes with
+	// one side's error, and the other may report that or its own), the
+	// caller branches on ErrInvalidPath to quarantine the candidate (#758),
+	// and a length mismatch (ErrBodyLength) must be logged as such rather
+	// than as the closed pipe it causes on the reading side.
+	classified := func(err error) bool {
+		return errors.Is(err, storage.ErrInvalidPath) || errors.Is(err, storage.ErrBodyLength)
+	}
 	var firstErr error
 	for i := 0; i < 2; i++ {
 		err := <-errCh
 		if err == nil {
 			continue
 		}
-		if firstErr == nil || (errors.Is(err, storage.ErrInvalidPath) && !errors.Is(firstErr, storage.ErrInvalidPath)) {
+		if firstErr == nil || (classified(err) && !classified(firstErr)) {
 			firstErr = err
 		}
 	}

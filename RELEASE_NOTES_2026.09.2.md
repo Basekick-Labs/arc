@@ -430,6 +430,41 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### Streaming uploads failed against plain-HTTP S3 endpoints ([#952](https://github.com/Basekick-Labs/arc/pull/952))
+
+Uploads whose body the AWS SDK cannot rewind — the tiering migrator's
+streaming copy, an edge-sync hub receiving a file, a peer-replication pull
+into an S3-backed node — failed against any plain `http://` S3 endpoint
+(SeaweedFS, MinIO, an internal proxy) with `compute input header checksum
+failed, unseekable stream is not supported without TLS and trailing
+checksum`. The SDK signs the payload and computes a request checksum before
+sending, both of which need to re-read the body, and its rewind-free
+alternative (trailing checksums) exists only over TLS. Bodies of 100 MiB and
+more were unaffected because they already went through the SDK's buffered
+uploader; everything smaller — every daily file tiering moves, every
+edge-sync receive — went through a plain `PutObject` and failed before a
+byte was sent. Over TLS these paths worked, which is why AWS deployments
+never saw it; #951's live run against SeaweedFS did.
+
+The S3 backend now reads an unrewindable body into memory first: up to
+16 MiB as a right-sized buffer behind the same single `PutObject`, larger as
+16 MiB parts through the uploader. Rewindable bodies (ingest flushes,
+compaction output, backups) take exactly the path they took before. Two
+consequences: a body whose length differs from what the caller declared now
+fails with `ErrBodyLength` and commits nothing (before, the store rejected it
+over TLS and it was never sent over plain HTTP), and because every request body is now
+rewindable, a transient error on one of these uploads is retried instead of
+failing with `failed to rewind transport stream`. The tiering migrator sizes
+the copy from the source file rather than its metadata row. A multipart
+upload cancelled mid-way (a cycle deadline, a shutdown) is aborted only while
+its context is live, so a bucket receiving streamed uploads should carry an
+`AbortIncompleteMultipartUpload` lifecycle rule — already true for files over
+100 MiB.
+
+Memory: one buffer the size of the file per in-flight streaming upload under
+16 MiB (`tiered_storage.migration_max_concurrent`, default 4, bounds
+tiering's); up to six 16 MiB buffers per larger stream.
+
 ### Tiering migration ran on every node of a shared-storage cluster, and nodes that never migrated could not see cold data ([#951](https://github.com/Basekick-Labs/arc/pull/951))
 
 In Pattern 2 (`cluster.shared_storage_mode = true`, one object-store bucket
