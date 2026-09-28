@@ -436,7 +436,7 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
-### The reconciler reported every replicated file as orphan storage on a per-node cluster ([#957](https://github.com/Basekick-Labs/arc/issues/957))
+### The reconciler reported every replicated file as orphan storage on a per-node cluster ([#957](https://github.com/Basekick-Labs/arc/issues/957), [#960](https://github.com/Basekick-Labs/arc/pull/960))
 
 On a per-node-storage cluster the reconciler scoped the manifest to the
 entries this node had originated before comparing it with the node's disk, on
