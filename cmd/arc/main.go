@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -3653,17 +3654,28 @@ func main() {
 					}
 				}
 
-				// Shared-storage mode: one hot bucket, N nodes. Only the
-				// Raft leader among the writers moves and deletes files
-				// (the gate retention and CQ use); every node still syncs
-				// its tier metadata each cycle because queries route from
-				// it. Per-node storage stays ungated on purpose: each
-				// node's metadata is authoritative for its own disk, and
-				// tiering has no manifest integration with which to
-				// coordinate replicas (tracked separately).
+				// Where nodes share data — one hot bucket (shared-storage
+				// mode), or per-node disks kept in step by file replication
+				// — only the primary writer among them moves and deletes
+				// files (the gate retention and CQ use); every node still
+				// syncs its tier metadata each cycle because queries route
+				// from it; and every hot copy tiering removes leaves the
+				// cluster manifest first, so peer replication does not pull
+				// it back. A local-storage cluster without replication
+				// shares nothing and stays ungated: each node's metadata is
+				// authoritative for its own disk. The manifest seam is wired
+				// whenever a coordinator exists, since files are registered
+				// in the manifest either way.
 				var tieringGate tiering.ClusterGate
-				if cfg.Cluster.SharedStorageMode && clusterCoordinator != nil {
-					tieringGate = newWriterClusterGate(clusterCoordinator)
+				var tieringManifest tiering.ManifestCoordinator
+				if clusterCoordinator != nil {
+					tieringManifest = &tieringManifestAdapter{
+						coordinator: clusterCoordinator,
+						logger:      logger.Get("tiering-manifest"),
+					}
+					if cfg.Cluster.SharedStorageMode || cfg.Cluster.ReplicationEnabled {
+						tieringGate = newWriterClusterGate(clusterCoordinator)
+					}
 				}
 
 				// Create tiering manager
@@ -3674,6 +3686,7 @@ func main() {
 					Config:        &cfg.TieredStorage,
 					LicenseClient: licenseClient,
 					ClusterGate:   tieringGate,
+					Manifest:      tieringManifest,
 					Logger:        logger.Get("tiering"),
 				})
 				if err != nil {
@@ -3710,6 +3723,23 @@ func main() {
 					}
 				}
 			}
+		}
+	}
+
+	// A replicating local-storage cluster node reads a daily file that
+	// another node migrated to cold only through its own cold row and cold
+	// backend: the primary's manifest delete unlinks every replica, and its
+	// sweep does the same for files migrated before the manifest was kept in
+	// step. Keyed on what was actually built, not on config: a tiering
+	// manager that failed to start, or a cold backend that failed to
+	// construct, leaves this node just as unable to read cold.
+	if clusterCoordinator != nil && cfg.Cluster.ReplicationEnabled && !cfg.Cluster.SharedStorageMode {
+		coldReadable := tieringManager != nil && tieringManager.GetBackendForTier(tiering.TierCold) != nil
+		if !coldReadable {
+			log.Warn().
+				Bool("tiering_enabled", cfg.TieredStorage.Enabled).
+				Bool("cold_enabled", cfg.TieredStorage.Cold.Enabled).
+				Msg("This replicating cluster node has no usable cold tier: a daily file any node migrates to cold is removed from local storage cluster-wide and would be unreadable here; enable tiering with the same cold backend on every node")
 		}
 	}
 
@@ -4174,6 +4204,53 @@ func runCompactSubcommand(args []string) {
 type shutdownFunc func() error
 
 func (f shutdownFunc) Close() error { return f() }
+
+// tieringManifestAdapter implements tiering.ManifestCoordinator over the
+// cluster coordinator the way retention builds its manifest deletes
+// (internal/api/retention.go): JSON DeleteFilePayload ops in one batch,
+// applied on the leader or forwarded to it. Lives in main.go so tiering has
+// no compile-time dependency on the cluster or raft packages.
+type tieringManifestAdapter struct {
+	coordinator *cluster.Coordinator
+	logger      zerolog.Logger
+}
+
+func (a *tieringManifestAdapter) DeleteFilesFromManifest(ctx context.Context, paths []string, reason string) error {
+	ops := make([]clusterraft.BatchFileOp, 0, len(paths))
+	for _, p := range paths {
+		payload, err := json.Marshal(clusterraft.DeleteFilePayload{Path: p, Reason: reason})
+		if err != nil {
+			return fmt.Errorf("marshal manifest delete for %q: %w", p, err)
+		}
+		ops = append(ops, clusterraft.BatchFileOp{Type: clusterraft.CommandDeleteFile, Payload: payload})
+	}
+	// A leader election mid-cycle is ordinary, and the forward path reports
+	// it at once rather than waiting one out, so retry briefly — four
+	// attempts, 1 s + 2 s + 4 s apart, about 7 s — before treating it as the
+	// quorum loss the migrator stops on. A rejection that carries a Raft
+	// apply code is not retried: quorum loss is not transient.
+	err := tiering.RetryTransient(ctx, 4, time.Second, func() error {
+		return a.coordinator.BatchFileOpsInManifestContext(ctx, ops)
+	}, func(err error) bool {
+		return errors.Is(err, cluster.ErrNoLeaderKnown) || errors.Is(err, cluster.ErrLeaderUnreachable)
+	})
+	if err != nil {
+		a.logger.Error().Err(err).
+			Int("count", len(ops)).
+			Str("reason", reason).
+			Bool("manifest_apply", errors.Is(err, clusterraft.ErrManifestApply)).
+			Msg("Failed to remove tiered files from the cluster manifest")
+	}
+	return err
+}
+
+func (a *tieringManifestAdapter) ManifestEntry(path string) (int64, bool) {
+	entry, ok := a.coordinator.GetFileEntry(path)
+	if !ok || entry == nil {
+		return 0, false
+	}
+	return entry.SizeBytes, true
+}
 
 // writerClusterGate implements scheduler.WriterGate (satisfies both
 // scheduler.RetentionClusterGate and scheduler.CQClusterGate aliases) and

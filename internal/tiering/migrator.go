@@ -214,10 +214,14 @@ func (m *Migrator) MigrateBatch(ctx context.Context, candidates []MigrationCandi
 		return 0, 0
 	}
 
+	// Phase 1: copy and flip, concurrently. After this each flipped file is
+	// migrated — its cold copy is canonical — whatever happens to its hot
+	// copy below.
 	sem := semaphore.NewWeighted(int64(m.maxConcurrent))
 	var wg sync.WaitGroup
-	var migrated, failed int64
 	var mu sync.Mutex
+	var flipped []MigrationCandidate
+	failed := 0
 
 	for _, candidate := range candidates {
 		if err := sem.Acquire(ctx, 1); err != nil {
@@ -230,7 +234,7 @@ func (m *Migrator) MigrateBatch(ctx context.Context, candidates []MigrationCandi
 			defer wg.Done()
 			defer sem.Release(1)
 
-			if err := m.MigrateFile(ctx, c); err != nil {
+			if err := m.copyAndFlip(ctx, c); err != nil {
 				// A quarantined candidate already logged its own, definitive
 				// line at Error; repeating it here would read as a second
 				// failure of the same file. It still counts as failed for this
@@ -248,20 +252,78 @@ func (m *Migrator) MigrateBatch(ctx context.Context, candidates []MigrationCandi
 				mu.Lock()
 				failed++
 				mu.Unlock()
-			} else {
-				mu.Lock()
-				migrated++
-				mu.Unlock()
+				return
 			}
+			mu.Lock()
+			flipped = append(flipped, c)
+			mu.Unlock()
 		}(candidate)
 	}
 
 	wg.Wait()
-	return int(migrated), int(failed)
+
+	// Phase 2: release the hot copies, manifest first, chunk by chunk. A
+	// manifest failure counts once for the cycle; the files are migrated
+	// regardless and reconciliation finishes the hot cleanup.
+	if err := m.releaseHotCopies(ctx, flipped, manifestReasonMigrated); err != nil {
+		failed++
+	}
+	return len(flipped), failed
 }
 
-// MigrateFile migrates a single file from one tier to another
+// MigrateFile migrates a single file from one tier to another: receipts,
+// copy, flip, then release the hot copy through the manifest — MigrateBatch
+// for one file.
 func (m *Migrator) MigrateFile(ctx context.Context, candidate MigrationCandidate) error {
+	if err := m.manager.notifyHotFilesRemoved([]string{candidate.Path}); err != nil {
+		return fmt.Errorf("mark sync receipts: %w", err)
+	}
+	if err := m.copyAndFlip(ctx, candidate); err != nil {
+		return err
+	}
+	return m.releaseHotCopies(ctx, []MigrationCandidate{candidate}, manifestReasonMigrated)
+}
+
+// releaseHotCopies removes migrated files' hot copies in chunks: each chunk
+// leaves the cluster manifest first (one proposal, paced by the manager so
+// every node's unlink queue drains between proposals), then its hot copies
+// are deleted. On a local-storage cluster the manifest delete is what
+// unlinks the replicas on every other node; on a shared bucket it is
+// bookkeeping and the delete here removes the object. A manifest failure
+// stops the batch with the remaining hot copies in place — their rows
+// already say cold, and reconciliation finishes them, manifest-first,
+// within its window.
+func (m *Migrator) releaseHotCopies(ctx context.Context, files []MigrationCandidate, reason string) error {
+	for i := 0; i < len(files); i += manifestChunk {
+		chunk := files[i:min(i+manifestChunk, len(files))]
+		paths := make([]string, len(chunk))
+		for j, c := range chunk {
+			paths[j] = c.Path
+		}
+		// The adapter logged the cause at Error; this is the consequence.
+		if err := m.manager.deleteFromManifest(ctx, paths, reason); err != nil {
+			m.logger.Warn().Err(err).Int("kept_hot_copies", len(files)-i).
+				Msg("Manifest update failed; keeping the remaining hot copies for reconciliation")
+			return err
+		}
+		for _, c := range chunk {
+			src := m.manager.GetBackendForTier(c.CurrentTier)
+			if err := src.Delete(ctx, c.Path); err != nil {
+				m.logger.Warn().Err(err).Str("path", c.Path).Msg("Failed to delete source file after migration")
+				// Don't fail the migration - file is in destination, just source cleanup failed
+				continue
+			}
+			// Clean up empty parent directories after successful delete
+			m.CleanupEmptyDirectories(ctx, c.Path)
+		}
+	}
+	return nil
+}
+
+// copyAndFlip streams the candidate to its target tier and flips its row.
+// After this the file is migrated: the cold copy is canonical and stays even
+// if a later step fails. The hot copy is released separately.
+func (m *Migrator) copyAndFlip(ctx context.Context, candidate MigrationCandidate) error {
 	// .UTC() so StartedAt persists in a stable timezone (matches the
 	// rest of internal/tiering/metadata.go). time.Since(startTime) is
 	// location-independent so the elapsed-duration math is unaffected.
@@ -321,23 +383,18 @@ func (m *Migrator) MigrateFile(ctx context.Context, candidate MigrationCandidate
 	// precede this flip, and a marked receipt for a file that ends up not
 	// migrating is documented harmless by the receive path.
 	if err := m.manager.metadata.UpdateTier(ctx, candidate.Path, candidate.TargetTier); err != nil {
-		// Rollback: delete from destination
-		if delErr := dstBackend.Delete(ctx, candidate.Path); delErr != nil {
-			m.logger.Error().Err(delErr).Str("path", candidate.Path).Msg("Failed to rollback destination file")
-		}
+		// The cold copy stays. Another node's metadata sync may already have
+		// recorded it as cold, and that node's reconciliation would then
+		// remove the hot copy on the strength of it — deleting the cold copy
+		// here could leave no copy anywhere. Left in place it is harmless:
+		// this row still says hot, so the next cycle copies over it and
+		// flips again.
+		m.logger.Warn().Err(err).Str("path", candidate.Path).
+			Msg("Failed to update tier metadata after copy; cold copy left in place for the next cycle")
 		if migrationID > 0 {
 			m.manager.metadata.CompleteMigration(ctx, migrationID, err)
 		}
 		return fmt.Errorf("failed to update tier metadata: %w", err)
-	}
-
-	// Delete from source tier
-	if err := srcBackend.Delete(ctx, candidate.Path); err != nil {
-		m.logger.Warn().Err(err).Str("path", candidate.Path).Msg("Failed to delete source file after migration")
-		// Don't fail the migration - file is in destination, just source cleanup failed
-	} else {
-		// Clean up empty parent directories after successful delete
-		m.CleanupEmptyDirectories(ctx, candidate.Path)
 	}
 
 	// Record success
@@ -495,6 +552,9 @@ func (m *Migrator) ReconcileOrphanedFiles(ctx context.Context) (orphansFound, de
 		return 0, 0, 1
 	}
 
+	// Pass 1: find the orphans whose cold copy is verified. Pass 2 removes
+	// them, manifest first.
+	var orphans []FileMetadata
 	for _, file := range coldFiles {
 		select {
 		case <-ctx.Done():
@@ -572,34 +632,131 @@ func (m *Migrator) ReconcileOrphanedFiles(ctx context.Context) (orphansFound, de
 			continue
 		}
 
-		m.logger.Info().
-			Str("path", file.Path).
-			Str("database", file.Database).
-			Str("measurement", file.Measurement).
-			Int64("size_bytes", file.SizeBytes).
-			Msg("Found orphaned hot file (metadata says cold), deleting from hot")
+		orphans = append(orphans, file)
+	}
 
-		// Mark sync receipts before this delete too (#687). Normally a no-op
-		// (MigrateFile marked before flipping the tier), but reconciliation
-		// is the crash-recovery path and must uphold the same invariant.
-		if err := m.manager.notifyHotFilesRemoved([]string{file.Path}); err != nil {
-			m.logger.Warn().Err(err).Str("path", file.Path).
-				Msg("Could not mark sync receipts; keeping orphaned hot file for the next cycle")
-			failed++
-			continue
+	if len(orphans) == 0 {
+		return orphansFound, deleted, failed
+	}
+	paths := make([]string, len(orphans))
+	for i, file := range orphans {
+		paths[i] = file.Path
+	}
+
+	// Mark sync receipts for every orphan before any can disappear (#687).
+	// Reconciliation is the crash-recovery path and must uphold the same
+	// invariant as migration; and on a local-storage cluster the manifest
+	// delete below unlinks the copies on every node, this one included, so
+	// marking in front of each hot delete would come too late.
+	if err := m.manager.notifyHotFilesRemoved(paths); err != nil {
+		m.logger.Warn().Err(err).Int("orphans", len(orphans)).
+			Msg("Could not mark sync receipts; keeping orphaned hot files for the next cycle")
+		return orphansFound, deleted, failed + len(orphans)
+	}
+
+	// Pass 2: manifest first, then the hot copies, chunk by chunk, as
+	// releaseHotCopies does for a migration batch.
+	for i := 0; i < len(orphans); i += manifestChunk {
+		end := min(i+manifestChunk, len(orphans))
+		if err := m.manager.deleteFromManifest(ctx, paths[i:end], manifestReasonReconcile); err != nil {
+			m.logger.Warn().Err(err).Int("kept_hot_copies", len(orphans)-i).
+				Msg("Manifest update failed; keeping orphaned hot files for the next cycle")
+			return orphansFound, deleted, failed + len(orphans) - i
 		}
+		for _, file := range orphans[i:end] {
+			m.logger.Info().
+				Str("path", file.Path).
+				Str("database", file.Database).
+				Str("measurement", file.Measurement).
+				Int64("size_bytes", file.SizeBytes).
+				Msg("Found orphaned hot file (metadata says cold), deleting from hot")
 
-		if err := hotBackend.Delete(ctx, file.Path); err != nil {
-			m.logger.Warn().Err(err).Str("path", file.Path).Msg("Failed to delete orphaned hot file")
-			failed++
-			continue
+			if err := hotBackend.Delete(ctx, file.Path); err != nil {
+				m.logger.Warn().Err(err).Str("path", file.Path).Msg("Failed to delete orphaned hot file")
+				failed++
+				continue
+			}
+
+			deleted++
+			m.CleanupEmptyDirectories(ctx, file.Path)
 		}
-
-		deleted++
-		m.CleanupEmptyDirectories(ctx, file.Path)
 	}
 
 	return orphansFound, deleted, failed
+}
+
+// ReconcileManifest removes cluster-manifest entries for files that are
+// already in cold: files migrated before tiering kept the manifest in step,
+// and files whose manifest step failed after their copy. While such an entry
+// exists, peer replication pulls the file back onto every node and a
+// restarted node fails catch-up on it. Only settled rows are considered —
+// migrated_at older than manifestSettle; the sync stamps it from the
+// object's own timestamp, so a copy still in flight on another node is never
+// swept — and the cold object must exist with the size the manifest
+// recorded: a row the sync took from a listing is not proof of a durable
+// copy, and a foreign object at the path does not count. Returns how many
+// entries were removed.
+func (m *Migrator) ReconcileManifest(ctx context.Context, coldRows []FileMetadata) (int, error) {
+	if m.manager.manifest == nil {
+		return 0, nil
+	}
+	coldBackend := m.manager.GetBackendForTier(TierCold)
+	if coldBackend == nil {
+		return 0, nil
+	}
+
+	settled := time.Now().Add(-manifestSettle)
+	var paths, unverified []string
+	for _, row := range coldRows {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		if row.Tier != TierCold || row.QuarantinedAt != nil || row.MigratedAt == nil || row.MigratedAt.After(settled) {
+			continue
+		}
+		want, ok := m.manager.manifest.ManifestEntry(row.Path)
+		if !ok {
+			continue
+		}
+		got, err := coldBackend.StatFile(ctx, row.Path)
+		if err != nil {
+			m.logger.Warn().Err(err).Str("path", row.Path).Msg("Failed to stat cold object during manifest reconciliation")
+			unverified = append(unverified, row.Path)
+			continue
+		}
+		if got != want {
+			// Absent, or not this file.
+			unverified = append(unverified, row.Path)
+			continue
+		}
+		paths = append(paths, row.Path)
+	}
+	if len(unverified) > 0 {
+		m.logger.Warn().
+			Int("count", len(unverified)).
+			Strs("sample", unverified[:min(5, len(unverified))]).
+			Msg("Cold rows still in the cluster manifest whose cold object is missing or differs in size; manifest entries kept and their hot copies still replicate. Restore or re-migrate the object, or let the reconciler remove the entry")
+	}
+	if len(paths) == 0 {
+		return 0, nil
+	}
+
+	// Receipts before the entries go (#687): the manifest delete unlinks hot
+	// copies cluster-wide.
+	if err := m.manager.notifyHotFilesRemoved(paths); err != nil {
+		return 0, fmt.Errorf("mark sync receipts: %w", err)
+	}
+
+	removed := 0
+	for _, chunk := range chunkPaths(paths, manifestChunk) {
+		if err := m.manager.deleteFromManifest(ctx, chunk, manifestReasonSweep); err != nil {
+			return removed, err
+		}
+		removed += len(chunk)
+	}
+	m.logger.Info().Int("entries", removed).
+		Msg("Removed cluster manifest entries for files already in cold; their replicas are unlinked cluster-wide, and a node without a cold tier can no longer read them")
+	return removed, nil
 }
 
 // CleanupEmptyDirectories removes empty directories after file migration

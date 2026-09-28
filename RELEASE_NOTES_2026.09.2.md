@@ -430,6 +430,63 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### Tiered files now leave the cluster manifest, and replicating per-node clusters get the primary-writer gate
+
+Tiering never told the cluster file manifest when it moved a file to cold.
+On a per-node-storage cluster with file replication (Pattern 1) that made
+migration undo itself: a node that moved a daily file to cold and deleted its
+local copy had the file pulled straight back from a peer, because the
+manifest still listed it — every node did this to its own replica, and once
+every peer had migrated, any node that restarted failed its startup catch-up
+on the entry and, with `cluster.query_gate_on_catchup`, answered reads with
+503 until the entry went away by hand. On a shared bucket (Pattern 2) the
+stale entries were harmless but accumulated forever unless the reconciler ran
+with `manifest_only_dry_run=false`.
+
+Migration now removes a file from the manifest before it removes the hot
+copy, one batched proposal per chunk of at most 200 files, and no two
+proposals from a node closer than a second — the FSM applies a proposal
+synchronously on every node and queues each removed local copy into a
+bounded unlink queue, so proposals stay small and spaced. On a per-node
+cluster the manifest delete is what unlinks the replica on every node; on a
+shared bucket it is bookkeeping and the migrator still deletes the object. A
+manifest failure (after four attempts over about seven seconds on
+leader-election blips) leaves the remaining hot copies in place; the rows
+already say cold, and reconciliation finishes them, manifest-first, within
+its 48-hour window — until then those files are read twice on the primary
+and on any node that has already synced their cold rows. Reconciliation of
+orphaned hot copies takes the same order. A sweep on the primary removes
+manifest entries for files that were already in cold before this release,
+once a row has been cold for an hour and the cold object exists with the
+recorded size, so replicas stop being re-pulled and restarts catch up; an
+upgraded cluster with thousands of such files takes about one second per 200
+on its first cycle. One thing nothing shipped here reclaims: a node whose
+unlink queue overflowed — it logs `local delete queue full; dropping` — keeps
+a replica the manifest no longer lists, and restart catch-up removes nothing;
+delete it by hand or with the reconciler (`reconciliation.enabled`), or that
+node reads the file twice.
+
+Two things follow for Pattern 1. First, a replicating per-node cluster is now
+gated like shared storage (#951): only the primary writer migrates, and every
+node syncs its tier metadata from the cold tier each cycle. A per-node
+cluster without replication shares nothing and keeps its per-node behaviour.
+Second — read this if you run tiering on such a cluster — **every replicating
+node must run tiering with the same cold backend**: once the primary migrates
+a daily file, the manifest delete removes every replica, and a node reads
+that data only through its own cold row and cold backend. A node with tiering
+off, or with no cold tier, cannot see that data any more; Arc says so at
+startup on such a node. After the replica is unlinked, a node that has no
+cold row yet for that measurement does not read the file until its next cold
+sync — at the default `0 2 * * *` schedule up to a day, for a measurement's
+first cold file on that node only; shorten `tiered_storage.migration_schedule`
+on readers if that matters.
+
+Also changed: a copy whose tier flip fails no longer deletes the cold object
+it just wrote (another node's metadata sync may already rely on it; the next
+cycle copies over it, and until then a node that already routes that
+measurement to cold reads the leftover once more), and a manual migration
+during a scheduled one still answers `409 Conflict`.
+
 ### Streaming uploads failed against plain-HTTP S3 endpoints ([#952](https://github.com/Basekick-Labs/arc/pull/952))
 
 Uploads whose body the AWS SDK cannot rewind — the tiering migrator's
@@ -524,10 +581,10 @@ coordinator failed to initialize or start — now exits instead of continuing
 "in standalone mode": without the coordinator every gated task would run
 unconditionally against the shared bucket.
 
-Per-node storage clusters (Pattern 1) are deliberately not gated. There,
-tiering has no coordination with the file-replication manifest at all — a
-node that migrates and deletes its local copy has it pulled back from a peer
-within minutes — and a gate would not fix that. That is tracked separately.
+Per-node storage clusters (Pattern 1) were not gated by this change: tiering
+had no coordination with the file-replication manifest, so a gate alone would
+not have helped. The manifest integration entry above closes that and gates
+replicating per-node clusters the same way.
 
 ### Configurable compaction cycle budget and cancellation ([#915](https://github.com/Basekick-Labs/arc/issues/915))
 
