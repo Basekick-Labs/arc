@@ -436,7 +436,7 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
-### A replica the manifest had dropped could stay on a node forever
+### A replica the manifest had dropped could stay on a node forever ([#958](https://github.com/Basekick-Labs/arc/pull/958))
 
 On a per-node-storage cluster with file replication, every node that applies
 a manifest delete unlinks its local copy of the file. The hand-off from the
