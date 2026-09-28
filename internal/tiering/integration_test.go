@@ -184,11 +184,10 @@ func setupIntegrationTest(t *testing.T, withColdBackend bool) (*Manager, *mockBa
 		MigrationBatchSize:     10,
 		DefaultHotMaxAgeDays:   7,
 		Cold: config.ColdTierConfig{
-			Enabled:        withColdBackend,
-			Backend:        "s3",
-			S3Bucket:       "arc-archive-test",
-			S3Region:       "us-east-1",
-			S3StorageClass: "GLACIER",
+			Enabled:  withColdBackend,
+			Backend:  "s3",
+			S3Bucket: "arc-archive-test",
+			S3Region: "us-east-1",
 		},
 	}
 

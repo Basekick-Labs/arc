@@ -250,15 +250,15 @@ s3_access_key = "minioadmin"     # MinIO/dev. AWS S3 with IRSA: remove
 s3_secret_key = "minioadmin"     # MinIO/dev. AWS S3 with IRSA: remove
 s3_use_ssl = false               # MinIO/dev. AWS S3: true
 s3_path_style = true             # MinIO/dev. AWS S3: false
-s3_storage_class = "GLACIER"
+# Cold objects are written with no storage class set (S3 Standard) and read in
+# place; there is deliberately no storage-class key. Keep bucket lifecycle
+# rules off the cold prefix — Glacier or Deep Archive objects cannot be queried.
 
-# Azure (when backend = "azure")
+# Azure (when backend = "azure"). Objects take the storage account's default
+# access tier; there is no access-tier key, for the same reason.
 azure_container = ""
 azure_endpoint = ""
 azure_use_managed_identity = false
-azure_access_tier = "Archive"
-
-retrieval_mode = "standard"  # standard, expedited, bulk
 
 # -----------------------------------------------------------------------------
 # Audit Logging (Enterprise)
