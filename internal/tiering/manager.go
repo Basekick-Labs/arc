@@ -56,6 +56,13 @@ type Manager struct {
 	// writer and switches on the cold-tier metadata sync. See ManagerConfig.
 	clusterGate ClusterGate
 
+	// manifest, when non-nil, is told about every hot copy tiering removes,
+	// before it is removed. See ManagerConfig. manifestMu serializes
+	// proposals and guards lastManifestProposal, which paces them.
+	manifest             ManifestCoordinator
+	manifestMu           sync.Mutex
+	lastManifestProposal time.Time
+
 	// Components
 	migrator  *Migrator
 	scheduler *Scheduler
@@ -88,12 +95,21 @@ type ManagerConfig struct {
 	LicenseClient *license.Client
 
 	// ClusterGate, when non-nil, restricts storage mutation (migrate, delete,
-	// orphan reconciliation) to the primary writer. main.go wires it only in
-	// shared-storage mode: with per-node storage every node's metadata is
-	// authoritative for its own disk and there is nothing to gate. A non-nil
-	// gate also switches on the cold-tier metadata sync in ScanTiers, since
-	// other nodes' migrations are then visible only by listing cold storage.
+	// orphan reconciliation) to the primary writer. main.go wires it where
+	// nodes share data — shared-storage mode, and per-node storage with file
+	// replication: there the primary's manifest deletes unlink every
+	// replica, so only one node may migrate. A non-nil gate also switches on
+	// the cold-tier metadata sync in ScanTiers, since other nodes' migrations
+	// are then visible only by listing cold storage. A local-storage cluster
+	// without replication shares nothing and stays ungated.
 	ClusterGate ClusterGate
+
+	// Manifest, when non-nil, keeps the cluster file manifest in step with
+	// the hot tier: every hot copy tiering removes is first removed from the
+	// manifest (one batched proposal per chunk), which is what stops peer
+	// replication from pulling the file back. main.go wires it whenever the
+	// cluster coordinator exists.
+	Manifest ManifestCoordinator
 
 	// Logger
 	Logger zerolog.Logger
@@ -142,6 +158,7 @@ func NewManager(cfg *ManagerConfig) (*Manager, error) {
 		config:        cfg.Config,
 		licenseClient: cfg.LicenseClient,
 		clusterGate:   cfg.ClusterGate,
+		manifest:      cfg.Manifest,
 		stopCh:        make(chan struct{}),
 		logger:        logger,
 	}
@@ -249,7 +266,7 @@ func (m *Manager) runCycle(ctx context.Context) error {
 	// Scan and register any new files before migration. The result is never
 	// nil: a cold sync that succeeded before the hot scan failed still
 	// changed what this node reads.
-	scanResult, err := m.ScanTiers(ctx)
+	scanResult, coldRows, err := m.scanTiers(ctx)
 	if err != nil {
 		m.logger.Warn().Err(err).Msg("File scan failed, continuing with existing metadata")
 	} else {
@@ -293,6 +310,16 @@ func (m *Manager) runCycle(ctx context.Context) error {
 		// Reconcile orphaned hot files (files tracked as cold but still in hot storage)
 		orphansFound, orphansDeleted, orphanErrors = m.migrator.ReconcileOrphanedFiles(ctx)
 		totalErrors += orphanErrors
+
+		// Manifest entries for files already in cold — migrated before the
+		// manifest was kept in step, or whose manifest step failed — keep
+		// peer replication pulling their replicas back. coldRows (every
+		// cold row this node knows) is held across the whole cycle for
+		// this; a few hundred bytes a row.
+		if _, err := m.migrator.ReconcileManifest(ctx, coldRows); err != nil {
+			m.logger.Warn().Err(err).Msg("Manifest reconciliation stopped; remaining entries are retried next cycle")
+			totalErrors++
+		}
 	}
 	if orphansFound > 0 || orphanErrors > 0 {
 		m.logger.Info().
@@ -321,6 +348,28 @@ func (m *Manager) runCycle(ctx context.Context) error {
 	m.notifyMigrationComplete(totalMigrated+scanResult.ColdSynced, orphansDeleted)
 
 	return nil
+}
+
+// deleteFromManifest removes hot paths from the cluster manifest, when there
+// is one; a nil manifest — no cluster — is a no-op. Callers chunk to
+// manifestChunk; this paces: no two proposals from this node, whatever
+// their source, are closer than manifestChunkPause, so every peer's unlink
+// queue drains between them. The pause therefore never applies where there
+// is nothing to pace.
+func (m *Manager) deleteFromManifest(ctx context.Context, paths []string, reason string) error {
+	if m.manifest == nil || len(paths) == 0 {
+		return nil
+	}
+	m.manifestMu.Lock()
+	defer m.manifestMu.Unlock()
+	if wait := manifestChunkPause - time.Since(m.lastManifestProposal); wait > 0 {
+		if err := sleepCtx(ctx, wait); err != nil {
+			return err
+		}
+	}
+	err := m.manifest.DeleteFilesFromManifest(ctx, paths, reason)
+	m.lastManifestProposal = time.Now()
+	return err
 }
 
 // roleGated reports whether a cluster gate is wired and denies this node.
@@ -554,10 +603,20 @@ type ScanResult struct {
 // (#683) must see the rows the cold pass flipped. The result is never nil,
 // so a caller can act on a partial pass when the hot scan fails.
 func (m *Manager) ScanTiers(ctx context.Context) (*ScanResult, error) {
+	result, _, err := m.scanTiers(ctx)
+	return result, err
+}
+
+// scanTiers is ScanTiers that also hands back the cold rows the sync worked
+// from (those it loaded plus those it recorded), so the primary's manifest
+// sweep in the same cycle does not load them a third time.
+func (m *Manager) scanTiers(ctx context.Context) (*ScanResult, []FileMetadata, error) {
 	result := &ScanResult{}
+	var coldRows []FileMetadata
 	if m.clusterGate != nil && m.coldBackend != nil && m.config.Cold.Enabled {
-		synced, err := m.syncColdTierMetadata(ctx)
+		synced, rows, err := m.syncColdTierMetadata(ctx)
 		result.ColdSynced = synced
+		coldRows = rows
 		if err != nil {
 			// The hot scan still matters on its own: the primary migrates
 			// from hot rows and every node routes reads from them.
@@ -567,36 +626,39 @@ func (m *Manager) ScanTiers(ctx context.Context) (*ScanResult, error) {
 	}
 	hot, err := m.ScanAndRegisterFiles(ctx)
 	if err != nil {
-		return result, err
+		return result, coldRows, err
 	}
 	result.FilesScanned = hot.FilesScanned
 	result.FilesRegistered = hot.FilesRegistered
 	result.FilesSkipped = hot.FilesSkipped
 	result.Errors = hot.Errors
-	return result, nil
+	return result, coldRows, nil
 }
 
 // syncColdTierMetadata makes this node's metadata reflect what is in cold
-// storage. In shared-storage mode only the primary writer migrates, but the
-// query layer routes each node from its OWN SQLite (buildMultiTierReadParquet
-// includes the cold tier only for measurements with a cold row here), so a
-// node that never migrated would never read the cold tier. Listing cold and
-// recording what is there is how every node — readers included — learns
-// about the primary's moves, and how a newly elected primary stops treating
+// storage. In a gated cluster — shared storage, or per-node storage with
+// file replication — only the primary writer migrates, but the query layer
+// routes each node from its OWN SQLite (buildMultiTierReadParquet includes
+// the cold tier only for measurements with a cold row here), so a node that
+// never migrated would never read the cold tier. Listing cold and recording
+// what is there is how every node — readers included — learns about the
+// primary's moves, and how a newly elected primary stops treating
 // already-migrated files as candidates.
 //
 // Rows are only ever added or flipped to cold. A cold row whose object is
 // gone is reported, never reverted, for the same reason the hot scan never
 // downgrades (#683): the object may be mid-move, and a hot copy is still
-// read through the hot glob. Returns how many rows changed.
-func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
+// read through the hot glob. Returns how many rows changed and the cold rows
+// it worked from — those loaded plus those recorded — for the manifest
+// sweep.
+func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata, error) {
 	lister, ok := m.coldBackend.(storage.ObjectLister)
 	if !ok {
-		return 0, fmt.Errorf("cold backend does not support ListObjects")
+		return 0, nil, fmt.Errorf("cold backend does not support ListObjects")
 	}
 	objects, err := lister.ListObjects(ctx, "")
 	if err != nil {
-		return 0, fmt.Errorf("failed to list cold objects: %w", err)
+		return 0, nil, fmt.Errorf("failed to list cold objects: %w", err)
 	}
 
 	// One query for the cold row set, as the hot scan does. Skipping rows
@@ -605,7 +667,7 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 	// node is using.
 	coldRows, err := m.metadata.GetFilesInTier(ctx, TierCold)
 	if err != nil {
-		return 0, fmt.Errorf("failed to load cold tier paths: %w", err)
+		return 0, nil, fmt.Errorf("failed to load cold tier paths: %w", err)
 	}
 	unseen := make(map[string]bool, len(coldRows))
 	for _, f := range coldRows {
@@ -622,7 +684,7 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 		// Past the deadline every remaining upsert would fail and log; stop
 		// with what was recorded — the next cycle continues from there.
 		if err := ctx.Err(); err != nil {
-			return synced, err
+			return synced, coldRows, err
 		}
 		if !strings.HasSuffix(obj.Path, ".parquet") {
 			continue
@@ -655,6 +717,14 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 			continue
 		}
 		synced++
+		// As recorded: the sweep needs the tier and the migration stamp.
+		migratedAt := obj.LastModified
+		if migratedAt.IsZero() {
+			migratedAt = time.Now()
+		}
+		file.Tier = TierCold
+		file.MigratedAt = &migratedAt
+		coldRows = append(coldRows, *file)
 	}
 
 	if len(unseen) > 0 {
@@ -677,7 +747,7 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 		Int("synced", synced).
 		Int("unparseable", unparseable).
 		Msg("Cold tier metadata sync completed")
-	return synced, nil
+	return synced, coldRows, nil
 }
 
 // ScanAndRegisterFiles scans the hot tier storage and registers all existing parquet files
