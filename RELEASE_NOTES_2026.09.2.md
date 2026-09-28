@@ -436,6 +436,36 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### The reconciler reported every replicated file as orphan storage on a per-node cluster ([#957](https://github.com/Basekick-Labs/arc/issues/957), [#960](https://github.com/Basekick-Labs/arc/pull/960))
+
+On a per-node-storage cluster the reconciler scoped the manifest to the
+entries this node had originated before comparing it with the node's disk, on
+the assumption that other nodes' files could not be on that disk. With file
+replication on — or a local backend over a shared mount — every node holds
+every file, so each run's dry-run audit reported the replicas of every other
+node as orphan storage: nearly the whole manifest on a writer, all of it on a
+reader. Nothing was deleted, because the storage sweep re-checks each
+candidate against the manifest before it deletes, but that re-check was a
+race guard doing a job it was never meant to do, the audit an operator
+reviews before turning the dry run off was unusable, and each run spent a
+manifest-sized lookup pass rejecting replicas. The same scoping also fed the
+walk, so a measurement only other nodes write, in a database this node had
+any entry in, was never walked on this node and a genuine orphan under it
+was invisible there.
+
+The membership check now uses every manifest entry — a tracked path is never
+an orphan-storage candidate, whatever node originated it — and the origin
+scoping applies only to the orphan-manifest direction, where it belongs: an
+entry another node originated that is missing from this disk is left to file
+replication. Measurements other nodes write are walked too. One wiring fix
+rides along: a node without an explicit `cluster.node_id` passed an empty id
+to the reconciler, which refused it, logged an error at startup and disabled
+the feature; it now uses the id the coordinator generated, the same one it
+stamps into manifest entries. That generated id is host name plus process id,
+so on bare metal it changes at every restart and entries stamped before the
+last restart count as another node's; set `cluster.node_id` explicitly where
+the orphan-manifest direction matters.
+
 ### A replica the manifest had dropped could stay on a node forever ([#958](https://github.com/Basekick-Labs/arc/pull/958))
 
 On a per-node-storage cluster with file replication, every node that applies

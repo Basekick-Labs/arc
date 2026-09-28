@@ -45,8 +45,10 @@ type BackendKind string
 const (
 	// BackendShared: S3, Azure, MinIO — one node sweeps the bucket.
 	BackendShared BackendKind = "shared"
-	// BackendLocal: every node walks its own disks; per-file
-	// OriginNodeID filter scopes the work.
+	// BackendLocal: every node walks its own disk against the FULL
+	// manifest (with file replication every node holds every file); the
+	// per-file OriginNodeID scopes only the orphan-manifest direction to
+	// entries this node originated.
 	BackendLocal BackendKind = "local"
 	// BackendStandalone: no cluster, no Raft. Reconciler runs unconditionally
 	// when enabled; manifest writes are no-ops because there is no manifest.
@@ -109,8 +111,11 @@ type Config struct {
 	// BackendKind drives gating + filtering rules.
 	BackendKind BackendKind
 
-	// LocalNodeID is the local node's cluster ID. Used in BackendLocal
-	// mode to filter orphan-storage candidates to files this node owns.
+	// LocalNodeID is the local node's cluster ID — the coordinator's, the
+	// same value stamped into manifest entries as OriginNodeID. Used in
+	// BackendLocal mode to scope orphan-MANIFEST candidates to entries this
+	// node originated; orphan-storage candidates are never scoped by
+	// origin, because a tracked path is tracked whoever wrote it (#957).
 	LocalNodeID string
 
 	// GraceWindow: orphan storage files younger than this are NEVER deleted.
@@ -537,11 +542,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, dryRun bool) (*Run, error) {
 	}
 	run.ManifestFileCount = len(manifest)
 
-	// In BackendLocal mode the per-node walk is conceptually scoped to
-	// "files this node owns". Reflect that in the manifest set used for
-	// diff so a file owned by node-B (and physically present on node-B's
-	// disk) doesn't show up as orphan-storage on node-A.
-	keys := r.manifestToKeys(fileEntriesToKeys(manifest))
+	// The full manifest, whatever node originated each entry: the walk
+	// derives its prefixes from it and the diff uses it as the membership
+	// set. Per-node storage scoping is applied inside computeDiff, and to
+	// the orphan-manifest direction only (#957) — a filtered set here made
+	// every replica of another node's file look like orphan storage.
+	keys := fileEntriesToKeys(manifest)
 	// Drop the full FileEntry slice now that we've reduced to ObjectKeys.
 	// At MaxManifestSize=200k entries this releases ~40 MB of pinned
 	// FileEntry data (SHA256, SizeBytes, CreatedAt, etc.) for GC during
@@ -563,7 +569,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, dryRun bool) (*Run, error) {
 	}
 
 	graceTotal := r.cfg.GraceWindow + r.cfg.ClockSkewAllowance
-	diff := computeDiff(keys, walkRes.records, time.Now().UTC(), graceTotal)
+	diff := computeDiff(keys, walkRes.records, time.Now().UTC(), graceTotal, r.cfg.LocalNodeID, r.cfg.BackendKind == BackendLocal)
 	run.OrphanManifestCount = len(diff.orphanManifest)
 	run.OrphanStorageCount = len(diff.orphanStorage)
 	run.SkippedGrace = diff.skippedGraceCount
@@ -610,27 +616,6 @@ func fileEntriesToKeys(entries []*raft.FileEntry) []*ObjectKey {
 			Measurement:  e.Measurement,
 			OriginNodeID: e.OriginNodeID,
 		})
-	}
-	return out
-}
-
-// manifestToKeys filters the manifest to files this node is responsible
-// for. In BackendShared and BackendStandalone the local node owns
-// nothing exclusively and the full manifest is returned. In
-// BackendLocal mode it filters to files this node owns — a file owned
-// by another node lives on that node's disk and is invisible to our
-// walk anyway, so leaving it in the manifest set would produce a false
-// orphan-manifest signal. NewReconciler rejects BackendLocal with an
-// empty LocalNodeID, so we don't need to defend against that here.
-func (r *Reconciler) manifestToKeys(manifest []*ObjectKey) []*ObjectKey {
-	if r.cfg.BackendKind != BackendLocal {
-		return manifest
-	}
-	out := make([]*ObjectKey, 0, len(manifest))
-	for _, e := range manifest {
-		if e.OriginNodeID == "" || e.OriginNodeID == r.cfg.LocalNodeID {
-			out = append(out, e)
-		}
 	}
 	return out
 }
