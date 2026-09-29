@@ -26,6 +26,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -35,6 +36,41 @@ import (
 
 	"github.com/rs/zerolog"
 )
+
+// TestS3WriteReaderUnseekableOverHTTP pins that a body the SDK cannot rewind
+// uploads over the plain-HTTP endpoint CI uses: as one PutObject (1 KiB) and
+// as a multipart upload (20 MiB, past one 16 MiB part). The SDK refused the
+// former client-side before a byte was sent; the latter — CRC32 headers on
+// every part and on the completion — had never been observed against a real
+// store. The pattern is positional so a mis-ordered or missing part shows.
+func TestS3WriteReaderUnseekableOverHTTP(t *testing.T) {
+	b := minioBackend(t)
+	ctx := context.Background()
+
+	for _, size := range []int{1024, 20 * 1024 * 1024} {
+		key := fmt.Sprintf("contract-unseekable/x/2024/03/15/%d.parquet", size)
+		data := make([]byte, size)
+		for i := range data {
+			data[i] = byte(i * 7)
+		}
+		pr, pw := io.Pipe()
+		go func() {
+			_, _ = pw.Write(data)
+			_ = pw.Close()
+		}()
+		if err := b.WriteReader(ctx, key, pr, int64(size)); err != nil {
+			t.Fatalf("WriteReader(%d bytes via io.Pipe): %v", size, err)
+		}
+		got, err := b.Read(ctx, key)
+		if err != nil {
+			t.Fatalf("Read(%s): %v", key, err)
+		}
+		if !bytes.Equal(got, data) {
+			t.Fatalf("read back %d bytes for a %d-byte upload, or the content differs", len(got), size)
+		}
+		_ = b.Delete(ctx, key)
+	}
+}
 
 func minioBackend(t *testing.T) *S3Backend {
 	t.Helper()

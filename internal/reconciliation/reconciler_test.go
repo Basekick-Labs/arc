@@ -828,10 +828,10 @@ func TestReconcile_BlastCapStopsManifestSweep(t *testing.T) {
 }
 
 func TestReconcile_LocalModeFiltersForeignOriginFiles(t *testing.T) {
-	// In local-storage mode, files owned by node-B should not appear in
-	// node-A's manifest set after manifestToKeys() — otherwise node-A
-	// would see them as orphan-manifest (storage walk on node-A's disk
-	// won't find them).
+	// In local-storage mode a file node-B originated must not be an
+	// orphan-manifest candidate on node-A: node-A's disk does not hold it
+	// (without replication) or has not pulled it yet (with). The scoping
+	// lives in computeDiff and applies to this direction only (#957).
 	now := time.Now().UTC()
 	coord := newFakeCoordinator(
 		fileEntry("db/m/own.parquet", "node-a"),

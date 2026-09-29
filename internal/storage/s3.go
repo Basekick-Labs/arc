@@ -34,6 +34,12 @@ const (
 	multipartConcurrency = 5
 )
 
+// ErrBodyLength reports a body that ended before, or continued past, the
+// length its caller declared to WriteReader. Nothing is committed: a small
+// body is checked before its PutObject is sent, and a multipart upload is
+// aborted.
+var ErrBodyLength = errors.New("s3: body length does not match the declared size")
+
 // HTTP transport bounds for the AWS SDK client. These cap the per-process
 // idle-connection state — the leak we care about is HTTP/2 frame buffers and
 // keep-alive metadata accumulating across long retention/delete sweeps. We do
@@ -218,8 +224,19 @@ func (b *S3Backend) Write(ctx context.Context, path string, data []byte) error {
 	return b.WriteReader(ctx, path, bytes.NewReader(data), int64(len(data)))
 }
 
-// WriteReader writes data from a reader to S3
-// For files larger than 100MB, uses multipart upload to avoid OOM
+// WriteReader writes data from a reader to S3.
+//
+// A body the SDK can rewind (*os.File, *bytes.Reader) goes as one PutObject
+// under the multipart threshold and through the Uploader above it. A body it
+// cannot rewind — a streaming copy's io.Pipe, an HTTP request body — needs
+// different handling on a plain-HTTP endpoint: the SDK signs the payload and
+// computes a request checksum before sending, both of which re-read the
+// body, and its rewind-free alternative (trailing checksums) exists only over
+// TLS. Such a body is read into memory first: up to one part size it becomes
+// a right-sized buffer behind the same PutObject, beyond that the Uploader
+// buffers 16 MiB parts. A declared size is enforced for an unrewindable body
+// (ErrBodyLength on a mismatch, nothing committed), and the source must end
+// — EOF or error — once the declared bytes have been read.
 func (b *S3Backend) WriteReader(ctx context.Context, path string, reader io.Reader, size int64) error {
 	key, err := b.prefixedKey(path)
 	if err != nil {
@@ -233,10 +250,26 @@ func (b *S3Backend) WriteReader(ctx context.Context, path string, reader io.Read
 		contentType = "application/vnd.apache.parquet"
 	}
 
-	// Use multipart upload for large files or unknown size
-	// This streams data in chunks without loading everything into memory
-	if size <= 0 || size >= multipartThreshold {
+	seekable := isSeekable(reader)
+	switch {
+	case size <= 0 || size >= multipartThreshold:
+		// Large or unknown length: the Uploader streams it in parts.
+		if !seekable && size > 0 {
+			reader = &exactLengthReader{ctx: ctx, r: reader, want: size}
+		}
 		return b.writeMultipart(ctx, path, reader, size, contentType, start)
+	case !seekable && size > multipartPartSize:
+		return b.writeMultipart(ctx, path, &exactLengthReader{ctx: ctx, r: reader, want: size}, size, contentType, start)
+	case !seekable:
+		// The request never leaves the process if the body is wrong, so this
+		// is the caller's error, not a storage error: not counted, and not
+		// logged here — every caller logs (or, for edge sync's dropped link,
+		// deliberately does not).
+		buf, err := spoolExact(ctx, reader, size)
+		if err != nil {
+			return fmt.Errorf("failed to read body for S3 upload: %w", err)
+		}
+		reader = bytes.NewReader(buf)
 	}
 
 	// For small files with known size, use simple PutObject
@@ -271,49 +304,151 @@ func (b *S3Backend) WriteReader(ctx context.Context, path string, reader io.Read
 	return nil
 }
 
-// writeMultipart handles multipart upload for large files
-// This streams data in 16MB chunks without loading the entire file into memory
+// writeMultipart hands the body to the SDK Uploader, which buffers 16 MiB
+// parts into memory and sends them as rewindable requests: one PutObject
+// when the body ends within the first part, a multipart upload otherwise.
+// A failed multipart upload is aborted, but only while ctx is live — a
+// cancelled context leaves parts behind, so a bucket that receives these
+// should carry an AbortIncompleteMultipartUpload lifecycle rule.
 func (b *S3Backend) writeMultipart(ctx context.Context, path string, reader io.Reader, size int64, contentType string, start time.Time) error {
 	key, err := b.prefixedKey(path)
 	if err != nil {
 		return err
 	}
-	_, err = b.uploader.Upload(ctx, &s3.PutObjectInput{
+	out, err := b.uploader.Upload(ctx, &s3.PutObjectInput{
 		Bucket:      aws.String(b.bucket),
 		Key:         aws.String(key),
 		Body:        reader,
 		ContentType: aws.String(contentType),
 	})
 	if err != nil {
-		recordStorageError(ctx, err)
-		b.logger.Error().
-			Err(err).
-			Str("path", path).
-			Int64("size", size).
-			Msg("Failed multipart upload to S3")
-		return fmt.Errorf("failed multipart upload to S3: %w", err)
+		// A length mismatch is the caller's error, counted and logged the
+		// same way as on the spooled path: by the caller. Everything else is
+		// the store's.
+		if !errors.Is(err, ErrBodyLength) {
+			recordStorageError(ctx, err)
+			b.logger.Error().
+				Err(err).
+				Str("path", path).
+				Int64("size", size).
+				Msg("Failed streamed upload to S3")
+		}
+		return fmt.Errorf("failed streamed upload to S3: %w", err)
 	}
 
-	// Record metrics. Multipart is also the path for unknown-size streams
+	// Record metrics. This is also the path for unknown-size streams
 	// (size <= 0), where the byte count is unavailable — count the write but
-	// skip the byte counter rather than subtracting from it. Note: size is
-	// the caller-declared length, not bytes observed on the wire — the
-	// uploader streams to EOF regardless of size, so a stale declared size
-	// drifts the byte counter (all current callers pass stat-derived sizes).
+	// skip the byte counter rather than subtracting from it. For an
+	// unrewindable body size is enforced on the wire (exactLengthReader);
+	// for a rewindable one it is the caller's declared length, which every
+	// such caller derives from a stat.
 	metrics.Get().IncStorageWrites()
 	if size > 0 {
 		metrics.Get().IncStorageWriteBytes(size)
 	}
 
-	b.logger.Info().
+	b.logger.Debug().
 		Str("path", path).
 		Int64("size", size).
 		Str("bucket", b.bucket).
 		Dur("duration", time.Since(start)).
-		Bool("multipart", true).
-		Msg("Wrote to S3 via multipart upload")
+		Bool("multipart", out != nil && out.UploadID != "").
+		Msg("Wrote to S3 via uploader")
 
 	return nil
+}
+
+// isSeekable mirrors the SDK's own test: an io.Seeker whose Seek works. A
+// body that only claims Seek (a FIFO behind an *os.File) would otherwise
+// reach PutObject, where the SDK's own probe fails it with the Seek error
+// before any request goes out, instead of being buffered here.
+func isSeekable(r io.Reader) bool {
+	s, ok := r.(io.Seeker)
+	if !ok {
+		return false
+	}
+	_, err := s.Seek(0, io.SeekCurrent)
+	return err == nil
+}
+
+// spoolExact reads exactly want bytes into memory and confirms the source
+// ends there. The source's own errors pass through unchanged (edge sync
+// matches its errShortBody with errors.Is); a body that ends early or runs
+// long is ErrBodyLength.
+func spoolExact(ctx context.Context, r io.Reader, want int64) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	buf := make([]byte, want)
+	n, err := io.ReadFull(r, buf)
+	if err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, fmt.Errorf("%w: body ended after %d of %d bytes", ErrBodyLength, n, want)
+		}
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := expectEOF(r, want); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+// expectEOF reads one byte past the declared length: the source must end.
+// io.ReadFull so that a spurious (0, nil) — permitted by io.Reader, meaning
+// "nothing happened" — is retried rather than taken for the end.
+func expectEOF(r io.Reader, want int64) error {
+	var probe [1]byte
+	n, err := io.ReadFull(r, probe[:])
+	if n > 0 {
+		return fmt.Errorf("%w: body continues past the declared %d bytes", ErrBodyLength, want)
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	return nil
+}
+
+// exactLengthReader feeds the Uploader an unrewindable body of a declared
+// length: it hands over at most want bytes, fails with ErrBodyLength if the
+// source ends early or continues past want, and honours ctx between reads
+// (the Uploader only checks ctx when it takes a buffer from its pool). The
+// source's own errors pass through unchanged.
+type exactLengthReader struct {
+	ctx  context.Context
+	r    io.Reader
+	want int64
+	n    int64
+}
+
+func (e *exactLengthReader) Read(p []byte) (int, error) {
+	if err := e.ctx.Err(); err != nil {
+		return 0, err
+	}
+	if e.n >= e.want {
+		if err := expectEOF(e.r, e.want); err != nil {
+			return 0, err
+		}
+		return 0, io.EOF
+	}
+	if rem := e.want - e.n; int64(len(p)) > rem {
+		p = p[:rem]
+	}
+	n, err := e.r.Read(p)
+	e.n += int64(n)
+	switch {
+	case err == nil:
+		return n, nil
+	case errors.Is(err, io.EOF):
+		if e.n < e.want {
+			return n, fmt.Errorf("%w: body ended after %d of %d bytes", ErrBodyLength, e.n, e.want)
+		}
+		return n, io.EOF
+	default:
+		return n, err
+	}
 }
 
 // Read reads data from S3

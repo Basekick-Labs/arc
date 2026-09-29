@@ -3692,13 +3692,43 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 		tierPaths, outcome := h.pruner.PruneTierPaths(ctx, src.glob, database, measurement, timeRange, src.backend, src.tier == tiering.TierHot)
 		results = append(results, tierPruneResult{glob: src.glob, paths: tierPaths, outcome: outcome})
 	}
+	// A tier that could not be pruned (no time range, or the cold end-only
+	// fallback) goes to DuckDB as its full glob. If that glob matches
+	// nothing — every file of the measurement has left the tier while its
+	// rows outlived them, as after compaction consumed the raw files and
+	// tiering moved the daily — DuckDB reports "no files" and the whole
+	// read returns nothing, cold data included. Verify such a tier holds a
+	// file at all before keeping it; a listing that cannot be trusted keeps
+	// the tier, as before. A transform that dropped a tier is volatile: the
+	// next flush into that tier must not wait out the cache TTL.
+	kept := results[:0]
+	droppedEmpty := 0
+	for i, r := range results {
+		if r.outcome == pruning.TierPruneFallback {
+			if has, verified := pruning.TierHasFiles(ctx, sources[i].backend, database, measurement); verified && !has {
+				h.logger.Debug().
+					Str("database", database).
+					Str("measurement", measurement).
+					Str("tier", string(sources[i].tier)).
+					Msg("Tier holds no files for this measurement; dropped from the read")
+				droppedEmpty++
+				continue
+			}
+		}
+		kept = append(kept, r)
+	}
+	results = kept
+	if droppedEmpty > 0 {
+		pruning.MarkVolatile(ctx)
+	}
+
 	paths, prunedTiers := combineTierPruneResults(results)
-	if prunedTiers > 0 {
+	if prunedTiers > 0 || droppedEmpty > 0 {
 		h.logger.Info().
 			Str("database", database).
 			Str("measurement", measurement).
 			Int("tiers", len(sources)).
-			Int("pruned_tiers", prunedTiers).
+			Int("pruned_tiers", prunedTiers+droppedEmpty).
 			Int("path_count", len(paths)).
 			Msg("Multi-tier partition pruning applied")
 	}

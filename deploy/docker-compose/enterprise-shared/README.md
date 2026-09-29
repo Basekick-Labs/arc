@@ -113,7 +113,7 @@ Singleton background tasks (retention, continuous queries, deletes) gate on the 
 Three writers in Pattern 2 multi-writer mode buy you **two things at once**:
 
 1. **HA via the LB**: Traefik routes around a crashed writer with no in-cluster ceremony. Even with just 2 writers Pattern 2 would be HA on the ingestion side.
-2. **Raft quorum tolerance** for the cluster-wide state (RBAC, tokens, manifest, shard assignments). Singleton tasks (retention, CQ, delete) all run on the Raft leader, so we want Raft to elect a leader even on one writer failure.
+2. **Raft quorum tolerance** for the cluster-wide state (RBAC, tokens, manifest, shard assignments). Singleton tasks (retention, CQ, delete, tiering migration) all run on the Raft leader, so we want Raft to elect a leader even on one writer failure.
 
 | Writers | Quorum | Can Tolerate (Raft side) |
 |---------|--------|--------------------------|
@@ -124,7 +124,7 @@ Three writers in Pattern 2 multi-writer mode buy you **two things at once**:
 
 With 3 writers, the cluster can survive 1 writer failure on both the ingestion side (LB routes around it) AND the singleton-task side (Raft still has quorum).
 
-`writer.replicas=2` is **not recommended** — ingestion stays HA via the LB but Raft cannot elect a leader on a single failure, so singleton tasks (retention, CQ, delete) pause until quorum is restored.
+`writer.replicas=2` is **not recommended** — ingestion stays HA via the LB but Raft cannot elect a leader on a single failure, so singleton tasks (retention, CQ, delete, tiering migration) pause until quorum is restored.
 
 ### Data Flow: shared storage + Raft state
 

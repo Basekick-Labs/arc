@@ -643,7 +643,7 @@ func (h *ClusterHandler) nodeToMapWithLease(node *cluster.Node, activeCompactorI
 		"role":  node.Role,
 		"state": node.GetState(),
 		// Which writer is the primary is what gates every singleton task
-		// (retention, CQ, delete). It was absent here, so an operator had no
+		// (retention, CQ, delete, tiering migration). It was absent here, so an operator had no
 		// way to see that no node held it — which is how #850 stayed hidden.
 		// Empty for readers, compactors, and for writers in shared-storage
 		// mode, where there is no primary/standby distinction.

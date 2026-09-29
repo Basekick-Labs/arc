@@ -23,7 +23,8 @@
 #   - HA via LB retry: a writer crash is recovered by /ready draining; the
 #     LB stops routing to it within one poll cycle
 #   - HA via Raft: a leader crash triggers election; the new leader picks
-#     up singleton-task ownership (retention/CQ/delete) for the next tick
+#     up singleton-task ownership (retention/CQ/delete/tiering migration)
+#     for the next tick
 #
 # Usage:
 #   export ARC_LICENSE_KEY="ARC-ENT-..."     # dev key, NOT the customer key

@@ -117,4 +117,8 @@ type SchedulerStatus struct {
 	Schedule string     `json:"schedule"`
 	NextRun  *time.Time `json:"next_run,omitempty"`
 	LastRun  *time.Time `json:"last_run,omitempty"`
+	// RoleGated is true when a cluster gate is wired and this node is not
+	// the primary writer: its cycles sync tier metadata but never migrate.
+	// Operators asking "why is this node not migrating" read this field.
+	RoleGated bool `json:"role_gated"`
 }
