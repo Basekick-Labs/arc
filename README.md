@@ -369,7 +369,7 @@ See [arc.toml](./arc.toml) for complete configuration reference.
 
 ### Runtime ingest buffer limits
 
-Arc exposes an admin-only runtime endpoint for the two buffer thresholds that can be changed without restarting the process:
+Arc exposes a runtime endpoint for changing the two buffer thresholds without restarting the process. When authentication is enabled, requests require an administrator token:
 
 ```http
 GET    /api/v1/config/runtime/ingest
@@ -385,6 +385,8 @@ curl -X PATCH -H "Authorization: Bearer $ARC_TOKEN" -H 'Content-Type: applicatio
   -d '{"max_buffer_age_ms":30000}' http://localhost:8000/api/v1/config/runtime/ingest
 curl -X DELETE -H "Authorization: Bearer $ARC_TOKEN" http://localhost:8000/api/v1/config/runtime/ingest
 ```
+
+See the [runtime ingest buffer configuration guide](./docs/runtime-ingest-buffer-config.md) for request and response fields, validation, persistence, precedence, reset behavior, and node scope.
 
 ---
 
