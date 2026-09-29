@@ -11,6 +11,8 @@ Arc can adjust its Arrow ingest buffer thresholds without restarting the process
 
 The settings apply to the current Arc process. Each node reads its own override from the metadata SQLite database at startup. The Arc API does not broadcast changes to cluster peers; `arcli ingest buffer set` coordinates the same change across all healthy nodes after preflighting them.
 
+The size and age thresholds are shared process settings, but each threshold is evaluated independently for every logical ingest buffer, keyed by database and measurement. `max_buffer_size` is therefore a per-buffer threshold, not a process-wide cap: multiple active measurements can collectively hold more records than this value. Shards partition the buffer map to reduce lock contention; they do not create separate configurations. Flush workers consume queued flush tasks and do not own separate ingest buffers or threshold values.
+
 ## Ingest hot path and runtime update cost
 
 The buffer-size threshold is checked once for each buffered Arrow batch, not once for each record. This check already existed before runtime reconfiguration: the original writer compared the accumulated record count with its immutable startup configuration. Runtime reconfiguration changes where that threshold comes from: Arc now loads it from an atomic in-memory value so an API update can take effect without rebuilding the writer.
