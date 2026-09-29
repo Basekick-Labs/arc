@@ -842,7 +842,34 @@ func (p *Puller) statLocal(path string) (int64, error) {
 	}
 	statCtx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
-	return p.cfg.Backend.StatFile(statCtx, path)
+	size, err := p.cfg.Backend.StatFile(statCtx, path)
+	if err != nil || size < 0 {
+		return size, err
+	}
+	// LocalBackend.StatFile falls back to the ".part" staging file when the
+	// final file is absent (the resume path wants that). Presence must not:
+	// a full-size .part left by a crash before the rename would read as
+	// "already here" and never be finalised. Where a staged partial exists,
+	// confirm the final file too; without it the answer is "not here", so the
+	// entry is pulled again.
+	if si, ok := p.cfg.Backend.(interface {
+		StagedSize(ctx context.Context, key string) (int64, error)
+	}); ok {
+		staged, err := si.StagedSize(statCtx, path)
+		if err != nil {
+			return -1, err
+		}
+		if staged >= 0 {
+			exists, err := p.cfg.Backend.Exists(statCtx, path)
+			if err != nil {
+				return -1, err
+			}
+			if !exists {
+				return -1, nil
+			}
+		}
+	}
+	return size, nil
 }
 
 // presentAtSize is the puller's definition of "already here": the stat

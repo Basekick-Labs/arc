@@ -175,6 +175,19 @@ func (f *fakeBackend) StatFile(ctx context.Context, path string) (int64, error) 
 	return -1, nil
 }
 
+// StagedSize mirrors LocalBackend's StagingInspector: the ".part" size, or -1.
+func (f *fakeBackend) StagedSize(ctx context.Context, key string) (int64, error) {
+	if err := checkKey(key); err != nil {
+		return -1, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if data, ok := f.files[key+".part"]; ok {
+		return int64(len(data)), nil
+	}
+	return -1, nil
+}
+
 func (f *fakeBackend) AppendReader(ctx context.Context, path string, reader io.Reader, appendSize int64) error {
 	if err := checkKey(path); err != nil {
 		return err

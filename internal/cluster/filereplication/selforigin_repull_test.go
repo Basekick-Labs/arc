@@ -106,6 +106,60 @@ func TestCatchUpPullsShortSelfOriginFile(t *testing.T) {
 	}
 }
 
+func TestCatchUpPullsFullSizeStagingFile(t *testing.T) {
+	backend := newFakeBackend()
+	const path = "testdb/cpu/2026/04/11/15/staged.parquet"
+	// A crash after the last byte reached the staging file but before the
+	// rename: the staging file is exactly the manifest size, the final file
+	// absent. That is not "present".
+	body := bytes.Repeat([]byte("x"), 100)
+	backend.mu.Lock()
+	backend.files[path+".part"] = body
+	backend.mu.Unlock()
+	fetcher := newFakeFetcher(fakeFetchResult{body: body})
+	p := newRepullPuller(t, backend, fetcher, selfResolver())
+	p.Start(context.Background())
+	defer p.Stop()
+
+	p.RunCatchUp(context.Background(), sliceFetcher([]*raft.FileEntry{makeEntry(path, selfNode, 100)}))
+	stats := waitStats(t, p, func(s map[string]int64) bool { return s["pulled"] == 1 })
+	if stats["pulled"] != 1 || stats["skipped_local"] != 0 {
+		t.Fatalf("a full-size staging file must be re-pulled, not skipped: %+v", stats)
+	}
+	got, err := backend.Read(context.Background(), path)
+	if err != nil || len(got) != 100 {
+		t.Fatalf("final file: err=%v len=%d, want 100", err, len(got))
+	}
+	backend.mu.Lock()
+	_, stale := backend.files[path+".part"]
+	backend.mu.Unlock()
+	if stale {
+		t.Errorf("staging file still present after the pull")
+	}
+}
+
+func TestWorkerPullsFullSizeStagingFile(t *testing.T) {
+	backend := newFakeBackend()
+	const path = "testdb/cpu/2026/04/11/15/peer-staged.parquet"
+	body := bytes.Repeat([]byte("x"), 100)
+	backend.mu.Lock()
+	backend.files[path+".part"] = body
+	backend.mu.Unlock()
+	fetcher := newFakeFetcher(fakeFetchResult{body: body})
+	p := newRepullPuller(t, backend, fetcher, staticResolver{nodeID: "peer-node", addrs: []string{"peer-1:9100"}, ok: true})
+	p.Start(context.Background())
+	defer p.Stop()
+
+	p.Enqueue(makeEntry(path, "peer-node", 100))
+	stats := waitStats(t, p, func(s map[string]int64) bool { return s["pulled"] == 1 || s["skipped_local"] == 1 })
+	if stats["pulled"] != 1 || stats["skipped_local"] != 0 {
+		t.Fatalf("the worker must pull past a full-size staging file: %+v", stats)
+	}
+	if got, err := backend.Read(context.Background(), path); err != nil || len(got) != 100 {
+		t.Fatalf("final file: err=%v len=%d, want 100", err, len(got))
+	}
+}
+
 func TestCatchUpSkipsPresentSelfOriginFile(t *testing.T) {
 	backend := newFakeBackend()
 	const path = "testdb/cpu/2026/04/11/15/present.parquet"
