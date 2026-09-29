@@ -851,6 +851,7 @@ type ArrowBuffer struct {
 	flushTimer    *time.Timer   // self-adjusting: fires when the oldest buffer is due to expire
 	flushDeadline time.Time     // absolute time when flushTimer will fire; updated whenever the timer is (re)set
 	newBufferCh   chan struct{} // signals periodicFlush that a new buffer was created (used for idle→active wake-up)
+	configChangedCh chan struct{} // signals periodicFlush to recalculate after a runtime setting change
 	wg            sync.WaitGroup
 
 	// OPTIMIZATION: Worker pool for bounded flush concurrency
@@ -895,7 +896,9 @@ type ArrowBuffer struct {
 
 	// Flush timeout for storage writes (prevents workers from blocking forever on S3 hangs)
 	flushTimeout time.Duration
-	maxBufferAge time.Duration // pre-calculated from cfg.MaxBufferAgeMS
+	maxBufferAge   atomic.Int64 // duration in nanoseconds; updated by PatchRuntimeConfig
+	maxBufferSize  atomic.Int64 // records; updated by PatchRuntimeConfig
+	runtimeConfigMu sync.Mutex
 
 	// Metrics (using atomic operations to avoid lock contention)
 	totalRecordsBuffered atomic.Int64
@@ -1159,16 +1162,18 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 		flushTimer:           time.NewTimer(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
 		flushDeadline:        time.Now().UTC().Add(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
 		newBufferCh:          make(chan struct{}, 1),
+		configChangedCh:      make(chan struct{}, 1),
 		flushQueue:           make(chan flushTask, queueSize),
 		flushWorkers:         flushWorkers,
 		flushTimeout:         flushTimeout,
-		maxBufferAge:         time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond,
 		sortKeysConfig:       sortKeysConfig,
 		defaultSortKeys:      defaultSortKeys,
 		decimalConfig:        decimalConfig,
 		defaultDecimalConfig: defaultDecimalConfig,
 		logger:               logger.With().Str("component", "arrow-buffer").Logger(),
 	}
+	buffer.maxBufferAge.Store(int64(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond))
+	buffer.maxBufferSize.Store(int64(cfg.MaxBufferSize))
 
 	// Initialize shards
 	for i := 0; i < shardCount; i++ {
@@ -1893,7 +1898,7 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 	totalBuffered := shard.bufferRecordCounts[bufferKey]
 
 	// Check if buffer needs flush (size-based)
-	if totalBuffered >= b.config.MaxBufferSize {
+	if int64(totalBuffered) >= b.maxBufferSize.Load() {
 		// Extract records to flush (hold lock for microseconds only)
 		recordsToFlush = make([]interface{}, len(shard.buffers[bufferKey]))
 		copy(recordsToFlush, shard.buffers[bufferKey])
@@ -2039,7 +2044,7 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 	totalBuffered := shard.bufferRecordCounts[bufferKey]
 
 	// Check if buffer needs flush (size-based)
-	if totalBuffered >= b.config.MaxBufferSize {
+	if int64(totalBuffered) >= b.maxBufferSize.Load() {
 		recordsToFlush = make([]interface{}, len(shard.buffers[bufferKey]))
 		copy(recordsToFlush, shard.buffers[bufferKey])
 
@@ -2526,6 +2531,49 @@ func (b *ArrowBuffer) metricsSampler() {
 	}
 }
 
+// RuntimeConfig returns the buffer thresholds currently used by the live
+// writer. These values are process-local and do not modify arc.toml.
+func (b *ArrowBuffer) RuntimeConfig() (maxBufferSize int, maxBufferAgeMS int) {
+	b.runtimeConfigMu.Lock()
+	defer b.runtimeConfigMu.Unlock()
+	return int(b.maxBufferSize.Load()), int(time.Duration(b.maxBufferAge.Load()) / time.Millisecond)
+}
+
+// PatchRuntimeConfig updates the size and age thresholds without rebuilding the
+// writer or its worker pool. A buffered batch that already exceeds the new
+// size is flushed on its next write; reducing the age threshold wakes the
+// periodic flusher so already-aged batches are flushed promptly.
+func (b *ArrowBuffer) PatchRuntimeConfig(maxBufferSize, maxBufferAgeMS *int) error {
+	b.runtimeConfigMu.Lock()
+	defer b.runtimeConfigMu.Unlock()
+	size := int(b.maxBufferSize.Load())
+	ageMS := int(time.Duration(b.maxBufferAge.Load()) / time.Millisecond)
+	if maxBufferSize != nil {
+		size = *maxBufferSize
+	}
+	if maxBufferAgeMS != nil {
+		ageMS = *maxBufferAgeMS
+	}
+	if size <= 0 {
+		return fmt.Errorf("max_buffer_size must be greater than zero")
+	}
+	if ageMS <= 0 {
+		return fmt.Errorf("max_buffer_age_ms must be greater than zero")
+	}
+	maxInt64 := int64(^uint64(0) >> 1)
+	if int64(ageMS) > maxInt64/int64(time.Millisecond) {
+		return fmt.Errorf("max_buffer_age_ms is too large")
+	}
+
+	b.maxBufferSize.Store(int64(size))
+	b.maxBufferAge.Store(int64(time.Duration(ageMS) * time.Millisecond))
+	select {
+	case b.configChangedCh <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
 func (b *ArrowBuffer) periodicFlush() {
 	defer b.wg.Done()
 
@@ -2553,6 +2601,19 @@ func (b *ArrowBuffer) periodicFlush() {
 				b.flushTimer.Reset(time.Until(nextDeadline))
 			}
 
+		case <-b.configChangedCh:
+			// Runtime age changes can move the next deadline in either
+			// direction. Recompute it unconditionally so both shortening and
+			// extending the configured age take effect immediately.
+			if !b.flushTimer.Stop() {
+				select {
+				case <-b.flushTimer.C:
+				default:
+				}
+			}
+			b.flushDeadline = b.computeNextFlushDeadline()
+			b.flushTimer.Reset(time.Until(b.flushDeadline))
+
 		case <-b.flushTimer.C:
 			b.flushAgedBuffers()
 			// Rearm the timer for the next oldest buffer expiry.
@@ -2569,7 +2630,7 @@ func (b *ArrowBuffer) periodicFlush() {
 // the call site.
 func (b *ArrowBuffer) computeNextFlushDeadline() time.Time {
 	now := time.Now().UTC()
-	maxAge := b.maxBufferAge
+	maxAge := time.Duration(b.maxBufferAge.Load())
 	earliest := now.Add(maxAge) // default when no buffers exist
 
 	for _, shard := range b.shards {
@@ -2592,7 +2653,7 @@ func (b *ArrowBuffer) computeNextFlushDeadline() time.Time {
 // flushAgedBuffers flushes buffers that have exceeded max age
 func (b *ArrowBuffer) flushAgedBuffers() {
 	now := time.Now().UTC()
-	maxAge := b.maxBufferAge
+	maxAge := time.Duration(b.maxBufferAge.Load())
 
 	threshold := maxAge
 

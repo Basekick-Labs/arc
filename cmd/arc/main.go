@@ -2226,6 +2226,11 @@ func main() {
 	}
 	msgpackHandler.RegisterRoutes(server.GetApp())
 
+	// Runtime-only ingest buffer thresholds. This admin API updates the live
+	// Arrow buffer; arc.toml remains the source for the next process start.
+	runtimeIngestConfigHandler := api.NewRuntimeIngestConfigHandler(arrowBuffer, authManager, logger.Get("runtime-ingest-config"))
+	runtimeIngestConfigHandler.RegisterRoutes(server.GetApp())
+
 	// Register Line Protocol handler
 	lineProtocolHandler := api.NewLineProtocolHandler(arrowBuffer, logger.Get("lineprotocol"))
 	if authManager != nil && rbacManager != nil {
