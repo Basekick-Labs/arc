@@ -87,6 +87,18 @@ When `persistent:false` is used with changed thresholds, Arc removes any saved r
 
 `DELETE` removes the override row rather than storing a copy of the startup values. This lets later startup configuration changes take effect after the reset.
 
+## Observability delay
+
+`GET /api/v1/config/runtime/ingest` and `arcli ingest buffer show` return the current process values immediately. They do not trigger a telemetry scrape, a write, or a Grafana refresh. A dashboard built from stored telemetry can therefore show the previous sample for a short time after a successful `PATCH`.
+
+For example, the Arc Wikimedia lab samples this API every `TELEMETRY_SECONDS` (10 seconds by default), writes the sample to `sse_ingestion_telemetry`, and refreshes its buffer dashboard every 15 seconds. Arc makes that telemetry row queryable after the row's own buffer flushes: when the buffer reaches `max_buffer_size` or `max_buffer_age_ms`, whichever happens first. A useful nominal delay estimate is:
+
+```text
+telemetry sampling interval + Arc buffer age threshold + Grafana refresh interval
+```
+
+With the lab's default 30,000 ms buffer age, that is about 55 seconds; with a 5,000 ms age, about 30 seconds. These are estimates, not a delivery guarantee; queueing, write errors, and query time add delay. The collector's `FLUSH_SECONDS` controls source-data batches and is separate from the telemetry sampling loop.
+
 ## Implementation and verification
 
 - `internal/api/runtime_ingest_config.go` implements the HTTP handlers and serializes reads and mutations.
