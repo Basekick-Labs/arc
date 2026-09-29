@@ -2,6 +2,16 @@
 
 > **Status:** Planned — October 2026 patch release.
 
+## New: persistent runtime ingest buffer configuration
+
+Arc can update `max_buffer_size` and `max_buffer_age_ms` without restarting. An administrator can persist the effective pair in Arc's metadata SQLite database; Arc loads that override before constructing the ingest buffer, ahead of the normal startup configuration. Runtime-only changes remain available with `persistent:false`.
+
+The size threshold was already checked once per buffered Arrow batch before this feature. Runtime updates replace the immutable startup-field read with one atomic in-memory load per batch; they do not add a configuration or SQLite read to the ingest write path. The age threshold remains managed by the background flusher. In a cluster, direct API calls affect one node; the companion `arcli ingest buffer set` command coordinates the update across healthy nodes, each using its own SQLite database.
+
+The API and CLI guides describe persistence precedence, restart behavior, cluster fan-out and best-effort rollback, and the delay between a runtime change and telemetry/Grafana visibility.
+
+Contributed by [@jallegri](https://github.com/jallegri) in [#PR](https://github.com/Basekick-Labs/arc/pull/PR).
+
 ## New: administrative cluster file deletion (`DELETE /api/v1/cluster/files`) ([#830](https://github.com/Basekick-Labs/arc/pull/830))
 
 A new administrative endpoint `DELETE /api/v1/cluster/files?path=...&confirm=true` allows cluster operators to remove an entry from the cluster-wide Raft manifest.

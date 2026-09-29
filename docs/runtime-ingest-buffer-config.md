@@ -1,6 +1,6 @@
 # Runtime ingest buffer configuration
 
-Arc can adjust its Arrow ingest buffer thresholds without restarting the process. The runtime API applies the new values immediately and stores them in Arc's metadata SQLite database so they are restored after a restart.
+Arc can adjust its Arrow ingest buffer thresholds without restarting the process. The runtime API applies new values immediately and can store them in Arc's metadata SQLite database so they are restored after a restart.
 
 ## Settings and scope
 
@@ -10,6 +10,16 @@ Arc can adjust its Arrow ingest buffer thresholds without restarting the process
 | `max_buffer_age_ms` | integer | milliseconds | Greater than zero and representable as a Go duration |
 
 The settings apply to the current Arc process. Each node reads its own override from the metadata SQLite database at startup. The Arc API does not broadcast changes to cluster peers; `arcli ingest buffer set` coordinates the same change across all healthy nodes after preflighting them.
+
+## Ingest hot path and runtime update cost
+
+The buffer-size threshold is checked once for each buffered Arrow batch, not once for each record. This check already existed before runtime reconfiguration: the original writer compared the accumulated record count with its immutable startup configuration. Runtime reconfiguration changes where that threshold comes from: Arc now loads it from an atomic in-memory value so an API update can take effect without rebuilding the writer.
+
+The write path does not read environment variables, `arc.toml`, SQLite, or the runtime API to obtain the threshold. The persistent override is loaded from SQLite once during startup. When `persistent:true` is requested, SQLite is written on the administrative configuration path, not on ingest writes. The runtime check adds one atomic load per buffered batch in place of the prior ordinary field read; no benchmark is claimed here, so its workload-specific cost has not been quantified.
+
+The age threshold is handled by Arc's background flusher. It is not polled for every record or batch. Updating the age signals that flusher to recompute its timer and flush deadlines; normal age-based scans happen in that background path.
+
+In a cluster, a direct API request still changes only the addressed process. `arcli` preflights the cluster and sends the same update to each healthy node, where it is persisted in that node's own metadata SQLite database. This is coordinated fan-out, not Raft replication or a distributed transaction. If an update fails partway through, `arcli` attempts best-effort rollback on nodes that may have changed; a rollback can also fail and must be treated as a partial cluster update.
 
 ## API
 
