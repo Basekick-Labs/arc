@@ -3935,18 +3935,22 @@ func (c *Coordinator) startFilePullerLocked() error {
 
 	raftNode := c.raftNode // set once in NewCoordinator; the gate at Start guarantees non-nil here
 	pullerCfg := filereplication.Config{
-		SelfNodeID:             c.localNode.ID,
-		Backend:                c.storage,
-		Fetcher:                fetchClient,
-		PeerResolver:           resolver,
-		Workers:                c.cfg.ReplicationPullWorkers,
-		QueueSize:              c.cfg.ReplicationQueueSize,
-		RetryMaxAttempts:       c.cfg.ReplicationRetryMaxAttempts,
-		FetchTimeout:           fetchTimeout,
-		RetryInitialBackoff:    500 * time.Millisecond,
-		CatchUpQueueHighWater:  c.cfg.ReplicationCatchUpQueueHighWater,
-		ReconciliationInterval: time.Duration(c.cfg.ReplicationReconciliationIntervalSeconds) * time.Second,
-		ReconciliationGate:     c.canRunFileReconciliation,
+		SelfNodeID: c.localNode.ID,
+		// Per-node storage only: a node restored with an empty data disk must
+		// pull back the files it originated (#959). On a shared bucket a
+		// missing own object is not on any peer either.
+		RepullMissingSelfOrigin: c.storage.Type() == "local",
+		Backend:                 c.storage,
+		Fetcher:                 fetchClient,
+		PeerResolver:            resolver,
+		Workers:                 c.cfg.ReplicationPullWorkers,
+		QueueSize:               c.cfg.ReplicationQueueSize,
+		RetryMaxAttempts:        c.cfg.ReplicationRetryMaxAttempts,
+		FetchTimeout:            fetchTimeout,
+		RetryInitialBackoff:     500 * time.Millisecond,
+		CatchUpQueueHighWater:   c.cfg.ReplicationCatchUpQueueHighWater,
+		ReconciliationInterval:  time.Duration(c.cfg.ReplicationReconciliationIntervalSeconds) * time.Second,
+		ReconciliationGate:      c.canRunFileReconciliation,
 		// Lets the puller stop pulling, and stop counting against the query
 		// gate, an entry that left the manifest while its pull was queued or
 		// in flight (#759, #795). Read lock on the FSM; the FSM never holds

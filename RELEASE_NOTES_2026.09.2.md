@@ -436,6 +436,47 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### A node restored with an empty data disk never got its own files back, and reconciliation could then delete them everywhere ([#959](https://github.com/Basekick-Labs/arc/issues/959), [#961](https://github.com/Basekick-Labs/arc/pull/961))
+
+On a per-node-storage cluster with file replication, the file puller assumed
+a node still holds every file it once wrote and never pulled a file whose
+origin was the node itself. A node that came back with an empty data disk
+under a stable `cluster.node_id` — the StatefulSet shape — pulled every other
+node's files back and none of its own, and its reads of those partitions
+returned fewer rows with no error, for good. If reconciliation then ran on
+that node in act mode, the orphan-manifest sweep found each of those entries
+missing locally and proposed its deletion, which every other node carried out
+on its replica; in the default dry run the report simply listed the node's
+own files as orphans.
+
+On per-node storage the walks now let the disk decide: at startup and on
+every periodic pass a file this node originated is checked at the manifest's
+size, skipped when present as before, and otherwise pulled from a peer that
+holds a replica, with the same catch-up accounting as any other file, so the
+query gate, when enabled, stays closed until it is back. A reactive register
+of an own file — the node just wrote it — is still never pulled, and on a
+shared bucket nothing changes, since a missing own object there is not on any
+peer either. The reconciler's orphan-manifest sweep on such a cluster now
+waits until file replication has converged on the node before it proposes
+anything; a held sweep is reported as `manifest_sweep_held` in the run, the
+storage half still runs, and the orphan-manifest counts are still reported.
+
+Two things to know. A file this node originated that no peer holds any more
+keeps the node's catch-up from converging, so its manifest sweep stays held —
+for all of that node's own orphans. To clear it, first confirm from a dry run
+that the node's remaining own orphans are only files no peer holds (the
+puller's log names each failed pull; a replica holder that is merely down
+heals on the next periodic pass); then restart with
+`cluster.replication_catchup_enabled=false`, run one act-mode reconciliation —
+with the walker off the sweep is not held, and it deletes every own-origin
+entry still missing on this node — and restart again with the walker
+re-enabled, after which catch-up no longer sees the entry and converges. And
+with the walker disabled in the first place neither the re-pull nor the hold
+applies (with reconciliation enabled, Arc says so at startup): keep
+reconciliation in dry run after a restore on such a cluster. If the startup
+manifest barrier times out, own files replayed by Raft after that point are
+recovered by the next periodic pass rather than the catch-up batch.
+
 ### The reconciler reported every replicated file as orphan storage on a per-node cluster ([#957](https://github.com/Basekick-Labs/arc/issues/957), [#960](https://github.com/Basekick-Labs/arc/pull/960))
 
 On a per-node-storage cluster the reconciler scoped the manifest to the
