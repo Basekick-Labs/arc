@@ -436,7 +436,7 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
-### A node restored with an empty data disk never got its own files back, and reconciliation could then delete them everywhere ([#959](https://github.com/Basekick-Labs/arc/issues/959))
+### A node restored with an empty data disk never got its own files back, and reconciliation could then delete them everywhere ([#959](https://github.com/Basekick-Labs/arc/issues/959), [#961](https://github.com/Basekick-Labs/arc/pull/961))
 
 On a per-node-storage cluster with file replication, the file puller assumed
 a node still holds every file it once wrote and never pulled a file whose
