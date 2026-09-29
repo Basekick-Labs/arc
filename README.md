@@ -367,6 +367,25 @@ export ARC_AUTH_ENABLED=true
 
 See [arc.toml](./arc.toml) for complete configuration reference.
 
+### Runtime ingest buffer limits
+
+Arc exposes an admin-only runtime endpoint for the two buffer thresholds that can be changed without restarting the process:
+
+```http
+GET    /api/v1/config/runtime/ingest
+PATCH  /api/v1/config/runtime/ingest
+DELETE /api/v1/config/runtime/ingest
+```
+
+`PATCH` accepts either or both positive integer fields. Updates are applied to the current process and saved in Arc's metadata SQLite database (`auth.db_path`, `./data/arc.db` by default). A saved override takes precedence over `arc.toml` and `ARC_INGEST_*` values after restart. `DELETE` removes the saved override and restores the configuration Arc loaded at startup. `GET` returns the effective values and whether they come from a persistent override or startup configuration. In a cluster, this setting is process-local and must be applied to each node.
+
+```bash
+curl -H "Authorization: Bearer $ARC_TOKEN" http://localhost:8000/api/v1/config/runtime/ingest
+curl -X PATCH -H "Authorization: Bearer $ARC_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"max_buffer_age_ms":30000}' http://localhost:8000/api/v1/config/runtime/ingest
+curl -X DELETE -H "Authorization: Bearer $ARC_TOKEN" http://localhost:8000/api/v1/config/runtime/ingest
+```
+
 ---
 
 ## Project Structure

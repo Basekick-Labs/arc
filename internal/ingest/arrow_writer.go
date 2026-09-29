@@ -846,13 +846,13 @@ type ArrowBuffer struct {
 	shardCount uint32
 
 	// Background flush
-	ctx           context.Context
-	cancel        context.CancelFunc
-	flushTimer    *time.Timer   // self-adjusting: fires when the oldest buffer is due to expire
-	flushDeadline time.Time     // absolute time when flushTimer will fire; updated whenever the timer is (re)set
-	newBufferCh   chan struct{} // signals periodicFlush that a new buffer was created (used for idle→active wake-up)
+	ctx             context.Context
+	cancel          context.CancelFunc
+	flushTimer      *time.Timer   // self-adjusting: fires when the oldest buffer is due to expire
+	flushDeadline   time.Time     // absolute time when flushTimer will fire; updated whenever the timer is (re)set
+	newBufferCh     chan struct{} // signals periodicFlush that a new buffer was created (used for idle→active wake-up)
 	configChangedCh chan struct{} // signals periodicFlush to recalculate after a runtime setting change
-	wg            sync.WaitGroup
+	wg              sync.WaitGroup
 
 	// OPTIMIZATION: Worker pool for bounded flush concurrency
 	// Prevents goroutine explosion under sustained load
@@ -895,9 +895,9 @@ type ArrowBuffer struct {
 	defaultDecimalConfig map[string]config.DecimalSpec            // default decimal columns
 
 	// Flush timeout for storage writes (prevents workers from blocking forever on S3 hangs)
-	flushTimeout time.Duration
-	maxBufferAge   atomic.Int64 // duration in nanoseconds; updated by PatchRuntimeConfig
-	maxBufferSize  atomic.Int64 // records; updated by PatchRuntimeConfig
+	flushTimeout    time.Duration
+	maxBufferAge    atomic.Int64 // duration in nanoseconds; updated by PatchRuntimeConfig
+	maxBufferSize   atomic.Int64 // records; updated by PatchRuntimeConfig
 	runtimeConfigMu sync.Mutex
 
 	// Metrics (using atomic operations to avoid lock contention)
@@ -2554,15 +2554,8 @@ func (b *ArrowBuffer) PatchRuntimeConfig(maxBufferSize, maxBufferAgeMS *int) err
 	if maxBufferAgeMS != nil {
 		ageMS = *maxBufferAgeMS
 	}
-	if size <= 0 {
-		return fmt.Errorf("max_buffer_size must be greater than zero")
-	}
-	if ageMS <= 0 {
-		return fmt.Errorf("max_buffer_age_ms must be greater than zero")
-	}
-	maxInt64 := int64(^uint64(0) >> 1)
-	if int64(ageMS) > maxInt64/int64(time.Millisecond) {
-		return fmt.Errorf("max_buffer_age_ms is too large")
+	if err := validateRuntimeIngestConfig(RuntimeIngestConfig{MaxBufferSize: size, MaxBufferAgeMS: ageMS}); err != nil {
+		return err
 	}
 
 	b.maxBufferSize.Store(int64(size))

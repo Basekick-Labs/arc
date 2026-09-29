@@ -844,6 +844,26 @@ func main() {
 		log.Info().Msg("WAL is DISABLED - data durability relies on immediate Parquet flushes")
 	}
 
+	// A persisted runtime override takes precedence over the startup settings
+	// from arc.toml/environment. It is read before the Arrow writer is created
+	// so the buffer starts with the same values the API last saved.
+	runtimeIngestStartupConfig := ingest.RuntimeIngestConfig{
+		MaxBufferSize:  cfg.Ingest.MaxBufferSize,
+		MaxBufferAgeMS: cfg.Ingest.MaxBufferAgeMS,
+	}
+	persistedRuntimeIngestConfig, hasRuntimeIngestOverride, err := loadPersistentRuntimeIngestConfig(cfg.Auth.DBPath)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to load persisted runtime ingest configuration")
+	}
+	if hasRuntimeIngestOverride {
+		cfg.Ingest.MaxBufferSize = persistedRuntimeIngestConfig.MaxBufferSize
+		cfg.Ingest.MaxBufferAgeMS = persistedRuntimeIngestConfig.MaxBufferAgeMS
+		log.Info().
+			Int("max_buffer_size", cfg.Ingest.MaxBufferSize).
+			Int("max_buffer_age_ms", cfg.Ingest.MaxBufferAgeMS).
+			Msg("Loaded persisted runtime ingest buffer settings")
+	}
+
 	// Initialize Arrow buffer (optionally with WAL)
 	log.Info().
 		Int("flush_workers", cfg.Ingest.FlushWorkers).
@@ -2226,9 +2246,32 @@ func main() {
 	}
 	msgpackHandler.RegisterRoutes(server.GetApp())
 
-	// Runtime-only ingest buffer thresholds. This admin API updates the live
-	// Arrow buffer; arc.toml remains the source for the next process start.
-	runtimeIngestConfigHandler := api.NewRuntimeIngestConfigHandler(arrowBuffer, authManager, logger.Get("runtime-ingest-config"))
+	// Runtime ingest settings are stored in the shared Arc metadata SQLite DB.
+	// Borrow the auth manager's connection when authentication is enabled;
+	// otherwise own and close the dedicated handle during shutdown.
+	runtimeIngestConfigDB, ownsRuntimeIngestConfigDB, err := sharedSQLiteHandle(authManager, cfg.Auth.DBPath)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to open runtime ingest configuration database")
+	}
+	runtimeIngestConfigStore, err := ingest.NewRuntimeIngestConfigStore(runtimeIngestConfigDB)
+	if err != nil {
+		if ownsRuntimeIngestConfigDB {
+			_ = runtimeIngestConfigDB.Close()
+		}
+		log.Fatal().Err(err).Msg("Failed to initialize runtime ingest configuration store")
+	}
+	if ownsRuntimeIngestConfigDB {
+		shutdownCoordinator.RegisterHook("runtime-ingest-config-db", func(context.Context) error {
+			return runtimeIngestConfigDB.Close()
+		}, shutdown.PriorityDatabase)
+	}
+	runtimeIngestConfigHandler := api.NewRuntimeIngestConfigHandler(
+		arrowBuffer,
+		runtimeIngestConfigStore,
+		runtimeIngestStartupConfig,
+		authManager,
+		logger.Get("runtime-ingest-config"),
+	)
 	runtimeIngestConfigHandler.RegisterRoutes(server.GetApp())
 
 	// Register Line Protocol handler
@@ -3991,6 +4034,21 @@ func main() {
 // enabled independently, so a feature can be on while auth is off. In that case
 // the caller gets its own handle and owns it — the returned bool reports
 // ownership, and only an owner may Close.
+func loadPersistentRuntimeIngestConfig(dbPath string) (ingest.RuntimeIngestConfig, bool, error) {
+	db, owned, err := sharedSQLiteHandle(nil, dbPath)
+	if err != nil {
+		return ingest.RuntimeIngestConfig{}, false, err
+	}
+	if owned {
+		defer db.Close()
+	}
+	store, err := ingest.NewRuntimeIngestConfigStore(db)
+	if err != nil {
+		return ingest.RuntimeIngestConfig{}, false, err
+	}
+	return store.Load()
+}
+
 func sharedSQLiteHandle(authManager *auth.AuthManager, dbPath string) (db *sql.DB, owned bool, err error) {
 	if authManager != nil {
 		return authManager.GetDB(), false, nil

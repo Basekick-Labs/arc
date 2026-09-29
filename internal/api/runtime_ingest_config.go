@@ -1,7 +1,11 @@
 package api
 
 import (
+	"fmt"
+	"sync"
+
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
@@ -16,14 +20,19 @@ type IngestRuntimeConfig interface {
 // RuntimeIngestConfigHandler serves process-local ingest buffer settings.
 type RuntimeIngestConfigHandler struct {
 	buffer      IngestRuntimeConfig
+	store       *ingest.RuntimeIngestConfigStore
+	startup     ingest.RuntimeIngestConfig
 	authManager *auth.AuthManager
 	logger      zerolog.Logger
+	mutationMu  sync.Mutex
 }
 
 // NewRuntimeIngestConfigHandler creates the runtime ingest configuration API.
-func NewRuntimeIngestConfigHandler(buffer IngestRuntimeConfig, authManager *auth.AuthManager, logger zerolog.Logger) *RuntimeIngestConfigHandler {
+func NewRuntimeIngestConfigHandler(buffer IngestRuntimeConfig, store *ingest.RuntimeIngestConfigStore, startup ingest.RuntimeIngestConfig, authManager *auth.AuthManager, logger zerolog.Logger) *RuntimeIngestConfigHandler {
 	return &RuntimeIngestConfigHandler{
 		buffer:      buffer,
+		store:       store,
+		startup:     startup,
 		authManager: authManager,
 		logger:      logger.With().Str("component", "runtime-ingest-config").Logger(),
 	}
@@ -35,27 +44,44 @@ func (h *RuntimeIngestConfigHandler) RegisterRoutes(app *fiber.App) {
 	if h.authManager != nil {
 		app.Get(path, auth.RequireAdmin(h.authManager), h.handleGet)
 		app.Patch(path, auth.RequireAdmin(h.authManager), h.handlePatch)
+		app.Delete(path, auth.RequireAdmin(h.authManager), h.handleDelete)
 		return
 	}
 	app.Get(path, h.handleGet)
 	app.Patch(path, h.handlePatch)
+	app.Delete(path, h.handleDelete)
 }
 
 type runtimeIngestConfigResponse struct {
 	MaxBufferSize  int    `json:"max_buffer_size"`
 	MaxBufferAgeMS int    `json:"max_buffer_age_ms"`
 	Scope          string `json:"scope"`
+	Persistent     bool   `json:"persistent"`
+	Source         string `json:"source"`
 }
 
 func (h *RuntimeIngestConfigHandler) handleGet(c *fiber.Ctx) error {
-	if h.buffer == nil {
-		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "ingest buffer is unavailable"})
+	h.mutationMu.Lock()
+	defer h.mutationMu.Unlock()
+	if h.buffer == nil || h.store == nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "runtime ingest configuration is unavailable"})
 	}
 	maxSize, maxAge := h.buffer.RuntimeConfig()
+	_, persistent, err := h.store.Load()
+	if err != nil {
+		h.logger.Error().Err(err).Msg("Could not read persisted runtime ingest configuration")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not read runtime ingest configuration"})
+	}
+	source := "startup_config"
+	if persistent {
+		source = "persistent_override"
+	}
 	return c.JSON(runtimeIngestConfigResponse{
 		MaxBufferSize:  maxSize,
 		MaxBufferAgeMS: maxAge,
 		Scope:          "current_process",
+		Persistent:     persistent,
+		Source:         source,
 	})
 }
 
@@ -65,8 +91,10 @@ type runtimeIngestConfigPatch struct {
 }
 
 func (h *RuntimeIngestConfigHandler) handlePatch(c *fiber.Ctx) error {
-	if h.buffer == nil {
-		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "ingest buffer is unavailable"})
+	h.mutationMu.Lock()
+	defer h.mutationMu.Unlock()
+	if h.buffer == nil || h.store == nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "runtime ingest configuration is unavailable"})
 	}
 	var patch runtimeIngestConfigPatch
 	if err := c.BodyParser(&patch); err != nil {
@@ -76,8 +104,21 @@ func (h *RuntimeIngestConfigHandler) handlePatch(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "provide max_buffer_size and/or max_buffer_age_ms"})
 	}
 
-	if err := h.buffer.PatchRuntimeConfig(patch.MaxBufferSize, patch.MaxBufferAgeMS); err != nil {
+	oldSize, oldAge := h.buffer.RuntimeConfig()
+	size, age := oldSize, oldAge
+	if patch.MaxBufferSize != nil {
+		size = *patch.MaxBufferSize
+	}
+	if patch.MaxBufferAgeMS != nil {
+		age = *patch.MaxBufferAgeMS
+	}
+	if err := h.buffer.PatchRuntimeConfig(&size, &age); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+	if err := h.store.Save(ingest.RuntimeIngestConfig{MaxBufferSize: size, MaxBufferAgeMS: age}); err != nil {
+		rollbackErr := h.buffer.PatchRuntimeConfig(&oldSize, &oldAge)
+		h.logger.Error().Err(err).Interface("rollback_error", rollbackErr).Msg("Could not persist runtime ingest settings; reverted live settings")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not persist runtime ingest configuration"})
 	}
 	maxSize, maxAge := h.buffer.RuntimeConfig()
 
@@ -86,5 +127,32 @@ func (h *RuntimeIngestConfigHandler) handlePatch(c *fiber.Ctx) error {
 		MaxBufferSize:  maxSize,
 		MaxBufferAgeMS: maxAge,
 		Scope:          "current_process",
+		Persistent:     true,
+		Source:         "persistent_override",
+	})
+}
+
+func (h *RuntimeIngestConfigHandler) handleDelete(c *fiber.Ctx) error {
+	h.mutationMu.Lock()
+	defer h.mutationMu.Unlock()
+	if h.buffer == nil || h.store == nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "runtime ingest configuration is unavailable"})
+	}
+	oldSize, oldAge := h.buffer.RuntimeConfig()
+	if err := h.buffer.PatchRuntimeConfig(&h.startup.MaxBufferSize, &h.startup.MaxBufferAgeMS); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": fmt.Sprintf("could not restore startup ingest configuration: %v", err)})
+	}
+	if err := h.store.Delete(); err != nil {
+		rollbackErr := h.buffer.PatchRuntimeConfig(&oldSize, &oldAge)
+		h.logger.Error().Err(err).Interface("rollback_error", rollbackErr).Msg("Could not clear persisted runtime ingest settings; restored live settings")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not clear persisted runtime ingest configuration"})
+	}
+	h.logger.Info().Int("max_buffer_size", h.startup.MaxBufferSize).Int("max_buffer_age_ms", h.startup.MaxBufferAgeMS).Msg("Restored startup ingest buffer settings")
+	return c.JSON(runtimeIngestConfigResponse{
+		MaxBufferSize:  h.startup.MaxBufferSize,
+		MaxBufferAgeMS: h.startup.MaxBufferAgeMS,
+		Scope:          "current_process",
+		Persistent:     false,
+		Source:         "startup_config",
 	})
 }
