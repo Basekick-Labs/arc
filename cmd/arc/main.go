@@ -3513,7 +3513,10 @@ func main() {
 	// enabled, runs on cron with conservative grace window + blast cap.
 	var reconciliationScheduler *reconciliation.Scheduler
 	if cfg.Reconciliation.Enabled && clusterCoordinator != nil {
-		gate := newReconciliationClusterGate(clusterCoordinator, cfg.Storage.Backend)
+		gate := newReconciliationClusterGate(clusterCoordinator, cfg.Storage.Backend, cfg.Cluster.ReplicationEnabled, cfg.Cluster.ReplicationCatchUpEnabled)
+		if !isSharedBackend(cfg.Storage.Backend) && cfg.Cluster.ReplicationEnabled && !cfg.Cluster.ReplicationCatchUpEnabled {
+			log.Warn().Msg("cluster.replication_catchup_enabled=false: the reconciler's orphan-manifest sweep is not held until file replication has converged on this node, and a node restored with an empty data disk does not pull back the files it originated. Keep reconciliation in dry run after such a restore, or re-enable the catch-up walker.")
+		}
 		recCfg := reconciliation.Config{
 			Enabled:     true,
 			BackendKind: reconciliationBackendKind(cfg.Storage.Backend),
@@ -4345,20 +4348,40 @@ func (g icebergWriterGate) CanRun() bool { return g.inner.CanCompact() }
 //   - Local storage: every node walks its own disk against the full
 //     manifest; inside the reconciler the per-file OriginNodeID scopes
 //     only the orphan-manifest direction to entries this node originated.
-//     BatchFileOpsInManifest leader-forwards on its own, so the
-//     manifest-sweep gate is also "always".
+//     BatchFileOpsInManifest leader-forwards on its own, so the storage
+//     scan is always allowed; the manifest sweep is held until file
+//     replication has converged on this node (#959): a node restored with
+//     an empty data disk is still pulling back the files it originated,
+//     and until it has them the sweep would see them missing and propose
+//     their deletion — which every other node would then carry out on its
+//     replica. The hold is armed only when the catch-up walker runs, since
+//     with it disabled readiness would never be reached (the query gate
+//     follows the same rule); the reconciler reports a held sweep as
+//     manifest_sweep_held and runs the storage half regardless.
 //
 // This type lives in main.go so the reconciliation package has no
 // compile-time dependency on the cluster package.
 type reconciliationClusterGate struct {
-	coordinator *cluster.Coordinator
+	coordinator reconciliationGateCoordinator
 	shared      bool // true for s3/azure backends — one-node-sweeps semantics
+	// holdSweepUntilCaughtUp arms the local-storage manifest-sweep hold:
+	// file replication and its catch-up walker are both enabled.
+	holdSweepUntilCaughtUp bool
 }
 
-func newReconciliationClusterGate(c *cluster.Coordinator, backendKind string) *reconciliationClusterGate {
+// reconciliationGateCoordinator is what the gate needs from the cluster
+// coordinator, kept narrow so the gate can be tested with a fake.
+type reconciliationGateCoordinator interface {
+	IsActiveCompactor() bool
+	ReplicationReady() bool
+	GetRole() cluster.NodeRole
+}
+
+func newReconciliationClusterGate(c reconciliationGateCoordinator, backendKind string, replicationEnabled, catchUpEnabled bool) *reconciliationClusterGate {
 	return &reconciliationClusterGate{
-		coordinator: c,
-		shared:      isSharedBackend(backendKind),
+		coordinator:            c,
+		shared:                 isSharedBackend(backendKind),
+		holdSweepUntilCaughtUp: !isSharedBackend(backendKind) && replicationEnabled && catchUpEnabled,
 	}
 }
 
@@ -4372,6 +4395,9 @@ func (g *reconciliationClusterGate) ShouldRunStorageScan() bool {
 func (g *reconciliationClusterGate) ShouldRunManifestSweep() bool {
 	if g.shared {
 		return g.coordinator.IsActiveCompactor()
+	}
+	if g.holdSweepUntilCaughtUp {
+		return g.coordinator.ReplicationReady()
 	}
 	return true
 }

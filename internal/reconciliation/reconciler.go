@@ -330,6 +330,13 @@ type Run struct {
 	AbortReason  AbortReason `json:"abort_reason,omitempty"`
 	AbortMessage string      `json:"abort_message,omitempty"`
 
+	// ManifestSweepHeld is set when the gate withheld the orphan-manifest
+	// sweep for this run while the storage half still ran: on per-node
+	// storage, until file replication has converged on this node, so a node
+	// still pulling back files it originated cannot propose their deletion
+	// (#959). The orphan-manifest counts and samples are still reported.
+	ManifestSweepHeld bool `json:"manifest_sweep_held"`
+
 	// CapHit indicates the run stopped early because MaxDeletesPerRun was reached.
 	CapHit bool `json:"cap_hit"`
 
@@ -579,14 +586,26 @@ func (r *Reconciler) Reconcile(ctx context.Context, dryRun bool) (*Run, error) {
 	// Step 4: orphan-manifest sweep. Cheap, retryable, no risk of data
 	// loss — runs first so a Raft quorum loss aborts the cycle BEFORE
 	// we touch any storage bytes.
-	if sweepErr := r.sweepOrphanManifest(runCtx, run, diff.orphanManifest, run.DryRun); sweepErr != nil {
+	//
+	// The gate may withhold this half alone (per-node storage until file
+	// replication has converged on this node, #959). That is a hold, not a
+	// revocation: the candidates were counted above, the storage half still
+	// runs, and the run completes and says so. The chunk-boundary check
+	// inside the sweep remains the mid-run revocation path.
+	if r.gate != nil && !r.gate.ShouldRunManifestSweep() {
+		run.ManifestSweepHeld = true
+		r.logger.Info().
+			Str("run_id", run.ID).
+			Int("orphan_manifest", run.OrphanManifestCount).
+			Msg("Reconciliation: orphan-manifest sweep held by the cluster gate this run (file replication has not converged on this node); storage half proceeds")
+	} else if sweepErr := r.sweepOrphanManifest(runCtx, run, diff.orphanManifest, run.DryRun); sweepErr != nil {
 		r.markAborted(run, sweepErr)
 		r.finalizeRun(run)
 		return run, sweepErr
 	}
 
-	// Step 5: orphan-storage sweep. Only runs if step 4 succeeded —
-	// manifest-before-storage ordering for the whole cycle. The cap
+	// Step 5: orphan-storage sweep. Only runs if step 4 succeeded or was
+	// held — manifest-before-storage ordering for the whole cycle. The cap
 	// flag may already be set by step 4, in which case sweepOrphanStorage
 	// short-circuits immediately on the first chunk.
 	if sweepErr := r.sweepOrphanStorage(runCtx, run, diff.orphanStorage, run.DryRun); sweepErr != nil {
@@ -660,6 +679,7 @@ func (r *Reconciler) finalizeRun(run *Run) {
 		Int("storage_deletes", run.StorageDeletes).
 		Int("skipped_grace", run.SkippedGrace).
 		Int("skipped_invalid_path", run.SkippedInvalidPath).
+		Bool("manifest_sweep_held", run.ManifestSweepHeld).
 		Dur("duration", duration)
 	if run.Aborted {
 		logEv = logEv.Str("abort_reason", string(run.AbortReason))
@@ -684,6 +704,7 @@ func (r *Reconciler) finalizeRun(run *Run) {
 			"skipped_invalid_path": strconv.Itoa(run.SkippedInvalidPath),
 			"walk_partial":         boolStr(run.WalkPartial),
 			"cap_hit":              boolStr(run.CapHit),
+			"manifest_sweep_held":  boolStr(run.ManifestSweepHeld),
 			"duration_ms":          strconv.FormatInt(duration.Milliseconds(), 10),
 		})
 	} else {
@@ -698,6 +719,7 @@ func (r *Reconciler) finalizeRun(run *Run) {
 			"skipped_invalid_path": strconv.Itoa(run.SkippedInvalidPath),
 			"walk_partial":         boolStr(run.WalkPartial),
 			"cap_hit":              boolStr(run.CapHit),
+			"manifest_sweep_held":  boolStr(run.ManifestSweepHeld),
 			"duration_ms":          strconv.FormatInt(duration.Milliseconds(), 10),
 		})
 	}
