@@ -10,8 +10,6 @@ The size threshold was already checked once per buffered Arrow batch before this
 
 The API and CLI guides describe persistence precedence, restart behavior, cluster fan-out and best-effort rollback, and the delay between a runtime change and telemetry/Grafana visibility.
 
-Contributed by [@jallegri](https://github.com/jallegri) in [#PR](https://github.com/Basekick-Labs/arc/pull/PR).
-
 ## New: administrative cluster file deletion (`DELETE /api/v1/cluster/files`) ([#830](https://github.com/Basekick-Labs/arc/pull/830))
 
 A new administrative endpoint `DELETE /api/v1/cluster/files?path=...&confirm=true` allows cluster operators to remove an entry from the cluster-wide Raft manifest.
