@@ -50,6 +50,15 @@ type Manager struct {
 	TempDirectory    string        // Temp directory for compaction files
 	MemoryLimit      string        // DuckDB memory limit for EACH subprocess (e.g., "8GB")
 	Threads          int           // DuckDB thread count for EACH subprocess (0 = DuckDB default: all cores)
+
+	// excludeDatabases holds compaction.exclude_databases as a set, built
+	// once by NewManager from the normalized excludeList. Immutable after
+	// construction, so readers need no lock. Consulted only by
+	// filterExcludedDatabases — see that method for the semantics.
+	excludeDatabases map[string]struct{}
+	// excludeList is the normalized, de-duplicated configured order, kept
+	// for startup logging and Stats().
+	excludeList []string
 	// Phase 4: local-disk directory where compaction subprocesses write
 	// completion manifests for the parent-side CompletionWatcher to pick
 	// up. Empty means "OSS mode, no completion-manifest handoff". Set by
@@ -136,7 +145,11 @@ type ManagerConfig struct {
 	// clampFilesPerBatch.
 	MaxFilesPerBatch int
 	MaxConcurrent    int
-	CycleTimeout     time.Duration       // Zero selects the backward-compatible 30m default
+	CycleTimeout     time.Duration // Zero selects the backward-compatible 30m default
+	// ExcludeDatabases is compaction.exclude_databases: databases that
+	// scheduled (unscoped) cycles skip during candidate discovery.
+	// Database-scoped cycles bypass it. Normalized by NewManager.
+	ExcludeDatabases []string
 	TempDirectory    string              // Temp directory for compaction files
 	MemoryLimit      string              // DuckDB memory limit for EACH subprocess (e.g., "8GB")
 	Threads          int                 // DuckDB thread count for EACH subprocess (0 = DuckDB default: all cores)
@@ -183,6 +196,12 @@ func NewManager(cfg *ManagerConfig) *Manager {
 
 	logger := cfg.Logger.With().Str("component", "compaction-manager").Logger()
 
+	excludeList := normalizeExcludeDatabases(cfg.ExcludeDatabases)
+	excludeSet := make(map[string]struct{}, len(excludeList))
+	for _, db := range excludeList {
+		excludeSet[db] = struct{}{}
+	}
+
 	m := &Manager{
 		StorageBackend:   cfg.StorageBackend,
 		LockManager:      cfg.LockManager,
@@ -199,8 +218,23 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		SortKeysConfig:   sortKeysConfig,
 		DefaultSortKeys:  defaultSortKeys,
 		Tiers:            cfg.Tiers,
+		excludeDatabases: excludeSet,
+		excludeList:      excludeList,
 		jobHistory:       make([]map[string]interface{}, 0),
 		logger:           logger,
+	}
+
+	if len(excludeList) > 0 {
+		m.logger.Info().
+			Strs("exclude_databases", excludeList).
+			Msg("Compaction exclusion list active: scheduled cycles skip these databases; database-scoped manual triggers bypass the list")
+		for _, db := range excludeList {
+			if excludeEntryCanNeverMatch(db) {
+				m.logger.Warn().
+					Str("entry", db).
+					Msg("compaction.exclude_databases entry can never match a discovered database; check for a typo")
+			}
+		}
 	}
 
 	if batchSizeAdjusted {
@@ -415,6 +449,105 @@ func (m *Manager) expandNamespaces(ctx context.Context, databases []string) []st
 	return out
 }
 
+// normalizeExcludeDatabases canonicalizes compaction.exclude_databases:
+// entries are whitespace-trimmed, de-duplicated, and empties dropped.
+// Nothing else is rewritten — matching is exact and case-sensitive, with no
+// prefixes, globs, or separator splitting, so an entry can never bleed onto
+// a sibling database ("wh" must not match "wh-other"; see the #534 class),
+// and a spoke namespace whose ID legally contains a comma or dot is
+// excluded verbatim rather than silently split into fragments that exclude
+// unrelated databases. Environment overrides need no splitting here either:
+// viper delivers ARC_COMPACTION_EXCLUDE_DATABASES="a b" as separate
+// whitespace-separated entries already; a name the environment form cannot
+// express belongs in the arc.toml array.
+func normalizeExcludeDatabases(entries []string) []string {
+	var out []string
+	seen := make(map[string]struct{})
+	for _, entry := range entries {
+		name := strings.TrimSpace(entry)
+		if name == "" {
+			continue
+		}
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	return out
+}
+
+// excludeEntryCanNeverMatch reports whether an exclusion entry can never
+// equal a database name that candidate discovery produces: listDatabases
+// skips reserved root directories (leading "_" or ".") and compaction's
+// scratch root; discovered names carry no path escapes or control
+// characters; and slashes appear only in the exactly-one-slash
+// "spoke/child" form that expandNamespaces builds — so a leading or
+// trailing slash ("staging/") or two-plus slashes is always a typo, never
+// a match. Warning on these catches configuration mistakes without ever
+// rejecting a legal spoke namespace, whose IDs may contain dots, commas,
+// or leading digits (validateSpokeID is a blocklist, not a database-name
+// allowlist).
+func excludeEntryCanNeverMatch(name string) bool {
+	if storage.IsReservedRootDir(name) || name == "compaction" {
+		return true
+	}
+	if strings.Contains(name, "\\") || strings.Contains(name, "..") {
+		return true
+	}
+	if strings.HasPrefix(name, "/") || strings.HasSuffix(name, "/") ||
+		strings.Count(name, "/") >= 2 {
+		return true
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
+// filterExcludedDatabases drops databases named in
+// compaction.exclude_databases. Callers apply it to unscoped discovery only
+// — an operator explicitly scoping a cycle to one database bypasses the
+// list — and apply it on both sides of namespace expansion, so an excluded
+// spoke parent ("spoke1") never has its children listed, and a single
+// received pseudo-database ("spoke1/telemetry") can be excluded on its own.
+// Manifest recovery is deliberately NOT filtered: exclusion gates new
+// candidate discovery, never the completion of work a previous cycle
+// already started.
+func (m *Manager) filterExcludedDatabases(databases []string) []string {
+	if len(m.excludeDatabases) == 0 {
+		return databases
+	}
+	out := make([]string, 0, len(databases))
+	var skipped []string
+	for _, db := range databases {
+		if _, excluded := m.excludeDatabases[db]; excluded {
+			skipped = append(skipped, db)
+			continue
+		}
+		out = append(out, db)
+	}
+	if len(skipped) > 0 {
+		m.logger.Debug().
+			Strs("excluded", skipped).
+			Msg("Skipping databases excluded from compaction")
+	}
+	return out
+}
+
+// ExcludedDatabases returns the normalized compaction.exclude_databases
+// list, for operator-facing surfaces (trigger responses, stats). The
+// returned slice is a copy; the configuration itself is immutable after
+// construction.
+func (m *Manager) ExcludedDatabases() []string {
+	if len(m.excludeList) == 0 {
+		return nil
+	}
+	return append([]string(nil), m.excludeList...)
+}
+
 // sanitizeDBForName maps a database name to a single path-safe token for
 // job IDs (which also name temp directories and cluster completion-manifest
 // files — validateJobID REJECTS path separators, and an unsanitized slash
@@ -473,7 +606,12 @@ func (m *Manager) FindCandidates(ctx context.Context) ([]Candidate, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The exclusion list applies here exactly as in a scheduled cycle, on
+	// both sides of the expansion, so this endpoint keeps previewing what
+	// a cycle would actually process (#619 review F4).
+	databases = m.filterExcludedDatabases(databases)
 	databases = m.expandNamespaces(ctx, databases)
+	databases = m.filterExcludedDatabases(databases)
 
 	m.logger.Info().Strs("databases", databases).Msg("Discovered databases for compaction")
 
@@ -1003,9 +1141,19 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 			m.logger.Error().Err(err).Msg("Failed to list databases for compaction cycle")
 			return cycleID, err
 		}
+		// The exclusion list applies to unscoped discovery only — an
+		// explicit filterDatabases scope is operator intent and bypasses
+		// it. Filtering here, before expansion, drops excluded real
+		// databases and whole spoke namespaces without listing their
+		// children; the post-expansion pass below catches individual
+		// pseudo-databases ("spoke1/telemetry").
+		databases = m.filterExcludedDatabases(databases)
 	}
 
 	databases = m.expandNamespaces(ctx, databases)
+	if filterDatabases == nil {
+		databases = m.filterExcludedDatabases(databases)
+	}
 	if err := ctx.Err(); err != nil {
 		return cycleID, err
 	}
@@ -1497,6 +1645,13 @@ func (m *Manager) Stats() map[string]interface{} {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// A copy, coerced so JSON consumers always see an array (the nil slice
+	// would marshal as null), matching the trigger-response echo surface.
+	excluded := m.ExcludedDatabases()
+	if excluded == nil {
+		excluded = []string{}
+	}
+
 	stats := map[string]interface{}{
 		"total_jobs_completed":    m.totalJobsCompleted,
 		"total_jobs_failed":       m.totalJobsFailed,
@@ -1507,6 +1662,7 @@ func (m *Manager) Stats() map[string]interface{} {
 		"total_manifests_recover": m.totalManifestsRecov,
 		"cycle_running":           m.cycleRunning.Load(),
 		"current_cycle_id":        m.cycleID.Load(),
+		"exclude_databases":       excluded,
 		"last_cycle": map[string]interface{}{
 			"cycle_id":            m.lastCycle.CycleID,
 			"status":              m.lastCycle.Status,

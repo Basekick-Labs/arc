@@ -104,6 +104,21 @@ enabled = true
 # retained; one that cannot be decoded is parked as *.quarantined.
 # cycle_timeout = "30m"
 
+# Databases that scheduled cycles (and manual triggers without a database
+# scope) skip during candidate discovery. A trigger that names a database
+# (POST /api/v1/compaction/trigger?database=X) bypasses the list — combined,
+# the two give control over what gets compacted and in which order.
+# Exact, case-sensitive names — no globs, prefixes, or separator splitting.
+# On a hub, received spoke data is excluded as "spoke/db" (one
+# pseudo-database) or "spoke" (the whole namespace); the manual bypass works
+# at spoke granularity only (?database= takes plain database names).
+# Manifest recovery is never filtered: compactions a previous cycle already
+# started always complete. This key gates compaction only — retention,
+# tiering, and Iceberg export ignore it. Default: empty (nothing excluded).
+# Environment override (whitespace-separated; a name containing spaces
+# needs this TOML array): ARC_COMPACTION_EXCLUDE_DATABASES="staging imports"
+# exclude_databases = ["staging", "imports_backlog"]
+
 # Hourly
 hourly_enabled = true
 hourly_schedule = "5 * * * *"
@@ -235,15 +250,15 @@ s3_access_key = "minioadmin"     # MinIO/dev. AWS S3 with IRSA: remove
 s3_secret_key = "minioadmin"     # MinIO/dev. AWS S3 with IRSA: remove
 s3_use_ssl = false               # MinIO/dev. AWS S3: true
 s3_path_style = true             # MinIO/dev. AWS S3: false
-s3_storage_class = "GLACIER"
+# Cold objects are written with no storage class set (S3 Standard) and read in
+# place; there is deliberately no storage-class key. Keep bucket lifecycle
+# rules off the cold prefix — Glacier or Deep Archive objects cannot be queried.
 
-# Azure (when backend = "azure")
+# Azure (when backend = "azure"). Objects take the storage account's default
+# access tier; there is no access-tier key, for the same reason.
 azure_container = ""
 azure_endpoint = ""
 azure_use_managed_identity = false
-azure_access_tier = "Archive"
-
-retrieval_mode = "standard"  # standard, expedited, bulk
 
 # -----------------------------------------------------------------------------
 # Audit Logging (Enterprise)

@@ -139,7 +139,9 @@ func newManifestDeleteRig(t *testing.T, peerAddr string) (*Coordinator, *memBack
 	t.Cleanup(func() {
 		c.puller.Stop()
 		cancel()
-		c.deleteWg.Wait()
+		// The delete workers exit only on their stop signal, as in Stop:
+		// cancelling the context no longer ends them (that was the leak).
+		c.stopDeleteWorkers(c.deleteStop, c.deleteWg)
 	})
 	return c, backend
 }

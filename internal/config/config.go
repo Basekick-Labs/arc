@@ -162,7 +162,13 @@ type CompactionConfig struct {
 	DailySkipFileAgeCheckDays int           // Skip file creation time check for partitions older than N days (default: 7)
 	MaxConcurrent             int           // Max concurrent compaction jobs (default: 2)
 	CycleTimeout              time.Duration // Maximum duration of one compaction cycle (default: 30m)
-	TempDirectory             string        // Temporary directory for compaction files (default: ./data/compaction)
+	// ExcludeDatabases lists databases that scheduled compaction cycles and
+	// unscoped manual triggers skip during candidate discovery. An
+	// explicitly scoped trigger (?database=X) bypasses the list — naming a
+	// database is operator intent. Names match exactly and case-sensitively;
+	// a hub excludes received spoke data as "spoke/db". (default: empty)
+	ExcludeDatabases []string
+	TempDirectory    string // Temporary directory for compaction files (default: ./data/compaction)
 
 	// MemoryLimit is the DuckDB memory limit applied to EACH compaction
 	// subprocess. Empty (the default) means auto-derive: database.memory_limit
@@ -561,35 +567,36 @@ type TieredStorageConfig struct {
 	Cold ColdTierConfig
 }
 
-// ColdTierConfig holds configuration for the cold storage tier (S3/Azure archive).
+// ColdTierConfig holds configuration for the cold storage tier (S3/Azure).
 // This is the only remote tier - data moves directly from hot (local) to cold (remote).
+// Cold objects are written with no storage class or access tier set — S3
+// STANDARD, and on Azure the storage account's default tier — and queried in
+// place; Arc does not select a storage class or access tier, because every
+// class that needs a restore step would make the data unreadable, and the
+// cheaper readable classes trade the query latency tiering is meant to
+// preserve for a saving that is small next to block storage versus S3.
 type ColdTierConfig struct {
 	Enabled bool   // Enable cold tier
 	Backend string // "s3" or "azure"
 
 	// S3 settings
-	S3Bucket       string // S3 bucket for archived data
-	S3Region       string // AWS region
-	S3Endpoint     string // Custom endpoint for MinIO
-	S3AccessKey    string // AWS access key (use env: ARC_TIERED_STORAGE_COLD_S3_ACCESS_KEY)
-	S3SecretKey    string // AWS secret key (use env: ARC_TIERED_STORAGE_COLD_S3_SECRET_KEY)
-	S3UseSSL       bool   // Use HTTPS for S3 connections
-	S3PathStyle    bool   // Use path-style addressing (required for MinIO)
-	S3Prefix       string // Path prefix within the bucket (e.g., "instances/abc123/")
-	S3StorageClass string // S3 storage class (default: "GLACIER")
+	S3Bucket    string // S3 bucket for cold-tier data
+	S3Region    string // AWS region
+	S3Endpoint  string // Custom endpoint for MinIO
+	S3AccessKey string // AWS access key (use env: ARC_TIERED_STORAGE_COLD_S3_ACCESS_KEY)
+	S3SecretKey string // AWS secret key (use env: ARC_TIERED_STORAGE_COLD_S3_SECRET_KEY)
+	S3UseSSL    bool   // Use HTTPS for S3 connections
+	S3PathStyle bool   // Use path-style addressing (required for MinIO)
+	S3Prefix    string // Path prefix within the bucket (e.g., "instances/abc123/")
 
 	// Azure settings
-	AzureContainer          string // Azure container for archived data
+	AzureContainer          string // Azure container for cold-tier data
 	AzureConnectionString   string // Connection string (simplest auth method)
 	AzureAccountName        string // Storage account name
 	AzureAccountKey         string // Storage account key
 	AzureSASToken           string // SAS token for scoped access
 	AzureEndpoint           string // Custom endpoint (for Azurite testing)
 	AzureUseManagedIdentity bool   // Use managed identity (Azure-hosted deployments)
-	AzureAccessTier         string // Azure access tier (default: "Archive")
-
-	// Retrieval settings (for Glacier/Archive)
-	RetrievalMode string // Glacier retrieval mode: "standard", "expedited", "bulk" (default: "standard")
 }
 
 // AuditLogConfig holds configuration for enterprise audit logging.
@@ -741,7 +748,7 @@ type ClusterConfig struct {
 	//     primary/standby distinction; LB does failover via retry).
 	//   - IsPrimaryWriter() returns "is Raft leader" instead of
 	//     singleton-writer semantics, so singleton background tasks
-	//     (retention, CQ, delete, reconciliation) run on whichever
+	//     (retention, CQ, delete, tiering migration, reconciliation) run on whichever
 	//     node currently holds the cluster Raft leadership.
 	//   - WAL replays un-flushed entries on writer restart for crash
 	//     recovery (S3 PUTs are durable; only in-memory buffer is at
@@ -932,6 +939,7 @@ func Load() (*Config, error) {
 			DailyMinFiles:               v.GetInt("compaction.daily_min_files"),
 			DailySkipFileAgeCheckDays:   v.GetInt("compaction.daily_skip_file_age_check_days"),
 			MaxConcurrent:               v.GetInt("compaction.max_concurrent"),
+			ExcludeDatabases:            v.GetStringSlice("compaction.exclude_databases"),
 			CycleTimeout:                cycleTimeout,
 			MaxFilesPerBatch:            v.GetInt("compaction.max_files_per_batch"),
 			TempDirectory:               v.GetString("compaction.temp_directory"),
@@ -1109,7 +1117,6 @@ func Load() (*Config, error) {
 				S3UseSSL:                v.GetBool("tiered_storage.cold.s3_use_ssl"),
 				S3PathStyle:             v.GetBool("tiered_storage.cold.s3_path_style"),
 				S3Prefix:                v.GetString("tiered_storage.cold.s3_prefix"),
-				S3StorageClass:          v.GetString("tiered_storage.cold.s3_storage_class"),
 				AzureContainer:          v.GetString("tiered_storage.cold.azure_container"),
 				AzureConnectionString:   v.GetString("tiered_storage.cold.azure_connection_string"),
 				AzureAccountName:        v.GetString("tiered_storage.cold.azure_account_name"),
@@ -1117,8 +1124,6 @@ func Load() (*Config, error) {
 				AzureSASToken:           v.GetString("tiered_storage.cold.azure_sas_token"),
 				AzureEndpoint:           v.GetString("tiered_storage.cold.azure_endpoint"),
 				AzureUseManagedIdentity: v.GetBool("tiered_storage.cold.azure_use_managed_identity"),
-				AzureAccessTier:         v.GetString("tiered_storage.cold.azure_access_tier"),
-				RetrievalMode:           v.GetString("tiered_storage.cold.retrieval_mode"),
 			},
 		},
 		AuditLog: AuditLogConfig{
@@ -1615,6 +1620,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.daily_skip_file_age_check_days", 7)   // Skip file age check for partitions older than 7 days
 	v.SetDefault("compaction.max_concurrent", 2)                   // 2 concurrent jobs
 	v.SetDefault("compaction.cycle_timeout", "30m")                // Maximum duration per cycle
+	v.SetDefault("compaction.exclude_databases", []string{})       // Databases skipped by scheduled cycles (scoped triggers bypass)
 	v.SetDefault("compaction.max_files_per_batch", 30)             // 30 files per DuckDB read_parquet() call; valid range [2, 500]
 	v.SetDefault("compaction.temp_directory", "./data/compaction") // Temp directory for compaction files
 	v.SetDefault("compaction.memory_limit", "")                    // "" = auto: database.memory_limit / max_concurrent (see CompactionConfig.MemoryLimit)
@@ -1803,26 +1809,24 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("tiered_storage.default_hot_max_age_days", 30)         // 30 days in hot tier before archiving
 	v.SetDefault("tiered_storage.migration_history_retention_days", 90) // 90 days migration history
 
-	// Cold tier defaults (S3/Azure archive storage)
-	v.SetDefault("tiered_storage.cold.enabled", false)              // Disabled by default
-	v.SetDefault("tiered_storage.cold.backend", "s3")               // S3 by default
-	v.SetDefault("tiered_storage.cold.s3_bucket", "")               // Must be configured
-	v.SetDefault("tiered_storage.cold.s3_region", "us-east-1")      // Default region
-	v.SetDefault("tiered_storage.cold.s3_endpoint", "")             // Empty for AWS, set for MinIO
-	v.SetDefault("tiered_storage.cold.s3_access_key", "")           // Must be configured
-	v.SetDefault("tiered_storage.cold.s3_secret_key", "")           // Must be configured
-	v.SetDefault("tiered_storage.cold.s3_use_ssl", true)            // HTTPS by default
-	v.SetDefault("tiered_storage.cold.s3_path_style", false)        // Virtual-hosted style for AWS
-	v.SetDefault("tiered_storage.cold.s3_storage_class", "GLACIER") // Glacier by default
-	v.SetDefault("tiered_storage.cold.azure_container", "")         // Must be configured for Azure
+	// Cold tier defaults (S3/Azure). Objects are written in the bucket's
+	// default storage class; there is deliberately no class or access-tier key.
+	v.SetDefault("tiered_storage.cold.enabled", false)         // Disabled by default
+	v.SetDefault("tiered_storage.cold.backend", "s3")          // S3 by default
+	v.SetDefault("tiered_storage.cold.s3_bucket", "")          // Must be configured
+	v.SetDefault("tiered_storage.cold.s3_region", "us-east-1") // Default region
+	v.SetDefault("tiered_storage.cold.s3_endpoint", "")        // Empty for AWS, set for MinIO
+	v.SetDefault("tiered_storage.cold.s3_access_key", "")      // Must be configured
+	v.SetDefault("tiered_storage.cold.s3_secret_key", "")      // Must be configured
+	v.SetDefault("tiered_storage.cold.s3_use_ssl", true)       // HTTPS by default
+	v.SetDefault("tiered_storage.cold.s3_path_style", false)   // Virtual-hosted style for AWS
+	v.SetDefault("tiered_storage.cold.azure_container", "")    // Must be configured for Azure
 	v.SetDefault("tiered_storage.cold.azure_connection_string", "")
 	v.SetDefault("tiered_storage.cold.azure_account_name", "")
 	v.SetDefault("tiered_storage.cold.azure_account_key", "")
 	v.SetDefault("tiered_storage.cold.azure_sas_token", "")
 	v.SetDefault("tiered_storage.cold.azure_endpoint", "")
 	v.SetDefault("tiered_storage.cold.azure_use_managed_identity", false)
-	v.SetDefault("tiered_storage.cold.azure_access_tier", "Archive") // Azure archive tier
-	v.SetDefault("tiered_storage.cold.retrieval_mode", "standard")   // Standard retrieval
 
 	// Audit log defaults (Enterprise feature)
 	v.SetDefault("audit_log.enabled", false)

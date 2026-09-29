@@ -260,6 +260,14 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 	if measurementParam != "" {
 		resp["measurement"] = measurementParam
 	}
+	// An unscoped trigger honors compaction.exclude_databases exactly like a
+	// scheduled cycle. Say so in the response, so an operator wondering why
+	// a database was skipped doesn't need the debug log.
+	if dbParam == "" {
+		if excluded := h.manager.ExcludedDatabases(); len(excluded) > 0 {
+			resp["exclude_databases"] = excluded
+		}
+	}
 	return c.JSON(resp)
 }
 

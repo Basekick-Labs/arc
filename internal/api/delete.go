@@ -894,12 +894,10 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 	// the seekable *os.File to the storage backend. Two reads of the same
 	// file, but the second hits OS page cache so disk is touched once.
 	//
-	// We can't use io.TeeReader here (one pass instead of two): AWS SDK Go v2
-	// requires either TLS or a seekable body to compute the mandatory request
-	// checksum. TeeReader-wrapping an *os.File is non-seekable and breaks
-	// uploads to plain-HTTP S3 (MinIO, Garage) with:
-	//   "compute input header checksum failed, unseekable stream is not
-	//    supported without TLS and trailing checksum"
+	// One pass with io.TeeReader would hand the backend a non-seekable body.
+	// The S3 backend buffers such bodies itself now, but a seekable *os.File
+	// lets it upload straight from the file (and rewind for retries) instead
+	// of copying it into memory, so the two-pass read stays.
 	uploadFile, err := os.Open(tempPath)
 	if err != nil {
 		return 0, nil, fmt.Errorf("failed to open temp file for upload: %w", err)

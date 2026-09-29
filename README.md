@@ -46,7 +46,7 @@ Arc is **not a wrapper**. You don't bring your own ingestion, compaction, or ret
 
 - **Keep full-resolution history** instead of choosing between retention and cost.
 - **Use standard SQL** with window functions, CTEs, joins, and analytical aggregations.
-- **Own the files**: Arc stores data as open Apache Parquet on local disk, S3, Azure, or MinIO.
+- **Own the files**: Arc stores data as open Apache Parquet on local disk, S3, Azure, or any S3-compatible store (SeaweedFS, R2, MinIO, ...).
 - **Start small**: run one binary on a laptop, edge box, or server before adding enterprise clustering.
 - **Migrate gradually**: use InfluxDB Line Protocol and Telegraf-compatible ingestion to dual-write and validate before cutover.
 
@@ -324,7 +324,7 @@ CMVP-certified; Arc itself is not a CMVP-listed module. See the
 - **Compaction**: Tiered (hourly/daily) automatic Parquet file merging — 10x storage reduction
 - **Data Lifecycle**: Retention policies, continuous queries, tiered storage (hot/cold)
 - **Durability**: Optional write-ahead log (WAL), backup and restore
-- **Storage**: Local filesystem, S3, MinIO
+- **Storage**: Local filesystem, S3 and S3-compatible object stores (SeaweedFS, R2, MinIO, ...), Azure Blob
 - **Auth**: Token-based authentication with in-memory caching
 - **Durability**: Optional write-ahead log (WAL)
 - **Data Management**: GDPR-compliant delete operations
