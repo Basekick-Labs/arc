@@ -10,6 +10,10 @@ The size threshold was already checked once per buffered Arrow batch before this
 
 The API and CLI guides describe persistence precedence, restart behavior, cluster fan-out and best-effort rollback, and the delay between a runtime change and telemetry/Grafana visibility.
 
+Runtime updates reject `max_buffer_size` values below 1,000 records. Flush timeouts now start when a worker dequeues a task, so time spent waiting in the flush queue does not consume the storage-write timeout. WAL cleanup recalculates its safe age from the current runtime buffer age.
+
+Contributed by [@jallegri](https://github.com/jallegri) in [#968](https://github.com/Basekick-Labs/arc/pull/968).
+
 ## New: administrative cluster file deletion (`DELETE /api/v1/cluster/files`) ([#830](https://github.com/Basekick-Labs/arc/pull/830))
 
 A new administrative endpoint `DELETE /api/v1/cluster/files?path=...&confirm=true` allows cluster operators to remove an entry from the cluster-wide Raft manifest.
