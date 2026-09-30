@@ -786,8 +786,6 @@ type bufferShard struct {
 
 // flushTask represents a flush operation to be executed by workers
 type flushTask struct {
-	ctx         context.Context
-	cancel      context.CancelFunc // must be called when task completes to release resources
 	bufferKey   string
 	database    string
 	measurement string
@@ -1656,10 +1654,8 @@ const (
 //  3. The queue-full default arm (queue at capacity; data stays in
 //     WAL for recovery).
 //
-// The caller MUST already have built `task` and called flushCancel
-// to register the timeout context — tryEnqueueFlush does not own
-// that lifecycle. flushCancel is invoked here on every non-queued
-// outcome so the ctx is cleaned up promptly.
+// The flush timeout starts when a worker dequeues the task. Time spent waiting
+// in the bounded queue therefore does not consume the storage-write timeout.
 //
 // Returns the outcome so the caller can pass it to metrics/logging
 // uniformly. All non-queued outcomes increment the same
@@ -1667,12 +1663,10 @@ const (
 // "records that fell back to WAL" rate authoritative.
 func (b *ArrowBuffer) tryEnqueueFlush(
 	task flushTask,
-	flushCancel context.CancelFunc,
 	bufferKey string,
 	totalBuffered int,
 ) flushSendOutcome {
 	if b.closing.Load() {
-		flushCancel()
 		b.logger.Warn().
 			Str("buffer_key", bufferKey).
 			Int("records", totalBuffered).
@@ -1692,7 +1686,6 @@ func (b *ArrowBuffer) tryEnqueueFlush(
 			Msg("Buffer size exceeded, queued flush to worker pool")
 		return flushQueued
 	case <-b.ctx.Done():
-		flushCancel()
 		b.logger.Warn().
 			Str("buffer_key", bufferKey).
 			Int("records", totalBuffered).
@@ -1701,7 +1694,6 @@ func (b *ArrowBuffer) tryEnqueueFlush(
 		b.walOnlyRecords.Add(int64(totalBuffered))
 		return flushCtxCanceled
 	default:
-		flushCancel()
 		b.logger.Warn().
 			Str("buffer_key", bufferKey).
 			Int("records", totalBuffered).
@@ -1935,12 +1927,7 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 	// OPTIMIZATION: Queue flush to worker pool (bounded concurrency)
 	// This prevents goroutine explosion under sustained load
 	if shouldFlush {
-		// Use buffer ctx as parent so Close() cancels in-flight writes,
-		// with a timeout to prevent workers from blocking forever on slow storage
-		flushCtx, flushCancel := context.WithTimeout(b.ctx, b.flushTimeout)
 		task := flushTask{
-			ctx:         flushCtx,
-			cancel:      flushCancel,
 			bufferKey:   bufferKey,
 			database:    database,
 			measurement: record.Measurement,
@@ -1953,7 +1940,7 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 		// the queue-full path uniformly across both write paths.
 		// The flushSkipClosing outcome short-circuits the rest of
 		// the write — Close() is in progress, no point continuing.
-		if b.tryEnqueueFlush(task, flushCancel, bufferKey, totalBuffered) == flushSkipClosing {
+		if b.tryEnqueueFlush(task, bufferKey, totalBuffered) == flushSkipClosing {
 			return nil
 		}
 	}
@@ -2074,10 +2061,7 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 
 	// Queue flush to worker pool if needed
 	if shouldFlush {
-		flushCtx, flushCancel := context.WithTimeout(b.ctx, b.flushTimeout)
 		task := flushTask{
-			ctx:         flushCtx,
-			cancel:      flushCancel,
 			bufferKey:   bufferKey,
 			database:    database,
 			measurement: measurement,
@@ -2085,7 +2069,7 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 			recordCount: totalBuffered,
 		}
 
-		if b.tryEnqueueFlush(task, flushCancel, bufferKey, totalBuffered) == flushSkipClosing {
+		if b.tryEnqueueFlush(task, bufferKey, totalBuffered) == flushSkipClosing {
 			return nil
 		}
 	}
@@ -2725,10 +2709,11 @@ func (b *ArrowBuffer) flushWorker(workerID int) {
 				Int64("queue_depth", b.queueDepth.Load()).
 				Msg("Worker processing flush task")
 
-			// Execute flush
-			b.flushRecordsAsync(task.ctx, task.bufferKey, task.database, task.measurement, task.records, task.recordCount)
-			// Release timeout context resources
-			task.cancel()
+			// Queue wait time does not count against the storage timeout. Start it
+			// only when a worker is ready to perform this flush.
+			flushCtx, flushCancel := context.WithTimeout(b.ctx, b.flushTimeout)
+			b.flushRecordsAsync(flushCtx, task.bufferKey, task.database, task.measurement, task.records, task.recordCount)
+			flushCancel()
 		}
 	}
 }
@@ -3949,7 +3934,6 @@ drain:
 			b.queueDepth.Add(-1)
 			abandoned += task.recordCount
 			b.walOnlyRecords.Add(int64(task.recordCount))
-			task.cancel() // release the task's timeout context
 		default:
 			break drain
 		}

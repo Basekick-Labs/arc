@@ -68,16 +68,17 @@ func (h *RuntimeIngestConfigHandler) handleGet(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "runtime ingest configuration is unavailable"})
 	}
 	maxSize, maxAge := h.buffer.RuntimeConfig()
-	_, persistent, err := h.store.Load()
+	_, hasPersistentOverride, err := h.store.Load()
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Could not read persisted runtime ingest configuration")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not read runtime ingest configuration"})
 	}
+	persistent := hasPersistentOverride && !h.runtimeOnly
 	source := "startup_config"
-	if persistent {
-		source = "persistent_override"
-	} else if h.runtimeOnly {
+	if h.runtimeOnly {
 		source = "runtime_override"
+	} else if persistent {
+		source = "persistent_override"
 	}
 	return c.JSON(runtimeIngestConfigResponse{
 		MaxBufferSize:  maxSize,
@@ -104,7 +105,7 @@ func (h *RuntimeIngestConfigHandler) handlePatch(c *fiber.Ctx) error {
 	if err := c.BodyParser(&patch); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid JSON body"})
 	}
-	persist := true // Preserve the existing PATCH behavior when the field is omitted.
+	persist := false
 	if patch.Persistent != nil {
 		persist = *patch.Persistent
 	}
@@ -123,16 +124,12 @@ func (h *RuntimeIngestConfigHandler) handlePatch(c *fiber.Ctx) error {
 	if err := h.buffer.PatchRuntimeConfig(&size, &age); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
-	var storeErr error
 	if persist {
-		storeErr = h.store.Save(ingest.RuntimeIngestConfig{MaxBufferSize: size, MaxBufferAgeMS: age})
-	} else {
-		storeErr = h.store.Delete()
-	}
-	if storeErr != nil {
-		rollbackErr := h.buffer.PatchRuntimeConfig(&oldSize, &oldAge)
-		h.logger.Error().Err(storeErr).Interface("rollback_error", rollbackErr).Msg("Could not save runtime ingest settings; reverted live settings")
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not persist runtime ingest configuration"})
+		if storeErr := h.store.Save(ingest.RuntimeIngestConfig{MaxBufferSize: size, MaxBufferAgeMS: age}); storeErr != nil {
+			rollbackErr := h.buffer.PatchRuntimeConfig(&oldSize, &oldAge)
+			h.logger.Error().Err(storeErr).Interface("rollback_error", rollbackErr).Msg("Could not save runtime ingest settings; reverted live settings")
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not persist runtime ingest configuration"})
+		}
 	}
 	h.runtimeOnly = !persist
 	maxSize, maxAge := h.buffer.RuntimeConfig()

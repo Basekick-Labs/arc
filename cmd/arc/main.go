@@ -853,9 +853,18 @@ func main() {
 	}
 	persistedRuntimeIngestConfig, hasRuntimeIngestOverride, err := loadPersistentRuntimeIngestConfig(cfg.Auth.DBPath)
 	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to load persisted runtime ingest configuration")
+		log.Warn().Err(err).Msg("Could not load persisted runtime ingest configuration; using startup settings")
+		hasRuntimeIngestOverride = false
 	}
 	if hasRuntimeIngestOverride {
+		if persistedRuntimeIngestConfig != runtimeIngestStartupConfig {
+			log.Warn().
+				Int("startup_max_buffer_size", runtimeIngestStartupConfig.MaxBufferSize).
+				Int("startup_max_buffer_age_ms", runtimeIngestStartupConfig.MaxBufferAgeMS).
+				Int("persisted_max_buffer_size", persistedRuntimeIngestConfig.MaxBufferSize).
+				Int("persisted_max_buffer_age_ms", persistedRuntimeIngestConfig.MaxBufferAgeMS).
+				Msg("Persisted runtime ingest settings override startup configuration")
+		}
 		cfg.Ingest.MaxBufferSize = persistedRuntimeIngestConfig.MaxBufferSize
 		cfg.Ingest.MaxBufferAgeMS = persistedRuntimeIngestConfig.MaxBufferAgeMS
 		log.Info().
@@ -995,13 +1004,9 @@ func main() {
 			return nil
 		}, shutdown.PriorityBuffer)
 
-		// Safe age threshold: after this duration, a rotated WAL file's data MUST have
-		// been flushed to parquet by the normal buffer flush cycle (MaxBufferAgeMS).
-		// We use 3x margin to account for flush worker delays and clock skew.
-		safeAge := time.Duration(cfg.Ingest.MaxBufferAgeMS) * time.Millisecond * 3
-		if safeAge < 30*time.Second {
-			safeAge = 30 * time.Second
-		}
+		// Initial value is logged below; each maintenance tick recomputes the
+		// threshold from the live runtime age setting before purging.
+		safeAge := walSafeAge(cfg.Ingest.MaxBufferAgeMS)
 
 		recoveryInterval := time.Duration(cfg.WAL.RecoveryIntervalSeconds) * time.Second
 		go func() {
@@ -1014,6 +1019,8 @@ func main() {
 				case <-walMaintenanceCtx.Done():
 					return
 				case <-ticker.C:
+					_, maxBufferAgeMS := arrowBuffer.RuntimeConfig()
+					currentSafeAge := walSafeAge(maxBufferAgeMS)
 					if arrowBuffer.HasFlushFailure() {
 						// Storage failure detected — replay WAL files to recover data
 						// that was cleared from buffers after failed flush
@@ -1022,7 +1029,7 @@ func main() {
 						// Purge old WAL files first (same as normal path) to avoid replaying
 						// data that was already successfully flushed to parquet before the failure.
 						if walWriter != nil {
-							deleted, purgeErr := walWriter.PurgeOlderThan(safeAge)
+							deleted, purgeErr := walWriter.PurgeOlderThan(currentSafeAge)
 							if purgeErr != nil {
 								walLogger.Error().Err(purgeErr).Msg("WAL purge before recovery failed")
 							} else if deleted > 0 {
@@ -1057,7 +1064,7 @@ func main() {
 					} else {
 						// Normal operation — purge WAL files old enough that their data
 						// has been flushed to parquet by the normal buffer flush cycle
-						deleted, err := walWriter.PurgeOlderThan(safeAge)
+						deleted, err := walWriter.PurgeOlderThan(currentSafeAge)
 						if err != nil {
 							walLogger.Error().Err(err).Msg("Periodic WAL purge failed")
 						} else if deleted > 0 {
@@ -2251,28 +2258,30 @@ func main() {
 	// otherwise own and close the dedicated handle during shutdown.
 	runtimeIngestConfigDB, ownsRuntimeIngestConfigDB, err := sharedSQLiteHandle(authManager, cfg.Auth.DBPath)
 	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to open runtime ingest configuration database")
-	}
-	runtimeIngestConfigStore, err := ingest.NewRuntimeIngestConfigStore(runtimeIngestConfigDB)
-	if err != nil {
-		if ownsRuntimeIngestConfigDB {
-			_ = runtimeIngestConfigDB.Close()
+		log.Warn().Err(err).Msg("Runtime ingest configuration API is unavailable; continuing with startup settings")
+	} else {
+		runtimeIngestConfigStore, storeErr := ingest.NewRuntimeIngestConfigStore(runtimeIngestConfigDB)
+		if storeErr != nil {
+			if ownsRuntimeIngestConfigDB {
+				_ = runtimeIngestConfigDB.Close()
+			}
+			log.Warn().Err(storeErr).Msg("Runtime ingest configuration API is unavailable; continuing with startup settings")
+		} else {
+			if ownsRuntimeIngestConfigDB {
+				shutdownCoordinator.RegisterHook("runtime-ingest-config-db", func(context.Context) error {
+					return runtimeIngestConfigDB.Close()
+				}, shutdown.PriorityDatabase)
+			}
+			runtimeIngestConfigHandler := api.NewRuntimeIngestConfigHandler(
+				arrowBuffer,
+				runtimeIngestConfigStore,
+				runtimeIngestStartupConfig,
+				authManager,
+				logger.Get("runtime-ingest-config"),
+			)
+			runtimeIngestConfigHandler.RegisterRoutes(server.GetApp())
 		}
-		log.Fatal().Err(err).Msg("Failed to initialize runtime ingest configuration store")
 	}
-	if ownsRuntimeIngestConfigDB {
-		shutdownCoordinator.RegisterHook("runtime-ingest-config-db", func(context.Context) error {
-			return runtimeIngestConfigDB.Close()
-		}, shutdown.PriorityDatabase)
-	}
-	runtimeIngestConfigHandler := api.NewRuntimeIngestConfigHandler(
-		arrowBuffer,
-		runtimeIngestConfigStore,
-		runtimeIngestStartupConfig,
-		authManager,
-		logger.Get("runtime-ingest-config"),
-	)
-	runtimeIngestConfigHandler.RegisterRoutes(server.GetApp())
 
 	// Register Line Protocol handler
 	lineProtocolHandler := api.NewLineProtocolHandler(arrowBuffer, logger.Get("lineprotocol"))
@@ -4047,6 +4056,26 @@ func loadPersistentRuntimeIngestConfig(dbPath string) (ingest.RuntimeIngestConfi
 		return ingest.RuntimeIngestConfig{}, false, err
 	}
 	return store.Load()
+}
+
+// walSafeAge applies a three-times margin to the live buffer age, with a
+// 30-second floor. Saturating at MaxInt64 avoids duration overflow for a
+// valid but unusually large runtime age.
+func walSafeAge(maxBufferAgeMS int) time.Duration {
+	const floor = 30 * time.Second
+	const maxDuration = time.Duration(1<<63 - 1)
+	if maxBufferAgeMS <= 0 {
+		return floor
+	}
+	maxSafeAgeMS := int64(maxDuration / time.Millisecond / 3)
+	if int64(maxBufferAgeMS) > maxSafeAgeMS {
+		return maxDuration
+	}
+	safeAge := time.Duration(maxBufferAgeMS) * time.Millisecond * 3
+	if safeAge < floor {
+		return floor
+	}
+	return safeAge
 }
 
 func sharedSQLiteHandle(authManager *auth.AuthManager, dbPath string) (db *sql.DB, owned bool, err error) {

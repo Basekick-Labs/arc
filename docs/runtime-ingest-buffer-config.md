@@ -6,7 +6,7 @@ Arc can adjust its Arrow ingest buffer thresholds without restarting the process
 
 | Setting | Type | Unit | Validation |
 | --- | --- | --- | --- |
-| `max_buffer_size` | integer | records | Greater than zero |
+| `max_buffer_size` | integer | records | At least 1,000 records |
 | `max_buffer_age_ms` | integer | milliseconds | Greater than zero and representable as a Go duration |
 
 The settings apply to the current Arc process. Each node reads its own override from the metadata SQLite database at startup. The Arc API does not broadcast changes to cluster peers; `arcli ingest buffer set` coordinates the same change across all healthy nodes after preflighting them.
@@ -15,11 +15,13 @@ The size and age thresholds are shared process settings, but each threshold is e
 
 ## Ingest hot path and runtime update cost
 
-The buffer-size threshold is checked once for each buffered Arrow batch, not once for each record. This check already existed before runtime reconfiguration: the original writer compared the accumulated record count with its immutable startup configuration. Runtime reconfiguration changes where that threshold comes from: Arc now loads it from an atomic in-memory value so an API update can take effect without rebuilding the writer.
+The buffer-size threshold is checked once for each buffered Arrow batch, not once for each record. This check already existed before runtime reconfiguration: the original writer compared the accumulated record count with its immutable startup configuration. Runtime reconfiguration changes where that threshold comes from: Arc now loads it from an atomic in-memory value so an API update can take effect without rebuilding the writer. Runtime changes and persisted overrides reject values below 1,000 records to avoid a threshold that creates a flush for nearly every record and quickly saturates the bounded flush queue.
 
 The write path does not read environment variables, `arc.toml`, SQLite, or the runtime API to obtain the threshold. The persistent override is loaded from SQLite once during startup. When `persistent:true` is requested, SQLite is written on the administrative configuration path, not on ingest writes. The runtime check adds one atomic load per buffered batch in place of the prior ordinary field read; no benchmark is claimed here, so its workload-specific cost has not been quantified.
 
-The age threshold is handled by Arc's background flusher. It is not polled for every record or batch. Updating the age signals that flusher to recompute its timer and flush deadlines; normal age-based scans happen in that background path.
+The age threshold is handled by Arc's background flusher. It is not polled for every record or batch. Updating the age signals that flusher to recompute its timer and flush deadlines; normal age-based scans happen in that background path. When WAL is enabled, its maintenance goroutine also reads the live age threshold on each maintenance tick to recompute the safe purge age.
+
+Flush tasks receive their storage-write timeout when a worker dequeues them. Waiting in the bounded queue does not consume that timeout; a storage operation that stalls after dequeue remains bounded by the configured timeout.
 
 In a cluster, a direct API request still changes only the addressed process. `arcli` preflights the cluster and sends the same update to each healthy node, where it is persisted in that node's own metadata SQLite database. This is coordinated fan-out, not Raft replication or a distributed transaction. If an update fails partway through, `arcli` attempts best-effort rollback on nodes that may have changed; a rollback can also fail and must be treated as a partial cluster update.
 
@@ -54,11 +56,11 @@ Example response:
 }
 ```
 
-`source` is `persistent_override` when a saved override is active, `runtime_override` when values were changed for this process only, or `startup_config` when the effective values come from Arc's startup configuration. `persistent` indicates whether the override row exists.
+`source` is `persistent_override` when a saved override is active, `runtime_override` when values were changed for this process only, or `startup_config` when the effective values come from Arc's startup configuration. `persistent` is true only when the values currently in effect are the saved override.
 
 ### Change one or both values
 
-`PATCH` accepts either threshold, both, and an optional `persistent` boolean. If a threshold is omitted, its current effective value is retained. `persistent` defaults to `true` for compatibility. Set it to `false` to apply the values only to the current process and remove any saved override.
+`PATCH` accepts either threshold, both, and an optional `persistent` boolean. If a threshold is omitted, its current effective value is retained. `persistent` defaults to `false`. Set it to `true` to store the resulting pair in SQLite. A `persistent:false` update changes only the live process values and leaves any previously saved override untouched; use `DELETE` to explicitly remove the saved override.
 
 ```sh
 curl -X PATCH \
@@ -78,7 +80,7 @@ curl -X PATCH \
   http://localhost:8000/api/v1/config/runtime/ingest
 ```
 
-To persist the current effective values without changing thresholds, send `{"persistent":true}`. An empty body, `persistent:false` without a threshold, malformed JSON, non-positive value, or duration overflow is rejected. If Arc cannot save/delete a valid change, it rolls back the in-memory setting and returns a server error.
+To persist the current effective values without changing thresholds, send `{"persistent":true}`. An empty body, `persistent:false` without a threshold, malformed JSON, a size below 1,000 records, a non-positive age, or duration overflow is rejected. If Arc cannot save a requested persistent change, it rolls back the in-memory setting and returns a server error.
 
 ### Restore startup values
 
@@ -91,11 +93,11 @@ Arc removes the override and restores the startup values immediately. Subsequent
 
 ## Persistence and precedence
 
-At startup, Arc reads the optional saved override before constructing the ingest buffer. When a row exists, it takes precedence over the values loaded from `arc.toml`, environment variables, or defaults. Without a row, Arc uses its normal startup configuration resolution.
+At startup, Arc reads the optional saved override before constructing the ingest buffer. When a valid row exists, it takes precedence over the values loaded from `arc.toml`, environment variables, or defaults; Arc logs a warning when the saved values differ from the startup values. Without a row, Arc uses its normal startup configuration resolution. If the saved row cannot be read or validated, Arc logs a warning and continues with startup settings rather than refusing to boot.
 
 The override is stored in the singleton `arc_runtime_ingest_config` table in Arc's metadata database, at the database path configured for Arc authentication (default `./data/arc.db`). Preserve this database across container replacement. For Docker deployments, keep the persistent volume mounted at Arc's data directory.
 
-When `persistent:false` is used with changed thresholds, Arc removes any saved row and keeps the new values in memory only. `GET` then reports `persistent:false` and `source:"runtime_override"`. A restart returns to normal startup configuration.
+When `persistent:false` is used with changed thresholds, Arc keeps the new values only in memory for the current process. Any previously saved row remains unchanged and is applied after a restart. `GET` reports `persistent:false` and `source:"runtime_override"` while the runtime-only values are active.
 
 `DELETE` removes the override row rather than storing a copy of the startup values. This lets later startup configuration changes take effect after the reset.
 

@@ -56,8 +56,8 @@ func TestRuntimeIngestConfigStoreRejectsNonPositiveValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, cfg := range []RuntimeIngestConfig{
-		{MaxBufferSize: 0, MaxBufferAgeMS: 1},
-		{MaxBufferSize: 1, MaxBufferAgeMS: 0},
+		{MaxBufferSize: MinRuntimeIngestBufferSize - 1, MaxBufferAgeMS: 1},
+		{MaxBufferSize: MinRuntimeIngestBufferSize, MaxBufferAgeMS: 0},
 	} {
 		if err := store.Save(cfg); err == nil {
 			t.Errorf("Save(%+v) succeeded; want validation error", cfg)
@@ -67,7 +67,7 @@ func TestRuntimeIngestConfigStoreRejectsNonPositiveValues(t *testing.T) {
 	maxInt := int(^uint(0) >> 1)
 	maxDurationMS := int64(^uint64(0)>>1) / int64(time.Millisecond)
 	if int64(maxInt) > maxDurationMS {
-		if err := store.Save(RuntimeIngestConfig{MaxBufferSize: 1, MaxBufferAgeMS: maxInt}); err == nil {
+		if err := store.Save(RuntimeIngestConfig{MaxBufferSize: MinRuntimeIngestBufferSize, MaxBufferAgeMS: maxInt}); err == nil {
 			t.Fatal("Save() with overflowing max_buffer_age_ms succeeded; want validation error")
 		}
 	}

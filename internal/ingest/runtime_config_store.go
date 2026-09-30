@@ -14,9 +14,14 @@ type RuntimeIngestConfig struct {
 	MaxBufferAgeMS int `json:"max_buffer_age_ms"`
 }
 
+// MinRuntimeIngestBufferSize is the smallest supported runtime threshold.
+// Values below this can create a flush task for nearly every incoming record
+// and rapidly saturate the bounded flush queue.
+const MinRuntimeIngestBufferSize = 1000
+
 func validateRuntimeIngestConfig(cfg RuntimeIngestConfig) error {
-	if cfg.MaxBufferSize <= 0 {
-		return fmt.Errorf("max_buffer_size must be greater than zero")
+	if cfg.MaxBufferSize < MinRuntimeIngestBufferSize {
+		return fmt.Errorf("max_buffer_size must be at least %d", MinRuntimeIngestBufferSize)
 	}
 	if cfg.MaxBufferAgeMS <= 0 {
 		return fmt.Errorf("max_buffer_age_ms must be greater than zero")
@@ -44,7 +49,7 @@ func NewRuntimeIngestConfigStore(db *sql.DB) (*RuntimeIngestConfigStore, error) 
 	if _, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS arc_runtime_ingest_config (
 			id INTEGER PRIMARY KEY CHECK (id = 1),
-			max_buffer_size INTEGER NOT NULL CHECK (max_buffer_size > 0),
+			max_buffer_size INTEGER NOT NULL CHECK (max_buffer_size >= 1000),
 			max_buffer_age_ms INTEGER NOT NULL CHECK (max_buffer_age_ms > 0),
 			updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)

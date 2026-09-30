@@ -25,8 +25,8 @@ func (b *runtimeConfigBufferStub) RuntimeConfig() (int, int) { return b.size, b.
 
 func (b *runtimeConfigBufferStub) PatchRuntimeConfig(size, age *int) error {
 	if size != nil {
-		if *size <= 0 {
-			return fiber.NewError(fiber.StatusBadRequest, "max_buffer_size must be greater than zero")
+		if *size < ingest.MinRuntimeIngestBufferSize {
+			return fiber.NewError(fiber.StatusBadRequest, "max_buffer_size is below the supported minimum")
 		}
 		b.size = *size
 	}
@@ -55,7 +55,7 @@ func TestRuntimeIngestConfigPatchPersistsAndDeleteRestoresStartupValues(t *testi
 	app := fiber.New()
 	NewRuntimeIngestConfigHandler(buffer, store, startup, nil, zerolog.Nop()).RegisterRoutes(app)
 
-	patch := httptest.NewRequest("PATCH", "/api/v1/config/runtime/ingest", strings.NewReader(`{"max_buffer_age_ms":9000}`))
+	patch := httptest.NewRequest("PATCH", "/api/v1/config/runtime/ingest", strings.NewReader(`{"max_buffer_age_ms":9000,"persistent":true}`))
 	patch.Header.Set("Content-Type", "application/json")
 	response, err := app.Test(patch)
 	if err != nil {
@@ -96,6 +96,53 @@ func TestRuntimeIngestConfigPatchPersistsAndDeleteRestoresStartupValues(t *testi
 	}
 }
 
+func TestRuntimeOnlyPatchKeepsExistingPersistentOverride(t *testing.T) {
+	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "arc.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	store, err := ingest.NewRuntimeIngestConfigStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := ingest.RuntimeIngestConfig{MaxBufferSize: 2000, MaxBufferAgeMS: 5000}
+	if err := store.Save(saved); err != nil {
+		t.Fatal(err)
+	}
+	buffer := &runtimeConfigBufferStub{size: saved.MaxBufferSize, age: saved.MaxBufferAgeMS}
+	app := fiber.New()
+	NewRuntimeIngestConfigHandler(buffer, store, saved, nil, zerolog.Nop()).RegisterRoutes(app)
+
+	request := httptest.NewRequest("PATCH", "/api/v1/config/runtime/ingest", strings.NewReader(`{"max_buffer_size":3000}`))
+	request.Header.Set("Content-Type", "application/json")
+	response, err := app.Test(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != fiber.StatusOK {
+		t.Fatalf("runtime-only PATCH status = %d, want %d", response.StatusCode, fiber.StatusOK)
+	}
+
+	get, err := app.Test(httptest.NewRequest("GET", "/api/v1/config/runtime/ingest", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer get.Body.Close()
+	var got runtimeIngestConfigResponse
+	if err := json.NewDecoder(get.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.MaxBufferSize != 3000 || got.Persistent || got.Source != "runtime_override" {
+		t.Fatalf("GET after runtime-only PATCH = %+v", got)
+	}
+	if gotSaved, found, err := store.Load(); err != nil || !found || gotSaved != saved {
+		t.Fatalf("saved override after runtime-only PATCH = (%+v, %v, %v), want unchanged %+v", gotSaved, found, err, saved)
+	}
+}
+
 func TestRuntimeIngestConfigPatchRejectsInvalidValueWithoutSaving(t *testing.T) {
 	db, err := sql.Open("sqlite3", ":memory:")
 	if err != nil {
@@ -107,11 +154,11 @@ func TestRuntimeIngestConfigPatchRejectsInvalidValueWithoutSaving(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	buffer := &runtimeConfigBufferStub{size: 100, age: 200}
+	buffer := &runtimeConfigBufferStub{size: 1000, age: 200}
 	app := fiber.New()
-	NewRuntimeIngestConfigHandler(buffer, store, ingest.RuntimeIngestConfig{MaxBufferSize: 100, MaxBufferAgeMS: 200}, nil, zerolog.Nop()).RegisterRoutes(app)
+	NewRuntimeIngestConfigHandler(buffer, store, ingest.RuntimeIngestConfig{MaxBufferSize: 1000, MaxBufferAgeMS: 200}, nil, zerolog.Nop()).RegisterRoutes(app)
 
-	request := httptest.NewRequest("PATCH", "/api/v1/config/runtime/ingest", strings.NewReader(`{"max_buffer_size":0}`))
+	request := httptest.NewRequest("PATCH", "/api/v1/config/runtime/ingest", strings.NewReader(`{"max_buffer_size":999}`))
 	request.Header.Set("Content-Type", "application/json")
 	response, err := app.Test(request)
 	if err != nil {
@@ -124,7 +171,7 @@ func TestRuntimeIngestConfigPatchRejectsInvalidValueWithoutSaving(t *testing.T) 
 	if _, found, err := store.Load(); err != nil || found {
 		t.Fatalf("invalid PATCH persisted an override: found=%v err=%v", found, err)
 	}
-	if size, age := buffer.RuntimeConfig(); size != 100 || age != 200 {
+	if size, age := buffer.RuntimeConfig(); size != 1000 || age != 200 {
 		t.Fatalf("invalid PATCH changed live settings to (%d, %d)", size, age)
 	}
 }
@@ -143,11 +190,11 @@ func TestRuntimeIngestConfigPatchRollsBackLiveValueWhenPersistenceFails(t *testi
 	if _, err := db.Exec(`CREATE TRIGGER reject_runtime_ingest_config BEFORE INSERT ON arc_runtime_ingest_config BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END`); err != nil {
 		t.Fatal(err)
 	}
-	buffer := &runtimeConfigBufferStub{size: 100, age: 200}
+	buffer := &runtimeConfigBufferStub{size: 1000, age: 200}
 	app := fiber.New()
-	NewRuntimeIngestConfigHandler(buffer, store, ingest.RuntimeIngestConfig{MaxBufferSize: 100, MaxBufferAgeMS: 200}, nil, zerolog.Nop()).RegisterRoutes(app)
+	NewRuntimeIngestConfigHandler(buffer, store, ingest.RuntimeIngestConfig{MaxBufferSize: 1000, MaxBufferAgeMS: 200}, nil, zerolog.Nop()).RegisterRoutes(app)
 
-	request := httptest.NewRequest("PATCH", "/api/v1/config/runtime/ingest", strings.NewReader(`{"max_buffer_size":300}`))
+	request := httptest.NewRequest("PATCH", "/api/v1/config/runtime/ingest", strings.NewReader(`{"max_buffer_size":1300,"persistent":true}`))
 	request.Header.Set("Content-Type", "application/json")
 	response, err := app.Test(request)
 	if err != nil {
@@ -157,7 +204,7 @@ func TestRuntimeIngestConfigPatchRollsBackLiveValueWhenPersistenceFails(t *testi
 	if response.StatusCode != fiber.StatusInternalServerError {
 		t.Fatalf("PATCH status = %d, want %d", response.StatusCode, fiber.StatusInternalServerError)
 	}
-	if size, age := buffer.RuntimeConfig(); size != 100 || age != 200 {
+	if size, age := buffer.RuntimeConfig(); size != 1000 || age != 200 {
 		t.Fatalf("persistence failure left live settings at (%d, %d)", size, age)
 	}
 	if _, found, err := store.Load(); err != nil || found {
@@ -177,17 +224,17 @@ func TestRuntimeIngestConfigRoutesRequireAdmin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	buffer := &runtimeConfigBufferStub{size: 100, age: 200}
+	buffer := &runtimeConfigBufferStub{size: 1000, age: 200}
 	app := fiber.New()
 	app.Use(auth.NewMiddleware(auth.MiddlewareConfig{AuthManager: am}))
-	NewRuntimeIngestConfigHandler(buffer, store, ingest.RuntimeIngestConfig{MaxBufferSize: 100, MaxBufferAgeMS: 200}, am, zerolog.Nop()).RegisterRoutes(app)
+	NewRuntimeIngestConfigHandler(buffer, store, ingest.RuntimeIngestConfig{MaxBufferSize: 1000, MaxBufferAgeMS: 200}, am, zerolog.Nop()).RegisterRoutes(app)
 
 	requests := []struct {
 		method string
 		body   string
 	}{
 		{method: http.MethodGet},
-		{method: http.MethodPatch, body: `{"max_buffer_size":300}`},
+		{method: http.MethodPatch, body: `{"max_buffer_size":1300}`},
 		{method: http.MethodDelete},
 	}
 	for _, tc := range requests {
@@ -206,7 +253,7 @@ func TestRuntimeIngestConfigRoutesRequireAdmin(t *testing.T) {
 			if authCase.token != "" {
 				req.Header.Set("Authorization", "Bearer "+authCase.token)
 			}
-			resp, err := app.Test(req)
+			resp, err := app.Test(req, -1)
 			if err != nil {
 				t.Fatalf("%s %s: %v", tc.method, authCase.name, err)
 			}
