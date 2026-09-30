@@ -1,6 +1,6 @@
 # Arc v2026.09.2 Release Notes
 
-> **Status:** Planned — October 2026 patch release.
+> **Status:** Released 2026-10-01.
 
 ## New: administrative cluster file deletion (`DELETE /api/v1/cluster/files`) ([#830](https://github.com/Basekick-Labs/arc/pull/830))
 
