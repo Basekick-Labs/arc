@@ -10,6 +10,12 @@ The size threshold was already checked once per buffered Arrow batch before this
 
 The API and CLI guides describe persistence precedence, restart behavior, cluster fan-out and best-effort rollback, and the delay between a runtime change and telemetry/Grafana visibility.
 
+## New (experimental): optional in-memory reserve for a full ingest flush queue
+
+Arc can optionally retain size-triggered flush tasks in a bounded, in-memory reserve when the normal flush queue is full. The reserve is disabled by default, can be reconfigured through the admin runtime API, and can be persisted independently in Arc's metadata SQLite database. Capacity and current occupancy are measured in records. Worker dequeue events return reserved tasks to the normal queue; the reserve does not poll from the ingest path or increase sustained flush throughput.
+
+New metrics distinguish reserve occupancy and admissions, normal queue activity, fallback with a WAL writer configured, and overflow with WAL disabled. A configured WAL fallback does not prove that each record was appended successfully. With WAL disabled, overflow after reserve exhaustion remains unprotected and may lose records. See `docs/runtime-ingest-buffer-config.md` for the API, persistence, cluster scope, metric meanings, and recovery limits.
+
 ## New: administrative cluster file deletion (`DELETE /api/v1/cluster/files`) ([#830](https://github.com/Basekick-Labs/arc/pull/830))
 
 A new administrative endpoint `DELETE /api/v1/cluster/files?path=...&confirm=true` allows cluster operators to remove an entry from the cluster-wide Raft manifest.

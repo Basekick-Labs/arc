@@ -63,12 +63,21 @@ type Metrics struct {
 	queryDisconnectsSQLJSON   atomic.Int64
 
 	// Arrow buffer metrics
-	bufferRecordsBuffered atomic.Int64
-	bufferRecordsWritten  atomic.Int64
-	bufferFlushesTotal    atomic.Int64
-	bufferErrorsTotal     atomic.Int64
-	bufferFlushFailures   atomic.Int64
-	bufferQueueDepth      atomic.Int64
+	bufferRecordsBuffered                   atomic.Int64
+	bufferRecordsWritten                    atomic.Int64
+	bufferFlushesTotal                      atomic.Int64
+	bufferErrorsTotal                       atomic.Int64
+	bufferFlushFailures                     atomic.Int64
+	bufferQueueDepth                        atomic.Int64
+	bufferElasticReserveEnabled             atomic.Int64
+	bufferElasticReserveCapacityRecords     atomic.Int64
+	bufferElasticReserveRecords             atomic.Int64
+	bufferElasticReserveAdmissions          atomic.Int64
+	bufferFlushQueueEnqueuedRecords         atomic.Int64
+	bufferFlushQueueFullRecords             atomic.Int64
+	bufferFlushFallbackRecords              atomic.Int64
+	bufferFlushFallbackWALConfiguredRecords atomic.Int64
+	bufferUnprotectedOverflowRecords        atomic.Int64
 
 	// Storage metrics
 	storageWritesTotal     atomic.Int64
@@ -396,6 +405,37 @@ func (m *Metrics) SetBufferFlushes(count int64)         { m.bufferFlushesTotal.S
 func (m *Metrics) SetBufferErrors(count int64)          { m.bufferErrorsTotal.Store(count) }
 func (m *Metrics) IncBufferFlushFailures()              { m.bufferFlushFailures.Add(1) }
 func (m *Metrics) SetBufferQueueDepth(depth int64)      { m.bufferQueueDepth.Store(depth) }
+func (m *Metrics) SetBufferElasticReserveEnabled(enabled bool) {
+	if enabled {
+		m.bufferElasticReserveEnabled.Store(1)
+	} else {
+		m.bufferElasticReserveEnabled.Store(0)
+	}
+}
+func (m *Metrics) SetBufferElasticReserveCapacity(records int64) {
+	m.bufferElasticReserveCapacityRecords.Store(records)
+}
+func (m *Metrics) SetBufferElasticReserveRecords(records int64) {
+	m.bufferElasticReserveRecords.Store(records)
+}
+func (m *Metrics) IncBufferElasticReserveAdmissions(records int64) {
+	m.bufferElasticReserveAdmissions.Add(records)
+}
+func (m *Metrics) IncBufferFlushQueueEnqueued(records int64) {
+	m.bufferFlushQueueEnqueuedRecords.Add(records)
+}
+func (m *Metrics) IncBufferFlushQueueFull(records int64) {
+	m.bufferFlushQueueFullRecords.Add(records)
+}
+func (m *Metrics) IncBufferFlushFallback(records int64) {
+	m.bufferFlushFallbackRecords.Add(records)
+}
+func (m *Metrics) IncBufferFlushFallbackWALConfigured(records int64) {
+	m.bufferFlushFallbackWALConfiguredRecords.Add(records)
+}
+func (m *Metrics) IncBufferUnprotectedOverflow(records int64) {
+	m.bufferUnprotectedOverflowRecords.Add(records)
+}
 
 // Storage Metrics
 func (m *Metrics) IncStorageWrites()                { m.storageWritesTotal.Add(1) }
@@ -640,12 +680,21 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"query_client_disconnects_sql_json_total":   m.queryDisconnectsSQLJSON.Load(),
 
 		// Buffer
-		"buffer_records_buffered":     m.bufferRecordsBuffered.Load(),
-		"buffer_records_written":      m.bufferRecordsWritten.Load(),
-		"buffer_flushes_total":        m.bufferFlushesTotal.Load(),
-		"buffer_errors_total":         m.bufferErrorsTotal.Load(),
-		"buffer_flush_failures_total": m.bufferFlushFailures.Load(),
-		"buffer_queue_depth":          m.bufferQueueDepth.Load(),
+		"buffer_records_buffered":                            m.bufferRecordsBuffered.Load(),
+		"buffer_records_written":                             m.bufferRecordsWritten.Load(),
+		"buffer_flushes_total":                               m.bufferFlushesTotal.Load(),
+		"buffer_errors_total":                                m.bufferErrorsTotal.Load(),
+		"buffer_flush_failures_total":                        m.bufferFlushFailures.Load(),
+		"buffer_queue_depth":                                 m.bufferQueueDepth.Load(),
+		"buffer_elastic_reserve_enabled":                     m.bufferElasticReserveEnabled.Load(),
+		"buffer_elastic_reserve_capacity_records":            m.bufferElasticReserveCapacityRecords.Load(),
+		"buffer_elastic_reserve_records":                     m.bufferElasticReserveRecords.Load(),
+		"buffer_elastic_reserve_admissions_total":            m.bufferElasticReserveAdmissions.Load(),
+		"buffer_flush_queue_enqueued_records_total":          m.bufferFlushQueueEnqueuedRecords.Load(),
+		"buffer_flush_queue_full_records_total":              m.bufferFlushQueueFullRecords.Load(),
+		"buffer_flush_fallback_records_total":                m.bufferFlushFallbackRecords.Load(),
+		"buffer_flush_fallback_wal_configured_records_total": m.bufferFlushFallbackWALConfiguredRecords.Load(),
+		"buffer_unprotected_overflow_records_total":          m.bufferUnprotectedOverflowRecords.Load(),
 
 		// Storage
 		"storage_writes_total":      m.storageWritesTotal.Load(),
@@ -905,6 +954,34 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_buffer_queue_depth Current flush queue depth\n"...)
 	b = append(b, "# TYPE arc_buffer_queue_depth gauge\n"...)
 	b = appendMetric(b, "arc_buffer_queue_depth", float64(m.bufferQueueDepth.Load()))
+
+	b = append(b, "# HELP arc_buffer_elastic_reserve_enabled Whether the ingest flush reserve is enabled\n"...)
+	b = append(b, "# TYPE arc_buffer_elastic_reserve_enabled gauge\n"...)
+	b = appendMetric(b, "arc_buffer_elastic_reserve_enabled", float64(m.bufferElasticReserveEnabled.Load()))
+	b = append(b, "# HELP arc_buffer_elastic_reserve_capacity_records Configured elastic reserve capacity in records\n"...)
+	b = append(b, "# TYPE arc_buffer_elastic_reserve_capacity_records gauge\n"...)
+	b = appendMetric(b, "arc_buffer_elastic_reserve_capacity_records", float64(m.bufferElasticReserveCapacityRecords.Load()))
+	b = append(b, "# HELP arc_buffer_elastic_reserve_records Records currently held in the elastic reserve\n"...)
+	b = append(b, "# TYPE arc_buffer_elastic_reserve_records gauge\n"...)
+	b = appendMetric(b, "arc_buffer_elastic_reserve_records", float64(m.bufferElasticReserveRecords.Load()))
+	b = append(b, "# HELP arc_buffer_elastic_reserve_admissions_total Records admitted to the elastic reserve\n"...)
+	b = append(b, "# TYPE arc_buffer_elastic_reserve_admissions_total counter\n"...)
+	b = appendMetric(b, "arc_buffer_elastic_reserve_admissions_total", float64(m.bufferElasticReserveAdmissions.Load()))
+	b = append(b, "# HELP arc_buffer_flush_queue_enqueued_records_total Records admitted to the flush queue, including reserve drains\n"...)
+	b = append(b, "# TYPE arc_buffer_flush_queue_enqueued_records_total counter\n"...)
+	b = appendMetric(b, "arc_buffer_flush_queue_enqueued_records_total", float64(m.bufferFlushQueueEnqueuedRecords.Load()))
+	b = append(b, "# HELP arc_buffer_flush_queue_full_records_total Records whose flush task encountered a full queue\n"...)
+	b = append(b, "# TYPE arc_buffer_flush_queue_full_records_total counter\n"...)
+	b = appendMetric(b, "arc_buffer_flush_queue_full_records_total", float64(m.bufferFlushQueueFullRecords.Load()))
+	b = append(b, "# HELP arc_buffer_flush_fallback_records_total Records left to Arc's configured failure fallback after queue and reserve exhaustion\n"...)
+	b = append(b, "# TYPE arc_buffer_flush_fallback_records_total counter\n"...)
+	b = appendMetric(b, "arc_buffer_flush_fallback_records_total", float64(m.bufferFlushFallbackRecords.Load()))
+	b = append(b, "# HELP arc_buffer_flush_fallback_wal_configured_records_total Records sent to the existing fallback while a WAL writer is configured; this does not confirm each record was appended successfully\n"...)
+	b = append(b, "# TYPE arc_buffer_flush_fallback_wal_configured_records_total counter\n"...)
+	b = appendMetric(b, "arc_buffer_flush_fallback_wal_configured_records_total", float64(m.bufferFlushFallbackWALConfiguredRecords.Load()))
+	b = append(b, "# HELP arc_buffer_unprotected_overflow_records_total Records that overflowed with the WAL disabled\n"...)
+	b = append(b, "# TYPE arc_buffer_unprotected_overflow_records_total counter\n"...)
+	b = appendMetric(b, "arc_buffer_unprotected_overflow_records_total", float64(m.bufferUnprotectedOverflowRecords.Load()))
 
 	// Storage metrics
 	b = append(b, "# HELP arc_storage_writes_total Total storage writes\n"...)

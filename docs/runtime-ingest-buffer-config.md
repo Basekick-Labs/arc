@@ -2,6 +2,42 @@
 
 Arc can adjust its Arrow ingest buffer thresholds without restarting the process. The runtime API applies new values immediately and can store them in Arc's metadata SQLite database so they are restored after a restart.
 
+## Optional elastic flush-queue reserve
+
+Arc can optionally reserve bounded in-memory capacity for size-triggered flush tasks that find `flushQueue` full. It is disabled by default. The reserve is only a temporary overflow cushion: it does not increase sustained flush throughput, cover age-triggered flushes or worker-held writes, or guarantee durable recovery after the reserve fills.
+
+The setting is measured and reported in **records**. Its capacity is an admission budget for batches: a batch is accepted only when its record count fits in the remaining capacity. Arc preallocates bounded task-reference slots when enabling/resizing the reserve and checks available memory before changing the live setting. If capacity cannot be validated or allocated, the API returns an error and leaves the prior runtime and SQLite state unchanged. Reserve admission happens only after the normal flush queue is full; the ordinary per-record ingest path does not poll the reserve, read SQLite/environment settings, or scan queue state.
+
+The reserve stores the existing extracted flush task and its batch references; it does not serialize a second copy of records. Worker dequeue events move pending tasks back to `flushQueue`, without a timer or polling loop. Occupancy should return to zero after the backlog drains. Arc rejects a resize below current occupancy or a disable while records remain reserved.
+
+The API is process-local and does not replicate through Raft. A cluster operator must configure each Arc node and store the override in each node's own metadata SQLite database.
+
+When `persistent:true` is supplied, Arc saves the reserve setting in the independent `arc_runtime_ingest_elastic_reserve` table. Reserve persistence is opt-in and defaults to false for runtime API changes. Omitting `persistent` preserves the current persistence mode for a saved override; `persistent:false` removes the saved row while leaving the live setting active until restart. `DELETE` disables the reserve and removes only its saved override. Resetting the `max_buffer_size` / `max_buffer_age_ms` override does not reset this reserve setting.
+
+```sh
+# Enable a runtime-only reserve with a 250,000-record capacity
+curl -X PATCH \
+  -H "Authorization: Bearer $ARC_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"enabled":true,"capacity_records":250000,"persistent":false}' \
+  http://localhost:8000/api/v1/config/runtime/ingest/elastic-reserve
+
+# Read settings and current occupancy
+curl -H "Authorization: Bearer $ARC_TOKEN" \
+  http://localhost:8000/api/v1/config/runtime/ingest/elastic-reserve
+
+# Persist the live setting for restart
+curl -X PATCH \
+  -H "Authorization: Bearer $ARC_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"persistent":true}' \
+  http://localhost:8000/api/v1/config/runtime/ingest/elastic-reserve
+```
+
+If the flush queue and reserve are both full, Arc uses the existing WAL fallback when a WAL writer is configured. A configured WAL is not proof that every affected record was appended successfully: correlate this counter with WAL append-error telemetry and WAL recovery status. With WAL disabled, overflow after reserve exhaustion is unprotected and may lose records. Arc reports it separately; the reserve is volatile memory and does not change that durability contract.
+
+New Prometheus metrics expose reserve enablement, configured/current record capacity, admissions, queue-full records, re-queued records, fallback records, and unprotected overflow: `arc_buffer_elastic_reserve_enabled`, `arc_buffer_elastic_reserve_capacity_records`, `arc_buffer_elastic_reserve_records`, `arc_buffer_elastic_reserve_admissions_total`, `arc_buffer_flush_queue_enqueued_records_total`, `arc_buffer_flush_queue_full_records_total`, `arc_buffer_flush_fallback_records_total`, `arc_buffer_flush_fallback_wal_configured_records_total`, and `arc_buffer_unprotected_overflow_records_total`. The WAL-configured fallback counter is not a durable-append confirmation. Use sequence-tagged test traffic to establish exact loss or duplication; production counters support flow comparison and alerting, not record-level proof.
+
 ## Settings and scope
 
 | Setting | Type | Unit | Validation |

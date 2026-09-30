@@ -72,3 +72,67 @@ func TestRuntimeIngestConfigStoreRejectsNonPositiveValues(t *testing.T) {
 		}
 	}
 }
+
+func TestRuntimeElasticReserveStorePersistsIndependently(t *testing.T) {
+	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "arc.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	store, err := NewRuntimeIngestConfigStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := store.LoadElasticReserve(); err != nil || found {
+		t.Fatalf("initial LoadElasticReserve = found %v, err %v; want no override", found, err)
+	}
+	want := RuntimeElasticReserveConfig{Enabled: true, CapacityRecords: 12345}
+	if err := store.SaveElasticReserve(want); err != nil {
+		t.Fatal(err)
+	}
+	got, found, err := store.LoadElasticReserve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || got != want {
+		t.Fatalf("LoadElasticReserve = (%+v, %v), want (%+v, true)", got, found, want)
+	}
+	if err := store.Save(RuntimeIngestConfig{MaxBufferSize: 11, MaxBufferAgeMS: 22}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Delete(); err != nil {
+		t.Fatal(err)
+	}
+	if got, found, err := store.LoadElasticReserve(); err != nil || !found || got != want {
+		t.Fatalf("buffer Delete changed reserve = (%+v, %v, %v)", got, found, err)
+	}
+	if err := store.DeleteElasticReserve(); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := store.LoadElasticReserve(); err != nil || found {
+		t.Fatalf("LoadElasticReserve after reserve delete = found %v, err %v; want no override", found, err)
+	}
+}
+
+func TestRuntimeElasticReserveStoreRejectsInvalidCapacity(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	store, err := NewRuntimeIngestConfigStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cfg := range []RuntimeElasticReserveConfig{
+		{Enabled: true, CapacityRecords: 0},
+		{Enabled: true, CapacityRecords: -1},
+		{Enabled: false, CapacityRecords: -1},
+	} {
+		if err := store.SaveElasticReserve(cfg); err == nil {
+			t.Errorf("SaveElasticReserve(%+v) succeeded; want validation error", cfg)
+		}
+	}
+}

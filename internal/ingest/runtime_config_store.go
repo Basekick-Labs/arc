@@ -51,7 +51,79 @@ func NewRuntimeIngestConfigStore(db *sql.DB) (*RuntimeIngestConfigStore, error) 
 	`); err != nil {
 		return nil, fmt.Errorf("create runtime ingest config table: %w", err)
 	}
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS arc_runtime_ingest_elastic_reserve (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+		enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+			capacity_records INTEGER NOT NULL CHECK (capacity_records >= 0),
+			updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)
+	`); err != nil {
+		return nil, fmt.Errorf("create runtime ingest elastic reserve table: %w", err)
+	}
 	return &RuntimeIngestConfigStore{db: db}, nil
+}
+
+// LoadElasticReserve returns the saved reserve override, if one exists.
+func (s *RuntimeIngestConfigStore) LoadElasticReserve() (RuntimeElasticReserveConfig, bool, error) {
+	if s == nil || s.db == nil {
+		return RuntimeElasticReserveConfig{}, false, fmt.Errorf("runtime ingest config store is unavailable")
+	}
+	var enabled int
+	var cfg RuntimeElasticReserveConfig
+	err := s.db.QueryRow(`
+		SELECT enabled, capacity_records
+		FROM arc_runtime_ingest_elastic_reserve WHERE id = 1
+	`).Scan(&enabled, &cfg.CapacityRecords)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RuntimeElasticReserveConfig{}, false, nil
+	}
+	if err != nil {
+		return RuntimeElasticReserveConfig{}, false, fmt.Errorf("load runtime ingest elastic reserve: %w", err)
+	}
+	cfg.Enabled = enabled == 1
+	if err := validateRuntimeElasticReserveConfig(cfg); err != nil {
+		return RuntimeElasticReserveConfig{}, false, fmt.Errorf("invalid persisted runtime ingest elastic reserve: %w", err)
+	}
+	return cfg, true, nil
+}
+
+// SaveElasticReserve atomically replaces the independent reserve override.
+func (s *RuntimeIngestConfigStore) SaveElasticReserve(cfg RuntimeElasticReserveConfig) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("runtime ingest config store is unavailable")
+	}
+	if err := validateRuntimeElasticReserveConfig(cfg); err != nil {
+		return err
+	}
+	enabled := 0
+	if cfg.Enabled {
+		enabled = 1
+	}
+	_, err := s.db.Exec(`
+		INSERT INTO arc_runtime_ingest_elastic_reserve (id, enabled, capacity_records, updated_at)
+		VALUES (1, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(id) DO UPDATE SET
+			enabled = excluded.enabled,
+			capacity_records = excluded.capacity_records,
+			updated_at = CURRENT_TIMESTAMP
+	`, enabled, cfg.CapacityRecords)
+	if err != nil {
+		return fmt.Errorf("save runtime ingest elastic reserve: %w", err)
+	}
+	return nil
+}
+
+// DeleteElasticReserve removes only the reserve override. It is deliberately
+// separate from Delete, which resets max_buffer_size and max_buffer_age_ms.
+func (s *RuntimeIngestConfigStore) DeleteElasticReserve() error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("runtime ingest config store is unavailable")
+	}
+	if _, err := s.db.Exec(`DELETE FROM arc_runtime_ingest_elastic_reserve WHERE id = 1`); err != nil {
+		return fmt.Errorf("delete runtime ingest elastic reserve: %w", err)
+	}
+	return nil
 }
 
 // Load returns the saved override, if one exists.

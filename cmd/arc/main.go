@@ -863,6 +863,10 @@ func main() {
 			Int("max_buffer_age_ms", cfg.Ingest.MaxBufferAgeMS).
 			Msg("Loaded persisted runtime ingest buffer settings")
 	}
+	persistedElasticReserve, hasElasticReserveOverride, err := loadPersistentRuntimeElasticReserve(cfg.Auth.DBPath)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to load persisted runtime ingest elastic reserve")
+	}
 
 	// Initialize Arrow buffer (optionally with WAL)
 	log.Info().
@@ -871,6 +875,14 @@ func main() {
 		Int("flush_queue_size", cfg.Ingest.FlushQueueSize).
 		Msg("Initializing Arrow buffer with ingestion config")
 	arrowBuffer := ingest.NewArrowBuffer(&cfg.Ingest, storageBackend, logger.Get("arrow"))
+	if hasElasticReserveOverride {
+		if err := arrowBuffer.ConfigureElasticReserve(persistedElasticReserve); err != nil {
+			log.Fatal().Err(err).Msg("Failed to apply persisted runtime ingest elastic reserve")
+		}
+		log.Info().Bool("enabled", persistedElasticReserve.Enabled).
+			Int64("capacity_records", persistedElasticReserve.CapacityRecords).
+			Msg("Loaded persisted runtime ingest elastic reserve")
+	}
 	if walWriter != nil {
 		arrowBuffer.SetWAL(walWriter)
 	}
@@ -2273,6 +2285,13 @@ func main() {
 		logger.Get("runtime-ingest-config"),
 	)
 	runtimeIngestConfigHandler.RegisterRoutes(server.GetApp())
+	runtimeIngestReserveHandler := api.NewRuntimeIngestReserveHandler(
+		arrowBuffer,
+		runtimeIngestConfigStore,
+		authManager,
+		logger.Get("runtime-ingest-reserve"),
+	)
+	runtimeIngestReserveHandler.RegisterRoutes(server.GetApp())
 
 	// Register Line Protocol handler
 	lineProtocolHandler := api.NewLineProtocolHandler(arrowBuffer, logger.Get("lineprotocol"))
@@ -4047,6 +4066,21 @@ func loadPersistentRuntimeIngestConfig(dbPath string) (ingest.RuntimeIngestConfi
 		return ingest.RuntimeIngestConfig{}, false, err
 	}
 	return store.Load()
+}
+
+func loadPersistentRuntimeElasticReserve(dbPath string) (ingest.RuntimeElasticReserveConfig, bool, error) {
+	db, owned, err := sharedSQLiteHandle(nil, dbPath)
+	if err != nil {
+		return ingest.RuntimeElasticReserveConfig{}, false, err
+	}
+	if owned {
+		defer db.Close()
+	}
+	store, err := ingest.NewRuntimeIngestConfigStore(db)
+	if err != nil {
+		return ingest.RuntimeElasticReserveConfig{}, false, err
+	}
+	return store.LoadElasticReserve()
 }
 
 func sharedSQLiteHandle(authManager *auth.AuthManager, dbPath string) (db *sql.DB, owned bool, err error) {

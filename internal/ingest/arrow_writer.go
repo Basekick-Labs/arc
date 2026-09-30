@@ -786,8 +786,6 @@ type bufferShard struct {
 
 // flushTask represents a flush operation to be executed by workers
 type flushTask struct {
-	ctx         context.Context
-	cancel      context.CancelFunc // must be called when task completes to release resources
 	bufferKey   string
 	database    string
 	measurement string
@@ -858,6 +856,15 @@ type ArrowBuffer struct {
 	// Prevents goroutine explosion under sustained load
 	flushQueue   chan flushTask
 	flushWorkers int
+
+	// Optional reserve for size-triggered flush tasks rejected by flushQueue.
+	// The reserve is inspected only at flush-task admission and worker events,
+	// never for each ingested record.
+	elasticReserveMu       sync.Mutex
+	elasticReserveTasks    []*flushTask
+	elasticReserveRecords  atomic.Int64
+	elasticReserveCapacity atomic.Int64
+	elasticReserveEnabled  atomic.Bool
 
 	// closing is the shutdown short-circuit checked by tryEnqueueFlush.
 	// See Close() for the full ordering rationale; senders see this
@@ -1030,6 +1037,9 @@ func (b *ArrowBuffer) publishBufferMetrics() {
 	m.SetBufferFlushes(b.totalFlushes.Load())
 	m.SetBufferRecordsWritten(b.totalRecordsWritten.Load())
 	m.SetBufferQueueDepth(b.queueDepth.Load())
+	m.SetBufferElasticReserveEnabled(b.elasticReserveEnabled.Load())
+	m.SetBufferElasticReserveCapacity(b.elasticReserveCapacity.Load())
+	m.SetBufferElasticReserveRecords(b.elasticReserveRecords.Load())
 	m.SetBufferErrors(b.totalErrors.Load())
 	m.SetBufferRecordsBuffered(b.currentBufferedRecords())
 }
@@ -1632,17 +1642,15 @@ func (b *ArrowBuffer) recordWALError(err error, fields func(*zerolog.Event)) {
 	ev.Msg("WAL write failed - data may be lost on crash")
 }
 
-// flushSendOutcome tells callers whether tryEnqueueFlush actually
-// queued the task. Callers don't need to do anything different on
-// queued vs dropped today (data is in WAL either way), but having a
-// distinct outcome makes the audit trail and metrics readable.
+// flushSendOutcome tells callers where a flush task was retained.
 type flushSendOutcome int
 
 const (
-	flushQueued      flushSendOutcome = iota // task accepted on flushQueue
-	flushSkipClosing                         // buffer is closing — short-circuit
-	flushCtxCanceled                         // ctx fired during the select (defense-in-depth vs the closing flag)
-	flushQueueFull                           // queue at capacity, drop relying on WAL replay
+	flushQueued          flushSendOutcome = iota // task accepted on flushQueue
+	flushElasticReserved                         // task retained in the elastic reserve
+	flushSkipClosing                             // buffer is closing — short-circuit
+	flushCtxCanceled                             // ctx fired during the select (defense-in-depth vs the closing flag)
+	flushQueueFull                               // queue and reserve at capacity; fallback depends on WAL availability
 )
 
 // tryEnqueueFlush is the shared non-blocking send into b.flushQueue
@@ -1653,38 +1661,32 @@ const (
 //  2. The ctx.Done() defense-in-depth select arm (covers the narrow
 //     window between flag-load and select-eval where Close()'s
 //     cancel could fire).
-//  3. The queue-full default arm (queue at capacity; data stays in
-//     WAL for recovery).
+//  3. The queue-full arm first transfers task ownership to the optional
+//     reserve, then uses Arc's existing fallback if both are full.
 //
-// The caller MUST already have built `task` and called flushCancel
-// to register the timeout context — tryEnqueueFlush does not own
-// that lifecycle. flushCancel is invoked here on every non-queued
-// outcome so the ctx is cleaned up promptly.
-//
-// Returns the outcome so the caller can pass it to metrics/logging
-// uniformly. All non-queued outcomes increment the same
-// IncWALRecordsPreserved counter to keep the operator-visible
-// "records that fell back to WAL" rate authoritative.
+// The flush timeout starts in the worker, after queueing, so waiting for
+// either queue does not consume the storage-write timeout.
 func (b *ArrowBuffer) tryEnqueueFlush(
 	task flushTask,
-	flushCancel context.CancelFunc,
 	bufferKey string,
 	totalBuffered int,
 ) flushSendOutcome {
 	if b.closing.Load() {
-		flushCancel()
-		b.logger.Warn().
-			Str("buffer_key", bufferKey).
-			Int("records", totalBuffered).
-			Msg("Flush queue send skipped: buffer is closing (data preserved in WAL)")
-		metrics.Get().IncWALRecordsPreserved(int64(totalBuffered))
+		b.recordWALFallback(int64(totalBuffered), "Flush queue send skipped: buffer is closing")
 		b.walOnlyRecords.Add(int64(totalBuffered))
 		return flushSkipClosing
+	}
+	if b.elasticReserveEnabled.Load() && b.elasticReserveRecords.Load() > 0 {
+		if b.admitElasticTask(task) {
+			metrics.Get().IncBufferElasticReserveAdmissions(int64(totalBuffered))
+			return flushElasticReserved
+		}
 	}
 	select {
 	case b.flushQueue <- task:
 		depth := b.queueDepth.Add(1)
 		metrics.Get().SetBufferQueueDepth(depth)
+		metrics.Get().IncBufferFlushQueueEnqueued(int64(totalBuffered))
 		b.logger.Info().
 			Str("buffer_key", bufferKey).
 			Int("total_records", totalBuffered).
@@ -1692,26 +1694,44 @@ func (b *ArrowBuffer) tryEnqueueFlush(
 			Msg("Buffer size exceeded, queued flush to worker pool")
 		return flushQueued
 	case <-b.ctx.Done():
-		flushCancel()
-		b.logger.Warn().
-			Str("buffer_key", bufferKey).
-			Int("records", totalBuffered).
-			Msg("Flush queue send aborted: ArrowBuffer ctx canceled (data preserved in WAL)")
-		metrics.Get().IncWALRecordsPreserved(int64(totalBuffered))
+		b.recordWALFallback(int64(totalBuffered), "Flush queue send aborted: ArrowBuffer context canceled")
 		b.walOnlyRecords.Add(int64(totalBuffered))
 		return flushCtxCanceled
 	default:
-		flushCancel()
+		metrics.Get().IncBufferFlushQueueFull(int64(totalBuffered))
+		if b.admitElasticTask(task) {
+			metrics.Get().IncBufferElasticReserveAdmissions(int64(totalBuffered))
+			b.logger.Warn().Str("buffer_key", bufferKey).Int("records", totalBuffered).
+				Int64("reserve_records", b.elasticReserveRecords.Load()).
+				Msg("Flush queue full; retained batch in elastic reserve")
+			return flushElasticReserved
+		}
+		b.recordWALFallback(int64(totalBuffered), "Flush queue and elastic reserve full")
 		b.logger.Warn().
 			Str("buffer_key", bufferKey).
 			Int("records", totalBuffered).
 			Int64("queue_depth", b.queueDepth.Load()).
-			Msg("Flush queue full - data preserved in WAL for recovery")
+			Bool("wal_enabled", b.wal != nil).
+			Msg("Flush queue and elastic reserve are full")
 		b.totalErrors.Add(1)
-		metrics.Get().IncWALRecordsPreserved(int64(totalBuffered))
 		b.walOnlyRecords.Add(int64(totalBuffered))
 		return flushQueueFull
 	}
+}
+
+func (b *ArrowBuffer) recordWALFallback(records int64, reason string) {
+	if records <= 0 {
+		return
+	}
+	if b.wal != nil {
+		metrics.Get().IncBufferFlushFallbackWALConfigured(records)
+		metrics.Get().IncBufferFlushFallback(records)
+		b.logger.Warn().Int64("records", records).Str("reason", reason).Msg("Flush records left for the configured WAL fallback; successful WAL append is not confirmed by this counter")
+		return
+	}
+	metrics.Get().IncBufferUnprotectedOverflow(records)
+	metrics.Get().IncBufferFlushFallback(records)
+	b.logger.Error().Int64("records", records).Str("reason", reason).Msg("Flush records could not be retained; WAL is disabled")
 }
 
 // schemaEvolutionMaxIters bounds the schema-evolution flush loop.
@@ -1935,12 +1955,7 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 	// OPTIMIZATION: Queue flush to worker pool (bounded concurrency)
 	// This prevents goroutine explosion under sustained load
 	if shouldFlush {
-		// Use buffer ctx as parent so Close() cancels in-flight writes,
-		// with a timeout to prevent workers from blocking forever on slow storage
-		flushCtx, flushCancel := context.WithTimeout(b.ctx, b.flushTimeout)
 		task := flushTask{
-			ctx:         flushCtx,
-			cancel:      flushCancel,
 			bufferKey:   bufferKey,
 			database:    database,
 			measurement: record.Measurement,
@@ -1953,7 +1968,7 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 		// the queue-full path uniformly across both write paths.
 		// The flushSkipClosing outcome short-circuits the rest of
 		// the write — Close() is in progress, no point continuing.
-		if b.tryEnqueueFlush(task, flushCancel, bufferKey, totalBuffered) == flushSkipClosing {
+		if b.tryEnqueueFlush(task, bufferKey, totalBuffered) == flushSkipClosing {
 			return nil
 		}
 	}
@@ -2074,10 +2089,7 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 
 	// Queue flush to worker pool if needed
 	if shouldFlush {
-		flushCtx, flushCancel := context.WithTimeout(b.ctx, b.flushTimeout)
 		task := flushTask{
-			ctx:         flushCtx,
-			cancel:      flushCancel,
 			bufferKey:   bufferKey,
 			database:    database,
 			measurement: measurement,
@@ -2085,7 +2097,7 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 			recordCount: totalBuffered,
 		}
 
-		if b.tryEnqueueFlush(task, flushCancel, bufferKey, totalBuffered) == flushSkipClosing {
+		if b.tryEnqueueFlush(task, bufferKey, totalBuffered) == flushSkipClosing {
 			return nil
 		}
 	}
@@ -2717,6 +2729,7 @@ func (b *ArrowBuffer) flushWorker(workerID int) {
 				return
 			}
 			metrics.Get().SetBufferQueueDepth(b.queueDepth.Add(-1))
+			b.drainElasticReserve()
 
 			b.logger.Debug().
 				Int("worker_id", workerID).
@@ -2726,9 +2739,11 @@ func (b *ArrowBuffer) flushWorker(workerID int) {
 				Msg("Worker processing flush task")
 
 			// Execute flush
-			b.flushRecordsAsync(task.ctx, task.bufferKey, task.database, task.measurement, task.records, task.recordCount)
-			// Release timeout context resources
-			task.cancel()
+			// Start the storage timeout only when execution begins. A task's time
+			// in flushQueue or the elastic reserve is queueing delay, not I/O time.
+			flushCtx, flushCancel := context.WithTimeout(b.ctx, b.flushTimeout)
+			b.flushRecordsAsync(flushCtx, task.bufferKey, task.database, task.measurement, task.records, task.recordCount)
+			flushCancel()
 		}
 	}
 }
@@ -3949,16 +3964,17 @@ drain:
 			b.queueDepth.Add(-1)
 			abandoned += task.recordCount
 			b.walOnlyRecords.Add(int64(task.recordCount))
-			task.cancel() // release the task's timeout context
 		default:
 			break drain
 		}
 	}
+	metrics.Get().SetBufferQueueDepth(b.queueDepth.Load())
+	for _, task := range b.takeElasticReserveTasks() {
+		abandoned += task.recordCount
+		b.walOnlyRecords.Add(int64(task.recordCount))
+	}
 	if abandoned > 0 {
-		b.logger.Warn().
-			Int("records", abandoned).
-			Msg("Flush tasks abandoned on close; records remain in the WAL and will be replayed on next startup")
-		metrics.Get().IncWALRecordsPreserved(int64(abandoned))
+		b.recordWALFallback(int64(abandoned), "Flush tasks abandoned during close")
 	}
 
 	b.logger.Info().Msg("All flush workers stopped, flushing remaining buffers")
@@ -4074,15 +4090,18 @@ func (b *ArrowBuffer) GetStats() map[string]interface{} {
 
 	// Read atomic values (lock-free!)
 	return map[string]interface{}{
-		"total_records_buffered":      b.totalRecordsBuffered.Load(),
-		"total_records_written":       b.totalRecordsWritten.Load(),
-		"total_flushes":               b.totalFlushes.Load(),
-		"total_errors":                b.totalErrors.Load(),
-		"total_wal_errors":            b.totalWALErrors.Load(),
-		"total_wal_dropped":           b.totalWALDropped.Load(),
-		"total_schema_churn_exceeded": b.totalSchemaChurnExceeded.Load(),
-		"active_buffers":              activeBuffers,
-		"flush_queue_depth":           b.queueDepth.Load(),
-		"flush_workers":               b.flushWorkers,
+		"total_records_buffered":           b.totalRecordsBuffered.Load(),
+		"total_records_written":            b.totalRecordsWritten.Load(),
+		"total_flushes":                    b.totalFlushes.Load(),
+		"total_errors":                     b.totalErrors.Load(),
+		"total_wal_errors":                 b.totalWALErrors.Load(),
+		"total_wal_dropped":                b.totalWALDropped.Load(),
+		"total_schema_churn_exceeded":      b.totalSchemaChurnExceeded.Load(),
+		"active_buffers":                   activeBuffers,
+		"flush_queue_depth":                b.queueDepth.Load(),
+		"elastic_reserve_enabled":          b.elasticReserveEnabled.Load(),
+		"elastic_reserve_capacity_records": b.elasticReserveCapacity.Load(),
+		"elastic_reserve_records":          b.elasticReserveRecords.Load(),
+		"flush_workers":                    b.flushWorkers,
 	}
 }
