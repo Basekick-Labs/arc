@@ -16,7 +16,10 @@ type Manifest struct {
 	TotalFiles     int64          `json:"total_files"`
 	TotalSizeBytes int64          `json:"total_size_bytes"`
 	// SkippedFiles counts data files that were listed and inventoried above but
-	// could not be read from source storage at copy time. When non-zero the
+	// could not be read from source storage at copy time, or whose backup
+	// destination key would exceed the storage key limit (a source key longer
+	// than storage.MaxUsableKeyLen minus the <backupID>/data/ prefix; #761).
+	// The backup log names each skipped file. When non-zero the
 	// backup is incomplete: TotalFiles/TotalSizeBytes describe what was
 	// inventoried, not what was actually stored. Counts the same population as
 	// TotalFiles, so a restore can compare the two; Iceberg metadata skips are
@@ -25,7 +28,8 @@ type Manifest struct {
 	SkippedFiles int64 `json:"skipped_files,omitempty"`
 	// SkippedMetadataFiles counts auxiliary files under the storage root
 	// (Iceberg warehouse metadata, compaction recovery state) that were listed
-	// but could not be read at copy time. They are copied under data/ but are
+	// but could not be read at copy time, or whose backup destination key
+	// would exceed the storage key limit. They are copied under data/ but are
 	// not part of TotalFiles. A compaction manifest whose job finished between
 	// the listing and the copy is the expected case. Skips from an
 	// outside-root warehouse are in IcebergWarehouse.SkippedFiles.

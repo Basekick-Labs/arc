@@ -168,7 +168,13 @@ type Metrics struct {
 	// receive path is strictly stronger than a counter scraped after the fact
 	// — the same shape as Kafka's OutOfOrderSequenceException or Raft's
 	// prevLogIndex rejection. The signal operators actually need here is
-	// replication LAG, which is tracked separately.
+	// replication LAG, which is the provider below (#819).
+
+	// The active writer supplies per-peer lag samples on demand at scrape
+	// time. No historical peer IDs or unbounded time series are retained in
+	// the collector.
+	replicationLagMu       sync.RWMutex
+	replicationLagProvider *replicationLagRegistration
 
 	// Cluster FSM security metrics (Enterprise only — only mutated when
 	// the Raft FSM is constructed, which is gated by cluster.enabled +
@@ -1083,6 +1089,20 @@ func (m *Metrics) PrometheusFormat() string {
 	b = appendMetric(b, "arc_query_mgmt_history_size", float64(m.queryMgmtHistorySize.Load()))
 
 	// Replication metrics
+	lagSamples := m.replicationLagSamples()
+	b = append(b, "# HELP arc_replication_lag_entries Writer entries not yet acknowledged by each connected replication reader, including entries a full replication buffer dropped\n"...)
+	b = append(b, "# TYPE arc_replication_lag_entries gauge\n"...)
+	for _, sample := range lagSamples {
+		b = appendReplicationLagMetric(b, "arc_replication_lag_entries", sample.Peer, float64(sample.Entries))
+	}
+	b = append(b, "# HELP arc_replication_lag_seconds Age in seconds of the oldest unacknowledged WAL entry per connected replication reader; a lower bound once the reader is more than cluster.replication_buffer_size entries behind\n"...)
+	b = append(b, "# TYPE arc_replication_lag_seconds gauge\n"...)
+	for _, sample := range lagSamples {
+		if sample.HasSeconds {
+			b = appendReplicationLagMetric(b, "arc_replication_lag_seconds", sample.Peer, sample.Seconds)
+		}
+	}
+
 	b = append(b, "# HELP arc_replication_entries_dropped_total Total replication entries dropped due to full buffer\n"...)
 	b = append(b, "# TYPE arc_replication_entries_dropped_total counter\n"...)
 	b = appendMetric(b, "arc_replication_entries_dropped_total", float64(m.replicationEntriesDroppedTotal.Load()))
