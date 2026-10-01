@@ -40,6 +40,27 @@ Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#908](https://
 
 ## Bug fixes
 
+### A long but legal source key made every backup fail permanently ([#761](https://github.com/Basekick-Labs/arc/issues/761))
+
+A backup stores each data file under `<backup ID>/data/<source key>`, which is
+37 bytes longer than the source key. The storage key limit is 1019 bytes, so a
+source key of 983 bytes or more, legal everywhere else in Arc, produced a
+destination the backup store refused. That write failure was classified as
+fatal, as every backup-storage write failure is, so the run aborted, left a
+partial tree with no manifest, and failed the same way on every later attempt.
+
+The backup now checks the destination length before copying and skips such a
+file the way it skips a file deleted between the listing and the copy: with a
+warning naming the file and the threshold, counted in the manifest's
+`skipped_files` (or `skipped_metadata_files` for Iceberg metadata), and
+subject to the existing 10% skip-ratio guard, so a deployment where most keys
+overrun still fails loudly rather than silently. Every other backup-storage
+write failure stays fatal. Arc's own partition layout stays well under the
+threshold; this protects against keys placed in the storage root by other
+tools.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#903](https://github.com/Basekick-Labs/arc/pull/903).
+
 ### A pull that crashed one step before the rename left a file that read as present and was never finalised ([#963](https://github.com/Basekick-Labs/arc/issues/963))
 
 On a per-node-storage cluster, the file puller writes each incoming file to a
