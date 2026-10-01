@@ -19,9 +19,10 @@ import (
 
 // errBackupRead marks a failure reading the SOURCE file from data storage.
 //
-// Only source-read failures are skippable: the file may legitimately have been
-// deleted by compaction or retention between the listing and the copy, and
-// aborting the whole backup for that benign race would be wrong.
+// Source-read failures are skippable: the file may legitimately have been
+// deleted by compaction or retention between listing and copy. The other
+// explicitly skippable case is an overlong destination key, checked before
+// streaming in copyDataFiles.
 //
 // Every other failure — temp file creation, seek, backup-storage write — is
 // fatal. Those indicate a broken environment (no temp space, unwritable or
@@ -32,15 +33,18 @@ import (
 // mode added here later is fatal by default until someone marks it skippable.
 var errBackupRead = errors.New("backup source read failed")
 
-// maxSkipRatio is the fraction of data files that may be skipped before the
+// maxSkipRatio is the fraction of inventoried files that may be skipped before the
 // backup is treated as failed rather than merely incomplete.
 //
-// Skipping exists to tolerate one narrow race: a file removed by compaction or
-// retention between the listing and the copy. That affects a small number of
-// files at the tail of a run, so a low ceiling is enough to absorb it. Anything
-// above this is a different event — throttling, credential expiry, a storage
-// outage — where returning a fraction of the data as a "successful" backup
-// hides the gap until a restore needs it.
+// Skipping exists to tolerate two narrow cases: a file removed by compaction
+// or retention between the listing and the copy, and a legal source key whose
+// backup destination would overrun the storage key limit (#761). The first
+// touches a handful of files at the tail of a run; the second is permanent
+// but, in any deployment Arc itself wrote, affects no file at all. A low
+// ceiling absorbs both. Anything above it is a different event — throttling,
+// credential expiry, a storage outage, or a storage root full of foreign keys
+// too long to back up — where returning a fraction of the data as a
+// "successful" backup hides the gap until a restore needs it.
 //
 // Deliberately a constant, not a config key: no operator has needed to tune it,
 // and a knob nobody sets is a knob nobody tests.
@@ -393,8 +397,8 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 
 // copyDataFiles copies parquet files from data storage to backup storage.
 //
-// Files whose source cannot be read are skipped (see errBackupRead) and added to
-// progress.SkippedFiles. Every other failure aborts the backup immediately.
+// Source-read failures and overlong backup destination keys are skipped and
+// counted in progress.SkippedFiles. Every other failure aborts immediately.
 //
 // The skip-ratio check is NOT applied here, because CreateBackup calls this more
 // than once (data files, then Iceberg warehouse metadata) and the ratio is only
@@ -412,6 +416,20 @@ func (m *Manager) copyDataFiles(ctx context.Context, backupID string, files []st
 		}
 
 		destPath := fmt.Sprintf("%s/data/%s", backupID, obj.Path)
+		// A legal source key can exceed the storage limit once the backup
+		// prefix is added. This predictable case is skippable; actual
+		// backup-storage write failures must still abort the run.
+		if len(destPath) > storage.MaxUsableKeyLen {
+			skipped++
+			m.logger.Warn().
+				Str("path", obj.Path).
+				Int("destination_key_bytes", len(destPath)).
+				Int("maximum_key_bytes", storage.MaxUsableKeyLen).
+				Int("max_source_key_bytes", storage.MaxUsableKeyLen-backupDataKeyHeadroom).
+				Msg("Backup destination key too long; skipping (source keys longer than max_source_key_bytes cannot be backed up under this backup prefix)")
+			continue
+		}
+
 		written, err := m.streamBackupFile(ctx, obj.Path, destPath)
 		if err != nil {
 			// Only a source-read failure is skippable — the file may have been
@@ -534,6 +552,13 @@ const unaddressableSampleCap = 32
 // SkippedFiles is zero, which is exactly the case here. Worse, its ratio would
 // hard-fail a nine-file deployment with one legacy file forever, and its
 // message sends the operator to diagnose storage rather than rename a file.
+//
+// The overlong backup DESTINATION key (#761) is the deliberate exception: that
+// file is listable and readable, only the backup cannot hold it under its
+// 37-byte prefix, so it is skipped and counted like a vanished file, the
+// ratio applies, and the ratio's message names the cause. Arc's own layout
+// never reaches the threshold, so the hard-fail shape above needs a root
+// where most keys are foreign and overlong.
 func (m *Manager) recordUnaddressable(manifest *Manifest, unaddressable []storage.UnusableObject, addressableFiles int) {
 	if len(unaddressable) == 0 {
 		return
@@ -566,14 +591,18 @@ func sampleUnaddressable(objs []storage.UnusableObject) []string {
 	return out
 }
 
-// checkSkipRatio fails the backup when too large a fraction of it was unreadable.
+// checkSkipRatio fails the backup when too large a fraction of its files was skipped.
 //
-// Skipping tolerates one specific thing: a file removed by compaction or retention
-// between the listing and the copy. That race touches a handful of files at the
-// tail of a run. A large fraction of the backup failing to read is a different
-// event — throttling, credential expiry, a storage outage — and silently returning
-// a fraction of the data as a successful backup is how an operator discovers the
-// gap at restore time instead of at backup time.
+// Skipping tolerates two specific things: a file removed by compaction or
+// retention between the listing and the copy, and a source key whose backup
+// destination would exceed the storage key limit (#761). The race touches a
+// handful of files at the tail of a run; the overrun is permanent and the
+// message names it so the operator renames keys rather than diagnosing
+// storage. A large fraction of the backup skipping for either reason is a
+// different event — throttling, credential expiry, a storage outage, a root
+// full of foreign keys — and silently returning a fraction of the data as a
+// successful backup is how an operator discovers the gap at restore time
+// instead of at backup time.
 //
 // Evaluated once over every file group, not per group: a stale entry or two in a
 // small Iceberg metadata set is a large fraction of that set but a negligible
@@ -584,7 +613,7 @@ func (m *Manager) checkSkipRatio(progress *Progress, totalFiles int) error {
 		return nil
 	}
 	if float64(skipped) > maxSkipRatio*float64(totalFiles) {
-		return fmt.Errorf("backup failed: %d of %d files were unreadable (>%.0f%%), source storage may be degraded",
+		return fmt.Errorf("backup failed: %d of %d files skipped (>%.0f%%); source storage may be degraded or backup destination keys may be too long",
 			skipped, totalFiles, maxSkipRatio*100)
 	}
 	return nil

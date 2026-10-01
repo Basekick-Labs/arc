@@ -114,7 +114,8 @@ type Config struct {
 	// the check would be one HEAD per own entry per walk.
 	RepullMissingSelfOrigin bool
 
-	// Backend is the local storage backend. The puller calls StatFile to skip
+	// Backend is the local storage backend. The puller calls StatFile (and,
+	// on a backend that stages writes, StagedSize and Exists) to skip
 	// already-local files and WriteReader to stream pulled bytes onto disk.
 	Backend storage.Backend
 
@@ -831,10 +832,11 @@ func (p *Puller) Enqueue(entry *raft.FileEntry) {
 }
 
 // statLocal sizes the local copy of a path. The timeout bounds a backend
-// whose StatFile honours the context (an object store HEAD); a local stat is
-// a syscall that ignores it, and a hung local disk stalls this the way it
-// stalls every other local I/O. The one presence rule the worker's pre-pull
-// check and the walks' self-origin check share is presentAtSize.
+// whose StatFile honours the context (an object store HEAD); the calls a
+// staging backend adds below are local stats that ignore it, and a hung local
+// disk stalls this the way it stalls every other local I/O. The one presence
+// rule the worker's pre-pull check and the walks' self-origin check share is
+// presentAtSize.
 func (p *Puller) statLocal(path string) (int64, error) {
 	parent := p.ctx
 	if parent == nil { // not started: tests, or a walk driven by hand
@@ -842,7 +844,37 @@ func (p *Puller) statLocal(path string) (int64, error) {
 	}
 	statCtx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
-	return p.cfg.Backend.StatFile(statCtx, path)
+	size, err := p.cfg.Backend.StatFile(statCtx, path)
+	if err != nil || size < 0 {
+		return size, err
+	}
+	// LocalBackend.StatFile falls back to the ".part" staging file when the
+	// final file is absent (the resume path wants that). Presence must not:
+	// a full-size .part left by a crash before the rename would read as
+	// "already here" and never be finalised (#963). Where a staged partial
+	// exists, confirm the final file too; without it the answer is "not
+	// here", so the entry is pulled again. Backends that do not stage (S3,
+	// Azure) fail the assertion, and for them StatFile's answer is final.
+	if si, ok := p.cfg.Backend.(storage.StagingInspector); ok {
+		staged, err := si.StagedSize(statCtx, path)
+		if err != nil {
+			return -1, err
+		}
+		if staged >= 0 {
+			exists, err := p.cfg.Backend.Exists(statCtx, path)
+			if err != nil {
+				return -1, err
+			}
+			if !exists {
+				p.logger.Debug().
+					Str("path", path).
+					Int64("staged_bytes", staged).
+					Msg("Staging file present without its final file; treating the path as absent so it is pulled again")
+				return -1, nil
+			}
+		}
+	}
+	return size, nil
 }
 
 // presentAtSize is the puller's definition of "already here": the stat
@@ -1108,8 +1140,9 @@ func (p *Puller) worker(id int) {
 }
 
 // processEntry pulls a single file with bounded retries. Each retry re-checks
-// backend.Exists (in case a concurrent worker or external process put the
-// file in place) and re-resolves the peer list (in case of topology change).
+// local presence via statLocal (in case a concurrent worker or external
+// process put the file in place) and re-resolves the peer list (in case of
+// topology change).
 // Within a single attempt, the resolver returns an ordered list of candidate
 // peers and we fall through to the next candidate on any per-peer failure
 // EXCEPT checksum mismatch — a corrupt body from one peer is a real data
