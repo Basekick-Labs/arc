@@ -189,6 +189,10 @@ func TestPullerSequentialSameSizeUpdateIssue798(t *testing.T) {
 		addrs:  []string{"peer:9100"},
 		ok:     true,
 	})
+	current := *oldEntry
+	p.cfg.ManifestEntry = func(string) (raft.FileEntry, bool) {
+		return current, true
+	}
 
 	p.Start(context.Background())
 	defer p.Stop()
@@ -202,6 +206,7 @@ func TestPullerSequentialSameSizeUpdateIssue798(t *testing.T) {
 		t.Fatalf("initial pull did not finish: %v", first)
 	}
 
+	current = newEntry
 	p.EnqueueContentChanged(&newEntry)
 
 	last := waitStats(t, p, func(s map[string]int64) bool {
@@ -225,8 +230,11 @@ func TestPullerSequentialSameSizeUpdateIssue798(t *testing.T) {
 
 	// An older callback arriving late must not roll back the file.
 	p.Enqueue(oldEntry)
-	if duplicates := p.Stats()["skipped_dup"]; duplicates != 1 {
-		t.Fatalf("stale callback was not rejected: skipped_dup=%d", duplicates)
+	stale := waitStats(t, p, func(s map[string]int64) bool {
+		return s["skipped_superseded"] == 1 && s["inflight_count"] == 0
+	})
+	if superseded := stale["skipped_superseded"]; superseded != 1 {
+		t.Fatalf("stale callback was not rejected: skipped_superseded=%d", superseded)
 	}
 
 	// Repeating the already-completed current version must retain the

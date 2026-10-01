@@ -248,7 +248,7 @@ type Puller struct {
 	// Unlike the old observed map, this is bounded by unresolved failures and
 	// queue drops rather than by the manifest size.
 	refreshPending map[string]uint64
-	inflightCount atomic.Int64
+	inflightCount  atomic.Int64
 
 	// Metrics (atomic for lock-free observability)
 	totalEnqueued          atomic.Int64
@@ -1053,7 +1053,7 @@ func (p *Puller) Stats() map[string]int64 {
 		"skipped_self":                       p.totalSkippedSelf.Load(),
 		"skipped_local":                      p.totalSkippedLocal.Load(),
 		"skipped_dup":                        p.totalSkippedDup.Load(),
-		"skipped_superseded":                p.totalSkippedSuperseded.Load(),
+		"skipped_superseded":                 p.totalSkippedSuperseded.Load(),
 		"skipped_gone":                       p.totalSkippedGone.Load(),
 		"pulled":                             p.totalPulled.Load(),
 		"failed":                             p.totalFailed.Load(),

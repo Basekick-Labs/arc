@@ -497,15 +497,15 @@ type ClusterFSM struct {
 	barrierOrder []string
 
 	// Callbacks for state changes
-	onNodeAdded         func(*NodeInfo)
-	onNodeRemoved       func(string)
-	onNodeUpdated       func(*NodeInfo)
-	onWriterPromoted    func(newPrimaryID, oldPrimaryID string)
-	onWriterDemoted     func(nodeID string)
-	onCompactorAssigned func(newCompactorID, oldCompactorID string)
-	onFileRegistered    func(*FileEntry)
+	onNodeAdded          func(*NodeInfo)
+	onNodeRemoved        func(string)
+	onNodeUpdated        func(*NodeInfo)
+	onWriterPromoted     func(newPrimaryID, oldPrimaryID string)
+	onWriterDemoted      func(nodeID string)
+	onCompactorAssigned  func(newCompactorID, oldCompactorID string)
+	onFileRegistered     func(*FileEntry)
 	onFileContentChanged func(*FileEntry)
-	onFileDeleted       func(path string, reason string)
+	onFileDeleted        func(path string, reason string)
 	// Auth-state callbacks: invoked from every node's apply path so the
 	// node's local AuthManager can materialise the change into its
 	// SQLite cache (and invalidate the in-memory verify-token cache).
