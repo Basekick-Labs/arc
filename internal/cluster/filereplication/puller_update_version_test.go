@@ -16,6 +16,44 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 )
 
+func TestManifestSupersedesUsesContentAndVersionTogether(t *testing.T) {
+	request := raft.FileEntry{LSN: 0, SHA256: "same", SizeBytes: 10}
+
+	tests := []struct {
+		name     string
+		request  raft.FileEntry
+		current  raft.FileEntry
+		supersed bool
+	}{
+		{
+			name:     "catch-up default LSN with unchanged content",
+			request:  request,
+			current:  raft.FileEntry{LSN: 7, SHA256: "same", SizeBytes: 10},
+			supersed: false,
+		},
+		{
+			name:     "stale known version",
+			request:  request,
+			current:  raft.FileEntry{LSN: 7, SHA256: "new", SizeBytes: 10},
+			supersed: true,
+		},
+		{
+			name:     "older current version",
+			request:  raft.FileEntry{LSN: 7, SHA256: "request", SizeBytes: 10},
+			current:  raft.FileEntry{LSN: 3, SHA256: "old", SizeBytes: 10},
+			supersed: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := manifestSupersedes(&tt.current, &tt.request); got != tt.supersed {
+				t.Fatalf("manifestSupersedes() = %v, want %v", got, tt.supersed)
+			}
+		})
+	}
+}
+
 type issue798BlockingFetcher struct {
 	started chan struct{}
 	release chan struct{}

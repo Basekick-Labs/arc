@@ -110,6 +110,30 @@ func newerFileVersion(incoming, current *raft.FileEntry) bool {
 		incoming.SizeBytes != current.SizeBytes
 }
 
+// manifestSupersedes reports whether current is a newer *content* version
+// than request. An LSN can change while the registered bytes stay the same
+// (for example when a catch-up snapshot carries an unstamped/default LSN), so
+// an LSN difference alone must not discard an otherwise valid pull.
+//
+// A zero LSN is an unknown version, not an older version. When the content is
+// different, a known current LSN can still supersede an unknown request; a
+// known request is superseded only by a strictly newer current LSN. Equal LSNs
+// use the content fields as the tie-breaker.
+func manifestSupersedes(current, request *raft.FileEntry) bool {
+	if current.SHA256 == request.SHA256 && current.SizeBytes == request.SizeBytes {
+		return false
+	}
+	if current.LSN == request.LSN {
+		// Two default LSNs carry no ordering information, so leave the
+		// decision to the fetch/verification path rather than discarding it.
+		return current.LSN != 0
+	}
+	if request.LSN == 0 {
+		return current.LSN != 0
+	}
+	return current.LSN > request.LSN
+}
+
 // Config bundles the puller's dependencies and tunables.
 type Config struct {
 	// SelfNodeID is the ID of the local node. A reactive Enqueue of a file
@@ -1272,7 +1296,8 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 	// so the walker can add the tag after this worker began processing it.
 	defer func() {
 		current, wanted := p.manifestEntry(entry.Path)
-		stillWanted := !failed || (wanted && !newerFileVersion(&current, entry))
+		stillWanted := !failed || (wanted &&
+			(p.cfg.ManifestEntry == nil || !manifestSupersedes(&current, entry)))
 		next = p.finishEntry(entry.Path, request.source, failed, succeeded, stillWanted)
 	}()
 
@@ -1296,7 +1321,7 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 				Msg("Manifest entry deleted while its pull was pending; skipping")
 			return
 		}
-		if newerFileVersion(&current, entry) {
+		if p.cfg.ManifestEntry != nil && manifestSupersedes(&current, entry) {
 			p.totalSkippedSuperseded.Add(1)
 			log.Debug().Str("path", entry.Path).Uint64("request_lsn", entry.LSN).
 				Uint64("manifest_lsn", current.LSN).
@@ -1383,7 +1408,7 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 						Msg("Manifest entry deleted while its pull was in transit; local copy removed")
 					return
 				}
-				if newerFileVersion(&current, entry) {
+				if p.cfg.ManifestEntry != nil && manifestSupersedes(&current, entry) {
 					p.totalSkippedSuperseded.Add(1)
 					p.deleteFile(log, entry.Path)
 					return
