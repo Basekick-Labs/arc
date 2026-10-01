@@ -2384,6 +2384,13 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		}
 	}
 	sort.Strings(removedNodes) // deterministic delivery order
+	var removedFiles []string
+	for path := range f.files {
+		if _, stillThere := restoredFiles[path]; !stillThere {
+			removedFiles = append(removedFiles, path)
+		}
+	}
+	sort.Strings(removedFiles) // deterministic delivery order
 	f.nodes = restoredNodes
 	f.barriers = restoredBarriers
 	f.barrierOrder = restoredOrder
@@ -2476,6 +2483,7 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	f.keysCache = nil // invalidate sorted-key cache after snapshot restore
 	onNodeAdded := f.onNodeAdded
 	onNodeRemoved := f.onNodeRemoved
+	onFileDeleted := f.onFileDeleted
 	f.mu.Unlock()
 
 	f.logger.Info().
@@ -2513,6 +2521,11 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	if onNodeRemoved != nil {
 		for _, id := range removedNodes {
 			onNodeRemoved(id)
+		}
+	}
+	if onFileDeleted != nil {
+		for _, path := range removedFiles {
+			onFileDeleted(path, "snapshot:removed")
 		}
 	}
 
