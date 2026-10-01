@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
@@ -134,6 +135,41 @@ func TestBackupLongSourceKeyIsSkippedAndReported(t *testing.T) {
 	if stored.TotalFiles != 21 || stored.SkippedFiles != 1 {
 		t.Errorf("stored manifest = total %d, skipped %d; want 21, 1",
 			stored.TotalFiles, stored.SkippedFiles)
+	}
+
+	// #977: the manifest names the file and attributes the skip to its cause,
+	// the status endpoint names it too, the listing carries the count, and
+	// the gauge reports it. The stored JSON is decoded as a map as well, so
+	// this part of the test compiles against a manifest without the field and
+	// fails there rather than being invisible.
+	if len(stored.SkippedSample) != 1 || stored.SkippedSample[0] != longKey {
+		t.Errorf("stored skipped_sample = %v, want [%s]", stored.SkippedSample, longKey)
+	}
+	if stored.SkippedOverlongKeys != 1 {
+		t.Errorf("stored skipped_overlong_keys = %d, want 1", stored.SkippedOverlongKeys)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(manifestData, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if sample, _ := raw["skipped_sample"].([]any); len(sample) != 1 || sample[0] != longKey {
+		t.Errorf("manifest.json skipped_sample = %v, want [%s]", raw["skipped_sample"], longKey)
+	}
+	if got := progress.SkippedSample; len(got) != 1 || got[0] != longKey {
+		t.Errorf("status skipped_sample = %v, want [%s]", got, longKey)
+	}
+	summaries, err := manager.ListBackups(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 || summaries[0].SkippedFiles != 1 {
+		t.Errorf("listing = %+v, want one entry with skipped_files 1", summaries)
+	}
+	if got, _ := metrics.Get().Snapshot()["backup_skipped_files"].(int64); got != 1 {
+		t.Errorf("backup_skipped_files gauge = %d, want 1", got)
+	}
+	if prom := metrics.Get().PrometheusFormat(); !strings.Contains(prom, "arc_backup_skipped_files 1\n") {
+		t.Error("arc_backup_skipped_files 1 missing from the Prometheus output")
 	}
 
 	goodData, err := manager.backupStorage.Read(

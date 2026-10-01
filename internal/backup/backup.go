@@ -252,7 +252,10 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	stateSkipped := atomic.LoadInt64(&progress.SkippedFiles)
 
 	// ── 2. Copy parquet files ───────────────────────────────────────────
-	if err := m.copyDataFiles(ctx, backupID, parquetFiles, progress); err != nil {
+	// One tally spans both copyDataFiles groups (data, then in-root Iceberg
+	// metadata): it records each skip's cause and names the files (#977).
+	tally := &skipTally{}
+	if err := m.copyDataFiles(ctx, backupID, parquetFiles, progress, tally); err != nil {
 		progress.Status = "failed"
 		progress.Error = err.Error()
 		return nil, err
@@ -299,7 +302,7 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	// their original locations and the SQLite catalog's metadata pointers still resolve. The
 	// referenced parquet data is already copied above; only the Iceberg metadata is added here.
 	if len(icebergMetaFiles) > 0 {
-		if err := m.copyDataFiles(ctx, backupID, icebergMetaFiles, progress); err != nil {
+		if err := m.copyDataFiles(ctx, backupID, icebergMetaFiles, progress, tally); err != nil {
 			progress.Status = "failed"
 			progress.Error = err.Error()
 			return nil, err
@@ -340,8 +343,21 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 			Msg("Backed up Iceberg warehouse metadata from outside the storage root")
 	}
 
+	// Every copy phase is done. Publish what was skipped where an operator can
+	// reach it even when the run fails just below: the names on the status
+	// endpoint, which stays until the next operation, and the total on the
+	// gauge (#977). The sample is handed over once and never appended to
+	// afterwards: published Progress values are snapshots that share this
+	// slice header. The gauge is set here, after the copy phases and before
+	// the ratio check, on purpose: a run the ratio fails still reports its
+	// skips, and a run that failed earlier leaves the previous value rather
+	// than clearing an alert with a zero that describes nothing.
+	progress.SkippedSample = tally.sample
+	m.setProgress(progress)
+	metrics.Get().SetBackupSkippedFiles(atomic.LoadInt64(&progress.SkippedFiles))
+
 	// Evaluate the skip ratio once, over every file group above.
-	if err := m.checkSkipRatio(progress, len(parquetFiles)+len(icebergMetaFiles)+warehouseFiles+len(stateFiles)); err != nil {
+	if err := m.checkSkipRatio(progress, len(parquetFiles)+len(icebergMetaFiles)+warehouseFiles+len(stateFiles), tally); err != nil {
 		progress.Status = "failed"
 		progress.Error = err.Error()
 		return nil, err
@@ -367,6 +383,8 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	// compaction state; see dataSkipped above).
 	manifest.SkippedFiles = dataSkipped
 	manifest.SkippedMetadataFiles = atomic.LoadInt64(&progress.SkippedFiles) - dataSkipped - warehouseSkipped
+	manifest.SkippedSample = tally.sample
+	manifest.SkippedOverlongKeys = tally.overlong
 
 	manifestData, err := MarshalManifest(manifest)
 	if err != nil {
@@ -398,14 +416,15 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 // copyDataFiles copies parquet files from data storage to backup storage.
 //
 // Source-read failures and overlong backup destination keys are skipped and
-// counted in progress.SkippedFiles. Every other failure aborts immediately.
+// counted in progress.SkippedFiles, and recorded by cause and name in tally
+// (#977). Every other failure aborts immediately.
 //
 // The skip-ratio check is NOT applied here, because CreateBackup calls this more
 // than once (data files, then Iceberg warehouse metadata) and the ratio is only
 // meaningful over the whole backup: a handful of stale entries in a small
 // metadata set is a large fraction of that set but a negligible fraction of the
 // backup. The caller evaluates the ratio once via checkSkipRatio.
-func (m *Manager) copyDataFiles(ctx context.Context, backupID string, files []storage.ObjectInfo, progress *Progress) error {
+func (m *Manager) copyDataFiles(ctx context.Context, backupID string, files []storage.ObjectInfo, progress *Progress, tally *skipTally) error {
 	var skipped int64
 
 	for _, obj := range files {
@@ -421,6 +440,7 @@ func (m *Manager) copyDataFiles(ctx context.Context, backupID string, files []st
 		// backup-storage write failures must still abort the run.
 		if len(destPath) > storage.MaxUsableKeyLen {
 			skipped++
+			tally.record(obj.Path, true)
 			m.logger.Warn().
 				Str("path", obj.Path).
 				Int("destination_key_bytes", len(destPath)).
@@ -440,6 +460,7 @@ func (m *Manager) copyDataFiles(ctx context.Context, backupID string, files []st
 				return fmt.Errorf("failed to back up %s: %w", obj.Path, err)
 			}
 			skipped++
+			tally.record(obj.Path, false)
 			m.logger.Warn().Str("path", obj.Path).Err(err).Msg("Failed to read data file, skipping")
 			continue
 		}
@@ -540,8 +561,44 @@ func isBackupPayload(p string) bool {
 // unaddressableSampleCap bounds how many paths land in the manifest. The
 // manifest is one JSON blob written to storage, and the over-length key shape
 // makes each path up to a kilobyte, so an unbounded list could dwarf the
-// manifest it is reported in.
+// manifest it is reported in. It bounds UnaddressableSample and SkippedSample
+// alike (#977).
 const unaddressableSampleCap = 32
+
+// skipTally is one backup run's record of WHY files were skipped and WHICH.
+// It lives outside Progress, which is published as value snapshots and so can
+// only receive the list once, after the copy phases. Only copyDataFiles feeds
+// it: that is the one loop with two skip causes — a source read that failed
+// (the file vanished between the listing and the copy; nothing to do) and a
+// destination key over the storage limit (permanent; the operator renames the
+// file, #761). Compaction-state and outside-root warehouse skips are read-time
+// skips with their own accounting and are not sampled.
+//
+// The unreadable count is derived, not stored: progress.SkippedFiles minus
+// overlong. That holds only once every copy loop has returned nil, because a
+// loop that aborts early has recorded here but not flushed its count to
+// progress; checkSkipRatio is the one consumer and runs only then.
+//
+// No mutex: CreateBackup holds Manager.mu for the whole run and the copy loops
+// are sequential.
+type skipTally struct {
+	overlong int64    // skips for a destination key over storage.MaxUsableKeyLen
+	sample   []string // up to unaddressableSampleCap skipped source keys, either cause
+}
+
+// record notes one skipped file. A nil tally is a no-op, so a caller without
+// per-run accounting cannot panic.
+func (t *skipTally) record(path string, overlong bool) {
+	if t == nil {
+		return
+	}
+	if overlong {
+		t.overlong++
+	}
+	if len(t.sample) < unaddressableSampleCap {
+		t.sample = append(t.sample, path)
+	}
+}
 
 // recordUnaddressable puts the finding in the manifest and decides whether the
 // run may still call itself a complete backup.
@@ -556,7 +613,8 @@ const unaddressableSampleCap = 32
 // The overlong backup DESTINATION key (#761) is the deliberate exception: that
 // file is listable and readable, only the backup cannot hold it under its
 // 37-byte prefix, so it is skipped and counted like a vanished file, the
-// ratio applies, and the ratio's message names the cause. Arc's own layout
+// ratio applies, the ratio's message gives each cause's count, and the run's
+// tally names the file in the manifest's SkippedSample (#977). Arc's own layout
 // never reaches the threshold, so the hard-fail shape above needs a root
 // where most keys are foreign and overlong.
 func (m *Manager) recordUnaddressable(manifest *Manifest, unaddressable []storage.UnusableObject, addressableFiles int) {
@@ -596,9 +654,10 @@ func sampleUnaddressable(objs []storage.UnusableObject) []string {
 // Skipping tolerates two specific things: a file removed by compaction or
 // retention between the listing and the copy, and a source key whose backup
 // destination would exceed the storage key limit (#761). The race touches a
-// handful of files at the tail of a run; the overrun is permanent and the
-// message names it so the operator renames keys rather than diagnosing
-// storage. A large fraction of the backup skipping for either reason is a
+// handful of files at the tail of a run; the overrun is permanent, and the
+// message gives each cause's count (from the run's tally, #977) so the
+// operator renames keys rather than diagnosing storage. A large fraction of
+// the backup skipping for either reason is a
 // different event — throttling, credential expiry, a storage outage, a root
 // full of foreign keys — and silently returning a fraction of the data as a
 // successful backup is how an operator discovers the gap at restore time
@@ -607,16 +666,38 @@ func sampleUnaddressable(objs []storage.UnusableObject) []string {
 // Evaluated once over every file group, not per group: a stale entry or two in a
 // small Iceberg metadata set is a large fraction of that set but a negligible
 // fraction of the backup, and must not abort a run whose data files all copied.
-func (m *Manager) checkSkipRatio(progress *Progress, totalFiles int) error {
+func (m *Manager) checkSkipRatio(progress *Progress, totalFiles int, tally *skipTally) error {
 	skipped := atomic.LoadInt64(&progress.SkippedFiles)
 	if skipped == 0 || totalFiles == 0 {
 		return nil
 	}
 	if float64(skipped) > maxSkipRatio*float64(totalFiles) {
-		return fmt.Errorf("backup failed: %d of %d files skipped (>%.0f%%); source storage may be degraded or backup destination keys may be too long",
-			skipped, totalFiles, maxSkipRatio*100)
+		return fmt.Errorf("backup failed: %d of %d files skipped (>%.0f%%): %s",
+			skipped, totalFiles, maxSkipRatio*100, describeSkips(skipped, tally))
 	}
 	return nil
+}
+
+// describeSkips names each skip cause with its count, leaving out a cause with
+// none, so a run skipped for one reason does not read "and 0 …". The unreadable
+// count is everything the tally did not attribute to an overlong key: data-file
+// read failures, vanished compaction manifests and outside-root warehouse read
+// failures alike. The byte threshold is the one the per-file warning reports as
+// max_source_key_bytes and the backup docs quote, not the destination limit.
+func describeSkips(skipped int64, tally *skipTally) string {
+	var overlong int64
+	if tally != nil {
+		overlong = tally.overlong
+	}
+	var parts []string
+	if unreadable := skipped - overlong; unreadable > 0 {
+		parts = append(parts, fmt.Sprintf("%d could not be read at copy time (check source storage)", unreadable))
+	}
+	if overlong > 0 {
+		parts = append(parts, fmt.Sprintf("%d have source keys longer than %d bytes, which no backup destination key can hold (rename them)",
+			overlong, storage.MaxUsableKeyLen-backupDataKeyHeadroom))
+	}
+	return strings.Join(parts, "; ")
 }
 
 // streamBackupFile streams a file from data storage to backup storage via a temp file,

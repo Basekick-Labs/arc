@@ -19,7 +19,8 @@ type Manifest struct {
 	// could not be read from source storage at copy time, or whose backup
 	// destination key would exceed the storage key limit (a source key longer
 	// than storage.MaxUsableKeyLen minus the <backupID>/data/ prefix; #761).
-	// The backup log names each skipped file. When non-zero the
+	// The backup log names each skipped file and SkippedSample names up to 32
+	// of them (#977). When non-zero the
 	// backup is incomplete: TotalFiles/TotalSizeBytes describe what was
 	// inventoried, not what was actually stored. Counts the same population as
 	// TotalFiles, so a restore can compare the two; Iceberg metadata skips are
@@ -34,6 +35,19 @@ type Manifest struct {
 	// the listing and the copy is the expected case. Skips from an
 	// outside-root warehouse are in IcebergWarehouse.SkippedFiles.
 	SkippedMetadataFiles int64 `json:"skipped_metadata_files,omitempty"`
+	// SkippedSample names up to 32 of the files the copy loop skipped, in copy
+	// order and for either cause (#977): data files (counted in SkippedFiles)
+	// and in-root Iceberg metadata (counted in SkippedMetadataFiles) share the
+	// one list; a metadata key carries a /metadata/ segment. Compaction
+	// manifests that vanished because their job finished and outside-root
+	// warehouse skips are not listed; the log names those. Manifests written
+	// before this field read it as nil.
+	SkippedSample []string `json:"skipped_sample,omitempty"`
+	// SkippedOverlongKeys is how many of the skips in SkippedFiles and
+	// SkippedMetadataFiles were for a backup destination key over the storage
+	// limit (#761): the permanent cause, fixed by renaming the source file,
+	// as opposed to a file that vanished between the listing and the copy.
+	SkippedOverlongKeys int64 `json:"skipped_overlong_keys,omitempty"`
 	// AuxiliaryFiles counts Parquet objects under a reserved root directory
 	// (the field schema anchors under _schema/, #914) that were copied with
 	// the data files. They are inside TotalFiles and TotalSizeBytes, because
@@ -109,6 +123,13 @@ type BackupSummary struct {
 	TotalFiles    int64     `json:"total_files"`
 	TotalBytes    int64     `json:"total_size_bytes"`
 	DatabaseCount int       `json:"database_count"`
+	// The manifest's incompleteness counts, so the listing says what the
+	// manifest says (#977): TotalFiles is what was inventoried, and these are
+	// what was not stored. Omitted when zero, so a complete backup's entry is
+	// unchanged. The names are in the manifest (GET /api/v1/backup/:id).
+	SkippedFiles         int64 `json:"skipped_files,omitempty"`
+	SkippedMetadataFiles int64 `json:"skipped_metadata_files,omitempty"`
+	UnaddressableFiles   int64 `json:"unaddressable_files,omitempty"`
 }
 
 // Progress tracks the state of a running backup or restore operation.
@@ -127,8 +148,11 @@ type Progress struct {
 	// operator can rename them in the backup and re-run.
 	UnaddressableFiles  int64    `json:"unaddressable_files,omitempty"`
 	UnaddressableSample []string `json:"unaddressable_sample,omitempty"`
-	// SkippedSample names up to unaddressableSampleCap of the backup objects a
-	// restore could not read. Restore only.
+	// SkippedSample names up to unaddressableSampleCap files. For a restore,
+	// the backup objects it could not read. For a backup, the files its copy
+	// loops skipped (the manifest's skipped_sample, #977), published once after
+	// the copy phases, so a run the skip ratio then fails — which writes no
+	// manifest — still names them here until the next operation starts.
 	SkippedSample []string `json:"skipped_sample,omitempty"`
 	// Restore only (#930). ConsumedInputsSkipped counts input files the
 	// backup held alongside the compacted output that replaced them, per a
@@ -180,11 +204,14 @@ func UnmarshalManifest(data []byte) (*Manifest, error) {
 // SummaryFromManifest creates a compact summary from a full manifest.
 func SummaryFromManifest(m *Manifest) BackupSummary {
 	return BackupSummary{
-		BackupID:      m.BackupID,
-		CreatedAt:     m.CreatedAt,
-		BackupType:    m.BackupType,
-		TotalFiles:    m.TotalFiles,
-		TotalBytes:    m.TotalSizeBytes,
-		DatabaseCount: len(m.Databases),
+		BackupID:             m.BackupID,
+		CreatedAt:            m.CreatedAt,
+		BackupType:           m.BackupType,
+		TotalFiles:           m.TotalFiles,
+		TotalBytes:           m.TotalSizeBytes,
+		DatabaseCount:        len(m.Databases),
+		SkippedFiles:         m.SkippedFiles,
+		SkippedMetadataFiles: m.SkippedMetadataFiles,
+		UnaddressableFiles:   m.UnaddressableFiles,
 	}
 }

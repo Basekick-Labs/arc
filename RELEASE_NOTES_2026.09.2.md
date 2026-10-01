@@ -1796,7 +1796,7 @@ What changes:
 
 - A backup now reports these files: a count and a sample of their paths in the
   backup manifest, a warning naming them, and a metric
-  (`arc_storage_unaddressable_files_total`) so it is visible without reading a
+  (`arc_storage_unaddressable_files`) so it is visible without reading a
   manifest. The message says to rename them, which is what actually recovers the
   data.
 - **A backup whose data files are all unaddressable now fails.** It previously
