@@ -21,6 +21,7 @@ import (
 type globCacheEntry struct {
 	matches   []string
 	expiresAt time.Time
+	setAt     time.Time
 }
 
 // globCache provides a TTL cache for filepath.Glob results
@@ -94,11 +95,33 @@ func (c *globCache) set(pattern string, matches []string) {
 			return
 		}
 	}
+	now := time.Now()
 	c.entries[pattern] = globCacheEntry{
 		matches:   cached,
-		expiresAt: time.Now().Add(c.ttl),
+		expiresAt: now.Add(c.ttl),
+		setAt:     now,
 	}
 	c.mu.Unlock()
+}
+
+// getFresh is get restricted to entries stored within maxAge; maxAge <= 0
+// means any unexpired entry. It is what the empty-range proof (#928) uses
+// so a stale "absent" verdict cannot stand in for a fresh listing.
+func (c *globCache) getFresh(pattern string, maxAge time.Duration) ([]string, bool) {
+	if maxAge <= 0 {
+		return c.get(pattern)
+	}
+	c.mu.RLock()
+	entry, ok := c.entries[pattern]
+	c.mu.RUnlock()
+	if !ok || time.Now().After(entry.expiresAt) || time.Since(entry.setAt) > maxAge {
+		c.misses.Add(1)
+		return nil, false
+	}
+	c.hits.Add(1)
+	result := make([]string, len(entry.matches))
+	copy(result, entry.matches)
+	return result, true
 }
 
 // evictExpiredLocked removes all expired entries. Caller must hold c.mu.
@@ -412,6 +435,11 @@ type TimeRange struct {
 	// consumer pruning storage that can legitimately hold data older than the
 	// assumption (a cold archive tier) must not trust Start for exclusion.
 	StartAssumed bool
+	// EndAssumed marks a range whose End was not extracted from the query
+	// (a start-only predicate, or an end literal the extractor could not
+	// parse) and was assumed as now plus one day. The empty-range proof
+	// (#928) must not trust it: the real end may be later.
+	EndAssumed bool
 }
 
 // evaluateRelativeTime converts a relative time expression to an absolute time.
@@ -586,7 +614,7 @@ func (p *PartitionPruner) ExtractTimeRange(sqlStr string) *TimeRange {
 	} else if startTime != nil {
 		// Only start time - assume query up to "now + 1 day"
 		end := time.Now().UTC().Add(24 * time.Hour)
-		return &TimeRange{Start: *startTime, End: end}
+		return &TimeRange{Start: *startTime, End: end, EndAssumed: true}
 	} else if endTime != nil {
 		// Only end time - assume from beginning of data
 		start := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -734,15 +762,28 @@ func (p *PartitionPruner) GeneratePartitionPaths(ctx context.Context, basePath, 
 //
 // Returns the optimized path (string or []string) and whether optimization was applied
 func (p *PartitionPruner) OptimizeTablePath(ctx context.Context, originalPath, sql string) (interface{}, bool) {
+	result, optimized, _ := p.optimize(ctx, originalPath, sql, false)
+	return result, optimized
+}
+
+// optimize is the shared body of OptimizeTablePath and
+// OptimizeTablePathVerdict. With wantProof false it behaves exactly as
+// OptimizeTablePath always has; with it true, an empty existence pass is
+// followed by the empty-range proof (empty_range.go).
+func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string, wantProof bool) (interface{}, bool, bool) {
 	if !p.enabled {
-		return originalPath, false
+		return originalPath, false, false
 	}
 
 	// Check partition cache first
 	cacheKey := p.partitionCache.cacheKey(originalPath, sql)
 	if result, optimized, ok := p.partitionCache.get(cacheKey); ok {
-		p.logger.Debug().Msg("Using cached partition paths")
-		return result, optimized
+		// A cached fallback verdict is exactly the stale-empty case the proof
+		// exists for: with wantProof, re-derive instead of trusting it.
+		if optimized || !wantProof {
+			p.logger.Debug().Msg("Using cached partition paths")
+			return result, optimized, false
+		}
 	}
 
 	// Extract time range from query
@@ -751,7 +792,7 @@ func (p *PartitionPruner) OptimizeTablePath(ctx context.Context, originalPath, s
 		p.logger.Debug().Msg("No time range found in query, skipping partition pruning")
 		// Cache negative result too
 		p.partitionCache.set(cacheKey, originalPath, false)
-		return originalPath, false
+		return originalPath, false, false
 	}
 
 	// Parse original path to extract components using pre-compiled pattern
@@ -761,7 +802,7 @@ func (p *PartitionPruner) OptimizeTablePath(ctx context.Context, originalPath, s
 	if len(matches) < 4 {
 		p.logger.Debug().Str("path", originalPath).Msg("Path format not recognized")
 		p.partitionCache.set(cacheKey, originalPath, false)
-		return originalPath, false
+		return originalPath, false, false
 	}
 
 	basePath := matches[1]
@@ -780,15 +821,21 @@ func (p *PartitionPruner) OptimizeTablePath(ctx context.Context, originalPath, s
 	if len(partitionPaths) == 0 {
 		p.logger.Info().Msg("No partitions found, using fallback")
 		p.partitionCache.set(cacheKey, originalPath, false)
-		return originalPath, false
+		return originalPath, false, false
 	}
 
 	// Filter out non-existent paths (works for both local and S3/Azure storage)
-	partitionPaths = p.filterExistingPaths(partitionPaths, basePath)
+	generated := partitionPaths
+	existing, verified, hits := p.filterExistingPathsOpts(ctx, partitionPaths, basePath, 0)
+	partitionPaths = existing
 	if len(partitionPaths) == 0 {
+		if wantProof && p.proveEmpty(ctx, basePath, database, measurement, sql, timeRange, generated, hits, verified) {
+			// Never cached: the next query must prove it again.
+			return originalPath, false, true
+		}
 		p.logger.Info().Msg("No data exists for time range, using fallback")
 		p.partitionCache.set(cacheKey, originalPath, false)
-		return originalPath, false
+		return originalPath, false, false
 	}
 
 	// File-level time pruning of the live-hour boundary glob. When it
@@ -816,7 +863,7 @@ func (p *PartitionPruner) OptimizeTablePath(ctx context.Context, originalPath, s
 	if !fileExpanded {
 		p.partitionCache.set(cacheKey, result, true)
 	}
-	return result, true
+	return result, true, false
 }
 
 // StatsSnapshot holds a point-in-time snapshot of pruner statistics
@@ -863,27 +910,44 @@ func parseDateTime(timeStr string) (time.Time, error) {
 // Uses a TTL cache to avoid repeated expensive filesystem operations
 // Handles both local and remote (S3/Azure) paths
 func (p *PartitionPruner) filterExistingPaths(paths []string, basePath string) []string {
+	existing, _, _ := p.filterExistingPathsOpts(context.Background(), paths, basePath, 0)
+	return existing
+}
+
+// filterExistingPathsOpts is filterExistingPaths returning, besides the
+// existing paths, whether every absence was verified by a listing (false when
+// any listing failed, which the plain filter treats as "assume present" for
+// directories and "drop" for day-level file checks) and how many answers
+// came from the cache. maxAge > 0 accepts only cache entries younger than it.
+func (p *PartitionPruner) filterExistingPathsOpts(ctx context.Context, paths []string, basePath string, maxAge time.Duration) ([]string, bool, int) {
 	if len(paths) == 0 {
-		return paths
+		return paths, true, 0
 	}
 
 	// Check if this is remote storage (S3/Azure)
 	firstPath := paths[0]
 	if strings.HasPrefix(firstPath, "s3://") || strings.HasPrefix(firstPath, "azure://") {
-		return p.filterExistingRemotePaths(paths, basePath)
+		return p.filterExistingRemotePathsOpts(ctx, paths, basePath, maxAge)
 	}
 
 	// Local path filtering using filepath.Glob
-	return p.filterExistingLocalPaths(paths)
+	return p.filterExistingLocalPathsOpts(paths, maxAge)
 }
 
 // filterExistingLocalPaths filters local paths using filepath.Glob
 func (p *PartitionPruner) filterExistingLocalPaths(paths []string) []string {
+	existing, _, _ := p.filterExistingLocalPathsOpts(paths, 0)
+	return existing
+}
+
+func (p *PartitionPruner) filterExistingLocalPathsOpts(paths []string, maxAge time.Duration) ([]string, bool, int) {
 	existingPaths := []string{}
+	hits := 0
 
 	for _, pattern := range paths {
 		// Check cache first
-		if matches, ok := p.globCache.get(pattern); ok {
+		if matches, ok := p.globCache.getFresh(pattern, maxAge); ok {
+			hits++
 			if len(matches) > 0 {
 				existingPaths = append(existingPaths, pattern)
 				p.logger.Debug().Str("pattern", pattern).Int("files", len(matches)).Msg("Path exists (cached)")
@@ -914,7 +978,9 @@ func (p *PartitionPruner) filterExistingLocalPaths(paths []string) []string {
 		Int("existing_count", len(existingPaths)).
 		Msg("Filtered existing local paths")
 
-	return existingPaths
+	// filepath.Glob only errors on a malformed pattern, which the generator
+	// never produces, so a local pass is always verified.
+	return existingPaths, true, hits
 }
 
 // filterExistingRemotePaths filters S3/Azure paths by checking which directories exist.
@@ -923,17 +989,24 @@ func (p *PartitionPruner) filterExistingLocalPaths(paths []string) []string {
 // ("s3://bucket/prefix"), and is what turns a full URL back into the
 // backend-relative key a listing needs. See extractStoragePrefix.
 func (p *PartitionPruner) filterExistingRemotePaths(paths []string, basePath string) []string {
+	existing, _, _ := p.filterExistingRemotePathsOpts(context.Background(), paths, basePath, 0)
+	return existing
+}
+
+func (p *PartitionPruner) filterExistingRemotePathsOpts(ctx context.Context, paths []string, basePath string, maxAge time.Duration) ([]string, bool, int) {
+	verified := true
+	hits := 0
 	if p.storage == nil {
 		// No storage backend configured - return all paths and let DuckDB handle errors
 		p.logger.Debug().Msg("No storage backend configured, skipping remote path filtering")
-		return paths
+		return paths, false, 0
 	}
 
 	lister, ok := p.storage.(storage.DirectoryLister)
 	if !ok {
 		// Storage backend doesn't support directory listing
 		p.logger.Debug().Msg("Storage backend doesn't support directory listing, skipping filtering")
-		return paths
+		return paths, false, 0
 	}
 
 	// Extract unique parent directories to check
@@ -976,7 +1049,8 @@ func (p *PartitionPruner) filterExistingRemotePaths(paths []string, basePath str
 	for parentDir := range uniqueParents {
 		cacheKey := "remote:parent:" + parentDir
 
-		if cached, ok := p.globCache.get(cacheKey); ok {
+		if cached, ok := p.globCache.getFresh(cacheKey, maxAge); ok {
+			hits++
 			// Cache hit - rebuild set from cached slice
 			childSet := make(map[string]bool, len(cached))
 			for _, child := range cached {
@@ -995,16 +1069,18 @@ func (p *PartitionPruner) filterExistingRemotePaths(paths []string, basePath str
 			// absent. Assume all exist, the same fail-open the listing-error
 			// branch below takes.
 			parentChildren[parentDir] = nil
+			verified = false
 			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		subdirs, err := lister.ListDirectories(ctx, storagePrefix)
+		listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		subdirs, err := lister.ListDirectories(listCtx, storagePrefix)
 		cancel()
 
 		if err != nil {
 			p.logger.Debug().Err(err).Str("prefix", storagePrefix).Msg("Failed to list remote directories")
 			// On error, mark all children as existing to avoid false negatives
 			parentChildren[parentDir] = nil // nil means "assume all exist"
+			verified = false
 			continue
 		}
 
@@ -1057,22 +1133,26 @@ func (p *PartitionPruner) filterExistingRemotePaths(paths []string, basePath str
 		if !ok {
 			// Cannot resolve: keep the path rather than judging it empty.
 			existingPaths = append(existingPaths, path)
+			verified = false
 			continue
 		}
 		if parts := strings.Split(strings.Trim(prefix, "/"), "/"); len(parts) == 5 {
 			// Check cache first for day-level file existence
 			cacheKey := "remote:dayfiles:" + prefix
 			var hasFiles bool
-			if cached, ok := p.globCache.get(cacheKey); ok {
+			if cached, ok := p.globCache.getFresh(cacheKey, maxAge); ok {
+				hits++
 				hasFiles = len(cached) > 0
 				p.logger.Debug().Str("prefix", prefix).Bool("has_files", hasFiles).Msg("Using cached day-level file check")
 			} else {
 				// Cache miss - make API call
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				files, err := p.storage.List(ctx, prefix)
+				listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				files, err := p.storage.List(listCtx, prefix)
 				cancel()
 				if err != nil {
 					p.logger.Debug().Err(err).Str("prefix", prefix).Msg("Failed to list files at day-level path")
+					// Dropped, as before, but the absence is not verified.
+					verified = false
 					continue
 				}
 				// Find direct parquet files (not in subdirs)
@@ -1102,7 +1182,7 @@ func (p *PartitionPruner) filterExistingRemotePaths(paths []string, basePath str
 		Int("existing_count", len(existingPaths)).
 		Msg("Filtered existing remote paths")
 
-	return existingPaths
+	return existingPaths, verified, hits
 }
 
 // extractStoragePrefix converts a full S3/Azure URL into the backend-relative

@@ -358,9 +358,12 @@ func (b *LocalBackend) ReadToAt(ctx context.Context, path string, writer io.Writ
 // final file nor its ".part" staging file exist.
 // Returns a non-nil error only for unexpected failures.
 //
-// Checking the staging file allows the puller's pre-pull check to distinguish
-// a fully-received file (size == entry.SizeBytes → skip) from a partial one
-// (size < entry.SizeBytes → resume).
+// The staging-file fallback serves the puller's resume path, which needs the
+// size of an interrupted download to continue from that byte. It is not a
+// presence check: a staging file at the full size with no final file is an
+// unfinished pull, not a present file (#963). Callers deciding presence
+// confirm the final file through StagingInspector.StagedSize and Exists, as
+// the puller's statLocal does.
 func (b *LocalBackend) StatFile(ctx context.Context, path string) (int64, error) {
 	fullPath, err := b.validatePath(path)
 	if err != nil {

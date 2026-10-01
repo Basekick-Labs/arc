@@ -37,12 +37,14 @@ type manifestWalkResult struct {
 // means no more pages. This avoids allocating a full O(N) snapshot of the
 // manifest.
 //
-// RunCatchUp does NOT itself talk to peers or verify files. It relies on
-// Enqueue's existing origin-is-self check, the inflight dedup set (so reactive
-// FSM callbacks can race without double-pulling), and the workers' backend
-// checks. All actual fetch work flows through the same code path that Phase 2
-// reactive pulls use, which means the same retry, backoff, checksum, and
-// metrics behavior applies automatically.
+// RunCatchUp does NOT itself talk to peers or verify files. It relies on the
+// inflight dedup set (so reactive FSM callbacks can race without
+// double-pulling) and the workers' backend checks; the one check it makes
+// itself is the disk presence of a self-origin entry when
+// RepullMissingSelfOrigin is on (otherwise such entries are skipped outright,
+// as enqueue does for the reactive path). All actual fetch work flows through
+// the same code path that Phase 2 reactive pulls use, which means the same
+// retry, backoff, checksum, and metrics behavior applies automatically.
 //
 // To avoid a thundering-herd drop storm on large manifests, the feeder sleeps
 // briefly whenever the queue is above CatchUpQueueHighWater (default 80%).
@@ -64,6 +66,21 @@ func (p *Puller) RunCatchUp(ctx context.Context, fetch func(cursor string, limit
 	p.reconciliationMu.Lock()
 	defer p.reconciliationMu.Unlock()
 	p.walkManifest(ctx, fetch, true)
+}
+
+// selfOriginPresent reports whether a self-origin entry may be skipped by a
+// walk: always when the re-pull is off (this node is assumed to hold what it
+// wrote), otherwise only when the file is on disk at the manifest's size.
+// One stat per own entry per walk, on the walker goroutine — the same call
+// the worker's pre-pull check makes; a node with many own files pays
+// microseconds each on a local disk and never puts a present file into the
+// queue.
+func (p *Puller) selfOriginPresent(entry *raft.FileEntry) bool {
+	if !p.cfg.RepullMissingSelfOrigin {
+		return true
+	}
+	size, err := p.statLocal(entry.Path)
+	return presentAtSize(size, err, entry.SizeBytes)
 }
 
 // RunReconciliation walks the current manifest and enqueues entries through
@@ -256,14 +273,24 @@ func (p *Puller) walkManifest(ctx context.Context, fetch func(cursor string, lim
 				return result
 			}
 
-			if startup {
-				// Fast-path self-origin entries so Enqueue does not create a
-				// catch-up tag for a file this node already owns.
-				if entry.OriginNodeID == p.cfg.SelfNodeID {
-					p.totalSkippedSelf.Add(1)
+			// A self-origin entry is skipped when this node still holds the
+			// file — always, when RepullMissingSelfOrigin is off, as it was
+			// before #959 — so that the startup walk does not create a
+			// catch-up tag for a file that is already here. With the re-pull
+			// on, the disk decides: a node restored with an empty data disk
+			// originated files it no longer has, and they must come back from
+			// a peer's replica like any other entry (catch-up-tagged on the
+			// startup walk, so the query gate stays red until they are).
+			if entry.OriginNodeID == p.cfg.SelfNodeID && p.selfOriginPresent(entry) {
+				p.totalSkippedSelf.Add(1)
+				if startup {
 					p.catchupSkippedLocal.Add(1)
-					continue
+				} else {
+					result.skipped++
 				}
+				continue
+			}
+			if startup {
 				p.markCatchUp(entry.Path)
 			}
 

@@ -115,8 +115,8 @@ func (s *StorageWalkSource) Measurements(ctx context.Context) ([]Measurement, er
 	var out []Measurement
 	for _, db := range dbs {
 		db = strings.Trim(db, "/")
-		if db == "" || s.isWarehouseDir(db) || db == compactionStateDir {
-			continue // skip empty, the exporter's own warehouse namespace dirs, and compaction's state dir
+		if db == "" || s.isWarehouseDir(db) || db == compactionStateDir || storage.IsReservedRootDir(db) {
+			continue // skip empty, the exporter's own warehouse namespace dirs, and Arc's reserved state dirs (_compaction_state, _schema)
 		}
 		measurements, err := dl.ListDirectories(ctx, db+"/")
 		if err != nil {
@@ -178,7 +178,7 @@ func (s *StorageWalkSource) expandNamespaces(ctx context.Context, dl dirLister, 
 		}
 		for _, child := range children {
 			child = strings.Trim(child, "/")
-			if child == "" {
+			if child == "" || storage.IsReservedRootDir(child) {
 				continue
 			}
 			out = append(out, name+"/"+child)

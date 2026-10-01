@@ -7,6 +7,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
+	"strings"
 )
 
 // recordStorageError increments the storage-error counter unless the
@@ -148,4 +149,14 @@ func validateReadSegment(what, seg string) error {
 		return fmt.Errorf("%s: %w", what, err)
 	}
 	return nil
+}
+
+// IsReservedRootDir reports whether a top-level storage directory is one Arc
+// reserves for its own state rather than a database: names starting with "_"
+// (compaction's _compaction_state, the field schema anchors under _schema)
+// or ".". Every walker that enumerates the storage root as a list of
+// databases must skip these.
+func IsReservedRootDir(name string) bool {
+	name = strings.TrimSuffix(name, "/")
+	return strings.HasPrefix(name, "_") || strings.HasPrefix(name, ".")
 }

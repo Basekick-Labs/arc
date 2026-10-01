@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -173,6 +174,60 @@ func (f *fakeBackend) StatFile(ctx context.Context, path string) (int64, error) 
 		return int64(len(data)), nil
 	}
 	return -1, nil
+}
+
+// The fake implements storage.StagingInspector the way LocalBackend does:
+// the staged partial for key lives at key+".part". StagedSize is the method
+// the puller's presence check uses; the rest complete the contract.
+var _ storage.StagingInspector = (*fakeBackend)(nil)
+
+// StagedSize mirrors LocalBackend: the ".part" size, or -1 when absent.
+func (f *fakeBackend) StagedSize(ctx context.Context, key string) (int64, error) {
+	if err := checkKey(key); err != nil {
+		return -1, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if data, ok := f.files[key+".part"]; ok {
+		return int64(len(data)), nil
+	}
+	return -1, nil
+}
+
+func (f *fakeBackend) ReadStaged(ctx context.Context, key string, writer io.Writer) error {
+	if err := checkKey(key); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	data, ok := f.files[key+".part"]
+	f.mu.Unlock()
+	if !ok {
+		return errors.New("not found")
+	}
+	_, err := writer.Write(data)
+	return err
+}
+
+func (f *fakeBackend) DeleteStaged(ctx context.Context, key string) error {
+	if err := checkKey(key); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.files, key+".part")
+	return nil
+}
+
+func (f *fakeBackend) ListStaged(ctx context.Context, prefix string) ([]storage.ObjectInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []storage.ObjectInfo
+	for k, data := range f.files {
+		if strings.HasSuffix(k, ".part") && strings.HasPrefix(k, prefix) {
+			out = append(out, storage.ObjectInfo{Path: strings.TrimSuffix(k, ".part"), Size: int64(len(data))})
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeBackend) AppendReader(ctx context.Context, path string, reader io.Reader, appendSize int64) error {

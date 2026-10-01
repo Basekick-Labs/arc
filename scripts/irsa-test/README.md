@@ -54,7 +54,7 @@ the caveat in duckdb-aws#136 that auto-refresh may only apply to un-globbed path
 
 - **`MaxSessionDuration` minimum is 3600s.** AWS rejects 900. Expiry testing means
   waiting an hour; there is no shortcut.
-- **The stock `arc.toml` ships MinIO defaults** (`s3_use_ssl=false`,
+- **The stock `arc.toml` ships self-hosted S3 defaults** (`s3_use_ssl=false`,
   `s3_path_style=true`). Against real AWS that yields `403 AccessDenied`. Override
   both, as above.
 - **Rancher Desktop does not bind-mount `/tmp`.** Put the token under `$HOME`, or

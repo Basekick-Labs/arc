@@ -267,16 +267,18 @@ func TestStop_DoesNotDeadlockOnDeleteAppliedDuringShutdown(t *testing.T) {
 }
 
 // localTypedBackend makes the callback take the local-unlink branch, which
-// sends on the delete queue, so a stale callback after Stop would be visible.
+// appends to the pending deletes, so a stale callback after Stop would be
+// visible.
 type localTypedBackend struct{ *memBackend }
 
 func (localTypedBackend) Type() string { return "local" }
 
-// Stop must unregister the file callbacks it captured a queue for. An
-// in-process Start restarts Raft, which replays the log into the same FSM
-// before fresh callbacks are registered; a leftover callback from the
-// previous life would send on the closed queue and panic.
-func TestStop_UnregistersFileCallbacksBeforeClosingTheQueue(t *testing.T) {
+// Stop must unregister the file callbacks before it stops the delete
+// workers. An in-process Start restarts Raft, which replays the log into the
+// same FSM before fresh callbacks are registered; a leftover callback from
+// the previous life would append deletes no worker is left to drain (and,
+// when the hand-off was a channel, would send on the closed one and panic).
+func TestStop_UnregistersFileCallbacksBeforeStoppingTheWorkers(t *testing.T) {
 	c, raftNode := newShutdownRig(t, allocFreePort(t), 1000)
 	c.storage = localTypedBackend{newMemBackend()}
 	// Rebuild the closures with the local-typed backend captured.

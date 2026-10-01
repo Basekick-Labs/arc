@@ -78,6 +78,12 @@ func markVolatile(ctx context.Context) {
 	}
 }
 
+// MarkVolatile flips the context's volatility flag, if one is attached. The
+// query layer calls it when it drops a tier from a read on the strength of a
+// listing: a transform built that way must not outlive the next flush into
+// that tier.
+func MarkVolatile(ctx context.Context) { markVolatile(ctx) }
+
 // SetFileTimePruning enables or disables file-level time pruning.
 // margin widens the keep-window below the query's lower bound to absorb
 // writer clock skew (rows stamped slightly ahead of the server clock).

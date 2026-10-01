@@ -649,7 +649,14 @@ func isSyncableFile(p string) bool {
 	if !strings.HasSuffix(p, ".parquet") {
 		return false
 	}
-	for _, seg := range strings.Split(p, "/") {
+	segs := strings.Split(p, "/")
+	// A reserved root (_schema, _compaction_state) is node-local state, not
+	// data: the field schema anchors under _schema are zero-row Parquet
+	// files the hub rebuilds for itself (#914).
+	if len(segs) > 0 && storage.IsReservedRootDir(segs[0]) {
+		return false
+	}
+	for _, seg := range segs {
 		if strings.HasPrefix(seg, ".") {
 			return false
 		}
