@@ -88,6 +88,7 @@ body:
       options:
         - Local filesystem
         - S3
+        - SeaweedFS
         - MinIO
         - Azure Blob Storage
         - Other (please specify in description)

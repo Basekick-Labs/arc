@@ -7,11 +7,12 @@
 // slash, Azure treating a backslash as a separator) are properties of the
 // servers, not of any mock.
 //
-// Run with:
+// Run with (SeaweedFS stands in for S3; see .github/workflows/ci.yml for the
+// identities file that supplies the minioadmin credentials these tests use):
 //
-//	docker run -d --name arc-minio -p 9000:9000 \
-//	  -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-//	  quay.io/minio/minio server /data
+//	docker run -d --name arc-seaweedfs -p 9000:8333 \
+//	  -v /tmp/seaweed-s3.json:/etc/seaweedfs/s3.json:ro \
+//	  chrislusf/seaweedfs:4.47 server -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
 //	ARC_TEST_S3_BUCKET=arctest go test -tags='duckdb_arrow objectstore' ./internal/storage/
 //
 // CI does this in .github/workflows/ci.yml.
@@ -25,6 +26,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -34,6 +36,41 @@ import (
 
 	"github.com/rs/zerolog"
 )
+
+// TestS3WriteReaderUnseekableOverHTTP pins that a body the SDK cannot rewind
+// uploads over the plain-HTTP endpoint CI uses: as one PutObject (1 KiB) and
+// as a multipart upload (20 MiB, past one 16 MiB part). The SDK refused the
+// former client-side before a byte was sent; the latter — CRC32 headers on
+// every part and on the completion — had never been observed against a real
+// store. The pattern is positional so a mis-ordered or missing part shows.
+func TestS3WriteReaderUnseekableOverHTTP(t *testing.T) {
+	b := minioBackend(t)
+	ctx := context.Background()
+
+	for _, size := range []int{1024, 20 * 1024 * 1024} {
+		key := fmt.Sprintf("contract-unseekable/x/2024/03/15/%d.parquet", size)
+		data := make([]byte, size)
+		for i := range data {
+			data[i] = byte(i * 7)
+		}
+		pr, pw := io.Pipe()
+		go func() {
+			_, _ = pw.Write(data)
+			_ = pw.Close()
+		}()
+		if err := b.WriteReader(ctx, key, pr, int64(size)); err != nil {
+			t.Fatalf("WriteReader(%d bytes via io.Pipe): %v", size, err)
+		}
+		got, err := b.Read(ctx, key)
+		if err != nil {
+			t.Fatalf("Read(%s): %v", key, err)
+		}
+		if !bytes.Equal(got, data) {
+			t.Fatalf("read back %d bytes for a %d-byte upload, or the content differs", len(got), size)
+		}
+		_ = b.Delete(ctx, key)
+	}
+}
 
 func minioBackend(t *testing.T) *S3Backend {
 	t.Helper()

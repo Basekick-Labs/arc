@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -29,6 +30,7 @@ import (
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/edgesync"
+	"github.com/basekick-labs/arc/internal/fieldschema"
 	"github.com/basekick-labs/arc/internal/fips"
 	"github.com/basekick-labs/arc/internal/governance"
 	"github.com/basekick-labs/arc/internal/iceberg"
@@ -762,33 +764,45 @@ func main() {
 	}
 
 	// Pattern 2 shared-storage multi-writer mode startup validation.
-	// Refuses to start under three conditions that would silently break
+	// Refuses to start under four conditions that would silently break
 	// the multi-writer invariant:
 	//
 	//   (a) cluster.enabled=false — without the cluster coordinator,
 	//       schedulers have a nil ClusterGate (see scheduler wiring in
-	//       cmd/arc/main.go) and singleton tasks (retention, CQ, delete)
-	//       run unconditionally. Two such "standalone" nodes pointed at
-	//       the same bucket would each run retention against the shared
-	//       data — duplicate deletes, duplicate writes. SharedStorageMode
-	//       is meaningless without clustering.
+	//       cmd/arc/main.go) and singleton tasks (retention, CQ, delete,
+	//       tiering migration) run unconditionally. Two such "standalone"
+	//       nodes pointed at the same bucket would each run retention
+	//       against the shared data — duplicate deletes, duplicate writes.
+	//       SharedStorageMode is meaningless without clustering.
 	//   (b) cfg.Storage.Backend == "local" — per-node filesystems can't
 	//       be shared across N writers. Writes would diverge silently.
-	//   (c) license lacks the shared_storage_multi_writer feature — this
+	//   (c) cluster.role resolves to standalone (the default when unset) —
+	//       a standalone-role node votes in Raft and can win leadership,
+	//       but IsPrimaryWriter in shared-storage mode requires the writer
+	//       role, so with a standalone leader NO node passes the gate and
+	//       every singleton task silently stops (the #862 hazard, for the
+	//       one role it left open).
+	//   (d) license lacks the shared_storage_multi_writer feature — this
 	//       is an Enterprise-tier capability that must be explicitly
 	//       licensed; running without the gate would be a license bypass.
 	//
-	// Order matters: cluster.enabled before backend before license, so
-	// the most upstream misconfig surfaces first.
+	// Order matters: cluster.enabled before backend before role before
+	// license, so the most upstream misconfig surfaces first. A role Arc
+	// does not recognise is left to the ResolveRole check further down.
 	if cfg.Cluster.SharedStorageMode {
 		if !cfg.Cluster.Enabled {
 			log.Fatal().
-				Msg("cluster.shared_storage_mode=true requires cluster.enabled=true; without the cluster coordinator there is no leader-election gate and singleton background tasks (retention, CQ, delete) would run on every node")
+				Msg("cluster.shared_storage_mode=true requires cluster.enabled=true; without the cluster coordinator there is no leader-election gate and singleton background tasks (retention, CQ, delete, tiering migration) would run on every node")
 		}
 		if cfg.Storage.Backend == "local" {
 			log.Fatal().
 				Str("backend", cfg.Storage.Backend).
 				Msg("cluster.shared_storage_mode=true requires an object-store backend (s3, minio, azure, or azblob); local-filesystem backend cannot be shared across writers")
+		}
+		if role, roleErr := cluster.ResolveRole(cfg.Cluster.Role); roleErr == nil && role == cluster.RoleStandalone {
+			log.Fatal().
+				Str("role", cfg.Cluster.Role).
+				Msg("cluster.shared_storage_mode=true requires cluster.role to be writer, reader or compactor; a standalone-role node can win Raft leadership but never passes the primary-writer gate, so retention, CQ, delete and tiering migration would run on no node")
 		}
 		if licenseClient == nil || !licenseClient.CanUseSharedStorageMultiWriter() {
 			log.Fatal().
@@ -841,6 +855,33 @@ func main() {
 		arrowBuffer.SetWAL(walWriter)
 	}
 	shutdownCoordinator.Register("arrow-buffer", arrowBuffer, shutdown.PriorityBuffer)
+
+	// Measurement field schema registry (#914). Ingest folds every flushed
+	// file's schema into the measurement's stored anchor under _schema/;
+	// the query rewriter lists a local copy of that anchor first in every
+	// read_parquet so fields bind independently of the selected time range.
+	// The local copies live under the upload dir, which is inside DuckDB's
+	// allowed_directories.
+	fieldSchemaRegistry := fieldschema.New(storageBackend, db.DB(), fieldschema.Options{
+		Enabled:           cfg.Query.StableSchema,
+		Bootstrap:         cfg.Query.StableSchemaBootstrap,
+		BootstrapMaxFiles: cfg.Query.StableSchemaBootstrapMaxFiles,
+		LocalDir:          uploadDir,
+	}, logger.Get("fieldschema"))
+	fieldSchemaCtx, cancelFieldSchema := context.WithCancel(context.Background())
+	fieldSchemaRegistry.Start(fieldSchemaCtx)
+	shutdownCoordinator.Register("field-schema", shutdownFunc(func() error {
+		cancelFieldSchema()
+		fieldSchemaRegistry.Stop()
+		return nil
+	}), shutdown.PriorityBuffer)
+	arrowBuffer.SetFieldSchema(fieldSchemaRegistry)
+	if cfg.Query.StableSchema {
+		log.Info().
+			Bool("bootstrap", cfg.Query.StableSchemaBootstrap).
+			Int("bootstrap_max_files", cfg.Query.StableSchemaBootstrapMaxFiles).
+			Msg("Stable measurement field schema enabled (query.stable_schema)")
+	}
 
 	// Purge WAL files after ArrowBuffer has flushed (priority 30) and before the
 	// WAL writer closes (priority 40), so recovery does not replay data that is
@@ -1278,7 +1319,9 @@ func main() {
 			StorageBackend:   storageBackend,
 			LockManager:      lockManager,
 			MaxConcurrent:    cfg.Compaction.MaxConcurrent,
+			CycleTimeout:     cfg.Compaction.CycleTimeout,
 			MaxFilesPerBatch: cfg.Compaction.MaxFilesPerBatch,
+			ExcludeDatabases: cfg.Compaction.ExcludeDatabases,
 			// Per-subprocess DuckDB bounds. Config resolves the "auto"
 			// sentinels at load time: memory_limit defaults to
 			// database.memory_limit / max_concurrent (so compaction's
@@ -2886,6 +2929,15 @@ func main() {
 	if authManager != nil && rbacManager != nil {
 		queryHandler.SetAuthAndRBAC(authManager, rbacManager)
 	}
+	queryHandler.SetFieldSchema(fieldSchemaRegistry)
+	if cfg.Query.EmptyRangeAnchorScan {
+		if cfg.Query.StableSchema {
+			queryHandler.SetEmptyRangeAnchorScan(true)
+			log.Info().Msg("Empty-range anchor scan enabled (query.empty_range_anchor_scan, experimental)")
+		} else {
+			log.Warn().Msg("query.empty_range_anchor_scan ignored: it requires query.stable_schema")
+		}
+	}
 	if cfg.Query.FileTimePruning {
 		queryHandler.SetFileTimePruning(true, time.Duration(cfg.Query.FileTimePruningMarginSeconds)*time.Second)
 	}
@@ -3218,6 +3270,7 @@ func main() {
 
 	// Register Databases handler
 	databasesHandler := api.NewDatabasesHandler(storageBackend, &cfg.Delete, authManager, logger.Get("databases"))
+	databasesHandler.SetFieldSchema(fieldSchemaRegistry)
 	databasesHandler.RegisterRoutes(server.GetApp())
 
 	// Register Debug handler — admin-auth memory diagnostics
@@ -3335,6 +3388,9 @@ func main() {
 	if cfg.ContinuousQuery.Enabled {
 		var err error
 		cqHandler, err = api.NewContinuousQueryHandler(db, storageBackend, arrowBuffer, &cfg.ContinuousQuery, authManager, logger.Get("cq"))
+		if err == nil {
+			cqHandler.SetFieldSchema(fieldSchemaRegistry)
+		}
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize continuous query handler")
 		}
@@ -3348,6 +3404,19 @@ func main() {
 		log.Info().Str("db_path", cfg.ContinuousQuery.DBPath).Msg("Continuous queries enabled")
 	} else {
 		log.Info().Msg("Continuous queries DISABLED")
+	}
+
+	// Shared-storage mode without a running cluster coordinator: every
+	// singleton scheduler wired below (CQ, retention, tiering) would get a
+	// nil gate and run against the shared bucket as if this were the only
+	// node — the duplicate-singleton hazard the startup validation refuses
+	// for cluster.enabled=false. The coordinator is nil here despite
+	// cluster.enabled=true when the license lacks clustering or the
+	// coordinator failed to initialize or start; each of those logs
+	// "running in standalone mode", which is exactly wrong on a shared bucket.
+	if cfg.Cluster.SharedStorageMode && clusterCoordinator == nil {
+		log.Fatal().
+			Msg("cluster.shared_storage_mode=true but the cluster coordinator is not running (see the errors above); without it retention, CQ and tiering migration would run on this node unconditionally against the shared bucket")
 	}
 
 	// Initialize CQ Scheduler (Enterprise feature - requires valid license)
@@ -3444,11 +3513,18 @@ func main() {
 	// enabled, runs on cron with conservative grace window + blast cap.
 	var reconciliationScheduler *reconciliation.Scheduler
 	if cfg.Reconciliation.Enabled && clusterCoordinator != nil {
-		gate := newReconciliationClusterGate(clusterCoordinator, cfg.Storage.Backend)
+		gate := newReconciliationClusterGate(clusterCoordinator, cfg.Storage.Backend, cfg.Cluster.ReplicationEnabled, cfg.Cluster.ReplicationCatchUpEnabled)
+		if !isSharedBackend(cfg.Storage.Backend) && cfg.Cluster.ReplicationEnabled && !cfg.Cluster.ReplicationCatchUpEnabled {
+			log.Warn().Msg("cluster.replication_catchup_enabled=false: the reconciler's orphan-manifest sweep is not held until file replication has converged on this node, and a node restored with an empty data disk does not pull back the files it originated. Keep reconciliation in dry run after such a restore, or re-enable the catch-up walker.")
+		}
 		recCfg := reconciliation.Config{
-			Enabled:                  true,
-			BackendKind:              reconciliationBackendKind(cfg.Storage.Backend),
-			LocalNodeID:              cfg.Cluster.NodeID,
+			Enabled:     true,
+			BackendKind: reconciliationBackendKind(cfg.Storage.Backend),
+			// The coordinator's id, not the raw config value: it generates
+			// one when cluster.node_id is unset, and it is what every
+			// producer of OriginNodeID stamps into manifest entries. The raw
+			// value left such a node without reconciliation at all (#957).
+			LocalNodeID:              clusterCoordinator.LocalNodeID(),
 			GraceWindow:              time.Duration(cfg.Reconciliation.GraceWindowSeconds) * time.Second,
 			ClockSkewAllowance:       time.Duration(cfg.Reconciliation.ClockSkewAllowanceSeconds) * time.Second,
 			PerPrefixTimeout:         time.Duration(cfg.Reconciliation.PerPrefixTimeoutSeconds) * time.Second,
@@ -3585,6 +3661,30 @@ func main() {
 					}
 				}
 
+				// Where nodes share data — one hot bucket (shared-storage
+				// mode), or per-node disks kept in step by file replication
+				// — only the primary writer among them moves and deletes
+				// files (the gate retention and CQ use); every node still
+				// syncs its tier metadata each cycle because queries route
+				// from it; and every hot copy tiering removes leaves the
+				// cluster manifest first, so peer replication does not pull
+				// it back. A local-storage cluster without replication
+				// shares nothing and stays ungated: each node's metadata is
+				// authoritative for its own disk. The manifest seam is wired
+				// whenever a coordinator exists, since files are registered
+				// in the manifest either way.
+				var tieringGate tiering.ClusterGate
+				var tieringManifest tiering.ManifestCoordinator
+				if clusterCoordinator != nil {
+					tieringManifest = &tieringManifestAdapter{
+						coordinator: clusterCoordinator,
+						logger:      logger.Get("tiering-manifest"),
+					}
+					if cfg.Cluster.SharedStorageMode || cfg.Cluster.ReplicationEnabled {
+						tieringGate = newWriterClusterGate(clusterCoordinator)
+					}
+				}
+
 				// Create tiering manager
 				tieringManager, err = tiering.NewManager(&tiering.ManagerConfig{
 					HotBackend:    storageBackend,
@@ -3592,6 +3692,8 @@ func main() {
 					DB:            tieringDB,
 					Config:        &cfg.TieredStorage,
 					LicenseClient: licenseClient,
+					ClusterGate:   tieringGate,
+					Manifest:      tieringManifest,
 					Logger:        logger.Get("tiering"),
 				})
 				if err != nil {
@@ -3628,6 +3730,23 @@ func main() {
 					}
 				}
 			}
+		}
+	}
+
+	// A replicating local-storage cluster node reads a daily file that
+	// another node migrated to cold only through its own cold row and cold
+	// backend: the primary's manifest delete unlinks every replica, and its
+	// sweep does the same for files migrated before the manifest was kept in
+	// step. Keyed on what was actually built, not on config: a tiering
+	// manager that failed to start, or a cold backend that failed to
+	// construct, leaves this node just as unable to read cold.
+	if clusterCoordinator != nil && cfg.Cluster.ReplicationEnabled && !cfg.Cluster.SharedStorageMode {
+		coldReadable := tieringManager != nil && tieringManager.GetBackendForTier(tiering.TierCold) != nil
+		if !coldReadable {
+			log.Warn().
+				Bool("tiering_enabled", cfg.TieredStorage.Enabled).
+				Bool("cold_enabled", cfg.TieredStorage.Cold.Enabled).
+				Msg("This replicating cluster node has no usable cold tier: a daily file any node migrates to cold is removed from local storage cluster-wide and would be unreadable here; enable tiering with the same cold backend on every node")
 		}
 	}
 
@@ -4093,11 +4212,59 @@ type shutdownFunc func() error
 
 func (f shutdownFunc) Close() error { return f() }
 
+// tieringManifestAdapter implements tiering.ManifestCoordinator over the
+// cluster coordinator the way retention builds its manifest deletes
+// (internal/api/retention.go): JSON DeleteFilePayload ops in one batch,
+// applied on the leader or forwarded to it. Lives in main.go so tiering has
+// no compile-time dependency on the cluster or raft packages.
+type tieringManifestAdapter struct {
+	coordinator *cluster.Coordinator
+	logger      zerolog.Logger
+}
+
+func (a *tieringManifestAdapter) DeleteFilesFromManifest(ctx context.Context, paths []string, reason string) error {
+	ops := make([]clusterraft.BatchFileOp, 0, len(paths))
+	for _, p := range paths {
+		payload, err := json.Marshal(clusterraft.DeleteFilePayload{Path: p, Reason: reason})
+		if err != nil {
+			return fmt.Errorf("marshal manifest delete for %q: %w", p, err)
+		}
+		ops = append(ops, clusterraft.BatchFileOp{Type: clusterraft.CommandDeleteFile, Payload: payload})
+	}
+	// A leader election mid-cycle is ordinary, and the forward path reports
+	// it at once rather than waiting one out, so retry briefly — four
+	// attempts, 1 s + 2 s + 4 s apart, about 7 s — before treating it as the
+	// quorum loss the migrator stops on. A rejection that carries a Raft
+	// apply code is not retried: quorum loss is not transient.
+	err := tiering.RetryTransient(ctx, 4, time.Second, func() error {
+		return a.coordinator.BatchFileOpsInManifestContext(ctx, ops)
+	}, func(err error) bool {
+		return errors.Is(err, cluster.ErrNoLeaderKnown) || errors.Is(err, cluster.ErrLeaderUnreachable)
+	})
+	if err != nil {
+		a.logger.Error().Err(err).
+			Int("count", len(ops)).
+			Str("reason", reason).
+			Bool("manifest_apply", errors.Is(err, clusterraft.ErrManifestApply)).
+			Msg("Failed to remove tiered files from the cluster manifest")
+	}
+	return err
+}
+
+func (a *tieringManifestAdapter) ManifestEntry(path string) (int64, bool) {
+	entry, ok := a.coordinator.GetFileEntry(path)
+	if !ok || entry == nil {
+		return 0, false
+	}
+	return entry.SizeBytes, true
+}
+
 // writerClusterGate implements scheduler.WriterGate (satisfies both
-// scheduler.RetentionClusterGate and scheduler.CQClusterGate aliases).
-// Only the primary writer node runs scheduled mutations (retention, CQ) to
-// prevent duplicate writes. Lives in main.go to avoid a compile-time
-// dependency between the scheduler and cluster packages.
+// scheduler.RetentionClusterGate and scheduler.CQClusterGate aliases) and
+// tiering.ClusterGate. Only the primary writer node runs scheduled
+// mutations (retention, CQ, tiering migration) to prevent duplicate writes.
+// Lives in main.go to avoid a compile-time dependency between the
+// scheduler/tiering and cluster packages.
 type writerClusterGate struct {
 	coordinator *cluster.Coordinator
 }
@@ -4178,22 +4345,43 @@ func (g icebergWriterGate) CanRun() bool { return g.inner.CanCompact() }
 //   - Shared storage (S3, Azure, MinIO): one node sweeps the bucket. Both
 //     halves gate on IsActiveCompactor — reuses the failover-managed
 //     compactor lease as a single-sweeper election with no new state.
-//   - Local storage: every node walks its own disks; the per-file
-//     OriginNodeID filter inside the reconciler handles scoping.
-//     BatchFileOpsInManifest leader-forwards on its own, so the
-//     manifest-sweep gate is also "always".
+//   - Local storage: every node walks its own disk against the full
+//     manifest; inside the reconciler the per-file OriginNodeID scopes
+//     only the orphan-manifest direction to entries this node originated.
+//     BatchFileOpsInManifest leader-forwards on its own, so the storage
+//     scan is always allowed; the manifest sweep is held until file
+//     replication has converged on this node (#959): a node restored with
+//     an empty data disk is still pulling back the files it originated,
+//     and until it has them the sweep would see them missing and propose
+//     their deletion — which every other node would then carry out on its
+//     replica. The hold is armed only when the catch-up walker runs, since
+//     with it disabled readiness would never be reached (the query gate
+//     follows the same rule); the reconciler reports a held sweep as
+//     manifest_sweep_held and runs the storage half regardless.
 //
 // This type lives in main.go so the reconciliation package has no
 // compile-time dependency on the cluster package.
 type reconciliationClusterGate struct {
-	coordinator *cluster.Coordinator
+	coordinator reconciliationGateCoordinator
 	shared      bool // true for s3/azure backends — one-node-sweeps semantics
+	// holdSweepUntilCaughtUp arms the local-storage manifest-sweep hold:
+	// file replication and its catch-up walker are both enabled.
+	holdSweepUntilCaughtUp bool
 }
 
-func newReconciliationClusterGate(c *cluster.Coordinator, backendKind string) *reconciliationClusterGate {
+// reconciliationGateCoordinator is what the gate needs from the cluster
+// coordinator, kept narrow so the gate can be tested with a fake.
+type reconciliationGateCoordinator interface {
+	IsActiveCompactor() bool
+	ReplicationReady() bool
+	GetRole() cluster.NodeRole
+}
+
+func newReconciliationClusterGate(c reconciliationGateCoordinator, backendKind string, replicationEnabled, catchUpEnabled bool) *reconciliationClusterGate {
 	return &reconciliationClusterGate{
-		coordinator: c,
-		shared:      isSharedBackend(backendKind),
+		coordinator:            c,
+		shared:                 isSharedBackend(backendKind),
+		holdSweepUntilCaughtUp: !isSharedBackend(backendKind) && replicationEnabled && catchUpEnabled,
 	}
 }
 
@@ -4207,6 +4395,9 @@ func (g *reconciliationClusterGate) ShouldRunStorageScan() bool {
 func (g *reconciliationClusterGate) ShouldRunManifestSweep() bool {
 	if g.shared {
 		return g.coordinator.IsActiveCompactor()
+	}
+	if g.holdSweepUntilCaughtUp {
+		return g.coordinator.ReplicationReady()
 	}
 	return true
 }

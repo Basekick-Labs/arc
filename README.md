@@ -46,7 +46,7 @@ Arc is **not a wrapper**. You don't bring your own ingestion, compaction, or ret
 
 - **Keep full-resolution history** instead of choosing between retention and cost.
 - **Use standard SQL** with window functions, CTEs, joins, and analytical aggregations.
-- **Own the files**: Arc stores data as open Apache Parquet on local disk, S3, Azure, or MinIO.
+- **Own the files**: Arc stores data as open Apache Parquet on local disk, S3, Azure, or any S3-compatible store (SeaweedFS, R2, MinIO, ...).
 - **Start small**: run one binary on a laptop, edge box, or server before adding enterprise clustering.
 - **Migrate gradually**: use InfluxDB Line Protocol and Telegraf-compatible ingestion to dual-write and validate before cutover.
 
@@ -226,16 +226,16 @@ Apple Silicon. DuckDB is statically linked, so there are no runtime dependencies
 ### Debian/Ubuntu
 
 ```bash
-wget https://github.com/basekick-labs/arc/releases/download/v26.09.1/arc_26.09.1_amd64.deb
-sudo dpkg -i arc_26.09.1_amd64.deb
+wget https://github.com/basekick-labs/arc/releases/download/v26.09.2/arc_26.09.2_amd64.deb
+sudo dpkg -i arc_26.09.2_amd64.deb
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
 ### RHEL/Fedora
 
 ```bash
-wget https://github.com/basekick-labs/arc/releases/download/v26.09.1/arc-26.09.1-1.x86_64.rpm
-sudo rpm -i arc-26.09.1-1.x86_64.rpm
+wget https://github.com/basekick-labs/arc/releases/download/v26.09.2/arc-26.09.2-1.x86_64.rpm
+sudo rpm -i arc-26.09.2-1.x86_64.rpm
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
@@ -244,15 +244,15 @@ sudo systemctl enable arc && sudo systemctl start arc
 Works on Arch Linux and Arch-based distros such as Omarchy (x86_64 and aarch64).
 
 ```bash
-wget https://github.com/basekick-labs/arc/releases/download/v26.09.1/arc-26.09.1-1-x86_64.pkg.tar.zst
-sudo pacman -U arc-26.09.1-1-x86_64.pkg.tar.zst
+wget https://github.com/basekick-labs/arc/releases/download/v26.09.2/arc-26.09.2-1-x86_64.pkg.tar.zst
+sudo pacman -U arc-26.09.2-1-x86_64.pkg.tar.zst
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
 ### Kubernetes (Helm)
 
 ```bash
-helm install arc https://github.com/basekick-labs/arc/releases/download/v26.09.1/arc-26.09.1.tgz
+helm install arc https://github.com/basekick-labs/arc/releases/download/v26.09.2/arc-26.09.2.tgz
 ```
 
 ### Build from Source
@@ -324,7 +324,7 @@ CMVP-certified; Arc itself is not a CMVP-listed module. See the
 - **Compaction**: Tiered (hourly/daily) automatic Parquet file merging — 10x storage reduction
 - **Data Lifecycle**: Retention policies, continuous queries, tiered storage (hot/cold)
 - **Durability**: Optional write-ahead log (WAL), backup and restore
-- **Storage**: Local filesystem, S3, MinIO
+- **Storage**: Local filesystem, S3 and S3-compatible object stores (SeaweedFS, R2, MinIO, ...), Azure Blob
 - **Auth**: Token-based authentication with in-memory caching
 - **Durability**: Optional write-ahead log (WAL)
 - **Data Management**: GDPR-compliant delete operations
@@ -456,9 +456,9 @@ Thanks to everyone who has contributed code to Arc:
 - [@copacabanaservice01](https://github.com/copacabanaservice01) — calendar-day S3 range path generation across DST transitions (#690)
 - [@be-student](https://github.com/be-student) — extracted the Arrow IPC stream loop into a testable helper with leak-checked regression coverage for disconnects, cancellation, and decimal-cast cleanup (#706)
 - [@MrBeldum](https://github.com/MrBeldum) (Daniel) — configured query timeout applied to the measurement endpoint, with request-scoped cancellation and 504 handling on both query paths (#701)
-- [@pujitha24](https://github.com/pujitha24) (Pujitha Paladugu) — tiered query routing pushed into SQL instead of filtering file metadata in Go (#707), replicate-sync handshake now authenticating the binary-framing capability flag (#715)
+- [@pujitha24](https://github.com/pujitha24) (Pujitha Paladugu) — tiered query routing pushed into SQL instead of filtering file metadata in Go (#707), replicate-sync handshake now authenticating the binary-framing capability flag (#715), file puller no longer treats a crash-stranded full-size `.part` as a present file (#965)
 - [@lecodev-26](https://github.com/lecodev-26) — numeric MessagePack host coercion logged at debug level, with an allocation-free log path verified under parallel ingest (#769)
-- [@efegokdemir](https://github.com/efegokdemir) (Efe) — one shared DuckDB string-literal quoting helper across the query, delete, retention and parallel-executor paths, replacing four drifting copies (#780); retention now reports data files its listings hide, with one inventory pass per policy and no abort on an invalid measurement name (#775); edge-sync spoke IDs with a colon rejected at registration, closing the one gap between the key contract and the cluster manifest validator (#776); tiering metadata store: redundant mutex removed and tier-cache fills ordered against invalidation by a generation counter (#777); the last two copies of the DuckDB string-literal escape routed through the shared helper, dropping compaction's backslash doubling (#782); backup tells a temp-file write failure apart from an unreadable source through the classifier shared with restore (#784); edge-sync hub bounds incoming paths by the key they actually become and answers 400 instead of a retryable 503 (#783); Iceberg export refuses to publish a table whose Parquet data files are hidden from the storage listing, naming the files (#785); compaction cleans exactly the job-owned temp directory instead of sweeping by partition prefix (#786); manifest register, delete and batch applies honour the caller's deadline through the leader-forwarding round trip (#787)
+- [@efegokdemir](https://github.com/efegokdemir) (Efe) — one shared DuckDB string-literal quoting helper across the query, delete, retention and parallel-executor paths, replacing four drifting copies (#780); retention now reports data files its listings hide, with one inventory pass per policy and no abort on an invalid measurement name (#775); edge-sync spoke IDs with a colon rejected at registration, closing the one gap between the key contract and the cluster manifest validator (#776); tiering metadata store: redundant mutex removed and tier-cache fills ordered against invalidation by a generation counter (#777); the last two copies of the DuckDB string-literal escape routed through the shared helper, dropping compaction's backslash doubling (#782); backup tells a temp-file write failure apart from an unreadable source through the classifier shared with restore (#784); edge-sync hub bounds incoming paths by the key they actually become and answers 400 instead of a retryable 503 (#783); Iceberg export refuses to publish a table whose Parquet data files are hidden from the storage listing, naming the files (#785); compaction cleans exactly the job-owned temp directory instead of sweeping by partition prefix (#786); manifest register, delete and batch applies honour the caller's deadline through the leader-forwarding round trip (#787), per-peer WAL replication lag gauges (#908)
 - [@alexeymoskalev-devops](https://github.com/alexeymoskalev-devops) — compaction candidates preview lists each measurement once and hands the listing to every tier, after finding and documenting why the scheduled cycle must not share listings across tiers (#789)
 - [@TayfurYldz](https://github.com/TayfurYldz) — DECIMAL query results stay JSON numbers on the JSON output path: aggregates such as SUM and AVG over integer columns are cast to int64 or double before encoding instead of being stringified (#831)
 - [@jallegri](https://github.com/jallegri) — hourly-compaction minimum-files rationale corrected to the actual ingest flush triggers (#838)

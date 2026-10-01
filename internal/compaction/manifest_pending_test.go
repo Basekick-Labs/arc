@@ -89,7 +89,7 @@ func TestPendingOutputsUnder(t *testing.T) {
 		t.Fatalf("deleted manifest: pending = %v err = %v, want empty", got, err)
 	}
 	// A manifest that exists but cannot be parsed (a zero-length file after a
-	// crash, or garbage) is skipped: it names nothing, recovery deletes it,
+	// crash, or garbage) is skipped: it names nothing, recovery parks it,
 	// and failing every measurement on every pass over it would be an outage.
 	if err := backend.Write(ctx, filepath.ToSlash(filepath.Join(ManifestBasePath, "hourly", "db", "corrupt.json")), []byte("{not json")); err != nil {
 		t.Fatal(err)

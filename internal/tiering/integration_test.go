@@ -124,7 +124,20 @@ func (m *mockBackend) Close() error { return nil }
 func (m *mockBackend) ReadToAt(_ context.Context, _ string, _ io.Writer, _ int64) error {
 	return nil
 }
-func (m *mockBackend) StatFile(_ context.Context, _ string) (int64, error) { return -1, nil }
+
+// StatFile mirrors the object-store backends: the size when present, -1
+// when absent, never an error for a missing key.
+func (m *mockBackend) StatFile(_ context.Context, path string) (int64, error) {
+	if err := storage.ValidateKey(path); err != nil {
+		return 0, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if data, ok := m.files[path]; ok {
+		return int64(len(data)), nil
+	}
+	return -1, nil
+}
 func (m *mockBackend) AppendReader(_ context.Context, _ string, _ io.Reader, _ int64) error {
 	return nil
 }
@@ -171,11 +184,10 @@ func setupIntegrationTest(t *testing.T, withColdBackend bool) (*Manager, *mockBa
 		MigrationBatchSize:     10,
 		DefaultHotMaxAgeDays:   7,
 		Cold: config.ColdTierConfig{
-			Enabled:        withColdBackend,
-			Backend:        "s3",
-			S3Bucket:       "arc-archive-test",
-			S3Region:       "us-east-1",
-			S3StorageClass: "GLACIER",
+			Enabled:  withColdBackend,
+			Backend:  "s3",
+			S3Bucket: "arc-archive-test",
+			S3Region: "us-east-1",
 		},
 	}
 

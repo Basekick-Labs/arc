@@ -123,8 +123,16 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	// mechanism but kept out of the db/measurement inventory below.
 	var parquetFiles []storage.ObjectInfo
 	var icebergMetaFiles []storage.ObjectInfo
+	// Compaction's crash-recovery state (#930): the manifests under
+	// _compaction_state/ that let recovery finish a job interrupted between
+	// its output upload and its input deletion, plus parked (.quarantined)
+	// manifests kept as an operator record. Checked first so neither the
+	// ".parquet" rule nor the Iceberg "/metadata/" rule sees them.
+	var stateFiles []storage.ObjectInfo
 	for _, obj := range objects {
 		switch {
+		case isCompactionState(obj.Path):
+			stateFiles = append(stateFiles, obj)
 		case strings.HasSuffix(obj.Path, ".parquet"):
 			parquetFiles = append(parquetFiles, obj)
 		case isIcebergMetadata(obj.Path):
@@ -158,6 +166,17 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 		manifest.TotalFiles++
 		manifest.TotalSizeBytes += obj.Size
 
+		// Parquet under a reserved root (the field schema anchors under
+		// _schema/, #914) is Arc's own state, not a database: it is copied
+		// and counted with the data files, because the restore compares
+		// TotalFiles against every .parquet object present and an anchor
+		// left out of the count would hide one missing data file, but it
+		// is kept out of the database inventory (#927).
+		if isReservedRootParquet(obj.Path) {
+			manifest.AuxiliaryFiles++
+			continue
+		}
+
 		db, meas := parseDBMeasurement(obj.Path)
 		di, exists := dbMap[db]
 		if !exists {
@@ -189,9 +208,11 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 		manifest.Databases = append(manifest.Databases, *di)
 	}
 
-	// Progress total includes Iceberg metadata files (copied in step 2b) so ProcessedFiles
-	// never exceeds TotalFiles. The manifest inventory (TotalFiles) counts only data files.
-	progress.TotalFiles = manifest.TotalFiles + int64(len(icebergMetaFiles))
+	// Progress total includes Iceberg metadata files (copied in step 2b) and
+	// compaction state (step 1b) so ProcessedFiles never exceeds TotalFiles.
+	// The manifest inventory (TotalFiles) counts only data files.
+	progress.TotalFiles = manifest.TotalFiles + int64(len(icebergMetaFiles)) + int64(len(stateFiles))
+	manifest.CompactionStateFiles = int64(len(stateFiles))
 	progress.TotalBytes = manifest.TotalSizeBytes
 	m.setProgress(progress)
 
@@ -203,17 +224,41 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 		return nil, err
 	}
 
+	// ── 1b. Copy compaction recovery state, BEFORE the data files ────────
+	// The order is load-bearing (#930). A job writes its manifest, uploads
+	// its output, deletes its inputs, then deletes the manifest. Every group
+	// here comes from the one listing above, so what matters is what a job
+	// did between the listing and each copy. Manifest first: if the job then
+	// finishes before its inputs are copied, those copies fail and the backup
+	// holds manifest + output, which recovery completes; if the job finished
+	// before even the manifest copy, its inputs are gone too and the backup
+	// holds the output alone. Data first would let inputs be copied while the
+	// job still ran and the manifest copy fail afterwards: output + inputs
+	// with nothing to reconcile them, and every row of the partition served
+	// twice after a restore.
+	if len(stateFiles) > 0 {
+		if err := m.copyStateFiles(ctx, backupID, stateFiles, progress); err != nil {
+			progress.Status = "failed"
+			progress.Error = err.Error()
+			return nil, err
+		}
+		m.logger.Info().Int("files", len(stateFiles)).Msg("Backed up compaction recovery state")
+	}
+	// A manifest whose job finished between the listing and this copy is an
+	// expected skip; it must not count against the data-file population.
+	stateSkipped := atomic.LoadInt64(&progress.SkippedFiles)
+
 	// ── 2. Copy parquet files ───────────────────────────────────────────
 	if err := m.copyDataFiles(ctx, backupID, parquetFiles, progress); err != nil {
 		progress.Status = "failed"
 		progress.Error = err.Error()
 		return nil, err
 	}
-	// Skips so far are data-file skips. copyDataFiles accumulates into one
-	// progress counter across both groups, but the manifest reports the two
-	// apart: SkippedFiles must describe the same population as TotalFiles
-	// (data files) for a restore to compare them.
-	dataSkipped := atomic.LoadInt64(&progress.SkippedFiles)
+	// Skips so far are state and data-file skips. copyDataFiles accumulates
+	// into one progress counter across every group, but the manifest reports
+	// them apart: SkippedFiles must describe the same population as
+	// TotalFiles (data files) for a restore to compare them.
+	dataSkipped := atomic.LoadInt64(&progress.SkippedFiles) - stateSkipped
 
 	// ── 3. Copy SQLite metadata ─────────────────────────────────────────
 	// Snapshotted BEFORE the Iceberg warehouse metadata below, on purpose: a
@@ -293,7 +338,7 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	}
 
 	// Evaluate the skip ratio once, over every file group above.
-	if err := m.checkSkipRatio(progress, len(parquetFiles)+len(icebergMetaFiles)+warehouseFiles); err != nil {
+	if err := m.checkSkipRatio(progress, len(parquetFiles)+len(icebergMetaFiles)+warehouseFiles+len(stateFiles)); err != nil {
 		progress.Status = "failed"
 		progress.Error = err.Error()
 		return nil, err
@@ -314,8 +359,9 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 
 	// ── 5. Write manifest ───────────────────────────────────────────────
 	// Record files that were inventoried but proved unreadable, so the manifest
-	// does not claim contents the backup does not actually hold. Data-file and
-	// Iceberg-metadata skips are recorded separately (see dataSkipped above).
+	// does not claim contents the backup does not actually hold. Data-file
+	// skips are recorded apart from the auxiliary ones (Iceberg metadata and
+	// compaction state; see dataSkipped above).
 	manifest.SkippedFiles = dataSkipped
 	manifest.SkippedMetadataFiles = atomic.LoadInt64(&progress.SkippedFiles) - dataSkipped - warehouseSkipped
 
@@ -751,6 +797,65 @@ func isIcebergMetadata(p string) bool {
 
 // parseDBMeasurement extracts the database and measurement from a storage path.
 // Path format: {database}/{measurement}/{YYYY}/{MM}/{DD}/{HH}/{file}.parquet
+// isReservedRootParquet reports whether a data-file key sits under an
+// underscore-prefixed root directory, which Arc reserves for its own state
+// (see storage.IsReservedRootDir). Dot-prefixed roots are deliberately not
+// included: edge sync's unverified receive area lives there and its
+// treatment by backup is unchanged by #927.
+func isReservedRootParquet(path string) bool {
+	first, _, _ := strings.Cut(filepath.ToSlash(path), "/")
+	return strings.HasPrefix(first, "_")
+}
+
+// compactionStateDir is compaction.ManifestBasePath, spelled here so this
+// package does not import compaction (which links DuckDB).
+const compactionStateDir = "_compaction_state"
+
+// copyStateFiles copies compaction's recovery state like copyDataFiles, with
+// one difference in what a read failure means. A data file that vanished
+// between the listing and its copy is an expected skip. A manifest that
+// vanished is expected too (its job finished), but a manifest that could
+// NOT be read and still exists (a throttled or failed GET) must fail the
+// backup: continuing would copy the job's output and inputs with nothing to
+// reconcile them, which is exactly the double-serve #930 exists to close,
+// and a manifest is a few hundred bytes, so retrying the backup is cheap.
+func (m *Manager) copyStateFiles(ctx context.Context, backupID string, files []storage.ObjectInfo, progress *Progress) error {
+	var skipped int64
+	for _, obj := range files {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		destPath := fmt.Sprintf("%s/data/%s", backupID, obj.Path)
+		written, err := m.streamBackupFile(ctx, obj.Path, destPath)
+		if err != nil {
+			if !isSourceReadError(err) {
+				return fmt.Errorf("failed to back up %s: %w", obj.Path, err)
+			}
+			exists, existsErr := m.dataStorage.Exists(ctx, obj.Path)
+			if existsErr != nil || exists {
+				return fmt.Errorf("backup failed: compaction recovery state %s could not be read but still exists (read: %v; exists: %v); a backup without it could restore a compacted output next to the inputs it replaced, so retry the backup", obj.Path, err, existsErr)
+			}
+			skipped++
+			m.logger.Info().Str("path", obj.Path).Msg("Compaction manifest gone before its copy: its job finished; skipping")
+			continue
+		}
+		atomic.AddInt64(&progress.ProcessedFiles, 1)
+		atomic.AddInt64(&progress.ProcessedBytes, written)
+		m.setProgress(progress)
+	}
+	atomic.AddInt64(&progress.SkippedFiles, skipped)
+	m.setProgress(progress)
+	return nil
+}
+
+// isCompactionState reports whether a key is compaction's crash-recovery
+// state: a manifest or a parked manifest under _compaction_state/.
+func isCompactionState(path string) bool {
+	return strings.HasPrefix(filepath.ToSlash(path), compactionStateDir+"/")
+}
+
 func parseDBMeasurement(path string) (database, measurement string) {
 	path = filepath.ToSlash(path)
 	parts := strings.SplitN(path, "/", 3)

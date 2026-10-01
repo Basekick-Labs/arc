@@ -66,7 +66,7 @@ func executeArrowJSONQuery(
 
 	if err != nil {
 		// Check for "no files found" — return empty result, not error
-		if isNoFilesFoundError(err) {
+		if isNoFilesFoundError(err) && !h.missingAnchor(err) {
 			if cancel != nil {
 				cancel()
 			}
