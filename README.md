@@ -226,16 +226,16 @@ Apple Silicon. DuckDB is statically linked, so there are no runtime dependencies
 ### Debian/Ubuntu
 
 ```bash
-wget https://github.com/basekick-labs/arc/releases/download/v26.09.1/arc_26.09.1_amd64.deb
-sudo dpkg -i arc_26.09.1_amd64.deb
+wget https://github.com/basekick-labs/arc/releases/download/v26.09.2/arc_26.09.2_amd64.deb
+sudo dpkg -i arc_26.09.2_amd64.deb
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
 ### RHEL/Fedora
 
 ```bash
-wget https://github.com/basekick-labs/arc/releases/download/v26.09.1/arc-26.09.1-1.x86_64.rpm
-sudo rpm -i arc-26.09.1-1.x86_64.rpm
+wget https://github.com/basekick-labs/arc/releases/download/v26.09.2/arc-26.09.2-1.x86_64.rpm
+sudo rpm -i arc-26.09.2-1.x86_64.rpm
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
@@ -244,15 +244,15 @@ sudo systemctl enable arc && sudo systemctl start arc
 Works on Arch Linux and Arch-based distros such as Omarchy (x86_64 and aarch64).
 
 ```bash
-wget https://github.com/basekick-labs/arc/releases/download/v26.09.1/arc-26.09.1-1-x86_64.pkg.tar.zst
-sudo pacman -U arc-26.09.1-1-x86_64.pkg.tar.zst
+wget https://github.com/basekick-labs/arc/releases/download/v26.09.2/arc-26.09.2-1-x86_64.pkg.tar.zst
+sudo pacman -U arc-26.09.2-1-x86_64.pkg.tar.zst
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
 ### Kubernetes (Helm)
 
 ```bash
-helm install arc https://github.com/basekick-labs/arc/releases/download/v26.09.1/arc-26.09.1.tgz
+helm install arc https://github.com/basekick-labs/arc/releases/download/v26.09.2/arc-26.09.2.tgz
 ```
 
 ### Build from Source
