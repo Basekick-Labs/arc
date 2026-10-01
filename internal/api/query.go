@@ -242,6 +242,16 @@ func hasCrossDatabaseSyntax(sql string) bool {
 			}
 		}
 	}
+
+	// A qualified name continuing the FROM list after a cross-join comma
+	// (`FROM cpu, otherdb.mem`) is cross-database syntax too; the keyword scan
+	// above never reaches it (#978). Scanned on the same normalised form, so
+	// a comma inside a literal or a comment cannot introduce one.
+	for _, ref := range findCommaJoinRefs(sql) {
+		if ref.db != "" {
+			return true
+		}
+	}
 	return false
 }
 
@@ -293,15 +303,18 @@ func normalizeSQLForShow(sql string) string {
 	return strings.TrimSpace(sqlutil.UnmaskStringLiterals(stripped, masks))
 }
 
-// isSingleTableQuery returns true if query has exactly one FROM and no JOINs.
-// These queries can use a faster transformation path.
+// isSingleTableQuery returns true if query has exactly one FROM naming a
+// single table and no JOINs. These queries can use a faster transformation path.
 func isSingleTableQuery(sqlLower string) bool {
 	fromCount := strings.Count(sqlLower, "from ")
 	if fromCount != 1 {
 		return false
 	}
-	// Check for any JOIN type
-	if strings.Contains(sqlLower, " join ") {
+	// Check for any JOIN type. Matched as a word, not as " join ": the keyword
+	// routinely starts a line (`FROM a\nJOIN b`), and the space-delimited
+	// check let that shape onto the fast path, which rewrote only the FROM
+	// table (#978).
+	if containsSQLWord(sqlLower, "join") {
 		return false
 	}
 	// Check for subquery (FROM followed by parenthesis)
@@ -309,6 +322,12 @@ func isSingleTableQuery(sqlLower string) bool {
 	if idx >= 0 {
 		rest := strings.TrimLeft(sqlLower[idx+5:], " \t\n")
 		if len(rest) > 0 && rest[0] == '(' {
+			return false
+		}
+		// A comma cross-join (`FROM a x, b y`) has one FROM and no JOIN
+		// keyword yet names two tables; the fast path rewrites only the
+		// first, so it must take the full rewriter (#978).
+		if fromTableListContinues(sqlLower, idx+5) {
 			return false
 		}
 	}
@@ -1501,6 +1520,37 @@ func extractTableReferences(sql string, identNames map[string]string) []TableRef
 		}
 	}
 
+	// Tables continuing the FROM list after a cross-join comma (`FROM a, b`,
+	// `FROM a, db.b`), which no FROM/JOIN pattern reaches. Located by the same
+	// walker the query transform uses, on the same normalised SQL, so the
+	// permission check and the executed query agree on the table set (#978).
+	// Guards mirror the loops above; the finder already skipped table
+	// functions and non-adjacent dots.
+	for _, ref := range findCommaJoinRefs(sql) {
+		if ref.db != "" {
+			db, table := resolve(ref.db), resolve(ref.table)
+			key := db + "." + table
+			if !seen[key] {
+				seen[key] = true
+				refs = append(refs, TableReference{Database: db, Measurement: table})
+			}
+			continue
+		}
+		tableName := resolve(ref.table)
+		table := strings.ToLower(tableName)
+		if shouldSkipTableConversion(table) {
+			continue
+		}
+		if cteNames[table] || cteNames[strings.ToLower(ref.table)] {
+			continue
+		}
+		key := "default." + tableName
+		if !seen[key] {
+			seen[key] = true
+			refs = append(refs, TableReference{Database: "default", Measurement: tableName})
+		}
+	}
+
 	return refs
 }
 
@@ -2570,16 +2620,17 @@ func ValidateSQLRequest(sql string) error {
 	// The check must distinguish a single-quoted STRING from a quoted
 	// IDENTIFIER: DuckDB uses `'` for strings and `"`/backtick for identifiers,
 	// and a quoted identifier in table position (`FROM "my table"`,
-	// `` FROM `my;db` ``) is legitimate — not a replacement scan. So it runs on
-	// the identifier-quote-stripped, single-quote-masked form, NOT the shared
-	// `normalised` above (which masks all quote kinds indiscriminately and would
-	// false-positive on a quoted identifier).
+	// `` FROM `my;db` ``) is legitimate — not a replacement scan. The shared
+	// `normalised` form keeps the two apart as distinct placeholder classes
+	// (`__STR_n__` vs `__IDENT_n__`), and the scanner flags only the string
+	// class, so a quoted identifier never trips it.
 	//
-	// ioCheckNormalised (computed above) is exactly the form we need here: it
-	// strips `"`/backtick identifier quoting (exposing identifiers as barewords)
-	// and masks the remaining single-quoted strings to `__STR__` placeholders,
-	// with comments stripped. Reuse it rather than normalising twice.
-	if stringLiteralInTablePosition(ioCheckNormalised) {
+	// It must NOT run on ioCheckNormalised: that form restores bare-looking
+	// quoted identifiers to barewords, so a quoted RESERVED word used as an
+	// alias (`FROM cpu "where", '…'`) came back as the keyword `where`, which
+	// terminates the table list in the scanner and hid the string after the
+	// comma from this guard (#978 review).
+	if stringLiteralInTablePosition(normalised) {
 		return &SQLValidationError{Message: "String literal not allowed in table position (replacement scans are disabled); reference a table by name"}
 	}
 
@@ -2610,17 +2661,20 @@ var tablePosPlaceholder = regexp.MustCompile(`__(?:STR|IDENT)_\d+__`)
 
 // tablePosTokenPattern tokenises the (space-isolated) masked/normalised SQL into
 // the atoms the table-position scanner cares about: a masked string placeholder
-// (`__STR_<n>__`), a parenthesis, a comma, or any other run of identifier bytes
-// (keywords, table names, aliases). Everything else (whitespace, operators) is
-// skipped. The placeholder alternative is matched BEFORE the generic identifier
-// run so it wins even though `_`/digits are also identifier bytes.
-var tablePosTokenPattern = regexp.MustCompile(`__(?:STR|IDENT)_\d+__|[A-Za-z_][A-Za-z0-9_]*|[(),]`)
+// (`__STR_<n>__`), a parenthesis, a list/struct bracket, a comma, or any other
+// run of identifier bytes (keywords, table names, aliases). Everything else
+// (whitespace, operators) is skipped. The placeholder alternative is matched
+// BEFORE the generic identifier run so it wins even though `_`/digits are also
+// identifier bytes. Brackets are tokens because a list or struct literal
+// (`[1, 2]`, `{'k': v}`) carries commas that are never cross-join commas, even
+// inside an armed FROM clause's ON predicate (#978 review).
+var tablePosTokenPattern = regexp.MustCompile(`__(?:STR|IDENT)_\d+__|[A-Za-z_][A-Za-z0-9_]*|[(),\[\]{}]`)
 
-// stringLiteralInTablePosition reports whether `normalised` — SQL whose SINGLE-
-// quoted string literals have already been masked to `__STR_<n>__` placeholders,
-// whose identifier quoting has been stripped, and whose comments have been
-// removed (i.e. the output of ioDenylistNormalise) — puts a masked string where
-// a table reference belongs. That is DuckDB's replacement-scan syntax
+// stringLiteralInTablePosition reports whether `normalised` — SQL whose string
+// literals have been masked to `__STR_<n>__` placeholders, whose quoted
+// identifiers have been masked to `__IDENT_<n>__` placeholders, and whose
+// comments have been removed (ValidateSQLRequest's shared normalisation) — puts
+// a masked string where a table reference belongs. That is DuckDB's replacement-scan syntax
 // (`FROM '…'`), which reads a file with no function name and so bypasses both the
 // I/O-function denylist and the RBAC table extractor (GHSA-w8x2-cccw-25f7).
 //
@@ -2685,87 +2739,28 @@ func invalidQuotedIdentifierInTablePosition(normalised string, identNames map[st
 	return offending
 }
 
-// maskedTokenInTablePosition is the shared table-position scanner: it walks
-// the masked/normalised SQL and returns the first placeholder token for which
-// flag returns true while the token stands in table position (directly after
-// FROM or JOIN, or after a comma continuing an armed FROM clause's table
-// list). Returns "" when no flagged placeholder is in table position.
+// maskedTokenInTablePosition walks the masked/normalised SQL with
+// walkTablePositions (the FROM-clause state machine shared with the
+// storage-path rewriters and the RBAC extractor, see table_position.go) and
+// returns the first placeholder token for which flag returns true while the
+// token stands in table position (directly after FROM or JOIN, or after a
+// comma continuing an armed FROM clause's table list). Returns "" when no
+// flagged placeholder is in table position.
 func maskedTokenInTablePosition(normalised string, flag func(tok string) bool) string {
-	// fromArmed[d] is true when, at paren depth d, we are inside a FROM clause
-	// whose table list is still open — so a comma at depth d continues that
-	// list (a cross-join table position). Indexed by depth; grows as needed.
-	fromArmed := make([]bool, 1, 8)
-
-	// afterFromJoin is true when the immediately preceding token was FROM or
-	// JOIN, so the very next table-atom is in table position.
-	afterFromJoin := false
-
-	depth := 0
 	// Isolate placeholders with surrounding spaces so a keyword directly
 	// abutting one (`FROM__STR_0__` from `FROM'…'`) tokenises as two atoms.
 	isolated := tablePosPlaceholder.ReplaceAllString(normalised, " $0 ")
-	toks := tablePosTokenPattern.FindAllString(isolated, -1)
-	for _, tok := range toks {
-		switch tok {
-		case "(":
-			depth++
-			if depth >= len(fromArmed) {
-				fromArmed = append(fromArmed, false)
-			} else {
-				fromArmed[depth] = false
-			}
-			afterFromJoin = false
-			continue
-		case ")":
-			if depth > 0 {
-				fromArmed[depth] = false
-				depth--
-			}
-			// Leaving the paren group does NOT touch fromArmed[depth-1]: the
-			// OUTER FROM clause (if any) is still open. This is the blocker-1 fix.
-			afterFromJoin = false
-			continue
-		case ",":
-			// A comma continues the table list only if THIS depth's FROM clause
-			// is still armed (excludes function-argument and projection commas,
-			// which are either at a deeper depth or after a clause terminator).
-			afterFromJoin = fromArmed[depth]
-			continue
+	found := ""
+	walkTablePositions(isolated, func(p tablePosition) bool {
+		// A masked token standing in table position: the caller's flag
+		// decides whether this class of placeholder is a violation.
+		if (strings.HasPrefix(p.tok, "__STR_") || strings.HasPrefix(p.tok, "__IDENT_")) && flag(p.tok) {
+			found = p.tok
+			return true
 		}
-
-		// tok is a placeholder or an identifier/keyword run.
-		if strings.HasPrefix(tok, "__STR_") || strings.HasPrefix(tok, "__IDENT_") {
-			// A masked token standing in table position: the caller's flag
-			// decides whether this class of placeholder is a violation.
-			if afterFromJoin && flag(tok) {
-				return tok
-			}
-			// A placeholder that is NOT flagged (or not in table position — a
-			// value, a function arg, a legitimate quoted table) closes the
-			// "immediately after FROM/JOIN" window but leaves the FROM
-			// clause's armed state (for a following cross-join comma) alone.
-			afterFromJoin = false
-			continue
-		}
-
-		switch strings.ToLower(tok) {
-		case "from", "join":
-			fromArmed[depth] = true
-			afterFromJoin = true
-		default:
-			// A real table name, alias, ON, USING, etc. ends the "immediately
-			// after FROM/JOIN" window but keeps the FROM clause armed so a
-			// following `, '…'` cross-join is still caught.
-			afterFromJoin = false
-			// Keywords that close the FROM clause's table list at this depth:
-			// after WHERE/GROUP/…, a top-level comma is a projection/ordering
-			// separator, not another cross-join table.
-			if fromClauseTerminator(strings.ToLower(tok)) {
-				fromArmed[depth] = false
-			}
-		}
-	}
-	return ""
+		return false
+	})
+	return found
 }
 
 // fromClauseTerminator reports whether a lower-cased keyword ends the table
@@ -2773,7 +2768,10 @@ func maskedTokenInTablePosition(normalised string, flag func(tok string) bool) s
 // ordering separator rather than another comma cross-join table.
 func fromClauseTerminator(word string) bool {
 	switch word {
-	case "where", "group", "having", "order", "limit", "offset", "window", "qualify", "union", "except", "intersect", "fetch", "for":
+	// SELECT is here for DuckDB's FROM-first form (`FROM t SELECT a, b`),
+	// which ValidateSQLRequest accepts: the projection commas after it must
+	// not read as cross-join tables (#978).
+	case "where", "group", "having", "order", "limit", "offset", "window", "qualify", "union", "except", "intersect", "fetch", "for", "select":
 		return true
 	}
 	return false
@@ -3010,6 +3008,7 @@ func (h *QueryHandler) getTransformedSQLForParallel(ctx context.Context, sql str
 // Converts: FROM measurement -> FROM read_parquet('path/**/*.parquet')
 // Converts: JOIN database.measurement -> JOIN read_parquet('path/**/*.parquet')
 // Converts: JOIN measurement -> JOIN read_parquet('path/**/*.parquet')
+// Converts: FROM a, measurement -> FROM a, read_parquet('path/**/*.parquet') (comma cross-join; also database.measurement)
 // CTE names are extracted and excluded from conversion to avoid replacing virtual table references.
 // String literals and comments are protected from regex matching.
 func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string) string {
@@ -3063,6 +3062,35 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 	// this keeps the transform safe for any caller that skips validation).
 	identNames := sqlutil.IdentifierNames(masks)
 	resolveIdent := makeIdentResolver(identNames)
+
+	// Handle tables continuing the FROM list after a cross-join comma:
+	// `FROM a, b` and `FROM a, db.b` (#978). Runs FIRST, on masked SQL the
+	// FROM/JOIN passes have not touched, so the storage paths they emit are
+	// never tokenised (a storage root containing a paren or a comma would
+	// otherwise confuse the walker). Its own output starts with "," — the
+	// clause keyword, re-emitted the way FROM/JOIN are — so the FROM/JOIN
+	// patterns below never match inside it.
+	sql = rewriteCommaJoinRefs(sql, func(ref commaJoinRef) (string, bool) {
+		if ref.db != "" {
+			db, _ := resolveIdent(ref.db)
+			table, _ := resolveIdent(ref.table)
+			path := h.getStoragePath(ctx, db, table)
+			return h.buildReadParquetExpr(ctx, path, originalSQL, ","), true
+		}
+		// Same guard chain as the FROM handler below.
+		if cteNames[strings.ToLower(ref.table)] {
+			return "", false
+		}
+		resolved, _ := resolveIdent(ref.table)
+		if cteNames[strings.ToLower(resolved)] {
+			return "", false
+		}
+		if shouldSkipTableConversion(strings.ToLower(resolved)) {
+			return "", false
+		}
+		path := h.getStoragePath(ctx, "default", resolved)
+		return h.buildReadParquetExpr(ctx, path, originalSQL, ","), true
+	})
 
 	// Handle FROM database.table references
 	sql = patternDBTable.ReplaceAllStringFunc(sql, func(match string) string {
@@ -3183,10 +3211,22 @@ const arcInvalidIdentifierSentinel = ".arc-invalid-quoted-identifier"
 // arcInvalidIdentifierSentinel when not. The second return is false only for
 // the sentinel case, letting callers log or count if they care — every caller
 // still receives a safe segment to build a path from.
+//
+// A placeholder-shaped token this mask table did not produce is a masked
+// STRING literal (`__STR_n__`, or a name shaped like one) and resolves to the
+// sentinel as well. It must never become a path segment: the segment is
+// quoted into read_parquet('…') while still a placeholder, and
+// UnmaskStringLiterals would then restore the raw literal, quotes and all,
+// INSIDE that quoted path — turning `FROM db.'…'` into a path expression
+// DuckDB evaluates. ValidateSQLRequest rejects a literal in table position up
+// front; this is the transform's own backstop.
 func makeIdentResolver(identNames map[string]string) func(string) (string, bool) {
 	return func(name string) (string, bool) {
 		orig, isPlaceholder := identNames[name]
 		if !isPlaceholder {
+			if strings.HasPrefix(name, "__STR_") || strings.HasPrefix(name, "__IDENT_") {
+				return arcInvalidIdentifierSentinel, false
+			}
 			return name, true
 		}
 		if err := validateIdentifier(orig); err != nil {
@@ -3930,6 +3970,29 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 	// path and the dotted path agree on what a quoted name means.
 	identNames := sqlutil.IdentifierNames(masks)
 	resolveIdent := makeIdentResolver(identNames)
+
+	// Handle tables continuing the FROM list after a cross-join comma (#978);
+	// runs first, see convertSQLToStoragePaths. A qualified name is left alone
+	// here, as the other passes of this path leave db.table alone:
+	// hasCrossDatabaseSyntax rejects it before the transform runs under a
+	// header database.
+	sql = rewriteCommaJoinRefs(sql, func(ref commaJoinRef) (string, bool) {
+		if ref.db != "" {
+			return "", false
+		}
+		if cteNames[strings.ToLower(ref.table)] {
+			return "", false
+		}
+		resolved, _ := resolveIdent(ref.table)
+		if cteNames[strings.ToLower(resolved)] {
+			return "", false
+		}
+		if shouldSkipTableConversion(strings.ToLower(resolved)) {
+			return "", false
+		}
+		path := h.getStoragePath(ctx, database, resolved)
+		return h.buildReadParquetExpr(ctx, path, originalSQL, ","), true
+	})
 
 	// Handle FROM simple_table references - apply header database
 	sql = replaceTableRefs(sql, patternSimpleTable, func(parts []string, end int) string {

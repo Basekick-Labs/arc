@@ -52,6 +52,49 @@ because snapshot restore fires no file callbacks.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#907](https://github.com/Basekick-Labs/arc/pull/907).
 
+### A comma cross-join `FROM a, b` read only the first measurement ([#978](https://github.com/Basekick-Labs/arc/issues/978))
+
+Arc resolves measurement names to Parquet paths by rewriting the table after
+`FROM` and after each `JOIN`. A table that continued the FROM list after a
+comma, the SQL-92 cross-join form `FROM otel_logs a, otel_logs b`, was left as
+a bare name, and DuckDB failed the whole query with `Catalog Error: Table with
+name otel_logs does not exist`. The explicit `JOIN` spelling of the same query
+worked.
+
+The rewriters now resolve comma-continued tables with the same handling as the
+`FROM` position: a plain name, a `database.measurement` name, and a quoted
+identifier are rewritten; a CTE name, a table function, and a subquery after
+the comma are left alone. Whether a comma continues a table list is decided by
+the FROM-clause walker the replacement-scan validator already used, so a comma
+in a projection, a `GROUP BY`, an `IN` list, a function argument, or DuckDB's
+`FROM t SELECT a, b` form is never mistaken for a table. Three related gaps
+closed with it. The RBAC permission check now sees the comma-continued table,
+so a query is checked against every measurement it reads. The cross-database
+check under an `x-arc-database` header now rejects `FROM cpu, otherdb.mem` the
+way it rejects `FROM otherdb.mem`. And the no-regex fast path for single-table
+queries under that header, which a quote-free comma join used to take, now
+defers to the full rewriter.
+
+Two validation gaps in the same table-position logic are closed as well.
+Validation now rejects a string literal standing as the table part of a
+qualified name (`FROM db.'…'`), in the `FROM`, `JOIN` and comma positions, and
+the transform never turns a masked literal into a storage path. And the
+replacement-scan check now runs on the normalisation that keeps quoted
+identifiers distinct from strings, so a quoted reserved word used as an alias
+no longer hides a string literal that follows it in table position. A list or
+struct literal inside an `ON` predicate, which that check wrongly rejected
+before, is accepted.
+
+Probing that fast path turned up two more shapes it mishandled, fixed with it.
+A `JOIN` that starts a new line (`FROM a` then `JOIN b` on the next line) was
+not recognised as a join, so only the `FROM` table was rewritten and DuckDB
+reported the joined table missing. And a table function in `FROM` position
+(`FROM generate_series(1, 10)`) was rewritten as if it were a measurement.
+Both affected only a query sent with an `x-arc-database` header and carrying
+no string literal or comment, which is what qualified it for that path.
+
+Found while wiring Arc into the SearchBench harness.
+
 ### A long but legal source key made every backup fail permanently ([#761](https://github.com/Basekick-Labs/arc/issues/761))
 
 A backup stores each data file under `<backup ID>/data/<source key>`, which is
