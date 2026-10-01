@@ -284,6 +284,18 @@ func (s *Sender) PrepareReader(conn net.Conn, readerID, handshakeNonce string, l
 		entryMAC:       security.NewReplicationEntryHMAC(sessionKey),
 		cumulativeHash: sha256.New(),
 	}
+	// Lag starts at the attach point. The sender has no replay-from-buffer
+	// path (see CurrentSequenceAndCanResume): entries accepted before this
+	// reader attached are never streamed to it, so counting them as its lag
+	// would report a backlog nothing on this stream will ever drain. A reader
+	// restarting against a live writer reports last_known_seq=0 and already
+	// holds the data through file replication; without this it showed the
+	// writer's whole history as minutes of lag until the next write. A reader
+	// that reports a position AHEAD of the writer (a writer restart, #887)
+	// keeps its value and saturates to zero until it rewinds.
+	if current := s.sequence.Load(); lastKnownSeq < current {
+		lastKnownSeq = current
+	}
 	reader.lastAck.Store(lastKnownSeq)
 	reader.lastSendTime.Store(time.Now().UnixNano())
 	return reader, nil
@@ -322,7 +334,7 @@ func (s *Sender) ActivateReader(reader *ReaderConnection) {
 
 	s.logger.Info().
 		Str("reader_id", reader.id).
-		Uint64("last_known_seq", reader.lastAck.Load()).
+		Uint64("lag_baseline_seq", reader.lastAck.Load()).
 		Uint64("current_seq", s.sequence.Load()).
 		Msg("Reader connected for replication")
 }
@@ -692,14 +704,26 @@ func (s *Sender) CurrentSequence() uint64 {
 // replicationLagSamples observes only currently connected readers.
 //
 // Entries is the writer's sequence minus the last acknowledged sequence,
-// saturated at zero across sequence-space resets. Seconds is the age of
-// the oldest unacknowledged entry's original WAL timestamp. It is zero
-// when caught up, and omitted if that timestamp was dropped, evicted,
-// invalid, or in the future. In particular, idle caught-up connections
-// never accumulate artificial age.
+// saturated at zero across sequence-space resets. It includes entries a
+// full buffer dropped: those consumed a sequence number and the reader will
+// never receive them on this stream. Seconds is the age of the oldest
+// unacknowledged entry's WAL append timestamp, zero when caught up, so an
+// idle caught-up connection never accumulates artificial age.
+//
+// The ring holds the timestamps of the last BufferSize accepted entries,
+// which is exactly the set a full queue holds. When the oldest outstanding
+// entry's slot was overwritten by a newer one (the reader is more than the
+// ring behind, i.e. the queue is saturated) or was never written (that
+// sequence was dropped), the sample is the age of the oldest RETAINED
+// outstanding entry instead: a lower bound on the true age, tight in the
+// saturated state because the ring then is the queue. If no retained entry
+// is outstanding, nothing accepted is pending and zero is exact. Omitting
+// the sample here would silence a threshold alert in the one state it
+// exists for. The only omission left is a timestamp in the future (a
+// backwards wall-clock step).
 func (s *Sender) replicationLagSamples() []metrics.ReplicationLagSample {
 	current := s.sequence.Load()
-	nowUS := time.Now().UnixMicro()
+	nowUS := uint64(time.Now().UnixMicro())
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -709,25 +733,35 @@ func (s *Sender) replicationLagSamples() []metrics.ReplicationLagSample {
 		ack := reader.lastAck.Load()
 		sample := metrics.ReplicationLagSample{Peer: id}
 
-		if current > ack {
-			sample.Entries = current - ack
-
-			// ack+1 cannot overflow here because ack < current.
-			oldest := ack + 1
-			s.timestampMu.RLock()
-			slot := s.timestamps[oldest%uint64(len(s.timestamps))]
-			s.timestampMu.RUnlock()
-
-			if slot.sequence == oldest &&
-				slot.timestamp > 0 &&
-				nowUS > 0 &&
-				slot.timestamp <= uint64(nowUS) {
-				sample.Seconds = float64(uint64(nowUS)-slot.timestamp) / 1_000_000
-				sample.HasSeconds = true
-			}
-		} else {
+		if current <= ack {
 			sample.HasSeconds = true
-			sample.Seconds = 0
+			samples = append(samples, sample)
+			continue
+		}
+		sample.Entries = current - ack
+
+		// ack+1 cannot overflow here because ack < current.
+		oldest := ack + 1
+		s.timestampMu.RLock()
+		slot := s.timestamps[oldest%uint64(len(s.timestamps))]
+		if slot.sequence != oldest {
+			// Evicted or dropped: fall back to the oldest retained
+			// outstanding entry. Sequences start at 1, so 0 means none.
+			slot = replicationTimestamp{}
+			for _, candidate := range s.timestamps {
+				if candidate.sequence > ack && (slot.sequence == 0 || candidate.sequence < slot.sequence) {
+					slot = candidate
+				}
+			}
+		}
+		s.timestampMu.RUnlock()
+
+		switch {
+		case slot.sequence == 0:
+			sample.HasSeconds = true // nothing accepted is outstanding
+		case slot.timestamp > 0 && slot.timestamp <= nowUS:
+			sample.Seconds = float64(nowUS-slot.timestamp) / 1_000_000
+			sample.HasSeconds = true
 		}
 
 		samples = append(samples, sample)
@@ -739,9 +773,9 @@ func (s *Sender) replicationLagSamples() []metrics.ReplicationLagSample {
 func (s *Sender) Stats() map[string]interface{} {
 	s.mu.RLock()
 	readerStats := make([]map[string]interface{}, 0, len(s.readers))
+	currentSeq := s.sequence.Load()
 	for id, reader := range s.readers {
 		lastSend := time.Unix(0, reader.lastSendTime.Load())
-		currentSeq := s.sequence.Load()
 		lastAck := reader.lastAck.Load()
 
 		// A reader's acknowledgment may be ahead of the writer's

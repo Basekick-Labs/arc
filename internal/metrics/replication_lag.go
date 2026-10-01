@@ -66,8 +66,6 @@ func appendReplicationLagMetric(b []byte, name, peer string, value float64) []by
 			b = append(b, '\\', '"')
 		case '\n':
 			b = append(b, '\\', 'n')
-		case '\r':
-			b = append(b, '\\', 'n')
 		default:
 			b = append(b, peer[i])
 		}

@@ -142,8 +142,11 @@ func TestReplicationPeerLagLifecycleIssue819(t *testing.T) {
 	if got, ok := issue819Sample(t, first, "arc_replication_lag_seconds", "reader-a"); !ok || got != 0 {
 		t.Fatalf("idle reader-a accumulated fake time lag: %v, present=%v", got, ok)
 	}
-	if got, ok := issue819Sample(t, first, "arc_replication_lag_entries", "reader-b"); !ok || got != 1 {
-		t.Fatalf("reader-b initial lag: %v, present=%v", got, ok)
+	// reader-b reported position 0 against sequence 1. The sender never
+	// replays entry 1 to it, so lag is measured from the attach point:
+	// zero, not one.
+	if got, ok := issue819Sample(t, first, "arc_replication_lag_entries", "reader-b"); !ok || got != 0 {
+		t.Fatalf("reader-b initial lag must baseline at the attach point: %v, present=%v", got, ok)
 	}
 
 	// Writer advances while readers remain at their prior positions.
@@ -156,14 +159,15 @@ func TestReplicationPeerLagLifecycleIssue819(t *testing.T) {
 	if got, ok := issue819Sample(t, behind, "arc_replication_lag_entries", "reader-a"); !ok || got != 1 {
 		t.Fatalf("reader-a lag after writer advances: %v, present=%v", got, ok)
 	}
-	if got, ok := issue819Sample(t, behind, "arc_replication_lag_entries", "reader-b"); !ok || got != 2 {
+	if got, ok := issue819Sample(t, behind, "arc_replication_lag_entries", "reader-b"); !ok || got != 1 {
 		t.Fatalf("reader-b lag after writer advances: %v, present=%v", got, ok)
 	}
 
 	if seconds, ok := issue819Sample(t, behind, "arc_replication_lag_seconds", "reader-a"); !ok || seconds < 7 || seconds > 12 {
 		t.Fatalf("reader-a outstanding entry age: %v, present=%v", seconds, ok)
 	}
-	if seconds, ok := issue819Sample(t, behind, "arc_replication_lag_seconds", "reader-b"); !ok || seconds < 19 || seconds > 24 {
+	// Both readers' oldest outstanding entry is the second one (8 s old).
+	if seconds, ok := issue819Sample(t, behind, "arc_replication_lag_seconds", "reader-b"); !ok || seconds < 7 || seconds > 12 {
 		t.Fatalf("reader-b outstanding entry age: %v, present=%v", seconds, ok)
 	}
 
@@ -176,7 +180,7 @@ func TestReplicationPeerLagLifecycleIssue819(t *testing.T) {
 	if got, ok := issue819Sample(t, caughtUp, "arc_replication_lag_seconds", "reader-a"); !ok || got != 0 {
 		t.Fatalf("caught-up reader-a has nonzero seconds: %v, present=%v", got, ok)
 	}
-	if got, ok := issue819Sample(t, caughtUp, "arc_replication_lag_entries", "reader-b"); !ok || got != 2 {
+	if got, ok := issue819Sample(t, caughtUp, "arc_replication_lag_entries", "reader-b"); !ok || got != 1 {
 		t.Fatalf("reader-b was incorrectly affected by reader-a: %v, present=%v", got, ok)
 	}
 
@@ -299,9 +303,146 @@ func TestSenderReconnectKeepsReplacementIssue819(t *testing.T) {
 	}
 }
 
-// Entries must remain visible even if their timestamps have aged out
-// of the bounded ring. An unavailable timestamp is not a zero-second
-// lag measurement.
+// A reader that attaches behind the writer's current sequence gets no
+// replay of the gap (the sender has no replay-from-buffer path), so lag
+// is measured from the attach point. A reader that reports a position
+// ahead of the writer keeps it and saturates to zero.
+func TestReaderAttachBaselinesLagAtCurrentSequenceIssue819(t *testing.T) {
+	sender := NewSender(&SenderConfig{
+		BufferSize:   8,
+		WriteTimeout: time.Second,
+		Logger:       zerolog.Nop(),
+		SharedSecret: testSenderSecret,
+		ClusterName:  "test-cluster",
+	})
+	if err := sender.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Stop()
+
+	prepare := func(id string, lastKnownSeq uint64) *ReaderConnection {
+		t.Helper()
+		conn, peer := net.Pipe()
+		t.Cleanup(func() { peer.Close() })
+		go func() { _, _ = io.Copy(io.Discard, peer) }()
+		reader, err := sender.PrepareReader(conn, id, testSenderNonce+"-"+id, lastKnownSeq)
+		if err != nil {
+			t.Fatalf("prepare %s: %v", id, err)
+		}
+		sender.mu.Lock()
+		sender.readers[id] = reader
+		sender.mu.Unlock()
+		return reader
+	}
+	samplesByPeer := func() map[string]metrics.ReplicationLagSample {
+		out := map[string]metrics.ReplicationLagSample{}
+		for _, sample := range sender.replicationLagSamples() {
+			out[sample.Peer] = sample
+		}
+		return out
+	}
+
+	// Two entries accepted before anyone attaches.
+	for _, age := range []time.Duration{60 * time.Second, 30 * time.Second} {
+		sender.Replicate(&ReplicateEntry{
+			TimestampUS: uint64(time.Now().Add(-age).UnixMicro()),
+			Payload:     []byte("before"),
+		})
+	}
+	if got := sender.CurrentSequence(); got != 2 {
+		t.Fatalf("sequence = %d, want 2", got)
+	}
+
+	behind := prepare("reader-behind", 0) // a restarted reader reports 0
+	ahead := prepare("reader-ahead", 5)   // the writer restarted; the reader is ahead
+	if got := behind.lastAck.Load(); got != 2 {
+		t.Fatalf("attach baseline = %d, want the writer's current sequence 2", got)
+	}
+	if got := ahead.lastAck.Load(); got != 5 {
+		t.Fatalf("a reader ahead of the writer must keep its position: got %d, want 5", got)
+	}
+
+	for peer, sample := range samplesByPeer() {
+		if sample.Entries != 0 || !sample.HasSeconds || sample.Seconds != 0 {
+			t.Fatalf("%s: the pre-attach gap must not read as lag: %+v", peer, sample)
+		}
+	}
+
+	// Only entries accepted after the attach count, and they are exact.
+	sender.Replicate(&ReplicateEntry{
+		TimestampUS: uint64(time.Now().Add(-3 * time.Second).UnixMicro()),
+		Payload:     []byte("after"),
+	})
+	after := samplesByPeer()
+	if s := after["reader-behind"]; s.Entries != 1 || !s.HasSeconds || s.Seconds < 2 || s.Seconds > 8 {
+		t.Fatalf("reader-behind after one post-attach entry: %+v", s)
+	}
+	if s := after["reader-ahead"]; s.Entries != 0 || !s.HasSeconds || s.Seconds != 0 {
+		t.Fatalf("reader-ahead must stay saturated at zero: %+v", s)
+	}
+}
+
+// Entries dropped by a full replication buffer consume sequence numbers
+// but never reach the ring. The oldest RETAINED outstanding entry is
+// reported instead, and zero when nothing accepted is outstanding.
+func TestReplicationLagDroppedEntriesIssue819(t *testing.T) {
+	sender := NewSender(&SenderConfig{BufferSize: 2, Logger: zerolog.Nop()})
+	sender.running.Store(true) // accept entries; nothing drains the buffer
+	reader := &ReaderConnection{id: "reader-1"}
+	sender.readers[reader.id] = reader
+
+	for _, age := range []time.Duration{10 * time.Second, 5 * time.Second, time.Second} {
+		sender.Replicate(&ReplicateEntry{
+			TimestampUS: uint64(time.Now().Add(-age).UnixMicro()),
+			Payload:     []byte("x"),
+		})
+	}
+	if got := sender.totalEntriesDropped.Load(); got != 1 {
+		t.Fatalf("dropped = %d, want 1 (sequence 3)", got)
+	}
+
+	// Behind everything: the oldest outstanding entry (1) is retained; exact.
+	s := sender.replicationLagSamples()[0]
+	if s.Entries != 3 || !s.HasSeconds || s.Seconds < 9 || s.Seconds > 14 {
+		t.Fatalf("lag with the oldest entry retained: %+v", s)
+	}
+
+	// Both accepted entries acknowledged: the only outstanding sequence (3)
+	// was dropped, so nothing accepted is pending and zero is exact. The
+	// entry count still reports the hole.
+	reader.lastAck.Store(2)
+	s = sender.replicationLagSamples()[0]
+	if s.Entries != 1 || !s.HasSeconds || s.Seconds != 0 {
+		t.Fatalf("lag with only a dropped entry outstanding: %+v", s)
+	}
+}
+
+// A one-slot ring is the smallest configuration the arithmetic must hold at.
+func TestReplicationLagSingleSlotRingIssue819(t *testing.T) {
+	sender := NewSender(&SenderConfig{BufferSize: 1, Logger: zerolog.Nop()})
+	sender.running.Store(true)
+	reader := &ReaderConnection{id: "reader-1"}
+	sender.readers[reader.id] = reader
+
+	sender.Replicate(&ReplicateEntry{TimestampUS: uint64(time.Now().Add(-7 * time.Second).UnixMicro()), Payload: []byte("x")})
+	sender.Replicate(&ReplicateEntry{TimestampUS: uint64(time.Now().Add(-2 * time.Second).UnixMicro()), Payload: []byte("y")}) // dropped: buffer full
+	if got := sender.totalEntriesDropped.Load(); got != 1 {
+		t.Fatalf("dropped = %d, want 1", got)
+	}
+	s := sender.replicationLagSamples()[0]
+	if s.Entries != 2 || !s.HasSeconds || s.Seconds < 6 || s.Seconds > 12 {
+		t.Fatalf("one-slot ring, oldest retained: %+v", s)
+	}
+	reader.lastAck.Store(1)
+	s = sender.replicationLagSamples()[0]
+	if s.Entries != 1 || !s.HasSeconds || s.Seconds != 0 {
+		t.Fatalf("one-slot ring, only a dropped entry outstanding: %+v", s)
+	}
+}
+
+// Entries must remain visible even if their timestamps have aged out of
+// the bounded ring, and seconds then reports the oldest RETAINED
+// outstanding entry: a lower bound, never an omission.
 func TestReplicationLagTimestampEvictionIssue819(t *testing.T) {
 	sender := NewSender(&SenderConfig{
 		BufferSize: 2,
@@ -329,12 +470,14 @@ func TestReplicationLagTimestampEvictionIssue819(t *testing.T) {
 	if samples[0].Entries != 3 {
 		t.Fatalf("entries after eviction = %d, want 3", samples[0].Entries)
 	}
-	if samples[0].HasSeconds {
-		t.Fatalf("evicted timestamp produced fabricated seconds: %+v", samples[0])
+	// Sequence 1's slot was overwritten by sequence 3; the oldest retained
+	// outstanding entry (3, 5 s old) is the lower bound reported.
+	if !samples[0].HasSeconds || samples[0].Seconds < 4 || samples[0].Seconds > 10 {
+		t.Fatalf("evicted oldest must fall back to the oldest retained entry: %+v", samples[0])
 	}
 
-	// Once the reader reaches an entry whose timestamp is known,
-	// seconds should become available again.
+	// Once the reader reaches an entry whose timestamp is retained, the
+	// age is exact again.
 	reader.lastAck.Store(2)
 
 	samples = sender.replicationLagSamples()
