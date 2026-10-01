@@ -657,8 +657,8 @@ func sampleUnaddressable(objs []storage.UnusableObject) []string {
 // handful of files at the tail of a run; the overrun is permanent, and the
 // message gives each cause's count (from the run's tally, #977) so the
 // operator renames keys rather than diagnosing storage. A large fraction of
-// the backup skipping for either reason is a
-// different event — throttling, credential expiry, a storage outage, a root
+// the backup skipping for either reason is a different event — throttling,
+// credential expiry, a storage outage, a root
 // full of foreign keys — and silently returning a fraction of the data as a
 // successful backup is how an operator discovers the gap at restore time
 // instead of at backup time.

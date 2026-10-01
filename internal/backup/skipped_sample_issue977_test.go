@@ -146,6 +146,28 @@ func TestBackupSkippedSampleNamesBothCauses(t *testing.T) {
 			t.Errorf("clean listing entry carries %q: %s", key, data)
 		}
 	}
+	// And the stored manifest.json of a clean backup carries none of the new
+	// keys, so clean manifests are unchanged byte for byte.
+	stored, err := clean.backupStorage.Read(ctx, result.Manifest.BackupID+"/manifest.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(stored, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"skipped_sample", "skipped_overlong_keys", "skipped_files", "skipped_metadata_files"} {
+		if _, present := raw[key]; present {
+			t.Errorf("clean manifest.json carries %q", key)
+		}
+	}
+}
+
+// failingLister makes the backup fail before any copy phase.
+type failingLister struct{ storage.Backend }
+
+func (failingLister) ListObjects(context.Context, string) ([]storage.ObjectInfo, error) {
+	return nil, errors.New("listing unavailable")
 }
 
 // A run the skip ratio fails writes no manifest, so the status endpoint and
@@ -182,6 +204,19 @@ func TestBackupRatioFailureNamesCauseAndKeepsStatusSample(t *testing.T) {
 	}
 	if got, _ := metrics.Get().Snapshot()["backup_skipped_files"].(int64); got != 5 {
 		t.Errorf("gauge after the failed run = %d, want 5 (set before the ratio check)", got)
+	}
+
+	// A backup that fails before copying anything leaves the gauge alone: a
+	// zero there would clear an alert with a value that describes nothing.
+	early, err := NewManager(&ManagerConfig{DataStorage: failingLister{dataStorage}, BackupPath: t.TempDir(), Logger: zerolog.Nop()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := early.CreateBackup(ctx, BackupOptions{}); err == nil {
+		t.Fatal("a backup whose listing fails must fail")
+	}
+	if got, _ := metrics.Get().Snapshot()["backup_skipped_files"].(int64); got != 5 {
+		t.Errorf("gauge after a pre-copy failure = %d, want the previous 5", got)
 	}
 }
 

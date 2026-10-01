@@ -454,10 +454,11 @@ func TestCheckSkipRatio_SpansAllFileGroups(t *testing.T) {
 	}
 
 	progress := &Progress{Operation: "backup", TotalFiles: int64(len(dataFiles) + len(metaFiles))}
-	if err := m.copyDataFiles(ctx, "bkid", dataFiles, progress, &skipTally{}); err != nil {
+	tally := &skipTally{} // one tally across both groups, as CreateBackup does
+	if err := m.copyDataFiles(ctx, "bkid", dataFiles, progress, tally); err != nil {
 		t.Fatalf("data files: %v", err)
 	}
-	if err := m.copyDataFiles(ctx, "bkid", metaFiles, progress, &skipTally{}); err != nil {
+	if err := m.copyDataFiles(ctx, "bkid", metaFiles, progress, tally); err != nil {
 		t.Fatalf("iceberg metadata: %v", err)
 	}
 

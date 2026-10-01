@@ -228,8 +228,9 @@ type Metrics struct {
 	// but could not store (#977): unreadable at copy time, or a destination key
 	// over the storage key limit (#761). Spans every file group the backup
 	// copies (data, in-root Iceberg metadata, compaction state, outside-root
-	// warehouse), the same total the status endpoint reports as skipped_files.
-	// A gauge for the same reason as storageUnaddressableFiles: the next clean
+	// warehouse), the same total the status endpoint reports as skipped_files;
+	// only the first two groups are named in skipped_sample, the others are
+	// named in the log. A gauge for the same reason as storageUnaddressableFiles: the next clean
 	// backup clears it. Set by every backup that finishes its copy phases,
 	// including one the skip ratio then fails; a backup that fails earlier
 	// leaves the previous value.
@@ -1147,7 +1148,7 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_storage_unaddressable_files gauge\n"...)
 	b = appendMetric(b, "arc_storage_unaddressable_files", float64(m.storageUnaddressableFiles.Load()))
 
-	b = append(b, "# HELP arc_backup_skipped_files Files the most recent backup inventoried but could not store: unreadable at copy time, or a backup destination key over the storage key limit. Counts every file group the backup copies, the same total the backup status endpoint reports as skipped_files; the backup's manifest and status name up to 32 of them in skipped_sample. Set by every backup that finishes its copy phases, including one the skip ratio then fails; a backup that fails earlier leaves the previous value. A clean backup sets it to 0.\n"...)
+	b = append(b, "# HELP arc_backup_skipped_files Files the most recent backup inventoried but could not store: unreadable at copy time, or a backup destination key over the storage key limit. Counts every file group the backup copies, the same total the backup status endpoint reports as skipped_files; the backup's manifest and status name up to 32 of the skipped data and Iceberg metadata files in skipped_sample, while a skipped compaction recovery manifest or outside-root warehouse file is counted here and named only in the log. Set by every backup that finishes its copy phases, including one the skip ratio then fails; a backup that fails earlier leaves the previous value. A clean backup sets it to 0.\n"...)
 	b = append(b, "# TYPE arc_backup_skipped_files gauge\n"...)
 	b = appendMetric(b, "arc_backup_skipped_files", float64(m.backupSkippedFiles.Load()))
 
