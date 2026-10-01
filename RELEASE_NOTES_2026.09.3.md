@@ -38,6 +38,37 @@ writer's sequence after a writer restart.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#908](https://github.com/Basekick-Labs/arc/pull/908).
 
+## Backups name the files they skipped ([#977](https://github.com/Basekick-Labs/arc/issues/977))
+
+A backup that skips a file, because it vanished between the listing and the
+copy or because its backup destination key would exceed the storage key limit,
+used to record only a count. The file's name appeared in the log alone, and
+for the second cause the operator has to rename that file, so a count was not
+enough to act on.
+
+The manifest now names up to 32 of the skipped data and Iceberg metadata
+files in `skipped_sample`, in copy order (a skipped compaction recovery
+manifest or outside-root warehouse file is counted but named only in the
+log), and says how many of the skips were for an overlong key in
+`skipped_overlong_keys`. The backup listing (`GET /api/v1/backup`) carries
+`skipped_files`, `skipped_metadata_files` and `unaddressable_files` from the
+manifest, so an entry whose `total_files` counts files that were not stored
+now says so. The status endpoint names a backup's skipped files the way it
+already did for a restore, published once the copy phases finish and before
+the skip-ratio check, so a run the ratio fails, which writes no manifest,
+still leaves them there until the next operation. That failure's message now
+gives each cause's count
+(how many files could not be read, how many have source keys longer than 982
+bytes) instead of naming both as possibilities. And a new gauge,
+`arc_backup_skipped_files`, reports the most recent backup's skipped count
+across every file group, set by every backup that finishes its copy phases
+and cleared by the next clean one, so an incomplete backup can be alerted on.
+
+Erratum: the 26.09.2 notes named the unaddressable-files gauge
+`arc_storage_unaddressable_files_total`. Its name is
+`arc_storage_unaddressable_files`, and it is a gauge; the 26.09.2 notes are
+corrected.
+
 ## Bug fixes
 
 ### A comma cross-join `FROM a, b` read only the first measurement ([#978](https://github.com/Basekick-Labs/arc/issues/978))
