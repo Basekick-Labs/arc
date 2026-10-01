@@ -230,6 +230,58 @@ func TestCommaJoinRewrite_Issue978(t *testing.T) {
 			sql:     "SELECT * FROM cpu -- , secret\n WHERE 1=1",
 			notWant: []string{rp("default", "secret")},
 		},
+		// Review findings: list/struct literals carry commas at paren depth 0
+		// while an ON predicate keeps the FROM clause armed.
+		{
+			name:    "list literal in ON predicate",
+			sql:     "SELECT * FROM t JOIN u ON u.ids = [1, 2] AND u.x = 1",
+			want:    []string{"ON u.ids = [1, 2] AND u.x = 1"},
+			notWant: []string{rp("default", "AND")},
+		},
+		{
+			name:    "list of dotted refs in ON predicate",
+			sql:     "SELECT * FROM t JOIN u ON u.tags = [u.a, u.b] WHERE 1=1",
+			want:    []string{"ON u.tags = [u.a, u.b] WHERE 1=1"},
+			notWant: []string{rp("u", "b")},
+		},
+		{
+			name:    "list cast in ON predicate",
+			sql:     "SELECT * FROM t JOIN u ON u.ids = [1, 2]::INT[] AND u.x = 1",
+			want:    []string{"[1, 2]::INT[] AND u.x = 1"},
+			notWant: []string{rp("default", "INT")},
+		},
+		{
+			name:    "ARRAY constructor in ON predicate",
+			sql:     "SELECT * FROM t JOIN u ON u.x = 1 AND t.v = ARRAY[1, 2] OR t.w = 0",
+			want:    []string{"ARRAY[1, 2] OR t.w = 0"},
+			notWant: []string{rp("default", "OR")},
+		},
+		{
+			name:    "struct literal in ON predicate",
+			sql:     "SELECT * FROM t JOIN u ON u.m = {'k': 'v', 'k2': 'v2'} AND u.x = 1",
+			want:    []string{"{'k': 'v', 'k2': 'v2'} AND u.x = 1"},
+			notWant: []string{rp("default", "AND")},
+		},
+		{
+			name:    "list literal in a projection before a comma join",
+			sql:     "SELECT [a, b], c FROM t, u",
+			want:    []string{"SELECT [a, b], c FROM " + rp("default", "t"), ", " + rp("default", "u")},
+			notWant: []string{rp("default", "b"), rp("default", "c")},
+		},
+		// Review finding: bytes the tokeniser skips must not be swallowed
+		// into a rewrite; the FROM pass leaves these alone, so does this one.
+		{
+			name:    "backtick-quoted name after the comma is left alone",
+			sql:     "SELECT * FROM cpu, `rocket-01` r",
+			want:    []string{", `rocket-01` r"},
+			notWant: []string{rp("default", "rocket")},
+		},
+		{
+			name:    "non-ASCII byte before the name is left alone",
+			sql:     "SELECT * FROM cpu, éb",
+			want:    []string{", éb"},
+			notWant: []string{rp("default", "b")},
+		},
 	}
 
 	for _, tt := range tests {
@@ -326,6 +378,12 @@ func TestCommaJoinRewriteWithHeaderDB_Issue978(t *testing.T) {
 			want:    []string{"SELECT * FROM generate_series(1, 10)"},
 			notWant: []string{"read_parquet"},
 		},
+		{
+			name:    "quote-free sample clause then comma table",
+			sql:     "SELECT * FROM cpu c TABLESAMPLE bernoulli(10), mem m",
+			want:    []string{"FROM " + rp("searchbench", "cpu") + ", union_by_name=true) c TABLESAMPLE bernoulli(10), " + rp("searchbench", "mem")},
+			notWant: []string{", mem m"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -373,6 +431,9 @@ func TestIsSingleTableQuery_CommaJoin_Issue978(t *testing.T) {
 		"select * from a\njoin b on a.x = b.x",
 		"select * from a x\n  left join b y on x.id = y.id",
 		"select * from a\tjoin b using (x)",
+		"select * from cpu c tablesample bernoulli(10), mem",
+		"select * from cpu tablesample bernoulli(10), mem m",
+		"select * from cpu as c using sample 10%, mem",
 	}
 	for _, sql := range multi {
 		if isSingleTableQuery(sql) {
@@ -520,5 +581,119 @@ func TestValidateSQLRequest_FromFirstForm_Issue978(t *testing.T) {
 	}
 	if err := ValidateSQLRequest("FROM cpu, '/data/arc/db2/x.parquet' SELECT 1"); err == nil {
 		t.Errorf("replacement scan in FROM-first form was accepted")
+	}
+}
+
+// A string literal standing as the TABLE part of a qualified name (`FROM
+// db.'…'`, in the FROM, JOIN and comma positions) is in table position too:
+// validation rejects it, and the transform never lets a masked literal become
+// a path segment (the unmask step would otherwise restore the raw literal
+// inside the quoted read_parquet path). A valid quoted identifier in that
+// position is still fine.
+func TestStringLiteralAsQualifiedTablePart_Issue978(t *testing.T) {
+	h := newCommaJoinTestHandler()
+	literal := "'||concat(chr(46),chr(46),chr(47),chr(100),chr(98),chr(50))||'"
+	rejected := []string{
+		"SELECT * FROM mydb." + literal,
+		"SELECT * FROM cpu JOIN mydb." + literal + " x ON 1=1",
+		"SELECT * FROM cpu, mydb." + literal,
+		`SELECT * FROM "mydb"."db2/**/*.parquet"`,
+		`SELECT * FROM cpu, "mydb"."db2/**/*.parquet"`,
+		"SELECT * FROM mydb.$$" + literal[1:len(literal)-1] + "$$",
+	}
+	for _, sql := range rejected {
+		if err := ValidateSQLRequest(sql); err == nil {
+			t.Errorf("%q accepted by validation", sql)
+		}
+		got := h.convertSQLToStoragePaths(context.Background(), sql)
+		if strings.Contains(got, "concat(") || strings.Contains(got, "||") || strings.Contains(got, "db2/**") {
+			t.Errorf("literal reached the storage path\n  sql: %q\n  got: %s", sql, got)
+		}
+		if !strings.Contains(got, arcInvalidIdentifierSentinel) {
+			t.Errorf("sentinel path not emitted\n  sql: %q\n  got: %s", sql, got)
+		}
+	}
+	for _, sql := range []string{"SELECT * FROM '" + literal[1:len(literal)-1] + "'", "SELECT * FROM cpu, '/x' b"} {
+		got := h.convertSQLToStoragePathsWithHeaderDB(context.Background(), sql, "mydb")
+		if strings.Contains(got, "concat(") || strings.Contains(got, "read_parquet('./data/mydb//x") {
+			t.Errorf("literal reached the storage path (header path)\n  sql: %q\n  got: %s", sql, got)
+		}
+	}
+	accepted := []string{
+		`SELECT * FROM mydb."rocket-01"`,
+		`SELECT * FROM "my-db"."cpu"`,
+		`SELECT * FROM cpu, mydb."rocket-01" r`,
+		`SELECT * FROM cpu c JOIN mydb."rocket-01" r ON c.id = r.id`,
+	}
+	for _, sql := range accepted {
+		if err := ValidateSQLRequest(sql); err != nil {
+			t.Errorf("%q rejected: %v", sql, err)
+		}
+	}
+	if got := h.convertSQLToStoragePaths(context.Background(), `SELECT * FROM cpu, mydb."rocket-01" r`); !strings.Contains(got, rp("mydb", "rocket-01")) {
+		t.Errorf("valid quoted qualified name after the comma not rewritten: %s", got)
+	}
+}
+
+// A quoted reserved word used as an alias (`FROM cpu "where", '…'`) must not
+// disarm the replacement-scan guard: the guard now runs on the normalisation
+// where a quoted identifier stays a placeholder instead of coming back as the
+// bare keyword that terminates the table list.
+func TestValidateSQLRequest_QuotedKeywordAlias_Issue978(t *testing.T) {
+	rejected := []string{
+		`SELECT * FROM cpu "where", '/data/arc/db2/x.parquet'`,
+		`SELECT * FROM cpu "select", '/data/arc/db2/x.parquet'`,
+		`SELECT * FROM cpu AS "group", '/data/arc/db2/x.parquet' b`,
+		"SELECT * FROM cpu `order`, '/data/arc/db2/x.parquet'",
+		`SELECT * FROM cpu "where" JOIN mem "limit" ON 1=1, '/data/arc/db2/x.parquet'`,
+	}
+	for _, sql := range rejected {
+		if err := ValidateSQLRequest(sql); err == nil {
+			t.Errorf("%q accepted: quoted keyword alias hid the replacement scan", sql)
+		}
+	}
+	accepted := []string{
+		`SELECT * FROM cpu "where" WHERE "where".x = 'a'`,
+		`SELECT * FROM cpu "order" ORDER BY a, 'x'`,
+		`SELECT "from", 'x' FROM cpu "select" WHERE 1=1`,
+		`SELECT * FROM cpu "where", mem "group" WHERE 1=1`,
+	}
+	for _, sql := range accepted {
+		if err := ValidateSQLRequest(sql); err != nil {
+			t.Errorf("%q rejected: %v", sql, err)
+		}
+	}
+}
+
+// Brackets now open a nested group in the shared walker, so a string inside a
+// list or struct literal in an ON predicate is a value (these were false
+// rejections before). A bracket standing in table position itself does not
+// hide the string that follows it from the replacement-scan guard.
+func TestValidateSQLRequest_BracketLiterals_Issue978(t *testing.T) {
+	accepted := []string{
+		"SELECT * FROM t JOIN u ON u.tags = ['a', 'b'] WHERE 1=1",
+		"SELECT * FROM t JOIN u ON u.m = {'k': 'v', 'k2': 'v2'} AND u.x = 1",
+		"SELECT * FROM t JOIN u ON u.ids = [1, 2] AND u.x = 1",
+	}
+	for _, sql := range accepted {
+		if err := ValidateSQLRequest(sql); err != nil {
+			t.Errorf("%q rejected: %v", sql, err)
+		}
+	}
+	rejected := []string{
+		"SELECT * FROM cpu, ['/data/arc/db2/x.parquet']",
+		"SELECT * FROM ['/data/arc/db2/x.parquet']",
+		"SELECT * FROM cpu, {'/data/arc/db2/x.parquet'}",
+		// Unbalanced brackets outside quotes (syntax errors in DuckDB) must
+		// not disarm the guard for a string that does stand in table position.
+		"SELECT [1 FROM cpu, '/data/arc/db2/x.parquet'",
+		"SELECT * FROM cpu ], '/data/arc/db2/x.parquet'",
+		"SELECT * FROM cpu[1], '/data/arc/db2/x.parquet'",
+		"SELECT * FROM cpu } JOIN '/data/arc/db2/x.parquet' x ON 1=1",
+	}
+	for _, sql := range rejected {
+		if err := ValidateSQLRequest(sql); err == nil {
+			t.Errorf("%q accepted: a string after a bracket in table position must stay flagged", sql)
+		}
 	}
 }

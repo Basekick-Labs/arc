@@ -63,6 +63,16 @@ way it rejects `FROM otherdb.mem`. And the no-regex fast path for single-table
 queries under that header, which a quote-free comma join used to take, now
 defers to the full rewriter.
 
+Two validation gaps in the same table-position logic are closed as well.
+Validation now rejects a string literal standing as the table part of a
+qualified name (`FROM db.'…'`), in the `FROM`, `JOIN` and comma positions, and
+the transform never turns a masked literal into a storage path. And the
+replacement-scan check now runs on the normalisation that keeps quoted
+identifiers distinct from strings, so a quoted reserved word used as an alias
+no longer hides a string literal that follows it in table position. A list or
+struct literal inside an `ON` predicate, which that check wrongly rejected
+before, is accepted.
+
 Probing that fast path turned up two more shapes it mishandled, fixed with it.
 A `JOIN` that starts a new line (`FROM a` then `JOIN b` on the next line) was
 not recognised as a join, so only the `FROM` table was rewritten and DuckDB

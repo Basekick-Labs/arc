@@ -36,9 +36,11 @@ type tablePosition struct {
 // opens its OWN nested FROM clause whose end (on the closing paren) must NOT
 // clear the outer clause — otherwise the trailing comma cross-join is wrongly
 // disarmed (GHSA-w8x2 review, blocker 1). A comma continues the table list
-// only while THIS depth's clause is armed, which excludes function-argument and
-// projection commas: those sit at a deeper depth, or after a clause terminator
-// (WHERE, GROUP, ORDER, SELECT in DuckDB's FROM-first form, …).
+// only while THIS depth's clause is armed, which excludes function-argument,
+// list/struct-literal and projection commas: parentheses, brackets and braces
+// all open a nested group, so those commas sit at a deeper depth, and the rest
+// follow a clause terminator (WHERE, GROUP, ORDER, SELECT in DuckDB's
+// FROM-first form, …).
 func walkTablePositions(normalised string, visit func(p tablePosition) (stop bool)) {
 	// fromArmed[d] is true when, at paren depth d, we are inside a FROM clause
 	// whose table list is still open. Indexed by depth; grows as needed.
@@ -53,22 +55,31 @@ func walkTablePositions(normalised string, visit func(p tablePosition) (stop boo
 	for _, m := range tablePosTokenPattern.FindAllStringIndex(normalised, -1) {
 		tok := normalised[m[0]:m[1]]
 		switch tok {
-		case "(":
+		case "(", "[", "{":
+			// A list or struct literal that itself stands in table position
+			// (`FROM cpu, ['/x']`) is a DuckDB syntax error, never a table —
+			// but the atom after the bracket stays in table position so the
+			// replacement-scan guard keeps flagging a string there, rather
+			// than relying on that grammar fact. Anywhere else a bracket opens
+			// a nested group exactly like a parenthesis.
+			bracketInTablePos := tok != "(" && (afterFromJoin || afterComma)
 			depth++
 			if depth >= len(fromArmed) {
 				fromArmed = append(fromArmed, false)
 			} else {
 				fromArmed[depth] = false
 			}
-			afterFromJoin, afterComma = false, false
+			if !bracketInTablePos {
+				afterFromJoin, afterComma = false, false
+			}
 			continue
-		case ")":
+		case ")", "]", "}":
 			if depth > 0 {
 				fromArmed[depth] = false
 				depth--
 			}
-			// Leaving the paren group does NOT touch fromArmed[depth-1]: the
-			// OUTER FROM clause (if any) is still open.
+			// Leaving the group does NOT touch fromArmed[depth-1]: the OUTER
+			// FROM clause (if any) is still open.
 			afterFromJoin, afterComma = false, false
 			continue
 		case ",":
@@ -81,12 +92,22 @@ func walkTablePositions(normalised string, visit func(p tablePosition) (stop boo
 		}
 
 		// tok is a placeholder or an identifier/keyword run.
-		if afterFromJoin || afterComma {
+		inTablePos := afterFromJoin || afterComma
+		if inTablePos {
 			if visit(tablePosition{tok: tok, start: m[0], end: m[1], viaComma: afterComma, introStart: introStart}) {
 				return
 			}
 		}
-		afterFromJoin, afterComma = false, false
+		// A qualifier (`db.table`): the part after the dot is the table
+		// itself and stays in table position, so a masked string or an
+		// invalid quoted name standing there (`FROM db.'…'`) is seen by the
+		// replacement-scan guards exactly like one standing directly after
+		// FROM. Whitespace before the dot is tolerated because the validator
+		// isolates placeholders with spaces (`__IDENT_0__ . __STR_0__`);
+		// over-recognising table position is safe for every consumer.
+		if !(inTablePos && dotFollows(normalised, m[1])) {
+			afterFromJoin, afterComma = false, false
+		}
 
 		if strings.HasPrefix(tok, "__STR_") || strings.HasPrefix(tok, "__IDENT_") {
 			// A placeholder — a value, a function argument, a quoted table —
@@ -136,10 +157,18 @@ type commaJoinRef struct {
 // by `(` (a table function or a subquery), a dotted name whose dot is not
 // adjacent on both sides (isDotOrCallAt leaves those alone too), a qualified
 // name followed by `(` (`db.func(...)`), LATERAL (which introduces a subquery
-// or a function, never a table), and the clause keywords the walker itself
-// interprets, so the finder never consumes a token the state machine treats as
-// structure.
+// or a function, never a table), the clause keywords the walker itself
+// interprets (so the finder never consumes a token the state machine treats as
+// structure), and a token with anything but whitespace between the comma and
+// itself: the tokeniser skips bytes it does not know, so without that guard
+// `, éb` or a backtick-quoted “ , `rocket-01` “ (not masked by the
+// converters) would be rewritten as `b` / `rocket` with the stray bytes
+// swallowed or left dangling. The FROM pass leaves those alone, and so does
+// this one.
 func findCommaJoinRefs(sql string) []commaJoinRef {
+	if strings.IndexByte(sql, ',') < 0 {
+		return nil
+	}
 	var refs []commaJoinRef
 	walkTablePositions(sql, func(p tablePosition) bool {
 		if !p.viaComma {
@@ -147,6 +176,9 @@ func findCommaJoinRefs(sql string) []commaJoinRef {
 		}
 		lower := strings.ToLower(p.tok)
 		if lower == "lateral" || lower == "from" || lower == "join" || fromClauseTerminator(lower) {
+			return false
+		}
+		if strings.TrimLeft(sql[p.introStart+1:p.start], " \t\r\n") != "" {
 			return false
 		}
 		rest := strings.TrimLeft(sql[p.end:], " \t\r\n")
@@ -216,9 +248,10 @@ func rewriteCommaJoinRefs(sql string, fn func(ref commaJoinRef) (string, bool)) 
 // starts at or after pos (just past the `from ` keyword in lower-cased SQL)
 // names more than the one table the single-table fast path can rewrite: the
 // table, or its optional `[AS] alias`, is followed by a comma (a SQL-92 cross
-// join, #978) or an opening paren (a table function or a column-alias list).
-// A clause keyword in alias position (`FROM t WHERE (…)`) ends the list, so
-// that common shape keeps the fast path.
+// join, #978), an opening paren (a table function or a column-alias list), or
+// a sample clause (`TABLESAMPLE …` / `USING SAMPLE …`, after which a comma
+// table may still follow). A clause keyword in alias position
+// (`FROM t WHERE (…)`) ends the list, so that common shape keeps the fast path.
 func fromTableListContinues(sqlLower string, pos int) bool {
 	skipWS := func() {
 		for pos < len(sqlLower) && isWhitespace(sqlLower[pos]) {
@@ -235,6 +268,10 @@ func fromTableListContinues(sqlLower string, pos int) bool {
 		return pos < len(sqlLower) && (sqlLower[pos] == ',' || sqlLower[pos] == '(')
 	}
 
+	sampleClause := func(word string) bool {
+		return word == "tablesample" || word == "using"
+	}
+
 	skipWS()
 	if readIdent() == "" {
 		return false
@@ -247,6 +284,9 @@ func fromTableListContinues(sqlLower string, pos int) bool {
 	if alias == "" || fromClauseTerminator(alias) {
 		return false
 	}
+	if sampleClause(alias) {
+		return true
+	}
 	if alias == "as" {
 		skipWS()
 		if readIdent() == "" {
@@ -254,7 +294,10 @@ func fromTableListContinues(sqlLower string, pos int) bool {
 		}
 	}
 	skipWS()
-	return continues()
+	if continues() {
+		return true
+	}
+	return sampleClause(readIdent())
 }
 
 // containsSQLWord reports whether lower-cased SQL contains word as a whole
@@ -273,4 +316,11 @@ func containsSQLWord(sqlLower, word string) bool {
 		}
 		pos = idx + 1
 	}
+}
+
+// dotFollows reports whether the first non-blank byte at or after pos is a
+// '.' — the token ending at pos is a qualifier of what follows.
+func dotFollows(s string, pos int) bool {
+	rest := strings.TrimLeft(s[pos:], " \t\r\n")
+	return len(rest) > 0 && rest[0] == '.'
 }
