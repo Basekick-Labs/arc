@@ -1,13 +1,19 @@
 # =============================================================================
-# Arc OSS — single node, S3-backed storage (bundled MinIO)
+# Arc OSS — single node, S3-backed storage (bundled SeaweedFS)
 #
-# One Arc container backed by a bundled MinIO for S3-compatible storage.
+# One Arc container backed by a bundled SeaweedFS for S3-compatible storage.
 # No clustering; Arc still reads/writes a single bucket. Useful for testing
 # the S3 code path locally, or as a stepping stone to Enterprise clustered
 # deployments that share a bucket across nodes.
 #
-# To point at external S3 / R2 / Tigris / Azure, replace the MinIO creds
-# and endpoint with your own values and remove the `minio` service.
+# A one-shot init pre-creates the bucket. SeaweedFS would create it on
+# Arc's first WRITE anyway, but a read-only call that lists storage before
+# anything was written (e.g. GET /api/v1/databases on a fresh stack) gets
+# NoSuchBucket and Arc answers 500 until #945 lands. (Arc also logs one
+# startup warning if it beat the init to the bucket; that is harmless.)
+#
+# To point at external S3 / R2 / Tigris / Azure, replace the SeaweedFS creds
+# and endpoint with your own values and remove the `seaweedfs` service.
 # =============================================================================
 
 services:
@@ -22,9 +28,9 @@ services:
       ARC_STORAGE_BACKEND: "s3"
       ARC_STORAGE_S3_BUCKET: "arc-data"
       ARC_STORAGE_S3_REGION: "us-east-1"
-      ARC_STORAGE_S3_ENDPOINT: "http://minio:9000"
-      ARC_STORAGE_S3_ACCESS_KEY: "${MINIO_ROOT_USER:-minioadmin}"
-      ARC_STORAGE_S3_SECRET_KEY: "${MINIO_ROOT_PASSWORD:-minioadmin}"
+      ARC_STORAGE_S3_ENDPOINT: "http://seaweedfs:8333"
+      ARC_STORAGE_S3_ACCESS_KEY: "${SEAWEEDFS_ACCESS_KEY:-arcadmin}"
+      ARC_STORAGE_S3_SECRET_KEY: "${SEAWEEDFS_SECRET_KEY:-arcadmin123}"
       ARC_STORAGE_S3_FORCE_PATH_STYLE: "true"
       ARC_STORAGE_S3_USE_SSL: "false"
       # WAL stays local even with S3 storage — it's only for in-flight writes
@@ -33,24 +39,72 @@ services:
     volumes:
       - arc-data:/app/data
     depends_on:
-      minio:
-        condition: service_started
+      seaweedfs:
+        condition: service_healthy
+      seaweedfs-init:
+        condition: service_completed_successfully
     restart: unless-stopped
 
-  minio:
-    image: minio/minio:latest
-    container_name: minio
-    command: server /data --console-address ":9001"
+  # `weed server -s3` runs master, volume server, filer and the S3 gateway in
+  # one process. The identities file is rendered from the environment at
+  # startup, so credentials stay overridable the same way they were with the
+  # previous MinIO service. -ip.bind is required for the localhost
+  # healthcheck: without it the gateway listens only on the container IP.
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.47
+    container_name: seaweedfs
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        cat > /etc/seaweedfs-s3.json <<EOF
+        {"identities":[{"name":"arc","credentials":[{"accessKey":"$$SEAWEEDFS_ACCESS_KEY","secretKey":"$$SEAWEEDFS_SECRET_KEY"}],"actions":["Admin","Read","Write","List"]}]}
+        EOF
+        exec weed server -s3 -s3.port=8333 -s3.config=/etc/seaweedfs-s3.json \
+          -dir=/data -ip.bind=0.0.0.0 -disableHttp
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "8333:8333"             # S3 API (authenticated)
+      # The master status port is unauthenticated; bind it to loopback so it
+      # is reachable from this host only. Filer/volume/gRPC ports are not
+      # published at all, and -disableHttp closes the HTTP data planes.
+      - "127.0.0.1:9333:9333"   # master status (local only)
     environment:
-      MINIO_ROOT_USER: "${MINIO_ROOT_USER:-minioadmin}"
-      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:-minioadmin}"
+      SEAWEEDFS_ACCESS_KEY: "${SEAWEEDFS_ACCESS_KEY:-arcadmin}"
+      SEAWEEDFS_SECRET_KEY: "${SEAWEEDFS_SECRET_KEY:-arcadmin123}"
     volumes:
-      - minio-data:/data
+      - seaweedfs-data:/data
+    healthcheck:
+      # /status on the S3 port answers 200 without authentication.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8333/status"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
     restart: unless-stopped
+
+  # =============================================================================
+  # seaweedfs-init — one-shot bucket creation
+  #
+  # SeaweedFS creates buckets on the first authenticated WRITE, but a
+  # read-only call that lists the bucket before anything has been written
+  # (e.g. GET /api/v1/databases on a fresh stack) gets NoSuchBucket and
+  # Arc answers 500. Pre-creating the bucket restores the old minio-init
+  # guarantee: every Arc endpoint works from the first request. weed shell
+  # talks to the master over gRPC, so it works with -disableHttp.
+  # Idempotent — re-creating an existing bucket is a no-op.
+  # =============================================================================
+  seaweedfs-init:
+    image: chrislusf/seaweedfs:4.47
+    container_name: seaweedfs-init
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        echo "s3.bucket.create -name arc-data" | weed shell -master seaweedfs:9333
+        echo "seaweedfs-init: bucket arc-data ready"
+    restart: "no"
+
 
 volumes:
   arc-data:
-  minio-data:
+  seaweedfs-data:

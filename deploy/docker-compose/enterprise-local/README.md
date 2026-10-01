@@ -191,9 +191,9 @@ Internal ports (not exposed):
 
 ## Comparison with Shared-Storage Pattern
 
-See [../docker-compose/](../docker-compose/) for the shared-storage version with MinIO.
+See [../enterprise-shared/](../enterprise-shared/) for the shared-storage version with SeaweedFS.
 
 | Folder | Backend | Shared Storage |
 |--------|---------|----------------|
-| `docker-compose/` | S3 (MinIO) | Yes — all nodes read from the same bucket |
-| `docker-compose-local/` | Local filesystem | No — each node holds a replica, files are fetched peer-to-peer |
+| `enterprise-shared/` | S3 (SeaweedFS) | Yes — all nodes read from the same bucket |
+| `enterprise-local/` | Local filesystem | No — each node holds a replica, files are fetched peer-to-peer |

@@ -194,6 +194,25 @@ type Metrics struct {
 	// this counter is the only place the condition is aggregated.
 	storageInvalidPathQuarantinedTotal atomic.Int64
 
+	// clusterLocalDeletePending is the number of manifest deletes a
+	// per-node-storage cluster node has been told about and has not yet
+	// unlinked locally. A gauge: it should return to zero within a grace
+	// period of every burst; a value that keeps climbing means the delete
+	// workers cannot keep up with retention or a compaction backlog.
+	clusterLocalDeletePending atomic.Int64
+
+	// compactionManifestsParkedUnparseableTotal counts crash-recovery
+	// manifests recovery parked because their body did not decode (#926): a
+	// zero-length file left by a crash before the rename was durable, or
+	// garbage. Parking removes the manifest from the recovery work set so it
+	// stops holding back every candidate on the node, which means compaction
+	// resumes and the "failed" cycle disappears; this counter is the only
+	// aggregated signal that the partition the parked path names (tier,
+	// database and job are in the file name) may hold a short _compacted
+	// output or both an output and its inputs. Counted only after the parked
+	// copy and the delete both landed, never on entry.
+	compactionManifestsParkedUnparseableTotal atomic.Int64
+
 	// storageUnaddressableFiles is how many data files the MOST RECENT backup
 	// found in source storage that no listing returns, so nothing could copy
 	// them (#756).
@@ -496,6 +515,18 @@ func (m *Metrics) IncClusterManifestRejectedPaths() { m.clusterManifestRejectedP
 // to counting it here is a loop that retries the same key forever.
 func (m *Metrics) IncStorageInvalidPathQuarantined() { m.storageInvalidPathQuarantinedTotal.Add(1) }
 
+// SetClusterLocalDeletePending publishes how many manifest deletes are still
+// waiting for a local unlink on this node.
+func (m *Metrics) SetClusterLocalDeletePending(n int64) { m.clusterLocalDeletePending.Store(n) }
+
+// IncCompactionManifestParkedUnparseable records one crash-recovery manifest
+// parked because its body could not be decoded (#926). Call it after the
+// park succeeded; a park that fails transiently is retried next cycle and
+// must not be reported as a drop from the work set that did not happen.
+func (m *Metrics) IncCompactionManifestParkedUnparseable() {
+	m.compactionManifestsParkedUnparseableTotal.Add(1)
+}
+
 // SetStorageUnaddressableFiles records how many data files the backup that just
 // ran could not copy because no listing returns them (#756). Called on every
 // backup including with 0, so fixing the files clears the gauge.
@@ -694,7 +725,10 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		// Cluster FSM security (Enterprise)
 		"cluster_manifest_rejected_paths_total":  m.clusterManifestRejectedPathsTotal.Load(),
 		"storage_invalid_path_quarantined_total": m.storageInvalidPathQuarantinedTotal.Load(),
-		"storage_unaddressable_files":            m.storageUnaddressableFiles.Load(),
+		// Cluster local delete workers (per-node storage with replication)
+		"cluster_local_delete_pending":                  m.clusterLocalDeletePending.Load(),
+		"compaction_manifests_parked_unparseable_total": m.compactionManifestsParkedUnparseableTotal.Load(),
+		"storage_unaddressable_files":                   m.storageUnaddressableFiles.Load(),
 
 		// Cluster Auth (Enterprise, Phase A)
 		"cluster_heartbeats_unknown_node_total": m.clusterHeartbeatsUnknownNodeTotal.Load(),
@@ -1078,6 +1112,14 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_storage_invalid_path_quarantined_total Total entries dropped from a cleanup, reconciliation or replication work set because a storage key was permanently unusable. Non-zero growth means a stored key (compaction manifest, cluster manifest entry, edge-sync ledger row) names something no storage backend can address; the entry is no longer retried and needs operator action.\n"...)
 	b = append(b, "# TYPE arc_storage_invalid_path_quarantined_total counter\n"...)
 	b = appendMetric(b, "arc_storage_invalid_path_quarantined_total", float64(m.storageInvalidPathQuarantinedTotal.Load()))
+
+	b = append(b, "# HELP arc_cluster_local_delete_pending Manifest deletes this per-node-storage cluster node has been told about and has not yet unlinked locally. Returns to zero within a grace period of every burst; a value that keeps climbing means the delete workers cannot keep up with retention or a compaction backlog.\n"...)
+	b = append(b, "# TYPE arc_cluster_local_delete_pending gauge\n"...)
+	b = appendMetric(b, "arc_cluster_local_delete_pending", float64(m.clusterLocalDeletePending.Load()))
+
+	b = append(b, "# HELP arc_compaction_manifests_parked_unparseable_total Total compaction crash-recovery manifests parked under the .quarantined suffix because their body could not be decoded. Growth means a manifest stopped blocking compaction without being completed; the parked file name gives the tier, database and job, and that partition should be checked for a zero-length _compacted output or for duplicate rows.\n"...)
+	b = append(b, "# TYPE arc_compaction_manifests_parked_unparseable_total counter\n"...)
+	b = appendMetric(b, "arc_compaction_manifests_parked_unparseable_total", float64(m.compactionManifestsParkedUnparseableTotal.Load()))
 
 	b = append(b, "# HELP arc_storage_unaddressable_files Data files the most recent backup found in source storage that no listing returns, so they could not be copied. Non-zero means that backup is incomplete: the files exist and the query path still serves them, but their key does not conform to the storage key rules and no backend method can address one. Rename them and the next backup clears this.\n"...)
 	b = append(b, "# TYPE arc_storage_unaddressable_files gauge\n"...)

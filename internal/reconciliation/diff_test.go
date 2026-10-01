@@ -16,7 +16,7 @@ func TestComputeDiff_Clean(t *testing.T) {
 		{path: "db/m/2026/04/27/12/a.parquet", lastModified: now.Add(-2 * time.Hour)},
 		{path: "db/m/2026/04/27/12/b.parquet", lastModified: now.Add(-2 * time.Hour)},
 	}
-	d := computeDiff(manifest, storage, now, 24*time.Hour)
+	d := computeDiff(manifest, storage, now, 24*time.Hour, "", false)
 	if len(d.orphanManifest) != 0 || len(d.orphanStorage) != 0 || d.skippedGraceCount != 0 {
 		t.Fatalf("expected clean diff, got: %+v", d)
 	}
@@ -32,7 +32,7 @@ func TestComputeDiff_OrphanManifestOnly(t *testing.T) {
 	storage := []objectRecord{
 		{path: "db/m/a.parquet", lastModified: now.Add(-2 * time.Hour)},
 	}
-	d := computeDiff(manifest, storage, now, 24*time.Hour)
+	d := computeDiff(manifest, storage, now, 24*time.Hour, "", false)
 	if len(d.orphanManifest) != 1 || d.orphanManifest[0] != "db/m/b.parquet" {
 		t.Fatalf("expected one orphan-manifest, got: %+v", d.orphanManifest)
 	}
@@ -50,7 +50,7 @@ func TestComputeDiff_OrphanStorageOnly(t *testing.T) {
 		{path: "db/m/a.parquet", lastModified: now.Add(-2 * time.Hour)},
 		{path: "db/m/orphan.parquet", lastModified: now.Add(-48 * time.Hour)}, // old, eligible
 	}
-	d := computeDiff(manifest, storage, now, 24*time.Hour)
+	d := computeDiff(manifest, storage, now, 24*time.Hour, "", false)
 	if len(d.orphanManifest) != 0 {
 		t.Fatalf("expected zero orphan-manifest, got: %+v", d.orphanManifest)
 	}
@@ -68,7 +68,7 @@ func TestComputeDiff_GraceWindowProtectsYoungFiles(t *testing.T) {
 		// Old: 25h old, grace is 24h → eligible
 		{path: "db/m/old.parquet", lastModified: now.Add(-25 * time.Hour)},
 	}
-	d := computeDiff(manifest, storage, now, 24*time.Hour)
+	d := computeDiff(manifest, storage, now, 24*time.Hour, "", false)
 	if d.skippedGraceCount != 1 {
 		t.Fatalf("expected 1 skipped, got %d", d.skippedGraceCount)
 	}
@@ -87,7 +87,7 @@ func TestComputeDiff_ZeroMtimeTreatedAsYoung(t *testing.T) {
 	storage := []objectRecord{
 		{path: "db/m/no-mtime.parquet"}, // zero LastModified
 	}
-	d := computeDiff(manifest, storage, now, 24*time.Hour)
+	d := computeDiff(manifest, storage, now, 24*time.Hour, "", false)
 	if len(d.orphanStorage) != 0 {
 		t.Fatalf("zero-mtime files must be protected, got orphans: %+v", d.orphanStorage)
 	}
@@ -109,7 +109,7 @@ func TestComputeDiff_BothKindsMixed(t *testing.T) {
 		{path: "db/m/orphan.parquet", lastModified: now.Add(-48 * time.Hour)},  // missing from manifest
 		{path: "db/m/young.parquet", lastModified: now.Add(-30 * time.Minute)}, // grace skip
 	}
-	d := computeDiff(manifest, storage, now, 24*time.Hour)
+	d := computeDiff(manifest, storage, now, 24*time.Hour, "", false)
 	if len(d.orphanManifest) != 1 || d.orphanManifest[0] != "db/m/b.parquet" {
 		t.Fatalf("expected b.parquet as orphan-manifest, got: %+v", d.orphanManifest)
 	}
@@ -131,17 +131,17 @@ func TestComputeDiff_ClockSkewAdded(t *testing.T) {
 		{path: "db/m/edge.parquet", lastModified: now.Add(-(24*time.Hour + 30*time.Minute))},
 	}
 	// Grace alone: 24h → eligible
-	d1 := computeDiff(manifest, storage, now, 24*time.Hour)
+	d1 := computeDiff(manifest, storage, now, 24*time.Hour, "", false)
 	if len(d1.orphanStorage) != 1 {
 		t.Fatalf("with grace=24h, file should be eligible, got: %+v", d1.orphanStorage)
 	}
 	// Grace + 5m skew: 24h5m → still eligible (file is 24h30m old)
-	d2 := computeDiff(manifest, storage, now, 24*time.Hour+5*time.Minute)
+	d2 := computeDiff(manifest, storage, now, 24*time.Hour+5*time.Minute, "", false)
 	if len(d2.orphanStorage) != 1 {
 		t.Fatalf("file is older than grace+skew, should be eligible, got: %+v", d2.orphanStorage)
 	}
 	// Grace + 1h: file is 24h30m old, grace+skew is 25h → NOT eligible
-	d3 := computeDiff(manifest, storage, now, 25*time.Hour)
+	d3 := computeDiff(manifest, storage, now, 25*time.Hour, "", false)
 	if len(d3.orphanStorage) != 0 || d3.skippedGraceCount != 1 {
 		t.Fatalf("grace+skew=25h should protect 24h30m file, got: %+v", d3)
 	}
@@ -187,7 +187,7 @@ func TestComputeDiff_OrphanManifestStable(t *testing.T) {
 	storage := []objectRecord{
 		// nothing in storage — all manifest entries are orphans
 	}
-	d := computeDiff(manifest, storage, now, 24*time.Hour)
+	d := computeDiff(manifest, storage, now, 24*time.Hour, "", false)
 	got := append([]string{}, d.orphanManifest...)
 	sort.Strings(got)
 	want := []string{"db/m/a.parquet", "db/m/b.parquet", "db/m/c.parquet"}

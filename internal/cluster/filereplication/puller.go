@@ -98,11 +98,24 @@ type pullRequest struct {
 
 // Config bundles the puller's dependencies and tunables.
 type Config struct {
-	// SelfNodeID is the ID of the local node. Files whose OriginNodeID matches
-	// are skipped (the origin already has the bytes).
+	// SelfNodeID is the ID of the local node. A reactive Enqueue of a file
+	// whose OriginNodeID matches is skipped: this node just wrote it. The
+	// catch-up and reconciliation walks skip such a file only when it is
+	// present on disk (see RepullMissingSelfOrigin), or always when that is
+	// off.
 	SelfNodeID string
 
-	// Backend is the local storage backend. The puller calls Exists to skip
+	// RepullMissingSelfOrigin makes the walks check a self-origin entry on
+	// disk instead of assuming this node still holds what it once wrote,
+	// and pull it from a peer's replica when it is missing or short. On per-
+	// node storage a node restored with an empty data disk otherwise pulls
+	// every other node's files back and never its own (#959). Off for shared
+	// backends: a missing own object there is not on any peer either, and
+	// the check would be one HEAD per own entry per walk.
+	RepullMissingSelfOrigin bool
+
+	// Backend is the local storage backend. The puller calls StatFile (and,
+	// on a backend that stages writes, StagedSize and Exists) to skip
 	// already-local files and WriteReader to stream pulled bytes onto disk.
 	Backend storage.Backend
 
@@ -237,12 +250,12 @@ type Puller struct {
 	catchupCompletedAt   atomic.Int64 // unix seconds; 0 if still running or never ran
 	catchupEntriesWalked atomic.Int64 // entries the walker iterated
 	catchupEnqueued      atomic.Int64 // entries successfully enqueued by the walker
-	// catchupSkippedLocal counts entries the walker chose NOT to enqueue
-	// because Enqueue already had a reason to skip — either origin==self
-	// (totalSkippedSelf bump) or the path was already in-flight via a
-	// reactive callback (totalSkippedDup bump). It does NOT include entries
-	// skipped because backend.Exists(path) was already true — that check
-	// happens downstream inside processEntry and is tracked by the global
+	// catchupSkippedLocal counts entries the walker chose NOT to enqueue:
+	// a self-origin entry (totalSkippedSelf bump — present on disk when
+	// RepullMissingSelfOrigin is on, always otherwise) or a path already
+	// in-flight via a reactive callback (totalSkippedDup bump). A foreign
+	// entry that turns out to be present is not counted here — the worker's
+	// pre-pull check inside processEntry finds it and bumps the global
 	// totalSkippedLocal counter.
 	catchupSkippedLocal atomic.Int64
 
@@ -805,9 +818,10 @@ func (p *Puller) Stop() {
 
 // Enqueue submits a file entry for pulling. Non-blocking: if the queue is
 // full, the entry is dropped and totalDropped is incremented. If origin is
-// self, the file already exists locally, or the same path is already
+// self (this node just wrote the file), or the same path is already
 // enqueued / in-flight (via the inflight set), the entry is counted as a
-// skip and never reaches a worker.
+// skip and never reaches a worker; a file already present on disk is
+// skipped by the worker's own check.
 //
 // Enqueue is safe to call from the Raft FSM apply callback (which must
 // return quickly): all checks here are O(1) and no I/O happens inline. It
@@ -817,12 +831,69 @@ func (p *Puller) Enqueue(entry *raft.FileEntry) {
 	p.enqueue(entry, enqueueSourceReactive)
 }
 
+// statLocal sizes the local copy of a path. The timeout bounds a backend
+// whose StatFile honours the context (an object store HEAD); the calls a
+// staging backend adds below are local stats that ignore it, and a hung local
+// disk stalls this the way it stalls every other local I/O. The one presence
+// rule the worker's pre-pull check and the walks' self-origin check share is
+// presentAtSize.
+func (p *Puller) statLocal(path string) (int64, error) {
+	parent := p.ctx
+	if parent == nil { // not started: tests, or a walk driven by hand
+		parent = context.Background()
+	}
+	statCtx, cancel := context.WithTimeout(parent, 5*time.Second)
+	defer cancel()
+	size, err := p.cfg.Backend.StatFile(statCtx, path)
+	if err != nil || size < 0 {
+		return size, err
+	}
+	// LocalBackend.StatFile falls back to the ".part" staging file when the
+	// final file is absent (the resume path wants that). Presence must not:
+	// a full-size .part left by a crash before the rename would read as
+	// "already here" and never be finalised (#963). Where a staged partial
+	// exists, confirm the final file too; without it the answer is "not
+	// here", so the entry is pulled again. Backends that do not stage (S3,
+	// Azure) fail the assertion, and for them StatFile's answer is final.
+	if si, ok := p.cfg.Backend.(storage.StagingInspector); ok {
+		staged, err := si.StagedSize(statCtx, path)
+		if err != nil {
+			return -1, err
+		}
+		if staged >= 0 {
+			exists, err := p.cfg.Backend.Exists(statCtx, path)
+			if err != nil {
+				return -1, err
+			}
+			if !exists {
+				p.logger.Debug().
+					Str("path", path).
+					Int64("staged_bytes", staged).
+					Msg("Staging file present without its final file; treating the path as absent so it is pulled again")
+				return -1, nil
+			}
+		}
+	}
+	return size, nil
+}
+
+// presentAtSize is the puller's definition of "already here": the stat
+// succeeded and the size is exactly the manifest's. Not found, short (a
+// partial), longer, or any stat error all mean the file must be pulled.
+func presentAtSize(localSize int64, statErr error, want int64) bool {
+	return statErr == nil && localSize == want
+}
+
 func (p *Puller) enqueue(entry *raft.FileEntry, source enqueueSource) enqueueResult {
 	if entry == nil {
 		return enqueueResultInvalid
 	}
-	// Fast-path: if origin is self there's nothing to pull.
-	if entry.OriginNodeID == p.cfg.SelfNodeID {
+	// Fast-path: a reactive register of a self-origin file means this node
+	// just wrote it; nothing to pull. The walks reach here for a self-origin
+	// entry only after checking the disk (RepullMissingSelfOrigin), so the
+	// fast path must not stop them — unless the re-pull is off, in which
+	// case self-origin is never pulled, as before.
+	if entry.OriginNodeID == p.cfg.SelfNodeID && (source == enqueueSourceReactive || !p.cfg.RepullMissingSelfOrigin) {
 		p.totalSkippedSelf.Add(1)
 		return enqueueResultSkippedSelf
 	}
@@ -1069,8 +1140,9 @@ func (p *Puller) worker(id int) {
 }
 
 // processEntry pulls a single file with bounded retries. Each retry re-checks
-// backend.Exists (in case a concurrent worker or external process put the
-// file in place) and re-resolves the peer list (in case of topology change).
+// local presence via statLocal (in case a concurrent worker or external
+// process put the file in place) and re-resolves the peer list (in case of
+// topology change).
 // Within a single attempt, the resolver returns an ordered list of candidate
 // peers and we fall through to the next candidate on any per-peer failure
 // EXCEPT checksum mismatch — a corrupt body from one peer is a real data
@@ -1123,10 +1195,8 @@ func (p *Puller) processEntry(log zerolog.Logger, request *pullRequest) {
 		// Pre-pull check: skip only if the file is fully present locally
 		// (size matches the manifest). A partial file (size < SizeBytes) should
 		// fall through so pullOnce can resume from the byte offset.
-		statCtx, statCancel := context.WithTimeout(p.ctx, 5*time.Second)
-		localSize, statErr := p.cfg.Backend.StatFile(statCtx, entry.Path)
-		statCancel()
-		if statErr == nil && localSize == entry.SizeBytes {
+		localSize, statErr := p.statLocal(entry.Path)
+		if presentAtSize(localSize, statErr, entry.SizeBytes) {
 			p.totalSkippedLocal.Add(1)
 			succeeded = true // File is already here — same as a fresh pull from the gate's perspective.
 			return

@@ -14,6 +14,7 @@ import (
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
+	"github.com/basekick-labs/arc/internal/fieldschema"
 	"github.com/basekick-labs/arc/internal/ingest"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -45,6 +46,7 @@ type ContinuousQueryHandler struct {
 	db          *database.DuckDB
 	storage     storage.Backend
 	arrowBuffer *ingest.ArrowBuffer
+	fieldSchema *fieldschema.Registry // optional, #914
 	config      *config.ContinuousQueryConfig
 	sqliteDB    *sql.DB
 	// ownsDB records whether this handler opened sqliteDB itself. When CQ
@@ -786,6 +788,9 @@ func wrapSourceMeasurement(query, database, measurement, readParquetExpr string)
 // same window produce identical (tags, time) rows that dedup at compaction (#521).
 // The window's end time is intentionally unused here: output rows are labelled by
 // the window START (bucket-start convention), so only startTime is needed.
+// SetFieldSchema installs the field schema registry (#914).
+func (h *ContinuousQueryHandler) SetFieldSchema(r *fieldschema.Registry) { h.fieldSchema = r }
+
 func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *ContinuousQuery, query string, startTime, _ time.Time) (int64, error) {
 	// Build storage path for source measurement (supports local, S3, Azure)
 	measurementPath, err := storage.GetStoragePath(h.storage, cq.Database, cq.SourceMeasurement)
@@ -805,6 +810,14 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 		// Escape single quotes: DuckDB read_parquet() paths cannot be
 		// parameterized, so the path is interpolated into a SQL string literal.
 		readParquetExpr := fmt.Sprintf("read_parquet('%s', union_by_name=true)", sqlutil.EscapeStringLiteral(measurementPath))
+		// A continuous query reads a narrow, recent window: exactly the
+		// range in which a field absent from the newest files fails to
+		// bind. List the measurement's schema anchor first (#914).
+		if h.fieldSchema != nil {
+			if anchor, ok := h.fieldSchema.Resolve(ctx, cq.Database, cq.SourceMeasurement); ok {
+				readParquetExpr = fmt.Sprintf("read_parquet(['%s', '%s'], union_by_name=true)", sqlutil.EscapeStringLiteral(anchor), sqlutil.EscapeStringLiteral(measurementPath))
+			}
+		}
 		wrappedQuery = wrapSourceMeasurement(query, cq.Database, cq.SourceMeasurement, readParquetExpr)
 	}
 

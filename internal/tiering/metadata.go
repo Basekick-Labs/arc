@@ -172,6 +172,53 @@ func (s *MetadataStore) RecordFile(ctx context.Context, file *FileMetadata) erro
 	return nil
 }
 
+// sqliteTimestampLayout is the text form CURRENT_TIMESTAMP writes. migrated_at
+// is compared and ordered as text, so a Go-side stamp must use the same
+// layout or the two formats sort against each other ('T' vs ' ').
+const sqliteTimestampLayout = "2006-01-02 15:04:05"
+
+// RecordColdFile records a file that is present in cold storage, as found by
+// the cold-tier metadata sync. Unlike RecordFile it stamps migrated_at from
+// the cold object's own timestamp rather than now: the sync discovers moves
+// after the fact, on every node, and orphan reconciliation walks every row
+// migrated in the last 48 hours with one HEAD each — stamping now on a
+// fresh node would make it HEAD the whole cold tier for two cycles. A
+// same-tier conflict keeps the row's migrated_at.
+func (s *MetadataStore) RecordColdFile(ctx context.Context, file *FileMetadata, migratedAt time.Time) error {
+	if migratedAt.IsZero() {
+		migratedAt = time.Now()
+	}
+	createdAt := file.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = migratedAt
+	}
+
+	query := `
+		INSERT INTO tier_files (path, database, measurement, partition_time, tier, size_bytes, created_at, migrated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(path) DO UPDATE SET
+			tier = excluded.tier,
+			size_bytes = excluded.size_bytes,
+			migrated_at = CASE WHEN tier_files.tier != excluded.tier THEN excluded.migrated_at ELSE tier_files.migrated_at END
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		file.Path,
+		file.Database,
+		file.Measurement,
+		file.PartitionTime.UTC(),
+		string(TierCold),
+		file.SizeBytes,
+		createdAt.UTC(),
+		migratedAt.UTC().Format(sqliteTimestampLayout),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to record cold file: %w", err)
+	}
+
+	s.invalidateTierCache(file.Database, file.Measurement)
+	return nil
+}
+
 // GetFile retrieves file metadata by path
 func (s *MetadataStore) GetFile(ctx context.Context, path string) (*FileMetadata, error) {
 	query := `
@@ -431,6 +478,24 @@ func (s *MetadataStore) DeleteFile(ctx context.Context, path string) error {
 	}
 
 	return nil
+}
+
+// DeleteFileInTier removes a file's row only if it is still in the given
+// tier, so a decision taken from a tier listing cannot delete a row that
+// changed tier meanwhile. Reports whether a row was removed.
+func (s *MetadataStore) DeleteFileInTier(ctx context.Context, path string, tier Tier) (bool, error) {
+	var database, measurement string
+	_ = s.db.QueryRowContext(ctx, `SELECT database, measurement FROM tier_files WHERE path = ? AND tier = ?`, path, string(tier)).Scan(&database, &measurement)
+
+	res, err := s.db.ExecContext(ctx, `DELETE FROM tier_files WHERE path = ? AND tier = ?`, path, string(tier))
+	if err != nil {
+		return false, fmt.Errorf("failed to delete file: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n > 0 && database != "" && measurement != "" {
+		s.invalidateTierCache(database, measurement)
+	}
+	return n > 0, nil
 }
 
 // QuarantineFile marks a file index row as one tiering must never act on

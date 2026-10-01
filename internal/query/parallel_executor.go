@@ -73,11 +73,17 @@ func (e *ParallelExecutor) ShouldUseParallel(partitionCount int) bool {
 //
 // Returns merged sql.Rows from all partitions. The caller is responsible for closing
 // all returned rows.
+//
+// anchorPath, when non-empty, is listed before every partition path so each
+// per-partition scan binds the measurement's full registered field schema
+// (#914); it also makes every partition's column set identical, which the
+// merge below requires.
 func (e *ParallelExecutor) ExecutePartitioned(
 	ctx context.Context,
 	paths []string,
 	queryTemplate string,
 	readParquetOptions string,
+	anchorPath string,
 ) ([]*PartitionResult, error) {
 	if len(paths) == 0 {
 		return nil, fmt.Errorf("no partition paths provided")
@@ -136,7 +142,7 @@ LaunchLoop:
 			}
 
 			// Build partition-specific query
-			partitionSQL := e.buildPartitionQuery(queryTemplate, partitionPath, readParquetOptions)
+			partitionSQL := e.buildPartitionQuery(queryTemplate, partitionPath, readParquetOptions, anchorPath)
 
 			// Execute query
 			rows, err := e.db.QueryContext(ctx, partitionSQL)
@@ -193,11 +199,14 @@ LaunchLoop:
 }
 
 // buildPartitionQuery builds a query for a single partition.
-func (e *ParallelExecutor) buildPartitionQuery(template, path, options string) string {
+func (e *ParallelExecutor) buildPartitionQuery(template, path, options, anchorPath string) string {
 	// Build read_parquet expression for this partition. Escape single quotes:
 	// DuckDB read_parquet() paths cannot be parameterized, so the path is
 	// interpolated into a SQL string literal. (options is program-built.)
 	readParquet := fmt.Sprintf("read_parquet(%s, %s)", sqlutil.QuoteStringLiteral(path), options)
+	if anchorPath != "" {
+		readParquet = fmt.Sprintf("read_parquet([%s, %s], %s)", sqlutil.QuoteStringLiteral(anchorPath), sqlutil.QuoteStringLiteral(path), options)
+	}
 
 	// Replace placeholder in template
 	return strings.Replace(template, "{PARTITION_PATH}", readParquet, 1)
