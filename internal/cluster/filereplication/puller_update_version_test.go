@@ -123,8 +123,8 @@ func TestPullerUpdatedVersionIsNotLostIssue798(t *testing.T) {
 	}
 
 	// Same path, new manifest version, different checksum, same size.
-	// The original code discards this callback as a duplicate.
-	p.Enqueue(&newEntry)
+	// The FSM content-change callback forces this refresh.
+	p.EnqueueContentChanged(&newEntry)
 	releaseFirst()
 
 	stats := waitStats(t, p, func(s map[string]int64) bool {
@@ -202,7 +202,7 @@ func TestPullerSequentialSameSizeUpdateIssue798(t *testing.T) {
 		t.Fatalf("initial pull did not finish: %v", first)
 	}
 
-	p.Enqueue(&newEntry)
+	p.EnqueueContentChanged(&newEntry)
 
 	last := waitStats(t, p, func(s map[string]int64) bool {
 		return s["pulled"] == 2 && s["inflight_count"] == 0
@@ -298,7 +298,7 @@ func TestPullerFailedRefreshRetriesSameVersionIssue798(t *testing.T) {
 		t.Fatalf("initial version did not finish: %v", first)
 	}
 
-	p.Enqueue(&newEntry)
+	p.EnqueueContentChanged(&newEntry)
 
 	failed := waitStats(t, p, func(s map[string]int64) bool {
 		return s["failed"] == 1 && s["inflight_count"] == 0
@@ -337,9 +337,9 @@ func TestPullerFailedRefreshRetriesSameVersionIssue798(t *testing.T) {
 	}
 }
 
-// Observed versions should not remain in memory after their manifest entry
-// is deleted. A subsequent registration starts a fresh lifecycle.
-func TestPullerManifestDeleteClearsObservedVersionIssue798(t *testing.T) {
+// Only failed or dropped forced refreshes retain bounded state, and deletion
+// clears that state. A completed pull retains no per-manifest copy.
+func TestPullerManifestDeleteClearsRefreshPendingIssue798(t *testing.T) {
 	const path = "db/cpu/2026/09/19/01/deleted-rewrite.parquet"
 
 	body := []byte("initial-file")
@@ -370,21 +370,20 @@ func TestPullerManifestDeleteClearsObservedVersionIssue798(t *testing.T) {
 	}
 
 	p.inflightMu.Lock()
-	_, existedBefore := p.observed[path]
+	_, existedBefore := p.refreshPending[path]
 	p.inflightMu.Unlock()
-
-	if !existedBefore {
-		t.Fatal("completed manifest version was not recorded")
+	if existedBefore {
+		t.Fatal("completed refresh left pending state")
 	}
 
 	p.OnManifestDelete(path)
 
 	p.inflightMu.Lock()
-	_, existsAfter := p.observed[path]
+	_, existsAfter := p.refreshPending[path]
 	p.inflightMu.Unlock()
 
 	if existsAfter {
-		t.Fatal("deleted manifest entry leaked observed-version state")
+		t.Fatal("deleted manifest entry leaked refresh-pending state")
 	}
 }
 
@@ -447,7 +446,7 @@ func TestPullerSupersededCatchUpClearsTagIssue798(t *testing.T) {
 	p.catchupCompletedAt.Store(time.Now().Unix())
 
 	// A newer reconciliation version takes over the existing slot.
-	if result := p.enqueue(&newEntry, enqueueSourceReconciliation); result != enqueueResultEnqueued {
+	if result := p.enqueue(&newEntry, enqueueSourceReconciliation, true); result != enqueueResultEnqueued {
 		t.Fatalf("superseding enqueue result: %v", result)
 	}
 

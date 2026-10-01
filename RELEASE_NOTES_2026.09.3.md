@@ -4,6 +4,18 @@
 
 ## Bug fixes
 
+### A reader could serve old bytes after an in-place rewrite during an active pull ([#798](https://github.com/Basekick-Labs/arc/issues/798))
+
+An in-place rewrite through the delete API could update the manifest while a
+reader was still pulling the previous version. The reader now checks the
+current manifest version before each attempt and hands the in-flight slot to
+the newest content version, so it does not retry or count a superseded pull as
+a failure. Same-size content changes are signalled by SHA-256/size changes;
+same-size stale copies installed by a Raft snapshot remain outside this fix
+because snapshot restore fires no file callbacks.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#907](https://github.com/Basekick-Labs/arc/pull/907).
+
 ### A pull that crashed one step before the rename left a file that read as present and was never finalised ([#963](https://github.com/Basekick-Labs/arc/issues/963))
 
 On a per-node-storage cluster, the file puller writes each incoming file to a
