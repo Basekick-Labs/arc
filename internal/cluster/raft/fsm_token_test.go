@@ -194,6 +194,9 @@ func TestApplyCreateToken_RejectsDuplicateName(t *testing.T) {
 	if fsm.TokenCount() != 1 {
 		t.Errorf("duplicate must not land: count=%d", fsm.TokenCount())
 	}
+	if fsm.RejectedTokensCount() != 0 {
+		t.Errorf("same-name conflict should not count as a malformed rejection: count=%d", fsm.RejectedTokensCount())
+	}
 }
 
 func TestApplyCreateToken_IgnoresIdenticalDuplicate(t *testing.T) {
