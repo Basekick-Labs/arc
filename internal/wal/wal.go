@@ -605,7 +605,7 @@ func (w *Writer) writeEntry(entry walEntry) error {
 	atomic.AddInt64(&w.TotalBytes, bytesWritten)
 
 	if entry.durable {
-		if err := w.currentFile.Sync(); err != nil {
+		if err := dataSync(w.currentFile); err != nil {
 			w.logger.Error().Err(err).Msg("WAL checkpoint sync failed")
 			return err
 		}
