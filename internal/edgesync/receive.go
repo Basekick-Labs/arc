@@ -530,6 +530,11 @@ func (r *Receiver) staging() storage.StagingInspector {
 // staging file intact, instead of promoting a truncated file.
 var errShortBody = errors.New("edgesync: body ended before the declared size")
 
+// ErrUnsafeReadPath marks a name refused because it would change which bytes a
+// reader returns, or what they contain. Wrapped by validateReadPathSafe so a
+// caller can tell this class apart from the layout and length rules.
+var ErrUnsafeReadPath = errors.New("edgesync: unsafe read path component")
+
 type shortBodyGuard struct {
 	r        io.Reader
 	expected int64
@@ -657,6 +662,39 @@ const MaxSpokeIDLen = 128
 // outside its own namespace — defeating §6.3 even though the ID is
 // HMAC-bound, because the binding proves WHO is asking, not WHERE they may
 // write.
+// validateReadPathSafe refuses one path component that would change which
+// bytes a DuckDB read returns, or what they contain.
+//
+// Both rules exist because a spoke ID is the first path segment of everything
+// that spoke writes into the hub's storage root and a sync path supplies the
+// rest, so these components are long-lived directory names. Refusing them at
+// admission is cheaper than guarding every present and future reader: see
+// #994, and #1005 for the read-side half that is still open.
+//
+// Glob metacharacters make the path a PATTERN rather than a name — a literal
+// ".../db[1]/f.parquet" returns the rows of a sibling "db1/" directory, and
+// silently falls back to the literal when no sibling exists, so there is no
+// error signal either way.
+//
+// "=" is a separate mechanism: DuckDB infers a Hive partition column from a
+// "key=value" DIRECTORY component, and when that name collides with a real
+// column the path's value silently replaces the stored one and its type.
+// Applied per component rather than per directory, which also refuses "=" in
+// a final filename where Hive inference does NOT apply. That over-breadth is
+// deliberate — the filename is not special enough to justify a second rule,
+// Arc never generates one containing "=", and other engines differ — so the
+// message below says what the character does to a path, not what DuckDB would
+// have done with this particular segment.
+func validateReadPathSafe(component string) error {
+	if strings.ContainsRune(component, '=') {
+		return fmt.Errorf("%w: contains '=', which a reader can treat as a Hive partition key", ErrUnsafeReadPath)
+	}
+	if err := storage.ValidateGlobSafe(component); err != nil {
+		return fmt.Errorf("%w: %w", ErrUnsafeReadPath, err)
+	}
+	return nil
+}
+
 func validateSpokeID(spokeID string) error {
 	if spokeID == "" {
 		return errors.New("edgesync: spoke ID is required")
@@ -667,11 +705,8 @@ func validateSpokeID(spokeID string) error {
 	if strings.ContainsRune(spokeID, ':') {
 		return fmt.Errorf("edgesync: spoke ID %q contains a colon, which the cluster manifest path validator refuses", spokeID)
 	}
-	if strings.ContainsRune(spokeID, '=') {
-		return fmt.Errorf("edgesync: spoke ID %q contains '=', which DuckDB treats as a Hive partition", spokeID)
-	}
-	if err := storage.ValidateGlobSafe(spokeID); err != nil {
-		return fmt.Errorf("edgesync: spoke ID %q is not glob-safe: %w", spokeID, err)
+	if err := validateReadPathSafe(spokeID); err != nil {
+		return fmt.Errorf("edgesync: spoke ID %q: %w", spokeID, err)
 	}
 	if spokeID == "." || spokeID == ".." || strings.HasPrefix(spokeID, ".") {
 		return fmt.Errorf("edgesync: spoke ID %q may not start with a dot", spokeID)
@@ -758,11 +793,8 @@ func validateSyncPathWithMaxLen(p string, maxPathLen int) error {
 		if seg == "" {
 			return fmt.Errorf("edgesync: path %q contains an empty segment", p)
 		}
-		if strings.ContainsRune(seg, '=') {
-			return fmt.Errorf("edgesync: path %q contains '=', which DuckDB treats as a Hive partition", p)
-		}
-		if err := storage.ValidateGlobSafe(seg); err != nil {
-			return fmt.Errorf("edgesync: path %q is not glob-safe: %w", p, err)
+		if err := validateReadPathSafe(seg); err != nil {
+			return fmt.Errorf("edgesync: path %q: %w", p, err)
 		}
 		// Checked per segment, not on the whole string. "db/./cpu/x.parquet"
 		// used to pass: path.Join cleans it before storage, but Measurement is

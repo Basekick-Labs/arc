@@ -361,7 +361,13 @@ func TestReceiver_RejectsMaliciousPaths(t *testing.T) {
 		{"dot prefix", ".sync-staging/rocket-02/f.parquet"},
 		{"empty segment", "metrics//f.parquet"},
 		{"glob wildcard", "metrics/cpu[1]/f.parquet"},
+		{"glob single char", "metrics/cpu?/f.parquet"},
+		{"glob recursive segment", "metrics/**/f.parquet"},
 		{"hive partition", "metrics/host=hub01/f.parquet"},
+		// Hive inference needs a DIRECTORY component, so this filename is not
+		// actually misread — refused anyway, deliberately. See
+		// validateReadPathSafe.
+		{"equals in filename", "metrics/cpu/host=weird.parquet"},
 		{"not parquet", "metrics/cpu/evil.sh"},
 	}
 
@@ -401,7 +407,10 @@ func TestReceiver_RejectsMaliciousSpokeIDs(t *testing.T) {
 		{"leading space", " rocket_01"},
 		{"control character", "rocket\n01"},
 		{"glob wildcard", "rocket*01"},
+		{"glob single char", "rocket?1"},
+		{"glob brace", "rocket{01,02}"},
 		{"hive partition", "host=hub01"},
+		{"bare equals", "="},
 	}
 
 	for _, tt := range ids {
@@ -1137,5 +1146,36 @@ func TestSpokeNamespacesAreInjective(t *testing.T) {
 		if want := "payload-from-" + id; string(got) != want {
 			t.Errorf("spoke %q reads back %q, so another accepted spoke ID resolves to its namespace", id, got)
 		}
+	}
+}
+
+// TestValidateSyncPath_UnsafeNamesRejectedAtEveryCallSite pins that the two
+// chokepoints carry the read-path rules to the call sites that get them for
+// free, which otherwise have no coverage asserting it: the offline bundle
+// reader (bundle_read.go) and reconciliation (reconcile.go) both go through
+// validateSyncPath / validateSpokeID rather than re-implementing the rules.
+func TestValidateSyncPath_UnsafeNamesRejectedAtEveryCallSite(t *testing.T) {
+	unsafe := []string{
+		"metrics/host=hub01/f.parquet",
+		"metrics/cpu[1]/f.parquet",
+		"metrics/cpu*/f.parquet",
+	}
+	for _, p := range unsafe {
+		if err := validateSyncPath(p); err == nil {
+			t.Errorf("validateSyncPath(%q) accepted an unsafe path", p)
+		} else if !errors.Is(err, ErrUnsafeReadPath) {
+			t.Errorf("validateSyncPath(%q) = %v, want it to wrap ErrUnsafeReadPath", p, err)
+		}
+	}
+	for _, id := range []string{"host=hub01", "rocket*01"} {
+		if err := validateSpokeID(id); err == nil {
+			t.Errorf("validateSpokeID(%q) accepted an unsafe ID", id)
+		} else if !errors.Is(err, ErrUnsafeReadPath) {
+			t.Errorf("validateSpokeID(%q) = %v, want it to wrap ErrUnsafeReadPath", id, err)
+		}
+	}
+	// A path Arc actually generates must still pass.
+	if err := validateSyncPath("testdb/cpu/2026/10/02/18/cpu_20261002_184915_409046821.parquet"); err != nil {
+		t.Errorf("a normal Arc path was rejected: %v", err)
 	}
 }
