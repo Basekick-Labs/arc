@@ -318,6 +318,52 @@ func containsSQLWord(sqlLower, word string) bool {
 	}
 }
 
+// indexSQLTokenStart returns the index of the first occurrence of s in sqlLower
+// whose first byte is NOT preceded by an identifier byte, or -1 if there is
+// none. countSQLTokenStart counts the same occurrences.
+//
+// These exist for the fast paths' `"from "` searches. A plain
+// strings.Index(sqlLower, "from ") has no leading word boundary, while the
+// extractor's patternSimpleTable requires `\bFROM`. A digit before the keyword
+// is an identifier byte, so `\b` declines while strings.Index matches — and
+// DuckDB lexes `1from` as `1` then `FROM`. `SELECT *,1from secret` was
+// therefore invisible to the permission check and a real table to the fast
+// path, which read it with no grant.
+//
+// Only the LEADING boundary is enforced; the caller's own trailing byte (the
+// space in `"from "`) is left alone deliberately, so routing is unchanged for
+// every shape that already worked. A keyword followed by other whitespace
+// simply fails the search and falls to the slow path, whose regexes are
+// boundary-correct.
+func indexSQLTokenStart(sqlLower, s string) int {
+	for pos := 0; ; {
+		idx := strings.Index(sqlLower[pos:], s)
+		if idx < 0 {
+			return -1
+		}
+		idx += pos
+		if idx == 0 || !isIdentChar(sqlLower[idx-1]) {
+			return idx
+		}
+		pos = idx + 1
+	}
+}
+
+func countSQLTokenStart(sqlLower, s string) int {
+	n := 0
+	for pos := 0; ; {
+		idx := strings.Index(sqlLower[pos:], s)
+		if idx < 0 {
+			return n
+		}
+		idx += pos
+		if idx == 0 || !isIdentChar(sqlLower[idx-1]) {
+			n++
+		}
+		pos = idx + 1
+	}
+}
+
 // dotFollows reports whether the first non-blank byte at or after pos is a
 // '.' — the token ending at pos is a qualifier of what follows.
 func dotFollows(s string, pos int) bool {
