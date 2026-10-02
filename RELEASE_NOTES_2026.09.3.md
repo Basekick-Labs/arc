@@ -69,7 +69,78 @@ Erratum: the 26.09.2 notes named the unaddressable-files gauge
 `arc_storage_unaddressable_files`, and it is a gauge; the 26.09.2 notes are
 corrected.
 
+## Security fixes
+
+### RBAC: three normalisation divergences let a query read a measurement the permission check never saw ([GHSA-h3rq-5r29-2wrh](https://github.com/Basekick-Labs/arc/security/advisories/GHSA-h3rq-5r29-2wrh))
+
+Arc decides twice which measurements a query touches. The RBAC extractor
+normalises the SQL and builds the set to authorize; the query rewriter
+normalises it again and decides which names become Parquet paths. The two must
+agree, because a query whose extracted set is empty is authorized outright —
+so any divergence that empties the set is a total bypass rather than a partial
+one.
+
+Three divergences are fixed:
+
+- The CTE pattern has an alternative that matches a comma-separated `name AS (`
+  clause with no `WITH` anchor. The extractor consulted that pattern on every
+  query while the rewriters consulted it only when they found a `WITH` keyword,
+  so one legal clause shape could make a real measurement look virtual to the
+  permission check and real to the rewriter. The `WITH` predicate now lives
+  inside the CTE extractor itself, so all five callers share one expression and
+  the two sides cannot disagree about whether to consult it. This is the fix
+  that matters: the defect was the asymmetry, not a keyword spelling.
+- Three rewriter gates tested for `WITH` followed by a space, while the
+  extractor matches it as a word followed by any whitespace — so a `WITH`
+  clause broken across lines, ordinary formatting for a multi-line query, was
+  read differently by the two sides. Those gates now match `WITH` as a word,
+  via the same helper [#978](https://github.com/Basekick-Labs/arc/issues/978)
+  introduced when it fixed the identical keyword-as-word mistake for `JOIN`. A
+  measurement genuinely named `with_history` is still a measurement.
+- The single-table fast paths located `FROM` without requiring a word boundary
+  before the keyword, while the extractor requires one. They now require the
+  same boundary. A name that merely ends in the keyword was never, and is still
+  not, a table reference.
+
+All three required RBAC to be enabled, a valid read token, and an
+`x-arc-database` header. Without the header the no-header rewriter extracted
+CTE names unconditionally and used only boundary-correct patterns, so it always
+agreed with the extractor. No configuration key gates any of it. Deployments
+with RBAC disabled have no per-measurement authorization to bypass.
+
+A regression suite (`internal/api/rbac_normalisation_parity_test.go`) now
+asserts the invariant directly — that the set the permission check extracts is
+never smaller than the set the executed query reads — across all three
+rewriters, and each fix was verified to be the sole thing keeping its own cases
+passing. See the advisory for the affected shapes and the upgrade guidance.
+
+Found internally while verifying that
+[#827](https://github.com/Basekick-Labs/arc/issues/827) — a different
+case-folding defect in the same seam — was already fixed in 26.09.2. All three
+predate that fix and #978.
+
 ## Bug fixes
+
+### A newline before a table function's parenthesis made the function a measurement
+
+Arc's RBAC extractor and its SQL rewriter each decide independently whether a
+name in table position is a table-valued function call, and they disagreed on
+what counts as whitespace before the parenthesis. The extractor skips a
+table-valued function by looking for the next non-whitespace byte after the name, counting
+space, tab, carriage return and newline; the rewriter's equivalent check
+trimmed only spaces and tabs. So a table function whose opening parenthesis sat
+on the next line was a function to the permission check and a measurement to
+the rewriter, which emitted a `read_parquet` for the function's name.
+
+DuckDB rejects the resulting SQL with a parser error rather than reading
+anything, so this was never a bypass — but it broke legitimate multi-line SQL,
+and the two sides must agree for the authorization set to mean anything. Both
+now use the same whitespace set.
+
+Found while fixing
+[GHSA-h3rq-5r29-2wrh](https://github.com/Basekick-Labs/arc/security/advisories/GHSA-h3rq-5r29-2wrh);
+the two are the same extractor-versus-rewriter seam in two different table
+positions.
 
 ### A comma cross-join `FROM a, b` read only the first measurement ([#978](https://github.com/Basekick-Labs/arc/issues/978))
 
@@ -88,7 +159,7 @@ the FROM-clause walker the replacement-scan validator already used, so a comma
 in a projection, a `GROUP BY`, an `IN` list, a function argument, or DuckDB's
 `FROM t SELECT a, b` form is never mistaken for a table. Three related gaps
 closed with it. The RBAC permission check now sees the comma-continued table,
-so a query is checked against every measurement it reads. The cross-database
+so a comma-continued measurement is no longer read unchecked. The cross-database
 check under an `x-arc-database` header now rejects `FROM cpu, otherdb.mem` the
 way it rejects `FROM otherdb.mem`. And the no-regex fast path for single-table
 queries under that header, which a quote-free comma join used to take, now

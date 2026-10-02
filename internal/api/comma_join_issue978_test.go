@@ -482,6 +482,18 @@ func TestExtractTableReferences_CommaJoin_Issue978(t *testing.T) {
 		{"comma inside a literal", "SELECT * FROM cpu WHERE msg = 'FROM a, secret'", []string{"default/cpu"}},
 		{"comma inside a comment", "SELECT * FROM cpu /* , secret */ WHERE 1=1", []string{"default/cpu"}},
 		{"IN-list after a comma join", "SELECT * FROM cpu, mem WHERE x IN (1, 2)", []string{"default/cpu", "default/mem"}},
+
+		// #827: the dedup key must not fold case. Object keys are
+		// case-sensitive on S3, so cpu and CPU are two measurements with two
+		// separate grants — folding them checks one grant and reads both.
+		// #832 fixed this for FROM and JOIN; the comma-continued path did not
+		// exist yet. The bare-ref key is query.go:1547, the qualified one
+		// query.go:1532. refKeys sorts, and ASCII puts 'C' (67) before 'c'
+		// (99), 'M' (77) before 'd' (100) before 'm' (109).
+		{"case-distinct comma tables", "SELECT * FROM cpu, CPU", []string{"default/CPU", "default/cpu"}},
+		{"case-distinct comma tables with aliases", "SELECT * FROM cpu c, CPU u WHERE c.x = u.x", []string{"default/CPU", "default/cpu"}},
+		{"case-distinct comma databases", "SELECT * FROM cpu, MYDB.cpu, mydb.cpu", []string{"MYDB/cpu", "default/cpu", "mydb/cpu"}},
+		{"four spellings of one name", "SELECT * FROM cpu, CPU, cPu, CpU", []string{"default/CPU", "default/CpU", "default/cPu", "default/cpu"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -517,6 +529,20 @@ func TestCommaJoinExtractRewriteParity_Issue978(t *testing.T) {
 		"SELECT * FROM t, generate_series(1, 10) g",
 		"SELECT * FROM cpu WHERE host IN (SELECT host FROM a, b)",
 		"SELECT * FROM cpu WHERE msg = 'FROM a, secret' -- , other\n",
+
+		// #827: case-distinct comma-continued refs must be checked AND read as
+		// distinct measurements. This is the stronger of the two guards — it
+		// asserts the check set equals the read set directly, which is the
+		// invariant #827 is about.
+		"SELECT * FROM cpu, CPU",
+		"SELECT * FROM cpu c, CPU u WHERE c.x = u.x",
+		"SELECT * FROM cpu, MYDB.cpu, mydb.cpu",
+		// cteNames is lower-cased on BOTH sides, so CPU here names the CTE for
+		// the extractor and for the rewriter alike (DuckDB resolves identifiers
+		// case-insensitively, so it really is the CTE). A characterization
+		// fixture, not a regression guard: making the REWRITER's CTE check
+		// case-sensitive would turn this into an #827-shaped under-check.
+		"WITH cpu AS (SELECT 1) SELECT * FROM a, CPU",
 	}
 
 	for _, sql := range fixtures {

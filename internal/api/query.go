@@ -306,7 +306,7 @@ func normalizeSQLForShow(sql string) string {
 // isSingleTableQuery returns true if query has exactly one FROM naming a
 // single table and no JOINs. These queries can use a faster transformation path.
 func isSingleTableQuery(sqlLower string) bool {
-	fromCount := strings.Count(sqlLower, "from ")
+	fromCount := countSQLTokenStart(sqlLower, "from ")
 	if fromCount != 1 {
 		return false
 	}
@@ -318,7 +318,7 @@ func isSingleTableQuery(sqlLower string) bool {
 		return false
 	}
 	// Check for subquery (FROM followed by parenthesis)
-	idx := strings.Index(sqlLower, "from ")
+	idx := indexSQLTokenStart(sqlLower, "from ")
 	if idx >= 0 {
 		rest := strings.TrimLeft(sqlLower[idx+5:], " \t\n")
 		if len(rest) > 0 && rest[0] == '(' {
@@ -389,6 +389,19 @@ func extractLimit(sql string, defaultLimit int) int {
 // extractCTENames extracts CTE names from a SQL query's WITH clause.
 // Returns a set of lowercase CTE names for efficient lookup.
 func extractCTENames(sql string) map[string]bool {
+	// The WITH predicate lives HERE, not at the call sites, because
+	// patternCTENames has a second alternative (`, name AS (`) with no WITH
+	// anchor: a multi-definition WINDOW clause matches it. The RBAC extractor
+	// called this unconditionally while every rewriter gated it on a WITH
+	// keyword, so `SELECT * FROM secret WINDOW w AS (), secret AS ()` was a
+	// CTE to the permission check (zero refs -> allowed outright) and a real
+	// measurement to the rewriter. One predicate, one place, every caller.
+	//
+	// Returning nil is safe for every caller: the only writes to the returned
+	// map are below, and a read from a nil map yields false.
+	if !containsSQLWord(strings.ToLower(sql), "with") {
+		return nil
+	}
 	cteNames := make(map[string]bool)
 	matches := patternCTENames.FindAllStringSubmatch(sql, -1)
 	for _, match := range matches {
@@ -2974,7 +2987,7 @@ func (h *QueryHandler) getTransformedSQLForParallel(ctx context.Context, sql str
 
 	// Parallel execution only supported for simple single-table queries with header DB
 	// Complex queries (JOINs, subqueries, CTEs) fall back to standard execution
-	if headerDB == "" || !isSingleTableQuery(sqlLower) || strings.Contains(sqlLower, "with ") {
+	if headerDB == "" || !isSingleTableQuery(sqlLower) || containsSQLWord(sqlLower, "with") {
 		transformed, cached, err := h.getTransformedSQL(ctx, sql, headerDB)
 		return transformed, nil, cached, err
 	}
@@ -3384,8 +3397,16 @@ func replaceTableRefs(sql string, re *regexp.Regexp, fn func(parts []string, end
 // '.' (so the identifier was a database qualifier, already handled by the
 // database.table pass) or a '(' (so it was a table-valued function call, not a
 // measurement). Either way the identifier must not be rewritten.
+//
+// The whitespace set MUST match isFunctionCallAt's, which the RBAC extractor
+// uses for the same decision: it skips isWhitespace (space, \t, \n, \r), so
+// trimming only " \t" here made `FROM generate_series\n(1, 10)` a function to
+// the permission check and a measurement to this rewriter — the extractor
+// emitted no ref while the rewriter emitted a read_parquet. DuckDB rejects the
+// result rather than reading it, so it is a correctness/parity defect rather
+// than a bypass, but the two sides must agree. dotFollows trims the same set.
 func isDotOrCallAt(sql string, end int) bool {
-	rest := strings.TrimLeft(sql[end:], " \t")
+	rest := strings.TrimLeft(sql[end:], " \t\r\n")
 	return len(rest) > 0 && (rest[0] == '.' || rest[0] == '(')
 }
 
@@ -3808,7 +3829,7 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 // It avoids regex entirely by using simple string manipulation.
 func (h *QueryHandler) convertSingleTableQuery(ctx context.Context, sql, sqlLower, database string) string {
 	// Find "FROM table" position
-	idx := strings.Index(sqlLower, "from ")
+	idx := indexSQLTokenStart(sqlLower, "from ")
 	if idx < 0 {
 		return sql
 	}
@@ -3847,7 +3868,7 @@ func (h *QueryHandler) convertSingleTableQuery(ctx context.Context, sql, sqlLowe
 // Returns (converted_sql, parallel_info) where parallel_info is non-nil if parallel execution is recommended.
 func (h *QueryHandler) convertSingleTableQueryForParallel(ctx context.Context, sql, sqlLower, database string) (string, *ParallelQueryInfo) {
 	// Find "FROM table" position
-	idx := strings.Index(sqlLower, "from ")
+	idx := indexSQLTokenStart(sqlLower, "from ")
 	if idx < 0 {
 		return sql, nil
 	}
@@ -3921,7 +3942,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 	// Bail when the SQL has a bare FROM inside EXTRACT/SUBSTRING/TRIM/OVERLAY
 	// — `SELECT EXTRACT(YEAR FROM CURRENT_DATE)` slips past isSingleTableQuery
 	// with fromCount==1, so the slow path's mask helper must run.
-	if isSingleTableQuery(sqlLower) && !strings.Contains(sqlLower, "with ") && !sqlutil.ContainsFromKeywordFunction(sql) {
+	if isSingleTableQuery(sqlLower) && !containsSQLWord(sqlLower, "with") && !sqlutil.ContainsFromKeywordFunction(sql) {
 		features := scanSQLFeatures(sql)
 		if !features.hasQuotes && !features.hasDashComment && !features.hasBlockComment {
 			// Also need to rewrite time functions if present
@@ -3956,11 +3977,10 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 	// Compute sqlLower once after all pre-processing mutations
 	sqlLower = strings.ToLower(sql)
 
-	// Extract CTE names only if query has WITH clause (fast path for majority of queries)
-	var cteNames map[string]bool
-	if strings.Contains(sqlLower, "with ") {
-		cteNames = extractCTENames(sql)
-	}
+	// Unconditional, exactly as the RBAC extractor calls it (query.go:1396).
+	// extractCTENames applies the WITH predicate itself; gating it again here
+	// is what let the two sides disagree about which names are virtual.
+	cteNames := extractCTENames(sql)
 
 	// OPTIMIZATION: Skip patternDBTable and patternJoinDBTable entirely
 	// since we know all tables use the header-specified database
