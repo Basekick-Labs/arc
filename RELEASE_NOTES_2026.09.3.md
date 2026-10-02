@@ -71,6 +71,89 @@ corrected.
 
 ## Security fixes
 
+### RBAC read and write restrictions were unreachable, and the database listings had no authorization ([GHSA-mcqm-h7hj-99fg](https://github.com/Basekick-Labs/arc/security/advisories/GHSA-mcqm-h7hj-99fg))
+
+**Read the behaviour-change list below before upgrading a deployment that uses RBAC.**
+
+Two authorization decisions never took effect.
+
+On an RBAC denial, the permission check fell back to the token's coarse
+permission list, which does no database or measurement filtering. At the same
+time the route middleware consulted only that same coarse list and never RBAC.
+So for an RBAC denial to stand, a token had to hold the coarse `read` bit to
+pass the middleware *and* not hold it for the fallback to decline — which is
+impossible. No read or write path in Arc could be narrowed by RBAC under any
+configuration. That covers query permission checks, the per-measurement
+endpoint, `SHOW DATABASES`, `SHOW TABLES FROM <db>`, the measurement listing
+and the shared write check used by every ingest path.
+
+Separately, `GET /api/v1/databases`, `/api/v1/databases/:name` and
+`/api/v1/databases/:name/measurements` were registered with no middleware and
+no permission check at all, while their mutating counterparts were admin-gated.
+Any valid token, including a write-only ingest token, could enumerate every
+database and measurement name, and could probe which databases exist from the
+404-versus-200 distinction.
+
+Enforcement is now decided by a token's **team memberships**, not by the
+license: a coarse `admin` token is allowed as break-glass, a token with
+memberships is governed by RBAC and a denial is final, and a token with no
+memberships resolves to its coarse permissions exactly as before — the
+"backward compatible with OSS tokens" guarantee the original RBAC work made.
+
+Enforcement no longer consults the license anywhere, and that is deliberate.
+A license counts as valid only while active or inside its grace period, and
+the client is dropped entirely if validation fails at startup — so a lapsed
+trial, a revoked key or a long outage would otherwise switch enforcement off
+and silently widen every tenant token to full read at whatever hour it
+expired. The license still gates RBAC *management*, so a lapse costs you the
+ability to change grants, never the grants' effect. A failure to load a
+token's grants now denies instead of falling through.
+
+The middleware half ships with it: a resource-scoped middleware that consults
+RBAC already existed and was wired to nothing. The listing routes now use it,
+so a token created with no coarse permissions — the documented way to ask for
+an RBAC-only token — can reach a handler and be scoped by its grants instead
+of being refused in front of it.
+
+**Behaviour changes.** All three are intended, and all three are visible:
+
+- **A token with team memberships is now restricted to its grants.** It
+  previously was not restricted at all. Review your grants before upgrading.
+- **A write-only or permissionless token can no longer list** databases or
+  measurements.
+- **A token scoped to specific databases now receives `403` from
+  `GET /api/v1/databases`** and must name its database via
+  `GET /api/v1/databases/<name>`, the same bar `SHOW DATABASES` applies.
+  Client tooling that lists databases to populate a picker needs to handle
+  that; updates to the CLI, console, MCP server and Python client ship
+  alongside.
+
+### A subquery in the `where` parameter read a measurement the check never saw ([GHSA-qcf2-6hm7-62c5](https://github.com/Basekick-Labs/arc/security/advisories/GHSA-qcf2-6hm7-62c5))
+
+`GET /api/v1/query/:measurement` authorized only the database and measurement
+named in its route and query string, then assembled a statement around a
+user-supplied `where` fragment and handed the whole thing to the rewriter,
+which resolves table references in any table position — including inside that
+fragment. A reference to another database there was read without ever being
+authorized, and since the endpoint returns rows and counts, the fragment also
+worked as an oracle. No header and no license were required.
+
+The fragment validator could not have caught it: it is a substring blocklist
+for statement terminators, comments and DDL/DML keywords, not a parser.
+Enumerating read syntaxes would not work either — DuckDB spells a table
+reference in a scalar subquery three different ways, and `FROM` is legal
+inside `EXTRACT`, `SUBSTRING` and `TRIM`.
+
+The endpoint now authorizes every table reference in the assembled statement.
+One detail is load-bearing: the database that *bare* references resolve to is
+now supplied explicitly by the caller, because this endpoint takes its
+database from `?database=` and gives the rewriter no header, so a bare name in
+`where` resolves to `default` and must be checked as `default`. Passing the
+`x-arc-database` header instead — the obvious implementation — would have
+authorized one database while reading another, reintroducing the same class of
+defect in the fix. A regression test pins it.
+
+
 ### Replacement-scan guard covered only `FROM` and `JOIN` ([GHSA-9rgq-j585-5fhq](https://github.com/Basekick-Labs/arc/security/advisories/GHSA-9rgq-j585-5fhq))
 
 Arc refuses a path in table position, because the permission check authorizes
