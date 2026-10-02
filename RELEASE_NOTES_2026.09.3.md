@@ -493,9 +493,9 @@ digits, underscores or hyphens, at most 64 characters.
 reason is recorded with the execution and readable through
 `GET /api/v1/continuous_queries/:id/executions`, naming both the continuous
 query and the offending value, so one that stops producing after an upgrade says
-why. The remedy is to delete that definition and create it again with a valid
-database name; editing it is not available, because update applies the same rule
-to the body it is given (#993).
+why. The remedy is to update that definition with a valid database name, or delete it
+and create it again; what is not available is keeping the old value, because
+update applies the same rule to the body it is given (#993).
 
 One deployment shape to check before upgrading. The rule is stricter than the
 storage layer's, and an edge-sync hub's spoke directories are top-level storage
@@ -617,6 +617,84 @@ already violates the rule cannot be updated — delete it and recreate it with a
 valid name.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#995](https://github.com/Basekick-Labs/arc/pull/995).
+
+### Continuous query measurement names are validated, and update requires a complete definition ([#1011](https://github.com/Basekick-Labs/arc/issues/1011))
+
+The sibling of the two `database` fixes above, for the two measurement names.
+`source_measurement` had no name rule at all — create checked only that it was
+non-empty, update did not check it — and `destination_measurement` had one on
+create but only `if provided` on update. Since `PUT` overwrites every column, a
+body that omitted a field stored a blank one.
+
+Both are storage path segments of every run, and the write side applies no name
+rule of its own: the only key check happens at flush, inside the storage
+backend, long after the run has reported its result. Two consequences followed,
+and neither was visible at the time it happened.
+
+**A blank `destination_measurement` made a run report success and lose its
+rows.** The write landed on a key with an empty segment, which the buffer
+accepted; the execution was recorded as `completed` with a row count and no
+error, readable that way through
+`GET /api/v1/continuous_queries/:id/executions`; and the flush then failed with
+`contains an empty segment`, taking the rest of that flush call with it. The
+aggregation looked like it worked and produced nothing.
+
+**A `destination_measurement` carrying a separator wrote into a measurement
+nobody configured.** A stored value of `a/b` produced
+`db/a/b/2026/10/02/12/a/b_….parquet` — nine path segments, each individually
+legal, so the key contract accepted it. Those rows are not orphaned, which
+would have been the safer failure: a measurement is read with a recursive glob,
+so they read back as part of measurement `a`, they are listed as measurement
+`a`, retention deletes them under that name, and Iceberg exports them into that
+table. Hourly compaction and tiering are the two that skip them, incidentally —
+the extra segments shift the partition fields, so the year fails to parse.
+
+Both endpoints now validate both names, and a run re-validates them before it
+builds any path — the same retroactive check
+[#1010](https://github.com/Basekick-Labs/arc/issues/1010) added for `database`,
+since a definition stored by an earlier build is not covered by a boundary rule
+added today. **A definition that fails reports a failed run** rather than
+executing, with the reason recorded against the execution.
+
+The two fields get different rules, deliberately. `destination_measurement`
+names a measurement Arc is about to create, so it gets the rule every
+client-facing ingest endpoint applies: start with a letter, then letters,
+digits, underscores or hyphens, at most 128 characters.
+`source_measurement` names a measurement that already exists, so it gets the
+rule Arc applies elsewhere to a name it is merely given — one storage path
+segment, no separator, no `.` or `..`, no leading dot, no glob metacharacter.
+That is the pair `POST /api/v1/delete` applies to a measurement in its body,
+and the segment half of it is what the retention endpoints apply to a policy's
+measurement. The stricter rule would have been wrong here: measurement names
+predate it, and backup restore and WAL replay still admit names it refuses, so
+a source of `_internal`, `7cpu` or `cpu.v2` keeps working.
+
+**One deployment shape to check before upgrading.** The rule for a source
+measurement is looser than the create-time one, but it is not looser in every
+direction: it declines a **dot-prefixed** name, which the storage layer accepts
+and which plain line protocol accepted before measurement validation shipped in
+v26.02.1. A continuous query reading a measurement called `.hidden` resolves
+today and will now report a failed run, and because the API declines to name
+dot-prefixed directories anywhere, there is no way to rename it — the data has
+to be re-ingested under a valid name, or the definition deleted. A stored
+`destination_measurement` that violates the create-time rule fails its runs
+likewise; that one is ordinary to fix, since the destination is the continuous
+query's own output, so updating the definition is enough. Definitions created
+before v26.02.1 are the population to look at for both: that release is when
+`destination_measurement` validation was added to create.
+
+**`PUT` now requires a complete definition** — `name`, `database`,
+`source_measurement`, `destination_measurement`, `query` with both placeholders,
+and `interval` — continuing what #993 began with `database`: a field left out
+was previously written to the row as a blank. Note also what `PUT` has always
+done with the fields it does **not** require: `description`, `tag_columns`,
+`retention_days`, `delete_source_after_days` and `is_active` are written from
+the body unconditionally, so omitting them zeroes them, and omitting
+`is_active` sets it `false` and stops the continuous query. Send the whole
+definition: read it, change the field, send it back. Both #993 and this change
+land in 26.09.3, so for anyone upgrading from 26.09.2 a partial `PUT` stops
+working in this release — a client that sends `{"is_active": false}` alone
+needs updating.
 
 ### The delete WHERE validator reuses the shared table-position guard
 
