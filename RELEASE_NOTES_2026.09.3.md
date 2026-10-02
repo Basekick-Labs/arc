@@ -333,3 +333,17 @@ resuming; a first-time pull still resumes as before. Backends with no staging
 area, S3 and Azure, never had a partial to resume from and now skip the probe
 instead of discovering it through a failed append — which also means
 `bad_offset_backend` now stays at zero in every shipping configuration.
+
+The same diagnosis was reached independently by
+[@efegokdemir](https://github.com/efegokdemir) in
+[#989](https://github.com/Basekick-Labs/arc/pull/989) — that a checksum
+mismatch describes the peer that answered rather than the file, so the loop
+should continue and the local replica should survive. That reading is correct
+and is what this change implements.
+
+Note for anyone tracing this further: presence is still decided by size alone,
+so a stale copy whose length happens to match the manifest's reads as present.
+This change cannot strand an entry on that rule — an exhausted pull remembers
+the path and forces one re-pull rather than trusting the size — but the rule
+itself is unchanged, and [#975](https://github.com/Basekick-Labs/arc/issues/975)
+is where a durable fix belongs.
