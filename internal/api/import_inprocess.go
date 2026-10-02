@@ -231,7 +231,7 @@ func (h *ImportHandler) importCSV(ctx fiberContext, database, measurement string
 		Validity: validity,
 	}
 	if err := h.arrowBuffer.WriteTypedColumnarDirect(ctx, database, measurement, batch, rowCount); err != nil {
-		return nil, &importError{StatusCode: fiber.StatusInternalServerError, Message: "failed to ingest CSV data", Err: err}
+		return nil, &importError{StatusCode: importBufferStatus(err), Message: "failed to ingest CSV data", Err: err}
 	}
 	if err := h.arrowBuffer.FlushAll(ctx); err != nil {
 		return nil, &importError{StatusCode: fiber.StatusInternalServerError, Message: "failed to flush imported data", Err: err}
@@ -384,7 +384,7 @@ func (h *ImportHandler) importParquet(ctx fiberContext, database, measurement st
 		Validity: validity,
 	}
 	if err := h.arrowBuffer.WriteTypedColumnarDirect(ctx, database, measurement, batch, numRows); err != nil {
-		return nil, &importError{StatusCode: fiber.StatusInternalServerError, Message: "failed to ingest parquet data", Err: err}
+		return nil, &importError{StatusCode: importBufferStatus(err), Message: "failed to ingest parquet data", Err: err}
 	}
 	if err := h.arrowBuffer.FlushAll(ctx); err != nil {
 		return nil, &importError{StatusCode: fiber.StatusInternalServerError, Message: "failed to flush imported data", Err: err}
@@ -1199,4 +1199,14 @@ func (lr *limitedReader) Read(p []byte) (int, error) {
 		return n, errImportTooLarge
 	}
 	return n, err
+}
+
+// importBufferStatus maps the ArrowBuffer's two retryable states to 503 so an
+// import that raced a shutdown, or hit sustained schema churn, is not reported
+// as a permanent server error.
+func importBufferStatus(err error) int {
+	if errors.Is(err, ingest.ErrBufferClosing) || errors.Is(err, ingest.ErrSchemaChurnExceeded) {
+		return fiber.StatusServiceUnavailable
+	}
+	return fiber.StatusInternalServerError
 }

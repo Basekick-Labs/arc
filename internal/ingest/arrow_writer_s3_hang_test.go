@@ -121,9 +121,15 @@ func TestFlushWorkers_BlockForever_WhenStorageHangs(t *testing.T) {
 		UseDictionary:   true,
 		WriteStatistics: true,
 		DataPageVersion: "2.0",
-		FlushWorkers:    2,
-		FlushQueueSize:  5,
-		ShardCount:      4,
+		// Bounded explicitly. These tests deliberately leave a flush stuck in the
+		// backend and then call Close; Close now WAITS for flushes in progress
+		// instead of cancelling them (#1007), so an unset timeout would default to
+		// 30s and leave a Close goroutine parked for that long after the test
+		// returned.
+		FlushTimeoutSeconds: 2,
+		FlushWorkers:        2,
+		FlushQueueSize:      5,
+		ShardCount:          4,
 	}
 
 	buf := NewArrowBuffer(cfg, store, logger)
@@ -155,10 +161,10 @@ func TestFlushWorkers_BlockForever_WhenStorageHangs(t *testing.T) {
 		// Close returned — worker may have been unblocked by ctx cancellation
 		// This is only possible if the flush task propagates buffer ctx (currently it doesn't)
 	case <-time.After(3 * time.Second):
-		t.Log("CONFIRMED: Close() hangs because flush task uses context.Background()")
+		t.Log("CONFIRMED: the worker is stuck in the backend and Close cannot finish instantly")
 	}
 
-	// The bug: flush tasks are created with context.Background() (arrow_writer.go:1182)
+	// Flush tasks now carry no context at all; the worker builds one from flushParent at dequeue, bounded by FlushTimeoutSeconds (#1006). Close waits for an in-flight write rather than cancelling it, bounded by its own budget (#1007)
 	// so neither the buffer's ctx cancellation nor Close() can stop in-flight S3 writes.
 }
 
@@ -177,9 +183,15 @@ func TestPeriodicFlush_BlocksOnStorageHang(t *testing.T) {
 		UseDictionary:   true,
 		WriteStatistics: true,
 		DataPageVersion: "2.0",
-		FlushWorkers:    2,
-		FlushQueueSize:  10,
-		ShardCount:      4,
+		// Bounded explicitly. These tests deliberately leave a flush stuck in the
+		// backend and then call Close; Close now WAITS for flushes in progress
+		// instead of cancelling them (#1007), so an unset timeout would default to
+		// 30s and leave a Close goroutine parked for that long after the test
+		// returned.
+		FlushTimeoutSeconds: 2,
+		FlushWorkers:        2,
+		FlushQueueSize:      10,
+		ShardCount:          4,
 	}
 
 	buf := NewArrowBuffer(cfg, store, logger)
@@ -230,9 +242,15 @@ func TestAllFlushWorkers_Exhausted_QueueFills(t *testing.T) {
 		UseDictionary:   true,
 		WriteStatistics: true,
 		DataPageVersion: "2.0",
-		FlushWorkers:    2,
-		FlushQueueSize:  3, // tiny queue
-		ShardCount:      2,
+		// Bounded explicitly. These tests deliberately leave a flush stuck in the
+		// backend and then call Close; Close now WAITS for flushes in progress
+		// instead of cancelling them (#1007), so an unset timeout would default to
+		// 30s and leave a Close goroutine parked for that long after the test
+		// returned.
+		FlushTimeoutSeconds: 2,
+		FlushWorkers:        2,
+		FlushQueueSize:      3, // tiny queue
+		ShardCount:          2,
 	}
 
 	buf := NewArrowBuffer(cfg, store, logger)
@@ -285,9 +303,15 @@ func TestFlushWorkers_RecoverWithTimeout(t *testing.T) {
 		UseDictionary:   true,
 		WriteStatistics: true,
 		DataPageVersion: "2.0",
-		FlushWorkers:    2,
-		FlushQueueSize:  5,
-		ShardCount:      4,
+		// Bounded explicitly. These tests deliberately leave a flush stuck in the
+		// backend and then call Close; Close now WAITS for flushes in progress
+		// instead of cancelling them (#1007), so an unset timeout would default to
+		// 30s and leave a Close goroutine parked for that long after the test
+		// returned.
+		FlushTimeoutSeconds: 2,
+		FlushWorkers:        2,
+		FlushQueueSize:      5,
+		ShardCount:          4,
 	}
 
 	buf := NewArrowBuffer(cfg, store, logger)
@@ -336,9 +360,15 @@ func TestMemoryGrows_WhileFlushWorkersStuck(t *testing.T) {
 		UseDictionary:   true,
 		WriteStatistics: true,
 		DataPageVersion: "2.0",
-		FlushWorkers:    2,
-		FlushQueueSize:  3,
-		ShardCount:      4,
+		// Bounded explicitly. These tests deliberately leave a flush stuck in the
+		// backend and then call Close; Close now WAITS for flushes in progress
+		// instead of cancelling them (#1007), so an unset timeout would default to
+		// 30s and leave a Close goroutine parked for that long after the test
+		// returned.
+		FlushTimeoutSeconds: 2,
+		FlushWorkers:        2,
+		FlushQueueSize:      3,
+		ShardCount:          4,
 	}
 
 	buf := NewArrowBuffer(cfg, store, logger)

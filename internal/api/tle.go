@@ -218,6 +218,15 @@ localProcessing:
 			Str("measurement", measurement).
 			Int("records", len(tleRecords)).
 			Msg("Failed to write TLE data to Arrow buffer")
+		// A write that arrives after its shard was flushed by shutdown is
+		// refused, not lost: the record is still in the WAL. 503 so the client
+		// retries (elsewhere, during a rolling restart) instead of treating a
+		// shutdown race as a permanent server error.
+		if errors.Is(err, ingest.ErrBufferClosing) {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"error": "Write rejected (server shutting down): " + err.Error(),
+			})
+		}
 		// See lineprotocol.go for ErrSchemaChurnExceeded → 503 rationale.
 		if errors.Is(err, ingest.ErrSchemaChurnExceeded) {
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
