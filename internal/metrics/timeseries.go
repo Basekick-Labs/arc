@@ -136,10 +136,11 @@ func (c *TimeSeriesCollector) collect() {
 		Timestamp: now,
 		Values: map[string]interface{}{
 			// Ingestion totals
-			"ingest_records_total": m.ingestRecordsTotal.Load(),
-			"ingest_bytes_total":   m.ingestBytesTotal.Load(),
-			"ingest_batches_total": m.ingestBatchesTotal.Load(),
-			"ingest_errors_total":  m.ingestErrorsTotal.Load(),
+			"ingest_records_total":        m.ingestRecordsTotal.Load(),
+			"ingest_bytes_total":          m.ingestBytesTotal.Load(),
+			"ingest_batches_total":        m.ingestBatchesTotal.Load(),
+			"ingest_errors_total":         m.ingestErrorsTotal.Load(),
+			"ingest_flush_deferred_total": m.ingestFlushDeferred.Load(),
 			// MessagePack specific
 			"msgpack_requests_total": m.msgpackRequestsTotal.Load(),
 			"msgpack_records_total":  m.msgpackRecordsTotal.Load(),
