@@ -264,3 +264,68 @@ a short partial is unchanged, and the S3 and Azure backends, which have no
 staging files, are unaffected.
 
 Contributed by [@pujitha24](https://github.com/pujitha24) in [#965](https://github.com/Basekick-Labs/arc/pull/965).
+
+### One stale peer could block a file from replicating, and took the local copy with it ([#999](https://github.com/Basekick-Labs/arc/issues/999))
+
+On a per-node-storage cluster, the file puller asks candidate peers for a file
+in turn and verifies every byte against the checksum the cluster manifest
+names. When a peer's bytes failed that check the puller stopped: it did not ask
+the remaining candidates, and it deleted its own copy of the file.
+
+Stopping was meant to treat a bad checksum as a data-integrity signal rather
+than a reason to keep shopping. But a mismatch is a fact about the peer that
+answered, not about the file. A rewrite reaches every node's manifest through
+Raft before the new bytes reach every replica, so a peer that is merely behind
+rejects on checksum while a peer that has the bytes would have served them. The
+peer that is behind is routinely the first one asked: the puller tries the
+file's origin node first, a rewrite in place keeps the original origin, and a
+compacted file's origin is the node that compacted it — none of which is
+necessarily the node that performed the rewrite. The origin is also the one
+candidate whose position is fixed, so every retry put the same stale peer first
+and the loop broke on it again. Deleting the local copy then turned "this node
+serves the previous generation of the file" into "this node has no file for that
+partition", which queries report as fewer rows rather than as an error, because
+the read path globs `*.parquet`.
+
+A rejected checksum now moves on to the next candidate, which is enough for the
+common case of a stale origin in front of a healthy replica. The fall-through
+is bounded at three peers per attempt: a peer can reject either in its reply
+header, before any bytes move, or on the hash of the body it just sent, and the
+puller cannot tell which it will be before asking — so the bound counts peers
+rather than bytes. Because the attempt loop is unchanged, an entry that no peer
+can serve now costs at most three rejections per attempt instead of one, nine
+in total at the default retry count. Asking more peers cannot cause bad bytes to
+be accepted: every candidate's body is still verified against the manifest
+checksum before it is committed.
+
+The rejected bytes are discarded and the committed file is left in place, so a
+node keeps serving the generation it already had until some peer can supply the
+one the manifest names. On local storage the rejected bytes sit in the write
+staging file and only that is removed. S3 and Azure never commit them at all —
+an upload whose source ends early or errors is never completed — so there is
+nothing to clean up and, since this release, nothing is deleted there either.
+
+A new `checksum_mismatch_exhausted` counter in the replication stats reports
+entries that failed after every reachable peer disagreed with the manifest,
+which is the state that warrants operator attention; it is also surfaced in the
+body of a 503 from the catch-up query gate, because it names a reason the gate
+will not clear on its own. `checksum_mismatch` continues to count individual
+peer rejections, and now rises by more than one per attempt when the puller
+falls through. Individual rejections moved from warning to debug level, since a
+peer that has not yet caught up to a rewrite is expected to reject.
+
+Resuming an interrupted transfer is now sized and hashed from the staging file
+alone, and is refused outright when a committed file is present. **This closes a
+silent corruption path that did not need a checksum mismatch to reach.** A
+resume hashes a prefix and appends a tail, but the calls that sized and read the
+prefix answer with the committed file whenever one exists, while the tail is
+appended to the staging file. A transfer interrupted mid-body over an older,
+shorter generation of the same path therefore hashed the old file as the
+"prefix" of the new one; where the old generation was a byte prefix of the new,
+the combined checksum verified and a file holding only the tail was committed
+and counted as a successful pull. The consequence of the new rule is that an
+interrupted transfer over an existing file restarts from zero rather than
+resuming; a first-time pull still resumes as before. Backends with no staging
+area, S3 and Azure, never had a partial to resume from and now skip the probe
+instead of discovering it through a failed append — which also means
+`bad_offset_backend` now stays at zero in every shipping configuration.
