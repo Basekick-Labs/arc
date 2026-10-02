@@ -147,16 +147,22 @@ func (s *slowCloseBackend) WriteReader(ctx context.Context, path string, r io.Re
 	return nil
 }
 
-// TestArrowBuffer_CloseNotCleanWhenQueuedFlushesAbandoned pins the asynchronous
-// half of #803.
+// TestArrowBuffer_CloseFlushesQueuedFlushTasks pins the asynchronous half of
+// #803, updated for #1007.
 //
-// Close() cancels the flush workers, and any task still sitting in the queue is
-// discarded "in favor of WAL replay". Those records were already removed from
-// shard.buffers at enqueue time, so the synchronous flush loop never sees them.
-// Before this was accounted for, Close() returned nil and CloseFlushedCleanly()
-// reported true — and the shutdown purge then deleted the WAL those records
-// depended on.
-func TestArrowBuffer_CloseNotCleanWhenQueuedFlushesAbandoned(t *testing.T) {
+// Close() used to cancel the flush workers and DISCARD any task still sitting
+// in the queue "in favour of WAL replay". Those records were already removed
+// from shard.buffers at enqueue time, so the synchronous flush loop never saw
+// them, and with the shipped wal.enabled=false they were simply lost on every
+// graceful stop under load.
+//
+// This test previously asserted the old contract — abandoned tasks => Close is
+// unclean, so the WAL purge is skipped. Close now FLUSHES those tasks instead,
+// so the correct assertion is that the records reached storage and the close is
+// clean. The #803 guarantee the old assertion protected (a Close that loses
+// data must report unclean) is pinned against the new code path by
+// TestClose_DrainedTaskFailureMarksUnclean in flush_contexts_close_test.go.
+func TestArrowBuffer_CloseFlushesQueuedFlushTasks(t *testing.T) {
 	cfg := closeTestConfig()
 	// Flush on every record so tasks queue up faster than the slow backend
 	// can drain them.
@@ -167,7 +173,8 @@ func TestArrowBuffer_CloseNotCleanWhenQueuedFlushesAbandoned(t *testing.T) {
 
 	buf := NewArrowBuffer(cfg, &slowCloseBackend{}, zerolog.New(io.Discard))
 
-	for i := 0; i < 12; i++ {
+	const writes = 12
+	for i := 0; i < writes; i++ {
 		if err := buf.Write(context.Background(), "default", []interface{}{closeTestRecord("async_drop")}); err != nil {
 			t.Fatalf("Write %d: %v", i, err)
 		}
@@ -175,10 +182,15 @@ func TestArrowBuffer_CloseNotCleanWhenQueuedFlushesAbandoned(t *testing.T) {
 	// Give the writes time to land in the queue behind the slow backend.
 	time.Sleep(50 * time.Millisecond)
 
-	_ = buf.Close()
+	if err := buf.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 
-	if buf.CloseFlushedCleanly() {
-		t.Fatal("CloseFlushedCleanly() is true although queued flush tasks were abandoned; the WAL purge would delete the only copy of those records (#803)")
+	if got := buf.totalRecordsWritten.Load(); got != writes {
+		t.Fatalf("Close wrote %d of %d records; tasks still queued at close were abandoned rather than flushed (#1007)", got, writes)
+	}
+	if !buf.CloseFlushedCleanly() {
+		t.Fatal("CloseFlushedCleanly() is false although Close flushed every queued task; the WAL would be retained and replayed on every start")
 	}
 }
 

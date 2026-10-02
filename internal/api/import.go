@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -292,6 +293,15 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 				Str("database", database).
 				Str("measurement", measurement).
 				Msg("LP import: failed to write to buffer")
+			// 503 for the two retryable buffer states. Note this loop has
+			// already written the measurements it got through, so the import is
+			// partial either way — a retryable status at least tells the client
+			// to re-run it rather than treating it as a permanent failure.
+			if errors.Is(err, ingest.ErrBufferClosing) || errors.Is(err, ingest.ErrSchemaChurnExceeded) {
+				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+					"error": fmt.Sprintf("import rejected at measurement %q (retry): %v", measurement, err),
+				})
+			}
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"error": fmt.Sprintf("failed to ingest measurement %q: %v", measurement, err),
 			})

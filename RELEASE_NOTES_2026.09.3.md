@@ -357,6 +357,61 @@ well-formed database directory is affected.
 Creating a continuous query requires an admin token, so this was a
 data-integrity bug rather than a vulnerability: no permission check was bypassed
 and no path escaped the storage root.
+### A graceful shutdown no longer abandons flushes, and a flush timeout no longer starts before a worker picks the task up ([#1006](https://github.com/Basekick-Labs/arc/issues/1006), [#1007](https://github.com/Basekick-Labs/arc/issues/1007))
+
+Two ways an acknowledged write could reach no storage at all.
+
+A flush task's timeout was created when the task was **queued**, not when a
+worker picked it up, so it was consumed while the task waited its turn. With a
+backlog of N tasks at T seconds per flush, the task at the back arrived with
+`flush_timeout_seconds - N*T` left and could already be expired; the storage
+write then failed with `context deadline exceeded` and the batch was dropped as
+though storage had failed. A queueing delay was reported — and handled — as a
+storage outage.
+
+`Close` cancelled flushes in progress and **discarded** whatever was still in
+the flush queue, in favour of WAL replay. Those records had already been removed
+from the in-memory buffer when they were queued, so nothing else would ever
+write them. A client disconnecting during a schema-evolution flush aborted that
+flush too, even though the rows in it belonged to other clients' earlier,
+already-acknowledged writes. With the WAL disabled — the shipped default — every
+graceful stop under load lost those records.
+
+What changed:
+
+- Flush I/O runs on a context that neither shutdown nor a client's cancellation
+  reaches. The timeout starts when a worker receives the task.
+- `Close` flushes every buffer, then flushes everything still queued instead of
+  discarding it, then waits for any flush a writer is finishing on its own
+  goroutine — and only then reports whether the shutdown was clean.
+- A write that arrives after its own shard has already been flushed by shutdown
+  is refused with `503` and counted as WAL-only, so the shutdown WAL purge is
+  skipped rather than deleting the only remaining copy. The check is per shard,
+  not global: a write arriving while shutdown is still working through the other
+  shards is accepted and flushed as usual.
+- `Close` bounds itself by **half** of `server.shutdown_timeout`, because it is
+  one shutdown component among several and the coordinator checks its own
+  deadline only between them. If that slice expires, `Close` stops flushing,
+  cancels any write still in progress, and reports the shutdown unclean — so the
+  remaining steps, including the WAL writer's final sync, still run. Records it
+  did not get to are left in the WAL and replayed on the next start. With the
+  WAL **disabled** there is nothing to retain, so those records are lost; a
+  shutdown that reports unclean with `wal.enabled = false` is telling you data
+  did not land.
+
+Two limits worth knowing. On the **local** storage backend a write already in
+progress cannot be interrupted, because that backend does not observe its
+context; local writes are fast, but a graceful stop can wait for one. And
+Parquet files written during shutdown are still not registered in the cluster
+manifest, because the file registrar stops before the buffer does — pre-existing,
+and tracked separately.
+
+**Not covered by this change:** a full flush queue still drops its batch
+([#966](https://github.com/Basekick-Labs/arc/issues/966) route 1, in progress),
+and with the WAL off a storage write that fails still loses that batch
+([#1008](https://github.com/Basekick-Labs/arc/issues/1008),
+[#1009](https://github.com/Basekick-Labs/arc/issues/1009)).
+
 
 ### Continuous queries re-validate their stored definition before each run
 

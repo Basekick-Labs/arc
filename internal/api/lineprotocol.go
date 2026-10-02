@@ -318,6 +318,15 @@ localProcessing:
 			// Schema-churn rejection is retryable — surface as 503 so
 			// upstream senders back off rather than treating this as a
 			// permanent server error. See ingest.ErrSchemaChurnExceeded.
+			// A write that arrives after its shard was flushed by shutdown is
+			// refused, not lost: the record is still in the WAL. 503 so the client
+			// retries (elsewhere, during a rolling restart) instead of treating a
+			// shutdown race as a permanent server error.
+			if errors.Is(err, ingest.ErrBufferClosing) {
+				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+					"error": "Write rejected (server shutting down): " + err.Error(),
+				})
+			}
 			if errors.Is(err, ingest.ErrSchemaChurnExceeded) {
 				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 					"error": "Write rejected (schema churn): " + err.Error(),
