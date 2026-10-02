@@ -337,12 +337,16 @@ func TestCQMigrationFromLegacySchema(t *testing.T) {
 
 func TestContinuousQueryDatabaseValidation(t *testing.T) {
 	validFields := `"name":"test","source_measurement":"src","destination_measurement":"dst","query":"SELECT * FROM src WHERE time >= {start_time} AND time < {end_time}","interval":"1h"`
+	invalidSourceMeasurementFields := `"name":"test","source_measurement":"src*","destination_measurement":"dst","query":"SELECT * FROM src WHERE time >= {start_time} AND time < {end_time}","interval":"1h"`
+	emptySourceMeasurementFields := `"name":"test","source_measurement":"","destination_measurement":"dst","query":"SELECT * FROM src WHERE time >= {start_time} AND time < {end_time}","interval":"1h"`
+	emptyDestinationMeasurementFields := `"name":"test","source_measurement":"src","destination_measurement":"","query":"SELECT * FROM src WHERE time >= {start_time} AND time < {end_time}","interval":"1h"`
 	tests := []struct {
-		name      string
-		method    string
-		body      string
-		seedQuery bool
-		wantError string
+		name       string
+		method     string
+		body       string
+		seedQuery  bool
+		wantError  string
+		wantStatus int
 	}{
 		{
 			name:      "POST rejects invalid database name",
@@ -363,6 +367,39 @@ func TestContinuousQueryDatabaseValidation(t *testing.T) {
 			body:      `{` + validFields + `}`,
 			seedQuery: true,
 			wantError: "database is required",
+		},
+		{
+			name:      "POST rejects invalid source measurement",
+			method:    "POST",
+			body:      `{` + invalidSourceMeasurementFields + `,"database":"db"}`,
+			wantError: "invalid source_measurement",
+		},
+		{
+			name:      "PUT rejects invalid source measurement",
+			method:    "PUT",
+			body:      `{` + invalidSourceMeasurementFields + `,"database":"db"}`,
+			seedQuery: true,
+			wantError: "invalid source_measurement",
+		},
+		{
+			name:      "PUT rejects empty source measurement",
+			method:    "PUT",
+			body:      `{` + emptySourceMeasurementFields + `,"database":"db"}`,
+			seedQuery: true,
+			wantError: "invalid source_measurement",
+		},
+		{
+			name:      "PUT rejects empty destination measurement",
+			method:    "PUT",
+			body:      `{` + emptyDestinationMeasurementFields + `,"database":"db"}`,
+			seedQuery: true,
+			wantError: "invalid destination_measurement",
+		},
+		{
+			name:       "POST accepts ordinary measurement names",
+			method:     "POST",
+			body:       `{` + validFields + `,"database":"db"}`,
+			wantStatus: fiber.StatusCreated,
 		},
 	}
 
@@ -398,10 +435,14 @@ func TestContinuousQueryDatabaseValidation(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read response body: %v", err)
 			}
-			if resp.StatusCode != fiber.StatusBadRequest {
-				t.Fatalf("expected status 400, got %d: %s", resp.StatusCode, body)
+			wantStatus := tt.wantStatus
+			if wantStatus == 0 {
+				wantStatus = fiber.StatusBadRequest
 			}
-			if !strings.Contains(string(body), tt.wantError) {
+			if resp.StatusCode != wantStatus {
+				t.Fatalf("expected status %d, got %d: %s", wantStatus, resp.StatusCode, body)
+			}
+			if tt.wantError != "" && !strings.Contains(string(body), tt.wantError) {
 				t.Fatalf("response %q does not contain %q", body, tt.wantError)
 			}
 		})

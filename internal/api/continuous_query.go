@@ -315,6 +315,11 @@ func (h *ContinuousQueryHandler) handleCreate(c *fiber.Ctx) error {
 	if req.SourceMeasurement == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "source_measurement is required"})
 	}
+	if !isValidMeasurementName(req.SourceMeasurement) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "invalid source_measurement: must start with a letter and contain only alphanumeric characters, underscores, or hyphens",
+		})
+	}
 	if req.DestinationMeasurement == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "destination_measurement is required"})
 	}
@@ -448,9 +453,13 @@ func (h *ContinuousQueryHandler) handleUpdate(c *fiber.Ctx) error {
 			"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)",
 		})
 	}
+	if !isValidMeasurementName(req.SourceMeasurement) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "invalid source_measurement: must start with a letter and contain only alphanumeric characters, underscores, or hyphens",
+		})
+	}
 
-	// Validate destination_measurement if provided
-	if req.DestinationMeasurement != "" && !isValidMeasurementName(req.DestinationMeasurement) {
+	if !isValidMeasurementName(req.DestinationMeasurement) {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "invalid destination_measurement: must start with a letter and contain only alphanumeric characters, underscores, or hyphens",
 		})
@@ -866,6 +875,12 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	// through the recorded execution, which is not sanitized.
 	if !isValidDatabaseName(cq.Database) {
 		return 0, fmt.Errorf("stored continuous-query definition %q has an invalid database name: %q", cq.Name, cq.Database)
+	}
+	if !isValidMeasurementName(cq.SourceMeasurement) {
+		return 0, fmt.Errorf("stored continuous-query definition %q has an invalid source_measurement: %q", cq.Name, cq.SourceMeasurement)
+	}
+	if !isValidMeasurementName(cq.DestinationMeasurement) {
+		return 0, fmt.Errorf("stored continuous-query definition %q has an invalid destination_measurement: %q", cq.Name, cq.DestinationMeasurement)
 	}
 
 	// Build storage path for source measurement (supports local, S3, Azure)

@@ -150,3 +150,42 @@ func TestExecuteAggregation_OrdinaryDatabaseNamesAreNotRefused(t *testing.T) {
 		}
 	}
 }
+
+func TestExecuteAggregation_RevalidatesStoredMeasurementNames(t *testing.T) {
+	h := &ContinuousQueryHandler{logger: zerolog.Nop()}
+	ctx := context.Background()
+	now := time.Now().UTC()
+	const validQuery = "SELECT count(*) AS c FROM db1.cpu"
+
+	refused := []struct {
+		name, sourceMeasurement, destinationMeasurement, wantError string
+	}{
+		{"invalid source measurement", "_internal", "dst", "invalid source_measurement"},
+		{"invalid destination measurement", "src", "dest/name", "invalid destination_measurement"},
+		{"empty destination measurement", "src", "", "invalid destination_measurement"},
+	}
+	for _, tt := range refused {
+		t.Run(tt.name, func(t *testing.T) {
+			cq := &ContinuousQuery{
+				Name:                   "stale",
+				Database:               "db1",
+				SourceMeasurement:      tt.sourceMeasurement,
+				DestinationMeasurement: tt.destinationMeasurement,
+			}
+			_, err := h.executeAggregation(ctx, cq, validQuery, now, now)
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("got error %v, want one containing %q", err, tt.wantError)
+			}
+		})
+	}
+
+	for _, tt := range []struct {
+		name, sourceMeasurement, destinationMeasurement string
+	}{
+		{"ordinary names", "src_01", "dst-01"},
+	} {
+		if !isValidMeasurementName(tt.sourceMeasurement) || !isValidMeasurementName(tt.destinationMeasurement) {
+			t.Errorf("the rule would refuse ordinary measurement names in %s", tt.name)
+		}
+	}
+}
