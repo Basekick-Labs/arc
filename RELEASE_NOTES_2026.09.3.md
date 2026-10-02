@@ -621,3 +621,10 @@ This change cannot strand an entry on that rule — an exhausted pull remembers
 the path and forces one re-pull rather than trusting the size — but the rule
 itself is unchanged, and [#975](https://github.com/Basekick-Labs/arc/issues/975)
 is where a durable fix belongs.
+
+### ArcX allowlist lookup handles a nil database receiver ([#1016](https://github.com/Basekick-Labs/arc/issues/1016))
+
+`AllowedDirectories` now returns nil when called on a nil `*DuckDB`, avoiding
+a panic in the ArcX query hook.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1020](https://github.com/Basekick-Labs/arc/pull/1020).
