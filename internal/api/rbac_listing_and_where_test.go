@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"io"
 	"net/http/httptest"
 	"net/url"
@@ -8,7 +9,9 @@ import (
 	"testing"
 
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/config"
 	"github.com/gofiber/fiber/v2"
+	"github.com/rs/zerolog"
 )
 
 // authedDatabasesRig wraps setupAuthedDatabasesHandler with a cleanup func,
@@ -260,5 +263,92 @@ func TestDatabasesListing_PerMeasurementGrantCannotListNames(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		t.Errorf("a per-measurement grant must not enumerate every measurement name in the database, got %d: %s",
 			resp.StatusCode, body)
+	}
+}
+
+// An RBAC-only token — auth.PermissionsNone, "whose access comes solely from
+// team/role grants" per that constant's own doc comment — must be able to
+// reach these endpoints and be scoped by its grants.
+//
+// Before this change it could not: withReadAuth required the coarse "read"
+// bit, which such a token deliberately lacks, so the one token class the
+// per-database check exists for was refused by the middleware in front of it.
+// The route now uses withResourceReadAuth, which consults RBAC.
+//
+// This uses the REAL *auth.RBACManager, not mockRBACChecker. That is only
+// possible because enforcement no longer consults the license: the manager is
+// built with LicenseClient nil, so IsRBACEnabled() is false throughout, and
+// the grants still decide. If someone re-gates enforcement on the license,
+// this test fails — which is the point.
+func TestDatabasesListing_RBACOnlyTokenIsScopedNotRefused(t *testing.T) {
+	_, app, am, cleanup := authedDatabasesRig(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	rm := auth.NewRBACManager(&auth.RBACManagerConfig{
+		DB:            am.GetDB(),
+		LicenseClient: nil,
+		Logger:        zerolog.Nop(),
+	})
+
+	org, err := rm.CreateOrganization(ctx, &auth.CreateOrganizationRequest{Name: "acme"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	team, err := rm.CreateTeam(ctx, org.ID, &auth.CreateTeamRequest{Name: "tenant1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Database-level read on db1 only, with no measurement grants, so the
+	// role-level permission applies to the whole database.
+	if _, err := rm.CreateRole(ctx, team.ID, &auth.CreateRoleRequest{
+		DatabasePattern: "db1", Permissions: []string{"read"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := am.CreateToken(ctx, "rbac-only", "no coarse perms", auth.PermissionsNone, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := am.VerifyToken(raw)
+	if info == nil {
+		t.Fatal("VerifyToken returned nil")
+	}
+	if len(info.Permissions) != 0 {
+		t.Fatalf("expected no coarse permissions, got %v", info.Permissions)
+	}
+	if _, err := rm.AddTokenToTeam(ctx, info.ID, team.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// The handler must be given the checker BEFORE its routes are registered,
+	// so re-register onto a fresh app with the checker installed.
+	h2 := NewDatabasesHandler(&mockLocalBackend{basePath: "./data"}, &config.DeleteConfig{Enabled: true}, am, zerolog.Nop())
+	h2.SetRBACManager(rm)
+	app2 := fiber.New()
+	app2.Use(auth.NewMiddleware(auth.MiddlewareConfig{AuthManager: am}))
+	h2.RegisterRoutes(app2)
+	_ = app
+
+	get := func(path string) int {
+		req := httptest.NewRequest("GET", path, nil)
+		req.Header.Set("Authorization", "Bearer "+raw)
+		resp, err := app2.Test(req, -1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if code := get("/api/v1/databases/db1"); code == fiber.StatusForbidden || code == fiber.StatusUnauthorized {
+		t.Errorf("an RBAC-only token granted db1 must reach the handler, got %d", code)
+	}
+	if code := get("/api/v1/databases/db2"); code != fiber.StatusForbidden {
+		t.Errorf("an ungranted database must be 403 for an RBAC-only token, got %d", code)
+	}
+	if code := get("/api/v1/databases"); code != fiber.StatusForbidden {
+		t.Errorf("listing every database needs a grant covering every database, got %d", code)
 	}
 }

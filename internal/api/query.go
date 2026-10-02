@@ -1589,7 +1589,13 @@ func (h *QueryHandler) checkQueryPermissions(c *fiber.Ctx, sql, permission strin
 // header there instead would check <header>/x while the query reads default/x.
 func (h *QueryHandler) checkQueryPermissionsForDefaultDB(c *fiber.Ctx, sql, permission, defaultDB string) error {
 	// If no RBAC manager, skip permission check (handled by basic auth middleware)
-	if h.rbacManager == nil || !h.rbacManager.IsRBACEnabled() {
+	// Gated on the checker being WIRED, not on the license. Enforcement must
+	// survive a lapsed or revoked license: see the RBAC ENFORCEMENT MODEL note
+	// in internal/auth/rbac_manager.go. CheckPermission itself resolves the
+	// three cases (admin break-glass, memberships -> RBAC authoritative, no
+	// memberships -> coarse permissions), so a deployment without RBAC
+	// configured is unaffected.
+	if h.rbacManager == nil {
 		return nil
 	}
 
@@ -1693,7 +1699,13 @@ func (h *QueryHandler) checkQueryPermissionsForDefaultDB(c *fiber.Ctx, sql, perm
 // This is a simpler version for endpoints where database/measurement are known directly
 func (h *QueryHandler) checkMeasurementPermission(c *fiber.Ctx, database, measurement, permission string) error {
 	// If no RBAC manager, skip permission check (handled by basic auth middleware)
-	if h.rbacManager == nil || !h.rbacManager.IsRBACEnabled() {
+	// Gated on the checker being WIRED, not on the license. Enforcement must
+	// survive a lapsed or revoked license: see the RBAC ENFORCEMENT MODEL note
+	// in internal/auth/rbac_manager.go. CheckPermission itself resolves the
+	// three cases (admin break-glass, memberships -> RBAC authoritative, no
+	// memberships -> coarse permissions), so a deployment without RBAC
+	// configured is unaffected.
+	if h.rbacManager == nil {
 		return nil
 	}
 

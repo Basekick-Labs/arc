@@ -256,7 +256,7 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 	for _, r := range records {
 		measurements[r.Measurement] = true
 	}
-	if h.rbacManager != nil && h.rbacManager.IsRBACEnabled() {
+	if h.rbacManager != nil { // not license-gated; see CheckWritePermissions
 		measList := make([]string, 0, len(measurements))
 		for m := range measurements {
 			measList = append(measList, m)
@@ -502,7 +502,7 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 	batch, numRecords := ingest.TLERecordsToTypedColumnar(tleRecords)
 
 	// Check RBAC permissions
-	if h.rbacManager != nil && h.rbacManager.IsRBACEnabled() {
+	if h.rbacManager != nil { // not license-gated; see CheckWritePermissions
 		if err := CheckWritePermissions(c, h.rbacManager, h.logger, database, []string{measurement}); err != nil {
 			h.totalErrors.Add(1)
 			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{

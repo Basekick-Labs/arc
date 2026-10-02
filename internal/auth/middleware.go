@@ -245,10 +245,31 @@ func ExtractTokenFromRequest(c *fiber.Ctx) string {
 	return c.Query("p")
 }
 
-// RequireResourcePermission creates middleware that checks resource-scoped permissions
-// using RBAC when enabled, with fallback to OSS token permissions.
-// The database and measurement are extracted from request headers or path.
-func RequireResourcePermission(am *AuthManager, rm *RBACManager, permission string) fiber.Handler {
+// ResourcePermissionChecker is the subset of *RBACManager this middleware
+// needs, so a handler holding the permission checker behind its own interface
+// can pass it through without depending on the concrete type.
+type ResourcePermissionChecker interface {
+	CheckPermission(req *PermissionCheckRequest) *PermissionCheckResult
+}
+
+// RequireResourcePermission creates middleware that checks resource-scoped
+// permissions, with the database and measurement taken from the request's
+// header or path.
+//
+// Prefer this over RequirePermission on any route that names a database or
+// measurement. RequirePermission consults only the token's coarse permission
+// list (AuthManager.HasPermission), which never looks at RBAC — so a token
+// whose read authority comes from a grant rather than from the coarse "read"
+// bit is refused before the handler can consult RBAC at all. That is the
+// middleware half of the enforcement model described in rbac_manager.go: a
+// denial there is final, so the gate in front of it has to be able to say yes
+// for the same reasons RBAC would.
+//
+// rm == nil means no permission checker was wired, which is the OSS
+// auth-without-RBAC build: fall back to the coarse list. When rm is present it
+// is authoritative, including when the license has lapsed — CheckPermission
+// itself decides, and it deliberately does not consult the license.
+func RequireResourcePermission(am *AuthManager, rm ResourcePermissionChecker, permission string) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		tokenInfo := GetTokenInfo(c)
 		if tokenInfo == nil {
@@ -262,8 +283,11 @@ func RequireResourcePermission(am *AuthManager, rm *RBACManager, permission stri
 		database := extractDatabase(c)
 		measurement := extractMeasurement(c)
 
-		// If no RBAC manager or RBAC not enabled, use OSS permissions
-		if rm == nil || !rm.IsRBACEnabled() {
+		// No checker wired (OSS auth-only build): coarse permissions.
+		// NOT also gated on IsRBACEnabled() — see rbac_manager.go's
+		// RBAC ENFORCEMENT MODEL: keying this off the license fails open the
+		// moment a license lapses.
+		if rm == nil {
 			if !am.HasPermission(tokenInfo, permission) {
 				return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 					"success": false,
@@ -307,6 +331,13 @@ func extractDatabase(c *fiber.Ctx) string {
 		return db
 	}
 
+	// The databases routes name their parameter ":name"
+	// (/api/v1/databases/:name). That is the ONLY route family using ":name",
+	// so reading it here cannot pick up a value that is not a database.
+	if db := c.Params("name"); db != "" {
+		return db
+	}
+
 	// Check query parameter
 	if db := c.Query("database"); db != "" {
 		return db
@@ -339,16 +370,16 @@ func extractMeasurement(c *fiber.Ctx) string {
 }
 
 // RequireResourceRead creates middleware requiring read permission with resource context
-func RequireResourceRead(am *AuthManager, rm *RBACManager) fiber.Handler {
+func RequireResourceRead(am *AuthManager, rm ResourcePermissionChecker) fiber.Handler {
 	return RequireResourcePermission(am, rm, "read")
 }
 
 // RequireResourceWrite creates middleware requiring write permission with resource context
-func RequireResourceWrite(am *AuthManager, rm *RBACManager) fiber.Handler {
+func RequireResourceWrite(am *AuthManager, rm ResourcePermissionChecker) fiber.Handler {
 	return RequireResourcePermission(am, rm, "write")
 }
 
 // RequireResourceDelete creates middleware requiring delete permission with resource context
-func RequireResourceDelete(am *AuthManager, rm *RBACManager) fiber.Handler {
+func RequireResourceDelete(am *AuthManager, rm ResourcePermissionChecker) fiber.Handler {
 	return RequireResourcePermission(am, rm, "delete")
 }

@@ -34,8 +34,10 @@ func (h *DatabasesHandler) SetFieldSchema(r *fieldschema.Registry) { h.fieldSche
 
 // SetRBACManager installs the RBAC checker for the listing endpoints.
 //
-// Called once at startup before RegisterRoutes, so a plain assignment is
-// enough. main.go guards the call with `authManager != nil && rbacManager !=
+// MUST be called before RegisterRoutes: the route middleware captures this
+// value when the route is registered, so a checker installed afterwards would
+// gate nothing. A plain assignment is enough because there is no concurrent
+// reader at startup. main.go guards the call with `authManager != nil && rbacManager !=
 // nil`, the same way it guards every other SetAuthAndRBAC: assigning a nil
 // *auth.RBACManager into this interface field would make `h.rbacManager !=
 // nil` true for a typed nil and defeat the guards below.
@@ -51,7 +53,13 @@ func (h *DatabasesHandler) SetRBACManager(rm RBACChecker) { h.rbacManager = rm }
 // middleware has already decided whether an unauthenticated request is
 // allowed, exactly as the query path does.
 func (h *DatabasesHandler) checkDatabasePermission(c *fiber.Ctx, database, permission string) error {
-	if h.rbacManager == nil || !h.rbacManager.IsRBACEnabled() {
+	// Gated on the checker being WIRED, not on the license. Enforcement must
+	// survive a lapsed or revoked license: see the RBAC ENFORCEMENT MODEL note
+	// in internal/auth/rbac_manager.go. CheckPermission itself resolves the
+	// three cases (admin break-glass, memberships -> RBAC authoritative, no
+	// memberships -> coarse permissions), so a deployment without RBAC
+	// configured is unaffected.
+	if h.rbacManager == nil {
 		return nil
 	}
 	tokenInfo := auth.GetTokenInfo(c)
@@ -165,7 +173,14 @@ func (h *DatabasesHandler) RegisterRoutes(app *fiber.App) {
 	// so any valid token could enumerate every database and measurement in the
 	// deployment — the query path's equivalents (`SHOW DATABASES`, `SHOW
 	// TABLES FROM db`, GET /api/v1/measurements) have always gated both.
-	readAuth := withReadAuth(h.authManager)
+	//
+	// withResourceReadAuth rather than withReadAuth: the latter requires the
+	// coarse "read" bit, which would refuse a token whose read authority comes
+	// from an RBAC grant instead — the one class for which the per-database
+	// check below does any work. The two gates answer different questions:
+	// the middleware asks "does this token have read authority at all, coarse
+	// or granted", the handler asks "for THIS database, or for all of them".
+	readAuth := withResourceReadAuth(h.authManager, h.rbacManager)
 
 	app.Get("/api/v1/databases", readAuth, h.handleList)
 	app.Get("/api/v1/databases/:name", readAuth, h.handleGet)

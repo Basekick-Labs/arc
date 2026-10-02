@@ -1443,10 +1443,15 @@ func (rm *RBACManager) CheckPermission(req *PermissionCheckRequest) *PermissionC
 		}
 	}
 
-	// If RBAC is not enabled, use OSS token permissions only (no caching needed - it's fast)
-	if !rm.IsRBACEnabled() {
-		return rm.checkOSSPermission(req)
+	// Case 1: break-glass.
+	if hasCoarseAdmin(req.TokenInfo) {
+		return &PermissionCheckResult{Allowed: true, Source: "token"}
 	}
+
+	// NOT gated on IsRBACEnabled(): see RBAC ENFORCEMENT MODEL above. A
+	// deployment with no team memberships still resolves to the coarse
+	// permissions through case 3, at the cost of one membership lookup per
+	// token per tokenCacheTTL.
 
 	// Check permission result cache first
 	cacheKey := permissionCacheKey{
@@ -1491,21 +1496,8 @@ func (rm *RBACManager) CheckPermissionsBatch(reqs []*PermissionCheckRequest) []*
 
 	results := make([]*PermissionCheckResult, len(reqs))
 
-	// If RBAC is not enabled, use OSS token permissions only (fast path)
-	if !rm.IsRBACEnabled() {
-		for i, req := range reqs {
-			if req.TokenInfo == nil {
-				results[i] = &PermissionCheckResult{
-					Allowed: false,
-					Source:  "denied",
-					Reason:  "no token provided",
-				}
-			} else {
-				results[i] = rm.checkOSSPermission(req)
-			}
-		}
-		return results
-	}
+	// NOT gated on IsRBACEnabled(): see RBAC ENFORCEMENT MODEL. Tokens with
+	// no memberships still resolve to the coarse permissions below.
 
 	// Group requests by token ID to batch-load RBAC data
 	type indexedReq struct {
@@ -1523,6 +1515,12 @@ func (rm *RBACManager) CheckPermissionsBatch(reqs []*PermissionCheckRequest) []*
 			}
 			continue
 		}
+		// Case 1: break-glass, resolved before grouping so an admin token
+		// never triggers a membership load.
+		if hasCoarseAdmin(req.TokenInfo) {
+			results[i] = &PermissionCheckResult{Allowed: true, Source: "token"}
+			continue
+		}
 		tokenGroups[req.TokenInfo.ID] = append(tokenGroups[req.TokenInfo.ID], indexedReq{index: i, req: req})
 	}
 
@@ -1531,10 +1529,15 @@ func (rm *RBACManager) CheckPermissionsBatch(reqs []*PermissionCheckRequest) []*
 		// Load RBAC data once for all requests with this token
 		rbacData, err := rm.getTokenRBACData(tokenID)
 		if err != nil {
-			rm.logger.Error().Err(err).Int64("token_id", tokenID).Msg("Failed to get token RBAC data for batch")
-			// Fall back to OSS permissions for all requests with this token
+			// Fail CLOSED, as the single-check path does.
+			rm.logger.Error().Err(err).Int64("token_id", tokenID).
+				Msg("RBAC data load failed for batch; denying (fail closed)")
 			for _, ir := range indexedReqs {
-				results[ir.index] = rm.checkOSSPermission(ir.req)
+				results[ir.index] = &PermissionCheckResult{
+					Allowed: false,
+					Source:  "denied",
+					Reason:  "permission data unavailable",
+				}
 			}
 			continue
 		}
@@ -1565,25 +1568,21 @@ func (rm *RBACManager) CheckPermissionsBatch(reqs []*PermissionCheckRequest) []*
 			// Compute permission using cached RBAC data
 			var result *PermissionCheckResult
 
-			// No team memberships - use OSS permissions (backward compat)
+			// Case 3: no memberships - coarse permissions (backward compat).
 			if len(rbacData.teams) == 0 {
 				result = rm.checkOSSPermission(req)
 			} else if rm.checkRBACPermissionCached(req, rbacData) {
+				// Case 2: RBAC is authoritative for this token.
 				result = &PermissionCheckResult{
 					Allowed: true,
 					Source:  "rbac",
 				}
 			} else {
-				// RBAC denied, fall back to OSS permissions
-				ossResult := rm.checkOSSPermission(req)
-				if ossResult.Allowed {
-					result = ossResult
-				} else {
-					result = &PermissionCheckResult{
-						Allowed: false,
-						Source:  "denied",
-						Reason:  fmt.Sprintf("no permission for %s on database '%s'", req.Permission, req.Database),
-					}
+				// Denial is FINAL - no coarse-permission fallback.
+				result = &PermissionCheckResult{
+					Allowed: false,
+					Source:  "denied",
+					Reason:  fmt.Sprintf("no permission for %s on database '%s'", req.Permission, req.Database),
 				}
 			}
 
@@ -1608,16 +1607,26 @@ func (rm *RBACManager) checkPermissionUncached(req *PermissionCheckRequest) *Per
 	// Get or load token RBAC data (cached)
 	rbacData, err := rm.getTokenRBACData(req.TokenInfo.ID)
 	if err != nil {
-		rm.logger.Error().Err(err).Msg("Failed to get token RBAC data")
-		return rm.checkOSSPermission(req)
+		// Fail CLOSED. The membership tables are created unconditionally by
+		// the auth schema, so an error here means a broken database, not a
+		// missing table — and we cannot tell whether RBAC restricts this
+		// token. Denying is the only safe answer.
+		rm.logger.Error().Err(err).
+			Int64("token_id", req.TokenInfo.ID).
+			Msg("RBAC data load failed; denying (fail closed)")
+		return &PermissionCheckResult{
+			Allowed: false,
+			Source:  "denied",
+			Reason:  "permission data unavailable",
+		}
 	}
 
-	// No team memberships - use OSS permissions (backward compat)
+	// Case 3: no memberships - coarse token permissions (backward compat).
 	if len(rbacData.teams) == 0 {
 		return rm.checkOSSPermission(req)
 	}
 
-	// Check RBAC permissions using cached data
+	// Case 2: RBAC is authoritative for this token.
 	if rm.checkRBACPermissionCached(req, rbacData) {
 		return &PermissionCheckResult{
 			Allowed: true,
@@ -1625,12 +1634,7 @@ func (rm *RBACManager) checkPermissionUncached(req *PermissionCheckRequest) *Per
 		}
 	}
 
-	// RBAC denied, fall back to OSS permissions
-	ossResult := rm.checkOSSPermission(req)
-	if ossResult.Allowed {
-		return ossResult
-	}
-
+	// Denial is FINAL - no coarse-permission fallback.
 	return &PermissionCheckResult{
 		Allowed: false,
 		Source:  "denied",
@@ -1753,6 +1757,56 @@ func (rm *RBACManager) loadTokenRBACData(tokenID int64) (*tokenRBACData, error) 
 
 	return data, nil
 }
+
+// hasCoarseAdmin reports whether a token carries the coarse "admin"
+// permission, which bypasses RBAC entirely.
+//
+// Deliberate break-glass: an admin token can already mint tokens, drop
+// databases and rewrite RBAC itself, so letting RBAC restrict it buys nothing
+// and would let an operator lock themselves out of their own tooling by adding
+// an admin token to a team.
+func hasCoarseAdmin(info *TokenInfo) bool {
+	if info == nil {
+		return false
+	}
+	for _, p := range info.Permissions {
+		if p == "admin" {
+			return true
+		}
+	}
+	return false
+}
+
+// RBAC ENFORCEMENT MODEL
+//
+// Whether RBAC is authoritative for a token is decided by that token's TEAM
+// MEMBERSHIPS, never by the license. The license gates RBAC *management* only
+// (RBACHandler.requireRBACLicense guards every /api/v1/rbac route).
+//
+// Keying enforcement off the license would fail OPEN. License.IsValid() is
+// true only for "active" and "grace_period", and cmd/arc/main.go sets
+// licenseClient to nil when validation fails at boot — so a lapsed trial, a
+// revoked key, or an outage past the cached-license window all make
+// IsRBACEnabled() false. If that switched enforcement off, every tenant token
+// holding the coarse "read" bit would silently widen from "its granted
+// measurements" to "every database in the deployment", at whatever hour the
+// license expired. Enforcement therefore never consults the license: a lapse
+// removes the ability to CHANGE grants, never the grants' effect.
+//
+// The three cases, in order:
+//
+//  1. coarse "admin"        -> allowed (break-glass, see hasCoarseAdmin)
+//  2. has team memberships  -> RBAC is authoritative; a denial is FINAL
+//  3. no team memberships   -> coarse token permissions ("backward compatible
+//                              with OSS tokens", the original RBAC goal)
+//
+// Case 2 previously fell back to the coarse permissions on denial, which made
+// RBAC purely additive. Combined with RequireRead/RequireWrite demanding the
+// very coarse bit that fallback then honoured, NO token could be restricted by
+// RBAC under any configuration: a token had to hold "read" to pass the route
+// middleware, and had to NOT hold it for an RBAC denial to stand. Those are
+// contradictory, so every read and write path was unnarrowable. Both halves
+// are fixed together; see RequireResourcePermission in middleware.go.
 
 // checkOSSPermission checks permissions using OSS token model
 func (rm *RBACManager) checkOSSPermission(req *PermissionCheckRequest) *PermissionCheckResult {

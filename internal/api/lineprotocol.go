@@ -280,7 +280,7 @@ localProcessing:
 	columnarByMeasurement := ingest.BatchToColumnar(records)
 
 	// Check RBAC permissions for all measurements being written (only if RBAC is enabled)
-	if h.rbacManager != nil && h.rbacManager.IsRBACEnabled() {
+	if h.rbacManager != nil { // not license-gated; see CheckWritePermissions
 		measurements := make([]string, 0, len(columnarByMeasurement))
 		for measurement := range columnarByMeasurement {
 			measurements = append(measurements, measurement)
