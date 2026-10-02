@@ -816,7 +816,7 @@ func TestValidateWhereClauseQuery(t *testing.T) {
 		{name: "comment dash", input: "host = 'server01'--comment", wantErr: true},
 		{name: "comment block start", input: "host = 'server01'/*", wantErr: true},
 		{name: "comment block end", input: "*/host = 'server01'", wantErr: true},
-		{name: "DROP keyword", input: "host = 'DROP'", wantErr: true},
+		{name: "DROP keyword", input: "DROP TABLE users", wantErr: true},
 		{name: "DELETE keyword", input: "DELETE FROM users", wantErr: true},
 		{name: "INSERT keyword", input: "INSERT INTO users", wantErr: true},
 		{name: "UPDATE keyword", input: "UPDATE users SET", wantErr: true},
@@ -838,6 +838,28 @@ func TestValidateWhereClauseQuery(t *testing.T) {
 			err := validateWhereClauseQuery(tt.input)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("validateWhereClauseQuery(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateWhereClauseQueryAllowsPatternsInStringLiterals(t *testing.T) {
+	for _, keyword := range dangerousQueryKeywords {
+		t.Run(keyword, func(t *testing.T) {
+			if err := validateWhereClauseQuery("message = '" + keyword + "'"); err != nil {
+				t.Errorf("validateWhereClauseQuery() rejected keyword in string literal: %v", err)
+			}
+		})
+	}
+
+	for name, input := range map[string]string{
+		"keyword substring":  "message = 'created at noon'",
+		"comment marker":     "message = 'a--b'",
+		"keyword identifier": "created_at = true",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateWhereClauseQuery(input); err != nil {
+				t.Errorf("validateWhereClauseQuery(%q) rejected valid input: %v", input, err)
 			}
 		})
 	}
