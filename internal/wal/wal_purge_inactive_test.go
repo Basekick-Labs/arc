@@ -754,6 +754,48 @@ func TestStartupRecovery_StillWorks(t *testing.T) {
 	}
 }
 
+// TestRecovery_SkipsEntriesCoveredByFlushCheckpoint verifies that a data WAL
+// entry already flushed to storage is not replayed after a crash. This is the
+// tagless-data regression for issue #948: replaying it would permanently
+// duplicate legitimate rows because compaction cannot deduplicate tagless
+// measurements by timestamp alone.
+func TestRecovery_SkipsEntriesCoveredByFlushCheckpoint(t *testing.T) {
+	writer, tmpDir := newTestWriter(t, SyncModeAsync)
+	defer os.RemoveAll(tmpDir)
+
+	records := []map[string]interface{}{{
+		"measurement": "events",
+		"time":        int64(1609459200000000),
+		"value":       "single-event",
+	}}
+	hashes, err := writer.AppendTracked(records)
+	if err != nil {
+		t.Fatalf("append tracked records: %v", err)
+	}
+	if err := writer.MarkFlushed(hashes); err != nil {
+		t.Fatalf("append flush checkpoint: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+
+	recovery := NewRecovery(tmpDir, zerolog.Nop())
+	recovered := 0
+	stats, err := recovery.Recover(context.Background(), func(ctx context.Context, recs []map[string]interface{}) error {
+		recovered += len(recs)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("recovery failed: %v", err)
+	}
+	if recovered != 0 {
+		t.Fatalf("expected checkpointed records not to replay, got %d", recovered)
+	}
+	if stats.RecoveredFiles != 1 {
+		t.Fatalf("expected checkpointed WAL file to be retired, got %d recovered files", stats.RecoveredFiles)
+	}
+}
+
 // ==========================================================================
 // PurgeOlderThan() method tests
 // ==========================================================================

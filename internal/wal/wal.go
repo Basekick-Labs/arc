@@ -2,6 +2,7 @@ package wal
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -46,7 +47,8 @@ const (
 	// WALEnvelopeMarker is the first byte of an enveloped WAL payload.
 	// Enveloped format: [0x01][2-byte db name length][db name][original msgpack]
 	// Since msgpack maps/arrays always start with bytes >= 0x80, 0x01 is unambiguous.
-	WALEnvelopeMarker = 0x01
+	WALEnvelopeMarker   = 0x01
+	WALCheckpointMarker = 0x02
 )
 
 // ParseEnvelope extracts the database name and msgpack payload from a WAL entry.
@@ -703,6 +705,84 @@ func (w *Writer) AppendRawWithMeta(database string, payload []byte) error {
 		}
 	}
 	return nil
+}
+
+// AppendTracked writes a row-format entry and returns its payload identity.
+// The identity is used by flush checkpoints to avoid replaying data that was
+// already durably written to storage.
+func (w *Writer) AppendTracked(records []map[string]interface{}) ([]string, error) {
+	payload, err := msgpack.Marshal(records)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize records: %w", err)
+	}
+	if err := w.appendRawEntry(payload); err != nil {
+		return nil, err
+	}
+	return []string{payloadHash(payload)}, nil
+}
+
+// AppendRawWithMetaTracked is the tracked counterpart to AppendRawWithMeta.
+func (w *Writer) AppendRawWithMetaTracked(database string, payload []byte) ([]string, error) {
+	if len(database) > 255 {
+		return nil, fmt.Errorf("database name too long: %d bytes", len(database))
+	}
+	chunks := [][]byte{payload}
+	if len(payload) > MaxWALPayloadSize {
+		var err error
+		chunks, err = splitOversizedPayload(payload)
+		if err != nil {
+			return nil, oversizedPayloadError(err)
+		}
+	}
+	dbBytes := []byte(database)
+	envelopeHeaderLen := 3 + len(dbBytes)
+	var hashes []string
+	for _, chunk := range chunks {
+		if envelopeHeaderLen+len(chunk) > MaxWALPayloadSize {
+			return nil, oversizedPayloadError(fmt.Errorf("size %d exceeds limit %d", envelopeHeaderLen+len(chunk), MaxWALPayloadSize))
+		}
+		if err := w.appendEnvelopedEntry(dbBytes, envelopeHeaderLen, chunk, envelopeHeaderLen+len(chunk)); err != nil {
+			return nil, err
+		}
+		hashes = append(hashes, payloadHash(envelopePayload(dbBytes, chunk)))
+	}
+	return hashes, nil
+}
+
+// MarkFlushed appends a checkpoint after the corresponding data entries have
+// reached durable storage. A failed checkpoint is safe: it can only cause a
+// replay duplicate, never data loss.
+func (w *Writer) MarkFlushed(hashes []string) error {
+	if len(hashes) == 0 {
+		return nil
+	}
+	payload, err := msgpack.Marshal(hashes)
+	if err != nil {
+		return err
+	}
+	checkpoint := append([]byte{WALCheckpointMarker}, payload...)
+	checksum := crc32.ChecksumIEEE(checkpoint)
+	timestampUS := uint64(time.Now().UnixMicro())
+	entryData := make([]byte, WALEntryHeaderSize+len(checkpoint))
+	binary.BigEndian.PutUint32(entryData[0:4], uint32(len(checkpoint)))
+	binary.BigEndian.PutUint64(entryData[4:12], timestampUS)
+	binary.BigEndian.PutUint32(entryData[12:16], checksum)
+	copy(entryData[WALEntryHeaderSize:], checkpoint)
+	return w.tryEnqueue(entryData)
+}
+
+func envelopePayload(dbBytes, payload []byte) []byte {
+	out := make([]byte, 3+len(dbBytes)+len(payload))
+	out[0] = WALEnvelopeMarker
+	binary.BigEndian.PutUint16(out[1:3], uint16(len(dbBytes)))
+	copy(out[3:], dbBytes)
+	copy(out[3+len(dbBytes):], payload)
+	return out
+}
+
+func payloadHash(payload []byte) string {
+	sum := sha256.Sum256(payload)
+	return fmt.Sprintf("%x", sum[:])
 }
 
 // appendEnvelopedEntry is AppendRawWithMeta's single-entry fast path: CRC,

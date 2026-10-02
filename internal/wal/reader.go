@@ -33,9 +33,11 @@ func NewReader(filePath string, logger zerolog.Logger) *Reader {
 
 // Entry represents a single WAL entry
 type Entry struct {
-	TimestampUS  uint64                   // Microseconds since epoch
-	Records      []map[string]interface{} // Row format (from Append path)
-	ColumnarData *ColumnarEntry           // Columnar format (from AppendRaw path)
+	TimestampUS      uint64                   // Microseconds since epoch
+	PayloadHash      string                   // SHA-256 identity of the logical WAL payload
+	CheckpointHashes []string                 // Flush checkpoint identities, when present
+	Records          []map[string]interface{} // Row format (from Append path)
+	ColumnarData     *ColumnarEntry           // Columnar format (from AppendRaw path)
 }
 
 // ColumnarEntry represents a columnar WAL entry written via the zero-copy path
@@ -143,6 +145,13 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 	if actualChecksum != expectedChecksum {
 		return nil, fmt.Errorf("checksum mismatch: expected %d, got %d", expectedChecksum, actualChecksum)
 	}
+	if len(payload) > 0 && payload[0] == WALCheckpointMarker {
+		var hashes []string
+		if err := msgpack.Unmarshal(payload[1:], &hashes); err != nil {
+			return nil, fmt.Errorf("failed to deserialize WAL checkpoint: %w", err)
+		}
+		return &Entry{TimestampUS: timestampUS, CheckpointHashes: hashes}, nil
+	}
 
 	// Parse envelope to extract database name and inner msgpack payload
 	database, msgpackData := ParseEnvelope(payload, "")
@@ -152,6 +161,7 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 	if err := msgpack.Unmarshal(msgpackData, &records); err == nil {
 		return &Entry{
 			TimestampUS: timestampUS,
+			PayloadHash: payloadHash(payload),
 			Records:     records,
 		}, nil
 	}
@@ -163,6 +173,7 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 			colEntry.Database = database
 			return &Entry{
 				TimestampUS:  timestampUS,
+				PayloadHash:  payloadHash(payload),
 				ColumnarData: colEntry,
 			}, nil
 		}

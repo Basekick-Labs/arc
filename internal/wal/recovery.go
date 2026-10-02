@@ -132,12 +132,29 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 			continue
 		}
 
+		// Flush checkpoints are written only after parquet upload succeeds.
+		// Gather them before replay so already-durable entries in the same WAL
+		// file are not ingested a second time after a crash.
+		flushed := make(map[string]struct{})
+		for _, entry := range entries {
+			for _, hash := range entry.CheckpointHashes {
+				flushed[hash] = struct{}{}
+			}
+		}
+
 		// Replay entries - track if all succeed
 		allEntriesSucceeded := true
 		fileRecoveredBatches := 0
 		fileRecoveredEntries := 0
 
 		for _, entry := range entries {
+			if len(entry.CheckpointHashes) > 0 {
+				continue
+			}
+			if _, ok := flushed[entry.PayloadHash]; ok {
+				r.logger.Debug().Str("payload_hash", entry.PayloadHash).Msg("Skipping WAL entry covered by flush checkpoint")
+				continue
+			}
 			// Dispatch based on entry format
 			if entry.ColumnarData != nil && opts.ColumnarCallback != nil {
 				// Columnar entry from zero-copy AppendRaw path
