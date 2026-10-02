@@ -583,12 +583,21 @@ func (h *AuthHandler) removeTokenFromTeam(c *fiber.Ctx) error {
 		})
 	}
 
-	if !h.rbacManager.IsRBACEnabled() {
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-			"success": false,
-			"error":   "RBAC requires an enterprise license with the 'rbac' feature enabled",
-		})
-	}
+	// Deliberately NOT license-gated, unlike every other RBAC mutation.
+	//
+	// Enforcement is license-independent, so a token's grants keep applying
+	// after a license lapses — correct, because the alternative is silently
+	// widening every tenant on expiry. The consequence is that a token whose
+	// grants deny more than intended stays denied, and every other recovery
+	// route (editing the team, the role, the grants) is license-gated. That
+	// left an operator on a lapsed license with no way to un-stick a tenant
+	// except rotating its credential or escalating it to admin.
+	//
+	// Removing a membership is the one mutation that can only ever NARROW
+	// RBAC's reach: the token falls back to its coarse permissions, which the
+	// route middleware already gates. So it is safe to allow unlicensed, and
+	// it is the escape hatch. Adding a membership stays license-gated, since
+	// that grants reach rather than removing it.
 
 	tokenID, err := strconv.ParseInt(c.Params("id"), 10, 64)
 	if err != nil {

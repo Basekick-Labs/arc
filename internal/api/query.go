@@ -38,6 +38,11 @@ type RBACChecker interface {
 	IsRBACEnabled() bool
 	CheckPermission(req *auth.PermissionCheckRequest) *auth.PermissionCheckResult
 	CheckPermissionsBatch(reqs []*auth.PermissionCheckRequest) []*auth.PermissionCheckResult
+	// CanAccessAnythingIn answers "may this caller enumerate inside this
+	// database", which is weaker than CheckPermission with "*" and is the
+	// only question a listing gate should ask. See its doc comment in
+	// internal/auth.
+	CanAccessAnythingIn(tokenInfo *auth.TokenInfo, database, permission string) bool
 }
 
 // TableReference represents a database.measurement reference extracted from SQL
@@ -1695,6 +1700,92 @@ func (h *QueryHandler) checkQueryPermissionsForDefaultDB(c *fiber.Ctx, sql, perm
 	return nil
 }
 
+// filterReadableMeasurementInfos is filterReadableMeasurements for the
+// cross-database listing, which carries its database per row.
+func (h *QueryHandler) filterReadableMeasurementInfos(c *fiber.Ctx, infos []MeasurementInfo) []MeasurementInfo {
+	if h.rbacManager == nil || len(infos) == 0 {
+		return infos
+	}
+	tokenInfo := auth.GetTokenInfo(c)
+	if tokenInfo == nil {
+		return infos
+	}
+	reqs := make([]*auth.PermissionCheckRequest, len(infos))
+	for i, info := range infos {
+		reqs[i] = &auth.PermissionCheckRequest{
+			TokenInfo:   tokenInfo,
+			Database:    info.Database,
+			Measurement: info.Measurement,
+			Permission:  "read",
+		}
+	}
+	results := h.rbacManager.CheckPermissionsBatch(reqs)
+	out := make([]MeasurementInfo, 0, len(infos))
+	for i, info := range infos {
+		if i < len(results) && results[i] != nil && results[i].Allowed {
+			out = append(out, info)
+		}
+	}
+	return out
+}
+
+// filterReadableMeasurements returns only the measurements the caller may
+// read, preserving order. See DatabasesHandler.filterReadableMeasurements —
+// the listing gate asks the weak "may you enumerate here" question, so the
+// per-name filter is what keeps a listing table-level and stops it disclosing
+// names the caller cannot read. One batch call per listing.
+func (h *QueryHandler) filterReadableMeasurements(c *fiber.Ctx, database string, names []string) []string {
+	if h.rbacManager == nil || len(names) == 0 {
+		return names
+	}
+	tokenInfo := auth.GetTokenInfo(c)
+	if tokenInfo == nil {
+		return names
+	}
+	reqs := make([]*auth.PermissionCheckRequest, len(names))
+	for i, n := range names {
+		reqs[i] = &auth.PermissionCheckRequest{
+			TokenInfo:   tokenInfo,
+			Database:    database,
+			Measurement: n,
+			Permission:  "read",
+		}
+	}
+	results := h.rbacManager.CheckPermissionsBatch(reqs)
+	out := make([]string, 0, len(names))
+	for i, n := range names {
+		if i < len(results) && results[i] != nil && results[i].Allowed {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// checkListingPermission gates enumerating the contents of ONE named database.
+//
+// It asks CanAccessAnythingIn, not CheckPermission with "*": the latter means
+// "may this caller touch every measurement in the database", which denies
+// every token whose role carries measurement-level grants — the canonical
+// tenant shape. Callers that return names should also filter them per name,
+// so a caller never learns the names it cannot read.
+func (h *QueryHandler) checkListingPermission(c *fiber.Ctx, database string) error {
+	if h.rbacManager == nil {
+		return nil
+	}
+	tokenInfo := auth.GetTokenInfo(c)
+	if tokenInfo == nil {
+		return nil
+	}
+	if h.rbacManager.CanAccessAnythingIn(tokenInfo, database, "read") {
+		return nil
+	}
+	h.logger.Warn().
+		Str("database", database).
+		Int64("token_id", tokenInfo.ID).
+		Msg("RBAC denied listing")
+	return fmt.Errorf("access denied: no read permission for database '%s'", database)
+}
+
 // checkMeasurementPermission checks RBAC permission for a specific database/measurement
 // This is a simpler version for endpoints where database/measurement are known directly
 func (h *QueryHandler) checkMeasurementPermission(c *fiber.Ctx, database, measurement, permission string) error {
@@ -1928,7 +2019,13 @@ localProcessing:
 			return respondError(c, fiber.StatusBadRequest, "invalid database name: "+err.Error(), timestamp, start)
 		}
 		// Check RBAC - user needs read permission on the specific database
-		if err := h.checkMeasurementPermission(c, database, "*", "read"); err != nil {
+		// A NAMED database's contents require only "some read grant inside this
+		// database" (Measurement: ""), not a grant covering every measurement in
+		// it (Measurement: "*"). Asking "*" denies every token whose role carries
+		// measurement-level grants — the canonical tenant shape, and the whole
+		// reason rbac_measurement_permissions exists — because matchPattern("cpu",
+		// "*") is false. Listing EVERYTHING still requires ("*","*").
+		if err := h.checkListingPermission(c, database); err != nil {
 			m.IncQueryErrors()
 			return respondError(c, fiber.StatusForbidden, fmt.Sprintf("access denied: no read permission for database '%s'", database), timestamp, start)
 		}
@@ -4365,6 +4462,12 @@ func (h *QueryHandler) handleShowTables(c *fiber.Ctx, start time.Time, database 
 		}
 	}
 
+	// Drop the measurements the caller may not read, so SHOW TABLES agrees
+	// with GET /api/v1/databases/:name/measurements instead of disclosing
+	// names that endpoint filters out. Done before the per-table stat calls,
+	// so an unreadable table costs nothing.
+	filtered = h.filterReadableMeasurements(c, database, filtered)
+
 	// Sort alphabetically
 	sort.Strings(filtered)
 
@@ -4589,7 +4692,13 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 				WarningLevel: "error",
 			})
 		}
-		if err := h.checkMeasurementPermission(c, database, "*", "read"); err != nil {
+		// A NAMED database's contents require only "some read grant inside this
+		// database" (Measurement: ""), not a grant covering every measurement in
+		// it (Measurement: "*"). Asking "*" denies every token whose role carries
+		// measurement-level grants — the canonical tenant shape, and the whole
+		// reason rbac_measurement_permissions exists — because matchPattern("cpu",
+		// "*") is false. Listing EVERYTHING still requires ("*","*").
+		if err := h.checkListingPermission(c, database); err != nil {
 			metrics.Get().IncQueryErrors()
 			return c.Status(fiber.StatusForbidden).JSON(EstimateResponse{
 				Success:      false,
@@ -4810,11 +4919,17 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 	// When a database filter is specified, check against that specific database instead of
 	// requiring wildcard access — users with single-database permissions should be able to
 	// list measurements scoped to that database.
-	rbacDB := "*"
+	// Scoped to one database: "some read grant inside it" (see the note on the
+	// SHOW TABLES gate above). Unscoped: a grant covering everything.
+	// Scoped to one database: the listing question. Unscoped: a grant
+	// covering everything, the same bar SHOW DATABASES applies.
+	var permErr error
 	if dbFilter != "" {
-		rbacDB = dbFilter
+		permErr = h.checkListingPermission(c, dbFilter)
+	} else {
+		permErr = h.checkMeasurementPermission(c, "*", "*", "read")
 	}
-	if err := h.checkMeasurementPermission(c, rbacDB, "*", "read"); err != nil {
+	if err := permErr; err != nil {
 		metrics.Get().IncQueryErrors()
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 			"success": false,
@@ -4889,6 +5004,13 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 			})
 		}
 	}
+
+	// Drop the (database, measurement) pairs the caller may not read. This
+	// endpoint can span several databases, so it filters per pair rather than
+	// per name. Unscoped callers had to clear the ("*","*") bar above to get
+	// here, so in practice this trims the scoped case; it is applied
+	// unconditionally so the result can never exceed the caller's grants.
+	measurements = h.filterReadableMeasurementInfos(c, measurements)
 
 	// Sort by database, then measurement
 	sort.Slice(measurements, func(i, j int) bool {

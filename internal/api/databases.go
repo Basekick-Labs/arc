@@ -52,7 +52,70 @@ func (h *DatabasesHandler) SetRBACManager(rm RBACChecker) { h.rbacManager = rm }
 // Returns nil when RBAC is disabled or no token is present: the route
 // middleware has already decided whether an unauthenticated request is
 // allowed, exactly as the query path does.
-func (h *DatabasesHandler) checkDatabasePermission(c *fiber.Ctx, database, permission string) error {
+// filterReadableMeasurements returns only the measurements the caller may
+// read, preserving order.
+//
+// The listing gate asks the weak question ("may this caller enumerate inside
+// this database"), so the gate alone would disclose the names of measurements
+// the caller cannot read. Filtering is what makes a listing table-level: a
+// caller granted db1.cpu sees ["cpu"], not ["cpu","secrets"]. One batch call,
+// so it is a single RBAC data load regardless of how many names there are.
+//
+// Returns the input unchanged when RBAC is not wired or there is no token, for
+// the same reason the gates do: the route middleware has already decided
+// whether an unauthenticated request is allowed.
+func (h *DatabasesHandler) filterReadableMeasurements(c *fiber.Ctx, database string, names []string) []string {
+	if h.rbacManager == nil || len(names) == 0 {
+		return names
+	}
+	tokenInfo := auth.GetTokenInfo(c)
+	if tokenInfo == nil {
+		return names
+	}
+	reqs := make([]*auth.PermissionCheckRequest, len(names))
+	for i, n := range names {
+		reqs[i] = &auth.PermissionCheckRequest{
+			TokenInfo:   tokenInfo,
+			Database:    database,
+			Measurement: n,
+			Permission:  "read",
+		}
+	}
+	results := h.rbacManager.CheckPermissionsBatch(reqs)
+	out := make([]string, 0, len(names))
+	for i, n := range names {
+		if i < len(results) && results[i] != nil && results[i].Allowed {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// checkDatabasePermissionScoped gates enumerating ONE named database on
+// CanAccessAnythingIn — "may this caller enumerate inside this database" —
+// rather than on a grant covering every measurement in it. Asking for "*"
+// denies every token whose role carries measurement-level grants, which is
+// the canonical tenant shape.
+func (h *DatabasesHandler) checkDatabasePermissionScoped(c *fiber.Ctx, database, permission string) error {
+	if h.rbacManager == nil {
+		return nil
+	}
+	tokenInfo := auth.GetTokenInfo(c)
+	if tokenInfo == nil {
+		return nil
+	}
+	if h.rbacManager.CanAccessAnythingIn(tokenInfo, database, permission) {
+		return nil
+	}
+	h.logger.Warn().
+		Str("database", database).
+		Str("permission", permission).
+		Int64("token_id", tokenInfo.ID).
+		Msg("RBAC denied listing")
+	return fmt.Errorf("access denied: no %s permission for database '%s'", permission, database)
+}
+
+func (h *DatabasesHandler) checkDatabasePermission(c *fiber.Ctx, database, measurement, permission string) error {
 	// Gated on the checker being WIRED, not on the license. Enforcement must
 	// survive a lapsed or revoked license: see the RBAC ENFORCEMENT MODEL note
 	// in internal/auth/rbac_manager.go. CheckPermission itself resolves the
@@ -69,7 +132,7 @@ func (h *DatabasesHandler) checkDatabasePermission(c *fiber.Ctx, database, permi
 	result := h.rbacManager.CheckPermission(&auth.PermissionCheckRequest{
 		TokenInfo:   tokenInfo,
 		Database:    database,
-		Measurement: "*",
+		Measurement: measurement,
 		Permission:  permission,
 	})
 	if !result.Allowed {
@@ -194,14 +257,11 @@ func (h *DatabasesHandler) handleList(c *fiber.Ctx) error {
 	// Listing every database asks for a grant covering every database, the
 	// same bar `SHOW DATABASES` applies (handleShowDatabases in query.go).
 	//
-	// CAVEAT, and it is not this function's doing: the RBAC layer currently
-	// overrides every denial with the token's coarse permissions
-	// (checkPermissionUncached -> checkOSSPermission, internal/auth), so a
-	// token carrying the coarse "read" bit — which RequireRead above demands
-	// of every caller — is allowed here whatever its grants say. This gate is
-	// therefore correct in shape and INERT in production until that is fixed.
-	// Do not read it as evidence that a database-scoped caller is refused.
-	if err := h.checkDatabasePermission(c, "*", "read"); err != nil {
+	// A caller without a grant covering every database is refused here and
+	// must name its database via GET /api/v1/databases/<name>, which asks the
+	// weaker "may you enumerate inside it" question and filters the names it
+	// returns. Same bar `SHOW DATABASES` applies.
+	if err := h.checkDatabasePermission(c, "*", "*", "read"); err != nil {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": err.Error()})
 	}
 
@@ -310,7 +370,7 @@ func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
 	// Gate on the resolved database, the same bar `SHOW TABLES FROM db`
 	// applies. Checked AFTER name validation so an invalid name is a 400
 	// rather than leaking whether the caller would have been allowed.
-	if err := h.checkDatabasePermission(c, name, "read"); err != nil {
+	if err := h.checkDatabasePermissionScoped(c, name, "read"); err != nil {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": err.Error()})
 	}
 
@@ -364,7 +424,7 @@ func (h *DatabasesHandler) handleListMeasurements(c *fiber.Ctx) error {
 	// Gate on the resolved database, the same bar `SHOW TABLES FROM db`
 	// applies. Checked AFTER name validation so an invalid name is a 400
 	// rather than leaking whether the caller would have been allowed.
-	if err := h.checkDatabasePermission(c, name, "read"); err != nil {
+	if err := h.checkDatabasePermissionScoped(c, name, "read"); err != nil {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": err.Error()})
 	}
 
@@ -396,6 +456,11 @@ func (h *DatabasesHandler) handleListMeasurements(c *fiber.Ctx) error {
 			"error": "Database '" + name + "' not found",
 		})
 	}
+
+	// Existence was decided above on the UNFILTERED list, so filtering cannot
+	// turn an existing database into a 404 — a caller that may enumerate here
+	// but holds no readable measurement gets an empty list, not "not found".
+	measurements = h.filterReadableMeasurements(c, name, measurements)
 
 	// Build response
 	measurementInfos := make([]DatabaseMeasurement, 0, len(measurements))

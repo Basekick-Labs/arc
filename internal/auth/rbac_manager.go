@@ -1473,14 +1473,18 @@ func (rm *RBACManager) CheckPermission(req *PermissionCheckRequest) *PermissionC
 	// Cache miss - compute permission
 	result := rm.checkPermissionUncached(req)
 
-	// Cache the result
-	rm.permCacheMu.Lock()
-	rm.evictPermCacheIfFull()
-	rm.permCache[cacheKey] = &permissionCacheEntry{
-		result:    result,
-		expiresAt: time.Now().Add(rm.permCacheTTL),
+	// Cache the result — except a store-unavailable denial, which is a
+	// transient fault, not a decision. Caching it would hold a 403 for
+	// permCacheTTL after the store recovered.
+	if result.Source != SourceUnavailable {
+		rm.permCacheMu.Lock()
+		rm.evictPermCacheIfFull()
+		rm.permCache[cacheKey] = &permissionCacheEntry{
+			result:    result,
+			expiresAt: time.Now().Add(rm.permCacheTTL),
+		}
+		rm.permCacheMu.Unlock()
 	}
-	rm.permCacheMu.Unlock()
 
 	return result
 }
@@ -1535,7 +1539,7 @@ func (rm *RBACManager) CheckPermissionsBatch(reqs []*PermissionCheckRequest) []*
 			for _, ir := range indexedReqs {
 				results[ir.index] = &PermissionCheckResult{
 					Allowed: false,
-					Source:  "denied",
+					Source:  SourceUnavailable,
 					Reason:  "permission data unavailable",
 				}
 			}
@@ -1586,14 +1590,16 @@ func (rm *RBACManager) CheckPermissionsBatch(reqs []*PermissionCheckRequest) []*
 				}
 			}
 
-			// Cache the result
-			rm.permCacheMu.Lock()
-			rm.evictPermCacheIfFull()
-			rm.permCache[cacheKey] = &permissionCacheEntry{
-				result:    result,
-				expiresAt: time.Now().Add(rm.permCacheTTL),
+			// Same exclusion as the single-check path.
+			if result.Source != SourceUnavailable {
+				rm.permCacheMu.Lock()
+				rm.evictPermCacheIfFull()
+				rm.permCache[cacheKey] = &permissionCacheEntry{
+					result:    result,
+					expiresAt: time.Now().Add(rm.permCacheTTL),
+				}
+				rm.permCacheMu.Unlock()
 			}
-			rm.permCacheMu.Unlock()
 
 			results[ir.index] = result
 		}
@@ -1616,7 +1622,7 @@ func (rm *RBACManager) checkPermissionUncached(req *PermissionCheckRequest) *Per
 			Msg("RBAC data load failed; denying (fail closed)")
 		return &PermissionCheckResult{
 			Allowed: false,
-			Source:  "denied",
+			Source:  SourceUnavailable,
 			Reason:  "permission data unavailable",
 		}
 	}
@@ -1758,6 +1764,14 @@ func (rm *RBACManager) loadTokenRBACData(tokenID int64) (*tokenRBACData, error) 
 	return data, nil
 }
 
+// SourceUnavailable is the Source of a denial caused by the permission store
+// being unreadable rather than by a grant. It is deliberately distinct from
+// "denied": a grant-based denial is a stable fact worth caching, while this
+// one is a transient infrastructure fault and caching it would turn a blip
+// into 30 seconds of 403 for every request that shares the cache key — on the
+// ingest path, which calls CheckPermission once per measurement.
+const SourceUnavailable = "unavailable"
+
 // hasCoarseAdmin reports whether a token carries the coarse "admin"
 // permission, which bypasses RBAC entirely.
 //
@@ -1825,6 +1839,65 @@ func (rm *RBACManager) checkOSSPermission(req *PermissionCheckRequest) *Permissi
 	}
 }
 
+// CanAccessAnythingIn reports whether the token holds any grant permitting
+// `permission` on at least one measurement in `database`.
+//
+// This is the question a LISTING asks, and it is deliberately not expressible
+// through CheckPermission: a listing wants "may this caller see that this
+// database exists / enumerate inside it", which is weaker than "may this
+// caller touch every measurement in it" (what CheckPermission with "*" asks)
+// and must not be reachable by passing a crafted measurement value. Callers
+// that enumerate names should pair this with a per-name CheckPermissionsBatch
+// so the names returned are the ones the caller can actually read.
+//
+// Resolution order matches CheckPermission: admin break-glass, then
+// memberships, then coarse permissions.
+func (rm *RBACManager) CanAccessAnythingIn(tokenInfo *TokenInfo, database, permission string) bool {
+	if tokenInfo == nil {
+		return false
+	}
+	if hasCoarseAdmin(tokenInfo) {
+		return true
+	}
+	data, err := rm.getTokenRBACData(tokenInfo.ID)
+	if err != nil {
+		rm.logger.Error().Err(err).
+			Int64("token_id", tokenInfo.ID).
+			Msg("RBAC data load failed; denying listing (fail closed)")
+		return false
+	}
+	if len(data.teams) == 0 {
+		return rm.checkOSSPermission(&PermissionCheckRequest{
+			TokenInfo: tokenInfo, Database: database, Measurement: "*", Permission: permission,
+		}).Allowed
+	}
+	if !tokenInfo.Enabled {
+		return false
+	}
+	for _, team := range data.teams {
+		if !team.Enabled {
+			continue
+		}
+		for _, role := range data.roles[team.ID] {
+			if !matchPattern(role.DatabasePattern, database) {
+				continue
+			}
+			if measPerms := data.measPerms[role.ID]; len(measPerms) > 0 {
+				for _, mp := range measPerms {
+					if containsPermission(mp.Permissions, permission) {
+						return true
+					}
+				}
+				continue
+			}
+			if containsPermission(role.Permissions, permission) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // checkRBACPermissionCached checks permissions using cached RBAC data (no DB queries)
 func (rm *RBACManager) checkRBACPermissionCached(req *PermissionCheckRequest, data *tokenRBACData) bool {
 	// Check if token is disabled - deny immediately
@@ -1844,25 +1917,37 @@ func (rm *RBACManager) checkRBACPermissionCached(req *PermissionCheckRequest, da
 				continue
 			}
 
-			// If measurement is specified, check measurement permissions
-			if req.Measurement != "" {
-				measPerms := data.measPerms[role.ID]
-
-				// If there are measurement permissions, check them
-				if len(measPerms) > 0 {
-					for _, mp := range measPerms {
-						if matchPattern(mp.MeasurementPattern, req.Measurement) {
-							if containsPermission(mp.Permissions, req.Permission) {
-								return true
-							}
-						}
+			// Once a role carries measurement grants it is restricted to them,
+			// whatever the requested measurement is — including "" and "*".
+			//
+			// This used to be guarded by `req.Measurement != ""`, which made
+			// the empty string the most permissive value in the system: it
+			// skipped the grant list and fell through to the role-level
+			// permission below. Since CreateRole requires a non-empty
+			// role-level permission list, a role narrowed by measurement
+			// grants ALWAYS has a database-wide permission underneath, so an
+			// empty measurement silently un-narrowed it. Any caller that
+			// forwards a request value — RequireResourcePermission passes
+			// extractMeasurement(c), which is "" on every route that names no
+			// measurement — could therefore ask a question that bypassed
+			// table-level scoping entirely.
+			//
+			// Asking "can this token reach ANY measurement in this database",
+			// which is what a listing needs, is a different question and now
+			// has its own predicate: CanAccessAnythingIn.
+			if measPerms := data.measPerms[role.ID]; len(measPerms) > 0 {
+				for _, mp := range measPerms {
+					if matchPattern(mp.MeasurementPattern, req.Measurement) &&
+						containsPermission(mp.Permissions, req.Permission) {
+						return true
 					}
-					// Has measurement permissions but none matched - deny for this role
-					continue
 				}
+				// Restricted to its grants, and none matched.
+				continue
 			}
 
-			// Check role-level permissions (applies if no measurement filter or no measurement permissions defined)
+			// No measurement grants: the role's database-level permission
+			// applies to every measurement in the matched database.
 			if containsPermission(role.Permissions, req.Permission) {
 				return true
 			}
@@ -1923,27 +2008,32 @@ func (rm *RBACManager) checkRBACPermission(req *PermissionCheckRequest, teams []
 }
 
 // GetEffectivePermissions returns all effective permissions for a token
+// GetEffectivePermissions is the surface an operator reads when debugging a
+// denial, so it must describe what ENFORCEMENT does, not what the license
+// says. It therefore no longer short-circuits on IsRBACEnabled(): on a lapsed
+// license enforcement still honours the grants, and reporting "no RBAC" there
+// would send the operator looking in the wrong place. The coarse permissions
+// are reported only when they actually apply — a token with team memberships
+// is governed by its grants, with coarse `admin` as the sole override.
 func (rm *RBACManager) GetEffectivePermissions(tokenID int64, tokenInfo *TokenInfo) ([]EffectivePermission, error) {
 	var perms []EffectivePermission
 
-	// Add OSS token permissions
-	if tokenInfo != nil && len(tokenInfo.Permissions) > 0 {
+	// Memberships decide, exactly as enforcement does, so resolve them first.
+	teams, err := rm.GetTokenTeams(tokenID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get token teams: %w", err)
+	}
+
+	// The coarse permissions apply only when they actually govern: a token
+	// with no memberships (case 3), or one holding `admin` (case 1). Reporting
+	// them as Database "*" for a membership-bearing non-admin token would
+	// claim deployment-wide access the enforcement path denies.
+	if tokenInfo != nil && len(tokenInfo.Permissions) > 0 && (len(teams) == 0 || hasCoarseAdmin(tokenInfo)) {
 		perms = append(perms, EffectivePermission{
 			Database:    "*",
 			Permissions: tokenInfo.Permissions,
 			Source:      "token",
 		})
-	}
-
-	// If RBAC is not enabled, return only OSS permissions
-	if !rm.IsRBACEnabled() {
-		return perms, nil
-	}
-
-	// Get RBAC permissions from team memberships
-	teams, err := rm.GetTokenTeams(tokenID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get token teams: %w", err)
 	}
 
 	for _, team := range teams {
@@ -2041,6 +2131,27 @@ func matchPattern(pattern, value string) bool {
 	if strings.HasSuffix(pattern, "*") {
 		prefix := strings.TrimSuffix(pattern, "*")
 		return strings.HasPrefix(value, prefix)
+	}
+
+	// General wildcard at start (e.g., "*metrics" matches "cpu_metrics",
+	// "httpmetrics"). The mirror of the branch above, and it was missing.
+	//
+	// patternValidationRegex accepts `^\*[a-zA-Z0-9_-]*$` and the rejection
+	// message advertises "optional trailing or leading wildcard", so such a
+	// pattern was always accepted at creation — and then matched nothing,
+	// because this fell through to the exact comparison below and no real
+	// name equals "*metrics". While an RBAC denial fell back to the token's
+	// coarse permissions that was invisible; now that a denial is final, a
+	// dead grant is a total silent lockout of the token it was meant to
+	// authorize. Honouring the documented pattern is the fix: tightening the
+	// validator instead would leave every already-stored grant dead, which is
+	// the lockout rather than a cure for it.
+	//
+	// Every pattern patternValidationRegex admits now has a branch: "*" above,
+	// "x*" above, "*_x" above, "*x" here, "x" exactly below. "**" and "*_*"
+	// are rejected at creation.
+	if strings.HasPrefix(pattern, "*") {
+		return strings.HasSuffix(value, strings.TrimPrefix(pattern, "*"))
 	}
 
 	// Exact match

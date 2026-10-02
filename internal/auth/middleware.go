@@ -250,6 +250,7 @@ func ExtractTokenFromRequest(c *fiber.Ctx) string {
 // can pass it through without depending on the concrete type.
 type ResourcePermissionChecker interface {
 	CheckPermission(req *PermissionCheckRequest) *PermissionCheckResult
+	CanAccessAnythingIn(tokenInfo *TokenInfo, database, permission string) bool
 }
 
 // RequireResourcePermission creates middleware that checks resource-scoped
@@ -297,7 +298,24 @@ func RequireResourcePermission(am *AuthManager, rm ResourcePermissionChecker, pe
 			return c.Next()
 		}
 
-		// Use RBAC permission checking
+		// A request that names NO measurement is asking about the database as
+		// a whole — a listing, or an operation the handler will scope itself.
+		// That is the weak question, and it must NOT be asked by passing an
+		// empty measurement to CheckPermission: a role carrying measurement
+		// grants is restricted to them for every measurement value, "" and
+		// "*" included, so that would deny the canonical tenant shape at the
+		// door. CanAccessAnythingIn is the predicate for it.
+		if measurement == "" {
+			if !rm.CanAccessAnythingIn(tokenInfo, database, permission) {
+				return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+					"success": false,
+					"error":   "Permission denied: " + permission + " required",
+				})
+			}
+			return c.Next()
+		}
+
+		// A named measurement is the exact question.
 		result := rm.CheckPermission(&PermissionCheckRequest{
 			TokenInfo:   tokenInfo,
 			Database:    database,
@@ -321,20 +339,28 @@ func RequireResourcePermission(am *AuthManager, rm ResourcePermissionChecker, pe
 // extractDatabase extracts the target database from the request.
 // Checks: x-arc-database header, path parameter, query parameter
 func extractDatabase(c *fiber.Ctx) string {
-	// Check header first
-	if db := c.Get("x-arc-database"); db != "" {
-		return db
-	}
-
-	// Check path parameter
+	// PATH FIRST, header second. A route that names the database in its path
+	// is serving that database, so authorizing a different one — the value of
+	// a client's session-wide x-arc-database header — is wrong in both
+	// directions: it false-denies a caller that is entitled to the path's
+	// database, and for any future route where this middleware is the ONLY
+	// gate it would authorize the header while the handler served the path.
+	// The handlers that exist today re-check the path name, so deny-wins
+	// makes that second case latent rather than live; it must not be left
+	// for the next adopter of RequireResourceWrite/Delete to discover.
+	//
+	// ":name" is the databases routes' parameter (/api/v1/databases/:name) and
+	// is the only route family using it, so reading it cannot pick up a value
+	// that is not a database.
 	if db := c.Params("database"); db != "" {
 		return db
 	}
-
-	// The databases routes name their parameter ":name"
-	// (/api/v1/databases/:name). That is the ONLY route family using ":name",
-	// so reading it here cannot pick up a value that is not a database.
 	if db := c.Params("name"); db != "" {
+		return db
+	}
+
+	// No database in the path: the header is the request's target.
+	if db := c.Get("x-arc-database"); db != "" {
 		return db
 	}
 

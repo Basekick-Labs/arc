@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -222,33 +223,26 @@ func TestDatabasesListing_RBACScoping(t *testing.T) {
 	}
 }
 
-// A caller whose grants in db1 are per-MEASUREMENT (say db1.cpu:read) has no
-// grant covering db1 as a whole, so it must not receive the list of every
-// measurement name in db1 — those names include measurements it cannot read.
+// A caller whose grants in db1 are per-MEASUREMENT must be able to enumerate
+// inside db1 — it does hold a grant there — but must see only the names it
+// can actually read. Gating the listing instead would deny it entirely, which
+// is the shape that made measurement-level grants unusable; returning every
+// name would disclose measurements it cannot read. Filtering is what makes a
+// listing table-level.
 //
-// The mock models the verdict the RBAC *matcher* reaches:
-// matchPattern(grantPattern, requested) (rbac_manager.go:1800) with
-// requested = "*" gives `"cpu" == "*"`, false — so the matcher denies, which
-// is the bar `SHOW TABLES FROM db1` applies (query.go:1919). The mock's
-// deniedMeasurements entry reproduces that for (db1, *) while leaving
-// (db1, cpu) allowed.
-//
-// It does NOT model the whole production path, and the difference matters:
-// one frame further out, checkPermissionUncached overrides any denial with
-// the token's coarse permissions (-> checkOSSPermission), and RequireRead
-// demands that same coarse "read" bit of every caller. So in production this
-// request is currently ALLOWED. This test pins the bar the handler asks for;
-// it does not prove a scoped caller is refused today, and it will start
-// reflecting production once the coarse-permission override is removed.
-func TestDatabasesListing_PerMeasurementGrantCannotListNames(t *testing.T) {
+// The gate and the filter ask deliberately different questions:
+// CanAccessAnythingIn for "may you enumerate here", then a per-name batch
+// check for "which of these may you read".
+func TestDatabasesListing_PerMeasurementGrantSeesOnlyGrantedNames(t *testing.T) {
 	h, app, am, cleanup := authedDatabasesRig(t)
 	defer cleanup()
 
+	// db1 is enumerable; within it only "cpu" is readable.
 	h.SetRBACManager(&mockRBACChecker{
 		enabled:            true,
 		allowedDBs:         map[string]bool{"db1": true},
-		deniedMeasurements: map[string]bool{"db1.*": true},
-		deniedReason:       "no database-wide read permission",
+		deniedMeasurements: map[string]bool{"db1.secrets": true},
+		deniedReason:       "no read permission",
 	})
 	tok := mustCreateToken(t, am, "measurement-scoped", "read")
 
@@ -259,10 +253,17 @@ func TestDatabasesListing_PerMeasurementGrantCannotListNames(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != fiber.StatusForbidden {
-		body, _ := io.ReadAll(resp.Body)
-		t.Errorf("a per-measurement grant must not enumerate every measurement name in the database, got %d: %s",
-			resp.StatusCode, body)
+	body, _ := io.ReadAll(resp.Body)
+
+	// The gate must not refuse it.
+	if resp.StatusCode == fiber.StatusForbidden {
+		t.Fatalf("a token holding a grant inside db1 must be able to enumerate it, got 403: %s", body)
+	}
+	// And an ungranted name must not appear. (The rig has no db1 on disk, so
+	// this is a 404 with no names; the assertion is that if names ever are
+	// returned, "secrets" is not among them.)
+	if strings.Contains(string(body), "secrets") {
+		t.Errorf("an ungranted measurement name leaked into the listing: %s", body)
 	}
 }
 

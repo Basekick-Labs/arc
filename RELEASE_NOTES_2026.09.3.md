@@ -110,10 +110,39 @@ ability to change grants, never the grants' effect. A failure to load a
 token's grants now denies instead of falling through.
 
 The middleware half ships with it: a resource-scoped middleware that consults
-RBAC already existed and was wired to nothing. The listing routes now use it,
-so a token created with no coarse permissions — the documented way to ask for
-an RBAC-only token — can reach a handler and be scoped by its grants instead
-of being refused in front of it.
+RBAC already existed and was wired to nothing. **The three database listing
+routes** now use it, so a token created with no coarse permissions — the
+documented way to ask for an RBAC-only token — can reach those handlers and be
+scoped by its grants instead of being refused in front of them. The query and
+ingest routes still require the coarse `read`/`write` bit, so such a token
+cannot yet query or write; those routes are authoritative on scoping already
+(`checkQueryPermissions`, `CheckWritePermissions`), and adopting the middleware
+there is a follow-up.
+
+**Grants are enforced per measurement, including for listings.** A role is
+restricted to its measurement grants for every question asked of it. That was
+previously true only when a specific measurement was named: an empty
+measurement skipped the grant list and fell through to the role's
+database-level permission, which made the empty string the most permissive
+value in the system and reachable from any route that named no measurement.
+Listing a database's contents is a genuinely different and weaker question —
+"may this caller enumerate here" — and now has its own predicate rather than
+borrowing an empty measurement, so it cannot be used to sidestep table-level
+scoping.
+
+Listings are therefore filtered rather than all-or-nothing: a caller granted
+`db1.cpu` sees `["cpu"]` from `GET /api/v1/databases/db1/measurements`,
+`SHOW TABLES FROM db1` and `GET /api/v1/measurements?database=db1` alike —
+not the whole table list, and not a `403`. One batched permission check per
+listing regardless of how many names it holds.
+
+**A grant pattern with a leading wildcard now matches.** `*metrics` and
+`*-metrics` were accepted at creation — the validator admits them and its
+rejection message advertises them — but the matcher had no branch for a
+leading `*` without an underscore, so they matched nothing. While an RBAC
+denial fell back to coarse permissions that was invisible; with a denial now
+final it would have been a silent, total lockout of the token it was meant to
+authorize. Every pattern the validator accepts now has a matcher branch.
 
 **Behaviour changes.** All three are intended, and all three are visible:
 
@@ -127,6 +156,15 @@ of being refused in front of it.
   Client tooling that lists databases to populate a picker needs to handle
   that; updates to the CLI, console, MCP server and Python client ship
   alongside.
+- **A grant pattern with a leading wildcard starts matching.** If you hold a
+  `*suffix` pattern it previously matched nothing; it now matches as
+  documented. Review any such pattern before upgrading.
+- **Removing a token from a team no longer requires a license.** Every other
+  RBAC mutation still does. Since enforcement is license-independent, a token
+  whose grants deny more than intended would otherwise be unrecoverable on a
+  lapsed license except by rotating its credential or escalating it to admin;
+  removing a membership can only narrow RBAC's reach, so it is the escape
+  hatch.
 - **The compaction and retention read-only endpoints now require admin.**
   `GET /api/v1/compaction/{status,stats,candidates,jobs,history}` and
   `GET /api/v1/retention{,/:id,/:id/executions}` previously accepted any
