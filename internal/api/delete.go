@@ -508,6 +508,40 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 		return false, fmt.Errorf("WHERE clause contains forbidden file I/O function: %s()", m[1])
 	}
 
+	// SECURITY: reject a path literal standing in table position inside the
+	// fragment. The keyword and I/O-function scans above cannot see this
+	// class: a replacement scan has no function name to match, and the
+	// keyword list blocks SELECT and UNION but not the other spellings
+	// DuckDB accepts for introducing a relation — `EXISTS (FROM '<glob>')`
+	// and `EXISTS (TABLE '<glob>')` carry neither.
+	//
+	// That matters here because the fragment is interpolated straight into
+	// `SELECT ... FROM read_parquet(...) WHERE <fragment>` (findAffectedFiles,
+	// and the per-file count below it), so a literal standing in table
+	// position there is resolved by DuckDB rather than treated as a value —
+	// and the response carries row and file counts derived from it, dry-run
+	// included.
+	//
+	// Reuses the query path's guard rather than growing a third keyword list
+	// in this file: that guard is fed by the same normalisation and already
+	// knows every relation-introducing keyword DuckDB has (FROM, JOIN, TABLE,
+	// SUMMARIZE, DESCRIBE, PIVOT, UNPIVOT), so this inherits additions to it
+	// instead of drifting from them.
+	//
+	// It is applied to the FRAGMENT, not to the assembled statement: by the
+	// time the statement exists the fragment sits inside Arc's own
+	// read_parquet(...), which would self-trip the I/O denylist — the same
+	// ordering constraint queryMeasurement documents. A fragment that
+	// introduces a relation carries its own keyword, so the scanner arms
+	// without needing a synthetic FROM clause around it.
+	maskInput := backticksToDoubleQuotes(where)
+	features := scanSQLFeatures(maskInput)
+	normalised, _ := sqlutil.MaskStringLiterals(maskInput, features.hasQuotes)
+	normalised = stripSQLComments(normalised, features.hasDashComment || features.hasBlockComment)
+	if stringLiteralInTablePosition(normalised) {
+		return false, fmt.Errorf("WHERE clause may not put a string literal in table position (replacement scans are disabled)")
+	}
+
 	// Check for dangerous prefixes
 	for _, pattern := range dangerousPrefixPatterns {
 		if strings.Contains(whereUpper, pattern) {

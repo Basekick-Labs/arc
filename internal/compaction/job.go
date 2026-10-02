@@ -582,9 +582,9 @@ func (j *Job) downloadFiles(ctx context.Context, tempDir string) ([]downloadedFi
 	return finalFiles, nil
 }
 
-// downloadSingleFile downloads a single file from storage using streaming to avoid memory issues.
-// MEMORY OPTIMIZATION: Uses ReadTo to stream directly to disk instead of loading entire file into memory.
-// This prevents OOM errors when compacting partitions with large files.
+// downloadSingleFile reuses local-backend files in place and streams other
+// backends into a unique temp file. Streaming avoids loading large files into
+// memory during compaction.
 func (j *Job) downloadSingleFile(ctx context.Context, tempDir string, index int, fileKey string) downloadResult {
 	// Check for cancellation
 	select {

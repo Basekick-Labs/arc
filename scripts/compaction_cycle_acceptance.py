@@ -16,6 +16,7 @@ from pathlib import Path
 import signal
 import socket
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -156,6 +157,26 @@ enabled = false
     def cycle(self, table):
         before = self.request('/api/v1/compaction/stats')['current_cycle_id']
         started = utc()
+        input_bytes = sum(path.stat().st_size for path in self.files(table))
+        storage_before = self.storage_counters()
+        peak_temp_bytes = [0]
+        stop_sampling = threading.Event()
+
+        def sample_temp_usage():
+            temp_dir = self.root / 'data' / 'compaction'
+            while not stop_sampling.is_set():
+                total = 0
+                for directory, _, names in os.walk(temp_dir):
+                    for name in names:
+                        try:
+                            total += (Path(directory) / name).stat().st_size
+                        except OSError:
+                            pass
+                peak_temp_bytes[0] = max(peak_temp_bytes[0], total)
+                stop_sampling.wait(.01)
+
+        sampler = threading.Thread(target=sample_temp_usage, daemon=True)
+        sampler.start()
         self.request('/api/v1/compaction/trigger?' + urllib.parse.urlencode(
             {'database': 'acceptance', 'measurement': table, 'tier': 'hourly'}), b'')
         deadline = time.monotonic() + 90
@@ -164,9 +185,35 @@ enabled = false
             stats = self.request('/api/v1/compaction/stats')
             outcome = stats['last_cycle']
             if outcome['cycle_id'] > before and not stats['cycle_running']:
-                return {'started_utc': started, 'finished_utc': utc(), **outcome}
+                stop_sampling.set()
+                sampler.join()
+                storage_after = self.storage_counters()
+                return {
+                    'started_utc': started,
+                    'finished_utc': utc(),
+                    'input_bytes': input_bytes,
+                    'peak_compaction_temp_bytes': peak_temp_bytes[0],
+                    'storage_read_bytes_delta': storage_after['read'] - storage_before['read'],
+                    'storage_write_bytes_delta': storage_after['write'] - storage_before['write'],
+                    **outcome,
+                }
             time.sleep(.02)
+        stop_sampling.set()
+        sampler.join()
         raise AssertionError('cycle did not terminate')
+
+    def storage_counters(self):
+        with urllib.request.urlopen(self.base + '/metrics', timeout=10) as response:
+            metrics = response.read().decode()
+
+        def counter(name):
+            match = re.search(rf'^{name}\s+([0-9.eE+-]+)$', metrics, re.MULTILINE)
+            return int(float(match.group(1))) if match else 0
+
+        return {
+            'read': counter('arc_storage_read_bytes_total'),
+            'write': counter('arc_storage_write_bytes_total'),
+        }
 
 
 def cgroup_events():

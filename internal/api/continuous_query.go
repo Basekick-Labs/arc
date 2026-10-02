@@ -792,6 +792,34 @@ func wrapSourceMeasurement(query, database, measurement, readParquetExpr string)
 func (h *ContinuousQueryHandler) SetFieldSchema(r *fieldschema.Registry) { h.fieldSchema = r }
 
 func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *ContinuousQuery, query string, startTime, _ time.Time) (int64, error) {
+	// SECURITY: re-validate the stored definition before running it.
+	//
+	// validateCQQuery gates create and update, but a definition is a row that
+	// outlives the request that wrote it: it re-executes on a schedule, and
+	// nothing re-checked it in between. Three ways a body reaches this point
+	// unvalidated by the CURRENT rules — a row stored before validateCQQuery
+	// existed at all (which, per its own doc comment, reached DuckDB with no
+	// validation whatsoever), a row stored by an older build whose validator
+	// knew fewer cases, and a row written directly to the shared auth SQLite.
+	//
+	// Validating here rather than in the callers covers all of them at once:
+	// the scheduler (ExecuteCQ), the admin execute endpoint, and any future
+	// caller. It is also why this is worth more now than when it was first
+	// raised — ValidateSQLRequest has since learned the relation-introducing
+	// keywords, so re-validating retroactively protects legacy bodies against
+	// a class their original validator could not see.
+	//
+	// The query arrives with {start_time}/{end_time} already substituted by
+	// both callers, so this validates the exact statement rather than
+	// validateCQQuery's representative probe.
+	//
+	// A body that fails is surfaced, not swallowed: both callers record a
+	// "failed" execution carrying this error, readable via
+	// GET /api/v1/continuous_queries/:id/executions.
+	if err := ValidateSQLRequest(query); err != nil {
+		return 0, fmt.Errorf("stored continuous-query definition %q is not valid SQL to execute: %w", cq.Name, err)
+	}
+
 	// Build storage path for source measurement (supports local, S3, Azure)
 	measurementPath, err := storage.GetStoragePath(h.storage, cq.Database, cq.SourceMeasurement)
 	if err != nil {

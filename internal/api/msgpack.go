@@ -358,7 +358,7 @@ localProcessing:
 	}
 
 	// Check RBAC permissions for all measurements being written (only if RBAC is enabled)
-	if h.rbacManager != nil && h.rbacManager.IsRBACEnabled() {
+	if h.rbacManager != nil { // not license-gated; see CheckWritePermissions
 		if err := h.checkWritePermissions(c, database, measurements); err != nil {
 			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 				"error": err.Error(),
