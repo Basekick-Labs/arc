@@ -503,3 +503,55 @@ func TestRBACParity_SpacedDotQualifier(t *testing.T) {
 		})
 	}
 }
+
+// The `where` fragment on GET /api/v1/query/:measurement is a table position:
+// the transform rewrites references inside it like any other. DuckDB spells a
+// table reference in a scalar subquery three ways, and `FROM` is also legal
+// inside EXTRACT/SUBSTRING/TRIM, which is why a keyword denylist cannot gate
+// this and the permission check has to.
+//
+// These fixtures pin which of those the transform actually resolves, so that
+// teaching the rewriter a new syntax without teaching the extractor fails here
+// rather than in production. `(TABLE t)` is resolved by NEITHER side today —
+// DuckDB then gets a bare name and errors, because Arc databases are virtual
+// and never ATTACHed.
+func TestRBACParity_WhereFragmentSyntaxSurface(t *testing.T) {
+	h := newParityTestHandler()
+	ctx := context.Background()
+
+	tests := []struct {
+		name  string
+		where string
+		want  []string // read set, beyond the always-present db1/cpu
+	}{
+		{name: "SELECT-FROM subquery", where: "1=(SELECT count(*) FROM db2.secrets)", want: []string{"db2/secrets"}},
+		{name: "bare FROM subquery", where: "1=(FROM db2.secrets)", want: []string{"db2/secrets"}},
+		{name: "IN-list subquery", where: "x IN (SELECT y FROM db2.secrets)", want: []string{"db2/secrets"}},
+		{name: "bare name resolves to default", where: "1=(FROM secrets)", want: []string{"default/secrets"}},
+		{name: "TABLE subquery resolved by neither side", where: "1=(TABLE db2.secrets)", want: nil},
+		{name: "FROM inside EXTRACT is not a table", where: "EXTRACT(YEAR FROM time)=2026", want: nil},
+		{name: "FROM inside SUBSTRING is not a table", where: "SUBSTRING(host FROM 1 FOR 3)='web'", want: nil},
+		{name: "FROM inside a string literal is not a table", where: "msg='x FROM db2.secrets'", want: nil},
+		{name: "ordinary predicate", where: "host='web1'", want: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sql := "SELECT * FROM db1.cpu WHERE " + tt.where + " ORDER BY time LIMIT 10 OFFSET 0"
+			want := append([]string{"db1/cpu"}, tt.want...)
+			sort.Strings(want)
+
+			// "" is the default database this route hands the rewriter.
+			check := parityChecks(sql, "")
+			read := parityReads(h.convertSQLToStoragePaths(ctx, sql))
+
+			if strings.Join(read, ",") != strings.Join(want, ",") {
+				t.Errorf("read set = %v, want %v", read, want)
+			}
+			if strings.Join(check, ",") != strings.Join(read, ",") {
+				t.Errorf("check set %v != read set %v — the permission check and the executed query disagree", check, read)
+			}
+			assertNoUnderCheck(t, sql, check, read)
+		})
+	}
+}

@@ -74,6 +74,27 @@ func (m *mockRBACChecker) CheckPermission(req *auth.PermissionCheckRequest) *aut
 	}
 }
 
+// CanAccessAnythingIn mirrors the real manager: "is there ANY grant for this
+// permission inside this database", which is weaker than CheckPermission with
+// "*". deniedMeasurements is deliberately NOT consulted — denying one
+// measurement does not mean the caller can reach nothing in the database.
+//
+// Keep this aligned with auth.RBACManager.CanAccessAnythingIn. A mock that is
+// more permissive than production is what let the coarse-permission fallback
+// go unnoticed; one that is stricter hides real behaviour just as well.
+func (m *mockRBACChecker) CanAccessAnythingIn(tokenInfo *auth.TokenInfo, database, permission string) bool {
+	if !m.enabled || m.allowAll {
+		return true
+	}
+	if tokenInfo == nil {
+		return false
+	}
+	if database == "*" {
+		return false
+	}
+	return m.allowedDBs != nil && m.allowedDBs[database]
+}
+
 func (m *mockRBACChecker) CheckPermissionsBatch(reqs []*auth.PermissionCheckRequest) []*auth.PermissionCheckResult {
 	results := make([]*auth.PermissionCheckResult, len(reqs))
 	for i, req := range reqs {

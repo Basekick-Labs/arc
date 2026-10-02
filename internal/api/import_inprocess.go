@@ -434,7 +434,7 @@ func (h *ImportHandler) importPreamble(c *fiber.Ctx) (string, string, error) {
 		return "", "", c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": fmt.Sprintf("invalid measurement name %q: must start with a letter and contain only alphanumeric characters, underscores, or hyphens", measurement)})
 	}
 
-	if h.rbacManager != nil && h.rbacManager.IsRBACEnabled() {
+	if h.rbacManager != nil { // not license-gated; see CheckWritePermissions
 		if err := CheckWritePermissions(c, h.rbacManager, h.logger, database, []string{measurement}); err != nil {
 			h.totalErrors.Add(1)
 			return "", "", c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": err.Error()})

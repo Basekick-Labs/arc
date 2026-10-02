@@ -31,6 +31,25 @@ func withReadAuth(am *auth.AuthManager) fiber.Handler {
 	return auth.RequireRead(am)
 }
 
+// withResourceReadAuth is withReadAuth for routes that name a database or
+// measurement: it consults RBAC as well as the token's coarse permissions, so
+// a token whose read authority comes from a grant rather than from the coarse
+// "read" bit is not refused before the handler can evaluate RBAC.
+//
+// rm may be nil (OSS, or auth without RBAC wired); the middleware then falls
+// back to the coarse list exactly as withReadAuth does. nil-am is the OSS
+// no-auth deployment.
+//
+// NOTE: the checker is captured when the route is registered, so a handler
+// must have been given its RBAC checker BEFORE RegisterRoutes runs. That is a
+// real requirement, not a convention — see DatabasesHandler.SetRBACManager.
+func withResourceReadAuth(am *auth.AuthManager, rm auth.ResourcePermissionChecker) fiber.Handler {
+	if am == nil {
+		return passthroughMiddleware
+	}
+	return auth.RequireResourceRead(am, rm)
+}
+
 // withAdminAuth is the admin-tier counterpart to withWriteAuth.
 // Used for endpoints that perform globally-disruptive operations
 // (force-flush, bulk imports that rewrite history).
