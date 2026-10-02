@@ -2,6 +2,7 @@ package api
 
 import (
 	"database/sql"
+	"io"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
@@ -335,28 +336,73 @@ func TestCQMigrationFromLegacySchema(t *testing.T) {
 }
 
 func TestContinuousQueryDatabaseValidation(t *testing.T) {
-	h := newSQLiteOnlyCQHandler(t, filepath.Join(t.TempDir(), "cq.db"))
-	defer h.sqliteDB.Close()
-	h.config = &config.ContinuousQueryConfig{Enabled: true}
+	validFields := `"name":"test","source_measurement":"src","destination_measurement":"dst","query":"SELECT * FROM src WHERE time >= {start_time} AND time < {end_time}","interval":"1h"`
+	tests := []struct {
+		name      string
+		method    string
+		body      string
+		seedQuery bool
+		wantError string
+	}{
+		{
+			name:      "POST rejects invalid database name",
+			method:    "POST",
+			body:      `{` + validFields + `,"database":"db*"}`,
+			wantError: "invalid database name",
+		},
+		{
+			name:      "PUT rejects invalid database name",
+			method:    "PUT",
+			body:      `{` + validFields + `,"database":"db*"}`,
+			seedQuery: true,
+			wantError: "invalid database name",
+		},
+		{
+			name:      "PUT requires database",
+			method:    "PUT",
+			body:      `{` + validFields + `}`,
+			seedQuery: true,
+			wantError: "database is required",
+		},
+	}
 
-	app := fiber.New()
-	app.Post("/continuous-queries", h.handleCreate)
-	app.Put("/continuous-queries/:id", h.handleUpdate)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newSQLiteOnlyCQHandler(t, filepath.Join(t.TempDir(), "cq.db"))
+			defer h.sqliteDB.Close()
+			h.config = &config.ContinuousQueryConfig{Enabled: true}
+			if tt.seedQuery {
+				_, err := h.sqliteDB.Exec(`INSERT INTO continuous_queries
+					(id, name, database, source_measurement, destination_measurement, query, interval, tag_columns)
+					VALUES (1, 'existing', 'db', 'src', 'dst', 'SELECT 1', '1h', '[]')`)
+				if err != nil {
+					t.Fatalf("seed existing continuous query: %v", err)
+				}
+			}
 
-	for _, method := range []string{"POST", "PUT"} {
-		t.Run(method, func(t *testing.T) {
+			app := fiber.New()
+			app.Post("/continuous-queries", h.handleCreate)
+			app.Put("/continuous-queries/:id", h.handleUpdate)
 			path := "/continuous-queries"
-			if method == "PUT" {
+			if tt.method == "PUT" {
 				path += "/1"
 			}
-			req := httptest.NewRequest(method, path, strings.NewReader(`{"database":"db*"}`))
+			req := httptest.NewRequest(tt.method, path, strings.NewReader(tt.body))
 			req.Header.Set("Content-Type", "application/json")
 			resp, err := app.Test(req, testRequestTimeoutMS)
 			if err != nil {
 				t.Fatalf("request failed: %v", err)
 			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read response body: %v", err)
+			}
 			if resp.StatusCode != fiber.StatusBadRequest {
-				t.Fatalf("expected status 400, got %d", resp.StatusCode)
+				t.Fatalf("expected status 400, got %d: %s", resp.StatusCode, body)
+			}
+			if !strings.Contains(string(body), tt.wantError) {
+				t.Fatalf("response %q does not contain %q", body, tt.wantError)
 			}
 		})
 	}

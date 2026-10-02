@@ -440,6 +440,9 @@ func (h *ContinuousQueryHandler) handleUpdate(c *fiber.Ctx) error {
 		})
 	}
 
+	if req.Database == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "database is required"})
+	}
 	if !isValidDatabaseName(req.Database) {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)",
