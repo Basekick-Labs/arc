@@ -127,6 +127,16 @@ of being refused in front of it.
   Client tooling that lists databases to populate a picker needs to handle
   that; updates to the CLI, console, MCP server and Python client ship
   alongside.
+- **The compaction and retention read-only endpoints now require admin.**
+  `GET /api/v1/compaction/{status,stats,candidates,jobs,history}` and
+  `GET /api/v1/retention{,/:id,/:id/executions}` previously accepted any
+  authenticated token. Compaction is cluster-wide operator work that cannot
+  be configured per team or per database, and retention policies are
+  configured by admins only — but `/candidates`, `/jobs`, `/history` and a
+  policy row all name the databases and measurements they apply to, so the
+  endpoints were a tenant-name enumeration surface for a token with no grant
+  on either. Monitoring that polls them with a non-admin token needs an
+  admin token.
 
 ### A subquery in the `where` parameter read a measurement the check never saw ([GHSA-qcf2-6hm7-62c5](https://github.com/Basekick-Labs/arc/security/advisories/GHSA-qcf2-6hm7-62c5))
 

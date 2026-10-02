@@ -36,12 +36,19 @@ func NewCompactionHandler(manager *compaction.Manager, hourlyScheduler, dailySch
 func (h *CompactionHandler) RegisterRoutes(app *fiber.App) {
 	group := app.Group("/api/v1/compaction")
 
-	// Read-only routes — any authenticated token
-	group.Get("/status", h.getStatus)
-	group.Get("/stats", h.getStats)
-	group.Get("/candidates", h.getCandidates)
-	group.Get("/jobs", h.getActiveJobs)
-	group.Get("/history", h.getHistory)
+	// Admin-only, including the read-only routes. Compaction is cluster-wide
+	// operator work — it cannot be configured per team or per database, so no
+	// tenant has a reason to read it — and /candidates, /jobs and /history
+	// return {database, measurement, partition_path} for every tenant in the
+	// deployment. They previously took any authenticated token, which made
+	// them a database- and measurement-name enumeration surface for a token
+	// with no grant on either.
+	adminOnly := withAdminAuth(h.authManager)
+	group.Get("/status", adminOnly, h.getStatus)
+	group.Get("/stats", adminOnly, h.getStats)
+	group.Get("/candidates", adminOnly, h.getCandidates)
+	group.Get("/jobs", adminOnly, h.getActiveJobs)
+	group.Get("/history", adminOnly, h.getHistory)
 
 	// Admin route — trigger compaction requires admin permission
 	if h.authManager != nil {

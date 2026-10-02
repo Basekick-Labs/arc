@@ -352,3 +352,55 @@ func TestDatabasesListing_RBACOnlyTokenIsScopedNotRefused(t *testing.T) {
 		t.Errorf("listing every database needs a grant covering every database, got %d", code)
 	}
 }
+
+// Compaction and retention are admin-domain operator features: compaction is
+// cluster-wide work that cannot be configured per team or per database, and
+// retention policies are configured by admins only. Both sets of read-only
+// routes previously took any authenticated token, while returning
+// {database, measurement, partition_path} rows naming every tenant — the same
+// enumeration surface closed on the database listings.
+func TestOperatorListings_RequireAdmin(t *testing.T) {
+	_, _, am, cleanup := authedDatabasesRig(t)
+	defer cleanup()
+
+	app := fiber.New()
+	app.Use(auth.NewMiddleware(auth.MiddlewareConfig{AuthManager: am}))
+	NewCompactionHandler(nil, nil, nil, am, zerolog.Nop()).RegisterRoutes(app)
+
+	readTok := mustCreateToken(t, am, "reader-ops", "read")
+	adminTok := mustCreateToken(t, am, "admin-ops", "read,write,delete,admin")
+
+	for _, path := range []string{
+		"/api/v1/compaction/status",
+		"/api/v1/compaction/stats",
+		"/api/v1/compaction/candidates",
+		"/api/v1/compaction/jobs",
+		"/api/v1/compaction/history",
+	} {
+		t.Run("read token denied "+path, func(t *testing.T) {
+			req := httptest.NewRequest("GET", path, nil)
+			req.Header.Set("Authorization", "Bearer "+readTok)
+			resp, err := app.Test(req, -1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != fiber.StatusForbidden {
+				body, _ := io.ReadAll(resp.Body)
+				t.Errorf("a non-admin token must not read operator listings, got %d: %s", resp.StatusCode, body)
+			}
+		})
+		t.Run("admin token reaches handler "+path, func(t *testing.T) {
+			req := httptest.NewRequest("GET", path, nil)
+			req.Header.Set("Authorization", "Bearer "+adminTok)
+			resp, err := app.Test(req, -1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode == fiber.StatusForbidden || resp.StatusCode == fiber.StatusUnauthorized {
+				t.Errorf("an admin token must reach the handler, got %d", resp.StatusCode)
+			}
+		})
+	}
+}
