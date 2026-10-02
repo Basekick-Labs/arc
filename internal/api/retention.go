@@ -1165,7 +1165,7 @@ func (h *RetentionHandler) getFileMaxTimeAndRowCount(ctx context.Context, filePa
 	// Use the shared DuckDB connection to avoid memory retention from temporary connections
 	db := h.duckdb.DB()
 
-	query := fmt.Sprintf("SELECT MAX(time) as max_time, COUNT(*) as cnt FROM read_parquet(%s)", sqlutil.QuoteStringLiteral(filePath))
+	query := fmt.Sprintf("SELECT MAX(time) as max_time, COUNT(*) as cnt FROM %s", sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(filePath)))
 	row := db.QueryRowContext(ctx, query)
 
 	var maxTime time.Time

@@ -885,13 +885,13 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	if !cteNames[strings.ToLower(cq.SourceMeasurement)] {
 		// Escape single quotes: DuckDB read_parquet() paths cannot be
 		// parameterized, so the path is interpolated into a SQL string literal.
-		readParquetExpr := fmt.Sprintf("read_parquet('%s', union_by_name=true)", sqlutil.EscapeStringLiteral(measurementPath))
+		readParquetExpr := sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(measurementPath), "union_by_name=true")
 		// A continuous query reads a narrow, recent window: exactly the
 		// range in which a field absent from the newest files fails to
 		// bind. List the measurement's schema anchor first (#914).
 		if h.fieldSchema != nil {
 			if anchor, ok := h.fieldSchema.Resolve(ctx, cq.Database, cq.SourceMeasurement); ok {
-				readParquetExpr = fmt.Sprintf("read_parquet(['%s', '%s'], union_by_name=true)", sqlutil.EscapeStringLiteral(anchor), sqlutil.EscapeStringLiteral(measurementPath))
+				readParquetExpr = sqlutil.ReadParquetList([]string{sqlutil.QuoteStringLiteral(anchor), sqlutil.QuoteStringLiteral(measurementPath)}, "union_by_name=true")
 			}
 		}
 		wrappedQuery = wrapSourceMeasurement(query, cq.Database, cq.SourceMeasurement, readParquetExpr)

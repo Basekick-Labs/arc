@@ -17,6 +17,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/rs/zerolog"
 
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 )
 
@@ -905,18 +906,15 @@ func (r *Registry) sampleFiles(ctx context.Context, database, measurement string
 // duckDBDescribe returns a describeFunc over the query engine.
 func duckDBDescribe(db *sql.DB) describeFunc {
 	return func(ctx context.Context, paths []string) ([][2]string, error) {
-		var sb strings.Builder
-		sb.WriteString("DESCRIBE SELECT * FROM read_parquet([")
+		quoted := make([]string, len(paths))
 		for i, p := range paths {
-			if i > 0 {
-				sb.WriteString(", ")
-			}
-			sb.WriteString("'")
-			sb.WriteString(strings.ReplaceAll(p, "'", "''"))
-			sb.WriteString("'")
+			quoted[i] = sqlutil.QuoteStringLiteral(p)
 		}
-		sb.WriteString("], union_by_name=true)")
-		rows, err := db.QueryContext(ctx, sb.String())
+		// Hive inference off: this is a DESCRIBE, so an inferred column would
+		// widen the schema this registry PERSISTS as the measurement's anchor
+		// (#1005).
+		query := "DESCRIBE SELECT * FROM " + sqlutil.ReadParquetList(quoted, "union_by_name=true")
+		rows, err := db.QueryContext(ctx, query)
 		if err != nil {
 			return nil, err
 		}

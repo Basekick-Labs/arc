@@ -60,7 +60,7 @@ func TestParallelExecutor_BuildPartitionQuery(t *testing.T) {
 
 	result := executor.buildPartitionQuery(template, path, options, "")
 
-	expected := "SELECT * FROM read_parquet('/data/db/table/2024/01/01/*.parquet', union_by_name=true) WHERE time > '2024-01-01'"
+	expected := "SELECT * FROM read_parquet('/data/db/table/2024/01/01/*.parquet', hive_partitioning=false, union_by_name=true) WHERE time > '2024-01-01'"
 	assert.Equal(t, expected, result)
 }
 
