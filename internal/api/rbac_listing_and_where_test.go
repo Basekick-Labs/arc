@@ -223,13 +223,20 @@ func TestDatabasesListing_RBACScoping(t *testing.T) {
 // grant covering db1 as a whole, so it must not receive the list of every
 // measurement name in db1 — those names include measurements it cannot read.
 //
-// This models production rather than relying on the mock's database-level
-// shortcut. The real check is matchPattern(grantPattern, requested)
-// (rbac_manager.go:1800) with requested = "*": a "cpu" grant takes no wildcard
-// branch and falls through to `"cpu" == "*"`, which is false. So production
-// denies, which is the same bar `SHOW TABLES FROM db1` applies. The mock's
-// deniedMeasurements entry reproduces that verdict for (db1, *) while leaving
+// The mock models the verdict the RBAC *matcher* reaches:
+// matchPattern(grantPattern, requested) (rbac_manager.go:1800) with
+// requested = "*" gives `"cpu" == "*"`, false — so the matcher denies, which
+// is the bar `SHOW TABLES FROM db1` applies (query.go:1919). The mock's
+// deniedMeasurements entry reproduces that for (db1, *) while leaving
 // (db1, cpu) allowed.
+//
+// It does NOT model the whole production path, and the difference matters:
+// one frame further out, checkPermissionUncached overrides any denial with
+// the token's coarse permissions (-> checkOSSPermission), and RequireRead
+// demands that same coarse "read" bit of every caller. So in production this
+// request is currently ALLOWED. This test pins the bar the handler asks for;
+// it does not prove a scoped caller is refused today, and it will start
+// reflecting production once the coarse-permission override is removed.
 func TestDatabasesListing_PerMeasurementGrantCannotListNames(t *testing.T) {
 	h, app, am, cleanup := authedDatabasesRig(t)
 	defer cleanup()

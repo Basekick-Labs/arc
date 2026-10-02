@@ -176,10 +176,16 @@ func (h *DatabasesHandler) RegisterRoutes(app *fiber.App) {
 
 // handleList handles GET /api/v1/databases
 func (h *DatabasesHandler) handleList(c *fiber.Ctx) error {
-	// Listing every database requires a grant covering every database, the
+	// Listing every database asks for a grant covering every database, the
 	// same bar `SHOW DATABASES` applies (handleShowDatabases in query.go).
-	// A caller scoped to one database gets 403 here and must name it via
-	// GET /api/v1/databases/:name, exactly as on the query path.
+	//
+	// CAVEAT, and it is not this function's doing: the RBAC layer currently
+	// overrides every denial with the token's coarse permissions
+	// (checkPermissionUncached -> checkOSSPermission, internal/auth), so a
+	// token carrying the coarse "read" bit — which RequireRead above demands
+	// of every caller — is allowed here whatever its grants say. This gate is
+	// therefore correct in shape and INERT in production until that is fixed.
+	// Do not read it as evidence that a database-scoped caller is refused.
 	if err := h.checkDatabasePermission(c, "*", "read"); err != nil {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": err.Error()})
 	}
