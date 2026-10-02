@@ -35,8 +35,9 @@ const (
 	// MaxWALPayloadSize is the maximum allowed payload size for a single WAL entry.
 	// This limit prevents integer overflow during buffer allocation (CWE-190) and
 	// aligns with the replication protocol limit (100MB).
-	MaxWALPayloadSize    = 100 * 1024 * 1024 // 100MB
-	walTrackedHeaderSize = 1 + 16
+	MaxWALPayloadSize      = 100 * 1024 * 1024 // 100MB
+	walTrackedHeaderSize   = 1 + 16
+	walCheckpointBatchSize = 100_000
 
 	// walChunkTarget is the payload size an oversized payload is chunked down
 	// to (#677). It sits well below MaxWALPayloadSize so a chunk still clears
@@ -796,8 +797,8 @@ func (w *Writer) MarkFlushed(hashes []string) error {
 	if len(hashes) == 0 {
 		return nil
 	}
-	for start := 0; start < len(hashes); start += 1000 {
-		end := start + 1000
+	for start := 0; start < len(hashes); start += walCheckpointBatchSize {
+		end := start + walCheckpointBatchSize
 		if end > len(hashes) {
 			end = len(hashes)
 		}

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1000,6 +1001,35 @@ func TestRecovery_CollectsCheckpointsFromRecentlyRotatedFile(t *testing.T) {
 	}
 	if stats.SkippedFiles != 2 {
 		t.Fatalf("expected active and recent checkpoint files to be skipped from replay, skipped=%d", stats.SkippedFiles)
+	}
+}
+
+func TestMarkFlushedBatchesCheckpointHashes(t *testing.T) {
+	writer, tmpDir := newTestWriter(t, SyncModeAsync)
+	defer os.RemoveAll(tmpDir)
+	defer writer.Close()
+
+	hashes := make([]string, walCheckpointBatchSize+1)
+	for i := range hashes {
+		hashes[i] = strconv.Itoa(i)
+	}
+	if err := writer.MarkFlushed(hashes); err != nil {
+		t.Fatalf("persist flush checkpoints: %v", err)
+	}
+
+	entries, err := NewReader(writer.CurrentFile(), zerolog.Nop()).ReadAll()
+	if err != nil {
+		t.Fatalf("read checkpoint WAL entries: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected checkpoints in two bounded WAL entries, got %d", len(entries))
+	}
+	checkpointCount := 0
+	for _, entry := range entries {
+		checkpointCount += len(entry.CheckpointHashes)
+	}
+	if checkpointCount != len(hashes) {
+		t.Fatalf("checkpoint hash count = %d, want %d", checkpointCount, len(hashes))
 	}
 }
 
