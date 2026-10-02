@@ -797,7 +797,11 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	// When dedup is active, count rows before compaction using parquet metadata (no data scan)
 	var rowsBefore int64
 	if dedupBranch {
-		rowsBefore, _ = countParquetRows(ctx, db, fileListSQL)
+		var err error
+		rowsBefore, err = countParquetRows(ctx, db, fileListSQL)
+		if err != nil {
+			j.logger.Debug().Err(err).Msg("Failed to count parquet rows before deduplication")
+		}
 	}
 
 	conn, err := db.Conn(ctx)
@@ -850,8 +854,10 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 
 	// Log dedup metrics when rows were removed
 	if dedupBranch && rowsBefore > 0 {
-		rowsAfter, _ := countParquetRows(ctx, db, fmt.Sprintf("[%s]", sqlutil.QuoteStringLiteral(outputFile)))
-		if rowsAfter > 0 && rowsAfter < rowsBefore {
+		rowsAfter, err := countParquetRows(ctx, db, fmt.Sprintf("[%s]", sqlutil.QuoteStringLiteral(outputFile)))
+		if err != nil {
+			j.logger.Debug().Err(err).Msg("Failed to count parquet rows after deduplication")
+		} else if rowsAfter > 0 && rowsAfter < rowsBefore {
 			deduped := rowsBefore - rowsAfter
 			j.logger.Info().
 				Int64("rows_before", rowsBefore).

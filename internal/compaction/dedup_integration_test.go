@@ -127,6 +127,30 @@ func TestBuildCompactionQuery_DedupMixedTimeType(t *testing.T) {
 	}
 }
 
+func TestCountParquetRows(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	file := filepath.ToSlash(filepath.Join(dir, "rows.parquet"))
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(
+		`COPY (SELECT * FROM range(3)) TO '%s' (FORMAT PARQUET)`, escapeSQLPath(file))); err != nil {
+		t.Fatalf("write parquet fixture: %v", err)
+	}
+
+	count, err := countParquetRows(ctx, db, fmt.Sprintf("['%s']", escapeSQLPath(file)))
+	if err != nil {
+		t.Fatalf("count parquet rows: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("countParquetRows() = %d, want 3", count)
+	}
+}
+
 // TestBuildCompactionQuery_StandardMixedTimeType is the tagless-branch counterpart
 // of the dedup test above. A measurement whose Parquet files carry NO "arc:tags"
 // metadata (pre-dedup files, msgpack-columnar) takes the standard branch in
