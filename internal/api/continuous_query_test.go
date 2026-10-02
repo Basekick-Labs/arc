@@ -2,9 +2,13 @@ package api
 
 import (
 	"database/sql"
+	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/basekick-labs/arc/internal/config"
+	"github.com/gofiber/fiber/v2"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog"
 )
@@ -327,6 +331,34 @@ func TestCQMigrationFromLegacySchema(t *testing.T) {
 	}
 	if got.Name != "legacy" {
 		t.Errorf("legacy row corrupted: name=%q", got.Name)
+	}
+}
+
+func TestContinuousQueryDatabaseValidation(t *testing.T) {
+	h := newSQLiteOnlyCQHandler(t, filepath.Join(t.TempDir(), "cq.db"))
+	defer h.sqliteDB.Close()
+	h.config = &config.ContinuousQueryConfig{Enabled: true}
+
+	app := fiber.New()
+	app.Post("/continuous-queries", h.handleCreate)
+	app.Put("/continuous-queries/:id", h.handleUpdate)
+
+	for _, method := range []string{"POST", "PUT"} {
+		t.Run(method, func(t *testing.T) {
+			path := "/continuous-queries"
+			if method == "PUT" {
+				path += "/1"
+			}
+			req := httptest.NewRequest(method, path, strings.NewReader(`{"database":"db*"}`))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := app.Test(req, testRequestTimeoutMS)
+			if err != nil {
+				t.Fatalf("request failed: %v", err)
+			}
+			if resp.StatusCode != fiber.StatusBadRequest {
+				t.Fatalf("expected status 400, got %d", resp.StatusCode)
+			}
+		})
 	}
 }
 

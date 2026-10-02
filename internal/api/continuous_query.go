@@ -307,6 +307,11 @@ func (h *ContinuousQueryHandler) handleCreate(c *fiber.Ctx) error {
 	if req.Database == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "database is required"})
 	}
+	if !isValidDatabaseName(req.Database) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)",
+		})
+	}
 	if req.SourceMeasurement == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "source_measurement is required"})
 	}
@@ -432,6 +437,12 @@ func (h *ContinuousQueryHandler) handleUpdate(c *fiber.Ctx) error {
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "Invalid request body: " + err.Error(),
+		})
+	}
+
+	if !isValidDatabaseName(req.Database) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)",
 		})
 	}
 
