@@ -99,7 +99,16 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 
 	r.logger.Info().Int("files", len(walFiles)).Msg("WAL recovery started")
 
-	// Process each WAL file
+	type loadedWALFile struct {
+		entries   []Entry
+		corrupted int64
+	}
+	loaded := make(map[string]loadedWALFile, len(walFiles))
+	flushed := make(map[string]struct{})
+
+	// Read all replayable files before invoking callbacks. A flush checkpoint
+	// can land in the next WAL file after rotation, while the data entry remains
+	// in the previous file; collecting checkpoints globally closes that gap.
 	for _, walFile := range walFiles {
 		select {
 		case <-ctx.Done():
@@ -123,24 +132,28 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 			}
 		}
 
-		r.logger.Info().Str("file", filepath.Base(walFile)).Msg("Recovering WAL file")
-
 		reader := NewReader(walFile, r.logger)
 		entries, err := reader.ReadAll()
 		if err != nil {
 			r.logger.Error().Err(err).Str("file", walFile).Msg("Failed to read WAL file")
 			continue
 		}
-
-		// Flush checkpoints are written only after parquet upload succeeds.
-		// Gather them before replay so already-durable entries in the same WAL
-		// file are not ingested a second time after a crash.
-		flushed := make(map[string]struct{})
+		loaded[walFile] = loadedWALFile{entries: entries, corrupted: reader.CorruptedEntries}
 		for _, entry := range entries {
 			for _, hash := range entry.CheckpointHashes {
 				flushed[hash] = struct{}{}
 			}
 		}
+	}
+
+	// Process each WAL file
+	for _, walFile := range walFiles {
+		file, ok := loaded[walFile]
+		if !ok {
+			continue
+		}
+		entries := file.entries
+		r.logger.Info().Str("file", filepath.Base(walFile)).Msg("Recovering WAL file")
 
 		// Replay entries - track if all succeed
 		allEntriesSucceeded := true
@@ -222,7 +235,7 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 			}
 		}
 
-		stats.CorruptedEntries += int(reader.CorruptedEntries)
+		stats.CorruptedEntries += int(file.corrupted)
 
 		// Only delete WAL file if ALL entries were successfully replayed
 		if allEntriesSucceeded && len(entries) > 0 {

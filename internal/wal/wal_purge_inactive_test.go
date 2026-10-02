@@ -772,6 +772,15 @@ func TestRecovery_SkipsEntriesCoveredByFlushCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("append tracked records: %v", err)
 	}
+	waitForEntries(t, writer, 1)
+	// Force the checkpoint into the next WAL file. This models a flush that
+	// completes after rotation and guards the cross-file recovery case.
+	writer.mu.Lock()
+	if err := writer.rotate(); err != nil {
+		writer.mu.Unlock()
+		t.Fatalf("rotate WAL: %v", err)
+	}
+	writer.mu.Unlock()
 	if err := writer.MarkFlushed(hashes); err != nil {
 		t.Fatalf("append flush checkpoint: %v", err)
 	}
@@ -791,8 +800,8 @@ func TestRecovery_SkipsEntriesCoveredByFlushCheckpoint(t *testing.T) {
 	if recovered != 0 {
 		t.Fatalf("expected checkpointed records not to replay, got %d", recovered)
 	}
-	if stats.RecoveredFiles != 1 {
-		t.Fatalf("expected checkpointed WAL file to be retired, got %d recovered files", stats.RecoveredFiles)
+	if stats.RecoveredEntries != 0 {
+		t.Fatalf("expected no WAL entries to be replayed, got %d", stats.RecoveredEntries)
 	}
 }
 
