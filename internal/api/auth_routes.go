@@ -598,6 +598,14 @@ func (h *AuthHandler) removeTokenFromTeam(c *fiber.Ctx) error {
 	// route middleware already gates. So it is safe to allow unlicensed, and
 	// it is the escape hatch. Adding a membership stays license-gated, since
 	// that grants reach rather than removing it.
+	//
+	// In a cluster this proposes a Raft entry like every other RBAC mutation
+	// (RemoveTokenFromTeam forwards through the proposer when one is set), so
+	// the removal converges across nodes rather than applying only locally.
+	// That is what makes it a usable escape hatch: clustering is itself
+	// license-gated, so if a license has lapsed every node is in the same
+	// state, and a removal that applied on one node only would leave the
+	// token still restricted everywhere else.
 
 	tokenID, err := strconv.ParseInt(c.Params("id"), 10, 64)
 	if err != nil {

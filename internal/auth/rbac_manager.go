@@ -1871,6 +1871,12 @@ func (rm *RBACManager) CanAccessAnythingIn(tokenInfo *TokenInfo, database, permi
 			TokenInfo: tokenInfo, Database: database, Measurement: "*", Permission: permission,
 		}).Allowed
 	}
+	// Enabled is checked here rather than at the top, matching
+	// checkRBACPermissionCached, which is reached the same way. A disabled
+	// token cannot arrive on a request path at all: VerifyToken is the only
+	// producer of a TokenInfo there and it never returns a disabled one, so
+	// the ordering is not load-bearing. A future caller that constructs a
+	// TokenInfo directly must not rely on that.
 	if !tokenInfo.Enabled {
 		return false
 	}

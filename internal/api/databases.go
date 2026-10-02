@@ -391,11 +391,14 @@ func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
 		})
 	}
 
-	// Get measurement count
+	// Count only the measurements the caller may read. Counting the raw list
+	// would disclose how many measurements exist that this caller cannot see
+	// — the same thing filtering the names is there to prevent, leaked as an
+	// integer instead.
 	measurements, err := h.listMeasurements(ctx, name)
 	measurementCount := 0
 	if err == nil {
-		measurementCount = len(measurements)
+		measurementCount = len(h.filterReadableMeasurements(c, name, measurements))
 	}
 
 	return c.JSON(DatabaseInfo{
