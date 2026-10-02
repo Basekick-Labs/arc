@@ -409,6 +409,8 @@ predate that fix and #978.
 
 Continuous-query source and destination measurements now use Arc's measurement-name rule when definitions are created or updated, and again before a stored definition runs. Previously, an invalid source name could be stored, and a `PUT` with an empty destination could blank the output name. Existing definitions with names that fail validation now report a failed run; recreate them with valid measurement names.
 
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1021](https://github.com/Basekick-Labs/arc/pull/1021).
+
 ### A continuous query could write into Arc's reserved storage root ([#1010](https://github.com/Basekick-Labs/arc/issues/1010))
 
 A continuous-query definition is a row that outlives the request that wrote it,
