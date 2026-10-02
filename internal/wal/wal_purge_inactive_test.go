@@ -890,6 +890,52 @@ func TestRecovery_DoesNotSkipDistinctIdenticalTrackedEntries(t *testing.T) {
 	}
 }
 
+func TestRecovery_UsesCheckpointsFromSkippedActiveFile(t *testing.T) {
+	writer, tmpDir := newTestWriter(t, SyncModeAsync)
+	defer os.RemoveAll(tmpDir)
+	defer writer.Close()
+
+	records := []map[string]interface{}{{"measurement": "events", "time": int64(1609459200000000), "value": "flushed"}}
+	hashes, err := writer.AppendTracked(records)
+	if err != nil {
+		t.Fatalf("append tracked records: %v", err)
+	}
+	waitForEntries(t, writer, 1)
+
+	writer.mu.Lock()
+	err = writer.rotate()
+	writer.mu.Unlock()
+	if err != nil {
+		t.Fatalf("rotate WAL: %v", err)
+	}
+	if err := writer.MarkFlushed(hashes); err != nil {
+		t.Fatalf("persist flush checkpoint: %v", err)
+	}
+	activeFile := writer.CurrentFile()
+	activeHashes, err := writer.CurrentCheckpointHashes()
+	if err != nil {
+		t.Fatalf("read active WAL checkpoints: %v", err)
+	}
+	if len(activeHashes) != 1 || activeHashes[0] != hashes[0] {
+		t.Fatalf("expected durable checkpoint %q in active WAL file, got %v", hashes[0], activeHashes)
+	}
+
+	recovered := 0
+	stats, err := NewRecovery(tmpDir, zerolog.Nop()).RecoverWithOptions(context.Background(), func(ctx context.Context, recs []map[string]interface{}) error {
+		recovered += len(recs)
+		return nil
+	}, &RecoveryOptions{
+		SkipActiveFile:             activeFile,
+		AdditionalCheckpointHashes: activeHashes,
+	})
+	if err != nil {
+		t.Fatalf("recover WAL: %v", err)
+	}
+	if recovered != 0 || stats.RecoveredEntries != 0 {
+		t.Fatalf("expected active-file checkpoint to suppress replay, callbacks=%d entries=%d", recovered, stats.RecoveredEntries)
+	}
+}
+
 // ==========================================================================
 // PurgeOlderThan() method tests
 // ==========================================================================

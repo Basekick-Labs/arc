@@ -366,7 +366,9 @@ var ErrWALDropped = errors.New("WAL entry dropped: async buffer full")
 
 // walEntry is a pre-serialized WAL entry ready for writing
 type walEntry struct {
-	data []byte // Complete entry: header + payload
+	data    []byte // Complete entry: header + payload
+	durable bool   // Force a sync before acknowledging this entry
+	done    chan error
 }
 
 // WriterConfig holds configuration for WAL writer
@@ -423,6 +425,7 @@ type Writer struct {
 	sequence        uint64 // Monotonic sequence counter for replication
 	trackedInstance uint64
 	trackedSequence uint64
+	closed          bool
 
 	// Metrics (atomic for lock-free reads)
 	TotalEntries   int64
@@ -516,7 +519,7 @@ func (w *Writer) writerLoop() {
 	for {
 		select {
 		case entry := <-w.entryChan:
-			w.writeEntry(entry)
+			w.processEntry(entry)
 
 		case <-syncTicker.C:
 			// Periodic sync
@@ -534,7 +537,7 @@ func (w *Writer) writerLoop() {
 			for {
 				select {
 				case entry := <-w.entryChan:
-					w.writeEntry(entry)
+					w.processEntry(entry)
 				default:
 					// No more entries, final sync and exit
 					w.mu.Lock()
@@ -550,8 +553,16 @@ func (w *Writer) writerLoop() {
 	}
 }
 
+func (w *Writer) processEntry(entry walEntry) {
+	err := w.writeEntry(entry)
+	if entry.done != nil {
+		entry.done <- err
+		close(entry.done)
+	}
+}
+
 // writeEntry writes a single entry to the WAL file (called from writerLoop)
-func (w *Writer) writeEntry(entry walEntry) {
+func (w *Writer) writeEntry(entry walEntry) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -566,7 +577,7 @@ func (w *Writer) writeEntry(entry walEntry) {
 		// permission change, file deleted). A new file might succeed.
 		if rotErr := w.rotate(); rotErr != nil {
 			w.logger.Error().Err(rotErr).Msg("Rotation after write failure also failed, entry lost")
-			return
+			return rotErr
 		}
 
 		// Retry write on the new file. If the original write failed partway
@@ -580,7 +591,7 @@ func (w *Writer) writeEntry(entry walEntry) {
 			atomic.AddInt64(&w.FailedWrites, 1)
 			metrics.Get().IncWALFailedWrites()
 			w.logger.Error().Err(err).Msg("Retry write after rotation also failed, entry lost")
-			return
+			return err
 		}
 	}
 
@@ -592,8 +603,15 @@ func (w *Writer) writeEntry(entry walEntry) {
 	atomic.AddInt64(&w.TotalEntries, 1)
 	atomic.AddInt64(&w.TotalBytes, bytesWritten)
 
-	// Sync if byte threshold exceeded
-	if w.bytesSinceSync >= w.config.SyncBytes {
+	if entry.durable {
+		if err := w.currentFile.Sync(); err != nil {
+			w.logger.Error().Err(err).Msg("WAL checkpoint sync failed")
+			return err
+		}
+		w.lastSyncTime = time.Now()
+		w.bytesSinceSync = 0
+		atomic.AddInt64(&w.TotalSyncs, 1)
+	} else if w.bytesSinceSync >= w.config.SyncBytes {
 		w.sync()
 		w.lastSyncTime = time.Now()
 		w.bytesSinceSync = 0
@@ -607,6 +625,7 @@ func (w *Writer) writeEntry(entry walEntry) {
 			w.logger.Error().Err(err).Msg("Failed to rotate WAL")
 		}
 	}
+	return nil
 }
 
 // rotate creates a new WAL file.
@@ -793,8 +812,12 @@ func (w *Writer) MarkFlushed(hashes []string) error {
 		binary.BigEndian.PutUint64(entryData[4:12], timestampUS)
 		binary.BigEndian.PutUint32(entryData[12:16], checksum)
 		copy(entryData[WALEntryHeaderSize:], checkpoint)
-		if err := w.tryEnqueue(entryData); err != nil {
+		done := make(chan error, 1)
+		if err := w.tryEnqueueEntry(walEntry{data: entryData, durable: true, done: done}); err != nil {
 			return err
+		}
+		if err := <-done; err != nil {
+			return fmt.Errorf("failed to persist WAL flush checkpoint: %w", err)
 		}
 	}
 	return nil
@@ -895,8 +918,21 @@ func (w *Writer) appendEnvelopedEntry(dbBytes []byte, envelopeHeaderLen int, pay
 // I/O errors. Centralized so the drop accounting is impossible to
 // drift across the multiple append paths.
 func (w *Writer) tryEnqueue(entryData []byte) error {
+	return w.tryEnqueueEntry(walEntry{data: entryData})
+}
+
+func (w *Writer) tryEnqueueEntry(entry walEntry) error {
+	if entry.durable {
+		// Coordinate shutdown only for acknowledged durable barriers. Keep the
+		// per-record append path lock-free.
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		if w.closed {
+			return errors.New("WAL writer is closed")
+		}
+	}
 	select {
-	case w.entryChan <- walEntry{data: entryData}:
+	case w.entryChan <- entry:
 		return nil
 	default:
 		atomic.AddInt64(&w.DroppedEntries, 1)
@@ -995,6 +1031,10 @@ func (w *Writer) sync() {
 
 // Close closes the WAL writer
 func (w *Writer) Close() error {
+	w.mu.Lock()
+	w.closed = true
+	w.mu.Unlock()
+
 	// Signal shutdown
 	close(w.done)
 
@@ -1119,6 +1159,25 @@ func (w *Writer) CurrentFile() string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.currentPath
+}
+
+// CurrentCheckpointHashes returns flush checkpoints in the active WAL file.
+// The writer lock keeps the file stable while the reader scans it.
+func (w *Writer) CurrentCheckpointHashes() ([]string, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.currentPath == "" {
+		return nil, nil
+	}
+	entries, err := NewReader(w.currentPath, w.logger).ReadAll()
+	if err != nil {
+		return nil, err
+	}
+	var hashes []string
+	for _, entry := range entries {
+		hashes = append(hashes, entry.CheckpointHashes...)
+	}
+	return hashes, nil
 }
 
 // SetReplicationHook sets the hook function called for each WAL entry.

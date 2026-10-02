@@ -33,6 +33,10 @@ type RecoveryOptions struct {
 	// during periodic recovery (to avoid reading a file being actively written)
 	SkipActiveFile string
 
+	// AdditionalCheckpointHashes contains checkpoints read safely from the
+	// active file, which is intentionally excluded from recovery scans.
+	AdditionalCheckpointHashes []string
+
 	// BatchSize limits how many records are replayed per callback invocation
 	// This provides backpressure during mass recovery after prolonged outages
 	// 0 means no limit (all records in an entry replayed at once)
@@ -100,6 +104,9 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 	r.logger.Info().Int("files", len(walFiles)).Msg("WAL recovery started")
 
 	flushed := make(map[string]struct{})
+	for _, hash := range opts.AdditionalCheckpointHashes {
+		flushed[hash] = struct{}{}
+	}
 
 	// Scan replayable files for checkpoints before invoking callbacks. A flush
 	// checkpoint can land in the next WAL file after rotation, while the data
