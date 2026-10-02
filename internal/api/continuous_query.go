@@ -834,6 +834,40 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 		return 0, fmt.Errorf("stored continuous-query definition %q is not valid SQL to execute: %w", cq.Name, err)
 	}
 
+	// SECURITY: the stored database name is re-checked for the same reason the
+	// query above is. It becomes a storage path segment on both sides of the
+	// run — the source glob built below, and the destination write at the end
+	// of this function — and the create/update boundary began applying Arc's
+	// name rule to it only in #995. So a row stored by any build before that,
+	// or by an older build, or written straight into the shared metadata
+	// SQLite, can carry anything. handleUpdate was a fourth route until the
+	// same change: it writes database unconditionally, so a partial PUT stored
+	// an empty one.
+	//
+	// GetStoragePath below already refuses the glob metacharacters, but that
+	// is deliberately a weaker rule: ValidateKeySegment accepts leading dots
+	// and underscores because it is the storage contract, not a name format
+	// (see its doc comment). So "_schema" passes it, and a run writes real
+	// rows into Arc's reserved root — where the database listing hides them
+	// while table resolution still reads them, every storage-root walker
+	// (retention, compaction, tiering, Iceberg, backup) skips them via
+	// IsReservedRootDir, and the field-schema registry nests its own anchor
+	// tree inside itself at _schema/_schema/.
+	//
+	// Checked here rather than in the callers so the scheduler, the admin
+	// execute endpoint and any future caller are covered at once, and ahead of
+	// GetStoragePath so the failure names the real cause rather than arriving
+	// as an unusable-source error.
+	//
+	// No apostrophe in the message: the global log hook masks quoted spans
+	// (internal/sql/forlog.go#MaskErrText), so a lone ' opens a span that never
+	// closes and swallows the rest of the line. The %q values still mask in
+	// logs, which is the project's posture; the full text reaches the operator
+	// through the recorded execution, which is not sanitized.
+	if !isValidDatabaseName(cq.Database) {
+		return 0, fmt.Errorf("stored continuous-query definition %q has an invalid database name: %q", cq.Name, cq.Database)
+	}
+
 	// Build storage path for source measurement (supports local, S3, Azure)
 	measurementPath, err := storage.GetStoragePath(h.storage, cq.Database, cq.SourceMeasurement)
 	if err != nil {

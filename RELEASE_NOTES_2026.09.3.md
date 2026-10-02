@@ -307,6 +307,57 @@ predate that fix and #978.
 
 ## Bug fixes
 
+### A continuous query could write into Arc's reserved storage root ([#1010](https://github.com/Basekick-Labs/arc/issues/1010))
+
+A continuous-query definition is a row that outlives the request that wrote it,
+and the create and update endpoints applied no name rule to its `database`
+([#993](https://github.com/Basekick-Labs/arc/issues/993)). The run did not check
+either. Its source-path builder refuses glob metacharacters, so a database of
+`**` already failed — but it accepts a leading underscore or dot deliberately,
+because that is the storage key contract rather than a name format. So a
+definition stored by any build to date, by an older build, or written straight
+into the metadata database, could carry `_schema`, `_compaction_state` or
+`.hidden`, and its output landed inside the directory Arc reserves for its own
+state.
+
+Nothing refused it and nothing reported it. The database listing hides
+underscore- and dot-prefixed entries while table resolution still reads them, so
+the rows were queryable but absent from every listing. Every walker that
+enumerates the storage root skips reserved directories, so that data was never
+aged out by retention, never compacted, never tiered and never exported to
+Iceberg; for an underscore-prefixed name it was **not backed up** either (backup
+skips underscore-prefixed roots only, so a dot-prefixed one was copied). The
+field-schema registry wrote anchors for the pseudo-database, nesting its own
+anchor tree inside itself at `_schema/_schema/`, which also made every real
+database name enumerate as a measurement of it. And because anchor cleanup
+removes everything under that prefix, deleting an unrelated real database whose
+name matched the continuous query's destination measurement would delete the
+continuous query's output with it.
+
+A run now re-validates the stored `database` against the same rule the ingest
+endpoints apply, before it builds any path: start with a letter, then letters,
+digits, underscores or hyphens, at most 64 characters.
+
+**A definition that fails now reports a failed run** rather than executing. The
+reason is recorded with the execution and readable through
+`GET /api/v1/continuous_queries/:id/executions`, naming both the continuous
+query and the offending value, so one that stops producing after an upgrade says
+why. The remedy is to delete that definition and create it again with a valid
+database name; editing it is not available, because update applies the same rule
+to the body it is given (#993).
+
+One deployment shape to check before upgrading. The rule is stricter than the
+storage layer's, and an edge-sync hub's spoke directories are top-level storage
+roots whose IDs are validated by a blocklist — a spoke ID may begin with a digit
+or contain a dot, which this rule refuses. A continuous query whose `database`
+names such a spoke runs today and will now report a failed run; recreate it
+against a database name that satisfies the rule. Nothing that produces a
+well-formed database directory is affected.
+
+Creating a continuous query requires an admin token, so this was a
+data-integrity bug rather than a vulnerability: no permission check was bypassed
+and no path escaped the storage root.
+
 ### Continuous queries re-validate their stored definition before each run
 
 A continuous-query definition is validated when it is created or updated, but
@@ -342,8 +393,10 @@ directory named `**`, `db*`, `db[1]` or `host=hub01`.
 
 Nothing read such a path unsafely. Every `read_parquet` sink that interpolates a
 storage path applies the glob-safety guard, and a stored definition whose
-database carries a glob metacharacter fails its run with `has an unusable
-source` rather than producing one. The reason to close it at the boundary is
+database carries a glob metacharacter fails its run rather than producing such a
+path — with the name-rule error above, since
+[#1010](https://github.com/Basekick-Labs/arc/issues/1010) checks the stored name
+before the source path is built. The reason to close it at the boundary is
 that the guard is each sink's to remember, and this field should not be able to
 produce such a name in the first place. Creating a continuous query requires an
 admin token, so this is defence in depth, not a privilege-escalation path.
