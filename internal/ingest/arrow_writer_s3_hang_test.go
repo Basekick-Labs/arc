@@ -334,8 +334,16 @@ func testFlushQueueSaturationRetainsData(t *testing.T, typed bool) {
 	if got := buf.totalFlushDeferred.Load(); got == 0 {
 		t.Fatal("expected full queue to defer at least one flush")
 	}
-	if got := len(buf.flushQueue); got != cap(buf.flushQueue) {
-		t.Fatalf("flush queue depth = %d, want full capacity %d", got, cap(buf.flushQueue))
+	// Deliberately NOT asserting len(buf.flushQueue) == cap(buf.flushQueue).
+	// The gate only holds FlushWorkers tasks inside the backend; a worker is free
+	// to dequeue the next task the moment it finishes handing one over, so the
+	// observed depth legitimately sits anywhere in [1, cap]. Pinning it to cap
+	// failed 10 times in 25 runs under -race, which is how CI runs the suite.
+	//
+	// totalFlushDeferred > 0 above already proves what the capacity check was
+	// reaching for: a deferral can only happen when the send found no room.
+	if got := len(buf.flushQueue); got == 0 {
+		t.Fatal("flush queue is empty, so the deferrals above cannot have come from a full queue")
 	}
 
 	// Let the already-enqueued tasks drain before Close, then Close flushes the
