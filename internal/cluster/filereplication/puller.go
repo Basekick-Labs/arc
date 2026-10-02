@@ -12,6 +12,7 @@ package filereplication
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash"
@@ -92,8 +93,9 @@ const (
 )
 
 type pullRequest struct {
-	entry  *raft.FileEntry
-	source enqueueSource
+	entry               *raft.FileEntry
+	source              enqueueSource
+	verifyLocalChecksum bool
 }
 
 // Config bundles the puller's dependencies and tunables.
@@ -884,6 +886,24 @@ func presentAtSize(localSize int64, statErr error, want int64) bool {
 	return statErr == nil && localSize == want
 }
 
+func (p *Puller) localChecksumMatches(entry *raft.FileEntry) bool {
+	if entry.SHA256 == "" {
+		return true
+	}
+	parent := p.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	readCtx, cancel := context.WithTimeout(parent, 5*time.Second)
+	defer cancel()
+
+	h := sha256.New()
+	if err := p.cfg.Backend.ReadTo(readCtx, entry.Path, h); err != nil {
+		return false
+	}
+	return hex.EncodeToString(h.Sum(nil)) == entry.SHA256
+}
+
 func (p *Puller) enqueue(entry *raft.FileEntry, source enqueueSource) enqueueResult {
 	if entry == nil {
 		return enqueueResultInvalid
@@ -906,7 +926,11 @@ func (p *Puller) enqueue(entry *raft.FileEntry, source enqueueSource) enqueueRes
 	// Copy so the caller can't mutate the entry out from under the worker.
 	entryCopy := *entry
 	select {
-	case p.queue <- &pullRequest{entry: &entryCopy, source: source}:
+	case p.queue <- &pullRequest{
+		entry:               &entryCopy,
+		source:              source,
+		verifyLocalChecksum: source == enqueueSourceCatchUp,
+	}:
 		p.totalEnqueued.Add(1)
 		return enqueueResultEnqueued
 	default:
@@ -1196,7 +1220,8 @@ func (p *Puller) processEntry(log zerolog.Logger, request *pullRequest) {
 		// (size matches the manifest). A partial file (size < SizeBytes) should
 		// fall through so pullOnce can resume from the byte offset.
 		localSize, statErr := p.statLocal(entry.Path)
-		if presentAtSize(localSize, statErr, entry.SizeBytes) {
+		if presentAtSize(localSize, statErr, entry.SizeBytes) &&
+			(!request.verifyLocalChecksum || p.localChecksumMatches(entry)) {
 			p.totalSkippedLocal.Add(1)
 			succeeded = true // File is already here — same as a fresh pull from the gate's perspective.
 			return

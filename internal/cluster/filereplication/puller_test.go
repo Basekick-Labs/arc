@@ -3,6 +3,7 @@ package filereplication
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"hash"
@@ -568,6 +569,42 @@ func TestPullerSkipsAlreadyLocalFile(t *testing.T) {
 	}
 	if fetcher.calls.Load() != 0 {
 		t.Errorf("fetcher should not be called when file exists locally")
+	}
+}
+
+func TestCatchUpRepullsSameSizeFileWithStaleContents(t *testing.T) {
+	backend := newFakeBackend()
+	path := "testdb/cpu/stale.parquet"
+	stale := []byte("stale file contents")
+	fresh := []byte("fresh file contents")
+	if len(stale) != len(fresh) {
+		t.Fatalf("test bodies must have the same size")
+	}
+	if err := backend.Write(context.Background(), path, stale); err != nil {
+		t.Fatalf("seed stale file: %v", err)
+	}
+	fetcher := newFakeFetcher(fakeFetchResult{body: fresh})
+	resolver := staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true}
+
+	p := newTestPuller(t, backend, fetcher, resolver)
+	p.Start(context.Background())
+	defer p.Stop()
+
+	entry := makeEntry(path, "writer-1", int64(len(fresh)))
+	digest := sha256.Sum256(fresh)
+	entry.SHA256 = fmt.Sprintf("%x", digest)
+	p.RunCatchUp(context.Background(), sliceFetcher([]*raft.FileEntry{entry}))
+
+	stats := waitStats(t, p, func(s map[string]int64) bool { return s["pulled"] == 1 })
+	if stats["pulled"] != 1 {
+		t.Fatalf("same-size stale file was not pulled: %+v", stats)
+	}
+	got, err := backend.Read(context.Background(), path)
+	if err != nil || !bytes.Equal(got, fresh) {
+		t.Fatalf("file was not refreshed: err=%v got=%q want=%q", err, got, fresh)
+	}
+	if fetcher.calls.Load() != 1 {
+		t.Fatalf("fetcher calls = %d, want 1", fetcher.calls.Load())
 	}
 }
 
