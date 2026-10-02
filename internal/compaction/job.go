@@ -613,9 +613,7 @@ func (j *Job) downloadSingleFile(ctx context.Context, tempDir string, index int,
 				j.logger.Debug().Str("file", fileKey).Msg("File not found (already compacted), skipping")
 				return downloadResult{index: index, skipped: true}
 			}
-			if err != nil {
-				return downloadResult{index: index, err: fmt.Errorf("failed to stat %s: %w", localPath, err)}
-			}
+			return downloadResult{index: index, err: fmt.Errorf("failed to stat %s: %w", localPath, err)}
 		}
 	}
 
