@@ -405,6 +405,35 @@ predate that fix and #978.
 
 ## Bug fixes
 
+### Ingestion retains buffered batches when the flush queue is full ([#966](https://github.com/Basekick-Labs/arc/issues/966))
+
+A size-triggered flush used to extract the whole buffer and delete it, and only
+then attempt a non-blocking send to the bounded flush queue. When the queue had
+no room the batch was discarded and the write still returned success — so a
+buffer built from many already-acknowledged writes was lost. With the WAL
+disabled, which is the shipped default, it was gone immediately; with the WAL
+enabled, nothing replayed it before the periodic purge deleted the file.
+
+Nothing is extracted now unless it has somewhere to go. Records that cannot be
+queued stay in the in-memory buffer, and the send happens under the shard lock,
+so the decision is atomic with respect to the buffer.
+
+A retained buffer is flushed by the next write to the same measurement, by the
+age-based flush, or by shutdown — so with a long `ingest.max_buffer_age_ms` it
+can sit in memory for up to that interval after the queue drains. There is no
+cap on retained rows yet, and nothing actively drains a deferred buffer while
+workers are idle; both are tracked in
+[#1008](https://github.com/Basekick-Labs/arc/issues/1008). A sampled warning and
+the new `arc_ingest_flush_deferred_total` metric report the condition that used
+to be a silent drop, so it is visible rather than inferred.
+
+This closes the first of #966's five routes; what remains is
+[#1008](https://github.com/Basekick-Labs/arc/issues/1008) and
+[#1009](https://github.com/Basekick-Labs/arc/issues/1009).
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#997](https://github.com/Basekick-Labs/arc/pull/997).
+
+
 ### A continuous query could write into Arc's reserved storage root ([#1010](https://github.com/Basekick-Labs/arc/issues/1010))
 
 A continuous-query definition is a row that outlives the request that wrote it,

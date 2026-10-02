@@ -735,51 +735,84 @@ func TestAgedFlush_SurvivesClose(t *testing.T) {
 	}
 }
 
-// TestClose_WaitsForWritersMidHandoff pins the third seam in #1007.
+// TestClose_NoHandoffWindow pins the third seam in #1007 as it now stands.
 //
-// A writer between shard.mu.Unlock() and tryEnqueueFlush holds no lock, is in no
-// queue and is in no inline flush. If Close drains the queue while such a writer
-// is mid-handoff, the writer's subsequent send lands in a queue that no worker
-// and no drain will ever read: the task is stranded, its records are counted
-// nowhere, and CloseFlushedCleanly still reports clean — so the shutdown purge
-// deletes the WAL those records depended on.
+// The seam was: a writer between shard.mu.Unlock() and the flush-queue send
+// holds records that are in no buffer, no queue and no flush, so a Close that
+// drains the queue in that window strands the writer's subsequent send — the
+// records are counted nowhere and the close still reports clean.
 //
-// This drives pendingEnqueueRecords directly rather than trying to race it. That
-// is deliberate: with shard.swept now set at the top of each shard's critical
-// section, a writer can only be mid-handoff if it extracted before its shard was
-// swept, so the window is far too narrow to provoke reliably — an earlier
-// version of this test asserted an empty queue after concurrent writes and
-// passed 20/20 with the mechanism removed, i.e. it pinned nothing. Exercising
-// the counter is what actually fails when the wait is gone.
-func TestClose_WaitsForWritersMidHandoff(t *testing.T) {
-	buf := NewArrowBuffer(closeTestConfig(), &countingBackend{}, zerolog.New(io.Discard))
-	buf.SetCloseBudget(20 * time.Second)
+// #1017 closed that with a pendingEnqueueRecords counter Close waited on. #966
+// route 1 then moved the send UNDER shard.mu, which removes the window itself:
+// a writer either completes its enqueue before Close's shard loop takes that
+// shard's lock, or blocks on the lock and then sees shard.swept and is refused
+// with ErrBufferClosing. There is no third state, so the counter was removed.
+//
+// This asserts the invariant that replaced it: under concurrent writers racing
+// Close, nothing is left in the queue and every accepted record is accounted
+// for. It is not a race-provoking test — it cannot be, now that the window is
+// gone — it is a guard against the send escaping shard.mu again.
+func TestClose_NoHandoffWindow(t *testing.T) {
+	const (
+		writers  = 12
+		perWrite = 4
+		rounds   = 25
+	)
 
-	// Stand in for a writer that has extracted a batch but not yet handed it to
-	// tryEnqueueFlush.
-	const inFlight = 7
-	buf.pendingEnqueueRecords.Add(inFlight)
+	store := &countingBackend{}
+	cfg := &config.IngestConfig{
+		MaxBufferSize:       perWrite, // every write triggers a flush → maximum handoff traffic
+		MaxBufferAgeMS:      3_600_000,
+		Compression:         "snappy",
+		ShardCount:          4,
+		FlushWorkers:        2,
+		FlushQueueSize:      64,
+		FlushTimeoutSeconds: 10,
+		DataPageVersion:     "2.0",
+	}
+	buf := NewArrowBuffer(cfg, store, zerolog.New(io.Discard))
+	buf.SetCloseBudget(30 * time.Second)
 
-	done := make(chan struct{})
-	go func() { _ = buf.Close(); close(done) }()
-
-	select {
-	case <-done:
-		t.Fatal("Close finished while a writer was still mid-handoff; its send would land in a queue nothing drains, leaving the records counted nowhere while the close reports clean (#1007, #803)")
-	case <-time.After(200 * time.Millisecond):
-		// Correct: Close is waiting.
+	var (
+		wg       sync.WaitGroup
+		accepted atomic.Int64
+		refused  atomic.Int64
+	)
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for r := 0; r < rounds; r++ {
+				err := buf.WriteColumnarDirect(context.Background(), "db", "m1", makeColumns(perWrite))
+				switch {
+				case err == nil:
+					accepted.Add(perWrite)
+				case errors.Is(err, ErrBufferClosing):
+					refused.Add(perWrite)
+				default:
+					t.Errorf("unexpected write error: %v", err)
+					return
+				}
+			}
+		}()
 	}
 
-	// The writer completes its handoff.
-	buf.pendingEnqueueRecords.Add(-inFlight)
-
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("Close did not resume after the handoff completed")
+	time.Sleep(15 * time.Millisecond)
+	if err := buf.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
+	wg.Wait()
 
 	if n := len(buf.flushQueue); n != 0 {
-		t.Fatalf("%d flush task(s) left in the queue after Close", n)
+		t.Fatalf("%d flush task(s) left in the queue after Close; a send escaped shard.mu, so Close's shard loop is no longer the barrier it relies on (#1007)", n)
+	}
+	written := buf.totalRecordsWritten.Load()
+	walOnly := buf.walOnlyRecords.Load() - refused.Load()
+	if walOnly < 0 {
+		walOnly = 0
+	}
+	if written+walOnly < accepted.Load() {
+		t.Fatalf("accepted %d records but only %d written + %d WAL-only = %d accounted for; %d vanished",
+			accepted.Load(), written, walOnly, written+walOnly, accepted.Load()-(written+walOnly))
 	}
 }

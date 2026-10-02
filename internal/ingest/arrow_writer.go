@@ -936,32 +936,6 @@ type ArrowBuffer struct {
 	// re-enable the shutdown WAL purge (#803).
 	closeFailed atomic.Bool
 
-	// pendingEnqueueRecords counts RECORDS that a writer has extracted from a
-	// shard buffer but has not yet handed to tryEnqueueFlush. In that window
-	// the records are in no shard, in no queue and in no inline flush, so
-	// nothing else can account for them.
-	//
-	// Incremented under shard.mu at extract time, so Close's shard loop — which
-	// takes every shard lock — cannot miss a writer that is about to enter the
-	// window. Close waits for it to drain to zero BEFORE draining the queue,
-	// which is what makes the drain a complete view of outstanding work.
-	//
-	// Without this, a writer that read b.closing as false before Close set it
-	// reaches a select whose queue-send arm and ctx.Done arm are both ready; Go
-	// picks uniformly, so roughly half the time it sends into a queue no worker
-	// and no drain will ever read, returns nil to its caller, and those records
-	// are counted nowhere.
-	pendingEnqueueRecords atomic.Int64
-
-	// lateFlushes counts synchronous flushes running on a writer's own
-	// goroutine because tryEnqueueFlush could not hand the task to a worker
-	// (buffer closing, or b.ctx cancelled during the send). Those records are
-	// already out of the buffer, so Close() must wait for the count to reach
-	// zero before deciding the shutdown was clean — otherwise it reports clean
-	// while a flush is still in flight and the WAL purge deletes the only
-	// other copy.
-	lateFlushes atomic.Int64
-
 	// closeBudget bounds Close() as a whole, including the wait for in-flight
 	// flushes. Set by SetCloseBudget from server.shutdown_timeout; falls back
 	// to flushTimeout when unset or non-positive. It bounds Close() only, not
@@ -4084,12 +4058,13 @@ func (b *ArrowBuffer) FlushAll(ctx context.Context) error {
 //  3. Mark each shard swept and flush its buffers, under the shard lock. Swept
 //     is set BEFORE the flush, because flushBufferLocked releases the lock for
 //     its I/O and a writer appending in that window would otherwise be lost.
-//  4. Wait for writers mid-handoff, then drain the flush queue and FLUSH what is
-//     in it. Previously those tasks were discarded "in favour of WAL replay",
-//     which with the shipped wal.enabled=false is loss on every graceful stop
-//     under load.
-//  5. Wait for any flush a writer is completing on its own goroutine.
-//  6. Decide whether the close was clean. Anything not confirmed written is
+//  4. Drain the flush queue and FLUSH what is in it. Previously those tasks were
+//     discarded "in favour of WAL replay", which with the shipped
+//     wal.enabled=false is loss on every graceful stop under load. No writer can
+//     be mid-handoff here: the enqueue happens under shard.mu, and step 3 took
+//     every shard lock, so a writer either completed its enqueue before its
+//     shard was swept or was refused with ErrBufferClosing.
+//  5. Decide whether the close was clean. Anything not confirmed written is
 //     counted into walOnlyRecords, which makes CloseFlushedCleanly false and
 //     keeps the shutdown WAL purge from deleting the only remaining copy (#803).
 //
@@ -4252,11 +4227,6 @@ func (b *ArrowBuffer) Close() error {
 		b.walOnlyRecords.Add(int64(budgetExpiredRecords))
 	}
 
-	// Let any writer that is mid-handoff finish, so the drain below sees every
-	// outstanding task. No shard can start a new one: step 1 marked them all
-	// swept while holding their locks.
-	b.waitForPendingEnqueues(deadline)
-
 	abandoned := b.drainAndFlushQueue(deadline)
 	if abandoned > 0 {
 		b.logger.Error().
@@ -4265,13 +4235,6 @@ func (b *ArrowBuffer) Close() error {
 		metrics.Get().IncWALRecordsPreserved(int64(abandoned))
 		b.walOnlyRecords.Add(int64(abandoned))
 	}
-
-	// STEP 3: wait for any flush a writer is running on its own goroutine
-	// (tryEnqueueFlush's inline path). Those records are out of the buffer and
-	// out of the queue, so without this wait Close could report a clean
-	// shutdown while one is still in flight and the WAL purge would delete its
-	// only other copy.
-	b.waitForLateFlushes(deadline)
 
 	// Record whether every record reached durable storage. The WAL purge on
 	// shutdown consults this via CloseFlushedCleanly: purging the WAL after a
@@ -4391,43 +4354,6 @@ drain:
 	}
 	wg.Wait()
 	return unwrit
-}
-
-// waitForPendingEnqueues blocks until no writer is between extracting a batch
-// and handing it to tryEnqueueFlush, or the Close deadline passes. Anything
-// still outstanding at the deadline is counted as WAL-only, since Close cannot
-// confirm where it ended up.
-func (b *ArrowBuffer) waitForPendingEnqueues(deadline time.Time) {
-	const poll = 2 * time.Millisecond
-	for b.pendingEnqueueRecords.Load() > 0 {
-		if !time.Now().Before(deadline) {
-			n := b.pendingEnqueueRecords.Load()
-			b.logger.Error().
-				Int64("in_flight", n).
-				Msg("Close budget expired with records still being handed to the flush queue; treating them as unconfirmed so the WAL is retained")
-			b.walOnlyRecords.Add(n)
-			return
-		}
-		time.Sleep(poll)
-	}
-}
-
-// waitForLateFlushes blocks until no writer is running an inline flush, or the
-// Close deadline passes. An inline flush that is still running when the deadline
-// expires is counted as WAL-only, because Close cannot confirm it landed.
-func (b *ArrowBuffer) waitForLateFlushes(deadline time.Time) {
-	const poll = 10 * time.Millisecond
-	for b.lateFlushes.Load() > 0 {
-		if !time.Now().Before(deadline) {
-			n := b.lateFlushes.Load()
-			b.logger.Error().
-				Int64("in_flight", n).
-				Msg("Close budget expired with inline flushes still running; treating them as unconfirmed so the WAL is retained")
-			b.walOnlyRecords.Add(n)
-			return
-		}
-		time.Sleep(poll)
-	}
 }
 
 // closeFlushContext builds the context for one flush performed by Close, and

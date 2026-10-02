@@ -88,6 +88,31 @@ func (h *hangingStorageBackend) AppendReader(_ context.Context, _ string, _ io.R
 	return nil
 }
 
+type gatedStorageBackend struct {
+	*hangingStorageBackend
+	release   <-chan struct{}
+	started   chan struct{}
+	completed chan struct{}
+	active    atomic.Int32
+}
+
+func (g *gatedStorageBackend) Write(_ context.Context, _ string, _ []byte) error {
+	g.active.Add(1)
+	g.started <- struct{}{}
+	<-g.release
+	g.active.Add(-1)
+	g.completed <- struct{}{}
+	return nil
+}
+
+func (g *gatedStorageBackend) WriteReader(ctx context.Context, path string, r io.Reader, _ int64) error {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	return g.Write(ctx, path, data)
+}
+
 // makeColumns builds a columnar batch with the given record count.
 func makeColumns(n int) map[string][]interface{} {
 	ts := make([]interface{}, n)
@@ -228,12 +253,31 @@ func TestPeriodicFlush_BlocksOnStorageHang(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
-// Test: all flush workers exhausted → queue fills → data dropped
+// Test: when all workers and queued slots are occupied, writes remain buffered
+// and Close persists them after the storage backend recovers.
 // -----------------------------------------------------------------------------
 
-func TestAllFlushWorkers_Exhausted_QueueFills(t *testing.T) {
+func TestAllFlushWorkers_Exhausted_QueueFills_DataRemainsBuffered(t *testing.T) {
+	for _, typed := range []bool{false, true} {
+		name := "columnar"
+		if typed {
+			name = "typed-columnar"
+		}
+		t.Run(name, func(t *testing.T) {
+			testFlushQueueSaturationRetainsData(t, typed)
+		})
+	}
+}
+
+func testFlushQueueSaturationRetainsData(t *testing.T, typed bool) {
 	logger := zerolog.Nop()
-	store := newHangingStorage(0, 0) // hang on ALL writes
+	release := make(chan struct{})
+	store := &gatedStorageBackend{
+		hangingStorageBackend: newHangingStorage(0, 0),
+		release:               release,
+		started:               make(chan struct{}, 32),
+		completed:             make(chan struct{}, 32),
+	}
 
 	cfg := &config.IngestConfig{
 		MaxBufferSize:   1000,
@@ -242,47 +286,78 @@ func TestAllFlushWorkers_Exhausted_QueueFills(t *testing.T) {
 		UseDictionary:   true,
 		WriteStatistics: true,
 		DataPageVersion: "2.0",
-		// Bounded explicitly. These tests deliberately leave a flush stuck in the
-		// backend and then call Close; Close now WAITS for flushes in progress
-		// instead of cancelling them (#1007), so an unset timeout would default to
-		// 30s and leave a Close goroutine parked for that long after the test
-		// returned.
-		FlushTimeoutSeconds: 2,
-		FlushWorkers:        2,
-		FlushQueueSize:      3, // tiny queue
-		ShardCount:          2,
+		FlushWorkers:    2,
+		FlushQueueSize:  3, // tiny queue
+		ShardCount:      2,
 	}
 
 	buf := NewArrowBuffer(cfg, store, logger)
 
-	// Write enough to trigger multiple flushes — workers and queue will fill up
-	for i := 0; i < 20; i++ {
-		buf.WriteColumnarDirect(context.Background(), "db", "m1", makeColumns(600))
+	const batchSize = 600
+	const batchCount = 20
+	for i := 0; i < batchCount; i++ {
+		var err error
+		if typed {
+			batch := &TypedColumnBatch{Data: map[string]interface{}{
+				"time": make([]int64, batchSize), "value": make([]float64, batchSize),
+				"device_id": make([]string, batchSize),
+			}}
+			err = buf.WriteTypedColumnarDirect(context.Background(), "db", "m1", batch, batchSize)
+		} else {
+			err = buf.WriteColumnarDirect(context.Background(), "db", "m1", makeColumns(batchSize))
+		}
+		if err != nil {
+			t.Fatalf("write %d was rejected instead of retained: %v", i, err)
+		}
 	}
-	time.Sleep(2 * time.Second)
+	for i := 0; i < cfg.FlushWorkers; i++ {
+		select {
+		case <-store.started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("flush worker did not reach gated storage")
+		}
+	}
 
 	stats := buf.GetStats()
 	errors, _ := stats["total_errors"].(int64)
 	written, _ := stats["total_records_written"].(int64)
 	buffered, _ := stats["total_records_buffered"].(int64)
-
 	if written != 0 {
-		t.Fatalf("expected 0 records written to S3 (all hung), got %d", written)
+		t.Fatalf("expected writes to remain gated, got %d records written", written)
+	}
+	if errors != 0 {
+		t.Fatalf("queue saturation must not count as a write failure, got %d", errors)
+	}
+	if buffered != batchSize*batchCount {
+		t.Fatalf("buffered records = %d, want %d", buffered, batchSize*batchCount)
+	}
+	if got := buf.totalFlushDeferred.Load(); got == 0 {
+		t.Fatal("expected full queue to defer at least one flush")
+	}
+	if got := len(buf.flushQueue); got != cap(buf.flushQueue) {
+		t.Fatalf("flush queue depth = %d, want full capacity %d", got, cap(buf.flushQueue))
 	}
 
-	if errors == 0 {
-		t.Fatal("expected flush queue full errors, got 0")
+	// Let the already-enqueued tasks drain before Close, then Close flushes the
+	// retained batches synchronously.
+	queuedAndActive := int(buf.queueDepth.Load()) + int(store.active.Load())
+	close(release)
+	for i := 0; i < queuedAndActive; i++ {
+		select {
+		case <-store.completed:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d of %d queued/active flushes completed", i, queuedAndActive)
+		}
 	}
-
-	t.Logf("CONFIRMED: workers=%d stuck, queue full errors=%d, buffered=%d, written=%d",
-		store.stuck.Load(), errors, buffered, written)
-	t.Log("CONFIRMED: data is accepted but never persisted to S3")
-
-	closeDone := make(chan struct{})
-	go func() { buf.Close(); close(closeDone) }()
-	select {
-	case <-closeDone:
-	case <-time.After(3 * time.Second):
+	if err := buf.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	final := buf.GetStats()
+	if got, _ := final["total_records_written"].(int64); got != batchSize*batchCount {
+		t.Fatalf("records written after Close = %d, want %d", got, batchSize*batchCount)
+	}
+	if !buf.CloseFlushedCleanly() {
+		t.Fatal("Close did not report a clean flush")
 	}
 }
 
