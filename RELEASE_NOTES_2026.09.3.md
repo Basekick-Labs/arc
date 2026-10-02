@@ -2,6 +2,15 @@
 
 > **Status:** Planned — November 2026 patch release.
 
+## Compaction dedup metrics count Parquet rows correctly ([#1015](https://github.com/Basekick-Labs/arc/issues/1015))
+
+Deduplication row counts now come from DuckDB's `parquet_file_metadata`, where
+`num_rows` is available, so the before/after counts and dedup-ratio log can be
+produced. Count failures are recorded at Debug level instead of being silently
+discarded.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1019](https://github.com/Basekick-Labs/arc/pull/1019).
+
 ## Fixed: edge-sync names reject DuckDB glob and Hive partition syntax ([#994](https://github.com/Basekick-Labs/arc/issues/994))
 
 Spoke IDs and received sync-path segments containing DuckDB glob metacharacters
