@@ -955,6 +955,11 @@ func (h *DeleteHandler) updateManifestAfterRewrite(relativePath string, s3 *s3Re
 	}
 
 	entry := *existing // copy all fields to preserve immutable metadata
+	if localNodeIDProvider, ok := h.coordinator.(interface{ LocalNodeID() string }); ok {
+		// The node that performed the rewrite owns the new bytes. Keeping the
+		// old origin after a writer failover makes readers fetch stale content.
+		entry.OriginNodeID = localNodeIDProvider.LocalNodeID()
+	}
 
 	if lb, ok := h.storage.(*storage.LocalBackend); ok {
 		basePath := lb.GetBasePath()
