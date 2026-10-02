@@ -453,8 +453,15 @@ Two new signals, both already present in `GetStats` as `total_flush_deferred` an
   records no worker could take. This is the one to alert on; it should return to
   zero within roughly one flush duration.
 
-**What this does not fix.** Deferred records are held in memory and there is
-still no cap on that ([#1025](https://github.com/Basekick-Labs/arc/issues/1025)).
+**What this does not fix.** Deferred records are held in memory, and Arc does not
+bound that — deliberately. `ingest.max_buffer_size` is a *per-measurement* flush
+trigger, so worst-case held memory is roughly
+`active_measurements x max_buffer_size x bytes_per_record`, and a global cap low
+enough to prevent that would reject many-measurement workloads that work today.
+The knobs are yours: lowering `max_buffer_size` or `max_buffer_age_ms` makes
+flushes smaller and more frequent, at the cost of more Parquet files for
+compaction to merge. Better signals for deciding that are tracked in
+[#1025](https://github.com/Basekick-Labs/arc/issues/1025).
 The drain also competes with ordinary writes for a freed slot, and a writer
 already holding its shard lock wins, so under *sustained* saturation a cold
 deferred buffer can still fall through to the age sweep — the guarantee is that
@@ -479,8 +486,9 @@ so the decision is atomic with respect to the buffer.
 
 A retained buffer is flushed as soon as a flush worker frees a queue slot (see
 the next entry), by the next write to the same measurement, by the age-based
-flush, or by shutdown. There is still no cap on how many records are retained;
-that is tracked in [#1025](https://github.com/Basekick-Labs/arc/issues/1025). A sampled warning and
+flush, or by shutdown. How many records a node retains is bounded by your
+`ingest.max_buffer_size` and `ingest.max_buffer_age_ms` settings rather than by a
+cap Arc applies — see the note on the drain below. A sampled warning and
 the new `arc_ingest_flush_deferred_total` metric report the condition that used
 to be a silent drop, so it is visible rather than inferred.
 
