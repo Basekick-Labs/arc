@@ -316,7 +316,7 @@ func (j *Job) Run(ctx context.Context) error {
 	}
 	defer j.cleanupTemp(tempDir)
 
-	// Download files to temp directory
+	// Reuse local files where possible; remote inputs are streamed to a temp directory.
 	downloadedFiles, err := j.downloadFiles(ctx, tempDir)
 	if err != nil {
 		return j.fail(fmt.Errorf("failed to download files: %w", err))
@@ -474,7 +474,7 @@ func (j *Job) Run(ctx context.Context) error {
 // downloadedFile tracks a downloaded file with its original storage key and local path
 type downloadedFile struct {
 	storageKey string // Original storage key
-	localPath  string // Local file path after download
+	localPath  string // Local file path after reuse or download
 	size       int64  // File size in bytes
 }
 
@@ -495,7 +495,8 @@ type downloadResult struct {
 // downloadWorkers is the number of concurrent download workers
 const downloadWorkers = 4
 
-// downloadFiles downloads files from storage to the temp directory using parallel workers.
+// downloadFiles prepares files for compaction using parallel workers. Local files
+// are reused in place; other backends are streamed to the temp directory.
 // Returns downloaded files info and any error encountered.
 func (j *Job) downloadFiles(ctx context.Context, tempDir string) ([]downloadedFile, error) {
 	if len(j.Files) == 0 {
@@ -590,6 +591,32 @@ func (j *Job) downloadSingleFile(ctx context.Context, tempDir string, index int,
 	case <-ctx.Done():
 		return downloadResult{index: index, err: ctx.Err()}
 	default:
+	}
+
+	// Local files are already on the filesystem DuckDB will read from. Keep
+	// the original path instead of copying the input into the compaction temp
+	// directory; remote backends continue through the streaming path below.
+	if local, ok := j.StorageBackend.(*storage.LocalBackend); ok {
+		if localPath, err := storage.ObjectURI(local, fileKey); err == nil {
+			info, err := os.Stat(localPath)
+			if err == nil {
+				if !info.Mode().IsRegular() {
+					return downloadResult{index: index, err: fmt.Errorf("local compaction input %s is not a regular file", localPath)}
+				}
+				return downloadResult{index: index, file: &downloadedFile{
+					storageKey: fileKey,
+					localPath:  localPath,
+					size:       info.Size(),
+				}}
+			}
+			if os.IsNotExist(err) {
+				j.logger.Debug().Str("file", fileKey).Msg("File not found (already compacted), skipping")
+				return downloadResult{index: index, skipped: true}
+			}
+			if err != nil {
+				return downloadResult{index: index, err: fmt.Errorf("failed to stat %s: %w", localPath, err)}
+			}
+		}
 	}
 
 	// The input index makes each download path unique even when source keys
@@ -701,6 +728,10 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	var validLocalPaths []string
 	var validStorageKeys []string
 	for _, df := range files {
+		if err := storage.ValidateGlobSafe(df.localPath); err != nil {
+			j.logger.Error().Err(err).Str("file", df.localPath).Msg("Skipping compaction input with glob metacharacters")
+			continue
+		}
 		if err := validateParquetFile(df.localPath); err != nil {
 			j.logger.Error().Err(err).Str("file", filepath.Base(df.localPath)).Msg("Skipping corrupted file")
 			continue

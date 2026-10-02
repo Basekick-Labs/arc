@@ -152,7 +152,7 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 		// still compacts instead of failing the column bind. See timeNormalizeReplace.
 		return []string{fmt.Sprintf(`
 		COPY (
-			SELECT * REPLACE (%s) FROM read_parquet(%s, union_by_name=true)
+			SELECT * REPLACE (%s) FROM read_parquet(%s, union_by_name=true, hive_partitioning=false)
 			%s
 		) TO '%s' (
 			FORMAT PARQUET,
@@ -213,7 +213,7 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 	partitionBy := strings.Join(quotedKeys, ", ")
 
 	stage := fmt.Sprintf(
-		`CREATE OR REPLACE TEMP TABLE %s AS SELECT * REPLACE (%s) FROM read_parquet(%s, union_by_name=true)`,
+		`CREATE OR REPLACE TEMP TABLE %s AS SELECT * REPLACE (%s) FROM read_parquet(%s, union_by_name=true, hive_partitioning=false)`,
 		dedupStagingTable, timeNormalizeReplace, fileListSQL)
 
 	copyOut := fmt.Sprintf(`
@@ -270,7 +270,7 @@ const timeNormalizeReplace = `COALESCE(TRY_CAST("time" AS TIMESTAMPTZ), make_tim
 // Job.compactFiles.
 func parquetFilesHaveTimeColumn(ctx context.Context, db *sql.DB, fileListSQL string) (bool, error) {
 	query := fmt.Sprintf(
-		`SELECT COUNT(*) FROM (DESCRIBE SELECT * FROM read_parquet(%s, union_by_name=true)) WHERE column_name = 'time'`,
+		`SELECT COUNT(*) FROM (DESCRIBE SELECT * FROM read_parquet(%s, union_by_name=true, hive_partitioning=false)) WHERE column_name = 'time'`,
 		fileListSQL,
 	)
 	var n int64

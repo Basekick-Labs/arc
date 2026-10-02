@@ -156,6 +156,19 @@ predate that fix and #978.
 
 ## Bug fixes
 
+### Compaction reuses local inputs safely and avoids glob/hive path interpretation ([#969](https://github.com/Basekick-Labs/arc/issues/969))
+
+Local compaction inputs are read in place instead of being copied into the job
+temporary directory. Compaction now rejects glob-sensitive paths before handing
+them to DuckDB, disables Hive partition inference for input paths, preserves
+temporary-file collision protection for streamed backends, and treats a
+concurrent input disappearance as a permanent skip for the current batch. Local
+input reads remain on the data volume and therefore do not contribute to the
+storage ReadTo byte metrics; the configured temporary directory continues to
+apply to streamed remote inputs and output staging.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#990](https://github.com/Basekick-Labs/arc/pull/990).
+
 ### A newline before a table function's parenthesis made the function a measurement
 
 Arc's RBAC extractor and its SQL rewriter each decide independently whether a
