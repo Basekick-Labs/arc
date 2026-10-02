@@ -287,6 +287,29 @@ predate that fix and #978.
 
 ## Bug fixes
 
+### Continuous queries re-validate their stored definition before each run
+
+A continuous-query definition is validated when it is created or updated, but
+it is a row that outlives the request that wrote it: it re-executes on a
+schedule, and nothing re-checked it in between. So a definition could reach
+DuckDB having never been checked by the rules in force at the time it ran —
+one stored before the create-time validator existed, one stored by an older
+build whose validator knew fewer cases, or one written directly into the
+shared metadata database.
+
+`executeAggregation` now runs the shared validator over the definition before
+executing it, which covers the scheduler, the admin execute endpoint, and any
+future caller in one place. The statement validated is the real one, with the
+`{start_time}`/`{end_time}` placeholders already substituted, rather than a
+representative probe.
+
+**A definition that fails now reports a failed run** rather than executing.
+The reason is recorded with the execution and is readable through
+`GET /api/v1/continuous_queries/:id/executions`, so a continuous query that
+stops producing after an upgrade says why. If you see one, the definition
+needs editing to satisfy the current validator — most likely it references a
+file path directly, calls a filesystem I/O function, or contains more than one
+statement.
 ### The delete WHERE validator reuses the shared table-position guard
 
 `POST /api/v1/delete` takes a WHERE fragment and interpolates it into a
