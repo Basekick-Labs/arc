@@ -574,6 +574,15 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	case queryID != "":
 		ctx, cancel = context.WithCancel(baseCtx)
 	}
+	if cancel == nil {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	watchClientDisconnect(ctx, c.Context().Conn(), func() {
+		if h.queryRegistry != nil && queryID != "" {
+			h.queryRegistry.Cancel(queryID)
+		}
+		cancel()
+	})
 
 	// The arcx hook may install an asynchronous stream writer. A successful
 	// hand-off transfers ownership of cancel and registry disposition to it.
