@@ -13,11 +13,11 @@ The count had been read from `parquet_metadata`, which has no `num_rows`
 column, so the query returned a binder error on every compaction and the error
 was discarded at both call sites. The row count was therefore always zero and
 the log it gates — `Deduplication removed duplicate rows`, the only output Arc
-produces for how many rows de-duplication discarded — **has never fired on any
-release**. An operator who saw no such line was reading an absent signal, not
-an absence of duplicates, and no historical dedup volume can be recovered from
-the logs. That matters beyond the missing metric: it is the line that would
-have surfaced the row loss described under
+produces for how many rows de-duplication discarded — **never fired on any
+release up to and including 2026.09.2**. An operator who saw no such line was
+reading an absent signal, not an absence of duplicates, and no historical dedup
+volume can be recovered from the logs. That matters beyond the missing metric:
+it is the line that would have surfaced the row loss described under
 [#1005](https://github.com/Basekick-Labs/arc/issues/1005) in these notes, where
 a `key=value` compaction temp directory collapsed the de-duplication key and
 discarded rows of distinct series as duplicates.
@@ -123,10 +123,12 @@ already there; where it did not, it added a column Arc ignored.
 - *Compacted output* written through a `key=value` compaction temp directory has
   the substituted column baked in, and where the derived name matched a tag,
   rows of distinct series were discarded as duplicates. There is no log line to
-  look back for: the de-duplication ratio Arc emits after a compaction counts
-  its input rows with a query that has always errored, so the one signal that
-  would have reported the loss has never fired. Tracked separately as
-  [#1015](https://github.com/Basekick-Labs/arc/issues/1015).
+  look back for: the de-duplication ratio Arc emits after a compaction counted
+  its input rows with a query that always errored, so the one signal that would
+  have reported the loss never fired on any release up to and including
+  2026.09.2. That count is fixed in this release
+  ([#1015](https://github.com/Basekick-Labs/arc/issues/1015)), which makes the
+  signal available from now on but recovers nothing retrospectively.
 - *Continuous-query destinations* hold the aggregates that were computed from
   the substituted column. Re-running a continuous query appends rather than
   corrects, so the affected windows have to be removed first.
