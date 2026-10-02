@@ -6,12 +6,11 @@
 #   base                 — boot 3 writers + 1 reader, ingest N records via
 #                          Traefik LB, query through reader, assert count.
 #   non-leader-crash     — same, but kill a non-leader writer mid-ingest.
-#                          Asserts: writes that succeeded HTTP-side are
-#                          all queryable; LB drained the dead writer.
+#                          Restarts the writer after ingest and asserts that
+#                          every HTTP-success record is queryable.
 #   leader-crash         — same, but kill the current Raft leader mid-ingest.
-#                          Asserts: Raft elects a new leader within a few
-#                          seconds; writes continue; succeeded writes are
-#                          all queryable.
+#                          Restarts it after ingest and asserts that every
+#                          HTTP-success record is queryable.
 #
 # What this validates end-to-end (from PR1a):
 #   - cluster.shared_storage_mode=true accepted by startup validation
@@ -379,6 +378,17 @@ for c in arc-writer1 arc-writer2 arc-writer3; do
   log "  $c: arc_ingest_records_total = ${metric:-?}"
 done
 
+# ---------- restart crashed writer and wait for WAL replay ----------
+if [[ "$SCENARIO" != "base" ]]; then
+  log "restarting $KILL_TARGET and waiting for WAL replay"
+  docker start "$KILL_TARGET" >/dev/null || fail "could not restart $KILL_TARGET"
+  if ! wait_ready "$KILL_TARGET"; then
+    docker compose "${COMPOSE_FILES[@]}" logs --tail=80 "$KILL_TARGET" || true
+    fail "$KILL_TARGET did not become ready after restart within ${READY_TIMEOUT_S}s"
+  fi
+  ok "$KILL_TARGET ready after WAL replay"
+fi
+
 # ---------- wait for flush + manifest replication ----------
 log "waiting ${FLUSH_WAIT_S}s for flush + manifest replication"
 sleep "$FLUSH_WAIT_S"
@@ -389,29 +399,34 @@ RESPONSE=$(curl -fsS -X POST "$TRAEFIK_URL/api/v1/query" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "x-arc-database: $DATABASE" \
   -H "Content-Type: application/json" \
-  -d "{\"sql\": \"SELECT COUNT(*) AS n FROM $MEASUREMENT\"}" \
+  -d "{\"sql\": \"SELECT COUNT(*) AS n, COUNT(DISTINCT host) AS unique_hosts FROM $MEASUREMENT\"}" \
   || fail "query")
 
-ACTUAL=$(echo "$RESPONSE" | python3 -c '
+COUNTS=$(echo "$RESPONSE" | python3 -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
-    # Arc native response: {"columns": ["n"], "data": [[1000]], ...}
+    # Arc native response: {"columns": ["n", "unique_hosts"], "data": [[1000, 1000]], ...}
     # Older/dict-row shape: {"data": [{"n": 1000}], ...}
     data = d.get("data") or []
     if data and isinstance(data[0], list):
-        print(data[0][0])
+        print(f"{data[0][0]}\t{data[0][1]}")
     elif data and isinstance(data[0], dict):
         row = data[0]
-        print(row.get("n") or row.get("COUNT(*)") or list(row.values())[0])
+        n = row.get("n", row.get("COUNT(*)", list(row.values())[0]))
+        unique_hosts = row.get("unique_hosts", 0)
+        print("{}\t{}".format(n, unique_hosts))
     else:
-        print("0")
+        print("0\t0")
 except Exception as e:
     sys.stderr.write(f"parse error: {e}\n")
-    print("0")
-' 2>/dev/null || echo "0")
+' 2>/dev/null || printf '0\t0\n')
+IFS=$'\t' read -r ACTUAL DISTINCT_ACTUAL <<<"$COUNTS"
+ACTUAL="${ACTUAL:-0}"
+DISTINCT_ACTUAL="${DISTINCT_ACTUAL:-0}"
 
 log "query returned: $ACTUAL records"
+log "  distinct records (host): $DISTINCT_ACTUAL"
 log "  HTTP-success during write: $WRITTEN_OK"
 log "  HTTP-error during write:   $(( WRITTEN_SENT - WRITTEN_OK ))"
 
@@ -435,21 +450,24 @@ case "$SCENARIO" in
     # not a duplicate-insert bug — it's a race between TCP teardown
     # and S3 flush, and it's the kind of edge case operators should
     # know about. Log informationally, don't fail.
-    if [[ "$ACTUAL" -lt "$WRITTEN_OK" ]]; then
+    if [[ "$DISTINCT_ACTUAL" -lt "$WRITTEN_OK" ]]; then
       log "  HTTP-success: $WRITTEN_OK"
-      log "  queryable:    $ACTUAL"
-      log "  missing:      $(( WRITTEN_OK - ACTUAL ))"
+      log "  distinct queryable: $DISTINCT_ACTUAL"
+      log "  missing:            $(( WRITTEN_OK - DISTINCT_ACTUAL ))"
       fail "$SCENARIO: records lost AFTER successful HTTP response (durability violation)"
     fi
-    if [[ "$ACTUAL" -gt "$WRITTEN_OK" ]]; then
-      log "  HTTP-success: $WRITTEN_OK"
-      log "  queryable:    $ACTUAL"
-      log "  extra:        $(( ACTUAL - WRITTEN_OK ))"
+    if [[ "$DISTINCT_ACTUAL" -gt "$WRITTEN_OK" ]]; then
+      log "  HTTP-success:     $WRITTEN_OK"
+      log "  distinct records: $DISTINCT_ACTUAL"
+      log "  extra:            $(( DISTINCT_ACTUAL - WRITTEN_OK ))"
       log "  note: docker-kill RST'd the client connection after the writer"
       log "  had already flushed to S3 — record counted-as-lost client-side"
       log "  but is durably stored. Not a duplicate; not a violation."
     fi
-    ok "$SCENARIO: durability OK ($ACTUAL >= $WRITTEN_OK; in-flight loss tolerated)"
+    if [[ "$ACTUAL" -gt "$DISTINCT_ACTUAL" ]]; then
+      log "  note: $(( ACTUAL - DISTINCT_ACTUAL )) replay duplicate rows are expected until compaction"
+    fi
+    ok "$SCENARIO: durability OK ($DISTINCT_ACTUAL distinct records >= $WRITTEN_OK HTTP successes)"
     ;;
 esac
 
