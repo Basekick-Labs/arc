@@ -1168,10 +1168,10 @@ func (p *Puller) worker(id int) {
 // process put the file in place) and re-resolves the peer list (in case of
 // topology change).
 // Within a single attempt, the resolver returns an ordered list of candidate
-// peers and we fall through to the next candidate on any per-peer failure
-// EXCEPT checksum mismatch — a corrupt body from one peer is a real data
-// integrity problem and shouldn't trigger pull-and-corrupt from every other
-// healthy peer in turn.
+// peers and we fall through to the next candidate on any per-peer failure. A
+// checksum mismatch removes the bad partial before returning, so trying the
+// next candidate is safe and allows a stale or corrupt origin to fail over to
+// a peer that has the manifest bytes.
 func (p *Puller) processEntry(log zerolog.Logger, request *pullRequest) {
 	entry := request.entry
 	// failed and succeeded are local to this worker so a concurrent worker
@@ -1317,14 +1317,12 @@ func (p *Puller) processEntry(log zerolog.Logger, request *pullRequest) {
 			if errors.Is(err, context.Canceled) {
 				return
 			}
-			// Checksum mismatch is a data-integrity signal, not a "try next
-			// peer" signal. A peer served bytes that didn't match the manifest
-			// SHA-256 — corrupt manifest, corrupt peer, or adversarial peer.
-			// Do NOT fall through to other peers; let the attempt-level retry
-			// handle it (delete-and-redownload semantics already in pullOnce).
+			// A checksum mismatch means this peer served bytes that did not
+			// match the manifest SHA-256. pullOnce has already removed the
+			// rejected file, so continue with the next candidate: the origin
+			// may be stale while another replica has the current bytes.
 			if errors.Is(err, ErrChecksumMismatch) {
 				checksumMismatch = true
-				break
 			}
 			// File-not-on-peer and transport errors both fall through to the
 			// next candidate. Log at Debug so operators can see the fallback
@@ -1528,8 +1526,7 @@ func (p *Puller) sleepBackoff(attempt int) {
 // ErrChecksumMismatch is returned by Fetcher implementations when the bytes
 // pulled from a peer don't match the expected SHA-256 from the manifest.
 // The puller tracks this as a distinct metric and deletes the partial local
-// file before retrying. Unlike ErrFileNotOnPeer, this error does NOT trigger
-// the multi-peer fallback — a corrupt body is a data integrity signal.
+// file before trying another candidate or retrying the attempt.
 var ErrChecksumMismatch = errors.New("filereplication: checksum mismatch")
 
 // ErrFileNotOnPeer is returned by Fetcher implementations when a peer

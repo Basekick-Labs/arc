@@ -177,6 +177,17 @@ Found while fixing
 the two are the same extractor-versus-rewriter seam in two different table
 positions.
 
+### File replication recovered from a stale origin when replicas disagreed on bytes ([#975](https://github.com/Basekick-Labs/arc/issues/975))
+
+When a replica returned a same-size file whose bytes did not match the
+manifest checksum, the puller discarded the rejected file but stopped trying
+the remaining candidate peers. A stale origin could therefore turn a healthy
+replica into a failed catch-up. The puller now continues to the next candidate
+after removing the rejected partial, and the regression test covers recovery
+from a stale first peer to a current second peer.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#989](https://github.com/Basekick-Labs/arc/pull/989).
+
 ### A comma cross-join `FROM a, b` read only the first measurement ([#978](https://github.com/Basekick-Labs/arc/issues/978))
 
 Arc resolves measurement names to Parquet paths by rewriting the table after

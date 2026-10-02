@@ -1029,26 +1029,25 @@ func TestPullerMultiPeerCtxCanceledEarlyExit(t *testing.T) {
 	}
 }
 
-// TestPullerMultiPeerChecksumMismatchDoesNotFallThrough is the regression
-// test for the "checksum mismatch breaks the peer loop" decision in the
-// Phase 3 plan. A corrupt body from peer-1 is a data integrity signal —
-// the puller should NOT then try peer-2 within the same attempt (which
-// would pull-and-corrupt from every healthy peer in turn). Instead it
-// delete-and-retries on the next attempt.
-func TestPullerMultiPeerChecksumMismatchDoesNotFallThrough(t *testing.T) {
+// TestPullerMultiPeerChecksumMismatchFallsThrough verifies that a stale or
+// corrupt first candidate does not prevent recovery from another replica.
+func TestPullerMultiPeerChecksumMismatchFallsThrough(t *testing.T) {
 	backend := newFakeBackend()
 	fetcher := newPerPeerFetcher()
-	// Peer 1: returns a checksum mismatch. The puller must short-circuit
-	// out of the per-attempt peer loop.
+	goodBody := []byte("current parquet")
+	digest := sha256.Sum256(goodBody)
+	// Peer 1: returns a body that fails the manifest checksum.
 	fetcher.handle("1.1.1.1:9100", func(dst io.Writer) (int64, error) {
-		return 0, ErrChecksumMismatch
+		body := []byte("stale parquet!!")
+		if _, err := dst.Write(body); err != nil {
+			return 0, err
+		}
+		return int64(len(body)), ErrChecksumMismatch
 	})
-	// Peer 2: would succeed if called. The puller must NOT call it within
-	// the same attempt.
-	peer2Called := atomic.Int64{}
+	// Peer 2: has the current manifest bytes and should recover the pull.
 	fetcher.handle("2.2.2.2:9100", func(dst io.Writer) (int64, error) {
-		peer2Called.Add(1)
-		return 0, ErrChecksumMismatch
+		n, err := dst.Write(goodBody)
+		return int64(n), err
 	})
 	resolver := multiPeerResolver{addrs: []string{"1.1.1.1:9100", "2.2.2.2:9100"}}
 
@@ -1059,7 +1058,7 @@ func TestPullerMultiPeerChecksumMismatchDoesNotFallThrough(t *testing.T) {
 		PeerResolver:        resolver,
 		Workers:             1,
 		QueueSize:           4,
-		RetryMaxAttempts:    1, // one attempt — no retries, so we can count peers precisely
+		RetryMaxAttempts:    1, // peer fallback must work within one attempt
 		RetryInitialBackoff: 10 * time.Millisecond,
 		FetchTimeout:        2 * time.Second,
 		Logger:              zerolog.Nop(),
@@ -1070,25 +1069,28 @@ func TestPullerMultiPeerChecksumMismatchDoesNotFallThrough(t *testing.T) {
 	p.Start(context.Background())
 	defer p.Stop()
 
-	entry := makeEntry("testdb/cpu/corrupt.parquet", "writer-1", 100)
+	entry := makeEntry("testdb/cpu/corrupt.parquet", "writer-1", int64(len(goodBody)))
+	entry.SHA256 = fmt.Sprintf("%x", digest)
 	p.Enqueue(entry)
 
 	stats := waitStats(t, p, func(s map[string]int64) bool {
-		return s["failed"] == 1
+		return s["pulled"] == 1
 	})
-	if stats["failed"] != 1 {
-		t.Errorf("failed: got %d, want 1", stats["failed"])
+	if stats["pulled"] != 1 {
+		t.Fatalf("pulled: got %d, want 1; stats=%+v", stats["pulled"], stats)
 	}
 	if stats["checksum_mismatch"] != 1 {
 		t.Errorf("checksum_mismatch: got %d, want 1", stats["checksum_mismatch"])
 	}
-	// Critical assertion: peer-2 must NOT have been called within the same
-	// attempt after peer-1's checksum mismatch.
 	if c := fetcher.callsFor("1.1.1.1:9100"); c != 1 {
 		t.Errorf("peer-1 calls: got %d, want 1", c)
 	}
-	if c := fetcher.callsFor("2.2.2.2:9100"); c != 0 {
-		t.Errorf("peer-2 calls: got %d, want 0 (checksum mismatch must break the peer loop)", c)
+	if c := fetcher.callsFor("2.2.2.2:9100"); c != 1 {
+		t.Errorf("peer-2 calls: got %d, want 1 (checksum mismatch should fall through)", c)
+	}
+	got, err := backend.Read(context.Background(), entry.Path)
+	if err != nil || !bytes.Equal(got, goodBody) {
+		t.Errorf("final body: err=%v got=%q want=%q", err, got, goodBody)
 	}
 }
 
