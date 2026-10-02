@@ -212,7 +212,7 @@ func (d *DuckDB) s3TierStatus(params s3SecretParams, refreshers map[string]*cred
 // bypass path around the sandbox. Returns the same list configureDatabase used to
 // lock DuckDB down (see buildAllowedDirectories).
 func (d *DuckDB) AllowedDirectories() []string {
-	if d.config == nil {
+	if d == nil || d.config == nil {
 		return nil
 	}
 	return buildAllowedDirectories(d.config)

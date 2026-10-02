@@ -150,6 +150,13 @@ func TestBuildAllowedDirectories(t *testing.T) {
 	}
 }
 
+func TestAllowedDirectoriesNilReceiver(t *testing.T) {
+	var db *DuckDB
+	if got := db.AllowedDirectories(); got != nil {
+		t.Fatalf("AllowedDirectories() on a nil receiver = %v, want nil", got)
+	}
+}
+
 // newSandboxFixture spins up a DuckDB with a real LocalStorageRoot under
 // t.TempDir() and pre-populates a parquet file inside that root. Returns the
 // DB plus the path of the inside-allowlist fixture so each sub-test can use
