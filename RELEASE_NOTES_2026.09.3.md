@@ -330,6 +330,35 @@ stops producing after an upgrade says why. If you see one, the definition
 needs editing to satisfy the current validator — most likely it references a
 file path directly, calls a filesystem I/O function, or contains more than one
 statement.
+
+### Continuous query create and update apply Arc's database-name rule ([#993](https://github.com/Basekick-Labs/arc/issues/993))
+
+`POST` and `PUT /api/v1/continuous_queries` validated `destination_measurement`
+but applied no name rule to `database` beyond a non-empty check — the only
+ingest-reaching `database` in the tree that did not. The value is not inert: it
+becomes a storage path segment for both the source read and the destination
+write, so a continuous query could be created whose output landed in a
+directory named `**`, `db*`, `db[1]` or `host=hub01`.
+
+Nothing read such a path unsafely. Every `read_parquet` sink that interpolates a
+storage path applies the glob-safety guard, and a stored definition whose
+database carries a glob metacharacter fails its run with `has an unusable
+source` rather than producing one. The reason to close it at the boundary is
+that the guard is each sink's to remember, and this field should not be able to
+produce such a name in the first place. Creating a continuous query requires an
+admin token, so this is defence in depth, not a privilege-escalation path.
+
+Two behaviour changes come with it. `database` must now satisfy the same rule as
+everywhere else — start with a letter, then letters, digits, underscores or
+hyphens, at most 64 characters — on both create and update. And because `PUT`
+overwrites the whole definition, it now requires a valid `database` in the body:
+a partial update that omitted the field previously succeeded and blanked the
+stored row, and is now refused. A continuous query whose stored `database`
+already violates the rule cannot be updated — delete it and recreate it with a
+valid name.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#995](https://github.com/Basekick-Labs/arc/pull/995).
+
 ### The delete WHERE validator reuses the shared table-position guard
 
 `POST /api/v1/delete` takes a WHERE fragment and interpolates it into a
