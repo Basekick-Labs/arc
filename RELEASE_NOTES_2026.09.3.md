@@ -17,10 +17,108 @@ refused from then on. There is no rename: re-registering mints a new secret and
 needs the edge box reconfigured, and the data already under the old namespace
 stays on disk where it is, unmigrated. Nothing is deleted.
 
-This closes the admission side only, and only for new names. Arc does not yet
-disable Hive inference on the reads it issues, so a `key=value` directory that
-is already on disk is still read that way — tracked in
-[#1005](https://github.com/Basekick-Labs/arc/issues/1005).
+This closes the admission side only, and only for new names: a `key=value`
+directory already on disk is unaffected by this change. The read side is fixed
+separately in [#1005](https://github.com/Basekick-Labs/arc/issues/1005), below.
+
+## Fixed: a `key=value` directory could silently overwrite a column's values ([#1005](https://github.com/Basekick-Labs/arc/issues/1005))
+
+DuckDB derives a column from any `key=value` directory component of a path it
+reads. Where that name matched a column already in the file, the value from the
+path replaced the stored value and its type, for every row, with no error. Arc
+never asked for that inference and never used it — the storage layout is parsed
+explicitly — but it did not switch it off, so any Arc deployment whose storage
+root or compaction temp directory contained a `key=value` directory read
+altered data.
+
+Deletes were the worst of it, because the `WHERE` clause was evaluated against
+the substituted value. A delete naming the directory's value matched every row
+in the file and took the "all rows deleted" path, which removes the file
+outright; a delete naming the value actually stored matched nothing, reported
+success and removed nothing. Where a delete did rewrite a file, the rows it kept
+were written back carrying the path's value instead of their own. Compaction
+running through a `key=value` temp directory baked the substituted column into
+its output, and if the inferred name matched a tag the de-duplication key
+collapsed, so rows of distinct series were discarded as duplicates.
+
+Every read Arc issues now disables the inference. Reads are built through a
+single helper so the flag cannot be forgotten, and a test refuses a
+`read_parquet` call written anywhere else — there is no DuckDB setting for this,
+so the flag has to travel with each call, and nothing but that test keeps the
+next one honest. On an unaffected deployment nothing changes: no part of Arc
+consumed an inferred column. The arcx engine is deliberately untouched; it reads
+Parquet itself, performs no such inference, and rejects the option.
+
+**Checking whether a deployment was affected.** Two configured directories end
+up inside a `read_parquet` path: `storage.local_path`, and
+`compaction.temp_directory`, into which compaction downloads its input files
+before reading them. (`database.temp_directory` is DuckDB's own spill
+directory and never appears in a read, so it does not matter here.) The
+`key=value` component can be anywhere in the path, including above the
+configured directory, so test the whole path and not just the tree beneath it.
+Set the two variables to the values as written in the config and run this from
+the working directory Arc runs in:
+
+```sh
+for d in "$STORAGE_LOCAL_PATH" "$COMPACTION_TEMP_DIRECTORY"; do
+  [ -n "$d" ] && [ -d "$d" ] || { echo "skipped (not a directory): ${d:-<unset>}"; continue; }
+  case "$d" in /*) abs=$d ;; *) abs=$PWD/$d ;; esac
+  case "$abs" in *=*) echo "ancestor: $abs" ;; esac
+  find "$abs" -type d -name '*=*'
+done
+```
+
+It prints nothing when the deployment is unaffected. Every `skipped` line is an
+unchecked directory, not a clean one.
+
+Symlinks are deliberately not resolved, because neither Arc nor DuckDB resolves
+them: Arc makes the configured path absolute lexically, and DuckDB infers from
+the string it is handed. A symlink whose target happens to sit under a
+`key=value` directory is therefore not affected, and a `key=value` component in
+the path as written is, whatever it resolves to. The one case this misses is
+Arc's own working directory being reached through a symlink while a relative
+path is configured; compare `pwd` with `pwd -P` if that applies.
+
+On S3 and Azure the same test is against `storage.s3.bucket` plus its prefix,
+or the Azure container name, and the keys underneath them. Arc's own keys are
+`{database}/{measurement}/{year}/{month}/{day}/{hour}/`, so a `=` can only come
+from the configured prefix or from a database or measurement name — which the
+write path has rejected since [#992](https://github.com/Basekick-Labs/arc/issues/992).
+
+**What a `key=value` path leaves behind, and what can be done about it.** The
+inference only mattered where the derived name matched a column that was
+already there; where it did not, it added a column Arc ignored.
+
+- *Field-schema anchors* recorded under such a path hold the extra column. It is
+  now always empty. A schema rebuild alone will not remove it — a rebuild merges
+  and never drops a field — so delete the measurement's anchor object,
+  `_schema/{database}/{measurement}.parquet` in the storage root, and only then
+  `POST /api/v1/databases/{database}/measurements/{measurement}/schema/rebuild`.
+  Note that backup and restore copy anchors, so restoring a backup taken
+  beforehand brings the column back.
+- *Files a delete rewrote, and files a delete removed* were altered or lost when
+  it happened. Neither can be reconstructed from what is on disk.
+- *Compacted output* written through a `key=value` compaction temp directory has
+  the substituted column baked in, and where the derived name matched a tag,
+  rows of distinct series were discarded as duplicates. There is no log line to
+  look back for: the de-duplication ratio Arc emits after a compaction counts
+  its input rows with a query that has always errored, so the one signal that
+  would have reported the loss has never fired. Tracked separately as
+  [#1015](https://github.com/Basekick-Labs/arc/issues/1015).
+- *Continuous-query destinations* hold the aggregates that were computed from
+  the substituted column. Re-running a continuous query appends rather than
+  corrects, so the affected windows have to be removed first.
+
+For everything in that list the recovery is a restore from a backup taken before
+the affected operation ran — a backup taken after it contains the same altered
+files. Backups and Iceberg exports perform none of these reads themselves, so
+neither introduced the problem, but an Iceberg export over affected files
+carries the substituted column in its schema.
+
+One shape to expect after upgrading on an affected deployment: a query naming a
+column that only ever existed because of the inference will now fail to bind
+where it previously returned the path's value, unless the column was recorded in
+a field-schema anchor, in which case it binds and returns empty.
 
 ## New: per-peer replication lag gauges ([#819](https://github.com/Basekick-Labs/arc/issues/819))
 
