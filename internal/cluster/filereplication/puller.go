@@ -319,6 +319,26 @@ type Puller struct {
 	// not. Shares inflightMu with the sets above.
 	quarantinedPaths map[string]struct{}
 
+	// staleKeptPaths holds paths whose pull exhausted every candidate on
+	// checksum and whose local copy was therefore left in place. The presence
+	// check consults it once per path to force one re-pull attempt.
+	//
+	// Needed because presence is size-only (presentAtSize). Before #999 an
+	// exhausted pull deleted the local file, and that delete was what
+	// guaranteed a retry: the next arrival found nothing and re-enqueued.
+	// Keeping the file is better for availability but, for a rewrite that did
+	// not change the file's length, it makes the local copy read as present
+	// forever — turning a self-healing state into a permanent one. Not
+	// reachable today, because a same-size local file is skipped before any
+	// pull can mismatch, but it goes live the moment presence gains a content
+	// check, and the exhausted log line promises a retry either way.
+	//
+	// Bounded by maxQuarantineLogPaths, like quarantinedPaths: past the cap no
+	// new path is remembered, which degrades to the pre-#999 "kept forever"
+	// shape rather than growing a map an adversary with Raft write access
+	// could feed. Shares inflightMu with the sets above.
+	staleKeptPaths map[string]struct{}
+
 	// catchupFailed / catchupDropped count failures and drops scoped to the
 	// catch-up batch only. FullyCaughtUp uses these (not the cumulative
 	// totalFailed / totalDropped) so transient steady-state failures don't
@@ -392,6 +412,7 @@ func New(cfg Config) (*Puller, error) {
 		catchupFailedPaths:  make(map[string]struct{}),
 		catchupDroppedPaths: make(map[string]struct{}),
 		quarantinedPaths:    make(map[string]struct{}),
+		staleKeptPaths:      make(map[string]struct{}),
 		catchupFinished:     make(chan struct{}),
 		logger:              cfg.Logger.With().Str("component", "file-puller").Logger(),
 	}, nil
@@ -490,6 +511,31 @@ func (p *Puller) markQuarantinedForLog(path string) bool {
 		return true
 	}
 	p.quarantinedPaths[path] = struct{}{}
+	return true
+}
+
+// markStaleKept remembers that path's local copy was left in place after every
+// candidate rejected it on checksum, so the next presence check pulls it again
+// instead of trusting its size. No-op past maxQuarantineLogPaths.
+func (p *Puller) markStaleKept(path string) {
+	p.inflightMu.Lock()
+	defer p.inflightMu.Unlock()
+	if len(p.staleKeptPaths) >= maxQuarantineLogPaths {
+		return
+	}
+	p.staleKeptPaths[path] = struct{}{}
+}
+
+// takeStaleKept reports whether path was left in place by an exhausted pull,
+// clearing the marker so the forced re-pull happens once per exhaustion rather
+// than on every arrival. A pull that exhausts again re-marks it.
+func (p *Puller) takeStaleKept(path string) bool {
+	p.inflightMu.Lock()
+	defer p.inflightMu.Unlock()
+	if _, ok := p.staleKeptPaths[path]; !ok {
+		return false
+	}
+	delete(p.staleKeptPaths, path)
 	return true
 }
 
@@ -645,6 +691,7 @@ func (p *Puller) forgetCatchUpPathLocked(path string) (hadFailure, hadDrop, hadT
 	p.clearCatchUpDropLocked(path)
 	p.removeCatchUpTagLocked(path)
 	delete(p.quarantinedPaths, path)
+	delete(p.staleKeptPaths, path)
 	return hadFailure, hadDrop, hadTag
 }
 
@@ -1230,9 +1277,21 @@ func (p *Puller) processEntry(log zerolog.Logger, request *pullRequest) {
 		// fall through so pullOnce can resume from the byte offset.
 		localSize, statErr := p.statLocal(entry.Path)
 		if presentAtSize(localSize, statErr, entry.SizeBytes) {
-			p.totalSkippedLocal.Add(1)
-			succeeded = true // File is already here — same as a fresh pull from the gate's perspective.
-			return
+			// One exception: a copy an exhausted pull deliberately left in
+			// place. Presence is size-only, so a rewrite that did not change
+			// the length makes such a copy read as present forever, and the
+			// delete that used to guarantee a retry is gone (#999). Force one
+			// pull; if it exhausts again it re-marks itself.
+			if p.takeStaleKept(entry.Path) {
+				log.Debug().
+					Str("path", entry.Path).
+					Int64("local_size", localSize).
+					Msg("Local copy matches the manifest size but an earlier pull found no peer holding its checksum; pulling again rather than trusting the size")
+			} else {
+				p.totalSkippedLocal.Add(1)
+				succeeded = true // File is already here — same as a fresh pull from the gate's perspective.
+				return
+			}
 		}
 		if errors.Is(statErr, storage.ErrInvalidPath) {
 			// Permanent (#747). This is the first backend call an entry makes,
@@ -1412,6 +1471,7 @@ func (p *Puller) processEntry(log zerolog.Logger, request *pullRequest) {
 				// TestPullerChecksumMismatchDiscardsStagedAndRecoversOnRetry
 				// pins that recovery.
 				p.totalChecksumMismatchExhausted.Add(1)
+				p.markStaleKept(entry.Path)
 				log.Error().
 					Err(lastErr).
 					Str("path", entry.Path).
@@ -1586,7 +1646,12 @@ func (p *Puller) tryResumeFromPartial(log zerolog.Logger, entry *raft.FileEntry)
 	// what this fetch is building — it belongs to some earlier, abandoned
 	// transfer. Pull from zero.
 	committed, existsErr := p.cfg.Backend.Exists(statCtx, entry.Path)
-	if existsErr != nil || committed {
+	if existsErr != nil {
+		log.Debug().Err(existsErr).Str("path", entry.Path).
+			Msg("Could not confirm whether a committed file exists; pulling from zero rather than resuming")
+		return 0, nil
+	}
+	if committed {
 		return 0, nil
 	}
 
@@ -1643,6 +1708,8 @@ func (p *Puller) deleteFile(log zerolog.Logger, path string) {
 func (p *Puller) discardUnverified(log zerolog.Logger, path string) {
 	si, ok := p.cfg.Backend.(storage.StagingInspector)
 	if !ok {
+		log.Debug().Str("path", path).
+			Msg("Rejected fetch on a backend with no staging area; nothing was committed, so nothing to discard")
 		return
 	}
 	delCtx, delCancel := context.WithTimeout(p.ctx, 5*time.Second)

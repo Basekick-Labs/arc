@@ -2287,3 +2287,93 @@ func TestPullerChecksumMismatchNoDeleteWithoutStaging(t *testing.T) {
 		t.Errorf("object destroyed on a staging-less backend: err=%v got=%q want=%q", readErr, got, oldGen)
 	}
 }
+
+// TestPullerStaleKeptPathBypassesSizePresence covers the bookkeeping that keeps
+// #999's "keep the local copy" from creating a permanently stale one.
+//
+// Presence is size-only (presentAtSize). Before #999 the delete on a rejected
+// fetch was what guaranteed a retry: the next arrival found no file and
+// re-enqueued. Keeping the file is better for availability, but for a rewrite
+// that did not change the length it would make the kept copy read as present
+// forever, so an exhausted pull records the path and the presence check forces
+// one pull instead of trusting the size.
+//
+// The marker is set directly here. Reaching it through a real pull is not
+// possible on this code: a same-size local file is skipped BEFORE any fetch can
+// mismatch, so exhaustion cannot leave a same-size copy today. It becomes
+// reachable the moment presence gains a content check (the shape of #989),
+// which is why the invariant is pinned now rather than later.
+func TestPullerStaleKeptPathBypassesSizePresence(t *testing.T) {
+	backend := newFakeBackend()
+	ctx := context.Background()
+	path := "testdb/cpu/stale_kept.parquet"
+	fresh := []byte("the generation the manifest names")
+	stale := []byte("a stale copy of the same length!!")
+	if len(stale) != len(fresh) {
+		t.Fatalf("test bodies must have equal length: %d vs %d", len(stale), len(fresh))
+	}
+	if err := backend.Write(ctx, path, stale); err != nil {
+		t.Fatal(err)
+	}
+	fetcher := newFakeFetcher(fakeFetchResult{body: fresh})
+	p := newTestPuller(t, backend, fetcher, staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
+	p.Start(ctx)
+	defer p.Stop()
+
+	entry := makeEntry(path, "writer-1", int64(len(fresh))) // SAME size as the stale copy
+
+	// Baseline: without the marker, a same-size local file skips by size.
+	p.Enqueue(entry)
+	s := waitStats(t, p, func(m map[string]int64) bool { return m["skipped_local"] >= 1 })
+	if s["pulled"] != 0 {
+		t.Fatalf("baseline: a same-size local file should skip, got %+v", s)
+	}
+
+	// With the marker an exhausted pull would have set, the same entry pulls.
+	p.markStaleKept(path)
+	p.Enqueue(entry)
+	s = waitStats(t, p, func(m map[string]int64) bool { return m["pulled"] == 1 })
+	if s["pulled"] != 1 {
+		t.Fatalf("a path kept by an exhausted pull was skipped by size: %+v", s)
+	}
+	if got, _ := backend.Read(ctx, path); !bytes.Equal(got, fresh) {
+		t.Errorf("content = %q, want the manifest's generation %q", got, fresh)
+	}
+
+	// One-shot: the marker is consumed, so a now-correct file skips again.
+	p.Enqueue(entry)
+	s = waitStats(t, p, func(m map[string]int64) bool { return m["skipped_local"] >= 2 })
+	if s["skipped_local"] < 2 {
+		t.Errorf("marker must be one-shot, not sticky: %+v", s)
+	}
+}
+
+// TestPullerExhaustionRecordsStaleKept pins that the exhausted branch is what
+// sets the marker, so the two halves cannot drift apart. The local copy is a
+// different length here, which is the only way a pull can reach exhaustion on
+// this code.
+func TestPullerExhaustionRecordsStaleKept(t *testing.T) {
+	backend := newFakeBackend()
+	ctx := context.Background()
+	path := "testdb/cpu/exhaustion_marks.parquet"
+	if err := backend.Write(ctx, path, []byte("short previous generation")); err != nil {
+		t.Fatal(err)
+	}
+	fetcher := newFakeFetcher(
+		fakeFetchResult{body: []byte("x"), err: ErrChecksumMismatch},
+		fakeFetchResult{body: []byte("x"), err: ErrChecksumMismatch},
+		fakeFetchResult{body: []byte("x"), err: ErrChecksumMismatch},
+	)
+	p := newTestPuller(t, backend, fetcher, staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
+	p.Start(ctx)
+	defer p.Stop()
+
+	p.Enqueue(makeEntry(path, "writer-1", 500))
+	s := waitStats(t, p, func(m map[string]int64) bool { return m["failed"] == 1 })
+	if s["checksum_mismatch_exhausted"] != 1 {
+		t.Fatalf("expected exhaustion, got %+v", s)
+	}
+	if !p.takeStaleKept(path) {
+		t.Error("an exhausted pull must record the path so the next presence check does not trust its size")
+	}
+}

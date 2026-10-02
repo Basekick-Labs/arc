@@ -300,7 +300,11 @@ checksum before it is committed.
 
 The rejected bytes are discarded and the committed file is left in place, so a
 node keeps serving the generation it already had until some peer can supply the
-one the manifest names. On local storage the rejected bytes sit in the write
+one the manifest names. A path left in place this way is remembered, and the
+next time it comes round the puller fetches it rather than trusting its size:
+whether a file is present is otherwise decided by size alone, so a rewrite that
+did not change the length would make the kept copy look correct forever — the
+delete this release removes was what used to guarantee the retry. On local storage the rejected bytes sit in the write
 staging file and only that is removed. S3 and Azure never commit them at all —
 an upload whose source ends early or errors is never completed — so there is
 nothing to clean up and, since this release, nothing is deleted there either.
