@@ -71,6 +71,41 @@ corrected.
 
 ## Security fixes
 
+### Replacement-scan guard covered only `FROM` and `JOIN` ([GHSA-9rgq-j585-5fhq](https://github.com/Basekick-Labs/arc/security/advisories/GHSA-9rgq-j585-5fhq))
+
+Arc refuses a path in table position, because the permission check authorizes
+measurements and a bare path is not one. That guard was applied only to the
+`FROM` and `JOIN` keywords.
+
+DuckDB introduces a relation after several other keywords, each of which
+accepts a path there and reads the file. Arc's table-position scanner did not
+arm on them, so those positions were never examined: the statement passed
+validation, the permission check derived **no** table reference from it — and a
+query with no references is authorized outright — and the rewriter passed the
+statement through unchanged. A read-capable token could read any Parquet file
+inside the DuckDB sandbox allowlist, which spans the whole local storage root,
+with no grant, no `x-arc-database` header and no license required.
+
+The sandbox itself held throughout: paths outside the allowlist were, and are,
+refused by DuckDB.
+
+The scanner now arms on those keywords as well, so a literal standing in any of
+those positions meets the same guard that already covered `FROM`. The arming is
+narrower than for `FROM`/`JOIN`: those mark a clause that can continue across a
+comma and the new forms cannot, so arming that state for them would have made a
+later comma a table position and refused legitimate statements. Every form of
+those keywords that does not put a literal in relation position keeps working,
+including the trailing `PIVOT`/`UNPIVOT` forms and `DESCRIBE`/`SUMMARIZE` over a
+query.
+
+This closes the keywords DuckDB has today without changing the shape of the
+defence — a keyword the scanner does not know still fails open. Deriving the
+relation set from a parse tree instead of from keyword scanning is tracked in
+[#764](https://github.com/Basekick-Labs/arc/issues/764) and
+[#491](https://github.com/Basekick-Labs/arc/issues/491); see also
+[#991](https://github.com/Basekick-Labs/arc/issues/991).
+
+
 ### RBAC: three normalisation divergences let a query read a measurement the permission check never saw ([GHSA-h3rq-5r29-2wrh](https://github.com/Basekick-Labs/arc/security/advisories/GHSA-h3rq-5r29-2wrh))
 
 Arc decides twice which measurements a query touches. The RBAC extractor
