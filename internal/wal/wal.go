@@ -49,6 +49,7 @@ const (
 	// Since msgpack maps/arrays always start with bytes >= 0x80, 0x01 is unambiguous.
 	WALEnvelopeMarker   = 0x01
 	WALCheckpointMarker = 0x02
+	WALTrackedMarker    = 0x03
 )
 
 // ParseEnvelope extracts the database name and msgpack payload from a WAL entry.
@@ -420,6 +421,8 @@ type Writer struct {
 	// Replication hook for streaming entries to readers
 	replicationHook ReplicationHook
 	sequence        uint64 // Monotonic sequence counter for replication
+	trackedInstance uint64
+	trackedSequence uint64
 
 	// Metrics (atomic for lock-free reads)
 	TotalEntries   int64
@@ -464,11 +467,12 @@ func NewWriter(cfg *WriterConfig) (*Writer, error) {
 	}
 
 	w := &Writer{
-		config:       *cfg,
-		logger:       cfg.Logger.With().Str("component", "wal-writer").Logger(),
-		lastSyncTime: time.Now(),
-		entryChan:    make(chan walEntry, cfg.BufferSize),
-		done:         make(chan struct{}),
+		config:          *cfg,
+		logger:          cfg.Logger.With().Str("component", "wal-writer").Logger(),
+		lastSyncTime:    time.Now(),
+		entryChan:       make(chan walEntry, cfg.BufferSize),
+		done:            make(chan struct{}),
+		trackedInstance: uint64(time.Now().UnixNano()) ^ uint64(os.Getpid()),
 	}
 
 	// Initialize first WAL file
@@ -715,10 +719,25 @@ func (w *Writer) AppendTracked(records []map[string]interface{}) ([]string, erro
 	if err != nil {
 		return nil, fmt.Errorf("failed to serialize records: %w", err)
 	}
-	if err := w.appendRawEntry(payload); err != nil {
-		return nil, err
+	chunks := [][]byte{payload}
+	if len(payload) > MaxWALPayloadSize {
+		chunks, err = splitOversizedPayload(payload)
+		if err != nil {
+			return nil, oversizedPayloadError(err)
+		}
 	}
-	return []string{payloadHash(payload)}, nil
+	hashes := make([]string, 0, len(chunks))
+	for _, chunk := range chunks {
+		if len(chunk) > MaxWALPayloadSize {
+			return nil, oversizedPayloadError(fmt.Errorf("size %d exceeds limit %d", len(chunk), MaxWALPayloadSize))
+		}
+		token, err := w.appendTrackedEntry(chunk)
+		if err != nil {
+			return nil, err
+		}
+		hashes = append(hashes, token)
+	}
+	return hashes, nil
 }
 
 // AppendRawWithMetaTracked is the tracked counterpart to AppendRawWithMeta.
@@ -741,10 +760,11 @@ func (w *Writer) AppendRawWithMetaTracked(database string, payload []byte) ([]st
 		if envelopeHeaderLen+len(chunk) > MaxWALPayloadSize {
 			return nil, oversizedPayloadError(fmt.Errorf("size %d exceeds limit %d", envelopeHeaderLen+len(chunk), MaxWALPayloadSize))
 		}
-		if err := w.appendEnvelopedEntry(dbBytes, envelopeHeaderLen, chunk, envelopeHeaderLen+len(chunk)); err != nil {
+		token, err := w.appendTrackedEntry(envelopePayload(dbBytes, chunk))
+		if err != nil {
 			return nil, err
 		}
-		hashes = append(hashes, payloadHash(envelopePayload(dbBytes, chunk)))
+		hashes = append(hashes, token)
 	}
 	return hashes, nil
 }
@@ -756,19 +776,28 @@ func (w *Writer) MarkFlushed(hashes []string) error {
 	if len(hashes) == 0 {
 		return nil
 	}
-	payload, err := msgpack.Marshal(hashes)
-	if err != nil {
-		return err
+	for start := 0; start < len(hashes); start += 1000 {
+		end := start + 1000
+		if end > len(hashes) {
+			end = len(hashes)
+		}
+		payload, err := msgpack.Marshal(hashes[start:end])
+		if err != nil {
+			return err
+		}
+		checkpoint := append([]byte{WALCheckpointMarker}, payload...)
+		checksum := crc32.ChecksumIEEE(checkpoint)
+		timestampUS := uint64(time.Now().UnixMicro())
+		entryData := make([]byte, WALEntryHeaderSize+len(checkpoint))
+		binary.BigEndian.PutUint32(entryData[0:4], uint32(len(checkpoint)))
+		binary.BigEndian.PutUint64(entryData[4:12], timestampUS)
+		binary.BigEndian.PutUint32(entryData[12:16], checksum)
+		copy(entryData[WALEntryHeaderSize:], checkpoint)
+		if err := w.tryEnqueue(entryData); err != nil {
+			return err
+		}
 	}
-	checkpoint := append([]byte{WALCheckpointMarker}, payload...)
-	checksum := crc32.ChecksumIEEE(checkpoint)
-	timestampUS := uint64(time.Now().UnixMicro())
-	entryData := make([]byte, WALEntryHeaderSize+len(checkpoint))
-	binary.BigEndian.PutUint32(entryData[0:4], uint32(len(checkpoint)))
-	binary.BigEndian.PutUint64(entryData[4:12], timestampUS)
-	binary.BigEndian.PutUint32(entryData[12:16], checksum)
-	copy(entryData[WALEntryHeaderSize:], checkpoint)
-	return w.tryEnqueue(entryData)
+	return nil
 }
 
 func envelopePayload(dbBytes, payload []byte) []byte {
@@ -783,6 +812,35 @@ func envelopePayload(dbBytes, payload []byte) []byte {
 func payloadHash(payload []byte) string {
 	sum := sha256.Sum256(payload)
 	return fmt.Sprintf("%x", sum[:])
+}
+
+func (w *Writer) appendTrackedEntry(logicalPayload []byte) (string, error) {
+	seq := atomic.AddUint64(&w.trackedSequence, 1)
+	token := fmt.Sprintf("%016x%016x", w.trackedInstance, seq)
+	trackedPayload := make([]byte, 1+16+len(logicalPayload))
+	trackedPayload[0] = WALTrackedMarker
+	binary.BigEndian.PutUint64(trackedPayload[1:9], w.trackedInstance)
+	binary.BigEndian.PutUint64(trackedPayload[9:17], seq)
+	copy(trackedPayload[17:], logicalPayload)
+	checksum := crc32.ChecksumIEEE(trackedPayload)
+	timestampUS := uint64(time.Now().UnixMicro())
+	if w.replicationHook != nil {
+		w.mu.Lock()
+		w.sequence++
+		replicationSequence := w.sequence
+		hook := w.replicationHook
+		w.mu.Unlock()
+		hook(&ReplicationEntry{Sequence: replicationSequence, TimestampUS: timestampUS, Payload: logicalPayload})
+	}
+	entryData := make([]byte, WALEntryHeaderSize+len(trackedPayload))
+	binary.BigEndian.PutUint32(entryData[0:4], uint32(len(trackedPayload)))
+	binary.BigEndian.PutUint64(entryData[4:12], timestampUS)
+	binary.BigEndian.PutUint32(entryData[12:16], checksum)
+	copy(entryData[WALEntryHeaderSize:], trackedPayload)
+	if err := w.tryEnqueue(entryData); err != nil {
+		return "", err
+	}
+	return token, nil
 }
 
 // appendEnvelopedEntry is AppendRawWithMeta's single-entry fast path: CRC,

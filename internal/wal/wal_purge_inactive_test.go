@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Basekick-Labs/msgpack/v6"
 	"github.com/rs/zerolog"
 )
 
@@ -802,6 +803,90 @@ func TestRecovery_SkipsEntriesCoveredByFlushCheckpoint(t *testing.T) {
 	}
 	if stats.RecoveredEntries != 0 {
 		t.Fatalf("expected no WAL entries to be replayed, got %d", stats.RecoveredEntries)
+	}
+}
+
+func TestRecovery_SkipsTrackedColumnarEntryAfterRotation(t *testing.T) {
+	writer, tmpDir := newTestWriter(t, SyncModeAsync)
+	defer os.RemoveAll(tmpDir)
+
+	payload, err := msgpack.Marshal(map[string]interface{}{
+		"m": "events",
+		"columns": map[string]interface{}{
+			"time":  []interface{}{int64(1609459200000000)},
+			"value": []interface{}{"single-event"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal columnar payload: %v", err)
+	}
+	hashes, err := writer.AppendRawWithMetaTracked("db", payload)
+	if err != nil {
+		t.Fatalf("append tracked columnar records: %v", err)
+	}
+	waitForEntries(t, writer, 1)
+	writer.mu.Lock()
+	if err := writer.rotate(); err != nil {
+		writer.mu.Unlock()
+		t.Fatalf("rotate WAL: %v", err)
+	}
+	writer.mu.Unlock()
+	if err := writer.MarkFlushed(hashes); err != nil {
+		t.Fatalf("append flush checkpoint: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+
+	recovered := 0
+	stats, err := NewRecovery(tmpDir, zerolog.Nop()).RecoverWithOptions(context.Background(), nil, &RecoveryOptions{
+		ColumnarCallback: func(ctx context.Context, database, measurement string, columns map[string][]interface{}) error {
+			recovered++
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("recovery failed: %v", err)
+	}
+	if recovered != 0 || stats.RecoveredEntries != 0 {
+		t.Fatalf("expected checkpointed columnar entry not to replay, callbacks=%d entries=%d", recovered, stats.RecoveredEntries)
+	}
+}
+
+func TestRecovery_DoesNotSkipDistinctIdenticalTrackedEntries(t *testing.T) {
+	writer, tmpDir := newTestWriter(t, SyncModeAsync)
+	defer os.RemoveAll(tmpDir)
+
+	records := []map[string]interface{}{{"measurement": "events", "time": int64(1609459200000000), "value": "same"}}
+	first, err := writer.AppendTracked(records)
+	if err != nil {
+		t.Fatalf("append first tracked record: %v", err)
+	}
+	second, err := writer.AppendTracked(records)
+	if err != nil {
+		t.Fatalf("append second tracked record: %v", err)
+	}
+	waitForEntries(t, writer, 2)
+	if first[0] == second[0] {
+		t.Fatal("identical tracked entries must have distinct identities")
+	}
+	if err := writer.MarkFlushed(first); err != nil {
+		t.Fatalf("append partial flush checkpoint: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+
+	recovered := 0
+	_, err = NewRecovery(tmpDir, zerolog.Nop()).Recover(context.Background(), func(ctx context.Context, recs []map[string]interface{}) error {
+		recovered += len(recs)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("recovery failed: %v", err)
+	}
+	if recovered != 1 {
+		t.Fatalf("expected one distinct identical entry to replay, got %d", recovered)
 	}
 }
 

@@ -152,16 +152,22 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 		}
 		return &Entry{TimestampUS: timestampUS, CheckpointHashes: hashes}, nil
 	}
+	payloadHashValue := payloadHash(payload)
+	logicalPayload := payload
+	if len(payload) >= 17 && payload[0] == WALTrackedMarker {
+		payloadHashValue = fmt.Sprintf("%016x%016x", binary.BigEndian.Uint64(payload[1:9]), binary.BigEndian.Uint64(payload[9:17]))
+		logicalPayload = payload[17:]
+	}
 
 	// Parse envelope to extract database name and inner msgpack payload
-	database, msgpackData := ParseEnvelope(payload, "")
+	database, msgpackData := ParseEnvelope(logicalPayload, "")
 
 	// Try row format first (array of maps from Append path)
 	var records []map[string]interface{}
 	if err := msgpack.Unmarshal(msgpackData, &records); err == nil {
 		return &Entry{
 			TimestampUS: timestampUS,
-			PayloadHash: payloadHash(payload),
+			PayloadHash: payloadHashValue,
 			Records:     records,
 		}, nil
 	}
@@ -173,7 +179,7 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 			colEntry.Database = database
 			return &Entry{
 				TimestampUS:  timestampUS,
-				PayloadHash:  payloadHash(payload),
+				PayloadHash:  payloadHashValue,
 				ColumnarData: colEntry,
 			}, nil
 		}
