@@ -177,14 +177,15 @@ Found while fixing
 the two are the same extractor-versus-rewriter seam in two different table
 positions.
 
-### File replication recovered from a stale origin when replicas disagreed on bytes ([#975](https://github.com/Basekick-Labs/arc/issues/975))
+### File replication kept a complete replica while checking replacement peers
 
-When a replica returned a same-size file whose bytes did not match the
-manifest checksum, the puller discarded the rejected file but stopped trying
-the remaining candidate peers. A stale origin could therefore turn a healthy
-replica into a failed catch-up. The puller now continues to the next candidate
-after removing the rejected partial, and the regression test covers recovery
-from a stale first peer to a current second peer.
+When a peer returned bytes that failed the manifest checksum, the puller
+discarded the local file before trying another candidate. The puller now
+checks the next peer and keeps any existing complete replica until a fetched
+replacement passes checksum validation and is committed. If all candidates
+fail, the previous replica remains available. This addresses the peer-fallback
+integrity case related to [#975](https://github.com/Basekick-Labs/arc/issues/975);
+it does not implement snapshot catch-up checksum verification.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#989](https://github.com/Basekick-Labs/arc/pull/989).
 

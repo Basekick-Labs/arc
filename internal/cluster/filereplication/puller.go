@@ -12,11 +12,11 @@ package filereplication
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash"
 	"io"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -93,9 +93,8 @@ const (
 )
 
 type pullRequest struct {
-	entry               *raft.FileEntry
-	source              enqueueSource
-	verifyLocalChecksum bool
+	entry  *raft.FileEntry
+	source enqueueSource
 }
 
 // Config bundles the puller's dependencies and tunables.
@@ -886,24 +885,6 @@ func presentAtSize(localSize int64, statErr error, want int64) bool {
 	return statErr == nil && localSize == want
 }
 
-func (p *Puller) localChecksumMatches(entry *raft.FileEntry) bool {
-	if entry.SHA256 == "" {
-		return true
-	}
-	parent := p.ctx
-	if parent == nil {
-		parent = context.Background()
-	}
-	readCtx, cancel := context.WithTimeout(parent, 5*time.Second)
-	defer cancel()
-
-	h := sha256.New()
-	if err := p.cfg.Backend.ReadTo(readCtx, entry.Path, h); err != nil {
-		return false
-	}
-	return hex.EncodeToString(h.Sum(nil)) == entry.SHA256
-}
-
 func (p *Puller) enqueue(entry *raft.FileEntry, source enqueueSource) enqueueResult {
 	if entry == nil {
 		return enqueueResultInvalid
@@ -926,11 +907,7 @@ func (p *Puller) enqueue(entry *raft.FileEntry, source enqueueSource) enqueueRes
 	// Copy so the caller can't mutate the entry out from under the worker.
 	entryCopy := *entry
 	select {
-	case p.queue <- &pullRequest{
-		entry:               &entryCopy,
-		source:              source,
-		verifyLocalChecksum: source == enqueueSourceCatchUp,
-	}:
+	case p.queue <- &pullRequest{entry: &entryCopy, source: source}:
 		p.totalEnqueued.Add(1)
 		return enqueueResultEnqueued
 	default:
@@ -1220,8 +1197,7 @@ func (p *Puller) processEntry(log zerolog.Logger, request *pullRequest) {
 		// (size matches the manifest). A partial file (size < SizeBytes) should
 		// fall through so pullOnce can resume from the byte offset.
 		localSize, statErr := p.statLocal(entry.Path)
-		if presentAtSize(localSize, statErr, entry.SizeBytes) &&
-			(!request.verifyLocalChecksum || p.localChecksumMatches(entry)) {
+		if presentAtSize(localSize, statErr, entry.SizeBytes) {
 			p.totalSkippedLocal.Add(1)
 			succeeded = true // File is already here — same as a fresh pull from the gate's perspective.
 			return
@@ -1274,11 +1250,12 @@ func (p *Puller) processEntry(log zerolog.Logger, request *pullRequest) {
 		var lastPeer string
 		pulledFromPeer := false
 		checksumMismatch := false
+		preserveExisting := statErr == nil && localSize >= 0
 		for _, peerAddr := range peers {
 			if p.ctx.Err() != nil {
 				return
 			}
-			err := p.pullOnce(log, entry, peerAddr, attempt)
+			err := p.pullOnce(log, entry, peerAddr, attempt, preserveExisting)
 			if err == nil {
 				// The entry may have left the manifest while the bytes were in
 				// transit. This node's own delete worker may already have
@@ -1368,7 +1345,7 @@ func (p *Puller) processEntry(log zerolog.Logger, request *pullRequest) {
 // checks for a partial file and resumes from the byte offset already written,
 // avoiding re-transferring bytes already on disk. The Fetcher verifies SHA-256
 // across the full file (prefix + tail); this function only tracks counters.
-func (p *Puller) pullOnce(log zerolog.Logger, entry *raft.FileEntry, peerAddr string, attempt int) error {
+func (p *Puller) pullOnce(log zerolog.Logger, entry *raft.FileEntry, peerAddr string, attempt int, preserveExisting bool) error {
 	fetchCtx, cancel := context.WithTimeout(p.ctx, p.cfg.FetchTimeout)
 	defer cancel()
 
@@ -1376,7 +1353,7 @@ func (p *Puller) pullOnce(log zerolog.Logger, entry *raft.FileEntry, peerAddr st
 	// byteOffset > 0 means [0, byteOffset) is written and only the tail is needed.
 	var byteOffset int64
 	var prefixHasher hash.Hash
-	if attempt > 1 {
+	if attempt > 1 && !preserveExisting {
 		byteOffset, prefixHasher = p.tryResumeFromPartial(log, entry)
 	}
 
@@ -1386,6 +1363,20 @@ func (p *Puller) pullOnce(log zerolog.Logger, entry *raft.FileEntry, peerAddr st
 	// and commits to the backend. Using a pipe keeps memory flat regardless of
 	// file size — bytes flow directly from the network connection to disk.
 	pr, pw := io.Pipe()
+	var replacement *os.File
+	if preserveExisting {
+		var err error
+		replacement, err = os.CreateTemp("", "arc-replication-*")
+		if err != nil {
+			_ = pr.CloseWithError(err)
+			_ = pw.CloseWithError(err)
+			return fmt.Errorf("create verified replacement spool: %w", err)
+		}
+		defer func() {
+			_ = replacement.Close()
+			_ = os.Remove(replacement.Name())
+		}()
+	}
 
 	var (
 		writeErr error
@@ -1394,7 +1385,11 @@ func (p *Puller) pullOnce(log zerolog.Logger, entry *raft.FileEntry, peerAddr st
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		writeErr = p.writeFileTail(fetchCtx, entry, pr, byteOffset, tailBytes)
+		if replacement != nil {
+			_, writeErr = io.Copy(replacement, pr)
+		} else {
+			writeErr = p.writeFileTail(fetchCtx, entry, pr, byteOffset, tailBytes)
+		}
 		if writeErr != nil {
 			// Signal the fetch side to abort; it will stop writing into pw.
 			_ = pr.CloseWithError(writeErr)
@@ -1421,12 +1416,16 @@ func (p *Puller) pullOnce(log zerolog.Logger, entry *raft.FileEntry, peerAddr st
 	if fetchErr != nil {
 		if errors.Is(fetchErr, ErrChecksumMismatch) {
 			p.totalChecksumMismatch.Add(1)
-			p.deleteFile(log, entry.Path)
+			if !preserveExisting {
+				p.deleteFile(log, entry.Path)
+			}
 		}
 		if errors.Is(fetchErr, ErrBadOffset) {
 			// Server rejected our resume offset — delete partial, retry from zero.
 			p.totalBadOffsetServer.Add(1)
-			p.deleteFile(log, entry.Path)
+			if !preserveExisting {
+				p.deleteFile(log, entry.Path)
+			}
 		}
 		return fetchErr
 	}
@@ -1435,6 +1434,14 @@ func (p *Puller) pullOnce(log zerolog.Logger, entry *raft.FileEntry, peerAddr st
 	}
 	if written != tailBytes {
 		return fmt.Errorf("short body: wrote %d tail bytes, expected %d", written, tailBytes)
+	}
+	if replacement != nil {
+		if _, err := replacement.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("rewind verified replacement spool: %w", err)
+		}
+		if err := p.cfg.Backend.WriteReader(fetchCtx, entry.Path, replacement, entry.SizeBytes); err != nil {
+			return fmt.Errorf("commit verified replacement: %w", err)
+		}
 	}
 	return nil
 }

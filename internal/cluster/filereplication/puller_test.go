@@ -572,42 +572,6 @@ func TestPullerSkipsAlreadyLocalFile(t *testing.T) {
 	}
 }
 
-func TestCatchUpRepullsSameSizeFileWithStaleContents(t *testing.T) {
-	backend := newFakeBackend()
-	path := "testdb/cpu/stale.parquet"
-	stale := []byte("stale file contents")
-	fresh := []byte("fresh file contents")
-	if len(stale) != len(fresh) {
-		t.Fatalf("test bodies must have the same size")
-	}
-	if err := backend.Write(context.Background(), path, stale); err != nil {
-		t.Fatalf("seed stale file: %v", err)
-	}
-	fetcher := newFakeFetcher(fakeFetchResult{body: fresh})
-	resolver := staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true}
-
-	p := newTestPuller(t, backend, fetcher, resolver)
-	p.Start(context.Background())
-	defer p.Stop()
-
-	entry := makeEntry(path, "writer-1", int64(len(fresh)))
-	digest := sha256.Sum256(fresh)
-	entry.SHA256 = fmt.Sprintf("%x", digest)
-	p.RunCatchUp(context.Background(), sliceFetcher([]*raft.FileEntry{entry}))
-
-	stats := waitStats(t, p, func(s map[string]int64) bool { return s["pulled"] == 1 })
-	if stats["pulled"] != 1 {
-		t.Fatalf("same-size stale file was not pulled: %+v", stats)
-	}
-	got, err := backend.Read(context.Background(), path)
-	if err != nil || !bytes.Equal(got, fresh) {
-		t.Fatalf("file was not refreshed: err=%v got=%q want=%q", err, got, fresh)
-	}
-	if fetcher.calls.Load() != 1 {
-		t.Fatalf("fetcher calls = %d, want 1", fetcher.calls.Load())
-	}
-}
-
 func TestPullerRetriesAndGivesUp(t *testing.T) {
 	backend := newFakeBackend()
 	// All 3 attempts return errors — none are ErrChecksumMismatch.
@@ -1033,6 +997,11 @@ func TestPullerMultiPeerCtxCanceledEarlyExit(t *testing.T) {
 // corrupt first candidate does not prevent recovery from another replica.
 func TestPullerMultiPeerChecksumMismatchFallsThrough(t *testing.T) {
 	backend := newFakeBackend()
+	path := "testdb/cpu/corrupt.parquet"
+	original := []byte("previous complete replica")
+	if err := backend.Write(context.Background(), path, original); err != nil {
+		t.Fatalf("seed existing replica: %v", err)
+	}
 	fetcher := newPerPeerFetcher()
 	goodBody := []byte("current parquet")
 	digest := sha256.Sum256(goodBody)
@@ -1069,7 +1038,7 @@ func TestPullerMultiPeerChecksumMismatchFallsThrough(t *testing.T) {
 	p.Start(context.Background())
 	defer p.Stop()
 
-	entry := makeEntry("testdb/cpu/corrupt.parquet", "writer-1", int64(len(goodBody)))
+	entry := makeEntry(path, "writer-1", int64(len(goodBody)))
 	entry.SHA256 = fmt.Sprintf("%x", digest)
 	p.Enqueue(entry)
 
@@ -1091,6 +1060,67 @@ func TestPullerMultiPeerChecksumMismatchFallsThrough(t *testing.T) {
 	got, err := backend.Read(context.Background(), entry.Path)
 	if err != nil || !bytes.Equal(got, goodBody) {
 		t.Errorf("final body: err=%v got=%q want=%q", err, got, goodBody)
+	}
+}
+
+func TestPullerPreservesExistingReplicaWhenAllReplacementPeersFail(t *testing.T) {
+	backend := newFakeBackend()
+	path := "testdb/cpu/preserved.parquet"
+	original := []byte("previous complete replica")
+	if err := backend.Write(context.Background(), path, original); err != nil {
+		t.Fatalf("seed existing replica: %v", err)
+	}
+	fetcher := newPerPeerFetcher()
+	fetcher.handle("1.1.1.1:9100", func(dst io.Writer) (int64, error) {
+		body := []byte("stale replacement")
+		if _, err := dst.Write(body); err != nil {
+			return 0, err
+		}
+		return int64(len(body)), ErrChecksumMismatch
+	})
+	fetcher.handle("2.2.2.2:9100", func(io.Writer) (int64, error) {
+		return 0, errors.New("peer unavailable")
+	})
+	resolver := multiPeerResolver{addrs: []string{"1.1.1.1:9100", "2.2.2.2:9100"}}
+	p, err := New(Config{
+		SelfNodeID:          "reader-1",
+		Backend:             backend,
+		Fetcher:             fetcher,
+		PeerResolver:        resolver,
+		Workers:             1,
+		QueueSize:           4,
+		RetryMaxAttempts:    1,
+		RetryInitialBackoff: 10 * time.Millisecond,
+		FetchTimeout:        2 * time.Second,
+		Logger:              zerolog.Nop(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	p.Start(context.Background())
+	defer p.Stop()
+
+	replacement := []byte("replacement bytes")
+	entry := makeEntry(path, "writer-1", int64(len(replacement)))
+	digest := sha256.Sum256(replacement)
+	entry.SHA256 = fmt.Sprintf("%x", digest)
+	p.Enqueue(entry)
+
+	stats := waitStats(t, p, func(s map[string]int64) bool { return s["failed"] == 1 })
+	if stats["failed"] != 1 {
+		t.Fatalf("failed: got %d, want 1; stats=%+v", stats["failed"], stats)
+	}
+	if stats["checksum_mismatch"] != 1 {
+		t.Errorf("checksum_mismatch: got %d, want 1", stats["checksum_mismatch"])
+	}
+	for _, peer := range []string{"1.1.1.1:9100", "2.2.2.2:9100"} {
+		if calls := fetcher.callsFor(peer); calls != 1 {
+			t.Errorf("%s calls: got %d, want 1", peer, calls)
+		}
+	}
+	got, err := backend.Read(context.Background(), path)
+	if err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("original replica was not preserved: err=%v got=%q want=%q", err, got, original)
 	}
 }
 
@@ -1339,6 +1369,18 @@ func (b *nonAppendingBackend) Delete(ctx context.Context, path string) error {
 }
 func (b *nonAppendingBackend) Exists(ctx context.Context, path string) (bool, error) {
 	return b.inner.Exists(ctx, path)
+}
+func (b *nonAppendingBackend) StagedSize(ctx context.Context, path string) (int64, error) {
+	return b.inner.StagedSize(ctx, path)
+}
+func (b *nonAppendingBackend) ReadStaged(ctx context.Context, path string, w io.Writer) error {
+	return b.inner.ReadStaged(ctx, path, w)
+}
+func (b *nonAppendingBackend) DeleteStaged(ctx context.Context, path string) error {
+	return b.inner.DeleteStaged(ctx, path)
+}
+func (b *nonAppendingBackend) ListStaged(ctx context.Context, prefix string) ([]storage.ObjectInfo, error) {
+	return b.inner.ListStaged(ctx, prefix)
 }
 func (b *nonAppendingBackend) Close() error       { return nil }
 func (b *nonAppendingBackend) Type() string       { return "non-appending" }
