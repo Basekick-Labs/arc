@@ -3,12 +3,16 @@
 package compaction
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/rs/zerolog"
 
 	_ "github.com/duckdb/duckdb-go/v2" // duckdb driver
 )
@@ -148,6 +152,90 @@ func TestCountParquetRows(t *testing.T) {
 	}
 	if count != 3 {
 		t.Fatalf("countParquetRows() = %d, want 3", count)
+	}
+
+	// Job.compactFiles passes a BARE quoted path, not a list, whenever a batch
+	// holds one file — a different parquet_file_metadata overload, and the one
+	// shape nothing else covers. Which overload it hit did not matter pre-fix
+	// (the function always errored); it does now.
+	bare, err := countParquetRows(ctx, db, fmt.Sprintf("'%s'", escapeSQLPath(file)))
+	if err != nil || bare != 3 {
+		t.Fatalf("single-path form: countParquetRows() = %d, err = %v, want 3", bare, err)
+	}
+}
+
+// TestDedupRatioLogFires is #1015's first acceptance criterion, and the reason
+// the issue was filed: the dedup-ratio log is the ONLY output Arc produces for
+// how many rows de-duplication removed, and it had never fired since auto-dedup
+// shipped, because countParquetRows always returned a Binder Error and the
+// error was discarded.
+//
+// Counting rows correctly is necessary but not sufficient — the log sits behind
+// `dedupBranch && rowsBefore > 0` and then `rowsAfter > 0 && rowsAfter <
+// rowsBefore`. A unit test on countParquetRows alone would still pass if any of
+// those gates went wrong, which is exactly how the metric went dark unnoticed
+// the first time. So drive the real caller, Job.compactFiles, and assert on the
+// log line an operator would actually read.
+//
+// Fails pre-fix: with the parquet_metadata spelling the count errors, rowsBefore
+// stays 0, and the log is skipped.
+func TestDedupRatioLogFires(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	// Two files carrying the "arc:tags" footer entry ingest writes, with
+	// identical (host, time) pairs — so dedup must collapse 4 rows to 2.
+	rows := `SELECT 'h1' AS host, TIMESTAMPTZ '2026-01-01 00:00:00' AS "time", 1 AS v
+	         UNION ALL SELECT 'h2', TIMESTAMPTZ '2026-01-01 00:00:01', 2`
+	write := func(name string) string {
+		path := filepath.ToSlash(filepath.Join(dir, name))
+		if _, err := db.ExecContext(ctx, fmt.Sprintf(
+			`COPY (%s) TO '%s' (FORMAT PARQUET, KV_METADATA {'arc:tags': 'host'})`,
+			rows, escapeSQLPath(path))); err != nil {
+			t.Fatalf("write fixture %s: %v", name, err)
+		}
+		return path
+	}
+
+	var logs bytes.Buffer
+	job := &Job{
+		Measurement:   "cpu",
+		Tier:          "hourly",
+		TempDirectory: dir,
+		JobID:         "dedup-ratio-log",
+		logger:        zerolog.New(&logs),
+		db:            db,
+	}
+	output, err := job.compactFiles(ctx, []downloadedFile{
+		{localPath: write("a.parquet"), storageKey: "db/cpu/a.parquet"},
+		{localPath: write("b.parquet"), storageKey: "db/cpu/b.parquet"},
+	}, dir)
+	if err != nil {
+		t.Fatalf("compactFiles: %v\nlog:\n%s", err, logs.String())
+	}
+
+	var got int64
+	if err := db.QueryRowContext(ctx, fmt.Sprintf(
+		`SELECT COUNT(*) FROM read_parquet('%s')`, escapeSQLPath(output))).Scan(&got); err != nil {
+		t.Fatalf("count output rows: %v", err)
+	}
+	if got != 2 {
+		t.Fatalf("compacted output has %d rows, want 2 — the fixture no longer exercises dedup, so the log assertion below proves nothing", got)
+	}
+
+	line := logs.String()
+	if !strings.Contains(line, "Deduplication removed duplicate rows") {
+		t.Fatalf("the dedup-ratio log did not fire on a partition where dedup removed half the rows (#1015); log:\n%s", line)
+	}
+	for _, want := range []string{`"rows_before":4`, `"rows_after":2`, `"rows_deduped":2`, `"dedup_ratio":50`} {
+		if !strings.Contains(line, want) {
+			t.Errorf("dedup-ratio log is missing %s; log:\n%s", want, line)
+		}
 	}
 }
 

@@ -281,7 +281,8 @@ func parquetFilesHaveTimeColumn(ctx context.Context, db *sql.DB, fileListSQL str
 }
 
 // countParquetRows counts total rows across Parquet files using metadata (no data scan).
-// fileListSQL is a DuckDB array literal like "['file1.parquet', 'file2.parquet']".
+// fileListSQL is a DuckDB array literal or single quoted path, as built by
+// Job.compactFiles — both forms have a parquet_file_metadata overload.
 func countParquetRows(ctx context.Context, db *sql.DB, fileListSQL string) (int64, error) {
 	query := fmt.Sprintf(`SELECT SUM(num_rows) FROM parquet_file_metadata(%s)`, fileListSQL)
 	var count int64

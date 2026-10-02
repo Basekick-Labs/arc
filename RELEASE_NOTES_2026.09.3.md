@@ -6,8 +6,21 @@
 
 Deduplication row counts now come from DuckDB's `parquet_file_metadata`, where
 `num_rows` is available, so the before/after counts and dedup-ratio log can be
-produced. Count failures are recorded at Debug level instead of being silently
-discarded.
+produced. A count failure is now reported at Warn level instead of being
+silently discarded.
+
+The count had been read from `parquet_metadata`, which has no `num_rows`
+column, so the query returned a binder error on every compaction and the error
+was discarded at both call sites. The row count was therefore always zero and
+the log it gates — `Deduplication removed duplicate rows`, the only output Arc
+produces for how many rows de-duplication discarded — **has never fired on any
+release**. An operator who saw no such line was reading an absent signal, not
+an absence of duplicates, and no historical dedup volume can be recovered from
+the logs. That matters beyond the missing metric: it is the line that would
+have surfaced the row loss described under
+[#1005](https://github.com/Basekick-Labs/arc/issues/1005) in these notes, where
+a `key=value` compaction temp directory collapsed the de-duplication key and
+discarded rows of distinct series as duplicates.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1019](https://github.com/Basekick-Labs/arc/pull/1019).
 

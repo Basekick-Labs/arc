@@ -800,7 +800,14 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 		var err error
 		rowsBefore, err = countParquetRows(ctx, db, fileListSQL)
 		if err != nil {
-			j.logger.Debug().Err(err).Msg("Failed to count parquet rows before deduplication")
+			// Warn, not Debug: both inputs were validated as Parquet moments
+			// ago (validateParquetFile above), so a failure here is a defect,
+			// not an operational condition. It also has to clear TWO level
+			// filters to reach an operator — the subprocess writes to stderr
+			// and the parent re-emits at the same level (forwardSubprocessLine)
+			// against log.level, which defaults to info. At Debug this line is
+			// dropped, which is the same silence that hid #1015 for a year.
+			j.logger.Warn().Err(err).Msg("Failed to count parquet rows before deduplication")
 		}
 	}
 
@@ -856,7 +863,9 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	if dedupBranch && rowsBefore > 0 {
 		rowsAfter, err := countParquetRows(ctx, db, fmt.Sprintf("[%s]", sqlutil.QuoteStringLiteral(outputFile)))
 		if err != nil {
-			j.logger.Debug().Err(err).Msg("Failed to count parquet rows after deduplication")
+			// Warn for the same reason as the before-count above: this file was
+			// written by the COPY two statements earlier.
+			j.logger.Warn().Err(err).Msg("Failed to count parquet rows after deduplication")
 		} else if rowsAfter > 0 && rowsAfter < rowsBefore {
 			deduped := rowsBefore - rowsAfter
 			j.logger.Info().
