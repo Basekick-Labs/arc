@@ -1434,10 +1434,10 @@ func (p *Puller) writeFileTail(ctx context.Context, entry *raft.FileEntry, r io.
 	return p.cfg.Backend.WriteReader(ctx, entry.Path, r, entry.SizeBytes)
 }
 
-// tryResumeFromPartial checks whether a partial file exists on disk for entry
+// tryResumeFromPartial checks whether a staged partial file exists for entry
 // and, if so, hashes its bytes so the fetch client can continue the SHA-256
 // chain over the tail. Returns (offset, hasher) on success, or (0, nil) if
-// there is no usable partial file (not found, too large, or hash failed).
+// there is no usable partial file (not staged, too large, or hash failed).
 //
 // Note: for backends that do not implement AppendingBackend, writeFileTail will
 // return ErrResumeNotSupported when called with a non-zero offset. This is
@@ -1450,8 +1450,13 @@ func (p *Puller) writeFileTail(ctx context.Context, entry *raft.FileEntry, r io.
 // why deleteFile below cannot be called with an unusable key. Both are pinned
 // by a test asserting the backend sees no Delete for a quarantined entry.
 func (p *Puller) tryResumeFromPartial(log zerolog.Logger, entry *raft.FileEntry) (int64, hash.Hash) {
+	staging, ok := p.cfg.Backend.(storage.StagingInspector)
+	if !ok {
+		return 0, nil
+	}
+
 	statCtx, statCancel := context.WithTimeout(p.ctx, 5*time.Second)
-	partial, statErr := p.cfg.Backend.StatFile(statCtx, entry.Path)
+	partial, statErr := staging.StagedSize(statCtx, entry.Path)
 	statCancel()
 	if statErr != nil || partial <= 0 || partial >= entry.SizeBytes {
 		return 0, nil
@@ -1459,7 +1464,7 @@ func (p *Puller) tryResumeFromPartial(log zerolog.Logger, entry *raft.FileEntry)
 
 	h := sha256.New()
 	hashCtx, hashCancel := context.WithTimeout(p.ctx, 30*time.Second)
-	hashErr := p.cfg.Backend.ReadToAt(hashCtx, entry.Path, h, 0)
+	hashErr := staging.ReadStaged(hashCtx, entry.Path, h)
 	hashCancel()
 	if hashErr != nil {
 		log.Debug().Err(hashErr).Str("path", entry.Path).

@@ -3,6 +3,7 @@ package filereplication
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"hash"
@@ -77,7 +78,7 @@ func (f *fakeBackend) WriteReader(ctx context.Context, path string, reader io.Re
 	}
 	// Atomic: read all bytes into a staging key. On success, promote to final key.
 	// On error, leave bytes in the ".part" staging key (same as real LocalBackend)
-	// so resume tests can discover them via StatFile/ReadTo.
+	// so resume tests can discover them through StagingInspector.
 	stagingKey := path + ".part"
 	var buf []byte
 	tmp := make([]byte, 4096)
@@ -126,7 +127,8 @@ func (f *fakeBackend) ReadTo(ctx context.Context, path string, writer io.Writer)
 	if err := checkKey(path); err != nil {
 		return err
 	}
-	// Fall back to staging file so tryResumeFromPartial can hash a partial prefix.
+	// Fall back to staging file for tests of other legacy readers; resume itself
+	// uses StagingInspector directly.
 	f.mu.Lock()
 	data, ok := f.files[path]
 	if !ok {
@@ -1213,6 +1215,77 @@ func TestPuller_ResumeOnRetry(t *testing.T) {
 	}
 }
 
+func TestPuller_ResumeUsesOnlyStagedPartial(t *testing.T) {
+	const path = "db/cpu/resume-staged.parquet"
+	fullBody := []byte("0123456789abcdefghijklmnopqrstuvwxyz")
+
+	tests := []struct {
+		name       string
+		final      []byte
+		staged     []byte
+		wantOffset int64
+	}{
+		{
+			name:       "final file is not resumable",
+			final:      fullBody[:10],
+			wantOffset: 0,
+		},
+		{
+			name:       "staged partial is resumable",
+			staged:     fullBody[:10],
+			wantOffset: 10,
+		},
+		{
+			name:       "staged partial wins over final file",
+			final:      fullBody[:6],
+			staged:     fullBody[:10],
+			wantOffset: 10,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			backend := newFakeBackend()
+			if tt.final != nil {
+				backend.files[path] = tt.final
+			}
+			if tt.staged != nil {
+				backend.files[path+".part"] = tt.staged
+			}
+
+			p, err := New(Config{
+				SelfNodeID:   "reader-1",
+				Backend:      backend,
+				Fetcher:      newResumeAwareFetcher(fullBody),
+				PeerResolver: multiPeerResolver{addrs: []string{"peer-1:9999"}},
+				Logger:       zerolog.Nop(),
+			})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			p.ctx = context.Background()
+
+			entry := makeEntry(path, "writer-1", int64(len(fullBody)))
+			offset, hasher := p.tryResumeFromPartial(zerolog.Nop(), entry)
+			if offset != tt.wantOffset {
+				t.Fatalf("offset = %d, want %d", offset, tt.wantOffset)
+			}
+			if tt.wantOffset == 0 {
+				if hasher != nil {
+					t.Fatal("hasher is non-nil for a non-staged final file")
+				}
+				return
+			}
+
+			_, _ = hasher.Write([]byte("tail"))
+			want := sha256.Sum256(append(append([]byte{}, tt.staged...), []byte("tail")...))
+			if !bytes.Equal(hasher.Sum(nil), want[:]) {
+				t.Fatal("hasher did not include the staged prefix")
+			}
+		})
+	}
+}
+
 // TestPuller_BadOffsetDeletesPartialAndRetries verifies that when the fetcher
 // returns ErrBadOffset, the puller deletes the partial file, increments the
 // bad_offset counter, and continues to retry from zero.
@@ -1268,8 +1341,8 @@ func TestPuller_BadOffsetDeletesPartialAndRetries(t *testing.T) {
 }
 
 // nonAppendingBackend delegates all Backend methods to fakeBackend but
-// deliberately omits AppendReader, so the puller's AppendingBackend
-// type-assertion fails and ErrResumeNotSupported is returned.
+// deliberately omits the optional resume interfaces, like an object-store
+// backend that does not stage writes or support appends.
 type nonAppendingBackend struct {
 	inner *fakeBackend
 }
@@ -1305,11 +1378,9 @@ func (b *nonAppendingBackend) Close() error       { return nil }
 func (b *nonAppendingBackend) Type() string       { return "non-appending" }
 func (b *nonAppendingBackend) ConfigJSON() string { return "{}" }
 
-// TestPuller_NonAppendingBackendFallback verifies that when the backend does
-// not implement AppendingBackend (e.g. S3/Azure), a resume attempt falls back
-// to a full re-fetch: the bad_offset_backend counter increments, the partial
-// file is deleted, and the next attempt fetches from offset 0.
-func TestPuller_NonAppendingBackendFallback(t *testing.T) {
+// TestPuller_NonStagingBackendFetchesFromZero verifies that a backend without
+// staging support (e.g. S3/Azure) never attempts to resume a partial file.
+func TestPuller_NonStagingBackendFetchesFromZero(t *testing.T) {
 
 	inner := newFakeBackend()
 	backend := &nonAppendingBackend{inner: inner}
@@ -1318,15 +1389,10 @@ func TestPuller_NonAppendingBackendFallback(t *testing.T) {
 	entry := makeEntry("testdb/cpu/resume_fallback.parquet", "writer-1", int64(len(fullBody)))
 
 	// Attempt 1: transport error + partial write (simulates mid-transfer drop).
-	// Attempt 2: puller detects partial → type-asserts AppendingBackend → fails
-	//            → ErrResumeNotSupported → bad_offset_backend++ → partial deleted.
-	//            The fetcher is called but the write goroutine closes the pipe
-	//            immediately, so the fetcher gets a broken-pipe error (scripted).
-	// Attempt 3: no partial on disk → fresh full fetch from offset 0 → success.
+	// Attempt 2: no staging inspector → fresh full fetch from offset 0 → success.
 	fetcher := newResumeAwareFetcher(fullBody,
-		fmt.Errorf("transport error"),    // attempt 1: mid-transfer drop
-		fmt.Errorf("write: broken pipe"), // attempt 2: pipe closed by write side
-		nil,                              // attempt 3: success (fresh fetch from zero)
+		fmt.Errorf("transport error"), // attempt 1: mid-transfer drop
+		nil,                           // attempt 2: success (fresh fetch from zero)
 	)
 
 	p, err := New(Config{
@@ -1356,8 +1422,11 @@ func TestPuller_NonAppendingBackendFallback(t *testing.T) {
 	if stats["pulled"] != 1 {
 		t.Fatalf("expected pulled=1, got %v", stats)
 	}
-	if stats["bad_offset_backend"] != 1 {
-		t.Errorf("expected bad_offset_backend=1, got %v", stats)
+	if stats["bad_offset_backend"] != 0 {
+		t.Errorf("expected bad_offset_backend=0, got %v", stats)
+	}
+	if fetcher.lastOffset() != 0 {
+		t.Errorf("second Fetch offset: got %d, want 0", fetcher.lastOffset())
 	}
 	data, readErr := inner.Read(context.Background(), entry.Path)
 	if readErr != nil {
