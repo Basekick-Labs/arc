@@ -1015,6 +1015,8 @@ func main() {
 						var activeCheckpointHashes []string
 						if walWriter != nil {
 							activeFile = walWriter.CurrentFile()
+							// Recovery skips the active file to avoid racing appends, so read
+							// its checkpoint index separately while the writer lock holds it stable.
 							activeCheckpointHashes, err = walWriter.CurrentCheckpointHashes()
 							if err != nil {
 								walLogger.Error().Err(err).Msg("Failed to read active WAL checkpoints; skipping recovery to avoid duplicate replay")

@@ -127,15 +127,13 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		}
 
 		reader := NewReader(walFile, r.logger)
-		entries, err := reader.ReadAll()
+		checkpointHashes, err := reader.ReadCheckpointHashes()
 		if err != nil {
-			r.logger.Error().Err(err).Str("file", walFile).Msg("Failed to read WAL file")
+			r.logger.Error().Err(err).Str("file", walFile).Msg("Failed to scan WAL checkpoints")
 			continue
 		}
-		for _, entry := range entries {
-			for _, hash := range entry.CheckpointHashes {
-				flushed[hash] = struct{}{}
-			}
+		for _, hash := range checkpointHashes {
+			flushed[hash] = struct{}{}
 		}
 	}
 

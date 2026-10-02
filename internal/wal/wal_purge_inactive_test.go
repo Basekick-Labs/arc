@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1009,10 +1010,15 @@ func TestMarkFlushedBatchesCheckpointHashes(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 	defer writer.Close()
 
+	dataHashes, err := writer.AppendTracked([]map[string]interface{}{{"payload": strings.Repeat("x", 1<<20)}})
+	if err != nil {
+		t.Fatalf("append tracked data entry: %v", err)
+	}
 	hashes := make([]string, walCheckpointBatchSize+1)
 	for i := range hashes {
 		hashes[i] = strconv.Itoa(i)
 	}
+	hashes = append(hashes, dataHashes...)
 	if err := writer.MarkFlushed(hashes); err != nil {
 		t.Fatalf("persist flush checkpoints: %v", err)
 	}
@@ -1021,8 +1027,8 @@ func TestMarkFlushedBatchesCheckpointHashes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read checkpoint WAL entries: %v", err)
 	}
-	if len(entries) != 2 {
-		t.Fatalf("expected checkpoints in two bounded WAL entries, got %d", len(entries))
+	if len(entries) != 3 {
+		t.Fatalf("expected one data entry and two bounded checkpoints, got %d entries", len(entries))
 	}
 	checkpointCount := 0
 	for _, entry := range entries {
@@ -1030,6 +1036,35 @@ func TestMarkFlushedBatchesCheckpointHashes(t *testing.T) {
 	}
 	if checkpointCount != len(hashes) {
 		t.Fatalf("checkpoint hash count = %d, want %d", checkpointCount, len(hashes))
+	}
+
+	checkpointHashes, err := NewReader(writer.CurrentFile(), zerolog.Nop()).ReadCheckpointHashes()
+	if err != nil {
+		t.Fatalf("scan checkpoint hashes: %v", err)
+	}
+	if len(checkpointHashes) != len(hashes) {
+		t.Fatalf("checkpoint-only scan returned %d hashes, want %d", len(checkpointHashes), len(hashes))
+	}
+	for i := range hashes {
+		if checkpointHashes[i] != hashes[i] {
+			t.Fatalf("checkpoint hash %d = %q, want %q", i, checkpointHashes[i], hashes[i])
+		}
+	}
+}
+
+func TestNewWriterTrackedInstancesAreRandomized(t *testing.T) {
+	first, firstDir := newTestWriter(t, SyncModeAsync)
+	defer os.RemoveAll(firstDir)
+	defer first.Close()
+	second, secondDir := newTestWriter(t, SyncModeAsync)
+	defer os.RemoveAll(secondDir)
+	defer second.Close()
+
+	if first.trackedInstance == 0 || second.trackedInstance == 0 {
+		t.Fatal("tracked writer instance must be non-zero")
+	}
+	if first.trackedInstance == second.trackedInstance {
+		t.Fatal("separate writers unexpectedly share a tracked instance identity")
 	}
 }
 

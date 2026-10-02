@@ -2,6 +2,7 @@ package wal
 
 import (
 	"bytes"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -442,6 +443,17 @@ type Writer struct {
 
 // NewWriter creates a new WAL writer
 func NewWriter(cfg *WriterConfig) (*Writer, error) {
+	var instanceBytes [8]byte
+	for {
+		if _, err := cryptorand.Read(instanceBytes[:]); err != nil {
+			return nil, fmt.Errorf("failed to initialize WAL tracked identity: %w", err)
+		}
+		if binary.BigEndian.Uint64(instanceBytes[:]) != 0 {
+			break
+		}
+	}
+	trackedInstance := binary.BigEndian.Uint64(instanceBytes[:])
+
 	// Set defaults
 	if cfg.SyncMode == "" {
 		cfg.SyncMode = SyncModeFdatasync
@@ -477,7 +489,7 @@ func NewWriter(cfg *WriterConfig) (*Writer, error) {
 		lastSyncTime:    time.Now(),
 		entryChan:       make(chan walEntry, cfg.BufferSize),
 		done:            make(chan struct{}),
-		trackedInstance: uint64(time.Now().UnixNano()) ^ uint64(os.Getpid()),
+		trackedInstance: trackedInstance,
 	}
 
 	// Initialize first WAL file
@@ -1175,15 +1187,7 @@ func (w *Writer) CurrentCheckpointHashes() ([]string, error) {
 	if w.currentPath == "" {
 		return nil, nil
 	}
-	entries, err := NewReader(w.currentPath, w.logger).ReadAll()
-	if err != nil {
-		return nil, err
-	}
-	var hashes []string
-	for _, entry := range entries {
-		hashes = append(hashes, entry.CheckpointHashes...)
-	}
-	return hashes, nil
+	return NewReader(w.currentPath, w.logger).ReadCheckpointHashes()
 }
 
 // SetReplicationHook sets the hook function called for each WAL entry.
