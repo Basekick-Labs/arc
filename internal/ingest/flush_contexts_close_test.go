@@ -682,3 +682,104 @@ func TestClose_BudgetExpiryStillFlushesRemainingBuffers(t *testing.T) {
 		t.Fatalf("Close wrote %d records; the buffered measurement (%d records) should still have been flushed after the budget expired", got, perBatch-2)
 	}
 }
+
+// TestAgedFlush_SurvivesClose pins the fourth seam named in #1007.
+//
+// The age-triggered flush built its context from b.ctx, which Close cancels. By
+// the time the storage write is running, flushBufferLocked has already deleted
+// the buffer entry, so cancelling it loses those rows outright — and with the
+// WAL disabled, which is the shipped default, there is no second copy.
+//
+// The sweep now runs on flushParent, so Close waits for an aged flush in
+// progress instead of killing it.
+func TestAgedFlush_SurvivesClose(t *testing.T) {
+	store := &ctxHonouringBackend{delay: 500 * time.Millisecond}
+	cfg := &config.IngestConfig{
+		MaxBufferSize:       1_000_000, // never size-flush: the age trigger is the only one
+		MaxBufferAgeMS:      60,
+		Compression:         "snappy",
+		ShardCount:          1,
+		FlushWorkers:        1,
+		FlushQueueSize:      4,
+		FlushTimeoutSeconds: 30,
+		DataPageVersion:     "2.0",
+	}
+	buf := NewArrowBuffer(cfg, store, zerolog.New(io.Discard))
+	buf.SetCloseBudget(30 * time.Second)
+
+	if err := buf.WriteColumnarDirect(context.Background(), "db", "aged", makeColumns(8)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Wait until the aged sweep is inside the storage write, then Close.
+	deadline := time.Now().Add(3 * time.Second)
+	for store.started.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if store.started.Load() == 0 {
+		t.Fatal("the aged flush never reached the storage backend")
+	}
+
+	if err := buf.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if got := store.cancelled.Load(); got != 0 {
+		t.Fatalf("%d aged flush(es) were cancelled by Close; flushBufferLocked had already deleted the buffer entry, so those rows are lost (#1007)", got)
+	}
+	if got := store.completed.Load(); got == 0 {
+		t.Fatal("the aged flush never completed; Close aborted it instead of waiting")
+	}
+	if !buf.CloseFlushedCleanly() {
+		t.Fatal("CloseFlushedCleanly() is false although the aged flush completed")
+	}
+}
+
+// TestClose_WaitsForWritersMidHandoff pins the third seam in #1007.
+//
+// A writer between shard.mu.Unlock() and tryEnqueueFlush holds no lock, is in no
+// queue and is in no inline flush. If Close drains the queue while such a writer
+// is mid-handoff, the writer's subsequent send lands in a queue that no worker
+// and no drain will ever read: the task is stranded, its records are counted
+// nowhere, and CloseFlushedCleanly still reports clean — so the shutdown purge
+// deletes the WAL those records depended on.
+//
+// This drives pendingEnqueueRecords directly rather than trying to race it. That
+// is deliberate: with shard.swept now set at the top of each shard's critical
+// section, a writer can only be mid-handoff if it extracted before its shard was
+// swept, so the window is far too narrow to provoke reliably — an earlier
+// version of this test asserted an empty queue after concurrent writes and
+// passed 20/20 with the mechanism removed, i.e. it pinned nothing. Exercising
+// the counter is what actually fails when the wait is gone.
+func TestClose_WaitsForWritersMidHandoff(t *testing.T) {
+	buf := NewArrowBuffer(closeTestConfig(), &countingBackend{}, zerolog.New(io.Discard))
+	buf.SetCloseBudget(20 * time.Second)
+
+	// Stand in for a writer that has extracted a batch but not yet handed it to
+	// tryEnqueueFlush.
+	const inFlight = 7
+	buf.pendingEnqueueRecords.Add(inFlight)
+
+	done := make(chan struct{})
+	go func() { _ = buf.Close(); close(done) }()
+
+	select {
+	case <-done:
+		t.Fatal("Close finished while a writer was still mid-handoff; its send would land in a queue nothing drains, leaving the records counted nowhere while the close reports clean (#1007, #803)")
+	case <-time.After(200 * time.Millisecond):
+		// Correct: Close is waiting.
+	}
+
+	// The writer completes its handoff.
+	buf.pendingEnqueueRecords.Add(-inFlight)
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not resume after the handoff completed")
+	}
+
+	if n := len(buf.flushQueue); n != 0 {
+		t.Fatalf("%d flush task(s) left in the queue after Close", n)
+	}
+}
