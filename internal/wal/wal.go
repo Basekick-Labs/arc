@@ -35,7 +35,8 @@ const (
 	// MaxWALPayloadSize is the maximum allowed payload size for a single WAL entry.
 	// This limit prevents integer overflow during buffer allocation (CWE-190) and
 	// aligns with the replication protocol limit (100MB).
-	MaxWALPayloadSize = 100 * 1024 * 1024 // 100MB
+	MaxWALPayloadSize    = 100 * 1024 * 1024 // 100MB
+	walTrackedHeaderSize = 1 + 16
 
 	// walChunkTarget is the payload size an oversized payload is chunked down
 	// to (#677). It sits well below MaxWALPayloadSize so a chunk still clears
@@ -739,7 +740,7 @@ func (w *Writer) AppendTracked(records []map[string]interface{}) ([]string, erro
 		return nil, fmt.Errorf("failed to serialize records: %w", err)
 	}
 	chunks := [][]byte{payload}
-	if len(payload) > MaxWALPayloadSize {
+	if !trackedPayloadFits(len(payload), 0) {
 		chunks, err = splitOversizedPayload(payload)
 		if err != nil {
 			return nil, oversizedPayloadError(err)
@@ -747,8 +748,8 @@ func (w *Writer) AppendTracked(records []map[string]interface{}) ([]string, erro
 	}
 	hashes := make([]string, 0, len(chunks))
 	for _, chunk := range chunks {
-		if len(chunk) > MaxWALPayloadSize {
-			return nil, oversizedPayloadError(fmt.Errorf("size %d exceeds limit %d", len(chunk), MaxWALPayloadSize))
+		if !trackedPayloadFits(len(chunk), 0) {
+			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", len(chunk)+walTrackedHeaderSize, MaxWALPayloadSize))
 		}
 		token, err := w.appendTrackedEntry(chunk)
 		if err != nil {
@@ -764,20 +765,20 @@ func (w *Writer) AppendRawWithMetaTracked(database string, payload []byte) ([]st
 	if len(database) > 255 {
 		return nil, fmt.Errorf("database name too long: %d bytes", len(database))
 	}
+	dbBytes := []byte(database)
+	envelopeHeaderLen := 3 + len(dbBytes)
 	chunks := [][]byte{payload}
-	if len(payload) > MaxWALPayloadSize {
+	if !trackedPayloadFits(len(payload), envelopeHeaderLen) {
 		var err error
 		chunks, err = splitOversizedPayload(payload)
 		if err != nil {
 			return nil, oversizedPayloadError(err)
 		}
 	}
-	dbBytes := []byte(database)
-	envelopeHeaderLen := 3 + len(dbBytes)
 	var hashes []string
 	for _, chunk := range chunks {
-		if envelopeHeaderLen+len(chunk) > MaxWALPayloadSize {
-			return nil, oversizedPayloadError(fmt.Errorf("size %d exceeds limit %d", envelopeHeaderLen+len(chunk), MaxWALPayloadSize))
+		if !trackedPayloadFits(len(chunk), envelopeHeaderLen) {
+			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", envelopeHeaderLen+len(chunk)+walTrackedHeaderSize, MaxWALPayloadSize))
 		}
 		token, err := w.appendTrackedEntry(envelopePayload(dbBytes, chunk))
 		if err != nil {
@@ -837,10 +838,14 @@ func payloadHash(payload []byte) string {
 	return fmt.Sprintf("%x", sum[:])
 }
 
+func trackedPayloadFits(payloadLen, envelopeHeaderLen int) bool {
+	return payloadLen <= MaxWALPayloadSize-walTrackedHeaderSize-envelopeHeaderLen
+}
+
 func (w *Writer) appendTrackedEntry(logicalPayload []byte) (string, error) {
 	seq := atomic.AddUint64(&w.trackedSequence, 1)
 	token := fmt.Sprintf("%016x%016x", w.trackedInstance, seq)
-	trackedPayload := make([]byte, 1+16+len(logicalPayload))
+	trackedPayload := make([]byte, walTrackedHeaderSize+len(logicalPayload))
 	trackedPayload[0] = WALTrackedMarker
 	binary.BigEndian.PutUint64(trackedPayload[1:9], w.trackedInstance)
 	binary.BigEndian.PutUint64(trackedPayload[9:17], seq)

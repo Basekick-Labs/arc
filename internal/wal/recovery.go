@@ -108,10 +108,10 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		flushed[hash] = struct{}{}
 	}
 
-	// Scan replayable files for checkpoints before invoking callbacks. A flush
+	// Scan non-active files for checkpoints before invoking callbacks. A flush
 	// checkpoint can land in the next WAL file after rotation, while the data
-	// entry remains in the previous file; collecting checkpoints globally closes
-	// that gap without retaining every decoded WAL entry in memory.
+	// entry remains in the previous file. Recently rotated files are scanned for
+	// checkpoints too, even though the replay pass below skips them.
 	for _, walFile := range walFiles {
 		select {
 		case <-ctx.Done():
@@ -124,15 +124,6 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 			r.logger.Debug().Str("file", filepath.Base(walFile)).Msg("Skipping active WAL file")
 			stats.SkippedFiles++
 			continue
-		}
-
-		// See RecoveryOptions.MinFileAge (#594 rotation-race defense).
-		if opts.MinFileAge > 0 {
-			if info, statErr := os.Stat(walFile); statErr == nil && time.Since(info.ModTime()) < opts.MinFileAge {
-				r.logger.Debug().Str("file", filepath.Base(walFile)).Msg("Skipping too-recent WAL file (possible fresh rotation)")
-				stats.SkippedFiles++
-				continue
-			}
 		}
 
 		reader := NewReader(walFile, r.logger)
@@ -160,6 +151,8 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		}
 		if opts.MinFileAge > 0 {
 			if info, statErr := os.Stat(walFile); statErr == nil && time.Since(info.ModTime()) < opts.MinFileAge {
+				r.logger.Debug().Str("file", filepath.Base(walFile)).Msg("Skipping too-recent WAL file (possible fresh rotation)")
+				stats.SkippedFiles++
 				continue
 			}
 		}

@@ -936,6 +936,73 @@ func TestRecovery_UsesCheckpointsFromSkippedActiveFile(t *testing.T) {
 	}
 }
 
+func TestRecovery_CollectsCheckpointsFromRecentlyRotatedFile(t *testing.T) {
+	writer, tmpDir := newTestWriter(t, SyncModeAsync)
+	defer os.RemoveAll(tmpDir)
+	defer writer.Close()
+
+	records := []map[string]interface{}{{"measurement": "events", "time": int64(1609459200000000), "value": "flushed"}}
+	hashes, err := writer.AppendTracked(records)
+	if err != nil {
+		t.Fatalf("append tracked records: %v", err)
+	}
+	waitForEntries(t, writer, 1)
+	dataFile := writer.CurrentFile()
+
+	writer.mu.Lock()
+	err = writer.rotate()
+	writer.mu.Unlock()
+	if err != nil {
+		t.Fatalf("rotate data WAL file: %v", err)
+	}
+	checkpointFile := writer.CurrentFile()
+	if err := writer.MarkFlushed(hashes); err != nil {
+		t.Fatalf("persist flush checkpoint: %v", err)
+	}
+	writer.mu.Lock()
+	err = writer.rotate()
+	writer.mu.Unlock()
+	if err != nil {
+		t.Fatalf("rotate checkpoint WAL file: %v", err)
+	}
+
+	oldTime := time.Now().Add(-20 * time.Second)
+	if err := os.Chtimes(dataFile, oldTime, oldTime); err != nil {
+		t.Fatalf("age data WAL file: %v", err)
+	}
+	activeFile := writer.CurrentFile()
+	activeHashes, err := writer.CurrentCheckpointHashes()
+	if err != nil {
+		t.Fatalf("read active WAL checkpoints: %v", err)
+	}
+	if len(activeHashes) != 0 {
+		t.Fatalf("expected no checkpoints in the new active file, got %v", activeHashes)
+	}
+	if info, err := os.Stat(checkpointFile); err != nil {
+		t.Fatalf("stat checkpoint WAL file: %v", err)
+	} else if time.Since(info.ModTime()) >= 5*time.Second {
+		t.Fatalf("expected checkpoint file to remain within MinFileAge, age=%s", time.Since(info.ModTime()))
+	}
+
+	recovered := 0
+	stats, err := NewRecovery(tmpDir, zerolog.Nop()).RecoverWithOptions(context.Background(), func(ctx context.Context, recs []map[string]interface{}) error {
+		recovered += len(recs)
+		return nil
+	}, &RecoveryOptions{
+		SkipActiveFile: activeFile,
+		MinFileAge:     5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("recover WAL: %v", err)
+	}
+	if recovered != 0 || stats.RecoveredEntries != 0 {
+		t.Fatalf("expected recent-file checkpoint to suppress replay, callbacks=%d entries=%d", recovered, stats.RecoveredEntries)
+	}
+	if stats.SkippedFiles != 2 {
+		t.Fatalf("expected active and recent checkpoint files to be skipped from replay, skipped=%d", stats.SkippedFiles)
+	}
+}
+
 // ==========================================================================
 // PurgeOlderThan() method tests
 // ==========================================================================
