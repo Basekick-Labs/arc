@@ -287,6 +287,24 @@ predate that fix and #978.
 
 ## Bug fixes
 
+### The delete WHERE validator reuses the shared table-position guard
+
+`POST /api/v1/delete` takes a WHERE fragment and interpolates it into a
+`read_parquet(...)` query, but validated it with its own set of scans —
+punctuation, keywords, I/O-function names, prefixes — and none of them
+examined table position. A string literal standing where a relation belongs
+is resolved by DuckDB rather than treated as a value, and that class has no
+function name for a denylist to match.
+
+The fragment now goes through the same guard the query endpoints use, applied
+to the fragment itself rather than the assembled statement (by then it sits
+inside Arc's own `read_parquet(...)`, which would self-trip the I/O denylist).
+Reusing that guard rather than extending this file's keyword list means it
+tracks the relation-introducing keywords DuckDB has rather than drifting from
+them. Ordinary predicates are unaffected, including values that look
+path-like.
+
+
 ### A newline before a table function's parenthesis made the function a measurement
 
 Arc's RBAC extractor and its SQL rewriter each decide independently whether a
