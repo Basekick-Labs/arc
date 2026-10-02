@@ -1571,6 +1571,23 @@ func extractTableReferences(sql string, identNames map[string]string) []TableRef
 // Returns nil if access is allowed, or an error describing what access was denied
 // Uses batch permission checking for efficiency when multiple tables are referenced
 func (h *QueryHandler) checkQueryPermissions(c *fiber.Ctx, sql, permission string) error {
+	// The x-arc-database header is what the query transform resolves bare
+	// names against on this path, so it is also what the check must use.
+	return h.checkQueryPermissionsForDefaultDB(c, sql, permission, c.Get("x-arc-database"))
+}
+
+// checkQueryPermissionsForDefaultDB is checkQueryPermissions with the database
+// that bare (unqualified) table references resolve to supplied explicitly.
+//
+// It exists because the two callers disagree about where that database comes
+// from, and getting it wrong is a bypass in one direction or a false denial in
+// the other. /api/v1/query resolves bare names against the x-arc-database
+// header, so it passes the header. GET /api/v1/query/:measurement takes its
+// database from the ?database= parameter, builds fully-qualified SQL, and hands
+// the rewriter an EMPTY header — so a bare reference inside its user-supplied
+// `where` fragment resolves to "default", and it must pass "" here. Passing the
+// header there instead would check <header>/x while the query reads default/x.
+func (h *QueryHandler) checkQueryPermissionsForDefaultDB(c *fiber.Ctx, sql, permission, defaultDB string) error {
 	// If no RBAC manager, skip permission check (handled by basic auth middleware)
 	if h.rbacManager == nil || !h.rbacManager.IsRBACEnabled() {
 		return nil
@@ -1609,15 +1626,17 @@ func (h *QueryHandler) checkQueryPermissions(c *fiber.Ctx, sql, permission strin
 		return nil
 	}
 
-	// Override "default" database with the x-arc-database header value when
-	// present. Without this, a user with default.cpu:read can bypass RBAC
-	// and query sensitive_db.cpu by setting x-arc-database: sensitive_db —
-	// the permission check would use "default" while the query transform
-	// resolves paths against the header-specified database.
-	if headerDB := c.Get("x-arc-database"); headerDB != "" {
+	// Re-point bare "default" references at the database the TRANSFORM will
+	// resolve them against. Without this, a user with default.cpu:read could
+	// bypass RBAC and query sensitive_db.cpu by setting x-arc-database:
+	// sensitive_db — the check would use "default" while the transform used
+	// the header. defaultDB is supplied by the caller rather than read here,
+	// because the two callers get it from different places; see the doc
+	// comment above.
+	if defaultDB != "" {
 		for i := range tableRefs {
 			if tableRefs[i].Database == "default" {
-				tableRefs[i].Database = headerDB
+				tableRefs[i].Database = defaultDB
 			}
 		}
 	}
@@ -5110,6 +5129,37 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
 			Success:   false,
 			Error:     "Invalid query: " + err.Error(),
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+	}
+
+	// SECURITY: authorize every table the ASSEMBLED statement references, not
+	// just the one named in the path.
+	//
+	// checkMeasurementPermission above gates `database`/`measurement` from the
+	// route and query string. It cannot see the user-supplied `where` fragment,
+	// which the transform below rewrites like any other table position — so a
+	// subquery in `where` read a second measurement that nothing had
+	// authorized. validateWhereClauseQuery is a substring blocklist and does
+	// not stop it: it blocks `;`, comments and DDL/DML, not a nested read.
+	// Enumerating read syntaxes does not work either — DuckDB spells the same
+	// thing `(SELECT x FROM t)`, `(FROM t)` and `(TABLE t)`, and `FROM` is
+	// legal inside EXTRACT/SUBSTRING/TRIM.
+	//
+	// So authorize what the transform will actually resolve. The extractor and
+	// the transform agree on that set, which is the invariant
+	// rbac_normalisation_parity_test.go asserts.
+	//
+	// "" for the default database, matching the empty header handed to
+	// getTransformedSQL on the very next line: bare names in `where` resolve
+	// to "default" there, so they must be checked as "default" here. Passing
+	// the x-arc-database header instead would check <header>/x while the query
+	// read default/x.
+	if err := h.checkQueryPermissionsForDefaultDB(c, sql, "read", ""); err != nil {
+		m.IncQueryErrors()
+		return c.Status(fiber.StatusForbidden).JSON(QueryResponse{
+			Success:   false,
+			Error:     err.Error(),
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
 		})
 	}
