@@ -360,6 +360,8 @@ func TestReceiver_RejectsMaliciousPaths(t *testing.T) {
 		{"NUL byte", "metrics/cpu\x00/f.parquet"},
 		{"dot prefix", ".sync-staging/rocket-02/f.parquet"},
 		{"empty segment", "metrics//f.parquet"},
+		{"glob wildcard", "metrics/cpu[1]/f.parquet"},
+		{"hive partition", "metrics/host=hub01/f.parquet"},
 		{"not parquet", "metrics/cpu/evil.sh"},
 	}
 
@@ -398,6 +400,8 @@ func TestReceiver_RejectsMaliciousSpokeIDs(t *testing.T) {
 		{"trailing space", "rocket_01 "},
 		{"leading space", " rocket_01"},
 		{"control character", "rocket\n01"},
+		{"glob wildcard", "rocket*01"},
+		{"hive partition", "host=hub01"},
 	}
 
 	for _, tt := range ids {

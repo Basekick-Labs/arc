@@ -2,6 +2,12 @@
 
 > **Status:** Planned — November 2026 patch release.
 
+## Fixed: edge-sync names reject DuckDB glob and Hive partition syntax ([#994](https://github.com/Basekick-Labs/arc/issues/994))
+
+Spoke IDs and received sync-path segments containing DuckDB glob metacharacters
+or `=` are now rejected. Existing registrations are not modified, but affected
+spokes must use safe names before new transfers can be accepted.
+
 ## New: per-peer replication lag gauges ([#819](https://github.com/Basekick-Labs/arc/issues/819))
 
 The writer now exposes two Prometheus gauges per connected WAL replication

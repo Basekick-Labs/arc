@@ -667,6 +667,12 @@ func validateSpokeID(spokeID string) error {
 	if strings.ContainsRune(spokeID, ':') {
 		return fmt.Errorf("edgesync: spoke ID %q contains a colon, which the cluster manifest path validator refuses", spokeID)
 	}
+	if strings.ContainsRune(spokeID, '=') {
+		return fmt.Errorf("edgesync: spoke ID %q contains '=', which DuckDB treats as a Hive partition", spokeID)
+	}
+	if err := storage.ValidateGlobSafe(spokeID); err != nil {
+		return fmt.Errorf("edgesync: spoke ID %q is not glob-safe: %w", spokeID, err)
+	}
 	if spokeID == "." || spokeID == ".." || strings.HasPrefix(spokeID, ".") {
 		return fmt.Errorf("edgesync: spoke ID %q may not start with a dot", spokeID)
 	}
@@ -751,6 +757,12 @@ func validateSyncPathWithMaxLen(p string, maxPathLen int) error {
 	for _, seg := range strings.Split(p, "/") {
 		if seg == "" {
 			return fmt.Errorf("edgesync: path %q contains an empty segment", p)
+		}
+		if strings.ContainsRune(seg, '=') {
+			return fmt.Errorf("edgesync: path %q contains '=', which DuckDB treats as a Hive partition", p)
+		}
+		if err := storage.ValidateGlobSafe(seg); err != nil {
+			return fmt.Errorf("edgesync: path %q is not glob-safe: %w", p, err)
 		}
 		// Checked per segment, not on the whole string. "db/./cpu/x.parquet"
 		// used to pass: path.Join cleans it before storage, but Measurement is
