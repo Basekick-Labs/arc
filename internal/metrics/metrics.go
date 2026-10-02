@@ -31,6 +31,16 @@ type Metrics struct {
 	ingestBatchesTotal  atomic.Int64
 	ingestErrorsTotal   atomic.Int64
 	ingestFlushDeferred atomic.Int64
+	// bufferDeferredBuffers is a GAUGE: how many buffers are currently holding
+	// records that could not be handed to a flush worker. It is what the flush
+	// drainer acts on, so a value that stays non-zero while the queue has room
+	// means the drainer is not keeping up (or is wedged).
+	//
+	// Exported as arc_buffer_deferred_buffers, NOT arc_ingest_*: in this file
+	// arc_ingest_* is uniformly counters and arc_buffer_* holds the buffer-state
+	// gauges (arc_buffer_queue_depth, arc_buffer_records_buffered), which this
+	// sits beside and is published alongside.
+	bufferDeferredBuffers atomic.Int64
 
 	// MessagePack specific
 	msgpackRequestsTotal atomic.Int64
@@ -359,6 +369,9 @@ func (m *Metrics) IncIngestBatches()            { m.ingestBatchesTotal.Add(1) }
 func (m *Metrics) IncIngestErrors()             { m.ingestErrorsTotal.Add(1) }
 func (m *Metrics) IncIngestFlushDeferred()      { m.ingestFlushDeferred.Add(1) }
 
+// SetBufferDeferredBuffers publishes the current deferred-buffer count.
+func (m *Metrics) SetBufferDeferredBuffers(n int64) { m.bufferDeferredBuffers.Store(n) }
+
 // MessagePack Metrics
 func (m *Metrics) IncMsgPackRequests()           { m.msgpackRequestsTotal.Add(1) }
 func (m *Metrics) IncMsgPackRecords(count int64) { m.msgpackRecordsTotal.Add(count) }
@@ -642,6 +655,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"ingest_batches_total":        m.ingestBatchesTotal.Load(),
 		"ingest_errors_total":         m.ingestErrorsTotal.Load(),
 		"ingest_flush_deferred_total": m.ingestFlushDeferred.Load(),
+		"buffer_deferred_buffers":     m.bufferDeferredBuffers.Load(),
 
 		// MessagePack
 		"msgpack_requests_total": m.msgpackRequestsTotal.Load(),
@@ -861,6 +875,9 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_ingest_flush_deferred_total Flushes deferred because the flush queue was full\n"...)
 	b = append(b, "# TYPE arc_ingest_flush_deferred_total counter\n"...)
 	b = appendMetric(b, "arc_ingest_flush_deferred_total", float64(m.ingestFlushDeferred.Load()))
+	b = append(b, "# HELP arc_buffer_deferred_buffers Buffers currently holding records that no flush worker could take\n"...)
+	b = append(b, "# TYPE arc_buffer_deferred_buffers gauge\n"...)
+	b = appendMetric(b, "arc_buffer_deferred_buffers", float64(m.bufferDeferredBuffers.Load()))
 
 	// MessagePack metrics
 	b = append(b, "# HELP arc_msgpack_requests_total Total MessagePack requests\n"...)

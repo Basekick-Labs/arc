@@ -783,6 +783,16 @@ type bufferShard struct {
 	bufferSchemas      map[string]string // Column signature for schema evolution detection
 	mu                 sync.RWMutex
 
+	// deferredKeys are buffers in this shard that crossed MaxBufferSize but
+	// could not be handed to a worker because the flush queue was full, so
+	// their records are still here. Maintained under mu.
+	//
+	// Without this set nothing knows a deferred buffer exists: it is re-enqueued
+	// only by a later write to the same key, by the age sweep, or by Close. When
+	// ingest moves on to other measurements, that buffer waits while flush
+	// workers sit idle. flushDrainer consumes this set.
+	deferredKeys map[string]struct{}
+
 	// swept is set by Close()'s shard-flush loop, under the same mu
 	// acquisition that flushes the shard, and is the signal that no further
 	// append may happen here: anything added after the sweep would never be
@@ -900,13 +910,23 @@ type ArrowBuffer struct {
 	// never closed; workers exit on b.ctx.Done()).
 	closing atomic.Bool
 
-	// totalFlushDeferred counts how many times a size-triggered flush was
-	// DEFERRED because the bounded flush queue had no room: the records stay in
-	// the shard buffer and are flushed by a later write to the same key, by the
-	// age-based sweep, or by Close. Before #966 route 1 this condition extracted
-	// the batch and dropped it, so this counter is the operator-visible
-	// replacement for a silent data loss. Exposed as
-	// arc_ingest_flush_deferred_total and total_flush_deferred in GetStats.
+	// drainCh wakes flushDrainer when a flush-queue slot may have freed. Capacity
+	// 1 with a non-blocking send: the signal is an edge, not a count, and the
+	// drainer re-reads the real state when it wakes, so a coalesced signal costs
+	// nothing.
+	drainCh chan struct{}
+
+	// totalFlushDeferred counts deferrals: a buffer that was ready to flush could
+	// not be handed to a worker because the bounded queue had no room, so its
+	// records stay in the shard. Both the write path and flushDrainer increment
+	// it, so it is a saturation signal rather than a count of distinct buffers.
+	//
+	// A deferred buffer is picked up by flushDrainer as soon as a worker frees a
+	// slot, by a later write to the same key, by the age-based sweep, or by
+	// Close. Before #966 route 1 this condition extracted the batch and dropped
+	// it, so this counter is the operator-visible replacement for what used to be
+	// a silent data loss. Exposed as arc_ingest_flush_deferred_total and as
+	// total_flush_deferred in GetStats.
 	totalFlushDeferred atomic.Int64
 
 	// flushDeferredLastLogNano is the sampler timestamp for the deferral Warn,
@@ -1086,6 +1106,19 @@ func (b *ArrowBuffer) publishBufferMetrics() {
 	m.SetBufferQueueDepth(b.queueDepth.Load())
 	m.SetBufferErrors(b.totalErrors.Load())
 	m.SetBufferRecordsBuffered(b.currentBufferedRecords())
+}
+
+// countDeferredBuffers counts buffers whose records no worker could take. Also
+// published as the arc_buffer_deferred_buffers gauge.
+func (b *ArrowBuffer) countDeferredBuffers() int64 {
+	var total int64
+	for i := range b.shards {
+		shard := b.shards[i]
+		shard.mu.RLock()
+		total += int64(len(shard.deferredKeys))
+		shard.mu.RUnlock()
+	}
+	return total
 }
 
 // currentBufferedRecords sums the records sitting in every shard's buffers.
@@ -1275,6 +1308,7 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 		shardCount:           uint32(shardCount),
 		ctx:                  ctx,
 		cancel:               cancel,
+		drainCh:              make(chan struct{}, 1),
 		flushParent:          flushParent,
 		flushParentCancel:    flushParentCancel,
 		flushTimer:           time.NewTimer(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
@@ -1298,6 +1332,7 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 			bufferStartTimes:   make(map[string]time.Time),
 			bufferRecordCounts: make(map[string]int),
 			bufferSchemas:      make(map[string]string),
+			deferredKeys:       make(map[string]struct{}),
 		}
 	}
 
@@ -1310,6 +1345,12 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 	// Start background flush
 	buffer.wg.Add(1)
 	go buffer.periodicFlush()
+
+	// One drainer, regardless of worker count: its work is a bounded scan plus a
+	// non-blocking enqueue, and serialising it keeps the oldest-first ordering
+	// meaningful.
+	buffer.wg.Add(1)
+	go buffer.flushDrainer()
 
 	// Publish buffer gauges on a fixed cadence (#802)
 	buffer.wg.Add(1)
@@ -1776,12 +1817,32 @@ func (b *ArrowBuffer) enqueueOrDeferLocked(
 	bufferKey, database, measurement string,
 	totalBuffered int,
 ) (queued bool, deferred bool) {
+	// The buffer may be gone. flushDrainer picks a key from a snapshot taken
+	// under a DIFFERENT lock acquisition, so between its scan and this call the
+	// key can be flushed by the age sweep, by a schema-change flush, by FlushAll,
+	// or by an ordinary write. Without this check the task below would carry
+	// records == nil with a stale recordCount, mergeBatches would fail with "no
+	// batches to merge", and markFlushFailure would then trigger a full periodic
+	// WAL recovery pass and leave CloseFlushedCleanly false for the rest of the
+	// process lifetime — all on a healthy system.
+	if _, exists := shard.buffers[bufferKey]; !exists {
+		// Clear the whole entry, not just the marker: leaving bufferStartTimes,
+		// bufferRecordCounts or bufferSchemas behind is the same phantom class the
+		// swept-guard move in this change exists to eliminate, and the aged sweep
+		// and next-deadline computation both walk bufferStartTimes.
+		delete(shard.deferredKeys, bufferKey)
+		delete(shard.bufferStartTimes, bufferKey)
+		delete(shard.bufferRecordCounts, bufferKey)
+		delete(shard.bufferSchemas, bufferKey)
+		return false, false
+	}
+
 	closing := b.closing.Load()
 	if closing || len(b.flushQueue) >= cap(b.flushQueue) {
 		// Deferring during shutdown is normal and uninteresting: Close flushes
 		// this buffer. Only a genuine queue-full deferral is worth counting.
 		if !closing {
-			b.recordFlushDeferred()
+			b.markDeferredLocked(shard, bufferKey)
 			return false, true
 		}
 		return false, false
@@ -1805,6 +1866,7 @@ func (b *ArrowBuffer) enqueueOrDeferLocked(
 	case b.flushQueue <- task:
 		b.queueDepth.Add(1)
 		// Only now does the buffer stop owning these records.
+		delete(shard.deferredKeys, bufferKey)
 		delete(shard.buffers, bufferKey)
 		delete(shard.bufferStartTimes, bufferKey)
 		delete(shard.bufferRecordCounts, bufferKey)
@@ -1816,9 +1878,185 @@ func (b *ArrowBuffer) enqueueOrDeferLocked(
 		return false, false
 	default:
 		// Lost the race against another writer for the last slot.
-		b.recordFlushDeferred()
+		b.markDeferredLocked(shard, bufferKey)
 		return false, true
 	}
+}
+
+// signalDrain nudges flushDrainer. Non-blocking: the channel is an edge, not a
+// queue, and the drainer re-reads real state when it wakes.
+func (b *ArrowBuffer) signalDrain() {
+	select {
+	case b.drainCh <- struct{}{}:
+	default:
+	}
+}
+
+// flushDrainer re-enqueues buffers that were deferred because the flush queue
+// was full, as soon as a slot frees.
+//
+// Without it a deferred buffer is picked up only by a later write to the same
+// measurement, by the age-based sweep, or by Close. When ingest moves on to
+// other measurements, that buffer sits while flush workers go idle — and the
+// age sweep is a single goroutine that holds each shard's lock across its whole
+// pass, so with many measurements it is the slowest way to drain anything.
+//
+// Two properties this loop must have, both learned the hard way:
+//
+//  1. **It must always reach its outer select.** Close sets b.closing, cancels
+//     b.ctx, and only then waits on b.wg — and that wait has no timeout of its
+//     own beyond the close budget. A drainer that spun in its inner loop would
+//     keep Close from returning, the coordinator would skip the wal-purge and
+//     wal components, and the WAL writer's final drain-and-sync would never run,
+//     leaving a retained WAL missing its newest entries.
+//  2. **It must never retry a buffer that refused to queue, but must skip past
+//     one that vanished.** enqueueOrDeferLocked returns (false, _) for a full
+//     queue, for shutdown, for losing the last slot, and for a buffer that no
+//     longer exists. Retrying the first three is how this loop fails to
+//     terminate; ENDING the pass on the fourth strands every other deferred
+//     buffer, because a buffer removed by the age sweep or a schema-change flush
+//     never touches flushQueue and so generates no signal to wake us again. The
+//     two are told apart by whether the key is still in deferredKeys afterwards.
+func (b *ArrowBuffer) flushDrainer() {
+	defer b.wg.Done()
+
+	for {
+		select {
+		case <-b.ctx.Done():
+			return
+		case <-b.drainCh:
+			b.drainDeferredOnce()
+		}
+	}
+}
+
+// drainDeferredOnce enqueues deferred buffers, oldest first, and returns.
+//
+// A pass ends on whichever comes first: the attempt budget is spent, the queue is
+// full, nothing is deferred, shutdown has begun, or a real buffer refused to
+// queue. All of them are reachable — the budget in particular is the ordinary
+// exit when starting from an empty queue, since cap(flushQueue) successful
+// enqueues spend it before the queue-full check sees a full queue.
+func (b *ArrowBuffer) drainDeferredOnce() {
+	budget := cap(b.flushQueue)
+	if budget < 1 {
+		budget = 1
+	}
+
+	for attempt := 0; attempt < budget; attempt++ {
+		// Re-checked every iteration, not just at the outer select: Close can
+		// begin at any point during a drain pass.
+		if b.closing.Load() || b.ctx.Err() != nil {
+			return
+		}
+		if len(b.flushQueue) >= cap(b.flushQueue) {
+			return
+		}
+
+		shard, key, ok := b.oldestDeferred()
+		if !ok {
+			return
+		}
+
+		database, measurement := splitDatabaseAndMeasurement(key)
+
+		shard.mu.Lock()
+		// recordCount is read under the lock rather than carried from the
+		// snapshot: the snapshot came from a different acquisition and a write
+		// may have grown the buffer since, so trusting it would under-report the
+		// task's size.
+		queued, _ := b.enqueueOrDeferLocked(shard, key, database, measurement, shard.bufferRecordCounts[key])
+		// Still deferred means the buffer is real and simply could not be queued.
+		// Gone means enqueueOrDeferLocked found no buffer and cleaned the marker,
+		// i.e. something else flushed it between the scan and now.
+		_, stillDeferred := shard.deferredKeys[key]
+		shard.mu.Unlock()
+
+		if queued {
+			continue
+		}
+		if !stillDeferred {
+			// The pick vanished. Move on to the next oldest rather than ending
+			// the pass: this costs nothing and NOT doing it strands every other
+			// deferred buffer, because a buffer removed by the age sweep or a
+			// schema-change flush never touches flushQueue and so produces no
+			// dequeue signal to wake us again.
+			continue
+		}
+		// A real buffer that would not queue: the queue is full, we lost the last
+		// slot, or shutdown began. Retrying this key is how the loop would fail
+		// to terminate, so end the pass.
+		return
+	}
+}
+
+// oldestDeferred finds the deferred buffer with the earliest start time across
+// all shards. Read-locks one shard at a time; no two shard locks are ever held
+// at once anywhere in this file, and that stays true here.
+//
+// The result is a snapshot: by the time the caller takes the write lock the key
+// may be gone. enqueueOrDeferLocked checks for that, which is why this can
+// return a stale key safely.
+func (b *ArrowBuffer) oldestDeferred() (*bufferShard, string, bool) {
+	var (
+		oldestShard *bufferShard
+		oldestKey   string
+		oldest      time.Time
+		found       bool
+	)
+	for i := range b.shards {
+		shard := b.shards[i]
+		shard.mu.RLock()
+		for key := range shard.deferredKeys {
+			start, ok := shard.bufferStartTimes[key]
+			if !ok {
+				// Defensive, and deliberately not load-bearing. No path should
+				// leave a deferred key without a start time now — the swept guard
+				// moved ahead of the buffer initialisation in this change, and
+				// every removal clears deferredKeys. If one ever does appear it is
+				// unreachable from here, which is why the removals clear the
+				// marker rather than relying on this skip.
+				continue
+			}
+			if !found || start.Before(oldest) {
+				oldestShard, oldestKey, oldest, found = shard, key, start, true
+			}
+		}
+		shard.mu.RUnlock()
+	}
+	return oldestShard, oldestKey, found
+}
+
+// splitDatabaseAndMeasurement unpacks a buffer key for the drainer, which only
+// has the key. Returns ("", "") for a malformed key, which enqueueOrDeferLocked
+// then treats as a normal flush of whatever the buffer holds — the key itself is
+// what identifies the buffer, and the pair is only used to build the task.
+func splitDatabaseAndMeasurement(bufferKey string) (string, string) {
+	parts := splitBufferKey(bufferKey)
+	if len(parts) != 2 {
+		return "", ""
+	}
+	return parts[0], parts[1]
+}
+
+// markDeferredLocked records that bufferKey's records are still in this shard
+// because no worker could take them, so flushDrainer can come back for it.
+// Caller holds shard.mu.
+func (b *ArrowBuffer) markDeferredLocked(shard *bufferShard, bufferKey string) {
+	shard.deferredKeys[bufferKey] = struct{}{}
+	b.recordFlushDeferred()
+
+	// Wake the drainer for THIS deferral. Relying only on the worker's
+	// dequeue signal loses a race: a writer can read a full queue, be
+	// descheduled, have its token consumed by a drainer pass that finds nothing
+	// deferred yet, and only then record the deferral — leaving an idle worker,
+	// an empty queue, a deferred buffer and no pending signal. That is the
+	// pre-#1008 behaviour, reached through the new code.
+	//
+	// Cheap even under sustained saturation: a woken drainer checks the queue
+	// before it scans anything, so a wake with no room costs one channel receive.
+	// Non-blocking, so holding shard.mu here is safe.
+	b.signalDrain()
 }
 
 // recordFlushDeferred counts a deferral. Before #966 route 1 this condition
@@ -2027,17 +2265,10 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 	}
 
 	// Initialize buffer and record count if needed
-	if _, exists := shard.buffers[bufferKey]; !exists {
-		shard.bufferStartTimes[bufferKey] = time.Now().UTC()
-		shard.bufferRecordCounts[bufferKey] = 0
-		shard.bufferSchemas[bufferKey] = newSignature // Store schema for evolution detection
-		// Tell periodicFlush to recompute its wakeup time for this new buffer.
-		select {
-		case b.newBufferCh <- struct{}{}:
-		default:
-		}
-	}
-
+	// Checked BEFORE the initialisation below, not after it. The old position
+	// left bufferStartTimes, bufferRecordCounts and bufferSchemas entries behind
+	// for a refused write, with no matching shard.buffers entry — a phantom the
+	// age sweep and the next-deadline computation both walk over.
 	// Refuse once Close() has swept THIS shard: anything appended after the
 	// sweep is never flushed and is not counted by CloseFlushedCleanly, so the
 	// shutdown WAL purge would delete its only other copy (#1007).
@@ -2061,6 +2292,17 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 		b.walOnlyRecords.Add(int64(numRecords))
 		metrics.Get().IncWALRecordsPreserved(int64(numRecords))
 		return ErrBufferClosing
+	}
+
+	if _, exists := shard.buffers[bufferKey]; !exists {
+		shard.bufferStartTimes[bufferKey] = time.Now().UTC()
+		shard.bufferRecordCounts[bufferKey] = 0
+		shard.bufferSchemas[bufferKey] = newSignature // Store schema for evolution detection
+		// Tell periodicFlush to recompute its wakeup time for this new buffer.
+		select {
+		case b.newBufferCh <- struct{}{}:
+		default:
+		}
 	}
 
 	// Add typed columns to buffer (already converted via zero-copy fast paths)
@@ -2169,17 +2411,10 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 	}
 
 	// Initialize buffer and record count if needed
-	if _, exists := shard.buffers[bufferKey]; !exists {
-		shard.bufferStartTimes[bufferKey] = time.Now().UTC()
-		shard.bufferRecordCounts[bufferKey] = 0
-		shard.bufferSchemas[bufferKey] = newSignature
-		// Tell periodicFlush to recompute its wakeup time for this new buffer.
-		select {
-		case b.newBufferCh <- struct{}{}:
-		default:
-		}
-	}
-
+	// Checked BEFORE the initialisation below, not after it. The old position
+	// left bufferStartTimes, bufferRecordCounts and bufferSchemas entries behind
+	// for a refused write, with no matching shard.buffers entry — a phantom the
+	// age sweep and the next-deadline computation both walk over.
 	// Refuse once Close() has swept THIS shard: anything appended after the
 	// sweep is never flushed and is not counted by CloseFlushedCleanly, so the
 	// shutdown WAL purge would delete its only other copy (#1007).
@@ -2203,6 +2438,17 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 		b.walOnlyRecords.Add(int64(numRecords))
 		metrics.Get().IncWALRecordsPreserved(int64(numRecords))
 		return ErrBufferClosing
+	}
+
+	if _, exists := shard.buffers[bufferKey]; !exists {
+		shard.bufferStartTimes[bufferKey] = time.Now().UTC()
+		shard.bufferRecordCounts[bufferKey] = 0
+		shard.bufferSchemas[bufferKey] = newSignature
+		// Tell periodicFlush to recompute its wakeup time for this new buffer.
+		select {
+		case b.newBufferCh <- struct{}{}:
+		default:
+		}
 	}
 
 	// Add typed columns to buffer directly (no conversion needed)
@@ -2676,6 +2922,11 @@ func (b *ArrowBuffer) metricsSampler() {
 			return
 		case <-ticker.C:
 			b.publishBufferMetrics()
+			// Only on the sampler, not inside publishBufferMetrics:
+			// publishBufferMetrics also runs once per flushed file, and this
+			// walks every shard under RLock — 32 lock round-trips per flush on
+			// locks writers contend for, for a gauge that needs 1 Hz.
+			metrics.Get().SetBufferDeferredBuffers(b.countDeferredBuffers())
 		}
 	}
 }
@@ -2837,6 +3088,10 @@ func (b *ArrowBuffer) flushWorker(workerID int) {
 				return
 			}
 			metrics.Get().SetBufferQueueDepth(b.queueDepth.Add(-1))
+			// Signal here, not only after the flush: the queue slot frees at
+			// RECEIVE, so waiting for completion delays the drain by a whole
+			// flush time and lets the write path win the slot instead.
+			b.signalDrain()
 
 			b.logger.Debug().
 				Int("worker_id", workerID).
@@ -3115,7 +3370,15 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard, bufferKey, database, measurement string) error {
 	batches, exists := shard.buffers[bufferKey]
 	if !exists || len(batches) == 0 {
-		// Clean up stale tracking entries even if buffer is empty
+		// Clean up stale tracking entries even if buffer is empty.
+		//
+		// deferredKeys has to go too. A key left here with no bufferStartTimes
+		// entry is UNCOLLECTABLE: oldestDeferred skips any key whose start time is
+		// missing, so it is never selected, and only a selected key reaches the
+		// cleanup in enqueueOrDeferLocked. It would then sit in
+		// arc_buffer_deferred_buffers and GetStats forever.
+		delete(shard.deferredKeys, bufferKey)
+		delete(shard.buffers, bufferKey)
 		delete(shard.bufferStartTimes, bufferKey)
 		delete(shard.bufferRecordCounts, bufferKey)
 		delete(shard.bufferSchemas, bufferKey)
@@ -3130,6 +3393,7 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 	copy(recordsToFlush, batches)
 
 	// Clear buffer immediately
+	delete(shard.deferredKeys, bufferKey)
 	delete(shard.buffers, bufferKey)
 	delete(shard.bufferStartTimes, bufferKey)
 	delete(shard.bufferRecordCounts, bufferKey)
@@ -4442,8 +4706,12 @@ func (b *ArrowBuffer) GetStats() map[string]interface{} {
 		"total_wal_errors":            b.totalWALErrors.Load(),
 		"total_wal_dropped":           b.totalWALDropped.Load(),
 		"total_schema_churn_exceeded": b.totalSchemaChurnExceeded.Load(),
-		"active_buffers":              activeBuffers,
-		"flush_queue_depth":           b.queueDepth.Load(),
-		"flush_workers":               b.flushWorkers,
+		// The field comment on totalFlushDeferred has claimed these were here
+		// since #997; they were not.
+		"total_flush_deferred": b.totalFlushDeferred.Load(),
+		"deferred_buffers":     b.countDeferredBuffers(),
+		"active_buffers":       activeBuffers,
+		"flush_queue_depth":    b.queueDepth.Load(),
+		"flush_workers":        b.flushWorkers,
 	}
 }
