@@ -26,10 +26,11 @@ type Metrics struct {
 	httpLatencyCount   atomic.Int64
 
 	// Ingestion metrics
-	ingestRecordsTotal atomic.Int64
-	ingestBytesTotal   atomic.Int64
-	ingestBatchesTotal atomic.Int64
-	ingestErrorsTotal  atomic.Int64
+	ingestRecordsTotal  atomic.Int64
+	ingestBytesTotal    atomic.Int64
+	ingestBatchesTotal  atomic.Int64
+	ingestErrorsTotal   atomic.Int64
+	ingestFlushDeferred atomic.Int64
 
 	// MessagePack specific
 	msgpackRequestsTotal atomic.Int64
@@ -356,6 +357,7 @@ func (m *Metrics) IncIngestRecords(count int64) { m.ingestRecordsTotal.Add(count
 func (m *Metrics) IncIngestBytes(bytes int64)   { m.ingestBytesTotal.Add(bytes) }
 func (m *Metrics) IncIngestBatches()            { m.ingestBatchesTotal.Add(1) }
 func (m *Metrics) IncIngestErrors()             { m.ingestErrorsTotal.Add(1) }
+func (m *Metrics) IncIngestFlushDeferred()      { m.ingestFlushDeferred.Add(1) }
 
 // MessagePack Metrics
 func (m *Metrics) IncMsgPackRequests()           { m.msgpackRequestsTotal.Add(1) }
@@ -635,10 +637,11 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"http_latency_count":    m.httpLatencyCount.Load(),
 
 		// Ingestion
-		"ingest_records_total": m.ingestRecordsTotal.Load(),
-		"ingest_bytes_total":   m.ingestBytesTotal.Load(),
-		"ingest_batches_total": m.ingestBatchesTotal.Load(),
-		"ingest_errors_total":  m.ingestErrorsTotal.Load(),
+		"ingest_records_total":        m.ingestRecordsTotal.Load(),
+		"ingest_bytes_total":          m.ingestBytesTotal.Load(),
+		"ingest_batches_total":        m.ingestBatchesTotal.Load(),
+		"ingest_errors_total":         m.ingestErrorsTotal.Load(),
+		"ingest_flush_deferred_total": m.ingestFlushDeferred.Load(),
 
 		// MessagePack
 		"msgpack_requests_total": m.msgpackRequestsTotal.Load(),
@@ -855,6 +858,9 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_ingest_errors_total Total ingestion errors\n"...)
 	b = append(b, "# TYPE arc_ingest_errors_total counter\n"...)
 	b = appendMetric(b, "arc_ingest_errors_total", float64(m.ingestErrorsTotal.Load()))
+	b = append(b, "# HELP arc_ingest_flush_deferred_total Flushes deferred because the flush queue was full\n"...)
+	b = append(b, "# TYPE arc_ingest_flush_deferred_total counter\n"...)
+	b = appendMetric(b, "arc_ingest_flush_deferred_total", float64(m.ingestFlushDeferred.Load()))
 
 	// MessagePack metrics
 	b = append(b, "# HELP arc_msgpack_requests_total Total MessagePack requests\n"...)
