@@ -121,6 +121,28 @@ func walkTablePositions(normalised string, visit func(p tablePosition) (stop boo
 			fromArmed[depth] = true
 			afterFromJoin = true
 			introStart = m[0]
+		case "table", "summarize", "describe", "pivot", "unpivot":
+			// DuckDB introduces a relation after these too, and it accepts a
+			// bare path there exactly as it does after FROM: `TABLE '<glob>'`,
+			// `SUMMARIZE '<glob>'`, `PIVOT '<glob>' ON …` all read the file.
+			// Arming only on from/join left the replacement-scan guard blind
+			// to every one of them, so a string literal in those positions
+			// reached DuckDB verbatim while the RBAC extractor emitted no
+			// reference for it — an authorization check over an empty set.
+			//
+			// fromArmed is deliberately NOT set: none of these forms continues
+			// a table list across a comma, and arming one would make a later
+			// comma a table position — `PIVOT t ON a, b` and
+			// `PIVOT t ON col IN ('a','b')` would then read as cross-join
+			// tables and a legitimate literal there would be refused.
+			//
+			// A following `(` resets the window (see the "(" case above), so
+			// `FROM t PIVOT (sum(x) FOR y IN ('a'))` and `DESCRIBE SELECT …`
+			// are unaffected. Arc supports no replacement scans at all, so a
+			// literal directly after one of these keywords has no legitimate
+			// form to protect.
+			afterFromJoin = true
+			introStart = m[0]
 		default:
 			// A real table name, alias, ON, USING, etc. keeps the clause armed
 			// so a following `, b` cross-join is still a table position.
