@@ -2,6 +2,26 @@
 
 > **Status:** Planned — November 2026 patch release.
 
+## Fixed: edge-sync names reject DuckDB glob and Hive partition syntax ([#994](https://github.com/Basekick-Labs/arc/issues/994))
+
+Spoke IDs and received sync-path segments containing DuckDB glob metacharacters
+or `=` are now rejected. A spoke ID is the first path segment of everything that
+spoke writes into the hub's storage root and the sync path supplies the rest, so
+these are long-lived directory names: a glob metacharacter makes the path a
+pattern rather than a name, and `=` is read as a Hive partition key, which can
+replace a stored column's value with the one in the path.
+
+Existing registrations are not modified. A spoke whose stored ID is no longer
+accepted is reported at hub startup, by ID and reason, and its transfers are
+refused from then on. There is no rename: re-registering mints a new secret and
+needs the edge box reconfigured, and the data already under the old namespace
+stays on disk where it is, unmigrated. Nothing is deleted.
+
+This closes the admission side only, and only for new names. Arc does not yet
+disable Hive inference on the reads it issues, so a `key=value` directory that
+is already on disk is still read that way — tracked in
+[#1005](https://github.com/Basekick-Labs/arc/issues/1005).
+
 ## New: per-peer replication lag gauges ([#819](https://github.com/Basekick-Labs/arc/issues/819))
 
 The writer now exposes two Prometheus gauges per connected WAL replication

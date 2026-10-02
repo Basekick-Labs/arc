@@ -285,7 +285,9 @@ func TestRegistry_RejectsMaliciousSpokeIDs(t *testing.T) {
 	// The spoke ID becomes the first path segment of everything that spoke
 	// writes, so registration is where a namespace-escaping ID must be caught
 	// — by the time a request arrives it is already HMAC-bound.
-	for _, id := range []string{"", "..", "rocket/../other", "rocket\\other", ".sync-staging", "rocket\x00-01"} {
+	for _, id := range []string{
+		"", "..", "rocket/../other", "rocket\\other", ".sync-staging", "rocket\x00-01", "rocket*01", "host=hub01",
+	} {
 		t.Run(id, func(t *testing.T) {
 			if _, err := reg.Register(ctx, id, "Some Spoke"); err == nil {
 				t.Errorf("spoke ID %q was accepted", id)

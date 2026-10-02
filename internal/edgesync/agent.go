@@ -664,6 +664,24 @@ func isSyncableFile(p string) bool {
 	return validateSyncPath(p) == nil
 }
 
+// unsafeReadPathSegment reports whether p was rejected specifically for the
+// read-path rules (glob metacharacters, "="), as opposed to the layout rules
+// that fire constantly and are expected.
+//
+// Only used to decide whether a skip is worth logging. Arc never generates
+// such a path — database and measurement are both ^[a-zA-Z][a-zA-Z0-9_-]*$ at
+// every write entry point, and filenames are generated — so the only way one
+// appears under a spoke's storage root is an operator putting it there, and
+// silently declining to sync it would be hard to diagnose.
+func unsafeReadPathSegment(p string) bool {
+	for _, seg := range strings.Split(p, "/") {
+		if validateReadPathSafe(seg) != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // parseArcPath extracts the Arc namespace from a storage path.
 //
 // Layout is {database}/{measurement}/{YYYY}/{MM}/{DD}/{HH}/file.parquet.
