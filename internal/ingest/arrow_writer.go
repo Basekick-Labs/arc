@@ -409,6 +409,8 @@ func inferArrowType(colName string, firstVal interface{}) (arrow.DataType, error
 		return arrow.PrimitiveTypes.Float64, nil
 	case string:
 		return arrow.BinaryTypes.String, nil
+	case []byte:
+		return arrow.BinaryTypes.Binary, nil
 	case bool:
 		return arrow.FixedWidthTypes.Boolean, nil
 	default:
@@ -460,6 +462,8 @@ func (w *ArrowWriter) getSchema(measurement string, columns map[string]interface
 			typeNames = append(typeNames, "float64")
 		case []string:
 			typeNames = append(typeNames, "string")
+		case [][]byte:
+			typeNames = append(typeNames, "binary")
 		case []bool:
 			typeNames = append(typeNames, "bool")
 		case []decimal128.Num:
@@ -536,6 +540,8 @@ func (w *ArrowWriter) inferSchema(columns map[string]interface{}, tagColumns []s
 			arrowType = arrow.PrimitiveTypes.Float64
 		case []string:
 			arrowType = arrow.BinaryTypes.String
+		case [][]byte:
+			arrowType = arrow.BinaryTypes.Binary
 		case []bool:
 			arrowType = arrow.FixedWidthTypes.Boolean
 		case []decimal128.Num:
@@ -688,6 +694,21 @@ func (w *ArrowWriter) writeParquetColumnarWithSchema(ctx context.Context, measur
 			} else {
 				return nil, nil, fmt.Errorf("column %s: expected []string, got %T", field.Name, col)
 			}
+			arrays[i] = builder.NewArray()
+
+		case arrow.BINARY:
+			builder := array.NewBinaryBuilder(mem, arrow.BinaryTypes.Binary)
+			builders[i] = builder
+
+			binaryCol, ok := col.([][]byte)
+			if !ok {
+				return nil, fmt.Errorf(
+					"column %s: expected [][]byte, got %T",
+					field.Name, col,
+				)
+			}
+
+			builder.AppendValues(binaryCol, colValidity)
 			arrays[i] = builder.NewArray()
 
 		case arrow.BOOL:
@@ -1038,6 +1059,8 @@ func getColumnSignature(columns map[string]interface{}) string {
 			typ = "f64"
 		case []string:
 			typ = "str"
+		case [][]byte:
+			typ = "bin"
 		case []bool:
 			typ = "bool"
 		case []decimal128.Num:
@@ -2702,6 +2725,42 @@ func (b *ArrowBuffer) convertColumnsToTyped(measurement string, columns map[stri
 				validity[name] = valid
 			}
 
+		case []byte:
+			// Preserve binary bytes exactly. A nil interface is SQL NULL,
+			// while an empty []byte is a valid zero-length binary value.
+			arr := make([][]byte, len(col))
+			var valid []bool
+
+			for i, v := range col {
+				if v == nil {
+					if valid == nil {
+						valid = make([]bool, len(col))
+						for j := 0; j < i; j++ {
+							valid[j] = true
+						}
+					}
+					continue
+				}
+
+				value, ok := v.([]byte)
+				if !ok {
+					return nil, 0, fmt.Errorf(
+						"unexpected type in binary column '%s': %T",
+						name, v,
+					)
+				}
+
+				arr[i] = value
+				if valid != nil {
+					valid[i] = true
+				}
+			}
+
+			typed[name] = arr
+			if valid != nil {
+				validity[name] = valid
+			}
+
 		case string:
 			if arr, ok := b.tryStringZeroCopy(col); ok {
 				typed[name] = arr
@@ -3510,6 +3569,8 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 					ct = "float64"
 				case []string:
 					ct = "string"
+				case [][]byte:
+					ct = "binary"
 				case []bool:
 					ct = "bool"
 				case []decimal128.Num:
@@ -3556,6 +3617,8 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 			merged[name] = make([]float64, totalRows)
 		case "string":
 			merged[name] = make([]string, totalRows)
+		case "binary":
+			merged[name] = make([][]byte, totalRows)
 		case "bool":
 			merged[name] = make([]bool, totalRows)
 		case "decimal128":
@@ -3595,6 +3658,8 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 				copy(merged[name].([]float64)[rowOffset:], v)
 			case []string:
 				copy(merged[name].([]string)[rowOffset:], v)
+			case [][]byte:
+				copy(merged[name].([][]byte)[rowOffset:], v)
 			case []bool:
 				copy(merged[name].([]bool)[rowOffset:], v)
 			case []decimal128.Num:
@@ -3708,6 +3773,8 @@ func sortColumnsByKeysWithPermutation(columns map[string]interface{}, sortKeys [
 		case []float64:
 			n = len(c)
 		case []string:
+			n = len(c)
+		case [][]byte:
 			n = len(c)
 		case []bool:
 			n = len(c)
@@ -3924,6 +3991,15 @@ func compareMultiKeyCached(cachedCols []interface{}, i, j int) bool {
 				return false
 			}
 
+		case [][]byte:
+			cmp := bytes.Compare(c[i], c[j])
+			if cmp < 0 {
+				return true
+			}
+			if cmp > 0 {
+				return false
+			}
+
 		case []bool:
 			if !c[i] && c[j] { // false < true
 				return true
@@ -3965,6 +4041,13 @@ func applyPermutation(colData interface{}, indices []int) interface{} {
 
 	case []string:
 		result := make([]string, len(indices))
+		for i, idx := range indices {
+			result[i] = col[idx]
+		}
+		return result
+
+	case [][]byte:
+		result := make([][]byte, len(indices))
 		for i, idx := range indices {
 			result[i] = col[idx]
 		}
@@ -4199,6 +4282,15 @@ func sliceColumnsByIndices(columns map[string]interface{}, indices []int) map[st
 				// else: leave as empty string (sparse column handling)
 			}
 			result[colName] = newCol
+
+		case [][]byte:
+			binarySlice := make([][]byte, len(indices))
+			for i, idx := range indices {
+				if idx < len(col) {
+					binarySlice[i] = col[idx]
+				}
+			}
+			result[colName] = binarySlice
 
 		case []bool:
 			newCol := make([]bool, len(indices))

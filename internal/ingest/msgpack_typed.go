@@ -64,10 +64,8 @@ func isFloatCode(c byte) bool {
 }
 
 func isStrCode(c byte) bool {
-	// Deliberately excludes Bin8/16/32: the generic path boxes bin as []byte
-	// and convertColumnsToTyped rejects it, so the typed path must not
-	// accept bin where today's path errors. Bin falls back to the generic
-	// decoder, which produces today's rejection.
+	// Binary values take the generic decoder, which preserves raw []byte.
+	// The typed fast path only handles its existing scalar classes.
 	return msgpcode.IsFixedString(c) || c == msgpcode.Str8 || c == msgpcode.Str16 || c == msgpcode.Str32
 }
 
@@ -82,12 +80,11 @@ func isBoolCode(c byte) bool {
 // validity, and inferred types are IDENTICAL to what the generic decode +
 // convertColumnsToTyped would have produced — or it returns ok=false having
 // caused no side effects, and the caller runs the generic path. It never
-// surfaces an error to the user: every reject decision (mixed types, bin
-// columns, string time, uint64 overflow, nested values, batch format, ...)
+// surfaces an error to the user: unsupported types and invalid values
+// fall back to the generic decoder, which also handles accepted binary data.
 // is delegated to the generic path by falling back, which guarantees the
 // user-visible accept/reject behavior is byte-identical to the pre-typed
-// decoder. The cost of double-decoding malformed payloads is irrelevant:
-// they are rejected requests, not the hot path.
+// decoder. Double-decoding uncommon fallback payloads is acceptable.
 //
 // Scope (deliberate, per the validated design): top-level single-map payloads
 // only. Batch format, array format, row format, and payloads for deployments
@@ -449,7 +446,7 @@ func (d *MessagePackDecoder) decodeValueColumnTyped(dec *msgpack.Decoder, n int)
 				class = clsBool
 				bools = make([]bool, n)
 			default:
-				// bin, nested array/map, ext — generic path rejects.
+				// Binary falls back to generic; nested array/map and ext remain rejected.
 				return nil, nil, 0, false
 			}
 		}
