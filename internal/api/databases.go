@@ -507,6 +507,11 @@ func (h *DatabasesHandler) handleListMeasurements(c *fiber.Ctx) error {
 			"error": fmt.Sprintf("invalid database name %q", name),
 		})
 	}
+	if storage.IsReservedRootDir(name) {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"error": "Database '" + name + "' not found",
+		})
+	}
 
 	// Gate on the resolved database, the same bar `SHOW TABLES FROM db`
 	// applies. Checked AFTER name validation so an invalid name is a 400
