@@ -429,6 +429,13 @@ predate that fix and #978.
 
 ## Bug fixes
 
+### Compaction subprocess threads respect the license core budget ([#1036](https://github.com/Basekick-Labs/arc/issues/1036))
+
+The licensed core budget is now divided between the main process and the
+configured maximum number of concurrent compaction subprocesses. Each
+subprocess's DuckDB thread count is clamped to its share, while lower explicit
+thread settings remain unchanged.
+
 ## Experimental arcx Arrow IPC streams signal writer panics ([#846](https://github.com/Basekick-Labs/arc/issues/846))
 
 When the experimental arcx Arrow IPC stream writer panics, the response now

@@ -53,6 +53,7 @@ func TestApplyLicenseCoreLimits_UnlimitedIsNoOp(t *testing.T) {
 	for _, maxCores := range []int{0, -1} {
 		withCores(t, 64, 2)
 		cfg := baseConfig()
+		cfg.Compaction.Threads = 7
 		before := runtime.GOMAXPROCS(0)
 
 		applyLicenseCoreLimits(&license.License{MaxCores: maxCores}, cfg)
@@ -63,9 +64,43 @@ func TestApplyLicenseCoreLimits_UnlimitedIsNoOp(t *testing.T) {
 		if cfg.Ingest.FlushWorkers != 8 {
 			t.Errorf("MaxCores=%d: FlushWorkers = %d, want 8", maxCores, cfg.Ingest.FlushWorkers)
 		}
+		if cfg.Compaction.Threads != 7 {
+			t.Errorf("MaxCores=%d: Compaction.Threads = %d, want 7", maxCores, cfg.Compaction.Threads)
+		}
 		if got := runtime.GOMAXPROCS(0); got != before {
 			t.Errorf("MaxCores=%d: GOMAXPROCS = %d, want %d (unlimited licence must not pin it)", maxCores, got, before)
 		}
+	}
+}
+
+func TestApplyLicenseCoreLimits_CompactionThreadsUseLicensedShare(t *testing.T) {
+	cases := []struct {
+		name          string
+		licensedCores int
+		maxConcurrent int
+		threads       int
+		want          int
+	}{
+		{"default concurrency", 4, 0, 32, 1},
+		{"configured concurrency", 8, 4, 32, 1},
+		{"minimum one thread", 2, 4, 32, 1},
+		{"preserve lower explicit value", 8, 1, 2, 2},
+		{"preserve value below licensed share", 64, 2, 8, 8},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			withCores(t, 64, 64)
+			cfg := baseConfig()
+			cfg.Compaction.MaxConcurrent = c.maxConcurrent
+			cfg.Compaction.Threads = c.threads
+
+			applyLicenseCoreLimits(&license.License{MaxCores: c.licensedCores}, cfg)
+
+			if cfg.Compaction.Threads != c.want {
+				t.Errorf("licensed=%d max_concurrent=%d configured_threads=%d: Compaction.Threads = %d, want %d",
+					c.licensedCores, c.maxConcurrent, c.threads, cfg.Compaction.Threads, c.want)
+			}
+		})
 	}
 }
 
