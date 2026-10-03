@@ -436,6 +436,12 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### Delete WHERE validation no longer rejects keywords inside literals ([#834](https://github.com/Basekick-Labs/arc/issues/834))
+
+Delete filters such as `host = 'drop'` and `note = 'a;b--c'` are now accepted as data. Validation masks plain, escape-string, and dollar-quoted literals before scanning for forbidden SQL keywords, punctuation, prefixes, and file-I/O functions, while still rejecting the same syntax outside literals.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#937](https://github.com/Basekick-Labs/arc/pull/937).
+
 ### A node restored with an empty data disk never got its own files back, and reconciliation could then delete them everywhere ([#959](https://github.com/Basekick-Labs/arc/issues/959), [#961](https://github.com/Basekick-Labs/arc/pull/961))
 
 On a per-node-storage cluster with file replication, the file puller assumed
