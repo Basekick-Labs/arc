@@ -75,6 +75,10 @@ type Metrics struct {
 
 	// Arrow buffer metrics
 	bufferRecordsBuffered atomic.Int64
+	bufferBytesBuffered   atomic.Int64
+	bufferOldestAgeNS     atomic.Int64
+	bufferMemoryLimit     atomic.Int64
+	bufferMemoryPressure  atomic.Int64
 	bufferRecordsWritten  atomic.Int64
 	bufferFlushesTotal    atomic.Int64
 	bufferErrorsTotal     atomic.Int64
@@ -424,11 +428,21 @@ func (m *Metrics) IncQueryClientDisconnect(path string) {
 
 // Buffer Metrics
 func (m *Metrics) SetBufferRecordsBuffered(count int64) { m.bufferRecordsBuffered.Store(count) }
-func (m *Metrics) SetBufferRecordsWritten(count int64)  { m.bufferRecordsWritten.Store(count) }
-func (m *Metrics) SetBufferFlushes(count int64)         { m.bufferFlushesTotal.Store(count) }
-func (m *Metrics) SetBufferErrors(count int64)          { m.bufferErrorsTotal.Store(count) }
-func (m *Metrics) IncBufferFlushFailures()              { m.bufferFlushFailures.Add(1) }
-func (m *Metrics) SetBufferQueueDepth(depth int64)      { m.bufferQueueDepth.Store(depth) }
+func (m *Metrics) SetBufferBytesBuffered(bytes int64)   { m.bufferBytesBuffered.Store(bytes) }
+func (m *Metrics) SetBufferOldestAge(age time.Duration) { m.bufferOldestAgeNS.Store(int64(age)) }
+func (m *Metrics) SetBufferMemoryLimit(bytes int64)     { m.bufferMemoryLimit.Store(bytes) }
+func (m *Metrics) SetBufferMemoryPressure(pressure bool) {
+	if pressure {
+		m.bufferMemoryPressure.Store(1)
+	} else {
+		m.bufferMemoryPressure.Store(0)
+	}
+}
+func (m *Metrics) SetBufferRecordsWritten(count int64) { m.bufferRecordsWritten.Store(count) }
+func (m *Metrics) SetBufferFlushes(count int64)        { m.bufferFlushesTotal.Store(count) }
+func (m *Metrics) SetBufferErrors(count int64)         { m.bufferErrorsTotal.Store(count) }
+func (m *Metrics) IncBufferFlushFailures()             { m.bufferFlushFailures.Add(1) }
+func (m *Metrics) SetBufferQueueDepth(depth int64)     { m.bufferQueueDepth.Store(depth) }
 
 // Storage Metrics
 func (m *Metrics) IncStorageWrites()                { m.storageWritesTotal.Add(1) }
@@ -682,12 +696,16 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"query_client_disconnects_sql_json_total":   m.queryDisconnectsSQLJSON.Load(),
 
 		// Buffer
-		"buffer_records_buffered":     m.bufferRecordsBuffered.Load(),
-		"buffer_records_written":      m.bufferRecordsWritten.Load(),
-		"buffer_flushes_total":        m.bufferFlushesTotal.Load(),
-		"buffer_errors_total":         m.bufferErrorsTotal.Load(),
-		"buffer_flush_failures_total": m.bufferFlushFailures.Load(),
-		"buffer_queue_depth":          m.bufferQueueDepth.Load(),
+		"buffer_records_buffered":         m.bufferRecordsBuffered.Load(),
+		"buffer_bytes_buffered":           m.bufferBytesBuffered.Load(),
+		"buffer_oldest_unflushed_seconds": float64(m.bufferOldestAgeNS.Load()) / float64(time.Second),
+		"buffer_memory_limit_bytes":       m.bufferMemoryLimit.Load(),
+		"buffer_memory_pressure":          m.bufferMemoryPressure.Load(),
+		"buffer_records_written":          m.bufferRecordsWritten.Load(),
+		"buffer_flushes_total":            m.bufferFlushesTotal.Load(),
+		"buffer_errors_total":             m.bufferErrorsTotal.Load(),
+		"buffer_flush_failures_total":     m.bufferFlushFailures.Load(),
+		"buffer_queue_depth":              m.bufferQueueDepth.Load(),
 
 		// Storage
 		"storage_writes_total":      m.storageWritesTotal.Load(),
@@ -938,6 +956,22 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_buffer_records_buffered Records currently buffered\n"...)
 	b = append(b, "# TYPE arc_buffer_records_buffered gauge\n"...)
 	b = appendMetric(b, "arc_buffer_records_buffered", float64(m.bufferRecordsBuffered.Load()))
+
+	b = append(b, "# HELP arc_buffer_bytes_buffered Approximate bytes currently buffered or awaiting flush\n"...)
+	b = append(b, "# TYPE arc_buffer_bytes_buffered gauge\n"...)
+	b = appendMetric(b, "arc_buffer_bytes_buffered", float64(m.bufferBytesBuffered.Load()))
+
+	b = append(b, "# HELP arc_buffer_oldest_unflushed_seconds Age of the oldest buffered or in-flight flush batch\n"...)
+	b = append(b, "# TYPE arc_buffer_oldest_unflushed_seconds gauge\n"...)
+	b = appendMetric(b, "arc_buffer_oldest_unflushed_seconds", float64(m.bufferOldestAgeNS.Load())/float64(time.Second))
+
+	b = append(b, "# HELP arc_buffer_memory_limit_bytes Memory limit detected for the process; zero means unavailable\n"...)
+	b = append(b, "# TYPE arc_buffer_memory_limit_bytes gauge\n"...)
+	b = appendMetric(b, "arc_buffer_memory_limit_bytes", float64(m.bufferMemoryLimit.Load()))
+
+	b = append(b, "# HELP arc_buffer_memory_pressure Whether buffered bytes have reached 50 percent of the process memory limit\n"...)
+	b = append(b, "# TYPE arc_buffer_memory_pressure gauge\n"...)
+	b = appendMetric(b, "arc_buffer_memory_pressure", float64(m.bufferMemoryPressure.Load()))
 
 	b = append(b, "# HELP arc_buffer_records_written_total Records written to storage\n"...)
 	b = append(b, "# TYPE arc_buffer_records_written_total counter\n"...)
