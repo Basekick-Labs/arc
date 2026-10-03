@@ -3325,7 +3325,6 @@ func (b *ArrowBuffer) flushWorker(workerID int) {
 			flushCtx, flushCancel := b.newFlushContext()
 			// Error is already logged and recorded by flushRecordsAsync via
 			// markFlushFailure; the worker has nowhere to return it to.
-<<<<<<< HEAD
 			_ = b.flushTrackedTask(flushCtx, task)
 			flushCancel()
 		}
@@ -4853,7 +4852,6 @@ drain:
 			}
 			defer flushCancel()
 
-<<<<<<< HEAD
 			b.markFlushTaskInFlight(task)
 			if err := b.flushTrackedTask(flushCtx, task); err != nil {
 				mu.Lock()
