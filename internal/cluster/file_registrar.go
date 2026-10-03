@@ -124,8 +124,8 @@ DrainLoop:
 
 // RegisterFile implements ingest.FileRegistrar. Non-blocking: enqueues the
 // registration and returns immediately. If the queue is full, the entry is
-// dropped and a counter is incremented — peer replication will discover it on
-// the next anti-entropy scan (Phase 3+).
+// dropped and a counter is incremented; no automatic reconciliation currently
+// recovers the missing manifest entry.
 //
 // sha256 is a hex-encoded SHA-256 of the Parquet file bytes. The caller
 // (arrow_writer.go flush path) computes it on the in-memory buffer before the
@@ -150,7 +150,7 @@ func (r *CoordinatorFileRegistrar) RegisterFile(database, measurement, path stri
 			r.logger.Warn().
 				Str("path", path).
 				Int64("total_dropped", dropped).
-				Msg("File registrar queue full, dropping manifest entry (will be recovered by anti-entropy)")
+				Msg("File registrar queue full; cluster manifest entry dropped (no automatic recovery)")
 		}
 	}
 }
