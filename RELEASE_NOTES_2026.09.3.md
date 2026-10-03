@@ -429,6 +429,48 @@ predate that fix and #978.
 
 ## Bug fixes
 
+### A deferred flush now waits for a free worker instead of the next age sweep ([#1008](https://github.com/Basekick-Labs/arc/issues/1008))
+
+When the flush queue is full, Arc keeps the batch in its in-memory buffer rather
+than discarding it. Nothing then re-enqueued that buffer: it waited for the next
+write to the *same* measurement, for the age-based flush, or for shutdown. With
+ingest spread across many measurements, a buffer could sit while flush workers
+went idle.
+
+Arc now re-enqueues deferred buffers, oldest first, as soon as a worker frees a
+queue slot. Measured on a node with 150 measurements, one flush worker and a
+storage backend taking 1.5 s per write: before, records written stayed flat at
+16,800 for 48 seconds with an idle worker until the age trigger fired; after,
+they climb continuously and the worker stays saturated.
+
+Two new signals, both already present in `GetStats` as `total_flush_deferred` and
+`deferred_buffers`:
+
+- `arc_ingest_flush_deferred_total` — counter, incremented every time a flush
+  could not be queued. Under sustained backpressure that is close to once per
+  write to a hot measurement, so read the rate as saturation, not volume.
+- `arc_buffer_deferred_buffers` — gauge, the number of buffers currently holding
+  records no worker could take. This is the one to alert on; it should return to
+  zero within roughly one flush duration.
+
+**What this does not fix.** Deferred records are held in memory, and Arc does not
+bound that — deliberately. `ingest.max_buffer_size` is a *per-measurement* flush
+trigger, so worst-case held memory is roughly
+`active_measurements x max_buffer_size x bytes_per_record`, and a global cap low
+enough to prevent that would reject many-measurement workloads that work today.
+The knobs are yours: lowering `max_buffer_size` or `max_buffer_age_ms` makes
+flushes smaller and more frequent, at the cost of more Parquet files for
+compaction to merge. Better signals for deciding that are tracked in
+[#1025](https://github.com/Basekick-Labs/arc/issues/1025).
+The drain also competes with ordinary writes for a freed slot, and a writer
+already holding its shard lock wins, so under *sustained* saturation a cold
+deferred buffer can still fall through to the age sweep — the guarantee is that
+it no longer needs an idle system to be picked up, not that it is always first.
+On a cluster reader, which applies replicated entries into its own buffer for
+query freshness, deferrals drain the same way but the reader cannot push back on
+the replication stream; see #1025.
+
+
 ### Ingestion retains buffered batches when the flush queue is full ([#966](https://github.com/Basekick-Labs/arc/issues/966))
 
 A size-triggered flush used to extract the whole buffer and delete it, and only
@@ -442,12 +484,11 @@ Nothing is extracted now unless it has somewhere to go. Records that cannot be
 queued stay in the in-memory buffer, and the send happens under the shard lock,
 so the decision is atomic with respect to the buffer.
 
-A retained buffer is flushed by the next write to the same measurement, by the
-age-based flush, or by shutdown — so with a long `ingest.max_buffer_age_ms` it
-can sit in memory for up to that interval after the queue drains. There is no
-cap on retained rows yet, and nothing actively drains a deferred buffer while
-workers are idle; both are tracked in
-[#1008](https://github.com/Basekick-Labs/arc/issues/1008). A sampled warning and
+A retained buffer is flushed as soon as a flush worker frees a queue slot (see
+the next entry), by the next write to the same measurement, by the age-based
+flush, or by shutdown. How many records a node retains is bounded by your
+`ingest.max_buffer_size` and `ingest.max_buffer_age_ms` settings rather than by a
+cap Arc applies — see the note on the drain below. A sampled warning and
 the new `arc_ingest_flush_deferred_total` metric report the condition that used
 to be a silent drop, so it is visible rather than inferred.
 
