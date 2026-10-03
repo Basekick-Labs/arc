@@ -181,6 +181,26 @@ func applyLicenseCoreLimits(lic *license.License, cfg *config.Config) {
 		cfg.Database.ThreadCount = lic.MaxCores
 	}
 
+	// Each compaction subprocess is a separate process, so the main process's
+	// GOMAXPROCS and DuckDB limits cannot constrain its DuckDB threads. Reserve
+	// one share for the main process and divide the licensed core budget across
+	// it and the maximum number of concurrent compaction subprocesses. Config
+	// Load resolves a zero max_concurrent to its default of two; keep that
+	// behavior for callers that construct Config directly as well.
+	maxConcurrent := cfg.Compaction.MaxConcurrent
+	if maxConcurrent <= 0 {
+		maxConcurrent = 2
+	}
+	licensedCompactionThreads := max(1, lic.MaxCores/(maxConcurrent+1))
+	if cfg.Compaction.Threads <= 0 || cfg.Compaction.Threads > licensedCompactionThreads {
+		cfg.Compaction.Threads = licensedCompactionThreads
+		log.Info().
+			Int("licensed_cores", lic.MaxCores).
+			Int("max_concurrent", maxConcurrent).
+			Int("compaction_threads", licensedCompactionThreads).
+			Msg("License core limit applied to compaction subprocess threads")
+	}
+
 	if cfg.Ingest.FlushWorkers > lic.MaxCores {
 		cfg.Ingest.FlushWorkers = lic.MaxCores
 		log.Info().
