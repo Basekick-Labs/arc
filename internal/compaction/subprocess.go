@@ -522,7 +522,9 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 	}
 
 	// Non-recoverable errors - don't waste time retrying
-	if strings.Contains(stderrLower, "permission denied") ||
+	if strings.Contains(errLower, "no files found that match") ||
+		strings.Contains(stderrLower, "no files found that match") ||
+		strings.Contains(stderrLower, "permission denied") ||
 		strings.Contains(stderrLower, "no such file") ||
 		strings.Contains(stderrLower, "access denied") ||
 		strings.Contains(stderrLower, "not found") {
