@@ -55,11 +55,12 @@ func TestManifestSupersedesUsesContentAndVersionTogether(t *testing.T) {
 }
 
 type issue798BlockingFetcher struct {
-	started chan struct{}
-	release chan struct{}
-	calls   atomic.Int64
-	oldBody []byte
-	newBody []byte
+	started  chan struct{}
+	release  chan struct{}
+	calls    atomic.Int64
+	oldBody  []byte
+	newBody  []byte
+	firstErr error
 }
 
 func (f *issue798BlockingFetcher) Fetch(
@@ -78,6 +79,9 @@ func (f *issue798BlockingFetcher) Fetch(
 		case <-f.release:
 		case <-ctx.Done():
 			return 0, ctx.Err()
+		}
+		if f.firstErr != nil {
+			return 0, f.firstErr
 		}
 	}
 
@@ -122,10 +126,11 @@ func TestPullerUpdatedVersionIsNotLostIssue798(t *testing.T) {
 
 	backend := newFakeBackend()
 	fetcher := &issue798BlockingFetcher{
-		started: make(chan struct{}),
-		release: make(chan struct{}),
-		oldBody: oldBody,
-		newBody: newBody,
+		started:  make(chan struct{}),
+		release:  make(chan struct{}),
+		oldBody:  oldBody,
+		newBody:  newBody,
+		firstErr: ErrChecksumMismatch,
 	}
 
 	p := newTestPuller(
@@ -138,6 +143,10 @@ func TestPullerUpdatedVersionIsNotLostIssue798(t *testing.T) {
 			ok:     true,
 		},
 	)
+	current := *oldEntry
+	p.cfg.ManifestEntry = func(string) (raft.FileEntry, bool) {
+		return current, true
+	}
 
 	var releaseOnce sync.Once
 	releaseFirst := func() {
@@ -150,7 +159,10 @@ func TestPullerUpdatedVersionIsNotLostIssue798(t *testing.T) {
 	})
 
 	p.Start(context.Background())
-	p.Enqueue(oldEntry)
+	p.markCatchUp(path)
+	if result := p.enqueue(oldEntry, enqueueSourceCatchUp); result != enqueueResultEnqueued {
+		t.Fatalf("initial catch-up enqueue result: %v", result)
+	}
 
 	// Synchronize on the first fetch actually being in progress.
 	// No timing guesses or sleeps are needed to trigger the race.
@@ -162,6 +174,7 @@ func TestPullerUpdatedVersionIsNotLostIssue798(t *testing.T) {
 
 	// Same path, new manifest version, different checksum, same size.
 	// The FSM content-change callback forces this refresh.
+	current = newEntry
 	p.EnqueueContentChanged(&newEntry)
 	releaseFirst()
 
@@ -180,6 +193,9 @@ func TestPullerUpdatedVersionIsNotLostIssue798(t *testing.T) {
 
 	if stats["inflight_count"] != 0 {
 		t.Fatalf("puller did not finish: stats=%v", stats)
+	}
+	if stats["failed"] != 0 || stats["catchup_failed"] != 0 {
+		t.Fatalf("superseded checksum mismatch was counted as a failure: stats=%v", stats)
 	}
 
 	actual, err := backend.Read(context.Background(), path)

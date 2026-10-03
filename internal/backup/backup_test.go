@@ -139,7 +139,7 @@ func TestCopyDataFiles_StreamsMultipleFiles(t *testing.T) {
 		TotalFiles: int64(len(files)),
 	}
 
-	if err := m.copyDataFiles(ctx, backupID, files, progress); err != nil {
+	if err := m.copyDataFiles(ctx, backupID, files, progress, &skipTally{}); err != nil {
 		t.Fatalf("copyDataFiles failed: %v", err)
 	}
 
@@ -204,7 +204,7 @@ func TestCopyDataFiles_SkipsFailedFiles(t *testing.T) {
 	}
 
 	// Should not return error — an isolated unreadable file is skipped
-	if err := m.copyDataFiles(ctx, backupID, files, progress); err != nil {
+	if err := m.copyDataFiles(ctx, backupID, files, progress, &skipTally{}); err != nil {
 		t.Fatalf("copyDataFiles should not fail on individual file errors: %v", err)
 	}
 
@@ -253,15 +253,16 @@ func TestCopyDataFiles_SkipRatioExceeded(t *testing.T) {
 	}
 
 	progress := &Progress{Operation: "backup", TotalFiles: int64(len(files))}
-	if err := m.copyDataFiles(ctx, "bkid", files, progress); err != nil {
+	if err := m.copyDataFiles(ctx, "bkid", files, progress, &skipTally{}); err != nil {
 		t.Fatalf("copyDataFiles should record skips, not fail: %v", err)
 	}
 	// The ratio is evaluated once over the whole backup, not per copy group.
-	err = m.checkSkipRatio(progress, len(files))
+	err = m.checkSkipRatio(progress, len(files), nil)
 	if err == nil {
 		t.Fatal("expected failure when the skip ratio is exceeded, got nil (partial backup would report success)")
 	}
-	if !strings.Contains(err.Error(), "source storage may be degraded") {
+	// The message gives the cause's count and leaves out the cause with none.
+	if !strings.Contains(err.Error(), "5 could not be read at copy time") || strings.Contains(err.Error(), "source keys longer") {
 		t.Errorf("unexpected error: %v", err)
 	}
 	// The count must still be recorded even though the backup failed.
@@ -324,7 +325,7 @@ func TestCopyDataFiles_TempFileFailureIsFatal(t *testing.T) {
 	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "does-not-exist"))
 
 	progress := &Progress{Operation: "backup", TotalFiles: int64(len(files))}
-	err = m.copyDataFiles(ctx, "bkid", files, progress)
+	err = m.copyDataFiles(ctx, "bkid", files, progress, &skipTally{})
 
 	if err == nil {
 		t.Fatalf("expected fatal error when temp files cannot be created; got nil with %d/%d files copied",
@@ -364,7 +365,7 @@ func TestCopyDataFiles_TempWriteFailureIsFatalNotSkipped(t *testing.T) {
 	}
 
 	progress := &Progress{Operation: "backup", TotalFiles: 1}
-	err = m.copyDataFiles(ctx, "bkid", []storage.ObjectInfo{{Path: srcPath, Size: 10}}, progress)
+	err = m.copyDataFiles(ctx, "bkid", []storage.ObjectInfo{{Path: srcPath, Size: 10}}, progress, &skipTally{})
 	if err == nil {
 		t.Fatal("expected fatal temp-write failure")
 	}
@@ -403,10 +404,10 @@ func TestCopyDataFiles_AllFilesSkippedIsFatal(t *testing.T) {
 	}
 
 	progress := &Progress{Operation: "backup", TotalFiles: int64(len(files))}
-	if err := m.copyDataFiles(ctx, "bkid", files, progress); err != nil {
+	if err := m.copyDataFiles(ctx, "bkid", files, progress, &skipTally{}); err != nil {
 		t.Fatalf("copyDataFiles should record skips, not fail: %v", err)
 	}
-	if err := m.checkSkipRatio(progress, len(files)); err == nil {
+	if err := m.checkSkipRatio(progress, len(files), nil); err == nil {
 		t.Fatal("expected error when every file is skipped, got nil (empty backup would report success)")
 	}
 }
@@ -453,10 +454,11 @@ func TestCheckSkipRatio_SpansAllFileGroups(t *testing.T) {
 	}
 
 	progress := &Progress{Operation: "backup", TotalFiles: int64(len(dataFiles) + len(metaFiles))}
-	if err := m.copyDataFiles(ctx, "bkid", dataFiles, progress); err != nil {
+	tally := &skipTally{} // one tally across both groups, as CreateBackup does
+	if err := m.copyDataFiles(ctx, "bkid", dataFiles, progress, tally); err != nil {
 		t.Fatalf("data files: %v", err)
 	}
-	if err := m.copyDataFiles(ctx, "bkid", metaFiles, progress); err != nil {
+	if err := m.copyDataFiles(ctx, "bkid", metaFiles, progress, tally); err != nil {
 		t.Fatalf("iceberg metadata: %v", err)
 	}
 
@@ -464,7 +466,7 @@ func TestCheckSkipRatio_SpansAllFileGroups(t *testing.T) {
 	if progress.SkippedFiles != 1 {
 		t.Errorf("SkippedFiles = %d, want 1 (a later group must not erase earlier skips)", progress.SkippedFiles)
 	}
-	if err := m.checkSkipRatio(progress, len(dataFiles)+len(metaFiles)); err != nil {
+	if err := m.checkSkipRatio(progress, len(dataFiles)+len(metaFiles), nil); err != nil {
 		t.Errorf("1 stale entry out of 33 files must not fail the backup: %v", err)
 	}
 }
@@ -499,7 +501,7 @@ func TestCopyDataFiles_PartialSkipRecordsCount(t *testing.T) {
 	}
 
 	progress := &Progress{Operation: "backup", TotalFiles: int64(len(files))}
-	if err := m.copyDataFiles(ctx, "bkid", files, progress); err != nil {
+	if err := m.copyDataFiles(ctx, "bkid", files, progress, &skipTally{}); err != nil {
 		t.Fatalf("partial skip should not fail the backup: %v", err)
 	}
 
@@ -538,7 +540,7 @@ func TestCopyDataFiles_ProgressUsesActualBytes(t *testing.T) {
 	files := []storage.ObjectInfo{{Path: path, Size: 999}}
 
 	progress := &Progress{Operation: "backup", TotalFiles: 1}
-	if err := m.copyDataFiles(ctx, "bkid", files, progress); err != nil {
+	if err := m.copyDataFiles(ctx, "bkid", files, progress, &skipTally{}); err != nil {
 		t.Fatalf("copyDataFiles failed: %v", err)
 	}
 

@@ -91,6 +91,22 @@ const (
 	enqueueResultDropped
 )
 
+// maxContentMismatchPeers bounds how many candidate peers one attempt will ask
+// after they reject on checksum. Rejection at the ack header costs only a
+// round trip, but rejection on the computed digest costs a full body transfer,
+// and the puller cannot tell which it will be before asking — so the fall
+// through has to be bounded by peer count rather than by bytes.
+//
+// Three is enough for the case this exists for: a stale OriginNodeID first in
+// the candidate list with a healthy replica behind it, which succeeds on the
+// second ask. The attempt loop is unchanged, so the worst case for an entry no
+// peer can serve is maxContentMismatchPeers * RetryMaxAttempts full transfers
+// — 9 at the defaults, against 3 before #999. That is the price of not having
+// one stale peer strand a file permanently, and it is paid only when every
+// peer asked disagrees with the manifest, which the
+// checksum_mismatch_exhausted counter reports.
+const maxContentMismatchPeers = 3
+
 type pullRequest struct {
 	entry  *raft.FileEntry
 	source enqueueSource
@@ -285,10 +301,15 @@ type Puller struct {
 	totalDropped           atomic.Int64 // queue full
 	totalSkippedGone       atomic.Int64 // deleted from the manifest while queued or in flight
 	totalChecksumMismatch  atomic.Int64 // bytes didn't match manifest SHA256
-	totalPeerLookupFailure atomic.Int64 // no candidate peers available
-	totalBadOffsetServer   atomic.Int64 // server rejected resume offset (AckCodeBadOffset)
-	totalBadOffsetBackend  atomic.Int64 // backend can't append (ErrResumeNotSupported)
-	totalInvalidPath       atomic.Int64 // entry path is permanently unusable (storage.ErrInvalidPath)
+	// Every candidate peer disagreed with the manifest's SHA256 for one entry.
+	// Distinct from totalChecksumMismatch, which counts per-peer rejections.
+	totalChecksumMismatchExhausted atomic.Int64
+	totalPeerLookupFailure         atomic.Int64 // no candidate peers available
+	totalBadOffsetServer           atomic.Int64 // server rejected resume offset (AckCodeBadOffset)
+	// Backend can't append (ErrResumeNotSupported). Kept because staging and
+	// append support are independent interfaces by contract.
+	totalBadOffsetBackend atomic.Int64 // backend can't append (ErrResumeNotSupported)
+	totalInvalidPath      atomic.Int64 // entry path is permanently unusable (storage.ErrInvalidPath)
 
 	// Catch-up metrics (Phase 3). Populated by RunCatchUp and read via Stats.
 	catchupStartedAt     atomic.Int64 // unix seconds; 0 if never started
@@ -336,6 +357,26 @@ type Puller struct {
 	// unbounded map on a path an adversary with Raft write access could feed is
 	// not. Shares inflightMu with the sets above.
 	quarantinedPaths map[string]struct{}
+
+	// staleKeptPaths holds paths whose pull exhausted every candidate on
+	// checksum and whose local copy was therefore left in place. The presence
+	// check consults it once per path to force one re-pull attempt.
+	//
+	// Needed because presence is size-only (presentAtSize). Before #999 an
+	// exhausted pull deleted the local file, and that delete was what
+	// guaranteed a retry: the next arrival found nothing and re-enqueued.
+	// Keeping the file is better for availability but, for a rewrite that did
+	// not change the file's length, it makes the local copy read as present
+	// forever — turning a self-healing state into a permanent one. Not
+	// reachable today, because a same-size local file is skipped before any
+	// pull can mismatch, but it goes live the moment presence gains a content
+	// check, and the exhausted log line promises a retry either way.
+	//
+	// Bounded by maxQuarantineLogPaths, like quarantinedPaths: past the cap no
+	// new path is remembered, which degrades to the pre-#999 "kept forever"
+	// shape rather than growing a map an adversary with Raft write access
+	// could feed. Shares inflightMu with the sets above.
+	staleKeptPaths map[string]struct{}
 
 	// catchupFailed / catchupDropped count failures and drops scoped to the
 	// catch-up batch only. FullyCaughtUp uses these (not the cumulative
@@ -412,6 +453,7 @@ func New(cfg Config) (*Puller, error) {
 		catchupFailedPaths:  make(map[string]struct{}),
 		catchupDroppedPaths: make(map[string]struct{}),
 		quarantinedPaths:    make(map[string]struct{}),
+		staleKeptPaths:      make(map[string]struct{}),
 		catchupFinished:     make(chan struct{}),
 		logger:              cfg.Logger.With().Str("component", "file-puller").Logger(),
 	}, nil
@@ -540,6 +582,31 @@ func (p *Puller) markQuarantinedForLog(path string) bool {
 		return true
 	}
 	p.quarantinedPaths[path] = struct{}{}
+	return true
+}
+
+// markStaleKept remembers that path's local copy was left in place after every
+// candidate rejected it on checksum, so the next presence check pulls it again
+// instead of trusting its size. No-op past maxQuarantineLogPaths.
+func (p *Puller) markStaleKept(path string) {
+	p.inflightMu.Lock()
+	defer p.inflightMu.Unlock()
+	if len(p.staleKeptPaths) >= maxQuarantineLogPaths {
+		return
+	}
+	p.staleKeptPaths[path] = struct{}{}
+}
+
+// takeStaleKept reports whether path was left in place by an exhausted pull,
+// clearing the marker so the forced re-pull happens once per exhaustion rather
+// than on every arrival. A pull that exhausts again re-marks it.
+func (p *Puller) takeStaleKept(path string) bool {
+	p.inflightMu.Lock()
+	defer p.inflightMu.Unlock()
+	if _, ok := p.staleKeptPaths[path]; !ok {
+		return false
+	}
+	delete(p.staleKeptPaths, path)
 	return true
 }
 
@@ -700,6 +767,7 @@ func (p *Puller) forgetCatchUpPathLocked(path string) (hadFailure, hadDrop, hadT
 	p.removeCatchUpTagLocked(path)
 	delete(p.quarantinedPaths, path)
 	delete(p.refreshPending, path)
+	delete(p.staleKeptPaths, path)
 	return hadFailure, hadDrop, hadTag
 }
 
@@ -896,6 +964,7 @@ func (p *Puller) Stop() {
 		Int64("total_failed", p.totalFailed.Load()).
 		Int64("total_dropped", p.totalDropped.Load()).
 		Int64("total_checksum_mismatch", p.totalChecksumMismatch.Load()).
+		Int64("total_checksum_mismatch_exhausted", p.totalChecksumMismatchExhausted.Load()).
 		Msg("File puller stopped")
 }
 
@@ -1083,6 +1152,7 @@ func (p *Puller) Stats() map[string]int64 {
 		"failed":                             p.totalFailed.Load(),
 		"dropped":                            p.totalDropped.Load(),
 		"checksum_mismatch":                  p.totalChecksumMismatch.Load(),
+		"checksum_mismatch_exhausted":        p.totalChecksumMismatchExhausted.Load(),
 		"peer_lookup_failure":                p.totalPeerLookupFailure.Load(),
 		"bad_offset_server":                  p.totalBadOffsetServer.Load(),
 		"bad_offset_backend":                 p.totalBadOffsetBackend.Load(),
@@ -1215,6 +1285,10 @@ func (p *Puller) CatchUpStatus() map[string]int64 {
 		// Pulls abandoned because their entry left the manifest: the one reason a
 		// catchup_inflight drop has no matching pulled/failed (#795).
 		"skipped_gone": p.totalSkippedGone.Load(),
+		// Why a red gate may not go green on its own: an exhausted entry sets
+		// failed -> catchupFailed, and no retry can fix it until some peer
+		// holds the checksum the manifest names.
+		"checksum_mismatch_exhausted": p.totalChecksumMismatchExhausted.Load(),
 
 		// Catch-up-batch-scoped counters (added in 26.06.1 for the query
 		// gate). Non-zero means the gate is closed for a reason FullyCaughtUp
@@ -1333,10 +1407,22 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 		// (size matches the manifest). A partial file (size < SizeBytes) should
 		// fall through so pullOnce can resume from the byte offset.
 		localSize, statErr := p.statLocal(entry.Path)
-		if presentAtSize(localSize, statErr, entry.SizeBytes) && !request.force {
-			p.totalSkippedLocal.Add(1)
-			succeeded = true // File is already here — same as a fresh pull from the gate's perspective.
-			return
+		if presentAtSize(localSize, statErr, entry.SizeBytes) {
+			// One exception: a copy an exhausted pull deliberately left in
+			// place. Presence is size-only, so a rewrite that did not change
+			// the length makes such a copy read as present forever, and the
+			// delete that used to guarantee a retry is gone (#999). Force one
+			// pull; if it exhausts again it re-marks itself.
+			if p.takeStaleKept(entry.Path) {
+				log.Debug().
+					Str("path", entry.Path).
+					Int64("local_size", localSize).
+					Msg("Local copy matches the manifest size but an earlier pull found no peer holding its checksum; pulling again rather than trusting the size")
+			} else if !request.force {
+				p.totalSkippedLocal.Add(1)
+				succeeded = true // File is already here — same as a fresh pull from the gate's perspective.
+				return
+			}
 		}
 		if errors.Is(statErr, storage.ErrInvalidPath) {
 			// Permanent (#747). This is the first backend call an entry makes,
@@ -1385,8 +1471,10 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 		var lastErr error
 		var lastPeer string
 		pulledFromPeer := false
-		checksumMismatch := false
+		contentMismatches := 0
+		peersTried := 0
 		for _, peerAddr := range peers {
+			peersTried++
 			if p.ctx.Err() != nil {
 				return
 			}
@@ -1435,14 +1523,45 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 			if errors.Is(err, context.Canceled) {
 				return
 			}
-			// Checksum mismatch is a data-integrity signal, not a "try next
-			// peer" signal. A peer served bytes that didn't match the manifest
-			// SHA-256 — corrupt manifest, corrupt peer, or adversarial peer.
-			// Do NOT fall through to other peers; let the attempt-level retry
-			// handle it (delete-and-redownload semantics already in pullOnce).
+			// A checksum mismatch says "THIS peer cannot serve the generation
+			// the manifest names", not "the content is unavailable" — so it
+			// falls through to the next candidate like any other per-peer
+			// failure (#999).
+			//
+			// This reverses the original decision, which broke out of the loop
+			// on the theory that falling through would "pull-and-corrupt from
+			// every healthy peer in turn". That theory was wrong: every
+			// candidate's bytes are verified against the manifest SHA-256
+			// before they are accepted, so no bad bytes can ever be trusted no
+			// matter how many peers are asked. Breaking instead made one stale
+			// peer fatal — and the stale peer is routinely the FIRST one tried,
+			// because the resolver puts OriginNodeID first and a rewrite
+			// preserves the original origin (internal/api/delete.go) while
+			// only the rewriting node has the new bytes. Re-resolving on the
+			// next attempt yields the same ordering, so the attempt-level
+			// retry this used to defer to could never rescue it.
+			//
+			// What falling through does cost is bandwidth: unlike a
+			// file-not-on-peer ack, a mismatch is only known after the body
+			// has transferred. Hence the bound below.
 			if errors.Is(err, ErrChecksumMismatch) {
-				checksumMismatch = true
-				break
+				contentMismatches++
+				// Debug, not Warn: a peer that has not yet caught up to a
+				// rewrite rejects routinely and the next candidate serves the
+				// entry. The operator-visible event is the exhausted case
+				// below, logged at Error.
+				log.Debug().
+					Err(err).
+					Str("path", entry.Path).
+					Str("peer", peerAddr).
+					Str("manifest_sha256", entry.SHA256).
+					Int("attempt", attempt).
+					Int("content_mismatches", contentMismatches).
+					Msg("Peer does not hold the checksum the manifest names; trying next candidate")
+				if contentMismatches >= maxContentMismatchPeers {
+					break
+				}
+				continue
 			}
 			// File-not-on-peer and transport errors both fall through to the
 			// next candidate. Log at Debug so operators can see the fallback
@@ -1463,20 +1582,46 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 			Err(lastErr).
 			Str("path", entry.Path).
 			Str("last_peer", lastPeer).
-			Int("peers_tried", len(peers)).
+			Int("peers_tried", peersTried).
 			Int("attempt", attempt).
 			Int("max_attempts", p.cfg.RetryMaxAttempts).
-			Bool("checksum_mismatch", checksumMismatch).
+			Int("content_mismatches", contentMismatches).
 			Msg("File pull attempt failed on all candidate peers")
+
+		// Did EVERY candidate reject on checksum? Requires that the bound did
+		// not cut the loop short — otherwise unasked candidates, one of which
+		// may hold the entry, would be reported as having disagreed.
+		allCandidatesRejected := contentMismatches > 0 &&
+			contentMismatches == peersTried &&
+			peersTried == len(peers)
 
 		if attempt >= p.cfg.RetryMaxAttempts {
 			p.totalFailed.Add(1)
 			failed = true // Signal to processEntry's defer that THIS entry failed.
+			if allCandidatesRejected {
+				// Counted here rather than per attempt so the counter reads as
+				// "entries no reachable peer could serve" rather than as a
+				// multiple of RetryMaxAttempts. A mismatch on its own is NOT
+				// this: a peer whose FSM has not yet converged on a rewrite
+				// rejects now and serves the entry fine after the backoff,
+				// which is why the attempt loop is left alone and
+				// TestPullerChecksumMismatchDiscardsStagedAndRecoversOnRetry
+				// pins that recovery.
+				p.totalChecksumMismatchExhausted.Add(1)
+				p.markStaleKept(entry.Path)
+				log.Error().
+					Err(lastErr).
+					Str("path", entry.Path).
+					Int("peers_tried", peersTried).
+					Str("manifest_sha256", entry.SHA256).
+					Msg("No candidate peer holds the checksum the manifest names; any local copy is left in place and the entry will be retried by the next FSM callback or catch-up scan")
+				return
+			}
 			log.Error().
 				Err(lastErr).
 				Str("path", entry.Path).
 				Str("last_peer", lastPeer).
-				Int("peers_tried", len(peers)).
+				Int("peers_tried", peersTried).
 				Msg("File pull giving up after max attempts (will be retried by next FSM callback or catch-up scan)")
 			return
 		}
@@ -1542,7 +1687,16 @@ func (p *Puller) pullOnce(log zerolog.Logger, entry *raft.FileEntry, peerAddr st
 	if fetchErr != nil {
 		if errors.Is(fetchErr, ErrChecksumMismatch) {
 			p.totalChecksumMismatch.Add(1)
-			p.deleteFile(log, entry.Path)
+			// Discard only the unverified bytes, never the committed file.
+			// On a staging backend the failed WriteReader left the rejected
+			// bytes in the ".part" and never renamed, so the committed file is
+			// still the previous generation — readable, and the best copy this
+			// node has until some peer can serve the one the manifest names.
+			// Deleting it instead (as this did before #999) turned "serves
+			// stale rows" into "has no file", which the read path cannot even
+			// report as an error: it globs *.parquet, so the partition just
+			// returns fewer rows.
+			p.discardUnverified(log, entry.Path)
 		}
 		if errors.Is(fetchErr, ErrBadOffset) {
 			// Server rejected our resume offset — delete partial, retry from zero.
@@ -1583,9 +1737,11 @@ func (p *Puller) writeFileTail(ctx context.Context, entry *raft.FileEntry, r io.
 // chain over the tail. Returns (offset, hasher) on success, or (0, nil) if
 // there is no usable partial file (not found, too large, or hash failed).
 //
-// Note: for backends that do not implement AppendingBackend, writeFileTail will
-// return ErrResumeNotSupported when called with a non-zero offset. This is
-// intentional — the puller increments bad_offset_backend and retries from zero.
+// Note: a non-zero offset is only ever returned for a backend with a staging
+// area, and LocalBackend is both the only StagingInspector and the only
+// AppendingBackend — so writeFileTail's ErrResumeNotSupported branch is
+// unreachable in every shipping configuration. It is kept because the two
+// interfaces are independent by contract.
 //
 // statErr here can no longer be storage.ErrInvalidPath, and the (0, nil) return
 // is therefore not ambiguous between "no partial" and "unusable key": the same
@@ -1593,22 +1749,58 @@ func (p *Puller) writeFileTail(ctx context.Context, entry *raft.FileEntry, r io.
 // quarantines and returns before any of this runs (#747). The same invariant is
 // why deleteFile below cannot be called with an unusable key. Both are pinned
 // by a test asserting the backend sees no Delete for a quarantined entry.
+//
+// A resume is sized and hashed from the STAGED partial alone, never from a
+// committed file, and is refused outright when a committed file exists. The
+// refusal is what is load-bearing; sizing and hashing through the staging API
+// is defence in depth, since StatFile and ReadToAt fall back to the staging
+// file exactly when no committed file exists — the only state the refusal lets
+// through. Going through StagedSize/ReadStaged additionally means a committed
+// file appearing between the two calls cannot silently retarget the hash. StatFile prefers the committed object and only falls
+// back to the staging file, and ReadToAt does the same; writeFileTail, by
+// contrast, appends to the staging file (AppendReader). Sizing or hashing with
+// the StatFile/ReadToAt pair therefore hashes the prefix of one file and
+// appends the tail to a different one. Once a rejected fetch stops deleting the
+// committed copy (#999), that is reachable: a committed previous generation
+// shorter than the entry would be hashed as the "prefix", the new tail appended
+// to the staging file, and — whenever the old generation happens to be a byte
+// prefix of the new one — the combined digest VERIFIES and a tail-only file is
+// renamed into place. Same hazard statLocal guards on the presence side (#963).
 func (p *Puller) tryResumeFromPartial(log zerolog.Logger, entry *raft.FileEntry) (int64, hash.Hash) {
+	si, ok := p.cfg.Backend.(storage.StagingInspector)
+	if !ok {
+		// No staging area, so there is no partial to resume from. writeFileTail
+		// would reject a non-zero offset anyway (ErrResumeNotSupported).
+		return 0, nil
+	}
+
 	statCtx, statCancel := context.WithTimeout(p.ctx, 5*time.Second)
-	partial, statErr := p.cfg.Backend.StatFile(statCtx, entry.Path)
-	statCancel()
+	defer statCancel()
+	partial, statErr := si.StagedSize(statCtx, entry.Path)
 	if statErr != nil || partial <= 0 || partial >= entry.SizeBytes {
+		return 0, nil
+	}
+	// A committed file next to the partial means the partial is not a prefix of
+	// what this fetch is building — it belongs to some earlier, abandoned
+	// transfer. Pull from zero.
+	committed, existsErr := p.cfg.Backend.Exists(statCtx, entry.Path)
+	if existsErr != nil {
+		log.Debug().Err(existsErr).Str("path", entry.Path).
+			Msg("Could not confirm whether a committed file exists; pulling from zero rather than resuming")
+		return 0, nil
+	}
+	if committed {
 		return 0, nil
 	}
 
 	h := sha256.New()
 	hashCtx, hashCancel := context.WithTimeout(p.ctx, 30*time.Second)
-	hashErr := p.cfg.Backend.ReadToAt(hashCtx, entry.Path, h, 0)
+	hashErr := si.ReadStaged(hashCtx, entry.Path, h)
 	hashCancel()
 	if hashErr != nil {
 		log.Debug().Err(hashErr).Str("path", entry.Path).
 			Msg("Failed to hash partial file prefix; retrying from zero")
-		p.deleteFile(log, entry.Path)
+		p.discardUnverified(log, entry.Path)
 		return 0, nil
 	}
 
@@ -1621,13 +1813,50 @@ func (p *Puller) tryResumeFromPartial(log zerolog.Logger, entry *raft.FileEntry)
 }
 
 // deleteFile is a helper that deletes a file from the local backend, logging
-// a warning if the deletion fails. Used after checksum mismatches and bad offsets.
+// a warning if the deletion fails. Used after bad offsets.
+//
+// Note this removes the key's staged partial as well as the committed object
+// (LocalBackend.Delete does both since #744), which is why a caller that only
+// wants to discard unverified bytes must use discardUnverified instead.
 func (p *Puller) deleteFile(log zerolog.Logger, path string) {
 	delCtx, delCancel := context.WithTimeout(p.ctx, 5*time.Second)
 	if delErr := p.cfg.Backend.Delete(delCtx, path); delErr != nil {
 		log.Warn().Err(delErr).Str("path", path).Msg("Failed to delete file")
 	}
 	delCancel()
+}
+
+// discardUnverified throws away the bytes a rejected fetch wrote, without
+// touching a committed object that passed verification earlier.
+//
+// On a staging backend the rejected bytes are in the key's staged partial and
+// the committed object was never replaced, so discarding the staged partial is
+// exactly right: this node keeps serving the generation it already had.
+//
+// Backends with no staging area (S3, Azure) need no cleanup at all, and must
+// not get a Delete. They never commit the rejected bytes in the first place:
+// the puller always hands WriteReader a pipe, so the body is not seekable and
+// goes through spoolExact or the multipart uploader, both of which read one
+// byte past the declared length to confirm the source ended (expectEOF,
+// internal/storage/s3.go). pullOnce closes that pipe with the mismatch error,
+// so the confirming read returns the error rather than io.EOF, PutObject is
+// never sent and a multipart upload is aborted — leaving the previous
+// generation intact. Deleting the object here would therefore destroy exactly
+// the readable copy this function exists to protect.
+func (p *Puller) discardUnverified(log zerolog.Logger, path string) {
+	si, ok := p.cfg.Backend.(storage.StagingInspector)
+	if !ok {
+		log.Debug().Str("path", path).
+			Msg("Rejected fetch on a backend with no staging area; nothing was committed, so nothing to discard")
+		return
+	}
+	delCtx, delCancel := context.WithTimeout(p.ctx, 5*time.Second)
+	defer delCancel()
+	if delErr := si.DeleteStaged(delCtx, path); delErr != nil {
+		log.Warn().Err(delErr).Str("path", path).Msg("Failed to discard staged partial after a rejected fetch")
+		return
+	}
+	log.Debug().Str("path", path).Msg("Discarded staged partial after a rejected fetch; committed file left in place")
 }
 
 // sleepBackoff sleeps for an exponential backoff interval, honoring context
@@ -1646,9 +1875,20 @@ func (p *Puller) sleepBackoff(attempt int) {
 
 // ErrChecksumMismatch is returned by Fetcher implementations when the bytes
 // pulled from a peer don't match the expected SHA-256 from the manifest.
-// The puller tracks this as a distinct metric and deletes the partial local
-// file before retrying. Unlike ErrFileNotOnPeer, this error does NOT trigger
-// the multi-peer fallback — a corrupt body is a data integrity signal.
+//
+// Like ErrFileNotOnPeer, this DOES trigger the multi-peer fallback, bounded by
+// maxContentMismatchPeers. It says "this peer cannot serve the generation the
+// manifest names", which is a per-peer fact, not a per-content one: a rewrite
+// propagates through Raft before the bytes reach every replica, so a peer that
+// is merely behind rejects on checksum while a healthy replica next in the
+// candidate list serves the entry fine (#999).
+//
+// Asking more peers cannot cause bad bytes to be trusted — every candidate's
+// body is verified against the manifest SHA-256 before it is accepted — so the
+// only cost of the fallback is bandwidth, which the bound caps. The puller
+// tracks each rejection as a distinct metric, discards the unverified bytes
+// without touching the committed file (discardUnverified), and counts the
+// case where every candidate rejected separately.
 var ErrChecksumMismatch = errors.New("filereplication: checksum mismatch")
 
 // ErrFileNotOnPeer is returned by Fetcher implementations when a peer

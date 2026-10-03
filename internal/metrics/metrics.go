@@ -26,10 +26,21 @@ type Metrics struct {
 	httpLatencyCount   atomic.Int64
 
 	// Ingestion metrics
-	ingestRecordsTotal atomic.Int64
-	ingestBytesTotal   atomic.Int64
-	ingestBatchesTotal atomic.Int64
-	ingestErrorsTotal  atomic.Int64
+	ingestRecordsTotal  atomic.Int64
+	ingestBytesTotal    atomic.Int64
+	ingestBatchesTotal  atomic.Int64
+	ingestErrorsTotal   atomic.Int64
+	ingestFlushDeferred atomic.Int64
+	// bufferDeferredBuffers is a GAUGE: how many buffers are currently holding
+	// records that could not be handed to a flush worker. It is what the flush
+	// drainer acts on, so a value that stays non-zero while the queue has room
+	// means the drainer is not keeping up (or is wedged).
+	//
+	// Exported as arc_buffer_deferred_buffers, NOT arc_ingest_*: in this file
+	// arc_ingest_* is uniformly counters and arc_buffer_* holds the buffer-state
+	// gauges (arc_buffer_queue_depth, arc_buffer_records_buffered), which this
+	// sits beside and is published alongside.
+	bufferDeferredBuffers atomic.Int64
 
 	// MessagePack specific
 	msgpackRequestsTotal atomic.Int64
@@ -224,6 +235,18 @@ type Metrics struct {
 	// after the first bad file, including after the operator fixed it.
 	storageUnaddressableFiles atomic.Int64
 
+	// backupSkippedFiles is how many files the MOST RECENT backup inventoried
+	// but could not store (#977): unreadable at copy time, or a destination key
+	// over the storage key limit (#761). Spans every file group the backup
+	// copies (data, in-root Iceberg metadata, compaction state, outside-root
+	// warehouse), the same total the status endpoint reports as skipped_files;
+	// only the first two groups are named in skipped_sample, the others are
+	// named in the log. A gauge for the same reason as storageUnaddressableFiles: the next clean
+	// backup clears it. Set by every backup that finishes its copy phases,
+	// including one the skip ratio then fails; a backup that fails earlier
+	// leaves the previous value.
+	backupSkippedFiles atomic.Int64
+
 	// Cluster auth metrics (Enterprise only — mutated on every FSM apply
 	// of a token command). clusterAuthApplyTotal increments per applied
 	// command type so operators can see "create vs update vs revoke"
@@ -344,6 +367,10 @@ func (m *Metrics) IncIngestRecords(count int64) { m.ingestRecordsTotal.Add(count
 func (m *Metrics) IncIngestBytes(bytes int64)   { m.ingestBytesTotal.Add(bytes) }
 func (m *Metrics) IncIngestBatches()            { m.ingestBatchesTotal.Add(1) }
 func (m *Metrics) IncIngestErrors()             { m.ingestErrorsTotal.Add(1) }
+func (m *Metrics) IncIngestFlushDeferred()      { m.ingestFlushDeferred.Add(1) }
+
+// SetBufferDeferredBuffers publishes the current deferred-buffer count.
+func (m *Metrics) SetBufferDeferredBuffers(n int64) { m.bufferDeferredBuffers.Store(n) }
 
 // MessagePack Metrics
 func (m *Metrics) IncMsgPackRequests()           { m.msgpackRequestsTotal.Add(1) }
@@ -535,6 +562,13 @@ func (m *Metrics) SetStorageUnaddressableFiles(n int64) {
 	m.storageUnaddressableFiles.Store(n)
 }
 
+// SetBackupSkippedFiles records how many files the backup that just finished
+// its copy phases inventoried but could not store (#977). Called with 0 on a
+// clean run, so fixing the files clears the gauge.
+func (m *Metrics) SetBackupSkippedFiles(n int64) {
+	m.backupSkippedFiles.Store(n)
+}
+
 // Cluster Auth metrics — incremented from the FSM apply path on every
 // Token command. apply_* counts successful applies per type;
 // IncClusterAuthRejected counts applier-side validation refusals.
@@ -616,10 +650,12 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"http_latency_count":    m.httpLatencyCount.Load(),
 
 		// Ingestion
-		"ingest_records_total": m.ingestRecordsTotal.Load(),
-		"ingest_bytes_total":   m.ingestBytesTotal.Load(),
-		"ingest_batches_total": m.ingestBatchesTotal.Load(),
-		"ingest_errors_total":  m.ingestErrorsTotal.Load(),
+		"ingest_records_total":        m.ingestRecordsTotal.Load(),
+		"ingest_bytes_total":          m.ingestBytesTotal.Load(),
+		"ingest_batches_total":        m.ingestBatchesTotal.Load(),
+		"ingest_errors_total":         m.ingestErrorsTotal.Load(),
+		"ingest_flush_deferred_total": m.ingestFlushDeferred.Load(),
+		"buffer_deferred_buffers":     m.bufferDeferredBuffers.Load(),
 
 		// MessagePack
 		"msgpack_requests_total": m.msgpackRequestsTotal.Load(),
@@ -730,6 +766,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"cluster_local_delete_pending":                  m.clusterLocalDeletePending.Load(),
 		"compaction_manifests_parked_unparseable_total": m.compactionManifestsParkedUnparseableTotal.Load(),
 		"storage_unaddressable_files":                   m.storageUnaddressableFiles.Load(),
+		"backup_skipped_files":                          m.backupSkippedFiles.Load(),
 
 		// Cluster Auth (Enterprise, Phase A)
 		"cluster_heartbeats_unknown_node_total": m.clusterHeartbeatsUnknownNodeTotal.Load(),
@@ -835,6 +872,12 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_ingest_errors_total Total ingestion errors\n"...)
 	b = append(b, "# TYPE arc_ingest_errors_total counter\n"...)
 	b = appendMetric(b, "arc_ingest_errors_total", float64(m.ingestErrorsTotal.Load()))
+	b = append(b, "# HELP arc_ingest_flush_deferred_total Flushes deferred because the flush queue was full\n"...)
+	b = append(b, "# TYPE arc_ingest_flush_deferred_total counter\n"...)
+	b = appendMetric(b, "arc_ingest_flush_deferred_total", float64(m.ingestFlushDeferred.Load()))
+	b = append(b, "# HELP arc_buffer_deferred_buffers Buffers currently holding records that no flush worker could take\n"...)
+	b = append(b, "# TYPE arc_buffer_deferred_buffers gauge\n"...)
+	b = appendMetric(b, "arc_buffer_deferred_buffers", float64(m.bufferDeferredBuffers.Load()))
 
 	// MessagePack metrics
 	b = append(b, "# HELP arc_msgpack_requests_total Total MessagePack requests\n"...)
@@ -1127,6 +1170,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_storage_unaddressable_files Data files the most recent backup found in source storage that no listing returns, so they could not be copied. Non-zero means that backup is incomplete: the files exist and the query path still serves them, but their key does not conform to the storage key rules and no backend method can address one. Rename them and the next backup clears this.\n"...)
 	b = append(b, "# TYPE arc_storage_unaddressable_files gauge\n"...)
 	b = appendMetric(b, "arc_storage_unaddressable_files", float64(m.storageUnaddressableFiles.Load()))
+
+	b = append(b, "# HELP arc_backup_skipped_files Files the most recent backup inventoried but could not store: unreadable at copy time, or a backup destination key over the storage key limit. Counts every file group the backup copies, the same total the backup status endpoint reports as skipped_files; the backup's manifest and status name up to 32 of the skipped data and Iceberg metadata files in skipped_sample, while a skipped compaction recovery manifest or outside-root warehouse file is counted here and named only in the log. Set by every backup that finishes its copy phases, including one the skip ratio then fails; a backup that fails earlier leaves the previous value. A clean backup sets it to 0.\n"...)
+	b = append(b, "# TYPE arc_backup_skipped_files gauge\n"...)
+	b = appendMetric(b, "arc_backup_skipped_files", float64(m.backupSkippedFiles.Load()))
 
 	// Cluster Auth metrics (Enterprise, Phase A — Cluster Auth Convergence).
 	// apply_* counters increment per applied token command, per node — so

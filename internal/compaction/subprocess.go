@@ -49,7 +49,8 @@ type SubprocessJobConfig struct {
 	SortKeys                []string `json:"sort_keys"`    // Sort keys for ORDER BY in compaction
 	MemoryLimit             string   `json:"memory_limit"` // DuckDB memory limit (e.g., "8GB")
 	// Threads is the DuckDB thread count for this subprocess. 0 means leave
-	// DuckDB at its default (all cores) — the parent normally sends the
+	// DuckDB at its own default, which is the container's CPU quota where there
+	// is one and all cores where there is not — the parent normally sends the
 	// resolved compaction.threads value, so 0 only occurs for callers that
 	// predate the field.
 	Threads int `json:"threads,omitempty"`
