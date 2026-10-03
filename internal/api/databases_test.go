@@ -397,6 +397,38 @@ func TestDatabasesHandler_ListMeasurementsEmpty(t *testing.T) {
 	}
 }
 
+func TestDatabasesHandler_ListMeasurementsReservedRoots(t *testing.T) {
+	_, app, tmpDir := setupTestDatabasesHandler(t, false)
+	defer os.RemoveAll(tmpDir)
+
+	ctx := context.Background()
+	backend, err := storage.NewLocalBackend(tmpDir, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("failed to create LocalBackend: %v", err)
+	}
+	defer backend.Close()
+
+	for _, root := range []string{"_schema", "_compaction_state"} {
+		t.Run(root, func(t *testing.T) {
+			if err := backend.Write(ctx, root+"/database/measurement.parquet", []byte("reserved data")); err != nil {
+				t.Fatalf("failed to seed reserved root: %v", err)
+			}
+
+			req := httptest.NewRequest("GET", "/api/v1/databases/"+root+"/measurements", nil)
+			resp, err := app.Test(req, testRequestTimeoutMS)
+			if err != nil {
+				t.Fatalf("request failed: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != fiber.StatusNotFound {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("expected status 404, got %d: %s", resp.StatusCode, body)
+			}
+		})
+	}
+}
+
 // TestDatabasesHandler_Delete tests deleting a database
 func TestDatabasesHandler_Delete(t *testing.T) {
 	_, app, tmpDir := setupTestDatabasesHandler(t, true) // delete enabled
@@ -438,6 +470,47 @@ func TestDatabasesHandler_Delete(t *testing.T) {
 			t.Error("Expected database files to be deleted")
 		}
 	})
+}
+
+func TestDatabasesHandler_DeleteReservedRoots(t *testing.T) {
+	_, app, tmpDir := setupTestDatabasesHandler(t, true)
+	defer os.RemoveAll(tmpDir)
+
+	ctx := context.Background()
+	backend, err := storage.NewLocalBackend(tmpDir, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("failed to create LocalBackend: %v", err)
+	}
+	defer backend.Close()
+
+	for _, root := range []string{"_schema", "_compaction_state"} {
+		t.Run(root, func(t *testing.T) {
+			path := root + "/database/measurement.parquet"
+			if err := backend.Write(ctx, path, []byte("reserved data")); err != nil {
+				t.Fatalf("failed to seed reserved root: %v", err)
+			}
+
+			req := httptest.NewRequest("DELETE", "/api/v1/databases/"+root+"?confirm=true", nil)
+			resp, err := app.Test(req, testRequestTimeoutMS)
+			if err != nil {
+				t.Fatalf("request failed: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != fiber.StatusForbidden {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("expected status 403, got %d: %s", resp.StatusCode, body)
+			}
+
+			exists, err := backend.Exists(ctx, path)
+			if err != nil {
+				t.Fatalf("failed to check reserved data: %v", err)
+			}
+			if !exists {
+				t.Fatalf("reserved data at %q was deleted", path)
+			}
+		})
+	}
 }
 
 // TestDatabasesHandler_DeleteDisabled tests deleting when delete is disabled
