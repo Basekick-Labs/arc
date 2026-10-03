@@ -1228,6 +1228,14 @@ throughput. A negative value is refused at startup.
 Above the new ceiling, when the WAL queue is full, an entry is still dropped and
 the write still acknowledged. What admission should do instead is
 [#676](https://github.com/Basekick-Labs/arc/issues/676).
+### Database measurements no longer expose Arc-reserved storage roots ([#1012](https://github.com/Basekick-Labs/arc/issues/1012))
+
+The per-database measurements endpoint now treats Arc's reserved storage roots,
+such as `_schema` and `_compaction_state`, as not found. Regression tests also
+cover the existing deletion guard, which preserves field-schema anchors and
+compaction state when database deletion is enabled.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1032](https://github.com/Basekick-Labs/arc/pull/1032).
 
 ### OSS Helm chart: `arc.config.enabled` no longer leaves the pod unable to start ([#1194](https://github.com/Basekick-Labs/arc/issues/1194))
 
