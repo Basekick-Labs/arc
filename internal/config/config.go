@@ -185,13 +185,13 @@ type CompactionConfig struct {
 	MemoryLimit string
 
 	// Threads is the DuckDB thread count for EACH compaction subprocess.
-	// 0 (the default) means auto: half of EffectiveCores, minimum 1 — half the
-	// CPUs this process may use, which is the container's CPU quota where there
-	// is one and the machine's core count where there is not (#1030). Before
-	// this key existed, each subprocess used DuckDB's own default, which is the
-	// quota or, unlimited, all cores — so two concurrent jobs could saturate the
-	// machine and starve ingest. Sort and scan buffers scale with threads, so
-	// this also bounds memory.
+	// 0 (the default) means auto: half of EffectiveCores without a CPU quota;
+	// with a quota, EffectiveCores divided by max_concurrent+1. Both have a
+	// minimum of 1. The no-quota default stays unchanged (#1037). Before this key
+	// existed, each subprocess used DuckDB's own default, which is the quota or,
+	// unlimited, all cores — so two concurrent jobs could saturate the machine
+	// and starve ingest. Sort and scan buffers scale with threads, so this also
+	// bounds memory.
 	Threads int
 
 	// MaxFilesPerBatch bounds how many files a single compaction job feeds to
@@ -1173,7 +1173,7 @@ func Load() (*Config, error) {
 		cfg.Compaction.MemoryLimit = deriveCompactionMemoryLimit(cfg.Database.MemoryLimit, cfg.Compaction.MaxConcurrent)
 	}
 	if cfg.Compaction.Threads == 0 {
-		cfg.Compaction.Threads = getDefaultCompactionThreads()
+		cfg.Compaction.Threads = getDefaultCompactionThreads(cfg.Compaction.MaxConcurrent)
 	}
 
 	// Trim storage identifiers in-place before validating. These build DuckDB
@@ -1647,7 +1647,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.max_files_per_batch", 30)             // 30 files per DuckDB read_parquet() call; valid range [2, 500]
 	v.SetDefault("compaction.temp_directory", "./data/compaction") // Temp directory for compaction files
 	v.SetDefault("compaction.memory_limit", "")                    // "" = auto: database.memory_limit / max_concurrent (see CompactionConfig.MemoryLimit)
-	v.SetDefault("compaction.threads", 0)                          // 0 = auto: half of EffectiveCores, min 1 (see CompactionConfig.Threads)
+	v.SetDefault("compaction.threads", 0)                          // 0 = auto; see CompactionConfig.Threads
 	// Phase 4: completion-manifest watcher tunables
 	v.SetDefault("compaction.completion_watcher_interval_ms", 1000) // 1s poll rate
 	v.SetDefault("compaction.completion_dir", "")                   // "" = derive from temp_directory
@@ -2144,9 +2144,9 @@ func deriveCompactionMemoryLimit(dbLimit string, maxConcurrent int) string {
 }
 
 // getDefaultCompactionThreads is the auto value for compaction.threads: half
-// the CPUs this process may use, minimum 1. With the default max_concurrent of
-// 2, the two subprocesses together use about one process's worth of cores,
-// leaving headroom for the main process's ingest and query work.
+// the CPUs this process may use without a quota, minimum 1. With the default
+// max_concurrent of 2 and no quota, the two subprocesses together use about one
+// process's worth of cores.
 //
 // Derived from EffectiveCores, not runtime.NumCPU: each compaction job is a
 // separate process in the SAME cgroup, so a 2-CPU pod on a 64-core host ran
@@ -2162,14 +2162,22 @@ func deriveCompactionMemoryLimit(dbLimit string, maxConcurrent int) string {
 // the failing range exactly where this issue was reported. Where a container
 // caps CPU but not memory this default now costs throughput; set the key.
 //
-// The halving hardcodes max_concurrent=2; a higher max_concurrent still
-// oversubscribes. Pre-existing, and tracked separately from #1030.
-func getDefaultCompactionThreads() int {
-	return defaultCompactionThreads(effectiveCoresFn())
+// Without a quota, preserve the existing half-core default to avoid changing
+// throughput on bare-metal hosts. With a quota, divide the available cores by
+// all concurrent compaction subprocesses plus the main process (#1037).
+func getDefaultCompactionThreads(maxConcurrent int) int {
+	return defaultCompactionThreads(effectiveCoresFn(), runtime.NumCPU(), maxConcurrent)
 }
 
-func defaultCompactionThreads(cores int) int {
-	threads := cores / 2
+func defaultCompactionThreads(cores, machineCores, maxConcurrent int) int {
+	divisor := 2
+	if cores < machineCores {
+		if maxConcurrent <= 0 {
+			maxConcurrent = 2
+		}
+		divisor = maxConcurrent + 1
+	}
+	threads := cores / divisor
 	if threads < 1 {
 		threads = 1
 	}
