@@ -429,6 +429,31 @@ predate that fix and #978.
 
 ## Bug fixes
 
+### Arc no longer overrides DuckDB's own container-aware memory and thread limits for the query engine ([#1026](https://github.com/Basekick-Labs/arc/issues/1026))
+
+**If you run Arc in a container with a memory limit, this changes how much memory DuckDB is allowed, and you should read on.**
+
+Arc derived `database.memory_limit` from the CPU count — `min(NumCPU(), 32) GB` — and `database.thread_count` from `NumCPU()` directly. `runtime.NumCPU()` reflects cpuset/affinity but **not** a CFS quota, and Kubernetes `limits.cpu` and docker `--cpus` are quotas. So a pod limited to 2 CPUs on a 64-core node saw 64 cores, estimated 128 GB of system memory, and was handed a **32 GB** DuckDB memory limit inside a 2Gi container along with `SET GLOBAL threads=64`. DuckDB then planned and allocated against that budget instead of spilling to `database.temp_directory`, and the kernel OOM-killed the container — which is the outcome `memory_limit` exists to prevent.
+
+The fix is to stop overriding, because **DuckDB already does this correctly**. `duckdb::CGroups::GetMemoryLimit` and `GetCPULimit` are in the library Arc links; DuckDB reads `memory.max`, `memory.limit_in_bytes` and `cpu.max`, and with no explicit limit it uses 80% of what it finds. Measured: 28.7 GiB on a 36 GiB host, 409.5 MiB in a `--memory=512m` container, and `threads=2` under `--cpus=2`.
+
+So `database.memory_limit` now defaults to empty and `database.thread_count` to `0`, both meaning "leave DuckDB's own value". An explicit setting still wins, and the licensed-core cap is unaffected.
+
+**What changes for you:**
+
+- **Container with a memory limit** — DuckDB's limit is now derived from your container, not from the host's core count. In the 2Gi example above it drops from 32 GB to roughly 1.6 GiB. This is the fix.
+- **No memory limit set** (including the OSS Helm chart, which ships `resources: {}`) — DuckDB sees the node's total memory and takes 80% of it. On a 16-core/64 GiB node that is a **rise**, from Arc's 16 GB to about 51 GiB. If you were relying on Arc's accidental cap, set `database.memory_limit` explicitly, or set container limits.
+- **A smaller limit makes spilling more likely.** Size `database.temp_directory` accordingly — in Kubernetes, the emptyDir or volume behind it. Be aware that spilling is not unconditional: measured against the engine, below roughly 85 MB a 2M-row `GROUP BY` does not spill, it raises `Out of Memory Error`, at any thread count. Compaction treats that as recoverable and halves its batch (30 → 15 → 7 → 3) with a warning before giving up, so it is bounded and visible rather than silent — but a container small enough to derive a per-subprocess limit in that range will make no compaction progress. A 256 MiB container at the default `max_concurrent = 2` derives about 68 MiB, which is inside that range.
+
+**Compaction.** `compaction.memory_limit` auto-derives from `database.memory_limit`, which is now empty — and left alone, every compaction subprocess would fall back to DuckDB's own default and take 80% of the *same* cgroup, so a main process plus the default two subprocesses would budget 240% of the container. Arc now detects the limit itself for that one purpose and gives each subprocess `detected x 0.8 / (max_concurrent + 1)`. Detection reads cgroup v2, then v1, then `/proc/meminfo`, and `hw.memsize` on macOS; if nothing can be determined the previous behaviour is kept.
+
+To be precise about what that bounds: it caps the **subprocesses'** combined budget at roughly one share, but it does not make the total fit the container — the main process still takes the engine's own 80% of the whole cgroup, so at the default `max_concurrent` of 2 the worst case is about 133% of the limit. That is far better than what it replaced (a 2Gi pod previously budgeted 32 GB for the main process plus 16 GB per subprocess) and it is tolerable because these are spill thresholds rather than reservations, but it is not a guarantee. Bounding Arc's total memory means deciding how much of the machine it may use in aggregate, which is [#1025](https://github.com/Basekick-Labs/arc/issues/1025).
+
+**Still overridden, deliberately out of scope:** `compaction.threads` is also derived from `runtime.NumCPU()`, so a compaction subprocess in that same 2-CPU pod still gets `SET threads=32` while the main process now correctly gets 2. Fixing it needs the CPU quota rather than the memory limit, and it sits with the other CPU-derived defaults in [#1030](https://github.com/Basekick-Labs/arc/issues/1030).
+
+**Also fixed:** `database.memory_limit = "50%"` or `"0"` passed configuration validation and then hard-failed startup inside DuckDB with a bare parser error. Both are now rejected at load with a message naming the key and listing the accepted units, using the same rule `compaction.memory_limit` already enforced.
+
+
 ### A deferred flush now waits for a free worker instead of the next age sweep ([#1008](https://github.com/Basekick-Labs/arc/issues/1008))
 
 When the flush queue is full, Arc keeps the batch in its in-memory buffer rather

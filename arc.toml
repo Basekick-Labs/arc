@@ -27,8 +27,14 @@ format = "console"  # json or console
 # Override via: ARC_DATABASE_MAX_CONNECTIONS, ARC_DATABASE_MEMORY_LIMIT, ARC_DATABASE_THREAD_COUNT
 [database]
 # max_connections = 28    # Default: 2x CPU cores
-# memory_limit = "8GB"    # Default: ~50% system memory
-# thread_count = 14       # Default: CPU cores
+# memory_limit = "8GB"    # Default: unset — DuckDB uses 80% of the container's
+#                         # cgroup limit, or of host memory when unlimited.
+#                         # Set this only to override that. Percent and unit-less
+#                         # forms are rejected: DuckDB needs an absolute size.
+# thread_count = 14       # Default: unset — DuckDB uses the container's CPU
+#                         # quota (cpu.max), not the host's core count. Note
+#                         # compaction.threads is still derived from the host's
+#                         # core count (see issue #1030).
 enable_wal = true
 
 # Allow DuckDB to reorder results of queries WITHOUT an ORDER BY (queries
