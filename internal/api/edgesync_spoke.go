@@ -106,6 +106,11 @@ func (h *EdgeSyncSpokeHandler) run(c *fiber.Ctx) error {
 	h.logger.Info().Msg("Manual sync pass starting")
 
 	res, err := h.agent.Run(ctx)
+	if errors.Is(err, edgesync.ErrSyncAlreadyRunning) {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"error": err.Error(),
+		})
+	}
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Manual sync pass failed")
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
