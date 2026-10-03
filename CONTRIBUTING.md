@@ -7,6 +7,7 @@ Thanks for your interest in improving Arc. Contributions of all sizes are welcom
 - Issues labeled [`good first issue`](https://github.com/Basekick-Labs/arc/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are scoped, well-described, and a good entry point.
 - Most issues include the file, the line, and the intended fix shape. If the shape is unclear, ask on the issue before writing code.
 - Comment on an issue when you start working on it, so effort is not duplicated.
+- Issues labeled [`arcx`](https://github.com/Basekick-Labs/arc/issues?q=is%3Aissue+is%3Aopen+label%3Aarcx) touch Arc's integration with arcx, a query engine we are developing. The glue is public source and these are real bugs, but they affect only builds made with the `arcx_engine` tag, **which no release ships**, and that tag cannot be compiled outside Basekick — so **a maintainer has to do the final verification run** — see [Building and testing](#building-and-testing). They are not off limits; just say on the issue that you are starting, keep the change small, and state plainly in the PR that you could not run the tagged build. We will run it and report back what we saw.
 
 ## Before you open a PR
 
@@ -71,6 +72,15 @@ go test -tags=duckdb_arrow -race ./... # what CI runs
 ```
 
 If your environment cannot run the cgo-dependent packages (common on Windows), say so in the PR body and run what you can. Linux CI is the authoritative validation, and maintainers verify locally before merging.
+
+One build mode is **not** reproducible outside Basekick: `-tags=duckdb_arrow,arcx_engine`, which links arcx — a query engine still in development — in process over cgo. No release ships that tag and no CI job compiles it; it needs `libarcx.a` and `arcx.h` from a private repository. So if you are changing `internal/api/arcx_hook.go`, `internal/arcxrouter`, or `internal/arcxengine`:
+
+```sh
+go build -tags=duckdb_arrow ./...                    # what you can run
+go test -tags=duckdb_arrow -race ./internal/api/...  # and this
+```
+
+That is the right amount to run — do not try to stub the engine to get the tag to compile. Say in the PR body that the `arcx_engine` variant was not built, as you would for any environment limit, and a maintainer runs the tagged build, the arcx test suites, and the pre-fix revert check before merging. Source-wiring tests are welcome and useful, but they do not substitute for that run, and the files above sit on an FFI boundary where an untested change can take the process down rather than fail a request — which is why the verification is ours to do, not a gap in your PR.
 
 ## Review and merge
 
