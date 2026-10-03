@@ -36,7 +36,6 @@ require (
 require (
 	github.com/apache/iceberg-go v0.6.0
 	github.com/hashicorp/go-msgpack/v2 v2.1.1
-	github.com/vmihailenco/msgpack/v5 v5.4.1
 	golang.org/x/sys v0.47.0
 )
 
@@ -130,6 +129,7 @@ require (
 	github.com/uptrace/bun/extra/bundebug v1.2.18 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/valyala/tcplisten v1.0.0 // indirect
+	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	github.com/zeebo/xxh3 v1.1.0 // indirect
