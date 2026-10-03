@@ -467,7 +467,7 @@ Fixed an issue where compaction crashes could cause data duplication. If a pod c
 1. Before compaction starts, a manifest is written with input files and expected output
 2. After successful upload, the manifest tracks what needs to be deleted
 3. On startup, orphaned manifests are recovered - either completing deletions or retrying compaction
-4. Stale manifests (older than 7 days) are automatically deleted with a warning
+4. Manifests older than 7 days emit an investigation warning and still follow normal recovery; age alone does not delete them. (Correction: the earlier automatic-deletion claim was inaccurate.)
 
 **Features:**
 - Manifests stored in S3, preserving compute/storage separation

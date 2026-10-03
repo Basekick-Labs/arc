@@ -377,7 +377,7 @@ func (m *ManifestManager) recoverLoadedManifest(ctx context.Context, manifestPat
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	// Check for stale manifests - older than ManifestMaxAge likely indicate a deeper problem
+	// Age is diagnostic only: warn, then process the manifest normally.
 	manifestAge := time.Since(manifest.CreatedAt)
 	isStale := manifestAge > ManifestMaxAge
 	if isStale {

@@ -2,6 +2,16 @@
 
 > **Status:** Planned — November 2026 patch release.
 
+## Stale compaction manifests follow normal recovery ([#750](https://github.com/Basekick-Labs/arc/issues/750))
+
+Corrected the recovery comment and an earlier release note that said manifests
+over seven days old are deleted. Age triggers an investigation warning; recovery
+still validates the output and applies its usual cleanup and retry rules. A
+regression test verifies input cleanup for an eight-day-old manifest with a
+valid output. Runtime behavior is unchanged.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#921](https://github.com/Basekick-Labs/arc/pull/921).
+
 ## Compaction dedup metrics count Parquet rows correctly ([#1015](https://github.com/Basekick-Labs/arc/issues/1015))
 
 Deduplication row counts now come from DuckDB's `parquet_file_metadata`, where
