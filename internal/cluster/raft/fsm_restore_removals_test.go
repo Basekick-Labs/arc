@@ -76,3 +76,31 @@ func TestClusterFSM_Restore_RemovalCallbackIsOptional(t *testing.T) {
 		t.Error("w1 survived a restore that dropped it")
 	}
 }
+
+func TestClusterFSM_Restore_AnnouncesFilesTheSnapshotDropped(t *testing.T) {
+	fsm := NewClusterFSM(zerolog.Nop())
+	var deletedPath, deletedReason string
+	fsm.SetFileCallbacks(nil, func(path, reason string) {
+		deletedPath = path
+		deletedReason = reason
+	})
+
+	file := makeFileEntry("db/cpu/2026/04/11/14/file.parquet", "db", "cpu", 1024)
+	keep := makeFileEntry("db/cpu/2026/04/11/14/keep.parquet", "db", "cpu", 1024)
+	restoreFrom(t, fsm, FSMSnapshot{Files: map[string]*FileEntry{
+		file.Path: &file,
+		keep.Path: &keep,
+	}})
+
+	deletedPath, deletedReason = "", ""
+	restoreFrom(t, fsm, FSMSnapshot{Files: map[string]*FileEntry{
+		keep.Path: &keep,
+	}})
+
+	if deletedPath != file.Path || deletedReason != "snapshot:removed" {
+		t.Errorf("deleted callback = (%q, %q), want (%q, %q)", deletedPath, deletedReason, file.Path, "snapshot:removed")
+	}
+	if _, exists := fsm.GetFile(file.Path); exists {
+		t.Error("file dropped by snapshot is still in the manifest")
+	}
+}
