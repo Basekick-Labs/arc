@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,6 +48,77 @@ func snapshotInt(t *testing.T, key string) int64 {
 		t.Fatalf("metric %q is %T, want int64", key, v)
 	}
 	return n
+}
+
+func awaitBufferRecordMetrics(t *testing.T, queued, inflight int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if snapshotInt(t, "buffer_records_queued") == queued && snapshotInt(t, "buffer_records_inflight") == inflight {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("queued/inflight records = %d/%d, want %d/%d", snapshotInt(t, "buffer_records_queued"), snapshotInt(t, "buffer_records_inflight"), queued, inflight)
+}
+
+func TestBufferMetricsIncludeQueuedAndInFlightRecords(t *testing.T) {
+	release := make(chan struct{})
+	releaseFlushes := func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}
+	backend := &gatedStorageBackend{
+		hangingStorageBackend: newHangingStorage(0, 0),
+		release:               release,
+		started:               make(chan struct{}, 2),
+		completed:             make(chan struct{}, 2),
+	}
+	buf := NewArrowBuffer(bufferMetricsConfig(), backend, zerolog.New(io.Discard))
+	t.Cleanup(func() {
+		releaseFlushes()
+		_ = buf.Close()
+	})
+
+	writeBatch := func() {
+		t.Helper()
+		for i := 0; i < 10; i++ {
+			if err := buf.Write(context.Background(), "default", []interface{}{bufferMetricsRecord()}); err != nil {
+				t.Fatalf("Write %d: %v", i, err)
+			}
+		}
+	}
+	writeBatch()
+	select {
+	case <-backend.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first flush did not reach the blocked storage backend")
+	}
+
+	writeBatch()
+	awaitBufferRecordMetrics(t, 10, 10)
+
+	for _, want := range []string{
+		"arc_buffer_records_queued 10",
+		"arc_buffer_records_inflight 10",
+	} {
+		if got := metrics.Get().PrometheusFormat(); !strings.Contains(got, want) {
+			t.Errorf("Prometheus output missing %q", want)
+		}
+	}
+
+	releaseFlushes()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-backend.completed:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("flush %d did not complete after releasing storage", i+1)
+		}
+	}
+	awaitBufferRecordMetrics(t, 0, 0)
 }
 
 // TestBufferMetrics_RecordsBufferedTracksUnflushedData pins the ingest
