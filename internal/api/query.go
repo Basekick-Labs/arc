@@ -2100,6 +2100,15 @@ localProcessing:
 			// Note: cancelTimeout is called inside the stream writer callback, not deferred here,
 			// because SetBodyStreamWriter runs asynchronously after this function returns.
 		}
+		if cancelTimeout == nil {
+			execCtx, cancelTimeout = context.WithCancel(execCtx)
+		}
+		watchClientDisconnect(execCtx, c.Context().Conn(), func() {
+			if h.queryRegistry != nil && queryID != "" {
+				h.queryRegistry.Cancel(queryID)
+			}
+			cancelTimeout()
+		})
 		results, err := h.parallelExecutor.ExecutePartitioned(
 			execCtx,
 			parallelInfo.Paths,
@@ -2336,6 +2345,15 @@ localProcessing:
 			// Note: cancel is called inside the stream writer callback, not deferred here,
 			// because SetBodyStreamWriter runs asynchronously after this function returns.
 		}
+		if cancel == nil {
+			ctx, cancel = context.WithCancel(ctx)
+		}
+		watchClientDisconnect(ctx, c.Context().Conn(), func() {
+			if h.queryRegistry != nil && queryID != "" {
+				h.queryRegistry.Cancel(queryID)
+			}
+			cancel()
+		})
 
 		// arcx router hook. Decides eligibility on the RAW req.SQL (date_trunc
 		// still intact, before rewriteDateTrunc's epoch rewrite) and, in serve

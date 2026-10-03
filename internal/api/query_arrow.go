@@ -604,6 +604,15 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		// release helper expects a cancel to call.
 		ctx, cancel = context.WithCancel(baseCtx)
 	}
+	if cancel == nil {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	watchClientDisconnect(ctx, c.Context().Conn(), func() {
+		if h.queryRegistry != nil && queryID != "" {
+			h.queryRegistry.Cancel(queryID)
+		}
+		cancel()
+	})
 
 	// Execute query using DuckDB's native Arrow API — returns record batches
 	// directly from DuckDB's internal columnar chunks, no row-by-row scanning.
