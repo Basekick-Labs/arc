@@ -19,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
@@ -599,6 +600,9 @@ func (b *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 			ContinuationToken: continuationToken,
 		})
 		if err != nil {
+			if isNoSuchBucketError(err) {
+				return []string{}, nil
+			}
 			return nil, fmt.Errorf("failed to list S3 objects: %w", err)
 		}
 
@@ -775,6 +779,11 @@ func isNotFoundError(err error) bool {
 		strings.Contains(errStr, "404")
 }
 
+func isNoSuchBucketError(err error) bool {
+	var apiErr smithy.APIError
+	return errors.As(err, &apiErr) && apiErr.ErrorCode() == "NoSuchBucket"
+}
+
 // ValidateS3Prefix checks a configured bucket prefix and returns it with a
 // trailing separator.
 //
@@ -933,6 +942,9 @@ func (b *S3Backend) ListDirectories(ctx context.Context, prefix string) ([]strin
 			ContinuationToken: continuationToken,
 		})
 		if err != nil {
+			if isNoSuchBucketError(err) {
+				return []string{}, nil
+			}
 			return nil, fmt.Errorf("failed to list S3 directories: %w", err)
 		}
 
@@ -980,6 +992,9 @@ func (b *S3Backend) ListObjects(ctx context.Context, prefix string) ([]ObjectInf
 			ContinuationToken: continuationToken,
 		})
 		if err != nil {
+			if isNoSuchBucketError(err) {
+				return []ObjectInfo{}, nil
+			}
 			return nil, fmt.Errorf("failed to list S3 objects: %w", err)
 		}
 
@@ -1039,6 +1054,9 @@ func (b *S3Backend) ListUnusable(ctx context.Context, prefix string) ([]Unusable
 			ContinuationToken: continuationToken,
 		})
 		if err != nil {
+			if isNoSuchBucketError(err) {
+				return []UnusableObject{}, nil
+			}
 			return nil, fmt.Errorf("failed to list S3 objects: %w", err)
 		}
 
