@@ -27,29 +27,90 @@ func TestDatabaseThreadCountDefaultsToZero(t *testing.T) {
 	}
 }
 
-func TestGetDefaultMaxConnections(t *testing.T) {
-	cores := runtime.NumCPU()
-	expected := cores * 2
-	if expected < 4 {
-		expected = 4
+// TestEffectiveCores covers the helper every quota-derived default is built on.
+//
+// Table-driven over the pure form rather than driven through
+// runtime.GOMAXPROCS(n): that is process-global, would slow every other test in
+// the binary, and the values worth testing (0, 128 on a smaller box) are ones a
+// test has no business installing process-wide.
+func TestEffectiveCores(t *testing.T) {
+	cases := []struct {
+		name           string
+		numCPU, gomaxp int
+		want           int
+	}{
+		// The ordinary container case: NumCPU cannot see the CFS quota, GOMAXPROCS
+		// can. This row is #1030.
+		{"quota below machine", 64, 2, 2},
+		{"no quota", 8, 8, 8},
+		{"cpuset only", 2, 2, 2},
+		// GOMAXPROCS env has no clamp in the runtime, so it can exceed the machine.
+		// Verified: GOMAXPROCS=128 on an 8-CPU box reports 128.
+		{"gomaxprocs raised above machine", 8, 128, 8},
+		// An operator-raised GOMAXPROCS below the machine size is honoured. A
+		// deliberate residual, documented on EffectiveCores.
+		{"gomaxprocs between quota and machine", 64, 32, 32},
+		// Degenerate inputs must not yield 0 — a 0 would make the compaction
+		// threads default 0, which means "unset" to the subprocess.
+		{"zero gomaxprocs", 8, 0, 8},
+		{"zero both", 0, 0, 1},
+		{"negative", -1, -1, 1},
 	}
-	if expected > 64 {
-		expected = 64
-	}
-
-	actual := getDefaultMaxConnections()
-	if actual != expected {
-		t.Errorf("getDefaultMaxConnections() = %d, want %d", actual, expected)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := effectiveCores(c.numCPU, c.gomaxp); got != c.want {
+				t.Errorf("effectiveCores(%d, %d) = %d, want %d", c.numCPU, c.gomaxp, got, c.want)
+			}
+		})
 	}
 }
 
-func TestGetDefaultMaxConnections_Bounds(t *testing.T) {
-	actual := getDefaultMaxConnections()
-	if actual < 4 {
-		t.Errorf("getDefaultMaxConnections() = %d, should be at least 4", actual)
+// TestEffectiveCores_MatchesRuntime pins that the exported form reads both
+// runtime values rather than only one of them.
+func TestEffectiveCores_MatchesRuntime(t *testing.T) {
+	want := effectiveCores(runtime.NumCPU(), runtime.GOMAXPROCS(0))
+	if got := EffectiveCores(); got != want {
+		t.Errorf("EffectiveCores() = %d, want %d", got, want)
 	}
-	if actual > 64 {
-		t.Errorf("getDefaultMaxConnections() = %d, should be at most 64", actual)
+}
+
+func TestDefaultCompactionThreads(t *testing.T) {
+	cases := []struct{ cores, want int }{
+		{1, 1}, // floor: never 0, which the subprocess reads as "unset"
+		{2, 1}, // the headline 2-CPU pod
+		{3, 1},
+		{8, 4},
+		{64, 32},
+		{0, 1},
+	}
+	for _, c := range cases {
+		if got := defaultCompactionThreads(c.cores); got != c.want {
+			t.Errorf("defaultCompactionThreads(%d) = %d, want %d", c.cores, got, c.want)
+		}
+	}
+}
+
+func TestDefaultMaxConnections(t *testing.T) {
+	cases := []struct{ cores, want int }{
+		{1, 4}, {2, 4}, {8, 16}, {64, 64}, {128, 64},
+	}
+	for _, c := range cases {
+		if got := defaultMaxConnections(c.cores); got != c.want {
+			t.Errorf("defaultMaxConnections(%d) = %d, want %d", c.cores, got, c.want)
+		}
+	}
+}
+
+// TestGetDefaultMaxConnections_StaysMachineDerived pins the #1030 decision that
+// max_connections is NOT quota-derived: it bounds statements in flight, not CPU
+// work, and Arc queries are frequently S3-I/O-bound, so a 2-CPU pod dropping
+// from 64 pool slots to 4 would convert concurrency into client timeouts.
+func TestGetDefaultMaxConnections_StaysMachineDerived(t *testing.T) {
+	if got, want := getDefaultMaxConnections(), defaultMaxConnections(runtime.NumCPU()); got != want {
+		t.Errorf("getDefaultMaxConnections() = %d, want %d (machine cores, deliberately not the CPU quota)", got, want)
+	}
+	if got := getDefaultMaxConnections(); got < 4 || got > 64 {
+		t.Errorf("getDefaultMaxConnections() = %d, want within 4..64", got)
 	}
 }
 
@@ -69,49 +130,55 @@ func TestDatabaseMemoryLimitDefaultsToEmpty(t *testing.T) {
 	}
 }
 
-func TestGetDefaultFlushWorkers(t *testing.T) {
-	cores := runtime.NumCPU()
-	expected := cores * 2
-	if expected < 8 {
-		expected = 8
+func TestDefaultFlushWorkers(t *testing.T) {
+	cases := []struct{ cores, want int }{
+		// The floor is why a quota-derived value would have been a no-op for any
+		// quota of 4 cores or fewer: 2 cores and 4 cores both yield 8.
+		{1, 8}, {2, 8}, {4, 8}, {8, 16}, {64, 64}, {128, 64},
 	}
-	if expected > 64 {
-		expected = 64
-	}
-
-	actual := getDefaultFlushWorkers()
-	if actual != expected {
-		t.Errorf("getDefaultFlushWorkers() = %d, want %d", actual, expected)
+	for _, c := range cases {
+		if got := defaultFlushWorkers(c.cores); got != c.want {
+			t.Errorf("defaultFlushWorkers(%d) = %d, want %d", c.cores, got, c.want)
+		}
 	}
 }
 
-func TestGetDefaultFlushWorkers_Bounds(t *testing.T) {
-	actual := getDefaultFlushWorkers()
-	if actual < 8 {
-		t.Errorf("getDefaultFlushWorkers() = %d, should be at least 8", actual)
+// TestGetDefaultFlushWorkers_StaysMachineDerived pins the #1030 decision that
+// flush_workers is NOT quota-derived. Measured, ABAB, with the Go path held to
+// 2 cores and the same offered load per arm: against a 500ms-per-upload sink, 8
+// workers pushed 61% as many rows to storage as 64 did over the same window,
+// both arms at their upload-concurrency ceiling; against a 1ms sink the two were
+// indistinguishable and both ingest-limited. The pool is bound by concurrent
+// uploads, not by cores.
+func TestGetDefaultFlushWorkers_StaysMachineDerived(t *testing.T) {
+	if got, want := getDefaultFlushWorkers(), defaultFlushWorkers(runtime.NumCPU()); got != want {
+		t.Errorf("getDefaultFlushWorkers() = %d, want %d (machine cores, deliberately not the CPU quota)", got, want)
 	}
-	if actual > 64 {
-		t.Errorf("getDefaultFlushWorkers() = %d, should be at most 64", actual)
-	}
-}
-
-func TestGetDefaultFlushQueueSize(t *testing.T) {
-	workers := getDefaultFlushWorkers()
-	expected := workers * 4
-	if expected < 100 {
-		expected = 100
-	}
-
-	actual := getDefaultFlushQueueSize()
-	if actual != expected {
-		t.Errorf("getDefaultFlushQueueSize() = %d, want %d", actual, expected)
+	if got := getDefaultFlushWorkers(); got < 8 || got > 64 {
+		t.Errorf("getDefaultFlushWorkers() = %d, want within 8..64", got)
 	}
 }
 
-func TestGetDefaultFlushQueueSize_Bounds(t *testing.T) {
-	actual := getDefaultFlushQueueSize()
-	if actual < 100 {
-		t.Errorf("getDefaultFlushQueueSize() = %d, should be at least 100", actual)
+// TestGetDefaultFlushQueueSize_FollowsWorkers keeps the wiring assertion the
+// pure table above cannot make: the queue is sized from the RESOLVED worker
+// count, so a change to one default moves the other.
+func TestGetDefaultFlushQueueSize_FollowsWorkers(t *testing.T) {
+	if got, want := getDefaultFlushQueueSize(), defaultFlushQueueSize(getDefaultFlushWorkers()); got != want {
+		t.Errorf("getDefaultFlushQueueSize() = %d, want %d (4x the resolved worker count, floor 100)", got, want)
+	}
+	if got := getDefaultFlushQueueSize(); got < 100 {
+		t.Errorf("getDefaultFlushQueueSize() = %d, want at least 100", got)
+	}
+}
+
+func TestDefaultFlushQueueSize(t *testing.T) {
+	cases := []struct{ workers, want int }{
+		{8, 100}, {24, 100}, {25, 100}, {26, 104}, {64, 256},
+	}
+	for _, c := range cases {
+		if got := defaultFlushQueueSize(c.workers); got != c.want {
+			t.Errorf("defaultFlushQueueSize(%d) = %d, want %d", c.workers, got, c.want)
+		}
 	}
 }
 

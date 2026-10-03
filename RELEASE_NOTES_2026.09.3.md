@@ -473,10 +473,51 @@ So `database.memory_limit` now defaults to empty and `database.thread_count` to 
 
 To be precise about what that bounds: it caps the **subprocesses'** combined budget at roughly one share, but it does not make the total fit the container — the main process still takes the engine's own 80% of the whole cgroup, so at the default `max_concurrent` of 2 the worst case is about 133% of the limit. That is far better than what it replaced (a 2Gi pod previously budgeted 32 GB for the main process plus 16 GB per subprocess) and it is tolerable because these are spill thresholds rather than reservations, but it is not a guarantee. Bounding Arc's total memory means deciding how much of the machine it may use in aggregate, which is [#1025](https://github.com/Basekick-Labs/arc/issues/1025).
 
-**Still overridden, deliberately out of scope:** `compaction.threads` is also derived from `runtime.NumCPU()`, so a compaction subprocess in that same 2-CPU pod still gets `SET threads=32` while the main process now correctly gets 2. Fixing it needs the CPU quota rather than the memory limit, and it sits with the other CPU-derived defaults in [#1030](https://github.com/Basekick-Labs/arc/issues/1030).
+**`compaction.threads` was left overridden by this change and is fixed separately**, in [#1030](https://github.com/Basekick-Labs/arc/issues/1030) below: a compaction subprocess in that same 2-CPU pod was getting `SET threads=32` while the main process correctly got 2.
 
 **Also fixed:** `database.memory_limit = "50%"` or `"0"` passed configuration validation and then hard-failed startup inside DuckDB with a bare parser error. Both are now rejected at load with a message naming the key and listing the accepted units, using the same rule `compaction.memory_limit` already enforced.
 
+
+### Compaction subprocesses now size their threads from the container's CPU quota ([#1030](https://github.com/Basekick-Labs/arc/issues/1030))
+
+`compaction.threads` defaults to half the available cores, which it derived from `runtime.NumCPU()`. That reflects cpuset/affinity but **not** a CFS quota, and Kubernetes `limits.cpu` and docker `--cpus` are quotas — so on a 2-CPU pod on a 64-core node every compaction subprocess ran `SET threads=32`. This is the same root cause as [#1026](https://github.com/Basekick-Labs/arc/issues/1026) above, in the one place that fix did not reach, and it mattered twice over: the subprocesses are separate processes in the *same* cgroup as the main process, and DuckDB's sort and scan buffers scale with the thread count, so the oversubscription cost memory as well as scheduling.
+
+The default is now derived from `min(runtime.NumCPU(), runtime.GOMAXPROCS(0))`. Since Go 1.25 the runtime computes `GOMAXPROCS` as `min(affinity CPUs, max(ceil(quota), 2))`, so it reads the quota — including under cgroup v1 — while `NumCPU()` covers cpuset limits that no quota expresses. Measured on an 8-CPU VM: `--cpus=2` yields 2, `--cpus=1.5` and `--cpus=0.5` also yield 2 (the runtime floors at 2), and `--cpuset-cpus=0-1` yields 2 through `NumCPU()`. An explicit `compaction.threads` is untouched, and with no CPU quota the resolved value is identical to previous releases.
+
+This does **not** make the totals fit the quota, and it is worth being precise: on a 2-CPU quota at the default `max_concurrent = 2`, the two subprocesses take 1 thread each and the main process takes the quota's 2, for 4 threads against 2 CPUs. As with memory, these are caps on parallelism rather than reservations, and the kernel throttles the aggregate — the point is to stop a subprocess planning as if it had 32 cores.
+
+**Measured, and it is a trade rather than a free win.** Under `--cpus=2` on 351 files / ~300 MB of input, varying only the per-subprocess memory budget:
+
+| `compaction.memory_limit` | `threads=1` (new default) | `threads=32` (old default) |
+|---|---|---|
+| 4.47 GB — what that container derives with no memory limit set | success, 13.0 s | success, **9.8 s** |
+| 1 GB | success, 20.5 s | **`Out of Memory Error`** |
+| 512 MB | success, 22.7 s | **`Out of Memory Error`** |
+
+With memory to spare, 32 threads is about 1.3x faster even under a 2-CPU quota — so where a container limits CPU but not memory, this change costs compaction throughput, and setting `compaction.threads` explicitly is the right move. Where the container limits both, the old default did not merely waste CPU: it failed. DuckDB's own error names the cause — *"Possible solutions: Reducing the number of threads (SET threads=X)"* — and a 2-CPU / 2 Gi pod on a 64-core node derives about 546 MB per subprocess at the default `max_concurrent`, which is squarely in the failing range. That is the deployment this issue is about.
+
+Compaction classifies an out-of-memory error as recoverable and retries with a halved batch, up to four times, before giving up (`30 -> 15 -> 7 -> 3` at the default `max_files_per_batch`). So the old behaviour surfaced as slow, repeatedly-shrinking compaction cycles rather than a hard stop, and at a small enough budget as partitions that simply never compacted — which is why it was not obvious from the outside.
+
+Two residuals are deliberate. A `GOMAXPROCS` environment variable set above the quota is honoured up to the machine's core count, and `GODEBUG=containermaxprocs=0` disables the runtime's cgroup read entirely; both are an operator explicitly overriding their own runtime's container awareness. Conversely, `GOMAXPROCS` set *below* the core count on a machine with no quota now lowers this default where it previously did not.
+
+**`database.max_connections` and `ingest.flush_workers` are deliberately left host-derived.** Both were part of the original report and neither is a CPU-capacity proxy:
+
+- `max_connections` bounds statements in flight. Arc queries are frequently S3-I/O-bound, so taking a 2-CPU pod from 64 pool slots to 4 would convert concurrency into client timeouts against the 30 s HTTP write timeout. It is still worth tuning by hand in a small container, because this pool is the only global admission control on concurrent query execution and the Go-side result memory of an in-flight query is not bounded by DuckDB's `memory_limit`.
+- `flush_workers` was measured rather than reasoned about. Against a storage backend taking 500 ms per upload, with the Go path held to 2 cores and the same offered load in each arm (131.6M against 131.5M rows acknowledged), 8 workers — what a 2-CPU quota would produce — pushed **61%** as many rows to storage over the same 90 s window as 64 workers did: 68.0M against 111.3M, ABAB. Both arms sat at their upload-concurrency ceiling, 13.6 of a theoretical 16 uploads/s and 112 of 128, which is the finding: the pool is bound by concurrent uploads, not by cores. Against a 1 ms backend the two were indistinguishable — 8 workers slightly ahead — and both were limited by the ingest path instead, so the slower pool is not merely losing a race that no deployment runs.
+
+  The remainder of the offered rows in each arm was queued or in flight when the window closed, not lost, and the smaller pool held far more of it: around 22,500 deferrals against 1,187–3,768. That is the wrong direction for the small container that would have been the one to get the smaller pool, given that Arc deliberately does not cap ingest buffer memory. No acknowledged write is lost at either size — drained to completion with 8 workers, 49,765,000 rows acknowledged became 49,765,000 written, with all 8,065 deferrals retried.
+
+**A licensed core cap no longer raises a limit to meet the licence.** `MaxCores` enforcement gated on `runtime.NumCPU() > MaxCores` and then assigned `MaxCores` outright, so a 4-core licence in that 2-CPU pod *raised* `GOMAXPROCS` from 2 to 4 and set DuckDB `threads=4` — overriding the container-correct value #1026 had just arranged. Each surface is now clamped independently: `GOMAXPROCS` and an explicitly configured `database.thread_count` can only move down, and `ingest.flush_workers` is capped whether or not a quota is in play.
+
+Three things to know about the new behaviour, because none of them is obvious:
+
+- **`GOMAXPROCS` is now pinned on a licensed node, in both directions.** Pinning is what stops a quota raised later (an in-place pod resize, `docker update --cpus`) lifting it past the licence — but the Go runtime disables automatic updates rather than capping them, so a licensed node whose quota is *lowered* keeps its boot value while an unlicensed node would follow the quota down.
+- **The clamp can still exceed the container's CPU quota in one case.** When `database.thread_count` is unset, the licence replaces it only if the licence is below the *machine's* core count — that, not `GOMAXPROCS`, is the bound on what DuckDB would otherwise choose, because DuckDB reads `cpu.max` directly and has never read `GOMAXPROCS`. The value written is clamped by the effective core count, so it cannot exceed what this process may use; but where an operator has inflated that themselves (`GOMAXPROCS` above the quota, or `GODEBUG=containermaxprocs=0`) the result can sit above the quota. It is always within the licence.
+- **`compaction.threads` is still not licence-capped at all.** It is resolved during config load, before the licence is applied, and a subprocess is a separate process that the parent's `GOMAXPROCS` cannot reach — so a 4-core licence on a 64-core host with no quota still runs each subprocess with 32 threads. Pre-existing, unchanged by this release, and tracked separately.
+
+Enforcement remains boot-time: nothing re-applies it after periodic re-validation.
+
+**For clustered Enterprise deployments, this changes core accounting.** Nodes report `GOMAXPROCS` as their core count in the join payload, and the cluster sums those to check the licence. A node in a 2-CPU pod on a 64-core host with a 4-core licence previously reported 4 — the raised value — and now reports 2, so twice as many such nodes fit one licence. Each node genuinely has 2 usable cores, so 2 x 2 = 4 is the licence being counted accurately rather than evaded, but the number of nodes that can join may change.
 
 ### A deferred flush now waits for a free worker instead of the next age sweep ([#1008](https://github.com/Basekick-Labs/arc/issues/1008))
 

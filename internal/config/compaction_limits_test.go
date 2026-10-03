@@ -76,13 +76,82 @@ func TestValidateCompactionMemoryLimit(t *testing.T) {
 	}
 }
 
-func TestGetDefaultCompactionThreads(t *testing.T) {
-	got := getDefaultCompactionThreads()
-	if got < 1 {
-		t.Errorf("getDefaultCompactionThreads() = %d, want >= 1", got)
+// TestGetDefaultCompactionThreads_UsesEffectiveCores is the test with teeth for
+// #1030: it drives the quota through the injectable seam, because CI runners
+// have no CPU quota and so cannot produce one.
+//
+// Two different injected values with two different expected outputs, and both
+// asserted to differ from the runtime.NumCPU()-derived answer on a machine with
+// more than 8 cores — a single value could pass by coincidence wherever
+// NumCPU()/2 happens to equal the expectation.
+func TestGetDefaultCompactionThreads_UsesEffectiveCores(t *testing.T) {
+	original := effectiveCoresFn
+	defer func() { effectiveCoresFn = original }()
+
+	for _, c := range []struct{ cores, want int }{
+		{2, 1}, // a 2-CPU pod: one thread per subprocess, two subprocesses, one quota
+		{8, 4},
+		{64, 32},
+	} {
+		effectiveCoresFn = func() int { return c.cores }
+		if got := getDefaultCompactionThreads(); got != c.want {
+			t.Errorf("with %d effective cores: getDefaultCompactionThreads() = %d, want %d", c.cores, got, c.want)
+		}
 	}
-	if want := runtime.NumCPU() / 2; want >= 1 && got != want {
-		t.Errorf("getDefaultCompactionThreads() = %d, want %d (half of %d cores)", got, want, runtime.NumCPU())
+
+	// The pre-#1030 behaviour, so a revert cannot pass: with a 2-core quota on a
+	// host of more than 8 cores the old NumCPU()/2 answer is a different number.
+	if runtime.NumCPU() > 8 {
+		effectiveCoresFn = func() int { return 2 }
+		if got, hostDerived := getDefaultCompactionThreads(), runtime.NumCPU()/2; got == hostDerived {
+			t.Errorf("getDefaultCompactionThreads() = %d with a 2-core quota, which equals the host-derived %d: the quota is not being read", got, hostDerived)
+		}
+	}
+}
+
+// TestLoad_CompactionThreadsResolvesFromEffectiveCores pins the same thing one
+// level up, through Load(), which is where the 0 sentinel is actually resolved
+// and where everything downstream (main.go wiring, the compaction manager, the
+// subprocess SET) reads it from.
+func TestLoad_CompactionThreadsResolvesFromEffectiveCores(t *testing.T) {
+	original := effectiveCoresFn
+	defer func() { effectiveCoresFn = original }()
+
+	// t.Chdir rather than os.Chdir + defer: cleanup-ordered, and it fails loudly
+	// if this test is ever made parallel.
+	t.Chdir(t.TempDir())
+
+	for _, c := range []struct{ cores, want int }{{2, 1}, {16, 8}} {
+		effectiveCoresFn = func() int { return c.cores }
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.Compaction.Threads != c.want {
+			t.Errorf("with %d effective cores: Compaction.Threads = %d, want %d", c.cores, cfg.Compaction.Threads, c.want)
+		}
+	}
+}
+
+// TestLoad_ExplicitCompactionThreadsSurvives pins that the sentinel resolution
+// only fills the UNSET value — an operator who wrote a number keeps it,
+// quota or no quota.
+func TestLoad_ExplicitCompactionThreadsSurvives(t *testing.T) {
+	original := effectiveCoresFn
+	defer func() { effectiveCoresFn = original }()
+	effectiveCoresFn = func() int { return 2 }
+
+	// t.Chdir rather than os.Chdir + defer: cleanup-ordered, and it fails loudly
+	// if this test is ever made parallel.
+	t.Chdir(t.TempDir())
+
+	t.Setenv("ARC_COMPACTION_THREADS", "6")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Compaction.Threads != 6 {
+		t.Errorf("Compaction.Threads = %d, want 6 (explicit value, not the 2-core quota default)", cfg.Compaction.Threads)
 	}
 }
 
