@@ -26,9 +26,22 @@ format = "console"  # json or console
 # Auto-configured based on system resources if not set.
 # Override via: ARC_DATABASE_MAX_CONNECTIONS, ARC_DATABASE_MEMORY_LIMIT, ARC_DATABASE_THREAD_COUNT
 [database]
-# max_connections = 28    # Default: 2x CPU cores
-# memory_limit = "8GB"    # Default: ~50% system memory
-# thread_count = 14       # Default: CPU cores
+# max_connections = 28    # Default: 2x the HOST's CPU cores (min 4, max 64).
+#                         # Deliberately not quota-derived: it bounds statements
+#                         # in flight, and Arc queries are often S3-I/O-bound, so
+#                         # a quota-sized pool converts concurrency into client
+#                         # timeouts. Worth lowering BY HAND in a small container
+#                         # though — this pool is the only global limit on
+#                         # concurrent queries, and the Go-side memory of an
+#                         # in-flight result is not covered by memory_limit.
+# memory_limit = "8GB"    # Default: unset — DuckDB uses 80% of the container's
+#                         # cgroup limit, or of host memory when unlimited.
+#                         # Set this only to override that. Percent and unit-less
+#                         # forms are rejected: DuckDB needs an absolute size.
+# thread_count = 14       # Default: unset — DuckDB uses the container's CPU
+#                         # quota (cpu.max), not the host's core count.
+#                         # compaction.threads follows the quota too since
+#                         # 26.09.3; see the [compaction] section below.
 enable_wal = true
 
 # Allow DuckDB to reorder results of queries WITHOUT an ORDER BY (queries
@@ -87,6 +100,33 @@ default_sort_keys = ""
 # -----------------------------------------------------------------------------
 [compaction]
 enabled = true
+
+# DuckDB thread count for EACH compaction subprocess.
+# Default: unset (0) = half of the CPUs this process may use, minimum 1.
+# Environment override: ARC_COMPACTION_THREADS=4
+#
+# "CPUs this process may use" is min(runtime.NumCPU(), runtime.GOMAXPROCS(0)):
+# Go derives GOMAXPROCS from the container's CPU quota (cpu.max, or
+# cpu.cfs_quota_us on cgroup v1), while NumCPU catches cpuset limits that no
+# quota expresses. Before 26.09.3 this was half the HOST's core count, so a
+# 2-CPU pod on a 64-core node ran every compaction job with 32 threads (#1030).
+#
+# Halving assumes the default max_concurrent = 2. Raising max_concurrent without
+# lowering this oversubscribes: the subprocesses do not share a budget.
+#
+# This does not make the total fit the quota. On a 2-CPU quota the two
+# subprocesses take 1 thread each and the main process takes the quota's 2 — 4
+# threads against 2 CPUs. These are caps on parallelism, not reservations.
+#
+# Three things that change the derived value, all deliberate:
+#   - GOMAXPROCS set ABOVE the quota is honoured, up to the machine's core count.
+#   - GODEBUG=containermaxprocs=0 turns the runtime's cgroup read off entirely,
+#     giving the pre-26.09.3 host-derived behaviour.
+#   - the runtime floors GOMAXPROCS at 2, so --cpus=0.5 still yields 1 thread.
+#
+# Not licence-capped: this is resolved before the licence is applied, and a
+# subprocess is a separate process. Set it by hand on a core-limited licence.
+# threads = 4
 
 # Maximum wall-clock budget for ONE scheduled or manual compaction cycle.
 # Default: 30m. Positive Go duration syntax: 90s, 30m, 2h, 2h15m.

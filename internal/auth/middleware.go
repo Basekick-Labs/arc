@@ -245,10 +245,32 @@ func ExtractTokenFromRequest(c *fiber.Ctx) string {
 	return c.Query("p")
 }
 
-// RequireResourcePermission creates middleware that checks resource-scoped permissions
-// using RBAC when enabled, with fallback to OSS token permissions.
-// The database and measurement are extracted from request headers or path.
-func RequireResourcePermission(am *AuthManager, rm *RBACManager, permission string) fiber.Handler {
+// ResourcePermissionChecker is the subset of *RBACManager this middleware
+// needs, so a handler holding the permission checker behind its own interface
+// can pass it through without depending on the concrete type.
+type ResourcePermissionChecker interface {
+	CheckPermission(req *PermissionCheckRequest) *PermissionCheckResult
+	CanAccessAnythingIn(tokenInfo *TokenInfo, database, permission string) bool
+}
+
+// RequireResourcePermission creates middleware that checks resource-scoped
+// permissions, with the database and measurement taken from the request's
+// header or path.
+//
+// Prefer this over RequirePermission on any route that names a database or
+// measurement. RequirePermission consults only the token's coarse permission
+// list (AuthManager.HasPermission), which never looks at RBAC — so a token
+// whose read authority comes from a grant rather than from the coarse "read"
+// bit is refused before the handler can consult RBAC at all. That is the
+// middleware half of the enforcement model described in rbac_manager.go: a
+// denial there is final, so the gate in front of it has to be able to say yes
+// for the same reasons RBAC would.
+//
+// rm == nil means no permission checker was wired, which is the OSS
+// auth-without-RBAC build: fall back to the coarse list. When rm is present it
+// is authoritative, including when the license has lapsed — CheckPermission
+// itself decides, and it deliberately does not consult the license.
+func RequireResourcePermission(am *AuthManager, rm ResourcePermissionChecker, permission string) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		tokenInfo := GetTokenInfo(c)
 		if tokenInfo == nil {
@@ -262,8 +284,11 @@ func RequireResourcePermission(am *AuthManager, rm *RBACManager, permission stri
 		database := extractDatabase(c)
 		measurement := extractMeasurement(c)
 
-		// If no RBAC manager or RBAC not enabled, use OSS permissions
-		if rm == nil || !rm.IsRBACEnabled() {
+		// No checker wired (OSS auth-only build): coarse permissions.
+		// NOT also gated on IsRBACEnabled() — see rbac_manager.go's
+		// RBAC ENFORCEMENT MODEL: keying this off the license fails open the
+		// moment a license lapses.
+		if rm == nil {
 			if !am.HasPermission(tokenInfo, permission) {
 				return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 					"success": false,
@@ -273,7 +298,24 @@ func RequireResourcePermission(am *AuthManager, rm *RBACManager, permission stri
 			return c.Next()
 		}
 
-		// Use RBAC permission checking
+		// A request that names NO measurement is asking about the database as
+		// a whole — a listing, or an operation the handler will scope itself.
+		// That is the weak question, and it must NOT be asked by passing an
+		// empty measurement to CheckPermission: a role carrying measurement
+		// grants is restricted to them for every measurement value, "" and
+		// "*" included, so that would deny the canonical tenant shape at the
+		// door. CanAccessAnythingIn is the predicate for it.
+		if measurement == "" {
+			if !rm.CanAccessAnythingIn(tokenInfo, database, permission) {
+				return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+					"success": false,
+					"error":   "Permission denied: " + permission + " required",
+				})
+			}
+			return c.Next()
+		}
+
+		// A named measurement is the exact question.
 		result := rm.CheckPermission(&PermissionCheckRequest{
 			TokenInfo:   tokenInfo,
 			Database:    database,
@@ -297,13 +339,28 @@ func RequireResourcePermission(am *AuthManager, rm *RBACManager, permission stri
 // extractDatabase extracts the target database from the request.
 // Checks: x-arc-database header, path parameter, query parameter
 func extractDatabase(c *fiber.Ctx) string {
-	// Check header first
-	if db := c.Get("x-arc-database"); db != "" {
+	// PATH FIRST, header second. A route that names the database in its path
+	// is serving that database, so authorizing a different one — the value of
+	// a client's session-wide x-arc-database header — is wrong in both
+	// directions: it false-denies a caller that is entitled to the path's
+	// database, and for any future route where this middleware is the ONLY
+	// gate it would authorize the header while the handler served the path.
+	// The handlers that exist today re-check the path name, so deny-wins
+	// makes that second case latent rather than live; it must not be left
+	// for the next adopter of RequireResourceWrite/Delete to discover.
+	//
+	// ":name" is the databases routes' parameter (/api/v1/databases/:name) and
+	// is the only route family using it, so reading it cannot pick up a value
+	// that is not a database.
+	if db := c.Params("database"); db != "" {
+		return db
+	}
+	if db := c.Params("name"); db != "" {
 		return db
 	}
 
-	// Check path parameter
-	if db := c.Params("database"); db != "" {
+	// No database in the path: the header is the request's target.
+	if db := c.Get("x-arc-database"); db != "" {
 		return db
 	}
 
@@ -339,16 +396,16 @@ func extractMeasurement(c *fiber.Ctx) string {
 }
 
 // RequireResourceRead creates middleware requiring read permission with resource context
-func RequireResourceRead(am *AuthManager, rm *RBACManager) fiber.Handler {
+func RequireResourceRead(am *AuthManager, rm ResourcePermissionChecker) fiber.Handler {
 	return RequireResourcePermission(am, rm, "read")
 }
 
 // RequireResourceWrite creates middleware requiring write permission with resource context
-func RequireResourceWrite(am *AuthManager, rm *RBACManager) fiber.Handler {
+func RequireResourceWrite(am *AuthManager, rm ResourcePermissionChecker) fiber.Handler {
 	return RequireResourcePermission(am, rm, "write")
 }
 
 // RequireResourceDelete creates middleware requiring delete permission with resource context
-func RequireResourceDelete(am *AuthManager, rm *RBACManager) fiber.Handler {
+func RequireResourceDelete(am *AuthManager, rm ResourcePermissionChecker) fiber.Handler {
 	return RequireResourcePermission(am, rm, "delete")
 }

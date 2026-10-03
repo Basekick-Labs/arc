@@ -889,6 +889,16 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 			return fmt.Errorf("failed to set threads: %w", err)
 		}
 	}
+
+	// Report what DuckDB is ACTUALLY using, not what Arc asked for.
+	//
+	// Since #1026, both settings above default to "leave DuckDB's own value" —
+	// DuckDB reads memory.max and cpu.max itself and takes 80% of the limit it
+	// finds. The configured-value log a few lines up therefore prints
+	// memory_limit="" and thread_count=0, which reads as "unlimited" and is the
+	// exact misreading #1026's review record warns about. Without this line an
+	// operator has no way to see the effective limit short of issuing a query.
+	logEffectiveResourceSettings(db, logger)
 	// Pin DuckDB's spill location so operators can place it on fast scratch
 	// storage AND so CleanupOrphanedSpillFiles can sweep a known path at
 	// startup. Empty leaves DuckDB's default (CWD-relative). The directory
@@ -1945,4 +1955,22 @@ func sumOperatorTimings(operators []duckdbProfileOperator) float64 {
 		total += sumOperatorTimings(op.Children)
 	}
 	return total
+}
+
+// logEffectiveResourceSettings logs the memory limit and thread count DuckDB
+// settled on, however they were decided.
+//
+// Best-effort by design: a failure to read a setting is not a reason to fail
+// startup, so it is logged at Debug and the node continues.
+func logEffectiveResourceSettings(db *sql.DB, logger zerolog.Logger) {
+	var memLimit, threads string
+	err := db.QueryRow("SELECT current_setting('memory_limit'), current_setting('threads')").Scan(&memLimit, &threads)
+	if err != nil {
+		logger.Debug().Err(err).Msg("Could not read DuckDB's effective memory limit and thread count")
+		return
+	}
+	logger.Info().
+		Str("memory_limit", memLimit).
+		Str("threads", threads).
+		Msg("DuckDB effective resource settings (empty config values mean DuckDB's own cgroup-aware defaults)")
 }

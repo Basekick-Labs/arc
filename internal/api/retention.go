@@ -289,10 +289,15 @@ func (h *RetentionHandler) Close() error {
 func (h *RetentionHandler) RegisterRoutes(app *fiber.App) {
 	group := app.Group("/api/v1/retention")
 
-	// Read-only routes — any authenticated token
-	group.Get("/", h.handleList)
-	group.Get("/:id", h.handleGet)
-	group.Get("/:id/executions", h.handleGetExecutions)
+	// Admin-only, including the read-only routes. Retention policies are
+	// configured by admins only, and a policy row names the database and
+	// measurement it applies to — so listing them on any authenticated token
+	// was a tenant-name enumeration surface, the same one closed on the
+	// database listing endpoints.
+	adminOnly := withAdminAuth(h.authManager)
+	group.Get("/", adminOnly, h.handleList)
+	group.Get("/:id", adminOnly, h.handleGet)
+	group.Get("/:id/executions", adminOnly, h.handleGetExecutions)
 
 	// Admin routes — require admin permission for mutating operations
 	if h.authManager != nil {
@@ -1160,7 +1165,7 @@ func (h *RetentionHandler) getFileMaxTimeAndRowCount(ctx context.Context, filePa
 	// Use the shared DuckDB connection to avoid memory retention from temporary connections
 	db := h.duckdb.DB()
 
-	query := fmt.Sprintf("SELECT MAX(time) as max_time, COUNT(*) as cnt FROM read_parquet(%s)", sqlutil.QuoteStringLiteral(filePath))
+	query := fmt.Sprintf("SELECT MAX(time) as max_time, COUNT(*) as cnt FROM %s", sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(filePath)))
 	row := db.QueryRowContext(ctx, query)
 
 	var maxTime time.Time

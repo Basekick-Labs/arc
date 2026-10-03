@@ -14,6 +14,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/backup"
 	"github.com/basekick-labs/arc/internal/compaction"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 )
 
@@ -272,6 +273,15 @@ func TestBackup_ManifestsCopiedBeforeDataIssue930(t *testing.T) {
 		// the data population; the two inputs are data skips.
 		if m.SkippedMetadataFiles != 1 || m.SkippedFiles != 2 {
 			t.Fatalf("metaSkipped=%d skipped=%d", m.SkippedMetadataFiles, m.SkippedFiles)
+		}
+		// #977: the sample names the two data inputs, not the vanished
+		// recovery manifest (an expected skip), while the gauge counts all
+		// three.
+		if len(m.SkippedSample) != 2 {
+			t.Fatalf("skipped_sample = %v, want the two data inputs only", m.SkippedSample)
+		}
+		if got, _ := metrics.Get().Snapshot()["backup_skipped_files"].(int64); got != 3 {
+			t.Fatalf("backup_skipped_files = %d, want 3 (every group counts)", got)
 		}
 		// Restore arithmetic still detects a missing data file.
 		backupStore, _ := storage.NewLocalBackend(backupDir, zerolog.Nop())

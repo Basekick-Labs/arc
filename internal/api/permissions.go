@@ -11,8 +11,13 @@ import (
 // CheckWritePermissions checks if the token has write permission for the database and measurements.
 // This is a shared implementation used by both LineProtocol and MsgPack handlers.
 func CheckWritePermissions(c *fiber.Ctx, rbacManager RBACChecker, logger zerolog.Logger, database string, measurements []string) error {
-	// Skip if RBAC is not configured or not enabled
-	if rbacManager == nil || !rbacManager.IsRBACEnabled() {
+	// Gated on the checker being WIRED, not on the license: enforcement must
+	// survive a lapsed or revoked license, or every tenant token would widen
+	// to full write the moment one expired. See the RBAC ENFORCEMENT MODEL
+	// note in internal/auth/rbac_manager.go. CheckPermission resolves admin
+	// break-glass, memberships-are-authoritative and no-memberships-means-
+	// coarse itself, so a deployment without RBAC configured is unaffected.
+	if rbacManager == nil {
 		return nil
 	}
 

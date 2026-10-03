@@ -80,32 +80,106 @@ const cacheInvalidateHMACTolerance = security.HMACTimestampTolerance
 // own default (internal/config/config.go, setDefaults).
 const defaultShutdownTimeout = 30 * time.Second
 
+// Seams for applyLicenseCoreLimits' tests. CI runners cannot be given a CPU
+// quota, and runtime.NumCPU() cannot be set at all, so without these the
+// license-clamp tests silently lose their teeth on a runner whose core count
+// differs from the developer's machine — which is how they were first written.
+var (
+	numCPUFn         = runtime.NumCPU
+	effectiveCoresFn = config.EffectiveCores
+)
+
 // applyLicenseCoreLimits enforces lic.MaxCores on every execution surface —
 // Go runtime (GOMAXPROCS), DuckDB native threads (cfg.Database.ThreadCount is
 // the REAL DuckDB enforcement; GOMAXPROCS does not bound CGo threads), and
 // ingestion flush workers. Shared by the online, cached and offline-file
 // license paths so no path can partially enforce (a 4-core site license on a
 // 64-core air-gapped box must not run DuckDB with 64 threads).
+//
+// Each knob is clamped INDEPENDENTLY and only ever downward. This used to gate
+// all three behind `runtime.NumCPU() > lic.MaxCores` and then assign
+// lic.MaxCores outright, which in a 2-CPU pod on a 64-core host with a 4-core
+// license RAISED GOMAXPROCS from the quota's 2 to 4 and set DuckDB threads=4,
+// overriding the container-correct value #1026 arranged (#1030). Gating on the
+// effective core count instead would have been worse than either: it skips the
+// flush-worker cap entirely and lets an explicitly configured thread_count
+// escape, so a 4-core license would run 8 flush workers and whatever
+// database.thread_count the operator wrote.
+//
+// Enforcement is boot-time, matching the model used for mid-process license
+// expiry: nothing re-applies this after StartPeriodicValidation re-verifies.
 func applyLicenseCoreLimits(lic *license.License, cfg *config.Config) {
+	machineCores, effective := numCPUFn(), effectiveCoresFn()
+	// Non-positive MaxCores means unlimited.
 	if lic.MaxCores <= 0 {
 		return
 	}
-	machineCores := runtime.NumCPU()
-	if machineCores <= lic.MaxCores {
-		return
-	}
-	previousGOMAXPROCS := runtime.GOMAXPROCS(lic.MaxCores)
-	log.Info().
-		Int("machine_cores", machineCores).
-		Int("licensed_cores", lic.MaxCores).
-		Int("gomaxprocs_before", previousGOMAXPROCS).
-		Int("gomaxprocs_after", lic.MaxCores).
-		Msg("License core limit applied via GOMAXPROCS")
 
-	cfg.Database.ThreadCount = lic.MaxCores
-	log.Info().
-		Int("duckdb_threads", lic.MaxCores).
-		Msg("License core limit applied to DuckDB threads")
+	// GOMAXPROCS, unconditionally. The call matters even when the value does not
+	// change: passing n > 0 pins GOMAXPROCS and stops the runtime re-reading the
+	// cgroup, so a quota raised later (an in-place pod resize, docker update
+	// --cpus) cannot lift it above the licensed count afterwards.
+	gomaxprocs := runtime.GOMAXPROCS(0)
+	if lic.MaxCores < gomaxprocs {
+		gomaxprocs = lic.MaxCores
+	}
+	previous := runtime.GOMAXPROCS(gomaxprocs)
+	switch {
+	case previous != gomaxprocs:
+		log.Info().
+			Int("machine_cores", machineCores).
+			Int("effective_cores", effective).
+			Int("licensed_cores", lic.MaxCores).
+			Int("gomaxprocs_before", previous).
+			Int("gomaxprocs_after", gomaxprocs).
+			Msg("License core limit applied via GOMAXPROCS")
+	default:
+		// Nothing moved, but the call still pinned the value. Say so: an operator
+		// wondering why GOMAXPROCS no longer follows a resized CPU quota has no
+		// other breadcrumb, and the pin is the whole reason this runs
+		// unconditionally.
+		log.Info().
+			Int("gomaxprocs", gomaxprocs).
+			Int("licensed_cores", lic.MaxCores).
+			Msg("GOMAXPROCS pinned at the license core limit; it no longer tracks CPU quota changes")
+	}
+
+	// DuckDB threads. Zero means "leave DuckDB's own value" (#1026), and the
+	// bound on that value is the CPU quota, which DuckDB reads from cpu.max
+	// itself — NOT GOMAXPROCS. So EffectiveCores is deliberately NOT used as the
+	// gate here: it can sit below DuckDB's own count (a GOMAXPROCS env var below
+	// the core count, or any divergence between Go's cgroup reading and DuckDB's)
+	// and gating on it would leave the count unset while DuckDB ran with the
+	// host's cores — weaker than the code this replaced. runtime.NumCPU() is the
+	// one bound on DuckDB's choice that is knowable here without asking DuckDB,
+	// so that is what decides whether to set a value at all.
+	//
+	// The value itself is then clamped by EffectiveCores too, so enforcing the
+	// license cannot raise the count past what this process may use. One residual
+	// survives: GOMAXPROCS set ABOVE a CPU quota inflates EffectiveCores, so the
+	// clamp can exceed the quota there — bounded by the license, and only for an
+	// operator who overrode their own runtime's container awareness.
+	switch {
+	case cfg.Database.ThreadCount <= 0:
+		if lic.MaxCores < machineCores {
+			threads := lic.MaxCores
+			if effective < threads {
+				threads = effective
+			}
+			cfg.Database.ThreadCount = threads
+			log.Info().
+				Int("machine_cores", machineCores).
+				Int("effective_cores", effective).
+				Int("duckdb_threads", cfg.Database.ThreadCount).
+				Msg("License core limit applied to DuckDB threads")
+		}
+	case cfg.Database.ThreadCount > lic.MaxCores:
+		log.Info().
+			Int("configured_threads", cfg.Database.ThreadCount).
+			Int("duckdb_threads", lic.MaxCores).
+			Msg("License core limit applied to DuckDB threads")
+		cfg.Database.ThreadCount = lic.MaxCores
+	}
 
 	if cfg.Ingest.FlushWorkers > lic.MaxCores {
 		cfg.Ingest.FlushWorkers = lic.MaxCores
@@ -331,6 +405,12 @@ func main() {
 		Str("memory_limit", cfg.Database.MemoryLimit).
 		Bool("arcx_enabled", arcxPath != "").
 		Int("machine_cpus", runtime.NumCPU()).
+		// effective_cpus is what a CPU quota leaves this process. machine_cpus
+		// alone is what made #1030 look like correct sizing. Note this is read
+		// AFTER applyLicenseCoreLimits may have pinned GOMAXPROCS lower, while
+		// compaction.threads was resolved from the pre-license value in
+		// config.Load() — so on a licensed node the two need not agree.
+		Int("effective_cpus", config.EffectiveCores()).
 		Msg("Initializing DuckDB with database config")
 	dbConfig := &database.Config{
 		MaxConnections:         cfg.Database.MaxConnections,
@@ -854,6 +934,39 @@ func main() {
 	if walWriter != nil {
 		arrowBuffer.SetWAL(walWriter)
 	}
+	// Bound ArrowBuffer.Close, which now WAITS for flushes in progress instead
+	// of cancelling them (#1007).
+	//
+	// The buffer is one component among several, and the coordinator invokes a
+	// component's Close with no context — it checks its own deadline only
+	// BETWEEN components. So a Close that consumes the whole budget makes the
+	// coordinator skip everything registered after it, including the `wal`
+	// component. wal.Writer.Close is what closes the writer's done channel and
+	// performs the final drain-and-sync of its async entry channel, so skipping
+	// it retains a WAL that is missing its newest entries — unrecoverable loss,
+	// and strictly worse than the records this change is saving.
+	//
+	// A live SIGTERM run with shutdown_timeout=5 and 60s-per-write storage
+	// showed exactly that: Close returned within its budget but AT the
+	// coordinator's deadline, and field-schema, wal-purge and wal were all
+	// skipped. Hence a fraction, not the whole budget.
+	//
+	// Half, and deliberately WITHOUT a floor. A floor large enough to be useful
+	// is larger than the whole budget at low settings — a 2s floor against
+	// shutdown_timeout=2 hands Close 100% of the coordinator's time and
+	// reintroduces the skip it was meant to prevent. Half is the honest rule at
+	// every value: the components after the buffer are a SQLite close, the WAL's
+	// final sync and the storage/database closes, all fast. Giving Close less
+	// time only means more records stay in the WAL to be replayed, which is
+	// recoverable; starving the WAL writer's sync is not.
+	//
+	// Note this does not account for what the hooks already spent before any
+	// component ran — in cluster mode ready-flag-off alone holds 10s. Close
+	// bounds itself; it cannot see the coordinator's remaining time.
+	//
+	// shutdownTimeout is the validated duration (server.shutdown_timeout with
+	// the non-positive fallback already applied above), not the raw config int.
+	arrowBuffer.SetCloseBudget(shutdownTimeout / 2)
 	shutdownCoordinator.Register("arrow-buffer", arrowBuffer, shutdown.PriorityBuffer)
 
 	// Measurement field schema registry (#914). Ingest folds every flushed
@@ -1323,10 +1436,15 @@ func main() {
 			MaxFilesPerBatch: cfg.Compaction.MaxFilesPerBatch,
 			ExcludeDatabases: cfg.Compaction.ExcludeDatabases,
 			// Per-subprocess DuckDB bounds. Config resolves the "auto"
-			// sentinels at load time: memory_limit defaults to
-			// database.memory_limit / max_concurrent (so compaction's
-			// worst case stays ~one database.memory_limit total, not
-			// max_concurrent times it), threads to half the cores.
+			// sentinels at load time. memory_limit: when
+			// database.memory_limit is set explicitly it is that
+			// divided by max_concurrent; when it is unset (the default
+			// since #1026, so DuckDB uses its own cgroup-aware value)
+			// it is detected_memory * 0.8 / (max_concurrent + 1), which
+			// bounds the subprocesses' combined budget rather than
+			// letting each take DuckDB's own 80% of the cgroup. threads
+			// is still half the HOST's cores, not the container's quota
+			// — see issue #1030.
 			MemoryLimit:   cfg.Compaction.MemoryLimit,
 			Threads:       cfg.Compaction.Threads,
 			CompletionDir: completionDir, // Phase 4: empty in OSS, set in cluster mode
@@ -3271,6 +3389,12 @@ func main() {
 	// Register Databases handler
 	databasesHandler := api.NewDatabasesHandler(storageBackend, &cfg.Delete, authManager, logger.Get("databases"))
 	databasesHandler.SetFieldSchema(fieldSchemaRegistry)
+	// Guarded the same way every other SetAuthAndRBAC call is: assigning a nil
+	// *auth.RBACManager into the handler's RBACChecker interface would make its
+	// `rbacManager == nil` guards false for a typed nil.
+	if authManager != nil && rbacManager != nil {
+		databasesHandler.SetRBACManager(rbacManager)
+	}
 	databasesHandler.RegisterRoutes(server.GetApp())
 
 	// Register Debug handler — admin-auth memory diagnostics

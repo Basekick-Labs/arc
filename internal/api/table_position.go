@@ -121,6 +121,28 @@ func walkTablePositions(normalised string, visit func(p tablePosition) (stop boo
 			fromArmed[depth] = true
 			afterFromJoin = true
 			introStart = m[0]
+		case "table", "summarize", "describe", "pivot", "unpivot":
+			// DuckDB introduces a relation after these too, and it accepts a
+			// bare path there exactly as it does after FROM: `TABLE '<glob>'`,
+			// `SUMMARIZE '<glob>'`, `PIVOT '<glob>' ON …` all read the file.
+			// Arming only on from/join left the replacement-scan guard blind
+			// to every one of them, so a string literal in those positions
+			// reached DuckDB verbatim while the RBAC extractor emitted no
+			// reference for it — an authorization check over an empty set.
+			//
+			// fromArmed is deliberately NOT set: none of these forms continues
+			// a table list across a comma, and arming one would make a later
+			// comma a table position — `PIVOT t ON a, b` and
+			// `PIVOT t ON col IN ('a','b')` would then read as cross-join
+			// tables and a legitimate literal there would be refused.
+			//
+			// A following `(` resets the window (see the "(" case above), so
+			// `FROM t PIVOT (sum(x) FOR y IN ('a'))` and `DESCRIBE SELECT …`
+			// are unaffected. Arc supports no replacement scans at all, so a
+			// literal directly after one of these keywords has no legitimate
+			// form to protect.
+			afterFromJoin = true
+			introStart = m[0]
 		default:
 			// A real table name, alias, ON, USING, etc. keeps the clause armed
 			// so a following `, b` cross-join is still a table position.
@@ -313,6 +335,52 @@ func containsSQLWord(sqlLower, word string) bool {
 		end := idx + len(word)
 		if (idx == 0 || !isIdentChar(sqlLower[idx-1])) && (end == len(sqlLower) || !isIdentChar(sqlLower[end])) {
 			return true
+		}
+		pos = idx + 1
+	}
+}
+
+// indexSQLTokenStart returns the index of the first occurrence of s in sqlLower
+// whose first byte is NOT preceded by an identifier byte, or -1 if there is
+// none. countSQLTokenStart counts the same occurrences.
+//
+// These exist for the fast paths' `"from "` searches. A plain
+// strings.Index(sqlLower, "from ") has no leading word boundary, while the
+// extractor's patternSimpleTable requires `\bFROM`. A digit before the keyword
+// is an identifier byte, so `\b` declines while strings.Index matches — and
+// DuckDB lexes `1from` as `1` then `FROM`. `SELECT *,1from secret` was
+// therefore invisible to the permission check and a real table to the fast
+// path, which read it with no grant.
+//
+// Only the LEADING boundary is enforced; the caller's own trailing byte (the
+// space in `"from "`) is left alone deliberately, so routing is unchanged for
+// every shape that already worked. A keyword followed by other whitespace
+// simply fails the search and falls to the slow path, whose regexes are
+// boundary-correct.
+func indexSQLTokenStart(sqlLower, s string) int {
+	for pos := 0; ; {
+		idx := strings.Index(sqlLower[pos:], s)
+		if idx < 0 {
+			return -1
+		}
+		idx += pos
+		if idx == 0 || !isIdentChar(sqlLower[idx-1]) {
+			return idx
+		}
+		pos = idx + 1
+	}
+}
+
+func countSQLTokenStart(sqlLower, s string) int {
+	n := 0
+	for pos := 0; ; {
+		idx := strings.Index(sqlLower[pos:], s)
+		if idx < 0 {
+			return n
+		}
+		idx += pos
+		if idx == 0 || !isIdentChar(sqlLower[idx-1]) {
+			n++
 		}
 		pos = idx + 1
 	}

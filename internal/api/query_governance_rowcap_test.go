@@ -13,12 +13,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Basekick-Labs/msgpack/v6"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 // Tests for #724. An Enterprise governance row cap truncated a result with no

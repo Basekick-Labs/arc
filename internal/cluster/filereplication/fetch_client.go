@@ -247,9 +247,15 @@ func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.Fi
 		return 0, fmt.Errorf("ack size mismatch: peer tail=%d expected tail=%d (offset=%d)", ack.SizeBytes, expectedTail, byteOffset)
 	}
 	if ack.SHA256 != entry.SHA256 {
-		// Peer disagrees with our manifest about this file's hash — shouldn't
-		// happen in a consistent cluster, but treat it as a mismatch rather
-		// than silently pulling possibly-wrong bytes.
+		// The peer's manifest disagrees with ours about this file's hash. The
+		// ack hash comes from the peer's own replicated FSM entry, not from
+		// hashing its bytes, so this means the peer's Raft state has not
+		// converged on the generation we are asking for — transient during
+		// propagation. Reject rather than pull bytes we cannot verify; the
+		// puller falls through to the next candidate, which is usually enough
+		// (one exception: a partitioned origin with a frozen FSM stays first
+		// in the candidate list, because the resolver adds the origin without
+		// a health check).
 		return 0, fmt.Errorf("%w: ack hash=%s manifest=%s", ErrChecksumMismatch, ack.SHA256, entry.SHA256)
 	}
 

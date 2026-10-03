@@ -102,6 +102,7 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 			Int64("backup_skipped_files", manifest.SkippedFiles).
 			Int64("backup_unaddressable_files", manifest.UnaddressableFiles).
 			Strs("unaddressable_sample", manifest.UnaddressableSample).
+			Strs("skipped_sample", manifest.SkippedSample).
 			Msg("Restoring a backup that was incomplete when it was taken")
 	}
 
