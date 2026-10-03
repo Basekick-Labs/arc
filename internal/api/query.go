@@ -829,10 +829,14 @@ var (
 
 	// Dangerous patterns for WHERE clause
 	dangerousQueryPatterns = []string{
-		";",      // Statement terminator
-		"--",     // SQL comment
-		"/*",     // Multi-line comment start
-		"*/",     // Multi-line comment end
+		";",  // Statement terminator
+		"--", // SQL comment
+		"/*", // Multi-line comment start
+		"*/", // Multi-line comment end
+		"xp_",
+		"sp_",
+	}
+	dangerousQueryKeywords = []string{
 		"DROP",   // DDL
 		"DELETE", // DML (in WHERE context means injection attempt)
 		"INSERT",
@@ -842,8 +846,6 @@ var (
 		"CREATE",
 		"EXEC",
 		"EXECUTE",
-		"xp_",
-		"sp_",
 		"UNION",
 	}
 )
@@ -901,12 +903,18 @@ func validateWhereClauseQuery(where string) error {
 		return fmt.Errorf("where clause too long (max 4096 characters)")
 	}
 
-	whereUpper := strings.ToUpper(where)
+	whereMasked, _ := sqlutil.MaskStringLiterals(where, sqlutil.HasQuotes(where))
+	whereLower := strings.ToLower(whereMasked)
 
-	// Check for dangerous patterns
+	// Check for dangerous patterns outside string literals.
 	for _, pattern := range dangerousQueryPatterns {
-		if strings.Contains(whereUpper, pattern) {
+		if strings.Contains(whereLower, strings.ToLower(pattern)) {
 			return fmt.Errorf("where clause contains forbidden pattern: %s", pattern)
+		}
+	}
+	for _, keyword := range dangerousQueryKeywords {
+		if containsSQLWord(whereLower, strings.ToLower(keyword)) {
+			return fmt.Errorf("where clause contains forbidden pattern: %s", keyword)
 		}
 	}
 
