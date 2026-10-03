@@ -2,6 +2,16 @@
 
 > **Status:** Planned — November 2026 patch release.
 
+## Local storage closes appended files exactly once ([#750](https://github.com/Basekick-Labs/arc/issues/750))
+
+`LocalBackend.AppendReader` previously closed the staging file explicitly on
+successful promotion and again through a deferred call. It now closes the file
+once on every path, checks close errors, and only promotes a completed transfer
+after a successful copy and close. Regression tests cover close-call count,
+partial transfers, successful promotion and interrupted reads.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#919](https://github.com/Basekick-Labs/arc/pull/919).
+
 ## Compaction dedup metrics count Parquet rows correctly ([#1015](https://github.com/Basekick-Labs/arc/issues/1015))
 
 Deduplication row counts now come from DuckDB's `parquet_file_metadata`, where
