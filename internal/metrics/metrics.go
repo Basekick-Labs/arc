@@ -38,8 +38,9 @@ type Metrics struct {
 	//
 	// Exported as arc_buffer_deferred_buffers, NOT arc_ingest_*: in this file
 	// arc_ingest_* is uniformly counters and arc_buffer_* holds the buffer-state
-	// gauges (arc_buffer_queue_depth, arc_buffer_records_buffered), which this
-	// sits beside and is published alongside.
+	// gauges (arc_buffer_queue_depth, arc_buffer_records_buffered,
+	// arc_buffer_records_queued, arc_buffer_records_inflight), which this sits
+	// beside and is published alongside.
 	bufferDeferredBuffers atomic.Int64
 
 	// MessagePack specific
@@ -80,6 +81,8 @@ type Metrics struct {
 	bufferErrorsTotal     atomic.Int64
 	bufferFlushFailures   atomic.Int64
 	bufferQueueDepth      atomic.Int64
+	bufferRecordsQueued   atomic.Int64
+	bufferRecordsInflight atomic.Int64
 
 	// Storage metrics
 	storageWritesTotal     atomic.Int64
@@ -429,6 +432,8 @@ func (m *Metrics) SetBufferFlushes(count int64)         { m.bufferFlushesTotal.S
 func (m *Metrics) SetBufferErrors(count int64)          { m.bufferErrorsTotal.Store(count) }
 func (m *Metrics) IncBufferFlushFailures()              { m.bufferFlushFailures.Add(1) }
 func (m *Metrics) SetBufferQueueDepth(depth int64)      { m.bufferQueueDepth.Store(depth) }
+func (m *Metrics) SetBufferRecordsQueued(count int64)   { m.bufferRecordsQueued.Store(count) }
+func (m *Metrics) SetBufferRecordsInflight(count int64) { m.bufferRecordsInflight.Store(count) }
 
 // Storage Metrics
 func (m *Metrics) IncStorageWrites()                { m.storageWritesTotal.Add(1) }
@@ -692,6 +697,8 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"buffer_errors_total":         m.bufferErrorsTotal.Load(),
 		"buffer_flush_failures_total": m.bufferFlushFailures.Load(),
 		"buffer_queue_depth":          m.bufferQueueDepth.Load(),
+		"buffer_records_queued":       m.bufferRecordsQueued.Load(),
+		"buffer_records_inflight":     m.bufferRecordsInflight.Load(),
 
 		// Storage
 		"storage_writes_total":      m.storageWritesTotal.Load(),
@@ -958,6 +965,14 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_buffer_queue_depth Current flush queue depth\n"...)
 	b = append(b, "# TYPE arc_buffer_queue_depth gauge\n"...)
 	b = appendMetric(b, "arc_buffer_queue_depth", float64(m.bufferQueueDepth.Load()))
+
+	b = append(b, "# HELP arc_buffer_records_queued Records waiting in the flush queue\n"...)
+	b = append(b, "# TYPE arc_buffer_records_queued gauge\n"...)
+	b = appendMetric(b, "arc_buffer_records_queued", float64(m.bufferRecordsQueued.Load()))
+
+	b = append(b, "# HELP arc_buffer_records_inflight Records currently being flushed\n"...)
+	b = append(b, "# TYPE arc_buffer_records_inflight gauge\n"...)
+	b = appendMetric(b, "arc_buffer_records_inflight", float64(m.bufferRecordsInflight.Load()))
 
 	// Storage metrics
 	b = append(b, "# HELP arc_storage_writes_total Total storage writes\n"...)
