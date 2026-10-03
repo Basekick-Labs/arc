@@ -1356,10 +1356,15 @@ func main() {
 			MaxFilesPerBatch: cfg.Compaction.MaxFilesPerBatch,
 			ExcludeDatabases: cfg.Compaction.ExcludeDatabases,
 			// Per-subprocess DuckDB bounds. Config resolves the "auto"
-			// sentinels at load time: memory_limit defaults to
-			// database.memory_limit / max_concurrent (so compaction's
-			// worst case stays ~one database.memory_limit total, not
-			// max_concurrent times it), threads to half the cores.
+			// sentinels at load time. memory_limit: when
+			// database.memory_limit is set explicitly it is that
+			// divided by max_concurrent; when it is unset (the default
+			// since #1026, so DuckDB uses its own cgroup-aware value)
+			// it is detected_memory * 0.8 / (max_concurrent + 1), which
+			// bounds the subprocesses' combined budget rather than
+			// letting each take DuckDB's own 80% of the cgroup. threads
+			// is still half the HOST's cores, not the container's quota
+			// — see issue #1030.
 			MemoryLimit:   cfg.Compaction.MemoryLimit,
 			Threads:       cfg.Compaction.Threads,
 			CompletionDir: completionDir, // Phase 4: empty in OSS, set in cluster mode

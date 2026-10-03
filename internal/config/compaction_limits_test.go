@@ -1,8 +1,11 @@
 package config
 
 import (
+	"fmt"
 	"runtime"
 	"testing"
+
+	"github.com/basekick-labs/arc/internal/sysmem"
 )
 
 func TestDeriveCompactionMemoryLimit(t *testing.T) {
@@ -24,7 +27,6 @@ func TestDeriveCompactionMemoryLimit(t *testing.T) {
 		{name: "explicit B unit works", dbLimit: "100000B", maxConcurrent: 2, want: "50000B"},
 		{name: "max_concurrent 1 returns input verbatim", dbLimit: "8GB", maxConcurrent: 1, want: "8GB"},
 		{name: "max_concurrent 0 treated as default 2", dbLimit: "8GB", maxConcurrent: 0, want: "4GB"},
-		{name: "empty input returns empty (nothing to derive)", dbLimit: "", maxConcurrent: 2, want: ""},
 		{name: "whitespace tolerated like the validation regex", dbLimit: "8 GB", maxConcurrent: 2, want: "4GB"},
 		// DuckDB's SET memory_limit rejects percent and unit-less forms, and
 		// either as database.memory_limit aborts startup at the main DB's loud
@@ -81,5 +83,88 @@ func TestGetDefaultCompactionThreads(t *testing.T) {
 	}
 	if want := runtime.NumCPU() / 2; want >= 1 && got != want {
 		t.Errorf("getDefaultCompactionThreads() = %d, want %d (half of %d cores)", got, want, runtime.NumCPU())
+	}
+}
+
+// TestDeriveCompactionMemoryLimit_EmptyDatabaseLimitDerivesFromSystem pins the
+// contract change in #1026.
+//
+// This case used to return "", which was correct while database.memory_limit
+// always had a value. It no longer does: Arc now leaves that empty so DuckDB
+// applies its own cgroup-aware default. Returning "" here would mean EVERY
+// compaction subprocess also falls back to DuckDB's default and takes 80% of the
+// same cgroup — a main process plus the default two subprocesses budgeting 240%
+// of the container. subprocess.go only warns when a SET fails, so it would do
+// that silently.
+//
+// The share is detected*0.8/(maxConcurrent+1): the +1 reserves the main
+// process's share, because the subprocesses are separate processes in the SAME
+// cgroup rather than independent budgets.
+func TestDeriveCompactionMemoryLimit_EmptyDatabaseLimitDerivesFromSystem(t *testing.T) {
+	detected, _, ok := sysmem.Limit()
+	if !ok {
+		t.Skip("no memory limit detectable on this platform")
+	}
+
+	for _, maxConcurrent := range []int{1, 2, 4} {
+		got := deriveCompactionMemoryLimit("", maxConcurrent)
+		if got == "" {
+			t.Fatalf("maxConcurrent=%d: derived \"\", so each subprocess would take DuckDB's own 80%% of the whole cgroup (#1026)", maxConcurrent)
+		}
+		if !memoryLimitRe.MatchString(got) {
+			t.Fatalf("maxConcurrent=%d: derived %q, which config validation would reject", maxConcurrent, got)
+		}
+		if err := validateCompactionMemoryLimit(got); err != nil {
+			t.Fatalf("maxConcurrent=%d: derived %q, which DuckDB would reject: %v", maxConcurrent, got, err)
+		}
+
+		// The whole point: a share, never the whole box.
+		var bytes uint64
+		if _, err := fmt.Sscanf(got, "%dB", &bytes); err != nil {
+			t.Fatalf("derived %q is not the exact <bytes>B form: %v", got, err)
+		}
+		if bytes >= detected {
+			t.Fatalf("maxConcurrent=%d: derived %d bytes from a detected limit of %d — that is not a share", maxConcurrent, bytes, detected)
+		}
+		want := uint64(float64(detected)*0.8) / uint64(maxConcurrent+1)
+		if bytes != want {
+			t.Fatalf("maxConcurrent=%d: derived %d bytes, want %d (detected*0.8/(maxConcurrent+1))", maxConcurrent, bytes, want)
+		}
+	}
+}
+
+// TestFormatDuckDBBytes_IsAcceptedEverywhere pins the string form.
+//
+// memoryLimitRe makes the unit OPTIONAL, so a bare number passes config
+// validation and then hard-fails inside DuckDB with `Unknown unit for memory:
+// ”` — a startup crash in every deployment. The binary units that would be
+// exact (MiB/GiB) are the ones memoryLimitRe rejects, and MB/GB are powers of
+// 1000 so they cannot render a byte count exactly. "<bytes>B" is the only form
+// that is both exact and accepted by both validators.
+func TestFormatDuckDBBytes_IsAcceptedEverywhere(t *testing.T) {
+	for _, b := range []uint64{1, 256 << 20, 536870912, 1 << 30, 1<<30 + 1} {
+		got := formatDuckDBBytes(b)
+		if !memoryLimitRe.MatchString(got) {
+			t.Fatalf("formatDuckDBBytes(%d) = %q, which memoryLimitRe rejects", b, got)
+		}
+		if err := validateDuckDBMemoryLimit("database.memory_limit", got); err != nil {
+			t.Fatalf("formatDuckDBBytes(%d) = %q, rejected by the DuckDB rule: %v", b, got, err)
+		}
+	}
+}
+
+// TestValidateDuckDBMemoryLimit_RejectsWhatDuckDBRejects closes a pre-existing
+// startup crash: database.memory_limit was checked against the loose regex only,
+// so "50%" and a bare number passed config load and then failed inside DuckDB.
+func TestValidateDuckDBMemoryLimit_RejectsWhatDuckDBRejects(t *testing.T) {
+	for _, bad := range []string{"50%", "0", "536870912", "100"} {
+		if err := validateDuckDBMemoryLimit("database.memory_limit", bad); err == nil {
+			t.Errorf("validateDuckDBMemoryLimit accepted %q; DuckDB fails with \"Unknown unit for memory\" and the node would crash at startup", bad)
+		}
+	}
+	for _, good := range []string{"", "8GB", "512MB", "536870912B", "1.5GB"} {
+		if err := validateDuckDBMemoryLimit("database.memory_limit", good); err != nil {
+			t.Errorf("validateDuckDBMemoryLimit rejected %q: %v", good, err)
+		}
 	}
 }
