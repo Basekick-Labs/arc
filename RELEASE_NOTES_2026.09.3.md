@@ -569,6 +569,18 @@ checks every field.
 
 Contributed by [@0utsights](https://github.com/0utsights) in [#871](https://github.com/Basekick-Labs/arc/pull/871).
 
+### Graceful shutdown registers final Parquet files in the cluster manifest ([#1014](https://github.com/Basekick-Labs/arc/issues/1014))
+
+The file registrar now stops after the Arrow buffer flushes its final files and
+before WAL cleanup and the cluster coordinator stop. This lets the registrar
+apply those final file entries to the cluster manifest while Raft is still
+available.
+Queue-full warnings also no longer promise anti-entropy recovery that is not
+implemented.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir)
+for [#1014](https://github.com/Basekick-Labs/arc/issues/1014).
+
 ## Experimental arcx Arrow IPC streams signal writer panics ([#846](https://github.com/Basekick-Labs/arc/issues/846))
 
 When the experimental arcx Arrow IPC stream writer panics, the response now

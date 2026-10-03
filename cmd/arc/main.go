@@ -1913,10 +1913,7 @@ func main() {
 						fileRegistrar := cluster.NewCoordinatorFileRegistrar(clusterCoordinator, logger.Get("file-registrar"))
 						fileRegistrar.Start(context.Background())
 						arrowBuffer.SetFileRegistrar(fileRegistrar)
-						shutdownCoordinator.RegisterHook("file-registrar", func(ctx context.Context) error {
-							fileRegistrar.Stop()
-							return nil
-						}, shutdown.PriorityBuffer)
+						registerFileRegistrarShutdown(shutdownCoordinator, fileRegistrar.Stop)
 						log.Info().Msg("Cluster file manifest registrar enabled")
 
 						// Phase 5: wire the dynamic compaction gate to the coordinator
@@ -4482,6 +4479,15 @@ func runCompactSubcommand(args []string) {
 type shutdownFunc func() error
 
 func (f shutdownFunc) Close() error { return f() }
+
+// The registrar must stop after ArrowBuffer finishes its final writes, but
+// before WAL cleanup and the cluster coordinator stop.
+func registerFileRegistrarShutdown(coordinator *shutdown.Coordinator, stop func()) {
+	coordinator.Register("file-registrar", shutdownFunc(func() error {
+		stop()
+		return nil
+	}), shutdown.PriorityBuffer+1)
+}
 
 // tieringManifestAdapter implements tiering.ManifestCoordinator over the
 // cluster coordinator the way retention builds its manifest deletes
