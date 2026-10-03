@@ -2,6 +2,15 @@
 
 > **Status:** Planned — November 2026 patch release.
 
+## Distinct Arrow schemas no longer share an ingest cache entry ([#750](https://github.com/Basekick-Labs/arc/issues/750))
+
+The ingest schema cache now uses deterministic, length-prefixed column identities
+instead of ambiguous slice formatting. It includes decimal precision/scale and
+canonicalises column and tag ordering, preventing stale Arrow types or metadata
+when a measurement's schema changes.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#913](https://github.com/Basekick-Labs/arc/pull/913).
+
 ## Compaction dedup metrics count Parquet rows correctly ([#1015](https://github.com/Basekick-Labs/arc/issues/1015))
 
 Deduplication row counts now come from DuckDB's `parquet_file_metadata`, where
