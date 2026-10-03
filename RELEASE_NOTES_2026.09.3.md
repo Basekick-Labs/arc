@@ -568,6 +568,8 @@ in the queue and batches currently being written. Together with
 `arc_buffer_records_buffered`, these show records retained across all three
 ingest stages without changing flush or write behavior.
 
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1042](https://github.com/Basekick-Labs/arc/pull/1042).
+
 ### Ingestion retains buffered batches when the flush queue is full ([#966](https://github.com/Basekick-Labs/arc/issues/966))
 
 A size-triggered flush used to extract the whole buffer and delete it, and only
