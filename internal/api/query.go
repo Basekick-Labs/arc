@@ -1203,27 +1203,16 @@ func (h *QueryHandler) anchorFor(ctx context.Context, database, measurement stri
 // anchor it is the bare path, exactly as before #914.
 func readParquetExpr(keyword, anchor string, paths []string, options string) string {
 	if anchor == "" && len(paths) == 1 {
-		return keyword + " read_parquet(" + quotePath(paths[0]) + ", " + options + ")"
+		return keyword + " " + sqlutil.ReadParquet(quotePath(paths[0]), options)
 	}
-	var sb strings.Builder
-	sb.WriteString(keyword)
-	sb.WriteString(" read_parquet([")
-	n := 0
+	quoted := make([]string, 0, len(paths)+1)
 	if anchor != "" {
-		sb.WriteString(quotePath(anchor))
-		n++
+		quoted = append(quoted, quotePath(anchor))
 	}
 	for _, p := range paths {
-		if n > 0 {
-			sb.WriteString(", ")
-		}
-		sb.WriteString(quotePath(p))
-		n++
+		quoted = append(quoted, quotePath(p))
 	}
-	sb.WriteString("], ")
-	sb.WriteString(options)
-	sb.WriteString(")")
-	return sb.String()
+	return keyword + " " + sqlutil.ReadParquetList(quoted, options)
 }
 
 // getMeasurementSchema serves GET /api/v1/databases/:database/measurements/:measurement/schema.
@@ -3458,7 +3447,10 @@ func quotePath(path string) string {
 }
 
 // buildReadParquetOptions builds the read_parquet options string.
-// Returns options like "union_by_name=true"
+//
+// Hive inference is NOT listed here: sqlutil.ReadParquet adds
+// hive_partitioning=false to every call it renders, so naming it here too
+// would emit the option twice (#1005).
 // Note: column pruning via 'columns' parameter is not supported in current DuckDB version.
 // DuckDB handles projection pushdown internally when it sees which columns are actually used.
 func buildReadParquetOptions() string {

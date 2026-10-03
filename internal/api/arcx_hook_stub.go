@@ -27,7 +27,14 @@ func (h *QueryHandler) tryArcxRouter(
 	return false
 }
 
-func (h *QueryHandler) tryArcxRouterArrow(c *fiber.Ctx, execCtx context.Context, cancel context.CancelFunc, rawSQL, headerDB, convertedSQL string) (handled bool) {
+func (h *QueryHandler) tryArcxRouterArrow(
+	c *fiber.Ctx,
+	execCtx context.Context,
+	cancel context.CancelFunc,
+	rawSQL, headerDB, convertedSQL string,
+	onComplete func(int),
+	onFail func(string),
+) (handled bool) {
 	return false
 }
 

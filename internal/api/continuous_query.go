@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -285,6 +286,102 @@ func (h *ContinuousQueryHandler) RegisterRoutes(app *fiber.App) {
 	group.Get("/:id/executions", h.handleGetExecutions)
 }
 
+// validateCQDefinition applies the field rules a stored continuous-query
+// definition must satisfy. Both create and update call it.
+//
+// Shared because PUT replaces the whole row: handleUpdate's UPDATE writes every
+// column (see it), so any field it does not validate is a field a partial body
+// silently blanks. The two handlers had drifted far apart — update checked
+// database (#995) and destination_measurement-only-if-present, and nothing
+// else, so a PUT carrying just a database blanked the name, both measurements,
+// the query and the interval. validateCQQuery documents its empty case as
+// "reported by the caller's own required-field check"; that became true of both
+// callers only here.
+//
+// Order and wording are carried over from handleCreate verbatim, because the
+// handler tests assert which message a body with more than one problem gets.
+//
+// The two measurements deliberately get DIFFERENT rules, and that is the
+// substantive decision in #1011:
+//
+//   - destination_measurement names a measurement Arc is about to CREATE, so it
+//     gets isValidMeasurementName, the create-time rule every client-facing
+//     ingest endpoint applies. handleCreate already did; update now does so
+//     unconditionally.
+//   - source_measurement names one that ALREADY EXISTS, so it gets the
+//     read-path rule instead: isSafeStoragePathSegment plus the glob rule, the
+//     same pair handleDelete and the retention handler apply to a stored
+//     policy's measurement. The create-time rule would be wrong here.
+//     Measurement names predate it (it shipped in v26.02.1), and edge-sync
+//     receive, backup restore and WAL replay each admit names it refuses, so
+//     real storage roots hold measurement directories it would reject — and
+//     Arc has no rename endpoint, so refusing them would orphan readable data
+//     with no remedy. isSafeStoragePathSegment makes the same argument for
+//     database names in its own doc comment.
+func validateCQDefinition(req *ContinuousQueryRequest) error {
+	if req.Name == "" {
+		return errors.New("name is required")
+	}
+	if req.Database == "" {
+		return errors.New("database is required")
+	}
+	if !isValidDatabaseName(req.Database) {
+		return errors.New("invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)")
+	}
+	if req.SourceMeasurement == "" {
+		return errors.New("source_measurement is required")
+	}
+	if err := validateCQSourceMeasurement(req.SourceMeasurement); err != nil {
+		return fmt.Errorf("invalid source_measurement: %w", err)
+	}
+	if req.DestinationMeasurement == "" {
+		return errors.New("destination_measurement is required")
+	}
+	if !isValidMeasurementName(req.DestinationMeasurement) {
+		return errors.New("invalid destination_measurement: must start with a letter and contain only alphanumeric characters, underscores, or hyphens")
+	}
+	if req.Query == "" {
+		return errors.New("query is required")
+	}
+	if req.Interval == "" {
+		return errors.New("interval is required")
+	}
+	// Validate query has required placeholders
+	if !strings.Contains(req.Query, "{start_time}") || !strings.Contains(req.Query, "{end_time}") {
+		return errors.New("query must contain {start_time} and {end_time} placeholders")
+	}
+	return nil
+}
+
+// validateCQSourceMeasurement is the rule for a measurement a continuous query
+// READS, applied identically at the boundary and before each run so the two
+// cannot drift.
+//
+// Both halves are needed and neither is redundant. isSafeStoragePathSegment is
+// the storage segment contract plus the API visibility rule, so it refuses a
+// separator ("a/b" names two components and would read a different directory),
+// "." and "..", an empty value, a NUL or backslash, an over-long segment, and a
+// leading dot. ValidateGlobSafe is the read-path rule on top: the source
+// becomes a read_parquet path, where "cpu*" is a PATTERN matching every
+// measurement starting with cpu rather than a name.
+// Returns the reason only; each caller supplies its own wording, since one is
+// answering a request about a field and the other is reporting a stored row.
+//
+// isSafeStoragePathSegment is the rule; ValidateKeySegment is consulted only to
+// explain a failure, since the rule is a bool and a caller that is told its
+// measurement is unusable should be told which part of it is. The leading dot
+// is the one thing isSafeStoragePathSegment refuses that the storage contract
+// accepts, so it is the only reason left to name locally.
+func validateCQSourceMeasurement(name string) error {
+	if !isSafeStoragePathSegment(name) {
+		if err := storage.ValidateKeySegment(name); err != nil {
+			return err
+		}
+		return errors.New("may not start with a dot, since the API declines to name dot-prefixed directories")
+	}
+	return storage.ValidateGlobSafe(name)
+}
+
 // handleCreate creates a new continuous query
 func (h *ContinuousQueryHandler) handleCreate(c *fiber.Ctx) error {
 	if !h.config.Enabled {
@@ -301,35 +398,8 @@ func (h *ContinuousQueryHandler) handleCreate(c *fiber.Ctx) error {
 	}
 
 	// Validate
-	if req.Name == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "name is required"})
-	}
-	if req.Database == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "database is required"})
-	}
-	if req.SourceMeasurement == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "source_measurement is required"})
-	}
-	if req.DestinationMeasurement == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "destination_measurement is required"})
-	}
-	if !isValidMeasurementName(req.DestinationMeasurement) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "invalid destination_measurement: must start with a letter and contain only alphanumeric characters, underscores, or hyphens",
-		})
-	}
-	if req.Query == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "query is required"})
-	}
-	if req.Interval == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "interval is required"})
-	}
-
-	// Validate query has required placeholders
-	if !strings.Contains(req.Query, "{start_time}") || !strings.Contains(req.Query, "{end_time}") {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "query must contain {start_time} and {end_time} placeholders",
-		})
+	if err := validateCQDefinition(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
 	// Run the shared SQL validator over the definition before storing it.
@@ -435,11 +505,11 @@ func (h *ContinuousQueryHandler) handleUpdate(c *fiber.Ctx) error {
 		})
 	}
 
-	// Validate destination_measurement if provided
-	if req.DestinationMeasurement != "" && !isValidMeasurementName(req.DestinationMeasurement) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "invalid destination_measurement: must start with a letter and contain only alphanumeric characters, underscores, or hyphens",
-		})
+	// The same rules create applies, for the reason the UPDATE below makes
+	// unavoidable: it overwrites every column, so a field this does not require
+	// is a field a partial body blanks (#995 for database, #1011 for the rest).
+	if err := validateCQDefinition(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
 	if err := validateTagColumns(req.TagColumns); err != nil {
@@ -467,6 +537,14 @@ func (h *ContinuousQueryHandler) handleUpdate(c *fiber.Ctx) error {
 	`, req.Name, req.Description, req.Database, req.SourceMeasurement, req.DestinationMeasurement, req.Query, req.Interval, tagColumnsJSON, req.RetentionDays, req.DeleteSourceAfterDays, req.IsActive, queryID)
 
 	if err != nil {
+		// Mapped the way handleCreate maps it: name is UNIQUE, and #1011 makes
+		// it mandatory on update, so a body carrying another definition's name
+		// is now an ordinary mistake rather than an internal failure.
+		if strings.Contains(err.Error(), "UNIQUE constraint") {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": fmt.Sprintf("Continuous query with name %q already exists", req.Name),
+			})
+		}
 		h.logger.Error().Err(err).Msg("Failed to update continuous query")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to update continuous query",
@@ -820,6 +898,77 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 		return 0, fmt.Errorf("stored continuous-query definition %q is not valid SQL to execute: %w", cq.Name, err)
 	}
 
+	// SECURITY: the stored database name is re-checked for the same reason the
+	// query above is. It becomes a storage path segment on both sides of the
+	// run — the source glob built below, and the destination write at the end
+	// of this function — and the create/update boundary began applying Arc's
+	// name rule to it only in #995. So a row stored by any build before that,
+	// or by an older build, or written straight into the shared metadata
+	// SQLite, can carry anything. handleUpdate was a fourth route until the
+	// same change: it writes database unconditionally, so a partial PUT stored
+	// an empty one.
+	//
+	// GetStoragePath below already refuses the glob metacharacters, but that
+	// is deliberately a weaker rule: ValidateKeySegment accepts leading dots
+	// and underscores because it is the storage contract, not a name format
+	// (see its doc comment). So "_schema" passes it, and a run writes real
+	// rows into Arc's reserved root — where the database listing hides them
+	// while table resolution still reads them, every storage-root walker
+	// (retention, compaction, tiering, Iceberg, backup) skips them via
+	// IsReservedRootDir, and the field-schema registry nests its own anchor
+	// tree inside itself at _schema/_schema/.
+	//
+	// Checked here rather than in the callers so the scheduler, the admin
+	// execute endpoint and any future caller are covered at once, and ahead of
+	// GetStoragePath so the failure names the real cause rather than arriving
+	// as an unusable-source error.
+	//
+	// No apostrophe in the message: the global log hook masks quoted spans
+	// (internal/sql/forlog.go#MaskErrText), so a lone ' opens a span that never
+	// closes and swallows the rest of the line. The %q values still mask in
+	// logs, which is the project's posture; the full text reaches the operator
+	// through the recorded execution, which is not sanitized.
+	if !isValidDatabaseName(cq.Database) {
+		return 0, fmt.Errorf("stored continuous-query definition %q has an invalid database name: %q", cq.Name, cq.Database)
+	}
+
+	// SECURITY: and the stored measurement names, for the same reason and in
+	// the same place. Both are storage path segments of the run — the source
+	// glob built immediately below, and the destination write at the end of
+	// this function — and until #1011 the create/update boundary applied no
+	// rule at all to source_measurement and let a partial PUT blank
+	// destination_measurement, so a stored row can carry anything.
+	//
+	// Each is checked against the rule its own boundary now applies, which is
+	// not the same rule for both: see validateCQDefinition for why a read
+	// measurement gets the storage-segment rule and a written one gets the
+	// create-time name rule.
+	//
+	// The source check is mostly about the error. GetStoragePath below already
+	// refuses a separator, a glob, "..", an empty value and an over-long
+	// segment, so what this adds is the leading-dot rule and a failure that
+	// names the field instead of arriving as "has an unusable source" — plus
+	// the property that the boundary and the run apply one predicate, which is
+	// what stops the next drift.
+	//
+	// The destination check is where the consequences are, and both only show
+	// up after the run: an empty destination made the write succeed into a key
+	// with an empty segment, which every caller recorded as a SUCCESSFUL
+	// execution while the rows died at flush; and a destination of "a/b" wrote
+	// db/a/b/{y}/{m}/{d}/{h}/a/b_*.parquet, which ValidateKey accepts because
+	// each segment is legal on its own. Those rows are not orphaned, they are
+	// worse: the measurement glob is recursive, so they read back as part of
+	// measurement "a", retention deletes them under that name, and Iceberg
+	// exports them into that table. Checked before the query runs rather than
+	// before the write, so an aggregation whose output can never land does not
+	// execute at all.
+	if err := validateCQSourceMeasurement(cq.SourceMeasurement); err != nil {
+		return 0, fmt.Errorf("stored continuous-query definition %q has an invalid source measurement name: %q: %w", cq.Name, cq.SourceMeasurement, err)
+	}
+	if !isValidMeasurementName(cq.DestinationMeasurement) {
+		return 0, fmt.Errorf("stored continuous-query definition %q has an invalid destination measurement name: %q", cq.Name, cq.DestinationMeasurement)
+	}
+
 	// Build storage path for source measurement (supports local, S3, Azure)
 	measurementPath, err := storage.GetStoragePath(h.storage, cq.Database, cq.SourceMeasurement)
 	if err != nil {
@@ -837,13 +986,13 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	if !cteNames[strings.ToLower(cq.SourceMeasurement)] {
 		// Escape single quotes: DuckDB read_parquet() paths cannot be
 		// parameterized, so the path is interpolated into a SQL string literal.
-		readParquetExpr := fmt.Sprintf("read_parquet('%s', union_by_name=true)", sqlutil.EscapeStringLiteral(measurementPath))
+		readParquetExpr := sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(measurementPath), "union_by_name=true")
 		// A continuous query reads a narrow, recent window: exactly the
 		// range in which a field absent from the newest files fails to
 		// bind. List the measurement's schema anchor first (#914).
 		if h.fieldSchema != nil {
 			if anchor, ok := h.fieldSchema.Resolve(ctx, cq.Database, cq.SourceMeasurement); ok {
-				readParquetExpr = fmt.Sprintf("read_parquet(['%s', '%s'], union_by_name=true)", sqlutil.EscapeStringLiteral(anchor), sqlutil.EscapeStringLiteral(measurementPath))
+				readParquetExpr = sqlutil.ReadParquetList([]string{sqlutil.QuoteStringLiteral(anchor), sqlutil.QuoteStringLiteral(measurementPath)}, "union_by_name=true")
 			}
 		}
 		wrappedQuery = wrapSourceMeasurement(query, cq.Database, cq.SourceMeasurement, readParquetExpr)

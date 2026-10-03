@@ -60,6 +60,10 @@ ingress:
           pathType: Prefix
   tls: []
 
+# Leaving this empty means no container memory limit, and the query engine then
+# sizes itself from the NODE's total memory — 80% of it. On a large node that is a
+# lot more than Arc's pre-26.09.3 default of min(cores, 32) GB. Set limits here,
+# or set database.memory_limit explicitly, if you want a smaller ceiling.
 resources: {}
   # limits:
   #   cpu: 2000m

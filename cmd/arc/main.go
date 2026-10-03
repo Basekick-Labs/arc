@@ -854,6 +854,39 @@ func main() {
 	if walWriter != nil {
 		arrowBuffer.SetWAL(walWriter)
 	}
+	// Bound ArrowBuffer.Close, which now WAITS for flushes in progress instead
+	// of cancelling them (#1007).
+	//
+	// The buffer is one component among several, and the coordinator invokes a
+	// component's Close with no context — it checks its own deadline only
+	// BETWEEN components. So a Close that consumes the whole budget makes the
+	// coordinator skip everything registered after it, including the `wal`
+	// component. wal.Writer.Close is what closes the writer's done channel and
+	// performs the final drain-and-sync of its async entry channel, so skipping
+	// it retains a WAL that is missing its newest entries — unrecoverable loss,
+	// and strictly worse than the records this change is saving.
+	//
+	// A live SIGTERM run with shutdown_timeout=5 and 60s-per-write storage
+	// showed exactly that: Close returned within its budget but AT the
+	// coordinator's deadline, and field-schema, wal-purge and wal were all
+	// skipped. Hence a fraction, not the whole budget.
+	//
+	// Half, and deliberately WITHOUT a floor. A floor large enough to be useful
+	// is larger than the whole budget at low settings — a 2s floor against
+	// shutdown_timeout=2 hands Close 100% of the coordinator's time and
+	// reintroduces the skip it was meant to prevent. Half is the honest rule at
+	// every value: the components after the buffer are a SQLite close, the WAL's
+	// final sync and the storage/database closes, all fast. Giving Close less
+	// time only means more records stay in the WAL to be replayed, which is
+	// recoverable; starving the WAL writer's sync is not.
+	//
+	// Note this does not account for what the hooks already spent before any
+	// component ran — in cluster mode ready-flag-off alone holds 10s. Close
+	// bounds itself; it cannot see the coordinator's remaining time.
+	//
+	// shutdownTimeout is the validated duration (server.shutdown_timeout with
+	// the non-positive fallback already applied above), not the raw config int.
+	arrowBuffer.SetCloseBudget(shutdownTimeout / 2)
 	shutdownCoordinator.Register("arrow-buffer", arrowBuffer, shutdown.PriorityBuffer)
 
 	// Measurement field schema registry (#914). Ingest folds every flushed
@@ -1323,10 +1356,15 @@ func main() {
 			MaxFilesPerBatch: cfg.Compaction.MaxFilesPerBatch,
 			ExcludeDatabases: cfg.Compaction.ExcludeDatabases,
 			// Per-subprocess DuckDB bounds. Config resolves the "auto"
-			// sentinels at load time: memory_limit defaults to
-			// database.memory_limit / max_concurrent (so compaction's
-			// worst case stays ~one database.memory_limit total, not
-			// max_concurrent times it), threads to half the cores.
+			// sentinels at load time. memory_limit: when
+			// database.memory_limit is set explicitly it is that
+			// divided by max_concurrent; when it is unset (the default
+			// since #1026, so DuckDB uses its own cgroup-aware value)
+			// it is detected_memory * 0.8 / (max_concurrent + 1), which
+			// bounds the subprocesses' combined budget rather than
+			// letting each take DuckDB's own 80% of the cgroup. threads
+			// is still half the HOST's cores, not the container's quota
+			// — see issue #1030.
 			MemoryLimit:   cfg.Compaction.MemoryLimit,
 			Threads:       cfg.Compaction.Threads,
 			CompletionDir: completionDir, // Phase 4: empty in OSS, set in cluster mode

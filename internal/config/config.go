@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/sysmem"
 	"github.com/spf13/viper"
 )
 
@@ -1145,8 +1146,8 @@ func Load() (*Config, error) {
 		},
 	}
 
-	if cfg.Database.MemoryLimit != "" && !memoryLimitRe.MatchString(cfg.Database.MemoryLimit) {
-		return nil, fmt.Errorf("invalid database.memory_limit value: %q", cfg.Database.MemoryLimit)
+	if err := validateDuckDBMemoryLimit("database.memory_limit", cfg.Database.MemoryLimit); err != nil {
+		return nil, err
 	}
 	if err := validateCompactionMemoryLimit(cfg.Compaction.MemoryLimit); err != nil {
 		return nil, err
@@ -1503,8 +1504,22 @@ func setDefaults(v *viper.Viper) {
 
 	// Database defaults - dynamically calculated based on system resources
 	v.SetDefault("database.max_connections", getDefaultMaxConnections())
-	v.SetDefault("database.memory_limit", getDefaultMemoryLimit())
-	v.SetDefault("database.thread_count", getDefaultThreadCount())
+	// Empty on purpose: DuckDB performs its own cgroup-aware detection
+	// (duckdb::CGroups::GetMemoryLimit is in the linked library) and defaults to
+	// 80% of the limit it finds. Arc used to overwrite that with a value derived
+	// from runtime.NumCPU(), which cannot see a CPU quota — a 2-core pod on a
+	// 64-core host reported 64 cores, estimated 128 GB of RAM and set a 32 GB
+	// limit inside a 2Gi container (#1026). Measured with this empty: a 36 GiB
+	// host yields 28.7 GiB, a --memory=512m container yields 409.5 MiB.
+	//
+	// An explicit value still wins; SetDefault only fills an absent key.
+	v.SetDefault("database.memory_limit", "")
+	// Zero means "leave DuckDB's own value": configureDatabase only issues
+	// SET GLOBAL threads when this is > 0. DuckDB reads cpu.max, so it gets the
+	// container's quota, where runtime.NumCPU() reported the host's core count
+	// and produced SET GLOBAL threads=64 in a 2-CPU pod (#1026). The licensed-core
+	// cap in main.go sets this explicitly and is unaffected.
+	v.SetDefault("database.thread_count", 0)
 	v.SetDefault("database.enable_wal", true)
 	v.SetDefault("database.temp_directory", "./.tmp")        // DuckDB query spill files (overflow, sort, join). Orphans swept at startup.
 	v.SetDefault("database.arcx_extension_path", "")         // Enterprise-only; gated by licenseClient.CanUseArcx()
@@ -1850,11 +1865,6 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("backup.local_path", "./data/backups")
 }
 
-func getDefaultThreadCount() int {
-	// Use number of CPU cores for optimal parallelism
-	return runtime.NumCPU()
-}
-
 // parseStringSlice parses a comma-separated string into a slice of strings.
 // This is needed because Viper's GetStringSlice doesn't automatically parse
 // comma-separated values from environment variables.
@@ -1902,15 +1912,32 @@ var memoryLimitValueRe = regexp.MustCompile(`^(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB|%
 // with a B/KB/MB/GB/TB unit work (decimals and internal whitespace included);
 // "%" and bare numbers are parser errors.
 func validateCompactionMemoryLimit(limit string) error {
+	return validateDuckDBMemoryLimit("compaction.memory_limit", limit)
+}
+
+// validateDuckDBMemoryLimit rejects every form DuckDB's SET memory_limit
+// rejects, for any key that feeds it.
+//
+// memoryLimitRe makes the unit OPTIONAL and permits "%", and DuckDB accepts
+// neither: "536870912" and "50%" both fail with `Unknown unit for memory`. Before
+// this was shared, database.memory_limit was checked against the loose regex
+// only, so "50%" or "0" passed config load and then hard-failed startup inside
+// configureDatabase — a crash at a point where the only signal is a DuckDB
+// parser error. compaction.memory_limit already enforced the strict rule; this is
+// the same rule, applied to both.
+func validateDuckDBMemoryLimit(key, limit string) error {
 	if limit == "" {
 		return nil
 	}
 	if !memoryLimitRe.MatchString(limit) {
-		return fmt.Errorf("invalid compaction.memory_limit value: %q", limit)
+		return fmt.Errorf("invalid %s value: %q", key, limit)
 	}
 	m := memoryLimitValueRe.FindStringSubmatch(strings.TrimSpace(limit))
 	if m == nil || m[2] == "" || m[2] == "%" {
-		return fmt.Errorf("invalid compaction.memory_limit value: %q (DuckDB requires an absolute size with a unit, e.g. \"2GB\" or \"512MB\"; percent and unit-less forms are not supported)", limit)
+		// The accepted set is spelled out because DuckDB's own rejection message
+		// advertises KiB/MiB/GiB/TiB, every one of which Arc's regex refuses — so
+		// an operator who follows DuckDB's hint lands on a second, vaguer error.
+		return fmt.Errorf("invalid %s value: %q (needs an absolute size with one of these units: B, KB, MB, GB, TB — e.g. \"2GB\" or \"512MB\". Percent forms, unit-less numbers and binary units like MiB are not accepted)", key, limit)
 	}
 	return nil
 }
@@ -1925,8 +1952,10 @@ func validateCompactionMemoryLimit(limit string) error {
 // nonsensical near-zero limit.
 //
 // An empty dbLimit (operator explicitly disabled the database limit, letting
-// DuckDB default to 80% of RAM) returns "" — there is nothing to derive from,
-// and the subprocess skips the SET entirely, matching pre-existing behavior.
+// An empty dbLimit no longer returns "": since #1026 that is the DEFAULT, and
+// leaving the subprocess to skip its SET would let each one take DuckDB's own 80%
+// of the whole cgroup. It now derives a concrete share from detected memory —
+// see deriveCompactionMemoryLimitFromSystem.
 // A percent or unit-less dbLimit also returns "": DuckDB's SET memory_limit
 // rejects both forms, so such a config aborts startup at the main database's
 // loud SET before compaction ever runs — deriving from it would only smuggle
@@ -1938,9 +1967,85 @@ func validateCompactionMemoryLimit(limit string) error {
 // limit per subprocess. Both are unreachable through Load, which has already
 // regex-validated dbLimit; they exist only so a future caller can't get an
 // empty limit out of a non-empty input by accident.
+// duckdbDefaultMemoryFraction is the fraction of a detected limit DuckDB gives
+// itself when memory_limit is unset. Measured, not assumed: a 36 GiB host yields
+// 28.7 GiB, and a --memory=512m container yields 409.5 MiB.
+const duckdbDefaultMemoryFraction = 0.8
+
+// deriveCompactionMemoryLimitFromSystem computes a per-subprocess DuckDB memory
+// limit from the memory this process may actually use.
+//
+// The arithmetic divides by maxConcurrent+1, not maxConcurrent, because the
+// subprocesses and the main Arc process are separate processes in the SAME
+// cgroup — the budget is shared, not per-process.
+//
+// Be clear about what this does and does not achieve. It bounds the
+// SUBPROCESSES' combined budget to roughly one share. It does NOT make the total
+// fit in the container: the main process takes DuckDB's own 80% of the whole
+// cgroup, so at the default max_concurrent of 2 the worst case is
+// 80% + 2*26.7% = 133%. That is a large improvement on what it replaced — a 2Gi
+// pod previously budgeted 32 GB for the main process and 16 GB for each
+// subprocess — but it is not a guarantee.
+//
+// It is tolerable because these are mostly SPILL THRESHOLDS rather than
+// reservations: DuckDB allocates up to the limit only if a query needs it, and
+// compaction subprocesses are short-lived and only run when there is work.
+// Mostly, because below roughly 85 MB DuckDB stops spilling and raises Out of
+// Memory instead — measured. Compaction classifies that as recoverable and halves
+// its batch, so a container too small for its max_concurrent makes no progress
+// rather than crashing. Bounding the total properly
+// means deciding how much of the machine Arc may use in aggregate, which is
+// #1025's subject, not this one's.
+//
+// Returns "" when nothing can be detected, which leaves today's behaviour in
+// place rather than substituting a guess.
+func deriveCompactionMemoryLimitFromSystem(maxConcurrent int) string {
+	if maxConcurrent <= 0 {
+		maxConcurrent = 2 // matches compaction.NewManager's default
+	}
+	detected, _, ok := sysmem.Limit()
+	if !ok || detected == 0 {
+		return ""
+	}
+
+	budget := uint64(float64(detected) * duckdbDefaultMemoryFraction)
+	share := budget / uint64(maxConcurrent+1)
+	if share == 0 {
+		return ""
+	}
+
+	// NO FLOOR, deliberately. A floor that can exceed the share re-creates the
+	// exact bug this fixes: a 128 MB container handed a 256 MB "floor" would be
+	// given twice its hard limit. A share too small to be useful means the
+	// container is too small for the configured max_concurrent, and inventing
+	// headroom would hide that until the kernel OOM-kills the pod. Returning the
+	// honest share lets DuckDB spill, which is slow but survivable.
+	return formatDuckDBBytes(share)
+}
+
+// formatDuckDBBytes renders a byte count in the one form that is both exact and
+// accepted by every validator here.
+//
+// "B" is required and deliberate. memoryLimitRe makes the unit optional, so a
+// bare number passes config validation and then hard-fails inside DuckDB with
+// `Unknown unit for memory: ”`. The binary units DuckDB would render (MiB/GiB)
+// are the ones memoryLimitRe rejects, and MB/GB are powers of 1000 so they
+// cannot express a byte count exactly. "<bytes>B" is exact: 536870912B is
+// 512.0 MiB.
+func formatDuckDBBytes(b uint64) string {
+	return strconv.FormatUint(b, 10) + "B"
+}
+
 func deriveCompactionMemoryLimit(dbLimit string, maxConcurrent int) string {
 	if dbLimit == "" {
-		return ""
+		// database.memory_limit is now empty by default, so DuckDB applies its
+		// own cgroup-aware value — and so would EVERY compaction subprocess,
+		// independently, each taking 80% of the same cgroup. A main process plus
+		// the default two subprocesses would budget 240% of the container, and
+		// subprocess.go only WARNS when a SET fails, so it would do it silently.
+		//
+		// Derive a concrete share from detected memory instead.
+		return deriveCompactionMemoryLimitFromSystem(maxConcurrent)
 	}
 	m := memoryLimitValueRe.FindStringSubmatch(strings.TrimSpace(dbLimit))
 	if m == nil {
@@ -1978,29 +2083,6 @@ func getDefaultCompactionThreads() int {
 		threads = 1
 	}
 	return threads
-}
-
-func getDefaultMemoryLimit() string {
-	// Target ~25% of system memory for DuckDB, capped at reasonable limits
-	// This is a conservative default that works well across different systems
-	// Users can override via ARC_DATABASE_MEMORY_LIMIT env var or config file
-	cores := runtime.NumCPU()
-
-	// Heuristic: assume ~2GB per core as a rough estimate of available memory
-	// This is conservative and works for most cloud instances
-	estimatedMemGB := cores * 2
-
-	// Use 50% of estimated memory for DuckDB
-	targetMemGB := estimatedMemGB / 2
-
-	// Apply bounds
-	if targetMemGB < 1 {
-		return "1GB"
-	}
-	if targetMemGB > 32 {
-		return "32GB" // Cap at 32GB by default
-	}
-	return fmt.Sprintf("%dGB", targetMemGB)
 }
 
 func getDefaultFlushWorkers() int {

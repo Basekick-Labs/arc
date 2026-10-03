@@ -117,6 +117,15 @@ func (d *Discoverer) Discover(ctx context.Context) (int, error) {
 			return 0, err
 		}
 		if !isSyncableFile(obj.Path) {
+			// Most skips are routine (not Parquet, reserved root, dot-prefixed)
+			// and logging them would drown the pass. A read-path rejection is
+			// not routine: it means a file is on disk that this spoke will
+			// never ship, and nothing else would say so.
+			if unsafeReadPathSegment(obj.Path) {
+				d.logger.Debug().
+					Str("path", obj.Path).
+					Msg("Skipping a file whose path a reader could misinterpret; it will never sync under this name")
+			}
 			continue
 		}
 		if len(excluded) > 0 {

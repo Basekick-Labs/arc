@@ -6,13 +6,24 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/spf13/viper"
 )
 
-func TestGetDefaultThreadCount(t *testing.T) {
-	expected := runtime.NumCPU()
-	actual := getDefaultThreadCount()
-	if actual != expected {
-		t.Errorf("getDefaultThreadCount() = %d, want %d", actual, expected)
+// TestDatabaseThreadCountDefaultsToZero pins that Arc does not set DuckDB's
+// thread count.
+//
+// DuckDB reads cpu.max and so gets the container's CPU quota. Arc used to
+// override that with runtime.NumCPU(), which reflects cpuset/affinity but NOT a
+// CFS quota — so a 2-CPU pod on a 64-core host produced SET GLOBAL threads=64
+// (#1026). Zero means configureDatabase skips the SET entirely and DuckDB's own
+// value stands. The licensed-core cap in main.go sets this explicitly and is
+// unaffected.
+func TestDatabaseThreadCountDefaultsToZero(t *testing.T) {
+	v := viper.New()
+	setDefaults(v)
+	if got := v.GetInt("database.thread_count"); got != 0 {
+		t.Errorf("database.thread_count default = %d, want 0 so DuckDB's cgroup-aware value is left alone", got)
 	}
 }
 
@@ -42,14 +53,19 @@ func TestGetDefaultMaxConnections_Bounds(t *testing.T) {
 	}
 }
 
-func TestGetDefaultMemoryLimit(t *testing.T) {
-	result := getDefaultMemoryLimit()
-	if result == "" {
-		t.Error("getDefaultMemoryLimit() returned empty string")
-	}
-	// Should end with "GB"
-	if len(result) < 3 || result[len(result)-2:] != "GB" {
-		t.Errorf("getDefaultMemoryLimit() = %s, should end with 'GB'", result)
+// TestDatabaseMemoryLimitDefaultsToEmpty pins that Arc does not set DuckDB's
+// memory limit either.
+//
+// Empty does NOT mean unlimited: DuckDB performs its own cgroup-aware detection
+// and defaults to 80% of what it finds (measured — 28.7 GiB on a 36 GiB host,
+// 409.5 MiB in a --memory=512m container). Arc used to overwrite that with
+// min(NumCPU, 32) GB, which is 32 GB inside a 2Gi pod on a big host and 14 GB on
+// a 36 GiB workstation: wrong in both directions depending on memory-per-core.
+func TestDatabaseMemoryLimitDefaultsToEmpty(t *testing.T) {
+	v := viper.New()
+	setDefaults(v)
+	if got := v.GetString("database.memory_limit"); got != "" {
+		t.Errorf("database.memory_limit default = %q, want \"\" so DuckDB's cgroup-aware value is left alone", got)
 	}
 }
 
@@ -118,9 +134,8 @@ func TestLoad_DefaultsFromSystem(t *testing.T) {
 	}
 
 	// Verify dynamic defaults are applied
-	expectedThreads := runtime.NumCPU()
-	if cfg.Database.ThreadCount != expectedThreads {
-		t.Errorf("Database.ThreadCount = %d, want %d", cfg.Database.ThreadCount, expectedThreads)
+	if cfg.Database.ThreadCount != 0 {
+		t.Errorf("Database.ThreadCount = %d, want 0 (DuckDB's own cgroup-aware value, #1026)", cfg.Database.ThreadCount)
 	}
 
 	expectedConns := getDefaultMaxConnections()
@@ -128,9 +143,8 @@ func TestLoad_DefaultsFromSystem(t *testing.T) {
 		t.Errorf("Database.MaxConnections = %d, want %d", cfg.Database.MaxConnections, expectedConns)
 	}
 
-	expectedMem := getDefaultMemoryLimit()
-	if cfg.Database.MemoryLimit != expectedMem {
-		t.Errorf("Database.MemoryLimit = %s, want %s", cfg.Database.MemoryLimit, expectedMem)
+	if cfg.Database.MemoryLimit != "" {
+		t.Errorf("Database.MemoryLimit = %q, want \"\" (DuckDB's own cgroup-aware value, #1026)", cfg.Database.MemoryLimit)
 	}
 
 	// Ingest dictionary defaults (26.09.1): no dictionary encoding at ingest —
