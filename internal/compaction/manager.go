@@ -49,7 +49,7 @@ type Manager struct {
 	CycleTimeout     time.Duration // Shared budget for scheduled and manual cycles
 	TempDirectory    string        // Temp directory for compaction files
 	MemoryLimit      string        // DuckDB memory limit for EACH subprocess (e.g., "8GB")
-	Threads          int           // DuckDB thread count for EACH subprocess (0 = DuckDB default: all cores)
+	Threads          int           // DuckDB thread count for EACH subprocess (0 = DuckDB decides: the container CPU quota, or all cores when unlimited)
 
 	// excludeDatabases holds compaction.exclude_databases as a set, built
 	// once by NewManager from the normalized excludeList. Immutable after
@@ -152,7 +152,7 @@ type ManagerConfig struct {
 	ExcludeDatabases []string
 	TempDirectory    string              // Temp directory for compaction files
 	MemoryLimit      string              // DuckDB memory limit for EACH subprocess (e.g., "8GB")
-	Threads          int                 // DuckDB thread count for EACH subprocess (0 = DuckDB default: all cores)
+	Threads          int                 // DuckDB thread count for EACH subprocess (0 = DuckDB decides: the container CPU quota, or all cores when unlimited)
 	CompletionDir    string              // Phase 4: local-disk completion-manifest dir (empty = OSS mode)
 	SortKeysConfig   map[string][]string // Per-measurement sort keys from ingest config
 	DefaultSortKeys  []string            // Default sort keys from ingest config
