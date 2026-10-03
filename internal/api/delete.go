@@ -508,6 +508,40 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 		return false, fmt.Errorf("WHERE clause contains forbidden file I/O function: %s()", m[1])
 	}
 
+	// SECURITY: reject a path literal standing in table position inside the
+	// fragment. The keyword and I/O-function scans above cannot see this
+	// class: a replacement scan has no function name to match, and the
+	// keyword list blocks SELECT and UNION but not the other spellings
+	// DuckDB accepts for introducing a relation — `EXISTS (FROM '<glob>')`
+	// and `EXISTS (TABLE '<glob>')` carry neither.
+	//
+	// That matters here because the fragment is interpolated straight into
+	// `SELECT ... FROM read_parquet(...) WHERE <fragment>` (findAffectedFiles,
+	// and the per-file count below it), so a literal standing in table
+	// position there is resolved by DuckDB rather than treated as a value —
+	// and the response carries row and file counts derived from it, dry-run
+	// included.
+	//
+	// Reuses the query path's guard rather than growing a third keyword list
+	// in this file: that guard is fed by the same normalisation and already
+	// knows every relation-introducing keyword DuckDB has (FROM, JOIN, TABLE,
+	// SUMMARIZE, DESCRIBE, PIVOT, UNPIVOT), so this inherits additions to it
+	// instead of drifting from them.
+	//
+	// It is applied to the FRAGMENT, not to the assembled statement: by the
+	// time the statement exists the fragment sits inside Arc's own
+	// read_parquet(...), which would self-trip the I/O denylist — the same
+	// ordering constraint queryMeasurement documents. A fragment that
+	// introduces a relation carries its own keyword, so the scanner arms
+	// without needing a synthetic FROM clause around it.
+	maskInput := backticksToDoubleQuotes(where)
+	features := scanSQLFeatures(maskInput)
+	normalised, _ := sqlutil.MaskStringLiterals(maskInput, features.hasQuotes)
+	normalised = stripSQLComments(normalised, features.hasDashComment || features.hasBlockComment)
+	if stringLiteralInTablePosition(normalised) {
+		return false, fmt.Errorf("WHERE clause may not put a string literal in table position (replacement scans are disabled)")
+	}
+
 	// Check for dangerous prefixes
 	for _, pattern := range dangerousPrefixPatterns {
 		if strings.Contains(whereUpper, pattern) {
@@ -613,11 +647,11 @@ func (h *DeleteHandler) countMatchingRowsInFiles(ctx context.Context, files []fi
 	// Single query to get counts per file using filename column
 	query := fmt.Sprintf(`
 		SELECT filename, COUNT(*) as match_count
-		FROM read_parquet(%s, filename=true, union_by_name=true)
+		FROM %s
 		WHERE %s
 		GROUP BY filename
 		HAVING COUNT(*) > 0`,
-		pathList.String(), whereClause)
+		sqlutil.ReadParquet(pathList.String(), "filename=true", "union_by_name=true"), whereClause)
 
 	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
@@ -676,7 +710,7 @@ func (h *DeleteHandler) countMatchingRowsIndividually(ctx context.Context, files
 	db := h.db.DB()
 
 	for _, f := range files {
-		query := fmt.Sprintf("SELECT COUNT(*) FROM read_parquet(%s) WHERE %s", sqlutil.QuoteStringLiteral(f.queryPath), whereClause)
+		query := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s", sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(f.queryPath)), whereClause)
 		var count int64
 		if err := db.QueryRowContext(ctx, query).Scan(&count); err != nil {
 			h.logger.Warn().Err(err).Str("file", f.relativePath).Msg("Failed to count matching rows, skipping file")
@@ -710,8 +744,8 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 		SELECT
 			COUNT(*) as total,
 			COUNT(*) FILTER (WHERE NOT (%s)) as remaining
-		FROM read_parquet(%s)`,
-		whereClause, sqlutil.QuoteStringLiteral(queryPath))
+		FROM %s`,
+		whereClause, sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(queryPath)))
 
 	if err := db.QueryRowContext(ctx, countQuery).Scan(&rowsBefore, &rowsAfter); err != nil {
 		return 0, fmt.Errorf("failed to count rows: %w", err)
@@ -793,13 +827,13 @@ func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, _, where
 	// database-wide setting is false.
 	copyQuery := fmt.Sprintf(`
 		COPY (
-			SELECT * FROM read_parquet(%s) WHERE NOT (%s)
+			SELECT * FROM %s WHERE NOT (%s)
 		) TO %s (
 			FORMAT PARQUET,
 			COMPRESSION ZSTD,
 			COMPRESSION_LEVEL 3,
 			ROW_GROUP_SIZE %d
-		)`, sqlutil.QuoteStringLiteral(filePath), whereClause, sqlutil.QuoteStringLiteral(tempFile), parquetRowGroupSize)
+		)`, sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(filePath)), whereClause, sqlutil.QuoteStringLiteral(tempFile), parquetRowGroupSize)
 
 	if err := database.ExecPreservingInsertionOrder(ctx, db, copyQuery); err != nil {
 		os.Remove(tempFile)
@@ -869,13 +903,13 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 	// database-wide setting is false.
 	copyQuery := fmt.Sprintf(`
 		COPY (
-			SELECT * FROM read_parquet(%s) WHERE NOT (%s)
+			SELECT * FROM %s WHERE NOT (%s)
 		) TO %s (
 			FORMAT PARQUET,
 			COMPRESSION ZSTD,
 			COMPRESSION_LEVEL 3,
 			ROW_GROUP_SIZE %d
-		)`, sqlutil.QuoteStringLiteral(s3Path), whereClause, sqlutil.QuoteStringLiteral(tempPath), parquetRowGroupSize)
+		)`, sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(s3Path)), whereClause, sqlutil.QuoteStringLiteral(tempPath), parquetRowGroupSize)
 
 	if err := database.ExecPreservingInsertionOrder(ctx, db, copyQuery); err != nil {
 		return 0, nil, fmt.Errorf("failed to write filtered data: %w", err)

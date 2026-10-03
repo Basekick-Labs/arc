@@ -783,12 +783,32 @@ type bufferShard struct {
 	bufferRecordCounts map[string]int
 	bufferSchemas      map[string]string // Column signature for schema evolution detection
 	mu                 sync.RWMutex
+
+	// swept is set by Close()'s shard-flush loop, under the same mu
+	// acquisition that flushes the shard, and is the signal that no further
+	// append may happen here: anything added after the sweep would never be
+	// flushed and would not be counted by CloseFlushedCleanly (#1007).
+	//
+	// It is deliberately PER SHARD rather than the global b.closing flag.
+	// b.closing is set as Close()'s first statement, but the shard loop does
+	// not start until after b.cancel() and b.wg.Wait() — a full flushTimeout
+	// later in the worst case. Refusing on the global flag would reject every
+	// write in that window, including replicated entries that have no WAL
+	// copy of their own (WriteColumnarDirectNoWAL passes skipWAL), where today
+	// Close() flushes them successfully.
+	swept bool
 }
 
-// flushTask represents a flush operation to be executed by workers
+// flushTask represents a flush operation to be executed by workers.
+//
+// It deliberately carries NO context: the flush timeout is created by the
+// worker that receives the task, not by the writer that enqueues it (#1006).
+// A timeout started at enqueue is consumed while the task waits in the queue,
+// so under a backlog of N tasks at T per flush the task at the back arrives
+// with flushTimeout-N*T left and can be already expired — the storage write
+// then fails for a queueing reason and the batch is dropped as if storage had
+// failed.
 type flushTask struct {
-	ctx         context.Context
-	cancel      context.CancelFunc // must be called when task completes to release resources
 	bufferKey   string
 	database    string
 	measurement string
@@ -866,12 +886,28 @@ type ArrowBuffer struct {
 	shardCount uint32
 
 	// Background flush
-	ctx           context.Context
-	cancel        context.CancelFunc
-	flushTimer    *time.Timer   // self-adjusting: fires when the oldest buffer is due to expire
-	flushDeadline time.Time     // absolute time when flushTimer will fire; updated whenever the timer is (re)set
-	newBufferCh   chan struct{} // signals periodicFlush that a new buffer was created (used for idle→active wake-up)
-	wg            sync.WaitGroup
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	// flushParent is the parent of every flush I/O context. It is derived
+	// with context.WithoutCancel(b.ctx), so b.cancel() — which exists to stop
+	// the metrics sampler, the periodic flush and the workers' receive loops —
+	// cannot abort a storage write that is already in progress (#1007).
+	//
+	// flushParentCancel is NOT part of normal shutdown. Close() calls it only
+	// when its budget expires, as a last resort so that Close() always returns
+	// and the remaining shutdown components still run. That matters because the
+	// coordinator invokes Close() with no context and checks its own deadline
+	// only BETWEEN components: a Close that never returns would skip the
+	// wal-purge and wal components, and wal.Writer.Close is what performs the
+	// WAL's final drain-and-sync. A shutdown that hangs here would retain a
+	// WAL missing its newest entries.
+	flushParent       context.Context
+	flushParentCancel context.CancelFunc
+	flushTimer        *time.Timer   // self-adjusting: fires when the oldest buffer is due to expire
+	flushDeadline     time.Time     // absolute time when flushTimer will fire; updated whenever the timer is (re)set
+	newBufferCh       chan struct{} // signals periodicFlush that a new buffer was created (used for idle→active wake-up)
+	wg                sync.WaitGroup
 
 	// OPTIMIZATION: Worker pool for bounded flush concurrency
 	// Prevents goroutine explosion under sustained load
@@ -883,6 +919,21 @@ type ArrowBuffer struct {
 	// flag set before the channel could be closed (the channel is
 	// never closed; workers exit on b.ctx.Done()).
 	closing atomic.Bool
+
+	// totalFlushDeferred counts how many times a size-triggered flush was
+	// DEFERRED because the bounded flush queue had no room: the records stay in
+	// the shard buffer and are flushed by a later write to the same key, by the
+	// age-based sweep, or by Close. Before #966 route 1 this condition extracted
+	// the batch and dropped it, so this counter is the operator-visible
+	// replacement for a silent data loss. Exposed as
+	// arc_ingest_flush_deferred_total and total_flush_deferred in GetStats.
+	totalFlushDeferred atomic.Int64
+
+	// flushDeferredLastLogNano is the sampler timestamp for the deferral Warn,
+	// following recordWALError's pattern: sustained backpressure can defer on
+	// every write to a hot measurement, and an unsampled line per deferral
+	// floods the log exactly when an operator needs to read it.
+	flushDeferredLastLogNano atomic.Int64
 
 	// closeFlushClean records whether Close()'s final flush persisted every
 	// buffered record. False until Close() completes successfully, so callers
@@ -904,6 +955,12 @@ type ArrowBuffer struct {
 	// not reach storage, so a subsequent Close cannot report a clean flush and
 	// re-enable the shutdown WAL purge (#803).
 	closeFailed atomic.Bool
+
+	// closeBudget bounds Close() as a whole, including the wait for in-flight
+	// flushes. Set by SetCloseBudget from server.shutdown_timeout; falls back
+	// to flushTimeout when unset or non-positive. It bounds Close() only, not
+	// the coordinator's remaining time, which Close() cannot observe.
+	closeBudget time.Duration
 
 	// Sort key configuration (for multi-column sorting)
 	sortKeysConfig  map[string][]string // measurement -> sort keys
@@ -1067,6 +1124,62 @@ func (b *ArrowBuffer) currentBufferedRecords() int64 {
 	return total
 }
 
+// newFlushContext returns the context every flush I/O must use: derived from
+// flushParent, so neither Close()'s b.cancel() nor a client disconnect can
+// abort a write whose records are already out of the buffer, and bounded by
+// flushTimeout.
+//
+// The nil guard covers tests that hand-build &ArrowBuffer{} without calling
+// NewArrowBuffer: context.WithTimeout(nil, d) panics, and none of those tests
+// should have to know that a flush needs a parent.
+//
+// NOTE on what the timeout actually bounds: it is only as effective as the
+// backend. LocalBackend.Write ignores its context entirely, so on the OSS
+// default backend a write in progress runs to completion regardless. The
+// timeout is a real bound for S3 and Azure, whose SDKs are context-aware.
+func (b *ArrowBuffer) newFlushContext() (context.Context, context.CancelFunc) {
+	parent := b.flushParent
+	if parent == nil {
+		parent = context.Background()
+	}
+	timeout := b.flushTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
+// SetCloseBudget bounds how long Close() may take in total, including the wait
+// for in-flight flushes. main.go passes the validated server.shutdown_timeout
+// duration right after construction.
+//
+// This bounds Close() alone. The shutdown coordinator runs every hook before
+// any component and invokes a component's Close with no context, checking its
+// own deadline only between components, so Close cannot see how much of the
+// overall budget the hooks already spent. If they overran it and the
+// coordinator skips the buffer entirely, Close never runs, closeFlushClean is
+// never set, and CloseFlushedCleanly reports false — the WAL is retained,
+// which is the safe direction.
+func (b *ArrowBuffer) SetCloseBudget(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	b.closeBudget = d
+}
+
+// closeDeadlineBudget is the effective budget for a Close(): the configured one
+// when set, otherwise a single flushTimeout, which is what one storage write is
+// already allowed to take.
+func (b *ArrowBuffer) closeDeadlineBudget() time.Duration {
+	if b.closeBudget > 0 {
+		return b.closeBudget
+	}
+	if b.flushTimeout > 0 {
+		return b.flushTimeout
+	}
+	return 30 * time.Second
+}
+
 func (b *ArrowBuffer) markFlushFailure() {
 	b.totalErrors.Add(1)
 	b.hasFlushFailure.Store(true)
@@ -1130,6 +1243,12 @@ func (b *ArrowBuffer) HasDecimalColumns() bool {
 func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger zerolog.Logger) *ArrowBuffer {
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// Flush I/O runs on a context that b.cancel() cannot reach, so a graceful
+	// shutdown stops the background loops without aborting a storage write
+	// whose records have already been removed from the buffer (#1007).
+	// Close() cancels flushParent only if its own budget expires.
+	flushParent, flushParentCancel := context.WithCancel(context.WithoutCancel(ctx))
+
 	// Use configured values with sensible fallbacks
 	flushWorkers := cfg.FlushWorkers
 	if flushWorkers <= 0 {
@@ -1176,6 +1295,8 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 		shardCount:           uint32(shardCount),
 		ctx:                  ctx,
 		cancel:               cancel,
+		flushParent:          flushParent,
+		flushParentCancel:    flushParentCancel,
 		flushTimer:           time.NewTimer(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
 		flushDeadline:        time.Now().UTC().Add(time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond),
 		newBufferCh:          make(chan struct{}, 1),
@@ -1647,85 +1768,102 @@ func (b *ArrowBuffer) recordWALError(err error, fields func(*zerolog.Event)) {
 	ev.Msg("WAL write failed - data may be lost on crash")
 }
 
-// flushSendOutcome tells callers whether tryEnqueueFlush actually
-// queued the task. Callers don't need to do anything different on
-// queued vs dropped today (data is in WAL either way), but having a
-// distinct outcome makes the audit trail and metrics readable.
-type flushSendOutcome int
-
-const (
-	flushQueued      flushSendOutcome = iota // task accepted on flushQueue
-	flushSkipClosing                         // buffer is closing — short-circuit
-	flushCtxCanceled                         // ctx fired during the select (defense-in-depth vs the closing flag)
-	flushQueueFull                           // queue at capacity, drop relying on WAL replay
-)
-
-// tryEnqueueFlush is the shared non-blocking send into b.flushQueue
-// used by both writeColumnarInternal and writeTypedColumnarInternal.
-// It encapsulates:
-//  1. The closing-flag short-circuit (Close() set the flag; data
-//     stays in WAL, no panic from a closed channel).
-//  2. The ctx.Done() defense-in-depth select arm (covers the narrow
-//     window between flag-load and select-eval where Close()'s
-//     cancel could fire).
-//  3. The queue-full default arm (queue at capacity; data stays in
-//     WAL for recovery).
+// enqueueOrDeferLocked handles a size-triggered flush. It MUST be called with
+// shard.mu held, and it never blocks.
 //
-// The caller MUST already have built `task` and called flushCancel
-// to register the timeout context — tryEnqueueFlush does not own
-// that lifecycle. flushCancel is invoked here on every non-queued
-// outcome so the ctx is cleaned up promptly.
+// Either the whole buffer is handed to a worker and its map entries are removed,
+// or nothing is touched and the records stay where they are. That choice is the
+// fix for #966 route 1: the old code extracted and deleted the buffer FIRST and
+// only then attempted the send, so a full queue destroyed a batch built from
+// many already-acknowledged writes. Nothing is extracted unless it has somewhere
+// to go.
 //
-// Returns the outcome so the caller can pass it to metrics/logging
-// uniformly. All non-queued outcomes increment the same
-// IncWALRecordsPreserved counter to keep the operator-visible
-// "records that fell back to WAL" rate authoritative.
-func (b *ArrowBuffer) tryEnqueueFlush(
-	task flushTask,
-	flushCancel context.CancelFunc,
-	bufferKey string,
+// Returns (queued, deferred). Both false means shutdown is in progress, where
+// Close's own shard loop flushes the buffer and a deferral is not worth
+// reporting.
+//
+// Why the send belongs under shard.mu: it is a non-blocking select, so it cannot
+// deadlock, and holding the lock across it is what makes the decision atomic
+// with respect to the buffer. It also removes the window that used to exist
+// between extracting and enqueueing, in which a writer held records that were in
+// no buffer, no queue and no flush.
+//
+// The pre-check on queue length matters for its own sake: without it, a buffer
+// that is over the threshold while the queue is saturated would build a task and
+// a context on every single write just to discard them.
+func (b *ArrowBuffer) enqueueOrDeferLocked(
+	shard *bufferShard,
+	bufferKey, database, measurement string,
 	totalBuffered int,
-) flushSendOutcome {
-	if b.closing.Load() {
-		flushCancel()
-		b.logger.Warn().
-			Str("buffer_key", bufferKey).
-			Int("records", totalBuffered).
-			Msg("Flush queue send skipped: buffer is closing (data preserved in WAL)")
-		metrics.Get().IncWALRecordsPreserved(int64(totalBuffered))
-		b.walOnlyRecords.Add(int64(totalBuffered))
-		return flushSkipClosing
+) (queued bool, deferred bool) {
+	closing := b.closing.Load()
+	if closing || len(b.flushQueue) >= cap(b.flushQueue) {
+		// Deferring during shutdown is normal and uninteresting: Close flushes
+		// this buffer. Only a genuine queue-full deferral is worth counting.
+		if !closing {
+			b.recordFlushDeferred()
+			return false, true
+		}
+		return false, false
 	}
+
+	// Hand the buffer's slice straight to the task rather than copying it. Safe
+	// because the map entries are deleted below on success, so the next write to
+	// this key starts a fresh slice and nothing appends to the one in flight.
+	//
+	// No context on the task: the worker builds the timeout when it receives it,
+	// so the timeout measures the storage write and not the queue wait (#1006).
+	task := flushTask{
+		bufferKey:   bufferKey,
+		database:    database,
+		measurement: measurement,
+		records:     shard.buffers[bufferKey],
+		recordCount: totalBuffered,
+	}
+
 	select {
 	case b.flushQueue <- task:
-		depth := b.queueDepth.Add(1)
-		metrics.Get().SetBufferQueueDepth(depth)
-		b.logger.Info().
-			Str("buffer_key", bufferKey).
-			Int("total_records", totalBuffered).
-			Int64("queue_depth", b.queueDepth.Load()).
-			Msg("Buffer size exceeded, queued flush to worker pool")
-		return flushQueued
+		b.queueDepth.Add(1)
+		// Only now does the buffer stop owning these records.
+		delete(shard.buffers, bufferKey)
+		delete(shard.bufferStartTimes, bufferKey)
+		delete(shard.bufferRecordCounts, bufferKey)
+		delete(shard.bufferSchemas, bufferKey)
+		return true, false
 	case <-b.ctx.Done():
-		flushCancel()
-		b.logger.Warn().
-			Str("buffer_key", bufferKey).
-			Int("records", totalBuffered).
-			Msg("Flush queue send aborted: ArrowBuffer ctx canceled (data preserved in WAL)")
-		metrics.Get().IncWALRecordsPreserved(int64(totalBuffered))
-		b.walOnlyRecords.Add(int64(totalBuffered))
-		return flushCtxCanceled
+		// Close cancelled b.ctx between the checks above and this select. The
+		// records stay in the buffer for Close's shard loop.
+		return false, false
 	default:
-		flushCancel()
+		// Lost the race against another writer for the last slot.
+		b.recordFlushDeferred()
+		return false, true
+	}
+}
+
+// recordFlushDeferred counts a deferral. Before #966 route 1 this condition
+// silently dropped the batch, so this counter is the operator-visible
+// replacement for a data loss.
+func (b *ArrowBuffer) recordFlushDeferred() {
+	b.totalFlushDeferred.Add(1)
+	metrics.Get().IncIngestFlushDeferred()
+}
+
+// logFlushDeferred emits a sampled Warn, on the same sampler pattern as
+// recordWALError: sustained backpressure defers on nearly every write to a hot
+// measurement, and one line per deferral would bury the signal.
+//
+// Called OUTSIDE shard.mu.
+func (b *ArrowBuffer) logFlushDeferred(bufferKey string, totalBuffered int) {
+	now := time.Now().UnixNano()
+	last := b.flushDeferredLastLogNano.Load()
+	if now-last >= walDropLogIntervalNano && b.flushDeferredLastLogNano.CompareAndSwap(last, now) {
 		b.logger.Warn().
 			Str("buffer_key", bufferKey).
 			Int("records", totalBuffered).
+			Int64("deferred_total", b.totalFlushDeferred.Load()).
 			Int64("queue_depth", b.queueDepth.Load()).
-			Msg("Flush queue full - data preserved in WAL for recovery")
-		b.totalErrors.Add(1)
-		metrics.Get().IncWALRecordsPreserved(int64(totalBuffered))
-		b.walOnlyRecords.Add(int64(totalBuffered))
-		return flushQueueFull
+			Msg("Flush queue full; records retained in memory for a later flush")
 	}
 }
 
@@ -1751,6 +1889,13 @@ const schemaEvolutionMaxIters = 8
 // per-iteration flushes, so there is no data loss — only a per-request
 // failure under sustained schema-rotation churn.
 var ErrSchemaChurnExceeded = errors.New("schema-evolution loop exceeded max iterations: sustained concurrent schema churn against the same (database, measurement)")
+
+// ErrBufferClosing is returned by a write whose shard has already been flushed
+// by Close(). Appending after the sweep would leave records that no flush ever
+// reaches and that CloseFlushedCleanly does not count, so the write is refused
+// instead. Handlers map it to 503: the node is shutting down, and the client
+// should retry elsewhere rather than treat it as a permanent server error.
+var ErrBufferClosing = errors.New("arrow buffer is closing: write refused")
 
 // flushOnSchemaChangeLocked is the shared helper used by both columnar
 // write paths to handle schema evolution under the shard lock.
@@ -1793,7 +1938,16 @@ func (b *ArrowBuffer) flushOnSchemaChangeLocked(
 			Str("new_schema", newSignature).
 			Msg("Schema evolution detected, flushing buffer")
 
-		if err := b.flushBufferLocked(ctx, shard, bufferKey, database, measurement); err != nil {
+		// The flush I/O runs on flushParent, NOT on the request context: these
+		// rows belong to whoever wrote them earlier, and a client disconnecting
+		// mid-flush must not abort a flush of other clients' acknowledged rows
+		// (#1007). The request context still governs the loop itself via the
+		// ctx.Err() check above, so a disconnect is observed between
+		// iterations rather than in the middle of a write.
+		flushCtx, flushCancel := b.newFlushContext()
+		err := b.flushBufferLocked(flushCtx, shard, bufferKey, database, measurement)
+		flushCancel()
+		if err != nil {
 			b.logger.Error().Err(err).
 				Str("buffer_key", bufferKey).
 				Msg("Failed to flush buffer on schema change")
@@ -1894,8 +2048,7 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 
 	// OPTIMIZATION: Extract-then-flush pattern
 	// Hold lock ONLY to extract records, flush outside lock
-	var recordsToFlush []interface{}
-	var shouldFlush bool
+	var shouldFlush, flushDeferred bool
 
 	shard.mu.Lock()
 
@@ -1920,6 +2073,31 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 		}
 	}
 
+	// Refuse once Close() has swept THIS shard: anything appended after the
+	// sweep is never flushed and is not counted by CloseFlushedCleanly, so the
+	// shutdown WAL purge would delete its only other copy (#1007).
+	//
+	// The check belongs here, after flushOnSchemaChangeLocked and immediately
+	// before the append with no unlock in between. A check right after
+	// shard.mu.Lock() would be bypassed: flushBufferLocked releases and
+	// re-acquires the lock around its I/O, so a writer could pass the check,
+	// the schema flush could unlock, Close() could sweep this shard, and the
+	// writer would then append into it.
+	//
+	// It is per-shard rather than the global b.closing flag on purpose; see
+	// bufferShard.swept for why refusing on the global flag loses replicated
+	// rows that have no WAL copy of their own.
+	//
+	// The record is already in the WAL when the WAL is enabled (that append
+	// precedes this lock), so count it as WAL-only: CloseFlushedCleanly then
+	// stays false and the shutdown purge is skipped.
+	if shard.swept {
+		shard.mu.Unlock()
+		b.walOnlyRecords.Add(int64(numRecords))
+		metrics.Get().IncWALRecordsPreserved(int64(numRecords))
+		return ErrBufferClosing
+	}
+
 	// Add typed columns to buffer (already converted via zero-copy fast paths)
 	shard.buffers[bufferKey] = append(shard.buffers[bufferKey], typedColumns)
 
@@ -1929,28 +2107,25 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 
 	// Check if buffer needs flush (size-based)
 	if totalBuffered >= b.config.MaxBufferSize {
-		// Extract records to flush (hold lock for microseconds only)
-		recordsToFlush = make([]interface{}, len(shard.buffers[bufferKey]))
-		copy(recordsToFlush, shard.buffers[bufferKey])
-
-		// Clear buffer completely so next write re-initializes bufferStartTimes
-		// Using delete() instead of = nil ensures the key doesn't exist,
-		// so the next WriteColumnar properly sets a fresh start time
-		delete(shard.buffers, bufferKey)
-		delete(shard.bufferStartTimes, bufferKey)
-		delete(shard.bufferRecordCounts, bufferKey)
-		delete(shard.bufferSchemas, bufferKey)
-
-		shouldFlush = true
-
-		b.logger.Debug().
-			Str("buffer_key", bufferKey).
-			Int("total_records", totalBuffered).
-			Msg("Extracted records for flush (fire-and-forget)")
+		shouldFlush, flushDeferred = b.enqueueOrDeferLocked(shard, bufferKey, database, record.Measurement, totalBuffered)
 	}
 
 	// Release lock IMMEDIATELY (lock held for <1ms)
 	shard.mu.Unlock()
+
+	// Logging and metrics outside the lock: the send itself is non-blocking, but
+	// there is no reason to hold a shard lock across zerolog formatting.
+	if shouldFlush {
+		metrics.Get().SetBufferQueueDepth(b.queueDepth.Load())
+		b.logger.Info().
+			Str("buffer_key", bufferKey).
+			Int("total_records", totalBuffered).
+			Int64("queue_depth", b.queueDepth.Load()).
+			Msg("Buffer size exceeded, queued flush to worker pool")
+	}
+	if flushDeferred {
+		b.logFlushDeferred(bufferKey, totalBuffered)
+	}
 
 	// OPTIMIZATION: Update metrics with atomic operations (lock-free!)
 	b.totalRecordsBuffered.Add(int64(numRecords))
@@ -1961,33 +2136,6 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 		Int("total_buffered", totalBuffered).
 		Bool("flushing", shouldFlush).
 		Msg("Added columnar data to buffer")
-
-	// OPTIMIZATION: Queue flush to worker pool (bounded concurrency)
-	// This prevents goroutine explosion under sustained load
-	if shouldFlush {
-		// Use buffer ctx as parent so Close() cancels in-flight writes,
-		// with a timeout to prevent workers from blocking forever on slow storage
-		flushCtx, flushCancel := context.WithTimeout(b.ctx, b.flushTimeout)
-		task := flushTask{
-			ctx:         flushCtx,
-			cancel:      flushCancel,
-			bufferKey:   bufferKey,
-			database:    database,
-			measurement: record.Measurement,
-			records:     recordsToFlush,
-			recordCount: totalBuffered,
-			walHashes:   collectWALHashes(recordsToFlush),
-		}
-
-		// Non-blocking enqueue. tryEnqueueFlush handles the closing-
-		// flag short-circuit, the ctx.Done() defense-in-depth, and
-		// the queue-full path uniformly across both write paths.
-		// The flushSkipClosing outcome short-circuits the rest of
-		// the write — Close() is in progress, no point continuing.
-		if b.tryEnqueueFlush(task, flushCancel, bufferKey, totalBuffered) == flushSkipClosing {
-			return nil
-		}
-	}
 
 	// Return immediately (don't wait for flush to complete!)
 	return nil
@@ -2060,8 +2208,7 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 	// Get shard for this buffer key (lock sharding)
 	shard := b.getShard(bufferKey)
 
-	var recordsToFlush []interface{}
-	var shouldFlush bool
+	var shouldFlush, flushDeferred bool
 
 	shard.mu.Lock()
 
@@ -2083,6 +2230,31 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 		}
 	}
 
+	// Refuse once Close() has swept THIS shard: anything appended after the
+	// sweep is never flushed and is not counted by CloseFlushedCleanly, so the
+	// shutdown WAL purge would delete its only other copy (#1007).
+	//
+	// The check belongs here, after flushOnSchemaChangeLocked and immediately
+	// before the append with no unlock in between. A check right after
+	// shard.mu.Lock() would be bypassed: flushBufferLocked releases and
+	// re-acquires the lock around its I/O, so a writer could pass the check,
+	// the schema flush could unlock, Close() could sweep this shard, and the
+	// writer would then append into it.
+	//
+	// It is per-shard rather than the global b.closing flag on purpose; see
+	// bufferShard.swept for why refusing on the global flag loses replicated
+	// rows that have no WAL copy of their own.
+	//
+	// The record is already in the WAL when the WAL is enabled (that append
+	// precedes this lock), so count it as WAL-only: CloseFlushedCleanly then
+	// stays false and the shutdown purge is skipped.
+	if shard.swept {
+		shard.mu.Unlock()
+		b.walOnlyRecords.Add(int64(numRecords))
+		metrics.Get().IncWALRecordsPreserved(int64(numRecords))
+		return ErrBufferClosing
+	}
+
 	// Add typed columns to buffer directly (no conversion needed)
 	shard.buffers[bufferKey] = append(shard.buffers[bufferKey], typedColumns)
 
@@ -2091,23 +2263,22 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 
 	// Check if buffer needs flush (size-based)
 	if totalBuffered >= b.config.MaxBufferSize {
-		recordsToFlush = make([]interface{}, len(shard.buffers[bufferKey]))
-		copy(recordsToFlush, shard.buffers[bufferKey])
-
-		delete(shard.buffers, bufferKey)
-		delete(shard.bufferStartTimes, bufferKey)
-		delete(shard.bufferRecordCounts, bufferKey)
-		delete(shard.bufferSchemas, bufferKey)
-
-		shouldFlush = true
-
-		b.logger.Debug().
-			Str("buffer_key", bufferKey).
-			Int("total_records", totalBuffered).
-			Msg("Extracted records for flush (fire-and-forget)")
+		shouldFlush, flushDeferred = b.enqueueOrDeferLocked(shard, bufferKey, database, measurement, totalBuffered)
 	}
 
 	shard.mu.Unlock()
+
+	if shouldFlush {
+		metrics.Get().SetBufferQueueDepth(b.queueDepth.Load())
+		b.logger.Info().
+			Str("buffer_key", bufferKey).
+			Int("total_records", totalBuffered).
+			Int64("queue_depth", b.queueDepth.Load()).
+			Msg("Buffer size exceeded, queued flush to worker pool")
+	}
+	if flushDeferred {
+		b.logFlushDeferred(bufferKey, totalBuffered)
+	}
 
 	b.totalRecordsBuffered.Add(int64(numRecords))
 
@@ -2117,25 +2288,6 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 		Int("total_buffered", totalBuffered).
 		Bool("flushing", shouldFlush).
 		Msg("Added typed columnar data to buffer")
-
-	// Queue flush to worker pool if needed
-	if shouldFlush {
-		flushCtx, flushCancel := context.WithTimeout(b.ctx, b.flushTimeout)
-		task := flushTask{
-			ctx:         flushCtx,
-			cancel:      flushCancel,
-			bufferKey:   bufferKey,
-			database:    database,
-			measurement: measurement,
-			records:     recordsToFlush,
-			recordCount: totalBuffered,
-			walHashes:   collectWALHashes(recordsToFlush),
-		}
-
-		if b.tryEnqueueFlush(task, flushCancel, bufferKey, totalBuffered) == flushSkipClosing {
-			return nil
-		}
-	}
 
 	return nil
 }
@@ -2656,6 +2808,23 @@ func (b *ArrowBuffer) flushAgedBuffers() {
 
 		// Check each buffer in this shard for age
 		for key, startTime := range shard.bufferStartTimes {
+			// Stop the sweep once Close() has begun and leave the rest to
+			// Close()'s own shard loop. This sweep is a single serial goroutine
+			// over every shard, and Close() waits for it via b.wg.Wait(); with
+			// many aged buffers on slow storage, finishing the whole sweep can
+			// outlast the shutdown budget.
+			//
+			// The unlock is REQUIRED: shard.mu is held across this entire loop
+			// (released only inside flushBufferLocked, around its I/O). A bare
+			// return would leak the lock, and Close()'s shard loop — plus every
+			// later write to this shard — would block on it forever.
+			if b.closing.Load() {
+				shard.mu.Unlock()
+				b.logger.Info().
+					Int("shard", shardIdx).
+					Msg("Aged-buffer sweep stopping: buffer is closing, remaining buffers left to Close()")
+				return
+			}
 			age := now.Sub(startTime)
 			if age >= threshold {
 				b.logger.Info().
@@ -2672,7 +2841,10 @@ func (b *ArrowBuffer) flushAgedBuffers() {
 					continue
 				}
 
-				flushCtx, flushCancel := context.WithTimeout(b.ctx, b.flushTimeout)
+				// flushParent-derived: Close() cancelling b.ctx must not abort
+				// an aged flush mid-write, because flushBufferLocked has
+				// already deleted the buffer entry (#1007).
+				flushCtx, flushCancel := b.newFlushContext()
 				if err := b.flushBufferLocked(flushCtx, shard, key, parts[0], parts[1]); err != nil {
 					b.logger.Error().Err(err).Str("buffer_key", key).Msg("Failed to flush aged buffer")
 				}
@@ -2723,15 +2895,27 @@ func (b *ArrowBuffer) flushWorker(workerID int) {
 				Int64("queue_depth", b.queueDepth.Load()).
 				Msg("Worker processing flush task")
 
-			// Execute flush
-			b.flushRecordsAsync(task.ctx, task.bufferKey, task.database, task.measurement, task.records, task.recordCount, task.walHashes)
-			// Release timeout context resources
-			task.cancel()
+			// Build the timeout HERE, not at enqueue: it must measure the
+			// storage write, not the time this task waited in the queue
+			// (#1006). It derives from flushParent, so Close() cancelling
+			// b.ctx does not abort a write already in progress (#1007).
+			flushCtx, flushCancel := b.newFlushContext()
+			// Error is already logged and recorded by flushRecordsAsync via
+			// markFlushFailure; the worker has nowhere to return it to.
+			_ = b.flushRecordsAsync(flushCtx, task.bufferKey, task.database, task.measurement, task.records, task.recordCount, task.walHashes)
+			flushCancel()
 		}
 	}
 }
 
-func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database, measurement string, records []interface{}, recordCount int, walHashes []string) {
+// flushRecordsAsync merges and writes one extracted batch.
+//
+// It returns an error as well as recording the failure through
+// markFlushFailure: Close() drains the queue and flushes each remaining task
+// itself, and it has to know WHICH tasks failed in order to count only those as
+// WAL-only. markFlushFailure alone cannot say — hasFlushFailure is a
+// process-wide latch with no per-task attribution.
+func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database, measurement string, records []interface{}, recordCount int, walHashes []string) error {
 	startTime := time.Now()
 
 	// Merge typed column batches
@@ -2752,7 +2936,7 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 		b.markFlushFailure()
 		// Data is already in WAL (written at ingest time) - no need to restore to buffer
 		// WAL will be replayed on restart or via periodic recovery
-		return
+		return err
 	}
 
 	// Flush with data timestamp partitioning
@@ -2765,9 +2949,10 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 		b.markFlushFailure()
 		// Data is already in WAL (written at ingest time) - no memory growth
 		// WAL will be replayed on restart or via periodic recovery
-		return
+		return err
 	}
 	b.markWALFlushed(walHashes)
+	return nil
 }
 
 func (b *ArrowBuffer) markWALFlushed(hashes []string) {
@@ -3890,13 +4075,26 @@ func (b *ArrowBuffer) FlushAll(ctx context.Context) error {
 		}
 
 		for _, key := range keys {
+			// The caller's context is honoured BETWEEN buffers only. A buffer is
+			// extracted before its I/O starts, so abandoning a flush in progress
+			// would lose it — the caller's cancellation must not reach the write
+			// itself (#1007).
+			if err := ctx.Err(); err != nil {
+				shard.mu.Unlock()
+				b.logger.Warn().Err(err).Msg("FlushAll stopping between buffers: caller context done")
+				return err
+			}
+
 			parts := splitBufferKey(key)
 			if len(parts) != 2 {
 				b.logger.Error().Str("buffer_key", key).Msg("Invalid buffer key format during flush")
 				continue
 			}
 
-			if err := b.flushBufferLocked(ctx, shard, key, parts[0], parts[1]); err != nil {
+			flushCtx, flushCancel := b.newFlushContext()
+			err := b.flushBufferLocked(flushCtx, shard, key, parts[0], parts[1])
+			flushCancel()
+			if err != nil {
 				b.logger.Error().Err(err).Str("buffer_key", key).Msg("Failed to flush buffer")
 				lastErr = err
 			}
@@ -3910,70 +4108,96 @@ func (b *ArrowBuffer) FlushAll(ctx context.Context) error {
 	return lastErr
 }
 
-// Close stops the buffer and flushes remaining data
+// Close stops the buffer and flushes everything it still holds.
 //
-// Shutdown ordering matters here:
-//  1. Set b.closing so writer goroutines short-circuit before reaching
-//     the channel send. Writers past shard.mu.Unlock() but not yet at
-//     the select would otherwise race a closed channel.
-//  2. Cancel b.ctx so flush workers exit via the <-b.ctx.Done() arm of
-//     their select. Data already enqueued is dropped in favor of WAL
-//     replay — that's the correct trade-off given a graceful shutdown
-//     should be quick. Those records are counted into walOnlyRecords
-//     (see the drain after wg.Wait) so CloseFlushedCleanly reports
-//     false and the shutdown WAL purge is skipped (#803).
-//  3. We deliberately do NOT close(b.flushQueue). Workers exit on ctx
-//     cancellation; closing the channel would re-introduce the
-//     send-on-closed-channel race the closing flag was added to fix.
-//  4. Wait for workers to drain. Then take shard locks to flush any
-//     in-memory buffers synchronously.
+// Ordering, and why each step is where it is:
+//
+//  1. Set b.closing. tryEnqueueFlush reads it to decide that no worker will take
+//     a task, and the aged sweep reads it to stop between buffers.
+//  2. b.cancel() stops the background loops — the metrics sampler, the periodic
+//     flush, and the workers' receive select. It does NOT reach flush I/O: every
+//     flush context derives from flushParent (context.WithoutCancel), so a write
+//     already in progress is waited for rather than aborted. Its records were
+//     removed from the buffer when the task was built, so cancelling it would
+//     lose them (#1007). The wait is bounded by the close budget; on expiry
+//     flushParent is cancelled so ctx-aware backends give up and Close returns.
+//  3. Mark each shard swept and flush its buffers, under the shard lock. Swept
+//     is set BEFORE the flush, because flushBufferLocked releases the lock for
+//     its I/O and a writer appending in that window would otherwise be lost.
+//  4. Drain the flush queue and FLUSH what is in it. Previously those tasks were
+//     discarded "in favour of WAL replay", which with the shipped
+//     wal.enabled=false is loss on every graceful stop under load. No writer can
+//     be mid-handoff here: the enqueue happens under shard.mu, and step 3 took
+//     every shard lock, so a writer either completed its enqueue before its
+//     shard was swept or was refused with ErrBufferClosing.
+//  5. Decide whether the close was clean. Anything not confirmed written is
+//     counted into walOnlyRecords, which makes CloseFlushedCleanly false and
+//     keeps the shutdown WAL purge from deleting the only remaining copy (#803).
+//
+// We deliberately do NOT close(b.flushQueue): workers exit on b.ctx.Done(), and
+// closing the channel would re-introduce the send-on-closed-channel race the
+// closing flag was added to fix.
 func (b *ArrowBuffer) Close() error {
 	b.logger.Info().Msg("Closing ArrowBuffer...")
 
+	// One deadline for the whole of Close, including the wait for in-flight
+	// flushes. The coordinator calls this with no context and only checks its
+	// own budget BETWEEN components, so a Close that does not return skips the
+	// wal-purge and wal components — and wal.Writer.Close is what performs the
+	// WAL's final drain-and-sync. Hanging here would retain a WAL missing its
+	// newest entries, which is worse than the loss this change fixes.
+	budget := b.closeDeadlineBudget()
+	start := time.Now()
+	// The budget is SPLIT, not spent wholly on whichever phase runs first.
+	//
+	// Waiting for in-flight flushes and flushing what is left are both bounded
+	// by it, and either one can consume all of it. If the wait took the lot,
+	// Close would reach the flush steps with nothing left and write nothing —
+	// the same outcome as cancelling the flushes, which is what this change
+	// exists to avoid. Half each: the wait gets a bounded chance to let
+	// in-progress writes finish, and the flush steps keep a guaranteed slice.
+	waitDeadline := start.Add(budget / 2)
+	deadline := start.Add(budget)
+
 	// Mark closing BEFORE cancelling so any writer past the shard
-	// unlock observes either the flag (skips send) or the cancelled
-	// ctx (Done arm fires). Either path avoids the panic.
+	// unlock observes either the flag (flushes inline) or the cancelled
+	// ctx (Done arm fires, also flushes inline). Either path avoids the panic.
 	b.closing.Store(true)
 
 	// Stop periodic flush
 	b.cancel()
 	b.flushTimer.Stop()
 
-	// Wait for all workers to finish (they exit via b.ctx.Done())
-	b.wg.Wait()
-
-	// Account for flush tasks still sitting in the queue when the workers
-	// exited. Those records were already removed from shard.buffers at enqueue
-	// time, so the synchronous loop below will not see them: without this
-	// drain they would be invisible to CloseFlushedCleanly and the shutdown
-	// WAL purge would delete the only copy of them (#803).
+	// Wait for the workers and the aged sweep to finish, bounded by the budget.
 	//
-	// Workers have returned, so no one else receives from the queue; a
-	// non-blocking drain is race-free here.
-	abandoned := 0
-drain:
-	for {
-		select {
-		case task, ok := <-b.flushQueue:
-			if !ok {
-				// Not reachable today (see point 3 above: the queue is never
-				// closed), but a labelled break keeps this loop terminating if
-				// that ever changes — a bare break would only exit the select.
-				break drain
-			}
-			b.queueDepth.Add(-1)
-			abandoned += task.recordCount
-			b.walOnlyRecords.Add(int64(task.recordCount))
-			task.cancel() // release the task's timeout context
-		default:
-			break drain
+	// Flush I/O no longer derives from b.ctx, so b.cancel() above does NOT
+	// abort a storage write in progress — that is the point of the change. The
+	// consequence is that this wait is bounded by flushTimeout rather than
+	// being instant, which is why it has to respect the budget: on expiry,
+	// cancel flushParent so context-aware backends abandon their writes and the
+	// workers return.
+	//
+	// Caveat worth knowing when reading a shutdown log: LocalBackend.Write does
+	// not observe its context, so on the local backend this cancel has no
+	// effect and the wait ends when the filesystem finishes.
+	workersDone := make(chan struct{})
+	go func() {
+		b.wg.Wait()
+		close(workersDone)
+	}()
+	budgetTimer := time.NewTimer(time.Until(waitDeadline))
+	defer budgetTimer.Stop()
+	select {
+	case <-workersDone:
+	case <-budgetTimer.C:
+		b.logger.Error().
+			Dur("budget", budget).
+			Dur("wait_slice", budget/2).
+			Msg("Close budget's wait slice expired; cancelling flushes in progress so the remaining buffers still get their share of the budget")
+		if b.flushParentCancel != nil {
+			b.flushParentCancel()
 		}
-	}
-	if abandoned > 0 {
-		b.logger.Warn().
-			Int("records", abandoned).
-			Msg("Flush tasks abandoned on close; records remain in the WAL and will be replayed on next startup")
-		metrics.Get().IncWALRecordsPreserved(int64(abandoned))
+		<-workersDone
 	}
 
 	b.logger.Info().Msg("All flush workers stopped, flushing remaining buffers")
@@ -3983,12 +4207,39 @@ drain:
 	// (#803).
 	var flushErrs []error
 	totalBuffers := 0
+	// Records left unflushed because the budget ran out mid-close. Counted as
+	// WAL-only so the close reports unclean and the shutdown purge is skipped.
+	budgetExpiredRecords := 0
 
-	// Flush all remaining buffers in all shards
+	// STEP 1: mark each shard swept, then flush every buffer in it.
+	//
+	// This runs BEFORE the queue drain below, so the drain sees a queue that no
+	// shard can add to any more.
 	for shardIdx := range b.shards {
 		shard := b.shards[shardIdx]
 
 		shard.mu.Lock()
+
+		// Mark the shard swept BEFORE flushing it, not after.
+		//
+		// flushBufferLocked releases shard.mu for the whole merge-encode-write
+		// and re-acquires it afterwards. If swept were set only at the end of
+		// this loop, a writer could take the lock during that I/O window, pass
+		// the swept check, and append either to a key that is not in the
+		// snapshot below or to a key this loop has already flushed. Those rows
+		// would then sit in shard.buffers forever: never written, never counted,
+		// and CloseFlushedCleanly would still report clean, so the shutdown
+		// purge would delete the WAL that held them. HTTP is already drained by
+		// then, but MQTT, continuous queries and replication apply are not, so
+		// that window is reached routinely rather than rarely.
+		//
+		// Setting it first closes the window completely: no append can land in
+		// this shard from here on. A write that arrives is refused with
+		// ErrBufferClosing and counted as WAL-only, which is recoverable. This
+		// is still PER SHARD — shards this loop has not reached yet keep
+		// accepting writes normally, which is what keeps replicated entries
+		// (skipWAL, no second copy) from being refused for the whole of Close.
+		shard.swept = true
 
 		// Copy keys to avoid modifying map while iterating
 		// (flushBufferLocked releases and re-acquires the lock during I/O)
@@ -4006,7 +4257,16 @@ drain:
 				continue
 			}
 
-			flushCtx, flushCancel := context.WithTimeout(context.Background(), b.flushTimeout)
+			flushCtx, flushCancel, ok := b.closeFlushContext(deadline)
+			if !ok {
+				// Out of budget. Leave the rest in the buffer and count it, so
+				// the close reports unclean and the WAL is retained for it.
+				// Attempting it anyway with a fresh floor is what made Close
+				// overrun and get the WAL writer's final sync skipped.
+				unflushed := shard.bufferRecordCounts[key]
+				budgetExpiredRecords += unflushed
+				continue
+			}
 			if err := b.flushBufferLocked(flushCtx, shard, key, parts[0], parts[1]); err != nil {
 				b.logger.Error().Err(err).Str("buffer_key", key).Msg("Failed to flush buffer during close")
 				flushErrs = append(flushErrs, fmt.Errorf("buffer %q: %w", key, err))
@@ -4018,14 +4278,38 @@ drain:
 		shard.mu.Unlock()
 	}
 
+	// STEP 2: drain the queue and FLUSH what is in it, instead of discarding it.
+	//
+	// These records were removed from shard.buffers at enqueue time, so the loop
+	// above never saw them. Previously they were counted into walOnlyRecords and
+	// thrown away "in favour of WAL replay", which with the shipped
+	// wal.enabled=false default is simply loss on every graceful stop under
+	// load (#1007).
+	if budgetExpiredRecords > 0 {
+		b.logger.Error().
+			Int("records", budgetExpiredRecords).
+			Msg("Close budget expired with buffers still unflushed; records remain in the WAL and will be replayed on next startup")
+		metrics.Get().IncWALRecordsPreserved(int64(budgetExpiredRecords))
+		b.walOnlyRecords.Add(int64(budgetExpiredRecords))
+	}
+
+	abandoned := b.drainAndFlushQueue(deadline)
+	if abandoned > 0 {
+		b.logger.Error().
+			Int("records", abandoned).
+			Msg("Flush tasks could not be written during close; records remain in the WAL and will be replayed on next startup")
+		metrics.Get().IncWALRecordsPreserved(int64(abandoned))
+		b.walOnlyRecords.Add(int64(abandoned))
+	}
+
 	// Record whether every record reached durable storage. The WAL purge on
 	// shutdown consults this via CloseFlushedCleanly: purging the WAL after a
 	// failed flush destroys the only remaining copy of that data (#803).
 	//
 	// "Clean" requires three things, not just the synchronous flush:
 	//   - no synchronous flush returned an error (flushErrs)
-	//   - no records were dropped to WAL-replay, either rejected at enqueue or
-	//     abandoned in the queue above (walOnlyRecords)
+	//   - no records ended up WAL-only: rejected at enqueue, or still unwritten
+	//     after the drain above (walOnlyRecords)
 	//   - no earlier async flush failed (hasFlushFailure) — the same signal the
 	//     WAL maintenance loop already trusts
 	//
@@ -4042,6 +4326,7 @@ drain:
 		Int64("total_records_written", b.totalRecordsWritten.Load()).
 		Int64("total_flushes", b.totalFlushes.Load()).
 		Int("failed_buffers", len(flushErrs)).
+		Bool("flushed_cleanly", b.closeFlushClean.Load()).
 		Msg("ArrowBuffer closed")
 
 	if len(flushErrs) > 0 {
@@ -4050,6 +4335,125 @@ drain:
 	}
 
 	return nil
+}
+
+// closeDrainParallelism caps how many drained tasks Close flushes at once.
+//
+// It is capped independently of flushWorkers because each concurrent flush
+// merges a whole extracted batch (mergeBatches allocates a full copy), and
+// flush_queue_size x max_buffer_size records can be a large transient at
+// exactly the moment the process is shutting down under memory pressure.
+const closeDrainParallelism = 4
+
+// drainAndFlushQueue empties b.flushQueue and writes each task, returning the
+// record count it could NOT write. The workers have returned by the time this
+// runs, so nothing else receives from the queue and a non-blocking drain is
+// race-free.
+func (b *ArrowBuffer) drainAndFlushQueue(deadline time.Time) int {
+	var tasks []flushTask
+drain:
+	for {
+		select {
+		case task, ok := <-b.flushQueue:
+			if !ok {
+				// Not reachable today (the queue is never closed), but a
+				// labelled break keeps this loop terminating if that changes —
+				// a bare break would only exit the select.
+				break drain
+			}
+			b.queueDepth.Add(-1)
+			tasks = append(tasks, task)
+		default:
+			break drain
+		}
+	}
+	if len(tasks) == 0 {
+		return 0
+	}
+
+	metrics.Get().SetBufferQueueDepth(b.queueDepth.Load())
+	b.logger.Info().
+		Int("tasks", len(tasks)).
+		Msg("Flushing flush tasks that were still queued at close")
+
+	parallel := b.flushWorkers
+	if parallel > closeDrainParallelism {
+		parallel = closeDrainParallelism
+	}
+	if parallel < 1 {
+		parallel = 1
+	}
+
+	var (
+		mu     sync.Mutex
+		unwrit int
+		wg     sync.WaitGroup // local: b.wg has already been waited on, and Close can be called twice
+		slots  = make(chan struct{}, parallel)
+	)
+
+	for i := range tasks {
+		task := tasks[i]
+		slots <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-slots }()
+
+			// Built HERE, on slot acquisition, not when the task was drained:
+			// a context created up front would burn its budget waiting for a
+			// slot, which is #1006 all over again inside Close.
+			flushCtx, flushCancel, ok := b.closeFlushContext(deadline)
+			if !ok {
+				mu.Lock()
+				unwrit += task.recordCount
+				mu.Unlock()
+				return
+			}
+			defer flushCancel()
+
+			if err := b.flushRecordsAsync(flushCtx, task.bufferKey, task.database, task.measurement, task.records, task.recordCount, task.walHashes); err != nil {
+				mu.Lock()
+				unwrit += task.recordCount
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	return unwrit
+}
+
+// closeFlushContext builds the context for one flush performed by Close, and
+// reports whether there is any budget left to perform it at all.
+//
+// Two things here are load-bearing, and getting either wrong reintroduces a bug
+// this change exists to fix:
+//
+//  1. The parent is context.WithoutCancel(b.flushParent). When the budget
+//     expires, Close cancels flushParent to unstick workers blocked in a
+//     storage write — but Close's OWN remaining flushes must still be able to
+//     run. Deriving them from the cancelled parent would make every one of them
+//     start already Done, so Close would write nothing at all: worse than the
+//     behaviour before this change, where the close loop used
+//     context.Background() and b.cancel() could not reach it.
+//  2. The timeout is the real remaining budget, with no floor. A floor would
+//     let Close exceed its budget by (units of work x floor) — with a default
+//     flush_queue_size of 100 and parallelism 4, a 2s floor alone is ~50s past
+//     the deadline. Overrunning makes the coordinator skip the components after
+//     the buffer, including the WAL writer's final drain-and-sync.
+//
+// ok is false once the deadline has passed; the caller must then count the work
+// as unwritten rather than attempting it, so the WAL is retained for it.
+func (b *ArrowBuffer) closeFlushContext(deadline time.Time) (ctx context.Context, cancel context.CancelFunc, ok bool) {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return nil, nil, false
+	}
+	parent := b.flushParent
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel = context.WithTimeout(context.WithoutCancel(parent), remaining)
+	return ctx, cancel, true
 }
 
 // CloseFlushedCleanly reports whether every record this buffer accepted
@@ -4073,6 +4477,14 @@ drain:
 // whereas purging a WAL that was still needed is unrecoverable data loss
 // (#803).
 func (b *ArrowBuffer) CloseFlushedCleanly() bool {
+	// Re-read the live signals rather than trusting only the snapshot Close
+	// took. HTTP is drained before this component closes, but MQTT, continuous
+	// queries and replication apply can still be writing, so an inline flush
+	// can fail after Close computed the flag. A stale "clean" here would purge
+	// a WAL that is still needed.
+	if b.closeFailed.Load() || b.hasFlushFailure.Load() || b.walOnlyRecords.Load() > 0 {
+		return false
+	}
 	return b.closeFlushClean.Load()
 }
 

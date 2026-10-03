@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -256,7 +257,7 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 	for _, r := range records {
 		measurements[r.Measurement] = true
 	}
-	if h.rbacManager != nil && h.rbacManager.IsRBACEnabled() {
+	if h.rbacManager != nil { // not license-gated; see CheckWritePermissions
 		measList := make([]string, 0, len(measurements))
 		for m := range measurements {
 			measList = append(measList, m)
@@ -292,6 +293,15 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 				Str("database", database).
 				Str("measurement", measurement).
 				Msg("LP import: failed to write to buffer")
+			// 503 for the two retryable buffer states. Note this loop has
+			// already written the measurements it got through, so the import is
+			// partial either way — a retryable status at least tells the client
+			// to re-run it rather than treating it as a permanent failure.
+			if errors.Is(err, ingest.ErrBufferClosing) || errors.Is(err, ingest.ErrSchemaChurnExceeded) {
+				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+					"error": fmt.Sprintf("import rejected at measurement %q (retry): %v", measurement, err),
+				})
+			}
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"error": fmt.Sprintf("failed to ingest measurement %q: %v", measurement, err),
 			})
@@ -502,7 +512,7 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 	batch, numRecords := ingest.TLERecordsToTypedColumnar(tleRecords)
 
 	// Check RBAC permissions
-	if h.rbacManager != nil && h.rbacManager.IsRBACEnabled() {
+	if h.rbacManager != nil { // not license-gated; see CheckWritePermissions
 		if err := CheckWritePermissions(c, h.rbacManager, h.logger, database, []string{measurement}); err != nil {
 			h.totalErrors.Add(1)
 			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{

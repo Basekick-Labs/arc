@@ -26,9 +26,11 @@ func newCommaJoinTestHandler() *QueryHandler {
 	}
 }
 
-// rp builds the read_parquet prefix the mock backend produces for db/table.
+// rp renders the open part of the read_parquet call the rewriter emits, up to
+// and including the inference flag sqlutil.ReadParquet always adds (#1005), so
+// the expectations below only append their own options.
 func rp(db, table string) string {
-	return "read_parquet('./data/" + db + "/" + table + "/**/*.parquet'"
+	return "read_parquet('./data/" + db + "/" + table + "/**/*.parquet', " + sqlutil.HivePartitioningOff
 }
 
 func TestCommaJoinRewrite_Issue978(t *testing.T) {
