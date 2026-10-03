@@ -429,6 +429,12 @@ predate that fix and #978.
 
 ## Bug fixes
 
+### Duplicate token-name races no longer increment the auth rejection counter ([#964](https://github.com/Basekick-Labs/arc/issues/964))
+
+Concurrent bootstrap or admin creates for an existing token name are now treated as expected name conflicts rather than malformed or forged entries. Identical Raft replays remain no-ops, while non-identical same-name creates still return an `already exists` error without incrementing `arc_cluster_auth_rejected_total`.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#973](https://github.com/Basekick-Labs/arc/pull/973).
+
 ## Experimental arcx Arrow IPC streams signal writer panics ([#846](https://github.com/Basekick-Labs/arc/issues/846))
 
 When the experimental arcx Arrow IPC stream writer panics, the response now

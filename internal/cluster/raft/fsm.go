@@ -1699,9 +1699,30 @@ func (f *ClusterFSM) applyCreateToken(payload []byte, logIndex uint64) interface
 	// tokensByName secondary index — the apply path is single-threaded
 	// and blocks the Raft commit loop, so a linear scan over all tokens
 	// would bottleneck the cluster as the token count grows.
-	if _, exists := f.tokensByName[entry.Name]; exists {
+	if existingID, exists := f.tokensByName[entry.Name]; exists {
+		existing := f.tokens[existingID]
+		if existing != nil {
+			existingContent := *existing
+			entryContent := entry
+			existingContent.ID = 0
+			existingContent.LSN = 0
+			entryContent.ID = 0
+			entryContent.LSN = 0
+			if existingContent == entryContent {
+				f.mu.Unlock()
+				f.logger.Debug().
+					Str("name", entry.Name).
+					Uint64("log_index", logIndex).
+					Msg("Duplicate token create ignored (identical replay)")
+				return nil
+			}
+		}
 		f.mu.Unlock()
-		return f.rejectToken("create", entry.ID, logIndex, fmt.Errorf("token name %q already exists", entry.Name))
+		f.logger.Debug().
+			Str("name", entry.Name).
+			Uint64("log_index", logIndex).
+			Msg("Duplicate token name create refused")
+		return fmt.Errorf("create token: token name %q already exists", entry.Name)
 	}
 	f.tokens[entry.ID] = &entry
 	f.tokensByPrefix[entry.TokenPrefix] = append(f.tokensByPrefix[entry.TokenPrefix], entry.ID)
