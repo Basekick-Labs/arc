@@ -856,6 +856,7 @@ func (c *Coordinator) Stop() error {
 		// callbacks can be unregistered and their queue closed below.
 		if fsm := raftNode.FSM(); fsm != nil {
 			fsm.SetFileCallbacks(nil, nil)
+			fsm.SetFileContentChangedCallback(nil)
 		}
 	}
 
@@ -3953,15 +3954,17 @@ func (c *Coordinator) startFilePullerLocked() error {
 		ReconciliationGate:      c.canRunFileReconciliation,
 		// Lets the puller stop pulling, and stop counting against the query
 		// gate, an entry that left the manifest while its pull was queued or
-		// in flight (#759, #795). Read lock on the FSM; the FSM never holds
-		// its lock while calling back into the puller, so no cycle.
-		ManifestHas: func(path string) bool {
+		// in flight (#759, #795), while also identifying superseding versions.
+		ManifestEntry: func(path string) (raft.FileEntry, bool) {
 			fsm := raftNode.FSM()
 			if fsm == nil {
-				return true
+				return raft.FileEntry{}, true
 			}
-			_, ok := fsm.GetFile(path)
-			return ok
+			entry, ok := fsm.GetFile(path)
+			if !ok {
+				return raft.FileEntry{}, false
+			}
+			return *entry, true
 		},
 		Logger: c.logger,
 	}
@@ -4022,6 +4025,9 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// (drops on full queue) so this is safe.
 		puller.Enqueue(entry)
 	}
+	onContentChanged := func(entry *raft.FileEntry) {
+		puller.EnqueueContentChanged(entry)
+	}
 	onDelete := func(path string, reason string) {
 		// Phase 4: the callback runs synchronously from applyDeleteFile on
 		// the Raft apply hot path. It MUST NOT block. It hands the path to
@@ -4058,6 +4064,7 @@ func (c *Coordinator) startFilePullerLocked() error {
 	}
 
 	fsm.SetFileCallbacks(onRegister, onDelete)
+	fsm.SetFileContentChangedCallback(onContentChanged)
 
 	// Start the puller workers.
 	puller.Start(context.Background())

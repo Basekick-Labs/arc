@@ -497,14 +497,15 @@ type ClusterFSM struct {
 	barrierOrder []string
 
 	// Callbacks for state changes
-	onNodeAdded         func(*NodeInfo)
-	onNodeRemoved       func(string)
-	onNodeUpdated       func(*NodeInfo)
-	onWriterPromoted    func(newPrimaryID, oldPrimaryID string)
-	onWriterDemoted     func(nodeID string)
-	onCompactorAssigned func(newCompactorID, oldCompactorID string)
-	onFileRegistered    func(*FileEntry)
-	onFileDeleted       func(path string, reason string)
+	onNodeAdded          func(*NodeInfo)
+	onNodeRemoved        func(string)
+	onNodeUpdated        func(*NodeInfo)
+	onWriterPromoted     func(newPrimaryID, oldPrimaryID string)
+	onWriterDemoted      func(nodeID string)
+	onCompactorAssigned  func(newCompactorID, oldCompactorID string)
+	onFileRegistered     func(*FileEntry)
+	onFileContentChanged func(*FileEntry)
+	onFileDeleted        func(path string, reason string)
 	// Auth-state callbacks: invoked from every node's apply path so the
 	// node's local AuthManager can materialise the change into its
 	// SQLite cache (and invalidate the in-memory verify-token cache).
@@ -684,6 +685,15 @@ func (f *ClusterFSM) SetFileCallbacks(onRegistered func(*FileEntry), onDeleted f
 	defer f.mu.Unlock()
 	f.onFileRegistered = onRegistered
 	f.onFileDeleted = onDeleted
+}
+
+// SetFileContentChangedCallback registers the callback used when a file's
+// content identity changes (SHA256 or SizeBytes). LSN-only metadata changes
+// do not fire it.
+func (f *ClusterFSM) SetFileContentChangedCallback(callback func(*FileEntry)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onFileContentChanged = callback
 }
 
 // SetAuthCallbacks wires the cluster FSM into the local AuthManager so that
@@ -1195,6 +1205,8 @@ func (f *ClusterFSM) applyRegisterFileStruct(p RegisterFilePayload, logIndex uin
 
 	f.mu.Lock()
 	entry := p.File
+	old, existed := f.files[entry.Path]
+	contentChanged := existed && (old.SHA256 != entry.SHA256 || old.SizeBytes != entry.SizeBytes)
 	// If the file was already registered under a different database (unlikely
 	// but possible if an operator moves a file across databases), remove the
 	// old index entry first to keep filesByDB consistent.
@@ -1216,6 +1228,7 @@ func (f *ClusterFSM) applyRegisterFileStruct(p RegisterFilePayload, logIndex uin
 	idx[entry.Path] = struct{}{}
 	f.keysCache = nil // invalidate sorted-key cache
 	callback := f.onFileRegistered
+	contentCallback := f.onFileContentChanged
 	f.mu.Unlock()
 
 	f.logger.Debug().
@@ -1230,6 +1243,10 @@ func (f *ClusterFSM) applyRegisterFileStruct(p RegisterFilePayload, logIndex uin
 	if callback != nil {
 		entryCopy := entry
 		callback(&entryCopy)
+	}
+	if contentChanged && contentCallback != nil {
+		entryCopy := entry
+		contentCallback(&entryCopy)
 	}
 
 	return nil
@@ -1327,6 +1344,8 @@ func (f *ClusterFSM) applyUpdateFileStruct(p UpdateFilePayload, logIndex uint64)
 
 	f.mu.Lock()
 	entry := p.File
+	old, existed := f.files[entry.Path]
+	contentChanged := existed && (old.SHA256 != entry.SHA256 || old.SizeBytes != entry.SizeBytes)
 	// If the database changed (defensive), remove the old secondary index entry first.
 	if old, existed := f.files[entry.Path]; existed && old.Database != entry.Database {
 		if oldIdx, ok := f.filesByDB[old.Database]; ok {
@@ -1347,6 +1366,7 @@ func (f *ClusterFSM) applyUpdateFileStruct(p UpdateFilePayload, logIndex uint64)
 	}
 	f.keysCache = nil // invalidate sorted-key cache
 	callback := f.onFileRegistered
+	contentCallback := f.onFileContentChanged
 	f.mu.Unlock()
 
 	f.logger.Debug().
@@ -1361,6 +1381,10 @@ func (f *ClusterFSM) applyUpdateFileStruct(p UpdateFilePayload, logIndex uint64)
 	if callback != nil {
 		entryCopy := entry
 		callback(&entryCopy)
+	}
+	if contentChanged && contentCallback != nil {
+		entryCopy := entry
+		contentCallback(&entryCopy)
 	}
 
 	return nil

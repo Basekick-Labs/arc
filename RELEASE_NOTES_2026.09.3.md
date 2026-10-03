@@ -429,6 +429,12 @@ predate that fix and #978.
 
 ## Bug fixes
 
+### A reader could serve old bytes after an in-place rewrite during an active pull ([#798](https://github.com/Basekick-Labs/arc/issues/798))
+
+During an in-place rewrite, a reader could finish or retry a pull for the previous manifest version and continue serving stale bytes until periodic reconciliation. The puller now hands an in-flight path to newer content, checks the current manifest before retrying or recording a failure, and forces a refresh only when content changes. Same-size stale copies restored by a Raft snapshot remain undetected because snapshot restore does not fire file callbacks.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#907](https://github.com/Basekick-Labs/arc/pull/907).
+
 ## Experimental arcx Arrow IPC streams signal writer panics ([#846](https://github.com/Basekick-Labs/arc/issues/846))
 
 When the experimental arcx Arrow IPC stream writer panics, the response now

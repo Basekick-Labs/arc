@@ -2,6 +2,7 @@ package filereplication
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -517,7 +518,11 @@ func TestPeriodicReconciliationStopsOnCancellation(t *testing.T) {
 		if once.CompareAndSwap(false, true) {
 			close(started)
 		}
-		<-p.ctx.Done()
+		select {
+		case <-p.ctx.Done():
+		case <-time.After(time.Second):
+			return nil, "", errors.New("reconciliation cancellation timeout")
+		}
 		return nil, "", p.ctx.Err()
 	}, time.Millisecond)
 
