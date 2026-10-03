@@ -572,6 +572,18 @@ caller-supplied JobID.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#912](https://github.com/Basekick-Labs/arc/pull/912).
 
+### Ingest buffer growth now reports estimated bytes and oldest flush age ([#1025](https://github.com/Basekick-Labs/arc/issues/1025))
+
+Arc now exports approximate buffered bytes and the age of the oldest unflushed
+batch, including batches queued or being written by flush workers. When buffered
+bytes reach 50% of the detected process memory limit, Arc emits an actionable
+warning to lower `ingest.max_buffer_size` or `ingest.max_buffer_age_ms`. These
+settings remain per-measurement flush triggers; Arc does not reject writes or
+impose a global memory cap. Lower settings trade memory for more, smaller
+Parquet files and additional compaction work.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) for [#1025](https://github.com/Basekick-Labs/arc/issues/1025).
+
 ### A node that rejoins through a Raft snapshot now removes the replicas the cluster deleted while it was away ([#962](https://github.com/Basekick-Labs/arc/issues/962))
 
 On a per-node-storage cluster every node unlinks its local copy of a file when

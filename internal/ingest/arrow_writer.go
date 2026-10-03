@@ -27,6 +27,7 @@ import (
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/basekick-labs/arc/internal/sysmem"
 	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/basekick-labs/arc/internal/wal"
 	"github.com/basekick-labs/arc/pkg/models"
@@ -34,8 +35,9 @@ import (
 )
 
 const (
-	flushTypeAsync = "async"
-	flushTypeSync  = "sync"
+	flushTypeAsync             = "async"
+	flushTypeSync              = "sync"
+	bufferMemoryWarningPercent = 50
 )
 
 // sharedArrowAllocator is a package-level shared allocator for Arrow operations.
@@ -837,6 +839,9 @@ type TypedColumnBatch struct {
 	// Coverage is the batch's coverage id on a coverage-enabled writer, or the
 	// pieces of a replayed covered entry (#1207). See coverage.go.
 	Coverage []CoveragePiece
+	// estimatedBytes approximates retained column data for the ingest-memory
+	// gauge; it is not used to limit or reject writes.
+	estimatedBytes int64
 }
 
 type bufferShard struct {
@@ -886,14 +891,16 @@ type bufferShard struct {
 // then fails for a queueing reason and the batch is dropped as if storage had
 // failed.
 type flushTask struct {
-	taskID      uint64
-	bufferKey   string
-	database    string
-	measurement string
-	records     []interface{}
-	recordCount int
-	walHashes   []string
-	group       *flushGroup // coverage of the flush, nil when coverage is off
+	taskID         uint64
+	bufferKey      string
+	database       string
+	measurement    string
+	records        []interface{}
+	recordCount    int
+	walHashes      []string
+	group          *flushGroup // coverage of the flush, nil when coverage is off
+	estimatedBytes int64
+	trackingID     uint64
 }
 
 // WALWriter interface for Write-Ahead Log support
@@ -1029,6 +1036,14 @@ type ArrowBuffer struct {
 	asyncFlushNext    uint64
 	asyncFlushPending map[uint64]struct{}
 	asyncFlushChanged chan struct{}
+	// Buffer memory metrics include batches while in a shard, queued, or being
+	// flushed. Estimates are added on append and removed when a flush completes.
+	bufferBytesBuffered atomic.Int64
+	flushTimesMu        sync.Mutex
+	flushTimes          map[uint64]time.Time
+	nextFlushID         atomic.Uint64
+	memoryLimitBytes    uint64
+	bufferMemoryWarning atomic.Bool
 
 	// closing is the shutdown short-circuit checked by tryEnqueueFlush.
 	// See Close() for the full ordering rationale; senders see this
@@ -1395,7 +1410,147 @@ func (b *ArrowBuffer) finishFlushTask(task flushTask) {
 
 func (b *ArrowBuffer) flushTrackedTask(ctx context.Context, task flushTask) error {
 	defer b.finishFlushTask(task)
+	defer b.releaseFlushTask(task)
 	return b.flushRecordsAsync(ctx, task.bufferKey, task.database, task.measurement, task.records, task.recordCount, task.walHashes, task.group)
+}
+
+func (b *ArrowBuffer) publishBufferMemoryMetrics() {
+	m := metrics.Get()
+	bytes := b.bufferBytesBuffered.Load()
+	m.SetBufferBytesBuffered(bytes)
+	m.SetBufferMemoryLimit(int64(b.memoryLimitBytes))
+	m.SetBufferOldestAge(b.oldestUnflushedAge())
+	m.SetBufferMemoryPressure(b.checkBufferMemoryPressure(bytes))
+}
+
+func (b *ArrowBuffer) checkBufferMemoryPressure(bytes int64) bool {
+	thresholdBytes := b.memoryLimitBytes / 2
+	if b.memoryLimitBytes%2 != 0 {
+		thresholdBytes++
+	}
+	pressure := b.memoryLimitBytes > 0 && bytes > 0 && uint64(bytes) >= thresholdBytes
+	if pressure {
+		if b.bufferMemoryWarning.CompareAndSwap(false, true) {
+			m := metrics.Get()
+			m.SetBufferMemoryLimit(int64(b.memoryLimitBytes))
+			b.logger.Warn().
+				Int64("buffered_bytes", bytes).
+				Uint64("memory_limit_bytes", b.memoryLimitBytes).
+				Int("threshold_percent", bufferMemoryWarningPercent).
+				Int("max_buffer_size", b.config.MaxBufferSize).
+				Int("max_buffer_age_ms", b.config.MaxBufferAgeMS).
+				Msg("Ingest buffers are using a large share of available memory; lower max_buffer_size or max_buffer_age_ms to flush sooner, at the cost of more smaller Parquet files")
+		}
+	} else {
+		b.bufferMemoryWarning.Store(false)
+	}
+	return pressure
+}
+
+func (b *ArrowBuffer) oldestUnflushedAge() time.Duration {
+	var oldest time.Time
+	for i := range b.shards {
+		shard := b.shards[i]
+		shard.mu.RLock()
+		for _, start := range shard.bufferStartTimes {
+			if oldest.IsZero() || start.Before(oldest) {
+				oldest = start
+			}
+		}
+		shard.mu.RUnlock()
+	}
+
+	b.flushTimesMu.Lock()
+	for _, start := range b.flushTimes {
+		if oldest.IsZero() || start.Before(oldest) {
+			oldest = start
+		}
+	}
+	b.flushTimesMu.Unlock()
+	if oldest.IsZero() {
+		return 0
+	}
+	age := time.Since(oldest)
+	if age < 0 {
+		return 0
+	}
+	return age
+}
+
+func (b *ArrowBuffer) trackFlush(start time.Time) uint64 {
+	if start.IsZero() {
+		start = time.Now().UTC()
+	}
+	id := b.nextFlushID.Add(1)
+	b.flushTimesMu.Lock()
+	if b.flushTimes == nil {
+		b.flushTimes = make(map[uint64]time.Time)
+	}
+	b.flushTimes[id] = start
+	b.flushTimesMu.Unlock()
+	return id
+}
+
+func (b *ArrowBuffer) untrackFlush(id uint64) {
+	if id == 0 {
+		return
+	}
+	b.flushTimesMu.Lock()
+	delete(b.flushTimes, id)
+	b.flushTimesMu.Unlock()
+}
+
+func estimateTypedColumnBatchBytes(batch *TypedColumnBatch) int64 {
+	if batch == nil {
+		return 0
+	}
+	var total int64
+	for _, column := range batch.Data {
+		switch values := column.(type) {
+		case []int64:
+			total += int64(len(values)) * 8
+		case []float64:
+			total += int64(len(values)) * 8
+		case []bool:
+			total += int64(len(values))
+		case []decimal128.Num:
+			total += int64(len(values)) * 16
+		case []string:
+			total += int64(len(values)) * int64(unsafe.Sizeof(string("")))
+			for _, value := range values {
+				total += int64(len(value))
+			}
+		case []interface{}:
+			total += int64(len(values)) * int64(unsafe.Sizeof(interface{}(nil)))
+			for _, value := range values {
+				switch value := value.(type) {
+				case string:
+					total += int64(len(value))
+				case []byte:
+					total += int64(len(value))
+				}
+			}
+		}
+	}
+	for _, valid := range batch.Validity {
+		total += int64(len(valid))
+	}
+	return total
+}
+
+func estimateBufferedBatchesBytes(batches []interface{}) int64 {
+	var total int64
+	for _, batch := range batches {
+		if typed, ok := batch.(*TypedColumnBatch); ok {
+			total += typed.estimatedBytes
+		}
+	}
+	return total
+}
+
+func (b *ArrowBuffer) releaseFlushTask(task flushTask) {
+	b.untrackFlush(task.trackingID)
+	b.bufferBytesBuffered.Add(-task.estimatedBytes)
 }
 
 // countDeferredBuffers counts buffers whose records no worker could take. Also
@@ -1590,6 +1745,7 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 	if cfg.FlushTimeoutSeconds <= 0 {
 		flushTimeout = 30 * time.Second
 	}
+	memoryLimitBytes, _, _ := sysmem.Limit()
 
 	buffer := &ArrowBuffer{
 		config:               cfg,
@@ -1607,6 +1763,8 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 		newBufferCh:          make(chan struct{}, 1),
 		flushQueue:           make(chan flushTask, queueSize),
 		flushWorkers:         flushWorkers,
+		flushTimes:           make(map[uint64]time.Time),
+		memoryLimitBytes:     memoryLimitBytes,
 		flushTimeout:         flushTimeout,
 		maxBufferAge:         time.Duration(cfg.MaxBufferAgeMS) * time.Millisecond,
 		sortKeysConfig:       sortKeysConfig,
@@ -2247,7 +2405,9 @@ func (b *ArrowBuffer) enqueueOrDeferLocked(
 		// after a crash, which is #948 for the one path that carries production
 		// ingest. Only flushBufferLocked (the age, schema-change, FlushAll and
 		// Close path) was checkpointing.
-		walHashes: collectWALHashes(shard.buffers[bufferKey]),
+		walHashes:      collectWALHashes(shard.buffers[bufferKey]),
+		estimatedBytes: estimateBufferedBatchesBytes(shard.buffers[bufferKey]),
+		trackingID:     b.trackFlush(shard.bufferStartTimes[bufferKey]),
 	}
 	task.group = b.newFlushGroup(bufferKey, task.records, task.walHashes)
 	queuedRecords := int64(task.recordCount)
@@ -2267,12 +2427,14 @@ func (b *ArrowBuffer) enqueueOrDeferLocked(
 	case <-b.ctx.Done():
 		b.completeAsyncFlushTask(task.taskID)
 		b.adjustFlushRecordMetrics(-queuedRecords, 0)
+		b.untrackFlush(task.trackingID)
 		// Close cancelled b.ctx between the checks above and this select. The
 		// records stay in the buffer for Close's shard loop.
 		return false, false
 	default:
 		b.completeAsyncFlushTask(task.taskID)
 		b.adjustFlushRecordMetrics(-queuedRecords, 0)
+		b.untrackFlush(task.trackingID)
 		// Lost the race against another writer for the last slot.
 		b.markDeferredLocked(shard, bufferKey)
 		return false, true
@@ -2752,6 +2914,11 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALHashes(ctx context.Context, da
 	if err != nil {
 		return fmt.Errorf("failed to convert columns: %w", err)
 	}
+	if len(record.RawPayload) > 0 {
+		typedColumns.estimatedBytes = int64(len(record.RawPayload))
+	} else {
+		typedColumns.estimatedBytes = estimateTypedColumnBatchBytes(typedColumns)
+	}
 
 	// Propagate tag column names for Parquet metadata (enables auto-dedup in compaction)
 	typedColumns.TagColumns = record.TagColumns
@@ -2838,6 +3005,7 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALHashes(ctx context.Context, da
 	// Add typed columns to buffer (already converted via zero-copy fast paths)
 	shard.buffers[bufferKey] = append(shard.buffers[bufferKey], typedColumns)
 	// The buffer owns these records now, so the deferred release must not fire.
+	b.bufferBytesBuffered.Add(typedColumns.estimatedBytes)
 	bufferCommitted = true
 
 	// CRITICAL FIX: Track count incrementally instead of O(n) loop
@@ -2851,6 +3019,7 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALHashes(ctx context.Context, da
 
 	// Release lock IMMEDIATELY (lock held for <1ms)
 	shard.mu.Unlock()
+	b.checkBufferMemoryPressure(b.bufferBytesBuffered.Load())
 
 	if walErr != nil {
 		b.recordWALError(walErr, func(ev *zerolog.Event) {
@@ -2904,6 +3073,11 @@ func (b *ArrowBuffer) writeTypedColumnarInternal(ctx context.Context, database, 
 // takes the lossy fallback.
 func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measurement string, typedColumns *TypedColumnBatch, numRecords int, rawPayload []byte, skipWAL bool) error {
 	bufferKey := database + "/" + measurement
+	if len(rawPayload) > 0 {
+		typedColumns.estimatedBytes = int64(len(rawPayload))
+	} else if typedColumns.estimatedBytes <= 0 {
+		typedColumns.estimatedBytes = estimateTypedColumnBatchBytes(typedColumns)
+	}
 	var walHashes []string
 
 	// Coverage-enabled writers prepare and commit under the shard lock; see
@@ -3068,6 +3242,7 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 
 	// Add typed columns to buffer directly (no conversion needed)
 	shard.buffers[bufferKey] = append(shard.buffers[bufferKey], typedColumns)
+	b.bufferBytesBuffered.Add(typedColumns.estimatedBytes)
 	// The buffer owns these records now, so the deferred release must not fire.
 	bufferCommitted = true
 
@@ -3080,6 +3255,7 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 	}
 
 	shard.mu.Unlock()
+	b.checkBufferMemoryPressure(b.bufferBytesBuffered.Load())
 
 	if walErr != nil {
 		b.recordWALError(walErr, func(ev *zerolog.Event) {
@@ -3545,6 +3721,7 @@ func (b *ArrowBuffer) metricsSampler() {
 			return
 		case <-ticker.C:
 			b.publishBufferMetrics()
+			b.publishBufferMemoryMetrics()
 			// Only on the sampler, not inside publishBufferMetrics:
 			// publishBufferMetrics also runs once per flushed file, and this
 			// walks every shard under RLock — 32 lock round-trips per flush on
@@ -4119,6 +4296,13 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 	recordCount := shard.bufferRecordCounts[bufferKey]
 	walHashes := collectWALHashes(batches)
 	group := b.newFlushGroup(bufferKey, batches, walHashes)
+	bufferStartTime := shard.bufferStartTimes[bufferKey]
+	estimatedBytes := estimateBufferedBatchesBytes(batches)
+	trackingID := b.trackFlush(bufferStartTime)
+	defer func() {
+		b.untrackFlush(trackingID)
+		b.bufferBytesBuffered.Add(-estimatedBytes)
+	}()
 
 	// Extract records to flush (hold lock for minimal time)
 	recordsToFlush := make([]interface{}, len(batches))
@@ -5559,6 +5743,7 @@ drain:
 			flushCtx, flushCancel, ok := b.closeFlushContext(deadline)
 			if !ok {
 				b.finishQueuedFlushTask(task)
+				b.releaseFlushTask(task)
 				mu.Lock()
 				unwrit += task.recordCount
 				mu.Unlock()
