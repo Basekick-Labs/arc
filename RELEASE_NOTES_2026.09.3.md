@@ -561,6 +561,13 @@ query freshness, deferrals drain the same way but the reader cannot push back on
 the replication stream; see #1025.
 
 
+### Flush metrics report queued and in-flight records ([#1038](https://github.com/Basekick-Labs/arc/issues/1038))
+
+Prometheus now exposes separate record-count gauges for flush batches waiting
+in the queue and batches currently being written. Together with
+`arc_buffer_records_buffered`, these show records retained across all three
+ingest stages without changing flush or write behavior.
+
 ### Ingestion retains buffered batches when the flush queue is full ([#966](https://github.com/Basekick-Labs/arc/issues/966))
 
 A size-triggered flush used to extract the whole buffer and delete it, and only
