@@ -526,6 +526,8 @@ its value now accounts for `compaction.max_concurrent` and the main process.
 The existing automatic value on hosts without a CPU quota and explicit thread
 settings are unchanged.
 
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1041](https://github.com/Basekick-Labs/arc/pull/1041).
+
 ### A deferred flush now waits for a free worker instead of the next age sweep ([#1008](https://github.com/Basekick-Labs/arc/issues/1008))
 
 When the flush queue is full, Arc keeps the batch in its in-memory buffer rather
