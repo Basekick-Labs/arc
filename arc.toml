@@ -102,7 +102,9 @@ default_sort_keys = ""
 enabled = true
 
 # DuckDB thread count for EACH compaction subprocess.
-# Default: unset (0) = half of the CPUs this process may use, minimum 1.
+# Default: unset (0) = half of the CPUs this process may use without a CPU
+# quota; with a quota, divide by compaction.max_concurrent + 1 (main process),
+# minimum 1. The no-quota default is unchanged.
 # Environment override: ARC_COMPACTION_THREADS=4
 #
 # "CPUs this process may use" is min(runtime.NumCPU(), runtime.GOMAXPROCS(0)):
@@ -111,12 +113,10 @@ enabled = true
 # quota expresses. Before 26.09.3 this was half the HOST's core count, so a
 # 2-CPU pod on a 64-core node ran every compaction job with 32 threads (#1030).
 #
-# Halving assumes the default max_concurrent = 2. Raising max_concurrent without
-# lowering this oversubscribes: the subprocesses do not share a budget.
+# Without a quota, the default remains half the available cores. With a quota,
+# the concurrent subprocesses and main process share the effective-core budget.
 #
-# This does not make the total fit the quota. On a 2-CPU quota the two
-# subprocesses take 1 thread each and the main process takes the quota's 2 — 4
-# threads against 2 CPUs. These are caps on parallelism, not reservations.
+# Thread counts are caps on parallelism, not reservations.
 #
 # Three things that change the derived value, all deliberate:
 #   - GOMAXPROCS set ABOVE the quota is honoured, up to the machine's core count.

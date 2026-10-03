@@ -519,6 +519,13 @@ Enforcement remains boot-time: nothing re-applies it after periodic re-validatio
 
 **For clustered Enterprise deployments, this changes core accounting.** Nodes report `GOMAXPROCS` as their core count in the join payload, and the cluster sums those to check the licence. A node in a 2-CPU pod on a 64-core host with a 4-core licence previously reported 4 — the raised value — and now reports 2, so twice as many such nodes fit one licence. Each node genuinely has 2 usable cores, so 2 x 2 = 4 is the licence being counted accurately rather than evaded, but the number of nodes that can join may change.
 
+### Quota-derived compaction threads account for concurrent jobs ([#1037](https://github.com/Basekick-Labs/arc/issues/1037))
+
+When `compaction.threads` is left at its automatic default under a CPU quota,
+its value now accounts for `compaction.max_concurrent` and the main process.
+The existing automatic value on hosts without a CPU quota and explicit thread
+settings are unchanged.
+
 ### A deferred flush now waits for a free worker instead of the next age sweep ([#1008](https://github.com/Basekick-Labs/arc/issues/1008))
 
 When the flush queue is full, Arc keeps the batch in its in-memory buffer rather

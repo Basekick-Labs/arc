@@ -76,25 +76,19 @@ func TestValidateCompactionMemoryLimit(t *testing.T) {
 	}
 }
 
-// TestGetDefaultCompactionThreads_UsesEffectiveCores is the test with teeth for
-// #1030: it drives the quota through the injectable seam, because CI runners
-// have no CPU quota and so cannot produce one.
-//
-// Two different injected values with two different expected outputs, and both
-// asserted to differ from the runtime.NumCPU()-derived answer on a machine with
-// more than 8 cores — a single value could pass by coincidence wherever
-// NumCPU()/2 happens to equal the expectation.
+// TestGetDefaultCompactionThreads_UsesEffectiveCores drives the effective-core
+// count through the injectable seam, because CI runners may have no CPU quota.
 func TestGetDefaultCompactionThreads_UsesEffectiveCores(t *testing.T) {
 	original := effectiveCoresFn
 	defer func() { effectiveCoresFn = original }()
 
+	machineCores := runtime.NumCPU()
 	for _, c := range []struct{ cores, want int }{
-		{2, 1}, // a 2-CPU pod: one thread per subprocess, two subprocesses, one quota
-		{8, 4},
-		{64, 32},
+		{2, 1},                                 // default concurrency and a 2-CPU quota still derive one thread
+		{machineCores, max(1, machineCores/2)}, // no quota preserves the old default
 	} {
 		effectiveCoresFn = func() int { return c.cores }
-		if got := getDefaultCompactionThreads(); got != c.want {
+		if got := getDefaultCompactionThreads(2); got != c.want {
 			t.Errorf("with %d effective cores: getDefaultCompactionThreads() = %d, want %d", c.cores, got, c.want)
 		}
 	}
@@ -103,7 +97,7 @@ func TestGetDefaultCompactionThreads_UsesEffectiveCores(t *testing.T) {
 	// host of more than 8 cores the old NumCPU()/2 answer is a different number.
 	if runtime.NumCPU() > 8 {
 		effectiveCoresFn = func() int { return 2 }
-		if got, hostDerived := getDefaultCompactionThreads(), runtime.NumCPU()/2; got == hostDerived {
+		if got, hostDerived := getDefaultCompactionThreads(2), runtime.NumCPU()/2; got == hostDerived {
 			t.Errorf("getDefaultCompactionThreads() = %d with a 2-core quota, which equals the host-derived %d: the quota is not being read", got, hostDerived)
 		}
 	}
@@ -127,9 +121,33 @@ func TestLoad_CompactionThreadsResolvesFromEffectiveCores(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Load() error = %v", err)
 		}
-		if cfg.Compaction.Threads != c.want {
-			t.Errorf("with %d effective cores: Compaction.Threads = %d, want %d", c.cores, cfg.Compaction.Threads, c.want)
+		want := c.want
+		if c.cores < runtime.NumCPU() {
+			want = max(1, c.cores/3) // two concurrent subprocesses plus the main process
 		}
+		if cfg.Compaction.Threads != want {
+			t.Errorf("with %d effective cores: Compaction.Threads = %d, want %d", c.cores, cfg.Compaction.Threads, want)
+		}
+	}
+}
+
+func TestLoad_CompactionThreadsUseMaxConcurrentUnderQuota(t *testing.T) {
+	if runtime.NumCPU() <= 8 {
+		t.Skip("test needs a host with more than 8 CPUs to distinguish quota-derived threads")
+	}
+
+	original := effectiveCoresFn
+	defer func() { effectiveCoresFn = original }()
+	effectiveCoresFn = func() int { return 8 }
+	t.Setenv("ARC_COMPACTION_MAX_CONCURRENT", "4")
+	t.Chdir(t.TempDir())
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Compaction.Threads != 1 {
+		t.Errorf("Compaction.Threads = %d, want 1 for 8 effective cores and 4 concurrent jobs under quota", cfg.Compaction.Threads)
 	}
 }
 
