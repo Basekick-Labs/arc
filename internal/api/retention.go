@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -793,7 +794,14 @@ func (h *RetentionHandler) handleGetExecutions(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid policy ID"})
 	}
 
-	limit := c.QueryInt("limit", 50)
+	limit := 50
+	if raw := c.Query("limit"); raw != "" {
+		parsed, parseErr := strconv.Atoi(raw)
+		if parseErr != nil || parsed < 0 || parsed > 1000 {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid limit"})
+		}
+		limit = parsed
+	}
 
 	rows, err := h.db.Query(`
 		SELECT id, policy_id, execution_time, status, deleted_count, cutoff_date, execution_duration_ms, error_message
