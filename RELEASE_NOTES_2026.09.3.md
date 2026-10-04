@@ -104,6 +104,26 @@ the cold tier through environment variables or Helm are unaffected. Note the
 general rule this illustrates: an empty environment variable does not blank a
 key that a configuration file sets — give the key the value you want, or remove
 it from the file.
+## Fixed: the WAL purge no longer infers durability from a file's age ([#1009](https://github.com/Basekick-Labs/arc/issues/1009))
+
+The periodic purge deleted rotated WAL files once their modification time passed a threshold of three times `ingest.max_buffer_age_ms`, taking that age as proof the data had reached Parquet. Whenever a flush took longer than the threshold — a slow or unavailable object store being the obvious way — the only remaining copy of acknowledged writes was deleted before it was durable. PR [#997](https://github.com/Basekick-Labs/arc/pull/997) measured 48,500 records lost this way.
+
+Rotated files that carry tracked WAL entries are now reclaimed only below a floor: the lowest sequence this process has appended that no durable flush checkpoint covers. No clock is involved, so neither mtime granularity nor an NTP step can affect it. The floor is released when a flush checkpoints the entry; when a write is **abandoned after its WAL append** — a type-mismatched column, the schema-churn guard; and when the checkpoint itself fails to persist, since the data did reach storage and only the record of it is missing. Without those a single rejected write would hold the floor for the life of the process, and because the purge stops at the first file it must retain rather than skipping it, nothing after that file would be reclaimed either.
+
+An identity a *replay* inherited is deliberately not released: it belongs to a WAL file whose keep-or-delete decision is recovery's, and the periodic recovery replays this process's own files.
+
+Two classes of file have no flush state to reason about, and those are still reclaimed by age — which is the only signal that exists for them, and a far narrower role for the clock than before:
+
+- **Files written by a previous process.** Their sequences belong to another numbering domain, so no floor of this process says anything about them. Recovery deletes the ones it replays, but deliberately keeps a file holding an entry it could not apply and one left by an unclean shutdown.
+- **Files holding only untracked entries.** A replication follower writes every replicated entry untracked, because its durability comes from the primary and from peer Parquet replication rather than from its own WAL. On a reader node that is every file it writes, so without this a follower's WAL directory would grow until the disk filled.
+
+A file carrying tracked sequences is never purged by age, whatever its age.
+
+`ingest.max_buffer_age_ms` therefore no longer bounds how long a rotated WAL file holding tracked data is kept; the flush floor does. It still sets the age threshold (at three times its value) for the two unaccounted classes above — so **raising it raises WAL disk usage on reader nodes**, where every file falls into the untracked class.
+
+One new figure to watch: `pending_unflushed` in the WAL stats is the floor's working set. It climbs while flushes fail and does not come back down until they succeed, so a steadily rising value is an object-store problem rather than a WAL one. It is also the memory this floor costs — one entry per unflushed write — which is reported rather than capped, as with the ingest buffers.
+
+Contributed by [@lecodev-26](https://github.com/lecodev-26) in [#1056](https://github.com/Basekick-Labs/arc/pull/1056).
 
 ## Compaction dedup metrics count Parquet rows correctly ([#1015](https://github.com/Basekick-Labs/arc/issues/1015))
 
@@ -585,7 +605,7 @@ To be precise about what that bounds: it caps the **subprocesses'** combined bud
 
 A replayed WAL entry correctly writes nothing back to the WAL — the copy being replayed is already on disk. But it also produced no flush *checkpoint*, because a checkpoint is keyed on the identity the WAL assigns at append time and a replay never appends. So every subsequent recovery pass replayed the same entry again.
 
-That matters whenever recovery **keeps** a file, which one poisoned entry is enough to cause ([#590](https://github.com/Basekick-Labs/arc/issues/590)): the file's healthy entries were re-applied on every pass, and for measurements without tags compaction can never remove the resulting duplicate rows. Today the periodic mtime purge eventually deletes the kept file and bounds the damage to one duplicate set — a backstop that disappears once purging becomes flush-aware, which is the rest of #1009.
+That matters whenever recovery **keeps** a file, which one poisoned entry is enough to cause ([#590](https://github.com/Basekick-Labs/arc/issues/590)): the file's healthy entries were re-applied on every pass, and for measurements without tags compaction can never remove the resulting duplicate rows. The periodic purge eventually deletes the kept file and bounds the damage to one duplicate set. That backstop survives the move to flush-aware purging described above: a file recovery keeps is one no checkpoint will ever cover, so it is reclaimed by age rather than by the flush floor.
 
 A replayed batch now inherits the identity of the entry it came from, so the flush that persists it checkpoints the **original** entry and no later pass replays it. Two deliberate exclusions, both of which would otherwise turn duplication into loss:
 
@@ -613,7 +633,7 @@ Checkpoint writes cost nothing measurable at Arc's flush rate: measured ABAB wit
 
 **Follow-up ([#1045](https://github.com/Basekick-Labs/arc/issues/1045)):** as first merged, this recorded checkpoints only for *synchronous* flushes — the age sweep, a schema change, `FlushAll` and shutdown. The flush task for an **asynchronous, size-triggered** flush was built without its WAL identities, so the checkpoint call received nothing and the main ingest path still replayed after a crash. Measured on the same crash test with the buffer configured to flush by size rather than age: 310 acknowledged records of which 300 had flushed replayed all 310 and left 600 rows queryable. Fixed before release; both paths now checkpoint, and the regression test drives the asynchronous path specifically.
 
-Two related WAL problems are **not** fixed by this and are tracked in [#1009](https://github.com/Basekick-Labs/arc/issues/1009): the periodic purge still deletes rotated WAL files by modification time rather than by what has actually been flushed, and recovery still deletes a replayed file as soon as its records are back in the buffer, before they reach Parquet.
+One related WAL problem is **not** fixed by this and remains tracked in [#1009](https://github.com/Basekick-Labs/arc/issues/1009): recovery still deletes a replayed file as soon as its records are back in the buffer, before they reach Parquet. The age-based purge of rotated files *is* fixed — see the entry above.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#998](https://github.com/Basekick-Labs/arc/pull/998).
 

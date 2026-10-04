@@ -1079,7 +1079,8 @@ func main() {
 
 		// Start periodic WAL maintenance goroutine.
 		// Two modes:
-		//   Normal:   purge rotated WAL files older than safeAge (data already in parquet)
+		//   Normal:   purge rotated WAL files below the unflushed floor, plus
+		//             files with no tracked sequences once older than safeAge
 		//   Recovery: when a flush failure is detected (S3 outage), replay WAL files
 		//             to re-buffer data that was cleared from buffers after failed flush
 		walMaintenanceCtx, walMaintenanceCancel := context.WithCancel(context.Background())
@@ -1088,9 +1089,11 @@ func main() {
 			return nil
 		}, shutdown.PriorityBuffer)
 
-		// Safe age threshold: after this duration, a rotated WAL file's data MUST have
-		// been flushed to parquet by the normal buffer flush cycle (MaxBufferAgeMS).
-		// We use 3x margin to account for flush worker delays and clock skew.
+		// Safe age threshold, now used ONLY for files whose durability nothing
+		// tracks — a previous process's files, and the untracked entries a
+		// replication follower writes. Tracked files are reclaimed by the
+		// flush floor instead, at any age. 3x MaxBufferAgeMS keeps the old
+		// margin for flush worker delays and clock skew.
 		safeAge := time.Duration(cfg.Ingest.MaxBufferAgeMS) * time.Millisecond * 3
 		if safeAge < 30*time.Second {
 			safeAge = 30 * time.Second
@@ -1120,6 +1123,11 @@ func main() {
 								walLogger.Error().Err(purgeErr).Msg("WAL purge before recovery failed")
 							} else if deleted > 0 {
 								walLogger.Info().Int("deleted", deleted).Msg("Purged old WAL files before recovery")
+							}
+							if n, err := walWriter.PurgeUnaccountedOlderThan(safeAge); err != nil {
+								walLogger.Error().Err(err).Msg("WAL unaccounted-file purge before recovery failed")
+							} else if n > 0 {
+								walLogger.Info().Int("deleted", n).Msg("Purged WAL files with no tracked sequences before recovery")
 							}
 						}
 
@@ -1157,13 +1165,30 @@ func main() {
 							arrowBuffer.ResetFlushFailure()
 						}
 					} else {
-						// Normal operation — purge only WAL files proven flushed by tracked
-						// sequence state; do not infer durability from wall-clock age.
+						// Normal operation. Two purges, because two different
+						// things bound WAL size and only one of them can be
+						// reasoned about from flush state:
+						//
+						//   - tracked files: reclaimed strictly below the
+						//     unflushed floor, never by age. Inferring
+						//     durability from wall-clock age is what lost
+						//     acknowledged writes (#966, #1009).
+						//   - files with no tracked sequences: a previous
+						//     process's files, and the untracked entries a
+						//     replication follower writes. No checkpoint will
+						//     ever cover them, so age is the only signal there
+						//     is — and without this a reader node's WAL grows
+						//     until the disk fills.
 						deleted, err := walWriter.PurgeFlushed(walWriter.MinUnflushedSequence())
 						if err != nil {
 							walLogger.Error().Err(err).Msg("Periodic WAL purge failed")
 						} else if deleted > 0 {
 							walLogger.Info().Int("deleted", deleted).Msg("Periodic WAL cleanup complete")
+						}
+						if n, err := walWriter.PurgeUnaccountedOlderThan(safeAge); err != nil {
+							walLogger.Error().Err(err).Msg("Periodic WAL unaccounted-file purge failed")
+						} else if n > 0 {
+							walLogger.Info().Int("deleted", n).Msg("Purged WAL files with no tracked sequences")
 						}
 					}
 				}

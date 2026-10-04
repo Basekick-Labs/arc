@@ -19,6 +19,7 @@ type checkpointRecordingWAL struct {
 	mu        sync.Mutex
 	handedOut []string
 	flushed   []string
+	forgotten []string
 	n         int
 }
 
@@ -50,6 +51,23 @@ func (w *checkpointRecordingWAL) MarkFlushed(hashes []string) error {
 	defer w.mu.Unlock()
 	w.flushed = append(w.flushed, hashes...)
 	return nil
+}
+
+// ForgetTracked completes trackedWALWriter. Without it this double no longer
+// satisfies the interface, the write path's type assertion falls through, and
+// tracking is silently skipped — which is how the checkpoint gap in #948
+// looked from the outside.
+func (w *checkpointRecordingWAL) ForgetTracked(hashes []string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.forgotten = append(w.forgotten, hashes...)
+}
+
+// forgottenIdentities reports what the write path abandoned.
+func (w *checkpointRecordingWAL) forgottenIdentities() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]string(nil), w.forgotten...)
 }
 
 func (w *checkpointRecordingWAL) counts() (handedOut, flushed int) {
@@ -250,5 +268,93 @@ func TestReplay_DoesNotInheritContentHash(t *testing.T) {
 
 	if _, flushed := walWriter.counts(); flushed != 0 {
 		t.Errorf("checkpointed %d identities for an untracked (content-hash) entry, want 0", flushed)
+	}
+}
+
+// A write rejected AFTER its WAL append must release its identity, or the WAL
+// purge floor waits forever for data no buffer holds. Because PurgeFlushed
+// stops at the first retained file instead of skipping it, one such identity
+// stops the WAL reclaiming anything at all for the life of the process (#676).
+//
+// A string time column is converted after the WAL append and rejected there
+// ("time column must be int64 microseconds"), which is one of several error
+// returns in that window — a type mismatch, a client that disconnects during a
+// schema-change flush, the schema-churn guard, a closing shard. The release is
+// deferred over the whole window rather than written at each return, so a
+// return added later cannot reintroduce the leak.
+func TestAbandonedWrite_ReleasesItsWALIdentity(t *testing.T) {
+	buffer, walWriter := newCheckpointBuffer(1)
+	defer buffer.Close()
+
+	rejected := checkpointTestRecord()
+	rejected.Columns = map[string][]interface{}{
+		"time":  {"not-an-int64"},
+		"value": {1.0},
+	}
+
+	err := buffer.writeColumnarInternal(context.Background(), "default", rejected, false, "")
+	if err == nil {
+		t.Fatal("expected the write to be rejected after its WAL append")
+	}
+
+	handedOut, _ := walWriter.counts()
+	if handedOut == 0 {
+		t.Fatal("the WAL handed out no identity, so this test proves nothing")
+	}
+	forgotten := walWriter.forgottenIdentities()
+	if len(forgotten) != handedOut {
+		t.Fatalf("WAL handed out %d identities and %d were released: %v — an unreleased identity pins the purge floor",
+			handedOut, len(forgotten), forgotten)
+	}
+}
+
+// The mirror image: a write that IS accepted must keep its identity pinned, so
+// the floor protects its WAL copy until a flush checkpoints it.
+func TestAcceptedWrite_KeepsItsWALIdentity(t *testing.T) {
+	// MaxBufferSize high so the write stays buffered rather than flushing.
+	buffer, walWriter := newCheckpointBuffer(1000)
+	defer buffer.Close()
+
+	if err := buffer.writeColumnarInternal(context.Background(), "default", checkpointTestRecord(), false, ""); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if forgotten := walWriter.forgottenIdentities(); len(forgotten) != 0 {
+		t.Fatalf("released %v for a buffered write; its WAL copy is now unprotected", forgotten)
+	}
+}
+
+// A REJECTED REPLAY must not release the identity it inherited. On the replay
+// path walHashes is the identity of the entry being replayed (#1048), and that
+// identity belongs to a WAL file whose keep-or-delete decision is recovery's.
+// Releasing it drops the purge floor below a sequence that is still unflushed,
+// and the periodic flush-failure recovery replays THIS process's own files, so
+// the instance prefix matches and the release lands.
+//
+// Sequence it would break: seq 5 is appended, its flush fails during an object
+// store outage, so it stays pending and its file is correctly retained.
+// Recovery replays that file; the replay write is rejected (a conversion
+// failure, or the schema-churn guard); the release drops the floor past seq 5;
+// recovery keeps the file; the next purge deletes it. Unflushed acknowledged
+// write, gone.
+func TestRejectedReplay_DoesNotReleaseTheInheritedIdentity(t *testing.T) {
+	buffer, walWriter := newCheckpointBuffer(1)
+	defer buffer.Close()
+
+	const inherited = "abababababababababababababababab"
+	rejected := checkpointTestRecord()
+	rejected.Columns = map[string][]interface{}{
+		"time":  {"not-an-int64"},
+		"value": {1.0},
+	}
+
+	// skipWAL=true with an inherited identity is the replay path.
+	err := buffer.writeColumnarInternal(context.Background(), "default", rejected, true, inherited)
+	if err == nil {
+		t.Fatal("expected the replay write to be rejected")
+	}
+
+	if forgotten := walWriter.forgottenIdentities(); len(forgotten) != 0 {
+		t.Fatalf("a rejected replay released %v; that identity's file is recovery's to keep or delete", forgotten)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -468,12 +469,19 @@ type Writer struct {
 	fileSeqs        map[string]*fileSeqState
 	fileOrder       []string
 	trackedSequence uint64
-	// pendingTracked maps this process's tracked identity token to its
-	// monotonic tracked sequence until a durable flush checkpoint is written.
-	// It is the source of truth for MinUnflushedSequence and therefore for
-	// clock-free WAL purging (#1009).
-	pendingTracked map[string]uint64
-	closed         bool
+	// pendingSeqs holds the tracked sequences this process has appended that no
+	// durable flush checkpoint covers yet. Its minimum is the floor that makes
+	// WAL purging clock-free (#1009).
+	//
+	// Keyed by sequence, not by identity token: the token encodes the
+	// sequence (see appendTrackedEntry), so a release can recover it without
+	// a second map. Guarded by pendingMu rather than w.mu, deliberately — the
+	// per-record append path must stay off the writer lock, which is held
+	// across file writes, fsync, rotation, and the full-file scan in
+	// CurrentCheckpointHashes.
+	pendingMu   sync.Mutex
+	pendingSeqs map[uint64]struct{}
+	closed      bool
 
 	// Metrics (atomic for lock-free reads)
 	TotalEntries   int64
@@ -534,7 +542,7 @@ func NewWriter(cfg *WriterConfig) (*Writer, error) {
 		lastSyncTime:    time.Now(),
 		entryChan:       make(chan walEntry, cfg.BufferSize),
 		fileSeqs:        make(map[string]*fileSeqState),
-		pendingTracked:  make(map[string]uint64),
+		pendingSeqs:     make(map[uint64]struct{}),
 		done:            make(chan struct{}),
 		trackedInstance: trackedInstance,
 	}
@@ -843,6 +851,12 @@ func (w *Writer) AppendTracked(records []map[string]interface{}) ([]string, erro
 		}
 		token, err := w.appendTrackedEntry(chunk)
 		if err != nil {
+			// The chunks that already landed are pending in the floor, and
+			// their tokens go out of scope with this slice — the caller gets
+			// nil and cannot release them. Unreleased, each pins the floor for
+			// the life of the process, and because PurgeFlushed stops at the
+			// first retained file the WAL never reclaims anything again (#676).
+			w.releasePending(hashes)
 			return nil, err
 		}
 		hashes = append(hashes, token)
@@ -872,6 +886,12 @@ func (w *Writer) AppendRawWithMetaTracked(database string, payload []byte) ([]st
 		}
 		token, err := w.appendTrackedEntry(envelopePayload(dbBytes, chunk))
 		if err != nil {
+			// The chunks that already landed are pending in the floor, and
+			// their tokens go out of scope with this slice — the caller gets
+			// nil and cannot release them. Unreleased, each pins the floor for
+			// the life of the process, and because PurgeFlushed stops at the
+			// first retained file the WAL never reclaims anything again (#676).
+			w.releasePending(hashes)
 			return nil, err
 		}
 		hashes = append(hashes, token)
@@ -910,11 +930,7 @@ func (w *Writer) MarkFlushed(hashes []string) error {
 		if err := <-done; err != nil {
 			return fmt.Errorf("failed to persist WAL flush checkpoint: %w", err)
 		}
-		w.mu.Lock()
-		for _, token := range hashes[start:end] {
-			delete(w.pendingTracked, token)
-		}
-		w.mu.Unlock()
+		w.releasePending(hashes[start:end])
 	}
 	return nil
 }
@@ -938,7 +954,16 @@ func trackedPayloadFits(payloadLen, envelopeHeaderLen int) bool {
 }
 
 func (w *Writer) appendTrackedEntry(logicalPayload []byte) (string, error) {
+	// Allocating the sequence and publishing it as pending must be one step.
+	// Everything after this — the Sprintf, the CRC, and above all the
+	// synchronous replication hook below — sits between them otherwise, and a
+	// sequence counted in trackedSequence but absent from pendingSeqs is a
+	// sequence the floor does not protect. With a replication hook set that
+	// window spans a network send.
+	w.pendingMu.Lock()
 	seq := atomic.AddUint64(&w.trackedSequence, 1)
+	w.pendingSeqs[seq] = struct{}{}
+	w.pendingMu.Unlock()
 	token := fmt.Sprintf("%016x%016x", w.trackedInstance, seq)
 	trackedPayload := make([]byte, walTrackedHeaderSize+len(logicalPayload))
 	trackedPayload[0] = WALTrackedMarker
@@ -960,19 +985,12 @@ func (w *Writer) appendTrackedEntry(logicalPayload []byte) (string, error) {
 	binary.BigEndian.PutUint64(entryData[4:12], timestampUS)
 	binary.BigEndian.PutUint32(entryData[12:16], checksum)
 	copy(entryData[WALEntryHeaderSize:], trackedPayload)
-	// Record the pending identity BEFORE enqueueing. The writer goroutine may
-	// consume the entry immediately; publishing it first closes the race where
-	// maintenance could otherwise observe an empty floor and purge its file.
-	w.mu.Lock()
-	w.pendingTracked[token] = seq
-	w.mu.Unlock()
-
 	// Carry the sequence so the writer loop can record it against the file the
 	// write actually lands in (#1009).
 	if err := w.tryEnqueueEntry(walEntry{data: entryData, seq: seq}); err != nil {
-		w.mu.Lock()
-		delete(w.pendingTracked, token)
-		w.mu.Unlock()
+		w.pendingMu.Lock()
+		delete(w.pendingSeqs, seq)
+		w.pendingMu.Unlock()
 		return "", err
 	}
 	return token, nil
@@ -1267,21 +1285,103 @@ func (w *Writer) forgetFileLocked(path string) {
 	}
 }
 
-// MinUnflushedSequence returns the lowest tracked sequence that has not yet
-// been covered by a durable flush checkpoint. When every tracked entry is
-// checkpointed it returns MaxUint64, which makes every eligible rotated file
-// reclaimable. Entries are tracked by identity token so duplicate payloads do
-// not collide and old-process checkpoints are harmless.
-func (w *Writer) MinUnflushedSequence() uint64 {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	min := ^uint64(0)
-	for _, seq := range w.pendingTracked {
-		if seq < min {
-			min = seq
+// trackedTokenSeq recovers the sequence from an identity token minted by this
+// process. Tokens are "%016x%016x" of the writer instance and the sequence
+// (appendTrackedEntry), so a foreign token — one inherited from a replayed
+// entry written by an earlier process — is reported as not ours. Its sequence
+// belongs to another numbering domain and means nothing against this
+// process's floor.
+func (w *Writer) trackedTokenSeq(token string) (uint64, bool) {
+	if len(token) != 32 {
+		return 0, false
+	}
+	instance, err := strconv.ParseUint(token[:16], 16, 64)
+	if err != nil || instance != w.trackedInstance {
+		return 0, false
+	}
+	seq, err := strconv.ParseUint(token[16:], 16, 64)
+	if err != nil {
+		return 0, false
+	}
+	return seq, true
+}
+
+// releasePending drops identities from the unflushed set.
+func (w *Writer) releasePending(tokens []string) {
+	w.pendingMu.Lock()
+	for _, token := range tokens {
+		if seq, ok := w.trackedTokenSeq(token); ok {
+			delete(w.pendingSeqs, seq)
 		}
 	}
-	return min
+	w.pendingMu.Unlock()
+}
+
+// ForgetTracked drops identities whose data will never be flushed, because the
+// write that produced them was abandoned after its WAL append.
+//
+// This is not the same as MarkFlushed: no checkpoint is written, because
+// nothing reached storage. It only stops the floor waiting for data no buffer
+// holds. Without it a single rejected write — a type-mismatched column, a
+// client that disconnects during a schema-change flush, the schema-churn
+// guard, a closing shard — would pin the floor for the life of the process,
+// and because PurgeFlushed stops at the first retained file, the WAL would
+// never reclaim anything again (#676).
+//
+// Callers must only pass identities they are certain no buffer and no flush
+// in flight still owns.
+func (w *Writer) ForgetTracked(hashes []string) {
+	if len(hashes) == 0 {
+		return
+	}
+	w.releasePending(hashes)
+}
+
+// MinUnflushedSequence returns the lowest tracked sequence this process has
+// appended that no durable flush checkpoint covers. With nothing pending it
+// returns one past the highest sequence issued.
+//
+// Deliberately NOT one past infinity. The caller reads the floor and then
+// calls PurgeFlushed with it, under a different lock acquisition, so an append
+// and a rotation can land in between; a MaxUint64 floor is above every
+// sequence the writer can ever issue, and would purge that file. highest+1 is
+// above everything pending and below anything issued later, which closes that
+// window at no cost.
+//
+// Deliberately a plain scan of the pending set, too. An earlier revision
+// walked a forward-only cursor over the sequence space to avoid it, which was
+// both unsound and slower: unsound because a sequence allocated but not yet
+// published let the cursor park above it and never return to it, and slower
+// because every pending sequence lies in [min, highest], so the range the
+// cursor walks is always at least as large as the set it is scanning.
+// PendingUnflushedCount reports how many tracked sequences are awaiting a
+// durable flush checkpoint. It is the floor's working set, and it grows for as
+// long as flushes keep failing — during a prolonged object-store outage that
+// is one entry per write request, which is worth being able to see rather than
+// infer. Detect and report rather than cap, as with the ingest buffers.
+func (w *Writer) PendingUnflushedCount() int {
+	w.pendingMu.Lock()
+	defer w.pendingMu.Unlock()
+	return len(w.pendingSeqs)
+}
+
+func (w *Writer) MinUnflushedSequence() uint64 {
+	w.pendingMu.Lock()
+	defer w.pendingMu.Unlock()
+
+	// Read inside the lock: a sequence is allocated and published together, so
+	// this observes no sequence that is issued but not yet pending.
+	highest := atomic.LoadUint64(&w.trackedSequence)
+	if len(w.pendingSeqs) == 0 {
+		return highest + 1
+	}
+	lowest := ^uint64(0)
+	for seq := range w.pendingSeqs {
+		if seq < lowest {
+			lowest = seq
+		}
+	}
+	return lowest
 }
 
 // PurgeFlushed deletes rotated WAL files whose data is known to have reached
@@ -1356,30 +1456,151 @@ func (w *Writer) PurgeFlushed(minUnflushedSeq uint64) (int, error) {
 	return deleted, firstErr
 }
 
-// PurgeOlderThan deletes inactive WAL files whose modification time is older
-// than the given threshold. The active WAL file is never deleted.
-// Use this during normal operation to safely purge rotated WAL files whose
-// data has been flushed to parquet by the normal buffer flush cycle.
-func (w *Writer) PurgeOlderThan(minAge time.Duration) (int, error) {
+// PurgeUnaccountedOlderThan reclaims, once older than minAge, the WAL files
+// PurgeFlushed can never reason about. Without it those accumulate until the
+// disk fills; with it, a file carrying tracked sequences is still never
+// deleted by age, which is the acknowledged-write loss of #966 and #1009.
+//
+// Two classes qualify, and they need different treatment:
+//
+//   - Files this process wrote that hold no tracked sequence. A replication
+//     follower writes every replicated entry through AppendRaw, which is
+//     untracked, so nothing will ever report those entries flushed and
+//     PurgeFlushed stops at the first such file. On a reader node that is
+//     every file it writes. Its local WAL is a convenience rather than its
+//     durability story — the receiver treats a dropped append as non-fatal
+//     because the data is held by the primary and by peer Parquet replication.
+//
+//   - Files written by a PREVIOUS process. They are absent from w.fileOrder by
+//     design: their sequences belong to another numbering domain, so no floor
+//     of ours describes them. Recovery deletes the ones it replays, but
+//     deliberately keeps a file holding an entry it could not apply
+//     (internal/wal/recovery.go) and one left by an unclean shutdown
+//     (cmd/arc/main.go) — both on the documented expectation that the periodic
+//     purge reclaims them afterwards.
+//
+// The first class is walked IN ROTATION ORDER and stops at the first file that
+// must be kept, exactly as PurgeFlushed does, and for the same reason: a flush
+// checkpoint is appended like any other entry, so a checkpoint covering file
+// R's entries can live in R or in any later file. Deleting a later file while R
+// is kept can destroy the only record that R's entries were flushed, and
+// recovery would replay them — permanent duplicate rows for a measurement
+// without tags.
+//
+// A file with maxSeq == 0 IS a candidate: it holds no tracked data, only
+// checkpoints or a header. That is safe precisely because the walk stops at
+// the first tracked file, so any checkpoint-only file it reaches has no
+// tracked file before it and therefore no proof to orphan. The writer loop is
+// FIFO and a data entry is enqueued before the checkpoint that covers it, so a
+// checkpoint is never in a file EARLIER than the data it describes.
+//
+// The second class is not in this process's rotation order at all, so the
+// ordering hazard does not apply to it: a previous process's checkpoints cover
+// a previous process's sequences, which recovery reads from the files
+// themselves.
+func (w *Writer) PurgeUnaccountedOlderThan(minAge time.Duration) (int, error) {
+	now := time.Now()
+	tooYoung := func(path string) bool {
+		info, err := os.Stat(path)
+		if err != nil {
+			// Cannot judge the age: keep it.
+			return true
+		}
+		return now.Sub(info.ModTime()) <= minAge
+	}
+
 	w.mu.Lock()
 	activePath := w.currentPath
+	known := make(map[string]bool, len(w.fileOrder))
+	ordered := make([]string, 0, len(w.fileOrder))
+	for _, path := range w.fileOrder {
+		known[path] = true
+		if path == activePath {
+			break
+		}
+		state := w.fileSeqs[path]
+		if state == nil || state.maxSeq != 0 {
+			// A tracked file is the floor's business, not ours, and anything
+			// after it may hold its checkpoint. Stop.
+			break
+		}
+		if tooYoung(path) {
+			break
+		}
+		ordered = append(ordered, path)
+	}
+	// Record the remaining paths so the foreign sweep below can tell a file
+	// this process wrote from one it did not.
+	for _, path := range w.fileOrder {
+		known[path] = true
+	}
 	w.mu.Unlock()
 
-	now := time.Now()
-	deleted, err := w.purgeWALFiles(func(path string) bool {
-		if path == activePath {
-			return false
+	deleted := 0
+	var firstErr error
+	for _, path := range ordered {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			if firstErr == nil {
+				firstErr = err
+			}
+			// Stop rather than skip, for the ordering reason above.
+			break
 		}
-		info, statErr := os.Stat(path)
-		if statErr != nil {
-			return false
-		}
-		return now.Sub(info.ModTime()) > minAge
-	})
-	if deleted > 0 {
-		w.logger.Info().Int("deleted", deleted).Dur("min_age", minAge).Msg("Purged old WAL files")
+		deleted++
+		w.mu.Lock()
+		w.forgetFileLocked(path)
+		w.mu.Unlock()
 	}
-	return deleted, err
+
+	// Foreign files. Glob returns sorted names and rotate() names files by
+	// timestamp, so this is creation order — and it must STOP at the first
+	// failed delete rather than skip past it, for the same reason the walk
+	// above does: a checkpoint covering a kept file's entries can live in a
+	// later file, and deleting that later file would destroy the proof.
+	pattern := filepath.Join(w.config.WALDir, "*.wal")
+	candidates, globErr := filepath.Glob(pattern)
+	if globErr != nil && firstErr == nil {
+		firstErr = globErr
+	}
+	foreign := 0
+	for _, path := range candidates {
+		if known[path] || tooYoung(path) {
+			continue
+		}
+		// Re-read the active path rather than trusting a snapshot: a rotation
+		// since then leaves a header-only file that noteWrittenLocked has not
+		// recorded yet, so it is absent from fileOrder and looks foreign.
+		// Deleting the file the writer is appending to leaves it writing to an
+		// unlinked inode for the rest of the session, with no durability and
+		// no error (#594).
+		w.mu.Lock()
+		isActive := path == w.currentPath
+		w.mu.Unlock()
+		if isActive {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			if firstErr == nil {
+				firstErr = err
+			}
+			break
+		}
+		foreign++
+		w.mu.Lock()
+		w.forgetFileLocked(path)
+		w.mu.Unlock()
+	}
+	deleted += foreign
+
+	if deleted > 0 {
+		w.logger.Info().
+			Int("deleted", deleted).
+			Int("untracked_own", deleted-foreign).
+			Int("previous_process", foreign).
+			Dur("min_age", minAge).
+			Msg("Purged WAL files with no tracked sequences")
+	}
+	return deleted, firstErr
 }
 
 // Stats returns WAL statistics
@@ -1398,9 +1619,13 @@ func (w *Writer) Stats() map[string]interface{} {
 		"total_syncs":         atomic.LoadInt64(&w.TotalSyncs),
 		"total_rotations":     atomic.LoadInt64(&w.TotalRotations),
 		"dropped_entries":     atomic.LoadInt64(&w.DroppedEntries),
-		"failed_writes":       atomic.LoadInt64(&w.FailedWrites),
-		"buffer_size":         w.config.BufferSize,
-		"buffer_used":         len(w.entryChan),
+		// The purge floor's working set. Climbs while flushes fail and does
+		// not come back down until they succeed, so a steadily rising value
+		// is an object-store problem, not a WAL one.
+		"pending_unflushed": w.PendingUnflushedCount(),
+		"failed_writes":     atomic.LoadInt64(&w.FailedWrites),
+		"buffer_size":       w.config.BufferSize,
+		"buffer_used":       len(w.entryChan),
 	}
 }
 

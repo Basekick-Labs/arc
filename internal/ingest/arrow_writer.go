@@ -840,6 +840,9 @@ type trackedWALWriter interface {
 	AppendTracked(records []map[string]interface{}) ([]string, error)
 	AppendRawWithMetaTracked(database string, payload []byte) ([]string, error)
 	MarkFlushed(hashes []string) error
+	// ForgetTracked releases identities whose write was abandoned after its
+	// WAL append, so the purge floor stops waiting for data no buffer holds.
+	ForgetTracked(hashes []string)
 }
 
 // walTrackedIdentityHexLen is the length of a tracked WAL identity:
@@ -2323,6 +2326,34 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 	}
 
 	// Convert []interface{} columns to typed arrays (optimized with zero-copy fast paths)
+	// From here to the line that puts this batch into shard.buffers, every
+	// return abandons a write whose WAL append has already happened. One
+	// deferred release covers all of them — including returns added later,
+	// which is the point: releasing at each error site is a contract the next
+	// edit silently breaks, and a single leaked identity pins the WAL purge
+	// floor for the life of the process. PurgeFlushed stops at the first
+	// retained file rather than skipping it, so nothing after that file is
+	// reclaimed either and the WAL grows until the disk fills (#676).
+	//
+	// Deliberately not MarkFlushed: nothing reached storage, so there is no
+	// checkpoint to write. It only stops the floor waiting for data that no
+	// buffer holds.
+	//
+	// Only for identities this write MINTED. On the replay path walHashes is
+	// the identity inherited from the entry being replayed (#1048), and that
+	// identity belongs to a WAL file whose keep-or-delete decision is
+	// recovery's — releasing it would drop the floor below a sequence that is
+	// still legitimately unflushed, and the periodic flush-failure recovery
+	// replays THIS process's own files, so the instance prefix matches and the
+	// release really lands.
+	bufferCommitted := skipWAL
+	defer func() {
+		if !bufferCommitted && len(walHashes) > 0 {
+			if tracked, ok := b.wal.(trackedWALWriter); ok {
+				tracked.ForgetTracked(walHashes)
+			}
+		}
+	}()
 	typedColumns, numRecords, err := b.convertColumnsToTyped(record.Measurement, record.Columns)
 	if err != nil {
 		return fmt.Errorf("failed to convert columns: %w", err)
@@ -2401,6 +2432,8 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 
 	// Add typed columns to buffer (already converted via zero-copy fast paths)
 	shard.buffers[bufferKey] = append(shard.buffers[bufferKey], typedColumns)
+	// The buffer owns these records now, so the deferred release must not fire.
+	bufferCommitted = true
 
 	// CRITICAL FIX: Track count incrementally instead of O(n) loop
 	shard.bufferRecordCounts[bufferKey] += numRecords
@@ -2499,6 +2532,34 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 		}
 	}
 	typedColumns.WALHashes = walHashes
+	// From here to the line that puts this batch into shard.buffers, every
+	// return abandons a write whose WAL append has already happened. One
+	// deferred release covers all of them — including returns added later,
+	// which is the point: releasing at each error site is a contract the next
+	// edit silently breaks, and a single leaked identity pins the WAL purge
+	// floor for the life of the process. PurgeFlushed stops at the first
+	// retained file rather than skipping it, so nothing after that file is
+	// reclaimed either and the WAL grows until the disk fills (#676).
+	//
+	// Deliberately not MarkFlushed: nothing reached storage, so there is no
+	// checkpoint to write. It only stops the floor waiting for data that no
+	// buffer holds.
+	//
+	// Only for identities this write MINTED. On the replay path walHashes is
+	// the identity inherited from the entry being replayed (#1048), and that
+	// identity belongs to a WAL file whose keep-or-delete decision is
+	// recovery's — releasing it would drop the floor below a sequence that is
+	// still legitimately unflushed, and the periodic flush-failure recovery
+	// replays THIS process's own files, so the instance prefix matches and the
+	// release really lands.
+	bufferCommitted := skipWAL
+	defer func() {
+		if !bufferCommitted && len(walHashes) > 0 {
+			if tracked, ok := b.wal.(trackedWALWriter); ok {
+				tracked.ForgetTracked(walHashes)
+			}
+		}
+	}()
 
 	// Column signature for schema evolution detection (pre-computed in convertColumnsToTyped)
 	newSignature := typedColumns.Signature
@@ -2562,6 +2623,8 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 
 	// Add typed columns to buffer directly (no conversion needed)
 	shard.buffers[bufferKey] = append(shard.buffers[bufferKey], typedColumns)
+	// The buffer owns these records now, so the deferred release must not fire.
+	bufferCommitted = true
 
 	shard.bufferRecordCounts[bufferKey] += numRecords
 	totalBuffered := shard.bufferRecordCounts[bufferKey]
@@ -3279,6 +3342,14 @@ func (b *ArrowBuffer) markWALFlushed(hashes []string) {
 	}
 	if err := tracked.MarkFlushed(hashes); err != nil {
 		b.logger.Error().Err(err).Int("entries", len(hashes)).Msg("Failed to write WAL flush checkpoint")
+		// The data IS in storage; only its checkpoint is missing. Holding the
+		// purge floor here would be waiting for a flush that already
+		// happened, and MarkFlushed writes its batches in order, so a failure
+		// part-way leaves every later identity pinned forever. Release them:
+		// the cost of a missing checkpoint is that recovery may replay the
+		// entry, which #1048 made idempotent — a duplicate risk, not a loss
+		// risk — whereas a pinned floor stops the WAL reclaiming anything.
+		tracked.ForgetTracked(hashes)
 	}
 }
 
