@@ -3772,9 +3772,18 @@ func main() {
 							PathStyle: cold.S3PathStyle,
 							Prefix:    cold.S3Prefix,
 						}
-						coldBackend, err = storage.NewS3Backend(s3Config, logger.Get("tiering-cold-s3"))
-						if err != nil {
-							log.Error().Err(err).Msg("Failed to create cold tier S3 backend for tiering")
+						// Assigned through a typed local, never straight into
+						// the interface: a constructor error comes back as a
+						// nil *S3Backend, and an interface holding a typed
+						// nil is not == nil (#713). Stored directly, every
+						// "coldBackend != nil" downstream — the startup tier
+						// scan's cold sync, the drainer's existence probe,
+						// the query router's cold glob — would pass and then
+						// dereference a nil receiver.
+						if b, err := storage.NewS3Backend(s3Config, logger.Get("tiering-cold-s3")); err != nil {
+							log.Error().Err(err).Msg("Failed to create cold tier S3 backend for tiering: the cold tier is unusable on this node until the configuration is fixed")
+						} else {
+							coldBackend = b
 						}
 
 					case "azure":
@@ -3787,9 +3796,11 @@ func main() {
 							Endpoint:           cold.AzureEndpoint,
 							UseManagedIdentity: cold.AzureUseManagedIdentity,
 						}
-						coldBackend, err = storage.NewAzureBlobBackend(azureConfig, logger.Get("tiering-cold-azure"))
-						if err != nil {
-							log.Error().Err(err).Msg("Failed to create cold tier Azure backend for tiering")
+						// Typed local for the same reason as the S3 branch.
+						if b, err := storage.NewAzureBlobBackend(azureConfig, logger.Get("tiering-cold-azure")); err != nil {
+							log.Error().Err(err).Msg("Failed to create cold tier Azure backend for tiering: the cold tier is unusable on this node until the configuration is fixed")
+						} else {
+							coldBackend = b
 						}
 					}
 				}
@@ -3835,31 +3846,126 @@ func main() {
 						tieringDB.Close()
 					}
 				} else {
+					// The startup tier scan runs in the background below, and
+					// it writes through the same SQLite handle this hook may
+					// close. Its context and completion channel are created
+					// here so the hook can cancel and join it FIRST — relying
+					// on a second hook for that would depend on registration
+					// order, and getting it wrong means a scan writing into a
+					// closed database, one logged warning per file. The
+					// channel is closed on every path that does not start the
+					// scan, so the join below never waits for a goroutine that
+					// will not run.
+					// scanDone is closed on every path, including the one
+					// that never starts the scan — a defer would not do, it
+					// being function-scoped to main and so running only after
+					// the hook had already blocked on it.
+					scanCtx, cancelScan := context.WithTimeout(context.Background(), 30*time.Minute)
+					scanDone := make(chan struct{})
+
+					// Registered as soon as the manager exists, not only once
+					// Start succeeds: NewManager already owns a goroutine (the
+					// tier-event drainer), so a Start that fails — an
+					// unparseable migration_schedule, say — must still get a
+					// Stop, or that goroutine outlives the SQLite handle this
+					// block closes below.
+					//
+					// Same priority as the "cluster-coordinator" hook and
+					// registered after it; sortHooksByPriority is stable, so
+					// the coordinator's delete drain runs while the drainer
+					// is still alive to apply what it reports. Nothing else
+					// enforces that order — keep this block below the cluster
+					// block.
+					shutdownCoordinator.RegisterHook("tiering", func(ctx context.Context) error {
+						cancelScan()
+						<-scanDone
+						stopErr := tieringManager.Stop()
+						// tiering.Manager never closes its DB — it may be
+						// borrowed. Close it here only when this block
+						// opened it.
+						if tieringOwnsDB {
+							if closeErr := tieringDB.Close(); closeErr != nil && stopErr == nil {
+								stopErr = closeErr
+							}
+						}
+						return stopErr
+					}, shutdown.PriorityCompaction)
+
+					// Let the cluster layer keep this node's tier rows in step
+					// with its own disk: the replication puller reports what it
+					// pulled, and the local-delete workers report what they
+					// unlinked — that second half only where storage is
+					// per-node, since the delete callback does nothing locally
+					// on a shared bucket. Without this, only locally-flushed
+					// files have rows between tier scans, and on a node that
+					// does not ingest a measurement the query layer loses
+					// partition pruning for it — or, where a cold row exists
+					// and a hot one does not, omits this node's local files
+					// from the read entirely.
+					//
+					// Wired HERE, before the startup scan below is launched,
+					// so there is no moment at which a file can land on disk
+					// after the scan's walk has passed its directory and
+					// before anything records pulls. The rest of the tiering
+					// wiring is further down, with the handlers.
+					if clusterCoordinator != nil {
+						clusterCoordinator.SetTierRecorder(tieringManager)
+					}
+
 					// Start tiering manager
 					if err := tieringManager.Start(); err != nil {
-						log.Error().Err(err).Msg("Failed to start tiering manager")
-						if tieringOwnsDB {
-							tieringDB.Close()
-						}
+						// Routes, multi-tier query routing and flush-path
+						// registration are all still wired below, and the
+						// tier-event drainer is running — what is missing is
+						// the migration scheduler, so nothing moves to cold
+						// and nothing scans on a schedule.
+						log.Error().Err(err).
+							Msg("Failed to start tiering manager: queries still route across tiers and files are still registered, but no migration or scheduled scan will run")
+						cancelScan()
+						close(scanDone)
 					} else {
-						shutdownCoordinator.RegisterHook("tiering", func(ctx context.Context) error {
-							stopErr := tieringManager.Stop()
-							// tiering.Manager never closes its DB — it may be
-							// borrowed. Close it here only when this block
-							// opened it.
-							if tieringOwnsDB {
-								if closeErr := tieringDB.Close(); closeErr != nil && stopErr == nil {
-									stopErr = closeErr
-								}
-							}
-							return stopErr
-						}, shutdown.PriorityCompaction)
-
 						log.Info().
 							Str("schedule", cfg.TieredStorage.MigrationSchedule).
 							Bool("cold_enabled", cfg.TieredStorage.Cold.Enabled).
 							Int("default_hot_days", cfg.TieredStorage.DefaultHotMaxAgeDays).
 							Msg("Tiered storage enabled")
+
+						// Bring the tier metadata in line with what is on disk
+						// once at boot. Nothing else did: the scan runs from
+						// the migration schedule (02:00 by default) and from
+						// POST /api/v1/tiering/scan, so files that arrived
+						// while this node was down — or, on a replicating
+						// cluster node, the whole set it holds for
+						// measurements it does not ingest — had no tier rows
+						// until the next cycle, and the query layer routes
+						// reads from those rows. In the background: the
+						// listing is proportional to the storage root and
+						// nothing else waits on it.
+						go func() {
+							defer close(scanDone)
+							defer cancelScan()
+							result, err := tieringManager.ScanTiers(scanCtx)
+							if err != nil {
+								log.Warn().Err(err).Msg("Startup tier scan did not complete; the next migration cycle will scan again")
+								return
+							}
+							log.Info().
+								Int("scanned", result.FilesScanned).
+								Int("registered", result.FilesRegistered).
+								Int("hot_retired", result.HotRetired).
+								Int("cold_synced", result.ColdSynced).
+								Msg("Startup tier scan completed")
+							// If the scan changed any row — on a node booting
+							// with none, measurements go from nothing to cold
+							// (the sync runs first) to hot and cold — a query
+							// that ran mid-scan has cached a transform built on
+							// the earlier state for up to the cache TTL. A
+							// migration cycle drops the query caches for the
+							// same reason; so does this, at most once per boot.
+							if result.ColdSynced+result.HotRowsWritten+result.HotRetired > 0 {
+								queryHandler.InvalidateCaches()
+							}
+						}()
 					}
 				}
 			}
@@ -3913,6 +4019,9 @@ func main() {
 		// Wire tiering manager to arrow buffer for automatic file registration
 		arrowBuffer.SetTieringManager(tieringManager)
 		log.Info().Msg("Tiering manager wired to arrow buffer for auto-registration")
+
+		// The cluster layer's tier recorder is wired where the manager is
+		// built, before its startup scan is launched — see that block.
 
 		// Configure DuckDB with cold tier S3 credentials for direct S3 queries
 		// This is needed because DuckDB's httpfs extension needs credentials to query S3 directly

@@ -3827,6 +3827,10 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 			Str("database", database).
 			Str("measurement", measurement).
 			Msg("No tier metadata found, using hot tier")
+		// Built on absent metadata, so it must not be cached: the rows appear
+		// as soon as a flush, a pull or a tier scan writes them, and a cached
+		// unpruned glob would outlive that by up to the transform cache TTL.
+		pruning.MarkVolatile(ctx)
 		return readParquetExpr(keyword, h.anchorFor(ctx, database, measurement), []string{h.getStoragePath(ctx, database, measurement)}, options)
 	}
 
@@ -3843,6 +3847,23 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 		if _, ok := tieredPaths[tiering.TierHot]; ok {
 			sources = append(sources, tierSource{tiering.TierHot, h.getStoragePath(ctx, database, measurement), h.storage})
 		}
+	} else {
+		// No row claims hot data, so this read omits local files. That is the
+		// correct steady state for a measurement whose data has all migrated
+		// to cold, so the transform is cached like any other — an earlier
+		// revision of this change marked it volatile, which would have
+		// stopped every archive measurement from ever caching its transform
+		// and made each query re-list cold storage.
+		//
+		// What makes the transient case safe instead is the writer side: the
+		// replication drainer drops the query caches for a measurement whose
+		// tier rows it changes, so a node that acquires hot rows for a
+		// measurement it is only receiving does not keep serving a cold-only
+		// read.
+		h.logger.Debug().
+			Str("database", database).
+			Str("measurement", measurement).
+			Msg("No hot tier metadata for this measurement; local files are excluded from this read")
 	}
 
 	// Cold tier (S3/Azure) - only if metadata says there's cold data

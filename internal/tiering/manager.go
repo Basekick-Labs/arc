@@ -63,6 +63,33 @@ type Manager struct {
 	manifestMu           sync.Mutex
 	lastManifestProposal time.Time
 
+	// tierEvent* carry the registration reports the cluster layer makes for
+	// files this node did not write itself — pulled from a peer, or unlinked
+	// because another node migrated them. One drainer applies them so a
+	// catch-up burst cannot pile writers onto the single shared SQLite
+	// connection; see internal/tiering/replicated.go for why.
+	//
+	// The queue and the goroutine are created by NewManager, not Start, so
+	// the seam is live for the whole life of the manager, and tierEventWG
+	// lets Stop join the drainer before the shared handle can be closed.
+	tierEvents        *tierEventQueue
+	tierEventStop     chan struct{}
+	tierEventWG       sync.WaitGroup
+	tierEventStopOnce sync.Once
+	// draining is set once Stop has signalled the drainer: its chunks then
+	// share what is left of tierEventStopDeadline (unix nanos) and start no
+	// cold-tier existence probe, because Stop is on the shared shutdown
+	// budget.
+	draining              atomic.Bool
+	tierEventStopDeadline atomic.Int64
+	// tierEventsProcessed counts events the drainer has finished with,
+	// whatever the outcome — the barrier a test waits on, since an event that
+	// correctly writes nothing moves none of the three counters below.
+	tierEventsProcessed atomic.Int64
+	tierEventsApplied   atomic.Int64
+	tierEventsDropped   atomic.Int64
+	tierEventsFailed    atomic.Int64
+
 	// Components
 	migrator  *Migrator
 	scheduler *Scheduler
@@ -160,8 +187,16 @@ func NewManager(cfg *ManagerConfig) (*Manager, error) {
 		clusterGate:   cfg.ClusterGate,
 		manifest:      cfg.Manifest,
 		stopCh:        make(chan struct{}),
+		tierEvents:    newTierEventQueue(),
+		tierEventStop: make(chan struct{}),
 		logger:        logger,
 	}
+
+	// Started here rather than in Start so the cluster layer can report pulls
+	// and unlinks from the moment the manager exists, and so a manager whose
+	// Start is refused still has a drainer that Stop can join.
+	m.tierEventWG.Add(1)
+	go m.tierEventLoop()
 
 	// Create migrator
 	m.migrator = NewMigrator(&MigratorConfig{
@@ -214,8 +249,26 @@ func (m *Manager) Start() error {
 	return nil
 }
 
-// Stop stops the tiering manager and scheduler
+// Stop stops the tiering manager and scheduler.
+//
+// The tier-event drainer is joined FIRST and outside m.mu: its batches write
+// through the shared SQLite handle, which the caller closes once Stop returns,
+// and holding an application mutex across that I/O is the deadlock this
+// codebase has been bitten by before — anything the drainer ever comes to call
+// that takes m.mu would wedge here. The join also happens before the
+// not-running early return, so a manager whose Start was refused (an expired
+// license, an unparseable migration schedule) still has its goroutine
+// collected rather than leaked against a closed handle.
 func (m *Manager) Stop() error {
+	// Nil only on a Manager built by hand rather than by NewManager, which
+	// the package's own tests do because NewManager needs a real license
+	// client. Closing a nil channel panics, and a Stop that panics on a test
+	// double is a trap for the next person, not a caught bug.
+	if m.tierEventStop != nil {
+		m.tierEventStopOnce.Do(func() { close(m.tierEventStop) })
+	}
+	m.tierEventWG.Wait()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -284,7 +337,9 @@ func (m *Manager) runCycle(ctx context.Context) error {
 	// node reads for a measurement, so the query caches need the same
 	// invalidation a migration would trigger (#662).
 	if m.roleGated() {
-		m.notifyMigrationComplete(scanResult.ColdSynced, 0)
+		// Hot rows the scan wrote count too: a measurement this node had
+		// only cold rows for may have just gained its first hot one.
+		m.notifyMigrationComplete(scanResult.ColdSynced+scanResult.HotRowsWritten, 0)
 		return ErrMigrationRoleGated
 	}
 
@@ -344,9 +399,10 @@ func (m *Manager) runCycle(ctx context.Context) error {
 		Dur("duration", duration).
 		Msg("Migration cycle completed")
 
-	// Cold rows the sync added or flipped count as moved from this node's
-	// point of view: they change which globs a query reads.
-	m.notifyMigrationComplete(totalMigrated+scanResult.ColdSynced, orphansDeleted)
+	// Cold rows the sync added or flipped, and hot rows the scan wrote, count
+	// as moved from this node's point of view: they change which globs a
+	// query reads.
+	m.notifyMigrationComplete(totalMigrated+scanResult.ColdSynced+scanResult.HotRowsWritten, orphansDeleted)
 
 	return nil
 }
@@ -570,6 +626,12 @@ func (m *Manager) GetStatus(ctx context.Context) (*StatusResponse, error) {
 	// Scheduler status
 	status.Scheduler = m.scheduler.Status()
 
+	// Omitted entirely when nothing has ever been reported, so a standalone
+	// node's status is not cluttered with three zeroes.
+	if applied, dropped, failed := m.TierEventStats(); applied|dropped|failed != 0 {
+		status.ReplicationEvents = &TierEventCounts{Applied: applied, Dropped: dropped, Failed: failed}
+	}
+
 	return status, nil
 }
 
@@ -599,6 +661,11 @@ type ScanResult struct {
 	// HotRetired counts hot rows removed because their file is no longer
 	// in hot storage.
 	HotRetired int `json:"hot_retired"`
+	// HotRowsWritten counts hot rows the walk actually inserted or changed.
+	// FilesRegistered counts every hot file the walk accounted for, written
+	// or not, so on a node whose rows already match its disk this is zero
+	// while FilesRegistered is the file count.
+	HotRowsWritten int `json:"hot_rows_written"`
 }
 
 // ScanTiers brings this node's tier metadata in line with storage: the cold
@@ -783,6 +850,13 @@ func (m *Manager) ScanAndRegisterFiles(ctx context.Context) (*ScanResult, error)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load cold tier paths: %w", err)
 	}
+	// Measurements whose rows this walk actually changed. Invalidating the
+	// tier cache per file would bump the process-wide generation once per
+	// file, and every bump makes concurrent GetTiersForMeasurement fills
+	// discard their result — so a first scan of a large node would leave the
+	// query path re-running SELECT DISTINCT tier for its whole duration.
+	touched := make(map[string][2]string)
+
 	coldPaths := make(map[string]bool, len(coldFiles))
 	for _, f := range coldFiles {
 		coldPaths[f.Path] = true
@@ -797,6 +871,13 @@ func (m *Manager) ScanAndRegisterFiles(ctx context.Context) (*ScanResult, error)
 		// but never tiered data); not a parse error.
 		if first, _, _ := strings.Cut(obj.Path, "/"); storage.IsReservedRootDir(first) {
 			continue
+		}
+
+		if err := ctx.Err(); err != nil {
+			// Cancelled — the shutdown hook, or the startup scan's deadline.
+			// Every write from here on would fail and log once per remaining
+			// file, and a partial walk must not reach retireVanishedHotRows.
+			return result, err
 		}
 
 		result.FilesScanned++
@@ -819,6 +900,14 @@ func (m *Manager) ScanAndRegisterFiles(ctx context.Context) (*ScanResult, error)
 		// post-migration cleanup. Re-registering it as hot would reset
 		// migrated_at, hide it from reconciliation, and re-upload it to cold
 		// every cycle.
+		//
+		// coldPaths is a snapshot taken before the walk, so it answers for
+		// the rows that existed when the scan started. The write below is
+		// conditional on the stored tier for the rest: the replication
+		// drainer flips rows to cold while this walk is in progress, and an
+		// unconditional upsert would undo those — permanently, since nothing
+		// reverts a cold row and retireVanishedHotRows skips any path in this
+		// same stale listing.
 		if coldPaths[obj.Path] {
 			result.FilesSkipped++
 			continue
@@ -835,14 +924,21 @@ func (m *Manager) ScanAndRegisterFiles(ctx context.Context) (*ScanResult, error)
 			CreatedAt:     obj.LastModified,
 		}
 
-		// Record the file (uses UPSERT, so safe to re-run)
-		if err := m.metadata.RecordFile(ctx, file); err != nil {
+		// Conditional on the stored row still being hot, and silent when the
+		// row is already what it would write — so a steady-state rescan does
+		// no writes at all, and invalidates no cache entries.
+		wrote, err := m.metadata.recordHotFileIfNotCold(ctx, file)
+		if err != nil {
 			m.logger.Warn().
 				Str("path", obj.Path).
 				Err(err).
 				Msg("Failed to record file, skipping")
 			result.Errors++
 			continue
+		}
+		if wrote {
+			touched[fileInfo.Database+"\x00"+fileInfo.Measurement] = [2]string{fileInfo.Database, fileInfo.Measurement}
+			result.HotRowsWritten++
 		}
 
 		result.FilesRegistered++
@@ -854,6 +950,11 @@ func (m *Manager) ScanAndRegisterFiles(ctx context.Context) (*ScanResult, error)
 				Int("registered", result.FilesRegistered).
 				Msg("Scan progress")
 		}
+	}
+
+	// One invalidation per measurement the walk changed, after the walk.
+	for _, dm := range touched {
+		m.metadata.invalidateTierCache(dm[0], dm[1])
 	}
 
 	result.HotRetired = m.retireVanishedHotRows(ctx, objects, listStart, result)
@@ -905,7 +1006,35 @@ func (m *Manager) retireVanishedHotRows(ctx context.Context, objects []storage.O
 		}
 		// Tier-conditional: a row that changed tier since the listing is
 		// not ours to remove.
-		removed, err := m.metadata.DeleteFileInTier(ctx, row.Path, TierHot)
+		// Confirm the file really is gone, now, rather than trusting the
+		// listing this decision came from. Between that listing and here the
+		// replication drainer can have pulled the path back and re-registered
+		// it — and re-registration keeps the row's original created_at, so
+		// neither the margin above nor an age condition on the delete can
+		// tell the refreshed row from the stale one. Retiring it anyway
+		// leaves a file on disk with no hot row, which costs its measurement
+		// the local glob entirely once its other rows are cold.
+		//
+		// One stat per row judged stale, not per file scanned: a steady-state
+		// node reaches this loop with nothing to retire.
+		n, statErr := m.hotBackend.StatFile(ctx, row.Path)
+		if statErr != nil {
+			// The stat confirmed nothing, so the listing is not enough on its
+			// own. Keep the row: one kept a scan too long costs an empty glob,
+			// one retired for a file still on disk costs the measurement its
+			// local reads once its other rows are cold.
+			m.logger.Warn().Err(statErr).Str("path", row.Path).Msg("Could not confirm a vanished hot file is gone; keeping its row for the next scan")
+			result.Errors++
+			continue
+		}
+		if n >= 0 {
+			continue
+		}
+
+		// createdBefore as a second condition, for the case the stat cannot
+		// see: a row the drainer deleted and a later pull re-INSERTED carries
+		// a fresh created_at, and this decision was not taken about that row.
+		removed, err := m.metadata.DeleteFileInTier(ctx, row.Path, TierHot, cutoff)
 		if err != nil {
 			m.logger.Warn().Err(err).Str("path", row.Path).Msg("Failed to retire hot row for a vanished file")
 			result.Errors++

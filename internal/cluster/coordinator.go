@@ -47,6 +47,26 @@ type deleteRequest struct {
 	reason string
 }
 
+// TierRecorder is the tier metadata a node keeps for its own storage.
+//
+// Implemented by *tiering.Manager. Declared here, consumer-side, for the same
+// reason tiering declares ManifestCoordinator rather than importing this
+// package: neither side needs the other's types. Both methods are
+// fire-and-forget — they are called from the replication pull workers and the
+// local-delete workers, never block, and the implementation queues rather than
+// writing through to SQLite on the caller's goroutine.
+type TierRecorder interface {
+	// RecordReplicatedFile reports a file pulled from a peer and kept, which
+	// is now on this node's hot storage.
+	RecordReplicatedFile(path string, sizeBytes int64)
+	// RecordUnlinkedFile reports that this node removed its own copy of a
+	// path that left the cluster manifest. sizeBytes is the size measured
+	// before the delete; the reason is the manifest delete's reason, which
+	// may come from an operator and so is a hint rather than proof of what
+	// happened to the file.
+	RecordUnlinkedFile(path, reason string, sizeBytes int64)
+}
+
 // deleteWorkerCount is the number of goroutines draining the pending local
 // deletes. 2 workers provide light parallelism without overwhelming local I/O.
 const deleteWorkerCount = 2
@@ -144,6 +164,20 @@ type Coordinator struct {
 	// worker skips such a path rather than unlink a file that is back. Nil
 	// before the puller starts and in tests: no check, unlink.
 	deleteManifestHas func(path string) bool
+
+	// tierRecorder, when set, is this node's tier metadata for its own disk.
+	// The puller reports what it pulled and the delete workers report what
+	// they unlinked, so the node's tier rows track its disk instead of only
+	// what it ingested itself. Nil means tiering is off here.
+	//
+	// Behind its own mutex rather than c.mu: both reporters run on worker
+	// goroutines, and a worker contending on the coordinator-wide lock is the
+	// shape of the shutdown deadlocks in #797 and #813. Snapshot under the
+	// lock, invoke outside it. Deliberately NOT cleared by Stop: the delete
+	// drain in Stop reports real unlinks, and the recorder's own shutdown hook
+	// runs after this coordinator's (see Stop).
+	tierRecorder   TierRecorder
+	tierRecorderMu sync.RWMutex
 
 	// fetchInvalidPathCount counts inbound fetch requests refused because the
 	// path is permanently unusable (#747). Its only job is to rate-limit the
@@ -862,6 +896,15 @@ func (c *Coordinator) Stop() error {
 	// Raft is joined and the file callbacks are unregistered, so nothing can
 	// add a pending local delete from here on: the workers drain what is
 	// pending and exit. Bounded, so a disk that hangs cannot hang shutdown.
+	//
+	// The tier recorder is deliberately left wired across this drain. The
+	// tiering manager registers its own shutdown hook after this one and
+	// equal-priority hooks run in registration order, so its drainer is still
+	// alive here and still applies what the drain reports — which is the
+	// point, those unlinks are real. Clearing the recorder first would throw
+	// that work away on every graceful shutdown; a report that does arrive
+	// after the tiering hook has run merely sits in a buffer nobody drains,
+	// which costs nothing.
 	if deleteStop != nil {
 		c.stopDeleteWorkers(deleteStop, deleteWg)
 	}
@@ -1025,6 +1068,61 @@ func (c *Coordinator) unlinkBatch(batch []deleteRequest, has func(string) bool) 
 	}
 }
 
+// SetTierRecorder wires this node's tier metadata. Safe to call on a running
+// coordinator: the puller's hook and the delete workers read the field through
+// tierRecorderMu, so a recorder wired after Start simply begins receiving
+// reports. Reports made before it is wired are covered by the startup tier
+// scan.
+func (c *Coordinator) SetTierRecorder(r TierRecorder) {
+	c.tierRecorderMu.Lock()
+	c.tierRecorder = r
+	c.tierRecorderMu.Unlock()
+	c.logger.Info().Msg("Tier metadata recorder wired: replicated files and local deletes will update this node's tier rows")
+}
+
+// tierRecorderSnapshot returns the recorder without holding the lock across
+// the call into it.
+func (c *Coordinator) tierRecorderSnapshot() TierRecorder {
+	c.tierRecorderMu.RLock()
+	r := c.tierRecorder
+	c.tierRecorderMu.RUnlock()
+	return r
+}
+
+// recordPulledFileInTiering is the puller's RecordPulledFile hook. Reports
+// whether a recorder took it: the hook is wired for the coordinator's whole
+// life, while the recorder is attached later and is absent on a node without
+// tiering, so this return value is what distinguishes the two.
+func (c *Coordinator) recordPulledFileInTiering(path string, sizeBytes int64) bool {
+	r := c.tierRecorderSnapshot()
+	if r == nil {
+		return false
+	}
+	r.RecordReplicatedFile(path, sizeBytes)
+	return true
+}
+
+// recordUnlinkedFileInTiering reports a local copy this node has just removed.
+func (c *Coordinator) recordUnlinkedFileInTiering(path, reason string, sizeBytes int64) {
+	if r := c.tierRecorderSnapshot(); r != nil {
+		r.RecordUnlinkedFile(path, reason, sizeBytes)
+	}
+}
+
+// tierReasonAbandonedPull is the reason reported for a copy the puller removed
+// because its path left the manifest while the pull was in transit. The puller
+// never learns the manifest delete's own reason, so the recorder treats this
+// one as possibly a migration. Shared literal with
+// tiering.unlinkReasonAbandonedPull; the packages do not import each other.
+const tierReasonAbandonedPull = "replication:abandoned"
+
+// recordAbandonedFileInTiering is the puller's RecordAbandonedFile hook.
+func (c *Coordinator) recordAbandonedFileInTiering(path string, sizeBytes int64) {
+	if r := c.tierRecorderSnapshot(); r != nil {
+		r.RecordUnlinkedFile(path, tierReasonAbandonedPull, sizeBytes)
+	}
+}
+
 func (c *Coordinator) unlinkOne(item deleteRequest, has func(string) bool) {
 	if has != nil && has(item.path) {
 		c.logger.Debug().
@@ -1033,7 +1131,34 @@ func (c *Coordinator) unlinkOne(item deleteRequest, has func(string) bool) {
 			Msg("Local delete skipped: the manifest lists the path again")
 		return
 	}
+	// One budget for the stat and the delete together. Both are a syscall on
+	// a local backend, which is the only backend this path runs on.
 	delCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Measured before the delete, and only for a node that keeps tier
+	// metadata. Two things depend on it: whether this node held the file at
+	// all — Delete reports success for a path that was never here, so the
+	// delete alone is not evidence — and the size, which a tier row needs and
+	// which cannot be recovered afterwards, the manifest entry being gone by
+	// the time a delete reaches a worker.
+	var (
+		sizeBytes int64
+		wasLocal  bool
+	)
+	recorder := c.tierRecorderSnapshot()
+	if recorder != nil {
+		// StatFile reports -1 with a nil error for a path that is not there,
+		// so the sentinel is the test, not the error. Getting this wrong makes
+		// every node in the cluster report every manifest delete, including
+		// the ones that never held the file.
+		//
+		// A local backend counts a staging .part as present, which is fine
+		// here: this path only ever flips a row to cold or retires a hot one,
+		// never claims a readable local file.
+		if n, statErr := c.storage.StatFile(delCtx, item.path); statErr == nil && n >= 0 {
+			sizeBytes = n
+			wasLocal = true
+		}
+	}
 	err := c.storage.Delete(delCtx, item.path)
 	cancel()
 	switch {
@@ -1062,6 +1187,12 @@ func (c *Coordinator) unlinkOne(item deleteRequest, has func(string) bool) {
 			Str("path", item.path).
 			Str("reason", item.reason).
 			Msg("Phase 4 local delete worker: removed local copy")
+		if wasLocal && recorder != nil {
+			// Only for a file this node actually held: the tier row for a
+			// path a node never had is not its to write, and without the stat
+			// above every node would report every manifest delete.
+			recorder.RecordUnlinkedFile(item.path, item.reason, sizeBytes)
+		}
 	}
 }
 
@@ -3963,7 +4094,12 @@ func (c *Coordinator) startFilePullerLocked() error {
 			_, ok := fsm.GetFile(path)
 			return ok
 		},
-		Logger: c.logger,
+		// Reads the recorder each time rather than capturing it: the tiering
+		// manager is built long after the coordinator starts, so the hook has
+		// to exist before the thing it reports to does.
+		RecordPulledFile:    c.recordPulledFileInTiering,
+		RecordAbandonedFile: c.recordAbandonedFileInTiering,
+		Logger:              c.logger,
 	}
 
 	puller, err := filereplication.New(pullerCfg)
