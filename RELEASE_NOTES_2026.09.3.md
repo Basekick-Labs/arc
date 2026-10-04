@@ -552,6 +552,23 @@ predate that fix and #978.
 
 ## Bug fixes
 
+### Audit events no longer alias Fiber request buffers ([#837](https://github.com/Basekick-Labs/arc/issues/837))
+
+The audit middleware builds each event from Fiber accessors (`c.Method()`,
+`c.Path()`, `c.Get`, `c.Params`, `c.Query`) and hands it to a background
+writer that serialises it up to a second later. Arc runs Fiber with
+`Immutable=false`, so every one of those strings aliased a pooled request
+buffer that the next request overwrites. An audit row could therefore record a
+later request's method, path, database, measurement or user agent, or garbage.
+
+The middleware now copies every request-derived string before enqueueing the
+event. It also takes its own copy of handler-supplied detail, so a handler no
+longer has to copy before setting it; the two existing producers already did.
+A regression test mutates the borrowed buffers after the event is queued and
+checks every field.
+
+Contributed by [@0utsights](https://github.com/0utsights) in [#871](https://github.com/Basekick-Labs/arc/pull/871).
+
 ## Experimental arcx Arrow IPC streams signal writer panics ([#846](https://github.com/Basekick-Labs/arc/issues/846))
 
 When the experimental arcx Arrow IPC stream writer panics, the response now
