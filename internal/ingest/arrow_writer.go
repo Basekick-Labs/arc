@@ -773,7 +773,8 @@ type TypedColumnBatch struct {
 	// footer gets an arc:dedup_time marker so compaction dedups on time even with
 	// no tag columns. See ColumnarRecord.DedupTime — CQ output only (#521).
 	DedupTime bool
-	Signature string // sorted column-name string; cached to avoid per-write recomputation
+	Signature string   // sorted column-name string; cached to avoid per-write recomputation
+	WALHashes []string // identities of WAL entries represented by this batch
 }
 
 type bufferShard struct {
@@ -823,6 +824,7 @@ type flushTask struct {
 	measurement string
 	records     []interface{}
 	recordCount int
+	walHashes   []string
 }
 
 // WALWriter interface for Write-Ahead Log support
@@ -832,6 +834,24 @@ type WALWriter interface {
 	AppendRawWithMeta(database string, payload []byte) error // Zero-copy with database metadata envelope
 	Stats() map[string]interface{}
 	Close() error
+}
+
+type trackedWALWriter interface {
+	AppendTracked(records []map[string]interface{}) ([]string, error)
+	AppendRawWithMetaTracked(database string, payload []byte) ([]string, error)
+	MarkFlushed(hashes []string) error
+}
+
+func collectWALHashes(records []interface{}) []string {
+	var hashes []string
+	for _, record := range records {
+		batch, ok := record.(*TypedColumnBatch)
+		if !ok || len(batch.WALHashes) == 0 {
+			continue
+		}
+		hashes = append(hashes, batch.WALHashes...)
+	}
+	return hashes
 }
 
 // FileRegistrar announces a newly written Parquet file to the cluster-wide
@@ -2199,10 +2219,18 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 
 	// WAL: Write to WAL before buffering (if enabled)
 	// Skip WAL during recovery to avoid re-writing recovered data
+	var walHashes []string
 	if b.wal != nil && !skipWAL {
+		tracked, canTrack := b.wal.(trackedWALWriter)
 		// ZERO-COPY PATH: Use raw msgpack bytes if available (avoids re-serialization)
 		if len(record.RawPayload) > 0 {
-			if err := b.wal.AppendRawWithMeta(database, record.RawPayload); err != nil {
+			var err error
+			if canTrack {
+				walHashes, err = tracked.AppendRawWithMetaTracked(database, record.RawPayload)
+			} else {
+				err = b.wal.AppendRawWithMeta(database, record.RawPayload)
+			}
+			if err != nil {
 				// Don't fail the write — WAL is for durability, not
 				// correctness. recordWALError differentiates backpressure
 				// drops (sampled Warn) from real I/O failures (unsampled
@@ -2218,7 +2246,13 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 			// This path is used for LineProtocol or when raw bytes aren't available
 			walRecords := b.columnarToWALRecords(database, record)
 			if len(walRecords) > 0 {
-				if err := b.wal.Append(walRecords); err != nil {
+				var err error
+				if canTrack {
+					walHashes, err = tracked.AppendTracked(walRecords)
+				} else {
+					err = b.wal.Append(walRecords)
+				}
+				if err != nil {
 					b.recordWALError(err, func(ev *zerolog.Event) {
 						ev.Str("database", database).
 							Str("measurement", record.Measurement).
@@ -2239,6 +2273,7 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 	typedColumns.TagColumns = record.TagColumns
 	// Propagate the dedup-on-time marker (CQ output only — see ColumnarRecord.DedupTime)
 	typedColumns.DedupTime = record.DedupTime
+	typedColumns.WALHashes = walHashes
 
 	// Column signature for schema evolution detection (pre-computed in convertColumnsToTyped)
 	newSignature := typedColumns.Signature
@@ -2366,11 +2401,19 @@ func (b *ArrowBuffer) writeTypedColumnarInternal(ctx context.Context, database, 
 // takes the lossy fallback.
 func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measurement string, typedColumns *TypedColumnBatch, numRecords int, rawPayload []byte, skipWAL bool) error {
 	bufferKey := database + "/" + measurement
+	var walHashes []string
 
 	// WAL: raw client bytes when available (zero-copy), row transpose otherwise
 	if b.wal != nil && !skipWAL {
+		tracked, canTrack := b.wal.(trackedWALWriter)
 		if len(rawPayload) > 0 {
-			if err := b.wal.AppendRawWithMeta(database, rawPayload); err != nil {
+			var err error
+			if canTrack {
+				walHashes, err = tracked.AppendRawWithMetaTracked(database, rawPayload)
+			} else {
+				err = b.wal.AppendRawWithMeta(database, rawPayload)
+			}
+			if err != nil {
 				b.recordWALError(err, func(ev *zerolog.Event) {
 					ev.Str("database", database).
 						Str("measurement", measurement).
@@ -2380,7 +2423,13 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 		} else {
 			walRecords := typedBatchToWALRecords(database, measurement, typedColumns, numRecords, b.getDecimalColumns(measurement))
 			if len(walRecords) > 0 {
-				if err := b.wal.Append(walRecords); err != nil {
+				var err error
+				if canTrack {
+					walHashes, err = tracked.AppendTracked(walRecords)
+				} else {
+					err = b.wal.Append(walRecords)
+				}
+				if err != nil {
 					b.recordWALError(err, func(ev *zerolog.Event) {
 						ev.Str("database", database).
 							Str("measurement", measurement).
@@ -2390,6 +2439,7 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 			}
 		}
 	}
+	typedColumns.WALHashes = walHashes
 
 	// Column signature for schema evolution detection (pre-computed in convertColumnsToTyped)
 	newSignature := typedColumns.Signature
@@ -3107,7 +3157,7 @@ func (b *ArrowBuffer) flushWorker(workerID int) {
 			flushCtx, flushCancel := b.newFlushContext()
 			// Error is already logged and recorded by flushRecordsAsync via
 			// markFlushFailure; the worker has nowhere to return it to.
-			_ = b.flushRecordsAsync(flushCtx, task.bufferKey, task.database, task.measurement, task.records, task.recordCount)
+			_ = b.flushRecordsAsync(flushCtx, task.bufferKey, task.database, task.measurement, task.records, task.recordCount, task.walHashes)
 			flushCancel()
 		}
 	}
@@ -3120,7 +3170,7 @@ func (b *ArrowBuffer) flushWorker(workerID int) {
 // itself, and it has to know WHICH tasks failed in order to count only those as
 // WAL-only. markFlushFailure alone cannot say — hasFlushFailure is a
 // process-wide latch with no per-task attribution.
-func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database, measurement string, records []interface{}, recordCount int) error {
+func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database, measurement string, records []interface{}, recordCount int, walHashes []string) error {
 	startTime := time.Now()
 
 	// Merge typed column batches
@@ -3156,7 +3206,21 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 		// WAL will be replayed on restart or via periodic recovery
 		return err
 	}
+	b.markWALFlushed(walHashes)
 	return nil
+}
+
+func (b *ArrowBuffer) markWALFlushed(hashes []string) {
+	if len(hashes) == 0 || b.wal == nil {
+		return
+	}
+	tracked, ok := b.wal.(trackedWALWriter)
+	if !ok {
+		return
+	}
+	if err := tracked.MarkFlushed(hashes); err != nil {
+		b.logger.Error().Err(err).Int("entries", len(hashes)).Msg("Failed to write WAL flush checkpoint")
+	}
 }
 
 // flushWithDataTimePartitioning partitions data by data timestamps (async path)
@@ -3387,6 +3451,7 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 
 	// Get record count before clearing buffer
 	recordCount := shard.bufferRecordCounts[bufferKey]
+	walHashes := collectWALHashes(batches)
 
 	// Extract records to flush (hold lock for minimal time)
 	recordsToFlush := make([]interface{}, len(batches))
@@ -3425,6 +3490,7 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 		// WAL will be replayed on restart or via periodic recovery
 		return err
 	}
+	b.markWALFlushed(walHashes)
 
 	// Re-acquire lock for caller
 	shard.mu.Lock()
@@ -4609,7 +4675,7 @@ drain:
 			}
 			defer flushCancel()
 
-			if err := b.flushRecordsAsync(flushCtx, task.bufferKey, task.database, task.measurement, task.records, task.recordCount); err != nil {
+			if err := b.flushRecordsAsync(flushCtx, task.bufferKey, task.database, task.measurement, task.records, task.recordCount, task.walHashes); err != nil {
 				mu.Lock()
 				unwrit += task.recordCount
 				mu.Unlock()

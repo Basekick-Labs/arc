@@ -1125,14 +1125,23 @@ func main() {
 
 						recovery := wal.NewRecovery(cfg.WAL.Directory, walLogger)
 						activeFile := ""
+						var activeCheckpointHashes []string
 						if walWriter != nil {
 							activeFile = walWriter.CurrentFile()
+							// Recovery skips the active file to avoid racing appends, so read
+							// its checkpoint index separately while the writer lock holds it stable.
+							activeCheckpointHashes, err = walWriter.CurrentCheckpointHashes()
+							if err != nil {
+								walLogger.Error().Err(err).Msg("Failed to read active WAL checkpoints; skipping recovery to avoid duplicate replay")
+								continue
+							}
 						}
 						stats, err := recovery.RecoverWithOptions(context.Background(), recoveryCallback, &wal.RecoveryOptions{
-							SkipActiveFile:   activeFile,
-							MinFileAge:       5 * time.Second,
-							BatchSize:        cfg.WAL.RecoveryBatchSize,
-							ColumnarCallback: columnarCallback,
+							SkipActiveFile:             activeFile,
+							AdditionalCheckpointHashes: activeCheckpointHashes,
+							MinFileAge:                 5 * time.Second,
+							BatchSize:                  cfg.WAL.RecoveryBatchSize,
+							ColumnarCallback:           columnarCallback,
 						})
 						if err != nil {
 							walLogger.Error().Err(err).Msg("WAL recovery after flush failure failed")

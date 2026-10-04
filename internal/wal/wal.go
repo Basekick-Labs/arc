@@ -2,6 +2,8 @@ package wal
 
 import (
 	"bytes"
+	cryptorand "crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -34,7 +36,9 @@ const (
 	// MaxWALPayloadSize is the maximum allowed payload size for a single WAL entry.
 	// This limit prevents integer overflow during buffer allocation (CWE-190) and
 	// aligns with the replication protocol limit (100MB).
-	MaxWALPayloadSize = 100 * 1024 * 1024 // 100MB
+	MaxWALPayloadSize      = 100 * 1024 * 1024 // 100MB
+	walTrackedHeaderSize   = 1 + 16
+	walCheckpointBatchSize = 100_000
 
 	// walChunkTarget is the payload size an oversized payload is chunked down
 	// to (#677). It sits well below MaxWALPayloadSize so a chunk still clears
@@ -46,7 +50,9 @@ const (
 	// WALEnvelopeMarker is the first byte of an enveloped WAL payload.
 	// Enveloped format: [0x01][2-byte db name length][db name][original msgpack]
 	// Since msgpack maps/arrays always start with bytes >= 0x80, 0x01 is unambiguous.
-	WALEnvelopeMarker = 0x01
+	WALEnvelopeMarker   = 0x01
+	WALCheckpointMarker = 0x02
+	WALTrackedMarker    = 0x03
 )
 
 // ParseEnvelope extracts the database name and msgpack payload from a WAL entry.
@@ -363,7 +369,9 @@ var ErrWALDropped = errors.New("WAL entry dropped: async buffer full")
 
 // walEntry is a pre-serialized WAL entry ready for writing
 type walEntry struct {
-	data []byte // Complete entry: header + payload
+	data    []byte // Complete entry: header + payload
+	durable bool   // Force a sync before acknowledging this entry
+	done    chan error
 }
 
 // WriterConfig holds configuration for WAL writer
@@ -418,6 +426,9 @@ type Writer struct {
 	// Replication hook for streaming entries to readers
 	replicationHook ReplicationHook
 	sequence        uint64 // Monotonic sequence counter for replication
+	trackedInstance uint64
+	trackedSequence uint64
+	closed          bool
 
 	// Metrics (atomic for lock-free reads)
 	TotalEntries   int64
@@ -432,6 +443,17 @@ type Writer struct {
 
 // NewWriter creates a new WAL writer
 func NewWriter(cfg *WriterConfig) (*Writer, error) {
+	var instanceBytes [8]byte
+	for {
+		if _, err := cryptorand.Read(instanceBytes[:]); err != nil {
+			return nil, fmt.Errorf("failed to initialize WAL tracked identity: %w", err)
+		}
+		if binary.BigEndian.Uint64(instanceBytes[:]) != 0 {
+			break
+		}
+	}
+	trackedInstance := binary.BigEndian.Uint64(instanceBytes[:])
+
 	// Set defaults
 	if cfg.SyncMode == "" {
 		cfg.SyncMode = SyncModeFdatasync
@@ -462,11 +484,12 @@ func NewWriter(cfg *WriterConfig) (*Writer, error) {
 	}
 
 	w := &Writer{
-		config:       *cfg,
-		logger:       cfg.Logger.With().Str("component", "wal-writer").Logger(),
-		lastSyncTime: time.Now(),
-		entryChan:    make(chan walEntry, cfg.BufferSize),
-		done:         make(chan struct{}),
+		config:          *cfg,
+		logger:          cfg.Logger.With().Str("component", "wal-writer").Logger(),
+		lastSyncTime:    time.Now(),
+		entryChan:       make(chan walEntry, cfg.BufferSize),
+		done:            make(chan struct{}),
+		trackedInstance: trackedInstance,
 	}
 
 	// Initialize first WAL file
@@ -510,7 +533,7 @@ func (w *Writer) writerLoop() {
 	for {
 		select {
 		case entry := <-w.entryChan:
-			w.writeEntry(entry)
+			w.processEntry(entry)
 
 		case <-syncTicker.C:
 			// Periodic sync
@@ -528,7 +551,7 @@ func (w *Writer) writerLoop() {
 			for {
 				select {
 				case entry := <-w.entryChan:
-					w.writeEntry(entry)
+					w.processEntry(entry)
 				default:
 					// No more entries, final sync and exit
 					w.mu.Lock()
@@ -544,8 +567,16 @@ func (w *Writer) writerLoop() {
 	}
 }
 
+func (w *Writer) processEntry(entry walEntry) {
+	err := w.writeEntry(entry)
+	if entry.done != nil {
+		entry.done <- err
+		close(entry.done)
+	}
+}
+
 // writeEntry writes a single entry to the WAL file (called from writerLoop)
-func (w *Writer) writeEntry(entry walEntry) {
+func (w *Writer) writeEntry(entry walEntry) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -560,7 +591,7 @@ func (w *Writer) writeEntry(entry walEntry) {
 		// permission change, file deleted). A new file might succeed.
 		if rotErr := w.rotate(); rotErr != nil {
 			w.logger.Error().Err(rotErr).Msg("Rotation after write failure also failed, entry lost")
-			return
+			return rotErr
 		}
 
 		// Retry write on the new file. If the original write failed partway
@@ -574,7 +605,7 @@ func (w *Writer) writeEntry(entry walEntry) {
 			atomic.AddInt64(&w.FailedWrites, 1)
 			metrics.Get().IncWALFailedWrites()
 			w.logger.Error().Err(err).Msg("Retry write after rotation also failed, entry lost")
-			return
+			return err
 		}
 	}
 
@@ -586,8 +617,15 @@ func (w *Writer) writeEntry(entry walEntry) {
 	atomic.AddInt64(&w.TotalEntries, 1)
 	atomic.AddInt64(&w.TotalBytes, bytesWritten)
 
-	// Sync if byte threshold exceeded
-	if w.bytesSinceSync >= w.config.SyncBytes {
+	if entry.durable {
+		if err := dataSync(w.currentFile); err != nil {
+			w.logger.Error().Err(err).Msg("WAL checkpoint sync failed")
+			return err
+		}
+		w.lastSyncTime = time.Now()
+		w.bytesSinceSync = 0
+		atomic.AddInt64(&w.TotalSyncs, 1)
+	} else if w.bytesSinceSync >= w.config.SyncBytes {
 		w.sync()
 		w.lastSyncTime = time.Now()
 		w.bytesSinceSync = 0
@@ -601,6 +639,7 @@ func (w *Writer) writeEntry(entry walEntry) {
 			w.logger.Error().Err(err).Msg("Failed to rotate WAL")
 		}
 	}
+	return nil
 }
 
 // rotate creates a new WAL file.
@@ -705,6 +744,146 @@ func (w *Writer) AppendRawWithMeta(database string, payload []byte) error {
 	return nil
 }
 
+// AppendTracked writes a row-format entry and returns its payload identity.
+// The identity is used by flush checkpoints to avoid replaying data that was
+// already durably written to storage.
+func (w *Writer) AppendTracked(records []map[string]interface{}) ([]string, error) {
+	payload, err := msgpack.Marshal(records)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize records: %w", err)
+	}
+	chunks := [][]byte{payload}
+	if !trackedPayloadFits(len(payload), 0) {
+		chunks, err = splitOversizedPayload(payload)
+		if err != nil {
+			return nil, oversizedPayloadError(err)
+		}
+	}
+	hashes := make([]string, 0, len(chunks))
+	for _, chunk := range chunks {
+		if !trackedPayloadFits(len(chunk), 0) {
+			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", len(chunk)+walTrackedHeaderSize, MaxWALPayloadSize))
+		}
+		token, err := w.appendTrackedEntry(chunk)
+		if err != nil {
+			return nil, err
+		}
+		hashes = append(hashes, token)
+	}
+	return hashes, nil
+}
+
+// AppendRawWithMetaTracked is the tracked counterpart to AppendRawWithMeta.
+func (w *Writer) AppendRawWithMetaTracked(database string, payload []byte) ([]string, error) {
+	if len(database) > 255 {
+		return nil, fmt.Errorf("database name too long: %d bytes", len(database))
+	}
+	dbBytes := []byte(database)
+	envelopeHeaderLen := 3 + len(dbBytes)
+	chunks := [][]byte{payload}
+	if !trackedPayloadFits(len(payload), envelopeHeaderLen) {
+		var err error
+		chunks, err = splitOversizedPayload(payload)
+		if err != nil {
+			return nil, oversizedPayloadError(err)
+		}
+	}
+	var hashes []string
+	for _, chunk := range chunks {
+		if !trackedPayloadFits(len(chunk), envelopeHeaderLen) {
+			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", envelopeHeaderLen+len(chunk)+walTrackedHeaderSize, MaxWALPayloadSize))
+		}
+		token, err := w.appendTrackedEntry(envelopePayload(dbBytes, chunk))
+		if err != nil {
+			return nil, err
+		}
+		hashes = append(hashes, token)
+	}
+	return hashes, nil
+}
+
+// MarkFlushed appends a checkpoint after the corresponding data entries have
+// reached durable storage. A failed checkpoint is safe: it can only cause a
+// replay duplicate, never data loss.
+func (w *Writer) MarkFlushed(hashes []string) error {
+	if len(hashes) == 0 {
+		return nil
+	}
+	for start := 0; start < len(hashes); start += walCheckpointBatchSize {
+		end := start + walCheckpointBatchSize
+		if end > len(hashes) {
+			end = len(hashes)
+		}
+		payload, err := msgpack.Marshal(hashes[start:end])
+		if err != nil {
+			return err
+		}
+		checkpoint := append([]byte{WALCheckpointMarker}, payload...)
+		checksum := crc32.ChecksumIEEE(checkpoint)
+		timestampUS := uint64(time.Now().UnixMicro())
+		entryData := make([]byte, WALEntryHeaderSize+len(checkpoint))
+		binary.BigEndian.PutUint32(entryData[0:4], uint32(len(checkpoint)))
+		binary.BigEndian.PutUint64(entryData[4:12], timestampUS)
+		binary.BigEndian.PutUint32(entryData[12:16], checksum)
+		copy(entryData[WALEntryHeaderSize:], checkpoint)
+		done := make(chan error, 1)
+		if err := w.tryEnqueueEntry(walEntry{data: entryData, durable: true, done: done}); err != nil {
+			return err
+		}
+		if err := <-done; err != nil {
+			return fmt.Errorf("failed to persist WAL flush checkpoint: %w", err)
+		}
+	}
+	return nil
+}
+
+func envelopePayload(dbBytes, payload []byte) []byte {
+	out := make([]byte, 3+len(dbBytes)+len(payload))
+	out[0] = WALEnvelopeMarker
+	binary.BigEndian.PutUint16(out[1:3], uint16(len(dbBytes)))
+	copy(out[3:], dbBytes)
+	copy(out[3+len(dbBytes):], payload)
+	return out
+}
+
+func payloadHash(payload []byte) string {
+	sum := sha256.Sum256(payload)
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func trackedPayloadFits(payloadLen, envelopeHeaderLen int) bool {
+	return payloadLen <= MaxWALPayloadSize-walTrackedHeaderSize-envelopeHeaderLen
+}
+
+func (w *Writer) appendTrackedEntry(logicalPayload []byte) (string, error) {
+	seq := atomic.AddUint64(&w.trackedSequence, 1)
+	token := fmt.Sprintf("%016x%016x", w.trackedInstance, seq)
+	trackedPayload := make([]byte, walTrackedHeaderSize+len(logicalPayload))
+	trackedPayload[0] = WALTrackedMarker
+	binary.BigEndian.PutUint64(trackedPayload[1:9], w.trackedInstance)
+	binary.BigEndian.PutUint64(trackedPayload[9:17], seq)
+	copy(trackedPayload[17:], logicalPayload)
+	checksum := crc32.ChecksumIEEE(trackedPayload)
+	timestampUS := uint64(time.Now().UnixMicro())
+	if w.replicationHook != nil {
+		w.mu.Lock()
+		w.sequence++
+		replicationSequence := w.sequence
+		hook := w.replicationHook
+		w.mu.Unlock()
+		hook(&ReplicationEntry{Sequence: replicationSequence, TimestampUS: timestampUS, Payload: logicalPayload})
+	}
+	entryData := make([]byte, WALEntryHeaderSize+len(trackedPayload))
+	binary.BigEndian.PutUint32(entryData[0:4], uint32(len(trackedPayload)))
+	binary.BigEndian.PutUint64(entryData[4:12], timestampUS)
+	binary.BigEndian.PutUint32(entryData[12:16], checksum)
+	copy(entryData[WALEntryHeaderSize:], trackedPayload)
+	if err := w.tryEnqueue(entryData); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
 // appendEnvelopedEntry is AppendRawWithMeta's single-entry fast path: CRC,
 // replication hook, and entry assembly for one size-validated payload.
 func (w *Writer) appendEnvelopedEntry(dbBytes []byte, envelopeHeaderLen int, payload []byte, totalPayloadLen int) error {
@@ -757,8 +936,21 @@ func (w *Writer) appendEnvelopedEntry(dbBytes []byte, envelopeHeaderLen int, pay
 // I/O errors. Centralized so the drop accounting is impossible to
 // drift across the multiple append paths.
 func (w *Writer) tryEnqueue(entryData []byte) error {
+	return w.tryEnqueueEntry(walEntry{data: entryData})
+}
+
+func (w *Writer) tryEnqueueEntry(entry walEntry) error {
+	if entry.durable {
+		// Coordinate shutdown only for acknowledged durable barriers. Keep the
+		// per-record append path lock-free.
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		if w.closed {
+			return errors.New("WAL writer is closed")
+		}
+	}
 	select {
-	case w.entryChan <- walEntry{data: entryData}:
+	case w.entryChan <- entry:
 		return nil
 	default:
 		atomic.AddInt64(&w.DroppedEntries, 1)
@@ -857,6 +1049,10 @@ func (w *Writer) sync() {
 
 // Close closes the WAL writer
 func (w *Writer) Close() error {
+	w.mu.Lock()
+	w.closed = true
+	w.mu.Unlock()
+
 	// Signal shutdown
 	close(w.done)
 
@@ -981,6 +1177,17 @@ func (w *Writer) CurrentFile() string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.currentPath
+}
+
+// CurrentCheckpointHashes returns flush checkpoints in the active WAL file.
+// The writer lock keeps the file stable while the reader scans it.
+func (w *Writer) CurrentCheckpointHashes() ([]string, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.currentPath == "" {
+		return nil, nil
+	}
+	return NewReader(w.currentPath, w.logger).ReadCheckpointHashes()
 }
 
 // SetReplicationHook sets the hook function called for each WAL entry.

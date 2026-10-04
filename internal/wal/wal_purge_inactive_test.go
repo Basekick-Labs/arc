@@ -5,10 +5,13 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Basekick-Labs/msgpack/v6"
 	"github.com/rs/zerolog"
 )
 
@@ -751,6 +754,317 @@ func TestStartupRecovery_StillWorks(t *testing.T) {
 	remaining, _ := filepath.Glob(filepath.Join(tmpDir, "*.wal"))
 	if len(remaining) != 0 {
 		t.Errorf("expected 0 WAL files after recovery, got %d", len(remaining))
+	}
+}
+
+// TestRecovery_SkipsEntriesCoveredByFlushCheckpoint verifies that a data WAL
+// entry already flushed to storage is not replayed after a crash. This is the
+// tagless-data regression for issue #948: replaying it would permanently
+// duplicate legitimate rows because compaction cannot deduplicate tagless
+// measurements by timestamp alone.
+func TestRecovery_SkipsEntriesCoveredByFlushCheckpoint(t *testing.T) {
+	writer, tmpDir := newTestWriter(t, SyncModeAsync)
+	defer os.RemoveAll(tmpDir)
+
+	records := []map[string]interface{}{{
+		"measurement": "events",
+		"time":        int64(1609459200000000),
+		"value":       "single-event",
+	}}
+	hashes, err := writer.AppendTracked(records)
+	if err != nil {
+		t.Fatalf("append tracked records: %v", err)
+	}
+	waitForEntries(t, writer, 1)
+	// Force the checkpoint into the next WAL file. This models a flush that
+	// completes after rotation and guards the cross-file recovery case.
+	writer.mu.Lock()
+	if err := writer.rotate(); err != nil {
+		writer.mu.Unlock()
+		t.Fatalf("rotate WAL: %v", err)
+	}
+	writer.mu.Unlock()
+	if err := writer.MarkFlushed(hashes); err != nil {
+		t.Fatalf("append flush checkpoint: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+
+	recovery := NewRecovery(tmpDir, zerolog.Nop())
+	recovered := 0
+	stats, err := recovery.Recover(context.Background(), func(ctx context.Context, recs []map[string]interface{}) error {
+		recovered += len(recs)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("recovery failed: %v", err)
+	}
+	if recovered != 0 {
+		t.Fatalf("expected checkpointed records not to replay, got %d", recovered)
+	}
+	if stats.RecoveredEntries != 0 {
+		t.Fatalf("expected no WAL entries to be replayed, got %d", stats.RecoveredEntries)
+	}
+}
+
+func TestRecovery_SkipsTrackedColumnarEntryAfterRotation(t *testing.T) {
+	writer, tmpDir := newTestWriter(t, SyncModeAsync)
+	defer os.RemoveAll(tmpDir)
+
+	payload, err := msgpack.Marshal(map[string]interface{}{
+		"m": "events",
+		"columns": map[string]interface{}{
+			"time":  []interface{}{int64(1609459200000000)},
+			"value": []interface{}{"single-event"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal columnar payload: %v", err)
+	}
+	hashes, err := writer.AppendRawWithMetaTracked("db", payload)
+	if err != nil {
+		t.Fatalf("append tracked columnar records: %v", err)
+	}
+	waitForEntries(t, writer, 1)
+	writer.mu.Lock()
+	if err := writer.rotate(); err != nil {
+		writer.mu.Unlock()
+		t.Fatalf("rotate WAL: %v", err)
+	}
+	writer.mu.Unlock()
+	if err := writer.MarkFlushed(hashes); err != nil {
+		t.Fatalf("append flush checkpoint: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+
+	recovered := 0
+	stats, err := NewRecovery(tmpDir, zerolog.Nop()).RecoverWithOptions(context.Background(), nil, &RecoveryOptions{
+		ColumnarCallback: func(ctx context.Context, database, measurement string, columns map[string][]interface{}) error {
+			recovered++
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("recovery failed: %v", err)
+	}
+	if recovered != 0 || stats.RecoveredEntries != 0 {
+		t.Fatalf("expected checkpointed columnar entry not to replay, callbacks=%d entries=%d", recovered, stats.RecoveredEntries)
+	}
+}
+
+func TestRecovery_DoesNotSkipDistinctIdenticalTrackedEntries(t *testing.T) {
+	writer, tmpDir := newTestWriter(t, SyncModeAsync)
+	defer os.RemoveAll(tmpDir)
+
+	records := []map[string]interface{}{{"measurement": "events", "time": int64(1609459200000000), "value": "same"}}
+	first, err := writer.AppendTracked(records)
+	if err != nil {
+		t.Fatalf("append first tracked record: %v", err)
+	}
+	second, err := writer.AppendTracked(records)
+	if err != nil {
+		t.Fatalf("append second tracked record: %v", err)
+	}
+	waitForEntries(t, writer, 2)
+	if first[0] == second[0] {
+		t.Fatal("identical tracked entries must have distinct identities")
+	}
+	if err := writer.MarkFlushed(first); err != nil {
+		t.Fatalf("append partial flush checkpoint: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+
+	recovered := 0
+	_, err = NewRecovery(tmpDir, zerolog.Nop()).Recover(context.Background(), func(ctx context.Context, recs []map[string]interface{}) error {
+		recovered += len(recs)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("recovery failed: %v", err)
+	}
+	if recovered != 1 {
+		t.Fatalf("expected one distinct identical entry to replay, got %d", recovered)
+	}
+}
+
+func TestRecovery_UsesCheckpointsFromSkippedActiveFile(t *testing.T) {
+	writer, tmpDir := newTestWriter(t, SyncModeAsync)
+	defer os.RemoveAll(tmpDir)
+	defer writer.Close()
+
+	records := []map[string]interface{}{{"measurement": "events", "time": int64(1609459200000000), "value": "flushed"}}
+	hashes, err := writer.AppendTracked(records)
+	if err != nil {
+		t.Fatalf("append tracked records: %v", err)
+	}
+	waitForEntries(t, writer, 1)
+
+	writer.mu.Lock()
+	err = writer.rotate()
+	writer.mu.Unlock()
+	if err != nil {
+		t.Fatalf("rotate WAL: %v", err)
+	}
+	if err := writer.MarkFlushed(hashes); err != nil {
+		t.Fatalf("persist flush checkpoint: %v", err)
+	}
+	activeFile := writer.CurrentFile()
+	activeHashes, err := writer.CurrentCheckpointHashes()
+	if err != nil {
+		t.Fatalf("read active WAL checkpoints: %v", err)
+	}
+	if len(activeHashes) != 1 || activeHashes[0] != hashes[0] {
+		t.Fatalf("expected durable checkpoint %q in active WAL file, got %v", hashes[0], activeHashes)
+	}
+
+	recovered := 0
+	stats, err := NewRecovery(tmpDir, zerolog.Nop()).RecoverWithOptions(context.Background(), func(ctx context.Context, recs []map[string]interface{}) error {
+		recovered += len(recs)
+		return nil
+	}, &RecoveryOptions{
+		SkipActiveFile:             activeFile,
+		AdditionalCheckpointHashes: activeHashes,
+	})
+	if err != nil {
+		t.Fatalf("recover WAL: %v", err)
+	}
+	if recovered != 0 || stats.RecoveredEntries != 0 {
+		t.Fatalf("expected active-file checkpoint to suppress replay, callbacks=%d entries=%d", recovered, stats.RecoveredEntries)
+	}
+}
+
+func TestRecovery_CollectsCheckpointsFromRecentlyRotatedFile(t *testing.T) {
+	writer, tmpDir := newTestWriter(t, SyncModeAsync)
+	defer os.RemoveAll(tmpDir)
+	defer writer.Close()
+
+	records := []map[string]interface{}{{"measurement": "events", "time": int64(1609459200000000), "value": "flushed"}}
+	hashes, err := writer.AppendTracked(records)
+	if err != nil {
+		t.Fatalf("append tracked records: %v", err)
+	}
+	waitForEntries(t, writer, 1)
+	dataFile := writer.CurrentFile()
+
+	writer.mu.Lock()
+	err = writer.rotate()
+	writer.mu.Unlock()
+	if err != nil {
+		t.Fatalf("rotate data WAL file: %v", err)
+	}
+	checkpointFile := writer.CurrentFile()
+	if err := writer.MarkFlushed(hashes); err != nil {
+		t.Fatalf("persist flush checkpoint: %v", err)
+	}
+	writer.mu.Lock()
+	err = writer.rotate()
+	writer.mu.Unlock()
+	if err != nil {
+		t.Fatalf("rotate checkpoint WAL file: %v", err)
+	}
+
+	oldTime := time.Now().Add(-20 * time.Second)
+	if err := os.Chtimes(dataFile, oldTime, oldTime); err != nil {
+		t.Fatalf("age data WAL file: %v", err)
+	}
+	activeFile := writer.CurrentFile()
+	activeHashes, err := writer.CurrentCheckpointHashes()
+	if err != nil {
+		t.Fatalf("read active WAL checkpoints: %v", err)
+	}
+	if len(activeHashes) != 0 {
+		t.Fatalf("expected no checkpoints in the new active file, got %v", activeHashes)
+	}
+	if info, err := os.Stat(checkpointFile); err != nil {
+		t.Fatalf("stat checkpoint WAL file: %v", err)
+	} else if time.Since(info.ModTime()) >= 5*time.Second {
+		t.Fatalf("expected checkpoint file to remain within MinFileAge, age=%s", time.Since(info.ModTime()))
+	}
+
+	recovered := 0
+	stats, err := NewRecovery(tmpDir, zerolog.Nop()).RecoverWithOptions(context.Background(), func(ctx context.Context, recs []map[string]interface{}) error {
+		recovered += len(recs)
+		return nil
+	}, &RecoveryOptions{
+		SkipActiveFile: activeFile,
+		MinFileAge:     5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("recover WAL: %v", err)
+	}
+	if recovered != 0 || stats.RecoveredEntries != 0 {
+		t.Fatalf("expected recent-file checkpoint to suppress replay, callbacks=%d entries=%d", recovered, stats.RecoveredEntries)
+	}
+	if stats.SkippedFiles != 2 {
+		t.Fatalf("expected active and recent checkpoint files to be skipped from replay, skipped=%d", stats.SkippedFiles)
+	}
+}
+
+func TestMarkFlushedBatchesCheckpointHashes(t *testing.T) {
+	writer, tmpDir := newTestWriter(t, SyncModeAsync)
+	defer os.RemoveAll(tmpDir)
+	defer writer.Close()
+
+	dataHashes, err := writer.AppendTracked([]map[string]interface{}{{"payload": strings.Repeat("x", 1<<20)}})
+	if err != nil {
+		t.Fatalf("append tracked data entry: %v", err)
+	}
+	hashes := make([]string, walCheckpointBatchSize+1)
+	for i := range hashes {
+		hashes[i] = strconv.Itoa(i)
+	}
+	hashes = append(hashes, dataHashes...)
+	if err := writer.MarkFlushed(hashes); err != nil {
+		t.Fatalf("persist flush checkpoints: %v", err)
+	}
+
+	entries, err := NewReader(writer.CurrentFile(), zerolog.Nop()).ReadAll()
+	if err != nil {
+		t.Fatalf("read checkpoint WAL entries: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("expected one data entry and two bounded checkpoints, got %d entries", len(entries))
+	}
+	checkpointCount := 0
+	for _, entry := range entries {
+		checkpointCount += len(entry.CheckpointHashes)
+	}
+	if checkpointCount != len(hashes) {
+		t.Fatalf("checkpoint hash count = %d, want %d", checkpointCount, len(hashes))
+	}
+
+	checkpointHashes, err := NewReader(writer.CurrentFile(), zerolog.Nop()).ReadCheckpointHashes()
+	if err != nil {
+		t.Fatalf("scan checkpoint hashes: %v", err)
+	}
+	if len(checkpointHashes) != len(hashes) {
+		t.Fatalf("checkpoint-only scan returned %d hashes, want %d", len(checkpointHashes), len(hashes))
+	}
+	for i := range hashes {
+		if checkpointHashes[i] != hashes[i] {
+			t.Fatalf("checkpoint hash %d = %q, want %q", i, checkpointHashes[i], hashes[i])
+		}
+	}
+}
+
+func TestNewWriterTrackedInstancesAreRandomized(t *testing.T) {
+	first, firstDir := newTestWriter(t, SyncModeAsync)
+	defer os.RemoveAll(firstDir)
+	defer first.Close()
+	second, secondDir := newTestWriter(t, SyncModeAsync)
+	defer os.RemoveAll(secondDir)
+	defer second.Close()
+
+	if first.trackedInstance == 0 || second.trackedInstance == 0 {
+		t.Fatal("tracked writer instance must be non-zero")
+	}
+	if first.trackedInstance == second.trackedInstance {
+		t.Fatal("separate writers unexpectedly share a tracked instance identity")
 	}
 }
 

@@ -33,6 +33,10 @@ type RecoveryOptions struct {
 	// during periodic recovery (to avoid reading a file being actively written)
 	SkipActiveFile string
 
+	// AdditionalCheckpointHashes contains checkpoints read safely from the
+	// active file, which is intentionally excluded from recovery scans.
+	AdditionalCheckpointHashes []string
+
 	// BatchSize limits how many records are replayed per callback invocation
 	// This provides backpressure during mass recovery after prolonged outages
 	// 0 means no limit (all records in an entry replayed at once)
@@ -99,7 +103,15 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 
 	r.logger.Info().Int("files", len(walFiles)).Msg("WAL recovery started")
 
-	// Process each WAL file
+	flushed := make(map[string]struct{})
+	for _, hash := range opts.AdditionalCheckpointHashes {
+		flushed[hash] = struct{}{}
+	}
+
+	// Scan non-active files for checkpoints before invoking callbacks. A flush
+	// checkpoint can land in the next WAL file after rotation, while the data
+	// entry remains in the previous file. Recently rotated files are scanned for
+	// checkpoints too, even though the replay pass below skips them.
 	for _, walFile := range walFiles {
 		select {
 		case <-ctx.Done():
@@ -114,7 +126,27 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 			continue
 		}
 
-		// See RecoveryOptions.MinFileAge (#594 rotation-race defense).
+		reader := NewReader(walFile, r.logger)
+		checkpointHashes, err := reader.ReadCheckpointHashes()
+		if err != nil {
+			r.logger.Error().Err(err).Str("file", walFile).Msg("Failed to scan WAL checkpoints")
+			continue
+		}
+		for _, hash := range checkpointHashes {
+			flushed[hash] = struct{}{}
+		}
+	}
+
+	// Process each WAL file
+	for _, walFile := range walFiles {
+		select {
+		case <-ctx.Done():
+			return stats, ctx.Err()
+		default:
+		}
+		if opts.SkipActiveFile != "" && walFile == opts.SkipActiveFile {
+			continue
+		}
 		if opts.MinFileAge > 0 {
 			if info, statErr := os.Stat(walFile); statErr == nil && time.Since(info.ModTime()) < opts.MinFileAge {
 				r.logger.Debug().Str("file", filepath.Base(walFile)).Msg("Skipping too-recent WAL file (possible fresh rotation)")
@@ -123,14 +155,13 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 			}
 		}
 
-		r.logger.Info().Str("file", filepath.Base(walFile)).Msg("Recovering WAL file")
-
 		reader := NewReader(walFile, r.logger)
 		entries, err := reader.ReadAll()
 		if err != nil {
 			r.logger.Error().Err(err).Str("file", walFile).Msg("Failed to read WAL file")
 			continue
 		}
+		r.logger.Info().Str("file", filepath.Base(walFile)).Msg("Recovering WAL file")
 
 		// Replay entries - track if all succeed
 		allEntriesSucceeded := true
@@ -138,6 +169,13 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		fileRecoveredEntries := 0
 
 		for _, entry := range entries {
+			if len(entry.CheckpointHashes) > 0 {
+				continue
+			}
+			if _, ok := flushed[entry.PayloadHash]; ok {
+				r.logger.Debug().Str("payload_hash", entry.PayloadHash).Msg("Skipping WAL entry covered by flush checkpoint")
+				continue
+			}
 			// Dispatch based on entry format
 			if entry.ColumnarData != nil && opts.ColumnarCallback != nil {
 				// Columnar entry from zero-copy AppendRaw path
