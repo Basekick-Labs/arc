@@ -273,6 +273,25 @@ func (p *Puller) walkManifest(ctx context.Context, fetch func(cursor string, lim
 				return result
 			}
 
+			// Snapshot restore rebuilds the manifest without firing the file-registration callback.
+			// A same-size local object can therefore be an older generation and must be
+			// verified by content during the startup catch-up walk. The normal reactive
+			// path keeps its cheap size-only check.
+			if startup {
+				localSize, statErr := p.statLocal(entry.Path)
+				if presentAtSize(localSize, statErr, entry.SizeBytes) {
+					matches, hashErr := p.localFileMatchesEntry(entry.Path, entry.SHA256)
+					if hashErr == nil && matches {
+						p.catchupSkippedLocal.Add(1)
+						continue
+					}
+					// The worker's normal presence check is intentionally size-only.
+					// Mark the path so processEntry performs the actual pull despite
+					// the stale copy having the same length as the manifest entry.
+					p.markStaleKept(entry.Path)
+				}
+			}
+
 			// A self-origin entry is skipped when this node still holds the
 			// file — always, when RepullMissingSelfOrigin is off, as it was
 			// before #959 — so that the startup walk does not create a
