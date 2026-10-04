@@ -51,12 +51,10 @@ type deleteRequest struct {
 //
 // Implemented by *tiering.Manager. Declared here, consumer-side, for the same
 // reason tiering declares ManifestCoordinator rather than importing this
-// package: neither side needs the other's types. Neither method writes through
-// to SQLite on the caller's goroutine; both queue. RecordReplicatedFile never
-// blocks — it runs on a replication pull worker. RecordUnlinkedFile may wait
-// briefly for queue room — it runs on a local-delete worker, which has
-// nothing else to do with the time — and gives up at once if the recorder is
-// stopping, so the delete drain in Stop is never held by it.
+// package: neither side needs the other's types. Both methods are
+// fire-and-forget — they are called from the replication pull workers and the
+// local-delete workers, never block, and the implementation queues rather than
+// writing through to SQLite on the caller's goroutine.
 type TierRecorder interface {
 	// RecordReplicatedFile reports a file pulled from a peer and kept, which
 	// is now on this node's hot storage.
@@ -1108,6 +1106,20 @@ func (c *Coordinator) recordPulledFileInTiering(path string, sizeBytes int64) bo
 func (c *Coordinator) recordUnlinkedFileInTiering(path, reason string, sizeBytes int64) {
 	if r := c.tierRecorderSnapshot(); r != nil {
 		r.RecordUnlinkedFile(path, reason, sizeBytes)
+	}
+}
+
+// tierReasonAbandonedPull is the reason reported for a copy the puller removed
+// because its path left the manifest while the pull was in transit. The puller
+// never learns the manifest delete's own reason, so the recorder treats this
+// one as possibly a migration. Shared literal with
+// tiering.unlinkReasonAbandonedPull; the packages do not import each other.
+const tierReasonAbandonedPull = "replication:abandoned"
+
+// recordAbandonedFileInTiering is the puller's RecordAbandonedFile hook.
+func (c *Coordinator) recordAbandonedFileInTiering(path string, sizeBytes int64) {
+	if r := c.tierRecorderSnapshot(); r != nil {
+		r.RecordUnlinkedFile(path, tierReasonAbandonedPull, sizeBytes)
 	}
 }
 
@@ -4085,8 +4097,9 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// Reads the recorder each time rather than capturing it: the tiering
 		// manager is built long after the coordinator starts, so the hook has
 		// to exist before the thing it reports to does.
-		RecordPulledFile: c.recordPulledFileInTiering,
-		Logger:           c.logger,
+		RecordPulledFile:    c.recordPulledFileInTiering,
+		RecordAbandonedFile: c.recordAbandonedFileInTiering,
+		Logger:              c.logger,
 	}
 
 	puller, err := filereplication.New(pullerCfg)

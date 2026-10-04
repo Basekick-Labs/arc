@@ -67,9 +67,11 @@ New counters for the path: `tier_registered` alongside `pulled` in
 `/api/v1/cluster`'s `replication_catchup_status` — it counts pulls a tier
 recorder accepted, so it tracks `pulled` where tiering is enabled and stays at
 zero where it is not — and `replication_events` in `/api/v1/tiering/status`,
-whose `dropped` should be zero: an unlink report waits for queue room rather
-than dropping, and a pull report drops only when the queue has been full for
-the whole of a catch-up burst.
+whose `dropped` is zero on a healthy node: reports are queued without blocking
+the pull or delete workers and the queue grows as a burst needs; it drops only
+if the drainer stops making progress for long enough to reach its memory bound,
+or at shutdown with work still queued, and either way the next tier scan
+reconciles.
 
 One behaviour note for the failure case: if the tiering manager cannot start —
 an unparseable `migration_schedule`, say — queries still route across tiers and

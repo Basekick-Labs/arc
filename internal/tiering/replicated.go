@@ -42,22 +42,31 @@ import (
 	"github.com/basekick-labs/arc/internal/storage"
 )
 
-// tierEventQueueSize is the drainer's buffer. The pull side drops when it is
-// full — a pull worker must not wait — while the unlink side waits for room up
-// to tierEventUnlinkWait, so under a migration chunk the delete workers are
-// throttled to the drainer's pace instead of losing the tail.
-const tierEventQueueSize = 4096
+// tierEventQueueMax bounds the drainer's queue in memory. Reports never block
+// their caller and are never dropped while the node is running normally: the
+// queue grows to whatever a burst needs and the drainer takes all of it. The
+// cap is a memory bound for a drainer that has stopped making progress — a
+// stalled SQLite handle, which also stalls authentication — not a throughput
+// knob; at roughly 200 bytes an event it is on the order of 200 MB. Events it
+// turns away are counted and reconciled by the next tier scan. A variable so
+// tests can shrink it.
+var tierEventQueueMax = 1 << 20
 
-// tierEventUnlinkWait is how long an unlink report waits for queue room before
-// it is dropped. The reporters are the coordinator's two background delete
-// workers, which have nothing else to do with the time; the wait ends early
-// once Stop has been signalled, so a worker is never held across shutdown.
-const tierEventUnlinkWait = 10 * time.Second
+// unlinkReasonAbandonedPull is the reason the replication puller reports when
+// it removes a copy it had just finished pulling because the path left the
+// cluster manifest while the bytes were in transit. The puller does not know
+// WHY the path left — that reason went to the delete worker, which may stat
+// the path before the bytes landed and find nothing to report — so this
+// reason is treated like a tiering one: the cold tier is asked. The literal is
+// shared with internal/cluster (tierReasonAbandonedPull); neither package
+// imports the other.
+const unlinkReasonAbandonedPull = "replication:abandoned"
 
-// tierEventStopDrainTimeout is the per-chunk budget once Stop has been
-// signalled. Short on purpose: Stop runs on the shutdown timeout that every
-// remaining hook and component shares, so a slow drain here is paid for by
-// things that still have to run.
+// tierEventStopDrainTimeout is the whole drain's budget once Stop has been
+// signalled; each chunk gets what is left of it. Short on purpose: Stop runs
+// on the shutdown timeout that every remaining hook and component shares, so a
+// slow drain here is paid for by things that still have to run. What it does
+// not cover is counted dropped and reconciled by the startup scan.
 const tierEventStopDrainTimeout = 2 * time.Second
 
 // tierEventDrainTimeout bounds one applied chunk of a batch. A chunk is
@@ -68,8 +77,8 @@ const tierEventStopDrainTimeout = 2 * time.Second
 var tierEventDrainTimeout = 30 * time.Second
 
 // tierEventChunk is how many events share one deadline. The deadline is a
-// stall detector, not a throughput budget: a batch is the whole queue, up to
-// tierEventQueueSize, and under a migration chunk each unlink in it costs a
+// stall detector, not a throughput budget: a batch is the whole queue, however
+// large a burst made it, and under a migration chunk each unlink in it costs a
 // cold-tier round trip — one deadline over the whole batch would be decided by
 // the batch's size rather than by whether anything is stuck.
 const tierEventChunk = 256
@@ -109,11 +118,8 @@ type tierEvent struct {
 // RecordReplicatedFile reports a file this node pulled from a peer and kept,
 // so it is registered in the hot tier the way a local flush would be.
 //
-// Non-blocking, like ingest.FileRegistrar: it runs on a replication pull
-// worker. An event dropped because the queue is full is logged at Debug and
-// counted — Debug because under a catch-up burst a Warn per file is a log
-// flood, and counted because unlike the timestamp update this pattern is
-// copied from, a lost event costs read accuracy until the next scan.
+// Never blocks: it runs on a replication pull worker. The report is appended
+// to the drainer's queue, which grows as a burst needs (tierEventQueueMax).
 //
 // Safe on a nil receiver: the cluster layer holds this as an interface, and an
 // interface holding a typed nil is not == nil (#713).
@@ -129,56 +135,96 @@ func (m *Manager) RecordReplicatedFile(path string, sizeBytes int64) {
 // caller stat'd before deleting, which is also the evidence that this node
 // actually held the file.
 //
-// Unlike RecordReplicatedFile this WAITS for queue room, up to
-// tierEventUnlinkWait, rather than dropping. The callers are the coordinator's
-// background delete workers, and a migration chunk has them unlinking at disk
-// speed while each of those unlinks costs the drainer a cold-tier round trip;
-// a dropped unlink is a row this node reads wrong until the next cold sync.
-// The wait ends at once if Stop has been signalled. Nil-receiver safe.
+// Never blocks and nil-receiver safe, as RecordReplicatedFile. It runs on a
+// local-delete worker, and a migration chunk has those unlinking at disk
+// speed while each unlink costs the drainer a cold-tier round trip; the queue
+// absorbs that difference, so neither the worker nor the event pays for it.
 func (m *Manager) RecordUnlinkedFile(path, reason string, sizeBytes int64) {
 	if m == nil {
 		return
 	}
-	m.enqueueTierEventWait(tierEvent{kind: tierEventUnlinked, path: path, reason: reason, sizeBytes: sizeBytes}, tierEventUnlinkWait)
+	m.enqueueTierEvent(tierEvent{kind: tierEventUnlinked, path: path, reason: reason, sizeBytes: sizeBytes})
 }
 
-// enqueueTierEvent queues without waiting.
 func (m *Manager) enqueueTierEvent(ev tierEvent) {
-	select {
-	case m.tierEventCh <- ev:
-	default:
-		m.dropTierEvent(ev)
-	}
-}
-
-// enqueueTierEventWait queues, waiting up to wait for room. It gives up at
-// once, dropping, if tierEventStop is closed: past that point nothing drains
-// the queue, and the caller's goroutine is on the shutdown budget.
-func (m *Manager) enqueueTierEventWait(ev tierEvent, wait time.Duration) {
-	select {
-	case m.tierEventCh <- ev:
+	if m.tierEvents == nil {
+		// A Manager built by hand without a queue, as some package tests do.
+		// Nothing drains, so the event counts as dropped.
+		m.tierEventsDropped.Add(1)
 		return
-	case <-m.tierEventStop:
-		m.dropTierEvent(ev)
+	}
+	if m.tierEvents.push(ev, tierEventQueueMax) {
 		return
-	default:
 	}
-	timer := time.NewTimer(wait)
-	defer timer.Stop()
-	select {
-	case m.tierEventCh <- ev:
-	case <-m.tierEventStop:
-		m.dropTierEvent(ev)
-	case <-timer.C:
-		m.dropTierEvent(ev)
-	}
-}
-
-func (m *Manager) dropTierEvent(ev tierEvent) {
 	m.tierEventsDropped.Add(1)
-	m.logger.Debug().
-		Str("path", ev.path).
-		Msg("Tier metadata event queue full, dropping; the next tier scan will reconcile")
+	if m.tierEvents.warnOnce() {
+		// Once per episode, not per event: a drainer that is not making
+		// progress is one problem, however many reports pile up behind it.
+		m.logger.Warn().
+			Int("queued", tierEventQueueMax).
+			Msg("Tier metadata event queue at its memory bound and the drainer is not keeping up — is the metadata database stalled? Dropping until it drains; the next tier scan will reconcile")
+	}
+}
+
+// tierEventQueue is the drainer's inbox: an unbounded slice behind a mutex
+// with a one-slot wake channel — the shape of the coordinator's pending local
+// deletes. Producers append and return; the single consumer takes the whole
+// slice at once.
+type tierEventQueue struct {
+	mu     sync.Mutex
+	events []tierEvent
+	warned bool
+	wake   chan struct{}
+}
+
+func newTierEventQueue() *tierEventQueue {
+	return &tierEventQueue{wake: make(chan struct{}, 1)}
+}
+
+// push appends ev unless the queue already holds max events; reports whether
+// it was queued.
+func (q *tierEventQueue) push(ev tierEvent, max int) bool {
+	q.mu.Lock()
+	if len(q.events) >= max {
+		q.mu.Unlock()
+		return false
+	}
+	q.events = append(q.events, ev)
+	q.mu.Unlock()
+	select {
+	case q.wake <- struct{}{}:
+	default:
+	}
+	return true
+}
+
+// warnOnce reports true the first time it is called after the queue was last
+// emptied, so a wedged drainer logs once per episode rather than per event.
+func (q *tierEventQueue) warnOnce() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.warned {
+		return false
+	}
+	q.warned = true
+	return true
+}
+
+// take hands back everything queued and leaves the queue empty.
+func (q *tierEventQueue) take() []tierEvent {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	events := q.events
+	q.events = nil
+	q.warned = false
+	return events
+}
+
+// pending is the number of queued events, for tests and the status endpoint.
+func (q *tierEventQueue) pending() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.events)
 }
 
 // TierEventStats reports what the drainer has done, for the status endpoint
@@ -193,51 +239,49 @@ func (m *Manager) TierEventStats() (applied, dropped, failed int64) {
 
 // tierEventLoop is the single writer applying queued events.
 //
-// It drains in batches: one receive parks until there is something to do, then
-// everything else already queued is taken without blocking and the whole batch
-// is applied before the tier cache is invalidated once per database/
-// measurement it touched. Started by NewManager so the seam is live before
-// Start, and joined by Stop before the shared SQLite handle can be closed.
+// One wake parks until there is something to do, then everything queued is
+// taken and applied as one batch — in chunks, each under its own deadline —
+// before the tier cache is invalidated once per database/measurement the
+// batch changed. Started by NewManager so the seam is live before Start, and
+// joined by Stop before the shared SQLite handle can be closed.
 func (m *Manager) tierEventLoop() {
 	defer m.tierEventWG.Done()
 
 	for {
 		select {
-		case ev := <-m.tierEventCh:
-			m.applyTierEventBatch(m.takeQueuedTierEvents(ev))
-		case <-m.tierEventStop:
-			// Drain what is already queued, then stop. Events still being
-			// sent concurrently are dropped rather than waited on: the
-			// database is about to close, and the next startup scan
-			// reconciles whatever is lost.
-			//
-			// draining=true, because Stop is on the shutdown budget that every
-			// remaining hook and component shares. A drain here writes rows
-			// but spends no network probe, and takes a fraction of the time
-			// rather than a fresh full batch deadline per batch.
-			m.draining.Store(true)
+		case <-m.tierEvents.wake:
 			for {
-				select {
-				case ev := <-m.tierEventCh:
-					m.applyTierEventBatch(m.takeQueuedTierEvents(ev))
-				default:
+				batch := m.tierEvents.take()
+				if len(batch) == 0 {
+					break
+				}
+				m.applyTierEventBatch(batch)
+			}
+		case <-m.tierEventStop:
+			// Drain what is queued, within one budget, then stop. Stop is on
+			// the shutdown timeout that every remaining hook and component
+			// shares, so the drain writes rows but starts no network probe
+			// (draining=true is read by the probe pre-pass and by
+			// applyUnlinked), and what the budget does not cover is counted
+			// dropped: the database is about to close, and the startup scan
+			// on the next boot reconciles it.
+			m.draining.Store(true)
+			m.tierEventStopDeadline.Store(time.Now().Add(tierEventStopDrainTimeout).UnixNano())
+			for {
+				batch := m.tierEvents.take()
+				if len(batch) == 0 {
 					return
 				}
+				if time.Now().UnixNano() >= m.tierEventStopDeadline.Load() {
+					m.tierEventsDropped.Add(int64(len(batch)))
+					m.tierEventsProcessed.Add(int64(len(batch)))
+					m.logger.Warn().
+						Int("unapplied", len(batch)).
+						Msg("Tier metadata events still queued when the shutdown drain budget ran out; the startup scan will reconcile")
+					return
+				}
+				m.applyTierEventBatch(batch)
 			}
-		}
-	}
-}
-
-// takeQueuedTierEvents returns first plus everything else already queued.
-func (m *Manager) takeQueuedTierEvents(first tierEvent) []tierEvent {
-	batch := make([]tierEvent, 0, 16)
-	batch = append(batch, first)
-	for {
-		select {
-		case ev := <-m.tierEventCh:
-			batch = append(batch, ev)
-		default:
-			return batch
 		}
 	}
 }
@@ -289,18 +333,18 @@ func (m *Manager) applyTierEventBatch(batch []tierEvent) {
 
 	for start := 0; start < len(batch); start += tierEventChunk {
 		end := min(start+tierEventChunk, len(batch))
-		if !m.applyTierEventChunk(batch[start:end], touched, before, mayChange) {
+		if unapplied := m.applyTierEventChunk(batch[start:end], touched, before, mayChange); unapplied > 0 {
 			// The chunk ran out of its deadline: the SQLite handle is stalled,
-			// or the cold tier is. Each remaining chunk would burn a full
-			// deadline against the same stall, so the rest of the batch is
-			// given up and the next scan reconciles it.
-			if rest := len(batch) - end; rest > 0 {
-				m.tierEventsFailed.Add(int64(rest))
-				m.tierEventsProcessed.Add(int64(rest))
-				m.logger.Warn().
-					Int("unapplied", rest).
-					Msg("Tier metadata batch abandoned after a chunk exceeded its deadline; the next tier scan will reconcile")
-			}
+			// the cold tier is, or the shutdown drain budget is spent. Each
+			// remaining chunk would burn a full deadline against the same
+			// stall, so the rest of the batch is given up and the next scan
+			// reconciles it.
+			rest := unapplied + (len(batch) - end)
+			m.tierEventsFailed.Add(int64(rest))
+			m.tierEventsProcessed.Add(int64(rest))
+			m.logger.Warn().
+				Int("unapplied", rest).
+				Msg("Tier metadata batch abandoned after a chunk exceeded its deadline; the next tier scan will reconcile")
 			break
 		}
 	}
@@ -377,11 +421,17 @@ func sameTierSet(a, b map[Tier]bool) bool {
 // measurement seen for the first time in this batch, and the cold-tier
 // existence of every unlinked path whose row might flip, probed in parallel —
 // and then writes sequentially, so the single SQLite connection never waits on
-// the network. Reports false if the deadline ran out with events unapplied.
-func (m *Manager) applyTierEventChunk(chunk []tierEvent, touched map[tierEventKey]struct{}, before map[tierEventKey]tierSetSnapshot, mayChange map[tierEventKey]bool) bool {
+// the network. Returns how many of the chunk's events went unapplied because
+// the deadline ran out; zero means the chunk completed.
+func (m *Manager) applyTierEventChunk(chunk []tierEvent, touched map[tierEventKey]struct{}, before map[tierEventKey]tierSetSnapshot, mayChange map[tierEventKey]bool) int {
 	budget := tierEventDrainTimeout
 	if m.draining.Load() {
-		budget = tierEventStopDrainTimeout
+		// What is left of the whole drain's budget, not a fresh one per
+		// chunk: Stop is on the shared shutdown timeout.
+		budget = time.Until(time.Unix(0, m.tierEventStopDeadline.Load()))
+		if budget <= 0 {
+			return len(chunk)
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
@@ -410,20 +460,15 @@ func (m *Manager) applyTierEventChunk(chunk []tierEvent, touched map[tierEventKe
 		}
 		if ctx.Err() != nil {
 			// Past the deadline the remaining writes would all fail and log.
-			// Count what is left of this chunk; the caller gives up the rest
-			// of the batch.
+			// Hand back what is left of this chunk; the caller counts it with
+			// the rest of the batch it gives up.
 			rest := 0
 			for _, later := range infos[i:] {
 				if later != nil {
 					rest++
 				}
 			}
-			m.tierEventsFailed.Add(int64(rest))
-			m.tierEventsProcessed.Add(int64(rest))
-			m.logger.Warn().
-				Int("unapplied", rest).
-				Msg("Tier metadata chunk exceeded its deadline; the next tier scan will reconcile")
-			return false
+			return rest
 		}
 
 		var (
@@ -459,7 +504,14 @@ func (m *Manager) applyTierEventChunk(chunk []tierEvent, touched map[tierEventKe
 		}
 		m.tierEventsProcessed.Add(1)
 	}
-	return true
+	return 0
+}
+
+// reasonMayBeMigration reports whether an unlink with this reason is worth a
+// cold-tier existence check: tiering's own reasons, and the puller's abandoned
+// pull, whose real reason is unknown to it.
+func reasonMayBeMigration(reason string) bool {
+	return strings.HasPrefix(reason, manifestReasonPrefix) || reason == unlinkReasonAbandonedPull
 }
 
 // coldProbe is the answer of one cold-tier existence check.
@@ -483,7 +535,7 @@ func (m *Manager) probeColdForChunk(ctx context.Context, chunk []tierEvent, info
 	var paths []string
 	seen := make(map[string]struct{})
 	for i, ev := range chunk {
-		if infos[i] == nil || ev.kind != tierEventUnlinked || !strings.HasPrefix(ev.reason, manifestReasonPrefix) {
+		if infos[i] == nil || ev.kind != tierEventUnlinked || !reasonMayBeMigration(ev.reason) {
 			continue
 		}
 		if _, dup := seen[ev.path]; dup {
@@ -592,7 +644,7 @@ func (m *Manager) applyPulled(ctx context.Context, info *FileMetadata) (bool, er
 // Returns whether a row was written.
 func (m *Manager) applyUnlinked(ctx context.Context, info *FileMetadata, reason string, probe *coldProbe) (bool, error) {
 	cold := m.GetBackendForTier(TierCold)
-	if strings.HasPrefix(reason, manifestReasonPrefix) && cold != nil && m.config.Cold.Enabled {
+	if reasonMayBeMigration(reason) && cold != nil && m.config.Cold.Enabled {
 		// A row that already says cold needs no probe and no write, and
 		// skipping it here is what keeps the existence check off the
 		// high-volume tiering reasons: the manifest sweep and orphan

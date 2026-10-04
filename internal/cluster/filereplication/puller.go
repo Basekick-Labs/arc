@@ -207,6 +207,15 @@ type Config struct {
 	// being non-nil — is what tier_registered counts.
 	RecordPulledFile func(path string, sizeBytes int64) bool
 
+	// RecordAbandonedFile, when set, is called for a file this node had just
+	// finished pulling when it found the path gone from the manifest and
+	// removed its copy. The delete worker handling that manifest delete may
+	// stat the path before the bytes landed and so find nothing of its own to
+	// report; without this, a hot row this node held for an earlier
+	// generation of the path would stand until the next tier scan. Must not
+	// block. nil means no tiering on this node.
+	RecordAbandonedFile func(path string, sizeBytes int64)
+
 	// Logger receives structured log output.
 	Logger zerolog.Logger
 }
@@ -704,6 +713,13 @@ func (p *Puller) recordPulledFile(path string, sizeBytes int64) {
 	}
 	if p.cfg.RecordPulledFile(path, sizeBytes) {
 		p.totalTierRegistered.Add(1)
+	}
+}
+
+// recordAbandonedFile is the nil-safe wrapper around cfg.RecordAbandonedFile.
+func (p *Puller) recordAbandonedFile(path string, sizeBytes int64) {
+	if p.cfg.RecordAbandonedFile != nil {
+		p.cfg.RecordAbandonedFile(path, sizeBytes)
 	}
 }
 
@@ -1396,6 +1412,7 @@ func (p *Puller) processEntry(log zerolog.Logger, request *pullRequest) {
 				if !p.manifestHas(entry.Path) {
 					p.totalSkippedGone.Add(1)
 					p.deleteFile(log, entry.Path)
+					p.recordAbandonedFile(entry.Path, entry.SizeBytes)
 					log.Debug().
 						Str("path", entry.Path).
 						Str("peer", peerAddr).

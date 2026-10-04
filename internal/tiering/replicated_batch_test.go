@@ -127,11 +127,16 @@ func (b *slowExistsBackend) Exists(ctx context.Context, path string) (bool, erro
 // next cold sync. The drainer has to apply a chunk whose probes, run
 // sequentially, would take several times its deadline.
 func TestApplyTierEventBatch_AppliesAMigrationChunkTheProbeLatencyWouldTimeOut(t *testing.T) {
+	// Sequentially the probes alone take n*probe = 8 s against a 2 s chunk
+	// deadline; in parallel a chunk's probes take ~0.3 s. The gap on each
+	// side is deliberately wide: the SQL writes under -race on a small CI
+	// runner cost real time too, and the test must fail only for the
+	// mechanism it is about.
 	const n = 400
-	const probe = 5 * time.Millisecond // n*probe = 2 s sequential
+	const probe = 20 * time.Millisecond
 
 	restore := tierEventDrainTimeout
-	tierEventDrainTimeout = 400 * time.Millisecond
+	tierEventDrainTimeout = 2 * time.Second
 	t.Cleanup(func() { tierEventDrainTimeout = restore })
 
 	cold := &slowExistsBackend{mockBackend: newMockBackend("s3"), delay: probe}
@@ -170,72 +175,63 @@ func TestApplyTierEventBatch_AppliesAMigrationChunkTheProbeLatencyWouldTimeOut(t
 	}
 }
 
-// The unlink reports come from the coordinator's two background delete
-// workers, which have nowhere to be: a report that finds the queue full
-// should wait for room rather than drop, because a dropped unlink is a row
-// this node reads wrong until the next cold sync. The pull side stays
-// non-blocking (TestTierEventQueueDropsWithoutBlocking).
-func TestRecordUnlinkedFile_WaitsForRoomInsteadOfDropping(t *testing.T) {
+// A migration chunk has the two delete workers unlinking at disk speed while
+// each unlink costs the drainer a cold-tier round trip. The queue absorbs the
+// difference: a report never blocks the worker and is never dropped while the
+// drainer is alive, however far behind it is.
+func TestRecordUnlinkedFile_NeverBlocksAndNeverDropsUnderABurst(t *testing.T) {
 	m := &Manager{
 		logger:        zerolog.Nop(),
-		tierEventCh:   make(chan tierEvent, 1),
+		tierEvents:    newTierEventQueue(),
 		tierEventStop: make(chan struct{}),
 	}
-	// No drainer: the first report fills the buffer.
-	m.RecordUnlinkedFile("db1/cpu/2026/10/03/14/a.parquet", "compaction:j1", 1)
-
+	// No drainer at all: the worst case for a queue, and the burst must still
+	// land in full without holding the caller.
+	const n = 10000
 	done := make(chan struct{})
 	go func() {
-		m.RecordUnlinkedFile("db1/cpu/2026/10/03/14/b.parquet", "compaction:j1", 1)
-		close(done)
+		defer close(done)
+		for i := 0; i < n; i++ {
+			m.RecordUnlinkedFile(fmt.Sprintf("db1/cpu/2026/10/03/%02d/f%05d.parquet", i%24, i), "tiering:migrated", 1)
+		}
 	}()
 	select {
 	case <-done:
-		t.Fatal("second unlink report returned with the queue full: it was dropped rather than waited")
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	// Make room, as the drainer would.
-	<-m.tierEventCh
-	select {
-	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("the waiting report did not complete once there was room")
+		t.Fatal("unlink reports blocked the delete worker")
 	}
 	if _, dropped, _ := m.TierEventStats(); dropped != 0 {
 		t.Fatalf("dropped = %d, want 0", dropped)
 	}
-	if got := len(m.tierEventCh); got != 1 {
-		t.Fatalf("queued = %d, want the waited report", got)
+	if got := m.tierEvents.pending(); got != n {
+		t.Fatalf("pending = %d, want %d", got, n)
 	}
 }
 
-// ...but never past Stop. Once the drainer has been told to stop, a waiting
-// report is dropped at once rather than holding a delete worker for the full
-// wait: the coordinator's shutdown drain is bounded, and so is the hook
-// budget everything else shares.
-func TestRecordUnlinkedFile_DoesNotWaitPastStop(t *testing.T) {
-	m := &Manager{
-		logger:        zerolog.Nop(),
-		tierEventCh:   make(chan tierEvent, 1),
-		tierEventStop: make(chan struct{}),
-	}
-	m.RecordUnlinkedFile("db1/cpu/2026/10/03/14/a.parquet", "compaction:j1", 1)
+// The puller removes a copy it had just finished pulling when the path left
+// the manifest in transit, and reports it under a reason of its own because it
+// never learns the manifest delete's. That reason is treated like a tiering
+// one — the cold tier decides — so a file the primary migrated out from under
+// an in-flight pull still ends up with a cold row here, and one that was simply
+// deleted ends up with no row.
+func TestRecordUnlinkedFile_AbandonedPullIsDecidedByTheColdTier(t *testing.T) {
+	cold := newMockBackend("s3")
+	const migrated = "db1/cpu/2026/10/03/a_daily.parquet"
+	const deleted = "db1/cpu/2026/10/03/14/b.parquet"
+	cold.seedRaw(migrated, []byte("cold copy"))
 
-	done := make(chan struct{})
-	go func() {
-		m.RecordUnlinkedFile("db1/cpu/2026/10/03/14/b.parquet", "compaction:j1", 1)
-		close(done)
-	}()
-	time.Sleep(50 * time.Millisecond)
-	close(m.tierEventStop)
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("unlink report still waiting after Stop")
+	m := newTierEventManager(t, cold, true)
+	hotRowFor(t, m, migrated) // an earlier generation this node held
+	hotRowFor(t, m, deleted)
+	m.RecordUnlinkedFile(migrated, unlinkReasonAbandonedPull, 9)
+	m.RecordUnlinkedFile(deleted, unlinkReasonAbandonedPull, 9)
+	waitTierEvents(t, m, 2)
+
+	if tier, ok := rowTier(t, m, migrated); !ok || tier != string(TierCold) {
+		t.Fatalf("migrated-mid-pull path: tier=%q present=%v, want cold", tier, ok)
 	}
-	if _, dropped, _ := m.TierEventStats(); dropped != 1 {
-		t.Fatalf("dropped = %d, want 1", dropped)
+	if tier, ok := rowTier(t, m, deleted); ok {
+		t.Fatalf("deleted-mid-pull path: row left at tier %q, want none", tier)
 	}
 }
 

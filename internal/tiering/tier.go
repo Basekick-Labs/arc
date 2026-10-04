@@ -112,10 +112,12 @@ type StatusResponse struct {
 	// ReplicationEvents counts the tier metadata updates this node made for
 	// files it did not write itself: files the cluster replication puller
 	// pulled, and local copies the delete workers removed. Dropped counts
-	// reports discarded — a full queue that stayed full, a stop in progress,
-	// or a licence that had lapsed — and should be zero; a non-zero one means
-	// some rows wait for the next tier scan, which costs this node partition
-	// pruning until then. Absent on a node with no cluster replication.
+	// reports discarded — a drainer that stopped making progress for long
+	// enough to hit the queue's memory bound, a shutdown with work still
+	// queued, or a licence that had lapsed — and is zero on a healthy node; a
+	// non-zero one means some rows wait for the next tier scan, which costs
+	// this node partition pruning until then. Absent on a node with no
+	// cluster replication.
 	ReplicationEvents *TierEventCounts `json:"replication_events,omitempty"`
 }
 

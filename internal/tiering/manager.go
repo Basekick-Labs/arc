@@ -69,17 +69,19 @@ type Manager struct {
 	// catch-up burst cannot pile writers onto the single shared SQLite
 	// connection; see internal/tiering/replicated.go for why.
 	//
-	// The channel and the goroutine are created by NewManager, not Start, so
+	// The queue and the goroutine are created by NewManager, not Start, so
 	// the seam is live for the whole life of the manager, and tierEventWG
 	// lets Stop join the drainer before the shared handle can be closed.
-	tierEventCh       chan tierEvent
+	tierEvents        *tierEventQueue
 	tierEventStop     chan struct{}
 	tierEventWG       sync.WaitGroup
 	tierEventStopOnce sync.Once
-	// draining is set once Stop has signalled the drainer: its batches then
-	// take a short deadline and skip the cold-tier existence probe, because
-	// Stop is on the shared shutdown budget.
-	draining atomic.Bool
+	// draining is set once Stop has signalled the drainer: its chunks then
+	// share what is left of tierEventStopDeadline (unix nanos) and start no
+	// cold-tier existence probe, because Stop is on the shared shutdown
+	// budget.
+	draining              atomic.Bool
+	tierEventStopDeadline atomic.Int64
 	// tierEventsProcessed counts events the drainer has finished with,
 	// whatever the outcome — the barrier a test waits on, since an event that
 	// correctly writes nothing moves none of the three counters below.
@@ -185,7 +187,7 @@ func NewManager(cfg *ManagerConfig) (*Manager, error) {
 		clusterGate:   cfg.ClusterGate,
 		manifest:      cfg.Manifest,
 		stopCh:        make(chan struct{}),
-		tierEventCh:   make(chan tierEvent, tierEventQueueSize),
+		tierEvents:    newTierEventQueue(),
 		tierEventStop: make(chan struct{}),
 		logger:        logger,
 	}

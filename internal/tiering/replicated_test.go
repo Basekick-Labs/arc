@@ -48,7 +48,7 @@ func newTierEventManager(t *testing.T, cold *mockBackend, coldEnabled bool) *Man
 		config:        cfg,
 		logger:        logger,
 		stopCh:        make(chan struct{}),
-		tierEventCh:   make(chan tierEvent, tierEventQueueSize),
+		tierEvents:    newTierEventQueue(),
 		tierEventStop: make(chan struct{}),
 	}
 	if cold != nil {
@@ -319,15 +319,22 @@ func TestRecordUnlinkedFile_ColdCheckFailureRetiresTheHotRow(t *testing.T) {
 	}
 }
 
-func TestTierEventQueueDropsWithoutBlocking(t *testing.T) {
+// The queue's cap is a memory bound for a drainer that has stopped making
+// progress, not a throughput knob: at the bound a report is dropped and
+// counted rather than blocking the pull worker that is making it.
+func TestTierEventQueueDropsOnlyAtItsMemoryBoundAndNeverBlocks(t *testing.T) {
+	restore := tierEventQueueMax
+	tierEventQueueMax = 2
+	t.Cleanup(func() { tierEventQueueMax = restore })
+
 	m := &Manager{
 		logger:        zerolog.Nop(),
-		tierEventCh:   make(chan tierEvent, 2),
+		tierEvents:    newTierEventQueue(),
 		tierEventStop: make(chan struct{}),
 	}
 
-	// No drainer running, so the buffer fills and the rest must be dropped
-	// rather than block the pull worker that is reporting.
+	// No drainer running, so the queue reaches its bound and the rest must be
+	// dropped rather than block the pull worker that is reporting.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -343,6 +350,9 @@ func TestTierEventQueueDropsWithoutBlocking(t *testing.T) {
 
 	if _, dropped, _ := m.TierEventStats(); dropped != 48 {
 		t.Fatalf("dropped = %d, want 48", dropped)
+	}
+	if got := m.tierEvents.pending(); got != 2 {
+		t.Fatalf("pending = %d, want the 2 the bound allows", got)
 	}
 }
 
