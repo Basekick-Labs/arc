@@ -572,6 +572,15 @@ caller-supplied JobID.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#912](https://github.com/Basekick-Labs/arc/pull/912).
 
+### Backup and restore preserve the local file-copy fast path ([#791](https://github.com/Basekick-Labs/arc/issues/791))
+
+Temp-file writers now delegate `io.ReaderFrom`, retaining Go's file-copy fast
+path where supported. A destination write probe keeps temp-file failures
+distinguishable from source read failures.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1060](https://github.com/Basekick-Labs/arc/pull/1060).
+
 ### A node that rejoins through a Raft snapshot now removes the replicas the cluster deleted while it was away ([#962](https://github.com/Basekick-Labs/arc/issues/962))
 
 On a per-node-storage cluster every node unlinks its local copy of a file when
