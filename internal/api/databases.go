@@ -601,6 +601,25 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		h.logger.Debug().Str("path", markerPath).Msg("Deleted database marker file")
 	}
 
+	// Everything List, ListStaged and the marker cover is gone now, so a file
+	// still under the prefix is one no listing addresses: a partial whose key
+	// the contract refuses (#772), or OS debris. It keeps the database visible
+	// and nothing else will ever name it, so name it here, once, at a level an
+	// operator sees. Not deleted: a committed object can share this shape.
+	if ul, ok := h.storage.(storage.UnusableLister); ok {
+		if left, err := ul.ListUnusable(ctx, name+"/"); err != nil {
+			h.logger.Warn().Err(err).Str("database", name).Msg("Could not check for unaddressable files left by the dropped database")
+		} else if len(left) > 0 {
+			n := min(len(left), 10)
+			paths := make([]string, 0, n)
+			for _, u := range left[:n] {
+				paths = append(paths, u.Path)
+			}
+			h.logger.Warn().Str("database", name).Int("files", len(left)).Strs("paths", paths).
+				Msg("Dropped database left files no listing addresses; they keep the database visible and must be removed by hand")
+		}
+	}
+
 	// Try to remove the empty database directory
 	// This is a best-effort operation - for local storage, we try to remove the directory
 	// For S3/Azure, directories don't exist as actual objects, so this is a no-op

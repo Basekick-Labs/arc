@@ -607,6 +607,29 @@ implemented.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir)
 for [#1014](https://github.com/Basekick-Labs/arc/issues/1014).
+### ListStaged reported partials its own DeleteStaged refused ([#772](https://github.com/Basekick-Labs/arc/issues/772))
+
+`ListStaged` walked for `*.part` files and reported each stripped key, but
+`DeleteStaged` resolves a key through the validation every backend applies
+(`ValidateKey`), minus the reserved-suffix rule so a legacy `x.part` partial
+stays reclaimable. A partial left behind by an older Arc version can belong to a key
+that is illegal under today's contract, such as one containing a backslash, so
+`ListStaged` reported it and `DeleteStaged` then refused it. Both consumers pipe
+one into the other: the `DROP DATABASE` reclaim of abandoned partials and the
+edge-sync staging sweep each logged a warning for that file on every run and
+never reclaimed it.
+
+`ListStaged` now applies the same validation before reporting an entry, so every
+key it returns is one `DeleteStaged` accepts, and a test pins that round trip.
+A partial with an illegal key is not lost from view: `ListUnusable` already
+reported it and still does; it is simply no longer also reported as reclaimable.
+`DROP DATABASE` now checks `ListUnusable` once it has removed everything it can
+address, and warns with the count and up to ten paths of anything left under the
+database, since those files keep the database visible and nothing else names them.
+A committed object whose real name ends in `.part` remains indistinguishable
+from a partial by name and is out of scope here.
+
+Contributed by [@pujitha24](https://github.com/pujitha24) in [#906](https://github.com/Basekick-Labs/arc/pull/906).
 
 ## Experimental arcx Arrow IPC streams signal writer panics ([#846](https://github.com/Basekick-Labs/arc/issues/846))
 
