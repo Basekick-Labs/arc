@@ -128,6 +128,12 @@ func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.Fi
 
 	conn, err := security.DialContext(ctx, "tcp", peerAddr, dialTimeout, f.TLSConfig)
 	if err != nil {
+		// Defensive normalisation, not load-bearing: both DialContext branches
+		// already return an error that satisfies errors.Is for the context
+		// sentinels (net.canceledError.Is and net.timeoutError.Is on the plain
+		// path, the handshake interrupter's bare ctx.Err() on the TLS one).
+		// This only guarantees the bare sentinel rather than a wrapped net
+		// error, so a reader of the log sees why the dial stopped.
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return 0, fmt.Errorf("dial %s: %w", peerAddr, ctxErr)
 		}

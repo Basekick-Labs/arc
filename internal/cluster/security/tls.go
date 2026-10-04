@@ -142,11 +142,14 @@ func Listen(network, addr string, tlsCfg *tls.Config) (net.Listener, error) {
 
 // Dial connects to addr, wrapping with TLS if tlsCfg is non-nil.
 func Dial(network, addr string, timeout time.Duration, tlsCfg *tls.Config) (net.Conn, error) {
-	if tlsCfg != nil {
-		dialer := &net.Dialer{Timeout: timeout}
-		return tls.DialWithDialer(dialer, network, addr, tlsCfg)
-	}
-	return net.DialTimeout(network, addr, timeout)
+	// Delegates so the two cannot drift. Behaviour-preserving: tls.DialWithDialer
+	// is dial(context.Background(), ...) and net.DialTimeout is
+	// (&net.Dialer{Timeout: t}).DialContext(context.Background(), ...), which is
+	// exactly what DialContext does with a background context.
+	//
+	// Prefer DialContext wherever a context is in scope — a cancelled context
+	// cannot interrupt a stalled dial or TLS handshake through this one.
+	return DialContext(context.Background(), network, addr, timeout, tlsCfg)
 }
 
 // DialContext connects to addr, wrapping with TLS if tlsCfg is non-nil, like

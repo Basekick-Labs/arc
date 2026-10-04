@@ -104,6 +104,15 @@ the cold tier through environment variables or Helm are unaffected. Note the
 general rule this illustrates: an empty environment variable does not blank a
 key that a configuration file sets — give the key the value you want, or remove
 it from the file.
+
+## Peer file fetches ignored cancellation during TCP/TLS connection setup ([#901](https://github.com/Basekick-Labs/arc/issues/901))
+
+A follow-up to the fetch-timeout fix shipped in 26.09.2 ([#899](https://github.com/Basekick-Labs/arc/pull/899)): connection establishment itself was not context-aware. `FetchClient.Fetch` checked `ctx.Err()` and derived a bounded dial timeout, but dialed through `security.Dial`, which wraps `tls.DialWithDialer` for TLS. That performs the TLS handshake against a background context internally, so cancelling the caller's context could not interrupt a peer that accepted the TCP connection, received the ClientHello, and then never responded. The connection-close cancellation hook was also installed only after the dial succeeded, so it offered no protection during dialing. A cancelled fetch could hold its pull worker until the ten-second dial timeout the coordinator hardcodes for peer fetches elapsed, delaying `Puller.Stop`, which cancels and joins its workers.
+
+`FetchClient` now dials through a new `security.DialContext`, which uses `net.Dialer.DialContext` for plain TCP and `tls.Dialer.DialContext` for TLS — the latter threads the context through to the handshake via `tls.Conn.HandshakeContext`, so a cancelled context now interrupts a stalled handshake instead of only being noticed after it. `security.Dial` is unchanged and still used by five other cluster-internal call sites. Three of them — the leave broadcast, the heartbeat send and the seed join — have no context in scope, so there is nothing for them to honour. Two do: the leader-forward dial and the WAL replication receiver's reconnect, where a stalled handshake still holds the caller for its dial timeout and defeats a surrounding shutdown select. Those are the same bug on different paths and are not fixed here.
+
+Contributed by [@pujitha24](https://github.com/pujitha24) in [#902](https://github.com/Basekick-Labs/arc/pull/902).
+
 ## Fixed: the WAL purge no longer infers durability from a file's age ([#1009](https://github.com/Basekick-Labs/arc/issues/1009))
 
 The periodic purge deleted rotated WAL files once their modification time passed a threshold of three times `ingest.max_buffer_age_ms`, taking that age as proof the data had reached Parquet. Whenever a flush took longer than the threshold — a slow or unavailable object store being the obvious way — the only remaining copy of acknowledged writes was deleted before it was durable. PR [#997](https://github.com/Basekick-Labs/arc/pull/997) measured 48,500 records lost this way.
