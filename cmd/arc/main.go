@@ -1770,12 +1770,21 @@ func main() {
 						log.Error().Err(err).Msg("Failed to start cluster coordinator - running in standalone mode")
 						clusterCoordinator = nil
 					} else {
-						shutdownCoordinator.RegisterHook("cluster-coordinator", func(ctx context.Context) error {
-							return clusterCoordinator.Stop()
-							// Stops AFTER the schedulers that ask it whether they may
-							// run (PriorityScheduler), so a tick in flight never finds
-							// the coordinator gone.
-						}, shutdown.PriorityCompaction)
+						// Two steps. The inbound replication stream applies entries
+						// through the ingest handler, so it must be gone before the
+						// Arrow buffer and WAL close (#853); those are components,
+						// every hook runs before any component, and PriorityIngest
+						// puts it with the other ingest paths. The coordinator
+						// itself is a COMPONENT: it owns Raft and must outlive the
+						// arrow-buffer flush and the file-registrar drain, which are
+						// components too (#1014). The schedulers that ask it whether
+						// they may run are hooks at PriorityScheduler, so they have
+						// already quiesced by the time any component runs.
+						shutdownCoordinator.RegisterHook("cluster-replication-receiver", func(context.Context) error {
+							clusterCoordinator.StopReplicationReceiver()
+							return nil
+						}, shutdown.PriorityIngest)
+						registerClusterCoordinatorShutdown(shutdownCoordinator, clusterCoordinator.Stop)
 
 						localNode := clusterCoordinator.GetLocalNode()
 						capabilities := localNode.GetCapabilities()
@@ -1899,17 +1908,17 @@ func main() {
 						//
 						// OSS deployments never reach this block (no coordinator).
 						//
-						// Shutdown ordering (lower priority runs first, see shutdown.go):
-						//   HTTPServer (10)  — stop accepting client requests
-						//   Ingest     (20)  — drain ingest/flush
-						//   Buffer     (30)  — file-registrar drains queue into Raft
-						//   Compaction (50)  — cluster-coordinator stops:
-						//                        puller.Stop()  (first)
-						//                        raftNode.Stop()  (second)
+						// Shutdown ordering, all COMPONENTS (hooks run before any
+						// component, so a hook here would stop before the buffer
+						// flushed — that was #1014):
+						//   arrow-buffer        (30) — final flush, enqueues each file
+						//   file-registrar      (31) — drains the queue into Raft
+						//   wal-purge           (35) — removes the WAL those files cover
+						//   cluster-coordinator (50) — puller.Stop(), then raftNode.Stop()
 						//
-						// This sequence ensures final file announcements land in Raft
-						// while Raft is still alive, and pending peer pulls are
-						// cancelled promptly when Raft is about to go away.
+						// Raft outlives the final flush, so the last files land in
+						// the manifest; registerClusterCoordinatorShutdown and
+						// registerFileRegistrarShutdown pin the two ends.
 						fileRegistrar := cluster.NewCoordinatorFileRegistrar(clusterCoordinator, logger.Get("file-registrar"))
 						fileRegistrar.Start(context.Background())
 						arrowBuffer.SetFileRegistrar(fileRegistrar)
@@ -1931,9 +1940,11 @@ func main() {
 						// construct the watcher and schedulers on every node but only
 						// start them when the node holds the compactor lease.
 						//
-						// Shutdown ordering: watcher stops at PriorityCompaction - 1
-						// so it drains any pending manifests BEFORE the coordinator
-						// tears down Raft.
+						// Shutdown ordering: the watcher is a hook, and the
+						// coordinator that owns Raft is a component, so the watcher
+						// drains any pending manifests BEFORE Raft goes away
+						// whatever its priority; PriorityCompaction - 1 keeps it
+						// after the schedulers that feed it.
 						if completionDir != "" && cfg.Compaction.Enabled {
 							bridge := cluster.NewCompactionBridge(clusterCoordinator)
 							pollInterval := time.Duration(cfg.Compaction.CompletionWatcherIntervalMS) * time.Millisecond
@@ -3869,19 +3880,16 @@ func main() {
 					}
 				} else {
 					// The startup tier scan runs in the background below, and
-					// it writes through the same SQLite handle this hook may
-					// close. Its context and completion channel are created
-					// here so the hook can cancel and join it FIRST — relying
-					// on a second hook for that would depend on registration
-					// order, and getting it wrong means a scan writing into a
-					// closed database, one logged warning per file. The
-					// channel is closed on every path that does not start the
-					// scan, so the join below never waits for a goroutine that
-					// will not run.
-					// scanDone is closed on every path, including the one
-					// that never starts the scan — a defer would not do, it
-					// being function-scoped to main and so running only after
-					// the hook had already blocked on it.
+					// it writes through the same SQLite handle the shutdown
+					// step may close. Its context and completion channel are
+					// created here so that step can cancel and join it FIRST —
+					// relying on a separate step for that would depend on
+					// registration order, and getting it wrong means a scan
+					// writing into a closed database, one logged warning per
+					// file. scanDone is closed on every path, including the
+					// one that never starts the scan — a defer would not do,
+					// it being function-scoped to main and so running only
+					// after the shutdown step had already blocked on it.
 					scanCtx, cancelScan := context.WithTimeout(context.Background(), 30*time.Minute)
 					scanDone := make(chan struct{})
 
@@ -3892,13 +3900,17 @@ func main() {
 					// Stop, or that goroutine outlives the SQLite handle this
 					// block closes below.
 					//
-					// Same priority as the "cluster-coordinator" hook and
-					// registered after it; sortHooksByPriority is stable, so
-					// the coordinator's delete drain runs while the drainer
-					// is still alive to apply what it reports. Nothing else
-					// enforces that order — keep this block below the cluster
-					// block.
-					shutdownCoordinator.RegisterHook("tiering", func(ctx context.Context) error {
+					// A component at the same priority as cluster-coordinator
+					// and registered after it; sortComponentsByPriority is
+					// stable, so the coordinator's delete drain runs while the
+					// drainer is still alive to apply what it reports. Nothing
+					// else enforces that order — keep this block below the
+					// cluster block. A component rather than a hook because
+					// the arrow-buffer flush is a component, and its final
+					// files are recorded through this manager's SQLite handle:
+					// as a hook this ran first and, where the handle is owned
+					// (auth disabled), closed it under those writes.
+					registerTieringShutdown(shutdownCoordinator, func() error {
 						cancelScan()
 						<-scanDone
 						stopErr := tieringManager.Stop()
@@ -3911,7 +3923,7 @@ func main() {
 							}
 						}
 						return stopErr
-					}, shutdown.PriorityCompaction)
+					})
 
 					// Let the cluster layer keep this node's tier rows in step
 					// with its own disk: the replication puller reports what it
@@ -4480,13 +4492,32 @@ type shutdownFunc func() error
 
 func (f shutdownFunc) Close() error { return f() }
 
-// The registrar must stop after ArrowBuffer finishes its final writes, but
-// before WAL cleanup and the cluster coordinator stop.
+// The registrar must stop after ArrowBuffer finishes its final writes
+// (PriorityBuffer), but before WAL cleanup and the cluster coordinator stop.
 func registerFileRegistrarShutdown(coordinator *shutdown.Coordinator, stop func()) {
 	coordinator.Register("file-registrar", shutdownFunc(func() error {
 		stop()
 		return nil
 	}), shutdown.PriorityBuffer+1)
+}
+
+// The cluster coordinator owns Raft. It must stop after the file registrar
+// has drained (so the final flush's files land in the manifest) and after the
+// tick-driven schedulers that ask it whether they may run — those are hooks
+// at PriorityScheduler and so already stopped. Registered as a component for
+// the first reason: every hook runs before any component, so a hook here
+// would have stopped Raft before the buffer flushed (#1014).
+func registerClusterCoordinatorShutdown(coordinator *shutdown.Coordinator, stop func() error) {
+	coordinator.Register("cluster-coordinator", shutdownFunc(stop), shutdown.PriorityCompaction)
+}
+
+// Tiering stops at the same priority as the cluster coordinator and must be
+// registered AFTER it: the coordinator's delete drain reports unlinks the
+// tiering drainer applies, and sortComponentsByPriority is stable. Also a
+// component because the final arrow-buffer flush records its files through
+// tiering's SQLite handle, which this step closes when it owns it.
+func registerTieringShutdown(coordinator *shutdown.Coordinator, stop func() error) {
+	coordinator.Register("tiering", shutdownFunc(stop), shutdown.PriorityCompaction)
 }
 
 // tieringManifestAdapter implements tiering.ManifestCoordinator over the
