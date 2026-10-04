@@ -871,12 +871,18 @@ Enforcement remains boot-time: nothing re-applies it after periodic re-validatio
 
 **For clustered Enterprise deployments, this changes core accounting.** Nodes report `GOMAXPROCS` as their core count in the join payload, and the cluster sums those to check the licence. A node in a 2-CPU pod on a 64-core host with a 4-core licence previously reported 4 — the raised value — and now reports 2, so twice as many such nodes fit one licence. Each node genuinely has 2 usable cores, so 2 x 2 = 4 is the licence being counted accurately rather than evaded, but the number of nodes that can join may change.
 
-### Quota-derived compaction threads account for concurrent jobs ([#1037](https://github.com/Basekick-Labs/arc/issues/1037))
+### Automatic compaction threads account for concurrent jobs ([#1037](https://github.com/Basekick-Labs/arc/issues/1037))
 
-When `compaction.threads` is left at its automatic default under a CPU quota,
-its value now accounts for `compaction.max_concurrent` and the main process.
-The existing automatic value on hosts without a CPU quota and explicit thread
-settings are unchanged.
+When `compaction.threads` is left at its automatic default, it now divides the
+available process CPUs by `max(2, compaction.max_concurrent)`. This preserves
+the previous default at `max_concurrent=2` and only reduces each subprocess's
+thread cap when concurrency is raised. Available CPUs include the process's
+effective runtime limit (quota, cpuset, or configured `GOMAXPROCS`); this is not
+a claim that Arc can identify which mechanism imposed the limit. Explicit
+thread settings remain unchanged. Higher concurrency can therefore reduce
+per-subprocess throughput compared with the previous half-core setting; no
+workload benchmark is claimed for this change. The divisor covers compaction
+subprocesses, not the main process, which can still compete for CPU.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1041](https://github.com/Basekick-Labs/arc/pull/1041).
 

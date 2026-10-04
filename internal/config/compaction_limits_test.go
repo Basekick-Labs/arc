@@ -2,7 +2,6 @@ package config
 
 import (
 	"fmt"
-	"runtime"
 	"testing"
 
 	"github.com/basekick-labs/arc/internal/sysmem"
@@ -82,94 +81,69 @@ func TestGetDefaultCompactionThreads_UsesEffectiveCores(t *testing.T) {
 	original := effectiveCoresFn
 	defer func() { effectiveCoresFn = original }()
 
-	machineCores := runtime.NumCPU()
-	for _, c := range []struct{ cores, want int }{
-		{2, 1},                                 // default concurrency and a 2-CPU quota still derive one thread
-		{machineCores, max(1, machineCores/2)}, // no quota preserves the old default
+	for _, c := range []struct {
+		cores, maxConcurrent, want int
+	}{
+		{8, 2, 4},  // the default stays byte-for-byte equivalent to the prior half-core value
+		{16, 4, 4}, // elevated concurrency divides available cores; the old quota formula returns 3
+		{8, 4, 2},  // a constrained process uses the same concurrency rule
+		{8, 0, 4},  // non-positive values retain NewManager's default of two
 	} {
-		effectiveCoresFn = func() int { return c.cores }
-		if got := getDefaultCompactionThreads(2); got != c.want {
-			t.Errorf("with %d effective cores: getDefaultCompactionThreads() = %d, want %d", c.cores, got, c.want)
-		}
+		t.Run(fmt.Sprintf("cores_%d_concurrent_%d", c.cores, c.maxConcurrent), func(t *testing.T) {
+			effectiveCoresFn = func() int { return c.cores }
+			if got := getDefaultCompactionThreads(c.maxConcurrent); got != c.want {
+				t.Errorf("with %d effective cores and max_concurrent=%d: got %d, want %d", c.cores, c.maxConcurrent, got, c.want)
+			}
+		})
 	}
-
-	// The pre-#1030 behaviour, so a revert cannot pass: with a 2-core quota on a
-	// host of more than 8 cores the old NumCPU()/2 answer is a different number.
-	if runtime.NumCPU() > 8 {
-		effectiveCoresFn = func() int { return 2 }
-		if got, hostDerived := getDefaultCompactionThreads(2), runtime.NumCPU()/2; got == hostDerived {
-			t.Errorf("getDefaultCompactionThreads() = %d with a 2-core quota, which equals the host-derived %d: the quota is not being read", got, hostDerived)
-		}
+	if got := defaultCompactionThreads(16, 4); got == 16/5 {
+		t.Errorf("raised-concurrency result %d matches the old max_concurrent+1 divisor result", got)
 	}
 }
 
-// TestLoad_CompactionThreadsResolvesFromEffectiveCores pins the same thing one
-// level up, through Load(), which is where the 0 sentinel is actually resolved
-// and where everything downstream (main.go wiring, the compaction manager, the
-// subprocess SET) reads it from.
+// TestLoad_CompactionThreadsResolvesFromEffectiveCores pins Load's wiring with
+// fixed injected core counts; it runs deterministically on low-core CI too.
 func TestLoad_CompactionThreadsResolvesFromEffectiveCores(t *testing.T) {
 	original := effectiveCoresFn
 	defer func() { effectiveCoresFn = original }()
-
-	// t.Chdir rather than os.Chdir + defer: cleanup-ordered, and it fails loudly
-	// if this test is ever made parallel.
 	t.Chdir(t.TempDir())
 
-	for _, c := range []struct{ cores, want int }{{2, 1}, {16, 8}} {
-		effectiveCoresFn = func() int { return c.cores }
-		cfg, err := Load()
-		if err != nil {
-			t.Fatalf("Load() error = %v", err)
-		}
-		want := c.want
-		if c.cores < runtime.NumCPU() {
-			want = max(1, c.cores/3) // two concurrent subprocesses plus the main process
-		}
-		if cfg.Compaction.Threads != want {
-			t.Errorf("with %d effective cores: Compaction.Threads = %d, want %d", c.cores, cfg.Compaction.Threads, want)
-		}
+	for _, c := range []struct {
+		cores, maxConcurrent, want int
+	}{
+		{8, 2, 4},
+		{16, 4, 4},
+	} {
+		t.Run(fmt.Sprintf("cores_%d_concurrent_%d", c.cores, c.maxConcurrent), func(t *testing.T) {
+			effectiveCoresFn = func() int { return c.cores }
+			t.Setenv("ARC_COMPACTION_MAX_CONCURRENT", fmt.Sprint(c.maxConcurrent))
+			t.Setenv("ARC_COMPACTION_THREADS", "0")
+			t.Chdir(t.TempDir())
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Compaction.Threads != c.want {
+				t.Errorf("with %d effective cores and max_concurrent=%d: Compaction.Threads = %d, want %d", c.cores, c.maxConcurrent, cfg.Compaction.Threads, c.want)
+			}
+		})
 	}
 }
 
-func TestLoad_CompactionThreadsUseMaxConcurrentUnderQuota(t *testing.T) {
-	if runtime.NumCPU() <= 8 {
-		t.Skip("test needs a host with more than 8 CPUs to distinguish quota-derived threads")
-	}
-
-	original := effectiveCoresFn
-	defer func() { effectiveCoresFn = original }()
-	effectiveCoresFn = func() int { return 8 }
-	t.Setenv("ARC_COMPACTION_MAX_CONCURRENT", "4")
-	t.Chdir(t.TempDir())
-
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if cfg.Compaction.Threads != 1 {
-		t.Errorf("Compaction.Threads = %d, want 1 for 8 effective cores and 4 concurrent jobs under quota", cfg.Compaction.Threads)
-	}
-}
-
-// TestLoad_ExplicitCompactionThreadsSurvives pins that the sentinel resolution
-// only fills the UNSET value — an operator who wrote a number keeps it,
-// quota or no quota.
 func TestLoad_ExplicitCompactionThreadsSurvives(t *testing.T) {
 	original := effectiveCoresFn
 	defer func() { effectiveCoresFn = original }()
 	effectiveCoresFn = func() int { return 2 }
-
-	// t.Chdir rather than os.Chdir + defer: cleanup-ordered, and it fails loudly
-	// if this test is ever made parallel.
+	t.Setenv("ARC_COMPACTION_THREADS", "6")
 	t.Chdir(t.TempDir())
 
-	t.Setenv("ARC_COMPACTION_THREADS", "6")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
 	if cfg.Compaction.Threads != 6 {
-		t.Errorf("Compaction.Threads = %d, want 6 (explicit value, not the 2-core quota default)", cfg.Compaction.Threads)
+		t.Errorf("Compaction.Threads = %d, want 6 (explicit values are not rewritten)", cfg.Compaction.Threads)
 	}
 }
 

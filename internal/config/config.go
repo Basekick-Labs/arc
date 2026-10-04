@@ -2361,10 +2361,9 @@ func deriveCompactionMemoryLimit(dbLimit string, maxConcurrent int) string {
 	return strconv.FormatFloat(derived, 'f', -1, 64) + m[2]
 }
 
-// getDefaultCompactionThreads is the auto value for compaction.threads: half
-// the CPUs this process may use without a quota, minimum 1. With the default
-// max_concurrent of 2 and no quota, the two subprocesses together use about one
-// process's worth of cores.
+// getDefaultCompactionThreads is the auto value for compaction.threads. It
+// derives from the CPUs this process may use and the maximum number of
+// concurrent subprocesses, with a minimum of one thread per subprocess.
 //
 // Derived from EffectiveCores, not runtime.NumCPU: each compaction job is a
 // separate process in the SAME cgroup, so a 2-CPU pod on a 64-core host ran
@@ -2380,21 +2379,21 @@ func deriveCompactionMemoryLimit(dbLimit string, maxConcurrent int) string {
 // the failing range exactly where this issue was reported. Where a container
 // caps CPU but not memory this default now costs throughput; set the key.
 //
-// Without a quota, preserve the existing half-core default to avoid changing
-// throughput on bare-metal hosts. With a quota, divide the available cores by
-// all concurrent compaction subprocesses plus the main process (#1037).
+// Two concurrent jobs is the default and keeps the existing half-core
+// per-subprocess behavior. Above that default, divide available cores across
+// the concurrent subprocesses so raising max_concurrent does not multiply the
+// aggregate DuckDB thread count (#1037). This is based on effective available
+// cores, not an attempt to distinguish CPU quotas from cpusets or an operator's
+// GOMAXPROCS setting.
 func getDefaultCompactionThreads(maxConcurrent int) int {
-	return defaultCompactionThreads(effectiveCoresFn(), runtime.NumCPU(), maxConcurrent)
+	return defaultCompactionThreads(effectiveCoresFn(), maxConcurrent)
 }
 
-func defaultCompactionThreads(cores, machineCores, maxConcurrent int) int {
-	divisor := 2
-	if cores < machineCores {
-		if maxConcurrent <= 0 {
-			maxConcurrent = 2
-		}
-		divisor = maxConcurrent + 1
+func defaultCompactionThreads(cores, maxConcurrent int) int {
+	if maxConcurrent <= 0 {
+		maxConcurrent = 2
 	}
+	divisor := max(2, maxConcurrent)
 	threads := cores / divisor
 	if threads < 1 {
 		threads = 1

@@ -121,30 +121,29 @@ default_sort_keys = ""
 enabled = true
 
 # DuckDB thread count for EACH compaction subprocess.
-# Default: unset (0) = half of the CPUs this process may use without a CPU
-# quota; with a quota, divide by compaction.max_concurrent + 1 (main process),
-# minimum 1. The no-quota default is unchanged.
+# Default: unset (0) = CPUs this process may use divided by
+# max(2, compaction.max_concurrent), minimum 1. The default concurrency of 2
+# keeps the existing half-core value; higher concurrency divides threads among
+# the subprocesses. Explicit values are unchanged by this automatic default.
 # Environment override: ARC_COMPACTION_THREADS=4
 #
-# "CPUs this process may use" is min(runtime.NumCPU(), runtime.GOMAXPROCS(0)):
-# Go derives GOMAXPROCS from the container's CPU quota (cpu.max, or
-# cpu.cfs_quota_us on cgroup v1), while NumCPU catches cpuset limits that no
-# quota expresses. Before 26.09.3 this was half the HOST's core count, so a
-# 2-CPU pod on a 64-core node ran every compaction job with 32 threads (#1030).
+# Available CPUs are min(runtime.NumCPU(), runtime.GOMAXPROCS(0)); this reflects
+# what the process can use, whether that comes from a quota, cpuset, or an
+# explicit GOMAXPROCS setting. Before 26.09.3 this was half the HOST's core
+# count, so a 2-CPU pod on a 64-core node ran every compaction job with 32
+# threads (#1030).
 #
-# Without a quota, the default remains half the available cores. With a quota,
-# the concurrent subprocesses and main process share the effective-core budget.
+# Example: 16 available CPUs and max_concurrent=4 gives 4 threads per
+# subprocess (16 / 4). At the default max_concurrent=2, it remains 8 (16 / 2).
+# This divides the subprocess thread budget; it does not reserve CPU for the
+# main process, and the main process can still compete with compaction.
 #
-# Thread counts are caps on parallelism, not reservations.
+# Thread counts are caps on parallelism, not reservations. At least one thread
+# is used even when available CPUs are fewer than concurrent subprocesses.
 #
-# Three things that change the derived value, all deliberate:
-#   - GOMAXPROCS set ABOVE the quota is honoured, up to the machine's core count.
-#   - GODEBUG=containermaxprocs=0 turns the runtime's cgroup read off entirely,
-#     giving the pre-26.09.3 host-derived behaviour.
-#   - the runtime floors GOMAXPROCS at 2, so --cpus=0.5 still yields 1 thread.
-#
-# Not licence-capped: this is resolved before the licence is applied, and a
-# subprocess is a separate process. Set it by hand on a core-limited licence.
+# Positive thread values are also lowered by license enforcement when they
+# exceed its per-process/effective-core cap (#1036); that cap does not divide
+# the license budget across the main process and all subprocesses.
 # threads = 4
 
 # Maximum wall-clock budget for ONE scheduled or manual compaction cycle.

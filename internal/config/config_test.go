@@ -76,23 +76,23 @@ func TestEffectiveCores_MatchesRuntime(t *testing.T) {
 
 func TestDefaultCompactionThreads(t *testing.T) {
 	cases := []struct {
-		name                               string
-		cores, machineCores, maxConcurrent int
-		want                               int
+		name                 string
+		cores, maxConcurrent int
+		want                 int
 	}{
-		{"no quota keeps existing default", 8, 8, 4, 4},
-		{"no quota keeps existing default at default concurrency", 8, 8, 2, 4},
-		{"two-core quota at default concurrency", 2, 64, 2, 1},
-		{"quota accounts for concurrent jobs and main process", 8, 64, 2, 2},
-		{"quota accounts for raised concurrency", 8, 64, 4, 1},
-		{"zero concurrency uses default", 8, 64, 0, 2},
-		{"minimum one thread", 1, 64, 8, 1},
-		{"zero cores", 0, 64, 2, 1},
+		{"default concurrency keeps half-core behavior", 8, 2, 4},
+		{"two-core limit at default concurrency", 2, 2, 1},
+		{"raised concurrency divides available cores", 16, 4, 4},
+		{"raised concurrency on constrained process", 8, 4, 2},
+		{"zero concurrency uses default", 8, 0, 4},
+		{"negative concurrency uses default", 8, -1, 4},
+		{"minimum one thread", 1, 8, 1},
+		{"zero cores", 0, 2, 1},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := defaultCompactionThreads(c.cores, c.machineCores, c.maxConcurrent); got != c.want {
-				t.Errorf("defaultCompactionThreads(%d, %d, %d) = %d, want %d", c.cores, c.machineCores, c.maxConcurrent, got, c.want)
+			if got := defaultCompactionThreads(c.cores, c.maxConcurrent); got != c.want {
+				t.Errorf("defaultCompactionThreads(%d, %d) = %d, want %d", c.cores, c.maxConcurrent, got, c.want)
 			}
 		})
 	}
