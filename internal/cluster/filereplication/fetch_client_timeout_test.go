@@ -3,7 +3,9 @@ package filereplication
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -178,5 +180,108 @@ func TestFetchClientCancellationStalledPeer(t *testing.T) {
 				t.Fatal("fetch did not stop promptly after cancellation")
 			}
 		})
+	}
+}
+
+// startTLSHandshakeStallPeer accepts a single TCP connection, reads the
+// TLS ClientHello record header, and then stalls without responding —
+// simulating a peer that never completes the TLS handshake.
+func startTLSHandshakeStallPeer(t *testing.T) (string, <-chan struct{}) {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reached := make(chan struct{})
+	finished := make(chan struct{})
+	stop := make(chan struct{})
+
+	go func() {
+		defer close(finished)
+
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		buf := make([]byte, 5) // TLS record header: type + version + length
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return
+		}
+
+		close(reached)
+		select {
+		case <-stop:
+		case <-time.After(1500 * time.Millisecond):
+		}
+	}()
+
+	t.Cleanup(func() {
+		close(stop)
+		_ = listener.Close()
+		<-finished
+	})
+
+	return listener.Addr().String(), reached
+}
+
+// TestFetchClientCancellationDuringTLSHandshake reproduces the scenario from
+// the fetch-cancellation report: a peer accepts the TCP connection and
+// receives the ClientHello but never completes the handshake. Before
+// security.DialContext, the dial path used tls.DialWithDialer, which
+// performs the handshake against a background context — cancelling ctx
+// could not interrupt it. Fetch must now return promptly with an error
+// matching context.Canceled.
+func TestFetchClientCancellationDuringTLSHandshake(t *testing.T) {
+	addr, reached := startTLSHandshakeStallPeer(t)
+
+	fc, err := NewFetchClient(FetchClient{
+		SelfNodeID:   "reader-1",
+		ClusterName:  "test-cluster",
+		SharedSecret: "test-secret",
+		DialTimeout:  2 * time.Second,
+		TLSConfig:    &tls.Config{InsecureSkipVerify: true},
+	})
+	if err != nil {
+		t.Fatalf("NewFetchClient: %v", err)
+	}
+
+	entry := &raft.FileEntry{
+		Path:      "db/cpu/2026/09/17/09/file.parquet",
+		SizeBytes: 4,
+		SHA256:    sha256Hex([]byte("data")),
+	}
+
+	// No deadline: cancellation alone must unblock the stalled handshake.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	result := make(chan error, 1)
+	go func() {
+		var dst bytes.Buffer
+		_, err := fc.Fetch(ctx, addr, entry, &dst, 0, nil)
+		result <- err
+	}()
+
+	select {
+	case <-reached:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("peer never received the TLS ClientHello")
+	}
+
+	cancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context cancellation, got: %v", err)
+		}
+	case <-time.After(750 * time.Millisecond):
+		t.Fatal("fetch did not stop promptly after cancellation during TLS handshake")
 	}
 }
