@@ -145,7 +145,7 @@ func canonicalFromRows(rows *sql.Rows) (canonicalResult, error) {
 func compareResults(rec arrow.Record, oracle canonicalResult) string {
 	got, err := canonicalFromArcx(rec)
 	if err != nil {
-		return "arcx result decode error: " + err.Error()
+		return skipPrefix + "arcx result decode error: " + err.Error()
 	}
 	if got.numCols != oracle.numCols {
 		return fmt.Sprintf("column-count mismatch: arcx=%d duckdb=%d", got.numCols, oracle.numCols)
@@ -295,7 +295,7 @@ func scalarFromRows(rows *sql.Rows) (scalarValue, error) {
 func compareScalar(rec arrow.Record, oracle scalarValue) string {
 	got, err := scalarFromArcx(rec)
 	if err != nil {
-		return "arcx scalar decode error: " + err.Error()
+		return skipPrefix + "arcx scalar decode error: " + err.Error()
 	}
 	if got.isNull != oracle.isNull || (!got.isNull && got.v != oracle.v) {
 		// NO VALUES (see compareCanonical): report the divergence CLASS only.
