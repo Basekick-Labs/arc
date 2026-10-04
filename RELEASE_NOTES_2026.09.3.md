@@ -569,6 +569,36 @@ checks every field.
 
 Contributed by [@0utsights](https://github.com/0utsights) in [#871](https://github.com/Basekick-Labs/arc/pull/871).
 
+### Graceful shutdown registers final Parquet files in the cluster manifest ([#1014](https://github.com/Basekick-Labs/arc/issues/1014))
+
+On a cluster node, the files written by the final Arrow buffer flush during a
+graceful shutdown never reached the cluster manifest. The shutdown sequence
+runs every hook before any component, and the cluster coordinator — which owns
+Raft — was a hook, so Raft was gone before the buffer flushed; the registrar
+that announces files then had nothing to apply to, and the files existed only
+on that node's disk, invisible to peers and to replication.
+
+Raft now outlives the final flush: the cluster coordinator and tiering stop as
+shutdown components, after the Arrow buffer, the file registrar and WAL cleanup,
+in that order. The registrar drains what the final flush queued as batched
+Raft entries — sized to fit the peer protocol frame when a non-leader forwards
+them, retried through a leader election — lets an apply in flight finish
+instead of cancelling it, and reports at `Warn` with a count if any
+registration was not confirmed. A manifest apply that fails at any time is now
+a rate-limited `Warn` rather than `Debug`: nothing re-registers such a file,
+and where the storage reconciliation sweep is enabled a file with no manifest
+entry is an orphan-storage delete candidate once past its grace window. The
+inbound replication receiver still stops before the buffers close, from its
+own hook, and cannot be re-attached while the node shuts down. Tiering's
+SQLite handle, where the node owns it, is no longer closed under the final
+flush's tier registrations.
+
+Queue-full warnings also no longer promise anti-entropy recovery that is not
+implemented.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir)
+for [#1014](https://github.com/Basekick-Labs/arc/issues/1014).
+
 ## Experimental arcx Arrow IPC streams signal writer panics ([#846](https://github.com/Basekick-Labs/arc/issues/846))
 
 When the experimental arcx Arrow IPC stream writer panics, the response now

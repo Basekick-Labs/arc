@@ -119,6 +119,11 @@ type Coordinator struct {
 	// WAL Replication (Phase 3.3)
 	replicationSender   *replication.Sender   // Writer only: sends entries to readers
 	replicationReceiver *replication.Receiver // Reader only: receives entries from writer
+	// replicationReceiverStopped is set by StopReplicationReceiver, which
+	// runs from a shutdown hook without cancelling ctx; the retarget loop
+	// checks it so it cannot start a fresh receiver into buffers that are
+	// closing (#853).
+	replicationReceiverStopped bool
 	// replicationRetarget pokes replicationTargetLoop to re-evaluate which
 	// writer this node should stream from. Depth 1: a poke while one is
 	// already pending is dropped, because the pending evaluation will read
@@ -880,6 +885,10 @@ func (c *Coordinator) Stop() error {
 	// the ingest handler, and its goroutines were previously left running on
 	// the shared context alone, so a receiver still draining could write into
 	// a WAL and an Arrow buffer that shutdown was already closing (#853).
+	// In cmd/arc the receiver is normally already stopped by then — Stop runs
+	// as a shutdown component, after the Arrow buffer and WAL have closed, so
+	// main.go stops the receiver from a hook first (StopReplicationReceiver);
+	// this call then finds it stopped and only takes the sender down.
 	c.stopReplicationSubsystems(replicationSender, replicationReceiver)
 
 	if raftNode != nil {
@@ -898,13 +907,13 @@ func (c *Coordinator) Stop() error {
 	// pending and exit. Bounded, so a disk that hangs cannot hang shutdown.
 	//
 	// The tier recorder is deliberately left wired across this drain. The
-	// tiering manager registers its own shutdown hook after this one and
-	// equal-priority hooks run in registration order, so its drainer is still
-	// alive here and still applies what the drain reports — which is the
-	// point, those unlinks are real. Clearing the recorder first would throw
-	// that work away on every graceful shutdown; a report that does arrive
-	// after the tiering hook has run merely sits in a buffer nobody drains,
-	// which costs nothing.
+	// tiering manager registers its own shutdown step after this one at the
+	// same priority and equal-priority steps run in registration order, so
+	// its drainer is still alive here and still applies what the drain
+	// reports — which is the point, those unlinks are real. Clearing the
+	// recorder first would throw that work away on every graceful shutdown;
+	// a report that does arrive after the tiering step has run merely sits
+	// in a buffer nobody drains, which costs nothing.
 	if deleteStop != nil {
 		c.stopDeleteWorkers(deleteStop, deleteWg)
 	}
@@ -4767,12 +4776,15 @@ func (c *Coordinator) reevaluateReplicationTarget(ctx context.Context) {
 	// this pointer comparison — neither Stop() nor StopReplication() ever
 	// writes c.replicationReceiver (stopReplicationSubsystems says so
 	// explicitly: "The fields are deliberately NOT cleared"), so the comparison
-	// cannot fail. It is that both shutdown paths call c.cancel() while holding
-	// c.mu. By the time we hold it, a shutdown that started has already
-	// cancelled c.ctx, so the receiver we create below is born with a cancelled
-	// context and its connectionLoop returns on its first select. The
+	// cannot fail. It is that Stop() and StopReplication() call c.cancel()
+	// while holding c.mu, so by the time we hold it a shutdown that started
+	// has already cancelled c.ctx and the receiver created below would be
+	// born cancelled; and that StopReplicationReceiver — the shutdown hook
+	// that stops the receiver WITHOUT cancelling ctx, because the coordinator
+	// must keep serving manifest applies after it — sets
+	// replicationReceiverStopped under c.mu, which is checked here. The
 	// comparison stays as a cheap assertion of the single-owner invariant.
-	if c.replicationReceiver != current {
+	if c.replicationReceiverStopped || c.replicationReceiver != current {
 		return
 	}
 	c.replicationReceiver = nil
@@ -4944,6 +4956,22 @@ func (c *Coordinator) StopReplication() {
 	c.stopReplicationSubsystems(sender, receiver)
 }
 
+// StopReplicationReceiver stops the inbound WAL replication stream and
+// nothing else: no sender, no Raft, and the coordinator context stays live
+// so manifest applies still go through. On a reader the receiver applies
+// entries through the ingest handler, so it must be gone before the Arrow
+// buffer and WAL close (#853); the coordinator as a whole must outlive them,
+// so the final flush can still be registered in the manifest (#1014). The
+// shutdown sequence in cmd/arc calls this from a hook and Stop later as a
+// component; Stop finds the receiver already stopped.
+func (c *Coordinator) StopReplicationReceiver() {
+	c.mu.Lock()
+	c.replicationReceiverStopped = true
+	receiver := c.replicationReceiver
+	c.mu.Unlock()
+	c.stopReplicationReceiver(receiver)
+}
+
 // stopReplicationSubsystems stops the sender and receiver without holding
 // c.mu. The fields are deliberately NOT cleared: the WAL replication hook
 // closes over the coordinator and calls Replicate for every appended entry,
@@ -4960,6 +4988,12 @@ func (c *Coordinator) stopReplicationSubsystems(sender *replication.Sender, rece
 			c.logger.Error().Err(err).Msg("Error stopping replication sender")
 		}
 	}
+	c.stopReplicationReceiver(receiver)
+}
+
+// stopReplicationReceiver joins the receiver, bounded. Idempotent: a stopped
+// receiver returns from Stop at once.
+func (c *Coordinator) stopReplicationReceiver(receiver *replication.Receiver) {
 	if receiver == nil {
 		return
 	}
