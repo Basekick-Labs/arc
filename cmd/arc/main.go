@@ -4016,6 +4016,9 @@ func main() {
 
 	// Register Tiering API handlers (always register, handlers check if manager is nil)
 	if tieringManager != nil {
+		if retentionHandler != nil {
+			retentionHandler.SetTieringManager(tieringManager)
+		}
 		tieringHandler := api.NewTieringHandler(tieringManager, authManager, licenseClient, logger.Get("tiering-api"))
 		tieringHandler.RegisterRoutes(server.GetApp())
 

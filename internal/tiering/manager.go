@@ -583,6 +583,32 @@ func (m *Manager) DeleteFile(ctx context.Context, path string) error {
 	return m.metadata.DeleteFile(ctx, path)
 }
 
+// GetColdFilesForRetention returns cold-tier metadata candidates whose
+// partition is older than the supplied cutoff. Retention still reads the
+// Parquet footer before deleting, so partition age is only a discovery index,
+// not the retention decision itself.
+func (m *Manager) GetColdFilesForRetention(ctx context.Context, database, measurement string, cutoff time.Time) ([]FileMetadata, error) {
+	age := time.Since(cutoff)
+	if age < 0 {
+		age = 0
+	}
+	files, err := m.metadata.GetFilesOlderThan(ctx, TierCold, age)
+	if err != nil {
+		return nil, err
+	}
+	filtered := files[:0]
+	for _, file := range files {
+		if file.Database != database {
+			continue
+		}
+		if measurement != "" && file.Measurement != measurement {
+			continue
+		}
+		filtered = append(filtered, file)
+	}
+	return filtered, nil
+}
+
 // GetStatus returns the current tiering status
 func (m *Manager) GetStatus(ctx context.Context) (*StatusResponse, error) {
 	status := &StatusResponse{
