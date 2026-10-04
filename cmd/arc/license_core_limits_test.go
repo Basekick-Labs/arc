@@ -73,32 +73,36 @@ func TestApplyLicenseCoreLimits_UnlimitedIsNoOp(t *testing.T) {
 	}
 }
 
-func TestApplyLicenseCoreLimits_CompactionThreadsUseLicensedShare(t *testing.T) {
+func TestApplyLicenseCoreLimits_CompactionThreadsOnlyDecrease(t *testing.T) {
 	cases := []struct {
 		name          string
+		machineCores  int
+		effective     int
 		licensedCores int
-		maxConcurrent int
 		threads       int
 		want          int
 	}{
-		{"default concurrency", 4, 0, 32, 1},
-		{"configured concurrency", 8, 4, 32, 1},
-		{"minimum one thread", 2, 4, 32, 1},
-		{"preserve lower explicit value", 8, 1, 2, 2},
-		{"preserve value below licensed share", 64, 2, 8, 8},
+		{"license caps each subprocess", 64, 64, 4, 32, 4},
+		{"CPU availability also caps threads", 64, 2, 64, 32, 2},
+		{"minimum licensed limit remains positive", 64, 64, 1, 32, 1},
+		{"preserve lower explicit value", 64, 64, 8, 2, 2},
+		{"preserve value below license cap", 64, 64, 64, 8, 8},
+		{"unresolved auto sentinel remains untouched above quota", 64, 2, 64, 0, 0},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			withCores(t, 64, 64)
+			withCores(t, c.machineCores, c.effective)
 			cfg := baseConfig()
-			cfg.Compaction.MaxConcurrent = c.maxConcurrent
 			cfg.Compaction.Threads = c.threads
 
 			applyLicenseCoreLimits(&license.License{MaxCores: c.licensedCores}, cfg)
 
 			if cfg.Compaction.Threads != c.want {
-				t.Errorf("licensed=%d max_concurrent=%d configured_threads=%d: Compaction.Threads = %d, want %d",
-					c.licensedCores, c.maxConcurrent, c.threads, cfg.Compaction.Threads, c.want)
+				t.Errorf("machine=%d effective=%d licensed=%d configured_threads=%d: Compaction.Threads = %d, want %d",
+					c.machineCores, c.effective, c.licensedCores, c.threads, cfg.Compaction.Threads, c.want)
+			}
+			if c.threads > 0 && cfg.Compaction.Threads > c.effective {
+				t.Errorf("Compaction.Threads = %d exceeds effective cores %d", cfg.Compaction.Threads, c.effective)
 			}
 		})
 	}
