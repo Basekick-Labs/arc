@@ -1880,6 +1880,19 @@ func (b *ArrowBuffer) enqueueOrDeferLocked(
 		measurement: measurement,
 		records:     shard.buffers[bufferKey],
 		recordCount: totalBuffered,
+		// Collect the WAL identities HERE, while the batches are still reachable
+		// and the shard lock is held. The worker cannot do it later: the first
+		// thing flushRecordsAsync does after merging is nil out every entry of
+		// task.records, so the *TypedColumnBatch values carrying WALHashes are
+		// gone by the time the flush succeeds.
+		//
+		// Omitting this left task.walHashes nil on every asynchronous flush, so
+		// markWALFlushed returned immediately and no checkpoint was ever written
+		// for the size-triggered path — recovery then replayed those entries
+		// after a crash, which is #948 for the one path that carries production
+		// ingest. Only flushBufferLocked (the age, schema-change, FlushAll and
+		// Close path) was checkpointing.
+		walHashes: collectWALHashes(shard.buffers[bufferKey]),
 	}
 
 	select {

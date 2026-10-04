@@ -497,6 +497,8 @@ The ordering is load-bearing in one direction only: the checkpoint is written st
 
 Checkpoint writes cost nothing measurable at Arc's flush rate: measured ABAB with the WAL on `fdatasync` and local storage at 683 flushes/s, 1,366,233 rows/s against 1,320,917 before the change — inside run-to-run noise.
 
+**Follow-up ([#1045](https://github.com/Basekick-Labs/arc/issues/1045)):** as first merged, this recorded checkpoints only for *synchronous* flushes — the age sweep, a schema change, `FlushAll` and shutdown. The flush task for an **asynchronous, size-triggered** flush was built without its WAL identities, so the checkpoint call received nothing and the main ingest path still replayed after a crash. Measured on the same crash test with the buffer configured to flush by size rather than age: 310 acknowledged records of which 300 had flushed replayed all 310 and left 600 rows queryable. Fixed before release; both paths now checkpoint, and the regression test drives the asynchronous path specifically.
+
 Two related WAL problems are **not** fixed by this and are tracked in [#1009](https://github.com/Basekick-Labs/arc/issues/1009): the periodic purge still deletes rotated WAL files by modification time rather than by what has actually been flushed, and recovery still deletes a replayed file as soon as its records are back in the buffer, before they reach Parquet.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#998](https://github.com/Basekick-Labs/arc/pull/998).
