@@ -462,6 +462,7 @@ Thanks to everyone who has contributed code to Arc:
 - [@alexeymoskalev-devops](https://github.com/alexeymoskalev-devops) — compaction candidates preview lists each measurement once and hands the listing to every tier, after finding and documenting why the scheduled cycle must not share listings across tiers (#789)
 - [@TayfurYldz](https://github.com/TayfurYldz) — DECIMAL query results stay JSON numbers on the JSON output path: aggregates such as SUM and AVG over integer columns are cast to int64 or double before encoding instead of being stringified (#831)
 - [@jallegri](https://github.com/jallegri) — hourly-compaction minimum-files rationale corrected to the actual ingest flush triggers (#838)
+- [@0utsights](https://github.com/0utsights) (John Surles) — audit middleware copies every Fiber request-backed string and the handler detail map before the background writer serialises the event, with a buffer-reuse regression covering each field (#871)
 
 And a thank-you to community members whose bug reports drove fixes:
 
