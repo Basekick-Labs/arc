@@ -80,6 +80,8 @@ type Metrics struct {
 	bufferErrorsTotal     atomic.Int64
 	bufferFlushFailures   atomic.Int64
 	bufferQueueDepth      atomic.Int64
+	bufferQueuedRecords   atomic.Int64
+	bufferInflightRecords atomic.Int64
 
 	// Storage metrics
 	storageWritesTotal     atomic.Int64
@@ -429,6 +431,8 @@ func (m *Metrics) SetBufferFlushes(count int64)         { m.bufferFlushesTotal.S
 func (m *Metrics) SetBufferErrors(count int64)          { m.bufferErrorsTotal.Store(count) }
 func (m *Metrics) IncBufferFlushFailures()              { m.bufferFlushFailures.Add(1) }
 func (m *Metrics) SetBufferQueueDepth(depth int64)      { m.bufferQueueDepth.Store(depth) }
+func (m *Metrics) SetBufferQueuedRecords(count int64)   { m.bufferQueuedRecords.Store(count) }
+func (m *Metrics) SetBufferInflightRecords(count int64) { m.bufferInflightRecords.Store(count) }
 
 // Storage Metrics
 func (m *Metrics) IncStorageWrites()                { m.storageWritesTotal.Add(1) }
@@ -692,6 +696,8 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"buffer_errors_total":         m.bufferErrorsTotal.Load(),
 		"buffer_flush_failures_total": m.bufferFlushFailures.Load(),
 		"buffer_queue_depth":          m.bufferQueueDepth.Load(),
+		"buffer_queued_records":       m.bufferQueuedRecords.Load(),
+		"buffer_inflight_records":     m.bufferInflightRecords.Load(),
 
 		// Storage
 		"storage_writes_total":      m.storageWritesTotal.Load(),
@@ -958,6 +964,14 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_buffer_queue_depth Current flush queue depth\n"...)
 	b = append(b, "# TYPE arc_buffer_queue_depth gauge\n"...)
 	b = appendMetric(b, "arc_buffer_queue_depth", float64(m.bufferQueueDepth.Load()))
+
+	b = append(b, "# HELP arc_buffer_queued_records Records waiting in the flush queue\n"...)
+	b = append(b, "# TYPE arc_buffer_queued_records gauge\n"...)
+	b = appendMetric(b, "arc_buffer_queued_records", float64(m.bufferQueuedRecords.Load()))
+
+	b = append(b, "# HELP arc_buffer_inflight_records Records currently being flushed by workers\n"...)
+	b = append(b, "# TYPE arc_buffer_inflight_records gauge\n"...)
+	b = appendMetric(b, "arc_buffer_inflight_records", float64(m.bufferInflightRecords.Load()))
 
 	// Storage metrics
 	b = append(b, "# HELP arc_storage_writes_total Total storage writes\n"...)
