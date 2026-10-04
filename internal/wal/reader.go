@@ -34,7 +34,7 @@ func NewReader(filePath string, logger zerolog.Logger) *Reader {
 // Entry represents a single WAL entry
 type Entry struct {
 	TimestampUS      uint64                   // Microseconds since epoch
-	PayloadHash      string                   // SHA-256 identity of the logical WAL payload
+	PayloadHash      string                   // Entry identity: the writer-assigned "instanceSeq" (32 hex) for a tracked entry, else a SHA-256 of the logical payload (64 hex)
 	CheckpointHashes []string                 // Flush checkpoint identities, when present
 	Records          []map[string]interface{} // Row format (from Append path)
 	ColumnarData     *ColumnarEntry           // Columnar format (from AppendRaw path)

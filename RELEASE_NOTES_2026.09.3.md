@@ -478,6 +478,17 @@ To be precise about what that bounds: it caps the **subprocesses'** combined bud
 **Also fixed:** `database.memory_limit = "50%"` or `"0"` passed configuration validation and then hard-failed startup inside DuckDB with a bare parser error. Both are now rejected at load with a message naming the key and listing the accepted units, using the same rule `compaction.memory_limit` already enforced.
 
 
+### WAL replay is now idempotent, so a retained file stops re-applying its healthy entries ([#1009](https://github.com/Basekick-Labs/arc/issues/1009))
+
+A replayed WAL entry correctly writes nothing back to the WAL — the copy being replayed is already on disk. But it also produced no flush *checkpoint*, because a checkpoint is keyed on the identity the WAL assigns at append time and a replay never appends. So every subsequent recovery pass replayed the same entry again.
+
+That matters whenever recovery **keeps** a file, which one poisoned entry is enough to cause ([#590](https://github.com/Basekick-Labs/arc/issues/590)): the file's healthy entries were re-applied on every pass, and for measurements without tags compaction can never remove the resulting duplicate rows. Today the periodic mtime purge eventually deletes the kept file and bounds the damage to one duplicate set — a backstop that disappears once purging becomes flush-aware, which is the rest of #1009.
+
+A replayed batch now inherits the identity of the entry it came from, so the flush that persists it checkpoints the **original** entry and no later pass replays it. Two deliberate exclusions, both of which would otherwise turn duplication into loss:
+
+- **The row-format recovery path does not inherit.** It fans one WAL entry out into one buffer write per record, routed by each record's own measurement, so a checkpoint for the entry could mark data durable that a sibling write discarded. That path is the rare non-msgpack fallback and keeps today's at-least-once behaviour.
+- **Untracked entries do not inherit.** Their identity is a SHA-256 of the payload rather than a writer-assigned sequence, and two legitimately identical payloads share it — two tagless rows with the same values and timestamp are two real events. Checkpointing one would make recovery skip the other. #948's fix moved off content hashes for this reason; inheritance is gated on the 32-character tracked form.
+
 ### WAL recovery no longer replays data that already reached Parquet ([#948](https://github.com/Basekick-Labs/arc/issues/948))
 
 **If you run with `wal.enabled = true` and ingest measurements without tags, this fixes a permanent over-counting bug.**

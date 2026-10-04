@@ -104,7 +104,7 @@ func TestAsyncFlush_RecordsWALCheckpoints(t *testing.T) {
 
 	const writes = 3
 	for i := 0; i < writes; i++ {
-		if err := buffer.writeColumnarInternal(context.Background(), "default", checkpointTestRecord(), false); err != nil {
+		if err := buffer.writeColumnarInternal(context.Background(), "default", checkpointTestRecord(), false, ""); err != nil {
 			t.Fatalf("write %d: %v", i, err)
 		}
 	}
@@ -147,7 +147,7 @@ func TestSyncFlush_RecordsWALCheckpoints(t *testing.T) {
 
 	const writes = 3
 	for i := 0; i < writes; i++ {
-		if err := buffer.writeColumnarInternal(context.Background(), "default", checkpointTestRecord(), false); err != nil {
+		if err := buffer.writeColumnarInternal(context.Background(), "default", checkpointTestRecord(), false, ""); err != nil {
 			t.Fatalf("write %d: %v", i, err)
 		}
 	}
@@ -159,5 +159,96 @@ func TestSyncFlush_RecordsWALCheckpoints(t *testing.T) {
 	handedOut, flushed := walWriter.counts()
 	if flushed != handedOut {
 		t.Errorf("sync flush checkpointed %d of %d WAL identities", flushed, handedOut)
+	}
+}
+
+// TestReplay_InheritsTrackedIdentity pins that a replayed batch carries the
+// identity of the WAL entry it came from, so the flush that persists it
+// checkpoints the ORIGINAL entry.
+//
+// Without this, a replayed batch writes nothing to the WAL (correct — the copy
+// being replayed is already on disk) and therefore produced no checkpoint
+// either, so every later recovery pass replayed the same entry again. Any file
+// recovery keeps — one poisoned entry is enough (#590) — re-applied all of its
+// healthy entries on every pass, and for a tagless measurement compaction can
+// never remove those duplicates.
+func TestReplay_InheritsTrackedIdentity(t *testing.T) {
+	buffer, walWriter := newCheckpointBuffer(1)
+	defer buffer.Close()
+
+	// 32 hex characters: the shape the writer issues, "%016x%016x" of
+	// (instance, sequence).
+	const identity = "00000000000000ff000000000000002a"
+	if err := buffer.WriteColumnarDirectReplay(context.Background(), "default", "replayed",
+		map[string][]interface{}{
+			"time":  {time.Now().UTC().UnixMicro()},
+			"value": {1.0},
+		}, identity); err != nil {
+		t.Fatalf("replay write: %v", err)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, flushed := walWriter.counts(); flushed > 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if buffer.HasFlushFailure() {
+		t.Fatal("flush failed; this test cannot distinguish that from a missing checkpoint")
+	}
+
+	walWriter.mu.Lock()
+	got := append([]string(nil), walWriter.flushed...)
+	handedOut := len(walWriter.handedOut)
+	walWriter.mu.Unlock()
+
+	// A replay must not append to the WAL: the entry is already on disk.
+	if handedOut != 0 {
+		t.Errorf("replay appended %d WAL entries, want 0 — the copy being replayed is already durable", handedOut)
+	}
+	if len(got) != 1 || got[0] != identity {
+		t.Errorf("checkpointed %v, want exactly [%s] — the replayed batch must checkpoint the original entry", got, identity)
+	}
+}
+
+// TestReplay_DoesNotInheritContentHash pins the other half: an UNtracked entry's
+// identity is a 64-hex SHA-256 of its payload, and it must never be
+// checkpointed. Content hashes collide for legitimately identical payloads — two
+// tagless rows with the same values and timestamp are two real events — so
+// checkpointing one would make recovery skip the other. #998 moved off content
+// hashes for exactly this reason, and inheriting one here would reintroduce it
+// as data loss rather than duplication.
+func TestReplay_DoesNotInheritContentHash(t *testing.T) {
+	buffer, walWriter := newCheckpointBuffer(1)
+	defer buffer.Close()
+
+	const contentHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	if len(contentHash) != 64 {
+		t.Fatalf("fixture is %d chars, want a 64-hex content hash", len(contentHash))
+	}
+	if err := buffer.WriteColumnarDirectReplay(context.Background(), "default", "replayed",
+		map[string][]interface{}{
+			"time":  {time.Now().UTC().UnixMicro()},
+			"value": {1.0},
+		}, contentHash); err != nil {
+		t.Fatalf("replay write: %v", err)
+	}
+
+	// Give a checkpoint every chance to appear before concluding it did not.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, flushed := walWriter.counts(); flushed > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if buffer.totalFlushes.Load() == 0 {
+		t.Fatal("no flush completed; this test cannot observe anything")
+	}
+
+	if _, flushed := walWriter.counts(); flushed != 0 {
+		t.Errorf("checkpointed %d identities for an untracked (content-hash) entry, want 0", flushed)
 	}
 }

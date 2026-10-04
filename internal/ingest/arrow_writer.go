@@ -842,6 +842,11 @@ type trackedWALWriter interface {
 	MarkFlushed(hashes []string) error
 }
 
+// walTrackedIdentityHexLen is the length of a tracked WAL identity:
+// fmt.Sprintf("%016x%016x", instance, sequence). An untracked entry's identity
+// is a 64-hex SHA-256 of its payload, which must never be treated as one.
+const walTrackedIdentityHexLen = 32
+
 func collectWALHashes(records []interface{}) []string {
 	var hashes []string
 	for _, record := range records {
@@ -1706,7 +1711,15 @@ func (b *ArrowBuffer) WriteColumnarRecord(ctx context.Context, database string, 
 // land in different compaction batches — a transient duplicate, never data
 // loss. This matches the pre-existing arc:tags WAL behavior; propagating the
 // markers through the WAL is a separate, larger change (WAL schema).
+// WriteColumnarDirectNoWAL writes a replayed or replicated columnar payload into
+// the buffer without appending it to the WAL. It inherits no WAL identity; use
+// WriteColumnarDirectReplay when replaying an entry whose identity should be
+// checkpointed once the batch reaches storage.
 func (b *ArrowBuffer) WriteColumnarDirectNoWAL(ctx context.Context, database, measurement string, columns map[string][]interface{}) error {
+	return b.writeColumnarDirect(ctx, database, measurement, columns, "")
+}
+
+func (b *ArrowBuffer) writeColumnarDirect(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string) error {
 	// #590: both callers (WAL crash replay, cluster WAL replication) feed
 	// RAW client payloads that never went through the live decode path's
 	// post-processing. Apply it here so replayed data behaves exactly like
@@ -1758,7 +1771,29 @@ func (b *ArrowBuffer) WriteColumnarDirectNoWAL(ctx context.Context, database, me
 		Columns:     columns,
 		Columnar:    true,
 	}
-	return b.writeColumnarInternal(ctx, database, record, true)
+	return b.writeColumnarInternal(ctx, database, record, true, walIdentity)
+}
+
+// WriteColumnarDirectReplay is WriteColumnarDirectNoWAL for WAL recovery, with
+// one addition: it carries the identity of the WAL entry being replayed, so the
+// re-buffered batch inherits it.
+//
+// That is what makes replay idempotent. A replayed batch writes nothing to the
+// WAL (there is already a copy on disk — that is what is being replayed), so
+// before this it also produced no flush checkpoint, and the entry was replayed
+// again by every subsequent recovery pass. Any file recovery keeps — one poisoned
+// entry is enough (#590) — therefore re-applied all of its healthy entries on
+// every pass, and for tagless measurements compaction can never remove the
+// duplicates. Inheriting the identity means the eventual flush checkpoints the
+// ORIGINAL entry, and the next pass skips it.
+//
+// Pass the empty string to inherit nothing. Callers MUST do that unless the
+// identity covers exactly the records in this call: the row-format recovery
+// callback explodes one WAL entry into one call per record, so checkpointing
+// the entry when only some of those calls flush would mark data durable that
+// was discarded. See cmd/arc's recovery callbacks.
+func (b *ArrowBuffer) WriteColumnarDirectReplay(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string) error {
+	return b.writeColumnarDirect(ctx, database, measurement, columns, walIdentity)
 }
 
 // WriteTypedColumnarDirect writes a pre-typed column batch to the buffer,
@@ -2222,10 +2257,10 @@ func (b *ArrowBuffer) flushOnSchemaChangeLocked(
 
 // writeColumnar writes a columnar record to the buffer
 func (b *ArrowBuffer) writeColumnar(ctx context.Context, database string, record *models.ColumnarRecord) error {
-	return b.writeColumnarInternal(ctx, database, record, false)
+	return b.writeColumnarInternal(ctx, database, record, false, "")
 }
 
-func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string, record *models.ColumnarRecord, skipWAL bool) error {
+func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string, record *models.ColumnarRecord, skipWAL bool, inheritedWALIdentity string) error {
 	// Create buffer key: database/measurement
 	// OPTIMIZATION: String concatenation is faster than fmt.Sprintf (no reflection)
 	bufferKey := database + "/" + record.Measurement
@@ -2233,6 +2268,17 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 	// WAL: Write to WAL before buffering (if enabled)
 	// Skip WAL during recovery to avoid re-writing recovered data
 	var walHashes []string
+	// A replayed entry writes nothing to the WAL — the copy being replayed is
+	// already on disk — but it DOES carry that copy's identity, so the flush
+	// that eventually persists it checkpoints the original entry and no later
+	// recovery pass replays it again. Only a 32-hex tracked identity is
+	// inherited: an untracked entry's identity is a 64-hex CONTENT hash, and
+	// two legitimately identical payloads share it, so checkpointing one would
+	// make recovery skip the other (#998 moved off content hashes for exactly
+	// this reason). Untracked entries keep replaying as before.
+	if skipWAL && len(inheritedWALIdentity) == walTrackedIdentityHexLen {
+		walHashes = []string{inheritedWALIdentity}
+	}
 	if b.wal != nil && !skipWAL {
 		tracked, canTrack := b.wal.(trackedWALWriter)
 		// ZERO-COPY PATH: Use raw msgpack bytes if available (avoids re-serialization)
