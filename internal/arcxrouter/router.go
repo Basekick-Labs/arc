@@ -127,6 +127,8 @@ type Decision struct {
 	// the mandatory alias — the builder re-emits from these validated parts.
 	EpochWidthSecs int
 	BucketAlias    string
+	// agg-5a: re-serialized HAVING over the select items ("" = none).
+	HavingText string
 }
 
 // Decide is the cheap per-query pre-filter. It never calls the engine; it only
@@ -165,6 +167,7 @@ func Decide(sql, headerDB string, h Handler) Decision {
 		Cols:           m.cols,
 		Preds:          m.preds,
 		WhereText:      m.whereText,
+		HavingText:     m.havingText,
 		OrderBy:        m.orderBy,
 		Limit:          m.limit,
 		AggItems:       m.aggItems,
@@ -379,6 +382,15 @@ func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 			return "", false
 		}
 		bucketText = "date_trunc('" + d.BucketUnit + "', " + d.BucketCol + ")"
+		// agg-5a: carry the alias through to the engine so the OUTPUT column keeps
+		// the name the user asked for (Grafana needs `time`). Rebuilt from the
+		// validated token, like every other part of this SQL.
+		if d.BucketAlias != "" {
+			if !isBareIdent(d.BucketAlias) {
+				return "", false
+			}
+			bucketText += " AS " + d.BucketAlias
+		}
 	}
 	tagText := ""
 	if d.GroupKey != "" {
@@ -433,6 +445,14 @@ func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 			b.WriteString(", ")
 		}
 		b.WriteString(strconv.Itoa(kp))
+	}
+	// agg-5a: HAVING between GROUP BY and ORDER BY. The text was rebuilt from
+	// validated parts by reserializeHaving — item text for aggregates, validated
+	// bare identifiers for keys, re-emitted literals — so nothing of the user's
+	// spelling reaches the engine SQL here either.
+	if d.HavingText != "" {
+		b.WriteString(" HAVING ")
+		b.WriteString(d.HavingText)
 	}
 	if d.OrderByItem != 0 {
 		ok := false
