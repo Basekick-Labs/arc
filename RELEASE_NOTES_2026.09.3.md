@@ -429,6 +429,14 @@ predate that fix and #978.
 
 ## Bug fixes
 
+### The quarantine re-enqueue test waits for the in-flight slot to clear ([#972](https://github.com/Basekick-Labs/arc/issues/972))
+
+The file-replication test now waits for both the invalid-path count and the
+in-flight slot to clear before re-enqueueing the same path. It also fails as
+soon as a round does not settle within the existing timeout.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1061](https://github.com/Basekick-Labs/arc/pull/1061).
+
 ## Experimental arcx Arrow IPC streams signal writer panics ([#846](https://github.com/Basekick-Labs/arc/issues/846))
 
 When the experimental arcx Arrow IPC stream writer panics, the response now
