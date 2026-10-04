@@ -68,6 +68,25 @@ func walFileCount(t *testing.T, dir string) int {
 	return len(m)
 }
 
+func TestMinUnflushedSequenceTracksDurableCheckpoints(t *testing.T) {
+	w := newPurgeTestWriter(t)
+	rows := []map[string]interface{}{{"m": "t", "time": time.Now().UTC().UnixMicro(), "v": 1}}
+	hashes, err := w.AppendTracked(rows)
+	if err != nil {
+		t.Fatalf("AppendTracked: %v", err)
+	}
+	waitForPurgeTestDrain(t, w)
+	if got := w.MinUnflushedSequence(); got != 1 {
+		t.Fatalf("MinUnflushedSequence before checkpoint = %d, want 1", got)
+	}
+	if err := w.MarkFlushed(hashes); err != nil {
+		t.Fatalf("MarkFlushed: %v", err)
+	}
+	if got := w.MinUnflushedSequence(); got == 1 {
+		t.Fatalf("MinUnflushedSequence still reports seq 1 after durable checkpoint")
+	}
+}
+
 // TestPurgeFlushed_DeletesOnlyBelowTheFloor is the core of #1009: a rotated file
 // goes away when every sequence it holds is flushed, and stays when any is not.
 // No clock is involved.

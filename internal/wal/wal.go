@@ -468,7 +468,12 @@ type Writer struct {
 	fileSeqs        map[string]*fileSeqState
 	fileOrder       []string
 	trackedSequence uint64
-	closed          bool
+	// pendingTracked maps this process's tracked identity token to its
+	// monotonic tracked sequence until a durable flush checkpoint is written.
+	// It is the source of truth for MinUnflushedSequence and therefore for
+	// clock-free WAL purging (#1009).
+	pendingTracked map[string]uint64
+	closed         bool
 
 	// Metrics (atomic for lock-free reads)
 	TotalEntries   int64
@@ -529,6 +534,7 @@ func NewWriter(cfg *WriterConfig) (*Writer, error) {
 		lastSyncTime:    time.Now(),
 		entryChan:       make(chan walEntry, cfg.BufferSize),
 		fileSeqs:        make(map[string]*fileSeqState),
+		pendingTracked:  make(map[string]uint64),
 		done:            make(chan struct{}),
 		trackedInstance: trackedInstance,
 	}
@@ -904,6 +910,11 @@ func (w *Writer) MarkFlushed(hashes []string) error {
 		if err := <-done; err != nil {
 			return fmt.Errorf("failed to persist WAL flush checkpoint: %w", err)
 		}
+		w.mu.Lock()
+		for _, token := range hashes[start:end] {
+			delete(w.pendingTracked, token)
+		}
+		w.mu.Unlock()
 	}
 	return nil
 }
@@ -949,9 +960,19 @@ func (w *Writer) appendTrackedEntry(logicalPayload []byte) (string, error) {
 	binary.BigEndian.PutUint64(entryData[4:12], timestampUS)
 	binary.BigEndian.PutUint32(entryData[12:16], checksum)
 	copy(entryData[WALEntryHeaderSize:], trackedPayload)
+	// Record the pending identity BEFORE enqueueing. The writer goroutine may
+	// consume the entry immediately; publishing it first closes the race where
+	// maintenance could otherwise observe an empty floor and purge its file.
+	w.mu.Lock()
+	w.pendingTracked[token] = seq
+	w.mu.Unlock()
+
 	// Carry the sequence so the writer loop can record it against the file the
 	// write actually lands in (#1009).
 	if err := w.tryEnqueueEntry(walEntry{data: entryData, seq: seq}); err != nil {
+		w.mu.Lock()
+		delete(w.pendingTracked, token)
+		w.mu.Unlock()
 		return "", err
 	}
 	return token, nil
@@ -1244,6 +1265,23 @@ func (w *Writer) forgetFileLocked(path string) {
 			break
 		}
 	}
+}
+
+// MinUnflushedSequence returns the lowest tracked sequence that has not yet
+// been covered by a durable flush checkpoint. When every tracked entry is
+// checkpointed it returns MaxUint64, which makes every eligible rotated file
+// reclaimable. Entries are tracked by identity token so duplicate payloads do
+// not collide and old-process checkpoints are harmless.
+func (w *Writer) MinUnflushedSequence() uint64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	min := ^uint64(0)
+	for _, seq := range w.pendingTracked {
+		if seq < min {
+			min = seq
+		}
+	}
+	return min
 }
 
 // PurgeFlushed deletes rotated WAL files whose data is known to have reached

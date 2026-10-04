@@ -1115,7 +1115,7 @@ func main() {
 						// Purge old WAL files first (same as normal path) to avoid replaying
 						// data that was already successfully flushed to parquet before the failure.
 						if walWriter != nil {
-							deleted, purgeErr := walWriter.PurgeOlderThan(safeAge)
+							deleted, purgeErr := walWriter.PurgeFlushed(walWriter.MinUnflushedSequence())
 							if purgeErr != nil {
 								walLogger.Error().Err(purgeErr).Msg("WAL purge before recovery failed")
 							} else if deleted > 0 {
@@ -1157,9 +1157,9 @@ func main() {
 							arrowBuffer.ResetFlushFailure()
 						}
 					} else {
-						// Normal operation — purge WAL files old enough that their data
-						// has been flushed to parquet by the normal buffer flush cycle
-						deleted, err := walWriter.PurgeOlderThan(safeAge)
+						// Normal operation — purge only WAL files proven flushed by tracked
+						// sequence state; do not infer durability from wall-clock age.
+						deleted, err := walWriter.PurgeFlushed(walWriter.MinUnflushedSequence())
 						if err != nil {
 							walLogger.Error().Err(err).Msg("Periodic WAL purge failed")
 						} else if deleted > 0 {
