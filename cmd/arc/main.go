@@ -1880,9 +1880,12 @@ func main() {
 							}
 						}
 
-						// Wire up WAL replication if enabled
-						if cfg.Cluster.ReplicationEnabled && walWriter != nil {
-							clusterCoordinator.SetWAL(walWriter)
+						// Wire up WAL replication if enabled. Receivers must start even when
+						// this node has no local WAL; only the writer-side sender requires it.
+						if cfg.Cluster.ReplicationEnabled {
+							if walWriter != nil {
+								clusterCoordinator.SetWAL(walWriter)
+							}
 							clusterCoordinator.SetIngestBuffer(arrowBuffer)
 							if err := clusterCoordinator.StartReplication(); err != nil {
 								log.Warn().Err(err).Msg("Failed to start WAL replication")

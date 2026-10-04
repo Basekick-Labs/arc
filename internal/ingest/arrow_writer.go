@@ -16,6 +16,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/Basekick-Labs/msgpack/v6"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
@@ -2305,14 +2306,20 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 			}
 		} else {
 			// FALLBACK: Convert columnar to row format for WAL storage
-			// This path is used for LineProtocol or when raw bytes aren't available
+			// This path is used for LineProtocol or when raw bytes aren't available.
 			walRecords := b.columnarToWALRecords(database, record)
 			if len(walRecords) > 0 {
+				// Row-format entries need the database envelope too. AppendTracked
+				// historically wrote the raw row payload, so replication parsed
+				// those entries with the receiver's "default" database (#889).
+				rowPayload, marshalErr := msgpack.Marshal(walRecords)
 				var err error
-				if canTrack {
-					walHashes, err = tracked.AppendTracked(walRecords)
+				if marshalErr != nil {
+					err = marshalErr
+				} else if canTrack {
+					walHashes, err = tracked.AppendRawWithMetaTracked(database, rowPayload)
 				} else {
-					err = b.wal.Append(walRecords)
+					err = b.wal.AppendRawWithMeta(database, rowPayload)
 				}
 				if err != nil {
 					b.recordWALError(err, func(ev *zerolog.Event) {
