@@ -899,12 +899,14 @@ func main() {
 	if cfg.WAL.Enabled {
 		var err error
 		walWriter, err = wal.NewWriter(&wal.WriterConfig{
-			WALDir:       cfg.WAL.Directory,
-			SyncMode:     wal.SyncMode(cfg.WAL.SyncMode),
-			MaxSizeBytes: int64(cfg.WAL.MaxSizeMB) * 1024 * 1024,
-			MaxAge:       time.Duration(cfg.WAL.MaxAgeSeconds) * time.Second,
-			BufferSize:   cfg.WAL.BufferSize,
-			Logger:       logger.Get("wal"),
+			WALDir:                   cfg.WAL.Directory,
+			SyncMode:                 wal.SyncMode(cfg.WAL.SyncMode),
+			MaxSizeBytes:             int64(cfg.WAL.MaxSizeMB) * 1024 * 1024,
+			MaxAge:                   time.Duration(cfg.WAL.MaxAgeSeconds) * time.Second,
+			BufferSize:               cfg.WAL.BufferSize,
+			DiskHighWatermarkPercent: cfg.WAL.DiskHighWatermarkPercent,
+			DiskMinFreeMB:            cfg.WAL.DiskMinFreeMB,
+			Logger:                   logger.Get("wal"),
 		})
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize WAL writer")

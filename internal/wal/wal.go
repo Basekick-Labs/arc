@@ -19,6 +19,7 @@ import (
 	"github.com/Basekick-Labs/msgpack/v6/msgpcode"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
+	"golang.org/x/sys/unix"
 )
 
 // WAL file format constants
@@ -368,6 +369,13 @@ func oversizedPayloadError(err error) error {
 // surface accurate operator-facing messages. Use errors.Is to detect.
 var ErrWALDropped = errors.New("WAL entry dropped: async buffer full")
 
+// ErrWALDiskPressure is returned before accepting a new data entry when the
+// WAL filesystem crosses its configured high-water mark or free-space reserve.
+// Callers should surface this as retryable backpressure (HTTP 503), not as a
+// successful buffered write: accepting more data here would consume the
+// headroom needed for rotation, shutdown and WAL recovery (#676).
+var ErrWALDiskPressure = errors.New("WAL disk pressure: write rejected to preserve recovery headroom")
+
 // walEntry is a pre-serialized WAL entry ready for writing
 type walEntry struct {
 	data    []byte // Complete entry: header + payload
@@ -407,14 +415,16 @@ type fileSeqState struct {
 
 // WriterConfig holds configuration for WAL writer
 type WriterConfig struct {
-	WALDir       string        // Directory for WAL files
-	SyncMode     SyncMode      // Sync mode: fsync, fdatasync, async
-	MaxSizeBytes int64         // Rotate WAL when it reaches this size (default: 100MB)
-	MaxAge       time.Duration // Rotate WAL after this duration (default: 1 hour)
-	SyncInterval time.Duration // Sync at most this often (default: 100ms, 0 = sync every write)
-	SyncBytes    int64         // Sync after this many bytes written (default: 1MB, 0 = no byte threshold)
-	BufferSize   int           // Size of async write buffer (default: 10000)
-	Logger       zerolog.Logger
+	WALDir                   string        // Directory for WAL files
+	SyncMode                 SyncMode      // Sync mode: fsync, fdatasync, async
+	MaxSizeBytes             int64         // Rotate WAL when it reaches this size (default: 100MB)
+	MaxAge                   time.Duration // Rotate WAL after this duration (default: 1 hour)
+	SyncInterval             time.Duration // Sync at most this often (default: 100ms, 0 = sync every write)
+	SyncBytes                int64         // Sync after this many bytes written (default: 1MB, 0 = no byte threshold)
+	BufferSize               int           // Size of async write buffer (default: 10000)
+	DiskHighWatermarkPercent int           // Reject data writes at or above this disk usage (default: 90)
+	DiskMinFreeMB            int           // Minimum free space reserved for recovery (default: 512)
+	Logger                   zerolog.Logger
 }
 
 // ReplicationEntry represents a WAL entry for replication.
@@ -529,6 +539,12 @@ func NewWriter(cfg *WriterConfig) (*Writer, error) {
 		cfg.BufferSize = 10000 // Default buffer size
 	} else if cfg.BufferSize > 1000000 {
 		cfg.BufferSize = 1000000 // Cap to prevent excessive memory allocation
+	}
+	if cfg.DiskHighWatermarkPercent <= 0 || cfg.DiskHighWatermarkPercent >= 100 {
+		cfg.DiskHighWatermarkPercent = 90
+	}
+	if cfg.DiskMinFreeMB <= 0 {
+		cfg.DiskMinFreeMB = 512
 	}
 
 	// Create WAL directory with owner-only permissions (WAL contains sensitive data)
@@ -953,6 +969,34 @@ func trackedPayloadFits(payloadLen, envelopeHeaderLen int) bool {
 	return payloadLen <= MaxWALPayloadSize-walTrackedHeaderSize-envelopeHeaderLen
 }
 
+// ensureDiskHeadroom rejects new data before it can consume the reserve needed
+// for WAL rotation and recovery. Statfs failures are fail-open: disk telemetry
+// must not become a new single point of ingest failure.
+func (w *Writer) ensureDiskHeadroom(additionalBytes int64) error {
+	var st unix.Statfs_t
+	if err := unix.Statfs(w.config.WALDir, &st); err != nil {
+		return nil
+	}
+	total := uint64(st.Blocks) * uint64(st.Bsize)
+	free := uint64(st.Bavail) * uint64(st.Bsize)
+	reserve := uint64(w.config.DiskMinFreeMB) * 1024 * 1024
+	if additionalBytes > 0 {
+		reserve += uint64(additionalBytes)
+	}
+	if free <= reserve {
+		metrics.Get().IncWALDiskPressure()
+		return ErrWALDiskPressure
+	}
+	if total > 0 {
+		used := total - free
+		if used*100 >= uint64(w.config.DiskHighWatermarkPercent)*total {
+			metrics.Get().IncWALDiskPressure()
+			return ErrWALDiskPressure
+		}
+	}
+	return nil
+}
+
 func (w *Writer) appendTrackedEntry(logicalPayload []byte) (string, error) {
 	// Allocating the sequence and publishing it as pending must be one step.
 	// Everything after this — the Sprintf, the CRC, and above all the
@@ -972,6 +1016,9 @@ func (w *Writer) appendTrackedEntry(logicalPayload []byte) (string, error) {
 	copy(trackedPayload[17:], logicalPayload)
 	checksum := crc32.ChecksumIEEE(trackedPayload)
 	timestampUS := uint64(time.Now().UnixMicro())
+	if err := w.ensureDiskHeadroom(int64(WALEntryHeaderSize + len(trackedPayload))); err != nil {
+		return "", err
+	}
 	if w.replicationHook != nil {
 		w.mu.Lock()
 		w.sequence++
@@ -1010,6 +1057,9 @@ func (w *Writer) appendEnvelopedEntry(dbBytes []byte, envelopeHeaderLen int, pay
 	checksum := crc.Sum32()
 
 	timestampUS := uint64(time.Now().UnixMicro())
+	if err := w.ensureDiskHeadroom(int64(WALEntryHeaderSize + totalPayloadLen)); err != nil {
+		return err
+	}
 
 	// Replication hook
 	if w.replicationHook != nil {
@@ -1052,6 +1102,9 @@ func (w *Writer) appendEnvelopedEntry(dbBytes []byte, envelopeHeaderLen int, pay
 // Checkpoints do not come through here — they build their own walEntry — which
 // is what keeps a file holding only checkpoints reclaimable.
 func (w *Writer) tryEnqueue(entryData []byte) error {
+	if err := w.ensureDiskHeadroom(int64(len(entryData))); err != nil {
+		return err
+	}
 	return w.tryEnqueueEntry(walEntry{data: entryData, untrackedData: true})
 }
 

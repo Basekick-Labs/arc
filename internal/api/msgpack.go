@@ -10,6 +10,7 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/wal"
 	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
@@ -384,6 +385,12 @@ localProcessing:
 		if errors.Is(err, ingest.ErrSchemaChurnExceeded) {
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 				"error": "Write rejected (schema churn): " + err.Error(),
+			})
+		}
+		if errors.Is(err, wal.ErrWALDiskPressure) {
+			c.Set("Retry-After", "5")
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"error": "Write rejected (WAL disk pressure): " + err.Error(),
 			})
 		}
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
