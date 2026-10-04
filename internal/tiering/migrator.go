@@ -67,13 +67,22 @@ func NewMigrator(cfg *MigratorConfig) *Migrator {
 // MigrateTier migrates eligible files from one tier to another
 // Returns the number of files migrated and the number of errors
 func (m *Migrator) MigrateTier(ctx context.Context, fromTier, toTier Tier) (int, int) {
+	return m.MigrateTierFiltered(ctx, fromTier, toTier, "", "")
+}
+
+// MigrateTierFiltered migrates eligible files, optionally restricted to a
+// database and/or measurement. The automatic scheduler uses MigrateTier with
+// empty filters, while manual API requests can safely target a subset.
+func (m *Migrator) MigrateTierFiltered(ctx context.Context, fromTier, toTier Tier, database, measurement string) (int, int) {
 	m.logger.Info().
 		Str("from_tier", string(fromTier)).
 		Str("to_tier", string(toTier)).
+		Str("database", database).
+		Str("measurement", measurement).
 		Msg("Starting tier migration")
 
 	// Find candidates for migration
-	candidates, err := m.FindCandidates(ctx, fromTier, toTier)
+	candidates, err := m.FindCandidatesFiltered(ctx, fromTier, toTier, database, measurement)
 	if err != nil {
 		m.logger.Error().Err(err).Msg("Failed to find migration candidates")
 		return 0, 1
@@ -107,6 +116,12 @@ func (m *Migrator) MigrateTier(ctx context.Context, fromTier, toTier Tier) (int,
 
 // FindCandidates finds files eligible for migration from one tier to another
 func (m *Migrator) FindCandidates(ctx context.Context, fromTier, toTier Tier) ([]MigrationCandidate, error) {
+	return m.FindCandidatesFiltered(ctx, fromTier, toTier, "", "")
+}
+
+// FindCandidatesFiltered finds eligible migration candidates, optionally
+// restricted to a database and/or measurement.
+func (m *Migrator) FindCandidatesFiltered(ctx context.Context, fromTier, toTier Tier, database, measurement string) ([]MigrationCandidate, error) {
 	// Only support Hot -> Cold migration in 2-tier system
 	if fromTier != TierHot || toTier != TierCold {
 		return nil, fmt.Errorf("unsupported migration: %s -> %s (only hot -> cold supported)", fromTier, toTier)
@@ -116,7 +131,7 @@ func (m *Migrator) FindCandidates(ctx context.Context, fromTier, toTier Tier) ([
 	maxAge := time.Duration(m.manager.config.DefaultHotMaxAgeDays) * 24 * time.Hour
 
 	// Get files older than max age in the source tier
-	files, err := m.manager.metadata.GetFilesOlderThan(ctx, fromTier, maxAge)
+	files, err := m.manager.metadata.GetFilesOlderThanFiltered(ctx, fromTier, maxAge, database, measurement)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get old files: %w", err)
 	}
