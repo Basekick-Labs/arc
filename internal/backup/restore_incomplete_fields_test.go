@@ -152,6 +152,28 @@ func TestTrackingWriterRecordsFirstError(t *testing.T) {
 	}
 }
 
+type failingReadToSource struct{ err error }
+
+func (s failingReadToSource) Read([]byte) (int, error) { return 0, s.err }
+
+func TestTrackingWriterReadFromKeepsSourceFailuresClassifiable(t *testing.T) {
+	tmpFile, err := os.CreateTemp(t.TempDir(), "source-read-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { tmpFile.Close() })
+
+	sourceErr := errors.New("source read failed")
+	tw := &trackingWriter{w: tmpFile}
+	_, readErr := tw.ReadFrom(failingReadToSource{err: sourceErr})
+	if !errors.Is(readErr, sourceErr) {
+		t.Fatalf("ReadFrom error = %v, want source error %v", readErr, sourceErr)
+	}
+	if tw.err != nil {
+		t.Fatalf("source read failure was recorded as a destination error: %v", tw.err)
+	}
+}
+
 // Guard, not a regression test: restore already published immutable snapshots
 // before #762. It pins that the sample slice is published safely under -race.
 func TestGetProgress_DoesNotRaceALiveRestore(t *testing.T) {

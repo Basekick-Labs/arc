@@ -10,11 +10,8 @@ import (
 // operation-specific pattern so backup and restore retain distinct temp-file
 // names while sharing the test seam.
 //
-// Wrapping the returned *os.File in trackingWriter costs the source-to-temp
-// io.Copy's zero-copy fast path (copy_file_range needs an *os.File
-// destination), so that hop runs through a buffered loop. This is deliberate:
-// the operation is disk-bound, and the alternative is not knowing whether a
-// ReadTo failure came from the source or the local temp destination.
+// trackingWriter preserves the source-to-temp io.Copy fast path through
+// io.ReaderFrom while retaining destination-write error attribution.
 var createTempFile = func(pattern string) (*os.File, error) {
 	return os.CreateTemp("", pattern)
 }
@@ -35,6 +32,30 @@ func (t *trackingWriter) Write(p []byte) (int, error) {
 	if err != nil && t.err == nil {
 		t.err = err
 	}
+	return n, err
+}
+
+// ReadFrom delegates to the underlying reader when available. If the copy
+// fails, a write probe distinguishes a destination failure from a source read
+// failure; failed temp files are discarded by the caller.
+func (t *trackingWriter) ReadFrom(r io.Reader) (int64, error) {
+	readerFrom, ok := t.w.(io.ReaderFrom)
+	if !ok {
+		return io.Copy(struct{ io.Writer }{t}, r)
+	}
+
+	n, err := readerFrom.ReadFrom(r)
+	if err != nil {
+		var probe [1]byte
+		if written, writeErr := t.w.Write(probe[:]); writeErr != nil {
+			if t.err == nil {
+				t.err = writeErr
+			}
+		} else if written != len(probe) && t.err == nil {
+			t.err = io.ErrShortWrite
+		}
+	}
+
 	return n, err
 }
 
