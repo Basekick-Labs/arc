@@ -111,10 +111,11 @@ type StatusResponse struct {
 	Scheduler        *SchedulerStatus `json:"scheduler,omitempty"`
 	// ReplicationEvents counts the tier metadata updates this node made for
 	// files it did not write itself: files the cluster replication puller
-	// pulled, and local copies the delete workers removed. Dropped is the
-	// queue-full count and should be zero; a non-zero one means some rows
-	// wait for the next tier scan, which costs this node partition pruning
-	// until then. Absent on a node with no cluster replication.
+	// pulled, and local copies the delete workers removed. Dropped counts
+	// reports discarded — a full queue that stayed full, a stop in progress,
+	// or a licence that had lapsed — and should be zero; a non-zero one means
+	// some rows wait for the next tier scan, which costs this node partition
+	// pruning until then. Absent on a node with no cluster replication.
 	ReplicationEvents *TierEventCounts `json:"replication_events,omitempty"`
 }
 

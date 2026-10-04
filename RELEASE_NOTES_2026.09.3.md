@@ -33,14 +33,27 @@ Three changes close it:
   local-delete workers report every copy they remove, to this node's tier
   metadata. Both reports are applied by a single background writer, so a
   catch-up burst cannot pile writers onto the SQLite handle that auth, audit,
-  continuous queries and the ingest flush path share.
-- A delete worker decides what a removal means from evidence rather than from
-  the manifest delete's reason, which an operator can supply: it checks whether
+  continuous queries and the ingest flush path share. The cold-tier existence
+  checks a migration's unlinks need run in parallel ahead of the writes, so a
+  nightly migration of thousands of files is recorded on every node within
+  about a minute rather than being cut off at a deadline, and the query
+  layer's caches are dropped only when the set of tiers a measurement reads
+  from actually changes — not once per replicated file.
+- The node decides what a removal means from evidence rather than from the
+  manifest delete's reason, which an operator can supply: it checks whether
   the object is actually in cold before marking the row cold, and retires the
   hot row otherwise.
 - Tier metadata is now scanned once at startup, in the background. This also
   covers files that arrived while a node was down, and files already on disk
-  when upgrading to this release.
+  when upgrading to this release. On a shared-storage cluster the scan lists
+  the shared hot bucket from every node at boot — the same listing the nightly
+  cycle already performs, now also once per restart.
+- A cold tier whose backend fails to construct — bad credentials, an
+  unreachable profile — is now left genuinely absent rather than present and
+  unusable. Previously the failed constructor's nil was stored behind the
+  backend interface, so every "is there a cold tier" check passed and the
+  first cold listing dereferenced it; the startup scan would have turned that
+  into a crash at boot.
 
 Two visible consequences. `GET /api/v1/tiering/files` and
 `/api/v1/tiering/stats` counts now converge across nodes within seconds of a
@@ -54,7 +67,9 @@ New counters for the path: `tier_registered` alongside `pulled` in
 `/api/v1/cluster`'s `replication_catchup_status` — it counts pulls a tier
 recorder accepted, so it tracks `pulled` where tiering is enabled and stays at
 zero where it is not — and `replication_events` in `/api/v1/tiering/status`,
-whose `dropped` should be zero.
+whose `dropped` should be zero: an unlink report waits for queue room rather
+than dropping, and a pull report drops only when the queue has been full for
+the whole of a catch-up burst.
 
 One behaviour note for the failure case: if the tiering manager cannot start —
 an unparseable `migration_schedule`, say — queries still route across tiers and

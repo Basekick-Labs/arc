@@ -51,10 +51,12 @@ type deleteRequest struct {
 //
 // Implemented by *tiering.Manager. Declared here, consumer-side, for the same
 // reason tiering declares ManifestCoordinator rather than importing this
-// package: neither side needs the other's types. Both methods are
-// fire-and-forget — they are called from the replication pull workers and the
-// local-delete workers, and the implementation queues rather than writing
-// through to SQLite on the caller's goroutine.
+// package: neither side needs the other's types. Neither method writes through
+// to SQLite on the caller's goroutine; both queue. RecordReplicatedFile never
+// blocks — it runs on a replication pull worker. RecordUnlinkedFile may wait
+// briefly for queue room — it runs on a local-delete worker, which has
+// nothing else to do with the time — and gives up at once if the recorder is
+// stopping, so the delete drain in Stop is never held by it.
 type TierRecorder interface {
 	// RecordReplicatedFile reports a file pulled from a peer and kept, which
 	// is now on this node's hot storage.
@@ -173,8 +175,9 @@ type Coordinator struct {
 	// Behind its own mutex rather than c.mu: both reporters run on worker
 	// goroutines, and a worker contending on the coordinator-wide lock is the
 	// shape of the shutdown deadlocks in #797 and #813. Snapshot under the
-	// lock, invoke outside it. Cleared by Stop before the delete workers
-	// drain.
+	// lock, invoke outside it. Deliberately NOT cleared by Stop: the delete
+	// drain in Stop reports real unlinks, and the recorder's own shutdown hook
+	// runs after this coordinator's (see Stop).
 	tierRecorder   TierRecorder
 	tierRecorderMu sync.RWMutex
 
@@ -1129,7 +1132,8 @@ func (c *Coordinator) unlinkOne(item deleteRequest, has func(string) bool) {
 		sizeBytes int64
 		wasLocal  bool
 	)
-	if c.tierRecorderSnapshot() != nil {
+	recorder := c.tierRecorderSnapshot()
+	if recorder != nil {
 		// StatFile reports -1 with a nil error for a path that is not there,
 		// so the sentinel is the test, not the error. Getting this wrong makes
 		// every node in the cluster report every manifest delete, including
@@ -1171,11 +1175,11 @@ func (c *Coordinator) unlinkOne(item deleteRequest, has func(string) bool) {
 			Str("path", item.path).
 			Str("reason", item.reason).
 			Msg("Phase 4 local delete worker: removed local copy")
-		if wasLocal {
+		if wasLocal && recorder != nil {
 			// Only for a file this node actually held: the tier row for a
 			// path a node never had is not its to write, and without the stat
 			// above every node would report every manifest delete.
-			c.recordUnlinkedFileInTiering(item.path, item.reason, sizeBytes)
+			recorder.RecordUnlinkedFile(item.path, item.reason, sizeBytes)
 		}
 	}
 }

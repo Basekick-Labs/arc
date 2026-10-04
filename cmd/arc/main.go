@@ -3772,9 +3772,18 @@ func main() {
 							PathStyle: cold.S3PathStyle,
 							Prefix:    cold.S3Prefix,
 						}
-						coldBackend, err = storage.NewS3Backend(s3Config, logger.Get("tiering-cold-s3"))
-						if err != nil {
-							log.Error().Err(err).Msg("Failed to create cold tier S3 backend for tiering")
+						// Assigned through a typed local, never straight into
+						// the interface: a constructor error comes back as a
+						// nil *S3Backend, and an interface holding a typed
+						// nil is not == nil (#713). Stored directly, every
+						// "coldBackend != nil" downstream — the startup tier
+						// scan's cold sync, the drainer's existence probe,
+						// the query router's cold glob — would pass and then
+						// dereference a nil receiver.
+						if b, err := storage.NewS3Backend(s3Config, logger.Get("tiering-cold-s3")); err != nil {
+							log.Error().Err(err).Msg("Failed to create cold tier S3 backend for tiering: the cold tier is unusable on this node until the configuration is fixed")
+						} else {
+							coldBackend = b
 						}
 
 					case "azure":
@@ -3787,9 +3796,11 @@ func main() {
 							Endpoint:           cold.AzureEndpoint,
 							UseManagedIdentity: cold.AzureUseManagedIdentity,
 						}
-						coldBackend, err = storage.NewAzureBlobBackend(azureConfig, logger.Get("tiering-cold-azure"))
-						if err != nil {
-							log.Error().Err(err).Msg("Failed to create cold tier Azure backend for tiering")
+						// Typed local for the same reason as the S3 branch.
+						if b, err := storage.NewAzureBlobBackend(azureConfig, logger.Get("tiering-cold-azure")); err != nil {
+							log.Error().Err(err).Msg("Failed to create cold tier Azure backend for tiering: the cold tier is unusable on this node until the configuration is fixed")
+						} else {
+							coldBackend = b
 						}
 					}
 				}
@@ -3858,6 +3869,13 @@ func main() {
 					// unparseable migration_schedule, say — must still get a
 					// Stop, or that goroutine outlives the SQLite handle this
 					// block closes below.
+					//
+					// Same priority as the "cluster-coordinator" hook and
+					// registered after it; sortHooksByPriority is stable, so
+					// the coordinator's delete drain runs while the drainer
+					// is still alive to apply what it reports. Nothing else
+					// enforces that order — keep this block below the cluster
+					// block.
 					shutdownCoordinator.RegisterHook("tiering", func(ctx context.Context) error {
 						cancelScan()
 						<-scanDone
@@ -3872,6 +3890,27 @@ func main() {
 						}
 						return stopErr
 					}, shutdown.PriorityCompaction)
+
+					// Let the cluster layer keep this node's tier rows in step
+					// with its own disk: the replication puller reports what it
+					// pulled, and the local-delete workers report what they
+					// unlinked — that second half only where storage is
+					// per-node, since the delete callback does nothing locally
+					// on a shared bucket. Without this, only locally-flushed
+					// files have rows between tier scans, and on a node that
+					// does not ingest a measurement the query layer loses
+					// partition pruning for it — or, where a cold row exists
+					// and a hot one does not, omits this node's local files
+					// from the read entirely.
+					//
+					// Wired HERE, before the startup scan below is launched,
+					// so there is no moment at which a file can land on disk
+					// after the scan's walk has passed its directory and
+					// before anything records pulls. The rest of the tiering
+					// wiring is further down, with the handlers.
+					if clusterCoordinator != nil {
+						clusterCoordinator.SetTierRecorder(tieringManager)
+					}
 
 					// Start tiering manager
 					if err := tieringManager.Start(); err != nil {
@@ -3916,6 +3955,16 @@ func main() {
 								Int("hot_retired", result.HotRetired).
 								Int("cold_synced", result.ColdSynced).
 								Msg("Startup tier scan completed")
+							// If the scan changed any row — on a node booting
+							// with none, measurements go from nothing to cold
+							// (the sync runs first) to hot and cold — a query
+							// that ran mid-scan has cached a transform built on
+							// the earlier state for up to the cache TTL. A
+							// migration cycle drops the query caches for the
+							// same reason; so does this, at most once per boot.
+							if result.ColdSynced+result.HotRowsWritten+result.HotRetired > 0 {
+								queryHandler.InvalidateCaches()
+							}
 						}()
 					}
 				}
@@ -3971,18 +4020,8 @@ func main() {
 		arrowBuffer.SetTieringManager(tieringManager)
 		log.Info().Msg("Tiering manager wired to arrow buffer for auto-registration")
 
-		// Let the cluster layer keep this node's tier rows in step with its
-		// own disk: the replication puller reports what it pulled, and the
-		// local-delete workers report what they unlinked — that second half
-		// only where storage is per-node, since the delete callback does
-		// nothing locally on a shared bucket. Without this, only
-		// locally-flushed files have rows between tier scans, and on a node
-		// that does not ingest a measurement the query layer loses partition
-		// pruning for it — or, where a cold row exists and a hot one does not,
-		// omits this node's local files from the read entirely.
-		if clusterCoordinator != nil {
-			clusterCoordinator.SetTierRecorder(tieringManager)
-		}
+		// The cluster layer's tier recorder is wired where the manager is
+		// built, before its startup scan is launched — see that block.
 
 		// Configure DuckDB with cold tier S3 credentials for direct S3 queries
 		// This is needed because DuckDB's httpfs extension needs credentials to query S3 directly

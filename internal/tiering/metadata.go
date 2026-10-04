@@ -78,6 +78,14 @@ func (s *MetadataStore) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_tier_files_tier ON tier_files(tier);
 	CREATE INDEX IF NOT EXISTS idx_tier_files_partition ON tier_files(partition_time);
 	CREATE INDEX IF NOT EXISTS idx_tier_files_database_tier ON tier_files(database, tier);
+	-- GetTiersForMeasurement's SELECT DISTINCT tier WHERE database = ? AND
+	-- measurement = ? is the query path's routing read and, uncached, the
+	-- replication drainer's before/after tier-set read. Without this it walks
+	-- every row of the database through idx_tier_files_database_tier and
+	-- filters on measurement. tier is included so the index COVERS the read:
+	-- the planner picks a two-column (database, measurement) index only once
+	-- ANALYZE has run, and nothing in Arc runs ANALYZE.
+	CREATE INDEX IF NOT EXISTS idx_tier_files_database_measurement_tier ON tier_files(database, measurement, tier);
 
 	-- Migration history
 	CREATE TABLE IF NOT EXISTS tier_migrations (
@@ -181,6 +189,12 @@ func (s *MetadataStore) recordHotFileIfNotCold(ctx context.Context, file *FileMe
 		createdAt = time.Now().UTC()
 	}
 
+	// Bound in UTC, here and in every other writer of created_at: the column
+	// is compared in SQL (DeleteFileInTier's createdBefore), go-sqlite3 stores
+	// a time.Time as text in whatever zone the value carries, and the scan
+	// passes a local backend's mtime, which is in the host zone. Two zones in
+	// one column make that comparison a string compare across offsets.
+	//
 	// A quarantined row is matched by the conflict target but excluded from the
 	// update: its key is permanently unusable, and the row records that.
 	res, err := s.db.ExecContext(ctx, `
@@ -197,7 +211,7 @@ func (s *MetadataStore) recordHotFileIfNotCold(ctx context.Context, file *FileMe
 		file.PartitionTime.UTC(),
 		string(TierHot),
 		file.SizeBytes,
-		createdAt,
+		createdAt.UTC(),
 		string(TierHot),
 	)
 	if err != nil {
@@ -256,7 +270,7 @@ func (s *MetadataStore) markFileCold(ctx context.Context, file *FileMetadata) (b
 		file.PartitionTime.UTC(),
 		string(TierCold),
 		file.SizeBytes,
-		createdAt,
+		createdAt.UTC(),
 		string(TierHot),
 	)
 	if err != nil {
@@ -321,7 +335,7 @@ func (s *MetadataStore) RecordFile(ctx context.Context, file *FileMetadata) erro
 		file.PartitionTime.UTC(),
 		string(file.Tier),
 		file.SizeBytes,
-		createdAt,
+		createdAt.UTC(),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to record file: %w", err)
@@ -646,12 +660,16 @@ func (s *MetadataStore) DeleteFile(ctx context.Context, path string) error {
 // changed tier meanwhile.
 //
 // createdBefore extends that to the row's age: a non-zero value deletes only
-// a row at least as old as the caller's evidence. The caller decides from a
-// snapshot, and between the snapshot and this call the replication drainer
-// can register a freshly pulled file under the same path — re-registering
-// keeps the original created_at, so without this condition the decision taken
-// about the old row would delete the new one, leaving a file on disk with no
-// hot row and its measurement reading cold-only.
+// a row at least as old as the caller's evidence. It covers one narrow case —
+// a row the replication drainer DELETED and a later pull re-INSERTED between
+// the caller's snapshot and this call carries a fresh created_at, and the
+// decision was not taken about that row. It does NOT cover a row that was
+// merely re-registered: no conflict branch in this file touches created_at,
+// so a refreshed row is as old as the one the snapshot judged, and the caller
+// has to re-check storage for that (retireVanishedHotRows stats the path).
+//
+// The comparison is on text — go-sqlite3 binds a time.Time in the zone it
+// carries — so every writer of created_at binds UTC and so does this.
 //
 // Reports whether a row was removed.
 func (s *MetadataStore) DeleteFileInTier(ctx context.Context, path string, tier Tier, createdBefore time.Time) (bool, error) {
@@ -855,13 +873,43 @@ func (s *MetadataStore) GetTiersForMeasurement(ctx context.Context, database, me
 	s.tierCacheMu.RUnlock()
 
 	// Cache miss - query database
-	query := `
+	tiers, err := s.queryTierSet(ctx, database, measurement)
+	if err != nil {
+		return nil, err
+	}
+
+	s.storeTierCacheIfUnchanged(cacheKey, tiers, cacheGen)
+
+	// Return a copy
+	result := make(map[Tier]bool, len(tiers))
+	for _, tier := range tiers {
+		result[tier] = true
+	}
+	return result, nil
+}
+
+// readTierSet is GetTiersForMeasurement without the cache: the tiers that have
+// a row for the measurement right now, straight from SQLite. For a writer that
+// needs to know whether its own writes changed the set — the cache can be up
+// to tierCacheTTL behind, and the writer is about to invalidate it anyway.
+func (s *MetadataStore) readTierSet(ctx context.Context, database, measurement string) (map[Tier]bool, error) {
+	tiers, err := s.queryTierSet(ctx, database, measurement)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[Tier]bool, len(tiers))
+	for _, tier := range tiers {
+		result[tier] = true
+	}
+	return result, nil
+}
+
+func (s *MetadataStore) queryTierSet(ctx context.Context, database, measurement string) ([]Tier, error) {
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT DISTINCT tier
 		FROM tier_files
 		WHERE database = ? AND measurement = ?
-	`
-
-	rows, err := s.db.QueryContext(ctx, query, database, measurement)
+	`, database, measurement)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get tiers for measurement: %w", err)
 	}
@@ -875,19 +923,10 @@ func (s *MetadataStore) GetTiersForMeasurement(ctx context.Context, database, me
 		}
 		tiers = append(tiers, TierFromString(tierStr))
 	}
-
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating tiers: %w", err)
 	}
-
-	s.storeTierCacheIfUnchanged(cacheKey, tiers, cacheGen)
-
-	// Return a copy
-	result := make(map[Tier]bool, len(tiers))
-	for _, tier := range tiers {
-		result[tier] = true
-	}
-	return result, nil
+	return tiers, nil
 }
 
 func (s *MetadataStore) storeTierCacheIfUnchanged(key string, tiers []Tier, gen uint64) {

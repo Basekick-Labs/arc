@@ -36,28 +36,53 @@ package tiering
 import (
 	"context"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/storage"
 )
 
-// tierEventQueueSize is the drainer's buffer, sized so a sweep that unlinks
-// thousands of files in back-to-back manifestChunk proposals cannot overflow
-// it. Buffer depth is not the binding constraint — the per-batch deadline is,
-// since takeQueuedTierEvents puts everything queued into one batch.
+// tierEventQueueSize is the drainer's buffer. The pull side drops when it is
+// full — a pull worker must not wait — while the unlink side waits for room up
+// to tierEventUnlinkWait, so under a migration chunk the delete workers are
+// throttled to the drainer's pace instead of losing the tail.
 const tierEventQueueSize = 4096
 
-// tierEventStopDrainTimeout is the per-batch budget once Stop has been
+// tierEventUnlinkWait is how long an unlink report waits for queue room before
+// it is dropped. The reporters are the coordinator's two background delete
+// workers, which have nothing else to do with the time; the wait ends early
+// once Stop has been signalled, so a worker is never held across shutdown.
+const tierEventUnlinkWait = 10 * time.Second
+
+// tierEventStopDrainTimeout is the per-chunk budget once Stop has been
 // signalled. Short on purpose: Stop runs on the shutdown timeout that every
 // remaining hook and component shares, so a slow drain here is paid for by
 // things that still have to run.
 const tierEventStopDrainTimeout = 2 * time.Second
 
-// tierEventDrainTimeout bounds one drained batch. A batch is applied with the
-// process's one SQLite connection, so it must not be able to park the drainer
-// behind a stalled handle indefinitely; whatever is left is retried by the
-// next scan.
-const tierEventDrainTimeout = 30 * time.Second
+// tierEventDrainTimeout bounds one applied chunk of a batch. A chunk is
+// applied with the process's one SQLite connection, so it must not be able to
+// park the drainer behind a stalled handle indefinitely; what is left of the
+// batch when a chunk runs out is counted failed and retried by the next scan.
+// A variable so tests can shrink it.
+var tierEventDrainTimeout = 30 * time.Second
+
+// tierEventChunk is how many events share one deadline. The deadline is a
+// stall detector, not a throughput budget: a batch is the whole queue, up to
+// tierEventQueueSize, and under a migration chunk each unlink in it costs a
+// cold-tier round trip — one deadline over the whole batch would be decided by
+// the batch's size rather than by whether anything is stuck.
+const tierEventChunk = 256
+
+// tierEventProbeParallelism bounds the concurrent cold-tier existence checks
+// per chunk. Sequential HEADs at tens of milliseconds each cannot keep up with
+// the delete workers unlinking a migration's files at disk speed: a nightly
+// migration of a few thousand files would outrun any deadline, and the
+// measurements whose unlinks fell in the failed tail would have their hot
+// files gone and no cold row until the next cold sync — which runs on the
+// same schedule as the primary's migration and so lists cold BEFORE that
+// night's uploads land: invisible on this node until the night after.
+const tierEventProbeParallelism = 16
 
 // tierEventKind distinguishes the two reports the cluster layer makes.
 type tierEventKind int
@@ -104,23 +129,56 @@ func (m *Manager) RecordReplicatedFile(path string, sizeBytes int64) {
 // caller stat'd before deleting, which is also the evidence that this node
 // actually held the file.
 //
-// Non-blocking and nil-receiver safe, as RecordReplicatedFile.
+// Unlike RecordReplicatedFile this WAITS for queue room, up to
+// tierEventUnlinkWait, rather than dropping. The callers are the coordinator's
+// background delete workers, and a migration chunk has them unlinking at disk
+// speed while each of those unlinks costs the drainer a cold-tier round trip;
+// a dropped unlink is a row this node reads wrong until the next cold sync.
+// The wait ends at once if Stop has been signalled. Nil-receiver safe.
 func (m *Manager) RecordUnlinkedFile(path, reason string, sizeBytes int64) {
 	if m == nil {
 		return
 	}
-	m.enqueueTierEvent(tierEvent{kind: tierEventUnlinked, path: path, reason: reason, sizeBytes: sizeBytes})
+	m.enqueueTierEventWait(tierEvent{kind: tierEventUnlinked, path: path, reason: reason, sizeBytes: sizeBytes}, tierEventUnlinkWait)
 }
 
+// enqueueTierEvent queues without waiting.
 func (m *Manager) enqueueTierEvent(ev tierEvent) {
 	select {
 	case m.tierEventCh <- ev:
 	default:
-		m.tierEventsDropped.Add(1)
-		m.logger.Debug().
-			Str("path", ev.path).
-			Msg("Tier metadata event queue full, dropping; the next tier scan will reconcile")
+		m.dropTierEvent(ev)
 	}
+}
+
+// enqueueTierEventWait queues, waiting up to wait for room. It gives up at
+// once, dropping, if tierEventStop is closed: past that point nothing drains
+// the queue, and the caller's goroutine is on the shutdown budget.
+func (m *Manager) enqueueTierEventWait(ev tierEvent, wait time.Duration) {
+	select {
+	case m.tierEventCh <- ev:
+		return
+	case <-m.tierEventStop:
+		m.dropTierEvent(ev)
+		return
+	default:
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case m.tierEventCh <- ev:
+	case <-m.tierEventStop:
+		m.dropTierEvent(ev)
+	case <-timer.C:
+		m.dropTierEvent(ev)
+	}
+}
+
+func (m *Manager) dropTierEvent(ev tierEvent) {
+	m.tierEventsDropped.Add(1)
+	m.logger.Debug().
+		Str("path", ev.path).
+		Msg("Tier metadata event queue full, dropping; the next tier scan will reconcile")
 }
 
 // TierEventStats reports what the drainer has done, for the status endpoint
@@ -153,7 +211,7 @@ func (m *Manager) tierEventLoop() {
 			// database is about to close, and the next startup scan
 			// reconciles whatever is lost.
 			//
-			// stopping=true, because Stop is on the shutdown budget that every
+			// draining=true, because Stop is on the shutdown budget that every
 			// remaining hook and component shares. A drain here writes rows
 			// but spends no network probe, and takes a fraction of the time
 			// rather than a fresh full batch deadline per batch.
@@ -184,8 +242,9 @@ func (m *Manager) takeQueuedTierEvents(first tierEvent) []tierEvent {
 	}
 }
 
-// applyTierEventBatch applies one batch and then invalidates the tier cache
-// once per distinct database/measurement the batch changed.
+// applyTierEventBatch applies one batch in chunks, invalidates the tier cache
+// once per distinct database/measurement the batch changed, and drops the
+// query layer's caches only if some measurement's SET of tiers changed.
 func (m *Manager) applyTierEventBatch(batch []tierEvent) {
 	if len(batch) == 0 {
 		return
@@ -208,6 +267,118 @@ func (m *Manager) applyTierEventBatch(batch []tierEvent) {
 		return
 	}
 
+	// Keyed by database/measurement only, not by tier: invalidateTierCache
+	// takes no tier, so adding one would just bump the generation twice for a
+	// batch that both registered a pulled file and flipped another cold in
+	// the same measurement.
+	touched := make(map[tierEventKey]struct{}, 4)
+	// The tier set each measurement had before this batch's first write to
+	// it, for the decision at the end. Read through the tier cache: every
+	// writer that changes a set invalidates the entry (RecordFile, the cold
+	// sync, DeleteFileInTier, this drainer at the end of each batch, the scan
+	// at the end of its walk), so a cached entry is current up to this batch's
+	// own writes — which the bookkeeping below accounts for. In steady state
+	// that makes the snapshot a map lookup, not a SELECT per pulled file.
+	before := make(map[tierEventKey]tierSetSnapshot, 4)
+	// Measurements a write in this batch could have moved to a different set:
+	// any unlink write, or a pulled file landing where no hot row was. A
+	// pull into a measurement that already had a hot row cannot change the
+	// set, and in steady state that is every event, so those skip the
+	// after-read too.
+	mayChange := make(map[tierEventKey]bool, 4)
+
+	for start := 0; start < len(batch); start += tierEventChunk {
+		end := min(start+tierEventChunk, len(batch))
+		if !m.applyTierEventChunk(batch[start:end], touched, before, mayChange) {
+			// The chunk ran out of its deadline: the SQLite handle is stalled,
+			// or the cold tier is. Each remaining chunk would burn a full
+			// deadline against the same stall, so the rest of the batch is
+			// given up and the next scan reconciles it.
+			if rest := len(batch) - end; rest > 0 {
+				m.tierEventsFailed.Add(int64(rest))
+				m.tierEventsProcessed.Add(int64(rest))
+				m.logger.Warn().
+					Int("unapplied", rest).
+					Msg("Tier metadata batch abandoned after a chunk exceeded its deadline; the next tier scan will reconcile")
+			}
+			break
+		}
+	}
+
+	if len(touched) == 0 {
+		return
+	}
+	for k := range touched {
+		m.metadata.invalidateTierCache(k.database, k.measurement)
+	}
+
+	// The query layer's pruned-path and SQL-transform caches hold WHICH tiers
+	// a measurement reads from — the thing a completed migration changes,
+	// which is why that drops them (main.go wires notifyMigrationComplete to
+	// QueryHandler.InvalidateCaches). A pulled file for a measurement that
+	// already has hot rows, or a compaction unlink that leaves others, changes
+	// nothing those caches hold — and on a replicating node that is every
+	// batch in steady state, since every pulled file is a new path. Dropping
+	// them per batch would disable both caches on every node for as long as
+	// any peer is ingesting, and log two Info lines per batch doing it. So the
+	// sets are compared, and a set that could not be read, before or after,
+	// counts as changed. Without any notification on a genuine change, a node
+	// that has just acquired its first hot row for a measurement it only
+	// receives would keep serving a cached cold-only read for the cache TTL.
+	changed := 0
+	ctx, cancel := context.WithTimeout(context.Background(), tierEventStopDrainTimeout)
+	defer cancel()
+	for k := range touched {
+		if !mayChange[k] {
+			continue
+		}
+		prev, ok := before[k]
+		if !ok || !prev.ok {
+			changed++
+			continue
+		}
+		after, err := m.metadata.readTierSet(ctx, k.database, k.measurement)
+		if err != nil || !sameTierSet(prev.tiers, after) {
+			changed++
+		}
+	}
+	if changed > 0 {
+		m.notifyMigrationComplete(changed, 0)
+	}
+}
+
+// tierEventKey identifies a measurement for the drainer's cache bookkeeping.
+type tierEventKey struct {
+	database    string
+	measurement string
+}
+
+// tierSetSnapshot is a measurement's tier set as read before a batch's first
+// write to it; ok is false when the read failed.
+type tierSetSnapshot struct {
+	tiers map[Tier]bool
+	ok    bool
+}
+
+func sameTierSet(a, b map[Tier]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for t := range a {
+		if !b[t] {
+			return false
+		}
+	}
+	return true
+}
+
+// applyTierEventChunk applies one chunk under one deadline. It gathers the
+// evidence the writes need first — a parse per event, the tier set of each
+// measurement seen for the first time in this batch, and the cold-tier
+// existence of every unlinked path whose row might flip, probed in parallel —
+// and then writes sequentially, so the single SQLite connection never waits on
+// the network. Reports false if the deadline ran out with events unapplied.
+func (m *Manager) applyTierEventChunk(chunk []tierEvent, touched map[tierEventKey]struct{}, before map[tierEventKey]tierSetSnapshot, mayChange map[tierEventKey]bool) bool {
 	budget := tierEventDrainTimeout
 	if m.draining.Load() {
 		budget = tierEventStopDrainTimeout
@@ -215,32 +386,44 @@ func (m *Manager) applyTierEventBatch(batch []tierEvent) {
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 
-	// Keyed by database/measurement only, not by tier: invalidateTierCache
-	// takes no tier, so adding one would just bump the generation twice for a
-	// batch that both registered a pulled file and flipped another cold in
-	// the same measurement.
-	type cacheKey struct {
-		database    string
-		measurement string
-	}
-	touched := make(map[cacheKey]struct{}, 4)
-
-	for i, ev := range batch {
-		if ctx.Err() != nil {
-			// Past the deadline the remaining writes would all fail and log.
-			// Stop with what was applied; the next scan reconciles the rest.
-			m.tierEventsFailed.Add(int64(len(batch) - i))
-			m.tierEventsProcessed.Add(int64(len(batch) - i))
-			m.logger.Warn().
-				Int("unapplied", len(batch)-i).
-				Msg("Tier metadata batch exceeded its deadline; the next tier scan will reconcile")
-			break
-		}
-
+	infos := make([]*FileMetadata, len(chunk))
+	for i, ev := range chunk {
 		info, ok := m.tierEventFileInfo(ev)
 		if !ok {
 			m.tierEventsProcessed.Add(1)
 			continue
+		}
+		infos[i] = info
+		k := tierEventKey{info.Database, info.Measurement}
+		if _, seen := before[k]; !seen {
+			tiers, err := m.metadata.GetTiersForMeasurement(ctx, k.database, k.measurement)
+			before[k] = tierSetSnapshot{tiers: tiers, ok: err == nil}
+		}
+	}
+
+	probes := m.probeColdForChunk(ctx, chunk, infos)
+
+	for i, ev := range chunk {
+		info := infos[i]
+		if info == nil {
+			continue
+		}
+		if ctx.Err() != nil {
+			// Past the deadline the remaining writes would all fail and log.
+			// Count what is left of this chunk; the caller gives up the rest
+			// of the batch.
+			rest := 0
+			for _, later := range infos[i:] {
+				if later != nil {
+					rest++
+				}
+			}
+			m.tierEventsFailed.Add(int64(rest))
+			m.tierEventsProcessed.Add(int64(rest))
+			m.logger.Warn().
+				Int("unapplied", rest).
+				Msg("Tier metadata chunk exceeded its deadline; the next tier scan will reconcile")
+			return false
 		}
 
 		var (
@@ -251,7 +434,11 @@ func (m *Manager) applyTierEventBatch(batch []tierEvent) {
 		case tierEventPulled:
 			wrote, err = m.applyPulled(ctx, info)
 		case tierEventUnlinked:
-			wrote, err = m.applyUnlinked(ctx, info, ev.reason)
+			var probe *coldProbe
+			if p, ok := probes[ev.path]; ok {
+				probe = &p
+			}
+			wrote, err = m.applyUnlinked(ctx, info, ev.reason, probe)
 		}
 
 		switch {
@@ -262,23 +449,83 @@ func (m *Manager) applyTierEventBatch(batch []tierEvent) {
 				Msg("Failed to apply tier metadata event; the next tier scan will reconcile")
 		case wrote:
 			m.tierEventsApplied.Add(1)
-			touched[cacheKey{info.Database, info.Measurement}] = struct{}{}
+			// Keyed after the write: applyUnlinked may have replaced the
+			// path-derived pair with the row's own.
+			k := tierEventKey{info.Database, info.Measurement}
+			touched[k] = struct{}{}
+			if prev, ok := before[k]; ev.kind != tierEventPulled || !ok || !prev.ok || !prev.tiers[TierHot] {
+				mayChange[k] = true
+			}
 		}
 		m.tierEventsProcessed.Add(1)
 	}
+	return true
+}
 
-	if len(touched) == 0 {
-		return
+// coldProbe is the answer of one cold-tier existence check.
+type coldProbe struct {
+	inCold bool
+	err    error
+}
+
+// probeColdForChunk runs the cold-tier existence checks a chunk's unlinks
+// will need, tierEventProbeParallelism at a time. Only an unlink with a
+// tiering reason, on a node that can read cold and is not shutting down, for
+// a path whose row is not already cold, costs a probe — the same conditions
+// applyUnlinked applies, so the two agree on which paths needed one. Returns
+// nil when nothing did.
+func (m *Manager) probeColdForChunk(ctx context.Context, chunk []tierEvent, infos []*FileMetadata) map[string]coldProbe {
+	cold := m.GetBackendForTier(TierCold)
+	if cold == nil || !m.config.Cold.Enabled || m.draining.Load() {
+		return nil
 	}
-	for k := range touched {
-		m.metadata.invalidateTierCache(k.database, k.measurement)
+
+	var paths []string
+	seen := make(map[string]struct{})
+	for i, ev := range chunk {
+		if infos[i] == nil || ev.kind != tierEventUnlinked || !strings.HasPrefix(ev.reason, manifestReasonPrefix) {
+			continue
+		}
+		if _, dup := seen[ev.path]; dup {
+			continue
+		}
+		seen[ev.path] = struct{}{}
+		if existing, err := m.metadata.GetFile(ctx, ev.path); err == nil && existing != nil && existing.Tier == TierCold {
+			continue
+		}
+		paths = append(paths, ev.path)
 	}
-	// Which tiers a measurement reads from has changed, so the query layer's
-	// pruned-path and SQL-transform caches are stale for it — the same reason
-	// a completed migration drops them. Without this a node that has just
-	// acquired hot rows for a measurement it only receives would keep serving
-	// a cached cold-only read for the cache TTL.
-	m.notifyMigrationComplete(len(touched), 0)
+	if len(paths) == 0 {
+		return nil
+	}
+
+	results := make(map[string]coldProbe, len(paths))
+	var (
+		mu  sync.Mutex
+		wg  sync.WaitGroup
+		sem = make(chan struct{}, tierEventProbeParallelism)
+	)
+	for _, p := range paths {
+		if ctx.Err() != nil || m.draining.Load() {
+			// Past the deadline the write pass stops too, and the paths not
+			// probed are among the ones it will not reach. Once Stop has been
+			// signalled no further probe is started: an unprobed unlink
+			// retires its hot row, which is the stop-drain behaviour anyway.
+			break
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(p string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			inCold, err := cold.Exists(ctx, p)
+			mu.Lock()
+			results[p] = coldProbe{inCold: inCold, err: err}
+			mu.Unlock()
+		}(p)
+	}
+	wg.Wait()
+	return results
 }
 
 // applyPulled registers a pulled file as hot, but only if it is still on this
@@ -338,40 +585,66 @@ func (m *Manager) applyPulled(ctx context.Context, info *FileMetadata) (bool, er
 // a row was written; the Warn is the signal that the cold tier was
 // unreachable.
 //
+// probe is the chunk's pre-pass answer for this path when it ran one, and
+// nil otherwise; a nil probe means a direct check here, unless the drainer is
+// stopping.
+//
 // Returns whether a row was written.
-func (m *Manager) applyUnlinked(ctx context.Context, info *FileMetadata, reason string) (bool, error) {
-	// A row that already says cold needs neither branch, and skipping it here
-	// is what keeps the existence check off the high-volume reasons: the
-	// manifest sweep and orphan reconciliation both act on paths this node
-	// has already recorded as cold, and they arrive in chunks of up to a
-	// thousand. Only a path whose row is missing or hot is worth a round trip.
-	if existing, err := m.metadata.GetFile(ctx, info.Path); err == nil && existing != nil && existing.Tier == TierCold {
-		return false, nil
-	}
-
-	// No network probe during shutdown: retiring the hot row is the same
-	// fallback the probe-failure branch below takes, and the cold-tier
-	// metadata sync records the cold row on the next boot either way.
+func (m *Manager) applyUnlinked(ctx context.Context, info *FileMetadata, reason string, probe *coldProbe) (bool, error) {
 	cold := m.GetBackendForTier(TierCold)
-	if strings.HasPrefix(reason, manifestReasonPrefix) && cold != nil && m.config.Cold.Enabled && !m.draining.Load() {
+	if strings.HasPrefix(reason, manifestReasonPrefix) && cold != nil && m.config.Cold.Enabled {
+		// A row that already says cold needs no probe and no write, and
+		// skipping it here is what keeps the existence check off the
+		// high-volume tiering reasons: the manifest sweep and orphan
+		// reconciliation both act on paths this node has already recorded as
+		// cold, and they arrive in chunks of up to a thousand. Only a path
+		// whose row is missing or hot is worth a round trip. The read is
+		// confined to this branch: for every other reason the tier-conditional
+		// DELETE below already refuses a cold row, so a SELECT first would be
+		// a second statement per compaction or retention unlink for nothing.
+		if existing, err := m.metadata.GetFile(ctx, info.Path); err == nil && existing != nil && existing.Tier == TierCold {
+			return false, nil
+		}
+
 		// Keyed on the backend that was actually constructed, not on
 		// Cold.Enabled alone: a cold backend whose construction failed leaves
 		// the feature enabled in config and this node unable to read cold.
-		inCold, err := cold.Exists(ctx, info.Path)
-		if err != nil {
-			// Unreachable cold backend: this node cannot tell whether the
-			// file moved or vanished, but it does know the local copy is
-			// gone, so the one thing the row must not keep saying is "hot
-			// here". Retire it and fall through. If the object really is in
-			// cold, the cold-tier metadata sync records it on the next cycle;
-			// the opposite choice — keeping the hot row — would leave the row
-			// contradicting the disk with nothing but the next scan to fix it.
-			m.logger.Warn().Err(err).
-				Str("path", info.Path).
-				Msg("Could not check the cold tier for an unlinked file; retiring the hot row")
-		} else if inCold {
-			wrote, err := m.metadata.markFileCold(ctx, info)
-			return wrote, err
+		// (main.go assigns it through a typed local so a failed constructor
+		// leaves a true nil here, not a typed one.)
+		//
+		// No NEW network probe during shutdown: retiring the hot row is the
+		// same fallback the probe-failure branch below takes, and the
+		// cold-tier metadata sync records the cold row on the next boot
+		// either way. An answer the pre-pass already has is used regardless.
+		var (
+			inCold  bool
+			err     error
+			decided bool
+		)
+		switch {
+		case probe != nil:
+			inCold, err, decided = probe.inCold, probe.err, true
+		case !m.draining.Load():
+			inCold, err = cold.Exists(ctx, info.Path)
+			decided = true
+		}
+		if decided {
+			if err != nil {
+				// Unreachable cold backend: this node cannot tell whether the
+				// file moved or vanished, but it does know the local copy is
+				// gone, so the one thing the row must not keep saying is "hot
+				// here". Retire it and fall through. If the object really is
+				// in cold, the cold-tier metadata sync records it on the next
+				// cycle; the opposite choice — keeping the hot row — would
+				// leave the row contradicting the disk with nothing but the
+				// next scan to fix it.
+				m.logger.Warn().Err(err).
+					Str("path", info.Path).
+					Msg("Could not check the cold tier for an unlinked file; retiring the hot row")
+			} else if inCold {
+				wrote, err := m.metadata.markFileCold(ctx, info)
+				return wrote, err
+			}
 		}
 	}
 

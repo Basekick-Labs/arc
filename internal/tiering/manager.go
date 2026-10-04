@@ -335,7 +335,9 @@ func (m *Manager) runCycle(ctx context.Context) error {
 	// node reads for a measurement, so the query caches need the same
 	// invalidation a migration would trigger (#662).
 	if m.roleGated() {
-		m.notifyMigrationComplete(scanResult.ColdSynced, 0)
+		// Hot rows the scan wrote count too: a measurement this node had
+		// only cold rows for may have just gained its first hot one.
+		m.notifyMigrationComplete(scanResult.ColdSynced+scanResult.HotRowsWritten, 0)
 		return ErrMigrationRoleGated
 	}
 
@@ -395,9 +397,10 @@ func (m *Manager) runCycle(ctx context.Context) error {
 		Dur("duration", duration).
 		Msg("Migration cycle completed")
 
-	// Cold rows the sync added or flipped count as moved from this node's
-	// point of view: they change which globs a query reads.
-	m.notifyMigrationComplete(totalMigrated+scanResult.ColdSynced, orphansDeleted)
+	// Cold rows the sync added or flipped, and hot rows the scan wrote, count
+	// as moved from this node's point of view: they change which globs a
+	// query reads.
+	m.notifyMigrationComplete(totalMigrated+scanResult.ColdSynced+scanResult.HotRowsWritten, orphansDeleted)
 
 	return nil
 }
@@ -656,6 +659,11 @@ type ScanResult struct {
 	// HotRetired counts hot rows removed because their file is no longer
 	// in hot storage.
 	HotRetired int `json:"hot_retired"`
+	// HotRowsWritten counts hot rows the walk actually inserted or changed.
+	// FilesRegistered counts every hot file the walk accounted for, written
+	// or not, so on a node whose rows already match its disk this is zero
+	// while FilesRegistered is the file count.
+	HotRowsWritten int `json:"hot_rows_written"`
 }
 
 // ScanTiers brings this node's tier metadata in line with storage: the cold
@@ -863,6 +871,13 @@ func (m *Manager) ScanAndRegisterFiles(ctx context.Context) (*ScanResult, error)
 			continue
 		}
 
+		if err := ctx.Err(); err != nil {
+			// Cancelled — the shutdown hook, or the startup scan's deadline.
+			// Every write from here on would fail and log once per remaining
+			// file, and a partial walk must not reach retireVanishedHotRows.
+			return result, err
+		}
+
 		result.FilesScanned++
 
 		// Parse the path to extract database, measurement, and partition time
@@ -921,6 +936,7 @@ func (m *Manager) ScanAndRegisterFiles(ctx context.Context) (*ScanResult, error)
 		}
 		if wrote {
 			touched[fileInfo.Database+"\x00"+fileInfo.Measurement] = [2]string{fileInfo.Database, fileInfo.Measurement}
+			result.HotRowsWritten++
 		}
 
 		result.FilesRegistered++
@@ -999,7 +1015,17 @@ func (m *Manager) retireVanishedHotRows(ctx context.Context, objects []storage.O
 		//
 		// One stat per row judged stale, not per file scanned: a steady-state
 		// node reaches this loop with nothing to retire.
-		if n, statErr := m.hotBackend.StatFile(ctx, row.Path); statErr == nil && n >= 0 {
+		n, statErr := m.hotBackend.StatFile(ctx, row.Path)
+		if statErr != nil {
+			// The stat confirmed nothing, so the listing is not enough on its
+			// own. Keep the row: one kept a scan too long costs an empty glob,
+			// one retired for a file still on disk costs the measurement its
+			// local reads once its other rows are cold.
+			m.logger.Warn().Err(statErr).Str("path", row.Path).Msg("Could not confirm a vanished hot file is gone; keeping its row for the next scan")
+			result.Errors++
+			continue
+		}
+		if n >= 0 {
 			continue
 		}
 
