@@ -856,10 +856,40 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 			if !c.punct(')') {
 				return fail()
 			}
+			// Optional `AS <ident>` (agg-5a). Grafana's time-series frame needs a
+			// column literally named `time`, so real panels alias this item — and
+			// while this arm did not consume one, the ENTIRE aliased dashboard
+			// emission declined while the unaliased form served (measured
+			// 2026-10-02). Validated like the epoch arm's mandatory alias: a bare
+			// identifier that is not a scan keyword, re-emitted from this token and
+			// never from source text.
+			//
+			// This does NOT make the alias resolvable in GROUP BY: `groupRef` below
+			// deliberately ignores `bucketAlias` because DuckDB binds a bare ident
+			// there to the RAW column (oracle-probed at agg-3b). Only `orderRef`
+			// honours it.
+			// `c.ident` consumes unconditionally (it wraps `c.next`), so an
+			// OPTIONAL keyword must save and restore the cursor — consuming on a
+			// miss would eat the following `,` and break every unaliased query.
+			alias := ""
+			save := c.i
+			if c.ident("as") {
+				al, tok := c.next()
+				if !tok || al.kind != tokIdent || isScanKeyword(al.lower) || !isBareIdent(al.orig) {
+					return fail()
+				}
+				alias = al.orig
+			} else {
+				c.i = save
+			}
 			m.bucketUnit = ut.str
 			m.bucketCol = bc.orig
+			m.bucketAlias = alias
 			bucketItem = len(items)
 			bucketText = "date_trunc('" + ut.str + "', " + bc.orig + ")"
+			if alias != "" {
+				bucketText += " AS " + alias
+			}
 			items = append(items, bucketText)
 		} else if isCall && (t.lower == "arg_max" || t.lower == "arg_min" || t.lower == "max_by" || t.lower == "min_by") {
 			// agg-4 two-arg by-time aggregates (see matchScanAgg's arm).
@@ -992,6 +1022,23 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 	if len(seen) != nKeys {
 		return fail() // every projected key must be grouped exactly once
 	}
+	// Optional `HAVING <tree>` (agg-5a) — clause order is GROUP BY, HAVING,
+	// ORDER BY. Re-serialized from validated parts; the grammar is the engine's,
+	// so a shape accepted here cannot be one the engine declines.
+	havingText := ""
+	if c.peekIdentLower() == "having" {
+		c.next()
+		ht, hok := reserializeHaving(c, havingCtx{
+			items:       items,
+			tagKey:      tagKey,
+			bucketAlias: m.bucketAlias,
+		})
+		if !hok {
+			return fail()
+		}
+		havingText = ht
+	}
+
 	// Optional `ORDER BY <key ref> [ASC]` (agg-3): the engine sorts that single
 	// key ascending, NULLS LAST. DESC / LIMIT / multi-key ORDER decline.
 	if c.peekIdentLower() == "order" {
@@ -1021,6 +1068,7 @@ func matchGroupedAgg(toks []token) (m groupedMatch, ok bool) {
 	m.tagKey = tagKey
 	m.tagItem = tagItem
 	m.whereText = whereText
+	m.havingText = havingText
 	m.meas = meas
 	return m, true
 }
@@ -1036,6 +1084,8 @@ type groupedMatch struct {
 	tagKey     string // the bare tag key's spelling ("" = no tag key)
 	tagItem    int    // select-list index of the tag key (-1 = none)
 	whereText  string
+	// agg-5a: re-serialized HAVING over the select items ("" = none).
+	havingText string
 	meas       string
 	bucketUnit string
 	bucketCol  string
