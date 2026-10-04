@@ -561,6 +561,15 @@ predate that fix and #978.
 
 ## Bug fixes
 
+### Database API storage calls now have a deadline ([#1065](https://github.com/Basekick-Labs/arc/issues/1065))
+
+Database API handlers now bound storage calls with a request context. Database
+deletion gets a deadline scaled to the number of listed files, so a large
+database is not cut off by the same fixed limit as a small one; partial-delete
+errors continue to be collected and reported.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1067](https://github.com/Basekick-Labs/arc/pull/1067).
+
 ### A node that rejoins through a Raft snapshot now removes the replicas the cluster deleted while it was away ([#962](https://github.com/Basekick-Labs/arc/issues/962))
 
 On a per-node-storage cluster every node unlinks its local copy of a file when
