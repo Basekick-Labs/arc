@@ -561,6 +561,14 @@ predate that fix and #978.
 
 ## Bug fixes
 
+### Forwarded writes and WAL replication honor cancellation during TLS setup ([#1064](https://github.com/Basekick-Labs/arc/issues/1064))
+
+Leader forwarding and WAL replication now pass their existing contexts into
+peer dials, so cancellation interrupts a stalled TLS handshake instead of
+waiting for the dial timeout. Regression tests cover both paths.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1068](https://github.com/Basekick-Labs/arc/pull/1068).
+
 ### A node that rejoins through a Raft snapshot now removes the replicas the cluster deleted while it was away ([#962](https://github.com/Basekick-Labs/arc/issues/962))
 
 On a per-node-storage cluster every node unlinks its local copy of a file when

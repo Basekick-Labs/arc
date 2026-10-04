@@ -8,6 +8,7 @@ package cluster
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -137,6 +138,45 @@ func TestGetOrDialLeader_RedialsAnIdleConnection(t *testing.T) {
 		t.Errorf("leader accepted %d connections; want 2", got)
 	}
 	c.closeForwardConn()
+}
+
+func TestGetOrDialLeader_CancelInterruptsAStalledTLSHandshake(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	accepted := make(chan struct{})
+	release := make(chan struct{})
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		close(accepted)
+		<-release
+		_ = conn.Close()
+	}()
+	defer close(release)
+
+	c := newForwardCoordinator(t)
+	c.tlsConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // test peer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-accepted
+		cancel()
+	}()
+
+	start := time.Now()
+	_, _, err = c.getOrDialLeader(ctx, "leader-1", listener.Addr().String())
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("dial error = %v, want context.Canceled", err)
+	}
+	if elapsed := time.Since(start); elapsed > 4*time.Second {
+		t.Fatalf("cancelled TLS handshake took %v", elapsed)
+	}
 }
 
 func TestForwardConnRefresh_LeavesRoomForAWholeRoundTrip(t *testing.T) {

@@ -404,7 +404,7 @@ func (c *Coordinator) getOrDialLeader(ctx context.Context, leaderID, leaderAddr 
 
 	// Dial outside the lock.
 	dialTimeout := manifestApplyTimeout(ctx)
-	conn, err := security.Dial("tcp", leaderAddr, dialTimeout, c.tlsConfig)
+	conn, err := security.DialContext(ctx, "tcp", leaderAddr, dialTimeout, c.tlsConfig)
 	if err != nil {
 		return nil, false, fmt.Errorf("dial leader %s (%s): %w", leaderID, leaderAddr, err)
 	}
