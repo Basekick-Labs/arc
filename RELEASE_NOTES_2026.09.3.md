@@ -478,6 +478,29 @@ To be precise about what that bounds: it caps the **subprocesses'** combined bud
 **Also fixed:** `database.memory_limit = "50%"` or `"0"` passed configuration validation and then hard-failed startup inside DuckDB with a bare parser error. Both are now rejected at load with a message naming the key and listing the accepted units, using the same rule `compaction.memory_limit` already enforced.
 
 
+### WAL recovery no longer replays data that already reached Parquet ([#948](https://github.com/Basekick-Labs/arc/issues/948))
+
+**If you run with `wal.enabled = true` and ingest measurements without tags, this fixes a permanent over-counting bug.**
+
+WAL recovery replayed every entry in the files it found, including entries whose batch had already been written to Parquet before the crash. Nothing acknowledged was lost — the failure was in the other direction. For tagged measurements the duplicates are exact copies and compaction removes them at the partition's next pass, so queries merely read high for a while. For measurements **without tags** compaction deliberately does not dedup (two tagless rows sharing a timestamp can be two legitimate events), so those duplicates were never removed: a restart after a hard crash silently double-counted up to a full WAL window of already-durable data, permanently.
+
+Every WAL entry now carries a tracked identity, and a checkpoint entry listing flushed identities is appended to the WAL — and durably synced — only *after* the Parquet write for that batch succeeds. Recovery gathers those checkpoints across all WAL files, including recently rotated files too young to replay and the active file it deliberately skips, and replays only the entries they do not cover. Writer identities come from `crypto/rand`, so a restarted process cannot reuse the previous one's identity space and have a fresh entry silently covered by a stale checkpoint — that inversion would have turned this over-counting bug into real data loss.
+
+Measured on the issue's own acceptance criterion — tagless measurement, `kill -9` mid-ingest, 310 acknowledged records of which 300 had flushed:
+
+| | replayed entries | post-restart rows |
+|---|---|---|
+| before | 310 | 610 (300 permanent duplicates) |
+| after | 10 | 310 (exact) |
+
+The ordering is load-bearing in one direction only: the checkpoint is written strictly after the flush is confirmed, never before. One window remains — a crash in the gap between the Parquet write completing and the checkpoint becoming durable replays that batch — so replay is still at-least-once in the strict sense, but the window is a single in-flight batch rather than a whole WAL file. **Historical over-counts from a crash recovery on an earlier version are not repaired retroactively.**
+
+Checkpoint writes cost nothing measurable at Arc's flush rate: measured ABAB with the WAL on `fdatasync` and local storage at 683 flushes/s, 1,366,233 rows/s against 1,320,917 before the change — inside run-to-run noise.
+
+Two related WAL problems are **not** fixed by this and are tracked in [#1009](https://github.com/Basekick-Labs/arc/issues/1009): the periodic purge still deletes rotated WAL files by modification time rather than by what has actually been flushed, and recovery still deletes a replayed file as soon as its records are back in the buffer, before they reach Parquet.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#998](https://github.com/Basekick-Labs/arc/pull/998).
+
 ### Compaction subprocesses now size their threads from the container's CPU quota ([#1030](https://github.com/Basekick-Labs/arc/issues/1030))
 
 `compaction.threads` defaults to half the available cores, which it derived from `runtime.NumCPU()`. That reflects cpuset/affinity but **not** a CFS quota, and Kubernetes `limits.cpu` and docker `--cpus` are quotas — so on a 2-CPU pod on a 64-core node every compaction subprocess ran `SET threads=32`. This is the same root cause as [#1026](https://github.com/Basekick-Labs/arc/issues/1026) above, in the one place that fix did not reach, and it mattered twice over: the subprocesses are separate processes in the *same* cgroup as the main process, and DuckDB's sort and scan buffers scale with the thread count, so the oversubscription cost memory as well as scheduling.
