@@ -2,6 +2,92 @@
 
 > **Status:** Planned — November 2026 patch release.
 
+## Fixed: a cluster node's tier metadata now follows its own disk, not only what it ingested
+
+On a cluster with peer file replication and a cold tier, a node's `tier_files`
+rows only ever described files that node had written itself. Files the
+replication puller pulled from a peer were never recorded, and files another
+node migrated to cold were not marked cold locally until the receiving node's
+next cold-tier sync. The scan that would have reconciled either runs from the
+migration schedule — `0 2 * * *` by default — and from
+`POST /api/v1/tiering/scan`; nothing ran it at startup.
+
+Because the query layer routes reads from those rows, the gap had two effects
+on any node that was not currently ingesting a measurement:
+
+- **Partition pruning was lost.** With no row for the measurement, the read
+  fell back to the unpruned `{database}/{measurement}/**/*.parquet` glob, so a
+  windowed query scanned every partition instead of the hours it asked for.
+- **Reads could silently omit local data.** The hot tier is included in a
+  multi-tier read only when a row says this node has hot data. A measurement
+  that had a cold row and no hot row — a node whose hot rows were retired after
+  another node migrated the measurement, or one that joined and received its
+  files by catch-up after its own scan — dropped its local files from the read
+  entirely. A windowed `count(*)` over data sitting on that node's disk
+  returned `0`, with `success: true` and no error; an unwindowed `count(*)`
+  undercounted.
+
+Three changes close it:
+
+- The replication puller reports every file it pulls and keeps, and the
+  local-delete workers report every copy they remove, to this node's tier
+  metadata. Both reports are applied by a single background writer, so a
+  catch-up burst cannot pile writers onto the SQLite handle that auth, audit,
+  continuous queries and the ingest flush path share.
+- A delete worker decides what a removal means from evidence rather than from
+  the manifest delete's reason, which an operator can supply: it checks whether
+  the object is actually in cold before marking the row cold, and retires the
+  hot row otherwise.
+- Tier metadata is now scanned once at startup, in the background. This also
+  covers files that arrived while a node was down, and files already on disk
+  when upgrading to this release.
+
+Two visible consequences. `GET /api/v1/tiering/files` and
+`/api/v1/tiering/stats` counts now converge across nodes within seconds of a
+file arriving instead of diverging until the next scan — a node that reported
+`0` files for a measurement it holds will now report them. And the `tier`
+column in `SHOW DATABASES` changes from `local` to `hot` for databases whose
+files reach a node only by replication, because that column reflects the tier
+rows.
+
+New counters for the path: `tier_registered` alongside `pulled` in
+`/api/v1/cluster`'s `replication_catchup_status` — it counts pulls a tier
+recorder accepted, so it tracks `pulled` where tiering is enabled and stays at
+zero where it is not — and `replication_events` in `/api/v1/tiering/status`,
+whose `dropped` should be zero.
+
+One behaviour note for the failure case: if the tiering manager cannot start —
+an unparseable `migration_schedule`, say — queries still route across tiers and
+files are still registered, but no migration or scheduled scan runs. The
+startup log line now says so rather than reporting only the failure.
+
+## Changed: `arc.toml` no longer ships MinIO connection values for the cold tier
+
+The sample `arc.toml` — which is copied into the container image — set
+`s3_endpoint = "localhost:9000"`, static `minioadmin` credentials,
+`s3_use_ssl = false` and `s3_path_style = true` under
+`[tiered_storage.cold]`, with a comment telling operators to leave the
+endpoint empty for AWS. **That instruction could not be followed from the
+environment.** Arc reads configuration through viper's `AutomaticEnv`, which
+treats an empty environment variable as unset, so
+`ARC_TIERED_STORAGE_COLD_S3_ENDPOINT=""` did not clear the file's value: a cold
+tier intended for AWS S3 silently addressed `localhost:9000` instead. Every
+cold listing then failed, which sets `ColdSyncFailed` and makes each migration
+cycle skip.
+
+Those keys, and `s3_bucket`, are now commented out in the sample file, so Arc's
+built-in defaults apply — no endpoint, HTTPS, virtual-hosted addressing, and
+credentials from the AWS chain, which is what IRSA and instance-role detection
+need. The values remain in the file as a commented MinIO/dev block.
+
+**If you enabled the cold tier and relied on the shipped MinIO values, uncomment
+that block as a set.** Leaving only `s3_endpoint` set now means HTTPS and
+virtual-hosted addressing against a MinIO endpoint. Deployments that configure
+the cold tier through environment variables or Helm are unaffected. Note the
+general rule this illustrates: an empty environment variable does not blank a
+key that a configuration file sets — give the key the value you want, or remove
+it from the file.
+
 ## Compaction dedup metrics count Parquet rows correctly ([#1015](https://github.com/Basekick-Labs/arc/issues/1015))
 
 Deduplication row counts now come from DuckDB's `parquet_file_metadata`, where

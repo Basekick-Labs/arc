@@ -1,0 +1,431 @@
+package tiering
+
+// Tier metadata for files this node did not write itself.
+//
+// Before this, a node's tier_files only ever described files it had ingested:
+// the flush path registers what it writes (internal/ingest, RecordFile) and
+// ScanAndRegisterFiles picks up the rest — but that scan runs only from
+// POST /api/v1/tiering/scan, from the pre-migration scan inside a migration
+// cycle, and (since this change) once at startup. At the default
+// migration_schedule of 02:00 that is once a day.
+//
+// On a cluster node with per-node storage and file replication, most of what
+// is on disk arrives from a peer, and most of what leaves does so because
+// another node migrated it. Between daily scans the metadata and the disk
+// disagree, and the query layer routes reads from the metadata:
+//
+//   - a measurement with no row at all falls back to an unpruned
+//     {db}/{meas}/**/*.parquet glob (a performance cost), and
+//   - a measurement with a cold row and no hot row loses its local hot glob
+//     entirely, so files sitting on this node's disk are silently left out of
+//     the answer (a correctness cost).
+//
+// This file closes both directions: the replication puller reports what it
+// pulled, the local-delete worker reports what it unlinked, and a single
+// drainer applies both to tier_files.
+//
+// Why a drainer rather than a write per event: tiering shares one *sql.DB with
+// auth, audit, CQ and retention, and that handle is opened with
+// SetMaxOpenConns(1). A write per pulled file, from the puller's workers and
+// the delete workers at once, would queue on that single connection against
+// live authentication, the audit writer and the ingest flush path's own
+// registration. AuthManager.lastUsedLoop solved the same problem the same way;
+// its comment is worth reading. A batching drainer also bounds how often the
+// tier cache is invalidated: see the note above recordHotFileIfNotCold.
+
+import (
+	"context"
+	"strings"
+	"time"
+
+	"github.com/basekick-labs/arc/internal/storage"
+)
+
+// tierEventQueueSize is the drainer's buffer, sized so a sweep that unlinks
+// thousands of files in back-to-back manifestChunk proposals cannot overflow
+// it. Buffer depth is not the binding constraint — the per-batch deadline is,
+// since takeQueuedTierEvents puts everything queued into one batch.
+const tierEventQueueSize = 4096
+
+// tierEventStopDrainTimeout is the per-batch budget once Stop has been
+// signalled. Short on purpose: Stop runs on the shutdown timeout that every
+// remaining hook and component shares, so a slow drain here is paid for by
+// things that still have to run.
+const tierEventStopDrainTimeout = 2 * time.Second
+
+// tierEventDrainTimeout bounds one drained batch. A batch is applied with the
+// process's one SQLite connection, so it must not be able to park the drainer
+// behind a stalled handle indefinitely; whatever is left is retried by the
+// next scan.
+const tierEventDrainTimeout = 30 * time.Second
+
+// tierEventKind distinguishes the two reports the cluster layer makes.
+type tierEventKind int
+
+const (
+	// tierEventPulled: this node pulled the file from a peer and kept it, so
+	// it is on local (hot) storage now.
+	tierEventPulled tierEventKind = iota
+	// tierEventUnlinked: this node removed its local copy because the file
+	// left the cluster manifest. Whether that means "it is in cold now" or
+	// "it is gone" is decided from evidence, not from the reason — see
+	// applyUnlinked.
+	tierEventUnlinked
+)
+
+// tierEvent is one queued report.
+type tierEvent struct {
+	kind      tierEventKind
+	path      string
+	reason    string
+	sizeBytes int64
+}
+
+// RecordReplicatedFile reports a file this node pulled from a peer and kept,
+// so it is registered in the hot tier the way a local flush would be.
+//
+// Non-blocking, like ingest.FileRegistrar: it runs on a replication pull
+// worker. An event dropped because the queue is full is logged at Debug and
+// counted — Debug because under a catch-up burst a Warn per file is a log
+// flood, and counted because unlike the timestamp update this pattern is
+// copied from, a lost event costs read accuracy until the next scan.
+//
+// Safe on a nil receiver: the cluster layer holds this as an interface, and an
+// interface holding a typed nil is not == nil (#713).
+func (m *Manager) RecordReplicatedFile(path string, sizeBytes int64) {
+	if m == nil {
+		return
+	}
+	m.enqueueTierEvent(tierEvent{kind: tierEventPulled, path: path, sizeBytes: sizeBytes})
+}
+
+// RecordUnlinkedFile reports that this node removed its own local copy of a
+// path because the path left the cluster manifest. sizeBytes is the size the
+// caller stat'd before deleting, which is also the evidence that this node
+// actually held the file.
+//
+// Non-blocking and nil-receiver safe, as RecordReplicatedFile.
+func (m *Manager) RecordUnlinkedFile(path, reason string, sizeBytes int64) {
+	if m == nil {
+		return
+	}
+	m.enqueueTierEvent(tierEvent{kind: tierEventUnlinked, path: path, reason: reason, sizeBytes: sizeBytes})
+}
+
+func (m *Manager) enqueueTierEvent(ev tierEvent) {
+	select {
+	case m.tierEventCh <- ev:
+	default:
+		m.tierEventsDropped.Add(1)
+		m.logger.Debug().
+			Str("path", ev.path).
+			Msg("Tier metadata event queue full, dropping; the next tier scan will reconcile")
+	}
+}
+
+// TierEventStats reports what the drainer has done, for the status endpoint
+// and for tests: a non-zero dropped count with a flat applied count is what a
+// wedged SQLite handle looks like from outside.
+func (m *Manager) TierEventStats() (applied, dropped, failed int64) {
+	if m == nil {
+		return 0, 0, 0
+	}
+	return m.tierEventsApplied.Load(), m.tierEventsDropped.Load(), m.tierEventsFailed.Load()
+}
+
+// tierEventLoop is the single writer applying queued events.
+//
+// It drains in batches: one receive parks until there is something to do, then
+// everything else already queued is taken without blocking and the whole batch
+// is applied before the tier cache is invalidated once per database/
+// measurement it touched. Started by NewManager so the seam is live before
+// Start, and joined by Stop before the shared SQLite handle can be closed.
+func (m *Manager) tierEventLoop() {
+	defer m.tierEventWG.Done()
+
+	for {
+		select {
+		case ev := <-m.tierEventCh:
+			m.applyTierEventBatch(m.takeQueuedTierEvents(ev))
+		case <-m.tierEventStop:
+			// Drain what is already queued, then stop. Events still being
+			// sent concurrently are dropped rather than waited on: the
+			// database is about to close, and the next startup scan
+			// reconciles whatever is lost.
+			//
+			// stopping=true, because Stop is on the shutdown budget that every
+			// remaining hook and component shares. A drain here writes rows
+			// but spends no network probe, and takes a fraction of the time
+			// rather than a fresh full batch deadline per batch.
+			m.draining.Store(true)
+			for {
+				select {
+				case ev := <-m.tierEventCh:
+					m.applyTierEventBatch(m.takeQueuedTierEvents(ev))
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+// takeQueuedTierEvents returns first plus everything else already queued.
+func (m *Manager) takeQueuedTierEvents(first tierEvent) []tierEvent {
+	batch := make([]tierEvent, 0, 16)
+	batch = append(batch, first)
+	for {
+		select {
+		case ev := <-m.tierEventCh:
+			batch = append(batch, ev)
+		default:
+			return batch
+		}
+	}
+}
+
+// applyTierEventBatch applies one batch and then invalidates the tier cache
+// once per distinct database/measurement the batch changed.
+func (m *Manager) applyTierEventBatch(batch []tierEvent) {
+	if len(batch) == 0 {
+		return
+	}
+
+	// Re-checked per batch rather than at startup: a license can expire while
+	// the process runs, and RunMigrationCycle re-checks for the same reason.
+	// NewManager refuses an unlicensed client outright, so in a real process
+	// this only fires on a runtime expiry.
+	//
+	// Only a client that is present and says no blocks. The field is never
+	// nil on a manager NewManager built, and leaving a nil client to mean
+	// "unlicensed" would make this a silent no-op in the package's own tests,
+	// which construct a Manager directly for exactly that reason.
+	if m.licenseClient != nil && !m.licenseClient.CanUseTieredStorage() {
+		// Counted, not silent: without this the status endpoint would report a
+		// healthy drainer while every event was being discarded.
+		m.tierEventsDropped.Add(int64(len(batch)))
+		m.tierEventsProcessed.Add(int64(len(batch)))
+		return
+	}
+
+	budget := tierEventDrainTimeout
+	if m.draining.Load() {
+		budget = tierEventStopDrainTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+
+	// Keyed by database/measurement only, not by tier: invalidateTierCache
+	// takes no tier, so adding one would just bump the generation twice for a
+	// batch that both registered a pulled file and flipped another cold in
+	// the same measurement.
+	type cacheKey struct {
+		database    string
+		measurement string
+	}
+	touched := make(map[cacheKey]struct{}, 4)
+
+	for i, ev := range batch {
+		if ctx.Err() != nil {
+			// Past the deadline the remaining writes would all fail and log.
+			// Stop with what was applied; the next scan reconciles the rest.
+			m.tierEventsFailed.Add(int64(len(batch) - i))
+			m.tierEventsProcessed.Add(int64(len(batch) - i))
+			m.logger.Warn().
+				Int("unapplied", len(batch)-i).
+				Msg("Tier metadata batch exceeded its deadline; the next tier scan will reconcile")
+			break
+		}
+
+		info, ok := m.tierEventFileInfo(ev)
+		if !ok {
+			m.tierEventsProcessed.Add(1)
+			continue
+		}
+
+		var (
+			wrote bool
+			err   error
+		)
+		switch ev.kind {
+		case tierEventPulled:
+			wrote, err = m.applyPulled(ctx, info)
+		case tierEventUnlinked:
+			wrote, err = m.applyUnlinked(ctx, info, ev.reason)
+		}
+
+		switch {
+		case err != nil:
+			m.tierEventsFailed.Add(1)
+			m.logger.Warn().Err(err).
+				Str("path", ev.path).
+				Msg("Failed to apply tier metadata event; the next tier scan will reconcile")
+		case wrote:
+			m.tierEventsApplied.Add(1)
+			touched[cacheKey{info.Database, info.Measurement}] = struct{}{}
+		}
+		m.tierEventsProcessed.Add(1)
+	}
+
+	if len(touched) == 0 {
+		return
+	}
+	for k := range touched {
+		m.metadata.invalidateTierCache(k.database, k.measurement)
+	}
+	// Which tiers a measurement reads from has changed, so the query layer's
+	// pruned-path and SQL-transform caches are stale for it — the same reason
+	// a completed migration drops them. Without this a node that has just
+	// acquired hot rows for a measurement it only receives would keep serving
+	// a cached cold-only read for the cache TTL.
+	m.notifyMigrationComplete(len(touched), 0)
+}
+
+// applyPulled registers a pulled file as hot, but only if it is still on this
+// node's hot storage.
+//
+// The stat is not redundant with the puller's own checks. A pull worker can
+// pass its in-transit manifest re-check and then be descheduled; the delete
+// worker unlinks the same path and reports first; this event then arrives for
+// a file that is no longer there. Inserting a hot row for it would make the
+// measurement claim local data it does not have — and the stale row stands
+// until the next tier scan.
+func (m *Manager) applyPulled(ctx context.Context, info *FileMetadata) (bool, error) {
+	if m.hotBackend != nil {
+		n, err := m.hotBackend.StatFile(ctx, info.Path)
+		if err != nil {
+			return false, err
+		}
+		if n < 0 {
+			// Gone between the pull and here. Not an error: the unlink that
+			// removed it reported too, and that report is the authority.
+			return false, nil
+		}
+	}
+	return m.metadata.recordHotFileIfNotCold(ctx, info)
+}
+
+// applyUnlinked decides what the removal of this node's local copy means for
+// the row, from evidence rather than from the reason string.
+//
+// The reason is a hint only, and must be: the operator manifest-delete
+// endpoint passes whatever ?reason= it is given, so a reason that looks like a
+// migration is not proof of one. Treating it as proof would insert a cold row
+// for a path with no cold object — and nothing retires such a row, because
+// orphan reconciliation only examines cold rows whose hot copy still exists
+// and the cold sync reports a missing object rather than reverting the row.
+// The measurement would then lose its hot glob: the very bug this file fixes.
+//
+// So a migration-shaped reason buys one existence check against the cold
+// backend, and the check decides:
+//
+//   - the object is there — the file really did move to cold, and this node
+//     can read it there. Flip (or insert) the cold row.
+//   - it is not — the file is simply gone from this node. Retire the hot row.
+//
+// Every other reason retires the hot row with no check. Those are the
+// high-volume ones, and the file is genuinely gone in each case: a compaction
+// that consumed it (compaction:<jobID>), a retention or operator delete
+// ("retention:<policyID>", "delete", "operator", anything an admin types) and
+// the reconciler's orphan-manifest sweep ("reconcile-orphan-manifest"). The
+// "delete" path rewrites files and can re-register a path, which is safe here
+// because the delete worker re-checks the manifest before unlinking at all and
+// skips a path that is back.
+//
+// There are three outcomes, not two: the cold check can also FAIL, and it
+// then retires the hot row like the absent case — see the comment at that
+// branch for why. Note the event is counted as applied in that case, because
+// a row was written; the Warn is the signal that the cold tier was
+// unreachable.
+//
+// Returns whether a row was written.
+func (m *Manager) applyUnlinked(ctx context.Context, info *FileMetadata, reason string) (bool, error) {
+	// A row that already says cold needs neither branch, and skipping it here
+	// is what keeps the existence check off the high-volume reasons: the
+	// manifest sweep and orphan reconciliation both act on paths this node
+	// has already recorded as cold, and they arrive in chunks of up to a
+	// thousand. Only a path whose row is missing or hot is worth a round trip.
+	if existing, err := m.metadata.GetFile(ctx, info.Path); err == nil && existing != nil && existing.Tier == TierCold {
+		return false, nil
+	}
+
+	// No network probe during shutdown: retiring the hot row is the same
+	// fallback the probe-failure branch below takes, and the cold-tier
+	// metadata sync records the cold row on the next boot either way.
+	cold := m.GetBackendForTier(TierCold)
+	if strings.HasPrefix(reason, manifestReasonPrefix) && cold != nil && m.config.Cold.Enabled && !m.draining.Load() {
+		// Keyed on the backend that was actually constructed, not on
+		// Cold.Enabled alone: a cold backend whose construction failed leaves
+		// the feature enabled in config and this node unable to read cold.
+		inCold, err := cold.Exists(ctx, info.Path)
+		if err != nil {
+			// Unreachable cold backend: this node cannot tell whether the
+			// file moved or vanished, but it does know the local copy is
+			// gone, so the one thing the row must not keep saying is "hot
+			// here". Retire it and fall through. If the object really is in
+			// cold, the cold-tier metadata sync records it on the next cycle;
+			// the opposite choice — keeping the hot row — would leave the row
+			// contradicting the disk with nothing but the next scan to fix it.
+			m.logger.Warn().Err(err).
+				Str("path", info.Path).
+				Msg("Could not check the cold tier for an unlinked file; retiring the hot row")
+		} else if inCold {
+			wrote, err := m.metadata.markFileCold(ctx, info)
+			return wrote, err
+		}
+	}
+
+	wrote, database, measurement, err := m.metadata.retireHotRow(ctx, info.Path)
+	if wrote {
+		// retireHotRow read them off the row that existed; prefer those over
+		// the path-derived pair in case an older row used another convention.
+		info.Database = database
+		info.Measurement = measurement
+	}
+	return wrote, err
+}
+
+// tierEventFileInfo turns a queued event into the row to write, using the same
+// path parser and the same exclusions as the hot scan.
+//
+// Database and measurement come from the PATH, not from the cluster manifest
+// entry — which carries its own copies — so that the row a replicated file
+// produces names the same database and measurement the scan would name for
+// that file. That matters because the scan is the other writer of these rows,
+// and a disagreement would make each pass rewrite the other's work. (created_at
+// does differ — the scan uses the object's mtime, this uses now — but neither
+// writer updates it on a conflict, so whichever sees the path first wins and
+// no pass rewrites it.)
+//
+// The two are not always the same: parseFilePath maps a spoke-namespaced
+// {spoke}/{db}/{meas}/... to database=spoke, measurement=db, because that is
+// the split the query layer produces for those paths, while the flush path and
+// the manifest entry carry the spoke's own pre-namespaced names. There are
+// three writers of tier_files and two conventions; this follows the scan's.
+func (m *Manager) tierEventFileInfo(ev tierEvent) (*FileMetadata, bool) {
+	if !strings.HasSuffix(ev.path, ".parquet") {
+		return nil, false
+	}
+	// Reserved roots hold Arc's own state; _schema anchors are Parquet but
+	// never tiered data. Not an error, same as the scan.
+	if first, _, _ := strings.Cut(ev.path, "/"); storage.IsReservedRootDir(first) {
+		return nil, false
+	}
+
+	info, err := m.parseFilePath(ev.path)
+	if err != nil {
+		m.logger.Debug().Err(err).
+			Str("path", ev.path).
+			Msg("Tier metadata event for an unparseable path, skipping")
+		return nil, false
+	}
+
+	return &FileMetadata{
+		Path:          ev.path,
+		Database:      info.Database,
+		Measurement:   info.Measurement,
+		PartitionTime: info.PartitionTime,
+		SizeBytes:     ev.sizeBytes,
+		CreatedAt:     time.Now().UTC(),
+	}, true
+}
