@@ -32,13 +32,19 @@ func Middleware(logger *Logger, includeReads bool) fiber.Handler {
 			return c.Next()
 		}
 
-		// Skip GET requests unless includeReads is enabled
-		method := utils.CopyString(c.Method())
+		// Skip GET requests unless includeReads is enabled. Compare the
+		// borrowed string first so a skipped request allocates nothing.
+		method := c.Method()
 		if !includeReads && method == "GET" {
 			return c.Next()
 		}
 
-		// Retain the original path even if a handler rewrites it.
+		// Fiber runs with Immutable=false, so every accessor returns a string
+		// aliasing a pooled request buffer that the next request overwrites.
+		// The event outlives the request (a background writer serialises it),
+		// so copy each retained string. The path is copied before the handler
+		// runs so a handler that rewrites it does not change the audited one.
+		method = utils.CopyString(method)
 		path = utils.CopyString(path)
 		start := time.Now()
 

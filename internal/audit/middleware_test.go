@@ -38,8 +38,7 @@ func TestMiddlewareOwnsRequestDataBeforeEnqueue(t *testing.T) {
 				} else if tc.name == "empty metadata" {
 					detail = map[string]string{}
 				}
-				// Literal key also lets this regression compile against the original middleware.
-				c.Locals("audit_detail", detail)
+				c.Locals(DetailLocalsKey, detail)
 				c.Locals("token_info", &auth.TokenInfo{Name: "service-token"})
 				return c.SendStatus(fiber.StatusCreated)
 			})
