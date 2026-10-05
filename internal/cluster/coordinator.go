@@ -5197,10 +5197,10 @@ func (c *Coordinator) WaitForLeader(timeout time.Duration) error {
 	return c.raftNode.WaitForLeader(timeout)
 }
 
-// LocalNodeID returns the local cluster node ID. Phase 4 uses this via
-// the CompactionBridge to set OriginNodeID on compacted-file Raft entries
-// so Phase 2/3's multi-peer resolver routes replica pulls back to the
-// compactor that produced the output.
+// LocalNodeID returns the local cluster node ID. The CompactionBridge stamps
+// it as OriginNodeID on compacted-file Raft entries, and the delete handler on
+// rewritten entries (#976), so the multi-peer resolver routes replica pulls to
+// the node that produced the bytes.
 func (c *Coordinator) LocalNodeID() string {
 	if c.localNode == nil {
 		return ""
