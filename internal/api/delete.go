@@ -164,12 +164,6 @@ var dangerousIOFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join([]s
 	"arc_partition_agg",
 }, "|") + `)\s*\(`)
 
-// Dangerous prefix patterns (match at word start)
-var dangerousPrefixPatterns = []string{
-	"xp_",
-	"sp_",
-}
-
 // NewDeleteHandler creates a new delete handler. tempDir MUST be the same
 // path cmd/arc/main.go added to the DuckDB sandbox's allowed_directories,
 // otherwise the COPY ... TO inside rewriteS3File fails on S3-backed
@@ -543,13 +537,6 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	normalised = stripSQLComments(normalised, features.hasDashComment || features.hasBlockComment)
 	if stringLiteralInTablePosition(normalised) {
 		return false, fmt.Errorf("WHERE clause may not put a string literal in table position (replacement scans are disabled)")
-	}
-
-	// Check for dangerous prefixes
-	for _, pattern := range dangerousPrefixPatterns {
-		if strings.Contains(whereUpper, pattern) {
-			return false, fmt.Errorf("WHERE clause contains forbidden pattern: %s", pattern)
-		}
 	}
 
 	// Check for unmatched quotes
