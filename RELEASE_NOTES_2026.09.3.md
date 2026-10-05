@@ -561,12 +561,6 @@ predate that fix and #978.
 
 ## Bug fixes
 
-### A replica refreshes an in-flight file when its manifest content changes ([#798](https://github.com/Basekick-Labs/arc/issues/798))
-
-When a replica is pulling a file and the manifest advances that path to different content, the puller now hands the path to the current version, including when the ordinary registration and forced content-change callbacks arrive together. A verified copy of the in-flight version remains available until its successor is installed. This covers the in-flight update shape; a same-size rewrite on the origin node and a delete followed by same-size re-registration during the delete grace window remain outside this fix.
-
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#907](https://github.com/Basekick-Labs/arc/pull/907).
-
 ### A node that rejoins through a Raft snapshot now removes the replicas the cluster deleted while it was away ([#962](https://github.com/Basekick-Labs/arc/issues/962))
 
 On a per-node-storage cluster every node unlinks its local copy of a file when

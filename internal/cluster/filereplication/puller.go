@@ -159,6 +159,15 @@ type Config struct {
 	// the check would be one HEAD per own entry per walk.
 	RepullMissingSelfOrigin bool
 
+	// ForceContentRefresh lets an FSM content-change signal bypass the
+	// size-only presence check and rewrite the local copy (#798). On a per-node
+	// backend that is the point. On a shared backend every node reads the
+	// writer's own object, so a forced pull would download it from a peer and
+	// upload it back over the same key: a wasted transfer at best, and a
+	// regression of the object if a second rewrite races the upload. The
+	// coordinator sets it for local storage only, like RepullMissingSelfOrigin.
+	ForceContentRefresh bool
+
 	// Backend is the local storage backend. The puller calls StatFile (and,
 	// on a backend that stages writes, StagedSize and Exists) to skip
 	// already-local files and WriteReader to stream pulled bytes onto disk.
@@ -321,8 +330,8 @@ type Puller struct {
 	totalTierRegistered            atomic.Int64 // pulled files reported to tier metadata
 	totalPeerLookupFailure         atomic.Int64 // no candidate peers available
 	totalBadOffsetServer           atomic.Int64 // server rejected resume offset (AckCodeBadOffset)
-	// Backend can't append (ErrResumeNotSupported). Kept because staging and
-	// append support are independent interfaces by contract.
+	// Kept because staging and append support are independent interfaces by
+	// contract.
 	totalBadOffsetBackend atomic.Int64 // backend can't append (ErrResumeNotSupported)
 	totalInvalidPath      atomic.Int64 // entry path is permanently unusable (storage.ErrInvalidPath)
 
@@ -1087,6 +1096,11 @@ func (p *Puller) enqueue(entry *raft.FileEntry, source enqueueSource, force bool
 	if entry == nil {
 		return enqueueResultInvalid
 	}
+	// On a shared backend a content change is just a registration: the object
+	// the manifest describes is already the one this node reads.
+	if force && !p.cfg.ForceContentRefresh {
+		force = false
+	}
 	// Fast-path: a reactive register of a self-origin file means this node
 	// just wrote it; nothing to pull. The walks reach here for a self-origin
 	// entry only after checking the disk (RepullMissingSelfOrigin), so the
@@ -1247,8 +1261,9 @@ func (p *Puller) CatchUpCompleted() bool {
 // Self-heal: catchupFailed and catchupDropped both decrement when a later
 // successful pull resolves a previously-affected path, or when the entry is
 // deleted from the cluster manifest (OnManifestDelete, fired by the FSM on
-// every node; pruneStaleCatchUpState covers snapshot restores, which fire no
-// callbacks), so transient peer outages, queue-saturation events, and entries
+// every node, including for the paths a snapshot restore drops since #962;
+// pruneStaleCatchUpState covers what neither reaches), so transient peer
+// outages, queue-saturation events, and entries
 // no peer can serve don't require a process restart to clear the gate.
 // Periodic reconciliation cannot create or remove startup tags, and its
 // failures cannot reopen readiness, but its successful pulls can heal

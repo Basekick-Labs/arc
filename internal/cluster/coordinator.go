@@ -4081,6 +4081,7 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// pull back the files it originated (#959). On a shared bucket a
 		// missing own object is not on any peer either.
 		RepullMissingSelfOrigin: c.storage.Type() == "local",
+		ForceContentRefresh:     c.storage.Type() == "local",
 		Backend:                 c.storage,
 		Fetcher:                 fetchClient,
 		PeerResolver:            resolver,
@@ -4209,8 +4210,11 @@ func (c *Coordinator) startFilePullerLocked() error {
 		c.enqueueLocalDelete(path, reason)
 	}
 
-	fsm.SetFileCallbacks(onRegister, onDelete)
+	// The content-change callback goes in first: the FSM fires it right after
+	// onRegister for one apply, so wiring it second would leave a window in
+	// which an update arrives with only its non-forced half delivered.
 	fsm.SetFileContentChangedCallback(onContentChanged)
+	fsm.SetFileCallbacks(onRegister, onDelete)
 
 	// Start the puller workers.
 	puller.Start(context.Background())

@@ -517,9 +517,7 @@ func TestPeriodicReconciliationStopsOnCancellation(t *testing.T) {
 		if once.CompareAndSwap(false, true) {
 			close(started)
 		}
-		select {
-		case <-p.ctx.Done():
-		}
+		<-p.ctx.Done()
 		return nil, "", p.ctx.Err()
 	}, time.Millisecond)
 

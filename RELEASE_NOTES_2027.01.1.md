@@ -4,6 +4,30 @@
 
 ## Bug fixes
 
+### A replica refreshes a file whose manifest content changes while it is being pulled ([#798](https://github.com/Basekick-Labs/arc/issues/798))
+
+The puller deduplicated arrivals by path: a manifest update for a path whose
+pull was already in flight was dropped as a duplicate, and a rewrite that kept
+the file's size was then skipped by the size-only presence check, so a reader
+kept serving the old bytes until the next content change of that path. The FSM
+now signals a content change (a different checksum or size) separately from the
+plain registration, the puller hands an in-flight path over to the newest
+version instead of dropping it, a content change bypasses the size check, and a
+forced refresh that fails or is dropped is remembered by path so the next
+arrival of that path is forced too. A verified copy of the previous version is
+kept until its successor is installed, so a failed refresh never leaves the
+node without the file. On shared-storage clusters, where every node reads the
+writer's own object, forced refreshes are off: the object is never re-uploaded
+by a reader.
+
+Two shapes stay outside this fix: a delete followed by a same-size
+re-registration of the same path inside the delete grace window, which the
+registrar sees as a new file rather than a change; and a rewrite a node learns
+of from a Raft snapshot rather than from the log, since a snapshot restore
+fires no registration callbacks (#1071 tracks the snapshot side).
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#907](https://github.com/Basekick-Labs/arc/pull/907).
+
 ### Delete API WHERE validation no longer rejects SQL words and punctuation inside string literals ([#834](https://github.com/Basekick-Labs/arc/issues/834))
 
 `POST /api/v1/delete` scans the WHERE clause for statement-level SQL before it
