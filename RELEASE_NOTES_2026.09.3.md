@@ -561,6 +561,12 @@ predate that fix and #978.
 
 ## Bug fixes
 
+### Cluster imports now forward writes to writer nodes ([#1070](https://github.com/Basekick-Labs/arc/issues/1070))
+
+CSV, Parquet, line-protocol, and TLE imports received by reader or compactor nodes now use the existing cluster write-forwarding path. Replayable request bodies are reused for retries without an additional full-payload copy.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1075](https://github.com/Basekick-Labs/arc/pull/1075).
+
 ### A node that rejoins through a Raft snapshot now removes the replicas the cluster deleted while it was away ([#962](https://github.com/Basekick-Labs/arc/issues/962))
 
 On a per-node-storage cluster every node unlinks its local copy of a file when
