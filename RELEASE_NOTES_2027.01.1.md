@@ -4,6 +4,29 @@
 
 ## Bug fixes
 
+### The measurement endpoint's `where` parameter no longer rejects values that contain SQL words ([#987](https://github.com/Basekick-Labs/arc/issues/987))
+
+`GET /api/v1/query/:measurement?where=...` pre-filters the clause for
+statement-level SQL before the shared validator checks the assembled statement.
+That pre-filter ran a plain substring match on the raw, upper-cased text, so it
+refused any value containing a forbidden word (`msg = 'created at noon'` failed
+on `CREATE`), any identifier containing one (`created_at`), and any value with a
+comment marker (`note = 'a--b'`).
+
+Keywords are now matched as whole words on a copy of the clause with its string
+literals masked by the same masker the query path uses; `;` and comment markers
+are still refused outside a literal, and a keyword glued to a number or a
+literal (`1UNION`, `'a'union`) is still seen. The assembled statement still goes
+through the shared validator with its file-I/O and replacement-scan checks,
+which is where this endpoint's security boundary has been since 26.09.1.
+
+The `xp_`/`sp_` entries are gone from this list. They were SQL Server procedure
+prefixes with no meaning to DuckDB, and here they were dead code: lowercase
+patterns compared against an upper-cased clause. The delete API's copy of the
+same two strings is tracked separately in #1077.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#988](https://github.com/Basekick-Labs/arc/pull/988).
+
 ### Delete API WHERE validation no longer rejects SQL words and punctuation inside string literals ([#834](https://github.com/Basekick-Labs/arc/issues/834))
 
 `POST /api/v1/delete` scans the WHERE clause for statement-level SQL before it

@@ -843,6 +843,48 @@ func TestValidateWhereClauseQuery(t *testing.T) {
 	}
 }
 
+// Edge cases added in review: identifiers that merely contain the former
+// xp_/sp_ prefixes or a keyword pass; the escaped-quote, trailing-comment and
+// dollar-tag shapes the masker was hardened against stay refused; and a quote
+// inside a backtick identifier must not open a literal that swallows the
+// statement after it.
+func TestValidateWhereClauseQueryMaskingEdgeCases(t *testing.T) {
+	// Every keyword in the list is still refused as a bare word.
+	for _, kw := range dangerousQueryKeywords {
+		if err := validateWhereClauseQuery("x = 1 " + kw + " y"); err == nil {
+			t.Errorf("validateWhereClauseQuery accepted bare keyword %q", kw)
+		}
+	}
+	for _, where := range []string{
+		`resp_time > 5`,
+		`disp_name = 'x'`,
+		`"drop" = 1`,
+		`note = 'it''s a drop; test'`,
+		`tag = $$drop$$`,
+		`tag = E'delete'`,
+		`x1union = 1`,
+	} {
+		if err := validateWhereClauseQuery(where); err != nil {
+			t.Errorf("validateWhereClauseQuery(%q) rejected valid input: %v", where, err)
+		}
+	}
+	for _, where := range []string{
+		`host = '\' OR 1=1; DROP TABLE x -- '`,
+		"host = 'a' -- '\n; DROP TABLE x",
+		`host = 'a' AS t$$$ ; DROP TABLE x`,
+		"`a'` = 1 OR 1=1; DROP TABLE x OR `'` = 1",
+		// DuckDB lexes 1UNION as two tokens; the whole-word scan must still see UNION.
+		`x = 1UNION SELECT 1`,
+		// A keyword glued to a literal has no word boundary against the masker's placeholder.
+		`host='a'union select 1`,
+		`host='a'UNION SELECT * FROM users`,
+	} {
+		if err := validateWhereClauseQuery(where); err == nil {
+			t.Errorf("validateWhereClauseQuery(%q) accepted unsafe input", where)
+		}
+	}
+}
+
 func TestValidateWhereClauseQueryAllowsPatternsInStringLiterals(t *testing.T) {
 	for _, keyword := range dangerousQueryKeywords {
 		t.Run(keyword, func(t *testing.T) {
