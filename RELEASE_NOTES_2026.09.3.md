@@ -631,6 +631,34 @@ from a partial by name and is out of scope here.
 
 Contributed by [@pujitha24](https://github.com/pujitha24) in [#906](https://github.com/Basekick-Labs/arc/pull/906).
 
+### Line-protocol WAL entries now carry their database ([#889](https://github.com/Basekick-Labs/arc/issues/889))
+
+The WAL has two append paths and only one of them carried the database. Native
+msgpack writes store the client's bytes behind an envelope that names the
+database; line-protocol writes, which reach the buffer as columns with no raw
+bytes, fell back to a bare row-format entry. The replication stream carries the
+entry as written, and a receiver parses it with `default` as the fallback
+database, so every line-protocol row a replica received was filed under
+`default` rather than the database it was written to. The row-format path now
+writes the same envelope. A receiver resolves the real database; recovery on
+the writing node is unchanged, since it already routed by the `_database`
+stamped on each record, and any binary from 26.05.1 on reads the entry.
+
+This is one of the three issues that make up the local-storage replication
+design work ([#886](https://github.com/Basekick-Labs/arc/issues/886),
+[#888](https://github.com/Basekick-Labs/arc/issues/888), #889), and the other
+two are deliberately not in this release. A replica that applies replicated
+rows flushes them into its own storage and its queries read that copy alongside
+the file it pulls from the primary, so a receiver must not start on a node
+without the hand-off #888 describes. Helm-deployed clusters run no receivers on
+readers or compactors and see no behaviour change from this fix. On a cluster
+where readers do receive (a local WAL enabled on the reader), line-protocol rows
+now land in the right database instead of `default`. The receiving reader still
+flushes and announces its own copy of them, so until #888 lands those rows count
+twice on every node, as native msgpack rows already did.
+
+Contributed by [@lecodev-26](https://github.com/lecodev-26) in [#1055](https://github.com/Basekick-Labs/arc/pull/1055). [@drakeo338](https://github.com/drakeo338) proposed the same source-side fix in #889.
+
 ## Experimental arcx Arrow IPC streams signal writer panics ([#846](https://github.com/Basekick-Labs/arc/issues/846))
 
 When the experimental arcx Arrow IPC stream writer panics, the response now
