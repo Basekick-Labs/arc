@@ -79,11 +79,11 @@ func isClientForwardingHeader(canonicalKey string) bool {
 // forwarding via the router.
 //
 // Lifecycle: every caller in this codebase (lineprotocol.go, msgpack.go,
-// tle.go, query.go) invokes the returned *http.Request synchronously
+// import.go, tle.go, query.go) invokes the returned *http.Request synchronously
 // within the Fiber handler — they pass it to router.RouteWrite/RouteQuery
-// (which blocks on http.Client.Do, and internally already buffers the body
-// via io.ReadAll for retry support, see internal/cluster/router.go
-// forwardRequest), then read+close the response
+// (which blocks on http.Client.Do and reopens this bytes.Reader for retries
+// without copying the request body, see internal/cluster/router.go
+// doForward), then read+close the response
 // body inside CopyResponse, then return. fasthttp does not recycle the
 // RequestCtx until after the handler returns (fasthttp server.go
 // releaseCtx is post-handler), so wrapping c.Body() in bytes.NewReader
@@ -103,8 +103,8 @@ func BuildHTTPRequest(c *fiber.Ctx) (*http.Request, error) {
 	url := c.BaseURL() + c.OriginalURL()
 
 	// Wrap fasthttp's body slice directly — synchronous-handler lifecycle
-	// argument above. Router.forwardRequest then io.ReadAll's it into its
-	// own buffer for retry support before issuing http.Client.Do.
+	// argument above. NewRequestWithContext records a GetBody function for this
+	// bytes.Reader, which lets the router retry without copying the payload.
 	body := bytes.NewReader(c.Body())
 
 	// c.Context() propagates client-disconnect cancellation to the
