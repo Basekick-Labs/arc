@@ -14,7 +14,7 @@ Thanks for your interest in improving Arc. Contributions of all sizes are welcom
 1. **One issue per PR.** Reference it in the body (`Closes #123`, or `Refs #123` if your change covers only part of it).
 2. **Keep PRs small.** We do not review large PRs. If the fix you have in mind is large, split it into a series of smaller PRs that can be reviewed and merged independently. A PR that does one thing well merges fast; a PR that does five things waits.
 3. **Add tests.** A bug fix needs a regression test that fails before the fix and passes after it. Deterministic tests are strongly preferred over sleeps and retries.
-4. **Add a release-notes entry.** Fixes go into the current planned release notes file (for example `RELEASE_NOTES_2027.01.1.md`) as a `###` entry under the `## Bug fixes` section, ending with a credit line:
+4. **Add a release-notes entry.** Fixes go into the current planned release notes file (for example `RELEASE_NOTES_2026.09.2.md`) as a `###` entry under the `## Bug fixes` section, ending with a credit line:
 
    ```markdown
    Contributed by [@your-handle](https://github.com/your-handle) in [#PR](https://github.com/Basekick-Labs/arc/pull/PR).
