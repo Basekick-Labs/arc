@@ -33,8 +33,8 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
-	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/basekick-labs/arc/internal/arcxengine"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
@@ -88,11 +88,24 @@ type Metrics interface {
 	// candidate — WARN-class, never the mismatch alarm).
 	ArcxShadowArgDivergence(shape string)
 	ArcxShadowError(shape string)
+	// ArcxServeError: an engine failure on the SERVE path. Separate from
+	// ArcxShadowError because feeding both into one counter made a serve-mode
+	// dashboard read "shadow errors > 0" while no shadow comparison was running.
+	ArcxServeError(shape string)
+	// ArcxShadowOracleError: the DuckDB oracle failed. Says nothing about arcx,
+	// but must be counted or the outcome buckets no longer sum to attempts.
+	ArcxShadowOracleError(shape string)
+	// ArcxShadowPanic: a shadow goroutine panicked and was recovered.
+	ArcxShadowPanic(shape string)
 	// ArcxShadowSkipped: a shadow sample was deliberately not taken (at the concurrency
 	// cap, or the result exceeded ShadowMaxRows). NOT an error and NOT a mismatch —
 	// conflating a skipped sample with a wrong answer would train operators to ignore
 	// shadow alarms, which is the one thing shadow mode exists to provide.
-	ArcxShadowSkipped(shape string)
+	// `reason` is one of metrics.ShadowSkipped{Shed,Cap,Host} — split because a
+	// shed sample (sampling under load) means something operationally different
+	// from a capped result or a host-side failure, and conflating them is what
+	// made a deterministic bug look intermittent.
+	ArcxShadowSkipped(shape, reason string)
 	ArcxShadowDeclined(shape string)
 	ArcxLatency(engine, shape string, micros int64)
 }
@@ -127,6 +140,8 @@ type Decision struct {
 	// the mandatory alias — the builder re-emits from these validated parts.
 	EpochWidthSecs int
 	BucketAlias    string
+	// agg-5a: re-serialized HAVING over the select items ("" = none).
+	HavingText string
 }
 
 // Decide is the cheap per-query pre-filter. It never calls the engine; it only
@@ -165,6 +180,7 @@ func Decide(sql, headerDB string, h Handler) Decision {
 		Cols:           m.cols,
 		Preds:          m.preds,
 		WhereText:      m.whereText,
+		HavingText:     m.havingText,
 		OrderBy:        m.orderBy,
 		Limit:          m.limit,
 		AggItems:       m.aggItems,
@@ -227,7 +243,7 @@ func RunArrow(ctx context.Context, d Decision, h Handler, mode Mode) (reader arr
 			if _, unsupported := err.(arcxengine.ErrUnsupported); !unsupported {
 				h.Logger.Error().Err(err).Str("shape", d.Shape).Str("sql", sqlutil.ForLog(engineSQL)).
 					Msg("arcx serve (arrow): engine ERROR; falling back to DuckDB")
-				h.Metrics.ArcxShadowError(d.Shape)
+				h.Metrics.ArcxServeError(d.Shape)
 			}
 			return nil, false
 		}
@@ -379,6 +395,15 @@ func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 			return "", false
 		}
 		bucketText = "date_trunc('" + d.BucketUnit + "', " + d.BucketCol + ")"
+		// agg-5a: carry the alias through to the engine so the OUTPUT column keeps
+		// the name the user asked for (Grafana needs `time`). Rebuilt from the
+		// validated token, like every other part of this SQL.
+		if d.BucketAlias != "" {
+			if !isBareIdent(d.BucketAlias) {
+				return "", false
+			}
+			bucketText += " AS " + d.BucketAlias
+		}
 	}
 	tagText := ""
 	if d.GroupKey != "" {
@@ -433,6 +458,14 @@ func buildGroupedSQL(d Decision, pathArray string) (string, bool) {
 			b.WriteString(", ")
 		}
 		b.WriteString(strconv.Itoa(kp))
+	}
+	// agg-5a: HAVING between GROUP BY and ORDER BY. The text was rebuilt from
+	// validated parts by reserializeHaving — item text for aggregates, validated
+	// bare identifiers for keys, re-emitted literals — so nothing of the user's
+	// spelling reaches the engine SQL here either.
+	if d.HavingText != "" {
+		b.WriteString(" HAVING ")
+		b.WriteString(d.HavingText)
 	}
 	if d.OrderByItem != 0 {
 		ok := false
@@ -600,93 +633,6 @@ func buildScanSQL(d Decision, pathArray string) (string, bool) {
 	return b.String(), true
 }
 
-// drainReaderToRecord pulls every batch from a streaming reader and concatenates them into
-// ONE arrow.Record (the shadow comparators take a single Record). Each batch is Retained on
-// extraction because the reader auto-releases the previous batch on the next Next() (the
-// arrow-go C-stream reader contract). The caller MUST runtime.KeepAlive(reader) until after
-// this returns — the batches are FFI-backed and free on the reader's GC finalizer. Returns
-// an empty-but-schema'd record for a zero-batch result.
-// `maxRows` bounds the drain: shadow materializes the WHOLE result into one record, and
-// an eligible shape need carry no LIMIT (`SELECT host FROM cpu` is eligible), so an
-// unbounded drain on a large measurement is an OOM in Arc's own address space. Stopping
-// early is safe here — shadow never serves, and a truncated compare is reported as a
-// skip, never as a mismatch (a false mismatch alarm would be worse than no signal).
-func drainReaderToRecord(reader array.RecordReader, maxRows int) (arrow.Record, error) {
-	schema := reader.Schema()
-	var batches []arrow.Record
-	rows := 0
-	for reader.Next() {
-		b := reader.Record()
-		if b == nil {
-			break
-		}
-		if maxRows > 0 && rows+int(b.NumRows()) > maxRows {
-			for _, x := range batches {
-				x.Release()
-			}
-			return nil, errShadowTruncated
-		}
-		rows += int(b.NumRows())
-		b.Retain()
-		batches = append(batches, b)
-	}
-	if err := reader.Err(); err != nil {
-		for _, b := range batches {
-			b.Release()
-		}
-		return nil, err
-	}
-	if len(batches) == 0 {
-		return emptyRecord(schema), nil
-	}
-	if len(batches) == 1 {
-		return batches[0], nil // caller releases
-	}
-	// Concatenate via a Table → single record. NewTableFromRecords retains the batches;
-	// release our refs after.
-	tbl := array.NewTableFromRecords(schema, batches)
-	defer tbl.Release()
-	for _, b := range batches {
-		b.Release()
-	}
-	tr := array.NewTableReader(tbl, tbl.NumRows())
-	defer tr.Release()
-	if !tr.Next() {
-		return emptyRecord(schema), nil
-	}
-	rec := tr.Record()
-	rec.Retain() // outlive the table reader
-	return rec, nil
-}
-
-// emptyRecord builds a zero-row record carrying `schema` (for a fully-filtered result).
-// Each column is built via NewBuilder(f.Type) — its empty array's type is EXACTLY the
-// schema field's type, so NewRecord's internal validate() cannot panic on a type mismatch
-// (the invariant that keeps this off the "no panics in the query path" list). arcx's scan
-// result schema is plain columns (dict encoding is reconciled to Utf8 before export), so
-// there is no dictionary/extension type here for which an empty builder could disagree.
-func emptyRecord(schema *arrow.Schema) arrow.Record {
-	cols := make([]arrow.Array, schema.NumFields())
-	for i, f := range schema.Fields() {
-		b := array.NewBuilder(memory.DefaultAllocator, f.Type)
-		cols[i] = b.NewArray()
-		b.Release()
-	}
-	rec := array.NewRecord(schema, cols, 0)
-	for _, col := range cols {
-		col.Release()
-	}
-	return rec
-}
-
-// errShadowTruncated marks a shadow run abandoned because the result exceeded
-// `ShadowMaxRows`. Reported as a SKIP, never a mismatch — see drainReaderToRecord.
-var errShadowTruncated = errors.New("arcx shadow: result exceeded the shadow row cap")
-
-// ShadowMaxRows bounds what shadow will materialize. Shadow holds the entire result in
-// memory at once, so this is a memory ceiling, not a fairness knob.
-const ShadowMaxRows = 1_000_000
-
 // shadowSlots bounds CONCURRENT shadow runs. Shadow costs a second full DuckDB query on
 // the same bounded `*sql.DB` pool plus a full arcx run, so unbounded concurrency doubles
 // pool pressure exactly when the server is busiest. A shadow run that cannot get a slot is
@@ -706,7 +652,7 @@ func (h Deps) runShadowAsync(ctx context.Context, d Decision, engineSQL string) 
 	select {
 	case shadowSlots <- struct{}{}:
 	default:
-		h.Metrics.ArcxShadowSkipped(d.Shape)
+		h.Metrics.ArcxShadowSkipped(d.Shape, metrics.ShadowSkippedShed)
 		return // at capacity: shed this sample rather than slow the request
 	}
 	detached := context.WithoutCancel(ctx)
@@ -717,6 +663,7 @@ func (h Deps) runShadowAsync(ctx context.Context, d Decision, engineSQL string) 
 		defer func() {
 			if r := recover(); r != nil {
 				h.Logger.Error().Interface("panic", r).Msg("arcx shadow: recovered panic")
+				h.Metrics.ArcxShadowPanic(d.Shape)
 			}
 		}()
 		h.runShadow(detached, d, engineSQL)
@@ -756,7 +703,16 @@ func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
 		// train the operator to ignore shadow alarms.
 		h.Logger.Debug().Str("shape", d.Shape).Int("cap", ShadowMaxRows).
 			Msg("arcx shadow: skipped, result exceeds the shadow row cap")
-		h.Metrics.ArcxShadowSkipped(d.Shape)
+		h.Metrics.ArcxShadowSkipped(d.Shape, metrics.ShadowSkippedCap)
+		return
+	}
+	if errors.Is(err, errShadowAssembly) {
+		// WE failed to assemble the comparison input (a concatenation error). Not
+		// "arcx is wrong" and not "arcx errored" — a host-side bug must not be
+		// attributed to the engine (gotcha #4). WARN + skip.
+		h.Logger.Warn().Err(err).Str("shape", d.Shape).Str("sql", sqlutil.ForLog(engineSQL)).
+			Msg("arcx shadow: skipped, could not assemble the arcx result")
+		h.Metrics.ArcxShadowSkipped(d.Shape, metrics.ShadowSkippedHost)
 		return
 	}
 	if err != nil {
@@ -775,6 +731,7 @@ func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
 	if err != nil {
 		// The oracle itself failed — can't compare. Log, don't alarm arcx for it.
 		h.Logger.Warn().Err(err).Str("shape", d.Shape).Msg("arcx shadow: oracle query failed; skipping compare")
+		h.Metrics.ArcxShadowOracleError(d.Shape)
 		return
 	}
 	h.Metrics.ArcxLatency("duckdb", d.Shape, oracleMicros)
@@ -788,6 +745,14 @@ func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
 		// here too) is recorded in the agg-4 plan doc; a WARN-rate spike is
 		// itself the signal, and the differential harness carries the strict
 		// membership checks.
+		if strings.HasPrefix(diff, skipPrefix) {
+			// The comparator could not render the arcx side (host-side failure).
+			// Same reasoning as errShadowAssembly above: never the mismatch alarm.
+			h.Logger.Warn().Str("shape", d.Shape).Str("reason", strings.TrimPrefix(diff, skipPrefix)).
+				Msg("arcx shadow: skipped, could not render the arcx result")
+			h.Metrics.ArcxShadowSkipped(d.Shape, metrics.ShadowSkippedHost)
+			return
+		}
 		if strings.HasPrefix(diff, "argdiff:") {
 			h.Logger.Warn().
 				Str("shape", d.Shape).

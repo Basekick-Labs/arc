@@ -189,6 +189,33 @@ type Config struct {
 	// on the next successful pull, as before.
 	ManifestHas func(path string) bool
 
+	// RecordPulledFile, when set, is called once for every file this node
+	// pulled and kept, so the node's tier metadata describes the file the way
+	// it would a file this node flushed itself. Without it a replicated file
+	// has no tier row until the next tier scan, and the query layer routes
+	// reads from those rows: a measurement with no row loses partition
+	// pruning, and one with a cold row but no hot row loses its local hot
+	// glob altogether.
+	//
+	// Called on a pull worker, so it must not block — the implementation is
+	// expected to queue, as ingest.FileRegistrar does on the flush path.
+	// nil means no tiering on this node.
+	//
+	// Returns whether anything accepted the report. The hook itself is wired
+	// for the life of the coordinator, but what it reports to is attached
+	// later and can be absent entirely, so the return value — not the hook
+	// being non-nil — is what tier_registered counts.
+	RecordPulledFile func(path string, sizeBytes int64) bool
+
+	// RecordAbandonedFile, when set, is called for a file this node had just
+	// finished pulling when it found the path gone from the manifest and
+	// removed its copy. The delete worker handling that manifest delete may
+	// stat the path before the bytes landed and so find nothing of its own to
+	// report; without this, a hot row this node held for an earlier
+	// generation of the path would stand until the next tier scan. Must not
+	// block. nil means no tiering on this node.
+	RecordAbandonedFile func(path string, sizeBytes int64)
+
 	// Logger receives structured log output.
 	Logger zerolog.Logger
 }
@@ -262,6 +289,7 @@ type Puller struct {
 	// and self-corrects, whereas this means no reachable peer holds the
 	// generation the manifest names.
 	totalChecksumMismatchExhausted atomic.Int64
+	totalTierRegistered            atomic.Int64 // pulled files reported to tier metadata
 	totalPeerLookupFailure         atomic.Int64 // no candidate peers available
 	totalBadOffsetServer           atomic.Int64 // server rejected resume offset (AckCodeBadOffset)
 	// Backend can't append (ErrResumeNotSupported). Zero in every shipping
@@ -677,6 +705,24 @@ func (p *Puller) manifestHas(path string) bool {
 	return p.cfg.ManifestHas == nil || p.cfg.ManifestHas(path)
 }
 
+// recordPulledFile is the nil-safe wrapper around cfg.RecordPulledFile. No
+// hook means no tiering on this node, which is today's behaviour.
+func (p *Puller) recordPulledFile(path string, sizeBytes int64) {
+	if p.cfg.RecordPulledFile == nil {
+		return
+	}
+	if p.cfg.RecordPulledFile(path, sizeBytes) {
+		p.totalTierRegistered.Add(1)
+	}
+}
+
+// recordAbandonedFile is the nil-safe wrapper around cfg.RecordAbandonedFile.
+func (p *Puller) recordAbandonedFile(path string, sizeBytes int64) {
+	if p.cfg.RecordAbandonedFile != nil {
+		p.cfg.RecordAbandonedFile(path, sizeBytes)
+	}
+}
+
 // forgetCatchUpPathLocked drops every trace of path from the catch-up batch:
 // a recorded failure, a recorded drop, the catch-up tag, and the once-per-
 // process quarantine log marker (so a re-registered bad path logs again). Each
@@ -1034,6 +1080,7 @@ func (p *Puller) Stats() map[string]int64 {
 		"skipped_dup":                        p.totalSkippedDup.Load(),
 		"skipped_gone":                       p.totalSkippedGone.Load(),
 		"pulled":                             p.totalPulled.Load(),
+		"tier_registered":                    p.totalTierRegistered.Load(),
 		"failed":                             p.totalFailed.Load(),
 		"dropped":                            p.totalDropped.Load(),
 		"checksum_mismatch":                  p.totalChecksumMismatch.Load(),
@@ -1161,6 +1208,13 @@ func (p *Puller) CatchUpStatus() map[string]int64 {
 		"pulled":      p.totalPulled.Load(),
 		"failed":      p.totalFailed.Load(),
 		"dropped":     p.totalDropped.Load(),
+
+		// Pulled files handed to this node's tier metadata. It should track
+		// "pulled" on a node with tiering on, and sit at zero on one without.
+		// "pulled" climbing while this stays flat means replicated files are
+		// not reaching tier_files, which costs the node partition pruning and,
+		// for a measurement whose rows are cold-only, correct reads.
+		"tier_registered": p.totalTierRegistered.Load(),
 
 		// Subset of "failed" whose cause is permanent: the manifest entry names
 		// a key no storage backend can address (#747). Surfaced here because it
@@ -1358,6 +1412,7 @@ func (p *Puller) processEntry(log zerolog.Logger, request *pullRequest) {
 				if !p.manifestHas(entry.Path) {
 					p.totalSkippedGone.Add(1)
 					p.deleteFile(log, entry.Path)
+					p.recordAbandonedFile(entry.Path, entry.SizeBytes)
 					log.Debug().
 						Str("path", entry.Path).
 						Str("peer", peerAddr).
@@ -1371,6 +1426,15 @@ func (p *Puller) processEntry(log zerolog.Logger, request *pullRequest) {
 					Int64("size_bytes", entry.SizeBytes).
 					Int("attempts", attempt).
 					Msg("File pulled from peer")
+				// Only here, past the manifest re-check above: a file whose
+				// entry left the manifest mid-pull was just unlinked and must
+				// not get a tier row. entry.SizeBytes is the file's size on
+				// this disk — WriteReader was given exactly that count,
+				// AppendReader promotes a resume only on a full write,
+				// pullOnce rejects a short body, and the bytes were verified
+				// against the manifest checksum. A rewrite landing between
+				// here and the write is corrected by the next pull.
+				p.recordPulledFile(entry.Path, entry.SizeBytes)
 				pulledFromPeer = true
 				succeeded = true // Signal to processEntry's defer to clear any prior catch-up failure for this path.
 				break

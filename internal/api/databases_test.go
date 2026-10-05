@@ -580,6 +580,59 @@ func TestDatabasesHandler_DeleteEmptyDatabase(t *testing.T) {
 	}
 }
 
+// TestDatabasesHandler_DeleteWarnsAboutFilesNoListingAddresses covers the
+// consumer side of #772. A partial whose key the contract refuses is omitted by
+// ListStaged, so the reclaim loop no longer warns about it on every DROP; the
+// file still keeps the directory alive and nothing else names it. DROP has to
+// say so itself, once, with the path.
+func TestDatabasesHandler_DeleteWarnsAboutFilesNoListingAddresses(t *testing.T) {
+	tmpDir := t.TempDir()
+	backend, err := storage.NewLocalBackend(tmpDir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	var logs bytes.Buffer
+	handler := NewDatabasesHandler(backend, &config.DeleteConfig{Enabled: true}, nil, zerolog.New(&logs))
+	app := fiber.New()
+	handler.RegisterRoutes(app)
+
+	ctx := context.Background()
+	if err := backend.Write(ctx, "leftoverdb/.arc-database", []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.Write(ctx, "leftoverdb/cpu/2026/01/01/00/a.parquet", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	// Left by an older version: a backslash is a plain filesystem character,
+	// but the key contract refuses it, so no listing addresses this file.
+	illegal := filepath.Join(tmpDir, "leftoverdb", "cpu", "weird\\name"+storage.PartSuffix)
+	if err := os.WriteFile(illegal, []byte("ORPHAN"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("DELETE", "/api/v1/databases/leftoverdb?confirm=true", nil)
+	resp, err := app.Test(req, testRequestTimeoutMS)
+	if err != nil {
+		t.Fatalf("Request failed: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("Expected status 200, got %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Out of scope by #772: the file is not deleted, only named.
+	if _, err := os.Stat(illegal); err != nil {
+		t.Fatalf("illegal-key partial should still be on disk: %v", err)
+	}
+	out := logs.String()
+	for _, want := range []string{`"level":"warn"`, `"database":"leftoverdb"`, `"files":1`, `leftoverdb/cpu/weird\\name.part`} {
+		if !bytes.Contains([]byte(out), []byte(want)) {
+			t.Errorf("DROP logged nothing containing %s; the leftover is invisible to the operator.\nlogs:\n%s", want, out)
+		}
+	}
+}
+
 // TestIsValidDatabaseName tests the database name validation function
 func TestIsValidDatabaseName(t *testing.T) {
 	tests := []struct {
