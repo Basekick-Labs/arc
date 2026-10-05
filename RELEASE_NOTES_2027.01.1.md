@@ -747,6 +747,15 @@ extension is available.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#916](https://github.com/Basekick-Labs/arc/pull/916).
 
+### DuckDB extensions can be configured per deployment ([#440](https://github.com/Basekick-Labs/arc/issues/440))
+
+Operators can set `database.extensions` or the `ARC_DATABASE_EXTENSIONS`
+environment variable to install and load DuckDB extensions at startup. Arc
+loads them before enabling its DuckDB external-access lockdown; the setting
+does not enable unsigned extensions.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1082](https://github.com/Basekick-Labs/arc/pull/1082).
+
 ### Writer failover picks the standby with the lowest node id ([#1207](https://github.com/Basekick-Labs/arc/issues/1207))
 
 When several healthy standby writers can replace a failed primary, the leader
