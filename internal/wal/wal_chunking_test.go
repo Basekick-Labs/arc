@@ -98,3 +98,15 @@ func TestWriter_AppendRaw_RejectsOversizedRaggedColumns(t *testing.T) {
 		t.Fatalf("oversized metric should bump by 1, got %d -> %d", before, after)
 	}
 }
+
+func TestTrackedPayloadFitsIncludesTrackingAndEnvelopeHeaders(t *testing.T) {
+	for _, envelopeHeaderLen := range []int{0, 3, 258} {
+		maxLogicalPayload := MaxWALPayloadSize - walTrackedHeaderSize - envelopeHeaderLen
+		if !trackedPayloadFits(maxLogicalPayload, envelopeHeaderLen) {
+			t.Errorf("payload at tracked limit rejected with envelope header length %d", envelopeHeaderLen)
+		}
+		if trackedPayloadFits(maxLogicalPayload+1, envelopeHeaderLen) {
+			t.Errorf("payload above tracked limit accepted with envelope header length %d", envelopeHeaderLen)
+		}
+	}
+}

@@ -1079,7 +1079,8 @@ func main() {
 
 		// Start periodic WAL maintenance goroutine.
 		// Two modes:
-		//   Normal:   purge rotated WAL files older than safeAge (data already in parquet)
+		//   Normal:   purge rotated WAL files below the unflushed floor, plus
+		//             files with no tracked sequences once older than safeAge
 		//   Recovery: when a flush failure is detected (S3 outage), replay WAL files
 		//             to re-buffer data that was cleared from buffers after failed flush
 		walMaintenanceCtx, walMaintenanceCancel := context.WithCancel(context.Background())
@@ -1088,9 +1089,11 @@ func main() {
 			return nil
 		}, shutdown.PriorityBuffer)
 
-		// Safe age threshold: after this duration, a rotated WAL file's data MUST have
-		// been flushed to parquet by the normal buffer flush cycle (MaxBufferAgeMS).
-		// We use 3x margin to account for flush worker delays and clock skew.
+		// Safe age threshold, now used ONLY for files whose durability nothing
+		// tracks — a previous process's files, and the untracked entries a
+		// replication follower writes. Tracked files are reclaimed by the
+		// flush floor instead, at any age. 3x MaxBufferAgeMS keeps the old
+		// margin for flush worker delays and clock skew.
 		safeAge := time.Duration(cfg.Ingest.MaxBufferAgeMS) * time.Millisecond * 3
 		if safeAge < 30*time.Second {
 			safeAge = 30 * time.Second
@@ -1115,24 +1118,38 @@ func main() {
 						// Purge old WAL files first (same as normal path) to avoid replaying
 						// data that was already successfully flushed to parquet before the failure.
 						if walWriter != nil {
-							deleted, purgeErr := walWriter.PurgeOlderThan(safeAge)
+							deleted, purgeErr := walWriter.PurgeFlushed(walWriter.MinUnflushedSequence())
 							if purgeErr != nil {
 								walLogger.Error().Err(purgeErr).Msg("WAL purge before recovery failed")
 							} else if deleted > 0 {
 								walLogger.Info().Int("deleted", deleted).Msg("Purged old WAL files before recovery")
 							}
+							if n, err := walWriter.PurgeUnaccountedOlderThan(safeAge); err != nil {
+								walLogger.Error().Err(err).Msg("WAL unaccounted-file purge before recovery failed")
+							} else if n > 0 {
+								walLogger.Info().Int("deleted", n).Msg("Purged WAL files with no tracked sequences before recovery")
+							}
 						}
 
 						recovery := wal.NewRecovery(cfg.WAL.Directory, walLogger)
 						activeFile := ""
+						var activeCheckpointHashes []string
 						if walWriter != nil {
 							activeFile = walWriter.CurrentFile()
+							// Recovery skips the active file to avoid racing appends, so read
+							// its checkpoint index separately while the writer lock holds it stable.
+							activeCheckpointHashes, err = walWriter.CurrentCheckpointHashes()
+							if err != nil {
+								walLogger.Error().Err(err).Msg("Failed to read active WAL checkpoints; skipping recovery to avoid duplicate replay")
+								continue
+							}
 						}
 						stats, err := recovery.RecoverWithOptions(context.Background(), recoveryCallback, &wal.RecoveryOptions{
-							SkipActiveFile:   activeFile,
-							MinFileAge:       5 * time.Second,
-							BatchSize:        cfg.WAL.RecoveryBatchSize,
-							ColumnarCallback: columnarCallback,
+							SkipActiveFile:             activeFile,
+							AdditionalCheckpointHashes: activeCheckpointHashes,
+							MinFileAge:                 5 * time.Second,
+							BatchSize:                  cfg.WAL.RecoveryBatchSize,
+							ColumnarCallback:           columnarCallback,
 						})
 						if err != nil {
 							walLogger.Error().Err(err).Msg("WAL recovery after flush failure failed")
@@ -1148,13 +1165,30 @@ func main() {
 							arrowBuffer.ResetFlushFailure()
 						}
 					} else {
-						// Normal operation — purge WAL files old enough that their data
-						// has been flushed to parquet by the normal buffer flush cycle
-						deleted, err := walWriter.PurgeOlderThan(safeAge)
+						// Normal operation. Two purges, because two different
+						// things bound WAL size and only one of them can be
+						// reasoned about from flush state:
+						//
+						//   - tracked files: reclaimed strictly below the
+						//     unflushed floor, never by age. Inferring
+						//     durability from wall-clock age is what lost
+						//     acknowledged writes (#966, #1009).
+						//   - files with no tracked sequences: a previous
+						//     process's files, and the untracked entries a
+						//     replication follower writes. No checkpoint will
+						//     ever cover them, so age is the only signal there
+						//     is — and without this a reader node's WAL grows
+						//     until the disk fills.
+						deleted, err := walWriter.PurgeFlushed(walWriter.MinUnflushedSequence())
 						if err != nil {
 							walLogger.Error().Err(err).Msg("Periodic WAL purge failed")
 						} else if deleted > 0 {
 							walLogger.Info().Int("deleted", deleted).Msg("Periodic WAL cleanup complete")
+						}
+						if n, err := walWriter.PurgeUnaccountedOlderThan(safeAge); err != nil {
+							walLogger.Error().Err(err).Msg("Periodic WAL unaccounted-file purge failed")
+						} else if n > 0 {
+							walLogger.Info().Int("deleted", n).Msg("Purged WAL files with no tracked sequences")
 						}
 					}
 				}
@@ -1736,12 +1770,21 @@ func main() {
 						log.Error().Err(err).Msg("Failed to start cluster coordinator - running in standalone mode")
 						clusterCoordinator = nil
 					} else {
-						shutdownCoordinator.RegisterHook("cluster-coordinator", func(ctx context.Context) error {
-							return clusterCoordinator.Stop()
-							// Stops AFTER the schedulers that ask it whether they may
-							// run (PriorityScheduler), so a tick in flight never finds
-							// the coordinator gone.
-						}, shutdown.PriorityCompaction)
+						// Two steps. The inbound replication stream applies entries
+						// through the ingest handler, so it must be gone before the
+						// Arrow buffer and WAL close (#853); those are components,
+						// every hook runs before any component, and PriorityIngest
+						// puts it with the other ingest paths. The coordinator
+						// itself is a COMPONENT: it owns Raft and must outlive the
+						// arrow-buffer flush and the file-registrar drain, which are
+						// components too (#1014). The schedulers that ask it whether
+						// they may run are hooks at PriorityScheduler, so they have
+						// already quiesced by the time any component runs.
+						shutdownCoordinator.RegisterHook("cluster-replication-receiver", func(context.Context) error {
+							clusterCoordinator.StopReplicationReceiver()
+							return nil
+						}, shutdown.PriorityIngest)
+						registerClusterCoordinatorShutdown(shutdownCoordinator, clusterCoordinator.Stop)
 
 						localNode := clusterCoordinator.GetLocalNode()
 						capabilities := localNode.GetCapabilities()
@@ -1865,24 +1908,21 @@ func main() {
 						//
 						// OSS deployments never reach this block (no coordinator).
 						//
-						// Shutdown ordering (lower priority runs first, see shutdown.go):
-						//   HTTPServer (10)  — stop accepting client requests
-						//   Ingest     (20)  — drain ingest/flush
-						//   Buffer     (30)  — file-registrar drains queue into Raft
-						//   Compaction (50)  — cluster-coordinator stops:
-						//                        puller.Stop()  (first)
-						//                        raftNode.Stop()  (second)
+						// Shutdown ordering, all COMPONENTS (hooks run before any
+						// component, so a hook here would stop before the buffer
+						// flushed — that was #1014):
+						//   arrow-buffer        (30) — final flush, enqueues each file
+						//   file-registrar      (31) — drains the queue into Raft
+						//   wal-purge           (35) — removes the WAL those files cover
+						//   cluster-coordinator (50) — puller.Stop(), then raftNode.Stop()
 						//
-						// This sequence ensures final file announcements land in Raft
-						// while Raft is still alive, and pending peer pulls are
-						// cancelled promptly when Raft is about to go away.
+						// Raft outlives the final flush, so the last files land in
+						// the manifest; registerClusterCoordinatorShutdown and
+						// registerFileRegistrarShutdown pin the two ends.
 						fileRegistrar := cluster.NewCoordinatorFileRegistrar(clusterCoordinator, logger.Get("file-registrar"))
 						fileRegistrar.Start(context.Background())
 						arrowBuffer.SetFileRegistrar(fileRegistrar)
-						shutdownCoordinator.RegisterHook("file-registrar", func(ctx context.Context) error {
-							fileRegistrar.Stop()
-							return nil
-						}, shutdown.PriorityBuffer)
+						registerFileRegistrarShutdown(shutdownCoordinator, fileRegistrar.Stop)
 						log.Info().Msg("Cluster file manifest registrar enabled")
 
 						// Phase 5: wire the dynamic compaction gate to the coordinator
@@ -1900,9 +1940,11 @@ func main() {
 						// construct the watcher and schedulers on every node but only
 						// start them when the node holds the compactor lease.
 						//
-						// Shutdown ordering: watcher stops at PriorityCompaction - 1
-						// so it drains any pending manifests BEFORE the coordinator
-						// tears down Raft.
+						// Shutdown ordering: the watcher is a hook, and the
+						// coordinator that owns Raft is a component, so the watcher
+						// drains any pending manifests BEFORE Raft goes away
+						// whatever its priority; PriorityCompaction - 1 keeps it
+						// after the schedulers that feed it.
 						if completionDir != "" && cfg.Compaction.Enabled {
 							bridge := cluster.NewCompactionBridge(clusterCoordinator)
 							pollInterval := time.Duration(cfg.Compaction.CompletionWatcherIntervalMS) * time.Millisecond
@@ -3763,9 +3805,18 @@ func main() {
 							PathStyle: cold.S3PathStyle,
 							Prefix:    cold.S3Prefix,
 						}
-						coldBackend, err = storage.NewS3Backend(s3Config, logger.Get("tiering-cold-s3"))
-						if err != nil {
-							log.Error().Err(err).Msg("Failed to create cold tier S3 backend for tiering")
+						// Assigned through a typed local, never straight into
+						// the interface: a constructor error comes back as a
+						// nil *S3Backend, and an interface holding a typed
+						// nil is not == nil (#713). Stored directly, every
+						// "coldBackend != nil" downstream — the startup tier
+						// scan's cold sync, the drainer's existence probe,
+						// the query router's cold glob — would pass and then
+						// dereference a nil receiver.
+						if b, err := storage.NewS3Backend(s3Config, logger.Get("tiering-cold-s3")); err != nil {
+							log.Error().Err(err).Msg("Failed to create cold tier S3 backend for tiering: the cold tier is unusable on this node until the configuration is fixed")
+						} else {
+							coldBackend = b
 						}
 
 					case "azure":
@@ -3778,9 +3829,11 @@ func main() {
 							Endpoint:           cold.AzureEndpoint,
 							UseManagedIdentity: cold.AzureUseManagedIdentity,
 						}
-						coldBackend, err = storage.NewAzureBlobBackend(azureConfig, logger.Get("tiering-cold-azure"))
-						if err != nil {
-							log.Error().Err(err).Msg("Failed to create cold tier Azure backend for tiering")
+						// Typed local for the same reason as the S3 branch.
+						if b, err := storage.NewAzureBlobBackend(azureConfig, logger.Get("tiering-cold-azure")); err != nil {
+							log.Error().Err(err).Msg("Failed to create cold tier Azure backend for tiering: the cold tier is unusable on this node until the configuration is fixed")
+						} else {
+							coldBackend = b
 						}
 					}
 				}
@@ -3826,31 +3879,127 @@ func main() {
 						tieringDB.Close()
 					}
 				} else {
+					// The startup tier scan runs in the background below, and
+					// it writes through the same SQLite handle the shutdown
+					// step may close. Its context and completion channel are
+					// created here so that step can cancel and join it FIRST —
+					// relying on a separate step for that would depend on
+					// registration order, and getting it wrong means a scan
+					// writing into a closed database, one logged warning per
+					// file. scanDone is closed on every path, including the
+					// one that never starts the scan — a defer would not do,
+					// it being function-scoped to main and so running only
+					// after the shutdown step had already blocked on it.
+					scanCtx, cancelScan := context.WithTimeout(context.Background(), 30*time.Minute)
+					scanDone := make(chan struct{})
+
+					// Registered as soon as the manager exists, not only once
+					// Start succeeds: NewManager already owns a goroutine (the
+					// tier-event drainer), so a Start that fails — an
+					// unparseable migration_schedule, say — must still get a
+					// Stop, or that goroutine outlives the SQLite handle this
+					// block closes below.
+					//
+					// A component at the same priority as cluster-coordinator
+					// and registered after it; sortComponentsByPriority is
+					// stable, so the coordinator's delete drain runs while the
+					// drainer is still alive to apply what it reports. Nothing
+					// else enforces that order — keep this block below the
+					// cluster block. A component rather than a hook because
+					// the arrow-buffer flush is a component, and its final
+					// files are recorded through this manager's SQLite handle:
+					// as a hook this ran first and, where the handle is owned
+					// (auth disabled), closed it under those writes.
+					registerTieringShutdown(shutdownCoordinator, func() error {
+						cancelScan()
+						<-scanDone
+						stopErr := tieringManager.Stop()
+						// tiering.Manager never closes its DB — it may be
+						// borrowed. Close it here only when this block
+						// opened it.
+						if tieringOwnsDB {
+							if closeErr := tieringDB.Close(); closeErr != nil && stopErr == nil {
+								stopErr = closeErr
+							}
+						}
+						return stopErr
+					})
+
+					// Let the cluster layer keep this node's tier rows in step
+					// with its own disk: the replication puller reports what it
+					// pulled, and the local-delete workers report what they
+					// unlinked — that second half only where storage is
+					// per-node, since the delete callback does nothing locally
+					// on a shared bucket. Without this, only locally-flushed
+					// files have rows between tier scans, and on a node that
+					// does not ingest a measurement the query layer loses
+					// partition pruning for it — or, where a cold row exists
+					// and a hot one does not, omits this node's local files
+					// from the read entirely.
+					//
+					// Wired HERE, before the startup scan below is launched,
+					// so there is no moment at which a file can land on disk
+					// after the scan's walk has passed its directory and
+					// before anything records pulls. The rest of the tiering
+					// wiring is further down, with the handlers.
+					if clusterCoordinator != nil {
+						clusterCoordinator.SetTierRecorder(tieringManager)
+					}
+
 					// Start tiering manager
 					if err := tieringManager.Start(); err != nil {
-						log.Error().Err(err).Msg("Failed to start tiering manager")
-						if tieringOwnsDB {
-							tieringDB.Close()
-						}
+						// Routes, multi-tier query routing and flush-path
+						// registration are all still wired below, and the
+						// tier-event drainer is running — what is missing is
+						// the migration scheduler, so nothing moves to cold
+						// and nothing scans on a schedule.
+						log.Error().Err(err).
+							Msg("Failed to start tiering manager: queries still route across tiers and files are still registered, but no migration or scheduled scan will run")
+						cancelScan()
+						close(scanDone)
 					} else {
-						shutdownCoordinator.RegisterHook("tiering", func(ctx context.Context) error {
-							stopErr := tieringManager.Stop()
-							// tiering.Manager never closes its DB — it may be
-							// borrowed. Close it here only when this block
-							// opened it.
-							if tieringOwnsDB {
-								if closeErr := tieringDB.Close(); closeErr != nil && stopErr == nil {
-									stopErr = closeErr
-								}
-							}
-							return stopErr
-						}, shutdown.PriorityCompaction)
-
 						log.Info().
 							Str("schedule", cfg.TieredStorage.MigrationSchedule).
 							Bool("cold_enabled", cfg.TieredStorage.Cold.Enabled).
 							Int("default_hot_days", cfg.TieredStorage.DefaultHotMaxAgeDays).
 							Msg("Tiered storage enabled")
+
+						// Bring the tier metadata in line with what is on disk
+						// once at boot. Nothing else did: the scan runs from
+						// the migration schedule (02:00 by default) and from
+						// POST /api/v1/tiering/scan, so files that arrived
+						// while this node was down — or, on a replicating
+						// cluster node, the whole set it holds for
+						// measurements it does not ingest — had no tier rows
+						// until the next cycle, and the query layer routes
+						// reads from those rows. In the background: the
+						// listing is proportional to the storage root and
+						// nothing else waits on it.
+						go func() {
+							defer close(scanDone)
+							defer cancelScan()
+							result, err := tieringManager.ScanTiers(scanCtx)
+							if err != nil {
+								log.Warn().Err(err).Msg("Startup tier scan did not complete; the next migration cycle will scan again")
+								return
+							}
+							log.Info().
+								Int("scanned", result.FilesScanned).
+								Int("registered", result.FilesRegistered).
+								Int("hot_retired", result.HotRetired).
+								Int("cold_synced", result.ColdSynced).
+								Msg("Startup tier scan completed")
+							// If the scan changed any row — on a node booting
+							// with none, measurements go from nothing to cold
+							// (the sync runs first) to hot and cold — a query
+							// that ran mid-scan has cached a transform built on
+							// the earlier state for up to the cache TTL. A
+							// migration cycle drops the query caches for the
+							// same reason; so does this, at most once per boot.
+							if result.ColdSynced+result.HotRowsWritten+result.HotRetired > 0 {
+								queryHandler.InvalidateCaches()
+							}
+						}()
 					}
 				}
 			}
@@ -3904,6 +4053,9 @@ func main() {
 		// Wire tiering manager to arrow buffer for automatic file registration
 		arrowBuffer.SetTieringManager(tieringManager)
 		log.Info().Msg("Tiering manager wired to arrow buffer for auto-registration")
+
+		// The cluster layer's tier recorder is wired where the manager is
+		// built, before its startup scan is launched — see that block.
 
 		// Configure DuckDB with cold tier S3 credentials for direct S3 queries
 		// This is needed because DuckDB's httpfs extension needs credentials to query S3 directly
@@ -4259,11 +4411,15 @@ func createWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolo
 // createColumnarRecoveryCallback creates a WAL recovery callback for columnar entries
 // written via the zero-copy AppendRaw path.
 func createColumnarRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolog.Logger) wal.ColumnarRecoveryCallback {
-	return func(ctx context.Context, database, measurement string, columns map[string][]interface{}) error {
+	return func(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string) error {
 		if database == "" {
 			database = "default"
 		}
-		if err := arrowBuffer.WriteColumnarDirectNoWAL(ctx, database, measurement, columns); err != nil {
+		// Inherit the replayed entry's identity: one columnar entry becomes
+		// exactly one buffer write, so a checkpoint for it covers precisely
+		// these records. The row-format callback above deliberately does NOT
+		// inherit — it fans one entry out into one write per record.
+		if err := arrowBuffer.WriteColumnarDirectReplay(ctx, database, measurement, columns, walIdentity); err != nil {
 			walLogger.Error().Err(err).Str("database", database).Str("measurement", measurement).Msg("Failed to replay columnar WAL entry")
 			return err
 		}
@@ -4335,6 +4491,34 @@ func runCompactSubcommand(args []string) {
 type shutdownFunc func() error
 
 func (f shutdownFunc) Close() error { return f() }
+
+// The registrar must stop after ArrowBuffer finishes its final writes
+// (PriorityBuffer), but before WAL cleanup and the cluster coordinator stop.
+func registerFileRegistrarShutdown(coordinator *shutdown.Coordinator, stop func()) {
+	coordinator.Register("file-registrar", shutdownFunc(func() error {
+		stop()
+		return nil
+	}), shutdown.PriorityBuffer+1)
+}
+
+// The cluster coordinator owns Raft. It must stop after the file registrar
+// has drained (so the final flush's files land in the manifest) and after the
+// tick-driven schedulers that ask it whether they may run — those are hooks
+// at PriorityScheduler and so already stopped. Registered as a component for
+// the first reason: every hook runs before any component, so a hook here
+// would have stopped Raft before the buffer flushed (#1014).
+func registerClusterCoordinatorShutdown(coordinator *shutdown.Coordinator, stop func() error) {
+	coordinator.Register("cluster-coordinator", shutdownFunc(stop), shutdown.PriorityCompaction)
+}
+
+// Tiering stops at the same priority as the cluster coordinator and must be
+// registered AFTER it: the coordinator's delete drain reports unlinks the
+// tiering drainer applies, and sortComponentsByPriority is stable. Also a
+// component because the final arrow-buffer flush records its files through
+// tiering's SQLite handle, which this step closes when it owns it.
+func registerTieringShutdown(coordinator *shutdown.Coordinator, stop func() error) {
+	coordinator.Register("tiering", shutdownFunc(stop), shutdown.PriorityCompaction)
+}
 
 // tieringManifestAdapter implements tiering.ManifestCoordinator over the
 // cluster coordinator the way retention builds its manifest deletes

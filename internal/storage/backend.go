@@ -108,7 +108,9 @@ type StagingInspector interface {
 
 	// ListStaged returns metadata for staged partials whose key has the given
 	// prefix, so a caller can reclaim abandoned ones. Staged partials are
-	// invisible to List by design, so this is the only way to find them.
+	// invisible to List by design, so this is the way to find them. Every key
+	// it returns is accepted by DeleteStaged: a partial whose key DeleteStaged
+	// refuses is omitted and surfaces through UnusableLister instead (#772).
 	ListStaged(ctx context.Context, prefix string) ([]ObjectInfo, error)
 }
 
