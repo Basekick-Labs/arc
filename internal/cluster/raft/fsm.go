@@ -2096,6 +2096,14 @@ func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 	}, nil
 }
 
+// UnlinkReasonSnapshotRemoved is the reason Restore reports for a file the
+// previous manifest listed and the restored snapshot does not (#962). The
+// reason the cluster deleted it is unknown here, so the tier recorder treats it
+// like an abandoned pull and asks the cold tier before retiring the hot row.
+// The literal is mirrored in internal/tiering (unlinkReasonSnapshotRemoved);
+// neither package imports the other.
+const UnlinkReasonSnapshotRemoved = "snapshot:removed"
+
 // Restore restores the FSM from a snapshot.
 func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	defer rc.Close()
@@ -2384,6 +2392,21 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		}
 	}
 	sort.Strings(removedNodes) // deterministic delivery order
+	// Files the manifest this FSM last held that the snapshot no longer lists
+	// are announced through the delete callback once the swap is visible
+	// (#962): a node that catches up through a snapshot otherwise keeps every
+	// replica of a file the cluster deleted while it was away. The baseline is
+	// this FSM instance's state: in a running process that is the fully
+	// applied manifest; after a restart it is the local snapshot hashicorp/raft
+	// loaded, so files registered after that snapshot and deleted during the
+	// outage are not in either map and are left to the orphan sweep (#1071).
+	var removedFiles []string
+	for path := range f.files {
+		if _, stillThere := restoredFiles[path]; !stillThere {
+			removedFiles = append(removedFiles, path)
+		}
+	}
+	sort.Strings(removedFiles) // deterministic delivery order
 	f.nodes = restoredNodes
 	f.barriers = restoredBarriers
 	f.barrierOrder = restoredOrder
@@ -2476,11 +2499,14 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	f.keysCache = nil // invalidate sorted-key cache after snapshot restore
 	onNodeAdded := f.onNodeAdded
 	onNodeRemoved := f.onNodeRemoved
+	onFileDeleted := f.onFileDeleted
 	f.mu.Unlock()
 
 	f.logger.Info().
 		Int("node_count", len(nodesToDeliver)).
+		Int("removed_node_count", len(removedNodes)).
 		Int("file_count", len(snapshot.Files)).
+		Int("removed_file_count", len(removedFiles)).
 		Int("token_count", len(snapshot.Tokens)).
 		Int("organization_count", len(restoredOrgs)).
 		Int("team_count", len(restoredTeams)).
@@ -2513,6 +2539,11 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	if onNodeRemoved != nil {
 		for _, id := range removedNodes {
 			onNodeRemoved(id)
+		}
+	}
+	if onFileDeleted != nil {
+		for _, path := range removedFiles {
+			onFileDeleted(path, UnlinkReasonSnapshotRemoved)
 		}
 	}
 

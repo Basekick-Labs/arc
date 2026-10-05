@@ -235,6 +235,33 @@ func TestRecordUnlinkedFile_AbandonedPullIsDecidedByTheColdTier(t *testing.T) {
 	}
 }
 
+// A snapshot restore reports a path the cluster dropped while this node was
+// away, without the reason (#962). Like an abandoned pull, the cold tier
+// decides: a migrated file flips its row to cold, a deleted one loses its row.
+// Before this reason was recognised the hot row was retired unprobed, and a
+// measurement whose first cold data landed during the outage vanished from
+// this node's reads until the next tier scan.
+func TestRecordUnlinkedFile_SnapshotRemovedIsDecidedByTheColdTier(t *testing.T) {
+	cold := newMockBackend("s3")
+	const migrated = "db1/cpu/2026/10/04/a_daily.parquet"
+	const deleted = "db1/cpu/2026/10/04/14/b.parquet"
+	cold.seedRaw(migrated, []byte("cold copy"))
+
+	m := newTierEventManager(t, cold, true)
+	hotRowFor(t, m, migrated)
+	hotRowFor(t, m, deleted)
+	m.RecordUnlinkedFile(migrated, unlinkReasonSnapshotRemoved, 9)
+	m.RecordUnlinkedFile(deleted, unlinkReasonSnapshotRemoved, 9)
+	waitTierEvents(t, m, 2)
+
+	if tier, ok := rowTier(t, m, migrated); !ok || tier != string(TierCold) {
+		t.Fatalf("migrated-while-away path: tier=%q present=%v, want cold", tier, ok)
+	}
+	if tier, ok := rowTier(t, m, deleted); ok {
+		t.Fatalf("deleted-while-away path: row left at tier %q, want none", tier)
+	}
+}
+
 // errStatBackend is a hot tier that cannot answer a stat right now.
 type errStatBackend struct {
 	*mockBackend

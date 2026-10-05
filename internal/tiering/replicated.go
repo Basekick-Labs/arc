@@ -62,6 +62,16 @@ var tierEventQueueMax = 1 << 20
 // imports the other.
 const unlinkReasonAbandonedPull = "replication:abandoned"
 
+// unlinkReasonSnapshotRemoved is the reason the Raft FSM reports when a
+// snapshot restore drops a path the previous manifest listed (#962). The
+// cluster deleted it while this node was away, for a reason the snapshot does
+// not carry, so it is treated like an abandoned pull: the cold tier is asked
+// before the hot row is retired, and a measurement migrated during the outage
+// reads from cold instead of vanishing from this node. Mirrored in
+// internal/cluster/raft (UnlinkReasonSnapshotRemoved); neither package imports
+// the other.
+const unlinkReasonSnapshotRemoved = "snapshot:removed"
+
 // tierEventStopDrainTimeout is the whole drain's budget once Stop has been
 // signalled; each chunk gets what is left of it. Short on purpose: Stop runs
 // on the shutdown timeout that every remaining hook and component shares, so a
@@ -511,7 +521,9 @@ func (m *Manager) applyTierEventChunk(chunk []tierEvent, touched map[tierEventKe
 // cold-tier existence check: tiering's own reasons, and the puller's abandoned
 // pull, whose real reason is unknown to it.
 func reasonMayBeMigration(reason string) bool {
-	return strings.HasPrefix(reason, manifestReasonPrefix) || reason == unlinkReasonAbandonedPull
+	return strings.HasPrefix(reason, manifestReasonPrefix) ||
+		reason == unlinkReasonAbandonedPull ||
+		reason == unlinkReasonSnapshotRemoved
 }
 
 // coldProbe is the answer of one cold-tier existence check.

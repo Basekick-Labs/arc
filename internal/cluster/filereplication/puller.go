@@ -784,10 +784,12 @@ func (p *Puller) OnManifestDelete(path string) {
 
 // pruneStaleCatchUpState clears recorded catch-up failures and drops for paths
 // the manifest no longer contains. OnManifestDelete does this synchronously
-// for every delete that goes through the log, but a follower that restores
-// from a Raft snapshot rebuilds its manifest with no callbacks at all, so
-// anything recorded for a path absent from the snapshot would hold the gate
-// red until restart. Runs on every periodic reconciliation tick, before the
+// for every delete that goes through the log and, since #962, for every path a
+// snapshot restore drops from the manifest a running follower held. It is the
+// backstop for what neither covers: a restart whose local snapshot predates the
+// recorded path (#1071), or a path recorded before the callbacks were wired.
+// Without it such a path would hold the gate red until restart. Runs on every
+// periodic reconciliation tick, before the
 // eligibility gate. Lookups happen outside inflightMu; each clear is
 // membership-guarded, so a path OnManifestDelete already handled cannot be
 // decremented twice. A path re-recorded between the lookup and the clear is
