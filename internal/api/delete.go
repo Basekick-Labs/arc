@@ -483,18 +483,7 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 		return false, fmt.Errorf("WHERE clause is required. To delete all data, use WHERE clause '1=1' with confirm=true")
 	}
 
-	// Validation scans run on the MASKED clause: a forbidden keyword or ';'
-	// inside a string literal is data, not SQL (#834). The raw clause is what
-	// gets interpolated into the DuckDB statement, so the unmatched-quote and
-	// unmatched-parenthesis checks below stay on it. Same masker the query
-	// path's validator uses, so the two paths accept the same literals.
-	// Backtick identifiers are normalised to double quotes first, as the query
-	// path's validator does: the masker does not know backticks, so a quote
-	// inside one would otherwise open a spurious literal that hides whatever
-	// follows it from the scans.
-	maskInput := backticksToDoubleQuotes(where)
-	maskedWhere, masks := sqlutil.MaskStringLiterals(maskInput, sqlutil.HasQuotes(maskInput))
-	whereUpper := strings.ToUpper(strings.TrimSpace(maskedWhere))
+	whereUpper := strings.ToUpper(strings.TrimSpace(where))
 
 	// Remove "WHERE" prefix if present
 	if strings.HasPrefix(whereUpper, "WHERE ") {
@@ -510,23 +499,14 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 
 	// Check for dangerous SQL keywords using word boundaries to avoid false positives
 	// on column names like "offset" (contains SET), "payload" (contains LOAD), "dataset" (contains SET)
-	if match := dangerousKeywordPattern.FindString(maskedWhere); match != "" {
+	if match := dangerousKeywordPattern.FindString(where); match != "" {
 		return false, fmt.Errorf("WHERE clause contains forbidden keyword: %s", strings.ToUpper(match))
 	}
 
 	// Reject filesystem-I/O table functions (see dangerousIOFunctionPattern).
 	// Matched against the identifier-quote-stripped form so the quoted spelling
-	// `"glob"(...)`, which DuckDB executes identically, cannot slip past. The
-	// masker turned double-quoted identifiers into placeholders too, so put
-	// those back before stripping the quotes: `"glob"(...)` must still be seen,
-	// while a string literal that merely mentions glob( stays masked.
-	ioCheck := maskedWhere
-	for _, m := range masks {
-		if m.Identifier {
-			ioCheck = strings.ReplaceAll(ioCheck, m.Placeholder, m.Original)
-		}
-	}
-	ioCheck = strings.NewReplacer(`"`, "", "`", "").Replace(ioCheck)
+	// `"glob"(...)`, which DuckDB executes identically, cannot slip past.
+	ioCheck := strings.NewReplacer(`"`, "", "`", "").Replace(where)
 	if m := dangerousIOFunctionPattern.FindStringSubmatch(ioCheck); m != nil {
 		return false, fmt.Errorf("WHERE clause contains forbidden file I/O function: %s()", m[1])
 	}
@@ -557,6 +537,7 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	// ordering constraint queryMeasurement documents. A fragment that
 	// introduces a relation carries its own keyword, so the scanner arms
 	// without needing a synthetic FROM clause around it.
+	maskInput := backticksToDoubleQuotes(where)
 	features := scanSQLFeatures(maskInput)
 	normalised, _ := sqlutil.MaskStringLiterals(maskInput, features.hasQuotes)
 	normalised = stripSQLComments(normalised, features.hasDashComment || features.hasBlockComment)
