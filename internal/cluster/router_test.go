@@ -150,6 +150,62 @@ func TestRouterForwardRequest(t *testing.T) {
 	}
 }
 
+type unreadableRequestBody struct {
+	reads atomic.Int32
+}
+
+func (b *unreadableRequestBody) Read([]byte) (int, error) {
+	b.reads.Add(1)
+	return 0, fmt.Errorf("original request body must not be read")
+}
+
+func (*unreadableRequestBody) Close() error { return nil }
+
+func TestRouterForwardRequest_UsesReplayableBodyWithoutBuffering(t *testing.T) {
+	const requestBody = "large import payload"
+	var receivedBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		receivedBody = string(body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	registry := newTestRegistry()
+	writer := NewNode("writer-1", "Writer", RoleWriter, "test-cluster")
+	writer.UpdateState(StateHealthy)
+	writer.APIAddress = strings.TrimPrefix(server.URL, "http://")
+	registry.Register(writer)
+
+	reader := NewNode("reader-1", "Reader", RoleReader, "test-cluster")
+	router := newTestRouter(registry, reader)
+	req := httptest.NewRequest("POST", "/api/v1/import/csv", nil)
+	originalBody := &unreadableRequestBody{}
+	req.Body = originalBody
+	req.ContentLength = int64(len(requestBody))
+	var getBodyCalls atomic.Int32
+	req.GetBody = func() (io.ReadCloser, error) {
+		getBodyCalls.Add(1)
+		return io.NopCloser(strings.NewReader(requestBody)), nil
+	}
+
+	resp, err := router.RouteWrite(context.Background(), req)
+	if err != nil {
+		t.Fatalf("RouteWrite failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if receivedBody != requestBody {
+		t.Errorf("forwarded body = %q, want %q", receivedBody, requestBody)
+	}
+	if got := originalBody.reads.Load(); got != 0 {
+		t.Errorf("original body was read %d times, want 0", got)
+	}
+	if got := getBodyCalls.Load(); got != 1 {
+		t.Errorf("GetBody called %d times, want 1", got)
+	}
+}
+
 func TestRouterRoundRobinSelection(t *testing.T) {
 	registry := newTestRegistry()
 

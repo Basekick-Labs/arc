@@ -81,7 +81,7 @@ func isClientForwardingHeader(canonicalKey string) bool {
 // forwarding via the router.
 //
 // Lifecycle: every caller in this codebase (lineprotocol.go, msgpack.go,
-// tle.go, query.go) invokes the returned *http.Request synchronously
+// import.go, tle.go, query.go) invokes the returned *http.Request synchronously
 // within the Fiber handler — they pass it to router.RouteWrite/RouteQuery
 // (which blocks on http.Client.Do; queries are buffered for retries, writes
 // are streamed once and never retried, see internal/cluster/router.go), then
