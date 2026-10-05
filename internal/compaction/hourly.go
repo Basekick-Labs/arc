@@ -139,14 +139,14 @@ func (t *HourlyTier) ShouldCompact(files []string, partitionTime time.Time) bool
 		"_compacted.parquet",
 		func(f string) bool {
 			// All non-compacted files are valid input for hourly compaction
-			return !strings.Contains(f, "_compacted.parquet")
+			return !strings.Contains(stripRewriteSuffix(f), "_compacted.parquet")
 		},
 	)
 }
 
 // IsCompactedFile checks if a file is a compacted hourly file
 func (t *HourlyTier) IsCompactedFile(filename string) bool {
-	return strings.HasSuffix(filename, "_compacted.parquet")
+	return strings.HasSuffix(stripRewriteSuffix(filename), "_compacted.parquet")
 }
 
 // GetStats returns tier statistics

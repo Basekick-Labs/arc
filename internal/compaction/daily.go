@@ -143,7 +143,7 @@ func (t *DailyTier) ShouldCompact(files []string, partitionTime time.Time) bool 
 
 // IsCompactedFile checks if a file is a compacted daily file
 func (t *DailyTier) IsCompactedFile(filename string) bool {
-	return strings.HasSuffix(filename, "_daily.parquet")
+	return strings.HasSuffix(stripRewriteSuffix(filename), "_daily.parquet")
 }
 
 // GetStats returns tier statistics
@@ -266,6 +266,7 @@ func extractNewestFileTime(files []string) time.Time {
 		filename := parts[len(parts)-1]
 
 		// Remove .parquet extension
+		filename = stripRewriteSuffix(filename)
 		filename = strings.TrimSuffix(filename, ".parquet")
 
 		// Check if it's a tier-compacted file: measurement_YYYYMMDD_HHMMSS_{nanos}_{daily|compacted}

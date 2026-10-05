@@ -4279,6 +4279,9 @@ func main() {
 
 		// Wire tiering manager to query handler for multi-tier query routing
 		queryHandler.SetTieringManager(tieringManager)
+		// DELETE rewrites immutable files outside the ingest/replication writers;
+		// keep tier metadata synchronized with the new path.
+		deleteHandler.SetTieringManager(tieringManager)
 		// A completed migration moves files between tiers, so cached pruned
 		// partition paths (pruner + SQL transform caches) go stale and must
 		// be dropped — same reason compaction invalidates them (#662).

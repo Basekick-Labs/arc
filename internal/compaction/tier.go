@@ -2,12 +2,31 @@ package compaction
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
+
+// stripRewriteSuffix returns the logical filename represented by an immutable
+// delete rewrite, preserving the original compaction suffixes for classification
+// and timestamp parsing.
+func stripRewriteSuffix(filename string) string {
+	const marker = "_rewrite_"
+	base := strings.TrimSuffix(filename, ".parquet")
+	idx := strings.LastIndex(base, marker)
+	if idx < 0 || idx+len(marker) == len(base) {
+		return filename
+	}
+	for _, r := range base[idx+len(marker):] {
+		if r < '0' || r > '9' {
+			return filename
+		}
+	}
+	return base[:idx] + ".parquet"
+}
 
 // Batch-size bounds for a single compaction job.
 //

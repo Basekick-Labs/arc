@@ -41,8 +41,8 @@ import (
 // (tiering tier_files in OSS, Raft manifest in cluster). PhysicalPath is the fully-qualified
 // location iceberg-go reads (file://… local, s3://bucket/prefix/… cold). SizeBytes is the
 // file's current size on storage; together with the path it is the reconcile key, because a
-// file rewritten in place keeps its path (the delete API's partial-match branch, #633) and
-// only the size distinguishes the new content from the manifest entry registered for the old.
+// delete rewrite now publishes a new immutable path, while a backup restore can still replace
+// the bytes represented by a live path.
 type FileRef struct {
 	PhysicalPath string
 	SizeBytes    int64
@@ -578,8 +578,8 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 	}
 
 	// The diff key is (path, size). A path on both sides with a different size is a file
-	// rewritten in place — the delete API's partial-match branch renames a smaller file over
-	// the original (#633). The manifest entry still describes the old content (record_count,
+	// whose bytes changed without changing its path — for example, a backup restore replacing
+	// an existing object. The manifest entry still describes the old content (record_count,
 	// file_size_in_bytes, column bounds), so external engines keep counting deleted rows and
 	// can mis-plan reads against the shorter file. Such a path is dropped and re-registered
 	// in the same commit.

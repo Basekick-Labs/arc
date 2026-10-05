@@ -646,6 +646,33 @@ func (m *Manager) GetRouter() *Router {
 	return m.router
 }
 
+// RecordRewrittenFile updates tier metadata for an immutable rewrite.
+// The old path is retired and the new path is recorded as hot. It is used by
+// DELETE because rewritten files bypass the normal ingest/replication writers.
+func (m *Manager) RecordRewrittenFile(ctx context.Context, oldPath, newPath string, sizeBytes int64) error {
+	if m == nil || m.metadata == nil {
+		return nil
+	}
+	info, err := m.parseFilePath(newPath)
+	if err != nil {
+		return fmt.Errorf("parse rewritten file path %q: %w", newPath, err)
+	}
+	if err := m.metadata.DeleteFile(ctx, oldPath); err != nil {
+		return fmt.Errorf("retire rewritten source %q from tier metadata: %w", oldPath, err)
+	}
+	if err := m.RecordNewFile(ctx, &FileMetadata{
+		Path:          newPath,
+		Database:      info.Database,
+		Measurement:   info.Measurement,
+		PartitionTime: info.PartitionTime,
+		SizeBytes:     sizeBytes,
+		CreatedAt:     time.Now().UTC(),
+	}); err != nil {
+		return fmt.Errorf("record rewritten file %q in tier metadata: %w", newPath, err)
+	}
+	return nil
+}
+
 // RecordNewFile records a newly ingested file in the hot tier
 func (m *Manager) RecordNewFile(ctx context.Context, file *FileMetadata) error {
 	file.Tier = TierHot

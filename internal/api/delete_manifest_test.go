@@ -1,7 +1,9 @@
 package api
 
 import (
+	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,18 +11,18 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster/raft"
+	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
 
 type rewriteManifestCoordinator struct {
-	entry   *raft.FileEntry
-	updated *raft.FileEntry
+	entry *raft.FileEntry
+	ops   []raft.BatchFileOp
 }
 
-func (c *rewriteManifestCoordinator) BatchFileOpsInManifest([]raft.BatchFileOp) error { return nil }
-func (c *rewriteManifestCoordinator) UpdateFileInManifest(file raft.FileEntry) error {
-	c.updated = &file
+func (c *rewriteManifestCoordinator) BatchFileOpsInManifest(ops []raft.BatchFileOp) error {
+	c.ops = append(c.ops, ops...)
 	return nil
 }
 func (c *rewriteManifestCoordinator) GetFileEntry(string) (*raft.FileEntry, bool) {
@@ -30,15 +32,17 @@ func (c *rewriteManifestCoordinator) IsPrimaryWriter() bool { return true }
 func (c *rewriteManifestCoordinator) Role() string          { return "writer" }
 func (c *rewriteManifestCoordinator) LocalNodeID() string   { return "new-primary" }
 
-func TestUpdateManifestAfterRewriteStampsLocalOrigin(t *testing.T) {
+func TestReplaceManifestAfterRewritePublishesImmutableFile(t *testing.T) {
 	root := t.TempDir()
 	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("create local backend: %v", err)
 	}
+	t.Cleanup(func() { _ = backend.Close() })
 
-	const relativePath = "db/cpu/rewrite.parquet"
-	fullPath := filepath.Join(root, relativePath)
+	const oldPath = "db/cpu/original.parquet"
+	const newPath = "db/cpu/original_rewrite_123.parquet"
+	fullPath := filepath.Join(root, newPath)
 	if err := os.MkdirAll(filepath.Dir(fullPath), 0o700); err != nil {
 		t.Fatalf("create file directory: %v", err)
 	}
@@ -49,7 +53,7 @@ func TestUpdateManifestAfterRewriteStampsLocalOrigin(t *testing.T) {
 	createdAt := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
 	partition := time.Date(2026, 10, 1, 11, 0, 0, 0, time.UTC)
 	coordinator := &rewriteManifestCoordinator{entry: &raft.FileEntry{
-		Path:          relativePath,
+		Path:          oldPath,
 		Database:      "db",
 		Measurement:   "cpu",
 		PartitionTime: partition,
@@ -61,30 +65,132 @@ func TestUpdateManifestAfterRewriteStampsLocalOrigin(t *testing.T) {
 	}}
 	h := &DeleteHandler{storage: backend, coordinator: coordinator}
 
-	if err := h.updateManifestAfterRewrite(relativePath, nil); err != nil {
-		t.Fatalf("update manifest: %v", err)
+	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, nil); err != nil {
+		t.Fatalf("replace manifest: %v", err)
 	}
-	if coordinator.updated == nil {
-		t.Fatal("manifest update was not recorded")
+	if len(coordinator.ops) != 2 {
+		t.Fatalf("manifest ops = %d, want 2", len(coordinator.ops))
 	}
-	if coordinator.updated.OriginNodeID != "new-primary" {
-		t.Fatalf("OriginNodeID = %q, want new-primary", coordinator.updated.OriginNodeID)
+
+	var registerPayload raft.RegisterFilePayload
+	if err := json.Unmarshal(coordinator.ops[0].Payload, &registerPayload); err != nil {
+		t.Fatalf("decode register payload: %v", err)
 	}
-	if coordinator.updated.SizeBytes != int64(len("rewritten parquet")) {
-		t.Fatalf("SizeBytes = %d, want %d", coordinator.updated.SizeBytes, len("rewritten parquet"))
+	if coordinator.ops[0].Type != raft.CommandRegisterFile {
+		t.Fatalf("first op type = %v, want register", coordinator.ops[0].Type)
 	}
-	// The checksum is what every replica verifies a pull against; it must
-	// describe the rewritten bytes, not the stale entry.
+	if registerPayload.File.Path != newPath {
+		t.Fatalf("registered path = %q, want %q", registerPayload.File.Path, newPath)
+	}
+	if registerPayload.File.OriginNodeID != "new-primary" {
+		t.Fatalf("OriginNodeID = %q, want new-primary", registerPayload.File.OriginNodeID)
+	}
+	if registerPayload.File.SizeBytes != int64(len("rewritten parquet")) {
+		t.Fatalf("SizeBytes = %d, want %d", registerPayload.File.SizeBytes, len("rewritten parquet"))
+	}
 	wantSHA := fmt.Sprintf("%x", sha256.Sum256([]byte("rewritten parquet")))
-	if coordinator.updated.SHA256 != wantSHA {
-		t.Fatalf("SHA256 = %q, want %q", coordinator.updated.SHA256, wantSHA)
+	if registerPayload.File.SHA256 != wantSHA {
+		t.Fatalf("SHA256 = %q, want %q", registerPayload.File.SHA256, wantSHA)
 	}
-	// Everything that identifies the file survives the copy; the real FSM
-	// rejects an update without CreatedAt, so a dropped field here would be
-	// a rejected proposal in production.
-	u := coordinator.updated
-	if u.Path != relativePath || u.Database != "db" || u.Measurement != "cpu" || u.Tier != "hot" ||
-		!u.PartitionTime.Equal(partition) || !u.CreatedAt.Equal(createdAt) {
-		t.Fatalf("identifying fields not preserved: %+v", *u)
+
+	if coordinator.ops[1].Type != raft.CommandDeleteFile {
+		t.Fatalf("second op type = %v, want delete", coordinator.ops[1].Type)
+	}
+	var deletePayload raft.DeleteFilePayload
+	if err := json.Unmarshal(coordinator.ops[1].Payload, &deletePayload); err != nil {
+		t.Fatalf("decode delete payload: %v", err)
+	}
+	if deletePayload.Path != oldPath {
+		t.Fatalf("deleted path = %q, want %q", deletePayload.Path, oldPath)
+	}
+}
+func TestPartialRewriteStandaloneDeletesOriginal(t *testing.T) {
+	root := t.TempDir()
+	logger := zerolog.Nop()
+	backend, err := storage.NewLocalBackend(root, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	db, err := database.New(&database.Config{MemoryLimit: "256MB", ThreadCount: 1, MaxConnections: 1, LocalStorageRoot: root}, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	oldPath := "db/cpu/2026/10/07/20/cpu_20261007_204851_558252000.parquet"
+	full := filepath.Join(root, oldPath)
+	if err := os.MkdirAll(filepath.Dir(full), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB().Exec("CREATE TABLE source(host VARCHAR); INSERT INTO source VALUES ('h1'), ('h2'), ('h2'), ('h3');"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB().Exec(fmt.Sprintf("COPY source TO %q (FORMAT PARQUET)", full)); err != nil {
+		t.Fatal(err)
+	}
+	h := &DeleteHandler{db: db, storage: backend, logger: logger}
+	if _, err := h.rewriteFileWithoutDeletedRows(context.Background(), full, oldPath, "host = 'h1'"); err != nil {
+		t.Fatal(err)
+	}
+	files, err := backend.List(context.Background(), filepath.Dir(oldPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parquet string
+	for _, p := range files {
+		if filepath.Ext(p) == ".parquet" {
+			if parquet != "" {
+				t.Fatalf("duplicate parquet files: %q and %q", parquet, p)
+			}
+			parquet = p
+		}
+	}
+	if parquet == "" || parquet == oldPath {
+		t.Fatalf("expected one rewritten parquet, got %q", parquet)
+	}
+	var rows, h1 int
+	q := filepath.Join(root, parquet)
+	if err := db.DB().QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM read_parquet(%q)", q)).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DB().QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM read_parquet(%q) WHERE host = 'h1'", q)).Scan(&h1); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 3 || h1 != 0 {
+		t.Fatalf("rewritten rows=%d h1=%d, want 3/0", rows, h1)
+	}
+}
+func TestReplaceManifestAfterRewriteDeletesOriginalObject(t *testing.T) {
+	root := t.TempDir()
+	local, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+	oldPath := "db/cpu/original.parquet"
+	newPath := "db/cpu/original_rewrite_123.parquet"
+	oldFull := filepath.Join(root, oldPath)
+	newFull := filepath.Join(root, newPath)
+	if err := os.MkdirAll(filepath.Dir(newFull), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(oldFull, []byte("old"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(newFull, []byte("new"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	c := &rewriteManifestCoordinator{entry: &raft.FileEntry{Path: oldPath, Database: "db", Measurement: "cpu", PartitionTime: time.Date(2026, 10, 1, 11, 0, 0, 0, time.UTC)}}
+	remote := &struct{ storage.Backend }{Backend: local}
+	h := &DeleteHandler{storage: remote, coordinator: c, logger: zerolog.Nop()}
+	s3 := &s3RewriteResult{newPath: newPath, sizeBytes: 3, sha256: "remote-test"}
+	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, s3); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(oldFull); !os.IsNotExist(err) {
+		t.Fatalf("old object still exists: %v", err)
+	}
+	if len(c.ops) != 2 {
+		t.Fatalf("manifest ops = %d, want 2", len(c.ops))
 	}
 }
