@@ -561,14 +561,20 @@ predate that fix and #978.
 
 ## Bug fixes
 
-### Atomic visibility for Raft manifest batches ([#447](https://github.com/Basekick-Labs/arc/issues/447))
+### A compaction batch is now applied to the Raft manifest atomically ([#447](https://github.com/Basekick-Labs/arc/issues/447))
 
-A batch of file registrations, deletions and updates previously released the
-Raft manifest lock between operations. Concurrent readers and file callbacks
-could observe an intermediate state with compaction inputs removed before the
-output was registered. All file mutations in a batch now execute under one
-write lock, and callbacks run in their original order after the completed
-batch is visible and the lock is released.
+Compaction commits its result to the cluster manifest as one Raft entry that
+registers the compacted output and deletes the source files it replaced. The
+FSM applied that batch one operation at a time, taking and releasing the
+manifest lock for each, so a reader listing the manifest between two operations
+could see the output already registered while some sources were still listed:
+duplicate rows for that query on every node that reads the manifest, in a window
+of microseconds that opened on every compaction. The callbacks that drive
+replication saw the same half-applied states.
+
+The whole batch now runs under one write lock, and its callbacks are delivered
+afterwards, in order, against the completed manifest. Single-operation
+registers, updates and deletes behave exactly as before.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#910](https://github.com/Basekick-Labs/arc/pull/910).
 

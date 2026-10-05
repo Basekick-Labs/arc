@@ -51,27 +51,42 @@ func TestFSMBatchFileOpsAtomicVisibilityIssue447(t *testing.T) {
 
 	callbacks := 0
 
-	// Installed AFTER seeding so only the batch invokes it.
-	// Reading the FSM inside the callback also verifies that callbacks
-	// run outside the manifest write lock.
+	// Installed AFTER seeding so only the batch invokes them. Both callbacks
+	// read the FSM: that is how the compaction bridge's consumers behave, and
+	// it also proves the callbacks run outside the manifest write lock.
+	observe := func(what string) {
+		callbacks++
+		files := fsm.GetFilesByDatabase("db")
+		if len(files) != 1 ||
+			files[0].Path != "db/cpu/2026/09/19/03/output.parquet" {
+			t.Errorf(
+				"observed intermediate manifest in callback %d (%s): files=%+v",
+				callbacks, what, files,
+			)
+		}
+	}
 	fsm.SetFileCallbacks(
-		nil,
-		func(path, reason string) {
-			callbacks++
-
-			files := fsm.GetFilesByDatabase("db")
-			if len(files) != 1 ||
-				files[0].Path != "db/cpu/2026/09/19/03/output.parquet" {
-				t.Errorf(
-					"observed intermediate manifest in callback %d: "+
-						"deleted=%q, files=%+v",
-					callbacks, path, files,
-				)
-			}
-		},
+		func(file *FileEntry) { observe("registered " + file.Path) },
+		func(path, reason string) { observe("deleted " + path) },
 	)
 
+	// The compaction bridge's order: the output is registered first, then
+	// the inputs are deleted (internal/cluster/compaction_bridge.go). On the
+	// unfixed code the register callback therefore saw four files and each
+	// delete callback one fewer.
+	output := FileEntry{
+		Path:        "db/cpu/2026/09/19/03/output.parquet",
+		Database:    "db",
+		Measurement: "cpu",
+		CreatedAt:   createdAt,
+	}
 	ops := make([]BatchFileOp, 0, 4)
+	ops = append(ops, BatchFileOp{
+		Type: CommandRegisterFile,
+		Payload: mustJSON(RegisterFilePayload{
+			File: output,
+		}),
+	})
 	for _, path := range inputs {
 		ops = append(ops, BatchFileOp{
 			Type: CommandDeleteFile,
@@ -82,20 +97,6 @@ func TestFSMBatchFileOpsAtomicVisibilityIssue447(t *testing.T) {
 		})
 	}
 
-	output := FileEntry{
-		Path:        "db/cpu/2026/09/19/03/output.parquet",
-		Database:    "db",
-		Measurement: "cpu",
-		CreatedAt:   createdAt,
-	}
-
-	ops = append(ops, BatchFileOp{
-		Type: CommandRegisterFile,
-		Payload: mustJSON(RegisterFilePayload{
-			File: output,
-		}),
-	})
-
 	if result := fsm.applyBatchFileOps(
 		mustJSON(BatchFileOpsPayload{Ops: ops}),
 		100,
@@ -103,8 +104,8 @@ func TestFSMBatchFileOpsAtomicVisibilityIssue447(t *testing.T) {
 		t.Fatalf("apply batch: %v", result)
 	}
 
-	if callbacks != 3 {
-		t.Fatalf("delete callbacks = %d, want 3", callbacks)
+	if callbacks != 4 {
+		t.Fatalf("callbacks = %d, want 4 (one register, three deletes)", callbacks)
 	}
 
 	files := fsm.GetFilesByDatabase("db")

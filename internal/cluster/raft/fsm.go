@@ -1201,6 +1201,7 @@ func (f *ClusterFSM) applyRegisterFileStruct(p RegisterFilePayload, logIndex uin
 // applyRegisterFileLocked mutates the manifest with f.mu already held.
 // Its returned event must be delivered only after unlocking.
 func (f *ClusterFSM) applyRegisterFileLocked(p RegisterFilePayload, logIndex uint64) func() {
+	// Stamp the LSN from the Raft log index (deterministic across all nodes).
 	p.File.LSN = logIndex
 	entry := p.File
 	// If the file was already registered under a different database (unlikely
@@ -1225,7 +1226,6 @@ func (f *ClusterFSM) applyRegisterFileLocked(p RegisterFilePayload, logIndex uin
 	f.keysCache = nil // invalidate sorted-key cache
 	callback := f.onFileRegistered
 	return func() {
-
 		f.logger.Debug().
 			Str("path", entry.Path).
 			Str("database", entry.Database).
@@ -1269,7 +1269,8 @@ func (f *ClusterFSM) applyDeleteFileStruct(p DeleteFilePayload) interface{} {
 }
 
 // applyDeleteFileLocked mutates the manifest with f.mu already held.
-// Its returned event must be delivered only after unlocking.
+// Its returned event must be delivered only after unlocking; it is nil when
+// the path was not in the manifest (idempotent delete, nothing to announce).
 func (f *ClusterFSM) applyDeleteFileLocked(p DeleteFilePayload) func() {
 	existing, existed := f.files[p.Path]
 	delete(f.files, p.Path)
@@ -1283,14 +1284,13 @@ func (f *ClusterFSM) applyDeleteFileLocked(p DeleteFilePayload) func() {
 		}
 	}
 	f.keysCache = nil // invalidate sorted-key cache
+	if !existed {
+		// Idempotent — deletion of a non-existent file is a no-op, and
+		// there is nothing to announce.
+		return nil
+	}
 	callback := f.onFileDeleted
 	return func() {
-
-		if !existed {
-			// Idempotent — deletion of a non-existent file is a no-op
-			return
-		}
-
 		f.logger.Debug().
 			Str("path", p.Path).
 			Str("reason", p.Reason).
@@ -1348,6 +1348,12 @@ func (f *ClusterFSM) applyUpdateFileStruct(p UpdateFilePayload, logIndex uint64)
 // applyUpdateFileLocked mutates the manifest with f.mu already held.
 // Its returned event must be delivered only after unlocking.
 func (f *ClusterFSM) applyUpdateFileLocked(p UpdateFilePayload, logIndex uint64) func() {
+	// Stamp the LSN from the current Raft log index so consumers that
+	// watch f.files for "did this entry change" can detect the update.
+	// Without this, an Update that mutates an existing entry would
+	// leave the LSN at its registration-time value, and downstream
+	// consumers (e.g. compaction watchers) couldn't distinguish a
+	// fresh state from a stale one.
 	p.File.LSN = logIndex
 	entry := p.File
 	// If the database changed (defensive), remove the old secondary index entry first.
@@ -1371,7 +1377,6 @@ func (f *ClusterFSM) applyUpdateFileLocked(p UpdateFilePayload, logIndex uint64)
 	f.keysCache = nil // invalidate sorted-key cache
 	callback := f.onFileRegistered
 	return func() {
-
 		f.logger.Debug().
 			Str("path", entry.Path).
 			Int64("size_bytes", entry.SizeBytes).
@@ -1430,10 +1435,11 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 	// the legitimate op would land before the loop hit the malicious
 	// one. See GHSA-f85q-mvg8-qf37 review notes.
 	//
-	// Delete ops are not validated here because applyDeleteFile only
-	// uses the path as a map key (delete of a non-existent key is a
-	// no-op); validating delete paths would change existing semantics
-	// for callers that legitimately race delete-then-register.
+	// Delete ops are checked for shape only (a decodable payload with a
+	// non-empty path): applyDeleteFile uses the path as a map key and a
+	// delete of a non-existent key is a no-op, so validating delete paths
+	// against the manifest rules would change existing semantics for
+	// callers that legitimately race delete-then-register.
 	//
 	// We store each decoded Register/Update payload in parallel slots
 	// (decoded[i]) so the apply loop below can call the *Struct apply
@@ -1546,7 +1552,7 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 	}
 	f.mu.Unlock()
 
-	// Preserve callback order and skip callbacks for idempotent deletes.
+	// Deliver in op order. Idempotent deletes contributed no event above.
 	for _, emit := range events {
 		emit()
 	}
