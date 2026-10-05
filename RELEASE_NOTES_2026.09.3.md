@@ -561,6 +561,23 @@ predate that fix and #978.
 
 ## Bug fixes
 
+### A compaction batch is now applied to the Raft manifest atomically ([#447](https://github.com/Basekick-Labs/arc/issues/447))
+
+Compaction commits its result to the cluster manifest as one Raft entry that
+registers the compacted output and deletes the source files it replaced. The
+FSM applied that batch one operation at a time, taking and releasing the
+manifest lock for each, so a reader listing the manifest between two operations
+could see the output already registered while some sources were still listed:
+duplicate rows for that query on every node that reads the manifest, in a window
+of microseconds that opened on every compaction. The callbacks that drive
+replication saw the same half-applied states.
+
+The whole batch now runs under one write lock, and its callbacks are delivered
+afterwards, in order, against the completed manifest. Single-operation
+registers, updates and deletes behave exactly as before.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#910](https://github.com/Basekick-Labs/arc/pull/910).
+
 ### A delete-API rewrite after a writer failover now names the node that holds the new bytes ([#976](https://github.com/Basekick-Labs/arc/issues/976))
 
 The delete API rewrites a Parquet file in place on the primary writer and
