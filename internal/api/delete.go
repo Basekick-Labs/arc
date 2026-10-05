@@ -34,6 +34,9 @@ type DeleteCoordinator interface {
 	GetFileEntry(path string) (*raft.FileEntry, bool)
 	IsPrimaryWriter() bool
 	Role() string
+	// LocalNodeID names this node in the manifest. A rewrite stamps it as the
+	// origin of the new bytes (#976).
+	LocalNodeID() string
 }
 
 // errManifestFailure is returned when a Raft manifest update fails.
@@ -795,9 +798,12 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 		return 0, rewriteErr
 	}
 
-	// Notify the cluster manifest that this file's content changed. Non-fatal:
-	// the rewrite succeeded in storage; a stale manifest entry is eventually
-	// consistent and does not affect query correctness.
+	// Notify the cluster manifest that this file's content changed. Non-fatal
+	// for this request: the rewrite already succeeded in storage. It is not
+	// harmless for the cluster, though: the manifest entry is what every other
+	// node pulls by, so a lost update leaves replicas on the pre-rewrite bytes
+	// until the path's next content change. The warning below is the only
+	// signal of that.
 	if h.coordinator != nil {
 		if err := h.updateManifestAfterRewrite(relativePath, s3Result); err != nil {
 			h.logger.Warn().Err(err).Str("file", relativePath).Msg("Failed to update manifest after partial rewrite")
@@ -970,17 +976,19 @@ func (h *DeleteHandler) isRemoteBackend() bool {
 }
 
 // updateManifestAfterRewrite updates the cluster manifest entry for a partially
-// rewritten file. It reads the existing entry to preserve all immutable fields
-// (database, measurement, origin node, tier, etc.) and updates only the mutable
-// metadata: SizeBytes and SHA256.
+// rewritten file. It reads the existing entry to keep the fields that identify
+// the file (path, database, measurement, partition time, tier, created-at) and
+// replaces the three that describe its bytes: SizeBytes, SHA256 and
+// OriginNodeID, the last because the node that rewrote the file is now the one
+// that holds the bytes the manifest describes (#976).
 //
-// For local storage, the new size and checksum are computed from the rewritten
-// file on disk. For S3, size/checksum are not re-read (would require an extra
-// round-trip) — the manifest entry is still re-committed so peers know the file
-// changed, but SizeBytes and SHA256 will be stale until the next register.
+// For local storage the new size and checksum are read from the rewritten file
+// on disk. For S3 they come from the rewrite result, which computed them while
+// uploading.
 //
-// Failure is non-fatal: the rewrite already succeeded in storage; a stale
-// manifest entry is eventually consistent and does not affect query correctness.
+// Failure is non-fatal for the request: the rewrite already succeeded in
+// storage. The caller logs it, because nothing re-proposes a lost update and
+// replicas keep serving the pre-rewrite bytes until the path changes again.
 func (h *DeleteHandler) updateManifestAfterRewrite(relativePath string, s3 *s3RewriteResult) error {
 	existing, ok := h.coordinator.GetFileEntry(relativePath)
 	if !ok {
@@ -989,11 +997,12 @@ func (h *DeleteHandler) updateManifestAfterRewrite(relativePath string, s3 *s3Re
 	}
 
 	entry := *existing // copy all fields to preserve immutable metadata
-	if localNodeIDProvider, ok := h.coordinator.(interface{ LocalNodeID() string }); ok {
-		// The node that performed the rewrite owns the new bytes. Keeping the
-		// old origin after a writer failover makes readers fetch stale content.
-		entry.OriginNodeID = localNodeIDProvider.LocalNodeID()
-	}
+	// The node that performed the rewrite owns the new bytes. After a writer
+	// failover the primary is not the file's origin, and keeping the old origin
+	// sent every replica to a node that still had the pre-rewrite bytes: a
+	// wasted transfer and a checksum failure on every pull, and the old origin
+	// itself skipped the update as its own and kept the deleted rows (#976).
+	entry.OriginNodeID = h.coordinator.LocalNodeID()
 
 	if lb, ok := h.storage.(*storage.LocalBackend); ok {
 		basePath := lb.GetBasePath()

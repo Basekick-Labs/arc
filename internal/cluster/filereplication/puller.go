@@ -1462,9 +1462,9 @@ func (p *Puller) processEntry(log zerolog.Logger, request *pullRequest) {
 			// before they are accepted, so no bad bytes can ever be trusted no
 			// matter how many peers are asked. Breaking instead made one stale
 			// peer fatal — and the stale peer is routinely the FIRST one tried,
-			// because the resolver puts OriginNodeID first and a rewrite
-			// preserves the original origin (internal/api/delete.go) while
-			// only the rewriting node has the new bytes. Re-resolving on the
+			// because the resolver puts OriginNodeID first and, until #976, a
+			// rewrite in place kept the original origin (internal/api/delete.go)
+			// while only the rewriting node had the new bytes. Re-resolving on the
 			// next attempt yields the same ordering, so the attempt-level
 			// retry this used to defer to could never rescue it.
 			//

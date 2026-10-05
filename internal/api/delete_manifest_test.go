@@ -1,9 +1,12 @@
 package api
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -43,9 +46,18 @@ func TestUpdateManifestAfterRewriteStampsLocalOrigin(t *testing.T) {
 		t.Fatalf("write rewritten file: %v", err)
 	}
 
+	createdAt := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	partition := time.Date(2026, 10, 1, 11, 0, 0, 0, time.UTC)
 	coordinator := &rewriteManifestCoordinator{entry: &raft.FileEntry{
-		Path:         relativePath,
-		OriginNodeID: "old-origin",
+		Path:          relativePath,
+		Database:      "db",
+		Measurement:   "cpu",
+		PartitionTime: partition,
+		Tier:          "hot",
+		CreatedAt:     createdAt,
+		OriginNodeID:  "old-origin",
+		SizeBytes:     4096,
+		SHA256:        "stale",
 	}}
 	h := &DeleteHandler{storage: backend, coordinator: coordinator}
 
@@ -60,5 +72,19 @@ func TestUpdateManifestAfterRewriteStampsLocalOrigin(t *testing.T) {
 	}
 	if coordinator.updated.SizeBytes != int64(len("rewritten parquet")) {
 		t.Fatalf("SizeBytes = %d, want %d", coordinator.updated.SizeBytes, len("rewritten parquet"))
+	}
+	// The checksum is what every replica verifies a pull against; it must
+	// describe the rewritten bytes, not the stale entry.
+	wantSHA := fmt.Sprintf("%x", sha256.Sum256([]byte("rewritten parquet")))
+	if coordinator.updated.SHA256 != wantSHA {
+		t.Fatalf("SHA256 = %q, want %q", coordinator.updated.SHA256, wantSHA)
+	}
+	// Everything that identifies the file survives the copy; the real FSM
+	// rejects an update without CreatedAt, so a dropped field here would be
+	// a rejected proposal in production.
+	u := coordinator.updated
+	if u.Path != relativePath || u.Database != "db" || u.Measurement != "cpu" || u.Tier != "hot" ||
+		!u.PartitionTime.Equal(partition) || !u.CreatedAt.Equal(createdAt) {
+		t.Fatalf("identifying fields not preserved: %+v", *u)
 	}
 }

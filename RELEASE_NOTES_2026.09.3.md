@@ -561,6 +561,30 @@ predate that fix and #978.
 
 ## Bug fixes
 
+### A delete-API rewrite after a writer failover now names the node that holds the new bytes ([#976](https://github.com/Basekick-Labs/arc/issues/976))
+
+The delete API rewrites a Parquet file in place on the primary writer and
+re-commits its manifest entry with the new size and checksum, copying every
+other field from the existing entry, including the origin node. After a writer
+failover the primary is not the node that first wrote the file, so the new bytes
+existed only on the new primary while the manifest still named the old origin.
+Every replica tried the old origin first and received the pre-rewrite bytes;
+before the #999 fix above, that single checksum failure ended the pull and the
+replica dropped its own copy, and since it the pull falls through to the next
+peer at the cost of a wasted full transfer from the stale origin every time. The
+old origin itself was never corrected: it saw an update to a file it had written,
+skipped it as its own, and kept serving the deleted rows.
+
+The rewritten entry now records the rewriting node as its origin. Replicas fetch
+from the node that produced the bytes on the first try, and the old origin sees
+a foreign-origin update and pulls the new file like any other replica, provided
+the rewrite changed the file's size, since the puller's "already here" check
+compares size only (#975). The `DeleteCoordinator` interface gained
+`LocalNodeID()` so the compiler enforces the dependency rather than a runtime
+type assertion.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#984](https://github.com/Basekick-Labs/arc/pull/984).
+
 ### Duplicate token-name races no longer increment the auth rejection counter ([#964](https://github.com/Basekick-Labs/arc/issues/964))
 
 Concurrent bootstrap or admin creates for an existing token name are now treated as expected name conflicts rather than malformed or forged entries. Identical Raft replays remain no-ops, while non-identical same-name creates still return an `already exists` error without incrementing `arc_cluster_auth_rejected_total`.
@@ -1239,7 +1263,7 @@ answered, not about the file. A rewrite reaches every node's manifest through
 Raft before the new bytes reach every replica, so a peer that is merely behind
 rejects on checksum while a peer that has the bytes would have served them. The
 peer that is behind is routinely the first one asked: the puller tries the
-file's origin node first, a rewrite in place keeps the original origin, and a
+file's origin node first, a rewrite in place kept the original origin (fixed by #976, below), and a
 compacted file's origin is the node that compacted it — none of which is
 necessarily the node that performed the rewrite. The origin is also the one
 candidate whose position is fixed, so every retry put the same stale peer first
