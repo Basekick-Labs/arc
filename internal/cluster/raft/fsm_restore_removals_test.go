@@ -79,27 +79,60 @@ func TestClusterFSM_Restore_RemovalCallbackIsOptional(t *testing.T) {
 
 func TestClusterFSM_Restore_AnnouncesFilesTheSnapshotDropped(t *testing.T) {
 	fsm := NewClusterFSM(zerolog.Nop())
-	var deletedPath, deletedReason string
+	type call struct{ path, reason string }
+	var calls []call
 	fsm.SetFileCallbacks(nil, func(path, reason string) {
-		deletedPath = path
-		deletedReason = reason
+		// Reading the FSM from inside the callback proves two things at once:
+		// delivery happens after the write lock is released (a held lock would
+		// deadlock here), and after the manifest swap (the path is gone).
+		if _, exists := fsm.GetFile(path); exists {
+			t.Errorf("callback for %q ran before the manifest dropped it", path)
+		}
+		calls = append(calls, call{path, reason})
 	})
 
-	file := makeFileEntry("db/cpu/2026/04/11/14/file.parquet", "db", "cpu", 1024)
+	dropped1 := makeFileEntry("db/cpu/2026/04/11/14/zz-file.parquet", "db", "cpu", 1024)
+	dropped2 := makeFileEntry("db/cpu/2026/04/11/14/aa-file.parquet", "db", "cpu", 1024)
 	keep := makeFileEntry("db/cpu/2026/04/11/14/keep.parquet", "db", "cpu", 1024)
 	restoreFrom(t, fsm, FSMSnapshot{Files: map[string]*FileEntry{
-		file.Path: &file,
-		keep.Path: &keep,
+		dropped1.Path: &dropped1,
+		dropped2.Path: &dropped2,
+		keep.Path:     &keep,
 	}})
+	// A restore into an empty manifest (a process restart loading its own
+	// snapshot) has nothing to diff and announces nothing.
+	if len(calls) != 0 {
+		t.Fatalf("restore into an empty manifest announced %v, want nothing", calls)
+	}
 
-	deletedPath, deletedReason = "", ""
 	restoreFrom(t, fsm, FSMSnapshot{Files: map[string]*FileEntry{
 		keep.Path: &keep,
 	}})
 
-	if deletedPath != file.Path || deletedReason != "snapshot:removed" {
-		t.Errorf("deleted callback = (%q, %q), want (%q, %q)", deletedPath, deletedReason, file.Path, "snapshot:removed")
+	want := []call{
+		{dropped2.Path, UnlinkReasonSnapshotRemoved}, // sorted: aa- before zz-
+		{dropped1.Path, UnlinkReasonSnapshotRemoved},
 	}
+	if len(calls) != len(want) {
+		t.Fatalf("delete callbacks = %v, want %v", calls, want)
+	}
+	for i := range want {
+		if calls[i] != want[i] {
+			t.Fatalf("delete callback %d = %v, want %v", i, calls[i], want[i])
+		}
+	}
+	if _, exists := fsm.GetFile(keep.Path); !exists {
+		t.Error("file the snapshot kept is missing from the manifest")
+	}
+}
+
+func TestClusterFSM_Restore_DroppedFilesWithNoCallbackAreJustDropped(t *testing.T) {
+	fsm := NewClusterFSM(zerolog.Nop())
+	file := makeFileEntry("db/cpu/2026/04/11/14/file.parquet", "db", "cpu", 1024)
+	restoreFrom(t, fsm, FSMSnapshot{Files: map[string]*FileEntry{file.Path: &file}})
+	// No file callbacks wired (replication off, or before the puller starts):
+	// the restore must still complete and the manifest must match the snapshot.
+	restoreFrom(t, fsm, FSMSnapshot{})
 	if _, exists := fsm.GetFile(file.Path); exists {
 		t.Error("file dropped by snapshot is still in the manifest")
 	}

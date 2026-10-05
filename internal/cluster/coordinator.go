@@ -951,7 +951,7 @@ func (c *Coordinator) enqueueLocalDelete(path, reason string) {
 	if n == deletePendingWarnAt {
 		c.logger.Warn().
 			Int("pending", n).
-			Msg("Local delete backlog is large; the delete workers are not keeping up with manifest deletes")
+			Msg("Local delete backlog is large; either the delete workers are not keeping up with manifest deletes or a snapshot restore just dropped many paths")
 	}
 	if wake != nil {
 		select {
@@ -4169,7 +4169,8 @@ func (c *Coordinator) startFilePullerLocked() error {
 	}
 	onDelete := func(path string, reason string) {
 		// Phase 4: the callback runs synchronously from applyDeleteFile on
-		// the Raft apply hot path. It MUST NOT block. It hands the path to
+		// the Raft apply hot path, and from a snapshot Restore for every path
+		// the snapshot dropped (#962). It MUST NOT block. It hands the path to
 		// the delete-worker pool, which waits a short grace period so
 		// in-flight queries scanning the old file can finish and then calls
 		// backend.Delete. On non-local backends (S3, Azure) the compactor

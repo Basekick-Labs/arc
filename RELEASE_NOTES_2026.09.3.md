@@ -561,6 +561,34 @@ predate that fix and #978.
 
 ## Bug fixes
 
+### A node that rejoins through a Raft snapshot now removes the replicas the cluster deleted while it was away ([#962](https://github.com/Basekick-Labs/arc/issues/962))
+
+On a per-node-storage cluster every node unlinks its local copy of a file when
+the manifest drops it, through the FSM delete callback. That callback fired only
+when a delete was applied from the Raft log. A node that fell far enough behind
+to receive a snapshot instead rebuilt its manifest from the snapshot without
+firing it, so it kept every replica it held before the outage, including the
+files compaction, retention and tiering had deleted in the meantime. Its reads
+glob the disk, so that node alone returned duplicate rows and rows that should
+have been gone, silently, until the orphan sweep (opt-in) removed them.
+
+Restoring a snapshot now diffs the manifest this node last held against the
+restored one and hands every path that disappeared to the same delete workers,
+with the reason `snapshot:removed`. Because that reason cannot say why the file
+left, the unlink is recorded in this node's tier metadata the way an abandoned
+pull is: the cold tier is asked whether the file moved there, so a measurement
+migrated while the node was away reads from cold instead of vanishing from that
+node's results. A process restart that loads its own snapshot into an empty
+manifest has nothing to diff and fires nothing.
+
+One gap remains after a restart: the diff is against the node's last local Raft
+snapshot (`cluster.raft_snapshot_threshold`, default 10,000 entries), not its
+disk. Files this node pulled after that snapshot and the cluster deleted while
+it was down are still removed only by the orphan sweep
+([#1071](https://github.com/Basekick-Labs/arc/issues/1071)).
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#983](https://github.com/Basekick-Labs/arc/pull/983).
+
 ### A compaction batch is now applied to the Raft manifest atomically ([#447](https://github.com/Basekick-Labs/arc/issues/447))
 
 Compaction commits its result to the cluster manifest as one Raft entry that
