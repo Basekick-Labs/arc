@@ -4,6 +4,28 @@
 
 ## Bug fixes
 
+### Delete API WHERE validation no longer rejects SQL words and punctuation inside string literals ([#834](https://github.com/Basekick-Labs/arc/issues/834))
+
+`POST /api/v1/delete` scans the WHERE clause for statement-level SQL before it
+interpolates the clause into the DuckDB statement: forbidden keywords (`DROP`,
+`UPDATE`, `SET`, ...), `;` and comment markers, and DuckDB's file-I/O table
+functions. Those scans ran on the raw text, so a value that merely contained
+one of those words was refused as if it were SQL: `status = 'delete-pending'`,
+`action = 'update'` or `note = 'a;b--c'` could not be deleted through the API
+at all.
+
+The scans now run on the clause with its string literals masked by the same
+masker the query path uses, which knows plain `'...'`, escape-string `E'...'`
+and dollar-quoted `$tag$...$tag$` forms, so a literal is data whatever it says.
+Backtick identifiers are normalised first, as the query path does, and the
+file-I/O scan still sees an identifier-quoted call such as `"glob"(...)`. The
+raw clause is what reaches DuckDB, and the unmatched-quote and
+unmatched-parenthesis checks still run on it. The same syntax outside a literal
+is refused exactly as before, including the escaped-quote and dollar-tag shapes
+the masker was hardened against in 26.09.1 and 26.09.2.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#937](https://github.com/Basekick-Labs/arc/pull/937).
+
 ### A replica refreshes a file whose manifest content changes while it is being pulled ([#798](https://github.com/Basekick-Labs/arc/issues/798))
 
 The puller deduplicated arrivals by path: a manifest update for a path whose

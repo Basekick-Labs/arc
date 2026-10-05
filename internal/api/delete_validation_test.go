@@ -49,3 +49,33 @@ func TestValidateWhereClauseRejectsDangerousTextOutsideLiterals(t *testing.T) {
 		}
 	}
 }
+
+// Edge cases the review added on top of the masking: literals that mention a
+// file-I/O function or an identifier that is a keyword stay data; the escaped
+// quote, trailing comment and dollar-tag shapes the masker was hardened
+// against stay refused; and a quote inside a backtick identifier must not
+// open a literal that swallows the call after it.
+func TestValidateWhereClauseMaskingEdgeCases(t *testing.T) {
+	h := &DeleteHandler{}
+	for _, where := range []string{
+		`msg = 'glob(/etc/*) failed'`,
+		`msg = E'read_csv(x)'`,
+		`"offset" = 'set'`,
+	} {
+		if _, err := h.validateWhereClause(where); err != nil {
+			t.Errorf("validateWhereClause(%q) returned error: %v", where, err)
+		}
+	}
+	for _, where := range []string{
+		`host = '\' OR 1=1; DROP TABLE x -- '`,
+		"host = 'a' -- '\n; DROP TABLE x",
+		`host = 'a' AS t$$$ ; DROP TABLE x`,
+		`host = "glob"('/etc/*')`,
+		"host = `read_csv`('/etc/passwd')",
+		"`a'` = 1 OR glob('/etc/passwd') IS NOT NULL OR `'` = 1",
+	} {
+		if _, err := h.validateWhereClause(where); err == nil {
+			t.Errorf("validateWhereClause(%q) accepted unsafe input", where)
+		}
+	}
+}
