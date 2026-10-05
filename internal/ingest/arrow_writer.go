@@ -776,6 +776,10 @@ type TypedColumnBatch struct {
 	DedupTime bool
 	Signature string   // sorted column-name string; cached to avoid per-write recomputation
 	WALHashes []string // identities of WAL entries represented by this batch
+	// Replicated marks a batch applied from another node's WAL. Such a batch
+	// is already represented by the origin's manifest entry and must not
+	// register its local materialisation again (#888).
+	Replicated bool
 }
 
 type bufferShard struct {
@@ -1456,7 +1460,7 @@ func (b *ArrowBuffer) SetFileRegistrar(fr FileRegistrar) {
 // sha256Hex is a hex-encoded SHA-256 of the Parquet bytes, computed by the caller on the
 // in-memory buffer immediately before the backend write. Peers validate downloaded bytes
 // against this checksum.
-func (b *ArrowBuffer) registerFileInTiering(ctx context.Context, database, measurement, storagePath string, partitionTime time.Time, sizeBytes int64, sha256Hex string) {
+func (b *ArrowBuffer) registerFileInTiering(ctx context.Context, database, measurement, storagePath string, partitionTime time.Time, sizeBytes int64, sha256Hex string, announce bool) {
 	// Register in local tiering metadata (hot/cold tracking)
 	if b.tieringManager != nil {
 		metadata := b.tieringManager.GetMetadata()
@@ -1483,7 +1487,7 @@ func (b *ArrowBuffer) registerFileInTiering(ctx context.Context, database, measu
 	// Announce to cluster-wide file manifest (peer replication).
 	// The registrar implementation MUST be non-blocking — it's called on
 	// the hot flush path.
-	if b.fileRegistrar != nil {
+	if announce && b.fileRegistrar != nil {
 		b.fileRegistrar.RegisterFile(database, measurement, storagePath, partitionTime, sizeBytes, sha256Hex)
 	}
 }
@@ -1720,10 +1724,17 @@ func (b *ArrowBuffer) WriteColumnarRecord(ctx context.Context, database string, 
 // WriteColumnarDirectReplay when replaying an entry whose identity should be
 // checkpointed once the batch reaches storage.
 func (b *ArrowBuffer) WriteColumnarDirectNoWAL(ctx context.Context, database, measurement string, columns map[string][]interface{}) error {
-	return b.writeColumnarDirect(ctx, database, measurement, columns, "")
+	return b.writeColumnarDirect(ctx, database, measurement, columns, "", false)
 }
 
-func (b *ArrowBuffer) writeColumnarDirect(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string) error {
+// WriteColumnarDirectNoWALReplicated buffers rows received from another node's
+// WAL. The resulting local Parquet is a query materialisation, not a new
+// cluster-manifest source, so its flush must not announce a second file (#888).
+func (b *ArrowBuffer) WriteColumnarDirectNoWALReplicated(ctx context.Context, database, measurement string, columns map[string][]interface{}) error {
+	return b.writeColumnarDirect(ctx, database, measurement, columns, "", true)
+}
+
+func (b *ArrowBuffer) writeColumnarDirect(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string, replicated bool) error {
 	// #590: both callers (WAL crash replay, cluster WAL replication) feed
 	// RAW client payloads that never went through the live decode path's
 	// post-processing. Apply it here so replayed data behaves exactly like
@@ -1774,6 +1785,7 @@ func (b *ArrowBuffer) writeColumnarDirect(ctx context.Context, database, measure
 		Measurement: measurement,
 		Columns:     columns,
 		Columnar:    true,
+		Replicated:  replicated,
 	}
 	return b.writeColumnarInternal(ctx, database, record, true, walIdentity)
 }
@@ -1797,7 +1809,7 @@ func (b *ArrowBuffer) writeColumnarDirect(ctx context.Context, database, measure
 // the entry when only some of those calls flush would mark data durable that
 // was discarded. See cmd/arc's recovery callbacks.
 func (b *ArrowBuffer) WriteColumnarDirectReplay(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string) error {
-	return b.writeColumnarDirect(ctx, database, measurement, columns, walIdentity)
+	return b.writeColumnarDirect(ctx, database, measurement, columns, walIdentity, false)
 }
 
 // WriteTypedColumnarDirect writes a pre-typed column batch to the buffer,
@@ -2265,9 +2277,15 @@ func (b *ArrowBuffer) writeColumnar(ctx context.Context, database string, record
 }
 
 func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string, record *models.ColumnarRecord, skipWAL bool, inheritedWALIdentity string) error {
-	// Create buffer key: database/measurement
+	// Create buffer key: database/measurement. Keep replication-applied
+	// batches in a separate buffer from locally originated rows so a flush
+	// can never accidentally suppress the manifest announcement for a mixed
+	// local/replicated file (#888).
 	// OPTIMIZATION: String concatenation is faster than fmt.Sprintf (no reflection)
 	bufferKey := database + "/" + record.Measurement
+	if record.Replicated {
+		bufferKey += "/__replicated__"
+	}
 
 	// WAL: Write to WAL before buffering (if enabled)
 	// Skip WAL during recovery to avoid re-writing recovered data
@@ -2370,6 +2388,7 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 	typedColumns.TagColumns = record.TagColumns
 	// Propagate the dedup-on-time marker (CQ output only — see ColumnarRecord.DedupTime)
 	typedColumns.DedupTime = record.DedupTime
+	typedColumns.Replicated = record.Replicated
 	typedColumns.WALHashes = walHashes
 
 	// Column signature for schema evolution detection (pre-computed in convertColumnsToTyped)
@@ -3369,6 +3388,12 @@ func (b *ArrowBuffer) flushWithDataTimePartitioning(ctx context.Context, bufferK
 // Called by both async (flushWithDataTimePartitioning) and sync (flushBufferLockedDataTime) paths
 // Uses hash-based grouping to partition by hour, then sorts each hour independently
 func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, database, measurement string, merged *TypedColumnBatch, recordCount int, flushType string, startTime time.Time) error {
+	// Replicated batches are local query materialisations of data already
+	// announced by the origin. Keep their local tiering metadata, but do not
+	// create a second cluster-manifest source. Local and replicated batches use
+	// separate buffer keys, so this flag cannot suppress a mixed-origin file.
+	announce := !merged.Replicated
+
 	// Get sort keys for this measurement (guaranteed to include "time")
 	sortKeys := b.getSortKeys(measurement)
 
@@ -3446,7 +3471,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		b.registerFieldSchema(ctx, database, measurement, fileSchema, sorted.TagColumns, storagePath)
 
 		// Register file in tiering metadata for query routing
-		b.registerFileInTiering(ctx, database, measurement, storagePath, minTime, int64(len(parquetData)), parquetSumHex)
+		b.registerFileInTiering(ctx, database, measurement, storagePath, minTime, int64(len(parquetData)), parquetSumHex, announce)
 
 		b.totalRecordsWritten.Add(int64(recordCount))
 		b.totalFlushes.Add(1)
@@ -3545,7 +3570,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	// All hours written successfully — now register in tiering and cluster manifest.
 	totalWritten := 0
 	for _, e := range written {
-		b.registerFileInTiering(ctx, database, measurement, e.storagePath, e.bucketTime, e.sizeBytes, e.sha256Hex)
+		b.registerFileInTiering(ctx, database, measurement, e.storagePath, e.bucketTime, e.sizeBytes, e.sha256Hex, announce)
 		totalWritten += e.records
 	}
 
@@ -3671,6 +3696,10 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 
 	// Union of tag columns across all batches (for Parquet metadata)
 	tagColumnSet := make(map[string]struct{})
+	// Replicated must be true only when every batch in the merged file came
+	// from replication. A defensive AND keeps a mixed-origin buffer safe even
+	// if a future caller bypasses the dedicated buffer-key split.
+	mergedReplicated := true
 	// Dedup-time marker is sticky: if ANY merged batch carries it, the output
 	// does (all writes to one measurement share the same producer, so this only
 	// ORs identical values in practice — the OR is defensive).
@@ -3682,6 +3711,7 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 		switch b := batch.(type) {
 		case *TypedColumnBatch:
 			cols = b.Data
+			mergedReplicated = mergedReplicated && b.Replicated
 			if len(b.Validity) > 0 {
 				hasAnyValidity = true
 			}
@@ -3693,6 +3723,7 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 			}
 		case map[string]interface{}:
 			cols = b
+			mergedReplicated = false
 		default:
 			return nil, fmt.Errorf("invalid batch type: %T", batch)
 		}
@@ -3861,7 +3892,7 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 		}
 	}
 
-	return &TypedColumnBatch{Data: merged, Validity: mergedValidity, TagColumns: mergedTagColumns, DedupTime: mergedDedupTime}, nil
+	return &TypedColumnBatch{Data: merged, Validity: mergedValidity, TagColumns: mergedTagColumns, DedupTime: mergedDedupTime, Replicated: mergedReplicated}, nil
 }
 
 // sortColumnsByTime sorts all columns by the time column in-place
@@ -4204,7 +4235,7 @@ func sortTypedColumnBatchByKeys(batch *TypedColumnBatch, sortKeys []string) *Typ
 
 	// nil indices means data was already sorted — no permutation needed
 	if indices == nil || batch.Validity == nil {
-		return &TypedColumnBatch{Data: sorted, Validity: batch.Validity, TagColumns: batch.TagColumns, DedupTime: batch.DedupTime, Signature: batch.Signature}
+		return &TypedColumnBatch{Data: sorted, Validity: batch.Validity, TagColumns: batch.TagColumns, DedupTime: batch.DedupTime, Signature: batch.Signature, Replicated: batch.Replicated}
 	}
 
 	// Apply the same permutation to validity bitmaps (no second sort)
@@ -4222,7 +4253,7 @@ func sortTypedColumnBatchByKeys(batch *TypedColumnBatch, sortKeys []string) *Typ
 		sortedValidity[name] = newValid
 	}
 
-	return &TypedColumnBatch{Data: sorted, Validity: sortedValidity, TagColumns: batch.TagColumns, DedupTime: batch.DedupTime, Signature: batch.Signature}
+	return &TypedColumnBatch{Data: sorted, Validity: sortedValidity, TagColumns: batch.TagColumns, DedupTime: batch.DedupTime, Signature: batch.Signature, Replicated: batch.Replicated}
 }
 
 // sliceTypedColumnBatchByIndices extracts rows from a TypedColumnBatch by index list,
@@ -4231,7 +4262,7 @@ func sliceTypedColumnBatchByIndices(batch *TypedColumnBatch, indices []int) *Typ
 	slicedData := sliceColumnsByIndices(batch.Data, indices)
 
 	if batch.Validity == nil {
-		return &TypedColumnBatch{Data: slicedData, Validity: nil, TagColumns: batch.TagColumns, DedupTime: batch.DedupTime, Signature: batch.Signature}
+		return &TypedColumnBatch{Data: slicedData, Validity: nil, TagColumns: batch.TagColumns, DedupTime: batch.DedupTime, Signature: batch.Signature, Replicated: batch.Replicated}
 	}
 
 	slicedValidity := make(map[string][]bool, len(batch.Validity))
@@ -4252,7 +4283,7 @@ func sliceTypedColumnBatchByIndices(batch *TypedColumnBatch, indices []int) *Typ
 		slicedValidity[name] = newValid
 	}
 
-	return &TypedColumnBatch{Data: slicedData, Validity: slicedValidity, TagColumns: batch.TagColumns, DedupTime: batch.DedupTime, Signature: batch.Signature}
+	return &TypedColumnBatch{Data: slicedData, Validity: slicedValidity, TagColumns: batch.TagColumns, DedupTime: batch.DedupTime, Signature: batch.Signature, Replicated: batch.Replicated}
 }
 
 // microPerHour is the number of microseconds in one hour (3600 * 1,000,000)

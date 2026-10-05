@@ -27,6 +27,10 @@ type ColumnarRecord struct {
 	DedupTime  bool   `json:"-"`
 	TimeUnit   string `json:"_time_unit,omitempty"`
 	RawPayload []byte `json:"-"` // Original msgpack bytes for zero-copy WAL
+	// Replicated marks rows applied from another node's WAL. Replicated batches
+	// are local materialisations of data already announced by the origin and
+	// must not announce a second file through the cluster manifest (#888).
+	Replicated bool `json:"-"`
 }
 
 // MsgPackPayload represents the top-level MessagePack payload structure

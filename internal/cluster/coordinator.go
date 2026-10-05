@@ -4875,7 +4875,7 @@ func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler 
 						}
 					}
 					if len(typedColumns) > 0 {
-						return buf.WriteColumnarDirectNoWAL(ctx, database, measurement, typedColumns)
+						return buf.WriteColumnarDirectNoWALReplicated(ctx, database, measurement, typedColumns)
 					}
 				}
 			}
@@ -4900,7 +4900,7 @@ func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler 
 			for measurement, rows := range byMeasurement {
 				columns := rowsToColumns(rows)
 				if len(columns) > 0 {
-					if err := buf.WriteColumnarDirectNoWAL(ctx, database, measurement, columns); err != nil {
+					if err := buf.WriteColumnarDirectNoWALReplicated(ctx, database, measurement, columns); err != nil {
 						return fmt.Errorf("write replicated rows for %s: %w", measurement, err)
 					}
 				}
