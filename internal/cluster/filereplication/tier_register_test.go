@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/rs/zerolog"
 )
 
@@ -42,7 +43,7 @@ func (r *tierReportRecorder) snapshot() []tierReport {
 	return out
 }
 
-func newTierPuller(t *testing.T, backend *fakeBackend, fetcher Fetcher, resolver PeerResolver, rec *tierReportRecorder, manifestHas func(string) bool) *Puller {
+func newTierPuller(t *testing.T, backend *fakeBackend, fetcher Fetcher, resolver PeerResolver, rec *tierReportRecorder, manifestEntry func(string) (raft.FileEntry, bool)) *Puller {
 	t.Helper()
 	cfg := Config{
 		SelfNodeID:          "reader-1",
@@ -54,7 +55,7 @@ func newTierPuller(t *testing.T, backend *fakeBackend, fetcher Fetcher, resolver
 		RetryMaxAttempts:    3,
 		RetryInitialBackoff: 10 * time.Millisecond,
 		FetchTimeout:        2 * time.Second,
-		ManifestHas:         manifestHas,
+		ManifestEntry:       manifestEntry,
 		Logger:              zerolog.Nop(),
 	}
 	if rec != nil {
@@ -119,9 +120,9 @@ func TestPuller_DoesNotReportAFileUnlinkedMidPull(t *testing.T) {
 	entry := makeEntry("testdb/cpu/2026/04/11/14/gone.parquet", "writer-1", int64(len(body)))
 	present.Store(entry.Path, true)
 
-	p := newTierPuller(t, backend, fetcher, resolver, rec, func(path string) bool {
+	p := newTierPuller(t, backend, fetcher, resolver, rec, func(path string) (raft.FileEntry, bool) {
 		v, ok := present.Load(path)
-		return ok && v.(bool)
+		return raft.FileEntry{Path: path}, ok && v.(bool)
 	})
 	p.Start(context.Background())
 	defer p.Stop()

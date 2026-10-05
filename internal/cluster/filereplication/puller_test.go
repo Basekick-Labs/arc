@@ -486,6 +486,7 @@ func newTestPuller(t *testing.T, backend *fakeBackend, fetcher Fetcher, resolver
 		RetryMaxAttempts:    3,
 		RetryInitialBackoff: 10 * time.Millisecond,
 		FetchTimeout:        2 * time.Second,
+		ForceContentRefresh: true, // per-node storage, the configuration #798 is about
 		Logger:              zerolog.Nop(),
 	})
 	if err != nil {

@@ -899,6 +899,7 @@ func (c *Coordinator) Stop() error {
 		// callbacks can be unregistered and their queue closed below.
 		if fsm := raftNode.FSM(); fsm != nil {
 			fsm.SetFileCallbacks(nil, nil)
+			fsm.SetFileContentChangedCallback(nil)
 		}
 	}
 
@@ -4080,6 +4081,7 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// pull back the files it originated (#959). On a shared bucket a
 		// missing own object is not on any peer either.
 		RepullMissingSelfOrigin: c.storage.Type() == "local",
+		ForceContentRefresh:     c.storage.Type() == "local",
 		Backend:                 c.storage,
 		Fetcher:                 fetchClient,
 		PeerResolver:            resolver,
@@ -4093,15 +4095,17 @@ func (c *Coordinator) startFilePullerLocked() error {
 		ReconciliationGate:      c.canRunFileReconciliation,
 		// Lets the puller stop pulling, and stop counting against the query
 		// gate, an entry that left the manifest while its pull was queued or
-		// in flight (#759, #795). Read lock on the FSM; the FSM never holds
-		// its lock while calling back into the puller, so no cycle.
-		ManifestHas: func(path string) bool {
+		// in flight (#759, #795), while also identifying superseding versions.
+		ManifestEntry: func(path string) (raft.FileEntry, bool) {
 			fsm := raftNode.FSM()
 			if fsm == nil {
-				return true
+				return raft.FileEntry{}, true
 			}
-			_, ok := fsm.GetFile(path)
-			return ok
+			entry, ok := fsm.GetFile(path)
+			if !ok {
+				return raft.FileEntry{}, false
+			}
+			return *entry, true
 		},
 		// Reads the recorder each time rather than capturing it: the tiering
 		// manager is built long after the coordinator starts, so the hook has
@@ -4167,6 +4171,9 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// (drops on full queue) so this is safe.
 		puller.Enqueue(entry)
 	}
+	onContentChanged := func(entry *raft.FileEntry) {
+		puller.EnqueueContentChanged(entry)
+	}
 	onDelete := func(path string, reason string) {
 		// Phase 4: the callback runs synchronously from applyDeleteFile on
 		// the Raft apply hot path, and from a snapshot Restore for every path
@@ -4203,6 +4210,10 @@ func (c *Coordinator) startFilePullerLocked() error {
 		c.enqueueLocalDelete(path, reason)
 	}
 
+	// The content-change callback goes in first: the FSM fires it right after
+	// onRegister for one apply, so wiring it second would leave a window in
+	// which an update arrives with only its non-forced half delivered.
+	fsm.SetFileContentChangedCallback(onContentChanged)
 	fsm.SetFileCallbacks(onRegister, onDelete)
 
 	// Start the puller workers.
