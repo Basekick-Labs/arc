@@ -483,7 +483,15 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 		return false, fmt.Errorf("WHERE clause is required. To delete all data, use WHERE clause '1=1' with confirm=true")
 	}
 
-	maskedWhere, masks := sqlutil.MaskStringLiterals(where, sqlutil.HasQuotes(where))
+	// Validation scans run on the MASKED clause: a forbidden keyword or ';'
+	// inside a string literal is data, not SQL (#834). The raw clause is what
+	// gets interpolated into the DuckDB statement, so the unmatched-quote and
+	// unmatched-parenthesis checks below stay on it. Backtick identifiers are
+	// normalised to double quotes first, as the query path's validator does:
+	// the masker does not know backticks, so a quote inside one would
+	// otherwise open a spurious literal that hides whatever follows it.
+	maskInput := backticksToDoubleQuotes(where)
+	maskedWhere, masks := sqlutil.MaskStringLiterals(maskInput, sqlutil.HasQuotes(maskInput))
 	whereUpper := strings.ToUpper(strings.TrimSpace(maskedWhere))
 
 	// Remove "WHERE" prefix if present
@@ -546,7 +554,6 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	// ordering constraint queryMeasurement documents. A fragment that
 	// introduces a relation carries its own keyword, so the scanner arms
 	// without needing a synthetic FROM clause around it.
-	maskInput := backticksToDoubleQuotes(where)
 	features := scanSQLFeatures(maskInput)
 	normalised, _ := sqlutil.MaskStringLiterals(maskInput, features.hasQuotes)
 	normalised = stripSQLComments(normalised, features.hasDashComment || features.hasBlockComment)
