@@ -311,17 +311,6 @@ func (r *CoordinatorFileRegistrar) drain(pending []fileRegistration) (applied, l
 // (arrow_writer.go flush path) computes it on the in-memory buffer before the
 // storage backend write, so it's effectively free.
 func (r *CoordinatorFileRegistrar) RegisterFile(database, measurement, path string, partitionTime time.Time, sizeBytes int64, sha256 string) {
-	// A reader/compactor may materialize replicated WAL rows into its local
-	// ArrowBuffer. Those files are copies of a manifest entry that already
-	// exists on the writer; registering them again would create a second
-	// manifest entry with the replica as origin and make the same rows eligible
-	// for another replication round (#888). Only nodes that can originate local
-	// ingest are allowed to announce files through this registrar.
-	role := r.coordinator.localNode.Role
-	if role != RoleWriter && role != RoleStandalone {
-		return
-	}
-
 	reg := fileRegistration{
 		database:      database,
 		measurement:   measurement,
