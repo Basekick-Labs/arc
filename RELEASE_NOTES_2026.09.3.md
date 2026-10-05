@@ -1,6 +1,6 @@
 # Arc v2026.09.3 Release Notes
 
-> **Status:** Planned — November 2026 patch release.
+> **Status:** Released 2026-10-05.
 
 ## Fixed: a cluster node's tier metadata now follows its own disk, not only what it ingested
 
