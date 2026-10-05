@@ -298,7 +298,7 @@ func (p *Puller) walkManifest(ctx context.Context, fetch func(cursor string, lim
 			if startup {
 				source = enqueueSourceCatchUp
 			}
-			enqueueStatus := p.enqueue(entry, source)
+			enqueueStatus := p.enqueue(entry, source, false)
 
 			if startup {
 				switch enqueueStatus {

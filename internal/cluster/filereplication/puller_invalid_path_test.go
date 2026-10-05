@@ -87,7 +87,7 @@ func TestPullerQuarantineKeepsTheQueryGateClosed(t *testing.T) {
 	// Tag the path as catch-up work and mark the walker finished, which is the
 	// state FullyCaughtUp is written against.
 	p.markCatchUp(invalidEntryPath)
-	p.enqueue(makeEntry(invalidEntryPath, "writer-1", 128), enqueueSourceCatchUp)
+	p.enqueue(makeEntry(invalidEntryPath, "writer-1", 128), enqueueSourceCatchUp, false)
 	p.catchupCompletedAt.Store(time.Now().Unix())
 
 	stats := waitStats(t, p, func(s map[string]int64) bool { return s["invalid_path"] == 1 })

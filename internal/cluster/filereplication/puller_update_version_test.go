@@ -16,9 +16,24 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 )
 
-func TestManifestSupersedesUsesContentAndVersionTogether(t *testing.T) {
-	request := raft.FileEntry{LSN: 0, SHA256: "same", SizeBytes: 10}
+type synchronizedManifestEntry struct {
+	mu    sync.RWMutex
+	entry raft.FileEntry
+}
 
+func (m *synchronizedManifestEntry) get(string) (raft.FileEntry, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.entry, true
+}
+
+func (m *synchronizedManifestEntry) set(entry raft.FileEntry) {
+	m.mu.Lock()
+	m.entry = entry
+	m.mu.Unlock()
+}
+
+func TestManifestSupersedesUsesContentAndVersionTogether(t *testing.T) {
 	tests := []struct {
 		name     string
 		request  raft.FileEntry
@@ -26,14 +41,14 @@ func TestManifestSupersedesUsesContentAndVersionTogether(t *testing.T) {
 		supersed bool
 	}{
 		{
-			name:     "catch-up default LSN with unchanged content",
-			request:  request,
-			current:  raft.FileEntry{LSN: 7, SHA256: "same", SizeBytes: 10},
+			name:     "same content at newer LSN",
+			request:  raft.FileEntry{LSN: 7, SHA256: "same", SizeBytes: 10},
+			current:  raft.FileEntry{LSN: 8, SHA256: "same", SizeBytes: 10},
 			supersed: false,
 		},
 		{
 			name:     "stale known version",
-			request:  request,
+			request:  raft.FileEntry{LSN: 6, SHA256: "old", SizeBytes: 10},
 			current:  raft.FileEntry{LSN: 7, SHA256: "new", SizeBytes: 10},
 			supersed: true,
 		},
@@ -43,6 +58,12 @@ func TestManifestSupersedesUsesContentAndVersionTogether(t *testing.T) {
 			current:  raft.FileEntry{LSN: 3, SHA256: "old", SizeBytes: 10},
 			supersed: false,
 		},
+		{
+			name:     "equal batch LSN with different content",
+			request:  raft.FileEntry{LSN: 42, SHA256: "request", SizeBytes: 10},
+			current:  raft.FileEntry{LSN: 42, SHA256: "current", SizeBytes: 10},
+			supersed: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -51,6 +72,57 @@ func TestManifestSupersedesUsesContentAndVersionTogether(t *testing.T) {
 				t.Fatalf("manifestSupersedes() = %v, want %v", got, tt.supersed)
 			}
 		})
+	}
+}
+
+// The FSM emits the ordinary register callback before its content-changed
+// callback. With an equal-sized stale local file, the first request alone
+// would skip locally; the forced equal-version successor must still run.
+func TestPullerFSMCallbackPairForcesEqualVersionIssue798(t *testing.T) {
+	const path = "db/cpu/2026/09/19/01/fsm-callback-pair.parquet"
+	oldBody := []byte("old-payload")
+	newBody := []byte("new-payload")
+	if len(oldBody) != len(newBody) {
+		t.Fatal("test setup: bodies must have the same size")
+	}
+
+	entry := makeEntry(path, "writer-1", int64(len(newBody)))
+	entry.LSN = 7
+	hash := sha256.Sum256(newBody)
+	entry.SHA256 = fmt.Sprintf("%x", hash)
+	backend := newFakeBackend()
+	if err := backend.Write(context.Background(), path, oldBody); err != nil {
+		t.Fatalf("write stale local file: %v", err)
+	}
+	fetcher := newFakeFetcher(fakeFetchResult{body: newBody})
+	p := newTestPuller(t, backend, fetcher, staticResolver{
+		nodeID: "writer-1",
+		addrs:  []string{"peer:9100"},
+		ok:     true,
+	})
+	manifest := &synchronizedManifestEntry{entry: *entry}
+	p.cfg.ManifestEntry = manifest.get
+
+	// Queue both callbacks before starting workers, exactly preserving the
+	// synchronous FSM callback order without allowing timing to choose a path.
+	if got := p.enqueue(entry, enqueueSourceReactive, false); got != enqueueResultEnqueued {
+		t.Fatalf("register callback result: %v", got)
+	}
+	if got := p.enqueue(entry, enqueueSourceReactive, true); got != enqueueResultEnqueued {
+		t.Fatalf("content-change callback result: %v", got)
+	}
+	p.Start(context.Background())
+	defer p.Stop()
+
+	stats := waitStats(t, p, func(s map[string]int64) bool {
+		return s["pulled"] == 1 && s["inflight_count"] == 0
+	})
+	if stats["pulled"] != 1 || stats["skipped_local"] != 1 || fetcher.calls.Load() != 1 {
+		t.Fatalf("callback pair failed to refresh equal-size content: stats=%v calls=%d", stats, fetcher.calls.Load())
+	}
+	got, err := backend.Read(context.Background(), path)
+	if err != nil || !bytes.Equal(got, newBody) {
+		t.Fatalf("stale bytes remained after callback pair: body=%q err=%v", got, err)
 	}
 }
 
@@ -143,10 +215,8 @@ func TestPullerUpdatedVersionIsNotLostIssue798(t *testing.T) {
 			ok:     true,
 		},
 	)
-	current := *oldEntry
-	p.cfg.ManifestEntry = func(string) (raft.FileEntry, bool) {
-		return current, true
-	}
+	manifest := &synchronizedManifestEntry{entry: *oldEntry}
+	p.cfg.ManifestEntry = manifest.get
 
 	var releaseOnce sync.Once
 	releaseFirst := func() {
@@ -160,7 +230,7 @@ func TestPullerUpdatedVersionIsNotLostIssue798(t *testing.T) {
 
 	p.Start(context.Background())
 	p.markCatchUp(path)
-	if result := p.enqueue(oldEntry, enqueueSourceCatchUp); result != enqueueResultEnqueued {
+	if result := p.enqueue(oldEntry, enqueueSourceCatchUp, false); result != enqueueResultEnqueued {
 		t.Fatalf("initial catch-up enqueue result: %v", result)
 	}
 
@@ -174,7 +244,7 @@ func TestPullerUpdatedVersionIsNotLostIssue798(t *testing.T) {
 
 	// Same path, new manifest version, different checksum, same size.
 	// The FSM content-change callback forces this refresh.
-	current = newEntry
+	manifest.set(newEntry)
 	p.EnqueueContentChanged(&newEntry)
 	releaseFirst()
 
@@ -211,6 +281,61 @@ func TestPullerUpdatedVersionIsNotLostIssue798(t *testing.T) {
 	}
 }
 
+func TestPullerCompletedStalePullKeepsCopyUntilSuccessorIssue798(t *testing.T) {
+	const path = "db/cpu/2026/09/19/01/completed-stale-pull.parquet"
+	oldBody := []byte("old-payload")
+	newBody := []byte("new-payload")
+	oldEntry := makeEntry(path, "writer-1", int64(len(oldBody)))
+	oldEntry.LSN = 1
+	oldHash := sha256.Sum256(oldBody)
+	oldEntry.SHA256 = fmt.Sprintf("%x", oldHash)
+	newEntry := *oldEntry
+	newEntry.LSN = 2
+	newHash := sha256.Sum256(newBody)
+	newEntry.SHA256 = fmt.Sprintf("%x", newHash)
+
+	backend := newFakeBackend()
+	fetcher := &issue798BlockingFetcher{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		oldBody: oldBody,
+		newBody: newBody,
+	}
+	p := newTestPuller(t, backend, fetcher, staticResolver{
+		nodeID: "writer-1",
+		addrs:  []string{"peer:9100"},
+		ok:     true,
+	})
+	manifest := &synchronizedManifestEntry{entry: *oldEntry}
+	p.cfg.ManifestEntry = manifest.get
+	p.Start(context.Background())
+	defer p.Stop()
+
+	p.Enqueue(oldEntry)
+	select {
+	case <-fetcher.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("initial fetch did not start")
+	}
+	manifest.set(newEntry)
+	p.EnqueueContentChanged(&newEntry)
+	close(fetcher.release)
+
+	stats := waitStats(t, p, func(s map[string]int64) bool {
+		return s["pulled"] == 1 && s["inflight_count"] == 0
+	})
+	if fetcher.calls.Load() != 2 || stats["pulled"] != 1 {
+		t.Fatalf("new version was not handed off: calls=%d stats=%v", fetcher.calls.Load(), stats)
+	}
+	if deleted := backend.deleteCount(); deleted != 0 {
+		t.Fatalf("valid stale-generation bytes were deleted before replacement: deletes=%d", deleted)
+	}
+	got, err := backend.Read(context.Background(), path)
+	if err != nil || !bytes.Equal(got, newBody) {
+		t.Fatalf("wrong final content: got %q err=%v", got, err)
+	}
+}
+
 // A second update can arrive after the previous pull has fully finished.
 // The local file's matching size must not hide a different manifest version.
 func TestPullerSequentialSameSizeUpdateIssue798(t *testing.T) {
@@ -243,10 +368,8 @@ func TestPullerSequentialSameSizeUpdateIssue798(t *testing.T) {
 		addrs:  []string{"peer:9100"},
 		ok:     true,
 	})
-	current := *oldEntry
-	p.cfg.ManifestEntry = func(string) (raft.FileEntry, bool) {
-		return current, true
-	}
+	manifest := &synchronizedManifestEntry{entry: *oldEntry}
+	p.cfg.ManifestEntry = manifest.get
 
 	p.Start(context.Background())
 	defer p.Stop()
@@ -260,7 +383,7 @@ func TestPullerSequentialSameSizeUpdateIssue798(t *testing.T) {
 		t.Fatalf("initial pull did not finish: %v", first)
 	}
 
-	current = newEntry
+	manifest.set(newEntry)
 	p.EnqueueContentChanged(&newEntry)
 
 	last := waitStats(t, p, func(s map[string]int64) bool {
@@ -295,9 +418,9 @@ func TestPullerSequentialSameSizeUpdateIssue798(t *testing.T) {
 	// original already-local optimization instead of downloading again.
 	p.Enqueue(&newEntry)
 	final := waitStats(t, p, func(s map[string]int64) bool {
-		return s["skipped_local"] == 1 && s["inflight_count"] == 0
+		return s["skipped_local"] == 2 && s["inflight_count"] == 0
 	})
-	if final["skipped_local"] != 1 || fetcher.calls.Load() != 2 {
+	if final["skipped_local"] != 2 || fetcher.calls.Load() != 2 {
 		t.Fatalf("duplicate current version caused another fetch: stats=%v, calls=%d",
 			final, fetcher.calls.Load())
 	}
@@ -343,6 +466,8 @@ func TestPullerFailedRefreshRetriesSameVersionIssue798(t *testing.T) {
 		addrs:  []string{"peer:9100"},
 		ok:     true,
 	})
+	manifest := &synchronizedManifestEntry{entry: *oldEntry}
+	p.cfg.ManifestEntry = manifest.get
 
 	// One attempt per request makes failure and the subsequent
 	// independent retry observable as separate operations.
@@ -360,6 +485,7 @@ func TestPullerFailedRefreshRetriesSameVersionIssue798(t *testing.T) {
 		t.Fatalf("initial version did not finish: %v", first)
 	}
 
+	manifest.set(newEntry)
 	p.EnqueueContentChanged(&newEntry)
 
 	failed := waitStats(t, p, func(s map[string]int64) bool {
@@ -373,9 +499,12 @@ func TestPullerFailedRefreshRetriesSameVersionIssue798(t *testing.T) {
 		t.Fatalf("expected two fetch attempts before retry, got %d", calls)
 	}
 
-	// The same manifest entry arrives again. A size-only local-file
-	// check would incorrectly skip the required refresh.
-	p.Enqueue(&newEntry)
+	// A later metadata-only manifest version carries identical bytes but must
+	// still retry the unresolved forced refresh.
+	retryEntry := newEntry
+	retryEntry.LSN = 3
+	manifest.set(retryEntry)
+	p.Enqueue(&retryEntry)
 
 	retried := waitStats(t, p, func(s map[string]int64) bool {
 		return s["pulled"] == 2 && s["inflight_count"] == 0
@@ -399,43 +528,49 @@ func TestPullerFailedRefreshRetriesSameVersionIssue798(t *testing.T) {
 	}
 }
 
-// Only failed or dropped forced refreshes retain bounded state, and deletion
-// clears that state. A completed pull retains no per-manifest copy.
+// A genuinely failed forced refresh retains retry state, and manifest deletion
+// clears it. This proves the deletion assertion is not vacuous.
 func TestPullerManifestDeleteClearsRefreshPendingIssue798(t *testing.T) {
 	const path = "db/cpu/2026/09/19/01/deleted-rewrite.parquet"
 
-	body := []byte("initial-file")
-	entry := makeEntry(path, "writer-1", int64(len(body)))
-
-	hash := sha256.Sum256(body)
+	oldBody := []byte("old-payload")
+	newBody := []byte("new-payload")
+	entry := makeEntry(path, "writer-1", int64(len(newBody)))
+	entry.LSN = 2
+	hash := sha256.Sum256(newBody)
 	entry.SHA256 = fmt.Sprintf("%x", hash)
 
 	backend := newFakeBackend()
-	fetcher := newFakeFetcher(fakeFetchResult{body: body})
+	if err := backend.Write(context.Background(), path, oldBody); err != nil {
+		t.Fatalf("write stale local bytes: %v", err)
+	}
+	fetcher := newFakeFetcher(fakeFetchResult{err: errors.New("peer unavailable")})
 
 	p := newTestPuller(t, backend, fetcher, staticResolver{
 		nodeID: "writer-1",
 		addrs:  []string{"peer:9100"},
 		ok:     true,
 	})
+	p.cfg.RetryMaxAttempts = 1
+	p.cfg.ManifestEntry = func(string) (raft.FileEntry, bool) { return *entry, true }
 
 	p.Start(context.Background())
 	defer p.Stop()
 
-	p.Enqueue(entry)
+	p.EnqueueContentChanged(entry)
 
 	stats := waitStats(t, p, func(s map[string]int64) bool {
-		return s["pulled"] == 1 && s["inflight_count"] == 0
+		return s["failed"] == 1 && s["inflight_count"] == 0
 	})
-	if stats["pulled"] != 1 || stats["inflight_count"] != 0 {
-		t.Fatalf("initial pull did not complete: %v", stats)
+	if stats["failed"] != 1 || stats["inflight_count"] != 0 {
+		t.Fatalf("forced refresh did not fail as arranged: %v", stats)
 	}
 
 	p.inflightMu.Lock()
 	_, existedBefore := p.refreshPending[path]
 	p.inflightMu.Unlock()
-	if existedBefore {
-		t.Fatal("completed refresh left pending state")
+	if !existedBefore {
+		t.Fatal("failed forced refresh did not retain retry state")
 	}
 
 	p.OnManifestDelete(path)
@@ -494,7 +629,7 @@ func TestPullerSupersededCatchUpClearsTagIssue798(t *testing.T) {
 
 	// Model the startup walker: tag before submitting its request.
 	p.markCatchUp(path)
-	if result := p.enqueue(oldEntry, enqueueSourceCatchUp); result != enqueueResultEnqueued {
+	if result := p.enqueue(oldEntry, enqueueSourceCatchUp, false); result != enqueueResultEnqueued {
 		t.Fatalf("catch-up enqueue result: %v", result)
 	}
 
@@ -531,5 +666,45 @@ func TestPullerSupersededCatchUpClearsTagIssue798(t *testing.T) {
 	got, err := backend.Read(context.Background(), path)
 	if err != nil || !bytes.Equal(got, newBody) {
 		t.Fatalf("wrong final file: got %q, err=%v", got, err)
+	}
+}
+
+func TestPullerCatchUpSupersededEntryQueuesCurrentVersionIssue798(t *testing.T) {
+	const path = "db/cpu/2026/09/19/01/stale-catchup-page.parquet"
+	oldBody := []byte("old-payload")
+	newBody := []byte("new-payload")
+	oldEntry := makeEntry(path, "writer-1", int64(len(oldBody)))
+	oldEntry.LSN = 1
+	oldHash := sha256.Sum256(oldBody)
+	oldEntry.SHA256 = fmt.Sprintf("%x", oldHash)
+	newEntry := *oldEntry
+	newEntry.LSN = 2
+	newHash := sha256.Sum256(newBody)
+	newEntry.SHA256 = fmt.Sprintf("%x", newHash)
+
+	backend := newFakeBackend()
+	if err := backend.Write(context.Background(), path, oldBody); err != nil {
+		t.Fatalf("write stale same-size catch-up copy: %v", err)
+	}
+	fetcher := newFakeFetcher(fakeFetchResult{body: newBody})
+	p := newTestPuller(t, backend, fetcher, staticResolver{
+		nodeID: "writer-1",
+		addrs:  []string{"peer:9100"},
+		ok:     true,
+	})
+	p.cfg.ManifestEntry = func(string) (raft.FileEntry, bool) { return newEntry, true }
+	p.Start(context.Background())
+	defer p.Stop()
+
+	p.RunCatchUp(context.Background(), singlePage(oldEntry))
+	stats := waitStats(t, p, func(s map[string]int64) bool {
+		return s["pulled"] == 1 && s["inflight_count"] == 0 && s["catchup_inflight"] == 0
+	})
+	if fetcher.calls.Load() != 1 || stats["catchup_failed"] != 0 || !p.FullyCaughtUp() {
+		t.Fatalf("stale catch-up entry did not hand off to current version: calls=%d stats=%v", fetcher.calls.Load(), stats)
+	}
+	got, err := backend.Read(context.Background(), path)
+	if err != nil || !bytes.Equal(got, newBody) {
+		t.Fatalf("current manifest bytes were not installed: got %q err=%v", got, err)
 	}
 }

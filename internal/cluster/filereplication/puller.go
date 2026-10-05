@@ -115,10 +115,11 @@ type pullRequest struct {
 	force bool
 }
 
-// newerFileVersion compares manifest versions, not just their storage paths.
-// Raft LSN is authoritative; checksum and size distinguish re-registrations
-// that carry the same LSN.
-func newerFileVersion(incoming, current *raft.FileEntry) bool {
+// requestReplacesCurrent reports whether an incoming callback should replace
+// the request already queued for a path. Raft LSN orders different entries;
+// operations in one batch can share an LSN, in which case the serialized FSM
+// callback order makes a content difference the replacement signal.
+func requestReplacesCurrent(incoming, current *raft.FileEntry) bool {
 	if incoming.LSN != current.LSN {
 		return incoming.LSN > current.LSN
 	}
@@ -126,26 +127,16 @@ func newerFileVersion(incoming, current *raft.FileEntry) bool {
 		incoming.SizeBytes != current.SizeBytes
 }
 
-// manifestSupersedes reports whether current is a newer *content* version
-// than request. An LSN can change while the registered bytes stay the same
-// (for example when a catch-up snapshot carries an unstamped/default LSN), so
-// an LSN difference alone must not discard an otherwise valid pull.
-//
-// A zero LSN is an unknown version, not an older version. When the content is
-// different, a known current LSN can still supersede an unknown request; a
-// known request is superseded only by a strictly newer current LSN. Equal LSNs
-// use the content fields as the tie-breaker.
+// manifestSupersedes reports whether the current FSM entry has different
+// content from the request and is at least as recent. Equal LSNs occur for
+// multiple operations in one Raft batch; in that case the final FSM value is
+// authoritative. A newer LSN with identical content does not supersede a pull.
 func manifestSupersedes(current, request *raft.FileEntry) bool {
 	if current.SHA256 == request.SHA256 && current.SizeBytes == request.SizeBytes {
 		return false
 	}
 	if current.LSN == request.LSN {
-		// Two default LSNs carry no ordering information, so leave the
-		// decision to the fetch/verification path rather than discarding it.
-		return current.LSN != 0
-	}
-	if request.LSN == 0 {
-		return current.LSN != 0
+		return true
 	}
 	return current.LSN > request.LSN
 }
@@ -216,13 +207,9 @@ type Config struct {
 	// ManifestEntry returns the current manifest entry for path. The puller
 	// consults it before each attempt and before recording a catch-up failure
 	// or drop. A newer entry supersedes the request without counting as a
-	// failure (#798).
+	// failure (#798). The hook may take the FSM read lock and must never be
+	// called while inflightMu is held (#759, #795).
 	ManifestEntry func(path string) (raft.FileEntry, bool)
-
-	// ManifestHas is retained for package-local compatibility with older test
-	// fixtures. Production wiring must use ManifestEntry so the puller can
-	// distinguish a deleted path from a superseding version.
-	ManifestHas func(path string) bool
 
 	// RecordPulledFile, when set, is called once for every file this node
 	// pulled and kept, so the node's tier metadata describes the file the way
@@ -311,10 +298,10 @@ type Puller struct {
 	// pending keeps only the newest update arriving while a path is busy.
 	// The current worker processes it before releasing the inflight slot.
 	pending map[string]*pullRequest
-	// refreshPending retains only forced versions that failed or were dropped.
-	// Unlike the old observed map, this is bounded by unresolved failures and
-	// queue drops rather than by the manifest size.
-	refreshPending map[string]uint64
+	// refreshPending contains paths whose forced refresh failed or was dropped.
+	// The next enqueue of any version retries the refresh; success or manifest
+	// deletion clears the marker.
+	refreshPending map[string]struct{}
 	inflightCount  atomic.Int64
 
 	// Metrics (atomic for lock-free observability)
@@ -476,7 +463,7 @@ func New(cfg Config) (*Puller, error) {
 		queue:               make(chan *pullRequest, cfg.QueueSize),
 		inflight:            make(map[string]*pullRequest),
 		pending:             make(map[string]*pullRequest),
-		refreshPending:      make(map[string]uint64),
+		refreshPending:      make(map[string]struct{}),
 		catchupPaths:        make(map[string]struct{}),
 		catchupFailedPaths:  make(map[string]struct{}),
 		catchupDroppedPaths: make(map[string]struct{}),
@@ -558,6 +545,13 @@ func (p *Puller) finishEntry(path string, source enqueueSource, failed, succeede
 	if next := p.pending[path]; next != nil &&
 		(p.ctx == nil || p.ctx.Err() == nil) {
 		delete(p.pending, path)
+		// A failed forced refresh must not hand off to an ordinary request
+		// that could skip the still-stale same-size local copy.
+		if failed {
+			if active := p.inflight[path]; active != nil && active.force {
+				next.force = true
+			}
+		}
 		// The superseding request inherits the existing catch-up ownership.
 		// Otherwise a reconciliation successor would finish without
 		// clearing the tag, leaving the startup query gate closed.
@@ -574,15 +568,11 @@ func (p *Puller) finishEntry(path string, source enqueueSource, failed, succeede
 	}
 	if failed && stillWanted {
 		if active := p.inflight[path]; active != nil && active.force {
-			p.refreshPending[path] = active.entry.LSN
+			p.refreshPending[path] = struct{}{}
 		}
 	}
 	if succeeded {
-		if active := p.inflight[path]; active != nil {
-			if pendingLSN, ok := p.refreshPending[path]; ok && pendingLSN == active.entry.LSN {
-				delete(p.refreshPending, path)
-			}
-		}
+		delete(p.refreshPending, path)
 		p.clearCatchUpFailureLocked(path)
 		p.clearCatchUpDropLocked(path)
 	}
@@ -774,9 +764,6 @@ func (p *Puller) manifestEntry(path string) (raft.FileEntry, bool) {
 	if p.cfg.ManifestEntry != nil {
 		return p.cfg.ManifestEntry(path)
 	}
-	if p.cfg.ManifestHas != nil {
-		return raft.FileEntry{Path: path}, p.cfg.ManifestHas(path)
-	}
 	return raft.FileEntry{Path: path}, true
 }
 
@@ -836,8 +823,8 @@ func (p *Puller) forgetCatchUpPathLocked(path string) (hadFailure, hadDrop, hadT
 // enqueue's drop branch.
 //
 // Called synchronously on the Raft apply goroutine and must not block: it only
-// takes inflightMu, whose holders are all map-only sections. Safe on a stopped
-// puller.
+// takes inflightMu, whose critical sections perform map operations and
+// non-blocking sends to the bounded pull queue. Safe on a stopped puller.
 func (p *Puller) OnManifestDelete(path string) {
 	p.inflightMu.Lock()
 	hadFailure, hadDrop, hadTag := p.forgetCatchUpPathLocked(path)
@@ -859,24 +846,24 @@ func (p *Puller) OnManifestDelete(path string) {
 	}
 }
 
-// pruneStaleCatchUpState clears recorded catch-up failures and drops for paths
-// the manifest no longer contains. OnManifestDelete does this synchronously
-// for every delete that goes through the log and, since #962, for every path a
-// snapshot restore drops from the manifest a running follower held. It is the
-// backstop for what neither covers: a restart whose local snapshot predates the
-// recorded path (#1071), or a path recorded before the callbacks were wired.
-// Without it such a path would hold the gate red until restart. Runs on every
-// periodic reconciliation tick, before the
+// pruneStaleCatchUpState clears recorded catch-up failures, drops and forced
+// refresh markers for paths the manifest no longer contains. OnManifestDelete
+// does this synchronously for every delete that goes through the log and,
+// since #962, for every path a snapshot restore drops from the manifest a
+// running follower held. It is the backstop for what neither covers: a restart
+// whose local snapshot predates the recorded path (#1071), or a path recorded
+// before the callbacks were wired. Without it such a path would hold the gate
+// red until restart. Runs on every periodic reconciliation tick, before the
 // eligibility gate. Lookups happen outside inflightMu; each clear is
 // membership-guarded, so a path OnManifestDelete already handled cannot be
 // decremented twice. A path re-recorded between the lookup and the clear is
 // cleared with the stale verdict; the FSM callback or the next tick settles it.
 func (p *Puller) pruneStaleCatchUpState() {
-	if p.cfg.ManifestEntry == nil && p.cfg.ManifestHas == nil {
+	if p.cfg.ManifestEntry == nil {
 		return
 	}
 	p.inflightMu.Lock()
-	candidates := make([]string, 0, len(p.catchupFailedPaths)+len(p.catchupDroppedPaths))
+	candidates := make([]string, 0, len(p.catchupFailedPaths)+len(p.catchupDroppedPaths)+len(p.refreshPending))
 	for path := range p.catchupFailedPaths {
 		candidates = append(candidates, path)
 	}
@@ -884,6 +871,15 @@ func (p *Puller) pruneStaleCatchUpState() {
 		if _, dup := p.catchupFailedPaths[path]; !dup {
 			candidates = append(candidates, path)
 		}
+	}
+	for path := range p.refreshPending {
+		if _, failed := p.catchupFailedPaths[path]; failed {
+			continue
+		}
+		if _, dropped := p.catchupDroppedPaths[path]; dropped {
+			continue
+		}
+		candidates = append(candidates, path)
 	}
 	p.inflightMu.Unlock()
 
@@ -1017,18 +1013,16 @@ func (p *Puller) Stop() {
 }
 
 // Enqueue submits a file entry for pulling. Non-blocking: if the queue is
-// full, the entry is dropped and totalDropped is incremented. If origin is
-// self (this node just wrote the file), or the same path is already
-// enqueued / in-flight (via the inflight set), the entry is counted as a
-// skip and never reaches a worker; a file already present on disk is
-// skipped by the worker's own check.
+// full, the entry is dropped and totalDropped is incremented. Self-origin
+// reactive entries and duplicate versions are skipped; a newer version or a
+// forced content-change notification is handed to the active worker as pending.
 //
 // Enqueue is safe to call from the Raft FSM apply callback (which must
 // return quickly): all checks here are O(1) and no I/O happens inline. It
 // is also safe to call from the Phase 3 catch-up walker concurrently with
 // reactive callbacks — the inflight set dedups cross-path races.
 func (p *Puller) Enqueue(entry *raft.FileEntry) {
-	p.enqueue(entry, enqueueSourceReactive)
+	p.enqueue(entry, enqueueSourceReactive, false)
 }
 
 // EnqueueContentChanged submits an FSM-signalled content change.
@@ -1089,7 +1083,7 @@ func presentAtSize(localSize int64, statErr error, want int64) bool {
 	return statErr == nil && localSize == want
 }
 
-func (p *Puller) enqueue(entry *raft.FileEntry, source enqueueSource, forced ...bool) enqueueResult {
+func (p *Puller) enqueue(entry *raft.FileEntry, source enqueueSource, force bool) enqueueResult {
 	if entry == nil {
 		return enqueueResultInvalid
 	}
@@ -1106,8 +1100,7 @@ func (p *Puller) enqueue(entry *raft.FileEntry, source enqueueSource, forced ...
 	// Snapshot the callback's entry before retaining it: the caller may
 	// subsequently mutate its FileEntry.
 	entryCopy := *entry
-	request := &pullRequest{entry: &entryCopy, source: source}
-	request.force = len(forced) > 0 && forced[0]
+	request := &pullRequest{entry: &entryCopy, source: source, force: force}
 
 	p.inflightMu.Lock()
 	if active, exists := p.inflight[entry.Path]; exists {
@@ -1116,7 +1109,8 @@ func (p *Puller) enqueue(entry *raft.FileEntry, source enqueueSource, forced ...
 			current = waiting
 		}
 
-		if current != nil && newerFileVersion(request.entry, current.entry) {
+		if current != nil && (requestReplacesCurrent(request.entry, current.entry) ||
+			(request.force && !current.force)) {
 			// This is a new manifest version, not a duplicate. Keep just
 			// the latest pending version to bound memory under rapid updates.
 			p.pending[entry.Path] = request
@@ -1130,7 +1124,7 @@ func (p *Puller) enqueue(entry *raft.FileEntry, source enqueueSource, forced ...
 		return enqueueResultSkippedDuplicate
 	}
 
-	if pendingLSN, ok := p.refreshPending[entry.Path]; ok && pendingLSN == entry.LSN {
+	if _, ok := p.refreshPending[entry.Path]; ok {
 		request.force = true
 	}
 
@@ -1146,22 +1140,20 @@ func (p *Puller) enqueue(entry *raft.FileEntry, source enqueueSource, forced ...
 		return enqueueResultEnqueued
 
 	default:
-		p.inflightMu.Unlock()
 		if request.force {
-			p.inflightMu.Lock()
-			p.refreshPending[entry.Path] = entry.LSN
-			p.inflightMu.Unlock()
+			p.refreshPending[entry.Path] = struct{}{}
 		}
+		p.inflightMu.Unlock()
 
 		// Preserve the existing catch-up drop accounting. The #795 convergence
 		// argument is preserved: deleting first clears the tag with nothing
 		// recorded; deleting after the drop clears the recorded drop. A reactive
-		// drop leaves the walker tag alone. The current
-		// manifest lookup must run outside inflightMu because its hook takes
-		// the FSM lock.
-		_, stillWanted := p.manifestEntry(entry.Path)
-		if source != enqueueSourceCatchUp {
-			stillWanted = true
+		// drop leaves the walker tag alone. Only catch-up drops need membership
+		// for gate accounting. Keep the lookup outside inflightMu because its
+		// hook takes the FSM lock.
+		stillWanted := true
+		if source == enqueueSourceCatchUp {
+			_, stillWanted = p.manifestEntry(entry.Path)
 		}
 		p.inflightMu.Lock()
 		if source == enqueueSourceCatchUp {
@@ -1178,7 +1170,7 @@ func (p *Puller) enqueue(entry *raft.FileEntry, source enqueueSource, forced ...
 			p.logger.Warn().
 				Str("path", entry.Path).
 				Int64("total_dropped", dropped).
-				Msg("File puller queue full, dropping entry (will be recovered by catch-up scanner)")
+				Msg("File puller queue full, dropping entry")
 		}
 		return enqueueResultDropped
 	}
@@ -1391,14 +1383,9 @@ func (p *Puller) worker(id int) {
 }
 
 // processEntry pulls a single file with bounded retries. Each retry re-checks
-// local presence via statLocal (in case a concurrent worker or external
-// process put the file in place) and re-resolves the peer list (in case of
-// topology change).
-// Within a single attempt, the resolver returns an ordered list of candidate
-// peers and we fall through to the next candidate on any per-peer failure
-// EXCEPT checksum mismatch — a corrupt body from one peer is a real data
-// integrity problem and shouldn't trigger pull-and-corrupt from every other
-// healthy peer in turn.
+// local presence and re-resolves peers. Newer versions stay on this worker and
+// retain the path's inflight slot; a continuously changing hot path can keep
+// this worker occupied, while the other workers continue independent paths.
 func (p *Puller) processEntry(log zerolog.Logger, request *pullRequest) {
 	// Consume superseding versions on the same worker and with the same
 	// inflight slot. No re-enqueue into a potentially full queue is needed.
@@ -1425,9 +1412,11 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 	// one lock. A reactive pull may already be in flight when RunCatchUp starts,
 	// so the walker can add the tag after this worker began processing it.
 	defer func() {
-		current, wanted := p.manifestEntry(entry.Path)
-		stillWanted := !failed || (wanted &&
-			(p.cfg.ManifestEntry == nil || !manifestSupersedes(&current, entry)))
+		stillWanted := true
+		if failed {
+			current, wanted := p.manifestEntry(entry.Path)
+			stillWanted = wanted && !manifestSupersedes(&current, entry)
+		}
 		next = p.finishEntry(entry.Path, request.source, failed, succeeded, stillWanted)
 	}()
 
@@ -1456,6 +1445,11 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 			log.Debug().Str("path", entry.Path).Uint64("request_lsn", entry.LSN).
 				Uint64("manifest_lsn", current.LSN).
 				Msg("Manifest version superseded queued pull")
+			// A stale catch-up page must force the current manifest version so
+			// size-only presence cannot falsely settle the readiness gate. A
+			// late reactive duplicate can use the local fast path; its paired
+			// content-change callback is delivered synchronously by the FSM.
+			p.enqueue(&current, request.source, request.source == enqueueSourceCatchUp)
 			return
 		}
 
@@ -1555,7 +1549,9 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 				}
 				if p.cfg.ManifestEntry != nil && manifestSupersedes(&current, entry) {
 					p.totalSkippedSuperseded.Add(1)
-					p.deleteFile(log, entry.Path)
+					// The bytes just fetched match this request's checksum. Keep
+					// that valid local copy until the queued successor replaces it.
+					p.enqueue(&current, request.source, true)
 					return
 				}
 				p.totalPulled.Add(1)
