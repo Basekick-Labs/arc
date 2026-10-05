@@ -24,7 +24,8 @@ format = "console"  # json or console
 # Database (DuckDB)
 # -----------------------------------------------------------------------------
 # Auto-configured based on system resources if not set.
-# Override via: ARC_DATABASE_MAX_CONNECTIONS, ARC_DATABASE_MEMORY_LIMIT, ARC_DATABASE_THREAD_COUNT
+# Override via ARC_DATABASE_MAX_CONNECTIONS, ARC_DATABASE_MEMORY_LIMIT,
+# ARC_DATABASE_THREAD_COUNT, ARC_DATABASE_EXTENSIONS (comma-separated).
 [database]
 # max_connections = 28    # Default: 2x the HOST's CPU cores (min 4, max 64).
 #                         # Deliberately not quota-derived: it bounds statements
@@ -43,6 +44,9 @@ format = "console"  # json or console
 #                         # compaction.threads follows the quota too since
 #                         # 26.09.3; see the [compaction] section below.
 enable_wal = true
+# DuckDB community extensions to install and load at startup (e.g. ["spatial"]).
+# This setting does not enable unsigned extensions; the default is empty.
+extensions = []
 
 # Allow DuckDB to reorder results of queries WITHOUT an ORDER BY (queries
 # with ORDER BY are unaffected); can reduce memory usage on large un-ordered

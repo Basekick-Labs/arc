@@ -229,6 +229,9 @@ func TestLoad_DefaultsFromSystem(t *testing.T) {
 	if cfg.Database.PreserveInsertionOrder {
 		t.Error("Database.PreserveInsertionOrder default = true, want false (26.09.1 default flip)")
 	}
+	if len(cfg.Database.Extensions) != 0 {
+		t.Errorf("Database.Extensions default = %v, want an empty list", cfg.Database.Extensions)
+	}
 
 	// Verify ingest defaults are applied
 	expectedFlushWorkers := getDefaultFlushWorkers()
@@ -400,10 +403,12 @@ func TestLoad_EnvOverride(t *testing.T) {
 	os.Setenv("ARC_DATABASE_MAX_CONNECTIONS", "42")
 	os.Setenv("ARC_DATABASE_MEMORY_LIMIT", "16GB")
 	os.Setenv("ARC_DATABASE_THREAD_COUNT", "8")
+	os.Setenv("ARC_DATABASE_EXTENSIONS", "spatial,vss")
 	defer func() {
 		os.Unsetenv("ARC_DATABASE_MAX_CONNECTIONS")
 		os.Unsetenv("ARC_DATABASE_MEMORY_LIMIT")
 		os.Unsetenv("ARC_DATABASE_THREAD_COUNT")
+		os.Unsetenv("ARC_DATABASE_EXTENSIONS")
 	}()
 
 	cfg, err := Load()
@@ -419,6 +424,9 @@ func TestLoad_EnvOverride(t *testing.T) {
 	}
 	if cfg.Database.ThreadCount != 8 {
 		t.Errorf("Database.ThreadCount = %d, want 8 (from env)", cfg.Database.ThreadCount)
+	}
+	if got, want := strings.Join(cfg.Database.Extensions, ","), "spatial,vss"; got != want {
+		t.Errorf("Database.Extensions = %q, want %q (from env)", got, want)
 	}
 }
 

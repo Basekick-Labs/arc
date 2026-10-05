@@ -71,6 +71,9 @@ type DatabaseConfig struct {
 	MemoryLimit    string
 	ThreadCount    int
 	EnableWAL      bool
+	// Extensions are DuckDB extensions to install and load before external
+	// access is locked down. Only signed extensions are accepted by default.
+	Extensions []string
 	// TempDirectory is where DuckDB writes query spill files (HASH_GROUP_BY
 	// overflow, large sorts, joins). Should be on local fast storage. Files
 	// here are NOT durable state; orphans from a crashed previous run are
@@ -837,6 +840,7 @@ func Load() (*Config, error) {
 			MemoryLimit:            v.GetString("database.memory_limit"),
 			ThreadCount:            v.GetInt("database.thread_count"),
 			EnableWAL:              v.GetBool("database.enable_wal"),
+			Extensions:             v.GetStringSlice("database.extensions"),
 			TempDirectory:          v.GetString("database.temp_directory"),
 			ArcxExtensionPath:      v.GetString("database.arcx_extension_path"),
 			PreserveInsertionOrder: v.GetBool("database.preserve_insertion_order"),
@@ -1529,6 +1533,7 @@ func setDefaults(v *viper.Viper) {
 	// applyLicenseCoreLimits in cmd/arc/main.go).
 	v.SetDefault("database.thread_count", 0)
 	v.SetDefault("database.enable_wal", true)
+	v.SetDefault("database.extensions", []string{})
 	v.SetDefault("database.temp_directory", "./.tmp")        // DuckDB query spill files (overflow, sort, join). Orphans swept at startup.
 	v.SetDefault("database.arcx_extension_path", "")         // Enterprise-only; gated by licenseClient.CanUseArcx()
 	v.SetDefault("database.preserve_insertion_order", false) // false = SQL-standard unordered results; ORDER BY queries unaffected
