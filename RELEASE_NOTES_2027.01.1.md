@@ -1769,6 +1769,13 @@ throughput. A negative value is refused at startup.
 Above the new ceiling, when the WAL queue is full, an entry is still dropped and
 the write still acknowledged. What admission should do instead is
 [#676](https://github.com/Basekick-Labs/arc/issues/676).
+### Cluster imports now forward writes to writer nodes ([#1070](https://github.com/Basekick-Labs/arc/issues/1070))
+
+CSV, Parquet, line-protocol, and TLE imports received by reader or compactor
+nodes now use the existing cluster write-forwarding path. Replayable request
+bodies are reused for retries without an additional full-payload copy.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1075](https://github.com/Basekick-Labs/arc/pull/1075).
 
 ### Ingest memory is visible while flushes back up ([#1038](https://github.com/Basekick-Labs/arc/issues/1038))
 
