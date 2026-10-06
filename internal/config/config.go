@@ -452,6 +452,12 @@ type IcebergConfig struct {
 	ReconcileInterval int    // Seconds between reconcile passes (default 300)
 	CatalogDBPath     string // SQLite catalog path; defaults to the shared auth DB
 	RetainSnapshots   int    // Snapshots (and metadata versions) to keep per table; older are expired (default 10)
+	// OrphanSweepEnabled gates the metadata orphan sweep (#835): deleting the manifest
+	// lists and manifests under a table's metadata directory that no metadata.json still
+	// on disk can reach. Default true. It is the only deleter in the exporter whose work
+	// nothing regenerates, so it gets an off switch; turning it off restores the pre-#835
+	// behaviour, where that metadata grows without bound and is copied into every backup.
+	OrphanSweepEnabled bool
 }
 
 type ContinuousQueryConfig struct {
@@ -978,12 +984,13 @@ func Load() (*Config, error) {
 			DBPath:  v.GetString("retention.db_path"),
 		},
 		Iceberg: IcebergConfig{
-			Enabled:           v.GetBool("iceberg.enabled"),
-			Warehouse:         v.GetString("iceberg.warehouse"),
-			NamespacePrefix:   v.GetString("iceberg.namespace_prefix"),
-			ReconcileInterval: v.GetInt("iceberg.reconcile_interval"),
-			CatalogDBPath:     v.GetString("iceberg.catalog_db_path"),
-			RetainSnapshots:   v.GetInt("iceberg.retain_snapshots"),
+			Enabled:            v.GetBool("iceberg.enabled"),
+			Warehouse:          v.GetString("iceberg.warehouse"),
+			NamespacePrefix:    v.GetString("iceberg.namespace_prefix"),
+			ReconcileInterval:  v.GetInt("iceberg.reconcile_interval"),
+			CatalogDBPath:      v.GetString("iceberg.catalog_db_path"),
+			RetainSnapshots:    v.GetInt("iceberg.retain_snapshots"),
+			OrphanSweepEnabled: v.GetBool("iceberg.orphan_sweep_enabled"),
 		},
 		ContinuousQuery: ContinuousQueryConfig{
 			Enabled: v.GetBool("continuous_query.enabled"),
@@ -1683,6 +1690,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("iceberg.reconcile_interval", 300)          // seconds
 	v.SetDefault("iceberg.catalog_db_path", "./data/arc.db") // shared SQLite DB with auth
 	v.SetDefault("iceberg.retain_snapshots", 10)
+	v.SetDefault("iceberg.orphan_sweep_enabled", true)
 	// iceberg.warehouse defaults at wire time to the storage root (needs the backend)
 
 	// Continuous query defaults

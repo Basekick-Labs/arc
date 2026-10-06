@@ -3550,6 +3550,15 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize Iceberg exporter")
 		}
+		// #835: reclaim the manifest files that expired snapshots and dropped
+		// transactions leave behind. Grace is derived from the reconcile interval
+		// (floored at an hour inside the exporter) so an unreachable manifest is
+		// only deleted once it is far older than any commit or reader in flight.
+		icebergOrphanGrace := iceberg.OrphanGraceFor(time.Duration(cfg.Iceberg.ReconcileInterval) * time.Second)
+		exporter.ConfigureOrphanSweep(cfg.Iceberg.OrphanSweepEnabled, icebergOrphanGrace)
+		if !cfg.Iceberg.OrphanSweepEnabled {
+			log.Warn().Msg("Iceberg orphan metadata sweep is disabled (iceberg.orphan_sweep_enabled=false): the manifest files of expired snapshots are retained indefinitely and are copied into every backup")
+		}
 		// #639 item 3: database deletion clears the Iceberg catalog too.
 		databasesHandler.SetIcebergDropper(exporter)
 		icebergSource := iceberg.NewStorageWalkSource(storageBackend, cfg.Iceberg.NamespacePrefix, logger.Get("iceberg"))
