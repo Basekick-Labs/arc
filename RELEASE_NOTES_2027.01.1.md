@@ -85,6 +85,15 @@ and scoping below the storage-root segment.
 
 ## Bug fixes
 
+### Database deletion propagates across cluster nodes ([#1094](https://github.com/Basekick-Labs/arc/issues/1094))
+
+Deleting a database on a cluster now requires the primary writer and removes
+the database's file-manifest entries in bounded batches before local cleanup,
+so registered files are also removed from replicas. Standalone deletion is
+unchanged; a manifest update failure aborts local cleanup.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1096](https://github.com/Basekick-Labs/arc/pull/1096).
+
 ### Backup and restore are cluster-safe ([#1083](https://github.com/Basekick-Labs/arc/issues/1083))
 
 On a cluster node a backup or a restore was undefined behaviour: any role
@@ -370,4 +379,3 @@ of from a Raft snapshot rather than from the log, since a snapshot restore
 fires no registration callbacks (#1071 tracks the snapshot side).
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#907](https://github.com/Basekick-Labs/arc/pull/907).
-
