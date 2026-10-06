@@ -2,33 +2,22 @@ package iceberg
 
 import (
 	"context"
-	"database/sql"
-	"path/filepath"
 	"testing"
 
 	iceberg "github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
-	"github.com/rs/zerolog"
 )
 
+// TestEnsureTableReconcilesRetentionProperties is the #1093 contract: a change to
+// iceberg.retain_snapshots must reach an EXISTING table's metadata-file retention
+// properties, which are otherwise only written on the CreateTable path — and the
+// reconcile must stay a no-op once they match, so a steady-state pass does not mint a
+// metadata version per tick.
 func TestEnsureTableReconcilesRetentionProperties(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	db, err := sql.Open("sqlite3", filepath.Join(dir, "catalog.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
 
-	newExporter := func(retain int) *Exporter {
-		exp, err := NewExporter(db, nil, "file://"+dir+"/warehouse", "arc", retain, zerolog.Nop())
-		if err != nil {
-			t.Fatalf("NewExporter: %v", err)
-		}
-		return exp
-	}
-
-	initial, err := newExporter(10).EnsureTable(ctx, "db", "measurement", ArcSchema{})
+	initial, err := newTestExporter(t, dir, 10).EnsureTable(ctx, "db", "measurement", ArcSchema{})
 	if err != nil {
 		t.Fatalf("create table: %v", err)
 	}
@@ -43,7 +32,7 @@ func TestEnsureTableReconcilesRetentionProperties(t *testing.T) {
 		t.Fatalf("commit stale retention properties: %v", err)
 	}
 
-	exp := newExporter(1)
+	exp := newTestExporter(t, dir, 1)
 	updated, err := exp.EnsureTable(ctx, "db", "measurement", ArcSchema{})
 	if err != nil {
 		t.Fatalf("EnsureTable with changed retention: %v", err)

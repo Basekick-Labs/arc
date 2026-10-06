@@ -393,6 +393,12 @@ func (e *Exporter) healNameMapping(ctx context.Context, tbl *icetable.Table) (*i
 // healRetentionProperties keeps an existing table's metadata-file retention in sync with
 // the current configuration. It only commits when a property differs, so unchanged settings
 // do not create a metadata version on every reconcile pass.
+//
+// Best-effort: a failure here must not fail the reconcile, since the data-file set is what
+// the pass exists to converge. The retry is NOT the next tick, though — the scheduler skips a
+// measurement whose fingerprint is unchanged before it ever reaches EnsureTable, so a failed
+// property commit waits for the next pass that actually reconciles THIS measurement (a file-set
+// change, or the restart that any config change implies, which empties the fingerprint cache).
 func (e *Exporter) healRetentionProperties(ctx context.Context, tbl *icetable.Table) *icetable.Table {
 	if e.retain < 1 {
 		return tbl
@@ -414,12 +420,12 @@ func (e *Exporter) healRetentionProperties(ctx context.Context, tbl *icetable.Ta
 
 	txn := tbl.NewTransaction()
 	if err := txn.SetProperties(updates); err != nil {
-		e.logger.Warn().Err(err).Msg("Iceberg retention property heal failed (non-fatal) — will retry next pass")
+		e.logger.Warn().Err(err).Msg("Iceberg retention property heal failed (non-fatal) — retried on the next pass that reconciles this measurement")
 		return tbl
 	}
 	updated, err := txn.Commit(ctx)
 	if err != nil {
-		e.logger.Warn().Err(err).Msg("Iceberg retention property heal failed (non-fatal) — will retry next pass")
+		e.logger.Warn().Err(err).Msg("Iceberg retention property heal failed (non-fatal) — retried on the next pass that reconciles this measurement")
 		return tbl
 	}
 	e.writeVersionHint(ctx, updated)
