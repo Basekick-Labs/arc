@@ -380,7 +380,20 @@ func forwardSubprocessLine(logger zerolog.Logger, line string) {
 		Msg(line)
 }
 
-// createStorageBackendFromConfig creates a storage backend from subprocess config
+// createStorageBackendFromConfig creates a storage backend from subprocess config.
+//
+// This deliberately does NOT go through the shared storage.NewBackend factory
+// (internal/storage/factory.go) that primary storage, the tiering cold tier and
+// the backup manager use. The subprocess has a credential model of its own, on
+// purpose: credentials are never serialised into the job config, so it MUST
+// read them from the environment the parent set. The S3 case passes none at all
+// and lets the SDK chain pick them up, and the Azure case derives
+// UseManagedIdentity from whether AZURE_STORAGE_KEY is present. The factory
+// itself is indifferent to credentials and its other callers simply forward
+// whatever the operator configured; here the empty credential set IS the
+// contract, and a regression in it surfaces as a failed compaction job in a
+// separate process rather than a failed startup - the hardest place to notice
+// one.
 func createStorageBackendFromConfig(config *SubprocessJobConfig, logger zerolog.Logger) (storage.Backend, error) {
 	switch config.StorageType {
 	case "local":

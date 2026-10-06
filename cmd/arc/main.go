@@ -777,25 +777,52 @@ func main() {
 		Int("idle", stats.Idle).
 		Msg("Database connection pool stats")
 
-	// Initialize storage backend
+	// Initialize storage backend.
+	//
+	// The switch maps this deployment's config onto a storage.BackendSpec and
+	// picks the operator-facing wording; storage.NewBackend (internal/storage/
+	// factory.go) owns the construction and its typed-nil guarantee (#713).
+	// What stays here is everything that is this call site's business and
+	// nobody else's: the logger name, the decision that a failure is fatal, the
+	// per-backend messages, and the shutdown registration.
+	//
+	// The switch is on the raw cfg.Storage.Backend so the accepted set is
+	// exactly what it has always been: config.Load lowercases and trims
+	// storage.backend before anything reads it, and already refuses anything
+	// outside the five aliases with "storage.backend %q is invalid". The
+	// default below is therefore unreachable through config today; it keeps its
+	// wording so a caller that ever bypasses that validation still Fatals here,
+	// before a backend is built.
 	var storageBackend storage.Backend
+	storageSpec := storage.BackendSpec{Type: cfg.Storage.Backend}
+	// Both of these have a usable default so that the next backend added below
+	// degrades a message instead of crashing. Every case sets them today and
+	// the default case provably exits, but a new case that fills in the spec
+	// and forgets logStorageReady would call nil AFTER the backend was already
+	// registered, and one that forgets storageFatalMsg would Fatal with an
+	// empty message. go vet reports neither.
+	storageFatalMsg := "Failed to initialize storage backend"
+	logStorageReady := func() {
+		log.Info().
+			Str("backend", cfg.Storage.Backend).
+			Msg("Storage backend initialized")
+	}
 	switch cfg.Storage.Backend {
 	case "local":
-		storageBackend, err = storage.NewLocalBackend(cfg.Storage.LocalPath, logger.Get("storage"))
-		if err != nil {
-			log.Fatal().Err(err).Msg("Failed to initialize local storage backend")
+		storageSpec.LocalPath = cfg.Storage.LocalPath
+		storageFatalMsg = "Failed to initialize local storage backend"
+		logStorageReady = func() {
+			log.Info().
+				Str("backend", "local").
+				Str("path", cfg.Storage.LocalPath).
+				Msg("Storage backend initialized")
 		}
-		shutdownCoordinator.Register("storage", storageBackend, shutdown.PriorityStorage)
-		log.Info().
-			Str("backend", "local").
-			Str("path", cfg.Storage.LocalPath).
-			Msg("Storage backend initialized")
 
 	case "s3", "minio":
 		// Note: an empty s3_bucket for an S3 primary backend is rejected earlier
 		// in config.Load (before database.New builds the DuckDB secret), so by
 		// here the bucket is guaranteed non-empty.
-		s3Config := &storage.S3Config{
+		storageSpec.S3 = storage.S3Config{
 			Bucket:    cfg.Storage.S3Bucket,
 			Region:    cfg.Storage.S3Region,
 			Endpoint:  cfg.Storage.S3Endpoint,
@@ -805,21 +832,19 @@ func main() {
 			PathStyle: cfg.Storage.S3PathStyle,
 			Prefix:    cfg.Storage.S3Prefix,
 		}
-		storageBackend, err = storage.NewS3Backend(s3Config, logger.Get("storage"))
-		if err != nil {
-			log.Fatal().Err(err).Msg("Failed to initialize S3 storage backend")
+		storageFatalMsg = "Failed to initialize S3 storage backend"
+		logStorageReady = func() {
+			log.Info().
+				Str("backend", cfg.Storage.Backend).
+				Str("bucket", cfg.Storage.S3Bucket).
+				Str("prefix", cfg.Storage.S3Prefix).
+				Str("region", cfg.Storage.S3Region).
+				Str("endpoint", cfg.Storage.S3Endpoint).
+				Msg("Storage backend initialized")
 		}
-		shutdownCoordinator.Register("storage", storageBackend, shutdown.PriorityStorage)
-		log.Info().
-			Str("backend", cfg.Storage.Backend).
-			Str("bucket", cfg.Storage.S3Bucket).
-			Str("prefix", cfg.Storage.S3Prefix).
-			Str("region", cfg.Storage.S3Region).
-			Str("endpoint", cfg.Storage.S3Endpoint).
-			Msg("Storage backend initialized")
 
 	case "azure", "azblob":
-		azureConfig := &storage.AzureBlobConfig{
+		storageSpec.Azure = storage.AzureBlobConfig{
 			ConnectionString:   cfg.Storage.AzureConnectionString,
 			AccountName:        cfg.Storage.AzureAccountName,
 			AccountKey:         cfg.Storage.AzureAccountKey,
@@ -828,20 +853,29 @@ func main() {
 			Endpoint:           cfg.Storage.AzureEndpoint,
 			UseManagedIdentity: cfg.Storage.AzureUseManagedIdentity,
 		}
-		storageBackend, err = storage.NewAzureBlobBackend(azureConfig, logger.Get("storage"))
-		if err != nil {
-			log.Fatal().Err(err).Msg("Failed to initialize Azure Blob Storage backend")
+		storageFatalMsg = "Failed to initialize Azure Blob Storage backend"
+		logStorageReady = func() {
+			log.Info().
+				Str("backend", cfg.Storage.Backend).
+				Str("container", cfg.Storage.AzureContainer).
+				Str("account", cfg.Storage.AzureAccountName).
+				Msg("Storage backend initialized")
 		}
-		shutdownCoordinator.Register("storage", storageBackend, shutdown.PriorityStorage)
-		log.Info().
-			Str("backend", cfg.Storage.Backend).
-			Str("container", cfg.Storage.AzureContainer).
-			Str("account", cfg.Storage.AzureAccountName).
-			Msg("Storage backend initialized")
 
 	default:
 		log.Fatal().Str("backend", cfg.Storage.Backend).Msg("Unsupported storage backend (use 'local', 's3', 'minio', 'azure', or 'azblob')")
 	}
+
+	// log.Fatal in the default case exits the process, so by here the backend
+	// type is one of the five aliases and both storageFatalMsg and
+	// logStorageReady carry that case's wording rather than the generic
+	// fallbacks they were declared with.
+	storageBackend, err = storage.NewBackend(storageSpec, logger.Get("storage"))
+	if err != nil {
+		log.Fatal().Err(err).Msg(storageFatalMsg)
+	}
+	shutdownCoordinator.Register("storage", storageBackend, shutdown.PriorityStorage)
+	logStorageReady()
 
 	// Pattern 2 shared-storage multi-writer mode startup validation.
 	// Refuses to start under four conditions that would silently break
@@ -3840,48 +3874,69 @@ func main() {
 				log.Error().Err(err).Msg("Failed to open tiering database - feature disabled")
 			} else {
 				// Create cold tier backend (S3 or Azure)
+				//
+				// coldBackend is only ever assigned from a successful
+				// storage.NewBackend, which never returns a typed nil inside a
+				// non-nil interface (#713) — the factory owns that guarantee
+				// now, so neither branch has to hand-roll it. It still matters
+				// here: every "coldBackend != nil" downstream — the startup
+				// tier scan's cold sync, the drainer's existence probe, the
+				// query router's cold glob — would otherwise pass and then
+				// dereference a nil receiver.
+				//
+				// Only s3 and azure are accepted, each with its own logger name
+				// and its own error wording. There is no default case, and what
+				// makes that safe is a CONJUNCTION, not one flag: config.Load
+				// refuses an invalid value with "tiered_storage.cold.backend %q
+				// is invalid" only when tiered_storage.enabled AND
+				// tiered_storage.cold.enabled are both true -- deliberately, so
+				// that an OSS or unlicensed node carrying a leftover
+				// cold.enabled=true still boots. The runtime claim therefore
+				// rests on this whole block sitting inside
+				// "if cfg.TieredStorage.Enabled" (cmd/arc/main.go:3860). Were that
+				// outer gate ever to move, an unvalidated cold.Backend would
+				// reach this switch, fall through in silence and leave
+				// coldBackend nil, with nothing louder than cold_enabled=false
+				// in a later log line to say so.
 				var coldBackend storage.Backend
 				cold := cfg.TieredStorage.Cold
 
 				if cold.Enabled {
 					switch cold.Backend {
 					case "s3":
-						s3Config := &storage.S3Config{
-							Region:    cold.S3Region,
-							Bucket:    cold.S3Bucket,
-							Endpoint:  cold.S3Endpoint,
-							AccessKey: cold.S3AccessKey,
-							SecretKey: cold.S3SecretKey,
-							UseSSL:    cold.S3UseSSL,
-							PathStyle: cold.S3PathStyle,
-							Prefix:    cold.S3Prefix,
+						coldSpec := storage.BackendSpec{
+							Type: "s3",
+							S3: storage.S3Config{
+								Region:    cold.S3Region,
+								Bucket:    cold.S3Bucket,
+								Endpoint:  cold.S3Endpoint,
+								AccessKey: cold.S3AccessKey,
+								SecretKey: cold.S3SecretKey,
+								UseSSL:    cold.S3UseSSL,
+								PathStyle: cold.S3PathStyle,
+								Prefix:    cold.S3Prefix,
+							},
 						}
-						// Assigned through a typed local, never straight into
-						// the interface: a constructor error comes back as a
-						// nil *S3Backend, and an interface holding a typed
-						// nil is not == nil (#713). Stored directly, every
-						// "coldBackend != nil" downstream — the startup tier
-						// scan's cold sync, the drainer's existence probe,
-						// the query router's cold glob — would pass and then
-						// dereference a nil receiver.
-						if b, err := storage.NewS3Backend(s3Config, logger.Get("tiering-cold-s3")); err != nil {
+						if b, err := storage.NewBackend(coldSpec, logger.Get("tiering-cold-s3")); err != nil {
 							log.Error().Err(err).Msg("Failed to create cold tier S3 backend for tiering: the cold tier is unusable on this node until the configuration is fixed")
 						} else {
 							coldBackend = b
 						}
 
 					case "azure":
-						azureConfig := &storage.AzureBlobConfig{
-							ConnectionString:   cold.AzureConnectionString,
-							AccountName:        cold.AzureAccountName,
-							AccountKey:         cold.AzureAccountKey,
-							SASToken:           cold.AzureSASToken,
-							ContainerName:      cold.AzureContainer,
-							Endpoint:           cold.AzureEndpoint,
-							UseManagedIdentity: cold.AzureUseManagedIdentity,
+						coldSpec := storage.BackendSpec{
+							Type: "azure",
+							Azure: storage.AzureBlobConfig{
+								ConnectionString:   cold.AzureConnectionString,
+								AccountName:        cold.AzureAccountName,
+								AccountKey:         cold.AzureAccountKey,
+								SASToken:           cold.AzureSASToken,
+								ContainerName:      cold.AzureContainer,
+								Endpoint:           cold.AzureEndpoint,
+								UseManagedIdentity: cold.AzureUseManagedIdentity,
+							},
 						}
-						// Typed local for the same reason as the S3 branch.
-						if b, err := storage.NewAzureBlobBackend(azureConfig, logger.Get("tiering-cold-azure")); err != nil {
+						if b, err := storage.NewBackend(coldSpec, logger.Get("tiering-cold-azure")); err != nil {
 							log.Error().Err(err).Msg("Failed to create cold tier Azure backend for tiering: the cold tier is unusable on this node until the configuration is fixed")
 						} else {
 							coldBackend = b
