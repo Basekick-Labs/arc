@@ -140,6 +140,22 @@ func (m *Manager) RecordReplicatedFile(path string, sizeBytes int64) {
 	m.enqueueTierEvent(tierEvent{kind: tierEventPulled, path: path, sizeBytes: sizeBytes})
 }
 
+// RecordRestoredFile reports a data file a backup restore has just written to
+// this node's hot storage (#1083). It is the same event as a replicated file:
+// bytes are on hot storage and no flush registered them, so without the
+// report the file has no tier row until the next tier scan, with the routing
+// consequences the file comment describes. Implements backup.TierRecorder.
+//
+// Never blocks and nil-receiver safe, as RecordReplicatedFile: the backup
+// manager holds this as an interface, and a restore writes files at disk
+// speed.
+func (m *Manager) RecordRestoredFile(path string, sizeBytes int64) {
+	if m == nil {
+		return
+	}
+	m.enqueueTierEvent(tierEvent{kind: tierEventPulled, path: path, sizeBytes: sizeBytes})
+}
+
 // RecordUnlinkedFile reports that this node removed its own local copy of a
 // path because the path left the cluster manifest. sizeBytes is the size the
 // caller stat'd before deleting, which is also the evidence that this node

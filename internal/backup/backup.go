@@ -2,11 +2,15 @@ package backup
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -156,59 +160,46 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 		return nil, err
 	}
 
+	// ── 1a. Cluster manifest cross-check (#1083) ────────────────────────
+	// Snapshot the manifest AFTER the listing, never before: registration is
+	// asynchronous (internal/cluster/file_registrar.go), so a snapshot taken
+	// first would call a file flushed between the two "unregistered" and
+	// leave it out. A data file the listing has and the manifest lacks is
+	// not copied: on a cluster the manifest says what is data, and a file it
+	// does not list is a compaction or retention input awaiting unlink, a
+	// pre-cluster file, or a dropped registration, which the reconciliation
+	// sweep treats the same way. Restoring such a file next to the output
+	// that replaced it would serve every row of that partition twice, on
+	// every node, forever. The decision is provisional: the end of the data
+	// copy re-reads the manifest once (recheckClusterManifest) so a file
+	// whose registration had merely not reached this node yet is copied
+	// after all, and a copied file the cluster has since stopped listing is
+	// taken out again. Reserved-root Parquet (the _schema anchors) is never
+	// in the manifest and is copied as before. Nil cluster: no manifest, no
+	// check, behaviour unchanged.
+	dataFiles := parquetFiles
+	var xc *manifestCrossCheck
+	if m.cluster != nil {
+		dataFiles, xc, err = m.crossCheckManifest(ctx, parquetFiles)
+		if err != nil {
+			progress.Status = "failed"
+			progress.Error = err.Error()
+			return nil, err
+		}
+	}
+
 	// Build manifest inventory
 	manifest := &Manifest{
-		Version:    "dev",
-		BackupID:   backupID,
-		CreatedAt:  startTime.UTC(),
-		BackupType: "full",
+		Version:                "dev",
+		BackupID:               backupID,
+		CreatedAt:              startTime.UTC(),
+		BackupType:             "full",
+		ClusterManifestChecked: xc != nil,
 	}
 
 	dbMap := make(map[string]*DatabaseInfo)
-	for _, obj := range parquetFiles {
-		manifest.TotalFiles++
-		manifest.TotalSizeBytes += obj.Size
-
-		// Parquet under a reserved root (the field schema anchors under
-		// _schema/, #914) is Arc's own state, not a database: it is copied
-		// and counted with the data files, because the restore compares
-		// TotalFiles against every .parquet object present and an anchor
-		// left out of the count would hide one missing data file, but it
-		// is kept out of the database inventory (#927).
-		if isReservedRootParquet(obj.Path) {
-			manifest.AuxiliaryFiles++
-			continue
-		}
-
-		db, meas := parseDBMeasurement(obj.Path)
-		di, exists := dbMap[db]
-		if !exists {
-			di = &DatabaseInfo{Name: db}
-			dbMap[db] = di
-		}
-		di.FileCount++
-		di.SizeBytes += obj.Size
-
-		// Find or create measurement entry
-		found := false
-		for i := range di.Measurements {
-			if di.Measurements[i].Name == meas {
-				di.Measurements[i].FileCount++
-				di.Measurements[i].SizeBytes += obj.Size
-				found = true
-				break
-			}
-		}
-		if !found {
-			di.Measurements = append(di.Measurements, MeasurementInfo{
-				Name:      meas,
-				FileCount: 1,
-				SizeBytes: obj.Size,
-			})
-		}
-	}
-	for _, di := range dbMap {
-		manifest.Databases = append(manifest.Databases, *di)
+	for _, obj := range dataFiles {
+		addToInventory(manifest, dbMap, obj)
 	}
 
 	// Progress total includes Iceberg metadata files (copied in step 2b) and
@@ -254,11 +245,38 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	// ── 2. Copy parquet files ───────────────────────────────────────────
 	// One tally spans both copyDataFiles groups (data, then in-root Iceberg
 	// metadata): it records each skip's cause and names the files (#977).
+	// One sidecar builder collects, for every database data file copied, the
+	// facts a cluster restore registers from (#1083); it is handed only to
+	// the data-file passes, never to the Iceberg metadata pass.
 	tally := &skipTally{}
-	if err := m.copyDataFiles(ctx, backupID, parquetFiles, progress, tally); err != nil {
+	sidecar := &sidecarBuilder{}
+	if xc != nil {
+		sidecar.byPath = xc.byPath
+	}
+	if err := m.copyDataFiles(ctx, backupID, dataFiles, progress, tally, sidecar); err != nil {
 		progress.Status = "failed"
 		progress.Error = err.Error()
 		return nil, err
+	}
+
+	// ── 2a. Re-read the cluster manifest once, both directions (#1083) ──
+	// Registration is asynchronous and compaction commits in two Raft phases
+	// on two watcher ticks, so the first snapshot can disagree with the end
+	// of the run three ways: a listed file registered since (copied now), a
+	// registered file this node has pulled since (copied now), and a copied
+	// file the manifest has stopped listing since, the inputs of a compaction
+	// whose phase 2 landed during the run above all (removed from the backup
+	// again). What is still unregistered, and what the node still does not
+	// hold, is reported.
+	if xc != nil {
+		if err := m.recheckClusterManifest(ctx, backupID, xc, manifest, dbMap, progress, tally, sidecar); err != nil {
+			progress.Status = "failed"
+			progress.Error = err.Error()
+			return nil, err
+		}
+	}
+	for _, di := range dbMap {
+		manifest.Databases = append(manifest.Databases, *di)
 	}
 	// Skips so far are state and data-file skips. copyDataFiles accumulates
 	// into one progress counter across every group, but the manifest reports
@@ -302,7 +320,7 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	// their original locations and the SQLite catalog's metadata pointers still resolve. The
 	// referenced parquet data is already copied above; only the Iceberg metadata is added here.
 	if len(icebergMetaFiles) > 0 {
-		if err := m.copyDataFiles(ctx, backupID, icebergMetaFiles, progress, tally); err != nil {
+		if err := m.copyDataFiles(ctx, backupID, icebergMetaFiles, progress, tally, nil); err != nil {
 			progress.Status = "failed"
 			progress.Error = err.Error()
 			return nil, err
@@ -356,8 +374,10 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	m.setProgress(progress)
 	metrics.Get().SetBackupSkippedFiles(atomic.LoadInt64(&progress.SkippedFiles))
 
-	// Evaluate the skip ratio once, over every file group above.
-	if err := m.checkSkipRatio(progress, len(parquetFiles)+len(icebergMetaFiles)+warehouseFiles+len(stateFiles), tally); err != nil {
+	// Evaluate the skip ratio once, over every file group above. The
+	// denominator is what the run set out to copy: unregistered files were
+	// excluded on purpose and are neither skips nor inventory.
+	if err := m.checkSkipRatio(progress, int(manifest.TotalFiles)+len(icebergMetaFiles)+warehouseFiles+len(stateFiles), tally); err != nil {
 		progress.Status = "failed"
 		progress.Error = err.Error()
 		return nil, err
@@ -365,7 +385,7 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 
 	// Record files that could never be copied because no listing returns them.
 	// The fatal case was decided before any copying began.
-	m.recordUnaddressable(manifest, unaddressable, len(parquetFiles))
+	m.recordUnaddressable(manifest, unaddressable, int(manifest.TotalFiles))
 
 	// ── 4. Copy config ──────────────────────────────────────────────────
 	if opts.IncludeConfig && m.configPath != "" {
@@ -385,6 +405,15 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	manifest.SkippedMetadataFiles = atomic.LoadInt64(&progress.SkippedFiles) - dataSkipped - warehouseSkipped
 	manifest.SkippedSample = tally.sample
 	manifest.SkippedOverlongKeys = tally.overlong
+
+	// The file sidecar goes in before the manifest: ListBackups keys on
+	// manifest.json, so a run that dies between the two leaves nothing a
+	// listing shows, rather than a listed backup a cluster restore refuses.
+	if err := m.writeSidecar(ctx, backupID, sidecar); err != nil {
+		progress.Status = "failed"
+		progress.Error = err.Error()
+		return nil, err
+	}
 
 	manifestData, err := MarshalManifest(manifest)
 	if err != nil {
@@ -424,7 +453,11 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 // meaningful over the whole backup: a handful of stale entries in a small
 // metadata set is a large fraction of that set but a negligible fraction of the
 // backup. The caller evaluates the ratio once via checkSkipRatio.
-func (m *Manager) copyDataFiles(ctx context.Context, backupID string, files []storage.ObjectInfo, progress *Progress, tally *skipTally) error {
+//
+// sidecar, when non-nil, receives one row per database data file copied, with
+// the SHA-256 of the bytes as they streamed through (#1083). The Iceberg
+// metadata pass passes nil: those files are never registered.
+func (m *Manager) copyDataFiles(ctx context.Context, backupID string, files []storage.ObjectInfo, progress *Progress, tally *skipTally, sidecar *sidecarBuilder) error {
 	var skipped int64
 
 	for _, obj := range files {
@@ -450,7 +483,7 @@ func (m *Manager) copyDataFiles(ctx context.Context, backupID string, files []st
 			continue
 		}
 
-		written, err := m.streamBackupFile(ctx, obj.Path, destPath)
+		written, sha, err := m.streamBackupFileSHA(ctx, obj.Path, destPath)
 		if err != nil {
 			// Only a source-read failure is skippable — the file may have been
 			// deleted by compaction/retention between listing and copy. Anything
@@ -463,6 +496,15 @@ func (m *Manager) copyDataFiles(ctx context.Context, backupID string, files []st
 			tally.record(obj.Path, false)
 			m.logger.Warn().Str("path", obj.Path).Err(err).Msg("Failed to read data file, skipping")
 			continue
+		}
+		if sidecar != nil && isRegistrableDataFile(obj.Path) {
+			if sidecar.add(obj.Path, sha, written, time.Now()) {
+				m.logger.Warn().
+					Str("path", obj.Path).
+					Str("sha256", sha).
+					Str("manifest_sha256", sidecar.byPath[filepath.ToSlash(obj.Path)].SHA256).
+					Msg("Data file bytes differ from the checksum the cluster manifest registered for the path; the backup records the bytes it holds. Peers verifying a pull of this file against the manifest will reject it until the two agree")
+			}
 		}
 
 		atomic.AddInt64(&progress.ProcessedFiles, 1)
@@ -584,6 +626,10 @@ const unaddressableSampleCap = 32
 type skipTally struct {
 	overlong int64    // skips for a destination key over storage.MaxUsableKeyLen
 	sample   []string // up to unaddressableSampleCap skipped source keys, either cause
+	// paths is every skipped key, unbounded: on a cluster the end-of-run
+	// manifest re-read reconciles each against the manifest (#1083), and a
+	// run with enough skips for this to matter fails the ratio check anyway.
+	paths []string
 }
 
 // record notes one skipped file. A nil tally is a no-op, so a caller without
@@ -598,6 +644,7 @@ func (t *skipTally) record(path string, overlong bool) {
 	if len(t.sample) < unaddressableSampleCap {
 		t.sample = append(t.sample, path)
 	}
+	t.paths = append(t.paths, path)
 }
 
 // recordUnaddressable puts the finding in the manifest and decides whether the
@@ -704,18 +751,33 @@ func describeSkips(skipped int64, tally *skipTally) string {
 // avoiding loading the entire file into memory (important for large Parquet files).
 // It returns the number of bytes actually copied.
 func (m *Manager) streamBackupFile(ctx context.Context, srcPath, destPath string) (int64, error) {
+	written, _, err := m.streamBackupFileSHA(ctx, srcPath, destPath)
+	return written, err
+}
+
+// streamBackupFileSHA is streamBackupFile returning, as well, the hex SHA-256
+// of the bytes that went through (#1083). The hash is taken on the hop from
+// data storage to the temp file, which already runs through a buffered loop
+// for trackingWriter (see readto.go), so hashing adds CPU on a disk-bound
+// path and no extra pass over the bytes. The sidecar carries it so a cluster
+// restore can register the file without hashing it again, and peers can
+// verify a pull of the restored file against the manifest.
+func (m *Manager) streamBackupFileSHA(ctx context.Context, srcPath, destPath string) (int64, string, error) {
 	tmpFile, err := createTempFile("arc-backup-*.parquet")
 	if err != nil {
-		return 0, fmt.Errorf("failed to create temp file: %w", err)
+		return 0, "", fmt.Errorf("failed to create temp file: %w", err)
 	}
 	tmpPath := tmpFile.Name()
 	defer os.Remove(tmpPath)
 	defer tmpFile.Close()
 
-	// Stream from data storage to temp file
+	// Stream from data storage to temp file, hashing on the way. The hasher
+	// never fails, so trackingWriter still attributes a write error to the
+	// temp file alone.
+	hasher := sha256.New()
 	tw := &trackingWriter{w: tmpFile}
-	if err := m.dataStorage.ReadTo(ctx, srcPath, tw); err != nil {
-		return 0, classifyReadToFailure(srcPath, err, tw.err, errBackupRead, "data storage")
+	if err := m.dataStorage.ReadTo(ctx, srcPath, io.MultiWriter(tw, hasher)); err != nil {
+		return 0, "", classifyReadToFailure(srcPath, err, tw.err, errBackupRead, "data storage")
 	}
 
 	// Size the upload from the temp file rather than the listing: the listing is a
@@ -724,22 +786,309 @@ func (m *Manager) streamBackupFile(ctx context.Context, srcPath, destPath string
 	// backends that send it as Content-Length. Matches streamRestoreFile.
 	info, err := tmpFile.Stat()
 	if err != nil {
-		return 0, fmt.Errorf("failed to stat temp file: %w", err)
+		return 0, "", fmt.Errorf("failed to stat temp file: %w", err)
 	}
 	size := info.Size()
 
 	// Rewind for upload
 	if _, err := tmpFile.Seek(0, 0); err != nil {
-		return 0, fmt.Errorf("failed to seek temp file: %w", err)
+		return 0, "", fmt.Errorf("failed to seek temp file: %w", err)
 	}
 
 	// Stream from temp file to backup storage
 	if err := m.backupStorage.WriteReader(ctx, destPath, tmpFile, size); err != nil {
 		m.cleanupPartialWrite(ctx, m.backupStorage, destPath)
-		return 0, fmt.Errorf("failed to write to backup storage: %w", err)
+		return 0, "", fmt.Errorf("failed to write to backup storage: %w", err)
 	}
 
-	return size, nil
+	return size, hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+// addToInventory counts one listed data file in the manifest.
+//
+// Parquet under a reserved root (the field schema anchors under _schema/,
+// #914) is Arc's own state, not a database: it is copied and counted with the
+// data files, because the restore compares TotalFiles against every .parquet
+// object present and an anchor left out of the count would hide one missing
+// data file, but it is kept out of the database inventory (#927).
+func addToInventory(manifest *Manifest, dbMap map[string]*DatabaseInfo, obj storage.ObjectInfo) {
+	manifest.TotalFiles++
+	manifest.TotalSizeBytes += obj.Size
+	if isReservedRootParquet(obj.Path) {
+		manifest.AuxiliaryFiles++
+		return
+	}
+
+	db, meas := parseDBMeasurement(obj.Path)
+	di, exists := dbMap[db]
+	if !exists {
+		di = &DatabaseInfo{Name: db}
+		dbMap[db] = di
+	}
+	di.FileCount++
+	di.SizeBytes += obj.Size
+	for i := range di.Measurements {
+		if di.Measurements[i].Name == meas {
+			di.Measurements[i].FileCount++
+			di.Measurements[i].SizeBytes += obj.Size
+			return
+		}
+	}
+	di.Measurements = append(di.Measurements, MeasurementInfo{Name: meas, FileCount: 1, SizeBytes: obj.Size})
+}
+
+// removeFromInventory takes one copied data file back out of the manifest
+// counts (the end-of-run re-check found the cluster no longer lists it).
+func removeFromInventory(manifest *Manifest, dbMap map[string]*DatabaseInfo, path string, size int64) {
+	manifest.TotalFiles--
+	manifest.TotalSizeBytes -= size
+	db, meas := parseDBMeasurement(path)
+	di, ok := dbMap[db]
+	if !ok {
+		return
+	}
+	di.FileCount--
+	di.SizeBytes -= size
+	for i := range di.Measurements {
+		if di.Measurements[i].Name != meas {
+			continue
+		}
+		di.Measurements[i].FileCount--
+		di.Measurements[i].SizeBytes -= size
+		if di.Measurements[i].FileCount <= 0 {
+			di.Measurements = append(di.Measurements[:i], di.Measurements[i+1:]...)
+		}
+		break
+	}
+	if di.FileCount <= 0 {
+		delete(dbMap, db)
+	}
+}
+
+// manifestCrossCheck is the first comparison of the listing against the
+// cluster manifest (#1083), kept so the end of the run can re-check it.
+type manifestCrossCheck struct {
+	byPath map[string]ManifestFile // the manifest as of the first snapshot
+	// unregistered are the listed database data files the first snapshot did
+	// not have: provisionally excluded, re-read at the end of the data copy.
+	unregistered []storage.ObjectInfo
+	// manifestOnly are the manifest's data-file paths the listing did not
+	// have, sorted: provisionally a gap, re-checked at the end of the data
+	// copy.
+	manifestOnly []string
+}
+
+// crossCheckManifest syncs the manifest, snapshots it, and splits the listed
+// Parquet files into the ones this run copies now (reserved-root Parquet,
+// plus every database data file the manifest lists) and the ones it holds
+// back, noting the manifest entries the listing lacks. One ManifestFiles
+// call, no per-path lookups.
+//
+// An EMPTY manifest while the listing holds data files fails the backup: it
+// means this node has no populated Raft manifest to check against (a fresh
+// FSM, or a coordinator without one), and reading it as "nothing is data"
+// would produce an empty backup that reports success.
+func (m *Manager) crossCheckManifest(ctx context.Context, parquetFiles []storage.ObjectInfo) ([]storage.ObjectInfo, *manifestCrossCheck, error) {
+	if err := m.cluster.Sync(ctx); err != nil {
+		return nil, nil, fmt.Errorf("backup failed: could not sync the cluster manifest before snapshotting it, so a stale view might call registered files unregistered: %w", err)
+	}
+	entries := m.cluster.ManifestFiles()
+	xc := &manifestCrossCheck{byPath: make(map[string]ManifestFile, len(entries))}
+	for _, e := range entries {
+		xc.byPath[filepath.ToSlash(e.Path)] = e
+	}
+	listed := make(map[string]struct{}, len(parquetFiles))
+	keep := make([]storage.ObjectInfo, 0, len(parquetFiles))
+	registrable, kept := 0, 0
+	for _, obj := range parquetFiles {
+		p := filepath.ToSlash(obj.Path)
+		listed[p] = struct{}{}
+		if !isRegistrableDataFile(p) {
+			keep = append(keep, obj)
+			continue
+		}
+		registrable++
+		if _, ok := xc.byPath[p]; ok {
+			keep = append(keep, obj)
+			kept++
+		} else {
+			xc.unregistered = append(xc.unregistered, obj)
+		}
+	}
+	if len(entries) == 0 && registrable > 0 {
+		return nil, nil, fmt.Errorf("backup refused: the cluster manifest is empty while this node lists %d data files; an empty manifest means this node has no populated Raft file manifest to check against (cluster.raft_data_dir unset, or a manifest not yet populated), not that nothing is data. Take the backup on a node with a populated manifest", registrable)
+	}
+	for p := range xc.byPath {
+		if _, ok := listed[p]; !ok && isRegistrableDataFile(p) {
+			xc.manifestOnly = append(xc.manifestOnly, p)
+		}
+	}
+	sort.Strings(xc.manifestOnly)
+	m.logger.Info().
+		Int("manifest_entries", len(entries)).
+		Int("listed_data_files", registrable).
+		Int("listed_and_registered", kept).
+		Int("unregistered_provisional", len(xc.unregistered)).
+		Int("manifest_only_provisional", len(xc.manifestOnly)).
+		Msg("Cluster manifest cross-check: provisional counts, re-checked at the end of the data copy")
+	return keep, xc, nil
+}
+
+// recheckClusterManifest syncs and re-reads the manifest once after the data
+// copy and settles every provisional decision against it:
+//
+//   - a copied data file the manifest no longer lists is removed from the
+//     backup (storage, inventory, sidecar) and counted as
+//     left_manifest_during_run: the cluster says it is no longer data, the
+//     inputs of a compaction whose phase 2 landed during the run above all;
+//   - a held-back file the manifest now lists is copied (its registration had
+//     not reached this node at the first snapshot); one still absent is
+//     counted as unregistered_skipped;
+//   - a manifest entry this node has pulled since the listing is copied; one
+//     still absent is counted as a manifest-only gap; one that has left the
+//     manifest meanwhile was retention or compaction doing its job;
+//   - a skipped file (unreadable at copy time) that has left the manifest is
+//     counted as reconciled: not missing data.
+func (m *Manager) recheckClusterManifest(ctx context.Context, backupID string, xc *manifestCrossCheck, manifest *Manifest, dbMap map[string]*DatabaseInfo, progress *Progress, tally *skipTally, sidecar *sidecarBuilder) error {
+	if err := m.cluster.Sync(ctx); err != nil {
+		return fmt.Errorf("backup failed: could not sync the cluster manifest for the end-of-run check: %w", err)
+	}
+	entries := m.cluster.ManifestFiles()
+	now := make(map[string]ManifestFile, len(entries))
+	for _, e := range entries {
+		now[filepath.ToSlash(e.Path)] = e
+	}
+
+	// (c) copied, and no longer listed. A storage delete that fails leaves
+	// a file in the backup the cluster says is not data; that is the
+	// double-serve this exists to prevent, so it fails the run.
+	var left int64
+	for _, row := range sidecar.rows() {
+		if _, ok := now[row.Path]; ok {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		dest := backupID + "/data/" + row.Path
+		if err := m.backupStorage.Delete(ctx, dest); err != nil {
+			return fmt.Errorf("backup failed: %s left the cluster manifest during the run and its copy could not be removed from the backup: %w", row.Path, err)
+		}
+		removeFromInventory(manifest, dbMap, row.Path, row.SizeBytes)
+		sidecar.drop(row.Path)
+		atomic.AddInt64(&progress.ProcessedFiles, -1)
+		atomic.AddInt64(&progress.ProcessedBytes, -row.SizeBytes)
+		progress.TotalFiles--
+		left++
+		if len(manifest.LeftManifestSample) < unaddressableSampleCap {
+			manifest.LeftManifestSample = append(manifest.LeftManifestSample, row.Path)
+		}
+	}
+	if left > 0 {
+		manifest.LeftManifestDuringRun = left
+		progress.TotalBytes = manifest.TotalSizeBytes
+		m.setProgress(progress)
+		m.logger.Warn().
+			Int64("left_manifest_during_run", left).
+			Strs("sample", manifest.LeftManifestSample).
+			Msg("Data files left the cluster manifest while the backup ran and were removed from it again: compaction, retention or tiering replaced or removed them. The backup holds what the cluster holds")
+	}
+
+	// (b) listed but unregistered at the first snapshot.
+	var late []storage.ObjectInfo
+	var still []storage.ObjectInfo
+	for _, obj := range xc.unregistered {
+		p := filepath.ToSlash(obj.Path)
+		if e, ok := now[p]; ok {
+			late = append(late, obj)
+			sidecar.byPath[p] = e
+		} else {
+			still = append(still, obj)
+		}
+	}
+	// (a) in the manifest but not in the listing: pulled since, or still absent.
+	var absent int64
+	for _, p := range xc.manifestOnly {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		e, ok := now[p]
+		if !ok {
+			continue // left the manifest since: retention or compaction, not a gap
+		}
+		size, err := m.dataStorage.StatFile(ctx, p)
+		if err != nil {
+			// Cannot confirm the file is here; counting it keeps the backup
+			// honest (INCOMPLETE) rather than optimistic.
+			m.logger.Warn().Err(err).Str("path", p).Msg("Could not check whether a manifest entry is present locally; counting it as absent")
+			size = -1
+		}
+		if size >= 0 {
+			// Pulled since the listing: copy it. It is registered data this
+			// node holds, and leaving it out would report it as a gap.
+			late = append(late, storage.ObjectInfo{Path: p, Size: size})
+			sidecar.byPath[p] = e
+			continue
+		}
+		absent++
+		if len(manifest.ManifestOnlySample) < unaddressableSampleCap {
+			manifest.ManifestOnlySample = append(manifest.ManifestOnlySample, p)
+		}
+	}
+	if len(late) > 0 {
+		for _, obj := range late {
+			addToInventory(manifest, dbMap, obj)
+		}
+		progress.TotalFiles += int64(len(late))
+		progress.TotalBytes = manifest.TotalSizeBytes
+		m.setProgress(progress)
+		m.logger.Info().Int("files", len(late)).Msg("Data files registered in the cluster manifest, or pulled, since the first snapshot; copying them")
+		if err := m.copyDataFiles(ctx, backupID, late, progress, tally, sidecar); err != nil {
+			return err
+		}
+	}
+	if len(still) > 0 {
+		manifest.UnregisteredSkipped = int64(len(still))
+		for i, obj := range still {
+			if i == unaddressableSampleCap {
+				break
+			}
+			manifest.UnregisteredSample = append(manifest.UnregisteredSample, filepath.ToSlash(obj.Path))
+		}
+		m.logger.Warn().
+			Int("unregistered_skipped", len(still)).
+			Strs("sample", manifest.UnregisteredSample).
+			Msg("Data files in this node storage are not in the cluster manifest and were not backed up: a compaction or retention input awaiting unlink, a pre-cluster file, or a dropped registration. The manifest, not the listing, says what is data on a cluster")
+	}
+	if absent > 0 {
+		manifest.ManifestOnlyFiles = absent
+		m.logger.Warn().
+			Int64("manifest_only_files", absent).
+			Strs("sample", manifest.ManifestOnlySample).
+			Msg("Backup is incomplete: the cluster manifest lists files this node does not hold (not pulled yet); re-run the backup once this node has caught up")
+	}
+
+	// (d) skips that are not missing data: the file had left the manifest by
+	// now, so compaction, retention or tiering removed it between the listing
+	// and its copy.
+	for _, p := range tally.paths {
+		p = filepath.ToSlash(p)
+		if !isRegistrableDataFile(p) {
+			continue
+		}
+		if _, ok := now[p]; !ok {
+			manifest.SkippedReconciled++
+		}
+	}
+
+	progress.UnregisteredSkipped = manifest.UnregisteredSkipped
+	progress.UnregisteredSample = manifest.UnregisteredSample
+	progress.ManifestOnlyFiles = manifest.ManifestOnlyFiles
+	progress.ManifestOnlySample = manifest.ManifestOnlySample
+	progress.LeftManifestDuringRun = manifest.LeftManifestDuringRun
+	progress.LeftManifestSample = manifest.LeftManifestSample
+	m.setProgress(progress)
+	return nil
 }
 
 // cleanupPartialWrite removes the staging file a failed WriteReader leaves behind

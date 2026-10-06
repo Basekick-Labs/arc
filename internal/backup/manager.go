@@ -40,6 +40,13 @@ type Manager struct {
 	icebergEnabled             bool
 	icebergNSPrefix            string
 
+	// cluster is the Raft file manifest on a cluster node, nil on a
+	// standalone one; tierRecorder is this node's tier metadata, nil without
+	// tiering. Independently wired (#1083): tiering runs standalone too, and
+	// a cluster node may have tiering off. See cluster.go.
+	cluster      ClusterManifest
+	tierRecorder TierRecorder
+
 	logger zerolog.Logger
 	mu     sync.Mutex // serializes backup/restore operations
 	active atomic.Pointer[Progress]
