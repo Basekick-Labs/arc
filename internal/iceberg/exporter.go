@@ -207,7 +207,11 @@ func (e *Exporter) EnsureTable(ctx context.Context, database, measurement string
 		// Table exists — evolve its schema to cover any new columns in `sc` (Arc's
 		// per-measurement schema can grow over time). Missing columns are added as optional,
 		// so older narrow files stay compatible. No-op when already a superset.
-		return e.evolveSchema(ctx, tbl, sc)
+		tbl, err = e.evolveSchema(ctx, tbl, sc)
+		if err != nil {
+			return nil, err
+		}
+		return e.healRetentionProperties(ctx, tbl), nil
 	}
 	if !errors.Is(err, icecatalog.ErrNoSuchTable) {
 		// The catalog has a row for this table but the table cannot be loaded. Falling
@@ -384,6 +388,43 @@ func (e *Exporter) healNameMapping(ctx context.Context, tbl *icetable.Table) (*i
 		e.logger.Info().Msg("Iceberg name-mapping healed to match current schema")
 	}
 	return healed, nil
+}
+
+// healRetentionProperties keeps an existing table's metadata-file retention in sync with
+// the current configuration. It only commits when a property differs, so unchanged settings
+// do not create a metadata version on every reconcile pass.
+func (e *Exporter) healRetentionProperties(ctx context.Context, tbl *icetable.Table) *icetable.Table {
+	if e.retain < 1 {
+		return tbl
+	}
+
+	desired := iceberg.Properties{
+		icetable.MetadataDeleteAfterCommitEnabledKey: "true",
+		icetable.MetadataPreviousVersionsMaxKey:      strconv.Itoa(e.retain),
+	}
+	updates := make(iceberg.Properties, len(desired))
+	for key, value := range desired {
+		if tbl.Properties()[key] != value {
+			updates[key] = value
+		}
+	}
+	if len(updates) == 0 {
+		return tbl
+	}
+
+	txn := tbl.NewTransaction()
+	if err := txn.SetProperties(updates); err != nil {
+		e.logger.Warn().Err(err).Msg("Iceberg retention property heal failed (non-fatal) — will retry next pass")
+		return tbl
+	}
+	updated, err := txn.Commit(ctx)
+	if err != nil {
+		e.logger.Warn().Err(err).Msg("Iceberg retention property heal failed (non-fatal) — will retry next pass")
+		return tbl
+	}
+	e.writeVersionHint(ctx, updated)
+	e.logger.Info().Int("retain_snapshots", e.retain).Msg("Iceberg retention properties reconciled")
+	return updated
 }
 
 // ReconcileMeasurement makes the Iceberg table's data-file set equal `current`: it AddFiles
