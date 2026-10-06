@@ -85,6 +85,12 @@ and scoping below the storage-root segment.
 
 ## Bug fixes
 
+### Existing Iceberg tables honor retention changes ([#1093](https://github.com/Basekick-Labs/arc/issues/1093))
+
+`iceberg.retain_snapshots` now updates Iceberg's metadata-file retention properties on existing tables. Reconciliation skips commits when the properties already match.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1095](https://github.com/Basekick-Labs/arc/pull/1095).
+
 ### Backup and restore are cluster-safe ([#1083](https://github.com/Basekick-Labs/arc/issues/1083))
 
 On a cluster node a backup or a restore was undefined behaviour: any role
@@ -370,4 +376,3 @@ of from a Raft snapshot rather than from the log, since a snapshot restore
 fires no registration callbacks (#1071 tracks the snapshot side).
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#907](https://github.com/Basekick-Labs/arc/pull/907).
-
