@@ -156,6 +156,22 @@ func (m *Manager) RecordRestoredFile(path string, sizeBytes int64) {
 	m.enqueueTierEvent(tierEvent{kind: tierEventPulled, path: path, sizeBytes: sizeBytes})
 }
 
+// DatabaseHasTierRows reports whether this node's tier metadata holds a row
+// for database in any tier (#1084): one indexed query. It is how a scoped
+// backup recognises a fully cold database, whose hot prefix is empty and
+// whose anchors may be gone. Implements backup.TierLookup. Nil-receiver safe
+// like the reports above; a nil manager knows no databases.
+func (m *Manager) DatabaseHasTierRows(ctx context.Context, database string) (bool, error) {
+	if m == nil || m.metadata == nil {
+		return false, nil
+	}
+	tiers, err := m.metadata.GetTiersForDatabase(ctx, database)
+	if err != nil {
+		return false, err
+	}
+	return len(tiers) > 0, nil
+}
+
 // RecordUnlinkedFile reports that this node removed its own local copy of a
 // path because the path left the cluster manifest. sizeBytes is the size the
 // caller stat'd before deleting, which is also the evidence that this node

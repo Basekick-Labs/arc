@@ -1011,6 +1011,45 @@ func (b *S3Backend) ListObjects(ctx context.Context, prefix string) ([]ObjectInf
 	return objects, nil
 }
 
+// HasObjectsUnderPrefix implements PrefixProber: it pages ListObjectsV2 under
+// the same prefix ListObjects would use and returns at the first key the
+// contract accepts. The continuation token is followed only while every key
+// of a page was one ListObjects would hide, so a prefix holding nothing but
+// directory markers or foreign keys is still answered correctly, and a prefix
+// with data is answered from its first page.
+func (b *S3Backend) HasObjectsUnderPrefix(ctx context.Context, prefix string) (bool, error) {
+	fullPrefix, err := b.prefixedListPrefix(prefix)
+	if err != nil {
+		return false, err
+	}
+	var continuationToken *string
+	for {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		result, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(b.bucket),
+			Prefix:            aws.String(fullPrefix),
+			ContinuationToken: continuationToken,
+		})
+		if err != nil {
+			return false, fmt.Errorf("failed to list S3 objects: %w", err)
+		}
+		for _, obj := range result.Contents {
+			if obj.Key == nil {
+				continue
+			}
+			if ValidateKey(strings.TrimPrefix(*obj.Key, b.prefix)) == nil {
+				return true, nil
+			}
+		}
+		if result.IsTruncated == nil || !*result.IsTruncated {
+			return false, nil
+		}
+		continuationToken = result.NextContinuationToken
+	}
+}
+
 // ListUnusable implements UnusableLister.
 //
 // Returns exactly what ListObjects drops, so the two partition the bucket.

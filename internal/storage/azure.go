@@ -656,6 +656,35 @@ func (b *AzureBlobBackend) ListObjects(ctx context.Context, prefix string) ([]Ob
 	return objects, nil
 }
 
+// HasObjectsUnderPrefix implements PrefixProber over the flat blob pager: the
+// first blob whose name the contract accepts answers true, and the pager is
+// only advanced while a whole page was blobs ListObjects would hide. See
+// S3Backend.HasObjectsUnderPrefix.
+func (b *AzureBlobBackend) HasObjectsUnderPrefix(ctx context.Context, prefix string) (bool, error) {
+	if err := ValidateListPrefix(prefix); err != nil {
+		return false, err
+	}
+	containerClient := b.client.ServiceClient().NewContainerClient(b.containerName)
+	pager := containerClient.NewListBlobsFlatPager(&container.ListBlobsFlatOptions{
+		Prefix: &prefix,
+	})
+	for pager.More() {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return false, fmt.Errorf("failed to list Azure blobs: %w", err)
+		}
+		for _, blobItem := range page.Segment.BlobItems {
+			if blobItem.Name != nil && ValidateKey(*blobItem.Name) == nil {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
 // ListUnusable implements UnusableLister.
 //
 // Returns exactly what ListObjects drops, so the two partition the container.

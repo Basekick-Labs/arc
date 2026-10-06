@@ -2,6 +2,87 @@
 
 > **Status:** Planned — January 2027 release.
 
+## New features
+
+### Backups can be scoped to one or more databases ([#1084](https://github.com/Basekick-Labs/arc/issues/1084))
+
+`POST /api/v1/backup` was whole-instance: its body took only `include_metadata`
+and `include_config`. It now also takes `databases`:
+
+```json
+{"databases": ["audit"]}
+```
+
+A scoped backup copies those databases and nothing else: their data files,
+their schema anchors under `_schema/` and their compaction state under
+`_compaction_state/` (parked `.quarantined` manifests included). The manifest
+records the list in `scope`, the backup list and the status endpoint show it,
+and the 202 echoes `databases`. `backup_type` stays `full`. An empty or absent
+list is the whole-instance backup, unchanged.
+
+Rules a scoped backup applies:
+
+- `include_metadata` and `include_config` default to **false**. An explicit
+  `include_metadata: true` is refused with 400: the SQLite database holds every
+  database's tier rows, the tokens, the continuous queries and the audit log,
+  so it cannot ride along with one database. `include_config: true` is allowed.
+- Every name must pass the storage-segment rule (the one that names an existing
+  database; no `..`, no separators, at most 256 names, no duplicates), and must
+  be a database this node knows: its hot prefix has a file, or `_schema/<db>/`
+  has an anchor, or the tier metadata has rows for it. The third rule is what
+  accepts a fully cold database (an audit database with a long retention, the
+  case that started this work) instead of answering 400. Its backup completes
+  with zero data files: the cold tier is not copied yet (#1086), and the
+  INCOMPLETE marker for that arrives with the remote-targets stage (#1085).
+  Unknown names answer 400 naming them. The probes are bounded (one indexed
+  query, then a listing that stops at the first object the storage would
+  return), so a large database does not hold the request. A database whose only files have keys no listing
+  can return is still recognised, by a fourth check that runs only after the
+  three above said no, so the run fails with the rename advice rather than
+  calling the database unknown.
+- The databases' Iceberg namespace directories (`<prefix>_<db>.db/`) are
+  excluded and counted (`iceberg_namespace_files_excluded`,
+  `iceberg_namespaces_excluded` on the manifest): the Iceberg SQL catalog is
+  instance-wide and rides with the metadata a scoped backup refuses, so
+  restoring those files would land tables no catalog can resolve.
+- Scope is the storage-root segment. Edge-sync spoke data lives under
+  `<spoke>/<db>/…`, so `databases: ["prod"]` does not include `spoke1/prod`
+  and `databases: ["spoke1"]` takes the whole spoke, anchors and compaction
+  state included. A spoke namespace below the root segment cannot be named.
+
+Restoring a scoped backup restores only its databases, in either mode. On a
+cluster node, a restore of a scoped backup that does not name a `mode` runs in
+`replace` — the mode a per-database backup is for (an additive restore of an
+audit database resurrects everything retention removed since) — and the 202
+echoes the effective mode. An explicit `"mode": "merge"` is honoured; a
+standalone node stays additive, as before; an unscoped backup still defaults
+to `merge`. In replace mode the current files to remove are selected by the
+storage path's first segment when the backup is scoped (a spoke file's
+manifest entry carries the canonical database, not the spoke). Replace is
+refused, with 400, when the scoped backup holds no data files for one of its
+databases: a fully cold database, or one dropped and re-created since, has
+nothing in the backup to put back, so replace would only remove its current
+files. The message points at `merge`, or at a fresh backup once the database
+has hot files again. The cluster-wide compaction pause (#1087) is taken for a
+scoped cluster restore exactly as for any other.
+
+A request body that is not JSON (curl's `-d` default is form-encoded) now
+answers 400 instead of being read as an empty request: for a scoping feature
+the worst outcome is a malformed `databases` silently becoming a
+whole-instance backup. An empty body still means the defaults.
+
+Storage backends gained a bounded existence probe (`PrefixProber`) for the
+known-database check; the local, S3 and Azure backends implement it and a
+backend without it falls back to a listing.
+
+A backup is a copy of the files on disk at the moment each is read: rows
+still in the ingest buffers are not in it. "Point in time" means the last
+flush.
+
+Not in this stage: a different backup target per database (#1085), the cold
+tier (#1086), `arcli backup create --database` (tracked in Basekick-Labs/arcli#44),
+and scoping below the storage-root segment.
+
 ## Bug fixes
 
 ### Backup and restore are cluster-safe ([#1083](https://github.com/Basekick-Labs/arc/issues/1083))
