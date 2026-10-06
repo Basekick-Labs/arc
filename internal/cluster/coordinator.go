@@ -5708,6 +5708,44 @@ func (c *Coordinator) GetFileEntry(path string) (*raft.FileEntry, bool) {
 	return c.raftFSM.GetFile(path)
 }
 
+// HasRaft reports whether this coordinator drives a Raft file manifest, which
+// is so only when cluster.raft_data_dir is set. Without one every manifest
+// write here is a successful no-op and GetFileManifest is nil, so a caller
+// that must tell "no manifest" from "an empty manifest" (the backup manager,
+// #1083) asks this first.
+func (c *Coordinator) HasRaft() bool {
+	return c.raftNode != nil
+}
+
+// SyncManifest blocks until this node's FSM has applied every log entry the
+// leader had committed when the call was made (#1083). It is the barrier the
+// catch-up path takes (waitForManifestSync, #799) with the same budget
+// (replication.catch_up_barrier_timeout_ms, default 30 s). A backup or a
+// restore snapshots the manifest only after it, because the primary writer is
+// routinely a Raft follower and can trail the leader for seconds after a
+// restart; a stale view would call registered files unregistered.
+func (c *Coordinator) SyncManifest(ctx context.Context) error {
+	if c.raftNode == nil {
+		return errors.New("raft not available")
+	}
+	timeout := time.Duration(c.cfg.ReplicationCatchUpBarrierTimeoutMs) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return c.waitForManifestSync(ctx, c.raftNode, timeout)
+}
+
+// IsTransientLeaderError reports whether a manifest apply failed only because
+// no leader is known yet or its address is not in the registry, an election
+// in progress, which a caller may retry for a bounded time the way the file
+// registrar's drain does.
+func IsTransientLeaderError(err error) bool {
+	return isTransientLeaderError(err)
+}
+
 // GetFileManifest returns the current file manifest from the Raft FSM.
 // Returns nil if Raft is not initialized.
 func (c *Coordinator) GetFileManifest() []*raft.FileEntry {

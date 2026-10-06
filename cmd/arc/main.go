@@ -4140,8 +4140,34 @@ func main() {
 			log.Error().Err(err).Msg("Failed to initialize backup manager")
 		} else {
 			backupHandler := api.NewBackupHandler(backupManager, authManager, logger.Get("backup-api"))
+			// Cluster safety (#1083). Only when the coordinator exists: an
+			// interface holding a typed nil *Coordinator is not == nil (#713),
+			// and both setters would then keep a pointer whose methods panic.
+			// The two hooks are independent of each other and of tiering:
+			// clusterCoordinator and tieringManager are each nil in supported
+			// modes (OSS standalone, cluster without tiering, standalone with
+			// tiering), so each gets its own guard.
+			if clusterCoordinator != nil {
+				backupHandler.SetCoordinator(clusterCoordinator)
+				// The manifest hook only where a Raft manifest exists. Without
+				// one (cluster.raft_data_dir unset) GetFileManifest is nil and
+				// every manifest write is a silent no-op, and the backup
+				// manager must not read that as "nothing is data".
+				if clusterCoordinator.HasRaft() {
+					backupManager.SetClusterManifest(&backupClusterManifest{coordinator: clusterCoordinator})
+				} else {
+					log.Warn().Msg("Cluster coordinator has no Raft file manifest: backups run without the manifest cross-check and restores register nothing")
+				}
+			}
+			if tieringManager != nil {
+				backupManager.SetTierRecorder(tieringManager)
+			}
 			backupHandler.RegisterRoutes(server.GetApp())
-			log.Info().Str("backup_path", cfg.Backup.LocalPath).Msg("Backup/restore enabled")
+			log.Info().
+				Str("backup_path", cfg.Backup.LocalPath).
+				Bool("cluster_gate", clusterCoordinator != nil).
+				Bool("tier_recorder", tieringManager != nil).
+				Msg("Backup/restore enabled")
 		}
 	}
 
@@ -4731,5 +4757,176 @@ func isSharedBackend(backend string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// backupClusterManifest adapts the cluster coordinator to backup.ClusterManifest
+// (#1083). internal/backup cannot import internal/cluster, so the Raft types
+// are mapped here: a ManifestFile becomes a raft.FileEntry stamped with this
+// node as origin and the hot tier, and both directions go through one batched
+// Raft entry per call. The backup manager chunks by count and bytes before
+// calling (its caps mirror the file registrar's), because this node is
+// routinely a Raft follower whose batches are forwarded inside a 1 MiB frame;
+// TestBackupClusterManifest_ChunksFitTheForwardFrame pins that fit.
+//
+// Wired only when the coordinator has a Raft manifest (HasRaft). Every write
+// here still checks, because BatchFileOpsInManifestContext reports success
+// without one and a restore must not believe its files were registered.
+type backupClusterManifest struct {
+	coordinator *cluster.Coordinator
+}
+
+// errNoRaftManifest is returned by every write when the coordinator has no
+// Raft manifest, instead of the coordinator's own nil-success.
+var errNoRaftManifest = errors.New("cluster coordinator has no Raft file manifest (cluster.raft_data_dir unset)")
+
+// Retry budget for a manifest batch refused only because no leader is known
+// or reachable (an election in progress). The file registrar's drain retries
+// the same errors for its shutdown budget; a restore has longer, since the
+// alternative is aborting a run of thousands of files over a few seconds of
+// leader election. Permanent refusals (no quorum, a rejected command) return
+// at once.
+const (
+	backupManifestRetryBudget = 15 * time.Second
+	backupManifestRetryDelay  = 250 * time.Millisecond
+)
+
+// Sync blocks until this node's FSM has caught up with the leader.
+func (b *backupClusterManifest) Sync(ctx context.Context) error {
+	if !b.coordinator.HasRaft() {
+		return errNoRaftManifest
+	}
+	return b.coordinator.SyncManifest(ctx)
+}
+
+// LocalNodeID is the origin stamped on every entry BatchRegister builds.
+func (b *backupClusterManifest) LocalNodeID() string {
+	return b.coordinator.LocalNodeID()
+}
+
+// ManifestFiles returns the hot data-file entries of the manifest, one FSM
+// read. Cold entries are left out: tiering removes a migrated file's entry
+// today, so there should be none, but one that did appear would be reported
+// by the backup as a file this node lacks, which it does not — the file moved.
+func (b *backupClusterManifest) ManifestFiles() []backup.ManifestFile {
+	entries := b.coordinator.GetFileManifest()
+	out := make([]backup.ManifestFile, 0, len(entries))
+	for _, e := range entries {
+		if e == nil || e.Tier == "cold" {
+			continue
+		}
+		out = append(out, backup.ManifestFile{
+			Path:          e.Path,
+			SHA256:        e.SHA256,
+			SizeBytes:     e.SizeBytes,
+			Database:      e.Database,
+			Measurement:   e.Measurement,
+			PartitionTime: e.PartitionTime,
+			CreatedAt:     e.CreatedAt,
+		})
+	}
+	return out
+}
+
+// BatchRegister applies one batch of register operations. Every path is
+// validated here first, because the FSM refuses the WHOLE batch for one bad
+// path and would name none of them; a refusal here names the path so the
+// restore's report is actionable. CreatedAt comes from the sidecar (the
+// manifest entry the backup saw, or the backup time on a standalone source)
+// and is never zero: the FSM refuses a zero created_at rather than fill it in,
+// since time.Now inside Apply would diverge replicas.
+//
+// Registering a path the manifest already lists is not a no-op: the FSM fires
+// its registration callback on every register (one enqueue and a stat per
+// peer), and a changed SHA fires the content-change callback too, so since
+// #907 every peer re-pulls that file from this node.
+func (b *backupClusterManifest) BatchRegister(ctx context.Context, files []backup.ManifestFile) error {
+	if !b.coordinator.HasRaft() {
+		return errNoRaftManifest
+	}
+	ops, err := buildRegisterOps(files, b.coordinator.LocalNodeID())
+	if err != nil {
+		return err
+	}
+	return applyManifestBatchWithRetry(ctx, func(ctx context.Context) error {
+		return b.coordinator.BatchFileOpsInManifestContext(ctx, ops)
+	}, backupManifestRetryBudget, backupManifestRetryDelay)
+}
+
+// buildRegisterOps maps sidecar rows onto register operations stamped with
+// originNodeID. Pure, so the frame-fit test can size what the manager sends.
+func buildRegisterOps(files []backup.ManifestFile, originNodeID string) ([]clusterraft.BatchFileOp, error) {
+	ops := make([]clusterraft.BatchFileOp, 0, len(files))
+	for _, f := range files {
+		if err := clusterraft.ValidateManifestPath(f.Path); err != nil {
+			return nil, fmt.Errorf("register %s: the cluster manifest refuses the path: %w", f.Path, err)
+		}
+		createdAt := f.CreatedAt
+		if createdAt.IsZero() {
+			createdAt = time.Now().UTC()
+		}
+		payload, err := json.Marshal(clusterraft.RegisterFilePayload{File: clusterraft.FileEntry{
+			Path:          f.Path,
+			SHA256:        f.SHA256,
+			SizeBytes:     f.SizeBytes,
+			Database:      f.Database,
+			Measurement:   f.Measurement,
+			PartitionTime: f.PartitionTime,
+			OriginNodeID:  originNodeID,
+			Tier:          "hot",
+			CreatedAt:     createdAt,
+		}})
+		if err != nil {
+			return nil, fmt.Errorf("register %s: marshal payload: %w", f.Path, err)
+		}
+		ops = append(ops, clusterraft.BatchFileOp{Type: clusterraft.CommandRegisterFile, Payload: payload})
+	}
+	return ops, nil
+}
+
+// BatchDelete applies one batch of delete operations stamped with reason. On
+// a local backend the coordinator's FSM delete callback hands each path to the
+// local-delete workers on every node; on a shared backend that callback takes
+// no action and the backup manager removes the objects itself, after this
+// returns (manifest before storage).
+func (b *backupClusterManifest) BatchDelete(ctx context.Context, paths []string, reason string) error {
+	if !b.coordinator.HasRaft() {
+		return errNoRaftManifest
+	}
+	ops := make([]clusterraft.BatchFileOp, 0, len(paths))
+	for _, p := range paths {
+		payload, err := json.Marshal(clusterraft.DeleteFilePayload{Path: p, Reason: reason})
+		if err != nil {
+			return fmt.Errorf("delete %s: marshal payload: %w", p, err)
+		}
+		ops = append(ops, clusterraft.BatchFileOp{Type: clusterraft.CommandDeleteFile, Payload: payload})
+	}
+	return applyManifestBatchWithRetry(ctx, func(ctx context.Context) error {
+		return b.coordinator.BatchFileOpsInManifestContext(ctx, ops)
+	}, backupManifestRetryBudget, backupManifestRetryDelay)
+}
+
+// applyManifestBatchWithRetry runs apply, retrying for up to budget (and
+// while ctx lives) when the refusal is only that no leader is known or
+// reachable, as file_registrar.go's drain does. Any other error, including
+// a quorum loss, returns at once; the last transient error is returned when
+// the budget runs out.
+func applyManifestBatchWithRetry(ctx context.Context, apply func(context.Context) error, budget, delay time.Duration) error {
+	deadline := time.Now().Add(budget)
+	for {
+		err := apply(ctx)
+		if err == nil || !cluster.IsTransientLeaderError(err) {
+			return err
+		}
+		if ctx.Err() != nil || !time.Now().Before(deadline) {
+			return err
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return err
+		case <-timer.C:
+		}
 	}
 }
