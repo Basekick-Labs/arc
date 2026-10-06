@@ -4212,12 +4212,16 @@ func main() {
 			}
 			if tieringManager != nil {
 				backupManager.SetTierRecorder(tieringManager)
+				// The known-database check of a scoped backup (#1084) asks
+				// the same tier metadata whether a database is fully cold.
+				backupManager.SetTierLookup(tieringManager)
 			}
 			backupHandler.RegisterRoutes(server.GetApp())
 			log.Info().
 				Str("backup_path", cfg.Backup.LocalPath).
 				Bool("cluster_gate", clusterCoordinator != nil).
 				Bool("tier_recorder", tieringManager != nil).
+				Bool("tier_lookup", tieringManager != nil).
 				Msg("Backup/restore enabled")
 		}
 	}

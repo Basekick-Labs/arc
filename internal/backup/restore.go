@@ -51,6 +51,67 @@ func NormalizeRestoreMode(mode string) (string, error) {
 	return "", fmt.Errorf("invalid restore mode %q: use %q (additive, the default) or %q (remove the current files of each restored database first; cluster nodes only)", mode, RestoreModeMerge, RestoreModeReplace)
 }
 
+// ResolveRestoreMode is the one place the effective mode of a restore is
+// decided (#1084), given the mode string exactly as the request spelled it,
+// the scope of the backup being restored (its manifest's Scope) and whether
+// the Raft file manifest is wired on this node. A request that named no mode
+// resolves to replace when the backup is scoped AND the node is clustered:
+// the point of restoring one database on a cluster is to put that database
+// back, not to resurrect every file retention and compaction removed from it
+// since. Everything else resolves as NormalizeRestoreMode does, so an explicit
+// "merge" stays merge, which is why this takes the RAW string: the normaliser
+// collapses "" and "merge" and cannot tell them apart. It never yields replace
+// on a standalone node, where the manager refuses an explicit replace.
+//
+// The API handler calls it to echo the effective mode and the manager calls it
+// again after reading the manifest, with the same inputs, so direct callers
+// get the same answer and the two cannot drift.
+func ResolveRestoreMode(rawMode string, scope []string, clustered bool) (string, error) {
+	mode, err := NormalizeRestoreMode(rawMode)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(rawMode) == "" && len(scope) > 0 && clustered {
+		return RestoreModeReplace, nil
+	}
+	return mode, nil
+}
+
+// CheckScopedReplace refuses a replace-mode restore of a scoped backup that
+// holds no data files for one of its databases (#1084). Replace removes the
+// current files of each restored database first, so for such a database it
+// would only remove and restore nothing: a database dropped and recreated, or
+// fully cold (its tier rows made it known at backup time, and a backup does
+// not carry cold tier objects until #1086), would lose its hot tier on every
+// node, and replace is the default a scoped backup resolves to on a cluster.
+// The inventory is keyed by storage-root segment (parseDBMeasurement), so a
+// spoke scope matches its own entry. Applied by the API handler (400) and by
+// the manager (failed run) with the same text, so the two cannot disagree.
+// Nil for an unscoped backup or any other mode.
+func CheckScopedReplace(mode string, manifest *Manifest) error {
+	if mode != RestoreModeReplace || len(manifest.Scope) == 0 {
+		return nil
+	}
+	held := make(map[string]bool, len(manifest.Databases))
+	for _, db := range manifest.Databases {
+		held[db.Name] = true
+	}
+	var missing []string
+	for _, name := range manifest.Scope {
+		if !held[name] {
+			missing = append(missing, fmt.Sprintf("%q", name))
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	noun := "database"
+	if len(missing) > 1 {
+		noun = "databases"
+	}
+	return fmt.Errorf("mode replace is refused: the backup holds no data files for %s %s, so replace would only remove its current files and restore nothing; use mode merge, or take the backup again once the database has hot files (cold tier objects are not carried by a backup until #1086)", noun, strings.Join(missing, ", "))
+}
+
 // restoreReplaceReason stamps the manifest deletes a replace-mode restore
 // issues. Tiering reads it as an ordinary removal (the hot row is retired).
 const restoreReplaceReason = "restore:replace"
@@ -61,8 +122,10 @@ type RestoreOptions struct {
 	RestoreData     bool // restore parquet files
 	RestoreMetadata bool // restore SQLite database
 	RestoreConfig   bool // restore arc.toml (requires restart)
-	// Mode is RestoreModeMerge or RestoreModeReplace; empty means merge. See
-	// the constants.
+	// Mode is RestoreModeMerge or RestoreModeReplace, or empty for the
+	// default: merge, except that a scoped backup restored on a cluster node
+	// defaults to replace (see ResolveRestoreMode, which the manager applies
+	// once it has read the manifest). An explicit value is used as given.
 	Mode string
 }
 
@@ -148,8 +211,6 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 		return nil, err
 	}
 
-	m.logger.Info().Str("backup_id", opts.BackupID).Str("mode", mode).Msg("Starting restore")
-
 	// ── 1. Read and validate manifest ───────────────────────────────────
 	manifest, err := m.GetBackup(ctx, opts.BackupID)
 	if err != nil {
@@ -157,6 +218,34 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 		progress.Error = err.Error()
 		return nil, fmt.Errorf("failed to read backup manifest: %w", err)
 	}
+
+	// The effective mode is decided from the manifest (#1084): a scoped
+	// backup on a cluster node restores in replace mode unless the request
+	// named one. Same function and same inputs as the API handler's echo.
+	// The spelling was checked above, so this cannot fail; the refusals above
+	// stand, and the resolution never yields replace on a standalone node.
+	mode, err = ResolveRestoreMode(opts.Mode, manifest.Scope, m.cluster != nil)
+	if err != nil {
+		progress.Status = "failed"
+		progress.Error = err.Error()
+		return nil, err
+	}
+	progress.Mode = mode
+	progress.Scope = manifest.Scope
+	m.setProgress(progress)
+	// Belt for the one replace that would only delete (#1084): refused here,
+	// before the compaction pause is taken, with the text the API gives.
+	if err := CheckScopedReplace(mode, manifest); err != nil {
+		progress.Status = "failed"
+		progress.Error = err.Error()
+		return nil, err
+	}
+
+	start := m.logger.Info().Str("backup_id", opts.BackupID).Str("mode", mode)
+	if len(manifest.Scope) > 0 {
+		start = start.Strs("scope", manifest.Scope)
+	}
+	start.Msg("Starting restore")
 
 	// A backup that was incomplete when it was taken restores exactly what it
 	// holds. Surface that up front so a gap that predates the restore is not
@@ -774,28 +863,48 @@ func appendSample(sample, paths []string) []string {
 // check that the output is still there (the watcher commits in two phases);
 // the caller holds the cluster-wide compaction pause for the run (#1087), and
 // pause is checked before every delete chunk.
+//
+// A scoped backup (#1084) selects the current entries by the PATH first
+// segment being in the manifest's Scope, not by the entry's Database label:
+// the label is the canonical database of an edge-sync spoke file while the
+// scope is its storage-root segment, so a scope of ["spoke1"] replaces the
+// spoke's files. A scope name absent from Databases (no data file for it in
+// the backup) was refused before this runs (CheckScopedReplace), because for
+// it replace would only delete. An unscoped backup selects by Database as
+// before.
 func (m *Manager) replaceDatabases(ctx context.Context, manifest *Manifest, files []string, dataPrefix string, skipInputs map[string]bool, current []ManifestFile, progress *Progress, pause CompactionPause) error {
+	sc := scopeFromManifest(manifest.Scope)
+	scopedDatabases := len(manifest.Databases)
+	if !sc.empty() {
+		scopedDatabases = len(sc.names)
+	}
 	unreconciled := manifest.SkippedFiles - manifest.SkippedReconciled
 	if unreconciled > 0 || manifest.UnaddressableFiles > 0 || manifest.ManifestOnlyFiles > 0 ||
 		progress.MissingFiles > 0 || progress.UnaddressableFiles > 0 {
 		return fmt.Errorf("restore refused: mode replace would remove the current files of %d databases and the backup is incomplete (backup skipped %d of which %d reconciled, backup unaddressable %d, backup manifest-only %d, missing from backup storage %d, unaddressable in backup storage %d); use mode merge, or take a complete backup first",
-			len(manifest.Databases), manifest.SkippedFiles, manifest.SkippedReconciled, manifest.UnaddressableFiles, manifest.ManifestOnlyFiles, progress.MissingFiles, progress.UnaddressableFiles)
+			scopedDatabases, manifest.SkippedFiles, manifest.SkippedReconciled, manifest.UnaddressableFiles, manifest.ManifestOnlyFiles, progress.MissingFiles, progress.UnaddressableFiles)
 	}
 	if listed := manifest.TotalFiles - manifest.AuxiliaryFiles + manifest.UnregisteredSkipped; manifest.UnregisteredSkipped > 0 &&
 		float64(manifest.UnregisteredSkipped) > maxSkipRatio*float64(listed) {
 		return fmt.Errorf("restore refused: mode replace would remove the current files of %d databases, and %d of the %d data files the backup node listed were not in its cluster manifest (>%.0f%%), so the backup was taken against a stale or partial manifest view and holds much less than that node did; use mode merge, or take the backup again on a caught-up primary",
-			len(manifest.Databases), manifest.UnregisteredSkipped, listed, maxSkipRatio*100)
+			scopedDatabases, manifest.UnregisteredSkipped, listed, maxSkipRatio*100)
 	}
 	m.logger.Info().
 		Str("backup_id", manifest.BackupID).
-		Int("databases", len(manifest.Databases)).
+		Int("databases", scopedDatabases).
 		Msg("Replace mode restore starting under the cluster-wide compaction pause: no compaction job can commit on the restored databases until it completes")
 	databases := make(map[string]bool, len(manifest.Databases))
 	for _, db := range manifest.Databases {
 		databases[db.Name] = true
 	}
-	if len(databases) == 0 {
+	if sc.empty() && len(databases) == 0 {
 		return nil
+	}
+	owns := func(e ManifestFile, p string) bool {
+		if sc.empty() {
+			return databases[e.Database]
+		}
+		return sc.ownsData(p)
 	}
 	writes := make(map[string]bool, len(files))
 	for _, f := range files {
@@ -808,7 +917,7 @@ func (m *Manager) replaceDatabases(ctx context.Context, manifest *Manifest, file
 	var paths []string
 	for _, e := range current {
 		p := filepath.ToSlash(e.Path)
-		if databases[e.Database] && !writes[p] {
+		if owns(e, p) && !writes[p] {
 			paths = append(paths, p)
 		}
 	}
@@ -818,7 +927,7 @@ func (m *Manager) replaceDatabases(ctx context.Context, manifest *Manifest, file
 	}
 	m.logger.Warn().
 		Int("files", len(paths)).
-		Int("databases", len(databases)).
+		Int("databases", scopedDatabases).
 		Msg("Replace mode: removing the current cluster-manifest entries of the restored databases before writing the backup")
 
 	sharedBackend := m.dataStorage.Type() != "local"

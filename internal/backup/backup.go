@@ -67,6 +67,14 @@ func isSourceReadError(err error) bool {
 type BackupOptions struct {
 	IncludeMetadata bool // back up the SQLite database
 	IncludeConfig   bool // back up arc.toml
+	// Databases limits the backup to these storage-root segments (#1084):
+	// their data files, their field schema anchors and their compaction
+	// recovery state, and nothing else. Empty means the whole instance,
+	// exactly as before. The names are validated, sorted and de-duplicated
+	// here as well as by the API layer (see newScope); the SQLite metadata
+	// is never copied for a scoped backup, whatever IncludeMetadata says at
+	// the API, because the API refuses that combination.
+	Databases []string
 }
 
 // BackupResult is returned when a backup completes.
@@ -75,7 +83,8 @@ type BackupResult struct {
 	Duration time.Duration
 }
 
-// CreateBackup performs a full backup. It runs synchronously; the API layer
+// CreateBackup performs a backup: the whole instance, or, when opts.Databases
+// names databases, only those (#1084). It runs synchronously; the API layer
 // launches it in a goroutine and exposes progress via GetProgress().
 func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*BackupResult, error) {
 	m.mu.Lock()
@@ -97,7 +106,32 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 		m.setProgress(progress)
 	}()
 
-	m.logger.Info().Str("backup_id", backupID).Msg("Starting backup")
+	// The scope (#1084): empty for a whole-instance backup, which changes
+	// nothing below; otherwise the storage-root segments the run is limited
+	// to, validated once more here for callers that bypass the API.
+	sc, err := newScope(opts.Databases)
+	if err != nil {
+		err = fmt.Errorf("invalid backup scope: %w", err)
+		progress.Status = "failed"
+		progress.Error = err.Error()
+		return nil, err
+	}
+	if sc.empty() {
+		m.logger.Info().Str("backup_id", backupID).Msg("Starting backup")
+	} else {
+		// The API refuses this combination; this is the belt for direct
+		// callers, so the promise that a scoped backup never carries the
+		// SQLite metadata holds whoever calls.
+		if opts.IncludeMetadata {
+			err := errors.New("invalid backup scope: include_metadata is not available on a scoped backup: the SQLite database holds the tier rows of every database, the tokens, the continuous queries and the audit log, so it cannot ride along with one database; take an unscoped backup for it")
+			progress.Status = "failed"
+			progress.Error = err.Error()
+			return nil, err
+		}
+		progress.Scope = sc.names
+		m.setProgress(progress)
+		m.logger.Info().Str("backup_id", backupID).Strs("databases", sc.names).Msg("Starting backup scoped to databases")
+	}
 
 	// ── 1. Discover data files ──────────────────────────────────────────
 	objectLister, ok := m.dataStorage.(storage.ObjectLister)
@@ -113,13 +147,37 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	// as unaddressable AND copied, which is a spurious warning. The reverse
 	// order loses it from both, which is silently the very bug this guards
 	// against (#756).
-	unaddressable := m.findUnaddressable(ctx, progress)
+	unaddressable := m.findUnaddressable(ctx, progress, sc)
 
-	objects, err := objectLister.ListObjects(ctx, "")
-	if err != nil {
-		progress.Status = "failed"
-		progress.Error = err.Error()
-		return nil, fmt.Errorf("failed to list data files: %w", err)
+	// Unscoped: one listing of the whole root, as always. Scoped: the
+	// databases' own prefixes plus the anchors and compaction state the scope
+	// owns (listScoped), which then flow through the same split and copy code
+	// below, so the #930 ordering, the #977 tallies and the #1083 sidecar are
+	// untouched. The listing and the hidden set above double as three of the
+	// four known-database rules, so the belt (checkScopeKnown) costs at most
+	// one tier-metadata query per name that has neither hot files, nor an
+	// anchor, nor a hidden key.
+	var objects []storage.ObjectInfo
+	if sc.empty() {
+		objects, err = objectLister.ListObjects(ctx, "")
+		if err != nil {
+			progress.Status = "failed"
+			progress.Error = err.Error()
+			return nil, fmt.Errorf("failed to list data files: %w", err)
+		}
+	} else {
+		listing, err := m.listScoped(ctx, objectLister, sc)
+		if err != nil {
+			progress.Status = "failed"
+			progress.Error = err.Error()
+			return nil, err
+		}
+		if err := m.checkScopeKnown(ctx, sc, listing, unaddressable); err != nil {
+			progress.Status = "failed"
+			progress.Error = err.Error()
+			return nil, err
+		}
+		objects = listing.objects
 	}
 
 	// Filter to .parquet data files (the manifest inventory), and separately collect Iceberg
@@ -145,6 +203,17 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 		case isIcebergMetadata(obj.Path):
 			icebergMetaFiles = append(icebergMetaFiles, obj)
 		}
+	}
+	// A scoped backup carries no Iceberg metadata (#1084): the namespace
+	// directories are not listed at all, and the catalog that would make a
+	// stray metadata file useful is never copied with it. The classifier
+	// above still runs so a non-Parquet file under a /metadata/ segment
+	// inside a scoped database lands in this bucket rather than in the data
+	// inventory; the bucket is then dropped.
+	if !sc.empty() && len(icebergMetaFiles) > 0 {
+		m.logger.Debug().Int("files", len(icebergMetaFiles)).
+			Msg("Non-Parquet files under a /metadata/ segment inside a scoped database are not copied: a scoped backup carries no Iceberg metadata")
+		icebergMetaFiles = nil
 	}
 
 	// MEDIUM: decide the fatal case before doing any work. Copying every
@@ -180,7 +249,7 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	dataFiles := parquetFiles
 	var xc *manifestCrossCheck
 	if m.cluster != nil {
-		dataFiles, xc, err = m.crossCheckManifest(ctx, parquetFiles)
+		dataFiles, xc, err = m.crossCheckManifest(ctx, parquetFiles, sc)
 		if err != nil {
 			progress.Status = "failed"
 			progress.Error = err.Error()
@@ -188,13 +257,27 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 		}
 	}
 
-	// Build manifest inventory
+	// Build manifest inventory. Scope is nil for an unscoped run, so that
+	// manifest is byte-identical to one written before scopes existed.
 	manifest := &Manifest{
 		Version:                "dev",
 		BackupID:               backupID,
 		CreatedAt:              startTime.UTC(),
 		BackupType:             "full",
+		Scope:                  sc.names,
 		ClusterManifestChecked: xc != nil,
+	}
+
+	// Scoped (#1084): count the Iceberg namespace metadata left out, now,
+	// with the other pre-copy decisions. It lists the data store, and a
+	// listing failure after the copy would leave <id>/data/ with no manifest,
+	// which ListBackups can neither show nor clean up.
+	if !sc.empty() && m.icebergEnabled {
+		if err := m.countExcludedIcebergNamespaces(ctx, objectLister, sc, manifest); err != nil {
+			progress.Status = "failed"
+			progress.Error = err.Error()
+			return nil, err
+		}
 	}
 
 	dbMap := make(map[string]*DatabaseInfo)
@@ -211,11 +294,15 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	m.setProgress(progress)
 
 	// An unreadable outside-root Iceberg warehouse fails the backup now, not
-	// after every data file was copied.
+	// after every data file was copied. A scoped backup does not copy the
+	// warehouse at all, so there it is only noted.
 	if err := m.preflightIcebergWarehouse(); err != nil {
-		progress.Status = "failed"
-		progress.Error = err.Error()
-		return nil, err
+		if sc.empty() {
+			progress.Status = "failed"
+			progress.Error = err.Error()
+			return nil, err
+		}
+		m.logger.Debug().Err(err).Msg("Iceberg warehouse is not readable; a scoped backup does not copy it, continuing")
 	}
 
 	// ── 1b. Copy compaction recovery state, BEFORE the data files ────────
@@ -269,7 +356,7 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	// again). What is still unregistered, and what the node still does not
 	// hold, is reported.
 	if xc != nil {
-		if err := m.recheckClusterManifest(ctx, backupID, xc, manifest, dbMap, progress, tally, sidecar); err != nil {
+		if err := m.recheckClusterManifest(ctx, backupID, xc, manifest, dbMap, progress, tally, sidecar, sc); err != nil {
 			progress.Status = "failed"
 			progress.Error = err.Error()
 			return nil, err
@@ -331,10 +418,11 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	// ── 3c. Copy an Iceberg warehouse that lives OUTSIDE the storage root ─
 	// The listing above cannot see it, so it is walked on the filesystem and
 	// stored under <backupID>/iceberg/<rel>; restore writes it back into the
-	// node's configured warehouse (#637).
+	// node's configured warehouse (#637). Not for a scoped backup (#1084),
+	// which instead counted what it leaves out before the copy began.
 	var warehouseFiles int
 	var warehouseSkipped int64
-	if m.icebergWarehouse != "" {
+	if m.icebergWarehouse != "" && sc.empty() {
 		whFiles, err := m.listIcebergWarehouseFiles()
 		if err != nil {
 			progress.Status = "failed"
@@ -431,13 +519,16 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	progress.Status = "completed"
 	duration := time.Since(startTime)
 
-	m.logger.Info().
+	done := m.logger.Info().
 		Str("backup_id", backupID).
 		Int64("files", manifest.TotalFiles).
 		Int64("bytes", manifest.TotalSizeBytes).
 		Int64("skipped", manifest.SkippedFiles).
-		Dur("duration", duration).
-		Msg("Backup completed")
+		Dur("duration", duration)
+	if !sc.empty() {
+		done = done.Strs("databases", sc.names)
+	}
+	done.Msg("Backup completed")
 
 	return &BackupResult{Manifest: manifest, Duration: duration}, nil
 }
@@ -550,7 +641,15 @@ func (m *Manager) copyDataFiles(ctx context.Context, backupID string, files []st
 //
 // A backend that cannot enumerate them contributes nothing, which is correct
 // rather than optimistic: it is the same position every caller was in before.
-func (m *Manager) findUnaddressable(ctx context.Context, progress *Progress) []storage.UnusableObject {
+//
+// A scoped backup (#1084) enumerates the hidden set under the prefixes it
+// lists and nothing else (each <name>/, then _schema/ and _compaction_state/
+// whole, since those two roots hold every database's anchors and state), so a
+// one-database backup does not page the whole bucket or walk the whole tree
+// for its diagnostic; the result is then filtered to what the scope owns, as
+// the two reserved roots need. The gauge is set from the kept count, since it
+// describes this run.
+func (m *Manager) findUnaddressable(ctx context.Context, progress *Progress, sc *scope) []storage.UnusableObject {
 	lister, ok := m.dataStorage.(storage.UnusableLister)
 	if !ok {
 		// Not clean, unchecked. Said out loud so a zero in the manifest is not
@@ -558,17 +657,29 @@ func (m *Manager) findUnaddressable(ctx context.Context, progress *Progress) []s
 		m.logger.Debug().Msg("Storage backend cannot enumerate hidden files; the backup cannot confirm it is complete")
 		return nil
 	}
-	hidden, err := lister.ListUnusable(ctx, "")
-	if err != nil {
-		// Not fatal: failing the backup because the diagnostic failed would be
-		// worse than the gap it reports. Loud, because the count is now part of
-		// whether the backup can call itself complete.
-		m.logger.Warn().Err(err).Msg("Could not check for unaddressable files; the backup cannot confirm it is complete")
-		return nil
+	prefixes := []string{""}
+	if !sc.empty() {
+		prefixes = make([]string, 0, len(sc.names)+2)
+		for _, name := range sc.names {
+			prefixes = append(prefixes, name+"/")
+		}
+		prefixes = append(prefixes, "_schema/", compactionStateDir+"/")
+	}
+	var hidden []storage.UnusableObject
+	for _, prefix := range prefixes {
+		part, err := lister.ListUnusable(ctx, prefix)
+		if err != nil {
+			// Not fatal: failing the backup because the diagnostic failed would be
+			// worse than the gap it reports. Loud, because the count is now part of
+			// whether the backup can call itself complete.
+			m.logger.Warn().Err(err).Str("prefix", prefix).Msg("Could not check for unaddressable files; the backup cannot confirm it is complete")
+			return nil
+		}
+		hidden = append(hidden, part...)
 	}
 	var out []storage.UnusableObject
 	for _, o := range hidden {
-		if isBackupPayload(o.Path) {
+		if isBackupPayload(o.Path) && sc.ownsPath(o.Path) {
 			out = append(out, o)
 		}
 	}
@@ -888,7 +999,14 @@ type manifestCrossCheck struct {
 // means this node has no populated Raft manifest to check against (a fresh
 // FSM, or a coordinator without one), and reading it as "nothing is data"
 // would produce an empty backup that reports success.
-func (m *Manager) crossCheckManifest(ctx context.Context, parquetFiles []storage.ObjectInfo) ([]storage.ObjectInfo, *manifestCrossCheck, error) {
+//
+// Scoped (#1084): the manifest describes every database, the listing only
+// the scope, so a manifest entry counts as manifest-only solely when the
+// scope owns it. Ownership here is the PATH first segment alone: the entries
+// in the manifest are all database data files (isRegistrableDataFile), and
+// the entry's Database label is the canonical database of an edge-sync spoke
+// file, not its storage-root segment.
+func (m *Manager) crossCheckManifest(ctx context.Context, parquetFiles []storage.ObjectInfo, sc *scope) ([]storage.ObjectInfo, *manifestCrossCheck, error) {
 	if err := m.cluster.Sync(ctx); err != nil {
 		return nil, nil, fmt.Errorf("backup failed: could not sync the cluster manifest before snapshotting it, so a stale view might call registered files unregistered: %w", err)
 	}
@@ -919,18 +1037,23 @@ func (m *Manager) crossCheckManifest(ctx context.Context, parquetFiles []storage
 		return nil, nil, fmt.Errorf("backup refused: the cluster manifest is empty while this node lists %d data files; an empty manifest means this node has no populated Raft file manifest to check against (cluster.raft_data_dir unset, or a manifest not yet populated), not that nothing is data. Take the backup on a node with a populated manifest", registrable)
 	}
 	for p := range xc.byPath {
-		if _, ok := listed[p]; !ok && isRegistrableDataFile(p) {
+		if _, ok := listed[p]; !ok && isRegistrableDataFile(p) && sc.ownsData(p) {
 			xc.manifestOnly = append(xc.manifestOnly, p)
 		}
 	}
 	sort.Strings(xc.manifestOnly)
-	m.logger.Info().
+	// manifest_entries is the whole cluster's count; the other counts are
+	// the scope's when there is one.
+	ev := m.logger.Info().
 		Int("manifest_entries", len(entries)).
 		Int("listed_data_files", registrable).
 		Int("listed_and_registered", kept).
 		Int("unregistered_provisional", len(xc.unregistered)).
-		Int("manifest_only_provisional", len(xc.manifestOnly)).
-		Msg("Cluster manifest cross-check: provisional counts, re-checked at the end of the data copy")
+		Int("manifest_only_provisional", len(xc.manifestOnly))
+	if !sc.empty() {
+		ev = ev.Strs("scope", sc.names)
+	}
+	ev.Msg("Cluster manifest cross-check: provisional counts, re-checked at the end of the data copy")
 	return keep, xc, nil
 }
 
@@ -949,7 +1072,12 @@ func (m *Manager) crossCheckManifest(ctx context.Context, parquetFiles []storage
 //     manifest meanwhile was retention or compaction doing its job;
 //   - a skipped file (unreadable at copy time) that has left the manifest is
 //     counted as reconciled: not missing data.
-func (m *Manager) recheckClusterManifest(ctx context.Context, backupID string, xc *manifestCrossCheck, manifest *Manifest, dbMap map[string]*DatabaseInfo, progress *Progress, tally *skipTally, sidecar *sidecarBuilder) error {
+//
+// Scoped (#1084): the manifest-only pass copies a late arrival only when the
+// scope owns its path; the provisional list was built that way, and the
+// check is repeated here so a scoped backup can never copy another
+// database's file however the two snapshots differ.
+func (m *Manager) recheckClusterManifest(ctx context.Context, backupID string, xc *manifestCrossCheck, manifest *Manifest, dbMap map[string]*DatabaseInfo, progress *Progress, tally *skipTally, sidecar *sidecarBuilder, sc *scope) error {
 	if err := m.cluster.Sync(ctx); err != nil {
 		return fmt.Errorf("backup failed: could not sync the cluster manifest for the end-of-run check: %w", err)
 	}
@@ -1011,6 +1139,13 @@ func (m *Manager) recheckClusterManifest(ctx context.Context, backupID string, x
 	for _, p := range xc.manifestOnly {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if !sc.ownsData(p) {
+			// Defense in depth: the provisional list was already filtered by
+			// crossCheckManifest, so this never fires; it stays so a scoped
+			// backup cannot copy another database's file however the two
+			// snapshots are later reconciled.
+			continue
 		}
 		e, ok := now[p]
 		if !ok {
