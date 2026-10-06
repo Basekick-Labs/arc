@@ -242,7 +242,12 @@ type Progress struct {
 	// has no row for them: a damaged backup. The live copy, if any, is left
 	// as it was; SidecarMismatchSample names up to 32. ReplacedFiles counts
 	// the current manifest entries a replace-mode restore removed before
-	// writing. BackupUnregisteredSkipped and BackupManifestOnlyFiles mirror
+	// writing. CompactionPause is the cluster-wide compaction pause the
+	// restore holds (#1087): "waiting" while every node quiesces, "paused"
+	// while the restore runs under it, "released" once resumed, "lost" when
+	// it stopped being this restore's pause mid-run (the restore then ends
+	// failed). Empty on a standalone node and for a metadata-only restore.
+	// BackupUnregisteredSkipped and BackupManifestOnlyFiles mirror
 	// the restored backup's own cross-check counts.
 	Mode                      string     `json:"mode,omitempty"`
 	FilesRegistered           int64      `json:"files_registered,omitempty"`
@@ -251,6 +256,7 @@ type Progress struct {
 	SidecarMismatches         int64      `json:"sidecar_mismatches,omitempty"`
 	SidecarMismatchSample     []string   `json:"sidecar_mismatch_sample,omitempty"`
 	ReplacedFiles             int64      `json:"replaced_files,omitempty"`
+	CompactionPause           string     `json:"compaction_pause,omitempty"`
 	BackupUnregisteredSkipped int64      `json:"backup_unregistered_skipped,omitempty"`
 	BackupManifestOnlyFiles   int64      `json:"backup_manifest_only_files,omitempty"`
 	TotalBytes                int64      `json:"total_bytes"`

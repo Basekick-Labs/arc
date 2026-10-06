@@ -1654,6 +1654,13 @@ func main() {
 	// Initialize Cluster Coordinator (Enterprise feature)
 	// Clustering enables role-based node separation: writer, reader, compactor
 	var clusterCoordinator *cluster.Coordinator
+	// completionWatcher is the Phase 4 completion watcher, built BEFORE the
+	// coordinator starts (inside the cluster block below) so the compaction
+	// pause quiescer (#1087) can see the pending commits on disk from the
+	// first pause onward; the post-Start block only starts it. nil on every
+	// node without the watcher (no replication, compaction disabled) and when
+	// its construction failed.
+	var completionWatcher *compaction.CompletionWatcher
 	if cfg.Cluster.Enabled {
 		if licenseClient == nil {
 			log.Warn().Msg("Clustering requires enterprise license - running in standalone mode")
@@ -1765,6 +1772,61 @@ func main() {
 					// received bytes. Must be set before Start — the puller is
 					// constructed inside Start when ReplicationEnabled is true.
 					clusterCoordinator.SetStorageBackend(storageBackend)
+
+					// The cluster-wide compaction pause (#1087), wired BEFORE
+					// Start on every cluster node: a pause replayed from the
+					// Raft log fires its callback inside Start, and the
+					// schedulers above already armed cron, so the gate the
+					// cycle consults and the quiescer the ack waits on must
+					// both be in place by then. The completion watcher is
+					// built here too, before Start, because the quiescer must
+					// see the phase-2 commits already pending on disk from the
+					// first pause onward: a watcher built only after Start
+					// would let a pause replayed during Start be acked with a
+					// sources_deleted manifest still waiting, which the
+					// watcher then applies under the restore. Construction is
+					// pure (the bridge stores the coordinator pointer, the
+					// watcher reads nothing until Start); the post-Start block
+					// starts it. compactionManager is nil when compaction is
+					// disabled (the quiescer then acks at once). If Start
+					// fails below the gate stays bound to a coordinator that
+					// never ran, whose FSM holds no pause: CompactionPaused
+					// reads false.
+					expectCompletionWatcher := completionDir != "" && cfg.Compaction.Enabled
+					completionWatcherPollInterval := time.Duration(cfg.Compaction.CompletionWatcherIntervalMS) * time.Millisecond
+					if completionWatcherPollInterval <= 0 {
+						completionWatcherPollInterval = 1 * time.Second
+					}
+					if expectCompletionWatcher {
+						watcher, werr := compaction.NewCompletionWatcher(compaction.CompletionWatcherConfig{
+							Dir:          completionDir,
+							Bridge:       cluster.NewCompactionBridge(clusterCoordinator),
+							PollInterval: completionWatcherPollInterval,
+							ApplyTimeout: 5 * time.Second,
+							// Under a pause the watcher must not re-register an
+							// output_written manifest's output (a restart or a
+							// regained lease would otherwise re-issue phase 1
+							// for an output the restore has just removed);
+							// its sources_deleted applies stay ungated, they
+							// are the drain the pause ack waits for.
+							PauseGate: clusterCoordinator.CompactionPaused,
+							Logger:    logger.Get("compaction-watcher"),
+						})
+						if werr != nil {
+							// The quiescer is told a watcher was expected and
+							// never reports this node idle, so a cluster
+							// restore times out naming it rather than run with
+							// its phase-2 commits unaccounted for.
+							log.Warn().Err(werr).Msg("Failed to construct compaction completion watcher; this node will not acknowledge cluster-wide compaction pauses")
+						} else {
+							completionWatcher = watcher
+						}
+					}
+					clusterCoordinator.SetCompactionQuiescer(newCompactionQuiescer(
+						clusterCoordinator, compactionManager, completionWatcher, expectCompletionWatcher, logger.Get("compaction-pause")))
+					if compactionManager != nil {
+						compactionManager.SetPauseGate(clusterCoordinator.CompactionPaused)
+					}
 
 					if err := clusterCoordinator.Start(); err != nil {
 						log.Error().Err(err).Msg("Failed to start cluster coordinator - running in standalone mode")
@@ -1945,78 +2007,67 @@ func main() {
 						// drains any pending manifests BEFORE Raft goes away
 						// whatever its priority; PriorityCompaction - 1 keeps it
 						// after the schedulers that feed it.
-						if completionDir != "" && cfg.Compaction.Enabled {
-							bridge := cluster.NewCompactionBridge(clusterCoordinator)
-							pollInterval := time.Duration(cfg.Compaction.CompletionWatcherIntervalMS) * time.Millisecond
-							if pollInterval <= 0 {
-								pollInterval = 1 * time.Second
+						// The watcher itself was built before Start (see the
+						// compaction pause wiring above); nil when this node
+						// has none or its construction failed.
+						if completionWatcher != nil {
+							watcher := completionWatcher
+							pollInterval := completionWatcherPollInterval
+							// If this node is already the active compactor (static
+							// RoleCompactor with no failover, or failover already
+							// assigned us), start immediately. Otherwise the FSM
+							// callback will start it dynamically.
+							if capabilities.CanCompact || clusterCoordinator.IsActiveCompactor() {
+								watcher.Start(context.Background())
+								log.Info().
+									Str("completion_dir", completionDir).
+									Dur("poll_interval", pollInterval).
+									Msg("Phase 4 compaction completion watcher started")
 							}
-							watcher, werr := compaction.NewCompletionWatcher(compaction.CompletionWatcherConfig{
-								Dir:          completionDir,
-								Bridge:       bridge,
-								PollInterval: pollInterval,
-								ApplyTimeout: 5 * time.Second,
-								Logger:       logger.Get("compaction-watcher"),
-							})
-							if werr != nil {
-								log.Warn().Err(werr).Msg("Failed to construct compaction completion watcher")
-							} else {
-								// If this node is already the active compactor (static
-								// RoleCompactor with no failover, or failover already
-								// assigned us), start immediately. Otherwise the FSM
-								// callback will start it dynamically.
-								if capabilities.CanCompact || clusterCoordinator.IsActiveCompactor() {
-									watcher.Start(context.Background())
-									log.Info().
-										Str("completion_dir", completionDir).
-										Dur("poll_interval", pollInterval).
-										Msg("Phase 4 compaction completion watcher started")
-								}
 
-								shutdownCoordinator.RegisterHook("compaction-completion-watcher", func(ctx context.Context) error {
-									watcher.Stop()
-									return nil
-								}, shutdown.PriorityCompaction-1)
+							shutdownCoordinator.RegisterHook("compaction-completion-watcher", func(ctx context.Context) error {
+								watcher.Stop()
+								return nil
+							}, shutdown.PriorityCompaction-1)
 
-								// Phase 5: wire OnBecomeCompactor / OnLoseCompactor
-								// callbacks so the scheduler and watcher activate/deactivate
-								// dynamically when the compactor lease moves between nodes.
-								// Dedicated compactor nodes (CanCompact=true) keep the watcher
-								// running regardless of lease state to process orphaned manifests.
-								isDedicatedCompactor := capabilities.CanCompact
-								clusterCoordinator.SetCompactorCallbacks(
-									func() {
-										// OnBecomeCompactor: start scheduler + watcher
-										log.Info().Msg("Phase 5: this node became the active compactor — starting compaction")
-										if hourlyScheduler != nil {
-											if err := hourlyScheduler.Start(); err != nil {
-												log.Error().Err(err).Msg("Failed to start hourly scheduler after failover")
-											}
+							// Phase 5: wire OnBecomeCompactor / OnLoseCompactor
+							// callbacks so the scheduler and watcher activate/deactivate
+							// dynamically when the compactor lease moves between nodes.
+							// Dedicated compactor nodes (CanCompact=true) keep the watcher
+							// running regardless of lease state to process orphaned manifests.
+							isDedicatedCompactor := capabilities.CanCompact
+							clusterCoordinator.SetCompactorCallbacks(
+								func() {
+									// OnBecomeCompactor: start scheduler + watcher
+									log.Info().Msg("Phase 5: this node became the active compactor — starting compaction")
+									if hourlyScheduler != nil {
+										if err := hourlyScheduler.Start(); err != nil {
+											log.Error().Err(err).Msg("Failed to start hourly scheduler after failover")
 										}
-										if dailyScheduler != nil {
-											if err := dailyScheduler.Start(); err != nil {
-												log.Error().Err(err).Msg("Failed to start daily scheduler after failover")
-											}
+									}
+									if dailyScheduler != nil {
+										if err := dailyScheduler.Start(); err != nil {
+											log.Error().Err(err).Msg("Failed to start daily scheduler after failover")
 										}
-										if !isDedicatedCompactor {
-											watcher.Start(context.Background())
-										}
-									},
-									func() {
-										// OnLoseCompactor: stop scheduler + watcher
-										log.Info().Msg("Phase 5: this node lost the active compactor lease — stopping compaction")
-										if hourlyScheduler != nil {
-											hourlyScheduler.Stop()
-										}
-										if dailyScheduler != nil {
-											dailyScheduler.Stop()
-										}
-										if !isDedicatedCompactor {
-											watcher.Stop()
-										}
-									},
-								)
-							}
+									}
+									if !isDedicatedCompactor {
+										watcher.Start(context.Background())
+									}
+								},
+								func() {
+									// OnLoseCompactor: stop scheduler + watcher
+									log.Info().Msg("Phase 5: this node lost the active compactor lease — stopping compaction")
+									if hourlyScheduler != nil {
+										hourlyScheduler.Stop()
+									}
+									if dailyScheduler != nil {
+										dailyScheduler.Stop()
+									}
+									if !isDedicatedCompactor {
+										watcher.Stop()
+									}
+								},
+							)
 						}
 					}
 				}
@@ -4659,6 +4710,19 @@ func (g *compactionClusterGate) CanCompact() bool {
 	return g.capabilities.CanCompact
 }
 
+// CompactionPauseReason implements the scheduler's optional pauseReporter
+// (#1087): the cluster-wide compaction pause in force, or "" when compaction
+// is not paused or there is no coordinator. Deliberately NOT folded into
+// CanCompact: Scheduler.Start treats a false CanCompact as permanent role
+// gating and never arms cron, so a node that took the compactor lease during
+// a pause would stay idle after the resume.
+func (g *compactionClusterGate) CompactionPauseReason() string {
+	if g.coordinator == nil {
+		return ""
+	}
+	return g.coordinator.CompactionPauseReason()
+}
+
 // Role returns the node's role string for log messages.
 func (g *compactionClusterGate) Role() string {
 	return string(g.role)
@@ -4802,6 +4866,87 @@ func (b *backupClusterManifest) Sync(ctx context.Context) error {
 // LocalNodeID is the origin stamped on every entry BatchRegister builds.
 func (b *backupClusterManifest) LocalNodeID() string {
 	return b.coordinator.LocalNodeID()
+}
+
+// PauseCompaction takes the cluster-wide compaction pause for a restore
+// (#1087). The coordinator handle satisfies backup.CompactionPause; a nil
+// interface is returned on error so the manager never holds a typed nil.
+func (b *backupClusterManifest) PauseCompaction(ctx context.Context, reason string) (backup.CompactionPause, error) {
+	if !b.coordinator.HasRaft() {
+		return nil, errNoRaftManifest
+	}
+	h, err := b.coordinator.PauseCompaction(ctx, reason)
+	if err != nil {
+		return nil, err
+	}
+	return h, nil
+}
+
+// newCompactionQuiescer builds the hook the coordinator runs on this node
+// when a cluster-wide compaction pause lands (#1087). It returns once no
+// compaction cycle is running and the completion watcher has no
+// sources_deleted manifest left to commit, polling every 250 ms; the cycle
+// stops at its next batch boundary on its own (the pause gate) and the
+// watcher keeps applying during the pause, which is the drain. It returns an
+// error when ctx ends or when the pause ends before this node quiesced, so
+// the coordinator does not ack a pause that is no longer in force.
+//
+// Once no cycle is running no subprocess is alive (the cycle finalizer waits
+// for every worker, each waits for its subprocess), so an output_written
+// manifest still pending at that point is stuck: its subprocess died between
+// the two commit phases and nothing advances it. It is logged with its job
+// IDs and does not hold the ack: the watcher will not delete its inputs from
+// the manifest, so it cannot race the restore.
+//
+// manager and watcher may each be nil (compaction disabled; the watcher is
+// built only with replication): a node with neither quiesces at once. When
+// expectWatcher is true (this node runs compaction with replication, so its
+// commits go through a watcher) and the watcher is nil, its construction
+// failed: the node then NEVER reports idle, because nothing can tell whether
+// a phase-2 commit is pending, and the restore times out naming it.
+func newCompactionQuiescer(coordinator *cluster.Coordinator, manager *compaction.Manager, watcher *compaction.CompletionWatcher, expectWatcher bool, logger zerolog.Logger) func(ctx context.Context) error {
+	return func(ctx context.Context) error {
+		if expectWatcher && watcher == nil {
+			return errors.New("compaction completion watcher not available on this node, so its pending compaction commits cannot be checked; the node will not acknowledge the pause")
+		}
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		warnedStuck := false
+		for {
+			if coordinator != nil && !coordinator.CompactionPaused() {
+				return errors.New("the compaction pause ended before this node quiesced")
+			}
+			idle := manager == nil || !manager.IsCycleRunning()
+			if idle {
+				if w := watcher; w != nil {
+					sourcesDeleted, outputWritten, err := w.PendingCommits()
+					if err != nil {
+						return fmt.Errorf("could not read the pending compaction commits: %w", err)
+					}
+					if sourcesDeleted > 0 {
+						idle = false
+					} else if len(outputWritten) > 0 && !warnedStuck {
+						warnedStuck = true
+						logger.Warn().
+							Strs("job_ids", outputWritten).
+							Msg("Compaction completion manifests are stuck at output_written with no cycle running: their subprocess ended between the two commit phases, nothing advances them and the inputs they name stay registered. They do not hold up the compaction pause")
+					}
+				}
+			}
+			if idle {
+				return nil
+			}
+			select {
+			case <-ctx.Done():
+				detail := "a compaction cycle is still running"
+				if manager == nil || !manager.IsCycleRunning() {
+					detail = "sources_deleted completion manifests are still pending"
+				}
+				return fmt.Errorf("compaction did not quiesce before the deadline (%s): %w", detail, ctx.Err())
+			case <-ticker.C:
+			}
+		}
+	}
 }
 
 // ManifestFiles returns the hot data-file entries of the manifest, one FSM

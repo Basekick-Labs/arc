@@ -113,12 +113,13 @@ manifest-only files) or by what is in backup storage, and when more than 10%
 of the data files the backup node listed were unregistered at backup time,
 which means the backup was taken against a stale or partial manifest view. A
 path in the backup whose object cannot be read keeps its current bytes and
-entry. **Disable compaction, or stop the compactor, for the duration of a
-`replace` restore**: a compaction job finishing on a restored database can
-manifest-delete inputs whose output the restore has just replaced, with no
-check that the output is still there; the restore logs this warning when it
-starts, and a cluster-wide compaction pause is tracked as a follow-up.
-Standalone nodes refuse `mode: "replace"` with 400.
+entry. A compaction job finishing on a restored database could manifest-delete
+inputs whose output the restore has just replaced, with no check that the
+output is still there; compaction is now paused cluster-wide for the duration
+of every cluster restore, automatically (see
+[#1087](https://github.com/Basekick-Labs/arc/issues/1087) below), so the
+operator no longer has to disable it or stop the compactor. Standalone nodes
+refuse `mode: "replace"` with 400.
 
 On a cluster node `restore_metadata` now defaults to false and an explicit
 `true` is refused with 400, as is `restore_config: true`: the SQLite database
@@ -129,6 +130,96 @@ node's state. A client that sends `restore_metadata: true` explicitly by
 default will be refused on every cluster node and must stop sending it. A
 standalone config restore still writes the literal `arc.toml` in the working
 directory, not the path the server was started with.
+
+### Cluster restores pause compaction cluster-wide ([#1087](https://github.com/Basekick-Labs/arc/issues/1087))
+
+Compaction commits in two Raft phases on the compactor: the output is
+registered when it is written, and the inputs are manifest-deleted on a later
+watcher tick, after the compaction subprocess has already deleted them from
+storage, with no check in between that the output is still in the manifest. A
+cluster restore whose manifest snapshot fell between the two phases raced the
+job. A `replace` restore removed the compacted output (it is not in the
+backup) and re-registered the backup's inputs, and the late phase then
+manifest-deleted those inputs on every node, leaving the partition empty; in
+either mode the late phase could unlink a freshly restored input in the short
+gap before its batched register, leaving a manifest entry whose file no node
+holds. Stage 0 of the backup work asked the operator to disable compaction or
+stop the compactor for a `replace` restore.
+
+Every cluster restore, `merge` and `replace`, now pauses compaction
+cluster-wide before its first manifest read and releases the pause after its
+last register. The restoring primary proposes the pause through Raft; every
+node, readers included, stops starting compaction batches at once, lets the
+batch it is running finish (a compaction subprocess is never killed for the
+pause: a kill between its two commit phases is exactly the state the pause
+exists to prevent), drains the manifest commits it has pending, and
+acknowledges. The restore starts only once every node in the cluster node
+table has acknowledged, and fails after 10 minutes naming the nodes that did
+not: a long batch may still be running on them, they hold compaction commits
+their completion watcher is not applying, or they are not on this release.
+**Every node of a cluster must run 27.01.1 for a cluster restore**: an older
+Raft leader refuses the pause outright and the restore fails at once with a
+clear error; an older compactor never acknowledges and the restore fails on
+the timeout. A node the RESTORING node's own registry has marked unhealthy or
+dead since that node started is not waited for; a node in the cluster node
+table that the restoring node has not heard from (for example right after the
+restoring node restarted, or a node whose leave never reached the leader) is
+waited for, and the restore fails after 10 minutes naming it until an operator
+removes it from the cluster. One exception to the unhealthy/dead skip: the
+node holding the compactor lease, and every node whose role can compact
+(compactor, standalone) while no lease is assigned, is always waited for,
+because those are the nodes that run compaction. A dead dedicated compactor
+therefore fails every cluster restore on the 10-minute timeout, naming it;
+remove it from the cluster, or let the lease move, before restoring. One more
+case fails closed the same way: a node that held the compactor lease, lost it
+while a compaction job had deleted its inputs from storage but not yet from
+the manifest (a `sources_deleted` completion manifest still pending), stops
+its completion watcher on the lease loss and so never drains that commit; it
+never acknowledges a pause, and every cluster restore fails on the timeout
+naming it. Move the lease back to that node (or restart it, when it is a
+dedicated compactor) so its watcher applies the pending commit, then restore.
+
+The pause carries a six-minute expiry from the requester's clock and the
+restoring node refreshes it every 30 seconds while it runs, so a restore whose
+process dies releases compaction within six minutes with no operator action
+(six minutes, not less, because every node judges the expiry by its own clock
+and the cluster tolerates up to five minutes of skew between nodes). During
+those six minutes a restore started from another node is refused with
+`compaction is already paused by <node> (restore <id>) until <time>` and
+succeeds once the expiry has passed; the same node may retry at once, since a
+requester takes over its own pause. If the pause stops being the restore's own
+while it runs (another node took over an expired pause, or it could not be
+refreshed until it expired), the restore stops at its next manifest batch and ends `failed` saying so, because
+a compaction job may have raced it; take a fresh backup and restore again. On
+a node that acquires the compactor lease during a pause, or a dedicated
+compactor that restarts during one, the scheduler still arms itself and the
+first tick after the resume runs. Compaction state is unchanged for standalone
+nodes and for cluster nodes without a Raft manifest, where no pause is taken.
+
+What operators see: restore progress (`GET /api/v1/backup/status`) carries a
+`compaction_pause` field, `waiting` while the nodes quiesce, `paused` while
+the restore runs, `released` once resumed, `lost` when the restore failed for
+that reason; `GET /api/v1/cluster` carries a `compaction_pause` object
+with the active flag, the requesting node, the reason (`restore <backup-id>`),
+the expiry, the node IDs that have acknowledged (`acks`) and those the
+requester is still waiting for (`pending_acks`); `GET
+/api/v1/compaction/stats` carries `paused`, and a cycle that stopped for the
+pause records the status `paused`. `POST /api/v1/compaction/trigger` answers
+**409** `compaction is paused cluster-wide` while a pause is in force, and a
+scheduled cycle that falls inside one is skipped at Info, not logged as a
+failure. The `replace` restore's start-up warning that asked the operator to
+disable compaction is gone.
+
+Not in this release: backups do not pause compaction (a backup taken during a
+compaction commit still has the residual window described under #1083), and
+there are no operator endpoints to pause or resume compaction by hand; the
+pause is taken and released by restores only. One residual window remains on
+a node that acknowledged a pause and then restarts while it is in force: its
+acknowledgement is already recorded, so it is not asked to quiesce again, and
+in the seconds between its compaction scheduler arming and its Raft state
+catching up with the leader it does not yet see the pause, so a scheduled
+tick landing exactly then could start a cycle. Avoid restarting compactor
+nodes during a cluster restore.
 
 ### The measurement endpoint's `where` parameter no longer rejects values that contain SQL words ([#987](https://github.com/Basekick-Labs/arc/issues/987))
 

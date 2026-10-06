@@ -89,6 +89,31 @@ type ClusterManifest interface {
 	// BatchDelete removes paths from the manifest as one Raft entry, stamped
 	// with reason. Same chunking and failure semantics as BatchRegister.
 	BatchDelete(ctx context.Context, paths []string, reason string) error
+	// PauseCompaction pauses compaction cluster-wide for reason and returns
+	// once every node has acknowledged that it has no compaction batch in
+	// flight and no phase-2 manifest commit pending (#1087). Every cluster
+	// restore takes it before its first manifest read and releases it with
+	// Resume after its last register; the pause stays in force on its own
+	// only for a bounded TTL, refreshed while the handle lives, so a restore
+	// that dies releases compaction without operator action. An error means
+	// the restore must not start: another node holds a pause, a node did not
+	// ack in time, or no leader could be reached.
+	PauseCompaction(ctx context.Context, reason string) (CompactionPause, error)
+}
+
+// CompactionPause is a cluster-wide compaction pause the restore holds.
+type CompactionPause interface {
+	// Lost reports whether the pause stopped being this restore's while held
+	// (another requester took over an expired pause, a refresh failed until
+	// it expired, or it was resumed), with the reason. The restore checks it
+	// between manifest batches and before declaring success, and fails when
+	// it is lost, because a compaction job may have run meanwhile.
+	Lost() (bool, error)
+	// Resume releases the pause. Idempotent. On a lost pause the release is
+	// still attempted, best effort (the record may still be this generation,
+	// expired with no leader reachable, and clearing it is correct; a stale
+	// generation is refused by the FSM), and nil is returned either way.
+	Resume(ctx context.Context) error
 }
 
 // TierRecorder receives one report per data file a restore writes, so this
