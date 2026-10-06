@@ -116,6 +116,19 @@ type Coordinator struct {
 	onBecomeCompactor func()
 	onLoseCompactor   func()
 
+	// compactionQuiescer is main.go's hook for the cluster-wide compaction
+	// pause (#1087): it returns once this node has no compaction batch in
+	// flight and no phase-2 commit pending, or an error when the pause ended
+	// first. nil means this node has nothing to quiesce (no compaction) and
+	// acks at once. Set before Start; read by quiesceAndAck under mu.
+	compactionQuiescer func(ctx context.Context) error
+	// compactionPauseAckInFlight holds the pause generations a quiesceAndAck
+	// is currently running for, under mu, so the two paths that can start
+	// one for the same generation (the FSM callback during log replay in
+	// Start, and ackCompactionPauseIfActive right after it) run the quiescer
+	// and propose the ack once. Lazily allocated; nil until the first pause.
+	compactionPauseAckInFlight map[uint64]struct{}
+
 	// WAL Replication (Phase 3.3)
 	replicationSender   *replication.Sender   // Writer only: sends entries to readers
 	replicationReceiver *replication.Receiver // Reader only: receives entries from writer
@@ -427,6 +440,11 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 			func(id string) { c.onRaftNodeRemoved(id) },
 			func(n *raft.NodeInfo) { c.onRaftNodeUpdated(n) },
 		)
+		// The cluster-wide compaction pause (#1087). Same lock rule as the
+		// callbacks above: this only spawns a goroutine.
+		c.raftFSM.SetCompactionPauseCallback(func(paused bool, generation uint64) {
+			c.onCompactionPauseChanged(paused, generation)
+		})
 
 		raftCfg := &raft.NodeConfig{
 			NodeID:            nodeID,
@@ -662,6 +680,11 @@ func (c *Coordinator) Start() error {
 		// registry. That is #858's worst case, and it is deterministic in a
 		// cluster whose only voter is the node being restarted.
 		go c.registerSelfInFSMWhenLeader()
+
+		// A compaction pause restored from the local snapshot at startup
+		// fires no callback (#1087); quiesce and ack it once a leader is
+		// known. Idempotent with the callback path.
+		go c.ackCompactionPauseIfActive()
 	}
 
 	// Wire the peer file replication puller (Enterprise Phase 2). This runs
@@ -2849,6 +2872,12 @@ func (c *Coordinator) Status() map[string]interface{} {
 		leaseStatus["preemption"] = preempt
 	}
 	status["active_compactor"] = leaseStatus
+
+	// The cluster-wide compaction pause a restore takes (#1087): who holds
+	// it, until when, and which nodes have acknowledged it.
+	if c.raftFSM != nil {
+		status["compaction_pause"] = c.CompactionPauseStatus()
+	}
 
 	// Add Raft status if configured (Phase 3)
 	if c.raftNode != nil {

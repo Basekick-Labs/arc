@@ -182,8 +182,47 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 	}
 
 	// ── 2. Restore data files ───────────────────────────────────────────
+	// On a cluster node under the cluster-wide compaction pause (#1087), both
+	// modes: compaction commits in two Raft phases on the compactor, and a
+	// job whose phase 2 lands during the restore manifest-deletes inputs the
+	// restore has just registered (replace) or unlinks a freshly written
+	// input before its batched register (both modes). The pause returns once
+	// every node has quiesced; it is released by the deferred resume AFTER
+	// the final Lost check below, with a fresh context because the run's own
+	// may be done by then. The pause expires on its own within its TTL if
+	// this process dies, so a failed resume is a warning, not a failure.
+	var pause CompactionPause
+	if opts.RestoreData && m.cluster != nil {
+		progress.CompactionPause = "waiting"
+		m.setProgress(progress)
+		p, err := m.cluster.PauseCompaction(ctx, "restore "+opts.BackupID)
+		if err != nil {
+			err = fmt.Errorf("restore refused: compaction could not be paused cluster-wide: %w", err)
+			progress.Status = "failed"
+			progress.Error = err.Error()
+			return nil, err
+		}
+		pause = p
+		progress.CompactionPause = "paused"
+		m.setProgress(progress)
+		m.logger.Info().Str("backup_id", opts.BackupID).Str("mode", mode).Msg("Compaction is paused cluster-wide for this restore; every node has acknowledged")
+		// Registered after the progress-publishing defer at the top of this
+		// function, so it runs BEFORE it (LIFO): the final published
+		// snapshot carries the "released" state this writes.
+		defer func() {
+			rctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := pause.Resume(rctx); err != nil {
+				m.logger.Warn().Err(err).Str("backup_id", opts.BackupID).Msg("Could not release the cluster-wide compaction pause; it expires on its own within six minutes")
+				return
+			}
+			if progress.CompactionPause != "lost" {
+				progress.CompactionPause = "released"
+			}
+		}()
+	}
 	if opts.RestoreData {
-		if err := m.restoreDataFiles(ctx, opts.BackupID, manifest, progress, mode); err != nil {
+		if err := m.restoreDataFiles(ctx, opts.BackupID, manifest, progress, mode, pause); err != nil {
 			progress.Status = "failed"
 			progress.Error = err.Error()
 			return nil, err
@@ -225,6 +264,15 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 	// Decided after the metadata and config steps so those are staged even
 	// when the data set has a gap: an operator recovering a node wants both.
 	duration := time.Since(startTime)
+	// The pause must still have been this restore's up to the last register
+	// (#1087); the between-batch checks cover the run, this one its tail.
+	if err := checkCompactionPauseLost(pause, progress); err != nil {
+		progress.Status = "failed"
+		progress.Error = err.Error()
+		m.setProgress(progress)
+		m.logger.Error().Err(err).Str("backup_id", opts.BackupID).Msg("Restore failed: the cluster-wide compaction pause was lost")
+		return nil, err
+	}
 	skipped := atomic.LoadInt64(&progress.SkippedFiles)
 	missing := progress.MissingFiles
 	unaddressable := progress.UnaddressableFiles
@@ -292,6 +340,22 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 	return &RestoreResult{Manifest: manifest, Duration: duration}, nil
 }
 
+// checkCompactionPauseLost fails the restore when the cluster-wide compaction
+// pause it holds has stopped being its own (#1087): a compaction job may have
+// run on the restored data meanwhile, so the restored set cannot be trusted.
+// nil pause (standalone, or a restore without data) passes.
+func checkCompactionPauseLost(pause CompactionPause, progress *Progress) error {
+	if pause == nil {
+		return nil
+	}
+	lost, cause := pause.Lost()
+	if !lost {
+		return nil
+	}
+	progress.CompactionPause = "lost"
+	return fmt.Errorf("restore failed: the cluster-wide compaction pause was lost (%v); a compaction job may have raced this restore, so take a fresh backup and restore again", cause)
+}
+
 // restoreDataFiles copies parquet files from the backup back into data storage.
 //
 // Backup objects that cannot be read are skipped, counted, and sampled; every
@@ -304,8 +368,10 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 // replace mode the current manifest entries of each restored database are
 // removed first. See restoreRegistration and replaceDatabases. Every data
 // file written is also reported to this node's tier metadata when tiering is
-// on, standalone or clustered.
-func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifest *Manifest, progress *Progress, mode string) error {
+// on, standalone or clustered. pause is the cluster-wide compaction pause the
+// caller holds for the run (#1087), nil on a standalone node; it is checked
+// before every manifest write.
+func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifest *Manifest, progress *Progress, mode string, pause CompactionPause) error {
 	dataPrefix := backupID + "/data/"
 
 	files, err := m.backupStorage.List(ctx, dataPrefix)
@@ -417,9 +483,10 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifes
 			entries:  entries,
 			existing: existing,
 			overhead: registerOpOverhead(len(m.cluster.LocalNodeID())),
+			pause:    pause,
 		}
 		if mode == RestoreModeReplace {
-			if err := m.replaceDatabases(ctx, manifest, files, dataPrefix, skipInputs, current, progress); err != nil {
+			if err := m.replaceDatabases(ctx, manifest, files, dataPrefix, skipInputs, current, progress, pause); err != nil {
 				return err
 			}
 		}
@@ -564,6 +631,9 @@ type restoreRegistration struct {
 	overhead int // registerOpOverhead for this node's ID
 	pending  []ManifestFile
 	batch    opBatcher
+	// pause is the cluster-wide compaction pause held for the run (#1087),
+	// checked before every register batch.
+	pause CompactionPause
 }
 
 // pendingRegistration is a data file's sidecar row, looked up before the file
@@ -627,6 +697,19 @@ func (m *Manager) flushRegistrations(ctx context.Context, reg *restoreRegistrati
 	if len(reg.pending) == 0 {
 		return nil
 	}
+	// A batch registered after the pause was lost could be the one a
+	// resumed compaction job races (#1087); the files of this batch are then
+	// written but unregistered, which registration_failed reports below.
+	if err := checkCompactionPauseLost(reg.pause, progress); err != nil {
+		paths := make([]string, len(reg.pending))
+		for i, f := range reg.pending {
+			paths[i] = f.Path
+		}
+		progress.RegistrationFailed += int64(len(reg.pending))
+		progress.RegistrationFailedSample = appendSample(progress.RegistrationFailedSample, paths)
+		m.setProgress(progress)
+		return err
+	}
 	batch := reg.pending
 	if err := m.cluster.BatchRegister(ctx, batch); err != nil {
 		paths := make([]string, len(batch))
@@ -686,12 +769,12 @@ func appendSample(sample, paths []string) []string {
 // against a stale or partial manifest view and describes much less than the
 // node held, the way checkSkipRatio treats a run that skipped too much.
 //
-// A compaction job finishing on a restored database while this runs can
+// A compaction job finishing on a restored database while this runs would
 // manifest-delete inputs whose output the restore has just replaced, with no
 // check that the output is still there (the watcher commits in two phases);
-// stage 0 asks the operator to pause compaction for the duration, and logs
-// that at the start.
-func (m *Manager) replaceDatabases(ctx context.Context, manifest *Manifest, files []string, dataPrefix string, skipInputs map[string]bool, current []ManifestFile, progress *Progress) error {
+// the caller holds the cluster-wide compaction pause for the run (#1087), and
+// pause is checked before every delete chunk.
+func (m *Manager) replaceDatabases(ctx context.Context, manifest *Manifest, files []string, dataPrefix string, skipInputs map[string]bool, current []ManifestFile, progress *Progress, pause CompactionPause) error {
 	unreconciled := manifest.SkippedFiles - manifest.SkippedReconciled
 	if unreconciled > 0 || manifest.UnaddressableFiles > 0 || manifest.ManifestOnlyFiles > 0 ||
 		progress.MissingFiles > 0 || progress.UnaddressableFiles > 0 {
@@ -703,10 +786,10 @@ func (m *Manager) replaceDatabases(ctx context.Context, manifest *Manifest, file
 		return fmt.Errorf("restore refused: mode replace would remove the current files of %d databases, and %d of the %d data files the backup node listed were not in its cluster manifest (>%.0f%%), so the backup was taken against a stale or partial manifest view and holds much less than that node did; use mode merge, or take the backup again on a caught-up primary",
 			len(manifest.Databases), manifest.UnregisteredSkipped, listed, maxSkipRatio*100)
 	}
-	m.logger.Warn().
+	m.logger.Info().
 		Str("backup_id", manifest.BackupID).
 		Int("databases", len(manifest.Databases)).
-		Msg("Replace mode restore starting: disable compaction, or stop the compactor, until it completes. A compaction job finishing on a restored database can manifest-delete inputs whose output this restore has just replaced")
+		Msg("Replace mode restore starting under the cluster-wide compaction pause: no compaction job can commit on the restored databases until it completes")
 	databases := make(map[string]bool, len(manifest.Databases))
 	for _, db := range manifest.Databases {
 		databases[db.Name] = true
@@ -744,6 +827,9 @@ func (m *Manager) replaceDatabases(ctx context.Context, manifest *Manifest, file
 			return err
 		}
 		chunk := paths[c[0]:c[1]]
+		if err := checkCompactionPauseLost(pause, progress); err != nil {
+			return fmt.Errorf("restore aborted with %d current files of the restored databases already removed from the manifest and none written: %w", progress.ReplacedFiles, err)
+		}
 		if err := m.cluster.BatchDelete(ctx, chunk, restoreReplaceReason); err != nil {
 			return fmt.Errorf("restore aborted before any file was written: the cluster manifest refused to remove %d current files of the restored databases (%d already removed): %w", len(chunk), progress.ReplacedFiles, err)
 		}

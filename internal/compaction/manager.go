@@ -18,6 +18,13 @@ import (
 // ErrCycleAlreadyRunning is returned when attempting to start a compaction cycle while one is already in progress
 var ErrCycleAlreadyRunning = errors.New("compaction cycle already running")
 
+// ErrCompactionPaused is returned by a cycle that did not start, or stopped
+// at a batch boundary, because compaction is paused cluster-wide (#1087): a
+// cluster restore holds the pause while it rewrites the manifest. Batches
+// already running finish first; the cycle status is "paused". Not an error
+// for the scheduler, which logs it at Info.
+var ErrCompactionPaused = errors.New("compaction is paused cluster-wide")
+
 // cycleOutcome records only eligible batches actually discovered during
 // this cycle. Unvisited measurements are never counted as unstarted work.
 type cycleOutcome struct {
@@ -129,9 +136,34 @@ type Manager struct {
 	// runner without starting an external compaction subprocess.
 	compactBatchForTest func(context.Context, Candidate) error
 
+	// pauseGate, when set, reports whether compaction is paused cluster-wide
+	// (#1087); main.go wires it to the cluster coordinator. Consulted at
+	// cycle start, before every worker launch and between the batches of a
+	// partition. nil (OSS, no cluster) means never paused. Lock-free so the
+	// hot loop and Stats (which holds mu) can both read it.
+	pauseGate atomic.Pointer[func() bool]
+
 	lastCycle cycleOutcome
 	logger    zerolog.Logger
 	mu        sync.Mutex
+}
+
+// SetPauseGate wires the cluster-wide compaction pause (#1087). The gate is
+// read before every batch, so it must be cheap: the coordinator's is one FSM
+// read and a clock comparison.
+func (m *Manager) SetPauseGate(gate func() bool) {
+	if gate == nil {
+		m.pauseGate.Store(nil)
+		return
+	}
+	m.pauseGate.Store(&gate)
+}
+
+// Paused reports whether compaction is paused cluster-wide. False when no
+// gate is wired (OSS, standalone, a cluster without a Raft manifest).
+func (m *Manager) Paused() bool {
+	gate := m.pauseGate.Load()
+	return gate != nil && (*gate)()
 }
 
 // ManagerConfig holds configuration for creating a compaction manager
@@ -1038,6 +1070,11 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 	var failed atomic.Int64
 	var interrupted atomic.Int64
 	var discoveryErrors atomic.Int64
+	// pausedSkipped is set by a partition goroutine that stopped between two
+	// of its batches because compaction was paused (#1087). The goroutine
+	// cannot set runErr, and the dispatch loop may already be waiting at the
+	// end of the tier, so it is checked there.
+	var pausedSkipped atomic.Bool
 
 	// This finalizer also covers every early return. Active workers finish
 	// before the cycle is recorded and before cycleRunning is released.
@@ -1065,6 +1102,8 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 			status = "timed_out"
 		case errors.Is(ctx.Err(), context.Canceled):
 			status = "cancelled"
+		case errors.Is(runErr, ErrCompactionPaused):
+			status = "paused"
 		case runErr != nil:
 			status = "failed"
 		}
@@ -1103,6 +1142,13 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 	}()
 	if err := ctx.Err(); err != nil {
 		return cycleID, err
+	}
+	// The cluster-wide compaction pause (#1087): a cycle that starts while a
+	// restore holds it would stop at its first batch boundary anyway, so it
+	// does not start. Recorded as a "paused" cycle so Stats shows why.
+	if m.Paused() {
+		m.logger.Info().Int64("cycle_id", cycleID).Msg("Compaction cycle not started: compaction is paused cluster-wide")
+		return cycleID, ErrCompactionPaused
 	}
 
 	// Require explicit tier names
@@ -1264,6 +1310,19 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 					return cycleID, ctx.Err()
 				default:
 				}
+				// The cluster-wide compaction pause (#1087) also ends
+				// discovery: the node acks the pause only once this cycle
+				// has ended, and listing every remaining measurement of a
+				// large store first would hold that ack for minutes.
+				if m.Paused() {
+					m.logger.Info().
+						Int64("cycle_id", cycleID).
+						Str("tier", tierName).
+						Str("database", database).
+						Msg("Compaction cycle stopping between measurements: compaction is paused cluster-wide")
+					wg.Wait()
+					return cycleID, ErrCompactionPaused
+				}
 
 				candidates, err := tier.FindCandidates(ctx, database, meas)
 				if err != nil {
@@ -1356,6 +1415,27 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 						wg.Wait()
 						return cycleID, err
 					}
+					// The cluster-wide compaction pause (#1087): no new worker
+					// while a restore holds it. Checked here, with capacity in
+					// hand, because the pause lands while this waits behind a
+					// running batch. Workers already running finish their
+					// current batch (a subprocess is never killed for the
+					// pause: a kill between its two commit phases leaves the
+					// manifest and storage disagreeing), so the cycle waits for
+					// them and ends "paused"; the batch just discovered counts
+					// as unstarted. Sub-batch splitting inside
+					// compactFilesAdaptively does not see the gate: those are
+					// one job's inputs and splitting them is part of running it.
+					if m.Paused() {
+						<-sem
+						m.logger.Info().
+							Int64("cycle_id", cycleID).
+							Str("tier", tierName).
+							Str("partition", candidate.PartitionPath).
+							Msg("Compaction cycle stopping at a batch boundary: compaction is paused cluster-wide")
+						wg.Wait()
+						return cycleID, ErrCompactionPaused
+					}
 					wg.Add(1)
 					active.Add(1)
 
@@ -1369,6 +1449,14 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 
 						for _, batch := range partitionBatches {
 							if ctx.Err() != nil {
+								return
+							}
+							// Between two batches of one partition the pause
+							// (#1087) applies too; the remaining batches stay
+							// unstarted and the tier end turns this into
+							// ErrCompactionPaused.
+							if m.Paused() {
+								pausedSkipped.Store(true)
 								return
 							}
 							// Count a batch only when its execution actually starts.
@@ -1410,6 +1498,13 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 		wg.Wait()
 		if err := ctx.Err(); err != nil {
 			return cycleID, err
+		}
+		if pausedSkipped.Load() {
+			m.logger.Info().
+				Int64("cycle_id", cycleID).
+				Str("tier", tierName).
+				Msg("Compaction cycle ended at a batch boundary: compaction is paused cluster-wide")
+			return cycleID, ErrCompactionPaused
 		}
 
 		if tierCandidateCount == 0 {
@@ -1663,6 +1758,7 @@ func (m *Manager) Stats() map[string]interface{} {
 		"cycle_running":           m.cycleRunning.Load(),
 		"current_cycle_id":        m.cycleID.Load(),
 		"exclude_databases":       excluded,
+		"paused":                  m.Paused(),
 		"last_cycle": map[string]interface{}{
 			"cycle_id":            m.lastCycle.CycleID,
 			"status":              m.lastCycle.Status,
