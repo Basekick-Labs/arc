@@ -9,16 +9,46 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
+
+type databasesTestCoordinator struct {
+	primary     bool
+	role        string
+	manifest    []*raft.FileEntry
+	batchSizes  []int
+	deletedPath []string
+	batchErr    error
+}
+
+func (c *databasesTestCoordinator) BatchFileOpsInManifest(ops []raft.BatchFileOp) error {
+	c.batchSizes = append(c.batchSizes, len(ops))
+	for _, op := range ops {
+		var payload raft.DeleteFilePayload
+		if err := json.Unmarshal(op.Payload, &payload); err != nil {
+			return err
+		}
+		c.deletedPath = append(c.deletedPath, payload.Path)
+	}
+	return c.batchErr
+}
+
+func (c *databasesTestCoordinator) GetFileManifestByDatabase(string) []*raft.FileEntry {
+	return c.manifest
+}
+
+func (c *databasesTestCoordinator) IsPrimaryWriter() bool { return c.primary }
+func (c *databasesTestCoordinator) Role() string          { return c.role }
 
 // countingBackend wraps a storage backend to count operations
 type countingBackend struct {
@@ -438,6 +468,114 @@ func TestDatabasesHandler_Delete(t *testing.T) {
 			t.Error("Expected database files to be deleted")
 		}
 	})
+}
+
+func TestDatabasesHandler_DeleteClusterRequiresPrimaryWriter(t *testing.T) {
+	handler, app, tmpDir := setupTestDatabasesHandler(t, true)
+	defer os.RemoveAll(tmpDir)
+
+	ctx := context.Background()
+	backend, err := storage.NewLocalBackend(tmpDir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	if err := backend.Write(ctx, "clusterdb/cpu/data.parquet", []byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	coordinator := &databasesTestCoordinator{role: "reader", manifest: []*raft.FileEntry{{Path: "clusterdb/cpu/data.parquet"}}}
+	handler.SetCoordinator(coordinator)
+
+	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/clusterdb?confirm=true", nil), testRequestTimeoutMS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != fiber.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, fiber.StatusServiceUnavailable)
+	}
+	exists, err := backend.Exists(ctx, "clusterdb/cpu/data.parquet")
+	if err != nil || !exists {
+		t.Fatalf("file exists = %v, err = %v; non-primary request must leave storage untouched", exists, err)
+	}
+	if len(coordinator.batchSizes) != 0 {
+		t.Fatalf("manifest batches = %v, want none", coordinator.batchSizes)
+	}
+}
+
+func TestDatabasesHandler_DeleteUpdatesClusterManifestInBatches(t *testing.T) {
+	handler, app, tmpDir := setupTestDatabasesHandler(t, true)
+	defer os.RemoveAll(tmpDir)
+
+	ctx := context.Background()
+	backend, err := storage.NewLocalBackend(tmpDir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	if err := backend.Write(ctx, "clusterdb/cpu/local.parquet", []byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	manifest := make([]*raft.FileEntry, 1001)
+	for i := range manifest {
+		manifest[i] = &raft.FileEntry{Path: fmt.Sprintf("clusterdb/cpu/replica-%d.parquet", i)}
+	}
+	manifest = append(manifest, &raft.FileEntry{Path: "anotherdb/cpu/untouched.parquet"})
+	coordinator := &databasesTestCoordinator{primary: true, role: "primary", manifest: manifest}
+	handler.SetCoordinator(coordinator)
+
+	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/clusterdb?confirm=true", nil), testRequestTimeoutMS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != fiber.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d: %s", resp.StatusCode, fiber.StatusOK, body)
+	}
+	if len(coordinator.batchSizes) != 2 || coordinator.batchSizes[0] != 1000 || coordinator.batchSizes[1] != 1 {
+		t.Fatalf("manifest batch sizes = %v, want [1000 1]", coordinator.batchSizes)
+	}
+	if len(coordinator.deletedPath) != 1001 {
+		t.Fatalf("manifest delete paths = %d, want 1001", len(coordinator.deletedPath))
+	}
+	for _, path := range coordinator.deletedPath {
+		if !strings.HasPrefix(path, "clusterdb/") {
+			t.Errorf("unexpected manifest delete path %q", path)
+		}
+	}
+}
+
+func TestDatabasesHandler_DeleteAbortsWhenClusterManifestUpdateFails(t *testing.T) {
+	handler, app, tmpDir := setupTestDatabasesHandler(t, true)
+	defer os.RemoveAll(tmpDir)
+
+	ctx := context.Background()
+	backend, err := storage.NewLocalBackend(tmpDir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	if err := backend.Write(ctx, "clusterdb/cpu/data.parquet", []byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	coordinator := &databasesTestCoordinator{
+		primary:  true,
+		role:     "primary",
+		manifest: []*raft.FileEntry{{Path: "clusterdb/cpu/data.parquet"}},
+		batchErr: fmt.Errorf("raft quorum unavailable"),
+	}
+	handler.SetCoordinator(coordinator)
+
+	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/clusterdb?confirm=true", nil), testRequestTimeoutMS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != fiber.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, fiber.StatusInternalServerError)
+	}
+	exists, err := backend.Exists(ctx, "clusterdb/cpu/data.parquet")
+	if err != nil || !exists {
+		t.Fatalf("file exists = %v, err = %v; manifest failure must abort local deletion", exists, err)
+	}
 }
 
 // TestDatabasesHandler_DeleteDisabled tests deleting when delete is disabled

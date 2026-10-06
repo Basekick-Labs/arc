@@ -2,12 +2,14 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/fieldschema"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -26,7 +28,21 @@ type DatabasesHandler struct {
 	logger         zerolog.Logger
 	icebergDropper IcebergCatalogDropper
 	fieldSchema    *fieldschema.Registry // optional, #914: anchors die with their database
+	coordinator    DatabasesCoordinator
 }
+
+// DatabasesCoordinator is the cluster interface needed to propagate database
+// deletes through the file manifest. nil = standalone mode.
+type DatabasesCoordinator interface {
+	BatchFileOpsInManifest(ops []raft.BatchFileOp) error
+	GetFileManifestByDatabase(database string) []*raft.FileEntry
+	IsPrimaryWriter() bool
+	Role() string
+}
+
+// SetCoordinator wires the cluster coordinator for manifest updates and role
+// checks during database deletion.
+func (h *DatabasesHandler) SetCoordinator(c DatabasesCoordinator) { h.coordinator = c }
 
 // SetFieldSchema installs the field schema registry so deleting a database
 // also deletes its stored field schema anchors (#914).
@@ -524,6 +540,13 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 
+	// Cluster-wide deletes must be initiated by the primary writer.
+	if h.coordinator != nil && !h.coordinator.IsPrimaryWriter() {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": fmt.Sprintf("delete rejected: node role %q is not primary writer", h.coordinator.Role()),
+		})
+	}
+
 	ctx := context.Background()
 
 	// Check if database exists
@@ -552,6 +575,37 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to list database files",
 		})
+	}
+
+	// Update the authoritative cluster manifest before deleting local files.
+	// The manifest callback removes each file from every node, including replicas
+	// whose local storage is not visible to this handler.
+	if h.coordinator != nil {
+		const manifestBatchSize = 1000
+		var ops []raft.BatchFileOp
+		for _, entry := range h.coordinator.GetFileManifestByDatabase(name) {
+			if entry == nil || !strings.HasPrefix(entry.Path, name+"/") {
+				continue
+			}
+			payload, err := json.Marshal(raft.DeleteFilePayload{Path: entry.Path, Reason: "manual"})
+			if err != nil {
+				h.logger.Error().Err(err).Str("path", entry.Path).Msg("Failed to marshal cluster manifest delete")
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+					"error": "Failed to update cluster manifest",
+				})
+			}
+			ops = append(ops, raft.BatchFileOp{Type: raft.CommandDeleteFile, Payload: payload})
+		}
+		for start := 0; start < len(ops); start += manifestBatchSize {
+			end := min(start+manifestBatchSize, len(ops))
+			if err := h.coordinator.BatchFileOpsInManifest(ops[start:end]); err != nil {
+				h.logger.Error().Err(err).Int("count", end-start).Int("chunk_start", start).
+					Str("database", name).Msg("Failed to update cluster manifest; aborting database deletion")
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+					"error": "Failed to update cluster manifest",
+				})
+			}
+		}
 	}
 
 	// Delete all files
