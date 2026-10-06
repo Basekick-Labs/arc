@@ -376,3 +376,64 @@ of from a Raft snapshot rather than from the log, since a snapshot restore
 fires no registration callbacks (#1071 tracks the snapshot side).
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#907](https://github.com/Basekick-Labs/arc/pull/907).
+
+## Internal changes
+
+These do not change how Arc behaves. They are here because the codebase is the
+thing a new maintainer has to learn, and a refactor that moves a decision from
+four places to one is worth knowing about before you go looking for it in the
+old place.
+
+### One shared constructor for storage backends ([#1085](https://github.com/Basekick-Labs/arc/issues/1085))
+
+Arc talks to three kinds of storage (a local directory, S3 and compatible
+stores, Azure Blob Storage) and it needed one of them in four unrelated places:
+primary storage, the tiering cold tier, the compaction subprocess, and the
+backup destination. Each place had written its own `switch` on a backend name,
+so the answer to "which backend names does Arc accept" lived in four files and
+differed between them: primary storage took five spellings (`local`, `s3`,
+`minio`, `azure`, `azblob`), the cold tier took two, the subprocess took three.
+
+There is now one constructor, `storage.NewBackend`, in
+`internal/storage/factory.go`. It takes a `BackendSpec` naming the type and
+carrying the backend's own config struct, and it returns a `storage.Backend`
+or an error. It deliberately does nothing else: it does not log, does not
+register anything for shutdown, and does not decide whether a failure should
+stop the process. Those three differ at every call site and they stayed there.
+Primary storage still treats a failure as fatal and registers the backend to be
+closed at shutdown; the cold tier still logs the failure and runs on without a
+cold tier; the backup manager still returns the error to its caller.
+
+The reason this was worth doing is a specific bug class, not tidiness. A Go
+interface holding a nil pointer is not equal to nil, so a constructor that
+returns `(*S3Backend)(nil)` alongside an error, stored straight into a
+`storage.Backend` variable, produces a value that passes `!= nil` and then
+panics on first use (#713). The cold-tier code carried a hand-written guard
+against exactly this, twice, with a comment naming the three places that check
+`coldBackend != nil` — the startup tier scan, the file drainer's existence
+probe, and the query router's cold glob. That guarantee is now part of the
+constructor's contract and is covered by a test, so the next caller inherits it
+instead of having to know about it.
+
+Two things stayed where they were, both on purpose:
+
+- **The compaction subprocess keeps its own factory.** It runs in a separate
+  process and receives its job as JSON, and credentials are deliberately never
+  written into that JSON: S3 credentials come from the environment the parent
+  set, and Azure infers managed-identity use from whether `AZURE_STORAGE_KEY`
+  is present. Every other caller passes whatever the operator configured, so
+  routing the subprocess through the shared constructor would make its
+  empty-credential spec look like a mistake rather than the contract. A comment
+  there explains this and points at the shared constructor.
+- **Credential refreshing is unrelated to this code.** The refresher
+  (`internal/database/credrefresh.go`, from #600 and #601) refreshes *DuckDB
+  secrets* so the query engine can keep reading an object store with temporary
+  credentials. It never touches a `storage.Backend`: the write path uses either
+  static credentials or the AWS SDK's own self-refreshing chain, which is why
+  writes never suffered from the bug that motivated it.
+
+This is the first of three changes behind per-database backup targets
+([#1085](https://github.com/Basekick-Labs/arc/issues/1085)): a backup
+destination is a `storage.Backend`, so named remote targets are mostly a
+configuration and routing problem once there is a single place that turns a
+destination description into a backend.
