@@ -417,6 +417,7 @@ func main() {
 		MemoryLimit:            cfg.Database.MemoryLimit,
 		ThreadCount:            cfg.Database.ThreadCount,
 		EnableWAL:              cfg.Database.EnableWAL,
+		Extensions:             cfg.Database.Extensions,
 		TempDirectory:          cfg.Database.TempDirectory,
 		PreserveInsertionOrder: cfg.Database.PreserveInsertionOrder,
 		// S3 configuration for httpfs extension (enables DuckDB to query S3 directly)

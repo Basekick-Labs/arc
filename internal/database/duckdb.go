@@ -463,6 +463,7 @@ type Config struct {
 	MemoryLimit    string
 	ThreadCount    int
 	EnableWAL      bool
+	Extensions     []string
 	// PreserveInsertionOrder maps to DuckDB's preserve_insertion_order.
 	// false allows DuckDB to reorder results of queries without an ORDER BY,
 	// enabling faster parallel scans/aggregations. Explicit ORDER BY clauses
@@ -810,6 +811,27 @@ func loadArcxExtension(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 	return nil
 }
 
+// loadConfiguredExtensions installs and loads operator-selected DuckDB
+// extensions before lockdownExternalAccess disables future INSTALL/LOAD.
+// DuckDB registers extensions per database, so one load covers the pool.
+func loadConfiguredExtensions(db *sql.DB, extensions []string, logger zerolog.Logger) error {
+	for _, name := range extensions {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return fmt.Errorf("DuckDB extension name must not be empty")
+		}
+		quotedName := quoteDuckDBIdent(name)
+		if _, err := db.Exec("INSTALL " + quotedName); err != nil {
+			return fmt.Errorf("install DuckDB extension %q: %w", name, err)
+		}
+		if _, err := db.Exec("LOAD " + quotedName); err != nil {
+			return fmt.Errorf("load DuckDB extension %q: %w", name, err)
+		}
+		logger.Info().Str("extension", name).Msg("DuckDB extension loaded")
+	}
+	return nil
+}
+
 // ForcePreserveInsertionOrder forces preserve_insertion_order=true for the
 // session of the pinned connection, so statements that rebuild parquet files
 // (DELETE rewrites, sort-keys-less compaction) keep the source's row order
@@ -994,6 +1016,10 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 		if err := ensureAzureLoaded(db, logger); err != nil {
 			return fmt.Errorf("failed to load azure extension for cold-tier Azure: %w", err)
 		}
+	}
+
+	if err := loadConfiguredExtensions(db, cfg.Extensions, logger); err != nil {
+		return fmt.Errorf("failed to load configured DuckDB extensions: %w", err)
 	}
 
 	// Load the proprietary arcx extension once for the whole pool. Extension

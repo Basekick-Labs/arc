@@ -2,6 +2,17 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Features
+
+### DuckDB extensions can be configured per deployment ([#440](https://github.com/Basekick-Labs/arc/issues/440))
+
+Operators can set `database.extensions` or the `ARC_DATABASE_EXTENSIONS`
+environment variable to install and load DuckDB extensions at startup. Arc
+loads them before enabling its DuckDB external-access lockdown; the setting
+does not enable unsigned extensions.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1082](https://github.com/Basekick-Labs/arc/pull/1082).
+
 ## Bug fixes
 
 ### Backup and restore are cluster-safe ([#1083](https://github.com/Basekick-Labs/arc/issues/1083))
@@ -198,4 +209,3 @@ of from a Raft snapshot rather than from the log, since a snapshot restore
 fires no registration callbacks (#1071 tracks the snapshot side).
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#907](https://github.com/Basekick-Labs/arc/pull/907).
-
