@@ -806,3 +806,28 @@ func TestAgent_ReconcileConflictIsTerminal(t *testing.T) {
 		t.Errorf("the second pass re-reported %d conflicts; the file should be terminal", len(res.Conflicts))
 	}
 }
+
+// TestUnsafeReadPathSegment covers the predicate that decides whether a
+// spoke-side skip is worth logging: only read-path rejections, not the layout
+// rules that fire on every pass.
+func TestUnsafeReadPathSegment(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		path string
+		want bool
+	}{
+		{"normal arc path", "testdb/cpu/2026/10/02/18/cpu_1.parquet", false},
+		{"dot prefixed is a layout rule, not ours", ".sync-staging/x/f.parquet", false},
+		{"not parquet is a layout rule, not ours", "testdb/cpu/evil.sh", false},
+		{"hive directory", "testdb/host=hub01/f.parquet", true},
+		{"glob directory", "testdb/cpu[1]/f.parquet", true},
+		{"glob star", "testdb/cpu*/f.parquet", true},
+		{"equals in filename", "testdb/cpu/host=weird.parquet", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := unsafeReadPathSegment(tt.path); got != tt.want {
+				t.Errorf("unsafeReadPathSegment(%q) = %v, want %v", tt.path, got, tt.want)
+			}
+		})
+	}
+}

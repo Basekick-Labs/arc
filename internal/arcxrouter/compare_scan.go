@@ -35,19 +35,58 @@ const scanNull = "\x00NULL"
 func compareScan(rec arrow.Record, oracle []scanRow) string {
 	arcx, err := scanRowsFromArcx(rec)
 	if err != nil {
-		return "arcx decode error: " + err.Error()
+		// A HOST-side render failure, not an engine disagreement. Returning it as a
+		// plain diff made it fire ArcxShadowMismatch — "arcx is wrong" — for a bug
+		// on our side of the boundary. Tag it so runShadow reports a SKIP instead
+		// (gotcha #4: decline, error and mismatch must stay distinguishable).
+		return skipPrefix + "arcx decode error: " + err.Error()
 	}
-	a := sortScanRows(arcx)
-	o := sortScanRows(oracle)
+	cols := make([]string, rec.Schema().NumFields())
+	for i, f := range rec.Schema().Fields() {
+		cols[i] = f.Name
+	}
+	a, ka := sortScanRows(arcx)
+	o, ko := sortScanRows(oracle)
 	if len(a) != len(o) {
 		return fmt.Sprintf("row count: arcx=%d duckdb=%d", len(a), len(o))
 	}
 	for i := range a {
-		if strings.Join(a[i], "\x1f") != strings.Join(o[i], "\x1f") {
-			return fmt.Sprintf("row %d: arcx=%v duckdb=%v", i, a[i], o[i])
+		if ka[i] != ko[i] {
+			// Values are WITHHELD. This used to print both raw rows — host names and
+			// metric values — into an ERROR log that only masks SQL and error text.
+			// It was effectively unreachable while the drain truncated (the row-count
+			// branch above always fired first); fixing the drain makes it the live
+			// branch for every real divergence, so it has to match the posture the
+			// sibling comparators already take (compare_grouped.go, compare.go).
+			// Name the first differing COLUMN — enough to start an investigation,
+			// nothing of the data itself.
+			return fmt.Sprintf("row %d of %d differs (first differing column: %s; values withheld)",
+				i, len(a), firstDiffColumn(a[i], o[i], cols))
 		}
 	}
 	return ""
+}
+
+// firstDiffColumn names the first column whose cell differs, or "(row length)"
+// when the rows differ only in length. Returns a NAME, never a value.
+//
+// `cols` is indexed POSITIONALLY, which is correct because a scanRow's cells are in
+// column order — not sorted by name. (The scanRow type comment above has said
+// "sorted by column name" for a while and is wrong; fixing the code to match it
+// would mis-name every diff column.)
+func firstDiffColumn(a, o scanRow, cols []string) string {
+	for i := range a {
+		if i >= len(o) {
+			break
+		}
+		if a[i] != o[i] {
+			if i < len(cols) {
+				return cols[i]
+			}
+			return fmt.Sprintf("#%d", i)
+		}
+	}
+	return "(row length)"
 }
 
 // scanRowsFromArcx renders the arcx record to name-keyed, per-row string cells.
@@ -146,14 +185,34 @@ func duckCell(v interface{}) string {
 	}
 }
 
-// sortScanRows sorts rows lexicographically for a stable multiset compare. Each
-// row's cells are already in column order (both sides in result-schema order); the
-// row-level sort makes the overall comparison order-insensitive.
-func sortScanRows(rows []scanRow) []scanRow {
+// sortScanRows sorts rows lexicographically for a stable multiset compare and
+// returns the sorted rows ALONGSIDE their join keys. Each row's cells are already in
+// column order (both sides in result-schema order); the row-level sort makes the
+// overall comparison order-insensitive.
+//
+// The key is precomputed once per row rather than joined inside the less-func. The
+// old form called strings.Join on BOTH operands on every comparison — O(n log n)
+// full-row joins. Measured at 907,916 rows × 5 columns: 1,462 ms / +2.3 GB churn
+// versus 171 ms / +249 MB keyed. That cost was unreachable while the drain truncated
+// the arcx side to one batch; fixing the drain is exactly what makes it reachable,
+// so the two changes belong in the same slice.
+func sortScanRows(rows []scanRow) ([]scanRow, []string) {
 	out := make([]scanRow, len(rows))
 	copy(out, rows)
-	sort.Slice(out, func(i, j int) bool {
-		return strings.Join(out[i], "\x1f") < strings.Join(out[j], "\x1f")
-	})
-	return out
+	keys := make([]string, len(out))
+	for i, r := range out {
+		keys[i] = strings.Join(r, "\x1f")
+	}
+	idx := make([]int, len(out))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.Slice(idx, func(i, j int) bool { return keys[idx[i]] < keys[idx[j]] })
+	sortedRows := make([]scanRow, len(out))
+	sortedKeys := make([]string, len(out))
+	for n, from := range idx {
+		sortedRows[n] = out[from]
+		sortedKeys[n] = keys[from]
+	}
+	return sortedRows, sortedKeys
 }

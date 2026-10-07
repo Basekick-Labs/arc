@@ -173,6 +173,7 @@ func TestTimeSeriesCollector_CollectedMetrics(t *testing.T) {
 			"ingest_bytes_total",
 			"ingest_batches_total",
 			"ingest_errors_total",
+			"ingest_flush_deferred_total",
 			"msgpack_requests_total",
 			"msgpack_records_total",
 			"msgpack_bytes_total",

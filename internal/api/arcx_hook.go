@@ -23,6 +23,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/basekick-labs/arc/internal/arcxrouter"
 	"github.com/basekick-labs/arc/internal/metrics"
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
@@ -92,7 +93,14 @@ func (h *QueryHandler) tryArcxRouter(
 // so the caller's DuckDB IPC path serves. execCtx must be the caller's
 // background-derived context (NOT the pooled Fiber ctx — used inside the async
 // stream writer).
-func (h *QueryHandler) tryArcxRouterArrow(c *fiber.Ctx, execCtx context.Context, cancel context.CancelFunc, rawSQL, headerDB, convertedSQL string) (handled bool) {
+func (h *QueryHandler) tryArcxRouterArrow(
+	c *fiber.Ctx,
+	execCtx context.Context,
+	cancel context.CancelFunc,
+	rawSQL, headerDB, convertedSQL string,
+	onComplete func(int),
+	onFail func(string),
+) (handled bool) {
 	// Captured for RecordQueryLatency (F1): this path previously recorded no latency at
 	// all, so arcx-served Arrow-IPC queries were invisible in the latency histogram.
 	start := time.Now()
@@ -130,10 +138,30 @@ func (h *QueryHandler) tryArcxRouterArrow(c *fiber.Ctx, execCtx context.Context,
 	// safeStream: fasthttp runs this on a bare goroutine, so an unrecovered
 	// panic (an FFI reader fault, an encoder bug) would take the process down
 	// rather than fail the request (#717). The resources are released by the
-	// deferred block below, which runs on the way out of a panic too. No
-	// registry disposition is needed: the Arrow endpoint registers the query
-	// only after this hook declines (query_arrow.go), so nothing is listed.
-	fctx.SetBodyStreamWriter(h.safeStream("arcx_serve_arrow_ipc", nil, func(w *bufio.Writer) {
+	// deferred block below, which runs on the way out of a panic too. A
+	// registry disposition IS needed here now: query_arrow.go registers the
+	// query before it chooses an engine (#731), so a panicked stream has to
+	// fail that entry instead of leaving it listed as running forever.
+	// The trailer is declared before the response headers are committed; its
+	// value is published by the connection goroutine, never from here.
+	if err := fctx.Response.Header.AddTrailer(arrowStreamTruncatedTrailer); err != nil {
+		arrowTrailerWarnOnce.Do(func() {
+			h.logger.Warn().Err(err).Str("trailer", arrowStreamTruncatedTrailer).
+				Msg("Failed to register arcx Arrow truncation trailer")
+		})
+	}
+	trailers := newResponseTrailers()
+
+	// A recovered panic must not leave a decodable but incomplete stream.
+	var streamW *bufio.Writer
+	h.setBodyStreamWithTrailers(fctx, "arcx_serve_arrow_ipc", trailers, func() {
+		poisonArrowStream(streamW, h.logger)
+		trailers.setIfAbsent(arrowStreamTruncatedTrailer, "stream writer panicked")
+		if onFail != nil {
+			onFail("stream writer panicked")
+		}
+	}, func(w *bufio.Writer) {
+		streamW = w
 		// The async writer OWNS cancel — it runs AFTER the handler returns, so the caller must
 		// NOT cancel eagerly (that would cancel execCtx while we're still streaming → the
 		// select below breaks immediately → schema-only + spurious "cancel mid-stream").
@@ -184,23 +212,51 @@ func (h *QueryHandler) tryArcxRouterArrow(c *fiber.Ctx, execCtx context.Context,
 				Msg("arcx serve (arrow): stream engine error mid-drain (partial IPC served)")
 			ipcErr = rerr
 		}
-		if err := ipcWriter.Close(); err != nil {
-			h.logger.Warn().Err(err).Msg("arcx serve (arrow): IPC close failed")
-			if ipcErr == nil {
+		// Do not emit a clean end-of-stream marker after an error or
+		// cancellation: a truncated Arrow stream might otherwise decode.
+		if ipcErr == nil {
+			ipcErr = execCtx.Err()
+		}
+		if ipcErr != nil {
+			poisonArrowStream(w, h.logger)
+			trailers.setIfAbsent(
+				arrowStreamTruncatedTrailer,
+				sqlutil.SanitizeErrText(ipcErr.Error()),
+			)
+		} else {
+			if err := ipcWriter.Close(); err != nil {
+				h.logger.Warn().Err(err).Msg("arcx serve (arrow): IPC close failed")
 				ipcErr = err
+				poisonArrowStream(w, h.logger)
+				trailers.setIfAbsent(
+					arrowStreamTruncatedTrailer,
+					sqlutil.SanitizeErrText(err.Error()),
+				)
 			}
 		}
-		w.Flush()
+		if err := w.Flush(); err != nil && ipcErr == nil {
+			ipcErr = err
+			trailers.setIfAbsent(
+				arrowStreamTruncatedTrailer,
+				sqlutil.SanitizeErrText(err.Error()),
+			)
+		}
 		// F1/F3: the DuckDB arrow path's completion metrics. A mid-stream failure is an
 		// error metric, not a success — but the rows already on the wire still count.
 		if ipcErr != nil {
 			m.IncQueryErrors()
+			if onFail != nil {
+				onFail(ipcErr.Error())
+			}
 		} else {
 			m.IncQuerySuccess()
 			m.IncQueryRows(int64(rows))
 			m.RecordQueryLatency(time.Since(start).Microseconds())
+			if onComplete != nil {
+				onComplete(rows)
+			}
 		}
-	}))
+	})
 	return true
 }
 
@@ -393,24 +449,48 @@ type arcxMetrics struct {
 	logger zerolog.Logger
 }
 
+// Each outcome bumps a real counter as well as logging. Logs alone were not enough:
+// `skipped` is Debug, so at the default level a shed sample was invisible and read
+// as "it matched" — which is how a deterministic shadow bug looked intermittent and
+// why its fix could not be validated by eye. See internal/metrics/arcx_shadow.go.
 func (m arcxMetrics) ArcxShadowMatch(shape string) {
+	metrics.Get().IncArcxShadowOutcome(metrics.ShadowMatch)
 	m.logger.Debug().Str("shape", shape).Msg("arcx shadow: match")
 }
 func (m arcxMetrics) ArcxShadowArgDivergence(shape string) {
+	metrics.Get().IncArcxShadowOutcome(metrics.ShadowArgDiff)
 	m.logger.Warn().Str("shape", shape).Msg("arcx shadow: arg-item divergence metric (tie candidate)")
 }
 func (m arcxMetrics) ArcxShadowMismatch(shape string) {
+	metrics.Get().IncArcxShadowOutcome(metrics.ShadowMismatch)
 	m.logger.Warn().Str("shape", shape).Msg("arcx shadow: mismatch metric")
 }
 func (m arcxMetrics) ArcxShadowError(shape string) {
+	metrics.Get().IncArcxShadowOutcome(metrics.ShadowError)
 	m.logger.Warn().Str("shape", shape).Msg("arcx shadow: error metric")
 }
-func (m arcxMetrics) ArcxShadowSkipped(shape string) {
+func (m arcxMetrics) ArcxServeError(shape string) {
+	// SERVE-path engine failure. Kept out of the shadow counters so a serve-mode
+	// dashboard does not report "shadow errors" while no shadow run exists.
+	m.logger.Warn().Str("shape", shape).Msg("arcx serve: error metric")
+}
+func (m arcxMetrics) ArcxShadowOracleError(shape string) {
+	metrics.Get().IncArcxShadowOutcome(metrics.ShadowOracleError)
+	m.logger.Warn().Str("shape", shape).Msg("arcx shadow: oracle error metric")
+}
+func (m arcxMetrics) ArcxShadowPanic(shape string) {
+	metrics.Get().IncArcxShadowOutcome(metrics.ShadowPanic)
+	m.logger.Error().Str("shape", shape).Msg("arcx shadow: recovered panic metric")
+}
+func (m arcxMetrics) ArcxShadowSkipped(shape, reason string) {
+	metrics.Get().IncArcxShadowOutcome(reason)
 	// Debug, not Warn: a skipped sample is expected under load or on a huge result —
-	// it is not evidence that arcx is wrong.
-	m.logger.Debug().Str("shape", shape).Msg("arcx shadow: sample skipped")
+	// it is not evidence that arcx is wrong. The COUNTER is what makes it visible,
+	// and the reason is what makes it actionable.
+	m.logger.Debug().Str("shape", shape).Str("reason", reason).Msg("arcx shadow: sample skipped")
 }
 func (m arcxMetrics) ArcxShadowDeclined(shape string) {
+	metrics.Get().IncArcxShadowOutcome(metrics.ShadowDeclined)
 	m.logger.Debug().Str("shape", shape).Msg("arcx shadow: declined")
 }
 func (m arcxMetrics) ArcxLatency(engine, shape string, micros int64) {

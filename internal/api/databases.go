@@ -22,6 +22,7 @@ type DatabasesHandler struct {
 	deleteConfig   *config.DeleteConfig
 	tieringManager *tiering.Manager
 	authManager    *auth.AuthManager
+	rbacManager    RBACChecker
 	logger         zerolog.Logger
 	icebergDropper IcebergCatalogDropper
 	fieldSchema    *fieldschema.Registry // optional, #914: anchors die with their database
@@ -30,6 +31,121 @@ type DatabasesHandler struct {
 // SetFieldSchema installs the field schema registry so deleting a database
 // also deletes its stored field schema anchors (#914).
 func (h *DatabasesHandler) SetFieldSchema(r *fieldschema.Registry) { h.fieldSchema = r }
+
+// SetRBACManager installs the RBAC checker for the listing endpoints.
+//
+// MUST be called before RegisterRoutes: the route middleware captures this
+// value when the route is registered, so a checker installed afterwards would
+// gate nothing. A plain assignment is enough because there is no concurrent
+// reader at startup. main.go guards the call with `authManager != nil && rbacManager !=
+// nil`, the same way it guards every other SetAuthAndRBAC: assigning a nil
+// *auth.RBACManager into this interface field would make `h.rbacManager !=
+// nil` true for a typed nil and defeat the guards below.
+func (h *DatabasesHandler) SetRBACManager(rm RBACChecker) { h.rbacManager = rm }
+
+// checkDatabasePermission gates a listing on the caller's read grant for a
+// database, mirroring QueryHandler.checkMeasurementPermission — which is what
+// the equivalent query-path endpoints use (`SHOW DATABASES`, `SHOW TABLES
+// FROM db`, GET /api/v1/measurements). database may be "*" for the
+// list-everything endpoint, matching the `SHOW DATABASES` gate.
+//
+// Returns nil when RBAC is disabled or no token is present: the route
+// middleware has already decided whether an unauthenticated request is
+// allowed, exactly as the query path does.
+// filterReadableMeasurements returns only the measurements the caller may
+// read, preserving order.
+//
+// The listing gate asks the weak question ("may this caller enumerate inside
+// this database"), so the gate alone would disclose the names of measurements
+// the caller cannot read. Filtering is what makes a listing table-level: a
+// caller granted db1.cpu sees ["cpu"], not ["cpu","secrets"]. One batch call,
+// so it is a single RBAC data load regardless of how many names there are.
+//
+// Returns the input unchanged when RBAC is not wired or there is no token, for
+// the same reason the gates do: the route middleware has already decided
+// whether an unauthenticated request is allowed.
+func (h *DatabasesHandler) filterReadableMeasurements(c *fiber.Ctx, database string, names []string) []string {
+	if h.rbacManager == nil || len(names) == 0 {
+		return names
+	}
+	tokenInfo := auth.GetTokenInfo(c)
+	if tokenInfo == nil {
+		return names
+	}
+	reqs := make([]*auth.PermissionCheckRequest, len(names))
+	for i, n := range names {
+		reqs[i] = &auth.PermissionCheckRequest{
+			TokenInfo:   tokenInfo,
+			Database:    database,
+			Measurement: n,
+			Permission:  "read",
+		}
+	}
+	results := h.rbacManager.CheckPermissionsBatch(reqs)
+	out := make([]string, 0, len(names))
+	for i, n := range names {
+		if i < len(results) && results[i] != nil && results[i].Allowed {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// checkDatabasePermissionScoped gates enumerating ONE named database on
+// CanAccessAnythingIn — "may this caller enumerate inside this database" —
+// rather than on a grant covering every measurement in it. Asking for "*"
+// denies every token whose role carries measurement-level grants, which is
+// the canonical tenant shape.
+func (h *DatabasesHandler) checkDatabasePermissionScoped(c *fiber.Ctx, database, permission string) error {
+	if h.rbacManager == nil {
+		return nil
+	}
+	tokenInfo := auth.GetTokenInfo(c)
+	if tokenInfo == nil {
+		return nil
+	}
+	if h.rbacManager.CanAccessAnythingIn(tokenInfo, database, permission) {
+		return nil
+	}
+	h.logger.Warn().
+		Str("database", database).
+		Str("permission", permission).
+		Int64("token_id", tokenInfo.ID).
+		Msg("RBAC denied listing")
+	return fmt.Errorf("access denied: no %s permission for database '%s'", permission, database)
+}
+
+func (h *DatabasesHandler) checkDatabasePermission(c *fiber.Ctx, database, measurement, permission string) error {
+	// Gated on the checker being WIRED, not on the license. Enforcement must
+	// survive a lapsed or revoked license: see the RBAC ENFORCEMENT MODEL note
+	// in internal/auth/rbac_manager.go. CheckPermission itself resolves the
+	// three cases (admin break-glass, memberships -> RBAC authoritative, no
+	// memberships -> coarse permissions), so a deployment without RBAC
+	// configured is unaffected.
+	if h.rbacManager == nil {
+		return nil
+	}
+	tokenInfo := auth.GetTokenInfo(c)
+	if tokenInfo == nil {
+		return nil
+	}
+	result := h.rbacManager.CheckPermission(&auth.PermissionCheckRequest{
+		TokenInfo:   tokenInfo,
+		Database:    database,
+		Measurement: measurement,
+		Permission:  permission,
+	})
+	if !result.Allowed {
+		h.logger.Warn().
+			Str("database", database).
+			Str("permission", permission).
+			Str("reason", result.Reason).
+			Int64("token_id", tokenInfo.ID).
+			Msg("RBAC permission denied")
+		return fmt.Errorf("access denied: no %s permission for database '%s'", permission, database)
+	}
+	return nil
+}
 
 // CreateDatabaseRequest represents a request to create a new database
 type CreateDatabaseRequest struct {
@@ -115,16 +231,40 @@ func (h *DatabasesHandler) SetTieringManager(tm *tiering.Manager) {
 // and tle.go — single source of truth for the nil-am branching.
 func (h *DatabasesHandler) RegisterRoutes(app *fiber.App) {
 	adminAuth := withAdminAuth(h.authManager)
+	// The listing endpoints enumerate database and measurement NAMES, which is
+	// tenant-visible metadata. They carried no middleware and no RBAC at all,
+	// so any valid token could enumerate every database and measurement in the
+	// deployment — the query path's equivalents (`SHOW DATABASES`, `SHOW
+	// TABLES FROM db`, GET /api/v1/measurements) have always gated both.
+	//
+	// withResourceReadAuth rather than withReadAuth: the latter requires the
+	// coarse "read" bit, which would refuse a token whose read authority comes
+	// from an RBAC grant instead — the one class for which the per-database
+	// check below does any work. The two gates answer different questions:
+	// the middleware asks "does this token have read authority at all, coarse
+	// or granted", the handler asks "for THIS database, or for all of them".
+	readAuth := withResourceReadAuth(h.authManager, h.rbacManager)
 
-	app.Get("/api/v1/databases", h.handleList)
-	app.Get("/api/v1/databases/:name", h.handleGet)
-	app.Get("/api/v1/databases/:name/measurements", h.handleListMeasurements)
+	app.Get("/api/v1/databases", readAuth, h.handleList)
+	app.Get("/api/v1/databases/:name", readAuth, h.handleGet)
+	app.Get("/api/v1/databases/:name/measurements", readAuth, h.handleListMeasurements)
 	app.Post("/api/v1/databases", adminAuth, h.handleCreate)
 	app.Delete("/api/v1/databases/:name", adminAuth, h.handleDelete)
 }
 
 // handleList handles GET /api/v1/databases
 func (h *DatabasesHandler) handleList(c *fiber.Ctx) error {
+	// Listing every database asks for a grant covering every database, the
+	// same bar `SHOW DATABASES` applies (handleShowDatabases in query.go).
+	//
+	// A caller without a grant covering every database is refused here and
+	// must name its database via GET /api/v1/databases/<name>, which asks the
+	// weaker "may you enumerate inside it" question and filters the names it
+	// returns. Same bar `SHOW DATABASES` applies.
+	if err := h.checkDatabasePermission(c, "*", "*", "read"); err != nil {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": err.Error()})
+	}
+
 	ctx := context.Background()
 
 	// Optimized: Single storage call to get all databases with measurement counts
@@ -227,6 +367,13 @@ func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
 		})
 	}
 
+	// Gate on the resolved database, the same bar `SHOW TABLES FROM db`
+	// applies. Checked AFTER name validation so an invalid name is a 400
+	// rather than leaking whether the caller would have been allowed.
+	if err := h.checkDatabasePermissionScoped(c, name, "read"); err != nil {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": err.Error()})
+	}
+
 	ctx := context.Background()
 
 	// Check if database exists
@@ -244,11 +391,14 @@ func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
 		})
 	}
 
-	// Get measurement count
+	// Count only the measurements the caller may read. Counting the raw list
+	// would disclose how many measurements exist that this caller cannot see
+	// — the same thing filtering the names is there to prevent, leaked as an
+	// integer instead.
 	measurements, err := h.listMeasurements(ctx, name)
 	measurementCount := 0
 	if err == nil {
-		measurementCount = len(measurements)
+		measurementCount = len(h.filterReadableMeasurements(c, name, measurements))
 	}
 
 	return c.JSON(DatabaseInfo{
@@ -272,6 +422,13 @@ func (h *DatabasesHandler) handleListMeasurements(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": fmt.Sprintf("invalid database name %q", name),
 		})
+	}
+
+	// Gate on the resolved database, the same bar `SHOW TABLES FROM db`
+	// applies. Checked AFTER name validation so an invalid name is a 400
+	// rather than leaking whether the caller would have been allowed.
+	if err := h.checkDatabasePermissionScoped(c, name, "read"); err != nil {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": err.Error()})
 	}
 
 	ctx := context.Background()
@@ -302,6 +459,11 @@ func (h *DatabasesHandler) handleListMeasurements(c *fiber.Ctx) error {
 			"error": "Database '" + name + "' not found",
 		})
 	}
+
+	// Existence was decided above on the UNFILTERED list, so filtering cannot
+	// turn an existing database into a 404 — a caller that may enumerate here
+	// but holds no readable measurement gets an empty list, not "not found".
+	measurements = h.filterReadableMeasurements(c, name, measurements)
 
 	// Build response
 	measurementInfos := make([]DatabaseMeasurement, 0, len(measurements))
@@ -437,6 +599,25 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	if err := h.storage.Delete(ctx, markerPath); err == nil {
 		deletedCount++
 		h.logger.Debug().Str("path", markerPath).Msg("Deleted database marker file")
+	}
+
+	// Everything List, ListStaged and the marker cover is gone now, so a file
+	// still under the prefix is one no listing addresses: a partial whose key
+	// the contract refuses (#772), or OS debris. It keeps the database visible
+	// and nothing else will ever name it, so name it here, once, at a level an
+	// operator sees. Not deleted: a committed object can share this shape.
+	if ul, ok := h.storage.(storage.UnusableLister); ok {
+		if left, err := ul.ListUnusable(ctx, name+"/"); err != nil {
+			h.logger.Warn().Err(err).Str("database", name).Msg("Could not check for unaddressable files left by the dropped database")
+		} else if len(left) > 0 {
+			n := min(len(left), 10)
+			paths := make([]string, 0, n)
+			for _, u := range left[:n] {
+				paths = append(paths, u.Path)
+			}
+			h.logger.Warn().Str("database", name).Int("files", len(left)).Strs("paths", paths).
+				Msg("Dropped database left files no listing addresses; they keep the database visible and must be removed by hand")
+		}
 	}
 
 	// Try to remove the empty database directory

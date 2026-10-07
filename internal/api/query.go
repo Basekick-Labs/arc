@@ -38,6 +38,11 @@ type RBACChecker interface {
 	IsRBACEnabled() bool
 	CheckPermission(req *auth.PermissionCheckRequest) *auth.PermissionCheckResult
 	CheckPermissionsBatch(reqs []*auth.PermissionCheckRequest) []*auth.PermissionCheckResult
+	// CanAccessAnythingIn answers "may this caller enumerate inside this
+	// database", which is weaker than CheckPermission with "*" and is the
+	// only question a listing gate should ask. See its doc comment in
+	// internal/auth.
+	CanAccessAnythingIn(tokenInfo *auth.TokenInfo, database, permission string) bool
 }
 
 // TableReference represents a database.measurement reference extracted from SQL
@@ -242,6 +247,16 @@ func hasCrossDatabaseSyntax(sql string) bool {
 			}
 		}
 	}
+
+	// A qualified name continuing the FROM list after a cross-join comma
+	// (`FROM cpu, otherdb.mem`) is cross-database syntax too; the keyword scan
+	// above never reaches it (#978). Scanned on the same normalised form, so
+	// a comma inside a literal or a comment cannot introduce one.
+	for _, ref := range findCommaJoinRefs(sql) {
+		if ref.db != "" {
+			return true
+		}
+	}
 	return false
 }
 
@@ -293,22 +308,31 @@ func normalizeSQLForShow(sql string) string {
 	return strings.TrimSpace(sqlutil.UnmaskStringLiterals(stripped, masks))
 }
 
-// isSingleTableQuery returns true if query has exactly one FROM and no JOINs.
-// These queries can use a faster transformation path.
+// isSingleTableQuery returns true if query has exactly one FROM naming a
+// single table and no JOINs. These queries can use a faster transformation path.
 func isSingleTableQuery(sqlLower string) bool {
-	fromCount := strings.Count(sqlLower, "from ")
+	fromCount := countSQLTokenStart(sqlLower, "from ")
 	if fromCount != 1 {
 		return false
 	}
-	// Check for any JOIN type
-	if strings.Contains(sqlLower, " join ") {
+	// Check for any JOIN type. Matched as a word, not as " join ": the keyword
+	// routinely starts a line (`FROM a\nJOIN b`), and the space-delimited
+	// check let that shape onto the fast path, which rewrote only the FROM
+	// table (#978).
+	if containsSQLWord(sqlLower, "join") {
 		return false
 	}
 	// Check for subquery (FROM followed by parenthesis)
-	idx := strings.Index(sqlLower, "from ")
+	idx := indexSQLTokenStart(sqlLower, "from ")
 	if idx >= 0 {
 		rest := strings.TrimLeft(sqlLower[idx+5:], " \t\n")
 		if len(rest) > 0 && rest[0] == '(' {
+			return false
+		}
+		// A comma cross-join (`FROM a x, b y`) has one FROM and no JOIN
+		// keyword yet names two tables; the fast path rewrites only the
+		// first, so it must take the full rewriter (#978).
+		if fromTableListContinues(sqlLower, idx+5) {
 			return false
 		}
 	}
@@ -370,6 +394,19 @@ func extractLimit(sql string, defaultLimit int) int {
 // extractCTENames extracts CTE names from a SQL query's WITH clause.
 // Returns a set of lowercase CTE names for efficient lookup.
 func extractCTENames(sql string) map[string]bool {
+	// The WITH predicate lives HERE, not at the call sites, because
+	// patternCTENames has a second alternative (`, name AS (`) with no WITH
+	// anchor: a multi-definition WINDOW clause matches it. The RBAC extractor
+	// called this unconditionally while every rewriter gated it on a WITH
+	// keyword, so `SELECT * FROM secret WINDOW w AS (), secret AS ()` was a
+	// CTE to the permission check (zero refs -> allowed outright) and a real
+	// measurement to the rewriter. One predicate, one place, every caller.
+	//
+	// Returning nil is safe for every caller: the only writes to the returned
+	// map are below, and a read from a nil map yields false.
+	if !containsSQLWord(strings.ToLower(sql), "with") {
+		return nil
+	}
 	cteNames := make(map[string]bool)
 	matches := patternCTENames.FindAllStringSubmatch(sql, -1)
 	for _, match := range matches {
@@ -792,10 +829,24 @@ var (
 
 	// Dangerous patterns for WHERE clause
 	dangerousQueryPatterns = []string{
-		";",      // Statement terminator
-		"--",     // SQL comment
-		"/*",     // Multi-line comment start
-		"*/",     // Multi-line comment end
+		";",  // Statement terminator
+		"--", // SQL comment
+		"/*", // Multi-line comment start
+		"*/", // Multi-line comment end
+	}
+	// Keywords are matched as whole words (containsSQLWord), so identifiers
+	// such as created_at or dataset pass. The former xp_/sp_ entries are gone:
+	// they are SQL Server procedure prefixes DuckDB has no notion of, and as
+	// substrings they refused any identifier containing them. The delete API's
+	// copy of the same two strings is tracked in #1077.
+	// numberGluedToWord matches a digit run at a token start that runs straight
+	// into letters, so `1UNION` can be split into `1 UNION` before the
+	// whole-word keyword scan.
+	numberGluedToWord = regexp.MustCompile(`(^|[^A-Za-z0-9_])([0-9]+)([a-z])`)
+	// maskPlaceholder matches the lower-cased placeholders sqlutil.MaskStringLiterals
+	// leaves for string literals and quoted identifiers.
+	maskPlaceholder        = regexp.MustCompile(`__(?:str|ident)_[0-9]+__`)
+	dangerousQueryKeywords = []string{
 		"DROP",   // DDL
 		"DELETE", // DML (in WHERE context means injection attempt)
 		"INSERT",
@@ -805,8 +856,6 @@ var (
 		"CREATE",
 		"EXEC",
 		"EXECUTE",
-		"xp_",
-		"sp_",
 		"UNION",
 	}
 )
@@ -864,12 +913,36 @@ func validateWhereClauseQuery(where string) error {
 		return fmt.Errorf("where clause too long (max 4096 characters)")
 	}
 
-	whereUpper := strings.ToUpper(where)
+	// Scan a string-literal-masked copy (#987): a keyword or comment marker
+	// inside a value is data, not SQL. Backtick identifiers are normalised to
+	// double quotes first, as ValidateSQLRequest does, because the masker does
+	// not know backticks and a quote inside one would otherwise open a
+	// spurious literal that hides whatever follows it. The raw clause is what
+	// the quote and parenthesis counts below check and what reaches the SQL
+	// assembly; ValidateSQLRequest then validates the assembled statement.
+	maskInput := backticksToDoubleQuotes(where)
+	whereMasked, _ := sqlutil.MaskStringLiterals(maskInput, sqlutil.HasQuotes(maskInput))
+	// DuckDB lexes a number glued to a word as two tokens (`1UNION` is `1`
+	// then `UNION`), while the whole-word scan below treats digits as
+	// identifier bytes and would not see the keyword. Split a number that
+	// starts a token from the letters that follow it; an identifier such as
+	// x1union, whose digits are not at a token start, is left alone.
+	whereLower := numberGluedToWord.ReplaceAllString(strings.ToLower(whereMasked), "$1$2 $3")
+	// The masker's placeholders are identifier-shaped (__str_0__), so a keyword
+	// glued to a literal (`host='a'union select ...`) would have no word
+	// boundary either. Blank them for the keyword scan; the punctuation scan
+	// above does not care, and nothing after this reads the placeholders.
+	whereLowerKeywords := maskPlaceholder.ReplaceAllString(whereLower, " ")
 
-	// Check for dangerous patterns
+	// Check for dangerous patterns outside string literals.
 	for _, pattern := range dangerousQueryPatterns {
-		if strings.Contains(whereUpper, pattern) {
+		if strings.Contains(whereLower, strings.ToLower(pattern)) {
 			return fmt.Errorf("where clause contains forbidden pattern: %s", pattern)
+		}
+	}
+	for _, keyword := range dangerousQueryKeywords {
+		if containsSQLWord(whereLowerKeywords, strings.ToLower(keyword)) {
+			return fmt.Errorf("where clause contains forbidden pattern: %s", keyword)
 		}
 	}
 
@@ -1166,27 +1239,16 @@ func (h *QueryHandler) anchorFor(ctx context.Context, database, measurement stri
 // anchor it is the bare path, exactly as before #914.
 func readParquetExpr(keyword, anchor string, paths []string, options string) string {
 	if anchor == "" && len(paths) == 1 {
-		return keyword + " read_parquet(" + quotePath(paths[0]) + ", " + options + ")"
+		return keyword + " " + sqlutil.ReadParquet(quotePath(paths[0]), options)
 	}
-	var sb strings.Builder
-	sb.WriteString(keyword)
-	sb.WriteString(" read_parquet([")
-	n := 0
+	quoted := make([]string, 0, len(paths)+1)
 	if anchor != "" {
-		sb.WriteString(quotePath(anchor))
-		n++
+		quoted = append(quoted, quotePath(anchor))
 	}
 	for _, p := range paths {
-		if n > 0 {
-			sb.WriteString(", ")
-		}
-		sb.WriteString(quotePath(p))
-		n++
+		quoted = append(quoted, quotePath(p))
 	}
-	sb.WriteString("], ")
-	sb.WriteString(options)
-	sb.WriteString(")")
-	return sb.String()
+	return keyword + " " + sqlutil.ReadParquetList(quoted, options)
 }
 
 // getMeasurementSchema serves GET /api/v1/databases/:database/measurements/:measurement/schema.
@@ -1501,6 +1563,37 @@ func extractTableReferences(sql string, identNames map[string]string) []TableRef
 		}
 	}
 
+	// Tables continuing the FROM list after a cross-join comma (`FROM a, b`,
+	// `FROM a, db.b`), which no FROM/JOIN pattern reaches. Located by the same
+	// walker the query transform uses, on the same normalised SQL, so the
+	// permission check and the executed query agree on the table set (#978).
+	// Guards mirror the loops above; the finder already skipped table
+	// functions and non-adjacent dots.
+	for _, ref := range findCommaJoinRefs(sql) {
+		if ref.db != "" {
+			db, table := resolve(ref.db), resolve(ref.table)
+			key := db + "." + table
+			if !seen[key] {
+				seen[key] = true
+				refs = append(refs, TableReference{Database: db, Measurement: table})
+			}
+			continue
+		}
+		tableName := resolve(ref.table)
+		table := strings.ToLower(tableName)
+		if shouldSkipTableConversion(table) {
+			continue
+		}
+		if cteNames[table] || cteNames[strings.ToLower(ref.table)] {
+			continue
+		}
+		key := "default." + tableName
+		if !seen[key] {
+			seen[key] = true
+			refs = append(refs, TableReference{Database: "default", Measurement: tableName})
+		}
+	}
+
 	return refs
 }
 
@@ -1508,8 +1601,31 @@ func extractTableReferences(sql string, identNames map[string]string) []TableRef
 // Returns nil if access is allowed, or an error describing what access was denied
 // Uses batch permission checking for efficiency when multiple tables are referenced
 func (h *QueryHandler) checkQueryPermissions(c *fiber.Ctx, sql, permission string) error {
+	// The x-arc-database header is what the query transform resolves bare
+	// names against on this path, so it is also what the check must use.
+	return h.checkQueryPermissionsForDefaultDB(c, sql, permission, c.Get("x-arc-database"))
+}
+
+// checkQueryPermissionsForDefaultDB is checkQueryPermissions with the database
+// that bare (unqualified) table references resolve to supplied explicitly.
+//
+// It exists because the two callers disagree about where that database comes
+// from, and getting it wrong is a bypass in one direction or a false denial in
+// the other. /api/v1/query resolves bare names against the x-arc-database
+// header, so it passes the header. GET /api/v1/query/:measurement takes its
+// database from the ?database= parameter, builds fully-qualified SQL, and hands
+// the rewriter an EMPTY header — so a bare reference inside its user-supplied
+// `where` fragment resolves to "default", and it must pass "" here. Passing the
+// header there instead would check <header>/x while the query reads default/x.
+func (h *QueryHandler) checkQueryPermissionsForDefaultDB(c *fiber.Ctx, sql, permission, defaultDB string) error {
 	// If no RBAC manager, skip permission check (handled by basic auth middleware)
-	if h.rbacManager == nil || !h.rbacManager.IsRBACEnabled() {
+	// Gated on the checker being WIRED, not on the license. Enforcement must
+	// survive a lapsed or revoked license: see the RBAC ENFORCEMENT MODEL note
+	// in internal/auth/rbac_manager.go. CheckPermission itself resolves the
+	// three cases (admin break-glass, memberships -> RBAC authoritative, no
+	// memberships -> coarse permissions), so a deployment without RBAC
+	// configured is unaffected.
+	if h.rbacManager == nil {
 		return nil
 	}
 
@@ -1546,15 +1662,17 @@ func (h *QueryHandler) checkQueryPermissions(c *fiber.Ctx, sql, permission strin
 		return nil
 	}
 
-	// Override "default" database with the x-arc-database header value when
-	// present. Without this, a user with default.cpu:read can bypass RBAC
-	// and query sensitive_db.cpu by setting x-arc-database: sensitive_db —
-	// the permission check would use "default" while the query transform
-	// resolves paths against the header-specified database.
-	if headerDB := c.Get("x-arc-database"); headerDB != "" {
+	// Re-point bare "default" references at the database the TRANSFORM will
+	// resolve them against. Without this, a user with default.cpu:read could
+	// bypass RBAC and query sensitive_db.cpu by setting x-arc-database:
+	// sensitive_db — the check would use "default" while the transform used
+	// the header. defaultDB is supplied by the caller rather than read here,
+	// because the two callers get it from different places; see the doc
+	// comment above.
+	if defaultDB != "" {
 		for i := range tableRefs {
 			if tableRefs[i].Database == "default" {
-				tableRefs[i].Database = headerDB
+				tableRefs[i].Database = defaultDB
 			}
 		}
 	}
@@ -1607,11 +1725,103 @@ func (h *QueryHandler) checkQueryPermissions(c *fiber.Ctx, sql, permission strin
 	return nil
 }
 
+// filterReadableMeasurementInfos is filterReadableMeasurements for the
+// cross-database listing, which carries its database per row.
+func (h *QueryHandler) filterReadableMeasurementInfos(c *fiber.Ctx, infos []MeasurementInfo) []MeasurementInfo {
+	if h.rbacManager == nil || len(infos) == 0 {
+		return infos
+	}
+	tokenInfo := auth.GetTokenInfo(c)
+	if tokenInfo == nil {
+		return infos
+	}
+	reqs := make([]*auth.PermissionCheckRequest, len(infos))
+	for i, info := range infos {
+		reqs[i] = &auth.PermissionCheckRequest{
+			TokenInfo:   tokenInfo,
+			Database:    info.Database,
+			Measurement: info.Measurement,
+			Permission:  "read",
+		}
+	}
+	results := h.rbacManager.CheckPermissionsBatch(reqs)
+	out := make([]MeasurementInfo, 0, len(infos))
+	for i, info := range infos {
+		if i < len(results) && results[i] != nil && results[i].Allowed {
+			out = append(out, info)
+		}
+	}
+	return out
+}
+
+// filterReadableMeasurements returns only the measurements the caller may
+// read, preserving order. See DatabasesHandler.filterReadableMeasurements —
+// the listing gate asks the weak "may you enumerate here" question, so the
+// per-name filter is what keeps a listing table-level and stops it disclosing
+// names the caller cannot read. One batch call per listing.
+func (h *QueryHandler) filterReadableMeasurements(c *fiber.Ctx, database string, names []string) []string {
+	if h.rbacManager == nil || len(names) == 0 {
+		return names
+	}
+	tokenInfo := auth.GetTokenInfo(c)
+	if tokenInfo == nil {
+		return names
+	}
+	reqs := make([]*auth.PermissionCheckRequest, len(names))
+	for i, n := range names {
+		reqs[i] = &auth.PermissionCheckRequest{
+			TokenInfo:   tokenInfo,
+			Database:    database,
+			Measurement: n,
+			Permission:  "read",
+		}
+	}
+	results := h.rbacManager.CheckPermissionsBatch(reqs)
+	out := make([]string, 0, len(names))
+	for i, n := range names {
+		if i < len(results) && results[i] != nil && results[i].Allowed {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// checkListingPermission gates enumerating the contents of ONE named database.
+//
+// It asks CanAccessAnythingIn, not CheckPermission with "*": the latter means
+// "may this caller touch every measurement in the database", which denies
+// every token whose role carries measurement-level grants — the canonical
+// tenant shape. Callers that return names should also filter them per name,
+// so a caller never learns the names it cannot read.
+func (h *QueryHandler) checkListingPermission(c *fiber.Ctx, database string) error {
+	if h.rbacManager == nil {
+		return nil
+	}
+	tokenInfo := auth.GetTokenInfo(c)
+	if tokenInfo == nil {
+		return nil
+	}
+	if h.rbacManager.CanAccessAnythingIn(tokenInfo, database, "read") {
+		return nil
+	}
+	h.logger.Warn().
+		Str("database", database).
+		Int64("token_id", tokenInfo.ID).
+		Msg("RBAC denied listing")
+	return fmt.Errorf("access denied: no read permission for database '%s'", database)
+}
+
 // checkMeasurementPermission checks RBAC permission for a specific database/measurement
 // This is a simpler version for endpoints where database/measurement are known directly
 func (h *QueryHandler) checkMeasurementPermission(c *fiber.Ctx, database, measurement, permission string) error {
 	// If no RBAC manager, skip permission check (handled by basic auth middleware)
-	if h.rbacManager == nil || !h.rbacManager.IsRBACEnabled() {
+	// Gated on the checker being WIRED, not on the license. Enforcement must
+	// survive a lapsed or revoked license: see the RBAC ENFORCEMENT MODEL note
+	// in internal/auth/rbac_manager.go. CheckPermission itself resolves the
+	// three cases (admin break-glass, memberships -> RBAC authoritative, no
+	// memberships -> coarse permissions), so a deployment without RBAC
+	// configured is unaffected.
+	if h.rbacManager == nil {
 		return nil
 	}
 
@@ -1834,7 +2044,13 @@ localProcessing:
 			return respondError(c, fiber.StatusBadRequest, "invalid database name: "+err.Error(), timestamp, start)
 		}
 		// Check RBAC - user needs read permission on the specific database
-		if err := h.checkMeasurementPermission(c, database, "*", "read"); err != nil {
+		// A NAMED database's contents require only "some read grant inside this
+		// database" (Measurement: ""), not a grant covering every measurement in
+		// it (Measurement: "*"). Asking "*" denies every token whose role carries
+		// measurement-level grants — the canonical tenant shape, and the whole
+		// reason rbac_measurement_permissions exists — because matchPattern("cpu",
+		// "*") is false. Listing EVERYTHING still requires ("*","*").
+		if err := h.checkListingPermission(c, database); err != nil {
 			m.IncQueryErrors()
 			return respondError(c, fiber.StatusForbidden, fmt.Sprintf("access denied: no read permission for database '%s'", database), timestamp, start)
 		}
@@ -2570,16 +2786,17 @@ func ValidateSQLRequest(sql string) error {
 	// The check must distinguish a single-quoted STRING from a quoted
 	// IDENTIFIER: DuckDB uses `'` for strings and `"`/backtick for identifiers,
 	// and a quoted identifier in table position (`FROM "my table"`,
-	// `` FROM `my;db` ``) is legitimate — not a replacement scan. So it runs on
-	// the identifier-quote-stripped, single-quote-masked form, NOT the shared
-	// `normalised` above (which masks all quote kinds indiscriminately and would
-	// false-positive on a quoted identifier).
+	// `` FROM `my;db` ``) is legitimate — not a replacement scan. The shared
+	// `normalised` form keeps the two apart as distinct placeholder classes
+	// (`__STR_n__` vs `__IDENT_n__`), and the scanner flags only the string
+	// class, so a quoted identifier never trips it.
 	//
-	// ioCheckNormalised (computed above) is exactly the form we need here: it
-	// strips `"`/backtick identifier quoting (exposing identifiers as barewords)
-	// and masks the remaining single-quoted strings to `__STR__` placeholders,
-	// with comments stripped. Reuse it rather than normalising twice.
-	if stringLiteralInTablePosition(ioCheckNormalised) {
+	// It must NOT run on ioCheckNormalised: that form restores bare-looking
+	// quoted identifiers to barewords, so a quoted RESERVED word used as an
+	// alias (`FROM cpu "where", '…'`) came back as the keyword `where`, which
+	// terminates the table list in the scanner and hid the string after the
+	// comma from this guard (#978 review).
+	if stringLiteralInTablePosition(normalised) {
 		return &SQLValidationError{Message: "String literal not allowed in table position (replacement scans are disabled); reference a table by name"}
 	}
 
@@ -2610,17 +2827,20 @@ var tablePosPlaceholder = regexp.MustCompile(`__(?:STR|IDENT)_\d+__`)
 
 // tablePosTokenPattern tokenises the (space-isolated) masked/normalised SQL into
 // the atoms the table-position scanner cares about: a masked string placeholder
-// (`__STR_<n>__`), a parenthesis, a comma, or any other run of identifier bytes
-// (keywords, table names, aliases). Everything else (whitespace, operators) is
-// skipped. The placeholder alternative is matched BEFORE the generic identifier
-// run so it wins even though `_`/digits are also identifier bytes.
-var tablePosTokenPattern = regexp.MustCompile(`__(?:STR|IDENT)_\d+__|[A-Za-z_][A-Za-z0-9_]*|[(),]`)
+// (`__STR_<n>__`), a parenthesis, a list/struct bracket, a comma, or any other
+// run of identifier bytes (keywords, table names, aliases). Everything else
+// (whitespace, operators) is skipped. The placeholder alternative is matched
+// BEFORE the generic identifier run so it wins even though `_`/digits are also
+// identifier bytes. Brackets are tokens because a list or struct literal
+// (`[1, 2]`, `{'k': v}`) carries commas that are never cross-join commas, even
+// inside an armed FROM clause's ON predicate (#978 review).
+var tablePosTokenPattern = regexp.MustCompile(`__(?:STR|IDENT)_\d+__|[A-Za-z_][A-Za-z0-9_]*|[(),\[\]{}]`)
 
-// stringLiteralInTablePosition reports whether `normalised` — SQL whose SINGLE-
-// quoted string literals have already been masked to `__STR_<n>__` placeholders,
-// whose identifier quoting has been stripped, and whose comments have been
-// removed (i.e. the output of ioDenylistNormalise) — puts a masked string where
-// a table reference belongs. That is DuckDB's replacement-scan syntax
+// stringLiteralInTablePosition reports whether `normalised` — SQL whose string
+// literals have been masked to `__STR_<n>__` placeholders, whose quoted
+// identifiers have been masked to `__IDENT_<n>__` placeholders, and whose
+// comments have been removed (ValidateSQLRequest's shared normalisation) — puts
+// a masked string where a table reference belongs. That is DuckDB's replacement-scan syntax
 // (`FROM '…'`), which reads a file with no function name and so bypasses both the
 // I/O-function denylist and the RBAC table extractor (GHSA-w8x2-cccw-25f7).
 //
@@ -2685,87 +2905,28 @@ func invalidQuotedIdentifierInTablePosition(normalised string, identNames map[st
 	return offending
 }
 
-// maskedTokenInTablePosition is the shared table-position scanner: it walks
-// the masked/normalised SQL and returns the first placeholder token for which
-// flag returns true while the token stands in table position (directly after
-// FROM or JOIN, or after a comma continuing an armed FROM clause's table
-// list). Returns "" when no flagged placeholder is in table position.
+// maskedTokenInTablePosition walks the masked/normalised SQL with
+// walkTablePositions (the FROM-clause state machine shared with the
+// storage-path rewriters and the RBAC extractor, see table_position.go) and
+// returns the first placeholder token for which flag returns true while the
+// token stands in table position (directly after FROM or JOIN, or after a
+// comma continuing an armed FROM clause's table list). Returns "" when no
+// flagged placeholder is in table position.
 func maskedTokenInTablePosition(normalised string, flag func(tok string) bool) string {
-	// fromArmed[d] is true when, at paren depth d, we are inside a FROM clause
-	// whose table list is still open — so a comma at depth d continues that
-	// list (a cross-join table position). Indexed by depth; grows as needed.
-	fromArmed := make([]bool, 1, 8)
-
-	// afterFromJoin is true when the immediately preceding token was FROM or
-	// JOIN, so the very next table-atom is in table position.
-	afterFromJoin := false
-
-	depth := 0
 	// Isolate placeholders with surrounding spaces so a keyword directly
 	// abutting one (`FROM__STR_0__` from `FROM'…'`) tokenises as two atoms.
 	isolated := tablePosPlaceholder.ReplaceAllString(normalised, " $0 ")
-	toks := tablePosTokenPattern.FindAllString(isolated, -1)
-	for _, tok := range toks {
-		switch tok {
-		case "(":
-			depth++
-			if depth >= len(fromArmed) {
-				fromArmed = append(fromArmed, false)
-			} else {
-				fromArmed[depth] = false
-			}
-			afterFromJoin = false
-			continue
-		case ")":
-			if depth > 0 {
-				fromArmed[depth] = false
-				depth--
-			}
-			// Leaving the paren group does NOT touch fromArmed[depth-1]: the
-			// OUTER FROM clause (if any) is still open. This is the blocker-1 fix.
-			afterFromJoin = false
-			continue
-		case ",":
-			// A comma continues the table list only if THIS depth's FROM clause
-			// is still armed (excludes function-argument and projection commas,
-			// which are either at a deeper depth or after a clause terminator).
-			afterFromJoin = fromArmed[depth]
-			continue
+	found := ""
+	walkTablePositions(isolated, func(p tablePosition) bool {
+		// A masked token standing in table position: the caller's flag
+		// decides whether this class of placeholder is a violation.
+		if (strings.HasPrefix(p.tok, "__STR_") || strings.HasPrefix(p.tok, "__IDENT_")) && flag(p.tok) {
+			found = p.tok
+			return true
 		}
-
-		// tok is a placeholder or an identifier/keyword run.
-		if strings.HasPrefix(tok, "__STR_") || strings.HasPrefix(tok, "__IDENT_") {
-			// A masked token standing in table position: the caller's flag
-			// decides whether this class of placeholder is a violation.
-			if afterFromJoin && flag(tok) {
-				return tok
-			}
-			// A placeholder that is NOT flagged (or not in table position — a
-			// value, a function arg, a legitimate quoted table) closes the
-			// "immediately after FROM/JOIN" window but leaves the FROM
-			// clause's armed state (for a following cross-join comma) alone.
-			afterFromJoin = false
-			continue
-		}
-
-		switch strings.ToLower(tok) {
-		case "from", "join":
-			fromArmed[depth] = true
-			afterFromJoin = true
-		default:
-			// A real table name, alias, ON, USING, etc. ends the "immediately
-			// after FROM/JOIN" window but keeps the FROM clause armed so a
-			// following `, '…'` cross-join is still caught.
-			afterFromJoin = false
-			// Keywords that close the FROM clause's table list at this depth:
-			// after WHERE/GROUP/…, a top-level comma is a projection/ordering
-			// separator, not another cross-join table.
-			if fromClauseTerminator(strings.ToLower(tok)) {
-				fromArmed[depth] = false
-			}
-		}
-	}
-	return ""
+		return false
+	})
+	return found
 }
 
 // fromClauseTerminator reports whether a lower-cased keyword ends the table
@@ -2773,7 +2934,10 @@ func maskedTokenInTablePosition(normalised string, flag func(tok string) bool) s
 // ordering separator rather than another comma cross-join table.
 func fromClauseTerminator(word string) bool {
 	switch word {
-	case "where", "group", "having", "order", "limit", "offset", "window", "qualify", "union", "except", "intersect", "fetch", "for":
+	// SELECT is here for DuckDB's FROM-first form (`FROM t SELECT a, b`),
+	// which ValidateSQLRequest accepts: the projection commas after it must
+	// not read as cross-join tables (#978).
+	case "where", "group", "having", "order", "limit", "offset", "window", "qualify", "union", "except", "intersect", "fetch", "for", "select":
 		return true
 	}
 	return false
@@ -2976,7 +3140,7 @@ func (h *QueryHandler) getTransformedSQLForParallel(ctx context.Context, sql str
 
 	// Parallel execution only supported for simple single-table queries with header DB
 	// Complex queries (JOINs, subqueries, CTEs) fall back to standard execution
-	if headerDB == "" || !isSingleTableQuery(sqlLower) || strings.Contains(sqlLower, "with ") {
+	if headerDB == "" || !isSingleTableQuery(sqlLower) || containsSQLWord(sqlLower, "with") {
 		transformed, cached, err := h.getTransformedSQL(ctx, sql, headerDB)
 		return transformed, nil, cached, err
 	}
@@ -3010,6 +3174,7 @@ func (h *QueryHandler) getTransformedSQLForParallel(ctx context.Context, sql str
 // Converts: FROM measurement -> FROM read_parquet('path/**/*.parquet')
 // Converts: JOIN database.measurement -> JOIN read_parquet('path/**/*.parquet')
 // Converts: JOIN measurement -> JOIN read_parquet('path/**/*.parquet')
+// Converts: FROM a, measurement -> FROM a, read_parquet('path/**/*.parquet') (comma cross-join; also database.measurement)
 // CTE names are extracted and excluded from conversion to avoid replacing virtual table references.
 // String literals and comments are protected from regex matching.
 func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string) string {
@@ -3063,6 +3228,35 @@ func (h *QueryHandler) convertSQLToStoragePaths(ctx context.Context, sql string)
 	// this keeps the transform safe for any caller that skips validation).
 	identNames := sqlutil.IdentifierNames(masks)
 	resolveIdent := makeIdentResolver(identNames)
+
+	// Handle tables continuing the FROM list after a cross-join comma:
+	// `FROM a, b` and `FROM a, db.b` (#978). Runs FIRST, on masked SQL the
+	// FROM/JOIN passes have not touched, so the storage paths they emit are
+	// never tokenised (a storage root containing a paren or a comma would
+	// otherwise confuse the walker). Its own output starts with "," — the
+	// clause keyword, re-emitted the way FROM/JOIN are — so the FROM/JOIN
+	// patterns below never match inside it.
+	sql = rewriteCommaJoinRefs(sql, func(ref commaJoinRef) (string, bool) {
+		if ref.db != "" {
+			db, _ := resolveIdent(ref.db)
+			table, _ := resolveIdent(ref.table)
+			path := h.getStoragePath(ctx, db, table)
+			return h.buildReadParquetExpr(ctx, path, originalSQL, ","), true
+		}
+		// Same guard chain as the FROM handler below.
+		if cteNames[strings.ToLower(ref.table)] {
+			return "", false
+		}
+		resolved, _ := resolveIdent(ref.table)
+		if cteNames[strings.ToLower(resolved)] {
+			return "", false
+		}
+		if shouldSkipTableConversion(strings.ToLower(resolved)) {
+			return "", false
+		}
+		path := h.getStoragePath(ctx, "default", resolved)
+		return h.buildReadParquetExpr(ctx, path, originalSQL, ","), true
+	})
 
 	// Handle FROM database.table references
 	sql = patternDBTable.ReplaceAllStringFunc(sql, func(match string) string {
@@ -3183,10 +3377,22 @@ const arcInvalidIdentifierSentinel = ".arc-invalid-quoted-identifier"
 // arcInvalidIdentifierSentinel when not. The second return is false only for
 // the sentinel case, letting callers log or count if they care — every caller
 // still receives a safe segment to build a path from.
+//
+// A placeholder-shaped token this mask table did not produce is a masked
+// STRING literal (`__STR_n__`, or a name shaped like one) and resolves to the
+// sentinel as well. It must never become a path segment: the segment is
+// quoted into read_parquet('…') while still a placeholder, and
+// UnmaskStringLiterals would then restore the raw literal, quotes and all,
+// INSIDE that quoted path — turning `FROM db.'…'` into a path expression
+// DuckDB evaluates. ValidateSQLRequest rejects a literal in table position up
+// front; this is the transform's own backstop.
 func makeIdentResolver(identNames map[string]string) func(string) (string, bool) {
 	return func(name string) (string, bool) {
 		orig, isPlaceholder := identNames[name]
 		if !isPlaceholder {
+			if strings.HasPrefix(name, "__STR_") || strings.HasPrefix(name, "__IDENT_") {
+				return arcInvalidIdentifierSentinel, false
+			}
 			return name, true
 		}
 		if err := validateIdentifier(orig); err != nil {
@@ -3277,7 +3483,10 @@ func quotePath(path string) string {
 }
 
 // buildReadParquetOptions builds the read_parquet options string.
-// Returns options like "union_by_name=true"
+//
+// Hive inference is NOT listed here: sqlutil.ReadParquet adds
+// hive_partitioning=false to every call it renders, so naming it here too
+// would emit the option twice (#1005).
 // Note: column pruning via 'columns' parameter is not supported in current DuckDB version.
 // DuckDB handles projection pushdown internally when it sees which columns are actually used.
 func buildReadParquetOptions() string {
@@ -3344,8 +3553,16 @@ func replaceTableRefs(sql string, re *regexp.Regexp, fn func(parts []string, end
 // '.' (so the identifier was a database qualifier, already handled by the
 // database.table pass) or a '(' (so it was a table-valued function call, not a
 // measurement). Either way the identifier must not be rewritten.
+//
+// The whitespace set MUST match isFunctionCallAt's, which the RBAC extractor
+// uses for the same decision: it skips isWhitespace (space, \t, \n, \r), so
+// trimming only " \t" here made `FROM generate_series\n(1, 10)` a function to
+// the permission check and a measurement to this rewriter — the extractor
+// emitted no ref while the rewriter emitted a read_parquet. DuckDB rejects the
+// result rather than reading it, so it is a correctness/parity defect rather
+// than a bypass, but the two sides must agree. dotFollows trims the same set.
 func isDotOrCallAt(sql string, end int) bool {
-	rest := strings.TrimLeft(sql[end:], " \t")
+	rest := strings.TrimLeft(sql[end:], " \t\r\n")
 	return len(rest) > 0 && (rest[0] == '.' || rest[0] == '(')
 }
 
@@ -3521,8 +3738,32 @@ func shouldSkipTableConversion(table string) bool {
 // or: {database}/{measurement}/**/*.parquet (relative path)
 // The key insight: database/measurement are always followed by year directories (4-digit numbers)
 func (h *QueryHandler) extractDBMeasurementFromPath(path string) (database, measurement string) {
-	// Normalize path separators
-	path = strings.ReplaceAll(path, "\\", "/")
+	// Backslashes are forbidden in storage keys. A local backend may,
+	// however, have native separators in its trusted root on Windows.
+	if strings.Contains(path, `\`) {
+		local, ok := h.storage.(*storage.LocalBackend)
+		if !ok {
+			return "", ""
+		}
+
+		root := local.GetBasePath()
+		if !strings.HasSuffix(root, string(filepath.Separator)) {
+			root += string(filepath.Separator)
+		}
+
+		// Only the exact local root may contain native separators. Never
+		// normalise a backslash in the database, measurement or file key.
+		if !strings.HasPrefix(path, root) {
+			return "", ""
+		}
+		keyPath := strings.TrimPrefix(path, root)
+		if strings.Contains(keyPath, `\`) {
+			return "", ""
+		}
+
+		// The remaining suffix contains no backslashes; parse it using '/'.
+		path = keyPath
+	}
 
 	// Remove any s3:// or azure:// prefix and bucket name
 	if strings.Contains(path, "://") {
@@ -3646,6 +3887,10 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 			Str("database", database).
 			Str("measurement", measurement).
 			Msg("No tier metadata found, using hot tier")
+		// Built on absent metadata, so it must not be cached: the rows appear
+		// as soon as a flush, a pull or a tier scan writes them, and a cached
+		// unpruned glob would outlive that by up to the transform cache TTL.
+		pruning.MarkVolatile(ctx)
 		return readParquetExpr(keyword, h.anchorFor(ctx, database, measurement), []string{h.getStoragePath(ctx, database, measurement)}, options)
 	}
 
@@ -3662,6 +3907,23 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 		if _, ok := tieredPaths[tiering.TierHot]; ok {
 			sources = append(sources, tierSource{tiering.TierHot, h.getStoragePath(ctx, database, measurement), h.storage})
 		}
+	} else {
+		// No row claims hot data, so this read omits local files. That is the
+		// correct steady state for a measurement whose data has all migrated
+		// to cold, so the transform is cached like any other — an earlier
+		// revision of this change marked it volatile, which would have
+		// stopped every archive measurement from ever caching its transform
+		// and made each query re-list cold storage.
+		//
+		// What makes the transient case safe instead is the writer side: the
+		// replication drainer drops the query caches for a measurement whose
+		// tier rows it changes, so a node that acquires hot rows for a
+		// measurement it is only receiving does not keep serving a cold-only
+		// read.
+		h.logger.Debug().
+			Str("database", database).
+			Str("measurement", measurement).
+			Msg("No hot tier metadata for this measurement; local files are excluded from this read")
 	}
 
 	// Cold tier (S3/Azure) - only if metadata says there's cold data
@@ -3692,13 +3954,43 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 		tierPaths, outcome := h.pruner.PruneTierPaths(ctx, src.glob, database, measurement, timeRange, src.backend, src.tier == tiering.TierHot)
 		results = append(results, tierPruneResult{glob: src.glob, paths: tierPaths, outcome: outcome})
 	}
+	// A tier that could not be pruned (no time range, or the cold end-only
+	// fallback) goes to DuckDB as its full glob. If that glob matches
+	// nothing — every file of the measurement has left the tier while its
+	// rows outlived them, as after compaction consumed the raw files and
+	// tiering moved the daily — DuckDB reports "no files" and the whole
+	// read returns nothing, cold data included. Verify such a tier holds a
+	// file at all before keeping it; a listing that cannot be trusted keeps
+	// the tier, as before. A transform that dropped a tier is volatile: the
+	// next flush into that tier must not wait out the cache TTL.
+	kept := results[:0]
+	droppedEmpty := 0
+	for i, r := range results {
+		if r.outcome == pruning.TierPruneFallback {
+			if has, verified := pruning.TierHasFiles(ctx, sources[i].backend, database, measurement); verified && !has {
+				h.logger.Debug().
+					Str("database", database).
+					Str("measurement", measurement).
+					Str("tier", string(sources[i].tier)).
+					Msg("Tier holds no files for this measurement; dropped from the read")
+				droppedEmpty++
+				continue
+			}
+		}
+		kept = append(kept, r)
+	}
+	results = kept
+	if droppedEmpty > 0 {
+		pruning.MarkVolatile(ctx)
+	}
+
 	paths, prunedTiers := combineTierPruneResults(results)
-	if prunedTiers > 0 {
+	if prunedTiers > 0 || droppedEmpty > 0 {
 		h.logger.Info().
 			Str("database", database).
 			Str("measurement", measurement).
 			Int("tiers", len(sources)).
-			Int("pruned_tiers", prunedTiers).
+			Int("pruned_tiers", prunedTiers+droppedEmpty).
 			Int("path_count", len(paths)).
 			Msg("Multi-tier partition pruning applied")
 	}
@@ -3738,7 +4030,7 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 // It avoids regex entirely by using simple string manipulation.
 func (h *QueryHandler) convertSingleTableQuery(ctx context.Context, sql, sqlLower, database string) string {
 	// Find "FROM table" position
-	idx := strings.Index(sqlLower, "from ")
+	idx := indexSQLTokenStart(sqlLower, "from ")
 	if idx < 0 {
 		return sql
 	}
@@ -3777,7 +4069,7 @@ func (h *QueryHandler) convertSingleTableQuery(ctx context.Context, sql, sqlLowe
 // Returns (converted_sql, parallel_info) where parallel_info is non-nil if parallel execution is recommended.
 func (h *QueryHandler) convertSingleTableQueryForParallel(ctx context.Context, sql, sqlLower, database string) (string, *ParallelQueryInfo) {
 	// Find "FROM table" position
-	idx := strings.Index(sqlLower, "from ")
+	idx := indexSQLTokenStart(sqlLower, "from ")
 	if idx < 0 {
 		return sql, nil
 	}
@@ -3851,7 +4143,7 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 	// Bail when the SQL has a bare FROM inside EXTRACT/SUBSTRING/TRIM/OVERLAY
 	// — `SELECT EXTRACT(YEAR FROM CURRENT_DATE)` slips past isSingleTableQuery
 	// with fromCount==1, so the slow path's mask helper must run.
-	if isSingleTableQuery(sqlLower) && !strings.Contains(sqlLower, "with ") && !sqlutil.ContainsFromKeywordFunction(sql) {
+	if isSingleTableQuery(sqlLower) && !containsSQLWord(sqlLower, "with") && !sqlutil.ContainsFromKeywordFunction(sql) {
 		features := scanSQLFeatures(sql)
 		if !features.hasQuotes && !features.hasDashComment && !features.hasBlockComment {
 			// Also need to rewrite time functions if present
@@ -3886,11 +4178,10 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 	// Compute sqlLower once after all pre-processing mutations
 	sqlLower = strings.ToLower(sql)
 
-	// Extract CTE names only if query has WITH clause (fast path for majority of queries)
-	var cteNames map[string]bool
-	if strings.Contains(sqlLower, "with ") {
-		cteNames = extractCTENames(sql)
-	}
+	// Unconditional, exactly as the RBAC extractor calls it (query.go:1396).
+	// extractCTENames applies the WITH predicate itself; gating it again here
+	// is what let the two sides disagree about which names are virtual.
+	cteNames := extractCTENames(sql)
 
 	// OPTIMIZATION: Skip patternDBTable and patternJoinDBTable entirely
 	// since we know all tables use the header-specified database
@@ -3900,6 +4191,29 @@ func (h *QueryHandler) convertSQLToStoragePathsWithHeaderDB(ctx context.Context,
 	// path and the dotted path agree on what a quoted name means.
 	identNames := sqlutil.IdentifierNames(masks)
 	resolveIdent := makeIdentResolver(identNames)
+
+	// Handle tables continuing the FROM list after a cross-join comma (#978);
+	// runs first, see convertSQLToStoragePaths. A qualified name is left alone
+	// here, as the other passes of this path leave db.table alone:
+	// hasCrossDatabaseSyntax rejects it before the transform runs under a
+	// header database.
+	sql = rewriteCommaJoinRefs(sql, func(ref commaJoinRef) (string, bool) {
+		if ref.db != "" {
+			return "", false
+		}
+		if cteNames[strings.ToLower(ref.table)] {
+			return "", false
+		}
+		resolved, _ := resolveIdent(ref.table)
+		if cteNames[strings.ToLower(resolved)] {
+			return "", false
+		}
+		if shouldSkipTableConversion(strings.ToLower(resolved)) {
+			return "", false
+		}
+		path := h.getStoragePath(ctx, database, resolved)
+		return h.buildReadParquetExpr(ctx, path, originalSQL, ","), true
+	})
 
 	// Handle FROM simple_table references - apply header database
 	sql = replaceTableRefs(sql, patternSimpleTable, func(parts []string, end int) string {
@@ -4221,6 +4535,12 @@ func (h *QueryHandler) handleShowTables(c *fiber.Ctx, start time.Time, database 
 		}
 	}
 
+	// Drop the measurements the caller may not read, so SHOW TABLES agrees
+	// with GET /api/v1/databases/:name/measurements instead of disclosing
+	// names that endpoint filters out. Done before the per-table stat calls,
+	// so an unreadable table costs nothing.
+	filtered = h.filterReadableMeasurements(c, database, filtered)
+
 	// Sort alphabetically
 	sort.Strings(filtered)
 
@@ -4445,7 +4765,13 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 				WarningLevel: "error",
 			})
 		}
-		if err := h.checkMeasurementPermission(c, database, "*", "read"); err != nil {
+		// A NAMED database's contents require only "some read grant inside this
+		// database" (Measurement: ""), not a grant covering every measurement in
+		// it (Measurement: "*"). Asking "*" denies every token whose role carries
+		// measurement-level grants — the canonical tenant shape, and the whole
+		// reason rbac_measurement_permissions exists — because matchPattern("cpu",
+		// "*") is false. Listing EVERYTHING still requires ("*","*").
+		if err := h.checkListingPermission(c, database); err != nil {
 			metrics.Get().IncQueryErrors()
 			return c.Status(fiber.StatusForbidden).JSON(EstimateResponse{
 				Success:      false,
@@ -4666,11 +4992,17 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 	// When a database filter is specified, check against that specific database instead of
 	// requiring wildcard access — users with single-database permissions should be able to
 	// list measurements scoped to that database.
-	rbacDB := "*"
+	// Scoped to one database: "some read grant inside it" (see the note on the
+	// SHOW TABLES gate above). Unscoped: a grant covering everything.
+	// Scoped to one database: the listing question. Unscoped: a grant
+	// covering everything, the same bar SHOW DATABASES applies.
+	var permErr error
 	if dbFilter != "" {
-		rbacDB = dbFilter
+		permErr = h.checkListingPermission(c, dbFilter)
+	} else {
+		permErr = h.checkMeasurementPermission(c, "*", "*", "read")
 	}
-	if err := h.checkMeasurementPermission(c, rbacDB, "*", "read"); err != nil {
+	if err := permErr; err != nil {
 		metrics.Get().IncQueryErrors()
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 			"success": false,
@@ -4745,6 +5077,13 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 			})
 		}
 	}
+
+	// Drop the (database, measurement) pairs the caller may not read. This
+	// endpoint can span several databases, so it filters per pair rather than
+	// per name. Unscoped callers had to clear the ("*","*") bar above to get
+	// here, so in practice this trims the scoped case; it is applied
+	// unconditionally so the result can never exceed the caller's grants.
+	measurements = h.filterReadableMeasurementInfos(c, measurements)
 
 	// Sort by database, then measurement
 	sort.Slice(measurements, func(i, j int) bool {
@@ -4973,8 +5312,9 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	// SECURITY (GHSA-wmjj-g8xc-6hwr): run the SHARED validator over the fully
 	// assembled statement.
 	//
-	// validateWhereClauseQuery above is a substring blocklist that blocks
-	// neither SELECT nor any DuckDB I/O table function, so a `where` fragment
+	// validateWhereClauseQuery above is a blocklist (whole-word keywords and
+	// substring punctuation on a literal-masked copy) that blocks neither
+	// SELECT nor any DuckDB I/O table function, so a `where` fragment
 	// could smuggle a cross-tenant read through a scalar subquery
 	// (`time > (SELECT max(v) FROM parquet_scan('/other-tenant/d.parquet'))`).
 	// RBAC only inspects the path params, and the DuckDB sandbox allowlists the
@@ -4997,6 +5337,37 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
 			Success:   false,
 			Error:     "Invalid query: " + err.Error(),
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+	}
+
+	// SECURITY: authorize every table the ASSEMBLED statement references, not
+	// just the one named in the path.
+	//
+	// checkMeasurementPermission above gates `database`/`measurement` from the
+	// route and query string. It cannot see the user-supplied `where` fragment,
+	// which the transform below rewrites like any other table position — so a
+	// subquery in `where` read a second measurement that nothing had
+	// authorized. validateWhereClauseQuery is a keyword blocklist and does
+	// not stop it: it blocks `;`, comments and DDL/DML, not a nested read.
+	// Enumerating read syntaxes does not work either — DuckDB spells the same
+	// thing `(SELECT x FROM t)`, `(FROM t)` and `(TABLE t)`, and `FROM` is
+	// legal inside EXTRACT/SUBSTRING/TRIM.
+	//
+	// So authorize what the transform will actually resolve. The extractor and
+	// the transform agree on that set, which is the invariant
+	// rbac_normalisation_parity_test.go asserts.
+	//
+	// "" for the default database, matching the empty header handed to
+	// getTransformedSQL on the very next line: bare names in `where` resolve
+	// to "default" there, so they must be checked as "default" here. Passing
+	// the x-arc-database header instead would check <header>/x while the query
+	// read default/x.
+	if err := h.checkQueryPermissionsForDefaultDB(c, sql, "read", ""); err != nil {
+		m.IncQueryErrors()
+		return c.Status(fiber.StatusForbidden).JSON(QueryResponse{
+			Success:   false,
+			Error:     err.Error(),
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
 		})
 	}

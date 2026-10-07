@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"time"
@@ -36,12 +37,19 @@ func NewCompactionHandler(manager *compaction.Manager, hourlyScheduler, dailySch
 func (h *CompactionHandler) RegisterRoutes(app *fiber.App) {
 	group := app.Group("/api/v1/compaction")
 
-	// Read-only routes — any authenticated token
-	group.Get("/status", h.getStatus)
-	group.Get("/stats", h.getStats)
-	group.Get("/candidates", h.getCandidates)
-	group.Get("/jobs", h.getActiveJobs)
-	group.Get("/history", h.getHistory)
+	// Admin-only, including the read-only routes. Compaction is cluster-wide
+	// operator work — it cannot be configured per team or per database, so no
+	// tenant has a reason to read it — and /candidates, /jobs and /history
+	// return {database, measurement, partition_path} for every tenant in the
+	// deployment. They previously took any authenticated token, which made
+	// them a database- and measurement-name enumeration surface for a token
+	// with no grant on either.
+	adminOnly := withAdminAuth(h.authManager)
+	group.Get("/status", adminOnly, h.getStatus)
+	group.Get("/stats", adminOnly, h.getStats)
+	group.Get("/candidates", adminOnly, h.getCandidates)
+	group.Get("/jobs", adminOnly, h.getActiveJobs)
+	group.Get("/history", adminOnly, h.getHistory)
 
 	// Admin route — trigger compaction requires admin permission
 	if h.authManager != nil {
@@ -192,6 +200,20 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 		}
 	}
 
+	// The cluster-wide compaction pause a cluster restore holds (#1087). A
+	// cycle started now would stop at its first batch boundary anyway, so
+	// refuse up front, before the trigger is logged as accepted. Checked
+	// before the running-cycle check: a cycle that was already running when
+	// the pause landed is ending at its boundary.
+	if h.manager.Paused() {
+		h.logger.Info().Strs("tiers", tierNames).Msg("Manual compaction trigger refused: compaction is paused cluster-wide")
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"error":   "compaction is paused cluster-wide",
+			"message": "a restore is running; retry when it ends",
+			"paused":  true,
+		})
+	}
+
 	logEvent := h.logger.Info().
 		Strs("tiers", tierNames).
 		Dur("cycle_timeout", h.manager.CycleTimeout)
@@ -241,6 +263,8 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 
 		if ctx.Err() != nil {
 			logger.Info().Err(ctx.Err()).Msg("Manual compaction interrupted")
+		} else if errors.Is(err, compaction.ErrCompactionPaused) {
+			logger.Info().Msg("Manual compaction stopped at a batch boundary: compaction is paused cluster-wide")
 		} else if err != nil {
 			logger.Error().Err(err).Msg("Manual compaction failed")
 		} else {
@@ -259,6 +283,14 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 	}
 	if measurementParam != "" {
 		resp["measurement"] = measurementParam
+	}
+	// An unscoped trigger honors compaction.exclude_databases exactly like a
+	// scheduled cycle. Say so in the response, so an operator wondering why
+	// a database was skipped doesn't need the debug log.
+	if dbParam == "" {
+		if excluded := h.manager.ExcludedDatabases(); len(excluded) > 0 {
+			resp["exclude_databases"] = excluded
+		}
 	}
 	return c.JSON(resp)
 }

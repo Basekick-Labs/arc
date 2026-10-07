@@ -535,11 +535,9 @@ func decodeIntElemAsInt64(dec *msgpack.Decoder, c byte) (int64, bool) {
 		if err != nil {
 			return 0, false
 		}
-		// toInt64 float semantics: bounds check, then truncate.
-		if f > float64(math.MaxInt64) || f < float64(math.MinInt64) {
-			return 0, false
-		}
-		return int64(f), true
+		// Share the generic path's exact bounds and non-finite checks so
+		// payload format cannot change whether an integer column is accepted.
+		return toInt64(f)
 	default:
 		return 0, false
 	}

@@ -358,9 +358,12 @@ func (b *LocalBackend) ReadToAt(ctx context.Context, path string, writer io.Writ
 // final file nor its ".part" staging file exist.
 // Returns a non-nil error only for unexpected failures.
 //
-// Checking the staging file allows the puller's pre-pull check to distinguish
-// a fully-received file (size == entry.SizeBytes → skip) from a partial one
-// (size < entry.SizeBytes → resume).
+// The staging-file fallback serves the puller's resume path, which needs the
+// size of an interrupted download to continue from that byte. It is not a
+// presence check: a staging file at the full size with no final file is an
+// unfinished pull, not a present file (#963). Callers deciding presence
+// confirm the final file through StagingInspector.StagedSize and Exists, as
+// the puller's statLocal does.
 func (b *LocalBackend) StatFile(ctx context.Context, path string) (int64, error) {
 	fullPath, err := b.validatePath(path)
 	if err != nil {
@@ -401,19 +404,21 @@ func (b *LocalBackend) AppendReader(ctx context.Context, path string, reader io.
 		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to open staging file for append: %w", err)
 	}
-	defer file.Close()
-
-	written, err := io.Copy(file, reader)
-	if err != nil {
+	// Close exactly once on every path, including a failed copy. Closing
+	// before promotion also makes close errors visible to the caller.
+	written, copyErr := io.Copy(file, reader)
+	closeErr := file.Close()
+	if copyErr != nil {
 		metrics.Get().IncStorageErrors()
-		return fmt.Errorf("failed to append file data: %w", err)
+		return fmt.Errorf("failed to append file data: %w", copyErr)
+	}
+	if closeErr != nil {
+		metrics.Get().IncStorageErrors()
+		return fmt.Errorf("failed to close staging file: %w", closeErr)
 	}
 
-	// After appending, promote staging → final if we've received all expected bytes.
+	// Promote only after a successful copy and close.
 	if written == appendSize {
-		if err := file.Close(); err != nil {
-			return fmt.Errorf("failed to close staging file: %w", err)
-		}
 		if err := os.Rename(stagingPath, fullPath); err != nil {
 			metrics.Get().IncStorageErrors()
 			return fmt.Errorf("failed to promote staging file after append: %w", err)
@@ -707,6 +712,56 @@ func (b *LocalBackend) ListObjects(ctx context.Context, prefix string) ([]Object
 	}
 
 	return results, nil
+}
+
+// errPrefixProbeHit is the sentinel HasObjectsUnderPrefix returns from its walk
+// callback to stop filepath.WalkDir at the first listable file. Never returned
+// to callers.
+var errPrefixProbeHit = errors.New("storage: prefix probe found a listable object")
+
+// HasObjectsUnderPrefix implements PrefixProber: it walks the directory the
+// prefix names and stops at the first file ListObjects would return. A prefix
+// whose directory does not exist is false with a nil error; a directory
+// holding only entries a listing hides (dot-prefixed names, keys the contract
+// refuses, staging partials) is false too, because omittedFromListing is the
+// one rule both share.
+func (b *LocalBackend) HasObjectsUnderPrefix(ctx context.Context, prefix string) (bool, error) {
+	searchPath, err := b.validateListPath(prefix)
+	if err != nil {
+		return false, fmt.Errorf("invalid prefix: %w", err)
+	}
+	err = filepath.WalkDir(searchPath, func(path string, d os.DirEntry, err error) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		relPath, err := filepath.Rel(b.basePath, path)
+		if err != nil {
+			return err
+		}
+		if omittedFromListing(d.Name(), filepath.ToSlash(relPath)) != nil {
+			return nil
+		}
+		return errPrefixProbeHit
+	})
+	if errors.Is(err, errPrefixProbeHit) {
+		return true, nil
+	}
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to probe prefix: %w", err)
+	}
+	return false, nil
 }
 
 // errHiddenName marks an entry a listing skips because its name is
@@ -1157,9 +1212,11 @@ func (b *LocalBackend) ListUnusable(ctx context.Context, prefix string) ([]Unusa
 
 // ListStaged implements StagingInspector.
 //
-// Staged partials are filtered out of List and ListObjects, so this is the only
-// way to find an abandoned one. Without it a spoke that keeps abandoning
-// transfers would fill the disk with files nothing could see.
+// Staged partials are filtered out of List and ListObjects, so this is the way
+// to find an abandoned one. Without it a spoke that keeps abandoning transfers
+// would fill the disk with files nothing could see. Every key it returns is
+// one DeleteStaged accepts; a partial whose stripped key fails that rule is
+// omitted here and reported by ListUnusable instead (#772).
 func (b *LocalBackend) ListStaged(ctx context.Context, prefix string) ([]ObjectInfo, error) {
 	searchPath, err := b.validateListPath(prefix)
 	if err != nil {
@@ -1186,14 +1243,23 @@ func (b *LocalBackend) ListStaged(ctx context.Context, prefix string) ([]ObjectI
 		if relErr != nil {
 			return nil
 		}
+		// Reported WITHOUT the suffix: the caller addresses a partial by
+		// the key it belongs to, never by the staging spelling.
+		key := strings.TrimSuffix(filepath.ToSlash(rel), PartSuffix)
+		// stagedPath applies the same validation DeleteStaged will apply to
+		// this key. A partial whose stripped key fails it (a legacy partial
+		// of a key that is illegal today) must not be reported here: nothing
+		// could ever delete it, and reclaimStagedPartials would just log the
+		// same refusal on every run forever. ListUnusable reports it instead.
+		if _, err := b.stagedPath(key); err != nil {
+			return nil
+		}
 		info, infoErr := d.Info()
 		if infoErr != nil {
 			return nil
 		}
 		results = append(results, ObjectInfo{
-			// Reported WITHOUT the suffix: the caller addresses a partial by
-			// the key it belongs to, never by the staging spelling.
-			Path:         strings.TrimSuffix(filepath.ToSlash(rel), PartSuffix),
+			Path:         key,
 			Size:         info.Size(),
 			LastModified: info.ModTime(),
 		})

@@ -109,6 +109,23 @@ type StatusResponse struct {
 	// should be zero; each one needs a rename by hand.
 	QuarantinedFiles int64            `json:"quarantined_files"`
 	Scheduler        *SchedulerStatus `json:"scheduler,omitempty"`
+	// ReplicationEvents counts the tier metadata updates this node made for
+	// files it did not write itself: files the cluster replication puller
+	// pulled, and local copies the delete workers removed. Dropped counts
+	// reports discarded — a drainer that stopped making progress for long
+	// enough to hit the queue's memory bound, a shutdown with work still
+	// queued, or a licence that had lapsed — and is zero on a healthy node; a
+	// non-zero one means some rows wait for the next tier scan, which costs
+	// this node partition pruning until then. Absent on a node with no
+	// cluster replication.
+	ReplicationEvents *TierEventCounts `json:"replication_events,omitempty"`
+}
+
+// TierEventCounts is the drainer's tally for StatusResponse.
+type TierEventCounts struct {
+	Applied int64 `json:"applied"`
+	Dropped int64 `json:"dropped"`
+	Failed  int64 `json:"failed"`
 }
 
 // SchedulerStatus represents the migration scheduler status
@@ -117,4 +134,8 @@ type SchedulerStatus struct {
 	Schedule string     `json:"schedule"`
 	NextRun  *time.Time `json:"next_run,omitempty"`
 	LastRun  *time.Time `json:"last_run,omitempty"`
+	// RoleGated is true when a cluster gate is wired and this node is not
+	// the primary writer: its cycles sync tier metadata but never migrate.
+	// Operators asking "why is this node not migrating" read this field.
+	RoleGated bool `json:"role_gated"`
 }

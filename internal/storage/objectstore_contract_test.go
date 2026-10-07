@@ -7,11 +7,12 @@
 // slash, Azure treating a backslash as a separator) are properties of the
 // servers, not of any mock.
 //
-// Run with:
+// Run with (SeaweedFS stands in for S3; see .github/workflows/ci.yml for the
+// identities file that supplies the minioadmin credentials these tests use):
 //
-//	docker run -d --name arc-minio -p 9000:9000 \
-//	  -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-//	  quay.io/minio/minio server /data
+//	docker run -d --name arc-seaweedfs -p 9000:8333 \
+//	  -v /tmp/seaweed-s3.json:/etc/seaweedfs/s3.json:ro \
+//	  chrislusf/seaweedfs:4.47 server -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
 //	ARC_TEST_S3_BUCKET=arctest go test -tags='duckdb_arrow objectstore' ./internal/storage/
 //
 // CI does this in .github/workflows/ci.yml.
@@ -25,6 +26,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -34,6 +36,41 @@ import (
 
 	"github.com/rs/zerolog"
 )
+
+// TestS3WriteReaderUnseekableOverHTTP pins that a body the SDK cannot rewind
+// uploads over the plain-HTTP endpoint CI uses: as one PutObject (1 KiB) and
+// as a multipart upload (20 MiB, past one 16 MiB part). The SDK refused the
+// former client-side before a byte was sent; the latter — CRC32 headers on
+// every part and on the completion — had never been observed against a real
+// store. The pattern is positional so a mis-ordered or missing part shows.
+func TestS3WriteReaderUnseekableOverHTTP(t *testing.T) {
+	b := minioBackend(t)
+	ctx := context.Background()
+
+	for _, size := range []int{1024, 20 * 1024 * 1024} {
+		key := fmt.Sprintf("contract-unseekable/x/2024/03/15/%d.parquet", size)
+		data := make([]byte, size)
+		for i := range data {
+			data[i] = byte(i * 7)
+		}
+		pr, pw := io.Pipe()
+		go func() {
+			_, _ = pw.Write(data)
+			_ = pw.Close()
+		}()
+		if err := b.WriteReader(ctx, key, pr, int64(size)); err != nil {
+			t.Fatalf("WriteReader(%d bytes via io.Pipe): %v", size, err)
+		}
+		got, err := b.Read(ctx, key)
+		if err != nil {
+			t.Fatalf("Read(%s): %v", key, err)
+		}
+		if !bytes.Equal(got, data) {
+			t.Fatalf("read back %d bytes for a %d-byte upload, or the content differs", len(got), size)
+		}
+		_ = b.Delete(ctx, key)
+	}
+}
 
 func minioBackend(t *testing.T) *S3Backend {
 	t.Helper()
@@ -221,6 +258,51 @@ func TestS3ListNeverReturnsUnusableKeys(t *testing.T) {
 		if err := ValidateKey(o.Path); err != nil {
 			t.Errorf("ListObjects returned %q, which this backend refuses: %v", o.Path, err)
 		}
+	}
+}
+
+// TestS3HasObjectsUnderPrefix pins the PrefixProber contract (#1084) against a
+// real store: a prefix with an object is true, an empty one is false, and a
+// prefix whose only key is one ListObjects hides (a directory marker) is
+// false, because the probe applies the listing's visibility rule rather than
+// answering from the raw key count.
+func TestS3HasObjectsUnderPrefix(t *testing.T) {
+	b := minioBackend(t)
+	ctx := context.Background()
+
+	if err := b.Write(ctx, "probe/real/2026/01/01/00/x.parquet", []byte("data")); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+	t.Cleanup(func() { _ = b.Delete(ctx, "probe/real/2026/01/01/00/x.parquet") })
+
+	for prefix, want := range map[string]bool{
+		"probe/real/": true,
+		"probe/rea":   true, // a key prefix on S3, as ListObjects treats it
+		"probe/none/": false,
+		"probe/":      true,
+	} {
+		got, err := b.HasObjectsUnderPrefix(ctx, prefix)
+		if err != nil {
+			t.Errorf("HasObjectsUnderPrefix(%q): %v", prefix, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("HasObjectsUnderPrefix(%q) = %v, want %v", prefix, got, want)
+		}
+	}
+	if _, err := b.HasObjectsUnderPrefix(ctx, "/"); err == nil {
+		t.Error(`HasObjectsUnderPrefix("/") accepted an invalid prefix`)
+	}
+
+	if err := putRawKey(t, b, "probe/marker/dir/"); err != nil {
+		t.Skipf("could not create a directory marker: %v", err)
+	}
+	got, err := b.HasObjectsUnderPrefix(ctx, "probe/marker/")
+	if err != nil {
+		t.Fatalf("HasObjectsUnderPrefix(probe/marker/): %v", err)
+	}
+	if got {
+		t.Error("a prefix holding only a directory marker answered true; ListObjects hides that key, so the probe must too")
 	}
 }
 

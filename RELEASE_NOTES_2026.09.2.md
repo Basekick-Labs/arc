@@ -1,13 +1,6 @@
 # Arc v2026.09.2 Release Notes
 
-> **Status:** Planned — October 2026 patch release.
-
-## Fixed: reject non-finite and rounded-out-of-range float conversions
-
-The integer conversion guard now rejects NaN, infinities, and float values at
-or beyond the exclusive `2^63` upper boundary. This closes a gap in the
-previous overflow fix, where converting `math.MaxInt64` to a floating-point
-type rounded it to `2^63` and allowed an invalid conversion.
+> **Status:** Released 2026-10-01.
 
 ## New: administrative cluster file deletion (`DELETE /api/v1/cluster/files`) ([#830](https://github.com/Basekick-Labs/arc/pull/830))
 
@@ -86,6 +79,26 @@ It is unauthenticated, like `/ready`, and strictly narrower: anything that makes
 
 Writes that arrive at a node which is not a write target are still accepted and proxied, as before. This endpoint lets a load balancer avoid that hop rather than changing what happens without one.
 
+## New: exclude databases from scheduled compaction (`compaction.exclude_databases`) ([#940](https://github.com/Basekick-Labs/arc/issues/940))
+
+Compaction used to be all-or-nothing: every database a scheduled cycle discovered was eligible, so one database with a huge backlog — a historical import, say — could keep the compactor busy while databases you care about more waited behind it.
+
+`compaction.exclude_databases` is a list of database names that scheduled cycles, and manual triggers that don't name a database, skip during candidate discovery. A trigger that does name one (`POST /api/v1/compaction/trigger?database=X`) bypasses the list, because an operator naming a database is explicit intent. The two together are the priority control: exclude what should wait, then trigger scoped cycles in whatever order you want.
+
+Names match exactly and case-sensitively — no prefixes, no globs, no separator splitting — so excluding `wh` never touches `wh-other`, and a spoke namespace whose ID contains a comma or dot is excluded verbatim. On an edge-sync hub, received spoke data is excluded either as one pseudo-database (`spoke1/telemetry`) or as the whole namespace (`spoke1`), and excluding the namespace also skips listing its children; while a received namespace is excluded, its raw files accumulate until it is un-excluded or triggered. The manual bypass works at spoke granularity there — `?database=` takes plain database names, so an excluded pseudo-database is bypassed by triggering its whole spoke, and a spoke whose ID is not a legal database name has no manual bypass yet. The candidates endpoint (`GET /api/v1/compaction/candidates`) applies the same filter, so it keeps previewing exactly what a scheduled cycle would process (which means it does not preview excluded databases), `GET /api/v1/compaction/stats` reports the active list, an unscoped trigger's response echoes it, and a startup warning flags entries whose shape can never match a discovered database (reserved prefixes, path escapes, stray or doubled slashes).
+
+Things the list deliberately does not touch: manifest recovery, so a compaction that was interrupted mid-flight always completes even if its database has since been excluded — exclusion gates new work, never the completion of started work — and retention, tiering, and Iceberg export, which are separate systems with their own configuration: an excluded database still ages to cold storage and still exports. The default is an empty list, so existing deployments are unchanged. The key takes a TOML array (`exclude_databases = ["staging", "imports_backlog"]`) or a whitespace-separated environment override (`ARC_COMPACTION_EXCLUDE_DATABASES="staging imports_backlog"`).
+
+## Changed: the bundled object store is now SeaweedFS (MinIO retired its open-source images)
+
+MinIO has retired its open-source distribution — its container images no longer pull, and the successor product, AIStor, is commercial. Everything in this repository that deployed MinIO now deploys [SeaweedFS](https://github.com/seaweedfs/seaweedfs) (`chrislusf/seaweedfs:4.47`, pinned) instead: the enterprise Helm chart's bundled shared-storage tier, the `oss-s3` and `enterprise-shared` Compose stacks, and CI's object-storage contract step. None of this changes Arc itself: Arc speaks S3, and an **external** MinIO deployment you already run keeps working — `storage.backend = "minio"` remains an accepted alias of `s3`.
+
+Two behaviors improve with the swap. Buckets are created on the first authenticated write, so the Helm chart needs no manual bucket step — Arc's first flush creates the bucket (the old bundled MinIO required creating it by hand). The Compose stacks still pre-create the bucket with a one-shot init (now `weed shell` on the SeaweedFS image instead of a separate `mc` image), because a read-only API call that lists storage before anything was written would hit `NoSuchBucket` and answer 500 — [#945](https://github.com/Basekick-Labs/arc/issues/945) tracks treating that as an empty store on read paths. And the chart-managed credentials Secret now uses the same `access-key`/`secret-key` keys as an operator-supplied external-S3 secret, so the two paths are no longer shaped differently.
+
+One caution the bundled MinIO never raised: SeaweedFS's credentials guard only the S3 port, while its single process also opens master, volume and filer ports. The chart therefore disables the HTTP data planes at the process level (`-disableHttp`) and ships a NetworkPolicy — default on, `seaweedfs.networkPolicy.enabled` — pinning ingress to the S3 port from the release's own pods, which also covers the gRPC planes wherever the CNI enforces NetworkPolicy. The Compose stacks publish only the authenticated S3 port to the host, plus the master status port bound to loopback.
+
+For the Helm chart this is a **breaking values change** — see Upgrade notes.
+
 ## Changed: telemetry now reports the arcli installations an instance served
 
 Arc's opt-out telemetry gains a `clients` section describing the [arcli](https://github.com/Basekick-Labs/arcli) installations that talked to this instance since the last successful report. arcli sends a random per-installation UUID and its version with each request. Arc counts an installation only on a request that succeeded (a status below 400) and, when authentication is configured, that carried a valid token, so unauthenticated endpoints such as `/health` never contribute. It then reports, per installation, the id, the version, and the time it was last seen, plus a count and a `truncated` flag once more than 256 distinct installations have been seen between reports. The section is omitted entirely when no arcli client was seen.
@@ -93,6 +106,12 @@ Arc's opt-out telemetry gains a `clients` section describing the [arcli](https:/
 The identifier is generated by arcli and is not derived from a user, a machine, or a network address, and no query text, database or measurement names, tokens, or IP addresses are included. The purpose is to tell how many distinct CLI installations an instance serves and which versions are in use.
 
 This rides on the existing telemetry channel and the existing switch: `telemetry.enabled = false` in `arc.toml`, or `ARC_TELEMETRY_ENABLED=false`, disables all of it including this section.
+
+## Removed: the cold tier's storage-class and retrieval keys, which never did anything ([#955](https://github.com/Basekick-Labs/arc/pull/955))
+
+`tiered_storage.cold.s3_storage_class`, `tiered_storage.cold.azure_access_tier` and `tiered_storage.cold.retrieval_mode`, and their `ARC_TIERED_STORAGE_COLD_*` environment forms, were parsed and never read. They date from an early hot/warm/cold design whose warm tier was dropped, and cold objects have always been written with no storage class or access tier set — S3 `STANDARD`, and on Azure the storage account's default tier, Hot unless the account owner changed it — and read in place. The keys are gone, from the loader and from the shipped `arc.toml`. A configuration that still sets them loads unchanged, since unknown keys are ignored. The documentation that advertised Glacier and Archive classes with retrieval modes described something that did not exist; it is corrected alongside this release ([docs.basekick.net#87](https://github.com/Basekick-Labs/docs.basekick.net/pull/87)).
+
+There is no replacement, deliberately. Cold data in Arc is old telemetry that is still queried, not an archive, so the saving tiering exists for is block storage versus object storage. A cheaper class either adds a per-gigabyte retrieval fee to every query that touches cold data or, for Glacier Flexible Retrieval, Deep Archive and Azure Archive, makes the objects unreadable without a restore. Keep bucket lifecycle rules off the cold prefix for the same reason.
 
 ## Security fixes
 
@@ -316,6 +335,18 @@ fails the build rather than leaving the note quietly wrong.
 
 ## Upgrade notes
 
+### The Helm chart's bundled MinIO is replaced by SeaweedFS (breaking values change)
+
+The `minio:` values block is renamed `seaweedfs:`, credentials are `seaweedfs.credentials.accessKey`/`secretKey` (previously `minio.credentials.rootUser`/`rootPassword`), the chart-managed Secret's keys are `access-key`/`secret-key`, and the in-cluster S3 service is `<release>-seaweedfs` on port 8333. The chart's schema now rejects any `minio.*` key outright — including old keys merged back in by `helm upgrade --reuse-values` — so the rename cannot be picked up silently: the upgrade fails until the values are renamed.
+
+Data on an existing bundled-MinIO PersistentVolume is **not migrated**: SeaweedFS cannot read MinIO's on-disk layout, and upgrading a bundled install renders a new, empty object store. Before switching, sync the bucket out and back (`aws s3 sync` against the old and new endpoints), or keep your data where it is by setting `storage.shared.external=true` with the old store's endpoint and credentials — external stores, including MinIO, remain fully supported. The Compose stacks have the same property (the `minio-data` volume is not read by the new `seaweedfs` service); they are development stacks, but sync the bucket first if the data matters.
+
+### Known behavior: WAL crash-recovery replay is at-least-once ([#948](https://github.com/Basekick-Labs/arc/issues/948))
+
+Not new in this release, but documented now because a live crash-recovery exercise made it precise. When a node with `wal.enabled=true` dies hard and restarts, recovery replays its whole active WAL file — including entries whose batches had already been flushed to Parquet before the crash. Nothing acknowledged is lost, but the already-durable entries are re-ingested.
+
+For tagged measurements the duplicates are exact copies and are removed the next time compaction merges the partition (dedup keys on tags + time), so queries can read high between the recovery and that pass. For measurements with no tags, compaction deliberately does not dedup — two tagless rows with one timestamp can be two legitimate events — so crash-recovery duplicates there currently persist. The window is bounded by WAL rotation (`wal.max_size_mb`, `wal.max_age`). [#948](https://github.com/Basekick-Labs/arc/issues/948) tracks flush-watermark checkpointing for 26.09.3, which replays only genuinely unflushed entries. Graceful shutdown is unaffected: it flushes and purges the WAL cleanly.
+
 ### A node asked to bootstrap Raft on a non-writing role now exits at startup
 
 `cluster.raft_bootstrap` has been a no-op on any node that already had Raft state, so setting it everywhere rather than on one node was harmless and some deployments do exactly that. From this release, a node with `cluster.raft_bootstrap=true` and a role that does not accept writes logs the reason and exits, because bootstrapping on such a role hands the new cluster the precise failure this release fixes: that node is elected, then fails the writer half of every singleton-task check, and there is no second voter that could take leadership away from it.
@@ -405,6 +436,294 @@ Check `cluster.role` on every node before upgrading a cluster. The accepted valu
 
 ## Bug fixes
 
+### A node restored with an empty data disk never got its own files back, and reconciliation could then delete them everywhere ([#959](https://github.com/Basekick-Labs/arc/issues/959), [#961](https://github.com/Basekick-Labs/arc/pull/961))
+
+On a per-node-storage cluster with file replication, the file puller assumed
+a node still holds every file it once wrote and never pulled a file whose
+origin was the node itself. A node that came back with an empty data disk
+under a stable `cluster.node_id` — the StatefulSet shape — pulled every other
+node's files back and none of its own, and its reads of those partitions
+returned fewer rows with no error, for good. If reconciliation then ran on
+that node in act mode, the orphan-manifest sweep found each of those entries
+missing locally and proposed its deletion, which every other node carried out
+on its replica; in the default dry run the report simply listed the node's
+own files as orphans.
+
+On per-node storage the walks now let the disk decide: at startup and on
+every periodic pass a file this node originated is checked at the manifest's
+size, skipped when present as before, and otherwise pulled from a peer that
+holds a replica, with the same catch-up accounting as any other file, so the
+query gate, when enabled, stays closed until it is back. A reactive register
+of an own file — the node just wrote it — is still never pulled, and on a
+shared bucket nothing changes, since a missing own object there is not on any
+peer either. The reconciler's orphan-manifest sweep on such a cluster now
+waits until file replication has converged on the node before it proposes
+anything; a held sweep is reported as `manifest_sweep_held` in the run, the
+storage half still runs, and the orphan-manifest counts are still reported.
+
+Two things to know. A file this node originated that no peer holds any more
+keeps the node's catch-up from converging, so its manifest sweep stays held —
+for all of that node's own orphans. To clear it, first confirm from a dry run
+that the node's remaining own orphans are only files no peer holds (the
+puller's log names each failed pull; a replica holder that is merely down
+heals on the next periodic pass); then restart with
+`cluster.replication_catchup_enabled=false`, run one act-mode reconciliation —
+with the walker off the sweep is not held, and it deletes every own-origin
+entry still missing on this node — and restart again with the walker
+re-enabled, after which catch-up no longer sees the entry and converges. And
+with the walker disabled in the first place neither the re-pull nor the hold
+applies (with reconciliation enabled, Arc says so at startup): keep
+reconciliation in dry run after a restore on such a cluster. If the startup
+manifest barrier times out, own files replayed by Raft after that point are
+recovered by the next periodic pass rather than the catch-up batch.
+
+### The reconciler reported every replicated file as orphan storage on a per-node cluster ([#957](https://github.com/Basekick-Labs/arc/issues/957), [#960](https://github.com/Basekick-Labs/arc/pull/960))
+
+On a per-node-storage cluster the reconciler scoped the manifest to the
+entries this node had originated before comparing it with the node's disk, on
+the assumption that other nodes' files could not be on that disk. With file
+replication on — or a local backend over a shared mount — every node holds
+every file, so each run's dry-run audit reported the replicas of every other
+node as orphan storage: nearly the whole manifest on a writer, all of it on a
+reader. Nothing was deleted, because the storage sweep re-checks each
+candidate against the manifest before it deletes, but that re-check was a
+race guard doing a job it was never meant to do, the audit an operator
+reviews before turning the dry run off was unusable, and each run spent a
+manifest-sized lookup pass rejecting replicas. The same scoping also fed the
+walk, so a measurement only other nodes write, in a database this node had
+any entry in, was never walked on this node and a genuine orphan under it
+was invisible there.
+
+The membership check now uses every manifest entry — a tracked path is never
+an orphan-storage candidate, whatever node originated it — and the origin
+scoping applies only to the orphan-manifest direction, where it belongs: an
+entry another node originated that is missing from this disk is left to file
+replication. Measurements other nodes write are walked too. One wiring fix
+rides along: a node without an explicit `cluster.node_id` passed an empty id
+to the reconciler, which refused it, logged an error at startup and disabled
+the feature; it now uses the id the coordinator generated, the same one it
+stamps into manifest entries. That generated id is host name plus process id,
+so on bare metal it changes at every restart and entries stamped before the
+last restart count as another node's; set `cluster.node_id` explicitly where
+the orphan-manifest direction matters.
+
+### A replica the manifest had dropped could stay on a node forever ([#958](https://github.com/Basekick-Labs/arc/pull/958))
+
+On a per-node-storage cluster with file replication, every node that applies
+a manifest delete unlinks its local copy of the file. The hand-off from the
+manifest to that unlink was a channel of 1024 slots with a non-blocking send:
+when it was full, the delete was dropped with a log line that promised a
+reconcile on restart — and nothing reconciles it, because startup catch-up
+only pulls what the manifest lists. Full was easy to reach. Each of the two
+delete workers takes one item and then waits out a 500 ms grace, while
+retention proposes deletes in chunks of 1000 with no pause and a compaction
+backlog applies dozens of completion manifests in one poll. A second loss sat
+at shutdown: stopping cancelled the coordinator's context before it closed the
+channel, so the item a worker was holding through its grace and everything
+still buffered were gone. The replica stayed on that node, and every read
+there read the file twice.
+
+Manifest deletes now go onto a pending list with no bound — it cannot outgrow
+the manifest the node already holds in memory, and the workers take the whole
+list every grace period — and the workers stop only when the node stops,
+after it has unregistered the manifest callbacks, so a stop drains everything
+that is pending. That drain is bounded at ten seconds, inside the default
+30-second `server.shutdown_timeout`; a disk that does not answer within it is
+reported at Error with the count still on disk, and a shutdown budget below
+about fifteen seconds can leave no time for the flush pass after a large
+drain. Before each unlink a worker asks the manifest whether it lists the path
+again and, if so, leaves the file alone. `arc_cluster_local_delete_pending`
+reports the backlog — entries not yet taken plus entries a worker holds — and
+should return to zero within a grace period of every burst; a value that
+keeps climbing means the workers are not keeping up. What remains: a crash,
+as opposed to a stop, loses the deletes pending at that instant, except the
+ones Raft re-applies on restart because they came after the last snapshot,
+which it does once the node has re-registered its manifest callbacks —
+usually all of them, since a lone node must first win an election.
+
+### A measurement whose files had all moved to cold returned nothing to a query without a time range ([#954](https://github.com/Basekick-Labs/arc/pull/954))
+
+Compaction consumes a measurement's raw hour files, but tiering kept their
+hot rows forever, so every multi-tier read of that measurement still
+included the hot tier. Once tiering had moved the compacted daily files to
+cold too — the hot directory now empty — a query without a time range sent
+that empty hot glob to DuckDB as-is, DuckDB reported "no files", and the
+whole read came back with zero rows and no columns, cold data included; the
+same query with a time range worked, because per-tier partition pruning
+already drops a tier with no matching partitions. Reachable on any node in
+either deployment pattern as soon as every file of a measurement has
+migrated (found on #953's live run, where a per-node cluster can reach that
+state for the first time).
+
+Two changes. A tier that reaches DuckDB unpruned is first checked for a
+parquet file — empty partition directories, which compaction and migration
+leave behind, do not count — by walking the partition tree newest partition
+first, one listing per level (a `readdir` locally, one delimited listing on
+an object store) and stopping at the first file, with one recursive listing
+deciding when the walk finds nothing or runs out of budget on a forest of
+empty directories; a tier with no file is dropped, a listing that fails
+keeps the tier, as before, and a read that dropped a tier is never served
+from the query cache. And the hot scan now retires hot rows whose file
+the listing did not return — after a five-minute margin, so a file flushed
+around the scan is never retired — which also fixes the hot counts in
+`GET /api/v1/tiering/status` (`hot_retired` in the scan result) and stops a
+vanished file from ever being selected for migration. Cold and quarantined
+rows are never touched.
+
+### Tiered files now leave the cluster manifest, and replicating per-node clusters get the primary-writer gate ([#953](https://github.com/Basekick-Labs/arc/pull/953))
+
+Tiering never told the cluster file manifest when it moved a file to cold.
+On a per-node-storage cluster with file replication (Pattern 1) that made
+migration undo itself: a node that moved a daily file to cold and deleted its
+local copy had the file pulled straight back from a peer, because the
+manifest still listed it — every node did this to its own replica, and once
+every peer had migrated, any node that restarted failed its startup catch-up
+on the entry and, with `cluster.query_gate_on_catchup`, answered reads with
+503 until the entry went away by hand. On a shared bucket (Pattern 2) the
+stale entries were harmless but accumulated forever unless the reconciler ran
+with `manifest_only_dry_run=false`.
+
+Migration now removes a file from the manifest before it removes the hot
+copy, one batched proposal per chunk of at most 200 files, and no two
+proposals from a node closer than a second — the FSM applies a proposal
+synchronously on every node and queues each removed local copy into a
+bounded unlink queue, so proposals stay small and spaced. On a per-node
+cluster the manifest delete is what unlinks the replica on every node; on a
+shared bucket it is bookkeeping and the migrator still deletes the object. A
+manifest failure (after four attempts over about seven seconds on
+leader-election blips) leaves the remaining hot copies in place; the rows
+already say cold, and reconciliation finishes them, manifest-first, within
+its 48-hour window — until then those files are read twice on the primary
+and on any node that has already synced their cold rows. Reconciliation of
+orphaned hot copies takes the same order. A sweep on the primary removes
+manifest entries for files that were already in cold before this release,
+once a row has been cold for an hour and the cold object exists with the
+recorded size, so replicas stop being re-pulled and restarts catch up; an
+upgraded cluster with thousands of such files takes about one second per 200
+on its first cycle. The unlink queue that could overflow on a node and leave
+a replica behind is fixed in this release too; see "A replica the manifest
+had dropped could stay on a node forever" above.
+
+Two things follow for Pattern 1. First, a replicating per-node cluster is now
+gated like shared storage (#951): only the primary writer migrates, and every
+node syncs its tier metadata from the cold tier each cycle. A per-node
+cluster without replication shares nothing and keeps its per-node behaviour.
+Second — read this if you run tiering on such a cluster — **every replicating
+node must run tiering with the same cold backend**: once the primary migrates
+a daily file, the manifest delete removes every replica, and a node reads
+that data only through its own cold row and cold backend. A node with tiering
+off, or with no cold tier, cannot see that data any more; Arc says so at
+startup on such a node. After the replica is unlinked, a node that has no
+cold row yet for that measurement does not read the file until its next cold
+sync — at the default `0 2 * * *` schedule up to a day, for a measurement's
+first cold file on that node only; shorten `tiered_storage.migration_schedule`
+on readers if that matters.
+
+Also changed: a copy whose tier flip fails no longer deletes the cold object
+it just wrote (another node's metadata sync may already rely on it; the next
+cycle copies over it, and until then a node that already routes that
+measurement to cold reads the leftover once more), and a manual migration
+during a scheduled one still answers `409 Conflict`.
+
+### Streaming uploads failed against plain-HTTP S3 endpoints ([#952](https://github.com/Basekick-Labs/arc/pull/952))
+
+Uploads whose body the AWS SDK cannot rewind — the tiering migrator's
+streaming copy, an edge-sync hub receiving a file, a peer-replication pull
+into an S3-backed node — failed against any plain `http://` S3 endpoint
+(SeaweedFS, MinIO, an internal proxy) with `compute input header checksum
+failed, unseekable stream is not supported without TLS and trailing
+checksum`. The SDK signs the payload and computes a request checksum before
+sending, both of which need to re-read the body, and its rewind-free
+alternative (trailing checksums) exists only over TLS. Bodies of 100 MiB and
+more were unaffected because they already went through the SDK's buffered
+uploader; everything smaller — every daily file tiering moves, every
+edge-sync receive — went through a plain `PutObject` and failed before a
+byte was sent. Over TLS these paths worked, which is why AWS deployments
+never saw it; #951's live run against SeaweedFS did.
+
+The S3 backend now reads an unrewindable body into memory first: up to
+16 MiB as a right-sized buffer behind the same single `PutObject`, larger as
+16 MiB parts through the uploader. Rewindable bodies (ingest flushes,
+compaction output, backups) take exactly the path they took before. Two
+consequences: a body whose length differs from what the caller declared now
+fails with `ErrBodyLength` and commits nothing (before, the store rejected it
+over TLS and it was never sent over plain HTTP), and because every request body is now
+rewindable, a transient error on one of these uploads is retried instead of
+failing with `failed to rewind transport stream`. The tiering migrator sizes
+the copy from the source file rather than its metadata row. A multipart
+upload cancelled mid-way (a cycle deadline, a shutdown) is aborted only while
+its context is live, so a bucket receiving streamed uploads should carry an
+`AbortIncompleteMultipartUpload` lifecycle rule — already true for files over
+100 MiB.
+
+Memory: one buffer the size of the file per in-flight streaming upload under
+16 MiB (`tiered_storage.migration_max_concurrent`, default 4, bounds
+tiering's); up to six 16 MiB buffers per larger stream.
+
+### Tiering migration ran on every node of a shared-storage cluster, and nodes that never migrated could not see cold data ([#951](https://github.com/Basekick-Labs/arc/pull/951))
+
+In Pattern 2 (`cluster.shared_storage_mode = true`, one object-store bucket
+shared by every node), every scheduled singleton gates on the primary writer
+except tiering migration. Each node's 02:00 cycle listed the shared hot
+bucket, registered every file in its own metadata store, and raced the other
+nodes to copy the same daily files to cold and delete them from hot: N copies
+of every migration PUT, duplicate migration-history rows, "Failed to delete
+source file" warnings on every node but the winner, and on a losing node a
+row that still said `hot` for a file that now existed only in cold, retried
+every cycle.
+
+The second half of the problem was invisible. Each node routes queries from
+its own metadata, and a node only learned that a measurement had cold data by
+winning the migration race for one of that measurement's files. A node that
+never won — a reader, typically — silently dropped the cold tier from every
+query on that measurement.
+
+Migration now runs on the Raft leader among the writers, the same gate
+retention and continuous queries use, checked on every cycle so a leader
+change takes effect without a restart. Every node with a cold tier configured
+still runs a metadata sync each cycle: it lists the cold tier and records what
+the primary moved, so
+readers and standby writers keep including cold data in queries, and a newly
+elected primary does not re-migrate files its predecessor already moved. The
+sync stamps `migrated_at` from the cold object's own timestamp, so a fresh
+node joining a cluster with years of cold data does not spend two cycles
+re-checking all of it. `GET /api/v1/tiering/status` reports
+`scheduler.role_gated` on nodes that sync but never migrate, and
+`POST /api/v1/tiering/migrate` on such a node answers `409 Conflict` naming
+the node's role instead of running. `POST /api/v1/tiering/scan` runs the same
+sync and reports `cold_synced`. The status endpoint also names the hot tier's
+real backend instead of always `local`.
+
+Two limits are worth knowing. All nodes fire on the same cron minute, so a
+non-primary learns a cycle's moves on its next cycle; only a measurement's
+very first cold file is affected, for one cycle. And the sync only ever adds
+or flips rows to cold — a cold row whose object has since disappeared is
+reported in one warning; while the measurement has any hot row on that node
+the hot copy is still read, and the primary's reconciliation reverts such a
+row to hot (so the file is migrated again) when it finds the hot copy
+present, rather than treating the row as proof of a cold copy and deleting
+the only one. A cycle asked for while one is already running on the same
+node — a manual trigger during the scheduled cycle — answers `409 Conflict`
+instead of overlapping it, and a primary whose cold listing failed skips
+migration for that cycle rather than re-selecting files that are already in
+cold.
+
+Two startup refusals close the same hole for every gated task. A node in
+shared-storage mode whose `cluster.role` is unset or `standalone` now exits:
+such a node votes in Raft and can win leadership, but only a writer passes
+the primary-writer gate, so a standalone leader meant retention, continuous
+queries and deletes ran on no node (and tiering migration, now gated, would
+have joined them). And a node in shared-storage mode whose cluster
+coordinator is not running — the license lacks clustering, or the
+coordinator failed to initialize or start — now exits instead of continuing
+"in standalone mode": without the coordinator every gated task would run
+unconditionally against the shared bucket.
+
+Per-node storage clusters (Pattern 1) were not gated by this change: tiering
+had no coordination with the file-replication manifest, so a gate alone would
+not have helped. The manifest integration entry above closes that and gates
+replicating per-node clusters the same way.
+
 ### Configurable compaction cycle budget and cancellation ([#915](https://github.com/Basekick-Labs/arc/issues/915))
 
 Scheduled and manual compaction use the same configurable cycle deadline
@@ -475,6 +794,11 @@ it. Backups copy it with the rest of the storage root, as auxiliary files
 outside the database inventory (#927), and restore it with the data. A node
 that receives Parquet files from a peer rather than through its own ingest
 path relies on bootstrap for those measurements.
+
+`scripts/range_schema_acceptance.py` runs the original reproducer (a late
+field inside one day, a field first written 59 days after the earlier day was
+compacted, a field that stops being written, daily compaction and restarts)
+against a native build; see `docs/testing/range-schema-26.09.2.md`.
 
 ### Parked unparseable compaction manifests are counted ([#926](https://github.com/Basekick-Labs/arc/issues/926))
 
@@ -1472,7 +1796,7 @@ What changes:
 
 - A backup now reports these files: a count and a sample of their paths in the
   backup manifest, a warning naming them, and a metric
-  (`arc_storage_unaddressable_files_total`) so it is visible without reading a
+  (`arc_storage_unaddressable_files`) so it is visible without reading a
   manifest. The message says to rename them, which is what actually recovers the
   data.
 - **A backup whose data files are all unaddressable now fails.** It previously

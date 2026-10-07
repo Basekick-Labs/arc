@@ -33,6 +33,12 @@ const (
 	multipartConcurrency = 5
 )
 
+// ErrBodyLength reports a body that ended before, or continued past, the
+// length its caller declared to WriteReader. Nothing is committed: a small
+// body is checked before its PutObject is sent, and a multipart upload is
+// aborted.
+var ErrBodyLength = errors.New("s3: body length does not match the declared size")
+
 // HTTP transport bounds for the AWS SDK client. These cap the per-process
 // idle-connection state — the leak we care about is HTTP/2 frame buffers and
 // keep-alive metadata accumulating across long retention/delete sweeps. We do
@@ -177,7 +183,7 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 	// Validate the prefix rather than repairing it. A prefix that cannot form
 	// usable keys must stop the backend from being built: the old fallback was
 	// the bucket root, which is a different location, not a safe default.
-	prefix, err := ValidateS3Prefix(cfg.Prefix)
+	prefix, err := ValidateObjectPrefix(cfg.Prefix)
 	if err != nil {
 		return nil, err
 	}
@@ -217,8 +223,19 @@ func (b *S3Backend) Write(ctx context.Context, path string, data []byte) error {
 	return b.WriteReader(ctx, path, bytes.NewReader(data), int64(len(data)))
 }
 
-// WriteReader writes data from a reader to S3
-// For files larger than 100MB, uses multipart upload to avoid OOM
+// WriteReader writes data from a reader to S3.
+//
+// A body the SDK can rewind (*os.File, *bytes.Reader) goes as one PutObject
+// under the multipart threshold and through the Uploader above it. A body it
+// cannot rewind — a streaming copy's io.Pipe, an HTTP request body — needs
+// different handling on a plain-HTTP endpoint: the SDK signs the payload and
+// computes a request checksum before sending, both of which re-read the
+// body, and its rewind-free alternative (trailing checksums) exists only over
+// TLS. Such a body is read into memory first: up to one part size it becomes
+// a right-sized buffer behind the same PutObject, beyond that the Uploader
+// buffers 16 MiB parts. A declared size is enforced for an unrewindable body
+// (ErrBodyLength on a mismatch, nothing committed), and the source must end
+// — EOF or error — once the declared bytes have been read.
 func (b *S3Backend) WriteReader(ctx context.Context, path string, reader io.Reader, size int64) error {
 	key, err := b.prefixedKey(path)
 	if err != nil {
@@ -232,10 +249,26 @@ func (b *S3Backend) WriteReader(ctx context.Context, path string, reader io.Read
 		contentType = "application/vnd.apache.parquet"
 	}
 
-	// Use multipart upload for large files or unknown size
-	// This streams data in chunks without loading everything into memory
-	if size <= 0 || size >= multipartThreshold {
+	seekable := isSeekable(reader)
+	switch {
+	case size <= 0 || size >= multipartThreshold:
+		// Large or unknown length: the Uploader streams it in parts.
+		if !seekable && size > 0 {
+			reader = &exactLengthReader{ctx: ctx, r: reader, want: size}
+		}
 		return b.writeMultipart(ctx, path, reader, size, contentType, start)
+	case !seekable && size > multipartPartSize:
+		return b.writeMultipart(ctx, path, &exactLengthReader{ctx: ctx, r: reader, want: size}, size, contentType, start)
+	case !seekable:
+		// The request never leaves the process if the body is wrong, so this
+		// is the caller's error, not a storage error: not counted, and not
+		// logged here — every caller logs (or, for edge sync's dropped link,
+		// deliberately does not).
+		buf, err := spoolExact(ctx, reader, size)
+		if err != nil {
+			return fmt.Errorf("failed to read body for S3 upload: %w", err)
+		}
+		reader = bytes.NewReader(buf)
 	}
 
 	// For small files with known size, use simple PutObject
@@ -270,49 +303,151 @@ func (b *S3Backend) WriteReader(ctx context.Context, path string, reader io.Read
 	return nil
 }
 
-// writeMultipart handles multipart upload for large files
-// This streams data in 16MB chunks without loading the entire file into memory
+// writeMultipart hands the body to the SDK Uploader, which buffers 16 MiB
+// parts into memory and sends them as rewindable requests: one PutObject
+// when the body ends within the first part, a multipart upload otherwise.
+// A failed multipart upload is aborted, but only while ctx is live — a
+// cancelled context leaves parts behind, so a bucket that receives these
+// should carry an AbortIncompleteMultipartUpload lifecycle rule.
 func (b *S3Backend) writeMultipart(ctx context.Context, path string, reader io.Reader, size int64, contentType string, start time.Time) error {
 	key, err := b.prefixedKey(path)
 	if err != nil {
 		return err
 	}
-	_, err = b.uploader.Upload(ctx, &s3.PutObjectInput{
+	out, err := b.uploader.Upload(ctx, &s3.PutObjectInput{
 		Bucket:      aws.String(b.bucket),
 		Key:         aws.String(key),
 		Body:        reader,
 		ContentType: aws.String(contentType),
 	})
 	if err != nil {
-		recordStorageError(ctx, err)
-		b.logger.Error().
-			Err(err).
-			Str("path", path).
-			Int64("size", size).
-			Msg("Failed multipart upload to S3")
-		return fmt.Errorf("failed multipart upload to S3: %w", err)
+		// A length mismatch is the caller's error, counted and logged the
+		// same way as on the spooled path: by the caller. Everything else is
+		// the store's.
+		if !errors.Is(err, ErrBodyLength) {
+			recordStorageError(ctx, err)
+			b.logger.Error().
+				Err(err).
+				Str("path", path).
+				Int64("size", size).
+				Msg("Failed streamed upload to S3")
+		}
+		return fmt.Errorf("failed streamed upload to S3: %w", err)
 	}
 
-	// Record metrics. Multipart is also the path for unknown-size streams
+	// Record metrics. This is also the path for unknown-size streams
 	// (size <= 0), where the byte count is unavailable — count the write but
-	// skip the byte counter rather than subtracting from it. Note: size is
-	// the caller-declared length, not bytes observed on the wire — the
-	// uploader streams to EOF regardless of size, so a stale declared size
-	// drifts the byte counter (all current callers pass stat-derived sizes).
+	// skip the byte counter rather than subtracting from it. For an
+	// unrewindable body size is enforced on the wire (exactLengthReader);
+	// for a rewindable one it is the caller's declared length, which every
+	// such caller derives from a stat.
 	metrics.Get().IncStorageWrites()
 	if size > 0 {
 		metrics.Get().IncStorageWriteBytes(size)
 	}
 
-	b.logger.Info().
+	b.logger.Debug().
 		Str("path", path).
 		Int64("size", size).
 		Str("bucket", b.bucket).
 		Dur("duration", time.Since(start)).
-		Bool("multipart", true).
-		Msg("Wrote to S3 via multipart upload")
+		Bool("multipart", out != nil && out.UploadID != "").
+		Msg("Wrote to S3 via uploader")
 
 	return nil
+}
+
+// isSeekable mirrors the SDK's own test: an io.Seeker whose Seek works. A
+// body that only claims Seek (a FIFO behind an *os.File) would otherwise
+// reach PutObject, where the SDK's own probe fails it with the Seek error
+// before any request goes out, instead of being buffered here.
+func isSeekable(r io.Reader) bool {
+	s, ok := r.(io.Seeker)
+	if !ok {
+		return false
+	}
+	_, err := s.Seek(0, io.SeekCurrent)
+	return err == nil
+}
+
+// spoolExact reads exactly want bytes into memory and confirms the source
+// ends there. The source's own errors pass through unchanged (edge sync
+// matches its errShortBody with errors.Is); a body that ends early or runs
+// long is ErrBodyLength.
+func spoolExact(ctx context.Context, r io.Reader, want int64) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	buf := make([]byte, want)
+	n, err := io.ReadFull(r, buf)
+	if err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, fmt.Errorf("%w: body ended after %d of %d bytes", ErrBodyLength, n, want)
+		}
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := expectEOF(r, want); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+// expectEOF reads one byte past the declared length: the source must end.
+// io.ReadFull so that a spurious (0, nil) — permitted by io.Reader, meaning
+// "nothing happened" — is retried rather than taken for the end.
+func expectEOF(r io.Reader, want int64) error {
+	var probe [1]byte
+	n, err := io.ReadFull(r, probe[:])
+	if n > 0 {
+		return fmt.Errorf("%w: body continues past the declared %d bytes", ErrBodyLength, want)
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	return nil
+}
+
+// exactLengthReader feeds the Uploader an unrewindable body of a declared
+// length: it hands over at most want bytes, fails with ErrBodyLength if the
+// source ends early or continues past want, and honours ctx between reads
+// (the Uploader only checks ctx when it takes a buffer from its pool). The
+// source's own errors pass through unchanged.
+type exactLengthReader struct {
+	ctx  context.Context
+	r    io.Reader
+	want int64
+	n    int64
+}
+
+func (e *exactLengthReader) Read(p []byte) (int, error) {
+	if err := e.ctx.Err(); err != nil {
+		return 0, err
+	}
+	if e.n >= e.want {
+		if err := expectEOF(e.r, e.want); err != nil {
+			return 0, err
+		}
+		return 0, io.EOF
+	}
+	if rem := e.want - e.n; int64(len(p)) > rem {
+		p = p[:rem]
+	}
+	n, err := e.r.Read(p)
+	e.n += int64(n)
+	switch {
+	case err == nil:
+		return n, nil
+	case errors.Is(err, io.EOF):
+		if e.n < e.want {
+			return n, fmt.Errorf("%w: body ended after %d of %d bytes", ErrBodyLength, e.n, e.want)
+		}
+		return n, io.EOF
+	default:
+		return n, err
+	}
 }
 
 // Read reads data from S3
@@ -640,53 +775,6 @@ func isNotFoundError(err error) bool {
 		strings.Contains(errStr, "404")
 }
 
-// ValidateS3Prefix checks a configured bucket prefix and returns it with a
-// trailing separator.
-//
-// It validates rather than rewrites. The previous SanitizeS3Prefix repaired its
-// input, and the damage was on its SUCCESS path, not its failure path:
-//
-//	"/"      -> "/"      every key then starts with "/", which MinIO folds away
-//	"a//b"   -> "a//b/"  every write 400s with XMinioInvalidObjectName
-//	"."      -> "./"     every write 400s with XMinioInvalidResourceName
-//	"a/..b"  -> ""       a legitimate prefix silently becomes the BUCKET ROOT
-//
-// The last is the worst of them: "" is not a safe fallback, it is a different
-// and much larger location, so a typo relocated an entire deployment without a
-// word. The ".." rejection that caused it was also a raw substring match, the
-// same class this repo removed for keys in #741.
-//
-// An empty prefix is legitimate and means the bucket root was chosen
-// deliberately.
-func ValidateS3Prefix(prefix string) (string, error) {
-	prefix = strings.TrimSpace(prefix)
-	if prefix == "" {
-		return "", nil
-	}
-	// Reuse the key contract, which already rejects leading "/", "." and ".."
-	// segments, empty interior segments, backslash and NUL. A trailing
-	// separator is what a prefix is for, so strip it before checking and add
-	// it back after.
-	if err := ValidateListPrefix(prefix); err != nil {
-		return "", fmt.Errorf("storage prefix %q is not usable: %w", prefix, err)
-	}
-	// Defence in depth against SQL injection: the prefix is interpolated into
-	// DuckDB read_parquet() calls, so keep the character allowlist the old
-	// implementation had.
-	for _, c := range prefix {
-		switch {
-		case (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'):
-		case c == '/' || c == '-' || c == '_' || c == '.':
-		default:
-			return "", fmt.Errorf("storage prefix %q contains an unsupported character %q", prefix, c)
-		}
-	}
-	if !strings.HasSuffix(prefix, "/") {
-		prefix += "/"
-	}
-	return prefix, nil
-}
-
 // prefixedKey validates a storage key and prepends the configured prefix.
 //
 // Returning an error is what makes the contract hold: a new method that builds
@@ -874,6 +962,45 @@ func (b *S3Backend) ListObjects(ctx context.Context, prefix string) ([]ObjectInf
 	}
 
 	return objects, nil
+}
+
+// HasObjectsUnderPrefix implements PrefixProber: it pages ListObjectsV2 under
+// the same prefix ListObjects would use and returns at the first key the
+// contract accepts. The continuation token is followed only while every key
+// of a page was one ListObjects would hide, so a prefix holding nothing but
+// directory markers or foreign keys is still answered correctly, and a prefix
+// with data is answered from its first page.
+func (b *S3Backend) HasObjectsUnderPrefix(ctx context.Context, prefix string) (bool, error) {
+	fullPrefix, err := b.prefixedListPrefix(prefix)
+	if err != nil {
+		return false, err
+	}
+	var continuationToken *string
+	for {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		result, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(b.bucket),
+			Prefix:            aws.String(fullPrefix),
+			ContinuationToken: continuationToken,
+		})
+		if err != nil {
+			return false, fmt.Errorf("failed to list S3 objects: %w", err)
+		}
+		for _, obj := range result.Contents {
+			if obj.Key == nil {
+				continue
+			}
+			if ValidateKey(strings.TrimPrefix(*obj.Key, b.prefix)) == nil {
+				return true, nil
+			}
+		}
+		if result.IsTruncated == nil || !*result.IsTruncated {
+			return false, nil
+		}
+		continuationToken = result.NextContinuationToken
+	}
 }
 
 // ListUnusable implements UnusableLister.

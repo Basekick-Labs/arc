@@ -129,6 +129,39 @@ func TestBuildAllowedDirectories(t *testing.T) {
 			want: []string{"azure://hot/", "azure://cold/"},
 		},
 		{
+			name: "hot + cold azure with prefixes",
+			cfg: &Config{
+				AzureContainer:     "hot",
+				AzurePrefix:        "p1",
+				ColdAzureContainer: "cold",
+				ColdAzurePrefix:    "p2",
+			},
+			want: []string{"azure://hot/p1/", "azure://cold/p2/"},
+		},
+		{
+			name: "cold azure same container and same prefix as hot deduplicated",
+			cfg: &Config{
+				AzureContainer:     "shared",
+				AzurePrefix:        "p",
+				ColdAzureContainer: "shared",
+				ColdAzurePrefix:    "p",
+			},
+			want: []string{"azure://shared/p/"},
+		},
+		{
+			// The topology the Azure prefix exists to make possible (#1102):
+			// one container, hot and cold separated only by prefix. Each half
+			// must get its own entry, as the S3 case above already does.
+			name: "cold azure same container different prefix kept (full-URI dedup)",
+			cfg: &Config{
+				AzureContainer:     "warehouse",
+				AzurePrefix:        "hot",
+				ColdAzureContainer: "warehouse",
+				ColdAzurePrefix:    "cold",
+			},
+			want: []string{"azure://warehouse/hot/", "azure://warehouse/cold/"},
+		},
+		{
 			name: "no os.TempDir leak when only LocalStorageRoot is set",
 			cfg:  &Config{LocalStorageRoot: "/var/lib/arc/data"},
 			want: []string{"/var/lib/arc/data/"},

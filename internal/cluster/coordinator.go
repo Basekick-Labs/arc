@@ -47,14 +47,42 @@ type deleteRequest struct {
 	reason string
 }
 
-// deleteQueueSize is the capacity of the buffered delete channel.
-// 1024 matches the puller's queue size — enough to absorb a full
-// compaction cycle's worth of source-file deletions without drops.
-const deleteQueueSize = 1024
+// TierRecorder is the tier metadata a node keeps for its own storage.
+//
+// Implemented by *tiering.Manager. Declared here, consumer-side, for the same
+// reason tiering declares ManifestCoordinator rather than importing this
+// package: neither side needs the other's types. Both methods are
+// fire-and-forget — they are called from the replication pull workers and the
+// local-delete workers, never block, and the implementation queues rather than
+// writing through to SQLite on the caller's goroutine.
+type TierRecorder interface {
+	// RecordReplicatedFile reports a file pulled from a peer and kept, which
+	// is now on this node's hot storage.
+	RecordReplicatedFile(path string, sizeBytes int64)
+	// RecordUnlinkedFile reports that this node removed its own copy of a
+	// path that left the cluster manifest. sizeBytes is the size measured
+	// before the delete; the reason is the manifest delete's reason, which
+	// may come from an operator and so is a hint rather than proof of what
+	// happened to the file.
+	RecordUnlinkedFile(path, reason string, sizeBytes int64)
+}
 
-// deleteWorkerCount is the number of goroutines draining the delete queue.
-// 2 workers provide light parallelism without overwhelming local I/O.
+// deleteWorkerCount is the number of goroutines draining the pending local
+// deletes. 2 workers provide light parallelism without overwhelming local I/O.
 const deleteWorkerCount = 2
+
+// deleteGrace is how long a worker waits after the first pending delete
+// before unlinking a batch, so a query that has just globbed the file can
+// still open it. Paid once per batch, not per file.
+const deleteGrace = 500 * time.Millisecond
+
+// deleteStopDrainBound caps how long Stop waits for the workers to unlink
+// what is still pending. A var so a test can shorten it.
+var deleteStopDrainBound = 10 * time.Second
+
+// deletePendingWarnAt is the pending count at which enqueue logs once, so a
+// node whose workers are not keeping up is visible before its disk is.
+const deletePendingWarnAt = 10_000
 
 type Coordinator struct {
 	cfg           *config.ClusterConfig
@@ -88,9 +116,27 @@ type Coordinator struct {
 	onBecomeCompactor func()
 	onLoseCompactor   func()
 
+	// compactionQuiescer is main.go's hook for the cluster-wide compaction
+	// pause (#1087): it returns once this node has no compaction batch in
+	// flight and no phase-2 commit pending, or an error when the pause ended
+	// first. nil means this node has nothing to quiesce (no compaction) and
+	// acks at once. Set before Start; read by quiesceAndAck under mu.
+	compactionQuiescer func(ctx context.Context) error
+	// compactionPauseAckInFlight holds the pause generations a quiesceAndAck
+	// is currently running for, under mu, so the two paths that can start
+	// one for the same generation (the FSM callback during log replay in
+	// Start, and ackCompactionPauseIfActive right after it) run the quiescer
+	// and propose the ack once. Lazily allocated; nil until the first pause.
+	compactionPauseAckInFlight map[uint64]struct{}
+
 	// WAL Replication (Phase 3.3)
 	replicationSender   *replication.Sender   // Writer only: sends entries to readers
 	replicationReceiver *replication.Receiver // Reader only: receives entries from writer
+	// replicationReceiverStopped is set by StopReplicationReceiver, which
+	// runs from a shutdown hook without cancelling ctx; the retarget loop
+	// checks it so it cannot start a fresh receiver into buffers that are
+	// closing (#853).
+	replicationReceiverStopped bool
 	// replicationRetarget pokes replicationTargetLoop to re-evaluate which
 	// writer this node should stream from. Depth 1: a poke while one is
 	// already pending is dropped, because the pending evaluation will read
@@ -111,13 +157,45 @@ type Coordinator struct {
 	// per coordinator lifetime, across repeated Start/Stop cycles in tests.
 	catchupOnce sync.Once
 
-	// deleteQueue is a bounded channel for local file deletions triggered
-	// by onFileDeleted FSM callbacks. Fixed workers drain the queue with a
-	// grace period before each delete. This replaces the earlier unbounded
-	// go func() pattern that could spawn thousands of goroutines during
-	// large compaction cycles.
-	deleteQueue chan deleteRequest
-	deleteWg    sync.WaitGroup
+	// deletePending holds the local deletes the FSM delete callback has
+	// handed over and the workers have not yet taken. A slice under its own
+	// mutex, unbounded on purpose: the bounded channel it replaces dropped
+	// the overflow, and a dropped local delete is a replica nothing ever
+	// reclaims. Every entry is a path the FSM listed a moment ago, and the
+	// workers take the whole slice every grace period, so the list holds
+	// at most the manifest churn of the time the workers are stuck; the
+	// Warn at deletePendingWarnAt makes that visible. deleteWake (one slot)
+	// nudges a parked worker; deleteStop, closed by Stop, is the only way a
+	// worker exits, so a stop drains everything that is pending.
+	// deleteInFlight counts the entries a worker has taken and not yet
+	// unlinked, so the gauge and the stop-bound Error report what is still
+	// on disk, not just what is still untaken.
+	deletePending   []deleteRequest
+	deletePendingMu sync.Mutex
+	deleteInFlight  atomic.Int64
+	deleteWake      chan struct{}
+	deleteStop      chan struct{}
+	// deleteWg is per Start: Stop's wait is bounded, and a WaitGroup that a
+	// later Start reused while that wait was still parked would panic.
+	deleteWg *sync.WaitGroup
+	// deleteManifestHas answers whether the manifest lists a path again; a
+	// worker skips such a path rather than unlink a file that is back. Nil
+	// before the puller starts and in tests: no check, unlink.
+	deleteManifestHas func(path string) bool
+
+	// tierRecorder, when set, is this node's tier metadata for its own disk.
+	// The puller reports what it pulled and the delete workers report what
+	// they unlinked, so the node's tier rows track its disk instead of only
+	// what it ingested itself. Nil means tiering is off here.
+	//
+	// Behind its own mutex rather than c.mu: both reporters run on worker
+	// goroutines, and a worker contending on the coordinator-wide lock is the
+	// shape of the shutdown deadlocks in #797 and #813. Snapshot under the
+	// lock, invoke outside it. Deliberately NOT cleared by Stop: the delete
+	// drain in Stop reports real unlinks, and the recorder's own shutdown hook
+	// runs after this coordinator's (see Stop).
+	tierRecorder   TierRecorder
+	tierRecorderMu sync.RWMutex
 
 	// fetchInvalidPathCount counts inbound fetch requests refused because the
 	// path is permanently unusable (#747). Its only job is to rate-limit the
@@ -362,6 +440,11 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 			func(id string) { c.onRaftNodeRemoved(id) },
 			func(n *raft.NodeInfo) { c.onRaftNodeUpdated(n) },
 		)
+		// The cluster-wide compaction pause (#1087). Same lock rule as the
+		// callbacks above: this only spawns a goroutine.
+		c.raftFSM.SetCompactionPauseCallback(func(paused bool, generation uint64) {
+			c.onCompactionPauseChanged(paused, generation)
+		})
 
 		raftCfg := &raft.NodeConfig{
 			NodeID:            nodeID,
@@ -597,6 +680,11 @@ func (c *Coordinator) Start() error {
 		// registry. That is #858's worst case, and it is deterministic in a
 		// cluster whose only voter is the node being restarted.
 		go c.registerSelfInFSMWhenLeader()
+
+		// A compaction pause restored from the local snapshot at startup
+		// fires no callback (#1087); quiesce and ack it once a leader is
+		// known. Idempotent with the callback path.
+		go c.ackCompactionPauseIfActive()
 	}
 
 	// Wire the peer file replication puller (Enterprise Phase 2). This runs
@@ -776,10 +864,9 @@ func (c *Coordinator) Stop() error {
 	// deadlocks shutdown the moment one of them does.
 	//
 	// The puller pointer is cleared now so readers see "no puller" during
-	// the join, as they do after it. deleteQueue stays set until the worker
-	// has exited: the worker reads the field, and the close below happens
+	// the join, as they do after it. The delete workers are stopped below,
 	// only after the Raft join has retired every callback that could still
-	// send on it.
+	// add to their pending list.
 	puller := c.puller
 	c.puller = nil
 	replicationSender := c.replicationSender
@@ -787,7 +874,8 @@ func (c *Coordinator) Stop() error {
 	writerFailover := c.writerFailoverMgr
 	compactorFailover := c.compactorFailoverMgr
 	raftNode := c.raftNode
-	deleteQueue := c.deleteQueue
+	deleteStop := c.deleteStop
+	deleteWg := c.deleteWg
 	healthChecker := c.healthChecker
 	listener := c.listener
 	c.mu.Unlock()
@@ -820,6 +908,10 @@ func (c *Coordinator) Stop() error {
 	// the ingest handler, and its goroutines were previously left running on
 	// the shared context alone, so a receiver still draining could write into
 	// a WAL and an Arrow buffer that shutdown was already closing (#853).
+	// In cmd/arc the receiver is normally already stopped by then — Stop runs
+	// as a shutdown component, after the Arrow buffer and WAL have closed, so
+	// main.go stops the receiver from a hook first (StopReplicationReceiver);
+	// this call then finds it stopped and only takes the sender down.
 	c.stopReplicationSubsystems(replicationSender, replicationReceiver)
 
 	if raftNode != nil {
@@ -830,12 +922,24 @@ func (c *Coordinator) Stop() error {
 		// callbacks can be unregistered and their queue closed below.
 		if fsm := raftNode.FSM(); fsm != nil {
 			fsm.SetFileCallbacks(nil, nil)
+			fsm.SetFileContentChangedCallback(nil)
 		}
 	}
 
-	if deleteQueue != nil {
-		close(deleteQueue)
-		c.deleteWg.Wait()
+	// Raft is joined and the file callbacks are unregistered, so nothing can
+	// add a pending local delete from here on: the workers drain what is
+	// pending and exit. Bounded, so a disk that hangs cannot hang shutdown.
+	//
+	// The tier recorder is deliberately left wired across this drain. The
+	// tiering manager registers its own shutdown step after this one at the
+	// same priority and equal-priority steps run in registration order, so
+	// its drainer is still alive here and still applies what the drain
+	// reports — which is the point, those unlinks are real. Clearing the
+	// recorder first would throw that work away on every graceful shutdown;
+	// a report that does arrive after the tiering step has run merely sits
+	// in a buffer nobody drains, which costs nothing.
+	if deleteStop != nil {
+		c.stopDeleteWorkers(deleteStop, deleteWg)
 	}
 
 	if healthChecker != nil {
@@ -846,7 +950,8 @@ func (c *Coordinator) Stop() error {
 	}
 
 	c.mu.Lock()
-	c.deleteQueue = nil
+	c.deleteStop = nil
+	c.deleteWg = nil
 	c.localNode.UpdateState(StateLeaving)
 	c.running = false
 	c.stopping = false
@@ -856,77 +961,270 @@ func (c *Coordinator) Stop() error {
 	return nil
 }
 
-// runDeleteWorker is a single goroutine that drains the deleteQueue channel.
-// Each item gets a 500ms grace period (for in-flight queries to finish), then
-// a bounded backend.Delete call. The worker exits when the channel is closed
-// (Stop() closes it during shutdown).
-func (c *Coordinator) runDeleteWorker() {
-	defer c.deleteWg.Done()
-	for {
-		// Wait for the first item (or shutdown).
+// enqueueLocalDelete hands a manifest delete to the workers. Called from the
+// FSM delete callback on the Raft apply goroutine, so it takes only the
+// pending-list mutex, does no I/O and never blocks: append, publish the
+// depth, nudge a worker. Nothing is ever dropped here (see deletePending).
+func (c *Coordinator) enqueueLocalDelete(path, reason string) {
+	c.deletePendingMu.Lock()
+	c.deletePending = append(c.deletePending, deleteRequest{path: path, reason: reason})
+	n := len(c.deletePending)
+	wake := c.deleteWake
+	c.publishDeleteDepthLocked()
+	c.deletePendingMu.Unlock()
+	if n == deletePendingWarnAt {
+		c.logger.Warn().
+			Int("pending", n).
+			Msg("Local delete backlog is large; either the delete workers are not keeping up with manifest deletes or a snapshot restore just dropped many paths")
+	}
+	if wake != nil {
 		select {
-		case <-c.ctx.Done():
-			return
-		case req, ok := <-c.deleteQueue:
-			if !ok {
-				return
-			}
-			// Grace period: wait 500ms once, then drain all queued items
-			// without waiting. This amortizes the grace cost across a
-			// burst of deletions (e.g. compaction deleting 100 sources).
-			select {
-			case <-c.ctx.Done():
-				return
-			case <-time.After(500 * time.Millisecond):
-			}
+		case wake <- struct{}{}:
+		default: // a nudge is already pending; the next swap takes this item too
+		}
+	}
+}
 
-			// Collect the first item plus any others already queued.
-			batch := []deleteRequest{req}
-		drain:
+// publishDeleteDepthLocked stores the gauge: entries not yet taken plus
+// entries taken and not yet unlinked. Called with deletePendingMu held so
+// two publishers cannot leave a stale value behind.
+func (c *Coordinator) publishDeleteDepthLocked() {
+	metrics.Get().SetClusterLocalDeletePending(int64(len(c.deletePending)) + c.deleteInFlight.Load())
+}
+
+// takePendingDeletes swaps the pending list out under the mutex — O(1) held
+// against the Raft apply goroutine — moving its entries to in-flight.
+func (c *Coordinator) takePendingDeletes() []deleteRequest {
+	c.deletePendingMu.Lock()
+	batch := c.deletePending
+	c.deletePending = nil
+	c.deleteInFlight.Add(int64(len(batch)))
+	c.publishDeleteDepthLocked()
+	c.deletePendingMu.Unlock()
+	return batch
+}
+
+// deleteDone retires one in-flight entry, unlinked or skipped.
+func (c *Coordinator) deleteDone() {
+	c.deleteInFlight.Add(-1)
+	c.deletePendingMu.Lock()
+	c.publishDeleteDepthLocked()
+	c.deletePendingMu.Unlock()
+}
+
+// startDeleteWorkers creates the wake and stop channels and the worker pool.
+// A no-op while workers from this Start exist. The workers capture the
+// manifest lookup here rather than read the field, so a worker that outlives
+// a timed-out drain never races a later Start's assignment.
+func (c *Coordinator) startDeleteWorkers() {
+	if c.deleteStop != nil {
+		return
+	}
+	wake := make(chan struct{}, 1)
+	stop := make(chan struct{})
+	wg := &sync.WaitGroup{}
+	has := c.deleteManifestHas
+	c.deletePendingMu.Lock()
+	c.deleteWake = wake
+	c.deletePendingMu.Unlock()
+	c.deleteStop = stop
+	c.deleteWg = wg
+	for i := 0; i < deleteWorkerCount; i++ {
+		wg.Add(1)
+		go c.runDeleteWorker(stop, wake, wg, has)
+	}
+}
+
+// stopDeleteWorkers closes stop and waits, bounded, for the workers to drain
+// the pending list. Past the bound it logs what is still on disk at Error —
+// the untaken entries plus the ones a stuck worker holds — and returns:
+// those deletes are the only thing a graceful stop can still lose, and only
+// when the disk itself is not answering. The waiting goroutine and the
+// stuck worker outlive the return until that Delete comes back.
+func (c *Coordinator) stopDeleteWorkers(stop chan struct{}, wg *sync.WaitGroup) {
+	close(stop)
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(deleteStopDrainBound):
+		c.deletePendingMu.Lock()
+		untaken := len(c.deletePending)
+		c.deletePendingMu.Unlock()
+		inFlight := c.deleteInFlight.Load()
+		c.logger.Error().
+			Int("pending_untaken", untaken).
+			Int64("in_flight", inFlight).
+			Int64("left_on_disk", int64(untaken)+inFlight).
+			Dur("bound", deleteStopDrainBound).
+			Msg("Local delete workers did not finish draining within the shutdown bound; those local copies stay on disk")
+	}
+}
+
+// runDeleteWorker drains the pending list. In steady state it waits for a
+// nudge, sits out one grace period so a query that just globbed a file can
+// still open it, takes the whole list and unlinks it. Once stop is closed it
+// skips the grace and keeps taking until the list is empty, then exits: Stop
+// has unregistered the FSM callbacks by then, so the list can only shrink.
+func (c *Coordinator) runDeleteWorker(stop <-chan struct{}, wake <-chan struct{}, wg *sync.WaitGroup, has func(string) bool) {
+	defer wg.Done()
+	for {
+		select {
+		case <-stop:
 			for {
-				select {
-				case r, ok := <-c.deleteQueue:
-					if !ok {
-						break drain
-					}
-					batch = append(batch, r)
-				default:
-					break drain
+				batch := c.takePendingDeletes()
+				if len(batch) == 0 {
+					return
 				}
+				c.unlinkBatch(batch, has)
 			}
+		case <-wake:
+			select {
+			case <-stop:
+				// Stopping: no grace; the branch above drains.
+			case <-time.After(deleteGrace):
+			}
+			c.unlinkBatch(c.takePendingDeletes(), has)
+		}
+	}
+}
 
-			// Delete all items in the batch.
-			for _, item := range batch {
-				delCtx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
-				if err := c.storage.Delete(delCtx, item.path); errors.Is(err, storage.ErrInvalidPath) {
-					// Permanent (#747). This queue is fire-and-forget, so the
-					// item is already out of the work set and nothing retries
-					// it; what changes is the diagnosis. A Warn here is
-					// indistinguishable from a backend hiccup, and an operator
-					// reading it would wait for a convergence that cannot
-					// happen: the local copy stays on disk forever, and no
-					// sweep can remove it either, because every path to it
-					// addresses the same unusable key.
-					metrics.Get().IncStorageInvalidPathQuarantined()
-					c.logger.Error().
-						Err(err).
-						Str("path", item.path).
-						Str("reason", item.reason).
-						Msg("Phase 4 local delete worker: the key is permanently unusable, so this local copy can never be removed by Arc and needs operator action")
-				} else if err != nil {
-					c.logger.Warn().
-						Err(err).
-						Str("path", item.path).
-						Str("reason", item.reason).
-						Msg("Phase 4 local delete worker: backend.Delete failed")
-				} else {
-					c.logger.Debug().
-						Str("path", item.path).
-						Str("reason", item.reason).
-						Msg("Phase 4 local delete worker: removed local copy")
-				}
-				cancel()
-			}
+// unlinkBatch removes each local copy. Deletes run against a fresh context,
+// not the coordinator's: that one is already cancelled during a stop, and
+// the drain is exactly when the unlinks must still happen. A path the
+// manifest lists again is skipped — Arc's own file names never repeat, so
+// this guards imports and restores, not a known race.
+func (c *Coordinator) unlinkBatch(batch []deleteRequest, has func(string) bool) {
+	for _, item := range batch {
+		c.unlinkOne(item, has)
+		c.deleteDone()
+	}
+}
+
+// SetTierRecorder wires this node's tier metadata. Safe to call on a running
+// coordinator: the puller's hook and the delete workers read the field through
+// tierRecorderMu, so a recorder wired after Start simply begins receiving
+// reports. Reports made before it is wired are covered by the startup tier
+// scan.
+func (c *Coordinator) SetTierRecorder(r TierRecorder) {
+	c.tierRecorderMu.Lock()
+	c.tierRecorder = r
+	c.tierRecorderMu.Unlock()
+	c.logger.Info().Msg("Tier metadata recorder wired: replicated files and local deletes will update this node's tier rows")
+}
+
+// tierRecorderSnapshot returns the recorder without holding the lock across
+// the call into it.
+func (c *Coordinator) tierRecorderSnapshot() TierRecorder {
+	c.tierRecorderMu.RLock()
+	r := c.tierRecorder
+	c.tierRecorderMu.RUnlock()
+	return r
+}
+
+// recordPulledFileInTiering is the puller's RecordPulledFile hook. Reports
+// whether a recorder took it: the hook is wired for the coordinator's whole
+// life, while the recorder is attached later and is absent on a node without
+// tiering, so this return value is what distinguishes the two.
+func (c *Coordinator) recordPulledFileInTiering(path string, sizeBytes int64) bool {
+	r := c.tierRecorderSnapshot()
+	if r == nil {
+		return false
+	}
+	r.RecordReplicatedFile(path, sizeBytes)
+	return true
+}
+
+// recordUnlinkedFileInTiering reports a local copy this node has just removed.
+func (c *Coordinator) recordUnlinkedFileInTiering(path, reason string, sizeBytes int64) {
+	if r := c.tierRecorderSnapshot(); r != nil {
+		r.RecordUnlinkedFile(path, reason, sizeBytes)
+	}
+}
+
+// tierReasonAbandonedPull is the reason reported for a copy the puller removed
+// because its path left the manifest while the pull was in transit. The puller
+// never learns the manifest delete's own reason, so the recorder treats this
+// one as possibly a migration. Shared literal with
+// tiering.unlinkReasonAbandonedPull; the packages do not import each other.
+const tierReasonAbandonedPull = "replication:abandoned"
+
+// recordAbandonedFileInTiering is the puller's RecordAbandonedFile hook.
+func (c *Coordinator) recordAbandonedFileInTiering(path string, sizeBytes int64) {
+	if r := c.tierRecorderSnapshot(); r != nil {
+		r.RecordUnlinkedFile(path, tierReasonAbandonedPull, sizeBytes)
+	}
+}
+
+func (c *Coordinator) unlinkOne(item deleteRequest, has func(string) bool) {
+	if has != nil && has(item.path) {
+		c.logger.Debug().
+			Str("path", item.path).
+			Str("reason", item.reason).
+			Msg("Local delete skipped: the manifest lists the path again")
+		return
+	}
+	// One budget for the stat and the delete together. Both are a syscall on
+	// a local backend, which is the only backend this path runs on.
+	delCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Measured before the delete, and only for a node that keeps tier
+	// metadata. Two things depend on it: whether this node held the file at
+	// all — Delete reports success for a path that was never here, so the
+	// delete alone is not evidence — and the size, which a tier row needs and
+	// which cannot be recovered afterwards, the manifest entry being gone by
+	// the time a delete reaches a worker.
+	var (
+		sizeBytes int64
+		wasLocal  bool
+	)
+	recorder := c.tierRecorderSnapshot()
+	if recorder != nil {
+		// StatFile reports -1 with a nil error for a path that is not there,
+		// so the sentinel is the test, not the error. Getting this wrong makes
+		// every node in the cluster report every manifest delete, including
+		// the ones that never held the file.
+		//
+		// A local backend counts a staging .part as present, which is fine
+		// here: this path only ever flips a row to cold or retires a hot one,
+		// never claims a readable local file.
+		if n, statErr := c.storage.StatFile(delCtx, item.path); statErr == nil && n >= 0 {
+			sizeBytes = n
+			wasLocal = true
+		}
+	}
+	err := c.storage.Delete(delCtx, item.path)
+	cancel()
+	switch {
+	case errors.Is(err, storage.ErrInvalidPath):
+		// Permanent (#747). The item is out of the work set and nothing
+		// retries it; what matters is the diagnosis. A Warn here is
+		// indistinguishable from a backend hiccup, and an operator
+		// reading it would wait for a convergence that cannot happen:
+		// the local copy stays on disk forever, and no sweep can remove
+		// it either, because every path to it addresses the same
+		// unusable key.
+		metrics.Get().IncStorageInvalidPathQuarantined()
+		c.logger.Error().
+			Err(err).
+			Str("path", item.path).
+			Str("reason", item.reason).
+			Msg("Phase 4 local delete worker: the key is permanently unusable, so this local copy can never be removed by Arc and needs operator action")
+	case err != nil:
+		c.logger.Warn().
+			Err(err).
+			Str("path", item.path).
+			Str("reason", item.reason).
+			Msg("Phase 4 local delete worker: backend.Delete failed")
+	default:
+		c.logger.Debug().
+			Str("path", item.path).
+			Str("reason", item.reason).
+			Msg("Phase 4 local delete worker: removed local copy")
+		if wasLocal && recorder != nil {
+			// Only for a file this node actually held: the tier row for a
+			// path a node never had is not its to write, and without the stat
+			// above every node would report every manifest delete.
+			recorder.RecordUnlinkedFile(item.path, item.reason, sizeBytes)
 		}
 	}
 }
@@ -2420,7 +2718,7 @@ func (c *Coordinator) GetRole() NodeRole {
 //     regardless of role; without it, a RoleReader or RoleCompactor that
 //     wins the election would run retention/CQ/delete.
 //
-//     Leader-change semantics: each scheduler (retention, CQ, delete,
+//     Leader-change semantics: each scheduler (retention, CQ, delete, tiering migration,
 //     delete endpoints) checks IsPrimaryWriter() ONCE at the start of each
 //     tick and runs all work for that tick if true. A leader change
 //     mid-tick will let the demoted node complete its current tick's
@@ -2574,6 +2872,12 @@ func (c *Coordinator) Status() map[string]interface{} {
 		leaseStatus["preemption"] = preempt
 	}
 	status["active_compactor"] = leaseStatus
+
+	// The cluster-wide compaction pause a restore takes (#1087): who holds
+	// it, until when, and which nodes have acknowledged it.
+	if c.raftFSM != nil {
+		status["compaction_pause"] = c.CompactionPauseStatus()
+	}
 
 	// Add Raft status if configured (Phase 3)
 	if c.raftNode != nil {
@@ -3801,31 +4105,43 @@ func (c *Coordinator) startFilePullerLocked() error {
 
 	raftNode := c.raftNode // set once in NewCoordinator; the gate at Start guarantees non-nil here
 	pullerCfg := filereplication.Config{
-		SelfNodeID:             c.localNode.ID,
-		Backend:                c.storage,
-		Fetcher:                fetchClient,
-		PeerResolver:           resolver,
-		Workers:                c.cfg.ReplicationPullWorkers,
-		QueueSize:              c.cfg.ReplicationQueueSize,
-		RetryMaxAttempts:       c.cfg.ReplicationRetryMaxAttempts,
-		FetchTimeout:           fetchTimeout,
-		RetryInitialBackoff:    500 * time.Millisecond,
-		CatchUpQueueHighWater:  c.cfg.ReplicationCatchUpQueueHighWater,
-		ReconciliationInterval: time.Duration(c.cfg.ReplicationReconciliationIntervalSeconds) * time.Second,
-		ReconciliationGate:     c.canRunFileReconciliation,
+		SelfNodeID: c.localNode.ID,
+		// Per-node storage only: a node restored with an empty data disk must
+		// pull back the files it originated (#959). On a shared bucket a
+		// missing own object is not on any peer either.
+		RepullMissingSelfOrigin: c.storage.Type() == "local",
+		ForceContentRefresh:     c.storage.Type() == "local",
+		Backend:                 c.storage,
+		Fetcher:                 fetchClient,
+		PeerResolver:            resolver,
+		Workers:                 c.cfg.ReplicationPullWorkers,
+		QueueSize:               c.cfg.ReplicationQueueSize,
+		RetryMaxAttempts:        c.cfg.ReplicationRetryMaxAttempts,
+		FetchTimeout:            fetchTimeout,
+		RetryInitialBackoff:     500 * time.Millisecond,
+		CatchUpQueueHighWater:   c.cfg.ReplicationCatchUpQueueHighWater,
+		ReconciliationInterval:  time.Duration(c.cfg.ReplicationReconciliationIntervalSeconds) * time.Second,
+		ReconciliationGate:      c.canRunFileReconciliation,
 		// Lets the puller stop pulling, and stop counting against the query
 		// gate, an entry that left the manifest while its pull was queued or
-		// in flight (#759, #795). Read lock on the FSM; the FSM never holds
-		// its lock while calling back into the puller, so no cycle.
-		ManifestHas: func(path string) bool {
+		// in flight (#759, #795), while also identifying superseding versions.
+		ManifestEntry: func(path string) (raft.FileEntry, bool) {
 			fsm := raftNode.FSM()
 			if fsm == nil {
-				return true
+				return raft.FileEntry{}, true
 			}
-			_, ok := fsm.GetFile(path)
-			return ok
+			entry, ok := fsm.GetFile(path)
+			if !ok {
+				return raft.FileEntry{}, false
+			}
+			return *entry, true
 		},
-		Logger: c.logger,
+		// Reads the recorder each time rather than capturing it: the tiering
+		// manager is built long after the coordinator starts, so the hook has
+		// to exist before the thing it reports to does.
+		RecordPulledFile:    c.recordPulledFileInTiering,
+		RecordAbandonedFile: c.recordAbandonedFileInTiering,
+		Logger:              c.logger,
 	}
 
 	puller, err := filereplication.New(pullerCfg)
@@ -3849,17 +4165,20 @@ func (c *Coordinator) startFilePullerLocked() error {
 		return fmt.Errorf("Raft FSM not available")
 	}
 
-	// Initialize the delete-worker pool BEFORE building the callbacks. The
-	// callbacks fire synchronously from Raft apply — if a DeleteFile
-	// command arrived between SetFileCallbacks and queue init, the onDelete
-	// closure would send to a nil channel.
-	if c.deleteQueue == nil {
-		c.deleteQueue = make(chan deleteRequest, deleteQueueSize)
-		for i := 0; i < deleteWorkerCount; i++ {
-			c.deleteWg.Add(1)
-			go c.runDeleteWorker()
+	// Start the delete workers BEFORE registering the callbacks, so a
+	// DeleteFile applied right after SetFileCallbacks finds a worker to
+	// nudge. Before each unlink a worker asks the manifest whether it lists
+	// the path again; a nil FSM cannot answer, and the manifest is what
+	// asked for the delete, so that reads as "not listed".
+	c.deleteManifestHas = func(path string) bool {
+		fsm := raftNode.FSM()
+		if fsm == nil {
+			return false
 		}
+		_, ok := fsm.GetFile(path)
+		return ok
 	}
+	c.startDeleteWorkers()
 
 	// CONTRACT for every FSM callback (#797, #813): they run synchronously
 	// on the Raft apply goroutine. Since #813 neither Coordinator.Stop nor
@@ -3869,26 +4188,30 @@ func (c *Coordinator) startFilePullerLocked() error {
 	// stopped under a lock from deadlocking too. So a callback must not take
 	// c.mu or call a Node method other than FSM() and Barrier() (they take
 	// n.mu), and the closures capture everything they need up front: the
-	// backend is set once, before Start (SetStorageBackend), and the queue
-	// is created just above, closed only after Raft is joined, and
-	// unregistered from the FSM before that (Stop), so a closure never
-	// outlives its queue. Neither callback may block.
+	// backend is set once, before Start (SetStorageBackend), and the
+	// pending-delete list lives on the coordinator behind its own mutex, so
+	// a callback that fires late appends harmlessly and Stop, which
+	// unregisters the callbacks before it stops the workers, drains it.
+	// Neither callback may block.
 	backend := c.storage
-	deleteQueue := c.deleteQueue
 	onRegister := func(entry *raft.FileEntry) {
 		// Called synchronously from applyRegisterFile. Must NOT block — the
 		// FSM apply goroutine is on the Raft hot path. Enqueue is non-blocking
 		// (drops on full queue) so this is safe.
 		puller.Enqueue(entry)
 	}
+	onContentChanged := func(entry *raft.FileEntry) {
+		puller.EnqueueContentChanged(entry)
+	}
 	onDelete := func(path string, reason string) {
 		// Phase 4: the callback runs synchronously from applyDeleteFile on
-		// the Raft apply hot path. It MUST NOT block. It hands the path to
-		// the bounded delete-worker pool, which waits a short grace period
-		// so in-flight queries scanning the old file can finish and then
-		// calls backend.Delete. On non-local backends (S3, Azure) the
-		// compactor that issued DeleteFile has already removed the shared
-		// object, so there is no local-side action.
+		// the Raft apply hot path, and from a snapshot Restore for every path
+		// the snapshot dropped (#962). It MUST NOT block. It hands the path to
+		// the delete-worker pool, which waits a short grace period so
+		// in-flight queries scanning the old file can finish and then calls
+		// backend.Delete. On non-local backends (S3, Azure) the compactor
+		// that issued DeleteFile has already removed the shared object, so
+		// there is no local-side action.
 		//
 		// First, and on every backend type: an entry that leaves the manifest
 		// must stop holding this node's query gate. A catch-up pull that
@@ -3908,21 +4231,18 @@ func (c *Coordinator) startFilePullerLocked() error {
 				Msg("FSM delete observed; shared backend, no local action needed")
 			return
 		}
-		// Enqueue to the bounded delete-worker pool. Non-blocking send
-		// mirrors the puller's Enqueue pattern — if the queue is full we
-		// drop and log, same as Phase 2's file-pull overflow. The dropped
-		// file stays in the manifest, and Phase 3 catch-up reconciles it
-		// on the next restart.
-		select {
-		case deleteQueue <- deleteRequest{path: path, reason: reason}:
-		default:
-			c.logger.Warn().
-				Str("path", path).
-				Str("reason", reason).
-				Msg("Phase 4 local delete queue full; dropping (will reconcile on restart)")
-		}
+		// Hand it to the delete workers. Unlike the puller's Enqueue, this
+		// never drops: a pull that is dropped is re-discovered by the next
+		// catch-up walk, but a local delete that is dropped is a replica
+		// the manifest no longer lists and nothing walks — it stayed on
+		// disk forever, and every read here read the file twice.
+		c.enqueueLocalDelete(path, reason)
 	}
 
+	// The content-change callback goes in first: the FSM fires it right after
+	// onRegister for one apply, so wiring it second would leave a window in
+	// which an update arrives with only its non-forced half delivered.
+	fsm.SetFileContentChangedCallback(onContentChanged)
 	fsm.SetFileCallbacks(onRegister, onDelete)
 
 	// Start the puller workers.
@@ -3933,7 +4253,6 @@ func (c *Coordinator) startFilePullerLocked() error {
 		Int("workers", pullerCfg.Workers).
 		Int("queue_size", pullerCfg.QueueSize).
 		Int("delete_workers", deleteWorkerCount).
-		Int("delete_queue_size", deleteQueueSize).
 		Msg("Peer file replication puller started")
 
 	// Phase 3: kick off the one-shot catch-up walker in a background goroutine
@@ -4498,12 +4817,15 @@ func (c *Coordinator) reevaluateReplicationTarget(ctx context.Context) {
 	// this pointer comparison — neither Stop() nor StopReplication() ever
 	// writes c.replicationReceiver (stopReplicationSubsystems says so
 	// explicitly: "The fields are deliberately NOT cleared"), so the comparison
-	// cannot fail. It is that both shutdown paths call c.cancel() while holding
-	// c.mu. By the time we hold it, a shutdown that started has already
-	// cancelled c.ctx, so the receiver we create below is born with a cancelled
-	// context and its connectionLoop returns on its first select. The
+	// cannot fail. It is that Stop() and StopReplication() call c.cancel()
+	// while holding c.mu, so by the time we hold it a shutdown that started
+	// has already cancelled c.ctx and the receiver created below would be
+	// born cancelled; and that StopReplicationReceiver — the shutdown hook
+	// that stops the receiver WITHOUT cancelling ctx, because the coordinator
+	// must keep serving manifest applies after it — sets
+	// replicationReceiverStopped under c.mu, which is checked here. The
 	// comparison stays as a cheap assertion of the single-owner invariant.
-	if c.replicationReceiver != current {
+	if c.replicationReceiverStopped || c.replicationReceiver != current {
 		return
 	}
 	c.replicationReceiver = nil
@@ -4675,6 +4997,22 @@ func (c *Coordinator) StopReplication() {
 	c.stopReplicationSubsystems(sender, receiver)
 }
 
+// StopReplicationReceiver stops the inbound WAL replication stream and
+// nothing else: no sender, no Raft, and the coordinator context stays live
+// so manifest applies still go through. On a reader the receiver applies
+// entries through the ingest handler, so it must be gone before the Arrow
+// buffer and WAL close (#853); the coordinator as a whole must outlive them,
+// so the final flush can still be registered in the manifest (#1014). The
+// shutdown sequence in cmd/arc calls this from a hook and Stop later as a
+// component; Stop finds the receiver already stopped.
+func (c *Coordinator) StopReplicationReceiver() {
+	c.mu.Lock()
+	c.replicationReceiverStopped = true
+	receiver := c.replicationReceiver
+	c.mu.Unlock()
+	c.stopReplicationReceiver(receiver)
+}
+
 // stopReplicationSubsystems stops the sender and receiver without holding
 // c.mu. The fields are deliberately NOT cleared: the WAL replication hook
 // closes over the coordinator and calls Replicate for every appended entry,
@@ -4691,6 +5029,12 @@ func (c *Coordinator) stopReplicationSubsystems(sender *replication.Sender, rece
 			c.logger.Error().Err(err).Msg("Error stopping replication sender")
 		}
 	}
+	c.stopReplicationReceiver(receiver)
+}
+
+// stopReplicationReceiver joins the receiver, bounded. Idempotent: a stopped
+// receiver returns from Stop at once.
+func (c *Coordinator) stopReplicationReceiver(receiver *replication.Receiver) {
 	if receiver == nil {
 		return
 	}
@@ -4894,10 +5238,10 @@ func (c *Coordinator) WaitForLeader(timeout time.Duration) error {
 	return c.raftNode.WaitForLeader(timeout)
 }
 
-// LocalNodeID returns the local cluster node ID. Phase 4 uses this via
-// the CompactionBridge to set OriginNodeID on compacted-file Raft entries
-// so Phase 2/3's multi-peer resolver routes replica pulls back to the
-// compactor that produced the output.
+// LocalNodeID returns the local cluster node ID. The CompactionBridge stamps
+// it as OriginNodeID on compacted-file Raft entries, and the delete handler on
+// rewritten entries (#976), so the multi-peer resolver routes replica pulls to
+// the node that produced the bytes.
 func (c *Coordinator) LocalNodeID() string {
 	if c.localNode == nil {
 		return ""
@@ -5391,6 +5735,44 @@ func (c *Coordinator) GetFileEntry(path string) (*raft.FileEntry, bool) {
 		return nil, false
 	}
 	return c.raftFSM.GetFile(path)
+}
+
+// HasRaft reports whether this coordinator drives a Raft file manifest, which
+// is so only when cluster.raft_data_dir is set. Without one every manifest
+// write here is a successful no-op and GetFileManifest is nil, so a caller
+// that must tell "no manifest" from "an empty manifest" (the backup manager,
+// #1083) asks this first.
+func (c *Coordinator) HasRaft() bool {
+	return c.raftNode != nil
+}
+
+// SyncManifest blocks until this node's FSM has applied every log entry the
+// leader had committed when the call was made (#1083). It is the barrier the
+// catch-up path takes (waitForManifestSync, #799) with the same budget
+// (replication.catch_up_barrier_timeout_ms, default 30 s). A backup or a
+// restore snapshots the manifest only after it, because the primary writer is
+// routinely a Raft follower and can trail the leader for seconds after a
+// restart; a stale view would call registered files unregistered.
+func (c *Coordinator) SyncManifest(ctx context.Context) error {
+	if c.raftNode == nil {
+		return errors.New("raft not available")
+	}
+	timeout := time.Duration(c.cfg.ReplicationCatchUpBarrierTimeoutMs) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return c.waitForManifestSync(ctx, c.raftNode, timeout)
+}
+
+// IsTransientLeaderError reports whether a manifest apply failed only because
+// no leader is known yet or its address is not in the registry, an election
+// in progress, which a caller may retry for a bounded time the way the file
+// registrar's drain does.
+func IsTransientLeaderError(err error) bool {
+	return isTransientLeaderError(err)
 }
 
 // GetFileManifest returns the current file manifest from the Raft FSM.

@@ -17,8 +17,11 @@ that template, so validation fires exactly once).
 {{- include "arc-enterprise.validate.license" . -}}
 {{- include "arc-enterprise.validate.sharedSecret" . -}}
 {{- include "arc-enterprise.validate.tls" . -}}
-{{- include "arc-enterprise.validate.minioCredentials" . -}}
+{{- /* Mode/shape checks (IRSA-with-bundled and external creds) run before
+     the bundled-credentials check, so an operator who misconfigured the
+     mode gets the pointed message, not a generic missing-creds one. */ -}}
 {{- include "arc-enterprise.validate.externalStorageCredentials" . -}}
+{{- include "arc-enterprise.validate.seaweedfsCredentials" . -}}
 {{- end }}
 
 {{/*
@@ -70,15 +73,16 @@ the chart does not generate certificates. Enforced only when TLS is on.
 {{- end }}
 
 {{/*
-Bundled MinIO must have credentials — no weak defaults. Only enforced
-when MinIO is actually rendered (shared mode + not external).
+Bundled SeaweedFS must have credentials — no weak defaults, and the 4.x S3
+gateway denies anonymous writes anyway. Only enforced when SeaweedFS is
+actually rendered (shared mode + not external).
 */}}
-{{- define "arc-enterprise.validate.minioCredentials" -}}
-{{- if eq (include "arc-enterprise.minioBundled" .) "true" -}}
-{{- if and (not .Values.minio.credentials.existingSecret) (or (not .Values.minio.credentials.rootUser) (not .Values.minio.credentials.rootPassword)) -}}
-{{- $existing := lookup "v1" "Secret" .Release.Namespace (include "arc-enterprise.minioSecretName" .) -}}
+{{- define "arc-enterprise.validate.seaweedfsCredentials" -}}
+{{- if eq (include "arc-enterprise.seaweedfsBundled" .) "true" -}}
+{{- if and (not .Values.seaweedfs.credentials.existingSecret) (or (not .Values.seaweedfs.credentials.accessKey) (not .Values.seaweedfs.credentials.secretKey)) -}}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace (include "arc-enterprise.seaweedfsSecretName" .) -}}
 {{- if not $existing -}}
-{{- fail "minio.credentials.rootUser and rootPassword are required (or set minio.credentials.existingSecret)" -}}
+{{- fail "seaweedfs.credentials.accessKey and secretKey are required (or set seaweedfs.credentials.existingSecret)" -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -99,13 +103,13 @@ Only enforced when shared storage is explicitly external.
 {{- $creds := $shared.credentials | default dict -}}
 {{- if eq .Values.storage.mode "shared" -}}
 {{/*
-  IRSA makes sense only for external S3. With bundled MinIO (external=false) the
-  chart would omit the S3 cred env vars and Arc would fall back to the AWS
-  credential chain, which can't authenticate to the local MinIO — a broken
+  IRSA makes sense only for external S3. With bundled SeaweedFS (external=false)
+  the chart would omit the S3 cred env vars and Arc would fall back to the AWS
+  credential chain, which can't authenticate to the local SeaweedFS — a broken
   deployment. Fail fast.
 */}}
 {{- if and $creds.useIRSA (not $shared.external) -}}
-{{- fail "storage.shared.credentials.useIRSA=true requires storage.shared.external=true (IRSA is for external S3; bundled MinIO needs static credentials)" -}}
+{{- fail "storage.shared.credentials.useIRSA=true requires storage.shared.external=true (IRSA is for external S3; bundled SeaweedFS needs static credentials)" -}}
 {{- end -}}
 {{- if $shared.external -}}
 {{- if $creds.useIRSA -}}

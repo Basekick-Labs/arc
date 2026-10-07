@@ -103,8 +103,10 @@ func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.Fi
 		return 0, fmt.Errorf("fetch: byteOffset=0 but prefixHasher is non-nil")
 	}
 
-	// Step 1: dial. Use security.Dial which wraps tls.DialWithDialer if TLS
-	// is configured, otherwise falls back to plain net.DialTimeout.
+	// Step 1: dial. Use security.DialContext, which wraps tls.Dialer.DialContext
+	// if TLS is configured (otherwise plain net.Dialer.DialContext), so a
+	// cancelled ctx interrupts a stalled TCP dial or TLS handshake instead of
+	// only being noticed after connection establishment finishes or times out.
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -124,8 +126,17 @@ func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.Fi
 		}
 	}
 
-	conn, err := security.Dial("tcp", peerAddr, dialTimeout, f.TLSConfig)
+	conn, err := security.DialContext(ctx, "tcp", peerAddr, dialTimeout, f.TLSConfig)
 	if err != nil {
+		// Defensive normalisation, not load-bearing: both DialContext branches
+		// already return an error that satisfies errors.Is for the context
+		// sentinels (net.canceledError.Is and net.timeoutError.Is on the plain
+		// path, the handshake interrupter's bare ctx.Err() on the TLS one).
+		// This only guarantees the bare sentinel rather than a wrapped net
+		// error, so a reader of the log sees why the dial stopped.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, fmt.Errorf("dial %s: %w", peerAddr, ctxErr)
+		}
 		return 0, fmt.Errorf("dial %s: %w", peerAddr, err)
 	}
 	defer conn.Close()
@@ -247,9 +258,15 @@ func (f *FetchClient) Fetch(ctx context.Context, peerAddr string, entry *raft.Fi
 		return 0, fmt.Errorf("ack size mismatch: peer tail=%d expected tail=%d (offset=%d)", ack.SizeBytes, expectedTail, byteOffset)
 	}
 	if ack.SHA256 != entry.SHA256 {
-		// Peer disagrees with our manifest about this file's hash — shouldn't
-		// happen in a consistent cluster, but treat it as a mismatch rather
-		// than silently pulling possibly-wrong bytes.
+		// The peer's manifest disagrees with ours about this file's hash. The
+		// ack hash comes from the peer's own replicated FSM entry, not from
+		// hashing its bytes, so this means the peer's Raft state has not
+		// converged on the generation we are asking for — transient during
+		// propagation. Reject rather than pull bytes we cannot verify; the
+		// puller falls through to the next candidate, which is usually enough
+		// (one exception: a partitioned origin with a frozen FSM stays first
+		// in the candidate list, because the resolver adds the origin without
+		// a health check).
 		return 0, fmt.Errorf("%w: ack hash=%s manifest=%s", ErrChecksumMismatch, ack.SHA256, entry.SHA256)
 	}
 

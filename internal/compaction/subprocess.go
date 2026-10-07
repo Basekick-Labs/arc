@@ -49,7 +49,8 @@ type SubprocessJobConfig struct {
 	SortKeys                []string `json:"sort_keys"`    // Sort keys for ORDER BY in compaction
 	MemoryLimit             string   `json:"memory_limit"` // DuckDB memory limit (e.g., "8GB")
 	// Threads is the DuckDB thread count for this subprocess. 0 means leave
-	// DuckDB at its default (all cores) — the parent normally sends the
+	// DuckDB at its own default, which is the container's CPU quota where there
+	// is one and all cores where there is not — the parent normally sends the
 	// resolved compaction.threads value, so 0 only occurs for callers that
 	// predate the field.
 	Threads int `json:"threads,omitempty"`
@@ -379,7 +380,20 @@ func forwardSubprocessLine(logger zerolog.Logger, line string) {
 		Msg(line)
 }
 
-// createStorageBackendFromConfig creates a storage backend from subprocess config
+// createStorageBackendFromConfig creates a storage backend from subprocess config.
+//
+// This deliberately does NOT go through the shared storage.NewBackend factory
+// (internal/storage/factory.go) that primary storage, the tiering cold tier and
+// the backup manager use. The subprocess has a credential model of its own, on
+// purpose: credentials are never serialised into the job config, so it MUST
+// read them from the environment the parent set. The S3 case passes none at all
+// and lets the SDK chain pick them up, and the Azure case derives
+// UseManagedIdentity from whether AZURE_STORAGE_KEY is present. The factory
+// itself is indifferent to credentials and its other callers simply forward
+// whatever the operator configured; here the empty credential set IS the
+// contract, and a regression in it surfaces as a failed compaction job in a
+// separate process rather than a failed startup - the hardest place to notice
+// one.
 func createStorageBackendFromConfig(config *SubprocessJobConfig, logger zerolog.Logger) (storage.Backend, error) {
 	switch config.StorageType {
 	case "local":
@@ -419,8 +433,16 @@ func createStorageBackendFromConfig(config *SubprocessJobConfig, logger zerolog.
 		}, logger)
 
 	case "azure":
+		// Same rule as the S3 case above, and for the same reason: every field
+		// AzureBlobBackend.ConfigJSON emits must be parsed and forwarded here.
+		// Prefix in particular is applied to every key the backend touches
+		// (prefixedKey), so dropping it silently reroots the subprocess at the
+		// container root and compaction reads and writes the wrong location.
+		// It defaults to empty, which is why the same omission on the S3 side
+		// went unnoticed.
 		var azureConfig struct {
 			Container   string `json:"container"`
+			Prefix      string `json:"prefix"`
 			AccountName string `json:"account_name"`
 			Endpoint    string `json:"endpoint"`
 		}
@@ -431,6 +453,7 @@ func createStorageBackendFromConfig(config *SubprocessJobConfig, logger zerolog.
 		accountKey := os.Getenv("AZURE_STORAGE_KEY")
 		return storage.NewAzureBlobBackend(&storage.AzureBlobConfig{
 			ContainerName:      azureConfig.Container,
+			Prefix:             azureConfig.Prefix,
 			AccountName:        azureConfig.AccountName,
 			AccountKey:         accountKey,
 			Endpoint:           azureConfig.Endpoint,

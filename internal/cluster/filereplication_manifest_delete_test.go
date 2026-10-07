@@ -2,7 +2,7 @@ package cluster
 
 // Query-gate self-heal on manifest delete (#759, #795), driven through the
 // production wiring: a bootstrapped Raft node, startFilePullerLocked (the real
-// onRegister/onDelete callbacks and the real ManifestHas hook), the real fetch
+// onRegister/onDelete callbacks and the real ManifestEntry hook), the real fetch
 // client against a peer, and DeleteFileFromManifest on the leader path.
 //
 // Two orderings against the reader's catch-up pull:
@@ -139,7 +139,9 @@ func newManifestDeleteRig(t *testing.T, peerAddr string) (*Coordinator, *memBack
 	t.Cleanup(func() {
 		c.puller.Stop()
 		cancel()
-		c.deleteWg.Wait()
+		// The delete workers exit only on their stop signal, as in Stop:
+		// cancelling the context no longer ends them (that was the leak).
+		c.stopDeleteWorkers(c.deleteStop, c.deleteWg)
 	})
 	return c, backend
 }

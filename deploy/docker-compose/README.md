@@ -7,9 +7,9 @@ Ready-to-run Docker Compose setups for every common Arc topology. Pick the folde
 | Folder | Edition | Storage | Proxy | Use case |
 |--------|---------|---------|-------|----------|
 | [`oss-local/`](./oss-local/) | OSS | Local disk | none | Local dev, evaluation, single-host small workloads |
-| [`oss-s3/`](./oss-s3/) | OSS | S3 (bundled MinIO) | none | Object-storage durability on a single host; testing S3 code path |
+| [`oss-s3/`](./oss-s3/) | OSS | S3 (bundled SeaweedFS) | none | Object-storage durability on a single host; testing S3 code path |
 | [`oss-traefik/`](./oss-traefik/) | OSS | Local disk | Traefik v3.6 | Single host with TLS / access logs / shared reverse proxy |
-| [`enterprise-shared/`](./enterprise-shared/) | Enterprise | Shared S3 (MinIO) | Traefik v3.6 | HA cluster sharing one bucket; cloud-native deployments |
+| [`enterprise-shared/`](./enterprise-shared/) | Enterprise | Shared S3 (SeaweedFS) | Traefik v3.6 | HA cluster sharing one bucket; cloud-native deployments |
 | [`enterprise-local/`](./enterprise-local/) | Enterprise | Local disk + peer replication | Traefik v3.6 | HA cluster on bare metal / edge / air-gapped (no shared storage) |
 
 ## Quick start

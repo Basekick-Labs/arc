@@ -3,6 +3,7 @@ package tiering
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -77,6 +78,14 @@ func (s *MetadataStore) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_tier_files_tier ON tier_files(tier);
 	CREATE INDEX IF NOT EXISTS idx_tier_files_partition ON tier_files(partition_time);
 	CREATE INDEX IF NOT EXISTS idx_tier_files_database_tier ON tier_files(database, tier);
+	-- GetTiersForMeasurement's SELECT DISTINCT tier WHERE database = ? AND
+	-- measurement = ? is the query path's routing read and, uncached, the
+	-- replication drainer's before/after tier-set read. Without this it walks
+	-- every row of the database through idx_tier_files_database_tier and
+	-- filters on measurement. tier is included so the index COVERS the read:
+	-- the planner picks a two-column (database, measurement) index only once
+	-- ANALYZE has run, and nothing in Arc runs ANALYZE.
+	CREATE INDEX IF NOT EXISTS idx_tier_files_database_measurement_tier ON tier_files(database, measurement, tier);
 
 	-- Migration history
 	CREATE TABLE IF NOT EXISTS tier_migrations (
@@ -137,6 +146,172 @@ func (s *MetadataStore) invalidateTierCache(database, measurement string) {
 	s.tierCacheMu.Unlock()
 }
 
+// The three write helpers below do NOT invalidate the tier cache; their
+// caller is the replication-registration drainer, which applies a whole batch
+// and then invalidates once per distinct database/measurement.
+//
+// That split is deliberate rather than tidy. invalidateTierCache bumps a
+// single process-wide tierCacheGen, and storeTierCacheIfUnchanged discards any
+// cache fill whose generation moved — so invalidating per row would make a
+// catch-up burst of thousands of files, or one compaction sweep's manifest
+// deletes, throw away concurrent GetTiersForMeasurement fills for every
+// unrelated measurement, leaving the query path to re-run SELECT DISTINCT tier
+// on the one shared SQLite connection. Per batch the bump count is the number
+// of measurements touched, not the number of files.
+//
+// Skipping invalidation entirely is not an option in either direction: a
+// concurrent GetTiersForMeasurement that read tierCacheGen and ran its query
+// BEFORE one of these writes must not be allowed to store a tier set missing
+// the tier just added, or it serves that set for the full TTL — for a
+// measurement whose only other row is cold, exactly the cold-only read these
+// helpers exist to prevent.
+
+// recordHotFileIfNotCold records a hot file without ever moving an existing
+// row out of the cold tier. It is the registration path for a file this node
+// did not write itself — one pulled from a peer by cluster file replication —
+// where plain RecordFile would be wrong: RecordFile's upsert sets
+// `tier = excluded.tier` unconditionally, which is why ScanAndRegisterFiles
+// needs its own cold-path pre-check before calling it (#683). A hot file whose
+// row already says cold is the orphan ReconcileOrphanedFiles deletes after a
+// failed post-migration cleanup; re-registering it as hot would reset
+// migrated_at, hide it from reconciliation, and re-upload it every cycle.
+//
+// One statement, so there is no read-then-write window: the conflict branch is
+// gated on the stored row still being hot, and a cold or quarantined row is
+// left exactly as it is.
+//
+// Reports whether a row was written. A conflict the WHERE excluded, and a
+// re-record of an identical row, both report false, so a reconciliation walk
+// over files this node already holds writes nothing.
+func (s *MetadataStore) recordHotFileIfNotCold(ctx context.Context, file *FileMetadata) (bool, error) {
+	createdAt := file.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+
+	// Bound in UTC, here and in every other writer of created_at: the column
+	// is compared in SQL (DeleteFileInTier's createdBefore), go-sqlite3 stores
+	// a time.Time as text in whatever zone the value carries, and the scan
+	// passes a local backend's mtime, which is in the host zone. Two zones in
+	// one column make that comparison a string compare across offsets.
+	//
+	// A quarantined row is matched by the conflict target but excluded from the
+	// update: its key is permanently unusable, and the row records that.
+	res, err := s.db.ExecContext(ctx, `
+		INSERT INTO tier_files (path, database, measurement, partition_time, tier, size_bytes, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(path) DO UPDATE SET size_bytes = excluded.size_bytes
+			WHERE tier_files.tier = ?
+			  AND tier_files.quarantined_at IS NULL
+			  AND tier_files.size_bytes != excluded.size_bytes
+	`,
+		file.Path,
+		file.Database,
+		file.Measurement,
+		file.PartitionTime.UTC(),
+		string(TierHot),
+		file.SizeBytes,
+		createdAt.UTC(),
+		string(TierHot),
+	)
+	if err != nil {
+		return false, fmt.Errorf("failed to record hot file: %w", err)
+	}
+
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// markFileCold records that a path is readable in the cold tier and no longer
+// in hot, for a node that learned it from its own storage rather than by
+// performing the migration: the primary writer migrates and then removes the
+// hot copy cluster-wide through the Raft manifest, and without this the
+// receiving node would not read the cold copy until its next cold-tier
+// metadata sync — up to a full migration interval.
+//
+// An upsert, not an update: the hot row may never have been written (a
+// registration dropped under load), and an update that matched nothing would
+// leave the file with no row at all — unlinked locally, absent from this
+// node's cold reads, and invisible until the sync. The conflict branch still
+// refuses to touch a cold or quarantined row.
+//
+// migrated_at is deliberately left NULL on insert and untouched on update.
+// Stamping it would put every path this node unlinks into orphan
+// reconciliation's recently-migrated window, which HEADs each row — see
+// RecordColdFile, which stamps from the cold object's own timestamp for that
+// reason.
+//
+// It stays NULL for good, and that is the intent rather than an oversight:
+// syncColdTierMetadata skips any path it already holds a cold row for, so it
+// never reaches RecordColdFile for one of these, and RecordColdFile keeps an
+// existing stamp when the tier is unchanged in any case. Nothing needs it.
+// Both readers of migrated_at — GetRecentlyMigratedFiles, for orphan
+// reconciliation, and the manifest sweep — look for work on a file whose hot
+// copy is still present and whose manifest entry still stands, and by the
+// time this runs neither is true.
+//
+// Reports whether a row was written.
+func (s *MetadataStore) markFileCold(ctx context.Context, file *FileMetadata) (bool, error) {
+	createdAt := file.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+
+	res, err := s.db.ExecContext(ctx, `
+		INSERT INTO tier_files (path, database, measurement, partition_time, tier, size_bytes, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(path) DO UPDATE SET tier = excluded.tier
+			WHERE tier_files.tier = ?
+			  AND tier_files.quarantined_at IS NULL
+	`,
+		file.Path,
+		file.Database,
+		file.Measurement,
+		file.PartitionTime.UTC(),
+		string(TierCold),
+		file.SizeBytes,
+		createdAt.UTC(),
+		string(TierHot),
+	)
+	if err != nil {
+		return false, fmt.Errorf("failed to mark file cold: %w", err)
+	}
+
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// retireHotRow removes a path's row only if it is still hot, for a node that
+// has just unlinked its local copy for a reason that does not put the file in
+// cold — a compaction that consumed it, a retention or operator delete. The
+// tier condition is the same one DeleteFileInTier applies: a row that reached
+// cold meanwhile is not this caller's to remove.
+//
+// Hands back the row's database and measurement so the caller can invalidate
+// the tier cache for the batch; they are read before the delete because the
+// row is gone afterwards. Reports whether a row was removed.
+func (s *MetadataStore) retireHotRow(ctx context.Context, path string) (bool, string, string, error) {
+	// One statement with RETURNING rather than SELECT-then-DELETE: the pair
+	// leaves a window in which a row inserted between them is deleted while
+	// the cache key reads empty, and it would have to discard the SELECT's
+	// error to stay readable.
+	var database, measurement string
+	err := s.db.QueryRowContext(ctx,
+		`DELETE FROM tier_files WHERE path = ? AND tier = ?
+		 RETURNING database, measurement`,
+		path, string(TierHot),
+	).Scan(&database, &measurement)
+	if errors.Is(err, sql.ErrNoRows) {
+		// No hot row for this path: already cold, quarantined away, or never
+		// registered. Not an error.
+		return false, "", "", nil
+	}
+	if err != nil {
+		return false, "", "", fmt.Errorf("failed to retire hot row: %w", err)
+	}
+	return true, database, measurement, nil
+}
+
 // RecordFile records a new file in the metadata store
 func (s *MetadataStore) RecordFile(ctx context.Context, file *FileMetadata) error {
 	query := `
@@ -160,7 +335,7 @@ func (s *MetadataStore) RecordFile(ctx context.Context, file *FileMetadata) erro
 		file.PartitionTime.UTC(),
 		string(file.Tier),
 		file.SizeBytes,
-		createdAt,
+		createdAt.UTC(),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to record file: %w", err)
@@ -169,6 +344,53 @@ func (s *MetadataStore) RecordFile(ctx context.Context, file *FileMetadata) erro
 	// Invalidate tier cache for this database/measurement
 	s.invalidateTierCache(file.Database, file.Measurement)
 
+	return nil
+}
+
+// sqliteTimestampLayout is the text form CURRENT_TIMESTAMP writes. migrated_at
+// is compared and ordered as text, so a Go-side stamp must use the same
+// layout or the two formats sort against each other ('T' vs ' ').
+const sqliteTimestampLayout = "2006-01-02 15:04:05"
+
+// RecordColdFile records a file that is present in cold storage, as found by
+// the cold-tier metadata sync. Unlike RecordFile it stamps migrated_at from
+// the cold object's own timestamp rather than now: the sync discovers moves
+// after the fact, on every node, and orphan reconciliation walks every row
+// migrated in the last 48 hours with one HEAD each — stamping now on a
+// fresh node would make it HEAD the whole cold tier for two cycles. A
+// same-tier conflict keeps the row's migrated_at.
+func (s *MetadataStore) RecordColdFile(ctx context.Context, file *FileMetadata, migratedAt time.Time) error {
+	if migratedAt.IsZero() {
+		migratedAt = time.Now()
+	}
+	createdAt := file.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = migratedAt
+	}
+
+	query := `
+		INSERT INTO tier_files (path, database, measurement, partition_time, tier, size_bytes, created_at, migrated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(path) DO UPDATE SET
+			tier = excluded.tier,
+			size_bytes = excluded.size_bytes,
+			migrated_at = CASE WHEN tier_files.tier != excluded.tier THEN excluded.migrated_at ELSE tier_files.migrated_at END
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		file.Path,
+		file.Database,
+		file.Measurement,
+		file.PartitionTime.UTC(),
+		string(TierCold),
+		file.SizeBytes,
+		createdAt.UTC(),
+		migratedAt.UTC().Format(sqliteTimestampLayout),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to record cold file: %w", err)
+	}
+
+	s.invalidateTierCache(file.Database, file.Measurement)
 	return nil
 }
 
@@ -433,6 +655,46 @@ func (s *MetadataStore) DeleteFile(ctx context.Context, path string) error {
 	return nil
 }
 
+// DeleteFileInTier removes a file's row only if it is still in the given
+// tier, so a decision taken from a tier listing cannot delete a row that
+// changed tier meanwhile.
+//
+// createdBefore extends that to the row's age: a non-zero value deletes only
+// a row at least as old as the caller's evidence. It covers one narrow case —
+// a row the replication drainer DELETED and a later pull re-INSERTED between
+// the caller's snapshot and this call carries a fresh created_at, and the
+// decision was not taken about that row. It does NOT cover a row that was
+// merely re-registered: no conflict branch in this file touches created_at,
+// so a refreshed row is as old as the one the snapshot judged, and the caller
+// has to re-check storage for that (retireVanishedHotRows stats the path).
+//
+// The comparison is on text — go-sqlite3 binds a time.Time in the zone it
+// carries — so every writer of created_at binds UTC and so does this.
+//
+// Reports whether a row was removed.
+func (s *MetadataStore) DeleteFileInTier(ctx context.Context, path string, tier Tier, createdBefore time.Time) (bool, error) {
+	query := `DELETE FROM tier_files WHERE path = ? AND tier = ?`
+	args := []any{path, string(tier)}
+	if !createdBefore.IsZero() {
+		query += ` AND created_at < ?`
+		args = append(args, createdBefore.UTC())
+	}
+	query += ` RETURNING database, measurement`
+
+	var database, measurement string
+	err := s.db.QueryRowContext(ctx, query, args...).Scan(&database, &measurement)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to delete file: %w", err)
+	}
+	if database != "" && measurement != "" {
+		s.invalidateTierCache(database, measurement)
+	}
+	return true, nil
+}
+
 // QuarantineFile marks a file index row as one tiering must never act on
 // again (#758). The row stays, with its tier unchanged, so the query path and
 // the status endpoints keep describing what is actually on disk; only the
@@ -611,13 +873,43 @@ func (s *MetadataStore) GetTiersForMeasurement(ctx context.Context, database, me
 	s.tierCacheMu.RUnlock()
 
 	// Cache miss - query database
-	query := `
+	tiers, err := s.queryTierSet(ctx, database, measurement)
+	if err != nil {
+		return nil, err
+	}
+
+	s.storeTierCacheIfUnchanged(cacheKey, tiers, cacheGen)
+
+	// Return a copy
+	result := make(map[Tier]bool, len(tiers))
+	for _, tier := range tiers {
+		result[tier] = true
+	}
+	return result, nil
+}
+
+// readTierSet is GetTiersForMeasurement without the cache: the tiers that have
+// a row for the measurement right now, straight from SQLite. For a writer that
+// needs to know whether its own writes changed the set — the cache can be up
+// to tierCacheTTL behind, and the writer is about to invalidate it anyway.
+func (s *MetadataStore) readTierSet(ctx context.Context, database, measurement string) (map[Tier]bool, error) {
+	tiers, err := s.queryTierSet(ctx, database, measurement)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[Tier]bool, len(tiers))
+	for _, tier := range tiers {
+		result[tier] = true
+	}
+	return result, nil
+}
+
+func (s *MetadataStore) queryTierSet(ctx context.Context, database, measurement string) ([]Tier, error) {
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT DISTINCT tier
 		FROM tier_files
 		WHERE database = ? AND measurement = ?
-	`
-
-	rows, err := s.db.QueryContext(ctx, query, database, measurement)
+	`, database, measurement)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get tiers for measurement: %w", err)
 	}
@@ -631,19 +923,10 @@ func (s *MetadataStore) GetTiersForMeasurement(ctx context.Context, database, me
 		}
 		tiers = append(tiers, TierFromString(tierStr))
 	}
-
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating tiers: %w", err)
 	}
-
-	s.storeTierCacheIfUnchanged(cacheKey, tiers, cacheGen)
-
-	// Return a copy
-	result := make(map[Tier]bool, len(tiers))
-	for _, tier := range tiers {
-		result[tier] = true
-	}
-	return result, nil
+	return tiers, nil
 }
 
 func (s *MetadataStore) storeTierCacheIfUnchanged(key string, tiers []Tier, gen uint64) {

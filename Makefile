@@ -42,10 +42,20 @@ build: ## Build the binary
 build-fips: ## Build the FIPS 140-3 variant (arc-fips) against the certified Go module
 	GOFIPS140=$(GOFIPS140_VERSION) CGO_ENABLED=1 $(GO) build $(FIPS_GOFLAGS) -o $(FIPS_BINARY_NAME) $(MAIN_PATH)
 
+# arcx-lib cds into $(ARCX_DIR) instead of passing --manifest-path: cargo discovers
+# .cargo/config.toml from the CWD upward, never from the manifest's directory, so
+# building it from here silently dropped arcx's MACOSX_DEPLOYMENT_TARGET pin (arcx
+# #55) and stamped the C objects (zstd, mimalloc) with minos = the HOST SDK.
+# Measured 2026-10-02: --manifest-path from here -> minos 27.0; cd first -> 26.0.
+# The former ships an `arc` that advertises macOS 26 support while embedding objects
+# that demand 27. (The ~22 "built for newer macOS version" ld warnings are a
+# DIFFERENT thing and survive either way — they track the objects' `sdk` field, i.e.
+# whichever SDK is installed; only an older -isysroot silences those. Don't read
+# them as this pin failing.)
 arcx-lib: ## Build the arcx engine static lib (libarcx.a) from $(ARCX_DIR)
 	@command -v cargo >/dev/null || { echo "ERROR: cargo (Rust) required for the arcx build; install rustup"; exit 1; }
 	@test -d "$(ARCX_DIR)" || { echo "ERROR: arcx repo not found at ARCX_DIR=$(ARCX_DIR)"; exit 1; }
-	cargo build --release --manifest-path $(ARCX_DIR)/Cargo.toml
+	cd $(ARCX_DIR) && cargo build --release
 
 build-arcx: arcx-lib ## Build arc with the arcx engine linked in (in-process FFI)
 	CGO_ENABLED=1 $(GO) build $(ARCX_GOFLAGS) -o $(BINARY_NAME) $(MAIN_PATH)

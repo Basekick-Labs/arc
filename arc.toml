@@ -26,9 +26,22 @@ format = "console"  # json or console
 # Auto-configured based on system resources if not set.
 # Override via: ARC_DATABASE_MAX_CONNECTIONS, ARC_DATABASE_MEMORY_LIMIT, ARC_DATABASE_THREAD_COUNT
 [database]
-# max_connections = 28    # Default: 2x CPU cores
-# memory_limit = "8GB"    # Default: ~50% system memory
-# thread_count = 14       # Default: CPU cores
+# max_connections = 28    # Default: 2x the HOST's CPU cores (min 4, max 64).
+#                         # Deliberately not quota-derived: it bounds statements
+#                         # in flight, and Arc queries are often S3-I/O-bound, so
+#                         # a quota-sized pool converts concurrency into client
+#                         # timeouts. Worth lowering BY HAND in a small container
+#                         # though — this pool is the only global limit on
+#                         # concurrent queries, and the Go-side memory of an
+#                         # in-flight result is not covered by memory_limit.
+# memory_limit = "8GB"    # Default: unset — DuckDB uses 80% of the container's
+#                         # cgroup limit, or of host memory when unlimited.
+#                         # Set this only to override that. Percent and unit-less
+#                         # forms are rejected: DuckDB needs an absolute size.
+# thread_count = 14       # Default: unset — DuckDB uses the container's CPU
+#                         # quota (cpu.max), not the host's core count.
+#                         # compaction.threads follows the quota too since
+#                         # 26.09.3; see the [compaction] section below.
 enable_wal = true
 
 # Allow DuckDB to reorder results of queries WITHOUT an ORDER BY (queries
@@ -59,6 +72,20 @@ s3_path_style = true        # MinIO/dev. AWS S3: false
 # Credentials via env: ARC_STORAGE_S3_ACCESS_KEY, ARC_STORAGE_S3_SECRET_KEY
 # On EKS with IRSA, leave both unset: Arc detects AWS_ROLE_ARN +
 # AWS_WEB_IDENTITY_TOKEN_FILE and authenticates via the pod's IAM role.
+#
+# A key prefix confines Arc to one subtree of the bucket or container, so
+# several deployments can share one, and so a backup target can live beside the
+# primary data. Both default to the root. Commented rather than set to "",
+# because a shipped value is the effective configuration for every deployment
+# that does not override it and an empty environment variable does not clear it
+# (see TestShippedArcTomlHasNoLiveColdTierConnectionValues).
+# s3_prefix = "instances/abc123"
+#
+# Azure Blob (when backend = "azure"). Credentials via env:
+# ARC_STORAGE_AZURE_ACCOUNT_NAME, ARC_STORAGE_AZURE_ACCOUNT_KEY (or
+# ARC_STORAGE_AZURE_CONNECTION_STRING).
+# azure_container = ""
+# azure_prefix = "instances/abc123"
 
 # -----------------------------------------------------------------------------
 # Ingestion
@@ -88,6 +115,33 @@ default_sort_keys = ""
 [compaction]
 enabled = true
 
+# DuckDB thread count for EACH compaction subprocess.
+# Default: unset (0) = half of the CPUs this process may use, minimum 1.
+# Environment override: ARC_COMPACTION_THREADS=4
+#
+# "CPUs this process may use" is min(runtime.NumCPU(), runtime.GOMAXPROCS(0)):
+# Go derives GOMAXPROCS from the container's CPU quota (cpu.max, or
+# cpu.cfs_quota_us on cgroup v1), while NumCPU catches cpuset limits that no
+# quota expresses. Before 26.09.3 this was half the HOST's core count, so a
+# 2-CPU pod on a 64-core node ran every compaction job with 32 threads (#1030).
+#
+# Halving assumes the default max_concurrent = 2. Raising max_concurrent without
+# lowering this oversubscribes: the subprocesses do not share a budget.
+#
+# This does not make the total fit the quota. On a 2-CPU quota the two
+# subprocesses take 1 thread each and the main process takes the quota's 2 — 4
+# threads against 2 CPUs. These are caps on parallelism, not reservations.
+#
+# Three things that change the derived value, all deliberate:
+#   - GOMAXPROCS set ABOVE the quota is honoured, up to the machine's core count.
+#   - GODEBUG=containermaxprocs=0 turns the runtime's cgroup read off entirely,
+#     giving the pre-26.09.3 host-derived behaviour.
+#   - the runtime floors GOMAXPROCS at 2, so --cpus=0.5 still yields 1 thread.
+#
+# Not licence-capped: this is resolved before the licence is applied, and a
+# subprocess is a separate process. Set it by hand on a core-limited licence.
+# threads = 4
+
 # Maximum wall-clock budget for ONE scheduled or manual compaction cycle.
 # Default: 30m. Positive Go duration syntax: 90s, 30m, 2h, 2h15m.
 # Environment override: ARC_COMPACTION_CYCLE_TIMEOUT=2h
@@ -103,6 +157,21 @@ enabled = true
 # cycle; valid delivery deferrals do not. A manifest that cannot be read is
 # retained; one that cannot be decoded is parked as *.quarantined.
 # cycle_timeout = "30m"
+
+# Databases that scheduled cycles (and manual triggers without a database
+# scope) skip during candidate discovery. A trigger that names a database
+# (POST /api/v1/compaction/trigger?database=X) bypasses the list — combined,
+# the two give control over what gets compacted and in which order.
+# Exact, case-sensitive names — no globs, prefixes, or separator splitting.
+# On a hub, received spoke data is excluded as "spoke/db" (one
+# pseudo-database) or "spoke" (the whole namespace); the manual bypass works
+# at spoke granularity only (?database= takes plain database names).
+# Manifest recovery is never filtered: compactions a previous cycle already
+# started always complete. This key gates compaction only — retention,
+# tiering, and Iceberg export ignore it. Default: empty (nothing excluded).
+# Environment override (whitespace-separated; a name containing spaces
+# needs this TOML array): ARC_COMPACTION_EXCLUDE_DATABASES="staging imports"
+# exclude_databases = ["staging", "imports_backlog"]
 
 # Hourly
 hourly_enabled = true
@@ -223,27 +292,38 @@ migration_history_retention_days = 90
 enabled = false
 backend = "s3"              # "s3" or "azure"
 
-# S3/MinIO — as with the primary [storage] block above, these are MinIO/local-dev
-# values. For real AWS S3: clear s3_endpoint, set s3_use_ssl = true and
-# s3_path_style = false, and REMOVE the static keys below — leaving them set
-# suppresses IRSA/instance-role detection for the cold tier, since configured
-# keys always take precedence over the AWS credential chain.
-s3_bucket = "arc-archive"
+# S3 — nothing below is set, on purpose. Arc's built-in defaults are already
+# the AWS-correct ones (no endpoint, HTTPS, virtual-hosted addressing, and
+# credentials from the AWS chain so IRSA and instance roles are detected), and
+# a value shipped here cannot be cleared from the environment: an empty env var
+# reads as unset, so ARC_TIERED_STORAGE_COLD_S3_ENDPOINT="" does NOT blank a
+# value in this file. A cold tier meant for AWS would silently keep talking to
+# whatever was shipped here.
+#
+# Set the bucket and region for your account; enabling the cold tier without a
+# bucket is refused at startup rather than defaulted to anything.
 s3_region = "us-east-1"
-s3_endpoint = "localhost:9000"   # MinIO/dev. AWS S3: leave empty
-s3_access_key = "minioadmin"     # MinIO/dev. AWS S3 with IRSA: remove
-s3_secret_key = "minioadmin"     # MinIO/dev. AWS S3 with IRSA: remove
-s3_use_ssl = false               # MinIO/dev. AWS S3: true
-s3_path_style = true             # MinIO/dev. AWS S3: false
-s3_storage_class = "GLACIER"
+# s3_bucket = ""
+#
+# MinIO / another S3-compatible store — uncomment as a set:
+# s3_endpoint = "localhost:9000"
+# s3_access_key = "minioadmin"   # configured keys take precedence over the
+# s3_secret_key = "minioadmin"   # AWS chain, so these disable IRSA detection
+# s3_use_ssl = false
+# s3_path_style = true
+# Cold objects are written with no storage class set (S3 Standard) and read in
+# place; there is deliberately no storage-class key. Keep bucket lifecycle
+# rules off the cold prefix — Glacier or Deep Archive objects cannot be queried.
 
-# Azure (when backend = "azure")
+# Azure (when backend = "azure"). Objects take the storage account's default
+# access tier; there is no access-tier key, for the same reason.
 azure_container = ""
 azure_endpoint = ""
 azure_use_managed_identity = false
-azure_access_tier = "Archive"
-
-retrieval_mode = "standard"  # standard, expedited, bulk
+# A prefix lets the cold tier share one container with the primary store. Left
+# commented for the same reason as the connection values above: a shipped value
+# cannot be cleared by an empty environment variable.
+# azure_prefix = "cold"
 
 # -----------------------------------------------------------------------------
 # Audit Logging (Enterprise)
@@ -258,6 +338,10 @@ include_reads = false           # Log GET/query requests (high volume)
 [backup]
 enabled = true
 local_path = "./data/backups"           # Directory for local backups
+# How long one backup or one restore may run before its context is cancelled.
+# Go duration syntax; must be positive. 2h is the value both were hardcoded to
+# before this key existed.
+# operation_timeout = "2h"
 
 # Query Management (Enterprise)
 # -----------------------------------------------------------------------------

@@ -30,8 +30,8 @@ trap 'rm -f "$manifest"' EXIT
 helm template arc "$chart" \
   --set license.key=not-a-real-key \
   --set cluster.sharedSecret.value=not-a-real-secret \
-  --set minio.credentials.rootUser=not-a-real-user \
-  --set minio.credentials.rootPassword=not-a-real-password \
+  --set seaweedfs.credentials.accessKey=not-a-real-user \
+  --set seaweedfs.credentials.secretKey=not-a-real-password \
   "$@" \
   > "$manifest"
 
@@ -66,7 +66,7 @@ for doc in docs:
     if "kind: StatefulSet" not in doc:
         continue
     if not env_value(doc, "ARC_CLUSTER_ENABLED"):
-        continue  # not a clustered Arc pod (e.g. the bundled MinIO)
+        continue  # not a clustered Arc pod (e.g. the bundled SeaweedFS)
     role = env_literal(doc, "ARC_CLUSTER_ROLE")
     if role is None:
         failures.append("a clustered StatefulSet renders with no ARC_CLUSTER_ROLE, so its role cannot be checked")
