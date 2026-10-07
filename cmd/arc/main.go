@@ -181,6 +181,23 @@ func applyLicenseCoreLimits(lic *license.License, cfg *config.Config) {
 		cfg.Database.ThreadCount = lic.MaxCores
 	}
 
+	// Each compaction subprocess is separate, so the main process's thread
+	// limits cannot constrain its DuckDB threads. Match the other licensed
+	// execution knobs: cap each positive subprocess setting at the license and
+	// at the effective cores available to this process. Do not replace zero:
+	// Config.Load resolves that automatic sentinel in production, while a
+	// directly constructed Config must retain DuckDB's own CPU-aware default.
+	licensedCompactionThreads := min(lic.MaxCores, effective)
+	if cfg.Compaction.Threads > licensedCompactionThreads {
+		log.Info().
+			Int("licensed_cores", lic.MaxCores).
+			Int("effective_cores", effective).
+			Int("configured_threads", cfg.Compaction.Threads).
+			Int("compaction_threads", licensedCompactionThreads).
+			Msg("License/effective core limit applied to compaction subprocess threads")
+		cfg.Compaction.Threads = licensedCompactionThreads
+	}
+
 	if cfg.Ingest.FlushWorkers > lic.MaxCores {
 		cfg.Ingest.FlushWorkers = lic.MaxCores
 		log.Info().
@@ -3008,6 +3025,7 @@ func main() {
 		// The network agent. Skipped entirely on a fully air-gapped spoke,
 		// which has no hub URL to build a transport from.
 		var syncAgent *edgesync.Agent
+		var automaticSync bool
 		if cfg.EdgeSync.Spoke.Enabled {
 			if cfg.EdgeSync.Spoke.HubToken == "" {
 				log.Warn().Msg("ARC_EDGE_SYNC_HUB_TOKEN is not set; a hub running with auth enabled " +
@@ -3106,6 +3124,49 @@ func main() {
 		}
 		spokeHandler.RegisterRoutes(server.GetApp())
 
+		// Automatic spoke sync is the paid scheduling phase of edge sync. The
+		// existing enabled flag is the operator's explicit opt-in to moving
+		// data off this node; without a valid paid license, the manual
+		// endpoint remains available as before.
+		if syncAgent != nil {
+			if licenseClient != nil && licenseClient.CanUseEdgeSyncScheduler() {
+				var writerGate edgesync.WriterGate
+				if clusterCoordinator != nil {
+					writerGate = newWriterClusterGate(clusterCoordinator)
+				}
+				syncScheduler, err := edgesync.NewScheduler(edgesync.SchedulerConfig{
+					Agent:         syncAgent,
+					LicenseClient: licenseClient,
+					SyncInterval:  cfg.EdgeSync.Spoke.SyncInterval,
+					RetryInterval: cfg.EdgeSync.Spoke.SyncRetryInterval,
+					Enabled:       true,
+					ClusterGate:   writerGate,
+					Metrics:       metrics.Get(),
+					Logger:        spokeLogger,
+				})
+				if err != nil {
+					log.Fatal().Err(err).Msg("Failed to configure the edge sync scheduler; refusing to start")
+				}
+				if err := syncScheduler.Start(); err != nil {
+					log.Fatal().Err(err).Msg("Failed to start the edge sync scheduler; refusing to start")
+				}
+				shutdownCoordinator.RegisterHook("edgesync-scheduler", func(context.Context) error {
+					syncScheduler.Stop()
+					return nil
+				}, shutdown.PriorityScheduler)
+				automaticSync = syncScheduler.IsRunning()
+				if automaticSync {
+					metrics.Get().EnableEdgeSyncSpokeScheduler()
+					spokeLogger.Info().
+						Dur("sync_interval", cfg.EdgeSync.Spoke.SyncInterval).
+						Dur("retry_interval", cfg.EdgeSync.Spoke.SyncRetryInterval).
+						Msg("Paid edge sync scheduler enabled")
+				}
+			} else {
+				spokeLogger.Info().Msg("Automatic edge sync requires a valid paid license; manual sync remains available")
+			}
+		}
+
 		// Reports what is actually enabled: an air-gap-only spoke has no hub
 		// URL and no /run endpoint, so claiming both would send an operator
 		// looking for a route that returns 503.
@@ -3118,9 +3179,17 @@ func main() {
 		}
 		switch {
 		case syncAgent != nil && bundleExporter != nil:
-			evt.Msg("Edge sync spoke enabled; POST /api/v1/spoke-sync/run to sync, /export for an air-gap bundle")
+			if automaticSync {
+				evt.Msg("Edge sync spoke enabled; scheduled and manual network sync are available, /export writes an air-gap bundle")
+			} else {
+				evt.Msg("Edge sync spoke enabled; trigger network sync with POST /api/v1/spoke-sync/run, /export writes an air-gap bundle")
+			}
 		case syncAgent != nil:
-			evt.Msg("Edge sync spoke enabled; trigger a pass with POST /api/v1/spoke-sync/run")
+			if automaticSync {
+				evt.Msg("Edge sync spoke enabled; scheduled sync is active and POST /api/v1/spoke-sync/run triggers a manual pass")
+			} else {
+				evt.Msg("Edge sync spoke enabled; trigger a pass with POST /api/v1/spoke-sync/run")
+			}
 		default:
 			evt.Msg("Edge sync air-gap export enabled; write a bundle with POST /api/v1/spoke-sync/export")
 		}
@@ -4304,30 +4373,35 @@ func main() {
 					Msg("iceberg.warehouse is not a local path; backups cannot include its table metadata")
 			}
 		}
-		// Backup destination (#1085 stage B2b-1). A configured target replaces
-		// the local directory entirely; with none, BackupPath is the
-		// destination exactly as before. config.Load has already validated the
-		// target, bounded its key prefix, and refused an overlap with primary
-		// storage or the cold tier — see
+		// Backup destinations (#1085 stage B2b-1, a set with per-database
+		// routing since B2b-2). A configured target replaces the local
+		// directory entirely; with none, BackupPath is the destination exactly
+		// as before. config.Load has already validated every target, bounded
+		// each key prefix, refused the same database on two targets, and
+		// refused an overlap with primary storage, with the cold tier and
+		// between any two targets — see
 		// config.checkBackupDestinationOverlap, which records what that
 		// refusal actually protects against: a backup that re-copies itself
 		// every run, and the reconciliation sweep deleting the backups.
-		var backupTarget *backup.Target
-		if t := cfg.Backup.DefaultBackupTarget(); t != nil {
+		var backupTargets []backup.Target
+		for _, name := range cfg.Backup.TargetNamesSorted() {
+			t := cfg.Backup.Targets[name]
 			keyPrefix, err := t.KeyPrefix()
 			if err != nil {
 				// Unreachable: validateBackupTargets asks for the same prefix
 				// at load and refuses a bad one. Fatal rather than silently
 				// reserving no key headroom, which would turn an overlong key
-				// from a reported skip into a failed write.
+				// from a reported skip into a failed write. Per target, so a
+				// routed target with an unusable prefix is as loud as the
+				// default one.
 				log.Fatal().Err(err).Str("target", t.Name).Msg("Backup target prefix is unusable")
 			}
-			backupTarget = &backup.Target{
+			backupTargets = append(backupTargets, backup.Target{
 				Name:      t.Name,
 				Spec:      t.BackendSpec(),
 				KeyPrefix: keyPrefix,
 				Remote:    t.IsRemote(),
-			}
+			})
 		}
 
 		// Backup owner identity (#1085 stage B2b-1). The CLUSTER when
@@ -4364,10 +4438,18 @@ func main() {
 			backupInstanceID = id
 		}
 
+		// Built once: the ready log below reports its size, and rebuilding it
+		// there would walk every target a second time to answer a question
+		// this map already answers.
+		backupRouting := cfg.Backup.RoutingMap()
+
 		backupManager, err := backup.NewManager(&backup.ManagerConfig{
 			DataStorage:            storageBackend,
 			BackupPath:             cfg.Backup.LocalPath,
-			Target:                 backupTarget,
+			Targets:                backupTargets,
+			DefaultTarget:          cfg.Backup.DefaultTarget,
+			Routing:                backupRouting,
+			OperationTimeout:       cfg.Backup.OperationTimeout,
 			InstanceID:             backupInstanceID,
 			SQLiteDBPath:           cfg.Auth.DBPath,
 			IcebergCatalogDBPath:   icebergCatalogDBPath,
@@ -4420,11 +4502,15 @@ func main() {
 			// backup goes somewhere it does not, and that directory is not
 			// even created in that configuration.
 			ready := log.Info()
-			if backupTarget != nil {
+			if len(backupTargets) > 0 {
+				names := make([]string, 0, len(backupTargets))
+				for _, t := range backupTargets {
+					names = append(names, t.Name)
+				}
 				ready = ready.
-					Str("backup_target", backupTarget.Name).
-					Str("backup_target_type", backupTarget.Spec.Type).
-					Bool("backup_target_remote", backupTarget.Remote)
+					Str("backup_default_target", cfg.Backup.DefaultTarget).
+					Strs("backup_targets", names).
+					Int("routed_databases", len(backupRouting))
 			} else {
 				ready = ready.Str("backup_path", cfg.Backup.LocalPath)
 			}

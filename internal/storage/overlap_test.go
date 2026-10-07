@@ -139,11 +139,11 @@ func TestDifferentObjectStoresDoNotOverlap(t *testing.T) {
 	// the root of an unnamed bucket collides with a local destination on
 	// every other field — empty store, empty bucket, root prefix — so Kind is
 	// all that keeps them apart. config.Load requires a bucket and a
-	// container, so this is not a reachable configuration today; stage B2b-2
-	// calls Overlaps N-squared times over inputs this package does not
-	// control, and a primitive that is only correct for the inputs one caller
-	// happens to pass is the shape that breaks when the second caller
-	// arrives.
+	// container, so this is not a reachable configuration today; the
+	// backup-target check calls Overlaps N-squared times over inputs this
+	// package does not control (#1085 stage B2b-2), and a primitive that is
+	// only correct for the inputs one caller happens to pass is the shape
+	// that breaks when the second caller arrives.
 	rootless, err := DestinationFromSpec(BackendSpec{Type: "s3"})
 	if err != nil {
 		t.Fatalf("DestinationFromSpec(s3, no bucket): %v", err)

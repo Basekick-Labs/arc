@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -64,7 +65,11 @@ func NewBackupHandler(manager *backup.Manager, authManager *auth.AuthManager, op
 // before backup.operation_timeout existed. It is the fallback for a
 // hand-built handler only; the configured default lives in
 // config.setDefaults so operators can see it.
-const defaultBackupOperationTimeout = 2 * time.Hour
+//
+// The manager's constant, not a second copy: the LISTING reads the same figure
+// to decide whether a run whose manifests have not landed may still be in
+// flight (#1085 stage B2b-2), and two 2h constants would drift.
+const defaultBackupOperationTimeout = backup.DefaultOperationTimeout
 
 // SetCoordinator wires the cluster coordinator for the node gate. Callers
 // pass it only when they hold a non-nil coordinator: an interface holding a
@@ -100,14 +105,34 @@ func (h *BackupHandler) rejectUnlessPrimaryWriter(c *fiber.Ctx, operation string
 }
 
 // describeTarget names the backup destination in an operator-facing error.
-// The manager's own describeDestination says the same thing for log lines; this
-// is the HTTP-response half, kept here because the response must not carry the
-// manager's wrapped SDK error.
+// The manager's own backupTarget.describe says the same thing for log lines;
+// this is the HTTP-response half, kept here because the response must not
+// carry the manager's wrapped SDK error.
 func describeTarget(name string) string {
 	if name == "" {
 		return "the backup destination"
 	}
 	return fmt.Sprintf("backup target %q", name)
+}
+
+// describeTargets names every configured destination (#1085 stage B2b-2).
+//
+// With several targets, naming only the DEFAULT points an operator at the
+// wrong store: the request may have failed against a routed one, and the
+// manager's own error says which. This is for the messages that cannot know,
+// where the honest answer is the whole set.
+func describeTargets(names []string) string {
+	switch len(names) {
+	case 0:
+		return "the backup destination"
+	case 1:
+		return describeTarget(names[0])
+	}
+	quoted := make([]string, 0, len(names))
+	for _, name := range names {
+		quoted = append(quoted, fmt.Sprintf("%q", name))
+	}
+	return "backup targets " + strings.Join(quoted, ", ")
 }
 
 // RegisterRoutes registers backup and restore API routes.
@@ -233,6 +258,10 @@ func (h *BackupHandler) CreateBackup(c *fiber.Ctx) error {
 	// credentials, so copying it there puts the keys that unlock the backup
 	// store inside the backups it holds. A request may still ask for it
 	// explicitly, and the manager warns when it does.
+	// IncludeConfig is false when ANY configured target is remote (#1085 stage
+	// B2b-2), not only the default one: arc.toml carries every target's
+	// credentials, so a local default plus one remote routed target still
+	// means copying it puts the keys to that store inside a backup it holds.
 	opts := backup.BackupOptions{
 		IncludeMetadata: !scoped,
 		IncludeConfig:   !scoped && !h.manager.TargetIsRemote(),
@@ -303,6 +332,12 @@ func (h *BackupHandler) CreateBackup(c *fiber.Ctx) error {
 
 // ListBackups returns all available backups.
 // GET /api/v1/backup
+//
+// With several configured targets (#1085 stage B2b-2) the listing fans out
+// over all of them and unions by backup ID. A target that will not answer is
+// NAMED in unreachable_targets and the response is still 200: one dead store
+// must not hide the backups on the others. 503 is kept for the case it was
+// introduced for — nothing could be read at all.
 func (h *BackupHandler) ListBackups(c *fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(c.Context(), 30*time.Second)
 	defer cancel()
@@ -317,28 +352,27 @@ func (h *BackupHandler) ListBackups(c *fiber.Ctx) error {
 	// of the next one to restore.
 	includeForeign := c.QueryBool("include_foreign", false)
 
-	var summaries []backup.BackupSummary
-	var filteredForeign int
-	var err error
-	if includeForeign {
-		summaries, err = h.manager.ListAllBackups(ctx)
-	} else {
-		summaries, filteredForeign, err = h.manager.ListBackupsFilteringForeign(ctx)
-	}
+	listing, err := h.manager.ListBackupsDetailed(ctx, includeForeign)
 	if err != nil {
-		h.logger.Error().Err(err).Str("target", h.manager.TargetName()).Msg("Failed to list backups")
+		targets := h.manager.TargetNames()
+		h.logger.Error().Err(err).Strs("targets", targets).Msg("Failed to list backups")
 		// 503, not 500: once a destination can be remote this is a transient
 		// far more often than a defect, and the answer has to name the
-		// destination or an operator with more than one configured store
+		// destinations or an operator with more than one configured store
 		// cannot tell which is down. Error text rather than err.Error()
 		// because installErrSanitizer masks quoted spans in logged errors and
 		// the response should not carry the SDK's own wording either.
+		//
+		// Reached only when EVERY target failed; a partial failure is a 200
+		// naming the unreachable ones.
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-			"error":  fmt.Sprintf("could not list backups: %s is unreachable or unreadable; retry, or check the destination configuration", describeTarget(h.manager.TargetName())),
-			"target": h.manager.TargetName(),
+			"error":   fmt.Sprintf("could not list backups: %s is unreachable or unreadable; retry, or check the destination configuration", describeTargets(targets)),
+			"target":  h.manager.TargetName(),
+			"targets": targets,
 		})
 	}
 
+	summaries := listing.Backups
 	if summaries == nil {
 		summaries = []backup.BackupSummary{}
 	}
@@ -353,9 +387,25 @@ func (h *BackupHandler) ListBackups(c *fiber.Ctx) error {
 	// with an empty array and no sign that anything had been withheld. The
 	// count, and the hint beside it, are what make include_foreign=true
 	// discoverable from the response rather than only from arc.toml.
-	if filteredForeign > 0 {
-		resp["filtered_foreign"] = filteredForeign
-		resp["hint"] = fmt.Sprintf("%d backup(s) at this destination were written by a different Arc instance and are not listed; add ?include_foreign=true to see them, with the owner id of each", filteredForeign)
+	if listing.FilteredForeign > 0 {
+		resp["filtered_foreign"] = listing.FilteredForeign
+		resp["hint"] = fmt.Sprintf("%d backup(s) at this destination were written by a different Arc instance and are not listed; add ?include_foreign=true to see them, with the owner id of each", listing.FilteredForeign)
+	}
+	// Both fields are omitted when empty, so a single-destination response is
+	// exactly the one it was.
+	if len(listing.UnreachableTargets) > 0 {
+		resp["unreachable_targets"] = listing.UnreachableTargets
+		// Two distinct consequences, and an operator needs both: a backup held
+		// ONLY there is absent from the listing, and one that spans targets is
+		// present with its counts summed over the legs that answered, marked
+		// partial_view with an incomplete_runs entry naming what is missing.
+		resp["warning"] = fmt.Sprintf("%d backup target(s) could not be reached: a backup held only there is missing from this listing, and one that spans targets is marked partial_view with counts from the targets that answered: %s",
+			len(listing.UnreachableTargets), strings.Join(listing.UnreachableTargets, ", "))
+	}
+	// A separate field, never mixed into backups: a client that renders that
+	// array must not grow phantom entries (#1085 stage B2b-2).
+	if len(listing.IncompleteRuns) > 0 {
+		resp["incomplete_runs"] = listing.IncompleteRuns
 	}
 	return c.JSON(resp)
 }
@@ -385,7 +435,10 @@ func (h *BackupHandler) GetBackup(c *fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(c.Context(), 30*time.Second)
 	defer cancel()
 
-	manifest, err := h.manager.GetBackup(ctx, id)
+	// The MERGED run view at the top level — where a one-manifest reader
+	// already looks for it — plus the per-target slices beside it (#1085 stage
+	// B2b-2). arcli and every other existing client keep working.
+	detail, err := h.manager.GetBackupDetail(ctx, id)
 	if err != nil {
 		// An unknown id and an unreadable destination are different answers
 		// (#1085 stage B2b-1). They used to be one 404, which cost nothing
@@ -396,15 +449,17 @@ func (h *BackupHandler) GetBackup(c *fiber.Ctx) error {
 				"error": "Backup not found",
 			})
 		}
-		h.logger.Error().Err(err).Str("backup_id", id).Str("target", h.manager.TargetName()).
+		targets := h.manager.TargetNames()
+		h.logger.Error().Err(err).Str("backup_id", id).Strs("targets", targets).
 			Msg("Failed to read the backup manifest")
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-			"error":  fmt.Sprintf("could not read backup %s: %s is unreachable or unreadable; retry, or check the destination configuration", id, describeTarget(h.manager.TargetName())),
-			"target": h.manager.TargetName(),
+			"error":   fmt.Sprintf("could not read backup %s: %s is unreachable or unreadable; retry, or check the destination configuration", id, describeTargets(targets)),
+			"target":  h.manager.TargetName(),
+			"targets": targets,
 		})
 	}
 
-	return c.JSON(manifest)
+	return c.JSON(detail)
 }
 
 // DeleteBackup removes a backup.
@@ -446,7 +501,7 @@ func (h *BackupHandler) DeleteBackup(c *fiber.Ctx) error {
 		// deliberately left at 500: splitting it into 404/503 the way GET
 		// /:id does is a separate change this stage did not scope, and no
 		// behaviour here depends on the distinction.
-		h.logger.Error().Err(err).Str("backup_id", id).Str("target", h.manager.TargetName()).
+		h.logger.Error().Err(err).Str("backup_id", id).Strs("targets", h.manager.TargetNames()).
 			Msg("Failed to delete backup")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to delete backup",
@@ -590,14 +645,16 @@ func (h *BackupHandler) RestoreBackup(c *fiber.Ctx) error {
 		cancel()
 		switch {
 		case errors.Is(err, backup.ErrBackupNotFound):
-			h.logger.Info().Str("backup_id", req.BackupID).Str("target", h.manager.TargetName()).
+			h.logger.Info().Str("backup_id", req.BackupID).Strs("targets", h.manager.TargetNames()).
 				Msg("No manifest for the requested backup; admitting the restore, which will fail with backup not found")
 		case err != nil:
-			h.logger.Error().Err(err).Str("backup_id", req.BackupID).Str("target", h.manager.TargetName()).
+			targets := h.manager.TargetNames()
+			h.logger.Error().Err(err).Str("backup_id", req.BackupID).Strs("targets", targets).
 				Msg("Could not read the backup manifest before the restore")
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-				"error":  fmt.Sprintf("could not read backup %s before the restore: %s is unreachable or unreadable; retry, or check the destination configuration", req.BackupID, describeTarget(h.manager.TargetName())),
-				"target": h.manager.TargetName(),
+				"error":   fmt.Sprintf("could not read backup %s before the restore: %s is unreachable or unreadable; retry, or check the destination configuration", req.BackupID, describeTargets(targets)),
+				"target":  h.manager.TargetName(),
+				"targets": targets,
 			})
 		default:
 			manifest = mf

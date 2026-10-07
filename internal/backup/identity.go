@@ -121,8 +121,17 @@ func LoadOrCreateInstanceID(dbPath string) (string, error) {
 // backups on the strength of a comparison it cannot make would be the same
 // upgrade failure by another route.
 func (m *Manager) ownsManifest(manifest *Manifest) bool {
-	if manifest == nil || manifest.OwnerInstanceID == "" || m.instanceID == "" {
+	if manifest == nil {
 		return true
 	}
-	return manifest.OwnerInstanceID == m.instanceID
+	return m.ownsInstanceID(manifest.OwnerInstanceID)
+}
+
+// ownsInstanceID is ownsManifest's rule applied to a bare owner id, for the
+// run index of an aborted run, which has no manifest to read it from.
+func (m *Manager) ownsInstanceID(owner string) bool {
+	if owner == "" || m.instanceID == "" {
+		return true
+	}
+	return owner == m.instanceID
 }

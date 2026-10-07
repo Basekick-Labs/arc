@@ -276,6 +276,20 @@ enabled = false
 # default_max_rows_per_query = 0
 
 # -----------------------------------------------------------------------------
+# Scheduled network spoke sync (valid paid license required, as for CQ/retention).
+# Manual network sync and air-gap bundle export remain available without a license.
+# A network spoke also needs its hub URL, identities and environment-only credentials.
+#
+# [edge_sync.spoke]
+# enabled = false
+# sync_interval = "5m"         # Delay after a completed pass; at least 1s
+# sync_retry_interval = "30s"  # Initial retry; doubles up to sync_interval
+#                             # At least 1s and shorter than sync_interval
+# Environment overrides:
+# ARC_EDGE_SYNC_SPOKE_SYNC_INTERVAL
+# ARC_EDGE_SYNC_SPOKE_SYNC_RETRY_INTERVAL
+#
+# -----------------------------------------------------------------------------
 # Telemetry
 # -----------------------------------------------------------------------------
 [telemetry]
@@ -358,8 +372,45 @@ local_path = "./data/backups"           # Directory for local backups; see the r
 #
 # A named backup TARGET makes the destination configurable, and it may be remote
 # (#1085). Point default_target at it and local_path above is ignored entirely —
-# the directory is not even created. Exactly ONE target is supported in this
-# release; per-database routing across several comes later.
+# the directory is not even created. SEVERAL targets are supported, with
+# per-database routing: `databases = [...]` on a target sends those databases
+# files there and everything else goes to default_target.
+#
+# A routed backup writes one manifest and one file sidecar PER TARGET, each
+# describing its own slice and each naming the whole run, plus an index at
+# <backup_id>/index.json on the default target that names every target the run
+# touched. The listing then returns ONE entry per backup id, with every
+# destination holding a slice of it; a target that will not answer is named in
+# unreachable_targets and the rest of the listing still answers. A delete
+# sweeps every target. A restore reads EVERY target of the run and REFUSES
+# before writing anything if one of them is not configured here, will not
+# answer, or holds no manifest for the id — restoring only the reachable part
+# would report success over a set it did not restore.
+#
+# A database goes to exactly one target: naming it on two is refused at
+# startup. Naming databases on default_target is allowed and does nothing,
+# since everything unrouted goes there already, so put them on the target you
+# want them to go TO: in the example below, default_target is "main" and only
+# [backup.targets.audit] carries `databases`.
+#
+# Only the COMMA separates names. A database name may contain a space, so
+# databases = "my db" is ONE name and databases = ["a", "b"] is two.
+#
+# A target nothing is routed to is INERT: no backup writes to it, and a warning
+# at startup names it. It is not a refusal, because adding the target block and
+# its databases in separate commits is ordinary, and it is deliberately not a
+# leg either — a leg is probed before anything is copied, so a target nothing
+# routes to would otherwise make an unrelated store a precondition of every
+# backup in this instance, including whole-instance ones. The names are storage-root
+# segments, exactly as a scoped backup names them, so an edge-sync spoke is
+# named as the SPOKE: ["prod"] does not mean spoke1/prod.
+#
+# The instance-wide state always goes to default_target whatever the routing
+# says, because it belongs to no one database: the SQLite database, the Iceberg
+# SQL catalog, the Iceberg table metadata, an out-of-root Iceberg warehouse and
+# this config file. A database's own field schema anchors (_schema/<db>/) and
+# compaction recovery state (_compaction_state/<tier>/<db>/) DO travel with its
+# data to its target.
 #
 # Target names are letters, digits and underscore only, and are lowercased. The
 # rule that matters is the HYPHEN: it cannot appear in an environment variable
@@ -370,8 +421,10 @@ local_path = "./data/backups"           # Directory for local backups; see the r
 # and "audit" are one target.
 #
 # Arc REFUSES AT STARTUP a destination that overlaps primary storage or the
-# tiered-storage cold tier, for two reasons that are both permanent and both
-# silent. A destination inside the storage root is inventoried by the next
+# tiered-storage cold tier, or ANOTHER backup target, for two reasons that are
+# both permanent and both silent (two targets that contain one another are one
+# listing, so each backup leg would enumerate the other objects and deleting
+# one backup id would reach both). A destination inside the storage root is inventoried by the next
 # backup, so each backup copies the previous one in full; on a cluster those
 # files are absent from the Raft manifest, and past the skip ratio every
 # replace-mode restore is refused. And with reconciliation enabled and
@@ -385,10 +438,18 @@ local_path = "./data/backups"           # Directory for local backups; see the r
 # "s3.us-east-1.amazonaws.com" on the other does not make them two places. One
 # bucket with DISJOINT prefixes is fine and is the intended shape.
 #
-# default_target = "audit"
+# default_target = "main"
 #
-# [backup.targets.audit]
-# type = "s3"                            # local, s3, minio, azure or azblob
+# [backup.targets.main]                  # the DEFAULT: everything unrouted goes here
+# type = "local"                         # local, s3, minio, azure or azblob
+# local_path = "/srv/arc-backups"
+#
+# [backup.targets.audit]                 # a ROUTED target: it carries `databases`
+# type = "s3"
+# databases = ["audit", "compliance"]    # these databases go here; everything else to default_target
+#                                        # also "audit,compliance" or
+#                                        # ARC_BACKUP_TARGETS_AUDIT_DATABASES=audit,compliance
+#                                        # the COMMA is the only separator: "my db" is ONE name
 # s3_bucket = "acme-arc-audit-backups"
 # s3_prefix = "arc/backups"
 # s3_region = "us-east-1"
@@ -400,15 +461,20 @@ local_path = "./data/backups"           # Directory for local backups; see the r
 #
 # From the environment ALONE, with nothing in this file, a target takes an extra
 # variable, because a name cannot be discovered from a map that does not exist:
-#   ARC_BACKUP_TARGET_NAMES=audit
+#   ARC_BACKUP_TARGET_NAMES=main,audit
+#   ARC_BACKUP_TARGETS_MAIN_TYPE=s3
+#   ARC_BACKUP_TARGETS_MAIN_S3_BUCKET=acme-arc-backups
 #   ARC_BACKUP_TARGETS_AUDIT_TYPE=s3
 #   ARC_BACKUP_TARGETS_AUDIT_S3_BUCKET=acme-arc-audit-backups
-#   ARC_BACKUP_DEFAULT_TARGET=audit
+#   ARC_BACKUP_TARGETS_AUDIT_DATABASES=audit,compliance
+#   ARC_BACKUP_DEFAULT_TARGET=main
 #
-# With a REMOTE target, include_config defaults to FALSE for every backup: this
-# file carries that target own credentials, so the default would put the keys
-# that unlock the backup store inside the backups it holds. A request may ask
-# for it explicitly and is warned.
+# With ANY remote target configured, include_config defaults to FALSE for every
+# backup — not only when the DEFAULT target is remote: this file carries every
+# target's own credentials, so a local default plus one remote routed target
+# still means the default would put the keys that unlock that store inside a
+# backup it holds. A request may ask for it explicitly and is warned, naming
+# every remote target whose keys the backup then carries.
 #
 # Backups carry the identity of the instance that wrote them, so two instances
 # sharing one bucket and prefix do not merge listings. On a cluster that

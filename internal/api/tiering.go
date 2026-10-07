@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -18,6 +19,7 @@ type TieringHandler struct {
 	authManager   *auth.AuthManager
 	licenseClient *license.Client
 	logger        zerolog.Logger
+	getFiles      func(context.Context, string, string) ([]tiering.FileMetadata, error)
 }
 
 // NewTieringHandler creates a new tiering handler
@@ -27,6 +29,24 @@ func NewTieringHandler(manager *tiering.Manager, authManager *auth.AuthManager, 
 		authManager:   authManager,
 		licenseClient: licenseClient,
 		logger:        logger.With().Str("component", "tiering-api").Logger(),
+		getFiles: func(ctx context.Context, tierParam, database string) ([]tiering.FileMetadata, error) {
+			var files []tiering.FileMetadata
+			if database != "" {
+				return manager.GetMetadata().GetFilesByDatabase(ctx, database)
+			}
+			if tierParam != "" {
+				tier := tiering.TierFromString(tierParam)
+				return manager.GetMetadata().GetFilesInTier(ctx, tier)
+			}
+			for _, t := range []tiering.Tier{tiering.TierHot, tiering.TierCold} {
+				tierFiles, err := manager.GetMetadata().GetFilesInTier(ctx, t)
+				if err != nil {
+					return nil, err
+				}
+				files = append(files, tierFiles...)
+			}
+			return files, nil
+		},
 	}
 }
 
@@ -56,27 +76,16 @@ func (h *TieringHandler) GetFiles(c *fiber.Ctx) error {
 
 	tierParam := c.Query("tier")
 	database := c.Query("database")
-	limit := c.QueryInt("limit", 100)
-
-	var files []tiering.FileMetadata
-	var err error
-
-	if database != "" {
-		files, err = h.manager.GetMetadata().GetFilesByDatabase(ctx, database)
-	} else if tierParam != "" {
-		tier := tiering.TierFromString(tierParam)
-		files, err = h.manager.GetMetadata().GetFilesInTier(ctx, tier)
-	} else {
-		// Get all files - query each tier (2-tier system: hot and cold)
-		for _, t := range []tiering.Tier{tiering.TierHot, tiering.TierCold} {
-			tierFiles, tierErr := h.manager.GetMetadata().GetFilesInTier(ctx, t)
-			if tierErr != nil {
-				err = tierErr
-				break
-			}
-			files = append(files, tierFiles...)
+	limit := 100
+	if raw := c.Query("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid limit"})
 		}
+		limit = n
 	}
+
+	files, err := h.getFiles(ctx, tierParam, database)
 
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to get tiering files")
@@ -85,8 +94,11 @@ func (h *TieringHandler) GetFiles(c *fiber.Ctx) error {
 		})
 	}
 
-	// Apply limit
-	if len(files) > limit {
+	// limit=0 deliberately means an empty result. Positive limits are
+	// clamped here as a second line of defence even if boundary validation changes.
+	if limit == 0 {
+		files = files[:0]
+	} else if limit > 0 && len(files) > limit {
 		files = files[:limit]
 	}
 

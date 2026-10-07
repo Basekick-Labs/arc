@@ -211,12 +211,37 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 		return nil, err
 	}
 
-	// ── 1. Read and validate manifest ───────────────────────────────────
-	manifest, err := m.GetBackup(ctx, opts.BackupID)
+	// ── 1. Read and validate the manifests ──────────────────────────────
+	// Every target the run committed to, assembled into one MERGED run view
+	// (#1085 stage B2b-2). Every gate below reads that and not one leg's
+	// manifest: a scoped backup routed to one target and read from the
+	// default's manifest has Scope=[audit] and Databases=[], which
+	// CheckScopedReplace refuses as "holds no data files", and HasMetadata,
+	// HasConfig and HasIcebergCatalog live on the default leg alone.
+	read, err := m.readRunManifests(ctx, opts.BackupID)
 	if err != nil {
 		progress.Status = "failed"
 		progress.Error = err.Error()
 		return nil, fmt.Errorf("failed to read backup manifest: %w", err)
+	}
+	manifest := read.merged
+	// Three refusals, BEFORE anything is written, each naming the target and
+	// the databases this node routes to it (#1085 stage B2b-2).
+	//
+	// The alternative — restore the targets that answer — was rejected: a
+	// partial replace-mode restore deletes the live files of a database whose
+	// backup bytes are on the unreachable target, and "the restore said it
+	// succeeded and one database is empty" is the failure mode backups exist
+	// to avoid. A merge-mode restore of a subset is no better: it reports
+	// success over a set it did not restore.
+	//
+	// The databases named come from LOCAL configuration, like the resolution
+	// itself: it is what this node would lose, and it needs no further read
+	// from a store that may be the unreachable one.
+	if err := m.refuseIncompleteRun(opts.BackupID, read); err != nil {
+		progress.Status = "failed"
+		progress.Error = err.Error()
+		return nil, err
 	}
 
 	// The effective mode is decided from the manifest (#1084): a scoped
@@ -327,7 +352,7 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 		}()
 	}
 	if opts.RestoreData {
-		if err := m.restoreDataFiles(ctx, opts.BackupID, manifest, progress, mode, pause); err != nil {
+		if err := m.restoreDataFiles(ctx, opts.BackupID, read, progress, mode, pause); err != nil {
 			progress.Status = "failed"
 			progress.Error = err.Error()
 			return nil, err
@@ -338,9 +363,17 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 	// Tied to either flag: the catalog rows (metadata) and the data files both
 	// depend on these metadata files, so restoring one without them leaves the
 	// tables unloadable (#637).
+	//
+	// This and the two steps after it read from read.anchor.target, NOT from
+	// this node's current default: the gates below gate on the MERGED view, so
+	// they fire whenever any leg declared the flag, while only the anchor leg
+	// ever wrote the bytes. The two are the same target until an operator adds
+	// a second target and re-points backup.default_target, after which reading
+	// from the current default fails on SQLite and arc.toml and silently
+	// restores no warehouse at all. See runRead.anchor.
 	if opts.RestoreData || opts.RestoreMetadata {
 		catalogRestored := opts.RestoreMetadata && manifest.HasMetadata
-		if err := m.restoreIcebergWarehouse(ctx, opts.BackupID, manifest, progress, catalogRestored); err != nil {
+		if err := m.restoreIcebergWarehouse(ctx, read.anchor.target, opts.BackupID, manifest, progress, catalogRestored); err != nil {
 			progress.Status = "failed"
 			progress.Error = err.Error()
 			return nil, err
@@ -349,7 +382,7 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 
 	// ── 3. Restore SQLite metadata ──────────────────────────────────────
 	if opts.RestoreMetadata && manifest.HasMetadata {
-		if err := m.restoreSQLite(ctx, opts.BackupID); err != nil {
+		if err := m.restoreSQLite(ctx, read.anchor.target, opts.BackupID); err != nil {
 			progress.Status = "failed"
 			progress.Error = err.Error()
 			return nil, fmt.Errorf("failed to restore SQLite database: %w", err)
@@ -358,7 +391,7 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 
 	// ── 4. Restore config ───────────────────────────────────────────────
 	if opts.RestoreConfig && manifest.HasConfig {
-		if err := m.restoreConfig(ctx, opts.BackupID); err != nil {
+		if err := m.restoreConfig(ctx, read.anchor.target, opts.BackupID); err != nil {
 			progress.Status = "failed"
 			progress.Error = err.Error()
 			return nil, fmt.Errorf("failed to restore config: %w", err)
@@ -461,6 +494,62 @@ func checkCompactionPauseLost(pause CompactionPause, progress *Progress) error {
 	return fmt.Errorf("restore failed: the cluster-wide compaction pause was lost (%v); a compaction job may have raced this restore, so take a fresh backup and restore again", cause)
 }
 
+// refuseIncompleteRun is the three pre-write refusals of a routed restore
+// (#1085 stage B2b-2).
+//
+// A run with ONE target resolves nothing: readRunManifests found its manifest
+// at the destination this node is configured with, so a backup whose Target
+// names a target this node does not have still restores, exactly as stage
+// B2b-1 promised. Only a run spanning SEVERAL targets has names to resolve,
+// because the other legs' bytes are somewhere this node must be able to reach.
+func (m *Manager) refuseIncompleteRun(backupID string, read *runRead) error {
+	describe := func(names []string) string {
+		out := make([]string, 0, len(names))
+		for _, name := range names {
+			if dbs := m.databasesRoutedTo(name); len(dbs) > 0 {
+				out = append(out, fmt.Sprintf("%s (this node routes %s to it)", name, strings.Join(dbs, ", ")))
+				continue
+			}
+			out = append(out, name)
+		}
+		return strings.Join(out, ", ")
+	}
+	switch {
+	case len(read.unknown) > 0:
+		return fmt.Errorf("restore refused: backup %s was written to %d targets and this node has no backup target named %s, so the data on it cannot be read. Configure that target, or restore on a node that has it. Restoring only the targets this node can reach would report success over a set it did not restore, and in replace mode would delete the live files of a database whose backup bytes are on the target it could not read",
+			backupID, len(read.merged.RunTargets), describe(read.unknown))
+	case len(read.unreachable) > 0:
+		return fmt.Errorf("restore refused: backup %s spans %d targets and %s would not answer; retry once it is reachable, or check its configuration. A partial restore would report success over a set it did not restore",
+			backupID, len(read.merged.RunTargets), describe(read.unreachable))
+	case len(read.missing) > 0:
+		return fmt.Errorf("restore refused: backup %s names %d targets and %s holds no manifest for it, so that part of the run never committed and the backup is known-partial. Delete the backup id and take the backup again rather than restore a run that is missing a target",
+			backupID, len(read.merged.RunTargets), describe(read.missing))
+	}
+	return nil
+}
+
+// databasesRoutedTo are the databases THIS NODE routes to a target, sorted,
+// for a refusal that has to say what is at stake.
+func (m *Manager) databasesRoutedTo(target string) []string {
+	var out []string
+	for db, name := range m.routing {
+		if name == target {
+			out = append(out, db)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// restoreLeg is one target's half of a restore: its destination, the manifest
+// it wrote, its listing, and the compaction inputs its own recovery manifests
+// say must not be restored.
+type restoreLeg struct {
+	runLeg
+	files      []string
+	skipInputs map[string]bool
+}
+
 // restoreDataFiles copies parquet files from the backup back into data storage.
 //
 // Backup objects that cannot be read are skipped, counted, and sampled; every
@@ -476,37 +565,76 @@ func checkCompactionPauseLost(pause CompactionPause, progress *Progress) error {
 // on, standalone or clustered. pause is the cluster-wide compaction pause the
 // caller holds for the run (#1087), nil on a standalone node; it is checked
 // before every manifest write.
-func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifest *Manifest, progress *Progress, mode string, pause CompactionPause) error {
+//
+// With several legs (#1085 stage B2b-2) every per-leg quantity is computed per
+// leg and every RUN-WIDE decision is made over the union:
+//
+//   - consumedInputsInBackup and the missing-files comparison are per leg,
+//     which decision 1 of the B2b-2 plan makes correct: a recovery manifest,
+//     its output and its inputs always share one storage-root segment, so they
+//     are always on one target;
+//   - the sidecar, the listing and skipInputs are UNIONED before
+//     replaceDatabases, which then runs ONCE. Per target it would be unsound:
+//     owns() keys on the cluster entry's Database label for an unscoped backup
+//     while writes is built from the backup listing, so target B's owns() can
+//     be true for a spoke entry whose bytes are in target A's listing and not
+//     B's — and B would BatchDelete live files A is about to restore. The two
+//     sets are only mutually protective when files is the whole run.
+//
+// The per-leg copy loop sits INSIDE the single compaction pause the caller
+// holds (#1087); a loop placed above it would take and release one pause per
+// leg.
+func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *runRead, progress *Progress, mode string, pause CompactionPause) error {
+	// The ID the CALLER asked for, never the manifest's own backup_id field: a
+	// manifest is data read from backup storage, so a field in it must not
+	// select the keys further bytes are read from. The two agree for every
+	// manifest Arc wrote; a corrupt or hand-edited one would otherwise send
+	// the restore at another backup's prefix.
 	dataPrefix := backupID + "/data/"
 
-	files, err := m.destination().List(ctx, dataPrefix)
-	if err != nil {
-		return fmt.Errorf("failed to list backup data files: %w", err)
+	legs := make([]*restoreLeg, 0, len(read.legs))
+	var allFiles []string
+	allSkipInputs := map[string]bool{}
+	var totalFiles int64
+	var presentTotal int64
+	var missing int64
+	for _, leg := range read.legs {
+		files, err := leg.target.backend.List(ctx, dataPrefix)
+		if err != nil {
+			return fmt.Errorf("failed to list the backup data files in %s: %w", leg.target.describe(), err)
+		}
+		// Reconcile compaction state before copying anything (#930). A backup
+		// taken between a compaction job's output upload and its input deletion
+		// holds both; restoring both would serve every row of that partition
+		// twice, until a compaction cycle's recovery deleted the inputs, and
+		// forever if compaction is disabled on the restored node or a cycle
+		// raced the restore. So the backed-up manifests are read first, and the
+		// inputs of every manifest whose output the backup holds are simply not
+		// restored: the restored store then looks exactly like a job that
+		// finished, and recovery on the next cycle finds the output, tolerates
+		// the absent inputs, fires the receipt hooks and deletes the manifest. A
+		// manifest whose output the backup does NOT hold keeps its inputs: that
+		// is a job that never uploaded, and recovery deletes the manifest so
+		// compaction retries. Every restore order is safe this way, because the
+		// inputs never land. Every other object under data/, the field schema
+		// anchors under _schema/ (#927) included, is restored to its original
+		// key.
+		skipInputs := m.consumedInputsInBackup(ctx, leg.target, dataPrefix, files)
+		totalFiles += int64(len(files) - len(skipInputs))
+		allFiles = append(allFiles, files...)
+		for k, v := range skipInputs {
+			if v {
+				allSkipInputs[k] = true
+			}
+		}
+		legs = append(legs, &restoreLeg{runLeg: leg, files: files, skipInputs: skipInputs})
 	}
+	progress.TotalFiles = totalFiles
+	progress.TotalBytes = read.merged.TotalSizeBytes
 
-	// Reconcile compaction state before copying anything (#930). A backup
-	// taken between a compaction job's output upload and its input deletion
-	// holds both; restoring both would serve every row of that partition
-	// twice, until a compaction cycle's recovery deleted the inputs, and
-	// forever if compaction is disabled on the restored node or a cycle
-	// raced the restore. So the backed-up manifests are read first, and the
-	// inputs of every manifest whose output the backup holds are simply not
-	// restored: the restored store then looks exactly like a job that
-	// finished, and recovery on the next cycle finds the output, tolerates
-	// the absent inputs, fires the receipt hooks and deletes the manifest. A
-	// manifest whose output the backup does NOT hold keeps its inputs: that
-	// is a job that never uploaded, and recovery deletes the manifest so
-	// compaction retries. Every restore order is safe this way, because the
-	// inputs never land. Every other object under data/, the field schema
-	// anchors under _schema/ (#927) included, is restored to its original
-	// key.
-	skipInputs := m.consumedInputsInBackup(ctx, dataPrefix, files)
-	progress.TotalFiles = int64(len(files) - len(skipInputs))
-	progress.TotalBytes = manifest.TotalSizeBytes
-
-	// Three ways the listing can under-represent what the manifest promised,
-	// and nothing in the copy loop can notice any of them: every listed file
-	// restores fine.
+	// Three ways a leg's listing can under-represent what its manifest
+	// promised, and nothing in the copy loop can notice any of them: every
+	// listed file restores fine.
 	//
 	// 1. The listing hides it. An object store returns dot-prefixed keys and
 	//    the backup copied them, but the local backup store's listing hides
@@ -514,50 +642,60 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifes
 	//    now refuses). ListUnusable returns exactly what List dropped, so those
 	//    are counted and named: renaming them in the backup recovers the data.
 	// 2. The object is gone: a partial sync, a truncated copy, an operator's
-	//    rm. Counted against the manifest inventory as missing.
+	//    rm. Counted against that leg's manifest inventory as missing.
 	// 3. The backup itself never wrote it (manifest.SkippedFiles); not missing.
 	//
 	// Only .parquet entries are counted: the listing also holds Iceberg
 	// warehouse metadata copied under data/, which is not part of TotalFiles.
-	var present int64
-	for _, f := range files {
-		if strings.HasSuffix(f, ".parquet") {
-			present++
-		}
-	}
-	if ul, ok := m.destination().(storage.UnusableLister); ok {
-		hidden, err := ul.ListUnusable(ctx, dataPrefix)
-		if err != nil {
-			return fmt.Errorf("failed to inventory unlistable backup objects: %w", err)
-		}
-		var sample []string
-		var n int64
-		for _, o := range hidden {
-			if !strings.HasSuffix(o.Path, ".parquet") {
-				continue
-			}
-			n++
-			if len(sample) < unaddressableSampleCap {
-				sample = append(sample, o.Path)
+	var unaddressableSample []string
+	for _, leg := range legs {
+		var present int64
+		for _, f := range leg.files {
+			if strings.HasSuffix(f, ".parquet") {
+				present++
 			}
 		}
-		if n > 0 {
-			progress.UnaddressableFiles = n
-			progress.UnaddressableSample = sample
+		presentTotal += present
+		var hiddenHere int64
+		if ul, ok := leg.target.backend.(storage.UnusableLister); ok {
+			hidden, err := ul.ListUnusable(ctx, dataPrefix)
+			if err != nil {
+				return fmt.Errorf("failed to inventory the unlistable backup objects in %s: %w", leg.target.describe(), err)
+			}
+			for _, o := range hidden {
+				if !strings.HasSuffix(o.Path, ".parquet") {
+					continue
+				}
+				hiddenHere++
+				if len(unaddressableSample) < unaddressableSampleCap {
+					unaddressableSample = append(unaddressableSample, o.Path)
+				}
+			}
+		}
+		progress.UnaddressableFiles += hiddenHere
+		// Per leg against its OWN listing, because each manifest's TotalFiles
+		// describes only its own slice.
+		if expected := leg.manifest.TotalFiles - leg.manifest.SkippedFiles; expected > present+hiddenHere {
+			gap := expected - present - hiddenHere
+			missing += gap
 			m.logger.Warn().
-				Int64("unaddressable", n).
-				Strs("sample", sample).
-				Msg("Backup storage holds data files no listing returns; they cannot be restored until renamed")
+				Str("target", leg.target.name).
+				Int64("inventoried", expected).
+				Int64("present", present).
+				Int64("unaddressable", hiddenHere).
+				Int64("missing", gap).
+				Msg("Backup storage holds fewer data files than the manifest inventoried; the restore will be incomplete")
 		}
 	}
-	if expected := manifest.TotalFiles - manifest.SkippedFiles; expected > present+progress.UnaddressableFiles {
-		progress.MissingFiles = expected - present - progress.UnaddressableFiles
+	if progress.UnaddressableFiles > 0 {
+		progress.UnaddressableSample = unaddressableSample
 		m.logger.Warn().
-			Int64("inventoried", expected).
-			Int64("present", present).
 			Int64("unaddressable", progress.UnaddressableFiles).
-			Int64("missing", progress.MissingFiles).
-			Msg("Backup storage holds fewer data files than the manifest inventoried; the restore will be incomplete")
+			Strs("sample", unaddressableSample).
+			Msg("Backup storage holds data files no listing returns; they cannot be restored until renamed")
+	}
+	if missing > 0 {
+		progress.MissingFiles = missing
 	}
 	m.setProgress(progress)
 
@@ -567,14 +705,26 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifes
 	// read once, for the labels of paths it already lists and for the replace
 	// half, which removes the current entries first so a failure there leaves
 	// the store exactly as it was.
+	//
+	// Every leg's sidecar is unioned into one map, which is sound because the
+	// rows are disjoint: a path was copied by exactly the leg its routing key
+	// named. Every leg must HAVE one — an empty leg still commits a sidecar,
+	// which is why planRun commits on every member — so a missing one is the
+	// same refusal it always was.
 	var reg *restoreRegistration
 	if m.cluster != nil {
-		entries, ok, err := m.readSidecar(ctx, backupID)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return fmt.Errorf("restore refused: backup %s has no %s, so the files it holds cannot be registered in the cluster manifest; it was taken before cluster-aware backups and can be restored on a standalone node, or taken again", backupID, sidecarName)
+		entries := map[string]ManifestFile{}
+		for _, leg := range legs {
+			legEntries, ok, err := m.readSidecar(ctx, leg.target, backupID)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return fmt.Errorf("restore refused: backup %s has no %s in %s, so the files it holds cannot be registered in the cluster manifest; it was taken before cluster-aware backups and can be restored on a standalone node, or taken again", backupID, sidecarName, leg.target.describe())
+			}
+			for path, row := range legEntries {
+				entries[path] = row
+			}
 		}
 		if err := m.cluster.Sync(ctx); err != nil {
 			return fmt.Errorf("restore refused: could not sync the cluster manifest before reading it: %w", err)
@@ -591,7 +741,7 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifes
 			pause:    pause,
 		}
 		if mode == RestoreModeReplace {
-			if err := m.replaceDatabases(ctx, manifest, files, dataPrefix, skipInputs, current, progress, pause); err != nil {
+			if err := m.replaceDatabases(ctx, read.merged, allFiles, dataPrefix, allSkipInputs, current, progress, pause); err != nil {
 				return err
 			}
 		}
@@ -613,101 +763,103 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifes
 		m.setProgress(progress)
 	}()
 
-	for _, srcPath := range files {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
+	for _, leg := range legs {
+		for _, srcPath := range leg.files {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
 
-		// Strip the backup prefix to get the original storage path
-		destPath := filepath.ToSlash(strings.TrimPrefix(srcPath, dataPrefix))
-		if destPath == "" || destPath == filepath.ToSlash(srcPath) {
-			continue
-		}
-		if skipInputs[destPath] {
-			atomic.AddInt64(&progress.ConsumedInputsSkipped, 1)
-			continue
-		}
-
-		// On a cluster a data file is written only when the sidecar describes
-		// it, and only if its bytes match that description (checked on the
-		// temp-file hop, before the write): a damaged backup object must not
-		// replace a good live copy, and a same-size corruption registered
-		// with the sidecar's SHA would fail every peer's checksum forever.
-		// A data file that would overflow the pending registration batch
-		// flushes it BEFORE being written, so a refused batch aborts with
-		// exactly that batch written-but-unregistered and nothing written
-		// past it (see registerRestoredFile).
-		registrable := isRegistrableDataFile(destPath)
-		var pendingRow pendingRegistration
-		var expect *ManifestFile
-		if reg != nil && registrable {
-			pendingRow = reg.lookup(destPath)
-			if !pendingRow.ok {
-				progress.SidecarMismatches++
-				progress.SidecarMismatchSample = appendSample(progress.SidecarMismatchSample, []string{destPath})
-				m.setProgress(progress)
-				m.logger.Error().Str("path", destPath).Msg("Backup data file has no row in the sidecar; not restored (it could not be registered in the cluster manifest)")
+			// Strip the backup prefix to get the original storage path
+			destPath := filepath.ToSlash(strings.TrimPrefix(srcPath, dataPrefix))
+			if destPath == "" || destPath == filepath.ToSlash(srcPath) {
 				continue
 			}
-			expect = &pendingRow.row
-			if !reg.batch.fits(pendingRow.size) {
-				if err := m.flushRegistrations(ctx, reg, progress); err != nil {
-					return err
+			if leg.skipInputs[destPath] {
+				atomic.AddInt64(&progress.ConsumedInputsSkipped, 1)
+				continue
+			}
+
+			// On a cluster a data file is written only when the sidecar describes
+			// it, and only if its bytes match that description (checked on the
+			// temp-file hop, before the write): a damaged backup object must not
+			// replace a good live copy, and a same-size corruption registered
+			// with the sidecar's SHA would fail every peer's checksum forever.
+			// A data file that would overflow the pending registration batch
+			// flushes it BEFORE being written, so a refused batch aborts with
+			// exactly that batch written-but-unregistered and nothing written
+			// past it (see registerRestoredFile).
+			registrable := isRegistrableDataFile(destPath)
+			var pendingRow pendingRegistration
+			var expect *ManifestFile
+			if reg != nil && registrable {
+				pendingRow = reg.lookup(destPath)
+				if !pendingRow.ok {
+					progress.SidecarMismatches++
+					progress.SidecarMismatchSample = appendSample(progress.SidecarMismatchSample, []string{destPath})
+					m.setProgress(progress)
+					m.logger.Error().Str("path", destPath).Msg("Backup data file has no row in the sidecar; not restored (it could not be registered in the cluster manifest)")
+					continue
+				}
+				expect = &pendingRow.row
+				if !reg.batch.fits(pendingRow.size) {
+					if err := m.flushRegistrations(ctx, reg, progress); err != nil {
+						return err
+					}
 				}
 			}
-		}
 
-		// Stream via temp file to avoid loading entire Parquet file into memory
-		bytesWritten, err := m.streamRestoreFile(ctx, srcPath, destPath, expect)
-		if err != nil {
-			if errors.Is(err, errSidecarMismatch) {
-				progress.SidecarMismatches++
-				progress.SidecarMismatchSample = appendSample(progress.SidecarMismatchSample, []string{destPath})
-				m.setProgress(progress)
-				m.logger.Error().Str("path", destPath).Err(err).Msg("Backup data file does not match the sidecar; not restored, the live copy is untouched")
+			// Stream via temp file to avoid loading entire Parquet file into memory
+			bytesWritten, err := m.streamRestoreFile(ctx, leg.target, srcPath, destPath, expect)
+			if err != nil {
+				if errors.Is(err, errSidecarMismatch) {
+					progress.SidecarMismatches++
+					progress.SidecarMismatchSample = appendSample(progress.SidecarMismatchSample, []string{destPath})
+					m.setProgress(progress)
+					m.logger.Error().Str("path", destPath).Err(err).Msg("Backup data file does not match the sidecar; not restored, the live copy is untouched")
+					continue
+				}
+				// Only a backup-storage read failure is skippable. A temp-file or
+				// data-storage failure means the environment underneath the
+				// restore is broken, and continuing would drop files silently.
+				if !isRestoreReadError(err) {
+					return fmt.Errorf("failed to restore %s: %w", srcPath, err)
+				}
+				skipped++
+				if len(sample) < unaddressableSampleCap {
+					sample = append(sample, srcPath)
+				}
+				m.logger.Warn().Str("path", srcPath).Err(err).Msg("Failed to read backup file, skipping")
 				continue
 			}
-			// Only a backup-storage read failure is skippable. A temp-file or
-			// data-storage failure means the environment underneath the
-			// restore is broken, and continuing would drop files silently.
-			if !isRestoreReadError(err) {
-				return fmt.Errorf("failed to restore %s: %w", srcPath, err)
-			}
-			skipped++
-			if len(sample) < unaddressableSampleCap {
-				sample = append(sample, srcPath)
-			}
-			m.logger.Warn().Str("path", srcPath).Err(err).Msg("Failed to read backup file, skipping")
-			continue
-		}
 
-		atomic.AddInt64(&progress.ProcessedFiles, 1)
-		atomic.AddInt64(&progress.ProcessedBytes, bytesWritten)
-		if isCompactionState(destPath) && strings.HasSuffix(destPath, ".json") {
-			atomic.AddInt64(&progress.CompactionStateRestored, 1)
-		}
-		if registrable {
-			// Storage first, then the manifest (Cluster Operations Checklist):
-			// the file is on disk before anything can route a reader to it.
-			// Tier rows the same way, after the bytes landed.
-			if m.tierRecorder != nil {
-				m.tierRecorder.RecordRestoredFile(destPath, bytesWritten)
+			atomic.AddInt64(&progress.ProcessedFiles, 1)
+			atomic.AddInt64(&progress.ProcessedBytes, bytesWritten)
+			if isCompactionState(destPath) && strings.HasSuffix(destPath, ".json") {
+				atomic.AddInt64(&progress.CompactionStateRestored, 1)
 			}
-			if reg != nil {
-				reg.queue(pendingRow)
+			if registrable {
+				// Storage first, then the manifest (Cluster Operations Checklist):
+				// the file is on disk before anything can route a reader to it.
+				// Tier rows the same way, after the bytes landed.
+				if m.tierRecorder != nil {
+					m.tierRecorder.RecordRestoredFile(destPath, bytesWritten)
+				}
+				if reg != nil {
+					reg.queue(pendingRow)
+				}
 			}
-		}
-		// Republish so /status polling sees live counters — published Progress
-		// values are immutable snapshots, not the struct being mutated here.
-		m.setProgress(progress)
+			// Republish so /status polling sees live counters — published Progress
+			// values are immutable snapshots, not the struct being mutated here.
+			m.setProgress(progress)
 
-		if atomic.LoadInt64(&progress.ProcessedFiles)%100 == 0 {
-			m.logger.Info().
-				Int64("processed", atomic.LoadInt64(&progress.ProcessedFiles)).
-				Int64("total", progress.TotalFiles).
-				Msg("Restore progress")
+			if atomic.LoadInt64(&progress.ProcessedFiles)%100 == 0 {
+				m.logger.Info().
+					Int64("processed", atomic.LoadInt64(&progress.ProcessedFiles)).
+					Int64("total", progress.TotalFiles).
+					Msg("Restore progress")
+			}
 		}
 	}
 
@@ -717,7 +869,7 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifes
 		}
 	}
 
-	if n := atomic.LoadInt64(&progress.CompactionStateRestored); n > 0 || len(skipInputs) > 0 {
+	if n := atomic.LoadInt64(&progress.CompactionStateRestored); n > 0 || len(allSkipInputs) > 0 {
 		m.logger.Info().
 			Int64("compaction_manifests_restored", n).
 			Int64("consumed_inputs_skipped", atomic.LoadInt64(&progress.ConsumedInputsSkipped)).
@@ -1012,7 +1164,7 @@ type restoredManifest struct {
 // manifest that cannot be read or decoded, or an output whose size cannot be
 // established, contributes nothing (its inputs are restored, and recovery
 // decides later), logged once.
-func (m *Manager) consumedInputsInBackup(ctx context.Context, dataPrefix string, files []string) map[string]bool {
+func (m *Manager) consumedInputsInBackup(ctx context.Context, src backupTarget, dataPrefix string, files []string) map[string]bool {
 	present := make(map[string]bool, len(files))
 	var manifests []string
 	for _, f := range files {
@@ -1022,17 +1174,17 @@ func (m *Manager) consumedInputsInBackup(ctx context.Context, dataPrefix string,
 			manifests = append(manifests, f)
 		}
 	}
-	lister, canSize := m.destination().(storage.ObjectLister)
+	lister, canSize := src.backend.(storage.ObjectLister)
 	skip := make(map[string]bool)
-	for _, src := range manifests {
-		data, err := m.destination().Read(ctx, src)
+	for _, key := range manifests {
+		data, err := src.backend.Read(ctx, key)
 		if err != nil {
-			m.logger.Warn().Err(err).Str("manifest", src).Msg("Cannot read a backed-up compaction manifest; its inputs are restored and left to recovery")
+			m.logger.Warn().Err(err).Str("manifest", key).Msg("Cannot read a backed-up compaction manifest; its inputs are restored and left to recovery")
 			continue
 		}
 		var mf restoredManifest
 		if err := json.Unmarshal(data, &mf); err != nil || mf.OutputPath == "" {
-			m.logger.Warn().Err(err).Str("manifest", src).Msg("Cannot decode a backed-up compaction manifest; its inputs are restored and left to recovery")
+			m.logger.Warn().Err(err).Str("manifest", key).Msg("Cannot decode a backed-up compaction manifest; its inputs are restored and left to recovery")
 			continue
 		}
 		output := filepath.ToSlash(mf.OutputPath)
@@ -1040,7 +1192,7 @@ func (m *Manager) consumedInputsInBackup(ctx context.Context, dataPrefix string,
 			continue // the job never uploaded: restore its inputs, recovery retries
 		}
 		if !canSize || !m.backupObjectHasSize(ctx, lister, dataPrefix+output, mf.OutputSize) {
-			m.logger.Warn().Str("manifest", src).Str("output", output).Int64("expected_size", mf.OutputSize).
+			m.logger.Warn().Str("manifest", key).Str("output", output).Int64("expected_size", mf.OutputSize).
 				Msg("Backed-up compacted output is not intact or cannot be sized; its inputs are restored and recovery will discard the output")
 			continue
 		}
@@ -1081,7 +1233,7 @@ func (m *Manager) backupObjectHasSize(ctx context.Context, lister storage.Object
 // hashed on the hop into the temp file and both size and SHA-256 must match
 // before anything is written to data storage; otherwise errSidecarMismatch.
 // nil (a standalone restore) hashes nothing and writes as before.
-func (m *Manager) streamRestoreFile(ctx context.Context, srcPath, destPath string, expect *ManifestFile) (int64, error) {
+func (m *Manager) streamRestoreFile(ctx context.Context, src backupTarget, srcPath, destPath string, expect *ManifestFile) (int64, error) {
 	tmpFile, err := createTempFile("arc-restore-*.parquet")
 	if err != nil {
 		return 0, fmt.Errorf("failed to create temp file: %w", err)
@@ -1099,7 +1251,7 @@ func (m *Manager) streamRestoreFile(ctx context.Context, srcPath, destPath strin
 		hasher = sha256.New()
 		dst = io.MultiWriter(tw, hasher)
 	}
-	if err := m.destination().ReadTo(ctx, srcPath, dst); err != nil {
+	if err := src.backend.ReadTo(ctx, srcPath, dst); err != nil {
 		return 0, classifyReadTo(srcPath, err, tw.err)
 	}
 
@@ -1134,8 +1286,8 @@ func (m *Manager) streamRestoreFile(ctx context.Context, srcPath, destPath strin
 
 // restoreSQLite restores the SQLite database from the backup.
 // It creates a .before-restore backup of the current database first.
-func (m *Manager) restoreSQLite(ctx context.Context, backupID string) error {
-	if err := m.restoreSQLiteFile(ctx, backupID, "arc.db", m.sqliteDBPath); err != nil {
+func (m *Manager) restoreSQLite(ctx context.Context, src backupTarget, backupID string) error {
+	if err := m.restoreSQLiteFile(ctx, src, backupID, "arc.db", m.sqliteDBPath); err != nil {
 		return err
 	}
 
@@ -1152,7 +1304,7 @@ func (m *Manager) restoreSQLite(ctx context.Context, backupID string) error {
 	// backup destination ever stops being local.
 	if m.icebergCatalogDBPath != "" {
 		srcPath := fmt.Sprintf("%s/metadata/%s", backupID, icebergCatalogDBName)
-		exists, err := m.destination().Exists(ctx, srcPath)
+		exists, err := src.backend.Exists(ctx, srcPath)
 		if err != nil {
 			return fmt.Errorf("failed to check for Iceberg catalog in backup: %w", err)
 		}
@@ -1161,7 +1313,7 @@ func (m *Manager) restoreSQLite(ctx context.Context, backupID string) error {
 				Msg("Backup contains no separate Iceberg catalog; skipping")
 			return nil
 		}
-		if err := m.restoreSQLiteFile(ctx, backupID, icebergCatalogDBName, m.icebergCatalogDBPath); err != nil {
+		if err := m.restoreSQLiteFile(ctx, src, backupID, icebergCatalogDBName, m.icebergCatalogDBPath); err != nil {
 			return fmt.Errorf("failed to restore Iceberg catalog: %w", err)
 		}
 		m.logger.Info().Str("backup_id", backupID).Msg("Iceberg catalog database restored")
@@ -1180,7 +1332,7 @@ func (m *Manager) restoreSQLite(ctx context.Context, backupID string) error {
 // that point (when it can be made complete and cheaply). Restaging overwrites
 // a previous staging: the last restore before restart wins. An operator can
 // cancel by deleting the .pending-restore file before restarting.
-func (m *Manager) restoreSQLiteFile(ctx context.Context, backupID, srcName, destPath string) error {
+func (m *Manager) restoreSQLiteFile(ctx context.Context, src backupTarget, backupID, srcName, destPath string) error {
 	srcPath := fmt.Sprintf("%s/metadata/%s", backupID, srcName)
 
 	// Stream from backup storage into the staging file (#639 item 8): the
@@ -1193,7 +1345,7 @@ func (m *Manager) restoreSQLiteFile(ctx context.Context, backupID, srcName, dest
 		return fmt.Errorf("failed to create restore staging file: %w", err)
 	}
 	stagingPath := staging.Name()
-	if err := m.destination().ReadTo(ctx, srcPath, staging); err != nil {
+	if err := src.backend.ReadTo(ctx, srcPath, staging); err != nil {
 		staging.Close()
 		os.Remove(stagingPath)
 		return fmt.Errorf("failed to stream SQLite backup into staging: %w", err)
@@ -1222,9 +1374,9 @@ func (m *Manager) restoreSQLiteFile(ctx context.Context, backupID, srcName, dest
 
 // restoreConfig restores the arc.toml config file from the backup.
 // It creates a .before-restore backup of the current config first.
-func (m *Manager) restoreConfig(ctx context.Context, backupID string) error {
+func (m *Manager) restoreConfig(ctx context.Context, src backupTarget, backupID string) error {
 	srcPath := fmt.Sprintf("%s/config/arc.toml", backupID)
-	data, err := m.destination().Read(ctx, srcPath)
+	data, err := src.backend.Read(ctx, srcPath)
 	if err != nil {
 		return fmt.Errorf("failed to read config backup: %w", err)
 	}

@@ -332,9 +332,18 @@ type EdgeSyncImportConfig struct {
 
 // EdgeSyncSpokeConfig configures the push side of edge sync (#569).
 type EdgeSyncSpokeConfig struct {
-	// Enabled mounts the manual sync controls. Off by default: pushing data
-	// off a box is a deliberate decision.
+	// Enabled opts this node into network sync. Off by default because pushing
+	// data off a box is a deliberate decision. Valid paid licenses also enable
+	// the automatic scheduler; other tiers retain manual triggering.
 	Enabled bool
+
+	// SyncInterval is the delay between scheduled network sync passes. The
+	// scheduler is only started for a valid paid license.
+	SyncInterval time.Duration
+
+	// SyncRetryInterval is the initial delay after a scheduled pass fails.
+	// Consecutive failures double it up to SyncInterval.
+	SyncRetryInterval time.Duration
 
 	// HubURL is the hub's root, e.g. https://ground-station.example.com.
 	HubURL string
@@ -674,9 +683,11 @@ type BackupConfig struct {
 	// configured target with no DefaultTarget pointing at it is a load-time
 	// error, not a silent fall back to LocalPath — see validateBackupTargets.
 	DefaultTarget string
-	// Targets holds the configured backup destinations, keyed by name. At
-	// most one in this release. Nil when none is configured, which is the
-	// shape every deployment has today.
+	// Targets holds the configured backup destinations, keyed by name. Any
+	// number since #1085 stage B2b-2, each optionally naming the databases
+	// routed to it (BackupTargetConfig.Databases); everything unrouted goes to
+	// DefaultTarget. Nil when none is configured, which is the shape every
+	// deployment that has not adopted targets has.
 	Targets map[string]BackupTargetConfig
 }
 
@@ -980,6 +991,8 @@ func Load() (*Config, error) {
 			},
 			Spoke: EdgeSyncSpokeConfig{
 				Enabled:                    v.GetBool("edge_sync.spoke.enabled"),
+				SyncInterval:               v.GetDuration("edge_sync.spoke.sync_interval"),
+				SyncRetryInterval:          v.GetDuration("edge_sync.spoke.sync_retry_interval"),
 				HubURL:                     v.GetString("edge_sync.spoke.hub_url"),
 				SpokeID:                    v.GetString("edge_sync.spoke.spoke_id"),
 				HubID:                      v.GetString("edge_sync.spoke.hub_id"),
@@ -1407,6 +1420,20 @@ func Load() (*Config, error) {
 				"it is the number of snapshots kept per table, and values below 1 would leave "+
 				"snapshot and metadata growth unbounded", cfg.Iceberg.RetainSnapshots)
 		}
+		// A dot in the prefix puts a dot in every namespace component Arc builds
+		// (arc_<database>), and iceberg-go v0.7.0 keys such a namespace by a JSON
+		// encoding instead of the plain dotted string. Arc cannot serve that: the
+		// warehouse directory becomes __iceberg_namespace_v1__:[...].db, which its
+		// own warehouse-directory test does not recognise and would walk back in as
+		// a user database, and the percent-encoded metadata location means no
+		// version-hint.text is published for directory-based readers. Refuse at load
+		// rather than build broken tables for every measurement on the node.
+		if strings.Contains(cfg.Iceberg.NamespacePrefix, ".") {
+			return nil, fmt.Errorf("iceberg.namespace_prefix must not contain a dot (got %q): "+
+				"Arc builds one Iceberg namespace component per database as <prefix>_<database>, and a "+
+				"dotted component is addressed differently by the Iceberg catalog, which leaves the "+
+				"table without a readable warehouse directory", cfg.Iceberg.NamespacePrefix)
+		}
 	}
 
 	// The spoke secret must come from the environment. Refuse rather than
@@ -1430,6 +1457,12 @@ func Load() (*Config, error) {
 	}
 
 	if cfg.EdgeSync.Spoke.Enabled {
+		if cfg.EdgeSync.Spoke.SyncInterval < time.Second {
+			return nil, fmt.Errorf("edge_sync.spoke.sync_interval must be at least 1s (got %s)", cfg.EdgeSync.Spoke.SyncInterval)
+		}
+		if cfg.EdgeSync.Spoke.SyncRetryInterval < time.Second || cfg.EdgeSync.Spoke.SyncRetryInterval >= cfg.EdgeSync.Spoke.SyncInterval {
+			return nil, fmt.Errorf("edge_sync.spoke.sync_retry_interval must be at least 1s and shorter than sync_interval (got %s)", cfg.EdgeSync.Spoke.SyncRetryInterval)
+		}
 		if cfg.EdgeSync.Spoke.HubURL == "" {
 			return nil, fmt.Errorf("edge_sync.spoke.enabled=true requires edge_sync.spoke.hub_url")
 		}
@@ -1712,6 +1745,8 @@ func setDefaults(v *viper.Viper) {
 	// zero-value fallbacks so the defaults are visible to an operator reading
 	// the config, and so the documented value and the code cannot drift apart.
 	v.SetDefault("edge_sync.spoke.enabled", false)
+	v.SetDefault("edge_sync.spoke.sync_interval", "5m")
+	v.SetDefault("edge_sync.spoke.sync_retry_interval", "30s")
 	v.SetDefault("edge_sync.spoke.hub_url", "")
 	v.SetDefault("edge_sync.spoke.spoke_id", "")
 	v.SetDefault("edge_sync.spoke.hub_id", "")
