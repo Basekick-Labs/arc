@@ -626,10 +626,14 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		// arcx decline census (closed label set; all-zero in stock builds —
 		// only the arcx_engine-tagged census path increments these).
 		"arcx_shape_census": m.arcxCensusSnapshot(),
-		"goroutines":        runtime.NumGoroutine(),
-		"go_version":        runtime.Version(),
-		"num_cpu":           runtime.NumCPU(),
-		"gomaxprocs":        runtime.GOMAXPROCS(0),
+		// arcx shadow outcomes (closed label set; all-zero in stock builds).
+		// `skipped` is the one to watch when reading the others: a shed or
+		// capped sample is NOT evidence that arcx matched.
+		"arcx_shadow": m.arcxShadowSnapshot(),
+		"goroutines":  runtime.NumGoroutine(),
+		"go_version":  runtime.Version(),
+		"num_cpu":     runtime.NumCPU(),
+		"gomaxprocs":  runtime.GOMAXPROCS(0),
 
 		// Memory (Go runtime)
 		"memory_alloc_bytes":       memStats.Alloc,

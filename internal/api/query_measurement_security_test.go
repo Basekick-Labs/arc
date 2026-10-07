@@ -18,7 +18,7 @@ func assembleMeasurementSQL(database, measurement, where string) string {
 // TestQueryMeasurementWhereRejectsCrossTenantReads covers GHSA-wmjj-g8xc-6hwr.
 //
 // GET /api/v1/query/:measurement guarded its user-controlled `where` param only
-// with validateWhereClauseQuery — a substring blocklist that blocks neither
+// with validateWhereClauseQuery — a keyword blocklist that blocks neither
 // SELECT nor any DuckDB I/O table function. The fragment is concatenated into
 // `SELECT * FROM db.meas WHERE <where> ...` and executed on a DuckDB handle whose
 // sandbox allowlists the entire storage root, while RBAC inspects only the path

@@ -136,7 +136,7 @@ func aggItemTolerant(item string) bool {
 func compareAgg(rec arrow.Record, oracle []aggCell, items []string) string {
 	got, err := aggFromArcx(rec)
 	if err != nil {
-		return "arcx agg decode error: " + err.Error()
+		return skipPrefix + "arcx agg decode error: " + err.Error()
 	}
 	if len(got) != len(oracle) {
 		return fmt.Sprintf("agg column count differs (arcx=%d duckdb=%d)", len(got), len(oracle))

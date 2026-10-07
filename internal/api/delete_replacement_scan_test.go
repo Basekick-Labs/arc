@@ -61,19 +61,3 @@ func TestValidateWhereClause_RejectsReplacementScan(t *testing.T) {
 		})
 	}
 }
-
-// Pre-existing false positive, NOT caused by the table-position guard above
-// and not fixed by it: the punctuation scan runs on raw text before string
-// literals are masked, so a value containing a comment marker is refused as
-// if it were SQL. `pattern = '**/*.parquet'` trips on the `/*` inside the
-// literal. This is the delete-side half of the same defect tracked as #834
-// (and #987 for the query side); the fix there is to mask literals first.
-//
-// Pinned so the behaviour is recorded rather than rediscovered, and so this
-// test starts failing — informatively — when #834 lands.
-func TestValidateWhereClause_KnownFalsePositive_Issue834(t *testing.T) {
-	h := &DeleteHandler{}
-	if _, err := h.validateWhereClause("pattern = '**/*.parquet'"); err == nil {
-		t.Skip("#834 appears to be fixed: a comment marker inside a string literal is now accepted. Remove this test.")
-	}
-}

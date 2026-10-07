@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	iceberg "github.com/apache/iceberg-go"
 	icecatalog "github.com/apache/iceberg-go/catalog"
@@ -78,6 +79,13 @@ type Exporter struct {
 	// against a future concurrent caller.
 	hintFailMu  sync.Mutex
 	hintFailure bool
+
+	// orphanSweepEnabled gates sweepOrphanMetadata (iceberg.orphan_sweep_enabled).
+	// orphanGrace is the minimum age an unreachable .avro must reach before the
+	// sweep deletes it. Both are set once at wiring time (ConfigureOrphanSweep)
+	// and read-only afterwards, so they need no lock.
+	orphanSweepEnabled bool
+	orphanGrace        time.Duration
 }
 
 // resetHintFailure clears the per-reconcile discovery-file failure flag.
@@ -127,7 +135,57 @@ func NewExporter(db *sql.DB, backend storage.Backend, warehouse, nsPrefix string
 		nsPrefix: nsPrefix,
 		retain:   retain,
 		logger:   logger.With().Str("component", "iceberg-exporter").Logger(),
+		// Safe defaults for an Exporter used without ConfigureOrphanSweep (tests,
+		// future callers): the sweep is on, with the grace floor. Never leave the
+		// grace at zero by default — an ungraced sweep would be free to delete a
+		// manifest written moments ago by a commit that has not landed yet.
+		orphanSweepEnabled: true,
+		orphanGrace:        minOrphanGrace,
 	}, nil
+}
+
+// minOrphanGrace is the floor for how old an unreachable manifest must be before
+// sweepOrphanMetadata deletes it. What it covers is a commit that wrote its
+// manifests and then died before its metadata.json landed: those files are
+// seconds old, so an hour is generous. OrphanGraceFor widens it for a deployment
+// that stretches the reconcile interval past half of this.
+//
+// What it does NOT cover, because the age is the FILE's and not the age of its
+// unreachability: a directory reader that resolved a v<N>.metadata.json moments
+// before the pass that retired that version. Such a manifest is typically hours
+// old by then, so it is past the grace the instant it becomes unreachable, and
+// this pass deletes it. That race is bounded by the same cushion as before this
+// change — pruneOldVersionFiles keeps retain+1 v<N> copies so the version a
+// reader just resolved is not the one being retired (see the keep comment there)
+// — not by this grace. Making the grace cover it would mean remembering when
+// each file was first seen unreachable, which is per-table state the reconciler
+// deliberately does not keep: it would be lost on restart, and a scheme that
+// needs two consecutive sweeps cannot fire at all on a table the scheduler
+// fingerprint-gates away (the design this replaced).
+const minOrphanGrace = time.Hour
+
+// OrphanGraceFor returns the orphan-sweep grace for a reconcile interval.
+func OrphanGraceFor(reconcileInterval time.Duration) time.Duration {
+	if g := 2 * reconcileInterval; g > minOrphanGrace {
+		return g
+	}
+	return minOrphanGrace
+}
+
+// ConfigureOrphanSweep sets whether the metadata orphan sweep runs and how old an
+// unreachable manifest must be before it is deleted. A non-positive grace is
+// refused in favour of the floor rather than honoured: a caller that forgets to
+// compute one must not end up with an ungraced deleter.
+//
+// Call it during wiring, before the reconcile scheduler starts. The fields it
+// writes are read without a lock by the reconcile goroutine, which is safe only
+// because that goroutine does not exist yet.
+func (e *Exporter) ConfigureOrphanSweep(enabled bool, grace time.Duration) {
+	e.orphanSweepEnabled = enabled
+	if grace < minOrphanGrace {
+		grace = minOrphanGrace
+	}
+	e.orphanGrace = grace
 }
 
 // tableIdent maps an Arc (database, measurement) to an Iceberg table identifier under the
@@ -207,7 +265,11 @@ func (e *Exporter) EnsureTable(ctx context.Context, database, measurement string
 		// Table exists — evolve its schema to cover any new columns in `sc` (Arc's
 		// per-measurement schema can grow over time). Missing columns are added as optional,
 		// so older narrow files stay compatible. No-op when already a superset.
-		return e.evolveSchema(ctx, tbl, sc)
+		tbl, err = e.evolveSchema(ctx, tbl, sc)
+		if err != nil {
+			return nil, err
+		}
+		return e.healRetentionProperties(ctx, tbl), nil
 	}
 	if !errors.Is(err, icecatalog.ErrNoSuchTable) {
 		// The catalog has a row for this table but the table cannot be loaded. Falling
@@ -386,6 +448,49 @@ func (e *Exporter) healNameMapping(ctx context.Context, tbl *icetable.Table) (*i
 	return healed, nil
 }
 
+// healRetentionProperties keeps an existing table's metadata-file retention in sync with
+// the current configuration. It only commits when a property differs, so unchanged settings
+// do not create a metadata version on every reconcile pass.
+//
+// Best-effort: a failure here must not fail the reconcile, since the data-file set is what
+// the pass exists to converge. The retry is NOT the next tick, though — the scheduler skips a
+// measurement whose fingerprint is unchanged before it ever reaches EnsureTable, so a failed
+// property commit waits for the next pass that actually reconciles THIS measurement (a file-set
+// change, or the restart that any config change implies, which empties the fingerprint cache).
+func (e *Exporter) healRetentionProperties(ctx context.Context, tbl *icetable.Table) *icetable.Table {
+	if e.retain < 1 {
+		return tbl
+	}
+
+	desired := iceberg.Properties{
+		icetable.MetadataDeleteAfterCommitEnabledKey: "true",
+		icetable.MetadataPreviousVersionsMaxKey:      strconv.Itoa(e.retain),
+	}
+	updates := make(iceberg.Properties, len(desired))
+	for key, value := range desired {
+		if tbl.Properties()[key] != value {
+			updates[key] = value
+		}
+	}
+	if len(updates) == 0 {
+		return tbl
+	}
+
+	txn := tbl.NewTransaction()
+	if err := txn.SetProperties(updates); err != nil {
+		e.logger.Warn().Err(err).Msg("Iceberg retention property heal failed (non-fatal) — retried on the next pass that reconciles this measurement")
+		return tbl
+	}
+	updated, err := txn.Commit(ctx)
+	if err != nil {
+		e.logger.Warn().Err(err).Msg("Iceberg retention property heal failed (non-fatal) — retried on the next pass that reconciles this measurement")
+		return tbl
+	}
+	e.writeVersionHint(ctx, updated)
+	e.logger.Info().Int("retain_snapshots", e.retain).Msg("Iceberg retention properties reconciled")
+	return updated
+}
+
 // ReconcileMeasurement makes the Iceberg table's data-file set equal `current`: it AddFiles
 // the files present in Arc but absent from the table, and Deletes the files present in the
 // table but absent from Arc. One transaction. Idempotent — if the sets already match, it is a
@@ -457,6 +562,12 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 		// Already converged — no new snapshot. Still republish the discovery
 		// files: a previous pass may have committed the snapshot but failed to
 		// write them, and this is the path that pass's retry lands on.
+		//
+		// Sweep here too. A measurement whose file set has stopped changing is
+		// skipped by the scheduler's fingerprint gate before it ever reaches this
+		// function, so for such a table THIS is the pass that reclaims: the first
+		// one after a restart, whose fingerprint cache is cold.
+		e.sweepOrphanMetadata(ctx, tbl)
 		return e.writeVersionHint(ctx, tbl) && hintOK, nil
 	}
 
@@ -482,6 +593,9 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 	committed = e.expireSnapshots(ctx, committed, database, measurement)
 	hintOK = e.writeVersionHint(ctx, committed) && !e.hintFailed()
 	e.pruneOldVersionFiles(ctx, committed)
+	// After pruneOldVersionFiles, so the on-disk metadata set the sweep reads for
+	// reachability is the one this pass settled on, not one version stale.
+	e.sweepOrphanMetadata(ctx, committed)
 	e.logger.Info().
 		Str("database", database).Str("measurement", measurement).
 		Int("added", len(toAdd)-len(rewritten)).Int("removed", len(toRemove)-len(rewritten)).
@@ -771,6 +885,195 @@ func (e *Exporter) pruneOldVersionFiles(ctx context.Context, tbl *icetable.Table
 			e.logger.Debug().Err(err).Str("key", v.key).Msg("prune old v<N> (non-fatal)")
 		}
 	}
+}
+
+// sweepOrphanMetadata deletes the manifest lists and manifests under the table's metadata
+// directory that NO metadata.json still on disk can reach (#835).
+//
+// Why anything is orphaned at all: expireSnapshots runs WithPostCommit(false) on purpose (#632 —
+// iceberg-go's post-commit hook would also delete Arc's DATA files, which the exporter must never
+// be allowed to do), and nothing else deletes the .avro files an expired snapshot leaves behind.
+// A dropped transaction leaves the same residue: iceberg-go writes its manifests inside the
+// snapshot producer, before Commit, so a refusal after that point (see replaceDataFilesResilient)
+// abandons files nothing reclaims. Unbounded on disk, and copied into every backup.
+//
+// Reachability is computed from the metadata files ON DISK, never from the current snapshot alone.
+// Arc deliberately keeps older entry points a reader can resolve: retain+1 v<N>.metadata.json
+// copies (see pruneOldVersionFiles) and iceberg-go's own NNNNN-*.metadata.json log. A reader that
+// resolves any of them gets that file's snapshots, so every .avro any on-disk metadata.json can
+// reach has to survive. The set of on-disk metadata files only ever shrinks (delete-after-commit
+// and pruneOldVersionFiles, both of which have already run by the time this is called), so a
+// manifest this sweep spares stays spared, and one it deletes can never become referenced again.
+//
+// Deletions are restricted to names ending ".avro" DIRECTLY under the table's metadata directory.
+// That is what keeps the blast radius off everything else: Arc's data files are .parquet and live
+// outside the warehouse table directory, version-hint.text and *.metadata.json are not .avro, and
+// Iceberg statistics are Puffin — so none of them are deletable here regardless of reachability.
+//
+// Every failure fails CLOSED. A listing error, an unreadable or unparsable metadata.json, or a
+// manifest list that cannot be opened all yield an incomplete reachable set, and an incomplete
+// reachable set must never authorise a delete — a deleted manifest is the only record of which
+// data files a snapshot held, and nothing regenerates it.
+//
+// Best-effort with respect to the reconcile: this runs after the pass has committed, so a failure
+// here never undoes a snapshot. Single-writer, like the rest of the reconcile path.
+func (e *Exporter) sweepOrphanMetadata(ctx context.Context, tbl *icetable.Table) {
+	if !e.orphanSweepEnabled || e.backend == nil {
+		return
+	}
+	// Ages come from the optional ObjectLister extension. Without it there is no way to tell a
+	// manifest abandoned long ago from one a commit wrote a moment ago, so do not sweep at all.
+	lister, ok := e.backend.(storage.ObjectLister)
+	if !ok {
+		return
+	}
+	_, dirKey, ok := e.parseVersionAndMetaDir(tbl.MetadataLocation())
+	if !ok {
+		return
+	}
+	// A metadata location directly under the warehouse root gives "." or "", both of which the
+	// storage key contract refuses as prefixes (#743) — same guard as pruneOldVersionFiles.
+	if dirKey == "" || dirKey == "." {
+		return
+	}
+
+	objs, err := lister.ListObjects(ctx, dirKey+"/")
+	if err != nil {
+		// Warn, not Debug: Debug is invisible at Arc default log level, and a listing that keeps
+		// failing (a permission problem, a key the contract refuses) makes the whole sweep
+		// permanently inert while the metadata directory grows.
+		e.logger.Warn().Err(err).Str("dir", dirKey).Msg("Iceberg orphan sweep: listing the metadata directory failed, skipping (nothing deleted)")
+		return
+	}
+
+	// Split the listing into entry points (metadata.json) and candidates (.avro old enough to be
+	// past the grace). Candidates are collected first so a directory whose .avro files are ALL
+	// young costs one listing and no metadata reads at all. That is the young-table case, not the
+	// steady state: once a table has history, its retained versions keep old-but-reachable
+	// manifests around, so most passes do walk every metadata.json here. The walk stays cheap
+	// because reachableManifestNames dedupes the manifest-list reads, which are the I/O.
+	var metaKeys []string
+	var candidates []string
+	young := 0
+	for _, o := range objs {
+		// ListObjects is recursive. Only sweep the metadata directory itself; a nested directory
+		// is not ours to reason about, and its basenames are not in the reachable set.
+		//
+		// path.Dir/path.Base, not filepath.*: backend keys are slash-separated on every platform
+		// (LocalBackend.ListObjects runs filepath.ToSlash before returning them), so the slash
+		// forms are correct here and on Windows. Note this differs from pruneOldVersionFiles above.
+		//
+		// This filter and the candidate filter below read the SAME key shape, which is load-bearing
+		// for safety: if the shapes ever diverged, the mismatch would yield zero candidates and an
+		// early return, never an empty reachable set authorising a mass delete.
+		if path.Dir(o.Path) != dirKey {
+			continue
+		}
+		base := path.Base(o.Path)
+		switch {
+		case strings.HasSuffix(base, ".metadata.json"):
+			metaKeys = append(metaKeys, o.Path)
+		case strings.HasSuffix(base, ".avro"):
+			if time.Since(o.LastModified) < e.orphanGrace {
+				young++
+				continue
+			}
+			candidates = append(candidates, o.Path)
+		}
+	}
+	if len(candidates) == 0 {
+		return
+	}
+
+	reachable, err := e.reachableManifestNames(ctx, tbl, metaKeys)
+	if err != nil {
+		// Loud, not Debug: a sweep that cannot establish reachability reclaims nothing, every
+		// pass, and an operator watching the metadata directory grow deserves the reason.
+		//
+		// It can also stay that way. Recovery needs the unreadable metadata.json to be retired by
+		// pruneOldVersionFiles or delete-after-commit, which takes further commits on this table —
+		// and a table whose file set has stopped changing gets no further passes at all (the
+		// scheduler fingerprint-gates it). So a warehouse restored with its .avro set lagging its
+		// metadata.json set can leave this table unswept until the files are reconciled by hand.
+		// That is the fail-closed direction and the right one, but it is not self-healing.
+		e.logger.Warn().Err(err).Str("dir", dirKey).
+			Msg("Iceberg orphan sweep: could not establish the reachable manifest set, skipping (nothing deleted)")
+		return
+	}
+
+	deleted, failed := 0, 0
+	for _, key := range candidates {
+		if _, live := reachable[path.Base(key)]; live {
+			continue
+		}
+		if err := e.backend.Delete(ctx, key); err != nil {
+			e.logger.Debug().Err(err).Str("key", key).Msg("Iceberg orphan sweep: delete failed (non-fatal)")
+			failed++
+			continue
+		}
+		deleted++
+	}
+	if deleted > 0 || failed > 0 {
+		e.logger.Info().Str("dir", dirKey).
+			Int("deleted", deleted).Int("failed", failed).
+			Int("reachable", len(reachable)).Int("within_grace", young).
+			Msg("Iceberg orphan sweep: reclaimed unreachable manifest files")
+	}
+}
+
+// reachableManifestNames returns the BASENAMES of every manifest list and manifest that any of the
+// given metadata.json keys can reach. An error means the set is incomplete and the caller must not
+// delete anything.
+//
+// Basenames, not full paths, on purpose. Paths inside metadata are absolute URIs (file://…) while
+// backend keys are storage-root-relative, and converting between the two is the exact arithmetic
+// that shipped broken in #534. Within one table's metadata directory a basename is unique — each
+// commit mints a fresh UUID for both shapes, "<commitUUID>-m<N>.avro" and
+// "snap-<snapshotID>-<attempt>-<commitUUID>.avro" — and iceberg-go writes both into that same
+// directory (the location provider's metadata path, which Arc never overrides). If a reachable
+// manifest ever did live elsewhere, its basename is still in this set, so a same-named local file
+// is KEPT: the failure direction is over-retention, never deletion of something live.
+// Paths in the errors below are deliberately NOT %q: the caller logs them through .Err(err), and
+// Arc masks quoted spans in every logged error (internal/logger/errsanitize.go), which would blank
+// out the one detail an operator needs.
+func (e *Exporter) reachableManifestNames(ctx context.Context, tbl *icetable.Table, metaKeys []string) (map[string]struct{}, error) {
+	fio, err := tbl.FS(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("open table filesystem: %w", err)
+	}
+	reachable := make(map[string]struct{})
+	// The same snapshot appears in many of these files; without this the walk would re-read every
+	// manifest list once per metadata version that mentions it.
+	listsSeen := make(map[string]struct{})
+	for _, key := range metaKeys {
+		raw, err := e.backend.Read(ctx, key)
+		if err != nil {
+			return nil, fmt.Errorf("read metadata %s: %w", key, err)
+		}
+		md, err := icetable.ParseMetadataBytes(raw)
+		if err != nil {
+			return nil, fmt.Errorf("parse metadata %s: %w", key, err)
+		}
+		for _, snap := range md.Snapshots() {
+			if snap.ManifestList == "" {
+				continue
+			}
+			if _, dup := listsSeen[snap.ManifestList]; dup {
+				continue
+			}
+			listsSeen[snap.ManifestList] = struct{}{}
+			reachable[path.Base(snap.ManifestList)] = struct{}{}
+			manifests, err := snap.Manifests(fio)
+			if err != nil {
+				return nil, fmt.Errorf("read manifest list %s (snapshot %d of %s): %w",
+					snap.ManifestList, snap.SnapshotID, key, err)
+			}
+			for _, m := range manifests {
+				reachable[path.Base(m.FilePath())] = struct{}{}
+			}
+		}
+	}
+	return reachable, nil
 }
 
 // writeVersionHint publishes the Hadoop-catalog discovery files next to the table's current

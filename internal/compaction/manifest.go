@@ -38,9 +38,9 @@ const ManifestBasePath = "_compaction_state"
 // path naming the tier, database and job) survives for an operator to act on.
 const ManifestQuarantineSuffix = ".quarantined"
 
-// ManifestMaxAge is the maximum age for manifests before they're considered stale.
-// Manifests older than this are deleted during recovery - they likely indicate
-// a deeper problem that requires investigation.
+// ManifestMaxAge is the age threshold for a stale-manifest investigation warning.
+// Age alone does not delete a manifest; normal recovery still validates the
+// output and applies its cleanup and retry rules.
 const ManifestMaxAge = 7 * 24 * time.Hour // 7 days
 
 // ErrManifestUnparseable marks a manifest whose bytes were read but do not

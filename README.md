@@ -226,16 +226,16 @@ Apple Silicon. DuckDB is statically linked, so there are no runtime dependencies
 ### Debian/Ubuntu
 
 ```bash
-wget https://github.com/basekick-labs/arc/releases/download/v26.09.2/arc_26.09.2_amd64.deb
-sudo dpkg -i arc_26.09.2_amd64.deb
+wget https://github.com/basekick-labs/arc/releases/download/v26.09.3/arc_26.09.3_amd64.deb
+sudo dpkg -i arc_26.09.3_amd64.deb
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
 ### RHEL/Fedora
 
 ```bash
-wget https://github.com/basekick-labs/arc/releases/download/v26.09.2/arc-26.09.2-1.x86_64.rpm
-sudo rpm -i arc-26.09.2-1.x86_64.rpm
+wget https://github.com/basekick-labs/arc/releases/download/v26.09.3/arc-26.09.3-1.x86_64.rpm
+sudo rpm -i arc-26.09.3-1.x86_64.rpm
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
@@ -244,15 +244,15 @@ sudo systemctl enable arc && sudo systemctl start arc
 Works on Arch Linux and Arch-based distros such as Omarchy (x86_64 and aarch64).
 
 ```bash
-wget https://github.com/basekick-labs/arc/releases/download/v26.09.2/arc-26.09.2-1-x86_64.pkg.tar.zst
-sudo pacman -U arc-26.09.2-1-x86_64.pkg.tar.zst
+wget https://github.com/basekick-labs/arc/releases/download/v26.09.3/arc-26.09.3-1-x86_64.pkg.tar.zst
+sudo pacman -U arc-26.09.3-1-x86_64.pkg.tar.zst
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
 ### Kubernetes (Helm)
 
 ```bash
-helm install arc https://github.com/basekick-labs/arc/releases/download/v26.09.2/arc-26.09.2.tgz
+helm install arc https://github.com/basekick-labs/arc/releases/download/v26.09.3/arc-26.09.3.tgz
 ```
 
 ### Build from Source
@@ -456,12 +456,14 @@ Thanks to everyone who has contributed code to Arc:
 - [@copacabanaservice01](https://github.com/copacabanaservice01) — calendar-day S3 range path generation across DST transitions (#690)
 - [@be-student](https://github.com/be-student) — extracted the Arrow IPC stream loop into a testable helper with leak-checked regression coverage for disconnects, cancellation, and decimal-cast cleanup (#706)
 - [@MrBeldum](https://github.com/MrBeldum) (Daniel) — configured query timeout applied to the measurement endpoint, with request-scoped cancellation and 504 handling on both query paths (#701)
-- [@pujitha24](https://github.com/pujitha24) (Pujitha Paladugu) — tiered query routing pushed into SQL instead of filtering file metadata in Go (#707), replicate-sync handshake now authenticating the binary-framing capability flag (#715), file puller no longer treats a crash-stranded full-size `.part` as a present file (#965)
-- [@lecodev-26](https://github.com/lecodev-26) — numeric MessagePack host coercion logged at debug level, with an allocation-free log path verified under parallel ingest (#769)
-- [@efegokdemir](https://github.com/efegokdemir) (Efe) — one shared DuckDB string-literal quoting helper across the query, delete, retention and parallel-executor paths, replacing four drifting copies (#780); retention now reports data files its listings hide, with one inventory pass per policy and no abort on an invalid measurement name (#775); edge-sync spoke IDs with a colon rejected at registration, closing the one gap between the key contract and the cluster manifest validator (#776); tiering metadata store: redundant mutex removed and tier-cache fills ordered against invalidation by a generation counter (#777); the last two copies of the DuckDB string-literal escape routed through the shared helper, dropping compaction's backslash doubling (#782); backup tells a temp-file write failure apart from an unreadable source through the classifier shared with restore (#784); edge-sync hub bounds incoming paths by the key they actually become and answers 400 instead of a retryable 503 (#783); Iceberg export refuses to publish a table whose Parquet data files are hidden from the storage listing, naming the files (#785); compaction cleans exactly the job-owned temp directory instead of sweeping by partition prefix (#786); manifest register, delete and batch applies honour the caller's deadline through the leader-forwarding round trip (#787), per-peer WAL replication lag gauges (#908), backups skip a source key whose destination would overrun the storage key limit instead of failing (#903); a full flush queue no longer discards an acknowledged batch — records stay buffered until a worker is free, with a sampled warning and `arc_ingest_flush_deferred_total` reporting what used to be a silent drop (#966); continuous-query create and update apply Arc's database-name rule, and update reports an omitted database separately from an invalid one (#995); compaction's de-duplication row count read from the Parquet file metadata that actually carries it, so the dedup-ratio log fires for the first time (#1019); a panic in the experimental arcx Arrow IPC stream writer now marks the response incomplete with an invalid-IPC marker and an `Arc-Stream-Truncated` trailer, instead of ending at a batch boundary that clients read as complete (#904); experimental arcx Arrow IPC queries are registered before the engine is chosen, so they carry an `X-Arc-Query-ID`, appear in active-query tracking and history, propagate registry cancellation, and dispose of their entry on success, failure, timeout or a recovered panic rather than staying listed as running (#911)
+- [@pujitha24](https://github.com/pujitha24) (Pujitha Paladugu) — tiered query routing pushed into SQL instead of filtering file metadata in Go (#707), replicate-sync handshake now authenticating the binary-framing capability flag (#715), file puller no longer treats a crash-stranded full-size `.part` as a present file (#965), `ListStaged` reports only partials its own `DeleteStaged` accepts so abandoned-partial reclaim stops warning on legacy illegal keys (#906)
+- [@lecodev-26](https://github.com/lecodev-26) — numeric MessagePack host coercion logged at debug level, with an allocation-free log path verified under parallel ingest (#769); line-protocol WAL entries carry their database envelope, so replicated rows land in the database they were written to instead of `default` (#1055)
+- [@drakeo338](https://github.com/drakeo338) — proposed the source-side WAL envelope for line-protocol entries that #1055 shipped (#889)
+- [@efegokdemir](https://github.com/efegokdemir) (Efe) — one shared DuckDB string-literal quoting helper across the query, delete, retention and parallel-executor paths, replacing four drifting copies (#780); retention now reports data files its listings hide, with one inventory pass per policy and no abort on an invalid measurement name (#775); edge-sync spoke IDs with a colon rejected at registration, closing the one gap between the key contract and the cluster manifest validator (#776); tiering metadata store: redundant mutex removed and tier-cache fills ordered against invalidation by a generation counter (#777); the last two copies of the DuckDB string-literal escape routed through the shared helper, dropping compaction's backslash doubling (#782); backup tells a temp-file write failure apart from an unreadable source through the classifier shared with restore (#784); edge-sync hub bounds incoming paths by the key they actually become and answers 400 instead of a retryable 503 (#783); Iceberg export refuses to publish a table whose Parquet data files are hidden from the storage listing, naming the files (#785); compaction cleans exactly the job-owned temp directory instead of sweeping by partition prefix (#786); manifest register, delete and batch applies honour the caller's deadline through the leader-forwarding round trip (#787), per-peer WAL replication lag gauges (#908), backups skip a source key whose destination would overrun the storage key limit instead of failing (#903); a full flush queue no longer discards an acknowledged batch — records stay buffered until a worker is free, with a sampled warning and `arc_ingest_flush_deferred_total` reporting what used to be a silent drop (#966); continuous-query create and update apply Arc's database-name rule, and update reports an omitted database separately from an invalid one (#995); compaction's de-duplication row count read from the Parquet file metadata that actually carries it, so the dedup-ratio log fires for the first time (#1019); a panic in the experimental arcx Arrow IPC stream writer now marks the response incomplete with an invalid-IPC marker and an `Arc-Stream-Truncated` trailer, instead of ending at a batch boundary that clients read as complete (#904); experimental arcx Arrow IPC queries are registered before the engine is chosen, so they carry an `X-Arc-Query-ID`, appear in active-query tracking and history, propagate registry cancellation, and dispose of their entry on success, failure, timeout or a recovered panic rather than staying listed as running (#911); WAL recovery replays only entries whose batch had not yet reached Parquet, through a per-entry tracked identity and a checkpoint written after the flush is confirmed — closing the permanent duplicate-row bug for tagless measurements, where compaction can never dedup (#948); same-name token-create conflicts no longer counted or logged as rejected entries at every restart (#973); a delete-API rewrite after a writer failover names the rewriting node as the file's origin (#984); a Raft manifest batch is applied under one lock so readers never see a half-applied compaction (#910); a snapshot restore announces the files it dropped so a rejoined node removes the replicas the cluster deleted while it was away (#983); a replica refreshes a file whose manifest content changes while it is being pulled, with the FSM signalling content changes separately from registrations and a verified copy kept until the successor lands (#907); delete API WHERE validation scans a string-literal-masked clause, so values containing SQL words or punctuation can be deleted again (#937, landed via #1079); the measurement endpoint's where pre-filter matches keywords as whole words on a literal-masked clause, so values and identifiers containing SQL words are accepted again (#988)
 - [@alexeymoskalev-devops](https://github.com/alexeymoskalev-devops) — compaction candidates preview lists each measurement once and hands the listing to every tier, after finding and documenting why the scheduled cycle must not share listings across tiers (#789)
 - [@TayfurYldz](https://github.com/TayfurYldz) — DECIMAL query results stay JSON numbers on the JSON output path: aggregates such as SUM and AVG over integer columns are cast to int64 or double before encoding instead of being stringified (#831)
 - [@jallegri](https://github.com/jallegri) — hourly-compaction minimum-files rationale corrected to the actual ingest flush triggers (#838)
+- [@0utsights](https://github.com/0utsights) (John Surles) — audit middleware copies every Fiber request-backed string and the handler detail map before the background writer serialises the event, with a buffer-reuse regression covering each field (#871)
 
 And a thank-you to community members whose bug reports drove fixes:
 

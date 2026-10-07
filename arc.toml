@@ -72,6 +72,20 @@ s3_path_style = true        # MinIO/dev. AWS S3: false
 # Credentials via env: ARC_STORAGE_S3_ACCESS_KEY, ARC_STORAGE_S3_SECRET_KEY
 # On EKS with IRSA, leave both unset: Arc detects AWS_ROLE_ARN +
 # AWS_WEB_IDENTITY_TOKEN_FILE and authenticates via the pod's IAM role.
+#
+# A key prefix confines Arc to one subtree of the bucket or container, so
+# several deployments can share one, and so a backup target can live beside the
+# primary data. Both default to the root. Commented rather than set to "",
+# because a shipped value is the effective configuration for every deployment
+# that does not override it and an empty environment variable does not clear it
+# (see TestShippedArcTomlHasNoLiveColdTierConnectionValues).
+# s3_prefix = "instances/abc123"
+#
+# Azure Blob (when backend = "azure"). Credentials via env:
+# ARC_STORAGE_AZURE_ACCOUNT_NAME, ARC_STORAGE_AZURE_ACCOUNT_KEY (or
+# ARC_STORAGE_AZURE_CONNECTION_STRING).
+# azure_container = ""
+# azure_prefix = "instances/abc123"
 
 # -----------------------------------------------------------------------------
 # Ingestion
@@ -278,18 +292,25 @@ migration_history_retention_days = 90
 enabled = false
 backend = "s3"              # "s3" or "azure"
 
-# S3/MinIO — as with the primary [storage] block above, these are MinIO/local-dev
-# values. For real AWS S3: clear s3_endpoint, set s3_use_ssl = true and
-# s3_path_style = false, and REMOVE the static keys below — leaving them set
-# suppresses IRSA/instance-role detection for the cold tier, since configured
-# keys always take precedence over the AWS credential chain.
-s3_bucket = "arc-archive"
+# S3 — nothing below is set, on purpose. Arc's built-in defaults are already
+# the AWS-correct ones (no endpoint, HTTPS, virtual-hosted addressing, and
+# credentials from the AWS chain so IRSA and instance roles are detected), and
+# a value shipped here cannot be cleared from the environment: an empty env var
+# reads as unset, so ARC_TIERED_STORAGE_COLD_S3_ENDPOINT="" does NOT blank a
+# value in this file. A cold tier meant for AWS would silently keep talking to
+# whatever was shipped here.
+#
+# Set the bucket and region for your account; enabling the cold tier without a
+# bucket is refused at startup rather than defaulted to anything.
 s3_region = "us-east-1"
-s3_endpoint = "localhost:9000"   # MinIO/dev. AWS S3: leave empty
-s3_access_key = "minioadmin"     # MinIO/dev. AWS S3 with IRSA: remove
-s3_secret_key = "minioadmin"     # MinIO/dev. AWS S3 with IRSA: remove
-s3_use_ssl = false               # MinIO/dev. AWS S3: true
-s3_path_style = true             # MinIO/dev. AWS S3: false
+# s3_bucket = ""
+#
+# MinIO / another S3-compatible store — uncomment as a set:
+# s3_endpoint = "localhost:9000"
+# s3_access_key = "minioadmin"   # configured keys take precedence over the
+# s3_secret_key = "minioadmin"   # AWS chain, so these disable IRSA detection
+# s3_use_ssl = false
+# s3_path_style = true
 # Cold objects are written with no storage class set (S3 Standard) and read in
 # place; there is deliberately no storage-class key. Keep bucket lifecycle
 # rules off the cold prefix — Glacier or Deep Archive objects cannot be queried.
@@ -299,6 +320,10 @@ s3_path_style = true             # MinIO/dev. AWS S3: false
 azure_container = ""
 azure_endpoint = ""
 azure_use_managed_identity = false
+# A prefix lets the cold tier share one container with the primary store. Left
+# commented for the same reason as the connection values above: a shipped value
+# cannot be cleared by an empty environment variable.
+# azure_prefix = "cold"
 
 # -----------------------------------------------------------------------------
 # Audit Logging (Enterprise)
@@ -313,6 +338,10 @@ include_reads = false           # Log GET/query requests (high volume)
 [backup]
 enabled = true
 local_path = "./data/backups"           # Directory for local backups
+# How long one backup or one restore may run before its context is cancelled.
+# Go duration syntax; must be positive. 2h is the value both were hardcoded to
+# before this key existed.
+# operation_timeout = "2h"
 
 # Query Management (Enterprise)
 # -----------------------------------------------------------------------------
