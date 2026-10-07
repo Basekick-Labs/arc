@@ -619,6 +619,12 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// Execute query using DuckDB's native Arrow API — returns record batches
 	// directly from DuckDB's internal columnar chunks, no row-by-row scanning.
 	reader, conn, err := h.db.ArrowQueryContext(ctx, convertedSQL)
+	// Match the JSON query contract: a data glob with no matches is an empty
+	// result, not a failed query. Keep missing schema anchors as errors because
+	// they invalidate the cached SQL transform.
+	if err != nil && ctx.Err() == nil && isNoFilesFoundError(err) && !h.missingAnchor(err) {
+		reader, err = array.NewRecordReader(arrow.NewSchema([]arrow.Field{}, nil), nil)
+	}
 	if err != nil {
 		// Read the cause before releasing the context: cancel() below turns
 		// ctx.Err() into Canceled for every failure, which would misfile a
