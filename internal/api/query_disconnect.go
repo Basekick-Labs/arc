@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"errors"
 	"net"
 	"time"
 )
@@ -11,23 +10,15 @@ const clientDisconnectPollInterval = 250 * time.Millisecond
 
 // watchClientDisconnect cancels query work when the client closes the
 // connection before the query has produced a response. fasthttp's request
-// context is only cancelled during server shutdown, so a connection read is
-// the only signal available while DuckDB is still executing.
-//
-// The request body has already been consumed by the time query handlers call
-// this function. The one-byte probe is therefore only used while this
-// request owns the connection; it is stopped as soon as queryCtx is done.
+// context is only cancelled during server shutdown, so a non-consuming TCP
+// peek is used while DuckDB is still executing. If another request is pending,
+// monitoring stops and leaves those bytes for the HTTP server.
 func watchClientDisconnect(queryCtx context.Context, conn net.Conn, onDisconnect func()) {
 	if conn == nil || isSyntheticTestConn(conn) {
 		return
 	}
 
 	go func() {
-		defer func() {
-			_ = conn.SetReadDeadline(time.Time{})
-		}()
-
-		probe := make([]byte, 1)
 		for {
 			select {
 			case <-queryCtx.Done():
@@ -35,23 +26,23 @@ func watchClientDisconnect(queryCtx context.Context, conn net.Conn, onDisconnect
 			default:
 			}
 
-			_ = conn.SetReadDeadline(time.Now().Add(clientDisconnectPollInterval))
-			_, err := conn.Read(probe)
-			if err == nil {
-				continue
-			}
-
-			var netErr net.Error
-			if errors.As(err, &netErr) && netErr.Timeout() {
-				continue
-			}
-
-			select {
-			case <-queryCtx.Done():
+			pending, disconnected, supported := peekClientConnection(conn)
+			if !supported || pending {
+				// A byte may belong to a pipelined keep-alive request. Leave it
+				// for the HTTP server rather than consuming it in this probe.
 				return
-			default:
+			}
+			if disconnected {
 				onDisconnect()
 				return
+			}
+
+			timer := time.NewTimer(clientDisconnectPollInterval)
+			select {
+			case <-queryCtx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
 			}
 		}
 	}()
