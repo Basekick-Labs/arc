@@ -92,6 +92,37 @@ func minioBackend(t *testing.T) *S3Backend {
 	return b
 }
 
+func TestS3MissingBucketListsEmptyThenListsFirstWrite(t *testing.T) {
+	base := minioBackend(t)
+	b := &S3Backend{
+		client: base.client,
+		bucket: fmt.Sprintf("arc-missing-%d", time.Now().UnixNano()),
+		logger: zerolog.Nop(),
+	}
+	ctx := context.Background()
+
+	objects, err := b.List(ctx, "")
+	if err != nil {
+		t.Fatalf("List on a fresh bucket: %v", err)
+	}
+	if len(objects) != 0 {
+		t.Fatalf("List on a fresh bucket returned %v, want empty", objects)
+	}
+
+	const key = "contract/first-write.parquet"
+	if err := b.Write(ctx, key, []byte("PAR1")); err != nil {
+		t.Fatalf("first write to fresh bucket: %v", err)
+	}
+	t.Cleanup(func() { _ = b.Delete(ctx, key) })
+	objects, err = b.List(ctx, "")
+	if err != nil {
+		t.Fatalf("List after first write: %v", err)
+	}
+	if len(objects) != 1 || objects[0] != key {
+		t.Fatalf("List after first write = %v, want [%s]", objects, key)
+	}
+}
+
 // TestS3RejectsNonInjectiveKeys pins the contract at the backend that has the
 // most to lose from it. Each key here either names one object under two
 // spellings, or is refused by the store itself with a remote 400 that says

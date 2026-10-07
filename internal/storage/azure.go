@@ -433,6 +433,9 @@ func (b *AzureBlobBackend) List(ctx context.Context, prefix string) ([]string, e
 
 		page, err := pager.NextPage(ctx)
 		if err != nil {
+			if isAzureContainerNotFoundError(err) {
+				return []string{}, nil
+			}
 			return nil, fmt.Errorf("failed to list Azure blobs: %w", err)
 		}
 
@@ -830,6 +833,17 @@ func (b *AzureBlobBackend) ListUnusable(ctx context.Context, prefix string) ([]U
 	}
 
 	return objects, nil
+}
+
+func isAzureContainerNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var responseError *azcore.ResponseError
+	if errors.As(err, &responseError) {
+		return responseError.ErrorCode == "ContainerNotFound"
+	}
+	return strings.Contains(err.Error(), "ContainerNotFound")
 }
 
 // isAzureNotFoundError checks if an error indicates the blob doesn't exist
