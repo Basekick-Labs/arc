@@ -55,6 +55,24 @@ func waitSchedulerCall(t *testing.T, started <-chan int, want int, timeout time.
 	}
 }
 
+func waitSchedulerMetric(t *testing.T, metric *atomic.Int64, want int64) {
+	t.Helper()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for {
+		if got := metric.Load(); got == want {
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			t.Fatalf("metric = %d, want %d", metric.Load(), want)
+		}
+	}
+}
+
 func newTestSyncScheduler(t *testing.T, runner SyncRunner, interval, retry time.Duration, gate WriterGate, metrics SchedulerMetrics) *Scheduler {
 	t.Helper()
 	s, err := NewScheduler(SchedulerConfig{
@@ -171,6 +189,49 @@ func TestSchedulerUsesRetryIntervalThenResetsAfterSuccess(t *testing.T) {
 	case <-time.After(70 * time.Millisecond):
 	}
 	waitSchedulerCall(t, started, 3, time.Second)
+}
+
+func TestSchedulerRetriesWhenPassReportsTransferFailures(t *testing.T) {
+	started := make(chan int, 4)
+	allowSuccess := make(chan struct{})
+	metrics := &schedulerMetrics{}
+	runner := &schedulerRunner{
+		started: started,
+		call: func(ctx context.Context, n int) (*RunResult, error) {
+			if n == 1 {
+				// Agent.Run returns per-file transfer errors in the result while
+				// keeping its pass-level error nil.
+				return &RunResult{Failed: 1}, nil
+			}
+			if n == 2 {
+				select {
+				case <-allowSuccess:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			return &RunResult{}, nil
+		},
+	}
+	newTestSyncScheduler(t, runner, 150*time.Millisecond, 30*time.Millisecond, nil, metrics)
+	waitSchedulerCall(t, started, 1, time.Second)
+	waitSchedulerCall(t, started, 2, 100*time.Millisecond)
+	waitSchedulerMetric(t, &metrics.failures, 1)
+	if got := metrics.successes.Load(); got != 0 {
+		t.Fatalf("failed pass updated last-success count = %d, want 0", got)
+	}
+	close(allowSuccess)
+	waitSchedulerMetric(t, &metrics.successes, 1)
+
+	// The pass after a reported transfer failure succeeds and restores the
+	// normal interval instead of polling again at the retry cadence.
+	select {
+	case got := <-started:
+		t.Fatalf("unexpected Run call %d before the normal interval", got)
+	case <-time.After(70 * time.Millisecond):
+	}
+	waitSchedulerCall(t, started, 3, time.Second)
+	waitSchedulerMetric(t, &metrics.successes, 2)
 }
 
 func TestSchedulerFailedPassKeepsCompactionDeferredUntilDelivery(t *testing.T) {

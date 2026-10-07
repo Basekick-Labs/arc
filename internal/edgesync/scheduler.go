@@ -207,11 +207,17 @@ func (s *Scheduler) runLoop(ctx context.Context) {
 				resetSchedulerTimer(timer, s.syncInterval)
 				continue
 			}
-			if outcome.err != nil {
+			passErr := outcome.err
+			if passErr == nil && outcome.result != nil && outcome.result.Failed > 0 {
+				// Agent.Run reports per-file transfer errors in RunResult while
+				// keeping the pass-level error nil so other files can finish.
+				passErr = fmt.Errorf("%d file transfers failed", outcome.result.Failed)
+			}
+			if passErr != nil {
 				if s.metrics != nil {
 					s.metrics.IncEdgeSyncFailure()
 				}
-				s.logger.Warn().Err(outcome.err).Msg("Scheduled edge sync pass failed; retrying after the configured backoff")
+				s.logger.Warn().Err(passErr).Msg("Scheduled edge sync pass failed; retrying after the configured backoff")
 				resetSchedulerTimer(timer, s.retryInterval)
 				continue
 			}
