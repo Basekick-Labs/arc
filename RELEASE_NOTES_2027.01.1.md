@@ -152,6 +152,21 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Float-to-integer conversion rejects the rounded upper bound and NaN ([#936](https://github.com/Basekick-Labs/arc/pull/936))
+
+Converting `math.MaxInt64` to a float rounds it to `2^63`, so the previous
+bounds check accepted that out-of-range value; NaN also passed the comparisons.
+Both now fail conversion to `int64`. The MessagePack typed decoder shares the
+same guard, so single-map columnar payloads follow the same rejection rules as
+the generic conversion path used for batch and array payloads and when decimal
+columns are configured. Invalid values in integer-inferred columns return an
+error instead of being silently converted to an architecture-dependent integer.
+
+Finite values in the valid range still truncate toward zero. Infinities and
+values beyond the boundaries remain rejected, as before.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#936](https://github.com/Basekick-Labs/arc/pull/936).
+
 ### Query path extraction no longer folds backslashes ([#750](https://github.com/Basekick-Labs/arc/issues/750))
 
 Query tier selection no longer converts backslashes in storage keys into path
