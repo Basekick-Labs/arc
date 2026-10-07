@@ -711,6 +711,14 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 		}
 	}
 
+	// The cold-tier gap (#1085 stage B3), with the other pre-copy decisions
+	// and for the same reason: a tier-metadata read that failed after the data
+	// copy would be a query failure over a <id>/data/ nobody can list. OUTSIDE
+	// the Iceberg guard above on purpose — an unscoped backup of a tiered
+	// deployment with Iceberg off is the common case, and it has the same gap.
+	// Never fails the run; see countColdFilesExcluded.
+	m.countColdFilesExcluded(ctx, run, sc)
+
 	// Progress total includes Iceberg metadata files (copied in step 2b) and
 	// compaction state (step 1b) so ProcessedFiles never exceeds TotalFiles.
 	// The manifest inventory (TotalFiles) counts only data files.

@@ -424,6 +424,84 @@ func (s *MetadataStore) GetFilesInTier(ctx context.Context, tier Tier) ([]FileMe
 	return s.scanFiles(rows)
 }
 
+// CountFilesInTierByDatabase counts the rows a tier holds, grouped by
+// database, in ONE query (#1085 stage B3). It backs the backup manifest's
+// cold_files_excluded marker: how many files a backup is NOT carrying because
+// they have been migrated out of hot storage.
+//
+// Grouped rather than one count per database on purpose. The set a caller
+// wants is "every database with rows in this tier", and that set is not the
+// backup inventory: a fully cold database has no hot files at all, so it is
+// absent from a backup listing and from the manifest inventory while still
+// holding the rows this counts. Returning the group means the caller never has
+// to discover the set first, and it cannot half-fail the way N point queries
+// can.
+//
+// Quarantined rows are excluded, as in GetFilesOlderThan: a quarantined file
+// is one tiering has established it can never act on (#758), so it is not a
+// file a backup is missing. Defensive today — quarantineCandidate leaves the
+// row in the HOT tier (migrator.go) — and correct if that ever changes.
+//
+// Measured, not assumed, on this schema at 200k rows with a third of them
+// cold, before and after ANALYZE (which changes nothing, and which nothing in
+// Arc runs anyway):
+//
+//	SEARCH tier_files USING INDEX idx_tier_files_tier (tier=?)
+//	USE TEMP B-TREE FOR GROUP BY                          ~21 ms
+//
+// idx_tier_files_database_tier is not picked, in either state: tier is that
+// index's SECOND column, so tier = ? cannot seek it. Forcing it with INDEXED BY
+// gives a full SCAN of the index — no temp b-tree, since the index is already
+// in database order, but every row visited including hot and a table lookup for
+// quarantined_at on each match, which no index covers. It loses by ~1.5x.
+//
+// This is NOT the fastest plan available, and the comment says so rather than
+// claiming optimality, because the next person to read it will otherwise
+// conclude nothing better exists. A covering index on
+// (tier, database, quarantined_at) seeks on the leading column, needs no temp
+// b-tree and no table lookups, is picked WITHOUT ANALYZE, and is ~6x faster
+// (~21 ms down to ~3 ms). It is deliberately not added: it costs ~7% of the
+// database file and a sixth b-tree to maintain on tier_files, which the ingest
+// flush path writes to on every file registration, and it buys ~18 ms ONCE per
+// backup run — on an operation that copies gigabytes over minutes. Wrong trade
+// today.
+//
+// The scale at which to revisit it: the read is linear in matched rows, about
+// 330 ns each, and it holds the shared SQLite connection for its duration
+// (the pool is SetMaxOpenConns(1)), so it stalls auth, audit and tier
+// registration for as long as it runs. At 1M cold rows that is ~330 ms once
+// per backup, which is where the covering index stops being a bad trade.
+func (s *MetadataStore) CountFilesInTierByDatabase(ctx context.Context, tier Tier) (map[string]int64, error) {
+	query := `
+		SELECT database, COUNT(*)
+		FROM tier_files
+		WHERE tier = ? AND quarantined_at IS NULL
+		GROUP BY database
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, string(tier))
+	if err != nil {
+		return nil, fmt.Errorf("failed to count files by database in tier: %w", err)
+	}
+	defer rows.Close()
+
+	counts := map[string]int64{}
+	for rows.Next() {
+		var database string
+		var n int64
+		if err := rows.Scan(&database, &n); err != nil {
+			return nil, fmt.Errorf("failed to scan tier file count: %w", err)
+		}
+		counts[database] = n
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating tier file counts: %w", err)
+	}
+
+	return counts, nil
+}
+
 // GetFilesOlderThan retrieves files in a tier older than the specified age.
 // Quarantined rows are excluded: this is the migration candidate query, and a
 // quarantined file is one tiering has established it can never act on (#758).

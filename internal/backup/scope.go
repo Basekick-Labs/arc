@@ -220,6 +220,32 @@ func (m *Manager) SetTierLookup(l TierLookup) {
 	m.tierLookup = l
 }
 
+// ColdCounter reports how many cold-tier files this node's tier metadata
+// holds, grouped by database. It is how a backup records the files it is NOT
+// carrying: cold-tier objects are not copied yet (#1085 stage C), so a backup
+// of a tiered deployment is complete only with respect to hot storage, and the
+// count is the size of that gap.
+//
+// One grouped query (tiering.MetadataStore.CountFilesInTierByDatabase), not
+// one per database, because the set that matters is "every database with cold
+// rows" and that is not the backup inventory — a fully cold database has no
+// hot files and so appears in neither. Nil when tiering is off, where no file
+// can be cold. Independent of TierRecorder and TierLookup in the wiring,
+// though cmd/arc attaches all three from the same tiering manager.
+type ColdCounter interface {
+	CountColdFilesByDatabase(ctx context.Context) (map[string]int64, error)
+}
+
+// SetColdCounter wires this node's tier metadata for the cold-file marker.
+// Nil is ignored, as SetTierLookup; a caller holding a typed nil pointer must
+// check for nil itself (#713).
+func (m *Manager) SetColdCounter(c ColdCounter) {
+	if c == nil {
+		return
+	}
+	m.coldCounter = c
+}
+
 // ClusterManifestWired reports whether the Raft file manifest is attached.
 // The API layer resolves a scoped restore mode from this, not from the
 // presence of a cluster coordinator: the two differ on a cluster node without
