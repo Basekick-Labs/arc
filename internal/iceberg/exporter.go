@@ -80,6 +80,12 @@ type Exporter struct {
 	hintFailMu  sync.Mutex
 	hintFailure bool
 
+	// collapseThreshold is the manifest count at which a pass also collapses the manifest set
+	// (see manifestCollapseThreshold). A field rather than a bare constant so a test can raise it
+	// out of reach or lower it to 1 without a mutable package variable; nothing outside this
+	// package sets it.
+	collapseThreshold int
+
 	// orphanSweepEnabled gates sweepOrphanMetadata (iceberg.orphan_sweep_enabled).
 	// orphanGrace is the minimum age an unreachable .avro must reach before the
 	// sweep deletes it. Both are set once at wiring time (ConfigureOrphanSweep)
@@ -141,6 +147,7 @@ func NewExporter(db *sql.DB, backend storage.Backend, warehouse, nsPrefix string
 		// manifest written moments ago by a commit that has not landed yet.
 		orphanSweepEnabled: true,
 		orphanGrace:        minOrphanGrace,
+		collapseThreshold:  manifestCollapseThreshold,
 	}, nil
 }
 
@@ -575,7 +582,12 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 	// is a ROW-level predicate that rewrites partially-matching files — wrong here; we drop
 	// whole files that Arc already removed from storage.) A rewritten path appears in both
 	// lists and is removed before it is added, inside the same transaction.
-	committed, skipped, err := e.replaceDataFilesResilient(ctx, tbl, toRemove, toAdd, database, measurement)
+	//
+	// The manifest collapse (#1106) is decided HERE, not inside, for two reasons: it reads the
+	// CURRENT snapshot and the pass cannot be re-driven once ReplaceDataFiles has staged, and
+	// len(want) — the live file set this pass is driving the table to — is only in scope here.
+	collapse := e.shouldCollapse(ctx, tbl, len(want), database, measurement)
+	committed, skipped, err := e.replaceDataFilesResilient(ctx, tbl, toRemove, toAdd, database, measurement, collapse, len(want))
 	if err != nil {
 		return false, err
 	}
@@ -630,8 +642,13 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 //     snapshot does, until it expires. The property is switched back off in the same
 //     transaction — see manifestMergeOn for why it must not stay on.
 //
+// When collapse is set the transaction also gets a merge-enabled append that rewrites the whole
+// manifest set into one (#1106), staged after the diff and before Commit, whichever of the paths
+// above staged it. The caller decides — see shouldCollapse for the conditions. It is cleared if
+// the "already referenced" branch ran, because that branch's merged add has already done it.
+//
 // Returns the committed table and the paths skipped for partition reasons.
-func (e *Exporter) replaceDataFilesResilient(ctx context.Context, tbl *icetable.Table, toRemove, toAdd []string, database, measurement string) (*icetable.Table, []string, error) {
+func (e *Exporter) replaceDataFilesResilient(ctx context.Context, tbl *icetable.Table, toRemove, toAdd []string, database, measurement string, collapse bool, liveAfter int) (*icetable.Table, []string, error) {
 	txn := tbl.NewTransaction()
 	// ReplaceDataFiles validates both lists against the current snapshot before it stages
 	// anything, so on the "already referenced" refusal the transaction is still clean and can
@@ -644,6 +661,13 @@ func (e *Exporter) replaceDataFilesResilient(ctx context.Context, tbl *icetable.
 		}
 		if err == nil {
 			err = e.addFilesMerging(ctx, txn, toAdd, database, measurement)
+			if err == nil {
+				// That WAS the collapse: addFilesMerging runs the same merge producer with the
+				// same properties, so the manifest set is already one manifest. A collapse on top
+				// would stage a third snapshot whose merge is a no-op and still write a manifest
+				// list and an .avro for it.
+				collapse = false
+			}
 		}
 	}
 	if err != nil {
@@ -651,9 +675,17 @@ func (e *Exporter) replaceDataFilesResilient(ctx context.Context, tbl *icetable.
 			return nil, nil, fmt.Errorf("iceberg ReplaceDataFiles (add=%d remove=%d): %w", len(toAdd), len(toRemove), err)
 		}
 		// The staged transaction is dropped: iceberg-go already wrote its manifests to the
-		// warehouse, and nothing reclaims them (same residue as before this change; see
-		// expireSnapshots). The property toggle lives only in the dropped transaction.
-		return e.replaceDataFilesOneByOne(ctx, tbl, toRemove, toAdd, database, measurement)
+		// warehouse, and no commit will ever reference them. sweepOrphanMetadata reclaims them
+		// once they pass its grace window (#835) — it names this case as a reason it exists. The
+		// collapse adds nothing here: it is staged only after staging succeeded, so a transaction
+		// dropped on this branch contains no collapse work. The property toggle lives only in the
+		// dropped transaction.
+		return e.replaceDataFilesOneByOne(ctx, tbl, toRemove, toAdd, database, measurement, collapse, liveAfter)
+	}
+	if collapse {
+		if err := e.collapseManifests(ctx, txn, database, measurement); err != nil {
+			return nil, nil, err
+		}
 	}
 	committed, err := txn.Commit(ctx)
 	if err != nil {
@@ -666,7 +698,11 @@ func (e *Exporter) replaceDataFilesResilient(ctx context.Context, tbl *icetable.
 // removes, then one AddFiles per file so a straddling file is skipped instead of failing the
 // batch. Files refused for stale DELETED history are collected and added in ONE merged step at
 // the end (each merged add rewrites the manifest set, so they must not go one by one).
-func (e *Exporter) replaceDataFilesOneByOne(ctx context.Context, tbl *icetable.Table, toRemove, toAdd []string, database, measurement string) (*icetable.Table, []string, error) {
+//
+// collapse carries the caller's manifest-collapse decision (#1106) into this path, and is honoured
+// here for the reason given at its use below. A merged add for stale DELETED history clears it,
+// since that add already collapses the set.
+func (e *Exporter) replaceDataFilesOneByOne(ctx context.Context, tbl *icetable.Table, toRemove, toAdd []string, database, measurement string, collapse bool, liveAfter int) (*icetable.Table, []string, error) {
 	txn := tbl.NewTransaction()
 	if len(toRemove) > 0 {
 		if err := txn.ReplaceDataFiles(ctx, toRemove, nil, nil); err != nil {
@@ -692,6 +728,23 @@ func (e *Exporter) replaceDataFilesOneByOne(ctx context.Context, tbl *icetable.T
 		// any other add error and is retried next tick.
 		if err := e.addFilesMerging(ctx, txn, referenced, database, measurement); err != nil {
 			return nil, nil, fmt.Errorf("iceberg add with merge (files=%d): %w", len(referenced), err)
+		}
+		collapse = false // the merged add already collapsed the set — see replaceDataFilesResilient
+	}
+	// liveAfter counted the files the pass INTENDED to register; the ones skipped here never make
+	// it into the table, so a pass whose every survivor is unmappable leaves the table empty after
+	// all and must not collapse — see shouldCollapse for what an all-DELETED merge does. The
+	// caller's guard cannot see this: it runs before the skips are known.
+	if collapse && liveAfter-len(skipped) <= 0 {
+		collapse = false
+	}
+	if collapse {
+		// This path is the package's heaviest manifest producer — one snapshot AND one manifest
+		// per added file — and it is sticky: a straddling file is never registered, so it is back
+		// in toAdd on every later pass and the measurement takes this path for good. Exempting it
+		// from the collapse would exempt exactly the table that needs it most.
+		if err := e.collapseManifests(ctx, txn, database, measurement); err != nil {
+			return nil, nil, err
 		}
 	}
 	committed, err := txn.Commit(ctx)
@@ -723,6 +776,130 @@ func (e *Exporter) addFilesMerging(ctx context.Context, txn *icetable.Transactio
 	return nil
 }
 
+// manifestCollapseThreshold is the number of data manifests in the current snapshot at which a
+// reconcile pass also collapses them into one (see collapseManifests). Every figure below is
+// reproducible from internal/iceberg/deleted_manifest_cost_test.go; measured local backend, Apple
+// silicon, so read the ratios rather than the absolute milliseconds.
+//
+// What the pile costs, per accumulated manifest: ~1.6 ms per reconcile pass and ~0.13 ms per
+// reader PlanFiles. BOTH slopes are independent of the table size (1.62 vs 1.58 ms/manifest at 300
+// and 5000 live files) — it is per-manifest open overhead, not per-entry work.
+//
+// What a collapse costs, as the marginal cost over the ordinary pass it replaces, measured where
+// there is nothing to collapse yet (5 manifests) so the pile's own scan cost cannot flatter it:
+// 8 ms at 300 live files, 13 ms at 1000, 52 ms at 5000, 61 ms at 10 000 — about 5 ms + 6 ms per
+// 1000 live files, linear in table size because it rewrites the whole live set into one manifest.
+//
+// Manifests grow by two per removal pass, so between collapses the count averages ~T/2 and the
+// amortised per-pass cost is 0.8*T + 2*C(N)/T, minimised at T = sqrt(2.5*C(N)): 4.5 at 300 live
+// files, 5.7 at 1000, 11.4 at 5000, 12.3 at 10 000. Twelve is optimal at the large end of that
+// range and within ~1.5x of optimal at the small end, where the absolute cost is small anyway.
+//
+// Two things that look like they should lower the threshold and do not. Reader plan time is paid
+// per query rather than per pass, but at 5 manifests it is already indistinguishable from one
+// manifest (2.26 vs 2.06 ms at 300 files, 18.85 vs 18.77 ms at 5000), so there is nothing to buy
+// below ~10. And a collapse pass is not merely affordable once the pile exists, it is CHEAPER than
+// the ordinary pass it replaces above ~2000 live files (175 vs 210 ms at 5000, 244 vs 352 ms at
+// 10 000, both at 33 manifests), because it trades 33 manifest writes for one. That makes the
+// threshold a bound on how long the pile is tolerated, not a budget to be spent carefully.
+//
+// It is deliberately not a config key: the only consequence of a wrong value is a slower or a more
+// frequent collapse, never data loss, so there is no operator decision to expose. Contrast
+// iceberg.orphan_sweep_enabled, which gates irreversible deletion.
+const manifestCollapseThreshold = 12
+
+// shouldCollapse reports whether this pass should also collapse the table's manifest set.
+// liveAfter is the number of data files the pass is driving the table to — len(want) at the call
+// site, not the count it has now.
+//
+// It reads the manifest list of the CURRENT snapshot: one local file open (Iceberg export requires
+// storage.backend="local"), uncached and side-effect free. It must be called before the pass
+// stages anything, because after a successful ReplaceDataFiles the transaction can no longer be
+// re-driven.
+//
+// Two conditions beyond the threshold, both load-bearing:
+//
+//   - liveAfter > 0. A pass that empties the measurement (the scheduler's all-data-files-gone
+//     branch reconciles the table to EMPTY rather than leave it pointing at deleted paths) stages
+//     an overwrite in which EVERY entry is DELETED and attributed to the overwrite's snapshot, not
+//     the collapse's. manifestMergeManager.createManifest keeps a DELETED entry only when it
+//     belongs to the snapshot being written, so the merge would drop all of them and write an
+//     empty manifest — which iceberg-go refuses outright ("empty manifest file has been written",
+//     ManifestWriter.Close). That error fails the pass, and the scheduler caches no fingerprint
+//     for a failed pass, so the SAME pass fails on every tick from then on: the table points at
+//     deleted files forever, which is the exact harm that branch exists to prevent. One surviving
+//     file is enough to make the merge legal; zero is not.
+//
+//   - Only DATA manifests are counted. The merge producer merges data manifests and passes delete
+//     manifests through untouched, so counting those would compare a number the collapse cannot
+//     reduce against the threshold — and a table carrying threshold-many unmergeable manifests
+//     would then collapse on EVERY pass, which is the O(files)-of-metadata-per-pass cost that
+//     manifestMergeOn's comment exists to rule out. Arc writes no delete files; another engine
+//     writing merge-on-read deletes into the table would.
+//
+// Fails open: a nil snapshot or any read error means "no collapse", which is exactly the behaviour
+// before this change. A table whose metadata cannot be inspected is not one to start rewriting
+// manifests on.
+func (e *Exporter) shouldCollapse(ctx context.Context, tbl *icetable.Table, liveAfter int, database, measurement string) bool {
+	if e.collapseThreshold <= 0 || liveAfter == 0 {
+		return false
+	}
+	snap := tbl.CurrentSnapshot()
+	if snap == nil {
+		return false
+	}
+	fio, err := tbl.FS(ctx)
+	if err != nil {
+		e.logger.Debug().Err(err).
+			Str("database", database).Str("measurement", measurement).
+			Msg("Iceberg: cannot open table filesystem to count manifests, skipping collapse")
+		return false
+	}
+	manifests, err := snap.Manifests(fio)
+	if err != nil {
+		e.logger.Debug().Err(err).
+			Str("database", database).Str("measurement", measurement).
+			Msg("Iceberg: cannot read manifest list, skipping collapse")
+		return false
+	}
+	data := 0
+	for _, m := range manifests {
+		if m.ManifestContent() == iceberg.ManifestContentData {
+			data++
+		}
+	}
+	return data >= e.collapseThreshold
+}
+
+// collapseManifests appends a merge-enabled append to the transaction that rewrites every data
+// manifest of the table into one, shedding the DELETED entries every earlier pass left behind
+// (#1106). It adds NO files: AddFiles with no paths still commits, because iceberg-go skips only
+// the new-manifest producer when nothing was appended and runs the merge over the inherited set
+// regardless. So the collapse rides on any pass — mixed, add-only or removal-only — which matters
+// because retention alone produces removal-only passes on a measurement that gained no file since
+// the last tick, and those are exactly the passes that accumulate the pile with no relief.
+//
+// It lands as its own snapshot after whatever the pass staged, inside the same commit, so readers
+// of the current snapshot never observe an intermediate state. The duplicate check is off because
+// there is nothing to check: no paths are being added.
+//
+// The property toggle is staged metadata — a dropped transaction leaves the table as it was.
+func (e *Exporter) collapseManifests(ctx context.Context, txn *icetable.Transaction, database, measurement string) error {
+	if err := txn.SetProperties(manifestMergeOn()); err != nil {
+		return fmt.Errorf("iceberg enable manifest merge for collapse: %w", err)
+	}
+	if err := txn.AddFiles(ctx, nil, nil, true); err != nil {
+		return fmt.Errorf("iceberg collapse manifests: %w", err)
+	}
+	if err := txn.SetProperties(manifestMergeOff()); err != nil {
+		return fmt.Errorf("iceberg disable manifest merge after collapse: %w", err)
+	}
+	e.logger.Info().
+		Str("database", database).Str("measurement", measurement).Int("threshold", e.collapseThreshold).
+		Msg("Iceberg: collapsed the manifest set (merged every data manifest into one)")
+	return nil
+}
+
 // manifestMergeOn is the property set that makes iceberg-go's append use its merge producer
 // for the commit in flight: merge whenever the new manifest shares a bin with at least one
 // existing one, and make the bin big enough (1 GiB, ~3M entries) that every manifest of the
@@ -730,14 +907,22 @@ func (e *Exporter) addFilesMerging(ctx context.Context, txn *icetable.Transactio
 // manifest left alone would make the next removal of that path fail. The merged manifest
 // keeps DELETED entries only of the snapshot being written, which is what sheds the history.
 //
-// It is enabled per transaction, never left on the table: with merging on, every append
-// commit would rewrite the whole manifest set (O(files) of metadata per pass), and Arc expires
-// snapshots without deleting their orphaned manifests (see expireSnapshots), so that residue
-// would grow without bound and be copied into every backup. Merging once still has a tail:
-// the table's live file list then sits in one manifest, and every later removal pass rewrites
-// that manifest minus the removed entries until they age out (#835). iceberg-go v0.6.0 has no
-// RemoveProperties on a transaction, so manifestMergeOff resets only the enabled flag; the
-// min-count and target-size keys stay on the table and are inert while merging is off.
+// It is enabled per transaction, never left on the table: with merging on, EVERY append commit
+// would rewrite the whole manifest set, O(files) of metadata per pass, with nothing to show for it
+// on a table whose manifest count is already low. That is the cost the threshold in
+// manifestCollapseThreshold exists to ration — and the reason shouldCollapse counts only the
+// manifests the merge can actually shed, since a count it cannot reduce would re-create exactly
+// this per-pass rewrite.
+//
+// Merging leaves the table's live file list in one manifest, so every later removal pass rewrites
+// that one manifest. Measured: that is not a new cost — an Arc table has had that shape since its
+// first commit put the whole file set in one manifest, and post-collapse pass cost tracks manifest
+// count on the same curve as pre-collapse (see the plan for #1106). The superseded manifests are
+// reclaimed by sweepOrphanMetadata (#835), except where an operator has turned that sweep off.
+//
+// iceberg-go v0.6.0 has no RemoveProperties on a transaction, so the min-count and target-size
+// keys cannot be deleted once set; manifestMergeOff writes iceberg-go's own defaults back under
+// them rather than leaving these values as the table standing policy.
 func manifestMergeOn() iceberg.Properties {
 	return iceberg.Properties{
 		icetable.ManifestMergeEnabledKey:    "true",
@@ -746,9 +931,21 @@ func manifestMergeOn() iceberg.Properties {
 	}
 }
 
-// manifestMergeOff restores the default (fast-append) producer for later commits.
+// manifestMergeOff restores the default (fast-append) producer for later commits, and puts
+// iceberg-go's own defaults back under the min-count/target-size keys. v0.6.0 has no
+// RemoveProperties on a transaction, so those two keys cannot be deleted once set; left at
+// manifestMergeOn's values they would stay on the table as its standing merge policy. They are
+// inert for Arc (only newMergeAppendFilesProducer reads them, and it is never constructed while
+// merging is off) but they are visible table properties, and another engine writing the table
+// would honour a 1 GiB manifest target and a min-merge-count of 2 as if Arc had chosen them for
+// it. Before the manifest collapse only #633 tables ever carried them; now nearly every exported
+// table would.
 func manifestMergeOff() iceberg.Properties {
-	return iceberg.Properties{icetable.ManifestMergeEnabledKey: "false"}
+	return iceberg.Properties{
+		icetable.ManifestMergeEnabledKey:    "false",
+		icetable.ManifestMinMergeCountKey:   strconv.Itoa(icetable.ManifestMinMergeCountDefault),
+		icetable.ManifestTargetSizeBytesKey: strconv.Itoa(icetable.ManifestTargetSizeBytesDefault),
+	}
 }
 
 // isAlreadyReferencedError reports iceberg-go's refusal to add a path that some manifest entry

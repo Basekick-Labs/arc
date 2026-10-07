@@ -233,10 +233,61 @@ Set `iceberg.orphan_sweep_enabled = false` to restore the previous behaviour. It
 in the exporter whose work nothing regenerates, so it has an off switch; Arc logs a warning at
 startup when it is off.
 
-The second half of #835 — iceberg-go carrying forward manifests that hold only DELETED entries, so
-the live manifest list grows with the removal history and readers open every one when planning — is
-tracked in [#1106](https://github.com/Basekick-Labs/arc/issues/1106). It is a planning cost, not
-disk growth, and the fix belongs upstream.
+The second half of #835 is fixed below in
+[#1106](https://github.com/Basekick-Labs/arc/issues/1106). Two claims made here when #835 shipped
+turned out to be wrong once measured: it is not only a planning cost (the larger cost is on Arc's
+own commit path), and the fix does not belong upstream (an upstream fix removes half the growth).
+
+### Iceberg export keeps a table's manifest set bounded ([#1106](https://github.com/Basekick-Labs/arc/issues/1106))
+
+Every reconcile pass that removed a file added **two** manifests to the table and nothing ever shed
+one: the manifest holding the removed entry, rewritten with that entry marked DELETED, plus this
+pass's additions in a new manifest. iceberg-go carries every untouched manifest into the next
+snapshot verbatim, so the set only grew — on the order of 48-96 manifests a day on a measurement
+with hourly compaction and daily retention, forever.
+
+Measured on a 300-file table, one file swapped per pass, so only the inherited manifests grow:
+
+| removal passes | manifests | reconcile pass | scan plan |
+|---|---|---|---|
+| 1 | 3 | 20 ms | 2.3 ms |
+| 16 | 33 | 71 ms | 7.0 ms |
+| 64 | 129 | 230 ms | 19.2 ms |
+| 80 | 161 | 276 ms | 21.8 ms |
+
+Both costs grow at ~1.6 ms per manifest per reconcile pass and ~0.13 ms per manifest per scan plan,
+and both slopes are independent of the table size — it is per-manifest open overhead, not per-entry
+work. The larger of the two is Arc's own write path: a pass has to read every manifest to find the
+ones holding the files it is removing, so pass cost grows quadratically with the number of passes.
+The scan-plan cost is paid by every reader of the table — DuckDB, Spark, Trino — on every query.
+
+A pass that finds the table at 12 data manifests or more now also merges them into one, in the same
+commit, and both figures return to their one-manifest baseline. The merge adds 8 ms to a pass on a
+300-file table and 61 ms on a 10 000-file one — it rewrites the live set, so its cost grows with the
+table while the saving does not, and that is where the threshold of 12 comes from. Once a pile has
+actually built up the merge is not merely affordable: above ~2000 live files the merging pass is
+*cheaper* than the ordinary pass it replaces (244 ms against 352 ms at 10 000 files), because it
+trades 33 manifest writes for one.
+
+It applies to any pass — additions, removals, or both — so a measurement that only loses files to
+retention is covered too. The one pass it deliberately skips is the one that leaves a
+measurement empty — whether because every data file is gone, or because the only candidates left
+are files Arc cannot map to a partition and has to skip. With no live files there is nothing for a
+merged manifest to hold, and Iceberg rejects an empty one.
+
+The threshold is not configurable: a wrong value means a slower or a more frequent merge, never
+data loss.
+
+Two notes for operators of large tables. A merged table's whole live file list sits in one manifest
+file, so a backup of the Iceberg warehouse sees fewer, larger `.avro` files. And a merge pass writes
+the manifest set twice within its commit; the superseded copy is reclaimed by the orphan sweep from
+#835 above, once the metadata versions referencing it retire. If you have turned that sweep off
+with `iceberg.orphan_sweep_enabled = false`, this residue is permanent like the rest of it — a
+merge pass is a new, modest contributor to the growth that switch accepts. One consequence worth
+knowing: a merged table's live file list is concentrated in a single manifest, so where losing one
+manifest used to cost a fraction of the file list it now costs all of it, and nothing re-registers
+a lost manifest.
+
 ### A backup fails loudly when compaction recovery state cannot be copied ([#1100](https://github.com/Basekick-Labs/arc/issues/1100))
 
 Object stores cap a key at 1024 bytes, and a backup writes every source key
@@ -613,6 +664,26 @@ contain dots, so distinct pseudo-database names can collide. A regression test
 documents the collision; runtime behavior is unchanged.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#920](https://github.com/Basekick-Labs/arc/pull/920).
+
+### Iceberg manifest merging no longer leaves its tuning on the table (#1106)
+
+`manifestMergeOn` sets `commit.manifest.min-count-to-merge=2` and
+`commit.manifest.target-size-bytes=1 GiB` for the commit in flight. iceberg-go v0.6.0 has no way to
+remove a property from a transaction, so those keys stayed on the table after the commit; until now
+that only happened on tables that had hit #633, and from this release nearly every exported table
+commits through that path. They are inert for Arc, but they are visible table properties that
+another engine writing the table would honour as if Arc had chosen them for it. `manifestMergeOff`
+now writes iceberg-go's own defaults back (100 and 8 MiB).
+
+The per-file fallback for day-straddling files (`replaceDataFilesOneByOne`) stages one snapshot and
+one manifest per added file, and the path is sticky — a straddling file is never registered, so it
+is back in the diff on every later pass. It takes the manifest merge too; it was the package's
+heaviest manifest producer and would otherwise have been the one path exempt.
+
+`internal/iceberg/deleted_manifest_cost_test.go` is the measurement harness behind the figures
+quoted for #1106, from 30 to 10 000 live files. It is opt-in — set
+`ARC_ICEBERG_MANIFEST_BENCH=1` to run it — because CI runs the whole suite under `-race` without
+`-short`, and these tests take minutes each.
 
 ### One shared constructor for storage backends ([#1085](https://github.com/Basekick-Labs/arc/issues/1085))
 
