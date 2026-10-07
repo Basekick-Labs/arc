@@ -75,8 +75,8 @@ func TestRunCatchUpKeepsSizeOnlyFastPathWithoutSnapshot(t *testing.T) {
 	defer p.Stop()
 
 	p.RunCatchUp(context.Background(), sliceFetcher([]*raft.FileEntry{entry}))
-	stats := waitStats(t, p, func(s map[string]int64) bool { return s["catchup_skipped_local"] == 1 })
-	if stats["catchup_skipped_local"] != 1 {
+	stats := waitStats(t, p, func(s map[string]int64) bool { return s["skipped_local"] == 1 })
+	if stats["skipped_local"] != 1 {
 		t.Fatalf("normal catch-up did not keep size-only fast path: %+v", stats)
 	}
 	if fetcher.calls.Load() != 0 {
@@ -101,8 +101,8 @@ func TestRunCatchUpSkipsSameSizeMatchingCopy(t *testing.T) {
 	defer p.Stop()
 
 	p.RunCatchUpWithContentVerification(context.Background(), sliceFetcher([]*raft.FileEntry{entry}))
-	stats := p.Stats()
-	if stats["catchup_skipped_local"] != 1 {
+	stats := waitStats(t, p, func(s map[string]int64) bool { return s["skipped_local"] == 1 })
+	if stats["skipped_local"] != 1 {
 		t.Fatalf("matching file was not skipped: %+v", stats)
 	}
 	if fetcher.calls.Load() != 0 {
