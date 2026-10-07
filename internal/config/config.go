@@ -656,13 +656,28 @@ type QueryManagementConfig struct {
 }
 
 type BackupConfig struct {
-	Enabled   bool   // Enable backup/restore API
+	Enabled bool // Enable backup/restore API
+	// LocalPath is the local directory a backup is written to when no target
+	// is configured. It is IGNORED, and the directory is never created, once
+	// DefaultTarget names a target (#1085 stage B2b-1): a deployment whose
+	// backups go to an object store has no reason to grow an empty
+	// ./data/backups, which LocalBackend's constructor would otherwise create
+	// at every boot.
 	LocalPath string // Local directory for backups (default: "./data/backups")
 	// OperationTimeout bounds one backup or one restore run. Both API routes
 	// detach from the request context (Fiber recycles it), so this is the only
 	// thing that stops a wedged run from holding the single-operation lock
 	// forever. Parsed from backup.operation_timeout; always positive.
 	OperationTimeout time.Duration
+	// DefaultTarget names the target in Targets that every backup is written
+	// to, or "" for the LocalPath destination that predates targets. A
+	// configured target with no DefaultTarget pointing at it is a load-time
+	// error, not a silent fall back to LocalPath — see validateBackupTargets.
+	DefaultTarget string
+	// Targets holds the configured backup destinations, keyed by name. At
+	// most one in this release. Nil when none is configured, which is the
+	// shape every deployment has today.
+	Targets map[string]BackupTargetConfig
 }
 
 // ClusterConfig holds configuration for Arc clustering (Enterprise feature)
@@ -860,6 +875,14 @@ func Load() (*Config, error) {
 		)
 	}
 
+	// Backup targets (#1085 stage B2b-1). Discovered before the struct is
+	// built because discovery can fail on a target NAME, which is a load-time
+	// error like every other config shape error here.
+	backupTargets, err := loadBackupTargets(v)
+	if err != nil {
+		return nil, err
+	}
+
 	// Build config from Viper (which includes defaults + env vars)
 	cfg := &Config{
 		Server: ServerConfig{
@@ -1036,8 +1059,10 @@ func Load() (*Config, error) {
 		},
 		Backup: BackupConfig{
 			Enabled:          v.GetBool("backup.enabled"),
-			LocalPath:        v.GetString("backup.local_path"),
+			LocalPath:        strings.TrimSpace(v.GetString("backup.local_path")),
 			OperationTimeout: backupOperationTimeout,
+			DefaultTarget:    strings.ToLower(strings.TrimSpace(v.GetString("backup.default_target"))),
+			Targets:          backupTargets,
 		},
 		Metrics: MetricsConfig{
 			TimeseriesRetentionMinutes: v.GetInt("metrics.timeseries_retention_minutes"),
@@ -1332,6 +1357,25 @@ func Load() (*Config, error) {
 			}
 		default:
 			return nil, fmt.Errorf("tiered_storage.cold.enabled is true but tiered_storage.cold.backend %q is invalid; must be \"s3\" or \"azure\"", cold.Backend)
+		}
+	}
+
+	// Backup destinations (#1085 stage B2b-1), both gated on backup.enabled to
+	// match the runtime: cmd/arc/main.go builds no backup destination when the
+	// API is off, so refusing a configuration nothing would ever read is a
+	// false-positive boot failure of exactly the shape the cold-tier gate
+	// above avoids. A stray default_target left behind after disabling the
+	// interface must not stop a node from booting.
+	//
+	// Target validation first, so a malformed target is reported as itself
+	// rather than as whatever the overlap check made of it; the overlap
+	// refusal second, because it needs a resolved destination.
+	if cfg.Backup.Enabled {
+		if err := cfg.validateBackupTargets(); err != nil {
+			return nil, err
+		}
+		if err := cfg.checkBackupDestinationOverlap(); err != nil {
+			return nil, err
 		}
 	}
 
@@ -1941,6 +1985,15 @@ func setDefaults(v *viper.Viper) {
 	// Backup defaults
 	v.SetDefault("backup.enabled", true)
 	v.SetDefault("backup.local_path", "./data/backups")
+	// Backup targets (#1085 stage B2b-1). Only the two keys whose names are
+	// fixed can be defaulted here: a target's own fields are
+	// backup.targets.<name>.*, and no name exists until a config file has been
+	// read. setBackupTargetDefaults registers those per discovered target.
+	//
+	// Empty default_target means the destination is backup.local_path, exactly
+	// as before targets existed.
+	v.SetDefault("backup.default_target", "")
+	v.SetDefault("backup.target_names", "")
 	// The value both backup and restore were hardcoded to before #1085, so
 	// leaving it unset changes nothing.
 	v.SetDefault("backup.operation_timeout", "2h")

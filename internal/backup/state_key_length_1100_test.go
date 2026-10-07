@@ -196,13 +196,21 @@ func TestBackupOverlongCompactionStateKeyFailsTheRun(t *testing.T) {
 	if strings.Contains(strings.ToLower(msg), "retry") {
 		t.Errorf("error asks for a retry, but an over-long key is deterministic and a retry changes nothing; got: %s", msg)
 	}
-	// There is no operator-settable backup key prefix: the destination key is
-	// the generated backup ID plus "/data/", and a destination backend own
-	// prefix is applied below ValidateKey and does not count toward the limit.
-	// So a remedy that says to shorten it would send the operator looking for
-	// a knob that does not exist.
+	// The PER-RUN backup prefix is not a setting: it is the generated backup ID
+	// plus "/data/", so a remedy that says to shorten it would send the
+	// operator looking for a knob that does not exist.
+	//
+	// #1085 stage B2b-1 made a destination's own key prefix operator-settable
+	// (backup.targets.<name>.s3_prefix) and made it COUNT toward the limit,
+	// which it did not before — so "no operator-settable prefix exists",
+	// which this comment used to assert, is no longer true. The remedy is
+	// still a rename rather than a prefix change, because renaming the source
+	// file works at every prefix length, and max_source_key_bytes already
+	// reports the per-target figure. This manager has no target, so the figure
+	// above is the unprefixed one; the prefixed figures are pinned in
+	// TestStateKeyHeadroomShrinksByTheTargetPrefix.
 	if strings.Contains(msg, "shorten the backup prefix") {
-		t.Errorf("error prescribes shortening the backup prefix, which is not a setting; got: %s", msg)
+		t.Errorf("error prescribes shortening the per-run backup prefix, which is not a setting; got: %s", msg)
 	}
 
 	// Checked BEFORE the write: no write to that key was ever attempted. The

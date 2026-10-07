@@ -4304,9 +4304,71 @@ func main() {
 					Msg("iceberg.warehouse is not a local path; backups cannot include its table metadata")
 			}
 		}
+		// Backup destination (#1085 stage B2b-1). A configured target replaces
+		// the local directory entirely; with none, BackupPath is the
+		// destination exactly as before. config.Load has already validated the
+		// target, bounded its key prefix, and refused an overlap with primary
+		// storage or the cold tier — see
+		// config.checkBackupDestinationOverlap, which records what that
+		// refusal actually protects against: a backup that re-copies itself
+		// every run, and the reconciliation sweep deleting the backups.
+		var backupTarget *backup.Target
+		if t := cfg.Backup.DefaultBackupTarget(); t != nil {
+			keyPrefix, err := t.KeyPrefix()
+			if err != nil {
+				// Unreachable: validateBackupTargets asks for the same prefix
+				// at load and refuses a bad one. Fatal rather than silently
+				// reserving no key headroom, which would turn an overlong key
+				// from a reported skip into a failed write.
+				log.Fatal().Err(err).Str("target", t.Name).Msg("Backup target prefix is unusable")
+			}
+			backupTarget = &backup.Target{
+				Name:      t.Name,
+				Spec:      t.BackendSpec(),
+				KeyPrefix: keyPrefix,
+				Remote:    t.IsRemote(),
+			}
+		}
+
+		// Backup owner identity (#1085 stage B2b-1). The CLUSTER when
+		// clustered — a per-node identity would make every writer failover
+		// orphan its own cluster's backups — and a persisted per-instance UUID
+		// standalone. Stored BESIDE the shared database, never inside it, so a
+		// restore cannot make this instance a continuation of the one the
+		// backup came from; see internal/backup/identity.go.
+		//
+		// A failure here is a warning, not a Fatal: an unidentified instance
+		// writes manifests with no owner and reads every manifest as its own,
+		// which is exactly the behaviour of every Arc before this change. It
+		// must never stop a node from booting.
+		backupInstanceID := ""
+		if cfg.Cluster.Enabled {
+			// TRIMMED, and warned about when empty. This string reaches every
+			// manifest and is compared byte-for-byte, so a stray space on one
+			// node makes two nodes of one cluster read each other's backups as
+			// foreign — and an empty cluster name yields an empty identity,
+			// which means "unidentified" and silently disables the filter,
+			// where the standalone path at least warns.
+			//
+			// Note the switch this implies: turning clustering off moves a
+			// node from the cluster name to its own minted UUID, so its own
+			// earlier backups then read as foreign. They are still listable
+			// with include_foreign=true and still restorable; the docs say so.
+			backupInstanceID = strings.TrimSpace(cfg.Cluster.ClusterName)
+			if backupInstanceID == "" {
+				log.Warn().Msg("cluster.enabled is true but cluster.cluster_name is empty: backups will be written without an owner, so every backup at the destination will be listed as this cluster own. Set cluster.cluster_name")
+			}
+		} else if id, idErr := backup.LoadOrCreateInstanceID(cfg.Auth.DBPath); idErr != nil {
+			log.Warn().Err(idErr).Msg("Could not resolve this instance backup identity: backups will be written without an owner and every backup at the destination will be listed as this instance own")
+		} else {
+			backupInstanceID = id
+		}
+
 		backupManager, err := backup.NewManager(&backup.ManagerConfig{
 			DataStorage:            storageBackend,
 			BackupPath:             cfg.Backup.LocalPath,
+			Target:                 backupTarget,
+			InstanceID:             backupInstanceID,
 			SQLiteDBPath:           cfg.Auth.DBPath,
 			IcebergCatalogDBPath:   icebergCatalogDBPath,
 			IcebergWarehousePath:   icebergWarehousePath,
@@ -4315,7 +4377,16 @@ func main() {
 			Logger:                 logger.Get("backup"),
 		})
 		if err != nil {
-			log.Error().Err(err).Msg("Failed to initialize backup manager")
+			// This stays "log and skip the whole backup API", and with a
+			// remote target that is still right rather than merely unchanged:
+			// neither NewS3Backend nor NewAzureBlobBackend fails on an
+			// unreachable store — each probes once with a 10 s timeout and
+			// only WARNS (s3.go, azure.go) — so an error here is a
+			// configuration or credential-shape failure, which is as loud and
+			// as permanent as "the local backup directory is unwritable" was.
+			// An unreachable target therefore boots with the API up and
+			// reports per operation, which is the required behaviour.
+			log.Error().Err(err).Str("target", cfg.Backup.DefaultTarget).Msg("Failed to initialize backup manager")
 		} else {
 			backupHandler := api.NewBackupHandler(backupManager, authManager, cfg.Backup.OperationTimeout, logger.Get("backup-api"))
 			// Cluster safety (#1083). Only when the coordinator exists: an
@@ -4344,8 +4415,21 @@ func main() {
 				backupManager.SetTierLookup(tieringManager)
 			}
 			backupHandler.RegisterRoutes(server.GetApp())
-			log.Info().
-				Str("backup_path", cfg.Backup.LocalPath).
+			// backup_path is logged only when it IS the destination. Logging
+			// "./data/backups" beside a configured S3 target would say the
+			// backup goes somewhere it does not, and that directory is not
+			// even created in that configuration.
+			ready := log.Info()
+			if backupTarget != nil {
+				ready = ready.
+					Str("backup_target", backupTarget.Name).
+					Str("backup_target_type", backupTarget.Spec.Type).
+					Bool("backup_target_remote", backupTarget.Remote)
+			} else {
+				ready = ready.Str("backup_path", cfg.Backup.LocalPath)
+			}
+			ready.
+				Bool("owner_identity", backupInstanceID != "").
 				Bool("cluster_gate", clusterCoordinator != nil).
 				Bool("tier_recorder", tieringManager != nil).
 				Bool("tier_lookup", tieringManager != nil).
