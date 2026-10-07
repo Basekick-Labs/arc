@@ -260,6 +260,15 @@ would destroy a registered file to clean up a write that did no damage.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1095](https://github.com/Basekick-Labs/arc/pull/1095).
 
+### Empty Arrow IPC queries complete successfully ([#731](https://github.com/Basekick-Labs/arc/issues/731))
+
+When a measurement had no Parquet files, `POST /api/v1/query/arrow` returned
+HTTP 500 and recorded the query as failed, unlike the JSON and MessagePack
+paths. It now returns a valid empty Arrow IPC stream and records a completed
+query with zero rows. Missing field-schema anchors remain errors.
+
+Contributed by [@jallegri](https://github.com/jallegri) in [#1120](https://github.com/Basekick-Labs/arc/pull/1120).
+
 ### Backup and restore are cluster-safe ([#1083](https://github.com/Basekick-Labs/arc/issues/1083))
 
 On a cluster node a backup or a restore was undefined behaviour: any role
