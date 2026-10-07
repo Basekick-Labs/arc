@@ -238,6 +238,14 @@ The second half of #835 is fixed below in
 turned out to be wrong once measured: it is not only a planning cost (the larger cost is on Arc's
 own commit path), and the fix does not belong upstream (an upstream fix removes half the growth).
 
+The same fix was implemented independently, and three weeks earlier, by
+[@efegokdemir](https://github.com/efegokdemir) in
+[#923](https://github.com/Basekick-Labs/arc/pull/923), which was open against this issue and had not
+been reviewed when the work above started. The two designs converged on the same approach. One check
+#923 carries that the shipped sweep does not — reloading the table and re-running reachability
+immediately before deleting, so a scan that has gone stale cannot delete — is tracked in
+[#1125](https://github.com/Basekick-Labs/arc/issues/1125).
+
 ### Iceberg export keeps a table's manifest set bounded ([#1106](https://github.com/Basekick-Labs/arc/issues/1106))
 
 Every reconcile pass that removed a file added **two** manifests to the table and nothing ever shed
