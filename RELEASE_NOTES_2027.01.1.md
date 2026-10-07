@@ -152,6 +152,16 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Local storage closes appended files exactly once ([#750](https://github.com/Basekick-Labs/arc/issues/750))
+
+`LocalBackend.AppendReader` previously closed the staging file explicitly on
+successful promotion and again through a deferred call. It now closes the file
+once after each copy attempt, including failed reads, and checks close errors
+before promoting a completed transfer. Failed copies and failed closes retain
+the staging file for retry and leave an existing committed file in place.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#919](https://github.com/Basekick-Labs/arc/pull/919).
+
 ### Distinct Arrow schemas no longer share an ingest cache entry ([#750](https://github.com/Basekick-Labs/arc/issues/750))
 
 The ingest schema cache now uses deterministic, length-prefixed column identities
