@@ -595,6 +595,15 @@ thing a new maintainer has to learn, and a refactor that moves a decision from
 four places to one is worth knowing about before you go looking for it in the
 old place.
 
+### Compaction database-name sanitization is documented as non-unique ([#750](https://github.com/Basekick-Labs/arc/issues/750))
+
+The `sanitizeDBForName` comment now explains that replacing slashes with dots
+produces a path-safe token, not a unique database identity: spoke IDs may
+contain dots, so distinct pseudo-database names can collide. A regression test
+documents the collision; runtime behavior is unchanged.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#920](https://github.com/Basekick-Labs/arc/pull/920).
+
 ### One shared constructor for storage backends ([#1085](https://github.com/Basekick-Labs/arc/issues/1085))
 
 Arc talks to three kinds of storage (a local directory, S3 and compatible
