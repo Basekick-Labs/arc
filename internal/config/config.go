@@ -1666,8 +1666,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("wal.recovery_interval_seconds", 300) // Periodic recovery every 5 minutes
 	v.SetDefault("wal.recovery_batch_size", 10000)     // Max records per recovery batch (rate limiting)
 	v.SetDefault("wal.buffer_size", 10000)             // Async write buffer size in entries
-	v.SetDefault("wal.disk_high_watermark_percent", 90) // Reject writes at or above this disk usage
-	v.SetDefault("wal.disk_min_free_mb", 512)            // Reserve free space for WAL recovery
+	// WAL disk-pressure defaults preserve recovery headroom.
+	v.SetDefault("wal.disk_high_watermark_percent", 90)
+	v.SetDefault("wal.disk_min_free_mb", 512)
 
 	// Telemetry defaults
 	v.SetDefault("telemetry.enabled", true)                                               // Enabled by default (opt-out)
