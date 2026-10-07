@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/storage"
@@ -21,6 +22,10 @@ import (
 // mismatch that reproduces) still stops after this many.
 const DefaultMaxAttempts = 5
 
+// ErrAgentRunInProgress is returned when a manual or scheduled sync pass is
+// already using this agent. The caller may safely retry the pass later.
+var ErrAgentRunInProgress = errors.New("edgesync: a sync pass is already in progress")
+
 // MaxAllowedConcurrent caps simultaneous transfers regardless of configuration.
 //
 // Each transfer holds an open file handle and an io.Pipe, and a spoke is by
@@ -31,10 +36,9 @@ const MaxAllowedConcurrent = 64
 // Agent runs one sync pass: discover local files, ask the hub what it is
 // missing, and stream those files to it.
 //
-// This is the manual half of the design. §8.2 describes a connectivity-adaptive
-// background loop, but that is the Enterprise feature (§9) — here the pass is
-// triggered by an operator and runs once. The internals are the same either
-// way, so phase 2 adds a ticker and a license gate rather than a rewrite.
+// The Agent owns one pass; Scheduler drives periodic passes for Enterprise
+// spokes. Keeping the loop separate lets the manual endpoint and the
+// Enterprise scheduler share the same recovery, discovery, and transfer path.
 type Agent struct {
 	ledger    *Ledger
 	transport SyncTransport
@@ -42,6 +46,7 @@ type Agent struct {
 	hubID     string
 	spokeID   string
 	logger    zerolog.Logger
+	runActive atomic.Bool
 
 	maxAttempts   int
 	maxConcurrent int
@@ -200,6 +205,11 @@ func NewAgent(cfg AgentConfig) (*Agent, error) {
 // the hub is missing — newest first, so that if a contact window closes
 // mid-backlog the freshest telemetry has already landed.
 func (a *Agent) Run(ctx context.Context) (*RunResult, error) {
+	if !a.runActive.CompareAndSwap(false, true) {
+		return nil, ErrAgentRunInProgress
+	}
+	defer a.runActive.Store(false)
+
 	start := time.Now()
 	res := &RunResult{}
 

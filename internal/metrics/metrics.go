@@ -169,6 +169,10 @@ type Metrics struct {
 
 	// Replication metrics
 	replicationEntriesDroppedTotal atomic.Int64 // Total replication entries dropped due to full buffer
+
+	// Scheduled edge sync metrics
+	edgeSyncLastSuccessUnixSeconds atomic.Int64
+	edgeSyncFailuresTotal          atomic.Int64
 	//
 	// There is deliberately no sequence-gap counter here (#810). A gap cannot
 	// occur silently on a replication connection: the receiver requires each
@@ -531,6 +535,17 @@ func (m *Metrics) SetQueryMgmtHistorySize(n int64)   { m.queryMgmtHistorySize.St
 // Replication Metrics
 func (m *Metrics) IncReplicationEntriesDropped() { m.replicationEntriesDroppedTotal.Add(1) }
 
+// RecordEdgeSyncSuccess stores the completion time of a successful scheduled
+// spoke sync pass as a Unix timestamp in seconds.
+func (m *Metrics) RecordEdgeSyncSuccess(at time.Time) {
+	if !at.IsZero() {
+		m.edgeSyncLastSuccessUnixSeconds.Store(at.Unix())
+	}
+}
+
+// IncEdgeSyncFailure counts a scheduled spoke sync pass that returned an error.
+func (m *Metrics) IncEdgeSyncFailure() { m.edgeSyncFailuresTotal.Add(1) }
+
 // IncClusterManifestRejectedPaths increments the cluster FSM
 // path-rejection counter. Called from internal/cluster/raft/fsm.go
 // when ValidateManifestPath refuses a Register/Update/Restore path.
@@ -762,6 +777,9 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 
 		// Replication
 		"replication_entries_dropped_total": m.replicationEntriesDroppedTotal.Load(),
+		// Scheduled edge sync
+		"edge_sync_spoke_last_success_timestamp_seconds": m.edgeSyncLastSuccessUnixSeconds.Load(),
+		"edge_sync_spoke_sync_failures_total":            m.edgeSyncFailuresTotal.Load(),
 
 		// Cluster FSM security (Enterprise)
 		"cluster_manifest_rejected_paths_total":  m.clusterManifestRejectedPathsTotal.Load(),
@@ -1153,6 +1171,15 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_replication_entries_dropped_total Total replication entries dropped due to full buffer\n"...)
 	b = append(b, "# TYPE arc_replication_entries_dropped_total counter\n"...)
 	b = appendMetric(b, "arc_replication_entries_dropped_total", float64(m.replicationEntriesDroppedTotal.Load()))
+
+	// Scheduled edge sync metrics. A zero timestamp means no scheduled pass
+	// has completed successfully since this process started.
+	b = append(b, "# HELP arc_edge_sync_spoke_last_success_timestamp_seconds Unix timestamp of the last successful scheduled spoke sync pass, or 0 if none has succeeded.\n"...)
+	b = append(b, "# TYPE arc_edge_sync_spoke_last_success_timestamp_seconds gauge\n"...)
+	b = appendMetric(b, "arc_edge_sync_spoke_last_success_timestamp_seconds", float64(m.edgeSyncLastSuccessUnixSeconds.Load()))
+	b = append(b, "# HELP arc_edge_sync_spoke_sync_failures_total Scheduled spoke sync passes that failed.\n"...)
+	b = append(b, "# TYPE arc_edge_sync_spoke_sync_failures_total counter\n"...)
+	b = appendMetric(b, "arc_edge_sync_spoke_sync_failures_total", float64(m.edgeSyncFailuresTotal.Load()))
 
 	// Cluster FSM security metrics (Enterprise — see GHSA-f85q-mvg8-qf37)
 	b = append(b, "# HELP arc_cluster_manifest_rejected_paths_total Total manifest path proposals refused by the cluster FSM. Non-zero growth indicates a peer/snapshot/log entry proposed a path validation refused (URL scheme, absolute, parent-traversal, NUL, oversize).\n"...)
