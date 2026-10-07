@@ -400,9 +400,9 @@ func (m *Manager) writeSidecar(ctx context.Context, backupID string, b *sidecarB
 	if _, err := tmp.Seek(0, 0); err != nil {
 		return fmt.Errorf("failed to seek sidecar temp file: %w", err)
 	}
-	if err := m.backupStorage.WriteReader(ctx, sidecarPath(backupID), tmp, info.Size()); err != nil {
+	if err := m.destination().WriteReader(ctx, sidecarPath(backupID), tmp, info.Size()); err != nil {
 		m.cleanupPartialBackupWrite(ctx, sidecarPath(backupID))
-		return fmt.Errorf("failed to write file sidecar: %w", err)
+		return fmt.Errorf("failed to write the file sidecar to %s: %w", m.describeDestination(), err)
 	}
 	return nil
 }
@@ -411,14 +411,14 @@ func (m *Manager) writeSidecar(ctx context.Context, backupID string, b *sidecarB
 // with a nil error, when the backup has none (it predates #1083).
 func (m *Manager) readSidecar(ctx context.Context, backupID string) (entries map[string]ManifestFile, ok bool, err error) {
 	p := sidecarPath(backupID)
-	exists, err := m.backupStorage.Exists(ctx, p)
+	exists, err := m.destination().Exists(ctx, p)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to check for the file sidecar: %w", err)
 	}
 	if !exists {
 		return nil, false, nil
 	}
-	data, err := m.backupStorage.Read(ctx, p)
+	data, err := m.destination().Read(ctx, p)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to read the file sidecar: %w", err)
 	}

@@ -116,6 +116,16 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 		progress.Error = err.Error()
 		return nil, err
 	}
+	// Does the destination answer at all? Asked before any copying, because a
+	// run's first destination touch is a bulk file write under the two-hour
+	// operation timeout while the single-operation lock is held, and nothing
+	// below it sets a response timeout. See Manager.probeDestination.
+	if err := m.probeDestination(ctx, backupID); err != nil {
+		progress.Status = "failed"
+		progress.Error = err.Error()
+		return nil, err
+	}
+
 	if sc.empty() {
 		m.logger.Info().Str("backup_id", backupID).Msg("Starting backup")
 	} else {
@@ -266,6 +276,8 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 		BackupType:             "full",
 		Scope:                  sc.names,
 		ClusterManifestChecked: xc != nil,
+		Target:                 m.targetName,
+		OwnerInstanceID:        m.instanceID,
 	}
 
 	// Scoped (#1084): count the Iceberg namespace metadata left out, now,
@@ -477,6 +489,19 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 
 	// ── 4. Copy config ──────────────────────────────────────────────────
 	if opts.IncludeConfig && m.configPath != "" {
+		// The default for a remote target is false, decided at the API layer
+		// from Manager.TargetIsRemote. Reaching here with a remote target
+		// means the request asked for it explicitly, which is allowed and
+		// warned about once: arc.toml holds this target's own credentials, so
+		// the copy puts the keys to the backup store inside the backups it
+		// holds. Warn, not Debug — a compaction-subprocess lesson: Debug
+		// reaches no operator at default levels, and this is a defect-shaped
+		// outcome the operator chose.
+		if m.targetRemote {
+			m.logger.Warn().
+				Str("target", m.targetName).
+				Msg("Copying arc.toml into a remote backup target: the config file carries that target credentials, so the backup store now holds the keys that unlock it")
+		}
 		if err := m.backupConfig(ctx, backupID); err != nil {
 			m.logger.Warn().Err(err).Msg("Failed to backup config file")
 		} else {
@@ -497,6 +522,18 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	// The file sidecar goes in before the manifest: ListBackups keys on
 	// manifest.json, so a run that dies between the two leaves nothing a
 	// listing shows, rather than a listed backup a cluster restore refuses.
+	//
+	// RECORDED, NOT FIXED HERE (#1085 stage B2b-1). On a local directory those
+	// two writes are microseconds apart. On a remote target the sidecar can
+	// land and the manifest fail on a transient, and cleanupPartialBackupWrite
+	// then deletes the manifest key that never landed while the sidecar and
+	// every data file stay. ListBackups correctly does not show that run, and
+	// DeleteBackup by its ID still finds and removes it, so an operator who
+	// WATCHED the backup fail can clean it up — but nothing ENUMERATES it, so
+	// an operator who did not watch has objects at the destination that no
+	// listing mentions. Stage B2b-2's index of backups is where that gets
+	// covered; widening this stage to fix it would mean building the index
+	// here.
 	if err := m.writeSidecar(ctx, backupID, sidecar); err != nil {
 		progress.Status = "failed"
 		progress.Error = err.Error()
@@ -516,10 +553,13 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	// committed-but-unreported manifest would make a failed run look like a
 	// complete backup. Left out only to keep #1101 to the WriteReader sites it
 	// was scoped to; tracked as #1110 with the config copy in backupConfig.
-	if err := m.backupStorage.Write(ctx, manifestPath, manifestData); err != nil {
+	manifestCtx, cancelManifest := withDestinationTimeout(ctx)
+	err = m.destination().Write(manifestCtx, manifestPath, manifestData)
+	cancelManifest()
+	if err != nil {
 		progress.Status = "failed"
 		progress.Error = err.Error()
-		return nil, fmt.Errorf("failed to write manifest: %w", err)
+		return nil, fmt.Errorf("failed to write the manifest to %s: %w", m.describeDestination(), err)
 	}
 
 	progress.Status = "completed"
@@ -568,14 +608,20 @@ func (m *Manager) copyDataFiles(ctx context.Context, backupID string, files []st
 		// A legal source key can exceed the storage limit once the backup
 		// prefix is added. This predictable case is skippable; actual
 		// backup-storage write failures must still abort the run.
-		if len(destPath) > storage.MaxUsableKeyLen {
+		//
+		// The threshold is PER DESTINATION, not a constant: a target with an
+		// object-key prefix stores prefix+key, so max_source_key_bytes shrinks
+		// by the prefix. Reporting the constant promised bytes the destination
+		// could not hold, and the overrun it hid fails the write rather than
+		// skipping the file. See Manager.destinationKeyHeadroom.
+		if m.destinationKeyTooLong(destPath) {
 			skipped++
 			tally.record(obj.Path, true)
 			m.logger.Warn().
 				Str("path", obj.Path).
-				Int("destination_key_bytes", len(destPath)).
+				Int("destination_key_bytes", len(m.targetKeyPrefix)+len(destPath)).
 				Int("maximum_key_bytes", storage.MaxUsableKeyLen).
-				Int("max_source_key_bytes", storage.MaxUsableKeyLen-backupDataKeyHeadroom).
+				Int("max_source_key_bytes", m.maxSourceKeyBytes()).
 				Msg("Backup destination key too long; skipping (source keys longer than max_source_key_bytes cannot be backed up under this backup prefix)")
 			continue
 		}
@@ -837,7 +883,7 @@ func (m *Manager) checkSkipRatio(progress *Progress, totalFiles int, tally *skip
 	}
 	if float64(skipped) > maxSkipRatio*float64(totalFiles) {
 		return fmt.Errorf("backup failed: %d of %d files skipped (>%.0f%%): %s",
-			skipped, totalFiles, maxSkipRatio*100, describeSkips(skipped, tally))
+			skipped, totalFiles, maxSkipRatio*100, describeSkips(skipped, tally, m.maxSourceKeyBytes()))
 	}
 	return nil
 }
@@ -848,7 +894,9 @@ func (m *Manager) checkSkipRatio(progress *Progress, totalFiles int, tally *skip
 // read failures, vanished compaction manifests and outside-root warehouse read
 // failures alike. The byte threshold is the one the per-file warning reports as
 // max_source_key_bytes and the backup docs quote, not the destination limit.
-func describeSkips(skipped int64, tally *skipTally) string {
+// It is passed in rather than computed here because it depends on the
+// destination's own key prefix (Manager.maxSourceKeyBytes).
+func describeSkips(skipped int64, tally *skipTally, maxSourceKeyBytes int) string {
 	var overlong int64
 	if tally != nil {
 		overlong = tally.overlong
@@ -859,7 +907,7 @@ func describeSkips(skipped int64, tally *skipTally) string {
 	}
 	if overlong > 0 {
 		parts = append(parts, fmt.Sprintf("%d have source keys longer than %d bytes, which no backup destination key can hold (rename them)",
-			overlong, storage.MaxUsableKeyLen-backupDataKeyHeadroom))
+			overlong, maxSourceKeyBytes))
 	}
 	return strings.Join(parts, "; ")
 }
@@ -913,9 +961,9 @@ func (m *Manager) streamBackupFileSHA(ctx context.Context, srcPath, destPath str
 	}
 
 	// Stream from temp file to backup storage
-	if err := m.backupStorage.WriteReader(ctx, destPath, tmpFile, size); err != nil {
+	if err := m.destination().WriteReader(ctx, destPath, tmpFile, size); err != nil {
 		m.cleanupPartialBackupWrite(ctx, destPath)
-		return 0, "", fmt.Errorf("failed to write to backup storage: %w", err)
+		return 0, "", fmt.Errorf("failed to write to %s: %w", m.describeDestination(), err)
 	}
 
 	return size, hex.EncodeToString(hasher.Sum(nil)), nil
@@ -1105,7 +1153,7 @@ func (m *Manager) recheckClusterManifest(ctx context.Context, backupID string, x
 			return err
 		}
 		dest := backupID + "/data/" + row.Path
-		if err := m.backupStorage.Delete(ctx, dest); err != nil {
+		if err := m.destination().Delete(ctx, dest); err != nil {
 			return fmt.Errorf("backup failed: %s left the cluster manifest during the run and its copy could not be removed from the backup: %w", row.Path, err)
 		}
 		removeFromInventory(manifest, dbMap, row.Path, row.SizeBytes)
@@ -1278,6 +1326,35 @@ func (m *Manager) cleanupPartialWrite(ctx context.Context, backend storage.Backe
 // "<backupID>/..." for a backup ID minted by this run, so nothing but this run
 // can have put an object there, and removing it is never destructive.
 //
+// WHAT THAT INVARIANT ACTUALLY RESTS ON, corrected (#1085 stage B2b-1). An
+// earlier draft of this comment claimed the premise moved from the code to the
+// configuration once a destination could be remote. It did not. Every one of
+// the six call sites passes a key of the form "<backupID>/…" for an ID this
+// run minted, and no other writer in Arc produces that shape, so the key
+// NAMESPACE is what makes the Delete safe — and that is a property of the
+// code, unchanged by where the destination points.
+//
+// Two honest qualifications rather than an absolute. The shape is not
+// reserved: a hyphen is legal in a key segment, so a database named with the
+// exact 31-character backup-ID spelling could in principle collide, which
+// makes the namespace claim true in practice rather than by construction. And
+// it only matters at all if two stores overlap, which is the thing
+// config.checkBackupDestinationOverlap refuses.
+//
+// So the overlap refusal is still right, and it protects DIFFERENT things than
+// this function: a backup destination inside the storage root is re-copied by
+// every subsequent backup (the data listing returns every .parquet under the
+// root), which on a cluster inflates the unregistered-skip count until the
+// skip ratio refuses every replace-mode restore; and with reconciliation
+// enabled and dry-run off, the sweep DELETES the backups, because a backup
+// data key has nine segments and its managed-path heuristic triggers at seven.
+// Those are the hazards. This Delete is cheap insurance on top.
+//
+// What does follow for THIS function: with a remote target the Delete below is
+// the branch that always runs, where before it was unreachable because only
+// LocalBackend implements storage.StagingInspector (s3.go and azure.go say in
+// comments that they do not).
+//
 // What each backend actually leaves behind, established against the vendored
 // SDKs rather than assumed:
 //
@@ -1305,7 +1382,7 @@ func (m *Manager) cleanupPartialWrite(ctx context.Context, backend storage.Backe
 // Best-effort, like the staging branch: logged at Debug and never fatal. The
 // write already failed and that error is the one the caller must surface.
 func (m *Manager) cleanupPartialBackupWrite(ctx context.Context, destPath string) {
-	if si, ok := m.backupStorage.(storage.StagingInspector); ok {
+	if si, ok := m.destination().(storage.StagingInspector); ok {
 		if err := si.DeleteStaged(ctx, destPath); err != nil {
 			m.logger.Debug().
 				Str("path", destPath).
@@ -1314,7 +1391,7 @@ func (m *Manager) cleanupPartialBackupWrite(ctx context.Context, destPath string
 		}
 		return
 	}
-	if err := m.backupStorage.Delete(ctx, destPath); err != nil {
+	if err := m.destination().Delete(ctx, destPath); err != nil {
 		m.logger.Debug().
 			Str("path", destPath).
 			Err(err).
@@ -1384,9 +1461,9 @@ func (m *Manager) backupSQLiteFile(ctx context.Context, backupID, dbPath, destNa
 	defer f.Close()
 
 	destPath := fmt.Sprintf("%s/metadata/%s", backupID, destName)
-	if err := m.backupStorage.WriteReader(ctx, destPath, f, size); err != nil {
+	if err := m.destination().WriteReader(ctx, destPath, f, size); err != nil {
 		m.cleanupPartialBackupWrite(ctx, destPath)
-		return fmt.Errorf("failed to write SQLite backup: %w", err)
+		return fmt.Errorf("failed to write the SQLite backup to %s: %w", m.describeDestination(), err)
 	}
 
 	m.logger.Info().
@@ -1413,8 +1490,14 @@ func (m *Manager) backupConfig(ctx context.Context, backupID string) error {
 	destPath := fmt.Sprintf("%s/config/arc.toml", backupID)
 	// No cleanupPartialBackupWrite here either; see the manifest write and
 	// #1110.
-	if err := m.backupStorage.Write(ctx, destPath, data); err != nil {
-		return fmt.Errorf("failed to write config backup: %w", err)
+	// Bounded: arc.toml is small and fixed-size, so a minute is generous and a
+	// stalled destination must not hold the operation lock for the whole run
+	// budget. See destinationProbeTimeout.
+	writeCtx, cancel := withDestinationTimeout(ctx)
+	err = m.destination().Write(writeCtx, destPath, data)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("failed to write the config backup to %s: %w", m.describeDestination(), err)
 	}
 
 	m.logger.Info().Str("backup_id", backupID).Msg("Config file backed up")
@@ -1509,9 +1592,10 @@ func (m *Manager) copyStateFiles(ctx context.Context, backupID string, files []s
 		default:
 		}
 		destPath := fmt.Sprintf("%s/data/%s", backupID, obj.Path)
-		if len(destPath) > storage.MaxUsableKeyLen {
+		// Per-destination threshold, for the reason recorded in copyDataFiles.
+		if m.destinationKeyTooLong(destPath) {
 			return fmt.Errorf("backup failed: the backup destination key for compaction recovery state %s is too long to store (destination_key_bytes=%d, maximum_key_bytes=%d, max_source_key_bytes=%d). A restore of a backup missing it would bring back the compacted output AND the inputs it replaced with nothing to reconcile them, so that partition would serve every row twice. Rename the file under %s/ so that its SOURCE KEY is at most max_source_key_bytes bytes",
-				obj.Path, len(destPath), storage.MaxUsableKeyLen, storage.MaxUsableKeyLen-backupDataKeyHeadroom, compactionStateDir)
+				obj.Path, len(m.targetKeyPrefix)+len(destPath), storage.MaxUsableKeyLen, m.maxSourceKeyBytes(), compactionStateDir)
 		}
 		written, err := m.streamBackupFile(ctx, obj.Path, destPath)
 		if err != nil {

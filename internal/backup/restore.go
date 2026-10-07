@@ -241,6 +241,22 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 		return nil, err
 	}
 
+	// A backup another instance wrote is restorable, and that is a decision,
+	// not an oversight: restoring onto fresh hardware is what backups are
+	// for, and a refusal here would be self-locking — the replacement
+	// instance has a new identity by construction, so it could never restore
+	// the backups it exists to restore. What it gets instead is an echo loud
+	// enough to stop an operator who did not mean it, and the restore does
+	// NOT adopt the owner id (see identity.go): this instance keeps the
+	// identity it has, so the next backup it takes is its own.
+	if !m.ownsManifest(manifest) {
+		m.logger.Warn().
+			Str("backup_id", opts.BackupID).
+			Str("owner_instance_id", manifest.OwnerInstanceID).
+			Str("this_instance_id", m.instanceID).
+			Msg("Restoring a backup written by a different Arc instance: allowed, and this instance keeps its own identity, so later backups will not be listed with it")
+	}
+
 	start := m.logger.Info().Str("backup_id", opts.BackupID).Str("mode", mode)
 	if len(manifest.Scope) > 0 {
 		start = start.Strs("scope", manifest.Scope)
@@ -463,7 +479,7 @@ func checkCompactionPauseLost(pause CompactionPause, progress *Progress) error {
 func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifest *Manifest, progress *Progress, mode string, pause CompactionPause) error {
 	dataPrefix := backupID + "/data/"
 
-	files, err := m.backupStorage.List(ctx, dataPrefix)
+	files, err := m.destination().List(ctx, dataPrefix)
 	if err != nil {
 		return fmt.Errorf("failed to list backup data files: %w", err)
 	}
@@ -509,7 +525,7 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifes
 			present++
 		}
 	}
-	if ul, ok := m.backupStorage.(storage.UnusableLister); ok {
+	if ul, ok := m.destination().(storage.UnusableLister); ok {
 		hidden, err := ul.ListUnusable(ctx, dataPrefix)
 		if err != nil {
 			return fmt.Errorf("failed to inventory unlistable backup objects: %w", err)
@@ -1006,10 +1022,10 @@ func (m *Manager) consumedInputsInBackup(ctx context.Context, dataPrefix string,
 			manifests = append(manifests, f)
 		}
 	}
-	lister, canSize := m.backupStorage.(storage.ObjectLister)
+	lister, canSize := m.destination().(storage.ObjectLister)
 	skip := make(map[string]bool)
 	for _, src := range manifests {
-		data, err := m.backupStorage.Read(ctx, src)
+		data, err := m.destination().Read(ctx, src)
 		if err != nil {
 			m.logger.Warn().Err(err).Str("manifest", src).Msg("Cannot read a backed-up compaction manifest; its inputs are restored and left to recovery")
 			continue
@@ -1083,7 +1099,7 @@ func (m *Manager) streamRestoreFile(ctx context.Context, srcPath, destPath strin
 		hasher = sha256.New()
 		dst = io.MultiWriter(tw, hasher)
 	}
-	if err := m.backupStorage.ReadTo(ctx, srcPath, dst); err != nil {
+	if err := m.destination().ReadTo(ctx, srcPath, dst); err != nil {
 		return 0, classifyReadTo(srcPath, err, tw.err)
 	}
 
@@ -1136,7 +1152,7 @@ func (m *Manager) restoreSQLite(ctx context.Context, backupID string) error {
 	// backup destination ever stops being local.
 	if m.icebergCatalogDBPath != "" {
 		srcPath := fmt.Sprintf("%s/metadata/%s", backupID, icebergCatalogDBName)
-		exists, err := m.backupStorage.Exists(ctx, srcPath)
+		exists, err := m.destination().Exists(ctx, srcPath)
 		if err != nil {
 			return fmt.Errorf("failed to check for Iceberg catalog in backup: %w", err)
 		}
@@ -1177,7 +1193,7 @@ func (m *Manager) restoreSQLiteFile(ctx context.Context, backupID, srcName, dest
 		return fmt.Errorf("failed to create restore staging file: %w", err)
 	}
 	stagingPath := staging.Name()
-	if err := m.backupStorage.ReadTo(ctx, srcPath, staging); err != nil {
+	if err := m.destination().ReadTo(ctx, srcPath, staging); err != nil {
 		staging.Close()
 		os.Remove(stagingPath)
 		return fmt.Errorf("failed to stream SQLite backup into staging: %w", err)
@@ -1208,7 +1224,7 @@ func (m *Manager) restoreSQLiteFile(ctx context.Context, backupID, srcName, dest
 // It creates a .before-restore backup of the current config first.
 func (m *Manager) restoreConfig(ctx context.Context, backupID string) error {
 	srcPath := fmt.Sprintf("%s/config/arc.toml", backupID)
-	data, err := m.backupStorage.Read(ctx, srcPath)
+	data, err := m.destination().Read(ctx, srcPath)
 	if err != nil {
 		return fmt.Errorf("failed to read config backup: %w", err)
 	}

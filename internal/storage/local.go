@@ -250,7 +250,10 @@ func (b *LocalBackend) Read(ctx context.Context, path string) ([]byte, error) {
 	if err != nil {
 		if os.IsNotExist(err) {
 			metrics.Get().IncStorageErrors()
-			return nil, fmt.Errorf("file not found: %s", path)
+			// Wraps ErrObjectNotFound so a caller can classify with
+			// errors.Is instead of a second round trip. The message is
+			// byte-for-byte what it was.
+			return nil, fmt.Errorf("%w: %s", ErrObjectNotFound, path)
 		}
 		metrics.Get().IncStorageErrors()
 		return nil, fmt.Errorf("failed to read file: %w", err)
@@ -835,6 +838,42 @@ const (
 	MaxUsableKeyLen        = MaxKeyLen - len(PartSuffix)
 	MaxUsableKeySegmentLen = MaxKeySegmentLen - len(PartSuffix)
 )
+
+// LongestBackupKeySuffix is the longest key a backup appends under a
+// destination's own object-key prefix: a generated backup ID plus the longest
+// FIXED file name a backup writes, "manifest-files.json" — the file sidecar.
+//
+// It lives here, beside the limit it is subtracted from, for the reason
+// MaxUsableKeyLen is exported at all: a caller that BUILDS keys under a
+// configured prefix has to bound the prefix by the same arithmetic, and
+// computing it independently is how a five-byte window opens. ValidateObjectPrefix
+// bounds a prefix at MaxUsableKeyLen on its OWN and the backends then build
+// prefix+key without re-checking the sum (prefixedKey validates the
+// UNPREFIXED key), so nothing else in this package bounds a prefix relative to
+// the keys that will follow it.
+const LongestBackupKeySuffix = len("backup-20060102-150405-12345678/manifest-files.json")
+
+// MaxBackupTargetPrefixLen is the longest object-key prefix a backup
+// destination may carry: past it, the backup's own manifest and file sidecar
+// cannot be stored at all, and the operator-facing "max_source_key_bytes"
+// figure goes negative.
+//
+// Derived, not chosen. At 1019 usable key bytes it is 968, which no real
+// prefix approaches; the value is in the failure being a refusal that names
+// the prefix rather than a feature that silently disappears.
+const MaxBackupTargetPrefixLen = MaxUsableKeyLen - LongestBackupKeySuffix
+
+// CheckBackupTargetPrefix reports whether a backup destination's object-key
+// prefix leaves room for the keys a backup writes under it. key is the
+// operator-facing configuration key, so the refusal names the line to edit.
+func CheckBackupTargetPrefix(key, prefix string) error {
+	if len(prefix) <= MaxBackupTargetPrefixLen {
+		return nil
+	}
+	return fmt.Errorf(
+		"%s is %d bytes, over the %d-byte maximum: a backup writes keys of up to %d bytes under the prefix, so the %d-byte object name limit would reject the backup own manifest and file sidecar",
+		key, len(prefix), MaxBackupTargetPrefixLen, LongestBackupKeySuffix, MaxUsableKeyLen)
+}
 
 // ValidateKey reports whether key names exactly one object.
 //

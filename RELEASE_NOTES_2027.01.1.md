@@ -2,6 +2,47 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Upgrade note: two configurations now refuse to start
+
+Read this before upgrading if you set either `storage.local_path` or
+`backup.local_path`. Both refusals apply only when `backup.enabled` is true,
+which is the default, and both are decided on **resolved absolute** paths:
+relative spellings, trailing slashes and symlinks are normalised first, and in
+the container image the working directory is `/app`.
+
+**1. The backup destination and the primary storage root may no longer be the
+same directory, and neither may contain the other.** With `backup.local_path`
+left at its default `./data/backups`, that means Arc refuses to start if
+`storage.local_path` is `/app/data`, `/app`, `.`, `data`, `./data`, or empty. In
+practice the one realistic break is a single-volume deployment that points
+`ARC_STORAGE_LOCAL_PATH` at the whole mount instead of a subdirectory of it.
+
+Sibling names are fine: `./data/arc` beside `./data/arc-backups` starts
+normally. Different kinds never overlap, so a local backup directory with S3
+primary storage starts normally. The cold-tier half of the check applies only
+when both `tiered_storage.enabled` and `tiered_storage.cold.enabled` are on.
+
+**2. `backup.local_path` may no longer be empty or whitespace-only unless a
+backup target is configured.** That combination previously started with the
+backup API silently disabled. An empty *environment variable* still falls
+through to the default, so only an empty value in the config file, or a stray
+space, triggers this.
+
+To fix either: move one path outside the other, point `backup.default_target` at
+a configured target, or set `backup.enabled = false`, which skips the check
+entirely.
+
+**Every shipped artifact is unaffected.** The stock `arc.toml` uses `./data/arc`
+and `./data/backups`; the Helm charts and Kubernetes manifests set
+`/app/data/storage` or `/app/data/arc` and leave `backup.local_path` at its
+default.
+
+Why the refusal exists: a backup destination inside the storage root makes each
+backup copy the previous one, so the inventory compounds every run. Worse, those
+copies look like ordinary data files to the reconciliation sweep, which deletes
+them as orphans when reconciliation is enabled and dry-run is off. The check
+costs one comparison at startup and removes a class of silent data loss.
+
 ## New features
 
 ### Backups can be scoped to one or more databases ([#1084](https://github.com/Basekick-Labs/arc/issues/1084))
@@ -82,6 +123,75 @@ flush.
 Not in this stage: a different backup target per database (#1085), the cold
 tier (#1086), `arcli backup create --database` (tracked in Basekick-Labs/arcli#44),
 and scoping below the storage-root segment.
+
+### A backup can be written somewhere other than a local directory ([#1085](https://github.com/Basekick-Labs/arc/issues/1085))
+
+Until now a backup went to `backup.local_path`, a directory on the server
+itself. A named target can now point it at S3, MinIO, Azure Blob Storage, or a
+different local path.
+
+```toml
+[backup]
+default_target = "audit"
+
+[backup.targets.audit]
+type = "s3"                   # local | s3 | minio | azure | azblob
+s3_bucket = "acme-arc-audit-backups"
+s3_region = "eu-west-1"
+s3_prefix = "arc/"            # optional, and it counts against the key budget
+```
+
+With a target configured, `backup.local_path` is not required at all. Nothing in
+the backup path needs local scratch space: the database snapshot is staged
+beside the database, and a restore stages beside its destination.
+
+Two details worth knowing before you write a target.
+
+**Target names take lowercase letters, digits and underscore only.** A hyphen is
+refused on purpose, and this contradicts the example in the original issue. The
+reason is that configuration keys are lowercased and a hyphen cannot appear in
+an environment variable name, so a hyphenated target could be set in a file and
+then never be overridable from the environment. `audit_bucket`, not
+`audit-bucket`.
+
+**A target is refused at startup if it overlaps primary storage or the cold
+tier.** Overlap means the same store and bucket with one prefix equal to or a
+parent of the other, or, for local paths, one directory containing the other.
+The same bucket with disjoint prefixes is fine. See the upgrade note above for
+what this means for an existing deployment.
+
+The field names match the cold tier's, so `s3_bucket` rather than `bucket`. From
+the environment alone it takes three variables, because a target name cannot be
+discovered from a configuration file that does not exist:
+
+```
+ARC_BACKUP_TARGET_NAMES=audit
+ARC_BACKUP_TARGETS_AUDIT_TYPE=s3
+ARC_BACKUP_TARGETS_AUDIT_S3_BUCKET=acme-arc-audit-backups
+ARC_BACKUP_DEFAULT_TARGET=audit
+```
+
+Three behaviours change when the target is remote. `include_config` defaults to
+false, because `arc.toml` carries the target's own credentials. The usable
+source-key length shrinks by the length of the target prefix, and the figure
+Arc reports to you accounts for it. And a prefix long enough to leave no room
+for a backup's own keys is refused when the configuration loads rather than
+later.
+
+**Backups now record which instance wrote them,** so two Arc instances sharing
+one bucket and prefix do not merge their listings. The identity is
+`cluster.cluster_name` on a cluster and a generated identifier otherwise, which
+means **you should set `cluster.cluster_name`**: two unrelated clusters both
+left at the default would read as one.
+
+A restore never adopts the identity of the backup it reads, so recovering onto
+replacement hardware leaves the new machine with its own identity and the old
+backups marked as another instance's. Those are hidden from the listing by
+default; add `?include_foreign=true` to see them, and the listing tells you when
+it has withheld any. Restoring one is allowed, and logs whose backup it was.
+
+Per-database routing, where different databases go to different targets, is the
+next change. This one is a single destination.
 
 ### Azure Blob Storage takes a key prefix ([#1102](https://github.com/Basekick-Labs/arc/issues/1102))
 
@@ -769,7 +879,7 @@ Two things stayed where they were, both on purpose:
   static credentials or the AWS SDK's own self-refreshing chain, which is why
   writes never suffered from the bug that motivated it.
 
-This is the first of three changes behind per-database backup targets
+This was the first of several changes behind per-database backup targets
 ([#1085](https://github.com/Basekick-Labs/arc/issues/1085)): a backup
 destination is a `storage.Backend`, so named remote targets are mostly a
 configuration and routing problem once there is a single place that turns a
@@ -813,3 +923,37 @@ something other than its default.
 `internal/storage/objectprefix.go`, with no alias, because all three backends
 share it and two names for one function is how the next reader comes to believe
 there are two rules.
+
+### What a remote backup destination changed underneath ([#1085](https://github.com/Basekick-Labs/arc/issues/1085))
+
+Three things are worth knowing if you work on backups next.
+
+**The partial-write cleanup is safe for a reason that is easy to misstate.**
+When a backup write fails, Arc deletes the destination key. That is safe because
+every key it can be handed lives under a backup identifier minted by the run in
+progress, and nothing else in Arc writes that shape. It is **not** the overlap
+refusal that makes it safe, although an earlier draft of this work said so in
+four places. The refusal exists for the recursion and the reconciliation sweep
+described in the upgrade note.
+
+**Listing backups no longer walks the whole destination.** It used to list every
+object and match on a filename suffix, which on a remote target meant
+enumerating the bucket and would match anything else that happened to share the
+prefix, including the cold tier. It now enumerates directories and filters on
+the backup identifier shape.
+
+A trap for the next person: `List` does not mean the same thing on every
+backend. The local one treats its argument as a directory to walk; the
+object-store ones treat it as a key prefix to match. A listing under a `backup-`
+prefix would have returned everything on S3 and nothing locally. `ListDirectories`
+is the one listing whose meaning is identical across all three.
+
+**Two spellings of the same object store used to compare as different stores.**
+The default AWS endpoint and an explicit regional one for the same bucket are
+the same place, and the overlap check did not know it. Endpoints are now
+canonicalised: AWS regional spellings fold together, a virtual-hosted bucket
+label is stripped, and an Azure account is preferred over the endpoint it can be
+derived from. Deliberately not folded: a different AWS partition, a hostname
+that merely ends in something that looks like an AWS suffix, and any self-hosted
+store, because treating two of those as one location would refuse a legitimate
+configuration.

@@ -64,7 +64,14 @@ func (m *Manager) configureIcebergWarehouse(cfg *ManagerConfig) {
 				Msg("Iceberg warehouse contains the storage root; only its " + m.icebergNSPrefix + "_*.db namespace directories are backed up from it")
 		}
 	}
-	if bp := resolveExistingPath(cfg.BackupPath); pathWithin(bp, wh) {
+	// Containment against the backup destination is a question only a LOCAL
+	// destination has (#1085 stage B2b-1): an object store cannot contain a
+	// directory on this machine. Asking it of cfg.BackupPath while a remote
+	// target is configured would be worse than useless — BackupPath keeps its
+	// "./data/backups" default and is not the destination, so the warning
+	// would name a directory nothing writes to, and resolveExistingPath("")
+	// resolves to the WORKING DIRECTORY, which contains almost everything.
+	if bp := localDestinationPath(cfg); bp != "" && pathWithin(bp, wh) {
 		m.logger.Warn().Str("warehouse", wh).Str("backup_path", bp).
 			Msg("Iceberg warehouse contains the backup directory; only its " + m.icebergNSPrefix + "_*.db namespace directories are backed up from it")
 	}
@@ -74,42 +81,37 @@ func (m *Manager) configureIcebergWarehouse(cfg *ManagerConfig) {
 		Msg("Iceberg warehouse is outside the storage root; backups copy its table metadata separately under " + icebergBackupPrefix + "/")
 }
 
-// resolveExistingPath returns p as an absolute, cleaned path with symlinks
-// resolved. A path that does not exist yet is resolved through its deepest
-// existing ancestor and the remainder is re-joined, so a fresh node whose
-// warehouse sits under a symlinked parent still classifies correctly.
-func resolveExistingPath(p string) string {
-	abs, err := filepath.Abs(p)
-	if err != nil {
-		return filepath.Clean(p)
-	}
-	abs = filepath.Clean(abs)
-	var tail []string
-	cur := abs
-	for {
-		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
-			for i := len(tail) - 1; i >= 0; i-- {
-				resolved = filepath.Join(resolved, tail[i])
-			}
-			return resolved
+// localDestinationPath returns the resolved local directory a backup will be
+// written to, or "" when the destination is an object store or no local path
+// is configured at all.
+func localDestinationPath(cfg *ManagerConfig) string {
+	path := cfg.BackupPath
+	if cfg.Target != nil {
+		if cfg.Target.Remote {
+			return ""
 		}
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			return abs
-		}
-		tail = append(tail, filepath.Base(cur))
-		cur = parent
+		path = cfg.Target.Spec.LocalPath
 	}
+	if path == "" {
+		return ""
+	}
+	return resolveExistingPath(path)
 }
 
-// pathWithin reports whether p is dir itself or lies beneath it, matching only
-// at a path boundary: "/data/wh-other" is not within "/data/wh" (#534).
-func pathWithin(p, dir string) bool {
-	sep := string(filepath.Separator)
-	dir = strings.TrimSuffix(filepath.Clean(dir), sep)
-	p = filepath.Clean(p)
-	return p == dir || strings.HasPrefix(p, dir+sep)
-}
+// resolveExistingPath and pathWithin are storage.ResolveExistingPath and
+// storage.PathWithin.
+//
+// The implementations moved to internal/storage when the backup-destination
+// overlap refusal needed the same two rules (#1085 stage B2b): the refusal
+// runs in config.Load, which cannot import this package, and two
+// independently-maintained copies of a boundary match is exactly how #534's
+// own fix shipped a mid-segment HasPrefix bug. Kept as package-local names so
+// the six call sites in this file and the table tests that pin their
+// behaviour continue to read as they did, and so those tests now exercise the
+// shared implementation rather than a second copy of it.
+func resolveExistingPath(p string) string { return storage.ResolveExistingPath(p) }
+
+func pathWithin(p, dir string) bool { return storage.PathWithin(p, dir) }
 
 // listIcebergWarehouseFiles walks the outside-root warehouse and returns the
 // exporter's table metadata files. The walk is scoped to the exporter's own
@@ -347,9 +349,9 @@ func (m *Manager) streamLocalFileToBackup(ctx context.Context, srcAbs, destPath 
 	if err != nil {
 		return 0, fmt.Errorf("%w: stat %s: %v", errBackupRead, srcAbs, err)
 	}
-	if err := m.backupStorage.WriteReader(ctx, destPath, f, info.Size()); err != nil {
+	if err := m.destination().WriteReader(ctx, destPath, f, info.Size()); err != nil {
 		m.cleanupPartialBackupWrite(ctx, destPath)
-		return 0, fmt.Errorf("failed to write to backup storage: %w", err)
+		return 0, fmt.Errorf("failed to write to %s: %w", m.describeDestination(), err)
 	}
 	return info.Size(), nil
 }
@@ -361,7 +363,7 @@ func (m *Manager) streamLocalFileToBackup(ctx context.Context, srcAbs, destPath 
 // the restore can only work when this node's warehouse is at the source's path.
 func (m *Manager) restoreIcebergWarehouse(ctx context.Context, backupID string, manifest *Manifest, progress *Progress, catalogRestored bool) error {
 	prefix := backupID + "/" + icebergBackupPrefix + "/"
-	files, err := m.backupStorage.List(ctx, prefix)
+	files, err := m.destination().List(ctx, prefix)
 	if err != nil {
 		return fmt.Errorf("failed to list backup iceberg warehouse files: %w", err)
 	}
@@ -477,7 +479,7 @@ func (m *Manager) streamRestoreToLocalFile(ctx context.Context, srcPath, dest st
 	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath)
 	tw := &trackingWriter{w: tmp}
-	if err := m.backupStorage.ReadTo(ctx, srcPath, tw); err != nil {
+	if err := m.destination().ReadTo(ctx, srcPath, tw); err != nil {
 		tmp.Close()
 		return 0, classifyReadTo(srcPath, err, tw.err)
 	}

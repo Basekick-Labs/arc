@@ -29,7 +29,10 @@ type Manifest struct {
 	// SkippedFiles counts data files that were listed and inventoried above but
 	// could not be read from source storage at copy time, or whose backup
 	// destination key would exceed the storage key limit (a source key longer
-	// than storage.MaxUsableKeyLen minus the <backupID>/data/ prefix; #761).
+	// than storage.MaxUsableKeyLen minus the <backupID>/data/ prefix AND minus
+	// the destination target's own object-key prefix, which counts since
+	// #1085 stage B2b-1; #761). The per-backup figure is reported as
+	// max_source_key_bytes in the log line that names each skip.
 	// The backup log names each skipped file and SkippedSample names up to 32
 	// of them (#977). When non-zero the
 	// backup is incomplete: TotalFiles/TotalSizeBytes describe what was
@@ -143,6 +146,33 @@ type Manifest struct {
 	// namespace directories are still excluded: they are never listed).
 	IcebergNamespaceFilesExcluded int64    `json:"iceberg_namespace_files_excluded,omitempty"`
 	IcebergNamespacesExcluded     []string `json:"iceberg_namespaces_excluded,omitempty"`
+	// Target names the configured backup target this backup was written to
+	// (#1085 stage B2b-1), absent when it went to backup.local_path as
+	// backups did before targets existed.
+	//
+	// IT IS A LABEL, NEVER A LOOKUP. The backend a restore reads from comes
+	// from LOCAL configuration and nothing else, by the same rule already
+	// established for the one other destination-naming field in this manifest
+	// (see restoreIcebergWarehouse, which uses this node's configured
+	// warehouse and not the manifest's path): the manifest is data read from
+	// backup storage, so a field in it must never select the credentials or
+	// the location used to read further bytes. A restore from a manifest whose
+	// Target names a target this node does not have still works, because the
+	// bytes were already found at the destination this node is configured
+	// with; the field tells an operator where the backup came from.
+	Target string `json:"target,omitempty"`
+	// OwnerInstanceID identifies the Arc instance that wrote this backup: the
+	// cluster name when clustered, a persistent per-instance UUID standalone
+	// (see identity.go). Absent for every backup written before this field,
+	// and for an instance that has no identity — and an ABSENT owner reads as
+	// the reading instance's own, because the alternative would hide every
+	// pre-upgrade backup from the listing.
+	//
+	// A restore does NOT adopt it. Identity is local configuration, by the
+	// same rule as Target above; a restore onto fresh hardware keeps the
+	// identity that hardware has, and the echo of this value is what tells
+	// the operator the backup belongs to another instance.
+	OwnerInstanceID string `json:"owner_instance_id,omitempty"`
 }
 
 // IcebergWarehouseInfo records the outside-root Iceberg warehouse a backup
@@ -199,6 +229,15 @@ type BackupSummary struct {
 	UnregisteredSkipped   int64 `json:"unregistered_skipped,omitempty"`
 	ManifestOnlyFiles     int64 `json:"manifest_only_files,omitempty"`
 	LeftManifestDuringRun int64 `json:"left_manifest_during_run,omitempty"`
+	// Target and OwnerInstanceID mirror the manifest's (#1085 stage B2b-1):
+	// which configured destination holds the backup, and which instance wrote
+	// it. ForeignOwner says the second belongs to a different instance than
+	// the one answering, which only ListAllBackups can return — the default
+	// listing leaves those out. It is derived per request rather than stored,
+	// so it is absent from the manifest.
+	Target          string `json:"target,omitempty"`
+	OwnerInstanceID string `json:"owner_instance_id,omitempty"`
+	ForeignOwner    bool   `json:"foreign_owner,omitempty"`
 }
 
 // Progress tracks the state of a running backup or restore operation.
@@ -330,5 +369,7 @@ func SummaryFromManifest(m *Manifest) BackupSummary {
 		UnregisteredSkipped:   m.UnregisteredSkipped,
 		ManifestOnlyFiles:     m.ManifestOnlyFiles,
 		LeftManifestDuringRun: m.LeftManifestDuringRun,
+		Target:                m.Target,
+		OwnerInstanceID:       m.OwnerInstanceID,
 	}
 }

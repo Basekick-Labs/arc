@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"regexp"
 	"sort"
 	"sync/atomic"
 	"time"
@@ -15,9 +14,6 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
-
-// validBackupID matches the format produced by generateBackupID.
-var validBackupID = regexp.MustCompile(`^backup-\d{8}-\d{6}-[a-f0-9]{8}$`)
 
 // BackupCoordinator is the minimal cluster interface the backup handler needs
 // (#1083): which node may run a backup or a restore. nil = standalone mode,
@@ -103,6 +99,17 @@ func (h *BackupHandler) rejectUnlessPrimaryWriter(c *fiber.Ctx, operation string
 	return true
 }
 
+// describeTarget names the backup destination in an operator-facing error.
+// The manager's own describeDestination says the same thing for log lines; this
+// is the HTTP-response half, kept here because the response must not carry the
+// manager's wrapped SDK error.
+func describeTarget(name string) string {
+	if name == "" {
+		return "the backup destination"
+	}
+	return fmt.Sprintf("backup target %q", name)
+}
+
 // RegisterRoutes registers backup and restore API routes.
 func (h *BackupHandler) RegisterRoutes(app fiber.Router) {
 	group := app.Group("/api/v1/backup")
@@ -121,7 +128,11 @@ func (h *BackupHandler) RegisterRoutes(app fiber.Router) {
 // CreateBackupRequest is the request body for POST /api/v1/backup.
 type CreateBackupRequest struct {
 	IncludeMetadata *bool `json:"include_metadata"` // default: true; false and refused when scoped
-	IncludeConfig   *bool `json:"include_config"`   // default: true; false when scoped
+	// IncludeConfig default: true, EXCEPT false when the backup is scoped and
+	// false when the destination is a remote target, whose own credentials
+	// arc.toml carries (#1085 stage B2b-1). Setting it true against a remote
+	// target is honoured and warned about.
+	IncludeConfig *bool `json:"include_config"`
 	// Databases scopes the backup to these databases (#1084): storage-root
 	// segments, so an edge-sync spoke is named as the spoke. Empty or absent
 	// is a whole-instance backup. At most maxScopeDatabases names, each a
@@ -217,9 +228,14 @@ func (h *BackupHandler) CreateBackup(c *fiber.Ctx) error {
 	// Defaults: a whole-instance backup carries the SQLite metadata and the
 	// config; a scoped one carries neither unless asked, and metadata cannot
 	// be asked for (it is every database's state, not one database's).
+	// IncludeConfig is additionally false when the destination is a REMOTE
+	// target (#1085 stage B2b-1): arc.toml carries that target's own
+	// credentials, so copying it there puts the keys that unlock the backup
+	// store inside the backups it holds. A request may still ask for it
+	// explicitly, and the manager warns when it does.
 	opts := backup.BackupOptions{
 		IncludeMetadata: !scoped,
-		IncludeConfig:   !scoped,
+		IncludeConfig:   !scoped && !h.manager.TargetIsRemote(),
 		Databases:       databases,
 	}
 	if req.IncludeMetadata != nil {
@@ -291,11 +307,35 @@ func (h *BackupHandler) ListBackups(c *fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(c.Context(), 30*time.Second)
 	defer cancel()
 
-	summaries, err := h.manager.ListBackups(ctx)
+	// include_foreign=true also returns backups another Arc instance wrote to
+	// the same destination, each marked foreign_owner with its
+	// owner_instance_id (#1085 stage B2b-1). The default leaves them out,
+	// because two instances sharing a bucket and prefix merging into one
+	// listing is the hazard the owner field exists for; the opt-in exists
+	// because after a restore onto fresh hardware every backup reads as
+	// foreign, and an operator who could not list them could not find the id
+	// of the next one to restore.
+	includeForeign := c.QueryBool("include_foreign", false)
+
+	var summaries []backup.BackupSummary
+	var filteredForeign int
+	var err error
+	if includeForeign {
+		summaries, err = h.manager.ListAllBackups(ctx)
+	} else {
+		summaries, filteredForeign, err = h.manager.ListBackupsFilteringForeign(ctx)
+	}
 	if err != nil {
-		h.logger.Error().Err(err).Msg("Failed to list backups")
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to list backups",
+		h.logger.Error().Err(err).Str("target", h.manager.TargetName()).Msg("Failed to list backups")
+		// 503, not 500: once a destination can be remote this is a transient
+		// far more often than a defect, and the answer has to name the
+		// destination or an operator with more than one configured store
+		// cannot tell which is down. Error text rather than err.Error()
+		// because installErrSanitizer masks quoted spans in logged errors and
+		// the response should not carry the SDK's own wording either.
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error":  fmt.Sprintf("could not list backups: %s is unreachable or unreadable; retry, or check the destination configuration", describeTarget(h.manager.TargetName())),
+			"target": h.manager.TargetName(),
 		})
 	}
 
@@ -303,10 +343,21 @@ func (h *BackupHandler) ListBackups(c *fiber.Ctx) error {
 		summaries = []backup.BackupSummary{}
 	}
 
-	return c.JSON(fiber.Map{
+	resp := fiber.Map{
 		"backups": summaries,
 		"count":   len(summaries),
-	})
+	}
+	// The filter has to announce itself (#1085 stage B2b-1). On fresh hardware
+	// every backup at the destination belongs to the instance being replaced,
+	// so recovery — the case backups exist for — would otherwise be answered
+	// with an empty array and no sign that anything had been withheld. The
+	// count, and the hint beside it, are what make include_foreign=true
+	// discoverable from the response rather than only from arc.toml.
+	if filteredForeign > 0 {
+		resp["filtered_foreign"] = filteredForeign
+		resp["hint"] = fmt.Sprintf("%d backup(s) at this destination were written by a different Arc instance and are not listed; add ?include_foreign=true to see them, with the owner id of each", filteredForeign)
+	}
+	return c.JSON(resp)
 }
 
 // GetStatus returns the progress of the current active operation.
@@ -325,7 +376,7 @@ func (h *BackupHandler) GetStatus(c *fiber.Ctx) error {
 // GET /api/v1/backup/:id
 func (h *BackupHandler) GetBackup(c *fiber.Ctx) error {
 	id := c.Params("id")
-	if !validBackupID.MatchString(id) {
+	if !backup.IsValidBackupID(id) {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "Invalid backup ID format",
 		})
@@ -336,8 +387,20 @@ func (h *BackupHandler) GetBackup(c *fiber.Ctx) error {
 
 	manifest, err := h.manager.GetBackup(ctx, id)
 	if err != nil {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-			"error": "Backup not found",
+		// An unknown id and an unreadable destination are different answers
+		// (#1085 stage B2b-1). They used to be one 404, which cost nothing
+		// when the destination was a local directory and lies once it is
+		// remote: a transient told the operator their backup was gone.
+		if errors.Is(err, backup.ErrBackupNotFound) {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+				"error": "Backup not found",
+			})
+		}
+		h.logger.Error().Err(err).Str("backup_id", id).Str("target", h.manager.TargetName()).
+			Msg("Failed to read the backup manifest")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error":  fmt.Sprintf("could not read backup %s: %s is unreachable or unreadable; retry, or check the destination configuration", id, describeTarget(h.manager.TargetName())),
+			"target": h.manager.TargetName(),
 		})
 	}
 
@@ -348,7 +411,7 @@ func (h *BackupHandler) GetBackup(c *fiber.Ctx) error {
 // DELETE /api/v1/backup/:id
 func (h *BackupHandler) DeleteBackup(c *fiber.Ctx) error {
 	id := c.Params("id")
-	if !validBackupID.MatchString(id) {
+	if !backup.IsValidBackupID(id) {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "Invalid backup ID format",
 		})
@@ -377,7 +440,14 @@ func (h *BackupHandler) DeleteBackup(c *fiber.Ctx) error {
 			}
 			return h.operationConflict(c, operation)
 		}
-		h.logger.Error().Err(err).Str("backup_id", id).Msg("Failed to delete backup")
+		// The manager's error now names the destination (#1085 stage B2b-1), and
+		// the target is a field as well so an operator with more than one
+		// configured store can tell which one failed. The status code is
+		// deliberately left at 500: splitting it into 404/503 the way GET
+		// /:id does is a separate change this stage did not scope, and no
+		// behaviour here depends on the distinction.
+		h.logger.Error().Err(err).Str("backup_id", id).Str("target", h.manager.TargetName()).
+			Msg("Failed to delete backup")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to delete backup",
 		})
@@ -422,7 +492,7 @@ func (h *BackupHandler) RestoreBackup(c *fiber.Ctx) error {
 		return nil
 	}
 
-	if !validBackupID.MatchString(req.BackupID) {
+	if !backup.IsValidBackupID(req.BackupID) {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "Invalid or missing backup_id",
 		})
@@ -491,19 +561,45 @@ func (h *BackupHandler) RestoreBackup(c *fiber.Ctx) error {
 	// backup in replace mode on a cluster node. Resolved here from the
 	// manifest's scope and from whether the manager has the Raft manifest
 	// wired, with the same function the manager applies after it reads the
-	// manifest, so the echo is what will run. A manifest that cannot be read
-	// here (unknown id, or a transient backup-storage error) resolves as
-	// unscoped, is echoed that way and is admitted as before; the manager
-	// then reads the manifest itself and fails the run with "backup not
-	// found", or runs from what it read.
+	// manifest, so the echo is what will run.
+	//
+	// A manifest that cannot be READ is an ERROR here, not a fall-through to
+	// "as for an unscoped backup" (#1085 stage B2b-1). The manager was always
+	// the authority and still is — it fails hard on a manifest read error,
+	// re-resolves the mode from the manifest it read and re-runs
+	// CheckScopedReplace — so the restore never actually ran with the wrong
+	// mode. What the fall-through produced was a 202 that LIED: an operator
+	// told "mode: merge" while the manager would run "replace", or the
+	// reverse. With a local destination the read could hardly fail; with a
+	// remote one it is an ordinary transient, and an operator who reads
+	// "merge" and stops worrying is the hazard. 503 rather than 500 for the
+	// same reason rejectUnlessPrimaryWriter uses it: the honest advice is to
+	// retry.
+	//
+	// A manifest that is ABSENT is a different answer and keeps the behaviour
+	// it has: admitted, and failed asynchronously by the manager with "backup
+	// not found". The echoed mode is not a lie in that case because no
+	// restore runs at all, the progress record carries the failure, and the
+	// asynchronous not-found failure is a tested contract this change has no
+	// reason to break. Only "the manifest may exist and I could not reach it"
+	// gets the 503.
 	var manifest *backup.Manifest
 	{
 		ctx, cancel := context.WithTimeout(c.Context(), 30*time.Second)
 		mf, err := h.manager.GetBackup(ctx, req.BackupID)
 		cancel()
-		if err != nil {
-			h.logger.Debug().Err(err).Str("backup_id", req.BackupID).Msg("Could not read the backup manifest before the restore; resolving the mode as for an unscoped backup")
-		} else {
+		switch {
+		case errors.Is(err, backup.ErrBackupNotFound):
+			h.logger.Info().Str("backup_id", req.BackupID).Str("target", h.manager.TargetName()).
+				Msg("No manifest for the requested backup; admitting the restore, which will fail with backup not found")
+		case err != nil:
+			h.logger.Error().Err(err).Str("backup_id", req.BackupID).Str("target", h.manager.TargetName()).
+				Msg("Could not read the backup manifest before the restore")
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"error":  fmt.Sprintf("could not read backup %s before the restore: %s is unreachable or unreadable; retry, or check the destination configuration", req.BackupID, describeTarget(h.manager.TargetName())),
+				"target": h.manager.TargetName(),
+			})
+		default:
 			manifest = mf
 		}
 	}
@@ -519,7 +615,9 @@ func (h *BackupHandler) RestoreBackup(c *fiber.Ctx) error {
 	}
 	// A replace of a scoped backup that holds no data file for one of its
 	// databases would only delete (#1084); refused here with the manager's
-	// text, whether the mode was defaulted or named.
+	// text, whether the mode was defaulted or named. Still guarded: an
+	// unreadable manifest is answered above, but an ABSENT one is admitted and
+	// fails in the manager, so manifest can be nil here.
 	if manifest != nil {
 		if err := backup.CheckScopedReplace(mode, manifest); err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -554,8 +652,10 @@ func (h *BackupHandler) RestoreBackup(c *fiber.Ctx) error {
 	// a restored config only takes effect on reload — both need a server
 	// restart to take effect. Only when the backup holds them: a scoped
 	// backup never carries the metadata, so a default standalone restore of
-	// one stages nothing. When the manifest could not be read the flags
-	// follow the request, as before.
+	// one stages nothing. A manifest that could not be READ is answered with a
+	// 503 above rather than letting these flags follow the request; a manifest
+	// that is ABSENT still reaches here, and the flags follow the request as
+	// before, because the restore it describes fails in the manager anyway.
 	stagesMetadata := opts.RestoreMetadata && (manifest == nil || manifest.HasMetadata)
 	restoresConfig := opts.RestoreConfig && (manifest == nil || manifest.HasConfig)
 	if stagesMetadata || restoresConfig {
