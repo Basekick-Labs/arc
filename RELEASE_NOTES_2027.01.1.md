@@ -152,6 +152,20 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Fallback compaction job IDs support spoke namespaces ([#750](https://github.com/Basekick-Labs/arc/issues/750))
+
+When a compaction job was created without an explicit JobID, its fallback ID
+included the raw database name. An edge-sync pseudo-database such as
+`rocket-01/telemetry` introduced a slash into the ID, causing completion-manifest
+validation to reject it and creating an unintended nested temporary directory.
+Fallback IDs now use the same database-name sanitiser as manager-generated IDs,
+while preserving the actual database value and any caller-supplied JobID.
+
+This addresses item 4 of #750. The manager already supplied sanitised IDs;
+the fix covers the fallback in `NewJob`.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#912](https://github.com/Basekick-Labs/arc/pull/912).
+
 ### Iceberg export reclaims the manifest files expired snapshots leave behind ([#835](https://github.com/Basekick-Labs/arc/issues/835))
 
 Iceberg export never deleted the manifest lists and manifests of snapshots it had expired, so a
