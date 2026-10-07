@@ -42,6 +42,64 @@ type fakeClusterManifest struct {
 	order            []string
 	failRegisterCall int // 1-based call index to refuse; 0 never
 	failDelete       bool
+	// The cluster-wide compaction pause (#1087). pauseErr refuses the pause;
+	// pauseReasons records what each pause was taken for; loseAfterRegisters
+	// makes Lost report true once that many register calls have happened
+	// (0 never). "pause" and "resume" land in order like every other call.
+	pauseErr           error
+	pauseReasons       []string
+	loseAfterRegisters int
+	pauses             []*fakeCompactionPause
+}
+
+// fakeCompactionPause is the handle the fake hands out.
+type fakeCompactionPause struct {
+	f       *fakeClusterManifest
+	resumes int
+}
+
+func (f *fakeClusterManifest) PauseCompaction(_ context.Context, reason string) (CompactionPause, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.order = append(f.order, "pause")
+	f.pauseReasons = append(f.pauseReasons, reason)
+	if f.pauseErr != nil {
+		return nil, f.pauseErr
+	}
+	p := &fakeCompactionPause{f: f}
+	f.pauses = append(f.pauses, p)
+	return p, nil
+}
+
+func (p *fakeCompactionPause) Lost() (bool, error) {
+	p.f.mu.Lock()
+	defer p.f.mu.Unlock()
+	if p.f.loseAfterRegisters > 0 && len(p.f.registers) >= p.f.loseAfterRegisters {
+		return true, errors.New("lost at 2026-10-06T10:00:00Z: generation 3 requested by other-node replaced this generation 2")
+	}
+	return false, nil
+}
+
+func (p *fakeCompactionPause) Resume(context.Context) error {
+	p.f.mu.Lock()
+	defer p.f.mu.Unlock()
+	p.resumes++
+	p.f.order = append(p.f.order, "resume")
+	return nil
+}
+
+// pauseOps filters order to the pause/resume calls and the manifest writes,
+// so a test can assert the pause brackets every write.
+func (f *fakeClusterManifest) pauseOps() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, op := range f.order {
+		if op == "register" || op == "delete" || op == "pause" || op == "resume" || op == "sync" || op == "read" {
+			out = append(out, op)
+		}
+	}
+	return out
 }
 
 func (f *fakeClusterManifest) Sync(context.Context) error {
@@ -577,8 +635,9 @@ func TestBackup_ClusterSyncsBeforeEverySnapshot(t *testing.T) {
 		if _, err := m.RestoreBackup(ctx, RestoreOptions{BackupID: backupID, RestoreData: true}); err != nil {
 			t.Fatal(err)
 		}
-		if got := strings.Join(cm.order, ","); got != "sync,read,register" {
-			t.Errorf("call order = %s, want sync,read,register", got)
+		// The pause (#1087) brackets every manifest access.
+		if got := strings.Join(cm.order, ","); got != "pause,sync,read,register,resume" {
+			t.Errorf("call order = %s, want pause,sync,read,register,resume", got)
 		}
 	})
 	t.Run("restore sync failure", func(t *testing.T) {

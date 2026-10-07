@@ -39,13 +39,23 @@ type Manager struct {
 	icebergWarehouseConfigured string
 	icebergEnabled             bool
 	icebergNSPrefix            string
+	// icebergWarehouseKeyPrefix is the storage key prefix of an under-root
+	// warehouse: "" when the warehouse IS the storage root (the default) and
+	// "<sub>/" when it is a subdirectory of it (#534 layout). Only a scoped
+	// backup reads it, to find the namespace directories it leaves out; the
+	// two layouts are the same string only at the default, which is exactly
+	// the #534 shape, so the prefix is stored rather than assumed.
+	icebergWarehouseKeyPrefix string
 
 	// cluster is the Raft file manifest on a cluster node, nil on a
 	// standalone one; tierRecorder is this node's tier metadata, nil without
 	// tiering. Independently wired (#1083): tiering runs standalone too, and
-	// a cluster node may have tiering off. See cluster.go.
+	// a cluster node may have tiering off. See cluster.go. tierLookup is the
+	// known-database check's view of the same tier metadata (#1084), nil
+	// without tiering; see scope.go.
 	cluster      ClusterManifest
 	tierRecorder TierRecorder
+	tierLookup   TierLookup
 
 	logger zerolog.Logger
 	mu     sync.Mutex // serializes backup/restore operations
@@ -82,7 +92,14 @@ func NewManager(cfg *ManagerConfig) (*Manager, error) {
 		return nil, fmt.Errorf("backup path is required")
 	}
 
-	backupBackend, err := storage.NewLocalBackend(cfg.BackupPath, cfg.Logger)
+	// BackupPath is a local directory, and that is unchanged: it is still the
+	// one backup destination. Constructing it through the shared factory keeps
+	// the typed-nil guarantee (#713) and the backend dispatch in one place
+	// (internal/storage/factory.go).
+	backupBackend, err := storage.NewBackend(storage.BackendSpec{
+		Type:      "local",
+		LocalPath: cfg.BackupPath,
+	}, cfg.Logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create backup storage: %w", err)
 	}

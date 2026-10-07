@@ -268,8 +268,11 @@ const (
 )
 
 // Azure secret names. Same rationale as the S3 names above: primary and cold
-// Azure storage get separate, SCOPE-bound secrets so distinct containers/accounts
-// per tier don't clobber each other.
+// Azure storage get separate, SCOPE-bound secrets so distinct
+// containers/prefixes/accounts per tier don't clobber each other. The scope is
+// container AND prefix since #1102, which is what distinguishes the two when
+// both tiers sit in ONE container separated only by prefix — see
+// azureSecretScope.
 const (
 	arcAzurePrimarySecretName = "azure_secret_primary"
 	arcAzureColdSecretName    = "azure_secret_cold"
@@ -504,6 +507,10 @@ type Config struct {
 	AzureSASToken  string
 	AzureEndpoint  string // Custom endpoint (optional); wired into azure secrets via azureEndpointSuffix (#605)
 	AzureContainer string // Container name; used to build the allowed_directories prefix for the sandbox
+	// AzurePrefix is the blob-name prefix under the container (#1102). Used
+	// with AzureContainer to scope sandbox access and the primary Azure
+	// secret, exactly as S3Prefix is used with S3Bucket.
+	AzurePrefix string
 	// AzureIsPrimaryBackend is true when storage.backend is "azure"/"azblob".
 	// Gates primary Azure secret creation on the backend actually being Azure,
 	// so a stray storage.azure_* value on a non-Azure-primary deployment does
@@ -518,6 +525,7 @@ type Config struct {
 	ColdS3Bucket       string
 	ColdS3Prefix       string
 	ColdAzureContainer string
+	ColdAzurePrefix    string
 	// LocalStorageRoot is the absolute path of the local-storage backend root,
 	// used to whitelist Arc-managed files in the DuckDB sandbox. Equals
 	// ArcxStorageRoot when arcx is enabled; populated independently so the
@@ -1356,7 +1364,7 @@ func (d *DuckDB) ClearHTTPCache() {
 // azureSecretParams describes one DuckDB Azure secret to create.
 type azureSecretParams struct {
 	name  string // secret name (unique per credential set)
-	scope string // azure://container/ this secret applies to; "" = unscoped
+	scope string // azure://container/prefix/ this secret applies to; "" = unscoped
 	// connectionString, when set, is the auth method (it embeds the account
 	// name + key); accountName/accountKey are then ignored. Mirrors the Go
 	// backend's connection-string-first precedence.
@@ -1381,7 +1389,7 @@ type azureSecretParams struct {
 //   - account name + key → a synthesized AccountName=…;AccountKey=… connection string;
 //   - account name, no key → PROVIDER CREDENTIAL_CHAIN (managed identity / az-login / env).
 //
-// SCOPE, when non-empty, binds the secret to one container so primary and cold-tier
+// SCOPE, when non-empty, binds the secret to one container and prefix so primary and cold-tier
 // Azure secrets coexist and DuckDB resolves the right credentials per path. Values are
 // escaped (single quotes doubled). Mirrors buildS3SecretSQL.
 func buildAzureSecretSQL(p azureSecretParams) (string, error) {
@@ -1464,15 +1472,6 @@ func azureEndpointSuffix(endpoint, accountName string) (string, bool) {
 	return h, true
 }
 
-// azureScope builds the SCOPE prefix for an Azure secret from a container name,
-// or "" (unscoped) when no container is configured.
-func azureScope(container string) string {
-	if container == "" {
-		return ""
-	}
-	return "azure://" + container + "/"
-}
-
 // ensureAzureLoaded installs and loads the azure extension and sets the Linux
 // curl transport. Like httpfs for S3, this MUST run before any
 // CREATE SECRET (TYPE AZURE) — including the runtime cold-tier secret created by
@@ -1545,7 +1544,7 @@ func primaryAzureSecretParams(cfg *Config) azureSecretParams {
 	suffix, _ := azureEndpointSuffix(cfg.AzureEndpoint, cfg.AzureAccountName)
 	return azureSecretParams{
 		name:             arcAzurePrimarySecretName,
-		scope:            azureScope(cfg.AzureContainer),
+		scope:            azureSecretScope(cfg.AzureContainer, cfg.AzurePrefix),
 		connectionString: cfg.AzureConnectionString,
 		accountName:      cfg.AzureAccountName,
 		accountKey:       cfg.AzureAccountKey,
@@ -1565,6 +1564,7 @@ type AzureConfig struct {
 	// acquire a broader identity than the operator intended).
 	SASToken  string
 	Container string // scopes the secret to this container; empty = unscoped
+	Prefix    string // narrows the scope to this blob-name prefix (#1102); empty = container-wide
 	Endpoint  string // full-URL Azure endpoint; normalized to DuckDB's suffix form
 }
 
@@ -1583,7 +1583,7 @@ func (d *DuckDB) ConfigureAzure(azcfg *AzureConfig) error {
 	}
 	params := azureSecretParams{
 		name:             arcAzureColdSecretName,
-		scope:            azureScope(azcfg.Container),
+		scope:            azureSecretScope(azcfg.Container, azcfg.Prefix),
 		connectionString: azcfg.ConnectionString,
 		accountName:      azcfg.AccountName,
 		accountKey:       azcfg.AccountKey,

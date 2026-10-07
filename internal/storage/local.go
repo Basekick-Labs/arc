@@ -404,19 +404,21 @@ func (b *LocalBackend) AppendReader(ctx context.Context, path string, reader io.
 		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to open staging file for append: %w", err)
 	}
-	defer file.Close()
-
-	written, err := io.Copy(file, reader)
-	if err != nil {
+	// Close exactly once on every path, including a failed copy. Closing
+	// before promotion also makes close errors visible to the caller.
+	written, copyErr := io.Copy(file, reader)
+	closeErr := file.Close()
+	if copyErr != nil {
 		metrics.Get().IncStorageErrors()
-		return fmt.Errorf("failed to append file data: %w", err)
+		return fmt.Errorf("failed to append file data: %w", copyErr)
+	}
+	if closeErr != nil {
+		metrics.Get().IncStorageErrors()
+		return fmt.Errorf("failed to close staging file: %w", closeErr)
 	}
 
-	// After appending, promote staging → final if we've received all expected bytes.
+	// Promote only after a successful copy and close.
 	if written == appendSize {
-		if err := file.Close(); err != nil {
-			return fmt.Errorf("failed to close staging file: %w", err)
-		}
 		if err := os.Rename(stagingPath, fullPath); err != nil {
 			metrics.Get().IncStorageErrors()
 			return fmt.Errorf("failed to promote staging file after append: %w", err)
@@ -710,6 +712,56 @@ func (b *LocalBackend) ListObjects(ctx context.Context, prefix string) ([]Object
 	}
 
 	return results, nil
+}
+
+// errPrefixProbeHit is the sentinel HasObjectsUnderPrefix returns from its walk
+// callback to stop filepath.WalkDir at the first listable file. Never returned
+// to callers.
+var errPrefixProbeHit = errors.New("storage: prefix probe found a listable object")
+
+// HasObjectsUnderPrefix implements PrefixProber: it walks the directory the
+// prefix names and stops at the first file ListObjects would return. A prefix
+// whose directory does not exist is false with a nil error; a directory
+// holding only entries a listing hides (dot-prefixed names, keys the contract
+// refuses, staging partials) is false too, because omittedFromListing is the
+// one rule both share.
+func (b *LocalBackend) HasObjectsUnderPrefix(ctx context.Context, prefix string) (bool, error) {
+	searchPath, err := b.validateListPath(prefix)
+	if err != nil {
+		return false, fmt.Errorf("invalid prefix: %w", err)
+	}
+	err = filepath.WalkDir(searchPath, func(path string, d os.DirEntry, err error) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		relPath, err := filepath.Rel(b.basePath, path)
+		if err != nil {
+			return err
+		}
+		if omittedFromListing(d.Name(), filepath.ToSlash(relPath)) != nil {
+			return nil
+		}
+		return errPrefixProbeHit
+	})
+	if errors.Is(err, errPrefixProbeHit) {
+		return true, nil
+	}
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to probe prefix: %w", err)
+	}
+	return false, nil
 }
 
 // errHiddenName marks an entry a listing skips because its name is

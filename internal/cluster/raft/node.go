@@ -767,6 +767,45 @@ func (n *Node) AssignCompactor(nodeID, oldCompactorID string, timeout time.Durat
 	return n.Apply(cmd, timeout)
 }
 
+// SetCompactionPause proposes a pause, refresh or resume of the cluster-wide
+// compaction pause (#1087). Leader only; followers forward the same command
+// (Coordinator.PauseCompaction builds it with CompactionPauseCommand).
+func (n *Node) SetCompactionPause(p SetCompactionPausePayload, timeout time.Duration) error {
+	cmd, err := CompactionPauseCommand(p)
+	if err != nil {
+		return err
+	}
+	return n.Apply(cmd, timeout)
+}
+
+// AckCompactionPause proposes this node's ack for a pause generation (#1087).
+func (n *Node) AckCompactionPause(p AckCompactionPausePayload, timeout time.Duration) error {
+	cmd, err := CompactionPauseAckCommand(p)
+	if err != nil {
+		return err
+	}
+	return n.Apply(cmd, timeout)
+}
+
+// CompactionPauseCommand builds the CommandSetCompactionPause entry, so the
+// leader-side Apply and the follower-side forward send the same bytes.
+func CompactionPauseCommand(p SetCompactionPausePayload) (*Command, error) {
+	payload, err := json.Marshal(p)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal compaction pause payload: %w", err)
+	}
+	return &Command{Type: CommandSetCompactionPause, Payload: payload}, nil
+}
+
+// CompactionPauseAckCommand builds the CommandAckCompactionPause entry.
+func CompactionPauseAckCommand(p AckCompactionPausePayload) (*Command, error) {
+	payload, err := json.Marshal(p)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal compaction pause ack payload: %w", err)
+	}
+	return &Command{Type: CommandAckCompactionPause, Payload: payload}, nil
+}
+
 // BatchFileOps applies a batch of RegisterFile and DeleteFile operations as a
 // single Raft log entry. Reduces compaction manifest apply from O(N) to 1.
 func (n *Node) BatchFileOps(ops []BatchFileOp, timeout time.Duration) error {
