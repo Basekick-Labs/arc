@@ -408,10 +408,13 @@ func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
 	// — the same thing filtering the names is there to prevent, leaked as an
 	// integer instead.
 	measurements, err := h.listMeasurements(ctx, name)
-	measurementCount := 0
-	if err == nil {
-		measurementCount = len(h.filterReadableMeasurements(c, name, measurements))
+	if err != nil {
+		h.logger.Error().Err(err).Str("database", name).Msg("Failed to list measurements")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to list measurements: " + err.Error(),
+		})
 	}
+	measurementCount := len(h.filterReadableMeasurements(c, name, measurements))
 
 	return c.JSON(DatabaseInfo{
 		Name:             name,
@@ -615,7 +618,10 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 
 	// Also delete the .arc-database marker file (not included in List due to hidden file filter)
 	markerPath := name + "/.arc-database"
-	if err := h.storage.Delete(ctx, markerPath); err == nil {
+	if err := h.storage.Delete(ctx, markerPath); err != nil {
+		h.logger.Warn().Err(err).Str("path", markerPath).Msg("Failed to delete database marker file")
+		deleteErrors = append(deleteErrors, markerPath+": "+err.Error())
+	} else {
 		deletedCount++
 		h.logger.Debug().Str("path", markerPath).Msg("Deleted database marker file")
 	}
