@@ -595,6 +595,16 @@ thing a new maintainer has to learn, and a refactor that moves a decision from
 four places to one is worth knowing about before you go looking for it in the
 old place.
 
+### Stale compaction manifests follow normal recovery ([#750](https://github.com/Basekick-Labs/arc/issues/750))
+
+Corrected the `ManifestMaxAge` and recovery comments and an earlier release note
+that said manifests over seven days old are deleted. Age triggers an investigation
+warning; recovery still validates the output and applies its usual cleanup and retry rules. A
+regression test verifies input cleanup for an eight-day-old manifest with a
+valid output. Runtime behavior is unchanged.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#921](https://github.com/Basekick-Labs/arc/pull/921).
+
 ### Compaction database-name sanitization is documented as non-unique ([#750](https://github.com/Basekick-Labs/arc/issues/750))
 
 The `sanitizeDBForName` comment now explains that replacing slashes with dots
