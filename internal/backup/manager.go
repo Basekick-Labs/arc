@@ -92,7 +92,14 @@ func NewManager(cfg *ManagerConfig) (*Manager, error) {
 		return nil, fmt.Errorf("backup path is required")
 	}
 
-	backupBackend, err := storage.NewLocalBackend(cfg.BackupPath, cfg.Logger)
+	// BackupPath is a local directory, and that is unchanged: it is still the
+	// one backup destination. Constructing it through the shared factory keeps
+	// the typed-nil guarantee (#713) and the backend dispatch in one place
+	// (internal/storage/factory.go).
+	backupBackend, err := storage.NewBackend(storage.BackendSpec{
+		Type:      "local",
+		LocalPath: cfg.BackupPath,
+	}, cfg.Logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create backup storage: %w", err)
 	}

@@ -72,6 +72,20 @@ s3_path_style = true        # MinIO/dev. AWS S3: false
 # Credentials via env: ARC_STORAGE_S3_ACCESS_KEY, ARC_STORAGE_S3_SECRET_KEY
 # On EKS with IRSA, leave both unset: Arc detects AWS_ROLE_ARN +
 # AWS_WEB_IDENTITY_TOKEN_FILE and authenticates via the pod's IAM role.
+#
+# A key prefix confines Arc to one subtree of the bucket or container, so
+# several deployments can share one, and so a backup target can live beside the
+# primary data. Both default to the root. Commented rather than set to "",
+# because a shipped value is the effective configuration for every deployment
+# that does not override it and an empty environment variable does not clear it
+# (see TestShippedArcTomlHasNoLiveColdTierConnectionValues).
+# s3_prefix = "instances/abc123"
+#
+# Azure Blob (when backend = "azure"). Credentials via env:
+# ARC_STORAGE_AZURE_ACCOUNT_NAME, ARC_STORAGE_AZURE_ACCOUNT_KEY (or
+# ARC_STORAGE_AZURE_CONNECTION_STRING).
+# azure_container = ""
+# azure_prefix = "instances/abc123"
 
 # -----------------------------------------------------------------------------
 # Ingestion
@@ -306,6 +320,10 @@ s3_region = "us-east-1"
 azure_container = ""
 azure_endpoint = ""
 azure_use_managed_identity = false
+# A prefix lets the cold tier share one container with the primary store. Left
+# commented for the same reason as the connection values above: a shipped value
+# cannot be cleared by an empty environment variable.
+# azure_prefix = "cold"
 
 # -----------------------------------------------------------------------------
 # Audit Logging (Enterprise)
@@ -320,6 +338,10 @@ include_reads = false           # Log GET/query requests (high volume)
 [backup]
 enabled = true
 local_path = "./data/backups"           # Directory for local backups
+# How long one backup or one restore may run before its context is cancelled.
+# Go duration syntax; must be positive. 2h is the value both were hardcoded to
+# before this key existed.
+# operation_timeout = "2h"
 
 # Query Management (Enterprise)
 # -----------------------------------------------------------------------------

@@ -304,6 +304,14 @@ func (m *Manager) copyIcebergWarehouse(ctx context.Context, backupID string, fil
 		default:
 		}
 		destPath := backupID + "/" + icebergBackupPrefix + "/" + f.rel
+		// Failing the whole run here is deliberate (#1100), for the same
+		// reason copyStateFiles fails on an unstorable key: absence would not
+		// be detectable. A warehouse is not routed per database and cannot be
+		// partially useful — Iceberg metadata is a graph of cross-references,
+		// so a backup holding all of it but one manifest list restores a
+		// catalog whose tables do not resolve, discovered at read time rather
+		// than at backup time. Only the data path skips, because a skipped
+		// data file is counted, named and still held by the source.
 		if err := storage.ValidateKey(destPath); err != nil {
 			return skipped, fmt.Errorf("iceberg warehouse file %q cannot be stored under a valid backup key: %w", f.rel, err)
 		}
@@ -340,7 +348,7 @@ func (m *Manager) streamLocalFileToBackup(ctx context.Context, srcAbs, destPath 
 		return 0, fmt.Errorf("%w: stat %s: %v", errBackupRead, srcAbs, err)
 	}
 	if err := m.backupStorage.WriteReader(ctx, destPath, f, info.Size()); err != nil {
-		m.cleanupPartialWrite(ctx, m.backupStorage, destPath)
+		m.cleanupPartialBackupWrite(ctx, destPath)
 		return 0, fmt.Errorf("failed to write to backup storage: %w", err)
 	}
 	return info.Size(), nil

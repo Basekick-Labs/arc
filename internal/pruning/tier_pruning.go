@@ -41,7 +41,7 @@ const (
 // range, existence-filtering against the tier's own backend.
 //
 // tierGlob is the tier's full glob ({base}/{db}/{measurement}/**/*.parquet,
-// where base may be local, s3://bucket/prefix, or azure://container).
+// where base may be local, s3://bucket/prefix, or azure://container/prefix).
 // allowFileTime additionally applies file-level time pruning (#660) — hot tier
 // only: the live hour that feature targets exists only on the hot tier, and
 // the feature is documented for the local backend.
