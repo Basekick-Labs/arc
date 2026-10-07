@@ -85,6 +85,50 @@ and scoping below the storage-root segment.
 
 ## Bug fixes
 
+### Iceberg export reclaims the manifest files expired snapshots leave behind ([#835](https://github.com/Basekick-Labs/arc/issues/835))
+
+Iceberg export never deleted the manifest lists and manifests of snapshots it had expired, so a
+table's `metadata/` directory grew with every commit for the life of the deployment and the whole
+pile was copied into every backup. On a rig with one live snapshot there were fifteen `.avro` files.
+
+The reconciler now sweeps them. After each pass it computes which manifest lists and manifests are
+still reachable — from **every** `metadata.json` left on disk, not just the current snapshot, since
+Arc deliberately keeps `retain_snapshots + 1` `v<N>.metadata.json` copies and iceberg-go keeps its
+own metadata log as entry points a directory reader can resolve — and deletes the `.avro` files in
+that directory that nothing can reach. Measured on the rig above: fifteen files down to ten, with
+every retained metadata version still resolving and DuckDB still reading the table.
+
+Three things bound what it will touch. Only files ending `.avro` directly in the table's metadata
+directory are ever deleted, so data files (`.parquet`, and outside that directory in any case),
+`version-hint.text`, the metadata files themselves and Iceberg's Puffin statistics are not
+deletable by this code path at all. A file must be older than a grace period — one hour, or twice
+`iceberg.reconcile_interval` if that is longer — so a manifest written by a commit that has not yet
+landed its `metadata.json` is left alone. And every failure fails closed: if the listing, a
+`metadata.json` or a manifest list cannot be read, the reachable set is incomplete and nothing is
+deleted at all. A warning says so; note that a warehouse restored with its `.avro` files lagging
+its `metadata.json` files can stay in that state until they are reconciled, since the sweep will
+not act on a reachable set it cannot complete.
+
+What the grace does **not** change is the window for a reader that has just resolved an older
+`v<N>.metadata.json`: the grace is keyed to a file's age, not to how long it has been unreachable,
+and a manifest is usually hours old by the time the last metadata version naming it is retired.
+That race is bounded as it was before this change, by `pruneOldVersionFiles` keeping
+`retain_snapshots + 1` of those copies so the version a reader just resolved is not the one being
+retired.
+
+This bounds the metadata directory rather than emptying it. The retained metadata versions keep
+their manifests alive on purpose, so the steady state is on the order of `retain_snapshots`
+commits' worth of `.avro` instead of unbounded growth.
+
+Set `iceberg.orphan_sweep_enabled = false` to restore the previous behaviour. It is the one deleter
+in the exporter whose work nothing regenerates, so it has an off switch; Arc logs a warning at
+startup when it is off.
+
+The second half of #835 — iceberg-go carrying forward manifests that hold only DELETED entries, so
+the live manifest list grows with the removal history and readers open every one when planning — is
+tracked in [#1106](https://github.com/Basekick-Labs/arc/issues/1106). It is a planning cost, not
+disk growth, and the fix belongs upstream.
+
 ### Existing Iceberg tables honor retention changes ([#1093](https://github.com/Basekick-Labs/arc/issues/1093))
 
 `iceberg.retain_snapshots` now updates Iceberg's metadata-file retention properties on existing tables. Reconciliation skips commits when the properties already match.
