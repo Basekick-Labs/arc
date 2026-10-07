@@ -33,9 +33,11 @@ func NewReader(filePath string, logger zerolog.Logger) *Reader {
 
 // Entry represents a single WAL entry
 type Entry struct {
-	TimestampUS  uint64                   // Microseconds since epoch
-	Records      []map[string]interface{} // Row format (from Append path)
-	ColumnarData *ColumnarEntry           // Columnar format (from AppendRaw path)
+	TimestampUS      uint64                   // Microseconds since epoch
+	PayloadHash      string                   // Entry identity: the writer-assigned "instanceSeq" (32 hex) for a tracked entry, else a SHA-256 of the logical payload (64 hex)
+	CheckpointHashes []string                 // Flush checkpoint identities, when present
+	Records          []map[string]interface{} // Row format (from Append path)
+	ColumnarData     *ColumnarEntry           // Columnar format (from AppendRaw path)
 }
 
 // ColumnarEntry represents a columnar WAL entry written via the zero-copy path
@@ -105,6 +107,111 @@ func (r *Reader) ReadAll() ([]Entry, error) {
 	return entries, nil
 }
 
+// ReadCheckpointHashes scans a WAL file for flush checkpoints without
+// materializing or decoding ordinary data entries. Non-checkpoint payloads are
+// skipped by seeking over their validated on-disk lengths; the recovery pass
+// still reads and checksum-validates entries before replaying them.
+func (r *Reader) ReadCheckpointHashes() ([]string, error) {
+	var hashes []string
+	f, err := os.Open(r.filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open WAL file: %w", err)
+	}
+	defer f.Close()
+
+	var header [WALFileHeaderSize]byte
+	if _, err := io.ReadFull(f, header[:]); err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			r.logger.Warn().Str("file", r.filePath).Msg("WAL file too short")
+			return hashes, nil
+		}
+		return nil, fmt.Errorf("failed to read WAL file header: %w", err)
+	}
+	if !bytes.Equal(header[0:4], WALMagic) {
+		return nil, fmt.Errorf("invalid WAL magic bytes")
+	}
+	version := binary.BigEndian.Uint16(header[4:6])
+	if version != WALVersion {
+		r.logger.Warn().Uint16("file_version", version).Uint16("expected_version", WALVersion).
+			Msg("WAL version mismatch")
+	}
+	fileInfo, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("failed to stat WAL file: %w", err)
+	}
+
+	for {
+		var entryHeader [WALEntryHeaderSize]byte
+		if _, err := io.ReadFull(f, entryHeader[:]); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				break
+			}
+			return hashes, fmt.Errorf("failed to read WAL entry header: %w", err)
+		}
+
+		payloadLen := binary.BigEndian.Uint32(entryHeader[0:4])
+		timestampUS := binary.BigEndian.Uint64(entryHeader[4:12])
+		expectedChecksum := binary.BigEndian.Uint32(entryHeader[12:16])
+		if payloadLen > MaxWALPayloadSize {
+			r.CorruptedEntries++
+			return hashes, fmt.Errorf("%w: size %d exceeds limit %d", ErrPayloadTooLarge, payloadLen, MaxWALPayloadSize)
+		}
+		payloadOffset, err := f.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return hashes, fmt.Errorf("failed to locate WAL payload: %w", err)
+		}
+		if payloadOffset+int64(payloadLen) > fileInfo.Size() {
+			r.CorruptedEntries++
+			r.logger.Warn().Str("file", r.filePath).Uint64("timestamp_us", timestampUS).
+				Msg("Skipping incomplete WAL entry while scanning checkpoints")
+			break
+		}
+		r.TotalEntries++
+		r.TotalBytes += int64(WALEntryHeaderSize) + int64(payloadLen)
+		if payloadLen == 0 {
+			continue
+		}
+
+		var marker [1]byte
+		if _, err := io.ReadFull(f, marker[:]); err != nil {
+			r.CorruptedEntries++
+			break
+		}
+		if marker[0] != WALCheckpointMarker {
+			if _, err := f.Seek(int64(payloadLen)-1, io.SeekCurrent); err != nil {
+				return hashes, fmt.Errorf("failed to skip WAL data payload: %w", err)
+			}
+			continue
+		}
+
+		payload := make([]byte, int(payloadLen))
+		payload[0] = marker[0]
+		if _, err := io.ReadFull(f, payload[1:]); err != nil {
+			r.CorruptedEntries++
+			break
+		}
+		if actualChecksum := crc32.ChecksumIEEE(payload); actualChecksum != expectedChecksum {
+			r.CorruptedEntries++
+			r.logger.Warn().Str("file", r.filePath).Uint64("timestamp_us", timestampUS).
+				Msg("Skipping WAL checkpoint with checksum mismatch")
+			continue
+		}
+		var checkpointHashes []string
+		if err := msgpack.Unmarshal(payload[1:], &checkpointHashes); err != nil {
+			r.CorruptedEntries++
+			r.logger.Warn().Err(err).Str("file", r.filePath).Uint64("timestamp_us", timestampUS).
+				Msg("Skipping malformed WAL checkpoint")
+			continue
+		}
+		hashes = append(hashes, checkpointHashes...)
+	}
+
+	r.logger.Debug().Str("file", r.filePath).Int64("entries", r.TotalEntries).
+		Int64("bytes", r.TotalBytes).Int64("corrupted", r.CorruptedEntries).
+		Int("checkpoint_hashes", len(hashes)).Msg("WAL checkpoint scan complete")
+	return hashes, nil
+}
+
 // readEntry reads a single entry from the file
 func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 	// Read entry header
@@ -143,15 +250,29 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 	if actualChecksum != expectedChecksum {
 		return nil, fmt.Errorf("checksum mismatch: expected %d, got %d", expectedChecksum, actualChecksum)
 	}
+	if len(payload) > 0 && payload[0] == WALCheckpointMarker {
+		var hashes []string
+		if err := msgpack.Unmarshal(payload[1:], &hashes); err != nil {
+			return nil, fmt.Errorf("failed to deserialize WAL checkpoint: %w", err)
+		}
+		return &Entry{TimestampUS: timestampUS, CheckpointHashes: hashes}, nil
+	}
+	payloadHashValue := payloadHash(payload)
+	logicalPayload := payload
+	if len(payload) >= 17 && payload[0] == WALTrackedMarker {
+		payloadHashValue = fmt.Sprintf("%016x%016x", binary.BigEndian.Uint64(payload[1:9]), binary.BigEndian.Uint64(payload[9:17]))
+		logicalPayload = payload[17:]
+	}
 
 	// Parse envelope to extract database name and inner msgpack payload
-	database, msgpackData := ParseEnvelope(payload, "")
+	database, msgpackData := ParseEnvelope(logicalPayload, "")
 
 	// Try row format first (array of maps from Append path)
 	var records []map[string]interface{}
 	if err := msgpack.Unmarshal(msgpackData, &records); err == nil {
 		return &Entry{
 			TimestampUS: timestampUS,
+			PayloadHash: payloadHashValue,
 			Records:     records,
 		}, nil
 	}
@@ -163,6 +284,7 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 			colEntry.Database = database
 			return &Entry{
 				TimestampUS:  timestampUS,
+				PayloadHash:  payloadHashValue,
 				ColumnarData: colEntry,
 			}, nil
 		}

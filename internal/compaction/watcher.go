@@ -112,6 +112,16 @@ type CompletionWatcherConfig struct {
 	// poll loop.
 	ApplyTimeout time.Duration
 
+	// PauseGate, when set, reports whether compaction is paused cluster-wide
+	// (#1087). While it reports paused, manifests in state output_written
+	// are left untouched: their phase-1 register would otherwise be
+	// re-issued by a fresh watcher (registeredOutputs is per instance, so a
+	// process restart or a regained lease re-registers), and a restore may
+	// just have removed that very output from the manifest. sources_deleted
+	// manifests are applied regardless: they are the drain the pause ack
+	// waits for. nil means never paused.
+	PauseGate func() bool
+
 	// Logger receives structured log output. Defaults to Nop if zero.
 	Logger zerolog.Logger
 }
@@ -150,6 +160,12 @@ type CompletionWatcher struct {
 	// single loop() goroutine. No lock needed. If applyOne is ever
 	// called from another goroutine, a lock must be added.
 	registeredOutputs map[string]struct{}
+
+	// pauseSkipLogged is set once the watcher has logged that it is leaving
+	// output_written manifests alone under a pause (#1087), and cleared when
+	// the pause ends, so the log line lands once per pause, not per tick.
+	// Same goroutine rule as registeredOutputs.
+	pauseSkipLogged bool
 
 	// Metrics (atomic for lock-free observability via Stats)
 	pollsTotal         atomic.Int64 // total scan cycles attempted
@@ -227,6 +243,39 @@ func (w *CompletionWatcher) Stop() {
 		Msg("Phase 4 completion watcher stopped")
 }
 
+// PendingCommits reports the completion manifests waiting in the pending
+// directory by state (#1087), so the cluster-wide compaction pause can tell
+// when this node has drained its phase-2 commits: sourcesDeleted counts
+// manifests whose inputs are gone from storage but not yet manifest-deleted
+// (the poll loop applies them at its next tick; the pause waits for zero),
+// outputWritten lists the job IDs of manifests whose output is registered but
+// whose subprocess has not yet reported the inputs deleted. Once no compaction
+// cycle is running no subprocess is alive, so an output_written manifest at
+// that point is stuck and will not advance; the caller warns and proceeds.
+// writing_output manifests are left out: they belong to a live subprocess, or
+// are orphans the startup cleanup removes. A manifest that cannot be read is
+// left out too: the poll loop cannot apply it either, so it is not a pending
+// commit. Reads only the directory; safe alongside the poll loop.
+func (w *CompletionWatcher) PendingCommits() (sourcesDeleted int, outputWritten []string, err error) {
+	paths, err := listPendingCompletionManifests(w.cfg.Dir)
+	if err != nil {
+		return 0, nil, err
+	}
+	for _, path := range paths {
+		manifest, rerr := readCompletionManifest(path)
+		if rerr != nil {
+			continue
+		}
+		switch manifest.State {
+		case CompletionStateSourcesDeleted:
+			sourcesDeleted++
+		case CompletionStateOutputWritten:
+			outputWritten = append(outputWritten, manifest.JobID)
+		}
+	}
+	return sourcesDeleted, outputWritten, nil
+}
+
 // Stats returns a point-in-time snapshot of the watcher's metrics, suitable
 // for /api/v1/cluster/status. The returned map is safe to marshal as JSON
 // directly — all values are int64 or strings.
@@ -300,6 +349,19 @@ func (w *CompletionWatcher) poll(ctx context.Context) {
 	}
 }
 
+// pausedByGate reports the cluster-wide compaction pause (#1087) through the
+// configured gate, and re-arms the once-per-pause log line when it ends.
+func (w *CompletionWatcher) pausedByGate() bool {
+	if w.cfg.PauseGate == nil {
+		return false
+	}
+	paused := w.cfg.PauseGate()
+	if !paused {
+		w.pauseSkipLogged = false
+	}
+	return paused
+}
+
 // applyOne processes a single completion manifest: read, apply via bridge,
 // remove on success. On bridge error leaves the manifest in place.
 func (w *CompletionWatcher) applyOne(ctx context.Context, path string) {
@@ -316,6 +378,23 @@ func (w *CompletionWatcher) applyOne(ctx context.Context, path string) {
 	// Orphan cleanup for stuck writing_output is handled separately by
 	// Manager.CleanupOrphanedCompletionManifests at startup.
 	if manifest.State == CompletionStateWritingOutput {
+		return
+	}
+
+	// The cluster-wide compaction pause (#1087): an output_written manifest
+	// waits for the pause to end. Its phase-1 register may already have been
+	// applied by a previous watcher instance, and a restore holding the
+	// pause may have removed that output from the manifest; re-registering
+	// it now would leave a manifest entry no node holds. sources_deleted
+	// manifests fall through: applying them is how this node drains before
+	// it acks the pause.
+	if manifest.State == CompletionStateOutputWritten && w.pausedByGate() {
+		if !w.pauseSkipLogged {
+			w.pauseSkipLogged = true
+			w.logger.Info().
+				Str("job_id", manifest.JobID).
+				Msg("Compaction is paused cluster-wide; leaving output_written completion manifests on disk until it ends")
+		}
 		return
 	}
 

@@ -14,8 +14,8 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// Pin the precise bug: an explicit Close plus a deferred Close causes
-// the same descriptor to be closed twice on successful promotion.
+// Guard against reintroducing redundant Close calls. Runtime cleanup and
+// close-error behavior are covered in append_reader_lifecycle_test.go.
 func TestAppendReaderSingleCloseIssue750(t *testing.T) {
 	parsed, err := parser.ParseFile(
 		token.NewFileSet(), "local.go", nil, 0,
