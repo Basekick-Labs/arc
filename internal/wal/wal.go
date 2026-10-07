@@ -375,6 +375,20 @@ var ErrWALDropped = errors.New("WAL entry dropped: async buffer full")
 // headroom needed for rotation, shutdown and WAL recovery (#676).
 var ErrWALDiskPressure = errors.New("WAL disk pressure: write rejected to preserve recovery headroom")
 
+// checkInitialWALHeadroom reports an actionable startup error when the WAL
+// filesystem cannot hold the first segment header.
+func checkInitialWALHeadroom(availableBytes uint64) error {
+	requiredBytes := uint64(WALFileHeaderSize)
+	if availableBytes >= requiredBytes {
+		return nil
+	}
+	return fmt.Errorf(
+		"insufficient free space to create the initial WAL file: %d bytes available, %d required; free space on the WAL filesystem before starting Arc",
+		availableBytes,
+		requiredBytes,
+	)
+}
+
 // walEntry is a pre-serialized WAL entry ready for writing
 type walEntry struct {
 	data    []byte // Complete entry: header + payload
@@ -578,6 +592,16 @@ func NewWriter(cfg *WriterConfig) (*Writer, error) {
 		pendingSeqs:     make(map[uint64]struct{}),
 		done:            make(chan struct{}),
 		trackedInstance: trackedInstance,
+	}
+
+	// Keep the preflight narrowly scoped to creating the initial file header.
+	// Requiring the normal ingest reserve here could prevent recovery from
+	// starting when older WAL data is already waiting to be flushed.
+	// A usage-probe failure remains fail-open; rotate below reports actual I/O errors.
+	if _, freeBytes, err := filesystemUsage(cfg.WALDir); err == nil {
+		if err := checkInitialWALHeadroom(freeBytes); err != nil {
+			return nil, err
+		}
 	}
 
 	// Initialize first WAL file

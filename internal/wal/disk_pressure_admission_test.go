@@ -10,6 +10,15 @@ import (
 	"github.com/rs/zerolog"
 )
 
+func TestInitialWALHeadroomPreflight(t *testing.T) {
+	if err := checkInitialWALHeadroom(uint64(WALFileHeaderSize - 1)); err == nil {
+		t.Fatal("preflight accepted less than the initial WAL header size")
+	}
+	if err := checkInitialWALHeadroom(uint64(WALFileHeaderSize)); err != nil {
+		t.Fatalf("preflight rejected exactly enough space for the initial WAL header: %v", err)
+	}
+}
+
 func TestDiskPressureAdmissionAccountsForQueuedWrites(t *testing.T) {
 	const (
 		concurrentWrites = 4
