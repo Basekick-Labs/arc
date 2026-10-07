@@ -360,7 +360,12 @@ func (b *sidecarBuilder) rows() []ManifestFile {
 // writeSidecar stores the run's rows under <backupID>/manifest-files.json,
 // streaming the JSON through a temp file rather than marshalling it in memory
 // next to the rows: a million-file backup has a sidecar of a few hundred MB.
-func (m *Manager) writeSidecar(ctx context.Context, backupID string, b *sidecarBuilder) error {
+//
+// One sidecar PER LEG, describing that leg's own rows (#1085 stage B2b-2), and
+// written even for a leg with no rows: a cluster restore refuses outright when
+// a backup has no sidecar, so an empty leg that skipped its own would make an
+// otherwise-good run unrestorable on a cluster.
+func (m *Manager) writeSidecar(ctx context.Context, dest backupTarget, backupID string, b *sidecarBuilder) error {
 	tmp, err := createTempFile("arc-backup-sidecar-*.json")
 	if err != nil {
 		return fmt.Errorf("failed to create sidecar temp file: %w", err)
@@ -400,27 +405,31 @@ func (m *Manager) writeSidecar(ctx context.Context, backupID string, b *sidecarB
 	if _, err := tmp.Seek(0, 0); err != nil {
 		return fmt.Errorf("failed to seek sidecar temp file: %w", err)
 	}
-	if err := m.destination().WriteReader(ctx, sidecarPath(backupID), tmp, info.Size()); err != nil {
-		m.cleanupPartialBackupWrite(ctx, sidecarPath(backupID))
-		return fmt.Errorf("failed to write the file sidecar to %s: %w", m.describeDestination(), err)
+	if err := dest.backend.WriteReader(ctx, sidecarPath(backupID), tmp, info.Size()); err != nil {
+		m.cleanupPartialBackupWrite(ctx, dest, sidecarPath(backupID))
+		return fmt.Errorf("failed to write the file sidecar to %s: %w", dest.describe(), err)
 	}
 	return nil
 }
 
-// readSidecar loads a backup's sidecar as a path-keyed map. ok is false,
-// with a nil error, when the backup has none (it predates #1083).
-func (m *Manager) readSidecar(ctx context.Context, backupID string) (entries map[string]ManifestFile, ok bool, err error) {
+// readSidecar loads one leg's sidecar as a path-keyed map. ok is false,
+// with a nil error, when that leg has none (the backup predates #1083).
+//
+// A restore unions every leg's sidecar before it writes anything: the rows are
+// disjoint by construction, since a path is copied by exactly the leg its
+// routing key names, so one map describes the whole run.
+func (m *Manager) readSidecar(ctx context.Context, dest backupTarget, backupID string) (entries map[string]ManifestFile, ok bool, err error) {
 	p := sidecarPath(backupID)
-	exists, err := m.destination().Exists(ctx, p)
+	exists, err := dest.backend.Exists(ctx, p)
 	if err != nil {
-		return nil, false, fmt.Errorf("failed to check for the file sidecar: %w", err)
+		return nil, false, fmt.Errorf("failed to check for the file sidecar in %s: %w", dest.describe(), err)
 	}
 	if !exists {
 		return nil, false, nil
 	}
-	data, err := m.destination().Read(ctx, p)
+	data, err := dest.backend.Read(ctx, p)
 	if err != nil {
-		return nil, false, fmt.Errorf("failed to read the file sidecar: %w", err)
+		return nil, false, fmt.Errorf("failed to read the file sidecar from %s: %w", dest.describe(), err)
 	}
 	var sc fileSidecar
 	if err := json.Unmarshal(data, &sc); err != nil {

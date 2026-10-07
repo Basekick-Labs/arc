@@ -25,9 +25,10 @@ import (
 // data loss.
 //
 // Built as a function over two Destinations rather than over one pair of
-// config blocks because stage B2b-2 compares N targets against each other as
-// well as against these two, and N-squared calls of a two-argument function is
-// the shape that extends without rewriting.
+// config blocks because the backup-target check compares N targets against
+// each other as well as against these two (#1085 stage B2b-2), and N-squared
+// calls of a two-argument function is the shape that extends without
+// rewriting.
 type Destination struct {
 	// Kind is "local", "s3" or "azure". The spelling aliases (minio for s3,
 	// azblob for azure) are normalised away, so two differently-spelled
@@ -56,9 +57,14 @@ type Destination struct {
 	// configuration, which is reachable only for an Azure config carrying
 	// neither an endpoint, an account name, nor a parseable connection string.
 	// Such a destination compares equal to every store of its kind, so the
-	// answer errs toward refusal — this check's whole job is upholding
-	// cleanupPartialBackupWrite's premise, and a false clearance there is
-	// deletion of objects the backup does not own. Note that config.Load
+	// answer errs toward refusal: a false clearance is a backup that re-copies
+	// itself on every run, or one the reconciliation sweep deletes, both
+	// permanent and both silent. (An earlier draft justified this by
+	// cleanupPartialBackupWrite's premise instead; that framing was retracted in
+	// config.checkBackupDestinationOverlap, where the real hazards are
+	// recorded, because that function's keys are all "<backupID>/..." for an ID
+	// the run minted and therefore carry their own premise.) Note that
+	// config.Load
 	// requires one of those three for an Azure block, so an unknown identity
 	// is a configuration Arc would already have refused.
 	StoreUnknown bool

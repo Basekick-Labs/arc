@@ -177,25 +177,365 @@ local_path = "/tmp/arc-audit-backups"
 	})
 }
 
-// TestBackupRefusesMoreThanOneTarget: B2b-1 routes to exactly one
-// destination, so a second target would be silently ignored — a destination an
-// operator believes they configured.
-func TestBackupRefusesMoreThanOneTarget(t *testing.T) {
+// TestSeveralBackupTargetsAreAllowed is the headline of #1085 stage B2b-2:
+// B2b-1 refused a second target outright, and that refusal is this change's
+// subject. Driven through the real Load() so the removal is observed where an
+// operator observes it.
+func TestSeveralBackupTargetsAreAllowed(t *testing.T) {
 	writeArcToml(t, `
 [backup]
-default_target = "audit"
+default_target = "main"
+[backup.targets.main]
+type = "local"
+local_path = "/tmp/arc-main-backups"
 [backup.targets.audit]
 type = "local"
 local_path = "/tmp/arc-audit-backups"
+databases = ["audit"]
+`)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() with two targets = %v, want success", err)
+	}
+	if len(cfg.Backup.Targets) != 2 {
+		t.Fatalf("Targets = %v, want both", cfg.Backup.Targets)
+	}
+	routing := cfg.Backup.RoutingMap()
+	if routing["audit"] != "audit" {
+		t.Errorf("RoutingMap() = %v, want audit routed to the audit target", routing)
+	}
+	if len(routing) != 1 {
+		t.Errorf("RoutingMap() = %v, want exactly one routed database", routing)
+	}
+}
+
+// TestBackupTargetDatabasesReadsEverySpelling is the accessor cell, and it is
+// a table over SPELLINGS rather than one case because the obvious accessor —
+// parseStringSlice(v.GetString(key)), which backup.target_names uses — reads
+// the TOML ARRAY as nothing at all, with no error: no routing, silently, in
+// the spelling the documentation itself writes. Measured, not reasoned about;
+// see parseTargetDatabases.
+func TestBackupTargetDatabasesReadsEverySpelling(t *testing.T) {
+	cases := []struct {
+		name    string
+		stanza  string
+		env     string
+		want    []string
+		routing map[string]string
+	}{
+		{
+			name:    "TOML array",
+			stanza:  "databases = [\"audit\", \"logs\"]",
+			want:    []string{"audit", "logs"},
+			routing: map[string]string{"audit": "audit", "logs": "audit"},
+		},
+		{
+			name:    "TOML comma-separated string",
+			stanza:  "databases = \"audit,logs\"",
+			want:    []string{"audit", "logs"},
+			routing: map[string]string{"audit": "audit", "logs": "audit"},
+		},
+		{
+			name:    "environment variable",
+			env:     "audit,logs",
+			want:    []string{"audit", "logs"},
+			routing: map[string]string{"audit": "audit", "logs": "audit"},
+		},
+		{
+			name:    "the environment overrides a file array",
+			stanza:  "databases = [\"fromfile\"]",
+			env:     "fromenv1,fromenv2",
+			want:    []string{"fromenv1", "fromenv2"},
+			routing: map[string]string{"fromenv1": "audit", "fromenv2": "audit"},
+		},
+		{
+			// The comma is the ONLY separator. v.GetStringSlice would also
+			// split this on whitespace (cast.ToStringSlice runs
+			// strings.Fields), which is why the accessor is a type switch on
+			// v.Get instead: storage.ValidateKeySegment accepts a space, so a
+			// database really can be called "audit logs" and splitting it
+			// produced two routing keys for databases that do not exist while
+			// the real one fell through to the default target.
+			name:    "a whitespace-separated scalar is ONE name",
+			stanza:  "databases = \"audit logs\"",
+			want:    []string{"audit logs"},
+			routing: map[string]string{"audit logs": "audit"},
+		},
+		{
+			// The same name in the array spelling, which was always correct.
+			// The two spellings are documented as equivalent, so a split that
+			// applied to only one of them was the worst shape this bug could
+			// take.
+			name:    "a name with a space in the array spelling",
+			stanza:  "databases = [\"my db\"]",
+			want:    []string{"my db"},
+			routing: map[string]string{"my db": "audit"},
+		},
+		{
+			name:    "a name with a space in the scalar spelling",
+			stanza:  "databases = \"my db\"",
+			want:    []string{"my db"},
+			routing: map[string]string{"my db": "audit"},
+		},
+		{
+			name:    "a name with a space from the environment",
+			env:     "my db,other",
+			want:    []string{"my db", "other"},
+			routing: map[string]string{"my db": "audit", "other": "audit"},
+		},
+		{
+			name:   "no databases at all",
+			stanza: "",
+			want:   nil,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			writeArcToml(t, `
+[backup]
+default_target = "main"
+[backup.targets.main]
+type = "local"
+local_path = "/tmp/arc-main-backups"
+[backup.targets.audit]
+type = "local"
+local_path = "/tmp/arc-audit-backups"
+`+c.stanza+"\n")
+			if c.env != "" {
+				t.Setenv("ARC_BACKUP_TARGETS_AUDIT_DATABASES", c.env)
+			}
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() = %v, want success", err)
+			}
+			got := cfg.Backup.Targets["audit"].Databases
+			if strings.Join(got, ",") != strings.Join(c.want, ",") {
+				t.Errorf("Databases = %v, want %v", got, c.want)
+			}
+			routing := cfg.Backup.RoutingMap()
+			if len(routing) != len(c.routing) {
+				t.Fatalf("RoutingMap() = %v, want %v", routing, c.routing)
+			}
+			for db, target := range c.routing {
+				if routing[db] != target {
+					t.Errorf("RoutingMap()[%q] = %q, want %q", db, routing[db], target)
+				}
+			}
+		})
+	}
+}
+
+// TestBackupTargetDatabasesValidation: each name is checked with the rules a
+// scoped backup applies to the same string, and one database cannot be claimed
+// by two targets — which would otherwise be a silent last-writer-wins over
+// where a database's only copy lands.
+func TestBackupTargetDatabasesValidation(t *testing.T) {
+	cases := []struct {
+		name   string
+		stanza string
+		want   string
+	}{
+		{
+			name:   "a reserved storage root is not a database",
+			stanza: "databases = [\"_schema\"]",
+			want:   "reserved storage root",
+		},
+		{
+			name:   "a name with a separator is not one segment",
+			stanza: "databases = [\"prod/cpu\"]",
+			want:   "not usable as a storage path segment",
+		},
+		{
+			name:   "a dot-prefixed name is not a database",
+			stanza: "databases = [\".hidden\"]",
+			want:   "reserved storage root",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			writeArcToml(t, `
+[backup]
+default_target = "main"
+[backup.targets.main]
+type = "local"
+local_path = "/tmp/arc-main-backups"
+[backup.targets.audit]
+type = "local"
+local_path = "/tmp/arc-audit-backups"
+`+c.stanza+"\n")
+			got := mustLoadError(t, c.want)
+			if !strings.Contains(got, "backup.targets.audit.databases") {
+				t.Errorf("refusal = %q, want it to name the key an operator edits", got)
+			}
+		})
+	}
+
+	t.Run("the same database on two targets is refused naming both", func(t *testing.T) {
+		writeArcToml(t, `
+[backup]
+default_target = "main"
+[backup.targets.main]
+type = "local"
+local_path = "/tmp/arc-main-backups"
+[backup.targets.audit]
+type = "local"
+local_path = "/tmp/arc-audit-backups"
+databases = ["prod"]
 [backup.targets.archive]
 type = "local"
 local_path = "/tmp/arc-archive-backups"
+databases = ["prod"]
 `)
-	got := mustLoadError(t, "only one is supported in this release")
-	for _, want := range []string{"archive", "audit"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("refusal = %q, want it to name %q", got, want)
+		got := mustLoadError(t, "goes to exactly one target")
+		for _, want := range []string{"archive", "audit", `"prod"`} {
+			if !strings.Contains(got, want) {
+				t.Errorf("refusal = %q, want it to name %q", got, want)
+			}
 		}
+	})
+
+	t.Run("the same database twice on ONE target is accepted", func(t *testing.T) {
+		writeArcToml(t, `
+[backup]
+default_target = "main"
+[backup.targets.main]
+type = "local"
+local_path = "/tmp/arc-main-backups"
+[backup.targets.audit]
+type = "local"
+local_path = "/tmp/arc-audit-backups"
+databases = ["prod", "prod"]
+`)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() = %v, want success: a repeat within one target says nothing new", err)
+		}
+		if routing := cfg.Backup.RoutingMap(); len(routing) != 1 || routing["prod"] != "audit" {
+			t.Errorf("RoutingMap() = %v, want prod routed once to audit", routing)
+		}
+	})
+
+	t.Run("databases on the DEFAULT target is a no-op", func(t *testing.T) {
+		writeArcToml(t, `
+[backup]
+default_target = "main"
+[backup.targets.main]
+type = "local"
+local_path = "/tmp/arc-main-backups"
+databases = ["prod"]
+`)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() = %v, want success: naming a database on the default target is harmless", err)
+		}
+		// Left out of the routing map on purpose: everything unrouted already
+		// goes to the default, so an entry would only make the map non-empty
+		// and cost the backup manager its single-destination fast path.
+		if routing := cfg.Backup.RoutingMap(); len(routing) != 0 {
+			t.Errorf("RoutingMap() = %v, want empty: the default target needs no routing entry", routing)
+		}
+	})
+}
+
+// TestTwoBackupTargetsThatContainOneAnotherAreRefused is the pairwise half of
+// the overlap check, which is new with several targets: two targets in one
+// bucket whose prefixes contain one another are ONE listing, so each leg would
+// enumerate the other objects and deleting one backup ID would reach both.
+func TestTwoBackupTargetsThatContainOneAnotherAreRefused(t *testing.T) {
+	for _, c := range []struct{ first, second string }{
+		{"", "backups"},
+		{"backups", "backups"},
+		{"backups", "backups/audit"},
+		{"backups/", "backups/audit/"},
+	} {
+		t.Run("main="+c.first+" audit="+c.second, func(t *testing.T) {
+			writeArcToml(t, `
+[storage]
+backend = "local"
+local_path = "./data/arc"
+[backup]
+default_target = "main"
+[backup.targets.main]
+type = "s3"
+s3_bucket = "acme-backups"
+s3_prefix = "`+c.first+`"
+[backup.targets.audit]
+type = "s3"
+s3_bucket = "acme-backups"
+s3_prefix = "`+c.second+`"
+databases = ["audit"]
+`)
+			got := mustLoadError(t, "two backup targets that contain one another")
+			for _, want := range []string{"backup target audit", "backup target main"} {
+				if !strings.Contains(got, want) {
+					t.Errorf("refusal = %q, want it to name %q", got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestTwoBackupTargetsWithDisjointPrefixesAreAllowed is the false-positive
+// half. Two targets in one bucket under unrelated prefixes is the shape an
+// operator picks on purpose; the sibling case is the #534 corollary, where
+// "backups-audit" must not read as a child of "backups".
+func TestTwoBackupTargetsWithDisjointPrefixesAreAllowed(t *testing.T) {
+	for _, c := range []struct{ first, second string }{
+		{"main", "audit"},
+		{"main/", "audit/"},
+		{"backups", "backups-audit"},
+		{"arc/main", "arc/audit"},
+	} {
+		t.Run("main="+c.first+" audit="+c.second, func(t *testing.T) {
+			writeArcToml(t, `
+[storage]
+backend = "local"
+local_path = "./data/arc"
+[backup]
+default_target = "main"
+[backup.targets.main]
+type = "s3"
+s3_bucket = "acme-backups"
+s3_prefix = "`+c.first+`"
+[backup.targets.audit]
+type = "s3"
+s3_bucket = "acme-backups"
+s3_prefix = "`+c.second+`"
+databases = ["audit"]
+`)
+			if _, err := Load(); err != nil {
+				t.Fatalf("Load() = %v, want success: one bucket with disjoint prefixes is legitimate", err)
+			}
+		})
+	}
+}
+
+// TestEveryBackupTargetIsCheckedForOverlap: the primary-storage and cold-tier
+// checks used to run against the ONE destination. With several targets the
+// loop has to cover each of them, and the row that proves it is a clean
+// default target plus a ROUTED target that overlaps — the one the old
+// single-destination check would have passed.
+func TestEveryBackupTargetIsCheckedForOverlap(t *testing.T) {
+	writeArcToml(t, `
+[storage]
+backend = "s3"
+s3_bucket = "acme"
+s3_prefix = "hot"
+[backup]
+default_target = "main"
+[backup.targets.main]
+type = "s3"
+s3_bucket = "acme"
+s3_prefix = "backups"
+[backup.targets.audit]
+type = "s3"
+s3_bucket = "acme"
+s3_prefix = "hot/audit-backups"
+databases = ["audit"]
+`)
+	got := mustLoadError(t, "overlaps primary storage")
+	if !strings.Contains(got, "backup target audit") {
+		t.Errorf("refusal = %q, want it to name the ROUTED target, not the default one", got)
 	}
 }
 
@@ -386,10 +726,15 @@ func TestDefaultsDoNotOverlap(t *testing.T) {
 	}
 }
 
-// TestDefaultIncludeConfigIsFalseOnlyForARemoteTarget: arc.toml holds the
-// target's own credentials, so the default must not copy it into the store
-// those credentials unlock. A LOCAL target keeps the old default, because a
-// local directory is not the thing the credentials open.
+// TestDefaultIncludeConfigIsFalseOnlyForARemoteTarget: arc.toml holds every
+// target's own credentials, so the default must not copy it into a store those
+// credentials unlock. A LOCAL target keeps the old default, because a local
+// directory is not the thing the credentials open.
+//
+// The last row is the one #1085 stage B2b-2 added: a LOCAL default plus one
+// REMOTE routed target still means arc.toml carries keys to an object store,
+// so the default has to key on ANY target being remote rather than on the
+// default one.
 func TestDefaultIncludeConfigIsFalseOnlyForARemoteTarget(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -417,6 +762,22 @@ func TestDefaultIncludeConfigIsFalseOnlyForARemoteTarget(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("a local default with a remote routed target", func(t *testing.T) {
+		b := BackupConfig{
+			DefaultTarget: "main",
+			Targets: map[string]BackupTargetConfig{
+				"main":  {Name: "main", Type: "local", LocalPath: "/tmp/arc-backups"},
+				"audit": {Name: "audit", Type: "s3", S3Bucket: "acme", Databases: []string{"audit"}},
+			},
+		}
+		if b.DefaultIncludeConfig() {
+			t.Error("DefaultIncludeConfig() = true with a remote ROUTED target, want false: arc.toml carries that target credentials too")
+		}
+		if !b.AnyTargetIsRemote() {
+			t.Error("AnyTargetIsRemote() = false, want true")
+		}
+	})
 }
 
 // TestBackupTargetRequiredFields: a destination missing the field that names

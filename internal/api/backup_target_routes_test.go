@@ -69,14 +69,15 @@ func newTargetRigFull(t *testing.T, name string, remote bool, configPath string,
 	destDir := t.TempDir()
 	manager, err := backup.NewManager(&backup.ManagerConfig{
 		DataStorage: dataStorage,
-		Target: &backup.Target{
+		Targets: []backup.Target{{
 			Name:   name,
 			Spec:   storage.BackendSpec{Type: "local", LocalPath: destDir},
 			Remote: remote,
-		},
-		InstanceID: instanceID,
-		ConfigPath: configPath,
-		Logger:     logger,
+		}},
+		DefaultTarget: name,
+		InstanceID:    instanceID,
+		ConfigPath:    configPath,
+		Logger:        logger,
 	})
 	if err != nil {
 		t.Fatalf("create backup manager: %v", err)
@@ -199,11 +200,14 @@ func TestIncludeConfigDefaultsOffForARemoteTarget(t *testing.T) {
 			t.Error("manifest has_config = false although the request asked for it; the default is safe, not a refusal")
 		}
 		out := logs.String()
-		if !strings.Contains(out, `"level":"warn"`) || !strings.Contains(out, "Copying arc.toml into a remote backup target") {
+		if !strings.Contains(out, `"level":"warn"`) || !strings.Contains(out, "Copying arc.toml into a backup while remote backup targets are configured") {
 			t.Errorf("no warning for an explicit include_config on a remote target; got: %s", out)
 		}
-		if !strings.Contains(out, `"target":"audit"`) {
-			t.Errorf("the warning does not name the target; got: %s", out)
+		// Every remote target, not just the default one (#1085 stage B2b-2):
+		// arc.toml carries all of their credentials, so the warning has to
+		// name each store whose keys the backup now holds.
+		if !strings.Contains(out, `"remote_targets":["audit"]`) {
+			t.Errorf("the warning does not name the remote targets; got: %s", out)
 		}
 	})
 }
@@ -251,7 +255,7 @@ func newUnreachableTargetRig(t *testing.T, name string) *targetRig {
 
 	manager, err := backup.NewManager(&backup.ManagerConfig{
 		DataStorage: dataStorage,
-		Target: &backup.Target{
+		Targets: []backup.Target{{
 			Name:   name,
 			Remote: true,
 			Spec: storage.BackendSpec{
@@ -265,8 +269,9 @@ func newUnreachableTargetRig(t *testing.T, name string) *targetRig {
 					PathStyle: true,
 				},
 			},
-		},
-		Logger: zerolog.Nop(),
+		}},
+		DefaultTarget: name,
+		Logger:        zerolog.Nop(),
 	})
 	if err != nil {
 		t.Fatalf("NewManager with an unreachable target = %v; it must succeed so the backup API comes up and reports per operation", err)

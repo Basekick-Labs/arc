@@ -960,7 +960,7 @@ func TestRestore_ClusterRegistersFromSidecarInBatchesByCount(t *testing.T) {
 func TestRestore_ClusterRegistersInBatchesByBytes(t *testing.T) {
 	backupDir, backupID, _, _ := seedClusterBackup(t, 10)
 	m0 := &Manager{backupStorage: mustLocalBackend(t, backupDir, zerolog.Nop()), logger: zerolog.Nop()}
-	entries, ok, err := m0.readSidecar(context.Background(), backupID)
+	entries, ok, err := m0.readSidecar(context.Background(), m0.defaultDestination(), backupID)
 	if err != nil || !ok {
 		t.Fatalf("sidecar: ok=%v err=%v", ok, err)
 	}
