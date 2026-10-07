@@ -51,6 +51,39 @@ func TestRunCatchUpDetectsSameSizeStaleCopy(t *testing.T) {
 
 // TestRunCatchUpSkipsSameSizeMatchingCopy verifies the cheap outcome we want
 // after the content check: an already-correct file is not downloaded again.
+// TestRunCatchUpKeepsSizeOnlyFastPathWithoutSnapshot verifies that ordinary
+// startup does not hash every local file. Content verification is explicitly
+// reserved for the snapshot-restore catch-up path.
+func TestRunCatchUpKeepsSizeOnlyFastPathWithoutSnapshot(t *testing.T) {
+	backend := newFakeBackend()
+	oldBody := []byte("old-generation")
+	newBody := []byte("new-generation")
+	if len(oldBody) != len(newBody) {
+		t.Fatalf("test bodies must have equal size")
+	}
+	if err := backend.Write(context.Background(), "testdb/cpu/normal-boot.parquet", oldBody); err != nil {
+		t.Fatalf("seed local file: %v", err)
+	}
+	hash := sha256.Sum256(newBody)
+	entry := makeEntry("testdb/cpu/normal-boot.parquet", "writer-1", int64(len(newBody)))
+	entry.SHA256 = fmt.Sprintf("%x", hash[:])
+
+	fetcher := newFakeFetcher()
+	resolver := staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true}
+	p := newTestPuller(t, backend, fetcher, resolver)
+	p.Start(context.Background())
+	defer p.Stop()
+
+	p.RunCatchUp(context.Background(), sliceFetcher([]*raft.FileEntry{entry}))
+	stats := p.Stats()
+	if stats["catchup_skipped_local"] != 1 {
+		t.Fatalf("normal catch-up did not keep size-only fast path: %+v", stats)
+	}
+	if fetcher.calls.Load() != 0 {
+		t.Fatalf("normal catch-up unexpectedly fetched same-size file: %d calls", fetcher.calls.Load())
+	}
+}
+
 func TestRunCatchUpSkipsSameSizeMatchingCopy(t *testing.T) {
 	backend := newFakeBackend()
 	body := []byte("current-generation")
