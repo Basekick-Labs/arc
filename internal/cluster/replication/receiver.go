@@ -25,6 +25,11 @@ type WALWriter interface {
 	AppendRaw(payload []byte) error
 }
 
+type trackedWALWriter interface {
+	AppendRawTracked(payload []byte) ([]string, error)
+	ForgetTracked(hashes []string)
+}
+
 // IngestHandler interface for applying entries to the ingest buffer
 type IngestHandler interface {
 	// ApplyReplicatedEntry applies a replicated entry to the local buffer
@@ -32,11 +37,29 @@ type IngestHandler interface {
 	ApplyReplicatedEntry(ctx context.Context, payload []byte) error
 }
 
+// WALIdentityIngestHandler accepts local WAL identities so the follower's
+// flush can checkpoint the entry and release its sequence-floor pin.
+type WALIdentityIngestHandler interface {
+	ApplyReplicatedEntryWithWAL(ctx context.Context, payload []byte, hashes []string) error
+}
+
 // IngestHandlerFunc is an adapter to allow the use of ordinary functions as IngestHandler.
 type IngestHandlerFunc func(ctx context.Context, payload []byte) error
 
 func (f IngestHandlerFunc) ApplyReplicatedEntry(ctx context.Context, payload []byte) error {
 	return f(ctx, payload)
+}
+
+// IngestHandlerWithWALFunc adapts a callback that also receives tracked local
+// WAL identities. It implements both handler interfaces for compatibility.
+type IngestHandlerWithWALFunc func(ctx context.Context, payload []byte, hashes []string) error
+
+func (f IngestHandlerWithWALFunc) ApplyReplicatedEntry(ctx context.Context, payload []byte) error {
+	return f(ctx, payload, nil)
+}
+
+func (f IngestHandlerWithWALFunc) ApplyReplicatedEntryWithWAL(ctx context.Context, payload []byte, hashes []string) error {
+	return f(ctx, payload, hashes)
 }
 
 // ReceiverConfig holds configuration for the replication receiver.
@@ -734,11 +757,23 @@ func (r *Receiver) receiveLoop() {
 // failed entry never reapplies. Both are worse than the brief
 // durability gap we accept here.
 func (r *Receiver) applyEntry(entry *ReplicateEntry) error {
+	var localWALHashes []string
+	trackedWAL, canTrackWAL := r.cfg.LocalWAL.(trackedWALWriter)
+	trackedIngest, canTrackIngest := r.cfg.IngestHandler.(WALIdentityIngestHandler)
+	trackLocalWAL := canTrackWAL && canTrackIngest
+
 	// Write to local WAL first (if configured). A drop on backpressure
 	// is non-fatal — see function doc.
 	if r.cfg.LocalWAL != nil {
-		if err := r.cfg.LocalWAL.AppendRaw(entry.Payload); err != nil {
+		var err error
+		if trackLocalWAL {
+			localWALHashes, err = trackedWAL.AppendRawTracked(entry.Payload)
+		} else {
+			err = r.cfg.LocalWAL.AppendRaw(entry.Payload)
+		}
+		if err != nil {
 			if errors.Is(err, wal.ErrWALDropped) {
+				localWALHashes = nil
 				r.totalLocalWALDropped.Add(1)
 				// Sampled Warn — at most one line per walDropLogIntervalNano.
 				// Sustained backpressure can drop one entry per replicated
@@ -760,7 +795,16 @@ func (r *Receiver) applyEntry(entry *ReplicateEntry) error {
 
 	// Apply to ingest handler (if configured)
 	if r.cfg.IngestHandler != nil {
-		if err := r.cfg.IngestHandler.ApplyReplicatedEntry(r.ctx, entry.Payload); err != nil {
+		var err error
+		if canTrackIngest {
+			err = trackedIngest.ApplyReplicatedEntryWithWAL(r.ctx, entry.Payload, localWALHashes)
+		} else {
+			err = r.cfg.IngestHandler.ApplyReplicatedEntry(r.ctx, entry.Payload)
+		}
+		if err != nil {
+			if trackLocalWAL && len(localWALHashes) > 0 {
+				trackedWAL.ForgetTracked(localWALHashes)
+			}
 			return fmt.Errorf("apply to ingest: %w", err)
 		}
 	}

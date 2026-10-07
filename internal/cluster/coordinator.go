@@ -4891,7 +4891,7 @@ func (c *Coordinator) startReceiverWithAddr(writerAddr string) error {
 // payloads and writes them to the local ArrowBuffer (NoWAL variant — the receiver's
 // LocalWAL path already handles WAL persistence).
 func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler {
-	return replication.IngestHandlerFunc(func(ctx context.Context, payload []byte) error {
+	return replication.IngestHandlerWithWALFunc(func(ctx context.Context, payload []byte, walHashes []string) error {
 		// Safety: read-lock to avoid data race with SetIngestBuffer
 		c.mu.RLock()
 		buf := c.ingestBuffer
@@ -4915,7 +4915,7 @@ func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler 
 						}
 					}
 					if len(typedColumns) > 0 {
-						return buf.WriteColumnarDirectNoWAL(ctx, database, measurement, typedColumns)
+						return buf.WriteColumnarDirectNoWALWithHashes(ctx, database, measurement, typedColumns, walHashes)
 					}
 				}
 			}
@@ -4940,7 +4940,7 @@ func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler 
 			for measurement, rows := range byMeasurement {
 				columns := rowsToColumns(rows)
 				if len(columns) > 0 {
-					if err := buf.WriteColumnarDirectNoWAL(ctx, database, measurement, columns); err != nil {
+					if err := buf.WriteColumnarDirectNoWALWithHashes(ctx, database, measurement, columns, walHashes); err != nil {
 						return fmt.Errorf("write replicated rows for %s: %w", measurement, err)
 					}
 				}

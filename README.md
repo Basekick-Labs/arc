@@ -323,10 +323,9 @@ CMVP-certified; Arc itself is not a CMVP-listed module. See the
 - **Query**: Full analytical SQL; JSON, columnar MessagePack, and Apache Arrow IPC responses
 - **Compaction**: Tiered (hourly/daily) automatic Parquet file merging — 10x storage reduction
 - **Data Lifecycle**: Retention policies, continuous queries, tiered storage (hot/cold)
-- **Durability**: Optional write-ahead log (WAL), backup and restore
+- **Durability**: Optional write-ahead log (WAL), backup and restore; [WAL recovery monitoring](docs/operations/wal-recovery.md)
 - **Storage**: Local filesystem, S3 and S3-compatible object stores (SeaweedFS, R2, MinIO, ...), Azure Blob
 - **Auth**: Token-based authentication with in-memory caching
-- **Durability**: Optional write-ahead log (WAL)
 - **Data Management**: GDPR-compliant delete operations
 - **Observability**: Prometheus metrics, structured logging, graceful shutdown
 - **Reliability**: Circuit breakers, retry with exponential backoff

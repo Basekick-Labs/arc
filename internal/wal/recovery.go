@@ -2,9 +2,11 @@ package wal
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -12,6 +14,11 @@ import (
 
 // RecoveryCallback is called for each batch of records during recovery (row format)
 type RecoveryCallback func(ctx context.Context, records []map[string]interface{}) error
+
+// TrackedRecoveryCallback receives the original WAL entry identity so the
+// eventual buffer flush can checkpoint the same entry if the recovery barrier
+// fails and the file must be replayed again.
+type TrackedRecoveryCallback func(ctx context.Context, records []map[string]interface{}, walIdentity string) error
 
 // ColumnarRecoveryCallback is called for columnar WAL entries during recovery.
 //
@@ -28,6 +35,9 @@ type RecoveryStats struct {
 	RecoveredEntries int
 	CorruptedEntries int
 	SkippedFiles     int
+	KeptFiles        int
+	BarrierFailures  int
+	QuarantinedFiles int
 	RecoveryDuration time.Duration
 }
 
@@ -49,6 +59,12 @@ type RecoveryOptions struct {
 	// ColumnarCallback handles columnar WAL entries from the zero-copy write path
 	ColumnarCallback ColumnarRecoveryCallback
 
+	// TrackedRowCallback handles row-format entries while preserving the entry's
+	// identity through the buffer flush. When configured, it receives the full
+	// WAL entry at once so a single identity is not split across independent
+	// flush tasks.
+	TrackedRowCallback TrackedRecoveryCallback
+
 	// MinFileAge, when > 0, skips WAL files modified more recently than this.
 	// Defense against the #594 class beyond the SkipActiveFile name match:
 	// the periodic recovery reads CurrentFile() and then scans — a rotation
@@ -58,19 +74,48 @@ type RecoveryOptions struct {
 	// recoverable young file is picked up by the next pass. Zero disables
 	// the guard (tests recover freshly-written files).
 	MinFileAge time.Duration
+
+	// MinFileAgeExemptFiles are known-closed files that may be recovered even
+	// when their modification time is recent. The periodic recovery path uses
+	// this for the file that Writer.Rotate just closed; MinFileAge still
+	// protects files that rotate while recovery is scanning.
+	MinFileAgeExemptFiles []string
+
+	// BeforeDelete is an epoch barrier that must make every replayed entry in a
+	// batch durable before the corresponding WAL files are removed. The
+	// callback runs after BarrierBatchFiles files or BarrierBatchRows records
+	// have replayed, whichever threshold is reached first. A nil callback means
+	// the recovery callback itself provides synchronous durability.
+	BeforeDelete func(context.Context) error
+
+	// BarrierBatchFiles bounds how many successfully replayed files are covered
+	// by one BeforeDelete call. Defaults to 16 when BeforeDelete is configured.
+	BarrierBatchFiles int
+
+	// BarrierBatchRows optionally triggers BeforeDelete after this many rows
+	// have replayed, allowing callers to align barriers with max_buffer_size.
+	BarrierBatchRows int
+
+	// MaxReplayFailures is the number of failed replay passes before a poison
+	// WAL file is quarantined as .wal.failed. Defaults to 3.
+	MaxReplayFailures int
 }
 
 // Recovery manages WAL recovery operations
 type Recovery struct {
 	walDir string
 	logger zerolog.Logger
+
+	failuresMu sync.Mutex
+	failures   map[string]int
 }
 
 // NewRecovery creates a new WAL recovery manager
 func NewRecovery(walDir string, logger zerolog.Logger) *Recovery {
 	return &Recovery{
-		walDir: walDir,
-		logger: logger.With().Str("component", "wal-recovery").Logger(),
+		walDir:   walDir,
+		logger:   logger.With().Str("component", "wal-recovery").Logger(),
+		failures: make(map[string]int),
 	}
 }
 
@@ -86,6 +131,18 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 
 	if opts == nil {
 		opts = &RecoveryOptions{}
+	}
+	barrierBatchFiles := opts.BarrierBatchFiles
+	if barrierBatchFiles <= 0 {
+		barrierBatchFiles = 16
+	}
+	maxReplayFailures := opts.MaxReplayFailures
+	if maxReplayFailures <= 0 {
+		maxReplayFailures = 3
+	}
+	minAgeExempt := make(map[string]struct{}, len(opts.MinFileAgeExemptFiles))
+	for _, path := range opts.MinFileAgeExemptFiles {
+		minAgeExempt[filepath.Clean(path)] = struct{}{}
 	}
 
 	// Check if WAL directory exists
@@ -112,6 +169,73 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		flushed[hash] = struct{}{}
 	}
 
+	type recoveredWALFile struct {
+		path    string
+		entries int
+		batches int
+	}
+	var pendingDelete []recoveredWALFile
+	pendingRows := 0
+	var recoveryErr error
+	flushPending := func() bool {
+		if len(pendingDelete) == 0 {
+			return true
+		}
+		if opts.BeforeDelete != nil {
+			if err := opts.BeforeDelete(ctx); err != nil {
+				stats.BarrierFailures++
+				stats.KeptFiles += len(pendingDelete)
+				recoveryErr = fmt.Errorf("WAL recovery flush barrier: %w", err)
+				r.logger.Error().Err(err).
+					Int("files", len(pendingDelete)).
+					Msg("WAL recovery flush barrier failed; keeping replayed files")
+				pendingDelete = nil
+				pendingRows = 0
+				return false
+			}
+		}
+		for index, recovered := range pendingDelete {
+			if err := os.Remove(recovered.path); err != nil {
+				if !os.IsNotExist(err) {
+					stats.KeptFiles += len(pendingDelete) - index
+					recoveryErr = fmt.Errorf("delete durably recovered WAL file %q: %w", recovered.path, err)
+					r.logger.Error().Err(err).Str("file", recovered.path).Msg("Failed to delete durably recovered WAL file")
+					pendingDelete = nil
+					pendingRows = 0
+					return false
+				}
+			}
+			stats.RecoveredFiles++
+			stats.RecoveredBatches += recovered.batches
+			stats.RecoveredEntries += recovered.entries
+			r.logger.Info().
+				Str("file", filepath.Base(recovered.path)).
+				Int("entries", recovered.entries).
+				Msg("WAL file recovered, flushed, and deleted")
+		}
+		pendingDelete = nil
+		pendingRows = 0
+		return true
+	}
+	recordReplayFailure := func(path string, cause error) bool {
+		quarantined, quarantineErr := r.noteReplayFailure(path, maxReplayFailures)
+		if quarantineErr != nil {
+			stats.KeptFiles++
+			r.logger.Error().Err(quarantineErr).Str("file", path).Msg("Failed to quarantine repeatedly failing WAL file")
+			return false
+		}
+		if quarantined {
+			stats.QuarantinedFiles++
+			r.logger.Error().Err(cause).
+				Str("file", filepath.Base(path)).
+				Int("attempts", maxReplayFailures).
+				Msg("Quarantined WAL file after repeated recovery failures")
+			return true
+		}
+		stats.KeptFiles++
+		return false
+	}
+
 	// Scan non-active files for checkpoints before invoking callbacks. A flush
 	// checkpoint can land in the next WAL file after rotation, while the data
 	// entry remains in the previous file. Recently rotated files are scanned for
@@ -119,6 +243,7 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 	for _, walFile := range walFiles {
 		select {
 		case <-ctx.Done():
+			stats.KeptFiles += len(pendingDelete)
 			return stats, ctx.Err()
 		default:
 		}
@@ -142,20 +267,25 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 	}
 
 	// Process each WAL file
-	for _, walFile := range walFiles {
+	for fileIndex, walFile := range walFiles {
 		select {
 		case <-ctx.Done():
+			stats.KeptFiles += len(pendingDelete)
 			return stats, ctx.Err()
 		default:
 		}
 		if opts.SkipActiveFile != "" && walFile == opts.SkipActiveFile {
-			continue
+			stats.KeptFiles += len(walFiles) - fileIndex - 1
+			break
 		}
 		if opts.MinFileAge > 0 {
-			if info, statErr := os.Stat(walFile); statErr == nil && time.Since(info.ModTime()) < opts.MinFileAge {
+			_, exempt := minAgeExempt[filepath.Clean(walFile)]
+			if info, statErr := os.Stat(walFile); !exempt && statErr == nil && time.Since(info.ModTime()) < opts.MinFileAge {
 				r.logger.Debug().Str("file", filepath.Base(walFile)).Msg("Skipping too-recent WAL file (possible fresh rotation)")
 				stats.SkippedFiles++
-				continue
+				stats.KeptFiles++
+				stats.KeptFiles += len(walFiles) - fileIndex - 1
+				break
 			}
 		}
 
@@ -163,6 +293,10 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		entries, err := reader.ReadAll()
 		if err != nil {
 			r.logger.Error().Err(err).Str("file", walFile).Msg("Failed to read WAL file")
+			if !recordReplayFailure(walFile, err) {
+				stats.KeptFiles += len(walFiles) - fileIndex - 1
+				break
+			}
 			continue
 		}
 		r.logger.Info().Str("file", filepath.Base(walFile)).Msg("Recovering WAL file")
@@ -189,10 +323,8 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 					// (e.g. a payload the write path rejects) must not
 					// discard every durable entry after it. The file is not
 					// deleted by THIS recovery pass (allEntriesSucceeded=
-					// false); note the periodic WAL maintenance will still
-					// purge it once it passes safeAge, so the failed entry
-					// is not durably retried — the win here is only that
-					// the healthy entries after it get replayed now.
+					// false); repeated callback failures eventually quarantine
+					// the file rather than age-purging its remaining data.
 					r.logger.Error().Err(err).
 						Str("database", entry.ColumnarData.Database).
 						Str("measurement", entry.ColumnarData.Measurement).
@@ -209,8 +341,15 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 				}
 			} else if entry.Records != nil {
 				// Row-format entry from Append path
-				// Apply rate limiting via batch size if configured
-				if opts.BatchSize > 0 && len(entry.Records) > opts.BatchSize {
+				if opts.TrackedRowCallback != nil {
+					if err := opts.TrackedRowCallback(ctx, entry.Records, entry.PayloadHash); err != nil {
+						r.logger.Error().Err(err).Msg("Failed to replay tracked WAL entry")
+						allEntriesSucceeded = false
+						break
+					}
+					fileRecoveredBatches++
+					fileRecoveredEntries += len(entry.Records)
+				} else if opts.BatchSize > 0 && len(entry.Records) > opts.BatchSize {
 					for i := 0; i < len(entry.Records); i += opts.BatchSize {
 						end := i + opts.BatchSize
 						if end > len(entry.Records) {
@@ -248,36 +387,58 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		}
 
 		stats.CorruptedEntries += int(reader.CorruptedEntries)
+		if reader.CorruptedEntries > 0 {
+			allEntriesSucceeded = false
+		}
 
 		// Only delete WAL file if ALL entries were successfully replayed
 		if allEntriesSucceeded && len(entries) > 0 {
-			stats.RecoveredBatches += fileRecoveredBatches
-			stats.RecoveredEntries += fileRecoveredEntries
-			stats.RecoveredFiles++
-
-			// Delete the WAL file after successful recovery
-			if err := os.Remove(walFile); err != nil {
-				r.logger.Error().Err(err).Str("file", walFile).Msg("Failed to delete recovered WAL file")
+			r.clearReplayFailure(walFile)
+			if fileRecoveredBatches == 0 || opts.BeforeDelete == nil {
+				pendingDelete = append(pendingDelete, recoveredWALFile{path: walFile, entries: fileRecoveredEntries, batches: fileRecoveredBatches})
+				if !flushPending() {
+					stats.KeptFiles += len(walFiles) - fileIndex - 1
+					break
+				}
 			} else {
-				r.logger.Info().
-					Str("file", filepath.Base(walFile)).
-					Int("entries", fileRecoveredEntries).
-					Msg("WAL file recovered and deleted")
+				pendingDelete = append(pendingDelete, recoveredWALFile{path: walFile, entries: fileRecoveredEntries, batches: fileRecoveredBatches})
+				pendingRows += fileRecoveredEntries
+				rowsReached := opts.BarrierBatchRows > 0 && pendingRows >= opts.BarrierBatchRows
+				if len(pendingDelete) >= barrierBatchFiles || rowsReached {
+					if !flushPending() {
+						stats.KeptFiles += len(walFiles) - fileIndex - 1
+						break
+					}
+				}
 			}
 		} else if allEntriesSucceeded && len(entries) == 0 {
 			// Empty WAL file (header-only, 7 bytes) — safe to delete
 			if err := os.Remove(walFile); err != nil {
-				r.logger.Error().Err(err).Str("file", walFile).Msg("Failed to delete empty WAL file")
-			} else {
-				r.logger.Debug().Str("file", filepath.Base(walFile)).Msg("Deleted empty WAL file")
+				if !os.IsNotExist(err) {
+					stats.KeptFiles++
+					stats.KeptFiles += len(walFiles) - fileIndex - 1
+					recoveryErr = fmt.Errorf("delete empty WAL file %q: %w", walFile, err)
+					break
+				}
 			}
+			r.logger.Debug().Str("file", filepath.Base(walFile)).Msg("Deleted empty WAL file")
+			stats.RecoveredFiles++
+			r.clearReplayFailure(walFile)
 		} else if !allEntriesSucceeded {
+			quarantined := recordReplayFailure(walFile, fmt.Errorf("one or more entries could not be replayed"))
 			r.logger.Warn().
 				Str("file", filepath.Base(walFile)).
 				Int("recovered_entries", fileRecoveredEntries).
 				Int("total_entries", len(entries)).
-				Msg("WAL file partially recovered - keeping for retry")
+				Msg("WAL file replay failed; keeping it or quarantining after repeated failures")
+			if !quarantined {
+				stats.KeptFiles += len(walFiles) - fileIndex - 1
+				break
+			}
 		}
+	}
+	if recoveryErr == nil {
+		flushPending()
 	}
 
 	stats.RecoveryDuration = time.Since(startTime)
@@ -288,10 +449,49 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		Int("entries", stats.RecoveredEntries).
 		Int("corrupted", stats.CorruptedEntries).
 		Int("skipped", stats.SkippedFiles).
+		Int("kept", stats.KeptFiles).
+		Int("barrier_failures", stats.BarrierFailures).
+		Int("quarantined", stats.QuarantinedFiles).
 		Dur("duration", stats.RecoveryDuration).
 		Msg("WAL recovery complete")
 
-	return stats, nil
+	return stats, recoveryErr
+}
+
+// noteReplayFailure counts consecutive failed replay passes for a WAL file and
+// moves it out of the recovery glob after the configured threshold. The
+// quarantined file remains on disk for operator inspection; it is never
+// discarded as part of recovery.
+func (r *Recovery) noteReplayFailure(path string, maxAttempts int) (bool, error) {
+	r.failuresMu.Lock()
+	if r.failures == nil {
+		r.failures = make(map[string]int)
+	}
+	r.failures[path]++
+	attempts := r.failures[path]
+	r.failuresMu.Unlock()
+	if attempts < maxAttempts {
+		return false, nil
+	}
+
+	quarantinePath := path + ".failed"
+	if _, err := os.Lstat(quarantinePath); err == nil {
+		quarantinePath = fmt.Sprintf("%s.%d.failed", path, time.Now().UnixNano())
+	}
+	if err := os.Rename(path, quarantinePath); err != nil {
+		return false, err
+	}
+
+	r.failuresMu.Lock()
+	delete(r.failures, path)
+	r.failuresMu.Unlock()
+	return true, nil
+}
+
+func (r *Recovery) clearReplayFailure(path string) {
+	r.failuresMu.Lock()
+	delete(r.failures, path)
+	r.failuresMu.Unlock()
 }
 
 // findWALFiles finds all WAL files in the directory, sorted by modification time
