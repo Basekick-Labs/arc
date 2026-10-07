@@ -80,6 +80,23 @@ const cacheInvalidateHMACTolerance = security.HMACTimestampTolerance
 // own default (internal/config/config.go, setDefaults).
 const defaultShutdownTimeout = 30 * time.Second
 
+type clusterReplicationStarter interface {
+	SetWAL(*wal.Writer)
+	SetIngestBuffer(*ingest.ArrowBuffer)
+	StartReplication() error
+}
+
+// startClusterWALReplication wires the node-local inputs required by WAL
+// replication. Readers do not need a local WAL, but still need replication
+// started so they can receive the writer's live entries.
+func startClusterWALReplication(coordinator clusterReplicationStarter, walWriter *wal.Writer, buffer *ingest.ArrowBuffer) error {
+	if walWriter != nil {
+		coordinator.SetWAL(walWriter)
+	}
+	coordinator.SetIngestBuffer(buffer)
+	return coordinator.StartReplication()
+}
+
 // Seams for applyLicenseCoreLimits' tests. CI runners cannot be given a CPU
 // quota, and runtime.NumCPU() cannot be set at all, so without these the
 // license-clamp tests silently lose their teeth on a runner whose core count
@@ -2025,11 +2042,11 @@ func main() {
 							}
 						}
 
-						// Wire up WAL replication if enabled
-						if cfg.Cluster.ReplicationEnabled && walWriter != nil {
-							clusterCoordinator.SetWAL(walWriter)
-							clusterCoordinator.SetIngestBuffer(arrowBuffer)
-							if err := clusterCoordinator.StartReplication(); err != nil {
+						// Wire up WAL replication if enabled. Readers can receive
+						// entries without owning a local WAL; only the sender needs
+						// one, so SetWAL remains conditional while startup does not.
+						if cfg.Cluster.ReplicationEnabled {
+							if err := startClusterWALReplication(clusterCoordinator, walWriter, arrowBuffer); err != nil {
 								log.Warn().Err(err).Msg("Failed to start WAL replication")
 							} else {
 								log.Info().

@@ -4519,6 +4519,10 @@ func (c *Coordinator) StartReplication() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if (c.localNode.Role == RoleWriter || c.localNode.Role == RoleStandalone) && c.walWriter == nil {
+		return fmt.Errorf("WAL replication is enabled on %s node, but WAL is disabled", c.localNode.Role)
+	}
+
 	// c.ctx is initialized in Start() — we must NOT overwrite it here,
 	// otherwise handleFetchFile and other goroutines using the original
 	// context would end up with an orphan parent. StartReplication runs
@@ -4850,6 +4854,7 @@ func (c *Coordinator) startReceiverWithAddr(writerAddr string) error {
 	if c.ingestBuffer != nil {
 		ingestHandler = c.buildReplicationIngestHandler()
 	}
+	localWAL := receiverWALWriter(c.walWriter)
 
 	// Stream-auth wiring (GHSA-wfgr-8x84-22q7): the receiver computes
 	// the handshake HMAC from SharedSecret + ClusterName + ReaderID
@@ -4865,7 +4870,7 @@ func (c *Coordinator) startReceiverWithAddr(writerAddr string) error {
 	c.replicationReceiver = replication.NewReceiver(&replication.ReceiverConfig{
 		ReaderID:          c.localNode.ID,
 		WriterAddr:        writerAddr,
-		LocalWAL:          c.walWriter,
+		LocalWAL:          localWAL,
 		IngestHandler:     ingestHandler,
 		ReconnectInterval: 5 * time.Second,
 		AckInterval:       time.Duration(c.cfg.ReplicationAckInterval) * time.Millisecond,
@@ -4885,6 +4890,16 @@ func (c *Coordinator) startReceiverWithAddr(writerAddr string) error {
 		Msg("Replication receiver started (reader mode)")
 
 	return nil
+}
+
+// receiverWALWriter preserves a truly nil interface when WAL is disabled.
+// Assigning a nil *wal.Writer directly to replication.WALWriter would create
+// a non-nil interface containing a nil pointer, which panics on AppendRaw.
+func receiverWALWriter(walWriter *wal.Writer) replication.WALWriter {
+	if walWriter == nil {
+		return nil
+	}
+	return walWriter
 }
 
 // buildReplicationIngestHandler creates an IngestHandler that parses WAL envelope

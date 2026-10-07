@@ -135,6 +135,9 @@ type Manager struct {
 	// Nil in production. Deterministic cycle tests may inject a batch
 	// runner without starting an external compaction subprocess.
 	compactBatchForTest func(context.Context, Candidate) error
+	// Nil in production. Cycle tests can synchronize after batches enter
+	// accounting and before worker capacity is acquired.
+	afterBatchDiscoveryForTest func(discovered int64)
 
 	// pauseGate, when set, reports whether compaction is paused cluster-wide
 	// (#1087); main.go wires it to the cluster coordinator. Consulted at
@@ -1399,7 +1402,10 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 					}
 
 					tierCandidateCount += len(batches)
-					discovered.Add(int64(len(batches)))
+					discoveredBatches := discovered.Add(int64(len(batches)))
+					if m.afterBatchDiscoveryForTest != nil {
+						m.afterBatchDiscoveryForTest(discoveredBatches)
+					}
 
 					// Capacity acquisition must not outlive the cycle budget.
 					select {
