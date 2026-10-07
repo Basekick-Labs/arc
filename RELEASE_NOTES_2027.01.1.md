@@ -936,6 +936,19 @@ the masker was hardened against in 26.09.1 and 26.09.2.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#937](https://github.com/Basekick-Labs/arc/pull/937).
 
+### The tiering files endpoint rejects an invalid `limit` ([#1135](https://github.com/Basekick-Labs/arc/issues/1135))
+
+`GET /api/v1/tiering/files?limit=-1` returned a 500 and logged a stack trace. The handler read the
+limit without validating it and then sliced the result with it, and the guard it used
+(`len(files) > limit`) can never be false for a negative value — so `files[:-1]` panicked, even when
+no files were tiered. It needed an authenticated admin on a licensed deployment, and Arc's panic
+recovery turned it into a 500 rather than a crash.
+
+Invalid limits now return 400, and the slice is clamped independently so the panic cannot return if
+the validation is ever moved.
+
+Contributed by [@lecodev-26](https://github.com/lecodev-26) in [#1051](https://github.com/Basekick-Labs/arc/pull/1051).
+
 ### A replica refreshes a file whose manifest content changes while it is being pulled ([#798](https://github.com/Basekick-Labs/arc/issues/798))
 
 The puller deduplicated arrivals by path: a manifest update for a path whose
