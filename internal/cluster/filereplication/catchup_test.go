@@ -101,8 +101,8 @@ func TestRunCatchUpSkipsSameSizeMatchingCopy(t *testing.T) {
 	defer p.Stop()
 
 	p.RunCatchUpWithContentVerification(context.Background(), sliceFetcher([]*raft.FileEntry{entry}))
-	stats := waitStats(t, p, func(s map[string]int64) bool { return s["skipped_local"] == 1 })
-	if stats["skipped_local"] != 1 {
+	stats := waitStats(t, p, func(s map[string]int64) bool { return s["catchup_skipped_local"] == 1 })
+	if stats["catchup_skipped_local"] != 1 {
 		t.Fatalf("matching file was not skipped: %+v", stats)
 	}
 	if fetcher.calls.Load() != 0 {
