@@ -401,7 +401,7 @@ func (m *Manager) writeSidecar(ctx context.Context, backupID string, b *sidecarB
 		return fmt.Errorf("failed to seek sidecar temp file: %w", err)
 	}
 	if err := m.backupStorage.WriteReader(ctx, sidecarPath(backupID), tmp, info.Size()); err != nil {
-		m.cleanupPartialWrite(ctx, m.backupStorage, sidecarPath(backupID))
+		m.cleanupPartialBackupWrite(ctx, sidecarPath(backupID))
 		return fmt.Errorf("failed to write file sidecar: %w", err)
 	}
 	return nil

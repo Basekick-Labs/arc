@@ -433,8 +433,16 @@ func createStorageBackendFromConfig(config *SubprocessJobConfig, logger zerolog.
 		}, logger)
 
 	case "azure":
+		// Same rule as the S3 case above, and for the same reason: every field
+		// AzureBlobBackend.ConfigJSON emits must be parsed and forwarded here.
+		// Prefix in particular is applied to every key the backend touches
+		// (prefixedKey), so dropping it silently reroots the subprocess at the
+		// container root and compaction reads and writes the wrong location.
+		// It defaults to empty, which is why the same omission on the S3 side
+		// went unnoticed.
 		var azureConfig struct {
 			Container   string `json:"container"`
+			Prefix      string `json:"prefix"`
 			AccountName string `json:"account_name"`
 			Endpoint    string `json:"endpoint"`
 		}
@@ -445,6 +453,7 @@ func createStorageBackendFromConfig(config *SubprocessJobConfig, logger zerolog.
 		accountKey := os.Getenv("AZURE_STORAGE_KEY")
 		return storage.NewAzureBlobBackend(&storage.AzureBlobConfig{
 			ContainerName:      azureConfig.Container,
+			Prefix:             azureConfig.Prefix,
 			AccountName:        azureConfig.AccountName,
 			AccountKey:         accountKey,
 			Endpoint:           azureConfig.Endpoint,

@@ -189,7 +189,9 @@ func TestObjectURICarriesTheConfiguredPrefix(t *testing.T) {
 		{"s3 without prefix", &S3Backend{bucket: "b"}, "s3://b/" + key},
 		{"s3 with prefix", &S3Backend{bucket: "b", prefix: "tenant/"}, "s3://b/tenant/" + key},
 		{"s3 with nested prefix", &S3Backend{bucket: "b", prefix: "a/b/"}, "s3://b/a/b/" + key},
-		{"azure has no prefix concept", &AzureBlobBackend{containerName: "c"}, "azure://c/" + key},
+		{"azure without prefix", &AzureBlobBackend{containerName: "c"}, "azure://c/" + key},
+		{"azure with prefix", &AzureBlobBackend{containerName: "c", prefix: "tenant/"}, "azure://c/tenant/" + key},
+		{"azure with nested prefix", &AzureBlobBackend{containerName: "c", prefix: "a/b/"}, "azure://c/a/b/" + key},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := ObjectURI(tc.backend, key)

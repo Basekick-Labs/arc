@@ -34,21 +34,41 @@ type BackupCoordinator interface {
 
 // BackupHandler handles backup and restore API operations.
 type BackupHandler struct {
-	manager         *backup.Manager
-	authManager     *auth.AuthManager
-	coordinator     BackupCoordinator // nil in standalone mode
-	logger          zerolog.Logger
-	activeOperation atomic.Pointer[string]
+	manager          *backup.Manager
+	authManager      *auth.AuthManager
+	coordinator      BackupCoordinator // nil in standalone mode
+	operationTimeout time.Duration
+	logger           zerolog.Logger
+	activeOperation  atomic.Pointer[string]
 }
 
 // NewBackupHandler creates a new backup handler.
-func NewBackupHandler(manager *backup.Manager, authManager *auth.AuthManager, logger zerolog.Logger) *BackupHandler {
+//
+// operationTimeout bounds one backup or one restore run
+// (backup.operation_timeout, default 2h). It is a constructor parameter rather
+// than a settable field because both routes detach from the request context —
+// Fiber recycles it — so this is the only thing that eventually releases the
+// single-operation slot, and a zero value would expire the context before the
+// run started. config.Load refuses a non-positive value; a caller that builds
+// one by hand and leaves it zero is corrected here to the historical 2h rather
+// than cancelling instantly.
+func NewBackupHandler(manager *backup.Manager, authManager *auth.AuthManager, operationTimeout time.Duration, logger zerolog.Logger) *BackupHandler {
+	if operationTimeout <= 0 {
+		operationTimeout = defaultBackupOperationTimeout
+	}
 	return &BackupHandler{
-		manager:     manager,
-		authManager: authManager,
-		logger:      logger.With().Str("component", "backup-api").Logger(),
+		manager:          manager,
+		authManager:      authManager,
+		operationTimeout: operationTimeout,
+		logger:           logger.With().Str("component", "backup-api").Logger(),
 	}
 }
+
+// defaultBackupOperationTimeout is the value both routes were hardcoded to
+// before backup.operation_timeout existed. It is the fallback for a
+// hand-built handler only; the configured default lives in
+// config.setDefaults so operators can see it.
+const defaultBackupOperationTimeout = 2 * time.Hour
 
 // SetCoordinator wires the cluster coordinator for the node gate. Callers
 // pass it only when they hold a non-nil coordinator: an interface holding a
@@ -247,7 +267,7 @@ func (h *BackupHandler) CreateBackup(c *fiber.Ctx) error {
 	// returns, so we must use a detached context.
 	go func() {
 		defer h.activeOperation.Store(nil)
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
+		ctx, cancel := context.WithTimeout(context.Background(), h.operationTimeout)
 		defer cancel()
 		if _, err := h.manager.CreateBackup(ctx, opts); err != nil {
 			h.logger.Error().Err(err).Msg("Backup failed")
@@ -517,7 +537,7 @@ func (h *BackupHandler) RestoreBackup(c *fiber.Ctx) error {
 	// Run restore asynchronously — detached context (Fiber recycles c.Context()).
 	go func() {
 		defer h.activeOperation.Store(nil)
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
+		ctx, cancel := context.WithTimeout(context.Background(), h.operationTimeout)
 		defer cancel()
 		if _, err := h.manager.RestoreBackup(ctx, opts); err != nil {
 			h.logger.Error().Err(err).Msg("Restore failed")
