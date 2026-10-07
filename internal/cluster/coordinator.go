@@ -4359,7 +4359,7 @@ func (c *Coordinator) runCatchUpOnce() {
 		fetchManifest := func(cursor string, limit int) ([]*raft.FileEntry, string, error) {
 			return fsm.GetFilesPaginated(cursor, limit)
 		}
-		if raftFSM, ok := fsm.(*raft.ClusterFSM); ok && raftFSM.RestoredFromSnapshot() {
+		if fsm.RestoredFromSnapshot() {
 			puller.RunCatchUpWithContentVerification(ctx, fetchManifest)
 		} else {
 			puller.RunCatchUp(ctx, fetchManifest)
