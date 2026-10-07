@@ -104,6 +104,45 @@ func TestReplaceManifestAfterRewritePublishesImmutableFile(t *testing.T) {
 		t.Fatalf("deleted path = %q, want %q", deletePayload.Path, oldPath)
 	}
 }
+
+// TestReplaceManifestAfterRewriteDeletesUnmanifestedSource ensures a stale
+// manifest miss cannot leave both the old and new objects visible to glob reads.
+func TestReplaceManifestAfterRewriteDeletesUnmanifestedSource(t *testing.T) {
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+
+	oldPath := "db/cpu/original.parquet"
+	newPath := "db/cpu/original_rewrite_123.parquet"
+	for path, body := range map[string]string{oldPath: "old", newPath: "new"} {
+		full := filepath.Join(root, path)
+		if err := os.MkdirAll(filepath.Dir(full), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	coordinator := &rewriteManifestCoordinator{}
+	h := &DeleteHandler{storage: backend, coordinator: coordinator, logger: zerolog.Nop()}
+	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, oldPath)); !os.IsNotExist(err) {
+		t.Fatalf("unmanifested source still exists: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, newPath)); err != nil {
+		t.Fatalf("rewritten object was removed: %v", err)
+	}
+	if len(coordinator.ops) != 0 {
+		t.Fatalf("manifest ops = %d, want 0 on manifest miss", len(coordinator.ops))
+	}
+}
+
 func TestPartialRewriteStandaloneDeletesOriginal(t *testing.T) {
 	root := t.TempDir()
 	logger := zerolog.Nop()
