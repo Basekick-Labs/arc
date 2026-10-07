@@ -54,8 +54,14 @@ func TestTieringGetFilesLimitSemantics(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		limit     string
-		wantCount int
+		wantCount int // negative means "expect 400 and no listing"
 	}{
+		// This case is the one that exercises the bug in #1135. The validation test above
+		// also passes limit=-1, but it builds a handler with no getFiles, so it never reaches
+		// the slice -- pre-fix it panics on the nil instead. Routed through the stub-backed
+		// app, a pre-fix handler reaches "files[:-1]" and panics with
+		// "slice bounds out of range [:-1]", which is the failure this guards against.
+		{name: "negative is refused before the slice", limit: "-1", wantCount: -1},
 		{name: "zero returns empty", limit: "0", wantCount: 0},
 		{name: "positive limit", limit: "2", wantCount: 2},
 		{name: "larger than result", limit: "5000", wantCount: 3},
@@ -66,6 +72,12 @@ func TestTieringGetFilesLimitSemantics(t *testing.T) {
 				t.Fatalf("app.Test: %v", err)
 			}
 			defer resp.Body.Close()
+			if tc.wantCount < 0 {
+				if resp.StatusCode != fiber.StatusBadRequest {
+					t.Fatalf("status = %d, want %d", resp.StatusCode, fiber.StatusBadRequest)
+				}
+				return
+			}
 			if resp.StatusCode != fiber.StatusOK {
 				t.Fatalf("status = %d, want %d", resp.StatusCode, fiber.StatusOK)
 			}
