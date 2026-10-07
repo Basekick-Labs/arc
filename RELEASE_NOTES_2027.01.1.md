@@ -455,7 +455,9 @@ actually built up the merge is not merely affordable: above ~2000 live files the
 trades 33 manifest writes for one.
 
 It applies to any pass — additions, removals, or both — so a measurement that only loses files to
-retention is covered too. The one pass it deliberately skips is the one that leaves a
+retention is covered too. On iceberg-go v0.7.0, which this release also moves to, a table reaches
+the threshold more slowly than it did: see the upgrade note below for which passes still grow the
+manifest set. The one pass it deliberately skips is the one that leaves a
 measurement empty — whether because every data file is gone, or because the only candidates left
 are files Arc cannot map to a partition and has to skip. With no live files there is nothing for a
 merged manifest to hold, and Iceberg rejects an empty one.
@@ -849,6 +851,68 @@ contain dots, so distinct pseudo-database names can collide. A regression test
 documents the collision; runtime behavior is unchanged.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#920](https://github.com/Basekick-Labs/arc/pull/920).
+
+### Iceberg export moves to iceberg-go v0.7.0
+
+The library Arc's Iceberg exporter is built on goes from v0.6.0 to v0.7.0. Arc's own code needed no
+changes for it; what changes is behaviour underneath.
+
+**The manifest pile gets smaller on its own.** v0.6.0 carried a manifest whose entries were all
+tombstones into every later snapshot forever, so a removal pass added two manifests. v0.7.0 drops
+it, and parallelises the manifest scan. Measured on the same 300-file table, one file replaced per
+pass:
+
+| removal passes | manifests (v0.6.0 → v0.7.0) | scan plan (v0.6.0 → v0.7.0) |
+|---|---|---|
+| 16 | 33 → 18 | 6.87 → 2.99 ms |
+| 64 | 129 → 66 | 18.62 → 7.12 ms |
+
+Per accumulated manifest, a reconcile pass costs ~0.24 ms instead of ~1.6 ms.
+
+What remains for the manifest collapse from #1106 above to handle is narrower than that table
+suggests, and worth knowing if you are watching a warehouse:
+
+- A pass that **only adds** files adds one manifest, and those accumulate until the collapse merges
+  them. Verified on a running node: the count climbed 2, 3, 4 … 12 over twelve append passes, then
+  the next pass merged them back to one.
+- A pass that **only removes** files usually adds nothing at all, because v0.7.0 drops a manifest
+  its removal leaves empty rather than carrying it forward. Retention on a quiet measurement no
+  longer grows the set.
+- A pass containing an **in-place rewrite** — what a `DELETE` that matches only some rows of a file
+  produces — already merges the whole manifest set as a side effect of re-registering the rewritten
+  path, and has since #633. Those passes need no collapse and do not get one.
+
+So the collapse is the backstop for append-only growth, and a table that is both written and deleted
+from reaches the threshold slowly or never. The `.avro` count on disk is unchanged by this upgrade,
+so the orphan sweep from #835 is still the only thing that reclaims metadata files.
+
+**Snapshot-expiry defaults changed upstream, and Arc is unaffected.** The retention keys moved to a
+`history.expire.*` prefix (with fallbacks) and the default maximum snapshot age went from
+effectively forever to 5 days. Arc passes an explicit age cutoff on every expire, so
+`iceberg.retain_snapshots` remains the only thing that decides how much history is kept.
+
+**A dotted database name is now refused rather than exported.** Arc builds one Iceberg namespace per
+database, `<prefix>_<database>`, and v0.7.0 addresses a namespace whose component contains a dot by
+a different catalog key than the directory Arc writes on disk. A table published that way would be
+unreadable by DuckDB or Spark, would shadow any table already exported for that database, and would
+be walked back in by the exporter as if it were a user database. Arc therefore:
+
+- refuses `iceberg.namespace_prefix` containing a dot at startup, since it would affect every
+  database on the node;
+- refuses an individual database whose name would produce a dotted namespace, logging it and
+  skipping that measurement while the rest of the node keeps exporting.
+
+Arc database names cannot contain a dot, so this is reachable only through an edge-sync spoke ID,
+which may contain one. If you export Iceberg from a hub with such a spoke, that spoke's tables stop
+being published and are reported in the log. Tracked in
+[#1129](https://github.com/Basekick-Labs/arc/issues/1129), which covers both emitting an
+addressable namespace and migrating tables already published under a dotted one.
+
+**New transitive dependencies.** v0.7.0 pulls in OpenTelemetry's API, RoaringBitmap and geospatial
+encoders for features Arc does not use (deletion vectors, geometry columns, remote scan planning).
+No telemetry is registered or emitted: the OpenTelemetry **SDK** is not in Arc's dependency graph,
+the only instrumented path requires a scan-planning mode Arc never selects, and the metrics reporter
+defaults to a no-op. There is no new network traffic and no new log output.
 
 ### Iceberg manifest merging no longer leaves its tuning on the table (#1106)
 

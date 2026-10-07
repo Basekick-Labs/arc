@@ -211,6 +211,42 @@ func (e *Exporter) tableIdent(database, measurement string) icetable.Identifier 
 
 // sanitizeNamespaceDB maps a database name to a single path-safe namespace token.
 // Plain names pass through unchanged; spoke pseudo-databases lose their separator.
+// checkNamespaceAddressable refuses a database whose Iceberg namespace component would contain a
+// dot. Arc builds ONE component per database — nsPrefix + "_" + sanitizeNamespaceDB(database) — and
+// iceberg-go v0.7.0 addresses a namespace with a dotted component by a JSON encoding rather than by
+// the plain dotted string (catalog/sql: namespaceToString, and namespaceStorageKeys, which
+// deliberately refuses the legacy key because "their legacy key belongs to a different namespace").
+//
+// Three things then go wrong at once, none of them loudly, which is why this is a refusal and not a
+// warning:
+//
+//   - A table created under v0.6.0 is no longer found, so EnsureTable correctly creates a NEW one
+//     and the original table plus its whole snapshot history is orphaned on disk.
+//   - The warehouse directory becomes __iceberg_namespace_v1__:["arc_x.y"].db, which isWarehouseDir
+//     does not recognise (it wants the nsPrefix + "_" … ".db" shape), so Measurements() walks the
+//     exporter's own metadata back in as if it were a user database — the exact harm the "/" to "."
+//     mapping below exists to prevent, one nesting level deeper per pass.
+//   - MetadataLocation() comes back percent-encoded while the directory on disk is not, so
+//     writeVersionHint publishes nowhere and directory-based readers (DuckDB, Spark) cannot resolve
+//     the table at all. The discovery-file failure also declines the scheduler's fingerprint cache,
+//     so the measurement is re-reconciled on every tick forever.
+//
+// Only this measurement fails; the rest of the node's export is unaffected, which matches how a
+// column-type conflict is handled. Reaching it needs a dot in a database name, and Arc's own
+// databases are dot-free by their create-time rule — an edge-sync spoke ID is the one source that
+// permits a single dot (validateSpokeID rejects "/", "\\", ":" and "..", but not "."). The
+// permanent fix is to stop building a dotted component at all, which needs a migration for tables
+// already published under one.
+func checkNamespaceAddressable(nsPrefix, database string) error {
+	if ns := nsPrefix + "_" + sanitizeNamespaceDB(database); strings.Contains(ns, ".") {
+		return fmt.Errorf("iceberg namespace %s contains a dot, which this Iceberg catalog addresses "+
+			"as a different namespace than the one Arc publishes to disk: the table would be "+
+			"unreadable and would shadow any table already exported for this database (database=%s)",
+			ns, database)
+	}
+	return nil
+}
+
 func sanitizeNamespaceDB(database string) string {
 	return strings.ReplaceAll(database, "/", ".")
 }
@@ -259,6 +295,9 @@ func (e *Exporter) tableExists(ctx context.Context, database, measurement string
 // A catalog row that exists but cannot be loaded (its metadata file is missing or unreadable)
 // is an error, never a create: see the load gate below (#637).
 func (e *Exporter) EnsureTable(ctx context.Context, database, measurement string, sc ArcSchema) (*icetable.Table, error) {
+	if err := checkNamespaceAddressable(e.nsPrefix, database); err != nil {
+		return nil, err
+	}
 	ident := e.tableIdent(database, measurement)
 	ns := icetable.Identifier{ident[0]}
 
@@ -629,10 +668,13 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 //     fallback adds files one at a time and skips (and returns) the ones that can't be mapped.
 //
 //   - Stale DELETED history ("cannot add files that are already referenced by table").
-//     iceberg-go v0.6.0 carries every removed file's DELETED manifest entry in all later
-//     snapshots and checks new adds against those entries too, so a path that ever left the
-//     table can never come back: an in-place rewrite (#633), a backup restore of a key that
-//     had been removed, or history from before this release. For those adds the transaction
+//     A removed file's DELETED manifest entry is checked against new adds, so a path that left
+//     the table and comes back is refused: an in-place rewrite (#633), a backup restore of a key
+//     that had been removed, or history from before this release. On iceberg-go v0.6.0 the
+//     tombstone was carried into EVERY later snapshot, so such a path could never come back at
+//     all; since v0.7.0 the overwrite producer drops a manifest with no surviving entries, so a
+//     tombstone is shed on the next overwrite and the refusal is rare rather than permanent. The
+//     refusal wording is unchanged, so this branch still fires when it applies. For those adds the transaction
 //     enables Iceberg manifest merging (commit.manifest-merge.enabled) and retries with the
 //     duplicate check off: the merge-append rewrites the manifests keeping DELETED entries
 //     only of its own snapshot, so the stale entries are gone once the commit lands and a later
@@ -778,30 +820,33 @@ func (e *Exporter) addFilesMerging(ctx context.Context, txn *icetable.Transactio
 
 // manifestCollapseThreshold is the number of data manifests in the current snapshot at which a
 // reconcile pass also collapses them into one (see collapseManifests). Every figure below is
-// reproducible from internal/iceberg/deleted_manifest_cost_test.go; measured local backend, Apple
-// silicon, so read the ratios rather than the absolute milliseconds.
+// reproducible from internal/iceberg/deleted_manifest_cost_test.go on iceberg-go v0.7.0; measured
+// local backend, Apple silicon, so read the ratios rather than the absolute milliseconds.
 //
-// What the pile costs, per accumulated manifest: ~1.6 ms per reconcile pass and ~0.13 ms per
-// reader PlanFiles. BOTH slopes are independent of the table size (1.62 vs 1.58 ms/manifest at 300
-// and 5000 live files) — it is per-manifest open overhead, not per-entry work.
+// What the pile costs, per accumulated manifest: ~0.24 ms per reconcile pass and ~0.105 ms per
+// reader PlanFiles.
 //
 // What a collapse costs, as the marginal cost over the ordinary pass it replaces, measured where
-// there is nothing to collapse yet (5 manifests) so the pile's own scan cost cannot flatter it:
-// 8 ms at 300 live files, 13 ms at 1000, 52 ms at 5000, 61 ms at 10 000 — about 5 ms + 6 ms per
+// there is nothing to collapse yet (4 manifests) so the pile's own scan cost cannot flatter it:
+// 5 ms at 300 live files, 8 ms at 1000, 33 ms at 5000, 66 ms at 10 000 — roughly 2 ms + 6.4 ms per
 // 1000 live files, linear in table size because it rewrites the whole live set into one manifest.
 //
-// Manifests grow by two per removal pass, so between collapses the count averages ~T/2 and the
-// amortised per-pass cost is 0.8*T + 2*C(N)/T, minimised at T = sqrt(2.5*C(N)): 4.5 at 300 live
-// files, 5.7 at 1000, 11.4 at 5000, 12.3 at 10 000. Twelve is optimal at the large end of that
-// range and within ~1.5x of optimal at the small end, where the absolute cost is small anyway.
+// A removal pass adds ONE manifest (the rewritten manifest holding the removed entry, plus this
+// pass's additions, minus the one the overwrite producer now drops when nothing survives in it), so
+// between collapses the count averages ~T/2 and the amortised per-pass cost is 0.12*T + C(N)/T,
+// minimised at T = sqrt(C(N)/0.12): 6.5 at 300 live files, 8.2 at 1000, 16.6 at 5000, 23.5 at
+// 10 000. Twelve is within ~1.25x of optimal across that whole range.
 //
-// Two things that look like they should lower the threshold and do not. Reader plan time is paid
-// per query rather than per pass, but at 5 manifests it is already indistinguishable from one
-// manifest (2.26 vs 2.06 ms at 300 files, 18.85 vs 18.77 ms at 5000), so there is nothing to buy
-// below ~10. And a collapse pass is not merely affordable once the pile exists, it is CHEAPER than
-// the ordinary pass it replaces above ~2000 live files (175 vs 210 ms at 5000, 244 vs 352 ms at
-// 10 000, both at 33 manifests), because it trades 33 manifest writes for one. That makes the
-// threshold a bound on how long the pile is tolerated, not a budget to be spent carefully.
+// Reader plan time is paid per query rather than per pass, which would favour a lower threshold, but
+// at 4 manifests it is already indistinguishable from one (1.53 vs 1.34 ms at 300 files, 18.4 vs
+// 17.9 ms at 5000), so there is nothing to buy below ~10.
+//
+// On iceberg-go v0.6.0 a removal pass added TWO manifests and each cost ~1.6 ms per pass, which put
+// the optimum at 4.5-12.3 and made this constant worth about six passes of headroom instead of
+// twelve. v0.7.0 drops the DELETED-only manifest the overwrite producer used to carry forward
+// (apache/iceberg-go#1153, #1393) and parallelises the manifest scan. The collapse is still needed:
+// the remaining one-per-pass growth is still unbounded, and v0.7.0 does not reduce the .avro count
+// on disk at all (258 files after 64 passes on both versions) — that is the orphan sweep's job.
 //
 // It is deliberately not a config key: the only consequence of a wrong value is a slower or a more
 // frequent collapse, never data loss, so there is no operator decision to expose. Contrast
@@ -824,11 +869,20 @@ const manifestCollapseThreshold = 12
 //     an overwrite in which EVERY entry is DELETED and attributed to the overwrite's snapshot, not
 //     the collapse's. manifestMergeManager.createManifest keeps a DELETED entry only when it
 //     belongs to the snapshot being written, so the merge would drop all of them and write an
-//     empty manifest — which iceberg-go refuses outright ("empty manifest file has been written",
-//     ManifestWriter.Close). That error fails the pass, and the scheduler caches no fingerprint
-//     for a failed pass, so the SAME pass fails on every tick from then on: the table points at
-//     deleted files forever, which is the exact harm that branch exists to prevent. One surviving
-//     file is enough to make the merge legal; zero is not.
+//     empty manifest, which ManifestWriter.Close refuses (ErrEmptyManifest). On iceberg-go v0.6.0
+//     that error failed the pass, and the scheduler caches no fingerprint for a failed pass, so
+//     the SAME pass failed on every tick from then on: the table pointed at deleted files forever,
+//     the exact harm that branch exists to prevent.
+//
+//     On v0.7.0 that error is no longer REACHABLE from here, and the reason is worth stating so
+//     nobody removes the guard on the strength of a passing test. Reaching it needs at least two
+//     inherited data manifests whose entries are all foreign-DELETED; v0.7.0 drops a manifest with
+//     no surviving entries instead of carrying it forward, so an emptying pass inherits exactly
+//     one (this pass's own tombstone) and mergeBin takes its single-manifest passthrough without
+//     ever calling createManifest. The guard is kept as belt-and-braces: it costs one comparison,
+//     it encodes the intent (do not run a merge with nothing to merge), and reachability returns
+//     with a multi-spec table or any upstream change to that drop. Its tests no longer
+//     discriminate on v0.7.0 and say so on themselves.
 //
 //   - Only DATA manifests are counted. The merge producer merges data manifests and passes delete
 //     manifests through untouched, so counting those would compare a number the collapse cannot
@@ -872,8 +926,9 @@ func (e *Exporter) shouldCollapse(ctx context.Context, tbl *icetable.Table, live
 }
 
 // collapseManifests appends a merge-enabled append to the transaction that rewrites every data
-// manifest of the table into one, shedding the DELETED entries every earlier pass left behind
-// (#1106). It adds NO files: AddFiles with no paths still commits, because iceberg-go skips only
+// manifest of the table into one (#1106). Since iceberg-go v0.7.0 the overwrite producer already
+// drops a manifest left with no surviving entries, so what this reclaims is the one-per-pass
+// growth that remains: each pass's additions land in their own manifest and nothing merges them. It adds NO files: AddFiles with no paths still commits, because iceberg-go skips only
 // the new-manifest producer when nothing was appended and runs the merge over the inherited set
 // regardless. So the collapse rides on any pass — mixed, add-only or removal-only — which matters
 // because retention alone produces removal-only passes on a measurement that gained no file since
@@ -920,9 +975,11 @@ func (e *Exporter) collapseManifests(ctx context.Context, txn *icetable.Transact
 // count on the same curve as pre-collapse (see the plan for #1106). The superseded manifests are
 // reclaimed by sweepOrphanMetadata (#835), except where an operator has turned that sweep off.
 //
-// iceberg-go v0.6.0 has no RemoveProperties on a transaction, so the min-count and target-size
-// keys cannot be deleted once set; manifestMergeOff writes iceberg-go's own defaults back under
-// them rather than leaving these values as the table standing policy.
+// manifestMergeOff writes iceberg-go's own defaults back under the min-count and target-size keys
+// rather than leaving these values as the table's standing policy. iceberg-go v0.7.0 does add
+// Transaction.RemoveProperties, so the keys could now be deleted instead — writing the defaults is
+// kept because it is equivalent for any reader (an unset key resolves to the same default) and
+// does not depend on a method v0.6.0 lacked, which keeps this readable against both versions.
 func manifestMergeOn() iceberg.Properties {
 	return iceberg.Properties{
 		icetable.ManifestMergeEnabledKey:    "true",
@@ -974,8 +1031,10 @@ func (e *Exporter) expireSnapshots(ctx context.Context, tbl *icetable.Table, dat
 	}
 	txn := tbl.NewTransaction()
 	// WithRetainLast is a FLOOR, not a cap: iceberg-go only expires a snapshot when it is BOTH
-	// older than maxSnapshotAgeMs AND beyond the retain-last count. With the default age
-	// (~5 days) nothing expires regardless of count. Pass WithOlderThan(0) so the age gate is
+	// older than maxSnapshotAgeMs AND beyond the retain-last count. iceberg-go v0.7.0 defaults
+	// that age to 5 days (v0.6.0 defaulted it to effectively forever, so this comment used to
+	// overstate the case), and moved the keys to history.expire.* with legacy fallbacks. Either
+	// way the default is not what Arc wants. Pass WithOlderThan(0) so the age gate is
 	// always satisfied and retain-last becomes the effective cap ("keep the last N, expire the
 	// rest"). Cluster-mode note: this is fine because the reconciler is writer-gated (single
 	// writer), so no concurrent reader-vs-expire race beyond Iceberg's own snapshot isolation.
@@ -1525,6 +1584,11 @@ func (e *Exporter) tableDataFiles(ctx context.Context, tbl *icetable.Table) (map
 	if err != nil {
 		return nil, err
 	}
+	// One data file can yield SEVERAL tasks since iceberg-go v0.7.0: a Parquet file above
+	// read.split.target-size (128 MiB) with at least two split offsets is planned as one task per
+	// byte range. This stays correct only because it is a map keyed on the path storing the FILE's
+	// size, which is identical across a file's splits — len(tasks), a slice, or task.Length would
+	// each double-count. Arc's own files are far below that size; bulk-imported Parquet need not be.
 	for _, task := range tasks {
 		out[task.File.FilePath()] = task.File.FileSizeBytes()
 	}
