@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -126,6 +127,20 @@ const (
 	// bounded token→index map. Appended last: CommandType values are wire
 	// numbers and the ones above must not move.
 	CommandBarrier
+	// CommandSetCompactionPause pauses, refreshes or resumes the cluster-wide
+	// compaction pause a cluster restore takes (#1087). The proposer is the
+	// restoring primary writer; see applySetCompactionPause for the
+	// generation CAS and the takeover rules. Appended after CommandBarrier:
+	// wire numbers above must not move.
+	CommandSetCompactionPause
+	// CommandAckCompactionPause is a node reporting that it has no compaction
+	// batch in flight and no phase-2 manifest commit pending for the pause
+	// generation it names (#1087). Every node acks, readers included; the
+	// restore waits for the acks of the nodes in the FSM node table that the
+	// registry does not positively mark unhealthy or dead, and for the
+	// compactor lease holder (or every compactor-role node when no lease is
+	// assigned) regardless (cluster.compactionPauseWaitSet).
+	CommandAckCompactionPause
 )
 
 // Command represents a command to be applied to the FSM.
@@ -222,6 +237,70 @@ const (
 	// first. A restarted follower needs only its own, most recent token.
 	maxBarriers = 256
 )
+
+// SetCompactionPausePayload is the payload for CommandSetCompactionPause
+// (#1087). Generation is a compare-and-swap: a new pause proposes the current
+// generation plus one, a refresh or a resume proposes the current one. Now and
+// ExpiresAt are the PROPOSER's clock: Apply never reads time.Now, because a
+// clock read inside Apply would make replicas disagree on whether a pause had
+// expired, and the proposer's clock is within security.HMACTimestampTolerance
+// of every other node's or the cluster would not have formed.
+type SetCompactionPausePayload struct {
+	Paused      bool      `json:"paused"`
+	Generation  uint64    `json:"generation"`
+	RequestedBy string    `json:"requested_by"` // node ID of the proposer
+	Reason      string    `json:"reason"`       // "restore <backup-id>"
+	Now         time.Time `json:"now"`
+	ExpiresAt   time.Time `json:"expires_at"`
+}
+
+// AckCompactionPausePayload is the payload for CommandAckCompactionPause.
+type AckCompactionPausePayload struct {
+	NodeID     string `json:"node_id"`
+	Generation uint64 `json:"generation"`
+}
+
+// CompactionPauseState is the cluster-wide compaction pause as the FSM holds
+// it (#1087). Generation is monotonic and survives a resume, so a stale
+// refresh or resume from a requester whose pause ended can never act on a
+// later one. Acks maps a node ID to the generation it last acknowledged.
+type CompactionPauseState struct {
+	Active      bool              `json:"active"`
+	Generation  uint64            `json:"generation"`
+	RequestedBy string            `json:"requested_by,omitempty"`
+	Reason      string            `json:"reason,omitempty"`
+	RequestedAt time.Time         `json:"requested_at"`
+	ExpiresAt   time.Time         `json:"expires_at"`
+	Acks        map[string]uint64 `json:"acks,omitempty"`
+}
+
+const (
+	// MaxCompactionPauseFieldLen bounds the node IDs and the reason any
+	// authenticated peer can put into the pause state (a node ID is at most a
+	// 253-byte DNS name; a reason is "restore <backup-id>").
+	MaxCompactionPauseFieldLen = 512
+	// MaxCompactionPauseTTL bounds ExpiresAt minus Now in a pause or refresh
+	// proposal, judged from the payload alone so every replica agrees: a
+	// buggy or hostile proposer must not be able to wedge compaction until
+	// someone resumes. The coordinator proposes a 6-minute TTL.
+	MaxCompactionPauseTTL = time.Hour
+	// maxCompactionPauseAcks bounds the ack map. A cluster has far fewer
+	// nodes; acks beyond the cap are ignored rather than grow the snapshot.
+	maxCompactionPauseAcks = 1024
+	// compactionPauseConflictText is the stable prefix of the error
+	// applySetCompactionPause returns for a generation CAS failure. A
+	// follower sees it as the text of a forwarded apply failure, so the
+	// proposer matches on it rather than on an error value.
+	compactionPauseConflictText = "compaction pause generation conflict"
+)
+
+// IsCompactionPauseConflict reports whether err is a compaction pause
+// generation conflict: the proposal named a generation other than the one the
+// FSM expects, because the proposer was behind or another pause landed first.
+// Works on the leader (the FSM error) and on a follower (the forwarded text).
+func IsCompactionPauseConflict(err error) bool {
+	return err != nil && strings.Contains(err.Error(), compactionPauseConflictText)
+}
 
 // UpdateFilePayload is the payload for CommandUpdateFile.
 type UpdateFilePayload struct {
@@ -340,6 +419,9 @@ type FSMSnapshot struct {
 	// function of the log, so every node's snapshot agrees. Older binaries
 	// ignore the field.
 	Barriers map[string]uint64 `json:"barriers,omitempty"`
+	// CompactionPause: the cluster-wide compaction pause (#1087). nil in a
+	// snapshot taken by an older binary, which Restore reads as "no pause".
+	CompactionPause *CompactionPauseState `json:"compaction_pause,omitempty"`
 }
 
 // ClusterFSM implements the raft.FSM interface for cluster state management.
@@ -496,6 +578,10 @@ type ClusterFSM struct {
 	barriers     map[string]uint64
 	barrierOrder []string
 
+	// compactionPause is the cluster-wide compaction pause (#1087). Part of
+	// the snapshot. Acks is nil until the first pause.
+	compactionPause CompactionPauseState
+
 	// Callbacks for state changes
 	onNodeAdded          func(*NodeInfo)
 	onNodeRemoved        func(string)
@@ -541,6 +627,12 @@ type ClusterFSM struct {
 	onMeasurementPermissionDeleted func(id int64)
 	onTokenMembershipAdded         func(*TokenMembershipEntry)
 	onTokenMembershipRemoved       func(tokenID, teamID int64)
+
+	// onCompactionPauseChanged fires when the compaction pause becomes active
+	// (a new generation) or inactive (a resume); refreshes and acks do not
+	// fire it (#1087). Same rule as every other callback here: it runs on the
+	// FSM goroutine and must not take coordinator or Raft locks.
+	onCompactionPauseChanged func(paused bool, generation uint64)
 }
 
 // NewClusterFSM creates a new cluster FSM.
@@ -677,6 +769,52 @@ func (f *ClusterFSM) GetActiveCompactorID() string {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	return f.activeCompactorID
+}
+
+// SetCompactionPauseCallback registers the callback fired when the
+// cluster-wide compaction pause starts or ends (#1087).
+//
+// Registry-only, like the other FSM callbacks: it runs on the Raft FSM
+// goroutine, including inside raft.NewRaft during a restore, so it must not
+// take the coordinator or Raft node locks (#797, #813). The coordinator spawns
+// a goroutine from it.
+func (f *ClusterFSM) SetCompactionPauseCallback(cb func(paused bool, generation uint64)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onCompactionPauseChanged = cb
+}
+
+// GetCompactionPause returns a copy of the cluster-wide compaction pause
+// state, acks included (#1087). Whether the pause is still in force is a local
+// decision: compare ExpiresAt with the local clock, as
+// Coordinator.CompactionPaused does.
+func (f *ClusterFSM) GetCompactionPause() CompactionPauseState {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return copyCompactionPause(f.compactionPause)
+}
+
+// CompactionPauseBrief is GetCompactionPause without the ack map (Acks is
+// nil in the result): a struct copy under the read lock and no allocation,
+// for the readers on hot paths — the compaction gate before every batch, the
+// scheduler tick, the restore's Lost check.
+func (f *ClusterFSM) CompactionPauseBrief() CompactionPauseState {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	brief := f.compactionPause
+	brief.Acks = nil
+	return brief
+}
+
+func copyCompactionPause(s CompactionPauseState) CompactionPauseState {
+	out := s
+	if s.Acks != nil {
+		out.Acks = make(map[string]uint64, len(s.Acks))
+		for node, gen := range s.Acks {
+			out.Acks[node] = gen
+		}
+	}
+	return out
 }
 
 // SetFileCallbacks sets the callbacks for file manifest events (peer replication).
@@ -892,10 +1030,142 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.applyRemoveTokenFromTeam(cmd.Payload, log.Index)
 	case CommandBarrier:
 		return f.applyBarrier(cmd.Payload, log.Index)
+	case CommandSetCompactionPause:
+		return f.applySetCompactionPause(cmd.Payload)
+	case CommandAckCompactionPause:
+		return f.applyAckCompactionPause(cmd.Payload)
 
 	default:
 		return fmt.Errorf("unknown command type: %d", cmd.Type)
 	}
+}
+
+// applySetCompactionPause pauses, refreshes or resumes the cluster-wide
+// compaction pause (#1087). Deterministic: every decision is made from the
+// payload and the current state, never from this node's clock.
+//
+//   - Paused, same generation, active, same requester: a REFRESH. ExpiresAt
+//     moves, acks are kept, no callback.
+//   - Paused, generation != current+1: a conflict; the proposer re-reads the
+//     state and retries once.
+//   - Paused, another requester holds a pause that has not expired by the
+//     PROPOSER's clock: refused, naming the holder.
+//   - Paused otherwise: a new generation. The same requester, or anyone once
+//     the pause has expired, takes it over; acks start empty; callback(true).
+//   - Not paused: a RESUME. Idempotent when nothing is active; refused when
+//     the generation is stale (the pause it ends is not the one in force);
+//     otherwise clears the pause and fires callback(false).
+func (f *ClusterFSM) applySetCompactionPause(payload []byte) interface{} {
+	var p SetCompactionPausePayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal compaction pause payload: %w", err)
+	}
+	if p.RequestedBy == "" {
+		return fmt.Errorf("compaction pause: requested_by is required")
+	}
+	if len(p.RequestedBy) > MaxCompactionPauseFieldLen || len(p.Reason) > MaxCompactionPauseFieldLen {
+		return fmt.Errorf("compaction pause: requested_by or reason longer than %d bytes", MaxCompactionPauseFieldLen)
+	}
+
+	f.mu.Lock()
+	cur := f.compactionPause
+	callback := f.onCompactionPauseChanged
+	if !p.Paused {
+		if !cur.Active {
+			f.mu.Unlock()
+			return nil
+		}
+		if p.Generation != cur.Generation {
+			f.mu.Unlock()
+			return fmt.Errorf("compaction pause resume is stale: generation %d is not the active generation %d", p.Generation, cur.Generation)
+		}
+		f.compactionPause = CompactionPauseState{Active: false, Generation: cur.Generation}
+		f.mu.Unlock()
+		f.logger.Info().
+			Uint64("generation", cur.Generation).
+			Str("requested_by", cur.RequestedBy).
+			Str("reason", cur.Reason).
+			Msg("Cluster-wide compaction pause resumed")
+		if callback != nil {
+			callback(false, cur.Generation)
+		}
+		return nil
+	}
+
+	if p.Now.IsZero() || p.ExpiresAt.IsZero() {
+		f.mu.Unlock()
+		return fmt.Errorf("compaction pause: now and expires_at are required")
+	}
+	if !p.ExpiresAt.After(p.Now) || p.ExpiresAt.Sub(p.Now) > MaxCompactionPauseTTL {
+		f.mu.Unlock()
+		return fmt.Errorf("compaction pause: expires_at must be after now and at most %s later", MaxCompactionPauseTTL)
+	}
+	if cur.Active && p.Generation == cur.Generation && p.RequestedBy == cur.RequestedBy {
+		f.compactionPause.ExpiresAt = p.ExpiresAt
+		f.mu.Unlock()
+		return nil
+	}
+	if p.Generation != cur.Generation+1 {
+		f.mu.Unlock()
+		return fmt.Errorf("%s (current %d, proposed %d)", compactionPauseConflictText, cur.Generation, p.Generation)
+	}
+	if cur.Active && p.Now.Before(cur.ExpiresAt) && cur.RequestedBy != p.RequestedBy {
+		f.mu.Unlock()
+		return fmt.Errorf("compaction is already paused by %s (%s) until %s", cur.RequestedBy, cur.Reason, cur.ExpiresAt.UTC().Format(time.RFC3339))
+	}
+	f.compactionPause = CompactionPauseState{
+		Active:      true,
+		Generation:  p.Generation,
+		RequestedBy: p.RequestedBy,
+		Reason:      p.Reason,
+		RequestedAt: p.Now,
+		ExpiresAt:   p.ExpiresAt,
+		Acks:        make(map[string]uint64),
+	}
+	f.mu.Unlock()
+	f.logger.Info().
+		Uint64("generation", p.Generation).
+		Str("requested_by", p.RequestedBy).
+		Str("reason", p.Reason).
+		Time("expires_at", p.ExpiresAt).
+		Bool("took_over", cur.Active).
+		Msg("Cluster-wide compaction pause active")
+	if callback != nil {
+		callback(true, p.Generation)
+	}
+	return nil
+}
+
+// applyAckCompactionPause records a node's ack for the active generation. An
+// ack for an inactive or another generation is ignored, not an error: it is a
+// late ack from a pause that has already ended, and the node will ack the
+// current one from its own callback.
+func (f *ClusterFSM) applyAckCompactionPause(payload []byte) interface{} {
+	var p AckCompactionPausePayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal compaction pause ack payload: %w", err)
+	}
+	if p.NodeID == "" {
+		return fmt.Errorf("compaction pause ack: node_id is required")
+	}
+	if len(p.NodeID) > MaxCompactionPauseFieldLen {
+		return fmt.Errorf("compaction pause ack: node_id longer than %d bytes", MaxCompactionPauseFieldLen)
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cur := &f.compactionPause
+	if !cur.Active || cur.Generation != p.Generation {
+		return nil
+	}
+	if cur.Acks == nil {
+		cur.Acks = make(map[string]uint64)
+	}
+	if _, known := cur.Acks[p.NodeID]; !known && len(cur.Acks) >= maxCompactionPauseAcks {
+		return nil
+	}
+	cur.Acks[p.NodeID] = p.Generation
+	return nil
 }
 
 // applyBarrier records the barrier token at the index it was applied. No
@@ -2105,9 +2375,18 @@ func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 		barriers[token] = idx
 	}
 
+	// The compaction pause is persisted only once a pause has existed, so a
+	// snapshot from a cluster that never paused is byte-identical to before.
+	var compactionPause *CompactionPauseState
+	if f.compactionPause.Generation > 0 || f.compactionPause.Active {
+		cp := copyCompactionPause(f.compactionPause)
+		compactionPause = &cp
+	}
+
 	return &fsmSnapshot{
 		nodes:                  nodes,
 		barriers:               barriers,
+		compactionPause:        compactionPause,
 		primaryWriterID:        f.primaryWriterID,
 		activeCompactorID:      f.activeCompactorID,
 		files:                  files,
@@ -2431,6 +2710,30 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		}
 	}
 	sort.Strings(removedFiles) // deterministic delivery order
+	// The compaction pause (#1087). A snapshot from an older binary carries
+	// none, which reads as no pause. The callback fires below when the
+	// restore changes whether a pause is in force or which generation is,
+	// for the same reason the node and file callbacks do: a running follower
+	// that catches up by snapshot install gets no log replay, and without
+	// this it would never quiesce and ack the pause the snapshot carries.
+	prevPause := f.compactionPause
+	var restoredPause CompactionPauseState
+	if snapshot.CompactionPause != nil {
+		restoredPause = copyCompactionPause(*snapshot.CompactionPause)
+		if len(restoredPause.RequestedBy) > MaxCompactionPauseFieldLen || len(restoredPause.Reason) > MaxCompactionPauseFieldLen {
+			f.logger.Error().Str("source", "snapshot").Msg("compaction pause state in snapshot exceeds the field bound — refused, restored as no pause")
+			restoredPause = CompactionPauseState{Generation: restoredPause.Generation}
+		}
+		for node := range restoredPause.Acks {
+			if node == "" || len(node) > MaxCompactionPauseFieldLen {
+				delete(restoredPause.Acks, node)
+			}
+		}
+	}
+	pauseChanged := prevPause.Active != restoredPause.Active ||
+		(restoredPause.Active && prevPause.Generation != restoredPause.Generation)
+	f.compactionPause = restoredPause
+	onCompactionPauseChanged := f.onCompactionPauseChanged
 	f.nodes = restoredNodes
 	f.barriers = restoredBarriers
 	f.barrierOrder = restoredOrder
@@ -2569,6 +2872,9 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		for _, path := range removedFiles {
 			onFileDeleted(path, UnlinkReasonSnapshotRemoved)
 		}
+	}
+	if pauseChanged && onCompactionPauseChanged != nil {
+		onCompactionPauseChanged(restoredPause.Active, restoredPause.Generation)
 	}
 
 	return nil
@@ -2778,6 +3084,7 @@ type fsmSnapshot struct {
 	measurementPermissions map[int64]*MeasurementPermissionEntry
 	tokenMemberships       map[int64]*TokenMembershipEntry
 	barriers               map[string]uint64
+	compactionPause        *CompactionPauseState
 }
 
 // Persist writes the snapshot to the given sink.
@@ -2794,6 +3101,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 		MeasurementPermissions: s.measurementPermissions,
 		TokenMemberships:       s.tokenMemberships,
 		Barriers:               s.barriers,
+		CompactionPause:        s.compactionPause,
 	}
 
 	data, err := json.Marshal(snapshot)

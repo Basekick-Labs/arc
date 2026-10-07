@@ -160,8 +160,11 @@ func TestRestoreBackupRefusesMetadataAndConfigOnACluster(t *testing.T) {
 	waitForOperationRelease(t, rig.handler)
 }
 
-// mode is validated: unknown spellings are 400, replace is 400 without a
-// coordinator and admitted with one, and the response echoes the mode.
+// mode is validated: unknown spellings are 400, replace is 400 without the
+// Raft file manifest and admitted with it (#1084: keyed on what the manager
+// runs from, not on the coordinator; a coordinator without a manifest is
+// covered by TestRestoreBackupEchoesTheResolvedMode), and the response echoes
+// the mode.
 func TestRestoreBackupModeValidation(t *testing.T) {
 	const id = `"backup_id":"backup-20260901-000000-00000000","confirm":true,"restore_metadata":false`
 	t.Run("standalone", func(t *testing.T) {
@@ -185,6 +188,7 @@ func TestRestoreBackupModeValidation(t *testing.T) {
 		rig := newBackupRouteRig(t, nil)
 		close(rig.storage.release)
 		rig.handler.SetCoordinator(&fakeBackupCoordinator{primary: true, role: "writer"})
+		rig.handler.manager.SetClusterManifest(fakeRouteClusterManifest{})
 		status, payload := rig.postJSON(t, "/api/v1/backup/restore", `{`+id+`,"mode":"replace"}`)
 		if status != fiber.StatusAccepted || payload["mode"] != "replace" {
 			t.Errorf("mode=replace cluster: status %d payload %v, want 202 with mode replace", status, payload)

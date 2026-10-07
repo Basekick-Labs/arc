@@ -8,17 +8,31 @@ import (
 
 // Manifest describes the contents of a backup.
 type Manifest struct {
-	Version        string         `json:"version"`
-	BackupID       string         `json:"backup_id"`
-	CreatedAt      time.Time      `json:"created_at"`
-	BackupType     string         `json:"backup_type"` // "full" (future: "incremental")
+	Version    string    `json:"version"`
+	BackupID   string    `json:"backup_id"`
+	CreatedAt  time.Time `json:"created_at"`
+	BackupType string    `json:"backup_type"` // "full" (future: "incremental")
+	// Scope names the databases the backup was limited to (#1084), sorted:
+	// storage-root segments, so an edge-sync spoke appears as the spoke. The
+	// backup holds only their data files, schema anchors and compaction
+	// recovery state, never the SQLite metadata or the Iceberg catalog, and a
+	// restore of it touches only those databases (on a cluster node, in
+	// replace mode unless the request names a mode; replace is refused when
+	// the backup holds no data file for one of them, see CheckScopedReplace).
+	// Absent for a whole-instance backup, which is also how a manifest
+	// written before this field reads. BackupType stays "full" for every
+	// backup: clients already read that field, and the scope is here.
+	Scope          []string       `json:"scope,omitempty"`
 	Databases      []DatabaseInfo `json:"databases"`
 	TotalFiles     int64          `json:"total_files"`
 	TotalSizeBytes int64          `json:"total_size_bytes"`
 	// SkippedFiles counts data files that were listed and inventoried above but
 	// could not be read from source storage at copy time, or whose backup
 	// destination key would exceed the storage key limit (a source key longer
-	// than storage.MaxUsableKeyLen minus the <backupID>/data/ prefix; #761).
+	// than storage.MaxUsableKeyLen minus the <backupID>/data/ prefix AND minus
+	// the destination target's own object-key prefix, which counts since
+	// #1085 stage B2b-1; #761). The per-backup figure is reported as
+	// max_source_key_bytes in the log line that names each skip.
 	// The backup log names each skipped file and SkippedSample names up to 32
 	// of them (#977). When non-zero the
 	// backup is incomplete: TotalFiles/TotalSizeBytes describe what was
@@ -120,6 +134,45 @@ type Manifest struct {
 	// <backup_id>/iceberg/. Nil when Iceberg export is off or the warehouse is
 	// under the root, where its metadata travels with the data listing (#637).
 	IcebergWarehouse *IcebergWarehouseInfo `json:"iceberg_warehouse,omitempty"`
+	// IcebergNamespaceFilesExcluded counts the files under the Iceberg
+	// namespace directories of the scoped databases (<prefix>_<db>.db/, in
+	// the storage root or in an outside-root warehouse) that a scoped backup
+	// (#1084) deliberately did not copy: the Iceberg catalog that makes them
+	// tables is instance-wide and travels with include_metadata, which a
+	// scoped backup cannot carry. IcebergNamespacesExcluded names those
+	// directories (relative to the storage root, or to the warehouse). Zero
+	// and absent for an unscoped backup, when Iceberg export is off, or when
+	// the warehouse is an object store, which this stage does not count (the
+	// namespace directories are still excluded: they are never listed).
+	IcebergNamespaceFilesExcluded int64    `json:"iceberg_namespace_files_excluded,omitempty"`
+	IcebergNamespacesExcluded     []string `json:"iceberg_namespaces_excluded,omitempty"`
+	// Target names the configured backup target this backup was written to
+	// (#1085 stage B2b-1), absent when it went to backup.local_path as
+	// backups did before targets existed.
+	//
+	// IT IS A LABEL, NEVER A LOOKUP. The backend a restore reads from comes
+	// from LOCAL configuration and nothing else, by the same rule already
+	// established for the one other destination-naming field in this manifest
+	// (see restoreIcebergWarehouse, which uses this node's configured
+	// warehouse and not the manifest's path): the manifest is data read from
+	// backup storage, so a field in it must never select the credentials or
+	// the location used to read further bytes. A restore from a manifest whose
+	// Target names a target this node does not have still works, because the
+	// bytes were already found at the destination this node is configured
+	// with; the field tells an operator where the backup came from.
+	Target string `json:"target,omitempty"`
+	// OwnerInstanceID identifies the Arc instance that wrote this backup: the
+	// cluster name when clustered, a persistent per-instance UUID standalone
+	// (see identity.go). Absent for every backup written before this field,
+	// and for an instance that has no identity — and an ABSENT owner reads as
+	// the reading instance's own, because the alternative would hide every
+	// pre-upgrade backup from the listing.
+	//
+	// A restore does NOT adopt it. Identity is local configuration, by the
+	// same rule as Target above; a restore onto fresh hardware keeps the
+	// identity that hardware has, and the echo of this value is what tells
+	// the operator the backup belongs to another instance.
+	OwnerInstanceID string `json:"owner_instance_id,omitempty"`
 }
 
 // IcebergWarehouseInfo records the outside-root Iceberg warehouse a backup
@@ -155,12 +208,15 @@ type MeasurementInfo struct {
 
 // BackupSummary is a compact representation of a backup for listing.
 type BackupSummary struct {
-	BackupID      string    `json:"backup_id"`
-	CreatedAt     time.Time `json:"created_at"`
-	BackupType    string    `json:"backup_type"`
-	TotalFiles    int64     `json:"total_files"`
-	TotalBytes    int64     `json:"total_size_bytes"`
-	DatabaseCount int       `json:"database_count"`
+	BackupID   string    `json:"backup_id"`
+	CreatedAt  time.Time `json:"created_at"`
+	BackupType string    `json:"backup_type"`
+	// Scope mirrors Manifest.Scope (#1084): the databases a scoped backup
+	// was limited to; absent for a whole-instance backup.
+	Scope         []string `json:"scope,omitempty"`
+	TotalFiles    int64    `json:"total_files"`
+	TotalBytes    int64    `json:"total_size_bytes"`
+	DatabaseCount int      `json:"database_count"`
 	// The manifest's incompleteness counts, so the listing says what the
 	// manifest says (#977): TotalFiles is what was inventoried, and these are
 	// what was not stored. Omitted when zero, so a complete backup's entry is
@@ -173,16 +229,29 @@ type BackupSummary struct {
 	UnregisteredSkipped   int64 `json:"unregistered_skipped,omitempty"`
 	ManifestOnlyFiles     int64 `json:"manifest_only_files,omitempty"`
 	LeftManifestDuringRun int64 `json:"left_manifest_during_run,omitempty"`
+	// Target and OwnerInstanceID mirror the manifest's (#1085 stage B2b-1):
+	// which configured destination holds the backup, and which instance wrote
+	// it. ForeignOwner says the second belongs to a different instance than
+	// the one answering, which only ListAllBackups can return — the default
+	// listing leaves those out. It is derived per request rather than stored,
+	// so it is absent from the manifest.
+	Target          string `json:"target,omitempty"`
+	OwnerInstanceID string `json:"owner_instance_id,omitempty"`
+	ForeignOwner    bool   `json:"foreign_owner,omitempty"`
 }
 
 // Progress tracks the state of a running backup or restore operation.
 type Progress struct {
-	Operation      string `json:"operation"` // "backup" or "restore"
-	BackupID       string `json:"backup_id"`
-	Status         string `json:"status"` // "running", "completed", "failed"
-	TotalFiles     int64  `json:"total_files"`
-	ProcessedFiles int64  `json:"processed_files"`
-	SkippedFiles   int64  `json:"skipped_files"`
+	Operation string `json:"operation"` // "backup" or "restore"
+	BackupID  string `json:"backup_id"`
+	Status    string `json:"status"` // "running", "completed", "failed"
+	// Scope (#1084): the databases a scoped backup is limited to, and for a
+	// restore the scope of the backup being restored; absent for a
+	// whole-instance backup.
+	Scope          []string `json:"scope,omitempty"`
+	TotalFiles     int64    `json:"total_files"`
+	ProcessedFiles int64    `json:"processed_files"`
+	SkippedFiles   int64    `json:"skipped_files"`
 	// UnaddressableFiles: for a backup, mirrors Manifest.UnaddressableFiles for
 	// live progress. For a restore, data files that are present in backup
 	// storage but that no listing returns (a dot-prefixed name an object store
@@ -242,7 +311,12 @@ type Progress struct {
 	// has no row for them: a damaged backup. The live copy, if any, is left
 	// as it was; SidecarMismatchSample names up to 32. ReplacedFiles counts
 	// the current manifest entries a replace-mode restore removed before
-	// writing. BackupUnregisteredSkipped and BackupManifestOnlyFiles mirror
+	// writing. CompactionPause is the cluster-wide compaction pause the
+	// restore holds (#1087): "waiting" while every node quiesces, "paused"
+	// while the restore runs under it, "released" once resumed, "lost" when
+	// it stopped being this restore's pause mid-run (the restore then ends
+	// failed). Empty on a standalone node and for a metadata-only restore.
+	// BackupUnregisteredSkipped and BackupManifestOnlyFiles mirror
 	// the restored backup's own cross-check counts.
 	Mode                      string     `json:"mode,omitempty"`
 	FilesRegistered           int64      `json:"files_registered,omitempty"`
@@ -251,6 +325,7 @@ type Progress struct {
 	SidecarMismatches         int64      `json:"sidecar_mismatches,omitempty"`
 	SidecarMismatchSample     []string   `json:"sidecar_mismatch_sample,omitempty"`
 	ReplacedFiles             int64      `json:"replaced_files,omitempty"`
+	CompactionPause           string     `json:"compaction_pause,omitempty"`
 	BackupUnregisteredSkipped int64      `json:"backup_unregistered_skipped,omitempty"`
 	BackupManifestOnlyFiles   int64      `json:"backup_manifest_only_files,omitempty"`
 	TotalBytes                int64      `json:"total_bytes"`
@@ -284,6 +359,7 @@ func SummaryFromManifest(m *Manifest) BackupSummary {
 		BackupID:              m.BackupID,
 		CreatedAt:             m.CreatedAt,
 		BackupType:            m.BackupType,
+		Scope:                 m.Scope,
 		TotalFiles:            m.TotalFiles,
 		TotalBytes:            m.TotalSizeBytes,
 		DatabaseCount:         len(m.Databases),
@@ -293,5 +369,7 @@ func SummaryFromManifest(m *Manifest) BackupSummary {
 		UnregisteredSkipped:   m.UnregisteredSkipped,
 		ManifestOnlyFiles:     m.ManifestOnlyFiles,
 		LeftManifestDuringRun: m.LeftManifestDuringRun,
+		Target:                m.Target,
+		OwnerInstanceID:       m.OwnerInstanceID,
 	}
 }

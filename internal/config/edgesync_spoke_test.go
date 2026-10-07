@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // loadWith installs body as arc.toml in a temp working directory and loads it.
@@ -116,6 +117,25 @@ func TestSpokeConfig_RequiresIdentitiesAndURL(t *testing.T) {
 
 // A disabled spoke is the default for every Arc deployment, so an incomplete
 // block must not block startup.
+func TestSpokeConfig_RejectsNonPositiveSyncIntervals(t *testing.T) {
+	t.Setenv("ARC_EDGE_SYNC_SPOKE_SECRET", strings.Repeat("a", 64))
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"zero success interval", "sync_interval = \"0s\"\n", "sync_interval"},
+		{"negative retry interval", "sync_retry_interval = \"-1s\"\n", "sync_retry_interval"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := loadWith(t, validSpokeConfig+tc.body); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Load error = %v, want it to mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestSpokeConfig_DisabledSpokeSkipsValidation(t *testing.T) {
 	cfg, err := loadWith(t, "[edge_sync.spoke]\nenabled = false\n")
 	if err != nil {
@@ -154,6 +174,12 @@ func TestSpokeConfig_DefaultsAreDeclared(t *testing.T) {
 	// hub; opting out is the explicit choice (issue #610).
 	if !cfg.EdgeSync.Spoke.DeferCompactionUntilSynced {
 		t.Error("defer_compaction_until_synced should default to true")
+	}
+	if got := cfg.EdgeSync.Spoke.SyncInterval; got != 5*time.Minute {
+		t.Errorf("sync_interval = %s, want 5m", got)
+	}
+	if got := cfg.EdgeSync.Spoke.SyncRetryInterval; got != 30*time.Second {
+		t.Errorf("sync_retry_interval = %s, want 30s", got)
 	}
 	// Default TRUE: a hub compacts what it received; keeping the raw
 	// per-file layout is the explicit choice (issue #619).

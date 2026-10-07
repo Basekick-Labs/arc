@@ -449,6 +449,16 @@ func (c *Client) CanUseRetentionScheduler() bool {
 	return c.license != nil && c.license.CanUseRetentionScheduler()
 }
 
+// CanUseEdgeSyncScheduler reads the current entitlement, including revalidation.
+func (c *Client) CanUseEdgeSyncScheduler() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.license.CanUseEdgeSyncScheduler()
+}
+
 // CanUseTieredStorage returns true if tiered storage is allowed
 func (c *Client) CanUseTieredStorage() bool {
 	c.mu.RLock()
