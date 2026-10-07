@@ -172,6 +172,27 @@ func (m *Manager) DatabaseHasTierRows(ctx context.Context, database string) (boo
 	return len(tiers) > 0, nil
 }
 
+// CountColdFilesByDatabase reports how many cold-tier files this node's tier
+// metadata holds, grouped by database (#1085 stage B3): one grouped query.
+// It is how a backup records the files it is NOT carrying, since cold-tier
+// objects are not backed up yet. Implements backup.ColdCounter. Nil-receiver
+// safe like the reports above; a nil manager holds no tier rows.
+//
+// No m.mu: the call touches no in-memory state and *sql.DB is thread-safe, so
+// taking the mutex would only block concurrent tier readers across DB I/O.
+//
+// This is THIS NODE's view. On a cluster where only the primary migrates, a
+// node's cold rows arrive through syncColdTierMetadata, so a node whose sync
+// has not run yet — or whose last one failed — holds fewer rows than the
+// cluster has cold files, and answers that lower number without an error. The
+// caller is expected to say whose view it is reporting.
+func (m *Manager) CountColdFilesByDatabase(ctx context.Context) (map[string]int64, error) {
+	if m == nil || m.metadata == nil {
+		return nil, nil
+	}
+	return m.metadata.CountFilesInTierByDatabase(ctx, TierCold)
+}
+
 // RecordUnlinkedFile reports that this node removed its own local copy of a
 // path because the path left the cluster manifest. sizeBytes is the size the
 // caller stat'd before deleting, which is also the evidence that this node

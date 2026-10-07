@@ -164,6 +164,68 @@ Not in this stage: the cold tier (#1086), `arcli backup create --database`
 segment. A different backup target per database landed separately in #1085,
 below.
 
+### A backup says how many cold-tier files it is not carrying ([#1085](https://github.com/Basekick-Labs/arc/issues/1085))
+
+A backup copies hot storage. On a deployment with tiered storage on, the files
+that have been migrated to the cold tier are not in it, and until now nothing
+in the backup said so: a manifest that read `total_files: 1400` was describing
+1400 hot files and however many cold ones you had, silently.
+
+Every backup manifest now carries `cold_files_excluded`, and
+`cold_files_excluded_databases` breaks it down per database, because a single
+total does not tell you which database has data the backup is missing:
+
+```json
+{
+  "backup_id": "backup-20261007-141500",
+  "total_files": 1400,
+  "cold_files_excluded": 412,
+  "cold_files_excluded_databases": { "audit": 400, "metrics": 12 }
+}
+```
+
+The figure also appears in the backup list, in `GET
+/api/v1/backup/:id` per target (so you can see which destination holds the
+gap, if you route databases to different targets), and in a warning the
+restore logs:
+
+```
+WARN The backup being restored did not carry these cold-tier files: a backup
+     copies hot storage only ... backup_cold_files_excluded=412
+```
+
+Three things to know about it.
+
+**It does not block anything.** In particular a replace-mode restore of a
+partly-cold backup still succeeds. Replace deletes the current files of the
+databases it restores, so it refuses to run from a backup that is *incomplete*
+— but a cold-tier object is not something the backup failed to get, it is
+something no backup carries yet, and replace cannot delete it either (it
+deletes through the cluster file manifest, which a migrated file has already
+left). Refusing here would prevent nothing and would make tiered storage and
+replace-mode restore mutually exclusive.
+
+**It is the reporting node's view.** The count comes from this node's tier
+metadata. On a cluster where one node migrates and the others learn about it
+through the cold-tier metadata sync, a node whose sync has not run yet reports
+a lower number. Take the backup on the primary writer for the full picture.
+
+**The cold tier is still not backed up.** That is the next piece of this work
+([#1086](https://github.com/Basekick-Labs/arc/issues/1086)). Until it lands,
+`cold_files_excluded` is how you size what a restore from this backup would not
+bring back — and the cold objects themselves are untouched and still readable
+where they are.
+
+The field is absent in four cases, which the JSON cannot tell apart: tiering
+is off, nothing has been migrated, the count could not be taken (the backup
+still completes and a warning names the failure) — and **this node has no
+tiered-storage licence**. That last one is worth knowing, because it is where
+the marker would help most: tiering is licence-gated at startup, so an
+unlicensed node reports nothing even though its cold objects and tier metadata
+are still there and its migrations have stopped. **An absent field is not
+evidence that nothing was migrated.** A licence that lapses while Arc is
+running keeps reporting; the next restart goes quiet.
+
 ### A different backup target per database ([#1085](https://github.com/Basekick-Labs/arc/issues/1085))
 
 A backup had one destination. Now each configured target may name the databases
@@ -990,6 +1052,56 @@ These do not change how Arc behaves. They are here because the codebase is the
 thing a new maintainer has to learn, and a refactor that moves a decision from
 four places to one is worth knowing about before you go looking for it in the
 old place.
+
+### The cold-file marker's shape ([#1085](https://github.com/Basekick-Labs/arc/issues/1085))
+
+`backup.ColdCounter` is a one-method interface (`CountColdFilesByDatabase`)
+wired from the tiering manager in `cmd/arc/main.go` beside `SetTierLookup`, nil
+when tiering is off — the same pattern #1084 used for the fully-cold database
+check, and for the same reason: the backup package should not import tiering.
+
+Because that wiring sits inside the tiering block, which is gated on the
+**licence** and not only on `tiered_storage.enabled`, an unlicensed node wires
+no counter at all. That is left as it is: the alternative is building a tiering
+`MetadataStore`, schema included, on an unlicensed node, which is the boundary
+the licence pattern exists to hold. The field's doc comment and the operator
+note above both say so, since an absent field would otherwise read as "nothing
+was migrated".
+
+Three decisions worth knowing before changing this code.
+
+**One grouped query, not one per database.** `SELECT database, COUNT(*) ...
+WHERE tier = ? AND quarantined_at IS NULL GROUP BY database`. The set a caller
+wants is "every database with cold rows", and that is *not* the backup
+inventory — a fully cold database has no hot files, so it is absent from both
+the listing and `manifest.Databases` while still holding the rows this counts.
+Grouping means the caller never has to discover the set first, and it cannot
+half-fail the way N point queries can, which is what lets the count be
+all-or-nothing instead of needing an "unavailable" flag. The plan is a seek on
+`idx_tier_files_tier` plus a temporary b-tree over only that tier's rows,
+measured and unchanged by `ANALYZE`; `idx_tier_files_database_tier` does not
+serve it, because `tier` is that index's second column. It is not the fastest
+plan available and the comment in the code says so: a covering index on
+`(tier, database, quarantined_at)` is about 6x faster, and is deliberately not
+added because it costs ~7% of the database file and a sixth b-tree on a table
+the ingest flush path writes to, to save ~18 ms once per backup run. The note
+records the scale at which that trade flips.
+
+**Per leg, by the same rule the data follows.** Since a backup can fan out to
+one destination per database, the count is attributed with `run.legFor`, so a
+database routed to the audit target has its gap on that target's manifest and
+nowhere else, and `mergeRunManifests` sums the legs into the run-level view
+every consumer reads. A new per-leg counter that is added to the struct but not
+to that merge reads zero on every multi-leg backup and correct on every
+single-leg one, because the one-leg path is a clone — the kind of bug that
+looks right in most tests.
+
+**Informational by construction.** A counting failure warns and the backup
+completes: the count describes data the backup was never going to carry, so
+failing the run would trade a healthy backup for no backup over a diagnostic.
+There is a comment at the replace-mode incompleteness refusal explaining why
+this count deliberately does not join it; a regression test fails if it ever
+does.
 
 ### Stale compaction manifests follow normal recovery ([#750](https://github.com/Basekick-Labs/arc/issues/750))
 

@@ -147,6 +147,37 @@ type Manifest struct {
 	// namespace directories are still excluded: they are never listed).
 	IcebergNamespaceFilesExcluded int64    `json:"iceberg_namespace_files_excluded,omitempty"`
 	IcebergNamespacesExcluded     []string `json:"iceberg_namespaces_excluded,omitempty"`
+	// ColdFilesExcluded counts the files this leg's databases hold in the
+	// COLD tier, which a backup does not carry: only hot storage is copied
+	// (#1085 stage B3; stage C adds the cold tier). It is INFORMATIONAL and
+	// deliberately joins no refusal — see the comment above the incompleteness
+	// refusal in restore.go, which explains why adding it there would prevent
+	// nothing. ColdFilesExcludedDatabases is the per-database breakdown,
+	// because one total over several databases does not tell an operator which
+	// database has data the backup is missing.
+	//
+	// Per leg, like the counters on TargetSlice: a database's cold gap is
+	// attributed to the target its DATA routes to, so the audit target's
+	// manifest reports the audit database's gap and nothing else. Summed into
+	// the run-level view by mergeRunManifests.
+	//
+	// THIS NODE's tier metadata, which is the only view a backup has. On a
+	// cluster where one node migrates and the others learn about it through
+	// the cold-tier metadata sync, a node whose sync has not run or has failed
+	// holds fewer rows than the cluster has cold files and reports the lower
+	// number without an error.
+	//
+	// Zero and absent in FOUR cases, which the JSON cannot distinguish: when
+	// tiering is off; when nothing has been migrated; when the count could not
+	// be taken (the WARN that names the failure is the only record of this
+	// one); and — the one that misleads — when this node has no tiering
+	// LICENCE. The tiering manager is licence-gated at startup, so an
+	// unlicensed node wires no counter even though its cold objects and tier
+	// rows are still there. An absent field is therefore NOT evidence that
+	// nothing was migrated. A licence that lapses while the process runs keeps
+	// reporting; the restart after a lapse does not.
+	ColdFilesExcluded          int64            `json:"cold_files_excluded,omitempty"`
+	ColdFilesExcludedDatabases map[string]int64 `json:"cold_files_excluded_databases,omitempty"`
 	// Target names the configured backup target this backup was written to
 	// (#1085 stage B2b-1), absent when it went to backup.local_path as
 	// backups did before targets existed.
@@ -263,6 +294,13 @@ type BackupSummary struct {
 	// one, so a client that reads the single-target field is never handed one
 	// of several.
 	Targets []string `json:"targets,omitempty"`
+	// ColdFilesExcluded is the run-level cold-tier gap: files the backup did
+	// not carry because they are no longer in hot storage. Summed over the
+	// legs, so it is a lower bound whenever PartialView is set, like the other
+	// counts here. The per-database breakdown is on the manifest, and so at
+	// the TOP LEVEL of the detail response — not per target (TargetSlice
+	// carries each leg's total only) and not in this listing row.
+	ColdFilesExcluded int64 `json:"cold_files_excluded,omitempty"`
 	// PartialView says the counts above are summed over FEWER legs than
 	// Targets names, because a target would not answer or has not committed.
 	// TotalFiles, TotalBytes and DatabaseCount are then lower bounds, and the
@@ -320,6 +358,19 @@ type Progress struct {
 	// storage root to put them in (the log names the fix).
 	IcebergWarehouseFilesSkipped int64 `json:"iceberg_warehouse_files_skipped,omitempty"`
 	BackupUnaddressableFiles     int64 `json:"backup_unaddressable_files,omitempty"`
+	// ColdFilesExcluded: for a backup, the run-level cold-tier gap, published
+	// once with the other pre-copy decisions — which is BEFORE the copy
+	// phase, so a run that fails later keeps the figure here beside
+	// status="failed". That is deliberate: it was true of the data when it was
+	// taken, and no manifest lands for a failed run, so this is the only place
+	// the gap is visible for one. For a restore,
+	// BackupColdFilesExcluded mirrors the restored backup's own figure, so the
+	// operator can tell data the backup never held from data the restore lost.
+	// The per-database breakdown is NOT here: Progress is published by
+	// setProgress, which takes a shallow copy, so a snapshot must share no
+	// mutable map with the run that is still writing.
+	ColdFilesExcluded       int64 `json:"cold_files_excluded,omitempty"`
+	BackupColdFilesExcluded int64 `json:"backup_cold_files_excluded,omitempty"`
 	// Cluster cross-check, backup only (#1083): mirrors of the manifest's
 	// UnregisteredSkipped/ManifestOnlyFiles and their samples, published once
 	// after the data copy.
@@ -418,6 +469,18 @@ const (
 func mergeRunManifests(legs []*Manifest) *Manifest {
 	if len(legs) == 1 {
 		clone := *legs[0]
+		// The slice fields are aliased, as they always have been, and no
+		// caller appends to them. The breakdown is the manifest's first MAP
+		// field, where an in-place m[k] = v is the natural way to write and
+		// would reach through into the leg, so it is copied rather than
+		// documented as untouchable.
+		if clone.ColdFilesExcludedDatabases != nil {
+			cp := make(map[string]int64, len(clone.ColdFilesExcludedDatabases))
+			for k, v := range clone.ColdFilesExcludedDatabases {
+				cp[k] = v
+			}
+			clone.ColdFilesExcludedDatabases = cp
+		}
 		return &clone
 	}
 	// Run-level fields come from the default leg when it is present, because
@@ -455,6 +518,17 @@ func mergeRunManifests(legs []*Manifest) *Manifest {
 		merged.LeftManifestDuringRun += leg.LeftManifestDuringRun
 		merged.SkippedReconciled += leg.SkippedReconciled
 		merged.IcebergNamespaceFilesExcluded += leg.IcebergNamespaceFilesExcluded
+		merged.ColdFilesExcluded += leg.ColdFilesExcluded
+		if len(leg.ColdFilesExcludedDatabases) > 0 && merged.ColdFilesExcludedDatabases == nil {
+			merged.ColdFilesExcludedDatabases = map[string]int64{}
+		}
+		for db, n := range leg.ColdFilesExcludedDatabases {
+			// Summed rather than assigned for the same reason
+			// mergeDatabaseInfo folds instead of replacing: a database's
+			// anchors and compaction state ride with its data, and a run whose
+			// routing changed between backups could hold one name on two legs.
+			merged.ColdFilesExcludedDatabases[db] += n
+		}
 		merged.SkippedSample = appendSample(merged.SkippedSample, leg.SkippedSample)
 		merged.UnaddressableSample = appendSample(merged.UnaddressableSample, leg.UnaddressableSample)
 		merged.UnregisteredSample = appendSample(merged.UnregisteredSample, leg.UnregisteredSample)
@@ -559,5 +633,6 @@ func SummaryFromManifest(m *Manifest) BackupSummary {
 		LeftManifestDuringRun: m.LeftManifestDuringRun,
 		Target:                m.Target,
 		OwnerInstanceID:       m.OwnerInstanceID,
+		ColdFilesExcluded:     m.ColdFilesExcluded,
 	}
 }

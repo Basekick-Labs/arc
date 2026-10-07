@@ -4495,6 +4495,24 @@ func main() {
 				// The known-database check of a scoped backup (#1084) asks
 				// the same tier metadata whether a database is fully cold.
 				backupManager.SetTierLookup(tieringManager)
+				// And the cold-file marker (#1085 stage B3) asks it how many
+				// files a backup is NOT carrying, since only hot storage is
+				// copied.
+				//
+				// Note what this does NOT cover, because it is the case where
+				// the marker would be most useful. The tiering block above is
+				// gated on the LICENCE, not only on cfg.TieredStorage.Enabled,
+				// so on a node without it tieringManager is nil, this line is
+				// never reached and the field is absent — on a deployment whose
+				// files are already out of hot storage and which has stopped
+				// migrating. A licence that lapses while the process RUNS keeps
+				// reporting, because the manager is already built and only the
+				// migration cycle re-checks; it is the restart after a lapse
+				// that goes quiet. Fixing that would mean building a tiering
+				// MetadataStore (and running its schema) on an unlicensed node,
+				// which is the boundary the licence pattern exists to hold, so
+				// the behaviour stays and the field doc says so instead.
+				backupManager.SetColdCounter(tieringManager)
 			}
 			backupHandler.RegisterRoutes(server.GetApp())
 			// backup_path is logged only when it IS the destination. Logging
@@ -4519,6 +4537,7 @@ func main() {
 				Bool("cluster_gate", clusterCoordinator != nil).
 				Bool("tier_recorder", tieringManager != nil).
 				Bool("tier_lookup", tieringManager != nil).
+				Bool("cold_counter", tieringManager != nil).
 				Msg("Backup/restore enabled")
 		}
 	}

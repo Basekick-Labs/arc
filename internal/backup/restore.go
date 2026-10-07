@@ -296,7 +296,21 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 	progress.BackupUnaddressableFiles = manifest.UnaddressableFiles
 	progress.BackupUnregisteredSkipped = manifest.UnregisteredSkipped
 	progress.BackupManifestOnlyFiles = manifest.ManifestOnlyFiles
+	progress.BackupColdFilesExcluded = manifest.ColdFilesExcluded
 	m.setProgress(progress)
+	// The cold-tier gap joins this informational WARN and NOTHING else
+	// (#1085 stage B3). It is read from the MERGED run view, so a routed
+	// backup reports every leg's gap summed and not whichever leg answered
+	// first. Reported on its own line: unlike the counts above it is not a
+	// defect in the backup, so an operator reading "incomplete" should not be
+	// told the two are the same kind of thing.
+	if manifest.ColdFilesExcluded > 0 {
+		m.logger.Warn().
+			Str("backup_id", opts.BackupID).
+			Int64("backup_cold_files_excluded", manifest.ColdFilesExcluded).
+			Interface("backup_cold_files_excluded_databases", manifest.ColdFilesExcludedDatabases).
+			Msg("The backup being restored did not carry these cold-tier files: a backup copies hot storage only, so the restored databases will be missing whatever had been migrated out of hot storage when the backup was taken. The cold-tier objects themselves are untouched and still readable where they are")
+	}
 	if manifest.SkippedFiles > 0 || manifest.UnaddressableFiles > 0 || manifest.ManifestOnlyFiles > 0 || manifest.UnregisteredSkipped > 0 {
 		m.logger.Warn().
 			Str("backup_id", opts.BackupID).
@@ -1046,6 +1060,46 @@ func (m *Manager) replaceDatabases(ctx context.Context, manifest *Manifest, file
 	if !sc.empty() {
 		scopedDatabases = len(sc.names)
 	}
+	// Manifest.ColdFilesExcluded (#1085 stage B3) is deliberately NOT in the
+	// refusal below, and adding "the other incompleteness count" to it is the
+	// mistake this comment exists to prevent. The counts here describe files
+	// the backup SHOULD have carried and does not, so replacing a database
+	// with the backup loses the difference. A cold-tier file is a different
+	// population: no backup carries it yet, and replace cannot delete it, so
+	// refusing on it would prevent nothing. Three independent mechanisms say
+	// so, not one:
+	//
+	//   - the delete set is built only from the cluster manifest entries this
+	//     function is handed, and tiering removes a migrated file from that
+	//     manifest as phase 2 of the migration (tiering/migrator.go,
+	//     releaseHotCopies, manifest first), so a cold object is never in it;
+	//   - the shared-backend object delete runs against m.dataStorage, which
+	//     is the HOT backend, and cannot address the cold store at all;
+	//   - the tier rows survive: recordHotFileIfNotCold binds its ON CONFLICT
+	//     update to tier = 'hot', so a cold row is left as it is.
+	//
+	// What that buys is narrow and worth stating exactly: the refusal would
+	// prevent nothing. It is NOT a claim that restoring a partly-cold backup
+	// leaves tiering consistent. A file that was hot when the backup was taken
+	// and migrated afterwards is restored to hot storage and registered, while
+	// its tier row still says cold and the report that should flip it is
+	// silently refused by that same ON CONFLICT clause. The query path then
+	// reads that file twice wherever the measurement still has a hot row, and
+	// where it does not, the measurement resolves to the cold glob alone and
+	// the restored copy is invisible. That is a separate, pre-existing
+	// defect about files the backup DOES carry; it happens with this count at
+	// zero, it happens in merge mode too, and gating on this count would not
+	// address it.
+	//
+	// Nor is this the gate that protects cold data from a restore. The one
+	// path that can orphan a cold object is opts.RestoreMetadata, which
+	// replaces tier_files wholesale with the backup-time snapshot; it is
+	// refused on a cluster node and allowed standalone, and it is unrelated to
+	// this count.
+	//
+	// Were ColdFilesExcluded added here, every partly-cold database would
+	// refuse a replace-mode restore — the normal state of any deployment with
+	// tiering on — making tiering and replace-mode restore mutually exclusive.
 	unreconciled := manifest.SkippedFiles - manifest.SkippedReconciled
 	if unreconciled > 0 || manifest.UnaddressableFiles > 0 || manifest.ManifestOnlyFiles > 0 ||
 		progress.MissingFiles > 0 || progress.UnaddressableFiles > 0 {
