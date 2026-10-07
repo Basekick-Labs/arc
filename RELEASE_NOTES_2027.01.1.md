@@ -85,6 +85,12 @@ and scoping below the storage-root segment.
 
 ## Bug fixes
 
+### Replicas without a local WAL start their replication receiver ([#886](https://github.com/Basekick-Labs/arc/issues/886))
+
+With replication enabled, startup previously skipped replication entirely when a node had no local WAL. Reader replicas in the no-shared-storage pattern therefore never started a receiver for the writer's live WAL entries. Startup now enables replication regardless of local WAL and wires the WAL only when present. Writers and standalone nodes configured for replication without a WAL now return a clear error, and the receiver preserves a truly nil WAL interface to avoid a typed-nil panic.
+
+Contributed by [@jallegri](https://github.com/jallegri) in [#1116](https://github.com/Basekick-Labs/arc/pull/1116).
+
 ### Backup and restore are cluster-safe ([#1083](https://github.com/Basekick-Labs/arc/issues/1083))
 
 On a cluster node a backup or a restore was undefined behaviour: any role
