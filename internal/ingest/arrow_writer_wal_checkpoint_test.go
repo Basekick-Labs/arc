@@ -122,7 +122,7 @@ func TestAsyncFlush_RecordsWALCheckpoints(t *testing.T) {
 
 	const writes = 3
 	for i := 0; i < writes; i++ {
-		if err := buffer.writeColumnarInternal(context.Background(), "default", checkpointTestRecord(), false, ""); err != nil {
+		if err := buffer.writeColumnarInternal(context.Background(), "default", checkpointTestRecord(), false, "", nil); err != nil {
 			t.Fatalf("write %d: %v", i, err)
 		}
 	}
@@ -165,7 +165,7 @@ func TestSyncFlush_RecordsWALCheckpoints(t *testing.T) {
 
 	const writes = 3
 	for i := 0; i < writes; i++ {
-		if err := buffer.writeColumnarInternal(context.Background(), "default", checkpointTestRecord(), false, ""); err != nil {
+		if err := buffer.writeColumnarInternal(context.Background(), "default", checkpointTestRecord(), false, "", nil); err != nil {
 			t.Fatalf("write %d: %v", i, err)
 		}
 	}
@@ -292,7 +292,7 @@ func TestAbandonedWrite_ReleasesItsWALIdentity(t *testing.T) {
 		"value": {1.0},
 	}
 
-	err := buffer.writeColumnarInternal(context.Background(), "default", rejected, false, "")
+	err := buffer.writeColumnarInternal(context.Background(), "default", rejected, false, "", nil)
 	if err == nil {
 		t.Fatal("expected the write to be rejected after its WAL append")
 	}
@@ -315,7 +315,7 @@ func TestAcceptedWrite_KeepsItsWALIdentity(t *testing.T) {
 	buffer, walWriter := newCheckpointBuffer(1000)
 	defer buffer.Close()
 
-	if err := buffer.writeColumnarInternal(context.Background(), "default", checkpointTestRecord(), false, ""); err != nil {
+	if err := buffer.writeColumnarInternal(context.Background(), "default", checkpointTestRecord(), false, "", nil); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
@@ -349,7 +349,7 @@ func TestRejectedReplay_DoesNotReleaseTheInheritedIdentity(t *testing.T) {
 	}
 
 	// skipWAL=true with an inherited identity is the replay path.
-	err := buffer.writeColumnarInternal(context.Background(), "default", rejected, true, inherited)
+	err := buffer.writeColumnarInternal(context.Background(), "default", rejected, true, inherited, nil)
 	if err == nil {
 		t.Fatal("expected the replay write to be rejected")
 	}

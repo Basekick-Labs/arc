@@ -1014,6 +1014,12 @@ func TestWALConfig_Defaults(t *testing.T) {
 	if cfg.WAL.RecoveryBatchSize != 10000 {
 		t.Errorf("WAL.RecoveryBatchSize default = %d, want 10000", cfg.WAL.RecoveryBatchSize)
 	}
+	if cfg.WAL.DiskHighWatermarkPercent != 90 {
+		t.Errorf("WAL.DiskHighWatermarkPercent default = %d, want 90", cfg.WAL.DiskHighWatermarkPercent)
+	}
+	if cfg.WAL.DiskMinFreeMB != 512 {
+		t.Errorf("WAL.DiskMinFreeMB default = %d, want 512", cfg.WAL.DiskMinFreeMB)
+	}
 }
 
 func TestWALConfig_EnvOverride(t *testing.T) {
@@ -1029,9 +1035,13 @@ func TestWALConfig_EnvOverride(t *testing.T) {
 
 	os.Setenv("ARC_WAL_RECOVERY_INTERVAL_SECONDS", "600")
 	os.Setenv("ARC_WAL_RECOVERY_BATCH_SIZE", "5000")
+	os.Setenv("ARC_WAL_DISK_HIGH_WATERMARK_PERCENT", "85")
+	os.Setenv("ARC_WAL_DISK_MIN_FREE_MB", "256")
 	defer func() {
 		os.Unsetenv("ARC_WAL_RECOVERY_INTERVAL_SECONDS")
 		os.Unsetenv("ARC_WAL_RECOVERY_BATCH_SIZE")
+		os.Unsetenv("ARC_WAL_DISK_HIGH_WATERMARK_PERCENT")
+		os.Unsetenv("ARC_WAL_DISK_MIN_FREE_MB")
 	}()
 
 	cfg, err := Load()
@@ -1044,6 +1054,12 @@ func TestWALConfig_EnvOverride(t *testing.T) {
 	}
 	if cfg.WAL.RecoveryBatchSize != 5000 {
 		t.Errorf("WAL.RecoveryBatchSize = %d, want 5000", cfg.WAL.RecoveryBatchSize)
+	}
+	if cfg.WAL.DiskHighWatermarkPercent != 85 {
+		t.Errorf("WAL.DiskHighWatermarkPercent = %d, want 85", cfg.WAL.DiskHighWatermarkPercent)
+	}
+	if cfg.WAL.DiskMinFreeMB != 256 {
+		t.Errorf("WAL.DiskMinFreeMB = %d, want 256", cfg.WAL.DiskMinFreeMB)
 	}
 }
 

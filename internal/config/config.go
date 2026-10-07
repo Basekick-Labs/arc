@@ -414,14 +414,16 @@ type EdgeSyncBundleConfig struct {
 }
 
 type WALConfig struct {
-	Enabled                 bool   // Enable WAL for durability (default: false)
-	Directory               string // WAL directory (default: ./data/wal)
-	SyncMode                string // Sync mode: fsync, fdatasync, async (default: fdatasync)
-	MaxSizeMB               int    // Rotate WAL when it reaches this size in MB (default: 100)
-	MaxAgeSeconds           int    // Rotate WAL after this many seconds (default: 3600)
-	RecoveryIntervalSeconds int    // Interval for periodic WAL recovery in seconds (default: 300 = 5 minutes)
-	RecoveryBatchSize       int    // Max records to replay per batch during recovery (default: 10000)
-	BufferSize              int    // Async write buffer size in entries (default: 10000)
+	Enabled                  bool   // Enable WAL for durability (default: false)
+	Directory                string // WAL directory (default: ./data/wal)
+	SyncMode                 string // Sync mode: fsync, fdatasync, async (default: fdatasync)
+	MaxSizeMB                int    // Rotate WAL when it reaches this size in MB (default: 100)
+	MaxAgeSeconds            int    // Rotate WAL after this many seconds (default: 3600)
+	RecoveryIntervalSeconds  int    // Interval for periodic WAL recovery in seconds (default: 300 = 5 minutes)
+	RecoveryBatchSize        int    // Max records to replay per batch during recovery (default: 10000)
+	BufferSize               int    // Async write buffer size in entries (default: 10000)
+	DiskHighWatermarkPercent int    // Reject WAL writes at or above this disk usage (default: 90)
+	DiskMinFreeMB            int    // Always reserve at least this much free space for WAL recovery (default: 512)
 }
 
 type TelemetryConfig struct {
@@ -954,14 +956,16 @@ func Load() (*Config, error) {
 			CompletionOrphanTimeoutMS:   v.GetInt("compaction.completion_orphan_timeout_ms"),
 		},
 		WAL: WALConfig{
-			Enabled:                 v.GetBool("wal.enabled"),
-			Directory:               v.GetString("wal.directory"),
-			SyncMode:                v.GetString("wal.sync_mode"),
-			MaxSizeMB:               v.GetInt("wal.max_size_mb"),
-			MaxAgeSeconds:           v.GetInt("wal.max_age_seconds"),
-			RecoveryIntervalSeconds: v.GetInt("wal.recovery_interval_seconds"),
-			RecoveryBatchSize:       v.GetInt("wal.recovery_batch_size"),
-			BufferSize:              v.GetInt("wal.buffer_size"),
+			Enabled:                  v.GetBool("wal.enabled"),
+			Directory:                v.GetString("wal.directory"),
+			SyncMode:                 v.GetString("wal.sync_mode"),
+			MaxSizeMB:                v.GetInt("wal.max_size_mb"),
+			MaxAgeSeconds:            v.GetInt("wal.max_age_seconds"),
+			RecoveryIntervalSeconds:  v.GetInt("wal.recovery_interval_seconds"),
+			RecoveryBatchSize:        v.GetInt("wal.recovery_batch_size"),
+			BufferSize:               v.GetInt("wal.buffer_size"),
+			DiskHighWatermarkPercent: v.GetInt("wal.disk_high_watermark_percent"),
+			DiskMinFreeMB:            v.GetInt("wal.disk_min_free_mb"),
 		},
 		Telemetry: TelemetryConfig{
 			Enabled:         v.GetBool("telemetry.enabled"),
@@ -1662,6 +1666,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("wal.recovery_interval_seconds", 300) // Periodic recovery every 5 minutes
 	v.SetDefault("wal.recovery_batch_size", 10000)     // Max records per recovery batch (rate limiting)
 	v.SetDefault("wal.buffer_size", 10000)             // Async write buffer size in entries
+	v.SetDefault("wal.disk_high_watermark_percent", 90) // Reject writes at or above this disk usage
+	v.SetDefault("wal.disk_min_free_mb", 512)            // Reserve free space for WAL recovery
 
 	// Telemetry defaults
 	v.SetDefault("telemetry.enabled", true)                                               // Enabled by default (opt-out)

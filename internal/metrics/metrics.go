@@ -149,6 +149,7 @@ type Metrics struct {
 	walDroppedEntries    atomic.Int64 // Entries dropped due to full WAL buffer
 	walFailedWrites      atomic.Int64 // Write failures to WAL file
 	walOversizedPayloads atomic.Int64 // Payloads rejected for exceeding the single-entry cap even after chunking (#677)
+	walDiskPressure      atomic.Int64 // Data writes rejected to preserve filesystem headroom (#676)
 
 	// NOTE: no decompression-pool discard counter here (#817). The pooled
 	// codecs it belonged to were replaced by decompressGzipPooled /
@@ -514,6 +515,7 @@ func (m *Metrics) IncWALRecoveryRecords(count int64)  { m.walRecoveryRecords.Add
 func (m *Metrics) IncWALDroppedEntries()              { m.walDroppedEntries.Add(1) }
 func (m *Metrics) IncWALFailedWrites()                { m.walFailedWrites.Add(1) }
 func (m *Metrics) IncWALOversizedPayloads()           { m.walOversizedPayloads.Add(1) }
+func (m *Metrics) IncWALDiskPressure()                { m.walDiskPressure.Add(1) }
 
 // Decompression Pool Metrics
 
@@ -740,12 +742,13 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"mqtt_reconnects":        m.mqttReconnects.Load(),
 
 		// WAL
-		"wal_records_preserved":  m.walRecordsPreserved.Load(),
-		"wal_recovery_total":     m.walRecoveryTotal.Load(),
-		"wal_recovery_records":   m.walRecoveryRecords.Load(),
-		"wal_dropped_entries":    m.walDroppedEntries.Load(),
-		"wal_failed_writes":      m.walFailedWrites.Load(),
-		"wal_oversized_payloads": m.walOversizedPayloads.Load(),
+		"wal_records_preserved":   m.walRecordsPreserved.Load(),
+		"wal_recovery_total":      m.walRecoveryTotal.Load(),
+		"wal_recovery_records":    m.walRecoveryRecords.Load(),
+		"wal_dropped_entries":     m.walDroppedEntries.Load(),
+		"wal_failed_writes":       m.walFailedWrites.Load(),
+		"wal_oversized_payloads":  m.walOversizedPayloads.Load(),
+		"wal_disk_pressure_total": m.walDiskPressure.Load(),
 
 		// Decompression Pool
 
@@ -1104,6 +1107,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_oversized_payloads_total Payloads rejected for exceeding the single-entry cap even after chunking\n"...)
 	b = append(b, "# TYPE arc_wal_oversized_payloads_total counter\n"...)
 	b = appendMetric(b, "arc_wal_oversized_payloads_total", float64(m.walOversizedPayloads.Load()))
+
+	b = append(b, "# HELP arc_wal_disk_pressure_total WAL data writes rejected for disk pressure\n"...)
+	b = append(b, "# TYPE arc_wal_disk_pressure_total counter\n"...)
+	b = appendMetric(b, "arc_wal_disk_pressure_total", float64(m.walDiskPressure.Load()))
 
 	// Governance metrics
 	b = append(b, "# HELP arc_governance_rate_limited_total Queries rejected by rate limiting\n"...)

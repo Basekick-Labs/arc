@@ -17,6 +17,7 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/basekick-labs/arc/internal/ingest"
+	"github.com/basekick-labs/arc/internal/wal"
 	"github.com/gofiber/fiber/v2"
 )
 
@@ -1201,11 +1202,10 @@ func (lr *limitedReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// importBufferStatus maps the ArrowBuffer's two retryable states to 503 so an
-// import that raced a shutdown, or hit sustained schema churn, is not reported
-// as a permanent server error.
+// importBufferStatus maps retryable ArrowBuffer errors and WAL disk pressure to
+// 503 so clients can back off and retry the import.
 func importBufferStatus(err error) int {
-	if errors.Is(err, ingest.ErrBufferClosing) || errors.Is(err, ingest.ErrSchemaChurnExceeded) {
+	if errors.Is(err, ingest.ErrBufferClosing) || errors.Is(err, ingest.ErrSchemaChurnExceeded) || errors.Is(err, wal.ErrWALDiskPressure) {
 		return fiber.StatusServiceUnavailable
 	}
 	return fiber.StatusInternalServerError

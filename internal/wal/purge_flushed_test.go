@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -84,6 +85,25 @@ func TestMinUnflushedSequenceTracksDurableCheckpoints(t *testing.T) {
 	}
 	if got := w.MinUnflushedSequence(); got == 1 {
 		t.Fatalf("MinUnflushedSequence still reports seq 1 after durable checkpoint")
+	}
+}
+
+func TestWALDiskPressureRejectsData(t *testing.T) {
+	w, err := NewWriter(&WriterConfig{
+		WALDir:        t.TempDir(),
+		SyncMode:      SyncModeFdatasync,
+		BufferSize:    16,
+		DiskMinFreeMB: 1 << 30,
+		Logger:        zerolog.Nop(),
+	})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	defer w.Close()
+
+	_, err = w.AppendTracked([]map[string]interface{}{{"m": "pressure", "v": 1}})
+	if !errors.Is(err, ErrWALDiskPressure) {
+		t.Fatalf("AppendTracked error = %v, want ErrWALDiskPressure", err)
 	}
 }
 
