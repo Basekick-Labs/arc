@@ -262,6 +262,17 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Crash smokes verify acknowledged records after WAL replay
+
+The enterprise-shared crash scenarios restart the killed writer and wait for
+`/ready`, then check the host IDs from every successful write batch. WAL replay
+duplicates and records persisted by failed requests are allowed, but cannot mask
+missing acknowledged records. Crash runs reject an idle kill target or a crash
+that never triggered. The base scenario keeps its exact row-count assertion and
+now exits successfully when it passes.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1004](https://github.com/Basekick-Labs/arc/pull/1004).
+
 ### Forwarded writes and WAL replication honor cancellation during TLS setup ([#1064](https://github.com/Basekick-Labs/arc/issues/1064))
 
 Leader forwarding and WAL replication now pass their existing contexts into

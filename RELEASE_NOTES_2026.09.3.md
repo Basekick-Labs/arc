@@ -1047,16 +1047,6 @@ and with the WAL off a storage write that fails still loses that batch
 [#1009](https://github.com/Basekick-Labs/arc/issues/1009)).
 
 
-### Crash smokes account for at-least-once WAL replay
-
-The enterprise-shared crash scenarios now restart the killed writer and wait
-for `/ready` before checking recovery. They compare HTTP-success coverage with
-the distinct `host` count, so duplicate rows from WAL replay do not look like
-lost records before compaction. The base scenario continues to assert an exact
-row count.
-
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1004](https://github.com/Basekick-Labs/arc/pull/1004).
-
 ### Continuous queries re-validate their stored definition before each run
 
 A continuous-query definition is validated when it is created or updated, but
