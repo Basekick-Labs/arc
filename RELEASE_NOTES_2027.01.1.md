@@ -152,6 +152,19 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Forwarded writes and WAL replication honor cancellation during TLS setup ([#1064](https://github.com/Basekick-Labs/arc/issues/1064))
+
+Leader forwarding and WAL replication now pass their existing contexts into
+peer dials, so cancellation interrupts a stalled TLS handshake instead of
+waiting for the dial timeout. Regression tests cover leader-dial cancellation,
+the receiver's cancellation error, and receiver shutdown during TLS setup.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1068](https://github.com/Basekick-Labs/arc/pull/1068) and
+[@jallegri](https://github.com/jallegri) in
+[#1117](https://github.com/Basekick-Labs/arc/pull/1117), combined here with
+coverage from both contributions.
+
 ### Float-to-integer conversion rejects the rounded upper bound and NaN ([#936](https://github.com/Basekick-Labs/arc/pull/936))
 
 Converting `math.MaxInt64` to a float rounds it to `2^63`, so the previous
