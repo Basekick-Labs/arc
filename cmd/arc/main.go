@@ -1235,18 +1235,18 @@ func main() {
 		// for the PERIODIC flush-failure recovery below, where ingest (and
 		// therefore rotation) is live during the scan.
 		recoveryStats, err := walRecovery.RecoverWithOptions(context.Background(), recoveryCallback, &wal.RecoveryOptions{
-			SkipActiveFile:      startupActiveFile,
-			BatchSize:           cfg.WAL.RecoveryBatchSize,
-			ColumnarCallback:    columnarCallback,
-			TrackedRowCallback:  createTrackedWALRecoveryCallback(arrowBuffer, logger.Get("wal-recovery")),
-			ValidateTrackedRows: validateTrackedWALRecoveryRows,
-			CheckpointRecovered: checkpointRecovered,
-			BeforeDelete:        arrowBuffer.NewRecoveryFlushBarrier(),
-			BarrierBatchFiles:   16,
-			BarrierBatchRows:    cfg.Ingest.MaxBufferSize,
-			MaxReplayFailures:   3,
-			Held:                walHold,
-			OnQuarantine:        walQuarantined,
+			SkipActiveFile:                 startupActiveFile,
+			BatchSize:                      cfg.WAL.RecoveryBatchSize,
+			ColumnarCallbackWithTagColumns: columnarCallback,
+			TrackedRowCallback:             createTrackedWALRecoveryCallback(arrowBuffer, logger.Get("wal-recovery")),
+			ValidateTrackedRows:            validateTrackedWALRecoveryRows,
+			CheckpointRecovered:            checkpointRecovered,
+			BeforeDelete:                   arrowBuffer.NewRecoveryFlushBarrier(),
+			BarrierBatchFiles:              16,
+			BarrierBatchRows:               cfg.Ingest.MaxBufferSize,
+			MaxReplayFailures:              3,
+			Held:                           walHold,
+			OnQuarantine:                   walQuarantined,
 		})
 		recoveryNeedsRetry := err != nil
 		if err != nil {
@@ -1388,21 +1388,21 @@ func main() {
 						}
 						failureGeneration := arrowBuffer.FlushFailureGeneration()
 						stats, err := walRecovery.RecoverWithOptions(walMaintenanceCtx, recoveryCallback, &wal.RecoveryOptions{
-							SkipActiveFile:             activeFile,
-							AdditionalCheckpointHashes: activeCheckpointHashes,
-							MinFileAge:                 5 * time.Second,
-							MinFileAgeExemptFiles:      []string{previousActiveFile},
-							BatchSize:                  cfg.WAL.RecoveryBatchSize,
-							ColumnarCallback:           columnarCallback,
-							TrackedRowCallback:         createTrackedWALRecoveryCallback(arrowBuffer, walLogger),
-							ValidateTrackedRows:        validateTrackedWALRecoveryRows,
-							CheckpointRecovered:        checkpointRecovered,
-							BeforeDelete:               arrowBuffer.NewRecoveryFlushBarrier(),
-							BarrierBatchFiles:          16,
-							BarrierBatchRows:           cfg.Ingest.MaxBufferSize,
-							MaxReplayFailures:          3,
-							Held:                       walHold,
-							OnQuarantine:               walQuarantined,
+							SkipActiveFile:                 activeFile,
+							AdditionalCheckpointHashes:     activeCheckpointHashes,
+							MinFileAge:                     5 * time.Second,
+							MinFileAgeExemptFiles:          []string{previousActiveFile},
+							BatchSize:                      cfg.WAL.RecoveryBatchSize,
+							ColumnarCallbackWithTagColumns: columnarCallback,
+							TrackedRowCallback:             createTrackedWALRecoveryCallback(arrowBuffer, walLogger),
+							ValidateTrackedRows:            validateTrackedWALRecoveryRows,
+							CheckpointRecovered:            checkpointRecovered,
+							BeforeDelete:                   arrowBuffer.NewRecoveryFlushBarrier(),
+							BarrierBatchFiles:              16,
+							BarrierBatchRows:               cfg.Ingest.MaxBufferSize,
+							MaxReplayFailures:              3,
+							Held:                           walHold,
+							OnQuarantine:                   walQuarantined,
 						})
 						if walWriter != nil && stats != nil {
 							walWriter.AdoptRetained(stats.Retained)
@@ -5199,8 +5199,8 @@ func createTrackedWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger
 
 // createColumnarRecoveryCallback creates a WAL recovery callback for columnar entries
 // written via the zero-copy AppendRaw path.
-func createColumnarRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolog.Logger) wal.ColumnarRecoveryCallback {
-	return func(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string) error {
+func createColumnarRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolog.Logger) wal.ColumnarRecoveryCallbackWithTagColumns {
+	return func(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string, tagColumns []string) error {
 		if database == "" {
 			database = "default"
 		}
@@ -5208,7 +5208,7 @@ func createColumnarRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger z
 		// exactly one buffer write, so a checkpoint for it covers precisely
 		// these records. Row batches instead inherit their precise row-range
 		// identities when recovery splits an entry.
-		if err := arrowBuffer.WriteColumnarDirectReplay(ctx, database, measurement, columns, walIdentity); err != nil {
+		if err := arrowBuffer.WriteColumnarDirectReplayWithTagColumns(ctx, database, measurement, columns, walIdentity, tagColumns); err != nil {
 			walLogger.Error().Err(err).Str("database", database).Str("measurement", measurement).Msg("Failed to replay columnar WAL entry")
 			return err
 		}
