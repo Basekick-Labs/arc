@@ -204,13 +204,16 @@ type CompactionConfig struct {
 	MemoryLimit string
 
 	// Threads is the DuckDB thread count for EACH compaction subprocess.
-	// 0 (the default) means auto: half of EffectiveCores without a CPU quota;
-	// with a quota, EffectiveCores divided by max_concurrent+1. Both have a
-	// minimum of 1. The no-quota default stays unchanged (#1037). Before this key
-	// existed, each subprocess used DuckDB's own default, which is the quota or,
-	// unlimited, all cores — so two concurrent jobs could saturate the machine
-	// and starve ingest. Sort and scan buffers scale with threads, so this also
-	// bounds memory.
+	// 0 (the default) means auto: EffectiveCores divided by max(2,
+	// max_concurrent), with a minimum of 1. EffectiveCores reflects the CPUs
+	// available to this process; it does not distinguish a quota, cpuset, or
+	// GOMAXPROCS setting. The default max_concurrent of 2 preserves the previous
+	// half-core value, while higher concurrency divides the thread cap across
+	// subprocesses. Positive explicit values are subject to the later licence
+	// cap. Before this key existed, each subprocess used DuckDB's own default,
+	// which could allow concurrent jobs to saturate the machine and starve
+	// ingest. Sort and scan buffers also scale with threads, so this bounds
+	// memory.
 	Threads int
 
 	// MaxFilesPerBatch bounds how many files a single compaction job feeds to
