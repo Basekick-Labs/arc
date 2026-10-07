@@ -307,9 +307,7 @@ func TestSchedulerFailedPassKeepsCompactionDeferredUntilDelivery(t *testing.T) {
 	if !checkEligibility() {
 		t.Fatal("file remained ineligible after the agent delivered it")
 	}
-	if got := metrics.successes.Load(); got != 1 {
-		t.Errorf("success metric = %d, want 1", got)
-	}
+	waitSchedulerMetric(t, &metrics.successes, 1)
 }
 
 func TestSchedulerStopCancelsAndWaitsForPass(t *testing.T) {
