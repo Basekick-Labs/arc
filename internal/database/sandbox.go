@@ -153,17 +153,20 @@ func buildAllowedDirectories(cfg *Config) []string {
 			dirs = append(dirs, coldS3)
 		}
 	}
-	// Primary Azure backend (when storage.backend = "azure"). Arc's config
-	// does not currently expose a per-deployment Azure key prefix, so the
-	// allowlist scopes to the whole container.
+	// Primary Azure backend (when storage.backend = "azure"). Azure has a key
+	// prefix since #1102, so this narrows to it exactly as the S3 entry above
+	// does. At the default (no prefix) the entry is byte-identical to the
+	// container-wide one it replaces.
 	var hotAzure string
 	if cfg.AzureContainer != "" {
-		hotAzure = "azure://" + cfg.AzureContainer + "/"
+		hotAzure = azurePrefixURI(cfg.AzureContainer, cfg.AzurePrefix)
 		dirs = append(dirs, hotAzure)
 	}
-	// Cold-tier Azure (Enterprise). Mirrors the S3 cold-tier full-URI dedupe.
+	// Cold-tier Azure (Enterprise). Mirrors the S3 cold-tier full-URI dedupe,
+	// which is what makes a same-container-different-prefix cold tier get its
+	// own entry rather than being folded into the hot one.
 	if cfg.ColdAzureContainer != "" {
-		coldAzure := "azure://" + cfg.ColdAzureContainer + "/"
+		coldAzure := azurePrefixURI(cfg.ColdAzureContainer, cfg.ColdAzurePrefix)
 		if coldAzure != hotAzure {
 			dirs = append(dirs, coldAzure)
 		}
@@ -225,4 +228,47 @@ func s3SecretScope(bucket, prefix string) string {
 		return ""
 	}
 	return s3PrefixURI(bucket, prefix)
+}
+
+// azurePrefixURI is s3PrefixURI for Azure Blob: a normalized
+// "azure://<container>/<prefix>/" entry, with the same path.Clean handling and
+// the same bare-container fallback for the shapes Clean cannot express.
+// Written as its own function rather than a scheme parameter so the two read
+// as a pair the next reader can diff.
+func azurePrefixURI(container, prefix string) string {
+	prefix = strings.TrimLeft(prefix, "/")
+	if prefix == "" {
+		return "azure://" + container + "/"
+	}
+	prefix = path.Clean(prefix)
+	if prefix == "." || prefix == ".." || strings.HasPrefix(prefix, "../") {
+		return "azure://" + container + "/"
+	}
+	return "azure://" + container + "/" + prefix + "/"
+}
+
+// azureSecretScope builds the SCOPE prefix for a DuckDB Azure secret, or ""
+// (unscoped) when no container is configured.
+//
+// The prefix is included, which is a decision rather than a given (#1102).
+// A container-wide scope still MATCHES a prefixed URI, so queries work either
+// way; what settles it is that the prefix is exactly what makes one container
+// holding both the primary store and the cold tier a sensible topology, and
+// two secrets with byte-identical scopes leave DuckDB to pick between them
+// arbitrarily. That is benign while both tiers authenticate the same way and
+// silently wrong when they do not (primary on a connection string, cold on
+// managed identity, say — independent config blocks). Including the prefix
+// gives DuckDB's longest-prefix match something to resolve on, exactly as the
+// S3 scope already does.
+//
+// Narrowing is safe for Arc's own reads because every Azure URI the query path
+// builds comes from storage.backendRoot, which carries the prefix. It does
+// mean an operator who sets a prefix can no longer hand-write a read_parquet
+// against some other location in the same container — the same confinement S3
+// has had since #746, and only for a key nobody has set yet.
+func azureSecretScope(container, prefix string) string {
+	if container == "" {
+		return ""
+	}
+	return azurePrefixURI(container, prefix)
 }

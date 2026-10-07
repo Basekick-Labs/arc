@@ -108,7 +108,9 @@ type StagingInspector interface {
 
 	// ListStaged returns metadata for staged partials whose key has the given
 	// prefix, so a caller can reclaim abandoned ones. Staged partials are
-	// invisible to List by design, so this is the only way to find them.
+	// invisible to List by design, so this is the way to find them. Every key
+	// it returns is accepted by DeleteStaged: a partial whose key DeleteStaged
+	// refuses is omitted and surfaces through UnusableLister instead (#772).
 	ListStaged(ctx context.Context, prefix string) ([]ObjectInfo, error)
 }
 
@@ -135,6 +137,27 @@ type ObjectInfo struct {
 // This is useful for retention policies that need to check file ages.
 type ObjectLister interface {
 	ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, error)
+}
+
+// PrefixProber answers "is there at least one listable object under this
+// prefix" without listing the prefix.
+//
+// ListObjects is the wrong tool for that question on a large prefix: it walks
+// every file (local) or pages through every key (S3, Azure) and returns them
+// all, when the caller only needs to know whether the first one exists. The
+// backup API asks it for up to 256 database names inside one request timeout,
+// and a database can hold millions of files, so the probe has to stop at the
+// first hit. Implementations apply the same prefix contract (ValidateListPrefix)
+// and the same visibility rule as ListObjects: an object the listing would
+// hide (a dot-prefixed name, a key the contract refuses, a staging partial) is
+// not a hit, so "false" from the probe and "empty" from ListObjects agree. A
+// prefix that names nothing at all is false with a nil error.
+//
+// Optional: callers type-assert and fall back to ListObjects when the backend
+// does not implement it (test fakes that embed the Backend interface, for
+// instance). LocalBackend, S3Backend and AzureBlobBackend all implement it.
+type PrefixProber interface {
+	HasObjectsUnderPrefix(ctx context.Context, prefix string) (bool, error)
 }
 
 // UnusableObject is an object that exists in the store but that no listing

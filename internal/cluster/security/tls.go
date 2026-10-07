@@ -1,6 +1,7 @@
 package security
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -141,9 +142,29 @@ func Listen(network, addr string, tlsCfg *tls.Config) (net.Listener, error) {
 
 // Dial connects to addr, wrapping with TLS if tlsCfg is non-nil.
 func Dial(network, addr string, timeout time.Duration, tlsCfg *tls.Config) (net.Conn, error) {
+	// Delegates so the two cannot drift. Behaviour-preserving: tls.DialWithDialer
+	// is dial(context.Background(), ...) and net.DialTimeout is
+	// (&net.Dialer{Timeout: t}).DialContext(context.Background(), ...), which is
+	// exactly what DialContext does with a background context.
+	//
+	// Prefer DialContext wherever a context is in scope — a cancelled context
+	// cannot interrupt a stalled dial or TLS handshake through this one.
+	return DialContext(context.Background(), network, addr, timeout, tlsCfg)
+}
+
+// DialContext connects to addr, wrapping with TLS if tlsCfg is non-nil, like
+// Dial, but honors ctx cancellation for the entire connection establishment
+// — including the TLS handshake. Dial's tls.DialWithDialer performs the
+// handshake against a background context internally, so canceling the
+// caller's context cannot interrupt a stalled handshake; tls.Dialer.DialContext
+// threads ctx through to the handshake, fixing that. timeout still bounds the
+// dial the same way it does for Dial (the earlier of ctx's deadline and
+// timeout wins).
+func DialContext(ctx context.Context, network, addr string, timeout time.Duration, tlsCfg *tls.Config) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: timeout}
 	if tlsCfg != nil {
-		dialer := &net.Dialer{Timeout: timeout}
-		return tls.DialWithDialer(dialer, network, addr, tlsCfg)
+		tlsDialer := &tls.Dialer{NetDialer: dialer, Config: tlsCfg}
+		return tlsDialer.DialContext(ctx, network, addr)
 	}
-	return net.DialTimeout(network, addr, timeout)
+	return dialer.DialContext(ctx, network, addr)
 }

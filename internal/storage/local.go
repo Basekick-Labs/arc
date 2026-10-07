@@ -712,6 +712,56 @@ func (b *LocalBackend) ListObjects(ctx context.Context, prefix string) ([]Object
 	return results, nil
 }
 
+// errPrefixProbeHit is the sentinel HasObjectsUnderPrefix returns from its walk
+// callback to stop filepath.WalkDir at the first listable file. Never returned
+// to callers.
+var errPrefixProbeHit = errors.New("storage: prefix probe found a listable object")
+
+// HasObjectsUnderPrefix implements PrefixProber: it walks the directory the
+// prefix names and stops at the first file ListObjects would return. A prefix
+// whose directory does not exist is false with a nil error; a directory
+// holding only entries a listing hides (dot-prefixed names, keys the contract
+// refuses, staging partials) is false too, because omittedFromListing is the
+// one rule both share.
+func (b *LocalBackend) HasObjectsUnderPrefix(ctx context.Context, prefix string) (bool, error) {
+	searchPath, err := b.validateListPath(prefix)
+	if err != nil {
+		return false, fmt.Errorf("invalid prefix: %w", err)
+	}
+	err = filepath.WalkDir(searchPath, func(path string, d os.DirEntry, err error) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		relPath, err := filepath.Rel(b.basePath, path)
+		if err != nil {
+			return err
+		}
+		if omittedFromListing(d.Name(), filepath.ToSlash(relPath)) != nil {
+			return nil
+		}
+		return errPrefixProbeHit
+	})
+	if errors.Is(err, errPrefixProbeHit) {
+		return true, nil
+	}
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to probe prefix: %w", err)
+	}
+	return false, nil
+}
+
 // errHiddenName marks an entry a listing skips because its name is
 // dot-prefixed. Not an ErrInvalidPath: the key contract accepts leading dots
 // (ValidateKeySegment does so deliberately), so this is a listing convention
@@ -1160,9 +1210,11 @@ func (b *LocalBackend) ListUnusable(ctx context.Context, prefix string) ([]Unusa
 
 // ListStaged implements StagingInspector.
 //
-// Staged partials are filtered out of List and ListObjects, so this is the only
-// way to find an abandoned one. Without it a spoke that keeps abandoning
-// transfers would fill the disk with files nothing could see.
+// Staged partials are filtered out of List and ListObjects, so this is the way
+// to find an abandoned one. Without it a spoke that keeps abandoning transfers
+// would fill the disk with files nothing could see. Every key it returns is
+// one DeleteStaged accepts; a partial whose stripped key fails that rule is
+// omitted here and reported by ListUnusable instead (#772).
 func (b *LocalBackend) ListStaged(ctx context.Context, prefix string) ([]ObjectInfo, error) {
 	searchPath, err := b.validateListPath(prefix)
 	if err != nil {
@@ -1189,14 +1241,23 @@ func (b *LocalBackend) ListStaged(ctx context.Context, prefix string) ([]ObjectI
 		if relErr != nil {
 			return nil
 		}
+		// Reported WITHOUT the suffix: the caller addresses a partial by
+		// the key it belongs to, never by the staging spelling.
+		key := strings.TrimSuffix(filepath.ToSlash(rel), PartSuffix)
+		// stagedPath applies the same validation DeleteStaged will apply to
+		// this key. A partial whose stripped key fails it (a legacy partial
+		// of a key that is illegal today) must not be reported here: nothing
+		// could ever delete it, and reclaimStagedPartials would just log the
+		// same refusal on every run forever. ListUnusable reports it instead.
+		if _, err := b.stagedPath(key); err != nil {
+			return nil
+		}
 		info, infoErr := d.Info()
 		if infoErr != nil {
 			return nil
 		}
 		results = append(results, ObjectInfo{
-			// Reported WITHOUT the suffix: the caller addresses a partial by
-			// the key it belongs to, never by the staging spelling.
-			Path:         strings.TrimSuffix(filepath.ToSlash(rel), PartSuffix),
+			Path:         key,
 			Size:         info.Size(),
 			LastModified: info.ModTime(),
 		})
