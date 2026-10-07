@@ -1254,6 +1254,14 @@ throughput. A negative value is refused at startup.
 Above the new ceiling, when the WAL queue is full, an entry is still dropped and
 the write still acknowledged. What admission should do instead is
 [#676](https://github.com/Basekick-Labs/arc/issues/676).
+### Flush metrics report queued and in-flight records ([#1038](https://github.com/Basekick-Labs/arc/issues/1038))
+
+Prometheus now exposes separate record-count gauges for flush batches waiting
+in the queue and batches currently being written. Together with
+`arc_buffer_records_buffered`, these show records retained across all three
+ingest stages without changing flush or write behaviour.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1042](https://github.com/Basekick-Labs/arc/pull/1042).
 
 ### Arc's own storage roots are no longer treated as databases ([#1012](https://github.com/Basekick-Labs/arc/issues/1012))
 
