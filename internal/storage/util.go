@@ -83,8 +83,12 @@ func backendRoot(backend Backend) string {
 	case *S3Backend:
 		return "s3://" + b.bucket + "/" + b.prefix
 	case *AzureBlobBackend:
-		// Azure has no prefix concept: the key IS the blob name.
-		return "azure://" + b.containerName + "/"
+		// Azure carries a prefix too since #1102, and it is part of the root
+		// for the same reason S3's is: every key the backend writes sits under
+		// it, so a read path that leaves it out reads a location nothing was
+		// written to. Same expression as the S3 arm above, because the prefix
+		// is either empty or already trailing-slashed.
+		return "azure://" + b.containerName + "/" + b.prefix
 	case *LocalBackend:
 		return b.pathPrefix
 	default:

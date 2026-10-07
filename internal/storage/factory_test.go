@@ -291,10 +291,10 @@ func TestNewBackendNeverReturnsTypedNilOnError(t *testing.T) {
 // TestNewBackendForwardsAndValidatesS3Prefix covers the one spec field whose
 // loss is silent. A dropped prefix does not fail: it relocates the whole
 // deployment to the bucket root, which is a different and much larger place
-// (see ValidateS3Prefix's own doc comment; the compaction subprocess once had
+// (see ValidateObjectPrefix's own doc comment; the compaction subprocess once had
 // the same omission, which is fixed and pinned by
 // internal/compaction/subprocess_config_test.go). So the factory must pass
-// Prefix through, and must let ValidateS3Prefix refuse an unusable one rather
+// Prefix through, and must let ValidateObjectPrefix refuse an unusable one rather
 // than fall back to "".
 func TestNewBackendForwardsAndValidatesS3Prefix(t *testing.T) {
 	t.Run("forwarded and normalised", func(t *testing.T) {
@@ -319,8 +319,8 @@ func TestNewBackendForwardsAndValidatesS3Prefix(t *testing.T) {
 	// Asserting only "it failed" would be no assertion at all: every other way
 	// an S3 construction can fail - a missing bucket, an AWS config the loader
 	// cannot read - satisfies that too, so the subtest would still pass with
-	// ValidateS3Prefix removed from the path entirely. Each case therefore
-	// matches the wording ValidateS3Prefix itself produces for that input.
+	// ValidateObjectPrefix removed from the path entirely. Each case therefore
+	// matches the wording ValidateObjectPrefix itself produces for that input.
 	t.Run("unusable prefix refuses construction", func(t *testing.T) {
 		cases := []struct{ prefix, wantMsg string }{
 			{"/", "is not a relative prefix"},

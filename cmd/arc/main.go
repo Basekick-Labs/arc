@@ -213,6 +213,14 @@ func main() {
 	logger.Setup(cfg.Log.Level, cfg.Log.Format)
 	log.Info().Str("version", Version).Bool("duckdb_arrow", database.ArrowEnabled).Bool("fips_mode", fips.Enabled()).Msg("Starting Arc...")
 
+	// Load-time advisories about values Arc accepted and kept. config.Load has
+	// no logger, so it collects them and this is the one place they are
+	// emitted. Str fields rather than a formatted message: the value goes in a
+	// structured field so installErrSanitizer cannot mask it.
+	for _, w := range cfg.Warnings {
+		log.Warn().Str("key", w.Key).Str("value", w.Value).Msg(w.Message)
+	}
+
 	// Fail closed: the arc-fips build (fips.BuildTagged) MUST run with the Go
 	// Cryptographic Module actually in FIPS mode. The binary bakes in
 	// GODEBUG=fips140=only (see cmd/arc/fips.go), but an operator could still
@@ -441,6 +449,7 @@ func main() {
 		AzureSASToken:         cfg.Storage.AzureSASToken,
 		AzureEndpoint:         cfg.Storage.AzureEndpoint,
 		AzureContainer:        cfg.Storage.AzureContainer,
+		AzurePrefix:           cfg.Storage.AzurePrefix,
 		// Primary-backend signal for Azure (mirrors S3IsPrimaryBackend): only an
 		// azure/azblob primary backend provisions a primary Azure secret.
 		AzureIsPrimaryBackend: cfg.Storage.Backend == "azure" || cfg.Storage.Backend == "azblob",
@@ -453,6 +462,7 @@ func main() {
 		ColdS3Bucket:       cfg.TieredStorage.Cold.S3Bucket,
 		ColdS3Prefix:       cfg.TieredStorage.Cold.S3Prefix,
 		ColdAzureContainer: cfg.TieredStorage.Cold.AzureContainer,
+		ColdAzurePrefix:    cfg.TieredStorage.Cold.AzurePrefix,
 		// Local storage root used by the DuckDB sandbox to whitelist
 		// Arc-managed file paths in allowed_directories. Always populated
 		// regardless of the configured backend; on S3/Azure-only deployments
@@ -799,9 +809,29 @@ func main() {
 	// degrades a message instead of crashing. Every case sets them today and
 	// the default case provably exits, but a new case that fills in the spec
 	// and forgets logStorageReady would call nil AFTER the backend was already
-	// registered, and one that forgets storageFatalMsg would Fatal with an
+	// registered, and one that forgets logStorageFatal would Fatal with an
 	// empty message. go vet reports neither.
-	storageFatalMsg := "Failed to initialize storage backend"
+	//
+	// The fatal is a closure rather than a message string so each case can put
+	// the values that identify its destination into STRUCTURED fields.
+	// installErrSanitizer masks quoted spans in every logged error, globally
+	// and deliberately, so ANY error whose text quotes the offending value —
+	// an unusable bucket or container name, a credential shape the SDK
+	// rejects, an endpoint it cannot parse — reaches the operator as "...".
+	// A field survives that. Same reason cluster.role reports its value in a
+	// field (see ResolveRole below).
+	//
+	// Note the prefix is no longer among those cases: config.Load validates
+	// every object-store prefix key, so an unusable one is a load-time error
+	// printed before the logger exists and never reaches here. It was the
+	// failure that motivated this closure, and fixing it at the root was the
+	// better half of that change; the closure stays because the reasoning
+	// applies to every other error this line can carry.
+	logStorageFatal := func(err error) {
+		log.Fatal().Err(err).
+			Str("backend", cfg.Storage.Backend).
+			Msg("Failed to initialize storage backend")
+	}
 	logStorageReady := func() {
 		log.Info().
 			Str("backend", cfg.Storage.Backend).
@@ -810,7 +840,12 @@ func main() {
 	switch cfg.Storage.Backend {
 	case "local":
 		storageSpec.LocalPath = cfg.Storage.LocalPath
-		storageFatalMsg = "Failed to initialize local storage backend"
+		logStorageFatal = func(err error) {
+			log.Fatal().Err(err).
+				Str("backend", cfg.Storage.Backend).
+				Str("path", cfg.Storage.LocalPath).
+				Msg("Failed to initialize local storage backend")
+		}
 		logStorageReady = func() {
 			log.Info().
 				Str("backend", "local").
@@ -832,7 +867,13 @@ func main() {
 			PathStyle: cfg.Storage.S3PathStyle,
 			Prefix:    cfg.Storage.S3Prefix,
 		}
-		storageFatalMsg = "Failed to initialize S3 storage backend"
+		logStorageFatal = func(err error) {
+			log.Fatal().Err(err).
+				Str("backend", cfg.Storage.Backend).
+				Str("bucket", cfg.Storage.S3Bucket).
+				Str("prefix", cfg.Storage.S3Prefix).
+				Msg("Failed to initialize S3 storage backend")
+		}
 		logStorageReady = func() {
 			log.Info().
 				Str("backend", cfg.Storage.Backend).
@@ -850,14 +891,22 @@ func main() {
 			AccountKey:         cfg.Storage.AzureAccountKey,
 			SASToken:           cfg.Storage.AzureSASToken,
 			ContainerName:      cfg.Storage.AzureContainer,
+			Prefix:             cfg.Storage.AzurePrefix,
 			Endpoint:           cfg.Storage.AzureEndpoint,
 			UseManagedIdentity: cfg.Storage.AzureUseManagedIdentity,
 		}
-		storageFatalMsg = "Failed to initialize Azure Blob Storage backend"
+		logStorageFatal = func(err error) {
+			log.Fatal().Err(err).
+				Str("backend", cfg.Storage.Backend).
+				Str("container", cfg.Storage.AzureContainer).
+				Str("prefix", cfg.Storage.AzurePrefix).
+				Msg("Failed to initialize Azure Blob Storage backend")
+		}
 		logStorageReady = func() {
 			log.Info().
 				Str("backend", cfg.Storage.Backend).
 				Str("container", cfg.Storage.AzureContainer).
+				Str("prefix", cfg.Storage.AzurePrefix).
 				Str("account", cfg.Storage.AzureAccountName).
 				Msg("Storage backend initialized")
 		}
@@ -867,12 +916,12 @@ func main() {
 	}
 
 	// log.Fatal in the default case exits the process, so by here the backend
-	// type is one of the five aliases and both storageFatalMsg and
+	// type is one of the five aliases and both logStorageFatal and
 	// logStorageReady carry that case's wording rather than the generic
 	// fallbacks they were declared with.
 	storageBackend, err = storage.NewBackend(storageSpec, logger.Get("storage"))
 	if err != nil {
-		log.Fatal().Err(err).Msg(storageFatalMsg)
+		logStorageFatal(err)
 	}
 	shutdownCoordinator.Register("storage", storageBackend, shutdown.PriorityStorage)
 	logStorageReady()
@@ -3927,7 +3976,15 @@ func main() {
 							},
 						}
 						if b, err := storage.NewBackend(coldSpec, logger.Get("tiering-cold-s3")); err != nil {
-							log.Error().Err(err).Msg("Failed to create cold tier S3 backend for tiering: the cold tier is unusable on this node until the configuration is fixed")
+							// Identifiers in structured fields: this site logs
+							// and CONTINUES with a nil cold backend, so this
+							// one line is all the operator gets, and
+							// installErrSanitizer masks quoted spans inside
+							// the error itself.
+							log.Error().Err(err).
+								Str("bucket", cold.S3Bucket).
+								Str("prefix", cold.S3Prefix).
+								Msg("Failed to create cold tier S3 backend for tiering: the cold tier is unusable on this node until the configuration is fixed")
 						} else {
 							coldBackend = b
 						}
@@ -3941,12 +3998,17 @@ func main() {
 								AccountKey:         cold.AzureAccountKey,
 								SASToken:           cold.AzureSASToken,
 								ContainerName:      cold.AzureContainer,
+								Prefix:             cold.AzurePrefix,
 								Endpoint:           cold.AzureEndpoint,
 								UseManagedIdentity: cold.AzureUseManagedIdentity,
 							},
 						}
 						if b, err := storage.NewBackend(coldSpec, logger.Get("tiering-cold-azure")); err != nil {
-							log.Error().Err(err).Msg("Failed to create cold tier Azure backend for tiering: the cold tier is unusable on this node until the configuration is fixed")
+							// Same reason as the cold S3 site above.
+							log.Error().Err(err).
+								Str("container", cold.AzureContainer).
+								Str("prefix", cold.AzurePrefix).
+								Msg("Failed to create cold tier Azure backend for tiering: the cold tier is unusable on this node until the configuration is fixed")
 						} else {
 							coldBackend = b
 						}
@@ -4206,6 +4268,7 @@ func main() {
 				AccountKey:       cold.AzureAccountKey,
 				SASToken:         cold.AzureSASToken,
 				Container:        cold.AzureContainer,
+				Prefix:           cold.AzurePrefix,
 				Endpoint:         cold.AzureEndpoint,
 			}); err != nil {
 				log.Warn().Err(err).Msg("Failed to configure DuckDB with cold tier Azure credentials")
@@ -4254,7 +4317,7 @@ func main() {
 		if err != nil {
 			log.Error().Err(err).Msg("Failed to initialize backup manager")
 		} else {
-			backupHandler := api.NewBackupHandler(backupManager, authManager, logger.Get("backup-api"))
+			backupHandler := api.NewBackupHandler(backupManager, authManager, cfg.Backup.OperationTimeout, logger.Get("backup-api"))
 			// Cluster safety (#1083). Only when the coordinator exists: an
 			// interface holding a typed nil *Coordinator is not == nil (#713),
 			// and both setters would then keep a pointer whose methods panic.

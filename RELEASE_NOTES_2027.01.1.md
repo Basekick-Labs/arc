@@ -83,6 +83,73 @@ Not in this stage: a different backup target per database (#1085), the cold
 tier (#1086), `arcli backup create --database` (tracked in Basekick-Labs/arcli#44),
 and scoping below the storage-root segment.
 
+### Azure Blob Storage takes a key prefix ([#1102](https://github.com/Basekick-Labs/arc/issues/1102))
+
+S3 has always had `storage.s3_prefix`, so one bucket could hold Arc's data
+under `arc/` beside something else, or two Arc deployments under disjoint
+prefixes. Azure had no equivalent: the key was the blob name, so a container
+could hold exactly one Arc deployment and nothing else.
+
+Two new keys close that:
+
+```toml
+[storage]
+backend = "azure"
+azure_container = "arc"
+# azure_prefix = "instances/abc123/"
+
+[tiered_storage.cold]
+backend = "azure"
+# azure_prefix = "cold/"
+```
+
+Both default to empty, which is the container root and byte-for-byte the
+behaviour you have today. Set one and every key Arc writes, reads, lists,
+stats and deletes moves under it, including the one that leaves the process:
+the compaction subprocess receives the prefix in its job configuration, so
+compaction reads and writes under the prefix rather than at the container root.
+The DuckDB secret Arc creates for the query engine is scoped to the container
+**and** the prefix rather than the whole container. That last one is what lets a primary store and a cold tier
+share one container distinguished only by prefix, which was not previously
+expressible.
+
+The prefix is validated, not repaired. A value that cannot form usable keys
+(an empty segment, a leading slash, a space, a character outside
+`A-Za-z0-9/._-`) is rejected when the configuration loads, with the offending
+value named, rather than being silently rewritten into something that writes to
+the container root. That applies to the cold-tier key too, and to the two S3
+prefix keys, which are now checked in the same place. The cold-tier keys are the
+reason the check sits at load: a bad `tiered_storage.cold.s3_prefix` was
+reported as a failure to build the backend and then left the node running with
+no cold tier at all, which is a silent outage until someone reads that one log
+line. A trailing slash is added if you leave it
+off, so `arc` and `arc/` are the same destination.
+
+One caveat worth knowing before you pick a value. If a prefix has three or more
+segments and the last one looks like a year, such as `tenants/eu/2026/`,
+queries against a tiered deployment can return zero rows: the code that works
+out which database and measurement a path belongs to scans backwards for a
+year-shaped segment and finds yours. A one- or two-segment prefix is
+unaffected, because the year then sits too near the front for that scan to use
+it. Arc warns at startup if your prefix has the affected shape. This predates
+the Azure key and affects `storage.s3_prefix` identically; it is tracked in
+[#1108](https://github.com/Basekick-Labs/arc/issues/1108).
+
+### Backup and restore runs have a configurable timeout ([#1085](https://github.com/Basekick-Labs/arc/issues/1085))
+
+Both runs were bounded by a hardcoded two hours. That is a guess that is
+simultaneously too long for an operator who wants a stuck backup to give up
+and alert, and too short for a first backup of a large dataset.
+
+```toml
+[backup]
+# operation_timeout = "2h"
+```
+
+The default is the old value, so nothing changes unless you set it. A zero,
+negative or unparseable value is a startup error naming the value rather than
+an unbounded operation.
+
 ## Bug fixes
 
 ### Iceberg export reclaims the manifest files expired snapshots leave behind ([#835](https://github.com/Basekick-Labs/arc/issues/835))
@@ -128,6 +195,64 @@ The second half of #835 — iceberg-go carrying forward manifests that hold only
 the live manifest list grows with the removal history and readers open every one when planning — is
 tracked in [#1106](https://github.com/Basekick-Labs/arc/issues/1106). It is a planning cost, not
 disk growth, and the fix belongs upstream.
+### A backup fails loudly when compaction recovery state cannot be copied ([#1100](https://github.com/Basekick-Labs/arc/issues/1100))
+
+Object stores cap a key at 1024 bytes, and a backup writes every source key
+under a longer destination key. Arc's three copy paths disagreed about what to
+do when that destination key would overrun.
+
+Data files checked before writing and skipped, counting and naming what they
+skipped. The Iceberg warehouse checked and failed the whole run. Compaction
+recovery state did not check at all, so the overrun surfaced from inside the
+storage write as a generic "failed to write to backup storage" and failed the
+run with a message about storage rather than about the key.
+
+Compaction recovery state now checks before writing and still fails the run,
+with an error that names the file, the destination size, the limit, and the
+length a source key has to come under. The behaviour is deliberately not the
+data path's skip, and the reason is worth stating because it looks like an
+inconsistency:
+
+- A skipped **data file** is detectable. It is counted in the manifest, named
+  in the skip sample, carried into the `INCOMPLETE` marker, and the source
+  still holds it, so you can see what the backup is missing.
+- A skipped **recovery manifest** is invisible **to a restore**. It is counted,
+  but the restore path reads four other skip fields and not that one, and
+  restoring without the manifest brings back a compacted output *next to the
+  inputs it replaced* with nothing to reconcile them. That partition then
+  serves every row twice, permanently. A third option would have been to skip
+  and set the `INCOMPLETE` marker; what rules it out is that a restore does not
+  look at this counter.
+
+So the paths differ on whether absence can be noticed, not arbitrarily. Only
+the data path skips.
+
+Reaching this at all needs a file with a very long name dropped under
+`_compaction_state/`; Arc's own state keys are short and fixed-shape.
+
+### A failed write to a remote backup destination no longer leaves an object behind ([#1101](https://github.com/Basekick-Labs/arc/issues/1101))
+
+Backup cleanup only ran for a destination that stages its writes, which in
+practice means a local directory: it removed the `.part` file and stopped.
+For an S3 or Azure destination it returned immediately on the grounds that
+those do not stage.
+
+That is true and it was the wrong conclusion. Neither commits anything on a
+failed upload (the AWS SDK aborts its own multipart, and an Azure block-blob
+commit is atomic), but a commit that *succeeds* while its response is lost
+leaves an object that no backup references. Cleanup now deletes the
+destination key in that case, logs at debug if the delete itself fails, and
+never fails the backup over it. The copy of the metadata database, which had
+no cleanup at all, is covered too.
+
+Nothing changes for you yet. A backup destination is still always a local
+directory, which does stage, so the new branch is unreachable until a backup
+can be sent to a named remote target. This lands now because that is the
+change it is a prerequisite for.
+
+Restore cleanup deliberately did not change: it is handed live data keys, and
+since a failed overwrite leaves the previous object intact, deleting there
+would destroy a registered file to clean up a write that did no damage.
 
 ### Existing Iceberg tables honor retention changes ([#1093](https://github.com/Basekick-Labs/arc/issues/1093))
 
@@ -481,3 +606,42 @@ This is the first of three changes behind per-database backup targets
 destination is a `storage.Backend`, so named remote targets are mostly a
 configuration and routing problem once there is a single place that turns a
 destination description into a backend.
+
+### The Azure prefix reaches four places that do not go through the backend ([#1102](https://github.com/Basekick-Labs/arc/issues/1102))
+
+Worth knowing if you ever add a field to a storage backend, because the
+compile-time safety you would expect is not there.
+
+Adding the prefix to `AzureBlobBackend` and routing its fourteen
+key-taking methods through `prefixedKey` is the easy half. The dangerous half
+is that four places build an Azure location or hand an Azure configuration to
+something else **without going through the backend object**, so each one keeps
+compiling and starts being wrong the moment the prefix is non-empty:
+
+- `AzureBlobBackend.ConfigJSON` and the azure case of
+  `internal/compaction/subprocess.go`. Compaction runs in a separate process
+  that rebuilds the backend from that JSON. The S3 case had already carried a
+  comment about this; the Azure case had never been tested at all. Missing the
+  prefix here reroots compaction at the container root, so it reads nothing or
+  writes output where queries do not look.
+- `iceberg.DefaultWarehouse` in `internal/iceberg/paths.go`, which type-switches
+  on the backend to build the warehouse root. Missing the prefix would put table
+  metadata at the container root while the data sits under the prefix. This one
+  is **not reachable today**: `config.Load` refuses `iceberg.enabled=true`
+  unless the primary backend is local, so the object-store arms of that switch
+  are dead code until Iceberg export supports object stores. It is fixed anyway,
+  because the next person to lift that restriction should not have to find it.
+- `azureSecretScope` in `internal/database/duckdb.go` and the sandbox allowlist
+  in `internal/database/sandbox.go`.
+- Two `cmd/arc/main.go` call sites, for the primary store and the cold tier.
+
+This is the same failure the broken `iceberg.warehouse` key was
+([#534](https://github.com/Basekick-Labs/arc/issues/534)): an expression that
+is correct only while a new key sits at its default. The defence is the same
+one that caught it here, which is running the binary with the key set to
+something other than its default.
+
+`ValidateS3Prefix` is now `ValidateObjectPrefix` in
+`internal/storage/objectprefix.go`, with no alias, because all three backends
+share it and two names for one function is how the next reader comes to believe
+there are two rules.

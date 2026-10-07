@@ -31,6 +31,9 @@ type BackendSpec struct {
 	S3 S3Config
 
 	// Azure configures an azure or azblob backend. Read only for those types.
+	// Prefix included, for the same reason as S3's (#1102): it is applied to
+	// every key the backend touches, so a caller that drops it silently
+	// reroots itself at the container root.
 	Azure AzureBlobConfig
 }
 
@@ -52,7 +55,8 @@ type BackendSpec struct {
 // the error is known to be nil.
 //
 // Each backend keeps its own validation: NewS3Backend requires a bucket and
-// fails on an unusable prefix, NewAzureBlobBackend requires a container and a
+// fails on an unusable prefix, NewAzureBlobBackend requires a container, a
+// usable prefix (checked first, before any credential or network work) and a
 // usable authentication combination, and NewLocalBackend creates its directory
 // with owner-only permissions.
 func NewBackend(spec BackendSpec, logger zerolog.Logger) (Backend, error) {

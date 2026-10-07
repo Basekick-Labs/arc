@@ -11,14 +11,32 @@ import (
 	"strings"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/sysmem"
 	"github.com/spf13/viper"
 )
+
+// yearShapedSegment matches a path segment that an Arc storage key would read
+// as a partition year. See Config.Warnings and #1108.
+var yearShapedSegment = regexp.MustCompile(`^20\d\d$`)
+
+// LoadWarning is a load-time advisory: a value Arc accepts and keeps, but
+// whose effect an operator is unlikely to have intended. Collected rather than
+// logged because config.Load has no logger and must stay testable without one;
+// cmd/arc/main.go emits them once, immediately after Load returns.
+type LoadWarning struct {
+	Key     string // the configuration key, as an operator spells it
+	Value   string // the configured value, verbatim
+	Message string // what the hazard is and what to do
+}
 
 var memoryLimitRe = regexp.MustCompile(`^\d+(\.\d+)?\s*(B|KB|MB|GB|TB|%)?$`)
 
 // Config holds all configuration for Arc
 type Config struct {
+	// Warnings are load-time advisories about accepted values (see
+	// LoadWarning). Emitted by cmd/arc/main.go right after Load; never fatal.
+	Warnings        []LoadWarning
 	Server          ServerConfig
 	Database        DatabaseConfig
 	Storage         StorageConfig
@@ -108,6 +126,7 @@ type StorageConfig struct {
 	AzureAccountKey         string // Storage account key
 	AzureSASToken           string // SAS token for scoped access
 	AzureContainer          string // Container name
+	AzurePrefix             string // Blob-name prefix within the container (e.g., "instances/abc123/")
 	AzureEndpoint           string // Custom endpoint (for Azurite testing)
 	AzureUseManagedIdentity bool   // Use managed identity (Azure-hosted deployments)
 }
@@ -601,6 +620,7 @@ type ColdTierConfig struct {
 
 	// Azure settings
 	AzureContainer          string // Azure container for cold-tier data
+	AzurePrefix             string // Blob-name prefix within the cold-tier container
 	AzureConnectionString   string // Connection string (simplest auth method)
 	AzureAccountName        string // Storage account name
 	AzureAccountKey         string // Storage account key
@@ -638,6 +658,11 @@ type QueryManagementConfig struct {
 type BackupConfig struct {
 	Enabled   bool   // Enable backup/restore API
 	LocalPath string // Local directory for backups (default: "./data/backups")
+	// OperationTimeout bounds one backup or one restore run. Both API routes
+	// detach from the request context (Fiber recycles it), so this is the only
+	// thing that stops a wedged run from holding the single-operation lock
+	// forever. Parsed from backup.operation_timeout; always positive.
+	OperationTimeout time.Duration
 }
 
 // ClusterConfig holds configuration for Arc clustering (Enterprise feature)
@@ -823,6 +848,18 @@ func Load() (*Config, error) {
 		)
 	}
 
+	// One backup or restore run gets this long. Go duration syntax, e.g. 30m,
+	// 2h or 90s, read the same way as compaction.cycle_timeout above because
+	// that is the only existing duration key and there is no GetDuration call
+	// in this repo.
+	backupOperationTimeout, err := time.ParseDuration(v.GetString("backup.operation_timeout"))
+	if err != nil || backupOperationTimeout <= 0 {
+		return nil, fmt.Errorf(
+			"invalid backup.operation_timeout %q: must be a positive Go duration",
+			v.GetString("backup.operation_timeout"),
+		)
+	}
+
 	// Build config from Viper (which includes defaults + env vars)
 	cfg := &Config{
 		Server: ServerConfig{
@@ -868,6 +905,7 @@ func Load() (*Config, error) {
 			AzureAccountKey:         v.GetString("storage.azure_account_key"),
 			AzureSASToken:           v.GetString("storage.azure_sas_token"),
 			AzureContainer:          v.GetString("storage.azure_container"),
+			AzurePrefix:             v.GetString("storage.azure_prefix"),
 			AzureEndpoint:           v.GetString("storage.azure_endpoint"),
 			AzureUseManagedIdentity: v.GetBool("storage.azure_use_managed_identity"),
 		},
@@ -997,8 +1035,9 @@ func Load() (*Config, error) {
 			DBPath:  v.GetString("continuous_query.db_path"),
 		},
 		Backup: BackupConfig{
-			Enabled:   v.GetBool("backup.enabled"),
-			LocalPath: v.GetString("backup.local_path"),
+			Enabled:          v.GetBool("backup.enabled"),
+			LocalPath:        v.GetString("backup.local_path"),
+			OperationTimeout: backupOperationTimeout,
 		},
 		Metrics: MetricsConfig{
 			TimeseriesRetentionMinutes: v.GetInt("metrics.timeseries_retention_minutes"),
@@ -1129,6 +1168,7 @@ func Load() (*Config, error) {
 				S3PathStyle:             v.GetBool("tiered_storage.cold.s3_path_style"),
 				S3Prefix:                v.GetString("tiered_storage.cold.s3_prefix"),
 				AzureContainer:          v.GetString("tiered_storage.cold.azure_container"),
+				AzurePrefix:             v.GetString("tiered_storage.cold.azure_prefix"),
 				AzureConnectionString:   v.GetString("tiered_storage.cold.azure_connection_string"),
 				AzureAccountName:        v.GetString("tiered_storage.cold.azure_account_name"),
 				AzureAccountKey:         v.GetString("tiered_storage.cold.azure_account_key"),
@@ -1197,6 +1237,7 @@ func Load() (*Config, error) {
 	cfg.Storage.AzureConnectionString = strings.TrimSpace(cfg.Storage.AzureConnectionString)
 	cfg.Storage.AzureAccountName = strings.TrimSpace(cfg.Storage.AzureAccountName)
 	cfg.Storage.AzureContainer = strings.TrimSpace(cfg.Storage.AzureContainer)
+	cfg.Storage.AzurePrefix = strings.TrimSpace(cfg.Storage.AzurePrefix)
 	cfg.Storage.AzureEndpoint = strings.TrimSpace(cfg.Storage.AzureEndpoint)
 
 	// Validate the primary storage backend against the supported set and check
@@ -1214,6 +1255,9 @@ func Load() (*Config, error) {
 		if cfg.Storage.S3Bucket == "" {
 			return nil, fmt.Errorf("storage.backend is %q but storage.s3_bucket is empty; set storage.s3_bucket", cfg.Storage.Backend)
 		}
+		if err := cfg.checkObjectPrefix("storage.s3_prefix", cfg.Storage.S3Prefix); err != nil {
+			return nil, err
+		}
 	case "azure", "azblob":
 		// An empty container yields an empty sandbox allowlist entry and opaque
 		// query-time errors. An empty account name is worse: configureAzureAccess
@@ -1229,6 +1273,9 @@ func Load() (*Config, error) {
 		}
 		if cfg.Storage.AzureContainer == "" {
 			return nil, fmt.Errorf("storage.backend is %q but storage.azure_container is empty; set storage.azure_container", cfg.Storage.Backend)
+		}
+		if err := cfg.checkObjectPrefix("storage.azure_prefix", cfg.Storage.AzurePrefix); err != nil {
+			return nil, err
 		}
 	default:
 		return nil, fmt.Errorf("storage.backend %q is invalid; must be \"local\", \"s3\", \"minio\", \"azure\", or \"azblob\"", cfg.Storage.Backend)
@@ -1257,11 +1304,20 @@ func Load() (*Config, error) {
 		cold.AzureConnectionString = strings.TrimSpace(cold.AzureConnectionString)
 		cold.AzureAccountName = strings.TrimSpace(cold.AzureAccountName)
 		cold.AzureContainer = strings.TrimSpace(cold.AzureContainer)
+		cold.AzurePrefix = strings.TrimSpace(cold.AzurePrefix)
 		cold.AzureEndpoint = strings.TrimSpace(cold.AzureEndpoint)
 		switch cold.Backend {
 		case "s3":
 			if cold.S3Bucket == "" {
 				return nil, fmt.Errorf("tiered_storage.cold.enabled is true and backend is \"s3\" but tiered_storage.cold.s3_bucket is empty; set tiered_storage.cold.s3_bucket")
+			}
+			// The cold keys are the asymmetric case and the reason this check
+			// exists at load: an unusable cold prefix fails backend
+			// construction at a call site that logs and CONTINUES with a nil
+			// cold backend, so the tier would be silently dead. See
+			// checkObjectPrefix.
+			if err := cfg.checkObjectPrefix("tiered_storage.cold.s3_prefix", cold.S3Prefix); err != nil {
+				return nil, err
 			}
 		case "azure":
 			if cold.AzureConnectionString == "" && cold.AzureAccountName == "" {
@@ -1269,6 +1325,10 @@ func Load() (*Config, error) {
 			}
 			if cold.AzureContainer == "" {
 				return nil, fmt.Errorf("tiered_storage.cold.enabled is true and backend is \"azure\" but tiered_storage.cold.azure_container is empty; set tiered_storage.cold.azure_container")
+			}
+			// Same reason as the cold S3 prefix above.
+			if err := cfg.checkObjectPrefix("tiered_storage.cold.azure_prefix", cold.AzurePrefix); err != nil {
+				return nil, err
 			}
 		default:
 			return nil, fmt.Errorf("tiered_storage.cold.enabled is true but tiered_storage.cold.backend %q is invalid; must be \"s3\" or \"azure\"", cold.Backend)
@@ -1546,6 +1606,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("storage.s3_region", "us-east-1")
 	v.SetDefault("storage.s3_use_ssl", true)
 	v.SetDefault("storage.s3_path_style", false) // Use virtual-hosted style by default (set true for MinIO)
+	v.SetDefault("storage.azure_prefix", "")     // Container root by default (#1102)
 
 	// Cache defaults
 	v.SetDefault("cache.enabled", true)
@@ -1852,6 +1913,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("tiered_storage.cold.s3_use_ssl", true)       // HTTPS by default
 	v.SetDefault("tiered_storage.cold.s3_path_style", false)   // Virtual-hosted style for AWS
 	v.SetDefault("tiered_storage.cold.azure_container", "")    // Must be configured for Azure
+	v.SetDefault("tiered_storage.cold.azure_prefix", "")       // Container root by default (#1102)
 	v.SetDefault("tiered_storage.cold.azure_connection_string", "")
 	v.SetDefault("tiered_storage.cold.azure_account_name", "")
 	v.SetDefault("tiered_storage.cold.azure_account_key", "")
@@ -1879,6 +1941,66 @@ func setDefaults(v *viper.Viper) {
 	// Backup defaults
 	v.SetDefault("backup.enabled", true)
 	v.SetDefault("backup.local_path", "./data/backups")
+	// The value both backup and restore were hardcoded to before #1085, so
+	// leaving it unset changes nothing.
+	v.SetDefault("backup.operation_timeout", "2h")
+}
+
+// checkObjectPrefix validates one configured object-store key prefix and
+// collects the advisories that apply to it. key is the operator-facing
+// configuration key, so a rejection names the key the operator must change.
+//
+// Validated HERE, at load, rather than only inside the backend constructors,
+// for one reason that is not symmetry: a backend-construction failure at the
+// COLD-tier call site is logged at Error and the process continues with a nil
+// cold backend (cmd/arc/main.go), so an unusable cold prefix would leave the
+// cold tier silently dead. And the error that reports it is logged through
+// zerolog, where installErrSanitizer masks quoted spans globally, so the
+// operator is shown dots for both the value and the offending character. A
+// load-time error is printed before the logger exists, so the value survives.
+// Same reason, same shape, as backup.operation_timeout.
+//
+// The backends keep their own validation: this is defence in depth, and the
+// compaction subprocess and the backup manager build backends without ever
+// passing through Load.
+func (c *Config) checkObjectPrefix(key, value string) error {
+	if _, err := storage.ValidateObjectPrefix(value); err != nil {
+		return fmt.Errorf("invalid %s: %w", key, err)
+	}
+
+	// A prefix whose LAST segment is year-shaped is accepted, and must stay
+	// accepted: rejecting it would refuse a configuration existing prefixed-S3
+	// deployments may already run. But the query path reads a database and
+	// measurement off the end of a storage path by scanning backwards for a
+	// partition year, so such a prefix can make it resolve the two segments
+	// BEFORE that year. A tiered query then globs a location nothing was
+	// written to and returns zero rows with no error (#1108).
+	//
+	// THREE segments or more, not merely a year-shaped tail, and the bound is
+	// exact rather than cautious. The scan is
+	// `for i := len(parts) - 1; i >= 2; i--` (QueryHandler
+	// .extractDBMeasurementFromPath), and the year sits at index
+	// len(prefixSegments)-1, so it is only visited once the prefix has three
+	// segments — and only then do two prefix segments exist in front of it to
+	// be returned. At one segment ("2026") the year is at index 0 and at two
+	// ("arc/2026") at index 1; both fall through to the correct
+	// last-two-segments rule. Warning about those would train operators to
+	// ignore this, which is worse than not warning at all. The three cases are
+	// pinned empirically in
+	// TestExtractDBMeasurementFromPathMisparsesAYearShapedPrefixTail.
+	trimmed := strings.Trim(value, "/")
+	if trimmed == "" {
+		return nil
+	}
+	segments := strings.Split(trimmed, "/")
+	if len(segments) >= 3 && yearShapedSegment.MatchString(segments[len(segments)-1]) {
+		c.Warnings = append(c.Warnings, LoadWarning{
+			Key:     key,
+			Value:   value,
+			Message: "the last segment of this storage prefix looks like a partition year, which the query path scans for when it reads a database and measurement off a storage path. Tiered queries against such a prefix can return zero rows with no error (#1108). Consider a prefix whose last segment is not four digits beginning 20",
+		})
+	}
+	return nil
 }
 
 // parseStringSlice parses a comma-separated string into a slice of strings.
