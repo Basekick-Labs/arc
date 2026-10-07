@@ -26,6 +26,14 @@ import (
 //     fail when shouldCollapse returns true on an unreadable manifest list.
 //   - StaleDeletedHistoryStillReregistered is a pure regression guard on #633, which the collapse
 //     now rides on top of. It passes before and after by design.
+//
+// TWO MORE stopped discriminating when Arc moved to iceberg-go v0.7.0, and say so on themselves:
+// EmptyingPassSucceeds and AllSurvivorsSkippedDoesNotCollapse. v0.7.0 drops a manifest left with
+// no surviving entries rather than carrying it forward, so an emptying pass inherits exactly one
+// data manifest and the merge takes its single-manifest passthrough instead of writing the empty
+// manifest ManifestWriter.Close refuses. Both pass with their guard removed. They are kept as
+// behaviour pins — the guards they cover are deliberate belt-and-braces (see shouldCollapse) and
+// these tests fail the moment that upstream drop changes back.
 
 // livePaths is the invariant a collapse must preserve: the set of live data files and their sizes.
 // The manifest LAYOUT is explicitly not an invariant — rearranging it is the point.
@@ -155,15 +163,29 @@ func TestManifestCollapse_BelowThresholdLeavesManifestsAlone(t *testing.T) {
 	live := r.write(t, "base", 20)
 	r.reconcile(t, ctx, live)
 	spare := r.write(t, "spare", 3)
+
+	// A collapse shows up as the manifest count DROPPING. Assert that directly rather than against
+	// an expected count: how many manifests a pass adds is iceberg-go's business and changes between
+	// versions (v0.6.0 added two per removal pass, v0.7.0 adds one), and a hard-coded total turns
+	// this control into a test of the library's growth rate.
+	counts := []int{}
 	for i := 0; i < 3; i++ {
 		live = append(live[1:], spare[i])
 		r.reconcile(t, ctx, live)
+		total, _, _ := r.manifestShape(t, ctx)
+		counts = append(counts, total)
 	}
-
-	total, _, _ := r.manifestShape(t, ctx)
-	// 3 removal passes past the initial single manifest, nowhere near the threshold of 12.
-	if want := 1 + 2*3; total != want {
-		t.Errorf("manifests = %d after 3 sub-threshold passes, want %d (a collapse fired early)", total, want)
+	for i, c := range counts {
+		if i > 0 && c < counts[i-1] {
+			t.Errorf("manifest count dropped %d -> %d at sub-threshold pass %d: a collapse fired early (counts=%v)",
+				counts[i-1], c, i+1, counts)
+		}
+	}
+	if last := counts[len(counts)-1]; last <= 1 {
+		t.Errorf("manifests = %d after 3 sub-threshold passes, want more than 1 (a collapse fired early)", last)
+	}
+	if last := counts[len(counts)-1]; last >= manifestCollapseThreshold {
+		t.Fatalf("setup reached the threshold (%d manifests): this control no longer tests the sub-threshold case", last)
 	}
 }
 
@@ -248,6 +270,10 @@ func TestManifestCollapse_PartitionFallbackStillCollapses(t *testing.T) {
 	}
 }
 
+// NOTE: on iceberg-go v0.7.0 this test passes with or without the liveAfter guard — upstream now
+// drops the entry-less manifests that made the merge illegal, so it pins behaviour rather than
+// proving the guard. It discriminated on v0.6.0 and will again if that changes. See the file header.
+//
 // TestManifestCollapse_EmptyingPassSucceeds is the regression guard for the one pass the collapse
 // must refuse. The scheduler reconciles a measurement whose data files are all gone to an EMPTY
 // table rather than leave it pointing at deleted paths; that pass stages an overwrite in which
@@ -293,6 +319,9 @@ func TestManifestCollapse_EmptyingPassSucceeds(t *testing.T) {
 	}
 }
 
+// NOTE: like EmptyingPassSucceeds, this no longer discriminates on iceberg-go v0.7.0 and pins
+// behaviour instead. See the file header for why.
+//
 // TestManifestCollapse_AllSurvivorsSkippedDoesNotCollapse closes the gap the caller's guard cannot
 // see. shouldCollapse is given len(want) — the files the pass INTENDS to register — but the
 // per-file fallback skips the ones iceberg-go cannot partition, and a skipped file never enters the

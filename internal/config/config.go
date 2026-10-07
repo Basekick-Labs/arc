@@ -1418,6 +1418,20 @@ func Load() (*Config, error) {
 				"it is the number of snapshots kept per table, and values below 1 would leave "+
 				"snapshot and metadata growth unbounded", cfg.Iceberg.RetainSnapshots)
 		}
+		// A dot in the prefix puts a dot in every namespace component Arc builds
+		// (arc_<database>), and iceberg-go v0.7.0 keys such a namespace by a JSON
+		// encoding instead of the plain dotted string. Arc cannot serve that: the
+		// warehouse directory becomes __iceberg_namespace_v1__:[...].db, which its
+		// own warehouse-directory test does not recognise and would walk back in as
+		// a user database, and the percent-encoded metadata location means no
+		// version-hint.text is published for directory-based readers. Refuse at load
+		// rather than build broken tables for every measurement on the node.
+		if strings.Contains(cfg.Iceberg.NamespacePrefix, ".") {
+			return nil, fmt.Errorf("iceberg.namespace_prefix must not contain a dot (got %q): "+
+				"Arc builds one Iceberg namespace component per database as <prefix>_<database>, and a "+
+				"dotted component is addressed differently by the Iceberg catalog, which leaves the "+
+				"table without a readable warehouse directory", cfg.Iceberg.NamespacePrefix)
+		}
 	}
 
 	// The spoke secret must come from the environment. Refuse rather than
