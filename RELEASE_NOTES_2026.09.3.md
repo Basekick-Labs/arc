@@ -561,6 +561,17 @@ predate that fix and #978.
 
 ## Bug fixes
 
+### Fallback compaction job IDs support spoke namespaces ([#750](https://github.com/Basekick-Labs/arc/issues/750))
+
+When a compaction job was created without an explicit JobID, its fallback ID
+included the raw database name. Edge-sync pseudo-databases contain a slash,
+so the generated ID failed completion-manifest validation and could create an
+unintended nested temporary directory. Fallback IDs now use the existing
+database-name sanitiser while preserving the original database and any
+caller-supplied JobID.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#912](https://github.com/Basekick-Labs/arc/pull/912).
+
 ### A node that rejoins through a Raft snapshot now removes the replicas the cluster deleted while it was away ([#962](https://github.com/Basekick-Labs/arc/issues/962))
 
 On a per-node-storage cluster every node unlinks its local copy of a file when

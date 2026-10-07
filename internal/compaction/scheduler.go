@@ -208,6 +208,12 @@ func (s *Scheduler) runCompaction() {
 			Msg("Scheduled compaction skipped: this node does not hold the compactor lease")
 		return
 	}
+	if reason := pauseReasonOf(gate); reason != "" {
+		s.logger.Info().
+			Str("pause", reason).
+			Msg("Scheduled compaction skipped: compaction is paused cluster-wide")
+		return
+	}
 
 	startTime := time.Now()
 	s.logger.Info().
@@ -222,6 +228,8 @@ func (s *Scheduler) runCompaction() {
 		switch {
 		case errors.Is(err, ErrCycleAlreadyRunning):
 			s.logger.Info().Msg("Scheduled compaction skipped: a cycle is already running")
+		case errors.Is(err, ErrCompactionPaused):
+			s.logger.Info().Int64("cycle_id", cycleID).Dur("duration", time.Since(startTime)).Msg("Scheduled compaction stopped at a batch boundary: compaction is paused cluster-wide")
 		case ctx.Err() != nil:
 			s.logger.Info().Err(ctx.Err()).Int64("cycle_id", cycleID).Dur("duration", time.Since(startTime)).Msg("Scheduled compaction interrupted")
 		default:
@@ -243,6 +251,30 @@ func (s *Scheduler) runCompaction() {
 // 500 or a silent no-op.
 var ErrCompactionRoleGated = fmt.Errorf("compaction: node role is not compactor")
 
+// pauseReporter is the optional half of a ClusterGate (#1087): a gate that
+// can also report the cluster-wide compaction pause in force, as a
+// human-readable reason, or "" when compaction is not paused. It is NOT part
+// of ClusterGate on purpose: Start treats a false CanCompact as permanent role
+// gating and never arms cron, so a node that acquired the compactor lease
+// during a pause, or a dedicated compactor rebooting mid-pause, would stay
+// idle after the resume. The pause is therefore checked per tick and per
+// manual trigger, and Start still arms cron while paused.
+type pauseReporter interface {
+	CompactionPauseReason() string
+}
+
+// pauseReasonOf returns the pause in force according to gate, or "" when the
+// gate is nil, cannot report one, or compaction is not paused.
+func pauseReasonOf(gate ClusterGate) string {
+	if gate == nil {
+		return ""
+	}
+	if pr, ok := gate.(pauseReporter); ok {
+		return pr.CompactionPauseReason()
+	}
+	return ""
+}
+
 // TriggerNow triggers compaction immediately (manual trigger)
 // Returns the cycle ID and any error that occurred
 func (s *Scheduler) TriggerNow(ctx context.Context) (int64, error) {
@@ -258,6 +290,12 @@ func (s *Scheduler) TriggerNow(ctx context.Context) (int64, error) {
 			Str("role", gate.Role()).
 			Msg("Manual compaction trigger rejected: node role is not compactor")
 		return 0, ErrCompactionRoleGated
+	}
+	if reason := pauseReasonOf(gate); reason != "" {
+		s.logger.Info().
+			Str("pause", reason).
+			Msg("Manual compaction trigger rejected: compaction is paused cluster-wide")
+		return 0, fmt.Errorf("%w: %s", ErrCompactionPaused, reason)
 	}
 
 	s.logger.Info().Msg("Manual compaction trigger")

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"time"
@@ -199,6 +200,20 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 		}
 	}
 
+	// The cluster-wide compaction pause a cluster restore holds (#1087). A
+	// cycle started now would stop at its first batch boundary anyway, so
+	// refuse up front, before the trigger is logged as accepted. Checked
+	// before the running-cycle check: a cycle that was already running when
+	// the pause landed is ending at its boundary.
+	if h.manager.Paused() {
+		h.logger.Info().Strs("tiers", tierNames).Msg("Manual compaction trigger refused: compaction is paused cluster-wide")
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"error":   "compaction is paused cluster-wide",
+			"message": "a restore is running; retry when it ends",
+			"paused":  true,
+		})
+	}
+
 	logEvent := h.logger.Info().
 		Strs("tiers", tierNames).
 		Dur("cycle_timeout", h.manager.CycleTimeout)
@@ -248,6 +263,8 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 
 		if ctx.Err() != nil {
 			logger.Info().Err(ctx.Err()).Msg("Manual compaction interrupted")
+		} else if errors.Is(err, compaction.ErrCompactionPaused) {
+			logger.Info().Msg("Manual compaction stopped at a batch boundary: compaction is paused cluster-wide")
 		} else if err != nil {
 			logger.Error().Err(err).Msg("Manual compaction failed")
 		} else {

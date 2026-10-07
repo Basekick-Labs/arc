@@ -80,7 +80,7 @@ func newBackupRouteRig(t *testing.T, listErr error) *backupRouteRig {
 	}
 
 	app := fiber.New(fiber.Config{DisableStartupMessage: true})
-	handler := NewBackupHandler(manager, nil, zerolog.Nop())
+	handler := NewBackupHandler(manager, nil, 2*time.Hour, zerolog.Nop())
 	handler.RegisterRoutes(app)
 	t.Cleanup(func() { app.Shutdown() })
 

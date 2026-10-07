@@ -9,8 +9,8 @@ import (
 
 // PathResolver turns Arc's storage-relative file keys (e.g.
 // "mydb/cpu/2026/07/13/14/cpu_....parquet") into the fully-qualified URIs iceberg-go reads:
-// "file://<abs>" for local, "s3://bucket/prefix/<key>" for S3, "azure://container/<key>" for
-// Azure. Resolution goes through storage.ObjectURI, the one validated key-to-location
+// "file://<abs>" for local, "s3://bucket/prefix/<key>" for S3,
+// "azure://container/prefix/<key>" for Azure. Resolution goes through storage.ObjectURI, the one validated key-to-location
 // builder (#746), so the exporter resolves paths identically to the rest of Arc by
 // construction rather than by keeping a copy of the backend type-switch in step.
 type PathResolver struct {
@@ -54,7 +54,12 @@ func DefaultWarehouse(backend storage.Backend) string {
 	case *storage.S3Backend:
 		return strings.TrimSuffix("s3://"+b.GetBucket()+"/"+b.GetPrefix(), "/")
 	case *storage.AzureBlobBackend:
-		return "azure://" + b.GetContainer()
+		// Same expression as the S3 arm, for the same reason (#1102): Azure
+		// has a key prefix now, and an Azure primary with one would otherwise
+		// write its DATA under the prefix and its Iceberg metadata at the
+		// container root, leaving the exported table's version-hint.text
+		// unreachable from the warehouse. That is #534 again.
+		return strings.TrimSuffix("azure://"+b.GetContainer()+"/"+b.GetPrefix(), "/")
 	case *storage.LocalBackend:
 		return localFileURI(b.GetBasePath())
 	default:

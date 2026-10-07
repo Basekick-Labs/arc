@@ -23,6 +23,7 @@ import (
 type AzureBlobBackend struct {
 	client        *azblob.Client
 	containerName string
+	prefix        string // blob-name prefix within the container (validated, with trailing /)
 	accountName   string
 	accountKey    string // Stored for subprocess credential passing
 	endpoint      string
@@ -47,6 +48,11 @@ type AzureBlobConfig struct {
 	// Container name (required)
 	ContainerName string
 
+	// Prefix is a blob-name prefix within the container, applied to every key
+	// the backend touches (e.g. "instances/abc123/"). Empty means the
+	// container root. Mirrors S3Config.Prefix (#1102).
+	Prefix string
+
 	// Custom endpoint (for Azurite testing)
 	Endpoint string
 }
@@ -57,10 +63,23 @@ func NewAzureBlobBackend(cfg *AzureBlobConfig, logger zerolog.Logger) (*AzureBlo
 		return nil, fmt.Errorf("Azure container name is required")
 	}
 
+	// Validate the prefix rather than repairing it, exactly as the S3 backend
+	// does: a prefix that cannot form usable keys must stop the backend from
+	// being built, because the fallback would be the container root, which is
+	// a different and much larger location rather than a safe default.
+	//
+	// Before the credential switch and the container probe on purpose: this is
+	// a pure config check, it needs no I/O, and failing it first means a
+	// misspelled prefix is reported as itself rather than behind whatever the
+	// network did next.
+	prefix, err := ValidateObjectPrefix(cfg.Prefix)
+	if err != nil {
+		return nil, err
+	}
+
 	log := logger.With().Str("component", "azure-storage").Logger()
 
 	var client *azblob.Client
-	var err error
 	var endpoint string
 
 	// Try authentication methods in order of preference
@@ -128,6 +147,7 @@ func NewAzureBlobBackend(cfg *AzureBlobConfig, logger zerolog.Logger) (*AzureBlo
 	backend := &AzureBlobBackend{
 		client:        client,
 		containerName: cfg.ContainerName,
+		prefix:        prefix,
 		accountName:   cfg.AccountName,
 		accountKey:    cfg.AccountKey,
 		endpoint:      endpoint,
@@ -149,22 +169,38 @@ func NewAzureBlobBackend(cfg *AzureBlobConfig, logger zerolog.Logger) (*AzureBlo
 	return backend, nil
 }
 
-// Write writes data to Azure Blob Storage
-// blobKey validates a storage key before it becomes a blob name.
+// prefixedKey validates a storage key and prepends the configured prefix to
+// build the blob name. The S3 twin is S3Backend.prefixedKey and the two are
+// meant to stay diffable.
 //
-// Azure has no prefix concept, so the key IS the blob name, and it needs the
-// same contract the other backends enforce (#743). One rule matters especially
-// here: Azure treats a backslash as a path separator, so "a\\b" and "a/b" are
+// Every key-taking method routes through this, so the contract the other
+// backends enforce (#743) holds here too. One rule matters especially on
+// Azure: a backslash IS a path separator there, so "a\\b" and "a/b" would be
 // ONE blob. ValidateKey rejects backslash for that reason.
-func (b *AzureBlobBackend) blobKey(key string) (string, error) {
+//
+// Azure used to have no prefix at all, and the key WAS the blob name. #1102
+// gave it one so a backup target and the primary store can share a container,
+// and the rule is now the same as S3's: the caller always speaks unprefixed
+// keys, this is the only place the prefix is added, and every listing strips
+// it again on the way out.
+func (b *AzureBlobBackend) prefixedKey(key string) (string, error) {
 	if err := ValidateKey(key); err != nil {
 		return "", err
 	}
-	return key, nil
+	return b.prefix + key, nil
 }
 
-// partitionValidKeys splits a batch into the keys that satisfy the storage
-// contract and one error per key that does not.
+// prefixedListPrefix is prefixedKey for enumeration, where "" and a trailing
+// separator are legitimate and cannot name an object.
+func (b *AzureBlobBackend) prefixedListPrefix(prefix string) (string, error) {
+	if err := ValidateListPrefix(prefix); err != nil {
+		return "", err
+	}
+	return b.prefix + prefix, nil
+}
+
+// partitionValidKeys splits a batch into the PREFIXED blob names of the keys
+// that satisfy the storage contract and one error per key that does not.
 //
 // DeleteBatch was the only key-taking method on any backend that reached the
 // service without validating, and on Azure that is not merely a missed
@@ -173,30 +209,35 @@ func (b *AzureBlobBackend) blobKey(key string) (string, error) {
 // the first would delete the second. Nothing else in the codebase can make a
 // delete address a different object than the caller named.
 //
+// It returns prefixed names because DeleteBatch hands them straight to the
+// batch builder, which never passes through prefixedKey (#1102). Validating
+// without prefixing here would delete at the container root instead.
+//
 // Rejections are collected rather than fatal, matching S3: callers such as
 // compaction and the reconciler submit whole batches with no per-file fallback,
 // so failing the batch on one key would leave every other file undeleted
 // forever. Split out as a function because AzureBlobBackend cannot be built
 // without live credentials, and this behaviour deserves a test that needs none.
-func partitionValidKeys(batch []string) (usable []string, rejected []error) {
+func partitionValidKeys(prefix string, batch []string) (usable []string, rejected []error) {
 	usable = make([]string, 0, len(batch))
 	for _, path := range batch {
 		if err := ValidateKey(path); err != nil {
 			rejected = append(rejected, err)
 			continue
 		}
-		usable = append(usable, path)
+		usable = append(usable, prefix+path)
 	}
 	return usable, rejected
 }
 
+// Write writes data to Azure Blob Storage.
 func (b *AzureBlobBackend) Write(ctx context.Context, path string, data []byte) error {
 	return b.WriteReader(ctx, path, bytes.NewReader(data), int64(len(data)))
 }
 
 // WriteReader writes data from a reader to Azure Blob Storage
 func (b *AzureBlobBackend) WriteReader(ctx context.Context, path string, reader io.Reader, size int64) error {
-	key, err := b.blobKey(path)
+	key, err := b.prefixedKey(path)
 	if err != nil {
 		return err
 	}
@@ -247,7 +288,7 @@ func (b *AzureBlobBackend) WriteReader(ctx context.Context, path string, reader 
 
 // Read reads data from Azure Blob Storage
 func (b *AzureBlobBackend) Read(ctx context.Context, path string) ([]byte, error) {
-	key, err := b.blobKey(path)
+	key, err := b.prefixedKey(path)
 	if err != nil {
 		return nil, err
 	}
@@ -280,7 +321,7 @@ func (b *AzureBlobBackend) Read(ctx context.Context, path string) ([]byte, error
 
 // ReadTo reads data from Azure Blob Storage and writes to a writer
 func (b *AzureBlobBackend) ReadTo(ctx context.Context, path string, writer io.Writer) error {
-	key, err := b.blobKey(path)
+	key, err := b.prefixedKey(path)
 	if err != nil {
 		return err
 	}
@@ -314,7 +355,7 @@ func (b *AzureBlobBackend) ReadTo(ctx context.Context, path string, writer io.Wr
 // offset and writes to writer. Uses blob.HTTPRange to skip already-transferred
 // bytes. offset=0 fetches the full blob without a Range header.
 func (b *AzureBlobBackend) ReadToAt(ctx context.Context, path string, writer io.Writer, offset int64) error {
-	key, err := b.blobKey(path)
+	key, err := b.prefixedKey(path)
 	if err != nil {
 		return err
 	}
@@ -352,7 +393,7 @@ func (b *AzureBlobBackend) ReadToAt(ctx context.Context, path string, writer io.
 
 // StatFile returns the byte size of the Azure blob at path, or -1 if not found.
 func (b *AzureBlobBackend) StatFile(ctx context.Context, path string) (int64, error) {
-	key, err := b.blobKey(path)
+	key, err := b.prefixedKey(path)
 	if err != nil {
 		return 0, err
 	}
@@ -373,7 +414,8 @@ func (b *AzureBlobBackend) StatFile(ctx context.Context, path string) (int64, er
 
 // List lists blobs with the given prefix
 func (b *AzureBlobBackend) List(ctx context.Context, prefix string) ([]string, error) {
-	if err := ValidateListPrefix(prefix); err != nil {
+	fullPrefix, err := b.prefixedListPrefix(prefix)
+	if err != nil {
 		return nil, err
 	}
 
@@ -381,7 +423,7 @@ func (b *AzureBlobBackend) List(ctx context.Context, prefix string) ([]string, e
 
 	containerClient := b.client.ServiceClient().NewContainerClient(b.containerName)
 	pager := containerClient.NewListBlobsFlatPager(&container.ListBlobsFlatOptions{
-		Prefix: &prefix,
+		Prefix: &fullPrefix,
 	})
 
 	for pager.More() {
@@ -396,12 +438,17 @@ func (b *AzureBlobBackend) List(ctx context.Context, prefix string) ([]string, e
 
 		for _, blobItem := range page.Segment.BlobItems {
 			if blobItem.Name != nil {
+				// Strip the prefix so callers see keys relative to the
+				// logical root. A listing that returned prefixed keys while
+				// writes took unprefixed ones is the shape that corrupts a
+				// backup manifest in silence (#1102).
+				key := strings.TrimPrefix(*blobItem.Name, b.prefix)
 				// See S3Backend.List: a listing never returns a key this
 				// backend would refuse (#743).
-				if ValidateKey(*blobItem.Name) != nil {
+				if ValidateKey(key) != nil {
 					continue
 				}
-				blobs = append(blobs, *blobItem.Name)
+				blobs = append(blobs, key)
 			}
 		}
 	}
@@ -411,7 +458,7 @@ func (b *AzureBlobBackend) List(ctx context.Context, prefix string) ([]string, e
 
 // Delete deletes a blob from Azure Blob Storage
 func (b *AzureBlobBackend) Delete(ctx context.Context, path string) error {
-	key, err := b.blobKey(path)
+	key, err := b.prefixedKey(path)
 	if err != nil {
 		return err
 	}
@@ -458,11 +505,13 @@ func (b *AzureBlobBackend) DeleteBatch(ctx context.Context, paths []string) erro
 			return fmt.Errorf("failed to create Azure batch builder: %w", err)
 		}
 
-		usable, rejected := partitionValidKeys(batch)
+		usable, rejected := partitionValidKeys(b.prefix, batch)
 		nonFatalErrs = append(nonFatalErrs, rejected...)
 		for _, key := range usable {
 			if err := bb.Delete(key, nil); err != nil {
-				return fmt.Errorf("failed to add delete to Azure batch for %q: %w", key, err)
+				// Reported on the UNPREFIXED spelling: the caller passed that
+				// one and has no reason to know the blob name (#1111).
+				return fmt.Errorf("failed to add delete to Azure batch for %q: %w", strings.TrimPrefix(key, b.prefix), err)
 			}
 		}
 		if len(usable) == 0 {
@@ -486,9 +535,14 @@ func (b *AzureBlobBackend) DeleteBatch(ctx context.Context, paths []string) erro
 			if isAzureNotFoundError(item.Error) {
 				continue
 			}
+			// The service answers with the PREFIXED blob name. Report the
+			// unprefixed spelling, so the error and the log field name the key
+			// the caller passed — the rule partitionValidKeys already follows
+			// for a rejection, and that every listing follows on the way out
+			// (#1111).
 			blobName := "unknown"
 			if item.BlobName != nil {
-				blobName = *item.BlobName
+				blobName = strings.TrimPrefix(*item.BlobName, b.prefix)
 			}
 			b.logger.Warn().
 				Err(item.Error).
@@ -508,7 +562,7 @@ func (b *AzureBlobBackend) DeleteBatch(ctx context.Context, paths []string) erro
 
 // Exists checks if a blob exists in Azure Blob Storage
 func (b *AzureBlobBackend) Exists(ctx context.Context, path string) (bool, error) {
-	key, err := b.blobKey(path)
+	key, err := b.prefixedKey(path)
 	if err != nil {
 		return false, err
 	}
@@ -536,6 +590,11 @@ func (b *AzureBlobBackend) GetContainer() string {
 	return b.containerName
 }
 
+// GetPrefix returns the blob-name prefix (empty string if none configured)
+func (b *AzureBlobBackend) GetPrefix() string {
+	return b.prefix
+}
+
 // GetAccountName returns the account name
 func (b *AzureBlobBackend) GetAccountName() string {
 	return b.accountName
@@ -555,10 +614,21 @@ func (b *AzureBlobBackend) Type() string {
 	return "azure"
 }
 
-// ConfigJSON returns the configuration as JSON for subprocess recreation
+// ConfigJSON returns the configuration as JSON for subprocess recreation.
+//
+// Every field emitted here must be parsed and forwarded by the compaction
+// subprocess (internal/compaction/subprocess.go). Prefix in particular: it is
+// applied to every key the backend touches (prefixedKey), so dropping it
+// silently reroots the subprocess at the container root and compaction reads
+// and writes the wrong location. It defaults to empty, which is how the same
+// omission on the S3 side went unnoticed.
+//
+// This carries no credentials, and must not start to: the subprocess reads
+// the account key from the environment the parent sets.
 func (b *AzureBlobBackend) ConfigJSON() string {
 	config := map[string]interface{}{
 		"container":    b.containerName,
+		"prefix":       b.prefix,
 		"account_name": b.accountName,
 		"endpoint":     b.endpoint,
 	}
@@ -575,12 +645,17 @@ func (b *AzureBlobBackend) ListDirectories(ctx context.Context, prefix string) (
 		prefix = prefix + "/"
 	}
 
+	fullPrefix, err := b.prefixedListPrefix(prefix)
+	if err != nil {
+		return nil, err
+	}
+
 	var dirs []string
 	delimiter := "/"
 
 	containerClient := b.client.ServiceClient().NewContainerClient(b.containerName)
 	pager := containerClient.NewListBlobsHierarchyPager(delimiter, &container.ListBlobsHierarchyOptions{
-		Prefix: &prefix,
+		Prefix: &fullPrefix,
 	})
 
 	for pager.More() {
@@ -596,9 +671,12 @@ func (b *AzureBlobBackend) ListDirectories(ctx context.Context, prefix string) (
 		// BlobPrefixes contains the "directories"
 		for _, blobPrefix := range page.Segment.BlobPrefixes {
 			if blobPrefix.Name != nil {
-				// Extract directory name from the prefix
-				// e.g., "mydb/cpu/" -> "cpu"
-				dir := strings.TrimPrefix(*blobPrefix.Name, prefix)
+				// Extract directory name from the prefix. fullPrefix, not the
+				// caller's prefix: the names come back with the backend prefix
+				// attached, and trimming only the caller's half would leave it
+				// on the directory name (see S3Backend.ListDirectories).
+				// e.g., "arc/mydb/cpu/" -> "cpu"
+				dir := strings.TrimPrefix(*blobPrefix.Name, fullPrefix)
 				dir = strings.TrimSuffix(dir, "/")
 				if dir != "" && !strings.HasPrefix(dir, ".") {
 					dirs = append(dirs, dir)
@@ -613,11 +691,16 @@ func (b *AzureBlobBackend) ListDirectories(ctx context.Context, prefix string) (
 // ListObjects lists blobs with their metadata at a prefix.
 // Implements the ObjectLister interface.
 func (b *AzureBlobBackend) ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, error) {
+	fullPrefix, err := b.prefixedListPrefix(prefix)
+	if err != nil {
+		return nil, err
+	}
+
 	var objects []ObjectInfo
 
 	containerClient := b.client.ServiceClient().NewContainerClient(b.containerName)
 	pager := containerClient.NewListBlobsFlatPager(&container.ListBlobsFlatOptions{
-		Prefix: &prefix,
+		Prefix: &fullPrefix,
 	})
 
 	for pager.More() {
@@ -632,13 +715,14 @@ func (b *AzureBlobBackend) ListObjects(ctx context.Context, prefix string) ([]Ob
 
 		for _, blobItem := range page.Segment.BlobItems {
 			if blobItem.Name != nil {
+				key := strings.TrimPrefix(*blobItem.Name, b.prefix)
 				// See S3Backend.List: a listing never returns a key this
 				// backend would refuse (#743).
-				if ValidateKey(*blobItem.Name) != nil {
+				if ValidateKey(key) != nil {
 					continue
 				}
 				info := ObjectInfo{
-					Path: *blobItem.Name,
+					Path: key,
 				}
 				if blobItem.Properties != nil {
 					if blobItem.Properties.ContentLength != nil {
@@ -656,6 +740,36 @@ func (b *AzureBlobBackend) ListObjects(ctx context.Context, prefix string) ([]Ob
 	return objects, nil
 }
 
+// HasObjectsUnderPrefix implements PrefixProber over the flat blob pager: the
+// first blob whose name the contract accepts answers true, and the pager is
+// only advanced while a whole page was blobs ListObjects would hide. See
+// S3Backend.HasObjectsUnderPrefix.
+func (b *AzureBlobBackend) HasObjectsUnderPrefix(ctx context.Context, prefix string) (bool, error) {
+	fullPrefix, err := b.prefixedListPrefix(prefix)
+	if err != nil {
+		return false, err
+	}
+	containerClient := b.client.ServiceClient().NewContainerClient(b.containerName)
+	pager := containerClient.NewListBlobsFlatPager(&container.ListBlobsFlatOptions{
+		Prefix: &fullPrefix,
+	})
+	for pager.More() {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return false, fmt.Errorf("failed to list Azure blobs: %w", err)
+		}
+		for _, blobItem := range page.Segment.BlobItems {
+			if blobItem.Name != nil && ValidateKey(strings.TrimPrefix(*blobItem.Name, b.prefix)) == nil {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
 // ListUnusable implements UnusableLister.
 //
 // Returns exactly what ListObjects drops, so the two partition the container.
@@ -663,11 +777,16 @@ func (b *AzureBlobBackend) ListObjects(ctx context.Context, prefix string) ([]Ob
 // writes and does not implement StagingInspector, so such a blob is an ordinary
 // committed object that #744's reserved suffix made unaddressable.
 func (b *AzureBlobBackend) ListUnusable(ctx context.Context, prefix string) ([]UnusableObject, error) {
+	fullPrefix, err := b.prefixedListPrefix(prefix)
+	if err != nil {
+		return nil, err
+	}
+
 	var objects []UnusableObject
 
 	containerClient := b.client.ServiceClient().NewContainerClient(b.containerName)
 	pager := containerClient.NewListBlobsFlatPager(&container.ListBlobsFlatOptions{
-		Prefix: &prefix,
+		Prefix: &fullPrefix,
 	})
 
 	for pager.More() {
@@ -684,11 +803,12 @@ func (b *AzureBlobBackend) ListUnusable(ctx context.Context, prefix string) ([]U
 			if blobItem.Name == nil {
 				continue
 			}
-			reason := ValidateKey(*blobItem.Name)
+			key := strings.TrimPrefix(*blobItem.Name, b.prefix)
+			reason := ValidateKey(key)
 			if reason == nil {
 				continue // ListObjects returns it
 			}
-			info := UnusableObject{Path: *blobItem.Name, Err: reason}
+			info := UnusableObject{Path: key, Err: reason}
 			if blobItem.Properties != nil {
 				if blobItem.Properties.ContentLength != nil {
 					info.Size = *blobItem.Properties.ContentLength
