@@ -301,6 +301,17 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Database API storage calls now have a deadline ([#1065](https://github.com/Basekick-Labs/arc/issues/1065))
+
+Database API handlers now bound storage calls with a request context. Database
+deletion gets a deadline scaled to the number of listed files, so a large
+database is not cut off by the same fixed limit as a small one; partial-delete
+errors continue to be collected and reported, including failure to delete the
+database marker. Database details return an error if measurement listing fails,
+rather than reporting a successful response with a zero measurement count.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1067](https://github.com/Basekick-Labs/arc/pull/1067).
+
 ### Forwarded writes and WAL replication honor cancellation during TLS setup ([#1064](https://github.com/Basekick-Labs/arc/issues/1064))
 
 Leader forwarding and WAL replication now pass their existing contexts into
