@@ -170,8 +170,9 @@ func NewAzureBlobBackend(cfg *AzureBlobConfig, logger zerolog.Logger) (*AzureBlo
 }
 
 // prefixedKey validates a storage key and prepends the configured prefix to
-// build the blob name. The S3 twin is S3Backend.prefixedKey and the two are
-// meant to stay diffable.
+// build the blob name. It also enforces the key-length limit after the prefix
+// is applied (#1121). The S3 twin is S3Backend.prefixedKey and the two are meant
+// to stay diffable.
 //
 // Every key-taking method routes through this, so the contract the other
 // backends enforce (#743) holds here too. One rule matters especially on
@@ -184,10 +185,7 @@ func NewAzureBlobBackend(cfg *AzureBlobConfig, logger zerolog.Logger) (*AzureBlo
 // keys, this is the only place the prefix is added, and every listing strips
 // it again on the way out.
 func (b *AzureBlobBackend) prefixedKey(key string) (string, error) {
-	if err := ValidateKey(key); err != nil {
-		return "", err
-	}
-	return b.prefix + key, nil
+	return prefixObjectKey(b.prefix, key)
 }
 
 // prefixedListPrefix is prefixedKey for enumeration, where "" and a trailing
@@ -221,11 +219,12 @@ func (b *AzureBlobBackend) prefixedListPrefix(prefix string) (string, error) {
 func partitionValidKeys(prefix string, batch []string) (usable []string, rejected []error) {
 	usable = make([]string, 0, len(batch))
 	for _, path := range batch {
-		if err := ValidateKey(path); err != nil {
+		objectName, err := prefixObjectKey(prefix, path)
+		if err != nil {
 			rejected = append(rejected, err)
 			continue
 		}
-		usable = append(usable, prefix+path)
+		usable = append(usable, objectName)
 	}
 	return usable, rejected
 }

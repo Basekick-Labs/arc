@@ -105,3 +105,29 @@ func TestPartitionValidKeysPrefixesTheBlobNames(t *testing.T) {
 		t.Errorf("rejection %v names the prefixed blob name; it must name the key the caller passed", rejected[0])
 	}
 }
+
+func TestPartitionValidKeysRejectsAnOverlongPrefixedBlobName(t *testing.T) {
+	const prefix = "p/"
+	keyAtLimit := strings.Repeat("x/", 508) + "x"
+	keyOverLimit := strings.Repeat("x/", 508) + "xx"
+	if got := len(prefix + keyAtLimit); got != MaxUsableKeyLen {
+		t.Fatalf("fixture object name is %d bytes, want %d", got, MaxUsableKeyLen)
+	}
+	if got := len(prefix + keyOverLimit); got != MaxUsableKeyLen+1 {
+		t.Fatalf("fixture object name is %d bytes, want %d", got, MaxUsableKeyLen+1)
+	}
+
+	usable, rejected := partitionValidKeys(prefix, []string{"safe/file", keyAtLimit, keyOverLimit})
+	if len(usable) != 2 || usable[0] != prefix+"safe/file" || usable[1] != prefix+keyAtLimit {
+		t.Errorf("usable = %v, want the two names that fit", usable)
+	}
+	if len(rejected) != 1 {
+		t.Fatalf("rejected %d keys, want only the overlong object name", len(rejected))
+	}
+	if !errors.Is(rejected[0], ErrInvalidPath) {
+		t.Errorf("rejection %v does not match ErrInvalidPath", rejected[0])
+	}
+	if !strings.Contains(rejected[0].Error(), prefix+keyOverLimit) {
+		t.Errorf("rejection %q does not identify the complete object name", rejected[0])
+	}
+}

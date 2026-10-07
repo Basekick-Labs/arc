@@ -796,7 +796,8 @@ func listError(what string, err error) error {
 	return fmt.Errorf("%s: %w", what, err)
 }
 
-// prefixedKey validates a storage key and prepends the configured prefix.
+// prefixedKey validates a storage key and prepends the configured prefix. It
+// also enforces the key-length limit after the prefix is applied (#1121).
 //
 // Returning an error is what makes the contract hold: a new method that builds
 // an S3 key has to deal with it, rather than silently passing an unvalidated
@@ -805,10 +806,7 @@ func listError(what string, err error) error {
 // DuckDB's read_parquet consumes, and iceberg-go writes metadata through its
 // own FileIO. Both are out of scope here (#746).
 func (b *S3Backend) prefixedKey(key string) (string, error) {
-	if err := ValidateKey(key); err != nil {
-		return "", err
-	}
-	return b.prefix + key, nil
+	return prefixObjectKey(b.prefix, key)
 }
 
 // prefixedListPrefix is prefixedKey for enumeration, where "" and a trailing
