@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -411,6 +412,60 @@ func TestTheListingNamesAnUnreachableTargetAndKeepsGoing(t *testing.T) {
 	rig.m.backupStorage = unreachableDestination{Backend: rig.m.backupStorage}
 	if _, err := rig.m.ListBackupsDetailed(ctx, false); err == nil {
 		t.Error("ListBackupsDetailed with every target down succeeded, want an error")
+	}
+}
+
+// TestTheListingSurfacesAnUnreadableTargetAndKeepsOtherTargets: a single
+// manifest read failure must not silently remove that backup, while a
+// multi-target listing should retain entries it can read from other targets.
+func TestTheListingSurfacesAnUnreadableTargetAndKeepsOtherTargets(t *testing.T) {
+	ctx := context.Background()
+	rig := newRoutedRig(t, map[string]string{"audit": "audit"})
+	rig.write(t, "audit/events/2026/10/07/00/a.parquet", "PAR1")
+	rig.write(t, "prod/cpu/2026/10/07/00/b.parquet", "PAR1")
+	result, err := rig.m.CreateBackup(ctx, BackupOptions{})
+	if err != nil {
+		t.Fatalf("CreateBackup: %v", err)
+	}
+	id := result.Manifest.BackupID
+	rig.write(t, "prod/cpu/2026/10/07/00/c.parquet", "PAR1")
+	other, err := rig.m.CreateBackup(ctx, BackupOptions{Databases: []string{"prod"}})
+	if err != nil {
+		t.Fatalf("CreateBackup for second run: %v", err)
+	}
+
+	backend := rig.m.targets["audit"].backend.(*storage.LocalBackend)
+	rig.m.targets["audit"] = backupTarget{
+		backend: &manifestFaultDestination{
+			LocalBackend: backend,
+			path:         id + "/manifest.json",
+			err:          errors.New("simulated manifest read failure"),
+		},
+		name: "audit",
+	}
+
+	listing, err := rig.m.ListBackupsDetailed(ctx, false)
+	if err != nil {
+		t.Fatalf("ListBackupsDetailed with one unreadable target: %v", err)
+	}
+	if len(listing.Backups) != 2 {
+		t.Fatalf("listing backups = %+v, want both runs despite one unreadable manifest", listing.Backups)
+	}
+	byID := make(map[string]BackupSummary, len(listing.Backups))
+	for _, summary := range listing.Backups {
+		byID[summary.BackupID] = summary
+	}
+	if partial, ok := byID[id]; !ok || !partial.PartialView {
+		t.Errorf("first run = %+v, want a partial view when its audit manifest is unreadable", partial)
+	}
+	if complete, ok := byID[other.Manifest.BackupID]; !ok || complete.PartialView {
+		t.Errorf("second run = %+v, want its complete main-only manifest retained", complete)
+	}
+	if strings.Join(listing.UnreachableTargets, ",") != "audit" {
+		t.Errorf("unreachable_targets = %v, want [audit]", listing.UnreachableTargets)
+	}
+	if len(listing.IncompleteRuns) != 1 || listing.IncompleteRuns[0].BackupID != id || strings.Join(listing.IncompleteRuns[0].Unknown, ",") != "audit" {
+		t.Errorf("incomplete_runs = %+v, want first run marked unknown on [audit]", listing.IncompleteRuns)
 	}
 }
 
