@@ -187,8 +187,18 @@ curl -X POST "http://localhost:8000/api/v1/query" \
 | Scenario | What it tests |
 |---|---|
 | `base` (default) | Ingest N records via Traefik LB, query through reader, assert exact record count. Verifies LB round-robin, writer concurrency, object-store durability, reader-can-see-writer-flushes. |
-| `non-leader-crash` | Same as base, but `docker kill` a non-leader writer mid-ingest. Asserts: every HTTP-success record is queryable (durability invariant). In-flight buffer on the killed writer may be lost. |
-| `leader-crash` | Same as base, but kill the current Raft leader mid-ingest. Asserts: Raft elects a new leader within seconds; writes continue via LB to surviving writers; durability invariant holds. |
+| `non-leader-crash` | Same as base, but `docker kill` a non-leader writer mid-ingest, then restart it and wait for `/ready` (including WAL replay). Asserts every acknowledged `host` is queryable, allowing WAL replay duplicates until compaction. |
+| `leader-crash` | Same as base, but kill the current Raft leader mid-ingest, then restart it and wait for `/ready`. Asserts every acknowledged `host` is queryable, allowing WAL replay duplicates until compaction. |
+
+The crash checks verify membership in the acknowledged host set in bounded
+queries, allowing replay duplicates and records persisted by failed requests.
+They reject an idle kill target or a crash that never triggered.
+The license-free harness regressions also run in CI. Run them locally from the
+repository root with:
+
+```bash
+python3 -m unittest discover -s deploy/docker-compose/enterprise-shared -p 'test_smoke.py'
+```
 
 The smoke uses `docker-compose.override.smoke.yml` to build Arc **from source** rather than pulling `ghcr.io/basekick-labs/arc:latest`, so you can run it against branch under review.
 
