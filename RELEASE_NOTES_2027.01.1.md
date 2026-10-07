@@ -45,6 +45,45 @@ costs one comparison at startup and removes a class of silent data loss.
 
 ## New features
 
+### Scheduled edge-to-hub replication for paid licenses ([#828](https://github.com/Basekick-Labs/arc/issues/828))
+
+Network spokes can now replicate automatically. Like continuous-query and
+retention scheduling, this requires a valid paid license: Starter,
+Professional, Enterprise, or Unlimited, including the license grace period.
+Manual `POST /api/v1/spoke-sync/run` and air-gap bundle export remain available
+without a license. Bundle export stays manual.
+
+With `edge_sync.spoke.enabled = true` and a valid paid license, the first
+scheduled pass starts after `edge_sync.spoke.sync_interval` (default `5m`).
+Failed or incomplete passes retry from `edge_sync.spoke.sync_retry_interval`
+(default `30s`), doubling up to the normal interval and resetting after a
+completed pass. Both durations must be at least one second, and the retry
+interval must be shorter than the normal interval. Environment overrides are
+`ARC_EDGE_SYNC_SPOKE_SYNC_INTERVAL` and
+`ARC_EDGE_SYNC_SPOKE_SYNC_RETRY_INTERVAL`.
+
+Each tick rechecks the paid-license entitlement and primary-writer role.
+Losing either cancels an active scheduled pass; a running scheduler resumes
+when eligibility returns. Manual and scheduled passes share an overlap guard:
+a busy manual request returns HTTP 409. Shutdown cancels and joins scheduled
+work before closing the ledger. Failed deliveries do not release the
+compaction defer gate.
+
+Scheduled spokes expose `arc_edgesync_spoke_scheduler_enabled`,
+`arc_edgesync_spoke_last_success_timestamp_seconds`, and
+`arc_edgesync_spoke_pass_failures_total` in Prometheus, with corresponding
+`edge_sync_spoke_*` JSON metrics. The success timestamp advances only after
+validated hub contact and a complete pass; an empty backlog, partial transfer,
+or conflict cannot report successful replication. Skipped overlaps and
+eligibility cancellations do not count as hub failures. These metrics are
+absent when the scheduler was not started.
+
+This combines work by [@jallegri](https://github.com/jallegri) in
+[#1119](https://github.com/Basekick-Labs/arc/pull/1119) and
+[@efegokdemir](https://github.com/efegokdemir) in
+[#924](https://github.com/Basekick-Labs/arc/pull/924), with shared paid-license
+checks and additional regression coverage.
+
 ### Backups can be scoped to one or more databases ([#1084](https://github.com/Basekick-Labs/arc/issues/1084))
 
 `POST /api/v1/backup` was whole-instance: its body took only `include_metadata`

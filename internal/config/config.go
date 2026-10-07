@@ -332,9 +332,18 @@ type EdgeSyncImportConfig struct {
 
 // EdgeSyncSpokeConfig configures the push side of edge sync (#569).
 type EdgeSyncSpokeConfig struct {
-	// Enabled mounts the manual sync controls. Off by default: pushing data
-	// off a box is a deliberate decision.
+	// Enabled opts this node into network sync. Off by default because pushing
+	// data off a box is a deliberate decision. Valid paid licenses also enable
+	// the automatic scheduler; other tiers retain manual triggering.
 	Enabled bool
+
+	// SyncInterval is the delay between scheduled network sync passes. The
+	// scheduler is only started for a valid paid license.
+	SyncInterval time.Duration
+
+	// SyncRetryInterval is the initial delay after a scheduled pass fails.
+	// Consecutive failures double it up to SyncInterval.
+	SyncRetryInterval time.Duration
 
 	// HubURL is the hub's root, e.g. https://ground-station.example.com.
 	HubURL string
@@ -980,6 +989,8 @@ func Load() (*Config, error) {
 			},
 			Spoke: EdgeSyncSpokeConfig{
 				Enabled:                    v.GetBool("edge_sync.spoke.enabled"),
+				SyncInterval:               v.GetDuration("edge_sync.spoke.sync_interval"),
+				SyncRetryInterval:          v.GetDuration("edge_sync.spoke.sync_retry_interval"),
 				HubURL:                     v.GetString("edge_sync.spoke.hub_url"),
 				SpokeID:                    v.GetString("edge_sync.spoke.spoke_id"),
 				HubID:                      v.GetString("edge_sync.spoke.hub_id"),
@@ -1430,6 +1441,12 @@ func Load() (*Config, error) {
 	}
 
 	if cfg.EdgeSync.Spoke.Enabled {
+		if cfg.EdgeSync.Spoke.SyncInterval < time.Second {
+			return nil, fmt.Errorf("edge_sync.spoke.sync_interval must be at least 1s (got %s)", cfg.EdgeSync.Spoke.SyncInterval)
+		}
+		if cfg.EdgeSync.Spoke.SyncRetryInterval < time.Second || cfg.EdgeSync.Spoke.SyncRetryInterval >= cfg.EdgeSync.Spoke.SyncInterval {
+			return nil, fmt.Errorf("edge_sync.spoke.sync_retry_interval must be at least 1s and shorter than sync_interval (got %s)", cfg.EdgeSync.Spoke.SyncRetryInterval)
+		}
 		if cfg.EdgeSync.Spoke.HubURL == "" {
 			return nil, fmt.Errorf("edge_sync.spoke.enabled=true requires edge_sync.spoke.hub_url")
 		}
@@ -1712,6 +1729,8 @@ func setDefaults(v *viper.Viper) {
 	// zero-value fallbacks so the defaults are visible to an operator reading
 	// the config, and so the documented value and the code cannot drift apart.
 	v.SetDefault("edge_sync.spoke.enabled", false)
+	v.SetDefault("edge_sync.spoke.sync_interval", "5m")
+	v.SetDefault("edge_sync.spoke.sync_retry_interval", "30s")
 	v.SetDefault("edge_sync.spoke.hub_url", "")
 	v.SetDefault("edge_sync.spoke.spoke_id", "")
 	v.SetDefault("edge_sync.spoke.hub_id", "")
