@@ -1441,6 +1441,14 @@ database marker. Database details return an error if measurement listing fails,
 rather than reporting a successful response with a zero measurement count.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1067](https://github.com/Basekick-Labs/arc/pull/1067).
+### Object-store prefixes count toward the storage key limit ([#1121](https://github.com/Basekick-Labs/arc/issues/1121))
+
+S3 and Azure now validate the complete object name, including its configured
+prefix, before sending it to the object store. Azure batch deletion applies
+the same check and continues deleting the other valid keys in the batch.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1132](https://github.com/Basekick-Labs/arc/pull/1132).
 
 ### Forwarded writes and WAL replication honor cancellation during TLS setup ([#1064](https://github.com/Basekick-Labs/arc/issues/1064))
 
