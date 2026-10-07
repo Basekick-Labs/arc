@@ -734,18 +734,6 @@ twice on every node, as native msgpack rows already did.
 
 Contributed by [@lecodev-26](https://github.com/lecodev-26) in [#1055](https://github.com/Basekick-Labs/arc/pull/1055). [@drakeo338](https://github.com/drakeo338) proposed the same source-side fix in #889.
 
-### Compaction subprocess threads respect license and effective-core limits ([#1036](https://github.com/Basekick-Labs/arc/issues/1036))
-
-Each positive compaction subprocess thread setting is now capped at the lower
-of the license's `MaxCores` and the effective cores available to the process;
-lower configured values are preserved. An automatic zero value remains
-DuckDB-controlled when `Config` is constructed directly, and normal config
-loading resolves it before license enforcement. This is a per-process cap, not
-an aggregate reservation: the main process and multiple subprocesses can still
-request more threads in total than `MaxCores`. Capping a previously higher
-setting can reduce compaction throughput; this change does not claim an
-aggregate CPU budget.
-
 ## Experimental arcx Arrow IPC streams signal writer panics ([#846](https://github.com/Basekick-Labs/arc/issues/846))
 
 When the experimental arcx Arrow IPC stream writer panics, the response now

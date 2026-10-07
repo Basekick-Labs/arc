@@ -4,6 +4,17 @@
 
 ## Bug fixes
 
+### Compaction subprocess threads respect license and effective-core limits ([#1036](https://github.com/Basekick-Labs/arc/issues/1036))
+
+Each compaction subprocess is now capped at the lower of the license's
+`MaxCores` and the effective cores available to Arc, after automatic thread
+defaults have been resolved. Lower configured values are preserved. This is a
+per-process cap, not an aggregate reservation: the main process and multiple
+subprocesses can still request more threads in total than `MaxCores`. Capping a
+previously higher setting can reduce compaction throughput.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1043](https://github.com/Basekick-Labs/arc/pull/1043).
+
 ### Delete API WHERE validation no longer rejects SQL words and punctuation inside string literals ([#834](https://github.com/Basekick-Labs/arc/issues/834))
 
 `POST /api/v1/delete` scans the WHERE clause for statement-level SQL before it
