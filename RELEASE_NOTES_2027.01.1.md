@@ -152,6 +152,15 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Distinct Arrow schemas no longer share an ingest cache entry ([#750](https://github.com/Basekick-Labs/arc/issues/750))
+
+The ingest schema cache now uses deterministic, length-prefixed column identities
+instead of ambiguous slice formatting. It includes decimal precision/scale and
+canonicalises column and tag ordering, preventing stale Arrow types or metadata
+when a measurement's schema changes.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#913](https://github.com/Basekick-Labs/arc/pull/913).
+
 ### Fallback compaction job IDs support spoke namespaces ([#750](https://github.com/Basekick-Labs/arc/issues/750))
 
 When a compaction job was created without an explicit JobID, its fallback ID
