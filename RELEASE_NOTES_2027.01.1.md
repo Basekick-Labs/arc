@@ -152,6 +152,15 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Query path extraction no longer folds backslashes ([#750](https://github.com/Basekick-Labs/arc/issues/750))
+
+Query tier selection no longer converts backslashes in storage keys into path
+separators, which could identify a different database or measurement. Native
+separators remain permitted only within a trusted local storage root; the key
+portion retains its slash-separated identity.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#918](https://github.com/Basekick-Labs/arc/pull/918).
+
 ### Local storage closes appended files exactly once ([#750](https://github.com/Basekick-Labs/arc/issues/750))
 
 `LocalBackend.AppendReader` previously closed the staging file explicitly on
