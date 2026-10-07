@@ -10,6 +10,23 @@ import (
 	"github.com/rs/zerolog"
 )
 
+type failFirstReconcileTransport struct {
+	SyncTransport
+	failed bool
+}
+
+func (t *failFirstReconcileTransport) Reconcile(
+	ctx context.Context,
+	hubID string,
+	pending []*LedgerEntry,
+) (*ReconcileResult, error) {
+	if !t.failed {
+		t.failed = true
+		return nil, errors.New("hub unavailable")
+	}
+	return t.SyncTransport.Reconcile(ctx, hubID, pending)
+}
+
 func newSchedulerRigIssue828(t *testing.T, gate func() bool) *SpokeScheduler {
 	t.Helper()
 	rig := newAgentRig(t)
@@ -122,6 +139,48 @@ func TestSpokeSchedulerClassifiesIncompletePassIssue828(t *testing.T) {
 	if s.failures != 1 {
 		t.Fatalf("failure count=%d, want 1", s.failures)
 	}
+}
+
+func TestSpokeSchedulerIncompletePassKeepsCompactionDeferredIssue828(t *testing.T) {
+	ctx := context.Background()
+	rig := newAgentRig(t)
+	path := agentPath
+	content := []byte("spoke file awaiting confirmed delivery")
+	rig.writeFile(t, path, content)
+	gated := NewCompactionEligibility(
+		rig.ledger, DefaultHubID, time.Now().UTC(), zerolog.Nop(),
+	)
+	checkEligibility := func(want bool) {
+		t.Helper()
+		got, err := gated(ctx, []string{path})
+		if err != nil {
+			t.Fatalf("compaction eligibility: %v", err)
+		}
+		if got[path] != want {
+			t.Fatalf("compaction eligibility after sync pass = %v, want %v", got[path], want)
+		}
+	}
+	checkEligibility(false)
+
+	rig.agent.transport = &failFirstReconcileTransport{SyncTransport: rig.transport}
+	s, err := NewSpokeScheduler(SpokeSchedulerConfig{
+		Agent:         rig.agent,
+		Interval:      5 * time.Minute,
+		RetryInterval: 30 * time.Second,
+		Logger:        zerolog.Nop(),
+	})
+	if err != nil {
+		t.Fatalf("new scheduler: %v", err)
+	}
+	if delay := s.runOnce(ctx); delay != s.retryInterval {
+		t.Fatalf("incomplete scheduled pass delay = %s, want retry interval %s", delay, s.retryInterval)
+	}
+	checkEligibility(false)
+
+	if delay := s.runOnce(ctx); delay != s.interval {
+		t.Fatalf("successful scheduled pass delay = %s, want success interval %s", delay, s.interval)
+	}
+	checkEligibility(true)
 }
 
 func TestSpokeSchedulerSkipsConcurrentManualPassIssue828(t *testing.T) {
