@@ -1107,6 +1107,8 @@ func (h *DeleteHandler) replaceManifestAfterRewrite(ctx context.Context, oldPath
 	// standalone mode and for clusters with replication disabled, where no
 	// manifest-delete worker is running.
 	if err := h.storage.Delete(ctx, oldPath); err != nil {
+		h.logger.Error().Err(err).Str("file", oldPath).Str("new_file", newPath).
+			Msg("Manifest committed but failed to delete superseded rewrite; the old object may remain visible to glob queries until cleanup succeeds")
 		return fmt.Errorf("manifest committed but failed to delete superseded rewrite %q: %w", oldPath, err)
 	}
 	return nil
