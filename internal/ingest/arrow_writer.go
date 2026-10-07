@@ -908,6 +908,9 @@ type ArrowBuffer struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	// Serializes flush-record counter transitions with their exported gauges.
+	flushRecordMetricsMu sync.Mutex
+
 	// flushParent is the parent of every flush I/O context. It is derived
 	// with context.WithoutCancel(b.ctx), so b.cancel() — which exists to stop
 	// the metrics sampler, the periodic flush and the workers' receive loops —
@@ -1128,8 +1131,8 @@ func (b *ArrowBuffer) ResetFlushFailure() {
 // records_buffered and queue_depth permanently zero (#802).
 //
 // Called after a flush completes and whenever the flush queue depth changes.
-// All reads are atomic loads and the sets are atomic stores, so this adds no
-// locking to the flush path.
+// The flush-record counters use a separate lock to keep each counter transition
+// and its exported gauges consistent across concurrent workers.
 func (b *ArrowBuffer) publishBufferMetrics() {
 	m := metrics.Get()
 	m.SetBufferFlushes(b.totalFlushes.Load())
@@ -1141,26 +1144,36 @@ func (b *ArrowBuffer) publishBufferMetrics() {
 }
 
 func (b *ArrowBuffer) publishFlushRecordMetrics() {
+	b.flushRecordMetricsMu.Lock()
+	defer b.flushRecordMetricsMu.Unlock()
+	b.publishFlushRecordMetricsLocked()
+}
+
+func (b *ArrowBuffer) publishFlushRecordMetricsLocked() {
 	m := metrics.Get()
 	m.SetBufferRecordsQueued(b.queuedRecords.Load())
 	m.SetBufferRecordsInflight(b.inflightRecords.Load())
 }
 
+func (b *ArrowBuffer) adjustFlushRecordMetrics(queuedDelta, inflightDelta int64) {
+	b.flushRecordMetricsMu.Lock()
+	defer b.flushRecordMetricsMu.Unlock()
+	b.queuedRecords.Add(queuedDelta)
+	b.inflightRecords.Add(inflightDelta)
+	b.publishFlushRecordMetricsLocked()
+}
+
 func (b *ArrowBuffer) markFlushTaskInFlight(task flushTask) {
 	count := int64(task.recordCount)
-	b.queuedRecords.Add(-count)
-	b.inflightRecords.Add(count)
-	b.publishFlushRecordMetrics()
+	b.adjustFlushRecordMetrics(-count, count)
 }
 
 func (b *ArrowBuffer) finishQueuedFlushTask(task flushTask) {
-	b.queuedRecords.Add(-int64(task.recordCount))
-	b.publishFlushRecordMetrics()
+	b.adjustFlushRecordMetrics(-int64(task.recordCount), 0)
 }
 
 func (b *ArrowBuffer) finishFlushTask(task flushTask) {
-	b.inflightRecords.Add(-int64(task.recordCount))
-	b.publishFlushRecordMetrics()
+	b.adjustFlushRecordMetrics(0, -int64(task.recordCount))
 }
 
 func (b *ArrowBuffer) flushTrackedTask(ctx context.Context, task flushTask) error {
@@ -1965,12 +1978,11 @@ func (b *ArrowBuffer) enqueueOrDeferLocked(
 		walHashes: collectWALHashes(shard.buffers[bufferKey]),
 	}
 	queuedRecords := int64(task.recordCount)
-	b.queuedRecords.Add(queuedRecords)
+	b.adjustFlushRecordMetrics(queuedRecords, 0)
 
 	select {
 	case b.flushQueue <- task:
 		b.queueDepth.Add(1)
-		b.publishFlushRecordMetrics()
 		// Only now does the buffer stop owning these records.
 		delete(shard.deferredKeys, bufferKey)
 		delete(shard.buffers, bufferKey)
@@ -1979,14 +1991,12 @@ func (b *ArrowBuffer) enqueueOrDeferLocked(
 		delete(shard.bufferSchemas, bufferKey)
 		return true, false
 	case <-b.ctx.Done():
-		b.queuedRecords.Add(-queuedRecords)
-		b.publishFlushRecordMetrics()
+		b.adjustFlushRecordMetrics(-queuedRecords, 0)
 		// Close cancelled b.ctx between the checks above and this select. The
 		// records stay in the buffer for Close's shard loop.
 		return false, false
 	default:
-		b.queuedRecords.Add(-queuedRecords)
-		b.publishFlushRecordMetrics()
+		b.adjustFlushRecordMetrics(-queuedRecords, 0)
 		// Lost the race against another writer for the last slot.
 		b.markDeferredLocked(shard, bufferKey)
 		return false, true
