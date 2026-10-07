@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -673,19 +674,20 @@ func stripSQLComments(sql string, hasComments bool) string {
 
 // QueryHandler handles SQL query endpoints
 type QueryHandler struct {
-	db                 *database.DuckDB
-	storage            storage.Backend
-	pruner             *pruning.PartitionPruner
-	fieldSchema        *fieldschema.Registry // nil or disabled: SQL is built exactly as before #914
-	emptyRangeAnchor   bool                  // #928: answer a proven-empty range from a complete anchor alone
-	queryCache         *database.QueryCache
-	logger             zerolog.Logger
-	authManager        *auth.AuthManager
-	rbacManager        RBACChecker
-	debugEnabled       bool // Cached check for debug logging to avoid repeated level checks
-	parallelExecutor   *query.ParallelExecutor
-	queryTimeout       time.Duration // Query timeout (0 = no timeout)
-	slowQueryThreshold time.Duration // Slow query WARN threshold (0 = disabled)
+	db                      *database.DuckDB
+	storage                 storage.Backend
+	pruner                  *pruning.PartitionPruner
+	fieldSchema             *fieldschema.Registry // nil or disabled: SQL is built exactly as before #914
+	emptyRangeAnchor        bool                  // #928: answer a proven-empty range from a complete anchor alone
+	queryCache              *database.QueryCache
+	logger                  zerolog.Logger
+	authManager             *auth.AuthManager
+	rbacManager             RBACChecker
+	debugEnabled            bool // Cached check for debug logging to avoid repeated level checks
+	parallelExecutor        *query.ParallelExecutor
+	queryTimeout            time.Duration // Query timeout (0 = no timeout)
+	disableClientDisconnect bool
+	slowQueryThreshold      time.Duration // Slow query WARN threshold (0 = disabled)
 
 	// Cluster routing support
 	router *cluster.Router
@@ -994,6 +996,37 @@ func NewQueryHandler(db *database.DuckDB, storage storage.Backend, logger zerolo
 		queryTimeout:       queryTimeout,
 		slowQueryThreshold: slowQueryThreshold,
 	}
+}
+
+// SetCancelOnClientDisconnect controls whether query contexts are cancelled
+// when the client connection closes before the response finishes. Some HTTP
+// clients half-close their write side after sending a request; operators can
+// disable this behavior for those clients.
+func (h *QueryHandler) SetCancelOnClientDisconnect(enabled bool) {
+	h.disableClientDisconnect = !enabled
+}
+
+// watchQueryClientDisconnect starts the connection watcher and returns a
+// once-only metric recorder for the later streaming-error path.
+func (h *QueryHandler) watchQueryClientDisconnect(queryCtx context.Context, conn net.Conn, queryID string, cancel context.CancelFunc, path string) func() {
+	var disconnectOnce sync.Once
+	recordDisconnect := func() {
+		disconnectOnce.Do(func() {
+			metrics.Get().IncQueryClientDisconnect(path)
+		})
+	}
+	if h.disableClientDisconnect {
+		return recordDisconnect
+	}
+	watchClientDisconnect(queryCtx, conn, func() {
+		recordDisconnect()
+		h.logger.Warn().Str("query_id", queryID).Msg("Query cancelled after client disconnect")
+		if h.queryRegistry != nil && queryID != "" {
+			h.queryRegistry.CancelWithReason(queryID, "client disconnected")
+		}
+		cancel()
+	})
+	return recordDisconnect
 }
 
 // logSlowQuery emits a WARN log and increments the slow query counter if
@@ -2139,12 +2172,7 @@ localProcessing:
 		if cancelTimeout == nil {
 			execCtx, cancelTimeout = context.WithCancel(execCtx)
 		}
-		watchClientDisconnect(execCtx, c.Context().Conn(), func() {
-			if h.queryRegistry != nil && queryID != "" {
-				h.queryRegistry.Cancel(queryID)
-			}
-			cancelTimeout()
-		})
+		recordDisconnect := h.watchQueryClientDisconnect(execCtx, c.Context().Conn(), queryID, cancelTimeout, metrics.DisconnectPathSQLJSON)
 		results, err := h.parallelExecutor.ExecutePartitioned(
 			execCtx,
 			parallelInfo.Paths,
@@ -2342,7 +2370,7 @@ localProcessing:
 				}
 				// Per-handler client-disconnect counter (#426).
 				if isClientError(streamErr) {
-					m.IncQueryClientDisconnect(metrics.DisconnectPathSQLJSON)
+					recordDisconnect()
 				}
 				// Warn for client-disconnect / context expiry (headers already
 				// committed, partial result was delivered). Error for genuine
@@ -2384,12 +2412,7 @@ localProcessing:
 		if cancel == nil {
 			ctx, cancel = context.WithCancel(ctx)
 		}
-		watchClientDisconnect(ctx, c.Context().Conn(), func() {
-			if h.queryRegistry != nil && queryID != "" {
-				h.queryRegistry.Cancel(queryID)
-			}
-			cancel()
-		})
+		recordDisconnect := h.watchQueryClientDisconnect(ctx, c.Context().Conn(), queryID, cancel, metrics.DisconnectPathSQLJSON)
 
 		// arcx router hook. Decides eligibility on the RAW req.SQL (date_trunc
 		// still intact, before rewriteDateTrunc's epoch rewrite) and, in serve
@@ -2632,7 +2655,7 @@ localProcessing:
 				}
 				// Per-handler client-disconnect counter (#426).
 				if isClientError(streamErr) {
-					m.IncQueryClientDisconnect(metrics.DisconnectPathSQLJSON)
+					recordDisconnect()
 				}
 				// Warn for client-disconnect / context expiry (headers already
 				// committed, partial result was delivered). Error for genuine
@@ -5411,8 +5434,8 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	timestamp := time.Now().UTC().Format(time.RFC3339)
 
 	// Create context with timeout if configured (0 = no timeout).
-	// Same pattern as POST /api/v1/query: start from UserContext so client
-	// disconnects cancel the query, then wrap with queryTimeout (#308).
+	// Same pattern as POST /api/v1/query: start from UserContext, watch the
+	// client connection for disconnects, then wrap with queryTimeout (#308).
 	// A governance policy's MaxDuration overrides the global timeout (#702),
 	// matching the POST handler's effectiveTimeout semantics.
 	effectiveTimeout := h.queryTimeout
@@ -5470,6 +5493,10 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		// paths below), not deferred here, because SetBodyStreamWriter runs
 		// asynchronously after this function returns.
 	}
+	if cancel == nil {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	recordDisconnect := h.watchQueryClientDisconnect(ctx, c.Context().Conn(), queryID, cancel, metrics.DisconnectPathSQLJSON)
 
 	// Dispositions for the Arrow JSON path, which owns the response once it
 	// reports handled=true and streams asynchronously. Passing these rather
@@ -5599,7 +5626,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 			// uses the pure database/sql streaming JSON path same as the
 			// other sites above, so it shares the sql_json label.
 			if isClientError(streamErr) {
-				m.IncQueryClientDisconnect(metrics.DisconnectPathSQLJSON)
+				recordDisconnect()
 			}
 			// Warn for client-disconnect / context expiry (headers already
 			// committed, partial result was delivered). Error for genuine

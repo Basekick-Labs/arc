@@ -12,9 +12,11 @@ const clientDisconnectPollInterval = 250 * time.Millisecond
 // connection before the query has produced a response. fasthttp's request
 // context is only cancelled during server shutdown, so a non-consuming TCP
 // peek is used while DuckDB is still executing. If another request is pending,
-// monitoring stops and leaves those bytes for the HTTP server.
+// monitoring stops for this query and leaves those bytes for the HTTP server.
+// As with net/http request-context cancellation, a client half-close is treated
+// as a disconnect even if it still intends to read the response.
 func watchClientDisconnect(queryCtx context.Context, conn net.Conn, onDisconnect func()) {
-	if conn == nil || isSyntheticTestConn(conn) {
+	if conn == nil {
 		return
 	}
 
@@ -29,7 +31,8 @@ func watchClientDisconnect(queryCtx context.Context, conn net.Conn, onDisconnect
 			pending, disconnected, supported := peekClientConnection(conn)
 			if !supported || pending {
 				// A byte may belong to a pipelined keep-alive request. Leave it
-				// for the HTTP server rather than consuming it in this probe.
+				// for the HTTP server; monitoring ends, so a later disconnect on
+				// this connection will not be observed for this query.
 				return
 			}
 			if disconnected {
@@ -46,12 +49,4 @@ func watchClientDisconnect(queryCtx context.Context, conn net.Conn, onDisconnect
 			}
 		}
 	}()
-}
-
-// Fiber's in-process App.Test connection uses an empty byte buffer and a
-// zero-address TCPAddr. It reports EOF as soon as the request bytes have been
-// consumed, which is not a client disconnect and must not cancel test queries.
-func isSyntheticTestConn(conn net.Conn) bool {
-	addr, ok := conn.RemoteAddr().(*net.TCPAddr)
-	return ok && addr.Port == 0 && addr.IP.IsUnspecified()
 }

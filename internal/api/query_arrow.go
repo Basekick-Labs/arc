@@ -577,12 +577,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	if cancel == nil {
 		ctx, cancel = context.WithCancel(ctx)
 	}
-	watchClientDisconnect(ctx, c.Context().Conn(), func() {
-		if h.queryRegistry != nil && queryID != "" {
-			h.queryRegistry.Cancel(queryID)
-		}
-		cancel()
-	})
+	recordDisconnect := h.watchQueryClientDisconnect(ctx, c.Context().Conn(), queryID, cancel, metrics.DisconnectPathArrowIPC)
 
 	// The arcx hook may install an asynchronous stream writer. A successful
 	// hand-off transfers ownership of cancel and registry disposition to it.
@@ -648,9 +643,10 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			})
 		}
 		if ctxErr == context.Canceled {
-			// Cancelled through the registry (DELETE /api/v1/queries/:id), which
-			// already recorded the disposition. go-duckdb materializes the Arrow
-			// result inside QueryContext, so an operator cancel that lands during
+			// Cancelled through the registry (DELETE /api/v1/queries/:id or a
+			// client disconnect), which already recorded the disposition.
+			// go-duckdb materializes the Arrow result inside QueryContext, so an
+			// operator cancel that lands during
 			// execution — the common case for a long query — surfaces here as an
 			// error return, not as a mid-stream break with a truncation trailer.
 			m.IncQueryErrors()
@@ -823,12 +819,10 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			} else if h.queryRegistry != nil && queryID != "" {
 				h.queryRegistry.Fail(queryID, sqlutil.SanitizeErrText(streamErr.Error()))
 			}
-			// Per-handler client-disconnect counter (#426). Lets operators
-			// dashboard the rate without log-scraping. Only fires on
-			// client-side events (disconnect / deadline / context-cancel)
-			// — server-side stream failures stay in IncQueryErrors only.
+			// Per-handler client-disconnect counter (#426). The watcher and this
+			// streaming-error path share a once-only recorder.
 			if isClientError(streamErr) {
-				m.IncQueryClientDisconnect(metrics.DisconnectPathArrowIPC)
+				recordDisconnect()
 			}
 			// Tell the client its Arrow stream is short (#721). Skipped only
 			// when the socket is already gone: a server-side timeout is a

@@ -1,4 +1,4 @@
-//go:build aix || darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris
+//go:build darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris
 
 package api
 
@@ -42,7 +42,7 @@ func peekClientConnection(conn net.Conn) (pending, disconnected, supported bool)
 			case unix.EAGAIN:
 				return
 			default:
-				disconnected = true
+				disconnected, supported = classifyPeekError(recvErr)
 				return
 			}
 		}
@@ -51,4 +51,15 @@ func peekClientConnection(conn net.Conn) (pending, disconnected, supported bool)
 		return false, false, false
 	}
 	return pending, disconnected, supported
+}
+
+// classifyPeekError treats known peer shutdown errors as disconnects. Unknown
+// socket errors disable the watcher rather than cancelling a healthy query.
+func classifyPeekError(err error) (disconnected, supported bool) {
+	switch err {
+	case unix.ECONNRESET, unix.ECONNABORTED, unix.ESHUTDOWN:
+		return true, true
+	default:
+		return false, false
+	}
 }

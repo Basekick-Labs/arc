@@ -79,6 +79,24 @@ func TestWatchClientDisconnectStopsWithQuery(t *testing.T) {
 	}
 }
 
+func TestQueryHandlerCanDisableClientDisconnectCancellation(t *testing.T) {
+	serverConn, clientConn := newTCPConnPair(t)
+	queryCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	h := &QueryHandler{disableClientDisconnect: true}
+	h.watchQueryClientDisconnect(queryCtx, serverConn, "", cancel, "sql_json")
+	if err := clientConn.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-queryCtx.Done():
+		t.Fatal("disabled disconnect watcher cancelled the query")
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
 func TestWatchClientDisconnectPreservesPipelinedHTTPRequest(t *testing.T) {
 	serverConn, clientConn := newTCPConnPair(t)
 	reader := bufio.NewReader(serverConn)

@@ -195,6 +195,12 @@ func (r *Registry) TimedOut(queryID string) {
 
 // Cancel cancels a running query by ID. Returns true if the query was found and cancelled.
 func (r *Registry) Cancel(queryID string) bool {
+	return r.CancelWithReason(queryID, "")
+}
+
+// CancelWithReason cancels a running query and records why it was cancelled.
+// An empty reason preserves the existing API-cancel history and log message.
+func (r *Registry) CancelWithReason(queryID, reason string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -207,15 +213,20 @@ func (r *Registry) Cancel(queryID string) bool {
 	entry.query.Status = StatusCancelled
 	entry.query.EndTime = &now
 	entry.query.DurationMs = float64(now.Sub(entry.query.StartTime).Milliseconds())
+	entry.query.Error = reason
 
 	// Cancel the context — this propagates to DuckDB QueryContext
 	entry.cancel()
 
-	r.logger.Info().
+	event := r.logger.Info().
 		Str("query_id", queryID).
 		Int64("token_id", entry.query.TokenID).
-		Float64("duration_ms", entry.query.DurationMs).
-		Msg("Query cancelled via API")
+		Float64("duration_ms", entry.query.DurationMs)
+	if reason == "" {
+		event.Msg("Query cancelled via API")
+	} else {
+		event.Str("reason", reason).Msg("Query cancelled")
+	}
 
 	r.addToHistory(entry.query)
 	delete(r.active, queryID)

@@ -3289,6 +3289,7 @@ func main() {
 
 	// Register Query handler with dedicated query timeout and slow query logging
 	queryHandler := api.NewQueryHandler(db, storageBackend, logger.Get("query"), cfg.Query.Timeout, cfg.Query.SlowQueryThresholdMs)
+	queryHandler.SetCancelOnClientDisconnect(cfg.Query.CancelOnClientDisconnect)
 	if authManager != nil && rbacManager != nil {
 		queryHandler.SetAuthAndRBAC(authManager, rbacManager)
 	}

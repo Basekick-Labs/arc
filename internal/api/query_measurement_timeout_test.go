@@ -85,6 +85,9 @@ func TestQueryMeasurementNoTimeoutKeepsUserContext(t *testing.T) {
 	arrowJSONQueryFunc = func(h *QueryHandler, c *fiber.Ctx, ctx context.Context, cancel context.CancelFunc, convertedSQL string, profileMode bool, governanceMaxRows int, start time.Time, timestamp string, onComplete func(int), onFail func(string), onTimeout func()) (int, bool) {
 		gotCtx = ctx
 		gotCancel = cancel
+		if cancel != nil {
+			cancel()
+		}
 		return 0, true
 	}
 
@@ -107,8 +110,8 @@ func TestQueryMeasurementNoTimeoutKeepsUserContext(t *testing.T) {
 	if gotCtx == nil {
 		t.Fatal("queryMeasurement did not invoke Arrow dispatch with a context")
 	}
-	if gotCancel != nil {
-		t.Fatal("queryTimeout=0 should not allocate a timeout cancel func")
+	if gotCancel == nil {
+		t.Fatal("queryTimeout=0 still needs a cancel func for client disconnects")
 	}
 	if _, ok := gotCtx.Deadline(); ok {
 		t.Fatal("queryTimeout=0 must not attach a deadline")

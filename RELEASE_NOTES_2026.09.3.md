@@ -1306,6 +1306,19 @@ staging files, are unaffected.
 
 Contributed by [@pujitha24](https://github.com/pujitha24) in [#965](https://github.com/Basekick-Labs/arc/pull/965).
 
+### Cancel queries when the client disconnects ([#979](https://github.com/Basekick-Labs/arc/issues/979))
+
+Queries now stop when Arc detects that the client connection has closed before
+the response completes. This detection follows Go's `net/http` request-context
+semantics: a client that half-closes its write side after sending a request can
+be treated as disconnected even if it still intends to read the response. Set
+`query.cancel_on_client_disconnect = false` to disable cancellation for clients
+that use that pattern. When a pipelined request is already pending, Arc leaves
+its bytes for the HTTP parser and stops monitoring the connection for that
+query, so a later disconnect on the same connection is not observed.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#982](https://github.com/Basekick-Labs/arc/pull/982).
+
 ### One stale peer could block a file from replicating, and took the local copy with it ([#999](https://github.com/Basekick-Labs/arc/issues/999))
 
 On a per-node-storage cluster, the file puller asks candidate peers for a file

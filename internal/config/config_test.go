@@ -986,6 +986,9 @@ func TestQueryConfig_Defaults(t *testing.T) {
 	if cfg.Query.EnableS3Cache != false {
 		t.Errorf("Query.EnableS3Cache default = %v, want false", cfg.Query.EnableS3Cache)
 	}
+	if !cfg.Query.CancelOnClientDisconnect {
+		t.Error("Query.CancelOnClientDisconnect default = false, want true")
+	}
 	expectedSize := int64(128 * 1024 * 1024) // 128MB in bytes
 	if cfg.Query.S3CacheSize != expectedSize {
 		t.Errorf("Query.S3CacheSize default = %d, want %d (128MB)", cfg.Query.S3CacheSize, expectedSize)
@@ -1009,15 +1012,20 @@ func TestQueryConfig_EnvOverride(t *testing.T) {
 	os.Setenv("ARC_QUERY_ENABLE_S3_CACHE", "true")
 	os.Setenv("ARC_QUERY_S3_CACHE_SIZE", "256MB")
 	os.Setenv("ARC_QUERY_S3_CACHE_TTL_SECONDS", "7200")
+	os.Setenv("ARC_QUERY_CANCEL_ON_CLIENT_DISCONNECT", "false")
 	defer func() {
 		os.Unsetenv("ARC_QUERY_ENABLE_S3_CACHE")
 		os.Unsetenv("ARC_QUERY_S3_CACHE_SIZE")
 		os.Unsetenv("ARC_QUERY_S3_CACHE_TTL_SECONDS")
+		os.Unsetenv("ARC_QUERY_CANCEL_ON_CLIENT_DISCONNECT")
 	}()
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Query.CancelOnClientDisconnect {
+		t.Error("Query.CancelOnClientDisconnect env override = true, want false")
 	}
 
 	if cfg.Query.EnableS3Cache != true {
