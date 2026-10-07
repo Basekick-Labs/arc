@@ -1216,9 +1216,10 @@ func (b *LocalBackend) ListUnusable(ctx context.Context, prefix string) ([]Unusa
 		// compaction output as data an operator lost, on every backup, forever,
 		// which is both a constant false alarm and dangerous advice. Such an
 		// object is the staging namespace collision #744 exists to prevent, and
-		// it is reachable through StagingInspector rather than through nothing
-		// (though see #762: no caller enumerates staged partials under the data
-		// root yet, and ListStaged reports them under the base key).
+		// it is reachable through StagingInspector. ListStaged reports staged
+		// partials only when DeleteStaged accepts their stripped key (#772);
+		// database-drop and edge-sync reclaim loops consume that list. Partials
+		// with rejected keys are reported here.
 		if committed, ok := strings.CutSuffix(relPath, PartSuffix); ok && ValidateKey(committed) == nil {
 			if fi, statErr := os.Stat(b.pathPrefix + committed); statErr != nil || !fi.IsDir() {
 				return nil
