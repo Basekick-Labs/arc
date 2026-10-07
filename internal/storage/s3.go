@@ -1002,6 +1002,9 @@ func (b *S3Backend) HasObjectsUnderPrefix(ctx context.Context, prefix string) (b
 			ContinuationToken: continuationToken,
 		})
 		if err != nil {
+			if isNoSuchBucketError(err) {
+				return false, nil
+			}
 			return false, fmt.Errorf("failed to list S3 objects: %w", err)
 		}
 		for _, obj := range result.Contents {

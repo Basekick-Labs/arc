@@ -668,6 +668,9 @@ func (b *AzureBlobBackend) ListDirectories(ctx context.Context, prefix string) (
 
 		page, err := pager.NextPage(ctx)
 		if err != nil {
+			if isAzureContainerNotFoundError(err) {
+				return []string{}, nil
+			}
 			return nil, fmt.Errorf("failed to list Azure directories: %w", err)
 		}
 
@@ -713,6 +716,9 @@ func (b *AzureBlobBackend) ListObjects(ctx context.Context, prefix string) ([]Ob
 
 		page, err := pager.NextPage(ctx)
 		if err != nil {
+			if isAzureContainerNotFoundError(err) {
+				return []ObjectInfo{}, nil
+			}
 			return nil, fmt.Errorf("failed to list Azure blobs: %w", err)
 		}
 
@@ -762,6 +768,9 @@ func (b *AzureBlobBackend) HasObjectsUnderPrefix(ctx context.Context, prefix str
 		}
 		page, err := pager.NextPage(ctx)
 		if err != nil {
+			if isAzureContainerNotFoundError(err) {
+				return false, nil
+			}
 			return false, fmt.Errorf("failed to list Azure blobs: %w", err)
 		}
 		for _, blobItem := range page.Segment.BlobItems {
@@ -799,6 +808,9 @@ func (b *AzureBlobBackend) ListUnusable(ctx context.Context, prefix string) ([]U
 
 		page, err := pager.NextPage(ctx)
 		if err != nil {
+			if isAzureContainerNotFoundError(err) {
+				return []UnusableObject{}, nil
+			}
 			return nil, fmt.Errorf("failed to list Azure blobs: %w", err)
 		}
 
@@ -843,7 +855,7 @@ func isAzureContainerNotFoundError(err error) bool {
 	if errors.As(err, &responseError) {
 		return responseError.ErrorCode == "ContainerNotFound"
 	}
-	return strings.Contains(err.Error(), "ContainerNotFound")
+	return false
 }
 
 // isAzureNotFoundError checks if an error indicates the blob doesn't exist

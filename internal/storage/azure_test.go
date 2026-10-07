@@ -75,7 +75,48 @@ func TestIsAzureNotFoundError(t *testing.T) {
 	}
 }
 
-func TestAzureListTreatsMissingContainerAsEmpty(t *testing.T) {
+func TestAzureListingsTreatMissingContainerAsEmpty(t *testing.T) {
+	operations := []struct {
+		name string
+		call func(*AzureBlobBackend) (bool, error)
+	}{
+		{
+			name: "List",
+			call: func(b *AzureBlobBackend) (bool, error) {
+				items, err := b.List(context.Background(), "")
+				return len(items) == 0, err
+			},
+		},
+		{
+			name: "ListDirectories",
+			call: func(b *AzureBlobBackend) (bool, error) {
+				items, err := b.ListDirectories(context.Background(), "")
+				return len(items) == 0, err
+			},
+		},
+		{
+			name: "ListObjects",
+			call: func(b *AzureBlobBackend) (bool, error) {
+				items, err := b.ListObjects(context.Background(), "")
+				return len(items) == 0, err
+			},
+		},
+		{
+			name: "ListUnusable",
+			call: func(b *AzureBlobBackend) (bool, error) {
+				items, err := b.ListUnusable(context.Background(), "")
+				return len(items) == 0, err
+			},
+		},
+		{
+			name: "HasObjectsUnderPrefix",
+			call: func(b *AzureBlobBackend) (bool, error) {
+				hasObjects, err := b.HasObjectsUnderPrefix(context.Background(), "")
+				return !hasObjects, err
+			},
+		},
+	}
+
 	for _, tt := range []struct {
 		name        string
 		errorCode   string
@@ -103,19 +144,30 @@ func TestAzureListTreatsMissingContainerAsEmpty(t *testing.T) {
 				containerName: "fresh",
 				logger:        zerolog.Nop(),
 			}
-			objects, err := backend.List(context.Background(), "")
-			if tt.wantEmptyOK {
-				if err != nil {
-					t.Fatalf("List returned error for missing container: %v", err)
-				}
-				if len(objects) != 0 {
-					t.Fatalf("List returned %v, want empty", objects)
-				}
-				return
-			}
-			if err == nil {
-				t.Fatalf("List returned nil error for %s", tt.errorCode)
+			for _, operation := range operations {
+				t.Run(operation.name, func(t *testing.T) {
+					isEmpty, err := operation.call(backend)
+					if tt.wantEmptyOK {
+						if err != nil {
+							t.Fatalf("%s returned error for missing container: %v", operation.name, err)
+						}
+						if !isEmpty {
+							t.Fatalf("%s returned non-empty results for a missing container", operation.name)
+						}
+						return
+					}
+					if err == nil {
+						t.Fatalf("%s returned nil error for %s", operation.name, tt.errorCode)
+					}
+				})
 			}
 		})
+	}
+}
+
+func TestIsAzureContainerNotFoundErrorDoesNotMatchTransportText(t *testing.T) {
+	err := errors.New("GET https://account.example/ContainerNotFound/prefix: connection reset by peer")
+	if isAzureContainerNotFoundError(err) {
+		t.Fatal("isAzureContainerNotFoundError matched a transport error containing ContainerNotFound")
 	}
 }

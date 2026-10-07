@@ -448,6 +448,16 @@ Contributed by [@efegokdemir](https://github.com/efegokdemir) in
 [#1117](https://github.com/Basekick-Labs/arc/pull/1117), combined here with
 coverage from both contributions.
 
+### Missing object-store buckets and containers are empty on read paths ([#945](https://github.com/Basekick-Labs/arc/issues/945))
+
+Read-only operations treat a missing S3 bucket or Azure container as empty,
+including listing directories, listing objects, enumerating unusable objects,
+and checking whether a prefix contains objects. Only structured
+`NoSuchBucket` and `ContainerNotFound` responses are treated this way; transport,
+authorization, and other storage errors remain visible.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#950](https://github.com/Basekick-Labs/arc/pull/950).
+
 ### Float-to-integer conversion rejects the rounded upper bound and NaN ([#936](https://github.com/Basekick-Labs/arc/pull/936))
 
 Converting `math.MaxInt64` to a float rounds it to `2^63`, so the previous

@@ -82,11 +82,26 @@ func TestS3ListsTreatMissingBucketAsEmpty(t *testing.T) {
 			t.Fatalf("ListUnusable returned %v, want empty", objects)
 		}
 	})
+
+	t.Run("HasObjectsUnderPrefix", func(t *testing.T) {
+		hasObjects, err := s3ErrorBackend(t, "NoSuchBucket").HasObjectsUnderPrefix(ctx, "")
+		if err != nil {
+			t.Fatalf("HasObjectsUnderPrefix returned an error: %v", err)
+		}
+		if hasObjects {
+			t.Fatal("HasObjectsUnderPrefix returned true for a missing bucket")
+		}
+	})
 }
 
 func TestS3ListsPreserveOtherErrors(t *testing.T) {
 	_, err := s3ErrorBackend(t, "AccessDenied").List(context.Background(), "")
 	if err == nil {
 		t.Fatal("List returned nil error for AccessDenied")
+	}
+
+	_, err = s3ErrorBackend(t, "AccessDenied").HasObjectsUnderPrefix(context.Background(), "")
+	if err == nil {
+		t.Fatal("HasObjectsUnderPrefix returned nil error for AccessDenied")
 	}
 }
