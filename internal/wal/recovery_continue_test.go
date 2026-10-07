@@ -29,7 +29,8 @@ func TestColumnarReplayContinuesPastFailedEntry(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		payload, merr := msgpack.Marshal(map[string]interface{}{
-			"m": fmt.Sprintf("m%d", i),
+			"m":        fmt.Sprintf("m%d", i),
+			"tag_keys": []string{"host"},
 			"columns": map[string]interface{}{
 				"time": []interface{}{int64(1700000000000000 + i)},
 				"v":    []interface{}{int64(i)},
@@ -49,8 +50,11 @@ func TestColumnarReplayContinuesPastFailedEntry(t *testing.T) {
 	}
 
 	var attempted []string
-	columnarCallback := func(ctx context.Context, database, measurement string, columns map[string][]interface{}, _ string) error {
+	columnarCallback := func(ctx context.Context, database, measurement string, columns map[string][]interface{}, _ string, tagColumns []string) error {
 		attempted = append(attempted, measurement)
+		if len(tagColumns) != 1 || tagColumns[0] != "host" {
+			t.Errorf("tag columns = %v, want [host]", tagColumns)
+		}
 		if measurement == "m0" {
 			return fmt.Errorf("simulated poisoned entry")
 		}

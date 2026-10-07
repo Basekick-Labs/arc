@@ -18,8 +18,10 @@ type RecoveryCallback func(ctx context.Context, records []map[string]interface{}
 // walIdentity is the identity of the entry being replayed, so the re-buffered
 // batch can inherit it and have its eventual flush checkpoint the ORIGINAL
 // entry — which is what stops a later pass replaying it again. It is empty for
-// an entry that carries no tracked identity.
-type ColumnarRecoveryCallback func(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string) error
+// an entry that carries no tracked identity. database may be empty if the WAL
+// entry predates the envelope format (defaults to "default").
+// database may be empty if the WAL entry predates the envelope format (defaults to "default").
+type ColumnarRecoveryCallback func(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string, tagColumns []string) error
 
 // RecoveryStats holds statistics about WAL recovery
 type RecoveryStats struct {
@@ -183,7 +185,7 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 			// Dispatch based on entry format
 			if entry.ColumnarData != nil && opts.ColumnarCallback != nil {
 				// Columnar entry from zero-copy AppendRaw path
-				if err := opts.ColumnarCallback(ctx, entry.ColumnarData.Database, entry.ColumnarData.Measurement, entry.ColumnarData.Columns, entry.PayloadHash); err != nil {
+				if err := opts.ColumnarCallback(ctx, entry.ColumnarData.Database, entry.ColumnarData.Measurement, entry.ColumnarData.Columns, entry.PayloadHash, entry.ColumnarData.TagColumns); err != nil {
 					// #590: continue with the remaining entries instead of
 					// abandoning the rest of the file — one poisoned entry
 					// (e.g. a payload the write path rejects) must not
