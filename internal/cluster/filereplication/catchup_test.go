@@ -75,7 +75,7 @@ func TestRunCatchUpKeepsSizeOnlyFastPathWithoutSnapshot(t *testing.T) {
 	defer p.Stop()
 
 	p.RunCatchUp(context.Background(), sliceFetcher([]*raft.FileEntry{entry}))
-	stats := p.Stats()
+	stats := waitStats(t, p, func(s map[string]int64) bool { return s["catchup_skipped_local"] == 1 })
 	if stats["catchup_skipped_local"] != 1 {
 		t.Fatalf("normal catch-up did not keep size-only fast path: %+v", stats)
 	}
