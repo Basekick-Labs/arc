@@ -428,16 +428,35 @@ func (s *MetadataStore) GetFilesInTier(ctx context.Context, tier Tier) ([]FileMe
 // Quarantined rows are excluded: this is the migration candidate query, and a
 // quarantined file is one tiering has established it can never act on (#758).
 func (s *MetadataStore) GetFilesOlderThan(ctx context.Context, tier Tier, maxAge time.Duration) ([]FileMetadata, error) {
+	return s.GetFilesOlderThanFiltered(ctx, tier, maxAge, "", "")
+}
+
+// GetFilesOlderThanFiltered retrieves migration candidates older than the
+// specified age, optionally restricted to one database and/or measurement.
+// Filters are applied in SQL so a manual migration does not load unrelated
+// metadata into memory.
+func (s *MetadataStore) GetFilesOlderThanFiltered(ctx context.Context, tier Tier, maxAge time.Duration, database, measurement string) ([]FileMetadata, error) {
 	cutoff := time.Now().UTC().Add(-maxAge)
 
 	query := `
 		SELECT ` + tierFileColumns + `
 		FROM tier_files
 		WHERE tier = ? AND partition_time < ? AND quarantined_at IS NULL
-		ORDER BY partition_time ASC
 	`
+	args := []any{string(tier), cutoff}
 
-	rows, err := s.db.QueryContext(ctx, query, string(tier), cutoff)
+	if database != "" {
+		query += " AND database = ?"
+		args = append(args, database)
+	}
+	if measurement != "" {
+		query += " AND measurement = ?"
+		args = append(args, measurement)
+	}
+
+	query += " ORDER BY partition_time ASC"
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query old files: %w", err)
 	}

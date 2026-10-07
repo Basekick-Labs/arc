@@ -537,6 +537,37 @@ func (m *Manager) TriggerMigration(ctx context.Context) error {
 	return m.RunMigrationCycle(ctx)
 }
 
+// PreviewMigration returns the currently indexed candidates for a manual
+// filtered migration without copying, flipping metadata, or deleting files.
+func (m *Manager) PreviewMigration(ctx context.Context, fromTier, toTier Tier, database, measurement string) ([]MigrationCandidate, error) {
+	return m.migrator.FindCandidatesFiltered(ctx, fromTier, toTier, database, measurement)
+}
+
+// TriggerFilteredMigration runs a manual migration against an optional
+// database/measurement filter. It shares the cycle guard with the scheduler
+// so a manual request cannot race a scheduled migration.
+func (m *Manager) TriggerFilteredMigration(ctx context.Context, fromTier, toTier Tier, database, measurement string) (int, int, error) {
+	if m.roleGated() {
+		return 0, 0, ErrMigrationRoleGated
+	}
+	if !m.licenseClient.CanUseTieredStorage() {
+		return 0, 0, nil
+	}
+	if fromTier != TierHot || toTier != TierCold {
+		return 0, 0, fmt.Errorf("unsupported migration: %s -> %s (only hot -> cold supported)", fromTier, toTier)
+	}
+	if m.coldBackend == nil || !m.config.Cold.Enabled {
+		return 0, 0, fmt.Errorf("cold tier is not enabled")
+	}
+	if !m.cycleRunning.CompareAndSwap(false, true) {
+		return 0, 0, ErrMigrationCycleRunning
+	}
+	defer m.cycleRunning.Store(false)
+
+	migrated, failed := m.migrator.MigrateTierFiltered(ctx, fromTier, toTier, database, measurement)
+	return migrated, failed, nil
+}
+
 // GetBackendForTier returns the storage backend for a tier
 func (m *Manager) GetBackendForTier(tier Tier) storage.Backend {
 	switch tier {
