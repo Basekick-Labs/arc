@@ -1226,6 +1226,38 @@ fires no registration callbacks (#1071 tracks the snapshot side).
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#907](https://github.com/Basekick-Labs/arc/pull/907).
 
+### Compaction reuses local inputs and validates DuckDB paths ([#969](https://github.com/Basekick-Labs/arc/issues/969))
+
+For local storage, compaction reads Parquet inputs from their existing paths
+instead of first copying them into the compaction temporary directory. This
+removes the input-staging copy, but DuckDB still reads the inputs and compaction
+still writes and uploads its output. Reads therefore remain on the data volume;
+operators who place `compaction.temp_directory` on a separate volume should
+account for that change.
+
+The input-copy byte figure in the acceptance harness is calculated from input
+file sizes, not measured storage I/O. Arc's parent `/metrics` endpoint does not
+aggregate storage counters from compaction subprocesses, so those counters
+cannot measure compaction reads or writes. The optional large-partition run
+records cycle wall time and sampled peak temporary-directory usage; its 10 ms
+sampling interval can miss short-lived peaks.
+
+In a single same-settings comparison with 42 Parquet inputs, 1.05 million rows
+and 9,130,407 input bytes, the baseline and this change completed in 0.905 s
+and 0.894 s. Sampled temporary-directory peaks were 1,878,338 bytes and
+356,610 bytes, respectively. The harness calculates 9,130,407 baseline input
+copy bytes versus zero with local-path reuse; it does not measure total disk
+I/O. This one run does not establish a throughput improvement.
+
+An input that disappears before validation is skipped safely. If it disappears
+after validation and before DuckDB reads it, the batch fails as a permanent
+missing-input error without adaptive splitting or retries; surviving inputs
+remain in storage for the next cycle to rediscover. Glob-sensitive paths are
+rejected before they reach DuckDB, and Hive partition inference is disabled for
+compaction reads.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#990](https://github.com/Basekick-Labs/arc/pull/990).
+
 ## Internal changes
 
 These do not change how Arc behaves. They are here because the codebase is the
