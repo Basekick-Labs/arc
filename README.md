@@ -332,7 +332,7 @@ CMVP-certified; Arc itself is not a CMVP-listed module. See the
 - **Reliability**: Circuit breakers, retry with exponential backoff
 - **Supply chain**: SBOM (SPDX + CycloneDX), Trivy scans, cosign-signed releases, SLSA L3 provenance
 - **FIPS 140-3**: Optional `arc-fips` build against the CMVP-certified Go Cryptographic Module — see [Installation](#fips-140-3-build)
-- **Edge Sync** (new in 26.09.1): Spoke-to-hub data transport for disconnected operations, over the network or via signed air-gap bundles
+- **Edge Sync** (new in 26.09.1): Spoke-to-hub data transport for disconnected operations, over the network or via signed air-gap bundles. Network spokes retain the manual trigger; a valid paid license also schedules sync. Configure `edge_sync.spoke.sync_interval` (default `5m`) and `edge_sync.spoke.sync_retry_interval` (default `30s`) to set the success and retry cadence.
 
 ---
 

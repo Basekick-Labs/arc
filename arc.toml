@@ -276,6 +276,20 @@ enabled = false
 # default_max_rows_per_query = 0
 
 # -----------------------------------------------------------------------------
+# Scheduled network spoke sync (valid paid license required, as for CQ/retention).
+# Manual network sync and air-gap bundle export remain available without a license.
+# A network spoke also needs its hub URL, identities and environment-only credentials.
+#
+# [edge_sync.spoke]
+# enabled = false
+# sync_interval = "5m"         # Delay after a completed pass; at least 1s
+# sync_retry_interval = "30s"  # Initial retry; doubles up to sync_interval
+#                             # At least 1s and shorter than sync_interval
+# Environment overrides:
+# ARC_EDGE_SYNC_SPOKE_SYNC_INTERVAL
+# ARC_EDGE_SYNC_SPOKE_SYNC_RETRY_INTERVAL
+#
+# -----------------------------------------------------------------------------
 # Telemetry
 # -----------------------------------------------------------------------------
 [telemetry]

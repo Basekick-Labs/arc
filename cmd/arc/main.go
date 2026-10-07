@@ -3008,6 +3008,7 @@ func main() {
 		// The network agent. Skipped entirely on a fully air-gapped spoke,
 		// which has no hub URL to build a transport from.
 		var syncAgent *edgesync.Agent
+		var automaticSync bool
 		if cfg.EdgeSync.Spoke.Enabled {
 			if cfg.EdgeSync.Spoke.HubToken == "" {
 				log.Warn().Msg("ARC_EDGE_SYNC_HUB_TOKEN is not set; a hub running with auth enabled " +
@@ -3106,6 +3107,49 @@ func main() {
 		}
 		spokeHandler.RegisterRoutes(server.GetApp())
 
+		// Automatic spoke sync is the paid scheduling phase of edge sync. The
+		// existing enabled flag is the operator's explicit opt-in to moving
+		// data off this node; without a valid paid license, the manual
+		// endpoint remains available as before.
+		if syncAgent != nil {
+			if licenseClient != nil && licenseClient.CanUseEdgeSyncScheduler() {
+				var writerGate edgesync.WriterGate
+				if clusterCoordinator != nil {
+					writerGate = newWriterClusterGate(clusterCoordinator)
+				}
+				syncScheduler, err := edgesync.NewScheduler(edgesync.SchedulerConfig{
+					Agent:         syncAgent,
+					LicenseClient: licenseClient,
+					SyncInterval:  cfg.EdgeSync.Spoke.SyncInterval,
+					RetryInterval: cfg.EdgeSync.Spoke.SyncRetryInterval,
+					Enabled:       true,
+					ClusterGate:   writerGate,
+					Metrics:       metrics.Get(),
+					Logger:        spokeLogger,
+				})
+				if err != nil {
+					log.Fatal().Err(err).Msg("Failed to configure the edge sync scheduler; refusing to start")
+				}
+				if err := syncScheduler.Start(); err != nil {
+					log.Fatal().Err(err).Msg("Failed to start the edge sync scheduler; refusing to start")
+				}
+				shutdownCoordinator.RegisterHook("edgesync-scheduler", func(context.Context) error {
+					syncScheduler.Stop()
+					return nil
+				}, shutdown.PriorityScheduler)
+				automaticSync = syncScheduler.IsRunning()
+				if automaticSync {
+					metrics.Get().EnableEdgeSyncSpokeScheduler()
+					spokeLogger.Info().
+						Dur("sync_interval", cfg.EdgeSync.Spoke.SyncInterval).
+						Dur("retry_interval", cfg.EdgeSync.Spoke.SyncRetryInterval).
+						Msg("Paid edge sync scheduler enabled")
+				}
+			} else {
+				spokeLogger.Info().Msg("Automatic edge sync requires a valid paid license; manual sync remains available")
+			}
+		}
+
 		// Reports what is actually enabled: an air-gap-only spoke has no hub
 		// URL and no /run endpoint, so claiming both would send an operator
 		// looking for a route that returns 503.
@@ -3118,9 +3162,17 @@ func main() {
 		}
 		switch {
 		case syncAgent != nil && bundleExporter != nil:
-			evt.Msg("Edge sync spoke enabled; POST /api/v1/spoke-sync/run to sync, /export for an air-gap bundle")
+			if automaticSync {
+				evt.Msg("Edge sync spoke enabled; scheduled and manual network sync are available, /export writes an air-gap bundle")
+			} else {
+				evt.Msg("Edge sync spoke enabled; trigger network sync with POST /api/v1/spoke-sync/run, /export writes an air-gap bundle")
+			}
 		case syncAgent != nil:
-			evt.Msg("Edge sync spoke enabled; trigger a pass with POST /api/v1/spoke-sync/run")
+			if automaticSync {
+				evt.Msg("Edge sync spoke enabled; scheduled sync is active and POST /api/v1/spoke-sync/run triggers a manual pass")
+			} else {
+				evt.Msg("Edge sync spoke enabled; trigger a pass with POST /api/v1/spoke-sync/run")
+			}
 		default:
 			evt.Msg("Edge sync air-gap export enabled; write a bundle with POST /api/v1/spoke-sync/export")
 		}
