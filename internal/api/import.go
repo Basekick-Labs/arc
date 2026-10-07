@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/gofiber/fiber/v2"
@@ -64,6 +65,7 @@ type ImportHandler struct {
 	// admin-tier auth because they rewrite historical data.
 	authManager *auth.AuthManager
 	rbacManager RBACChecker
+	router      *cluster.Router
 
 	// Stats
 	totalRequests atomic.Int64
@@ -91,6 +93,41 @@ func (h *ImportHandler) SetAuthAndRBAC(authManager *auth.AuthManager, rbacManage
 	h.rbacManager = rbacManager
 }
 
+// SetRouter configures cluster write forwarding for import requests.
+func (h *ImportHandler) SetRouter(router *cluster.Router) {
+	h.router = router
+}
+
+func (h *ImportHandler) forwardWriteIfNeeded(c *fiber.Ctx) (bool, error) {
+	switch WriteForwardDecision(h.router, c) {
+	case ForwardAlreadyForwarded:
+		h.totalErrors.Add(1)
+		return true, RespondAlreadyForwarded(c)
+	case ForwardToPeer:
+		req, err := BuildHTTPRequest(c)
+		if err != nil {
+			h.totalErrors.Add(1)
+			h.logger.Error().Err(err).Msg("Failed to build import request for forwarding")
+			return true, c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to prepare request for forwarding",
+			})
+		}
+
+		resp, err := h.router.RouteWrite(c.Context(), req)
+		if err == cluster.ErrLocalNodeCanHandle {
+			return false, nil
+		}
+		if err != nil {
+			h.totalErrors.Add(1)
+			h.logger.Error().Err(err).Msg("Failed to route import request")
+			return true, HandleRoutingError(c, err)
+		}
+		return true, CopyResponse(c, resp)
+	default:
+		return false, nil
+	}
+}
+
 // RegisterRoutes registers import API routes. Import endpoints write
 // historical data and use admin-tier auth (not write-tier) — bulk
 // imports can rewrite or supplant existing partitions, so the
@@ -111,6 +148,9 @@ func (h *ImportHandler) RegisterRoutes(app *fiber.App) {
 // Uses the same ArrowBuffer ingest pipeline as streaming LP ingestion.
 func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
+	if handled, err := h.forwardWriteIfNeeded(c); handled {
+		return err
+	}
 	start := time.Now()
 
 	// c.Get / c.Query are zero-copy aliases into the fasthttp request buffer.
@@ -384,6 +424,9 @@ func (h *ImportHandler) importErrorResponse(c *fiber.Ctx, err error) error {
 // Uses the same ArrowBuffer ingest pipeline as streaming TLE ingestion.
 func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
+	if handled, err := h.forwardWriteIfNeeded(c); handled {
+		return err
+	}
 	start := time.Now()
 
 	// strings.Clone: c.Get/c.Query alias the fasthttp buffer and this database is

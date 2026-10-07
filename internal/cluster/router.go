@@ -332,22 +332,39 @@ func (r *Router) doForward(ctx context.Context, node *Node, originalReq *http.Re
 		RawQuery: originalReq.URL.RawQuery,
 	}).String()
 
-	// Read and buffer the body so it can be retried
+	// Use GetBody when available so large payloads can be streamed from a
+	// replayable source on each attempt without an additional full-body copy.
+	// Requests without a replayable body keep the buffering fallback needed
+	// for retries.
 	var bodyBytes []byte
+	var body io.Reader
 	if originalReq.Body != nil {
-		var err error
-		bodyBytes, err = io.ReadAll(originalReq.Body)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read request body: %w", err)
+		if originalReq.GetBody != nil {
+			var err error
+			body, err = originalReq.GetBody()
+			if err != nil {
+				return nil, fmt.Errorf("failed to recreate request body: %w", err)
+			}
+		} else {
+			var err error
+			bodyBytes, err = io.ReadAll(originalReq.Body)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read request body: %w", err)
+			}
+			// Reset the original request body for potential retries.
+			originalReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			body = bytes.NewReader(bodyBytes)
 		}
-		// Reset the original request body for potential retries
-		originalReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}
 
 	// Create forwarded request
-	forwardReq, err := http.NewRequestWithContext(ctx, originalReq.Method, targetURL, bytes.NewReader(bodyBytes))
+	forwardReq, err := http.NewRequestWithContext(ctx, originalReq.Method, targetURL, body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create forward request: %w", err)
+	}
+	if originalReq.Body != nil && originalReq.GetBody != nil {
+		forwardReq.ContentLength = originalReq.ContentLength
+		forwardReq.GetBody = originalReq.GetBody
 	}
 
 	// Copy headers
