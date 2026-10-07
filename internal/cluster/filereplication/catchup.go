@@ -37,7 +37,7 @@ type manifestWalkResult struct {
 // means no more pages. This avoids allocating a full O(N) snapshot of the
 // manifest.
 //
-// RunCatchUp does NOT itself talk to peers or verify files. It relies on the
+// RunCatchUp does NOT itself talk to peers or verify file content. It relies on the
 // inflight dedup set (so reactive FSM callbacks can race without
 // double-pulling) and the workers' backend checks; the one check it makes
 // itself is the disk presence of a self-origin entry when
@@ -56,6 +56,18 @@ type manifestWalkResult struct {
 // method returns when all entries have been processed (enqueued or skipped) or
 // ctx is cancelled; it does not wait for actual pulls to complete.
 func (p *Puller) RunCatchUp(ctx context.Context, fetch func(cursor string, limit int) ([]*raft.FileEntry, string, error)) {
+	p.runCatchUp(ctx, fetch, false)
+}
+
+// RunCatchUpWithContentVerification runs the startup catch-up with content
+// verification enabled for same-size local files. The coordinator uses this
+// only when the FSM actually restored a snapshot; ordinary boots keep the
+// size-only fast path.
+func (p *Puller) RunCatchUpWithContentVerification(ctx context.Context, fetch func(cursor string, limit int) ([]*raft.FileEntry, string, error)) {
+	p.runCatchUp(ctx, fetch, true)
+}
+
+func (p *Puller) runCatchUp(ctx context.Context, fetch func(cursor string, limit int) ([]*raft.FileEntry, string, error), verifyContent bool) {
 	// Single-shot guard: only one catch-up per puller lifetime.
 	if !p.catchupStartedAt.CompareAndSwap(0, time.Now().Unix()) {
 		p.logger.Debug().Msg("File puller catch-up already ran, skipping")
@@ -65,7 +77,7 @@ func (p *Puller) RunCatchUp(ctx context.Context, fetch func(cursor string, limit
 
 	p.reconciliationMu.Lock()
 	defer p.reconciliationMu.Unlock()
-	p.walkManifest(ctx, fetch, true)
+	p.walkManifest(ctx, fetch, true, verifyContent)
 }
 
 // selfOriginPresent reports whether a self-origin entry may be skipped by a
@@ -97,7 +109,7 @@ func (p *Puller) RunReconciliation(ctx context.Context, fetch func(cursor string
 	defer p.reconciliationMu.Unlock()
 
 	p.recheckStarted.Add(1)
-	result := p.walkManifest(ctx, fetch, false)
+	result := p.walkManifest(ctx, fetch, false, false)
 	p.recheckEntriesWalked.Add(result.entriesWalked)
 	p.recheckEnqueued.Add(result.enqueued)
 	p.recheckSkipped.Add(result.skipped)
@@ -127,7 +139,7 @@ func lifecycleDone(ctx context.Context) <-chan struct{} {
 // the #392 metrics and path bookkeeping; periodic walks use separate metrics,
 // never create or remove startup tags, and can heal existing path-scoped
 // failure/drop state only when their pull succeeds.
-func (p *Puller) walkManifest(ctx context.Context, fetch func(cursor string, limit int) ([]*raft.FileEntry, string, error), startup bool) manifestWalkResult {
+func (p *Puller) walkManifest(ctx context.Context, fetch func(cursor string, limit int) ([]*raft.FileEntry, string, error), startup, verifyContent bool) manifestWalkResult {
 	result := manifestWalkResult{status: manifestWalkCompleted}
 	if startup {
 		p.logger.Info().Msg("File puller catch-up started (paginated)")
@@ -277,7 +289,7 @@ func (p *Puller) walkManifest(ctx context.Context, fetch func(cursor string, lim
 			// A same-size local object can therefore be an older generation and must be
 			// verified by content during the startup catch-up walk. The normal reactive
 			// path keeps its cheap size-only check.
-			if startup {
+			if startup && verifyContent {
 				localSize, statErr := p.statLocal(entry.Path)
 				if presentAtSize(localSize, statErr, entry.SizeBytes) {
 					matches, hashErr := p.localFileMatchesEntry(entry.Path, entry.SHA256)

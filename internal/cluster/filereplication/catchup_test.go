@@ -35,7 +35,7 @@ func TestRunCatchUpDetectsSameSizeStaleCopy(t *testing.T) {
 	p.Start(context.Background())
 	defer p.Stop()
 
-	p.RunCatchUp(context.Background(), sliceFetcher([]*raft.FileEntry{entry}))
+	p.RunCatchUpWithContentVerification(context.Background(), sliceFetcher([]*raft.FileEntry{entry}))
 	stats := waitStats(t, p, func(s map[string]int64) bool { return s["pulled"] == 1 })
 	if stats["pulled"] != 1 {
 		t.Fatalf("same-size stale copy was skipped: %+v", stats)
@@ -67,7 +67,7 @@ func TestRunCatchUpSkipsSameSizeMatchingCopy(t *testing.T) {
 	p.Start(context.Background())
 	defer p.Stop()
 
-	p.RunCatchUp(context.Background(), sliceFetcher([]*raft.FileEntry{entry}))
+	p.RunCatchUpWithContentVerification(context.Background(), sliceFetcher([]*raft.FileEntry{entry}))
 	stats := p.Stats()
 	if stats["catchup_skipped_local"] != 1 {
 		t.Fatalf("matching file was not skipped: %+v", stats)

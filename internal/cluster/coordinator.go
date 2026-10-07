@@ -4356,9 +4356,14 @@ func (c *Coordinator) runCatchUpOnce() {
 		// stable for the lifetime of the node — hashicorp/raft never
 		// replaces the FSM instance once set. The nil guard above ensures
 		// the capture is safe even if the puller outlives the coordinator.
-		puller.RunCatchUp(ctx, func(cursor string, limit int) ([]*raft.FileEntry, string, error) {
+		fetchManifest := func(cursor string, limit int) ([]*raft.FileEntry, string, error) {
 			return fsm.GetFilesPaginated(cursor, limit)
-		})
+		}
+		if raftFSM, ok := fsm.(*raft.ClusterFSM); ok && raftFSM.RestoredFromSnapshot() {
+			puller.RunCatchUpWithContentVerification(ctx, fetchManifest)
+		} else {
+			puller.RunCatchUp(ctx, fetchManifest)
+		}
 	})
 }
 
