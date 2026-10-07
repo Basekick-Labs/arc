@@ -53,7 +53,12 @@ func TestCycleWorkerWaitCancellationAccountingIssue915(t *testing.T) {
 	manager.MaxConcurrent = 1
 
 	started := make(chan struct{})
-	secondFiltered := make(chan struct{})
+	secondBatchDiscovered := make(chan struct{})
+	manager.afterBatchDiscoveryForTest = func(discovered int64) {
+		if discovered == 2 {
+			close(secondBatchDiscovered)
+		}
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -63,21 +68,6 @@ func TestCycleWorkerWaitCancellationAccountingIssue915(t *testing.T) {
 		<-ctx.Done()
 		return ctx.Err()
 	}
-
-	filterCalls := 0
-	manager.SetSyncEligibility(func(
-		_ context.Context, paths []string,
-	) (map[string]bool, error) {
-		filterCalls++
-		if filterCalls == 2 {
-			close(secondFiltered)
-		}
-		eligible := make(map[string]bool, len(paths))
-		for _, path := range paths {
-			eligible[path] = true
-		}
-		return eligible, nil
-	})
 
 	manager.Tiers = []Tier{cycleTierIssue915{
 		find: func(context.Context, string, string) ([]Candidate, error) {
@@ -96,7 +86,7 @@ func TestCycleWorkerWaitCancellationAccountingIssue915(t *testing.T) {
 		done <- err
 	}()
 
-	for _, signal := range []<-chan struct{}{started, secondFiltered} {
+	for _, signal := range []<-chan struct{}{started, secondBatchDiscovered} {
 		select {
 		case <-signal:
 		case <-time.After(10 * time.Second):
