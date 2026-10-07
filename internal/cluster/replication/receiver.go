@@ -280,7 +280,7 @@ func (r *Receiver) connect() error {
 	}
 
 	// Connect with timeout (TLS if configured)
-	conn, err := security.Dial("tcp", r.cfg.WriterAddr, 10*time.Second, r.cfg.TLSConfig)
+	conn, err := security.DialContext(r.ctx, "tcp", r.cfg.WriterAddr, 10*time.Second, r.cfg.TLSConfig)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
