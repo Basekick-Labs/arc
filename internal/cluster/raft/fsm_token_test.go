@@ -194,6 +194,29 @@ func TestApplyCreateToken_RejectsDuplicateName(t *testing.T) {
 	if fsm.TokenCount() != 1 {
 		t.Errorf("duplicate must not land: count=%d", fsm.TokenCount())
 	}
+	if fsm.RejectedTokensCount() != 0 {
+		t.Errorf("same-name conflict should not count as a malformed rejection: count=%d", fsm.RejectedTokensCount())
+	}
+}
+
+func TestApplyCreateToken_IgnoresIdenticalDuplicate(t *testing.T) {
+	fsm := newTestFSMWithBootstrapNode(t)
+	tok := makeTokenEntry("admin")
+	cmd := makeTokenCommand(t, CommandCreateToken, CreateTokenPayload{Token: tok})
+	if r := fsm.Apply(&raft.Log{Data: cmd, Index: 1}); r != nil {
+		t.Fatalf("first create should succeed: %v", r)
+	}
+
+	result := fsm.Apply(&raft.Log{Data: cmd, Index: 2})
+	if result != nil {
+		t.Fatalf("identical duplicate should be ignored: %v", result)
+	}
+	if fsm.TokenCount() != 1 {
+		t.Errorf("identical duplicate must not add a token: count=%d", fsm.TokenCount())
+	}
+	if fsm.RejectedTokensCount() != 0 {
+		t.Errorf("identical duplicate should not be rejected: count=%d", fsm.RejectedTokensCount())
+	}
 }
 
 func TestApplyCreateToken_StampsLogIndexAsID(t *testing.T) {

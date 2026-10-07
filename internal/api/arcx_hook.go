@@ -449,24 +449,48 @@ type arcxMetrics struct {
 	logger zerolog.Logger
 }
 
+// Each outcome bumps a real counter as well as logging. Logs alone were not enough:
+// `skipped` is Debug, so at the default level a shed sample was invisible and read
+// as "it matched" — which is how a deterministic shadow bug looked intermittent and
+// why its fix could not be validated by eye. See internal/metrics/arcx_shadow.go.
 func (m arcxMetrics) ArcxShadowMatch(shape string) {
+	metrics.Get().IncArcxShadowOutcome(metrics.ShadowMatch)
 	m.logger.Debug().Str("shape", shape).Msg("arcx shadow: match")
 }
 func (m arcxMetrics) ArcxShadowArgDivergence(shape string) {
+	metrics.Get().IncArcxShadowOutcome(metrics.ShadowArgDiff)
 	m.logger.Warn().Str("shape", shape).Msg("arcx shadow: arg-item divergence metric (tie candidate)")
 }
 func (m arcxMetrics) ArcxShadowMismatch(shape string) {
+	metrics.Get().IncArcxShadowOutcome(metrics.ShadowMismatch)
 	m.logger.Warn().Str("shape", shape).Msg("arcx shadow: mismatch metric")
 }
 func (m arcxMetrics) ArcxShadowError(shape string) {
+	metrics.Get().IncArcxShadowOutcome(metrics.ShadowError)
 	m.logger.Warn().Str("shape", shape).Msg("arcx shadow: error metric")
 }
-func (m arcxMetrics) ArcxShadowSkipped(shape string) {
+func (m arcxMetrics) ArcxServeError(shape string) {
+	// SERVE-path engine failure. Kept out of the shadow counters so a serve-mode
+	// dashboard does not report "shadow errors" while no shadow run exists.
+	m.logger.Warn().Str("shape", shape).Msg("arcx serve: error metric")
+}
+func (m arcxMetrics) ArcxShadowOracleError(shape string) {
+	metrics.Get().IncArcxShadowOutcome(metrics.ShadowOracleError)
+	m.logger.Warn().Str("shape", shape).Msg("arcx shadow: oracle error metric")
+}
+func (m arcxMetrics) ArcxShadowPanic(shape string) {
+	metrics.Get().IncArcxShadowOutcome(metrics.ShadowPanic)
+	m.logger.Error().Str("shape", shape).Msg("arcx shadow: recovered panic metric")
+}
+func (m arcxMetrics) ArcxShadowSkipped(shape, reason string) {
+	metrics.Get().IncArcxShadowOutcome(reason)
 	// Debug, not Warn: a skipped sample is expected under load or on a huge result —
-	// it is not evidence that arcx is wrong.
-	m.logger.Debug().Str("shape", shape).Msg("arcx shadow: sample skipped")
+	// it is not evidence that arcx is wrong. The COUNTER is what makes it visible,
+	// and the reason is what makes it actionable.
+	m.logger.Debug().Str("shape", shape).Str("reason", reason).Msg("arcx shadow: sample skipped")
 }
 func (m arcxMetrics) ArcxShadowDeclined(shape string) {
+	metrics.Get().IncArcxShadowOutcome(metrics.ShadowDeclined)
 	m.logger.Debug().Str("shape", shape).Msg("arcx shadow: declined")
 }
 func (m arcxMetrics) ArcxLatency(engine, shape string, micros int64) {

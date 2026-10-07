@@ -30,7 +30,7 @@ func TestPartitionValidKeysGuardsAzureBatchDeletes(t *testing.T) {
 	} {
 		// Bad key in the middle, so a bug that stops at the first rejection
 		// still loses good2.
-		usable, rejected := partitionValidKeys([]string{good1, bad, good2})
+		usable, rejected := partitionValidKeys("", []string{good1, bad, good2})
 
 		if len(rejected) != 1 {
 			t.Errorf("key %q: rejected %d keys, want 1", bad, len(rejected))
@@ -52,12 +52,12 @@ func TestPartitionValidKeysGuardsAzureBatchDeletes(t *testing.T) {
 }
 
 // TestPartitionValidKeysPassesACleanBatchThrough pins that validation does not
-// rewrite or reorder anything on the ordinary path. Azure has no prefix, so the
-// key IS the blob name and any transformation here would be a wrong delete of
-// its own.
+// rewrite or reorder anything on the ordinary path. With no prefix configured
+// the key IS the blob name, and any transformation here would be a wrong
+// delete of its own.
 func TestPartitionValidKeysPassesACleanBatchThrough(t *testing.T) {
 	in := []string{"a/b.parquet", "a/c.parquet", "d/e..f.parquet"}
-	usable, rejected := partitionValidKeys(in)
+	usable, rejected := partitionValidKeys("", in)
 	if len(rejected) != 0 {
 		t.Fatalf("rejected %v from a clean batch", rejected)
 	}
@@ -68,5 +68,40 @@ func TestPartitionValidKeysPassesACleanBatchThrough(t *testing.T) {
 		if usable[i] != in[i] {
 			t.Fatalf("key %d changed: %q became %q", i, in[i], usable[i])
 		}
+	}
+}
+
+// With a prefix configured, DeleteBatch is the one key-taking method whose
+// keys never pass through prefixedKey: the usable names go straight to the
+// batch builder. Validating without prefixing would address the container
+// root, so a batch would delete nothing it was asked to and could delete
+// something it was not (#1102).
+func TestPartitionValidKeysPrefixesTheBlobNames(t *testing.T) {
+	in := []string{"a/b.parquet", "a/c.parquet"}
+	usable, rejected := partitionValidKeys("arc/", in)
+	if len(rejected) != 0 {
+		t.Fatalf("rejected %v from a clean batch", rejected)
+	}
+	want := []string{"arc/a/b.parquet", "arc/a/c.parquet"}
+	if len(usable) != len(want) {
+		t.Fatalf("usable = %v, want %v", usable, want)
+	}
+	for i := range want {
+		if usable[i] != want[i] {
+			t.Errorf("key %d = %q, want %q", i, usable[i], want[i])
+		}
+	}
+
+	// A rejected key is rejected on its UNPREFIXED spelling, so the error the
+	// caller sees names the key the caller passed.
+	_, rejected = partitionValidKeys("arc/", []string{`a\b.parquet`})
+	if len(rejected) != 1 {
+		t.Fatalf("rejected %d keys, want 1", len(rejected))
+	}
+	if !errors.Is(rejected[0], ErrInvalidPath) {
+		t.Errorf("rejection %v does not match ErrInvalidPath", rejected[0])
+	}
+	if strings.Contains(rejected[0].Error(), "arc/") {
+		t.Errorf("rejection %v names the prefixed blob name; it must name the key the caller passed", rejected[0])
 	}
 }

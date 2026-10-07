@@ -183,7 +183,7 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 	// Validate the prefix rather than repairing it. A prefix that cannot form
 	// usable keys must stop the backend from being built: the old fallback was
 	// the bucket root, which is a different location, not a safe default.
-	prefix, err := ValidateS3Prefix(cfg.Prefix)
+	prefix, err := ValidateObjectPrefix(cfg.Prefix)
 	if err != nil {
 		return nil, err
 	}
@@ -775,53 +775,6 @@ func isNotFoundError(err error) bool {
 		strings.Contains(errStr, "404")
 }
 
-// ValidateS3Prefix checks a configured bucket prefix and returns it with a
-// trailing separator.
-//
-// It validates rather than rewrites. The previous SanitizeS3Prefix repaired its
-// input, and the damage was on its SUCCESS path, not its failure path:
-//
-//	"/"      -> "/"      every key then starts with "/", which MinIO folds away
-//	"a//b"   -> "a//b/"  every write 400s with XMinioInvalidObjectName
-//	"."      -> "./"     every write 400s with XMinioInvalidResourceName
-//	"a/..b"  -> ""       a legitimate prefix silently becomes the BUCKET ROOT
-//
-// The last is the worst of them: "" is not a safe fallback, it is a different
-// and much larger location, so a typo relocated an entire deployment without a
-// word. The ".." rejection that caused it was also a raw substring match, the
-// same class this repo removed for keys in #741.
-//
-// An empty prefix is legitimate and means the bucket root was chosen
-// deliberately.
-func ValidateS3Prefix(prefix string) (string, error) {
-	prefix = strings.TrimSpace(prefix)
-	if prefix == "" {
-		return "", nil
-	}
-	// Reuse the key contract, which already rejects leading "/", "." and ".."
-	// segments, empty interior segments, backslash and NUL. A trailing
-	// separator is what a prefix is for, so strip it before checking and add
-	// it back after.
-	if err := ValidateListPrefix(prefix); err != nil {
-		return "", fmt.Errorf("storage prefix %q is not usable: %w", prefix, err)
-	}
-	// Defence in depth against SQL injection: the prefix is interpolated into
-	// DuckDB read_parquet() calls, so keep the character allowlist the old
-	// implementation had.
-	for _, c := range prefix {
-		switch {
-		case (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'):
-		case c == '/' || c == '-' || c == '_' || c == '.':
-		default:
-			return "", fmt.Errorf("storage prefix %q contains an unsupported character %q", prefix, c)
-		}
-	}
-	if !strings.HasSuffix(prefix, "/") {
-		prefix += "/"
-	}
-	return prefix, nil
-}
-
 // prefixedKey validates a storage key and prepends the configured prefix.
 //
 // Returning an error is what makes the contract hold: a new method that builds
@@ -1009,6 +962,45 @@ func (b *S3Backend) ListObjects(ctx context.Context, prefix string) ([]ObjectInf
 	}
 
 	return objects, nil
+}
+
+// HasObjectsUnderPrefix implements PrefixProber: it pages ListObjectsV2 under
+// the same prefix ListObjects would use and returns at the first key the
+// contract accepts. The continuation token is followed only while every key
+// of a page was one ListObjects would hide, so a prefix holding nothing but
+// directory markers or foreign keys is still answered correctly, and a prefix
+// with data is answered from its first page.
+func (b *S3Backend) HasObjectsUnderPrefix(ctx context.Context, prefix string) (bool, error) {
+	fullPrefix, err := b.prefixedListPrefix(prefix)
+	if err != nil {
+		return false, err
+	}
+	var continuationToken *string
+	for {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		result, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(b.bucket),
+			Prefix:            aws.String(fullPrefix),
+			ContinuationToken: continuationToken,
+		})
+		if err != nil {
+			return false, fmt.Errorf("failed to list S3 objects: %w", err)
+		}
+		for _, obj := range result.Contents {
+			if obj.Key == nil {
+				continue
+			}
+			if ValidateKey(strings.TrimPrefix(*obj.Key, b.prefix)) == nil {
+				return true, nil
+			}
+		}
+		if result.IsTruncated == nil || !*result.IsTruncated {
+			return false, nil
+		}
+		continuationToken = result.NextContinuationToken
+	}
 }
 
 // ListUnusable implements UnusableLister.
