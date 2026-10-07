@@ -57,8 +57,19 @@ func TestReplaceManifestAfterRewriteDeletesOriginalS3Object(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := backend.StatFile(ctx, oldPath); err == nil {
-		t.Fatal("old S3 object still exists")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		size, err := backend.StatFile(ctx, oldPath)
+		if err == nil && size < 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				t.Fatalf("old S3 object still exists or could not be checked: %v", err)
+			}
+			t.Fatalf("old S3 object still exists after delete: size=%d", size)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 	size, err := backend.StatFile(ctx, newPath)
 	if err != nil {
