@@ -3,6 +3,7 @@ package api
 import (
 	"database/sql"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
@@ -449,5 +450,200 @@ func TestValidateTagColumnsRejectsTime(t *testing.T) {
 	// A non-time column alongside is fine.
 	if err := validateTagColumns([]string{"host", "region"}); err != nil {
 		t.Errorf("validateTagColumns([host region]): unexpected error: %v", err)
+	}
+}
+
+// A continuous query's measurement names are storage path segments of every
+// run, and until #1011 neither boundary applied a rule to source_measurement
+// while update applied one to destination_measurement only if the body
+// happened to carry it. Since the UPDATE overwrites every column, a partial
+// PUT stored blanks.
+//
+// The two fields deliberately get different rules — the destination names a
+// measurement Arc creates, the source names one that already exists — so the
+// accepted cases at the bottom are as load-bearing as the refused ones: they
+// are the shapes a real storage root holds that the create-time rule would
+// have orphaned.
+func TestContinuousQueryMeasurementValidation(t *testing.T) {
+	// Everything except the field under test is valid, so each case fails for
+	// the reason it names rather than on an earlier check. Each body carries
+	// every field at most once: a duplicate JSON key would leave the case
+	// resting on the decoder resolving it last-wins.
+	const rest = `"name":"test","database":"db","query":"SELECT * FROM src WHERE time >= {start_time} AND time < {end_time}","interval":"1h"`
+	body := func(source, destination string) string {
+		b := "{" + rest
+		if source != "" {
+			b += `,"source_measurement":"` + source + `"`
+		}
+		if destination != "" {
+			b += `,"destination_measurement":"` + destination + `"`
+		}
+		return b + "}"
+	}
+
+	refused := []struct {
+		name      string
+		method    string
+		body      string
+		wantError string
+	}{
+		{
+			name:      "POST rejects a source naming two path components",
+			method:    "POST",
+			body:      body("a/b", "dst"),
+			wantError: "invalid source_measurement",
+		},
+		{
+			name:      "POST rejects a source that is a glob",
+			method:    "POST",
+			body:      body("src*", "dst"),
+			wantError: "invalid source_measurement",
+		},
+		{
+			name:      "POST rejects a dot-prefixed source",
+			method:    "POST",
+			body:      body(".hidden", "dst"),
+			wantError: "invalid source_measurement",
+		},
+		{
+			name:      "PUT rejects a source naming two path components",
+			method:    "PUT",
+			body:      body("a/b", "dst"),
+			wantError: "invalid source_measurement",
+		},
+		{
+			name:      "PUT requires source_measurement",
+			method:    "PUT",
+			body:      body("", "dst"),
+			wantError: "source_measurement is required",
+		},
+		{
+			// 200 before #1011, and it blanked the column.
+			name:      "PUT requires destination_measurement",
+			method:    "PUT",
+			body:      body("src", ""),
+			wantError: "destination_measurement is required",
+		},
+		{
+			// The control: this one was already refused, by the
+			// if-provided guard #1011 made unconditional.
+			name:      "PUT rejects an invalid destination_measurement",
+			method:    "PUT",
+			body:      body("src", "dst*"),
+			wantError: "invalid destination_measurement",
+		},
+		{
+			// Same blanking shape, found while fixing the measurements:
+			// validateCQQuery returns nil for an empty query because "the
+			// caller's own required-field check" reports it, which update
+			// did not have.
+			name:      "PUT requires query",
+			method:    "PUT",
+			body:      `{"name":"test","database":"db","source_measurement":"src","destination_measurement":"dst","interval":"1h"}`,
+			wantError: "query is required",
+		},
+	}
+
+	for _, tt := range refused {
+		t.Run(tt.name, func(t *testing.T) {
+			resp, respBody := doCQRequest(t, tt.method, tt.body)
+			defer resp.Body.Close()
+			if resp.StatusCode != fiber.StatusBadRequest {
+				t.Fatalf("expected status 400, got %d: %s", resp.StatusCode, respBody)
+			}
+			if !strings.Contains(respBody, tt.wantError) {
+				t.Fatalf("response %q does not contain %q", respBody, tt.wantError)
+			}
+		})
+	}
+
+	// Measurement names predate the create-time rule (it shipped in v26.02.1),
+	// and edge-sync receive, backup restore and WAL replay all admit names it
+	// refuses. Arc has no rename endpoint, so a continuous query reading one of
+	// those directories must keep working.
+	accepted := []string{"_internal", "7cpu", "cpu.v2", "CPU-load_2"}
+	for _, source := range accepted {
+		t.Run("POST accepts an existing measurement named "+source, func(t *testing.T) {
+			resp, respBody := doCQRequest(t, "POST", body(source, "dst"))
+			defer resp.Body.Close()
+			if resp.StatusCode != fiber.StatusCreated {
+				t.Fatalf("expected status 201 for source %q, got %d: %s", source, resp.StatusCode, respBody)
+			}
+		})
+	}
+}
+
+// doCQRequest drives handleCreate or handleUpdate against a fresh SQLite-only
+// handler, seeding a row for the PUT cases so they reach validation rather
+// than 404.
+func doCQRequest(t *testing.T, method, body string) (*http.Response, string) {
+	t.Helper()
+	h := newSQLiteOnlyCQHandler(t, filepath.Join(t.TempDir(), "cq.db"))
+	t.Cleanup(func() { h.sqliteDB.Close() })
+	h.config = &config.ContinuousQueryConfig{Enabled: true}
+
+	path := "/continuous-queries"
+	if method == "PUT" {
+		_, err := h.sqliteDB.Exec(`INSERT INTO continuous_queries
+			(id, name, database, source_measurement, destination_measurement, query, interval, tag_columns)
+			VALUES (1, 'existing', 'db', 'src', 'dst', 'SELECT 1', '1h', '[]')`)
+		if err != nil {
+			t.Fatalf("seed existing continuous query: %v", err)
+		}
+		path += "/1"
+	}
+
+	app := fiber.New()
+	app.Post("/continuous-queries", h.handleCreate)
+	app.Put("/continuous-queries/:id", h.handleUpdate)
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req, testRequestTimeoutMS)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	return resp, string(raw)
+}
+
+// handleUpdate maps a UNIQUE name collision the way handleCreate does. #1011
+// makes name mandatory on update, so a body carrying another definition's name
+// is an ordinary mistake, and it used to answer 500.
+func TestContinuousQueryUpdateRejectsDuplicateName(t *testing.T) {
+	h := newSQLiteOnlyCQHandler(t, filepath.Join(t.TempDir(), "cq.db"))
+	defer h.sqliteDB.Close()
+	h.config = &config.ContinuousQueryConfig{Enabled: true}
+
+	for id, name := range map[int]string{1: "first", 2: "second"} {
+		_, err := h.sqliteDB.Exec(`INSERT INTO continuous_queries
+			(id, name, database, source_measurement, destination_measurement, query, interval, tag_columns)
+			VALUES (?, ?, 'db', 'src', 'dst', 'SELECT 1', '1h', '[]')`, id, name)
+		if err != nil {
+			t.Fatalf("seed continuous query %d: %v", id, err)
+		}
+	}
+
+	app := fiber.New()
+	app.Put("/continuous-queries/:id", h.handleUpdate)
+	req := httptest.NewRequest("PUT", "/continuous-queries/2",
+		strings.NewReader(`{"name":"first","database":"db","source_measurement":"src","destination_measurement":"dst","query":"SELECT * FROM src WHERE time >= {start_time} AND time < {end_time}","interval":"1h"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req, testRequestTimeoutMS)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s", resp.StatusCode, raw)
+	}
+	if !strings.Contains(string(raw), "already exists") {
+		t.Fatalf("response %q does not say the name is taken", raw)
 	}
 }

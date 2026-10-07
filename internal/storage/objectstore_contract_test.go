@@ -261,6 +261,51 @@ func TestS3ListNeverReturnsUnusableKeys(t *testing.T) {
 	}
 }
 
+// TestS3HasObjectsUnderPrefix pins the PrefixProber contract (#1084) against a
+// real store: a prefix with an object is true, an empty one is false, and a
+// prefix whose only key is one ListObjects hides (a directory marker) is
+// false, because the probe applies the listing's visibility rule rather than
+// answering from the raw key count.
+func TestS3HasObjectsUnderPrefix(t *testing.T) {
+	b := minioBackend(t)
+	ctx := context.Background()
+
+	if err := b.Write(ctx, "probe/real/2026/01/01/00/x.parquet", []byte("data")); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+	t.Cleanup(func() { _ = b.Delete(ctx, "probe/real/2026/01/01/00/x.parquet") })
+
+	for prefix, want := range map[string]bool{
+		"probe/real/": true,
+		"probe/rea":   true, // a key prefix on S3, as ListObjects treats it
+		"probe/none/": false,
+		"probe/":      true,
+	} {
+		got, err := b.HasObjectsUnderPrefix(ctx, prefix)
+		if err != nil {
+			t.Errorf("HasObjectsUnderPrefix(%q): %v", prefix, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("HasObjectsUnderPrefix(%q) = %v, want %v", prefix, got, want)
+		}
+	}
+	if _, err := b.HasObjectsUnderPrefix(ctx, "/"); err == nil {
+		t.Error(`HasObjectsUnderPrefix("/") accepted an invalid prefix`)
+	}
+
+	if err := putRawKey(t, b, "probe/marker/dir/"); err != nil {
+		t.Skipf("could not create a directory marker: %v", err)
+	}
+	got, err := b.HasObjectsUnderPrefix(ctx, "probe/marker/")
+	if err != nil {
+		t.Fatalf("HasObjectsUnderPrefix(probe/marker/): %v", err)
+	}
+	if got {
+		t.Error("a prefix holding only a directory marker answered true; ListObjects hides that key, so the probe must too")
+	}
+}
+
 // putRawKey writes an object under a key the backend itself would refuse,
 // using a signed request rather than the backend, so the test can create the
 // state a foreign tool would leave behind.

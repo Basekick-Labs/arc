@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -170,6 +171,112 @@ func TestStagedPartialOfANowReservedKeyIsReclaimable(t *testing.T) {
 	// must not be refused.
 	if err := b.DeleteStaged(ctx, staged[0].Path); err != nil {
 		t.Fatalf("DeleteStaged(%q) = %v; the orphan would be permanently unreclaimable", staged[0].Path, err)
+	}
+}
+
+// TestListStagedOmitsWhatDeleteStagedWouldRefuse covers #772. A partial can
+// belong to a key that fails validateKeyBody outright (not merely the
+// reserved-suffix case TestStagedPartialOfANowReservedKeyIsReclaimable
+// covers), such as one containing a backslash. ListStaged must not report a
+// key DeleteStaged then refuses, or reclaimStagedPartials logs the same
+// warning on every run and never reclaims the file. ListUnusable is where
+// such a file is reported instead.
+func TestListStagedOmitsWhatDeleteStagedWouldRefuse(t *testing.T) {
+	dir := t.TempDir()
+	b, _ := NewLocalBackend(dir, zerolog.Nop())
+	ctx := context.Background()
+
+	// Written behind the backend's back, as an older version could have left
+	// it: a backslash is a plain filesystem character, but validateKeyBody
+	// refuses it because Azure treats it as a path separator.
+	if err := os.MkdirAll(filepath.Join(dir, "db"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	illegalPath := filepath.Join(dir, "db", "weird\\name"+PartSuffix)
+	if err := os.WriteFile(illegalPath, []byte("ORPHAN"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	staged, err := b.ListStaged(ctx, "db/")
+	if err != nil {
+		t.Fatalf("ListStaged: %v", err)
+	}
+	if len(staged) != 0 {
+		t.Fatalf("ListStaged = %+v, want none: DeleteStaged refuses every one of these keys", staged)
+	}
+
+	unusable, err := b.ListUnusable(ctx, "db/")
+	if err != nil {
+		t.Fatalf("ListUnusable: %v", err)
+	}
+	if len(unusable) != 1 || unusable[0].Path != "db/weird\\name.part" {
+		t.Fatalf("ListUnusable = %+v, want the one file ListStaged dropped", unusable)
+	}
+}
+
+// TestEveryKeyListStagedReturnsIsAcceptedByDeleteStaged pins the invariant
+// #772 asks for: ListStaged and DeleteStaged share one key rule, so a loop that
+// pipes one into the other (reclaimStagedPartials, the edge-sync staging sweep)
+// never logs a refusal. Only shapes a POSIX filesystem can hold are seeded: an
+// overlong or ".." segment cannot exist on disk, so it cannot be a legacy
+// partial either. A whole key over MaxUsableKeyLen can exist and takes the same
+// path as the backslash shape (dropped, refused, reported); it is not seeded.
+func TestEveryKeyListStagedReturnsIsAcceptedByDeleteStaged(t *testing.T) {
+	dir := t.TempDir()
+	b, _ := NewLocalBackend(dir, zerolog.Nop())
+	ctx := context.Background()
+
+	if err := os.MkdirAll(filepath.Join(dir, "db", "cpu"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Staging files written behind the backend's back, as older versions left them.
+	for _, name := range []string{
+		"db/cpu/a.parquet" + PartSuffix, // partial of a legal key
+		"db/x.part" + PartSuffix,        // legacy: the key was legal before the suffix was reserved
+		"db/" + PartSuffix,              // stripped key is "db/", a directory prefix
+		"db/weird\\name" + PartSuffix,   // stripped key carries a backslash
+	} {
+		if err := os.WriteFile(filepath.Join(dir, filepath.FromSlash(name)), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	staged, err := b.ListStaged(ctx, "")
+	if err != nil {
+		t.Fatalf("ListStaged: %v", err)
+	}
+	var got []string
+	for _, obj := range staged {
+		got = append(got, obj.Path)
+		if err := b.DeleteStaged(ctx, obj.Path); err != nil {
+			t.Errorf("DeleteStaged(%q) = %v; ListStaged reported a key its own deleter refuses", obj.Path, err)
+			continue
+		}
+		// Accepted is not enough: the key must resolve to the file the walk found.
+		if _, err := os.Stat(filepath.Join(dir, filepath.FromSlash(obj.Path)+PartSuffix)); !os.IsNotExist(err) {
+			t.Errorf("DeleteStaged(%q) returned nil but the staging file is still on disk (stat: %v)", obj.Path, err)
+		}
+	}
+	slices.Sort(got)
+	if want := []string{"db/cpu/a.parquet", "db/x.part"}; !slices.Equal(got, want) {
+		t.Errorf("ListStaged keys = %q, want %q", got, want)
+	}
+
+	// What the reclaim left on disk is exactly what ListUnusable reports, so a
+	// partial ListStaged drops is not lost from view. Checked AFTER the reclaim
+	// on purpose: before it, ListUnusable also reports db/x.part.part, whose
+	// base key is itself reserved, so the two listings overlap on that shape.
+	unusable, err := b.ListUnusable(ctx, "")
+	if err != nil {
+		t.Fatalf("ListUnusable: %v", err)
+	}
+	var left []string
+	for _, u := range unusable {
+		left = append(left, u.Path)
+	}
+	slices.Sort(left)
+	if want := []string{"db/.part", "db/weird\\name.part"}; !slices.Equal(left, want) {
+		t.Errorf("ListUnusable = %q, want %q", left, want)
 	}
 }
 

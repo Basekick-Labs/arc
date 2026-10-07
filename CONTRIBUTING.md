@@ -7,13 +7,14 @@ Thanks for your interest in improving Arc. Contributions of all sizes are welcom
 - Issues labeled [`good first issue`](https://github.com/Basekick-Labs/arc/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are scoped, well-described, and a good entry point.
 - Most issues include the file, the line, and the intended fix shape. If the shape is unclear, ask on the issue before writing code.
 - Comment on an issue when you start working on it, so effort is not duplicated.
+- Issues labeled [`arcx`](https://github.com/Basekick-Labs/arc/issues?q=is%3Aissue+is%3Aopen+label%3Aarcx) touch Arc's integration with arcx, a query engine we are developing. The glue is public source and these are real bugs, but they affect only builds made with the `arcx_engine` tag, **which no release ships**, and that tag cannot be compiled outside Basekick — so **a maintainer has to do the final verification run** — see [Building and testing](#building-and-testing). They are not off limits; just say on the issue that you are starting, keep the change small, and state plainly in the PR that you could not run the tagged build. We will run it and report back what we saw.
 
 ## Before you open a PR
 
 1. **One issue per PR.** Reference it in the body (`Closes #123`, or `Refs #123` if your change covers only part of it).
 2. **Keep PRs small.** We do not review large PRs. If the fix you have in mind is large, split it into a series of smaller PRs that can be reviewed and merged independently. A PR that does one thing well merges fast; a PR that does five things waits.
 3. **Add tests.** A bug fix needs a regression test that fails before the fix and passes after it. Deterministic tests are strongly preferred over sleeps and retries.
-4. **Add a release-notes entry.** Fixes go into the current planned release notes file (for example `RELEASE_NOTES_2026.09.2.md`) as a `###` entry under the `## Bug fixes` section, ending with a credit line:
+4. **Add a release-notes entry.** Fixes go into the current planned release notes file (for example `RELEASE_NOTES_2027.01.1.md`) as a `###` entry under the `## Bug fixes` section, ending with a credit line:
 
    ```markdown
    Contributed by [@your-handle](https://github.com/your-handle) in [#PR](https://github.com/Basekick-Labs/arc/pull/PR).
@@ -71,6 +72,15 @@ go test -tags=duckdb_arrow -race ./... # what CI runs
 ```
 
 If your environment cannot run the cgo-dependent packages (common on Windows), say so in the PR body and run what you can. Linux CI is the authoritative validation, and maintainers verify locally before merging.
+
+One build mode is **not** reproducible outside Basekick: `-tags=duckdb_arrow,arcx_engine`, which links arcx — a query engine still in development — in process over cgo. No release ships that tag and no CI job compiles it; it needs `libarcx.a` and `arcx.h` from a private repository. So if you are changing `internal/api/arcx_hook.go`, `internal/arcxrouter`, or `internal/arcxengine`:
+
+```sh
+go build -tags=duckdb_arrow ./...                    # what you can run
+go test -tags=duckdb_arrow -race ./internal/api/...  # and this
+```
+
+That is the right amount to run — do not try to stub the engine to get the tag to compile. Say in the PR body that the `arcx_engine` variant was not built, as you would for any environment limit, and a maintainer runs the tagged build, the arcx test suites, and the pre-fix revert check before merging. Source-wiring tests are welcome and useful, but they do not substitute for that run, and the files above sit on an FFI boundary where an untested change can take the process down rather than fail a request — which is why the verification is ours to do, not a gap in your PR.
 
 ## Review and merge
 

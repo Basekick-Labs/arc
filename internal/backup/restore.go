@@ -2,11 +2,16 @@ package backup
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -14,12 +19,114 @@ import (
 	"github.com/basekick-labs/arc/internal/storage"
 )
 
+// Restore modes (#1083).
+//
+// RestoreModeMerge is the behaviour every restore had before modes existed:
+// the backup's files are written over whatever is there and nothing is
+// removed. It therefore resurrects every file that retention, compaction or
+// the delete API removed since the backup was taken — on every node of a
+// cluster, once the restored files replicate — which for an audit database is
+// the opposite of what an auditor wants.
+//
+// RestoreModeReplace removes the current files of every database the backup
+// holds before writing the backup's. It is available on a cluster node only,
+// where the removal goes through the cluster manifest (manifest-before-
+// storage, as the Cluster Operations Checklist requires) and every node drops
+// its copy; a standalone node has no manifest to drive it and refuses.
+const (
+	RestoreModeMerge   = "merge"
+	RestoreModeReplace = "replace"
+)
+
+// NormalizeRestoreMode maps the request spelling onto a mode: empty means
+// merge, the two names are accepted as is, anything else is an error naming
+// the choices.
+func NormalizeRestoreMode(mode string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", RestoreModeMerge:
+		return RestoreModeMerge, nil
+	case RestoreModeReplace:
+		return RestoreModeReplace, nil
+	}
+	return "", fmt.Errorf("invalid restore mode %q: use %q (additive, the default) or %q (remove the current files of each restored database first; cluster nodes only)", mode, RestoreModeMerge, RestoreModeReplace)
+}
+
+// ResolveRestoreMode is the one place the effective mode of a restore is
+// decided (#1084), given the mode string exactly as the request spelled it,
+// the scope of the backup being restored (its manifest's Scope) and whether
+// the Raft file manifest is wired on this node. A request that named no mode
+// resolves to replace when the backup is scoped AND the node is clustered:
+// the point of restoring one database on a cluster is to put that database
+// back, not to resurrect every file retention and compaction removed from it
+// since. Everything else resolves as NormalizeRestoreMode does, so an explicit
+// "merge" stays merge, which is why this takes the RAW string: the normaliser
+// collapses "" and "merge" and cannot tell them apart. It never yields replace
+// on a standalone node, where the manager refuses an explicit replace.
+//
+// The API handler calls it to echo the effective mode and the manager calls it
+// again after reading the manifest, with the same inputs, so direct callers
+// get the same answer and the two cannot drift.
+func ResolveRestoreMode(rawMode string, scope []string, clustered bool) (string, error) {
+	mode, err := NormalizeRestoreMode(rawMode)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(rawMode) == "" && len(scope) > 0 && clustered {
+		return RestoreModeReplace, nil
+	}
+	return mode, nil
+}
+
+// CheckScopedReplace refuses a replace-mode restore of a scoped backup that
+// holds no data files for one of its databases (#1084). Replace removes the
+// current files of each restored database first, so for such a database it
+// would only remove and restore nothing: a database dropped and recreated, or
+// fully cold (its tier rows made it known at backup time, and a backup does
+// not carry cold tier objects until #1086), would lose its hot tier on every
+// node, and replace is the default a scoped backup resolves to on a cluster.
+// The inventory is keyed by storage-root segment (parseDBMeasurement), so a
+// spoke scope matches its own entry. Applied by the API handler (400) and by
+// the manager (failed run) with the same text, so the two cannot disagree.
+// Nil for an unscoped backup or any other mode.
+func CheckScopedReplace(mode string, manifest *Manifest) error {
+	if mode != RestoreModeReplace || len(manifest.Scope) == 0 {
+		return nil
+	}
+	held := make(map[string]bool, len(manifest.Databases))
+	for _, db := range manifest.Databases {
+		held[db.Name] = true
+	}
+	var missing []string
+	for _, name := range manifest.Scope {
+		if !held[name] {
+			missing = append(missing, fmt.Sprintf("%q", name))
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	noun := "database"
+	if len(missing) > 1 {
+		noun = "databases"
+	}
+	return fmt.Errorf("mode replace is refused: the backup holds no data files for %s %s, so replace would only remove its current files and restore nothing; use mode merge, or take the backup again once the database has hot files (cold tier objects are not carried by a backup until #1086)", noun, strings.Join(missing, ", "))
+}
+
+// restoreReplaceReason stamps the manifest deletes a replace-mode restore
+// issues. Tiering reads it as an ordinary removal (the hot row is retired).
+const restoreReplaceReason = "restore:replace"
+
 // RestoreOptions controls what gets restored and from where.
 type RestoreOptions struct {
 	BackupID        string
 	RestoreData     bool // restore parquet files
 	RestoreMetadata bool // restore SQLite database
 	RestoreConfig   bool // restore arc.toml (requires restart)
+	// Mode is RestoreModeMerge or RestoreModeReplace, or empty for the
+	// default: merge, except that a scoped backup restored on a cluster node
+	// defaults to replace (see ResolveRestoreMode, which the manager applies
+	// once it has read the manifest). An explicit value is used as given.
+	Mode string
 }
 
 // RestoreResult is returned when a restore completes.
@@ -79,7 +186,30 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 		m.setProgress(progress)
 	}()
 
-	m.logger.Info().Str("backup_id", opts.BackupID).Msg("Starting restore")
+	mode, err := NormalizeRestoreMode(opts.Mode)
+	if err != nil {
+		progress.Status = "failed"
+		progress.Error = err.Error()
+		return nil, err
+	}
+	progress.Mode = mode
+	m.setProgress(progress)
+
+	// Cluster refusals (#1083). The API layer refuses these first, from the
+	// coordinator's presence; this is the belt for callers that reach the
+	// manager directly, keyed on the manifest hook being wired.
+	if m.cluster != nil && (opts.RestoreMetadata || opts.RestoreConfig) {
+		err := errors.New("restore refused on a cluster node: the SQLite database holds Raft-replicated tokens, per-node tier rows and the audit log, and arc.toml holds this node identity (cluster.node_id, role, seeds, raft_bootstrap, shared secret); restoring either from a backup would give this node another node state. Restore data only")
+		progress.Status = "failed"
+		progress.Error = err.Error()
+		return nil, err
+	}
+	if m.cluster == nil && mode == RestoreModeReplace {
+		err := errors.New("restore mode replace is only available on a cluster node, where the current files are removed through the cluster manifest; a standalone restore is additive (mode merge)")
+		progress.Status = "failed"
+		progress.Error = err.Error()
+		return nil, err
+	}
 
 	// ── 1. Read and validate manifest ───────────────────────────────────
 	manifest, err := m.GetBackup(ctx, opts.BackupID)
@@ -89,26 +219,115 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 		return nil, fmt.Errorf("failed to read backup manifest: %w", err)
 	}
 
+	// The effective mode is decided from the manifest (#1084): a scoped
+	// backup on a cluster node restores in replace mode unless the request
+	// named one. Same function and same inputs as the API handler's echo.
+	// The spelling was checked above, so this cannot fail; the refusals above
+	// stand, and the resolution never yields replace on a standalone node.
+	mode, err = ResolveRestoreMode(opts.Mode, manifest.Scope, m.cluster != nil)
+	if err != nil {
+		progress.Status = "failed"
+		progress.Error = err.Error()
+		return nil, err
+	}
+	progress.Mode = mode
+	progress.Scope = manifest.Scope
+	m.setProgress(progress)
+	// Belt for the one replace that would only delete (#1084): refused here,
+	// before the compaction pause is taken, with the text the API gives.
+	if err := CheckScopedReplace(mode, manifest); err != nil {
+		progress.Status = "failed"
+		progress.Error = err.Error()
+		return nil, err
+	}
+
+	// A backup another instance wrote is restorable, and that is a decision,
+	// not an oversight: restoring onto fresh hardware is what backups are
+	// for, and a refusal here would be self-locking — the replacement
+	// instance has a new identity by construction, so it could never restore
+	// the backups it exists to restore. What it gets instead is an echo loud
+	// enough to stop an operator who did not mean it, and the restore does
+	// NOT adopt the owner id (see identity.go): this instance keeps the
+	// identity it has, so the next backup it takes is its own.
+	if !m.ownsManifest(manifest) {
+		m.logger.Warn().
+			Str("backup_id", opts.BackupID).
+			Str("owner_instance_id", manifest.OwnerInstanceID).
+			Str("this_instance_id", m.instanceID).
+			Msg("Restoring a backup written by a different Arc instance: allowed, and this instance keeps its own identity, so later backups will not be listed with it")
+	}
+
+	start := m.logger.Info().Str("backup_id", opts.BackupID).Str("mode", mode)
+	if len(manifest.Scope) > 0 {
+		start = start.Strs("scope", manifest.Scope)
+	}
+	start.Msg("Starting restore")
+
 	// A backup that was incomplete when it was taken restores exactly what it
 	// holds. Surface that up front so a gap that predates the restore is not
 	// mistaken for one the restore caused, and so an operator who never read
 	// the manifest learns about it now.
 	progress.BackupSkippedFiles = manifest.SkippedFiles
 	progress.BackupUnaddressableFiles = manifest.UnaddressableFiles
+	progress.BackupUnregisteredSkipped = manifest.UnregisteredSkipped
+	progress.BackupManifestOnlyFiles = manifest.ManifestOnlyFiles
 	m.setProgress(progress)
-	if manifest.SkippedFiles > 0 || manifest.UnaddressableFiles > 0 {
+	if manifest.SkippedFiles > 0 || manifest.UnaddressableFiles > 0 || manifest.ManifestOnlyFiles > 0 || manifest.UnregisteredSkipped > 0 {
 		m.logger.Warn().
 			Str("backup_id", opts.BackupID).
 			Int64("backup_skipped_files", manifest.SkippedFiles).
 			Int64("backup_unaddressable_files", manifest.UnaddressableFiles).
+			Int64("backup_manifest_only_files", manifest.ManifestOnlyFiles).
+			Int64("backup_unregistered_skipped", manifest.UnregisteredSkipped).
 			Strs("unaddressable_sample", manifest.UnaddressableSample).
 			Strs("skipped_sample", manifest.SkippedSample).
-			Msg("Restoring a backup that was incomplete when it was taken")
+			Strs("manifest_only_sample", manifest.ManifestOnlySample).
+			Strs("unregistered_sample", manifest.UnregisteredSample).
+			Msg("Restoring a backup that was incomplete, or deliberately excluded unregistered files, when it was taken")
 	}
 
 	// ── 2. Restore data files ───────────────────────────────────────────
+	// On a cluster node under the cluster-wide compaction pause (#1087), both
+	// modes: compaction commits in two Raft phases on the compactor, and a
+	// job whose phase 2 lands during the restore manifest-deletes inputs the
+	// restore has just registered (replace) or unlinks a freshly written
+	// input before its batched register (both modes). The pause returns once
+	// every node has quiesced; it is released by the deferred resume AFTER
+	// the final Lost check below, with a fresh context because the run's own
+	// may be done by then. The pause expires on its own within its TTL if
+	// this process dies, so a failed resume is a warning, not a failure.
+	var pause CompactionPause
+	if opts.RestoreData && m.cluster != nil {
+		progress.CompactionPause = "waiting"
+		m.setProgress(progress)
+		p, err := m.cluster.PauseCompaction(ctx, "restore "+opts.BackupID)
+		if err != nil {
+			err = fmt.Errorf("restore refused: compaction could not be paused cluster-wide: %w", err)
+			progress.Status = "failed"
+			progress.Error = err.Error()
+			return nil, err
+		}
+		pause = p
+		progress.CompactionPause = "paused"
+		m.setProgress(progress)
+		m.logger.Info().Str("backup_id", opts.BackupID).Str("mode", mode).Msg("Compaction is paused cluster-wide for this restore; every node has acknowledged")
+		// Registered after the progress-publishing defer at the top of this
+		// function, so it runs BEFORE it (LIFO): the final published
+		// snapshot carries the "released" state this writes.
+		defer func() {
+			rctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := pause.Resume(rctx); err != nil {
+				m.logger.Warn().Err(err).Str("backup_id", opts.BackupID).Msg("Could not release the cluster-wide compaction pause; it expires on its own within six minutes")
+				return
+			}
+			if progress.CompactionPause != "lost" {
+				progress.CompactionPause = "released"
+			}
+		}()
+	}
 	if opts.RestoreData {
-		if err := m.restoreDataFiles(ctx, opts.BackupID, manifest, progress); err != nil {
+		if err := m.restoreDataFiles(ctx, opts.BackupID, manifest, progress, mode, pause); err != nil {
 			progress.Status = "failed"
 			progress.Error = err.Error()
 			return nil, err
@@ -150,6 +369,15 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 	// Decided after the metadata and config steps so those are staged even
 	// when the data set has a gap: an operator recovering a node wants both.
 	duration := time.Since(startTime)
+	// The pause must still have been this restore's up to the last register
+	// (#1087); the between-batch checks cover the run, this one its tail.
+	if err := checkCompactionPauseLost(pause, progress); err != nil {
+		progress.Status = "failed"
+		progress.Error = err.Error()
+		m.setProgress(progress)
+		m.logger.Error().Err(err).Str("backup_id", opts.BackupID).Msg("Restore failed: the cluster-wide compaction pause was lost")
+		return nil, err
+	}
 	skipped := atomic.LoadInt64(&progress.SkippedFiles)
 	missing := progress.MissingFiles
 	unaddressable := progress.UnaddressableFiles
@@ -171,10 +399,13 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 		m.logger.Error().Str("backup_id", opts.BackupID).Int64("iceberg_warehouse_files_skipped", progress.IcebergWarehouseFilesSkipped).Msg("Restore incomplete")
 		return nil, err
 	}
-	if skipped+missing+unaddressable > 0 {
+	if skipped+missing+unaddressable+progress.SidecarMismatches > 0 {
 		var parts []string
 		if skipped > 0 {
 			parts = append(parts, fmt.Sprintf("%d objects could not be read from backup storage (skipped_sample)", skipped))
+		}
+		if progress.SidecarMismatches > 0 {
+			parts = append(parts, fmt.Sprintf("%d data files in the backup do not match its sidecar (size, SHA-256, or no row) and were not restored (sidecar_mismatch_sample); the backup is damaged", progress.SidecarMismatches))
 		}
 		if unaddressable > 0 {
 			parts = append(parts, fmt.Sprintf("%d data files are in backup storage under names no listing returns (unaddressable_sample; rename them and re-run)", unaddressable))
@@ -191,8 +422,10 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 			Int64("skipped", skipped).
 			Int64("unaddressable", unaddressable).
 			Int64("missing", missing).
+			Int64("sidecar_mismatches", progress.SidecarMismatches).
 			Strs("skipped_sample", progress.SkippedSample).
 			Strs("unaddressable_sample", progress.UnaddressableSample).
+			Strs("sidecar_mismatch_sample", progress.SidecarMismatchSample).
 			Dur("duration", duration).
 			Msg("Restore incomplete")
 		return nil, err
@@ -202,11 +435,30 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 
 	m.logger.Info().
 		Str("backup_id", opts.BackupID).
+		Str("mode", mode).
 		Int64("files_restored", atomic.LoadInt64(&progress.ProcessedFiles)).
+		Int64("files_registered", progress.FilesRegistered).
+		Int64("replaced_files", progress.ReplacedFiles).
 		Dur("duration", duration).
 		Msg("Restore completed")
 
 	return &RestoreResult{Manifest: manifest, Duration: duration}, nil
+}
+
+// checkCompactionPauseLost fails the restore when the cluster-wide compaction
+// pause it holds has stopped being its own (#1087): a compaction job may have
+// run on the restored data meanwhile, so the restored set cannot be trusted.
+// nil pause (standalone, or a restore without data) passes.
+func checkCompactionPauseLost(pause CompactionPause, progress *Progress) error {
+	if pause == nil {
+		return nil
+	}
+	lost, cause := pause.Lost()
+	if !lost {
+		return nil
+	}
+	progress.CompactionPause = "lost"
+	return fmt.Errorf("restore failed: the cluster-wide compaction pause was lost (%v); a compaction job may have raced this restore, so take a fresh backup and restore again", cause)
 }
 
 // restoreDataFiles copies parquet files from the backup back into data storage.
@@ -215,10 +467,19 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 // other failure aborts (see errRestoreRead). Data files the listing cannot
 // return, and files the manifest inventoried that are gone, are counted too.
 // The caller turns any non-zero count into a failed restore.
-func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifest *Manifest, progress *Progress) error {
+//
+// On a cluster node (#1083) every database data file written is registered
+// in the cluster manifest from the backup's sidecar, in batches, and in
+// replace mode the current manifest entries of each restored database are
+// removed first. See restoreRegistration and replaceDatabases. Every data
+// file written is also reported to this node's tier metadata when tiering is
+// on, standalone or clustered. pause is the cluster-wide compaction pause the
+// caller holds for the run (#1087), nil on a standalone node; it is checked
+// before every manifest write.
+func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifest *Manifest, progress *Progress, mode string, pause CompactionPause) error {
 	dataPrefix := backupID + "/data/"
 
-	files, err := m.backupStorage.List(ctx, dataPrefix)
+	files, err := m.destination().List(ctx, dataPrefix)
 	if err != nil {
 		return fmt.Errorf("failed to list backup data files: %w", err)
 	}
@@ -264,7 +525,7 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifes
 			present++
 		}
 	}
-	if ul, ok := m.backupStorage.(storage.UnusableLister); ok {
+	if ul, ok := m.destination().(storage.UnusableLister); ok {
 		hidden, err := ul.ListUnusable(ctx, dataPrefix)
 		if err != nil {
 			return fmt.Errorf("failed to inventory unlistable backup objects: %w", err)
@@ -300,6 +561,42 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifes
 	}
 	m.setProgress(progress)
 
+	// ── Cluster: the sidecar, the manifest, and the replace half (#1083) ─
+	// All before any byte is written. A cluster restore registers each file
+	// from the sidecar and cannot do without it; the manifest is synced and
+	// read once, for the labels of paths it already lists and for the replace
+	// half, which removes the current entries first so a failure there leaves
+	// the store exactly as it was.
+	var reg *restoreRegistration
+	if m.cluster != nil {
+		entries, ok, err := m.readSidecar(ctx, backupID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("restore refused: backup %s has no %s, so the files it holds cannot be registered in the cluster manifest; it was taken before cluster-aware backups and can be restored on a standalone node, or taken again", backupID, sidecarName)
+		}
+		if err := m.cluster.Sync(ctx); err != nil {
+			return fmt.Errorf("restore refused: could not sync the cluster manifest before reading it: %w", err)
+		}
+		current := m.cluster.ManifestFiles()
+		existing := make(map[string]ManifestFile, len(current))
+		for _, e := range current {
+			existing[filepath.ToSlash(e.Path)] = e
+		}
+		reg = &restoreRegistration{
+			entries:  entries,
+			existing: existing,
+			overhead: registerOpOverhead(len(m.cluster.LocalNodeID())),
+			pause:    pause,
+		}
+		if mode == RestoreModeReplace {
+			if err := m.replaceDatabases(ctx, manifest, files, dataPrefix, skipInputs, current, progress, pause); err != nil {
+				return err
+			}
+		}
+	}
+
 	// Skips are published on every exit, including a fatal abort part-way
 	// through, so the status shows which objects were unreadable even when
 	// something else ended the restore. The sample is assigned once, here, and
@@ -324,8 +621,8 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifes
 		}
 
 		// Strip the backup prefix to get the original storage path
-		destPath := strings.TrimPrefix(srcPath, dataPrefix)
-		if destPath == "" || destPath == srcPath {
+		destPath := filepath.ToSlash(strings.TrimPrefix(srcPath, dataPrefix))
+		if destPath == "" || destPath == filepath.ToSlash(srcPath) {
 			continue
 		}
 		if skipInputs[destPath] {
@@ -333,9 +630,45 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifes
 			continue
 		}
 
+		// On a cluster a data file is written only when the sidecar describes
+		// it, and only if its bytes match that description (checked on the
+		// temp-file hop, before the write): a damaged backup object must not
+		// replace a good live copy, and a same-size corruption registered
+		// with the sidecar's SHA would fail every peer's checksum forever.
+		// A data file that would overflow the pending registration batch
+		// flushes it BEFORE being written, so a refused batch aborts with
+		// exactly that batch written-but-unregistered and nothing written
+		// past it (see registerRestoredFile).
+		registrable := isRegistrableDataFile(destPath)
+		var pendingRow pendingRegistration
+		var expect *ManifestFile
+		if reg != nil && registrable {
+			pendingRow = reg.lookup(destPath)
+			if !pendingRow.ok {
+				progress.SidecarMismatches++
+				progress.SidecarMismatchSample = appendSample(progress.SidecarMismatchSample, []string{destPath})
+				m.setProgress(progress)
+				m.logger.Error().Str("path", destPath).Msg("Backup data file has no row in the sidecar; not restored (it could not be registered in the cluster manifest)")
+				continue
+			}
+			expect = &pendingRow.row
+			if !reg.batch.fits(pendingRow.size) {
+				if err := m.flushRegistrations(ctx, reg, progress); err != nil {
+					return err
+				}
+			}
+		}
+
 		// Stream via temp file to avoid loading entire Parquet file into memory
-		bytesWritten, err := m.streamRestoreFile(ctx, srcPath, destPath)
+		bytesWritten, err := m.streamRestoreFile(ctx, srcPath, destPath, expect)
 		if err != nil {
+			if errors.Is(err, errSidecarMismatch) {
+				progress.SidecarMismatches++
+				progress.SidecarMismatchSample = appendSample(progress.SidecarMismatchSample, []string{destPath})
+				m.setProgress(progress)
+				m.logger.Error().Str("path", destPath).Err(err).Msg("Backup data file does not match the sidecar; not restored, the live copy is untouched")
+				continue
+			}
 			// Only a backup-storage read failure is skippable. A temp-file or
 			// data-storage failure means the environment underneath the
 			// restore is broken, and continuing would drop files silently.
@@ -355,6 +688,17 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifes
 		if isCompactionState(destPath) && strings.HasSuffix(destPath, ".json") {
 			atomic.AddInt64(&progress.CompactionStateRestored, 1)
 		}
+		if registrable {
+			// Storage first, then the manifest (Cluster Operations Checklist):
+			// the file is on disk before anything can route a reader to it.
+			// Tier rows the same way, after the bytes landed.
+			if m.tierRecorder != nil {
+				m.tierRecorder.RecordRestoredFile(destPath, bytesWritten)
+			}
+			if reg != nil {
+				reg.queue(pendingRow)
+			}
+		}
 		// Republish so /status polling sees live counters — published Progress
 		// values are immutable snapshots, not the struct being mutated here.
 		m.setProgress(progress)
@@ -367,6 +711,12 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifes
 		}
 	}
 
+	if reg != nil {
+		if err := m.flushRegistrations(ctx, reg, progress); err != nil {
+			return err
+		}
+	}
+
 	if n := atomic.LoadInt64(&progress.CompactionStateRestored); n > 0 || len(skipInputs) > 0 {
 		m.logger.Info().
 			Int64("compaction_manifests_restored", n).
@@ -376,6 +726,272 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, manifes
 
 	return nil
 }
+
+// restoreRegistration is the cluster-manifest side of one restore run
+// (#1083): the sidecar's entries, the manifest as it stood when the restore
+// started, and the files written but not yet registered.
+type restoreRegistration struct {
+	entries  map[string]ManifestFile
+	existing map[string]ManifestFile
+	overhead int // registerOpOverhead for this node's ID
+	pending  []ManifestFile
+	batch    opBatcher
+	// pause is the cluster-wide compaction pause held for the run (#1087),
+	// checked before every register batch.
+	pause CompactionPause
+}
+
+// pendingRegistration is a data file's sidecar row, looked up before the file
+// is written so the bytes can be verified against it and the batch flushed
+// first if the row would overflow it.
+type pendingRegistration struct {
+	row  ManifestFile
+	size int // registerOpBytes(row)
+	ok   bool
+}
+
+// lookup finds the sidecar row for destPath. When the manifest already lists
+// the path, the entry's database, measurement, partition time and created_at
+// win over the sidecar's: the manifest is how the cluster labels the file
+// (an edge-sync spoke file is labelled with the spoke's own database there,
+// while the path's first segment is the spoke), and created_at is when the
+// cluster first saw it. The SHA-256 and size stay the sidecar's: they
+// describe the bytes being restored.
+func (r *restoreRegistration) lookup(destPath string) pendingRegistration {
+	p := filepath.ToSlash(destPath)
+	row, ok := r.entries[p]
+	if !ok {
+		return pendingRegistration{}
+	}
+	if e, listed := r.existing[p]; listed {
+		row.Database, row.Measurement, row.PartitionTime = e.Database, e.Measurement, e.PartitionTime
+		if !e.CreatedAt.IsZero() {
+			row.CreatedAt = e.CreatedAt
+		}
+	}
+	return pendingRegistration{row: row, size: registerOpBytes(row, r.overhead), ok: true}
+}
+
+// queue adds a written, verified data file to the pending batch. The caller
+// has already made room (restoreDataFiles flushes before the write when the
+// row would not fit), so the row always fits here. Batches are capped by
+// count AND bytes: in Pattern 1 the primary writer is routinely a Raft
+// follower, so each batch is forwarded to the leader inside a 1 MiB frame
+// (see manifestBatchBytes). Writes and registrations interleave per batch,
+// so an abort strands at most one batch of written-but-unregistered files,
+// and names them.
+func (r *restoreRegistration) queue(pending pendingRegistration) {
+	r.pending = append(r.pending, pending.row)
+	r.batch.add(pending.size)
+}
+
+// flushRegistrations applies the pending batch as one Raft entry. A refusal
+// is a quorum loss or a leader that will not apply, not a blip: the restore
+// aborts here rather than carry on to the next batch, and names what it
+// leaves behind. The files in the batch are on this node and not in the
+// manifest, so peers never pull them and nothing re-registers them; an
+// enabled reconciliation sweep (opt-in, and report-only until the operator
+// turns its dry run off) removes them after its grace window, 24 h plus clock
+// skew, and nothing else does. The recovery is to run the restore again.
+//
+// Registering a path that is already in the manifest is not a no-op: the FSM
+// fires its registration callback on every register (one enqueue and a stat
+// per peer), and a changed SHA fires the content-change callback too, so
+// since #907 every peer re-pulls that file from this node.
+func (m *Manager) flushRegistrations(ctx context.Context, reg *restoreRegistration, progress *Progress) error {
+	if len(reg.pending) == 0 {
+		return nil
+	}
+	// A batch registered after the pause was lost could be the one a
+	// resumed compaction job races (#1087); the files of this batch are then
+	// written but unregistered, which registration_failed reports below.
+	if err := checkCompactionPauseLost(reg.pause, progress); err != nil {
+		paths := make([]string, len(reg.pending))
+		for i, f := range reg.pending {
+			paths[i] = f.Path
+		}
+		progress.RegistrationFailed += int64(len(reg.pending))
+		progress.RegistrationFailedSample = appendSample(progress.RegistrationFailedSample, paths)
+		m.setProgress(progress)
+		return err
+	}
+	batch := reg.pending
+	if err := m.cluster.BatchRegister(ctx, batch); err != nil {
+		paths := make([]string, len(batch))
+		for i, f := range batch {
+			paths[i] = f.Path
+		}
+		progress.RegistrationFailed += int64(len(batch))
+		progress.RegistrationFailedSample = appendSample(progress.RegistrationFailedSample, paths)
+		m.setProgress(progress)
+		m.logger.Error().
+			Err(err).
+			Int("files", len(batch)).
+			Strs("sample", progress.RegistrationFailedSample).
+			Msg("Cluster manifest refused a batch of restored files; aborting the restore. The files are on this node but not in the manifest: peers will not replicate them, nothing re-registers them, and an enabled reconciliation sweep removes them after its grace window; nothing else does. Run the restore again")
+		return fmt.Errorf("restore aborted: the cluster manifest refused to register %d restored files (registration_failed_sample); they are on this node but not in the manifest, so run the restore again once the manifest accepts writes: %w", len(batch), err)
+	}
+	progress.FilesRegistered += int64(len(batch))
+	reg.pending = nil
+	reg.batch.reset()
+	m.setProgress(progress)
+	return nil
+}
+
+// appendSample adds paths to a sample bounded like every other sample here.
+func appendSample(sample, paths []string) []string {
+	for _, p := range paths {
+		if len(sample) >= unaddressableSampleCap {
+			break
+		}
+		sample = append(sample, p)
+	}
+	return sample
+}
+
+// replaceDatabases is the delete half of a replace-mode restore. For every
+// database the backup manifest names, the current cluster-manifest entries
+// are removed, in batches, EXCEPT the paths this run is about to write. The
+// two sets are kept disjoint on purpose: a manifest delete reaches the
+// local-delete workers, which unlink after a short grace, and a path both
+// deleted and rewritten would race its own unlink between the write and the
+// batched register. A path in both sets is simply overwritten and
+// re-registered; where its SHA changed, peers re-pull it (#907).
+//
+// Manifest first, then storage. On a local backend the coordinator's delete
+// callback unlinks each path on every node, so nothing more is done here. On
+// a shared backend (Pattern 2) that callback takes no action, by design, and
+// the issuer removes the objects, exactly as retention does: the objects are
+// deleted here after their manifest entries, so a failure between the two
+// leaves an unregistered object the reconciliation sweep removes, never a
+// manifest entry with no object.
+//
+// Refused when the backup is known incomplete: deleting live data to replace
+// it with a set that is missing files is the one outcome this cannot undo. A
+// skip the backup reconciled (the file had left the manifest by the end of
+// the run) is not a gap, and neither are unregistered-skipped files, unless
+// they were a large share of what the node listed: then the backup was taken
+// against a stale or partial manifest view and describes much less than the
+// node held, the way checkSkipRatio treats a run that skipped too much.
+//
+// A compaction job finishing on a restored database while this runs would
+// manifest-delete inputs whose output the restore has just replaced, with no
+// check that the output is still there (the watcher commits in two phases);
+// the caller holds the cluster-wide compaction pause for the run (#1087), and
+// pause is checked before every delete chunk.
+//
+// A scoped backup (#1084) selects the current entries by the PATH first
+// segment being in the manifest's Scope, not by the entry's Database label:
+// the label is the canonical database of an edge-sync spoke file while the
+// scope is its storage-root segment, so a scope of ["spoke1"] replaces the
+// spoke's files. A scope name absent from Databases (no data file for it in
+// the backup) was refused before this runs (CheckScopedReplace), because for
+// it replace would only delete. An unscoped backup selects by Database as
+// before.
+func (m *Manager) replaceDatabases(ctx context.Context, manifest *Manifest, files []string, dataPrefix string, skipInputs map[string]bool, current []ManifestFile, progress *Progress, pause CompactionPause) error {
+	sc := scopeFromManifest(manifest.Scope)
+	scopedDatabases := len(manifest.Databases)
+	if !sc.empty() {
+		scopedDatabases = len(sc.names)
+	}
+	unreconciled := manifest.SkippedFiles - manifest.SkippedReconciled
+	if unreconciled > 0 || manifest.UnaddressableFiles > 0 || manifest.ManifestOnlyFiles > 0 ||
+		progress.MissingFiles > 0 || progress.UnaddressableFiles > 0 {
+		return fmt.Errorf("restore refused: mode replace would remove the current files of %d databases and the backup is incomplete (backup skipped %d of which %d reconciled, backup unaddressable %d, backup manifest-only %d, missing from backup storage %d, unaddressable in backup storage %d); use mode merge, or take a complete backup first",
+			scopedDatabases, manifest.SkippedFiles, manifest.SkippedReconciled, manifest.UnaddressableFiles, manifest.ManifestOnlyFiles, progress.MissingFiles, progress.UnaddressableFiles)
+	}
+	if listed := manifest.TotalFiles - manifest.AuxiliaryFiles + manifest.UnregisteredSkipped; manifest.UnregisteredSkipped > 0 &&
+		float64(manifest.UnregisteredSkipped) > maxSkipRatio*float64(listed) {
+		return fmt.Errorf("restore refused: mode replace would remove the current files of %d databases, and %d of the %d data files the backup node listed were not in its cluster manifest (>%.0f%%), so the backup was taken against a stale or partial manifest view and holds much less than that node did; use mode merge, or take the backup again on a caught-up primary",
+			scopedDatabases, manifest.UnregisteredSkipped, listed, maxSkipRatio*100)
+	}
+	m.logger.Info().
+		Str("backup_id", manifest.BackupID).
+		Int("databases", scopedDatabases).
+		Msg("Replace mode restore starting under the cluster-wide compaction pause: no compaction job can commit on the restored databases until it completes")
+	databases := make(map[string]bool, len(manifest.Databases))
+	for _, db := range manifest.Databases {
+		databases[db.Name] = true
+	}
+	if sc.empty() && len(databases) == 0 {
+		return nil
+	}
+	owns := func(e ManifestFile, p string) bool {
+		if sc.empty() {
+			return databases[e.Database]
+		}
+		return sc.ownsData(p)
+	}
+	writes := make(map[string]bool, len(files))
+	for _, f := range files {
+		dest := filepath.ToSlash(strings.TrimPrefix(f, dataPrefix))
+		if dest != "" && dest != f && !skipInputs[dest] && isRegistrableDataFile(dest) {
+			writes[dest] = true
+		}
+	}
+
+	var paths []string
+	for _, e := range current {
+		p := filepath.ToSlash(e.Path)
+		if owns(e, p) && !writes[p] {
+			paths = append(paths, p)
+		}
+	}
+	sort.Strings(paths)
+	if len(paths) == 0 {
+		return nil
+	}
+	m.logger.Warn().
+		Int("files", len(paths)).
+		Int("databases", scopedDatabases).
+		Msg("Replace mode: removing the current cluster-manifest entries of the restored databases before writing the backup")
+
+	sharedBackend := m.dataStorage.Type() != "local"
+	for _, c := range manifestChunks(len(paths), func(i int) int { return deleteOpBytes(paths[i], restoreReplaceReason) }) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		chunk := paths[c[0]:c[1]]
+		if err := checkCompactionPauseLost(pause, progress); err != nil {
+			return fmt.Errorf("restore aborted with %d current files of the restored databases already removed from the manifest and none written: %w", progress.ReplacedFiles, err)
+		}
+		if err := m.cluster.BatchDelete(ctx, chunk, restoreReplaceReason); err != nil {
+			return fmt.Errorf("restore aborted before any file was written: the cluster manifest refused to remove %d current files of the restored databases (%d already removed): %w", len(chunk), progress.ReplacedFiles, err)
+		}
+		progress.ReplacedFiles += int64(len(chunk))
+		m.setProgress(progress)
+		if sharedBackend {
+			m.deleteReplacedObjects(ctx, chunk)
+		}
+	}
+	return nil
+}
+
+// deleteReplacedObjects removes manifest-deleted objects from a shared
+// backend. Best effort per object, as retention: the manifest entry is
+// already gone, so a failure leaves an unregistered object, which is the safe
+// side; an enabled reconciliation sweep removes it after its grace window,
+// and nothing else does.
+func (m *Manager) deleteReplacedObjects(ctx context.Context, paths []string) {
+	if bd, ok := m.dataStorage.(storage.BatchDeleter); ok {
+		if err := bd.DeleteBatch(ctx, paths); err == nil {
+			return
+		} else {
+			m.logger.Warn().Err(err).Int("files", len(paths)).Msg("Batch delete of replaced objects failed; deleting one by one")
+		}
+	}
+	for _, p := range paths {
+		if err := m.dataStorage.Delete(ctx, p); err != nil {
+			m.logger.Warn().Err(err).Str("path", p).Msg("Failed to delete a replaced object from shared storage; its manifest entry is gone, so an enabled reconciliation sweep removes it after its grace window and nothing else does")
+		}
+	}
+}
+
+// errSidecarMismatch marks a backup object whose bytes do not match the
+// sidecar row that describes it (size or SHA-256). Detected on the temp-file
+// hop, before anything is written to data storage, so the live copy is
+// untouched. The restore counts and names the file and ends failed.
+var errSidecarMismatch = errors.New("backup object does not match the sidecar")
 
 // restoredManifest is the subset of compaction.Manifest the restore needs,
 // decoded here so this package does not import compaction.
@@ -406,10 +1022,10 @@ func (m *Manager) consumedInputsInBackup(ctx context.Context, dataPrefix string,
 			manifests = append(manifests, f)
 		}
 	}
-	lister, canSize := m.backupStorage.(storage.ObjectLister)
+	lister, canSize := m.destination().(storage.ObjectLister)
 	skip := make(map[string]bool)
 	for _, src := range manifests {
-		data, err := m.backupStorage.Read(ctx, src)
+		data, err := m.destination().Read(ctx, src)
 		if err != nil {
 			m.logger.Warn().Err(err).Str("manifest", src).Msg("Cannot read a backed-up compaction manifest; its inputs are restored and left to recovery")
 			continue
@@ -460,7 +1076,12 @@ func (m *Manager) backupObjectHasSize(ctx context.Context, lister storage.Object
 // skippable by the caller); temp file, seek, and data-storage write failures are
 // returned unwrapped and are fatal to the restore. A ReadTo failure caused by
 // the temp file itself (see trackingWriter) is fatal, not a read.
-func (m *Manager) streamRestoreFile(ctx context.Context, srcPath, destPath string) (int64, error) {
+//
+// expect, when non-nil, is the sidecar row for the file (#1083): the bytes are
+// hashed on the hop into the temp file and both size and SHA-256 must match
+// before anything is written to data storage; otherwise errSidecarMismatch.
+// nil (a standalone restore) hashes nothing and writes as before.
+func (m *Manager) streamRestoreFile(ctx context.Context, srcPath, destPath string, expect *ManifestFile) (int64, error) {
 	tmpFile, err := createTempFile("arc-restore-*.parquet")
 	if err != nil {
 		return 0, fmt.Errorf("failed to create temp file: %w", err)
@@ -469,9 +1090,16 @@ func (m *Manager) streamRestoreFile(ctx context.Context, srcPath, destPath strin
 	defer os.Remove(tmpPath)
 	defer tmpFile.Close()
 
-	// Stream from backup storage to temp file
+	// Stream from backup storage to temp file, hashing on the way when the
+	// bytes have to be verified.
 	tw := &trackingWriter{w: tmpFile}
-	if err := m.backupStorage.ReadTo(ctx, srcPath, tw); err != nil {
+	var dst io.Writer = tw
+	var hasher hash.Hash
+	if expect != nil {
+		hasher = sha256.New()
+		dst = io.MultiWriter(tw, hasher)
+	}
+	if err := m.destination().ReadTo(ctx, srcPath, dst); err != nil {
 		return 0, classifyReadTo(srcPath, err, tw.err)
 	}
 
@@ -481,6 +1109,15 @@ func (m *Manager) streamRestoreFile(ctx context.Context, srcPath, destPath strin
 		return 0, fmt.Errorf("failed to stat temp file: %w", err)
 	}
 	size := info.Size()
+
+	if expect != nil {
+		if size != expect.SizeBytes {
+			return 0, fmt.Errorf("%w: %s is %d bytes, the sidecar recorded %d", errSidecarMismatch, destPath, size, expect.SizeBytes)
+		}
+		if sum := hex.EncodeToString(hasher.Sum(nil)); expect.SHA256 != "" && sum != expect.SHA256 {
+			return 0, fmt.Errorf("%w: %s hashes to %s, the sidecar recorded %s", errSidecarMismatch, destPath, sum, expect.SHA256)
+		}
+	}
 
 	if _, err := tmpFile.Seek(0, 0); err != nil {
 		return 0, fmt.Errorf("failed to seek temp file: %w", err)
@@ -515,7 +1152,7 @@ func (m *Manager) restoreSQLite(ctx context.Context, backupID string) error {
 	// backup destination ever stops being local.
 	if m.icebergCatalogDBPath != "" {
 		srcPath := fmt.Sprintf("%s/metadata/%s", backupID, icebergCatalogDBName)
-		exists, err := m.backupStorage.Exists(ctx, srcPath)
+		exists, err := m.destination().Exists(ctx, srcPath)
 		if err != nil {
 			return fmt.Errorf("failed to check for Iceberg catalog in backup: %w", err)
 		}
@@ -556,7 +1193,7 @@ func (m *Manager) restoreSQLiteFile(ctx context.Context, backupID, srcName, dest
 		return fmt.Errorf("failed to create restore staging file: %w", err)
 	}
 	stagingPath := staging.Name()
-	if err := m.backupStorage.ReadTo(ctx, srcPath, staging); err != nil {
+	if err := m.destination().ReadTo(ctx, srcPath, staging); err != nil {
 		staging.Close()
 		os.Remove(stagingPath)
 		return fmt.Errorf("failed to stream SQLite backup into staging: %w", err)
@@ -587,7 +1224,7 @@ func (m *Manager) restoreSQLiteFile(ctx context.Context, backupID, srcName, dest
 // It creates a .before-restore backup of the current config first.
 func (m *Manager) restoreConfig(ctx context.Context, backupID string) error {
 	srcPath := fmt.Sprintf("%s/config/arc.toml", backupID)
-	data, err := m.backupStorage.Read(ctx, srcPath)
+	data, err := m.destination().Read(ctx, srcPath)
 	if err != nil {
 		return fmt.Errorf("failed to read config backup: %w", err)
 	}

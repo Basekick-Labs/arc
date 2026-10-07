@@ -26,10 +26,21 @@ type Metrics struct {
 	httpLatencyCount   atomic.Int64
 
 	// Ingestion metrics
-	ingestRecordsTotal atomic.Int64
-	ingestBytesTotal   atomic.Int64
-	ingestBatchesTotal atomic.Int64
-	ingestErrorsTotal  atomic.Int64
+	ingestRecordsTotal  atomic.Int64
+	ingestBytesTotal    atomic.Int64
+	ingestBatchesTotal  atomic.Int64
+	ingestErrorsTotal   atomic.Int64
+	ingestFlushDeferred atomic.Int64
+	// bufferDeferredBuffers is a GAUGE: how many buffers are currently holding
+	// records that could not be handed to a flush worker. It is what the flush
+	// drainer acts on, so a value that stays non-zero while the queue has room
+	// means the drainer is not keeping up (or is wedged).
+	//
+	// Exported as arc_buffer_deferred_buffers, NOT arc_ingest_*: in this file
+	// arc_ingest_* is uniformly counters and arc_buffer_* holds the buffer-state
+	// gauges (arc_buffer_queue_depth, arc_buffer_records_buffered), which this
+	// sits beside and is published alongside.
+	bufferDeferredBuffers atomic.Int64
 
 	// MessagePack specific
 	msgpackRequestsTotal atomic.Int64
@@ -356,6 +367,10 @@ func (m *Metrics) IncIngestRecords(count int64) { m.ingestRecordsTotal.Add(count
 func (m *Metrics) IncIngestBytes(bytes int64)   { m.ingestBytesTotal.Add(bytes) }
 func (m *Metrics) IncIngestBatches()            { m.ingestBatchesTotal.Add(1) }
 func (m *Metrics) IncIngestErrors()             { m.ingestErrorsTotal.Add(1) }
+func (m *Metrics) IncIngestFlushDeferred()      { m.ingestFlushDeferred.Add(1) }
+
+// SetBufferDeferredBuffers publishes the current deferred-buffer count.
+func (m *Metrics) SetBufferDeferredBuffers(n int64) { m.bufferDeferredBuffers.Store(n) }
 
 // MessagePack Metrics
 func (m *Metrics) IncMsgPackRequests()           { m.msgpackRequestsTotal.Add(1) }
@@ -611,10 +626,14 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		// arcx decline census (closed label set; all-zero in stock builds —
 		// only the arcx_engine-tagged census path increments these).
 		"arcx_shape_census": m.arcxCensusSnapshot(),
-		"goroutines":        runtime.NumGoroutine(),
-		"go_version":        runtime.Version(),
-		"num_cpu":           runtime.NumCPU(),
-		"gomaxprocs":        runtime.GOMAXPROCS(0),
+		// arcx shadow outcomes (closed label set; all-zero in stock builds).
+		// `skipped` is the one to watch when reading the others: a shed or
+		// capped sample is NOT evidence that arcx matched.
+		"arcx_shadow": m.arcxShadowSnapshot(),
+		"goroutines":  runtime.NumGoroutine(),
+		"go_version":  runtime.Version(),
+		"num_cpu":     runtime.NumCPU(),
+		"gomaxprocs":  runtime.GOMAXPROCS(0),
 
 		// Memory (Go runtime)
 		"memory_alloc_bytes":       memStats.Alloc,
@@ -635,10 +654,12 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"http_latency_count":    m.httpLatencyCount.Load(),
 
 		// Ingestion
-		"ingest_records_total": m.ingestRecordsTotal.Load(),
-		"ingest_bytes_total":   m.ingestBytesTotal.Load(),
-		"ingest_batches_total": m.ingestBatchesTotal.Load(),
-		"ingest_errors_total":  m.ingestErrorsTotal.Load(),
+		"ingest_records_total":        m.ingestRecordsTotal.Load(),
+		"ingest_bytes_total":          m.ingestBytesTotal.Load(),
+		"ingest_batches_total":        m.ingestBatchesTotal.Load(),
+		"ingest_errors_total":         m.ingestErrorsTotal.Load(),
+		"ingest_flush_deferred_total": m.ingestFlushDeferred.Load(),
+		"buffer_deferred_buffers":     m.bufferDeferredBuffers.Load(),
 
 		// MessagePack
 		"msgpack_requests_total": m.msgpackRequestsTotal.Load(),
@@ -855,6 +876,12 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_ingest_errors_total Total ingestion errors\n"...)
 	b = append(b, "# TYPE arc_ingest_errors_total counter\n"...)
 	b = appendMetric(b, "arc_ingest_errors_total", float64(m.ingestErrorsTotal.Load()))
+	b = append(b, "# HELP arc_ingest_flush_deferred_total Flushes deferred because the flush queue was full\n"...)
+	b = append(b, "# TYPE arc_ingest_flush_deferred_total counter\n"...)
+	b = appendMetric(b, "arc_ingest_flush_deferred_total", float64(m.ingestFlushDeferred.Load()))
+	b = append(b, "# HELP arc_buffer_deferred_buffers Buffers currently holding records that no flush worker could take\n"...)
+	b = append(b, "# TYPE arc_buffer_deferred_buffers gauge\n"...)
+	b = appendMetric(b, "arc_buffer_deferred_buffers", float64(m.bufferDeferredBuffers.Load()))
 
 	// MessagePack metrics
 	b = append(b, "# HELP arc_msgpack_requests_total Total MessagePack requests\n"...)

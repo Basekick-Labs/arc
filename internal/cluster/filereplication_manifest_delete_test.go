@@ -2,7 +2,7 @@ package cluster
 
 // Query-gate self-heal on manifest delete (#759, #795), driven through the
 // production wiring: a bootstrapped Raft node, startFilePullerLocked (the real
-// onRegister/onDelete callbacks and the real ManifestHas hook), the real fetch
+// onRegister/onDelete callbacks and the real ManifestEntry hook), the real fetch
 // client against a peer, and DeleteFileFromManifest on the leader path.
 //
 // Two orderings against the reader's catch-up pull:

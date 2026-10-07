@@ -203,9 +203,10 @@ func (e *ParallelExecutor) buildPartitionQuery(template, path, options, anchorPa
 	// Build read_parquet expression for this partition. Escape single quotes:
 	// DuckDB read_parquet() paths cannot be parameterized, so the path is
 	// interpolated into a SQL string literal. (options is program-built.)
-	readParquet := fmt.Sprintf("read_parquet(%s, %s)", sqlutil.QuoteStringLiteral(path), options)
+	readParquet := sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(path), options)
 	if anchorPath != "" {
-		readParquet = fmt.Sprintf("read_parquet([%s, %s], %s)", sqlutil.QuoteStringLiteral(anchorPath), sqlutil.QuoteStringLiteral(path), options)
+		readParquet = sqlutil.ReadParquetList(
+			[]string{sqlutil.QuoteStringLiteral(anchorPath), sqlutil.QuoteStringLiteral(path)}, options)
 	}
 
 	// Replace placeholder in template

@@ -44,10 +44,17 @@ const (
 // The sync stamps migrated_at from the object's own timestamp.
 const manifestSettle = time.Hour
 
+// manifestReasonPrefix is what every reason tiering itself proposes starts
+// with. A node receiving a manifest delete uses it to decide whether the
+// removal is worth one cold-tier existence check (see Manager.applyUnlinked);
+// it is a hint, never proof, because the operator manifest-delete endpoint
+// passes an arbitrary caller-supplied reason.
+const manifestReasonPrefix = "tiering:"
+
 const (
-	manifestReasonMigrated  = "tiering:migrated"
-	manifestReasonReconcile = "tiering:reconcile"
-	manifestReasonSweep     = "tiering:sweep"
+	manifestReasonMigrated  = manifestReasonPrefix + "migrated"
+	manifestReasonReconcile = manifestReasonPrefix + "reconcile"
+	manifestReasonSweep     = manifestReasonPrefix + "sweep"
 )
 
 // RetryTransient runs fn up to attempts times, waiting base, 2·base, 4·base…

@@ -20,8 +20,8 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 )
 
-// fakeManifest is a concurrency-safe stand-in for the FSM membership lookup
-// the coordinator wires into Config.ManifestHas.
+// fakeManifest is a concurrency-safe stand-in for the FSM lookup wired into
+// Config.ManifestEntry.
 type fakeManifest struct {
 	mu    sync.Mutex
 	paths map[string]bool
@@ -39,6 +39,10 @@ func (m *fakeManifest) has(path string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.paths[path]
+}
+
+func (m *fakeManifest) entry(path string) (raft.FileEntry, bool) {
+	return raft.FileEntry{Path: path}, m.has(path)
 }
 
 func (m *fakeManifest) add(path string) {
@@ -183,7 +187,7 @@ func TestPuller_OnManifestDelete_DuringRealWorkerPull(t *testing.T) {
 
 	const path = "db/cpu/2026/09/14/17/inflight-real.parquet"
 	manifest := newFakeManifest(path)
-	p.cfg.ManifestHas = manifest.has
+	p.cfg.ManifestEntry = manifest.entry
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -226,7 +230,7 @@ func TestPuller_OnManifestDelete_DuringRealWorkerPull(t *testing.T) {
 // can wait minutes mid-page at queue high water). The callback found nothing
 // to clear, so the membership check at pull time is the only defence: the
 // worker must skip the pull and finishEntry must record nothing.
-func TestPuller_ManifestHas_DeletedBeforeTagIsNotCounted(t *testing.T) {
+func TestPuller_ManifestEntry_DeletedBeforeTagIsNotCounted(t *testing.T) {
 	backend := newFakeBackend()
 	fetcher := newFakeFetcher() // any call would fail with "no scripted results"
 	resolver := staticResolver{nodeID: "writer-1", addrs: []string{"peer:9100"}, ok: true}
@@ -234,7 +238,7 @@ func TestPuller_ManifestHas_DeletedBeforeTagIsNotCounted(t *testing.T) {
 
 	const path = "db/cpu/2026/09/14/17/deleted-before-tag.parquet"
 	manifest := newFakeManifest() // already gone
-	p.cfg.ManifestHas = manifest.has
+	p.cfg.ManifestEntry = manifest.entry
 	p.OnManifestDelete(path) // what the FSM callback did earlier: a no-op
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -291,13 +295,13 @@ func TestPuller_CatchUpDrop_ExactAgainstManifestDelete(t *testing.T) {
 	p := newTestPuller(t, newFakeBackend(), newFakeFetcher(), staticResolver{})
 	// Not started: the queue (cap 8) fills and the ninth enqueue drops.
 	manifest := newFakeManifest()
-	p.cfg.ManifestHas = manifest.has
+	p.cfg.ManifestEntry = manifest.entry
 
 	for i := 0; i < 8; i++ {
 		path := "db/cpu/2026/09/14/17/queued-" + string(rune('a'+i)) + ".parquet"
 		manifest.add(path)
 		p.markCatchUp(path)
-		if got := p.enqueue(makeEntry(path, "writer-1", 8), enqueueSourceCatchUp); got != enqueueResultEnqueued {
+		if got := p.enqueue(makeEntry(path, "writer-1", 8), enqueueSourceCatchUp, false); got != enqueueResultEnqueued {
 			t.Fatalf("fill %d: want enqueued, got %v", i, got)
 		}
 	}
@@ -306,7 +310,7 @@ func TestPuller_CatchUpDrop_ExactAgainstManifestDelete(t *testing.T) {
 	// (a) delete landed before the drop: nothing recorded, tag released.
 	const goneFirst = "db/cpu/2026/09/14/17/gone-first.parquet"
 	p.markCatchUp(goneFirst) // manifest never had it: the delete came first
-	if got := p.enqueue(makeEntry(goneFirst, "writer-1", 8), enqueueSourceCatchUp); got != enqueueResultDropped {
+	if got := p.enqueue(makeEntry(goneFirst, "writer-1", 8), enqueueSourceCatchUp, false); got != enqueueResultDropped {
 		t.Fatalf("want dropped, got %v", got)
 	}
 	if s := p.CatchUpStatus(); s["catchup_dropped"] != 0 || s["catchup_inflight"] != 8 {
@@ -317,7 +321,7 @@ func TestPuller_CatchUpDrop_ExactAgainstManifestDelete(t *testing.T) {
 	const goneAfter = "db/cpu/2026/09/14/17/gone-after.parquet"
 	manifest.add(goneAfter)
 	p.markCatchUp(goneAfter)
-	if got := p.enqueue(makeEntry(goneAfter, "writer-1", 8), enqueueSourceCatchUp); got != enqueueResultDropped {
+	if got := p.enqueue(makeEntry(goneAfter, "writer-1", 8), enqueueSourceCatchUp, false); got != enqueueResultDropped {
 		t.Fatalf("want dropped, got %v", got)
 	}
 	if s := p.CatchUpStatus(); s["catchup_dropped"] != 1 {
@@ -331,7 +335,7 @@ func TestPuller_CatchUpDrop_ExactAgainstManifestDelete(t *testing.T) {
 
 	// (c) a reactive (untagged) drop never touches the catch-up counters.
 	const reactive = "db/cpu/2026/09/14/17/reactive.parquet"
-	if got := p.enqueue(makeEntry(reactive, "writer-1", 8), enqueueSourceReactive); got != enqueueResultDropped {
+	if got := p.enqueue(makeEntry(reactive, "writer-1", 8), enqueueSourceReactive, false); got != enqueueResultDropped {
 		t.Fatalf("want dropped, got %v", got)
 	}
 	s := p.Stats()
@@ -348,7 +352,7 @@ func TestPuller_PruneStaleCatchUpState(t *testing.T) {
 	const goneDrop = "db/cpu/2026/09/14/17/gone-drop.parquet"
 	const kept = "db/cpu/2026/09/14/17/kept.parquet"
 	manifest := newFakeManifest(kept)
-	p.cfg.ManifestHas = manifest.has
+	p.cfg.ManifestEntry = manifest.entry
 
 	for _, path := range []string{gone, kept} {
 		p.markCatchUp(path)
@@ -371,7 +375,7 @@ func TestPuller_PruneStaleCatchUpState(t *testing.T) {
 	}
 
 	// Without a hook the prune is a no-op (today's behaviour).
-	p.cfg.ManifestHas = nil
+	p.cfg.ManifestEntry = nil
 	p.pruneStaleCatchUpState()
 	if s := p.CatchUpStatus(); s["catchup_failed"] != 1 {
 		t.Fatalf("nil hook must not prune, got %+v", s)
@@ -410,7 +414,7 @@ func TestPuller_PullCompletingAfterDeleteIsDiscarded(t *testing.T) {
 
 	const path = "db/cpu/2026/09/14/17/late.parquet"
 	manifest := newFakeManifest(path)
-	p.cfg.ManifestHas = manifest.has
+	p.cfg.ManifestEntry = manifest.entry
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

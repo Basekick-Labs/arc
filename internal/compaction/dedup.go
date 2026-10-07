@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 )
 
 // readTagColumnsFromParquetFiles reads and unions "arc:tags" metadata from multiple Parquet files.
@@ -152,7 +154,7 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 		// still compacts instead of failing the column bind. See timeNormalizeReplace.
 		return []string{fmt.Sprintf(`
 		COPY (
-			SELECT * REPLACE (%s) FROM read_parquet(%s, union_by_name=true)
+			SELECT * REPLACE (%s) FROM %s
 			%s
 		) TO '%s' (
 			FORMAT PARQUET,
@@ -160,7 +162,7 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 			COMPRESSION_LEVEL 3,
 			ROW_GROUP_SIZE 122880
 		)
-	`, timeNormalizeReplace, fileListSQL, orderByClause, escapedOutput)}
+	`, timeNormalizeReplace, sqlutil.ReadParquet(fileListSQL, "union_by_name=true"), orderByClause, escapedOutput)}
 	}
 
 	// Dedup compaction — keep one row per unique (tags, time) key.
@@ -213,8 +215,8 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 	partitionBy := strings.Join(quotedKeys, ", ")
 
 	stage := fmt.Sprintf(
-		`CREATE OR REPLACE TEMP TABLE %s AS SELECT * REPLACE (%s) FROM read_parquet(%s, union_by_name=true)`,
-		dedupStagingTable, timeNormalizeReplace, fileListSQL)
+		`CREATE OR REPLACE TEMP TABLE %s AS SELECT * REPLACE (%s) FROM %s`,
+		dedupStagingTable, timeNormalizeReplace, sqlutil.ReadParquet(fileListSQL, "union_by_name=true"))
 
 	copyOut := fmt.Sprintf(`
 		COPY (
@@ -270,8 +272,8 @@ const timeNormalizeReplace = `COALESCE(TRY_CAST("time" AS TIMESTAMPTZ), make_tim
 // Job.compactFiles.
 func parquetFilesHaveTimeColumn(ctx context.Context, db *sql.DB, fileListSQL string) (bool, error) {
 	query := fmt.Sprintf(
-		`SELECT COUNT(*) FROM (DESCRIBE SELECT * FROM read_parquet(%s, union_by_name=true)) WHERE column_name = 'time'`,
-		fileListSQL,
+		`SELECT COUNT(*) FROM (DESCRIBE SELECT * FROM %s) WHERE column_name = 'time'`,
+		sqlutil.ReadParquet(fileListSQL, "union_by_name=true"),
 	)
 	var n int64
 	if err := db.QueryRowContext(ctx, query).Scan(&n); err != nil {
@@ -281,9 +283,10 @@ func parquetFilesHaveTimeColumn(ctx context.Context, db *sql.DB, fileListSQL str
 }
 
 // countParquetRows counts total rows across Parquet files using metadata (no data scan).
-// fileListSQL is a DuckDB array literal like "['file1.parquet', 'file2.parquet']".
+// fileListSQL is a DuckDB array literal or single quoted path, as built by
+// Job.compactFiles — both forms have a parquet_file_metadata overload.
 func countParquetRows(ctx context.Context, db *sql.DB, fileListSQL string) (int64, error) {
-	query := fmt.Sprintf(`SELECT SUM(num_rows) FROM parquet_metadata(%s)`, fileListSQL)
+	query := fmt.Sprintf(`SELECT SUM(num_rows) FROM parquet_file_metadata(%s)`, fileListSQL)
 	var count int64
 	err := db.QueryRowContext(ctx, query).Scan(&count)
 	if err != nil {

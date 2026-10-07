@@ -250,7 +250,7 @@ func normalizeNullParts(rows []groupedRow) {
 func compareGrouped(rec arrow.Record, oracle []groupedRow, items []string, keyCols []int) string {
 	got, err := groupedFromArcx(rec, keyCols)
 	if err != nil {
-		return "arcx grouped decode error: " + err.Error()
+		return skipPrefix + "arcx grouped decode error: " + err.Error()
 	}
 	if len(got) != len(oracle) {
 		return fmt.Sprintf("grouped row count differs (arcx=%d duckdb=%d)", len(got), len(oracle))

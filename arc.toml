@@ -26,9 +26,22 @@ format = "console"  # json or console
 # Auto-configured based on system resources if not set.
 # Override via: ARC_DATABASE_MAX_CONNECTIONS, ARC_DATABASE_MEMORY_LIMIT, ARC_DATABASE_THREAD_COUNT
 [database]
-# max_connections = 28    # Default: 2x CPU cores
-# memory_limit = "8GB"    # Default: ~50% system memory
-# thread_count = 14       # Default: CPU cores
+# max_connections = 28    # Default: 2x the HOST's CPU cores (min 4, max 64).
+#                         # Deliberately not quota-derived: it bounds statements
+#                         # in flight, and Arc queries are often S3-I/O-bound, so
+#                         # a quota-sized pool converts concurrency into client
+#                         # timeouts. Worth lowering BY HAND in a small container
+#                         # though — this pool is the only global limit on
+#                         # concurrent queries, and the Go-side memory of an
+#                         # in-flight result is not covered by memory_limit.
+# memory_limit = "8GB"    # Default: unset — DuckDB uses 80% of the container's
+#                         # cgroup limit, or of host memory when unlimited.
+#                         # Set this only to override that. Percent and unit-less
+#                         # forms are rejected: DuckDB needs an absolute size.
+# thread_count = 14       # Default: unset — DuckDB uses the container's CPU
+#                         # quota (cpu.max), not the host's core count.
+#                         # compaction.threads follows the quota too since
+#                         # 26.09.3; see the [compaction] section below.
 enable_wal = true
 
 # Allow DuckDB to reorder results of queries WITHOUT an ORDER BY (queries
@@ -42,6 +55,11 @@ enable_wal = true
 # -----------------------------------------------------------------------------
 [storage]
 backend = "local"           # "local" or "s3"
+# Arc REFUSES TO START when the backup destination overlaps this root — see the
+# note on [backup].local_path. Setting this to a PARENT of the backup directory
+# (for example "./data" beside the default backup path "./data/backups") is the
+# shape that boots today and will not boot after the upgrade. An empty value is
+# refused as itself.
 local_path = "./data/arc"
 
 # S3/MinIO (when backend = "s3")
@@ -59,6 +77,20 @@ s3_path_style = true        # MinIO/dev. AWS S3: false
 # Credentials via env: ARC_STORAGE_S3_ACCESS_KEY, ARC_STORAGE_S3_SECRET_KEY
 # On EKS with IRSA, leave both unset: Arc detects AWS_ROLE_ARN +
 # AWS_WEB_IDENTITY_TOKEN_FILE and authenticates via the pod's IAM role.
+#
+# A key prefix confines Arc to one subtree of the bucket or container, so
+# several deployments can share one, and so a backup target can live beside the
+# primary data. Both default to the root. Commented rather than set to "",
+# because a shipped value is the effective configuration for every deployment
+# that does not override it and an empty environment variable does not clear it
+# (see TestShippedArcTomlHasNoLiveColdTierConnectionValues).
+# s3_prefix = "instances/abc123"
+#
+# Azure Blob (when backend = "azure"). Credentials via env:
+# ARC_STORAGE_AZURE_ACCOUNT_NAME, ARC_STORAGE_AZURE_ACCOUNT_KEY (or
+# ARC_STORAGE_AZURE_CONNECTION_STRING).
+# azure_container = ""
+# azure_prefix = "instances/abc123"
 
 # -----------------------------------------------------------------------------
 # Ingestion
@@ -87,6 +119,33 @@ default_sort_keys = ""
 # -----------------------------------------------------------------------------
 [compaction]
 enabled = true
+
+# DuckDB thread count for EACH compaction subprocess.
+# Default: unset (0) = half of the CPUs this process may use, minimum 1.
+# Environment override: ARC_COMPACTION_THREADS=4
+#
+# "CPUs this process may use" is min(runtime.NumCPU(), runtime.GOMAXPROCS(0)):
+# Go derives GOMAXPROCS from the container's CPU quota (cpu.max, or
+# cpu.cfs_quota_us on cgroup v1), while NumCPU catches cpuset limits that no
+# quota expresses. Before 26.09.3 this was half the HOST's core count, so a
+# 2-CPU pod on a 64-core node ran every compaction job with 32 threads (#1030).
+#
+# Halving assumes the default max_concurrent = 2. Raising max_concurrent without
+# lowering this oversubscribes: the subprocesses do not share a budget.
+#
+# This does not make the total fit the quota. On a 2-CPU quota the two
+# subprocesses take 1 thread each and the main process takes the quota's 2 — 4
+# threads against 2 CPUs. These are caps on parallelism, not reservations.
+#
+# Three things that change the derived value, all deliberate:
+#   - GOMAXPROCS set ABOVE the quota is honoured, up to the machine's core count.
+#   - GODEBUG=containermaxprocs=0 turns the runtime's cgroup read off entirely,
+#     giving the pre-26.09.3 host-derived behaviour.
+#   - the runtime floors GOMAXPROCS at 2, so --cpus=0.5 still yields 1 thread.
+#
+# Not licence-capped: this is resolved before the licence is applied, and a
+# subprocess is a separate process. Set it by hand on a core-limited licence.
+# threads = 4
 
 # Maximum wall-clock budget for ONE scheduled or manual compaction cycle.
 # Default: 30m. Positive Go duration syntax: 90s, 30m, 2h, 2h15m.
@@ -238,18 +297,25 @@ migration_history_retention_days = 90
 enabled = false
 backend = "s3"              # "s3" or "azure"
 
-# S3/MinIO — as with the primary [storage] block above, these are MinIO/local-dev
-# values. For real AWS S3: clear s3_endpoint, set s3_use_ssl = true and
-# s3_path_style = false, and REMOVE the static keys below — leaving them set
-# suppresses IRSA/instance-role detection for the cold tier, since configured
-# keys always take precedence over the AWS credential chain.
-s3_bucket = "arc-archive"
+# S3 — nothing below is set, on purpose. Arc's built-in defaults are already
+# the AWS-correct ones (no endpoint, HTTPS, virtual-hosted addressing, and
+# credentials from the AWS chain so IRSA and instance roles are detected), and
+# a value shipped here cannot be cleared from the environment: an empty env var
+# reads as unset, so ARC_TIERED_STORAGE_COLD_S3_ENDPOINT="" does NOT blank a
+# value in this file. A cold tier meant for AWS would silently keep talking to
+# whatever was shipped here.
+#
+# Set the bucket and region for your account; enabling the cold tier without a
+# bucket is refused at startup rather than defaulted to anything.
 s3_region = "us-east-1"
-s3_endpoint = "localhost:9000"   # MinIO/dev. AWS S3: leave empty
-s3_access_key = "minioadmin"     # MinIO/dev. AWS S3 with IRSA: remove
-s3_secret_key = "minioadmin"     # MinIO/dev. AWS S3 with IRSA: remove
-s3_use_ssl = false               # MinIO/dev. AWS S3: true
-s3_path_style = true             # MinIO/dev. AWS S3: false
+# s3_bucket = ""
+#
+# MinIO / another S3-compatible store — uncomment as a set:
+# s3_endpoint = "localhost:9000"
+# s3_access_key = "minioadmin"   # configured keys take precedence over the
+# s3_secret_key = "minioadmin"   # AWS chain, so these disable IRSA detection
+# s3_use_ssl = false
+# s3_path_style = true
 # Cold objects are written with no storage class set (S3 Standard) and read in
 # place; there is deliberately no storage-class key. Keep bucket lifecycle
 # rules off the cold prefix — Glacier or Deep Archive objects cannot be queried.
@@ -259,6 +325,10 @@ s3_path_style = true             # MinIO/dev. AWS S3: false
 azure_container = ""
 azure_endpoint = ""
 azure_use_managed_identity = false
+# A prefix lets the cold tier share one container with the primary store. Left
+# commented for the same reason as the connection values above: a shipped value
+# cannot be cleared by an empty environment variable.
+# azure_prefix = "cold"
 
 # -----------------------------------------------------------------------------
 # Audit Logging (Enterprise)
@@ -271,8 +341,88 @@ include_reads = false           # Log GET/query requests (high volume)
 # Backup & Restore
 # -----------------------------------------------------------------------------
 [backup]
+# BREAKING on upgrade, and it is these two keys that cause it, not the target
+# block below: Arc now REFUSES TO START when the backup destination overlaps
+# primary storage, and with no target configured the destination is
+# local_path. A deployment whose local_path sits inside storage.local_path — or
+# whose storage.local_path is a parent of it, such as "./data" — boots today
+# and will not boot after the upgrade. The defaults below are disjoint and are
+# unaffected. An empty local_path with no target is refused too, where it used
+# to boot with the backup API quietly skipped.
 enabled = true
-local_path = "./data/backups"           # Directory for local backups
+local_path = "./data/backups"           # Directory for local backups; see the refusal note above
+# How long one backup or one restore may run before its context is cancelled.
+# Go duration syntax; must be positive. 2h is the value both were hardcoded to
+# before this key existed.
+# operation_timeout = "2h"
+#
+# A named backup TARGET makes the destination configurable, and it may be remote
+# (#1085). Point default_target at it and local_path above is ignored entirely —
+# the directory is not even created. Exactly ONE target is supported in this
+# release; per-database routing across several comes later.
+#
+# Target names are letters, digits and underscore only, and are lowercased. The
+# rule that matters is the HYPHEN: it cannot appear in an environment variable
+# name, so a hyphenated target could be set here and never afterwards
+# overridden from the environment, which is how a credential stays in a config
+# file for good. So "audit-bucket" is REFUSED and "audit_bucket" is not. Case is
+# not a hazard — both this file and the environment are lowercased, so "Audit"
+# and "audit" are one target.
+#
+# Arc REFUSES AT STARTUP a destination that overlaps primary storage or the
+# tiered-storage cold tier, for two reasons that are both permanent and both
+# silent. A destination inside the storage root is inventoried by the next
+# backup, so each backup copies the previous one in full; on a cluster those
+# files are absent from the Raft manifest, and past the skip ratio every
+# replace-mode restore is refused. And with reconciliation enabled and
+# manifest_only_dry_run off, its sweep DELETES the backups, because a backup
+# data key has nine path segments and the sweep treats seven or more as a
+# managed path.
+#
+# The same applies to a prefix that is a parent of, or sits under, the storage
+# or cold-tier prefix, and every spelling of one endpoint counts as one store:
+# leaving s3_endpoint empty for AWS on one side and writing out
+# "s3.us-east-1.amazonaws.com" on the other does not make them two places. One
+# bucket with DISJOINT prefixes is fine and is the intended shape.
+#
+# default_target = "audit"
+#
+# [backup.targets.audit]
+# type = "s3"                            # local, s3, minio, azure or azblob
+# s3_bucket = "acme-arc-audit-backups"
+# s3_prefix = "arc/backups"
+# s3_region = "us-east-1"
+# s3_endpoint = ""                       # set for MinIO/SeaweedFS
+# s3_use_ssl = true
+# s3_path_style = false                  # required for MinIO
+# s3_access_key = ""                     # prefer ARC_BACKUP_TARGETS_AUDIT_S3_ACCESS_KEY
+# s3_secret_key = ""                     # prefer ARC_BACKUP_TARGETS_AUDIT_S3_SECRET_KEY
+#
+# From the environment ALONE, with nothing in this file, a target takes an extra
+# variable, because a name cannot be discovered from a map that does not exist:
+#   ARC_BACKUP_TARGET_NAMES=audit
+#   ARC_BACKUP_TARGETS_AUDIT_TYPE=s3
+#   ARC_BACKUP_TARGETS_AUDIT_S3_BUCKET=acme-arc-audit-backups
+#   ARC_BACKUP_DEFAULT_TARGET=audit
+#
+# With a REMOTE target, include_config defaults to FALSE for every backup: this
+# file carries that target own credentials, so the default would put the keys
+# that unlock the backup store inside the backups it holds. A request may ask
+# for it explicitly and is warned.
+#
+# Backups carry the identity of the instance that wrote them, so two instances
+# sharing one bucket and prefix do not merge listings. On a cluster that
+# identity is cluster.cluster_name, whose default is "arc-cluster" — SET IT, or
+# two unrelated clusters on the default collide. Standalone, Arc mints a UUID
+# and keeps it in a file beside the shared SQLite database. Switching a node
+# from clustered to standalone therefore changes its identity, so its own
+# earlier backups then read as foreign; they stay listable with
+# include_foreign=true and stay restorable. A restore never
+# adopts the identity in the backup it restored: the listing marks another
+# instance backups as foreign_owner, and GET /api/v1/backup?include_foreign=true
+# shows them, with a filtered_foreign count on the plain listing so an empty
+# answer says what it withheld. That is what makes recovery onto fresh
+# hardware possible.
 
 # Query Management (Enterprise)
 # -----------------------------------------------------------------------------

@@ -829,10 +829,24 @@ var (
 
 	// Dangerous patterns for WHERE clause
 	dangerousQueryPatterns = []string{
-		";",      // Statement terminator
-		"--",     // SQL comment
-		"/*",     // Multi-line comment start
-		"*/",     // Multi-line comment end
+		";",  // Statement terminator
+		"--", // SQL comment
+		"/*", // Multi-line comment start
+		"*/", // Multi-line comment end
+	}
+	// Keywords are matched as whole words (containsSQLWord), so identifiers
+	// such as created_at or dataset pass. The former xp_/sp_ entries are gone:
+	// they are SQL Server procedure prefixes DuckDB has no notion of, and as
+	// substrings they refused any identifier containing them. The delete API's
+	// copy of the same two strings is tracked in #1077.
+	// numberGluedToWord matches a digit run at a token start that runs straight
+	// into letters, so `1UNION` can be split into `1 UNION` before the
+	// whole-word keyword scan.
+	numberGluedToWord = regexp.MustCompile(`(^|[^A-Za-z0-9_])([0-9]+)([a-z])`)
+	// maskPlaceholder matches the lower-cased placeholders sqlutil.MaskStringLiterals
+	// leaves for string literals and quoted identifiers.
+	maskPlaceholder        = regexp.MustCompile(`__(?:str|ident)_[0-9]+__`)
+	dangerousQueryKeywords = []string{
 		"DROP",   // DDL
 		"DELETE", // DML (in WHERE context means injection attempt)
 		"INSERT",
@@ -842,8 +856,6 @@ var (
 		"CREATE",
 		"EXEC",
 		"EXECUTE",
-		"xp_",
-		"sp_",
 		"UNION",
 	}
 )
@@ -901,12 +913,36 @@ func validateWhereClauseQuery(where string) error {
 		return fmt.Errorf("where clause too long (max 4096 characters)")
 	}
 
-	whereUpper := strings.ToUpper(where)
+	// Scan a string-literal-masked copy (#987): a keyword or comment marker
+	// inside a value is data, not SQL. Backtick identifiers are normalised to
+	// double quotes first, as ValidateSQLRequest does, because the masker does
+	// not know backticks and a quote inside one would otherwise open a
+	// spurious literal that hides whatever follows it. The raw clause is what
+	// the quote and parenthesis counts below check and what reaches the SQL
+	// assembly; ValidateSQLRequest then validates the assembled statement.
+	maskInput := backticksToDoubleQuotes(where)
+	whereMasked, _ := sqlutil.MaskStringLiterals(maskInput, sqlutil.HasQuotes(maskInput))
+	// DuckDB lexes a number glued to a word as two tokens (`1UNION` is `1`
+	// then `UNION`), while the whole-word scan below treats digits as
+	// identifier bytes and would not see the keyword. Split a number that
+	// starts a token from the letters that follow it; an identifier such as
+	// x1union, whose digits are not at a token start, is left alone.
+	whereLower := numberGluedToWord.ReplaceAllString(strings.ToLower(whereMasked), "$1$2 $3")
+	// The masker's placeholders are identifier-shaped (__str_0__), so a keyword
+	// glued to a literal (`host='a'union select ...`) would have no word
+	// boundary either. Blank them for the keyword scan; the punctuation scan
+	// above does not care, and nothing after this reads the placeholders.
+	whereLowerKeywords := maskPlaceholder.ReplaceAllString(whereLower, " ")
 
-	// Check for dangerous patterns
+	// Check for dangerous patterns outside string literals.
 	for _, pattern := range dangerousQueryPatterns {
-		if strings.Contains(whereUpper, pattern) {
+		if strings.Contains(whereLower, strings.ToLower(pattern)) {
 			return fmt.Errorf("where clause contains forbidden pattern: %s", pattern)
+		}
+	}
+	for _, keyword := range dangerousQueryKeywords {
+		if containsSQLWord(whereLowerKeywords, strings.ToLower(keyword)) {
+			return fmt.Errorf("where clause contains forbidden pattern: %s", keyword)
 		}
 	}
 
@@ -1203,27 +1239,16 @@ func (h *QueryHandler) anchorFor(ctx context.Context, database, measurement stri
 // anchor it is the bare path, exactly as before #914.
 func readParquetExpr(keyword, anchor string, paths []string, options string) string {
 	if anchor == "" && len(paths) == 1 {
-		return keyword + " read_parquet(" + quotePath(paths[0]) + ", " + options + ")"
+		return keyword + " " + sqlutil.ReadParquet(quotePath(paths[0]), options)
 	}
-	var sb strings.Builder
-	sb.WriteString(keyword)
-	sb.WriteString(" read_parquet([")
-	n := 0
+	quoted := make([]string, 0, len(paths)+1)
 	if anchor != "" {
-		sb.WriteString(quotePath(anchor))
-		n++
+		quoted = append(quoted, quotePath(anchor))
 	}
 	for _, p := range paths {
-		if n > 0 {
-			sb.WriteString(", ")
-		}
-		sb.WriteString(quotePath(p))
-		n++
+		quoted = append(quoted, quotePath(p))
 	}
-	sb.WriteString("], ")
-	sb.WriteString(options)
-	sb.WriteString(")")
-	return sb.String()
+	return keyword + " " + sqlutil.ReadParquetList(quoted, options)
 }
 
 // getMeasurementSchema serves GET /api/v1/databases/:database/measurements/:measurement/schema.
@@ -3458,7 +3483,10 @@ func quotePath(path string) string {
 }
 
 // buildReadParquetOptions builds the read_parquet options string.
-// Returns options like "union_by_name=true"
+//
+// Hive inference is NOT listed here: sqlutil.ReadParquet adds
+// hive_partitioning=false to every call it renders, so naming it here too
+// would emit the option twice (#1005).
 // Note: column pruning via 'columns' parameter is not supported in current DuckDB version.
 // DuckDB handles projection pushdown internally when it sees which columns are actually used.
 func buildReadParquetOptions() string {
@@ -3710,8 +3738,32 @@ func shouldSkipTableConversion(table string) bool {
 // or: {database}/{measurement}/**/*.parquet (relative path)
 // The key insight: database/measurement are always followed by year directories (4-digit numbers)
 func (h *QueryHandler) extractDBMeasurementFromPath(path string) (database, measurement string) {
-	// Normalize path separators
-	path = strings.ReplaceAll(path, "\\", "/")
+	// Backslashes are forbidden in storage keys. A local backend may,
+	// however, have native separators in its trusted root on Windows.
+	if strings.Contains(path, `\`) {
+		local, ok := h.storage.(*storage.LocalBackend)
+		if !ok {
+			return "", ""
+		}
+
+		root := local.GetBasePath()
+		if !strings.HasSuffix(root, string(filepath.Separator)) {
+			root += string(filepath.Separator)
+		}
+
+		// Only the exact local root may contain native separators. Never
+		// normalise a backslash in the database, measurement or file key.
+		if !strings.HasPrefix(path, root) {
+			return "", ""
+		}
+		keyPath := strings.TrimPrefix(path, root)
+		if strings.Contains(keyPath, `\`) {
+			return "", ""
+		}
+
+		// The remaining suffix contains no backslashes; parse it using '/'.
+		path = keyPath
+	}
 
 	// Remove any s3:// or azure:// prefix and bucket name
 	if strings.Contains(path, "://") {
@@ -3835,6 +3887,10 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 			Str("database", database).
 			Str("measurement", measurement).
 			Msg("No tier metadata found, using hot tier")
+		// Built on absent metadata, so it must not be cached: the rows appear
+		// as soon as a flush, a pull or a tier scan writes them, and a cached
+		// unpruned glob would outlive that by up to the transform cache TTL.
+		pruning.MarkVolatile(ctx)
 		return readParquetExpr(keyword, h.anchorFor(ctx, database, measurement), []string{h.getStoragePath(ctx, database, measurement)}, options)
 	}
 
@@ -3851,6 +3907,23 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 		if _, ok := tieredPaths[tiering.TierHot]; ok {
 			sources = append(sources, tierSource{tiering.TierHot, h.getStoragePath(ctx, database, measurement), h.storage})
 		}
+	} else {
+		// No row claims hot data, so this read omits local files. That is the
+		// correct steady state for a measurement whose data has all migrated
+		// to cold, so the transform is cached like any other — an earlier
+		// revision of this change marked it volatile, which would have
+		// stopped every archive measurement from ever caching its transform
+		// and made each query re-list cold storage.
+		//
+		// What makes the transient case safe instead is the writer side: the
+		// replication drainer drops the query caches for a measurement whose
+		// tier rows it changes, so a node that acquires hot rows for a
+		// measurement it is only receiving does not keep serving a cold-only
+		// read.
+		h.logger.Debug().
+			Str("database", database).
+			Str("measurement", measurement).
+			Msg("No hot tier metadata for this measurement; local files are excluded from this read")
 	}
 
 	// Cold tier (S3/Azure) - only if metadata says there's cold data
@@ -5239,8 +5312,9 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	// SECURITY (GHSA-wmjj-g8xc-6hwr): run the SHARED validator over the fully
 	// assembled statement.
 	//
-	// validateWhereClauseQuery above is a substring blocklist that blocks
-	// neither SELECT nor any DuckDB I/O table function, so a `where` fragment
+	// validateWhereClauseQuery above is a blocklist (whole-word keywords and
+	// substring punctuation on a literal-masked copy) that blocks neither
+	// SELECT nor any DuckDB I/O table function, so a `where` fragment
 	// could smuggle a cross-tenant read through a scalar subquery
 	// (`time > (SELECT max(v) FROM parquet_scan('/other-tenant/d.parquet'))`).
 	// RBAC only inspects the path params, and the DuckDB sandbox allowlists the
@@ -5274,7 +5348,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	// route and query string. It cannot see the user-supplied `where` fragment,
 	// which the transform below rewrites like any other table position — so a
 	// subquery in `where` read a second measurement that nothing had
-	// authorized. validateWhereClauseQuery is a substring blocklist and does
+	// authorized. validateWhereClauseQuery is a keyword blocklist and does
 	// not stop it: it blocks `;`, comments and DDL/DML, not a nested read.
 	// Enumerating read syntaxes does not work either — DuckDB spells the same
 	// thing `(SELECT x FROM t)`, `(FROM t)` and `(TABLE t)`, and `FROM` is

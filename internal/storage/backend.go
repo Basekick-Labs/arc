@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"time"
 )
 
@@ -11,6 +12,37 @@ import (
 // backends that do not support append writes (S3, Azure Blob Storage).
 // Callers should delete any partial file and retry from byte zero.
 var ErrResumeNotSupported = errors.New("storage: resume not supported by this backend")
+
+// ErrObjectNotFound reports that a key names no object.
+//
+// It exists so a caller can tell "that object is not there" apart from "the
+// store would not answer" with ONE round trip. Without it the only portable
+// way to ask was Exists-then-Read, which doubles the request count on a path
+// that runs once per object — the backup listing reads a manifest per backup,
+// and on a remote destination with a few hundred backups the extra HEAD per
+// backup is what exhausts an API handler's budget on a perfectly healthy
+// store.
+//
+// Each backend wraps it from its own not-found shape; IsNotFound is the
+// predicate to use rather than string-matching, because the shapes differ
+// (an *fs.PathError locally, NoSuchKey on S3, a 404 ResponseError on Azure).
+var ErrObjectNotFound = errors.New("file not found")
+
+// IsNotFound reports whether err is a backend saying the key names no object.
+//
+// Tolerant on purpose: it accepts the wrapped sentinel, a wrapped fs
+// not-exist, and the per-backend shapes the two SDKs produce, because not
+// every error path in this package has been routed through the sentinel and a
+// false "no" here would turn an absent object into a hard failure.
+func IsNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrObjectNotFound) || errors.Is(err, fs.ErrNotExist) {
+		return true
+	}
+	return isNotFoundError(err) || isAzureNotFoundError(err)
+}
 
 // Backend defines the interface for storage backends (local, S3, MinIO)
 type Backend interface {
@@ -108,7 +140,9 @@ type StagingInspector interface {
 
 	// ListStaged returns metadata for staged partials whose key has the given
 	// prefix, so a caller can reclaim abandoned ones. Staged partials are
-	// invisible to List by design, so this is the only way to find them.
+	// invisible to List by design, so this is the way to find them. Every key
+	// it returns is accepted by DeleteStaged: a partial whose key DeleteStaged
+	// refuses is omitted and surfaces through UnusableLister instead (#772).
 	ListStaged(ctx context.Context, prefix string) ([]ObjectInfo, error)
 }
 
@@ -135,6 +169,27 @@ type ObjectInfo struct {
 // This is useful for retention policies that need to check file ages.
 type ObjectLister interface {
 	ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, error)
+}
+
+// PrefixProber answers "is there at least one listable object under this
+// prefix" without listing the prefix.
+//
+// ListObjects is the wrong tool for that question on a large prefix: it walks
+// every file (local) or pages through every key (S3, Azure) and returns them
+// all, when the caller only needs to know whether the first one exists. The
+// backup API asks it for up to 256 database names inside one request timeout,
+// and a database can hold millions of files, so the probe has to stop at the
+// first hit. Implementations apply the same prefix contract (ValidateListPrefix)
+// and the same visibility rule as ListObjects: an object the listing would
+// hide (a dot-prefixed name, a key the contract refuses, a staging partial) is
+// not a hit, so "false" from the probe and "empty" from ListObjects agree. A
+// prefix that names nothing at all is false with a nil error.
+//
+// Optional: callers type-assert and fall back to ListObjects when the backend
+// does not implement it (test fakes that embed the Backend interface, for
+// instance). LocalBackend, S3Backend and AzureBlobBackend all implement it.
+type PrefixProber interface {
+	HasObjectsUnderPrefix(ctx context.Context, prefix string) (bool, error)
 }
 
 // UnusableObject is an object that exists in the store but that no listing

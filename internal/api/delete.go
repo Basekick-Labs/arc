@@ -34,6 +34,9 @@ type DeleteCoordinator interface {
 	GetFileEntry(path string) (*raft.FileEntry, bool)
 	IsPrimaryWriter() bool
 	Role() string
+	// LocalNodeID names this node in the manifest. A rewrite stamps it as the
+	// origin of the new bytes (#976).
+	LocalNodeID() string
 }
 
 // errManifestFailure is returned when a Raft manifest update fails.
@@ -480,7 +483,16 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 		return false, fmt.Errorf("WHERE clause is required. To delete all data, use WHERE clause '1=1' with confirm=true")
 	}
 
-	whereUpper := strings.ToUpper(strings.TrimSpace(where))
+	// Validation scans run on the MASKED clause: a forbidden keyword or ';'
+	// inside a string literal is data, not SQL (#834). The raw clause is what
+	// gets interpolated into the DuckDB statement, so the unmatched-quote and
+	// unmatched-parenthesis checks below stay on it. Backtick identifiers are
+	// normalised to double quotes first, as the query path's validator does:
+	// the masker does not know backticks, so a quote inside one would
+	// otherwise open a spurious literal that hides whatever follows it.
+	maskInput := backticksToDoubleQuotes(where)
+	maskedWhere, masks := sqlutil.MaskStringLiterals(maskInput, sqlutil.HasQuotes(maskInput))
+	whereUpper := strings.ToUpper(strings.TrimSpace(maskedWhere))
 
 	// Remove "WHERE" prefix if present
 	if strings.HasPrefix(whereUpper, "WHERE ") {
@@ -496,14 +508,22 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 
 	// Check for dangerous SQL keywords using word boundaries to avoid false positives
 	// on column names like "offset" (contains SET), "payload" (contains LOAD), "dataset" (contains SET)
-	if match := dangerousKeywordPattern.FindString(where); match != "" {
+	if match := dangerousKeywordPattern.FindString(maskedWhere); match != "" {
 		return false, fmt.Errorf("WHERE clause contains forbidden keyword: %s", strings.ToUpper(match))
 	}
 
 	// Reject filesystem-I/O table functions (see dangerousIOFunctionPattern).
 	// Matched against the identifier-quote-stripped form so the quoted spelling
 	// `"glob"(...)`, which DuckDB executes identically, cannot slip past.
-	ioCheck := strings.NewReplacer(`"`, "", "`", "").Replace(where)
+	ioCheck := maskedWhere
+	for _, mask := range masks {
+		if mask.Identifier {
+			// Keep quoted identifiers visible to the function-name check while
+			// leaving string-literal contents masked.
+			ioCheck = strings.ReplaceAll(ioCheck, mask.Placeholder, mask.Original)
+		}
+	}
+	ioCheck = strings.NewReplacer(`"`, "", "`", "").Replace(ioCheck)
 	if m := dangerousIOFunctionPattern.FindStringSubmatch(ioCheck); m != nil {
 		return false, fmt.Errorf("WHERE clause contains forbidden file I/O function: %s()", m[1])
 	}
@@ -534,7 +554,6 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	// ordering constraint queryMeasurement documents. A fragment that
 	// introduces a relation carries its own keyword, so the scanner arms
 	// without needing a synthetic FROM clause around it.
-	maskInput := backticksToDoubleQuotes(where)
 	features := scanSQLFeatures(maskInput)
 	normalised, _ := sqlutil.MaskStringLiterals(maskInput, features.hasQuotes)
 	normalised = stripSQLComments(normalised, features.hasDashComment || features.hasBlockComment)
@@ -647,11 +666,11 @@ func (h *DeleteHandler) countMatchingRowsInFiles(ctx context.Context, files []fi
 	// Single query to get counts per file using filename column
 	query := fmt.Sprintf(`
 		SELECT filename, COUNT(*) as match_count
-		FROM read_parquet(%s, filename=true, union_by_name=true)
+		FROM %s
 		WHERE %s
 		GROUP BY filename
 		HAVING COUNT(*) > 0`,
-		pathList.String(), whereClause)
+		sqlutil.ReadParquet(pathList.String(), "filename=true", "union_by_name=true"), whereClause)
 
 	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
@@ -710,7 +729,7 @@ func (h *DeleteHandler) countMatchingRowsIndividually(ctx context.Context, files
 	db := h.db.DB()
 
 	for _, f := range files {
-		query := fmt.Sprintf("SELECT COUNT(*) FROM read_parquet(%s) WHERE %s", sqlutil.QuoteStringLiteral(f.queryPath), whereClause)
+		query := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s", sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(f.queryPath)), whereClause)
 		var count int64
 		if err := db.QueryRowContext(ctx, query).Scan(&count); err != nil {
 			h.logger.Warn().Err(err).Str("file", f.relativePath).Msg("Failed to count matching rows, skipping file")
@@ -744,8 +763,8 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 		SELECT
 			COUNT(*) as total,
 			COUNT(*) FILTER (WHERE NOT (%s)) as remaining
-		FROM read_parquet(%s)`,
-		whereClause, sqlutil.QuoteStringLiteral(queryPath))
+		FROM %s`,
+		whereClause, sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(queryPath)))
 
 	if err := db.QueryRowContext(ctx, countQuery).Scan(&rowsBefore, &rowsAfter); err != nil {
 		return 0, fmt.Errorf("failed to count rows: %w", err)
@@ -795,9 +814,12 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 		return 0, rewriteErr
 	}
 
-	// Notify the cluster manifest that this file's content changed. Non-fatal:
-	// the rewrite succeeded in storage; a stale manifest entry is eventually
-	// consistent and does not affect query correctness.
+	// Notify the cluster manifest that this file's content changed. Non-fatal
+	// for this request: the rewrite already succeeded in storage. It is not
+	// harmless for the cluster, though: the manifest entry is what every other
+	// node pulls by, so a lost update leaves replicas on the pre-rewrite bytes
+	// until the path's next content change. The warning below is the only
+	// signal of that.
 	if h.coordinator != nil {
 		if err := h.updateManifestAfterRewrite(relativePath, s3Result); err != nil {
 			h.logger.Warn().Err(err).Str("file", relativePath).Msg("Failed to update manifest after partial rewrite")
@@ -827,13 +849,13 @@ func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, _, where
 	// database-wide setting is false.
 	copyQuery := fmt.Sprintf(`
 		COPY (
-			SELECT * FROM read_parquet(%s) WHERE NOT (%s)
+			SELECT * FROM %s WHERE NOT (%s)
 		) TO %s (
 			FORMAT PARQUET,
 			COMPRESSION ZSTD,
 			COMPRESSION_LEVEL 3,
 			ROW_GROUP_SIZE %d
-		)`, sqlutil.QuoteStringLiteral(filePath), whereClause, sqlutil.QuoteStringLiteral(tempFile), parquetRowGroupSize)
+		)`, sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(filePath)), whereClause, sqlutil.QuoteStringLiteral(tempFile), parquetRowGroupSize)
 
 	if err := database.ExecPreservingInsertionOrder(ctx, db, copyQuery); err != nil {
 		os.Remove(tempFile)
@@ -903,13 +925,13 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 	// database-wide setting is false.
 	copyQuery := fmt.Sprintf(`
 		COPY (
-			SELECT * FROM read_parquet(%s) WHERE NOT (%s)
+			SELECT * FROM %s WHERE NOT (%s)
 		) TO %s (
 			FORMAT PARQUET,
 			COMPRESSION ZSTD,
 			COMPRESSION_LEVEL 3,
 			ROW_GROUP_SIZE %d
-		)`, sqlutil.QuoteStringLiteral(s3Path), whereClause, sqlutil.QuoteStringLiteral(tempPath), parquetRowGroupSize)
+		)`, sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(s3Path)), whereClause, sqlutil.QuoteStringLiteral(tempPath), parquetRowGroupSize)
 
 	if err := database.ExecPreservingInsertionOrder(ctx, db, copyQuery); err != nil {
 		return 0, nil, fmt.Errorf("failed to write filtered data: %w", err)
@@ -970,17 +992,19 @@ func (h *DeleteHandler) isRemoteBackend() bool {
 }
 
 // updateManifestAfterRewrite updates the cluster manifest entry for a partially
-// rewritten file. It reads the existing entry to preserve all immutable fields
-// (database, measurement, origin node, tier, etc.) and updates only the mutable
-// metadata: SizeBytes and SHA256.
+// rewritten file. It reads the existing entry to keep the fields that identify
+// the file (path, database, measurement, partition time, tier, created-at) and
+// replaces the three that describe its bytes: SizeBytes, SHA256 and
+// OriginNodeID, the last because the node that rewrote the file is now the one
+// that holds the bytes the manifest describes (#976).
 //
-// For local storage, the new size and checksum are computed from the rewritten
-// file on disk. For S3, size/checksum are not re-read (would require an extra
-// round-trip) — the manifest entry is still re-committed so peers know the file
-// changed, but SizeBytes and SHA256 will be stale until the next register.
+// For local storage the new size and checksum are read from the rewritten file
+// on disk. For S3 they come from the rewrite result, which computed them while
+// uploading.
 //
-// Failure is non-fatal: the rewrite already succeeded in storage; a stale
-// manifest entry is eventually consistent and does not affect query correctness.
+// Failure is non-fatal for the request: the rewrite already succeeded in
+// storage. The caller logs it, because nothing re-proposes a lost update and
+// replicas keep serving the pre-rewrite bytes until the path changes again.
 func (h *DeleteHandler) updateManifestAfterRewrite(relativePath string, s3 *s3RewriteResult) error {
 	existing, ok := h.coordinator.GetFileEntry(relativePath)
 	if !ok {
@@ -989,6 +1013,12 @@ func (h *DeleteHandler) updateManifestAfterRewrite(relativePath string, s3 *s3Re
 	}
 
 	entry := *existing // copy all fields to preserve immutable metadata
+	// The node that performed the rewrite owns the new bytes. After a writer
+	// failover the primary is not the file's origin, and keeping the old origin
+	// sent every replica to a node that still had the pre-rewrite bytes: a
+	// wasted transfer and a checksum failure on every pull, and the old origin
+	// itself skipped the update as its own and kept the deleted rows (#976).
+	entry.OriginNodeID = h.coordinator.LocalNodeID()
 
 	if lb, ok := h.storage.(*storage.LocalBackend); ok {
 		basePath := lb.GetBasePath()

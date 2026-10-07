@@ -1,6 +1,160 @@
 # Arc v2026.09.3 Release Notes
 
-> **Status:** Planned — November 2026 patch release.
+> **Status:** Released 2026-10-05.
+
+## Fixed: a cluster node's tier metadata now follows its own disk, not only what it ingested
+
+On a cluster with peer file replication and a cold tier, a node's `tier_files`
+rows only ever described files that node had written itself. Files the
+replication puller pulled from a peer were never recorded, and files another
+node migrated to cold were not marked cold locally until the receiving node's
+next cold-tier sync. The scan that would have reconciled either runs from the
+migration schedule — `0 2 * * *` by default — and from
+`POST /api/v1/tiering/scan`; nothing ran it at startup.
+
+Because the query layer routes reads from those rows, the gap had two effects
+on any node that was not currently ingesting a measurement:
+
+- **Partition pruning was lost.** With no row for the measurement, the read
+  fell back to the unpruned `{database}/{measurement}/**/*.parquet` glob, so a
+  windowed query scanned every partition instead of the hours it asked for.
+- **Reads could silently omit local data.** The hot tier is included in a
+  multi-tier read only when a row says this node has hot data. A measurement
+  that had a cold row and no hot row — a node whose hot rows were retired after
+  another node migrated the measurement, or one that joined and received its
+  files by catch-up after its own scan — dropped its local files from the read
+  entirely. A windowed `count(*)` over data sitting on that node's disk
+  returned `0`, with `success: true` and no error; an unwindowed `count(*)`
+  undercounted.
+
+Three changes close it:
+
+- The replication puller reports every file it pulls and keeps, and the
+  local-delete workers report every copy they remove, to this node's tier
+  metadata. Both reports are applied by a single background writer, so a
+  catch-up burst cannot pile writers onto the SQLite handle that auth, audit,
+  continuous queries and the ingest flush path share. The cold-tier existence
+  checks a migration's unlinks need run in parallel ahead of the writes, so a
+  nightly migration of thousands of files is recorded on every node within
+  about a minute rather than being cut off at a deadline, and the query
+  layer's caches are dropped only when the set of tiers a measurement reads
+  from actually changes — not once per replicated file.
+- The node decides what a removal means from evidence rather than from the
+  manifest delete's reason, which an operator can supply: it checks whether
+  the object is actually in cold before marking the row cold, and retires the
+  hot row otherwise.
+- Tier metadata is now scanned once at startup, in the background. This also
+  covers files that arrived while a node was down, and files already on disk
+  when upgrading to this release. On a shared-storage cluster the scan lists
+  the shared hot bucket from every node at boot — the same listing the nightly
+  cycle already performs, now also once per restart.
+- A cold tier whose backend fails to construct — bad credentials, an
+  unreachable profile — is now left genuinely absent rather than present and
+  unusable. Previously the failed constructor's nil was stored behind the
+  backend interface, so every "is there a cold tier" check passed and the
+  first cold listing dereferenced it; the startup scan would have turned that
+  into a crash at boot.
+
+Two visible consequences. `GET /api/v1/tiering/files` and
+`/api/v1/tiering/stats` counts now converge across nodes within seconds of a
+file arriving instead of diverging until the next scan — a node that reported
+`0` files for a measurement it holds will now report them. And the `tier`
+column in `SHOW DATABASES` changes from `local` to `hot` for databases whose
+files reach a node only by replication, because that column reflects the tier
+rows.
+
+New counters for the path: `tier_registered` alongside `pulled` in
+`/api/v1/cluster`'s `replication_catchup_status` — it counts pulls a tier
+recorder accepted, so it tracks `pulled` where tiering is enabled and stays at
+zero where it is not — and `replication_events` in `/api/v1/tiering/status`,
+whose `dropped` is zero on a healthy node: reports are queued without blocking
+the pull or delete workers and the queue grows as a burst needs; it drops only
+if the drainer stops making progress for long enough to reach its memory bound,
+or at shutdown with work still queued, and either way the next tier scan
+reconciles.
+
+One behaviour note for the failure case: if the tiering manager cannot start —
+an unparseable `migration_schedule`, say — queries still route across tiers and
+files are still registered, but no migration or scheduled scan runs. The
+startup log line now says so rather than reporting only the failure.
+
+## Changed: `arc.toml` no longer ships MinIO connection values for the cold tier
+
+The sample `arc.toml` — which is copied into the container image — set
+`s3_endpoint = "localhost:9000"`, static `minioadmin` credentials,
+`s3_use_ssl = false` and `s3_path_style = true` under
+`[tiered_storage.cold]`, with a comment telling operators to leave the
+endpoint empty for AWS. **That instruction could not be followed from the
+environment.** Arc reads configuration through viper's `AutomaticEnv`, which
+treats an empty environment variable as unset, so
+`ARC_TIERED_STORAGE_COLD_S3_ENDPOINT=""` did not clear the file's value: a cold
+tier intended for AWS S3 silently addressed `localhost:9000` instead. Every
+cold listing then failed, which sets `ColdSyncFailed` and makes each migration
+cycle skip.
+
+Those keys, and `s3_bucket`, are now commented out in the sample file, so Arc's
+built-in defaults apply — no endpoint, HTTPS, virtual-hosted addressing, and
+credentials from the AWS chain, which is what IRSA and instance-role detection
+need. The values remain in the file as a commented MinIO/dev block.
+
+**If you enabled the cold tier and relied on the shipped MinIO values, uncomment
+that block as a set.** Leaving only `s3_endpoint` set now means HTTPS and
+virtual-hosted addressing against a MinIO endpoint. Deployments that configure
+the cold tier through environment variables or Helm are unaffected. Note the
+general rule this illustrates: an empty environment variable does not blank a
+key that a configuration file sets — give the key the value you want, or remove
+it from the file.
+
+## Peer file fetches ignored cancellation during TCP/TLS connection setup ([#901](https://github.com/Basekick-Labs/arc/issues/901))
+
+A follow-up to the fetch-timeout fix shipped in 26.09.2 ([#899](https://github.com/Basekick-Labs/arc/pull/899)): connection establishment itself was not context-aware. `FetchClient.Fetch` checked `ctx.Err()` and derived a bounded dial timeout, but dialed through `security.Dial`, which wraps `tls.DialWithDialer` for TLS. That performs the TLS handshake against a background context internally, so cancelling the caller's context could not interrupt a peer that accepted the TCP connection, received the ClientHello, and then never responded. The connection-close cancellation hook was also installed only after the dial succeeded, so it offered no protection during dialing. A cancelled fetch could hold its pull worker until the ten-second dial timeout the coordinator hardcodes for peer fetches elapsed, delaying `Puller.Stop`, which cancels and joins its workers.
+
+`FetchClient` now dials through a new `security.DialContext`, which uses `net.Dialer.DialContext` for plain TCP and `tls.Dialer.DialContext` for TLS — the latter threads the context through to the handshake via `tls.Conn.HandshakeContext`, so a cancelled context now interrupts a stalled handshake instead of only being noticed after it. `security.Dial` is unchanged and still used by five other cluster-internal call sites. Three of them — the leave broadcast, the heartbeat send and the seed join — have no context in scope, so there is nothing for them to honour. Two do: the leader-forward dial and the WAL replication receiver's reconnect, where a stalled handshake still holds the caller for its dial timeout and defeats a surrounding shutdown select. Those are the same bug on different paths and are not fixed here.
+
+Contributed by [@pujitha24](https://github.com/pujitha24) in [#902](https://github.com/Basekick-Labs/arc/pull/902).
+
+## Fixed: the WAL purge no longer infers durability from a file's age ([#1009](https://github.com/Basekick-Labs/arc/issues/1009))
+
+The periodic purge deleted rotated WAL files once their modification time passed a threshold of three times `ingest.max_buffer_age_ms`, taking that age as proof the data had reached Parquet. Whenever a flush took longer than the threshold — a slow or unavailable object store being the obvious way — the only remaining copy of acknowledged writes was deleted before it was durable. PR [#997](https://github.com/Basekick-Labs/arc/pull/997) measured 48,500 records lost this way.
+
+Rotated files that carry tracked WAL entries are now reclaimed only below a floor: the lowest sequence this process has appended that no durable flush checkpoint covers. No clock is involved, so neither mtime granularity nor an NTP step can affect it. The floor is released when a flush checkpoints the entry; when a write is **abandoned after its WAL append** — a type-mismatched column, the schema-churn guard; and when the checkpoint itself fails to persist, since the data did reach storage and only the record of it is missing. Without those a single rejected write would hold the floor for the life of the process, and because the purge stops at the first file it must retain rather than skipping it, nothing after that file would be reclaimed either.
+
+An identity a *replay* inherited is deliberately not released: it belongs to a WAL file whose keep-or-delete decision is recovery's, and the periodic recovery replays this process's own files.
+
+Two classes of file have no flush state to reason about, and those are still reclaimed by age — which is the only signal that exists for them, and a far narrower role for the clock than before:
+
+- **Files written by a previous process.** Their sequences belong to another numbering domain, so no floor of this process says anything about them. Recovery deletes the ones it replays, but deliberately keeps a file holding an entry it could not apply and one left by an unclean shutdown.
+- **Files holding only untracked entries.** A replication follower writes every replicated entry untracked, because its durability comes from the primary and from peer Parquet replication rather than from its own WAL. On a reader node that is every file it writes, so without this a follower's WAL directory would grow until the disk filled.
+
+A file carrying tracked sequences is never purged by age, whatever its age.
+
+`ingest.max_buffer_age_ms` therefore no longer bounds how long a rotated WAL file holding tracked data is kept; the flush floor does. It still sets the age threshold (at three times its value) for the two unaccounted classes above — so **raising it raises WAL disk usage on reader nodes**, where every file falls into the untracked class.
+
+One new figure to watch: `pending_unflushed` in the WAL stats is the floor's working set. It climbs while flushes fail and does not come back down until they succeed, so a steadily rising value is an object-store problem rather than a WAL one. It is also the memory this floor costs — one entry per unflushed write — which is reported rather than capped, as with the ingest buffers.
+
+Contributed by [@lecodev-26](https://github.com/lecodev-26) in [#1056](https://github.com/Basekick-Labs/arc/pull/1056).
+
+## Compaction dedup metrics count Parquet rows correctly ([#1015](https://github.com/Basekick-Labs/arc/issues/1015))
+
+Deduplication row counts now come from DuckDB's `parquet_file_metadata`, where
+`num_rows` is available, so the before/after counts and dedup-ratio log can be
+produced. A count failure is now reported at Warn level instead of being
+silently discarded.
+
+The count had been read from `parquet_metadata`, which has no `num_rows`
+column, so the query returned a binder error on every compaction and the error
+was discarded at both call sites. The row count was therefore always zero and
+the log it gates — `Deduplication removed duplicate rows`, the only output Arc
+produces for how many rows de-duplication discarded — **never fired on any
+release up to and including 2026.09.2**. An operator who saw no such line was
+reading an absent signal, not an absence of duplicates, and no historical dedup
+volume can be recovered from the logs. That matters beyond the missing metric:
+it is the line that would have surfaced the row loss described under
+[#1005](https://github.com/Basekick-Labs/arc/issues/1005) in these notes, where
+a `key=value` compaction temp directory collapsed the de-duplication key and
+discarded rows of distinct series as duplicates.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1019](https://github.com/Basekick-Labs/arc/pull/1019).
 
 ## Fixed: edge-sync names reject DuckDB glob and Hive partition syntax ([#994](https://github.com/Basekick-Labs/arc/issues/994))
 
@@ -17,10 +171,110 @@ refused from then on. There is no rename: re-registering mints a new secret and
 needs the edge box reconfigured, and the data already under the old namespace
 stays on disk where it is, unmigrated. Nothing is deleted.
 
-This closes the admission side only, and only for new names. Arc does not yet
-disable Hive inference on the reads it issues, so a `key=value` directory that
-is already on disk is still read that way — tracked in
-[#1005](https://github.com/Basekick-Labs/arc/issues/1005).
+This closes the admission side only, and only for new names: a `key=value`
+directory already on disk is unaffected by this change. The read side is fixed
+separately in [#1005](https://github.com/Basekick-Labs/arc/issues/1005), below.
+
+## Fixed: a `key=value` directory could silently overwrite a column's values ([#1005](https://github.com/Basekick-Labs/arc/issues/1005))
+
+DuckDB derives a column from any `key=value` directory component of a path it
+reads. Where that name matched a column already in the file, the value from the
+path replaced the stored value and its type, for every row, with no error. Arc
+never asked for that inference and never used it — the storage layout is parsed
+explicitly — but it did not switch it off, so any Arc deployment whose storage
+root or compaction temp directory contained a `key=value` directory read
+altered data.
+
+Deletes were the worst of it, because the `WHERE` clause was evaluated against
+the substituted value. A delete naming the directory's value matched every row
+in the file and took the "all rows deleted" path, which removes the file
+outright; a delete naming the value actually stored matched nothing, reported
+success and removed nothing. Where a delete did rewrite a file, the rows it kept
+were written back carrying the path's value instead of their own. Compaction
+running through a `key=value` temp directory baked the substituted column into
+its output, and if the inferred name matched a tag the de-duplication key
+collapsed, so rows of distinct series were discarded as duplicates.
+
+Every read Arc issues now disables the inference. Reads are built through a
+single helper so the flag cannot be forgotten, and a test refuses a
+`read_parquet` call written anywhere else — there is no DuckDB setting for this,
+so the flag has to travel with each call, and nothing but that test keeps the
+next one honest. On an unaffected deployment nothing changes: no part of Arc
+consumed an inferred column. The arcx engine is deliberately untouched; it reads
+Parquet itself, performs no such inference, and rejects the option.
+
+**Checking whether a deployment was affected.** Two configured directories end
+up inside a `read_parquet` path: `storage.local_path`, and
+`compaction.temp_directory`, into which compaction downloads its input files
+before reading them. (`database.temp_directory` is DuckDB's own spill
+directory and never appears in a read, so it does not matter here.) The
+`key=value` component can be anywhere in the path, including above the
+configured directory, so test the whole path and not just the tree beneath it.
+Set the two variables to the values as written in the config and run this from
+the working directory Arc runs in:
+
+```sh
+for d in "$STORAGE_LOCAL_PATH" "$COMPACTION_TEMP_DIRECTORY"; do
+  [ -n "$d" ] && [ -d "$d" ] || { echo "skipped (not a directory): ${d:-<unset>}"; continue; }
+  case "$d" in /*) abs=$d ;; *) abs=$PWD/$d ;; esac
+  case "$abs" in *=*) echo "ancestor: $abs" ;; esac
+  find "$abs" -type d -name '*=*'
+done
+```
+
+It prints nothing when the deployment is unaffected. Every `skipped` line is an
+unchecked directory, not a clean one.
+
+Symlinks are deliberately not resolved, because neither Arc nor DuckDB resolves
+them: Arc makes the configured path absolute lexically, and DuckDB infers from
+the string it is handed. A symlink whose target happens to sit under a
+`key=value` directory is therefore not affected, and a `key=value` component in
+the path as written is, whatever it resolves to. The one case this misses is
+Arc's own working directory being reached through a symlink while a relative
+path is configured; compare `pwd` with `pwd -P` if that applies.
+
+On S3 and Azure the same test is against `storage.s3.bucket` plus its prefix,
+or the Azure container name, and the keys underneath them. Arc's own keys are
+`{database}/{measurement}/{year}/{month}/{day}/{hour}/`, so a `=` can only come
+from the configured prefix or from a database or measurement name — which the
+write path has rejected since [#992](https://github.com/Basekick-Labs/arc/issues/992).
+
+**What a `key=value` path leaves behind, and what can be done about it.** The
+inference only mattered where the derived name matched a column that was
+already there; where it did not, it added a column Arc ignored.
+
+- *Field-schema anchors* recorded under such a path hold the extra column. It is
+  now always empty. A schema rebuild alone will not remove it — a rebuild merges
+  and never drops a field — so delete the measurement's anchor object,
+  `_schema/{database}/{measurement}.parquet` in the storage root, and only then
+  `POST /api/v1/databases/{database}/measurements/{measurement}/schema/rebuild`.
+  Note that backup and restore copy anchors, so restoring a backup taken
+  beforehand brings the column back.
+- *Files a delete rewrote, and files a delete removed* were altered or lost when
+  it happened. Neither can be reconstructed from what is on disk.
+- *Compacted output* written through a `key=value` compaction temp directory has
+  the substituted column baked in, and where the derived name matched a tag,
+  rows of distinct series were discarded as duplicates. There is no log line to
+  look back for: the de-duplication ratio Arc emits after a compaction counted
+  its input rows with a query that always errored, so the one signal that would
+  have reported the loss never fired on any release up to and including
+  2026.09.2. That count is fixed in this release
+  ([#1015](https://github.com/Basekick-Labs/arc/issues/1015)), which makes the
+  signal available from now on but recovers nothing retrospectively.
+- *Continuous-query destinations* hold the aggregates that were computed from
+  the substituted column. Re-running a continuous query appends rather than
+  corrects, so the affected windows have to be removed first.
+
+For everything in that list the recovery is a restore from a backup taken before
+the affected operation ran — a backup taken after it contains the same altered
+files. Backups and Iceberg exports perform none of these reads themselves, so
+neither introduced the problem, but an Iceberg export over affected files
+carries the substituted column in its schema.
+
+One shape to expect after upgrading on an affected deployment: a query naming a
+column that only ever existed because of the inference will now fail to bind
+where it previously returned the path's value, unless the column was recorded in
+a field-schema anchor, in which case it binds and returns empty.
 
 ## New: per-peer replication lag gauges ([#819](https://github.com/Basekick-Labs/arc/issues/819))
 
@@ -307,6 +561,386 @@ predate that fix and #978.
 
 ## Bug fixes
 
+### Fallback compaction job IDs support spoke namespaces ([#750](https://github.com/Basekick-Labs/arc/issues/750))
+
+When a compaction job was created without an explicit JobID, its fallback ID
+included the raw database name. Edge-sync pseudo-databases contain a slash,
+so the generated ID failed completion-manifest validation and could create an
+unintended nested temporary directory. Fallback IDs now use the existing
+database-name sanitiser while preserving the original database and any
+caller-supplied JobID.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#912](https://github.com/Basekick-Labs/arc/pull/912).
+
+### A node that rejoins through a Raft snapshot now removes the replicas the cluster deleted while it was away ([#962](https://github.com/Basekick-Labs/arc/issues/962))
+
+On a per-node-storage cluster every node unlinks its local copy of a file when
+the manifest drops it, through the FSM delete callback. That callback fired only
+when a delete was applied from the Raft log. A node that fell far enough behind
+to receive a snapshot instead rebuilt its manifest from the snapshot without
+firing it, so it kept every replica it held before the outage, including the
+files compaction, retention and tiering had deleted in the meantime. Its reads
+glob the disk, so that node alone returned duplicate rows and rows that should
+have been gone, silently, until the orphan sweep (opt-in) removed them.
+
+Restoring a snapshot now diffs the manifest this node last held against the
+restored one and hands every path that disappeared to the same delete workers,
+with the reason `snapshot:removed`. Because that reason cannot say why the file
+left, the unlink is recorded in this node's tier metadata the way an abandoned
+pull is: the cold tier is asked whether the file moved there, so a measurement
+migrated while the node was away reads from cold instead of vanishing from that
+node's results. A process restart that loads its own snapshot into an empty
+manifest has nothing to diff and fires nothing.
+
+One gap remains after a restart: the diff is against the node's last local Raft
+snapshot (`cluster.raft_snapshot_threshold`, default 10,000 entries), not its
+disk. Files this node pulled after that snapshot and the cluster deleted while
+it was down are still removed only by the orphan sweep
+([#1071](https://github.com/Basekick-Labs/arc/issues/1071)).
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#983](https://github.com/Basekick-Labs/arc/pull/983).
+
+### A compaction batch is now applied to the Raft manifest atomically ([#447](https://github.com/Basekick-Labs/arc/issues/447))
+
+Compaction commits its result to the cluster manifest as one Raft entry that
+registers the compacted output and deletes the source files it replaced. The
+FSM applied that batch one operation at a time, taking and releasing the
+manifest lock for each, so a reader listing the manifest between two operations
+could see the output already registered while some sources were still listed:
+duplicate rows for that query on every node that reads the manifest, in a window
+of microseconds that opened on every compaction. The callbacks that drive
+replication saw the same half-applied states.
+
+The whole batch now runs under one write lock, and its callbacks are delivered
+afterwards, in order, against the completed manifest. Single-operation
+registers, updates and deletes behave exactly as before.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#910](https://github.com/Basekick-Labs/arc/pull/910).
+
+### A delete-API rewrite after a writer failover now names the node that holds the new bytes ([#976](https://github.com/Basekick-Labs/arc/issues/976))
+
+The delete API rewrites a Parquet file in place on the primary writer and
+re-commits its manifest entry with the new size and checksum, copying every
+other field from the existing entry, including the origin node. After a writer
+failover the primary is not the node that first wrote the file, so the new bytes
+existed only on the new primary while the manifest still named the old origin.
+Every replica tried the old origin first and received the pre-rewrite bytes;
+before the #999 fix above, that single checksum failure ended the pull and the
+replica dropped its own copy, and since it the pull falls through to the next
+peer at the cost of a wasted full transfer from the stale origin every time. The
+old origin itself was never corrected: it saw an update to a file it had written,
+skipped it as its own, and kept serving the deleted rows.
+
+The rewritten entry now records the rewriting node as its origin. Replicas fetch
+from the node that produced the bytes on the first try, and the old origin sees
+a foreign-origin update and pulls the new file like any other replica, provided
+the rewrite changed the file's size, since the puller's "already here" check
+compares size only (#975). The `DeleteCoordinator` interface gained
+`LocalNodeID()` so the compiler enforces the dependency rather than a runtime
+type assertion.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#984](https://github.com/Basekick-Labs/arc/pull/984).
+
+### Duplicate token-name races no longer increment the auth rejection counter ([#964](https://github.com/Basekick-Labs/arc/issues/964))
+
+Concurrent bootstrap or admin creates for an existing token name are now treated as expected name conflicts rather than malformed or forged entries. Identical Raft replays remain no-ops, while non-identical same-name creates still return an `already exists` error without incrementing `arc_cluster_auth_rejected_total`.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#973](https://github.com/Basekick-Labs/arc/pull/973).
+
+### Audit events no longer alias Fiber request buffers ([#837](https://github.com/Basekick-Labs/arc/issues/837))
+
+The audit middleware builds each event from Fiber accessors (`c.Method()`,
+`c.Path()`, `c.Get`, `c.Params`, `c.Query`) and hands it to a background
+writer that serialises it up to a second later. Arc runs Fiber with
+`Immutable=false`, so every one of those strings aliased a pooled request
+buffer that the next request overwrites. An audit row could therefore record a
+later request's method, path, database, measurement or user agent, or garbage.
+
+The middleware now copies every request-derived string before enqueueing the
+event. It also takes its own copy of handler-supplied detail, so a handler no
+longer has to copy before setting it; the two existing producers already did.
+A regression test mutates the borrowed buffers after the event is queued and
+checks every field.
+
+Contributed by [@0utsights](https://github.com/0utsights) in [#871](https://github.com/Basekick-Labs/arc/pull/871).
+
+### Graceful shutdown registers final Parquet files in the cluster manifest ([#1014](https://github.com/Basekick-Labs/arc/issues/1014))
+
+On a cluster node, the files written by the final Arrow buffer flush during a
+graceful shutdown never reached the cluster manifest. The shutdown sequence
+runs every hook before any component, and the cluster coordinator — which owns
+Raft — was a hook, so Raft was gone before the buffer flushed; the registrar
+that announces files then had nothing to apply to, and the files existed only
+on that node's disk, invisible to peers and to replication.
+
+Raft now outlives the final flush: the cluster coordinator and tiering stop as
+shutdown components, after the Arrow buffer, the file registrar and WAL cleanup,
+in that order. The registrar drains what the final flush queued as batched
+Raft entries — sized to fit the peer protocol frame when a non-leader forwards
+them, retried through a leader election — lets an apply in flight finish
+instead of cancelling it, and reports at `Warn` with a count if any
+registration was not confirmed. A manifest apply that fails at any time is now
+a rate-limited `Warn` rather than `Debug`: nothing re-registers such a file,
+and where the storage reconciliation sweep is enabled a file with no manifest
+entry is an orphan-storage delete candidate once past its grace window. The
+inbound replication receiver still stops before the buffers close, from its
+own hook, and cannot be re-attached while the node shuts down. Tiering's
+SQLite handle, where the node owns it, is no longer closed under the final
+flush's tier registrations.
+
+Queue-full warnings also no longer promise anti-entropy recovery that is not
+implemented.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir)
+for [#1014](https://github.com/Basekick-Labs/arc/issues/1014).
+### ListStaged reported partials its own DeleteStaged refused ([#772](https://github.com/Basekick-Labs/arc/issues/772))
+
+`ListStaged` walked for `*.part` files and reported each stripped key, but
+`DeleteStaged` resolves a key through the validation every backend applies
+(`ValidateKey`), minus the reserved-suffix rule so a legacy `x.part` partial
+stays reclaimable. A partial left behind by an older Arc version can belong to a key
+that is illegal under today's contract, such as one containing a backslash, so
+`ListStaged` reported it and `DeleteStaged` then refused it. Both consumers pipe
+one into the other: the `DROP DATABASE` reclaim of abandoned partials and the
+edge-sync staging sweep each logged a warning for that file on every run and
+never reclaimed it.
+
+`ListStaged` now applies the same validation before reporting an entry, so every
+key it returns is one `DeleteStaged` accepts, and a test pins that round trip.
+A partial with an illegal key is not lost from view: `ListUnusable` already
+reported it and still does; it is simply no longer also reported as reclaimable.
+`DROP DATABASE` now checks `ListUnusable` once it has removed everything it can
+address, and warns with the count and up to ten paths of anything left under the
+database, since those files keep the database visible and nothing else names them.
+A committed object whose real name ends in `.part` remains indistinguishable
+from a partial by name and is out of scope here.
+
+Contributed by [@pujitha24](https://github.com/pujitha24) in [#906](https://github.com/Basekick-Labs/arc/pull/906).
+
+### Line-protocol WAL entries now carry their database ([#889](https://github.com/Basekick-Labs/arc/issues/889))
+
+The WAL has two append paths and only one of them carried the database. Native
+msgpack writes store the client's bytes behind an envelope that names the
+database; line-protocol writes, which reach the buffer as columns with no raw
+bytes, fell back to a bare row-format entry. The replication stream carries the
+entry as written, and a receiver parses it with `default` as the fallback
+database, so every line-protocol row a replica received was filed under
+`default` rather than the database it was written to. The row-format path now
+writes the same envelope. A receiver resolves the real database; recovery on
+the writing node is unchanged, since it already routed by the `_database`
+stamped on each record, and any binary from 26.05.1 on reads the entry.
+
+This is one of the three issues that make up the local-storage replication
+design work ([#886](https://github.com/Basekick-Labs/arc/issues/886),
+[#888](https://github.com/Basekick-Labs/arc/issues/888), #889), and the other
+two are deliberately not in this release. A replica that applies replicated
+rows flushes them into its own storage and its queries read that copy alongside
+the file it pulls from the primary, so a receiver must not start on a node
+without the hand-off #888 describes. Helm-deployed clusters run no receivers on
+readers or compactors and see no behaviour change from this fix. On a cluster
+where readers do receive (a local WAL enabled on the reader), line-protocol rows
+now land in the right database instead of `default`. The receiving reader still
+flushes and announces its own copy of them, so until #888 lands those rows count
+twice on every node, as native msgpack rows already did.
+
+Contributed by [@lecodev-26](https://github.com/lecodev-26) in [#1055](https://github.com/Basekick-Labs/arc/pull/1055). [@drakeo338](https://github.com/drakeo338) proposed the same source-side fix in #889.
+
+## Experimental arcx Arrow IPC streams signal writer panics ([#846](https://github.com/Basekick-Labs/arc/issues/846))
+
+When the experimental arcx Arrow IPC stream writer panics, the response now
+includes an invalid Arrow IPC message marker and an `Arc-Stream-Truncated`
+trailer. Clients can detect the incomplete result instead of accepting a
+stream that ends at a batch boundary as complete. The standard DuckDB Arrow
+path is unchanged.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir)
+for [#846](https://github.com/Basekick-Labs/arc/issues/846).
+
+## Experimental arcx Arrow IPC queries now appear in query management ([#731](https://github.com/Basekick-Labs/arc/issues/731))
+
+When the experimental arcx engine serves an Arrow IPC query, the request now
+receives an `X-Arc-Query-ID` and appears in active-query tracking and history.
+Registry cancellation propagates into execution. Success, failure, timeout
+and recovered panic paths dispose of the entry rather than leaving it running.
+A declined arcx request reuses the same entry when DuckDB takes over.
+
+The standard Arrow path continues to use its existing registry lifecycle.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir)
+for [#731](https://github.com/Basekick-Labs/arc/issues/731).
+
+### Arc no longer overrides DuckDB's own container-aware memory and thread limits for the query engine ([#1026](https://github.com/Basekick-Labs/arc/issues/1026))
+
+**If you run Arc in a container with a memory limit, this changes how much memory DuckDB is allowed, and you should read on.**
+
+Arc derived `database.memory_limit` from the CPU count — `min(NumCPU(), 32) GB` — and `database.thread_count` from `NumCPU()` directly. `runtime.NumCPU()` reflects cpuset/affinity but **not** a CFS quota, and Kubernetes `limits.cpu` and docker `--cpus` are quotas. So a pod limited to 2 CPUs on a 64-core node saw 64 cores, estimated 128 GB of system memory, and was handed a **32 GB** DuckDB memory limit inside a 2Gi container along with `SET GLOBAL threads=64`. DuckDB then planned and allocated against that budget instead of spilling to `database.temp_directory`, and the kernel OOM-killed the container — which is the outcome `memory_limit` exists to prevent.
+
+The fix is to stop overriding, because **DuckDB already does this correctly**. `duckdb::CGroups::GetMemoryLimit` and `GetCPULimit` are in the library Arc links; DuckDB reads `memory.max`, `memory.limit_in_bytes` and `cpu.max`, and with no explicit limit it uses 80% of what it finds. Measured: 28.7 GiB on a 36 GiB host, 409.5 MiB in a `--memory=512m` container, and `threads=2` under `--cpus=2`.
+
+So `database.memory_limit` now defaults to empty and `database.thread_count` to `0`, both meaning "leave DuckDB's own value". An explicit setting still wins, and the licensed-core cap is unaffected.
+
+**What changes for you:**
+
+- **Container with a memory limit** — DuckDB's limit is now derived from your container, not from the host's core count. In the 2Gi example above it drops from 32 GB to roughly 1.6 GiB. This is the fix.
+- **No memory limit set** (including the OSS Helm chart, which ships `resources: {}`) — DuckDB sees the node's total memory and takes 80% of it. On a 16-core/64 GiB node that is a **rise**, from Arc's 16 GB to about 51 GiB. If you were relying on Arc's accidental cap, set `database.memory_limit` explicitly, or set container limits.
+- **A smaller limit makes spilling more likely.** Size `database.temp_directory` accordingly — in Kubernetes, the emptyDir or volume behind it. Be aware that spilling is not unconditional: measured against the engine, below roughly 85 MB a 2M-row `GROUP BY` does not spill, it raises `Out of Memory Error`, at any thread count. Compaction treats that as recoverable and halves its batch (30 → 15 → 7 → 3) with a warning before giving up, so it is bounded and visible rather than silent — but a container small enough to derive a per-subprocess limit in that range will make no compaction progress. A 256 MiB container at the default `max_concurrent = 2` derives about 68 MiB, which is inside that range.
+
+**Compaction.** `compaction.memory_limit` auto-derives from `database.memory_limit`, which is now empty — and left alone, every compaction subprocess would fall back to DuckDB's own default and take 80% of the *same* cgroup, so a main process plus the default two subprocesses would budget 240% of the container. Arc now detects the limit itself for that one purpose and gives each subprocess `detected x 0.8 / (max_concurrent + 1)`. Detection reads cgroup v2, then v1, then `/proc/meminfo`, and `hw.memsize` on macOS; if nothing can be determined the previous behaviour is kept.
+
+To be precise about what that bounds: it caps the **subprocesses'** combined budget at roughly one share, but it does not make the total fit the container — the main process still takes the engine's own 80% of the whole cgroup, so at the default `max_concurrent` of 2 the worst case is about 133% of the limit. That is far better than what it replaced (a 2Gi pod previously budgeted 32 GB for the main process plus 16 GB per subprocess) and it is tolerable because these are spill thresholds rather than reservations, but it is not a guarantee. Bounding Arc's total memory means deciding how much of the machine it may use in aggregate, which is [#1025](https://github.com/Basekick-Labs/arc/issues/1025).
+
+**`compaction.threads` was left overridden by this change and is fixed separately**, in [#1030](https://github.com/Basekick-Labs/arc/issues/1030) below: a compaction subprocess in that same 2-CPU pod was getting `SET threads=32` while the main process correctly got 2.
+
+**Also fixed:** `database.memory_limit = "50%"` or `"0"` passed configuration validation and then hard-failed startup inside DuckDB with a bare parser error. Both are now rejected at load with a message naming the key and listing the accepted units, using the same rule `compaction.memory_limit` already enforced.
+
+
+### WAL replay is now idempotent, so a retained file stops re-applying its healthy entries ([#1009](https://github.com/Basekick-Labs/arc/issues/1009))
+
+A replayed WAL entry correctly writes nothing back to the WAL — the copy being replayed is already on disk. But it also produced no flush *checkpoint*, because a checkpoint is keyed on the identity the WAL assigns at append time and a replay never appends. So every subsequent recovery pass replayed the same entry again.
+
+That matters whenever recovery **keeps** a file, which one poisoned entry is enough to cause ([#590](https://github.com/Basekick-Labs/arc/issues/590)): the file's healthy entries were re-applied on every pass, and for measurements without tags compaction can never remove the resulting duplicate rows. The periodic purge eventually deletes the kept file and bounds the damage to one duplicate set. That backstop survives the move to flush-aware purging described above: a file recovery keeps is one no checkpoint will ever cover, so it is reclaimed by age rather than by the flush floor.
+
+A replayed batch now inherits the identity of the entry it came from, so the flush that persists it checkpoints the **original** entry and no later pass replays it. Two deliberate exclusions, both of which would otherwise turn duplication into loss:
+
+- **The row-format recovery path does not inherit.** It fans one WAL entry out into one buffer write per record, routed by each record's own measurement, so a checkpoint for the entry could mark data durable that a sibling write discarded. That path is the rare non-msgpack fallback and keeps today's at-least-once behaviour.
+- **Untracked entries do not inherit.** Their identity is a SHA-256 of the payload rather than a writer-assigned sequence, and two legitimately identical payloads share it — two tagless rows with the same values and timestamp are two real events. Checkpointing one would make recovery skip the other. #948's fix moved off content hashes for this reason; inheritance is gated on the 32-character tracked form.
+
+### WAL recovery no longer replays data that already reached Parquet ([#948](https://github.com/Basekick-Labs/arc/issues/948))
+
+**If you run with `wal.enabled = true` and ingest measurements without tags, this fixes a permanent over-counting bug.**
+
+WAL recovery replayed every entry in the files it found, including entries whose batch had already been written to Parquet before the crash. Nothing acknowledged was lost — the failure was in the other direction. For tagged measurements the duplicates are exact copies and compaction removes them at the partition's next pass, so queries merely read high for a while. For measurements **without tags** compaction deliberately does not dedup (two tagless rows sharing a timestamp can be two legitimate events), so those duplicates were never removed: a restart after a hard crash silently double-counted up to a full WAL window of already-durable data, permanently.
+
+Every WAL entry now carries a tracked identity, and a checkpoint entry listing flushed identities is appended to the WAL — and durably synced — only *after* the Parquet write for that batch succeeds. Recovery gathers those checkpoints across all WAL files, including recently rotated files too young to replay and the active file it deliberately skips, and replays only the entries they do not cover. Writer identities come from `crypto/rand`, so a restarted process cannot reuse the previous one's identity space and have a fresh entry silently covered by a stale checkpoint — that inversion would have turned this over-counting bug into real data loss.
+
+Measured on the issue's own acceptance criterion — tagless measurement, `kill -9` mid-ingest, 310 acknowledged records of which 300 had flushed:
+
+| | replayed entries | post-restart rows |
+|---|---|---|
+| before | 310 | 610 (300 permanent duplicates) |
+| after | 10 | 310 (exact) |
+
+The ordering is load-bearing in one direction only: the checkpoint is written strictly after the flush is confirmed, never before. One window remains — a crash in the gap between the Parquet write completing and the checkpoint becoming durable replays that batch — so replay is still at-least-once in the strict sense, but the window is a single in-flight batch rather than a whole WAL file. **Historical over-counts from a crash recovery on an earlier version are not repaired retroactively.**
+
+Checkpoint writes cost nothing measurable at Arc's flush rate: measured ABAB with the WAL on `fdatasync` and local storage at 683 flushes/s, 1,366,233 rows/s against 1,320,917 before the change — inside run-to-run noise.
+
+**Follow-up ([#1045](https://github.com/Basekick-Labs/arc/issues/1045)):** as first merged, this recorded checkpoints only for *synchronous* flushes — the age sweep, a schema change, `FlushAll` and shutdown. The flush task for an **asynchronous, size-triggered** flush was built without its WAL identities, so the checkpoint call received nothing and the main ingest path still replayed after a crash. Measured on the same crash test with the buffer configured to flush by size rather than age: 310 acknowledged records of which 300 had flushed replayed all 310 and left 600 rows queryable. Fixed before release; both paths now checkpoint, and the regression test drives the asynchronous path specifically.
+
+One related WAL problem is **not** fixed by this and remains tracked in [#1009](https://github.com/Basekick-Labs/arc/issues/1009): recovery still deletes a replayed file as soon as its records are back in the buffer, before they reach Parquet. The age-based purge of rotated files *is* fixed — see the entry above.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#998](https://github.com/Basekick-Labs/arc/pull/998).
+
+### Compaction subprocesses now size their threads from the container's CPU quota ([#1030](https://github.com/Basekick-Labs/arc/issues/1030))
+
+`compaction.threads` defaults to half the available cores, which it derived from `runtime.NumCPU()`. That reflects cpuset/affinity but **not** a CFS quota, and Kubernetes `limits.cpu` and docker `--cpus` are quotas — so on a 2-CPU pod on a 64-core node every compaction subprocess ran `SET threads=32`. This is the same root cause as [#1026](https://github.com/Basekick-Labs/arc/issues/1026) above, in the one place that fix did not reach, and it mattered twice over: the subprocesses are separate processes in the *same* cgroup as the main process, and DuckDB's sort and scan buffers scale with the thread count, so the oversubscription cost memory as well as scheduling.
+
+The default is now derived from `min(runtime.NumCPU(), runtime.GOMAXPROCS(0))`. Since Go 1.25 the runtime computes `GOMAXPROCS` as `min(affinity CPUs, max(ceil(quota), 2))`, so it reads the quota — including under cgroup v1 — while `NumCPU()` covers cpuset limits that no quota expresses. Measured on an 8-CPU VM: `--cpus=2` yields 2, `--cpus=1.5` and `--cpus=0.5` also yield 2 (the runtime floors at 2), and `--cpuset-cpus=0-1` yields 2 through `NumCPU()`. An explicit `compaction.threads` is untouched, and with no CPU quota the resolved value is identical to previous releases.
+
+This does **not** make the totals fit the quota, and it is worth being precise: on a 2-CPU quota at the default `max_concurrent = 2`, the two subprocesses take 1 thread each and the main process takes the quota's 2, for 4 threads against 2 CPUs. As with memory, these are caps on parallelism rather than reservations, and the kernel throttles the aggregate — the point is to stop a subprocess planning as if it had 32 cores.
+
+**Measured, and it is a trade rather than a free win.** Under `--cpus=2` on 351 files / ~300 MB of input, varying only the per-subprocess memory budget:
+
+| `compaction.memory_limit` | `threads=1` (new default) | `threads=32` (old default) |
+|---|---|---|
+| 4.47 GB — what that container derives with no memory limit set | success, 13.0 s | success, **9.8 s** |
+| 1 GB | success, 20.5 s | **`Out of Memory Error`** |
+| 512 MB | success, 22.7 s | **`Out of Memory Error`** |
+
+With memory to spare, 32 threads is about 1.3x faster even under a 2-CPU quota — so where a container limits CPU but not memory, this change costs compaction throughput, and setting `compaction.threads` explicitly is the right move. Where the container limits both, the old default did not merely waste CPU: it failed. DuckDB's own error names the cause — *"Possible solutions: Reducing the number of threads (SET threads=X)"* — and a 2-CPU / 2 Gi pod on a 64-core node derives about 546 MB per subprocess at the default `max_concurrent`, which is squarely in the failing range. That is the deployment this issue is about.
+
+Compaction classifies an out-of-memory error as recoverable and retries with a halved batch, up to four times, before giving up (`30 -> 15 -> 7 -> 3` at the default `max_files_per_batch`). So the old behaviour surfaced as slow, repeatedly-shrinking compaction cycles rather than a hard stop, and at a small enough budget as partitions that simply never compacted — which is why it was not obvious from the outside.
+
+Two residuals are deliberate. A `GOMAXPROCS` environment variable set above the quota is honoured up to the machine's core count, and `GODEBUG=containermaxprocs=0` disables the runtime's cgroup read entirely; both are an operator explicitly overriding their own runtime's container awareness. Conversely, `GOMAXPROCS` set *below* the core count on a machine with no quota now lowers this default where it previously did not.
+
+**`database.max_connections` and `ingest.flush_workers` are deliberately left host-derived.** Both were part of the original report and neither is a CPU-capacity proxy:
+
+- `max_connections` bounds statements in flight. Arc queries are frequently S3-I/O-bound, so taking a 2-CPU pod from 64 pool slots to 4 would convert concurrency into client timeouts against the 30 s HTTP write timeout. It is still worth tuning by hand in a small container, because this pool is the only global admission control on concurrent query execution and the Go-side result memory of an in-flight query is not bounded by DuckDB's `memory_limit`.
+- `flush_workers` was measured rather than reasoned about. Against a storage backend taking 500 ms per upload, with the Go path held to 2 cores and the same offered load in each arm (131.6M against 131.5M rows acknowledged), 8 workers — what a 2-CPU quota would produce — pushed **61%** as many rows to storage over the same 90 s window as 64 workers did: 68.0M against 111.3M, ABAB. Both arms sat at their upload-concurrency ceiling, 13.6 of a theoretical 16 uploads/s and 112 of 128, which is the finding: the pool is bound by concurrent uploads, not by cores. Against a 1 ms backend the two were indistinguishable — 8 workers slightly ahead — and both were limited by the ingest path instead, so the slower pool is not merely losing a race that no deployment runs.
+
+  The remainder of the offered rows in each arm was queued or in flight when the window closed, not lost, and the smaller pool held far more of it: around 22,500 deferrals against 1,187–3,768. That is the wrong direction for the small container that would have been the one to get the smaller pool, given that Arc deliberately does not cap ingest buffer memory. No acknowledged write is lost at either size — drained to completion with 8 workers, 49,765,000 rows acknowledged became 49,765,000 written, with all 8,065 deferrals retried.
+
+**A licensed core cap no longer raises a limit to meet the licence.** `MaxCores` enforcement gated on `runtime.NumCPU() > MaxCores` and then assigned `MaxCores` outright, so a 4-core licence in that 2-CPU pod *raised* `GOMAXPROCS` from 2 to 4 and set DuckDB `threads=4` — overriding the container-correct value #1026 had just arranged. Each surface is now clamped independently: `GOMAXPROCS` and an explicitly configured `database.thread_count` can only move down, and `ingest.flush_workers` is capped whether or not a quota is in play.
+
+Three things to know about the new behaviour, because none of them is obvious:
+
+- **`GOMAXPROCS` is now pinned on a licensed node, in both directions.** Pinning is what stops a quota raised later (an in-place pod resize, `docker update --cpus`) lifting it past the licence — but the Go runtime disables automatic updates rather than capping them, so a licensed node whose quota is *lowered* keeps its boot value while an unlicensed node would follow the quota down.
+- **The clamp can still exceed the container's CPU quota in one case.** When `database.thread_count` is unset, the licence replaces it only if the licence is below the *machine's* core count — that, not `GOMAXPROCS`, is the bound on what DuckDB would otherwise choose, because DuckDB reads `cpu.max` directly and has never read `GOMAXPROCS`. The value written is clamped by the effective core count, so it cannot exceed what this process may use; but where an operator has inflated that themselves (`GOMAXPROCS` above the quota, or `GODEBUG=containermaxprocs=0`) the result can sit above the quota. It is always within the licence.
+- **`compaction.threads` is still not licence-capped at all.** It is resolved during config load, before the licence is applied, and a subprocess is a separate process that the parent's `GOMAXPROCS` cannot reach — so a 4-core licence on a 64-core host with no quota still runs each subprocess with 32 threads. Pre-existing, unchanged by this release, and tracked separately.
+
+Enforcement remains boot-time: nothing re-applies it after periodic re-validation.
+
+**For clustered Enterprise deployments, this changes core accounting.** Nodes report `GOMAXPROCS` as their core count in the join payload, and the cluster sums those to check the licence. A node in a 2-CPU pod on a 64-core host with a 4-core licence previously reported 4 — the raised value — and now reports 2, so twice as many such nodes fit one licence. Each node genuinely has 2 usable cores, so 2 x 2 = 4 is the licence being counted accurately rather than evaded, but the number of nodes that can join may change.
+
+### A deferred flush now waits for a free worker instead of the next age sweep ([#1008](https://github.com/Basekick-Labs/arc/issues/1008))
+
+When the flush queue is full, Arc keeps the batch in its in-memory buffer rather
+than discarding it. Nothing then re-enqueued that buffer: it waited for the next
+write to the *same* measurement, for the age-based flush, or for shutdown. With
+ingest spread across many measurements, a buffer could sit while flush workers
+went idle.
+
+Arc now re-enqueues deferred buffers, oldest first, as soon as a worker frees a
+queue slot. Measured on a node with 150 measurements, one flush worker and a
+storage backend taking 1.5 s per write: before, records written stayed flat at
+16,800 for 48 seconds with an idle worker until the age trigger fired; after,
+they climb continuously and the worker stays saturated.
+
+Two new signals, both already present in `GetStats` as `total_flush_deferred` and
+`deferred_buffers`:
+
+- `arc_ingest_flush_deferred_total` — counter, incremented every time a flush
+  could not be queued. Under sustained backpressure that is close to once per
+  write to a hot measurement, so read the rate as saturation, not volume.
+- `arc_buffer_deferred_buffers` — gauge, the number of buffers currently holding
+  records no worker could take. This is the one to alert on; it should return to
+  zero within roughly one flush duration.
+
+**What this does not fix.** Deferred records are held in memory, and Arc does not
+bound that — deliberately. `ingest.max_buffer_size` is a *per-measurement* flush
+trigger, so worst-case held memory is roughly
+`active_measurements x max_buffer_size x bytes_per_record`, and a global cap low
+enough to prevent that would reject many-measurement workloads that work today.
+The knobs are yours: lowering `max_buffer_size` or `max_buffer_age_ms` makes
+flushes smaller and more frequent, at the cost of more Parquet files for
+compaction to merge. Better signals for deciding that are tracked in
+[#1025](https://github.com/Basekick-Labs/arc/issues/1025).
+The drain also competes with ordinary writes for a freed slot, and a writer
+already holding its shard lock wins, so under *sustained* saturation a cold
+deferred buffer can still fall through to the age sweep — the guarantee is that
+it no longer needs an idle system to be picked up, not that it is always first.
+On a cluster reader, which applies replicated entries into its own buffer for
+query freshness, deferrals drain the same way but the reader cannot push back on
+the replication stream; see #1025.
+
+
+### Ingestion retains buffered batches when the flush queue is full ([#966](https://github.com/Basekick-Labs/arc/issues/966))
+
+A size-triggered flush used to extract the whole buffer and delete it, and only
+then attempt a non-blocking send to the bounded flush queue. When the queue had
+no room the batch was discarded and the write still returned success — so a
+buffer built from many already-acknowledged writes was lost. With the WAL
+disabled, which is the shipped default, it was gone immediately; with the WAL
+enabled, nothing replayed it before the periodic purge deleted the file.
+
+Nothing is extracted now unless it has somewhere to go. Records that cannot be
+queued stay in the in-memory buffer, and the send happens under the shard lock,
+so the decision is atomic with respect to the buffer.
+
+A retained buffer is flushed as soon as a flush worker frees a queue slot (see
+the next entry), by the next write to the same measurement, by the age-based
+flush, or by shutdown. How many records a node retains is bounded by your
+`ingest.max_buffer_size` and `ingest.max_buffer_age_ms` settings rather than by a
+cap Arc applies — see the note on the drain below. A sampled warning and
+the new `arc_ingest_flush_deferred_total` metric report the condition that used
+to be a silent drop, so it is visible rather than inferred.
+
+This closes the first of #966's five routes; what remains is
+[#1008](https://github.com/Basekick-Labs/arc/issues/1008) and
+[#1009](https://github.com/Basekick-Labs/arc/issues/1009).
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#997](https://github.com/Basekick-Labs/arc/pull/997).
+
+
 ### A continuous query could write into Arc's reserved storage root ([#1010](https://github.com/Basekick-Labs/arc/issues/1010))
 
 A continuous-query definition is a row that outlives the request that wrote it,
@@ -342,9 +976,9 @@ digits, underscores or hyphens, at most 64 characters.
 reason is recorded with the execution and readable through
 `GET /api/v1/continuous_queries/:id/executions`, naming both the continuous
 query and the offending value, so one that stops producing after an upgrade says
-why. The remedy is to delete that definition and create it again with a valid
-database name; editing it is not available, because update applies the same rule
-to the body it is given (#993).
+why. The remedy is to update that definition with a valid database name, or delete it
+and create it again; what is not available is keeping the old value, because
+update applies the same rule to the body it is given (#993).
 
 One deployment shape to check before upgrading. The rule is stricter than the
 storage layer's, and an edge-sync hub's spoke directories are top-level storage
@@ -357,6 +991,61 @@ well-formed database directory is affected.
 Creating a continuous query requires an admin token, so this was a
 data-integrity bug rather than a vulnerability: no permission check was bypassed
 and no path escaped the storage root.
+### A graceful shutdown no longer abandons flushes, and a flush timeout no longer starts before a worker picks the task up ([#1006](https://github.com/Basekick-Labs/arc/issues/1006), [#1007](https://github.com/Basekick-Labs/arc/issues/1007))
+
+Two ways an acknowledged write could reach no storage at all.
+
+A flush task's timeout was created when the task was **queued**, not when a
+worker picked it up, so it was consumed while the task waited its turn. With a
+backlog of N tasks at T seconds per flush, the task at the back arrived with
+`flush_timeout_seconds - N*T` left and could already be expired; the storage
+write then failed with `context deadline exceeded` and the batch was dropped as
+though storage had failed. A queueing delay was reported — and handled — as a
+storage outage.
+
+`Close` cancelled flushes in progress and **discarded** whatever was still in
+the flush queue, in favour of WAL replay. Those records had already been removed
+from the in-memory buffer when they were queued, so nothing else would ever
+write them. A client disconnecting during a schema-evolution flush aborted that
+flush too, even though the rows in it belonged to other clients' earlier,
+already-acknowledged writes. With the WAL disabled — the shipped default — every
+graceful stop under load lost those records.
+
+What changed:
+
+- Flush I/O runs on a context that neither shutdown nor a client's cancellation
+  reaches. The timeout starts when a worker receives the task.
+- `Close` flushes every buffer, then flushes everything still queued instead of
+  discarding it, then waits for any flush a writer is finishing on its own
+  goroutine — and only then reports whether the shutdown was clean.
+- A write that arrives after its own shard has already been flushed by shutdown
+  is refused with `503` and counted as WAL-only, so the shutdown WAL purge is
+  skipped rather than deleting the only remaining copy. The check is per shard,
+  not global: a write arriving while shutdown is still working through the other
+  shards is accepted and flushed as usual.
+- `Close` bounds itself by **half** of `server.shutdown_timeout`, because it is
+  one shutdown component among several and the coordinator checks its own
+  deadline only between them. If that slice expires, `Close` stops flushing,
+  cancels any write still in progress, and reports the shutdown unclean — so the
+  remaining steps, including the WAL writer's final sync, still run. Records it
+  did not get to are left in the WAL and replayed on the next start. With the
+  WAL **disabled** there is nothing to retain, so those records are lost; a
+  shutdown that reports unclean with `wal.enabled = false` is telling you data
+  did not land.
+
+Two limits worth knowing. On the **local** storage backend a write already in
+progress cannot be interrupted, because that backend does not observe its
+context; local writes are fast, but a graceful stop can wait for one. And
+Parquet files written during shutdown are still not registered in the cluster
+manifest, because the file registrar stops before the buffer does — pre-existing,
+and tracked separately.
+
+**Not covered by this change:** a full flush queue still drops its batch
+([#966](https://github.com/Basekick-Labs/arc/issues/966) route 1, in progress),
+and with the WAL off a storage write that fails still loses that batch
+([#1008](https://github.com/Basekick-Labs/arc/issues/1008),
+[#1009](https://github.com/Basekick-Labs/arc/issues/1009)).
+
 
 ### Crash smokes account for at-least-once WAL replay
 
@@ -421,6 +1110,84 @@ already violates the rule cannot be updated — delete it and recreate it with a
 valid name.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#995](https://github.com/Basekick-Labs/arc/pull/995).
+
+### Continuous query measurement names are validated, and update requires a complete definition ([#1011](https://github.com/Basekick-Labs/arc/issues/1011))
+
+The sibling of the two `database` fixes above, for the two measurement names.
+`source_measurement` had no name rule at all — create checked only that it was
+non-empty, update did not check it — and `destination_measurement` had one on
+create but only `if provided` on update. Since `PUT` overwrites every column, a
+body that omitted a field stored a blank one.
+
+Both are storage path segments of every run, and the write side applies no name
+rule of its own: the only key check happens at flush, inside the storage
+backend, long after the run has reported its result. Two consequences followed,
+and neither was visible at the time it happened.
+
+**A blank `destination_measurement` made a run report success and lose its
+rows.** The write landed on a key with an empty segment, which the buffer
+accepted; the execution was recorded as `completed` with a row count and no
+error, readable that way through
+`GET /api/v1/continuous_queries/:id/executions`; and the flush then failed with
+`contains an empty segment`, taking the rest of that flush call with it. The
+aggregation looked like it worked and produced nothing.
+
+**A `destination_measurement` carrying a separator wrote into a measurement
+nobody configured.** A stored value of `a/b` produced
+`db/a/b/2026/10/02/12/a/b_….parquet` — nine path segments, each individually
+legal, so the key contract accepted it. Those rows are not orphaned, which
+would have been the safer failure: a measurement is read with a recursive glob,
+so they read back as part of measurement `a`, they are listed as measurement
+`a`, retention deletes them under that name, and Iceberg exports them into that
+table. Hourly compaction and tiering are the two that skip them, incidentally —
+the extra segments shift the partition fields, so the year fails to parse.
+
+Both endpoints now validate both names, and a run re-validates them before it
+builds any path — the same retroactive check
+[#1010](https://github.com/Basekick-Labs/arc/issues/1010) added for `database`,
+since a definition stored by an earlier build is not covered by a boundary rule
+added today. **A definition that fails reports a failed run** rather than
+executing, with the reason recorded against the execution.
+
+The two fields get different rules, deliberately. `destination_measurement`
+names a measurement Arc is about to create, so it gets the rule every
+client-facing ingest endpoint applies: start with a letter, then letters,
+digits, underscores or hyphens, at most 128 characters.
+`source_measurement` names a measurement that already exists, so it gets the
+rule Arc applies elsewhere to a name it is merely given — one storage path
+segment, no separator, no `.` or `..`, no leading dot, no glob metacharacter.
+That is the pair `POST /api/v1/delete` applies to a measurement in its body,
+and the segment half of it is what the retention endpoints apply to a policy's
+measurement. The stricter rule would have been wrong here: measurement names
+predate it, and backup restore and WAL replay still admit names it refuses, so
+a source of `_internal`, `7cpu` or `cpu.v2` keeps working.
+
+**One deployment shape to check before upgrading.** The rule for a source
+measurement is looser than the create-time one, but it is not looser in every
+direction: it declines a **dot-prefixed** name, which the storage layer accepts
+and which plain line protocol accepted before measurement validation shipped in
+v26.02.1. A continuous query reading a measurement called `.hidden` resolves
+today and will now report a failed run, and because the API declines to name
+dot-prefixed directories anywhere, there is no way to rename it — the data has
+to be re-ingested under a valid name, or the definition deleted. A stored
+`destination_measurement` that violates the create-time rule fails its runs
+likewise; that one is ordinary to fix, since the destination is the continuous
+query's own output, so updating the definition is enough. Definitions created
+before v26.02.1 are the population to look at for both: that release is when
+`destination_measurement` validation was added to create.
+
+**`PUT` now requires a complete definition** — `name`, `database`,
+`source_measurement`, `destination_measurement`, `query` with both placeholders,
+and `interval` — continuing what #993 began with `database`: a field left out
+was previously written to the row as a blank. Note also what `PUT` has always
+done with the fields it does **not** require: `description`, `tag_columns`,
+`retention_days`, `delete_source_after_days` and `is_active` are written from
+the body unconditionally, so omitting them zeroes them, and omitting
+`is_active` sets it `false` and stops the continuous query. Send the whole
+definition: read it, change the field, send it back. Both #993 and this change
+land in 26.09.3, so for anyone upgrading from 26.09.2 a partial `PUT` stops
+working in this release — a client that sends `{"is_active": false}` alone
+needs updating.
 
 ### The delete WHERE validator reuses the shared table-position guard
 
@@ -562,7 +1329,7 @@ answered, not about the file. A rewrite reaches every node's manifest through
 Raft before the new bytes reach every replica, so a peer that is merely behind
 rejects on checksum while a peer that has the bytes would have served them. The
 peer that is behind is routinely the first one asked: the puller tries the
-file's origin node first, a rewrite in place keeps the original origin, and a
+file's origin node first, a rewrite in place kept the original origin (fixed by #976, below), and a
 compacted file's origin is the node that compacted it — none of which is
 necessarily the node that performed the rewrite. The origin is also the one
 candidate whose position is fixed, so every retry put the same stale peer first

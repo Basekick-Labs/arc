@@ -143,7 +143,17 @@ func TestEligibleShape_Declines(t *testing.T) {
 		{"agg group by 2", "SELECT date_trunc('day', time), count(*) FROM cpu GROUP BY 2"},
 		{"agg no group by", "SELECT date_trunc('day', time), count(*) FROM cpu"},
 		{"agg extra projection", "SELECT date_trunc('day', time), host, count(*) FROM cpu GROUP BY 1"},
-		{"agg having", "SELECT date_trunc('day', time), count(*) FROM cpu GROUP BY 1 HAVING count(*) > 1"},
+		// (plain `HAVING count(*) > 1` became ELIGIBLE at agg-5a — see
+		// TestHavingEligibility. These HAVING forms still decline.)
+		{"having on an agg not in the select list", "SELECT host, count(*) FROM cpu GROUP BY host HAVING sum(x) > 1"},
+		{"having on an unknown name", "SELECT host, count(*) FROM cpu GROUP BY host HAVING nope > 1"},
+		{"having with an expression over an agg", "SELECT host, count(*) FROM cpu GROUP BY host HAVING count(*) + 1 > 2"},
+		{"having comparing two aggs", "SELECT host, count(*), sum(x) FROM cpu GROUP BY host HAVING count(*) > sum(x)"},
+		{"having IS NULL", "SELECT host, count(*) FROM cpu GROUP BY host HAVING count(*) IS NULL"},
+		{"having BETWEEN", "SELECT host, count(*) FROM cpu GROUP BY host HAVING count(*) BETWEEN 1 AND 2"},
+		{"having count(DISTINCT)", "SELECT host, count(*) FROM cpu GROUP BY host HAVING count(DISTINCT x) > 1"},
+		{"ungrouped having", "SELECT count(*) FROM cpu HAVING count(*) > 1"},
+		{"having on a bucket alias that was never declared", "SELECT date_trunc('day', time), count(*) FROM cpu GROUP BY 1 HAVING h > 1"},
 		{"agg order by 2", "SELECT date_trunc('day', time), count(*) FROM cpu GROUP BY 1 ORDER BY 2"},
 		// "agg sum not count": the agg-3 surface itself — now eligible (grouped).
 

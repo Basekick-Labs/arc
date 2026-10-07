@@ -250,7 +250,10 @@ func (b *LocalBackend) Read(ctx context.Context, path string) ([]byte, error) {
 	if err != nil {
 		if os.IsNotExist(err) {
 			metrics.Get().IncStorageErrors()
-			return nil, fmt.Errorf("file not found: %s", path)
+			// Wraps ErrObjectNotFound so a caller can classify with
+			// errors.Is instead of a second round trip. The message is
+			// byte-for-byte what it was.
+			return nil, fmt.Errorf("%w: %s", ErrObjectNotFound, path)
 		}
 		metrics.Get().IncStorageErrors()
 		return nil, fmt.Errorf("failed to read file: %w", err)
@@ -404,19 +407,21 @@ func (b *LocalBackend) AppendReader(ctx context.Context, path string, reader io.
 		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to open staging file for append: %w", err)
 	}
-	defer file.Close()
-
-	written, err := io.Copy(file, reader)
-	if err != nil {
+	// Close exactly once on every path, including a failed copy. Closing
+	// before promotion also makes close errors visible to the caller.
+	written, copyErr := io.Copy(file, reader)
+	closeErr := file.Close()
+	if copyErr != nil {
 		metrics.Get().IncStorageErrors()
-		return fmt.Errorf("failed to append file data: %w", err)
+		return fmt.Errorf("failed to append file data: %w", copyErr)
+	}
+	if closeErr != nil {
+		metrics.Get().IncStorageErrors()
+		return fmt.Errorf("failed to close staging file: %w", closeErr)
 	}
 
-	// After appending, promote staging → final if we've received all expected bytes.
+	// Promote only after a successful copy and close.
 	if written == appendSize {
-		if err := file.Close(); err != nil {
-			return fmt.Errorf("failed to close staging file: %w", err)
-		}
 		if err := os.Rename(stagingPath, fullPath); err != nil {
 			metrics.Get().IncStorageErrors()
 			return fmt.Errorf("failed to promote staging file after append: %w", err)
@@ -712,6 +717,56 @@ func (b *LocalBackend) ListObjects(ctx context.Context, prefix string) ([]Object
 	return results, nil
 }
 
+// errPrefixProbeHit is the sentinel HasObjectsUnderPrefix returns from its walk
+// callback to stop filepath.WalkDir at the first listable file. Never returned
+// to callers.
+var errPrefixProbeHit = errors.New("storage: prefix probe found a listable object")
+
+// HasObjectsUnderPrefix implements PrefixProber: it walks the directory the
+// prefix names and stops at the first file ListObjects would return. A prefix
+// whose directory does not exist is false with a nil error; a directory
+// holding only entries a listing hides (dot-prefixed names, keys the contract
+// refuses, staging partials) is false too, because omittedFromListing is the
+// one rule both share.
+func (b *LocalBackend) HasObjectsUnderPrefix(ctx context.Context, prefix string) (bool, error) {
+	searchPath, err := b.validateListPath(prefix)
+	if err != nil {
+		return false, fmt.Errorf("invalid prefix: %w", err)
+	}
+	err = filepath.WalkDir(searchPath, func(path string, d os.DirEntry, err error) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		relPath, err := filepath.Rel(b.basePath, path)
+		if err != nil {
+			return err
+		}
+		if omittedFromListing(d.Name(), filepath.ToSlash(relPath)) != nil {
+			return nil
+		}
+		return errPrefixProbeHit
+	})
+	if errors.Is(err, errPrefixProbeHit) {
+		return true, nil
+	}
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to probe prefix: %w", err)
+	}
+	return false, nil
+}
+
 // errHiddenName marks an entry a listing skips because its name is
 // dot-prefixed. Not an ErrInvalidPath: the key contract accepts leading dots
 // (ValidateKeySegment does so deliberately), so this is a listing convention
@@ -783,6 +838,42 @@ const (
 	MaxUsableKeyLen        = MaxKeyLen - len(PartSuffix)
 	MaxUsableKeySegmentLen = MaxKeySegmentLen - len(PartSuffix)
 )
+
+// LongestBackupKeySuffix is the longest key a backup appends under a
+// destination's own object-key prefix: a generated backup ID plus the longest
+// FIXED file name a backup writes, "manifest-files.json" — the file sidecar.
+//
+// It lives here, beside the limit it is subtracted from, for the reason
+// MaxUsableKeyLen is exported at all: a caller that BUILDS keys under a
+// configured prefix has to bound the prefix by the same arithmetic, and
+// computing it independently is how a five-byte window opens. ValidateObjectPrefix
+// bounds a prefix at MaxUsableKeyLen on its OWN and the backends then build
+// prefix+key without re-checking the sum (prefixedKey validates the
+// UNPREFIXED key), so nothing else in this package bounds a prefix relative to
+// the keys that will follow it.
+const LongestBackupKeySuffix = len("backup-20060102-150405-12345678/manifest-files.json")
+
+// MaxBackupTargetPrefixLen is the longest object-key prefix a backup
+// destination may carry: past it, the backup's own manifest and file sidecar
+// cannot be stored at all, and the operator-facing "max_source_key_bytes"
+// figure goes negative.
+//
+// Derived, not chosen. At 1019 usable key bytes it is 968, which no real
+// prefix approaches; the value is in the failure being a refusal that names
+// the prefix rather than a feature that silently disappears.
+const MaxBackupTargetPrefixLen = MaxUsableKeyLen - LongestBackupKeySuffix
+
+// CheckBackupTargetPrefix reports whether a backup destination's object-key
+// prefix leaves room for the keys a backup writes under it. key is the
+// operator-facing configuration key, so the refusal names the line to edit.
+func CheckBackupTargetPrefix(key, prefix string) error {
+	if len(prefix) <= MaxBackupTargetPrefixLen {
+		return nil
+	}
+	return fmt.Errorf(
+		"%s is %d bytes, over the %d-byte maximum: a backup writes keys of up to %d bytes under the prefix, so the %d-byte object name limit would reject the backup own manifest and file sidecar",
+		key, len(prefix), MaxBackupTargetPrefixLen, LongestBackupKeySuffix, MaxUsableKeyLen)
+}
 
 // ValidateKey reports whether key names exactly one object.
 //
@@ -1160,9 +1251,11 @@ func (b *LocalBackend) ListUnusable(ctx context.Context, prefix string) ([]Unusa
 
 // ListStaged implements StagingInspector.
 //
-// Staged partials are filtered out of List and ListObjects, so this is the only
-// way to find an abandoned one. Without it a spoke that keeps abandoning
-// transfers would fill the disk with files nothing could see.
+// Staged partials are filtered out of List and ListObjects, so this is the way
+// to find an abandoned one. Without it a spoke that keeps abandoning transfers
+// would fill the disk with files nothing could see. Every key it returns is
+// one DeleteStaged accepts; a partial whose stripped key fails that rule is
+// omitted here and reported by ListUnusable instead (#772).
 func (b *LocalBackend) ListStaged(ctx context.Context, prefix string) ([]ObjectInfo, error) {
 	searchPath, err := b.validateListPath(prefix)
 	if err != nil {
@@ -1189,14 +1282,23 @@ func (b *LocalBackend) ListStaged(ctx context.Context, prefix string) ([]ObjectI
 		if relErr != nil {
 			return nil
 		}
+		// Reported WITHOUT the suffix: the caller addresses a partial by
+		// the key it belongs to, never by the staging spelling.
+		key := strings.TrimSuffix(filepath.ToSlash(rel), PartSuffix)
+		// stagedPath applies the same validation DeleteStaged will apply to
+		// this key. A partial whose stripped key fails it (a legacy partial
+		// of a key that is illegal today) must not be reported here: nothing
+		// could ever delete it, and reclaimStagedPartials would just log the
+		// same refusal on every run forever. ListUnusable reports it instead.
+		if _, err := b.stagedPath(key); err != nil {
+			return nil
+		}
 		info, infoErr := d.Info()
 		if infoErr != nil {
 			return nil
 		}
 		results = append(results, ObjectInfo{
-			// Reported WITHOUT the suffix: the caller addresses a partial by
-			// the key it belongs to, never by the staging spelling.
-			Path:         strings.TrimSuffix(filepath.ToSlash(rel), PartSuffix),
+			Path:         key,
 			Size:         info.Size(),
 			LastModified: info.ModTime(),
 		})

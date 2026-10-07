@@ -142,6 +142,7 @@ type matchResult struct {
 	cols        []string   // scan only: projected columns (as written)
 	preds       []scanPred // scan only: AND-conjoined WHERE predicates (flat case)
 	whereText   string     // re-serialized WHERE: boolean tree (scan, 2b-2) OR time-range (date_trunc agg, PR-A)
+	havingText  string     // agg-5a: re-serialized HAVING over the grouped select items ("" = none)
 	// (OR / parens). Mutually exclusive with preds — set only when the flat AND-list
 	// can't represent the WHERE (2b-2). buildScanSQL emits it verbatim; the engine is
 	// the tree authority.
@@ -235,6 +236,7 @@ func eligibleShape(sql string) (matchResult, bool) {
 			bucketAlias:    gm.bucketAlias,
 			orderByItem:    gm.orderByItem,
 			whereText:      gm.whereText,
+			havingText:     gm.havingText,
 			measurement:    gm.meas,
 		}, true
 	}
