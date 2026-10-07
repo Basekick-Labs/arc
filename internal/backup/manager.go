@@ -485,10 +485,11 @@ type BackupListing struct {
 	// FilteredForeign is how many backups were left out because another
 	// instance wrote them. See ListBackupsFilteringForeign.
 	FilteredForeign int
-	// UnreachableTargets names the configured targets that would not answer.
-	// They contribute nothing to Backups, and the listing still succeeds: one
-	// dead store must not hide the backups on the others. Empty when every
-	// target answered; a listing where EVERY target failed is an error
+	// UnreachableTargets names the configured targets that could not provide a
+	// complete listing, including when one or more candidate manifests could
+	// not be read or parsed. Such a target is omitted from the union; one failed
+	// target must not hide backups on the others. Empty when every target
+	// answered completely; a listing where EVERY target failed is an error
 	// instead.
 	UnreachableTargets []string
 	// IncompleteRuns are runs whose index or manifests say they did not commit
@@ -613,13 +614,16 @@ type targetListing struct {
 	// uncommitted are the IDs that have a directory here and no manifest: a
 	// run in flight, or one that died before its commit record.
 	uncommitted []string
-	// err is a transport-wide failure. The target then contributes nothing and
-	// is named in UnreachableTargets.
+	// err means the target could not provide a complete listing. It contributes
+	// nothing to the union and is named in UnreachableTargets, just like a
+	// target whose directory listing failed.
 	err error
 }
 
 // listBackups fans out over every configured target, concurrently, and unions
-// the results by backup ID.
+// the results by backup ID. A target with unreadable candidate manifests is
+// reported as incomplete rather than silently presenting those backups as
+// absent.
 //
 // Concurrent for a reason that is not arithmetic. withDestinationTimeout
 // derives from the caller's context, so N targets cannot each cost a fresh
@@ -651,9 +655,9 @@ func (m *Manager) listBackups(ctx context.Context, includeForeign bool) (BackupL
 			listing.UnreachableTargets = append(listing.UnreachableTargets, r.target.name)
 		}
 	}
-	// Every target failed: that is a failure of the listing, not a partial
-	// answer, and it keeps the single-destination contract — an unreachable
-	// lone destination is an error naming it, as it was before the fan-out.
+	// No target provided a complete listing: that is a failure, not a partial
+	// answer. It keeps the single-destination contract — an unreachable or
+	// unreadable lone destination is an error naming it, as before the fan-out.
 	if failed == len(results) && failed > 0 {
 		return BackupListing{}, firstErr
 	}
@@ -937,22 +941,22 @@ func (m *Manager) listOneTarget(ctx context.Context, t backupTarget) targetListi
 			out.uncommitted = append(out.uncommitted, id)
 			continue
 		case err != nil:
-			// Per-object, and that is why it warns and carries on rather than
-			// failing the listing. The object is there and could not be
-			// fetched: corruption, or a permission on that one key. A
-			// transport-wide failure never reaches here — listBackupIDs ran
-			// first and aborts naming the target, which is what makes this
-			// branch safe to swallow and is the asymmetry two readers have now
-			// had to derive.
+			// A candidate whose manifest cannot be read must not disappear as
+			// though the backup were absent. Treat this target as incomplete;
+			// the outer listing can still use other targets. ErrBackupNotFound
+			// above remains the expected in-flight/uncommitted case.
+			out.err = err
 			m.logger.Warn().Str("path", manifestPath).Err(err).
-				Str("target", t.name).Msg("Failed to read manifest, skipping")
-			continue
+				Str("target", t.name).Msg("Failed to read manifest; target listing is incomplete")
+			return out
 		}
 		manifest, err := UnmarshalManifest(data)
 		if err != nil {
-			m.logger.Warn().Str("path", manifestPath).Err(err).
-				Str("target", t.name).Msg("Failed to parse manifest, skipping")
-			continue
+			parseErr := fmt.Errorf("failed to parse %s from %s: %w", manifestPath, t.describe(), err)
+			out.err = parseErr
+			m.logger.Warn().Str("path", manifestPath).Err(parseErr).
+				Str("target", t.name).Msg("Failed to parse manifest; target listing is incomplete")
+			return out
 		}
 		out.manifests[id] = manifest
 	}
