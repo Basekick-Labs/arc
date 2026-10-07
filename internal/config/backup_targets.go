@@ -1,16 +1,18 @@
 package config
 
-// Backup destinations (#1085 stage B2b-1).
+// Backup destinations (#1085 stages B2b-1 and B2b-2).
 //
 // Before this, a backup had exactly one destination: a local directory named
 // by backup.local_path. A named target makes that destination configurable and
 // lets it be an object store, which is the point — a backup on the same disk
 // as the data it backs up is not a backup.
 //
-// B2b-1 allows exactly ONE target. Per-database routing, several targets and
-// the index that resolves them are B2b-2. The refusal of a second target is
-// here rather than left to misbehave, because a silently-ignored second target
-// is a destination an operator believes they configured.
+// B2b-1 allowed exactly ONE target. B2b-2 allows several and routes per
+// database: `databases = [...]` on a target sends those databases' files
+// there, and everything else goes to backup.default_target. The refusal of a
+// second target is gone with it; what is left in its place is the pairwise
+// overlap check below, because two targets in one bucket whose prefixes
+// contain one another are one listing.
 //
 // Shape: [backup.targets.<name>] in a file, every field also settable as
 // ARC_BACKUP_TARGETS_<NAME>_<FIELD>. Field names mirror [tiered_storage.cold]
@@ -25,6 +27,7 @@ import (
 	"strings"
 
 	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/spf13/cast"
 	"github.com/spf13/viper"
 )
 
@@ -62,6 +65,22 @@ type BackupTargetConfig struct {
 	// there is deliberately no default, because the whole reason a target
 	// exists is that its destination is not the built-in one.
 	Type string
+	// Databases are the databases whose files go to this target (#1085 stage
+	// B2b-2), as storage-root segments — so an edge-sync spoke is named as the
+	// spoke, exactly as a scoped backup names it (internal/backup/scope.go).
+	// Everything not named by any target goes to backup.default_target.
+	//
+	// Order is as configured and duplicates are possible: the accessor splits
+	// and trims but deliberately does not de-duplicate or lowercase (a
+	// database name is a storage segment and stays case-sensitive, even though
+	// viper lowercases target NAMES). validateBackupTargets de-duplicates
+	// within a target and refuses the same database on two targets.
+	//
+	// Naming databases on the default target is allowed and is a no-op —
+	// everything unrouted goes there already — so RoutingMap leaves those
+	// entries out, which keeps "routing is non-empty" equivalent to "more than
+	// the default destination is in play".
+	Databases []string
 
 	LocalPath string
 
@@ -228,6 +247,86 @@ func setBackupTargetDefaults(v *viper.Viper, name string) {
 	v.SetDefault(k+"azure_sas_token", "")
 	v.SetDefault(k+"azure_endpoint", "")
 	v.SetDefault(k+"azure_use_managed_identity", false)
+	// A string default rather than an empty []string, so an unset key reads
+	// back as the scalar spelling rather than as an empty array, which is the
+	// shape parseTargetDatabases treats as "nothing routed" without having to
+	// distinguish the two. Required like every other key (the SQLite checklist
+	// rule): without it the key is invisible to an operator reading the
+	// defaults.
+	v.SetDefault(k+"databases", "")
+}
+
+// parseTargetDatabases reads backup.targets.<name>.databases.
+//
+// A type switch on v.Get, NOT v.GetStringSlice, and the reason is a bug that
+// accessor has for this key. The four spellings, MEASURED against this repo
+// viper setup rather than reasoned about:
+//
+//	source                                   Get               GetString      GetStringSlice
+//	TOML databases = ["audit","logs"]        []interface{}     ""             ["audit","logs"]
+//	TOML databases = "audit,logs"            "audit,logs"      "audit,logs"   ["audit,logs"]
+//	ARC_BACKUP_TARGETS_AUDIT_DATABASES=a,b   "a,b"             "a,b"          ["a,b"]
+//	env set with a file array present        "fromenv1,..."    same           ["fromenv1,..."]
+//
+// So the array spelling needs a slice accessor and the scalar spellings need a
+// comma split; the env value correctly overrides a file array, so there is no
+// precedence trap. parseStringSlice(v.GetString(k)) — the accessor
+// backup.target_names uses — returns NIL for the TOML array with no error at
+// all, i.e. no routing, silently; that precedent is safe only because a target
+// NAME has a second source (the backup.targets map), and databases has none.
+//
+// GetStringSlice was the first answer and is WRONG for the scalar spellings:
+// it casts through cast.ToStringSlice, which runs strings.Fields, so it splits
+// on WHITESPACE as well as on the comma this function adds. A database name
+// may legitimately contain a space — storage.ValidateKeySegment rejects only
+// NUL, a backslash, a separator, the empty string, "." and ".." — so
+// databases = "my db" became ["my", "db"]: two routing keys for databases that
+// do not exist, and the real one silently falling through to the default
+// target. The array spelling of the same name was already correct, which is
+// the worst shape for a bug of this kind, since the two spellings are
+// documented as equivalent.
+//
+// Hence: a slice value is cast element by element with NO splitting, and only
+// a scalar is comma-split.
+func parseTargetDatabases(value any) []string {
+	switch val := value.(type) {
+	case nil:
+		return nil
+	case string:
+		return parseStringSlice(val)
+	case []string:
+		return trimmedNames(val)
+	case []any:
+		names := make([]string, 0, len(val))
+		for _, item := range val {
+			names = append(names, cast.ToString(item))
+		}
+		return trimmedNames(names)
+	default:
+		// Any other shape viper might hand back (a []interface{} nested in an
+		// interface, a number) goes through the same cast the slice case uses,
+		// which yields "" for something unusable and is then dropped.
+		return trimmedNames(cast.ToStringSlice(value))
+	}
+}
+
+// trimmedNames trims and drops empties, without splitting: each element of an
+// array spelling is one name, spaces included. See parseTargetDatabases.
+//
+// Deliberately UNCAPPED, where a backup scope caps at 256 names
+// (backup.maxScopeDatabases). The cap there bounds an API REQUEST, whose
+// handler probes each name synchronously inside its own timeout; this is
+// configuration read once at startup into a map, and a long list costs one map
+// entry per name. An operator with 500 databases on one target has a legitimate
+// configuration, not an attack.
+func trimmedNames(in []string) []string {
+	var out []string
+	for _, name := range in {
+		if name = strings.TrimSpace(name); name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 // loadBackupTargets discovers and reads every configured backup target.
@@ -271,6 +370,7 @@ func loadBackupTargets(v *viper.Viper) (map[string]BackupTargetConfig, error) {
 			AzureSASToken:           v.GetString(k + "azure_sas_token"),
 			AzureEndpoint:           get("azure_endpoint"),
 			AzureUseManagedIdentity: v.GetBool(k + "azure_use_managed_identity"),
+			Databases:               parseTargetDatabases(v.Get(k + "databases")),
 		}
 	}
 	return targets, nil
@@ -286,6 +386,11 @@ func prefixKeyName(targetType string) string {
 		return "s3_prefix"
 	}
 }
+
+// TargetNamesSorted is targetNames for callers outside this package:
+// cmd/arc/main.go builds one backup.Target per name and needs a deterministic
+// order, because the manager reports the set in its logs and its refusals.
+func (c *BackupConfig) TargetNamesSorted() []string { return c.targetNames() }
 
 // targetNames returns the configured target names, sorted — the "discovered
 // set" a refusal message names.
@@ -307,11 +412,16 @@ func (c *BackupConfig) targetNames() []string {
 // watching.
 func (c *Config) validateBackupTargets() error {
 	b := &c.Backup
-	if len(b.Targets) > 1 {
-		return fmt.Errorf(
-			"backup.targets names %d targets (%s) but only one is supported in this release; per-database routing across several targets is not implemented yet, and a second target would be silently ignored",
-			len(b.Targets), strings.Join(b.targetNames(), ", "))
-	}
+	// Several targets are the subject of #1085 stage B2b-2, so the refusal of
+	// a second one is gone. What replaces it is the per-database routing check
+	// below and the pairwise overlap check in
+	// checkBackupDestinationOverlap: two targets are legal, two targets whose
+	// prefixes contain one another are not.
+	//
+	// routedBy records which target claimed each database, so the same
+	// database on two targets is a refusal naming both rather than a silent
+	// last-writer-wins.
+	routedBy := map[string]string{}
 
 	for _, name := range b.targetNames() {
 		t := b.Targets[name]
@@ -364,6 +474,34 @@ func (c *Config) validateBackupTargets() error {
 		if err := storage.CheckBackupTargetPrefix(key+prefixKeyName(t.Type), prefix); err != nil {
 			return err
 		}
+
+		// Routing (#1085 stage B2b-2). Each name is checked with the rules a
+		// SCOPED backup applies to the same string (internal/backup.newScope):
+		// it becomes a storage-root segment to match against, and a reserved
+		// root holds Arc's own state rather than a database. Spelled here
+		// rather than shared because config cannot import internal/backup.
+		seen := map[string]bool{}
+		for _, db := range t.Databases {
+			if err := storage.ValidateKeySegment(db); err != nil {
+				return fmt.Errorf("%sdatabases names %q, which is not usable as a storage path segment: %w", key, db, err)
+			}
+			if storage.IsReservedRootDir(db) {
+				return fmt.Errorf("%sdatabases names %q, which is a reserved storage root holding Arc own state, not a database", key, db)
+			}
+			if seen[db] {
+				// Within one target a repeat says nothing new, so it is
+				// dropped rather than refused: the operator's intent is
+				// unambiguous.
+				continue
+			}
+			seen[db] = true
+			if other, dup := routedBy[db]; dup {
+				return fmt.Errorf(
+					"database %q is named by backup.targets.%s.databases and by backup.targets.%s.databases; a database goes to exactly one target, so remove it from one of them",
+					db, other, name)
+			}
+			routedBy[db] = name
+		}
 	}
 
 	// default_target resolution. Both failures below are errors rather than a
@@ -389,8 +527,10 @@ func (c *Config) validateBackupTargets() error {
 	return nil
 }
 
-// DefaultBackupTarget returns the target every backup is written to, or nil
-// when none is configured and the destination is backup.local_path as before.
+// DefaultBackupTarget returns the DEFAULT target — where everything unrouted
+// goes — or nil when none is configured and the destination is
+// backup.local_path as before. Under routing it is no longer the only
+// destination a backup writes to: see RoutingMap for the rest.
 func (c *BackupConfig) DefaultBackupTarget() *BackupTargetConfig {
 	if c.DefaultTarget == "" {
 		return nil
@@ -402,17 +542,58 @@ func (c *BackupConfig) DefaultBackupTarget() *BackupTargetConfig {
 	return &t
 }
 
+// RoutingMap is database name → target name for every ROUTED database (#1085
+// stage B2b-2), or nil when nothing routes.
+//
+// The default target's own databases are left out: everything unrouted already
+// goes there, so an entry for one would be a no-op that only made the map
+// non-empty. Leaving them out keeps "the routing map is non-empty" equivalent
+// to "a destination other than the default is in play", which is the condition
+// the backup manager's single-destination fast path keys on.
+//
+// Load has already refused the same database on two targets, so the map cannot
+// lose an entry here; the de-duplication is for a repeat within one target,
+// which Load drops rather than refuses.
+func (c *BackupConfig) RoutingMap() map[string]string {
+	var routing map[string]string
+	for _, name := range c.targetNames() {
+		if name == c.DefaultTarget {
+			continue
+		}
+		for _, db := range c.Targets[name].Databases {
+			if routing == nil {
+				routing = make(map[string]string)
+			}
+			if _, taken := routing[db]; taken {
+				continue
+			}
+			routing[db] = name
+		}
+	}
+	return routing
+}
+
+// AnyTargetIsRemote reports whether ANY configured target is an object store.
+func (c *BackupConfig) AnyTargetIsRemote() bool {
+	for _, t := range c.Targets {
+		if t.IsRemote() {
+			return true
+		}
+	}
+	return false
+}
+
 // DefaultIncludeConfig is whether a backup should copy arc.toml when the
 // request did not say.
 //
-// False for a remote default target. arc.toml carries that target's own
-// credentials verbatim (BackupTargetConfig), so the default would put the keys
-// to the backup store inside every backup held in it. An operator who wants it
-// anyway says so per request and is warned; the default is the safe one
-// because it is the one nobody chooses.
+// False when ANY configured target is remote, not only the default one (#1085
+// stage B2b-2). arc.toml carries every target's credentials verbatim
+// (BackupTargetConfig), so a local default plus one remote routed target still
+// means copying arc.toml puts the keys to that store inside a backup it holds.
+// An operator who wants it anyway says so per request and is warned; the
+// default is the safe one because it is the one nobody chooses.
 func (c *BackupConfig) DefaultIncludeConfig() bool {
-	t := c.DefaultBackupTarget()
-	return t == nil || !t.IsRemote()
+	return !c.AnyTargetIsRemote()
 }
 
 // checkBackupDestinationOverlap refuses a configuration in which the backup
@@ -454,8 +635,15 @@ func (c *BackupConfig) DefaultIncludeConfig() bool {
 //
 // Applied to backup.local_path as well as to a target, because the hazard
 // predates targets: "./data/arc" and "./data/backups" are one typo apart.
+// With several targets (#1085 stage B2b-2) it also checks every PAIR of
+// targets, which is a hazard of its own: two targets in one bucket whose
+// prefixes contain one another are one listing, so each backup leg would
+// enumerate the other's objects and a delete of one backup ID would reach
+// both. Disjoint prefixes in one bucket stay legal — that is the shape an
+// operator picks on purpose, and keyPrefixWithin matches at a separator
+// boundary so "wh-other" is not inside "wh" (#534).
 func (c *Config) checkBackupDestinationOverlap() error {
-	dest, destKey, err := c.backupDestination()
+	dests, err := c.backupDestinations()
 	if err != nil {
 		return err
 	}
@@ -470,42 +658,82 @@ func (c *Config) checkBackupDestinationOverlap() error {
 	if err != nil {
 		return fmt.Errorf("cannot resolve the primary storage location to check it against the backup destination: %w", err)
 	}
-	if dest.Overlaps(primary) {
-		return fmt.Errorf(
-			"%s is %s, which overlaps primary storage at %s; every subsequent backup would then copy the previous one, because the data listing returns every Parquet file under the storage root, and on a cluster that climbs until the skip ratio refuses every replace-mode restore. With reconciliation enabled and manifest_only_dry_run off, its sweep deletes the backups outright. Point the destination outside the storage root",
-			destKey, dest.String(), primary.String())
-	}
-
 	// Only when the cold tier would actually be built: the runtime enters the
 	// cold-tier path under tiered_storage.enabled and then cold.enabled, so
 	// checking a disabled cold block would refuse a configuration the runtime
 	// ignores entirely — the same false-positive boot failure the cold
 	// validation above avoids.
-	if c.TieredStorage.Enabled && c.TieredStorage.Cold.Enabled {
-		cold, err := c.coldTierDestination()
+	var cold storage.Destination
+	checkCold := c.TieredStorage.Enabled && c.TieredStorage.Cold.Enabled
+	if checkCold {
+		cold, err = c.coldTierDestination()
 		if err != nil {
 			return fmt.Errorf("cannot resolve the tiered-storage cold tier location to check it against the backup destination: %w", err)
 		}
-		if dest.Overlaps(cold) {
+	}
+
+	for i, d := range dests {
+		if d.dest.Overlaps(primary) {
+			return fmt.Errorf(
+				"%s is %s, which overlaps primary storage at %s; every subsequent backup would then copy the previous one, because the data listing returns every Parquet file under the storage root, and on a cluster that climbs until the skip ratio refuses every replace-mode restore. With reconciliation enabled and manifest_only_dry_run off, its sweep deletes the backups outright. Point the destination outside the storage root",
+				d.key, d.dest.String(), primary.String())
+		}
+		if checkCold && d.dest.Overlaps(cold) {
 			return fmt.Errorf(
 				"%s is %s, which overlaps the tiered-storage cold tier at %s; the two would share one listing, so each would enumerate the other objects, and a migrated file would be copied into the backup as data. Use a different bucket or a prefix that is not a parent of the other",
-				destKey, dest.String(), cold.String())
+				d.key, d.dest.String(), cold.String())
+		}
+		// Pairwise, each pair once: Overlaps is symmetric.
+		for _, other := range dests[i+1:] {
+			if d.dest.Overlaps(other.dest) {
+				return fmt.Errorf(
+					"%s is %s, which overlaps %s at %s; two backup targets that contain one another share one listing, so each backup leg would enumerate the other objects and deleting one backup would reach both. Use a different bucket, or prefixes where neither is a parent of the other",
+					d.key, d.dest.String(), other.key, other.dest.String())
+			}
 		}
 	}
 	return nil
 }
 
-// backupDestination is where a backup is written, plus the configuration key
-// that names it so a refusal tells the operator which line to edit.
-func (c *Config) backupDestination() (storage.Destination, string, error) {
-	if t := c.Backup.DefaultBackupTarget(); t != nil {
-		key := "backup target " + t.Name
-		d, err := storage.DestinationFromSpec(t.BackendSpec())
-		if err != nil {
-			return storage.Destination{}, key, fmt.Errorf("cannot resolve the location of %s: %w", key, err)
+// backupDestinationRef is one place a backup can be written, with the
+// configuration key that names it so a refusal tells the operator which line
+// to edit.
+type backupDestinationRef struct {
+	dest storage.Destination
+	key  string
+}
+
+// backupDestinations is every place a backup can be written: one entry per
+// configured target (#1085 stage B2b-2), or the single backup.local_path
+// destination when none is configured.
+//
+// Sorted by target name, so a refusal over N targets names the same pair every
+// time and a changed message is a changed configuration rather than map
+// iteration order.
+func (c *Config) backupDestinations() ([]backupDestinationRef, error) {
+	if len(c.Backup.Targets) > 0 {
+		out := make([]backupDestinationRef, 0, len(c.Backup.Targets))
+		for _, name := range c.Backup.targetNames() {
+			t := c.Backup.Targets[name]
+			key := "backup target " + name
+			d, err := storage.DestinationFromSpec(t.BackendSpec())
+			if err != nil {
+				return nil, fmt.Errorf("cannot resolve the location of %s: %w", key, err)
+			}
+			out = append(out, backupDestinationRef{dest: d, key: key})
 		}
-		return d, key, nil
+		return out, nil
 	}
+	d, key, err := c.localBackupDestination()
+	if err != nil {
+		return nil, err
+	}
+	return []backupDestinationRef{{dest: d, key: key}}, nil
+}
+
+// localBackupDestination is the backup.local_path destination that predates
+// targets, plus the key that names it.
+func (c *Config) localBackupDestination() (storage.Destination, string, error) {
 	if c.Backup.LocalPath == "" {
 		// NOT merely a missing required field: storage.LocalDestination("")
 		// resolves through filepath.Abs, which answers the WORKING DIRECTORY,

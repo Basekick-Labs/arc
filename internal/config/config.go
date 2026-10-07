@@ -683,9 +683,11 @@ type BackupConfig struct {
 	// configured target with no DefaultTarget pointing at it is a load-time
 	// error, not a silent fall back to LocalPath — see validateBackupTargets.
 	DefaultTarget string
-	// Targets holds the configured backup destinations, keyed by name. At
-	// most one in this release. Nil when none is configured, which is the
-	// shape every deployment has today.
+	// Targets holds the configured backup destinations, keyed by name. Any
+	// number since #1085 stage B2b-2, each optionally naming the databases
+	// routed to it (BackupTargetConfig.Databases); everything unrouted goes to
+	// DefaultTarget. Nil when none is configured, which is the shape every
+	// deployment that has not adopted targets has.
 	Targets map[string]BackupTargetConfig
 }
 

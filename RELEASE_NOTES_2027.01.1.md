@@ -159,9 +159,120 @@ A backup is a copy of the files on disk at the moment each is read: rows
 still in the ingest buffers are not in it. "Point in time" means the last
 flush.
 
-Not in this stage: a different backup target per database (#1085), the cold
-tier (#1086), `arcli backup create --database` (tracked in Basekick-Labs/arcli#44),
-and scoping below the storage-root segment.
+Not in this stage: the cold tier (#1086), `arcli backup create --database`
+(tracked in Basekick-Labs/arcli#44), and scoping below the storage-root
+segment. A different backup target per database landed separately in #1085,
+below.
+
+### A different backup target per database ([#1085](https://github.com/Basekick-Labs/arc/issues/1085))
+
+A backup had one destination. Now each configured target may name the databases
+whose files go to it, and everything else goes to `backup.default_target`:
+
+```toml
+[backup]
+default_target = "main"
+
+[backup.targets.main]
+type = "local"
+local_path = "/srv/arc-backups"
+
+[backup.targets.audit]
+type = "s3"
+s3_bucket = "acme-arc-audit"
+databases = ["audit", "compliance"]
+```
+
+`databases` also takes a comma-separated string, and
+`ARC_BACKUP_TARGETS_AUDIT_DATABASES=audit,compliance` overrides whatever the
+file says. A database may be named by exactly one target: naming it twice is
+refused at startup, naming it on the default target is allowed and does
+nothing. The names are storage-root segments, exactly as a scoped backup names
+them, so an edge-sync spoke is named as the **spoke** — `["prod"]` does not mean
+`spoke1/prod`. A database's own field schema anchors and compaction recovery
+state travel with its data to its target.
+
+The instance-wide state always goes to the default target, because it belongs
+to no one database: the SQLite database, the Iceberg SQL catalog, Iceberg table
+metadata, an out-of-root Iceberg warehouse, and `arc.toml`.
+
+**What a routed backup writes.** One manifest and one file sidecar per target,
+each describing that target's own slice and each naming the whole run, so a
+manifest found on its own is self-describing. Plus `<backup_id>/index.json` on
+the default target, written before the first copy, naming every target the run
+touched. A target that receives no files still commits an empty manifest and
+sidecar, so a routed database whose name is a typo shows up as a leg with
+`total_files: 0` rather than as a target the run failed to reach.
+
+**The listing** returns one entry per backup id whatever it is spread across,
+with `targets` naming every destination that holds a slice of it (`target`
+stays set only when there is exactly one). It fans out over every target
+concurrently, so one unreachable store no longer consumes the request budget
+and cancels the rest: it is named in `unreachable_targets` and the response is
+still 200 with everything the others hold. 503 is now only for a listing where
+nothing could be read at all. A run that did not commit to every target it
+named appears in `incomplete_runs`, marked `aborted` or `possibly_in_flight` —
+the second because a cluster reader listing a shared destination has no view of
+the primary's live run and must not report a healthy backup as aborted. A
+target that would not answer is reported as `unknown_targets` on that entry
+rather than as `missing_targets`: "missing" means the listing looked and found
+no manifest, so a store that is briefly down no longer makes a complete backup
+read as a run that did not finish.
+
+**`GET /api/v1/backup/:id`** still answers the manifest at the top level, now
+the merged view of the whole run, with a `targets` array of the per-target
+slices beside it. **A delete** sweeps every target under one lock, and names
+the ones it could not reach having deleted where it could, so a second delete
+finishes the job.
+
+**A restore** reads every target of the run and assembles the merged view
+before any of its gates, so a scoped backup that lives on one target is not
+mistaken for a backup holding nothing. It **refuses before writing anything**
+when a target of the run is not configured on this node, will not answer, or
+holds no manifest for the id. Restoring only the reachable part would report
+success over a set it did not restore, and in replace mode would delete the
+live files of a database whose backup bytes are on the target it could not
+read. A backup with a single destination resolves no names at all, so one
+whose target has since been renamed still restores.
+
+`include_config` now defaults to false when **any** configured target is
+remote, not only when the default one is: `arc.toml` carries every target's
+credentials, so a local default beside one remote routed target still means
+copying it puts the keys to that store inside a backup it holds. Asking for it
+explicitly is honoured and warns, naming each remote target.
+
+`/api/v1/backup/status` gains a `targets` array while a routed backup runs:
+per-target files, bytes, skips and status.
+
+A **target nothing is routed to is inert**: no backup writes to it, and a
+warning at startup names it. It is deliberately not a refusal — adding the
+target block in one commit and its `databases` in the next is ordinary — and
+deliberately not a backup leg either. Every leg is probed before anything is
+copied, so taking every configured target as a leg would make an unrelated
+store a precondition of every backup in the instance, whole-instance ones
+included.
+
+In a listing, an entry whose targets could not all be read now says so.
+`targets` names every destination **the run recorded**, the single-target
+`target` field is cleared when there is more than one, and `partial_view: true`
+marks an entry whose file and byte counts are summed over fewer legs than that.
+The matching `incomplete_runs` entry says which target is unaccounted for, and
+its `state` is `undetermined` when nothing is known to be missing — a complete
+backup read while one store is briefly down is not a run that failed.
+
+Only the **comma** separates names in `databases`. A database name may contain
+a space, so `databases = "my db"` is one name and `databases = ["a", "b"]` is
+two.
+
+Startup now also refuses two backup targets that contain one another — same
+bucket with one prefix a parent of the other — for the reason it already
+refuses an overlap with primary storage or the cold tier: the two would be one
+listing, so each leg would enumerate the other's objects and deleting one
+backup id would reach both. Two targets in one bucket under disjoint prefixes
+stay legal.
+
+Not in this stage: `cold_files_excluded` (#1086 is still the cold tier), backup
+scheduling, and incremental backups.
 
 ### A backup can be written somewhere other than a local directory ([#1085](https://github.com/Basekick-Labs/arc/issues/1085))
 
@@ -211,11 +322,12 @@ ARC_BACKUP_DEFAULT_TARGET=audit
 ```
 
 Three behaviours change when the target is remote. `include_config` defaults to
-false, because `arc.toml` carries the target's own credentials. The usable
-source-key length shrinks by the length of the target prefix, and the figure
-Arc reports to you accounts for it. And a prefix long enough to leave no room
-for a backup's own keys is refused when the configuration loads rather than
-later.
+false, because `arc.toml` carries that target's credentials — with per-database
+routing the rule widened to **any** configured target being remote, as
+described above. The usable source-key length shrinks by the length of the
+target prefix, and the figure Arc reports to you accounts for it. And a prefix
+long enough to leave no room for a backup's own keys is refused when the
+configuration loads rather than later.
 
 **Backups now record which instance wrote them,** so two Arc instances sharing
 one bucket and prefix do not merge their listings. The identity is
@@ -229,8 +341,8 @@ backups marked as another instance's. Those are hidden from the listing by
 default; add `?include_foreign=true` to see them, and the listing tells you when
 it has withheld any. Restoring one is allowed, and logs whose backup it was.
 
-Per-database routing, where different databases go to different targets, is the
-next change. This one is a single destination.
+Per-database routing, where different databases go to different targets, is
+described above; this section is the single-destination half it was built on.
 
 ### Azure Blob Storage takes a key prefix ([#1102](https://github.com/Basekick-Labs/arc/issues/1102))
 
@@ -1071,3 +1183,148 @@ derived from. Deliberately not folded: a different AWS partition, a hostname
 that merely ends in something that looks like an AWS suffix, and any self-hosted
 store, because treating two of those as one location would refuse a legitimate
 configuration.
+
+### Backups are written per leg rather than per destination ([#1085](https://github.com/Basekick-Labs/arc/issues/1085))
+
+Per-database routing turned one destination into a set, and the refactor that
+made that possible is worth knowing before you go looking for the old shape.
+
+**A run is now a set of legs.** `backupRun` holds one `backupLeg` per target it
+routes to, and a leg owns its destination, its `Manifest`, its `dbMap`, its
+`sidecarBuilder`, its `skipTally`, its key headroom and its own state and data
+skip counters. The run owns `Progress`, the run-wide skip ratio, the cluster
+cross-check and the index. Files are partitioned into legs **up front**, before
+any copy, and every copy function takes a leg: routing inside
+`streamBackupFile` would make the destination a function of the path at every
+write and force a per-file lookup of the right manifest, sidecar and tally.
+
+A leg carries a back-pointer to its run so each copy function takes one
+argument. That is not tidiness: with the run and the leg as separate
+parameters a caller can pass a leg belonging to another run, and the per-target
+progress is then published for a leg nothing is writing to — a mismatch that
+compiles, runs, and reports plausible numbers for the wrong destination.
+
+The state-vs-data skip split used to be a global subtraction — snapshot
+`progress.SkippedFiles` after the state copies, subtract. That assumed every
+state copy precedes every data copy, which per-leg interleaving (A-state,
+A-data, B-state, B-data) breaks, so each leg counts its own and
+`progress.SkippedFiles` stays a run-wide total used only for the gauge and the
+ratio. The out-of-root warehouse's skips now stay out of both by construction,
+where the subtraction had to take them back out.
+
+**`destination()` is gone.** The no-argument accessor stage B2b-1 introduced is
+replaced by `defaultDestination()` and a `backupTarget` value threaded through
+every call site, including the ones that were never `destination()` callers and
+are equally per-target: `describeDestination` (now `backupTarget.describe`),
+the key-headroom arithmetic (now on `backupTarget`, because two targets with
+different prefixes have different usable source-key lengths), the sidecar
+writes, and the restore's reads.
+
+**`Manager.targets` holds only the NON-default targets, and is nil for both
+single-destination shapes** — no target configured, and exactly one target,
+where the default must be it and routing is a no-op. `defaultDestination()`
+re-reads the flat `backupStorage`/`targetName`/`targetKeyPrefix`/`targetRemote`
+fields on every call and caches nothing. That is a compatibility rule, not a
+style: twelve tests swap `m.backupStorage` on a Manager built by `NewManager`
+to stand in for a counting, failing, unreachable, write-refusing or stalling
+destination, and a populated map or a cached destination would route past every
+one of those fakes and leave them green against a broken implementation.
+
+**`ListBackups` fans out and returns a struct.** `BackupListing` carries the
+backups, the foreign-filter count, the unreachable targets and the incomplete
+runs; `ListBackupsDetailed` is what the API answers from, and
+`ListBackups`/`ListAllBackups`/`ListBackupsFilteringForeign` remain as
+convenience forms over the same fan-out. The fan-out is concurrent for a reason
+that is not arithmetic: `withDestinationTimeout` derives from the caller's
+context, so N targets cannot each cost a fresh 60 s, but **one** dead target
+consumes the whole 30 s handler budget and cancels the rest — so a serial
+listing could never report the unreachable target it is supposed to mark.
+
+**The end-of-run cluster re-check is its own ordered step.**
+`recheckClusterManifest` both writes and deletes after every leg has copied,
+and its delete is routed to the leg that holds the file. Unrouted it would go
+to the default destination, where `LocalBackend.Delete` returns nil for a
+missing key and S3's `DeleteObject` is idempotent: it would **report success
+while the file stayed on the routed target**, which is the double-serve #1083
+and #930 exist to prevent, arrived at through a delete that looks fine.
+
+**`replaceDatabases` runs once, over the union of every leg.** Per target it
+would be unsound: `owns()` keys on the cluster entry's `Database` label for an
+unscoped backup while `writes` is built from the backup listing, so one leg's
+`owns()` can be true for a spoke entry whose bytes are in another leg's listing
+— and it would `BatchDelete` live files the other leg is about to restore. The
+two sets are only mutually protective when the file set is the whole run. The
+per-leg copy loop sits inside the single compaction pause the caller already
+holds, so the run still takes one pause and not one per leg.
+
+**Known single-destination assumption, deferred deliberately.** The
+single-operation lock stays one lock for the whole manager. A run spans every
+target it routes to, so per-target locking would not make "back up to A while
+restoring from B" safe, and `DeleteBackup` must sweep every target under one
+`TryLock`. `/api/v1/backup/status` gained the per-target fields so an operator
+can at least see which destinations a busy run is writing to.
+
+`Progress.Targets` is replaced wholesale on every publish and never mutated in
+place. `setProgress` publishes a shallow copy, so every published snapshot
+shares that slice header and an element written after publication races every
+reader of `/status` — the same reason `SkippedSample` is handed over once and
+never appended to.
+
+**A run has an ANCHOR leg, and the three default-leg restore steps read from
+it.** `runRead.anchor` is the leg whose manifest asserted `HasMetadata`,
+`HasConfig` and `IcebergWarehouse` — by `IsDefaultTarget` where that is set,
+and otherwise by being the only leg. SQLite, `arc.toml` and an outside-root
+Iceberg warehouse are read from `read.anchor.target` and never from
+`m.defaultDestination()`.
+
+Those two are the same target right up until an operator adds a second target
+and re-points `backup.default_target`, which is the documented migration path.
+After that the gates still fire — they read the MERGED view, so `HasMetadata`
+is true because some leg set it — while the read goes to a target holding
+nothing. SQLite and config then fail outright, in replace mode *after*
+`replaceDatabases` has already deleted and rewritten live files, and every
+retry fails identically until the default is pointed back. The warehouse arm
+does not fail at all: `restoreIcebergWarehouse` returns nil on a zero-object
+listing, because that is a legitimate "this run had no warehouse", so the
+restore reports **completed** having written no warehouse while the catalog it
+just restored points at absolute paths under it — #637's failure mode, by a
+different route. The anchor must NOT be keyed off `IsDefaultTarget` alone:
+`planRun` writes that field only for multi-leg runs, so the single-target
+manifest this exists to fix has it false.
+
+**The run index is read from every configured target, written to one.** The
+write only ever goes to the default, so a healthy destination needs one read;
+the read is wide because the default can MOVE, and a reader of only the current
+default silently stops enumerating exactly the leftovers the index exists to
+find. Same shape for `DeleteBackup`'s owner echo, which now tries every target
+so a backup held only on a routed one is not deleted without one. The remaining
+limit is recorded in the code: a run that died before any manifest is invisible
+when no reachable target holds its index, because the directory listing that
+produces the ID and the index key are on the same store.
+
+**The `databases` accessor is a type switch on `v.Get`, not `v.GetStringSlice`.**
+That accessor casts a scalar through `cast.ToStringSlice`, which runs
+`strings.Fields`, so it split on whitespace as well as on the comma: a database
+really can be called `my db` (`storage.ValidateKeySegment` rejects only NUL, a
+backslash, a separator, the empty string, `.` and `..`), and the scalar
+spelling turned it into two routing keys for databases that do not exist while
+the real one fell through to the default target. The array spelling of the same
+name was already correct, which is the worst shape a bug of this kind can take,
+since the two spellings are documented as equivalent.
+
+**The `include_config` credential warning comes from the configured set, not
+the run's legs.** What leaks is the file, and `arc.toml` holds every target's
+credentials, so a scoped backup of an unrelated database — whose legs are just
+the default, and which is the one request that can override `include_config`
+without a refusal — must still name every configured remote target.
+
+**`backupRun.fail` marks every leg that has not committed.** A leg that
+committed keeps that status, because its manifest really did land; everything
+still pending, copying or copied is marked failed, so `/status` does not show a
+half-green run that produced nothing restorable there.
+
+Every leg's `sidecarBuilder` ALIASES one `byPath` map — the first cluster
+manifest snapshot, the same immutable reference set for every leg. Only
+`recheckClusterManifest`'s `addLate` writes into it, after every leg has
+copied, on one goroutine. If the leg copies are ever parallelised, that map has
+to become per leg or the write has to be guarded.

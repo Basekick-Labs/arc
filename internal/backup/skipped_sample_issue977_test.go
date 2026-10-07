@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -242,19 +243,32 @@ func TestCheckSkipRatio_MessageNamesCauses(t *testing.T) {
 	m := &Manager{logger: zerolog.Nop()}
 	threshold := fmt.Sprintf("longer than %d bytes", storage.MaxUsableKeyLen-backupDataKeyHeadroom)
 
-	err := m.checkSkipRatio(&Progress{SkippedFiles: 5}, 10, &skipTally{overlong: 3})
+	// The ratio is evaluated over the RUN now (#1085 stage B2b-2), so the
+	// counts come from the legs' tallies: one leg here, the default
+	// destination, which is the single-destination shape.
+	ratio := func(skipped, overlong int64) error {
+		progress := &Progress{SkippedFiles: skipped}
+		leg := m.planRun("bkid", time.Now(), progress, nil).def
+		leg.tally.overlong = overlong
+		return m.checkSkipRatio(leg.run, 10)
+	}
+
+	err := ratio(5, 3)
 	if err == nil || !strings.Contains(err.Error(), "2 could not be read at copy time") || !strings.Contains(err.Error(), "3 have source keys "+threshold) {
 		t.Errorf("mixed causes: %v", err)
 	}
-	err = m.checkSkipRatio(&Progress{SkippedFiles: 5}, 10, &skipTally{overlong: 5})
+	err = ratio(5, 5)
 	if err == nil || strings.Contains(err.Error(), "could not be read") || !strings.Contains(err.Error(), "5 have source keys "+threshold) {
 		t.Errorf("overlong only: %v", err)
 	}
-	err = m.checkSkipRatio(&Progress{SkippedFiles: 5}, 10, nil)
+	err = ratio(5, 0)
 	if err == nil || !strings.Contains(err.Error(), "5 could not be read at copy time") || strings.Contains(err.Error(), "source keys") {
-		t.Errorf("unreadable only (nil tally): %v", err)
+		t.Errorf("unreadable only: %v", err)
 	}
-	if err := m.checkSkipRatio(&Progress{SkippedFiles: 1}, 20, &skipTally{overlong: 1}); err != nil {
+	progress := &Progress{SkippedFiles: 1}
+	leg := m.planRun("bkid", time.Now(), progress, nil).def
+	leg.tally.overlong = 1
+	if err := m.checkSkipRatio(leg.run, 20); err != nil {
 		t.Errorf("one skip in twenty is tolerated: %v", err)
 	}
 }

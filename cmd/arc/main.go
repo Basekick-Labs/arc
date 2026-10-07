@@ -4356,30 +4356,35 @@ func main() {
 					Msg("iceberg.warehouse is not a local path; backups cannot include its table metadata")
 			}
 		}
-		// Backup destination (#1085 stage B2b-1). A configured target replaces
-		// the local directory entirely; with none, BackupPath is the
-		// destination exactly as before. config.Load has already validated the
-		// target, bounded its key prefix, and refused an overlap with primary
-		// storage or the cold tier — see
+		// Backup destinations (#1085 stage B2b-1, a set with per-database
+		// routing since B2b-2). A configured target replaces the local
+		// directory entirely; with none, BackupPath is the destination exactly
+		// as before. config.Load has already validated every target, bounded
+		// each key prefix, refused the same database on two targets, and
+		// refused an overlap with primary storage, with the cold tier and
+		// between any two targets — see
 		// config.checkBackupDestinationOverlap, which records what that
 		// refusal actually protects against: a backup that re-copies itself
 		// every run, and the reconciliation sweep deleting the backups.
-		var backupTarget *backup.Target
-		if t := cfg.Backup.DefaultBackupTarget(); t != nil {
+		var backupTargets []backup.Target
+		for _, name := range cfg.Backup.TargetNamesSorted() {
+			t := cfg.Backup.Targets[name]
 			keyPrefix, err := t.KeyPrefix()
 			if err != nil {
 				// Unreachable: validateBackupTargets asks for the same prefix
 				// at load and refuses a bad one. Fatal rather than silently
 				// reserving no key headroom, which would turn an overlong key
-				// from a reported skip into a failed write.
+				// from a reported skip into a failed write. Per target, so a
+				// routed target with an unusable prefix is as loud as the
+				// default one.
 				log.Fatal().Err(err).Str("target", t.Name).Msg("Backup target prefix is unusable")
 			}
-			backupTarget = &backup.Target{
+			backupTargets = append(backupTargets, backup.Target{
 				Name:      t.Name,
 				Spec:      t.BackendSpec(),
 				KeyPrefix: keyPrefix,
 				Remote:    t.IsRemote(),
-			}
+			})
 		}
 
 		// Backup owner identity (#1085 stage B2b-1). The CLUSTER when
@@ -4416,10 +4421,18 @@ func main() {
 			backupInstanceID = id
 		}
 
+		// Built once: the ready log below reports its size, and rebuilding it
+		// there would walk every target a second time to answer a question
+		// this map already answers.
+		backupRouting := cfg.Backup.RoutingMap()
+
 		backupManager, err := backup.NewManager(&backup.ManagerConfig{
 			DataStorage:            storageBackend,
 			BackupPath:             cfg.Backup.LocalPath,
-			Target:                 backupTarget,
+			Targets:                backupTargets,
+			DefaultTarget:          cfg.Backup.DefaultTarget,
+			Routing:                backupRouting,
+			OperationTimeout:       cfg.Backup.OperationTimeout,
 			InstanceID:             backupInstanceID,
 			SQLiteDBPath:           cfg.Auth.DBPath,
 			IcebergCatalogDBPath:   icebergCatalogDBPath,
@@ -4472,11 +4485,15 @@ func main() {
 			// backup goes somewhere it does not, and that directory is not
 			// even created in that configuration.
 			ready := log.Info()
-			if backupTarget != nil {
+			if len(backupTargets) > 0 {
+				names := make([]string, 0, len(backupTargets))
+				for _, t := range backupTargets {
+					names = append(names, t.Name)
+				}
 				ready = ready.
-					Str("backup_target", backupTarget.Name).
-					Str("backup_target_type", backupTarget.Spec.Type).
-					Bool("backup_target_remote", backupTarget.Remote)
+					Str("backup_default_target", cfg.Backup.DefaultTarget).
+					Strs("backup_targets", names).
+					Int("routed_databases", len(backupRouting))
 			} else {
 				ready = ready.Str("backup_path", cfg.Backup.LocalPath)
 			}

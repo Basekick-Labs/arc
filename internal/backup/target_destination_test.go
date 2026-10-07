@@ -42,13 +42,20 @@ import (
 // target exercises without a network or a credential. The alternative — a real
 // S3 target — cannot run in a unit test: NewS3Backend probes the bucket with a
 // ten-second timeout.
-func localTarget(dir, name, keyPrefix string, remote bool) *Target {
-	return &Target{
+func localTarget(dir, name, keyPrefix string, remote bool) Target {
+	return Target{
 		Name:      name,
 		Spec:      storage.BackendSpec{Type: "local", LocalPath: dir},
 		KeyPrefix: keyPrefix,
 		Remote:    remote,
 	}
+}
+
+// oneTarget is the single-target configuration: the shape in which
+// NewManager leaves Manager.targets NIL, so every fake these tests swap into
+// m.backupStorage is still the destination every operation uses.
+func oneTarget(dir, name, keyPrefix string, remote bool) []Target {
+	return []Target{localTarget(dir, name, keyPrefix, remote)}
 }
 
 // TestNewManagerDoesNotNeedALocalPathWithATarget is the headline cell of this
@@ -64,10 +71,11 @@ func TestNewManagerDoesNotNeedALocalPathWithATarget(t *testing.T) {
 
 	targetDir := t.TempDir()
 	m, err := NewManager(&ManagerConfig{
-		DataStorage: dataStorage,
-		BackupPath:  "", // deliberately unset
-		Target:      localTarget(targetDir, "audit", "", false),
-		Logger:      zerolog.Nop(),
+		DataStorage:   dataStorage,
+		BackupPath:    "", // deliberately unset
+		Targets:       oneTarget(targetDir, "audit", "", false),
+		DefaultTarget: "audit",
+		Logger:        zerolog.Nop(),
 	})
 	if err != nil {
 		t.Fatalf("NewManager with a target and no BackupPath = %v, want success", err)
@@ -99,10 +107,11 @@ func TestATargetLeavesTheLocalBackupDirectoryUncreated(t *testing.T) {
 	root := t.TempDir()
 	unused := filepath.Join(root, "unused-local-backups")
 	if _, err := NewManager(&ManagerConfig{
-		DataStorage: dataStorage,
-		BackupPath:  unused,
-		Target:      localTarget(filepath.Join(root, "target"), "audit", "", false),
-		Logger:      zerolog.Nop(),
+		DataStorage:   dataStorage,
+		BackupPath:    unused,
+		Targets:       oneTarget(filepath.Join(root, "target"), "audit", "", false),
+		DefaultTarget: "audit",
+		Logger:        zerolog.Nop(),
 	}); err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -154,9 +163,10 @@ func TestATargetKeyPrefixThatCannotHoldTheBackupsOwnKeysIsRefused(t *testing.T) 
 			t.Fatalf("a %d-byte prefix must still pass ValidateObjectPrefix, which is the point: %v", prefixLen, err)
 		}
 		return NewManager(&ManagerConfig{
-			DataStorage: dataStorage,
-			Target:      localTarget(t.TempDir(), "audit", prefix, true),
-			Logger:      zerolog.Nop(),
+			DataStorage:   dataStorage,
+			Targets:       oneTarget(t.TempDir(), "audit", prefix, true),
+			DefaultTarget: "audit",
+			Logger:        zerolog.Nop(),
 		})
 	}
 
@@ -183,10 +193,10 @@ func TestATargetKeyPrefixThatCannotHoldTheBackupsOwnKeysIsRefused(t *testing.T) 
 	if err != nil {
 		t.Fatalf("NewManager refused a 968-byte prefix, which is exactly the maximum: %v", err)
 	}
-	if got := m.maxSourceKeyBytes(); got != 14 {
+	if got := m.defaultDestination().maxSourceKeyBytes(); got != 14 {
 		t.Errorf("maxSourceKeyBytes() at the maximum prefix = %d, want 14 (1019 - 968 - 37)", got)
 	}
-	if m.maxSourceKeyBytes() <= 0 {
+	if m.defaultDestination().maxSourceKeyBytes() <= 0 {
 		t.Error("maxSourceKeyBytes() is not positive at the largest accepted prefix; the messages would report a negative byte count")
 	}
 }
@@ -212,7 +222,11 @@ func TestIcebergContainmentWarningFollowsTheDestination(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	newWith := func(t *testing.T, target *Target, backupPath string) string {
+	newWith := func(t *testing.T, targets []Target, backupPath string) string {
+		defaultTarget := ""
+		if len(targets) > 0 {
+			defaultTarget = targets[0].Name
+		}
 		t.Helper()
 		dataStorage, err := storage.NewLocalBackend(filepath.Join(t.TempDir(), "data"), zerolog.Nop())
 		if err != nil {
@@ -223,7 +237,8 @@ func TestIcebergContainmentWarningFollowsTheDestination(t *testing.T) {
 		if _, err := NewManager(&ManagerConfig{
 			DataStorage:          dataStorage,
 			BackupPath:           backupPath,
-			Target:               target,
+			Targets:              targets,
+			DefaultTarget:        defaultTarget,
 			IcebergWarehousePath: warehouse,
 			Logger:               zerolog.New(&logOutput),
 		}); err != nil {
@@ -246,7 +261,7 @@ func TestIcebergContainmentWarningFollowsTheDestination(t *testing.T) {
 		// BackupPath points somewhere harmless and is ignored; the target is
 		// the directory inside the warehouse.
 		elsewhere := filepath.Join(root, "ignored-local-path")
-		logs := newWith(t, localTarget(insideWarehouse, "nearby", "", false), elsewhere)
+		logs := newWith(t, oneTarget(insideWarehouse, "nearby", "", false), elsewhere)
 		if !strings.Contains(logs, "contains the backup directory") {
 			t.Fatalf("no containment warning for a local TARGET inside the warehouse; got: %s", logs)
 		}
@@ -266,7 +281,7 @@ func TestIcebergContainmentWarningFollowsTheDestination(t *testing.T) {
 		// read, so "type = s3" beside a leftover local_path is an ordinary
 		// half-edited config. An object store cannot contain a directory on
 		// this machine, so the answer is silence either way.
-		logs := newWith(t, localTarget(insideWarehouse, "audit", "", true), insideWarehouse)
+		logs := newWith(t, oneTarget(insideWarehouse, "audit", "", true), insideWarehouse)
 		if strings.Contains(logs, "contains the backup directory") {
 			t.Errorf("a remote target produced a backup-directory containment warning about a path nothing writes to; got: %s", logs)
 		}
@@ -295,7 +310,8 @@ func TestIcebergContainmentWarningFollowsTheDestination(t *testing.T) {
 		if _, err := NewManager(&ManagerConfig{
 			DataStorage:          dataStorage,
 			BackupPath:           "",
-			Target:               localTarget(t.TempDir(), "audit", "", true),
+			Targets:              oneTarget(t.TempDir(), "audit", "", true),
+			DefaultTarget:        "audit",
 			IcebergWarehousePath: cwd,
 			Logger:               zerolog.New(&logOutput),
 		}); err != nil {
@@ -378,15 +394,16 @@ func TestDataKeyHeadroomShrinksByTheTargetPrefix(t *testing.T) {
 
 	var logOutput bytes.Buffer
 	m, err := NewManager(&ManagerConfig{
-		DataStorage: headroomInventory{Backend: dataStorage, longKey: longKey},
-		Target:      localTarget(t.TempDir(), "audit", "arc/", true),
-		Logger:      zerolog.New(&logOutput),
+		DataStorage:   headroomInventory{Backend: dataStorage, longKey: longKey},
+		Targets:       oneTarget(t.TempDir(), "audit", "arc/", true),
+		DefaultTarget: "audit",
+		Logger:        zerolog.New(&logOutput),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if got := m.maxSourceKeyBytes(); got != 978 {
+	if got := m.defaultDestination().maxSourceKeyBytes(); got != 978 {
 		t.Errorf("maxSourceKeyBytes() with the prefix \"arc/\" = %d, want 978", got)
 	}
 
@@ -460,9 +477,10 @@ func TestStateKeyHeadroomShrinksByTheTargetPrefix(t *testing.T) {
 	longKey := compactionStateDir + "/" + suffix
 
 	m, err := NewManager(&ManagerConfig{
-		DataStorage: longStateInventory{Backend: dataStorage, longKey: longKey},
-		Target:      localTarget(t.TempDir(), "audit", "arc/", true),
-		Logger:      zerolog.Nop(),
+		DataStorage:   longStateInventory{Backend: dataStorage, longKey: longKey},
+		Targets:       oneTarget(t.TempDir(), "audit", "arc/", true),
+		DefaultTarget: "audit",
+		Logger:        zerolog.Nop(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -504,10 +522,10 @@ func TestNoTargetKeepsTheUnprefixedHeadroom(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := m.maxSourceKeyBytes(); got != 982 {
+	if got := m.defaultDestination().maxSourceKeyBytes(); got != 982 {
 		t.Errorf("maxSourceKeyBytes() with no target = %d, want 982", got)
 	}
-	if got := m.destinationKeyHeadroom(); got != 37 {
+	if got := m.defaultDestination().keyHeadroom(); got != 37 {
 		t.Errorf("destinationKeyHeadroom() with no target = %d, want 37", got)
 	}
 }
@@ -730,10 +748,11 @@ func TestBackupRecordsItsTargetAndOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 	m, err := NewManager(&ManagerConfig{
-		DataStorage: dataStorage,
-		Target:      localTarget(t.TempDir(), "audit", "", false),
-		InstanceID:  "cluster-alpha",
-		Logger:      zerolog.Nop(),
+		DataStorage:   dataStorage,
+		Targets:       oneTarget(t.TempDir(), "audit", "", false),
+		DefaultTarget: "audit",
+		InstanceID:    "cluster-alpha",
+		Logger:        zerolog.Nop(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1219,7 +1238,7 @@ func TestTheInstanceIdentitySurvivesABackupAndRestoreFromInsideTheStorageRoot(t 
 	}
 
 	// The sidecar is not in the backup at all.
-	copied, err := m.destination().List(ctx, result.Manifest.BackupID+"/")
+	copied, err := m.defaultDestination().backend.List(ctx, result.Manifest.BackupID+"/")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1327,17 +1346,38 @@ func TestDeleteBackupEchoesAForeignOwner(t *testing.T) {
 
 // writeRefusingDestination accepts every read and fails every write, the way a
 // destination whose credentials lost write access does.
+// writeRefusingDestination refuses every write, except the keys allow lets
+// through.
+//
+// The allow list exists because #1085 stage B2b-2 made the RUN INDEX the first
+// write a backup makes, so a blanket refusal makes every one of these tests
+// report the index failure and stop testing the message it was written for.
+// Letting index.json through keeps each test on its own call site: the test
+// that claims to check the data-copy message checks the data-copy message, and
+// the index write has a test of its own below.
 type writeRefusingDestination struct {
 	storage.Backend
+	allow func(path string) bool
 }
 
 const writeRefusedErr = "AccessDenied: the credential may not write to this bucket"
 
-func (writeRefusingDestination) Write(ctx context.Context, path string, data []byte) error {
+// refuseAllWritesExceptTheIndex is the usual allow list.
+func refuseAllWritesExceptTheIndex(path string) bool {
+	return strings.HasSuffix(path, "/index.json")
+}
+
+func (w writeRefusingDestination) Write(ctx context.Context, path string, data []byte) error {
+	if w.allow != nil && w.allow(path) {
+		return w.Backend.Write(ctx, path, data)
+	}
 	return errors.New(writeRefusedErr)
 }
 
-func (writeRefusingDestination) WriteReader(ctx context.Context, path string, r io.Reader, size int64) error {
+func (w writeRefusingDestination) WriteReader(ctx context.Context, path string, r io.Reader, size int64) error {
+	if w.allow != nil && w.allow(path) {
+		return w.Backend.WriteReader(ctx, path, r, size)
+	}
 	return errors.New(writeRefusedErr)
 }
 
@@ -1347,8 +1387,10 @@ func (writeRefusingDestination) WriteReader(ctx context.Context, path string, r 
 // operator with more than one configured store to guess which one refused.
 //
 // Driven through CreateBackup so it exercises the real call chain rather than
-// the message in isolation; the data copy is the first write a run makes, so
-// that is the error the run reports.
+// the message in isolation. The RUN INDEX is the first write a run makes since
+// #1085 stage B2b-2, so the fake lets that one key through and the data copy
+// is then the first write that fails — which is the error this test is about.
+// The index write has its own test below.
 func TestEveryDestinationWriteFailureNamesTheDestination(t *testing.T) {
 	ctx := context.Background()
 	dataStorage, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
@@ -1360,14 +1402,15 @@ func TestEveryDestinationWriteFailureNamesTheDestination(t *testing.T) {
 		t.Fatal(err)
 	}
 	m, err := NewManager(&ManagerConfig{
-		DataStorage: dataStorage,
-		Target:      localTarget(t.TempDir(), "audit", "", true),
-		Logger:      zerolog.Nop(),
+		DataStorage:   dataStorage,
+		Targets:       oneTarget(t.TempDir(), "audit", "", true),
+		DefaultTarget: "audit",
+		Logger:        zerolog.Nop(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	m.backupStorage = writeRefusingDestination{Backend: m.backupStorage}
+	m.backupStorage = writeRefusingDestination{Backend: m.backupStorage, allow: refuseAllWritesExceptTheIndex}
 
 	_, err = m.CreateBackup(ctx, BackupOptions{})
 	if err == nil {
@@ -1394,14 +1437,15 @@ func TestTheSidecarAndManifestWriteFailuresNameTheDestination(t *testing.T) {
 	}
 	t.Cleanup(func() { dataStorage.Close() })
 	m, err := NewManager(&ManagerConfig{
-		DataStorage: dataStorage,
-		Target:      localTarget(t.TempDir(), "audit", "", true),
-		Logger:      zerolog.Nop(),
+		DataStorage:   dataStorage,
+		Targets:       oneTarget(t.TempDir(), "audit", "", true),
+		DefaultTarget: "audit",
+		Logger:        zerolog.Nop(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	m.backupStorage = writeRefusingDestination{Backend: m.backupStorage}
+	m.backupStorage = writeRefusingDestination{Backend: m.backupStorage, allow: refuseAllWritesExceptTheIndex}
 
 	_, err = m.CreateBackup(ctx, BackupOptions{})
 	if err == nil {
@@ -1460,9 +1504,10 @@ func TestABackupProbesTheDestinationBeforeCopying(t *testing.T) {
 		}
 	}
 	m, err := NewManager(&ManagerConfig{
-		DataStorage: dataStorage,
-		Target:      localTarget(t.TempDir(), "audit", "", true),
-		Logger:      zerolog.Nop(),
+		DataStorage:   dataStorage,
+		Targets:       oneTarget(t.TempDir(), "audit", "", true),
+		DefaultTarget: "audit",
+		Logger:        zerolog.Nop(),
 	})
 	if err != nil {
 		t.Fatal(err)
