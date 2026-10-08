@@ -469,6 +469,71 @@ func TestTheListingSurfacesAnUnreadableTargetAndKeepsOtherTargets(t *testing.T) 
 	}
 }
 
+// When another backup makes a target's listing incomplete, an index-only run
+// must not report that target as missing if its manifest could not be checked.
+func TestIndexOnlyFallbackReportsUnreachableTargetAsUnknown(t *testing.T) {
+	ctx := context.Background()
+	rig := newRoutedRig(t, map[string]string{"audit": "audit"})
+	rig.write(t, "audit/events/2026/10/07/00/a.parquet", "PAR1")
+	rig.write(t, "prod/cpu/2026/10/07/00/b.parquet", "PAR1")
+
+	partial, err := rig.m.CreateBackup(ctx, BackupOptions{})
+	if err != nil {
+		t.Fatalf("CreateBackup for partial run: %v", err)
+	}
+	partialID := partial.Manifest.BackupID
+	if _, err := os.Stat(filepath.Join(rig.mainDir, partialID, "manifest.json")); err != nil {
+		t.Fatalf("partial run main manifest should remain readable: %v", err)
+	}
+	if err := os.Remove(filepath.Join(rig.auditDir, partialID, "manifest.json")); err != nil {
+		t.Fatal(err)
+	}
+	partialIndex := readIndexFile(t, rig.mainDir, partialID)
+	partialIndex.CreatedAt = time.Now().UTC().Add(-72 * time.Hour)
+	indexBody, err := json.Marshal(partialIndex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rig.mainDir, partialID, "index.json"), indexBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// This single-target backup is an unrelated candidate whose unreadable
+	// manifest makes the main listing fail. The partial run's main manifest
+	// remains readable, but the listing must conservatively classify it as
+	// unknown because that target could not be enumerated completely.
+	unreadable, err := rig.m.CreateBackup(ctx, BackupOptions{Databases: []string{"prod"}})
+	if err != nil {
+		t.Fatalf("CreateBackup for unreadable candidate: %v", err)
+	}
+	rig.m.backupStorage = &manifestFaultDestination{
+		LocalBackend: rig.m.backupStorage.(*storage.LocalBackend),
+		path:         unreadable.Manifest.BackupID + "/manifest.json",
+		err:          errors.New("simulated manifest read failure"),
+	}
+
+	listing, err := rig.m.ListBackupsDetailed(ctx, false)
+	if err != nil {
+		t.Fatalf("ListBackupsDetailed: %v", err)
+	}
+	if strings.Join(listing.UnreachableTargets, ",") != "main" {
+		t.Fatalf("unreachable_targets = %v, want [main]", listing.UnreachableTargets)
+	}
+	if len(listing.IncompleteRuns) != 1 || listing.IncompleteRuns[0].BackupID != partialID {
+		t.Fatalf("incomplete_runs = %+v, want only partial run %s", listing.IncompleteRuns, partialID)
+	}
+	run := listing.IncompleteRuns[0]
+	if strings.Join(run.Missing, ",") != "audit" {
+		t.Errorf("missing_targets = %v, want [audit]", run.Missing)
+	}
+	if strings.Join(run.Unknown, ",") != "main" {
+		t.Errorf("unknown_targets = %v, want [main]", run.Unknown)
+	}
+	if run.State != IncompleteRunAborted {
+		t.Errorf("state = %q, want %q because audit is known missing", run.State, IncompleteRunAborted)
+	}
+}
+
 // TestDeleteSweepsEveryTargetAndReportsTheOnesItCouldNot: a delete reaches
 // every destination holding the ID under one lock, and an unreachable one is
 // reported AFTER everything reachable was deleted, so a re-run finishes the
