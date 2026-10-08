@@ -351,7 +351,24 @@ func testBarrierStartupBudget(t *testing.T, rows int, source []string) {
 	s.unblock()
 	// Finish already-owned records, then retry recovery with the active file's
 	// checkpoints, just as maintenance does. No record may be replayed twice.
-	require.NoError(t, b.FlushAllAndWait(context.Background()))
+	//
+	// Drain in a loop rather than one call. The 200ms flushTimeout above is
+	// what makes the FIRST barrier expire while storage is unresponsive, and
+	// FlushAllAndWait caps the caller's context to it - so a single call gave
+	// real Parquet encoding and eight local writes 200ms to finish, which is
+	// ample on a developer machine and marginal on a shared CI runner under
+	// -race, where it failed. Raising flushTimeout here instead would be a
+	// data race: the flush goroutines read it, which is why it is set once
+	// before any task is submitted. A timed-out barrier discards nothing, so
+	// repeated calls make progress until the drain completes.
+	drained := false
+	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); {
+		if err := b.FlushAllAndWait(context.Background()); err == nil {
+			drained = true
+			break
+		}
+	}
+	require.True(t, drained, "healthy storage never drained within 30s of repeated barriers")
 	checkpoints, err := w.CurrentCheckpointHashes()
 	require.NoError(t, err)
 	stats, err := recovery.RecoverWithOptions(context.Background(), nil, &wal.RecoveryOptions{
