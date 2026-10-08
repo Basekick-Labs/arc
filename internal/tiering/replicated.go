@@ -238,12 +238,23 @@ func (m *Manager) ColdRows(ctx context.Context) (map[string]int64, error) {
 	return m.metadata.ColdFilePathsAndSizes(ctx, TierCold)
 }
 
-// RecordRestoredColdFile records a file a restore has just written to this
-// node's cold tier (#1086 stage C), so the query path can route to it: tier
-// routing reads these rows, so the row is what makes the restored file
-// readable at all.
+// RecordRestoredColdFiles records a batch of files a restore has just written
+// to this node's cold tier (#1086 stage C, batched in #1141), so the query
+// path can route to them: tier routing reads these rows, so the row is what
+// makes a restored file readable at all.
 //
-// Reports false when the path has a quarantined row, which is left alone.
+// Reports two disjoint subsets of the paths it was given, because the caller
+// counts them into different fields:
+//
+//   - quarantined — the row exists, it is quarantined, and it was left exactly
+//     as it is. Its key is permanently unusable and tiering has established
+//     that it can never act on it (#758), so neither the sync nor a restore
+//     may act on it either.
+//   - failed — the path could not be parsed, so no row was even attempted.
+//
+// A non-nil error means NOTHING in the batch was written (the store runs one
+// transaction per call and rolls it back), so the caller counts the whole
+// submitted chunk as unrecorded rather than having to ask how far it got.
 //
 // Not RecordRestoredFile. That one enqueues a tierEventPulled whose applyPulled
 // stats the HOT backend and returns false for a file that is not there, and
@@ -260,48 +271,37 @@ func (m *Manager) ColdRows(ctx context.Context) (map[string]int64, error) {
 // its rows inside that window and each costs one hot-side existence check per
 // cycle until they age out. See RecordColdFile.
 //
-// Two costs this deliberately accepts, because a restore is a rare,
-// operator-initiated batch and correctness here is what makes the data
-// readable at all:
+// One cost this still deliberately accepts: the cleanup it relies on is ROLE
+// GATED. ReconcileOrphanedFiles removes the stale hot copy, but it runs past
+// m.roleGated(), and RestoreBackup is not writer gated — so a restore
+// performed on a FOLLOWER writes rows whose cleanup never runs on that node,
+// and the rows live in that node's own SQLite, so no other node does it
+// either. Restore on the primary writer when the backup holds cold files.
 //
-//   - ONE WRITE PER FILE, synchronous, each its own implicit transaction and
-//     so its own fsync, on the single shared SQLite connection. A restore of
-//     many cold files therefore blocks auth, audit and tier registration for
-//     its duration. The hot path avoids this by batching through the tier
-//     event queue, which this cannot use for the reason above. Batching the
-//     cold rows is the obvious improvement and is tracked separately.
-//   - the cleanup it relies on is ROLE GATED. ReconcileOrphanedFiles removes
-//     the stale hot copy, but it runs past m.roleGated(), and RestoreBackup is
-//     not writer gated — so a restore performed on a FOLLOWER writes rows
-//     whose cleanup never runs on that node, and the rows live in that node's
-//     own SQLite, so no other node does it either. Restore on the primary
-//     writer when the backup holds cold files.
+// (The other cost #1086 accepted — one synchronous write, and so one fsync,
+// per file on the single shared connection — is what #1141 removed by making
+// this a batch.)
 //
-// The path is parsed here because parseFilePath is tiering's own rule,
+// The paths are parsed here because parseFilePath is tiering's own rule,
 // including the extra edge-sync spoke level, and the backup package cannot
 // reach it.
-func (m *Manager) RecordRestoredColdFile(ctx context.Context, path string, sizeBytes int64) (bool, error) {
+func (m *Manager) RecordRestoredColdFiles(ctx context.Context, sizes map[string]int64) ([]string, []string, error) {
 	if m == nil || m.metadata == nil {
-		return false, nil
-	}
-	info, err := m.parseFilePath(path)
-	if err != nil {
-		return false, err
+		return nil, pathsOf(sizes), nil
 	}
 	now := time.Now()
-	return m.metadata.RecordColdFile(ctx, &FileMetadata{
-		Path:          path,
-		Database:      info.Database,
-		Measurement:   info.Measurement,
-		PartitionTime: info.PartitionTime,
-		SizeBytes:     sizeBytes,
-		CreatedAt:     now,
-	}, now)
+	files, failed := m.restoredFileRows(sizes, now)
+	quarantined, err := m.metadata.RecordColdFilesBatch(ctx, files, now)
+	if err != nil {
+		return nil, failed, err
+	}
+	return quarantined, failed, nil
 }
 
-// RecordRestoredHotFile records a file a restore wrote to HOT storage when
-// the backup had read it from a cold tier and this node has none (#1086
-// stage C). Reports false when a quarantined row left it alone.
+// RecordRestoredHotFiles records a batch of files a restore wrote to HOT
+// storage when the backup had read them from a cold tier and this node has
+// none (#1086 stage C, batched in #1141). Same two-subset report and same
+// all-or-nothing error as RecordRestoredColdFiles.
 //
 // Needed because the ordinary report, RecordRestoredFile, routes through an
 // upsert guarded tier = 'hot' and so cannot move a row that already says
@@ -310,22 +310,74 @@ func (m *Manager) RecordRestoredColdFile(ctx context.Context, path string, sizeB
 // backend) and returns nothing at all for the measurement.
 //
 // Nil-receiver safe, like the adapters around it.
-func (m *Manager) RecordRestoredHotFile(ctx context.Context, path string, sizeBytes int64) (bool, error) {
+func (m *Manager) RecordRestoredHotFiles(ctx context.Context, sizes map[string]int64) ([]string, []string, error) {
 	if m == nil || m.metadata == nil {
-		return false, nil
+		return nil, pathsOf(sizes), nil
 	}
-	info, err := m.parseFilePath(path)
+	files, failed := m.restoredFileRows(sizes, time.Now())
+	quarantined, err := m.metadata.RecordRestoredHotFilesBatch(ctx, files)
 	if err != nil {
-		return false, err
+		return nil, failed, err
 	}
-	return m.metadata.RecordRestoredHotFile(ctx, &FileMetadata{
-		Path:          path,
-		Database:      info.Database,
-		Measurement:   info.Measurement,
-		PartitionTime: info.PartitionTime,
-		SizeBytes:     sizeBytes,
-		CreatedAt:     time.Now(),
-	})
+	return quarantined, failed, nil
+}
+
+// restoredFileRows turns a restore's path-to-size map into the rows the store
+// writes, reporting the paths it could not parse rather than failing the
+// batch for them: one unparseable key among a thousand good ones must not
+// cost the other nine hundred and ninety nine their rows.
+//
+// The parse error is logged here, once per batch, with a path. The caller
+// counts these but cannot say why they failed, and the alternative — one line
+// per file — would be a line per file on a restore whose whole prefix is
+// unparseable. Logging an error at the lower layer is the exception the
+// no-double-logging rule allows.
+func (m *Manager) restoredFileRows(sizes map[string]int64, now time.Time) ([]FileMetadata, []string) {
+	files := make([]FileMetadata, 0, len(sizes))
+	var failed []string
+	var firstErr error
+	for path, size := range sizes {
+		info, err := m.parseFilePath(path)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			failed = append(failed, path)
+			continue
+		}
+		files = append(files, FileMetadata{
+			Path:          path,
+			Database:      info.Database,
+			Measurement:   info.Measurement,
+			PartitionTime: info.PartitionTime,
+			SizeBytes:     size,
+			CreatedAt:     now,
+		})
+	}
+	if firstErr != nil {
+		m.logger.Warn().
+			Str("path", failed[0]).
+			Int("paths", len(failed)).
+			Err(firstErr).
+			Msg("Could not parse the path of a restored file, so no tier row was written for it; the bytes are in storage and the file is not queryable until a row exists")
+	}
+	return files, failed
+}
+
+// pathsOf is the keys of a restore batch, for the nil-manager case: nothing
+// was written, and a manager with no metadata store has established nothing
+// about these keys, so they are reported FAILED rather than quarantined. A
+// quarantine is a fact tiering recorded (#758), not the absence of a store to
+// ask.
+func pathsOf(sizes map[string]int64) []string {
+	if len(sizes) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(sizes))
+	for path := range sizes {
+		out = append(out, path)
+	}
+	return out
 }
 
 // RecordUnlinkedFile reports that this node removed its own local copy of a

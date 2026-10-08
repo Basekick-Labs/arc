@@ -362,7 +362,7 @@ const sqliteTimestampLayout = "2006-01-02 15:04:05"
 // the whole cold tier for two cycles. The sync therefore passes the cold
 // object's own timestamp. A RESTORE passes now, deliberately: it has just
 // written the object, and a row outside the reconciliation window would leave
-// a stale hot copy at the same key forever. See RecordRestoredColdFile.
+// a stale hot copy at the same key forever. See RecordRestoredColdFiles.
 //
 // A same-tier conflict keeps the row's migrated_at (the CASE below), so a
 // re-run of either caller is idempotent in that column.
@@ -419,6 +419,192 @@ func (s *MetadataStore) RecordColdFile(ctx context.Context, file *FileMetadata, 
 	}
 	s.invalidateTierCache(file.Database, file.Measurement)
 	return true, nil
+}
+
+// RecordColdFilesBatch records a batch of files a RESTORE has just written to
+// the cold tier (#1141), each with the semantics RecordColdFile gives one:
+// migrated_at stamped from the caller's value, kept unchanged on a same-tier
+// conflict, and a QUARANTINED row left exactly as it is.
+//
+// Reports the paths whose row was not written, which with this statement means
+// quarantined and nothing else. The caller counts them separately from the
+// ones that failed, because the two are different facts about a key: one says
+// tiering has established it can never act on this path (#758), the other says
+// Arc does not know yet.
+//
+// Replaces the per-file RecordRestoredColdFile the restore used to call in a
+// loop. That was one implicit transaction — one fsync — per file on a handle
+// limited to a single connection and shared with auth, audit, MQTT and the
+// ingest path's own tier registration, so a restore of a few hundred thousand
+// cold files serialised every other SQLite user in the process behind a few
+// hundred thousand fsyncs. The cold-tier metadata sync keeps using the
+// single-file RecordColdFile: it writes rows it discovers one at a time as it
+// walks, and is not a burst.
+func (s *MetadataStore) RecordColdFilesBatch(ctx context.Context, files []FileMetadata, migratedAt time.Time) ([]string, error) {
+	if migratedAt.IsZero() {
+		migratedAt = time.Now()
+	}
+	// Formatted once, and as TEXT, exactly as the single-file version does:
+	// migrated_at is compared as a string against every other row, and
+	// go-sqlite3 binds a time.Time with its offset appended, which sorts
+	// against the layout every existing row was written in.
+	stamp := migratedAt.UTC().Format(sqliteTimestampLayout)
+
+	return s.recordRestoredFilesBatch(ctx, files, `
+		INSERT INTO tier_files (path, database, measurement, partition_time, tier, size_bytes, created_at, migrated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(path) DO UPDATE SET
+			tier = excluded.tier,
+			size_bytes = excluded.size_bytes,
+			migrated_at = CASE WHEN tier_files.tier != excluded.tier THEN excluded.migrated_at ELSE tier_files.migrated_at END
+		WHERE tier_files.quarantined_at IS NULL
+	`, func(file FileMetadata) []any {
+		createdAt := file.CreatedAt
+		if createdAt.IsZero() {
+			createdAt = migratedAt
+		}
+		return []any{
+			file.Path,
+			file.Database,
+			file.Measurement,
+			file.PartitionTime.UTC(),
+			string(TierCold),
+			file.SizeBytes,
+			createdAt.UTC(),
+			stamp,
+		}
+	})
+}
+
+// RecordRestoredHotFilesBatch records a batch of files a restore wrote to HOT
+// storage, forcing each row to hot whatever it said before (#1086 stage C,
+// batched in #1141). Reports the paths whose row was not written, which here
+// means quarantined.
+//
+// This exists because recordHotFileIfNotCold cannot do it. That one binds its
+// ON CONFLICT update to tier = 'hot' on purpose, so an ordinary registration
+// cannot clobber a row that has since migrated. A restore is the one caller
+// that IS authoritative: when a backup carried a file from a cold tier and
+// this node has no cold tier to put it back in, the bytes land in hot storage
+// and the row has to say so — otherwise the query path omits the hot glob
+// (no row claims hot) AND the cold glob (no cold backend), and the restored
+// data is invisible rather than merely mis-tiered.
+//
+// migrated_at is CLEARED, because the file is not a migrated copy any more.
+// Leaving a stamp would put the row in the orphan-reconciliation window as a
+// cold-tier candidate when there is no cold object to verify against.
+func (s *MetadataStore) RecordRestoredHotFilesBatch(ctx context.Context, files []FileMetadata) ([]string, error) {
+	now := time.Now().UTC()
+
+	return s.recordRestoredFilesBatch(ctx, files, `
+		INSERT INTO tier_files (path, database, measurement, partition_time, tier, size_bytes, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(path) DO UPDATE SET
+			tier = excluded.tier,
+			size_bytes = excluded.size_bytes,
+			migrated_at = NULL
+		WHERE tier_files.quarantined_at IS NULL
+	`, func(file FileMetadata) []any {
+		createdAt := file.CreatedAt
+		if createdAt.IsZero() {
+			createdAt = now
+		}
+		return []any{
+			file.Path,
+			file.Database,
+			file.Measurement,
+			file.PartitionTime.UTC(),
+			string(TierHot),
+			file.SizeBytes,
+			createdAt.UTC(),
+		}
+	})
+}
+
+// recordRestoredFilesBatch writes one upsert per file through a single
+// prepared statement inside ONE explicit transaction, and reports the paths
+// whose row was not written — RowsAffected 0, which under both callers'
+// statements means a quarantined row the upsert deliberately left alone.
+//
+// Shared by the two restore recorders because the only things that differ
+// between them are the statement and its bindings (#1141).
+//
+// ONE TRANSACTION PER CALL, AND THE CALLER CHUNKS. That is the contract rather
+// than an implementation detail, because it is what keeps the outcome exact: a
+// returned error means nothing in this call was written, so the caller can
+// count the whole chunk as unrecorded without having to ask how far it got.
+// Chunking in here instead would commit some chunks and roll back one, and no
+// return value short of a per-path map could then describe what happened.
+// coldRowBatch in internal/backup caps a call at coldRowBatchSize; a caller
+// that passes far more than that holds the SQLite write lock for the whole
+// lot, which on this handle is the thing #1141 exists to shorten.
+//
+// RowsAffected() == 0 MEANS QUARANTINED, and only because neither caller's
+// statement carries a value-change guard: SQLite counts a DO UPDATE as one
+// changed row even when every value is identical, so the single way to affect
+// no rows is the WHERE tier_files.quarantined_at IS NULL filter. The
+// neighbouring recordHotFileIfNotCold DOES carry one
+// (AND tier_files.size_bytes != excluded.size_bytes); adding that here for
+// symmetry would silently start reporting unchanged rows as quarantined.
+//
+// EVERY STATEMENT HERE GOES THROUGH tx, NEVER s.db. This is the first explicit
+// transaction in the package, and the handle allows exactly one connection
+// (SetMaxOpenConns(1) in internal/auth, shared with auth, audit, MQTT and tier
+// registration) — so an s.db call made while this transaction is open would
+// wait forever for the connection the transaction itself is holding. That is a
+// self-deadlock, not a slow query. invalidateTierCache is safe on both counts:
+// it touches only the in-memory map under its own mutex, and it is called
+// after the commit regardless.
+func (s *MetadataStore) recordRestoredFilesBatch(ctx context.Context, files []FileMetadata, query string, bind func(FileMetadata) []any) ([]string, error) {
+	if len(files) == 0 {
+		return nil, nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin a tier row batch of %d files: %w", len(files), err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	stmt, err := tx.PrepareContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to prepare a tier row batch of %d files: %w", len(files), err)
+	}
+	defer stmt.Close()
+
+	// The cache is keyed by database/measurement and a restore writes many
+	// files under each pair, so the invalidation is collected here and done
+	// once per pair after the commit — not once per row.
+	type tierScope struct{ database, measurement string }
+	touched := make(map[tierScope]struct{}, len(files))
+
+	var notWritten []string
+	for _, file := range files {
+		res, err := stmt.ExecContext(ctx, bind(file)...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to record a tier row for %s: %w", file.Path, err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			notWritten = append(notWritten, file.Path)
+			continue
+		}
+		touched[tierScope{database: file.Database, measurement: file.Measurement}] = struct{}{}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("failed to commit a tier row batch of %d files: %w", len(files), err)
+	}
+	committed = true
+
+	for scope := range touched {
+		s.invalidateTierCache(scope.database, scope.measurement)
+	}
+	return notWritten, nil
 }
 
 // GetFile retrieves file metadata by path
@@ -496,59 +682,6 @@ func (s *MetadataStore) ColdFilePathsAndSizes(ctx context.Context, tier Tier) (m
 		return nil, fmt.Errorf("error iterating tier file paths: %w", err)
 	}
 	return out, nil
-}
-
-// RecordRestoredHotFile records a file a restore wrote to HOT storage,
-// forcing the row to hot whatever it said before (#1086 stage C). Reports
-// whether a row was written; a quarantined row is left alone and reports
-// false.
-//
-// This exists because recordHotFileIfNotCold cannot do it. That one binds its
-// ON CONFLICT update to tier = 'hot' on purpose, so an ordinary registration
-// cannot clobber a row that has since migrated. A restore is the one caller
-// that IS authoritative: when a backup carried a file from a cold tier and
-// this node has no cold tier to put it back in, the bytes land in hot storage
-// and the row has to say so — otherwise the query path omits the hot glob
-// (no row claims hot) AND the cold glob (no cold backend), and the restored
-// data is invisible rather than merely mis-tiered.
-//
-// migrated_at is CLEARED, because the file is not a migrated copy any more.
-// Leaving a stamp would put the row in the orphan-reconciliation window as a
-// cold-tier candidate when there is no cold object to verify against.
-func (s *MetadataStore) RecordRestoredHotFile(ctx context.Context, file *FileMetadata) (bool, error) {
-	createdAt := file.CreatedAt
-	if createdAt.IsZero() {
-		createdAt = time.Now().UTC()
-	}
-
-	query := `
-		INSERT INTO tier_files (path, database, measurement, partition_time, tier, size_bytes, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(path) DO UPDATE SET
-			tier = excluded.tier,
-			size_bytes = excluded.size_bytes,
-			migrated_at = NULL
-		WHERE tier_files.quarantined_at IS NULL
-	`
-
-	res, err := s.db.ExecContext(ctx, query,
-		file.Path,
-		file.Database,
-		file.Measurement,
-		file.PartitionTime.UTC(),
-		string(TierHot),
-		file.SizeBytes,
-		createdAt.UTC(),
-	)
-	if err != nil {
-		return false, fmt.Errorf("failed to record restored hot file: %w", err)
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return false, nil
-	}
-	s.invalidateTierCache(file.Database, file.Measurement)
-	return true, nil
 }
 
 // CountFilesInTierByDatabase counts the rows a tier holds, grouped by

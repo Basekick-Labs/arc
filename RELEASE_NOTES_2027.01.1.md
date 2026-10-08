@@ -1617,3 +1617,87 @@ manifest snapshot, the same immutable reference set for every leg. Only
 `recheckClusterManifest`'s `addLate` writes into it, after every leg has
 copied, on one goroutine. If the leg copies are ever parallelised, that map has
 to become per leg or the write has to be guarded.
+
+**A cold restore writes its tier rows in batches, not one per file** (#1141).
+Stage C of the backup work gave a restore its own tier-row recorder, because
+neither of the hot paths can report a cold file: the cluster manifest drops
+cold entries, and `RecordRestoredFile` enqueues an event whose handler stats
+the hot backend and whose upsert is guarded to hot rows. That recorder wrote
+one row per file, synchronously — one implicit transaction, and so one fsync,
+each — on a handle limited to a single connection and shared with auth, audit,
+MQTT and the ingest path's own tier registration. A restore of a few hundred
+thousand cold files was therefore a few hundred thousand fsyncs with every
+other SQLite user in the process queued behind them.
+
+The rows are now accumulated and written a thousand at a time in one explicit
+transaction each: `RecordColdFilesBatch` and `RecordRestoredHotFilesBatch` in
+the tiering metadata store, `RecordRestoredColdFiles` and
+`RecordRestoredHotFiles` on the manager, and a `coldRowBatch` in the restore
+beside the manifest registration that already batches the same way.
+
+No field changes and no final value changes: `cold_files_restored_to_cold`,
+`cold_files_restored_to_hot`, `cold_restore_quarantine_skipped` and
+`cold_rows_not_recorded` keep their per-file meanings, which is why the batch
+reports back the paths it did not write rather than a count — a quarantined row
+and a path tiering cannot parse are different facts about a key, and they land
+in different fields.
+
+**One thing an operator will notice**, which is the honest cost of batching:
+three of those counters are no longer live during a run. They move at a flush,
+so a `/status` poll through a 900-file cold restore shows `processed_files`
+climbing while `cold_files_restored_to_cold` sits at 0 until the run ends, then
+jumps to 900. A restore larger than a thousand files steps in thousands. The
+final values are what they always were. `cold_files_restored_to_hot` is
+unaffected — it counts the routing decision, taken per file before the bytes
+are written, not the row.
+
+Four details worth keeping straight, since this is the first explicit
+transaction in `internal/tiering`:
+
+- **One transaction per call, and the caller chunks.** That contract is what
+  makes the accounting exact: an error means nothing in the call was written,
+  so the caller counts the whole chunk as unrecorded without having to ask how
+  far it got. Chunking inside the store would commit some chunks and roll back
+  one, and no return value short of a per-path map could then describe it.
+- **Every statement goes through the transaction, never the pool.** The handle
+  allows exactly one connection, so a `db` call made while the transaction is
+  open would wait forever for the connection the transaction itself holds.
+  That is a self-deadlock, not a slow query. The rollback on the failure path
+  is what releases that connection, and the test for it is the one that proves
+  a batch after a failed batch can still get a connection at all.
+- **Every flush runs on a context detached from the restore's**, not only the
+  final one. A transaction cannot begin or continue on a dead context, and a
+  restore runs under a fixed `operation_timeout` deadline — so that deadline
+  can land inside a mid-run flush of a full chunk, which is the
+  longest-running thing a restore does to SQLite. A flush takes its rows out
+  of the batch before it writes them, so a chunk lost that way cannot be
+  retried: a thousand files would be left with bytes in the cold store and no
+  tier row. Each flush is bounded by its own timeout, so a cancelled restore
+  still exits after at most one. Unlike the manifest registration beside it,
+  the flush also runs on every exit path: the bytes are already in the cold
+  store, and on a standalone node, or a cluster without shared storage or
+  replication, nothing else ever writes the row, because the cold-metadata
+  sync does not run there.
+- **`migrated_at` is still written as text in `2006-01-02 15:04:05`.** The
+  column is compared as a string against every other row, and go-sqlite3 binds
+  a `time.Time` with its offset appended, so a bound time here would sort
+  against every row Arc has ever written. The cold-tier metadata sync still
+  uses the single-file `RecordColdFile`, which writes the same shape; a test
+  asserts the two are byte-identical for the same moment.
+
+The cold-tier metadata sync keeps its per-file writes: it records rows it
+discovers one at a time as it walks a listing, and is not a burst.
+
+One pre-existing hazard this makes longer-lived, and worth knowing before
+restoring onto a node whose cold tier is **configured but disabled**: a
+cold-carried file restored into hot storage keeps a row saying cold, with a
+recent `migrated_at`, until the batch flushes. That is what
+`ReconcileOrphanedFiles` looks for, and that sweep is not gated on
+`tiered_storage.cold.enabled` (only migration is), nor is the
+`GetBackendForTier` lookup it verifies the cold copy through. So it can delete
+the hot copy the restore just wrote, and the forced-hot row then lands for a
+file that is gone. The window used to be microseconds and is now up to the rest
+of the restore. The defect is the ungated sweep rather than the batching — with
+cold disabled it deletes hot copies whose cold objects the query path will not
+read, restore or no restore — so it is filed as #1143; until that is fixed, run
+such a restore with tiering stopped.

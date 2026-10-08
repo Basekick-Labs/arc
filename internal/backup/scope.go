@@ -263,14 +263,27 @@ type ColdSource interface {
 	// stdlib types are what keep this interface satisfiable without tiering
 	// importing this package.
 	ColdRows(ctx context.Context) (map[string]int64, error)
-	// RecordRestoredColdFile records a file a restore wrote to the cold tier,
-	// reporting false when a quarantined row left it alone.
-	RecordRestoredColdFile(ctx context.Context, path string, sizeBytes int64) (bool, error)
-	// RecordRestoredHotFile forces a row to HOT for a file the backup read
+	// RecordRestoredColdFiles records a batch of files a restore wrote to the
+	// cold tier, keyed path to size. It reports two disjoint subsets of those
+	// paths, which the caller counts into different fields: `quarantined`
+	// paths whose row exists, is quarantined, and was deliberately left
+	// alone, and `failed` paths for which no row could be attempted at all.
+	//
+	// A non-nil error means NOTHING in the batch was written — the
+	// implementation runs one transaction per call — so the caller counts the
+	// whole submitted chunk as unrecorded rather than guessing how far it got.
+	//
+	// Batched rather than one call per file (#1141): each row is a write on
+	// the single shared SQLite connection, and a restore of many cold files
+	// used to serialise auth, audit and ingest tier registration behind one
+	// fsync per file. The caller chunks at coldRowBatchSize.
+	RecordRestoredColdFiles(ctx context.Context, sizes map[string]int64) (quarantined, failed []string, err error)
+	// RecordRestoredHotFiles forces rows to HOT for files the backup read
 	// from cold and that this node had to put in hot storage instead. The
 	// ordinary hot report cannot do it: its upsert is guarded to rows that
-	// already say hot, and this row says cold.
-	RecordRestoredHotFile(ctx context.Context, path string, sizeBytes int64) (bool, error)
+	// already say hot, and these rows say cold. Same two-subset report and
+	// same all-or-nothing error as RecordRestoredColdFiles.
+	RecordRestoredHotFiles(ctx context.Context, sizes map[string]int64) (quarantined, failed []string, err error)
 }
 
 // SetColdSource wires this node's cold tier for the cold walk and the cold

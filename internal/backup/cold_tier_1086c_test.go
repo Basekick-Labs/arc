@@ -22,12 +22,18 @@ type fakeColdSource struct {
 	rows     map[string]int64
 	rowsErr  error
 	recorded map[string]int64
-	// quarantined paths report wrote=false, as a quarantined row does.
+	// quarantined paths come back in the batch's quarantined set, as a
+	// quarantined row does; unparseable ones come back in its failed set,
+	// as a path tiering cannot parse does.
 	quarantined map[string]bool
+	unparseable map[string]bool
 	recordErr   error
 	records     atomic.Int32
 	recordedHot map[string]int64
 	hotRecords  atomic.Int32
+	// callSizes is how many paths each batch call was given, in order, so a
+	// test can assert the flush points and not just the call count.
+	callSizes []int
 }
 
 func (f *fakeColdSource) ColdBackend() storage.Backend { return f.backend }
@@ -39,36 +45,70 @@ func (f *fakeColdSource) ColdRows(_ context.Context) (map[string]int64, error) {
 	return f.rows, nil
 }
 
-// recordedHot is what the forced hot recorder wrote: the row this node had to
-// move because the backup's file was cold and this node has no cold tier.
-func (f *fakeColdSource) RecordRestoredHotFile(_ context.Context, path string, size int64) (bool, error) {
+// recordedHot is what the forced hot recorder wrote: the rows this node had to
+// move because the backup's files were cold and this node has no cold tier.
+//
+// records and hotRecords count batch CALLS, not files. That is the assertion
+// #1141 exists for: a restore of N cold files makes one call per
+// coldRowBatchSize files, not one per file.
+func (f *fakeColdSource) RecordRestoredHotFiles(ctx context.Context, sizes map[string]int64) ([]string, []string, error) {
 	f.hotRecords.Add(1)
+	f.callSizes = append(f.callSizes, len(sizes))
+	// Context-aware on purpose: the final flush runs on a context DETACHED
+	// from the restore (#1141), and a recorder that ignored the context could
+	// not tell the two apart. A real one cannot begin a transaction on a dead
+	// context.
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	if f.recordErr != nil {
-		return false, f.recordErr
+		return nil, nil, f.recordErr
 	}
-	if f.quarantined[path] {
-		return false, nil
+	var quarantined, failed []string
+	for path, size := range sizes {
+		switch {
+		case f.quarantined[path]:
+			quarantined = append(quarantined, path)
+		case f.unparseable[path]:
+			failed = append(failed, path)
+		default:
+			if f.recordedHot == nil {
+				f.recordedHot = map[string]int64{}
+			}
+			f.recordedHot[path] = size
+		}
 	}
-	if f.recordedHot == nil {
-		f.recordedHot = map[string]int64{}
-	}
-	f.recordedHot[path] = size
-	return true, nil
+	return quarantined, failed, nil
 }
 
-func (f *fakeColdSource) RecordRestoredColdFile(_ context.Context, path string, size int64) (bool, error) {
+func (f *fakeColdSource) RecordRestoredColdFiles(ctx context.Context, sizes map[string]int64) ([]string, []string, error) {
 	f.records.Add(1)
+	f.callSizes = append(f.callSizes, len(sizes))
+	// Context-aware on purpose: the final flush runs on a context DETACHED
+	// from the restore (#1141), and a recorder that ignored the context could
+	// not tell the two apart. A real one cannot begin a transaction on a dead
+	// context.
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	if f.recordErr != nil {
-		return false, f.recordErr
+		return nil, nil, f.recordErr
 	}
-	if f.quarantined[path] {
-		return false, nil
+	var quarantined, failed []string
+	for path, size := range sizes {
+		switch {
+		case f.quarantined[path]:
+			quarantined = append(quarantined, path)
+		case f.unparseable[path]:
+			failed = append(failed, path)
+		default:
+			if f.recorded == nil {
+				f.recorded = map[string]int64{}
+			}
+			f.recorded[path] = size
+		}
 	}
-	if f.recorded == nil {
-		f.recorded = map[string]int64{}
-	}
-	f.recorded[path] = size
-	return true, nil
+	return quarantined, failed, nil
 }
 
 // coldRig is routedRig plus a real cold-tier backend.
