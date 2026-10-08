@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -64,6 +65,16 @@ func (f *fakeManifest) DeleteFilesFromManifest(ctx context.Context, paths []stri
 func (f *fakeManifest) ManifestEntry(path string) (int64, bool) {
 	n, ok := f.entries[path]
 	return n, ok
+}
+
+func (f *fakeManifest) ManifestEntriesByDatabase(database string) []string {
+	var paths []string
+	for path := range f.entries {
+		if strings.HasPrefix(path, database+"/") {
+			paths = append(paths, path)
+		}
+	}
+	return paths
 }
 
 var manifestPartition = time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC)

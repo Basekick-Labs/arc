@@ -21,12 +21,20 @@ type DatabasesHandler struct {
 	storage        storage.Backend
 	requestTimeout time.Duration
 	deleteConfig   *config.DeleteConfig
-	tieringManager *tiering.Manager
+	tieringManager databaseTieringManager
 	authManager    *auth.AuthManager
 	rbacManager    RBACChecker
 	logger         zerolog.Logger
 	icebergDropper IcebergCatalogDropper
 	fieldSchema    *fieldschema.Registry // optional, #914: anchors die with their database
+}
+
+type databaseTieringManager interface {
+	GetMetadata() *tiering.MetadataStore
+	DatabaseHasTierRows(ctx context.Context, database string) (bool, error)
+	BeginDatabaseDelete() (func(), error)
+	PrepareDatabaseDelete(ctx context.Context, database string, hotPaths []string) error
+	CleanupDatabaseDelete(ctx context.Context, database string, hotListed, hotFailed []string) (int, []error)
 }
 
 // SetFieldSchema installs the field schema registry so deleting a database
@@ -218,7 +226,7 @@ func (h *DatabasesHandler) storageContext(c *fiber.Ctx, timeout time.Duration) (
 
 // SetTieringManager sets the tiering manager for multi-tier database/measurement listing.
 // This is called after initialization when tiering is enabled and licensed.
-func (h *DatabasesHandler) SetTieringManager(tm *tiering.Manager) {
+func (h *DatabasesHandler) SetTieringManager(tm databaseTieringManager) {
 	h.tieringManager = tm
 }
 
@@ -539,6 +547,15 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 			"error": "Cannot delete reserved database '" + name + "'",
 		})
 	}
+	if h.tieringManager != nil {
+		release, err := h.tieringManager.BeginDatabaseDelete()
+		if err != nil {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"error": "Tiering is scanning or migrating files. Retry the database deletion.",
+			})
+		}
+		defer release()
+	}
 
 	ctx, cancel := h.storageContext(c, h.requestTimeout)
 	defer func() { cancel() }()
@@ -575,10 +592,20 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	// abandoned after the same fixed timeout as a small one.
 	cancel()
 	ctx, cancel = h.storageContext(c, h.requestTimeout*time.Duration(len(files)+2))
+	if h.tieringManager != nil {
+		if err := h.tieringManager.PrepareDatabaseDelete(ctx, name, files); err != nil {
+			h.logger.Error().Err(err).Str("database", name).Msg("Failed to remove database files from the cluster manifest")
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to prepare database deletion",
+			})
+		}
+	}
 
 	// Delete all files
 	deletedCount := 0
 	var deleteErrors []string
+	var hotDeleted []string
+	var hotFailed []string
 
 	// Try batch delete if available, fall back to individual deletes
 	deleteIndividually := true
@@ -587,6 +614,7 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 			h.logger.Warn().Err(err).Str("database", name).Msg("Batch delete failed, falling back to individual deletes")
 		} else {
 			deletedCount = len(files)
+			hotDeleted = append(hotDeleted, files...)
 			deleteIndividually = false
 		}
 	}
@@ -595,9 +623,18 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 			if err := h.storage.Delete(ctx, file); err != nil {
 				h.logger.Warn().Err(err).Str("file", file).Msg("Failed to delete file")
 				deleteErrors = append(deleteErrors, file+": "+err.Error())
+				hotFailed = append(hotFailed, file)
 			} else {
 				deletedCount++
+				hotDeleted = append(hotDeleted, file)
 			}
+		}
+	}
+	if h.tieringManager != nil {
+		coldDeleted, errs := h.tieringManager.CleanupDatabaseDelete(ctx, name, hotDeleted, hotFailed)
+		deletedCount += coldDeleted
+		for _, err := range errs {
+			deleteErrors = append(deleteErrors, err.Error())
 		}
 	}
 
@@ -607,7 +644,7 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	// common source is an upload that failed after staging bytes, whose final
 	// key never existed, so the loop above never saw it.
 	deletedCount += reclaimStagedPartials(ctx, h.storage, name+"/", h.logger)
-	if h.fieldSchema != nil {
+	if h.fieldSchema != nil && len(deleteErrors) == 0 {
 		// Best effort: a leftover anchor is inert (its measurement has no
 		// files) and is overwritten by the next ingest into a database of
 		// the same name.
@@ -618,12 +655,14 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 
 	// Also delete the .arc-database marker file (not included in List due to hidden file filter)
 	markerPath := name + "/.arc-database"
-	if err := h.storage.Delete(ctx, markerPath); err != nil {
-		h.logger.Warn().Err(err).Str("path", markerPath).Msg("Failed to delete database marker file")
-		deleteErrors = append(deleteErrors, markerPath+": "+err.Error())
-	} else {
-		deletedCount++
-		h.logger.Debug().Str("path", markerPath).Msg("Deleted database marker file")
+	if len(deleteErrors) == 0 {
+		if err := h.storage.Delete(ctx, markerPath); err != nil {
+			h.logger.Warn().Err(err).Str("path", markerPath).Msg("Failed to delete database marker file")
+			deleteErrors = append(deleteErrors, markerPath+": "+err.Error())
+		} else {
+			deletedCount++
+			h.logger.Debug().Str("path", markerPath).Msg("Deleted database marker file")
+		}
 	}
 
 	// Everything List, ListStaged and the marker cover is gone now, so a file
@@ -659,8 +698,6 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	// recreate them. Failures are logged, not returned: the files are
 	// already deleted, catalog residue equals the pre-fix status quo, and
 	// re-running the DELETE retries the cleanup.
-	h.dropIcebergCatalog(ctx, name)
-
 	if len(deleteErrors) > 0 {
 		h.logger.Error().
 			Str("database", name).
@@ -674,6 +711,8 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 			"errors":        deleteErrors,
 		})
 	}
+
+	h.dropIcebergCatalog(ctx, name)
 
 	h.logger.Info().
 		Str("database", name).
@@ -954,7 +993,13 @@ func (h *DatabasesHandler) databaseExists(ctx context.Context, name string) (boo
 	if err != nil {
 		return false, err
 	}
-	return len(files) > 0, nil
+	if len(files) > 0 {
+		return true, nil
+	}
+	if h.tieringManager != nil {
+		return h.tieringManager.DatabaseHasTierRows(ctx, name)
+	}
+	return false, nil
 }
 
 func extractTopLevelDirs(files []string) []string {

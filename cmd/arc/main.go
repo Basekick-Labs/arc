@@ -5190,6 +5190,17 @@ func (a *tieringManifestAdapter) DeleteFilesFromManifest(ctx context.Context, pa
 	return err
 }
 
+func (a *tieringManifestAdapter) ManifestEntriesByDatabase(database string) []string {
+	entries := a.coordinator.GetFileManifestByDatabase(database)
+	paths := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry != nil {
+			paths = append(paths, entry.Path)
+		}
+	}
+	return paths
+}
+
 func (a *tieringManifestAdapter) ManifestEntry(path string) (int64, bool) {
 	entry, ok := a.coordinator.GetFileEntry(path)
 	if !ok || entry == nil {
