@@ -190,6 +190,35 @@ enabled = true
 # needs this TOML array): ARC_COMPACTION_EXCLUDE_DATABASES="staging imports"
 # exclude_databases = ["staging", "imports_backlog"]
 
+# Scratch directory for one compaction job: DuckDB spill plus the compacted
+# output before it is published. Default: "./data/compaction".
+# Environment override: ARC_COMPACTION_TEMP_DIRECTORY=/mnt/fast/compaction
+#
+# Two things about WHERE you point it, both of which matter on a local backend:
+#
+#   - Same filesystem as storage.local_path, and Arc MOVES the finished output
+#     into the storage root instead of copying it, so publishing costs a rename
+#     rather than a full read plus a full write of the file. On a different
+#     filesystem the move is impossible and Arc copies exactly as it used to,
+#     logging one warning per job that names both paths. The defaults
+#     ("./data/arc" and "./data/compaction") are siblings, so this applies out
+#     of the box (#969).
+#   - NOT inside storage.local_path. Everything under the storage root is
+#     treated as storage: the job directory is listed as a database by
+#     SHOW DATABASES, and an instance backup sweeps it, so a half-written
+#     output can land in a backup. A sibling directory satisfies "same
+#     filesystem" without this. Ordinary queries are unaffected either way --
+#     they glob <database>/<measurement>/**/*.parquet.
+#
+# Sizing: this directory needs room for whatever DuckDB spills plus the whole
+# compacted output. Inputs are not staged here on a local backend - they are read
+# from their own paths since 27.01.1 (#969). On a DIFFERENT filesystem from the
+# storage root, the storage root additionally needs room for a second copy of the
+# output while it is being published; on a volume too tight for that, compaction
+# does not fail cleanly - the adaptive splitter halves the batch and reports
+# success, leaving several partly compacted files where one belonged.
+# temp_directory = "./data/compaction"
+
 # Hourly
 hourly_enabled = true
 hourly_schedule = "5 * * * *"

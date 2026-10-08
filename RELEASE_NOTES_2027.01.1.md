@@ -1289,6 +1289,45 @@ would never have progressed while every metric showed jobs completing.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#990](https://github.com/Basekick-Labs/arc/pull/990).
 
+#### The output side (maintainer follow-up, not part of #990)
+
+Everything above is the input half of #969. The **output** side no longer copies
+either. On a local backend a compacted file is moved into the storage root rather
+than copied into it, so publishing the output costs a rename instead of a full
+read plus a full write of the file.
+
+Two conditions apply, and both are ordinary configuration rather than edge
+cases:
+
+- **The backend has to be local.** On S3 and Azure the upload is a network
+  transfer and nothing changes.
+- **`compaction.temp_directory` has to be on the same filesystem as
+  `storage.local_path`.** They are independently configurable and pointing the
+  temporary directory at a larger or faster volume is the reason the key exists.
+  When they are on different filesystems the rename is impossible and Arc copies
+  exactly as before, logging one warning per job that names both paths. If you
+  see that warning and want the saving, co-locate the two paths.
+
+Do **not** put `compaction.temp_directory` inside `storage.local_path` to
+satisfy that condition. Everything under the storage root is treated as storage:
+the job temporary directory is listed as a database by `SHOW DATABASES`, and a
+backup of the instance sweeps it, so a half-written compaction output can end up
+in a backup. An ordinary query is not affected -- it globs
+`<database>/<measurement>/**/*.parquet`, which a job directory at another top
+level does not match. Use a sibling directory on the same filesystem, which is
+what the defaults (`./data/arc` and `./data/compaction`) already are.
+
+In clustered deployments the output is still read once more, to compute the
+SHA-256 the completion manifest publishes and peers verify their pulled bytes
+against. That digest is now taken before the output is published rather than
+after, because a moved file is no longer there to read. So on a cluster this
+removes one of two passes over the output, not both; a single node writes no
+completion manifest and skips the digest entirely.
+
+`arc_storage_write_bytes_total` counts a moved file exactly as it counted a
+copied one, so the counter is unchanged by this work and is not where the saving
+shows up.
+
 ## Internal changes
 
 These do not change how Arc behaves. They are here because the codebase is the
@@ -1938,3 +1977,47 @@ replicating local-storage node is unchanged by this. It keys off
 `GetBackendForTier(TierCold) != nil`, and with cold disabled that was already
 nil before this change, so the warning was already firing. Nothing at that
 call site behaves differently in any reachable configuration.
+
+### `storage.FileAdopter`, and what a compaction-manifest failure does not retry into
+
+`storage.FileAdopter` is a new optional backend interface, in the shape of the
+existing `BatchDeleter`: a backend whose objects really are local files can
+implement `AdoptFile` and take ownership of a file the caller has already
+written, instead of copying it through `WriteReader`. `LocalBackend` implements
+it; `S3Backend` and `AzureBlobBackend` deliberately do not, and a test asserts
+they never will, because the contract **consumes the caller's file** and a
+backend that copies bytes cannot honour that.
+
+`ErrAdoptUnsupported` means "this pair of paths cannot be adopted, copy
+instead" and is not a failure. `AdoptFile` returns it for **any** rename the
+filesystem refuses, not only a cross-device one, and also when the source
+filesystem will not let Arc set the file mode. The reason is the same in both
+cases: before this change the copy was unconditional, so a filesystem that
+refuses either operation would go from "compacts, slowly" to "compaction fails
+every cycle". Falling back is safe for any rename error, because a rename is
+atomic — a failed one moved nothing, and the source the fallback reads is still
+there. Only a caller error (a key that escapes the storage root, a source that
+is not a regular file) is a hard failure, and both are rejected before the
+rename.
+
+The `chmod` is what keeps a moved object at mode `0600`, the same mode
+`WriteReader` gives every other local object; a rename otherwise preserves
+whatever mode DuckDB wrote the output under, which is umask-derived. It runs
+before the rename, so a refused adopt can leave the source file at `0600` — the
+contract on `ErrAdoptUnsupported` says so, since it promises only that nothing
+was moved.
+
+Unlike `WriteReader`, `AdoptFile` does not stage through a `.part` name. That
+name exists so an interrupted *copy* leaves resumable bytes on disk, and a
+rename has no partial state — so renaming straight to the final path is
+strictly stronger: there is no window in which a reader can observe a short
+object.
+
+Separately, a comment in `internal/compaction/job.go` claimed that failing a job
+on a completion-manifest write error means the next cycle retries and the
+cluster eventually sees the output. It does not, and the comment now says so.
+Recovery finds the output present with a matching size, deletes the inputs and
+deletes the compaction manifest without ever writing a completion manifest, so
+the Raft `RegisterFile` never fires and the compacted file ends up with no
+manifest entry describing it. Only the comment changed here; the recovery gap
+is tracked in [#1155](https://github.com/Basekick-Labs/arc/issues/1155).
