@@ -5,7 +5,12 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"github.com/basekick-labs/arc/internal/cluster/protocol"
+	"github.com/stretchr/testify/require"
+	"net"
 	"testing"
+	"time"
 
 	"github.com/basekick-labs/arc/internal/wal"
 	"github.com/rs/zerolog"
@@ -72,5 +77,43 @@ func TestReceiverTrackedEntryRejectsLegacyAndReceivedMarkers(t *testing.T) {
 	}
 	if local.received != 0 || local.raw != 0 {
 		t.Fatal("persisted unsupported wire payload")
+	}
+}
+
+func TestReceiverRejectsIncompatibleIdentityAck(t *testing.T) {
+	for _, tracked := range []bool{false, true} {
+		t.Run(fmt.Sprint(tracked), func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			defer ln.Close()
+			result := make(chan error, 1)
+			go func() {
+				conn, err := ln.Accept()
+				if err != nil {
+					result <- err
+					return
+				}
+				defer conn.Close()
+				msg, err := protocol.ReceiveMessage(conn, 5*time.Second)
+				if err != nil {
+					result <- err
+					return
+				}
+				req := msg.Payload.(*protocol.ReplicateSync)
+				if req.SupportsTrackedEntries != tracked {
+					result <- fmt.Errorf("receiver advertised wrong identity mode")
+					return
+				}
+				result <- protocol.SendMessage(conn, &protocol.Message{Type: protocol.MsgReplicateSyncAck, Payload: &protocol.ReplicateSyncAck{TrackedEntries: !tracked}}, 5*time.Second)
+			}()
+			r := NewReceiver(&ReceiverConfig{ReaderID: "reader", WriterAddr: ln.Addr().String(), SharedSecret: "test-secret", ClusterName: "test", TrackedEntries: tracked, Logger: zerolog.Nop()})
+			r.ctx = context.Background()
+			r.lastSeq.Store(42)
+			err = r.connect()
+			require.ErrorContains(t, err, "incompatible WAL identity protocol")
+			require.False(t, r.connected.Load())
+			require.Equal(t, uint64(42), r.lastSeq.Load(), "rejection must precede any sequence-space reset")
+			require.NoError(t, <-result)
+		})
 	}
 }

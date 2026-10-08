@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -237,6 +238,15 @@ type Config struct {
 	// later and can be absent entirely, so the return value — not the hook
 	// being non-nil — is what tier_registered counts.
 	RecordPulledFile func(path string, sizeBytes int64) bool
+
+	// PublishLocalFile installs this exact requested version in the replica
+	// query view. Called on the worker after a successful pull, and on the
+	// already-local fast path. It must verify and pin the local bytes against
+	// entry.SHA256 before publishing: size-only presence is not proof of the
+	// content version. A failure keeps catch-up incomplete and retries the
+	// pull; an advertisement alone never makes canonical rows visible.
+	// The callback must treat entry and its slice fields as immutable.
+	PublishLocalFile func(context.Context, raft.FileEntry) error
 
 	// RecordAbandonedFile, when set, is called for a file this node had just
 	// finished pulling when it found the path gone from the manifest and
@@ -787,6 +797,13 @@ func (p *Puller) recordPulledFile(path string, sizeBytes int64) {
 	}
 }
 
+func (p *Puller) publishLocalFile(entry raft.FileEntry) error {
+	if p.cfg.PublishLocalFile == nil {
+		return nil
+	}
+	return p.cfg.PublishLocalFile(p.ctx, entry)
+}
+
 // recordAbandonedFile is the nil-safe wrapper around cfg.RecordAbandonedFile.
 func (p *Puller) recordAbandonedFile(path string, sizeBytes int64) {
 	if p.cfg.RecordAbandonedFile != nil {
@@ -1101,12 +1118,14 @@ func (p *Puller) enqueue(entry *raft.FileEntry, source enqueueSource, force bool
 	if force && !p.cfg.ForceContentRefresh {
 		force = false
 	}
+	// With a query publisher even own files must reach a worker: compaction
+	// and startup can create canonical bytes not yet visible in the view.
 	// Fast-path: a reactive register of a self-origin file means this node
 	// just wrote it; nothing to pull. The walks reach here for a self-origin
 	// entry only after checking the disk (RepullMissingSelfOrigin), so the
 	// fast path must not stop them — unless the re-pull is off, in which
 	// case self-origin is never pulled, as before.
-	if entry.OriginNodeID == p.cfg.SelfNodeID && (source == enqueueSourceReactive || !p.cfg.RepullMissingSelfOrigin) {
+	if p.cfg.PublishLocalFile == nil && entry.OriginNodeID == p.cfg.SelfNodeID && (source == enqueueSourceReactive || !p.cfg.RepullMissingSelfOrigin) {
 		p.totalSkippedSelf.Add(1)
 		return enqueueResultSkippedSelf
 	}
@@ -1114,6 +1133,11 @@ func (p *Puller) enqueue(entry *raft.FileEntry, source enqueueSource, force bool
 	// Snapshot the callback's entry before retaining it: the caller may
 	// subsequently mutate its FileEntry.
 	entryCopy := *entry
+	entryCopy.Replaces = slices.Clone(entry.Replaces)
+	entryCopy.WALCoverage = slices.Clone(entry.WALCoverage)
+	for i := range entryCopy.WALCoverage {
+		entryCopy.WALCoverage[i].Coverage = slices.Clone(entry.WALCoverage[i].Coverage)
+	}
 	request := &pullRequest{entry: &entryCopy, source: source, force: force}
 
 	p.inflightMu.Lock()
@@ -1484,9 +1508,14 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 					Int64("local_size", localSize).
 					Msg("Local copy matches the manifest size but an earlier pull found no peer holding its checksum; pulling again rather than trusting the size")
 			} else if !request.force {
-				p.totalSkippedLocal.Add(1)
-				succeeded = true // File is already here — same as a fresh pull from the gate's perspective.
-				return
+				if err := p.publishLocalFile(*entry); err == nil {
+					p.totalSkippedLocal.Add(1)
+					succeeded = true
+					return
+				} else {
+					log.Warn().Err(err).Str("path", entry.Path).
+						Msg("Local file could not be published; verifying it through a peer pull")
+				}
 			}
 		}
 		if errors.Is(statErr, storage.ErrInvalidPath) {
@@ -1568,6 +1597,11 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 					// that valid local copy until the queued successor replaces it.
 					p.enqueue(&current, request.source, true)
 					return
+				}
+				if err := p.publishLocalFile(*entry); err != nil {
+					lastErr = fmt.Errorf("publish pulled file: %w", err)
+					lastPeer = peerAddr
+					continue
 				}
 				p.totalPulled.Add(1)
 				log.Info().

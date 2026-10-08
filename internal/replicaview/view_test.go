@@ -114,3 +114,96 @@ func TestReplacementCannotWithdrawUncoveredInput(t *testing.T) {
 		t.Fatal("failed replacement partially changed query sources")
 	}
 }
+
+func TestReplayIndexAndShadowCollectionRespectHoursAndLeases(t *testing.T) {
+	v := NewView()
+	a := viewTestFile(t, "hour1", true, 1, 1)
+	a.Metadata.Segments[0].End = 4
+	b := viewTestFile(t, "hour2", true, 2, 1)
+	b.Metadata.Segments[0].End = 6
+	id := a.Metadata.Segments[0].Identity
+	if err := v.Publish(a); err != nil {
+		t.Fatal(err)
+	}
+	if v.HasEntry("db", "cpu", id) {
+		t.Fatal("partial multi-hour entry claimed complete")
+	}
+	retry := a
+	retry.Path = "retry"
+	if err := v.Publish(retry); err != nil {
+		t.Fatal(err)
+	}
+	if v.HasEntry("db", "cpu", id) {
+		t.Fatal("retry was counted as another hour")
+	}
+	if err := v.Publish(b); err != nil {
+		t.Fatal(err)
+	}
+	if !v.HasEntry("db", "cpu", id) {
+		t.Fatal("complete entry not indexed")
+	}
+	// Republishing the same file must not double its indexed row count.
+	if err := v.Publish(b); err != nil {
+		t.Fatal(err)
+	}
+	if !v.HasEntry("db", "cpu", id) {
+		t.Fatal("idempotent publication changed completeness")
+	}
+	lease := v.Snapshot("db", "cpu")
+	if err := v.Publish(viewTestFile(t, "primary1", false, 1, 1)); err != nil {
+		t.Fatal(err)
+	}
+	removed := v.PruneCoveredReplicas()
+	if len(removed) != 2 {
+		t.Fatalf("removed %d, want both covered hour-1 retry files", len(removed))
+	}
+	if v.CanUnlink("hour1") {
+		t.Fatal("query lease did not protect the withdrawn file")
+	}
+	if v.HasEntry("db", "cpu", id) {
+		t.Fatal("withdrawn rows retained in replay index")
+	}
+	if len(v.entries) != 1 {
+		t.Fatal("entry with remaining hour was dropped")
+	}
+	if err := v.Publish(viewTestFile(t, "primary2", false, 2, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if len(v.PruneCoveredReplicas()) != 1 {
+		t.Fatal("last replica hour not collected")
+	}
+	if len(v.entries) != 0 {
+		t.Fatal("replay index retains historical identities after handoff")
+	}
+	lease.Close()
+	if !v.CanUnlink("hour1") || !v.CanUnlink("hour2") {
+		t.Fatal("released query still holds pins")
+	}
+	snapshot := v.Snapshot("db", "cpu")
+	defer snapshot.Close()
+	if len(snapshot.Sources) != 2 {
+		t.Fatal("garbage collection removed canonical data")
+	}
+}
+
+func TestReplacementValidationIsAtomic(t *testing.T) {
+	v := NewView()
+	input := viewTestFile(t, "original", false, 1, 1)
+	if err := v.Publish(input); err != nil {
+		t.Fatal(err)
+	}
+	valid := viewTestFile(t, "valid", false, 1, 1)
+	invalid := viewTestFile(t, "invalid", false, 1, 1)
+	invalid.Metadata.Database = ""
+	if err := v.Replace([]string{input.Path}, []File{valid, invalid}); err == nil {
+		t.Fatal("accepted malformed output")
+	}
+	snapshot := v.Snapshot("db", "cpu")
+	defer snapshot.Close()
+	if len(snapshot.Sources) != 1 || snapshot.Sources[0].File.Path != input.Path {
+		t.Fatal("failed replacement changed visible files")
+	}
+	if err := v.Replace([]string{input.Path}, []File{valid, valid}); err == nil {
+		t.Fatal("accepted duplicate output path")
+	}
+}

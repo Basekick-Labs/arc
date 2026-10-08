@@ -133,6 +133,7 @@ type ReplicateSync struct {
 
 // ReplicateSyncAck is sent by the writer in response to a sync request.
 type ReplicateSyncAck struct {
+	TrackedEntries  bool   `json:"tracked_entries,omitempty"`
 	CurrentSequence uint64 `json:"current_seq"`
 	CanResume       bool   `json:"can_resume"`
 	Error           string `json:"error,omitempty"`

@@ -29,6 +29,12 @@ type partition struct {
 	hour        int64
 }
 
+type entryKey struct{ database, measurement, identity string }
+type entryMaterialization struct {
+	hour, rows, total int64
+	valid             bool
+}
+
 // View publishes immutable, verified files and takes one source snapshot for
 // each query. Merely advertising a primary file must never publish it here.
 type View struct {
@@ -36,10 +42,11 @@ type View struct {
 	files   map[string]File
 	refs    map[string]int
 	retired map[partition]Coverage
+	entries map[entryKey]map[string]entryMaterialization
 }
 
 func NewView() *View {
-	return &View{files: make(map[string]File), refs: make(map[string]int), retired: make(map[partition]Coverage)}
+	return &View{files: make(map[string]File), refs: make(map[string]int), retired: make(map[partition]Coverage), entries: make(map[entryKey]map[string]entryMaterialization)}
 }
 
 func cloneFile(f File) File {
@@ -66,24 +73,32 @@ func (v *View) Publish(file File) error {
 	return v.publishLocked(file)
 }
 
-func (v *View) publishLocked(file File) error {
+func normalizeFile(file File) (File, error) {
 	rows := int64(0)
 	if segments := file.Metadata.Segments; len(segments) > 0 {
 		rows = segments[len(segments)-1].End
 	}
 	normalized, err := DecodeFileMetadata(file.Metadata.Encode(), rows)
 	if err != nil {
-		return err
+		return File{}, err
 	}
 	file.Metadata = normalized
-
 	if file.Path == "" || file.SHA256 == "" {
-		return fmt.Errorf("replication view requires an immutable verified file")
+		return File{}, fmt.Errorf("replication view requires an immutable verified file")
+	}
+	return file, nil
+}
+
+func (v *View) publishLocked(file File) error {
+	file, err := normalizeFile(file)
+	if err != nil {
+		return err
 	}
 	if previous, ok := v.files[file.Path]; ok && previous.SHA256 != file.SHA256 {
 		return fmt.Errorf("replication view file was replaced in place: %s", file.Path)
 	}
-	v.files[file.Path] = cloneFile(file)
+	v.removeFileLocked(file.Path)
+	v.addFileLocked(file)
 	return nil
 }
 
@@ -97,7 +112,19 @@ func (v *View) Replace(inputs []string, outputs []File) error {
 	for _, path := range inputs {
 		inputSet[path] = true
 	}
-	for _, output := range outputs {
+	validated := make([]File, len(outputs))
+	outputPaths := make(map[string]bool, len(outputs))
+	for i, output := range outputs {
+		var err error
+		output, err = normalizeFile(output)
+		if err != nil {
+			return err
+		}
+		if outputPaths[output.Path] {
+			return fmt.Errorf("duplicate replacement output")
+		}
+		outputPaths[output.Path] = true
+		validated[i] = output
 		if output.Path == "" || output.SHA256 == "" || output.Metadata.IsReplica() {
 			return fmt.Errorf("invalid canonical replacement")
 		}
@@ -109,6 +136,7 @@ func (v *View) Replace(inputs []string, outputs []File) error {
 		}
 	}
 
+	outputs = validated
 	replacementCoverage := make(map[partition]Coverage)
 	for _, output := range outputs {
 		for _, part := range output.Metadata.PartitionCoverages() {
@@ -127,10 +155,10 @@ func (v *View) Replace(inputs []string, outputs []File) error {
 		}
 	}
 	for _, path := range inputs {
-		delete(v.files, path)
+		v.removeFileLocked(path)
 	}
 	for _, output := range outputs {
-		v.files[output.Path] = cloneFile(output)
+		v.addFileLocked(output)
 	}
 	return nil
 }
@@ -144,7 +172,7 @@ func (v *View) Retire(database, measurement string, hour int64, coverage Coverag
 	key := partition{database, measurement, hour}
 	v.retired[key] = Union(v.retired[key], coverage)
 	for _, path := range paths {
-		delete(v.files, path)
+		v.removeFileLocked(path)
 	}
 }
 
@@ -245,25 +273,18 @@ func (v *View) HasEntry(database, measurement, identity string) bool {
 	defer v.mu.Unlock()
 	rowsByHour := make(map[int64]int64)
 	var expected int64
-	for _, file := range v.files {
-		metadata := file.Metadata
-		if metadata.Database != database || metadata.Measurement != measurement {
-			continue
+	for _, entry := range v.entries[entryKey{database, measurement, identity}] {
+		if !entry.valid {
+			return false
 		}
-		var rows int64
-		for _, segment := range metadata.Segments {
-			if segment.Identity == identity {
-				rows += segment.End - segment.Start
-				if expected == 0 {
-					expected = segment.TotalRows
-				}
-				if expected != segment.TotalRows {
-					return false
-				}
-			}
+		if expected == 0 {
+			expected = entry.total
 		}
-		if rows > rowsByHour[metadata.Hour] {
-			rowsByHour[metadata.Hour] = rows
+		if expected != entry.total {
+			return false
+		}
+		if entry.rows > rowsByHour[entry.hour] {
+			rowsByHour[entry.hour] = entry.rows
 		}
 	}
 	var total int64
@@ -271,4 +292,71 @@ func (v *View) HasEntry(database, measurement, identity string) bool {
 		total += rows
 	}
 	return expected > 0 && total == expected
+}
+
+// The replay index retains only identities backed by current replica files.
+// It does not grow with the history of writes already handed to primary files.
+func (v *View) addFileLocked(file File) {
+	v.files[file.Path] = cloneFile(file)
+	m := file.Metadata
+	for _, segment := range m.Segments {
+		key := entryKey{m.Database, m.Measurement, segment.Identity}
+		versions := v.entries[key]
+		if versions == nil {
+			versions = make(map[string]entryMaterialization)
+			v.entries[key] = versions
+		}
+		entry, exists := versions[file.Path]
+		if !exists {
+			entry = entryMaterialization{hour: m.Hour, total: segment.TotalRows, valid: true}
+		}
+		entry.rows += segment.End - segment.Start
+		entry.valid = entry.valid && entry.total == segment.TotalRows
+		versions[file.Path] = entry
+	}
+}
+
+func (v *View) removeFileLocked(path string) {
+	file, exists := v.files[path]
+	if !exists {
+		return
+	}
+	for _, segment := range file.Metadata.Segments {
+		key := entryKey{file.Metadata.Database, file.Metadata.Measurement, segment.Identity}
+		delete(v.entries[key], path)
+		if len(v.entries[key]) == 0 {
+			delete(v.entries, key)
+		}
+	}
+	delete(v.files, path)
+}
+
+// PruneCoveredReplicas withdraws fully covered shadows from future snapshots.
+// The returned files still need their pins/data retained until CanUnlink is
+// true. Partial-hour coverage never removes the replica's only remaining rows.
+func (v *View) PruneCoveredReplicas() []File {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	covered := make(map[partition]Coverage, len(v.retired))
+	for key, coverage := range v.retired {
+		covered[key] = coverage
+	}
+	for _, file := range v.files {
+		if file.Metadata.IsReplica() {
+			continue
+		}
+		for _, part := range file.Metadata.PartitionCoverages() {
+			key := partition{file.Metadata.Database, file.Metadata.Measurement, part.Hour}
+			covered[key] = Union(covered[key], part.Coverage)
+		}
+	}
+	var removed []File
+	for path, file := range v.files {
+		if !file.Metadata.IsReplica() || !covered[partitionOf(file.Metadata)].Covers(file.Metadata.Coverage) {
+			continue
+		}
+		removed = append(removed, cloneFile(file))
+		v.removeFileLocked(path)
+	}
+	return removed
 }

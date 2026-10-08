@@ -35,13 +35,23 @@ func (b *ArrowBuffer) WriteReplicatedColumnar(ctx context.Context, database, mea
 	if _, _, err := replicaview.ParseIdentity(identity); err != nil {
 		return err
 	}
-	if known, ok := b.replicationPublisher.(interface {
+	known, canCheck := b.replicationPublisher.(interface {
 		HasEntry(string, string, string) bool
-	}); ok && known.HasEntry(database, measurement, identity) {
+	})
+	if canCheck && known.HasEntry(database, measurement, identity) {
+		// The receiver appended this retry to its WAL before apply. Its rows
+		// are already durable, so release that new local purge sequence too.
+		b.markWALFlushed([]string{identity})
 		return nil
 	}
 	key := database + "\x00" + measurement + "\x00" + identity
 	if _, exists := b.replicaInFlight.LoadOrStore(key, struct{}{}); exists {
+		// Publication/checkpointing can finish after the first HasEntry but
+		// before this lookup, while the flush still owns the in-flight key.
+		// Recheck so that narrow window cannot pin a retry's WAL forever.
+		if canCheck && known.HasEntry(database, measurement, identity) {
+			b.markWALFlushed([]string{identity})
+		}
 		return nil
 	}
 	if err := b.writeColumnarDirect(ctx, database, measurement, columns, identity, true); err != nil {

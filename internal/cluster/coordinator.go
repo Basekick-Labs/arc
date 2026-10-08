@@ -2273,7 +2273,7 @@ func (c *Coordinator) handleReplicateSync(conn net.Conn, syncReq *protocol.Repli
 	}
 	if err := security.ValidateReplicateSyncHMAC(
 		c.cfg.SharedSecret, syncReq.Nonce, syncReq.ReaderID, syncReq.ClusterName,
-		syncReq.LastKnownSequence, syncReq.SupportsBinaryEntries, syncReq.Timestamp, syncReq.HMAC, security.HMACTimestampTolerance,
+		syncReq.LastKnownSequence, syncReq.SupportsBinaryEntries, syncReq.Timestamp, syncReq.HMAC, security.HMACTimestampTolerance, syncReq.SupportsTrackedEntries,
 	); err != nil {
 		c.logger.Warn().
 			Err(err).
@@ -2332,10 +2332,11 @@ func (c *Coordinator) handleReplicateSync(conn net.Conn, syncReq *protocol.Repli
 	// Carry the handshake nonce through so the sender can derive the
 	// same HKDF session key the receiver derived (GHSA-wfgr-8x84-22q7).
 	replSyncReq := &replication.ReplicateSync{
-		ReaderID:              syncReq.ReaderID,
-		LastKnownSequence:     syncReq.LastKnownSequence,
-		HandshakeNonce:        syncReq.Nonce,
-		SupportsBinaryEntries: syncReq.SupportsBinaryEntries,
+		ReaderID:               syncReq.ReaderID,
+		LastKnownSequence:      syncReq.LastKnownSequence,
+		HandshakeNonce:         syncReq.Nonce,
+		SupportsBinaryEntries:  syncReq.SupportsBinaryEntries,
+		SupportsTrackedEntries: syncReq.SupportsTrackedEntries,
 	}
 
 	if err := c.AcceptReplicationConnection(conn, replSyncReq); err != nil {
@@ -4554,13 +4555,27 @@ func (c *Coordinator) StartReplication() error {
 			return fmt.Errorf("failed to start replication sender: %w", err)
 		}
 
+		// Capture the negotiated payload mode before installing the hook. All
+		// readers of a sender must use that same mode.
+		trackedEntries := c.ingestBuffer != nil && c.ingestBuffer.HasReplicationPublisher()
+
 		// Hook into WAL if available
 		if c.walWriter != nil {
 			c.walWriter.SetReplicationHook(func(entry *wal.ReplicationEntry) {
+				payload := entry.Payload
+				if trackedEntries {
+					// Untracked writes cannot be safely handed off to canonical
+					// files. Never silently fall back to identity-free replication.
+					if len(entry.TrackedPayload) == 0 || entry.TrackedPayload[0] != wal.WALTrackedMarker {
+						c.logger.Error().Msg("Cannot stream WAL entry without originating write identity")
+						return
+					}
+					payload = entry.TrackedPayload
+				}
 				c.replicationSender.Replicate(&replication.ReplicateEntry{
 					Sequence:    entry.Sequence,
 					TimestampUS: entry.TimestampUS,
-					Payload:     entry.Payload,
+					Payload:     payload,
 				})
 			})
 			c.logger.Info().Msg("WAL replication hook installed")
@@ -4871,6 +4886,7 @@ func (c *Coordinator) startReceiverWithAddr(writerAddr string) error {
 		ReaderID:          c.localNode.ID,
 		WriterAddr:        writerAddr,
 		LocalWAL:          localWAL,
+		TrackedEntries:    c.ingestBuffer != nil && c.ingestBuffer.HasReplicationPublisher(),
 		IngestHandler:     ingestHandler,
 		ReconnectInterval: 5 * time.Second,
 		AckInterval:       time.Duration(c.cfg.ReplicationAckInterval) * time.Millisecond,
@@ -5112,6 +5128,7 @@ func (c *Coordinator) GetReplicationStats() map[string]interface{} {
 func (c *Coordinator) AcceptReplicationConnection(conn net.Conn, syncReq *replication.ReplicateSync) error {
 	c.mu.RLock()
 	sender := c.replicationSender
+	trackedEntries := c.ingestBuffer != nil && c.ingestBuffer.HasReplicationPublisher()
 	c.mu.RUnlock()
 
 	if sender == nil {
@@ -5121,6 +5138,14 @@ func (c *Coordinator) AcceptReplicationConnection(conn net.Conn, syncReq *replic
 		// for the reasons spelled out on the primary check below.
 		c.sendReplicationSyncError(conn, "this node is not configured as a writer with replication enabled")
 		return fmt.Errorf("replication connection rejected: not a writer")
+	}
+
+	// A legacy reader would materialize a second, unidentifiable copy, while
+	// a tracked reader cannot apply legacy payloads. Refuse both mixed modes
+	// before publishing the connection to the sender.
+	if syncReq.SupportsTrackedEntries != trackedEntries {
+		c.sendReplicationSyncError(conn, "incompatible WAL identity protocol; upgrade and restart all cluster nodes together")
+		return fmt.Errorf("replication connection rejected: incompatible WAL identity protocol")
 	}
 
 	// Defence in depth for #885: in local-storage mode only the primary writer
@@ -5201,6 +5226,7 @@ func (c *Coordinator) AcceptReplicationConnection(conn net.Conn, syncReq *replic
 	ack := &protocol.ReplicateSyncAck{
 		CurrentSequence: currentSeq,
 		CanResume:       canResume,
+		TrackedEntries:  trackedEntries,
 	}
 	if err := protocol.SendMessage(conn, &protocol.Message{
 		Type:    protocol.MsgReplicateSyncAck,

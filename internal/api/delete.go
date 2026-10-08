@@ -887,6 +887,10 @@ func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, relative
 	deleted := rowsBefore - rowsAfter
 	newRelativePath := rewritePath(relativePath)
 	newFilePath := filepath.Join(filepath.Dir(filePath), filepath.Base(newRelativePath))
+	metadataOptions, err := h.replicationRewriteOptions(ctx, filePath, relativePath, rowsBefore)
+	if err != nil {
+		return 0, "", err
+	}
 
 	// Create temp file for the rewritten data. Key it from the immutable output
 	// name so concurrent rewrites cannot collide on one source's staging path.
@@ -909,8 +913,8 @@ func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, relative
 			FORMAT PARQUET,
 			COMPRESSION ZSTD,
 			COMPRESSION_LEVEL 3,
-			ROW_GROUP_SIZE %d
-		)`, sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(filePath)), whereClause, sqlutil.QuoteStringLiteral(tempFile), parquetRowGroupSize)
+			ROW_GROUP_SIZE %d%s
+		)`, sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(filePath)), whereClause, sqlutil.QuoteStringLiteral(tempFile), parquetRowGroupSize, metadataOptions)
 
 	if err := database.ExecPreservingInsertionOrder(ctx, db, copyQuery); err != nil {
 		os.Remove(tempFile)
@@ -990,6 +994,10 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 	// preserve_insertion_order forced on so the rewritten file keeps the
 	// source's row order (typically time-sorted) even when the
 	// database-wide setting is false.
+	metadataOptions, err := h.replicationRewriteOptions(ctx, s3Path, relativePath, rowsBefore)
+	if err != nil {
+		return 0, nil, err
+	}
 	copyQuery := fmt.Sprintf(`
 		COPY (
 			SELECT * FROM %s WHERE NOT (%s)
@@ -997,8 +1005,8 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 			FORMAT PARQUET,
 			COMPRESSION ZSTD,
 			COMPRESSION_LEVEL 3,
-			ROW_GROUP_SIZE %d
-		)`, sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(s3Path)), whereClause, sqlutil.QuoteStringLiteral(tempPath), parquetRowGroupSize)
+			ROW_GROUP_SIZE %d%s
+		)`, sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(s3Path)), whereClause, sqlutil.QuoteStringLiteral(tempPath), parquetRowGroupSize, metadataOptions)
 
 	if err := database.ExecPreservingInsertionOrder(ctx, db, copyQuery); err != nil {
 		return 0, nil, fmt.Errorf("failed to write filtered data: %w", err)
@@ -1098,6 +1106,7 @@ func (h *DeleteHandler) replaceManifestAfterRewrite(ctx context.Context, oldPath
 
 	entry := *existing
 	entry.Path = newPath
+	entry.Replaces = []string{oldPath}
 	entry.OriginNodeID = h.coordinator.LocalNodeID()
 
 	if lb, ok := h.storage.(*storage.LocalBackend); ok {

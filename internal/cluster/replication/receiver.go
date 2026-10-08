@@ -346,6 +346,11 @@ func (r *Receiver) connect() error {
 		return fmt.Errorf("sync rejected: %s", syncAck.Error)
 	}
 
+	if syncAck.TrackedEntries != r.cfg.TrackedEntries {
+		conn.Close()
+		return fmt.Errorf("incompatible WAL identity protocol; upgrade and restart all cluster nodes together")
+	}
+
 	// Handshake accepted. Before anything streams, reconcile our sequence
 	// mark with the writer's space.
 	//

@@ -76,6 +76,11 @@ func (p *Puller) RunCatchUp(ctx context.Context, fetch func(cursor string, limit
 // microseconds each on a local disk and never puts a present file into the
 // queue.
 func (p *Puller) selfOriginPresent(entry *raft.FileEntry) bool {
+	// Publishing is worker work, including verifying an already-local file.
+	// Size-only presence cannot settle query-view catch-up after a restart.
+	if p.cfg.PublishLocalFile != nil {
+		return false
+	}
 	if !p.cfg.RepullMissingSelfOrigin {
 		return true
 	}
