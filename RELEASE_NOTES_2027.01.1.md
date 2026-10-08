@@ -1699,5 +1699,5 @@ the hot copy the restore just wrote, and the forced-hot row then lands for a
 file that is gone. The window used to be microseconds and is now up to the rest
 of the restore. The defect is the ungated sweep rather than the batching — with
 cold disabled it deletes hot copies whose cold objects the query path will not
-read, restore or no restore — so it is filed separately; until it is fixed, run
+read, restore or no restore — so it is filed as #1143; until that is fixed, run
 such a restore with tiering stopped.

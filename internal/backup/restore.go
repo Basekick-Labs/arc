@@ -1023,10 +1023,10 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 					// Not fixed here, because the defect is the ungated
 					// sweep rather than the batching: with cold disabled that
 					// sweep deletes hot copies whose cold objects the query
-					// path will not read, restore or no restore. Filed
-					// separately; a restore onto a node whose cold tier is
-					// configured but disabled should run with tiering
-					// stopped until it is fixed.
+					// path will not read, restore or no restore. That is
+					// #1143; until it is fixed, a restore onto a node whose
+					// cold tier is configured but disabled should run with
+					// tiering stopped.
 					m.queueHotRow(ctx, batch, destPath, bytesWritten, progress)
 				}
 				if m.tierRecorder != nil {
