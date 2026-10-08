@@ -3777,6 +3777,13 @@ func (h *QueryHandler) extractDBMeasurementFromPath(path string) (database, meas
 		}
 	}
 
+	// Object-store URIs include the configured key prefix. Remove it before
+	// looking for the database and measurement, since a prefix segment can
+	// itself look like a year.
+	if backend, ok := h.storage.(interface{ GetPrefix() string }); ok {
+		path = strings.TrimPrefix(path, backend.GetPrefix())
+	}
+
 	// Remove glob pattern suffix (**/*.parquet)
 	if idx := strings.Index(path, "**"); idx > 0 {
 		path = path[:idx]
