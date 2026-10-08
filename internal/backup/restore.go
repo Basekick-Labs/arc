@@ -739,6 +739,7 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 	// cold_files_restored_to_hot is always zero — which is exactly the number
 	// an operator restoring onto a cold-less node needs to see.
 	tiers := map[string]string{}
+	backupRows := map[string]ManifestFile{}
 	if m.cluster == nil {
 		for _, leg := range legs {
 			legEntries, ok, err := m.readSidecar(ctx, leg.target, backupID)
@@ -765,6 +766,7 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 				continue
 			}
 			for path, row := range legEntries {
+				backupRows[path] = row
 				if row.Tier != "" {
 					tiers[path] = row.Tier
 				}
@@ -773,6 +775,7 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 	}
 
 	var reg *restoreRegistration
+	var current []ManifestFile
 	if m.cluster != nil {
 		entries := map[string]ManifestFile{}
 		for _, leg := range legs {
@@ -785,6 +788,7 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 			}
 			for path, row := range legEntries {
 				entries[path] = row
+				backupRows[path] = row
 				if row.Tier != "" {
 					tiers[path] = row.Tier
 				}
@@ -793,7 +797,7 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 		if err := m.cluster.Sync(ctx); err != nil {
 			return fmt.Errorf("restore refused: could not sync the cluster manifest before reading it: %w", err)
 		}
-		current := m.cluster.ManifestFiles()
+		current = m.cluster.ManifestFiles()
 		existing := make(map[string]ManifestFile, len(current))
 		for _, e := range current {
 			existing[filepath.ToSlash(e.Path)] = e
@@ -804,10 +808,61 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 			overhead: registerOpOverhead(len(m.cluster.LocalNodeID())),
 			pause:    pause,
 		}
-		if mode == RestoreModeReplace {
-			if err := m.replaceDatabases(ctx, read.merged, allFiles, dataPrefix, allSkipInputs, current, progress, pause); err != nil {
-				return err
+	}
+
+	// A hot file in the backup may since have migrated to this node's cold
+	// tier. Check that state before replaceDatabases can remove any live data:
+	// a matching cold object is already the authoritative restored copy, while
+	// a missing or size-mismatched one must be restored hot and its row forced
+	// back to hot. Size is intentionally the same weak discriminator used by
+	// cold-manifest reconciliation; tier rows do not store the backup's SHA.
+	alreadyCold := map[string]bool{}
+	forceHotRow := map[string]bool{}
+	if m.coldSource != nil {
+		coldRows, err := m.coldSource.ColdRows(ctx)
+		if err != nil {
+			return fmt.Errorf("restore refused: could not read cold tier rows before restoring: %w", err)
+		}
+		cold := m.coldBackendOrNil()
+		for _, leg := range legs {
+			for _, srcPath := range leg.files {
+				destPath := filepath.ToSlash(strings.TrimPrefix(srcPath, dataPrefix))
+				if destPath == "" || destPath == filepath.ToSlash(srcPath) || leg.skipInputs[destPath] ||
+					tiers[destPath] == tierCold {
+					continue
+				}
+				if _, isCold := coldRows[destPath]; !isCold {
+					continue
+				}
+				row, hasBackupRow := backupRows[destPath]
+				if cold == nil || !hasBackupRow {
+					forceHotRow[destPath] = true
+					continue
+				}
+				exists, err := cold.Exists(ctx, destPath)
+				if err != nil {
+					return fmt.Errorf("restore refused: could not check whether the cold copy of %s exists before restoring: %w", destPath, err)
+				}
+				if !exists {
+					forceHotRow[destPath] = true
+					continue
+				}
+				size, err := cold.StatFile(ctx, destPath)
+				if err != nil {
+					return fmt.Errorf("restore refused: could not read the size of cold copy %s before restoring: %w", destPath, err)
+				}
+				if size == row.SizeBytes {
+					alreadyCold[destPath] = true
+				} else {
+					forceHotRow[destPath] = true
+				}
 			}
+		}
+	}
+
+	if m.cluster != nil && mode == RestoreModeReplace {
+		if err := m.replaceDatabases(ctx, read.merged, allFiles, dataPrefix, allSkipInputs, current, progress, pause); err != nil {
+			return err
 		}
 	}
 
@@ -862,6 +917,11 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 				atomic.AddInt64(&progress.ConsumedInputsSkipped, 1)
 				continue
 			}
+			if alreadyCold[destPath] {
+				atomic.AddInt64(&progress.ColdFilesSkippedAlreadyCold, 1)
+				m.setProgress(progress)
+				continue
+			}
 
 			// On a cluster a data file is written only when the sidecar describes
 			// it, and only if its bytes match that description (checked on the
@@ -905,7 +965,7 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 			// file written there would be unreadable. ColdBackend() ANDs the
 			// flag, so that case takes the hot branch here.
 			dest, destName := m.dataStorage, "data storage"
-			toCold, coldToHot := false, false
+			toCold, forceHot := false, false
 			if tiers[destPath] == tierCold {
 				if cold := m.coldBackendOrNil(); cold != nil {
 					dest, destName, toCold = cold, "cold tier storage", true
@@ -915,8 +975,11 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 					// move it in. With no tiering wired at all there are no
 					// tier rows, so there is nothing to correct — and
 					// m.coldSource is nil, so this must not be set.
-					coldToHot = m.coldSource != nil
+					forceHot = m.coldSource != nil
 				}
+			}
+			if forceHotRow[destPath] {
+				forceHot = true
 			}
 
 			// Stream via temp file to avoid loading entire Parquet file into memory
@@ -978,49 +1041,14 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 				// Storage first, then the manifest (Cluster Operations Checklist):
 				// the file is on disk before anything can route a reader to it.
 				// Tier rows the same way, after the bytes landed.
-				if coldToHot {
-					// The backup read this file from a cold tier and this node
-					// has none, so the bytes went to HOT storage — and the
-					// row, which says cold, has to be moved or the data is
-					// invisible rather than merely mis-tiered: the query path
-					// omits the hot glob when nothing claims hot AND the cold
-					// glob when there is no cold backend, which together
-					// resolve to a read of nothing.
-					//
-					// The ordinary report below cannot do it: its upsert is
-					// guarded to rows that already say hot. Hence a forced
-					// recorder, used only here.
-					// coldSource is non-nil here: coldToHot is set only when it
-					// is, in the branch above.
-					//
-					// Batched (#1141), so the forced write now happens AFTER
-					// the asynchronous RecordRestoredFile below rather than
-					// before it, possibly much later. Both orders converge on
-					// a hot row: the asynchronous report's upsert is guarded
-					// to rows that already say hot, so it cannot downgrade
-					// anything, and the forced write sets hot
-					// unconditionally. Stated here because it is now an
-					// argument rather than sequential code — anyone changing
-					// either path has to keep it true.
-					//
-					// WHAT THE LAG DOES NOT COST, corrected from what this
-					// comment claimed when #1142 shipped yesterday: until the
-					// row is written it still says cold with a recent
-					// migrated_at, which is what ReconcileOrphanedFiles looks
-					// for — so the sweep could in principle find the hot copy
-					// this restore just wrote and delete it once it confirmed
-					// the cold object.
-					//
-					// It cannot, and the reason is this branch's own
-					// precondition. coldToHot is reached only when
-					// coldBackendOrNil() is nil, which means this node has no
-					// cold backend OR has cold disabled — and cmd/arc/main.go
-					// builds a cold backend only inside "if cold.Enabled", so
-					// in both cases m.coldBackend is nil. The sweep then has
-					// nothing to verify a cold copy against and keeps the hot
-					// file; since #1143 it is skipped outright on such a node.
-					// The window the #1142 note warned about, and its advice
-					// to run this restore with tiering stopped, were wrong.
+				if forceHot {
+					// A cold-sidecar file without an enabled cold backend, or a
+					// hot-sidecar file whose cold copy is missing or differs in
+					// size, lands in hot storage. The ordinary report below cannot
+					// move a cold row, so queue the forced hot update as well. Both
+					// writes are batched (#1141); the ordinary report is guarded
+					// against changing a cold row, so the order still converges on
+					// hot even if its asynchronous event arrives later.
 					m.queueHotRow(ctx, batch, destPath, bytesWritten, progress)
 				}
 				if m.tierRecorder != nil {

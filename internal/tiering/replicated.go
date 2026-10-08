@@ -856,7 +856,22 @@ func (m *Manager) applyPulled(ctx context.Context, info *FileMetadata) (bool, er
 			return false, nil
 		}
 	}
-	return m.metadata.recordHotFileIfNotCold(ctx, info)
+	wrote, err := m.metadata.recordHotFileIfNotCold(ctx, info)
+	if err != nil || wrote {
+		return wrote, err
+	}
+	// A false result is also the normal identical-hot-row case. Inspect only
+	// that no-op path so a stale pull refused by the cold-row guard is visible
+	// without adding a read to every successful replication write.
+	existing, err := m.metadata.GetFile(ctx, info.Path)
+	if err != nil {
+		return false, err
+	}
+	if existing != nil && existing.Tier == TierCold {
+		m.logger.Warn().Str("path", info.Path).
+			Msg("Refused to register a hot file over a cold tier row")
+	}
+	return false, nil
 }
 
 // applyUnlinked decides what the removal of this node's local copy means for

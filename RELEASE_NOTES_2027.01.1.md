@@ -650,6 +650,17 @@ Three consequences worth knowing before you upgrade:
   holds the lease, or run a single compactor-role node — the same constraint
   Iceberg export already documents.
 
+### Restore preserves a matching cold copy of hot-backup files ([#1139](https://github.com/Basekick-Labs/arc/issues/1139))
+
+Restore now checks local cold-tier rows and objects before writing a file that
+the backup recorded as hot. A matching cold copy is left in place and counted,
+while a missing or differently sized copy is restored hot and its tier row is
+forced hot. A size match is the same compatibility check used by cold-tier
+reconciliation and does not prove the contents are identical. A replication
+report refused by the cold-row guard now logs the path and reason.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#PR](https://github.com/Basekick-Labs/arc/pulls).
+
 ### Crash smokes verify acknowledged records after WAL replay
 
 The enterprise-shared crash scenarios restart the killed writer and wait for
