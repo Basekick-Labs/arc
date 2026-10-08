@@ -1763,24 +1763,24 @@ func (b *ArrowBuffer) WriteColumnarRecord(ctx context.Context, database string, 
 // WriteColumnarDirectNoWAL writes columnar data without writing to WAL.
 // Used during WAL recovery to avoid re-writing recovered data back to WAL.
 //
-// Note (#521): the WAL stores flattened rows and does NOT carry TagColumns or
-// the DedupTime marker (both are json:"-"), so a Parquet file produced purely
-// from WAL replay has neither arc:tags nor arc:dedup_time. In practice this
-// self-heals: compaction unions metadata across all files in a partition, so
-// a replayed file dedups against any marked sibling written normally for the
-// same window. It only fails to dedup if the replayed copy and a marked copy
-// land in different compaction batches — a transient duplicate, never data
-// loss. This matches the pre-existing arc:tags WAL behavior; propagating the
-// markers through the WAL is a separate, larger change (WAL schema).
+// Raw MessagePack WAL entries preserve tag_keys through recovery so replayed
+// files keep their arc:tags metadata. The row-format fallback and DedupTime
+// marker remain separate WAL format concerns.
 // WriteColumnarDirectNoWAL writes a replayed or replicated columnar payload into
 // the buffer without appending it to the WAL. It inherits no WAL identity; use
 // WriteColumnarDirectReplay when replaying an entry whose identity should be
 // checkpointed once the batch reaches storage.
 func (b *ArrowBuffer) WriteColumnarDirectNoWAL(ctx context.Context, database, measurement string, columns map[string][]interface{}) error {
-	return b.writeColumnarDirect(ctx, database, measurement, columns, "")
+	return b.writeColumnarDirect(ctx, database, measurement, columns, "", nil)
 }
 
-func (b *ArrowBuffer) writeColumnarDirect(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string) error {
+// WriteColumnarDirectNoWALWithTagColumns replays columnar data without
+// rewriting it to the WAL while preserving MessagePack tag metadata.
+func (b *ArrowBuffer) WriteColumnarDirectNoWALWithTagColumns(ctx context.Context, database, measurement string, columns map[string][]interface{}, tagColumns []string) error {
+	return b.writeColumnarDirect(ctx, database, measurement, columns, "", tagColumns)
+}
+
+func (b *ArrowBuffer) writeColumnarDirect(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string, tagColumns []string) error {
 	// #590: both callers (WAL crash replay, cluster WAL replication) feed
 	// RAW client payloads that never went through the live decode path's
 	// post-processing. Apply it here so replayed data behaves exactly like
@@ -1830,6 +1830,7 @@ func (b *ArrowBuffer) writeColumnarDirect(ctx context.Context, database, measure
 	record := &models.ColumnarRecord{
 		Measurement: measurement,
 		Columns:     columns,
+		TagColumns:  tagColumns,
 		Columnar:    true,
 	}
 	return b.writeColumnarInternal(ctx, database, record, true, walIdentity)
@@ -1854,7 +1855,13 @@ func (b *ArrowBuffer) writeColumnarDirect(ctx context.Context, database, measure
 // the entry when only some of those calls flush would mark data durable that
 // was discarded. See cmd/arc's recovery callbacks.
 func (b *ArrowBuffer) WriteColumnarDirectReplay(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string) error {
-	return b.writeColumnarDirect(ctx, database, measurement, columns, walIdentity)
+	return b.writeColumnarDirect(ctx, database, measurement, columns, walIdentity, nil)
+}
+
+// WriteColumnarDirectReplayWithTagColumns preserves MessagePack tag metadata
+// while carrying the WAL identity into the replayed buffer.
+func (b *ArrowBuffer) WriteColumnarDirectReplayWithTagColumns(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string, tagColumns []string) error {
+	return b.writeColumnarDirect(ctx, database, measurement, columns, walIdentity, tagColumns)
 }
 
 // WriteTypedColumnarDirect writes a pre-typed column batch to the buffer,

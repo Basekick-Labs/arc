@@ -45,6 +45,7 @@ type ColumnarEntry struct {
 	Database    string // From envelope metadata (empty = "default")
 	Measurement string
 	Columns     map[string][]interface{}
+	TagColumns  []string
 }
 
 // ReadAll reads all entries from the WAL file
@@ -318,9 +319,18 @@ func parseColumnarEntry(rawMap map[string]interface{}) *ColumnarEntry {
 		}
 		columns[k] = arr
 	}
+	tagColumns := make([]string, 0)
+	if rawTagColumns, ok := rawMap["tag_keys"].([]interface{}); ok {
+		for _, rawTag := range rawTagColumns {
+			if tag, ok := rawTag.(string); ok {
+				tagColumns = append(tagColumns, tag)
+			}
+		}
+	}
 
 	return &ColumnarEntry{
 		Measurement: m,
 		Columns:     columns,
+		TagColumns:  tagColumns,
 	}
 }

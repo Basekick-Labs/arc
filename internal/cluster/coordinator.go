@@ -4915,7 +4915,15 @@ func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler 
 						}
 					}
 					if len(typedColumns) > 0 {
-						return buf.WriteColumnarDirectNoWAL(ctx, database, measurement, typedColumns)
+						tagColumns := make([]string, 0)
+						if rawTagColumns, ok := rawMap["tag_keys"].([]interface{}); ok {
+							for _, rawTag := range rawTagColumns {
+								if tag, ok := rawTag.(string); ok {
+									tagColumns = append(tagColumns, tag)
+								}
+							}
+						}
+						return buf.WriteColumnarDirectNoWALWithTagColumns(ctx, database, measurement, typedColumns, tagColumns)
 					}
 				}
 			}
