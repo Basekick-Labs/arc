@@ -17,13 +17,15 @@ import (
 )
 
 // BackupCoordinator is the minimal cluster interface the backup handler needs
-// (#1083): which node may run a backup or a restore. nil = standalone mode,
-// no gate. Same shape as DeleteCoordinator and RetentionCoordinator.
+// (#1083, #1134): which node may create, restore or delete a backup.
+// nil = standalone mode, no gate. Same shape as DeleteCoordinator and
+// RetentionCoordinator.
 type BackupCoordinator interface {
 	// IsPrimaryWriter reports whether this node may execute writer-only
 	// mutations. A restore writes data files and (on a cluster) manifest
 	// entries; a backup reads a listing that only the primary writer is
 	// guaranteed to hold in full, and only one node should hold the slot.
+	// Deletion sweeps the configured backup targets of the authoritative node.
 	IsPrimaryWriter() bool
 	// Role returns a human-readable role string for the rejection message.
 	Role() string
@@ -90,7 +92,8 @@ func (h *BackupHandler) SetCoordinator(c BackupCoordinator) {
 // same 503 for the same condition. Standby writers, readers and the compactor
 // are all refused: a backup from a node that is not the primary may lack
 // files the primary holds, and a restore from one would write and register
-// files from a node the cluster does not treat as its writer.
+// files from a node the cluster does not treat as its writer. Deletion must
+// use the authoritative node's configured target set as well (#1134).
 func (h *BackupHandler) rejectUnlessPrimaryWriter(c *fiber.Ctx, operation string) bool {
 	if h.coordinator == nil || h.coordinator.IsPrimaryWriter() {
 		return false
@@ -465,6 +468,10 @@ func (h *BackupHandler) GetBackup(c *fiber.Ctx) error {
 // DeleteBackup removes a backup.
 // DELETE /api/v1/backup/:id
 func (h *BackupHandler) DeleteBackup(c *fiber.Ctx) error {
+	if h.rejectUnlessPrimaryWriter(c, "delete") {
+		return nil
+	}
+
 	id := c.Params("id")
 	if !backup.IsValidBackupID(id) {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
