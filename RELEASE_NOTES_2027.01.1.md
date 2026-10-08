@@ -695,6 +695,72 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Compaction reports how many jobs are in flight ([#1168](https://github.com/Basekick-Labs/arc/issues/1168))
+
+Two endpoints advertised a count of in-flight compaction work and neither ever
+produced one. `GET /api/v1/compaction/status` emitted
+`"manager": {"active_jobs": null}`, and `GET /api/v1/compaction/jobs` answered
+`"active_jobs": 0` **unconditionally** — including in the middle of a cycle
+with work running — because it read a key the manager never set and fell back
+to zero when the read failed. Nothing tracked the number: compaction jobs run
+in a subprocess, and the count was never added when that design landed.
+
+It is tracked now. An attempt registers as in flight once it holds its
+partition lock and deregisters when it returns, so all three surfaces report a
+real number: `/status` (`manager.active_jobs`), `/jobs` (`active_jobs`), and
+`/stats`, which gains the same `active_jobs` key.
+
+**The unit is attempts, not batches.** This is the same unit as the records in
+`/api/v1/compaction/history` and as `total_jobs_completed` / `total_jobs_failed`
+beside it, and `/jobs` now says so explicitly with `"unit": "attempts"`. A
+batch too large to compact in one pass is split by the adaptive splitter and
+retried at successively smaller sizes, so one batch can account for several
+attempts in sequence. If you are reconciling this against a cycle's
+`discovered_batches` or `failed_batches` from `/api/v1/compaction/cycles/{id}`,
+those are batches and will not match attempt counts.
+
+`/jobs` still returns an empty `"jobs"` array. Only the count is tracked, not
+the identity of each in-flight attempt; the array is there for compatibility
+and listing which partitions are being compacted remains future work.
+
+A partition skipped because another attempt already holds its lock does no work
+and does not register as in flight, matching how it is already excluded from
+the `total_jobs_*` totals.
+
+If you use `arcli compaction status`, the `active` column stops showing `-` and
+starts showing the count, with no client upgrade required.
+
+### Compaction requests are audited per method instead of all as triggers ([#1168](https://github.com/Basekick-Labs/arc/issues/1168))
+
+With audit logging enabled, every request under `/api/v1/compaction` was
+recorded with the action `compaction.triggered` regardless of method — so an
+auditor filtering for who triggered a compaction also got everyone who read the
+status page, the candidate list or the cycle history. The sibling prefixes
+already did this correctly (`mqtt.put`, `tiering.put`).
+
+`POST /api/v1/compaction/trigger` keeps the action `compaction.triggered`, so
+existing filters and alerts on the one action that mutates anything are
+unaffected. The seven read routes now carry their own method:
+`compaction.get`, and `compaction.head` for the HEAD requests that Fiber
+registers alongside every GET.
+
+**This is visible at the default configuration.** `audit_log.include_reads`
+(default `false`) suppresses GET requests, but it does not suppress HEAD, so a
+`HEAD` against any compaction read route was already being recorded as
+`compaction.triggered` and will now be recorded as `compaction.head`. With
+`include_reads = true` the seven GET routes change from `compaction.triggered`
+to `compaction.get`. If you have a dashboard or alert that counts
+`compaction.triggered` events, it was over-counting and the number will drop.
+
+The prefix is also matched at a path-segment boundary now, so a request to an
+unrelated path that merely begins with the same characters — `/api/v1/compactionfoo`
+— is no longer recorded as a compaction action. The `mqtt` and `tiering`
+prefixes still match mid-segment; that is unchanged here.
+
+Audit logging remains an enterprise feature: it is mounted only when
+`audit_log.enabled` is true and the license includes `audit_logging`, so
+nothing in this fix is reachable on OSS.
+
 ### The compaction trigger now claims its cycle before it answers
 
 `POST /api/v1/compaction/trigger` decided whether a cycle was already running

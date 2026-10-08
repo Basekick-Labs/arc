@@ -256,8 +256,17 @@ type Manager struct {
 	// Tiers
 	Tiers []Tier
 
-	// Job history (jobs run in subprocess, so no activeJobs tracking)
+	// Job history. Each entry is one ATTEMPT (one subprocess invocation), not
+	// one batch: a batch rescued by the adaptive splitter contributes several.
 	jobHistory []map[string]interface{}
+
+	// activeJobs counts attempts currently in flight -- incremented once
+	// compactPartition holds the partition lock and decremented by its defer,
+	// so it is the same unit as totalJobsCompleted/Failed/Interrupted and as
+	// jobHistory. Two API surfaces advertised this number long before anything
+	// produced it: /status emitted null and /jobs an unconditional 0 (#1168).
+	// Read it through ActiveJobs(), never by asserting a type out of Stats().
+	activeJobs atomic.Int64
 
 	// Cycle management - prevents concurrent compaction cycles.
 	//
@@ -994,6 +1003,14 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 		return nil
 	}
 	defer m.LockManager.ReleaseLock(lockKey)
+
+	// In flight from here, not from function entry: the lock-skip return above
+	// does no work and is excluded from totalJobs* for the same reason. The
+	// window deliberately covers the post-subprocess bookkeeping (receipt
+	// marking, manifest delete, cache invalidation) -- the attempt is not
+	// finished until those are. Deferred, so a panic cannot leak the count.
+	m.activeJobs.Add(1)
+	defer m.activeJobs.Add(-1)
 
 	// Build subprocess config. JobID is generated here (not inside NewJob)
 	// so the parent and subprocess agree on the completion-manifest filename.
@@ -2221,6 +2238,21 @@ func (m *Manager) filterCandidateFilesWithError(ctx context.Context, candidate C
 	return candidate, len(filteredFiles) > 0, nil
 }
 
+// ActiveJobs returns the number of compaction attempts in flight.
+//
+// The unit is attempts, matching total_jobs_* and the /history records: a
+// batch the adaptive splitter rescues is several attempts inside one batch,
+// so this is not a batch count and must not be labelled as one.
+//
+// Typed on purpose. The same number is in Stats() under "active_jobs" for
+// JSON consumers, but reading it from there means asserting a type out of an
+// interface{}, and an assertion that guesses wrong yields a silent zero --
+// which is exactly how /jobs came to report 0 forever (#1168). Callers that
+// need the value use this; the map entry is for marshalling only.
+func (m *Manager) ActiveJobs() int64 {
+	return m.activeJobs.Load()
+}
+
 // Stats returns compaction statistics
 func (m *Manager) Stats() map[string]interface{} {
 	m.mu.Lock()
@@ -2241,6 +2273,7 @@ func (m *Manager) Stats() map[string]interface{} {
 		"total_bytes_saved":       m.totalBytesSaved,
 		"total_bytes_saved_mb":    float64(m.totalBytesSaved) / 1024 / 1024,
 		"total_manifests_recover": m.totalManifestsRecov,
+		"active_jobs":             m.activeJobs.Load(),
 		"cycle_running":           m.cycleRunning.Load(),
 		"current_cycle_id":        m.cycleID.Load(),
 		"exclude_databases":       excluded,

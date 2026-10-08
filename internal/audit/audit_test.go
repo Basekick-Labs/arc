@@ -208,6 +208,24 @@ func TestClassifyEvent(t *testing.T) {
 		{"POST", "/api/v1/import", 200, "data.import"},
 		{"PUT", "/api/v1/mqtt/config", 200, "mqtt.put"},
 		{"POST", "/api/v1/compaction/trigger", 200, "compaction.triggered"},
+		// #1168: every compaction method used to classify as
+		// "compaction.triggered". The seven read routes now carry their own
+		// method, so a status poll is no longer recorded as a trigger. HEAD
+		// matters because Fiber registers it alongside every GET and the
+		// include_reads skip only matches GET -- these are audited at the
+		// default configuration.
+		{"GET", "/api/v1/compaction/status", 200, "compaction.get"},
+		{"GET", "/api/v1/compaction/stats", 200, "compaction.get"},
+		{"GET", "/api/v1/compaction/candidates", 200, "compaction.get"},
+		{"GET", "/api/v1/compaction/jobs", 200, "compaction.get"},
+		{"GET", "/api/v1/compaction/history", 200, "compaction.get"},
+		{"GET", "/api/v1/compaction/cycles", 200, "compaction.get"},
+		{"GET", "/api/v1/compaction/cycles/42", 200, "compaction.get"},
+		{"HEAD", "/api/v1/compaction/status", 200, "compaction.head"},
+		// Matched at a segment boundary: a sibling path that merely starts
+		// with the same letters is not a compaction action.
+		{"GET", "/api/v1/compactionfoo", 404, "api.get"},
+		{"POST", "/api/v1/compactionfoo", 404, "api.post"},
 		{"PUT", "/api/v1/tiering/policy", 200, "tiering.put"},
 		{"GET", "/unknown", 200, "api.get"},
 	}

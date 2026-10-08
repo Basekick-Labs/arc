@@ -172,9 +172,23 @@ func classifyEvent(method, path string, statusCode int) string {
 		return "mqtt." + strings.ToLower(method)
 	}
 
-	// Compaction triggers
-	if strings.HasPrefix(path, "/api/v1/compaction") {
-		return "compaction.triggered"
+	// Compaction. Every method used to classify as "compaction.triggered", so
+	// an auditor filtering for who triggered a compaction also got everyone
+	// who polled the status page -- and with HEAD bypassing the include_reads
+	// skip below, that happened at the default configuration (#1168).
+	//
+	// POST keeps the shipped name: /trigger is the only non-GET compaction
+	// route today and audit consumers filter on "compaction.triggered". A new
+	// POST sibling must be given its own action name rather than inheriting
+	// this one -- inheriting it is the mislabelling this fix removes.
+	//
+	// Matched at a segment boundary, so /api/v1/compactionfoo is not a
+	// compaction action. The sibling prefixes below still match mid-segment.
+	if underPrefix(path, "/api/v1/compaction") {
+		if method == "POST" {
+			return "compaction.triggered"
+		}
+		return "compaction." + strings.ToLower(method)
 	}
 
 	// Tiering
@@ -184,6 +198,14 @@ func classifyEvent(method, path string, statusCode int) string {
 
 	// Default
 	return "api." + strings.ToLower(method)
+}
+
+// underPrefix reports whether path is prefix itself or sits beneath it,
+// matching only at a segment boundary. Plain strings.HasPrefix matches
+// mid-segment, so "/api/v1/compaction" would also claim
+// "/api/v1/compactionfoo" and audit it as a compaction action.
+func underPrefix(path, prefix string) bool {
+	return path == prefix || strings.HasPrefix(path, prefix+"/")
 }
 
 // extractRBACResource extracts the RBAC resource name from a path like /api/v1/rbac/organizations/...
