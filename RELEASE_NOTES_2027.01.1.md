@@ -1142,6 +1142,21 @@ a cleanup panic. Missing field-schema anchors remain errors.
 
 Contributed by [@jallegri](https://github.com/jallegri) in [#1120](https://github.com/Basekick-Labs/arc/pull/1120).
 
+### Behavior change for clustered deployments: backup deletion requires the primary writer ([#1134](https://github.com/Basekick-Labs/arc/issues/1134))
+
+`DELETE /api/v1/backup/:id` now uses the same primary-writer gate as backup
+creation and restore. Previously, a request reaching a reader, standby writer,
+or compactor could delete a backup across that node's configured targets.
+Non-primary nodes now return **503** with `route to the primary writer` before
+accessing backup storage. Direct backup deletion requests, including those from
+`arcli backup delete`, to the primary writer rather than a service address that
+can send them to other nodes.
+
+Eligibility is checked on every request, so promotion and demotion take effect
+without a restart. A deletion already admitted is not cancelled on demotion.
+Standalone and OSS deployments without a cluster coordinator keep their
+existing behavior.
+
 ### Backup and restore are cluster-safe ([#1083](https://github.com/Basekick-Labs/arc/issues/1083))
 
 On a cluster node a backup or a restore was undefined behaviour: any role
