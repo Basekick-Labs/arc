@@ -49,11 +49,28 @@ const (
 // own empty cycles would evict an operator's trigger overnight.
 const CycleHistoryLimit = 500
 
-// cycleFailedSampleLimit bounds the per-cycle sample of failed partitions.
-// The counters say how many batches failed; without the sample an operator has
-// no way to learn which, because job history carries no cycle id and is capped
-// at 10 entries in Stats. Mirrors skipped_sample (#977).
-const cycleFailedSampleLimit = 10
+// cycleFailedPartitionLimit bounds the DISTINCT partitions recorded per cycle.
+//
+// #1162 shipped this as a 10-entry sample, on the assumption that job history
+// could answer the rest once it carried a cycle id. It cannot: every
+// invocation of compactFilesAdaptively writes a job record, and a batch killed
+// for memory splits 30 -> 15 -> 7 -> 3, so ONE failing batch emits four
+// records. The customer case is 80 partitions over ~1,500 batches, so a cycle
+// that fails throughout emits ~6,000 records against a 100-entry job ring --
+// under 2% of the answer. (Even one batch per partition would be ~320, still
+// three times the ring.)
+//
+// This list is the complete answer instead, because it is populated at the
+// outer dispatch level (one call per failed batch, no split-attempt noise) and
+// keyed by partition path, so the many batches of one partition collapse to
+// one entry. The customer case that motivated #1162 is 80 partitions over
+// ~1,500 batches; deduplicated that is 80 entries.
+//
+// 200 distinct partitions is ~16 KB per cycle at typical path lengths. Against
+// CycleHistoryLimit that is a ~8 MB ceiling, reached only if all 500 retained
+// cycles each failed 200+ distinct partitions -- a wholly broken deployment.
+// Typical cost is zero, because a healthy cycle fails nothing.
+const cycleFailedPartitionLimit = 200
 
 // cycleProgress holds a running cycle's live counters. These were locals in
 // runClaimed, which meant a lookup of a running cycle could report its scope
@@ -68,30 +85,44 @@ type cycleProgress struct {
 	interrupted     atomic.Int64
 	discoveryErrors atomic.Int64
 
-	mu           sync.Mutex
-	failedSample []string
+	mu sync.Mutex
+	// failedPartitions maps a partition path to how many of its batches
+	// failed, so one entry covers a partition however many batches it was
+	// split into. failedTruncated records that the distinct-partition cap was
+	// reached, so a consumer never reads a capped list as complete.
+	failedPartitions map[string]int
+	failedTruncated  bool
 }
 
-// recordFailure samples the partition of a failed batch, up to the cap.
+// recordFailure counts a failed batch against its partition. Called once per
+// failed batch from the outer dispatch loop, so the count is in batches while
+// the key space is partitions.
+//
+// A partition already present is always counted, even past the cap: the cap
+// bounds how many DISTINCT partitions are tracked, not how many failures an
+// already-tracked partition may accumulate.
 func (p *cycleProgress) recordFailure(partitionPath string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if len(p.failedSample) >= cycleFailedSampleLimit {
+	if p.failedPartitions == nil {
+		p.failedPartitions = make(map[string]int)
+	}
+	if _, known := p.failedPartitions[partitionPath]; !known && len(p.failedPartitions) >= cycleFailedPartitionLimit {
+		p.failedTruncated = true
 		return
 	}
-	p.failedSample = append(p.failedSample, partitionPath)
+	p.failedPartitions[partitionPath]++
 }
 
-// snapshotFailedSample copies the sample out from under the mutex.
-func (p *cycleProgress) snapshotFailedSample() []string {
+// snapshotFailedPartitions copies the map out from under the mutex, with the
+// flag saying whether the distinct-partition cap dropped anything.
+func (p *cycleProgress) snapshotFailedPartitions() (map[string]int, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if len(p.failedSample) == 0 {
-		return nil
+	if len(p.failedPartitions) == 0 {
+		return nil, p.failedTruncated
 	}
-	out := make([]string, len(p.failedSample))
-	copy(out, p.failedSample)
-	return out
+	return copyCounts(p.failedPartitions), p.failedTruncated
 }
 
 // CycleRecord is the outcome of one compaction cycle. It records only eligible
@@ -126,8 +157,14 @@ type CycleRecord struct {
 
 	// Err is the cycle error, truncated. A discovery-error count with no
 	// reason attached is a dead end for whoever has to act on it.
-	Err          string
-	FailedSample []string
+	Err string
+	// FailedPartitions maps each partition that failed at least one batch to
+	// its failed-batch count. Deduplicated by partition, so this is the list
+	// of partitions to retry, not a sample of failures.
+	FailedPartitions map[string]int
+	// FailedPartitionsTruncated is true when more distinct partitions failed
+	// than cycleFailedPartitionLimit retains.
+	FailedPartitionsTruncated bool
 
 	// progress is non-nil only while the cycle runs, and is read only when
 	// FinishedAt is zero. The finalizer copies the counters into the fields
@@ -157,7 +194,7 @@ func (o CycleRecord) counters() CycleRecord {
 	o.Interrupted = p.interrupted.Load()
 	o.DiscoveryErrors = p.discoveryErrors.Load()
 	o.Unstarted = o.Discovered - o.Started
-	o.FailedSample = p.snapshotFailedSample()
+	o.FailedPartitions, o.FailedPartitionsTruncated = p.snapshotFailedPartitions()
 	return o
 }
 
@@ -174,11 +211,7 @@ func (o CycleRecord) clone() CycleRecord {
 		copy(tiers, o.Tiers)
 		o.Tiers = tiers
 	}
-	if o.FailedSample != nil {
-		fs := make([]string, len(o.FailedSample))
-		copy(fs, o.FailedSample)
-		o.FailedSample = fs
-	}
+	o.FailedPartitions = copyCounts(o.FailedPartitions)
 	return o
 }
 
@@ -470,18 +503,80 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	return m
 }
 
-// appendJobHistory keeps the newest 100 job-stat maps. When trimming is
-// required, copy the retained map references into fresh slice storage so the
-// current history does not keep an older backing array that may retain evicted
-// pointer-containing entries. The maps themselves are intentionally shared.
+// jobAttribution says which cycle dispatched a job and how deep in the
+// adaptive splitter the attempt sits.
+//
+// AttemptDepth matters because job records count ATTEMPTS, not batches: a
+// batch that fails at 30 files and then succeeds as 15+15 writes three
+// records for the same partition path, identical in every other field, and the
+// depth is the only thing that tells them apart.
+//
+// Do NOT read depth-0 failures as the batch failures. recordFailure and
+// failed.Add fire together, and only when compactFilesAdaptively returns an
+// error -- so a batch that fails at depth 0 and is then RESCUED by splitting
+// returns nil, counts as succeeded, and contributes no failed partition, while
+// still leaving a depth-0 success=false record in job history. Depth-0
+// failures therefore exceed failed_batches whenever the splitter rescues
+// anything.
+//
+// The invariant that does hold exactly, and the one to reconcile against:
+//
+//	sum(FailedPartitions values) == Failed    (when not truncated)
+type jobAttribution struct {
+	CycleID      int64
+	AttemptDepth int
+}
+
+// copyCounts copies a partition->count map so a retained one never escapes
+// the lock. One helper rather than three hand-rolled loops, so the "never hand
+// out the retained map" invariant is one line to audit.
+func copyCounts(in map[string]int) map[string]int {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]int, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+// attributeJobToCycle stamps a job record with the cycle that dispatched it.
+//
+// A zero cycle id is omitted entirely rather than recorded as 0: ids start at
+// 1, so a zero would read as a real cycle. Zero means the job ran outside any
+// cycle, which no caller does today -- CompactPartition is exported, and this
+// guard is here so a future direct caller cannot misattribute its jobs.
+//
+// Extracted rather than inlined at the one call site because that call site is
+// inside compactPartition, which runs a real compaction subprocess and cannot
+// be reached from a unit test. Inlined, the guard was unverifiable: a mutation
+// recording cycle_id unconditionally passed the whole suite, because the test
+// fixture seeded history through its own helper and never ran this code.
+func attributeJobToCycle(job map[string]interface{}, attr jobAttribution) {
+	if attr.CycleID > 0 {
+		job["cycle_id"] = attr.CycleID
+	}
+	job["attempt_depth"] = attr.AttemptDepth
+}
+
+// JobHistoryLimit bounds the retained per-job compaction records. Exported so
+// the API can clamp its limit parameter to it.
+const JobHistoryLimit = 100
+
+// appendJobHistory keeps the newest JobHistoryLimit job-stat maps. When
+// trimming is required, copy the retained map references into fresh slice
+// storage so the current history does not keep an older backing array that may
+// retain evicted pointer-containing entries. The maps themselves are
+// intentionally shared.
 func appendJobHistory(history []map[string]interface{}, jobStats map[string]interface{}) []map[string]interface{} {
 	history = append(history, jobStats)
-	if len(history) <= 100 {
+	if len(history) <= JobHistoryLimit {
 		return history
 	}
 
-	retained := make([]map[string]interface{}, 100)
-	copy(retained, history[len(history)-100:])
+	retained := make([]map[string]interface{}, JobHistoryLimit)
+	copy(retained, history[len(history)-JobHistoryLimit:])
 	return retained
 }
 
@@ -872,7 +967,25 @@ func (m *Manager) FindCandidates(ctx context.Context) ([]Candidate, error) {
 // CompactPartition compacts a single partition using subprocess isolation.
 // Running compaction in a subprocess ensures that DuckDB's jemalloc memory
 // is fully released when the subprocess exits, preventing memory retention.
+//
+// Jobs recorded through this exported entry carry no cycle_id: it compacts one
+// partition on its own, outside any cycle. The cycle path goes through
+// compactPartition instead, which attributes the record.
+//
+// The signature is deliberately unchanged. jobAttribution is unexported, so
+// adding it here would have made this method uncallable from outside the
+// package -- and it already has an external caller in
+// cmd/arc/license_compaction_subprocess_test.go.
 func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) error {
+	return m.compactPartition(ctx, candidate, jobAttribution{})
+}
+
+// compactPartition is CompactPartition with job attribution. attr says which
+// cycle dispatched the work and how deep in the adaptive splitter the attempt
+// sits. A zero CycleID means "outside any cycle": the history entry then
+// carries no cycle_id at all, rather than a zero that would read as a real
+// cycle (ids start at 1).
+func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, attr jobAttribution) error {
 	lockKey := filepath.Join(candidate.Database, candidate.PartitionPath)
 
 	// Try to acquire lock
@@ -998,6 +1111,7 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 		"partition_path": candidate.PartitionPath,
 		"tier":           candidate.Tier,
 	}
+	attributeJobToCycle(jobStats, attr)
 
 	if result != nil {
 		jobStats["files_compacted"] = result.FilesCompacted
@@ -1084,7 +1198,7 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 //     - Split files in half
 //     - Recursively compact each half
 //  3. If batch size <= minBatchSize and still failing, give up
-func (m *Manager) compactFilesAdaptively(ctx context.Context, candidate Candidate, files []string, depth int, stderr string) error {
+func (m *Manager) compactFilesAdaptively(ctx context.Context, candidate Candidate, files []string, depth int, stderr string, cycleID int64) error {
 	// Maximum split depth. Each level halves the batch, so the ladder starts at
 	// whatever compaction.max_files_per_batch produced and bottoms out at
 	// MinFilesPerBatch — e.g. at the default 30: 30 → 15 → 7 → 3 → stop.
@@ -1123,7 +1237,7 @@ func (m *Manager) compactFilesAdaptively(ctx context.Context, candidate Candidat
 	}
 
 	// Attempt compaction
-	err := m.CompactPartition(ctx, batchCandidate)
+	err := m.compactPartition(ctx, batchCandidate, jobAttribution{CycleID: cycleID, AttemptDepth: depth})
 	if err == nil {
 		// Success!
 		if depth > 0 {
@@ -1192,12 +1306,12 @@ func (m *Manager) compactFilesAdaptively(ctx context.Context, candidate Candidat
 		Msg("Splitting batch after recoverable failure")
 
 	// Try first half
-	if err := m.compactFilesAdaptively(ctx, candidate, firstHalf, depth+1, errStderr); err != nil {
+	if err := m.compactFilesAdaptively(ctx, candidate, firstHalf, depth+1, errStderr, cycleID); err != nil {
 		return fmt.Errorf("first half failed: %w", err)
 	}
 
 	// Try second half
-	if err := m.compactFilesAdaptively(ctx, candidate, secondHalf, depth+1, errStderr); err != nil {
+	if err := m.compactFilesAdaptively(ctx, candidate, secondHalf, depth+1, errStderr, cycleID); err != nil {
 		return fmt.Errorf("second half failed: %w", err)
 	}
 
@@ -1455,8 +1569,8 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 			Failed:          failed.Load(),
 			Interrupted:     interrupted.Load(),
 			DiscoveryErrors: discoveryErrors.Load(),
-			FailedSample:    progress.snapshotFailedSample(),
 		}
+		outcome.FailedPartitions, outcome.FailedPartitionsTruncated = progress.snapshotFailedPartitions()
 		outcome.Unstarted = outcome.Discovered - outcome.Started
 		if runErr != nil {
 			outcome.Err = truncateCycleError(runErr.Error())
@@ -1831,7 +1945,7 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 							if m.compactBatchForTest != nil {
 								err = m.compactBatchForTest(ctx, batch)
 							} else {
-								err = m.compactFilesAdaptively(ctx, batch, batch.Files, 0, "")
+								err = m.compactFilesAdaptively(ctx, batch, batch.Files, 0, "", cycleID)
 							}
 
 							if err != nil {
@@ -2144,12 +2258,19 @@ func (m *Manager) Stats() map[string]interface{} {
 		},
 	}
 
-	// Add recent jobs (last 10)
+	// Add recent jobs (last 10). Copied into fresh storage rather than handed
+	// out as a slice of the live ring: the maps are shared by reference either
+	// way, but a caller holding a slice of m.jobHistory's backing array reads
+	// it with no lock, which is one in-place mutation away from a real race.
+	// The 10 here is the /status and dashboard view; GET /compaction/history
+	// serves up to JobHistoryLimit through JobHistory.
 	recentJobs := m.jobHistory
 	if len(recentJobs) > 10 {
 		recentJobs = recentJobs[len(recentJobs)-10:]
 	}
-	stats["recent_jobs"] = recentJobs
+	recentCopy := make([]map[string]interface{}, len(recentJobs))
+	copy(recentCopy, recentJobs)
+	stats["recent_jobs"] = recentCopy
 
 	// Add tier stats
 	if len(m.Tiers) > 0 {
@@ -2425,4 +2546,165 @@ func (m *Manager) CycleLookup(id int64) (rec CycleRecord, found bool, oldest int
 		}
 	}
 	return CycleRecord{}, false, oldest, newest, hasRange
+}
+
+// JobHistoryPage is a consistent view of retained job records: the page, how
+// much matched, and -- when filtered to a cycle -- that cycle's authoritative
+// counters. Assembled under ONE lock acquisition, following the precedent
+// CycleHistoryPage set, so no field can disagree with another. Both rings are
+// guarded by the same mutex, so the cross-check costs nothing extra.
+type JobHistoryPage struct {
+	Jobs    []map[string]interface{}
+	Matched int
+	// Retained is how many job records exist at all. Matched == Retained means
+	// the filter matched everything retained, which for a cycle filter is a
+	// warning: earlier records of that cycle may have been evicted.
+	Retained int
+	RingFull bool
+	// Truncated means "there is more than this page shows", and is decided
+	// here rather than by the caller because only this layer can be tested
+	// against a full ring: nothing outside this package can seed job history,
+	// so a handler-side computation was unverifiable -- a mutation dropping
+	// the eviction half of it passed the whole suite.
+	//
+	// It is NOT simply Matched > len(Jobs). Matched is counted over the ring,
+	// so once the ring is full it is a floor rather than a total: for a
+	// cycle-filtered read, earlier attempts of that cycle may already have
+	// been evicted, and reporting only the page comparison would answer "you
+	// have everything" at exactly that moment.
+	Truncated bool
+	// MayHaveEvicted is the hedged half of Truncated: the ring is full and the
+	// filtered cycle's earliest records may already be gone.
+	MayHaveEvicted     bool
+	TotalJobsCompleted int
+
+	// Cycle cross-check, populated when a cycle filter was applied. The job
+	// ring holds attempts and can be evicted; the cycle record holds the
+	// authoritative outer-level counts and is retained far longer, so it is
+	// the ground truth a page should be compared against.
+	CycleFound                  bool
+	CycleStatus                 string
+	CycleFailedBatches          int64
+	CycleStartedBatches         int64
+	CycleFailedPartitions       map[string]int
+	CycleFailedPartitionsCapped bool
+	OldestRetainedCycle         int64
+	NewestRetainedCycle         int64
+	HasCycleRange               bool
+}
+
+// JobHistory returns retained compaction job records, oldest first within the
+// window, limited to the newest limit entries.
+//
+// cycleID filters to one cycle's jobs; 0 returns every retained job. A limit
+// below 1 is clamped to 1 rather than returning nothing, so Matched always
+// reports the true match count -- a zero Matched must mean "nothing matched",
+// never "you asked wrong".
+//
+// Each record is copied, so the retained ring never escapes the lock. The
+// values are scalars, so a per-map shallow copy is a complete copy.
+// The return is NAMED because the truncation decision is made in a defer:
+// with an unnamed return, `return page` copies the value before the defer runs
+// and the flag is silently dropped.
+func (m *Manager) JobHistory(limit int, cycleID int64) (page JobHistoryPage) {
+	if limit < 1 {
+		limit = 1
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	page = JobHistoryPage{
+		Retained:           len(m.jobHistory),
+		RingFull:           len(m.jobHistory) >= JobHistoryLimit,
+		TotalJobsCompleted: m.totalJobsCompleted,
+	}
+
+	// Oldest retained job record that carries a cycle id. Records are appended
+	// in cycle order, so the first one that has an id has the smallest.
+	var oldestJobCycleID int64
+	for _, job := range m.jobHistory {
+		if id, ok := job["cycle_id"].(int64); ok {
+			oldestJobCycleID = id
+			break
+		}
+	}
+
+	matches := func(job map[string]interface{}) bool {
+		if cycleID <= 0 {
+			return true
+		}
+		id, ok := job["cycle_id"].(int64)
+		return ok && id == cycleID
+	}
+
+	for _, job := range m.jobHistory {
+		if matches(job) {
+			page.Matched++
+		}
+	}
+
+	if cycleID > 0 {
+		if len(m.cycleHistory) > 0 {
+			page.OldestRetainedCycle = m.cycleHistory[0].CycleID
+			page.NewestRetainedCycle = m.cycleHistory[len(m.cycleHistory)-1].CycleID
+			page.HasCycleRange = true
+		}
+		for i := len(m.cycleHistory) - 1; i >= 0; i-- {
+			if m.cycleHistory[i].CycleID != cycleID {
+				continue
+			}
+			rec := m.cycleHistory[i].counters()
+			page.CycleFound = true
+			page.CycleStatus = rec.Status
+			page.CycleFailedBatches = rec.Failed
+			page.CycleStartedBatches = rec.Started
+			page.CycleFailedPartitionsCapped = rec.FailedPartitionsTruncated
+			page.CycleFailedPartitions = copyCounts(rec.FailedPartitions)
+			break
+		}
+	}
+
+	// Decided before the early return so an evicted, fully-matched page is
+	// still flagged.
+	//
+	// The eviction term is NOT simply "the ring is full". A busy node's ring is
+	// permanently full, so that would make this flag constant-true for every
+	// cycle-filtered read and therefore carry no information at all. Cycles are
+	// strictly serialized (cycleRunning CAS) with monotonically increasing ids,
+	// so one cycle's records are contiguous in the ring and the oldest retained
+	// cycle id decides it: strictly older than the filter means nothing of the
+	// filtered cycle was evicted.
+	defer func() {
+		evicted := page.RingFull && cycleID > 0 && oldestJobCycleID > 0 && oldestJobCycleID >= cycleID
+		page.Truncated = page.Matched > len(page.Jobs) || evicted
+		page.MayHaveEvicted = evicted
+	}()
+
+	if page.Matched == 0 {
+		return page
+	}
+
+	// Walk forward so the result stays chronological -- the order this history
+	// has always been served in -- skipping all but the newest `limit`.
+	skip := page.Matched - limit
+	if skip < 0 {
+		skip = 0
+	}
+	page.Jobs = make([]map[string]interface{}, 0, page.Matched-skip)
+	for _, job := range m.jobHistory {
+		if !matches(job) {
+			continue
+		}
+		if skip > 0 {
+			skip--
+			continue
+		}
+		copied := make(map[string]interface{}, len(job))
+		for k, v := range job {
+			copied[k] = v
+		}
+		page.Jobs = append(page.Jobs, copied)
+	}
+	return page
 }

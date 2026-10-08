@@ -87,11 +87,69 @@ cycle from another. Each one reports the **scope** it was asked for
 compaction one database at a time, this is what separates your trigger's cycle
 from the hourly scheduler's cycle that fired in between.
 
-Failures name themselves. Alongside `failed_batches` a record carries
-`failed_sample` — up to ten partition paths that failed — and `error`, the
-cycle's error text. Previously a failure count was a dead end: job history
-carries no cycle id and is capped at ten entries, so there was no way to get
-from "two batches failed" to which two partitions to retry.
+Failures name themselves, completely. Alongside `failed_batches` a record
+carries `failed_partitions` — an object mapping each partition that failed to
+how many of its batches failed — plus `failed_partition_count` and `error`.
+Previously a failure count was a dead end: there was no way to get from "forty
+batches failed" to which partitions to retry.
+
+The list is deduplicated by partition, which is what makes it the retry list
+rather than a sample. A partition split into nineteen batches that all fail is
+one entry with a count of nineteen, so a cycle over eighty partitions and
+fifteen hundred batches yields eighty entries. Up to **200 distinct
+partitions** are recorded per cycle; past that the record carries
+`failed_partitions_truncated: true` so a capped list is never read as
+complete.
+
+**`GET /api/v1/compaction/history` gains cycle attribution and a working
+`limit`.** Each job record now carries `cycle_id` and `attempt_depth`, and the
+endpoint takes `?cycle_id=N` to show only one cycle's work.
+
+Two things to know about reading it. First, `?limit=N` previously returned at
+most ten records whatever you asked for — `recent_jobs` was truncated to ten
+before the limit was applied — so this is a bug fix, and the parameter now
+works up to the 100 records retained. (`scripts/range_schema_acceptance.py`
+has been requesting `limit=50` and passing only because its target happened to
+land in the last ten.) Second, **these records count attempts, not batches**:
+the adaptive splitter retries a failed batch at half size, and every attempt
+writes its own record with the same `partition_path`. `attempt_depth` tells
+them apart. Do **not** read depth-0 failures as the batch failures: a batch
+that fails at depth 0 and is then rescued by splitting counts as *succeeded*
+and contributes no failed partition, while still leaving a depth-0
+`success: false` record here. The response says `"unit": "attempts"` to make
+that hard to misread, and the rule that does hold exactly is
+`sum(failed_partitions) == failed_batches` on the cycle record, when not
+truncated.
+
+Because attempts multiply, one cycle can emit several hundred records against
+a hundred-record ring. The response is explicit about it rather than quietly
+partial: `matched` is how many retained records matched before `limit` was
+applied — counted over the ring, so on a full ring it is a floor rather than a
+total — `page_size` what you got, and `truncated` whether anything is missing.
+For a **cycle-filtered** read, `truncated` also accounts for eviction, with
+`may_have_evicted_earlier_attempts` saying so; that only fires when the ring is
+full *and* the filtered cycle is old enough to have lost records, so it stays
+informative on a busy node instead of being permanently true. An unfiltered
+read makes no completeness claim — compare `retained` with `capacity` for
+that. A cycle-filtered
+response also carries that cycle's authoritative outer-level counters
+(`cycle_failed_batches`, `cycle_started_batches`, `cycle_failed_partitions`),
+which are retained far longer than the job ring and are the numbers to trust.
+**For "which partitions do I retry", read `failed_partitions` on the cycle
+record** — job history is the attempt-level detail beneath it.
+
+`GET /api/v1/compaction/cycles` (the list) carries `failed_partition_count` but
+not the full map: 500 retained cycles of 200 partitions each would be a
+multi-megabyte response. Fetch the map from `/cycles/{id}` or
+`/history?cycle_id=`.
+
+One smaller shape change: `recent_jobs` in `/api/v1/compaction/stats` was
+`null` on a node that had compacted nothing and is now `[]`.
+
+If the cycle you ask about is no longer retained, the response says
+`cycle_retained: false` with the retained id range, because an empty result
+otherwise reads as "this cycle failed nothing" — the most expensive wrong
+answer the endpoint could give.
 
 A cycle that is still running is visible too, as `status: "running"` with live
 counters and no `finished_at`, so you can watch a long cycle progress rather

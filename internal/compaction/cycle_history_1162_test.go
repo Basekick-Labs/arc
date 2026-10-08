@@ -365,10 +365,10 @@ func TestRunningCycleDoesNotLeakIntoLastCycleIssue1162(t *testing.T) {
 	<-second
 }
 
-// TestCycleRecordSamplesFailedPartitionsIssue1162 covers the follow-up question
-// after failed_batches: WHICH partitions. Job history carries no cycle id and
-// Stats caps it at 10 entries, so the sample is the only answer.
-func TestCycleRecordSamplesFailedPartitionsIssue1162(t *testing.T) {
+// TestCycleRecordNamesFailedPartitionsIssue1162 covers the follow-up question
+// after failed_batches: WHICH partitions. Deduplicated by partition, so this
+// is the retry list; job history is the attempt-level detail beneath it.
+func TestCycleRecordNamesFailedPartitionsIssue1162(t *testing.T) {
 	manager := historyRig(t, func(context.Context, Candidate) error {
 		return errors.New("compaction exploded")
 	})
@@ -388,8 +388,14 @@ func TestCycleRecordSamplesFailedPartitionsIssue1162(t *testing.T) {
 	if rec.Failed != 1 {
 		t.Errorf("failed_batches = %d, want 1", rec.Failed)
 	}
-	if len(rec.FailedSample) != 1 || rec.FailedSample[0] != "db1/cpu/2026/10/08/09" {
-		t.Errorf("failed_sample = %v, want the failing partition path", rec.FailedSample)
+	if got := rec.FailedPartitions["db1/cpu/2026/10/08/09"]; got != 1 {
+		t.Errorf("failed_partitions[the failing partition] = %d, want 1; map = %v", got, rec.FailedPartitions)
+	}
+	if len(rec.FailedPartitions) != 1 {
+		t.Errorf("failed_partitions holds %d partitions, want 1: %v", len(rec.FailedPartitions), rec.FailedPartitions)
+	}
+	if rec.FailedPartitionsTruncated {
+		t.Error("failed_partitions reported truncated with one partition")
 	}
 	if rec.Err == "" {
 		t.Error("cycle error not retained; a failure count with no reason is a dead end")
@@ -488,10 +494,10 @@ func TestCycleLookupIsRaceFreeIssue1162(t *testing.T) {
 	const candidates = 60
 
 	manager := historyRig(t, func(context.Context, Candidate) error {
-		// Widen the window deliberately: the first cycleFailedSampleLimit
-		// failures are the only ones that WRITE failedSample, and without a
-		// pause they all land within microseconds of each other and the
-		// readers can miss them entirely.
+		// Widen the window deliberately: without a pause every failure lands
+		// within microseconds of the others and the readers can miss the
+		// writes entirely. All 60 write, since 60 is well under the
+		// distinct-partition cap.
 		time.Sleep(time.Millisecond)
 		return errors.New("deliberate failure")
 	})
@@ -551,9 +557,24 @@ func TestCycleLookupIsRaceFreeIssue1162(t *testing.T) {
 	if rec.Failed != candidates {
 		t.Errorf("failed_batches = %d, want %d", rec.Failed, candidates)
 	}
-	if len(rec.FailedSample) != cycleFailedSampleLimit {
-		t.Fatalf("failed_sample holds %d entries, want the cap of %d -- recordFailure did not race the readers",
-			len(rec.FailedSample), cycleFailedSampleLimit)
+	// Precondition: recordFailure genuinely ran for every distinct partition.
+	// 60 candidates are 60 distinct paths, well under the cap, so a complete
+	// map is the expected result and a short one means the readers raced
+	// nothing.
+	if len(rec.FailedPartitions) != candidates {
+		t.Fatalf("failed_partitions holds %d partitions, want all %d -- recordFailure did not race the readers",
+			len(rec.FailedPartitions), candidates)
+	}
+	if rec.FailedPartitionsTruncated {
+		t.Errorf("reported truncated at %d distinct partitions, under the cap of %d", len(rec.FailedPartitions), cycleFailedPartitionLimit)
+	}
+	// The exact reconciliation rule, pinned on a real cycle.
+	sum := 0
+	for _, n := range rec.FailedPartitions {
+		sum += n
+	}
+	if int64(sum) != rec.Failed {
+		t.Errorf("sum(failed_partitions) = %d, want failed_batches = %d", sum, rec.Failed)
 	}
 	if rec.Unstarted < 0 {
 		t.Errorf("unstarted_batches = %d, must never be negative", rec.Unstarted)

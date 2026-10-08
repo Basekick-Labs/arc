@@ -475,24 +475,94 @@ func (h *CompactionHandler) getHistory(c *fiber.Ctx) error {
 	if err != nil || limit < 1 {
 		limit = 10
 	}
+	if limit > compaction.JobHistoryLimit {
+		limit = compaction.JobHistoryLimit
+	}
 
-	stats := h.manager.Stats()
-	recentJobs := []interface{}{}
-	if jobs, ok := stats["recent_jobs"].([]map[string]interface{}); ok {
-		// Return at most 'limit' jobs
-		startIdx := 0
-		if len(jobs) > limit {
-			startIdx = len(jobs) - limit
-		}
-		for _, job := range jobs[startIdx:] {
-			recentJobs = append(recentJobs, job)
+	// Optional filter to one compaction cycle, so the cycle_id a trigger
+	// returned can be resolved down to the individual partitions it touched.
+	// Rejected rather than treated as "no filter" when invalid: ids start at 1,
+	// so a 0 is a bad request, and silently returning every job for a
+	// malformed id would read as "this cycle touched everything".
+	var cycleID int64
+	// An ABSENT or empty cycle_id means no filter; a present-but-invalid one is
+	// rejected. The empty string is treated as absent deliberately, because
+	// that is what a client building a query string from an unset variable
+	// sends, and refusing it would turn a missing filter into an error.
+	if raw := c.Query("cycle_id"); raw != "" {
+		cycleID, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil || cycleID < 1 {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "cycle_id must be a positive integer",
+			})
 		}
 	}
 
-	return c.JSON(fiber.Map{
-		"total_jobs":  stats["total_jobs_completed"],
+	// One acquisition: the page, the match count and the cycle cross-check all
+	// come from the same snapshot, so no two fields in this response can
+	// disagree. Also avoids building the whole Stats map to read one counter.
+	page := h.manager.JobHistory(limit, cycleID)
+	recentJobs := make([]interface{}, 0, len(page.Jobs))
+	for _, job := range page.Jobs {
+		recentJobs = append(recentJobs, job)
+	}
+
+	// Job records count ATTEMPTS, not batches: the adaptive splitter retries a
+	// failed batch at half size, and every attempt writes its own record with
+	// the same partition_path, distinguished only by attempt_depth.
+	//
+	// Depth-0 failures are NOT the batch failures: a batch that fails at depth
+	// 0 and is rescued by splitting counts as succeeded and contributes no
+	// failed partition, yet still leaves a depth-0 success=false record here.
+	// To reconcile, use the cycle record: sum(failed_partitions) ==
+	// failed_batches when not truncated.
+	resp := fiber.Map{
+		"total_jobs":  page.TotalJobsCompleted,
 		"recent_jobs": recentJobs,
-	})
+		"matched":     page.Matched,
+		"page_size":   len(recentJobs),
+		"retained":    page.Retained,
+		"capacity":    compaction.JobHistoryLimit,
+		"unit":        "attempts",
+	}
+
+	// Decided by the manager, which is the only layer a test can drive against
+	// a full ring. See JobHistoryPage.Truncated for why it is not simply
+	// matched > page_size.
+	resp["truncated"] = page.Truncated
+	if page.MayHaveEvicted {
+		resp["may_have_evicted_earlier_attempts"] = true
+	}
+
+	if cycleID > 0 {
+		resp["cycle_id"] = cycleID
+		if page.CycleFound {
+			// Ground truth. The cycle record is retained far longer than the
+			// job ring and counts outer-level batches, so these are the
+			// numbers to trust and to compare the page against.
+			resp["cycle_status"] = page.CycleStatus
+			resp["cycle_failed_batches"] = page.CycleFailedBatches
+			resp["cycle_started_batches"] = page.CycleStartedBatches
+			if len(page.CycleFailedPartitions) > 0 {
+				resp["cycle_failed_partitions"] = page.CycleFailedPartitions
+				resp["cycle_failed_partition_count"] = len(page.CycleFailedPartitions)
+			}
+			if page.CycleFailedPartitionsCapped {
+				resp["cycle_failed_partitions_truncated"] = true
+			}
+		} else {
+			// Without this, zero rows for an aged-out cycle is identical to
+			// zero rows for a cycle that failed nothing -- the most expensive
+			// wrong answer this endpoint can give.
+			resp["cycle_retained"] = false
+			if page.HasCycleRange {
+				resp["oldest_retained_cycle"] = page.OldestRetainedCycle
+				resp["newest_retained_cycle"] = page.NewestRetainedCycle
+			}
+			resp["message"] = "this node retains no record of that compaction cycle, so an empty result here does not mean the cycle failed nothing. Cycle ids restart at 1 when the process restarts, and cycles run on the node holding the compactor lease."
+		}
+	}
+	return c.JSON(resp)
 }
 
 // cycleResponse renders a retained cycle. Built as a fiber.Map rather than a
@@ -506,6 +576,18 @@ func (h *CompactionHandler) getHistory(c *fiber.Ctx) error {
 // Stats(), which coerces a nil slice to []: here [] would be ambiguous with
 // "no databases", so null carries the meaning.
 func cycleResponse(rec compaction.CycleRecord) fiber.Map {
+	return cycleResponseWithPartitions(rec, true)
+}
+
+// cycleResponseWithPartitions renders a cycle, optionally omitting the full
+// failed-partition map.
+//
+// The list route omits it: 500 retained cycles x 200 partitions is ~100,000
+// entries in one Fiber-buffered response, several megabytes, where the old
+// 10-path sample was a few hundred kilobytes. The count and the truncation
+// flag still ride along, and the full map is one request away on
+// /cycles/{id} or /history?cycle_id=.
+func cycleResponseWithPartitions(rec compaction.CycleRecord, includePartitions bool) fiber.Map {
 	startedAt := rec.StartedAt.UTC().Truncate(time.Second)
 	out := fiber.Map{
 		"cycle_id":            rec.CycleID,
@@ -540,11 +622,19 @@ func cycleResponse(rec compaction.CycleRecord) fiber.Map {
 	if rec.Err != "" {
 		out["error"] = rec.Err
 	}
-	if len(rec.FailedSample) > 0 {
-		// Which partitions failed, not just how many. Job history carries no
-		// cycle id and Stats caps it at 10 entries, so without this an
-		// operator reading failed_batches has nowhere to go next.
-		out["failed_sample"] = rec.FailedSample
+	if len(rec.FailedPartitions) > 0 && includePartitions {
+		// WHICH partitions failed, deduplicated, so this is the retry list
+		// rather than a sample. Keyed by partition path with the number of its
+		// batches that failed, so one entry covers a partition however many
+		// batches it was split into.
+		out["failed_partitions"] = rec.FailedPartitions
+	}
+	if n := len(rec.FailedPartitions); n > 0 {
+		out["failed_partition_count"] = n
+	}
+	if rec.FailedPartitionsTruncated {
+		// Never let a capped list read as complete.
+		out["failed_partitions_truncated"] = true
 	}
 	return out
 }
@@ -652,7 +742,7 @@ func (h *CompactionHandler) listCycles(c *fiber.Ctx) error {
 	page := h.manager.CyclePage(limit)
 	cycles := make([]fiber.Map, 0, len(page.Cycles))
 	for _, rec := range page.Cycles {
-		cycles = append(cycles, cycleResponse(rec))
+		cycles = append(cycles, cycleResponseWithPartitions(rec, false))
 	}
 
 	resp := fiber.Map{
