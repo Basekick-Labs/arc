@@ -330,32 +330,64 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 	if dbParam != "" {
 		logEvent = logEvent.Str("database", dbParam)
 	}
-	logEvent.Msg("Manual compaction triggered via API")
-
-	// Check if a cycle is already running
-	if h.manager.IsCycleRunning() {
+	// Claim the cycle synchronously (#1153). Before this the handler read
+	// IsCycleRunning() here and left the real claim -- the CompareAndSwap --
+	// to the goroutine below, so two triggers could both pass the read and
+	// both be answered 200 while only one cycle ran. That is not a narrow
+	// race: the goroutine is scheduled lazily, so measured against 32
+	// concurrent triggers, a substantial fraction were falsely accepted (3 to
+	// 16 across runs and machines). The loser's caller had already been handed
+	// an id belonging to the winner.
+	//
+	// Claiming here also makes the reported id real rather than a prediction,
+	// which is what an operator needs: /compaction/stats carries a single
+	// global last_cycle, so matching on cycle_id is the only way to tell
+	// whose result is whose.
+	claim, err := h.manager.ClaimCycle()
+	if err != nil {
+		// RunningCycleID rather than GetCurrentCycleID: it takes the same
+		// mutex as the claim, so it cannot report the previous, finished
+		// cycle's id in the instant between a claim and its id assignment.
+		// arcli prints this number verbatim as "cycle N", so a wrong or
+		// zero id is what the operator sees.
+		running := h.manager.RunningCycleID()
+		h.logger.Info().
+			Int64("cycle_id", running).
+			Strs("tiers", tierNames).
+			Msg("Manual compaction trigger refused: a cycle is already running")
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
 			"error":      "Compaction cycle already running",
 			"message":    "A compaction cycle is already in progress. Please wait for it to complete.",
-			"cycle_id":   h.manager.GetCurrentCycleID(),
+			"cycle_id":   running,
 			"is_running": true,
 		})
 	}
 
+	// Logged only once the claim is held, so a refused trigger is never
+	// recorded as accepted -- the same ordering the lease gate and the pause
+	// check already follow. Nothing between the claim and the goroutine can
+	// return: an unreleased claim would leave cycleRunning true and stop
+	// compaction on this node until a restart.
+	logEvent.Int64("cycle_id", claim.ID).Msg("Manual compaction triggered via API")
+
 	// Trigger compaction asynchronously
 	go func() {
+		// First statement: the claim must be released on every exit from
+		// this goroutine, including a panic unwind.
+		defer claim.Release()
+
 		ctx, cancel := context.WithTimeout(context.Background(), h.manager.CycleTimeout)
 		defer cancel()
 
 		start := time.Now()
-		var cycleID int64
+		cycleID := claim.ID
 		var err error
 		if measurementParam != "" {
-			cycleID, err = h.manager.RunCompactionCycleForMeasurement(ctx, dbParam, measurementParam, tierNames)
+			err = h.manager.RunClaimedCycleForMeasurement(ctx, claim, dbParam, measurementParam, tierNames)
 		} else if dbParam != "" {
-			cycleID, err = h.manager.RunCompactionCycleForDatabase(ctx, dbParam, tierNames)
+			err = h.manager.RunClaimedCycleForDatabase(ctx, claim, dbParam, tierNames)
 		} else {
-			cycleID, err = h.manager.RunCompactionCycleForTiers(ctx, tierNames)
+			err = h.manager.RunClaimedCycleForTiers(ctx, claim, tierNames)
 		}
 		duration := time.Since(start)
 
@@ -383,7 +415,7 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 		"message":  "Compaction triggered",
 		"status":   "running",
 		"tiers":    tierNames,
-		"cycle_id": h.manager.GetCurrentCycleID() + 1, // Next cycle ID that will be assigned
+		"cycle_id": claim.ID, // the id this cycle claimed, not a prediction
 	}
 	if dbParam != "" {
 		resp["database"] = dbParam
