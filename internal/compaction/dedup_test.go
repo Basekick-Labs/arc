@@ -26,6 +26,13 @@ func TestBuildCompactionQuery_NoDedup(t *testing.T) {
 	}
 }
 
+func TestBuildCompactionQueryDisablesHivePartitioning(t *testing.T) {
+	query := buildCompactionSQL("['a.parquet', 'b.parquet']", `ORDER BY "time"`, "/tmp/out.parquet", []string{"host"}, false)
+	if strings.Count(query, "read_parquet") != strings.Count(query, "hive_partitioning=false") {
+		t.Fatalf("every read_parquet call must disable Hive partition inference, got:\n%s", query)
+	}
+}
+
 func TestBuildCompactionQuery_WithDedup(t *testing.T) {
 	query := buildCompactionSQL(
 		"['a.parquet', 'b.parquet']",

@@ -32,6 +32,10 @@ type MigratorConfig struct {
 	Logger        zerolog.Logger
 }
 
+func isDailyCompactedPath(path string) bool {
+	return strings.HasSuffix(storage.StripRewriteSuffix(path), "_daily.parquet")
+}
+
 // ErrCandidateQuarantined is returned by MigrateFile when the candidate's
 // storage key turned out to be permanently unusable and the file index row
 // was marked so it is never selected again (#758). It wraps the backend's
@@ -143,8 +147,9 @@ func (m *Migrator) FindCandidates(ctx context.Context, fromTier, toTier Tier) ([
 			continue
 		}
 
-		// Only migrate daily-compacted files to cold tier
-		if !strings.HasSuffix(file.Path, "_daily.parquet") {
+		// Only migrate daily-compacted files to cold tier. Immutable DELETE
+		// rewrites retain the logical suffix after normalization.
+		if !isDailyCompactedPath(file.Path) {
 			continue
 		}
 

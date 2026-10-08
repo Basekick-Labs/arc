@@ -85,6 +85,13 @@ func TestClassifySubprocessError(t *testing.T) {
 			wantReason:      "permanent_error",
 		},
 		{
+			name:            "missing glob input - not recoverable",
+			err:             errors.New("failed to execute compaction query: IO Error: No files found that match the pattern"),
+			stderr:          "",
+			wantRecoverable: false,
+			wantReason:      "permanent_error",
+		},
+		{
 			name:            "unknown error - default recoverable",
 			err:             errors.New("some unknown error occurred"),
 			stderr:          "some log output",

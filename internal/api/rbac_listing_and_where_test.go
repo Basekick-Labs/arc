@@ -366,7 +366,7 @@ func TestOperatorListings_RequireAdmin(t *testing.T) {
 
 	app := fiber.New()
 	app.Use(auth.NewMiddleware(auth.MiddlewareConfig{AuthManager: am}))
-	NewCompactionHandler(nil, nil, nil, am, zerolog.Nop()).RegisterRoutes(app)
+	NewCompactionHandler(nil, nil, nil, am, nil, zerolog.Nop()).RegisterRoutes(app)
 
 	readTok := mustCreateToken(t, am, "reader-ops", "read")
 	adminTok := mustCreateToken(t, am, "admin-ops", "read,write,delete,admin")

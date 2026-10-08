@@ -474,6 +474,16 @@ var sqlErrorMarkers = []string{"binder error", "catalog error", "parser error"}
 // is exactly the right response.
 var memoryErrorMarkers = []string{"out of memory", "cannot allocate", "memory allocation failed"}
 
+// permanentErrorMarkers are failures no retry can fix: the input is gone or
+// unreadable. Both streams are searched for each one - see ClassifySubprocessError.
+var permanentErrorMarkers = []string{
+	"no files found that match",
+	"permission denied",
+	"no such file",
+	"access denied",
+	"not found",
+}
+
 // ClassifySubprocessError determines if a subprocess error is recoverable via retry.
 // Returns (recoverable, reason) where reason describes the error type.
 //
@@ -544,12 +554,17 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 		}
 	}
 
-	// Non-recoverable errors - don't waste time retrying
-	if strings.Contains(stderrLower, "permission denied") ||
-		strings.Contains(stderrLower, "no such file") ||
-		strings.Contains(stderrLower, "access denied") ||
-		strings.Contains(stderrLower, "not found") {
-		return false, "permanent_error"
+	// Non-recoverable errors - don't waste time retrying. Checked against BOTH
+	// streams, like memoryErrorMarkers above: a subprocess reports a missing
+	// input through stderr, but the parent's own wrapped error carries it in
+	// err, and a marker tested against only one stream leaves the other
+	// classified "unknown" and spending the full retry budget on a failure that
+	// cannot succeed (#969 - an input deleted mid-job cost ~15 subprocess
+	// launches before this was symmetric).
+	for _, marker := range permanentErrorMarkers {
+		if strings.Contains(errLower, marker) || strings.Contains(stderrLower, marker) {
+			return false, "permanent_error"
+		}
 	}
 
 	// Default: treat unknown errors as potentially recoverable once
