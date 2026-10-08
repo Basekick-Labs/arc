@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 
 	_ "github.com/duckdb/duckdb-go/v2" // duckdb driver
@@ -24,6 +26,150 @@ func writeFixtureParquet(t *testing.T, ctx context.Context, db *sql.DB, path, se
 	q := fmt.Sprintf(`COPY (SELECT %s) TO '%s' (FORMAT PARQUET)`, selectList, escapeSQLPath(filepath.ToSlash(path)))
 	if _, err := db.ExecContext(ctx, q); err != nil {
 		t.Fatalf("write fixture %s: %v", path, err)
+	}
+}
+
+type deleteInputAtLogHook struct {
+	trigger string
+	path    string
+	once    sync.Once
+	err     error
+}
+
+func (h *deleteInputAtLogHook) Run(_ *zerolog.Event, _ zerolog.Level, message string) {
+	if message == h.trigger {
+		h.once.Do(func() { h.err = os.Remove(h.path) })
+	}
+}
+
+func TestJobRunInputDeletedBeforeValidationIsSkipped(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	baseDir := t.TempDir()
+	backend, err := storage.NewLocalBackend(baseDir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	const partition = "testdb/cpu/2026/04/11/14"
+	keys := []string{partition + "/a.parquet", partition + "/b.parquet"}
+	for i, key := range keys {
+		fixture := filepath.Join(t.TempDir(), fmt.Sprintf("input-%d.parquet", i))
+		writeFixtureParquet(t, ctx, db, fixture, fmt.Sprintf("TIMESTAMPTZ '2026-04-11 14:00:0%dZ' AS time, 'h%d' AS host, %d.0 AS value", i, i, i+1))
+		data, err := os.ReadFile(fixture)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := backend.Write(ctx, key, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	deletedPath, err := storage.ObjectURI(backend, keys[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	hook := &deleteInputAtLogHook{trigger: "Downloaded files for compaction", path: deletedPath}
+	logger := zerolog.New(os.Stderr).Hook(hook)
+	job := NewJob(&JobConfig{
+		Measurement: "cpu", PartitionPath: partition, Files: keys,
+		StorageBackend: backend, Database: "testdb", Tier: "hourly",
+		TempDirectory: t.TempDir(), Logger: logger, DB: db,
+		ManifestManager: NewManifestManager(backend, zerolog.Nop()), JobID: "pre-validation-delete",
+	})
+	if err := job.Run(ctx); err != nil {
+		t.Fatalf("Job.Run should skip the input removed before validation: %v", err)
+	}
+	if hook.err != nil {
+		t.Fatalf("delete input at hook: %v", hook.err)
+	}
+	if job.Status != JobStatusCompleted || job.FilesCompacted != 1 {
+		t.Fatalf("job status/files compacted = %s/%d, want completed/1", job.Status, job.FilesCompacted)
+	}
+	if job.OutputStorageKey == "" {
+		t.Fatal("remaining valid input should produce an output")
+	}
+	var rows int
+	outputURI, err := storage.ObjectURI(backend, job.OutputStorageKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, fmt.Sprintf("SELECT count(*) FROM read_parquet('%s')", escapeSQLPath(filepath.ToSlash(outputURI)))).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Fatalf("compacted rows = %d, want the surviving input's single row", rows)
+	}
+}
+
+func TestJobRunInputDeletedAfterValidationFailsWithoutPublishing(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	baseDir := t.TempDir()
+	backend, err := storage.NewLocalBackend(baseDir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	const partition = "testdb/cpu/2026/04/11/14"
+	keys := []string{partition + "/a.parquet", partition + "/b.parquet"}
+	for i, key := range keys {
+		fixture := filepath.Join(t.TempDir(), fmt.Sprintf("input-%d.parquet", i))
+		writeFixtureParquet(t, ctx, db, fixture, fmt.Sprintf("TIMESTAMPTZ '2026-04-11 14:00:0%dZ' AS time, 'h%d' AS host, %d.0 AS value", i, i, i+1))
+		data, err := os.ReadFile(fixture)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := backend.Write(ctx, key, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	deletedPath, err := storage.ObjectURI(backend, keys[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	hook := &deleteInputAtLogHook{trigger: "Validated files for compaction", path: deletedPath}
+	logger := zerolog.New(os.Stderr).Hook(hook)
+	manifestManager := NewManifestManager(backend, zerolog.Nop())
+	job := NewJob(&JobConfig{
+		Measurement: "cpu", PartitionPath: partition, Files: keys,
+		StorageBackend: backend, Database: "testdb", Tier: "hourly",
+		TempDirectory: t.TempDir(), Logger: logger, DB: db,
+		ManifestManager: manifestManager, JobID: "post-validation-delete",
+	})
+	err = job.Run(ctx)
+	if err == nil {
+		t.Fatal("Job.Run should fail when an input disappears after validation")
+	}
+	if hook.err != nil {
+		t.Fatalf("delete input at hook: %v", hook.err)
+	}
+	if recoverable, reason := ClassifySubprocessError(err, ""); recoverable || reason != "permanent_error" {
+		t.Fatalf("concurrent-delete error classified as recoverable=%v reason=%q; want permanent_error", recoverable, reason)
+	}
+	if job.Status != JobStatusFailed {
+		t.Fatalf("job status = %s, want failed", job.Status)
+	}
+	if job.OutputStorageKey != "" || len(job.compactedFiles) != 0 || job.FilesCompacted != 0 {
+		t.Fatalf("failed job published state: output=%q compacted=%v files=%d", job.OutputStorageKey, job.compactedFiles, job.FilesCompacted)
+	}
+	if exists, err := backend.Exists(ctx, keys[1]); err != nil || !exists {
+		t.Fatalf("surviving source exists=%v err=%v, want it preserved", exists, err)
+	}
+	manifestPath := manifestManager.GenerateManifestPath("hourly", "testdb", partition, job.JobID)
+	if exists, err := backend.Exists(ctx, manifestPath); err != nil || exists {
+		t.Fatalf("storage recovery manifest exists=%v err=%v, want none", exists, err)
 	}
 }
 

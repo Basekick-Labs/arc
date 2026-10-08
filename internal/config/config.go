@@ -1402,6 +1402,14 @@ func Load() (*Config, error) {
 		}
 	}
 
+	// Refuse a path that reaches read_parquet and could be read as a pattern.
+	// Placed after the backup checks so an overlapping destination is still
+	// reported as itself, and before the storage-identifier trims below, which
+	// do not touch these two keys.
+	if err := cfg.checkParquetReadRootsGlobSafe(); err != nil {
+		return nil, err
+	}
+
 	// Iceberg export is LOCAL-ONLY in v1. The reconciler walks the single configured storage
 	// backend and derives schemas by reading Parquet footers from the local filesystem, and the
 	// export was verified only against a local backend. Refuse non-local primary backends and

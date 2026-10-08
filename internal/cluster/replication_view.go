@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -95,4 +96,22 @@ func (c *Coordinator) publishPulledCanonical(ctx context.Context, entry raft.Fil
 		return fmt.Errorf("replication publication store is unavailable")
 	}
 	return c.replicationStore.PublishCanonical(ctx, canonicalFile(entry))
+}
+
+// WaitForReplicationView gates startup replay on the leader's committed
+// retirement history. Local Raft restore alone is insufficient after downtime.
+func (c *Coordinator) WaitForReplicationView(ctx context.Context) error {
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		err := c.RefreshReplicationView(ctx)
+		if !errors.Is(err, replicaview.ErrManifestNotReady) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }

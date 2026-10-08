@@ -21,6 +21,9 @@ type Reader struct {
 	TotalEntries     int64
 	TotalBytes       int64
 	CorruptedEntries int64
+	// TruncatedEntries counts incomplete entries at EOF after an interrupted
+	// append. These are not corrupt complete entries and cannot be replayed.
+	TruncatedEntries int64
 }
 
 // NewReader creates a new WAL reader
@@ -107,6 +110,7 @@ func (r *Reader) ReadAll() ([]Entry, error) {
 		Int64("entries", r.TotalEntries).
 		Int64("bytes", r.TotalBytes).
 		Int64("corrupted", r.CorruptedEntries).
+		Int64("truncated", r.TruncatedEntries).
 		Msg("WAL read complete")
 
 	return entries, nil
@@ -149,6 +153,9 @@ func (r *Reader) ReadCheckpointHashes() ([]string, error) {
 		var entryHeader [WALEntryHeaderSize]byte
 		if _, err := io.ReadFull(f, entryHeader[:]); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				if err == io.ErrUnexpectedEOF {
+					r.TruncatedEntries++
+				}
 				break
 			}
 			return hashes, fmt.Errorf("failed to read WAL entry header: %w", err)
@@ -166,7 +173,7 @@ func (r *Reader) ReadCheckpointHashes() ([]string, error) {
 			return hashes, fmt.Errorf("failed to locate WAL payload: %w", err)
 		}
 		if payloadOffset+int64(payloadLen) > fileInfo.Size() {
-			r.CorruptedEntries++
+			r.TruncatedEntries++
 			r.logger.Warn().Str("file", r.filePath).Uint64("timestamp_us", timestampUS).
 				Msg("Skipping incomplete WAL entry while scanning checkpoints")
 			break
@@ -227,6 +234,9 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 		// truncated entry header). Must stop here — the file offset is
 		// mid-header; continuing would cascade misaligned reads.
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			if err == io.ErrUnexpectedEOF {
+				r.TruncatedEntries++
+			}
 			return nil, io.EOF
 		}
 		return nil, fmt.Errorf("failed to read entry header: %w", err)
@@ -245,6 +255,13 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 	payload := make([]byte, payloadLen)
 	n, err := io.ReadFull(f, payload)
 	if err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			// A complete header followed by an incomplete payload is the same
+			// crash suffix as a torn header. Earlier complete entries may still
+			// be recovered and fenced; checksum/decode failures remain errors.
+			r.TruncatedEntries++
+			return nil, io.EOF
+		}
 		return nil, fmt.Errorf("failed to read payload: %w", err)
 	}
 

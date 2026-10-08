@@ -20,7 +20,7 @@ func TestCompactionTriggerAnswers409WhilePausedIssue1087(t *testing.T) {
 	manager := compaction.NewManager(&compaction.ManagerConfig{CycleTimeout: time.Minute, Logger: zerolog.Nop()})
 	var paused atomic.Bool
 	manager.SetPauseGate(paused.Load)
-	handler := NewCompactionHandler(manager, nil, nil, nil, zerolog.Nop())
+	handler := NewCompactionHandler(manager, nil, nil, nil, nil, zerolog.Nop())
 	app := fiber.New()
 	handler.RegisterRoutes(app)
 

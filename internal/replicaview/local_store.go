@@ -414,3 +414,39 @@ func sameReplacements(a, b []string) bool {
 	slices.Sort(b)
 	return slices.Equal(a, b)
 }
+
+// CoveredOriginHours is used only by originating WAL replay. Pins recovered
+// before a checkpoint still prove that their complete hourly contribution is
+// durable. An intentional retirement is equally authoritative after the leader
+// barrier; replica materializations never count as primary publication proof.
+func (s *LocalStore) CoveredOriginHours(database, measurement, identity string) (map[int64]bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.ready {
+		return nil, ErrManifestNotReady
+	}
+	if _, _, err := ParseIdentity(identity); err != nil {
+		return nil, err
+	}
+	covered := make(map[int64]bool)
+	for _, r := range s.retirements {
+		if r.Database == database && r.Measurement == measurement && r.Coverage.Contains(identity) {
+			covered[r.Hour] = true
+		}
+	}
+	include := func(files map[string]File) {
+		for _, f := range files {
+			if f.Metadata.Database != database || f.Metadata.Measurement != measurement || f.Metadata.IsReplica() {
+				continue
+			}
+			for _, part := range f.Metadata.PartitionCoverages() {
+				if part.Coverage.Contains(identity) {
+					covered[part.Hour] = true
+				}
+			}
+		}
+	}
+	include(s.canonical)
+	include(s.provisional)
+	return covered, nil
+}

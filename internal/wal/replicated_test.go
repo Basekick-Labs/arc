@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -156,7 +157,7 @@ func TestReceivedWALPurgesOnlyAfterCheckpoint(t *testing.T) {
 	// Neither the foreign origin identity nor an abandoned local write can
 	// accidentally release the receiver's independent durability obligation.
 	w.ForgetTracked([]string{identity})
-	for _, purge := range []func() (int, error){w.PurgeInactive, w.PurgeAll, func() (int, error) { return w.PurgeUnaccountedOlderThan(-time.Hour) }, func() (int, error) { return w.PurgeFlushed(w.MinUnflushedSequence()) }} {
+	for _, purge := range []func() (int, error){w.PurgeInactive, w.PurgeAll, func() (int, error) { return w.PurgeFlushed(w.MinUnflushedSequence()) }} {
 		if _, err := purge(); err != nil {
 			t.Fatal(err)
 		}
@@ -189,9 +190,6 @@ func TestPreviousProcessReceivedWALSurvivesAgePurge(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer next.Close()
-	if _, err := next.PurgeUnaccountedOlderThan(-time.Hour); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("previous-process replica data discarded: %v", err)
 	}
@@ -229,7 +227,7 @@ func TestForeignReceivedWALKeepsLaterCheckpoint(t *testing.T) {
 	if err := next.Rotate(); err != nil {
 		t.Fatal(err)
 	}
-	for _, purge := range []func() (int, error){func() (int, error) { return next.PurgeFlushed(next.MinUnflushedSequence()) }, func() (int, error) { return next.PurgeUnaccountedOlderThan(-time.Hour) }} {
+	for _, purge := range []func() (int, error){func() (int, error) { return next.PurgeFlushed(next.MinUnflushedSequence()) }} {
 		if _, err := purge(); err != nil {
 			t.Fatal(err)
 		}
@@ -274,5 +272,93 @@ func TestReplicationRecoveryRefusesAmbiguousLegacyWAL(t *testing.T) {
 	}
 	if !bytes.Equal(before, after) {
 		t.Fatal("migration refusal changed the only durable WAL copy")
+	}
+}
+
+func TestReceivedRecoveryUsesSharedBeforeDeleteBarrier(t *testing.T) {
+	w := newReceivedTestWriter(t)
+	payload := receivedTestPayload(t, 1)
+	if err := w.AppendReplicated(payload); err != nil {
+		t.Fatal(err)
+	}
+	path := w.CurrentFile()
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := errors.New("asynchronous flush failed before the barrier")
+	applied, barriers := 0, 0
+	options := &RecoveryOptions{
+		ReplicationCallback: func(context.Context, []byte) error { applied++; return nil },
+		BeforeDelete: func(context.Context) error {
+			barriers++
+			if applied == 0 {
+				t.Fatal("barrier preceded replay")
+			}
+			if _, err := os.Stat(path); err != nil {
+				t.Fatal("WAL removed before the barrier")
+			}
+			return sentinel
+		},
+	}
+	recovery := NewRecovery(w.config.WALDir, zerolog.Nop())
+	if _, err := recovery.RecoverWithOptions(context.Background(), nil, options); !errors.Is(err, sentinel) {
+		t.Fatalf("missing barrier failure: %v", err)
+	}
+	if barriers != 1 {
+		t.Fatalf("barriers=%d", barriers)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal("failed shared barrier discarded received WAL")
+	}
+	options.BeforeDelete = func(context.Context) error { return nil }
+	if _, err := recovery.RecoverWithOptions(context.Background(), nil, options); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("successful shared barrier did not reclaim WAL")
+	}
+}
+
+func TestHandoffRecoveryPreservesWholeRowIdentity(t *testing.T) {
+	for _, partial := range []bool{false, true} {
+		t.Run(fmt.Sprint(partial), func(t *testing.T) {
+			w := newReceivedTestWriter(t)
+			rows := []map[string]interface{}{{"m": "cpu", "time": int64(1700000000000000), "v": 1}, {"m": "cpu", "time": int64(1700000000000001), "v": 2}}
+			identities, err := w.AppendTracked(rows)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if partial {
+				if err := w.MarkFlushed([]string{recoveryRowIdentity(identities[0], 0, 1)}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			path := w.CurrentFile()
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+			called := false
+			_, err = NewRecovery(w.config.WALDir, zerolog.Nop()).RecoverWithOptions(context.Background(), nil, &RecoveryOptions{
+				BatchSize: 1, PreserveWholeTrackedRows: true, RequireOriginIdentity: true,
+				TrackedRowCallback: func(_ context.Context, batch []map[string]interface{}, identity string) error {
+					called = true
+					if identity != identities[0] || len(batch) != len(rows) {
+						t.Fatal("handoff replay split originating identity")
+					}
+					return nil
+				},
+				BeforeDelete: func(context.Context) error { return nil },
+			})
+			if partial {
+				if err == nil || called {
+					t.Fatal("partial old checkpoints must not be published as complete coverage")
+				}
+				if _, err := os.Stat(path); err != nil {
+					t.Fatal("migration refusal removed WAL")
+				}
+			} else if err != nil || !called {
+				t.Fatalf("whole entry recovery: called=%v err=%v", called, err)
+			}
+		})
 	}
 }

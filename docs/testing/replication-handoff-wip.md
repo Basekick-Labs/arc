@@ -80,8 +80,7 @@ publication failure/readiness behavior.
 
 The focused handoff tests copy files and invoke publication explicitly. The
 licensed local integration benchmark additionally exercises production startup,
-real file pulls and live queries. Abrupt process restart testing remains pending;
-these successful steady-state runs do not establish crash correctness. The full race matrix passed for `internal/wal`, `internal/replicaview`,
+real file pulls and live queries. The newer licensed restart results below supersede the initial steady-state-only checkpoint; they still do not establish correctness at every crash boundary. The full race matrix passed for `internal/wal`, `internal/replicaview`,
 `internal/ingest`, `internal/cluster/...`, `internal/compaction`, `internal/api`,
 and `cmd/arc` with `duckdb_arrow` enabled. After the own-origin publication and
 queued-metadata-copy follow-up, the complete file-replication race suite also
@@ -93,8 +92,7 @@ Those timings are not the completed fix's performance result.
 
 ## Remaining work before contributor push or merge
 
-1. Integrate PR #1118's recovery barriers and tracked row replay, reconciling
-   their identity/checkpoint semantics with received-WAL provenance and coverage.
+1. Review the integrated PR #1118 recovery barriers at the remaining crash boundaries, including pending originating files and active-buffer replay.
 2. Complete legacy provenance migration and unmanifested origin-file recovery.
    Never infer provenance from the node's current role or payload equality.
 3. Integrate shared storage, cold-tier sources, failover, and immutable remote
@@ -149,8 +147,7 @@ The benchmark binary predates the subsequent canonical-pin cleanup and HTTP 503
 classification changes. Raw reports and binary hashes:
 `/private/tmp/arc-msgpack-1m.Zp5NTf/{before-local-handoff-control,handoff-local-pins-serial,handoff-local-pins-concurrent}/results.json`.
 The original baseline harness is unchanged; the handoff harness recognizes the
-received marker and requires exact row counts. A separate abrupt-restart harness
-has been prepared but has NOT been run.
+received marker and requires exact row counts. The abrupt-restart harness was subsequently run; see the integration checkpoint below.
 
 ### Do not duplicate PR #1118
 
@@ -161,11 +158,80 @@ startup and maintenance pass `NewRecoveryFlushBarrier` to `BeforeDelete`, with
 queued/direct task fencing and flush-failure-generation checks. It also provides
 tracked row-range replay and a real two-process-kill regression test.
 
-Reuse/integrate that work rather than create an independent originating-WAL fix
-in this branch. Its CI is green at the inspected head, but its author explicitly
-leaves performance attribution and live licensed-cluster validation open. The
-existing received-WAL `ReplicationFlush` must be reconciled with its stronger
-barrier; a plain `FlushAll` call is not sufficient proof that all earlier queued
-or already-failed asynchronous tasks persisted. Until that integration, no
-complete crash-durability claim is justified. Row-range identities also require
-compatibility review with this branch's originating-identity coverage model.
+That work is now integrated in this branch, retaining its commit history. Its CI is green at the inspected head, but its author explicitly
+leaves performance attribution and live licensed-cluster validation open. Received recovery now uses the same stronger `BeforeDelete` barrier. Handoff-mode row replay preserves the whole originating identity; existing partial row-range checkpoints are refused with the WAL retained, pending a migration design.
+
+
+## PR #1118 integration and licensed recovery validation
+
+Integrated contributor head `e855b6d74bfa14f845e7be7ae9ca1abbee26f360`, including
+its newer main ancestry, with origin/received provenance kept separate. The
+local pin publication now syncs the file inode as well as its directory before
+it can justify WAL reclamation. This adds no per-ingestion journal record.
+
+Two recovery defects were reproduced and corrected during integration:
+
+- Startup replay previously flushed originating files before the cluster file
+  registrar existed. A recovered writer could query 1M rows while advertising
+  zero event files; restoring an empty reader failed. Local handoff startup now
+  waits for a reconciled manifest, installs the registrar, replays WAL, and only
+  then starts live WAL replication. Repeating the same probe advertised the
+  recovered file and restored all 1M rows to the empty reader.
+- Retrying an originating entry after one hour had persisted could write that
+  hour again. A real Parquet regression returned five rows instead of two.
+  Recovery now omits durably covered or retired hours, preserving the original
+  identity for the remaining rows. The same regression passes with two rows,
+  including retry and subsequent retirement checks.
+
+Compaction crash recovery also needed integration: its newly introduced recovery
+path reconstructed completion records without replication coverage/replacement
+metadata. A real Job.Run regression forces completion publication failure after
+upload, then invokes recovery. It failed with empty coverage before the fix.
+The existing pre-upload recovery manifest now carries that metadata, and the
+regression passes through source deletion with coverage preserved.
+
+Licensed native cluster probes use the development license from an external
+private file, authentication, real Raft, HTTP MessagePack ingestion, live WAL
+streaming and local file pulls. Each ingests the same pinned 1M-row fixture:
+
+| Probe | Result |
+| --- | --- |
+| Settled reader, writer, then both abruptly restarted | Each returns exactly 1M total / 1M distinct IDs |
+| Both killed with 1M received rows buffered and no event Parquet files | WAL recovery returns exactly 1M on both; repeated restarts pass |
+| Reader offline during partial DELETE, then full DELETE | Both converge to 500k, then zero rows |
+| Empty reader data directory after unflushed writer recovery | Restores exactly 1M from the advertised recovered origin file |
+| Writer/reader/compactor raw-to-compacted handoff | 20 event files become one; both retain exactly 1M, including reader restart |
+
+The compaction probe invokes the real `arc compact --job-stdin` child because
+newly flushed files are intentionally ineligible for hourly scheduling for one
+hour. The live completion watcher, Raft transition, output pulls, queries and
+reader restart remain exercised; this is not a scheduler-selection test.
+
+External artifacts live under `/private/tmp/arc-msgpack-1m.Zp5NTf/`:
+`handoff-1118-recovery-01`, `handoff-1118-offline-delete-01`,
+`handoff-1118-unflushed-02`, `handoff-1118-empty-restore-02`, and
+`handoff-1118-compaction-02`. Failed setup/reproduction runs are retained too.
+Functional probe ingest timings are not the before/after performance comparison.
+The unflushed probe uses a deliberately enlarged buffer, and process restarts
+reset counters: its cross-restart metric deltas must not be used as throughput
+or delivery evidence. Its pre-crash buffer counts, matched WAL identities, lack
+of event Parquet files, and post-restart query counts establish the tested case.
+
+### Still not merge-ready
+
+The startup ordering fix does not solve a crash after originating file pinning
+and checkpointing but before asynchronous manifest registration. Existing
+unannounced pins need durable ownership and a safe registration retry; blindly
+registering all recovered pins could resurrect a deleted or foreign file.
+Other remaining boundaries include active-buffer replay, shared/cold storage,
+legacy migration, failover, mixed versions, network corruption/delay, streamed
+query leases, and bounded retirement/reconciliation costs. These successful
+local probes do not clear those requirements. The contributor release note
+remains credited; a release claim for the completed handoff is intentionally
+pending completion of this work.
+
+
+The final integrated race matrix passed all 13 packages (`wal`, `replicaview`,
+`ingest`, `cluster/...`, `compaction`, `api`, `storage`, and `cmd/arc`) with
+`duckdb_arrow`, after the startup, origin-hour replay, inode sync, and compaction
+recovery fixes. Log: `/private/tmp/arc-handoff-1118-final-race.log`.

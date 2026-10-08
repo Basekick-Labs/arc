@@ -131,3 +131,65 @@ func TestLocalStoreHandoffRecoveryAndDelete(t *testing.T) {
 	require.Equal(t, 1, count(snapshot))
 	snapshot.Close()
 }
+
+func TestLocalOriginReplaySkipsPersistedHours(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	require.NoError(t, err)
+	defer backend.Close()
+	store, err := replicaview.OpenLocalStore(ctx, root)
+	require.NoError(t, err)
+	require.NoError(t, store.Reconcile(ctx, nil, nil))
+	cfg := &config.IngestConfig{MaxBufferSize: 100000, MaxBufferAgeMS: 600000, FlushWorkers: 1, FlushQueueSize: 10, ShardCount: 1, Compression: "snappy"}
+	buffer := ingest.NewArrowBuffer(cfg, backend, zerolog.Nop())
+	buffer.SetReplicationPublisher(store)
+	const identity = "00000000000000070000000000000001"
+	const timestamp = int64(1700000000000000)
+	// Model a crash after one hour's file was published but before the other
+	// hour and the parent WAL checkpoint. No payload-content deduplication.
+	require.NoError(t, buffer.WriteColumnarDirectReplay(ctx, "db", "cpu", map[string][]interface{}{"time": {timestamp}, "v": {int64(1)}}, identity))
+	require.NoError(t, buffer.FlushAll(ctx))
+	require.NoError(t, buffer.Close())
+	require.NoError(t, store.Close())
+	store, err = replicaview.OpenLocalStore(ctx, root)
+	require.NoError(t, err)
+	defer store.Close()
+	require.NoError(t, store.Reconcile(ctx, nil, nil))
+	buffer = ingest.NewArrowBuffer(cfg, backend, zerolog.Nop())
+	buffer.SetReplicationPublisher(store)
+	defer buffer.Close()
+	columns := func() map[string][]interface{} {
+		return map[string][]interface{}{"time": {timestamp, timestamp + 3600*1000000}, "v": {int64(1), int64(2)}}
+	}
+	require.NoError(t, buffer.WriteColumnarDirectReplay(ctx, "db", "cpu", columns(), identity))
+	require.NoError(t, buffer.FlushAll(ctx))
+	// A second retry after every hour is durable must also add nothing.
+	require.NoError(t, buffer.WriteColumnarDirectReplay(ctx, "db", "cpu", columns(), identity))
+	require.NoError(t, buffer.FlushAll(ctx))
+	snapshot := store.View().Snapshot("db", "cpu")
+	defer snapshot.Close()
+	relation, err := snapshot.SQL(store.Resolve, "", "union_by_name=true")
+	require.NoError(t, err)
+	db, err := sql.Open("duckdb", "")
+	require.NoError(t, err)
+	defer db.Close()
+	var total, distinct int
+	require.NoError(t, db.QueryRow("SELECT count(*),count(DISTINCT v) FROM "+relation).Scan(&total, &distinct))
+	require.Equal(t, 2, total)
+	require.Equal(t, 2, distinct)
+	before, err := backend.List(ctx, "db/cpu")
+	require.NoError(t, err)
+	coverage, err := replicaview.FromIdentities([]string{identity})
+	require.NoError(t, err)
+	hour := timestamp / 1000000 / 3600
+	require.NoError(t, store.Reconcile(ctx, nil, []replicaview.Retirement{{Database: "db", Measurement: "cpu", Hour: hour, Coverage: coverage}, {Database: "db", Measurement: "cpu", Hour: hour + 1, Coverage: coverage}}))
+	require.NoError(t, buffer.WriteColumnarDirectReplay(ctx, "db", "cpu", columns(), identity))
+	require.NoError(t, buffer.FlushAll(ctx))
+	after, err := backend.List(ctx, "db/cpu")
+	require.NoError(t, err)
+	require.Equal(t, before, after, "retired originating WAL must not create new canonical files")
+	retired := store.View().Snapshot("db", "cpu")
+	defer retired.Close()
+	require.Empty(t, retired.Sources)
+}

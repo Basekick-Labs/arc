@@ -91,9 +91,18 @@ func (p *PinnedFiles) Pin(key, expectedSHA string) (string, error) {
 	}
 	digest := sha256.New()
 	_, copyErr := io.Copy(digest, f)
+	// The backend may have closed/renamed without syncing file contents.
+	// Directory durability alone cannot justify releasing the source WAL.
+	var syncErr error
+	if copyErr == nil {
+		syncErr = f.Sync()
+	}
 	closeErr := f.Close()
 	if copyErr != nil {
 		return fail(copyErr)
+	}
+	if syncErr != nil {
+		return fail(syncErr)
 	}
 	if closeErr != nil {
 		return fail(closeErr)

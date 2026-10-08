@@ -155,6 +155,8 @@ type Metrics struct {
 	walDroppedEntries    atomic.Int64 // Entries dropped due to full WAL buffer
 	walFailedWrites      atomic.Int64 // Write failures to WAL file
 	walOversizedPayloads atomic.Int64 // Payloads rejected for exceeding the single-entry cap even after chunking (#677)
+	walDirectoryBytes    atomic.Int64 // Current bytes occupied by .wal and quarantined .failed files
+	walQuarantinedFiles  atomic.Int64 // WAL files isolated after repeated recovery failures
 
 	// NOTE: no decompression-pool discard counter here (#817). The pooled
 	// codecs it belonged to were replaced by decompressGzipPooled /
@@ -541,6 +543,8 @@ func (m *Metrics) IncWALRecoveryRecords(count int64)  { m.walRecoveryRecords.Add
 func (m *Metrics) IncWALDroppedEntries()              { m.walDroppedEntries.Add(1) }
 func (m *Metrics) IncWALFailedWrites()                { m.walFailedWrites.Add(1) }
 func (m *Metrics) IncWALOversizedPayloads()           { m.walOversizedPayloads.Add(1) }
+func (m *Metrics) SetWALDirectoryBytes(bytes int64)   { m.walDirectoryBytes.Store(bytes) }
+func (m *Metrics) IncWALQuarantinedFiles()            { m.walQuarantinedFiles.Add(1) }
 
 // Decompression Pool Metrics
 
@@ -773,6 +777,8 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"wal_dropped_entries":    m.walDroppedEntries.Load(),
 		"wal_failed_writes":      m.walFailedWrites.Load(),
 		"wal_oversized_payloads": m.walOversizedPayloads.Load(),
+		"wal_directory_bytes":    m.walDirectoryBytes.Load(),
+		"wal_quarantined_files":  m.walQuarantinedFiles.Load(),
 
 		// Decompression Pool
 
@@ -1152,6 +1158,14 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_oversized_payloads_total Payloads rejected for exceeding the single-entry cap even after chunking\n"...)
 	b = append(b, "# TYPE arc_wal_oversized_payloads_total counter\n"...)
 	b = appendMetric(b, "arc_wal_oversized_payloads_total", float64(m.walOversizedPayloads.Load()))
+
+	b = append(b, "# HELP arc_wal_dir_bytes Current bytes occupied by WAL and quarantined WAL files\n"...)
+	b = append(b, "# TYPE arc_wal_dir_bytes gauge\n"...)
+	b = appendMetric(b, "arc_wal_dir_bytes", float64(m.walDirectoryBytes.Load()))
+
+	b = append(b, "# HELP arc_wal_quarantined_files_total WAL files isolated after repeated recovery failures\n"...)
+	b = append(b, "# TYPE arc_wal_quarantined_files_total counter\n"...)
+	b = appendMetric(b, "arc_wal_quarantined_files_total", float64(m.walQuarantinedFiles.Load()))
 
 	// Governance metrics
 	b = append(b, "# HELP arc_governance_rate_limited_total Queries rejected by rate limiting\n"...)
