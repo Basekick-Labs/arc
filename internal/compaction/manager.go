@@ -619,6 +619,16 @@ func (m *Manager) notifyCompactedOutput(storageKey string) {
 	}
 }
 
+// recoverOrphanedManifests wires cluster completion updates into storage recovery.
+func (m *Manager) recoverOrphanedManifests(ctx context.Context, scope recoveryScope) (int, error) {
+	hooks := recoveryHooks{}
+	if m.CompletionDir != "" {
+		hooks.beforeInputDelete = m.writeRecoveredOutputWrittenManifest
+		hooks.afterInputDelete = m.writeRecoveredSourcesDeletedManifest
+	}
+	return m.ManifestManager.recoverOrphanedManifestsWithHooks(ctx, scope, m.notifyCompactedOutput, m.notifyConsumedInputs, hooks)
+}
+
 // FindCandidates finds partitions that are candidates for compaction across all databases
 func (m *Manager) FindCandidates(ctx context.Context) ([]Candidate, error) {
 	var candidates []Candidate
@@ -1214,7 +1224,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 	// recoveryScope for why a tier-scoped recovery is wrong for the
 	// single-tier schedulers.
 	if m.ManifestManager != nil {
-		recovered, err := m.ManifestManager.recoverOrphanedManifests(ctx, recoveryScope{Databases: recoveryDatabases, Measurement: filterMeasurement}, m.notifyCompactedOutput, m.notifyConsumedInputs)
+		recovered, err := m.recoverOrphanedManifests(ctx, recoveryScope{Databases: recoveryDatabases, Measurement: filterMeasurement})
 		if recovered > 0 {
 			m.mu.Lock()
 			m.totalManifestsRecov += recovered

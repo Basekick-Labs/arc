@@ -391,6 +391,7 @@ func (j *Job) Run(ctx context.Context) error {
 			Database:      j.Database,
 			Measurement:   j.Measurement,
 			PartitionPath: j.PartitionPath,
+			PartitionTime: j.PartitionTime,
 			Tier:          j.Tier,
 			Status:        ManifestStatusPending,
 			CreatedAt:     time.Now().UTC(),

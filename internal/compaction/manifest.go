@@ -65,6 +65,7 @@ type Manifest struct {
 	Database      string         `json:"database"`
 	Measurement   string         `json:"measurement"`
 	PartitionPath string         `json:"partition_path"`
+	PartitionTime time.Time      `json:"partition_time,omitempty"` // authoritative scanner timestamp for cluster registration
 	Tier          string         `json:"tier"`
 	Status        ManifestStatus `json:"status"`
 	CreatedAt     time.Time      `json:"created_at"`
@@ -314,6 +315,17 @@ func (m *ManifestManager) RecoverOrphanedManifests(ctx context.Context, onKeptOu
 }
 
 func (m *ManifestManager) recoverOrphanedManifests(ctx context.Context, scope recoveryScope, onKeptOutput func(string), onConsumedInputs func([]string) error) (recovered int, recoveryErr error) {
+	return m.recoverOrphanedManifestsWithHooks(ctx, scope, onKeptOutput, onConsumedInputs, recoveryHooks{})
+}
+
+type recoveryHooks struct {
+	// beforeInputDelete records the kept output before recovery removes sources.
+	beforeInputDelete func(context.Context, *Manifest) error
+	// afterInputDelete advances completion state after all source removals.
+	afterInputDelete func(context.Context, *Manifest) error
+}
+
+func (m *ManifestManager) recoverOrphanedManifestsWithHooks(ctx context.Context, scope recoveryScope, onKeptOutput func(string), onConsumedInputs func([]string) error, hooks recoveryHooks) (recovered int, recoveryErr error) {
 	defer func() {
 		// A cancellation may arrive after some manifests were completed.
 		if recovered > 0 {
@@ -358,7 +370,7 @@ func (m *ManifestManager) recoverOrphanedManifests(ctx context.Context, scope re
 			continue
 		}
 		if err == nil {
-			err = m.recoverLoadedManifest(ctx, path, manifest, onKeptOutput, onConsumedInputs)
+			err = m.recoverLoadedManifest(ctx, path, manifest, onKeptOutput, onConsumedInputs, hooks)
 		}
 		if err != nil {
 			if ctx.Err() != nil {
@@ -373,7 +385,7 @@ func (m *ManifestManager) recoverOrphanedManifests(ctx context.Context, scope re
 	return recovered, recoveryErr
 }
 
-func (m *ManifestManager) recoverLoadedManifest(ctx context.Context, manifestPath string, manifest *Manifest, onKeptOutput func(string), onConsumedInputs func([]string) error) error {
+func (m *ManifestManager) recoverLoadedManifest(ctx context.Context, manifestPath string, manifest *Manifest, onKeptOutput func(string), onConsumedInputs func([]string) error, hooks recoveryHooks) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -462,6 +474,11 @@ func (m *ManifestManager) recoverLoadedManifest(ctx context.Context, manifestPat
 	// failure retries this manifest next cycle, and the consumer is
 	// idempotent, so firing early is safe while firing late risks a window
 	// where discovery syncs the output.
+	if hooks.beforeInputDelete != nil {
+		if err := hooks.beforeInputDelete(ctx, manifest); err != nil {
+			return fmt.Errorf("failed to record kept output before deleting inputs: %w", err)
+		}
+	}
 	if onKeptOutput != nil {
 		onKeptOutput(manifest.OutputPath)
 	}
@@ -516,6 +533,11 @@ func (m *ManifestManager) recoverLoadedManifest(ctx context.Context, manifestPat
 			Int("total", len(manifest.InputFiles)).
 			Msg("Some input files could not be deleted during recovery, keeping manifest for retry")
 		return fmt.Errorf("failed to delete %d of %d input files", deleteErrors, len(manifest.InputFiles))
+	}
+	if hooks.afterInputDelete != nil {
+		if err := hooks.afterInputDelete(ctx, manifest); err != nil {
+			return fmt.Errorf("failed to record deleted inputs: %w", err)
+		}
 	}
 
 	// All input files deleted. Fire the consumed-inputs observer BEFORE
