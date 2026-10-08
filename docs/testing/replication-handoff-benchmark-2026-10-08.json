@@ -1,0 +1,856 @@
+{
+  "date": "2026-10-08",
+  "status": "unfinished local handoff; not merge-ready",
+  "limitations": [
+    "Shared development host; no CPU affinity or hard quotas.",
+    "Three sequential short trials per configuration; no tests/builds run concurrently by this session.",
+    "ACK timing excludes later flush/catch-up; correctness checked after settling.",
+    "Baseline has reader duplication; its third concurrent trial fails stream ordering.",
+    "Final binary source matches 9f4ac14e; built immediately before commit, so embedded VCS metadata predates it.",
+    "Per-path Parquet byte totals omitted because pins share inodes."
+  ],
+  "reports": [
+    {
+      "label": "pr1118-control-serial",
+      "source_commit": "e855b6d7",
+      "binary_sha256": "e468e00ad5d4f7758507435b2ff6a0280324cc944e6af599435eba7e16452f91",
+      "fixture_sha256": "a286d26162c5fb1ebe818ac71d004b89246df30f045e36e305542287c3970a7d",
+      "clients": 1,
+      "rows": 1000000,
+      "batch_rows": 1000,
+      "warmup_rows": 100000,
+      "payload_bytes": 41938544,
+      "configuration": {
+        "GOMAXPROCS": "4",
+        "GOMEMLIMIT": "1536MiB",
+        "ARC_SERVER_HOST": "127.0.0.1",
+        "ARC_LOG_LEVEL": "info",
+        "ARC_LOG_FORMAT": "json",
+        "ARC_TELEMETRY_ENABLED": "false",
+        "ARC_AUTH_ENABLED": "true",
+        "ARC_STORAGE_BACKEND": "local",
+        "ARC_WAL_ENABLED": "true",
+        "ARC_WAL_SYNC_MODE": "fdatasync",
+        "ARC_WAL_MAX_SIZE_MB": "100",
+        "ARC_WAL_MAX_AGE_SECONDS": "3600",
+        "ARC_INGEST_MAX_BUFFER_SIZE": "50000",
+        "ARC_INGEST_MAX_BUFFER_AGE_MS": "1000",
+        "ARC_INGEST_FLUSH_WORKERS": "4",
+        "ARC_INGEST_SHARD_COUNT": "16",
+        "ARC_INGEST_COMPRESSION": "snappy",
+        "ARC_COMPACTION_ENABLED": "false",
+        "ARC_RETENTION_ENABLED": "false",
+        "ARC_CONTINUOUS_QUERY_ENABLED": "false",
+        "ARC_TIERING_ENABLED": "false",
+        "ARC_BACKUP_ENABLED": "false",
+        "ARC_CACHE_ENABLED": "false",
+        "ARC_DATABASE_MEMORY_LIMIT": "512MB",
+        "ARC_DATABASE_THREAD_COUNT": "2",
+        "ARC_DATABASE_MAX_CONNECTIONS": "4",
+        "ARC_CLUSTER_ENABLED": "true",
+        "ARC_CLUSTER_REPLICATION_ENABLED": "true",
+        "ARC_CLUSTER_CLUSTER_NAME": "arc-msgpack-1m-isolated",
+        "ARC_CLUSTER_FAILOVER_ENABLED": "false",
+        "ARC_CLUSTER_SHARED_STORAGE_MODE": "false"
+      },
+      "machine": "macOS-26.6.2-arm64-arm-64bit",
+      "architecture": "arm64",
+      "trials": [
+        {
+          "trial": 1,
+          "write": {
+            "seconds": 0.9508961249375716,
+            "records_per_second": 1051639.5784719936,
+            "requests": 1000,
+            "http_statuses": {
+              "204": 1000
+            },
+            "p50_ms": 0.24337507784366608,
+            "p95_ms": 4.4144169660285115,
+            "p99_ms": 8.834542008116841
+          },
+          "first_all_distinct_visible_seconds": {
+            "writer": 1.0699269160395488,
+            "reader": 1.069928958080709
+          },
+          "settled_counts": {
+            "writer": {
+              "total": 1000000,
+              "distinct_ids": 1000000
+            },
+            "reader": {
+              "total": 2000000,
+              "distinct_ids": 1000000
+            }
+          },
+          "exact_once": false,
+          "wal_drops_delta": [
+            0.0,
+            0.0
+          ],
+          "flush_failures_delta": [
+            0.0,
+            0.0
+          ],
+          "replication_drops_delta": 0.0,
+          "live_replica_rows_delta": 1000000.0,
+          "wal_identity_summary": {
+            "writer": {
+              "data_entries": 1100,
+              "tracked_entries": 1100,
+              "data_payload_bytes": 46045988,
+              "identity_set_sha256": "c403394cedcb036fc7d0f5e5e0be549cf2ffb3170dd81e2249441ce00e9bcc83"
+            },
+            "reader": {
+              "data_entries": 1100,
+              "tracked_entries": 1100,
+              "data_payload_bytes": 46045988,
+              "identity_set_sha256": "7f6df2893b89835e506be368043921b2f0de93f09e6c306a66a20603af0c88e5"
+            }
+          },
+          "cpu_seconds_during_writes": {
+            "writer": 0.5700000000000001,
+            "reader": 0.66
+          }
+        },
+        {
+          "trial": 2,
+          "write": {
+            "seconds": 0.9916599170537665,
+            "records_per_second": 1008410.2249196599,
+            "requests": 1000,
+            "http_statuses": {
+              "204": 1000
+            },
+            "p50_ms": 0.25345804169774055,
+            "p95_ms": 4.631832940503955,
+            "p99_ms": 8.581207948736846
+          },
+          "first_all_distinct_visible_seconds": {
+            "writer": 1.1081536250421777,
+            "reader": 1.1081542500760406
+          },
+          "settled_counts": {
+            "writer": {
+              "total": 1000000,
+              "distinct_ids": 1000000
+            },
+            "reader": {
+              "total": 2000000,
+              "distinct_ids": 1000000
+            }
+          },
+          "exact_once": false,
+          "wal_drops_delta": [
+            0.0,
+            0.0
+          ],
+          "flush_failures_delta": [
+            0.0,
+            0.0
+          ],
+          "replication_drops_delta": 0.0,
+          "live_replica_rows_delta": 1000000.0,
+          "wal_identity_summary": {
+            "writer": {
+              "data_entries": 1100,
+              "tracked_entries": 1100,
+              "data_payload_bytes": 46045988,
+              "identity_set_sha256": "c0dd44fd7edab0330d3d2dc7d3d9d1bb7d93d1fdfeacc0df678b61b1207359db"
+            },
+            "reader": {
+              "data_entries": 1100,
+              "tracked_entries": 1100,
+              "data_payload_bytes": 46045988,
+              "identity_set_sha256": "977657ec7a8699678b8d0ba692d38e58a9ab31b6a2f680ee08202909313e0607"
+            }
+          },
+          "cpu_seconds_during_writes": {
+            "writer": 0.59,
+            "reader": 0.67
+          }
+        },
+        {
+          "trial": 3,
+          "write": {
+            "seconds": 0.9340000000083819,
+            "records_per_second": 1070663.811553561,
+            "requests": 1000,
+            "http_statuses": {
+              "204": 1000
+            },
+            "p50_ms": 0.2448749728500843,
+            "p95_ms": 4.192000022158027,
+            "p99_ms": 8.551290957257152
+          },
+          "first_all_distinct_visible_seconds": {
+            "writer": 1.054164458066225,
+            "reader": 1.054165167035535
+          },
+          "settled_counts": {
+            "writer": {
+              "total": 1000000,
+              "distinct_ids": 1000000
+            },
+            "reader": {
+              "total": 2000000,
+              "distinct_ids": 1000000
+            }
+          },
+          "exact_once": false,
+          "wal_drops_delta": [
+            0.0,
+            0.0
+          ],
+          "flush_failures_delta": [
+            0.0,
+            0.0
+          ],
+          "replication_drops_delta": 0.0,
+          "live_replica_rows_delta": 1000000.0,
+          "wal_identity_summary": {
+            "writer": {
+              "data_entries": 1100,
+              "tracked_entries": 1100,
+              "data_payload_bytes": 46045988,
+              "identity_set_sha256": "32b4fbbaac9bb3f8f46cc1e830286be43b6071b318f7e8fdf4a8b4364e2ed950"
+            },
+            "reader": {
+              "data_entries": 1100,
+              "tracked_entries": 1100,
+              "data_payload_bytes": 46045988,
+              "identity_set_sha256": "4b5ba1c8f9bf64bd78446f94037543be946a1df2feb95e7d18d7e06ba55abd0b"
+            }
+          },
+          "cpu_seconds_during_writes": {
+            "writer": 0.5700000000000001,
+            "reader": 0.67
+          }
+        }
+      ],
+      "median_records_per_second": 1051639.5784719936
+    },
+    {
+      "label": "handoff-1118-final-serial",
+      "source_commit": "9f4ac14e",
+      "binary_sha256": "b6e6143034c70cac38a6063b0c24f012e0e5c638e0ba46dfc2c51cb09be5839b",
+      "fixture_sha256": "a286d26162c5fb1ebe818ac71d004b89246df30f045e36e305542287c3970a7d",
+      "clients": 1,
+      "rows": 1000000,
+      "batch_rows": 1000,
+      "warmup_rows": 100000,
+      "payload_bytes": 41938544,
+      "configuration": {
+        "GOMAXPROCS": "4",
+        "GOMEMLIMIT": "1536MiB",
+        "ARC_SERVER_HOST": "127.0.0.1",
+        "ARC_LOG_LEVEL": "info",
+        "ARC_LOG_FORMAT": "json",
+        "ARC_TELEMETRY_ENABLED": "false",
+        "ARC_AUTH_ENABLED": "true",
+        "ARC_STORAGE_BACKEND": "local",
+        "ARC_WAL_ENABLED": "true",
+        "ARC_WAL_SYNC_MODE": "fdatasync",
+        "ARC_WAL_MAX_SIZE_MB": "100",
+        "ARC_WAL_MAX_AGE_SECONDS": "3600",
+        "ARC_INGEST_MAX_BUFFER_SIZE": "50000",
+        "ARC_INGEST_MAX_BUFFER_AGE_MS": "1000",
+        "ARC_INGEST_FLUSH_WORKERS": "4",
+        "ARC_INGEST_SHARD_COUNT": "16",
+        "ARC_INGEST_COMPRESSION": "snappy",
+        "ARC_COMPACTION_ENABLED": "false",
+        "ARC_RETENTION_ENABLED": "false",
+        "ARC_CONTINUOUS_QUERY_ENABLED": "false",
+        "ARC_TIERING_ENABLED": "false",
+        "ARC_BACKUP_ENABLED": "false",
+        "ARC_CACHE_ENABLED": "false",
+        "ARC_DATABASE_MEMORY_LIMIT": "512MB",
+        "ARC_DATABASE_THREAD_COUNT": "2",
+        "ARC_DATABASE_MAX_CONNECTIONS": "4",
+        "ARC_CLUSTER_ENABLED": "true",
+        "ARC_CLUSTER_REPLICATION_ENABLED": "true",
+        "ARC_CLUSTER_CLUSTER_NAME": "arc-msgpack-1m-isolated",
+        "ARC_CLUSTER_FAILOVER_ENABLED": "false",
+        "ARC_CLUSTER_SHARED_STORAGE_MODE": "false"
+      },
+      "machine": "macOS-26.6.2-arm64-arm-64bit",
+      "architecture": "arm64",
+      "trials": [
+        {
+          "trial": 1,
+          "write": {
+            "seconds": 1.4090991669800133,
+            "records_per_second": 709673.2603591015,
+            "requests": 1000,
+            "http_statuses": {
+              "204": 1000
+            },
+            "p50_ms": 0.2615000121295452,
+            "p95_ms": 7.518458995036781,
+            "p99_ms": 13.940959004685283
+          },
+          "first_all_distinct_visible_seconds": {
+            "writer": 1.5069033750332892,
+            "reader": 1.5069055419880897
+          },
+          "settled_counts": {
+            "writer": {
+              "total": 1000000,
+              "distinct_ids": 1000000
+            },
+            "reader": {
+              "total": 1000000,
+              "distinct_ids": 1000000
+            }
+          },
+          "exact_once": true,
+          "wal_drops_delta": [
+            0.0,
+            0.0
+          ],
+          "flush_failures_delta": [
+            0.0,
+            0.0
+          ],
+          "replication_drops_delta": 0.0,
+          "live_replica_rows_delta": 1000000.0,
+          "wal_identity_summary": {
+            "writer": {
+              "data_entries": 1100,
+              "tracked_entries": 1100,
+              "data_payload_bytes": 46045988,
+              "identity_set_sha256": "45b6905da3dbf2fe34ba7af0e7ad74a6db34fe3e76f2bac0a1e4af9eac6d0ae4"
+            },
+            "reader": {
+              "data_entries": 1100,
+              "tracked_entries": 1100,
+              "data_payload_bytes": 46045988,
+              "identity_set_sha256": "45b6905da3dbf2fe34ba7af0e7ad74a6db34fe3e76f2bac0a1e4af9eac6d0ae4"
+            }
+          },
+          "cpu_seconds_during_writes": {
+            "writer": 0.6300000000000001,
+            "reader": 0.7600000000000001
+          }
+        },
+        {
+          "trial": 2,
+          "write": {
+            "seconds": 1.3741678330115974,
+            "records_per_second": 727713.1482610977,
+            "requests": 1000,
+            "http_statuses": {
+              "204": 1000
+            },
+            "p50_ms": 0.25516701862215996,
+            "p95_ms": 7.430542027577758,
+            "p99_ms": 11.808792012743652
+          },
+          "first_all_distinct_visible_seconds": {
+            "writer": 1.463033500011079,
+            "reader": 1.4630341669544578
+          },
+          "settled_counts": {
+            "writer": {
+              "total": 1000000,
+              "distinct_ids": 1000000
+            },
+            "reader": {
+              "total": 1000000,
+              "distinct_ids": 1000000
+            }
+          },
+          "exact_once": true,
+          "wal_drops_delta": [
+            0.0,
+            0.0
+          ],
+          "flush_failures_delta": [
+            0.0,
+            0.0
+          ],
+          "replication_drops_delta": 0.0,
+          "live_replica_rows_delta": 1000000.0,
+          "wal_identity_summary": {
+            "writer": {
+              "data_entries": 1100,
+              "tracked_entries": 1100,
+              "data_payload_bytes": 46045988,
+              "identity_set_sha256": "edd61d59e66c423634f4ab4de517ad7a84017cba48af89fa1376a54b4ce9f687"
+            },
+            "reader": {
+              "data_entries": 1100,
+              "tracked_entries": 1100,
+              "data_payload_bytes": 46045988,
+              "identity_set_sha256": "edd61d59e66c423634f4ab4de517ad7a84017cba48af89fa1376a54b4ce9f687"
+            }
+          },
+          "cpu_seconds_during_writes": {
+            "writer": 0.6299999999999999,
+            "reader": 0.78
+          }
+        },
+        {
+          "trial": 3,
+          "write": {
+            "seconds": 1.3962118750205263,
+            "records_per_second": 716223.674852571,
+            "requests": 1000,
+            "http_statuses": {
+              "204": 1000
+            },
+            "p50_ms": 0.252292025834322,
+            "p95_ms": 7.813999895006418,
+            "p99_ms": 11.86008402146399
+          },
+          "first_all_distinct_visible_seconds": {
+            "writer": 1.4855725000379607,
+            "reader": 1.485575916012749
+          },
+          "settled_counts": {
+            "writer": {
+              "total": 1000000,
+              "distinct_ids": 1000000
+            },
+            "reader": {
+              "total": 1000000,
+              "distinct_ids": 1000000
+            }
+          },
+          "exact_once": true,
+          "wal_drops_delta": [
+            0.0,
+            0.0
+          ],
+          "flush_failures_delta": [
+            0.0,
+            0.0
+          ],
+          "replication_drops_delta": 0.0,
+          "live_replica_rows_delta": 1000000.0,
+          "wal_identity_summary": {
+            "writer": {
+              "data_entries": 1100,
+              "tracked_entries": 1100,
+              "data_payload_bytes": 46045988,
+              "identity_set_sha256": "1071935a3392b1cc8412f9a20318e165cde12e6ad5b73b158330afb7b2403d64"
+            },
+            "reader": {
+              "data_entries": 1100,
+              "tracked_entries": 1100,
+              "data_payload_bytes": 46045988,
+              "identity_set_sha256": "1071935a3392b1cc8412f9a20318e165cde12e6ad5b73b158330afb7b2403d64"
+            }
+          },
+          "cpu_seconds_during_writes": {
+            "writer": 0.62,
+            "reader": 0.7500000000000001
+          }
+        }
+      ],
+      "median_records_per_second": 716223.674852571
+    },
+    {
+      "label": "pr1118-control-concurrent",
+      "source_commit": "e855b6d7",
+      "binary_sha256": "e468e00ad5d4f7758507435b2ff6a0280324cc944e6af599435eba7e16452f91",
+      "fixture_sha256": "a286d26162c5fb1ebe818ac71d004b89246df30f045e36e305542287c3970a7d",
+      "clients": 4,
+      "rows": 1000000,
+      "batch_rows": 1000,
+      "warmup_rows": 100000,
+      "payload_bytes": 41938544,
+      "configuration": {
+        "GOMAXPROCS": "4",
+        "GOMEMLIMIT": "1536MiB",
+        "ARC_SERVER_HOST": "127.0.0.1",
+        "ARC_LOG_LEVEL": "info",
+        "ARC_LOG_FORMAT": "json",
+        "ARC_TELEMETRY_ENABLED": "false",
+        "ARC_AUTH_ENABLED": "true",
+        "ARC_STORAGE_BACKEND": "local",
+        "ARC_WAL_ENABLED": "true",
+        "ARC_WAL_SYNC_MODE": "fdatasync",
+        "ARC_WAL_MAX_SIZE_MB": "100",
+        "ARC_WAL_MAX_AGE_SECONDS": "3600",
+        "ARC_INGEST_MAX_BUFFER_SIZE": "50000",
+        "ARC_INGEST_MAX_BUFFER_AGE_MS": "1000",
+        "ARC_INGEST_FLUSH_WORKERS": "4",
+        "ARC_INGEST_SHARD_COUNT": "16",
+        "ARC_INGEST_COMPRESSION": "snappy",
+        "ARC_COMPACTION_ENABLED": "false",
+        "ARC_RETENTION_ENABLED": "false",
+        "ARC_CONTINUOUS_QUERY_ENABLED": "false",
+        "ARC_TIERING_ENABLED": "false",
+        "ARC_BACKUP_ENABLED": "false",
+        "ARC_CACHE_ENABLED": "false",
+        "ARC_DATABASE_MEMORY_LIMIT": "512MB",
+        "ARC_DATABASE_THREAD_COUNT": "2",
+        "ARC_DATABASE_MAX_CONNECTIONS": "4",
+        "ARC_CLUSTER_ENABLED": "true",
+        "ARC_CLUSTER_REPLICATION_ENABLED": "true",
+        "ARC_CLUSTER_CLUSTER_NAME": "arc-msgpack-1m-isolated",
+        "ARC_CLUSTER_FAILOVER_ENABLED": "false",
+        "ARC_CLUSTER_SHARED_STORAGE_MODE": "false"
+      },
+      "machine": "macOS-26.6.2-arm64-arm-64bit",
+      "architecture": "arm64",
+      "trials": [
+        {
+          "trial": 1,
+          "write": {
+            "seconds": 0.82421404204797,
+            "records_per_second": 1213277.0724401213,
+            "requests": 1000,
+            "http_statuses": {
+              "204": 1000
+            },
+            "p50_ms": 0.8842500392347574,
+            "p95_ms": 10.053417063318193,
+            "p99_ms": 17.552000004798174
+          },
+          "first_all_distinct_visible_seconds": {
+            "writer": 0.946158375008963,
+            "reader": 0.9461605419637635
+          },
+          "settled_counts": {
+            "writer": {
+              "total": 1000000,
+              "distinct_ids": 1000000
+            },
+            "reader": {
+              "total": 2000000,
+              "distinct_ids": 1000000
+            }
+          },
+          "exact_once": false,
+          "wal_drops_delta": [
+            0.0,
+            0.0
+          ],
+          "flush_failures_delta": [
+            0.0,
+            0.0
+          ],
+          "replication_drops_delta": 0.0,
+          "live_replica_rows_delta": 1000000.0,
+          "wal_identity_summary": {
+            "writer": {
+              "data_entries": 1100,
+              "tracked_entries": 1100,
+              "data_payload_bytes": 46045988,
+              "identity_set_sha256": "e590c2a1221bf83e43551a5bd77066bd218ca44943d08e11fea6dff82bd29156"
+            },
+            "reader": {
+              "data_entries": 1100,
+              "tracked_entries": 1100,
+              "data_payload_bytes": 46045988,
+              "identity_set_sha256": "6bfeda345800f4b13467c33e5967994999f95552422b056af064701d21451d8a"
+            }
+          },
+          "cpu_seconds_during_writes": {
+            "writer": 0.5700000000000001,
+            "reader": 0.67
+          }
+        },
+        {
+          "trial": 2,
+          "write": {
+            "seconds": 0.793104707961902,
+            "records_per_second": 1260867.562581707,
+            "requests": 1000,
+            "http_statuses": {
+              "204": 1000
+            },
+            "p50_ms": 0.6668339483439922,
+            "p95_ms": 10.012833983637393,
+            "p99_ms": 17.01662503182888
+          },
+          "first_all_distinct_visible_seconds": {
+            "writer": 0.9160879170522094,
+            "reader": 0.9160885839955881
+          },
+          "settled_counts": {
+            "writer": {
+              "total": 1000000,
+              "distinct_ids": 1000000
+            },
+            "reader": {
+              "total": 2000000,
+              "distinct_ids": 1000000
+            }
+          },
+          "exact_once": false,
+          "wal_drops_delta": [
+            0.0,
+            0.0
+          ],
+          "flush_failures_delta": [
+            0.0,
+            0.0
+          ],
+          "replication_drops_delta": 0.0,
+          "live_replica_rows_delta": 1000000.0,
+          "wal_identity_summary": {
+            "writer": {
+              "data_entries": 1100,
+              "tracked_entries": 1100,
+              "data_payload_bytes": 46045988,
+              "identity_set_sha256": "0ad0e450433b947020a929af32c35410cc2188d4ac0ec4ff3dc6df1dd96fcb78"
+            },
+            "reader": {
+              "data_entries": 1100,
+              "tracked_entries": 1100,
+              "data_payload_bytes": 46045988,
+              "identity_set_sha256": "e81ca0d69c1a164ae3a387cc80d7db15aa4a5b0daf3e06eb1428d6b5f6ca70d5"
+            }
+          },
+          "cpu_seconds_during_writes": {
+            "writer": 0.55,
+            "reader": 0.6599999999999999
+          }
+        }
+      ],
+      "failed_trials": [
+        {
+          "trial": 3,
+          "status": "failed",
+          "reason": "replication did not settle before timeout",
+          "reader_sequence_rejection_count": 1,
+          "last_counts": {
+            "writer": {
+              "total": 1000000,
+              "distinct_ids": 1000000
+            },
+            "reader": {
+              "total": 1448000,
+              "distinct_ids": 1000000
+            }
+          },
+          "throughput_valid": false
+        }
+      ],
+      "median_records_per_second": null
+    },
+    {
+      "label": "handoff-1118-final-concurrent",
+      "source_commit": "9f4ac14e",
+      "binary_sha256": "b6e6143034c70cac38a6063b0c24f012e0e5c638e0ba46dfc2c51cb09be5839b",
+      "fixture_sha256": "a286d26162c5fb1ebe818ac71d004b89246df30f045e36e305542287c3970a7d",
+      "clients": 4,
+      "rows": 1000000,
+      "batch_rows": 1000,
+      "warmup_rows": 100000,
+      "payload_bytes": 41938544,
+      "configuration": {
+        "GOMAXPROCS": "4",
+        "GOMEMLIMIT": "1536MiB",
+        "ARC_SERVER_HOST": "127.0.0.1",
+        "ARC_LOG_LEVEL": "info",
+        "ARC_LOG_FORMAT": "json",
+        "ARC_TELEMETRY_ENABLED": "false",
+        "ARC_AUTH_ENABLED": "true",
+        "ARC_STORAGE_BACKEND": "local",
+        "ARC_WAL_ENABLED": "true",
+        "ARC_WAL_SYNC_MODE": "fdatasync",
+        "ARC_WAL_MAX_SIZE_MB": "100",
+        "ARC_WAL_MAX_AGE_SECONDS": "3600",
+        "ARC_INGEST_MAX_BUFFER_SIZE": "50000",
+        "ARC_INGEST_MAX_BUFFER_AGE_MS": "1000",
+        "ARC_INGEST_FLUSH_WORKERS": "4",
+        "ARC_INGEST_SHARD_COUNT": "16",
+        "ARC_INGEST_COMPRESSION": "snappy",
+        "ARC_COMPACTION_ENABLED": "false",
+        "ARC_RETENTION_ENABLED": "false",
+        "ARC_CONTINUOUS_QUERY_ENABLED": "false",
+        "ARC_TIERING_ENABLED": "false",
+        "ARC_BACKUP_ENABLED": "false",
+        "ARC_CACHE_ENABLED": "false",
+        "ARC_DATABASE_MEMORY_LIMIT": "512MB",
+        "ARC_DATABASE_THREAD_COUNT": "2",
+        "ARC_DATABASE_MAX_CONNECTIONS": "4",
+        "ARC_CLUSTER_ENABLED": "true",
+        "ARC_CLUSTER_REPLICATION_ENABLED": "true",
+        "ARC_CLUSTER_CLUSTER_NAME": "arc-msgpack-1m-isolated",
+        "ARC_CLUSTER_FAILOVER_ENABLED": "false",
+        "ARC_CLUSTER_SHARED_STORAGE_MODE": "false"
+      },
+      "machine": "macOS-26.6.2-arm64-arm-64bit",
+      "architecture": "arm64",
+      "trials": [
+        {
+          "trial": 1,
+          "write": {
+            "seconds": 1.1425692499615252,
+            "records_per_second": 875220.4735368766,
+            "requests": 1000,
+            "http_statuses": {
+              "204": 1000
+            },
+            "p50_ms": 3.6768330028280616,
+            "p95_ms": 14.736084034666419,
+            "p99_ms": 20.828874898143113
+          },
+          "first_all_distinct_visible_seconds": {
+            "writer": 1.2471007080748677,
+            "reader": 1.2471031669992954
+          },
+          "settled_counts": {
+            "writer": {
+              "total": 1000000,
+              "distinct_ids": 1000000
+            },
+            "reader": {
+              "total": 1000000,
+              "distinct_ids": 1000000
+            }
+          },
+          "exact_once": true,
+          "wal_drops_delta": [
+            0.0,
+            0.0
+          ],
+          "flush_failures_delta": [
+            0.0,
+            0.0
+          ],
+          "replication_drops_delta": 0.0,
+          "live_replica_rows_delta": 1000000.0,
+          "wal_identity_summary": {
+            "writer": {
+              "data_entries": 1100,
+              "tracked_entries": 1100,
+              "data_payload_bytes": 46045988,
+              "identity_set_sha256": "2f37ad26107e8b64853057fa51aa6bf6f4c764e94ceebeaeee448538cc49a649"
+            },
+            "reader": {
+              "data_entries": 1100,
+              "tracked_entries": 1100,
+              "data_payload_bytes": 46045988,
+              "identity_set_sha256": "2f37ad26107e8b64853057fa51aa6bf6f4c764e94ceebeaeee448538cc49a649"
+            }
+          },
+          "cpu_seconds_during_writes": {
+            "writer": 0.6699999999999999,
+            "reader": 0.73
+          }
+        },
+        {
+          "trial": 2,
+          "write": {
+            "seconds": 1.1566004999913275,
+            "records_per_second": 864602.7733927992,
+            "requests": 1000,
+            "http_statuses": {
+              "204": 1000
+            },
+            "p50_ms": 3.63016698975116,
+            "p95_ms": 14.329084078781307,
+            "p99_ms": 22.98087498638779
+          },
+          "first_all_distinct_visible_seconds": {
+            "writer": 1.2767203329131007,
+            "reader": 1.276721040951088
+          },
+          "settled_counts": {
+            "writer": {
+              "total": 1000000,
+              "distinct_ids": 1000000
+            },
+            "reader": {
+              "total": 1000000,
+              "distinct_ids": 1000000
+            }
+          },
+          "exact_once": true,
+          "wal_drops_delta": [
+            0.0,
+            0.0
+          ],
+          "flush_failures_delta": [
+            0.0,
+            0.0
+          ],
+          "replication_drops_delta": 0.0,
+          "live_replica_rows_delta": 1000000.0,
+          "wal_identity_summary": {
+            "writer": {
+              "data_entries": 1100,
+              "tracked_entries": 1100,
+              "data_payload_bytes": 46045988,
+              "identity_set_sha256": "058bb723f13fb106ec96d1689ff4efe02c6367459ea5404fd53c164add67ecd9"
+            },
+            "reader": {
+              "data_entries": 1100,
+              "tracked_entries": 1100,
+              "data_payload_bytes": 46045988,
+              "identity_set_sha256": "058bb723f13fb106ec96d1689ff4efe02c6367459ea5404fd53c164add67ecd9"
+            }
+          },
+          "cpu_seconds_during_writes": {
+            "writer": 0.6299999999999999,
+            "reader": 0.75
+          }
+        },
+        {
+          "trial": 3,
+          "write": {
+            "seconds": 1.1918272499460727,
+            "records_per_second": 839047.7731107823,
+            "requests": 1000,
+            "http_statuses": {
+              "204": 1000
+            },
+            "p50_ms": 3.582332981750369,
+            "p95_ms": 16.421749955043197,
+            "p99_ms": 24.255999946035445
+          },
+          "first_all_distinct_visible_seconds": {
+            "writer": 1.331452582962811,
+            "reader": 1.3314533329103142
+          },
+          "settled_counts": {
+            "writer": {
+              "total": 1000000,
+              "distinct_ids": 1000000
+            },
+            "reader": {
+              "total": 1000000,
+              "distinct_ids": 1000000
+            }
+          },
+          "exact_once": true,
+          "wal_drops_delta": [
+            0.0,
+            0.0
+          ],
+          "flush_failures_delta": [
+            0.0,
+            0.0
+          ],
+          "replication_drops_delta": 0.0,
+          "live_replica_rows_delta": 1000000.0,
+          "wal_identity_summary": {
+            "writer": {
+              "data_entries": 1100,
+              "tracked_entries": 1100,
+              "data_payload_bytes": 46045988,
+              "identity_set_sha256": "fe4333987f6e4ccc6fa1247209a2d7730d0438142ab69f7fff88011f5286ab5c"
+            },
+            "reader": {
+              "data_entries": 1100,
+              "tracked_entries": 1100,
+              "data_payload_bytes": 46045988,
+              "identity_set_sha256": "fe4333987f6e4ccc6fa1247209a2d7730d0438142ab69f7fff88011f5286ab5c"
+            }
+          },
+          "cpu_seconds_during_writes": {
+            "writer": 0.69,
+            "reader": 0.82
+          }
+        }
+      ],
+      "median_records_per_second": 864602.7733927992
+    }
+  ]
+}

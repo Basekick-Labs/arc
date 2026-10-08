@@ -235,3 +235,42 @@ The final integrated race matrix passed all 13 packages (`wal`, `replicaview`,
 `ingest`, `cluster/...`, `compaction`, `api`, `storage`, and `cmd/arc`) with
 `duckdb_arrow`, after the startup, origin-hour replay, inode sync, and compaction
 recovery fixes. Log: `/private/tmp/arc-handoff-1118-final-race.log`.
+
+
+## Integrated checkpoint performance: 2026-10-08
+
+Fresh comparison against PR #1118 (`e855b6d7`), using the same pinned fixture,
+100k warm-up, 1,000-row batches, 50k buffer, and licensed writer/reader settings.
+Handoff source: `9f4ac14e`. No builds or tests from this session ran alongside
+these measurements. Three sequential trials per configuration:
+
+| Build | Clients | Median records/sec | Reader total/distinct |
+| --- | ---: | ---: | --- |
+| PR #1118 control | 1 | 1,051,640 | 2M / 1M (duplicates) |
+| Integrated local handoff | 1 | 716,224 | 1M / 1M |
+| PR #1118 control | 4 | No valid three-trial result | Third trial failed stream ordering/catch-up |
+| Integrated local handoff | 4 | 864,603 | 1M / 1M |
+
+Serial median throughput fell **31.9%**; median request p95 increased from
+4.41 ms to 7.52 ms. All six handoff trials returned exactly 1M rows on both nodes,
+matched originating and received identities, and recorded no drops or flush
+failures. Both builds wrote 1,100 data WAL entries including warm-up and the same
+46,101,435 WAL bytes per node: this is not an extra WAL record per write. The
+comparison measures the full handoff, verification, pinning and durability work;
+it does not isolate which component causes the regression.
+
+The four-client control completed two timed trials (1,213,277 and 1,260,868
+records/sec, both with duplicate reader rows). Trial three rejected an
+out-of-order replication entry and timed out at reader counts of 1,448,000 total /
+1,000,000 distinct. Do not discard that failure and present a three-trial median
+or a clean concurrent speed comparison. The handoff's sender-ordering fix
+avoided the failure in its three observed trials.
+
+These are short ~0.8–1.4 second ingestion windows on a shared machine, not capacity
+estimates. The serial regression remains unresolved and needs profiling before
+release. Machine/configuration, binary/fixture hashes, per-trial timings, row
+counts, WAL identity summaries and the failed baseline trial are checked in as
+[`replication-handoff-benchmark-2026-10-08.json`](replication-handoff-benchmark-2026-10-08.json).
+External raw directories: `/private/tmp/arc-msgpack-1m.Zp5NTf/` with labels `pr1118-control-serial`,
+`handoff-1118-final-serial`, `pr1118-control-concurrent`, and
+`handoff-1118-final-concurrent`.
