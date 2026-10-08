@@ -432,8 +432,11 @@ type Progress struct {
 	// from a different cause — and on a node where the cold-metadata sync
 	// never runs (standalone, or a cluster without shared storage or
 	// replication) nothing will write that row later either.
-	ColdFilesRestoredToCold      int64 `json:"cold_files_restored_to_cold,omitempty"`
-	ColdFilesRestoredToHot       int64 `json:"cold_files_restored_to_hot,omitempty"`
+	ColdFilesRestoredToCold int64 `json:"cold_files_restored_to_cold,omitempty"`
+	ColdFilesRestoredToHot  int64 `json:"cold_files_restored_to_hot,omitempty"`
+	// ColdFilesSkippedAlreadyCold counts hot-backup files whose matching cold
+	// copy and cold tier row already exist locally, so restore left them there.
+	ColdFilesSkippedAlreadyCold  int64 `json:"cold_files_skipped_already_cold,omitempty"`
 	ColdRestoreQuarantineSkipped int64 `json:"cold_restore_quarantine_skipped,omitempty"`
 	ColdRowsNotRecorded          int64 `json:"cold_rows_not_recorded,omitempty"`
 	// Cluster cross-check, backup only (#1083): mirrors of the manifest's
