@@ -41,6 +41,30 @@ in an earlier file that is still awaiting recovery. Preserve quarantined files
 together with the remaining WAL directory; deleting or moving one away can
 remove the proof that prevents already-flushed records from being replayed.
 
+## Replay attempts across restarts
+
+Completed failed replay passes are recorded in a small `<file>.wal.recovery`
+sidecar. Its update is written to a temporary file, synced, renamed atomically,
+and the directory is synced before quarantine can proceed. Restarting Arc no
+longer resets the threshold (three failed passes by default). The sidecar stores
+only a format version, attempt count, file size and modification timestamp;
+it contains no records. A changed size or timestamp starts a new attempt series
+for an operator-repaired file.
+
+Cancellation of recovery and failure of the flush barrier do not add strikes.
+Successful replay clears prior strikes. Attempts interrupted before their
+failure is recorded are not counted. Quarantine preserves the original WAL
+bytes and their checkpoints; it does not declare their records disposable.
+
+Each node must exclusively own its WAL directory. Keep attempt sidecars with
+the WAL when restoring a stopped node, preserving file timestamps. If attempt
+metadata cannot be read or written, recovery reports an error and retains the
+WAL rather than guessing a count. Investigate filesystem permissions, free
+space or malformed metadata before retrying. Sidecars are removed after a
+successful replay or quarantine; cleanup failures are logged. A process crash
+may leave an unreferenced `.wal-recovery-*` temporary file, which is not replayed
+or used as a checkpoint.
+
 ## Recovery wait budget
 
 Startup and maintenance recovery barriers submit buffered measurements to the

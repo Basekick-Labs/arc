@@ -107,15 +107,13 @@ type Recovery struct {
 	logger zerolog.Logger
 
 	failuresMu sync.Mutex
-	failures   map[string]int
 }
 
 // NewRecovery creates a new WAL recovery manager
 func NewRecovery(walDir string, logger zerolog.Logger) *Recovery {
 	return &Recovery{
-		walDir:   walDir,
-		logger:   logger.With().Str("component", "wal-recovery").Logger(),
-		failures: make(map[string]int),
+		walDir: walDir,
+		logger: logger.With().Str("component", "wal-recovery").Logger(),
 	}
 }
 
@@ -218,9 +216,15 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		return true
 	}
 	recordReplayFailure := func(path string, cause error) bool {
+		if err := ctx.Err(); err != nil {
+			stats.KeptFiles++
+			recoveryErr = err
+			return false
+		}
 		quarantined, quarantineErr := r.noteReplayFailure(path, maxReplayFailures)
 		if quarantineErr != nil {
 			stats.KeptFiles++
+			recoveryErr = fmt.Errorf("persist WAL replay failure for %q: %w", path, quarantineErr)
 			r.logger.Error().Err(quarantineErr).Str("file", path).Msg("Failed to quarantine repeatedly failing WAL file")
 			return false
 		}
@@ -397,6 +401,12 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		}
 
 		stats.CorruptedEntries += int(reader.CorruptedEntries)
+		// Shutdown is not evidence of a poison file. Keep this file and any
+		// pending barrier batch without persisting a failed replay attempt.
+		if err := ctx.Err(); err != nil {
+			stats.KeptFiles += len(pendingDelete) + len(walFiles) - fileIndex
+			return stats, err
+		}
 		if reader.CorruptedEntries > 0 {
 			allEntriesSucceeded = false
 		}
@@ -449,6 +459,8 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 	}
 	if recoveryErr == nil {
 		flushPending()
+	} else {
+		stats.KeptFiles += len(pendingDelete)
 	}
 
 	stats.RecoveryDuration = time.Since(startTime)
@@ -474,12 +486,19 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 // discarded as part of recovery.
 func (r *Recovery) noteReplayFailure(path string, maxAttempts int) (bool, error) {
 	r.failuresMu.Lock()
-	if r.failures == nil {
-		r.failures = make(map[string]int)
+	defer r.failuresMu.Unlock()
+	attempts, err := readReplayAttempts(path)
+	if err != nil {
+		return false, err
 	}
-	r.failures[path]++
-	attempts := r.failures[path]
-	r.failuresMu.Unlock()
+	if attempts < maxAttempts {
+		attempts++
+	}
+	// Persist the completed failed pass BEFORE renaming the WAL. If the
+	// process dies between these steps, a new Recovery can finish quarantine.
+	if err := writeReplayAttempts(path, attempts); err != nil {
+		return false, err
+	}
 	if attempts < maxAttempts {
 		return false, nil
 	}
@@ -491,17 +510,17 @@ func (r *Recovery) noteReplayFailure(path string, maxAttempts int) (bool, error)
 	if err := os.Rename(path, quarantinePath); err != nil {
 		return false, err
 	}
-
-	r.failuresMu.Lock()
-	delete(r.failures, path)
-	r.failuresMu.Unlock()
+	if err := syncRecoveryDirectory(filepath.Dir(path)); err != nil {
+		return false, err
+	}
+	r.removeReplayAttempts(path)
 	return true, nil
 }
 
 func (r *Recovery) clearReplayFailure(path string) {
 	r.failuresMu.Lock()
-	delete(r.failures, path)
-	r.failuresMu.Unlock()
+	defer r.failuresMu.Unlock()
+	r.removeReplayAttempts(path)
 }
 
 // findWALFiles finds all WAL files in the directory, sorted by modification time

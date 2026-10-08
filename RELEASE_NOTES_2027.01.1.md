@@ -1115,6 +1115,13 @@ their normal per-write deadlines and WAL identities. A timeout or failed
 barrier retains the WAL for a later recovery pass, including when storage ignores
 cancellation. Concurrent ingestion can continue while recovery waits.
 
+Completed failed replay attempts now survive process restarts in synced
+per-file `.wal.recovery` sidecars, so repeated restarts cannot reset the poison
+file quarantine threshold. Cancellation and flush-barrier outages do not add
+strikes. Unreadable or unwritable attempt metadata reports an error and retains
+the WAL; quarantine still preserves its original bytes and valid checkpoints.
+The operational guide describes sidecar recovery and cleanup behavior.
+
 Contributed by [@jallegri](https://github.com/jallegri) in [#1118](https://github.com/Basekick-Labs/arc/pull/1118).
 
 ### The tiering files endpoint rejects an invalid `limit` ([#1135](https://github.com/Basekick-Labs/arc/issues/1135))
