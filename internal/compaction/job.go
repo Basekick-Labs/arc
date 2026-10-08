@@ -374,6 +374,24 @@ func (j *Job) Run(ctx context.Context) error {
 		Int64("bytes", j.BytesAfter).
 		Msg("Compacted file created")
 
+	// Digest the output BEFORE it is published, because publishing may consume
+	// it: on a local backend uploadFile moves the file into place rather than
+	// copying it (#969), so a hash taken afterwards would read a path that no
+	// longer exists. Taken here rather than nearer the manifest write so a
+	// hash failure needs no unwinding -- no manifest exists yet.
+	//
+	// Cluster mode only. The completion manifest is the only consumer, and an
+	// unconditional hash would add a full read of the output to the OSS
+	// single-node configuration, which never writes one.
+	var outputSHA string
+	if j.clusterMode() {
+		sum, hashErr := sha256File(compactedFile)
+		if hashErr != nil {
+			return j.fail(fmt.Errorf("failed to hash compacted file: %w", hashErr))
+		}
+		outputSHA = sum
+	}
+
 	// Upload compacted file
 	compactedKey := filepath.Join(j.PartitionPath, filepath.Base(compactedFile))
 	// Recorded on the Job so the subprocess result can carry the STORAGE key
@@ -419,14 +437,19 @@ func (j *Job) Run(ctx context.Context) error {
 	// completion manifest in state output_written BEFORE we delete sources.
 	// From here on, the watcher will eventually register the compacted file
 	// in the Raft manifest even if the subprocess crashes before the delete
-	// phase. Failure to write the completion manifest is non-fatal in the
-	// sense that it doesn't unwind the upload — but we log a warning and
-	// fail the job so the next cycle retries: the watcher needs the
-	// manifest to do its work, and without it this job's output is invisible
-	// to the cluster.
+	// phase.
+	//
+	// Failing here does NOT unwind the upload, and it does not get retried
+	// into a good state either: next cycle recoverLoadedManifest finds the
+	// output present with a matching size (manifest.go:397-460), deletes the
+	// inputs and deletes the compaction manifest without ever writing a
+	// completion manifest, so the Raft RegisterFile never fires and the output
+	// is a file no manifest entry describes. We still fail the job, because a
+	// failed job is at least visible; the recovery gap itself is #1155 and is
+	// not something this call site can fix.
 	if j.clusterMode() {
-		if err := j.writeOutputWrittenManifest(ctx, compactedFile, compactedKey); err != nil {
-			j.logger.Error().Err(err).Msg("Phase 4: failed to write output_written completion manifest; cluster will not see this compaction until the next cycle")
+		if err := j.writeOutputWrittenManifest(ctx, outputSHA, compactedKey); err != nil {
+			j.logger.Error().Err(err).Msg("Phase 4: failed to write output_written completion manifest; the cluster will not see this compacted file and the next cycle does not recover it - see arc issue 1155")
 			return j.fail(fmt.Errorf("failed to write completion manifest: %w", err))
 		}
 	}
@@ -920,10 +943,41 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	return outputFile, nil
 }
 
-// uploadFile uploads a file to storage using streaming to avoid memory issues.
-// MEMORY OPTIMIZATION: Uses WriteReader to stream from disk instead of loading entire file into memory.
-// This prevents OOM errors when uploading large compacted files.
+// uploadFile publishes the compacted output to storage.
+//
+// On a local backend the object is a file on the same machine, so when the two
+// paths share a filesystem the output is MOVED into place rather than copied
+// (storage.FileAdopter) -- halving the I/O this step costs for an output of any
+// size (#969). The move CONSUMES the temp file, which is why Job.Run hashes it
+// beforehand rather than afterwards.
+//
+// Everything else streams: WriteReader reads from disk instead of loading the
+// whole file into memory, so a large compacted file cannot OOM the subprocess.
 func (j *Job) uploadFile(ctx context.Context, localPath, key string) error {
+	if adopter, ok := j.StorageBackend.(storage.FileAdopter); ok {
+		err := adopter.AdoptFile(ctx, key, localPath)
+		if err == nil {
+			j.logger.Debug().
+				Str("local_path", localPath).
+				Str("path", key).
+				Msg("Moved compacted output into storage without copying it")
+			return nil
+		}
+		if !errors.Is(err, storage.ErrAdoptUnsupported) {
+			return fmt.Errorf("failed to adopt compacted output: %w", err)
+		}
+		// Warn, not Debug: this costs the operator a full extra pass over the
+		// output on every compaction, and Debug from the compaction subprocess
+		// reaches nobody at the default log level. The usual cause is
+		// compaction.temp_directory sitting on a different filesystem from
+		// storage.local_path, which is a supported and deliberate setup -- so
+		// the line reports the cost, it does not report a fault.
+		j.logger.Warn().Err(err).
+			Str("local_path", localPath).
+			Str("path", key).
+			Msg("Compacted output cannot be moved into storage and will be copied instead; point compaction.temp_directory at the same filesystem as the storage root to avoid the extra pass")
+	}
+
 	file, err := os.Open(localPath)
 	if err != nil {
 		return fmt.Errorf("failed to open local file: %w", err)
@@ -995,30 +1049,18 @@ func (j *Job) deleteOldFiles(ctx context.Context) error {
 // RegisterFile to the Raft manifest, making the compacted file visible to
 // every peer in the cluster.
 //
-// We compute the SHA-256 of the compacted file by streaming the local temp
-// copy, not by re-downloading from storage — we still have it on disk at
-// this point in the flow, and hashing locally is essentially free compared
-// to a re-download. The hash is the authoritative value: peers will verify
-// their pulled bytes against it via the existing Phase 2/3 fetch path.
+// outputSHA is the SHA-256 of the compacted output, computed by Job.Run from
+// the local temp copy BEFORE the upload rather than by re-downloading from
+// storage: we still had the file on disk at that point and hashing locally is
+// essentially free next to a re-download. It has to happen before the upload
+// because on a local backend the upload MOVES the file into place rather than
+// copying it (#969), so there is nothing left here to read. The hash is the
+// authoritative value: peers verify their pulled bytes against it via the
+// existing Phase 2/3 fetch path.
 //
-// Fails fast with a wrapped error on SHA computation or manifest write
-// failure. The caller (Job.Run) treats a failure here as job-fatal so the
-// next cycle retries cleanly.
-func (j *Job) writeOutputWrittenManifest(_ context.Context, localPath, storageKey string) error {
-	// Hash the local compacted file before upload wipes the reference.
-	// Streaming sha256 avoids allocating the whole file into memory.
-	f, err := os.Open(localPath)
-	if err != nil {
-		return fmt.Errorf("open compacted file for hashing: %w", err)
-	}
-	defer f.Close()
-
-	hasher := sha256.New()
-	if _, err := io.Copy(hasher, f); err != nil {
-		return fmt.Errorf("stream-hash compacted file: %w", err)
-	}
-	sum := hex.EncodeToString(hasher.Sum(nil))
-
+// Fails fast with a wrapped error on manifest write failure. See the call site
+// in Job.Run for what a failure here does and does not get retried into.
+func (j *Job) writeOutputWrittenManifest(_ context.Context, outputSHA, storageKey string) error {
 	now := time.Now().UTC()
 	m := &CompletionManifest{
 		JobID: j.JobID,
@@ -1036,7 +1078,7 @@ func (j *Job) writeOutputWrittenManifest(_ context.Context, localPath, storageKe
 		Outputs: []CompactedOutput{
 			{
 				Path:      storageKey,
-				SHA256:    sum,
+				SHA256:    outputSHA,
 				SizeBytes: j.BytesAfter,
 				// THIS is the field the watcher reads into the Raft
 				// FileEntry (watcher.go builds CompactedFile from Outputs),
@@ -1060,7 +1102,7 @@ func (j *Job) writeOutputWrittenManifest(_ context.Context, localPath, storageKe
 	}
 	j.logger.Info().
 		Str("completion_state", string(CompletionStateOutputWritten)).
-		Str("sha256", sum).
+		Str("sha256", outputSHA).
 		Int64("size_bytes", j.BytesAfter).
 		Str("storage_key", storageKey).
 		Msg("Phase 4 completion manifest: output_written")
@@ -1129,6 +1171,26 @@ func (j *Job) discardCompletionManifest() {
 	if err := deleteCompletionManifest(path); err != nil {
 		j.logger.Warn().Err(err).Str("path", path).Msg("Failed to remove completion manifest for zero-work job; orphan sweep will collect it")
 	}
+}
+
+// sha256File streams the file at path through SHA-256 and returns the digest
+// hex-encoded. Streaming rather than reading the file in keeps a large
+// compacted output off the subprocess heap.
+//
+// Job.Run calls this on the compacted output BEFORE publishing it, because
+// publishing may move the file rather than copy it (#969).
+func sha256File(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("open file for hashing: %w", err)
+	}
+	defer f.Close()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, f); err != nil {
+		return "", fmt.Errorf("stream-hash file: %w", err)
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
 // cleanupTemp removes the temporary directory
