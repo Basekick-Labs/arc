@@ -49,6 +49,9 @@ jobs:
             exit 1
           fi
 
+      - name: Enterprise shared smoke harness regressions
+        run: python3 -m unittest discover -s deploy/docker-compose/enterprise-shared -p 'test_smoke.py'
+
       - name: Build
         run: go build -tags=duckdb_arrow ./...
 

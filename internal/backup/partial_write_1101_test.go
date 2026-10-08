@@ -88,7 +88,7 @@ func TestCleanupPartialBackupWriteDeletesOnANonStagingDestination(t *testing.T) 
 	fake := &recordingBackend{}
 	m := newTestManagerWithBackupStorage(fake, &out)
 
-	m.cleanupPartialBackupWrite(context.Background(), "backup-20260101-000000-abcdef12/data/db/cpu/x.parquet")
+	m.cleanupPartialBackupWrite(context.Background(), m.defaultDestination(), "backup-20260101-000000-abcdef12/data/db/cpu/x.parquet")
 
 	if len(fake.deleted) != 1 {
 		t.Fatalf("Delete called %d times, want 1: a failed write to a remote backup destination must be compensated", len(fake.deleted))
@@ -105,7 +105,7 @@ func TestCleanupPartialBackupWriteUsesStagingWhenAvailable(t *testing.T) {
 	fake := &stagingBackend{}
 	m := newTestManagerWithBackupStorage(fake, &out)
 
-	m.cleanupPartialBackupWrite(context.Background(), "backup-x/data/db/cpu/x.parquet")
+	m.cleanupPartialBackupWrite(context.Background(), m.defaultDestination(), "backup-x/data/db/cpu/x.parquet")
 
 	if len(fake.staged) != 1 || fake.staged[0] != "backup-x/data/db/cpu/x.parquet" {
 		t.Errorf("DeleteStaged calls = %v, want exactly the destination key", fake.staged)
@@ -123,7 +123,7 @@ func TestCleanupPartialBackupWriteSwallowsItsOwnFailure(t *testing.T) {
 	fake := &recordingBackend{deleteErr: errors.New("storage unreachable")}
 	m := newTestManagerWithBackupStorage(fake, &out)
 
-	m.cleanupPartialBackupWrite(context.Background(), "backup-x/data/db/cpu/x.parquet")
+	m.cleanupPartialBackupWrite(context.Background(), m.defaultDestination(), "backup-x/data/db/cpu/x.parquet")
 
 	if len(fake.deleted) != 1 {
 		t.Fatalf("Delete called %d times, want 1", len(fake.deleted))
@@ -193,7 +193,7 @@ func TestBackupSQLiteFileCompensatesAFailedWrite(t *testing.T) {
 	fake := &recordingBackend{}
 	m := newTestManagerWithBackupStorage(fake, &out)
 
-	err = m.backupSQLiteFile(ctx, "backup-20260101-000000-abcdef12", dbPath, "arc.db")
+	err = m.backupSQLiteFile(ctx, m.defaultDestination(), "backup-20260101-000000-abcdef12", dbPath, "arc.db")
 	if err == nil {
 		t.Fatal("backupSQLiteFile must return the write failure")
 	}

@@ -18,6 +18,7 @@ const (
 const (
 	FeatureCQScheduler        = "cq_scheduler"
 	FeatureRetentionScheduler = "retention_scheduler"
+	FeatureEdgeSyncScheduler  = "edge_sync_scheduler"
 	FeatureClustering         = "clustering"
 	FeatureRBAC               = "rbac"
 	FeatureTieredStorage      = "tiering"
@@ -109,6 +110,12 @@ func (l *License) CanUseCQScheduler() bool {
 // CanUseRetentionScheduler returns true if the license allows retention scheduling
 // All valid license tiers (starter, professional, enterprise, unlimited) include this feature
 func (l *License) CanUseRetentionScheduler() bool {
+	return l.IsValid()
+}
+
+// CanUseEdgeSyncScheduler follows the CQ and retention scheduler entitlement:
+// every valid paid tier, including the grace period, can schedule sync.
+func (l *License) CanUseEdgeSyncScheduler() bool {
 	return l.IsValid()
 }
 

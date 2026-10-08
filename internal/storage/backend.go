@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"time"
 )
 
@@ -11,6 +12,37 @@ import (
 // backends that do not support append writes (S3, Azure Blob Storage).
 // Callers should delete any partial file and retry from byte zero.
 var ErrResumeNotSupported = errors.New("storage: resume not supported by this backend")
+
+// ErrObjectNotFound reports that a key names no object.
+//
+// It exists so a caller can tell "that object is not there" apart from "the
+// store would not answer" with ONE round trip. Without it the only portable
+// way to ask was Exists-then-Read, which doubles the request count on a path
+// that runs once per object — the backup listing reads a manifest per backup,
+// and on a remote destination with a few hundred backups the extra HEAD per
+// backup is what exhausts an API handler's budget on a perfectly healthy
+// store.
+//
+// Each backend wraps it from its own not-found shape; IsNotFound is the
+// predicate to use rather than string-matching, because the shapes differ
+// (an *fs.PathError locally, NoSuchKey on S3, a 404 ResponseError on Azure).
+var ErrObjectNotFound = errors.New("file not found")
+
+// IsNotFound reports whether err is a backend saying the key names no object.
+//
+// Tolerant on purpose: it accepts the wrapped sentinel, a wrapped fs
+// not-exist, and the per-backend shapes the two SDKs produce, because not
+// every error path in this package has been routed through the sentinel and a
+// false "no" here would turn an absent object into a hard failure.
+func IsNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrObjectNotFound) || errors.Is(err, fs.ErrNotExist) {
+		return true
+	}
+	return isNotFoundError(err) || isAzureNotFoundError(err)
+}
 
 // Backend defines the interface for storage backends (local, S3, MinIO)
 type Backend interface {
