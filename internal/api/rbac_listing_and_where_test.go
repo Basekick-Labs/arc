@@ -377,6 +377,10 @@ func TestOperatorListings_RequireAdmin(t *testing.T) {
 		"/api/v1/compaction/candidates",
 		"/api/v1/compaction/jobs",
 		"/api/v1/compaction/history",
+		// Per-cycle lookup (#1162): same enumeration surface — a cycle record
+		// names the databases it covered.
+		"/api/v1/compaction/cycles",
+		"/api/v1/compaction/cycles/1",
 	} {
 		t.Run("read token denied "+path, func(t *testing.T) {
 			req := httptest.NewRequest("GET", path, nil)

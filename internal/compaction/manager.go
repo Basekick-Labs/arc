@@ -25,11 +25,97 @@ var ErrCycleAlreadyRunning = errors.New("compaction cycle already running")
 // for the scheduler, which logs it at Info.
 var ErrCompactionPaused = errors.New("compaction is paused cluster-wide")
 
-// cycleOutcome records only eligible batches actually discovered during
-// this cycle. Unvisited measurements are never counted as unstarted work.
-type cycleOutcome struct {
-	CycleID         int64
-	Status          string
+// Where a cycle came from, recorded on its outcome so an operator can tell
+// their own trigger's cycle from the scheduler's. "unspecified" is the honest
+// label for the public RunCompactionCycle* family: the scheduler reaches the
+// cycle body through runCycleInternal directly, so those exported entries have
+// no production caller today and guessing "scheduler" for them would mislabel
+// whichever caller is added next.
+const (
+	cycleSourceAPI         = "api"
+	cycleSourceScheduler   = "scheduler"
+	cycleSourceUnspecified = "unspecified"
+)
+
+// CycleHistoryLimit bounds the retained cycle outcomes (#1162). Exported so
+// the API can clamp its limit parameter to it.
+//
+// The default schedules are hourly "5 * * * *" plus daily "0 3 * * *", so a
+// completely idle node still burns 25 ids a day -- every tick claims a cycle
+// and records a slot even with zero candidates. 500 is therefore ~20 days at
+// the defaults, and ~41 hours at the "*/5 * * * *" an operator reconciling a
+// large migration might set. 100 (the bound appendJobHistory uses) would have
+// been 4 days and 8.3 hours respectively: short enough that the scheduler's
+// own empty cycles would evict an operator's trigger overnight.
+const CycleHistoryLimit = 500
+
+// cycleFailedSampleLimit bounds the per-cycle sample of failed partitions.
+// The counters say how many batches failed; without the sample an operator has
+// no way to learn which, because job history carries no cycle id and is capped
+// at 10 entries in Stats. Mirrors skipped_sample (#977).
+const cycleFailedSampleLimit = 10
+
+// cycleProgress holds a running cycle's live counters. These were locals in
+// runClaimed, which meant a lookup of a running cycle could report its scope
+// and start time but nothing about progress -- useless for the multi-hour
+// cycles this endpoint exists to observe. The outcome record holds a pointer
+// while the cycle runs; the finalizer copies the values out and clears it.
+type cycleProgress struct {
+	discovered      atomic.Int64
+	started         atomic.Int64
+	succeeded       atomic.Int64
+	failed          atomic.Int64
+	interrupted     atomic.Int64
+	discoveryErrors atomic.Int64
+
+	mu           sync.Mutex
+	failedSample []string
+}
+
+// recordFailure samples the partition of a failed batch, up to the cap.
+func (p *cycleProgress) recordFailure(partitionPath string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.failedSample) >= cycleFailedSampleLimit {
+		return
+	}
+	p.failedSample = append(p.failedSample, partitionPath)
+}
+
+// snapshotFailedSample copies the sample out from under the mutex.
+func (p *cycleProgress) snapshotFailedSample() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.failedSample) == 0 {
+		return nil
+	}
+	out := make([]string, len(p.failedSample))
+	copy(out, p.failedSample)
+	return out
+}
+
+// CycleRecord is the outcome of one compaction cycle. It records only eligible
+// batches actually discovered during this cycle; unvisited measurements are
+// never counted as unstarted work.
+//
+// Exported because the API serves it per cycle id (#1162). Retained in a
+// bounded in-memory ring -- see CycleHistoryLimit.
+type CycleRecord struct {
+	CycleID int64
+	Status  string
+	Source  string
+
+	// Requested scope. Databases is nil when the cycle covered every database
+	// and Measurement is empty when it covered every measurement -- the cycle
+	// body works on its own expanded copy, so these stay what the caller asked
+	// for, which is what an operator is trying to match against.
+	Databases   []string
+	Measurement string
+	Tiers       []string
+
+	StartedAt  time.Time
+	FinishedAt time.Time // zero while the cycle runs
+
 	Discovered      int64
 	Started         int64
 	Succeeded       int64
@@ -37,6 +123,63 @@ type cycleOutcome struct {
 	Interrupted     int64
 	Unstarted       int64
 	DiscoveryErrors int64
+
+	// Err is the cycle error, truncated. A discovery-error count with no
+	// reason attached is a dead end for whoever has to act on it.
+	Err          string
+	FailedSample []string
+
+	// progress is non-nil only while the cycle runs, and is read only when
+	// FinishedAt is zero. The finalizer copies the counters into the fields
+	// above and clears it, so a finished outcome never follows the pointer.
+	progress *cycleProgress
+}
+
+// counters returns the outcome with its live counters resolved. A running
+// cycle's numbers come from progress; a finished one already has them.
+func (o CycleRecord) counters() CycleRecord {
+	p := o.progress
+	if p == nil {
+		return o
+	}
+	o.progress = nil
+	// Started is loaded FIRST, deliberately. Every batch is counted in
+	// discovered before started, so S <= D at any instant -- but these are two
+	// separate loads, and a full discover-dispatch-start sequence landing
+	// between them (async preemption can stretch that to milliseconds) would
+	// give Started(t2) > Discovered(t1) and a NEGATIVE Unstarted. Loading the
+	// smaller counter first makes Unstarted = D(t2) - S(t1) >= 0 always,
+	// because discovered is non-decreasing.
+	o.Started = p.started.Load()
+	o.Discovered = p.discovered.Load()
+	o.Succeeded = p.succeeded.Load()
+	o.Failed = p.failed.Load()
+	o.Interrupted = p.interrupted.Load()
+	o.DiscoveryErrors = p.discoveryErrors.Load()
+	o.Unstarted = o.Discovered - o.Started
+	o.FailedSample = p.snapshotFailedSample()
+	return o
+}
+
+// clone deep-copies the slices so a retained outcome never shares backing
+// storage with a caller outside the lock.
+func (o CycleRecord) clone() CycleRecord {
+	if o.Databases != nil {
+		dbs := make([]string, len(o.Databases))
+		copy(dbs, o.Databases)
+		o.Databases = dbs
+	}
+	if o.Tiers != nil {
+		tiers := make([]string, len(o.Tiers))
+		copy(tiers, o.Tiers)
+		o.Tiers = tiers
+	}
+	if o.FailedSample != nil {
+		fs := make([]string, len(o.FailedSample))
+		copy(fs, o.FailedSample)
+		o.FailedSample = fs
+	}
+	return o
 }
 
 // Manager orchestrates compaction jobs across all measurements
@@ -158,9 +301,18 @@ type Manager struct {
 	// hot loop and Stats (which holds mu) can both read it.
 	pauseGate atomic.Pointer[func() bool]
 
-	lastCycle cycleOutcome
-	logger    zerolog.Logger
-	mu        sync.Mutex
+	lastCycle CycleRecord
+
+	// cycleHistory retains the newest CycleHistoryLimit outcomes so a cycle id
+	// can be looked up after the fact (#1162). In memory only, like
+	// jobHistory: this package has no persistence, so the window dies with the
+	// process. Append-only and monotonic in CycleID, which is what lets the
+	// finalizer update the newest entry in place and the lookup treat the first
+	// and last entries as the retained range.
+	cycleHistory []CycleRecord
+
+	logger zerolog.Logger
+	mu     sync.Mutex
 }
 
 // SetPauseGate wires the cluster-wide compaction pause (#1087). The gate is
@@ -330,6 +482,20 @@ func appendJobHistory(history []map[string]interface{}, jobStats map[string]inte
 
 	retained := make([]map[string]interface{}, 100)
 	copy(retained, history[len(history)-100:])
+	return retained
+}
+
+// appendCycleHistory keeps the newest CycleHistoryLimit cycle outcomes. Same
+// trim-from-the-front shape as appendJobHistory, so the newest entry stays
+// last -- the invariant the in-place finalizer update relies on.
+func appendCycleHistory(history []CycleRecord, outcome CycleRecord) []CycleRecord {
+	history = append(history, outcome)
+	if len(history) <= CycleHistoryLimit {
+		return history
+	}
+
+	retained := make([]CycleRecord, CycleHistoryLimit)
+	copy(retained, history[len(history)-CycleHistoryLimit:])
 	return retained
 }
 
@@ -1116,7 +1282,7 @@ func (m *Manager) RunClaimedCycleForTiers(ctx context.Context, claim *CycleClaim
 	if err := m.checkClaim(claim); err != nil {
 		return err
 	}
-	return m.runClaimed(ctx, claim.ID, nil, tierNames, "")
+	return m.runClaimed(ctx, claim.ID, cycleSourceAPI, nil, tierNames, "")
 }
 
 // RunClaimedCycleForDatabase is RunClaimedCycleForTiers scoped to one database.
@@ -1124,7 +1290,7 @@ func (m *Manager) RunClaimedCycleForDatabase(ctx context.Context, claim *CycleCl
 	if err := m.checkClaim(claim); err != nil {
 		return err
 	}
-	return m.runClaimed(ctx, claim.ID, []string{database}, tierNames, "")
+	return m.runClaimed(ctx, claim.ID, cycleSourceAPI, []string{database}, tierNames, "")
 }
 
 // RunClaimedCycleForMeasurement is RunClaimedCycleForTiers scoped to one
@@ -1137,7 +1303,7 @@ func (m *Manager) RunClaimedCycleForMeasurement(ctx context.Context, claim *Cycl
 	if err := m.checkClaim(claim); err != nil {
 		return err
 	}
-	return m.runClaimed(ctx, claim.ID, []string{database}, tierNames, measurement)
+	return m.runClaimed(ctx, claim.ID, cycleSourceAPI, []string{database}, tierNames, measurement)
 }
 
 // RunCompactionCycle runs one compaction cycle for all enabled tiers.
@@ -1156,14 +1322,19 @@ func (m *Manager) RunCompactionCycle(ctx context.Context) (int64, error) {
 
 // RunCompactionCycleForTiers runs a complete compaction cycle for specific tiers across all databases.
 // tierNames must be non-empty - specify which tiers to run explicitly.
+//
+// Cycles started through this family are recorded with source "unspecified"
+// (#1162). The scheduler passes cycleSourceScheduler through runCycleInternal
+// directly, so labelling this family "scheduler" would mislabel whichever
+// caller is added next -- today it has none in production.
 func (m *Manager) RunCompactionCycleForTiers(ctx context.Context, tierNames []string) (int64, error) {
-	return m.runCycleInternal(ctx, nil, tierNames)
+	return m.runCycleInternal(ctx, cycleSourceUnspecified, nil, tierNames)
 }
 
 // RunCompactionCycleForDatabase runs a compaction cycle for a single database.
 // tierNames must be non-empty - specify which tiers to run explicitly.
 func (m *Manager) RunCompactionCycleForDatabase(ctx context.Context, database string, tierNames []string) (int64, error) {
-	return m.runCycleInternal(ctx, []string{database}, tierNames)
+	return m.runCycleInternal(ctx, cycleSourceUnspecified, []string{database}, tierNames)
 }
 
 // RunCompactionCycleForMeasurement restricts discovery to one measurement.
@@ -1171,13 +1342,13 @@ func (m *Manager) RunCompactionCycleForMeasurement(ctx context.Context, database
 	if database == "" || measurement == "" {
 		return 0, fmt.Errorf("database and measurement are required")
 	}
-	return m.runCycleInternalFiltered(ctx, []string{database}, tierNames, measurement)
+	return m.runCycleInternalFiltered(ctx, cycleSourceUnspecified, []string{database}, tierNames, measurement)
 }
 
 // runCycleInternal is the shared implementation for compaction cycles.
 // If filterDatabases is non-nil, only those databases are compacted; otherwise all databases are discovered.
-func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string, tierNames []string) (int64, error) {
-	return m.runCycleInternalFiltered(ctx, filterDatabases, tierNames, "")
+func (m *Manager) runCycleInternal(ctx context.Context, source string, filterDatabases []string, tierNames []string) (int64, error) {
+	return m.runCycleInternalFiltered(ctx, source, filterDatabases, tierNames, "")
 }
 
 // runCycleInternalFiltered claims a cycle and runs it to completion. Every
@@ -1185,7 +1356,7 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 // three RunCompactionCycleFor* entry points -- goes through here, so their
 // behaviour is unchanged by the claim split: same loss Warn, same (0, error)
 // on a lost claim, same release-after-the-finalizer ordering.
-func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases []string, tierNames []string, filterMeasurement string) (int64, error) {
+func (m *Manager) runCycleInternalFiltered(ctx context.Context, source string, filterDatabases []string, tierNames []string, filterMeasurement string) (int64, error) {
 	claim, err := m.ClaimCycle()
 	if err != nil {
 		m.logger.Warn().Msg("Compaction cycle already running, skipping")
@@ -1197,24 +1368,45 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 	// previous defer ordering guaranteed. No worker can outlive the claim.
 	defer claim.Release()
 
-	return claim.ID, m.runClaimed(ctx, claim.ID, filterDatabases, tierNames, filterMeasurement)
+	return claim.ID, m.runClaimed(ctx, claim.ID, source, filterDatabases, tierNames, filterMeasurement)
 }
 
 // runClaimed is the cycle body. The caller holds the claim and owns its
 // release; runErr is named because the finalizer mutates it.
-func (m *Manager) runClaimed(ctx context.Context, cycleID int64, filterDatabases []string, tierNames []string, filterMeasurement string) (runErr error) {
+func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, filterDatabases []string, tierNames []string, filterMeasurement string) (runErr error) {
 	var active sync.WaitGroup
-	var discovered atomic.Int64
-	var started atomic.Int64
-	var succeeded atomic.Int64
-	var failed atomic.Int64
-	var interrupted atomic.Int64
-	var discoveryErrors atomic.Int64
+	progress := &cycleProgress{}
+	discovered := &progress.discovered
+	started := &progress.started
+	succeeded := &progress.succeeded
+	failed := &progress.failed
+	interrupted := &progress.interrupted
+	discoveryErrors := &progress.discoveryErrors
 	// pausedSkipped is set by a partition goroutine that stopped between two
 	// of its batches because compaction was paused (#1087). The goroutine
 	// cannot set runErr, and the dispatch loop may already be waiting at the
 	// end of the tier, so it is checked there.
 	var pausedSkipped atomic.Bool
+
+	// The cycle is recorded as "running" before it starts, carrying its scope
+	// and a pointer to the live counters (#1162). Recording only at completion
+	// would make the endpoint 404 in exactly the window it exists for: the
+	// operator triggers, is handed a cycle id, and asks about it immediately.
+	// Nothing can return between here and the finalizer below -- only variable
+	// declarations sit in between -- so the finalizer always finds this entry.
+	startRecord := CycleRecord{
+		CycleID:     cycleID,
+		Status:      "running",
+		Source:      source,
+		Databases:   filterDatabases,
+		Measurement: filterMeasurement,
+		Tiers:       tierNames,
+		StartedAt:   time.Now().UTC(),
+		progress:    progress,
+	}
+	m.mu.Lock()
+	m.cycleHistory = appendCycleHistory(m.cycleHistory, startRecord.clone())
+	m.mu.Unlock()
 
 	// This finalizer also covers every early return. Active workers finish
 	// before the cycle is recorded and before cycleRunning is released.
@@ -1248,20 +1440,53 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, filterDatabases
 			status = "failed"
 		}
 
-		outcome := cycleOutcome{
+		outcome := CycleRecord{
 			CycleID:         cycleID,
 			Status:          status,
+			Source:          source,
+			Databases:       filterDatabases,
+			Measurement:     filterMeasurement,
+			Tiers:           tierNames,
+			StartedAt:       startRecord.StartedAt,
+			FinishedAt:      time.Now().UTC(),
 			Discovered:      discovered.Load(),
 			Started:         started.Load(),
 			Succeeded:       succeeded.Load(),
 			Failed:          failed.Load(),
 			Interrupted:     interrupted.Load(),
 			DiscoveryErrors: discoveryErrors.Load(),
+			FailedSample:    progress.snapshotFailedSample(),
 		}
 		outcome.Unstarted = outcome.Discovered - outcome.Started
+		if runErr != nil {
+			outcome.Err = truncateCycleError(runErr.Error())
+		}
 
 		m.mu.Lock()
 		m.lastCycle = outcome
+		// Replace the "running" entry this cycle appended at its start.
+		//
+		// Searched for by id rather than assumed to be the newest entry. It IS
+		// the newest one for every path that goes through ClaimCycle, whose CAS
+		// admits one cycle at a time. But RunClaimedCycleFor* is exported and
+		// checkClaim does not stop one claim from driving two concurrent
+		// runClaimed calls, and under that shape assuming the last index would
+		// strand an entry at "running" forever, holding a live progress pointer
+		// and serving a duration that grows without bound.
+		replaced := false
+		for i := len(m.cycleHistory) - 1; i >= 0; i-- {
+			if m.cycleHistory[i].CycleID == cycleID && m.cycleHistory[i].FinishedAt.IsZero() {
+				m.cycleHistory[i] = outcome.clone()
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			m.cycleHistory = appendCycleHistory(m.cycleHistory, outcome.clone())
+			m.logger.Warn().
+				Int64("cycle_id", cycleID).
+				Msg("Compaction cycle history lost its running entry; appended the outcome instead")
+		}
 		m.mu.Unlock()
 
 		event := m.logger.Info()
@@ -1615,6 +1840,7 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, filterDatabases
 									return
 								}
 								failed.Add(1)
+								progress.recordFailure(batch.PartitionPath)
 								m.logger.Error().Err(err).
 									Str("partition", batch.PartitionPath).
 									Str("tier", tierName).
@@ -2111,4 +2337,92 @@ func enabledTiers(tiers []Tier) []Tier {
 		}
 	}
 	return out
+}
+
+// truncateCycleError bounds a retained cycle error. The history holds up to
+// CycleHistoryLimit entries, so an unbounded error string is an unbounded
+// retention cost.
+func truncateCycleError(msg string) string {
+	const limit = 512
+	if len(msg) <= limit {
+		return msg
+	}
+	return msg[:limit] + "... (truncated)"
+}
+
+// CycleHistoryPage is a consistent snapshot of the retained cycle history:
+// the page, the window it sits in, and which cycle is still open. Assembled
+// under one lock acquisition so the fields cannot disagree -- reading them
+// through separate accessors allowed a page that listed no running cycle
+// beside a RunningCycleID naming one that had just started, and vice versa.
+type CycleHistoryPage struct {
+	Cycles   []CycleRecord
+	Retained int
+
+	// Oldest and Newest are meaningless unless HasRange; callers must not
+	// report 0/0 as a range, because ids start at 1.
+	Oldest   int64
+	Newest   int64
+	HasRange bool
+
+	// RunningCycleID is the cycle whose record is still open, if any.
+	RunningCycleID int64
+	HasRunning     bool
+}
+
+// CyclePage returns up to limit retained cycles, newest first, together with
+// the window and running-cycle facts that describe them.
+func (m *Manager) CyclePage(limit int) CycleHistoryPage {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	page := CycleHistoryPage{Retained: len(m.cycleHistory)}
+	if len(m.cycleHistory) == 0 {
+		return page
+	}
+
+	page.Oldest = m.cycleHistory[0].CycleID
+	page.Newest = m.cycleHistory[len(m.cycleHistory)-1].CycleID
+	page.HasRange = true
+
+	if newest := m.cycleHistory[len(m.cycleHistory)-1]; newest.FinishedAt.IsZero() {
+		page.RunningCycleID = newest.CycleID
+		page.HasRunning = true
+	}
+
+	if limit < 1 {
+		return page
+	}
+	if limit > len(m.cycleHistory) {
+		limit = len(m.cycleHistory)
+	}
+	page.Cycles = make([]CycleRecord, 0, limit)
+	for i := len(m.cycleHistory) - 1; i >= len(m.cycleHistory)-limit; i-- {
+		page.Cycles = append(page.Cycles, m.cycleHistory[i].counters().clone())
+	}
+	return page
+}
+
+// CycleLookup resolves a cycle id and, when nothing is retained for it, the
+// window that absence sits in -- both under a single lock acquisition, so the
+// range reported in a 404 is the same snapshot that produced the miss.
+//
+// Deliberately does not consult the claim: that needs claimMu, and nothing in
+// this package establishes an m.mu -> claimMu order. The caller checks the
+// claim after this returns, holding no lock.
+func (m *Manager) CycleLookup(id int64) (rec CycleRecord, found bool, oldest int64, newest int64, hasRange bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if len(m.cycleHistory) > 0 {
+		oldest = m.cycleHistory[0].CycleID
+		newest = m.cycleHistory[len(m.cycleHistory)-1].CycleID
+		hasRange = true
+	}
+	for i := len(m.cycleHistory) - 1; i >= 0; i-- {
+		if m.cycleHistory[i].CycleID == id {
+			return m.cycleHistory[i].counters().clone(), true, oldest, newest, hasRange
+		}
+	}
+	return CycleRecord{}, false, oldest, newest, hasRange
 }

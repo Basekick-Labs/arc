@@ -118,11 +118,19 @@ func TestCompactionTriggerAdmitsExactlyOneCycleIssue1153(t *testing.T) {
 	// winning cycle is still held open in FindCandidates; if the fixture ever
 	// stops reaching the tier, cycles finish in microseconds, the claim is
 	// released between requests, and later triggers legitimately win. That
-	// turns this into a flake whose message blames the fix -- measured 1 in 8
-	// runs against correct code with a fixture that missed the tier.
+	// turns this into a flake whose message blames the fix.
+	//
+	// A BOUNDED WAIT, not the non-blocking select this originally used.
+	// Post-#1153 the claim is taken synchronously in the handler, so the
+	// accepted==1 assertion above already proves exclusivity by the time we
+	// get here -- the winner's cycle goroutine, which is what reaches the
+	// tier, is still scheduled lazily and routinely had not run yet. Measured
+	// on this branch: 13 of 30 runs failed here against correct code, with a
+	// message blaming exclusivity. The comment above predicted exactly that
+	// and the original code polled anyway.
 	select {
 	case <-tier.entered:
-	default:
+	case <-time.After(30 * time.Second):
 		t.Fatal("precondition failed: the winning cycle never reached the blocking tier, so these 409s do not demonstrate exclusivity")
 	}
 }

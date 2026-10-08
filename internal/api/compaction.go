@@ -139,6 +139,13 @@ func (h *CompactionHandler) RegisterRoutes(app *fiber.App) {
 	group.Get("/candidates", adminOnly, h.getCandidates)
 	group.Get("/jobs", adminOnly, h.getActiveJobs)
 	group.Get("/history", adminOnly, h.getHistory)
+	// Per-cycle lookup (#1162). /compaction/stats carries a single global
+	// last_cycle, so the cycle_id the trigger hands back had nowhere to be
+	// resolved. Static /cycles is registered before the /cycles/:id param
+	// route; Fiber v2 matches in registration order and the two differ in
+	// segment count anyway.
+	group.Get("/cycles", adminOnly, h.listCycles)
+	group.Get("/cycles/:id", adminOnly, h.getCycle)
 
 	// Admin route — trigger compaction requires admin permission
 	if h.authManager != nil {
@@ -486,4 +493,180 @@ func (h *CompactionHandler) getHistory(c *fiber.Ctx) error {
 		"total_jobs":  stats["total_jobs_completed"],
 		"recent_jobs": recentJobs,
 	})
+}
+
+// cycleResponse renders a retained cycle. Built as a fiber.Map rather than a
+// tagged struct because several keys are omitted conditionally and
+// `json:",omitempty"` does nothing for a time.Time: encoding/json (which Fiber
+// uses, no custom JSONEncoder is set) has no notion of an empty struct, so a
+// zero time would serialise as "0001-01-01T00:00:00Z".
+//
+// databases is null when the cycle covered every database, and measurement is
+// "" when it covered every measurement. This is deliberately the opposite of
+// Stats(), which coerces a nil slice to []: here [] would be ambiguous with
+// "no databases", so null carries the meaning.
+func cycleResponse(rec compaction.CycleRecord) fiber.Map {
+	startedAt := rec.StartedAt.UTC().Truncate(time.Second)
+	out := fiber.Map{
+		"cycle_id":            rec.CycleID,
+		"status":              rec.Status,
+		"source":              rec.Source,
+		"databases":           rec.Databases,
+		"measurement":         rec.Measurement,
+		"tiers":               rec.Tiers,
+		"started_at":          startedAt,
+		"discovered_batches":  rec.Discovered,
+		"started_batches":     rec.Started,
+		"succeeded_batches":   rec.Succeeded,
+		"failed_batches":      rec.Failed,
+		"interrupted_batches": rec.Interrupted,
+		"unstarted_batches":   rec.Unstarted,
+		"discovery_errors":    rec.DiscoveryErrors,
+	}
+
+	if rec.FinishedAt.IsZero() {
+		// Still running: the counters above are a live snapshot, so report the
+		// elapsed time rather than a duration that does not exist yet.
+		out["duration_seconds"] = int64(time.Since(startedAt).Seconds())
+	} else {
+		// Both derived from the TRUNCATED values that are rendered, so the
+		// duration always equals finished_at - started_at as the client reads
+		// them. Computing from the untruncated times let a cycle that started
+		// at :00.9 and finished at :01.1 render a 1 s gap with duration 0.
+		finishedAt := rec.FinishedAt.UTC().Truncate(time.Second)
+		out["finished_at"] = finishedAt
+		out["duration_seconds"] = int64(finishedAt.Sub(startedAt).Seconds())
+	}
+	if rec.Err != "" {
+		out["error"] = rec.Err
+	}
+	if len(rec.FailedSample) > 0 {
+		// Which partitions failed, not just how many. Job history carries no
+		// cycle id and Stats caps it at 10 entries, so without this an
+		// operator reading failed_batches has nowhere to go next.
+		out["failed_sample"] = rec.FailedSample
+	}
+	return out
+}
+
+// getCycle resolves one compaction cycle id (#1162).
+func (h *CompactionHandler) getCycle(c *fiber.Ctx) error {
+	if h.manager == nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "Compaction not initialized",
+		})
+	}
+
+	// ParseInt, not Atoi: cycle ids are int64. Ids start at 1, so a zero or
+	// negative id is a bad request rather than a cycle that was trimmed --
+	// reporting it as "older than the retained window" would be a lie.
+	id, err := strconv.ParseInt(c.Params("id"), 10, 64)
+	if err != nil || id < 1 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "cycle id must be a positive integer",
+		})
+	}
+
+	// History first, and only then the claim. The claim is taken before the
+	// cycle records anything and released after the terminal record is
+	// written, so it is held during two windows where it disagrees with the
+	// history; checking the record first means the recorded answer always
+	// wins and the synthesized one below is reachable only when there is
+	// genuinely nothing recorded.
+	//
+	// The record and the retained range come from ONE lock acquisition, so the
+	// range a 404 reports is the same snapshot that produced the miss.
+	rec, found, oldest, newest, haveRange := h.manager.CycleLookup(id)
+	if found {
+		return c.JSON(cycleResponse(rec))
+	}
+
+	// Claimed, not yet started. The trigger answers with the cycle id as soon
+	// as it holds the claim, and the cycle body runs on a goroutine that is
+	// scheduled lazily, so an operator who triggers and immediately looks up
+	// the id they were handed lands here. IsCycleRunning is required:
+	// RunningCycleID reports the most recent id when no claim is held, which
+	// would synthesize this answer for a long-finished cycle.
+	if h.manager.IsCycleRunning() && h.manager.RunningCycleID() == id {
+		return c.JSON(fiber.Map{
+			"cycle_id": id,
+			"status":   "claimed",
+			"message":  "this cycle is claimed and starting; its record appears within milliseconds",
+		})
+	}
+
+	resp := fiber.Map{
+		"error":    "no retained record of this compaction cycle on this node",
+		"cycle_id": id,
+	}
+	// On a cluster the holder is the only actionable datum in this response:
+	// it names where the cycle actually ran. The trigger 503 already reports
+	// it (#1152), so the lookup that follows a trigger should too. nil gate is
+	// OSS or standalone, and an empty holder means this cluster manages no
+	// lease at all -- in neither case is there a holder to name.
+	if h.gate != nil {
+		if holder := h.gate.LeaseHolder(); holder != "" {
+			resp["lease_holder"] = holder
+		}
+	}
+	switch {
+	case !haveRange:
+		// No range keys at all. Emitting 0/0 would make every id look newer
+		// than the newest retained cycle.
+		resp["message"] = "this node has recorded no compaction cycle. History is held in memory only and is lost on restart, and cycles run on the node holding the compactor lease."
+	case id < oldest:
+		resp["oldest_retained"] = oldest
+		resp["newest_retained"] = newest
+		resp["message"] = "this cycle is older than the window this node retains. History is held in memory only, so it is also lost on restart."
+	default:
+		resp["oldest_retained"] = oldest
+		resp["newest_retained"] = newest
+		// Deliberately not "this cycle never ran": cycle ids restart at 1 on
+		// every restart, so an id recorded before one is genuinely absent here
+		// and did run.
+		resp["message"] = "this node has recorded no cycle with that id. Cycle ids restart at 1 when the process restarts, and cycles run on the node holding the compactor lease, so a cycle triggered elsewhere is not recorded here."
+	}
+	return c.Status(fiber.StatusNotFound).JSON(resp)
+}
+
+// listCycles returns the retained compaction cycles, newest first (#1162).
+func (h *CompactionHandler) listCycles(c *fiber.Ctx) error {
+	if h.manager == nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "Compaction not initialized",
+		})
+	}
+
+	// Same fallback as getHistory: a garbage or non-positive limit falls back
+	// to the default rather than erroring.
+	limit, err := strconv.Atoi(c.Query("limit", "10"))
+	if err != nil || limit < 1 {
+		limit = 10
+	}
+	if limit > compaction.CycleHistoryLimit {
+		limit = compaction.CycleHistoryLimit
+	}
+
+	// One snapshot, so the page cannot disagree with the window or the
+	// running-cycle id reported beside it.
+	page := h.manager.CyclePage(limit)
+	cycles := make([]fiber.Map, 0, len(page.Cycles))
+	for _, rec := range page.Cycles {
+		cycles = append(cycles, cycleResponse(rec))
+	}
+
+	resp := fiber.Map{
+		"cycles":   cycles,
+		"retained": page.Retained,
+	}
+	if page.HasRange {
+		resp["oldest_retained"] = page.Oldest
+		resp["newest_retained"] = page.Newest
+	}
+	// Derived from the history rather than from the claim, so it can never
+	// contradict the cycles listed beside it.
+	if page.HasRunning {
+		resp["running_cycle_id"] = page.RunningCycleID
+	}
+	return c.JSON(resp)
 }
