@@ -1922,6 +1922,7 @@ func main() {
 						fileRegistrar := cluster.NewCoordinatorFileRegistrar(clusterCoordinator, logger.Get("file-registrar"))
 						fileRegistrar.Start(context.Background())
 						arrowBuffer.SetFileRegistrar(fileRegistrar)
+						arrowBuffer.SetReplicatedFileReconciler(clusterCoordinator)
 						registerFileRegistrarShutdown(shutdownCoordinator, fileRegistrar.Stop)
 						log.Info().Msg("Cluster file manifest registrar enabled")
 

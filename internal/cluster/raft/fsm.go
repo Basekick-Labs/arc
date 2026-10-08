@@ -184,16 +184,17 @@ type DemoteWriterPayload struct {
 // This is the authoritative record of a file's existence, used by peer
 // replication to decide what to pull from other nodes.
 type FileEntry struct {
-	Path          string    `json:"path"`           // Relative storage path (e.g. "db/measurement/2026/04/11/14/file.parquet")
-	SHA256        string    `json:"sha256"`         // Content checksum for verification
-	SizeBytes     int64     `json:"size_bytes"`     // File size
-	Database      string    `json:"database"`       // Arc database name
-	Measurement   string    `json:"measurement"`    // Arc measurement name
-	PartitionTime time.Time `json:"partition_time"` // Partition time (for hot/cold routing)
-	OriginNodeID  string    `json:"origin_node_id"` // Node that first wrote the file
-	Tier          string    `json:"tier"`           // "hot" or "cold"
-	CreatedAt     time.Time `json:"created_at"`     // When the file was first registered
-	LSN           uint64    `json:"lsn"`            // Raft log index at registration (for ordering)
+	Path          string    `json:"path"`                   // Relative storage path (e.g. "db/measurement/2026/04/11/14/file.parquet")
+	SHA256        string    `json:"sha256"`                 // Content checksum for verification
+	ContentHash   string    `json:"content_hash,omitempty"` // Logical WAL-payload identity for replication reconciliation
+	SizeBytes     int64     `json:"size_bytes"`             // File size
+	Database      string    `json:"database"`               // Arc database name
+	Measurement   string    `json:"measurement"`            // Arc measurement name
+	PartitionTime time.Time `json:"partition_time"`         // Partition time (for hot/cold routing)
+	OriginNodeID  string    `json:"origin_node_id"`         // Node that first wrote the file
+	Tier          string    `json:"tier"`                   // "hot" or "cold"
+	CreatedAt     time.Time `json:"created_at"`             // When the file was first registered
+	LSN           uint64    `json:"lsn"`                    // Raft log index at registration (for ordering)
 }
 
 // RegisterFilePayload is the payload for CommandRegisterFile.

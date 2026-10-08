@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,6 +17,18 @@ type recordingFileRegistrar struct {
 
 func (r *recordingFileRegistrar) RegisterFile(database, measurement, path string, partitionTime time.Time, sizeBytes int64, sha256 string) {
 	r.calls++
+}
+
+type recordingReplicatedFileReconciler struct {
+	calls       int
+	path        string
+	contentHash string
+}
+
+func (r *recordingReplicatedFileReconciler) ReconcileReplicatedFile(path, contentHash string) {
+	r.calls++
+	r.path = path
+	r.contentHash = contentHash
 }
 
 func newReplicationTestBuffer(t *testing.T) (*ArrowBuffer, context.Context, context.CancelFunc) {
@@ -57,7 +70,7 @@ func TestReplicatedFlushDoesNotRegisterManifestFile(t *testing.T) {
 	reg := &recordingFileRegistrar{}
 	buf.SetFileRegistrar(reg)
 
-	if err := buf.WriteColumnarDirectNoWALReplicated(ctx, "testdb", "cpu", replicationTestColumns()); err != nil {
+	if err := buf.WriteColumnarDirectNoWALReplicated(ctx, "testdb", "cpu", replicationTestColumns(), "test-payload-hash"); err != nil {
 		t.Fatalf("write replicated rows: %v", err)
 	}
 	if err := buf.FlushAll(ctx); err != nil {
@@ -65,6 +78,30 @@ func TestReplicatedFlushDoesNotRegisterManifestFile(t *testing.T) {
 	}
 	if reg.calls != 0 {
 		t.Fatalf("replicated flush registered %d manifest files, want 0", reg.calls)
+	}
+}
+
+func TestReplicatedFlushPublishesReconciliationIdentity(t *testing.T) {
+	buf, ctx, _ := newReplicationTestBuffer(t)
+	reconciler := &recordingReplicatedFileReconciler{}
+	buf.SetReplicatedFileReconciler(reconciler)
+
+	if err := buf.WriteColumnarDirectNoWALReplicated(ctx, "testdb", "cpu", replicationTestColumns(), "test-payload-hash"); err != nil {
+		t.Fatalf("write replicated rows: %v", err)
+	}
+	if err := buf.FlushAll(ctx); err != nil {
+		t.Fatalf("flush replicated rows: %v", err)
+	}
+
+	wantHash := payloadHashFingerprint([]string{"test-payload-hash"})
+	if reconciler.calls != 1 {
+		t.Fatalf("reconciliation hook called %d times, want 1", reconciler.calls)
+	}
+	if reconciler.contentHash != wantHash {
+		t.Fatalf("content hash = %q, want %q", reconciler.contentHash, wantHash)
+	}
+	if !strings.Contains(reconciler.path, "_replicated_"+wantHash+"_") {
+		t.Fatalf("replicated path %q does not carry reconciliation identity %q", reconciler.path, wantHash)
 	}
 }
 
@@ -83,7 +120,7 @@ func TestLocalAndReplicatedFlushesKeepManifestRegistrationSeparate(t *testing.T)
 		t.Fatalf("local flush registered %d manifest files, want 1", reg.calls)
 	}
 
-	if err := buf.WriteColumnarDirectNoWALReplicated(ctx, "testdb", "cpu", replicationTestColumns()); err != nil {
+	if err := buf.WriteColumnarDirectNoWALReplicated(ctx, "testdb", "cpu", replicationTestColumns(), "test-payload-hash"); err != nil {
 		t.Fatalf("write replicated rows: %v", err)
 	}
 	if err := buf.FlushAll(ctx); err != nil {

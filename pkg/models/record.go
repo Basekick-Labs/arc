@@ -24,9 +24,10 @@ type ColumnarRecord struct {
 	// producers whose data model guarantees one row per (tags, time) — continuous
 	// queries (#521). MUST stay false for raw ingest, where many distinct rows
 	// legitimately share a timestamp and time-only dedup would destroy data.
-	DedupTime  bool   `json:"-"`
-	TimeUnit   string `json:"_time_unit,omitempty"`
-	RawPayload []byte `json:"-"` // Original msgpack bytes for zero-copy WAL
+	DedupTime     bool     `json:"-"`
+	TimeUnit      string   `json:"_time_unit,omitempty"`
+	RawPayload    []byte   `json:"-"` // Original msgpack bytes for zero-copy WAL
+	PayloadHashes []string `json:"-"` // SHA-256 identities of original WAL payloads
 	// Replicated marks rows applied from another node's WAL. Replicated batches
 	// are local materialisations of data already announced by the origin and
 	// must not announce a second file through the cluster manifest (#888).
