@@ -515,9 +515,33 @@ func TestPulledFileRefusedByColdRowGuardIsLogged(t *testing.T) {
 	if tier, ok := rowTier(t, m, path); !ok || tier != string(TierCold) {
 		t.Fatalf("tier = %q (exists=%v), want cold", tier, ok)
 	}
-	if !bytes.Contains(logs.Bytes(), []byte("Refused to register a hot file over a cold tier row")) ||
+	if !bytes.Contains(logs.Bytes(), []byte("Refused to register a hot file over a protected tier row")) ||
 		!bytes.Contains(logs.Bytes(), []byte(path)) {
 		t.Fatalf("cold-row refusal was not logged with its path: %s", logs.String())
+	}
+}
+
+func TestPulledFileRefusedByQuarantineIsLogged(t *testing.T) {
+	const path = "db1/cpu/2026/10/03/14/quarantined.parquet"
+	m := newTierEventManager(t, nil, false)
+	stopTierEventLoop(t, m)
+	hot := newMockBackend("local")
+	hot.seedRaw(path, []byte("pulled copy"))
+	m.hotBackend = hot
+	if err := m.metadata.RecordFile(context.Background(), replicatedTestFile(path, int64(len("pulled copy")))); err != nil {
+		t.Fatalf("seed hot row: %v", err)
+	}
+	if err := m.metadata.QuarantineFile(context.Background(), path, "test quarantine"); err != nil {
+		t.Fatalf("quarantine row: %v", err)
+	}
+
+	var logs bytes.Buffer
+	m.logger = zerolog.New(&logs)
+	m.applyTierEventBatch([]tierEvent{{kind: tierEventPulled, path: path, sizeBytes: int64(len("pulled copy"))}})
+
+	if !bytes.Contains(logs.Bytes(), []byte("Refused to register a hot file over a protected tier row")) ||
+		!bytes.Contains(logs.Bytes(), []byte(path)) || !bytes.Contains(logs.Bytes(), []byte(`"quarantined":true`)) {
+		t.Fatalf("quarantine refusal was not logged with its path and reason: %s", logs.String())
 	}
 }
 

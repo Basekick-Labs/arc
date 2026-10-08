@@ -867,9 +867,12 @@ func (m *Manager) applyPulled(ctx context.Context, info *FileMetadata) (bool, er
 	if err != nil {
 		return false, err
 	}
-	if existing != nil && existing.Tier == TierCold {
-		m.logger.Warn().Str("path", info.Path).
-			Msg("Refused to register a hot file over a cold tier row")
+	if existing != nil && (existing.Tier != TierHot || existing.QuarantinedAt != nil) {
+		m.logger.Warn().
+			Str("path", info.Path).
+			Str("tier", string(existing.Tier)).
+			Bool("quarantined", existing.QuarantinedAt != nil).
+			Msg("Refused to register a hot file over a protected tier row")
 	}
 	return false, nil
 }
