@@ -659,7 +659,7 @@ forced hot. A size match is the same compatibility check used by cold-tier
 reconciliation and does not prove the contents are identical. A replication
 report refused by the cold-row guard now logs the path and reason.
 
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#PR](https://github.com/Basekick-Labs/arc/pulls).
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1145](https://github.com/Basekick-Labs/arc/pull/1145).
 
 ### Crash smokes verify acknowledged records after WAL replay
 
