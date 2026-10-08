@@ -1343,6 +1343,8 @@ accounted before worker launch, the test no longer races the eligibility
 callback and consistently verifies that the waiting batch is counted as
 unstarted.
 
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1160](https://github.com/Basekick-Labs/arc/pull/1160).
+
 ### A quarantine test waited on the counter, not the bookkeeping it asserts ([#1146](https://github.com/Basekick-Labs/arc/issues/1146))
 
 `TestPullerQuarantineKeepsTheQueryGateClosed` reddened `Build & Test`
