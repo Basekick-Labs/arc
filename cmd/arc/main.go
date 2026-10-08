@@ -4157,7 +4157,7 @@ func main() {
 					// one that never starts the scan — a defer would not do,
 					// it being function-scoped to main and so running only
 					// after the shutdown step had already blocked on it.
-					scanCtx, cancelScan := context.WithTimeout(context.Background(), 30*time.Minute)
+					scanCtx, cancelScan := context.WithTimeout(context.Background(), tieringManager.ScanBudget())
 					scanDone := make(chan struct{})
 
 					// Registered as soon as the manager exists, not only once
@@ -4246,16 +4246,40 @@ func main() {
 							defer close(scanDone)
 							defer cancelScan()
 							result, err := tieringManager.ScanTiers(scanCtx)
-							if err != nil {
-								log.Warn().Err(err).Msg("Startup tier scan did not complete; the next migration cycle will scan again")
-								return
+							switch {
+							case errors.Is(err, context.Canceled):
+								// The node is shutting down: the shutdown step
+								// cancels this scan before joining it. Neither
+								// budget is at fault, and telling the operator
+								// to raise one would be wrong - the scan was
+								// interrupted, not short of time.
+								log.Warn().
+									Int("scanned", result.FilesScanned).
+									Msg("Startup tier scan was cancelled because the node is shutting down; the next start will scan again")
+							case err != nil && result.Truncated,
+								err == nil && result.Truncated:
+								// Name the key, and say what a partial scan
+								// costs. Pointing at the next migration cycle
+								// was misleading: every path now shares this
+								// budget, so the cycle will truncate in the
+								// same place, and the manual endpoint carries
+								// the same number too (#1154).
+								log.Warn().Err(err).
+									Dur("scan_timeout", tieringManager.ScanBudget()).
+									Int("scanned", result.FilesScanned).
+									Int("registered", result.FilesRegistered).
+									Msg("Startup tier scan ran out of its budget and stopped part way; tier rows are incomplete and no stale hot row was retired, which costs this node partition pruning. Raise tiered_storage.scan_timeout above the time a full scan takes here. GET /api/v1/tiering/status reports this under last_scan")
+							case err != nil:
+								log.Warn().Err(err).
+									Msg("Startup tier scan did not complete; the next migration cycle will scan again")
+							default:
+								log.Info().
+									Int("scanned", result.FilesScanned).
+									Int("registered", result.FilesRegistered).
+									Int("hot_retired", result.HotRetired).
+									Int("cold_synced", result.ColdSynced).
+									Msg("Startup tier scan completed")
 							}
-							log.Info().
-								Int("scanned", result.FilesScanned).
-								Int("registered", result.FilesRegistered).
-								Int("hot_retired", result.HotRetired).
-								Int("cold_synced", result.ColdSynced).
-								Msg("Startup tier scan completed")
 							// If the scan changed any row — on a node booting
 							// with none, measurements go from nothing to cold
 							// (the sync runs first) to hot and cold — a query
@@ -4263,6 +4287,11 @@ func main() {
 							// the earlier state for up to the cache TTL. A
 							// migration cycle drops the query caches for the
 							// same reason; so does this, at most once per boot.
+							//
+							// Runs for a TRUNCATED scan too: the rows it wrote
+							// before stopping are real, and this used to return
+							// on the error above and leave the query caches
+							// serving the pre-scan answer indefinitely.
 							if result.ColdSynced+result.HotRowsWritten+result.HotRetired > 0 {
 								queryHandler.InvalidateCaches()
 							}
