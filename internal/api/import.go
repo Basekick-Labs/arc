@@ -10,6 +10,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/ingest"
+	"github.com/basekick-labs/arc/internal/wal"
 	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
@@ -283,30 +284,33 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 		}
 	}
 
-	// Feed each measurement into the ArrowBuffer ingest pipeline
+	// Admit the complete import before mutating any measurement buffer. This
+	// keeps a WAL-pressure rejection request-wide instead of accepting earlier
+	// measurements and failing only when a later one crosses the disk limit.
 	var totalRows int64
 	importedMeasurements := make([]string, 0, len(columnarByMeasurement))
-	for measurement, record := range columnarByMeasurement {
-		if err := h.arrowBuffer.WriteColumnarRecord(c.Context(), database, record); err != nil {
-			h.totalErrors.Add(1)
-			h.logger.Error().Err(err).
-				Str("database", database).
-				Str("measurement", measurement).
-				Msg("LP import: failed to write to buffer")
-			// 503 for the two retryable buffer states. Note this loop has
-			// already written the measurements it got through, so the import is
-			// partial either way — a retryable status at least tells the client
-			// to re-run it rather than treating it as a permanent failure.
-			if errors.Is(err, ingest.ErrBufferClosing) || errors.Is(err, ingest.ErrSchemaChurnExceeded) {
-				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-					"error": fmt.Sprintf("import rejected at measurement %q (retry): %v", measurement, err),
-				})
-			}
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-				"error": fmt.Sprintf("failed to ingest measurement %q: %v", measurement, err),
+	if err := h.arrowBuffer.WriteColumnarBatch(c.Context(), database, columnarByMeasurement); err != nil {
+		h.totalErrors.Add(1)
+		h.logger.Error().Err(err).
+			Str("database", database).
+			Int("measurements", len(columnarByMeasurement)).
+			Msg("LP import: failed to write batch to buffer")
+		if errors.Is(err, wal.ErrWALDiskPressure) {
+			c.Set("Retry-After", "5")
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"error": "LP import rejected (WAL disk pressure): " + err.Error(),
 			})
 		}
-		// Count rows from the time column
+		if errors.Is(err, ingest.ErrBufferClosing) || errors.Is(err, ingest.ErrSchemaChurnExceeded) {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"error": "LP import rejected (retry): " + err.Error(),
+			})
+		}
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "failed to ingest LP import: " + err.Error(),
+		})
+	}
+	for measurement, record := range columnarByMeasurement {
 		if timeCol, ok := record.Columns["time"]; ok {
 			totalRows += int64(len(timeCol))
 		}
@@ -371,6 +375,9 @@ func (e *importError) Error() string {
 // importErrorResponse returns the appropriate HTTP error response for an import error
 func (h *ImportHandler) importErrorResponse(c *fiber.Ctx, err error) error {
 	if ie, ok := err.(*importError); ok {
+		if errors.Is(ie.Err, wal.ErrWALDiskPressure) {
+			c.Set("Retry-After", "5")
+		}
 		return c.Status(ie.StatusCode).JSON(fiber.Map{
 			"error": ie.Error(),
 		})
@@ -529,6 +536,12 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 			Str("database", database).
 			Str("measurement", measurement).
 			Msg("TLE import: failed to write to buffer")
+		if errors.Is(err, wal.ErrWALDiskPressure) {
+			c.Set("Retry-After", "5")
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"error": fmt.Sprintf("TLE import rejected (WAL disk pressure): %v", err),
+			})
+		}
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": fmt.Sprintf("failed to ingest measurement %q: %v", measurement, err),
 		})

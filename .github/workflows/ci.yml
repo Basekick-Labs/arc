@@ -154,6 +154,28 @@ jobs:
             exit 1
           fi
 
+  # Keep the Apple Silicon build in the PR gate. The release workflow already
+  # builds this target, but only on release branches or manual dispatches.
+  macos-arm64:
+    name: macOS Apple Silicon
+    runs-on: macos-14
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build Arc
+        env:
+          CGO_ENABLED: 1
+        run: go build -tags=duckdb_arrow ./cmd/arc
+
+      - name: Test WAL on macOS
+        run: go test -tags=duckdb_arrow ./internal/wal
+
   # A rendered-template check, in its own job because it needs helm and not Go.
   # It is fast and has no build step, so it reports long before Build & Test.
   chart:

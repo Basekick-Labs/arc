@@ -368,11 +368,35 @@ func oversizedPayloadError(err error) error {
 // surface accurate operator-facing messages. Use errors.Is to detect.
 var ErrWALDropped = errors.New("WAL entry dropped: async buffer full")
 
+// ErrWALDiskPressure is returned before accepting a new data entry when the
+// WAL filesystem crosses its configured high-water mark or free-space reserve.
+// Callers should surface this as retryable backpressure (HTTP 503), not as a
+// successful buffered write: accepting more data here would consume the
+// headroom needed for rotation, shutdown and WAL recovery (#676).
+var ErrWALDiskPressure = errors.New("WAL disk pressure: write rejected to preserve recovery headroom")
+
+// checkInitialWALHeadroom reports an actionable startup error when the WAL
+// filesystem cannot hold the first segment header.
+func checkInitialWALHeadroom(availableBytes uint64) error {
+	requiredBytes := uint64(WALFileHeaderSize)
+	if availableBytes >= requiredBytes {
+		return nil
+	}
+	return fmt.Errorf(
+		"insufficient free space to create the initial WAL file: %d bytes available, %d required; free space on the WAL filesystem before starting Arc",
+		availableBytes,
+		requiredBytes,
+	)
+}
+
 // walEntry is a pre-serialized WAL entry ready for writing
 type walEntry struct {
 	data    []byte // Complete entry: header + payload
 	durable bool   // Force a sync before acknowledging this entry
 	done    chan error
+	// diskReservationBytes keeps accepted but not-yet-written data in the
+	// admission budget until writerLoop has materialized it on disk.
+	diskReservationBytes int64
 
 	// seq is the tracked sequence this entry carries, or 0 for an entry that
 	// carries none (an untracked data append, or a flush checkpoint). The
@@ -407,14 +431,16 @@ type fileSeqState struct {
 
 // WriterConfig holds configuration for WAL writer
 type WriterConfig struct {
-	WALDir       string        // Directory for WAL files
-	SyncMode     SyncMode      // Sync mode: fsync, fdatasync, async
-	MaxSizeBytes int64         // Rotate WAL when it reaches this size (default: 100MB)
-	MaxAge       time.Duration // Rotate WAL after this duration (default: 1 hour)
-	SyncInterval time.Duration // Sync at most this often (default: 100ms, 0 = sync every write)
-	SyncBytes    int64         // Sync after this many bytes written (default: 1MB, 0 = no byte threshold)
-	BufferSize   int           // Size of async write buffer (default: 10000)
-	Logger       zerolog.Logger
+	WALDir                   string        // Directory for WAL files
+	SyncMode                 SyncMode      // Sync mode: fsync, fdatasync, async
+	MaxSizeBytes             int64         // Rotate WAL when it reaches this size (default: 100MB)
+	MaxAge                   time.Duration // Rotate WAL after this duration (default: 1 hour)
+	SyncInterval             time.Duration // Sync at most this often (default: 100ms, 0 = sync every write)
+	SyncBytes                int64         // Sync after this many bytes written (default: 1MB, 0 = no byte threshold)
+	BufferSize               int           // Size of async write buffer (default: 10000)
+	DiskHighWatermarkPercent int           // Reject data writes at or above this disk usage (default: 90)
+	DiskMinFreeMB            int           // Minimum free space reserved for recovery (default: 512)
+	Logger                   zerolog.Logger
 }
 
 // ReplicationEntry represents a WAL entry for replication.
@@ -433,6 +459,15 @@ type ReplicationEntry struct {
 // ReplicationHook is called for each WAL entry before it's written locally.
 // This enables real-time streaming of entries to reader nodes.
 type ReplicationHook func(entry *ReplicationEntry)
+
+// DiskReservation holds WAL capacity admitted for a complete logical write.
+// Appends transfer bytes from the reservation to queued WAL entries; Release
+// returns any capacity that the caller did not consume.
+type DiskReservation struct {
+	writer    *Writer
+	mu        sync.Mutex
+	remaining int64
+}
 
 // Writer is a Write-Ahead Log writer with configurable durability
 type Writer struct {
@@ -453,6 +488,12 @@ type Writer struct {
 	entryChan chan walEntry
 	done      chan struct{}
 	wg        sync.WaitGroup
+
+	// diskReservedBytes accounts for entries accepted into the async channel
+	// (and appends blocked in replication) but not yet written. The mutex makes
+	// the free-space check and reservation one admission step.
+	diskAdmissionMu   sync.Mutex
+	diskReservedBytes int64
 
 	// Replication hook for streaming entries to readers
 	replicationHook ReplicationHook
@@ -530,6 +571,12 @@ func NewWriter(cfg *WriterConfig) (*Writer, error) {
 	} else if cfg.BufferSize > 1000000 {
 		cfg.BufferSize = 1000000 // Cap to prevent excessive memory allocation
 	}
+	if cfg.DiskHighWatermarkPercent <= 0 || cfg.DiskHighWatermarkPercent >= 100 {
+		cfg.DiskHighWatermarkPercent = 90
+	}
+	if cfg.DiskMinFreeMB <= 0 {
+		cfg.DiskMinFreeMB = 512
+	}
 
 	// Create WAL directory with owner-only permissions (WAL contains sensitive data)
 	if err := os.MkdirAll(cfg.WALDir, 0700); err != nil {
@@ -545,6 +592,16 @@ func NewWriter(cfg *WriterConfig) (*Writer, error) {
 		pendingSeqs:     make(map[uint64]struct{}),
 		done:            make(chan struct{}),
 		trackedInstance: trackedInstance,
+	}
+
+	// Keep the preflight narrowly scoped to creating the initial file header.
+	// Requiring the normal ingest reserve here could prevent recovery from
+	// starting when older WAL data is already waiting to be flushed.
+	// A usage-probe failure remains fail-open; rotate below reports actual I/O errors.
+	if _, freeBytes, err := filesystemUsage(cfg.WALDir); err == nil {
+		if err := checkInitialWALHeadroom(freeBytes); err != nil {
+			return nil, err
+		}
 	}
 
 	// Initialize first WAL file
@@ -624,6 +681,9 @@ func (w *Writer) writerLoop() {
 
 func (w *Writer) processEntry(entry walEntry) {
 	err := w.writeEntry(entry)
+	if entry.diskReservationBytes > 0 {
+		w.releaseDiskReservation(entry.diskReservationBytes)
+	}
 	if entry.done != nil {
 		entry.done <- err
 		close(entry.done)
@@ -837,61 +897,65 @@ func (w *Writer) AppendTracked(records []map[string]interface{}) ([]string, erro
 	if err != nil {
 		return nil, fmt.Errorf("failed to serialize records: %w", err)
 	}
-	chunks := [][]byte{payload}
-	if !trackedPayloadFits(len(payload), 0) {
-		chunks, err = splitOversizedPayload(payload)
-		if err != nil {
-			return nil, oversizedPayloadError(err)
-		}
+	return w.appendTrackedPayload(payload, nil, 0, nil)
+}
+
+// AppendTrackedReserved appends row-format records using capacity admitted for
+// a larger logical request. The caller releases the reservation when the full
+// request has finished.
+func (w *Writer) AppendTrackedReserved(records []map[string]interface{}, reservation *DiskReservation) ([]string, error) {
+	payload, err := msgpack.Marshal(records)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize records: %w", err)
 	}
-	hashes := make([]string, 0, len(chunks))
-	for _, chunk := range chunks {
-		if !trackedPayloadFits(len(chunk), 0) {
-			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", len(chunk)+walTrackedHeaderSize, MaxWALPayloadSize))
-		}
-		token, err := w.appendTrackedEntry(chunk)
-		if err != nil {
-			// The chunks that already landed are pending in the floor, and
-			// their tokens go out of scope with this slice — the caller gets
-			// nil and cannot release them. Unreleased, each pins the floor for
-			// the life of the process, and because PurgeFlushed stops at the
-			// first retained file the WAL never reclaims anything again (#676).
-			w.releasePending(hashes)
-			return nil, err
-		}
-		hashes = append(hashes, token)
-	}
-	return hashes, nil
+	return w.appendTrackedPayload(payload, nil, 0, reservation)
 }
 
 // AppendRawWithMetaTracked is the tracked counterpart to AppendRawWithMeta.
 func (w *Writer) AppendRawWithMetaTracked(database string, payload []byte) ([]string, error) {
+	return w.AppendRawWithMetaTrackedReserved(database, payload, nil)
+}
+
+// AppendRawWithMetaTrackedReserved appends one payload using capacity admitted
+// for a larger logical request. The reservation is checked against the full
+// payload, including all WAL chunks, before the first chunk is enqueued.
+func (w *Writer) AppendRawWithMetaTrackedReserved(database string, payload []byte, reservation *DiskReservation) ([]string, error) {
 	if len(database) > 255 {
 		return nil, fmt.Errorf("database name too long: %d bytes", len(database))
 	}
 	dbBytes := []byte(database)
 	envelopeHeaderLen := 3 + len(dbBytes)
-	chunks := [][]byte{payload}
-	if !trackedPayloadFits(len(payload), envelopeHeaderLen) {
-		var err error
-		chunks, err = splitOversizedPayload(payload)
-		if err != nil {
-			return nil, oversizedPayloadError(err)
-		}
+	return w.appendTrackedPayload(payload, dbBytes, envelopeHeaderLen, reservation)
+}
+
+func (w *Writer) appendTrackedPayload(payload []byte, database []byte, envelopeHeaderLen int, reservation *DiskReservation) ([]string, error) {
+	chunks, err := trackedPayloadChunks(payload, envelopeHeaderLen)
+	if err != nil {
+		return nil, err
 	}
-	var hashes []string
-	for _, chunk := range chunks {
-		if !trackedPayloadFits(len(chunk), envelopeHeaderLen) {
-			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", envelopeHeaderLen+len(chunk)+walTrackedHeaderSize, MaxWALPayloadSize))
-		}
-		token, err := w.appendTrackedEntry(envelopePayload(dbBytes, chunk))
+	needed := trackedReservationBytes(chunks, envelopeHeaderLen)
+	if reservation == nil {
+		reservation, err = w.newDiskReservation(needed)
 		if err != nil {
-			// The chunks that already landed are pending in the floor, and
-			// their tokens go out of scope with this slice — the caller gets
-			// nil and cannot release them. Unreleased, each pins the floor for
-			// the life of the process, and because PurgeFlushed stops at the
-			// first retained file the WAL never reclaims anything again (#676).
-			w.releasePending(hashes)
+			return nil, err
+		}
+		defer reservation.Release()
+	} else if !reservation.hasAtLeast(w, needed) {
+		return nil, ErrWALDiskPressure
+	}
+
+	hashes := make([]string, 0, len(chunks))
+	for _, chunk := range chunks {
+		logicalPayload := chunk
+		if envelopeHeaderLen > 0 {
+			logicalPayload = envelopePayload(database, chunk)
+		}
+		token, err := w.appendTrackedEntry(logicalPayload, reservation)
+		if err != nil {
+			// Chunks already enqueued stay pinned: returning no partial hash list
+			// means the caller cannot checkpoint them when its buffered batch is
+			// flushed. Releasing these sequences here could make the WAL file
+			// purgeable before that flush completes.
 			return nil, err
 		}
 		hashes = append(hashes, token)
@@ -953,7 +1017,169 @@ func trackedPayloadFits(payloadLen, envelopeHeaderLen int) bool {
 	return payloadLen <= MaxWALPayloadSize-walTrackedHeaderSize-envelopeHeaderLen
 }
 
-func (w *Writer) appendTrackedEntry(logicalPayload []byte) (string, error) {
+func trackedPayloadChunks(payload []byte, envelopeHeaderLen int) ([][]byte, error) {
+	chunks := [][]byte{payload}
+	if !trackedPayloadFits(len(payload), envelopeHeaderLen) {
+		var err error
+		chunks, err = splitOversizedPayload(payload)
+		if err != nil {
+			return nil, oversizedPayloadError(err)
+		}
+	}
+	for _, chunk := range chunks {
+		if !trackedPayloadFits(len(chunk), envelopeHeaderLen) {
+			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", envelopeHeaderLen+len(chunk)+walTrackedHeaderSize, MaxWALPayloadSize))
+		}
+	}
+	return chunks, nil
+}
+
+func trackedReservationBytes(chunks [][]byte, envelopeHeaderLen int) int64 {
+	var total int64
+	for _, chunk := range chunks {
+		total += int64(WALEntryHeaderSize + walTrackedHeaderSize + envelopeHeaderLen + len(chunk))
+	}
+	return total
+}
+
+// ensureDiskHeadroom rejects new data before it can consume the reserve needed
+// for WAL rotation and recovery. Statfs failures are fail-open: disk telemetry
+// must not become a new single point of ingest failure.
+func (w *Writer) ensureDiskHeadroom(additionalBytes int64) error {
+	total, free, err := filesystemUsage(w.config.WALDir)
+	if err != nil {
+		return nil
+	}
+	reserve := uint64(w.config.DiskMinFreeMB) * 1024 * 1024
+	if additionalBytes > 0 {
+		reserve += uint64(additionalBytes)
+	}
+	if free <= reserve {
+		metrics.Get().IncWALDiskPressure()
+		return ErrWALDiskPressure
+	}
+	if total > 0 {
+		used := total - free
+		projectedUsed := float64(used) + float64(additionalBytes)
+		if projectedUsed*100 >= float64(w.config.DiskHighWatermarkPercent)*float64(total) {
+			metrics.Get().IncWALDiskPressure()
+			return ErrWALDiskPressure
+		}
+	}
+	return nil
+}
+
+// reserveDiskHeadroom serializes admission and includes accepted entries that
+// are still queued or being replicated. Without the reservation, concurrent
+// callers can all observe the same free space and collectively consume the
+// recovery reserve before writerLoop writes any of them.
+func (w *Writer) reserveDiskHeadroom(additionalBytes int64) error {
+	if additionalBytes <= 0 {
+		return nil
+	}
+	w.diskAdmissionMu.Lock()
+	defer w.diskAdmissionMu.Unlock()
+	if err := w.ensureDiskHeadroom(additionalBytes + w.diskReservedBytes); err != nil {
+		return err
+	}
+	w.diskReservedBytes += additionalBytes
+	return nil
+}
+
+func (w *Writer) newDiskReservation(bytes int64) (*DiskReservation, error) {
+	if bytes < 0 {
+		return nil, errors.New("negative WAL disk reservation")
+	}
+	if err := w.reserveDiskHeadroom(bytes); err != nil {
+		return nil, err
+	}
+	return &DiskReservation{writer: w, remaining: bytes}, nil
+}
+
+// ReserveRawWithMetaBatch admits every tracked, database-enveloped payload in
+// one step. Callers use the returned reservation while appending each payload,
+// so disk pressure cannot reject only the tail of a multi-measurement request.
+func (w *Writer) ReserveRawWithMetaBatch(database string, payloads [][]byte) (*DiskReservation, error) {
+	if len(database) > 255 {
+		return nil, fmt.Errorf("database name too long: %d bytes", len(database))
+	}
+	envelopeHeaderLen := 3 + len(database)
+	var total int64
+	for _, payload := range payloads {
+		chunks, err := trackedPayloadChunks(payload, envelopeHeaderLen)
+		if err != nil {
+			return nil, err
+		}
+		for _, chunk := range chunks {
+			total += int64(WALEntryHeaderSize + walTrackedHeaderSize + envelopeHeaderLen + len(chunk))
+		}
+	}
+	return w.newDiskReservation(total)
+}
+
+func (r *DiskReservation) hasAtLeast(writer *Writer, bytes int64) bool {
+	if r == nil || bytes < 0 || r.writer != writer {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.remaining >= bytes
+}
+
+func (r *DiskReservation) consume(writer *Writer, bytes int64) error {
+	if r == nil || bytes < 0 || r.writer != writer {
+		return errors.New("invalid WAL disk reservation")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if bytes > r.remaining {
+		return ErrWALDiskPressure
+	}
+	r.remaining -= bytes
+	return nil
+}
+
+// Release returns unused capacity and is safe to call more than once.
+func (r *DiskReservation) Release() {
+	if r == nil || r.writer == nil {
+		return
+	}
+	r.mu.Lock()
+	remaining := r.remaining
+	r.remaining = 0
+	r.mu.Unlock()
+	r.writer.releaseDiskReservation(remaining)
+}
+
+func (w *Writer) releaseDiskReservation(reservedBytes int64) {
+	if reservedBytes <= 0 {
+		return
+	}
+	w.diskAdmissionMu.Lock()
+	if reservedBytes > w.diskReservedBytes {
+		w.logger.Error().Int64("release_bytes", reservedBytes).Int64("reserved_bytes", w.diskReservedBytes).Msg("WAL disk reservation underflow")
+		w.diskReservedBytes = 0
+	} else {
+		w.diskReservedBytes -= reservedBytes
+	}
+	w.diskAdmissionMu.Unlock()
+}
+
+func (w *Writer) enqueueReservedDataEntry(entry walEntry, reservedBytes int64) error {
+	entry.diskReservationBytes = reservedBytes
+	if err := w.tryEnqueueEntry(entry); err != nil {
+		w.releaseDiskReservation(reservedBytes)
+		return err
+	}
+	return nil
+}
+
+func (w *Writer) appendTrackedEntry(logicalPayload []byte, reservation *DiskReservation) (string, error) {
+	reservedBytes := int64(WALEntryHeaderSize + walTrackedHeaderSize + len(logicalPayload))
+	if err := reservation.consume(w, reservedBytes); err != nil {
+		return "", err
+	}
+
 	// Allocating the sequence and publishing it as pending must be one step.
 	// Everything after this — the Sprintf, the CRC, and above all the
 	// synchronous replication hook below — sits between them otherwise, and a
@@ -987,7 +1213,7 @@ func (w *Writer) appendTrackedEntry(logicalPayload []byte) (string, error) {
 	copy(entryData[WALEntryHeaderSize:], trackedPayload)
 	// Carry the sequence so the writer loop can record it against the file the
 	// write actually lands in (#1009).
-	if err := w.tryEnqueueEntry(walEntry{data: entryData, seq: seq}); err != nil {
+	if err := w.enqueueReservedDataEntry(walEntry{data: entryData, seq: seq}, reservedBytes); err != nil {
 		w.pendingMu.Lock()
 		delete(w.pendingSeqs, seq)
 		w.pendingMu.Unlock()
@@ -1010,6 +1236,10 @@ func (w *Writer) appendEnvelopedEntry(dbBytes []byte, envelopeHeaderLen int, pay
 	checksum := crc.Sum32()
 
 	timestampUS := uint64(time.Now().UnixMicro())
+	reservedBytes := int64(WALEntryHeaderSize + totalPayloadLen)
+	if err := w.reserveDiskHeadroom(reservedBytes); err != nil {
+		return err
+	}
 
 	// Replication hook
 	if w.replicationHook != nil {
@@ -1038,7 +1268,7 @@ func (w *Writer) appendEnvelopedEntry(dbBytes []byte, envelopeHeaderLen int, pay
 	copy(entryData[WALEntryHeaderSize:], envHeader[:envelopeHeaderLen])
 	copy(entryData[WALEntryHeaderSize+envelopeHeaderLen:], payload)
 
-	return w.tryEnqueue(entryData)
+	return w.enqueueReservedDataEntry(walEntry{data: entryData, untrackedData: true}, reservedBytes)
 }
 
 // tryEnqueue is the shared non-blocking send into entryChan used by
@@ -1052,7 +1282,11 @@ func (w *Writer) appendEnvelopedEntry(dbBytes []byte, envelopeHeaderLen int, pay
 // Checkpoints do not come through here — they build their own walEntry — which
 // is what keeps a file holding only checkpoints reclaimable.
 func (w *Writer) tryEnqueue(entryData []byte) error {
-	return w.tryEnqueueEntry(walEntry{data: entryData, untrackedData: true})
+	reservedBytes := int64(len(entryData))
+	if err := w.reserveDiskHeadroom(reservedBytes); err != nil {
+		return err
+	}
+	return w.enqueueReservedDataEntry(walEntry{data: entryData, untrackedData: true}, reservedBytes)
 }
 
 func (w *Writer) tryEnqueueEntry(entry walEntry) error {

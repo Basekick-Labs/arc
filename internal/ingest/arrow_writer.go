@@ -903,6 +903,12 @@ type trackedWALWriter interface {
 	ForgetTracked(hashes []string)
 }
 
+type reservableTrackedWALWriter interface {
+	trackedWALWriter
+	ReserveRawWithMetaBatch(database string, payloads [][]byte) (*wal.DiskReservation, error)
+	AppendRawWithMetaTrackedReserved(database string, payload []byte, reservation *wal.DiskReservation) ([]string, error)
+}
+
 // walTrackedIdentityHexLen is the length of a tracked WAL identity:
 // fmt.Sprintf("%016x%016x", instance, sequence). An untracked entry's identity
 // is a 64-hex SHA-256 of its payload, which must never be treated as one.
@@ -1693,54 +1699,105 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 		return fmt.Errorf("expected []interface{}, got %T", records)
 	}
 
-	// OPTIMIZATION: Lazy initialization - avoid map allocation for pure columnar writes (common path)
+	type pendingWrite struct {
+		columnar *models.ColumnarRecord
+		typed    *TypedColumnarRecord
+		payload  []byte
+	}
+
+	// Prepare every WAL payload before the first buffer mutation. Besides making
+	// malformed dispatch fail before any record is visible, this lets the WAL
+	// reserve the aggregate request size in one admission step.
+	pending := make([]pendingWrite, 0, len(recordList))
 	var rowRecordsByMeasurement map[string][]*models.Record
 
 	for _, record := range recordList {
 		switch r := record.(type) {
 		case *models.ColumnarRecord:
-			if err := b.writeColumnar(ctx, database, r); err != nil {
-				b.logger.Error().Err(err).Str("measurement", r.Measurement).Msg("Failed to write columnar record")
-				b.totalErrors.Add(1)
-				return err
+			payload, err := b.columnarWALPayload(database, r)
+			if err != nil {
+				return fmt.Errorf("prepare WAL payload for measurement %q: %w", r.Measurement, err)
 			}
+			pending = append(pending, pendingWrite{columnar: r, payload: payload})
 		case *TypedColumnarRecord:
-			// Typed msgpack decode fast path: already converted, carries the
-			// raw client bytes for the zero-copy WAL branch.
-			if err := b.writeTypedColumnarRaw(ctx, database, r.Measurement, r.Batch, r.NumRecords, r.RawPayload, false); err != nil {
-				b.logger.Error().Err(err).Str("measurement", r.Measurement).Msg("Failed to write typed columnar record")
-				b.totalErrors.Add(1)
-				return err
+			payload, err := b.typedWALPayload(database, r)
+			if err != nil {
+				return fmt.Errorf("prepare WAL payload for measurement %q: %w", r.Measurement, err)
 			}
+			pending = append(pending, pendingWrite{typed: r, payload: payload})
 		case *models.Record:
-			// Lazy init: only allocate map when we actually have row records
 			if rowRecordsByMeasurement == nil {
 				rowRecordsByMeasurement = make(map[string][]*models.Record)
 			}
-			// Group row records by measurement for batch conversion
 			rowRecordsByMeasurement[r.Measurement] = append(rowRecordsByMeasurement[r.Measurement], r)
 		default:
-			// FAIL LOUDLY: an unwired record type here means a decoder
-			// produced a type this dispatch doesn't know — silently dropping
-			// it would return 204 to the client while writing nothing, and
-			// would also mean api/msgpack.go extractMeasurements skipped
-			// measurement validation and RBAC for it. Refuse the write.
 			b.totalErrors.Add(1)
 			return fmt.Errorf("unknown record type %T in write dispatch (unwired decoder output)", record)
 		}
 	}
 
-	// Convert grouped row records to columnar format and write
+	// Convert grouped row records to columnar format before reserving capacity.
 	for measurement, rowRecords := range rowRecordsByMeasurement {
 		columnar := b.rowsToColumnar(measurement, rowRecords)
-		if err := b.writeColumnar(ctx, database, columnar); err != nil {
-			b.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to write converted row records")
+		payload, err := b.columnarWALPayload(database, columnar)
+		if err != nil {
+			return fmt.Errorf("prepare WAL payload for measurement %q: %w", measurement, err)
+		}
+		pending = append(pending, pendingWrite{columnar: columnar, payload: payload})
+	}
+
+	payloads := make([][]byte, 0, len(pending))
+	for _, write := range pending {
+		if write.payload != nil {
+			payloads = append(payloads, write.payload)
+		}
+	}
+	var reservation *wal.DiskReservation
+	if reservable, ok := b.wal.(reservableTrackedWALWriter); ok && len(payloads) > 0 {
+		var err error
+		reservation, err = reservable.ReserveRawWithMetaBatch(database, payloads)
+		if err != nil {
+			return err
+		}
+		defer reservation.Release()
+	}
+
+	for _, write := range pending {
+		var err error
+		if write.columnar != nil {
+			write.columnar.RawPayload = write.payload
+			err = b.writeColumnarInternal(ctx, database, write.columnar, false, "", reservation)
+			if err != nil {
+				b.logger.Error().Err(err).Str("measurement", write.columnar.Measurement).Msg("Failed to write columnar record")
+			}
+		} else {
+			err = b.writeTypedColumnarRaw(ctx, database, write.typed.Measurement, write.typed.Batch, write.typed.NumRecords, write.payload, false, reservation)
+			if err != nil {
+				b.logger.Error().Err(err).Str("measurement", write.typed.Measurement).Msg("Failed to write typed columnar record")
+			}
+		}
+		if err != nil {
 			b.totalErrors.Add(1)
 			return err
 		}
 	}
 
 	return nil
+}
+
+func (b *ArrowBuffer) typedWALPayload(database string, record *TypedColumnarRecord) ([]byte, error) {
+	if len(record.RawPayload) > 0 {
+		return record.RawPayload, nil
+	}
+	walRecords := typedBatchToWALRecords(database, record.Measurement, record.Batch, record.NumRecords, b.getDecimalColumns(record.Measurement))
+	if len(walRecords) == 0 {
+		return nil, nil
+	}
+	payload, err := msgpack.Marshal(walRecords)
+	if err != nil {
+		return nil, fmt.Errorf("serialize row-format WAL records: %w", err)
+	}
+	return payload, nil
 }
 
 // WriteColumnarDirect writes columnar data directly to the buffer
@@ -1758,6 +1815,59 @@ func (b *ArrowBuffer) WriteColumnarDirect(ctx context.Context, database, measure
 // Preserves TagColumns metadata for Parquet schema (enables auto-dedup in compaction).
 func (b *ArrowBuffer) WriteColumnarRecord(ctx context.Context, database string, record *models.ColumnarRecord) error {
 	return b.writeColumnar(ctx, database, record)
+}
+
+// WriteColumnarBatch admits the complete set of WAL payloads before mutating
+// any measurement buffer. A disk-pressure rejection therefore applies to the
+// whole request even when it contains multiple measurements.
+func (b *ArrowBuffer) WriteColumnarBatch(ctx context.Context, database string, records map[string]*models.ColumnarRecord) error {
+	if len(records) == 0 {
+		return nil
+	}
+
+	payloads := make([][]byte, 0, len(records))
+	for _, record := range records {
+		payload, err := b.columnarWALPayload(database, record)
+		if err != nil {
+			return fmt.Errorf("prepare WAL payload for measurement %q: %w", record.Measurement, err)
+		}
+		record.RawPayload = payload
+		if payload != nil {
+			payloads = append(payloads, payload)
+		}
+	}
+
+	var reservation *wal.DiskReservation
+	if reservable, ok := b.wal.(reservableTrackedWALWriter); ok && len(payloads) > 0 {
+		var err error
+		reservation, err = reservable.ReserveRawWithMetaBatch(database, payloads)
+		if err != nil {
+			return err
+		}
+		defer reservation.Release()
+	}
+
+	for _, record := range records {
+		if err := b.writeColumnarInternal(ctx, database, record, false, "", reservation); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *ArrowBuffer) columnarWALPayload(database string, record *models.ColumnarRecord) ([]byte, error) {
+	if len(record.RawPayload) > 0 {
+		return record.RawPayload, nil
+	}
+	walRecords := b.columnarToWALRecords(database, record)
+	if len(walRecords) == 0 {
+		return nil, nil
+	}
+	payload, err := msgpack.Marshal(walRecords)
+	if err != nil {
+		return nil, fmt.Errorf("serialize row-format WAL records: %w", err)
+	}
+	return payload, nil
 }
 
 // WriteColumnarDirectNoWAL writes columnar data without writing to WAL.
@@ -1832,7 +1942,7 @@ func (b *ArrowBuffer) writeColumnarDirect(ctx context.Context, database, measure
 		Columns:     columns,
 		Columnar:    true,
 	}
-	return b.writeColumnarInternal(ctx, database, record, true, walIdentity)
+	return b.writeColumnarInternal(ctx, database, record, true, walIdentity, nil)
 }
 
 // WriteColumnarDirectReplay is WriteColumnarDirectNoWAL for WAL recovery, with
@@ -2318,10 +2428,10 @@ func (b *ArrowBuffer) flushOnSchemaChangeLocked(
 
 // writeColumnar writes a columnar record to the buffer
 func (b *ArrowBuffer) writeColumnar(ctx context.Context, database string, record *models.ColumnarRecord) error {
-	return b.writeColumnarInternal(ctx, database, record, false, "")
+	return b.writeColumnarInternal(ctx, database, record, false, "", nil)
 }
 
-func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string, record *models.ColumnarRecord, skipWAL bool, inheritedWALIdentity string) error {
+func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string, record *models.ColumnarRecord, skipWAL bool, inheritedWALIdentity string, reservation *wal.DiskReservation) error {
 	// Create buffer key: database/measurement
 	// OPTIMIZATION: String concatenation is faster than fmt.Sprintf (no reflection)
 	bufferKey := database + "/" + record.Measurement
@@ -2346,7 +2456,15 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 		if len(record.RawPayload) > 0 {
 			var err error
 			if canTrack {
-				walHashes, err = tracked.AppendRawWithMetaTracked(database, record.RawPayload)
+				if reservation != nil {
+					if reservable, ok := b.wal.(reservableTrackedWALWriter); ok {
+						walHashes, err = reservable.AppendRawWithMetaTrackedReserved(database, record.RawPayload, reservation)
+					} else {
+						err = errors.New("WAL writer cannot consume a request disk reservation")
+					}
+				} else {
+					walHashes, err = tracked.AppendRawWithMetaTracked(database, record.RawPayload)
+				}
 			} else {
 				err = b.wal.AppendRawWithMeta(database, record.RawPayload)
 			}
@@ -2360,6 +2478,9 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 						Str("measurement", record.Measurement).
 						Int("payload_size", len(record.RawPayload))
 				})
+				if errors.Is(err, wal.ErrWALDiskPressure) {
+					return err
+				}
 			}
 		} else {
 			// FALLBACK: Convert columnar to row format for WAL storage
@@ -2374,7 +2495,15 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 				if marshalErr != nil {
 					err = marshalErr
 				} else if canTrack {
-					walHashes, err = tracked.AppendRawWithMetaTracked(database, rowPayload)
+					if reservation != nil {
+						if reservable, ok := b.wal.(reservableTrackedWALWriter); ok {
+							walHashes, err = reservable.AppendRawWithMetaTrackedReserved(database, rowPayload, reservation)
+						} else {
+							err = errors.New("WAL writer cannot consume a request disk reservation")
+						}
+					} else {
+						walHashes, err = tracked.AppendRawWithMetaTracked(database, rowPayload)
+					}
 				} else {
 					err = b.wal.AppendRawWithMeta(database, rowPayload)
 				}
@@ -2384,6 +2513,9 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 							Str("measurement", record.Measurement).
 							Int("records", len(walRecords))
 					})
+					if errors.Is(err, wal.ErrWALDiskPressure) {
+						return err
+					}
 				}
 			}
 		}
@@ -2544,7 +2676,7 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 // is already typed ([]int64, []float64, []string). Used by format-specific parsers
 // that know column types at compile time.
 func (b *ArrowBuffer) writeTypedColumnarInternal(ctx context.Context, database, measurement string, typedColumns *TypedColumnBatch, numRecords int, skipWAL bool) error {
-	return b.writeTypedColumnarRaw(ctx, database, measurement, typedColumns, numRecords, nil, skipWAL)
+	return b.writeTypedColumnarRaw(ctx, database, measurement, typedColumns, numRecords, nil, skipWAL, nil)
 }
 
 // writeTypedColumnarRaw is writeTypedColumnarInternal with an optional raw
@@ -2555,7 +2687,7 @@ func (b *ArrowBuffer) writeTypedColumnarInternal(ctx context.Context, database, 
 // lossy for NULLs (typedBatchToWALRecords ignores Validity; see plan doc).
 // The typed msgpack decode path always supplies rawPayload, so it never
 // takes the lossy fallback.
-func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measurement string, typedColumns *TypedColumnBatch, numRecords int, rawPayload []byte, skipWAL bool) error {
+func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measurement string, typedColumns *TypedColumnBatch, numRecords int, rawPayload []byte, skipWAL bool, reservation *wal.DiskReservation) error {
 	bufferKey := database + "/" + measurement
 	var walHashes []string
 
@@ -2565,7 +2697,15 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 		if len(rawPayload) > 0 {
 			var err error
 			if canTrack {
-				walHashes, err = tracked.AppendRawWithMetaTracked(database, rawPayload)
+				if reservation != nil {
+					if reservable, ok := b.wal.(reservableTrackedWALWriter); ok {
+						walHashes, err = reservable.AppendRawWithMetaTrackedReserved(database, rawPayload, reservation)
+					} else {
+						err = errors.New("WAL writer cannot consume a request disk reservation")
+					}
+				} else {
+					walHashes, err = tracked.AppendRawWithMetaTracked(database, rawPayload)
+				}
 			} else {
 				err = b.wal.AppendRawWithMeta(database, rawPayload)
 			}
@@ -2575,13 +2715,28 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 						Str("measurement", measurement).
 						Int("payload_size", len(rawPayload))
 				})
+				if errors.Is(err, wal.ErrWALDiskPressure) {
+					return err
+				}
 			}
 		} else {
 			walRecords := typedBatchToWALRecords(database, measurement, typedColumns, numRecords, b.getDecimalColumns(measurement))
 			if len(walRecords) > 0 {
 				var err error
 				if canTrack {
-					walHashes, err = tracked.AppendTracked(walRecords)
+					if reservation != nil {
+						var payload []byte
+						payload, err = msgpack.Marshal(walRecords)
+						if err == nil {
+							if reservable, ok := b.wal.(reservableTrackedWALWriter); ok {
+								walHashes, err = reservable.AppendRawWithMetaTrackedReserved(database, payload, reservation)
+							} else {
+								err = errors.New("WAL writer cannot consume a request disk reservation")
+							}
+						}
+					} else {
+						walHashes, err = tracked.AppendTracked(walRecords)
+					}
 				} else {
 					err = b.wal.Append(walRecords)
 				}
@@ -2591,6 +2746,9 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 							Str("measurement", measurement).
 							Int("records", len(walRecords))
 					})
+					if errors.Is(err, wal.ErrWALDiskPressure) {
+						return err
+					}
 				}
 			}
 		}

@@ -12,6 +12,7 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/wal"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
@@ -303,39 +304,41 @@ localProcessing:
 		}
 	}
 
-	// Write each measurement to the buffer
-	for measurement, record := range columnarByMeasurement {
-		err := h.buffer.WriteColumnarRecord(c.Context(), database, record)
-		if err != nil {
-			h.totalErrors.Add(1)
-			metrics.Get().IncIngestErrors()
-			h.logger.Error().
-				Err(err).
-				Str("database", database).
-				Str("measurement", measurement).
-				Int("records", len(record.Columns["time"])).
-				Msg("Failed to write to Arrow buffer")
-			// Schema-churn rejection is retryable — surface as 503 so
-			// upstream senders back off rather than treating this as a
-			// permanent server error. See ingest.ErrSchemaChurnExceeded.
-			// A write that arrives after its shard was flushed by shutdown is
-			// refused, not lost: the record is still in the WAL. 503 so the client
-			// retries (elsewhere, during a rolling restart) instead of treating a
-			// shutdown race as a permanent server error.
-			if errors.Is(err, ingest.ErrBufferClosing) {
-				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-					"error": "Write rejected (server shutting down): " + err.Error(),
-				})
-			}
-			if errors.Is(err, ingest.ErrSchemaChurnExceeded) {
-				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-					"error": "Write rejected (schema churn): " + err.Error(),
-				})
-			}
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-				"error": "Write failed: " + err.Error(),
+	// Admit the WAL capacity for every measurement before writing any of them.
+	if err := h.buffer.WriteColumnarBatch(c.Context(), database, columnarByMeasurement); err != nil {
+		h.totalErrors.Add(1)
+		metrics.Get().IncIngestErrors()
+		h.logger.Error().
+			Err(err).
+			Str("database", database).
+			Int("measurements", len(columnarByMeasurement)).
+			Msg("Failed to write Line Protocol request to Arrow buffer")
+		// Schema-churn rejection is retryable — surface as 503 so
+		// upstream senders back off rather than treating this as a
+		// permanent server error. See ingest.ErrSchemaChurnExceeded.
+		// A write that arrives after its shard was flushed by shutdown is
+		// refused, not lost: the record is still in the WAL. 503 so the client
+		// retries (elsewhere, during a rolling restart) instead of treating a
+		// shutdown race as a permanent server error.
+		if errors.Is(err, ingest.ErrBufferClosing) {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"error": "Write rejected (server shutting down): " + err.Error(),
 			})
 		}
+		if errors.Is(err, ingest.ErrSchemaChurnExceeded) {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"error": "Write rejected (schema churn): " + err.Error(),
+			})
+		}
+		if errors.Is(err, wal.ErrWALDiskPressure) {
+			c.Set("Retry-After", "5")
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"error": "Write rejected (WAL disk pressure): " + err.Error(),
+			})
+		}
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Write failed: " + err.Error(),
+		})
 	}
 
 	// Record global metrics
