@@ -204,13 +204,23 @@ type CompactionConfig struct {
 	MemoryLimit string
 
 	// Threads is the DuckDB thread count for EACH compaction subprocess.
-	// 0 (the default) means auto: half of EffectiveCores, minimum 1 — half the
-	// CPUs this process may use, which is the container's CPU quota where there
-	// is one and the machine's core count where there is not (#1030). Before
-	// this key existed, each subprocess used DuckDB's own default, which is the
-	// quota or, unlimited, all cores — so two concurrent jobs could saturate the
-	// machine and starve ingest. Sort and scan buffers scale with threads, so
-	// this also bounds memory.
+	// 0 (the default) means auto: EffectiveCores divided by max(2,
+	// max_concurrent), with a minimum of 1. EffectiveCores reflects the CPUs
+	// available to this process; it does not distinguish a quota, cpuset, or
+	// GOMAXPROCS setting. The default max_concurrent of 2 preserves the previous
+	// half-core value, while higher concurrency divides the thread cap across
+	// subprocesses (#1037).
+	//
+	// Whatever value this ends up with is then subject to the licence cap in
+	// cmd/arc/main.go#applyLicenseCoreLimits (#1036) — the AUTO value included,
+	// not only an explicit one, because Load resolves this sentinel to a
+	// positive number before that runs. The cap applies on a core-limited
+	// licence only; applyLicenseCoreLimits returns early when MaxCores <= 0.
+	//
+	// Before this key existed, each subprocess used DuckDB's own default,
+	// which could allow concurrent jobs to saturate the machine and starve
+	// ingest. Sort and scan buffers also scale with threads, so this bounds
+	// memory.
 	Threads int
 
 	// MaxFilesPerBatch bounds how many files a single compaction job feeds to
@@ -1258,7 +1268,7 @@ func Load() (*Config, error) {
 		cfg.Compaction.MemoryLimit = deriveCompactionMemoryLimit(cfg.Database.MemoryLimit, cfg.Compaction.MaxConcurrent)
 	}
 	if cfg.Compaction.Threads == 0 {
-		cfg.Compaction.Threads = getDefaultCompactionThreads()
+		cfg.Compaction.Threads = getDefaultCompactionThreads(cfg.Compaction.MaxConcurrent)
 	}
 
 	// Trim storage identifiers in-place before validating. These build DuckDB
@@ -1794,7 +1804,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.max_files_per_batch", 30)             // 30 files per DuckDB read_parquet() call; valid range [2, 500]
 	v.SetDefault("compaction.temp_directory", "./data/compaction") // Temp directory for compaction files
 	v.SetDefault("compaction.memory_limit", "")                    // "" = auto: database.memory_limit / max_concurrent (see CompactionConfig.MemoryLimit)
-	v.SetDefault("compaction.threads", 0)                          // 0 = auto: half of EffectiveCores, min 1 (see CompactionConfig.Threads)
+	v.SetDefault("compaction.threads", 0)                          // 0 = auto; see CompactionConfig.Threads
 	// Phase 4: completion-manifest watcher tunables
 	v.SetDefault("compaction.completion_watcher_interval_ms", 1000) // 1s poll rate
 	v.SetDefault("compaction.completion_dir", "")                   // "" = derive from temp_directory
@@ -2361,10 +2371,9 @@ func deriveCompactionMemoryLimit(dbLimit string, maxConcurrent int) string {
 	return strconv.FormatFloat(derived, 'f', -1, 64) + m[2]
 }
 
-// getDefaultCompactionThreads is the auto value for compaction.threads: half
-// the CPUs this process may use, minimum 1. With the default max_concurrent of
-// 2, the two subprocesses together use about one process's worth of cores,
-// leaving headroom for the main process's ingest and query work.
+// getDefaultCompactionThreads is the auto value for compaction.threads. It
+// derives from the CPUs this process may use and the maximum number of
+// concurrent subprocesses, with a minimum of one thread per subprocess.
 //
 // Derived from EffectiveCores, not runtime.NumCPU: each compaction job is a
 // separate process in the SAME cgroup, so a 2-CPU pod on a 64-core host ran
@@ -2380,14 +2389,24 @@ func deriveCompactionMemoryLimit(dbLimit string, maxConcurrent int) string {
 // the failing range exactly where this issue was reported. Where a container
 // caps CPU but not memory this default now costs throughput; set the key.
 //
-// The halving hardcodes max_concurrent=2; a higher max_concurrent still
-// oversubscribes. Pre-existing, and tracked separately from #1030.
-func getDefaultCompactionThreads() int {
-	return defaultCompactionThreads(effectiveCoresFn())
+// Two concurrent jobs is the default and keeps the existing half-core
+// per-subprocess behavior. Above that default, divide available cores across
+// the concurrent subprocesses so raising max_concurrent does not multiply the
+// aggregate DuckDB thread count (#1037). This is based on effective available
+// cores, not an attempt to distinguish CPU quotas from cpusets or an operator's
+// GOMAXPROCS setting.
+func getDefaultCompactionThreads(maxConcurrent int) int {
+	return defaultCompactionThreads(effectiveCoresFn(), maxConcurrent)
 }
 
-func defaultCompactionThreads(cores int) int {
-	threads := cores / 2
+func defaultCompactionThreads(cores, maxConcurrent int) int {
+	// The floor of 2 does double duty: it keeps the pre-#1037 half-core default
+	// byte-identical at the default max_concurrent, and it absorbs the
+	// non-positive sentinel the same way compaction.NewManager does (0 means
+	// "use 2"). Load has already rejected a negative max_concurrent, so the only
+	// non-positive value that reaches here is an explicit max_concurrent = 0.
+	divisor := max(2, maxConcurrent)
+	threads := cores / divisor
 	if threads < 1 {
 		threads = 1
 	}
