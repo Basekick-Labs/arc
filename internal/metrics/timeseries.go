@@ -154,6 +154,8 @@ func (c *TimeSeriesCollector) collect() {
 			"query_rows_total":     m.queryRowsTotal.Load(),
 			// Buffer
 			"buffer_queue_depth":          m.bufferQueueDepth.Load(),
+			"buffer_records_queued":       m.bufferRecordsQueued.Load(),
+			"buffer_records_inflight":     m.bufferRecordsInflight.Load(),
 			"buffer_flushes_total":        m.bufferFlushesTotal.Load(),
 			"buffer_errors_total":         m.bufferErrorsTotal.Load(),
 			"buffer_flush_failures_total": m.bufferFlushFailures.Load(),

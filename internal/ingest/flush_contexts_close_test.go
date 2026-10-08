@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/config"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
 
@@ -69,6 +70,28 @@ func (c *ctxHonouringBackend) AppendReader(context.Context, string, io.Reader, i
 type countingBackend struct {
 	delay  time.Duration
 	writes atomic.Int64
+}
+
+type gatedBackend struct {
+	countingBackend
+	started chan struct{}
+	release chan struct{}
+}
+
+func (g *gatedBackend) Write(ctx context.Context, path string, data []byte) error {
+	g.started <- struct{}{}
+	select {
+	case <-g.release:
+		g.writes.Add(1)
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (g *gatedBackend) WriteReader(ctx context.Context, path string, r io.Reader, _ int64) error {
+	_, _ = io.Copy(io.Discard, r)
+	return g.Write(ctx, path, nil)
 }
 
 func (c *countingBackend) Write(context.Context, string, []byte) error {
@@ -214,6 +237,92 @@ func TestClose_FlushesQueuedTasks(t *testing.T) {
 	}
 	if !buf.CloseFlushedCleanly() {
 		t.Fatal("CloseFlushedCleanly() is false although every record reached storage; the WAL would be retained and replayed on every start")
+	}
+}
+
+func TestClose_DrainsConcurrentFlushRecordMetrics(t *testing.T) {
+	const (
+		workers   = 4
+		batches   = 8
+		perBatch  = 5
+		records   = int64(perBatch)
+		waitLimit = 2 * time.Second
+	)
+	store := &gatedBackend{
+		started: make(chan struct{}, batches),
+		release: make(chan struct{}, batches),
+	}
+	cfg := &config.IngestConfig{
+		MaxBufferSize:       perBatch,
+		MaxBufferAgeMS:      3_600_000,
+		Compression:         "snappy",
+		ShardCount:          1,
+		FlushWorkers:        workers,
+		FlushQueueSize:      batches + 2,
+		FlushTimeoutSeconds: 10,
+		DataPageVersion:     "2.0",
+	}
+	buf := NewArrowBuffer(cfg, store, zerolog.New(io.Discard))
+	buf.SetCloseBudget(10 * time.Second)
+	for i := 0; i < batches; i++ {
+		if err := buf.WriteColumnarDirect(context.Background(), "db", "m1", makeColumns(perBatch)); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+
+	deadline := time.After(waitLimit)
+	for i := 0; i < workers; i++ {
+		select {
+		case <-store.started:
+		case <-deadline:
+			t.Fatalf("only %d flush workers entered storage", i)
+		}
+	}
+	queued := records * int64(batches-workers)
+	inflight := records * workers
+	if got := metrics.Get().Snapshot()["buffer_records_queued"]; got != queued {
+		t.Fatalf("queued gauge = %v, want %d while workers are blocked", got, queued)
+	}
+	if got := metrics.Get().Snapshot()["buffer_records_inflight"]; got != inflight {
+		t.Fatalf("in-flight gauge = %v, want %d while workers are blocked", got, inflight)
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- buf.Close() }()
+	for !buf.closing.Load() {
+		select {
+		case <-deadline:
+			t.Fatal("Close did not begin draining")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	for i := 0; i < batches; i++ {
+		store.release <- struct{}{}
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(waitLimit):
+		t.Fatal("Close did not finish draining gated flushes")
+	}
+	if got := buf.queuedRecords.Load(); got != 0 {
+		t.Fatalf("queued counter = %d after Close, want 0", got)
+	}
+	if got := buf.inflightRecords.Load(); got != 0 {
+		t.Fatalf("in-flight counter = %d after Close, want 0", got)
+	}
+	snapshot := metrics.Get().Snapshot()
+	if got := snapshot["buffer_records_queued"]; got != int64(0) {
+		t.Fatalf("queued gauge = %v after Close, want 0", got)
+	}
+	if got := snapshot["buffer_records_inflight"]; got != int64(0) {
+		t.Fatalf("in-flight gauge = %v after Close, want 0", got)
+	}
+	if !buf.CloseFlushedCleanly() {
+		t.Fatal("CloseFlushedCleanly() is false after all gated flushes completed")
 	}
 }
 
