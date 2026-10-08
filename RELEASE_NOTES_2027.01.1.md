@@ -67,6 +67,58 @@ costs one comparison at startup and removes a class of silent data loss.
 
 ## New features
 
+### Compaction cycles can be looked up by id ([#1162](https://github.com/Basekick-Labs/arc/issues/1162))
+
+`POST /api/v1/compaction/trigger` answers with a `cycle_id`. Until now that id
+had nowhere to be resolved: `GET /api/v1/compaction/stats` carries a single
+global `last_cycle`, so by the time you polled it could already describe a
+later cycle, and nothing in the payload said which cycle you were looking at
+relative to the one you asked about. Two new admin-only routes close that:
+
+- **`GET /api/v1/compaction/cycles/{id}`** — one cycle.
+- **`GET /api/v1/compaction/cycles?limit=N`** — the retained window, newest
+  first. `limit` defaults to 10.
+
+A record carries more than counters, because counters alone cannot tell one
+cycle from another. Each one reports the **scope** it was asked for
+(`databases`, `measurement`, `tiers`), **when** it ran (`started_at`,
+`finished_at`, `duration_seconds`), and **where it came from** (`source`:
+`api` for a manual trigger, `scheduler` for a scheduled one). If you drive
+compaction one database at a time, this is what separates your trigger's cycle
+from the hourly scheduler's cycle that fired in between.
+
+Failures name themselves. Alongside `failed_batches` a record carries
+`failed_sample` — up to ten partition paths that failed — and `error`, the
+cycle's error text. Previously a failure count was a dead end: job history
+carries no cycle id and is capped at ten entries, so there was no way to get
+from "two batches failed" to which two partitions to retry.
+
+A cycle that is still running is visible too, as `status: "running"` with live
+counters and no `finished_at`, so you can watch a long cycle progress rather
+than only read its obituary. A cycle that has been claimed but has not yet
+started — the millisecond or two between the trigger's reply and the cycle
+body starting — answers `status: "claimed"`.
+
+**Three limits worth knowing**, all reported in the 404 body rather than left
+to be discovered:
+
+- **History is in memory and bounded at 500 cycles.** At the default schedules
+  (`compaction.hourly_schedule = "5 * * * *"` plus
+  `compaction.daily_schedule = "0 3 * * *"`) a node consumes 25 cycle ids a day
+  even when every cycle finds nothing to do, so 500 is roughly 20 days. Tighten
+  the hourly schedule and the window shortens proportionally — about 41 hours
+  at `*/5 * * * *`. Nothing is persisted, so a restart empties it.
+- **Cycle ids restart at 1 when the process restarts.** An id recorded before a
+  restart will not resolve afterwards, and it is not a different cycle's id —
+  it is simply gone. The 404 says so instead of claiming the cycle never ran.
+- **Cycles run on the node holding the compactor lease**, and the lookup
+  answers for the node it is asked on. A cycle triggered on another node is not
+  recorded here.
+
+`last_cycle` in `/api/v1/compaction/stats` is unchanged, including its field
+names and its meaning: it still describes the most recent *finished* cycle and
+never reports `running`.
+
 ### Scheduled edge-to-hub replication for paid licenses ([#828](https://github.com/Basekick-Labs/arc/issues/828))
 
 Network spokes can now replicate automatically. Like continuous-query and

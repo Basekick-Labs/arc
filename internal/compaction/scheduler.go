@@ -223,7 +223,7 @@ func (s *Scheduler) runCompaction() {
 	ctx, cancel := context.WithTimeout(context.Background(), s.manager.CycleTimeout)
 	defer cancel()
 
-	cycleID, err := s.manager.RunCompactionCycleForTiers(ctx, s.tierNames)
+	cycleID, err := s.manager.runCycleInternal(ctx, cycleSourceScheduler, nil, s.tierNames)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrCycleAlreadyRunning):
@@ -301,7 +301,7 @@ func (s *Scheduler) TriggerNow(ctx context.Context) (int64, error) {
 	s.logger.Info().Msg("Manual compaction trigger")
 
 	startTime := time.Now()
-	cycleID, err := s.manager.RunCompactionCycleForTiers(ctx, s.tierNames)
+	cycleID, err := s.manager.runCycleInternal(ctx, cycleSourceScheduler, nil, s.tierNames)
 	if err != nil {
 		return cycleID, err
 	}
