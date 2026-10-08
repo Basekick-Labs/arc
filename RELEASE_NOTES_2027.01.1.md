@@ -584,6 +584,8 @@ Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1004](https:/
 
 When recovery finds an uploaded compacted file, it now writes the parent-side completion record before removing its inputs, then records the source deletions for Raft. If the output record cannot be written, recovery retains the inputs and retries with the storage manifest on a later cycle.
 
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1157](https://github.com/Basekick-Labs/arc/pull/1157).
+
 ### Partial DELETE rewrites remain immutable without duplicating data ([#975](https://github.com/Basekick-Labs/arc/issues/975))
 
 Partial DELETE now publishes the surviving rows under a fresh immutable Parquet path and retires the superseded object in every storage mode, including standalone OSS deployments. The rewrite filename is normalized before compaction, tiering and file-time pruning classify it. This closes the same-size/different-content replication class without leaving deleted rows visible through Arc's glob-based query path.
