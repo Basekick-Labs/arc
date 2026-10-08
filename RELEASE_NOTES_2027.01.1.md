@@ -569,6 +569,87 @@ an unbounded operation.
 
 ## Bug fixes
 
+### The manual compaction trigger now requires the compactor lease
+
+`POST /api/v1/compaction/trigger` ran a full compaction cycle on whatever node
+received it. It checked whether a cycle was already running *on that process*
+and nothing else — not the node role, not the compactor lease. Only the
+scheduled cycles ever consulted the lease, and `compaction.enabled` defaults to
+true, so every node in a cluster built a compaction manager and served a live,
+unguarded trigger endpoint. A reader, a standby writer or a second compactor
+would all accept one. Readers and non-lease writers are now refused; a second
+compactor-role node still is not, unless compactor failover is enabled — see
+the last bullet below.
+
+That is unsafe because the partition lock is per-process: a trigger sent to a
+non-lease node could select the same partition as the lease holder and delete
+the same input files. With `cluster.replication_enabled` on it is worse and
+needs no second node at all. The completion-manifest watcher — the component
+that registers a compacted output and the deletion of its sources in the Raft
+manifest — starts only on a node that may compact, but the job's own source
+deletion is unconditional. So one trigger on a non-lease node deleted the
+source files from storage while nothing recorded either the new output or the
+deletions: phantom manifest entries pointing at files that are gone, and an
+orphan output no manifest knows about. Nothing re-registers either, and an
+enabled reconciliation sweep deletes the orphan and strips the phantoms.
+
+The trigger now consults the same gate the schedulers use, re-read on every
+request so a lease hand-over or a demotion takes effect without a restart. A
+node that may not compact answers **503** with `can_compact: false`, its
+`role`, and `lease_holder` (empty when the cluster manages no lease). 503
+rather than 409 because this endpoint already answers 409 for a paused cluster
+and for a cycle already in progress, and arcli reports any 409 here as "a
+compaction cycle is already running (cycle N)" — a role rejection has no cycle
+id, so it would have been reported as cycle 0. The remedy is carried in the
+`error` field rather than only in `message`, because arcli renders `error` and
+discards `message`.
+
+The refusal distinguishes the two reasons a node may not compact, because they
+have different remedies. If a lease exists and another node holds it, the
+message names the holder and points at
+`POST /api/v1/cluster/compactor/assign`. If the cluster manages no lease at
+all — the default, since `cluster.failover_enabled` is false — the refusal came
+from the node role, and the message says so and does *not* recommend the assign
+endpoint, which answers "this cluster does not manage a compactor lease" in
+exactly that state.
+
+Read-only compaction routes are unchanged: they report the node's own state,
+which is accurate everywhere.
+
+Three consequences worth knowing before you upgrade:
+
+- **A cluster-configured node whose license check fails now refuses manual
+  triggers** on writer and reader roles. Such a node logs "running in
+  standalone mode" but keeps its configured role, and its scheduler was already
+  gated, so nothing scheduled ever ran there — the manual path was the only one
+  left, and it is now closed. The node still shares storage with its licensed
+  peers, which is why it is gated rather than exempted. Fix the license, or set
+  `cluster.enabled=false` to run it as a genuine standalone node.
+- **If the lease sits on a node that cannot be recovered, compaction stops
+  cluster-wide and the manual trigger is no longer a way around it.** Move the
+  lease with `POST /api/v1/cluster/compactor/assign`; the 503 body says so.
+  That endpoint accepts compactor and writer targets.
+- **A licensed cluster with no compactor-role node now has no manual
+  compaction path.** With explicit `writer` and `reader` roles and
+  `cluster.failover_enabled` at its default `false`, no node has the static
+  capability and no lease exists to hold. Scheduled compaction never ran on
+  those nodes either — the scheduler was already gated — so this configuration
+  was already not compacting, but the manual trigger used to work and now
+  returns 503. Give one node `cluster.role=compactor`, or set
+  `cluster.failover_enabled=true` so the lease can be assigned to a writer.
+- **A cluster whose nodes never set `cluster.role` is still permissive.** Every
+  node is then `role=standalone`, which cannot hold the compactor lease, so the
+  gate falls back to the static role capability — and that is true for
+  standalone. Every node still accepts a trigger, exactly as every node already
+  runs its own scheduled cycles in that configuration. That is a separate
+  pre-existing problem, tracked as #892, and it is not changed here. Set
+  explicit roles on a cluster.
+- **Two compactor-role nodes with failover off both still accept a trigger.**
+  Both have the static capability and no lease is ever assigned, so neither can
+  be told it is the standby. Enable `cluster.failover_enabled` so exactly one
+  holds the lease, or run a single compactor-role node — the same constraint
+  Iceberg export already documents.
+
 ### Crash smokes verify acknowledged records after WAL replay
 
 The enterprise-shared crash scenarios restart the killed writer and wait for
