@@ -649,6 +649,11 @@ Three consequences worth knowing before you upgrade:
   be told it is the standby. Enable `cluster.failover_enabled` so exactly one
   holds the lease, or run a single compactor-role node — the same constraint
   Iceberg export already documents.
+### Query path parsing honours year-shaped object-store prefixes ([#1108](https://github.com/Basekick-Labs/arc/issues/1108))
+
+Query routing and partition pruning now remove the configured S3 or Azure key prefix before extracting the database and measurement. A multi-segment prefix ending in a year such as `a/b/2026/` no longer makes the parser treat prefix components as the database and measurement.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1156](https://github.com/Basekick-Labs/arc/pull/1156).
 
 ### Crash smokes verify acknowledged records after WAL replay
 
