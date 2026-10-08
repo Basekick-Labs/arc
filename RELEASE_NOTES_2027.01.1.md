@@ -2,13 +2,14 @@
 
 > **Status:** Planned — January 2027 release.
 
-## Upgrade note: two configurations now refuse to start
+## Upgrade note: three configurations now refuse to start
 
-Read this before upgrading if you set either `storage.local_path` or
-`backup.local_path`. Both refusals apply only when `backup.enabled` is true,
-which is the default, and both are decided on **resolved absolute** paths:
-relative spellings, trailing slashes and symlinks are normalised first, and in
-the container image the working directory is `/app`.
+Read this before upgrading if you set `storage.local_path`,
+`backup.local_path` or `compaction.temp_directory`. The first two refusals apply
+only when `backup.enabled` is true, which is the default, and both are decided
+on **resolved absolute** paths: relative spellings, trailing slashes and
+symlinks are normalised first, and in the container image the working directory
+is `/app`. The third applies independently of `backup.enabled`.
 
 **1. The backup destination and the primary storage root may no longer be the
 same directory, and neither may contain the other.** With `backup.local_path`
@@ -27,6 +28,27 @@ backup target is configured.** That combination previously started with the
 backup API silently disabled. An empty *environment variable* still falls
 through to the default, so only an empty value in the config file, or a stray
 space, triggers this.
+
+**3. `storage.local_path` and `compaction.temp_directory` may no longer contain
+a glob metacharacter** — one of `*`, `?`, `[`, `]`, `{`, `}`. All six are legal
+in a POSIX directory name, so `/data/arc[prod]` was an accepted configuration
+before this release.
+
+It cannot stay accepted. Compaction interpolates a full filesystem path into
+DuckDB's `read_parquet()`, which reads its argument as a **pattern**: with a
+metacharacter in the path, Go's literal `os.Open` and DuckDB can resolve the
+same string to **different files**, so a job could validate one file and read
+another, then delete the inputs it never read. The storage root is checked for
+the local backend only, since that is the only one whose paths reach a local
+glob; `compaction.temp_directory` is checked whenever compaction is enabled,
+because inputs from object storage are streamed into it and read back from
+there.
+
+To fix: rename the directory. The refusal names the offending character.
+
+Arc also refuses such a path per-job as defence-in-depth, but that is not where
+an operator should find out: every input would fail identically on every cycle,
+so compaction would never progress while the logs showed jobs completing.
 
 To fix either: move one path outside the other, point `backup.default_target` at
 a configured target, or set `backup.enabled = false`, which skips the check
@@ -1225,6 +1247,47 @@ of from a Raft snapshot rather than from the log, since a snapshot restore
 fires no registration callbacks (#1071 tracks the snapshot side).
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#907](https://github.com/Basekick-Labs/arc/pull/907).
+
+### Compaction reuses local inputs and validates DuckDB paths ([#969](https://github.com/Basekick-Labs/arc/issues/969))
+
+For local storage, compaction reads Parquet inputs from their existing paths
+instead of first copying them into the compaction temporary directory. This
+removes the input-staging copy, but DuckDB still reads the inputs and compaction
+still writes and uploads its output. Reads therefore remain on the data volume;
+operators who place `compaction.temp_directory` on a separate volume should
+account for that change.
+
+The input-copy byte figure in the acceptance harness is calculated from input
+file sizes, not measured storage I/O. Arc's parent `/metrics` endpoint does not
+aggregate storage counters from compaction subprocesses, so those counters
+cannot measure compaction reads or writes. The optional large-partition run
+records cycle wall time and sampled peak temporary-directory usage; its 10 ms
+sampling interval can miss short-lived peaks.
+
+In a single same-settings comparison with 42 Parquet inputs, 1.05 million rows
+and 9,130,407 input bytes, the baseline and this change completed in 0.905 s
+and 0.894 s. Sampled temporary-directory peaks were 1,878,338 bytes and
+356,610 bytes, respectively. The harness calculates 9,130,407 baseline input
+copy bytes versus zero with local-path reuse; it does not measure total disk
+I/O. This one run does not establish a throughput improvement.
+
+An input that disappears before validation is skipped safely. If it disappears
+after validation and before DuckDB reads it, the batch fails as a permanent
+missing-input error without adaptive splitting or retries; surviving inputs
+remain in storage for the next cycle to rediscover. A permanent failure is now
+recognised in either the subprocess stderr or the parent error, rather than only
+in stderr, so such a batch stops immediately instead of spending its full retry
+budget.
+
+Because DuckDB reads a `read_parquet()` path as a pattern, a path containing a
+glob metacharacter could resolve to a different file than the one Arc named and
+validated. Such a path now **fails the compaction job** rather than skipping the
+file, and the two operator-set directories that reach `read_parquet` are
+refused at startup instead — see the upgrade note at the top of these notes. A
+skipped file would have failed identically on every later cycle, so compaction
+would never have progressed while every metric showed jobs completing.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#990](https://github.com/Basekick-Labs/arc/pull/990).
 
 ## Internal changes
 

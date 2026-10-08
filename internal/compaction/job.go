@@ -316,7 +316,7 @@ func (j *Job) Run(ctx context.Context) error {
 	}
 	defer j.cleanupTemp(tempDir)
 
-	// Download files to temp directory
+	// Reuse local files where possible; remote inputs are streamed to a temp directory.
 	downloadedFiles, err := j.downloadFiles(ctx, tempDir)
 	if err != nil {
 		return j.fail(fmt.Errorf("failed to download files: %w", err))
@@ -474,7 +474,7 @@ func (j *Job) Run(ctx context.Context) error {
 // downloadedFile tracks a downloaded file with its original storage key and local path
 type downloadedFile struct {
 	storageKey string // Original storage key
-	localPath  string // Local file path after download
+	localPath  string // Local file path after reuse or download
 	size       int64  // File size in bytes
 }
 
@@ -495,7 +495,8 @@ type downloadResult struct {
 // downloadWorkers is the number of concurrent download workers
 const downloadWorkers = 4
 
-// downloadFiles downloads files from storage to the temp directory using parallel workers.
+// downloadFiles prepares files for compaction using parallel workers. Local files
+// are reused in place; other backends are streamed to the temp directory.
 // Returns downloaded files info and any error encountered.
 func (j *Job) downloadFiles(ctx context.Context, tempDir string) ([]downloadedFile, error) {
 	if len(j.Files) == 0 {
@@ -581,15 +582,39 @@ func (j *Job) downloadFiles(ctx context.Context, tempDir string) ([]downloadedFi
 	return finalFiles, nil
 }
 
-// downloadSingleFile downloads a single file from storage using streaming to avoid memory issues.
-// MEMORY OPTIMIZATION: Uses ReadTo to stream directly to disk instead of loading entire file into memory.
-// This prevents OOM errors when compacting partitions with large files.
+// downloadSingleFile reuses local-backend files in place and streams other
+// backends into a unique temp file. Streaming avoids loading large files into
+// memory during compaction.
 func (j *Job) downloadSingleFile(ctx context.Context, tempDir string, index int, fileKey string) downloadResult {
 	// Check for cancellation
 	select {
 	case <-ctx.Done():
 		return downloadResult{index: index, err: ctx.Err()}
 	default:
+	}
+
+	// Local files are already on the filesystem DuckDB will read from. Keep
+	// the original path instead of copying the input into the compaction temp
+	// directory; remote backends continue through the streaming path below.
+	if local, ok := j.StorageBackend.(*storage.LocalBackend); ok {
+		if localPath, err := storage.ObjectURI(local, fileKey); err == nil {
+			info, err := os.Stat(localPath)
+			if err == nil {
+				if !info.Mode().IsRegular() {
+					return downloadResult{index: index, err: fmt.Errorf("local compaction input %s is not a regular file", localPath)}
+				}
+				return downloadResult{index: index, file: &downloadedFile{
+					storageKey: fileKey,
+					localPath:  localPath,
+					size:       info.Size(),
+				}}
+			}
+			if os.IsNotExist(err) {
+				j.logger.Debug().Str("file", fileKey).Msg("File not found (already compacted), skipping")
+				return downloadResult{index: index, skipped: true}
+			}
+			return downloadResult{index: index, err: fmt.Errorf("failed to stat %s: %w", localPath, err)}
+		}
 	}
 
 	// The input index makes each download path unique even when source keys
@@ -701,6 +726,18 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	var validLocalPaths []string
 	var validStorageKeys []string
 	for _, df := range files {
+		// FAIL, not skip. DuckDB would read this path as a pattern and could
+		// resolve it to a different file than os.Open does, so the read must not
+		// happen - but a per-file skip is unsatisfiable: the same path fails the
+		// same way on every cycle, so compaction would never progress while every
+		// metric showed a job completing. config.checkParquetReadRootsGlobSafe
+		// refuses the two operator-set roots at startup, which makes this branch
+		// defence-in-depth for a key Arc built from a database or measurement name
+		// (#993, #994). Returning the error aborts the job before any input is
+		// deleted.
+		if err := storage.ValidateGlobSafe(df.localPath); err != nil {
+			return "", fmt.Errorf("compaction input path is not safe to interpolate into read_parquet: %w", err)
+		}
 		if err := validateParquetFile(df.localPath); err != nil {
 			j.logger.Error().Err(err).Str("file", filepath.Base(df.localPath)).Msg("Skipping corrupted file")
 			continue
