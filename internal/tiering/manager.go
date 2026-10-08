@@ -751,7 +751,7 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 		unseen[f.Path] = true
 	}
 
-	synced, unparseable := 0, 0
+	synced, unparseable, quarantined := 0, 0, 0
 	for _, obj := range objects {
 		// Past the deadline every remaining upsert would fail and log; stop
 		// with what was recorded — the next cycle continues from there.
@@ -784,8 +784,18 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 			SizeBytes:     obj.Size,
 			CreatedAt:     obj.LastModified,
 		}
-		if err := m.metadata.RecordColdFile(ctx, file, obj.LastModified); err != nil {
+		wrote, err := m.metadata.RecordColdFile(ctx, file, obj.LastModified)
+		if err != nil {
 			m.logger.Warn().Str("path", obj.Path).Err(err).Msg("Failed to record cold file, skipping")
+			continue
+		}
+		if !wrote {
+			// Quarantined (#1086 stage C added that guard). The row is
+			// already the record that this key is unusable, and before the
+			// guard every cycle re-upserted it for as long as the listing
+			// kept returning the object. Not counted as synced and not
+			// appended to coldRows: the sweep must not act on it either.
+			quarantined++
 			continue
 		}
 		synced++
@@ -818,6 +828,7 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 		Int("objects", len(objects)).
 		Int("synced", synced).
 		Int("unparseable", unparseable).
+		Int("quarantined_skipped", quarantined).
 		Msg("Cold tier metadata sync completed")
 	return synced, coldRows, nil
 }

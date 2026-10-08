@@ -490,20 +490,35 @@ local_path = "./data/backups"           # Directory for local backups; see the r
 # answer says what it withheld. That is what makes recovery onto fresh
 # hardware possible.
 #
-# A backup copies HOT storage. With tiered_storage on, whatever has been
-# migrated to the cold tier is not in the backup, and the manifest says so:
-# cold_files_excluded counts those files and cold_files_excluded_databases
-# breaks the count down per database. The figure is also in the backup listing
-# and per target in GET /api/v1/backup/<id>, and a restore logs a warning
-# naming it. It blocks nothing — in particular a replace-mode restore of a
-# partly-cold backup still succeeds, because replace deletes through the
-# cluster file manifest and a migrated file has already left it. The count is
-# the REPORTING NODE view of its own tier metadata, so on a cluster where only
-# the primary migrates, take the backup on the primary writer for the full
-# figure. An ABSENT field is not evidence that nothing was migrated: tiering is
-# licence-gated at startup, so a node without the licence reports nothing even
-# though its cold objects are still there. Backing up the cold tier itself is
-# not done yet.
+# A backup carries BOTH tiers. With tiered_storage on, the cold-tier objects are
+# backed up too and a restore puts each file back on the tier it came from,
+# recording the tier row that makes it queryable. cold_files on the manifest
+# says how many came from cold; it is also in the listing and per target in
+# GET /api/v1/backup/<id>.
+#
+# So a backup of a tiered deployment is roughly the size of hot PLUS cold.
+# There is deliberately no switch to turn the cold half off — a backup that
+# silently omits most of a database is the problem this solves — so scope the
+# backup with `databases` if you want a smaller one.
+#
+# Restoring onto a node with NO cold tier is supported: those files land in hot
+# storage and the status reports cold_files_restored_to_hot. An UNREACHABLE
+# cold store FAILS the backup rather than producing a smaller one, because
+# nothing in Arc deletes a cold object, so a read that fails means the store is
+# gone rather than the file.
+#
+# WHICH NODE takes the backup now decides what is IN it, not just what a count
+# says: the walk reads THIS node cold store and THIS node tier rows. On a
+# cluster where only the primary migrates, take the backup on the primary
+# writer. Restore there too — a cold restore leaves a tier row, and the stale
+# hot copy it can supersede is removed by a reconciliation that runs only on
+# the migrating node.
+#
+# cold_files_excluded counts tier rows whose data the backup does NOT hold:
+# with a readable cold tier that is the rows whose object is missing from the
+# store, which is data that is genuinely gone. An ABSENT field is not evidence
+# that nothing was migrated — tiering is licence-gated at startup, so a node
+# without the licence carries no cold data and reports nothing about it.
 
 # Query Management (Enterprise)
 # -----------------------------------------------------------------------------

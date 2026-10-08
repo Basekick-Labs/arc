@@ -113,6 +113,10 @@ type Manager struct {
 	tierRecorder TierRecorder
 	tierLookup   TierLookup
 	coldCounter  ColdCounter
+	// coldSource is the cold tier itself (#1086 stage C): the store a backup
+	// reads cold objects from and a restore writes them back to. Nil without
+	// tiering, with cold disabled, or when the cold backend failed to build.
+	coldSource ColdSource
 
 	logger zerolog.Logger
 	mu     sync.Mutex // serializes backup/restore operations
@@ -1130,12 +1134,18 @@ type TargetSlice struct {
 	UnregisteredSkipped  int64 `json:"unregistered_skipped,omitempty"`
 	ManifestOnlyFiles    int64 `json:"manifest_only_files,omitempty"`
 	UnaddressableFiles   int64 `json:"unaddressable_files,omitempty"`
-	// ColdFilesExcluded is this leg's cold-tier gap: files its databases hold
-	// in the cold tier, which no backup carries yet (#1085 stage B3). Per leg
-	// like the counts above, and this is the only place an operator can see
-	// WHICH target carries the gap — the manifest's breakdown is per database,
-	// and the listing's is the run total.
+	// ColdFilesExcluded is this leg's cold-tier gap: tier rows whose data the
+	// backup does not hold. Per leg like the counts above, and this is the
+	// only place an operator can see WHICH target carries the gap — the
+	// manifest's breakdown is per database, and the listing's is the run
+	// total.
+	//
+	// ColdFiles is the complement: how many of this leg's files came FROM the
+	// cold tier (#1086 stage C). On a node with a readable cold tier the
+	// backup carries them, so this is the figure that is normally non-zero and
+	// ColdFilesExcluded that is normally zero.
 	ColdFilesExcluded int64 `json:"cold_files_excluded,omitempty"`
+	ColdFiles         int64 `json:"cold_files,omitempty"`
 }
 
 // GetBackupDetail is GetBackup plus the per-target slices, for the API.
@@ -1172,6 +1182,7 @@ func (l runLeg) slice() TargetSlice {
 		ManifestOnlyFiles:    l.manifest.ManifestOnlyFiles,
 		UnaddressableFiles:   l.manifest.UnaddressableFiles,
 		ColdFilesExcluded:    l.manifest.ColdFilesExcluded,
+		ColdFiles:            l.manifest.ColdFiles,
 	}
 	for _, db := range l.manifest.Databases {
 		s.Databases = append(s.Databases, db.Name)

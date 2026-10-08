@@ -193,6 +193,141 @@ func (m *Manager) CountColdFilesByDatabase(ctx context.Context) (map[string]int6
 	return m.metadata.CountFilesInTierByDatabase(ctx, TierCold)
 }
 
+// ColdBackend is the cold-tier store, or nil when this node has none (#1086
+// stage C). It is how a backup reads cold objects and how a restore writes
+// them back. Implements backup.ColdSource together with the two below.
+//
+// ANDs config.Cold.Enabled, which GetBackendForTier does NOT: an operator who
+// turns cold off keeps the configuration, and every other consumer of the cold
+// backend pairs the two checks (manager.go in the migration gate, the stats
+// and the sync). A backup that walked a disabled cold tier would carry objects
+// the query path refuses to read, because GetGlobPathsForQuery gates the cold
+// glob on exactly this conjunction (router.go).
+//
+// Nil-receiver safe like the reports around it.
+func (m *Manager) ColdBackend() storage.Backend {
+	// config is a POINTER, so it is checked before Cold.Enabled is read.
+	// NewManager always sets it, but "nil-receiver safe" has to mean safe
+	// against a partly-built manager too, which is the shape a caller holding
+	// this as an interface can be handed.
+	if m == nil || m.coldBackend == nil || m.config == nil || !m.config.Cold.Enabled {
+		return nil
+	}
+	return m.coldBackend
+}
+
+// ColdRows is this node's cold-tier metadata, quarantined rows excluded
+// (#1086 stage C). A backup cross-checks its cold listing against these: an
+// object with no row is still copied and counted, a row with no object is the
+// gap it reports.
+//
+// Keyed by path because every use is a lookup by path — matching the cold
+// listing against the rows in both directions — and because a map of stdlib
+// types keeps this interface satisfiable without tiering importing the backup
+// package, which is the whole point of the narrow-interface pattern the other
+// three adapters follow.
+//
+// Quarantined rows are excluded IN SQL by the accessor, not filtered here:
+// their keys are permanently unusable (#758), and a Go-side filter would still
+// pay to materialise and convert every row it then threw away, on the one
+// shared SQLite connection. See ColdFilePathsAndSizes.
+func (m *Manager) ColdRows(ctx context.Context) (map[string]int64, error) {
+	if m == nil || m.metadata == nil {
+		return nil, nil
+	}
+	return m.metadata.ColdFilePathsAndSizes(ctx, TierCold)
+}
+
+// RecordRestoredColdFile records a file a restore has just written to this
+// node's cold tier (#1086 stage C), so the query path can route to it: tier
+// routing reads these rows, so the row is what makes the restored file
+// readable at all.
+//
+// Reports false when the path has a quarantined row, which is left alone.
+//
+// Not RecordRestoredFile. That one enqueues a tierEventPulled whose applyPulled
+// stats the HOT backend and returns false for a file that is not there, and
+// whose upsert is guarded tier = 'hot' — so a cold restore reported through it
+// is silently dropped twice over (#1139 is that guard seen from the other
+// side). Written synchronously rather than through the event queue because a
+// restore is already a bounded, operator-initiated batch and the caller counts
+// the outcome per file.
+//
+// migratedAt is NOW, not the object's timestamp, and that is deliberate: a
+// hot-to-cold flip stamped in the past sits outside the orphan reconciliation
+// window, so a stale hot copy at the same key would never be cleaned up and
+// would keep peers replicating it. The cost is that a large cold restore puts
+// its rows inside that window and each costs one hot-side existence check per
+// cycle until they age out. See RecordColdFile.
+//
+// Two costs this deliberately accepts, because a restore is a rare,
+// operator-initiated batch and correctness here is what makes the data
+// readable at all:
+//
+//   - ONE WRITE PER FILE, synchronous, each its own implicit transaction and
+//     so its own fsync, on the single shared SQLite connection. A restore of
+//     many cold files therefore blocks auth, audit and tier registration for
+//     its duration. The hot path avoids this by batching through the tier
+//     event queue, which this cannot use for the reason above. Batching the
+//     cold rows is the obvious improvement and is tracked separately.
+//   - the cleanup it relies on is ROLE GATED. ReconcileOrphanedFiles removes
+//     the stale hot copy, but it runs past m.roleGated(), and RestoreBackup is
+//     not writer gated — so a restore performed on a FOLLOWER writes rows
+//     whose cleanup never runs on that node, and the rows live in that node's
+//     own SQLite, so no other node does it either. Restore on the primary
+//     writer when the backup holds cold files.
+//
+// The path is parsed here because parseFilePath is tiering's own rule,
+// including the extra edge-sync spoke level, and the backup package cannot
+// reach it.
+func (m *Manager) RecordRestoredColdFile(ctx context.Context, path string, sizeBytes int64) (bool, error) {
+	if m == nil || m.metadata == nil {
+		return false, nil
+	}
+	info, err := m.parseFilePath(path)
+	if err != nil {
+		return false, err
+	}
+	now := time.Now()
+	return m.metadata.RecordColdFile(ctx, &FileMetadata{
+		Path:          path,
+		Database:      info.Database,
+		Measurement:   info.Measurement,
+		PartitionTime: info.PartitionTime,
+		SizeBytes:     sizeBytes,
+		CreatedAt:     now,
+	}, now)
+}
+
+// RecordRestoredHotFile records a file a restore wrote to HOT storage when
+// the backup had read it from a cold tier and this node has none (#1086
+// stage C). Reports false when a quarantined row left it alone.
+//
+// Needed because the ordinary report, RecordRestoredFile, routes through an
+// upsert guarded tier = 'hot' and so cannot move a row that already says
+// cold — which is exactly the row such a file has. Without this the query
+// path omits the hot glob (nothing claims hot) and the cold glob (no cold
+// backend) and returns nothing at all for the measurement.
+//
+// Nil-receiver safe, like the adapters around it.
+func (m *Manager) RecordRestoredHotFile(ctx context.Context, path string, sizeBytes int64) (bool, error) {
+	if m == nil || m.metadata == nil {
+		return false, nil
+	}
+	info, err := m.parseFilePath(path)
+	if err != nil {
+		return false, err
+	}
+	return m.metadata.RecordRestoredHotFile(ctx, &FileMetadata{
+		Path:          path,
+		Database:      info.Database,
+		Measurement:   info.Measurement,
+		PartitionTime: info.PartitionTime,
+		SizeBytes:     sizeBytes,
+		CreatedAt:     time.Now(),
+	})
+}
+
 // RecordUnlinkedFile reports that this node removed its own local copy of a
 // path because the path left the cluster manifest. sizeBytes is the size the
 // caller stat'd before deleting, which is also the evidence that this node

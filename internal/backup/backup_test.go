@@ -50,7 +50,7 @@ func TestStreamBackupFile(t *testing.T) {
 
 	// Stream backup
 	destPath := "backup-123/data/" + srcPath
-	written, err := m.streamBackupFile(ctx, m.defaultDestination(), srcPath, destPath)
+	written, err := m.streamBackupFile(ctx, m.defaultDestination(), m.dataStorage, "data storage", srcPath, destPath)
 	if err != nil {
 		t.Fatalf("streamBackupFile failed: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestStreamBackupFile_SourceNotFound(t *testing.T) {
 		logger:        logger,
 	}
 
-	_, err = m.streamBackupFile(ctx, m.defaultDestination(), "nonexistent.parquet", "backup/data/nonexistent.parquet")
+	_, err = m.streamBackupFile(ctx, m.defaultDestination(), m.dataStorage, "data storage", "nonexistent.parquet", "backup/data/nonexistent.parquet")
 	if err == nil {
 		t.Fatal("expected error for nonexistent source file")
 	}
@@ -140,7 +140,7 @@ func TestCopyDataFiles_StreamsMultipleFiles(t *testing.T) {
 		TotalFiles: int64(len(files)),
 	}
 
-	if _, err := m.copyDataFiles(ctx, testLeg(m, backupID, progress), files, nil); err != nil {
+	if _, err := m.copyDataFiles(ctx, testLeg(m, backupID, progress), files, nil, m.dataStorage, "data storage", ""); err != nil {
 		t.Fatalf("copyDataFiles failed: %v", err)
 	}
 
@@ -205,7 +205,7 @@ func TestCopyDataFiles_SkipsFailedFiles(t *testing.T) {
 	}
 
 	// Should not return error — an isolated unreadable file is skipped
-	if _, err := m.copyDataFiles(ctx, testLeg(m, backupID, progress), files, nil); err != nil {
+	if _, err := m.copyDataFiles(ctx, testLeg(m, backupID, progress), files, nil, m.dataStorage, "data storage", ""); err != nil {
 		t.Fatalf("copyDataFiles should not fail on individual file errors: %v", err)
 	}
 
@@ -263,7 +263,7 @@ func TestCopyDataFiles_SkipRatioExceeded(t *testing.T) {
 
 	progress := &Progress{Operation: "backup", TotalFiles: int64(len(files))}
 	leg := testLeg(m, "bkid", progress)
-	if _, err := m.copyDataFiles(ctx, leg, files, nil); err != nil {
+	if _, err := m.copyDataFiles(ctx, leg, files, nil, m.dataStorage, "data storage", ""); err != nil {
 		t.Fatalf("copyDataFiles should record skips, not fail: %v", err)
 	}
 	// The ratio is evaluated once over the whole backup, not per copy group.
@@ -335,7 +335,7 @@ func TestCopyDataFiles_TempFileFailureIsFatal(t *testing.T) {
 	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "does-not-exist"))
 
 	progress := &Progress{Operation: "backup", TotalFiles: int64(len(files))}
-	_, err = m.copyDataFiles(ctx, testLeg(m, "bkid", progress), files, nil)
+	_, err = m.copyDataFiles(ctx, testLeg(m, "bkid", progress), files, nil, m.dataStorage, "data storage", "")
 
 	if err == nil {
 		t.Fatalf("expected fatal error when temp files cannot be created; got nil with %d/%d files copied",
@@ -375,7 +375,7 @@ func TestCopyDataFiles_TempWriteFailureIsFatalNotSkipped(t *testing.T) {
 	}
 
 	progress := &Progress{Operation: "backup", TotalFiles: 1}
-	_, err = m.copyDataFiles(ctx, testLeg(m, "bkid", progress), []storage.ObjectInfo{{Path: srcPath, Size: 10}}, nil)
+	_, err = m.copyDataFiles(ctx, testLeg(m, "bkid", progress), []storage.ObjectInfo{{Path: srcPath, Size: 10}}, nil, m.dataStorage, "data storage", "")
 	if err == nil {
 		t.Fatal("expected fatal temp-write failure")
 	}
@@ -415,7 +415,7 @@ func TestCopyDataFiles_AllFilesSkippedIsFatal(t *testing.T) {
 
 	progress := &Progress{Operation: "backup", TotalFiles: int64(len(files))}
 	leg := testLeg(m, "bkid", progress)
-	if _, err := m.copyDataFiles(ctx, leg, files, nil); err != nil {
+	if _, err := m.copyDataFiles(ctx, leg, files, nil, m.dataStorage, "data storage", ""); err != nil {
 		t.Fatalf("copyDataFiles should record skips, not fail: %v", err)
 	}
 	if err := m.checkSkipRatio(leg.run, len(files)); err == nil {
@@ -469,10 +469,10 @@ func TestCheckSkipRatio_SpansAllFileGroups(t *testing.T) {
 	// in-root Iceberg metadata both land on the default leg, and share its
 	// tally.
 	leg := testLeg(m, "bkid", progress)
-	if _, err := m.copyDataFiles(ctx, leg, dataFiles, nil); err != nil {
+	if _, err := m.copyDataFiles(ctx, leg, dataFiles, nil, m.dataStorage, "data storage", ""); err != nil {
 		t.Fatalf("data files: %v", err)
 	}
-	if _, err := m.copyDataFiles(ctx, leg, metaFiles, nil); err != nil {
+	if _, err := m.copyDataFiles(ctx, leg, metaFiles, nil, m.dataStorage, "data storage", ""); err != nil {
 		t.Fatalf("iceberg metadata: %v", err)
 	}
 
@@ -515,7 +515,7 @@ func TestCopyDataFiles_PartialSkipRecordsCount(t *testing.T) {
 	}
 
 	progress := &Progress{Operation: "backup", TotalFiles: int64(len(files))}
-	if _, err := m.copyDataFiles(ctx, testLeg(m, "bkid", progress), files, nil); err != nil {
+	if _, err := m.copyDataFiles(ctx, testLeg(m, "bkid", progress), files, nil, m.dataStorage, "data storage", ""); err != nil {
 		t.Fatalf("partial skip should not fail the backup: %v", err)
 	}
 
@@ -554,7 +554,7 @@ func TestCopyDataFiles_ProgressUsesActualBytes(t *testing.T) {
 	files := []storage.ObjectInfo{{Path: path, Size: 999}}
 
 	progress := &Progress{Operation: "backup", TotalFiles: 1}
-	if _, err := m.copyDataFiles(ctx, testLeg(m, "bkid", progress), files, nil); err != nil {
+	if _, err := m.copyDataFiles(ctx, testLeg(m, "bkid", progress), files, nil, m.dataStorage, "data storage", ""); err != nil {
 		t.Fatalf("copyDataFiles failed: %v", err)
 	}
 
@@ -629,7 +629,7 @@ func TestStreamBackupFile_CleansUpPartFileOnWriteFailure(t *testing.T) {
 	}
 
 	destPath := "bkid/data/" + srcPath
-	if _, err := m.streamBackupFile(ctx, m.defaultDestination(), srcPath, destPath); err == nil {
+	if _, err := m.streamBackupFile(ctx, m.defaultDestination(), m.dataStorage, "data storage", srcPath, destPath); err == nil {
 		t.Fatal("expected write failure")
 	}
 
@@ -673,7 +673,7 @@ func TestStreamBackupFile_CleanupFailureDoesNotMaskWriteError(t *testing.T) {
 		t.Fatalf("failed to write source: %v", err)
 	}
 
-	_, err = m.streamBackupFile(ctx, m.defaultDestination(), srcPath, "bkid/data/"+srcPath)
+	_, err = m.streamBackupFile(ctx, m.defaultDestination(), m.dataStorage, "data storage", srcPath, "bkid/data/"+srcPath)
 	if err == nil {
 		t.Fatal("expected write failure")
 	}

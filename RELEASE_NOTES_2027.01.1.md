@@ -164,6 +164,78 @@ Not in this stage: the cold tier (#1086), `arcli backup create --database`
 segment. A different backup target per database landed separately in #1085,
 below.
 
+### Backups carry the cold tier ([#1086](https://github.com/Basekick-Labs/arc/issues/1086))
+
+A backup used to copy hot storage only. On a deployment with tiered storage on,
+everything that had been migrated to the cold tier was simply not in it — which
+for a long-retention database like an audit log meant most of the data. Arc now
+backs up the cold tier too, and a restore puts each file back on the tier it
+came from.
+
+The manifest says how much came from cold:
+
+```json
+{
+  "total_files": 1812,
+  "cold_files": 412,
+  "cold_size_bytes": 8294400
+}
+```
+
+`cold_files` is also in the backup listing and per destination in `GET
+/api/v1/backup/:id`, so with per-database routing you can see which target
+holds the cold slice.
+
+**Restores.** A file the backup read from cold goes back to this node's cold
+tier, and its tier row is recorded — that row is what makes it queryable, so no
+manual tiering scan is needed afterwards. Restoring onto a node with **no**
+cold tier is still fine: those files land in hot storage and the status reports
+`cold_files_restored_to_hot`, so the data is all there and all hot. Two smaller
+counts cover the cases where a file arrives but stays unreadable:
+`cold_restore_quarantine_skipped` (the path has a quarantined tier row, which a
+restore must not resurrect) and `cold_rows_not_recorded` (the bytes landed but
+the row could not be written).
+
+**What this changes operationally.** Backups of tiered deployments get bigger
+and slower, by roughly the size of your cold tier. There is deliberately no
+switch to turn it off: a backup that silently omits most of a database is the
+problem this fixes. If you want a smaller backup, scope it with `databases`.
+
+**An unreachable cold store now fails the backup** rather than quietly
+producing a smaller one. A missing hot file is tolerated and skipped, because
+compaction or retention may legitimately have removed it between the listing
+and the copy; nothing in Arc ever deletes a cold object, so a cold read that
+fails means the store is unreachable, and continuing would report success over
+missing data.
+
+Three reconciliation counts appear when this node's tier metadata and its cold
+store disagree. `cold_objects_unrecorded` counts objects in the cold store that
+have no tier row — they are **backed up anyway**, because the store is the
+authority on what exists, and refusing them would mean a node with incomplete
+metadata backs up no cold data at all. `cold_files_excluded` now counts the
+reverse: tier rows whose object is missing from the store, i.e. data that is
+genuinely gone — and `cold_rows_stale_but_hot` counts the third case, a row
+that says cold whose file is still in hot storage and therefore **is** in the
+backup. That last one matters because without it the backup would report a file
+it holds as permanently gone. On a standalone node, or a cluster without shared
+storage or replication, an unrecorded object is a permanent condition rather
+than a lag — the cold-metadata sync that would record it does not run there.
+
+`cold_files_excluded` keeps its per-database breakdown in
+`cold_files_excluded_databases`, so tooling built on the stage-B field keeps
+working.
+
+**Restore cold files on the primary writer.** A cold restore leaves the tier
+row that makes the file readable, and if the node already had a hot copy at
+that key the row flips hot-to-cold, leaving the hot copy stale. Tiering's
+orphan reconciliation removes it — but that runs only on the migrating node,
+and restores are not writer-gated, so a restore on a follower leaves the stale
+copy behind.
+
+Needs the tiered-storage licence, which tiering already required. A node
+without it backs up no cold data and says nothing about it, the same hole the
+`cold_files_excluded` marker has.
+
 ### A backup says how many cold-tier files it is not carrying ([#1085](https://github.com/Basekick-Labs/arc/issues/1085))
 
 A backup copies hot storage. On a deployment with tiered storage on, the files
@@ -1052,6 +1124,76 @@ These do not change how Arc behaves. They are here because the codebase is the
 thing a new maintainer has to learn, and a refactor that moves a decision from
 four places to one is worth knowing about before you go looking for it in the
 old place.
+
+### Cold files are a third object set, not merged into the hot one ([#1086](https://github.com/Basekick-Labs/arc/issues/1086))
+
+The obvious implementation — add the cold listing to the file list a backup
+copies — is wrong, and wrong in a way no test without a real cold tier can see.
+**Five** mechanisms in the cluster path would each destroy or misreport a
+merged cold file:
+
+- the Raft manifest adapter drops every cold entry, so a scope whose data is
+  all cold contributes zero manifest entries while the listing is non-empty,
+  and `crossCheckManifest` **refuses the run outright**;
+- that same cross-check holds back any data file the manifest does not list,
+  which every cold file is by construction (tiering deletes a migrated file's
+  entry as phase 2 of the migration);
+- the end-of-run recheck **deletes the backup object** for any sidecar row the
+  fresh manifest snapshot lacks — so a cold file would be copied and then
+  removed again, on every cluster backup, with the status reporting success;
+- the recheck's last pass would label a skipped cold file "reconciled: not
+  missing data", because a cold file is never in the manifest;
+- a path the cross-check held back as unregistered is reported as "not backed
+  up" even when the cold tier supplied it — and since that count gates
+  replace-mode restore past a 10% skip ratio, a deployment with a backlog of
+  failed hot deletes could have had a complete backup refuse its own restore.
+
+So `backupLeg` has a third set, `cold`, which bypasses all five, and
+`ManifestFile.Tier` on the sidecar carries the per-file answer the restore
+needs. There is a regression test per mechanism.
+
+**The cold listing is authoritative and the tier rows are the cross-check,
+which is the inverse of the hot path.** `crossCheckManifest` trusts the Raft
+manifest over this node's listing, because on a cluster the listing can be a
+stale view of a store several nodes write. The cold listing is not that: it is
+this node reading the cold store directly. Hence an object with no row is
+carried and counted rather than held back.
+
+**Mid-migration, the cold copy wins.** A migration copies to cold before
+releasing the hot copy, so one path can be in both listings. Taking the hot
+side loses the file: if the migration completes during the run, the manifest
+entry goes away and the recheck deletes the hot copy's backup object, leaving
+the file in neither set. The cold object is canonical and nothing in Arc ever
+deletes one, and the tier row has already been flipped to cold by that point,
+so cold is both the safe and the consistent choice.
+
+**The restore's cold path is separate on purpose.** A cold file is registered
+in no Raft manifest — registering one would create an entry the next tiering
+cycle wants gone, and would make peers try to replicate a file that is not in
+hot storage — and it is not reported through `RecordRestoredFile` either, whose
+handler stats the hot backend and whose upsert is guarded to hot rows, so a
+cold report is dropped silently twice over. It has its own recorder, which
+stamps `migrated_at` as **now**: only a row inside the orphan-reconciliation
+window lets a stale hot copy at the same key be cleaned up, and the cost is one
+hot-side existence check per restored file per cycle until the rows age out.
+
+`RecordColdFile` also gained a `quarantined_at IS NULL` guard and now reports
+whether it wrote. That is **defensive** rather than a fix for an active bug:
+the old query had no `WHERE` at all, so it would set `tier = 'cold'` on a
+quarantined row, but it never cleared `quarantined_at`, and the condition needs
+a key some backend still lists while tiering has given up on it. The guard
+earns its place because stage C adds a second caller — a restore recording a
+row for a file it has just written — where acting on a quarantined path would
+be a new way to lose the record of an unusable key.
+
+Two shapes worth knowing for whoever tunes this next. The cold walk loads every
+non-quarantined cold row once per backup, through a narrow two-column query
+rather than the full-row accessor, because that load sits on the one shared
+SQLite connection and so blocks auth, audit and tier registration while it
+runs. And the restore writes one row per cold file **synchronously** — the
+asynchronous tier-event path cannot be used, since its handler stats the hot
+backend and its upsert is guarded to hot rows — so a large cold restore is one
+fsync per file. Batching those writes is the obvious next improvement.
 
 ### The cold-file marker's shape ([#1085](https://github.com/Basekick-Labs/arc/issues/1085))
 
