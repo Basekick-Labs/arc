@@ -611,6 +611,19 @@ type TieredStorageConfig struct {
 	// Migration history cleanup
 	MigrationHistoryRetentionDays int // How long to keep migration history (default: 90)
 
+	// ScanTimeout bounds ONE tier scan on every path that runs one: the
+	// startup scan, POST /api/v1/tiering/scan, and the pre-migration scan
+	// inside a migration cycle. Default 2h.
+	//
+	// It does NOT replace the migration cycle budget. Inside a cycle the scan
+	// runs on a context derived from the cycle's, so it gets whichever of the
+	// two is shorter and migration keeps the remainder (#1154).
+	//
+	// A value below the time a full scan takes is harmful, not conservative:
+	// hot-row retirement runs only after the whole walk, so a scan that always
+	// truncates never retires a stale row.
+	ScanTimeout time.Duration
+
 	// Cold tier configuration (remote S3/Azure storage)
 	Cold ColdTierConfig
 }
@@ -888,6 +901,14 @@ func Load() (*Config, error) {
 	// 2h or 90s, read the same way as compaction.cycle_timeout above because
 	// that is the only existing duration key and there is no GetDuration call
 	// in this repo.
+	scanTimeout, err := time.ParseDuration(v.GetString("tiered_storage.scan_timeout"))
+	if err != nil || scanTimeout <= 0 {
+		return nil, fmt.Errorf(
+			"invalid tiered_storage.scan_timeout %q: must be a positive Go duration",
+			v.GetString("tiered_storage.scan_timeout"),
+		)
+	}
+
 	backupOperationTimeout, err := time.ParseDuration(v.GetString("backup.operation_timeout"))
 	if err != nil || backupOperationTimeout <= 0 {
 		return nil, fmt.Errorf(
@@ -1202,6 +1223,7 @@ func Load() (*Config, error) {
 			MigrationBatchSize:            v.GetInt("tiered_storage.migration_batch_size"),
 			DefaultHotMaxAgeDays:          v.GetInt("tiered_storage.default_hot_max_age_days"),
 			MigrationHistoryRetentionDays: v.GetInt("tiered_storage.migration_history_retention_days"),
+			ScanTimeout:                   scanTimeout,
 			Cold: ColdTierConfig{
 				Enabled: v.GetBool("tiered_storage.cold.enabled"),
 				// Normalized like storage.backend so cold.Backend == "s3"/"azure"
@@ -1997,6 +2019,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("tiered_storage.migration_batch_size", 100)            // 100 files per batch
 	v.SetDefault("tiered_storage.default_hot_max_age_days", 30)         // 30 days in hot tier before archiving
 	v.SetDefault("tiered_storage.migration_history_retention_days", 90) // 90 days migration history
+	v.SetDefault("tiered_storage.scan_timeout", "2h")                   // One tier scan; see TieredStorageConfig.ScanTimeout
 
 	// Cold tier defaults (S3/Azure). Objects are written in the bucket's
 	// default storage class; there is deliberately no class or access-tier key.

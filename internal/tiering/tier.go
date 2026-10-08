@@ -119,6 +119,15 @@ type StatusResponse struct {
 	// this node partition pruning until then. Absent on a node with no
 	// cluster replication.
 	ReplicationEvents *TierEventCounts `json:"replication_events,omitempty"`
+	// LastScan is this node's most recent tier scan, absent until it has
+	// run one. It is the only way a TRUNCATED scan is observable after the
+	// fact: the startup scan has no HTTP response to carry its result, and
+	// a health check cannot ask POST /tiering/scan without starting a scan.
+	// A LastScan with truncated set means tier rows are incomplete and no
+	// stale hot row was retired, which costs this node partition pruning
+	// until a scan completes (#1154).
+	LastScan   *ScanResult `json:"last_scan,omitempty"`
+	LastScanAt *time.Time  `json:"last_scan_at,omitempty"`
 }
 
 // TierEventCounts is the drainer's tally for StatusResponse.

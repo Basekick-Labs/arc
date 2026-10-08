@@ -3,6 +3,7 @@ package tiering
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strconv"
@@ -41,6 +42,32 @@ type Manager struct {
 	// spoke re-uploads a duplicate. An error return means the caller MUST NOT
 	// delete the files. Guarded by callbackMu.
 	onHotFilesRemoved func(paths []string) error
+
+	// scanRunning serializes ScanTiers across its exported callers: the
+	// startup scan and POST /api/v1/tiering/scan. The endpoint has no
+	// handler deadline and fasthttp does not cancel a request when the
+	// client disconnects, so an operator who gives up on a slow scan and
+	// retries would otherwise start a second full one over the same
+	// storage root, against the same SQLite handle, each invalidating the
+	// tier cache the query path reads (#1154).
+	//
+	// Deliberately NOT on the unexported scanTiers: a migration cycle that
+	// lands on a running API scan must still run its own pre-migration
+	// scan, or it would migrate from stale hot rows.
+	scanRunning atomic.Bool
+
+	// lastScan is a copy of the most recent scan result and when it
+	// finished, written by scanTiers on every path including truncation.
+	// The startup scan has no HTTP response to carry its result, and a
+	// health check cannot ask the scan endpoint without starting a scan, so
+	// this is the only way a partial startup scan is observable after the
+	// fact. Guarded by scanStateMu: scanRunning serializes the startup and
+	// API scans and cycleRunning serializes the cycle and migrate paths, so
+	// two scans can still be in flight at once while the status handler
+	// reads.
+	scanStateMu sync.RWMutex
+	lastScan    *ScanResult
+	lastScanAt  time.Time
 
 	// Data stores
 	metadata *MetadataStore
@@ -319,10 +346,41 @@ func (m *Manager) runCycle(ctx context.Context) error {
 	// Scan and register any new files before migration. The result is never
 	// nil: a cold sync that succeeded before the hot scan failed still
 	// changed what this node reads.
-	scanResult, coldRows, err := m.scanTiers(ctx)
-	if err != nil {
-		m.logger.Warn().Err(err).Msg("File scan failed, continuing with existing metadata")
-	} else {
+	// The scan gets its own budget, derived from the cycle's rather than
+	// replacing it: whichever is shorter bounds the scan, and migration — the
+	// step that actually moves files — keeps the remainder of the cycle. A
+	// scan_timeout larger than the cycle budget is capped by this parent.
+	scanResult, coldRows, err := func() (*ScanResult, []FileMetadata, error) {
+		scanCtx, cancelScan := context.WithTimeout(ctx, m.scanBudget())
+		defer cancelScan()
+		return m.scanTiers(scanCtx)
+	}()
+	switch {
+	case err != nil && errors.Is(ctx.Err(), context.Canceled):
+		// The cycle was cancelled rather than timed out — a shutdown, or the
+		// request context behind TriggerMigration. Neither budget is at
+		// fault, so name neither.
+		m.logger.Warn().Err(err).
+			Msg("File scan stopped because the migration cycle was cancelled, continuing with existing metadata")
+	case err != nil && ctx.Err() != nil:
+		// The CYCLE ran out, not the scan. Say which, so an operator does
+		// not raise tiered_storage.scan_timeout at a cycle that was already
+		// out of time.
+		m.logger.Warn().Err(err).
+			Msg("File scan stopped because the migration cycle ran out of time, continuing with existing metadata")
+	case err != nil:
+		m.logger.Warn().Err(err).
+			Dur("scan_timeout", m.scanBudget()).
+			Bool("truncated", scanResult.Truncated).
+			Int("scanned", scanResult.FilesScanned).
+			Msg("File scan failed, continuing with existing metadata")
+	case scanResult.Truncated:
+		m.logger.Warn().
+			Dur("scan_timeout", m.scanBudget()).
+			Int("scanned", scanResult.FilesScanned).
+			Int("registered", scanResult.FilesRegistered).
+			Msg("Pre-migration scan ran out of budget and stopped part way; no hot rows were retired this cycle. Raise tiered_storage.scan_timeout above the time a full scan takes")
+	default:
 		m.logger.Info().
 			Int("scanned", scanResult.FilesScanned).
 			Int("registered", scanResult.FilesRegistered).
@@ -693,6 +751,11 @@ func (m *Manager) GetStatus(ctx context.Context) (*StatusResponse, error) {
 		Enabled:      m.config.Enabled,
 		LicenseValid: m.licenseClient.CanUseTieredStorage(),
 	}
+	if last, at := m.LastScan(); last != nil {
+		status.LastScan = last
+		scannedAt := at
+		status.LastScanAt = &scannedAt
+	}
 
 	if !status.LicenseValid {
 		status.Reason = "license required"
@@ -770,6 +833,15 @@ type ScanResult struct {
 	// or not, so on a node whose rows already match its disk this is zero
 	// while FilesRegistered is the file count.
 	HotRowsWritten int `json:"hot_rows_written"`
+	// Truncated reports that the scan ran out of budget and stopped part
+	// way. The counts beside it are real but incomplete, and in particular
+	// hot-row retirement runs only after the whole walk, so a truncated
+	// scan has retired nothing: stale rows for files that are gone from hot
+	// storage survive to the next complete scan.
+	//
+	// Set on every path that can run out of budget — the cold sync, the hot
+	// walk, and the retire tail, which returns no error of its own.
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 // ScanTiers brings this node's tier metadata in line with storage: the cold
@@ -778,8 +850,63 @@ type ScanResult struct {
 // (#683) must see the rows the cold pass flipped. The result is never nil,
 // so a caller can act on a partial pass when the hot scan fails.
 func (m *Manager) ScanTiers(ctx context.Context) (*ScanResult, error) {
+	if !m.scanRunning.CompareAndSwap(false, true) {
+		return &ScanResult{}, ErrScanRunning
+	}
+	defer m.scanRunning.Store(false)
+
 	result, _, err := m.scanTiers(ctx)
 	return result, err
+}
+
+// defaultScanTimeout is the budget for one tier scan when no configuration
+// supplies one. It matches the tiered_storage.scan_timeout default rather than
+// restating it: a Manager built in a test, or the partly-built shape
+// NewMetadataStore callers are handed, has no config at all, and a zero
+// duration would make context.WithTimeout return an already-expired context
+// that truncates every scan on its first object.
+const defaultScanTimeout = 2 * time.Hour
+
+// scanBudget is how long one scan may take. Read through here, never off the
+// config struct: m.config is a pointer and nil is a supported shape.
+func (m *Manager) scanBudget() time.Duration {
+	if m.config != nil && m.config.ScanTimeout > 0 {
+		return m.config.ScanTimeout
+	}
+	return defaultScanTimeout
+}
+
+// ScanBudget is scanBudget for callers outside the package: the API handler
+// bounds its own scan with the same number the background paths use, read from
+// the manager rather than plumbed through a constructor so a hand-built handler
+// cannot carry a zero.
+func (m *Manager) ScanBudget() time.Duration { return m.scanBudget() }
+
+// recordScan stores a COPY of the result. The caller keeps the pointer it
+// passed and hands it to HTTP responses and callbacks; storing that pointer
+// would let a later in-place annotation rewrite what this node reports as its
+// last scan.
+func (m *Manager) recordScan(result *ScanResult) {
+	if result == nil {
+		return
+	}
+	snapshot := *result
+	m.scanStateMu.Lock()
+	m.lastScan = &snapshot
+	m.lastScanAt = time.Now().UTC()
+	m.scanStateMu.Unlock()
+}
+
+// LastScan returns a copy of the most recent scan result and when it finished,
+// or nil if this node has not scanned since it started.
+func (m *Manager) LastScan() (*ScanResult, time.Time) {
+	m.scanStateMu.RLock()
+	defer m.scanStateMu.RUnlock()
+	if m.lastScan == nil {
+		return nil, time.Time{}
+	}
+	snapshot := *m.lastScan
+	return &snapshot, m.lastScanAt
 }
 
 // scanTiers is ScanTiers that also hands back the cold rows the sync worked
@@ -788,10 +915,12 @@ func (m *Manager) ScanTiers(ctx context.Context) (*ScanResult, error) {
 func (m *Manager) scanTiers(ctx context.Context) (*ScanResult, []FileMetadata, error) {
 	result := &ScanResult{}
 	var coldRows []FileMetadata
+	var coldSyncErr error
 	if m.clusterGate != nil && m.coldTierUsable() {
 		synced, rows, err := m.syncColdTierMetadata(ctx)
 		result.ColdSynced = synced
 		coldRows = rows
+		coldSyncErr = err
 		if err != nil {
 			// The hot scan still matters on its own: the primary migrates
 			// from hot rows and every node routes reads from them.
@@ -800,15 +929,40 @@ func (m *Manager) scanTiers(ctx context.Context) (*ScanResult, []FileMetadata, e
 		}
 	}
 	hot, err := m.ScanAndRegisterFiles(ctx)
+	// Copy whatever the walk accounted for whether or not it finished. A
+	// truncated walk returns real counts on a non-nil result, and dropping
+	// them reported files_scanned 0 after a walk over tens of thousands of
+	// files (#1154). HotRowsWritten was missing from this copy entirely, so
+	// every consumer read zero: the cache invalidations keyed on it never
+	// fired, including the one a standalone node needs on its first boot.
+	if hot != nil {
+		result.FilesScanned = hot.FilesScanned
+		result.FilesRegistered = hot.FilesRegistered
+		result.FilesSkipped = hot.FilesSkipped
+		result.HotRetired = hot.HotRetired
+		result.HotRowsWritten = hot.HotRowsWritten
+		result.Errors = hot.Errors
+		if hot.Truncated {
+			result.Truncated = true
+		}
+	}
+	// A budget that expired anywhere in the scan is a truncation, including
+	// in the cold sync above, whose error this function deliberately folds
+	// into ColdSyncFailed so the hot scan still runs.
+	if isBudgetExpiry(err) || isBudgetExpiry(coldSyncErr) {
+		result.Truncated = true
+	}
+	m.recordScan(result)
 	if err != nil {
 		return result, coldRows, err
 	}
-	result.FilesScanned = hot.FilesScanned
-	result.FilesRegistered = hot.FilesRegistered
-	result.FilesSkipped = hot.FilesSkipped
-	result.HotRetired = hot.HotRetired
-	result.Errors = hot.Errors
 	return result, coldRows, nil
+}
+
+// isBudgetExpiry reports whether err is a scan that ran out of time or was
+// cancelled, rather than a scan that failed on its own terms.
+func isBudgetExpiry(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
 }
 
 // syncColdTierMetadata makes this node's metadata reflect what is in cold
@@ -989,9 +1143,18 @@ func (m *Manager) ScanAndRegisterFiles(ctx context.Context) (*ScanResult, error)
 		}
 
 		if err := ctx.Err(); err != nil {
-			// Cancelled — the shutdown hook, or the startup scan's deadline.
+			// Cancelled — the shutdown hook, or the scan's own deadline.
 			// Every write from here on would fail and log once per remaining
 			// file, and a partial walk must not reach retireVanishedHotRows.
+			//
+			// Returning from inside the loop skips the batched invalidation
+			// below, so do it here: the rows written before this point are
+			// real, and leaving the tier cache on its pre-scan answer makes
+			// the query path contradict the database it just wrote (#1154).
+			result.Truncated = true
+			for _, dm := range touched {
+				m.metadata.invalidateTierCache(dm[0], dm[1])
+			}
 			return result, err
 		}
 
@@ -1074,15 +1237,29 @@ func (m *Manager) ScanAndRegisterFiles(ctx context.Context) (*ScanResult, error)
 
 	result.HotRetired = m.retireVanishedHotRows(ctx, objects, listStart, result)
 
-	m.logger.Info().
+	m.logScanOutcome(result)
+	return result, nil
+}
+
+// logScanOutcome reports a finished walk. Split out because the decision it
+// makes is the testable part: the retirement pass returns a count and no
+// error, so a truncation in its tail arrives here with err nil, and calling
+// that "completed" is the success-with-the-wrong-answer shape #1154 is about
+// — the walk ran, but stale hot rows were left behind.
+func (m *Manager) logScanOutcome(result *ScanResult) {
+	event := m.logger.Info()
+	msg := "File scan completed"
+	if result.Truncated {
+		event = m.logger.Warn()
+		msg = "File scan ran out of budget and stopped part way; stale hot rows were not retired"
+	}
+	event.
 		Int("scanned", result.FilesScanned).
 		Int("registered", result.FilesRegistered).
 		Int("skipped", result.FilesSkipped).
 		Int("retired", result.HotRetired).
 		Int("errors", result.Errors).
-		Msg("File scan completed")
-
-	return result, nil
+		Msg(msg)
 }
 
 // retireVanishedHotRowMargin is how recently a hot row may have been created
@@ -1102,6 +1279,13 @@ const retireVanishedHotRowMargin = 5 * time.Minute
 func (m *Manager) retireVanishedHotRows(ctx context.Context, objects []storage.ObjectInfo, listStart time.Time, result *ScanResult) int {
 	hotRows, err := m.metadata.GetFilesInTier(ctx, TierHot)
 	if err != nil {
+		// A budget that expired here is a truncation, not a database
+		// failure: without the flag the scan reports Errors++ and still
+		// returns a nil error, so it reads as a complete scan that had a
+		// hiccup rather than one that never retired anything (#1154).
+		if isBudgetExpiry(err) {
+			result.Truncated = true
+		}
 		m.logger.Warn().Err(err).Msg("Failed to load hot rows; stale rows are retried next scan")
 		result.Errors++
 		return 0
@@ -1117,6 +1301,18 @@ func (m *Manager) retireVanishedHotRows(ctx context.Context, objects []storage.O
 			continue
 		}
 		if err := ctx.Err(); err != nil {
+			// This exit returns a count and no error, so without the flag
+			// the caller logs "File scan completed" and the endpoint
+			// answers 200 on a scan that retired only part of what it
+			// should have (#1154). result is the same object the caller
+			// reads.
+			//
+			// Reaching here needs the budget to expire BETWEEN the load
+			// above and this check, which no test can arrange without a
+			// seam; the load-failure path above is the covered one. Kept
+			// because a budget that expires mid-loop is the likelier case
+			// on a node with many stale rows, one StatFile each.
+			result.Truncated = true
 			return retired
 		}
 		// Tier-conditional: a row that changed tier since the listing is

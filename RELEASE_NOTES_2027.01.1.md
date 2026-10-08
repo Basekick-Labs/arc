@@ -610,6 +610,68 @@ Scheduled compaction behaves exactly as before: the cron path and the internal
 trigger claim and release the cycle in one call, with the same refusal logging
 and the same return values on a lost claim.
 
+### One configurable budget for the tier scan, and a truncated scan you can see ([#1154](https://github.com/Basekick-Labs/arc/issues/1154))
+
+The tier scan runs on four paths, and until now they carried two different
+budgets. A scheduled migration cycle gave the whole cycle 2 hours. The scan at
+startup and `POST /api/v1/tiering/scan` were each capped at **30 minutes**, and
+neither was configurable. The short cap was on both paths an operator reaches
+for, so a warning that the startup scan did not finish pointed at the scheduled
+cycle while the manual endpoint carried the same cap that had just failed.
+
+`tiered_storage.scan_timeout` now bounds the scan on every path, defaulting to
+`2h` so all four agree. It is a Go duration; zero, negative and malformed values
+are refused at startup.
+
+Inside a migration cycle the scan runs on a budget **derived from** the cycle's,
+so it gets whichever is shorter. At the default the two are equal — the cycle
+budget is also 2 hours — so the derivation changes nothing there. It matters once
+the key is set *below* 2 hours: the scan then gives up on its own budget and
+migration, the step that actually moves files, keeps the remainder of the cycle.
+Setting it above 2 hours is harmless, because the cycle still bounds the scan.
+The cycle budget itself is unchanged.
+
+**Why the scan finishing matters.** The scan is the only thing that writes a
+tier row for a compacted file on the node that produced it: the ingest flush
+path and the replication workers are the other writers, and neither sees
+compaction output. A node whose data is largely compacted therefore depends on
+the scan entirely, and a truncated one costs partition pruning — a measurement
+whose remaining rows are all cold drops this node's local files from the read.
+
+**Setting the key below the time a full scan takes is harmful, not
+conservative.** Hot-row retirement runs only after the whole walk, so a scan
+that always truncates never retires a row for a file that has left hot storage.
+
+**A truncated scan is now reported instead of being logged once and forgotten:**
+
+- `ScanResult` carries `truncated`, set on every path that can run out of
+  budget — the cold-tier sync, the hot walk, and the retirement pass, which
+  returns no error of its own and so used to be reported as a complete scan.
+- The partial counts come back rather than being discarded. `POST
+  /api/v1/tiering/scan` answered a bare `500` with `context deadline exceeded`
+  and nothing else; it now answers **503** with the counts and `truncated`, and
+  distinguishes a scan the node cancelled while shutting down from one that ran
+  out of budget. Any other failure keeps its `500`.
+- `GET /api/v1/tiering/status` reports the last scan under `last_scan`. This is
+  the only way a truncated **startup** scan is observable after the fact: it has
+  no HTTP response, and a health check cannot ask the scan endpoint without
+  starting a scan.
+- A truncated scan now invalidates the query caches for what it did reach. The
+  rows it wrote were real, but the query path kept serving its pre-scan answer.
+
+**A second concurrent scan is refused with `409`.** The endpoint has no handler
+deadline and a client disconnecting does not cancel the scan, so an operator who
+gave up on a slow one and retried would start another full scan over the same
+storage root, against the same SQLite handle, each invalidating the tier cache
+the query path reads. A scan inside a migration cycle is deliberately not
+refused — the cycle must always scan, or it would migrate from stale rows.
+
+Fixed alongside: `scanTiers` never copied `HotRowsWritten` out of the walk, so
+every consumer read zero. The cache invalidations keyed on it never fired,
+including the one a standalone node needs on its first boot, when the scan
+writes every hot row it has.
+
+
 ### The manual compaction trigger now requires the compactor lease
 
 `POST /api/v1/compaction/trigger` ran a full compaction cycle on whatever node

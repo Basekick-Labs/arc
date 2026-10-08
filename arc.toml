@@ -348,6 +348,38 @@ migration_batch_size = 100
 default_hot_max_age_days = 0
 migration_history_retention_days = 90
 
+# Budget for ONE tier scan. Default: "2h". Positive Go duration; zero, negative
+# and malformed values are rejected at startup.
+# Environment override: ARC_TIERED_STORAGE_SCAN_TIMEOUT=4h
+#
+# The scan is what puts a file in the tier metadata the query path routes reads
+# from. It runs on four paths and this one number now bounds all of them: the
+# startup scan, POST /api/v1/tiering/scan, and the pre-migration scan inside a
+# scheduled cycle or POST /api/v1/tiering/migrate. Before 27.01.1 the first two
+# were capped at 30 minutes with no way to change it (#1154).
+#
+# Inside a migration cycle the scan runs on a budget derived from the cycle's,
+# so it gets whichever is shorter. At this default the two are equal (the cycle
+# budget is also 2h), so the derivation changes nothing; it matters once this is
+# set BELOW 2h, where the scan gives up on its own budget and migration - the
+# step that actually moves files - keeps the remainder of the cycle. Setting it
+# ABOVE 2h is harmless: the cycle still bounds the scan.
+#
+# Setting it BELOW the time a full scan takes is harmful, not conservative.
+# Hot-row retirement runs only after the whole walk, so a scan that always
+# truncates never retires a row for a file that has left hot storage, and a
+# measurement whose remaining rows are all cold loses this node's local files
+# from the read. A truncated scan is reported: the log names this key, the
+# result carries "truncated", and GET /api/v1/tiering/status reports it under
+# "last_scan".
+#
+# Size it from the time a full scan takes on your storage root, which is
+# proportional to the number of objects under it rather than to their size. A
+# node whose data is largely compaction output depends on the scan entirely:
+# nothing else writes a tier row for a compacted file on the node that produced
+# it.
+# scan_timeout = "2h"
+
 [tiered_storage.cold]
 enabled = false
 backend = "s3"              # "s3" or "azure"
