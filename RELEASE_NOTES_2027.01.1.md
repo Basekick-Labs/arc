@@ -569,6 +569,109 @@ an unbounded operation.
 
 ## Bug fixes
 
+### The compaction trigger now claims its cycle before it answers
+
+`POST /api/v1/compaction/trigger` decided whether a cycle was already running
+by reading a flag, then left the actual claim — the compare-and-swap that makes
+a cycle exclusive — to the background goroutine it started afterwards. Two
+things followed.
+
+**Concurrent triggers were accepted when only one could run.** The window
+between the read and the claim is not narrow: the goroutine is scheduled
+lazily, so a handler routinely finished its read *and sent its response* before
+any goroutine claimed. Measured against 32 simultaneous triggers on the old
+code, a substantial fraction were accepted — between 3 and 16, varying by
+machine and scheduler. Each loser's cycle never ran, and while the server did
+log the loss, the caller had been told the trigger succeeded and was handed a
+cycle id belonging to the winner.
+
+**The reported cycle id was a guess.** The response carried "current id plus
+one", computed in the handler, while the id was really assigned later inside
+the cycle. With two drivers, both were told the same id and only one cycle
+existed, so the loser matched that id against `last_cycle` in
+`/api/v1/compaction/stats` and read the winner's counters as its own. Since
+`last_cycle` is a single global record, matching on `cycle_id` is the only way
+an operator can tell whose result they are reading — and it was exactly the
+mechanism that was unsound.
+
+The handler now takes the claim synchronously and reports the id that claim
+assigned. Taking the claim and publishing its id are one step, so a refusal can
+also name the running cycle without ever reporting a previous, finished one.
+
+**Behaviour change:** a second concurrent trigger now gets **409** immediately,
+where it previously got a 200 whose cycle was silently dropped. If you drive
+compaction from more than one place — one process per database, for example —
+you will start seeing those 409s. They are the honest answer to what was
+already happening; the cycle was never going to run. The 409 carries
+`cycle_id`, `is_running`, and is now logged, so a refused trigger leaves a
+trace on the server.
+
+Scheduled compaction behaves exactly as before: the cron path and the internal
+trigger claim and release the cycle in one call, with the same refusal logging
+and the same return values on a lost claim.
+
+### One configurable budget for the tier scan, and a truncated scan you can see ([#1154](https://github.com/Basekick-Labs/arc/issues/1154))
+
+The tier scan runs on four paths, and until now they carried two different
+budgets. A scheduled migration cycle gave the whole cycle 2 hours. The scan at
+startup and `POST /api/v1/tiering/scan` were each capped at **30 minutes**, and
+neither was configurable. The short cap was on both paths an operator reaches
+for, so a warning that the startup scan did not finish pointed at the scheduled
+cycle while the manual endpoint carried the same cap that had just failed.
+
+`tiered_storage.scan_timeout` now bounds the scan on every path, defaulting to
+`2h` so all four agree. It is a Go duration; zero, negative and malformed values
+are refused at startup.
+
+Inside a migration cycle the scan runs on a budget **derived from** the cycle's,
+so it gets whichever is shorter. At the default the two are equal — the cycle
+budget is also 2 hours — so the derivation changes nothing there. It matters once
+the key is set *below* 2 hours: the scan then gives up on its own budget and
+migration, the step that actually moves files, keeps the remainder of the cycle.
+Setting it above 2 hours is harmless, because the cycle still bounds the scan.
+The cycle budget itself is unchanged.
+
+**Why the scan finishing matters.** The scan is the only thing that writes a
+tier row for a compacted file on the node that produced it: the ingest flush
+path and the replication workers are the other writers, and neither sees
+compaction output. A node whose data is largely compacted therefore depends on
+the scan entirely, and a truncated one costs partition pruning — a measurement
+whose remaining rows are all cold drops this node's local files from the read.
+
+**Setting the key below the time a full scan takes is harmful, not
+conservative.** Hot-row retirement runs only after the whole walk, so a scan
+that always truncates never retires a row for a file that has left hot storage.
+
+**A truncated scan is now reported instead of being logged once and forgotten:**
+
+- `ScanResult` carries `truncated`, set on every path that can run out of
+  budget — the cold-tier sync, the hot walk, and the retirement pass, which
+  returns no error of its own and so used to be reported as a complete scan.
+- The partial counts come back rather than being discarded. `POST
+  /api/v1/tiering/scan` answered a bare `500` with `context deadline exceeded`
+  and nothing else; it now answers **503** with the counts and `truncated`, and
+  distinguishes a scan the node cancelled while shutting down from one that ran
+  out of budget. Any other failure keeps its `500`.
+- `GET /api/v1/tiering/status` reports the last scan under `last_scan`. This is
+  the only way a truncated **startup** scan is observable after the fact: it has
+  no HTTP response, and a health check cannot ask the scan endpoint without
+  starting a scan.
+- A truncated scan now invalidates the query caches for what it did reach. The
+  rows it wrote were real, but the query path kept serving its pre-scan answer.
+
+**A second concurrent scan is refused with `409`.** The endpoint has no handler
+deadline and a client disconnecting does not cancel the scan, so an operator who
+gave up on a slow one and retried would start another full scan over the same
+storage root, against the same SQLite handle, each invalidating the tier cache
+the query path reads. A scan inside a migration cycle is deliberately not
+refused — the cycle must always scan, or it would migrate from stale rows.
+
+Fixed alongside: `scanTiers` never copied `HotRowsWritten` out of the walk, so
+every consumer read zero. The cache invalidations keyed on it never fired,
+including the one a standalone node needs on its first boot, when the scan
+writes every hot row it has.
+
+
 ### The manual compaction trigger now requires the compactor lease
 
 `POST /api/v1/compaction/trigger` ran a full compaction cycle on whatever node
@@ -1038,6 +1141,21 @@ query with zero rows. Empty results release their query timeout context without
 a cleanup panic. Missing field-schema anchors remain errors.
 
 Contributed by [@jallegri](https://github.com/jallegri) in [#1120](https://github.com/Basekick-Labs/arc/pull/1120).
+
+### Behavior change for clustered deployments: backup deletion requires the primary writer ([#1134](https://github.com/Basekick-Labs/arc/issues/1134))
+
+`DELETE /api/v1/backup/:id` now uses the same primary-writer gate as backup
+creation and restore. Previously, a request reaching a reader, standby writer,
+or compactor could delete a backup across that node's configured targets.
+Non-primary nodes now return **503** with `route to the primary writer` before
+accessing backup storage. Direct backup deletion requests, including those from
+`arcli backup delete`, to the primary writer rather than a service address that
+can send them to other nodes.
+
+Eligibility is checked on every request, so promotion and demotion take effect
+without a restart. A deletion already admitted is not cancelled on demotion.
+Standalone and OSS deployments without a cluster coordinator keep their
+existing behavior.
 
 ### Backup and restore are cluster-safe ([#1083](https://github.com/Basekick-Labs/arc/issues/1083))
 

@@ -28,3 +28,8 @@ var ErrMigrationRoleGated = errors.New("tiering: node is not the primary writer;
 // is still running on this node. Two overlapping cycles would let the
 // second one's metadata sync observe the first one's half-finished copy.
 var ErrMigrationCycleRunning = errors.New("tiering: a migration cycle is already running on this node")
+
+// ErrScanRunning reports that a tier scan is already in progress on this node,
+// so this caller did not start a second one. See Manager.scanRunning for why
+// the exported scan is serialized and the in-cycle scan is not (#1154).
+var ErrScanRunning = errors.New("tiering: a tier scan is already running on this node")

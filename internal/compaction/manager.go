@@ -83,7 +83,22 @@ type Manager struct {
 	// Job history (jobs run in subprocess, so no activeJobs tracking)
 	jobHistory []map[string]interface{}
 
-	// Cycle management - prevents concurrent compaction cycles
+	// Cycle management - prevents concurrent compaction cycles.
+	//
+	// claimMu makes taking the claim and publishing its id one step (#1153).
+	// Without it there is a window between the winner's CompareAndSwap and
+	// its cycleID.Add in which another caller reads the PREVIOUS, finished
+	// cycle's id -- and the trigger endpoint reports that id to an operator,
+	// who has no way to tell it apart from the cycle that is actually
+	// running. Held only around the claim and by the id accessors, never
+	// across cycle work or any I/O.
+	//
+	// It closes that window only for callers that take it. Stats() still
+	// reads cycleRunning and the id as two independent loads, so
+	// /api/v1/compaction/stats can pair cycle_running true with the previous
+	// cycle's id for an instant. Narrow, pre-existing, and not worth
+	// serialising a stats read behind the claim.
+	claimMu      sync.Mutex
 	cycleRunning atomic.Bool
 	cycleID      atomic.Int64
 
@@ -1023,6 +1038,108 @@ func (m *Manager) compactFilesAdaptively(ctx context.Context, candidate Candidat
 	return nil
 }
 
+// CycleClaim is the exclusive right to run one compaction cycle, with the id
+// that cycle will report. Taking the claim and learning its id is one step, so
+// a caller can answer an operator with the real id before the cycle body
+// starts (#1153) -- the trigger endpoint used to answer with
+// GetCurrentCycleID()+1, a guess made in the handler, while the id was
+// actually assigned later inside the cycle goroutine.
+//
+// The holder MUST call Release, and must arrange for it before any path that
+// can leave the claim behind -- a return OR a recovered panic. An unreleased
+// claim leaves cycleRunning true forever, which stops compaction on the node
+// until it is restarted. Further Release calls are no-ops.
+type CycleClaim struct {
+	// ID is the cycle id this claim will run under. Already published, so
+	// RunningCycleID returns it the moment ClaimCycle returns.
+	ID int64
+
+	m        *Manager
+	released atomic.Bool
+}
+
+// Release gives up the claim. Idempotent: a second call is a no-op rather
+// than clearing cycleRunning under a cycle that claimed it later, which would
+// be a worse bug than the one CycleClaim exists to fix.
+func (c *CycleClaim) Release() {
+	if c == nil || !c.released.CompareAndSwap(false, true) {
+		return
+	}
+	c.m.cycleRunning.Store(false)
+}
+
+// ClaimCycle takes the exclusive right to run one cycle and assigns its id.
+// Returns ErrCycleAlreadyRunning when a cycle already holds the claim.
+//
+// Deliberately silent: the caller decides whether a refusal is worth a log
+// line. runCycleInternalFiltered keeps the scheduler's Warn, and the API
+// handler logs its own refusal, so moving a log in here would double it.
+func (m *Manager) ClaimCycle() (*CycleClaim, error) {
+	m.claimMu.Lock()
+	defer m.claimMu.Unlock()
+
+	if !m.cycleRunning.CompareAndSwap(false, true) {
+		return nil, ErrCycleAlreadyRunning
+	}
+	return &CycleClaim{ID: m.cycleID.Add(1), m: m}, nil
+}
+
+// RunningCycleID is the id of the cycle holding the claim, or of the most
+// recent one when none is held. Takes claimMu, so it never observes the
+// instant between a claim being taken and its id being assigned -- that is
+// the whole point of the mutex, and the reason callers answering an operator
+// should prefer this over GetCurrentCycleID.
+func (m *Manager) RunningCycleID() int64 {
+	m.claimMu.Lock()
+	defer m.claimMu.Unlock()
+	return m.cycleID.Load()
+}
+
+// errInvalidClaim rejects a claim that cannot safely run a cycle. Running on a
+// released claim is the dangerous case: cycleRunning is false, so another
+// cycle can claim and run concurrently -- exactly the exclusivity CycleClaim
+// exists to provide. A claim from another Manager would run this manager's
+// cycle under that one's exclusion.
+var errInvalidClaim = errors.New("compaction: nil, already-released, or foreign cycle claim")
+
+func (m *Manager) checkClaim(claim *CycleClaim) error {
+	if claim == nil || claim.m != m || claim.released.Load() {
+		return errInvalidClaim
+	}
+	return nil
+}
+
+// RunClaimedCycleForTiers runs a cycle the caller already claimed, for the
+// given tiers across all databases. The caller owns the claim and releases
+// it -- including when this returns an error; this never releases it.
+func (m *Manager) RunClaimedCycleForTiers(ctx context.Context, claim *CycleClaim, tierNames []string) error {
+	if err := m.checkClaim(claim); err != nil {
+		return err
+	}
+	return m.runClaimed(ctx, claim.ID, nil, tierNames, "")
+}
+
+// RunClaimedCycleForDatabase is RunClaimedCycleForTiers scoped to one database.
+func (m *Manager) RunClaimedCycleForDatabase(ctx context.Context, claim *CycleClaim, database string, tierNames []string) error {
+	if err := m.checkClaim(claim); err != nil {
+		return err
+	}
+	return m.runClaimed(ctx, claim.ID, []string{database}, tierNames, "")
+}
+
+// RunClaimedCycleForMeasurement is RunClaimedCycleForTiers scoped to one
+// measurement of one database. Validates before touching the claim, matching
+// RunCompactionCycleForMeasurement, which validates before claiming.
+func (m *Manager) RunClaimedCycleForMeasurement(ctx context.Context, claim *CycleClaim, database, measurement string, tierNames []string) error {
+	if database == "" || measurement == "" {
+		return fmt.Errorf("database and measurement are required")
+	}
+	if err := m.checkClaim(claim); err != nil {
+		return err
+	}
+	return m.runClaimed(ctx, claim.ID, []string{database}, tierNames, measurement)
+}
+
 // RunCompactionCycle runs one compaction cycle for all enabled tiers.
 // Returns the cycle ID and an error if the cycle couldn't be started.
 // Returns ErrCycleAlreadyRunning if a cycle is already in progress.
@@ -1063,16 +1180,29 @@ func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string
 	return m.runCycleInternalFiltered(ctx, filterDatabases, tierNames, "")
 }
 
-func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases []string, tierNames []string, filterMeasurement string) (cycleID int64, runErr error) {
-	// Prevent concurrent compaction cycles using atomic compare-and-swap
-	if !m.cycleRunning.CompareAndSwap(false, true) {
+// runCycleInternalFiltered claims a cycle and runs it to completion. Every
+// caller that wants the whole operation in one call -- both schedulers and the
+// three RunCompactionCycleFor* entry points -- goes through here, so their
+// behaviour is unchanged by the claim split: same loss Warn, same (0, error)
+// on a lost claim, same release-after-the-finalizer ordering.
+func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases []string, tierNames []string, filterMeasurement string) (int64, error) {
+	claim, err := m.ClaimCycle()
+	if err != nil {
 		m.logger.Warn().Msg("Compaction cycle already running, skipping")
-		return 0, ErrCycleAlreadyRunning
+		return 0, err
 	}
-	defer m.cycleRunning.Store(false)
+	// Registered before runClaimed is called, and runClaimed's own finalizer
+	// (which waits for active workers) completes before it returns -- so the
+	// release still happens strictly after the last worker, exactly as the
+	// previous defer ordering guaranteed. No worker can outlive the claim.
+	defer claim.Release()
 
-	cycleID = m.cycleID.Add(1)
+	return claim.ID, m.runClaimed(ctx, claim.ID, filterDatabases, tierNames, filterMeasurement)
+}
 
+// runClaimed is the cycle body. The caller holds the claim and owns its
+// release; runErr is named because the finalizer mutates it.
+func (m *Manager) runClaimed(ctx context.Context, cycleID int64, filterDatabases []string, tierNames []string, filterMeasurement string) (runErr error) {
 	var active sync.WaitGroup
 	var discovered atomic.Int64
 	var started atomic.Int64
@@ -1151,20 +1281,20 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 			Msg("Compaction cycle finished")
 	}()
 	if err := ctx.Err(); err != nil {
-		return cycleID, err
+		return err
 	}
 	// The cluster-wide compaction pause (#1087): a cycle that starts while a
 	// restore holds it would stop at its first batch boundary anyway, so it
 	// does not start. Recorded as a "paused" cycle so Stats shows why.
 	if m.Paused() {
 		m.logger.Info().Int64("cycle_id", cycleID).Msg("Compaction cycle not started: compaction is paused cluster-wide")
-		return cycleID, ErrCompactionPaused
+		return ErrCompactionPaused
 	}
 
 	// Require explicit tier names
 	if len(tierNames) == 0 {
 		m.logger.Debug().Int64("cycle_id", cycleID).Msg("No tiers specified, skipping cycle")
-		return cycleID, nil
+		return nil
 	}
 
 	logEvent := m.logger.Info().
@@ -1195,7 +1325,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 		databases, err = m.listDatabases(ctx)
 		if err != nil {
 			m.logger.Error().Err(err).Msg("Failed to list databases for compaction cycle")
-			return cycleID, err
+			return err
 		}
 		// The exclusion list applies to unscoped discovery only — an
 		// explicit filterDatabases scope is operator intent and bypasses
@@ -1211,7 +1341,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 		databases = m.filterExcludedDatabases(databases)
 	}
 	if err := ctx.Err(); err != nil {
-		return cycleID, err
+		return err
 	}
 
 	recoveryDatabases := databases
@@ -1233,7 +1363,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 		}
 		if err != nil {
 			if ctx.Err() != nil {
-				return cycleID, ctx.Err()
+				return ctx.Err()
 			}
 			discoveryErrors.Add(1)
 			m.logger.Warn().Err(err).Msg("Manifest recovery encountered errors")
@@ -1244,7 +1374,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 	dbMeasurements := make(map[string][]string)
 	for _, database := range databases {
 		if err := ctx.Err(); err != nil {
-			return cycleID, err
+			return err
 		}
 		if filterMeasurement != "" {
 			dbMeasurements[database] = []string{filterMeasurement}
@@ -1253,7 +1383,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 		measurements, err := m.listMeasurements(ctx, database)
 		if err != nil {
 			if ctx.Err() != nil {
-				return cycleID, ctx.Err()
+				return ctx.Err()
 			}
 			discoveryErrors.Add(1)
 			m.logger.Error().Err(err).
@@ -1273,7 +1403,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 	// would read it. Each tier lists the measurement itself (#316).
 	for _, tier := range m.Tiers {
 		if err := ctx.Err(); err != nil {
-			return cycleID, err
+			return err
 		}
 		if !tier.IsEnabled() {
 			continue
@@ -1317,7 +1447,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 						Str("tier", tierName).
 						Msg("Tier processing cancelled")
 					wg.Wait()
-					return cycleID, ctx.Err()
+					return ctx.Err()
 				default:
 				}
 				// The cluster-wide compaction pause (#1087) also ends
@@ -1331,14 +1461,14 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 						Str("database", database).
 						Msg("Compaction cycle stopping between measurements: compaction is paused cluster-wide")
 					wg.Wait()
-					return cycleID, ErrCompactionPaused
+					return ErrCompactionPaused
 				}
 
 				candidates, err := tier.FindCandidates(ctx, database, meas)
 				if err != nil {
 					if ctx.Err() != nil {
 						wg.Wait()
-						return cycleID, ctx.Err()
+						return ctx.Err()
 					}
 					discoveryErrors.Add(1)
 					m.logger.Error().Err(err).
@@ -1353,7 +1483,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 				for _, candidate := range candidates {
 					if err := ctx.Err(); err != nil {
 						wg.Wait()
-						return cycleID, err
+						return err
 					}
 					// A slash-carrying database is by construction a
 					// pseudo-database from the namespace expander — received
@@ -1366,7 +1496,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 					filteredCandidate, shouldProcess, manifestErr := m.filterCandidateFilesWithError(ctx, candidate)
 					if err := ctx.Err(); err != nil {
 						wg.Wait()
-						return cycleID, err
+						return err
 					}
 					if manifestErr != nil {
 						// The candidate stays excluded. Record genuine manifest
@@ -1391,7 +1521,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 					}
 					if err := ctx.Err(); err != nil {
 						wg.Wait()
-						return cycleID, err
+						return err
 					}
 					if !shouldProcess {
 						continue
@@ -1416,14 +1546,14 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 					case sem <- struct{}{}:
 					case <-ctx.Done():
 						wg.Wait()
-						return cycleID, ctx.Err()
+						return ctx.Err()
 					}
 					// If both select arms were ready, cancellation still wins
 					// before a new worker can be launched.
 					if err := ctx.Err(); err != nil {
 						<-sem
 						wg.Wait()
-						return cycleID, err
+						return err
 					}
 					// The cluster-wide compaction pause (#1087): no new worker
 					// while a restore holds it. Checked here, with capacity in
@@ -1444,7 +1574,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 							Str("partition", candidate.PartitionPath).
 							Msg("Compaction cycle stopping at a batch boundary: compaction is paused cluster-wide")
 						wg.Wait()
-						return cycleID, ErrCompactionPaused
+						return ErrCompactionPaused
 					}
 					wg.Add(1)
 					active.Add(1)
@@ -1507,14 +1637,14 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 		// Wait for all jobs in this tier to complete before moving to next tier
 		wg.Wait()
 		if err := ctx.Err(); err != nil {
-			return cycleID, err
+			return err
 		}
 		if pausedSkipped.Load() {
 			m.logger.Info().
 				Int64("cycle_id", cycleID).
 				Str("tier", tierName).
 				Msg("Compaction cycle ended at a batch boundary: compaction is paused cluster-wide")
-			return cycleID, ErrCompactionPaused
+			return ErrCompactionPaused
 		}
 
 		if tierCandidateCount == 0 {
@@ -1540,7 +1670,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 	}
 
 	// The finalizer records the terminal outcome and complete counters.
-	return cycleID, nil
+	return nil
 }
 
 // IsCycleRunning returns true if a compaction cycle is currently in progress
@@ -1548,9 +1678,15 @@ func (m *Manager) IsCycleRunning() bool {
 	return m.cycleRunning.Load()
 }
 
-// GetCurrentCycleID returns the current or most recent cycle ID
+// GetCurrentCycleID returns the current or most recent cycle ID.
+//
+// Takes claimMu, so it is identical to RunningCycleID -- kept as the older
+// name because callers outside this package may use it, and deliberately NOT
+// left as a bare atomic load: a caller that picked this one over
+// RunningCycleID would silently reintroduce the window the mutex exists to
+// close (#1153).
 func (m *Manager) GetCurrentCycleID() int64 {
-	return m.cycleID.Load()
+	return m.RunningCycleID()
 }
 
 // listDatabases discovers all databases in storage
