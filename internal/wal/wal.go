@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -391,6 +392,13 @@ type walEntry struct {
 	// flushed. Checkpoint entries also have seq 0 but must NOT set this, or
 	// every file would hold one and none would ever be reclaimable.
 	untrackedData bool
+	// foreignProof marks a CHECKPOINT entry that covers at least one identity
+	// this process did not mint: a row-range identity, or a whole-entry token
+	// from an earlier writer instance. Both describe entries in a file that
+	// recovery retained, and such a file is absent from w.fileOrder — so the
+	// purge walk cannot see it and cannot stop at it. The destination file is
+	// therefore pinned; see Writer.PurgeFlushed.
+	foreignProof bool
 }
 
 // fileSeqState is what the purge needs to know about one WAL file this process
@@ -402,6 +410,11 @@ type fileSeqState struct {
 	// file can hold a non-contiguous set. The bound is all the purge rule needs
 	// — see Writer.PurgeFlushed.
 	maxSeq uint64
+	// hasForeignProof is set when a checkpoint covering an identity from a
+	// retained file this process did not create lands here. Such a file is the
+	// only record that those entries were flushed, and the file they describe
+	// is not in w.fileOrder, so no ordering rule protects it.
+	hasForeignProof bool
 	// hasUntrackedData is set when an untracked data entry lands here.
 	hasUntrackedData bool
 }
@@ -960,7 +973,12 @@ func (w *Writer) MarkFlushed(hashes []string) error {
 		binary.BigEndian.PutUint32(entryData[12:16], checksum)
 		copy(entryData[WALEntryHeaderSize:], checkpoint)
 		done := make(chan error, 1)
-		if err := w.tryEnqueueEntry(walEntry{data: entryData, durable: true, done: done}); err != nil {
+		if err := w.tryEnqueueEntry(walEntry{
+			data:         entryData,
+			durable:      true,
+			done:         done,
+			foreignProof: w.coversForeignIdentity(hashes[start:end]),
+		}); err != nil {
 			return err
 		}
 		if err := <-done; err != nil {
@@ -1327,6 +1345,10 @@ func (w *Writer) noteWrittenLocked(entry walEntry) {
 		// file created by the write-failure retry path.
 		w.fileOrder = append(w.fileOrder, w.currentPath)
 	}
+	if entry.foreignProof {
+		state.hasForeignProof = true
+		return
+	}
 	if entry.untrackedData {
 		state.hasUntrackedData = true
 		return
@@ -1370,6 +1392,28 @@ func (w *Writer) trackedTokenSeq(token string) (uint64, bool) {
 		return 0, false
 	}
 	return seq, true
+}
+
+// coversForeignIdentity reports whether any identity in a checkpoint batch
+// describes an entry this process did not write: a row-range identity (which by
+// construction covers part of an entry recovery replayed), or a whole-entry
+// token minted by an earlier writer instance.
+//
+// The file such a checkpoint lands in must not be purged by sequence — the
+// entries it vouches for live in a file absent from w.fileOrder, so the walk in
+// PurgeFlushed cannot reach them to stop there.
+func (w *Writer) coversForeignIdentity(hashes []string) bool {
+	for _, h := range hashes {
+		if strings.HasPrefix(h, recoveryRowPrefix) {
+			return true
+		}
+		if len(h) == 32 {
+			if _, ours := w.trackedTokenSeq(h); !ours {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // releasePending drops identities from the unflushed set.
@@ -1485,6 +1529,17 @@ func (w *Writer) PurgeFlushed(minUnflushedSeq uint64) (int, error) {
 		}
 		state := w.fileSeqs[path]
 		if state == nil || state.hasUntrackedData {
+			break
+		}
+		// A file holding proof for a retained file an earlier process wrote is
+		// the only record that those entries were flushed, and that file is not
+		// in w.fileOrder, so the ordering rule above cannot protect it.
+		// Deleting this one makes recovery replay rows that are already in
+		// storage. Pinning is deliberately conservative: the pin lasts until
+		// this process exits, and only files written while a retained file
+		// existed can carry it, so the bound is the outage window rather than
+		// the lifetime of the node.
+		if state.hasForeignProof {
 			break
 		}
 		// maxSeq == 0 means the file holds no tracked data at all (checkpoints

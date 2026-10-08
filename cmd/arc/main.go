@@ -1240,23 +1240,19 @@ func main() {
 						// that was cleared from buffers after failed flush
 						walLogger.Info().Msg("Flush failure detected, attempting WAL recovery")
 
-						// Settle older async flushes and all current buffers before
-						// reading checkpoints. Otherwise a checkpoint written by an
-						// in-flight worker could land after recovery's checkpoint scan.
-						if err := arrowBuffer.FlushAllAndWait(walMaintenanceCtx); err != nil {
-							walLogger.Error().Err(err).Msg("WAL recovery pre-barrier failed; retaining WAL files for the next pass")
-							continue
-						}
-
-						if walWriter != nil {
-							deleted, purgeErr := walWriter.PurgeFlushed(walWriter.MinUnflushedSequence())
-							if purgeErr != nil {
-								walLogger.Error().Err(purgeErr).Msg("WAL purge before recovery failed")
-							} else if deleted > 0 {
-								walLogger.Info().Int("deleted", deleted).Msg("Purged old WAL files before recovery")
-							}
-						}
-
+						// ORDER MATTERS, and it is: rotate, barrier, read
+						// checkpoints, purge, recover.
+						//
+						// Rotation comes FIRST so that every append racing this
+						// pass lands in a file whose fate this pass decides.
+						// Barriering first instead leaves a window — between the
+						// barrier returning and the rotation command being
+						// dequeued — in which a tracked append lands in the
+						// file about to become previousActiveFile. That file is
+						// then exempted from MinFileAge below, so recovery
+						// replays an entry no checkpoint covers into a buffer
+						// that still holds the live copy, and nothing
+						// de-duplicates rows.
 						previousActiveFile := ""
 						activeFile := ""
 						var activeCheckpointHashes []string
@@ -1274,12 +1270,37 @@ func main() {
 								continue
 							}
 							activeFile = walWriter.CurrentFile()
-							// Recovery skips the active file to avoid racing appends, so read
-							// its checkpoint index separately while the writer lock holds it stable.
+						}
+
+						// Settle older async flushes and all current buffers before
+						// reading checkpoints. Otherwise a checkpoint written by an
+						// in-flight worker could land after recovery's checkpoint scan.
+						//
+						// After the rotation above, this also flushes whatever the
+						// window-era appends put in previousActiveFile, and their
+						// checkpoints land in the NEW active file — which is read
+						// into AdditionalCheckpointHashes below, so recovery skips
+						// them. Appends during the barrier go to the new active
+						// file, which recovery skips entirely.
+						if err := arrowBuffer.FlushAllAndWait(walMaintenanceCtx); err != nil {
+							walLogger.Error().Err(err).Msg("WAL recovery pre-barrier failed; retaining WAL files for the next pass")
+							continue
+						}
+
+						if walWriter != nil {
+							// Read AFTER the barrier, so the checkpoints it just
+							// wrote for previousActiveFile are included.
 							activeCheckpointHashes, err = walWriter.CurrentCheckpointHashes()
 							if err != nil {
 								walLogger.Error().Err(err).Msg("Failed to read active WAL checkpoints; skipping recovery to avoid duplicate replay")
 								continue
+							}
+
+							deleted, purgeErr := walWriter.PurgeFlushed(walWriter.MinUnflushedSequence())
+							if purgeErr != nil {
+								walLogger.Error().Err(purgeErr).Msg("WAL purge before recovery failed")
+							} else if deleted > 0 {
+								walLogger.Info().Int("deleted", deleted).Msg("Purged old WAL files before recovery")
 							}
 						}
 						failureGeneration := arrowBuffer.FlushFailureGeneration()

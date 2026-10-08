@@ -118,13 +118,19 @@ type Recovery struct {
 	logger zerolog.Logger
 
 	failuresMu sync.Mutex
+	// localFailures counts failed replay passes for files whose .recovery
+	// sidecar could not be written. It exists so that a WAL volume with no
+	// free space - the scenario quarantine is FOR - still makes progress.
+	// Lost on restart, unlike the sidecar.
+	localFailures map[string]int
 }
 
 // NewRecovery creates a new WAL recovery manager
 func NewRecovery(walDir string, logger zerolog.Logger) *Recovery {
 	return &Recovery{
-		walDir: walDir,
-		logger: logger.With().Str("component", "wal-recovery").Logger(),
+		walDir:        walDir,
+		logger:        logger.With().Str("component", "wal-recovery").Logger(),
+		localFailures: make(map[string]int),
 	}
 }
 
@@ -582,8 +588,28 @@ func (r *Recovery) noteReplayFailure(path string, maxAttempts int) (bool, error)
 	}
 	// Persist the completed failed pass BEFORE renaming the WAL. If the
 	// process dies between these steps, a new Recovery can finish quarantine.
-	if err := writeReplayAttempts(path, attempts); err != nil {
-		return false, err
+	if err := writeReplayAttemptsFn(path, attempts); err != nil {
+		// A WAL volume that is full or read-only is the scenario quarantine
+		// exists for, so a sidecar that cannot be written must not stop it.
+		// Returning an error here left the poison file in place AND every
+		// later file unreached, because the caller breaks the file loop. Fall
+		// back to a count held for this process only: it is lost on restart,
+		// so a crash-looping node can need more than maxAttempts passes to
+		// quarantine - which is still progress, where aborting is none. The
+		// rename below needs no free SPACE, so the out-of-space case can still
+		// quarantine; a read-only WAL directory cannot, and that is reported as
+		// an error because nothing Arc does can remediate it.
+		if r.localFailures == nil {
+			r.localFailures = make(map[string]int)
+		}
+		r.localFailures[path]++
+		if local := r.localFailures[path]; local > attempts {
+			attempts = local
+		}
+		r.logger.Warn().Err(err).
+			Str("file", filepath.Base(path)).
+			Int("attempts", attempts).
+			Msg("Could not persist the WAL replay-failure count; counting this pass in memory only, so quarantine may need more passes after a restart")
 	}
 	if attempts < maxAttempts {
 		return false, nil
@@ -600,6 +626,7 @@ func (r *Recovery) noteReplayFailure(path string, maxAttempts int) (bool, error)
 		return false, err
 	}
 	r.removeReplayAttempts(path)
+	delete(r.localFailures, path)
 	return true, nil
 }
 
@@ -607,6 +634,10 @@ func (r *Recovery) clearReplayFailure(path string) {
 	r.failuresMu.Lock()
 	defer r.failuresMu.Unlock()
 	r.removeReplayAttempts(path)
+	// A successful replay clears the in-memory fallback too, or a file that
+	// failed while the volume was full would keep its strikes after the volume
+	// recovered and it replayed cleanly.
+	delete(r.localFailures, path)
 }
 
 // findWALFiles finds all WAL files in the directory, sorted by modification time

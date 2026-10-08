@@ -42,6 +42,12 @@ func readReplayAttempts(path string) (int, error) {
 	return state.Attempts, nil
 }
 
+// writeReplayAttemptsFn is the sidecar write noteReplayFailure performs. It is
+// a variable so a test can inject the out-of-space failure that the feature
+// has to survive: planting an obstruction at the sidecar path fails the READ
+// instead, which is a different path.
+var writeReplayAttemptsFn = writeReplayAttempts
+
 func writeReplayAttempts(path string, attempts int) error {
 	info, err := os.Stat(path)
 	if err != nil {
