@@ -443,8 +443,8 @@ func (b *AzureBlobBackend) List(ctx context.Context, prefix string) ([]string, e
 				// backup manifest in silence (#1102).
 				key := strings.TrimPrefix(*blobItem.Name, b.prefix)
 				// See S3Backend.List: a listing never returns a key this
-				// backend would refuse (#743).
-				if ValidateKey(key) != nil {
+				// backend would refuse (#743, #1121).
+				if _, err := b.prefixedKey(key); err != nil {
 					continue
 				}
 				blobs = append(blobs, key)
@@ -716,8 +716,8 @@ func (b *AzureBlobBackend) ListObjects(ctx context.Context, prefix string) ([]Ob
 			if blobItem.Name != nil {
 				key := strings.TrimPrefix(*blobItem.Name, b.prefix)
 				// See S3Backend.List: a listing never returns a key this
-				// backend would refuse (#743).
-				if ValidateKey(key) != nil {
+				// backend would refuse (#743, #1121).
+				if _, err := b.prefixedKey(key); err != nil {
 					continue
 				}
 				info := ObjectInfo{
@@ -761,8 +761,11 @@ func (b *AzureBlobBackend) HasObjectsUnderPrefix(ctx context.Context, prefix str
 			return false, azureListError("failed to list Azure blobs", err)
 		}
 		for _, blobItem := range page.Segment.BlobItems {
-			if blobItem.Name != nil && ValidateKey(strings.TrimPrefix(*blobItem.Name, b.prefix)) == nil {
-				return true, nil
+			if blobItem.Name != nil {
+				key := strings.TrimPrefix(*blobItem.Name, b.prefix)
+				if _, err := b.prefixedKey(key); err == nil {
+					return true, nil
+				}
 			}
 		}
 	}
@@ -803,7 +806,7 @@ func (b *AzureBlobBackend) ListUnusable(ctx context.Context, prefix string) ([]U
 				continue
 			}
 			key := strings.TrimPrefix(*blobItem.Name, b.prefix)
-			reason := ValidateKey(key)
+			_, reason := b.prefixedKey(key)
 			if reason == nil {
 				continue // ListObjects returns it
 			}

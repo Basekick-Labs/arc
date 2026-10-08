@@ -1444,8 +1444,10 @@ Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1067](https:/
 ### Object-store prefixes count toward the storage key limit ([#1121](https://github.com/Basekick-Labs/arc/issues/1121))
 
 S3 and Azure now validate the complete object name, including its configured
-prefix, before sending it to the object store. Azure batch deletion applies
-the same check and continues deleting the other valid keys in the batch.
+prefix, before sending it to the object store. Listings and prefix probes use
+the same check; previously stored over-limit names are omitted from ordinary
+listings and reported by `ListUnusable`. Azure batch deletion applies the same
+check and continues deleting the other valid keys in the batch.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in
 [#1132](https://github.com/Basekick-Labs/arc/pull/1132).
