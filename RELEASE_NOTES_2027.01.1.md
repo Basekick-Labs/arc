@@ -1169,6 +1169,29 @@ thing a new maintainer has to learn, and a refactor that moves a decision from
 four places to one is worth knowing about before you go looking for it in the
 old place.
 
+### A quarantine test waited on the counter, not the bookkeeping it asserts ([#1146](https://github.com/Basekick-Labs/arc/issues/1146))
+
+`TestPullerQuarantineKeepsTheQueryGateClosed` reddened `Build & Test`
+intermittently with `catchupInflight = 1, want 0`. Nothing was wrong with the
+puller. `totalInvalidPath` is incremented inside `processEntryOnce`, while the
+in-flight bookkeeping the test asserts is released by that function's deferred
+`finishEntry` — so a wait predicate watching only the counter can return in
+between, and the assertion reads the pre-drain state.
+
+This is [#972](https://github.com/Basekick-Labs/arc/issues/972) a second time.
+That issue diagnosed the identical mechanism in
+`TestPullerQuarantineIsIdempotentAcrossReenqueues` and fixed it by adding
+`inflight_count == 0` to that test's wait; the two sibling tests in the same
+file that share the window were never updated. Both now gate on the
+bookkeeping, and `TestPullerQuarantinesUnusableKeyWithoutTouchingPeers` needed
+it too — its shared-metric assertion sat in the same gap, three statements wide.
+
+The assertions keep their teeth: `waitStats` returns the last snapshot on
+timeout rather than failing, so removing the real drain in `finishEntry` still
+fails both tests on the full deadline. Verified, along with the mechanism, by
+temporarily widening the window — a 300 ms sleep after the counter increment
+fails both tests 10/10 before the change and 0/10 after.
+
 ### Cold files are a third object set, not merged into the hot one ([#1086](https://github.com/Basekick-Labs/arc/issues/1086))
 
 The obvious implementation — add the cold listing to the file list a backup
