@@ -1041,6 +1041,12 @@ describing.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1145](https://github.com/Basekick-Labs/arc/pull/1145), carried forward with the routing change.
 
+### Database deletion cleans up tiered storage ([#1091](https://github.com/Basekick-Labs/arc/issues/1091))
+
+Deleting a database now removes its tier metadata and cold-tier objects as well as its hot files. In clustered deployments, manifest entries are removed before hot files; if cleanup fails, the database remains available for a retry.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1166](https://github.com/Basekick-Labs/arc/pull/1166).
+
 ### Crash smokes verify acknowledged records after WAL replay
 
 The enterprise-shared crash scenarios restart the killed writer and wait for
