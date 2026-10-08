@@ -1688,16 +1688,55 @@ transaction in `internal/tiering`:
 The cold-tier metadata sync keeps its per-file writes: it records rows it
 discovers one at a time as it walks a listing, and is not a burst.
 
-One pre-existing hazard this makes longer-lived, and worth knowing before
-restoring onto a node whose cold tier is **configured but disabled**: a
-cold-carried file restored into hot storage keeps a row saying cold, with a
-recent `migrated_at`, until the batch flushes. That is what
-`ReconcileOrphanedFiles` looks for, and that sweep is not gated on
-`tiered_storage.cold.enabled` (only migration is), nor is the
-`GetBackendForTier` lookup it verifies the cold copy through. So it can delete
-the hot copy the restore just wrote, and the forced-hot row then lands for a
-file that is gone. The window used to be microseconds and is now up to the rest
-of the restore. The defect is the ungated sweep rather than the batching — with
-cold disabled it deletes hot copies whose cold objects the query path will not
-read, restore or no restore — so it is filed as #1143; until that is fixed, run
-such a restore with tiering stopped.
+**Correction to the paragraph that shipped with the batching change above.**
+It said a cold-carried file restored into hot storage could have that hot copy
+deleted by orphan reconciliation while its forced-hot row was still pending,
+on a node whose cold tier is *configured but disabled*, and advised running
+such a restore with tiering stopped. That was wrong, and the advice is
+withdrawn. The fallback branch is reached only when this node has no usable
+cold backend, and a disabled cold tier has no backend **object** either —
+`cmd/arc/main.go` constructs one only inside `if cold.Enabled`, nothing
+assigns the flag after configuration load, and there is no reload. The sweep
+therefore has nothing to verify a cold copy against and keeps the hot file,
+which is what it already did. No window existed to widen.
+
+**Orphan reconciliation is gated on `tiered_storage.cold.enabled`, and the
+cold accessors no longer disagree** (#1143). Two related pieces of tidying,
+neither of which changes what a correctly configured node does:
+
+- A node with tiering on and cold off ran the orphan sweep and the manifest
+  sweep every migration cycle, and the orphan sweep logged an **error and
+  counted a failure for every ORPHAN it examined, every cycle** — every cold
+  row in its 48-hour window whose hot copy is still present — for work it
+  could never do, since it needs a cold copy to verify and there is no cold
+  backend to verify against. A cold row whose hot copy is gone costs one
+  silent existence check and was never the problem. Both sweeps are now
+  skipped on such a node, so the cycle is quiet and its error count is honest.
+  For the manifest sweep the skip is a pure no-op: it already returned
+  immediately on a nil cold backend.
+
+  Two smaller operator-visible consequences of skipping, rather than letting
+  the sweep run into its keep-everything branch. The orphan sweep also marks a
+  permanently unusable storage key as quarantined, and it does that *before*
+  it looks at the cold tier — so on a cold-disabled node that mark is now
+  deferred until cold comes back, and since the rows age out of the 48-hour
+  window meanwhile, in practice it is not taken. That is harmless while the
+  sweep is not running, because the mark exists to stop the sweep retrying
+  that key. And the per-orphan error was incidentally the only line saying
+  such a node holds a hot copy under a cold row; a skipped cycle now says so
+  once, at debug level, instead of once per orphan at error level.
+- `GetBackendForTier(TierCold)` now ANDs `cold.enabled`, as `ColdBackend()`
+  already did, and both answer through one predicate alongside the migration
+  gate, the tier stats, the cold-metadata sync and the query glob. The old
+  split was documented as deliberate, with a doc comment asserting that every
+  other consumer paired the two checks itself — the orphan sweep did not,
+  which is how this was found. Nothing reachable depended on the difference,
+  because a disabled cold tier has no backend to return; enforcing it in one
+  place means a future change that constructs the backend unconditionally
+  cannot turn that latent inconsistency into a live one.
+
+One claim worth not making: the "no usable cold tier" startup warning on a
+replicating local-storage node is unchanged by this. It keys off
+`GetBackendForTier(TierCold) != nil`, and with cold disabled that was already
+nil before this change, so the warning was already firing. Nothing at that
+call site behaves differently in any reachable configuration.
