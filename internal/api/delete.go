@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -21,6 +22,7 @@ import (
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/throttle"
+	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
@@ -30,7 +32,6 @@ import (
 // nil = standalone mode (no gate, manifest not updated).
 type DeleteCoordinator interface {
 	BatchFileOpsInManifest(ops []raft.BatchFileOp) error
-	UpdateFileInManifest(file raft.FileEntry) error
 	GetFileEntry(path string) (*raft.FileEntry, bool)
 	IsPrimaryWriter() bool
 	Role() string
@@ -42,6 +43,12 @@ type DeleteCoordinator interface {
 // errManifestFailure is returned when a Raft manifest update fails.
 // This is non-transient (e.g. Raft quorum loss) and aborts the delete operation.
 var errManifestFailure = errors.New("cluster manifest update failed")
+
+// errSourceRetired reports that the file a rewrite was about to read is gone because a concurrent
+// DELETE retired it and republished its surviving rows under a new path. The request is not wrong,
+// it is stale: re-running it rebuilds the affected-file list and succeeds. Phrased without an
+// apostrophe because the log masker truncates a line at the first quote.
+var errSourceRetired = errors.New("source file was retired by a concurrent delete, retry the request")
 
 // parquetRowGroupSize is the row group size used for Parquet rewrites during delete operations.
 // Matches compaction's row group size to limit DuckDB's internal write buffer per group.
@@ -75,11 +82,12 @@ func freeOSMemoryThrottled() {
 
 // DeleteHandler handles delete operations using file rewrite strategy
 type DeleteHandler struct {
-	db          *database.DuckDB
-	storage     storage.Backend
-	config      *config.DeleteConfig
-	authManager *auth.AuthManager
-	coordinator DeleteCoordinator // nil in standalone mode
+	db             *database.DuckDB
+	storage        storage.Backend
+	config         *config.DeleteConfig
+	authManager    *auth.AuthManager
+	coordinator    DeleteCoordinator // nil in standalone mode
+	tieringManager *tiering.Manager
 	// tempDir is the absolute, sandbox-allowlisted directory used by
 	// rewriteS3File to stage the COPY-rewritten parquet locally before
 	// uploading. MUST match one of the prefixes added to DuckDB's
@@ -87,8 +95,9 @@ type DeleteHandler struct {
 	// fails with a permission error and DELETE on S3 backends silently
 	// breaks. main.go passes the same path as the import handler's upload
 	// dir; the two flows have identical sandbox requirements.
-	tempDir string
-	logger  zerolog.Logger
+	tempDir   string
+	rewriteMu sync.Mutex
+	logger    zerolog.Logger
 }
 
 // DeleteRequest represents a delete operation request
@@ -194,6 +203,11 @@ func NewDeleteHandler(db *database.DuckDB, storage storage.Backend, cfg *config.
 // gating. Called after construction when cluster mode is enabled.
 func (h *DeleteHandler) SetCoordinator(c DeleteCoordinator) {
 	h.coordinator = c
+}
+
+// SetTieringManager wires rewrite/delete metadata updates into tiering.
+func (h *DeleteHandler) SetTieringManager(tm *tiering.Manager) {
+	h.tieringManager = tm
 }
 
 // RegisterRoutes registers delete endpoints
@@ -399,7 +413,14 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 
-	// Execute actual deletion (rewrite files)
+	// Execute actual deletion (rewrite files). Partial rewrites publish a new
+	// immutable path and retire the old one, so overlapping requests for the
+	// same source must not both read and publish from the same pre-delete
+	// snapshot. DELETE is already dominated by Parquet rewrite I/O; serialize
+	// the rewrite phase rather than letting one request multiply another.
+	h.rewriteMu.Lock()
+	defer h.rewriteMu.Unlock()
+
 	h.logger.Info().
 		Int("file_count", len(affected)).
 		Int64("rows", totalToDelete).
@@ -413,6 +434,11 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	for _, f := range affected {
 		deleted, err := h.rewriteFileWithoutDeletedRows(ctx, f.path, f.relativePath, req.Where)
 		if err != nil {
+			// Post-rewrite bookkeeping/storage failures still mean the rows were
+			// removed from the newly published file. rewriteFileWithoutDeletedRows
+			// returns zero only when the manifest was not committed and the old
+			// file remains authoritative.
+			totalDeleted += deleted
 			h.logger.Error().Err(err).Str("file", f.path).Msg("Failed to rewrite file")
 			// Manifest failures are non-transient (Raft quorum loss) — abort the
 			// entire operation to avoid deleting files from storage without a
@@ -753,6 +779,17 @@ func (h *DeleteHandler) countMatchingRowsIndividually(ctx context.Context, files
 // For local storage: uses atomic rename
 // For S3: downloads, processes locally, then uploads
 func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, queryPath, relativePath, whereClause string) (int64, error) {
+	// The affected-file list was built before the rewrite mutex was acquired, so a delete that
+	// won the lock first may already have retired this source and published its survivors under a
+	// new immutable path. Detect that here rather than letting DuckDB report it: the engine
+	// surfaces a missing source as "IO Error: No files found that match the pattern", which tells
+	// an operator nothing about what to do. Both backends report an absent object as (-1, nil)
+	// from StatFile, so this needs no error-string matching. The mutex is held for the whole
+	// rewrite phase, so nothing can retire the file between this check and the read below.
+	if size, statErr := h.storage.StatFile(ctx, relativePath); statErr == nil && size < 0 {
+		return 0, fmt.Errorf("%w: %s", errSourceRetired, filepath.Base(relativePath))
+	}
+
 	// Use the shared DuckDB connection to avoid memory retention from temporary connections
 	db := h.db.DB()
 
@@ -803,45 +840,63 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 
 	// For remote backends (S3, Azure), write to a local temp file then upload.
 	var rewroteDeleted int64
+	var rewrittenPath string
 	var s3Result *s3RewriteResult
 	var rewriteErr error
 	if h.isRemoteBackend() {
 		rewroteDeleted, s3Result, rewriteErr = h.rewriteS3File(ctx, queryPath, relativePath, whereClause, rowsBefore, rowsAfter)
+		if s3Result != nil {
+			rewrittenPath = s3Result.newPath
+		}
 	} else {
-		rewroteDeleted, rewriteErr = h.rewriteLocalFile(ctx, queryPath, relativePath, whereClause, rowsBefore, rowsAfter)
+		rewroteDeleted, rewrittenPath, rewriteErr = h.rewriteLocalFile(ctx, queryPath, relativePath, whereClause, rowsBefore, rowsAfter)
 	}
 	if rewriteErr != nil {
 		return 0, rewriteErr
 	}
 
-	// Notify the cluster manifest that this file's content changed. Non-fatal
-	// for this request: the rewrite already succeeded in storage. It is not
-	// harmless for the cluster, though: the manifest entry is what every other
-	// node pulls by, so a lost update leaves replicas on the pre-rewrite bytes
-	// until the path's next content change. The warning below is the only
-	// signal of that.
+	// Partial rewrites are immutable: publish the rewritten file under a new
+	// path and delete the old manifest entry in the same Raft batch. Readers
+	// therefore observe a register+delete instead of an in-place checksum/size
+	// mutation, eliminating the same-size stale-file class (#975).
+	if rewrittenPath == "" {
+		return rewroteDeleted, nil
+	}
 	if h.coordinator != nil {
-		if err := h.updateManifestAfterRewrite(relativePath, s3Result); err != nil {
-			h.logger.Warn().Err(err).Str("file", relativePath).Msg("Failed to update manifest after partial rewrite")
+		if err := h.replaceManifestAfterRewrite(ctx, relativePath, rewrittenPath, s3Result); err != nil {
+			if errors.Is(err, errManifestFailure) {
+				return 0, err
+			}
+			return rewroteDeleted, err
 		}
+	} else {
+		if err := h.storage.Delete(ctx, relativePath); err != nil {
+			return rewroteDeleted, fmt.Errorf("failed to delete superseded rewritten file %q: %w", relativePath, err)
+		}
+	}
+	if err := h.recordRewriteTiering(ctx, relativePath, rewrittenPath, s3Result); err != nil {
+		return rewroteDeleted, err
 	}
 
 	return rewroteDeleted, nil
 }
 
-// rewriteLocalFile handles file rewrite for local storage using atomic rename
-func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, _, whereClause string, rowsBefore, rowsAfter int64) (int64, error) {
+// rewriteLocalFile handles file rewrite for local storage by publishing a fresh immutable path
+func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, relativePath, whereClause string, rowsBefore, rowsAfter int64) (int64, string, error) {
 	db := h.db.DB()
 	deleted := rowsBefore - rowsAfter
+	newRelativePath := rewritePath(relativePath)
+	newFilePath := filepath.Join(filepath.Dir(filePath), filepath.Base(newRelativePath))
 
-	// Create temp file for the rewritten data
+	// Create temp file for the rewritten data. Key it from the immutable output
+	// name so concurrent rewrites cannot collide on one source's staging path.
 	dir := filepath.Dir(filePath)
 	tempDir := filepath.Join(dir, ".tmp")
 	if err := os.MkdirAll(tempDir, 0700); err != nil {
-		return 0, fmt.Errorf("failed to create temp directory: %w", err)
+		return 0, "", fmt.Errorf("failed to create temp directory: %w", err)
 	}
 
-	tempFile := filepath.Join(tempDir, filepath.Base(filePath)+".new")
+	tempFile := filepath.Join(tempDir, filepath.Base(newRelativePath)+".new")
 
 	// Write filtered data to temp file using DuckDB COPY. Run with
 	// preserve_insertion_order forced on so the rewritten file keeps the
@@ -859,13 +914,14 @@ func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, _, where
 
 	if err := database.ExecPreservingInsertionOrder(ctx, db, copyQuery); err != nil {
 		os.Remove(tempFile)
-		return 0, fmt.Errorf("failed to write filtered data: %w", err)
+		return 0, "", fmt.Errorf("failed to write filtered data: %w", err)
 	}
 
-	// Atomic replace: rename temp file to original
-	if err := os.Rename(tempFile, filePath); err != nil {
+	// Publish the rewritten bytes under a fresh immutable path. Keep the old
+	// file intact until the manifest register+delete transaction commits.
+	if err := os.Rename(tempFile, newFilePath); err != nil {
 		os.Remove(tempFile)
-		return 0, fmt.Errorf("failed to replace original file: %w", err)
+		return 0, "", fmt.Errorf("failed to publish rewritten file: %w", err)
 	}
 
 	// Try to clean up temp directory if empty
@@ -878,13 +934,23 @@ func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, _, where
 		Int64("deleted", deleted).
 		Msg("Rewrote file")
 
-	return deleted, nil
+	return deleted, newRelativePath, nil
 }
 
-// s3RewriteResult holds the outcome of rewriteS3File for manifest update.
+// s3RewriteResult holds the outcome of rewriteS3File for manifest replacement.
 type s3RewriteResult struct {
+	newPath   string
 	sizeBytes int64
 	sha256    string
+}
+
+// rewritePath returns a fresh path in the same partition directory. Keeping
+// rewritten files immutable makes a content change visible as register+delete
+// in the manifest instead of an in-place UpdateFile (#975).
+func rewritePath(relativePath string) string {
+	logicalPath := storage.StripRewriteSuffix(relativePath)
+	base := strings.TrimSuffix(logicalPath, filepath.Ext(logicalPath))
+	return fmt.Sprintf("%s_rewrite_%d.parquet", base, time.Now().UTC().UnixNano())
 }
 
 // rewriteS3File handles file rewrite for S3 storage
@@ -902,6 +968,7 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 	}
 	db := h.db.DB()
 	deleted := rowsBefore - rowsAfter
+	newRelativePath := rewritePath(relativePath)
 
 	// Create temp file locally for the rewritten data. The destination
 	// directory MUST be inside DuckDB's allowed_directories — main.go
@@ -967,18 +1034,19 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 		return 0, nil, fmt.Errorf("failed to rewind rewritten file for upload: %w", err)
 	}
 
-	if err := h.storage.WriteReader(ctx, relativePath, uploadFile, sizeBytes); err != nil {
+	if err := h.storage.WriteReader(ctx, newRelativePath, uploadFile, sizeBytes); err != nil {
 		return 0, nil, fmt.Errorf("failed to upload rewritten file to remote storage: %w", err)
 	}
 
 	h.logger.Info().
 		Str("file", filepath.Base(relativePath)).
+		Str("new_file", filepath.Base(newRelativePath)).
 		Int64("rows_before", rowsBefore).
 		Int64("rows_after", rowsAfter).
 		Int64("deleted", deleted).
 		Msg("Rewrote S3 file")
 
-	return deleted, &s3RewriteResult{sizeBytes: sizeBytes, sha256: sha256hex}, nil
+	return deleted, &s3RewriteResult{newPath: newRelativePath, sizeBytes: sizeBytes, sha256: sha256hex}, nil
 }
 
 // isRemoteBackend returns true if the storage backend requires a remote rewrite
@@ -991,42 +1059,52 @@ func (h *DeleteHandler) isRemoteBackend() bool {
 	return false
 }
 
-// updateManifestAfterRewrite updates the cluster manifest entry for a partially
-// rewritten file. It reads the existing entry to keep the fields that identify
-// the file (path, database, measurement, partition time, tier, created-at) and
-// replaces the three that describe its bytes: SizeBytes, SHA256 and
-// OriginNodeID, the last because the node that rewrote the file is now the one
-// that holds the bytes the manifest describes (#976).
-//
-// For local storage the new size and checksum are read from the rewritten file
-// on disk. For S3 they come from the rewrite result, which computed them while
-// uploading.
-//
-// Failure is non-fatal for the request: the rewrite already succeeded in
-// storage. The caller logs it, because nothing re-proposes a lost update and
-// replicas keep serving the pre-rewrite bytes until the path changes again.
-func (h *DeleteHandler) updateManifestAfterRewrite(relativePath string, s3 *s3RewriteResult) error {
-	existing, ok := h.coordinator.GetFileEntry(relativePath)
+func (h *DeleteHandler) recordRewriteTiering(ctx context.Context, oldPath, newPath string, s3 *s3RewriteResult) error {
+	if h.tieringManager == nil {
+		return nil
+	}
+	sizeBytes := int64(0)
+	if s3 != nil {
+		sizeBytes = s3.sizeBytes
+	} else if lb, ok := h.storage.(*storage.LocalBackend); ok {
+		info, err := os.Stat(filepath.Join(lb.GetBasePath(), newPath))
+		if err != nil {
+			return fmt.Errorf("stat rewritten file for tiering: %w", err)
+		}
+		sizeBytes = info.Size()
+	}
+	if err := h.tieringManager.RecordRewrittenFile(ctx, oldPath, newPath, sizeBytes); err != nil {
+		return fmt.Errorf("update tier metadata for rewritten file: %w", err)
+	}
+	return nil
+}
+
+// replaceManifestAfterRewrite publishes a partial rewrite as a new immutable
+// file. Registering the new path and deleting the old path in one Raft command
+// means followers never have to infer a content change from size/checksum on an
+// existing path (#975).
+func (h *DeleteHandler) replaceManifestAfterRewrite(ctx context.Context, oldPath, newPath string, s3 *s3RewriteResult) error {
+	existing, ok := h.coordinator.GetFileEntry(oldPath)
 	if !ok {
-		// File not in manifest (standalone-registered or pre-cluster file) — skip.
+		h.logger.Warn().
+			Str("file", oldPath).
+			Str("new_file", newPath).
+			Msg("Rewritten source is absent from the manifest; new file is not registered and will not replicate; deleting the superseded storage object (reconciliation may later remove the orphan)")
+		if err := h.storage.Delete(ctx, oldPath); err != nil {
+			return fmt.Errorf("failed to delete unmanifested superseded rewrite %q: %w", oldPath, err)
+		}
 		return nil
 	}
 
-	entry := *existing // copy all fields to preserve immutable metadata
-	// The node that performed the rewrite owns the new bytes. After a writer
-	// failover the primary is not the file's origin, and keeping the old origin
-	// sent every replica to a node that still had the pre-rewrite bytes: a
-	// wasted transfer and a checksum failure on every pull, and the old origin
-	// itself skipped the update as its own and kept the deleted rows (#976).
+	entry := *existing
+	entry.Path = newPath
 	entry.OriginNodeID = h.coordinator.LocalNodeID()
 
 	if lb, ok := h.storage.(*storage.LocalBackend); ok {
 		basePath := lb.GetBasePath()
-		fullPath := filepath.Join(basePath, relativePath)
-		// Containment check: relativePath is already validated upstream, but
-		// guard here too since fileMetadata opens the file for reading.
+		fullPath := filepath.Join(basePath, newPath)
 		if !strings.HasPrefix(fullPath, basePath+string(filepath.Separator)) {
-			return fmt.Errorf("path escapes storage root: %s", relativePath)
+			return fmt.Errorf("path escapes storage root: %s", newPath)
 		}
 		size, sha, err := fileMetadata(fullPath)
 		if err != nil {
@@ -1035,10 +1113,39 @@ func (h *DeleteHandler) updateManifestAfterRewrite(relativePath string, s3 *s3Re
 		entry.SizeBytes = size
 		entry.SHA256 = sha
 	} else if s3 != nil {
-		// For S3: size and SHA256 were computed from the local temp file before upload.
 		entry.SizeBytes = s3.sizeBytes
 		entry.SHA256 = s3.sha256
 	}
 
-	return h.coordinator.UpdateFileInManifest(entry)
+	registerPayload, err := json.Marshal(raft.RegisterFilePayload{File: entry})
+	if err != nil {
+		return fmt.Errorf("%w: marshal replacement register: %v", errManifestFailure, err)
+	}
+	deletePayload, err := json.Marshal(raft.DeleteFilePayload{Path: oldPath, Reason: "delete-rewrite"})
+	if err != nil {
+		return fmt.Errorf("%w: marshal replacement delete: %v", errManifestFailure, err)
+	}
+
+	if err := h.coordinator.BatchFileOpsInManifest([]raft.BatchFileOp{
+		{Type: raft.CommandRegisterFile, Payload: registerPayload},
+		{Type: raft.CommandDeleteFile, Payload: deletePayload},
+	}); err != nil {
+		// The old manifest entry is still authoritative, so remove the new
+		// orphan if publication failed. The cleanup is best-effort.
+		if cleanupErr := h.storage.Delete(ctx, newPath); cleanupErr != nil {
+			h.logger.Warn().Err(cleanupErr).Str("file", newPath).Msg("Failed to clean up unregistered rewrite")
+		}
+		return errors.Join(errManifestFailure, fmt.Errorf("replace rewritten file in manifest: %w", err))
+	}
+
+	// The rewritten file is now authoritative. Delete the superseded object
+	// directly on the node that performed the rewrite; this is required for
+	// standalone mode and for clusters with replication disabled, where no
+	// manifest-delete worker is running.
+	if err := h.storage.Delete(ctx, oldPath); err != nil {
+		h.logger.Error().Err(err).Str("file", oldPath).Str("new_file", newPath).
+			Msg("Manifest committed but failed to delete superseded rewrite; the old object may remain visible to glob queries until cleanup succeeds")
+		return fmt.Errorf("manifest committed but failed to delete superseded rewrite %q: %w", oldPath, err)
+	}
+	return nil
 }

@@ -27,6 +27,17 @@ type countingBackend struct {
 	existsCalls atomic.Int64
 }
 
+type waitingExistsBackend struct {
+	storage.Backend
+	started chan struct{}
+}
+
+func (b *waitingExistsBackend) Exists(ctx context.Context, _ string) (bool, error) {
+	close(b.started)
+	<-ctx.Done()
+	return false, ctx.Err()
+}
+
 func (c *countingBackend) List(ctx context.Context, prefix string) ([]string, error) {
 	c.listCalls.Add(1)
 	return c.Backend.List(ctx, prefix)
@@ -79,6 +90,41 @@ func setupTestDatabasesHandler(t *testing.T, deleteEnabled bool) (*DatabasesHand
 	handler.RegisterRoutes(app)
 
 	return handler, app, tmpDir
+}
+
+func TestDatabasesHandlerCreateStorageCallHonorsDeadline(t *testing.T) {
+	backend, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatalf("failed to create LocalBackend: %v", err)
+	}
+	defer backend.Close()
+
+	waitingBackend := &waitingExistsBackend{
+		Backend: backend,
+		started: make(chan struct{}),
+	}
+	handler := NewDatabasesHandler(waitingBackend, nil, nil, zerolog.Nop())
+	handler.requestTimeout = 10 * time.Millisecond
+	app := fiber.New()
+	handler.RegisterRoutes(app)
+
+	req := httptest.NewRequest("POST", "/api/v1/databases", bytes.NewBufferString(`{"name":"testdb"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req, testRequestTimeoutMS)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	select {
+	case <-waitingBackend.started:
+	default:
+		t.Fatal("storage existence check was not called")
+	}
+	if resp.StatusCode != fiber.StatusInternalServerError {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected status 500 after storage timeout, got %d: %s", resp.StatusCode, body)
+	}
 }
 
 // TestDatabasesHandler_List tests listing databases

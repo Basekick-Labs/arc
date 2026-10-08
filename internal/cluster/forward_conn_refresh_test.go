@@ -8,6 +8,7 @@ package cluster
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -105,6 +106,57 @@ func TestGetOrDialLeader_ReusesAFreshConnection(t *testing.T) {
 		t.Errorf("leader accepted %d connections; want 1", got)
 	}
 	c.closeForwardConn()
+}
+
+func TestGetOrDialLeader_CancelInterruptsStalledTLSHandshake(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	accepted := make(chan struct{})
+	release := make(chan struct{})
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		close(accepted)
+		<-release
+		_ = conn.Close()
+	}()
+	t.Cleanup(func() { close(release) })
+
+	c := newForwardCoordinator(t)
+	c.tlsConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // the test peer deliberately never completes TLS
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := c.getOrDialLeader(ctx, "leader-1", listener.Addr().String())
+		result <- err
+	}()
+
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("leader did not accept the TLS connection")
+	}
+
+	start := time.Now()
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("dial error = %v, want context.Canceled", err)
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("cancellation took %v; want under 1s", elapsed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("dial did not stop promptly after its context was cancelled")
+	}
 }
 
 // A connection idle past forwardConnIdleRefresh is redialled rather than

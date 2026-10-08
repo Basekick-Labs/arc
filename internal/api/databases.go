@@ -19,6 +19,7 @@ import (
 // DatabasesHandler handles database management API endpoints
 type DatabasesHandler struct {
 	storage        storage.Backend
+	requestTimeout time.Duration
 	deleteConfig   *config.DeleteConfig
 	tieringManager *tiering.Manager
 	authManager    *auth.AuthManager
@@ -200,11 +201,19 @@ func (h *DatabasesHandler) SetIcebergDropper(d IcebergCatalogDropper) {
 
 func NewDatabasesHandler(storage storage.Backend, deleteConfig *config.DeleteConfig, authManager *auth.AuthManager, logger zerolog.Logger) *DatabasesHandler {
 	return &DatabasesHandler{
-		storage:      storage,
-		deleteConfig: deleteConfig,
-		authManager:  authManager,
-		logger:       logger.With().Str("component", "databases-handler").Logger(),
+		storage:        storage,
+		requestTimeout: 30 * time.Second,
+		deleteConfig:   deleteConfig,
+		authManager:    authManager,
+		logger:         logger.With().Str("component", "databases-handler").Logger(),
 	}
+}
+
+func (h *DatabasesHandler) storageContext(c *fiber.Ctx, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	return context.WithTimeout(c.Context(), timeout)
 }
 
 // SetTieringManager sets the tiering manager for multi-tier database/measurement listing.
@@ -265,7 +274,8 @@ func (h *DatabasesHandler) handleList(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	ctx := context.Background()
+	ctx, cancel := h.storageContext(c, h.requestTimeout)
+	defer cancel()
 
 	// Optimized: Single storage call to get all databases with measurement counts
 	databaseInfos, err := h.listDatabasesWithMeasurementCounts(ctx)
@@ -312,7 +322,8 @@ func (h *DatabasesHandler) handleCreate(c *fiber.Ctx) error {
 		})
 	}
 
-	ctx := context.Background()
+	ctx, cancel := h.storageContext(c, h.requestTimeout)
+	defer cancel()
 
 	// Check if database already exists
 	exists, err := h.databaseExists(ctx, req.Name)
@@ -374,7 +385,8 @@ func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	ctx := context.Background()
+	ctx, cancel := h.storageContext(c, h.requestTimeout)
+	defer cancel()
 
 	// Check if database exists
 	exists, err := h.databaseExists(ctx, name)
@@ -396,10 +408,13 @@ func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
 	// — the same thing filtering the names is there to prevent, leaked as an
 	// integer instead.
 	measurements, err := h.listMeasurements(ctx, name)
-	measurementCount := 0
-	if err == nil {
-		measurementCount = len(h.filterReadableMeasurements(c, name, measurements))
+	if err != nil {
+		h.logger.Error().Err(err).Str("database", name).Msg("Failed to list measurements")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to list measurements: " + err.Error(),
+		})
 	}
+	measurementCount := len(h.filterReadableMeasurements(c, name, measurements))
 
 	return c.JSON(DatabaseInfo{
 		Name:             name,
@@ -431,7 +446,8 @@ func (h *DatabasesHandler) handleListMeasurements(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	ctx := context.Background()
+	ctx, cancel := h.storageContext(c, h.requestTimeout)
+	defer cancel()
 
 	// Optimized: Skip separate existence check. Instead, check marker file once
 	// and list measurements in a single operation.
@@ -524,7 +540,8 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 
-	ctx := context.Background()
+	ctx, cancel := h.storageContext(c, h.requestTimeout)
+	defer func() { cancel() }()
 
 	// Check if database exists
 	exists, err := h.databaseExists(ctx, name)
@@ -553,6 +570,11 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 			"error": "Failed to list database files",
 		})
 	}
+	// Deletion can make many independent storage calls. Scale the overall
+	// deadline with the number of listed files so a large database is not
+	// abandoned after the same fixed timeout as a small one.
+	cancel()
+	ctx, cancel = h.storageContext(c, h.requestTimeout*time.Duration(len(files)+2))
 
 	// Delete all files
 	deletedCount := 0
@@ -596,7 +618,10 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 
 	// Also delete the .arc-database marker file (not included in List due to hidden file filter)
 	markerPath := name + "/.arc-database"
-	if err := h.storage.Delete(ctx, markerPath); err == nil {
+	if err := h.storage.Delete(ctx, markerPath); err != nil {
+		h.logger.Warn().Err(err).Str("path", markerPath).Msg("Failed to delete database marker file")
+		deleteErrors = append(deleteErrors, markerPath+": "+err.Error())
+	} else {
 		deletedCount++
 		h.logger.Debug().Str("path", markerPath).Msg("Deleted database marker file")
 	}

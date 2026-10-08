@@ -220,6 +220,82 @@ func (m *Manager) SetTierLookup(l TierLookup) {
 	m.tierLookup = l
 }
 
+// ColdCounter reports how many cold-tier files this node's tier metadata
+// holds, grouped by database. It is how a backup records the files it is NOT
+// carrying: cold-tier objects are not copied yet (#1085 stage C), so a backup
+// of a tiered deployment is complete only with respect to hot storage, and the
+// count is the size of that gap.
+//
+// One grouped query (tiering.MetadataStore.CountFilesInTierByDatabase), not
+// one per database, because the set that matters is "every database with cold
+// rows" and that is not the backup inventory — a fully cold database has no
+// hot files and so appears in neither. Nil when tiering is off, where no file
+// can be cold. Independent of TierRecorder and TierLookup in the wiring,
+// though cmd/arc attaches all three from the same tiering manager.
+type ColdCounter interface {
+	CountColdFilesByDatabase(ctx context.Context) (map[string]int64, error)
+}
+
+// SetColdCounter wires this node's tier metadata for the cold-file marker.
+// Nil is ignored, as SetTierLookup; a caller holding a typed nil pointer must
+// check for nil itself (#713).
+func (m *Manager) SetColdCounter(c ColdCounter) {
+	if c == nil {
+		return
+	}
+	m.coldCounter = c
+}
+
+// ColdSource is this node's cold tier: the store a backup reads cold objects
+// from and a restore writes them back to, plus the tier rows it reconciles the
+// listing against (#1086 stage C). Nil when the node has no cold tier, which
+// includes cold being configured but disabled and the backend having failed to
+// construct — ColdBackend answers nil in both.
+//
+// Separate from ColdCounter even though one tiering manager implements both,
+// because the marker stage B shipped must keep working on a node that has tier
+// rows and no reachable cold store.
+type ColdSource interface {
+	// ColdBackend is the cold store, or nil when there is none.
+	ColdBackend() storage.Backend
+	// ColdRows is this node's cold tier metadata, path to size, quarantined
+	// rows excluded. A map because every use is a lookup by path, and because
+	// stdlib types are what keep this interface satisfiable without tiering
+	// importing this package.
+	ColdRows(ctx context.Context) (map[string]int64, error)
+	// RecordRestoredColdFiles records a batch of files a restore wrote to the
+	// cold tier, keyed path to size. It reports two disjoint subsets of those
+	// paths, which the caller counts into different fields: `quarantined`
+	// paths whose row exists, is quarantined, and was deliberately left
+	// alone, and `failed` paths for which no row could be attempted at all.
+	//
+	// A non-nil error means NOTHING in the batch was written — the
+	// implementation runs one transaction per call — so the caller counts the
+	// whole submitted chunk as unrecorded rather than guessing how far it got.
+	//
+	// Batched rather than one call per file (#1141): each row is a write on
+	// the single shared SQLite connection, and a restore of many cold files
+	// used to serialise auth, audit and ingest tier registration behind one
+	// fsync per file. The caller chunks at coldRowBatchSize.
+	RecordRestoredColdFiles(ctx context.Context, sizes map[string]int64) (quarantined, failed []string, err error)
+	// RecordRestoredHotFiles forces rows to HOT for files the backup read
+	// from cold and that this node had to put in hot storage instead. The
+	// ordinary hot report cannot do it: its upsert is guarded to rows that
+	// already say hot, and these rows say cold. Same two-subset report and
+	// same all-or-nothing error as RecordRestoredColdFiles.
+	RecordRestoredHotFiles(ctx context.Context, sizes map[string]int64) (quarantined, failed []string, err error)
+}
+
+// SetColdSource wires this node's cold tier for the cold walk and the cold
+// restore. Nil is ignored, as SetColdCounter; a caller holding a typed nil
+// pointer must check for nil itself (#713).
+func (m *Manager) SetColdSource(c ColdSource) {
+	if c == nil {
+		return
+	}
+	m.coldSource = c
+}
+
 // ClusterManifestWired reports whether the Raft file manifest is attached.
 // The API layer resolves a scoped restore mode from this, not from the
 // presence of a cluster coordinator: the two differ on a cluster node without

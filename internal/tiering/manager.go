@@ -357,24 +357,55 @@ func (m *Manager) runCycle(ctx context.Context) error {
 		totalErrors++
 	} else {
 		// Hot -> Cold migrations (2-tier system)
-		if m.coldBackend != nil && m.config.Cold.Enabled {
+		if m.coldTierUsable() {
 			migrated, errors := m.migrator.MigrateTier(ctx, TierHot, TierCold)
 			totalMigrated += migrated
 			totalErrors += errors
 		}
 
-		// Reconcile orphaned hot files (files tracked as cold but still in hot storage)
-		orphansFound, orphansDeleted, orphanErrors = m.migrator.ReconcileOrphanedFiles(ctx)
-		totalErrors += orphanErrors
+		// Reconcile orphaned hot files (files tracked as cold but still in
+		// hot storage) — and ONLY with a usable cold tier (#1143).
+		//
+		// Both of these verify a cold copy before acting, so without one
+		// there is nothing they can soundly do: GetBackendForTier answers
+		// nil, the orphan sweep keeps every hot copy it examines and the
+		// manifest sweep returns before doing any work at all. Skipped
+		// rather than left to those branches because the orphan sweep logs
+		// an error and counts a failure per orphan, so a node with cold off
+		// reports errors every cycle for work it was never going to do.
+		// (For the manifest sweep the gate is a pure no-op; it already
+		// returned early on a nil cold backend.)
+		//
+		// This is the gate whose absence was #1143. Its cost was noise
+		// rather than data: a disabled cold tier has no backend (main.go
+		// builds one only when the flag is on), so the sweep took its
+		// keep-the-file branch — but it took it per ORPHAN, every cycle,
+		// with an Error line and a counted failure each time. Per orphan,
+		// not per cold row: a row whose hot copy is gone costs one silent
+		// existence check and never reaches the cold step.
+		if !m.coldTierUsable() {
+			// One line per cycle, not one per row. Named because skipping
+			// costs something besides the noise: the sweep quarantines a
+			// permanently unusable storage key (#758) BEFORE it looks at the
+			// cold tier, so that mark is now deferred on such a node until
+			// cold comes back — and the rows age out of the 48-hour window
+			// meanwhile, so in practice it is not taken at all. Harmless
+			// while the sweep itself is not running (the mark exists to stop
+			// the sweep retrying that key), and worth saying out loud.
+			m.logger.Debug().Msg("Cold tier is not usable on this node; orphan and manifest reconciliation are skipped this cycle")
+		} else {
+			orphansFound, orphansDeleted, orphanErrors = m.migrator.ReconcileOrphanedFiles(ctx)
+			totalErrors += orphanErrors
 
-		// Manifest entries for files already in cold — migrated before the
-		// manifest was kept in step, or whose manifest step failed — keep
-		// peer replication pulling their replicas back. coldRows (every
-		// cold row this node knows) is held across the whole cycle for
-		// this; a few hundred bytes a row.
-		if _, err := m.migrator.ReconcileManifest(ctx, coldRows); err != nil {
-			m.logger.Warn().Err(err).Msg("Manifest reconciliation stopped; remaining entries are retried next cycle")
-			totalErrors++
+			// Manifest entries for files already in cold — migrated before the
+			// manifest was kept in step, or whose manifest step failed — keep
+			// peer replication pulling their replicas back. coldRows (every
+			// cold row this node knows) is held across the whole cycle for
+			// this; a few hundred bytes a row.
+			if _, err := m.migrator.ReconcileManifest(ctx, coldRows); err != nil {
+				m.logger.Warn().Err(err).Msg("Manifest reconciliation stopped; remaining entries are retried next cycle")
+				totalErrors++
+			}
 		}
 	}
 	if orphansFound > 0 || orphanErrors > 0 {
@@ -537,12 +568,58 @@ func (m *Manager) TriggerMigration(ctx context.Context) error {
 	return m.RunMigrationCycle(ctx)
 }
 
-// GetBackendForTier returns the storage backend for a tier
+// coldTierUsable reports whether this node has a cold tier it may actually
+// read or write: a backend was built AND the operator has it enabled.
+//
+// The single definition of that question (#1143). It used to be spelled out
+// inline at every consumer — the migration gate, the stats, the cold-metadata
+// sync, the query glob, two drainer paths — and orphan reconciliation was the
+// one that forgot. A conjunction remembered at six call sites is not a design;
+// there is now one predicate, and the only conjunction still spelled out is
+// NewManager's own startup log line, which runs before there is an m to ask.
+//
+// What the omission did and did not cost, because the comment this replaces
+// overstated it: the sweep confirms a cold copy before deleting a hot one, so
+// taking an unflagged backend as proof would have had it delete the copy the
+// query path was actually reading. But a disabled cold tier has no backend at
+// all — cmd/arc/main.go builds one only inside "if cold.Enabled", nothing
+// assigns the flag after load, and there is no reload — so the sweep met nil
+// and already kept the file. The real cost was noise: it ran every cycle on
+// such a node and logged an error per orphan row for work it could never do.
+// The invariant is enforced here anyway, so moving construction out of that
+// "if" cannot quietly turn a latent violation into a live one.
+//
+// config is a POINTER and is checked before Cold.Enabled is read: NewManager
+// always sets it, but a partly-built manager is the shape a caller holding
+// this as an interface can be handed. Nil-receiver safe for the same reason.
+func (m *Manager) coldTierUsable() bool {
+	return m != nil && m.coldBackend != nil && m.config != nil && m.config.Cold.Enabled
+}
+
+// GetBackendForTier returns the storage backend for a tier, or nil when this
+// node has no usable one.
+//
+// The cold answer ANDs cold.enabled (#1143). It did not until that issue, and
+// what that cost is narrower than it looks: a caller taking a non-nil answer
+// as "cold is usable" WOULD have been wrong on a node that kept a cold backend
+// with the flag off, but no such node exists — cmd/arc/main.go builds one only
+// inside "if cold.Enabled", so disabling cold leaves this nil either way. The
+// flag is ANDed here so the two cannot drift if construction ever moves.
+//
+// Callers that need the configured backend regardless of the flag do not
+// exist; the one that looked like it did, the migration source cleanup, always
+// asks for the HOT tier.
 func (m *Manager) GetBackendForTier(tier Tier) storage.Backend {
+	if m == nil {
+		return nil
+	}
 	switch tier {
 	case TierHot:
 		return m.hotBackend
 	case TierCold:
+		if !m.coldTierUsable() {
+			return nil
+		}
 		return m.coldBackend
 	default:
 		return m.hotBackend
@@ -567,6 +644,33 @@ func (m *Manager) GetConfig() *config.TieredStorageConfig {
 // GetRouter returns the tier router for query routing
 func (m *Manager) GetRouter() *Router {
 	return m.router
+}
+
+// RecordRewrittenFile updates tier metadata for an immutable rewrite.
+// The old path is retired and the new path is recorded as hot. It is used by
+// DELETE because rewritten files bypass the normal ingest/replication writers.
+func (m *Manager) RecordRewrittenFile(ctx context.Context, oldPath, newPath string, sizeBytes int64) error {
+	if m == nil || m.metadata == nil {
+		return nil
+	}
+	info, err := m.parseFilePath(newPath)
+	if err != nil {
+		return fmt.Errorf("parse rewritten file path %q: %w", newPath, err)
+	}
+	if err := m.metadata.DeleteFile(ctx, oldPath); err != nil {
+		return fmt.Errorf("retire rewritten source %q from tier metadata: %w", oldPath, err)
+	}
+	if err := m.RecordNewFile(ctx, &FileMetadata{
+		Path:          newPath,
+		Database:      info.Database,
+		Measurement:   info.Measurement,
+		PartitionTime: info.PartitionTime,
+		SizeBytes:     sizeBytes,
+		CreatedAt:     time.Now().UTC(),
+	}); err != nil {
+		return fmt.Errorf("record rewritten file %q in tier metadata: %w", newPath, err)
+	}
+	return nil
 }
 
 // RecordNewFile records a newly ingested file in the hot tier
@@ -613,7 +717,7 @@ func (m *Manager) GetStatus(ctx context.Context) (*StatusResponse, error) {
 
 	// Cold tier
 	coldStats := tierStats[TierCold]
-	coldStats.Enabled = m.config.Cold.Enabled && m.coldBackend != nil
+	coldStats.Enabled = m.coldTierUsable()
 	coldStats.Backend = m.config.Cold.Backend
 	status.Tiers["cold"] = coldStats
 
@@ -684,7 +788,7 @@ func (m *Manager) ScanTiers(ctx context.Context) (*ScanResult, error) {
 func (m *Manager) scanTiers(ctx context.Context) (*ScanResult, []FileMetadata, error) {
 	result := &ScanResult{}
 	var coldRows []FileMetadata
-	if m.clusterGate != nil && m.coldBackend != nil && m.config.Cold.Enabled {
+	if m.clusterGate != nil && m.coldTierUsable() {
 		synced, rows, err := m.syncColdTierMetadata(ctx)
 		result.ColdSynced = synced
 		coldRows = rows
@@ -751,7 +855,7 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 		unseen[f.Path] = true
 	}
 
-	synced, unparseable := 0, 0
+	synced, unparseable, quarantined := 0, 0, 0
 	for _, obj := range objects {
 		// Past the deadline every remaining upsert would fail and log; stop
 		// with what was recorded — the next cycle continues from there.
@@ -784,8 +888,18 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 			SizeBytes:     obj.Size,
 			CreatedAt:     obj.LastModified,
 		}
-		if err := m.metadata.RecordColdFile(ctx, file, obj.LastModified); err != nil {
+		wrote, err := m.metadata.RecordColdFile(ctx, file, obj.LastModified)
+		if err != nil {
 			m.logger.Warn().Str("path", obj.Path).Err(err).Msg("Failed to record cold file, skipping")
+			continue
+		}
+		if !wrote {
+			// Quarantined (#1086 stage C added that guard). The row is
+			// already the record that this key is unusable, and before the
+			// guard every cycle re-upserted it for as long as the listing
+			// kept returning the object. Not counted as synced and not
+			// appended to coldRows: the sweep must not act on it either.
+			quarantined++
 			continue
 		}
 		synced++
@@ -818,6 +932,7 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 		Int("objects", len(objects)).
 		Int("synced", synced).
 		Int("unparseable", unparseable).
+		Int("quarantined_skipped", quarantined).
 		Msg("Cold tier metadata sync completed")
 	return synced, coldRows, nil
 }

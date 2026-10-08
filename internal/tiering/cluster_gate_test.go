@@ -285,7 +285,7 @@ func TestSync_FlipsInsertsPreservesAndStamps(t *testing.T) {
 	// C: already known cold, with a migration time that must survive.
 	earlier := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
 	mustWrite(t, cold, gateDailyC)
-	if err := m.metadata.RecordColdFile(ctx, &FileMetadata{
+	if _, err := m.metadata.RecordColdFile(ctx, &FileMetadata{
 		Path: gateDailyC, Database: "db1", Measurement: "cpu", PartitionTime: partition, SizeBytes: 7,
 	}, earlier); err != nil {
 		t.Fatal(err)
@@ -388,7 +388,7 @@ func TestSync_ColdRowWithoutObjectIsLeftAlone(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 	gate.primary.Store(false)
-	if err := m.metadata.RecordColdFile(ctx, &FileMetadata{
+	if _, err := m.metadata.RecordColdFile(ctx, &FileMetadata{
 		Path: gateDailyA, Database: "db1", Measurement: "cpu",
 		PartitionTime: time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC), SizeBytes: 7,
 	}, gateColdModTime); err != nil {
@@ -547,7 +547,7 @@ func TestReconcile_KeepsOnlyCopyWhenColdObjectIsGone(t *testing.T) {
 	row := &FileMetadata{Path: gateDailyA, Database: "db1", Measurement: "cpu", PartitionTime: partition, SizeBytes: 7}
 
 	mustWrite(t, hot, gateDailyA)
-	if err := m.metadata.RecordColdFile(ctx, row, time.Now()); err != nil {
+	if _, err := m.metadata.RecordColdFile(ctx, row, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	found, deleted, failed := m.migrator.ReconcileOrphanedFiles(ctx)
@@ -563,7 +563,7 @@ func TestReconcile_KeepsOnlyCopyWhenColdObjectIsGone(t *testing.T) {
 
 	// With the cold copy present the orphan hot copy is removed as before.
 	mustWrite(t, cold, gateDailyA)
-	if err := m.metadata.RecordColdFile(ctx, row, time.Now()); err != nil {
+	if _, err := m.metadata.RecordColdFile(ctx, row, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	found, deleted, failed = m.migrator.ReconcileOrphanedFiles(ctx)

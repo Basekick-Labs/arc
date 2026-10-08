@@ -75,18 +75,26 @@ func TestEffectiveCores_MatchesRuntime(t *testing.T) {
 }
 
 func TestDefaultCompactionThreads(t *testing.T) {
-	cases := []struct{ cores, want int }{
-		{1, 1}, // floor: never 0, which the subprocess reads as "unset"
-		{2, 1}, // the headline 2-CPU pod
-		{3, 1},
-		{8, 4},
-		{64, 32},
-		{0, 1},
+	cases := []struct {
+		name                 string
+		cores, maxConcurrent int
+		want                 int
+	}{
+		{"default concurrency keeps half-core behavior", 8, 2, 4},
+		{"two-core limit at default concurrency", 2, 2, 1},
+		{"raised concurrency divides available cores", 16, 4, 4},
+		{"raised concurrency on constrained process", 8, 4, 2},
+		{"zero concurrency uses default", 8, 0, 4},
+		{"negative concurrency uses default", 8, -1, 4},
+		{"minimum one thread", 1, 8, 1},
+		{"zero cores", 0, 2, 1},
 	}
 	for _, c := range cases {
-		if got := defaultCompactionThreads(c.cores); got != c.want {
-			t.Errorf("defaultCompactionThreads(%d) = %d, want %d", c.cores, got, c.want)
-		}
+		t.Run(c.name, func(t *testing.T) {
+			if got := defaultCompactionThreads(c.cores, c.maxConcurrent); got != c.want {
+				t.Errorf("defaultCompactionThreads(%d, %d) = %d, want %d", c.cores, c.maxConcurrent, got, c.want)
+			}
+		})
 	}
 }
 
@@ -340,6 +348,47 @@ func TestLoad_IcebergRequiresLocalBackend(t *testing.T) {
 
 	if _, err := Load(); err == nil {
 		t.Fatal("expected error for iceberg.enabled + non-local backend, got nil")
+	}
+}
+
+func TestLoad_IcebergRejectsDottedNamespacePrefix(t *testing.T) {
+	// Arc builds ONE Iceberg namespace component per database, as <prefix>_<database>. A dot in
+	// the prefix puts a dot in every one of them, and iceberg-go v0.7.0 addresses a namespace with
+	// a dotted component by a JSON-encoded catalog key instead of the plain dotted string. The
+	// warehouse directory then becomes __iceberg_namespace_v1__:[...].db, which Arc's own
+	// warehouse-directory test does not recognise and would walk back in as a user database, and
+	// the percent-encoded metadata location leaves no version-hint.text for directory readers.
+	for _, tc := range []struct {
+		prefix  string
+		wantErr bool
+	}{
+		{"arc", false},
+		{"arc_wh", false},
+		{"my-warehouse", false},
+		{"my.warehouse", true},
+		{".arc", true},
+		{"arc.", true},
+	} {
+		t.Run(tc.prefix, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			t.Setenv("ARC_ICEBERG_ENABLED", "true")
+			t.Setenv("ARC_STORAGE_BACKEND", "local")
+			t.Setenv("ARC_ICEBERG_NAMESPACE_PREFIX", tc.prefix)
+
+			_, err := Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("namespace_prefix %q was accepted; it would publish unreadable tables", tc.prefix)
+				}
+				if !strings.Contains(err.Error(), "must not contain a dot") {
+					t.Errorf("error does not name the cause: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("namespace_prefix %q rejected: %v", tc.prefix, err)
+			}
+		})
 	}
 }
 

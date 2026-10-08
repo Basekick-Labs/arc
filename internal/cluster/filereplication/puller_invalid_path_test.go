@@ -40,9 +40,16 @@ func TestPullerQuarantinesUnusableKeyWithoutTouchingPeers(t *testing.T) {
 	before := metrics.Get().Snapshot()["storage_invalid_path_quarantined_total"].(int64)
 	p.Enqueue(makeEntry(invalidEntryPath, "writer-1", 128))
 
-	stats := waitStats(t, p, func(s map[string]int64) bool { return s["invalid_path"] == 1 })
-	if stats["invalid_path"] != 1 {
-		t.Fatalf("invalid_path = %d, want 1: %+v", stats["invalid_path"], stats)
+	// inflight_count is in the predicate, not just invalid_path, because the
+	// counter moves inside processEntryOnce while the in-flight state is
+	// released by its deferred finishEntry. Gating on the counter alone can
+	// return between totalInvalidPath.Add(1) and the shared-metric increment
+	// three statements later, and the assertion below reads that metric (#1146).
+	stats := waitStats(t, p, func(s map[string]int64) bool {
+		return s["invalid_path"] == 1 && s["inflight_count"] == 0
+	})
+	if stats["invalid_path"] != 1 || stats["inflight_count"] != 0 {
+		t.Fatalf("quarantine did not settle: %+v", stats)
 	}
 	// The puller has its own counter, but it must also move the shared one:
 	// Stats() is JSON-only, so without this the highest-frequency site is
@@ -90,7 +97,18 @@ func TestPullerQuarantineKeepsTheQueryGateClosed(t *testing.T) {
 	p.enqueue(makeEntry(invalidEntryPath, "writer-1", 128), enqueueSourceCatchUp, false)
 	p.catchupCompletedAt.Store(time.Now().Unix())
 
-	stats := waitStats(t, p, func(s map[string]int64) bool { return s["invalid_path"] == 1 })
+	// Both in-flight counters are in the predicate. invalid_path moves inside
+	// processEntryOnce; catchupInflight and inflightCount are cleared by its
+	// deferred finishEntry, so a predicate watching only the counter returns
+	// while the assertions below still read the pre-drain state and the test
+	// fails on CI for a reason that is not a defect (#1146 — the same mechanism
+	// #972 fixed in TestPullerQuarantineIsIdempotentAcrossReenqueues, which
+	// shares this file). Both keys are asserted because finishEntry and
+	// inflightRemove clear them in opposite orders, so neither alone is a
+	// barrier for the other.
+	stats := waitStats(t, p, func(s map[string]int64) bool {
+		return s["invalid_path"] == 1 && s["inflight_count"] == 0 && s["catchup_inflight"] == 0
+	})
 	if stats["failed"] != 1 {
 		t.Errorf("failed = %d, want 1: the file really is absent, so the gate must stay closed", stats["failed"])
 	}

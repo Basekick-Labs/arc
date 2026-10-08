@@ -289,9 +289,10 @@ func (t *BaseTier) ShouldCompactByFileSuffix(
 
 	var compactedFiles, uncompactedFiles []string
 	for _, f := range files {
-		if len(f) >= len(compactedSuffix) && f[len(f)-len(compactedSuffix):] == compactedSuffix {
+		logical := storage.StripRewriteSuffix(f)
+		if len(logical) >= len(compactedSuffix) && logical[len(logical)-len(compactedSuffix):] == compactedSuffix {
 			compactedFiles = append(compactedFiles, f)
-		} else if isUncompactedInput(f) {
+		} else if isUncompactedInput(logical) {
 			uncompactedFiles = append(uncompactedFiles, f)
 		}
 	}

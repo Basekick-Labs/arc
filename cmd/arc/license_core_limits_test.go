@@ -53,6 +53,7 @@ func TestApplyLicenseCoreLimits_UnlimitedIsNoOp(t *testing.T) {
 	for _, maxCores := range []int{0, -1} {
 		withCores(t, 64, 2)
 		cfg := baseConfig()
+		cfg.Compaction.Threads = 7
 		before := runtime.GOMAXPROCS(0)
 
 		applyLicenseCoreLimits(&license.License{MaxCores: maxCores}, cfg)
@@ -63,9 +64,47 @@ func TestApplyLicenseCoreLimits_UnlimitedIsNoOp(t *testing.T) {
 		if cfg.Ingest.FlushWorkers != 8 {
 			t.Errorf("MaxCores=%d: FlushWorkers = %d, want 8", maxCores, cfg.Ingest.FlushWorkers)
 		}
+		if cfg.Compaction.Threads != 7 {
+			t.Errorf("MaxCores=%d: Compaction.Threads = %d, want 7", maxCores, cfg.Compaction.Threads)
+		}
 		if got := runtime.GOMAXPROCS(0); got != before {
 			t.Errorf("MaxCores=%d: GOMAXPROCS = %d, want %d (unlimited licence must not pin it)", maxCores, got, before)
 		}
+	}
+}
+
+func TestApplyLicenseCoreLimits_CompactionThreadsOnlyDecrease(t *testing.T) {
+	cases := []struct {
+		name          string
+		machineCores  int
+		effective     int
+		licensedCores int
+		threads       int
+		want          int
+	}{
+		{"license caps each subprocess", 64, 64, 4, 32, 4},
+		{"CPU availability also caps threads", 64, 2, 64, 32, 2},
+		{"minimum licensed limit remains positive", 64, 64, 1, 32, 1},
+		{"preserve lower explicit value", 64, 64, 8, 2, 2},
+		{"preserve value below license cap", 64, 64, 64, 8, 8},
+		{"unresolved auto sentinel remains untouched above quota", 64, 2, 64, 0, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			withCores(t, c.machineCores, c.effective)
+			cfg := baseConfig()
+			cfg.Compaction.Threads = c.threads
+
+			applyLicenseCoreLimits(&license.License{MaxCores: c.licensedCores}, cfg)
+
+			if cfg.Compaction.Threads != c.want {
+				t.Errorf("machine=%d effective=%d licensed=%d configured_threads=%d: Compaction.Threads = %d, want %d",
+					c.machineCores, c.effective, c.licensedCores, c.threads, cfg.Compaction.Threads, c.want)
+			}
+			if c.threads > 0 && cfg.Compaction.Threads > c.effective {
+				t.Errorf("Compaction.Threads = %d exceeds effective cores %d", cfg.Compaction.Threads, c.effective)
+			}
+		})
 	}
 }
 
