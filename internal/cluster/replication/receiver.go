@@ -62,6 +62,41 @@ func (f IngestHandlerWithWALFunc) ApplyReplicatedEntryWithWAL(ctx context.Contex
 	return f(ctx, payload, hashes)
 }
 
+// PreparedWALIngest is one independently flushable part of a replicated entry.
+// Payload must describe exactly the records Apply will put in one buffer. Apply
+// takes ownership of its local WAL identities on success; on error it must not
+// leave those identities in a buffer or an in-flight flush.
+type PreparedWALIngest struct {
+	Payload []byte
+	Apply   func(context.Context, []string) error
+}
+
+// WALIngestPreparer determines ownership before the receiver appends local WAL.
+// An ignored entry produces no parts and therefore no orphan sequence-floor pin.
+// Multi-measurement entries produce separate parts, with separate checkpoints.
+type WALIngestPreparer interface {
+	PrepareReplicatedEntry(context.Context, []byte) ([]PreparedWALIngest, error)
+}
+
+type PreparingIngestHandlerFunc func(context.Context, []byte) ([]PreparedWALIngest, error)
+
+func (f PreparingIngestHandlerFunc) PrepareReplicatedEntry(ctx context.Context, payload []byte) ([]PreparedWALIngest, error) {
+	return f(ctx, payload)
+}
+
+func (f PreparingIngestHandlerFunc) ApplyReplicatedEntry(ctx context.Context, payload []byte) error {
+	parts, err := f(ctx, payload)
+	if err != nil {
+		return err
+	}
+	for _, part := range parts {
+		if err := part.Apply(ctx, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ReceiverConfig holds configuration for the replication receiver.
 type ReceiverConfig struct {
 	// ReaderID is this reader's unique identifier
@@ -757,19 +792,55 @@ func (r *Receiver) receiveLoop() {
 // failed entry never reapplies. Both are worse than the brief
 // durability gap we accept here.
 func (r *Receiver) applyEntry(entry *ReplicateEntry) error {
+	if preparer, ok := r.cfg.IngestHandler.(WALIngestPreparer); ok {
+		parts, err := preparer.PrepareReplicatedEntry(r.ctx, entry.Payload)
+		if err != nil {
+			return fmt.Errorf("prepare replicated ingest: %w", err)
+		}
+		for _, part := range parts {
+			if part.Apply == nil {
+				return fmt.Errorf("prepared replicated ingest has no buffer owner")
+			}
+		}
+		for _, part := range parts {
+			if err := r.applyWALPayload(entry.Sequence, part.Payload, part.Apply, true); err != nil {
+				return err
+			}
+		}
+		r.totalEntriesApplied.Add(1)
+		return nil
+	}
+
+	trackedIngest, canTrackIngest := r.cfg.IngestHandler.(WALIdentityIngestHandler)
+	apply := func(ctx context.Context, hashes []string) error {
+		if canTrackIngest {
+			return trackedIngest.ApplyReplicatedEntryWithWAL(ctx, entry.Payload, hashes)
+		}
+		if r.cfg.IngestHandler != nil {
+			return r.cfg.IngestHandler.ApplyReplicatedEntry(ctx, entry.Payload)
+		}
+		return nil
+	}
+	if err := r.applyWALPayload(entry.Sequence, entry.Payload, apply, canTrackIngest); err != nil {
+		return err
+	}
+	r.totalEntriesApplied.Add(1)
+	return nil
+}
+
+func (r *Receiver) applyWALPayload(sequence uint64, payload []byte, apply func(context.Context, []string) error, tracksIngest bool) error {
 	var localWALHashes []string
 	trackedWAL, canTrackWAL := r.cfg.LocalWAL.(trackedWALWriter)
-	trackedIngest, canTrackIngest := r.cfg.IngestHandler.(WALIdentityIngestHandler)
-	trackLocalWAL := canTrackWAL && canTrackIngest
+	trackLocalWAL := canTrackWAL && tracksIngest
 
 	// Write to local WAL first (if configured). A drop on backpressure
 	// is non-fatal — see function doc.
 	if r.cfg.LocalWAL != nil {
 		var err error
 		if trackLocalWAL {
-			localWALHashes, err = trackedWAL.AppendRawTracked(entry.Payload)
+			localWALHashes, err = trackedWAL.AppendRawTracked(payload)
 		} else {
-			err = r.cfg.LocalWAL.AppendRaw(entry.Payload)
+			err = r.cfg.LocalWAL.AppendRaw(payload)
 		}
 		if err != nil {
 			if errors.Is(err, wal.ErrWALDropped) {
@@ -782,8 +853,8 @@ func (r *Receiver) applyEntry(entry *ReplicateEntry) error {
 				last := r.walDropLastLogNano.Load()
 				if now-last >= walDropLogIntervalNano && r.walDropLastLogNano.CompareAndSwap(last, now) {
 					r.logger.Warn().
-						Uint64("sequence", entry.Sequence).
-						Int("payload_size", len(entry.Payload)).
+						Uint64("sequence", sequence).
+						Int("payload_size", len(payload)).
 						Int64("total_dropped", r.totalLocalWALDropped.Load()).
 						Msg("Replication: follower LocalWAL dropped entry on backpressure; applying to ingest buffer anyway (durability via primary + peer Parquet replication)")
 				}
@@ -793,23 +864,14 @@ func (r *Receiver) applyEntry(entry *ReplicateEntry) error {
 		}
 	}
 
-	// Apply to ingest handler (if configured)
-	if r.cfg.IngestHandler != nil {
-		var err error
-		if canTrackIngest {
-			err = trackedIngest.ApplyReplicatedEntryWithWAL(r.ctx, entry.Payload, localWALHashes)
-		} else {
-			err = r.cfg.IngestHandler.ApplyReplicatedEntry(r.ctx, entry.Payload)
+	if err := apply(r.ctx, localWALHashes); err != nil {
+		if trackLocalWAL && len(localWALHashes) > 0 {
+			// Only this rejected part is unowned. Earlier prepared parts may
+			// already be buffered or flushing and must retain their identities.
+			trackedWAL.ForgetTracked(localWALHashes)
 		}
-		if err != nil {
-			if trackLocalWAL && len(localWALHashes) > 0 {
-				trackedWAL.ForgetTracked(localWALHashes)
-			}
-			return fmt.Errorf("apply to ingest: %w", err)
-		}
+		return fmt.Errorf("apply to ingest: %w", err)
 	}
-
-	r.totalEntriesApplied.Add(1)
 	return nil
 }
 

@@ -1097,6 +1097,15 @@ recovery failures. Checkpoints in quarantined WAL files remain part of recovery'
 durability proof, so a later retry does not replay already-flushed entries merely
 because their checkpoint file was renamed.
 
+Replication followers prepare buffer ownership before appending local WAL.
+Ignored payloads no longer leave an unowned identity that prevents reclamation.
+An entry containing multiple measurements gets a separate local WAL payload and
+identity for each buffer, preserving its database envelope. Flushing one
+measurement cannot checkpoint another measurement's pending rows; rejecting a
+later measurement does not release an earlier buffer's identity. Normal
+single-measurement payloads retain their original bytes. Replication sequence
+and acknowledgement semantics are unchanged.
+
 Contributed by [@jallegri](https://github.com/jallegri) in [#1118](https://github.com/Basekick-Labs/arc/pull/1118).
 
 ### The tiering files endpoint rejects an invalid `limit` ([#1135](https://github.com/Basekick-Labs/arc/issues/1135))
