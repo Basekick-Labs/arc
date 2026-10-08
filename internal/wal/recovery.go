@@ -606,15 +606,10 @@ func (r *Recovery) findWALFiles() ([]string, error) {
 		return nil, err
 	}
 
-	// Sort by modification time (oldest first)
-	sort.Slice(walFiles, func(i, j int) bool {
-		infoI, _ := os.Stat(walFiles[i])
-		infoJ, _ := os.Stat(walFiles[j])
-		if infoI == nil || infoJ == nil {
-			return walFiles[i] < walFiles[j]
-		}
-		return infoI.ModTime().Before(infoJ.ModTime())
-	})
+	// WAL names encode their rotation timestamps. Modification times can change
+	// after a copy or repair; using them could reclaim a later checkpoint file
+	// before the earlier data file that still depends on it.
+	sort.Strings(walFiles)
 
 	return walFiles, nil
 }

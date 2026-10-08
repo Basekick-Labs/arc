@@ -1122,6 +1122,11 @@ strikes. Unreadable or unwritable attempt metadata reports an error and retains
 the WAL; quarantine still preserves its original bytes and valid checkpoints.
 The operational guide describes sidecar recovery and cleanup behavior.
 
+Recovery orders ordinary WAL files by their timestamped filenames rather than
+filesystem modification times. Altered or tied mtimes can no longer make it
+reclaim a later checkpoint file before an earlier retained data file, which
+could otherwise cause already-flushed records to be replayed on retry.
+
 Forced maintenance rotation now waits for WAL queue capacity instead of
 returning `ErrWALDropped` and skipping recovery under sustained queue pressure.
 It preserves FIFO ordering and uses a cancellable wait bounded by

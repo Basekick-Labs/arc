@@ -41,6 +41,13 @@ in an earlier file that is still awaiting recovery. Preserve quarantined files
 together with the remaining WAL directory; deleting or moving one away can
 remove the proof that prevents already-flushed records from being replayed.
 
+Recovery visits ordinary WAL files in filename timestamp order, independent of
+filesystem modification times. Copying or repairing a file must not cause a
+later checkpoint file to be reclaimed before an earlier retained data file.
+Keep original WAL filenames when restoring a consistent backup. This ordering
+assumes rotation timestamps increase; it does not establish creation order
+across a backwards wall-clock adjustment or manually renamed files.
+
 ## Rotation while the WAL queue is full
 
 Maintenance rotation waits for space in the same FIFO queue as data appends.
