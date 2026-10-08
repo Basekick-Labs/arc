@@ -36,7 +36,7 @@ func (c *Config) checkParquetReadRootsGlobSafe() error {
 	if c.Storage.Backend == "local" {
 		if err := storage.ValidateGlobSafe(c.Storage.LocalPath); err != nil {
 			return fmt.Errorf("invalid storage.local_path %q: %w; DuckDB reads compaction inputs by "+
-				"interpolating this path into read_parquet(), where a glob metacharacter can match a "+
+				"interpolating this path into a read_parquet scan, where a glob metacharacter can match a "+
 				"different file than the one named. Rename the directory to remove it",
 				c.Storage.LocalPath, err)
 		}
@@ -44,7 +44,7 @@ func (c *Config) checkParquetReadRootsGlobSafe() error {
 	if c.Compaction.Enabled && strings.TrimSpace(c.Compaction.TempDirectory) != "" {
 		if err := storage.ValidateGlobSafe(c.Compaction.TempDirectory); err != nil {
 			return fmt.Errorf("invalid compaction.temp_directory %q: %w; compaction interpolates paths "+
-				"under this directory into read_parquet(), where a glob metacharacter can match a "+
+				"under this directory into a read_parquet scan, where a glob metacharacter can match a "+
 				"different file than the one named. Rename the directory to remove it",
 				c.Compaction.TempDirectory, err)
 		}
