@@ -109,8 +109,18 @@ func TestColdSourceMethodsAreNilSafe(t *testing.T) {
 	if rows, err := nilManager.ColdRows(ctx); err != nil || rows != nil {
 		t.Errorf("nil manager ColdRows = %v, %v, want nil nil", rows, err)
 	}
-	if wrote, err := nilManager.RecordRestoredColdFile(ctx, "db/m/2025/01/01/00/a.parquet", 1); err != nil || wrote {
-		t.Errorf("nil manager RecordRestoredColdFile = %v, %v, want false nil", wrote, err)
+	const nilPath = "db/m/2025/01/01/00/a.parquet"
+	quarantined, failed, err := nilManager.RecordRestoredColdFiles(ctx, map[string]int64{nilPath: 1})
+	if err != nil || len(quarantined) != 0 {
+		t.Errorf("nil manager RecordRestoredColdFiles = %v, %v, %v, want no quarantine and no error", quarantined, failed, err)
+	}
+	// Reported FAILED, not quarantined: a quarantine is a fact tiering
+	// recorded, and a manager with no store has established nothing.
+	if len(failed) != 1 || failed[0] != nilPath {
+		t.Errorf("failed = %v, want the one path back", failed)
+	}
+	if _, failed, err := nilManager.RecordRestoredHotFiles(ctx, map[string]int64{nilPath: 1}); err != nil || len(failed) != 1 {
+		t.Errorf("nil manager RecordRestoredHotFiles failed = %v, err = %v, want the one path back", failed, err)
 	}
 	// A partly-built manager too: config is a pointer, so ColdBackend must
 	// check it before reading Cold.Enabled.
@@ -159,9 +169,9 @@ func TestColdBackendRespectsTheEnabledFlag(t *testing.T) {
 	}
 }
 
-// RecordRestoredColdFile parses the path with tiering's own rule, stamps the
+// RecordRestoredColdFiles parses each path with tiering's own rule, stamps the
 // row now, and writes it as cold.
-func TestRecordRestoredColdFileWritesAColdRow(t *testing.T) {
+func TestRecordRestoredColdFilesWritesAColdRow(t *testing.T) {
 	store, cleanup := setupTestMetadataStore(t)
 	defer cleanup()
 	ctx := context.Background()
@@ -169,9 +179,9 @@ func TestRecordRestoredColdFileWritesAColdRow(t *testing.T) {
 	const path = "db1/cpu/2025/01/01/00/a.parquet"
 
 	before := time.Now().Add(-time.Second)
-	wrote, err := m.RecordRestoredColdFile(ctx, path, 1234)
-	if err != nil || !wrote {
-		t.Fatalf("RecordRestoredColdFile = %v, %v, want true nil", wrote, err)
+	quarantined, failed, err := m.RecordRestoredColdFiles(ctx, map[string]int64{path: 1234})
+	if err != nil || len(quarantined) != 0 || len(failed) != 0 {
+		t.Fatalf("RecordRestoredColdFiles = %v, %v, %v, want all empty", quarantined, failed, err)
 	}
 	got, err := store.GetFile(ctx, path)
 	if err != nil {
@@ -197,7 +207,7 @@ func TestRecordRestoredColdFileWritesAColdRow(t *testing.T) {
 // A HOT row for the same path flips to cold: the restore is authoritative
 // about what it just wrote, and leaving the row hot would make the restored
 // cold object unreadable.
-func TestRecordRestoredColdFileFlipsAHotRow(t *testing.T) {
+func TestRecordRestoredColdFilesFlipsAHotRow(t *testing.T) {
 	store, cleanup := setupTestMetadataStore(t)
 	defer cleanup()
 	ctx := context.Background()
@@ -205,9 +215,9 @@ func TestRecordRestoredColdFileFlipsAHotRow(t *testing.T) {
 	recordAt(t, store, path, "db1", TierHot)
 
 	m := &Manager{metadata: store}
-	wrote, err := m.RecordRestoredColdFile(ctx, path, 99)
-	if err != nil || !wrote {
-		t.Fatalf("RecordRestoredColdFile = %v, %v", wrote, err)
+	quarantined, failed, err := m.RecordRestoredColdFiles(ctx, map[string]int64{path: 99})
+	if err != nil || len(quarantined) != 0 || len(failed) != 0 {
+		t.Fatalf("RecordRestoredColdFiles = %v, %v, %v", quarantined, failed, err)
 	}
 	got, err := store.GetFile(ctx, path)
 	if err != nil {
@@ -279,9 +289,9 @@ func TestRecordRestoredHotFileMovesAColdRow(t *testing.T) {
 	}
 
 	m := &Manager{metadata: store}
-	wrote, err := m.RecordRestoredHotFile(ctx, path, 55)
-	if err != nil || !wrote {
-		t.Fatalf("RecordRestoredHotFile = %v, %v, want true nil", wrote, err)
+	quarantined, failed, err := m.RecordRestoredHotFiles(ctx, map[string]int64{path: 55})
+	if err != nil || len(quarantined) != 0 || len(failed) != 0 {
+		t.Fatalf("RecordRestoredHotFiles = %v, %v, %v, want all empty", quarantined, failed, err)
 	}
 	got, err := store.GetFile(ctx, path)
 	if err != nil {
@@ -299,7 +309,7 @@ func TestRecordRestoredHotFileMovesAColdRow(t *testing.T) {
 }
 
 // And it leaves a quarantined row alone, like its cold counterpart.
-func TestRecordRestoredHotFileLeavesAQuarantinedRowAlone(t *testing.T) {
+func TestRecordRestoredHotFilesLeavesAQuarantinedRowAlone(t *testing.T) {
 	store, cleanup := setupTestMetadataStore(t)
 	defer cleanup()
 	ctx := context.Background()
@@ -310,12 +320,12 @@ func TestRecordRestoredHotFileLeavesAQuarantinedRowAlone(t *testing.T) {
 	}
 
 	m := &Manager{metadata: store}
-	wrote, err := m.RecordRestoredHotFile(ctx, path, 55)
+	quarantined, _, err := m.RecordRestoredHotFiles(ctx, map[string]int64{path: 55})
 	if err != nil {
-		t.Fatalf("RecordRestoredHotFile: %v", err)
+		t.Fatalf("RecordRestoredHotFiles: %v", err)
 	}
-	if wrote {
-		t.Error("reported a write for a quarantined row")
+	if len(quarantined) != 1 || quarantined[0] != path {
+		t.Errorf("quarantined = %v, want the one path reported rather than written", quarantined)
 	}
 	got, _ := store.GetFile(ctx, path)
 	if got.Tier != TierCold {

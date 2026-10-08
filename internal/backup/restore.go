@@ -827,6 +827,24 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 		m.setProgress(progress)
 	}()
 
+	// The tier rows this restore owes, batched (#1141). Flushed on EVERY exit
+	// path, which is deliberately unlike the manifest registration beside it:
+	// reg's pending rows are abandoned on an early return because a failed
+	// restore is re-run and the cluster re-derives its manifest, but a tier
+	// row has no such second chance. The bytes are already in the cold store,
+	// and on a standalone node — or a cluster without shared storage or
+	// replication — nothing ever writes the row, because the cold-metadata
+	// sync does not run there. A file whose bytes landed and whose row was
+	// dropped is unreadable indefinitely.
+	batch := newColdRowBatch()
+	defer func() {
+		m.flushColdRows(ctx, batch, progress)
+		// Published after the counters move: a flush error is a warn-and-count
+		// outcome, and a defer cannot reach the return value, so this snapshot
+		// is the only way an operator sees what the last chunk did.
+		m.setProgress(progress)
+	}()
+
 	for _, leg := range legs {
 		for _, srcPath := range leg.files {
 			select {
@@ -947,33 +965,15 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 				// hot rows anyway. A cold restore reported through it is
 				// dropped silently, twice over.
 				//
-				// So: its own recorder, synchronously, because the tier row is
-				// what makes the file queryable at all and the caller counts
-				// the outcome per file.
-				wrote, err := m.coldSource.RecordRestoredColdFile(ctx, destPath, bytesWritten)
-				switch {
-				case err != nil:
-					// The bytes are in the cold store; only the row is
-					// missing, so the file is not yet queryable. Warn rather
-					// than fail: the rest of the restore is sound, and the
-					// tiering cold sync records the row on a cluster whose
-					// gate runs it. Named so an operator can act.
-					atomic.AddInt64(&progress.ColdRowsNotRecorded, 1)
-					m.logger.Warn().Str("path", destPath).Err(err).
-						Msg("Restored a cold-tier file but could not record its tier row; the bytes are in the cold store and the file is not queryable until a row exists")
-				case !wrote:
-					// A quarantined row: its key is permanently unusable and
-					// tiering has established it can never act on it, so the
-					// restore must not act on it.
-					//
-					// Counted, with a bounded sample on the progress rather
-					// than a log line per file: the tiering cold sync treats
-					// the identical condition the same way, and a restore of
-					// many quarantined paths should not write one line each.
-					atomic.AddInt64(&progress.ColdRestoreQuarantineSkipped, 1)
-				default:
-					atomic.AddInt64(&progress.ColdFilesRestoredToCold, 1)
-				}
+				// So: its own recorder, and a batched one (#1141) — the tier
+				// row is what makes the file queryable at all, and each row
+				// used to be its own transaction, and so its own fsync, on
+				// the one shared SQLite connection.
+				//
+				// Queued AFTER the bytes landed, never before: a flush must
+				// not be able to describe a file that is not there (Cluster
+				// Operations Checklist item 2, applied to tier rows).
+				m.queueColdRow(ctx, batch, destPath, bytesWritten, progress)
 			} else if registrable {
 				// Storage first, then the manifest (Cluster Operations Checklist):
 				// the file is on disk before anything can route a reader to it.
@@ -992,13 +992,42 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 					// recorder, used only here.
 					// coldSource is non-nil here: coldToHot is set only when it
 					// is, in the branch above.
-					if wrote, err := m.coldSource.RecordRestoredHotFile(ctx, destPath, bytesWritten); err != nil {
-						atomic.AddInt64(&progress.ColdRowsNotRecorded, 1)
-						m.logger.Warn().Str("path", destPath).Err(err).
-							Msg("Restored a cold-tier file into hot storage but could not move its tier row to hot; the bytes are here and the measurement may read as empty until the row is corrected")
-					} else if !wrote {
-						atomic.AddInt64(&progress.ColdRestoreQuarantineSkipped, 1)
-					}
+					//
+					// Batched (#1141), so the forced write now happens AFTER
+					// the asynchronous RecordRestoredFile below rather than
+					// before it, possibly much later. Both orders converge on
+					// a hot row: the asynchronous report's upsert is guarded
+					// to rows that already say hot, so it cannot downgrade
+					// anything, and the forced write sets hot
+					// unconditionally. Stated here because it is now an
+					// argument rather than sequential code — anyone changing
+					// either path has to keep it true.
+					//
+					// WHAT THE LAG COSTS, since the batch makes it long
+					// enough to matter: until the row is written it still
+					// says cold with a recent migrated_at, and that is
+					// exactly what ReconcileOrphanedFiles looks for. On a
+					// node with a cold backend CONFIGURED BUT DISABLED —
+					// which is one of the two ways to reach this branch,
+					// because ColdBackend() ANDs the enabled flag — that
+					// sweep is not gated on the flag (tiering manager.go,
+					// where only MigrateTier is) and verifies the cold copy
+					// through GetBackendForTier, which ignores the flag too.
+					// So it can find the hot copy this restore just wrote,
+					// confirm the cold object still exists, and delete the
+					// hot copy and its manifest entry — after which the
+					// forced row lands claiming hot for a file that is gone.
+					// The window was microseconds before this change and is
+					// now up to the rest of the restore.
+					//
+					// Not fixed here, because the defect is the ungated
+					// sweep rather than the batching: with cold disabled that
+					// sweep deletes hot copies whose cold objects the query
+					// path will not read, restore or no restore. Filed
+					// separately; a restore onto a node whose cold tier is
+					// configured but disabled should run with tiering
+					// stopped until it is fixed.
+					m.queueHotRow(ctx, batch, destPath, bytesWritten, progress)
 				}
 				if m.tierRecorder != nil {
 					m.tierRecorder.RecordRestoredFile(destPath, bytesWritten)
@@ -1034,6 +1063,179 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 	}
 
 	return nil
+}
+
+// coldRowBatchSize caps one batch call at the SQLite Review Checklist's
+// number for batched work, which is also the bound the manifest registration
+// beside it uses for Raft ops. The store writes exactly what it is given in
+// ONE transaction, so this is the write-lock hold time an operator is agreeing
+// to: a thousand upserts on the shared connection, rather than one fsync per
+// file for the length of the restore (#1141).
+const coldRowBatchSize = 1000
+
+// coldRowFlushTimeout bounds ONE flush, each of which runs on a context
+// detached from the restore's own (see flushColdRowsTo). Generous because a
+// flush is up to a full chunk against a loaded SQLite file, and bounded so a
+// cancelled restore cannot be held up by more than one of them. It does not
+// need to cover a closed handle: BeginTx then fails at once with
+// "sql: database is closed" rather than waiting.
+const coldRowFlushTimeout = 30 * time.Second
+
+// coldRowBatch is the tier-row side of one restore run (#1141): the rows owed
+// for files already written to the cold tier, and for cold-carried files this
+// node had to put in hot storage instead.
+//
+// Two maps rather than one with a tier field, because they are written by two
+// different statements with two different guards, and a path can only ever be
+// in one of them. Maps rather than slices because every entry is a path with
+// one size, and a repeated path would be one row either way.
+//
+// One accounting consequence of the map: legs are not deduplicated, so the
+// same destPath can be restored twice in one run, and the per-file recorder
+// this replaced counted it twice. A map counts it once per chunk — so the
+// count now depends on where the chunk boundary falls for a run with
+// cross-leg duplicates. The ROW is right either way (last write wins, which
+// is the last object written); only the counter is affected, and counting a
+// path once is the more defensible of the two.
+type coldRowBatch struct {
+	cold map[string]int64
+	hot  map[string]int64
+}
+
+// The maps are allocated on first use: a restore with no tiering, or one with
+// no cold-carried files, never writes either.
+func newColdRowBatch() *coldRowBatch {
+	return &coldRowBatch{}
+}
+
+// queueColdRow adds the row a file just written to the cold tier needs, and
+// flushes when the batch is full.
+//
+// Not quite reg.queue beside it: that one does NOT flush, because its caller
+// pre-checks fits() and flushes BEFORE writing a file that would overflow,
+// which is what gives the registration its "nothing written past a refused
+// batch" property. This adds first and flushes after, because a tier row may
+// only be queued once its bytes are in the store.
+func (m *Manager) queueColdRow(ctx context.Context, batch *coldRowBatch, path string, sizeBytes int64, progress *Progress) {
+	if batch == nil || m.coldSource == nil {
+		return
+	}
+	if batch.cold == nil {
+		batch.cold = make(map[string]int64, coldRowBatchSize)
+	}
+	batch.cold[path] = sizeBytes
+	if len(batch.cold) >= coldRowBatchSize {
+		m.flushColdRowsTo(ctx, batch, progress, true)
+	}
+}
+
+// queueHotRow adds the forced-hot row a cold-carried file needs when this node
+// has no cold tier to put it back in.
+func (m *Manager) queueHotRow(ctx context.Context, batch *coldRowBatch, path string, sizeBytes int64, progress *Progress) {
+	if batch == nil || m.coldSource == nil {
+		return
+	}
+	if batch.hot == nil {
+		batch.hot = make(map[string]int64, coldRowBatchSize)
+	}
+	batch.hot[path] = sizeBytes
+	if len(batch.hot) >= coldRowBatchSize {
+		m.flushColdRowsTo(ctx, batch, progress, false)
+	}
+}
+
+// flushColdRows writes both pending sets. Never returns an error: the bytes
+// are already in storage, the rest of the restore is sound, and the outcome an
+// operator needs is on the progress and in the log.
+func (m *Manager) flushColdRows(ctx context.Context, batch *coldRowBatch, progress *Progress) {
+	m.flushColdRowsTo(ctx, batch, progress, true)
+	m.flushColdRowsTo(ctx, batch, progress, false)
+}
+
+// flushColdRowsTo writes one of the two pending sets and accounts for it per
+// path, which is the whole point of keeping a recorder here rather than
+// reporting through the tier event queue: "41 of 50 written, 9 quarantined" is
+// what an operator can act on, and a batch that collapsed it into one error
+// would be strictly worse than the unbatched version it replaced.
+func (m *Manager) flushColdRowsTo(ctx context.Context, batch *coldRowBatch, progress *Progress, toCold bool) {
+	if batch == nil || m.coldSource == nil {
+		return
+	}
+
+	sizes := batch.cold
+	if !toCold {
+		sizes = batch.hot
+	}
+	if len(sizes) == 0 {
+		return
+	}
+	// Taken, not reused: the set is handed to the recorder, so a later queue
+	// must not be able to add to the map a flush is reporting on. It also means
+	// a flush that fails cannot be retried — the rows are gone from the batch —
+	// which is why the context below is detached rather than the caller's.
+	if toCold {
+		batch.cold = nil
+	} else {
+		batch.hot = nil
+	}
+
+	// DETACHED from the caller's context, at EVERY flush point and not only the
+	// final one. The restore runs under a fixed operation_timeout deadline
+	// (internal/api/backup_routes.go), and a transaction cannot begin or
+	// continue on a dead context — so a deadline landing anywhere inside a
+	// flush would lose that whole chunk of rows, for files whose bytes are
+	// already in the store, with nothing left to retry from. The window is not
+	// small: it is the duration of a full chunk on the single shared
+	// connection, which is the very thing this batching exists to shorten.
+	//
+	// Bounded by its own timeout so a cancelled restore still exits after at
+	// most one flush: the copy loop returns at its next ctx.Done() check, and
+	// the deferred flush is then the only one left.
+	flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), coldRowFlushTimeout)
+	defer cancel()
+
+	submitted := int64(len(sizes))
+	var quarantined, failed []string
+	var err error
+	if toCold {
+		quarantined, failed, err = m.coldSource.RecordRestoredColdFiles(flushCtx, sizes)
+	} else {
+		quarantined, failed, err = m.coldSource.RecordRestoredHotFiles(flushCtx, sizes)
+	}
+
+	if err != nil {
+		// Nothing in the chunk was written — the recorder runs one
+		// transaction per call — so the whole chunk is unrecorded. The bytes
+		// are in storage; only the rows are missing, so those files are not
+		// yet queryable. Warn rather than fail: the rest of the restore is
+		// sound, and on a cluster whose gate runs it the tiering cold sync
+		// records the rows. On a standalone node nothing will.
+		atomic.AddInt64(&progress.ColdRowsNotRecorded, submitted)
+		event := m.logger.Warn().Int64("files", submitted).Err(err)
+		if toCold {
+			event.Msg("Restored cold-tier files but could not record their tier rows; the bytes are in the cold store and those files are not queryable until rows exist")
+		} else {
+			event.Msg("Restored cold-tier files into hot storage but could not move their tier rows to hot; the bytes are here and those measurements may read as empty until the rows are corrected")
+		}
+		return
+	}
+
+	// A quarantined row: the key is permanently unusable and tiering has
+	// established it can never act on it, so the restore must not act on it
+	// either. Counted rather than logged per file, as the tiering cold sync
+	// treats the identical condition.
+	atomic.AddInt64(&progress.ColdRestoreQuarantineSkipped, int64(len(quarantined)))
+	// A path the recorder could not even attempt — it logged why, with a path.
+	// Same unqueryable outcome as a failed write, so the same counter.
+	atomic.AddInt64(&progress.ColdRowsNotRecorded, int64(len(failed)))
+
+	// Only the cold set counts files restored INTO cold. The hot set's own
+	// counter, ColdFilesRestoredToHot, is incremented where the fallback is
+	// decided, before the bytes are written — it counts the routing decision,
+	// not the row.
+	if toCold {
+		atomic.AddInt64(&progress.ColdFilesRestoredToCold, submitted-int64(len(quarantined))-int64(len(failed)))
+	}
 }
 
 // restoreRegistration is the cluster-manifest side of one restore run
