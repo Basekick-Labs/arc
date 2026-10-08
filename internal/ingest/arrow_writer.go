@@ -4639,11 +4639,31 @@ func (b *ArrowBuffer) FlushAll(ctx context.Context) error {
 	return lastErr
 }
 
-// FlushAllAndWait establishes a flush epoch barrier. It fences every earlier
+// NewRecoveryFlushBarrier captures the failure generation BEFORE replay starts.
+// An async replay flush can fail and finish before BeforeDelete is called;
+// waiting for its completion alone cannot prove that its data reached storage.
+// Use one returned barrier for every batch in a recovery pass, then create a
+// new one for the next pass so an older failure does not prevent a healthy retry.
+func (b *ArrowBuffer) NewRecoveryFlushBarrier() func(context.Context) error {
+	generation := b.FlushFailureGeneration()
+	return func(ctx context.Context) error {
+		if err := b.FlushAllAndWait(ctx); err != nil {
+			return err
+		}
+		if current := b.FlushFailureGeneration(); current != generation {
+			return fmt.Errorf("flush failed during WAL recovery (generation %d -> %d); retaining replayed files", generation, current)
+		}
+		return nil
+	}
+}
+
+// FlushAllAndWait establishes a flush completion barrier. It fences every earlier
 // queued or direct flush while holding every shard lock, waits for their
 // storage writes and WAL checkpoints, then snapshots the remaining buffers.
 // Storage I/O for that snapshot runs without shard locks so ingestion can
-// continue. Recovery uses this before deleting replayed WAL files.
+// continue. It returns errors from the snapshot flushes; async failures are
+// recorded in FlushFailureGeneration. Recovery must use NewRecoveryFlushBarrier
+// to cover failures that happen during replay, before this wait begins.
 func (b *ArrowBuffer) FlushAllAndWait(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()

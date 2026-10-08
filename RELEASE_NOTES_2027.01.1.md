@@ -347,6 +347,17 @@ the masker was hardened against in 26.09.1 and 26.09.2.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#937](https://github.com/Basekick-Labs/arc/pull/937).
 
+### Keep replayed WAL files until recovery flushes succeed
+
+WAL recovery now waits for queued and direct flushes before deleting replayed
+files, and retains them if any flush fails during the recovery pass, including
+an asynchronous flush that finishes before the deletion barrier begins. A later
+pass can retry after storage recovers. Periodic cleanup uses the unflushed
+sequence floor instead of file age so a slow flush cannot lose its durable copy
+(#1009, #966).
+
+Contributed by [@jallegri](https://github.com/jallegri) in [#1118](https://github.com/Basekick-Labs/arc/pull/1118).
+
 ### A replica refreshes a file whose manifest content changes while it is being pulled ([#798](https://github.com/Basekick-Labs/arc/issues/798))
 
 The puller deduplicated arrivals by path: a manifest update for a path whose
