@@ -1122,6 +1122,15 @@ strikes. Unreadable or unwritable attempt metadata reports an error and retains
 the WAL; quarantine still preserves its original bytes and valid checkpoints.
 The operational guide describes sidecar recovery and cleanup behavior.
 
+Tracked row recovery now honors `wal.recovery_batch_size`. Durable row-range
+checkpoints let a restart skip the precise persisted portion even after a
+batch-size change; the original entry is checkpointed only after its complete
+flush barrier succeeds. This bounds callback batches, not whole-file decoding
+or total recovery memory. Legacy content-hash entries remain at-least-once.
+Before downgrading to a binary without row-range support, drain recovery with
+this version: older binaries can replay partially completed entries in full.
+See the [restart compatibility guide](docs/operations/wal-recovery.md#bounded-row-replay-and-restart-compatibility).
+
 Retained and quarantined WAL files are not reclaimed by age. The
 [WAL operations guide](docs/operations/wal-recovery.md#reclaiming-retained-and-quarantined-files)
 now documents offline inventory, verified backup, record reconciliation and

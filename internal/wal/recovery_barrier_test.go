@@ -86,7 +86,15 @@ func TestRecoveryBarrierFailureKeepsReplayedWALFile(t *testing.T) {
 }
 
 func TestRecoveryPassesRowEntryIdentityToTrackedCallback(t *testing.T) {
-	dir, _ := writeRecoveryFiles(t, 1)
+	dir := t.TempDir()
+	w := crashRecoveryWriter(t, dir)
+	identities, err := w.AppendTracked([]map[string]interface{}{{"index": 0}})
+	if err != nil || len(identities) != 1 || len(identities[0]) != 32 {
+		t.Fatalf("AppendTracked identities=%v error=%v", identities, err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
 	recovery := NewRecovery(dir, zerolog.Nop())
 	var gotIdentity string
 	var gotRows int
@@ -105,8 +113,8 @@ func TestRecoveryPassesRowEntryIdentityToTrackedCallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RecoverWithOptions: %v", err)
 	}
-	if gotIdentity == "" || gotRows != 1 {
-		t.Fatalf("tracked callback received identity %q and %d rows, want a non-empty identity and one row", gotIdentity, gotRows)
+	if gotIdentity != identities[0] || gotRows != 1 {
+		t.Fatalf("tracked callback received identity %q and %d rows, want original identity %q and one row", gotIdentity, gotRows, identities[0])
 	}
 	if stats.RecoveredFiles != 1 || stats.RecoveredEntries != 1 || stats.RecoveredBatches != 1 {
 		t.Fatalf("recovery stats = %+v, want one recovered row/file/batch", stats)

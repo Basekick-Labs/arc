@@ -15,9 +15,9 @@ import (
 // RecoveryCallback is called for each batch of records during recovery (row format)
 type RecoveryCallback func(ctx context.Context, records []map[string]interface{}) error
 
-// TrackedRecoveryCallback receives the original WAL entry identity so the
-// eventual buffer flush can checkpoint the same entry if the recovery barrier
-// fails and the file must be replayed again.
+// TrackedRecoveryCallback receives an entry identity, or a recovery row-range
+// identity when BatchSize splits a tracked entry. A flush must checkpoint exactly
+// the supplied identity, never the parent of a partially flushed entry.
 type TrackedRecoveryCallback func(ctx context.Context, records []map[string]interface{}, walIdentity string) error
 
 // ColumnarRecoveryCallback is called for columnar WAL entries during recovery.
@@ -59,11 +59,20 @@ type RecoveryOptions struct {
 	// ColumnarCallback handles columnar WAL entries from the zero-copy write path
 	ColumnarCallback ColumnarRecoveryCallback
 
-	// TrackedRowCallback handles row-format entries while preserving the entry's
-	// identity through the buffer flush. When configured, it receives the full
-	// WAL entry at once so a single identity is not split across independent
-	// flush tasks.
+	// TrackedRowCallback handles row-format entries in batches bounded by
+	// BatchSize. Legacy content-hash entries inherit no checkpoint identity.
 	TrackedRowCallback TrackedRecoveryCallback
+
+	// ValidateTrackedRows validates the complete row entry before any of its
+	// batches are submitted. This preserves whole-entry validation when batching.
+	ValidateTrackedRows func([]map[string]interface{}) error
+
+	// CheckpointRecovered checkpoints original parent identities after all of
+	// their row ranges are durable and before deleting their files. Production
+	// callers use Writer.MarkFlushed to release the original pending sequence.
+	// A failure retains the files for retry. Nil is suitable for synchronous
+	// callbacks with no live writer pending identities to release.
+	CheckpointRecovered func([]string) error
 
 	// MinFileAge, when > 0, skips WAL files modified more recently than this.
 	// Defense against the #594 class beyond the SkipActiveFile name match:
@@ -171,6 +180,7 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		path    string
 		entries int
 		batches int
+		parents []string
 	}
 	var pendingDelete []recoveredWALFile
 	pendingRows := 0
@@ -190,6 +200,26 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 				pendingDelete = nil
 				pendingRows = 0
 				return false
+			}
+		}
+		if opts.CheckpointRecovered != nil {
+			var parents []string
+			for _, recovered := range pendingDelete {
+				parents = append(parents, recovered.parents...)
+			}
+			if len(parents) > 0 {
+				err := ctx.Err()
+				if err == nil {
+					err = opts.CheckpointRecovered(parents)
+				}
+				if err != nil {
+					stats.BarrierFailures++
+					stats.KeptFiles += len(pendingDelete)
+					recoveryErr = fmt.Errorf("checkpoint recovered WAL row parents: %w", err)
+					pendingDelete = nil
+					pendingRows = 0
+					return false
+				}
 			}
 		}
 		for index, recovered := range pendingDelete {
@@ -280,6 +310,7 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		}
 	}
 
+	rowCoverage := recoveryRowCoverage(flushed)
 	// Process each WAL file
 	for fileIndex, walFile := range walFiles {
 		select {
@@ -319,6 +350,7 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		allEntriesSucceeded := true
 		fileRecoveredBatches := 0
 		fileRecoveredEntries := 0
+		var fileRecoveredParents []string
 
 		for _, entry := range entries {
 			if len(entry.CheckpointHashes) > 0 {
@@ -356,13 +388,56 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 			} else if entry.Records != nil {
 				// Row-format entry from Append path
 				if opts.TrackedRowCallback != nil {
-					if err := opts.TrackedRowCallback(ctx, entry.Records, entry.PayloadHash); err != nil {
-						r.logger.Error().Err(err).Msg("Failed to replay tracked WAL entry")
-						allEntriesSucceeded = false
+					missing, err := uncoveredRecoveryRows(len(entry.Records), rowCoverage[entry.PayloadHash])
+					if err != nil {
+						stats.KeptFiles += len(pendingDelete) + len(walFiles) - fileIndex
+						return stats, err
+					}
+					if opts.ValidateTrackedRows != nil && len(missing) > 0 {
+						if err := opts.ValidateTrackedRows(entry.Records); err != nil {
+							r.logger.Error().Err(err).Msg("Invalid tracked WAL row entry")
+							allEntriesSucceeded = false
+							break
+						}
+					}
+					tracked := trackedRowIdentity(entry.PayloadHash)
+					split := len(rowCoverage[entry.PayloadHash]) > 0 || (opts.BatchSize > 0 && len(entry.Records) > opts.BatchSize)
+					for _, span := range missing {
+						for start := span.start; start < span.end; {
+							if ctx.Err() != nil {
+								allEntriesSucceeded = false
+								break
+							}
+							end := span.end
+							if opts.BatchSize > 0 && opts.BatchSize < end-start {
+								end = start + opts.BatchSize
+							}
+							identity := ""
+							if tracked {
+								identity = entry.PayloadHash
+								if split {
+									identity = recoveryRowIdentity(identity, start, end)
+								}
+							}
+							if err := opts.TrackedRowCallback(ctx, entry.Records[start:end], identity); err != nil {
+								r.logger.Error().Err(err).Msg("Failed to replay tracked WAL row batch")
+								allEntriesSucceeded = false
+								break
+							}
+							fileRecoveredBatches++
+							fileRecoveredEntries += end - start
+							start = end
+						}
+						if !allEntriesSucceeded {
+							break
+						}
+					}
+					if !allEntriesSucceeded {
 						break
 					}
-					fileRecoveredBatches++
-					fileRecoveredEntries += len(entry.Records)
+					if tracked && split {
+						fileRecoveredParents = append(fileRecoveredParents, entry.PayloadHash)
+					}
 				} else if opts.BatchSize > 0 && len(entry.Records) > opts.BatchSize {
 					for i := 0; i < len(entry.Records); i += opts.BatchSize {
 						end := i + opts.BatchSize
@@ -415,13 +490,13 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		if allEntriesSucceeded && len(entries) > 0 {
 			r.clearReplayFailure(walFile)
 			if fileRecoveredBatches == 0 || opts.BeforeDelete == nil {
-				pendingDelete = append(pendingDelete, recoveredWALFile{path: walFile, entries: fileRecoveredEntries, batches: fileRecoveredBatches})
+				pendingDelete = append(pendingDelete, recoveredWALFile{path: walFile, entries: fileRecoveredEntries, batches: fileRecoveredBatches, parents: fileRecoveredParents})
 				if !flushPending() {
 					stats.KeptFiles += len(walFiles) - fileIndex - 1
 					break
 				}
 			} else {
-				pendingDelete = append(pendingDelete, recoveredWALFile{path: walFile, entries: fileRecoveredEntries, batches: fileRecoveredBatches})
+				pendingDelete = append(pendingDelete, recoveredWALFile{path: walFile, entries: fileRecoveredEntries, batches: fileRecoveredBatches, parents: fileRecoveredParents})
 				pendingRows += fileRecoveredEntries
 				rowsReached := opts.BarrierBatchRows > 0 && pendingRows >= opts.BarrierBatchRows
 				if len(pendingDelete) >= barrierBatchFiles || rowsReached {

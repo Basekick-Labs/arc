@@ -1158,14 +1158,16 @@ func main() {
 		// for the PERIODIC flush-failure recovery below, where ingest (and
 		// therefore rotation) is live during the scan.
 		recoveryStats, err := walRecovery.RecoverWithOptions(context.Background(), recoveryCallback, &wal.RecoveryOptions{
-			SkipActiveFile:     startupActiveFile,
-			BatchSize:          cfg.WAL.RecoveryBatchSize,
-			ColumnarCallback:   columnarCallback,
-			TrackedRowCallback: createTrackedWALRecoveryCallback(arrowBuffer, logger.Get("wal-recovery")),
-			BeforeDelete:       arrowBuffer.NewRecoveryFlushBarrier(),
-			BarrierBatchFiles:  16,
-			BarrierBatchRows:   cfg.Ingest.MaxBufferSize,
-			MaxReplayFailures:  3,
+			SkipActiveFile:      startupActiveFile,
+			BatchSize:           cfg.WAL.RecoveryBatchSize,
+			ColumnarCallback:    columnarCallback,
+			TrackedRowCallback:  createTrackedWALRecoveryCallback(arrowBuffer, logger.Get("wal-recovery")),
+			ValidateTrackedRows: validateTrackedWALRecoveryRows,
+			CheckpointRecovered: walWriter.MarkFlushed,
+			BeforeDelete:        arrowBuffer.NewRecoveryFlushBarrier(),
+			BarrierBatchFiles:   16,
+			BarrierBatchRows:    cfg.Ingest.MaxBufferSize,
+			MaxReplayFailures:   3,
 		})
 		recoveryNeedsRetry := err != nil
 		if err != nil {
@@ -1282,6 +1284,8 @@ func main() {
 							BatchSize:                  cfg.WAL.RecoveryBatchSize,
 							ColumnarCallback:           columnarCallback,
 							TrackedRowCallback:         createTrackedWALRecoveryCallback(arrowBuffer, walLogger),
+							ValidateTrackedRows:        validateTrackedWALRecoveryRows,
+							CheckpointRecovered:        walWriter.MarkFlushed,
 							BeforeDelete:               arrowBuffer.NewRecoveryFlushBarrier(),
 							BarrierBatchFiles:          16,
 							BarrierBatchRows:           cfg.Ingest.MaxBufferSize,
@@ -4844,43 +4848,58 @@ func createWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolo
 	}
 }
 
-// createTrackedWALRecoveryCallback restores a row-format WAL entry as one
-// columnar buffer write and carries its identity through the eventual flush.
-// This lets a later recovery pass skip the entry if the previous pass flushed
-// it but could not complete its file-delete barrier.
+func trackedWALRowTarget(rec map[string]interface{}) (database, measurement string) {
+	for _, key := range []string{"_measurement", "measurement", "m"} {
+		measurement, _ = rec[key].(string)
+		if measurement != "" {
+			break
+		}
+	}
+	for _, key := range []string{"_database", "database"} {
+		database, _ = rec[key].(string)
+		if database != "" {
+			break
+		}
+	}
+	if database == "" {
+		database = "default"
+	}
+	return
+}
+
+// Validate before splitting: a boundary must not hide an invalid mixed-target
+// entry or allow an earlier chunk to be accepted before a missing target.
+func validateTrackedWALRecoveryRows(records []map[string]interface{}) error {
+	var database, measurement string
+	for i, rec := range records {
+		rowDatabase, rowMeasurement := trackedWALRowTarget(rec)
+		if rowMeasurement == "" {
+			return fmt.Errorf("WAL row %d has no measurement", i)
+		}
+		if i == 0 {
+			database, measurement = rowDatabase, rowMeasurement
+		} else if database != rowDatabase || measurement != rowMeasurement {
+			return fmt.Errorf("WAL row entry spans multiple databases or measurements")
+		}
+	}
+	return nil
+}
+
+// createTrackedWALRecoveryCallback restores one bounded row batch as a columnar
+// buffer write. Its identity covers exactly this batch, allowing a later pass
+// to skip durable ranges even if the file-delete barrier did not complete.
 func createTrackedWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolog.Logger) wal.TrackedRecoveryCallback {
 	return func(ctx context.Context, records []map[string]interface{}, walIdentity string) error {
 		if len(records) == 0 {
 			return nil
 		}
 
-		var database, measurement string
+		if err := validateTrackedWALRecoveryRows(records); err != nil {
+			return err
+		}
+		database, measurement := trackedWALRowTarget(records[0])
 		columns := make(map[string][]interface{})
 		for rowIndex, rec := range records {
-			rowMeasurement, _ := rec["_measurement"].(string)
-			if rowMeasurement == "" {
-				rowMeasurement, _ = rec["measurement"].(string)
-			}
-			if rowMeasurement == "" {
-				rowMeasurement, _ = rec["m"].(string)
-			}
-			if rowMeasurement == "" {
-				return fmt.Errorf("WAL row %d has no measurement", rowIndex)
-			}
-
-			rowDatabase, _ := rec["_database"].(string)
-			if rowDatabase == "" {
-				rowDatabase, _ = rec["database"].(string)
-			}
-			if rowDatabase == "" {
-				rowDatabase = "default"
-			}
-			if rowIndex == 0 {
-				database, measurement = rowDatabase, rowMeasurement
-			} else if database != rowDatabase || measurement != rowMeasurement {
-				return fmt.Errorf("WAL row entry spans multiple databases or measurements")
-			}
-
 			for key, value := range rec {
 				switch key {
 				case "_measurement", "measurement", "m", "_database", "database":
@@ -4913,8 +4932,8 @@ func createColumnarRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger z
 		}
 		// Inherit the replayed entry's identity: one columnar entry becomes
 		// exactly one buffer write, so a checkpoint for it covers precisely
-		// these records. The row-format callback above deliberately does NOT
-		// inherit — it fans one entry out into one write per record.
+		// these records. Row batches instead inherit their precise row-range
+		// identities when recovery splits an entry.
 		if err := arrowBuffer.WriteColumnarDirectReplay(ctx, database, measurement, columns, walIdentity); err != nil {
 			walLogger.Error().Err(err).Str("database", database).Str("measurement", measurement).Msg("Failed to replay columnar WAL entry")
 			return err

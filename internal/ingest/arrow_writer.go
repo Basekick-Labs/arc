@@ -1963,12 +1963,18 @@ func (b *ArrowBuffer) writeColumnarDirectWithHashes(ctx context.Context, databas
 // duplicates. Inheriting the identity means the eventual flush checkpoints the
 // ORIGINAL entry, and the next pass skips it.
 //
-// Pass the empty string to inherit nothing. Callers MUST do that unless the
-// identity covers exactly the records in this call: the row-format recovery
-// callback explodes one WAL entry into one call per record, so checkpointing
-// the entry when only some of those calls flush would mark data durable that
-// was discarded. See cmd/arc's recovery callbacks.
+// Pass the empty string to inherit nothing. The identity must cover exactly
+// the records in this call. Bounded row replay supplies a versioned row-range
+// identity; checkpointing its parent before all ranges flush would lose data.
 func (b *ArrowBuffer) WriteColumnarDirectReplay(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string) error {
+	if _, start, end, ok := wal.ParseRecoveryRowIdentity(walIdentity); ok {
+		for _, column := range columns {
+			if len(column) != end-start {
+				return fmt.Errorf("replayed WAL row range length %d does not match column length %d", end-start, len(column))
+			}
+		}
+		return b.writeColumnarDirectWithHashes(ctx, database, measurement, columns, []string{walIdentity})
+	}
 	return b.writeColumnarDirect(ctx, database, measurement, columns, walIdentity)
 }
 

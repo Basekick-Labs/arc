@@ -41,6 +41,40 @@ in an earlier file that is still awaiting recovery. Preserve quarantined files
 together with the remaining WAL directory; deleting or moving one away can
 remove the proof that prevents already-flushed records from being replayed.
 
+## Bounded row replay and restart compatibility
+
+`wal.recovery_batch_size` limits the number of row-format records passed to
+each recovery callback, including the tracked callback used at startup and
+during maintenance. Zero leaves that callback unbounded. The complete row
+entry is validated before any batch is submitted. This setting does not split
+columnar WAL entries, and the reader still decodes a whole WAL file before
+replay: it is **not a cap on total recovery memory**.
+
+When a tracked row entry is split, each buffer write carries a checkpoint for
+its precise half-open row range, encoded as
+`arc:rows:v1:<32-hex-parent-identity>:<start>:<end>` in the existing checkpoint
+string list. A durable range is excluded from the next replay even if the
+batch size changes. The parent is checkpointed only after all missing ranges
+have been submitted and the flush barrier succeeds. A failed parent checkpoint
+keeps the source WAL for retry and leaves the writer's pending sequence pinned.
+As with ordinary replay, a storage write followed by a failed checkpoint can
+still be replayed; this is not an exactly-once transaction across storage and WAL.
+
+Legacy entries identified only by a content hash do not inherit row-range
+checkpoints: identical payloads may be distinct writes. They respect the batch
+bound but retain their existing at-least-once recovery behavior. Preserve the
+whole WAL/checkpoint set, including quarantined files, when moving or backing
+up an interrupted recovery.
+
+**Downgrade:** older binaries can read the checkpoint list but do not interpret
+row-range identities. They can replay a partially recovered entry in full,
+duplicating the already-durable portion. Before downgrading, divert input and
+finish recovery with a range-aware binary until original parent checkpoints
+are durable and the source files have been reclaimed. If that drain cannot
+complete, retain this binary and the complete WAL set or restore a consistent
+paired WAL/storage snapshot; do not perform a blind rollback onto storage that
+has advanced.
+
 ## Reclaiming retained and quarantined files
 
 There is no age-based fallback for retained files. A file's age, a successful
