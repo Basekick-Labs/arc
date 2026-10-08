@@ -276,7 +276,15 @@ func (f *fakeBackend) Delete(ctx context.Context, path string) error {
 }
 
 func (f *fakeBackend) List(ctx context.Context, prefix string) ([]string, error) {
-	panic("not used")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	paths := make([]string, 0)
+	for key := range f.files {
+		if strings.HasPrefix(key, prefix) {
+			paths = append(paths, key)
+		}
+	}
+	return paths, nil
 }
 
 func (f *fakeBackend) Exists(ctx context.Context, path string) (bool, error) {
@@ -511,6 +519,32 @@ func waitStats(t *testing.T, p *Puller, pred func(map[string]int64) bool) map[st
 }
 
 // --- Tests ---------------------------------------------------------------
+
+func TestReconcileReplicatedMaterializationRetiresMatchingCopy(t *testing.T) {
+	backend := newFakeBackend()
+	replicated := "testdb/cpu/2026/04/11/14/cpu_replicated_abc123_20261007_120000_000000000.parquet"
+	canonical := "testdb/cpu/2026/04/11/14/cpu_20261007_120001_000000000.parquet"
+	if err := backend.Write(context.Background(), replicated, []byte("replica")); err != nil {
+		t.Fatalf("write replicated file: %v", err)
+	}
+	if err := backend.Write(context.Background(), canonical, []byte("canonical")); err != nil {
+		t.Fatalf("write canonical file: %v", err)
+	}
+
+	p := newTestPuller(t, backend, newFakeFetcher(fakeFetchResult{}), staticResolver{nodeID: "writer-1", ok: true})
+
+	p.reconcileReplicatedMaterialization(zerolog.Nop(), &raft.FileEntry{
+		Path:        canonical,
+		ContentHash: "abc123",
+	})
+
+	if _, err := backend.StatFile(context.Background(), replicated); err != nil {
+		t.Fatalf("stat replicated file: %v", err)
+	}
+	if size, err := backend.StatFile(context.Background(), replicated); err != nil || size != -1 {
+		t.Fatalf("replicated materialisation still exists: size=%d err=%v", size, err)
+	}
+}
 
 func TestPullerHappyPath(t *testing.T) {
 	backend := newFakeBackend()

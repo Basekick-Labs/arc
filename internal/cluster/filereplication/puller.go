@@ -16,6 +16,8 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"path"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -791,6 +793,41 @@ func (p *Puller) recordPulledFile(path string, sizeBytes int64) {
 func (p *Puller) recordAbandonedFile(path string, sizeBytes int64) {
 	if p.cfg.RecordAbandonedFile != nil {
 		p.cfg.RecordAbandonedFile(path, sizeBytes)
+	}
+}
+
+// reconcileReplicatedMaterialization retires the query-visible local materialisation
+// created by WAL replication once the canonical primary file carrying the same
+// logical payload identity has arrived. Replicated paths embed the identity so this
+// remains a cheap directory listing rather than reading the canonical Parquet file.
+func (p *Puller) reconcileReplicatedMaterialization(log zerolog.Logger, entry *raft.FileEntry) {
+	if entry.ContentHash == "" {
+		return
+	}
+	dir := path.Dir(entry.Path)
+	prefix := dir + "/"
+	paths, err := p.cfg.Backend.List(p.ctx, prefix)
+	if err != nil {
+		log.Warn().Err(err).Str("prefix", prefix).Msg("Failed to list replicated materialisations for reconciliation")
+		return
+	}
+	marker := "_replicated_" + entry.ContentHash + "_"
+	for _, candidate := range paths {
+		base := path.Base(candidate)
+		if !strings.Contains(base, marker) {
+			continue
+		}
+		sizeBytes, statErr := p.cfg.Backend.StatFile(p.ctx, candidate)
+		if statErr != nil {
+			log.Warn().Err(statErr).Str("path", candidate).Msg("Failed to stat replicated materialisation during reconciliation")
+			continue
+		}
+		if err := p.cfg.Backend.Delete(p.ctx, candidate); err != nil {
+			log.Error().Err(err).Str("path", candidate).Str("canonical_path", entry.Path).Msg("Failed to retire replicated materialisation after canonical file arrived")
+			continue
+		}
+		p.recordAbandonedFile(candidate, sizeBytes)
+		log.Info().Str("path", candidate).Str("canonical_path", entry.Path).Msg("Retired replicated materialisation after canonical file arrived")
 	}
 }
 
@@ -1584,6 +1621,7 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 				// pullOnce rejects a short body, and the bytes were verified
 				// against the manifest checksum. A rewrite landing between
 				// here and the write is corrected by the next pull.
+				p.reconcileReplicatedMaterialization(log, entry)
 				p.recordPulledFile(entry.Path, entry.SizeBytes)
 				pulledFromPeer = true
 				succeeded = true // Signal to processEntry's defer to clear any prior catch-up failure for this path.

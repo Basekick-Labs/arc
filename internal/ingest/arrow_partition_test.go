@@ -210,7 +210,7 @@ func TestGenerateStoragePath(t *testing.T) {
 	buffer := &ArrowBuffer{}
 
 	testTime := time.Date(2024, 11, 25, 16, 30, 45, 0, time.UTC)
-	path := buffer.generateStoragePath("mydb", "cpu", testTime)
+	path := buffer.generateStoragePath("mydb", "cpu", testTime, false, "")
 
 	// Should contain the date/hour from the partition time
 	expectedPrefix := "mydb/cpu/2024/11/25/16/"

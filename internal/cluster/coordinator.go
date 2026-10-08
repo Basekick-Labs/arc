@@ -3,7 +3,9 @@ package cluster
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -4915,7 +4917,8 @@ func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler 
 						}
 					}
 					if len(typedColumns) > 0 {
-						return buf.WriteColumnarDirectNoWAL(ctx, database, measurement, typedColumns)
+						payloadHash := sha256.Sum256(msgpackData)
+						return buf.WriteColumnarDirectNoWALReplicated(ctx, database, measurement, typedColumns, hex.EncodeToString(payloadHash[:]))
 					}
 				}
 			}
@@ -4940,7 +4943,8 @@ func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler 
 			for measurement, rows := range byMeasurement {
 				columns := rowsToColumns(rows)
 				if len(columns) > 0 {
-					if err := buf.WriteColumnarDirectNoWAL(ctx, database, measurement, columns); err != nil {
+					payloadHash := sha256.Sum256(msgpackData)
+					if err := buf.WriteColumnarDirectNoWALReplicated(ctx, database, measurement, columns, hex.EncodeToString(payloadHash[:])); err != nil {
 						return fmt.Errorf("write replicated rows for %s: %w", measurement, err)
 					}
 				}
@@ -5786,6 +5790,31 @@ func (c *Coordinator) GetFileManifest() []*raft.FileEntry {
 		return nil
 	}
 	return fsm.GetAllFiles()
+}
+
+// ReconcileReplicatedFile retires a query-visible replica materialisation when
+// the canonical origin file is already present in the manifest. The inverse
+// ordering (replica first, canonical later) is handled by Puller.
+func (c *Coordinator) ReconcileReplicatedFile(path, contentHash string) {
+	if contentHash == "" || c.storage == nil {
+		return
+	}
+	for _, entry := range c.GetFileManifest() {
+		if entry == nil || entry.Path == path || entry.ContentHash != contentHash {
+			continue
+		}
+		sizeBytes, err := c.storage.StatFile(context.Background(), path)
+		if err != nil || sizeBytes < 0 {
+			return
+		}
+		if err := c.storage.Delete(context.Background(), path); err != nil {
+			c.logger.Error().Err(err).Str("path", path).Str("canonical_path", entry.Path).Msg("Failed to retire replicated materialisation after canonical manifest match")
+			return
+		}
+		c.recordUnlinkedFileInTiering(path, "replication:canonical-content-match", sizeBytes)
+		c.logger.Info().Str("path", path).Str("canonical_path", entry.Path).Msg("Retired replicated materialisation after canonical manifest match")
+		return
+	}
 }
 
 // GetFileManifestPaginated returns a page of files from the Raft FSM using

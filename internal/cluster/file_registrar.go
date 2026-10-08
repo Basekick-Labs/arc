@@ -88,6 +88,7 @@ type fileRegistration struct {
 	partitionTime time.Time
 	sizeBytes     int64
 	sha256        string // hex-encoded SHA-256 of the Parquet bytes
+	contentHash   string // logical identity of the WAL payload set represented by this file
 }
 
 // NewCoordinatorFileRegistrar creates a new registrar backed by the coordinator.
@@ -310,7 +311,15 @@ func (r *CoordinatorFileRegistrar) drain(pending []fileRegistration) (applied, l
 // sha256 is a hex-encoded SHA-256 of the Parquet file bytes. The caller
 // (arrow_writer.go flush path) computes it on the in-memory buffer before the
 // storage backend write, so it's effectively free.
+type ContentHashFileRegistrar interface {
+	RegisterFileWithContentHash(database, measurement, path string, partitionTime time.Time, sizeBytes int64, sha256, contentHash string)
+}
+
 func (r *CoordinatorFileRegistrar) RegisterFile(database, measurement, path string, partitionTime time.Time, sizeBytes int64, sha256 string) {
+	r.RegisterFileWithContentHash(database, measurement, path, partitionTime, sizeBytes, sha256, "")
+}
+
+func (r *CoordinatorFileRegistrar) RegisterFileWithContentHash(database, measurement, path string, partitionTime time.Time, sizeBytes int64, sha256, contentHash string) {
 	reg := fileRegistration{
 		database:      database,
 		measurement:   measurement,
@@ -318,6 +327,7 @@ func (r *CoordinatorFileRegistrar) RegisterFile(database, measurement, path stri
 		partitionTime: partitionTime,
 		sizeBytes:     sizeBytes,
 		sha256:        sha256,
+		contentHash:   contentHash,
 	}
 	if r.stopping.Load() {
 		r.dropped(path, "File registrar stopped; cluster manifest entry dropped (nothing re-registers it)")
@@ -373,6 +383,7 @@ func (r *CoordinatorFileRegistrar) entry(reg fileRegistration) raft.FileEntry {
 	return raft.FileEntry{
 		Path:          reg.path,
 		SHA256:        reg.sha256,
+		ContentHash:   reg.contentHash,
 		SizeBytes:     reg.sizeBytes,
 		Database:      reg.database,
 		Measurement:   reg.measurement,
