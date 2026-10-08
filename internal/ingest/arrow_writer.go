@@ -2360,6 +2360,9 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 						Str("measurement", record.Measurement).
 						Int("payload_size", len(record.RawPayload))
 				})
+				if errors.Is(err, wal.ErrWALDiskPressure) {
+					return err
+				}
 			}
 		} else {
 			// FALLBACK: Convert columnar to row format for WAL storage
@@ -2384,6 +2387,9 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 							Str("measurement", record.Measurement).
 							Int("records", len(walRecords))
 					})
+					if errors.Is(err, wal.ErrWALDiskPressure) {
+						return err
+					}
 				}
 			}
 		}
