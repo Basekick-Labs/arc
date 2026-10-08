@@ -6,12 +6,11 @@
 #   base                 — boot 3 writers + 1 reader, ingest N records via
 #                          Traefik LB, query through reader, assert count.
 #   non-leader-crash     — same, but kill a non-leader writer mid-ingest.
-#                          Asserts: writes that succeeded HTTP-side are
-#                          all queryable; LB drained the dead writer.
+#                          Restarts the writer after ingest and asserts that
+#                          every HTTP-success record is queryable.
 #   leader-crash         — same, but kill the current Raft leader mid-ingest.
-#                          Asserts: Raft elects a new leader within a few
-#                          seconds; writes continue; succeeded writes are
-#                          all queryable.
+#                          Restarts it after ingest and asserts that every
+#                          HTTP-success record is queryable.
 #
 # What this validates end-to-end (from PR1a):
 #   - cluster.shared_storage_mode=true accepted by startup validation
@@ -44,7 +43,7 @@ cd "$(dirname "$0")"
 # ---------- config ----------
 SCENARIO="${SCENARIO:-base}"
 RECORDS="${RECORDS:-1000}"
-TRAEFIK_URL="http://localhost:8000"
+TRAEFIK_URL="${TRAEFIK_URL:-http://localhost:8000}"
 # Database name includes a per-run epoch so re-running the smoke doesn't
 # collide with leftover state in the shared SeaweedFS bucket (the bucket
 # persists across `docker compose down -v` runs because volume-cleanup
@@ -306,6 +305,10 @@ esac
 # Records at which point we'll kill the target (crash scenarios).
 KILL_AT=$(python3 -c "print(int($RECORDS * $CRASH_AT_FRACTION))")
 
+# Track the IDs belonging to successful requests; failed requests can persist too.
+ACK_RANGES=$(mktemp)
+trap 'rm -f "$ACK_RANGES"' EXIT
+
 # ---------- write phase ----------
 log "writing $RECORDS records via Traefik LB"
 [[ "$SCENARIO" != "base" ]] && log "  (will kill $KILL_TARGET at record $KILL_AT)"
@@ -333,6 +336,11 @@ while [[ $WRITTEN_SENT -lt $RECORDS ]]; do
   # Crash trigger
   if [[ "$SCENARIO" != "base" && "$KILLED" == "false" && $WRITTEN_SENT -ge $KILL_AT ]]; then
     log "  >>> killing $KILL_TARGET at record $WRITTEN_SENT"
+    target_records=$(docker exec "$KILL_TARGET" curl -fsS http://localhost:8000/metrics \
+      | awk '$1 == "arc_ingest_records_total" {print $2}')
+    if ! python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)' "$target_records"; then
+      fail "$KILL_TARGET has accepted no records; refusing an idle-writer crash test"
+    fi
     docker kill "$KILL_TARGET" >/dev/null
     KILLED=true
   fi
@@ -345,6 +353,7 @@ while [[ $WRITTEN_SENT -lt $RECORDS ]]; do
        -H "Authorization: Bearer $ADMIN_TOKEN" \
        -H "x-arc-database: $DATABASE" \
        --data-binary "$lines" >/dev/null 2>&1; then
+    printf '%s %s\n' "$WRITTEN_SENT" "$this_batch" >> "$ACK_RANGES"
     WRITTEN_OK=$(( WRITTEN_OK + this_batch ))
   else
     WRITE_ERRORS=$(( WRITE_ERRORS + 1 ))
@@ -379,79 +388,38 @@ for c in arc-writer1 arc-writer2 arc-writer3; do
   log "  $c: arc_ingest_records_total = ${metric:-?}"
 done
 
+# ---------- restart crashed writer and wait for WAL replay ----------
+if [[ "$SCENARIO" != "base" ]]; then
+  [[ "$KILLED" == "true" ]] || fail "crash was never triggered; increase RECORDS or lower CRASH_AT_FRACTION"
+  log "restarting $KILL_TARGET and waiting for WAL replay"
+  docker start "$KILL_TARGET" >/dev/null || fail "could not restart $KILL_TARGET"
+  if ! wait_ready "$KILL_TARGET"; then
+    docker compose "${COMPOSE_FILES[@]}" logs --tail=80 "$KILL_TARGET" || true
+    fail "$KILL_TARGET did not become ready after restart within ${READY_TIMEOUT_S}s"
+  fi
+  ok "$KILL_TARGET ready after WAL replay"
+fi
+
 # ---------- wait for flush + manifest replication ----------
 log "waiting ${FLUSH_WAIT_S}s for flush + manifest replication"
 sleep "$FLUSH_WAIT_S"
 
 # ---------- query phase ----------
 log "querying via reader"
-RESPONSE=$(curl -fsS -X POST "$TRAEFIK_URL/api/v1/query" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "x-arc-database: $DATABASE" \
-  -H "Content-Type: application/json" \
-  -d "{\"sql\": \"SELECT COUNT(*) AS n FROM $MEASUREMENT\"}" \
-  || fail "query")
-
-ACTUAL=$(echo "$RESPONSE" | python3 -c '
-import json, sys
-try:
-    d = json.load(sys.stdin)
-    # Arc native response: {"columns": ["n"], "data": [[1000]], ...}
-    # Older/dict-row shape: {"data": [{"n": 1000}], ...}
-    data = d.get("data") or []
-    if data and isinstance(data[0], list):
-        print(data[0][0])
-    elif data and isinstance(data[0], dict):
-        row = data[0]
-        print(row.get("n") or row.get("COUNT(*)") or list(row.values())[0])
-    else:
-        print("0")
-except Exception as e:
-    sys.stderr.write(f"parse error: {e}\n")
-    print("0")
-' 2>/dev/null || echo "0")
-
-log "query returned: $ACTUAL records"
+COUNTS=$(ADMIN_TOKEN="$ADMIN_TOKEN" python3 smoke_coverage.py \
+  "$TRAEFIK_URL" "$DATABASE" "$MEASUREMENT" "$SCENARIO" "$RECORDS" "$ACK_RANGES") \
+  || fail "record coverage"
+IFS=$'\t' read -r ACTUAL DISTINCT_ACTUAL <<<"$COUNTS"
+log "query returned: $ACTUAL records ($DISTINCT_ACTUAL distinct hosts)"
 log "  HTTP-success during write: $WRITTEN_OK"
 log "  HTTP-error during write:   $(( WRITTEN_SENT - WRITTEN_OK ))"
-
-# ---------- scenario-specific assertions ----------
-case "$SCENARIO" in
-  base)
-    if [[ "$ACTUAL" != "$RECORDS" ]]; then
-      log "  expected: $RECORDS"
-      log "  got:      $ACTUAL"
-      fail "base scenario: record count mismatch (no crash should mean exact match)"
-    fi
-    ok "base scenario: exact count match ($ACTUAL == $RECORDS)"
-    ;;
-  non-leader-crash|leader-crash)
-    # Crash scenarios: every record whose HTTP POST succeeded must be
-    # queryable (the load-bearing durability invariant). The reverse —
-    # ACTUAL > WRITTEN_OK — can legitimately happen too: docker kill
-    # can RST the TCP connection AFTER the writer has already PUT the
-    # parquet to S3, so the client sees a connection error (record not
-    # counted toward WRITTEN_OK) but the record IS queryable. That's
-    # not a duplicate-insert bug — it's a race between TCP teardown
-    # and S3 flush, and it's the kind of edge case operators should
-    # know about. Log informationally, don't fail.
-    if [[ "$ACTUAL" -lt "$WRITTEN_OK" ]]; then
-      log "  HTTP-success: $WRITTEN_OK"
-      log "  queryable:    $ACTUAL"
-      log "  missing:      $(( WRITTEN_OK - ACTUAL ))"
-      fail "$SCENARIO: records lost AFTER successful HTTP response (durability violation)"
-    fi
-    if [[ "$ACTUAL" -gt "$WRITTEN_OK" ]]; then
-      log "  HTTP-success: $WRITTEN_OK"
-      log "  queryable:    $ACTUAL"
-      log "  extra:        $(( ACTUAL - WRITTEN_OK ))"
-      log "  note: docker-kill RST'd the client connection after the writer"
-      log "  had already flushed to S3 — record counted-as-lost client-side"
-      log "  but is durably stored. Not a duplicate; not a violation."
-    fi
-    ok "$SCENARIO: durability OK ($ACTUAL >= $WRITTEN_OK; in-flight loss tolerated)"
-    ;;
-esac
+if [[ "$SCENARIO" == "base" ]]; then
+  ok "base scenario: exact count match ($ACTUAL == $RECORDS)"
+else
+  ok "$SCENARIO: all $WRITTEN_OK acknowledged hosts are queryable"
+  log "  extra distinct hosts from failed requests: $(( DISTINCT_ACTUAL - WRITTEN_OK ))"
+  log "  duplicate rows (allowed before compaction): $(( ACTUAL - DISTINCT_ACTUAL ))"
+fi
 
 # ---------- teardown ----------
 log "smoke passed; tearing down"
@@ -465,4 +433,6 @@ log "  HTTP errors:     $(( WRITTEN_SENT - WRITTEN_OK ))"
 log "  queryable:       $ACTUAL"
 log "  ingest duration: ${ELAPSED}s"
 log "  flush wait:      ${FLUSH_WAIT_S}s"
-[[ -n "$KILL_TARGET" ]] && log "  kill target:     $KILL_TARGET (killed at record $KILL_AT)"
+if [[ -n "$KILL_TARGET" ]]; then
+  log "  kill target:     $KILL_TARGET (killed at record $KILL_AT)"
+fi

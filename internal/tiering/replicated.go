@@ -172,6 +172,215 @@ func (m *Manager) DatabaseHasTierRows(ctx context.Context, database string) (boo
 	return len(tiers) > 0, nil
 }
 
+// CountColdFilesByDatabase reports how many cold-tier files this node's tier
+// metadata holds, grouped by database (#1085 stage B3): one grouped query.
+// It is how a backup records the files it is NOT carrying, since cold-tier
+// objects are not backed up yet. Implements backup.ColdCounter. Nil-receiver
+// safe like the reports above; a nil manager holds no tier rows.
+//
+// No m.mu: the call touches no in-memory state and *sql.DB is thread-safe, so
+// taking the mutex would only block concurrent tier readers across DB I/O.
+//
+// This is THIS NODE's view. On a cluster where only the primary migrates, a
+// node's cold rows arrive through syncColdTierMetadata, so a node whose sync
+// has not run yet — or whose last one failed — holds fewer rows than the
+// cluster has cold files, and answers that lower number without an error. The
+// caller is expected to say whose view it is reporting.
+func (m *Manager) CountColdFilesByDatabase(ctx context.Context) (map[string]int64, error) {
+	if m == nil || m.metadata == nil {
+		return nil, nil
+	}
+	return m.metadata.CountFilesInTierByDatabase(ctx, TierCold)
+}
+
+// ColdBackend is the cold-tier store, or nil when this node has none (#1086
+// stage C). It is how a backup reads cold objects and how a restore writes
+// them back. Implements backup.ColdSource together with the two below.
+//
+// ANDs config.Cold.Enabled. A backup that walked a disabled cold tier would
+// carry objects the query path refuses to read, because GetGlobPathsForQuery
+// gates the cold glob on the same answer.
+//
+// This used to say that GetBackendForTier deliberately did NOT check the flag,
+// and that every other consumer paired the two checks itself. The second half
+// was false: orphan reconciliation did not pair them, and would have deleted
+// hot copies on the strength of an unflagged answer had there been a backend
+// to return (#1143) — there is not, since cmd/arc/main.go constructs one only
+// when the flag is on. Both accessors now answer through coldTierUsable, so
+// they cannot drift if that ever changes.
+//
+// Nil-receiver safe like the reports around it.
+func (m *Manager) ColdBackend() storage.Backend {
+	if !m.coldTierUsable() {
+		return nil
+	}
+	return m.coldBackend
+}
+
+// ColdRows is this node's cold-tier metadata, quarantined rows excluded
+// (#1086 stage C). A backup cross-checks its cold listing against these: an
+// object with no row is still copied and counted, a row with no object is the
+// gap it reports.
+//
+// Keyed by path because every use is a lookup by path — matching the cold
+// listing against the rows in both directions — and because a map of stdlib
+// types keeps this interface satisfiable without tiering importing the backup
+// package, which is the whole point of the narrow-interface pattern the other
+// three adapters follow.
+//
+// Quarantined rows are excluded IN SQL by the accessor, not filtered here:
+// their keys are permanently unusable (#758), and a Go-side filter would still
+// pay to materialise and convert every row it then threw away, on the one
+// shared SQLite connection. See ColdFilePathsAndSizes.
+func (m *Manager) ColdRows(ctx context.Context) (map[string]int64, error) {
+	if m == nil || m.metadata == nil {
+		return nil, nil
+	}
+	return m.metadata.ColdFilePathsAndSizes(ctx, TierCold)
+}
+
+// RecordRestoredColdFiles records a batch of files a restore has just written
+// to this node's cold tier (#1086 stage C, batched in #1141), so the query
+// path can route to them: tier routing reads these rows, so the row is what
+// makes a restored file readable at all.
+//
+// Reports two disjoint subsets of the paths it was given, because the caller
+// counts them into different fields:
+//
+//   - quarantined — the row exists, it is quarantined, and it was left exactly
+//     as it is. Its key is permanently unusable and tiering has established
+//     that it can never act on it (#758), so neither the sync nor a restore
+//     may act on it either.
+//   - failed — the path could not be parsed, so no row was even attempted.
+//
+// A non-nil error means NOTHING in the batch was written (the store runs one
+// transaction per call and rolls it back), so the caller counts the whole
+// submitted chunk as unrecorded rather than having to ask how far it got.
+//
+// Not RecordRestoredFile. That one enqueues a tierEventPulled whose applyPulled
+// stats the HOT backend and returns false for a file that is not there, and
+// whose upsert is guarded tier = 'hot' — so a cold restore reported through it
+// is silently dropped twice over (#1139 is that guard seen from the other
+// side). Written synchronously rather than through the event queue because a
+// restore is already a bounded, operator-initiated batch and the caller counts
+// the outcome per file.
+//
+// migratedAt is NOW, not the object's timestamp, and that is deliberate: a
+// hot-to-cold flip stamped in the past sits outside the orphan reconciliation
+// window, so a stale hot copy at the same key would never be cleaned up and
+// would keep peers replicating it. The cost is that a large cold restore puts
+// its rows inside that window and each costs one hot-side existence check per
+// cycle until they age out. See RecordColdFile.
+//
+// One cost this still deliberately accepts: the cleanup it relies on is ROLE
+// GATED. ReconcileOrphanedFiles removes the stale hot copy, but it runs past
+// m.roleGated(), and RestoreBackup is not writer gated — so a restore
+// performed on a FOLLOWER writes rows whose cleanup never runs on that node,
+// and the rows live in that node's own SQLite, so no other node does it
+// either. Restore on the primary writer when the backup holds cold files.
+//
+// (The other cost #1086 accepted — one synchronous write, and so one fsync,
+// per file on the single shared connection — is what #1141 removed by making
+// this a batch.)
+//
+// The paths are parsed here because parseFilePath is tiering's own rule,
+// including the extra edge-sync spoke level, and the backup package cannot
+// reach it.
+func (m *Manager) RecordRestoredColdFiles(ctx context.Context, sizes map[string]int64) ([]string, []string, error) {
+	if m == nil || m.metadata == nil {
+		return nil, pathsOf(sizes), nil
+	}
+	now := time.Now()
+	files, failed := m.restoredFileRows(sizes, now)
+	quarantined, err := m.metadata.RecordColdFilesBatch(ctx, files, now)
+	if err != nil {
+		return nil, failed, err
+	}
+	return quarantined, failed, nil
+}
+
+// RecordRestoredHotFiles records a batch of files a restore wrote to HOT
+// storage when the backup had read them from a cold tier and this node has
+// none (#1086 stage C, batched in #1141). Same two-subset report and same
+// all-or-nothing error as RecordRestoredColdFiles.
+//
+// Needed because the ordinary report, RecordRestoredFile, routes through an
+// upsert guarded tier = 'hot' and so cannot move a row that already says
+// cold — which is exactly the row such a file has. Without this the query
+// path omits the hot glob (nothing claims hot) and the cold glob (no cold
+// backend) and returns nothing at all for the measurement.
+//
+// Nil-receiver safe, like the adapters around it.
+func (m *Manager) RecordRestoredHotFiles(ctx context.Context, sizes map[string]int64) ([]string, []string, error) {
+	if m == nil || m.metadata == nil {
+		return nil, pathsOf(sizes), nil
+	}
+	files, failed := m.restoredFileRows(sizes, time.Now())
+	quarantined, err := m.metadata.RecordRestoredHotFilesBatch(ctx, files)
+	if err != nil {
+		return nil, failed, err
+	}
+	return quarantined, failed, nil
+}
+
+// restoredFileRows turns a restore's path-to-size map into the rows the store
+// writes, reporting the paths it could not parse rather than failing the
+// batch for them: one unparseable key among a thousand good ones must not
+// cost the other nine hundred and ninety nine their rows.
+//
+// The parse error is logged here, once per batch, with a path. The caller
+// counts these but cannot say why they failed, and the alternative — one line
+// per file — would be a line per file on a restore whose whole prefix is
+// unparseable. Logging an error at the lower layer is the exception the
+// no-double-logging rule allows.
+func (m *Manager) restoredFileRows(sizes map[string]int64, now time.Time) ([]FileMetadata, []string) {
+	files := make([]FileMetadata, 0, len(sizes))
+	var failed []string
+	var firstErr error
+	for path, size := range sizes {
+		info, err := m.parseFilePath(path)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			failed = append(failed, path)
+			continue
+		}
+		files = append(files, FileMetadata{
+			Path:          path,
+			Database:      info.Database,
+			Measurement:   info.Measurement,
+			PartitionTime: info.PartitionTime,
+			SizeBytes:     size,
+			CreatedAt:     now,
+		})
+	}
+	if firstErr != nil {
+		m.logger.Warn().
+			Str("path", failed[0]).
+			Int("paths", len(failed)).
+			Err(firstErr).
+			Msg("Could not parse the path of a restored file, so no tier row was written for it; the bytes are in storage and the file is not queryable until a row exists")
+	}
+	return files, failed
+}
+
+// pathsOf is the keys of a restore batch, for the nil-manager case: nothing
+// was written, and a manager with no metadata store has established nothing
+// about these keys, so they are reported FAILED rather than quarantined. A
+// quarantine is a fact tiering recorded (#758), not the absence of a store to
+// ask.
+func pathsOf(sizes map[string]int64) []string {
+	if len(sizes) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(sizes))
+	for path := range sizes {
+		out = append(out, path)
+	}
+	return out
+}
+
 // RecordUnlinkedFile reports that this node removed its own local copy of a
 // path because the path left the cluster manifest. sizeBytes is the size the
 // caller stat'd before deleting, which is also the evidence that this node
@@ -571,8 +780,10 @@ type coldProbe struct {
 // applyUnlinked applies, so the two agree on which paths needed one. Returns
 // nil when nothing did.
 func (m *Manager) probeColdForChunk(ctx context.Context, chunk []tierEvent, infos []*FileMetadata) map[string]coldProbe {
+	// GetBackendForTier ANDs cold.enabled since #1143, so the flag is not
+	// re-checked here.
 	cold := m.GetBackendForTier(TierCold)
-	if cold == nil || !m.config.Cold.Enabled || m.draining.Load() {
+	if cold == nil || m.draining.Load() {
 		return nil
 	}
 
@@ -688,7 +899,7 @@ func (m *Manager) applyPulled(ctx context.Context, info *FileMetadata) (bool, er
 // Returns whether a row was written.
 func (m *Manager) applyUnlinked(ctx context.Context, info *FileMetadata, reason string, probe *coldProbe) (bool, error) {
 	cold := m.GetBackendForTier(TierCold)
-	if reasonMayBeMigration(reason) && cold != nil && m.config.Cold.Enabled {
+	if reasonMayBeMigration(reason) && cold != nil {
 		// A row that already says cold needs no probe and no write, and
 		// skipping it here is what keeps the existence check off the
 		// high-volume tiering reasons: the manifest sweep and orphan

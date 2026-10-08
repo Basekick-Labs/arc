@@ -343,6 +343,47 @@ func TestLoad_IcebergRequiresLocalBackend(t *testing.T) {
 	}
 }
 
+func TestLoad_IcebergRejectsDottedNamespacePrefix(t *testing.T) {
+	// Arc builds ONE Iceberg namespace component per database, as <prefix>_<database>. A dot in
+	// the prefix puts a dot in every one of them, and iceberg-go v0.7.0 addresses a namespace with
+	// a dotted component by a JSON-encoded catalog key instead of the plain dotted string. The
+	// warehouse directory then becomes __iceberg_namespace_v1__:[...].db, which Arc's own
+	// warehouse-directory test does not recognise and would walk back in as a user database, and
+	// the percent-encoded metadata location leaves no version-hint.text for directory readers.
+	for _, tc := range []struct {
+		prefix  string
+		wantErr bool
+	}{
+		{"arc", false},
+		{"arc_wh", false},
+		{"my-warehouse", false},
+		{"my.warehouse", true},
+		{".arc", true},
+		{"arc.", true},
+	} {
+		t.Run(tc.prefix, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			t.Setenv("ARC_ICEBERG_ENABLED", "true")
+			t.Setenv("ARC_STORAGE_BACKEND", "local")
+			t.Setenv("ARC_ICEBERG_NAMESPACE_PREFIX", tc.prefix)
+
+			_, err := Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("namespace_prefix %q was accepted; it would publish unreadable tables", tc.prefix)
+				}
+				if !strings.Contains(err.Error(), "must not contain a dot") {
+					t.Errorf("error does not name the cause: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("namespace_prefix %q rejected: %v", tc.prefix, err)
+			}
+		})
+	}
+}
+
 func TestLoad_IcebergReconcileInterval(t *testing.T) {
 	tests := []struct {
 		name     string

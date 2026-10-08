@@ -181,6 +181,23 @@ func applyLicenseCoreLimits(lic *license.License, cfg *config.Config) {
 		cfg.Database.ThreadCount = lic.MaxCores
 	}
 
+	// Each compaction subprocess is separate, so the main process's thread
+	// limits cannot constrain its DuckDB threads. Match the other licensed
+	// execution knobs: cap each positive subprocess setting at the license and
+	// at the effective cores available to this process. Do not replace zero:
+	// Config.Load resolves that automatic sentinel in production, while a
+	// directly constructed Config must retain DuckDB's own CPU-aware default.
+	licensedCompactionThreads := min(lic.MaxCores, effective)
+	if cfg.Compaction.Threads > licensedCompactionThreads {
+		log.Info().
+			Int("licensed_cores", lic.MaxCores).
+			Int("effective_cores", effective).
+			Int("configured_threads", cfg.Compaction.Threads).
+			Int("compaction_threads", licensedCompactionThreads).
+			Msg("License/effective core limit applied to compaction subprocess threads")
+		cfg.Compaction.Threads = licensedCompactionThreads
+	}
+
 	if cfg.Ingest.FlushWorkers > lic.MaxCores {
 		cfg.Ingest.FlushWorkers = lic.MaxCores
 		log.Info().
@@ -212,6 +229,14 @@ func main() {
 	// Setup logger
 	logger.Setup(cfg.Log.Level, cfg.Log.Format)
 	log.Info().Str("version", Version).Bool("duckdb_arrow", database.ArrowEnabled).Bool("fips_mode", fips.Enabled()).Msg("Starting Arc...")
+
+	// Load-time advisories about values Arc accepted and kept. config.Load has
+	// no logger, so it collects them and this is the one place they are
+	// emitted. Str fields rather than a formatted message: the value goes in a
+	// structured field so installErrSanitizer cannot mask it.
+	for _, w := range cfg.Warnings {
+		log.Warn().Str("key", w.Key).Str("value", w.Value).Msg(w.Message)
+	}
 
 	// Fail closed: the arc-fips build (fips.BuildTagged) MUST run with the Go
 	// Cryptographic Module actually in FIPS mode. The binary bakes in
@@ -441,6 +466,7 @@ func main() {
 		AzureSASToken:         cfg.Storage.AzureSASToken,
 		AzureEndpoint:         cfg.Storage.AzureEndpoint,
 		AzureContainer:        cfg.Storage.AzureContainer,
+		AzurePrefix:           cfg.Storage.AzurePrefix,
 		// Primary-backend signal for Azure (mirrors S3IsPrimaryBackend): only an
 		// azure/azblob primary backend provisions a primary Azure secret.
 		AzureIsPrimaryBackend: cfg.Storage.Backend == "azure" || cfg.Storage.Backend == "azblob",
@@ -453,6 +479,7 @@ func main() {
 		ColdS3Bucket:       cfg.TieredStorage.Cold.S3Bucket,
 		ColdS3Prefix:       cfg.TieredStorage.Cold.S3Prefix,
 		ColdAzureContainer: cfg.TieredStorage.Cold.AzureContainer,
+		ColdAzurePrefix:    cfg.TieredStorage.Cold.AzurePrefix,
 		// Local storage root used by the DuckDB sandbox to whitelist
 		// Arc-managed file paths in allowed_directories. Always populated
 		// regardless of the configured backend; on S3/Azure-only deployments
@@ -777,25 +804,77 @@ func main() {
 		Int("idle", stats.Idle).
 		Msg("Database connection pool stats")
 
-	// Initialize storage backend
+	// Initialize storage backend.
+	//
+	// The switch maps this deployment's config onto a storage.BackendSpec and
+	// picks the operator-facing wording; storage.NewBackend (internal/storage/
+	// factory.go) owns the construction and its typed-nil guarantee (#713).
+	// What stays here is everything that is this call site's business and
+	// nobody else's: the logger name, the decision that a failure is fatal, the
+	// per-backend messages, and the shutdown registration.
+	//
+	// The switch is on the raw cfg.Storage.Backend so the accepted set is
+	// exactly what it has always been: config.Load lowercases and trims
+	// storage.backend before anything reads it, and already refuses anything
+	// outside the five aliases with "storage.backend %q is invalid". The
+	// default below is therefore unreachable through config today; it keeps its
+	// wording so a caller that ever bypasses that validation still Fatals here,
+	// before a backend is built.
 	var storageBackend storage.Backend
+	storageSpec := storage.BackendSpec{Type: cfg.Storage.Backend}
+	// Both of these have a usable default so that the next backend added below
+	// degrades a message instead of crashing. Every case sets them today and
+	// the default case provably exits, but a new case that fills in the spec
+	// and forgets logStorageReady would call nil AFTER the backend was already
+	// registered, and one that forgets logStorageFatal would Fatal with an
+	// empty message. go vet reports neither.
+	//
+	// The fatal is a closure rather than a message string so each case can put
+	// the values that identify its destination into STRUCTURED fields.
+	// installErrSanitizer masks quoted spans in every logged error, globally
+	// and deliberately, so ANY error whose text quotes the offending value —
+	// an unusable bucket or container name, a credential shape the SDK
+	// rejects, an endpoint it cannot parse — reaches the operator as "...".
+	// A field survives that. Same reason cluster.role reports its value in a
+	// field (see ResolveRole below).
+	//
+	// Note the prefix is no longer among those cases: config.Load validates
+	// every object-store prefix key, so an unusable one is a load-time error
+	// printed before the logger exists and never reaches here. It was the
+	// failure that motivated this closure, and fixing it at the root was the
+	// better half of that change; the closure stays because the reasoning
+	// applies to every other error this line can carry.
+	logStorageFatal := func(err error) {
+		log.Fatal().Err(err).
+			Str("backend", cfg.Storage.Backend).
+			Msg("Failed to initialize storage backend")
+	}
+	logStorageReady := func() {
+		log.Info().
+			Str("backend", cfg.Storage.Backend).
+			Msg("Storage backend initialized")
+	}
 	switch cfg.Storage.Backend {
 	case "local":
-		storageBackend, err = storage.NewLocalBackend(cfg.Storage.LocalPath, logger.Get("storage"))
-		if err != nil {
-			log.Fatal().Err(err).Msg("Failed to initialize local storage backend")
+		storageSpec.LocalPath = cfg.Storage.LocalPath
+		logStorageFatal = func(err error) {
+			log.Fatal().Err(err).
+				Str("backend", cfg.Storage.Backend).
+				Str("path", cfg.Storage.LocalPath).
+				Msg("Failed to initialize local storage backend")
 		}
-		shutdownCoordinator.Register("storage", storageBackend, shutdown.PriorityStorage)
-		log.Info().
-			Str("backend", "local").
-			Str("path", cfg.Storage.LocalPath).
-			Msg("Storage backend initialized")
+		logStorageReady = func() {
+			log.Info().
+				Str("backend", "local").
+				Str("path", cfg.Storage.LocalPath).
+				Msg("Storage backend initialized")
+		}
 
 	case "s3", "minio":
 		// Note: an empty s3_bucket for an S3 primary backend is rejected earlier
 		// in config.Load (before database.New builds the DuckDB secret), so by
 		// here the bucket is guaranteed non-empty.
-		s3Config := &storage.S3Config{
+		storageSpec.S3 = storage.S3Config{
 			Bucket:    cfg.Storage.S3Bucket,
 			Region:    cfg.Storage.S3Region,
 			Endpoint:  cfg.Storage.S3Endpoint,
@@ -805,43 +884,64 @@ func main() {
 			PathStyle: cfg.Storage.S3PathStyle,
 			Prefix:    cfg.Storage.S3Prefix,
 		}
-		storageBackend, err = storage.NewS3Backend(s3Config, logger.Get("storage"))
-		if err != nil {
-			log.Fatal().Err(err).Msg("Failed to initialize S3 storage backend")
+		logStorageFatal = func(err error) {
+			log.Fatal().Err(err).
+				Str("backend", cfg.Storage.Backend).
+				Str("bucket", cfg.Storage.S3Bucket).
+				Str("prefix", cfg.Storage.S3Prefix).
+				Msg("Failed to initialize S3 storage backend")
 		}
-		shutdownCoordinator.Register("storage", storageBackend, shutdown.PriorityStorage)
-		log.Info().
-			Str("backend", cfg.Storage.Backend).
-			Str("bucket", cfg.Storage.S3Bucket).
-			Str("prefix", cfg.Storage.S3Prefix).
-			Str("region", cfg.Storage.S3Region).
-			Str("endpoint", cfg.Storage.S3Endpoint).
-			Msg("Storage backend initialized")
+		logStorageReady = func() {
+			log.Info().
+				Str("backend", cfg.Storage.Backend).
+				Str("bucket", cfg.Storage.S3Bucket).
+				Str("prefix", cfg.Storage.S3Prefix).
+				Str("region", cfg.Storage.S3Region).
+				Str("endpoint", cfg.Storage.S3Endpoint).
+				Msg("Storage backend initialized")
+		}
 
 	case "azure", "azblob":
-		azureConfig := &storage.AzureBlobConfig{
+		storageSpec.Azure = storage.AzureBlobConfig{
 			ConnectionString:   cfg.Storage.AzureConnectionString,
 			AccountName:        cfg.Storage.AzureAccountName,
 			AccountKey:         cfg.Storage.AzureAccountKey,
 			SASToken:           cfg.Storage.AzureSASToken,
 			ContainerName:      cfg.Storage.AzureContainer,
+			Prefix:             cfg.Storage.AzurePrefix,
 			Endpoint:           cfg.Storage.AzureEndpoint,
 			UseManagedIdentity: cfg.Storage.AzureUseManagedIdentity,
 		}
-		storageBackend, err = storage.NewAzureBlobBackend(azureConfig, logger.Get("storage"))
-		if err != nil {
-			log.Fatal().Err(err).Msg("Failed to initialize Azure Blob Storage backend")
+		logStorageFatal = func(err error) {
+			log.Fatal().Err(err).
+				Str("backend", cfg.Storage.Backend).
+				Str("container", cfg.Storage.AzureContainer).
+				Str("prefix", cfg.Storage.AzurePrefix).
+				Msg("Failed to initialize Azure Blob Storage backend")
 		}
-		shutdownCoordinator.Register("storage", storageBackend, shutdown.PriorityStorage)
-		log.Info().
-			Str("backend", cfg.Storage.Backend).
-			Str("container", cfg.Storage.AzureContainer).
-			Str("account", cfg.Storage.AzureAccountName).
-			Msg("Storage backend initialized")
+		logStorageReady = func() {
+			log.Info().
+				Str("backend", cfg.Storage.Backend).
+				Str("container", cfg.Storage.AzureContainer).
+				Str("prefix", cfg.Storage.AzurePrefix).
+				Str("account", cfg.Storage.AzureAccountName).
+				Msg("Storage backend initialized")
+		}
 
 	default:
 		log.Fatal().Str("backend", cfg.Storage.Backend).Msg("Unsupported storage backend (use 'local', 's3', 'minio', 'azure', or 'azblob')")
 	}
+
+	// log.Fatal in the default case exits the process, so by here the backend
+	// type is one of the five aliases and both logStorageFatal and
+	// logStorageReady carry that case's wording rather than the generic
+	// fallbacks they were declared with.
+	storageBackend, err = storage.NewBackend(storageSpec, logger.Get("storage"))
+	if err != nil {
+		logStorageFatal(err)
+	}
+	shutdownCoordinator.Register("storage", storageBackend, shutdown.PriorityStorage)
+	logStorageReady()
 
 	// Pattern 2 shared-storage multi-writer mode startup validation.
 	// Refuses to start under four conditions that would silently break
@@ -2953,6 +3053,7 @@ func main() {
 		// The network agent. Skipped entirely on a fully air-gapped spoke,
 		// which has no hub URL to build a transport from.
 		var syncAgent *edgesync.Agent
+		var automaticSync bool
 		if cfg.EdgeSync.Spoke.Enabled {
 			if cfg.EdgeSync.Spoke.HubToken == "" {
 				log.Warn().Msg("ARC_EDGE_SYNC_HUB_TOKEN is not set; a hub running with auth enabled " +
@@ -3051,6 +3152,49 @@ func main() {
 		}
 		spokeHandler.RegisterRoutes(server.GetApp())
 
+		// Automatic spoke sync is the paid scheduling phase of edge sync. The
+		// existing enabled flag is the operator's explicit opt-in to moving
+		// data off this node; without a valid paid license, the manual
+		// endpoint remains available as before.
+		if syncAgent != nil {
+			if licenseClient != nil && licenseClient.CanUseEdgeSyncScheduler() {
+				var writerGate edgesync.WriterGate
+				if clusterCoordinator != nil {
+					writerGate = newWriterClusterGate(clusterCoordinator)
+				}
+				syncScheduler, err := edgesync.NewScheduler(edgesync.SchedulerConfig{
+					Agent:         syncAgent,
+					LicenseClient: licenseClient,
+					SyncInterval:  cfg.EdgeSync.Spoke.SyncInterval,
+					RetryInterval: cfg.EdgeSync.Spoke.SyncRetryInterval,
+					Enabled:       true,
+					ClusterGate:   writerGate,
+					Metrics:       metrics.Get(),
+					Logger:        spokeLogger,
+				})
+				if err != nil {
+					log.Fatal().Err(err).Msg("Failed to configure the edge sync scheduler; refusing to start")
+				}
+				if err := syncScheduler.Start(); err != nil {
+					log.Fatal().Err(err).Msg("Failed to start the edge sync scheduler; refusing to start")
+				}
+				shutdownCoordinator.RegisterHook("edgesync-scheduler", func(context.Context) error {
+					syncScheduler.Stop()
+					return nil
+				}, shutdown.PriorityScheduler)
+				automaticSync = syncScheduler.IsRunning()
+				if automaticSync {
+					metrics.Get().EnableEdgeSyncSpokeScheduler()
+					spokeLogger.Info().
+						Dur("sync_interval", cfg.EdgeSync.Spoke.SyncInterval).
+						Dur("retry_interval", cfg.EdgeSync.Spoke.SyncRetryInterval).
+						Msg("Paid edge sync scheduler enabled")
+				}
+			} else {
+				spokeLogger.Info().Msg("Automatic edge sync requires a valid paid license; manual sync remains available")
+			}
+		}
+
 		// Reports what is actually enabled: an air-gap-only spoke has no hub
 		// URL and no /run endpoint, so claiming both would send an operator
 		// looking for a route that returns 503.
@@ -3063,9 +3207,17 @@ func main() {
 		}
 		switch {
 		case syncAgent != nil && bundleExporter != nil:
-			evt.Msg("Edge sync spoke enabled; POST /api/v1/spoke-sync/run to sync, /export for an air-gap bundle")
+			if automaticSync {
+				evt.Msg("Edge sync spoke enabled; scheduled and manual network sync are available, /export writes an air-gap bundle")
+			} else {
+				evt.Msg("Edge sync spoke enabled; trigger network sync with POST /api/v1/spoke-sync/run, /export writes an air-gap bundle")
+			}
 		case syncAgent != nil:
-			evt.Msg("Edge sync spoke enabled; trigger a pass with POST /api/v1/spoke-sync/run")
+			if automaticSync {
+				evt.Msg("Edge sync spoke enabled; scheduled sync is active and POST /api/v1/spoke-sync/run triggers a manual pass")
+			} else {
+				evt.Msg("Edge sync spoke enabled; trigger a pass with POST /api/v1/spoke-sync/run")
+			}
 		default:
 			evt.Msg("Edge sync air-gap export enabled; write a bundle with POST /api/v1/spoke-sync/export")
 		}
@@ -3578,6 +3730,15 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize Iceberg exporter")
 		}
+		// #835: reclaim the manifest files that expired snapshots and dropped
+		// transactions leave behind. Grace is derived from the reconcile interval
+		// (floored at an hour inside the exporter) so an unreachable manifest is
+		// only deleted once it is far older than any commit or reader in flight.
+		icebergOrphanGrace := iceberg.OrphanGraceFor(time.Duration(cfg.Iceberg.ReconcileInterval) * time.Second)
+		exporter.ConfigureOrphanSweep(cfg.Iceberg.OrphanSweepEnabled, icebergOrphanGrace)
+		if !cfg.Iceberg.OrphanSweepEnabled {
+			log.Warn().Msg("Iceberg orphan metadata sweep is disabled (iceberg.orphan_sweep_enabled=false): the manifest files of expired snapshots are retained indefinitely and are copied into every backup")
+		}
 		// #639 item 3: database deletion clears the Iceberg catalog too.
 		databasesHandler.SetIcebergDropper(exporter)
 		icebergSource := iceberg.NewStorageWalkSource(storageBackend, cfg.Iceberg.NamespacePrefix, logger.Get("iceberg"))
@@ -3868,49 +4029,83 @@ func main() {
 				log.Error().Err(err).Msg("Failed to open tiering database - feature disabled")
 			} else {
 				// Create cold tier backend (S3 or Azure)
+				//
+				// coldBackend is only ever assigned from a successful
+				// storage.NewBackend, which never returns a typed nil inside a
+				// non-nil interface (#713) — the factory owns that guarantee
+				// now, so neither branch has to hand-roll it. It still matters
+				// here: every "coldBackend != nil" downstream — the startup
+				// tier scan's cold sync, the drainer's existence probe, the
+				// query router's cold glob — would otherwise pass and then
+				// dereference a nil receiver.
+				//
+				// Only s3 and azure are accepted, each with its own logger name
+				// and its own error wording. There is no default case, and what
+				// makes that safe is a CONJUNCTION, not one flag: config.Load
+				// refuses an invalid value with "tiered_storage.cold.backend %q
+				// is invalid" only when tiered_storage.enabled AND
+				// tiered_storage.cold.enabled are both true -- deliberately, so
+				// that an OSS or unlicensed node carrying a leftover
+				// cold.enabled=true still boots. The runtime claim therefore
+				// rests on this whole block sitting inside
+				// "if cfg.TieredStorage.Enabled" (cmd/arc/main.go:3987). Were that
+				// outer gate ever to move, an unvalidated cold.Backend would
+				// reach this switch, fall through in silence and leave
+				// coldBackend nil, with nothing louder than cold_enabled=false
+				// in a later log line to say so.
 				var coldBackend storage.Backend
 				cold := cfg.TieredStorage.Cold
 
 				if cold.Enabled {
 					switch cold.Backend {
 					case "s3":
-						s3Config := &storage.S3Config{
-							Region:    cold.S3Region,
-							Bucket:    cold.S3Bucket,
-							Endpoint:  cold.S3Endpoint,
-							AccessKey: cold.S3AccessKey,
-							SecretKey: cold.S3SecretKey,
-							UseSSL:    cold.S3UseSSL,
-							PathStyle: cold.S3PathStyle,
-							Prefix:    cold.S3Prefix,
+						coldSpec := storage.BackendSpec{
+							Type: "s3",
+							S3: storage.S3Config{
+								Region:    cold.S3Region,
+								Bucket:    cold.S3Bucket,
+								Endpoint:  cold.S3Endpoint,
+								AccessKey: cold.S3AccessKey,
+								SecretKey: cold.S3SecretKey,
+								UseSSL:    cold.S3UseSSL,
+								PathStyle: cold.S3PathStyle,
+								Prefix:    cold.S3Prefix,
+							},
 						}
-						// Assigned through a typed local, never straight into
-						// the interface: a constructor error comes back as a
-						// nil *S3Backend, and an interface holding a typed
-						// nil is not == nil (#713). Stored directly, every
-						// "coldBackend != nil" downstream — the startup tier
-						// scan's cold sync, the drainer's existence probe,
-						// the query router's cold glob — would pass and then
-						// dereference a nil receiver.
-						if b, err := storage.NewS3Backend(s3Config, logger.Get("tiering-cold-s3")); err != nil {
-							log.Error().Err(err).Msg("Failed to create cold tier S3 backend for tiering: the cold tier is unusable on this node until the configuration is fixed")
+						if b, err := storage.NewBackend(coldSpec, logger.Get("tiering-cold-s3")); err != nil {
+							// Identifiers in structured fields: this site logs
+							// and CONTINUES with a nil cold backend, so this
+							// one line is all the operator gets, and
+							// installErrSanitizer masks quoted spans inside
+							// the error itself.
+							log.Error().Err(err).
+								Str("bucket", cold.S3Bucket).
+								Str("prefix", cold.S3Prefix).
+								Msg("Failed to create cold tier S3 backend for tiering: the cold tier is unusable on this node until the configuration is fixed")
 						} else {
 							coldBackend = b
 						}
 
 					case "azure":
-						azureConfig := &storage.AzureBlobConfig{
-							ConnectionString:   cold.AzureConnectionString,
-							AccountName:        cold.AzureAccountName,
-							AccountKey:         cold.AzureAccountKey,
-							SASToken:           cold.AzureSASToken,
-							ContainerName:      cold.AzureContainer,
-							Endpoint:           cold.AzureEndpoint,
-							UseManagedIdentity: cold.AzureUseManagedIdentity,
+						coldSpec := storage.BackendSpec{
+							Type: "azure",
+							Azure: storage.AzureBlobConfig{
+								ConnectionString:   cold.AzureConnectionString,
+								AccountName:        cold.AzureAccountName,
+								AccountKey:         cold.AzureAccountKey,
+								SASToken:           cold.AzureSASToken,
+								ContainerName:      cold.AzureContainer,
+								Prefix:             cold.AzurePrefix,
+								Endpoint:           cold.AzureEndpoint,
+								UseManagedIdentity: cold.AzureUseManagedIdentity,
+							},
 						}
-						// Typed local for the same reason as the S3 branch.
-						if b, err := storage.NewAzureBlobBackend(azureConfig, logger.Get("tiering-cold-azure")); err != nil {
-							log.Error().Err(err).Msg("Failed to create cold tier Azure backend for tiering: the cold tier is unusable on this node until the configuration is fixed")
+						if b, err := storage.NewBackend(coldSpec, logger.Get("tiering-cold-azure")); err != nil {
+							// Same reason as the cold S3 site above.
+							log.Error().Err(err).
+								Str("container", cold.AzureContainer).
+								Str("prefix", cold.AzurePrefix).
+								Msg("Failed to create cold tier Azure backend for tiering: the cold tier is unusable on this node until the configuration is fixed")
 						} else {
 							coldBackend = b
 						}
@@ -4170,6 +4365,7 @@ func main() {
 				AccountKey:       cold.AzureAccountKey,
 				SASToken:         cold.AzureSASToken,
 				Container:        cold.AzureContainer,
+				Prefix:           cold.AzurePrefix,
 				Endpoint:         cold.AzureEndpoint,
 			}); err != nil {
 				log.Warn().Err(err).Msg("Failed to configure DuckDB with cold tier Azure credentials")
@@ -4205,9 +4401,84 @@ func main() {
 					Msg("iceberg.warehouse is not a local path; backups cannot include its table metadata")
 			}
 		}
+		// Backup destinations (#1085 stage B2b-1, a set with per-database
+		// routing since B2b-2). A configured target replaces the local
+		// directory entirely; with none, BackupPath is the destination exactly
+		// as before. config.Load has already validated every target, bounded
+		// each key prefix, refused the same database on two targets, and
+		// refused an overlap with primary storage, with the cold tier and
+		// between any two targets — see
+		// config.checkBackupDestinationOverlap, which records what that
+		// refusal actually protects against: a backup that re-copies itself
+		// every run, and the reconciliation sweep deleting the backups.
+		var backupTargets []backup.Target
+		for _, name := range cfg.Backup.TargetNamesSorted() {
+			t := cfg.Backup.Targets[name]
+			keyPrefix, err := t.KeyPrefix()
+			if err != nil {
+				// Unreachable: validateBackupTargets asks for the same prefix
+				// at load and refuses a bad one. Fatal rather than silently
+				// reserving no key headroom, which would turn an overlong key
+				// from a reported skip into a failed write. Per target, so a
+				// routed target with an unusable prefix is as loud as the
+				// default one.
+				log.Fatal().Err(err).Str("target", t.Name).Msg("Backup target prefix is unusable")
+			}
+			backupTargets = append(backupTargets, backup.Target{
+				Name:      t.Name,
+				Spec:      t.BackendSpec(),
+				KeyPrefix: keyPrefix,
+				Remote:    t.IsRemote(),
+			})
+		}
+
+		// Backup owner identity (#1085 stage B2b-1). The CLUSTER when
+		// clustered — a per-node identity would make every writer failover
+		// orphan its own cluster's backups — and a persisted per-instance UUID
+		// standalone. Stored BESIDE the shared database, never inside it, so a
+		// restore cannot make this instance a continuation of the one the
+		// backup came from; see internal/backup/identity.go.
+		//
+		// A failure here is a warning, not a Fatal: an unidentified instance
+		// writes manifests with no owner and reads every manifest as its own,
+		// which is exactly the behaviour of every Arc before this change. It
+		// must never stop a node from booting.
+		backupInstanceID := ""
+		if cfg.Cluster.Enabled {
+			// TRIMMED, and warned about when empty. This string reaches every
+			// manifest and is compared byte-for-byte, so a stray space on one
+			// node makes two nodes of one cluster read each other's backups as
+			// foreign — and an empty cluster name yields an empty identity,
+			// which means "unidentified" and silently disables the filter,
+			// where the standalone path at least warns.
+			//
+			// Note the switch this implies: turning clustering off moves a
+			// node from the cluster name to its own minted UUID, so its own
+			// earlier backups then read as foreign. They are still listable
+			// with include_foreign=true and still restorable; the docs say so.
+			backupInstanceID = strings.TrimSpace(cfg.Cluster.ClusterName)
+			if backupInstanceID == "" {
+				log.Warn().Msg("cluster.enabled is true but cluster.cluster_name is empty: backups will be written without an owner, so every backup at the destination will be listed as this cluster own. Set cluster.cluster_name")
+			}
+		} else if id, idErr := backup.LoadOrCreateInstanceID(cfg.Auth.DBPath); idErr != nil {
+			log.Warn().Err(idErr).Msg("Could not resolve this instance backup identity: backups will be written without an owner and every backup at the destination will be listed as this instance own")
+		} else {
+			backupInstanceID = id
+		}
+
+		// Built once: the ready log below reports its size, and rebuilding it
+		// there would walk every target a second time to answer a question
+		// this map already answers.
+		backupRouting := cfg.Backup.RoutingMap()
+
 		backupManager, err := backup.NewManager(&backup.ManagerConfig{
 			DataStorage:            storageBackend,
 			BackupPath:             cfg.Backup.LocalPath,
+			Targets:                backupTargets,
+			DefaultTarget:          cfg.Backup.DefaultTarget,
+			Routing:                backupRouting,
+			OperationTimeout:       cfg.Backup.OperationTimeout,
+			InstanceID:             backupInstanceID,
 			SQLiteDBPath:           cfg.Auth.DBPath,
 			IcebergCatalogDBPath:   icebergCatalogDBPath,
 			IcebergWarehousePath:   icebergWarehousePath,
@@ -4216,9 +4487,18 @@ func main() {
 			Logger:                 logger.Get("backup"),
 		})
 		if err != nil {
-			log.Error().Err(err).Msg("Failed to initialize backup manager")
+			// This stays "log and skip the whole backup API", and with a
+			// remote target that is still right rather than merely unchanged:
+			// neither NewS3Backend nor NewAzureBlobBackend fails on an
+			// unreachable store — each probes once with a 10 s timeout and
+			// only WARNS (s3.go, azure.go) — so an error here is a
+			// configuration or credential-shape failure, which is as loud and
+			// as permanent as "the local backup directory is unwritable" was.
+			// An unreachable target therefore boots with the API up and
+			// reports per operation, which is the required behaviour.
+			log.Error().Err(err).Str("target", cfg.Backup.DefaultTarget).Msg("Failed to initialize backup manager")
 		} else {
-			backupHandler := api.NewBackupHandler(backupManager, authManager, logger.Get("backup-api"))
+			backupHandler := api.NewBackupHandler(backupManager, authManager, cfg.Backup.OperationTimeout, logger.Get("backup-api"))
 			// Cluster safety (#1083). Only when the coordinator exists: an
 			// interface holding a typed nil *Coordinator is not == nil (#713),
 			// and both setters would then keep a pointer whose methods panic.
@@ -4243,13 +4523,60 @@ func main() {
 				// The known-database check of a scoped backup (#1084) asks
 				// the same tier metadata whether a database is fully cold.
 				backupManager.SetTierLookup(tieringManager)
+				// And the cold-file marker (#1085 stage B3) asks it how many
+				// files a backup is NOT carrying, since only hot storage is
+				// copied.
+				//
+				// Note what this does NOT cover, because it is the case where
+				// the marker would be most useful. The tiering block above is
+				// gated on the LICENCE, not only on cfg.TieredStorage.Enabled,
+				// so on a node without it tieringManager is nil, this line is
+				// never reached and the field is absent — on a deployment whose
+				// files are already out of hot storage and which has stopped
+				// migrating. A licence that lapses while the process RUNS keeps
+				// reporting, because the manager is already built and only the
+				// migration cycle re-checks; it is the restart after a lapse
+				// that goes quiet. Fixing that would mean building a tiering
+				// MetadataStore (and running its schema) on an unlicensed node,
+				// which is the boundary the licence pattern exists to hold, so
+				// the behaviour stays and the field doc says so instead.
+				backupManager.SetColdCounter(tieringManager)
+				// And the cold tier itself (#1086 stage C): the store a backup
+				// reads cold objects from and a restore writes them back to.
+				// Same licence hole as the counter above — an unlicensed node
+				// wires neither, so its backups silently carry no cold data.
+				backupManager.SetColdSource(tieringManager)
 			}
 			backupHandler.RegisterRoutes(server.GetApp())
-			log.Info().
-				Str("backup_path", cfg.Backup.LocalPath).
+			// backup_path is logged only when it IS the destination. Logging
+			// "./data/backups" beside a configured S3 target would say the
+			// backup goes somewhere it does not, and that directory is not
+			// even created in that configuration.
+			ready := log.Info()
+			if len(backupTargets) > 0 {
+				names := make([]string, 0, len(backupTargets))
+				for _, t := range backupTargets {
+					names = append(names, t.Name)
+				}
+				ready = ready.
+					Str("backup_default_target", cfg.Backup.DefaultTarget).
+					Strs("backup_targets", names).
+					Int("routed_databases", len(backupRouting))
+			} else {
+				ready = ready.Str("backup_path", cfg.Backup.LocalPath)
+			}
+			ready.
+				Bool("owner_identity", backupInstanceID != "").
 				Bool("cluster_gate", clusterCoordinator != nil).
 				Bool("tier_recorder", tieringManager != nil).
 				Bool("tier_lookup", tieringManager != nil).
+				Bool("cold_counter", tieringManager != nil).
+				// NOT tieringManager != nil like its neighbours: cold can be
+				// configured and disabled, or its backend can have failed to
+				// build while tiering is otherwise up, and a startup line
+				// claiming a cold source in either case would be the kind of
+				// lie that takes an operator a long afternoon.
+				Bool("cold_source", tieringManager != nil && tieringManager.ColdBackend() != nil).
 				Msg("Backup/restore enabled")
 		}
 	}
@@ -5049,6 +5376,15 @@ func (b *backupClusterManifest) ManifestFiles() []backup.ManifestFile {
 	entries := b.coordinator.GetFileManifest()
 	out := make([]backup.ManifestFile, 0, len(entries))
 	for _, e := range entries {
+		// Cold entries stay OUT, and this filter is load-bearing for the cold
+		// backup walk (#1086 stage C) as well as for the reason below.
+		// crossCheckManifest treats this set as the authority on what is
+		// registered data; a cold entry appearing here would make it hold back
+		// or re-delete the very files the cold walk exists to carry. Cold files
+		// are enumerated from the cold store and reconciled against tier rows
+		// instead, and they are deliberately never registered in the Raft
+		// manifest. Do not "fix" the cold walk by letting cold entries through
+		// here.
 		if e == nil || e.Tier == "cold" {
 			continue
 		}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/storage"
@@ -28,13 +29,15 @@ const DefaultMaxAttempts = 5
 // able to exhaust its file descriptors.
 const MaxAllowedConcurrent = 64
 
+// ErrAgentRunInProgress prevents manual and scheduled passes from
+// modifying the same ledger concurrently.
+var ErrAgentRunInProgress = errors.New("edgesync: sync pass already running")
+
 // Agent runs one sync pass: discover local files, ask the hub what it is
 // missing, and stream those files to it.
 //
-// This is the manual half of the design. §8.2 describes a connectivity-adaptive
-// background loop, but that is the Enterprise feature (§9) — here the pass is
-// triggered by an operator and runs once. The internals are the same either
-// way, so phase 2 adds a ticker and a license gate rather than a rewrite.
+// Manual calls remain available without a license. The separate paid scheduler
+// uses the same guarded discover/reconcile/send pass.
 type Agent struct {
 	ledger    *Ledger
 	transport SyncTransport
@@ -42,6 +45,10 @@ type Agent struct {
 	hubID     string
 	spokeID   string
 	logger    zerolog.Logger
+
+	// runActive is shared by all callers of Run, including manual requests
+	// and scheduled attempts. A rejected pass never touches the ledger.
+	runActive atomic.Bool
 
 	maxAttempts   int
 	maxConcurrent int
@@ -135,6 +142,10 @@ type RunResult struct {
 	// operator, not a retry, so they are surfaced rather than counted away.
 	Conflicts []Conflict
 
+	// HubContacted is true only after a reconcile response was validated.
+	// An empty backlog performs no network request.
+	HubContacted bool
+
 	Duration time.Duration
 }
 
@@ -200,6 +211,14 @@ func NewAgent(cfg AgentConfig) (*Agent, error) {
 // the hub is missing — newest first, so that if a contact window closes
 // mid-backlog the freshest telemetry has already landed.
 func (a *Agent) Run(ctx context.Context) (*RunResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !a.runActive.CompareAndSwap(false, true) {
+		return nil, ErrAgentRunInProgress
+	}
+	defer a.runActive.Store(false)
+
 	start := time.Now()
 	res := &RunResult{}
 
@@ -314,6 +333,7 @@ func (a *Agent) reconcileAndSend(ctx context.Context, pending []*LedgerEntry, re
 	if err := reconciled.Validate(); err != nil {
 		return fmt.Errorf("edgesync: hub returned an invalid reconcile result: %w", err)
 	}
+	res.HubContacted = true
 
 	// Files the hub already holds are advanced without sending a byte. This is
 	// the lost-ack path: a transfer that completed but whose acknowledgment

@@ -336,14 +336,18 @@ func toInt64(v interface{}) (int64, bool) {
 		}
 		return int64(val), true
 	case float32:
-		// Bounds check required before conversion to int64
-		if val > float32(math.MaxInt64) || val < float32(math.MinInt64) {
+		// Use the exact half-open int64 range. Converting MaxInt64 to float32
+		// rounds it to 2^63, so comparing against float32(math.MaxInt64) would
+		// incorrectly allow that out-of-range value.
+		f := float64(val)
+		if math.IsNaN(f) || math.IsInf(f, 0) || f >= 1<<63 || f < -1<<63 {
 			return 0, false
 		}
 		return int64(val), true //nolint:gosec // Bounds checked above
 	case float64:
-		// Bounds check required before conversion to int64
-		if val > float64(math.MaxInt64) || val < float64(math.MinInt64) {
+		// The upper bound is exclusive because float64(math.MaxInt64) rounds
+		// to 2^63. Reject non-finite values before the integer conversion too.
+		if math.IsNaN(val) || math.IsInf(val, 0) || val >= 1<<63 || val < -1<<63 {
 			return 0, false
 		}
 		return int64(val), true //nolint:gosec // Bounds checked above
@@ -446,6 +450,7 @@ func (w *ArrowWriter) getSchema(measurement string, columns map[string]interface
 		}
 		colNames = append(colNames, name)
 	}
+	sort.Strings(colNames)
 
 	// Get type signatures
 	for _, name := range colNames {
@@ -470,9 +475,61 @@ func (w *ArrowWriter) getSchema(measurement string, columns map[string]interface
 		}
 	}
 
-	// Create cache key (includes tag columns and the dedup-time marker to ensure
-	// metadata correctness — the flag changes the emitted arc:dedup_time key)
-	cacheKey := fmt.Sprintf("%s:%v:%v:%v:%t", measurement, colNames, typeNames, tagColumns, dedupTime)
+	// Length-prefix each string so names containing spaces, colons or
+	// separators cannot make distinct schemas share a cache key.
+	// Sort sets before encoding: map iteration and tag order are not identity.
+	var key strings.Builder
+	writePart := func(value string) {
+		key.WriteString(strconv.Itoa(len(value)))
+		key.WriteByte(':')
+		key.WriteString(value)
+	}
+
+	writePart(measurement)
+
+	key.WriteByte('F')
+	key.WriteString(strconv.Itoa(len(colNames)))
+	key.WriteByte(';')
+	for i, name := range colNames {
+		writePart(name)
+		writePart(typeNames[i])
+	}
+
+	sortedTags := append([]string(nil), tagColumns...)
+	sort.Strings(sortedTags)
+	key.WriteByte('T')
+	key.WriteString(strconv.Itoa(len(sortedTags)))
+	key.WriteByte(';')
+	for _, tag := range sortedTags {
+		writePart(tag)
+	}
+
+	key.WriteByte('D')
+	if dedupTime {
+		key.WriteByte('1')
+	} else {
+		key.WriteByte('0')
+	}
+
+	// Precision/scale change the Arrow type and arc:decimals metadata.
+	// Include every specification, including metadata-only entries.
+	specNames := make([]string, 0, len(decimalCols))
+	for name := range decimalCols {
+		specNames = append(specNames, name)
+	}
+	sort.Strings(specNames)
+
+	key.WriteByte('S')
+	key.WriteString(strconv.Itoa(len(specNames)))
+	key.WriteByte(';')
+	for _, name := range specNames {
+		spec := decimalCols[name]
+		writePart(name)
+		writePart(strconv.FormatInt(int64(spec.Precision), 10))
+		writePart(strconv.FormatInt(int64(spec.Scale), 10))
+	}
+
+	cacheKey := key.String()
 
 	// Check LRU cache
 	if schema := w.schemaCache.get(cacheKey); schema != nil {
