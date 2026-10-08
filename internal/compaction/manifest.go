@@ -452,19 +452,39 @@ func (m *ManifestManager) recoverLoadedManifest(ctx context.Context, manifestPat
 	if objectLister, ok := m.backend.(storage.ObjectLister); ok {
 		objects, err := objectLister.ListObjects(ctx, manifest.OutputPath)
 		if err == nil && len(objects) > 0 {
-			actualSize := objects[0].Size
-			if actualSize != manifest.OutputSize {
-				// Size mismatch - partial upload, delete output and manifest for retry
-				m.logger.Warn().
-					Str("manifest", manifestPath).
-					Int64("expected_size", manifest.OutputSize).
-					Int64("actual_size", actualSize).
-					Msg("Output file size mismatch, deleting for retry")
+			if actualSize := objects[0].Size; actualSize != manifest.OutputSize {
+				return m.discardPartialOutput(ctx, manifestPath, manifest, actualSize)
+			}
+		}
+	}
 
-				if err := m.backend.Delete(ctx, manifest.OutputPath); err != nil {
-					m.logger.Warn().Err(err).Str("output", manifest.OutputPath).Msg("Failed to delete partial output")
-				}
-				return m.DeleteManifest(ctx, manifestPath)
+	// Record the kept output for the cluster BEFORE deleting the inputs, so a
+	// crash between the two leaves a completion manifest the watcher can still
+	// turn into a Raft RegisterFile. Without this the inputs went and the
+	// output was never registered (#1155).
+	//
+	// How a failure here is handled depends on whether it can ever clear:
+	//
+	//   - permanent (the stored output disagrees with the manifest, the
+	//     completion manifest describes a different job, a tier whose
+	//     partition time cannot be derived): park the manifest. A plain error
+	//     would retain it, and recovery would re-read and re-hash the whole
+	//     output every cycle forever -- the #747 shape this file already
+	//     guards against above.
+	//   - a short output: hand it to the same partial-upload path the
+	//     ObjectLister check above uses, so the handling does not depend on
+	//     which backend is in play.
+	//   - anything else is transient: return it and retry next cycle.
+	if hooks.beforeInputDelete != nil {
+		if err := hooks.beforeInputDelete(ctx, manifest); err != nil {
+			var short *shortOutputError
+			switch {
+			case errors.As(err, &short):
+				return m.discardPartialOutput(ctx, manifestPath, manifest, short.actual)
+			case errors.Is(err, errRecoveryPermanent):
+				return m.quarantineManifest(ctx, manifestPath, manifest.OutputPath, err)
+			default:
+				return fmt.Errorf("failed to record kept output before deleting inputs: %w", err)
 			}
 		}
 	}
@@ -474,11 +494,6 @@ func (m *ManifestManager) recoverLoadedManifest(ctx context.Context, manifestPat
 	// failure retries this manifest next cycle, and the consumer is
 	// idempotent, so firing early is safe while firing late risks a window
 	// where discovery syncs the output.
-	if hooks.beforeInputDelete != nil {
-		if err := hooks.beforeInputDelete(ctx, manifest); err != nil {
-			return fmt.Errorf("failed to record kept output before deleting inputs: %w", err)
-		}
-	}
 	if onKeptOutput != nil {
 		onKeptOutput(manifest.OutputPath)
 	}
@@ -585,6 +600,26 @@ func quarantinePathFor(manifestPath string) (string, error) {
 // That is right for the transient case (the backend is down). The one way it
 // could loop forever, the parked name being too long to be a valid key itself,
 // is removed by quarantinePathFor falling back to a hashed name.
+// discardPartialOutput handles an output whose stored size disagrees with the
+// manifest: a partial upload. The output and the manifest both go, so the next
+// cycle rediscovers the inputs and redoes the job from scratch.
+//
+// Shared by the ObjectLister size check and the recovery completion hook, which
+// catches the same condition while streaming the output to hash it -- on a
+// backend that is not an ObjectLister, the hook is the only check that runs.
+func (m *ManifestManager) discardPartialOutput(ctx context.Context, manifestPath string, manifest *Manifest, actualSize int64) error {
+	m.logger.Warn().
+		Str("manifest", manifestPath).
+		Int64("expected_size", manifest.OutputSize).
+		Int64("actual_size", actualSize).
+		Msg("Output file size mismatch, deleting for retry")
+
+	if err := m.backend.Delete(ctx, manifest.OutputPath); err != nil {
+		m.logger.Warn().Err(err).Str("output", manifest.OutputPath).Msg("Failed to delete partial output")
+	}
+	return m.DeleteManifest(ctx, manifestPath)
+}
+
 func (m *ManifestManager) quarantineManifest(ctx context.Context, manifestPath, badKey string, cause error) error {
 	parkedPath, err := quarantinePathFor(manifestPath)
 	if err != nil {
