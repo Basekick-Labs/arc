@@ -97,7 +97,21 @@ A cycle that is still running is visible too, as `status: "running"` with live
 counters and no `finished_at`, so you can watch a long cycle progress rather
 than only read its obituary. A cycle that has been claimed but has not yet
 started — the millisecond or two between the trigger's reply and the cycle
-body starting — answers `status: "claimed"`.
+body starting — answers `status: "claimed"`, a four-field body with no scope
+yet recorded. Note that `GET /cycles` does **not** list a cycle in that state:
+its `running_cycle_id` is derived from the retained history so that the list
+can never contradict itself, which means during those few milliseconds the
+by-id lookup answers `claimed` while the list shows neither the cycle nor a
+`running_cycle_id`. Poll the id the trigger gave you, not the list.
+
+`source` has a third value, `unspecified`, for cycles started through an
+internal entry point that is neither the API nor the scheduler. No shipped
+code path produces it today; it exists so that a future caller is not
+silently misattributed to the scheduler.
+
+The list response also carries `retained`, the number of cycles currently
+held. A cycle's `error` is truncated at 512 bytes with a trailing
+`... (truncated)`, since up to 500 of them are retained at once.
 
 **Three limits worth knowing**, all reported in the 404 body rather than left
 to be discovered:
@@ -113,7 +127,9 @@ to be discovered:
   it is simply gone. The 404 says so instead of claiming the cycle never ran.
 - **Cycles run on the node holding the compactor lease**, and the lookup
   answers for the node it is asked on. A cycle triggered on another node is not
-  recorded here.
+  recorded here. On a cluster that manages a compactor lease, the 404 names its
+  holder in `lease_holder`, so the response says where to ask instead — the
+  same datum the trigger's 503 already reports.
 
 `last_cycle` in `/api/v1/compaction/stats` is unchanged, including its field
 names and its meaning: it still describes the most recent *finished* cycle and

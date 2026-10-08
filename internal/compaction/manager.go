@@ -143,8 +143,15 @@ func (o CycleRecord) counters() CycleRecord {
 		return o
 	}
 	o.progress = nil
-	o.Discovered = p.discovered.Load()
+	// Started is loaded FIRST, deliberately. Every batch is counted in
+	// discovered before started, so S <= D at any instant -- but these are two
+	// separate loads, and a full discover-dispatch-start sequence landing
+	// between them (async preemption can stretch that to milliseconds) would
+	// give Started(t2) > Discovered(t1) and a NEGATIVE Unstarted. Loading the
+	// smaller counter first makes Unstarted = D(t2) - S(t1) >= 0 always,
+	// because discovered is non-decreasing.
 	o.Started = p.started.Load()
+	o.Discovered = p.discovered.Load()
 	o.Succeeded = p.succeeded.Load()
 	o.Failed = p.failed.Load()
 	o.Interrupted = p.interrupted.Load()
@@ -1457,14 +1464,24 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 
 		m.mu.Lock()
 		m.lastCycle = outcome
-		// Replace the "running" entry this cycle appended at its start. It is
-		// the newest entry, because ClaimCycle's CAS admits one cycle at a time
-		// and the claim is released only after this finalizer returns. The
-		// append is defensive: it must not be reachable, and a test asserts the
-		// history grows by exactly one entry per cycle.
-		if n := len(m.cycleHistory); n > 0 && m.cycleHistory[n-1].CycleID == cycleID {
-			m.cycleHistory[n-1] = outcome.clone()
-		} else {
+		// Replace the "running" entry this cycle appended at its start.
+		//
+		// Searched for by id rather than assumed to be the newest entry. It IS
+		// the newest one for every path that goes through ClaimCycle, whose CAS
+		// admits one cycle at a time. But RunClaimedCycleFor* is exported and
+		// checkClaim does not stop one claim from driving two concurrent
+		// runClaimed calls, and under that shape assuming the last index would
+		// strand an entry at "running" forever, holding a live progress pointer
+		// and serving a duration that grows without bound.
+		replaced := false
+		for i := len(m.cycleHistory) - 1; i >= 0; i-- {
+			if m.cycleHistory[i].CycleID == cycleID && m.cycleHistory[i].FinishedAt.IsZero() {
+				m.cycleHistory[i] = outcome.clone()
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
 			m.cycleHistory = appendCycleHistory(m.cycleHistory, outcome.clone())
 			m.logger.Warn().
 				Int64("cycle_id", cycleID).
@@ -2333,38 +2350,6 @@ func truncateCycleError(msg string) string {
 	return msg[:limit] + "... (truncated)"
 }
 
-// CycleByID returns the retained outcome for a cycle id. A running cycle's
-// counters are resolved live. Returns false when no record is retained --
-// which does not mean the cycle never ran: ids restart at 1 on restart, the
-// ring is bounded, and cycles run on the node holding the compactor lease.
-func (m *Manager) CycleByID(id int64) (CycleRecord, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for i := len(m.cycleHistory) - 1; i >= 0; i-- {
-		if m.cycleHistory[i].CycleID == id {
-			return m.cycleHistory[i].counters().clone(), true
-		}
-	}
-	return CycleRecord{}, false
-}
-
-// RetainedCycleRange returns the oldest and newest retained cycle ids. ok is
-// false when nothing is retained -- callers must not report 0/0 as a range,
-// because ids start at 1 and every id would then look newer than the newest.
-//
-// Safe to read as the ends of the slice: the history is appended in cycle
-// order and the finalizer only ever updates the entry it appended.
-func (m *Manager) RetainedCycleRange() (oldest int64, newest int64, ok bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if len(m.cycleHistory) == 0 {
-		return 0, 0, false
-	}
-	return m.cycleHistory[0].CycleID, m.cycleHistory[len(m.cycleHistory)-1].CycleID, true
-}
-
 // CycleHistoryPage is a consistent snapshot of the retained cycle history:
 // the page, the window it sits in, and which cycle is still open. Assembled
 // under one lock acquisition so the fields cannot disagree -- reading them
@@ -2416,4 +2401,28 @@ func (m *Manager) CyclePage(limit int) CycleHistoryPage {
 		page.Cycles = append(page.Cycles, m.cycleHistory[i].counters().clone())
 	}
 	return page
+}
+
+// CycleLookup resolves a cycle id and, when nothing is retained for it, the
+// window that absence sits in -- both under a single lock acquisition, so the
+// range reported in a 404 is the same snapshot that produced the miss.
+//
+// Deliberately does not consult the claim: that needs claimMu, and nothing in
+// this package establishes an m.mu -> claimMu order. The caller checks the
+// claim after this returns, holding no lock.
+func (m *Manager) CycleLookup(id int64) (rec CycleRecord, found bool, oldest int64, newest int64, hasRange bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if len(m.cycleHistory) > 0 {
+		oldest = m.cycleHistory[0].CycleID
+		newest = m.cycleHistory[len(m.cycleHistory)-1].CycleID
+		hasRange = true
+	}
+	for i := len(m.cycleHistory) - 1; i >= 0; i-- {
+		if m.cycleHistory[i].CycleID == id {
+			return m.cycleHistory[i].counters().clone(), true, oldest, newest, hasRange
+		}
+	}
+	return CycleRecord{}, false, oldest, newest, hasRange
 }

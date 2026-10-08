@@ -7,6 +7,7 @@ package compaction
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,7 +22,7 @@ import (
 
 // TestAppendCycleHistoryBoundsAtTheLimitIssue1162 pins the ring bound and that
 // trimming drops the oldest -- the invariant the in-place finalizer update and
-// RetainedCycleRange both rely on.
+// CycleLookup both rely on.
 func TestAppendCycleHistoryBoundsAtTheLimitIssue1162(t *testing.T) {
 	var history []CycleRecord
 	total := CycleHistoryLimit + 25
@@ -98,6 +99,20 @@ func historyRig(t *testing.T, compact func(context.Context, Candidate) error) *M
 	return manager
 }
 
+// cycleByID and retainedRange narrow the production lookup for tests that
+// care about only one of its results.
+func cycleByID(t interface{ Helper() }, m *Manager, id int64) (CycleRecord, bool) {
+	t.Helper()
+	rec, found, _, _, _ := m.CycleLookup(id)
+	return rec, found
+}
+
+func retainedRange(t interface{ Helper() }, m *Manager) (int64, int64, bool) {
+	t.Helper()
+	_, _, oldest, newest, hasRange := m.CycleLookup(-1)
+	return oldest, newest, hasRange
+}
+
 // awaitBatch fails loudly rather than hanging when a batch is never entered.
 // A test that blocks inside a batch is meaningless if the batch never ran.
 func awaitBatch(t *testing.T, entered <-chan struct{}) {
@@ -120,7 +135,7 @@ func TestCycleHistoryRecordsRequestedScopeIssue1162(t *testing.T) {
 		t.Fatalf("cycle failed: %v", err)
 	}
 
-	rec, ok := manager.CycleByID(cycleID)
+	rec, ok := cycleByID(t, manager, cycleID)
 	if !ok {
 		t.Fatalf("cycle %d not retained", cycleID)
 	}
@@ -183,7 +198,7 @@ func TestCycleHistorySourceDistinguishesCallersIssue1162(t *testing.T) {
 			if err != nil {
 				t.Fatalf("cycle failed: %v", err)
 			}
-			rec, ok := manager.CycleByID(cycleID)
+			rec, ok := cycleByID(t, manager, cycleID)
 			if !ok {
 				t.Fatalf("cycle %d not retained", cycleID)
 			}
@@ -229,7 +244,7 @@ func TestRunningCycleIsVisibleWithLiveCountersIssue1162(t *testing.T) {
 		t.Fatal("no cycle recorded as running while a batch is blocked inside one")
 	}
 	running := page.RunningCycleID
-	rec, ok := manager.CycleByID(running)
+	rec, ok := cycleByID(t, manager, running)
 	if !ok {
 		t.Fatalf("running cycle %d not retained", running)
 	}
@@ -242,9 +257,18 @@ func TestRunningCycleIsVisibleWithLiveCountersIssue1162(t *testing.T) {
 	if len(rec.Databases) != 1 || rec.Databases[0] != "db1" {
 		t.Errorf("databases = %v, want [db1] while running", rec.Databases)
 	}
-	// Live counters: the batch has started but cannot have finished.
+	// Live counters: the batch has started but cannot have finished. Every
+	// counter is asserted, not just one -- a resolver that forgot to load
+	// Discovered would still satisfy a Started-only check, and would then
+	// report a NEGATIVE unstarted_batches.
 	if rec.Started != 1 {
 		t.Errorf("started_batches = %d, want 1 (live counters must be readable)", rec.Started)
+	}
+	if rec.Discovered != 1 {
+		t.Errorf("discovered_batches = %d, want 1 while running", rec.Discovered)
+	}
+	if rec.Unstarted < 0 {
+		t.Errorf("unstarted_batches = %d, must never be negative", rec.Unstarted)
 	}
 	if rec.Succeeded != 0 {
 		t.Errorf("succeeded_batches = %d, want 0 while the batch is blocked", rec.Succeeded)
@@ -256,7 +280,7 @@ func TestRunningCycleIsVisibleWithLiveCountersIssue1162(t *testing.T) {
 		t.Fatalf("finished cycle %d != running cycle %d", finished, running)
 	}
 
-	rec, ok = manager.CycleByID(finished)
+	rec, ok = cycleByID(t, manager, finished)
 	if !ok {
 		t.Fatalf("cycle %d not retained after finishing", finished)
 	}
@@ -276,7 +300,7 @@ func TestRunningCycleIsVisibleWithLiveCountersIssue1162(t *testing.T) {
 
 // TestCycleHistoryGrowsByExactlyOnePerCycleIssue1162 guards the in-place
 // update. If the finalizer matched the wrong id it would take the defensive
-// append branch and write TWO records per cycle; CycleByID returns one of them,
+// append branch and write TWO records per cycle; a lookup returns one of them,
 // so every other test here would still pass.
 func TestCycleHistoryGrowsByExactlyOnePerCycleIssue1162(t *testing.T) {
 	manager := historyRig(t, func(context.Context, Candidate) error { return nil })
@@ -319,7 +343,11 @@ func TestRunningCycleDoesNotLeakIntoLastCycleIssue1162(t *testing.T) {
 	}
 
 	blockSecond.Store(true)
-	go manager.RunCompactionCycleForDatabase(context.Background(), "db1", []string{"hourly"})
+	second := make(chan struct{})
+	go func() {
+		defer close(second)
+		_, _ = manager.RunCompactionCycleForDatabase(context.Background(), "db1", []string{"hourly"})
+	}()
 
 	awaitBatch(t, entered)
 
@@ -331,7 +359,10 @@ func TestRunningCycleDoesNotLeakIntoLastCycleIssue1162(t *testing.T) {
 		t.Errorf("last_cycle.cycle_id = %v, want %d (the previous finished cycle)", got, first)
 	}
 
+	// Waited for, not abandoned: historyRig closes the storage backend in
+	// t.Cleanup, and a cycle still running past the test would outlive it.
 	close(release)
+	<-second
 }
 
 // TestCycleRecordSamplesFailedPartitionsIssue1162 covers the follow-up question
@@ -347,7 +378,7 @@ func TestCycleRecordSamplesFailedPartitionsIssue1162(t *testing.T) {
 		t.Fatal("cycle reported success despite a failing batch")
 	}
 
-	rec, ok := manager.CycleByID(cycleID)
+	rec, ok := cycleByID(t, manager, cycleID)
 	if !ok {
 		t.Fatalf("cycle %d not retained", cycleID)
 	}
@@ -382,14 +413,14 @@ func TestTruncateCycleErrorBoundsRetentionIssue1162(t *testing.T) {
 	}
 }
 
-// TestRetainedCycleRangeReportsAbsenceIssue1162 pins that an empty history is
+// TestCycleLookupReportsAbsenceIssue1162 pins that an empty history is
 // distinguishable from a real range. Ids start at 1, so a 0/0 range would make
 // every id look newer than the newest retained cycle.
-func TestRetainedCycleRangeReportsAbsenceIssue1162(t *testing.T) {
+func TestCycleLookupReportsAbsenceIssue1162(t *testing.T) {
 	manager, _, cleanup := setupTestManager(t)
 	t.Cleanup(cleanup)
 
-	if _, _, ok := manager.RetainedCycleRange(); ok {
+	if _, _, ok := retainedRange(t, manager); ok {
 		t.Error("an empty history reported a retained range")
 	}
 	empty := manager.CyclePage(10)
@@ -402,8 +433,8 @@ func TestRetainedCycleRangeReportsAbsenceIssue1162(t *testing.T) {
 	if empty.Cycles != nil {
 		t.Errorf("empty history returned %v cycles", empty.Cycles)
 	}
-	if rec, ok := manager.CycleByID(1); ok {
-		t.Errorf("CycleByID on an empty history returned %+v", rec)
+	if rec, ok := cycleByID(t, manager, 1); ok {
+		t.Errorf("a lookup on an empty history returned %+v", rec)
 	}
 }
 
@@ -428,7 +459,7 @@ func TestCycleHistoryNewestFirstIssue1162(t *testing.T) {
 		t.Errorf("got ids %d,%d, want %d,%d (newest first)", page[0].CycleID, page[1].CycleID, ids[3], ids[2])
 	}
 
-	oldest, newest, ok := manager.RetainedCycleRange()
+	oldest, newest, ok := retainedRange(t, manager)
 	if !ok {
 		t.Fatal("no retained range after four cycles")
 	}
@@ -437,44 +468,134 @@ func TestCycleHistoryNewestFirstIssue1162(t *testing.T) {
 	}
 }
 
-// TestCycleLookupIsRaceFreeIssue1162 reads a running cycle's live counters
-// while its workers mutate them.
+// TestCycleLookupIsRaceFreeIssue1162 reads a running cycle while its workers
+// mutate BOTH the atomic counters and failedSample.
+//
+// The first version of this test asserted the right thing about the wrong
+// state. With one candidate and MaxConcurrent 1 there is a single worker: it
+// increments started once and then blocks, and succeeded/failed fire only
+// after release is closed -- which happened AFTER the readers finished. So no
+// counter was written during any read, recordFailure was never called at all,
+// and removing the mutex from recordFailure and snapshotFailedSample left the
+// whole package passing under -race. failedSample is the only part of
+// cycleProgress that is not an atomic, so it was the one thing that needed
+// this test and the one thing it did not touch.
+//
+// Now: many candidates, several workers, every batch FAILS (so recordFailure
+// writes), each sleeping briefly to widen the window, and readers spin for the
+// whole cycle rather than a fixed count.
 func TestCycleLookupIsRaceFreeIssue1162(t *testing.T) {
-	release := make(chan struct{})
-	entered := make(chan struct{})
-	var once sync.Once
+	const candidates = 60
 
-	manager := historyRig(t, func(ctx context.Context, _ Candidate) error {
-		once.Do(func() { close(entered) })
-		select {
-		case <-release:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-		return nil
+	manager := historyRig(t, func(context.Context, Candidate) error {
+		// Widen the window deliberately: the first cycleFailedSampleLimit
+		// failures are the only ones that WRITE failedSample, and without a
+		// pause they all land within microseconds of each other and the
+		// readers can miss them entirely.
+		time.Sleep(time.Millisecond)
+		return errors.New("deliberate failure")
 	})
+	manager.MaxConcurrent = 4
+	manager.Tiers = []Tier{cycleTierIssue915{
+		find: func(context.Context, string, string) ([]Candidate, error) {
+			out := make([]Candidate, 0, candidates)
+			for i := 0; i < candidates; i++ {
+				out = append(out, Candidate{
+					Database:      "db1",
+					Measurement:   "cpu",
+					PartitionPath: fmt.Sprintf("db1/cpu/2026/10/08/%02d", i),
+					Files:         []string{"a.parquet", "b.parquet"},
+					FileCount:     2,
+					Tier:          "hourly",
+				})
+			}
+			return out, nil
+		},
+	}}
 
+	// Readers start BEFORE the cycle and spin until it ends, so overlap does
+	// not depend on timing.
 	done := make(chan struct{})
-	go func() {
-		manager.RunCompactionCycleForDatabase(context.Background(), "db1", []string{"hourly"})
-		close(done)
-	}()
-
-	awaitBatch(t, entered)
 	var readers sync.WaitGroup
 	for i := 0; i < 8; i++ {
 		readers.Add(1)
 		go func() {
 			defer readers.Done()
-			for j := 0; j < 50; j++ {
-				if p := manager.CyclePage(10); p.HasRunning {
-					manager.CycleByID(p.RunningCycleID)
+			for {
+				select {
+				case <-done:
+					return
+				default:
 				}
-				manager.RetainedCycleRange()
+				if p := manager.CyclePage(10); p.HasRunning {
+					cycleByID(t2NoFatal{}, manager, p.RunningCycleID)
+				}
+				manager.CyclePage(0)
 			}
 		}()
 	}
+
+	cycleID, err := manager.RunCompactionCycleForDatabase(context.Background(), "db1", []string{"hourly"})
+	close(done)
 	readers.Wait()
-	close(release)
-	<-done
+
+	if err == nil {
+		t.Fatal("cycle reported success despite every batch failing")
+	}
+	rec, ok := cycleByID(t, manager, cycleID)
+	if !ok {
+		t.Fatalf("cycle %d not retained", cycleID)
+	}
+	// Precondition: recordFailure genuinely ran, and filled the sample to its
+	// cap. Without this the test could pass having raced nothing.
+	if rec.Failed != candidates {
+		t.Errorf("failed_batches = %d, want %d", rec.Failed, candidates)
+	}
+	if len(rec.FailedSample) != cycleFailedSampleLimit {
+		t.Fatalf("failed_sample holds %d entries, want the cap of %d -- recordFailure did not race the readers",
+			len(rec.FailedSample), cycleFailedSampleLimit)
+	}
+	if rec.Unstarted < 0 {
+		t.Errorf("unstarted_batches = %d, must never be negative", rec.Unstarted)
+	}
+}
+
+// t2NoFatal lets the reader goroutines call cycleByID, whose signature takes a
+// *testing.T only for t.Helper(). Calling t.Fatal off the test goroutine is
+// invalid, and these readers assert nothing.
+type t2NoFatal struct{}
+
+func (t2NoFatal) Helper() {}
+
+// TestFinalisedRecordDropsItsProgressPointerIssue1162 pins the retention half
+// of the progress contract.
+//
+// CycleRecord.progress documents that the finalizer "clears it, so a finished
+// outcome never follows the pointer". Nothing enforced that: leaving the
+// pointer on the finalised outcome kept both packages green, because by then
+// the live atomics equal the stored values and counters() recomputes the same
+// numbers. The cost is invisible and purely retention -- up to
+// CycleHistoryLimit cycleProgress structs, each with its failedSample backing
+// array, pinned for the life of the process.
+func TestFinalisedRecordDropsItsProgressPointerIssue1162(t *testing.T) {
+	manager := historyRig(t, func(context.Context, Candidate) error { return nil })
+
+	if _, err := manager.RunCompactionCycleForDatabase(context.Background(), "db1", []string{"hourly"}); err != nil {
+		t.Fatalf("cycle failed: %v", err)
+	}
+
+	// Inspected in the retained history, not through a lookup: counters()
+	// nils the pointer on the COPY it returns, so a lookup can never see this.
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if len(manager.cycleHistory) != 1 {
+		t.Fatalf("history holds %d records, want 1", len(manager.cycleHistory))
+	}
+	rec := manager.cycleHistory[0]
+	if rec.FinishedAt.IsZero() {
+		t.Fatal("record is not finalised; this test asserts nothing")
+	}
+	if rec.progress != nil {
+		t.Error("a finalised record still holds its cycleProgress pointer, pinning it for the life of the process")
+	}
 }

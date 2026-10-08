@@ -506,6 +506,7 @@ func (h *CompactionHandler) getHistory(c *fiber.Ctx) error {
 // Stats(), which coerces a nil slice to []: here [] would be ambiguous with
 // "no databases", so null carries the meaning.
 func cycleResponse(rec compaction.CycleRecord) fiber.Map {
+	startedAt := rec.StartedAt.UTC().Truncate(time.Second)
 	out := fiber.Map{
 		"cycle_id":            rec.CycleID,
 		"status":              rec.Status,
@@ -513,7 +514,7 @@ func cycleResponse(rec compaction.CycleRecord) fiber.Map {
 		"databases":           rec.Databases,
 		"measurement":         rec.Measurement,
 		"tiers":               rec.Tiers,
-		"started_at":          rec.StartedAt.UTC().Truncate(time.Second),
+		"started_at":          startedAt,
 		"discovered_batches":  rec.Discovered,
 		"started_batches":     rec.Started,
 		"succeeded_batches":   rec.Succeeded,
@@ -526,10 +527,15 @@ func cycleResponse(rec compaction.CycleRecord) fiber.Map {
 	if rec.FinishedAt.IsZero() {
 		// Still running: the counters above are a live snapshot, so report the
 		// elapsed time rather than a duration that does not exist yet.
-		out["duration_seconds"] = int64(time.Since(rec.StartedAt).Seconds())
+		out["duration_seconds"] = int64(time.Since(startedAt).Seconds())
 	} else {
-		out["finished_at"] = rec.FinishedAt.UTC().Truncate(time.Second)
-		out["duration_seconds"] = int64(rec.FinishedAt.Sub(rec.StartedAt).Seconds())
+		// Both derived from the TRUNCATED values that are rendered, so the
+		// duration always equals finished_at - started_at as the client reads
+		// them. Computing from the untruncated times let a cycle that started
+		// at :00.9 and finished at :01.1 render a 1 s gap with duration 0.
+		finishedAt := rec.FinishedAt.UTC().Truncate(time.Second)
+		out["finished_at"] = finishedAt
+		out["duration_seconds"] = int64(finishedAt.Sub(startedAt).Seconds())
 	}
 	if rec.Err != "" {
 		out["error"] = rec.Err
@@ -567,7 +573,11 @@ func (h *CompactionHandler) getCycle(c *fiber.Ctx) error {
 	// history; checking the record first means the recorded answer always
 	// wins and the synthesized one below is reachable only when there is
 	// genuinely nothing recorded.
-	if rec, ok := h.manager.CycleByID(id); ok {
+	//
+	// The record and the retained range come from ONE lock acquisition, so the
+	// range a 404 reports is the same snapshot that produced the miss.
+	rec, found, oldest, newest, haveRange := h.manager.CycleLookup(id)
+	if found {
 		return c.JSON(cycleResponse(rec))
 	}
 
@@ -589,7 +599,16 @@ func (h *CompactionHandler) getCycle(c *fiber.Ctx) error {
 		"error":    "no retained record of this compaction cycle on this node",
 		"cycle_id": id,
 	}
-	oldest, newest, haveRange := h.manager.RetainedCycleRange()
+	// On a cluster the holder is the only actionable datum in this response:
+	// it names where the cycle actually ran. The trigger 503 already reports
+	// it (#1152), so the lookup that follows a trigger should too. nil gate is
+	// OSS or standalone, and an empty holder means this cluster manages no
+	// lease at all -- in neither case is there a holder to name.
+	if h.gate != nil {
+		if holder := h.gate.LeaseHolder(); holder != "" {
+			resp["lease_holder"] = holder
+		}
+	}
 	switch {
 	case !haveRange:
 		// No range keys at all. Emitting 0/0 would make every id look newer
