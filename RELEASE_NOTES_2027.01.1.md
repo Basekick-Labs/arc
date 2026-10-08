@@ -569,6 +569,40 @@ previously higher setting can reduce compaction throughput.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1043](https://github.com/Basekick-Labs/arc/pull/1043).
 
+### Raising compaction.max_concurrent no longer multiplies the subprocess thread count ([#1037](https://github.com/Basekick-Labs/arc/issues/1037))
+
+When `compaction.threads` is left at its automatic default, Arc divided the CPUs
+this process may use by two, regardless of how many compaction jobs could run at
+once. The halving hardcoded the default `compaction.max_concurrent = 2`, so an
+operator who raised concurrency got that many subprocesses each still claiming
+half the cores: at `max_concurrent = 4` on 16 CPUs, four jobs at 8 threads
+each. The memory budget already tracked the setting — `compaction.memory_limit`
+divides by `max_concurrent` — so the two derivations disagreed about the same
+knob.
+
+The automatic default is now those CPUs divided by `max(2,
+compaction.max_concurrent)`, minimum 1. "CPUs this process may use" is
+`min(runtime.NumCPU(), runtime.GOMAXPROCS(0))`, which reflects a quota, a
+cpuset, or an explicitly set `GOMAXPROCS` without distinguishing which one
+imposed the limit.
+
+**At the default `max_concurrent = 2` nothing changes** — the divisor is still
+2, so no existing deployment loses compaction throughput on upgrade. Above the
+default it tightens: `max_concurrent = 4` on 16 CPUs now gives 4 threads per
+subprocess rather than 8. That is a deliberate throughput trade in the
+configuration that was oversubscribing, and it is not backed by a workload
+benchmark at raised concurrency — what is measured is that thread count trades
+against the per-subprocess memory budget rather than being uniformly better or
+worse (see #1030 in the 26.09.3 notes for the numbers). An explicit
+`compaction.threads` value is untouched by the automatic default, though the
+licence cap above still applies to it.
+
+The divisor covers compaction subprocesses only. The main process competes for
+the same CPUs and is not accounted for here, so these remain caps on
+parallelism, not reservations.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1041](https://github.com/Basekick-Labs/arc/pull/1041).
+
 ### Database API storage calls now have a deadline ([#1065](https://github.com/Basekick-Labs/arc/issues/1065))
 
 Database API handlers now bound storage calls with a request context. Database

@@ -209,8 +209,15 @@ type CompactionConfig struct {
 	// available to this process; it does not distinguish a quota, cpuset, or
 	// GOMAXPROCS setting. The default max_concurrent of 2 preserves the previous
 	// half-core value, while higher concurrency divides the thread cap across
-	// subprocesses. Positive explicit values are subject to the later licence
-	// cap. Before this key existed, each subprocess used DuckDB's own default,
+	// subprocesses (#1037).
+	//
+	// Whatever value this ends up with is then subject to the licence cap in
+	// cmd/arc/main.go#applyLicenseCoreLimits (#1036) — the AUTO value included,
+	// not only an explicit one, because Load resolves this sentinel to a
+	// positive number before that runs. The cap applies on a core-limited
+	// licence only; applyLicenseCoreLimits returns early when MaxCores <= 0.
+	//
+	// Before this key existed, each subprocess used DuckDB's own default,
 	// which could allow concurrent jobs to saturate the machine and starve
 	// ingest. Sort and scan buffers also scale with threads, so this bounds
 	// memory.
@@ -2393,9 +2400,11 @@ func getDefaultCompactionThreads(maxConcurrent int) int {
 }
 
 func defaultCompactionThreads(cores, maxConcurrent int) int {
-	if maxConcurrent <= 0 {
-		maxConcurrent = 2
-	}
+	// The floor of 2 does double duty: it keeps the pre-#1037 half-core default
+	// byte-identical at the default max_concurrent, and it absorbs the
+	// non-positive sentinel the same way compaction.NewManager does (0 means
+	// "use 2"). Load has already rejected a negative max_concurrent, so the only
+	// non-positive value that reaches here is an explicit max_concurrent = 0.
 	divisor := max(2, maxConcurrent)
 	threads := cores / divisor
 	if threads < 1 {
