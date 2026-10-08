@@ -29,3 +29,14 @@ data reached storage. Files that remain unrecoverable are kept for retry and,
 after repeated replay failures, renamed with a `.failed` suffix. Investigate
 `arc_wal_quarantined_files_total` and preserve those files until their contents
 have been accounted for.
+
+An incomplete final entry after an interrupted append is treated as a truncated
+tail, not as a poison entry. Complete preceding entries still pass the flush
+barrier before their file is removed. A checksum or decoding failure in a
+complete entry remains a recovery failure, even at the end of the file.
+
+Quarantined WAL files are not replayed, but their valid flush checkpoints are
+still scanned on every recovery pass. A checkpoint in one file can cover data
+in an earlier file that is still awaiting recovery. Preserve quarantined files
+together with the remaining WAL directory; deleting or moving one away can
+remove the proof that prevents already-flushed records from being replayed.

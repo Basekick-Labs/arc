@@ -1090,6 +1090,13 @@ pass can retry after storage recovers. Periodic cleanup uses the unflushed
 sequence floor instead of file age so a slow flush cannot lose its durable copy
 (#1009, #966).
 
+An incomplete final WAL header or payload after an interrupted append no longer
+counts as a poison entry: complete preceding entries still require a successful
+flush barrier before reclamation. Complete entries with invalid checksums remain
+recovery failures. Checkpoints in quarantined WAL files remain part of recovery's
+durability proof, so a later retry does not replay already-flushed entries merely
+because their checkpoint file was renamed.
+
 Contributed by [@jallegri](https://github.com/jallegri) in [#1118](https://github.com/Basekick-Labs/arc/pull/1118).
 
 ### The tiering files endpoint rejects an invalid `limit` ([#1135](https://github.com/Basekick-Labs/arc/issues/1135))

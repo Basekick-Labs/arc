@@ -236,11 +236,20 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		return false
 	}
 
+	// Quarantined data is not replayed, but its checkpoints remain durable
+	// proof for entries in earlier retained files, including after a restart.
+	// Include the collision suffix used by noteReplayFailure as well.
+	quarantinedFiles, err := filepath.Glob(filepath.Join(r.walDir, "*.wal*.failed"))
+	if err != nil {
+		return stats, fmt.Errorf("find quarantined WAL checkpoints: %w", err)
+	}
+	checkpointFiles := append(append([]string(nil), walFiles...), quarantinedFiles...)
+
 	// Scan non-active files for checkpoints before invoking callbacks. A flush
 	// checkpoint can land in the next WAL file after rotation, while the data
 	// entry remains in the previous file. Recently rotated files are scanned for
 	// checkpoints too, even though the replay pass below skips them.
-	for _, walFile := range walFiles {
+	for _, walFile := range checkpointFiles {
 		select {
 		case <-ctx.Done():
 			stats.KeptFiles += len(pendingDelete)
@@ -259,8 +268,9 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		checkpointHashes, err := reader.ReadCheckpointHashes()
 		if err != nil {
 			r.logger.Error().Err(err).Str("file", walFile).Msg("Failed to scan WAL checkpoints")
-			continue
 		}
+		// A later damaged entry must not erase earlier checksum-validated
+		// checkpoints returned by the reader alongside its scan error.
 		for _, hash := range checkpointHashes {
 			flushed[hash] = struct{}{}
 		}
