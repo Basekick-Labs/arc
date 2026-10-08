@@ -85,9 +85,9 @@ func TestGetDefaultCompactionThreads_UsesEffectiveCores(t *testing.T) {
 		cores, maxConcurrent, want int
 	}{
 		{8, 2, 4},  // the default stays byte-for-byte equivalent to the prior half-core value
-		{16, 4, 4}, // elevated concurrency divides available cores; the old quota formula returns 3
+		{16, 4, 4}, // raised concurrency divides the cores; the pre-#1037 always-halve rule returns 8
 		{8, 4, 2},  // a constrained process uses the same concurrency rule
-		{8, 0, 4},  // non-positive values retain NewManager's default of two
+		{8, 0, 4},  // an explicit max_concurrent = 0 falls back to two, as NewManager does
 	} {
 		t.Run(fmt.Sprintf("cores_%d_concurrent_%d", c.cores, c.maxConcurrent), func(t *testing.T) {
 			effectiveCoresFn = func() int { return c.cores }
@@ -95,9 +95,6 @@ func TestGetDefaultCompactionThreads_UsesEffectiveCores(t *testing.T) {
 				t.Errorf("with %d effective cores and max_concurrent=%d: got %d, want %d", c.cores, c.maxConcurrent, got, c.want)
 			}
 		})
-	}
-	if got := defaultCompactionThreads(16, 4); got == 16/5 {
-		t.Errorf("raised-concurrency result %d matches the old max_concurrent+1 divisor result", got)
 	}
 }
 
