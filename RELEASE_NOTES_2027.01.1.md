@@ -617,6 +617,56 @@ parallelism, not reservations.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1041](https://github.com/Basekick-Labs/arc/pull/1041).
 
+### Iceberg snapshot history no longer advertises files Arc has deleted ([#1092](https://github.com/Basekick-Labs/arc/issues/1092))
+
+**Arc does not support Iceberg time travel across compaction, retention or a
+partial DELETE, and the metadata now says so instead of failing on the read.**
+
+Every Arc mechanism that removes a data file — compaction (scheduled hourly by
+default), retention, and both branches of the delete API — removes it from
+storage and from the current Iceberg snapshot. Older snapshots kept naming the
+deleted path, so an external engine time-travelling to one got:
+
+```
+IO Error: Cannot open file ".../cpu_20261008_155058_567682000.parquet": No such file or directory
+```
+
+That is indistinguishable from object storage having lost the object, which is
+the wrong thing for an operator to go and investigate. A reconcile pass that
+removes any path now expires every older snapshot, so the same query returns a
+routine `Could not find snapshot with id ...` — a normal outcome of any
+retention policy, which Iceberg consumers already handle by re-reading the
+current snapshot.
+
+**This loses no readable history.** A removed path is referenced by every
+snapshot from the one that added it onward, so each of those was already
+unreadable. An append-only pass removes nothing and still keeps
+`iceberg.retain_snapshots` snapshots (default 10), because that history does
+work.
+
+Why Arc cannot do real copy-on-write here: Iceberg keeps superseded data files
+alive until the snapshots referencing them expire, but Arc reads a partition
+with a glob, so any superseded file left in place is double-counted by every
+ordinary query — the bug [#1073](https://github.com/Basekick-Labs/arc/pull/1073)
+fixed, where a 3-row table returned 11. The two requirements are in direct
+conflict, and honest metadata is the half Arc can deliver.
+
+**Two limitations worth knowing:**
+
+- The fix applies to the entry point readers use, `version-hint.text`. Arc also
+  keeps `retain_snapshots + 1` older `v<N>.metadata.json` copies for
+  directory-based readers, and those still list the pre-floor snapshots. A
+  consumer that pins one of them directly still gets the `IO Error` until the
+  copy is pruned, roughly `retain_snapshots` passes later.
+- History already broken on an existing deployment is cleaned on that table's
+  next pass that removes something. A table whose file set has gone quiet is
+  skipped by the reconciler, so its stale metadata stays until it changes again.
+
+A pass that drops history logs at `warn` with the before and after snapshot
+counts, so an operator who notices one-deep history finds the reason rather
+than inferring it. A failed expiry now also leaves the measurement uncached, so
+the next pass retries it; previously only a failed version-hint write did that.
+
 ### Database API storage calls now have a deadline ([#1065](https://github.com/Basekick-Labs/arc/issues/1065))
 
 Database API handlers now bound storage calls with a request context. Database
