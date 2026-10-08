@@ -2,7 +2,9 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"github.com/gofiber/fiber/v2"
 	"sync"
 
 	"github.com/basekick-labs/arc/internal/replicaview"
@@ -32,12 +34,19 @@ func (h *QueryHandler) SetReplicationView(view *replicaview.View, resolve func(s
 	h.replicationResolve = resolve
 }
 
+func (h *QueryHandler) SetReplicationSync(sync func(context.Context) error) { h.replicationSync = sync }
+
 func (h *QueryHandler) attachReplicationLease(ctx context.Context) (context.Context, error) {
 	if h.replicationView == nil {
 		return ctx, nil
 	}
 	if _, ok := ctx.Value(replicationLeaseKey{}).(*replicationQueryLease); ok {
 		return ctx, nil
+	}
+	if h.replicationSync != nil {
+		if err := h.replicationSync(ctx); err != nil {
+			return ctx, errors.Join(replicaview.ErrUnavailable, err)
+		}
 	}
 	owner, ok := ctx.(interface {
 		SetUserValue(interface{}, interface{})
@@ -72,4 +81,12 @@ func (h *QueryHandler) replicationReadExpr(ctx context.Context, database, measur
 		return keyword + " (SELECT NULL)"
 	}
 	return keyword + " " + relation
+}
+
+// Catch-up delays are retryable availability failures, not malformed SQL.
+func queryTransformErrorStatus(err error) int {
+	if errors.Is(err, replicaview.ErrUnavailable) {
+		return fiber.StatusServiceUnavailable
+	}
+	return fiber.StatusBadRequest
 }

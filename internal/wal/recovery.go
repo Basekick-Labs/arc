@@ -34,6 +34,11 @@ type RecoveryStats struct {
 
 // RecoveryOptions configures WAL recovery behavior
 type RecoveryOptions struct {
+	// RequireOriginIdentity refuses historical payloads whose provenance cannot
+	// be distinguished from old identity-free received WAL. They stay on disk;
+	// neither a node's current role nor a content hash establishes origin.
+	RequireOriginIdentity bool
+
 	// ReplicationCallback recovers received WAL entries into the replica view,
 	// never the ordinary ingest buffer. A missing callback preserves the WAL
 	// file and reports an error rather than reclassifying or discarding data.
@@ -192,6 +197,9 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 			if _, ok := flushed[entry.PayloadHash]; ok {
 				r.logger.Debug().Str("payload_hash", entry.PayloadHash).Msg("Skipping WAL entry covered by flush checkpoint")
 				continue
+			}
+			if opts.RequireOriginIdentity && len(entry.PayloadHash) != 32 {
+				return stats, fmt.Errorf("WAL entry lacks originating provenance; preserve this WAL for explicit migration")
 			}
 			if entry.ReplicationPayload != nil {
 				if opts.ReplicationCallback == nil || opts.ReplicationFlush == nil {

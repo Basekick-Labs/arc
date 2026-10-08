@@ -575,6 +575,10 @@ func (b *LocalBackend) ListDirectories(ctx context.Context, prefix string) ([]st
 		return nil, fmt.Errorf("invalid prefix: %w", err)
 	}
 
+	if isReplicaPrivateKey(prefix) {
+		return nil, nil
+	}
+
 	entries, err := os.ReadDir(searchPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -782,6 +786,9 @@ var errHiddenName = errors.New("storage: name is dot-prefixed")
 // would miss everything skipped for another reason, and would drift again the
 // next time a listing grows a filter (#756).
 func omittedFromListing(base, relPath string) error {
+	if isReplicaPrivateKey(relPath) {
+		return errHiddenName
+	}
 	// Dot-prefixed names cover Arc's own in-flight ".arc-*.tmp" writes and OS
 	// debris such as .DS_Store. Note it also covers dot-prefixed DATA files,
 	// which the key contract accepts, which is why this is part of the
@@ -1184,6 +1191,9 @@ func (b *LocalBackend) ListUnusable(ctx context.Context, prefix string) ([]Unusa
 		}
 		relPath = filepath.ToSlash(relPath)
 
+		if isReplicaPrivateKey(relPath) {
+			return nil
+		}
 		reason := omittedFromListing(d.Name(), relPath)
 		if reason == nil {
 			return nil // ListObjects returns it; not our business

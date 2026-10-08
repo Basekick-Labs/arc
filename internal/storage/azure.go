@@ -445,7 +445,7 @@ func (b *AzureBlobBackend) List(ctx context.Context, prefix string) ([]string, e
 				key := strings.TrimPrefix(*blobItem.Name, b.prefix)
 				// See S3Backend.List: a listing never returns a key this
 				// backend would refuse (#743).
-				if ValidateKey(key) != nil {
+				if isReplicaPrivateKey(key) || ValidateKey(key) != nil {
 					continue
 				}
 				blobs = append(blobs, key)
@@ -650,6 +650,10 @@ func (b *AzureBlobBackend) ListDirectories(ctx context.Context, prefix string) (
 		return nil, err
 	}
 
+	if isReplicaPrivateKey(prefix) {
+		return nil, nil
+	}
+
 	var dirs []string
 	delimiter := "/"
 
@@ -718,7 +722,7 @@ func (b *AzureBlobBackend) ListObjects(ctx context.Context, prefix string) ([]Ob
 				key := strings.TrimPrefix(*blobItem.Name, b.prefix)
 				// See S3Backend.List: a listing never returns a key this
 				// backend would refuse (#743).
-				if ValidateKey(key) != nil {
+				if isReplicaPrivateKey(key) || ValidateKey(key) != nil {
 					continue
 				}
 				info := ObjectInfo{
@@ -804,6 +808,9 @@ func (b *AzureBlobBackend) ListUnusable(ctx context.Context, prefix string) ([]U
 				continue
 			}
 			key := strings.TrimPrefix(*blobItem.Name, b.prefix)
+			if isReplicaPrivateKey(key) {
+				continue
+			}
 			reason := ValidateKey(key)
 			if reason == nil {
 				continue // ListObjects returns it

@@ -674,6 +674,7 @@ func stripSQLComments(sql string, hasComments bool) string {
 
 // QueryHandler handles SQL query endpoints
 type QueryHandler struct {
+	replicationSync    func(context.Context) error
 	replicationView    *replicaview.View
 	replicationResolve func(string) string
 	db                 *database.DuckDB
@@ -2070,7 +2071,7 @@ localProcessing:
 	convertedSQL, parallelInfo, cached, err := h.getTransformedSQLForParallel(c.Context(), req.SQL, headerDB)
 	if err != nil {
 		m.IncQueryErrors()
-		return respondError(c, fiber.StatusBadRequest, err.Error(), timestamp, start)
+		return respondError(c, queryTransformErrorStatus(err), err.Error(), timestamp, start)
 	}
 
 	// arcx decline census (no-op stub in stock builds; no query text is emitted).
@@ -4848,7 +4849,7 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 	convertedSQL, _, err := h.getTransformedSQL(c.Context(), req.SQL, headerDB)
 	if err != nil {
 		metrics.Get().IncQueryErrors()
-		return c.Status(fiber.StatusBadRequest).JSON(EstimateResponse{
+		return c.Status(queryTransformErrorStatus(err)).JSON(EstimateResponse{
 			Success:         false,
 			Error:           err.Error(),
 			WarningLevel:    "error",
@@ -5397,7 +5398,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	convertedSQL, _, err := h.getTransformedSQL(c.Context(), sql, "")
 	if err != nil {
 		m.IncQueryErrors()
-		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
+		return c.Status(queryTransformErrorStatus(err)).JSON(QueryResponse{
 			Success:   false,
 			Error:     "Invalid query: " + err.Error(),
 			Timestamp: time.Now().UTC().Format(time.RFC3339),

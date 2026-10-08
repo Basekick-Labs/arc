@@ -155,3 +155,21 @@ func (c Coverage) Covers(other Coverage) bool {
 	}
 	return true
 }
+
+// Intersects reports overlap between normalized identity ranges.
+func (c Coverage) Intersects(other Coverage) bool {
+	i, j := 0, 0
+	for i < len(c) && j < len(other) {
+		a, b := c[i], other[j]
+		if a.Instance < b.Instance || (a.Instance == b.Instance && a.Last < b.First) {
+			i++
+			continue
+		}
+		if b.Instance < a.Instance || (a.Instance == b.Instance && b.Last < a.First) {
+			j++
+			continue
+		}
+		return true
+	}
+	return false
+}

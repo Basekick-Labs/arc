@@ -616,7 +616,7 @@ func (b *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 				// becomes a hard error, and manifest recovery retries a
 				// permanent error forever. They are not data, so they are
 				// skipped rather than reported.
-				if ValidateKey(key) != nil {
+				if isReplicaPrivateKey(key) || ValidateKey(key) != nil {
 					continue
 				}
 				objects = append(objects, key)
@@ -871,6 +871,10 @@ func (b *S3Backend) ListDirectories(ctx context.Context, prefix string) ([]strin
 		return nil, err
 	}
 
+	if isReplicaPrivateKey(prefix) {
+		return nil, nil
+	}
+
 	var dirs []string
 	var continuationToken *string
 
@@ -941,7 +945,7 @@ func (b *S3Backend) ListObjects(ctx context.Context, prefix string) ([]ObjectInf
 				key := strings.TrimPrefix(*obj.Key, b.prefix)
 				// See List: a listing never returns a key the backend would
 				// refuse (#743).
-				if ValidateKey(key) != nil {
+				if isReplicaPrivateKey(key) || ValidateKey(key) != nil {
 					continue
 				}
 				info := ObjectInfo{Path: key}
@@ -1039,6 +1043,9 @@ func (b *S3Backend) ListUnusable(ctx context.Context, prefix string) ([]Unusable
 				continue
 			}
 			key := strings.TrimPrefix(*obj.Key, b.prefix)
+			if isReplicaPrivateKey(key) {
+				continue
+			}
 			reason := ValidateKey(key)
 			if reason == nil {
 				continue // ListObjects returns it

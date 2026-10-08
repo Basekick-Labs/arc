@@ -431,12 +431,13 @@ type FSMSnapshot struct {
 // ClusterFSM implements the raft.FSM interface for cluster state management.
 // It maintains the authoritative state of nodes in the cluster.
 type ClusterFSM struct {
-	replicationRetired map[string]ReplicationRetirement
-	mu                 sync.RWMutex
-	nodes              map[string]*NodeInfo
-	primaryWriterID    string                // ID of the current primary writer node
-	activeCompactorID  string                // ID of the node currently holding the compactor lease
-	files              map[string]*FileEntry // File manifest (path → entry) for peer replication
+	replicationRevision uint64
+	replicationRetired  map[string]ReplicationRetirement
+	mu                  sync.RWMutex
+	nodes               map[string]*NodeInfo
+	primaryWriterID     string                // ID of the current primary writer node
+	activeCompactorID   string                // ID of the node currently holding the compactor lease
+	files               map[string]*FileEntry // File manifest (path → entry) for peer replication
 	// Secondary index: database → set of file paths. Maintained alongside
 	// the primary `files` map on register/delete to avoid O(N) scans when
 	// filtering by database.
@@ -1515,6 +1516,7 @@ func (f *ClusterFSM) applyRegisterFileLocked(p RegisterFilePayload, logIndex uin
 		f.filesByDB[entry.Database] = idx
 	}
 	idx[entry.Path] = struct{}{}
+	f.replicationRevision++
 	f.keysCache = nil // invalidate sorted-key cache
 	callback := f.onFileRegistered
 	contentCallback := f.onFileContentChanged
@@ -1583,6 +1585,7 @@ func (f *ClusterFSM) applyDeleteFileLocked(p DeleteFilePayload) func() {
 			}
 		}
 	}
+	f.replicationRevision++
 	f.keysCache = nil // invalidate sorted-key cache
 	if !existed {
 		// Idempotent — deletion of a non-existent file is a no-op, and
@@ -1681,6 +1684,7 @@ func (f *ClusterFSM) applyUpdateFileLocked(p UpdateFilePayload, logIndex uint64)
 		}
 		idx[entry.Path] = struct{}{}
 	}
+	f.replicationRevision++
 	f.keysCache = nil // invalidate sorted-key cache
 	callback := f.onFileRegistered
 	contentCallback := f.onFileContentChanged
@@ -2869,6 +2873,7 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		}
 		teamSet[id] = struct{}{}
 	}
+	f.replicationRevision++
 	f.keysCache = nil // invalidate sorted-key cache after snapshot restore
 	onNodeAdded := f.onNodeAdded
 	onNodeRemoved := f.onNodeRemoved

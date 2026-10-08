@@ -2,6 +2,7 @@ package replicaview
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -38,11 +39,13 @@ type entryMaterialization struct {
 // View publishes immutable, verified files and takes one source snapshot for
 // each query. Merely advertising a primary file must never publish it here.
 type View struct {
-	mu      sync.Mutex
-	files   map[string]File
-	refs    map[string]int
-	retired map[partition]Coverage
-	entries map[entryKey]map[string]entryMaterialization
+	mu          sync.Mutex
+	files       map[string]File
+	refs        map[string]int
+	retired     map[partition]Coverage
+	entries     map[entryKey]map[string]entryMaterialization
+	unavailable error
+	blocked     map[string]error
 }
 
 func NewView() *View {
@@ -186,6 +189,7 @@ func (v *View) CanUnlink(path string) bool {
 }
 
 type Snapshot struct {
+	Err         error
 	Sources     []Selection
 	view        *View
 	leasedPaths []string
@@ -211,7 +215,14 @@ func (s *Snapshot) Close() error {
 func (v *View) Snapshot(database, measurement string) *Snapshot {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	snapshot := &Snapshot{view: v}
+	snapshot := &Snapshot{view: v, Err: v.unavailable}
+	if snapshot.Err == nil {
+		snapshot.Err = v.blocked[MeasurementKey(database, measurement)]
+	}
+	if snapshot.Err != nil {
+		snapshot.Err = errors.Join(ErrUnavailable, snapshot.Err)
+		return snapshot
+	}
 	covered := make(map[partition]Coverage)
 	for key, coverage := range v.retired {
 		if key.database == database && key.measurement == measurement {

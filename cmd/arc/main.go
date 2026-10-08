@@ -41,6 +41,7 @@ import (
 	"github.com/basekick-labs/arc/internal/mqtt"
 	"github.com/basekick-labs/arc/internal/queryregistry"
 	"github.com/basekick-labs/arc/internal/reconciliation"
+	"github.com/basekick-labs/arc/internal/replicaview"
 	"github.com/basekick-labs/arc/internal/scheduler"
 	"github.com/basekick-labs/arc/internal/shutdown"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -1047,7 +1048,35 @@ func main() {
 		Int("shard_count", cfg.Ingest.ShardCount).
 		Int("flush_queue_size", cfg.Ingest.FlushQueueSize).
 		Msg("Initializing Arrow buffer with ingestion config")
+	// WIP local-storage integration. Shared/cold-tier lifecycle is still a
+	// separate required integration before this branch can be shipped.
+	var replicationStore *replicaview.LocalStore
+	if cfg.Cluster.Enabled && cfg.Cluster.ReplicationEnabled && !cfg.Cluster.SharedStorageMode &&
+		!cfg.TieredStorage.Enabled && licenseClient != nil && licenseClient.GetLicense() != nil &&
+		licenseClient.GetLicense().HasFeature(license.FeatureClustering) {
+		if local, ok := storageBackend.(*storage.LocalBackend); ok {
+			var err error
+			replicationStore, err = replicaview.OpenLocalStore(context.Background(), local.GetBasePath())
+			if err != nil {
+				log.Fatal().Err(err).Msg("Cannot recover replica file provenance")
+			}
+			if cfg.Cluster.RaftDataDir == "" {
+				log.Fatal().Msg("Replica handoff requires a durable Raft manifest")
+			}
+			shutdownCoordinator.Register("replication-view", replicationStore, shutdown.PriorityStorage-1)
+		}
+	}
 	arrowBuffer := ingest.NewArrowBuffer(&cfg.Ingest, storageBackend, logger.Get("arrow"))
+	if replicationStore != nil {
+		arrowBuffer.SetReplicationPublisher(replicationStore)
+	}
+	var recoverReplicated func(context.Context, []byte) error
+	var flushReplicated func(context.Context) error
+	if replicationStore != nil {
+		recoverReplicated = arrowBuffer.ApplyReplicatedWAL
+		flushReplicated = arrowBuffer.FlushAll
+	}
+
 	if walWriter != nil {
 		arrowBuffer.SetWAL(walWriter)
 	}
@@ -1175,11 +1204,17 @@ func main() {
 		// for the PERIODIC flush-failure recovery below, where ingest (and
 		// therefore rotation) is live during the scan.
 		recoveryStats, err := walRecovery.RecoverWithOptions(context.Background(), recoveryCallback, &wal.RecoveryOptions{
-			SkipActiveFile:   startupActiveFile,
-			BatchSize:        cfg.WAL.RecoveryBatchSize,
-			ColumnarCallback: columnarCallback,
+			SkipActiveFile:        startupActiveFile,
+			BatchSize:             cfg.WAL.RecoveryBatchSize,
+			ColumnarCallback:      columnarCallback,
+			ReplicationCallback:   recoverReplicated,
+			ReplicationFlush:      flushReplicated,
+			RequireOriginIdentity: replicationStore != nil,
 		})
 		if err != nil {
+			if replicationStore != nil {
+				log.Fatal().Err(err).Msg("WAL recovery incomplete; preserving WAL and refusing to expose an incomplete replica view")
+			}
 			log.Error().Err(err).Msg("WAL recovery failed")
 		} else if recoveryStats.RecoveredFiles > 0 {
 			// Track recovery metrics
@@ -1267,6 +1302,9 @@ func main() {
 							MinFileAge:                 5 * time.Second,
 							BatchSize:                  cfg.WAL.RecoveryBatchSize,
 							ColumnarCallback:           columnarCallback,
+							ReplicationCallback:        recoverReplicated,
+							ReplicationFlush:           flushReplicated,
+							RequireOriginIdentity:      replicationStore != nil,
 						})
 						if err != nil {
 							walLogger.Error().Err(err).Msg("WAL recovery after flush failure failed")
@@ -1889,6 +1927,9 @@ func main() {
 					// received bytes. Must be set before Start — the puller is
 					// constructed inside Start when ReplicationEnabled is true.
 					clusterCoordinator.SetStorageBackend(storageBackend)
+					if replicationStore != nil {
+						clusterCoordinator.SetReplicationStore(replicationStore)
+					}
 
 					// The cluster-wide compaction pause (#1087), wired BEFORE
 					// Start on every cluster node: a pause replayed from the
@@ -3310,6 +3351,13 @@ func main() {
 		queryHandler.SetAuthAndRBAC(authManager, rbacManager)
 	}
 	queryHandler.SetFieldSchema(fieldSchemaRegistry)
+	if replicationStore != nil {
+		if clusterCoordinator == nil {
+			log.Fatal().Msg("Replica query view requires a running cluster coordinator")
+		}
+		queryHandler.SetReplicationView(replicationStore.View(), replicationStore.Resolve)
+		queryHandler.SetReplicationSync(clusterCoordinator.RefreshReplicationView)
+	}
 	if cfg.Query.EmptyRangeAnchorScan {
 		if cfg.Query.StableSchema {
 			queryHandler.SetEmptyRangeAnchorScan(true)

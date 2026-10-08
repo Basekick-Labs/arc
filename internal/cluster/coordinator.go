@@ -25,6 +25,7 @@ import (
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/license"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/replicaview"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/wal"
 	hraft "github.com/hashicorp/raft"
@@ -85,6 +86,12 @@ var deleteStopDrainBound = 10 * time.Second
 const deletePendingWarnAt = 10_000
 
 type Coordinator struct {
+	replicationStore        *replicaview.LocalStore
+	replicationViewMu       sync.Mutex
+	replicationViewRevision uint64
+	replicationViewSynced   atomic.Bool
+	replicationViewDone     chan struct{}
+
 	cfg           *config.ClusterConfig
 	licenseClient *license.Client
 	registry      *Registry
@@ -749,6 +756,12 @@ func (c *Coordinator) Start() error {
 	// checker never marks anyone as unhealthy.
 	go c.heartbeatLoop()
 
+	if c.replicationStore != nil && c.raftNode != nil {
+		c.replicationViewSynced.Store(false)
+		c.replicationViewRevision = ^uint64(0)
+		c.replicationViewDone = make(chan struct{})
+		go c.runReplicationView(c.ctx, c.raftNode, c.replicationStore, c.replicationViewDone)
+	}
 	c.running = true
 	c.localNode.MarkJoined()
 
@@ -878,7 +891,12 @@ func (c *Coordinator) Stop() error {
 	deleteWg := c.deleteWg
 	healthChecker := c.healthChecker
 	listener := c.listener
+	viewDone := c.replicationViewDone
 	c.mu.Unlock()
+
+	if viewDone != nil {
+		<-viewDone
+	}
 
 	// Close the cached leader connection so any in-flight forward fails
 	// fast rather than waiting on a dying leader.
@@ -4145,6 +4163,9 @@ func (c *Coordinator) startFilePullerLocked() error {
 		Logger:              c.logger,
 	}
 
+	if c.replicationStore != nil {
+		pullerCfg.PublishLocalFile = c.publishPulledCanonical
+	}
 	puller, err := filereplication.New(pullerCfg)
 	if err != nil {
 		return fmt.Errorf("construct puller: %w", err)

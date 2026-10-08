@@ -66,3 +66,18 @@ func cloneManifestFile(file *FileEntry) FileEntry {
 	}
 	return result
 }
+
+// ReplicationState observes manifest files and retirements under one lock. The
+// process-local revision also changes on Restore; it is not a Raft log index.
+func (f *ClusterFSM) ReplicationState(previous uint64) (uint64, []FileEntry, []ReplicationRetirement, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if previous == f.replicationRevision {
+		return f.replicationRevision, nil, nil, false
+	}
+	files := make([]FileEntry, 0, len(f.files))
+	for _, entry := range f.files {
+		files = append(files, cloneManifestFile(entry))
+	}
+	return f.replicationRevision, files, f.replicationRetirementsLocked(), true
+}

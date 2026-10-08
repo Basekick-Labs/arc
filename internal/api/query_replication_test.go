@@ -62,3 +62,26 @@ func TestReplicationSQLSnapshotFollowsHTTPRequestLifetime(t *testing.T) {
 		t.Fatalf("next query reused obsolete/parallel sources: %s", after)
 	}
 }
+
+func TestReplicationUnavailableRemainsRetryableThroughTransform(t *testing.T) {
+	h := &QueryHandler{logger: zerolog.Nop(), queryCache: database.NewQueryCache(database.QueryCacheTTL, database.DefaultQueryCacheMaxSize)}
+	view := replicaview.NewView()
+	h.SetReplicationView(view, func(path string) string { return path })
+	for _, phase := range []string{"startup", "replacement"} {
+		t.Run(phase, func(t *testing.T) {
+			var request fasthttp.RequestCtx
+			defer request.ResetUserValues()
+			if phase == "startup" {
+				view.SetUnavailable(replicaview.ErrManifestNotReady)
+			} else {
+				if err := view.SetCanonicalState(nil, nil, map[string]error{replicaview.MeasurementKey("db", "cpu"): replicaview.ErrManifestNotReady}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, _, err := h.getTransformedSQL(&request, "SELECT * FROM cpu", "db")
+			if err == nil || queryTransformErrorStatus(err) != 503 {
+				t.Fatalf("unavailable source must be retryable: %v", err)
+			}
+		})
+	}
+}

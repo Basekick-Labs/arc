@@ -13,6 +13,9 @@ func quoteIdentifier(value string) string { return `"` + strings.ReplaceAll(valu
 // single replica file before the entry-range filter. Explicit column aliases
 // keep every user column intact, even one named ordinality or file_row_number.
 func (s *Snapshot) SQL(resolve func(string) string, anchor string, options string) (string, error) {
+	if s.Err != nil {
+		return "", s.Err
+	}
 	var queries []string
 	if anchor != "" {
 		queries = append(queries, "SELECT * FROM read_parquet("+quoteString(anchor)+", hive_partitioning=false)")

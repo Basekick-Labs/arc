@@ -238,3 +238,41 @@ func TestForeignReceivedWALKeepsLaterCheckpoint(t *testing.T) {
 		}
 	}
 }
+
+func TestReplicationRecoveryRefusesAmbiguousLegacyWAL(t *testing.T) {
+	w := newReceivedTestWriter(t)
+	body, err := msgpack.Marshal(map[string]interface{}{"m": "cpu", "columns": map[string]interface{}{"time": []int64{1700000000000000}, "v": []int64{42}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.AppendRawWithMeta("db", body); err != nil {
+		t.Fatal(err)
+	}
+	path := w.CurrentFile()
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invoked := false
+	recovery := NewRecovery(w.config.WALDir, zerolog.Nop())
+	_, err = recovery.RecoverWithOptions(context.Background(), func(context.Context, []map[string]interface{}) error { invoked = true; return nil }, &RecoveryOptions{
+		RequireOriginIdentity: true,
+		ColumnarCallback: func(context.Context, string, string, map[string][]interface{}, string) error {
+			invoked = true
+			return nil
+		},
+	})
+	if err == nil || invoked {
+		t.Fatalf("ambiguous WAL was replayed: invoked=%v err=%v", invoked, err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("migration refusal changed the only durable WAL copy")
+	}
+}
