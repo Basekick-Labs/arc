@@ -1335,6 +1335,16 @@ thing a new maintainer has to learn, and a refactor that moves a decision from
 four places to one is worth knowing about before you go looking for it in the
 old place.
 
+### Compaction cancellation accounting test waits for discovered batches ([#1136](https://github.com/Basekick-Labs/arc/issues/1136))
+
+The cancellation accounting test now uses a candidate split into two batches
+and cancels only after the first worker starts. Since batch discovery is
+accounted before worker launch, the test no longer races the eligibility
+callback and consistently verifies that the waiting batch is counted as
+unstarted.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1160](https://github.com/Basekick-Labs/arc/pull/1160).
+
 ### A quarantine test waited on the counter, not the bookkeeping it asserts ([#1146](https://github.com/Basekick-Labs/arc/issues/1146))
 
 `TestPullerQuarantineKeepsTheQueryGateClosed` reddened `Build & Test`
