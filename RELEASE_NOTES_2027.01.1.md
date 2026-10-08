@@ -1106,6 +1106,15 @@ later measurement does not release an earlier buffer's identity. Normal
 single-measurement payloads retain their original bytes. Replication sequence
 and acknowledgement semantics are unchanged.
 
+Recovery barriers now use the configured flush worker pool instead of serial
+per-measurement writes, and release shard locks before waiting. Each barrier
+has a total wait budget of `ingest.flush_timeout_seconds` (30 seconds by default)
+or the caller's earlier deadline. The first observed flush failure stops further
+admission. Unsubmitted records remain buffered; queued/in-flight writes retain
+their normal per-write deadlines and WAL identities. A timeout or failed
+barrier retains the WAL for a later recovery pass, including when storage ignores
+cancellation. Concurrent ingestion can continue while recovery waits.
+
 Contributed by [@jallegri](https://github.com/jallegri) in [#1118](https://github.com/Basekick-Labs/arc/pull/1118).
 
 ### The tiering files endpoint rejects an invalid `limit` ([#1135](https://github.com/Basekick-Labs/arc/issues/1135))

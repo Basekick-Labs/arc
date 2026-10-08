@@ -40,3 +40,26 @@ still scanned on every recovery pass. A checkpoint in one file can cover data
 in an earlier file that is still awaiting recovery. Preserve quarantined files
 together with the remaining WAL directory; deleting or moving one away can
 remove the proof that prevents already-flushed records from being replayed.
+
+## Recovery wait budget
+
+Startup and maintenance recovery barriers submit buffered measurements to the
+existing `ingest.flush_workers` pool. They do not hold shard locks while waiting
+for queue space or storage completion. Each barrier waits for at most
+`ingest.flush_timeout_seconds` (default 30 seconds), or an earlier caller
+deadline. This is a budget for the barrier's wait, not a new timeout started at
+enqueue for each storage write. It does not bound file scanning or the entire
+healthy recovery pass.
+
+On deadline expiry or the first observed flush failure, recovery retains the
+affected WAL files and retries through normal maintenance. Records not yet
+submitted remain in their buffers. Admitted tasks remain owned by the workers
+and retain their own storage-write deadlines; they may complete after the
+barrier returns. This also lets the barrier return when a storage implementation
+ignores cancellation, without discarding an in-flight write. A later recovery
+pass must settle those tasks and read their checkpoints before replaying again.
+
+A short barrier budget can defer reclamation on a healthy but backlogged node.
+Inspect flush errors, queue depth, throughput and WAL growth before increasing
+the budget. Increasing it also increases how long recovery waits during an
+outage; it does not improve the downstream drain rate.

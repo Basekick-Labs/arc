@@ -992,9 +992,10 @@ type ArrowBuffer struct {
 	flushWorkers int
 
 	// asyncFlushPending tracks queued and direct flushes through their storage
-	// writes and WAL checkpoints. FlushAllAndWait fences tasks while all shards
-	// are locked, so no flush can start outside the observed epoch.
-	flushBarrierMu    sync.Mutex
+	// writes and WAL checkpoints. Buffer handoffs register under their shard
+	// lock, so a barrier can fence them without holding locks during I/O waits.
+	flushBarrierOnce  sync.Once
+	flushBarrierGate  chan struct{}
 	asyncFlushMu      sync.Mutex
 	asyncFlushNext    uint64
 	asyncFlushPending map[uint64]struct{}
@@ -1247,26 +1248,30 @@ func (b *ArrowBuffer) asyncFlushFence() uint64 {
 
 func (b *ArrowBuffer) waitForAsyncFlushTasksThrough(ctx context.Context, fence uint64) error {
 	for {
-		b.asyncFlushMu.Lock()
-		pending := false
-		for taskID := range b.asyncFlushPending {
-			if taskID <= fence {
-				pending = true
-				break
-			}
-		}
+		pending, changed := b.asyncFlushState(fence)
 		if !pending {
-			b.asyncFlushMu.Unlock()
 			return nil
 		}
-		changed := b.asyncFlushChanged
-		b.asyncFlushMu.Unlock()
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-changed:
 		}
 	}
+}
+
+func (b *ArrowBuffer) asyncFlushState(fence uint64) (bool, <-chan struct{}) {
+	b.asyncFlushMu.Lock()
+	defer b.asyncFlushMu.Unlock()
+	if b.asyncFlushChanged == nil {
+		b.asyncFlushChanged = make(chan struct{})
+	}
+	for taskID := range b.asyncFlushPending {
+		if taskID <= fence {
+			return true, b.asyncFlushChanged
+		}
+	}
+	return false, b.asyncFlushChanged
 }
 
 // markFlushFailure records that buffered data could not be persisted and must
@@ -4714,19 +4719,56 @@ func (b *ArrowBuffer) NewRecoveryFlushBarrier() func(context.Context) error {
 	}
 }
 
-// FlushAllAndWait establishes a flush completion barrier. It fences every earlier
-// queued or direct flush while holding every shard lock, waits for their
-// storage writes and WAL checkpoints, then snapshots the remaining buffers.
-// Storage I/O for that snapshot runs without shard locks so ingestion can
-// continue. It returns errors from the snapshot flushes; async failures are
-// recorded in FlushFailureGeneration. Recovery must use NewRecoveryFlushBarrier
-// to cover failures that happen during replay, before this wait begins.
+// FlushAllAndWait snapshots buffer keys, hands their records to the existing
+// bounded worker pool, and fences those tasks plus earlier queued/direct flushes.
+// No shard lock is held while waiting for queue capacity or storage. A timeout
+// or first flush failure stops admission: unsubmitted records stay in buffers;
+// admitted tasks keep their normal independent I/O deadlines and WAL identities.
+// The barrier's total wait budget is one flushTimeout (or the caller's earlier
+// deadline), not one timeout per measurement. Returning an error never proves
+// durability and must not permit WAL deletion. Recovery must also use
+// NewRecoveryFlushBarrier to cover failures that completed before this call.
 func (b *ArrowBuffer) FlushAllAndWait(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	b.flushBarrierMu.Lock()
-	defer b.flushBarrierMu.Unlock()
+	budget := b.flushTimeout
+	if budget <= 0 {
+		budget = 30 * time.Second
+	}
+	if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > budget {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, budget)
+		defer cancel()
+	}
+	generation := b.FlushFailureGeneration()
+	check := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if b.closing.Load() {
+			return ErrBufferClosing
+		}
+		if b.FlushFailureGeneration() != generation {
+			return fmt.Errorf("flush failed while waiting for WAL recovery barrier; retaining replayed files")
+		}
+		return nil
+	}
+	if err := check(); err != nil {
+		return err
+	}
+	b.flushBarrierOnce.Do(func() { b.flushBarrierGate = make(chan struct{}, 1) })
+	// Fast path also avoids installing a cancellation waiter when uncontended.
+	select {
+	case b.flushBarrierGate <- struct{}{}:
+	default:
+		select {
+		case b.flushBarrierGate <- struct{}{}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	defer func() { <-b.flushBarrierGate }()
 
 	locked := 0
 	defer func() {
@@ -4738,38 +4780,15 @@ func (b *ArrowBuffer) FlushAllAndWait(ctx context.Context) error {
 		b.shards[i].mu.Lock()
 		locked++
 	}
-	fence := b.asyncFlushFence()
-	if err := b.waitForAsyncFlushTasksThrough(ctx, fence); err != nil {
-		return err
+	type pendingBuffer struct {
+		shard *bufferShard
+		key   string
 	}
-
-	var tasks []flushTask
-	var flushErrors []error
+	var snapshot []pendingBuffer
 	for shardIdx := range b.shards {
 		shard := b.shards[shardIdx]
-		keys := make([]string, 0, len(shard.buffers))
 		for key := range shard.buffers {
-			keys = append(keys, key)
-		}
-		for _, key := range keys {
-			parts := splitBufferKey(key)
-			if len(parts) != 2 {
-				flushErrors = append(flushErrors, fmt.Errorf("invalid buffer key %q", key))
-				continue
-			}
-			tasks = append(tasks, flushTask{
-				bufferKey:   key,
-				database:    parts[0],
-				measurement: parts[1],
-				records:     shard.buffers[key],
-				recordCount: shard.bufferRecordCounts[key],
-				walHashes:   collectWALHashes(shard.buffers[key]),
-			})
-			delete(shard.deferredKeys, key)
-			delete(shard.buffers, key)
-			delete(shard.bufferStartTimes, key)
-			delete(shard.bufferRecordCounts, key)
-			delete(shard.bufferSchemas, key)
+			snapshot = append(snapshot, pendingBuffer{shard: shard, key: key})
 		}
 	}
 	for i := locked - 1; i >= 0; i-- {
@@ -4777,20 +4796,55 @@ func (b *ArrowBuffer) FlushAllAndWait(ctx context.Context) error {
 	}
 	locked = 0
 
-	for _, task := range tasks {
-		flushID := b.beginAsyncFlushTask()
-		flushCtx, flushCancel := b.newFlushContext()
-		err := b.flushRecordsAsync(flushCtx, task.bufferKey, task.database, task.measurement, task.records, task.recordCount, task.walHashes)
-		flushCancel()
-		b.completeAsyncFlushTask(flushID)
-		if err != nil {
-			flushErrors = append(flushErrors, fmt.Errorf("flush buffer %q: %w", task.bufferKey, err))
+	for _, item := range snapshot {
+		parts := splitBufferKey(item.key)
+		if len(parts) != 2 {
+			return fmt.Errorf("invalid buffer key %q", item.key)
+		}
+		for {
+			// Observe completion before attempting admission so a completion
+			// between the failed send and the wait cannot be missed.
+			_, changed := b.asyncFlushState(^uint64(0))
+			if err := check(); err != nil {
+				return err
+			}
+			item.shard.mu.Lock()
+			_, exists := item.shard.buffers[item.key]
+			queued := false
+			if exists {
+				queued, _ = b.enqueueOrDeferLocked(item.shard, item.key, parts[0], parts[1], item.shard.bufferRecordCounts[item.key])
+			}
+			item.shard.mu.Unlock()
+			if !exists || queued {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-changed:
+			}
 		}
 	}
-	if err := ctx.Err(); err != nil {
-		flushErrors = append(flushErrors, err)
+
+	// Every snapshot key was either handed off here or by another flusher.
+	// Those handoffs register under shard.mu before removing their buffers,
+	// so their task IDs are all at or below this fence. Later writes need not
+	// finish for this barrier to succeed.
+	fence := b.asyncFlushFence()
+	for {
+		pending, changed := b.asyncFlushState(fence)
+		if err := check(); err != nil {
+			return err
+		}
+		if !pending {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-changed:
+		}
 	}
-	return errors.Join(flushErrors...)
 }
 
 // Close stops the buffer and flushes everything it still holds.
