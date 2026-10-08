@@ -4513,6 +4513,11 @@ func main() {
 				// which is the boundary the licence pattern exists to hold, so
 				// the behaviour stays and the field doc says so instead.
 				backupManager.SetColdCounter(tieringManager)
+				// And the cold tier itself (#1086 stage C): the store a backup
+				// reads cold objects from and a restore writes them back to.
+				// Same licence hole as the counter above — an unlicensed node
+				// wires neither, so its backups silently carry no cold data.
+				backupManager.SetColdSource(tieringManager)
 			}
 			backupHandler.RegisterRoutes(server.GetApp())
 			// backup_path is logged only when it IS the destination. Logging
@@ -4538,6 +4543,12 @@ func main() {
 				Bool("tier_recorder", tieringManager != nil).
 				Bool("tier_lookup", tieringManager != nil).
 				Bool("cold_counter", tieringManager != nil).
+				// NOT tieringManager != nil like its neighbours: cold can be
+				// configured and disabled, or its backend can have failed to
+				// build while tiering is otherwise up, and a startup line
+				// claiming a cold source in either case would be the kind of
+				// lie that takes an operator a long afternoon.
+				Bool("cold_source", tieringManager != nil && tieringManager.ColdBackend() != nil).
 				Msg("Backup/restore enabled")
 		}
 	}
@@ -5277,6 +5288,15 @@ func (b *backupClusterManifest) ManifestFiles() []backup.ManifestFile {
 	entries := b.coordinator.GetFileManifest()
 	out := make([]backup.ManifestFile, 0, len(entries))
 	for _, e := range entries {
+		// Cold entries stay OUT, and this filter is load-bearing for the cold
+		// backup walk (#1086 stage C) as well as for the reason below.
+		// crossCheckManifest treats this set as the authority on what is
+		// registered data; a cold entry appearing here would make it hold back
+		// or re-delete the very files the cold walk exists to carry. Cold files
+		// are enumerated from the cold store and reconciled against tier rows
+		// instead, and they are deliberately never registered in the Raft
+		// manifest. Do not "fix" the cold walk by letting cold entries through
+		// here.
 		if e == nil || e.Tier == "cold" {
 			continue
 		}

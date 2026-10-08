@@ -246,6 +246,43 @@ func (m *Manager) SetColdCounter(c ColdCounter) {
 	m.coldCounter = c
 }
 
+// ColdSource is this node's cold tier: the store a backup reads cold objects
+// from and a restore writes them back to, plus the tier rows it reconciles the
+// listing against (#1086 stage C). Nil when the node has no cold tier, which
+// includes cold being configured but disabled and the backend having failed to
+// construct — ColdBackend answers nil in both.
+//
+// Separate from ColdCounter even though one tiering manager implements both,
+// because the marker stage B shipped must keep working on a node that has tier
+// rows and no reachable cold store.
+type ColdSource interface {
+	// ColdBackend is the cold store, or nil when there is none.
+	ColdBackend() storage.Backend
+	// ColdRows is this node's cold tier metadata, path to size, quarantined
+	// rows excluded. A map because every use is a lookup by path, and because
+	// stdlib types are what keep this interface satisfiable without tiering
+	// importing this package.
+	ColdRows(ctx context.Context) (map[string]int64, error)
+	// RecordRestoredColdFile records a file a restore wrote to the cold tier,
+	// reporting false when a quarantined row left it alone.
+	RecordRestoredColdFile(ctx context.Context, path string, sizeBytes int64) (bool, error)
+	// RecordRestoredHotFile forces a row to HOT for a file the backup read
+	// from cold and that this node had to put in hot storage instead. The
+	// ordinary hot report cannot do it: its upsert is guarded to rows that
+	// already say hot, and this row says cold.
+	RecordRestoredHotFile(ctx context.Context, path string, sizeBytes int64) (bool, error)
+}
+
+// SetColdSource wires this node's cold tier for the cold walk and the cold
+// restore. Nil is ignored, as SetColdCounter; a caller holding a typed nil
+// pointer must check for nil itself (#713).
+func (m *Manager) SetColdSource(c ColdSource) {
+	if c == nil {
+		return
+	}
+	m.coldSource = c
+}
+
 // ClusterManifestWired reports whether the Raft file manifest is attached.
 // The API layer resolves a scoped restore mode from this, not from the
 // presence of a cluster coordinator: the two differ on a cluster node without

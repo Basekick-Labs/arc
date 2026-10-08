@@ -209,7 +209,7 @@ func TestMarkFileCold_NoOpOnColdAndQuarantined(t *testing.T) {
 	// not overwrite it.
 	const coldPath = "testdb/cpu/2026/10/03/14/cold.parquet"
 	stamped := time.Date(2026, 10, 1, 2, 0, 0, 0, time.UTC)
-	if err := store.RecordColdFile(ctx, replicatedTestFile(coldPath, 100), stamped); err != nil {
+	if _, err := store.RecordColdFile(ctx, replicatedTestFile(coldPath, 100), stamped); err != nil {
 		t.Fatalf("RecordColdFile() setup error = %v", err)
 	}
 	wrote, err := store.markFileCold(ctx, replicatedTestFile(coldPath, 100))

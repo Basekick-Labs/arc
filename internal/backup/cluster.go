@@ -54,6 +54,21 @@ type ManifestFile struct {
 	Measurement   string    `json:"measurement"`
 	PartitionTime time.Time `json:"partition_time"`
 	CreatedAt     time.Time `json:"created_at"`
+	// Tier is "cold" for a file this backup read from the cold tier (#1086
+	// stage C), and ABSENT for a hot one — so every backup taken before this
+	// stage, and every hot-only backup taken after it, has a byte-identical
+	// sidecar. It is the only per-file record a backup writes, which is why
+	// the tier lives here and not on the manifest: the manifest is aggregate
+	// by design (a million-file backup's per-file record is hundreds of MB,
+	// see writeSidecar).
+	//
+	// The restore reads it to choose a destination. Absent means hot, which is
+	// also what a missing sidecar means, so the two degrade the same way.
+	//
+	// Not part of the Raft manifest: ManifestFile and the cluster package's
+	// FileEntry are separate structs mapped field by field in cmd/arc, so this
+	// field is inert on the Raft wire.
+	Tier string `json:"tier,omitempty"`
 }
 
 // ClusterManifest is the backup manager's view of the cluster's Raft file
@@ -269,6 +284,12 @@ const sidecarName = "manifest-files.json"
 
 const sidecarVersion = 1
 
+// tierCold is the value ManifestFile.Tier carries for a file read from the
+// cold tier (#1086 stage C). It matches tiering's own Tier string so an
+// operator reading a sidecar and a tier row sees one word, but it is declared
+// here because the backup package does not import tiering.
+const tierCold = "cold"
+
 // fileSidecar is the on-disk shape of sidecarName.
 type fileSidecar struct {
 	Version int `json:"version"`
@@ -276,6 +297,11 @@ type fileSidecar struct {
 	// partition time and created_at came from the cluster manifest (true) or
 	// were derived from each path by a standalone backup (false). The SHA-256
 	// and size always describe the bytes in the backup.
+	// FromClusterManifest says this node HAD a cluster manifest when the
+	// backup ran, not that every row below came from it. Since #1086 a cold
+	// file's row is usually path-derived even on a cluster, because tiering
+	// removes a migrated file's manifest entry — so on a backup carrying cold
+	// files this is true while some rows were derived.
 	FromClusterManifest bool           `json:"from_cluster_manifest"`
 	Files               []ManifestFile `json:"files"`
 }
@@ -309,9 +335,20 @@ type sidecarBuilder struct {
 // for a file the manifest does not describe (a standalone backup): the FSM
 // refuses a zero created_at, and "the backup saw it then" is the most honest
 // value a standalone node has.
-func (b *sidecarBuilder) add(path, sha string, size int64, now time.Time) (mismatch bool) {
+// tier is "" for a hot file and tierCold for one read from the cold tier.
+//
+// A cold path is USUALLY absent from b.byPath, since tiering removes a
+// migrated file from the cluster manifest, so it usually takes the
+// path-derived branch. Not always, and the exception is worth knowing: a
+// mid-migration path that is in both listings is carried from cold while its
+// manifest entry still stands, so its row takes the b.byPath branch, inherits
+// the manifest's labels, and is checksum-compared against the entry recorded
+// for the HOT copy. Richer metadata and a legitimate mismatch warning if the
+// two copies differ — but do not write code that assumes a cold row is always
+// path-derived.
+func (b *sidecarBuilder) add(path, sha string, size int64, now time.Time, tier string) (mismatch bool) {
 	path = filepath.ToSlash(path)
-	row := ManifestFile{Path: path, SHA256: sha, SizeBytes: size}
+	row := ManifestFile{Path: path, SHA256: sha, SizeBytes: size, Tier: tier}
 	if e, ok := b.byPath[path]; ok {
 		row.Database, row.Measurement = e.Database, e.Measurement
 		row.PartitionTime, row.CreatedAt = e.PartitionTime, e.CreatedAt
