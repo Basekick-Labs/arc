@@ -569,6 +569,47 @@ an unbounded operation.
 
 ## Bug fixes
 
+### The compaction trigger now claims its cycle before it answers
+
+`POST /api/v1/compaction/trigger` decided whether a cycle was already running
+by reading a flag, then left the actual claim — the compare-and-swap that makes
+a cycle exclusive — to the background goroutine it started afterwards. Two
+things followed.
+
+**Concurrent triggers were accepted when only one could run.** The window
+between the read and the claim is not narrow: the goroutine is scheduled
+lazily, so a handler routinely finished its read *and sent its response* before
+any goroutine claimed. Measured against 32 simultaneous triggers on the old
+code, a substantial fraction were accepted — between 3 and 16, varying by
+machine and scheduler. Each loser's cycle never ran, and while the server did
+log the loss, the caller had been told the trigger succeeded and was handed a
+cycle id belonging to the winner.
+
+**The reported cycle id was a guess.** The response carried "current id plus
+one", computed in the handler, while the id was really assigned later inside
+the cycle. With two drivers, both were told the same id and only one cycle
+existed, so the loser matched that id against `last_cycle` in
+`/api/v1/compaction/stats` and read the winner's counters as its own. Since
+`last_cycle` is a single global record, matching on `cycle_id` is the only way
+an operator can tell whose result they are reading — and it was exactly the
+mechanism that was unsound.
+
+The handler now takes the claim synchronously and reports the id that claim
+assigned. Taking the claim and publishing its id are one step, so a refusal can
+also name the running cycle without ever reporting a previous, finished one.
+
+**Behaviour change:** a second concurrent trigger now gets **409** immediately,
+where it previously got a 200 whose cycle was silently dropped. If you drive
+compaction from more than one place — one process per database, for example —
+you will start seeing those 409s. They are the honest answer to what was
+already happening; the cycle was never going to run. The 409 carries
+`cycle_id`, `is_running`, and is now logged, so a refused trigger leaves a
+trace on the server.
+
+Scheduled compaction behaves exactly as before: the cron path and the internal
+trigger claim and release the cycle in one call, with the same refusal logging
+and the same return values on a lost claim.
+
 ### The manual compaction trigger now requires the compactor lease
 
 `POST /api/v1/compaction/trigger` ran a full compaction cycle on whatever node
