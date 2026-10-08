@@ -1003,30 +1003,24 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 					// argument rather than sequential code — anyone changing
 					// either path has to keep it true.
 					//
-					// WHAT THE LAG COSTS, since the batch makes it long
-					// enough to matter: until the row is written it still
-					// says cold with a recent migrated_at, and that is
-					// exactly what ReconcileOrphanedFiles looks for. On a
-					// node with a cold backend CONFIGURED BUT DISABLED —
-					// which is one of the two ways to reach this branch,
-					// because ColdBackend() ANDs the enabled flag — that
-					// sweep is not gated on the flag (tiering manager.go,
-					// where only MigrateTier is) and verifies the cold copy
-					// through GetBackendForTier, which ignores the flag too.
-					// So it can find the hot copy this restore just wrote,
-					// confirm the cold object still exists, and delete the
-					// hot copy and its manifest entry — after which the
-					// forced row lands claiming hot for a file that is gone.
-					// The window was microseconds before this change and is
-					// now up to the rest of the restore.
+					// WHAT THE LAG DOES NOT COST, corrected from what this
+					// comment claimed when #1142 shipped yesterday: until the
+					// row is written it still says cold with a recent
+					// migrated_at, which is what ReconcileOrphanedFiles looks
+					// for — so the sweep could in principle find the hot copy
+					// this restore just wrote and delete it once it confirmed
+					// the cold object.
 					//
-					// Not fixed here, because the defect is the ungated
-					// sweep rather than the batching: with cold disabled that
-					// sweep deletes hot copies whose cold objects the query
-					// path will not read, restore or no restore. That is
-					// #1143; until it is fixed, a restore onto a node whose
-					// cold tier is configured but disabled should run with
-					// tiering stopped.
+					// It cannot, and the reason is this branch's own
+					// precondition. coldToHot is reached only when
+					// coldBackendOrNil() is nil, which means this node has no
+					// cold backend OR has cold disabled — and cmd/arc/main.go
+					// builds a cold backend only inside "if cold.Enabled", so
+					// in both cases m.coldBackend is nil. The sweep then has
+					// nothing to verify a cold copy against and keeps the hot
+					// file; since #1143 it is skipped outright on such a node.
+					// The window the #1142 note warned about, and its advice
+					// to run this restore with tiering stopped, were wrong.
 					m.queueHotRow(ctx, batch, destPath, bytesWritten, progress)
 				}
 				if m.tierRecorder != nil {

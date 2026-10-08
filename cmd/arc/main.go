@@ -4020,7 +4020,7 @@ func main() {
 				// that an OSS or unlicensed node carrying a leftover
 				// cold.enabled=true still boots. The runtime claim therefore
 				// rests on this whole block sitting inside
-				// "if cfg.TieredStorage.Enabled" (cmd/arc/main.go:3860). Were that
+				// "if cfg.TieredStorage.Enabled" (cmd/arc/main.go:3987). Were that
 				// outer gate ever to move, an unvalidated cold.Backend would
 				// reach this switch, fall through in silence and leave
 				// coldBackend nil, with nothing louder than cold_enabled=false

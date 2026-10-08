@@ -137,10 +137,14 @@ func TestColdSourceMethodsAreNilSafe(t *testing.T) {
 	}
 }
 
-// ColdBackend ANDs the enabled flag, which GetBackendForTier does not. A
+// Both cold accessors AND the enabled flag, and they must agree (#1143). A
 // backup that walked a disabled cold tier would carry objects the query path
 // refuses to read, because the query router gates its cold glob on the same
-// flag.
+// answer — and orphan reconciliation, which took GetBackendForTier's old
+// unflagged answer as proof that cold was usable, would have deleted hot
+// copies on the strength of it had a disabled cold tier ever held a backend
+// to return. It does not: cmd/arc/main.go builds one only when the flag is
+// on. This pins the invariant so that stays true.
 func TestColdBackendRespectsTheEnabledFlag(t *testing.T) {
 	store, cleanup := setupTestMetadataStore(t)
 	defer cleanup()
@@ -162,10 +166,30 @@ func TestColdBackendRespectsTheEnabledFlag(t *testing.T) {
 	if off.ColdBackend() != nil {
 		t.Error("ColdBackend() returned a backend with cold DISABLED; a file written there would be unreadable, since the query router gates the cold glob on the same flag")
 	}
-	// GetBackendForTier deliberately does not check the flag, so the contrast
-	// is the point of this test.
-	if off.GetBackendForTier(TierCold) == nil {
-		t.Error("GetBackendForTier stopped returning the configured backend; ColdBackend is the one that ANDs the flag")
+	// GetBackendForTier ANDs the flag too since #1143. It did not, and orphan
+	// reconciliation believed it — it would have confirmed the cold copy
+	// through this accessor and deleted the hot copy the query path was
+	// reading. Only a Manager built by hand, as here, can hold that state.
+	if off.GetBackendForTier(TierCold) != nil {
+		t.Error("GetBackendForTier returned a backend with cold DISABLED; reconciliation treats a non-nil answer as proof the cold copy is usable and would delete the hot copy on it")
+	}
+	// The hot tier is not affected by the cold flag.
+	hot, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hot.Close()
+	off.hotBackend = hot
+	if off.GetBackendForTier(TierHot) == nil {
+		t.Error("GetBackendForTier(TierHot) is nil with only the COLD tier disabled")
+	}
+	// And a partly-built or nil manager answers nil rather than panicking.
+	if b := (&Manager{coldBackend: backend}).GetBackendForTier(TierCold); b != nil {
+		t.Error("GetBackendForTier(TierCold) with a nil config must be nil, not a panic")
+	}
+	var nilManager *Manager
+	if b := nilManager.GetBackendForTier(TierCold); b != nil {
+		t.Error("nil manager returned a cold backend")
 	}
 }
 

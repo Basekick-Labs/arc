@@ -307,7 +307,24 @@ func (m *Migrator) releaseHotCopies(ctx context.Context, files []MigrationCandid
 			return err
 		}
 		for _, c := range chunk {
+			// Always the HOT backend in the only production caller
+			// (MigrateTier(ctx, TierHot, TierCold)), but GetBackendForTier
+			// can answer nil for cold since #1143, so a cold-to-hot path
+			// added later finds a guard rather than a panic.
+			//
+			// Nothing re-runs this delete, and the comment must not pretend
+			// otherwise (Cluster Operations Checklist item 5): the manifest
+			// entry is already gone for this chunk, and the orphan sweep only
+			// ever removes HOT copies, so a leftover source copy in cold is
+			// an orphan in storage with no manifest entry. The opt-in
+			// reconciliation sweep would delete it after its grace window;
+			// nothing else will.
 			src := m.manager.GetBackendForTier(c.CurrentTier)
+			if src == nil {
+				m.logger.Error().Str("path", c.Path).Str("tier", string(c.CurrentTier)).
+					Msg("No usable backend for the migration source tier, so the copy in it cannot be removed; its manifest entry is already gone and nothing re-runs this delete, leaving an orphan in that tier until an operator or the opt-in reconciliation sweep removes it")
+				continue
+			}
 			if err := src.Delete(ctx, c.Path); err != nil {
 				m.logger.Warn().Err(err).Str("path", c.Path).Msg("Failed to delete source file after migration")
 				// Don't fail the migration - file is in destination, just source cleanup failed
