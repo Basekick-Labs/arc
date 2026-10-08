@@ -1492,9 +1492,26 @@ func main() {
 	// the gate is consulted at Scheduler.Start() and TriggerNow(). OSS and
 	// standalone deployments pass a nil gate (compactionGate below) and
 	// skip the role check entirely, preserving pre-Phase-4 behavior.
+	//
+	// Two interface variables over ONE gate value (#1152): the schedulers
+	// take compaction.ClusterGate, and the API handler takes
+	// api.CompactionGate, which additionally reports the lease holder so a
+	// refusal can name it. Both are assigned from the same pointer here, so
+	// the manual trigger and the scheduled cycles can never disagree about
+	// whether this node may compact, and setCoordinator below upgrades both
+	// to lease mode at once.
+	//
+	// Both must stay INTERFACE variables assigned only inside this branch.
+	// Declaring either as *compactionClusterGate would hand the handler a
+	// non-nil interface wrapping a nil pointer in OSS, which passes the
+	// handler's nil check and then panics in CanCompact — the #713 shape.
+	// TestCompactionGateNilInterfaceConversionIssue1152 pins this.
 	var compactionGate compaction.ClusterGate
+	var compactionAPIGate api.CompactionGate
 	if cfg.Cluster.Enabled {
-		compactionGate = newCompactionClusterGate(cfg.Cluster.Role)
+		gate := newCompactionClusterGate(cfg.Cluster.Role)
+		compactionGate = gate
+		compactionAPIGate = gate
 	}
 	// Phase 4: completion-manifest directory used by the cluster-mode
 	// subprocess → parent handoff. Empty in OSS (nil gate is what disables
@@ -3478,7 +3495,11 @@ func main() {
 
 	// Register Compaction handler (if compaction is enabled)
 	if compactionManager != nil {
-		compactionHandler := api.NewCompactionHandler(compactionManager, hourlyScheduler, dailyScheduler, authManager, logger.Get("compaction"))
+		// compactionAPIGate wraps the same gate value the schedulers consult,
+		// so the manual trigger and the scheduled cycles can never disagree
+		// about whether this node may compact (#1152). nil outside cluster
+		// mode, and deliberately a nil INTERFACE rather than a typed nil.
+		compactionHandler := api.NewCompactionHandler(compactionManager, hourlyScheduler, dailyScheduler, authManager, compactionAPIGate, logger.Get("compaction"))
 		compactionHandler.RegisterRoutes(server.GetApp())
 
 		// Wire post-compaction cache invalidation.
@@ -5042,6 +5063,19 @@ func (g *compactionClusterGate) CanCompact() bool {
 	}
 	// No failover or no lease assigned yet — fall back to static role.
 	return g.capabilities.CanCompact
+}
+
+// LeaseHolder implements api.CompactionGate (#1152): the node ID holding the
+// compactor lease, or "" when this cluster manages no lease — no coordinator,
+// or compactor failover never assigned one (cluster.failover_enabled defaults
+// to false). The trigger endpoint needs the distinction because CanCompact is
+// false for two reasons with different remedies: a lease held elsewhere, which
+// the operator can move, versus a static-role refusal with no lease to move.
+func (g *compactionClusterGate) LeaseHolder() string {
+	if g.coordinator == nil {
+		return ""
+	}
+	return g.coordinator.GetActiveCompactorID()
 }
 
 // CompactionPauseReason implements the scheduler's optional pauseReporter

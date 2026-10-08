@@ -14,7 +14,7 @@ import (
 func TestCompactionMeasurementValidationIssue915(t *testing.T) {
 	manager := &compaction.Manager{CycleTimeout: time.Minute}
 	handler := NewCompactionHandler(
-		manager, nil, nil, nil, zerolog.Nop(),
+		manager, nil, nil, nil, nil, zerolog.Nop(),
 	)
 
 	app := fiber.New()

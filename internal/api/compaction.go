@@ -13,24 +13,113 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// CompactionGate is the minimal cluster interface the compaction handler needs
+// (#1152): whether this node may run a compaction cycle. Same shape as
+// compaction.ClusterGate, which the scheduler already consults, so the value
+// main builds for the scheduler satisfies this with no adapter — and the two
+// paths cannot drift apart. nil = OSS or standalone, no gate.
+type CompactionGate interface {
+	// CanCompact reports whether the local node may run compaction. With
+	// compactor failover configured this is the FSM's active-compactor
+	// lease; otherwise it is the static role capability.
+	CanCompact() bool
+	// Role returns a human-readable role string for the rejection message.
+	Role() string
+	// LeaseHolder returns the node ID holding the compactor lease, or ""
+	// when this cluster manages no lease at all.
+	//
+	// The rejection message needs this because CanCompact() is false for two
+	// unrelated reasons and the remedy differs. With a lease, the operator
+	// sends the trigger to its holder. Without one — the default, since
+	// cluster.failover_enabled is false — the refusal came from the static
+	// role, there is no lease to route to, and POST
+	// /api/v1/cluster/compactor/assign cannot create the first one: it
+	// answers "this cluster does not manage a compactor lease". Telling that
+	// operator to assign a lease sends them to an endpoint that refuses in
+	// exactly the state the message describes.
+	LeaseHolder() string
+}
+
 // CompactionHandler handles compaction API endpoints
 type CompactionHandler struct {
 	manager         *compaction.Manager
 	hourlyScheduler *compaction.Scheduler
 	dailyScheduler  *compaction.Scheduler
 	authManager     *auth.AuthManager
+	gate            CompactionGate // nil in OSS and standalone mode
 	logger          zerolog.Logger
 }
 
-// NewCompactionHandler creates a new compaction handler
-func NewCompactionHandler(manager *compaction.Manager, hourlyScheduler, dailyScheduler *compaction.Scheduler, authManager *auth.AuthManager, logger zerolog.Logger) *CompactionHandler {
+// NewCompactionHandler creates a new compaction handler.
+//
+// gate is a constructor parameter rather than a setter (which is how the
+// backup handler takes its coordinator) because main already holds the gate
+// before it builds this handler: the value exists at the compaction-gate
+// block and the handler is constructed much later. A setter would leave the
+// wiring optional, which is the failure this gate exists to close — the
+// trigger endpoint ran a full cycle on any node precisely because nothing
+// required the role check to be wired.
+func NewCompactionHandler(manager *compaction.Manager, hourlyScheduler, dailyScheduler *compaction.Scheduler, authManager *auth.AuthManager, gate CompactionGate, logger zerolog.Logger) *CompactionHandler {
 	return &CompactionHandler{
 		manager:         manager,
 		hourlyScheduler: hourlyScheduler,
 		dailyScheduler:  dailyScheduler,
 		authManager:     authManager,
+		gate:            gate,
 		logger:          logger.With().Str("component", "compaction-handler").Logger(),
 	}
+}
+
+// rejectUnlessCompactionLeaseHolder answers 503 when this node is a cluster
+// member that may not compact, and reports whether it did. Evaluated per
+// request, as the scheduler evaluates its gate at every tick, so a lease
+// hand-over or a demotion takes effect without a restart.
+//
+// 503 rather than 409: this endpoint already answers 409 for two states —
+// paused cluster-wide and a cycle already running — and arcli maps any 409 on
+// this route to "a compaction cycle is already running (cycle N)", reading
+// only cycle_id from the body. A role rejection carries no cycle id, so a
+// third 409 would be reported to operators as cycle 0. The backup and delete
+// APIs chose 503 over 409 for the same overload.
+//
+// The wording branches on LeaseHolder because the two refusals need different
+// remedies, and it never blames the role alone: a standby RoleCompactor is
+// refused while its own role string still reads "compactor".
+//
+// The action goes in "error", not only in "message", because arcli builds its
+// HTTPError from the error field and discards message — so an operator using
+// the CLI would otherwise see the refusal without the way out.
+//
+// can_compact is always false here; it is a hint for a client, not a reliable
+// discriminator against the other 503 on this route (manager not initialized),
+// which omits the key entirely and so unmarshals to false as well. That 503 is
+// unreachable in a running server anyway: the handler is only constructed when
+// the manager is non-nil.
+func (h *CompactionHandler) rejectUnlessCompactionLeaseHolder(c *fiber.Ctx) bool {
+	if h.gate == nil || h.gate.CanCompact() {
+		return false
+	}
+	role := h.gate.Role()
+	holder := h.gate.LeaseHolder()
+
+	body := fiber.Map{"role": role, "can_compact": false, "lease_holder": holder}
+	if holder != "" {
+		body["error"] = "compaction rejected: the compaction lease is held by " + holder + "; send the trigger there, or move the lease with POST /api/v1/cluster/compactor/assign"
+		body["message"] = "this node does not hold the compaction lease"
+	} else {
+		// No lease exists. Saying "does not hold the lease" here would send
+		// the operator looking for a holder that does not exist, and the
+		// assign endpoint refuses while no lease is managed.
+		body["error"] = "compaction rejected: this cluster manages no compaction lease and role " + role + " may not compact; send the trigger to a node whose cluster.role is compactor, or set cluster.failover_enabled so the lease can be assigned"
+		body["message"] = "refused by the static role capability, not by a lease"
+	}
+
+	h.logger.Warn().
+		Str("role", role).
+		Str("lease_holder", holder).
+		Msg("Manual compaction trigger refused: this node may not run compaction")
+	_ = c.Status(fiber.StatusServiceUnavailable).JSON(body)
+	return true
 }
 
 // RegisterRoutes registers compaction endpoints
@@ -198,6 +287,24 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 				tierNames = append(tierNames, tier.GetTierName())
 			}
 		}
+	}
+
+	// Role gate (#1152). After parameter validation — a malformed database
+	// or tier name is a client error on every node, and reporting it as a
+	// role problem would send an operator to a different node to get the
+	// same 400 — but ahead of both state-dependent refusals and ahead of
+	// the accepted-trigger log line below: a node that may not compact must
+	// not be told its trigger was accepted, and its answer must not depend
+	// on whether a cycle happens to be running or paused here. Before this
+	// check the endpoint ran a full cycle on whatever node received it —
+	// only the scheduler consulted the lease — and the partition lock is
+	// per-process, so a trigger on a non-lease node could delete the same
+	// inputs as the lease holder. With peer replication it is worse and
+	// needs no second node: the completion-manifest watcher starts only on a
+	// node that may compact, so the job deletes the sources from storage
+	// while nothing registers the output or the deletes in Raft.
+	if h.rejectUnlessCompactionLeaseHolder(c) {
+		return nil
 	}
 
 	// The cluster-wide compaction pause a cluster restore holds (#1087). A
