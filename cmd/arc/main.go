@@ -1262,8 +1262,15 @@ func main() {
 						var activeCheckpointHashes []string
 						if walWriter != nil {
 							previousActiveFile = walWriter.CurrentFile()
-							if err := walWriter.Rotate(); err != nil {
-								walLogger.Error().Err(err).Msg("Failed to rotate WAL before recovery; retaining files for the next pass")
+							rotationTimeout := time.Duration(cfg.Ingest.FlushTimeoutSeconds) * time.Second
+							if rotationTimeout <= 0 {
+								rotationTimeout = 30 * time.Second
+							}
+							rotationCtx, cancelRotation := context.WithTimeout(walMaintenanceCtx, rotationTimeout)
+							rotationErr := walWriter.RotateContext(rotationCtx)
+							cancelRotation()
+							if rotationErr != nil {
+								walLogger.Error().Err(rotationErr).Msg("Failed to rotate WAL before recovery; retaining files for the next pass")
 								continue
 							}
 							activeFile = walWriter.CurrentFile()

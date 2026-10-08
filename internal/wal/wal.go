@@ -2,6 +2,7 @@ package wal
 
 import (
 	"bytes"
+	"context"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
@@ -720,11 +721,46 @@ func (w *Writer) writeEntry(entry walEntry) error {
 // them — to be written to the NEW file, where the pass that rotated would not
 // look. Going through the writer loop puts the rotation behind those entries.
 func (w *Writer) Rotate() error {
-	done := make(chan error, 1)
-	if err := w.tryEnqueueEntry(walEntry{rotate: true, durable: true, done: done}); err != nil {
+	return w.RotateContext(context.Background())
+}
+
+// RotateContext waits for queue capacity instead of dropping a maintenance
+// command when writers fill the queue. The command uses the same FIFO as data,
+// so all preceding accepted entries are processed before the rotation.
+//
+// Cancellation bounds both admission and completion waits. Once admitted, the
+// command remains owned by the writer loop and can complete after cancellation;
+// callers must not infer a rotation boundary from an error. The buffered reply
+// lets the writer finish even after its caller has stopped waiting.
+func (w *Writer) RotateContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return <-done
+	select {
+	case <-w.done:
+		return errors.New("WAL writer is closed")
+	default:
+	}
+	done := make(chan error, 1)
+	// Do not hold w.mu while waiting for capacity: the consumer needs it to
+	// write the entries that free that capacity. Unlike a data checkpoint, an
+	// unprocessed rotation racing the final shutdown drain carries no data or
+	// durability proof; the shutdown arm below reports failure in that case.
+	select {
+	case w.entryChan <- walEntry{rotate: true, durable: true, done: done}:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-w.done:
+		return errors.New("WAL writer is closed")
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-w.done:
+		return errors.New("WAL writer is closed")
+	}
 }
 
 // rotate creates a new WAL file.

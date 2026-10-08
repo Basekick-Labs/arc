@@ -41,6 +41,22 @@ in an earlier file that is still awaiting recovery. Preserve quarantined files
 together with the remaining WAL directory; deleting or moving one away can
 remove the proof that prevents already-flushed records from being replayed.
 
+## Rotation while the WAL queue is full
+
+Maintenance rotation waits for space in the same FIFO queue as data appends.
+It no longer counts a full queue as a dropped data entry and skips that recovery
+attempt immediately. All entries queued ahead of the rotation command are
+processed before the file boundary, making them visible to the recovery scan.
+Normal data appends keep their non-blocking admission and drop reporting.
+
+The maintenance caller bounds rotation admission and completion with
+`ingest.flush_timeout_seconds` (30 seconds if unset), or earlier shutdown
+cancellation. A timeout leaves recovery pending and does not authorize WAL
+deletion. A command already admitted to the writer loop can still finish after
+the caller stops waiting; the next pass discovers the current files again.
+The timeout bounds the wait, not an underlying filesystem operation already in
+progress, checkpoint scanning, or the whole maintenance pass.
+
 ## Bounded row replay and restart compatibility
 
 `wal.recovery_batch_size` limits the number of row-format records passed to

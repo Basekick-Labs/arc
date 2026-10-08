@@ -1122,6 +1122,12 @@ strikes. Unreadable or unwritable attempt metadata reports an error and retains
 the WAL; quarantine still preserves its original bytes and valid checkpoints.
 The operational guide describes sidecar recovery and cleanup behavior.
 
+Forced maintenance rotation now waits for WAL queue capacity instead of
+returning `ErrWALDropped` and skipping recovery under sustained queue pressure.
+It preserves FIFO ordering and uses a cancellable wait bounded by
+`ingest.flush_timeout_seconds`. An admitted command may finish after timeout;
+the failed wait keeps recovery pending. Normal append admission is unchanged.
+
 Tracked row recovery now honors `wal.recovery_batch_size`. Durable row-range
 checkpoints let a restart skip the precise persisted portion even after a
 batch-size change; the original entry is checkpointed only after its complete
