@@ -824,7 +824,8 @@ Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1095](https:/
 When a measurement had no Parquet files, `POST /api/v1/query/arrow` returned
 HTTP 500 and recorded the query as failed, unlike the JSON and MessagePack
 paths. It now returns a valid empty Arrow IPC stream and records a completed
-query with zero rows. Missing field-schema anchors remain errors.
+query with zero rows. Empty results release their query timeout context without
+a cleanup panic. Missing field-schema anchors remain errors.
 
 Contributed by [@jallegri](https://github.com/jallegri) in [#1120](https://github.com/Basekick-Labs/arc/pull/1120).
 

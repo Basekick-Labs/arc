@@ -772,7 +772,14 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	}, func(w *bufio.Writer) {
 		// Registered before anything that can panic, so it runs exactly once
 		// whether the writer returns normally or unwinds (#733).
-		defer releaseArrowStreamResourcesFunc(reader, conn, cancel, h.logger)
+		// A no-files fallback has a synthetic reader and a nil *sql.Conn.
+		// Do not box that typed nil: cleanup would call Close on it and
+		// recover a panic before reaching cancel, leaving the timer alive.
+		var streamConn interface{ Close() error }
+		if conn != nil {
+			streamConn = conn
+		}
+		defer releaseArrowStreamResourcesFunc(reader, streamConn, cancel, h.logger)
 		streamW = w
 		totalRows, streamErr := streamArrowIPCFunc(
 			streamCtx, w, reader, schema, castInfo, dictEnabled, ipcCompression, governanceMaxRows, h.logger,
