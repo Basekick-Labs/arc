@@ -95,6 +95,8 @@ type RecoveryOptions struct {
 	// callback runs after BarrierBatchFiles files or BarrierBatchRows records
 	// have replayed, whichever threshold is reached first. A nil callback means
 	// the recovery callback itself provides synchronous durability.
+	// A batch containing only entries covered by durable checkpoints needs no
+	// flush; an earlier replay still pending in that batch must be fenced.
 	BeforeDelete func(context.Context) error
 
 	// BarrierBatchFiles bounds how many successfully replayed files are covered
@@ -189,7 +191,16 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		if len(pendingDelete) == 0 {
 			return true
 		}
-		if opts.BeforeDelete != nil {
+		// A checkpoint-only file can complete a batch that also contains older
+		// replayed files. Inspect the whole batch, not just the current file.
+		needsFlush := false
+		for _, recovered := range pendingDelete {
+			if recovered.batches > 0 {
+				needsFlush = true
+				break
+			}
+		}
+		if needsFlush && opts.BeforeDelete != nil {
 			if err := opts.BeforeDelete(ctx); err != nil {
 				stats.BarrierFailures++
 				stats.KeptFiles += len(pendingDelete)

@@ -48,6 +48,12 @@ Keep original WAL filenames when restoring a consistent backup. This ordering
 assumes rotation timestamps increase; it does not establish creation order
 across a backwards wall-clock adjustment or manually renamed files.
 
+Files whose entries are all covered by durable checkpoints can be reclaimed
+without running another storage flush. If the pending deletion batch also
+contains any replayed entries, the entire batch still waits for its flush
+barrier before deletion. Fully covered row ranges still require the parent
+checkpoint to succeed before their source WAL can be removed.
+
 ## Rotation while the WAL queue is full
 
 Maintenance rotation waits for space in the same FIFO queue as data appends.

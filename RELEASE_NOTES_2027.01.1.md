@@ -1127,6 +1127,10 @@ filesystem modification times. Altered or tied mtimes can no longer make it
 reclaim a later checkpoint file before an earlier retained data file, which
 could otherwise cause already-flushed records to be replayed on retry.
 
+Recovery skips redundant flush barriers for batches covered entirely by durable
+checkpoints. Mixed batches still fence all replayed entries, and parent
+checkpoint failures still retain files with fully covered row ranges.
+
 Forced maintenance rotation now waits for WAL queue capacity instead of
 returning `ErrWALDropped` and skipping recovery under sustained queue pressure.
 It preserves FIFO ordering and uses a cancellable wait bounded by
