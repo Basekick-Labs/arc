@@ -1074,6 +1074,8 @@ type ArrowBuffer struct {
 	// alert on a non-zero rate.
 	totalSchemaChurnExceeded atomic.Int64
 	queueDepth               atomic.Int64 // Current flush queue depth
+	queuedRecords            atomic.Int64 // Records waiting in flushQueue
+	inflightRecords          atomic.Int64 // Records currently being flushed by workers
 
 	// walDropLogSampler debounces the WAL-dropped Warn so a sustained
 	// burst of backpressure produces ~one log line per second instead
@@ -1190,6 +1192,8 @@ func (b *ArrowBuffer) publishBufferMetrics() {
 	m.SetBufferFlushes(b.totalFlushes.Load())
 	m.SetBufferRecordsWritten(b.totalRecordsWritten.Load())
 	m.SetBufferQueueDepth(b.queueDepth.Load())
+	m.SetBufferQueuedRecords(b.queuedRecords.Load())
+	m.SetBufferInflightRecords(b.inflightRecords.Load())
 	m.SetBufferErrors(b.totalErrors.Load())
 	m.SetBufferRecordsBuffered(b.currentBufferedRecords())
 }
@@ -1994,6 +1998,13 @@ func (b *ArrowBuffer) enqueueOrDeferLocked(
 	select {
 	case b.flushQueue <- task:
 		b.queueDepth.Add(1)
+		b.queuedRecords.Add(int64(task.recordCount))
+		// enqueueOrDeferLocked holds shard.mu; publishBufferMetrics also
+		// scans shards under RLock, which would self-deadlock here. Publish
+		// only the queue counters while the shard lock is held. The sampler
+		// publishes the full buffer metrics, including records buffered.
+		metrics.Get().SetBufferQueueDepth(b.queueDepth.Load())
+		metrics.Get().SetBufferQueuedRecords(b.queuedRecords.Load())
 		// Only now does the buffer stop owning these records.
 		delete(shard.deferredKeys, bufferKey)
 		delete(shard.buffers, bufferKey)
@@ -3324,6 +3335,9 @@ func (b *ArrowBuffer) flushWorker(workerID int) {
 				return
 			}
 			metrics.Get().SetBufferQueueDepth(b.queueDepth.Add(-1))
+			b.queuedRecords.Add(-int64(task.recordCount))
+			b.inflightRecords.Add(int64(task.recordCount))
+			b.publishBufferMetrics()
 			// Signal here, not only after the flush: the queue slot frees at
 			// RECEIVE, so waiting for completion delays the drain by a whole
 			// flush time and lets the write path win the slot instead.
@@ -3345,6 +3359,8 @@ func (b *ArrowBuffer) flushWorker(workerID int) {
 			// markFlushFailure; the worker has nowhere to return it to.
 			_ = b.flushRecordsAsync(flushCtx, task.bufferKey, task.database, task.measurement, task.records, task.recordCount, task.walHashes)
 			flushCancel()
+			b.inflightRecords.Add(-int64(task.recordCount))
+			b.publishBufferMetrics()
 		}
 	}
 }
