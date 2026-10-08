@@ -37,6 +37,7 @@ package compaction
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/basekick-labs/arc/internal/replicaview"
 	"os"
 	"path/filepath"
 	"sort"
@@ -80,14 +81,16 @@ const (
 // compaction strategy (Phase 5+) may split a partition into multiple
 // outputs. Phase 4 always populates exactly one entry per manifest.
 type CompactedOutput struct {
-	Path          string    `json:"path"`           // storage-relative path (e.g. "mydb/cpu/2026/04/11/14/compacted_....parquet")
-	SHA256        string    `json:"sha256"`         // hex-encoded 64 chars; bridged into raft.FileEntry.SHA256
-	SizeBytes     int64     `json:"size_bytes"`     // authoritative size after upload
-	Database      string    `json:"database"`       // bridged into raft.FileEntry.Database
-	Measurement   string    `json:"measurement"`    // bridged into raft.FileEntry.Measurement
-	PartitionTime time.Time `json:"partition_time"` // bridged into raft.FileEntry.PartitionTime
-	Tier          string    `json:"tier"`           // "hot", "cold", etc.
-	CreatedAt     time.Time `json:"created_at"`     // bridged into raft.FileEntry.CreatedAt
+	WALCoverage   []replicaview.PartitionCoverage `json:"wal_coverage,omitempty"`
+	Replaces      []string                        `json:"replaces,omitempty"`
+	Path          string                          `json:"path"`           // storage-relative path (e.g. "mydb/cpu/2026/04/11/14/compacted_....parquet")
+	SHA256        string                          `json:"sha256"`         // hex-encoded 64 chars; bridged into raft.FileEntry.SHA256
+	SizeBytes     int64                           `json:"size_bytes"`     // authoritative size after upload
+	Database      string                          `json:"database"`       // bridged into raft.FileEntry.Database
+	Measurement   string                          `json:"measurement"`    // bridged into raft.FileEntry.Measurement
+	PartitionTime time.Time                       `json:"partition_time"` // bridged into raft.FileEntry.PartitionTime
+	Tier          string                          `json:"tier"`           // "hot", "cold", etc.
+	CreatedAt     time.Time                       `json:"created_at"`     // bridged into raft.FileEntry.CreatedAt
 }
 
 // CompletionManifest is the durable handoff from the compaction subprocess

@@ -127,6 +127,8 @@ type ReplicateSync struct {
 	// handshake a hard cutover anyway, so this rides along with the
 	// same coordinated-restart release.
 	SupportsBinaryEntries bool `json:"bin_entries,omitempty"`
+	// SupportsTrackedEntries is authenticated and requires identity-aware apply.
+	SupportsTrackedEntries bool `json:"tracked_entries,omitempty"`
 }
 
 // ReplicateSyncAck is sent by the writer in response to a sync request.

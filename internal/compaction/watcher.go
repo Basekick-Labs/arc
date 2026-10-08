@@ -25,6 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/replicaview"
 	"github.com/rs/zerolog"
 )
 
@@ -50,8 +51,10 @@ var ErrNotLeader = errors.New("compaction bridge: not the Raft leader")
 // The bridge converts CompactedFile to raft.FileEntry inside the cluster
 // package, keeping the compaction package free of any raft.* imports.
 type CompactedFile struct {
-	Path          string // storage-relative path
-	SHA256        string // hex-encoded 64 chars
+	WALCoverage   []replicaview.PartitionCoverage `json:"wal_coverage,omitempty"`
+	Replaces      []string                        `json:"replaces,omitempty"`
+	Path          string                          // storage-relative path
+	SHA256        string                          // hex-encoded 64 chars
 	SizeBytes     int64
 	Database      string
 	Measurement   string
@@ -415,6 +418,8 @@ func (w *CompletionWatcher) applyOne(ctx context.Context, path string) {
 			registers = append(registers, CompactedFile{
 				Path:          output.Path,
 				SHA256:        output.SHA256,
+				WALCoverage:   output.WALCoverage,
+				Replaces:      output.Replaces,
 				SizeBytes:     output.SizeBytes,
 				Database:      output.Database,
 				Measurement:   output.Measurement,

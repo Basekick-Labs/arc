@@ -87,6 +87,8 @@ func (b *CompactionBridge) RegisterCompactedFile(ctx context.Context, file compa
 	entry := raft.FileEntry{
 		Path:          file.Path,
 		SHA256:        file.SHA256,
+		WALCoverage:   file.WALCoverage,
+		Replaces:      file.Replaces,
 		SizeBytes:     file.SizeBytes,
 		Database:      file.Database,
 		Measurement:   file.Measurement,
@@ -174,6 +176,8 @@ func (b *CompactionBridge) BatchFileOps(ctx context.Context, registers []compact
 		payload, err := json.Marshal(raft.RegisterFilePayload{File: raft.FileEntry{
 			Path:          file.Path,
 			SHA256:        file.SHA256,
+			WALCoverage:   file.WALCoverage,
+			Replaces:      file.Replaces,
 			SizeBytes:     file.SizeBytes,
 			Database:      file.Database,
 			Measurement:   file.Measurement,

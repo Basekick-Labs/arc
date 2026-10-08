@@ -135,6 +135,7 @@ type Sender struct {
 	readers   map[string]*ReaderConnection // reader ID -> connection
 	entryChan chan *ReplicateEntry         // Buffered entry queue
 	sequence  atomic.Uint64                // Global sequence counter
+	publishMu sync.Mutex                   // Orders sequence allocation with queue publication
 	mu        sync.RWMutex                 // Protects readers map
 	logger    zerolog.Logger
 
@@ -417,6 +418,12 @@ func (s *Sender) Replicate(entry *ReplicateEntry) {
 	if s == nil || !s.running.Load() {
 		return
 	}
+
+	// Allocation and publication must be ordered together. Concurrent WAL
+	// hooks otherwise enqueue N+1 before N and the receiver rejects N as a
+	// replay. This lock never spans network I/O.
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
 
 	// Assign sequence number
 	entry.Sequence = s.sequence.Add(1)

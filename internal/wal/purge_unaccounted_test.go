@@ -154,7 +154,7 @@ func TestPurgeUnaccountedOlderThan_ReclaimsPreviousProcessFiles(t *testing.T) {
 
 	// A file this writer never wrote, as a restart would leave behind.
 	foreign := filepath.Join(w.config.WALDir, "arc-0000000000-foreign.wal")
-	if err := os.WriteFile(foreign, []byte("stale wal from a previous process"), 0o600); err != nil {
+	if err := os.WriteFile(foreign, emptyWALFixture(), 0o600); err != nil {
 		t.Fatalf("seed foreign file: %v", err)
 	}
 	old := time.Now().Add(-time.Hour)

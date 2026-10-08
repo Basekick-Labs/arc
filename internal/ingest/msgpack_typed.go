@@ -174,6 +174,25 @@ func (d *MessagePackDecoder) tryDecodeColumnarTyped(data []byte) (*TypedColumnar
 			arr[i] = nowMicros
 		}
 		typed["time"] = arr
+		// Generated timestamps must travel with the originating WAL entry. A
+		// replica/recovery run can cross an hour boundary and must not generate a
+		// different partition for the same identity. Preserve original nullable
+		// values when adding this one generated column.
+		var raw map[string]interface{}
+		if err := msgpack.Unmarshal(data, &raw); err != nil {
+			return nil, false
+		}
+		rawColumns, ok := raw["columns"].(map[string]interface{})
+		if !ok {
+			return nil, false
+		}
+		rawColumns["time"] = arr
+		raw["m"] = measurement
+		normalized, err := msgpack.Marshal(raw)
+		if err != nil {
+			return nil, false
+		}
+		data = normalized
 	}
 
 	if sanitized > 0 {

@@ -26,6 +26,7 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/replicaview"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/basekick-labs/arc/internal/wal"
@@ -664,11 +665,23 @@ func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement stri
 
 // writeParquetColumnarWithSchema is WriteParquetColumnar returning the Arrow
 // schema the file was written with, for field schema registration (#914).
-func (w *ArrowWriter) writeParquetColumnarWithSchema(ctx context.Context, measurement string, columns map[string]interface{}, validity map[string][]bool, tagColumns []string, dedupTime bool, decimalCols map[string]config.DecimalSpec) ([]byte, *arrow.Schema, error) {
+func (w *ArrowWriter) writeParquetColumnarWithSchema(ctx context.Context, measurement string, columns map[string]interface{}, validity map[string][]bool, tagColumns []string, dedupTime bool, decimalCols map[string]config.DecimalSpec, replicationMetadata ...replicaview.FileMetadata) ([]byte, *arrow.Schema, error) {
 	// Get or infer schema (with caching)
 	schema, err := w.getSchema(measurement, columns, tagColumns, dedupTime, decimalCols)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to get schema: %w", err)
+	}
+
+	if len(replicationMetadata) > 0 {
+		replicationMetadata[0].Columns = make([]string, len(schema.Fields()))
+		for i, field := range schema.Fields() {
+			replicationMetadata[0].Columns[i] = field.Name
+		}
+		metadata := schema.Metadata().ToMap()
+		metadata[replicaview.FileMetadataKey] = replicationMetadata[0].Encode()
+		metadata[replicaview.MetadataKey] = replicationMetadata[0].Coverage.Encode()
+		md := arrow.MetadataFrom(metadata)
+		schema = arrow.NewSchema(schema.Fields(), &md)
 	}
 
 	// Create Arrow arrays from columns
@@ -830,9 +843,10 @@ type TypedColumnBatch struct {
 	// DedupTime propagates ColumnarRecord.DedupTime: when true, the Parquet
 	// footer gets an arc:dedup_time marker so compaction dedups on time even with
 	// no tag columns. See ColumnarRecord.DedupTime — CQ output only (#521).
-	DedupTime bool
-	Signature string   // sorted column-name string; cached to avoid per-write recomputation
-	WALHashes []string // identities of WAL entries represented by this batch
+	DedupTime       bool
+	Signature       string // sorted column-name string; cached to avoid per-write recomputation
+	ReplicaSegments []replicaview.Segment
+	WALHashes       []string // identities of WAL entries represented by this batch
 }
 
 type bufferShard struct {
@@ -952,7 +966,9 @@ type ArrowBuffer struct {
 	// Optional file registrar for cluster-wide file manifest (Enterprise peer replication)
 	// Set by cmd/arc/main.go when clustering + peer replication is enabled.
 	// Called asynchronously after each flush — never blocks the flush path.
-	fileRegistrar FileRegistrar
+	fileRegistrar        FileRegistrar
+	replicationPublisher ReplicationPublisher
+	replicaInFlight      sync.Map
 
 	// OPTIMIZATION: Shard buffers to reduce lock contention
 	// Configurable via ingest.shard_count (default 32)
@@ -1458,6 +1474,9 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 // SetWAL sets the WAL writer for durability
 // When set, records are written to WAL before being buffered
 func (b *ArrowBuffer) SetWAL(wal WALWriter) {
+	if publisher, ok := wal.(interface{ DeferTrackedReplication() }); ok {
+		publisher.DeferTrackedReplication()
+	}
 	b.wal = wal
 	b.logger.Info().Msg("WAL enabled for ArrowBuffer")
 }
@@ -1513,7 +1532,7 @@ func (b *ArrowBuffer) SetFileRegistrar(fr FileRegistrar) {
 // sha256Hex is a hex-encoded SHA-256 of the Parquet bytes, computed by the caller on the
 // in-memory buffer immediately before the backend write. Peers validate downloaded bytes
 // against this checksum.
-func (b *ArrowBuffer) registerFileInTiering(ctx context.Context, database, measurement, storagePath string, partitionTime time.Time, sizeBytes int64, sha256Hex string) {
+func (b *ArrowBuffer) registerFileInTiering(ctx context.Context, database, measurement, storagePath string, partitionTime time.Time, sizeBytes int64, sha256Hex string, coverage ...[]replicaview.PartitionCoverage) {
 	// Register in local tiering metadata (hot/cold tracking)
 	if b.tieringManager != nil {
 		metadata := b.tieringManager.GetMetadata()
@@ -1541,7 +1560,13 @@ func (b *ArrowBuffer) registerFileInTiering(ctx context.Context, database, measu
 	// The registrar implementation MUST be non-blocking — it's called on
 	// the hot flush path.
 	if b.fileRegistrar != nil {
-		b.fileRegistrar.RegisterFile(database, measurement, storagePath, partitionTime, sizeBytes, sha256Hex)
+		if registrar, ok := b.fileRegistrar.(interface {
+			RegisterFileWithCoverage(string, string, string, time.Time, int64, string, []replicaview.PartitionCoverage)
+		}); ok && len(coverage) > 0 {
+			registrar.RegisterFileWithCoverage(database, measurement, storagePath, partitionTime, sizeBytes, sha256Hex, coverage[0])
+		} else {
+			b.fileRegistrar.RegisterFile(database, measurement, storagePath, partitionTime, sizeBytes, sha256Hex)
+		}
 	}
 }
 
@@ -1780,7 +1805,7 @@ func (b *ArrowBuffer) WriteColumnarDirectNoWAL(ctx context.Context, database, me
 	return b.writeColumnarDirect(ctx, database, measurement, columns, "")
 }
 
-func (b *ArrowBuffer) writeColumnarDirect(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string) error {
+func (b *ArrowBuffer) writeColumnarDirect(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string, replicated ...bool) error {
 	// #590: both callers (WAL crash replay, cluster WAL replication) feed
 	// RAW client payloads that never went through the live decode path's
 	// post-processing. Apply it here so replayed data behaves exactly like
@@ -1832,7 +1857,7 @@ func (b *ArrowBuffer) writeColumnarDirect(ctx context.Context, database, measure
 		Columns:     columns,
 		Columnar:    true,
 	}
-	return b.writeColumnarInternal(ctx, database, record, true, walIdentity)
+	return b.writeColumnarInternal(ctx, database, record, true, walIdentity, replicated...)
 }
 
 // WriteColumnarDirectReplay is WriteColumnarDirectNoWAL for WAL recovery, with
@@ -2321,10 +2346,14 @@ func (b *ArrowBuffer) writeColumnar(ctx context.Context, database string, record
 	return b.writeColumnarInternal(ctx, database, record, false, "")
 }
 
-func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string, record *models.ColumnarRecord, skipWAL bool, inheritedWALIdentity string) error {
+func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string, record *models.ColumnarRecord, skipWAL bool, inheritedWALIdentity string, replicated ...bool) error {
 	// Create buffer key: database/measurement
 	// OPTIMIZATION: String concatenation is faster than fmt.Sprintf (no reflection)
 	bufferKey := database + "/" + record.Measurement
+	isReplica := len(replicated) > 0 && replicated[0]
+	if isReplica {
+		bufferKey = replicaBufferPrefix + bufferKey
+	}
 
 	// WAL: Write to WAL before buffering (if enabled)
 	// Skip WAL during recovery to avoid re-writing recovered data
@@ -2428,6 +2457,9 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 	// Propagate the dedup-on-time marker (CQ output only — see ColumnarRecord.DedupTime)
 	typedColumns.DedupTime = record.DedupTime
 	typedColumns.WALHashes = walHashes
+	if isReplica {
+		typedColumns.ReplicaSegments = []replicaview.Segment{{Identity: inheritedWALIdentity, TotalRows: int64(numRecords), Start: 0, End: int64(numRecords)}}
+	}
 
 	// Column signature for schema evolution detection (pre-computed in convertColumnsToTyped)
 	newSignature := typedColumns.Signature
@@ -2510,6 +2542,9 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 
 	// Release lock IMMEDIATELY (lock held for <1ms)
 	shard.mu.Unlock()
+	if publisher, ok := b.wal.(interface{ PublishTracked([]string) }); ok && !skipWAL {
+		publisher.PublishTracked(walHashes)
+	}
 
 	// Logging and metrics outside the lock: the send itself is non-blocking, but
 	// there is no reason to hold a shard lock across zerolog formatting.
@@ -2699,6 +2734,9 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 	}
 
 	shard.mu.Unlock()
+	if publisher, ok := b.wal.(interface{ PublishTracked([]string) }); ok && !skipWAL {
+		publisher.PublishTracked(walHashes)
+	}
 
 	if shouldFlush {
 		metrics.Get().SetBufferQueueDepth(b.queueDepth.Load())
@@ -3295,6 +3333,7 @@ func (b *ArrowBuffer) flushAgedBuffers() {
 
 // splitBufferKey splits "database/measurement" into [database, measurement]
 func splitBufferKey(key string) []string {
+	key = strings.TrimPrefix(key, replicaBufferPrefix)
 	// Find first slash to split database/measurement
 	for i, c := range key {
 		if c == '/' {
@@ -3358,6 +3397,9 @@ func (b *ArrowBuffer) flushWorker(workerID int) {
 // process-wide latch with no per-task attribution.
 func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database, measurement string, records []interface{}, recordCount int, walHashes []string) error {
 	startTime := time.Now()
+	if strings.HasPrefix(bufferKey, replicaBufferPrefix) {
+		defer b.releaseReplicaInFlight(database, measurement, walHashes)
+	}
 
 	// Merge typed column batches
 	merged, err := b.mergeBatches(records)
@@ -3429,9 +3471,6 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	// Get sort keys for this measurement (guaranteed to include "time")
 	sortKeys := b.getSortKeys(measurement)
 
-	// Get decimal column config for this measurement (nil if none configured)
-	decimalCols := b.getDecimalColumns(measurement)
-
 	// Extract time column (doesn't need to be sorted yet)
 	times, ok := merged.Data["time"].([]int64)
 	if !ok || len(times) == 0 {
@@ -3481,14 +3520,15 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	maxHour := maxTime.Truncate(time.Hour)
 	if minHour.Equal(maxHour) {
 		// Single hour - sort once and write one file
-		sorted := sortTypedColumnBatchByKeys(merged, sortKeys)
-
-		parquetData, fileSchema, err := b.writer.writeParquetColumnarWithSchema(ctx, measurement, sorted.Data, sorted.Validity, sorted.TagColumns, sorted.DedupTime, decimalCols)
+		parquetData, fileSchema, replicationMetadata, err := b.writeReplicationParquet(ctx, database, measurement, merged, minHour, sortKeys)
 		if err != nil {
 			return fmt.Errorf("failed to write Parquet: %w", err)
 		}
 
 		storagePath := b.generateStoragePath(database, measurement, minTime)
+		if replicationMetadata.IsReplica() {
+			storagePath = replicaview.ReplicaPrefix + storagePath
+		}
 
 		// Compute SHA-256 of the Parquet buffer before the backend write so the
 		// hash lands in the cluster manifest with the same commit that announces
@@ -3500,10 +3540,12 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
 			return fmt.Errorf("failed to write to storage: %w", err)
 		}
-		b.registerFieldSchema(ctx, database, measurement, fileSchema, sorted.TagColumns, storagePath)
+		b.registerFieldSchema(ctx, database, measurement, fileSchema, merged.TagColumns, storagePath)
 
 		// Register file in tiering metadata for query routing
-		b.registerFileInTiering(ctx, database, measurement, storagePath, minTime, int64(len(parquetData)), parquetSumHex)
+		if err := b.publishReplicationFile(ctx, storagePath, replicationMetadata, int64(len(parquetData)), parquetSumHex); err != nil {
+			return err
+		}
 
 		b.totalRecordsWritten.Add(int64(recordCount))
 		b.totalFlushes.Add(1)
@@ -3544,11 +3586,12 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	// to avoid leaving stale manifest entries when a later hour fails — WAL replay
 	// would otherwise create a duplicate file for the already-registered hour.
 	type tieringEntry struct {
-		storagePath string
-		bucketTime  time.Time
-		sizeBytes   int64
-		sha256Hex   string
-		records     int
+		storagePath         string
+		bucketTime          time.Time
+		sizeBytes           int64
+		sha256Hex           string
+		records             int
+		replicationMetadata replicaview.FileMetadata
 	}
 	written := make([]tieringEntry, 0, len(hourBuckets))
 
@@ -3559,11 +3602,13 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		// Extract rows for this hour using the index list
 		hourBatch := sliceTypedColumnBatchByIndices(merged, bucket.indices)
 
-		// Sort this hour's data by configured sort keys
-		sorted := sortTypedColumnBatchByKeys(hourBatch, sortKeys)
+		hourBatch.WALHashes = merged.WALHashes
+		if len(merged.ReplicaSegments) > 0 {
+			hourBatch.ReplicaSegments = replicaview.SliceSegments(merged.ReplicaSegments, bucket.indices)
+		}
 
 		// Write Parquet file for this hour
-		parquetData, fileSchema, err := b.writer.writeParquetColumnarWithSchema(ctx, measurement, sorted.Data, sorted.Validity, sorted.TagColumns, sorted.DedupTime, decimalCols)
+		parquetData, fileSchema, replicationMetadata, err := b.writeReplicationParquet(ctx, database, measurement, hourBatch, hourIDToTime(hourID), sortKeys)
 		if err != nil {
 			return fmt.Errorf("failed to write Parquet for hour %d: %w", hourID, err)
 		}
@@ -3571,6 +3616,9 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		// Use bucket's minTime for path generation (convert hourID to time only here)
 		bucketTime := hourIDToTime(hourID)
 		storagePath := b.generateStoragePath(database, measurement, bucketTime)
+		if replicationMetadata.IsReplica() {
+			storagePath = replicaview.ReplicaPrefix + storagePath
+		}
 
 		// Compute SHA-256 of the Parquet buffer for peer replication checksum.
 		// See the single-hour branch above for rationale.
@@ -3580,14 +3628,15 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
 			return fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err)
 		}
-		b.registerFieldSchema(ctx, database, measurement, fileSchema, sorted.TagColumns, storagePath)
+		b.registerFieldSchema(ctx, database, measurement, fileSchema, merged.TagColumns, storagePath)
 
 		written = append(written, tieringEntry{
-			storagePath: storagePath,
-			bucketTime:  bucketTime,
-			sizeBytes:   int64(len(parquetData)),
-			sha256Hex:   parquetSumHex,
-			records:     splitRecordCount,
+			storagePath:         storagePath,
+			bucketTime:          bucketTime,
+			sizeBytes:           int64(len(parquetData)),
+			sha256Hex:           parquetSumHex,
+			records:             splitRecordCount,
+			replicationMetadata: replicationMetadata,
 		})
 
 		b.logger.Info().
@@ -3602,7 +3651,9 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	// All hours written successfully — now register in tiering and cluster manifest.
 	totalWritten := 0
 	for _, e := range written {
-		b.registerFileInTiering(ctx, database, measurement, e.storagePath, e.bucketTime, e.sizeBytes, e.sha256Hex)
+		if err := b.publishReplicationFile(ctx, e.storagePath, e.replicationMetadata, e.sizeBytes, e.sha256Hex); err != nil {
+			return err
+		}
 		totalWritten += e.records
 	}
 
@@ -3646,6 +3697,9 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 	// Get record count before clearing buffer
 	recordCount := shard.bufferRecordCounts[bufferKey]
 	walHashes := collectWALHashes(batches)
+	if strings.HasPrefix(bufferKey, replicaBufferPrefix) {
+		defer b.releaseReplicaInFlight(database, measurement, walHashes)
+	}
 
 	// Extract records to flush (hold lock for minimal time)
 	recordsToFlush := make([]interface{}, len(batches))
@@ -3732,6 +3786,8 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 	// does (all writes to one measurement share the same producer, so this only
 	// ORs identical values in practice — the OR is defensive).
 	mergedDedupTime := false
+	var mergedReplicaSegments []replicaview.Segment
+	var mergedWALHashes []string
 
 	// First pass: count total rows using time column
 	for _, batch := range batches {
@@ -3739,6 +3795,12 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 		switch b := batch.(type) {
 		case *TypedColumnBatch:
 			cols = b.Data
+			mergedWALHashes = append(mergedWALHashes, b.WALHashes...)
+			for _, segment := range b.ReplicaSegments {
+				segment.Start += int64(totalRows)
+				segment.End += int64(totalRows)
+				mergedReplicaSegments = append(mergedReplicaSegments, segment)
+			}
 			if len(b.Validity) > 0 {
 				hasAnyValidity = true
 			}
@@ -3918,7 +3980,7 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 		}
 	}
 
-	return &TypedColumnBatch{Data: merged, Validity: mergedValidity, TagColumns: mergedTagColumns, DedupTime: mergedDedupTime}, nil
+	return &TypedColumnBatch{Data: merged, Validity: mergedValidity, TagColumns: mergedTagColumns, DedupTime: mergedDedupTime, WALHashes: mergedWALHashes, ReplicaSegments: mergedReplicaSegments}, nil
 }
 
 // sortColumnsByTime sorts all columns by the time column in-place

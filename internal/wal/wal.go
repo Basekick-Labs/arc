@@ -54,6 +54,11 @@ const (
 	WALEnvelopeMarker   = 0x01
 	WALCheckpointMarker = 0x02
 	WALTrackedMarker    = 0x03
+	// WALReplicatedMarker uses the same 17-byte header as WALTrackedMarker,
+	// but records that this node RECEIVED the entry. Recovery must never send
+	// it through the local-origin callback. The identity is the origin's,
+	// not a new identity allocated by this WAL writer.
+	WALReplicatedMarker = 0x04
 )
 
 // ParseEnvelope extracts the database name and msgpack payload from a WAL entry.
@@ -420,6 +425,8 @@ type WriterConfig struct {
 // ReplicationEntry represents a WAL entry for replication.
 // This is passed to the replication hook for streaming to readers.
 type ReplicationEntry struct {
+	// TrackedPayload includes the originating identity without another allocation.
+	TrackedPayload []byte
 	// Sequence is a monotonically increasing number for ordering
 	Sequence uint64
 
@@ -455,9 +462,11 @@ type Writer struct {
 	wg        sync.WaitGroup
 
 	// Replication hook for streaming entries to readers
-	replicationHook ReplicationHook
-	sequence        uint64 // Monotonic sequence counter for replication
-	trackedInstance uint64
+	replicationHook         ReplicationHook
+	deferTrackedReplication atomic.Bool
+	stagedReplication       map[string]*ReplicationEntry // guarded by pendingMu
+	sequence                uint64                       // Monotonic sequence counter for replication
+	trackedInstance         uint64
 
 	// fileSeqs and fileOrder track what this process wrote to each WAL file, so
 	// the purge can decide by what has been flushed rather than by mtime
@@ -481,7 +490,10 @@ type Writer struct {
 	// CurrentCheckpointHashes.
 	pendingMu   sync.Mutex
 	pendingSeqs map[uint64]struct{}
-	closed      bool
+	// Received identities use local purge sequences without changing their
+	// originating identity on disk. Guarded by pendingMu.
+	receivedSeqs map[string][]uint64
+	closed       bool
 
 	// Metrics (atomic for lock-free reads)
 	TotalEntries   int64
@@ -931,6 +943,7 @@ func (w *Writer) MarkFlushed(hashes []string) error {
 			return fmt.Errorf("failed to persist WAL flush checkpoint: %w", err)
 		}
 		w.releasePending(hashes[start:end])
+		w.releaseReceived(hashes[start:end])
 	}
 	return nil
 }
@@ -972,14 +985,6 @@ func (w *Writer) appendTrackedEntry(logicalPayload []byte) (string, error) {
 	copy(trackedPayload[17:], logicalPayload)
 	checksum := crc32.ChecksumIEEE(trackedPayload)
 	timestampUS := uint64(time.Now().UnixMicro())
-	if w.replicationHook != nil {
-		w.mu.Lock()
-		w.sequence++
-		replicationSequence := w.sequence
-		hook := w.replicationHook
-		w.mu.Unlock()
-		hook(&ReplicationEntry{Sequence: replicationSequence, TimestampUS: timestampUS, Payload: logicalPayload})
-	}
 	entryData := make([]byte, WALEntryHeaderSize+len(trackedPayload))
 	binary.BigEndian.PutUint32(entryData[0:4], uint32(len(trackedPayload)))
 	binary.BigEndian.PutUint64(entryData[4:12], timestampUS)
@@ -993,6 +998,7 @@ func (w *Writer) appendTrackedEntry(logicalPayload []byte) (string, error) {
 		w.pendingMu.Unlock()
 		return "", err
 	}
+	w.stageOrPublishTracked(token, &ReplicationEntry{TimestampUS: timestampUS, Payload: logicalPayload, TrackedPayload: trackedPayload})
 	return token, nil
 }
 
@@ -1201,6 +1207,11 @@ func (w *Writer) purgeWALFiles(shouldDelete func(path string) bool) (int, error)
 
 	deleted := 0
 	for _, f := range files {
+		if protected, scanErr := containsReceivedEntries(f); scanErr != nil || protected {
+			// Keep this file and every later checkpoint. Replica recovery owns
+			// reclamation when the per-process sequence proof is unavailable.
+			break
+		}
 		if shouldDelete(f) {
 			if err := os.Remove(f); err != nil {
 				w.logger.Error().Err(err).Str("file", f).Msg("Failed to purge WAL file")
@@ -1335,6 +1346,11 @@ func (w *Writer) ForgetTracked(hashes []string) {
 		return
 	}
 	w.releasePending(hashes)
+	w.pendingMu.Lock()
+	for _, hash := range hashes {
+		delete(w.stagedReplication, hash)
+	}
+	w.pendingMu.Unlock()
 }
 
 // MinUnflushedSequence returns the lowest tracked sequence this process has
@@ -1409,6 +1425,9 @@ func (w *Writer) MinUnflushedSequence() uint64 {
 //
 // Returns the number of files deleted.
 func (w *Writer) PurgeFlushed(minUnflushedSeq uint64) (int, error) {
+	if w.hasForeignReceivedWAL() {
+		return 0, nil
+	}
 	w.mu.Lock()
 	activePath := w.currentPath
 	candidates := make([]string, 0, len(w.fileOrder))
@@ -1499,6 +1518,9 @@ func (w *Writer) PurgeFlushed(minUnflushedSeq uint64) (int, error) {
 // a previous process's sequences, which recovery reads from the files
 // themselves.
 func (w *Writer) PurgeUnaccountedOlderThan(minAge time.Duration) (int, error) {
+	if w.hasForeignReceivedWAL() {
+		return 0, nil
+	}
 	now := time.Now()
 	tooYoung := func(path string) bool {
 		info, err := os.Stat(path)
@@ -1578,6 +1600,9 @@ func (w *Writer) PurgeUnaccountedOlderThan(minAge time.Duration) (int, error) {
 		w.mu.Unlock()
 		if isActive {
 			continue
+		}
+		if protected, scanErr := containsReceivedEntries(path); scanErr != nil || protected {
+			break
 		}
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			if firstErr == nil {

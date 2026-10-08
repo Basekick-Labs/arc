@@ -33,11 +33,16 @@ func NewReader(filePath string, logger zerolog.Logger) *Reader {
 
 // Entry represents a single WAL entry
 type Entry struct {
-	TimestampUS      uint64                   // Microseconds since epoch
-	PayloadHash      string                   // Entry identity: the writer-assigned "instanceSeq" (32 hex) for a tracked entry, else a SHA-256 of the logical payload (64 hex)
-	CheckpointHashes []string                 // Flush checkpoint identities, when present
-	Records          []map[string]interface{} // Row format (from Append path)
-	ColumnarData     *ColumnarEntry           // Columnar format (from AppendRaw path)
+	// ReplicationPayload is populated only for received entries. Keeping the
+	// originating tracked envelope lets one replica-specific callback handle
+	// row and columnar formats identically during live apply and recovery.
+	// Records/ColumnarData are deliberately empty for this provenance.
+	ReplicationPayload []byte
+	TimestampUS        uint64                   // Microseconds since epoch
+	PayloadHash        string                   // Entry identity: the writer-assigned "instanceSeq" (32 hex) for a tracked entry, else a SHA-256 of the logical payload (64 hex)
+	CheckpointHashes   []string                 // Flush checkpoint identities, when present
+	Records            []map[string]interface{} // Row format (from Append path)
+	ColumnarData       *ColumnarEntry           // Columnar format (from AppendRaw path)
 }
 
 // ColumnarEntry represents a columnar WAL entry written via the zero-copy path
@@ -256,6 +261,16 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 			return nil, fmt.Errorf("failed to deserialize WAL checkpoint: %w", err)
 		}
 		return &Entry{TimestampUS: timestampUS, CheckpointHashes: hashes}, nil
+	}
+	if len(payload) > 0 && payload[0] == WALReplicatedMarker {
+		identity, _, err := TrackedPayload(payload)
+		if err != nil {
+			return nil, err
+		}
+		// This buffer is owned by readEntry. Restore the wire marker for the
+		// replica apply callback while retaining provenance in the Entry type.
+		payload[0] = WALTrackedMarker
+		return &Entry{TimestampUS: timestampUS, PayloadHash: identity, ReplicationPayload: payload}, nil
 	}
 	payloadHashValue := payloadHash(payload)
 	logicalPayload := payload

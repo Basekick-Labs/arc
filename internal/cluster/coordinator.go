@@ -4915,6 +4915,10 @@ func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler 
 			return nil
 		}
 
+		if buf.HasReplicationPublisher() {
+			return buf.ApplyReplicatedWAL(ctx, payload)
+		}
+
 		// Parse WAL envelope to extract database name and msgpack payload
 		database, msgpackData := wal.ParseEnvelope(payload, "default")
 

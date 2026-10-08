@@ -148,7 +148,8 @@ type ReplicateSync struct {
 	// SupportsBinaryEntries carries the reader's MsgReplicateEntryBin
 	// capability from the protocol-level handshake (#698). Internal
 	// hand-off only, like HandshakeNonce.
-	SupportsBinaryEntries bool `json:"-"`
+	SupportsBinaryEntries  bool `json:"-"`
+	SupportsTrackedEntries bool `json:"-"`
 }
 
 // ReplicateSyncAck responds with the writer's current position.

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/replicaview"
 	"github.com/hashicorp/raft"
 	"github.com/rs/zerolog"
 )
@@ -199,16 +200,18 @@ type DemoteWriterPayload struct {
 // This is the authoritative record of a file's existence, used by peer
 // replication to decide what to pull from other nodes.
 type FileEntry struct {
-	Path          string    `json:"path"`           // Relative storage path (e.g. "db/measurement/2026/04/11/14/file.parquet")
-	SHA256        string    `json:"sha256"`         // Content checksum for verification
-	SizeBytes     int64     `json:"size_bytes"`     // File size
-	Database      string    `json:"database"`       // Arc database name
-	Measurement   string    `json:"measurement"`    // Arc measurement name
-	PartitionTime time.Time `json:"partition_time"` // Partition time (for hot/cold routing)
-	OriginNodeID  string    `json:"origin_node_id"` // Node that first wrote the file
-	Tier          string    `json:"tier"`           // "hot" or "cold"
-	CreatedAt     time.Time `json:"created_at"`     // When the file was first registered
-	LSN           uint64    `json:"lsn"`            // Raft log index at registration (for ordering)
+	WALCoverage   []replicaview.PartitionCoverage `json:"wal_coverage,omitempty"`
+	Replaces      []string                        `json:"replaces,omitempty"`
+	Path          string                          `json:"path"`           // Relative storage path (e.g. "db/measurement/2026/04/11/14/file.parquet")
+	SHA256        string                          `json:"sha256"`         // Content checksum for verification
+	SizeBytes     int64                           `json:"size_bytes"`     // File size
+	Database      string                          `json:"database"`       // Arc database name
+	Measurement   string                          `json:"measurement"`    // Arc measurement name
+	PartitionTime time.Time                       `json:"partition_time"` // Partition time (for hot/cold routing)
+	OriginNodeID  string                          `json:"origin_node_id"` // Node that first wrote the file
+	Tier          string                          `json:"tier"`           // "hot" or "cold"
+	CreatedAt     time.Time                       `json:"created_at"`     // When the file was first registered
+	LSN           uint64                          `json:"lsn"`            // Raft log index at registration (for ordering)
 }
 
 // RegisterFilePayload is the payload for CommandRegisterFile.
@@ -400,11 +403,12 @@ type RotateTokenPayload struct {
 // entries — no version field required. The reverse (newer snapshot decoded
 // by older binary) silently drops the unknown fields per encoding/json.
 type FSMSnapshot struct {
-	Nodes             map[string]*NodeInfo  `json:"nodes"`
-	PrimaryWriterID   string                `json:"primary_writer_id,omitempty"`
-	ActiveCompactorID string                `json:"active_compactor_id,omitempty"`
-	Files             map[string]*FileEntry `json:"files,omitempty"`  // File manifest (peer replication)
-	Tokens            map[int64]*TokenEntry `json:"tokens,omitempty"` // Cluster-wide auth tokens (Phase A)
+	ReplicationRetired []ReplicationRetirement `json:"replication_retired,omitempty"`
+	Nodes              map[string]*NodeInfo    `json:"nodes"`
+	PrimaryWriterID    string                  `json:"primary_writer_id,omitempty"`
+	ActiveCompactorID  string                  `json:"active_compactor_id,omitempty"`
+	Files              map[string]*FileEntry   `json:"files,omitempty"`  // File manifest (peer replication)
+	Tokens             map[int64]*TokenEntry   `json:"tokens,omitempty"` // Cluster-wide auth tokens (Phase A)
 	// Phase A.1: Cluster Auth Convergence (RBAC). Secondary indices
 	// (organizationsByName, teamsByOrg, etc.) are intentionally NOT
 	// persisted — Restore rebuilds them from the primary maps after the
@@ -427,11 +431,12 @@ type FSMSnapshot struct {
 // ClusterFSM implements the raft.FSM interface for cluster state management.
 // It maintains the authoritative state of nodes in the cluster.
 type ClusterFSM struct {
-	mu                sync.RWMutex
-	nodes             map[string]*NodeInfo
-	primaryWriterID   string                // ID of the current primary writer node
-	activeCompactorID string                // ID of the node currently holding the compactor lease
-	files             map[string]*FileEntry // File manifest (path → entry) for peer replication
+	replicationRetired map[string]ReplicationRetirement
+	mu                 sync.RWMutex
+	nodes              map[string]*NodeInfo
+	primaryWriterID    string                // ID of the current primary writer node
+	activeCompactorID  string                // ID of the node currently holding the compactor lease
+	files              map[string]*FileEntry // File manifest (path → entry) for peer replication
 	// Secondary index: database → set of file paths. Maintained alongside
 	// the primary `files` map on register/delete to avoid O(N) scans when
 	// filtering by database.
@@ -1451,6 +1456,11 @@ func (f *ClusterFSM) applyRegisterFile(payload []byte, logIndex uint64) interfac
 // Single-op callers validate here; batch callers use the shared locked
 // mutation helper after validating every operation up front.
 func (f *ClusterFSM) applyRegisterFileStruct(p RegisterFilePayload, logIndex uint64) interface{} {
+	var coverageErr error
+	p.File.WALCoverage, coverageErr = replicaview.NormalizePartitions(p.File.WALCoverage)
+	if coverageErr != nil {
+		return coverageErr
+	}
 	// Validate the path BEFORE any state mutation. See GHSA-f85q-mvg8-qf37:
 	// historically the only check was empty-string, which let an attacker
 	// register arbitrary paths (/etc/passwd, s3://attacker-bucket/..., etc.)
@@ -1483,7 +1493,7 @@ func (f *ClusterFSM) applyRegisterFileStruct(p RegisterFilePayload, logIndex uin
 func (f *ClusterFSM) applyRegisterFileLocked(p RegisterFilePayload, logIndex uint64) func() {
 	// Stamp the LSN from the Raft log index (deterministic across all nodes).
 	p.File.LSN = logIndex
-	entry := p.File
+	entry := cloneManifestFile(&p.File)
 	old, existed := f.files[entry.Path]
 	contentChanged := existed && (old.SHA256 != entry.SHA256 || old.SizeBytes != entry.SizeBytes)
 	// If the file was already registered under a different database (unlikely
@@ -1519,11 +1529,11 @@ func (f *ClusterFSM) applyRegisterFileLocked(p RegisterFilePayload, logIndex uin
 			Msg("File registered in cluster manifest")
 
 		if callback != nil {
-			entryCopy := entry
+			entryCopy := cloneManifestFile(&entry)
 			callback(&entryCopy)
 		}
 		if contentChanged && contentCallback != nil {
-			entryCopy := entry
+			entryCopy := cloneManifestFile(&entry)
 			contentCallback(&entryCopy)
 		}
 	}
@@ -1560,6 +1570,9 @@ func (f *ClusterFSM) applyDeleteFileStruct(p DeleteFilePayload) interface{} {
 // the path was not in the manifest (idempotent delete, nothing to announce).
 func (f *ClusterFSM) applyDeleteFileLocked(p DeleteFilePayload) func() {
 	existing, existed := f.files[p.Path]
+	if existed {
+		f.retireReplicationLocked(existing, p.Reason)
+	}
 	delete(f.files, p.Path)
 	if existed {
 		// Remove from the database → files secondary index
@@ -1601,6 +1614,11 @@ func (f *ClusterFSM) applyUpdateFile(payload []byte, logIndex uint64) interface{
 // Single-op callers validate here; batch callers use the shared locked
 // mutation helper after validating every operation up front.
 func (f *ClusterFSM) applyUpdateFileStruct(p UpdateFilePayload, logIndex uint64) interface{} {
+	var coverageErr error
+	p.File.WALCoverage, coverageErr = replicaview.NormalizePartitions(p.File.WALCoverage)
+	if coverageErr != nil {
+		return coverageErr
+	}
 	// Same validation as applyRegisterFile — an attacker who can submit
 	// Update commands could otherwise insert a new manifest entry at a
 	// malicious path (Update writes f.files[entry.Path] = &entry, so a
@@ -1642,7 +1660,7 @@ func (f *ClusterFSM) applyUpdateFileLocked(p UpdateFilePayload, logIndex uint64)
 	// consumers (e.g. compaction watchers) couldn't distinguish a
 	// fresh state from a stale one.
 	p.File.LSN = logIndex
-	entry := p.File
+	entry := cloneManifestFile(&p.File)
 	old, existed := f.files[entry.Path]
 	contentChanged := existed && (old.SHA256 != entry.SHA256 || old.SizeBytes != entry.SizeBytes)
 	// If the database changed (defensive), remove the old secondary index entry first.
@@ -1677,11 +1695,11 @@ func (f *ClusterFSM) applyUpdateFileLocked(p UpdateFilePayload, logIndex uint64)
 		// pull the updated file from the writer. The file path is the same but the
 		// content (and checksum) changed, so readers must re-fetch it.
 		if callback != nil {
-			entryCopy := entry
+			entryCopy := cloneManifestFile(&entry)
 			callback(&entryCopy)
 		}
 		if contentChanged && contentCallback != nil {
-			entryCopy := entry
+			entryCopy := cloneManifestFile(&entry)
 			contentCallback(&entryCopy)
 		}
 	}
@@ -1764,6 +1782,11 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 			if rp.File.CreatedAt.IsZero() {
 				return fmt.Errorf("batch file ops: op[%d]: register file: created_at is required", i)
 			}
+			var err error
+			rp.File.WALCoverage, err = replicaview.NormalizePartitions(rp.File.WALCoverage)
+			if err != nil {
+				return fmt.Errorf("batch file ops: coverage: %w", err)
+			}
 			decoded[i] = rp
 		case CommandUpdateFile:
 			var up UpdateFilePayload
@@ -1784,6 +1807,11 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 			// Mirror applyUpdateFileStruct's CreatedAt requirement.
 			if up.File.CreatedAt.IsZero() {
 				return fmt.Errorf("batch file ops: op[%d]: update file: created_at is required", i)
+			}
+			var err error
+			up.File.WALCoverage, err = replicaview.NormalizePartitions(up.File.WALCoverage)
+			if err != nil {
+				return fmt.Errorf("batch file ops: coverage: %w", err)
 			}
 			decoded[i] = up
 		case CommandDeleteFile:
@@ -2331,7 +2359,7 @@ func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 	// Deep copy files
 	files := make(map[string]*FileEntry, len(f.files))
 	for path, file := range f.files {
-		fileCopy := *file
+		fileCopy := cloneManifestFile(file)
 		files[path] = &fileCopy
 	}
 
@@ -2384,7 +2412,7 @@ func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 	}
 
 	return &fsmSnapshot{
-		nodes:                  nodes,
+		replicationRetired: f.replicationRetirementsLocked(), nodes: nodes,
 		barriers:               barriers,
 		compactionPause:        compactionPause,
 		primaryWriterID:        f.primaryWriterID,
@@ -2414,6 +2442,17 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	var snapshot FSMSnapshot
 	if err := json.NewDecoder(rc).Decode(&snapshot); err != nil {
 		return fmt.Errorf("failed to decode snapshot: %w", err)
+	}
+
+	restoredRetirements := make(map[string]ReplicationRetirement, len(snapshot.ReplicationRetired))
+	for _, retirement := range snapshot.ReplicationRetired {
+		coverage, err := replicaview.Normalize(retirement.Coverage)
+		if err != nil {
+			return fmt.Errorf("invalid replication retirement in snapshot: %w", err)
+		}
+		key := retirementKey(retirement.Database, retirement.Measurement, retirement.Hour)
+		retirement.Coverage = replicaview.Union(restoredRetirements[key].Coverage, coverage)
+		restoredRetirements[key] = retirement
 	}
 
 	// Validate every restored manifest path. Entries that fail
@@ -2453,7 +2492,13 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 				Msg("manifest path validation failed during snapshot restore — entry refused, not added to f.files")
 			continue
 		}
-		restoredFiles[path] = entry
+		copy := cloneManifestFile(entry)
+		var coverageErr error
+		copy.WALCoverage, coverageErr = replicaview.NormalizePartitions(copy.WALCoverage)
+		if coverageErr != nil {
+			return fmt.Errorf("invalid file coverage in snapshot: %w", coverageErr)
+		}
+		restoredFiles[path] = &copy
 	}
 
 	// Validate every restored token. Same quarantine policy as files: a
@@ -2740,6 +2785,7 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	f.primaryWriterID = snapshot.PrimaryWriterID
 	f.activeCompactorID = snapshot.ActiveCompactorID
 	f.files = restoredFiles
+	f.replicationRetired = restoredRetirements
 	// Rebuild the database → files secondary index from the restored files
 	f.filesByDB = make(map[string]map[string]struct{}, len(f.files))
 	for path, entry := range f.files {
@@ -2944,7 +2990,7 @@ func (f *ClusterFSM) GetFile(path string) (*FileEntry, bool) {
 	if !exists {
 		return nil, false
 	}
-	entryCopy := *entry
+	entryCopy := cloneManifestFile(entry)
 	return &entryCopy, true
 }
 
@@ -2961,7 +3007,7 @@ func (f *ClusterFSM) GetAllFiles() []*FileEntry {
 	defer f.mu.RUnlock()
 	files := make([]*FileEntry, 0, len(f.files))
 	for _, file := range f.files {
-		fileCopy := *file
+		fileCopy := cloneManifestFile(file)
 		files = append(files, &fileCopy)
 	}
 	return files
@@ -2980,7 +3026,7 @@ func (f *ClusterFSM) GetFilesByDatabase(database string) []*FileEntry {
 	files := make([]*FileEntry, 0, len(idx))
 	for path := range idx {
 		if entry, exists := f.files[path]; exists {
-			entryCopy := *entry
+			entryCopy := cloneManifestFile(entry)
 			files = append(files, &entryCopy)
 		}
 	}
@@ -3048,7 +3094,7 @@ func (f *ClusterFSM) GetFilesPaginated(cursor string, limit int) ([]*FileEntry, 
 	result := make([]*FileEntry, 0, end-start)
 	for i := start; i < end; i++ {
 		if entry, exists := f.files[keys[i]]; exists {
-			entryCopy := *entry
+			entryCopy := cloneManifestFile(entry)
 			result = append(result, &entryCopy)
 		}
 	}
@@ -3071,11 +3117,12 @@ func (f *ClusterFSM) FileCount() int {
 
 // fsmSnapshot implements raft.FSMSnapshot.
 type fsmSnapshot struct {
-	nodes             map[string]*NodeInfo
-	primaryWriterID   string
-	activeCompactorID string
-	files             map[string]*FileEntry
-	tokens            map[int64]*TokenEntry
+	replicationRetired []ReplicationRetirement
+	nodes              map[string]*NodeInfo
+	primaryWriterID    string
+	activeCompactorID  string
+	files              map[string]*FileEntry
+	tokens             map[int64]*TokenEntry
 
 	// Phase A.1: RBAC primary maps (no secondary indices persisted).
 	organizations          map[int64]*OrganizationEntry
@@ -3090,7 +3137,7 @@ type fsmSnapshot struct {
 // Persist writes the snapshot to the given sink.
 func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 	snapshot := FSMSnapshot{
-		Nodes:                  s.nodes,
+		ReplicationRetired: s.replicationRetired, Nodes: s.nodes,
 		PrimaryWriterID:        s.primaryWriterID,
 		ActiveCompactorID:      s.activeCompactorID,
 		Files:                  s.files,

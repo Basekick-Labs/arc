@@ -245,19 +245,22 @@ func ValidateCacheInvalidateHMAC(sharedSecret, nonce, nodeID, clusterName string
 // downgrading the framing or getting a mismatched writer expectation.
 //
 // Format: "replicate-sync" \x00 nonce \x00 readerID \x00 clusterName \x00 lastKnownSeq \x00 supportsBinaryEntries \x00 timestamp
-func ComputeReplicateSyncHMAC(sharedSecret, nonce, readerID, clusterName string, lastKnownSeq uint64, supportsBinaryEntries bool, timestamp int64) string {
-	return hex.EncodeToString(computeReplicateSyncHMACRaw(sharedSecret, nonce, readerID, clusterName, lastKnownSeq, supportsBinaryEntries, timestamp))
+func ComputeReplicateSyncHMAC(sharedSecret, nonce, readerID, clusterName string, lastKnownSeq uint64, supportsBinaryEntries bool, timestamp int64, supportsTrackedEntries ...bool) string {
+	return hex.EncodeToString(computeReplicateSyncHMACRaw(sharedSecret, nonce, readerID, clusterName, lastKnownSeq, supportsBinaryEntries, timestamp, supportsTrackedEntries...))
 }
 
-func computeReplicateSyncHMACRaw(sharedSecret, nonce, readerID, clusterName string, lastKnownSeq uint64, supportsBinaryEntries bool, timestamp int64) []byte {
+func computeReplicateSyncHMACRaw(sharedSecret, nonce, readerID, clusterName string, lastKnownSeq uint64, supportsBinaryEntries bool, timestamp int64, supportsTrackedEntries ...bool) []byte {
 	message := fmt.Sprintf("replicate-sync\x00%s\x00%s\x00%s\x00%d\x00%t\x00%d", nonce, readerID, clusterName, lastKnownSeq, supportsBinaryEntries, timestamp)
+	if len(supportsTrackedEntries) > 0 && supportsTrackedEntries[0] {
+		message += "\x00tracked-entries-v1"
+	}
 	return computeRawHMAC(sharedSecret, message)
 }
 
 // ValidateReplicateSyncHMAC validates the handshake HMAC and checks
 // freshness. Same symmetric-drift semantics as the other validators —
 // both stale-past and future-dated timestamps are refused.
-func ValidateReplicateSyncHMAC(sharedSecret, nonce, readerID, clusterName string, lastKnownSeq uint64, supportsBinaryEntries bool, timestamp int64, receivedMAC string, tolerance time.Duration) error {
+func ValidateReplicateSyncHMAC(sharedSecret, nonce, readerID, clusterName string, lastKnownSeq uint64, supportsBinaryEntries bool, timestamp int64, receivedMAC string, tolerance time.Duration, supportsTrackedEntries ...bool) error {
 	now := time.Now().Unix()
 	drift := now - timestamp
 	if drift < 0 {
@@ -267,7 +270,7 @@ func ValidateReplicateSyncHMAC(sharedSecret, nonce, readerID, clusterName string
 		return fmt.Errorf("replicate-sync auth timestamp expired or out of tolerance (drift: %ds, tolerance: %ds)", drift, int64(tolerance.Seconds()))
 	}
 
-	expected := computeReplicateSyncHMACRaw(sharedSecret, nonce, readerID, clusterName, lastKnownSeq, supportsBinaryEntries, timestamp)
+	expected := computeReplicateSyncHMACRaw(sharedSecret, nonce, readerID, clusterName, lastKnownSeq, supportsBinaryEntries, timestamp, supportsTrackedEntries...)
 	if !constantTimeHexEqual(expected, receivedMAC) {
 		return fmt.Errorf("replicate-sync HMAC validation failed: shared secret mismatch or malformed MAC")
 	}

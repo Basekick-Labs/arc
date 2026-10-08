@@ -111,8 +111,20 @@ func assertEquivalent(t *testing.T, name string, payload []byte, skipTimeValues 
 	if !reflect.DeepEqual(map[string][]bool(typedRec.Batch.Validity), map[string][]bool(refBatch.Validity)) {
 		t.Errorf("%s: validity mismatch (presence matters)\n got: %#v\nwant: %#v", name, typedRec.Batch.Validity, refBatch.Validity)
 	}
-	// RawPayload must be the original client bytes (zero-copy WAL contract),
-	// same as the generic path's ColumnarRecord.RawPayload.
+	// Original bytes remain zero-copy when timestamps came from the client.
+	// Generated timestamps instead must be persisted exactly, including NULLs.
+	if skipTimeValues {
+		for _, test := range []struct {
+			raw      []byte
+			expected *TypedColumnBatch
+		}{{typedRec.RawPayload, typedRec.Batch}, {boxedRec.RawPayload, refBatch}} {
+			replayed, _ := decodeBoth(t, test.raw)
+			if replayed == nil || !reflect.DeepEqual(replayed.Batch.Data, test.expected.Data) || !reflect.DeepEqual(replayed.Batch.Validity, test.expected.Validity) {
+				t.Fatalf("%s: WAL replay did not preserve generated timestamps and nulls", name)
+			}
+		}
+		return
+	}
 	if !reflect.DeepEqual(typedRec.RawPayload, payload) {
 		t.Errorf("%s: RawPayload does not equal original payload bytes", name)
 	}

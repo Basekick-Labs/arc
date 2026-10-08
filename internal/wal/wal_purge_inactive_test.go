@@ -281,7 +281,7 @@ func TestNoDuplication_MultipleNewCycles(t *testing.T) {
 
 	for cycle := 1; cycle <= 5; cycle++ {
 		oldName := filepath.Join(tmpDir, "arc-2024010"+string(rune('0'+cycle))+"_000000.wal")
-		os.WriteFile(oldName, []byte("old"), 0600)
+		os.WriteFile(oldName, emptyWALFixture(), 0600)
 
 		deleted, err := writer.PurgeInactive()
 		if err != nil {
@@ -444,7 +444,7 @@ func TestPurgeInactive_PreservesActiveFileDuringWrites(t *testing.T) {
 	writer.Append([]map[string]interface{}{{"measurement": "cpu", "value": 42.0}})
 	waitForEntries(t, writer, 1)
 
-	os.WriteFile(filepath.Join(tmpDir, "arc-20240101_000000.wal"), []byte("old"), 0600)
+	os.WriteFile(filepath.Join(tmpDir, "arc-20240101_000000.wal"), emptyWALFixture(), 0600)
 
 	deleted, err := writer.PurgeInactive()
 	if err != nil {
@@ -480,7 +480,7 @@ func TestPurgeInactive_DoesNotDeleteNonWALFiles(t *testing.T) {
 		os.WriteFile(f, []byte("data"), 0600)
 	}
 
-	os.WriteFile(filepath.Join(tmpDir, "arc-20240101_000000.wal"), []byte("old"), 0600)
+	os.WriteFile(filepath.Join(tmpDir, "arc-20240101_000000.wal"), emptyWALFixture(), 0600)
 
 	deleted, err := writer.PurgeInactive()
 	if err != nil {
@@ -520,7 +520,7 @@ func TestPurgeInactive_ConcurrentWithWrite(t *testing.T) {
 
 	for i := 0; i < 5; i++ {
 		name := filepath.Join(tmpDir, "arc-2024010"+string(rune('1'+i))+"_000000.wal")
-		os.WriteFile(name, []byte("old data"), 0600)
+		os.WriteFile(name, emptyWALFixture(), 0600)
 	}
 
 	done := make(chan struct{})
@@ -568,7 +568,7 @@ func TestPurgeAll_VsPurgeInactive(t *testing.T) {
 
 	activeFile := writer.CurrentFile()
 	oldFile := filepath.Join(tmpDir, "arc-20240101_000000.wal")
-	os.WriteFile(oldFile, []byte("old"), 0600)
+	os.WriteFile(oldFile, emptyWALFixture(), 0600)
 
 	// PurgeInactive keeps active file
 	deleted, _ := writer.PurgeInactive()
@@ -580,7 +580,7 @@ func TestPurgeAll_VsPurgeInactive(t *testing.T) {
 	}
 
 	// PurgeAll deletes everything (shutdown)
-	os.WriteFile(oldFile, []byte("old"), 0600)
+	os.WriteFile(oldFile, emptyWALFixture(), 0600)
 	writer.Close()
 	allDeleted, _ := writer.PurgeAll()
 	if allDeleted != 2 {
@@ -1088,8 +1088,8 @@ func TestPurgeAll_UsesSharedHelper(t *testing.T) {
 	}
 
 	// Create extra files
-	os.WriteFile(filepath.Join(tmpDir, "arc-20240101_000000.wal"), []byte("old"), 0600)
-	os.WriteFile(filepath.Join(tmpDir, "arc-20240102_000000.wal"), []byte("old"), 0600)
+	os.WriteFile(filepath.Join(tmpDir, "arc-20240101_000000.wal"), emptyWALFixture(), 0600)
+	os.WriteFile(filepath.Join(tmpDir, "arc-20240102_000000.wal"), emptyWALFixture(), 0600)
 	writer.Close()
 
 	allFiles, _ := filepath.Glob(filepath.Join(tmpDir, "*.wal"))

@@ -16,6 +16,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/replicaview"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
@@ -792,7 +793,15 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	// pin both statements to a single dedicated connection via db.Conn. Closing it
 	// also deterministically drops the temp table (no leak on partial failure).
 	dedupBranch := len(tagColumns) > 0 || dedupTime
-	stmts := buildCompactionQuery(fileListSQL, orderByClause, outputFile, tagColumns, dedupTime)
+	replicationMetadata, err := compactionReplicationMetadata(validLocalPaths, validStorageKeys)
+	if err != nil {
+		return "", err
+	}
+	var footer map[string]string
+	if replicationMetadata != nil {
+		footer = map[string]string{replicaview.FileMetadataKey: replicationMetadata.Encode(), replicaview.MetadataKey: replicationMetadata.Coverage.Encode()}
+	}
+	stmts := buildCompactionQuery(fileListSQL, orderByClause, outputFile, tagColumns, dedupTime, footer)
 
 	// When dedup is active, count rows before compaction using parquet metadata (no data scan)
 	var rowsBefore int64
@@ -981,6 +990,20 @@ func (j *Job) writeOutputWrittenManifest(_ context.Context, localPath, storageKe
 		return fmt.Errorf("stream-hash compacted file: %w", err)
 	}
 	sum := hex.EncodeToString(hasher.Sum(nil))
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	replicationMetadata, err := replicaview.ReadFileMetadata(f, info.Size())
+	if err != nil {
+		return err
+	}
+	var coverage []replicaview.PartitionCoverage
+	var replaces []string
+	if replicationMetadata != nil {
+		coverage = replicationMetadata.PartitionCoverages()
+		replaces = replicationMetadata.Replaces
+	}
 
 	now := time.Now().UTC()
 	m := &CompletionManifest{
@@ -998,9 +1021,11 @@ func (j *Job) writeOutputWrittenManifest(_ context.Context, localPath, storageKe
 		State:         CompletionStateOutputWritten,
 		Outputs: []CompactedOutput{
 			{
-				Path:      storageKey,
-				SHA256:    sum,
-				SizeBytes: j.BytesAfter,
+				Path:        storageKey,
+				SHA256:      sum,
+				WALCoverage: coverage,
+				Replaces:    replaces,
+				SizeBytes:   j.BytesAfter,
 				// THIS is the field the watcher reads into the Raft
 				// FileEntry (watcher.go builds CompactedFile from Outputs),
 				// so it must carry the canonical database like the top-level

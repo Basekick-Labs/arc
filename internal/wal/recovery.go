@@ -2,6 +2,7 @@ package wal
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -33,6 +34,13 @@ type RecoveryStats struct {
 
 // RecoveryOptions configures WAL recovery behavior
 type RecoveryOptions struct {
+	// ReplicationCallback recovers received WAL entries into the replica view,
+	// never the ordinary ingest buffer. A missing callback preserves the WAL
+	// file and reports an error rather than reclassifying or discarding data.
+	ReplicationCallback func(context.Context, []byte) error
+	// ReplicationFlush confirms that all received entries accepted by the
+	// callback are durably materialized before recovery removes their WAL.
+	ReplicationFlush func(context.Context) error
 	// SkipActiveFile is the path to the currently active WAL file that should be skipped
 	// during periodic recovery (to avoid reading a file being actively written)
 	SkipActiveFile string
@@ -165,12 +173,17 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 			r.logger.Error().Err(err).Str("file", walFile).Msg("Failed to read WAL file")
 			continue
 		}
+		if opts.ReplicationCallback != nil && reader.CorruptedEntries > 0 {
+			return stats, fmt.Errorf("WAL file contains corrupt entries and was retained: %s", filepath.Base(walFile))
+		}
+
 		r.logger.Info().Str("file", filepath.Base(walFile)).Msg("Recovering WAL file")
 
 		// Replay entries - track if all succeed
 		allEntriesSucceeded := true
 		fileRecoveredBatches := 0
 		fileRecoveredEntries := 0
+		recoveredReplication := false
 
 		for _, entry := range entries {
 			if len(entry.CheckpointHashes) > 0 {
@@ -178,6 +191,17 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 			}
 			if _, ok := flushed[entry.PayloadHash]; ok {
 				r.logger.Debug().Str("payload_hash", entry.PayloadHash).Msg("Skipping WAL entry covered by flush checkpoint")
+				continue
+			}
+			if entry.ReplicationPayload != nil {
+				if opts.ReplicationCallback == nil || opts.ReplicationFlush == nil {
+					return stats, fmt.Errorf("received WAL entries require replication recovery and durable flush callbacks: %s", filepath.Base(walFile))
+				}
+				if err := opts.ReplicationCallback(ctx, entry.ReplicationPayload); err != nil {
+					return stats, fmt.Errorf("recover received WAL entry %s: %w", entry.PayloadHash, err)
+				}
+				fileRecoveredBatches++
+				recoveredReplication = true
 				continue
 			}
 			// Dispatch based on entry format
@@ -248,6 +272,11 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		}
 
 		stats.CorruptedEntries += int(reader.CorruptedEntries)
+		if recoveredReplication {
+			if err := opts.ReplicationFlush(ctx); err != nil {
+				return stats, fmt.Errorf("flush recovered replicated entries: %w", err)
+			}
+		}
 
 		// Only delete WAL file if ALL entries were successfully replayed
 		if allEntriesSucceeded && len(entries) > 0 {

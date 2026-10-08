@@ -41,6 +41,8 @@ func (f IngestHandlerFunc) ApplyReplicatedEntry(ctx context.Context, payload []b
 
 // ReceiverConfig holds configuration for the replication receiver.
 type ReceiverConfig struct {
+	// TrackedEntries requires originating write identities and provenance-aware WAL persistence.
+	TrackedEntries bool
 	// ReaderID is this reader's unique identifier
 	ReaderID string
 
@@ -300,15 +302,16 @@ func (r *Receiver) connect() error {
 	// MAC instead of silently downgrading the framing.
 	const supportsBinaryEntries = true
 	syncReq := &protocol.ReplicateSync{
-		ReaderID:              r.cfg.ReaderID,
-		LastKnownSequence:     lastKnownSeq,
-		Nonce:                 nonce,
-		ClusterName:           r.cfg.ClusterName,
-		Timestamp:             timestamp,
-		SupportsBinaryEntries: supportsBinaryEntries,
+		ReaderID:               r.cfg.ReaderID,
+		LastKnownSequence:      lastKnownSeq,
+		Nonce:                  nonce,
+		ClusterName:            r.cfg.ClusterName,
+		Timestamp:              timestamp,
+		SupportsBinaryEntries:  supportsBinaryEntries,
+		SupportsTrackedEntries: r.cfg.TrackedEntries,
 		HMAC: security.ComputeReplicateSyncHMAC(
 			r.cfg.SharedSecret, nonce, r.cfg.ReaderID, r.cfg.ClusterName,
-			lastKnownSeq, supportsBinaryEntries, timestamp,
+			lastKnownSeq, supportsBinaryEntries, timestamp, r.cfg.TrackedEntries,
 		),
 	}
 
@@ -573,8 +576,8 @@ func (r *Receiver) receiveLoop() {
 				llog.Error().
 					Err(err).
 					Uint64("sequence", entry.Sequence).
-					Msg("Failed to apply entry")
-				continue
+					Msg("Failed to apply entry; reconnecting without acknowledging it")
+				return
 			}
 
 			r.lastSeq.Store(entry.Sequence)
@@ -734,10 +737,29 @@ func (r *Receiver) receiveLoop() {
 // failed entry never reapplies. Both are worse than the brief
 // durability gap we accept here.
 func (r *Receiver) applyEntry(entry *ReplicateEntry) error {
+	if r.cfg.TrackedEntries {
+		if len(entry.Payload) == 0 || entry.Payload[0] != wal.WALTrackedMarker {
+			return fmt.Errorf("replication requires an originating tracked payload")
+		}
+		if _, _, err := wal.TrackedPayload(entry.Payload); err != nil {
+			return err
+		}
+	}
+
 	// Write to local WAL first (if configured). A drop on backpressure
 	// is non-fatal — see function doc.
 	if r.cfg.LocalWAL != nil {
-		if err := r.cfg.LocalWAL.AppendRaw(entry.Payload); err != nil {
+		var appendErr error
+		if r.cfg.TrackedEntries {
+			writer, ok := r.cfg.LocalWAL.(interface{ AppendReplicated([]byte) error })
+			if !ok {
+				return fmt.Errorf("local WAL cannot preserve received provenance")
+			}
+			appendErr = writer.AppendReplicated(entry.Payload)
+		} else {
+			appendErr = r.cfg.LocalWAL.AppendRaw(entry.Payload)
+		}
+		if err := appendErr; err != nil {
 			if errors.Is(err, wal.ErrWALDropped) {
 				r.totalLocalWALDropped.Add(1)
 				// Sampled Warn — at most one line per walDropLogIntervalNano.

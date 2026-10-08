@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster/raft"
+	"github.com/basekick-labs/arc/internal/replicaview"
 	"github.com/rs/zerolog"
 )
 
@@ -82,6 +83,7 @@ func (r *CoordinatorFileRegistrar) Stats() map[string]int64 {
 }
 
 type fileRegistration struct {
+	walCoverage   []replicaview.PartitionCoverage
 	database      string
 	measurement   string
 	path          string
@@ -311,7 +313,12 @@ func (r *CoordinatorFileRegistrar) drain(pending []fileRegistration) (applied, l
 // (arrow_writer.go flush path) computes it on the in-memory buffer before the
 // storage backend write, so it's effectively free.
 func (r *CoordinatorFileRegistrar) RegisterFile(database, measurement, path string, partitionTime time.Time, sizeBytes int64, sha256 string) {
+	r.RegisterFileWithCoverage(database, measurement, path, partitionTime, sizeBytes, sha256, nil)
+}
+
+func (r *CoordinatorFileRegistrar) RegisterFileWithCoverage(database, measurement, path string, partitionTime time.Time, sizeBytes int64, sha256 string, coverage []replicaview.PartitionCoverage) {
 	reg := fileRegistration{
+		walCoverage:   cloneWALPartitions(coverage),
 		database:      database,
 		measurement:   measurement,
 		path:          path,
@@ -371,6 +378,7 @@ func (r *CoordinatorFileRegistrar) worker() {
 
 func (r *CoordinatorFileRegistrar) entry(reg fileRegistration) raft.FileEntry {
 	return raft.FileEntry{
+		WALCoverage:   reg.walCoverage,
 		Path:          reg.path,
 		SHA256:        reg.sha256,
 		SizeBytes:     reg.sizeBytes,
@@ -404,4 +412,9 @@ func (r *CoordinatorFileRegistrar) process(parent context.Context, reg fileRegis
 		return
 	}
 	r.totalApplied.Add(1)
+}
+
+func cloneWALPartitions(parts []replicaview.PartitionCoverage) []replicaview.PartitionCoverage {
+	result, _ := replicaview.NormalizePartitions(parts)
+	return result
 }

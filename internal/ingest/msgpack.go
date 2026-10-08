@@ -275,6 +275,14 @@ func (d *MessagePackDecoder) decodeColumnar(payload *models.MsgPackPayload, rawD
 			Msg("Sanitized non-UTF8 characters in string columns")
 	}
 
+	if !hasTime || timeCol == nil || len(timeCol) == 0 {
+		var err error
+		rawData, err = msgpack.Marshal(map[string]interface{}{"m": measurement, "columns": payload.Columns})
+		if err != nil {
+			return nil, fmt.Errorf("preserve generated timestamps in WAL payload: %w", err)
+		}
+	}
+
 	return &models.ColumnarRecord{
 		Measurement: measurement,
 		Columnar:    true,

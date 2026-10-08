@@ -26,6 +26,7 @@ import (
 	"github.com/basekick-labs/arc/internal/pruning"
 	"github.com/basekick-labs/arc/internal/query"
 	"github.com/basekick-labs/arc/internal/queryregistry"
+	"github.com/basekick-labs/arc/internal/replicaview"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/tiering"
@@ -673,6 +674,8 @@ func stripSQLComments(sql string, hasComments bool) string {
 
 // QueryHandler handles SQL query endpoints
 type QueryHandler struct {
+	replicationView    *replicaview.View
+	replicationResolve func(string) string
 	db                 *database.DuckDB
 	storage            storage.Backend
 	pruner             *pruning.PartitionPruner
@@ -3070,6 +3073,11 @@ var dynamicSQLFunctionPattern = regexp.MustCompile(`(?i)\b(query|query_table|jso
 // If headerDB is non-empty, uses the optimized path with that database for all tables.
 // Returns the transformed SQL and whether it was a cache hit.
 func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, headerDB string) (string, bool, error) {
+	var leaseErr error
+	ctx, leaseErr = h.attachReplicationLease(ctx)
+	if leaseErr != nil {
+		return "", false, leaseErr
+	}
 	// Fast path: queries already using read_parquet don't need transformation
 	sqlLower := strings.ToLower(sql)
 	if strings.Contains(sqlLower, "read_parquet") {
@@ -3089,7 +3097,7 @@ func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, header
 	}
 
 	// Check cache
-	if transformed, ok := h.queryCache.Get(cacheKey); ok {
+	if transformed, ok := h.queryCache.Get(cacheKey); ok && h.replicationView == nil {
 		return transformed, true, nil
 	}
 
@@ -3117,7 +3125,7 @@ func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, header
 		return "", false, pathFailure.err
 	}
 
-	if !volatile.Volatile {
+	if !volatile.Volatile && h.replicationView == nil {
 		h.queryCache.Set(cacheKey, transformed)
 	}
 	return transformed, false, nil
@@ -3128,6 +3136,10 @@ func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, header
 // Only simple single-table queries with header DB can use parallel execution.
 // Returns (sql, parallel_info, cache_hit).
 func (h *QueryHandler) getTransformedSQLForParallel(ctx context.Context, sql string, headerDB string) (string, *ParallelQueryInfo, bool, error) {
+	if h.replicationView != nil {
+		transformed, cached, err := h.getTransformedSQL(ctx, sql, headerDB)
+		return transformed, nil, cached, err
+	}
 	sqlLower := strings.ToLower(sql)
 
 	// Fast paths that don't support parallel execution
@@ -3594,6 +3606,10 @@ func joinKeyword(prefix string) string {
 // for join clauses.
 // If tiering is enabled and cold tier has data, builds a UNION ALL query across tiers.
 func (h *QueryHandler) buildReadParquetExpr(ctx context.Context, path, originalSQL, keyword string) string {
+	if h.replicationView != nil {
+		database, measurement := h.extractDBMeasurementFromPath(path)
+		return h.replicationReadExpr(ctx, database, measurement, keyword)
+	}
 	// Check if tiering is enabled and cold tier is configured
 	if h.tieringManager != nil {
 		router := h.tieringManager.GetRouter()
@@ -3646,6 +3662,10 @@ func (h *QueryHandler) buildReadParquetExpr(ctx context.Context, path, originalS
 // This is the tiering-aware version used by the fast path that takes database and measurement
 // separately instead of a pre-constructed path, allowing proper tiering metadata lookup.
 func (h *QueryHandler) buildReadParquetExprForMeasurement(ctx context.Context, database, measurement, originalSQL, keyword string) string {
+	if h.replicationView != nil {
+		_ = h.getStoragePath(ctx, database, measurement)
+		return h.replicationReadExpr(ctx, database, measurement, keyword)
+	}
 	// Check if tiering is enabled and cold tier is configured
 	if h.tieringManager != nil {
 		router := h.tieringManager.GetRouter()

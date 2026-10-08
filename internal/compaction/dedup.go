@@ -144,7 +144,7 @@ const dedupStagingTable = "arc_compaction_staged"
 // set (a no-group-by continuous query, #521), the key is "time" alone — one row
 // per timestamp. This is safe ONLY because dedupTime is written exclusively by
 // producers whose data is one-row-per-time; raw ingest never sets it.
-func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColumns []string, dedupTime bool) []string {
+func buildCompactionQueryBase(fileListSQL, orderByClause, outputFile string, tagColumns []string, dedupTime bool) []string {
 	escapedOutput := escapeSQLPath(outputFile)
 
 	if len(tagColumns) == 0 && !dedupTime {
