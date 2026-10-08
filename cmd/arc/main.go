@@ -1158,24 +1158,55 @@ func main() {
 		// for the PERIODIC flush-failure recovery below, where ingest (and
 		// therefore rotation) is live during the scan.
 		recoveryStats, err := walRecovery.RecoverWithOptions(context.Background(), recoveryCallback, &wal.RecoveryOptions{
-			SkipActiveFile:   startupActiveFile,
-			BatchSize:        cfg.WAL.RecoveryBatchSize,
-			ColumnarCallback: columnarCallback,
+			SkipActiveFile:      startupActiveFile,
+			BatchSize:           cfg.WAL.RecoveryBatchSize,
+			ColumnarCallback:    columnarCallback,
+			TrackedRowCallback:  createTrackedWALRecoveryCallback(arrowBuffer, logger.Get("wal-recovery")),
+			ValidateTrackedRows: validateTrackedWALRecoveryRows,
+			CheckpointRecovered: walWriter.MarkFlushed,
+			BeforeDelete:        arrowBuffer.NewRecoveryFlushBarrier(),
+			BarrierBatchFiles:   16,
+			BarrierBatchRows:    cfg.Ingest.MaxBufferSize,
+			MaxReplayFailures:   3,
 		})
+		recoveryNeedsRetry := err != nil
 		if err != nil {
 			log.Error().Err(err).Msg("WAL recovery failed")
-		} else if recoveryStats.RecoveredFiles > 0 {
-			// Track recovery metrics
-			metrics.Get().IncWALRecoveryTotal()
-			metrics.Get().IncWALRecoveryRecords(int64(recoveryStats.RecoveredEntries))
-			log.Info().
-				Int("files", recoveryStats.RecoveredFiles).
-				Int("batches", recoveryStats.RecoveredBatches).
-				Int("entries", recoveryStats.RecoveredEntries).
-				Int("corrupted", recoveryStats.CorruptedEntries).
-				Dur("duration", recoveryStats.RecoveryDuration).
-				Msg("WAL recovery complete")
 		}
+		if recoveryStats != nil {
+			if recoveryStats.RecoveredFiles > 0 {
+				// Track recovery metrics
+				metrics.Get().IncWALRecoveryTotal()
+				metrics.Get().IncWALRecoveryRecords(int64(recoveryStats.RecoveredEntries))
+				log.Info().
+					Int("files", recoveryStats.RecoveredFiles).
+					Int("batches", recoveryStats.RecoveredBatches).
+					Int("entries", recoveryStats.RecoveredEntries).
+					Int("corrupted", recoveryStats.CorruptedEntries).
+					Dur("duration", recoveryStats.RecoveryDuration).
+					Msg("WAL recovery complete")
+			}
+			for i := 0; i < recoveryStats.QuarantinedFiles; i++ {
+				metrics.Get().IncWALQuarantinedFiles()
+			}
+			if recoveryStats.KeptFiles > 0 || recoveryStats.BarrierFailures > 0 {
+				recoveryNeedsRetry = true
+			}
+		}
+		if recoveryNeedsRetry {
+			arrowBuffer.MarkWALRecoveryPending()
+		}
+
+		walSizeLogger := logger.Get("wal-maintenance")
+		updateWALDirectoryBytes := func() {
+			bytes, err := wal.DirectoryBytes(cfg.WAL.Directory)
+			if err != nil {
+				walSizeLogger.Warn().Err(err).Msg("Failed to sample WAL directory size")
+				return
+			}
+			metrics.Get().SetWALDirectoryBytes(bytes)
+		}
+		updateWALDirectoryBytes()
 
 		// Start periodic WAL maintenance goroutine.
 		// Two modes:
@@ -1189,67 +1220,104 @@ func main() {
 			return nil
 		}, shutdown.PriorityBuffer)
 
-		// Safe age threshold, now used ONLY for files whose durability nothing
-		// tracks — a previous process's files, and the untracked entries a
-		// replication follower writes. Tracked files are reclaimed by the
-		// flush floor instead, at any age. 3x MaxBufferAgeMS keeps the old
-		// margin for flush worker delays and clock skew.
-		safeAge := time.Duration(cfg.Ingest.MaxBufferAgeMS) * time.Millisecond * 3
-		if safeAge < 30*time.Second {
-			safeAge = 30 * time.Second
-		}
-
 		recoveryInterval := time.Duration(cfg.WAL.RecoveryIntervalSeconds) * time.Second
 		go func() {
 			ticker := time.NewTicker(recoveryInterval)
 			defer ticker.Stop()
+			bytesTicker := time.NewTicker(15 * time.Second)
+			defer bytesTicker.Stop()
 			walLogger := logger.Get("wal-maintenance")
 
 			for {
 				select {
 				case <-walMaintenanceCtx.Done():
 					return
+				case <-bytesTicker.C:
+					updateWALDirectoryBytes()
 				case <-ticker.C:
 					if arrowBuffer.HasFlushFailure() {
 						// Storage failure detected — replay WAL files to recover data
 						// that was cleared from buffers after failed flush
 						walLogger.Info().Msg("Flush failure detected, attempting WAL recovery")
 
-						// Purge old WAL files first (same as normal path) to avoid replaying
-						// data that was already successfully flushed to parquet before the failure.
+						// ORDER MATTERS, and it is: rotate, barrier, read
+						// checkpoints, purge, recover.
+						//
+						// Rotation comes FIRST so that every append racing this
+						// pass lands in a file whose fate this pass decides.
+						// Barriering first instead leaves a window — between the
+						// barrier returning and the rotation command being
+						// dequeued — in which a tracked append lands in the
+						// file about to become previousActiveFile. That file is
+						// then exempted from MinFileAge below, so recovery
+						// replays an entry no checkpoint covers into a buffer
+						// that still holds the live copy, and nothing
+						// de-duplicates rows.
+						previousActiveFile := ""
+						activeFile := ""
+						var activeCheckpointHashes []string
 						if walWriter != nil {
+							previousActiveFile = walWriter.CurrentFile()
+							rotationTimeout := time.Duration(cfg.Ingest.FlushTimeoutSeconds) * time.Second
+							if rotationTimeout <= 0 {
+								rotationTimeout = 30 * time.Second
+							}
+							rotationCtx, cancelRotation := context.WithTimeout(walMaintenanceCtx, rotationTimeout)
+							rotationErr := walWriter.RotateContext(rotationCtx)
+							cancelRotation()
+							if rotationErr != nil {
+								walLogger.Error().Err(rotationErr).Msg("Failed to rotate WAL before recovery; retaining files for the next pass")
+								continue
+							}
+							activeFile = walWriter.CurrentFile()
+						}
+
+						// Settle older async flushes and all current buffers before
+						// reading checkpoints. Otherwise a checkpoint written by an
+						// in-flight worker could land after recovery's checkpoint scan.
+						//
+						// After the rotation above, this also flushes whatever the
+						// window-era appends put in previousActiveFile, and their
+						// checkpoints land in the NEW active file — which is read
+						// into AdditionalCheckpointHashes below, so recovery skips
+						// them. Appends during the barrier go to the new active
+						// file, which recovery skips entirely.
+						if err := arrowBuffer.FlushAllAndWait(walMaintenanceCtx); err != nil {
+							walLogger.Error().Err(err).Msg("WAL recovery pre-barrier failed; retaining WAL files for the next pass")
+							continue
+						}
+
+						if walWriter != nil {
+							// Read AFTER the barrier, so the checkpoints it just
+							// wrote for previousActiveFile are included.
+							activeCheckpointHashes, err = walWriter.CurrentCheckpointHashes()
+							if err != nil {
+								walLogger.Error().Err(err).Msg("Failed to read active WAL checkpoints; skipping recovery to avoid duplicate replay")
+								continue
+							}
+
 							deleted, purgeErr := walWriter.PurgeFlushed(walWriter.MinUnflushedSequence())
 							if purgeErr != nil {
 								walLogger.Error().Err(purgeErr).Msg("WAL purge before recovery failed")
 							} else if deleted > 0 {
 								walLogger.Info().Int("deleted", deleted).Msg("Purged old WAL files before recovery")
 							}
-							if n, err := walWriter.PurgeUnaccountedOlderThan(safeAge); err != nil {
-								walLogger.Error().Err(err).Msg("WAL unaccounted-file purge before recovery failed")
-							} else if n > 0 {
-								walLogger.Info().Int("deleted", n).Msg("Purged WAL files with no tracked sequences before recovery")
-							}
 						}
-
-						recovery := wal.NewRecovery(cfg.WAL.Directory, walLogger)
-						activeFile := ""
-						var activeCheckpointHashes []string
-						if walWriter != nil {
-							activeFile = walWriter.CurrentFile()
-							// Recovery skips the active file to avoid racing appends, so read
-							// its checkpoint index separately while the writer lock holds it stable.
-							activeCheckpointHashes, err = walWriter.CurrentCheckpointHashes()
-							if err != nil {
-								walLogger.Error().Err(err).Msg("Failed to read active WAL checkpoints; skipping recovery to avoid duplicate replay")
-								continue
-							}
-						}
-						stats, err := recovery.RecoverWithOptions(context.Background(), recoveryCallback, &wal.RecoveryOptions{
+						failureGeneration := arrowBuffer.FlushFailureGeneration()
+						stats, err := walRecovery.RecoverWithOptions(walMaintenanceCtx, recoveryCallback, &wal.RecoveryOptions{
 							SkipActiveFile:             activeFile,
 							AdditionalCheckpointHashes: activeCheckpointHashes,
 							MinFileAge:                 5 * time.Second,
+							MinFileAgeExemptFiles:      []string{previousActiveFile},
 							BatchSize:                  cfg.WAL.RecoveryBatchSize,
 							ColumnarCallback:           columnarCallback,
+							TrackedRowCallback:         createTrackedWALRecoveryCallback(arrowBuffer, walLogger),
+							ValidateTrackedRows:        validateTrackedWALRecoveryRows,
+							CheckpointRecovered:        walWriter.MarkFlushed,
+							BeforeDelete:               arrowBuffer.NewRecoveryFlushBarrier(),
+							BarrierBatchFiles:          16,
+							BarrierBatchRows:           cfg.Ingest.MaxBufferSize,
+							MaxReplayFailures:          3,
 						})
 						if err != nil {
 							walLogger.Error().Err(err).Msg("WAL recovery after flush failure failed")
@@ -1260,44 +1328,36 @@ func main() {
 								walLogger.Info().
 									Int("files", stats.RecoveredFiles).
 									Int("entries", stats.RecoveredEntries).
+									Int("kept_files", stats.KeptFiles).
+									Int("barrier_failures", stats.BarrierFailures).
 									Msg("WAL recovery after flush failure complete")
 							}
-							arrowBuffer.ResetFlushFailure()
+							for i := 0; i < stats.QuarantinedFiles; i++ {
+								metrics.Get().IncWALQuarantinedFiles()
+							}
+							if stats.KeptFiles == 0 && stats.BarrierFailures == 0 {
+								if !arrowBuffer.ResetFlushFailure(failureGeneration) {
+									walLogger.Info().Msg("A newer flush failure arrived during WAL recovery; keeping recovery armed")
+								}
+							}
 						}
+						updateWALDirectoryBytes()
 					} else {
-						// Normal operation. Two purges, because two different
-						// things bound WAL size and only one of them can be
-						// reasoned about from flush state:
-						//
-						//   - tracked files: reclaimed strictly below the
-						//     unflushed floor, never by age. Inferring
-						//     durability from wall-clock age is what lost
-						//     acknowledged writes (#966, #1009).
-						//   - files with no tracked sequences: a previous
-						//     process's files, and the untracked entries a
-						//     replication follower writes. No checkpoint will
-						//     ever cover them, so age is the only signal there
-						//     is — and without this a reader node's WAL grows
-						//     until the disk fills.
+						// Tracked files are reclaimed below the durable sequence
+						// floor. Files outside that floor remain for recovery; age
+						// is not evidence that their data reached storage.
 						deleted, err := walWriter.PurgeFlushed(walWriter.MinUnflushedSequence())
 						if err != nil {
 							walLogger.Error().Err(err).Msg("Periodic WAL purge failed")
 						} else if deleted > 0 {
 							walLogger.Info().Int("deleted", deleted).Msg("Periodic WAL cleanup complete")
 						}
-						if n, err := walWriter.PurgeUnaccountedOlderThan(safeAge); err != nil {
-							walLogger.Error().Err(err).Msg("Periodic WAL unaccounted-file purge failed")
-						} else if n > 0 {
-							walLogger.Info().Int("deleted", n).Msg("Purged WAL files with no tracked sequences")
-						}
+						updateWALDirectoryBytes()
 					}
 				}
 			}
 		}()
-		log.Info().
-			Dur("interval", recoveryInterval).
-			Dur("safe_age", safeAge).
-			Msg("Periodic WAL maintenance enabled")
+		log.Info().Dur("interval", recoveryInterval).Msg("Periodic WAL maintenance enabled")
 	}
 
 	// MQTT is initialized after the auth manager (below) so it can share the
@@ -4869,6 +4929,81 @@ func createWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolo
 	}
 }
 
+func trackedWALRowTarget(rec map[string]interface{}) (database, measurement string) {
+	for _, key := range []string{"_measurement", "measurement", "m"} {
+		measurement, _ = rec[key].(string)
+		if measurement != "" {
+			break
+		}
+	}
+	for _, key := range []string{"_database", "database"} {
+		database, _ = rec[key].(string)
+		if database != "" {
+			break
+		}
+	}
+	if database == "" {
+		database = "default"
+	}
+	return
+}
+
+// Validate before splitting: a boundary must not hide an invalid mixed-target
+// entry or allow an earlier chunk to be accepted before a missing target.
+func validateTrackedWALRecoveryRows(records []map[string]interface{}) error {
+	var database, measurement string
+	for i, rec := range records {
+		rowDatabase, rowMeasurement := trackedWALRowTarget(rec)
+		if rowMeasurement == "" {
+			return fmt.Errorf("WAL row %d has no measurement", i)
+		}
+		if i == 0 {
+			database, measurement = rowDatabase, rowMeasurement
+		} else if database != rowDatabase || measurement != rowMeasurement {
+			return fmt.Errorf("WAL row entry spans multiple databases or measurements")
+		}
+	}
+	return nil
+}
+
+// createTrackedWALRecoveryCallback restores one bounded row batch as a columnar
+// buffer write. Its identity covers exactly this batch, allowing a later pass
+// to skip durable ranges even if the file-delete barrier did not complete.
+func createTrackedWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolog.Logger) wal.TrackedRecoveryCallback {
+	return func(ctx context.Context, records []map[string]interface{}, walIdentity string) error {
+		if len(records) == 0 {
+			return nil
+		}
+
+		if err := validateTrackedWALRecoveryRows(records); err != nil {
+			return err
+		}
+		database, measurement := trackedWALRowTarget(records[0])
+		columns := make(map[string][]interface{})
+		for rowIndex, rec := range records {
+			for key, value := range rec {
+				switch key {
+				case "_measurement", "measurement", "m", "_database", "database":
+					continue
+				}
+				column, ok := columns[key]
+				if !ok {
+					column = make([]interface{}, len(records))
+					columns[key] = column
+				}
+				column[rowIndex] = value
+			}
+		}
+
+		if err := arrowBuffer.WriteColumnarDirectReplay(ctx, database, measurement, columns, walIdentity); err != nil {
+			walLogger.Error().Err(err).Str("measurement", measurement).Msg("Failed to replay tracked WAL row entry")
+			return err
+		}
+		walLogger.Info().Int("records", len(records)).Msg("WAL recovery: replayed tracked row entry")
+		return nil
+	}
+}
+
 // createColumnarRecoveryCallback creates a WAL recovery callback for columnar entries
 // written via the zero-copy AppendRaw path.
 func createColumnarRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolog.Logger) wal.ColumnarRecoveryCallback {
@@ -4878,8 +5013,8 @@ func createColumnarRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger z
 		}
 		// Inherit the replayed entry's identity: one columnar entry becomes
 		// exactly one buffer write, so a checkpoint for it covers precisely
-		// these records. The row-format callback above deliberately does NOT
-		// inherit — it fans one entry out into one write per record.
+		// these records. Row batches instead inherit their precise row-range
+		// identities when recovery splits an entry.
 		if err := arrowBuffer.WriteColumnarDirectReplay(ctx, database, measurement, columns, walIdentity); err != nil {
 			walLogger.Error().Err(err).Str("database", database).Str("measurement", measurement).Msg("Failed to replay columnar WAL entry")
 			return err

@@ -1487,6 +1487,81 @@ the masker was hardened against in 26.09.1 and 26.09.2.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#937](https://github.com/Basekick-Labs/arc/pull/937).
 
+### Keep replayed WAL files until recovery flushes succeed
+
+WAL recovery now waits for queued and direct flushes before deleting replayed
+files, and retains them if any flush fails during the recovery pass, including
+an asynchronous flush that finishes before the deletion barrier begins. A later
+pass can retry after storage recovers. Periodic cleanup uses the unflushed
+sequence floor instead of file age so a slow flush cannot lose its durable copy
+(#1009, #966).
+
+An incomplete final WAL header or payload after an interrupted append no longer
+counts as a poison entry: complete preceding entries still require a successful
+flush barrier before reclamation. Complete entries with invalid checksums remain
+recovery failures. Checkpoints in quarantined WAL files remain part of recovery's
+durability proof, so a later retry does not replay already-flushed entries merely
+because their checkpoint file was renamed.
+
+Replication followers prepare buffer ownership before appending local WAL.
+Ignored payloads no longer leave an unowned identity that prevents reclamation.
+An entry containing multiple measurements gets a separate local WAL payload and
+identity for each buffer, preserving its database envelope. Flushing one
+measurement cannot checkpoint another measurement's pending rows; rejecting a
+later measurement does not release an earlier buffer's identity. Normal
+single-measurement payloads retain their original bytes. Replication sequence
+and acknowledgement semantics are unchanged.
+
+Recovery barriers now use the configured flush worker pool instead of serial
+per-measurement writes, and release shard locks before waiting. Each barrier
+has a total wait budget of `ingest.flush_timeout_seconds` (30 seconds by default)
+or the caller's earlier deadline. The first observed flush failure stops further
+admission. Unsubmitted records remain buffered; queued/in-flight writes retain
+their normal per-write deadlines and WAL identities. A timeout or failed
+barrier retains the WAL for a later recovery pass, including when storage ignores
+cancellation. Concurrent ingestion can continue while recovery waits.
+
+Completed failed replay attempts now survive process restarts in synced
+per-file `.wal.recovery` sidecars, so repeated restarts cannot reset the poison
+file quarantine threshold. Cancellation and flush-barrier outages do not add
+strikes. Unreadable or unwritable attempt metadata reports an error and retains
+the WAL; quarantine still preserves its original bytes and valid checkpoints.
+The operational guide describes sidecar recovery and cleanup behavior.
+
+Recovery orders ordinary WAL files by their timestamped filenames rather than
+filesystem modification times. Altered or tied mtimes can no longer make it
+reclaim a later checkpoint file before an earlier retained data file, which
+could otherwise cause already-flushed records to be replayed on retry.
+
+Recovery skips redundant flush barriers for batches covered entirely by durable
+checkpoints. Mixed batches still fence all replayed entries, and parent
+checkpoint failures still retain files with fully covered row ranges.
+
+Forced maintenance rotation now waits for WAL queue capacity instead of
+returning `ErrWALDropped` and skipping recovery under sustained queue pressure.
+It preserves FIFO ordering and uses a cancellable wait bounded by
+`ingest.flush_timeout_seconds`. An admitted command may finish after timeout;
+the failed wait keeps recovery pending. Normal append admission is unchanged.
+
+Tracked row recovery now honors `wal.recovery_batch_size`. Durable row-range
+checkpoints let a restart skip the precise persisted portion even after a
+batch-size change; the original entry is checkpointed only after its complete
+flush barrier succeeds. This bounds callback batches, not whole-file decoding
+or total recovery memory. Legacy content-hash entries remain at-least-once.
+Before downgrading to a binary without row-range support, drain recovery with
+this version: older binaries can replay partially completed entries in full.
+See the [restart compatibility guide](docs/operations/wal-recovery.md#bounded-row-replay-and-restart-compatibility).
+
+Retained and quarantined WAL files are not reclaimed by age. The
+[WAL operations guide](docs/operations/wal-recovery.md#reclaiming-retained-and-quarantined-files)
+now documents offline inventory, verified backup, record reconciliation and
+the checkpoint-dependency gate required before an operator reclaims quarantine
+space. It includes a read-only empty-WAL check and a whole-directory relocation
+procedure for capacity shortages. A clean recovery result alone does not prove
+quarantined data is disposable.
+
+Contributed by [@jallegri](https://github.com/jallegri) in [#1118](https://github.com/Basekick-Labs/arc/pull/1118).
+
 ### The tiering files endpoint rejects an invalid `limit` ([#1135](https://github.com/Basekick-Labs/arc/issues/1135))
 
 `GET /api/v1/tiering/files?limit=-1` returned a 500 and logged a stack trace. The handler read the
