@@ -1134,10 +1134,6 @@ Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#907](https://
 
 ## Internal changes
 
-### Immutable DELETE rewrite filenames are normalized centrally
-
-Partial DELETEs use the `_rewrite_<unixnano>.parquet` naming convention. The suffix parser now lives in `internal/storage` and is shared by DELETE, compaction, tiering and file-time pruning, so rewritten daily and compacted files retain their logical classification and timestamps.
-
 These do not change how Arc behaves. They are here because the codebase is the
 thing a new maintainer has to learn, and a refactor that moves a decision from
 four places to one is worth knowing about before you go looking for it in the
@@ -1212,6 +1208,10 @@ runs. And the restore writes one row per cold file **synchronously** — the
 asynchronous tier-event path cannot be used, since its handler stats the hot
 backend and its upsert is guarded to hot rows — so a large cold restore is one
 fsync per file. Batching those writes is the obvious next improvement.
+
+### Immutable DELETE rewrite filenames are normalized centrally
+
+Partial DELETEs use the `_rewrite_<unixnano>.parquet` naming convention. The suffix parser now lives in `internal/storage` and is shared by DELETE, compaction, tiering and file-time pruning, so rewritten daily and compacted files retain their logical classification and timestamps.
 
 ### The cold-file marker's shape ([#1085](https://github.com/Basekick-Labs/arc/issues/1085))
 
