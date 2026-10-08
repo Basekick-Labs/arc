@@ -44,6 +44,12 @@ type DeleteCoordinator interface {
 // This is non-transient (e.g. Raft quorum loss) and aborts the delete operation.
 var errManifestFailure = errors.New("cluster manifest update failed")
 
+// errSourceRetired reports that the file a rewrite was about to read is gone because a concurrent
+// DELETE retired it and republished its surviving rows under a new path. The request is not wrong,
+// it is stale: re-running it rebuilds the affected-file list and succeeds. Phrased without an
+// apostrophe because the log masker truncates a line at the first quote.
+var errSourceRetired = errors.New("source file was retired by a concurrent delete, retry the request")
+
 // parquetRowGroupSize is the row group size used for Parquet rewrites during delete operations.
 // Matches compaction's row group size to limit DuckDB's internal write buffer per group.
 const parquetRowGroupSize = 122880
@@ -773,6 +779,17 @@ func (h *DeleteHandler) countMatchingRowsIndividually(ctx context.Context, files
 // For local storage: uses atomic rename
 // For S3: downloads, processes locally, then uploads
 func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, queryPath, relativePath, whereClause string) (int64, error) {
+	// The affected-file list was built before the rewrite mutex was acquired, so a delete that
+	// won the lock first may already have retired this source and published its survivors under a
+	// new immutable path. Detect that here rather than letting DuckDB report it: the engine
+	// surfaces a missing source as "IO Error: No files found that match the pattern", which tells
+	// an operator nothing about what to do. Both backends report an absent object as (-1, nil)
+	// from StatFile, so this needs no error-string matching. The mutex is held for the whole
+	// rewrite phase, so nothing can retire the file between this check and the read below.
+	if size, statErr := h.storage.StatFile(ctx, relativePath); statErr == nil && size < 0 {
+		return 0, fmt.Errorf("%w: %s", errSourceRetired, filepath.Base(relativePath))
+	}
+
 	// Use the shared DuckDB connection to avoid memory retention from temporary connections
 	db := h.db.DB()
 

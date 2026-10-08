@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -231,5 +233,54 @@ func TestReplaceManifestAfterRewriteDeletesOriginalObject(t *testing.T) {
 	}
 	if len(c.ops) != 2 {
 		t.Fatalf("manifest ops = %d, want 2", len(c.ops))
+	}
+}
+
+// A DELETE whose affected-file list was built before another DELETE won the rewrite mutex finds its
+// source already retired. It must say so in terms an operator can act on, rather than surfacing
+// DuckDB's "IO Error: No files found that match the pattern", which gives no hint that the right
+// response is simply to retry.
+func TestRewriteReportsSourceRetiredByConcurrentDelete(t *testing.T) {
+	root := t.TempDir()
+	logger := zerolog.Nop()
+	backend, err := storage.NewLocalBackend(root, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	db, err := database.New(&database.Config{MemoryLimit: "256MB", ThreadCount: 1, MaxConnections: 1, LocalStorageRoot: root}, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	relativePath := "db/cpu/2026/10/07/20/cpu_20261007_204851_558252000.parquet"
+	full := filepath.Join(root, relativePath)
+	if err := os.MkdirAll(filepath.Dir(full), 0700); err != nil {
+		t.Fatal(err)
+	}
+	h := &DeleteHandler{db: db, storage: backend, logger: logger}
+
+	// The source is absent, exactly as it is for the request that loses the mutex race.
+	_, err = h.rewriteFileWithoutDeletedRows(context.Background(), full, relativePath, "host = 'h1'")
+	if err == nil {
+		t.Fatal("rewrite of a retired source returned no error")
+	}
+	if !errors.Is(err, errSourceRetired) {
+		t.Fatalf("error = %v, want errSourceRetired (an operator cannot act on the engine error)", err)
+	}
+	if strings.Contains(err.Error(), "No files found that match the pattern") {
+		t.Errorf("the engine error is still leaking to the caller: %v", err)
+	}
+
+	// A source that IS present must not be mistaken for a retired one.
+	if _, err := db.DB().Exec("CREATE TABLE src2(host VARCHAR); INSERT INTO src2 VALUES ('h1'), ('h2');"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB().Exec(fmt.Sprintf("COPY src2 TO %q (FORMAT PARQUET)", full)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.rewriteFileWithoutDeletedRows(context.Background(), full, relativePath, "host = 'h1'"); errors.Is(err, errSourceRetired) {
+		t.Errorf("a present source was reported as retired: %v", err)
 	}
 }
