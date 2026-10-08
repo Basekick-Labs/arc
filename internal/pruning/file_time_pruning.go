@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/basekick-labs/arc/internal/storage"
 )
 
 // File-level time pruning. EXPERIMENTAL in 26.09.2 (opt-in via
@@ -123,7 +125,7 @@ func allDigits(s string) bool {
 // shape (hourly/daily compacted outputs, hand-placed files) can mis-parse to
 // a wrong time; anything else fails and the caller keeps the file (fail open).
 func parseFileTime(name string) (time.Time, bool) {
-	base := strings.TrimSuffix(filepath.Base(name), ".parquet")
+	base := strings.TrimSuffix(filepath.Base(storage.StripRewriteSuffix(name)), ".parquet")
 	toks := strings.Split(base, "_")
 	if len(toks) < 4 {
 		return time.Time{}, false

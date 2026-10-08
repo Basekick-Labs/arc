@@ -557,6 +557,20 @@ that never triggered. The base scenario keeps its exact row-count assertion and
 now exits successfully when it passes.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1004](https://github.com/Basekick-Labs/arc/pull/1004).
+### Partial DELETE rewrites remain immutable without duplicating data ([#975](https://github.com/Basekick-Labs/arc/issues/975))
+
+Partial DELETE now publishes the surviving rows under a fresh immutable Parquet path and retires the superseded object in every storage mode, including standalone OSS deployments. The rewrite filename is normalized before compaction, tiering and file-time pruning classify it. This closes the same-size/different-content replication class without leaving deleted rows visible through Arc's glob-based query path.
+
+**Two DELETEs that touch the same file no longer merge.** Before this release they did, because the
+rewrite kept the file at its original path, so the second request read what the first had written.
+With immutable rewrites the rewrite phase is serialized, and a request whose source was retired
+while it waited fails with `source file was retired by a concurrent delete, retry the request`
+rather than acting on a stale file list. Retrying it succeeds — the retry rebuilds the affected-file
+list and sees the new path. Nothing is lost and no deleted rows come back, but a client that fires
+overlapping DELETEs (or times out and retries one) will now see that error where it previously saw
+success, and should retry rather than treat it as a failure.
+
+If the old-object delete fails after the manifest commit or standalone publish, Arc reports the storage failure explicitly because the old object can remain query-visible until cleanup. A crash in that window can likewise leave both objects; operators should treat the corresponding error as a signal to inspect the partition before retrying.
 
 ### Compaction subprocess threads respect license and effective-core limits ([#1036](https://github.com/Basekick-Labs/arc/issues/1036))
 
@@ -1238,6 +1252,10 @@ runs. And the restore writes one row per cold file **synchronously** — the
 asynchronous tier-event path cannot be used, since its handler stats the hot
 backend and its upsert is guarded to hot rows — so a large cold restore is one
 fsync per file. Batching those writes is the obvious next improvement.
+
+### Immutable DELETE rewrite filenames are normalized centrally
+
+Partial DELETEs use the `_rewrite_<unixnano>.parquet` naming convention. The suffix parser now lives in `internal/storage` and is shared by DELETE, compaction, tiering and file-time pruning, so rewritten daily and compacted files retain their logical classification and timestamps.
 
 ### The cold-file marker's shape ([#1085](https://github.com/Basekick-Labs/arc/issues/1085))
 
