@@ -726,9 +726,17 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	var validLocalPaths []string
 	var validStorageKeys []string
 	for _, df := range files {
+		// FAIL, not skip. DuckDB would read this path as a pattern and could
+		// resolve it to a different file than os.Open does, so the read must not
+		// happen - but a per-file skip is unsatisfiable: the same path fails the
+		// same way on every cycle, so compaction would never progress while every
+		// metric showed a job completing. config.checkParquetReadRootsGlobSafe
+		// refuses the two operator-set roots at startup, which makes this branch
+		// defence-in-depth for a key Arc built from a database or measurement name
+		// (#993, #994). Returning the error aborts the job before any input is
+		// deleted.
 		if err := storage.ValidateGlobSafe(df.localPath); err != nil {
-			j.logger.Error().Err(err).Str("file", df.localPath).Msg("Skipping compaction input with glob metacharacters")
-			continue
+			return "", fmt.Errorf("compaction input path is not safe to interpolate into read_parquet: %w", err)
 		}
 		if err := validateParquetFile(df.localPath); err != nil {
 			j.logger.Error().Err(err).Str("file", filepath.Base(df.localPath)).Msg("Skipping corrupted file")
