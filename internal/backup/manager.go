@@ -522,20 +522,20 @@ type IncompleteRun struct {
 	Targets   []string `json:"targets,omitempty"`
 	Committed []string `json:"committed_targets,omitempty"`
 	Missing   []string `json:"missing_targets"`
-	// Unknown are this run's targets that would not answer, so whether they
-	// committed could not be established. They are NOT in Missing: "missing"
-	// means the listing looked and found no manifest, and counting a target
-	// that was briefly down would report a complete backup as a run that did
-	// not finish. An entry with Missing empty and Unknown non-empty is exactly
-	// that case, and resolves itself when the store answers again.
+	// Unknown are this run's targets whose manifests could not be established
+	// because the destination could not provide a complete listing. They are
+	// NOT in Missing: "missing" means the listing looked and found no
+	// manifest. An entry with Missing empty and Unknown non-empty may be a
+	// complete backup; it becomes determinate when the destination can be
+	// listed completely again.
 	Unknown []string `json:"unknown_targets,omitempty"`
 	// State is "aborted", "possibly_in_flight" or "undetermined".
 	//
 	// The third is for an entry with nothing known to be missing: every target
-	// that has not committed is one that would not answer, so the run may well
-	// be COMPLETE and neither of the other two words would be true of it. A
-	// listing taken while one store is briefly down must not report a
-	// finished backup as a run that did not finish.
+	// that has not committed is one whose manifest could not be established,
+	// so the run may well be COMPLETE and neither of the other two words would
+	// be true of it. An incomplete listing must not report a finished backup
+	// as a run that did not finish.
 	//
 	// The second is not politeness. ListBackups has no primary-writer gate, so
 	// on a shared destination a READER node lists a run the primary is
@@ -756,11 +756,11 @@ func (m *Manager) listBackups(ctx context.Context, includeForeign bool) (BackupL
 		}
 	}
 
-	// Runs with no manifest anywhere. Their shape comes from the run index,
-	// which is the one key that names every target a run touched; without one
-	// there is nothing to report and the directory is skipped in silence,
-	// exactly as it was before the index existed (an in-flight run, or a
-	// pre-index one that died).
+	// Runs with no manifest read from a completely listed target. Their shape
+	// comes from the run index, which is the one key that names every target a
+	// run touched; without one there is nothing to report and the directory is
+	// skipped in silence, exactly as it was before the index existed (an
+	// in-flight run, or a pre-index one that died).
 	//
 	// Looked for on EVERY configured target, not just the current default,
 	// even though the write only ever goes to the default. The two differ
@@ -789,20 +789,26 @@ func (m *Manager) listBackups(ctx context.Context, includeForeign bool) (BackupL
 			listing.FilteredForeign++
 			continue
 		}
+		// A failed target may still hold this run's manifest. Do not report
+		// that leg as missing merely because its manifest could not be
+		// established; only reachable targets that were listed without a
+		// manifest are known missing.
+		unknown := intersect(index.Targets, listing.UnreachableTargets)
+		missing := missingTargets(index.Targets, nil, unknown)
+		state := m.runState(index.CreatedAt, missing)
+		if len(index.Targets) == 0 {
+			// The legacy unnamed local destination has no target names to
+			// classify, but a run with no manifest anywhere is still aborted
+			// (or possibly in flight), not undetermined.
+			state = m.incompleteState(index.CreatedAt)
+		}
 		listing.IncompleteRuns = append(listing.IncompleteRuns, IncompleteRun{
 			BackupID:  id,
 			CreatedAt: index.CreatedAt,
 			Targets:   index.Targets,
-			Missing:   index.Targets,
-			// incompleteState, never runState: a run with no manifest ANYWHERE
-			// is missing in its entirety, whether or not its index names
-			// targets, and nothing about it is unreachable. The
-			// backup.local_path destination that predates targets has no
-			// target name at all, so its index names none and Missing is
-			// empty — which runState would read as "nothing is known to be
-			// missing" and report undetermined, the one state that is false
-			// here.
-			State: m.incompleteState(index.CreatedAt),
+			Missing:   missing,
+			Unknown:   unknown,
+			State:     state,
 		})
 	}
 
