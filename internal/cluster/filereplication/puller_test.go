@@ -276,7 +276,15 @@ func (f *fakeBackend) Delete(ctx context.Context, path string) error {
 }
 
 func (f *fakeBackend) List(ctx context.Context, prefix string) ([]string, error) {
-	panic("not used")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	paths := make([]string, 0)
+	for key := range f.files {
+		if strings.HasPrefix(key, prefix) {
+			paths = append(paths, key)
+		}
+	}
+	return paths, nil
 }
 
 func (f *fakeBackend) Exists(ctx context.Context, path string) (bool, error) {
