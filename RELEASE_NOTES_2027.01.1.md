@@ -557,6 +557,11 @@ that never triggered. The base scenario keeps its exact row-count assertion and
 now exits successfully when it passes.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1004](https://github.com/Basekick-Labs/arc/pull/1004).
+### Partial DELETE rewrites remain immutable without duplicating data ([#975](https://github.com/Basekick-Labs/arc/issues/975))
+
+Partial DELETE now publishes the surviving rows under a fresh immutable Parquet path and retires the superseded object in every storage mode, including standalone OSS deployments. Overlapping rewrites are serialized, and the rewrite filename is normalized before compaction, tiering and file-time pruning classify it. This closes the same-size/different-content replication class without leaving deleted rows visible through Arc's glob-based query path.
+
+If the old-object delete fails after the manifest commit or standalone publish, Arc reports the storage failure explicitly because the old object can remain query-visible until cleanup. A crash in that window can likewise leave both objects; operators should treat the corresponding error as a signal to inspect the partition before retrying.
 
 ### Compaction subprocess threads respect license and effective-core limits ([#1036](https://github.com/Basekick-Labs/arc/issues/1036))
 
@@ -1119,6 +1124,10 @@ fires no registration callbacks (#1071 tracks the snapshot side).
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#907](https://github.com/Basekick-Labs/arc/pull/907).
 
 ## Internal changes
+
+### Immutable DELETE rewrite filenames are normalized centrally
+
+Partial DELETEs use the `_rewrite_<unixnano>.parquet` naming convention. The suffix parser now lives in `internal/storage` and is shared by DELETE, compaction, tiering and file-time pruning, so rewritten daily and compacted files retain their logical classification and timestamps.
 
 These do not change how Arc behaves. They are here because the codebase is the
 thing a new maintainer has to learn, and a refactor that moves a decision from

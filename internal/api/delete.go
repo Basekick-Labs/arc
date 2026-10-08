@@ -10,9 +10,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -88,8 +88,9 @@ type DeleteHandler struct {
 	// fails with a permission error and DELETE on S3 backends silently
 	// breaks. main.go passes the same path as the import handler's upload
 	// dir; the two flows have identical sandbox requirements.
-	tempDir string
-	logger  zerolog.Logger
+	tempDir   string
+	rewriteMu sync.Mutex
+	logger    zerolog.Logger
 }
 
 // DeleteRequest represents a delete operation request
@@ -405,7 +406,14 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 
-	// Execute actual deletion (rewrite files)
+	// Execute actual deletion (rewrite files). Partial rewrites publish a new
+	// immutable path and retire the old one, so overlapping requests for the
+	// same source must not both read and publish from the same pre-delete
+	// snapshot. DELETE is already dominated by Parquet rewrite I/O; serialize
+	// the rewrite phase rather than letting one request multiply another.
+	h.rewriteMu.Lock()
+	defer h.rewriteMu.Unlock()
+
 	h.logger.Info().
 		Int("file_count", len(affected)).
 		Int64("rows", totalToDelete).
@@ -419,6 +427,11 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	for _, f := range affected {
 		deleted, err := h.rewriteFileWithoutDeletedRows(ctx, f.path, f.relativePath, req.Where)
 		if err != nil {
+			// Post-rewrite bookkeeping/storage failures still mean the rows were
+			// removed from the newly published file. rewriteFileWithoutDeletedRows
+			// returns zero only when the manifest was not committed and the old
+			// file remains authoritative.
+			totalDeleted += deleted
 			h.logger.Error().Err(err).Str("file", f.path).Msg("Failed to rewrite file")
 			// Manifest failures are non-transient (Raft quorum loss) — abort the
 			// entire operation to avoid deleting files from storage without a
@@ -833,15 +846,18 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 	}
 	if h.coordinator != nil {
 		if err := h.replaceManifestAfterRewrite(ctx, relativePath, rewrittenPath, s3Result); err != nil {
-			return 0, err
+			if errors.Is(err, errManifestFailure) {
+				return 0, err
+			}
+			return rewroteDeleted, err
 		}
 	} else {
 		if err := h.storage.Delete(ctx, relativePath); err != nil {
-			return 0, fmt.Errorf("failed to delete superseded rewritten file %q: %w", relativePath, err)
+			return rewroteDeleted, fmt.Errorf("failed to delete superseded rewritten file %q: %w", relativePath, err)
 		}
 	}
 	if err := h.recordRewriteTiering(ctx, relativePath, rewrittenPath, s3Result); err != nil {
-		return 0, err
+		return rewroteDeleted, err
 	}
 
 	return rewroteDeleted, nil
@@ -854,14 +870,15 @@ func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, relative
 	newRelativePath := rewritePath(relativePath)
 	newFilePath := filepath.Join(filepath.Dir(filePath), filepath.Base(newRelativePath))
 
-	// Create temp file for the rewritten data
+	// Create temp file for the rewritten data. Key it from the immutable output
+	// name so concurrent rewrites cannot collide on one source's staging path.
 	dir := filepath.Dir(filePath)
 	tempDir := filepath.Join(dir, ".tmp")
 	if err := os.MkdirAll(tempDir, 0700); err != nil {
 		return 0, "", fmt.Errorf("failed to create temp directory: %w", err)
 	}
 
-	tempFile := filepath.Join(tempDir, filepath.Base(filePath)+".new")
+	tempFile := filepath.Join(tempDir, filepath.Base(newRelativePath)+".new")
 
 	// Write filtered data to temp file using DuckDB COPY. Run with
 	// preserve_insertion_order forced on so the rewritten file keeps the
@@ -912,11 +929,9 @@ type s3RewriteResult struct {
 // rewritePath returns a fresh path in the same partition directory. Keeping
 // rewritten files immutable makes a content change visible as register+delete
 // in the manifest instead of an in-place UpdateFile (#975).
-var rewriteSuffixPattern = regexp.MustCompile(`_rewrite_\d+$`)
-
 func rewritePath(relativePath string) string {
-	base := strings.TrimSuffix(relativePath, filepath.Ext(relativePath))
-	base = rewriteSuffixPattern.ReplaceAllString(base, "")
+	logicalPath := storage.StripRewriteSuffix(relativePath)
+	base := strings.TrimSuffix(logicalPath, filepath.Ext(logicalPath))
 	return fmt.Sprintf("%s_rewrite_%d.parquet", base, time.Now().UTC().UnixNano())
 }
 
@@ -1053,7 +1068,10 @@ func (h *DeleteHandler) recordRewriteTiering(ctx context.Context, oldPath, newPa
 func (h *DeleteHandler) replaceManifestAfterRewrite(ctx context.Context, oldPath, newPath string, s3 *s3RewriteResult) error {
 	existing, ok := h.coordinator.GetFileEntry(oldPath)
 	if !ok {
-		h.logger.Warn().Str("file", oldPath).Msg("Rewritten source is absent from the manifest; deleting the superseded storage object")
+		h.logger.Warn().
+			Str("file", oldPath).
+			Str("new_file", newPath).
+			Msg("Rewritten source is absent from the manifest; new file is not registered and will not replicate; deleting the superseded storage object (reconciliation may later remove the orphan)")
 		if err := h.storage.Delete(ctx, oldPath); err != nil {
 			return fmt.Errorf("failed to delete unmanifested superseded rewrite %q: %w", oldPath, err)
 		}
