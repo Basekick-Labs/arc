@@ -1122,6 +1122,14 @@ strikes. Unreadable or unwritable attempt metadata reports an error and retains
 the WAL; quarantine still preserves its original bytes and valid checkpoints.
 The operational guide describes sidecar recovery and cleanup behavior.
 
+Retained and quarantined WAL files are not reclaimed by age. The
+[WAL operations guide](docs/operations/wal-recovery.md#reclaiming-retained-and-quarantined-files)
+now documents offline inventory, verified backup, record reconciliation and
+the checkpoint-dependency gate required before an operator reclaims quarantine
+space. It includes a read-only empty-WAL check and a whole-directory relocation
+procedure for capacity shortages. A clean recovery result alone does not prove
+quarantined data is disposable.
+
 Contributed by [@jallegri](https://github.com/jallegri) in [#1118](https://github.com/Basekick-Labs/arc/pull/1118).
 
 ### The tiering files endpoint rejects an invalid `limit` ([#1135](https://github.com/Basekick-Labs/arc/issues/1135))

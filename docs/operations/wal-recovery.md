@@ -41,6 +41,91 @@ in an earlier file that is still awaiting recovery. Preserve quarantined files
 together with the remaining WAL directory; deleting or moving one away can
 remove the proof that prevents already-flushed records from being replayed.
 
+## Reclaiming retained and quarantined files
+
+There is no age-based fallback for retained files. A file's age, a successful
+health check, zero `kept_files`, or a falling WAL gauge does not establish that
+the records in a quarantined file reached storage. Recovery skips quarantined
+data, so even a successful recovery pass is insufficient for that conclusion.
+
+Use this maintenance procedure for one node's private WAL directory:
+
+1. Stop or divert all input to the node, including replication and background
+   producers. Restore healthy downstream storage and let normal recovery and
+   flushing finish. Resolve reported replay/barrier errors. Keep all
+   quarantined files in place throughout this drain: their checkpoints may be
+   the only proof that records in earlier files were already persisted.
+2. Stop Arc and confirm that no process or container can write this WAL
+   directory. Take a complete offline copy on a separate filesystem, including
+   normal WAL, quarantined WAL, and attempt sidecars. Record exact filenames,
+   sizes and SHA-256 hashes; verify the copied bytes and preserve timestamps.
+   Record the Arc revision, configuration and corresponding durable-storage
+   backup or snapshot. A copy on the same full filesystem does not free space.
+3. Inspect the stopped directory. **If any ordinary `*.wal` file contains an
+   entry, is malformed, or cannot be read, stop manual reclamation.** Retain the
+   complete checkpoint set and resume normal recovery after fixing the cause.
+   The conservative check below allows only valid empty headers; it also
+   refuses checkpoint-only files. It does not inspect quarantined records or
+   authorize deleting them.
+4. Account for every quarantined file's records against durable storage and
+   the producer's authoritative record set, or recover missing records through
+   a separately validated repair on an isolated copy. Counts alone cannot
+   distinguish missing records from duplicates. If contents cannot be decoded
+   or reconciled, preserve the file and escalate for repair; do not assume the
+   missing data is expendable. Renaming `.failed` back to `.wal` or resending
+   its entire contents can replay already-persisted records.
+5. Only after steps 2–4 succeed, archive/remove the **explicitly inventoried
+   quarantined filenames** from the stopped node's WAL directory, keeping the
+   verified offline copy and the reconciliation record. Do not use a wildcard
+   deletion, delete normal WAL files, or act on files that appeared after the
+   inventory. An orphan attempt sidecar may be removed only when its associated
+   normal WAL no longer exists; preserve it in the archive as well.
+6. Start Arc, check recovery/flush errors, and repeat the affected record
+   reconciliation before restoring input. On a discrepancy, stop and investigate
+   using the archived set and the matching storage snapshot. Never restore an
+   arbitrary subset of old WAL/checkpoints into a directory or storage state
+   that has advanced since the snapshot; that can introduce duplicate replay.
+
+This read-only check implements the conservative ordinary-WAL condition in
+step 3 on Linux and macOS (Python 3). Set `WAL_DIR` to the stopped node's exact
+directory. It neither proves quarantined data is durable nor removes files.
+
+```sh
+python3 - "$WAL_DIR" <<'PY'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+if not root.is_dir():
+    raise SystemExit("STOP: WAL directory does not exist")
+blocked = []
+try:
+    candidates = sorted(p for p in root.iterdir() if p.name.endswith(".wal"))
+except OSError:
+    raise SystemExit("STOP: cannot list the WAL directory")
+for path in candidates:
+    try:
+        # Read one extra byte: an entry, torn tail, or unexpected header blocks.
+        with path.open("rb") as source:
+            header = source.read(8)
+        if path.is_symlink() or header != b"ARCW\x00\x01\x01":
+            blocked.append(path.name)
+    except OSError:
+        blocked.append(path.name)
+if blocked:
+    print("STOP: ordinary WAL needs recovery/inspection:", *blocked, sep="\n")
+    raise SystemExit(1)
+print("No ordinary WAL entries found. Backup and quarantine reconciliation remain required.")
+PY
+```
+
+If free space is insufficient to complete recovery, first reduce admission or
+provide capacity. A stopped node's **entire** WAL directory can be relocated to
+a larger volume using a verified copy with original names/timestamps, updating
+`wal.directory` before restart. Keep every quarantined checkpoint and sidecar
+with it. Verify recovery from the new location before retiring the old copy.
+Moving only the largest `.failed` file while retained files remain is unsafe.
+
 ## Replay attempts across restarts
 
 Completed failed replay passes are recorded in a small `<file>.wal.recovery`
