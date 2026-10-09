@@ -1117,6 +1117,13 @@ throughput. A negative value is refused at startup.
 Above the new ceiling, when the WAL queue is full, an entry is still dropped and
 the write still acknowledged. What admission should do instead is
 [#676](https://github.com/Basekick-Labs/arc/issues/676).
+### Cold tier metadata sync batches cache invalidation ([#1188](https://github.com/Basekick-Labs/arc/issues/1188))
+
+When rebuilding metadata from a large cold bucket, sync now writes bounded
+batches and invalidates each database/measurement cache once, rather than once
+per object. Per-object timestamps are preserved.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1197](https://github.com/Basekick-Labs/arc/pull/1197).
 
 ### Delete API catches dangerous keywords glued to numbers or literals ([#1080](https://github.com/Basekick-Labs/arc/issues/1080))
 
