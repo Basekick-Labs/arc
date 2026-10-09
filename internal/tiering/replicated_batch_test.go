@@ -127,16 +127,28 @@ func (b *slowExistsBackend) Exists(ctx context.Context, path string) (bool, erro
 // next cold sync. The drainer has to apply a chunk whose probes, run
 // sequentially, would take several times its deadline.
 func TestApplyTierEventBatch_AppliesAMigrationChunkTheProbeLatencyWouldTimeOut(t *testing.T) {
-	// Sequentially the probes alone take n*probe = 8 s against a 2 s chunk
-	// deadline; in parallel a chunk's probes take ~0.3 s. The gap on each
-	// side is deliberately wide: the SQL writes under -race on a small CI
-	// runner cost real time too, and the test must fail only for the
-	// mechanism it is about.
+	// The budget, as arithmetic rather than as a round number, because this
+	// test has now been widened twice for the same reason and guessing is
+	// what put it here.
+	//
+	// Probes: n*probe = 8 s if they run sequentially, and n/16*probe = 0.5 s
+	// at the 16-way parallelism the fix introduced. Writes: 400 SQLite
+	// upserts on one connection (SetMaxOpenConns(1)), under -race, on a
+	// shared 2-vCPU runner with the rest of the suite competing for it.
+	//
+	// The 2 s deadline this used to carry left 1.5 s for those writes once
+	// the probes had taken their 0.5 s — 3.75 ms each, which is inside the
+	// range a contended runner actually costs. CI duly failed with 386 of
+	// 400 applied. 5 s leaves 4.5 s, or 11 ms per write, and still fails
+	// loudly if the probes ever serialize again: 8 s is well past it.
+	//
+	// Note that rerunning locally proves nothing about this. It is 20/20 on
+	// a 14-core machine; the failure needs the contention.
 	const n = 400
 	const probe = 20 * time.Millisecond
 
 	restore := tierEventDrainTimeout
-	tierEventDrainTimeout = 2 * time.Second
+	tierEventDrainTimeout = 5 * time.Second
 	t.Cleanup(func() { tierEventDrainTimeout = restore })
 
 	cold := &slowExistsBackend{mockBackend: newMockBackend("s3"), delay: probe}
