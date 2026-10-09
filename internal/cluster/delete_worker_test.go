@@ -6,6 +6,7 @@ package cluster
 // hang the shutdown.
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -85,6 +86,36 @@ func waitForDeletes(t *testing.T, backend *recordingBackend, want int, within ti
 		time.Sleep(20 * time.Millisecond)
 	}
 	return backend.deleteCalls()
+}
+
+func TestDeleteWorkerRefreshesManifestEntryWhenUnlinkIsSkipped(t *testing.T) {
+	const path = "testdb/cpu/2026/10/08/reregistered.parquet"
+	ctx := context.Background()
+	mem := newMemBackend()
+	oldBody := []byte("old same-size payload")
+	if err := mem.Write(ctx, path, oldBody); err != nil {
+		t.Fatal(err)
+	}
+	backend := &recordingBackend{memBackend: mem}
+	var refreshed string
+	c := &Coordinator{storage: backend, logger: zerolog.Nop()}
+
+	c.unlinkOne(
+		deleteRequest{path: path, reason: "test"},
+		func(got string) bool { return got == path },
+		func(got string) { refreshed = got },
+	)
+
+	if refreshed != path {
+		t.Fatalf("re-registered path refresh = %q, want %q", refreshed, path)
+	}
+	if calls := backend.deleteCalls(); len(calls) != 0 {
+		t.Fatalf("manifest-listed path was unlinked: %v", calls)
+	}
+	got, err := mem.Read(ctx, path)
+	if err != nil || !bytes.Equal(got, oldBody) {
+		t.Fatalf("old local copy must remain readable until refresh succeeds: got %q, err=%v", got, err)
+	}
 }
 
 // TestDeleteWorkerClassifiesAnUnusableKey covers the worker's three outcomes.

@@ -12,7 +12,9 @@ package cluster
 // ordering 2 does.
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"net"
 	"sync"
 	"testing"
@@ -21,6 +23,8 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster/protocol"
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/config"
+	"github.com/basekick-labs/arc/internal/storage"
+	hraft "github.com/hashicorp/raft"
 	"github.com/rs/zerolog"
 )
 
@@ -95,6 +99,12 @@ func (h *hangingOrigin) stop() {
 // function main.go's Coordinator.Start uses.
 func newManifestDeleteRig(t *testing.T, peerAddr string) (*Coordinator, *memBackend) {
 	t.Helper()
+	backend := newMemBackend()
+	return newManifestDeleteRigWithBackend(t, peerAddr, backend), backend
+}
+
+func newManifestDeleteRigWithBackend(t *testing.T, peerAddr string, backend storage.Backend) *Coordinator {
+	t.Helper()
 	raftNode := startRaftNode(t, manifestDeleteReader, allocFreePort(t), true)
 	t.Cleanup(func() { _ = raftNode.Stop() })
 	if err := raftNode.WaitForLeader(10 * time.Second); err != nil {
@@ -110,7 +120,6 @@ func newManifestDeleteRig(t *testing.T, peerAddr string) (*Coordinator, *memBack
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	backend := newMemBackend()
 	c := &Coordinator{
 		cfg: &config.ClusterConfig{
 			ClusterName:                 manifestDeleteCluster,
@@ -143,7 +152,7 @@ func newManifestDeleteRig(t *testing.T, peerAddr string) (*Coordinator, *memBack
 		// cancelling the context no longer ends them (that was the leak).
 		c.stopDeleteWorkers(c.deleteStop, c.deleteWg)
 	})
-	return c, backend
+	return c
 }
 
 func (c *Coordinator) catchUpFromFSM(t *testing.T) {
@@ -166,6 +175,120 @@ func waitForStatus(t *testing.T, c *Coordinator, what string, pred func(map[stri
 	}
 	t.Fatalf("timed out waiting for %s; stats=%+v", what, c.puller.Stats())
 	return nil
+}
+
+func applyRegisterFileAtIndex(t *testing.T, fsm *raft.ClusterFSM, file raft.FileEntry, index uint64) {
+	t.Helper()
+	payload, err := json.Marshal(raft.RegisterFilePayload{File: file})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, err := json.Marshal(raft.Command{Type: raft.CommandRegisterFile, Payload: payload})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := fsm.Apply(&hraft.Log{Index: index, Data: command}); result != nil {
+		t.Fatalf("origin FSM register: %v", result)
+	}
+}
+
+func TestManifestDelete_ReregisteredSameSizePathRefreshesLocalCopyIssue798(t *testing.T) {
+	for _, state := range []string{"fresh", "existing"} {
+		t.Run(state, func(t *testing.T) {
+			ctx := context.Background()
+			oldBody := []byte("same-size old parquet payload")
+			newBody := []byte("same-size new parquet payload")
+			if len(oldBody) != len(newBody) {
+				t.Fatal("test setup: rewrite bodies must have equal length")
+			}
+			path := "testdb/cpu/2026/10/08/00/issue798-reregister.parquet"
+			originBackend := newMemBackend()
+			if err := originBackend.Write(ctx, path, oldBody); err != nil {
+				t.Fatal(err)
+			}
+			originFSM := raft.NewClusterFSM(zerolog.Nop())
+			oldEntry := makeFileEntry(path, oldBody, manifestDeleteOrigin)
+			oldEntry.CreatedAt = time.Now().UTC()
+			seedFileInFSM(t, originFSM, oldEntry)
+			origin := startOriginServer(t, originBackend, originFSM, manifestDeleteSecret, manifestDeleteCluster, manifestDeleteOrigin)
+			defer origin.stop()
+
+			local, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+			if err != nil {
+				t.Fatalf("NewLocalBackend: %v", err)
+			}
+			defer local.Close()
+			const retainedPath = "retained/preexisting.parquet"
+			retainedBody := []byte("preserve unrelated existing data")
+			if state == "existing" {
+				if err := local.Write(ctx, path, oldBody); err != nil {
+					t.Fatal(err)
+				}
+				if err := local.Write(ctx, retainedPath, retainedBody); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			c := newManifestDeleteRigWithBackend(t, origin.addr(), local)
+			if err := c.raftNode.RegisterFile(oldEntry, 5*time.Second); err != nil {
+				t.Fatalf("register initial file: %v", err)
+			}
+			initial := waitForStatus(t, c, "initial file available", func(s map[string]int64) bool {
+				if state == "fresh" {
+					return s["pulled"] == 1 && s["inflight_count"] == 0
+				}
+				return s["skipped_local"] == 1 && s["inflight_count"] == 0
+			})
+			if got, err := local.Read(ctx, path); err != nil || !bytes.Equal(got, oldBody) {
+				t.Fatalf("initial version: got %q, err=%v, stats=%v", got, err, initial)
+			}
+
+			newEntry := makeFileEntry(path, newBody, manifestDeleteOrigin)
+			newEntry.CreatedAt = oldEntry.CreatedAt
+			if err := originBackend.Write(ctx, path, newBody); err != nil {
+				t.Fatal(err)
+			}
+			applyRegisterFileAtIndex(t, originFSM, newEntry, 2)
+
+			deleted, err := json.Marshal(raft.DeleteFilePayload{Path: path, Reason: "test: same-size re-register"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			registered, err := json.Marshal(raft.RegisterFilePayload{File: newEntry})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Applying both operations as one Raft batch guarantees the delete
+			// worker sees the path again during its grace-period membership check.
+			if err := c.raftNode.BatchFileOps([]raft.BatchFileOp{
+				{Type: raft.CommandDeleteFile, Payload: deleted},
+				{Type: raft.CommandRegisterFile, Payload: registered},
+			}, 5*time.Second); err != nil {
+				t.Fatalf("delete + re-register: %v", err)
+			}
+
+			wantPulled := int64(1)
+			if state == "fresh" {
+				wantPulled = 2
+			}
+			waitForStatus(t, c, "same-size replacement installed", func(s map[string]int64) bool {
+				c.deletePendingMu.Lock()
+				deletesPending := len(c.deletePending) + int(c.deleteInFlight.Load())
+				c.deletePendingMu.Unlock()
+				return s["pulled"] == wantPulled && s["inflight_count"] == 0 && deletesPending == 0
+			})
+			got, err := local.Read(ctx, path)
+			if err != nil || !bytes.Equal(got, newBody) {
+				t.Fatalf("same-size re-register kept stale bytes: got %q, err=%v", got, err)
+			}
+			if state == "existing" {
+				got, err := local.Read(ctx, retainedPath)
+				if err != nil || !bytes.Equal(got, retainedBody) {
+					t.Fatalf("pre-existing unrelated data changed: got %q, err=%v", got, err)
+				}
+			}
+		})
+	}
 }
 
 // Ordering 1: every peer answers not-found, the pull gives up, the gate is
