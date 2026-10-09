@@ -622,12 +622,17 @@ func (m *Migrator) ReconcileOrphanedFiles(ctx context.Context) (orphansFound, de
 		orphansFound++
 
 		// A cold row written by this node's own migration is proof of a cold
-		// copy; a cold row written by the shared-storage metadata sync is
-		// not. The sync records rows from a cold LISTING, which can catch an
-		// object the primary copied and then rolled back (MigrateFile
-		// deletes the cold object when its UpdateTier fails). Deleting the
-		// hot copy on such a row would lose the file, so require the cold
-		// object first; a row whose cold object is gone goes back to hot so
+		// copy; a cold row written by the metadata sync is not, and since
+		// #1179 that sync runs on every node with a usable cold tier, not
+		// only on shared storage. The sync records rows from a cold LISTING,
+		// and a listing says an object is there, not that it is the complete
+		// and current copy of that path: copyAndFlip leaves the cold object
+		// in place when its UpdateTier fails (see the comment there, which
+		// says why removing it would be worse), so an object can sit in cold
+		// under a row that still says hot until some later pass reconciles
+		// them. Deleting the hot copy on the strength of a listing alone
+		// would lose the file, so require the cold object first; a row whose
+		// cold object is gone goes back to hot so
 		// the primary migrates it again instead of leaving a cold row that
 		// points at nothing.
 		coldBackend := m.manager.GetBackendForTier(TierCold)

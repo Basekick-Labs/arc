@@ -212,8 +212,10 @@ func (h *TieringHandler) GetStats(c *fiber.Ctx) error {
 	})
 }
 
-// ScanFiles registers every file in hot storage and, on a node with a
-// cluster gate, first learns which files other nodes moved to cold.
+// ScanFiles registers every file in hot storage and, on any node with a usable
+// cold tier, first reads the cold listing — which is what rebuilds cold rows
+// this node has lost and, on a cluster, what shows it the files other nodes
+// moved (#1179).
 // POST /api/v1/tiering/scan
 //
 // Bounded by tiered_storage.scan_timeout, the same budget the startup scan and
