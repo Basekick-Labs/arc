@@ -57,6 +57,13 @@ spec:
             {{- with .Values.arc.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+            {{- if or .Values.auth.bootstrapToken.existingSecret .Values.auth.bootstrapToken.value }}
+            - name: ARC_AUTH_BOOTSTRAP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "arc.bootstrapTokenSecretName" . }}
+                  key: bootstrap-token
+            {{- end }}
           startupProbe:
             # WAL replay runs before the listener binds. Keep liveness from
             # turning a long recovery into a crash loop.
