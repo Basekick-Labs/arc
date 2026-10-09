@@ -81,7 +81,7 @@ func (f *fakeBackend) WriteReader(ctx context.Context, path string, reader io.Re
 	}
 	// Atomic: read all bytes into a staging key. On success, promote to final key.
 	// On error, leave bytes in the ".part" staging key (same as real LocalBackend)
-	// so resume tests can discover them via StagingInspector/ReadTo.
+	// so resume tests can discover them through StagingInspector.
 	stagingKey := path + ".part"
 	var buf []byte
 	tmp := make([]byte, 4096)
@@ -130,12 +130,8 @@ func (f *fakeBackend) ReadTo(ctx context.Context, path string, writer io.Writer)
 	if err := checkKey(path); err != nil {
 		return err
 	}
-	// Fall back to staging file so tryResumeFromPartial can hash a partial prefix.
 	f.mu.Lock()
 	data, ok := f.files[path]
-	if !ok {
-		data, ok = f.files[path+".part"]
-	}
 	f.mu.Unlock()
 	if !ok {
 		return errors.New("not found")
@@ -150,9 +146,6 @@ func (f *fakeBackend) ReadToAt(ctx context.Context, path string, writer io.Write
 	}
 	f.mu.Lock()
 	data, ok := f.files[path]
-	if !ok {
-		data, ok = f.files[path+".part"]
-	}
 	f.mu.Unlock()
 	if !ok {
 		return errors.New("not found")
