@@ -433,10 +433,7 @@ func (b *AzureBlobBackend) List(ctx context.Context, prefix string) ([]string, e
 
 		page, err := pager.NextPage(ctx)
 		if err != nil {
-			if isAzureContainerNotFoundError(err) {
-				return []string{}, nil
-			}
-			return nil, fmt.Errorf("failed to list Azure blobs: %w", err)
+			return nil, azureListError("failed to list Azure blobs", err)
 		}
 
 		for _, blobItem := range page.Segment.BlobItems {
@@ -668,10 +665,7 @@ func (b *AzureBlobBackend) ListDirectories(ctx context.Context, prefix string) (
 
 		page, err := pager.NextPage(ctx)
 		if err != nil {
-			if isAzureContainerNotFoundError(err) {
-				return []string{}, nil
-			}
-			return nil, fmt.Errorf("failed to list Azure directories: %w", err)
+			return nil, azureListError("failed to list Azure directories", err)
 		}
 
 		// BlobPrefixes contains the "directories"
@@ -716,10 +710,7 @@ func (b *AzureBlobBackend) ListObjects(ctx context.Context, prefix string) ([]Ob
 
 		page, err := pager.NextPage(ctx)
 		if err != nil {
-			if isAzureContainerNotFoundError(err) {
-				return []ObjectInfo{}, nil
-			}
-			return nil, fmt.Errorf("failed to list Azure blobs: %w", err)
+			return nil, azureListError("failed to list Azure blobs", err)
 		}
 
 		for _, blobItem := range page.Segment.BlobItems {
@@ -768,10 +759,7 @@ func (b *AzureBlobBackend) HasObjectsUnderPrefix(ctx context.Context, prefix str
 		}
 		page, err := pager.NextPage(ctx)
 		if err != nil {
-			if isAzureContainerNotFoundError(err) {
-				return false, nil
-			}
-			return false, fmt.Errorf("failed to list Azure blobs: %w", err)
+			return false, azureListError("failed to list Azure blobs", err)
 		}
 		for _, blobItem := range page.Segment.BlobItems {
 			if blobItem.Name != nil && ValidateKey(strings.TrimPrefix(*blobItem.Name, b.prefix)) == nil {
@@ -808,10 +796,7 @@ func (b *AzureBlobBackend) ListUnusable(ctx context.Context, prefix string) ([]U
 
 		page, err := pager.NextPage(ctx)
 		if err != nil {
-			if isAzureContainerNotFoundError(err) {
-				return []UnusableObject{}, nil
-			}
-			return nil, fmt.Errorf("failed to list Azure blobs: %w", err)
+			return nil, azureListError("failed to list Azure blobs", err)
 		}
 
 		for _, blobItem := range page.Segment.BlobItems {
@@ -847,6 +832,11 @@ func (b *AzureBlobBackend) ListUnusable(ctx context.Context, prefix string) ([]U
 	return objects, nil
 }
 
+// isAzureContainerNotFoundError reports Azure's answer for a container that
+// does not exist. Matched on the structured response code only: the string
+// "ContainerNotFound" can appear in the request URL of a transport error (a
+// storage prefix of that name plus a connection reset), and treating that as
+// a missing container would hide a network failure.
 func isAzureContainerNotFoundError(err error) bool {
 	if err == nil {
 		return false
@@ -856,6 +846,16 @@ func isAzureContainerNotFoundError(err error) bool {
 		return responseError.ErrorCode == "ContainerNotFound"
 	}
 	return false
+}
+
+// azureListError wraps a listing failure, tagging a missing container with
+// ErrStoreNotFound while keeping the SDK error in the chain. Mirrors
+// listError in s3.go; every paginated listing here routes through it.
+func azureListError(what string, err error) error {
+	if isAzureContainerNotFoundError(err) {
+		return fmt.Errorf("%s: %w: %w", what, err, ErrStoreNotFound)
+	}
+	return fmt.Errorf("%s: %w", what, err)
 }
 
 // isAzureNotFoundError checks if an error indicates the blob doesn't exist

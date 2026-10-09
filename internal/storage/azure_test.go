@@ -75,7 +75,10 @@ func TestIsAzureNotFoundError(t *testing.T) {
 	}
 }
 
-func TestAzureListingsTreatMissingContainerAsEmpty(t *testing.T) {
+// Every listing method reports a missing container through the sentinel and
+// keeps the SDK error in the chain; no other error code may be mistaken for
+// it. The leniency decision belongs to the caller — see ErrStoreNotFound.
+func TestAzureListingsReportMissingContainerAsErrStoreNotFound(t *testing.T) {
 	operations := []struct {
 		name string
 		call func(*AzureBlobBackend) (bool, error)
@@ -118,11 +121,11 @@ func TestAzureListingsTreatMissingContainerAsEmpty(t *testing.T) {
 	}
 
 	for _, tt := range []struct {
-		name        string
-		errorCode   string
-		wantEmptyOK bool
+		name          string
+		errorCode     string
+		wantStoreGone bool
 	}{
-		{name: "missing container", errorCode: "ContainerNotFound", wantEmptyOK: true},
+		{name: "missing container", errorCode: "ContainerNotFound", wantStoreGone: true},
 		{name: "other not found", errorCode: "BlobNotFound"},
 		{name: "authorization failure", errorCode: "AuthorizationFailure"},
 	} {
@@ -147,17 +150,23 @@ func TestAzureListingsTreatMissingContainerAsEmpty(t *testing.T) {
 			for _, operation := range operations {
 				t.Run(operation.name, func(t *testing.T) {
 					isEmpty, err := operation.call(backend)
-					if tt.wantEmptyOK {
-						if err != nil {
-							t.Fatalf("%s returned error for missing container: %v", operation.name, err)
+					if err == nil {
+						t.Fatalf("%s returned nil error for %s", operation.name, tt.errorCode)
+					}
+					if !isEmpty {
+						t.Fatalf("%s returned results alongside its error", operation.name)
+					}
+					if tt.wantStoreGone {
+						if !IsStoreNotFound(err) {
+							t.Fatalf("%s: err = %v, want ErrStoreNotFound", operation.name, err)
 						}
-						if !isEmpty {
-							t.Fatalf("%s returned non-empty results for a missing container", operation.name)
+						if !isAzureContainerNotFoundError(err) {
+							t.Fatalf("%s: the SDK error left the chain: %v", operation.name, err)
 						}
 						return
 					}
-					if err == nil {
-						t.Fatalf("%s returned nil error for %s", operation.name, tt.errorCode)
+					if IsStoreNotFound(err) {
+						t.Fatalf("%s reported %s as a missing container: %v", operation.name, tt.errorCode, err)
 					}
 				})
 			}

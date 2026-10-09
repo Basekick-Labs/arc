@@ -13,6 +13,32 @@ import (
 // Callers should delete any partial file and retry from byte zero.
 var ErrResumeNotSupported = errors.New("storage: resume not supported by this backend")
 
+// ErrStoreNotFound reports that the bucket or container itself does not
+// exist — not that a key is missing inside it.
+//
+// It exists because "the store is not there" and "the store is there and
+// empty" mean different things to different callers, and only the caller
+// knows which. A fresh deployment reading before its first write wants
+// "no data yet": most S3-compatible stores create the bucket on the first
+// authenticated write, so the state heals itself and a 500 on the read is
+// pure noise (#945). But a caller that DECIDES from a listing — drops a tier
+// from a query, retires a metadata row, reports a backup complete — must
+// never read a missing store as "verified empty", because that turns a
+// misconfigured bucket name into a silently wrong answer.
+//
+// So the backends report it and the few read paths that want leniency opt in
+// with IsStoreNotFound. Everything else keeps failing as it always did. The
+// listing methods wrap it alongside the SDK's own error, so both chains stay
+// inspectable.
+var ErrStoreNotFound = errors.New("storage: bucket or container does not exist")
+
+// IsStoreNotFound reports whether err is a backend saying its bucket or
+// container does not exist. Use it instead of matching the SDKs' shapes:
+// S3 answers NoSuchBucket, Azure answers a ContainerNotFound ResponseError.
+func IsStoreNotFound(err error) bool {
+	return errors.Is(err, ErrStoreNotFound)
+}
+
 // ErrObjectNotFound reports that a key names no object.
 //
 // It exists so a caller can tell "that object is not there" apart from "the

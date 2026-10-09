@@ -4396,6 +4396,13 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error 
 			databases = h.extractTopLevelDirs(files)
 		}
 	}
+	// A store that does not exist yet answers an empty result set, not an
+	// error: the bucket appears on the first authenticated write (#945). Only
+	// the read paths named in that issue opt in — see storage.ErrStoreNotFound
+	// for why a missing store must stay an error everywhere that decides.
+	if storage.IsStoreNotFound(err) {
+		databases, err = nil, nil
+	}
 
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to list databases")
@@ -4495,6 +4502,11 @@ func (h *QueryHandler) handleShowTables(c *fiber.Ctx, start time.Time, database 
 		} else {
 			tables = h.extractTableNames(files, database)
 		}
+	}
+	// As in SHOW DATABASES: a store that does not exist yet is an empty
+	// result set (#945), and nowhere else.
+	if storage.IsStoreNotFound(err) {
+		tables, err = nil, nil
 	}
 
 	if err != nil {

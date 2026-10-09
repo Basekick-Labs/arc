@@ -448,13 +448,31 @@ Contributed by [@efegokdemir](https://github.com/efegokdemir) in
 [#1117](https://github.com/Basekick-Labs/arc/pull/1117), combined here with
 coverage from both contributions.
 
-### Missing object-store buckets and containers are empty on read paths ([#945](https://github.com/Basekick-Labs/arc/issues/945))
+### A fresh object store no longer makes the database and table listings fail ([#945](https://github.com/Basekick-Labs/arc/issues/945))
 
-Read-only operations treat a missing S3 bucket or Azure container as empty,
-including listing directories, listing objects, enumerating unusable objects,
-and checking whether a prefix contains objects. Only structured
-`NoSuchBucket` and `ContainerNotFound` responses are treated this way; transport,
-authorization, and other storage errors remain visible.
+Most S3-compatible stores create the bucket on the first authenticated write,
+so a deployment read before its first write had no bucket yet and every
+listing failed: `GET /api/v1/databases`, `GET /api/v1/databases/{db}/measurements`,
+`SHOW DATABASES` and `SHOW TABLES` all answered 500 with `NoSuchBucket` until
+data arrived. Those four now answer an empty result instead.
+
+The five listing operations on both object-store backends — listing keys,
+listing directories, listing objects, enumerating unusable objects, and
+checking whether a prefix holds any object — report a bucket or container that
+does not exist as a distinct error rather than as an error message, which is
+what lets those four read paths recognise it. Only the structured
+`NoSuchBucket` and `ContainerNotFound` responses are recognised; transport
+failures, authorization failures and every other storage error stay visible,
+and a failed read of a specific object is unchanged.
+
+Everything else that lists storage still treats a store it cannot find as a
+failure, deliberately. Query planning drops a whole tier from a read when a
+listing proves the tier holds no files for the time range, and retention,
+backup, reconciliation and the Iceberg export all decide what to delete or
+publish from a listing. For those, a bucket name with a typo in it answering
+"empty" would not be a slow query or a missing log line — it would be a
+silently wrong answer, or a deletion. The two states produce the same listing
+and only the error tells them apart, so the error is what they get.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#950](https://github.com/Basekick-Labs/arc/pull/950).
 

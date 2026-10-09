@@ -34,6 +34,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/rs/zerolog"
 )
 
@@ -92,7 +94,10 @@ func minioBackend(t *testing.T) *S3Backend {
 	return b
 }
 
-func TestS3MissingBucketListsEmptyThenListsFirstWrite(t *testing.T) {
+// The #945 round trip against a real store: a bucket that does not exist is
+// reported as ErrStoreNotFound (never as an empty success), the first
+// authenticated write creates it, and the listing then shows the object.
+func TestS3MissingBucketReportsStoreNotFoundThenListsFirstWrite(t *testing.T) {
 	base := minioBackend(t)
 	b := &S3Backend{
 		client: base.client,
@@ -102,18 +107,26 @@ func TestS3MissingBucketListsEmptyThenListsFirstWrite(t *testing.T) {
 	ctx := context.Background()
 
 	objects, err := b.List(ctx, "")
-	if err != nil {
-		t.Fatalf("List on a fresh bucket: %v", err)
+	if !IsStoreNotFound(err) {
+		t.Fatalf("List on a bucket that does not exist: err = %v, want ErrStoreNotFound", err)
 	}
 	if len(objects) != 0 {
-		t.Fatalf("List on a fresh bucket returned %v, want empty", objects)
+		t.Fatalf("List on a missing bucket returned %v alongside its error", objects)
 	}
 
 	const key = "contract/first-write.parquet"
 	if err := b.Write(ctx, key, []byte("PAR1")); err != nil {
 		t.Fatalf("first write to fresh bucket: %v", err)
 	}
-	t.Cleanup(func() { _ = b.Delete(ctx, key) })
+	// Drop the bucket, not just the object. The whole point of this test is
+	// that the write creates a bucket that did not exist, and on SeaweedFS a
+	// bucket is a collection backed by volumes: leaking one per run exhausts
+	// the store's volume budget, and the next run fails on PutObject with an
+	// opaque 500 InternalError that looks nothing like the real cause.
+	t.Cleanup(func() {
+		_ = b.Delete(ctx, key)
+		_, _ = b.client.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(b.bucket)})
+	})
 	objects, err = b.List(ctx, "")
 	if err != nil {
 		t.Fatalf("List after first write: %v", err)
