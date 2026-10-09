@@ -976,8 +976,10 @@ went back to hot storage and the file was registered in the cluster manifest,
 while the guarded tier upsert refused to move the row off cold and said nothing
 about it. The row and the objects then disagreed, and the query path reads both
 tiers for a measurement that claims both — so the restored rows came back
-**twice** if anything else in that measurement was still hot, and **not at all**
-if the measurement had gone entirely cold, despite the file sitting on disk.
+**twice** if anything else in that measurement was still hot. They came back
+**not at all** when the measurement had gone entirely cold and the cold object
+was missing or unreadable — the restored copy then sat on disk with nothing
+routing a reader to it.
 
 The local tier row now decides where a restored file belongs, because it is
 this node's current truth and a restore's job is to make the bytes at that
@@ -989,13 +991,26 @@ as hot whose row says cold:
 - a cold object that is missing, differs in size, or is only a half-finished
   staging file is overwritten **in cold storage**, where the row says it is;
 - a node with no cold backend configured has nowhere to put it, so it is
-  restored hot and its row forced hot, exactly as before.
+  restored hot and its row forced hot, exactly as before — counted as
+  `cold_files_restored_to_hot`, not as a route to cold;
+- a backup carrying no sidecar row for the file leaves the cold copy **exactly
+  as it is**, counted as `cold_rows_skipped_unverifiable` and named in the log.
+  There is nothing to check replacement bytes against, and overwriting the only
+  copy with unverifiable bytes is worse than not restoring it. Those files are
+  not restored.
 
-Both of the first two cases are counted as `hot_backup_files_routed_to_cold`.
-No hot copy is created for a file whose row says cold, so the row and the
-objects never disagree — which also means the tiering orphan sweep, which
-deletes a hot copy once it confirms a cold one, can no longer act on a file a
-restore has just written.
+The first two cases are counted as `hot_backup_files_routed_to_cold`, and a
+routed write is verified against the sidecar's size and SHA-256 before it
+replaces the cold object — on a standalone node as well as in a cluster. A
+damaged backup therefore fails the restore with `sidecar_mismatch_sample`
+instead of replacing the only copy of the file.
+
+Where a cold backend exists, no hot copy is created for a file whose row says
+cold, so this restore does not create a row/object disagreement — which means
+the tiering orphan sweep, which deletes a hot copy once it confirms a cold one,
+cannot act on a file this restore has just written. It does not clean up
+duplicates an earlier restore already produced; those age out of the sweep's
+window on their own.
 
 Size is the discriminator because a tier row stores no checksum of the backup
 object. On its own that is weak, but migration is a byte-preserving move of the

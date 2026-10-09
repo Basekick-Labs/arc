@@ -841,6 +841,8 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 	// mismatch is therefore the interesting case, and it routes to cold rather
 	// than being trusted either way.
 	alreadyCold := map[string]bool{}
+	skipUnverifiable := map[string]bool{}
+	toColdRouted := map[string]bool{}
 	if m.coldSource != nil {
 		coldRows, err := m.coldSource.ColdRows(ctx)
 		if err != nil {
@@ -849,6 +851,11 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 		cold := m.coldBackendOrNil()
 		for _, leg := range legs {
 			for _, srcPath := range leg.files {
+				// Two HEADs per candidate against an object store, so this loop
+				// is cancellable and publishes, like the write loop below.
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 				destPath := filepath.ToSlash(strings.TrimPrefix(srcPath, dataPrefix))
 				if destPath == "" || destPath == filepath.ToSlash(srcPath) || leg.skipInputs[destPath] ||
 					tiers[destPath] == tierCold {
@@ -857,14 +864,34 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 				if _, isCold := coldRows[destPath]; !isCold {
 					continue
 				}
-				// From here the row says cold, so the file is restored on the
-				// cold route whatever happens next.
-				tiers[destPath] = tierCold
-				atomic.AddInt64(&progress.HotBackupFilesRoutedToCold, 1)
 				row, hasBackupRow := backupRows[destPath]
-				if cold == nil || !hasBackupRow {
+				if cold == nil {
+					// Nowhere to put a cold copy, so the file goes to hot and its
+					// row has to be forced hot or it is invisible. Marking the tier
+					// cold is what reaches that existing branch; it is NOT a route
+					// to cold, so it is not counted as one.
+					tiers[destPath] = tierCold
 					continue
 				}
+				if !hasBackupRow {
+					// No sidecar row, so nothing can check the bytes we would
+					// write, and what we would overwrite is the only copy. Leave it
+					// alone: the row already says cold and the object is already
+					// there, so the node keeps the state it had. Overwriting the
+					// canonical copy with unverifiable bytes is the one outcome
+					// worse than not restoring the file, so this is reported rather
+					// than attempted.
+					skipUnverifiable[destPath] = true
+					atomic.AddInt64(&progress.ColdRowsSkippedUnverifiable, 1)
+					m.logger.Warn().Str("path", destPath).
+						Msg("Backup has no sidecar row for a file this node holds in cold storage; left the cold copy untouched rather than overwriting it with unverifiable bytes")
+					m.setProgress(progress)
+					continue
+				}
+				tiers[destPath] = tierCold
+				toColdRouted[destPath] = true
+				atomic.AddInt64(&progress.HotBackupFilesRoutedToCold, 1)
+				m.setProgress(progress)
 				// Exists AND StatFile, which is not the redundant pair it looks
 				// like: LocalBackend.StatFile falls back to the ".part" staging
 				// file when the final object is absent and returns ITS size
@@ -949,6 +976,9 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 				atomic.AddInt64(&progress.ConsumedInputsSkipped, 1)
 				continue
 			}
+			if skipUnverifiable[destPath] {
+				continue
+			}
 			if alreadyCold[destPath] {
 				atomic.AddInt64(&progress.ColdFilesSkippedAlreadyCold, 1)
 				m.setProgress(progress)
@@ -967,6 +997,17 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 			registrable := isRegistrableDataFile(destPath)
 			var pendingRow pendingRegistration
 			var expect *ManifestFile
+			// Standalone has no registration pass, so expect stays nil and
+			// nothing checks the bytes. That was tolerable while an unverified
+			// write landed in HOT storage beside an intact cold object; a routed
+			// write overwrites the canonical copy, so verify it against the same
+			// sidecar row the routing decision already trusted.
+			if expect == nil && toColdRouted[destPath] {
+				if row, ok := backupRows[destPath]; ok {
+					verified := row
+					expect = &verified
+				}
+			}
 			if reg != nil && registrable {
 				pendingRow = reg.lookup(destPath)
 				if !pendingRow.ok {
