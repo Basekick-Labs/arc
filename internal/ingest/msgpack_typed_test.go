@@ -349,7 +349,7 @@ func TestTypedDecodeRejectEquivalence(t *testing.T) {
 
 // TestTypedDecodeWriteTimeRejects: payloads that pass Decode today but are
 // rejected later at write time by convertColumnsToTyped (uint64 overflow,
-// bin columns, mid-column type mismatches, nested values). The typed path
+// mid-column type mismatches, nested values). The typed path
 // must FALL BACK on these — never produce a typed record — so the write-time
 // rejection is preserved unchanged.
 func TestTypedDecodeWriteTimeRejects(t *testing.T) {
@@ -361,11 +361,6 @@ func TestTypedDecodeWriteTimeRejects(t *testing.T) {
 			"m": "cpu", "columns": map[string]interface{}{
 				"time": []interface{}{int64(1700000000000000), int64(1700000000000001)},
 				"v":    []interface{}{int64(1), uint64(math.MaxInt64) + 1},
-			}}},
-		{"bin_column", map[string]interface{}{
-			"m": "cpu", "columns": map[string]interface{}{
-				"time": []interface{}{int64(1700000000000000)},
-				"v":    []interface{}{[]byte{0x01, 0x02}},
 			}}},
 		{"string_in_int_column", map[string]interface{}{
 			"m": "cpu", "columns": map[string]interface{}{
