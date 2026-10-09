@@ -733,6 +733,8 @@ Cold metadata sync now skips objects belonging to databases pinned to the hot
 tier. A cold object left behind by a failed migration can no longer make the
 orphan sweep remove the hot copy.
 
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1192](https://github.com/Basekick-Labs/arc/pull/1192).
+
 ### Cold-tier metadata is rebuilt on standalone nodes ([#1179](https://github.com/Basekick-Labs/arc/issues/1179))
 
 A node with a usable cold tier now reads the cold listing at the start of every
