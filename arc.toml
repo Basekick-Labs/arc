@@ -303,6 +303,22 @@ s3_cache_size = "128MB"
 s3_cache_ttl_seconds = 3600
 
 # -----------------------------------------------------------------------------
+# Iceberg export (optional)
+# -----------------------------------------------------------------------------
+# Export Arc measurements as Iceberg tables. Legacy dotted namespaces are
+# previewed first; set namespace_migration_dry_run=false only after reviewing
+# the migration logs. Migration is retried safely across restarts.
+# [iceberg]
+# enabled = false
+# warehouse = ""                     # defaults to the Arc storage root
+# namespace_prefix = "arc"
+# namespace_migration_dry_run = true
+# reconcile_interval = 300
+# catalog_db_path = "./data/arc.db"   # the shared auth database
+# retain_snapshots = 10
+# orphan_sweep_enabled = true
+
+# -----------------------------------------------------------------------------
 # Query Governance (Enterprise)
 # -----------------------------------------------------------------------------
 # Per-token rate limits, quotas and row caps. Defaults here apply to every token

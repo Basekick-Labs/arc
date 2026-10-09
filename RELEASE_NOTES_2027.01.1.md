@@ -1125,6 +1125,52 @@ Three consequences worth knowing before you upgrade:
   be told it is the standby. Enable `cluster.failover_enabled` so exactly one
   holds the lease, or run a single compactor-role node — the same constraint
   Iceberg export already documents.
+### Iceberg export serves a dotted edge-sync spoke, and migrates tables already published under one ([#1129](https://github.com/Basekick-Labs/arc/issues/1129))
+
+An edge-sync spoke ID may contain a dot (`validateSpokeID` rejects `/`, `\`, `:`
+and `..`, but not `.`), and Arc used to fold the spoke/database separator into
+one, publishing a single Iceberg namespace component such as
+`arc_rocket.01.telemetry`. iceberg-go v0.7.0 addresses a namespace whose
+component contains a dot by a JSON-encoded catalog key rather than the plain
+dotted string, so those tables stopped being found — and the v0.7.0 bump
+refused such a database rather than publish one nothing could read.
+
+A spoke pseudo-database `{spoke}/{db}` now keeps its boundary as **two**
+namespace components, `{arc_rocket.01, telemetry}`, and Arc handles the encoded
+catalog key end to end: the warehouse walk recognises the encoded directory, so
+the exporter no longer reads its own metadata back in as a user database, and
+the discovery files are published at the decoded path that directory-based
+readers actually open.
+
+**A spoke ID without a dot is unaffected and needs no migration.** Its catalog
+key is byte-identical to the one Arc wrote before this change —
+`rocket01/telemetry` is `arc_rocket01.telemetry` either way — so those tables
+keep their identity and their history.
+
+**A spoke ID with a dot needs its catalog row rekeyed, and that is previewed
+before it runs.** `iceberg.namespace_migration_dry_run` defaults to **true**:
+each reconcile pass reports the migration it would perform and changes nothing.
+While a table is awaiting migration that measurement is **not exported** — the
+legacy table stays readable and no second table is created beside it — and the
+log names each affected database and measurement every pass, counted as
+`awaiting_namespace_migration` in the pass summary. Set
+`iceberg.namespace_migration_dry_run = false` to apply it.
+
+**The migration rewrites the catalog row and moves nothing on disk.** That is
+deliberate. Iceberg records manifest and data locations as absolute paths inside
+the table metadata, and relocating a table does not rewrite them, so a migration
+that moved the warehouse directory would leave the table's current snapshot
+still reading its manifest chain out of the old directory. Rekeying leaves one
+directory, not two: the table keeps the location it already has, later commits
+write new metadata versions beside the existing ones, and nothing has to be
+cleaned up afterwards. One consequence worth knowing if you browse the
+warehouse: a migrated table's directory keeps its original
+`arc_<spoke>.<db>.db` name, which no longer matches its catalog key. Tables
+created after the upgrade use the encoded name.
+
+The rekey is a single transaction, so it is idempotent and safe to interrupt,
+and it refuses rather than guesses if the row changed underneath it.
+
 ### A year-shaped storage prefix no longer makes tiered queries return zero rows ([#1108](https://github.com/Basekick-Labs/arc/issues/1108))
 
 If `storage.s3_prefix` or `storage.azure_prefix` had three or more segments and
@@ -2455,22 +2501,17 @@ so the orphan sweep from #835 is still the only thing that reclaims metadata fil
 effectively forever to 5 days. Arc passes an explicit age cutoff on every expire, so
 `iceberg.retain_snapshots` remains the only thing that decides how much history is kept.
 
-**A dotted database name is now refused rather than exported.** Arc builds one Iceberg namespace per
-database, `<prefix>_<database>`, and v0.7.0 addresses a namespace whose component contains a dot by
-a different catalog key than the directory Arc writes on disk. A table published that way would be
-unreadable by DuckDB or Spark, would shadow any table already exported for that database, and would
-be walked back in by the exporter as if it were a user database. Arc therefore:
+**A dotted database name is exported through v0.7.0's encoded catalog key.** Arc used to build one
+Iceberg namespace component per database, `<prefix>_<database>`, folding an edge-sync spoke's
+separator into a dot — and v0.7.0 addresses a namespace whose component contains a dot by a
+different catalog key than the plain dotted string. The bump shipped two refusals so nothing was
+published broken: a dotted `iceberg.namespace_prefix` at startup, and a dotted database per
+measurement.
 
-- refuses `iceberg.namespace_prefix` containing a dot at startup, since it would affect every
-  database on the node;
-- refuses an individual database whose name would produce a dotted namespace, logging it and
-  skipping that measurement while the rest of the node keeps exporting.
-
-Arc database names cannot contain a dot, so this is reachable only through an edge-sync spoke ID,
-which may contain one. If you export Iceberg from a hub with such a spoke, that spoke's tables stop
-being published and are reported in the log. Tracked in
-[#1129](https://github.com/Basekick-Labs/arc/issues/1129), which covers both emitting an
-addressable namespace and migrating tables already published under a dotted one.
+The per-database refusal is gone, because the cause is fixed — see the #1129 entry above for how
+spoke namespaces are built now and how tables already published under a dotted one are migrated.
+The `iceberg.namespace_prefix` refusal stays: a prefix is a free choice that would put the encoded
+spelling on every database on the node, and a prefix without a dot costs nothing.
 
 **New transitive dependencies.** v0.7.0 pulls in OpenTelemetry's API, RoaringBitmap and geospatial
 encoders for features Arc does not use (deletion vectors, geometry columns, remote scan planning).

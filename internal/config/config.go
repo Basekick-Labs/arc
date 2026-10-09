@@ -481,12 +481,13 @@ type RetentionConfig struct {
 // (Spark, Trino, DuckDB) can read Arc's data. Disabled by default. The reconciler discovers
 // files by walking the storage backend, so it works in OSS and cluster alike.
 type IcebergConfig struct {
-	Enabled           bool   // Enable the Iceberg export reconciler
-	Warehouse         string // Root URI for Iceberg table metadata (file://… or s3://bucket/prefix); defaults to the storage root
-	NamespacePrefix   string // Iceberg namespace prefix; tables land in "<prefix>_<database>" (default "arc")
-	ReconcileInterval int    // Seconds between reconcile passes (default 300)
-	CatalogDBPath     string // SQLite catalog path; defaults to the shared auth DB
-	RetainSnapshots   int    // Snapshots (and metadata versions) to keep per table; older are expired (default 10)
+	Enabled                  bool   // Enable the Iceberg export reconciler
+	Warehouse                string // Root URI for Iceberg table metadata (file://… or s3://bucket/prefix); defaults to the storage root
+	NamespacePrefix          string // Iceberg namespace prefix; tables land in "<prefix>_<database>" (default "arc")
+	NamespaceMigrationDryRun bool   // Preview migration of legacy dotted namespaces; false applies it
+	ReconcileInterval        int    // Seconds between reconcile passes (default 300)
+	CatalogDBPath            string // SQLite catalog path; defaults to the shared auth DB
+	RetainSnapshots          int    // Snapshots (and metadata versions) to keep per table; older are expired (default 10)
 	// OrphanSweepEnabled gates the metadata orphan sweep (#835): deleting the manifest
 	// lists and manifests under a table's metadata directory that no metadata.json still
 	// on disk can reach. Default true. It is the only deleter in the exporter whose work
@@ -1087,13 +1088,14 @@ func Load() (*Config, error) {
 			DBPath:  v.GetString("retention.db_path"),
 		},
 		Iceberg: IcebergConfig{
-			Enabled:            v.GetBool("iceberg.enabled"),
-			Warehouse:          v.GetString("iceberg.warehouse"),
-			NamespacePrefix:    v.GetString("iceberg.namespace_prefix"),
-			ReconcileInterval:  v.GetInt("iceberg.reconcile_interval"),
-			CatalogDBPath:      v.GetString("iceberg.catalog_db_path"),
-			RetainSnapshots:    v.GetInt("iceberg.retain_snapshots"),
-			OrphanSweepEnabled: v.GetBool("iceberg.orphan_sweep_enabled"),
+			Enabled:                  v.GetBool("iceberg.enabled"),
+			Warehouse:                v.GetString("iceberg.warehouse"),
+			NamespacePrefix:          v.GetString("iceberg.namespace_prefix"),
+			NamespaceMigrationDryRun: v.GetBool("iceberg.namespace_migration_dry_run"),
+			ReconcileInterval:        v.GetInt("iceberg.reconcile_interval"),
+			CatalogDBPath:            v.GetString("iceberg.catalog_db_path"),
+			RetainSnapshots:          v.GetInt("iceberg.retain_snapshots"),
+			OrphanSweepEnabled:       v.GetBool("iceberg.orphan_sweep_enabled"),
 		},
 		ContinuousQuery: ContinuousQueryConfig{
 			Enabled: v.GetBool("continuous_query.enabled"),
@@ -1459,19 +1461,22 @@ func Load() (*Config, error) {
 				"it is the number of snapshots kept per table, and values below 1 would leave "+
 				"snapshot and metadata growth unbounded", cfg.Iceberg.RetainSnapshots)
 		}
-		// A dot in the prefix puts a dot in every namespace component Arc builds
-		// (arc_<database>), and iceberg-go v0.7.0 keys such a namespace by a JSON
-		// encoding instead of the plain dotted string. Arc cannot serve that: the
-		// warehouse directory becomes __iceberg_namespace_v1__:[...].db, which its
-		// own warehouse-directory test does not recognise and would walk back in as
-		// a user database, and the percent-encoded metadata location means no
-		// version-hint.text is published for directory-based readers. Refuse at load
-		// rather than build broken tables for every measurement on the node.
+		// A dot in the prefix puts one in every namespace component Arc builds, and iceberg-go
+		// v0.7.0 keys such a namespace by a JSON encoding instead of the plain dotted string.
+		// Arc does now handle that encoding -- it has to, because an edge-sync spoke ID may carry
+		// a dot (#1129) -- so this is no longer a refusal of something unserveable. It stays a
+		// refusal because it is the one case that is unserveable for NO reason: a prefix is a
+		// free choice that affects every database on the node, every one of their warehouse
+		// directories would carry the encoded spelling, and a plain prefix costs nothing.
+		//
+		// Keeping it also keeps the blast radius of the encoded form down to the spoke IDs that
+		// genuinely need it, which is what makes the migration a bounded set rather than every
+		// table on the node.
 		if strings.Contains(cfg.Iceberg.NamespacePrefix, ".") {
 			return nil, fmt.Errorf("iceberg.namespace_prefix must not contain a dot (got %q): "+
-				"Arc builds one Iceberg namespace component per database as <prefix>_<database>, and a "+
-				"dotted component is addressed differently by the Iceberg catalog, which leaves the "+
-				"table without a readable warehouse directory", cfg.Iceberg.NamespacePrefix)
+				"Arc builds one Iceberg namespace component per database as <prefix>_<database>, and the "+
+				"Iceberg catalog addresses a dotted component through an encoded key, which would apply "+
+				"to every database on this node; choose a prefix without a dot", cfg.Iceberg.NamespacePrefix)
 		}
 	}
 
@@ -1866,6 +1871,7 @@ func setDefaults(v *viper.Viper) {
 	// Iceberg export defaults (opt-in; disabled by default)
 	v.SetDefault("iceberg.enabled", false)
 	v.SetDefault("iceberg.namespace_prefix", "arc")
+	v.SetDefault("iceberg.namespace_migration_dry_run", true)
 	v.SetDefault("iceberg.reconcile_interval", 300)          // seconds
 	v.SetDefault("iceberg.catalog_db_path", "./data/arc.db") // shared SQLite DB with auth
 	v.SetDefault("iceberg.retain_snapshots", 10)

@@ -3818,6 +3818,10 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize Iceberg exporter")
 		}
+		exporter.ConfigureNamespaceMigrationDryRun(cfg.Iceberg.NamespaceMigrationDryRun)
+		if cfg.Iceberg.NamespaceMigrationDryRun {
+			log.Info().Msg("Iceberg dotted-namespace migration is in dry-run mode; set iceberg.namespace_migration_dry_run=false after reviewing the migration plan to apply it")
+		}
 		// #835: reclaim the manifest files that expired snapshots and dropped
 		// transactions leave behind. Grace is derived from the reconcile interval
 		// (floored at an hour inside the exporter) so an unreachable manifest is
