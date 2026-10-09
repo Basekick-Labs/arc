@@ -99,6 +99,15 @@ arc:
     # - name: ARC_AUTH_ENABLED
     #   value: "true"
 
+# Pre-set the initial admin token instead of retrieving the generated token
+# from the pod logs. Existing tokens are preserved on reinstall.
+# `value` must be at least 32 characters long. When existingSecret is set, it
+# must contain the key `bootstrap-token`.
+auth:
+  bootstrapToken:
+    existingSecret: ""
+    value: ""
+
 # Persistent storage for Arc data
 persistence:
   enabled: true

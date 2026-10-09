@@ -171,7 +171,7 @@ jobs:
   # A rendered-template check, in its own job because it needs helm and not Go.
   # It is fast and has no build step, so it reports long before Build & Test.
   chart:
-    name: Enterprise chart
+    name: Helm charts
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -183,6 +183,9 @@ jobs:
       - uses: azure/setup-helm@v4
         with:
           version: v3.16.4
+
+      - name: OSS chart configuration and bootstrap token
+        run: bash scripts/test_oss_helm_chart.sh helm/arc
 
       # Every Arc pod joins Raft, whatever its role. A role whose pod has no
       # advertisable Raft address falls back to standalone mode and is
