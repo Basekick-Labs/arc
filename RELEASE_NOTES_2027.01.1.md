@@ -718,6 +718,14 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Restore OSS Helm chart configuration resources ([#1194](https://github.com/Basekick-Labs/arc/issues/1194))
+
+The OSS chart now renders the ConfigMap mounted when `arc.config.enabled` is
+set. New chart templates are no longer hidden by the binary ignore rule, and
+the chart can pass a bootstrap token through a generated or existing Secret.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1198](https://github.com/Basekick-Labs/arc/pull/1198).
+
 ### Delete API removes the inactive SQL Server prefix scan ([#1077](https://github.com/Basekick-Labs/arc/issues/1077))
 
 The WHERE validator no longer lists or checks `xp_` and `sp_`. The lowercase
