@@ -431,6 +431,41 @@ func TestLocalBackend_ReadToAt(t *testing.T) {
 			t.Error("expected error for missing file, got nil")
 		}
 	})
+
+	t.Run("staged partial is not a committed file", func(t *testing.T) {
+		const path = "db/tbl/staged.parquet"
+		stagedPath, err := backend.stagedPath(path)
+		if err != nil {
+			t.Fatalf("stagedPath: %v", err)
+		}
+		if err := os.MkdirAll(filepath.Dir(stagedPath), 0700); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		partial := []byte("uncommitted partial")
+		if err := os.WriteFile(stagedPath, partial, 0600); err != nil {
+			t.Fatalf("WriteFile staged partial: %v", err)
+		}
+
+		var buf bytes.Buffer
+		if err := backend.ReadToAt(ctx, path, &buf, 0); err == nil {
+			t.Fatal("ReadToAt unexpectedly read a staged partial as a committed file")
+		}
+		if buf.Len() != 0 {
+			t.Fatalf("ReadToAt wrote %q before failing, want no bytes", buf.Bytes())
+		}
+
+		var staged bytes.Buffer
+		inspector, ok := any(backend).(StagingInspector)
+		if !ok {
+			t.Fatal("LocalBackend does not implement StagingInspector")
+		}
+		if err := inspector.ReadStaged(ctx, path, &staged); err != nil {
+			t.Fatalf("ReadStaged: %v", err)
+		}
+		if !bytes.Equal(staged.Bytes(), partial) {
+			t.Fatalf("ReadStaged = %q, want %q", staged.Bytes(), partial)
+		}
+	})
 }
 
 // TestLocalBackend_AppendReader verifies that AppendingBackend is implemented,

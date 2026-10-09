@@ -1839,8 +1839,7 @@ func (p *Puller) writeFileTail(ctx context.Context, entry *raft.FileEntry, r io.
 // committed file, and is refused outright when a committed file exists. Using
 // the staging interface for both operations also prevents a committed file
 // appearing between the size and read calls from changing which bytes are
-// hashed. ReadToAt can read staged data when no committed file exists, so it
-// must not be paired with a committed-file size when building a resume hash.
+// hashed.
 func (p *Puller) tryResumeFromPartial(log zerolog.Logger, entry *raft.FileEntry) (int64, hash.Hash) {
 	si, ok := p.cfg.Backend.(storage.StagingInspector)
 	if !ok {

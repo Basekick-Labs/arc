@@ -718,6 +718,16 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Local `ReadToAt` no longer returns staged partials ([#1199](https://github.com/Basekick-Labs/arc/issues/1199))
+
+`ReadToAt` now reads committed objects only. Local staged data remains available
+through `StagingInspector`, which the replication puller uses to resume
+transfers. This keeps the read contract aligned with `StatFile` and prevents a
+caller from combining committed-file metadata with bytes from an uncommitted
+partial.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1203](https://github.com/Basekick-Labs/arc/pull/1203).
+
 ### Delete API removes the inactive SQL Server prefix scan ([#1077](https://github.com/Basekick-Labs/arc/issues/1077))
 
 The WHERE validator no longer lists or checks `xp_` and `sp_`. The lowercase
@@ -781,12 +791,9 @@ can see change with it, all in the safe direction:
 - a backup counts such a path as absent — and says so in its incomplete
   sample — instead of recording a partial's size and then failing to copy it.
 
-One asymmetry to know about, because it is the thing most easily got wrong
-from the sentence above: **`ReadToAt` still serves staged data** when no
-committed file exists. The resume path depends on that. So a caller must not
-pair a committed-only `StatFile` size with a `ReadToAt` read and assume both
-saw the same bytes; the interface comments now say so, and making `ReadToAt`
-honest too is tracked separately.
+Staged partials are accessed through `StagingInspector`; `ReadToAt` reads
+committed files only. This is consistent with the contract described above and
+is covered separately under #1199.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1190](https://github.com/Basekick-Labs/arc/pull/1190).
 
