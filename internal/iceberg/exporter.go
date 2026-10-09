@@ -1554,7 +1554,12 @@ func decodedURIPath(raw string) string {
 // is a consistency nit, never a commit failure.
 func (e *Exporter) hardenLocalMetadataPerms(metaLoc string) {
 	const scheme = "file://"
-	resolved := resolveFileURI(metaLoc)
+	// decodedURIPath before trimming: localFileURI percent-encodes, and an encoded namespace
+	// directory contains characters it escapes ("[" becomes %5B), so a raw TrimPrefix yields a
+	// path os.ReadDir cannot open. This function returns silently on a read error, so without the
+	// decode it would be a no-op for exactly the dotted tables it now has to harden, leaving
+	// iceberg-go's 0644 metadata world-readable.
+	resolved := decodedURIPath(resolveFileURI(metaLoc))
 	if !strings.HasPrefix(resolved, scheme) {
 		return
 	}
@@ -1725,7 +1730,11 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 	// deleted by the caller); remove the namespace directory's objects via
 	// the backend so local and object-store warehouses behave alike.
 	if e.backend != nil {
-		nsDirURI := e.warehouse + "/" + e.nsPrefix + "_" + database + ".db"
+		// catalogNamespaceKey, not a second concatenation of nsPrefix and the database: the SQL
+		// catalog names a namespace directory after the key it stores, and for a namespace whose
+		// component contains a dot that key is JSON-encoded (#1129). Re-deriving the plain form
+		// here would list a directory that does not exist and leave the real one behind.
+		nsDirURI := e.warehouse + "/" + catalogNamespaceKey(ns) + ".db"
 		// relDir == "" means the namespace directory IS the storage root, so
 		// relDir+"/" would be "/", which the storage key contract refuses
 		// (#743). It listed empty before, and enumerating the whole root to

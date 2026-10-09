@@ -3,22 +3,70 @@ package iceberg
 import (
 	"context"
 	"database/sql"
-	"net/url"
 	"os"
-	"path"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/apache/iceberg-go/table"
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog"
 
 	"github.com/basekick-labs/arc/internal/storage"
 )
 
-func TestDottedNamespaceMigrationDryRunThenApply(t *testing.T) {
+// A spoke ID WITHOUT a dot must keep the exact catalog key Arc wrote before #1129, because that
+// key is the table's identity: if it changed, every existing spoke table would stop being found
+// and the exporter would publish a second one beside it -- the orphaning #1129 exists to prevent.
+//
+// The old scheme is spelled out here rather than called, deliberately. It no longer exists in the
+// tree (sanitizeNamespaceDB is gone), so a test that ran current code on both sides would compare
+// it against itself and pass whatever either side did.
+func TestSpokeCatalogKeyCompatibility(t *testing.T) {
+	// The pre-#1129 scheme: one namespace component, separator folded into a dot.
+	legacyKey := func(nsPrefix, database string) string {
+		return nsPrefix + "_" + strings.ReplaceAll(database, "/", ".")
+	}
+
+	for _, tc := range []struct {
+		database  string
+		unchanged bool // true: same key, no migration; false: key moves, migration required
+	}{
+		{"rocket01/telemetry", true},
+		{"site01/metrics", true},
+		{"plant2/db", true},
+		{"rocket-01/telemetry", true},
+		{"mydb", true},
+		{"rocket.01/telemetry", false},
+		{"site.a/metrics", false},
+	} {
+		t.Run(tc.database, func(t *testing.T) {
+			namespace, err := namespaceIdentifier("arc", tc.database)
+			if err != nil {
+				t.Fatalf("namespaceIdentifier(%q): %v", tc.database, err)
+			}
+			got, legacy := catalogNamespaceKey(namespace), legacyKey("arc", tc.database)
+			if tc.unchanged && got != legacy {
+				t.Fatalf("catalog key for %q moved: %q != legacy %q; every table under the legacy key would be orphaned",
+					tc.database, got, legacy)
+			}
+			if !tc.unchanged && got == legacy {
+				t.Fatalf("catalog key for %q is unchanged (%q); legacyNamespaceCandidates would skip it and the fix would be inert",
+					tc.database, got)
+			}
+		})
+	}
+}
+
+// The migration rekeys the catalog row and moves NOTHING on disk.
+//
+// The fixture is built in the order a real pre-upgrade deployment produced: the table is placed at
+// the legacy warehouse location FIRST and only then given its snapshot, so the manifest chain is
+// written under the legacy tree and is internally consistent there. Seeding the other way round --
+// reconciling first and relocating the metadata afterwards -- leaves the manifests under the
+// target directory, which is the one state in which a relocating migration appears to work, and
+// is why the first version of this test could not see that a copy-and-repoint migration left the
+// live chain behind (the copies in the new tree were referenced by nothing).
+func TestDottedNamespaceMigrationRekeysWithoutMovingFiles(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
@@ -36,233 +84,185 @@ func TestDottedNamespaceMigrationDryRunThenApply(t *testing.T) {
 	}
 
 	database, measurement := "rocket.01/telemetry", "cpu"
+	identifier := exp.tableIdent(database, measurement)
+	encodedNamespace := catalogNamespaceKey(identifier[:len(identifier)-1])
+	legacyNamespace := "arc_rocket.01.telemetry"
+
 	dataPath := filepath.Join(root, "rocket.01", "telemetry", measurement, "2026", "07", "14", "15", "a.parquet")
 	writeArcStyleParquet(t, dataPath, 1_752_500_000_000_000, 2)
 	schema, err := UnionSchema(ctx, []string{dataPath})
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	// Place the table at the legacy location BEFORE it has any snapshot.
+	if _, err := exp.EnsureTable(ctx, database, measurement, schema); err != nil {
+		t.Fatal(err)
+	}
+	legacyTableURI := localFileURI(filepath.Join(root, legacyNamespace+".db", measurement))
+	if _, _, err := exp.catalog.CommitTable(ctx, identifier, nil,
+		[]table.Update{table.NewSetLocationUpdate(legacyTableURI)}); err != nil {
+		t.Fatal(err)
+	}
+	// Now give it its data, so the snapshot and its manifests are written under the legacy tree.
 	if err := exp.ReconcileMeasurement(ctx, database, measurement, schema, []FileRef{refOf(t, dataPath)}); err != nil {
-		t.Fatalf("seed dotted spoke table: %v", err)
+		t.Fatal(err)
+	}
+	// Drop the directory EnsureTable made under the encoded key: a pre-upgrade deployment never
+	// had one, and leaving it would hide a migration that writes there.
+	encodedDir := filepath.Join(root, encodedNamespace+".db")
+	if err := os.RemoveAll(encodedDir); err != nil {
+		t.Fatal(err)
 	}
 
-	identifier := exp.tableIdent(database, measurement)
-	newNamespace := catalogNamespaceKey(identifier[:len(identifier)-1])
-	oldNamespace := "arc_rocket.01.telemetry"
-	oldTableLocation := localFileURI(filepath.Join(root, oldNamespace+".db", measurement))
-	if _, _, err := exp.catalog.CommitTable(ctx, identifier, nil,
-		[]table.Update{table.NewSetLocationUpdate(oldTableLocation)}); err != nil {
-		t.Fatalf("place seeded table at legacy warehouse location: %v", err)
-	}
 	legacyTable, err := exp.catalog.LoadTable(ctx, identifier)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if !metadataHasNamespaceDirectory(legacyTable.MetadataLocation(), oldNamespace, measurement) {
-		t.Fatalf("seed table metadata did not move to legacy directory: %s", legacyTable.MetadataLocation())
 	}
 	if legacyTable.CurrentSnapshot() == nil {
 		t.Fatal("seed table has no snapshot")
 	}
 	legacySnapshotID := legacyTable.CurrentSnapshot().SnapshotID
+	legacyManifestList := legacyTable.CurrentSnapshot().ManifestList
+	legacyMetadataLocation := legacyTable.MetadataLocation()
+	if !strings.Contains(legacyManifestList, legacyNamespace+".db") {
+		t.Fatalf("fixture is not faithful: manifest list %q is not under the legacy tree", legacyManifestList)
+	}
 	legacyFiles, err := exp.tableDataFiles(ctx, legacyTable)
 	if err != nil {
 		t.Fatal(err)
 	}
-	targetBeforeDryRun := tableTreeHashes(t, ctx, exp, path.Join(newNamespace+".db", measurement))
-	if len(targetBeforeDryRun) == 0 {
-		t.Fatal("seeded target directory unexpectedly has no files")
-	}
 
-	// Model a pre-upgrade SQL catalog row while retaining a namespace property that the migration
-	// must carry forward. The row points to the real legacy table location and snapshot history.
+	// Model the pre-upgrade catalog row, plus a namespace property the migration must carry.
 	if _, err := db.ExecContext(ctx,
 		`UPDATE iceberg_tables SET table_namespace = ? WHERE catalog_name = ? AND table_namespace = ? AND table_name = ?`,
-		oldNamespace, "arc", newNamespace, measurement); err != nil {
+		legacyNamespace, "arc", encodedNamespace, measurement); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.ExecContext(ctx,
 		`INSERT INTO iceberg_namespace_properties (catalog_name, namespace, property_key, property_value) VALUES (?, ?, ?, ?)`,
-		"arc", oldNamespace, "migration-test", "preserve-me"); err != nil {
+		"arc", legacyNamespace, "migration-test", "preserve-me"); err != nil {
 		t.Fatal(err)
 	}
 
 	measurements := []Measurement{{Database: database, Measurement: measurement}}
+	key := measurementKey(database, measurement)
+
+	// Dry run: blocks the measurement, changes nothing.
 	blocked, err := exp.MigrateDottedNamespaces(ctx, measurements)
 	if err != nil {
 		t.Fatalf("dry-run plan: %v", err)
 	}
-	if _, ok := blocked[database+"\x00"+measurement]; !ok {
-		t.Fatal("dry-run did not block reconciliation of the legacy table")
+	if _, ok := blocked[key]; !ok {
+		t.Fatal("dry run did not block reconciliation of the legacy table")
 	}
-	assertCatalogNamespace(t, ctx, db, oldNamespace, measurement)
-	if !metadataHasNamespaceDirectory(legacyTable.MetadataLocation(), oldNamespace, measurement) {
-		t.Fatal("dry-run changed the legacy metadata location")
-	}
-	if targetAfterDryRun := tableTreeHashes(t, ctx, exp, path.Join(newNamespace+".db", measurement)); !reflect.DeepEqual(targetAfterDryRun, targetBeforeDryRun) {
-		t.Fatal("dry-run changed the target table tree")
-	}
+	assertCatalogNamespace(t, ctx, db, legacyNamespace, measurement)
 
-	// Leave an interrupted migration after the target files and catalog namespace are in place,
-	// but before the table metadata location moves. The next reconcile must finish it safely.
+	// Apply.
 	exp.ConfigureNamespaceMigrationDryRun(false)
-	migration := namespaceMigration{
-		database: database, measurement: measurement, identifier: identifier,
-		oldNamespace: oldNamespace, newNamespace: newNamespace,
-		catalogNamespace: oldNamespace, metadataLocation: legacyTable.MetadataLocation(),
-	}
-	targetMetadata, _, err := relocatedMetadataLocation(legacyTable.MetadataLocation(), oldNamespace, newNamespace, measurement)
-	if err != nil {
-		t.Fatal(err)
-	}
-	oldMetadataKey, ok := exp.warehouseRelKey(legacyTable.MetadataLocation())
-	if !ok {
-		t.Fatal("legacy metadata location is not addressable")
-	}
-	newMetadataKey, ok := exp.warehouseRelKey(targetMetadata)
-	if !ok {
-		t.Fatal("target metadata location is not addressable")
-	}
-	if err := exp.copyAndVerifyTableTree(ctx, path.Dir(path.Dir(oldMetadataKey)), path.Dir(path.Dir(newMetadataKey))); err != nil {
-		t.Fatalf("stage interrupted table tree copy: %v", err)
-	}
-	if err := exp.rekeyNamespaceTable(ctx, migration); err != nil {
-		t.Fatalf("stage interrupted catalog rekey: %v", err)
-	}
-	assertCatalogNamespace(t, ctx, db, newNamespace, measurement)
 	blocked, err = exp.MigrateDottedNamespaces(ctx, measurements)
 	if err != nil {
-		t.Fatalf("apply migration: %v", err)
+		t.Fatalf("apply: %v", err)
 	}
-	if _, ok := blocked[database+"\x00"+measurement]; ok {
-		t.Fatal("successful migration left the measurement blocked")
+	if _, ok := blocked[key]; ok {
+		t.Fatal("a successful migration left the measurement blocked")
 	}
-	assertCatalogNamespace(t, ctx, db, newNamespace, measurement)
+	assertCatalogNamespace(t, ctx, db, encodedNamespace, measurement)
+
+	// Nothing moved: no directory under the encoded key at all.
+	if _, err := os.Stat(encodedDir); !os.IsNotExist(err) {
+		t.Errorf("migration created %s; it must rekey the catalog row and move nothing (err=%v)", encodedDir, err)
+	}
 
 	migrated, err := exp.catalog.LoadTable(ctx, identifier)
 	if err != nil {
 		t.Fatalf("load migrated table: %v", err)
 	}
-	if !metadataHasNamespaceDirectory(migrated.MetadataLocation(), newNamespace, measurement) {
-		t.Fatalf("migrated metadata location is not under target namespace: %s", migrated.MetadataLocation())
+	if got := migrated.MetadataLocation(); got != legacyMetadataLocation {
+		t.Errorf("metadata location changed: %q != %q", got, legacyMetadataLocation)
 	}
 	if migrated.CurrentSnapshot() == nil || migrated.CurrentSnapshot().SnapshotID != legacySnapshotID {
 		t.Fatalf("migration changed the current snapshot: got %v, want %d", migrated.CurrentSnapshot(), legacySnapshotID)
 	}
+	if got := migrated.CurrentSnapshot().ManifestList; got != legacyManifestList {
+		t.Errorf("manifest list changed: %q != %q", got, legacyManifestList)
+	}
 	migratedFiles, err := exp.tableDataFiles(ctx, migrated)
+	if err != nil {
+		t.Fatalf("migrated table is not readable: %v", err)
+	}
+	if len(migratedFiles) != len(legacyFiles) || len(migratedFiles) == 0 {
+		t.Fatalf("migrated table lists %d data files, want %d", len(migratedFiles), len(legacyFiles))
+	}
+
+	// The namespace property moved with the row.
+	var value string
+	if err := db.QueryRowContext(ctx,
+		`SELECT property_value FROM iceberg_namespace_properties WHERE catalog_name = ? AND namespace = ? AND property_key = ?`,
+		"arc", encodedNamespace, "migration-test").Scan(&value); err != nil {
+		t.Fatalf("namespace property did not move: %v", err)
+	}
+	if value != "preserve-me" {
+		t.Errorf("namespace property value = %q, want preserve-me", value)
+	}
+
+	// Idempotent: a second pass finds nothing to do and blocks nothing.
+	blocked, err = exp.MigrateDottedNamespaces(ctx, measurements)
+	if err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+	if len(blocked) != 0 {
+		t.Errorf("second pass blocked %v, want nothing", blocked)
+	}
+	assertCatalogNamespace(t, ctx, db, encodedNamespace, measurement)
+}
+
+// The rekey refuses a row that changed under it rather than updating a different number of rows
+// than it planned for. Without the RowsAffected check an UPDATE matching nothing is silently a
+// success, and the measurement is unblocked while its table is still under the legacy key.
+func TestRekeyRefusesWhenTheRowDidNotMatch(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(migratedFiles) != len(legacyFiles) {
-		t.Fatalf("migrated table has %d data files, legacy table had %d", len(migratedFiles), len(legacyFiles))
-	}
-	for file, size := range legacyFiles {
-		if migratedFiles[file] != size {
-			t.Fatalf("migrated table changed file %s size: got %d, want %d", file, migratedFiles[file], size)
-		}
-	}
-	if _, err := os.Stat(filepath.Join(root, oldNamespace+".db", measurement, "metadata")); err != nil {
-		t.Fatalf("legacy metadata chain was not retained: %v", err)
-	}
-	var property string
-	if err := db.QueryRowContext(ctx,
-		`SELECT property_value FROM iceberg_namespace_properties WHERE catalog_name = ? AND namespace = ? AND property_key = ?`,
-		"arc", newNamespace, "migration-test").Scan(&property); err != nil {
-		t.Fatalf("load migrated namespace property: %v", err)
-	}
-	if property != "preserve-me" {
-		t.Fatalf("migrated namespace property = %q, want preserve-me", property)
-	}
-
-	_, ok = exp.warehouseRelKey(migrated.MetadataLocation())
-	if !ok {
-		t.Fatal("migrated metadata location is not addressable by storage backend")
-	}
-	version, versionDir, ok := exp.parseVersionAndMetaDir(migrated.MetadataLocation())
-	if !ok {
-		t.Fatalf("parse migrated metadata location %q", migrated.MetadataLocation())
-	}
-	versionHint, err := backend.Read(ctx, path.Join(versionDir, "version-hint.text"))
+	db, err := sql.Open("sqlite3", filepath.Join(root, "catalog.db"))
 	if err != nil {
-		t.Fatalf("read migrated version-hint: %v", err)
+		t.Fatal(err)
 	}
-	if string(versionHint) != version {
-		t.Fatalf("version-hint = %q, want %q", versionHint, version)
-	}
-	versionedMetadataKey := path.Join(versionDir, "v"+version+".metadata.json")
-	if _, err := backend.Read(ctx, versionedMetadataKey); err != nil {
-		t.Fatalf("read migrated v<N>.metadata.json: %v", err)
-	}
-
-	// A second startup pass must recognize the completed migration and do no further work.
-	blocked, err = exp.MigrateDottedNamespaces(ctx, measurements)
+	t.Cleanup(func() { _ = db.Close() })
+	exp, err := NewExporter(db, backend, localFileURI(root), "arc", 10, zerolog.Nop())
 	if err != nil {
-		t.Fatalf("repeat migration: %v", err)
+		t.Fatal(err)
 	}
-	if len(blocked) != 0 {
-		t.Fatalf("completed migration returned blocked measurements: %v", blocked)
+	// Create the catalog schema by touching it once.
+	if _, err := exp.namespaceTableRows(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	err = exp.rekeyNamespaceTable(ctx, namespaceMigration{
+		database:     "rocket.01/telemetry",
+		measurement:  "cpu",
+		oldNamespace: "arc_rocket.01.telemetry", // no such row
+		newNamespace: `__iceberg_namespace_v1__:["arc_rocket.01","telemetry"]`,
+	})
+	if err == nil {
+		t.Fatal("rekey of a row that does not exist reported success")
+	}
+	if !strings.Contains(err.Error(), "0 rows updated") {
+		t.Errorf("error does not name the cause: %v", err)
 	}
 }
 
-func tableTreeHashes(t *testing.T, ctx context.Context, exp *Exporter, prefix string) map[string]string {
-	t.Helper()
-	objects, err := exp.backend.List(ctx, strings.TrimSuffix(prefix, "/")+"/")
-	if err != nil {
-		t.Fatalf("list table tree %q: %v", prefix, err)
-	}
-	hashes := make(map[string]string, len(objects))
-	for _, object := range objects {
-		hash, err := exp.hashObject(ctx, object)
-		if err != nil {
-			t.Fatalf("hash table object %q: %v", object, err)
-		}
-		hashes[object] = hash
-	}
-	return hashes
-}
-
-func TestRelativeTableObjectPathRejectsTraversal(t *testing.T) {
-	for _, source := range []string{
-		"legacy.db/cpu/../other.parquet",
-		"legacy.db/cpu//metadata.json",
-		"legacy.db/cpu/../../outside",
-		"legacy.db/cpu/",
-	} {
-		if _, err := relativeTableObjectPath(source, "legacy.db/cpu"); err == nil {
-			t.Errorf("relativeTableObjectPath(%q) accepted an unsafe key", source)
-		}
-	}
-	got, err := relativeTableObjectPath("legacy.db/cpu/metadata/v2.json", "legacy.db/cpu")
-	if err != nil || got != "metadata/v2.json" {
-		t.Fatalf("relativeTableObjectPath returned %q, %v; want metadata/v2.json", got, err)
-	}
-}
-
-func TestRelocatedMetadataLocationRejectsMissingScheme(t *testing.T) {
-	if _, _, err := relocatedMetadataLocation("/warehouse/legacy.db/cpu/metadata/v1.metadata.json", "legacy", "target", "cpu"); err == nil {
-		t.Fatal("relocatedMetadataLocation accepted a path without a URI scheme")
-	}
-}
-
+// localFileURI percent-encodes, so an encoded namespace directory survives a URI round trip.
 func TestLocalFileURIEncodesReservedPathCharacters(t *testing.T) {
-	localPath := filepath.Join(t.TempDir(), "arc data?#%", "warehouse")
-	uri := localFileURI(localPath)
-	parsed, err := url.Parse(uri)
-	if err != nil {
-		t.Fatalf("parse local file URI %q: %v", uri, err)
+	uri := localFileURI(`/tmp/__iceberg_namespace_v1__:["arc_rocket.01","telemetry"].db/cpu`)
+	if !strings.Contains(uri, "%5B") || !strings.Contains(uri, "%22") {
+		t.Errorf("localFileURI did not escape reserved characters: %s", uri)
 	}
-	if parsed.RawQuery != "" || parsed.Fragment != "" {
-		t.Fatalf("local path was parsed as query or fragment: %q", uri)
-	}
-	wantPath := filepath.ToSlash(localPath)
-	if !filepath.IsAbs(localPath) {
-		t.Fatal("test path is not absolute")
-	}
-	if !strings.HasPrefix(wantPath, "/") {
-		wantPath = "/" + wantPath
-	}
-	if parsed.Path != wantPath {
-		t.Fatalf("local file URI path = %q, want %q", parsed.Path, wantPath)
+	if got, want := decodedURIPath(uri), `file:///tmp/__iceberg_namespace_v1__:["arc_rocket.01","telemetry"].db/cpu`; got != want {
+		t.Errorf("decodedURIPath(localFileURI(p)) = %q, want %q", got, want)
 	}
 }
 
@@ -272,9 +272,97 @@ func assertCatalogNamespace(t *testing.T, ctx context.Context, db *sql.DB, want,
 	if err := db.QueryRowContext(ctx,
 		`SELECT table_namespace FROM iceberg_tables WHERE catalog_name = ? AND table_name = ?`,
 		"arc", measurement).Scan(&got); err != nil {
-		t.Fatal(err)
+		t.Fatalf("read catalog namespace: %v", err)
 	}
 	if got != want {
 		t.Fatalf("catalog namespace = %q, want %q", got, want)
 	}
+}
+
+// oneMeasurementSource serves a single measurement whose database is a dotted spoke, which the
+// storage walk cannot produce on its own (it needs a spoke registry to expand namespaces).
+type oneMeasurementSource struct {
+	measurement Measurement
+	files       []FileRef
+	local       []string
+}
+
+func (s *oneMeasurementSource) Measurements(context.Context) ([]Measurement, error) {
+	return []Measurement{s.measurement}, nil
+}
+func (s *oneMeasurementSource) Files(context.Context, Measurement) ([]FileRef, error) {
+	return s.files, nil
+}
+func (s *oneMeasurementSource) LocalFiles(context.Context, Measurement) ([]string, error) {
+	return s.local, nil
+}
+func (s *oneMeasurementSource) FilesAndLocal(context.Context, Measurement) ([]FileRef, []string, error) {
+	return s.files, s.local, nil
+}
+
+// The scheduler must ACT on the blocked set, not merely receive it.
+//
+// This is the whole point of the mechanism: while a legacy row is still under its dotted key, the
+// table is unreachable under the identifier tableIdent builds, so a reconcile would not find it
+// and EnsureTable would create a SECOND table beside the readable one -- the orphaning #1129
+// exists to prevent. Deleting the gate in runPass leaves every other test in this package green,
+// which is why this one exists and asserts on the catalog row count rather than on a log line.
+func TestSchedulerSkipsMeasurementsAwaitingNamespaceMigration(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", filepath.Join(root, "catalog.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	exp, err := NewExporter(db, backend, localFileURI(root), "arc", 10, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	database, measurement := "rocket.01/telemetry", "cpu"
+	identifier := exp.tableIdent(database, measurement)
+	encodedNamespace := catalogNamespaceKey(identifier[:len(identifier)-1])
+	legacyNamespace := "arc_rocket.01.telemetry"
+
+	dataPath := filepath.Join(root, "rocket.01", "telemetry", measurement, "2026", "07", "14", "15", "a.parquet")
+	writeArcStyleParquet(t, dataPath, 1_752_500_000_000_000, 2)
+	schema, err := UnionSchema(ctx, []string{dataPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.ReconcileMeasurement(ctx, database, measurement, schema, []FileRef{refOf(t, dataPath)}); err != nil {
+		t.Fatal(err)
+	}
+	// Pre-upgrade catalog row: under the legacy dotted key.
+	if _, err := db.ExecContext(ctx,
+		`UPDATE iceberg_tables SET table_namespace = ? WHERE catalog_name = ? AND table_namespace = ? AND table_name = ?`,
+		legacyNamespace, "arc", encodedNamespace, measurement); err != nil {
+		t.Fatal(err)
+	}
+
+	src := &oneMeasurementSource{
+		measurement: Measurement{Database: database, Measurement: measurement},
+		files:       []FileRef{refOf(t, dataPath)},
+		local:       []string{dataPath},
+	}
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: src, Logger: zerolog.Nop()})
+
+	// Dry-run is the default, so the measurement stays blocked for this pass.
+	sched.runPass(ctx)
+
+	var rows int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM iceberg_tables WHERE catalog_name = ? AND table_name = ?`,
+		"arc", measurement).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Fatalf("catalog holds %d rows for %s, want 1: the pass reconciled a measurement awaiting migration and created a duplicate table", rows, measurement)
+	}
+	assertCatalogNamespace(t, ctx, db, legacyNamespace, measurement)
 }

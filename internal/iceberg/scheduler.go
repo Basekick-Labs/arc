@@ -152,12 +152,23 @@ func (s *Scheduler) runPass(ctx context.Context) {
 		s.logger.Error().Err(err).Msg("Iceberg reconcile: failed to enumerate measurements")
 		return
 	}
-	blocked, err := s.exporter.MigrateDottedNamespaces(ctx, measurements)
+	// Bounded like a measurement, and for the same reason: this reads the shared SQLite catalog
+	// (auth, audit and tiering write to it too), and an unbounded call here would hold the whole
+	// pass open until shutdown rather than until the next tick (#1154).
+	nsctx, nscancel := context.WithTimeout(ctx, measurementTimeout)
+	blocked, err := s.exporter.MigrateDottedNamespaces(nsctx, measurements)
+	nscancel()
 	if err != nil {
-		s.logger.Error().Err(err).Msg("Iceberg reconcile: failed to inspect dotted-namespace migration; pass skipped")
-		return
+		// Do NOT return: the only error source is reading the catalog table list, and on a
+		// SQLITE_BUSY against the shared DB that would skip every measurement on the node rather
+		// than the few a migration concerns. An empty blocked set is the safe fallback -- a
+		// legacy dotted table is then reconciled, which at worst creates the duplicate the
+		// migration would have prevented, so the warning names that risk explicitly.
+		s.logger.Warn().Err(err).
+			Msg("Iceberg reconcile: could not read the catalog to plan dotted-namespace migration; continuing without it. A database whose Iceberg namespace contains a dot may get a second table this pass")
+		blocked = nil
 	}
-	var ok, failed, skipped int
+	var ok, failed, skipped, awaitingMigration int
 	seen := make(map[string]struct{}, len(measurements))
 	for _, m := range measurements {
 		if ctx.Err() != nil { // shutdown mid-pass
@@ -166,9 +177,12 @@ func (s *Scheduler) runPass(ctx context.Context) {
 		key := m.Database + "\x00" + m.Measurement
 		seen[key] = struct{}{}
 		if _, blocked := blocked[key]; blocked {
-			s.logger.Warn().Str("database", m.Database).Str("measurement", m.Measurement).
-				Msg("Iceberg reconcile skipped until dotted-namespace migration is reviewed or succeeds")
-			skipped++
+			// Counted apart from `skipped`, which means "fingerprint unchanged, nothing to do".
+			// Folding the two together would report a permanently unexported measurement in the
+			// same number as a healthy no-op, and the pass summary would look clean. The
+			// per-measurement reason is logged by MigrateDottedNamespaces, which has it; this
+			// layer only counts (one log line per fact -- SQLite checklist item 7).
+			awaitingMigration++
 			continue
 		}
 		mctx, cancel := context.WithTimeout(ctx, measurementTimeout)
@@ -193,8 +207,11 @@ func (s *Scheduler) runPass(ctx context.Context) {
 			delete(s.state, k)
 		}
 	}
-	s.logger.Info().Int("reconciled", ok).Int("unchanged", skipped).Int("failed", failed).
-		Msg("Iceberg reconcile pass complete")
+	event := s.logger.Info().Int("reconciled", ok).Int("unchanged", skipped).Int("failed", failed)
+	if awaitingMigration > 0 {
+		event = event.Int("awaiting_namespace_migration", awaitingMigration)
+	}
+	event.Msg("Iceberg reconcile pass complete")
 }
 
 // reconcileOne reconciles one measurement, returning whether it did work (changed=true) or was

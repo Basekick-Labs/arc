@@ -314,7 +314,7 @@ s3_cache_ttl_seconds = 3600
 # namespace_prefix = "arc"
 # namespace_migration_dry_run = true
 # reconcile_interval = 300
-# catalog_db_path = ""                # defaults to the shared auth database
+# catalog_db_path = "./data/arc.db"   # the shared auth database
 # retain_snapshots = 10
 # orphan_sweep_enabled = true
 

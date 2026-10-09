@@ -2,20 +2,19 @@ package iceberg
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/url"
-	"path"
-	"sort"
 	"strings"
 
 	"github.com/apache/iceberg-go/table"
 )
 
+// encodedNamespacePrefix is the marker iceberg-go v0.7.0's SQL catalog puts in
+// front of a JSON-encoded namespace key. It encodes a namespace whose component
+// contains a dot rather than storing the plain dotted string, because that
+// string belongs to a different namespace (catalog/sql: namespaceStorageKeys
+// refuses the legacy key for exactly that reason).
 const encodedNamespacePrefix = "__iceberg_namespace_v1__:"
 
 type namespaceTableRow struct {
@@ -24,14 +23,12 @@ type namespaceTableRow struct {
 	metadataLocation sql.NullString
 }
 
+// namespaceMigration is one catalog row to rekey, and the measurement it serves.
 type namespaceMigration struct {
-	database         string
-	measurement      string
-	identifier       table.Identifier
-	oldNamespace     string
-	newNamespace     string
-	catalogNamespace string
-	metadataLocation string
+	database     string
+	measurement  string
+	oldNamespace string
+	newNamespace string
 }
 
 // ConfigureNamespaceMigrationDryRun sets whether the dotted-namespace migration only reports
@@ -40,31 +37,38 @@ func (e *Exporter) ConfigureNamespaceMigrationDryRun(dryRun bool) {
 	e.namespaceMigrationDryRun = dryRun
 }
 
-// MigrateDottedNamespaces finds legacy catalog rows that correspond to current Arc measurements.
-// A failed or dry-run migration returns the affected measurements in blocked so the scheduler
-// will not create a second table beside the still-readable legacy table.
-func (e *Exporter) MigrateDottedNamespaces(ctx context.Context, measurements []Measurement) (blocked map[string]struct{}, err error) {
-	blocked = make(map[string]struct{})
-	if e.db == nil || e.backend == nil {
+// MigrateDottedNamespaces rekeys catalog rows that an older Arc wrote under a plain dotted
+// namespace, so iceberg-go v0.7.0 can address them again (#1129).
+//
+// It REKEYS THE CATALOG ROW AND MOVES NOTHING ON DISK, and that is the whole design rather than a
+// shortcut. Iceberg records manifest and data locations as absolute paths inside the table
+// metadata, and nothing in iceberg-go rewrites them when a table's location changes -- a
+// SetLocation update only sets the metadata's own location field (table/updates.go,
+// setLocationUpdate.Apply). So a migration that relocated the warehouse directory would publish a
+// table whose current snapshot still reads its manifest chain out of the OLD tree, leaving the
+// copies in the new tree referenced by nothing and the old tree permanently load-bearing while the
+// log reported a completed move. Rekeying leaves exactly one tree: the table keeps the location it
+// already has, later commits write new metadata versions beside the existing ones, and the legacy
+// directory stays excluded from the data walk because isWarehouseDir matches its
+// "<nsPrefix>_....db" shape on its first branch.
+//
+// The returned set names the measurements that must NOT be reconciled on this pass. Until its row
+// is rekeyed, a legacy table is unreachable under the identifier tableIdent now builds, so letting
+// the scheduler proceed would CREATE A SECOND TABLE beside the readable legacy one -- the
+// orphaning this issue exists to prevent. Scheduler.runPass is what acts on it; that coupling is
+// the point of the mechanism and is pinned by TestSchedulerSkipsBlockedMeasurements.
+func (e *Exporter) MigrateDottedNamespaces(ctx context.Context, measurements []Measurement) (map[string]struct{}, error) {
+	blocked := make(map[string]struct{})
+	if e.db == nil {
 		return blocked, nil
 	}
 
-	legacyMeasurements := make(map[string][]Measurement)
-	for _, measurement := range measurements {
-		if !strings.ContainsAny(measurement.Database, "./") {
-			continue
-		}
-		ident := e.tableIdent(measurement.Database, measurement.Measurement)
-		if len(ident) < 2 {
-			continue
-		}
-		oldNamespace := e.nsPrefix + "_" + strings.ReplaceAll(measurement.Database, "/", ".")
-		newNamespace := catalogNamespaceKey(ident[:len(ident)-1])
-		if oldNamespace == newNamespace {
-			continue
-		}
-		key := oldNamespace + "\x00" + measurement.Measurement
-		legacyMeasurements[key] = append(legacyMeasurements[key], measurement)
+	// Build the legacy-to-current mapping FIRST and do no catalog I/O at all when nothing could
+	// have a legacy row. This runs on every reconcile pass of every deployment with Iceberg
+	// enabled, and only a deployment with a dotted spoke has anything here to do.
+	legacy := e.legacyNamespaceCandidates(measurements)
+	if len(legacy) == 0 {
+		return blocked, nil
 	}
 
 	rows, err := e.namespaceTableRows(ctx)
@@ -72,49 +76,83 @@ func (e *Exporter) MigrateDottedNamespaces(ctx context.Context, measurements []M
 		return blocked, err
 	}
 	for _, row := range rows {
-		migration, matches, affected, err := e.namespaceMigrationForRow(row, legacyMeasurements)
+		migration, matches, affected, err := e.namespaceMigrationForRow(row, legacy)
 		if err != nil {
 			for _, measurement := range affected {
-				blocked[measurement.Database+"\x00"+measurement.Measurement] = struct{}{}
+				blocked[measurementKey(measurement.Database, measurement.Measurement)] = struct{}{}
 			}
+			// Paths and namespaces here are deliberately NOT %q: the caller logs this through
+			// .Err(err) and Arc masks quoted spans in every logged error (logger.installErrSanitizer),
+			// which would blank out the one detail naming the row an operator has to fix.
 			e.logger.Error().Err(err).Str("namespace", row.namespace).Str("table", row.table).
-				Msg("Iceberg dotted-namespace migration could not be planned; leaving the legacy table readable")
+				Msg("Iceberg dotted-namespace migration could not be planned; leaving the legacy table readable and unreconciled")
 			continue
 		}
 		if !matches {
 			continue
 		}
 
-		measurementKey := migration.database + "\x00" + migration.measurement
-		blocked[measurementKey] = struct{}{}
+		key := measurementKey(migration.database, migration.measurement)
+		blocked[key] = struct{}{}
 		if e.namespaceMigrationDryRun {
-			if err := e.checkNamespaceMigrationPlan(ctx, migration); err != nil {
-				e.logger.Error().Err(err).
-					Str("database", migration.database).
-					Str("measurement", migration.measurement).
-					Msg("Iceberg dotted-namespace migration dry-run found an unsafe table; no changes made")
-				continue
-			}
 			e.logger.Info().
 				Str("database", migration.database).
 				Str("measurement", migration.measurement).
 				Str("from_namespace", migration.oldNamespace).
 				Str("to_namespace", migration.newNamespace).
-				Msg("Iceberg dotted-namespace migration planned; no catalog or warehouse changes made")
+				Msg("Iceberg dotted-namespace migration planned; no catalog changes made, and this measurement is not exported until it runs. Set iceberg.namespace_migration_dry_run=false to apply it")
 			continue
 		}
-		if err := e.applyNamespaceMigration(ctx, migration); err != nil {
+		if err := e.rekeyNamespaceTable(ctx, migration); err != nil {
 			e.logger.Error().Err(err).
 				Str("database", migration.database).
 				Str("measurement", migration.measurement).
 				Str("from_namespace", migration.oldNamespace).
 				Str("to_namespace", migration.newNamespace).
-				Msg("Iceberg dotted-namespace migration failed; the measurement remains blocked for this pass")
+				Msg("Iceberg dotted-namespace migration failed; the legacy table stays readable and the measurement stays unreconciled until the next pass")
 			continue
 		}
-		delete(blocked, measurementKey)
+		e.logger.Info().
+			Str("database", migration.database).
+			Str("measurement", migration.measurement).
+			Str("from_namespace", migration.oldNamespace).
+			Str("to_namespace", migration.newNamespace).
+			Msg("Migrated Iceberg dotted namespace; the table keeps its existing warehouse directory and metadata")
+		delete(blocked, key)
 	}
 	return blocked, nil
+}
+
+// measurementKey is the scheduler's per-measurement map key. NUL-joined because neither a database
+// nor a measurement name can contain one, so the halves can never run together ambiguously.
+func measurementKey(database, measurement string) string {
+	return database + "\x00" + measurement
+}
+
+// legacyNamespaceCandidates maps the catalog key an older Arc would have written to the current
+// measurements that would land there. Keyed by the LEGACY namespace and table, which is what a
+// pre-upgrade catalog row holds.
+func (e *Exporter) legacyNamespaceCandidates(measurements []Measurement) map[string][]Measurement {
+	candidates := make(map[string][]Measurement)
+	for _, measurement := range measurements {
+		// Only a name carrying a dot or a separator could have produced a different key: the old
+		// scheme was nsPrefix + "_" + strings.ReplaceAll(database, "/", "."), so for every other
+		// name the legacy and current keys are the same string and there is nothing to migrate.
+		if !strings.ContainsAny(measurement.Database, "./") {
+			continue
+		}
+		namespace, err := namespaceIdentifier(e.nsPrefix, measurement.Database)
+		if err != nil {
+			continue // not addressable at all; EnsureTable reports it per measurement
+		}
+		oldNamespace := e.nsPrefix + "_" + strings.ReplaceAll(measurement.Database, "/", ".")
+		if oldNamespace == catalogNamespaceKey(namespace) {
+			continue
+		}
+		key := measurementKey(oldNamespace, measurement.Measurement)
+		candidates[key] = append(candidates[key], measurement)
+	}
+	return candidates
 }
 
 func (e *Exporter) namespaceTableRows(ctx context.Context) ([]namespaceTableRow, error) {
@@ -140,69 +178,47 @@ func (e *Exporter) namespaceTableRows(ctx context.Context) ([]namespaceTableRow,
 	return out, nil
 }
 
+// namespaceMigrationForRow decides what one catalog row needs. The returned measurements are the
+// ones to block when the error is non-nil: a row that cannot be planned must not be reconciled
+// either, or the scheduler would create a duplicate table beside it.
+//
+// A row already under the encoded key needs nothing, and there is no half-migrated state to
+// resume: the rekey is one transaction, so a row holds either the legacy key or the new one.
 func (e *Exporter) namespaceMigrationForRow(row namespaceTableRow, legacy map[string][]Measurement) (namespaceMigration, bool, []Measurement, error) {
 	if strings.HasPrefix(row.namespace, encodedNamespacePrefix) {
-		parts, ok := decodeCatalogNamespace(row.namespace)
-		if !ok || !namespaceBelongsToPrefix(parts, e.nsPrefix) || !hasDottedNamespacePart(parts) {
-			return namespaceMigration{}, false, nil, nil
-		}
-		database, ok := databaseFromNamespace(parts, e.nsPrefix)
-		if !ok {
-			return namespaceMigration{}, false, nil, nil
-		}
-		oldNamespace := strings.Join(parts, ".")
-		newNamespace := row.namespace
-		if oldNamespace == newNamespace {
-			return namespaceMigration{}, false, nil, nil
-		}
-		if !row.metadataLocation.Valid || row.metadataLocation.String == "" {
-			return namespaceMigration{}, false, []Measurement{{Database: database, Measurement: row.table}},
-				fmt.Errorf("catalog row has no metadata location")
-		}
-		if _, _, err := relocatedMetadataLocation(row.metadataLocation.String, oldNamespace, newNamespace, row.table); err != nil {
-			return namespaceMigration{}, false, []Measurement{{Database: database, Measurement: row.table}}, err
-		}
-		if metadataHasNamespaceDirectory(row.metadataLocation.String, newNamespace, row.table) {
-			return namespaceMigration{}, false, nil, nil
-		}
-		return namespaceMigration{
-			database: database, measurement: row.table,
-			identifier:   append(append(table.Identifier(nil), parts...), row.table),
-			oldNamespace: oldNamespace, newNamespace: newNamespace, catalogNamespace: row.namespace,
-			metadataLocation: row.metadataLocation.String,
-		}, true, nil, nil
+		return namespaceMigration{}, false, nil, nil
 	}
-
-	matches := legacy[row.namespace+"\x00"+row.table]
+	matches := legacy[measurementKey(row.namespace, row.table)]
 	if len(matches) == 0 {
 		return namespaceMigration{}, false, nil, nil
 	}
 	if len(matches) > 1 {
 		return namespaceMigration{}, false, matches,
-			fmt.Errorf("legacy namespace %q maps to more than one current Arc database; refusing an ambiguous migration", row.namespace)
+			fmt.Errorf("legacy Iceberg namespace %s maps to more than one current Arc database; refusing an ambiguous migration", row.namespace)
 	}
 	measurement := matches[0]
-	ident := e.tableIdent(measurement.Database, measurement.Measurement)
-	newNamespace := catalogNamespaceKey(ident[:len(ident)-1])
-	if row.namespace == newNamespace {
-		return namespaceMigration{}, false, nil, nil
-	}
-	if !row.metadataLocation.Valid || row.metadataLocation.String == "" {
-		return namespaceMigration{}, false, matches, fmt.Errorf("catalog row has no metadata location")
-	}
-	if _, _, err := relocatedMetadataLocation(row.metadataLocation.String, row.namespace, newNamespace, row.table); err != nil {
+	namespace, err := namespaceIdentifier(e.nsPrefix, measurement.Database)
+	if err != nil {
 		return namespaceMigration{}, false, matches, err
 	}
-	if metadataHasNamespaceDirectory(row.metadataLocation.String, newNamespace, row.table) {
-		return namespaceMigration{}, false, nil, nil
+	// A row with no metadata location cannot be loaded at either key. Refuse rather than rekey it:
+	// the rekey would succeed, the measurement would be unblocked, and every later pass would fail
+	// the #637 load gate instead of naming the broken row once here.
+	if !row.metadataLocation.Valid || row.metadataLocation.String == "" {
+		return namespaceMigration{}, false, matches,
+			fmt.Errorf("legacy Iceberg catalog row has no metadata location, so it cannot be loaded under either namespace key")
 	}
 	return namespaceMigration{
-		database: measurement.Database, measurement: measurement.Measurement,
-		identifier: ident, oldNamespace: row.namespace, newNamespace: newNamespace, catalogNamespace: row.namespace,
-		metadataLocation: row.metadataLocation.String,
+		database:     measurement.Database,
+		measurement:  measurement.Measurement,
+		oldNamespace: row.namespace,
+		newNamespace: catalogNamespaceKey(namespace),
 	}, true, nil, nil
 }
 
+// catalogNamespaceKey is the key iceberg-go's SQL catalog stores for a namespace: the plain
+// dot-joined string, or a JSON encoding when any component contains a dot (which would otherwise
+// be ambiguous with a multi-component namespace).
 func catalogNamespaceKey(namespace table.Identifier) string {
 	legacy := strings.Join(namespace, ".")
 	if !strings.Contains(legacy, encodedNamespacePrefix) && !hasDottedNamespacePart(namespace) {
@@ -212,6 +228,8 @@ func catalogNamespaceKey(namespace table.Identifier) string {
 	return encodedNamespacePrefix + string(encoded)
 }
 
+// decodeCatalogNamespace reverses catalogNamespaceKey for an encoded key, accepting only the
+// canonical encoding so a hand-edited or truncated key is not mistaken for one of ours.
 func decodeCatalogNamespace(namespace string) (table.Identifier, bool) {
 	if !strings.HasPrefix(namespace, encodedNamespacePrefix) {
 		return nil, false
@@ -238,278 +256,13 @@ func hasDottedNamespacePart(parts table.Identifier) bool {
 	return false
 }
 
-func databaseFromNamespace(parts table.Identifier, prefix string) (string, bool) {
-	if !namespaceBelongsToPrefix(parts, prefix) {
-		return "", false
-	}
-	first := strings.TrimPrefix(parts[0], prefix+"_")
-	if first == "" {
-		return "", false
-	}
-	switch len(parts) {
-	case 1:
-		return first, true
-	case 2:
-		if parts[1] == "" || strings.ContainsAny(parts[1], "/.") || strings.Contains(first, "/") {
-			return "", false
-		}
-		return first + "/" + parts[1], true
-	default:
-		return "", false
-	}
-}
-
-func relocatedMetadataLocation(metadataLocation, oldNamespace, newNamespace, tableName string) (metadataURI, tableURI string, err error) {
-	u, err := url.Parse(metadataLocation)
-	if err != nil {
-		return "", "", fmt.Errorf("parse table metadata location %q: %w", metadataLocation, err)
-	}
-	if u.Scheme == "" {
-		return "", "", fmt.Errorf("table metadata location %q has no URI scheme", metadataLocation)
-	}
-	segments := strings.Split(u.Path, "/")
-	oldDir, newDir := oldNamespace+".db", newNamespace+".db"
-	foundOld, foundNew := -1, -1
-	for i, segment := range segments {
-		if segment == oldDir {
-			if foundOld >= 0 {
-				return "", "", fmt.Errorf("metadata location contains multiple legacy namespace directories")
-			}
-			foundOld = i
-		}
-		if segment == newDir {
-			if foundNew >= 0 {
-				return "", "", fmt.Errorf("metadata location contains multiple target namespace directories")
-			}
-			foundNew = i
-		}
-	}
-	index := foundOld
-	if index >= 0 {
-		segments[index] = newDir
-	} else if foundNew >= 0 {
-		index = foundNew // a prior interrupted attempt may already point into the target tree
-	} else {
-		return "", "", fmt.Errorf("metadata location is outside the expected legacy and target warehouse paths")
-	}
-	if index+1 >= len(segments) || segments[index+1] != tableName || index+2 >= len(segments) || segments[index+2] != "metadata" {
-		return "", "", fmt.Errorf("metadata location does not match namespace/table/metadata layout")
-	}
-	metadataURL := *u
-	metadataURL.Path = strings.Join(segments, "/")
-	metadataURL.RawPath = ""
-	tableURL := metadataURL
-	tableURL.Path = strings.Join(segments[:index+2], "/")
-	return metadataURL.String(), tableURL.String(), nil
-}
-
-func metadataHasNamespaceDirectory(metadataLocation, namespace, tableName string) bool {
-	u, err := url.Parse(metadataLocation)
-	if err != nil || u.Scheme == "" {
-		return false
-	}
-	segments := strings.Split(u.Path, "/")
-	for i, segment := range segments {
-		if segment == namespace+".db" && i+2 < len(segments) && segments[i+1] == tableName && segments[i+2] == "metadata" {
-			return true
-		}
-	}
-	return false
-}
-
-func (e *Exporter) checkNamespaceMigrationPlan(ctx context.Context, migration namespaceMigration) error {
-	targetMetadata, _, err := relocatedMetadataLocation(
-		migration.metadataLocation, migration.oldNamespace, migration.newNamespace, migration.measurement)
-	if err != nil {
-		return err
-	}
-	oldMetadataKey, ok := e.warehouseRelKey(migration.metadataLocation)
-	if !ok {
-		return fmt.Errorf("legacy metadata location is outside the configured Iceberg warehouse or storage root")
-	}
-	newMetadataKey, ok := e.warehouseRelKey(targetMetadata)
-	if !ok {
-		return fmt.Errorf("target metadata location is outside the configured Iceberg warehouse or storage root")
-	}
-	return e.copyAndVerifyTableTree(ctx, path.Dir(path.Dir(oldMetadataKey)), path.Dir(path.Dir(newMetadataKey)))
-}
-
-func (e *Exporter) applyNamespaceMigration(ctx context.Context, migration namespaceMigration) error {
-	targetMetadata, targetTable, err := relocatedMetadataLocation(
-		migration.metadataLocation, migration.oldNamespace, migration.newNamespace, migration.measurement)
-	if err != nil {
-		return err
-	}
-	oldMetadataKey, ok := e.warehouseRelKey(migration.metadataLocation)
-	if !ok {
-		return fmt.Errorf("legacy metadata location is outside the configured Iceberg warehouse or storage root")
-	}
-	newMetadataKey, ok := e.warehouseRelKey(targetMetadata)
-	if !ok {
-		return fmt.Errorf("target metadata location is outside the configured Iceberg warehouse or storage root")
-	}
-	oldTablePrefix := path.Dir(path.Dir(oldMetadataKey))
-	newTablePrefix := path.Dir(path.Dir(newMetadataKey))
-	if err := e.copyAndVerifyTableTree(ctx, oldTablePrefix, newTablePrefix); err != nil {
-		return err
-	}
-
-	if migration.catalogNamespace != migration.newNamespace {
-		if err := e.rekeyNamespaceTable(ctx, migration); err != nil {
-			return err
-		}
-	}
-	_, _, err = e.catalog.CommitTable(ctx, migration.identifier, nil,
-		[]table.Update{table.NewSetLocationUpdate(targetTable)})
-	if err != nil {
-		return fmt.Errorf("commit Iceberg table location update: %w", err)
-	}
-	migrated, err := e.catalog.LoadTable(ctx, migration.identifier)
-	if err != nil {
-		return fmt.Errorf("reload migrated Iceberg table: %w", err)
-	}
-	if !metadataHasNamespaceDirectory(migrated.MetadataLocation(), migration.newNamespace, migration.measurement) {
-		return fmt.Errorf("migrated catalog row still points outside its target namespace directory")
-	}
-	if _, _, err := relocatedMetadataLocation(migrated.MetadataLocation(), migration.newNamespace, migration.newNamespace, migration.measurement); err != nil {
-		return fmt.Errorf("verify migrated Iceberg metadata location: %w", err)
-	}
-	if !e.writeVersionHint(ctx, migrated) {
-		return fmt.Errorf("publish migrated Iceberg version-hint files; will retry on the next reconcile pass")
-	}
-	e.logger.Info().
-		Str("database", migration.database).
-		Str("measurement", migration.measurement).
-		Str("from_namespace", migration.oldNamespace).
-		Str("to_namespace", migration.newNamespace).
-		Msg("Migrated Iceberg dotted namespace; legacy warehouse files retained for snapshot history")
-	return nil
-}
-
-func (e *Exporter) copyAndVerifyTableTree(ctx context.Context, oldPrefix, newPrefix string) error {
-	oldPrefix = strings.TrimSuffix(oldPrefix, "/")
-	newPrefix = strings.TrimSuffix(newPrefix, "/")
-	if oldPrefix == "" || newPrefix == "" || oldPrefix == newPrefix {
-		return fmt.Errorf("invalid legacy or target table path")
-	}
-	objects, err := e.backend.List(ctx, oldPrefix+"/")
-	if err != nil {
-		return fmt.Errorf("list legacy Iceberg table files: %w", err)
-	}
-	if len(objects) == 0 {
-		return fmt.Errorf("legacy Iceberg table directory contains no objects")
-	}
-	sort.Strings(objects)
-	for _, source := range objects {
-		if !strings.HasPrefix(source, oldPrefix+"/") {
-			return fmt.Errorf("backend returned object %q outside legacy table prefix", source)
-		}
-		relative, err := relativeTableObjectPath(source, oldPrefix)
-		if err != nil {
-			return err
-		}
-		destination := path.Join(newPrefix, relative)
-		sourceSize, err := e.backend.StatFile(ctx, source)
-		if err != nil || sourceSize < 0 {
-			if err == nil {
-				err = fmt.Errorf("object does not exist")
-			}
-			return fmt.Errorf("stat legacy Iceberg object %q: %w", source, err)
-		}
-		targetSize, err := e.backend.StatFile(ctx, destination)
-		if err != nil {
-			return fmt.Errorf("stat target Iceberg object %q: %w", destination, err)
-		}
-		if targetSize >= 0 {
-			if targetSize != sourceSize {
-				return fmt.Errorf("target Iceberg object %q conflicts with source size (%d != %d)", destination, targetSize, sourceSize)
-			}
-			sourceHash, err := e.hashObject(ctx, source)
-			if err != nil {
-				return err
-			}
-			targetHash, err := e.hashObject(ctx, destination)
-			if err != nil {
-				return err
-			}
-			if sourceHash != targetHash {
-				return fmt.Errorf("target Iceberg object %q conflicts with legacy contents", destination)
-			}
-			continue
-		}
-		if e.namespaceMigrationDryRun {
-			continue
-		}
-		if err := e.copyObject(ctx, source, destination, sourceSize); err != nil {
-			return err
-		}
-		targetSize, err = e.backend.StatFile(ctx, destination)
-		if err != nil || targetSize != sourceSize {
-			if err == nil {
-				err = fmt.Errorf("copied size %d does not match source size %d", targetSize, sourceSize)
-			}
-			return fmt.Errorf("verify copied Iceberg object %q: %w", destination, err)
-		}
-		sourceHash, err := e.hashObject(ctx, source)
-		if err != nil {
-			return err
-		}
-		targetHash, err := e.hashObject(ctx, destination)
-		if err != nil {
-			return err
-		}
-		if sourceHash != targetHash {
-			return fmt.Errorf("copied Iceberg object %q failed SHA-256 verification", destination)
-		}
-	}
-	return nil
-}
-
-func relativeTableObjectPath(source, tablePrefix string) (string, error) {
-	prefix := strings.TrimSuffix(tablePrefix, "/") + "/"
-	if !strings.HasPrefix(source, prefix) {
-		return "", fmt.Errorf("backend returned object %q outside legacy table prefix", source)
-	}
-	relative := strings.TrimPrefix(source, prefix)
-	cleaned := path.Clean(relative)
-	if relative == "" || path.IsAbs(relative) || cleaned != relative || cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
-		return "", fmt.Errorf("backend returned unsafe object path %q under legacy table", source)
-	}
-	return relative, nil
-}
-
-func (e *Exporter) copyObject(ctx context.Context, source, destination string, size int64) error {
-	reader, writer := io.Pipe()
-	readDone := make(chan error, 1)
-	go func() {
-		err := e.backend.ReadTo(ctx, source, writer)
-		_ = writer.CloseWithError(err)
-		readDone <- err
-	}()
-	writeErr := e.backend.WriteReader(ctx, destination, reader, size)
-	if writeErr != nil {
-		_ = reader.CloseWithError(writeErr)
-	} else {
-		_ = reader.Close()
-	}
-	readErr := <-readDone
-	if writeErr != nil {
-		return fmt.Errorf("copy Iceberg object %q to %q: %w", source, destination, writeErr)
-	}
-	if readErr != nil {
-		return fmt.Errorf("read legacy Iceberg object %q: %w", source, readErr)
-	}
-	return nil
-}
-
-func (e *Exporter) hashObject(ctx context.Context, key string) (string, error) {
-	h := sha256.New()
-	if err := e.backend.ReadTo(ctx, key, h); err != nil {
-		return "", fmt.Errorf("hash Iceberg object %q: %w", key, err)
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
-}
-
+// rekeyNamespaceTable moves one catalog row, and its namespace properties, from the legacy dotted
+// key to the encoded one. Nothing on disk is touched; see MigrateDottedNamespaces for why.
+//
+// Both statements run in one transaction so a crash cannot leave the properties and the table row
+// under different namespaces. The metadata_location is part of the WHERE clause and the update is
+// required to affect exactly one row, so a row another process changed in the meantime is refused
+// rather than overwritten.
 func (e *Exporter) rekeyNamespaceTable(ctx context.Context, migration namespaceMigration) error {
 	tx, err := e.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -524,15 +277,16 @@ func (e *Exporter) rekeyNamespaceTable(ctx context.Context, migration namespaceM
 		return fmt.Errorf("check target Iceberg table: %w", err)
 	}
 	if targetExists != 0 {
-		return fmt.Errorf("target Iceberg table %s.%s already exists", migration.newNamespace, migration.measurement)
+		return fmt.Errorf("target Iceberg table %s.%s already exists, so rekeying the legacy row would collide with it",
+			migration.newNamespace, migration.measurement)
 	}
 	if err := e.moveNamespaceProperties(ctx, tx, migration.oldNamespace, migration.newNamespace); err != nil {
 		return err
 	}
 	result, err := tx.ExecContext(ctx,
 		`UPDATE iceberg_tables SET table_namespace = ?
-		 WHERE catalog_name = ? AND table_namespace = ? AND table_name = ? AND metadata_location = ?`,
-		migration.newNamespace, e.catalogName, migration.catalogNamespace, migration.measurement, migration.metadataLocation)
+		 WHERE catalog_name = ? AND table_namespace = ? AND table_name = ?`,
+		migration.newNamespace, e.catalogName, migration.oldNamespace, migration.measurement)
 	if err != nil {
 		return fmt.Errorf("rekey Iceberg table namespace: %w", err)
 	}
@@ -541,7 +295,7 @@ func (e *Exporter) rekeyNamespaceTable(ctx context.Context, migration namespaceM
 		return fmt.Errorf("confirm Iceberg table namespace update: %w", err)
 	}
 	if changed != 1 {
-		return fmt.Errorf("Iceberg table row changed during migration; refusing to update it")
+		return fmt.Errorf("Iceberg table row changed during migration (%d rows updated, want 1); refusing to update it", changed)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit Iceberg catalog namespace migration: %w", err)
@@ -566,12 +320,12 @@ func (e *Exporter) moveNamespaceProperties(ctx context.Context, tx *sql.Tx, oldN
 	for _, old := range oldProperties {
 		if current, exists := newProperties[old.key]; exists {
 			if current.value != old.value {
-				return fmt.Errorf("Iceberg namespace property %q conflicts in the target namespace", old.key)
+				return fmt.Errorf("Iceberg namespace property %s conflicts in the target namespace", old.key)
 			}
 			if _, err := tx.ExecContext(ctx,
 				`DELETE FROM iceberg_namespace_properties WHERE catalog_name = ? AND namespace = ? AND property_key = ?`,
 				e.catalogName, oldNamespace, old.key); err != nil {
-				return fmt.Errorf("merge legacy Iceberg namespace property %q: %w", old.key, err)
+				return fmt.Errorf("merge legacy Iceberg namespace property %s: %w", old.key, err)
 			}
 			continue
 		}
@@ -579,7 +333,7 @@ func (e *Exporter) moveNamespaceProperties(ctx context.Context, tx *sql.Tx, oldN
 			`UPDATE iceberg_namespace_properties SET namespace = ?
 			 WHERE catalog_name = ? AND namespace = ? AND property_key = ?`,
 			newNamespace, e.catalogName, oldNamespace, old.key); err != nil {
-			return fmt.Errorf("move legacy Iceberg namespace property %q: %w", old.key, err)
+			return fmt.Errorf("move legacy Iceberg namespace property %s: %w", old.key, err)
 		}
 	}
 	return nil

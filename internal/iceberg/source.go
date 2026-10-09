@@ -2,7 +2,6 @@ package iceberg
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -92,19 +91,17 @@ func (s *StorageWalkSource) isWarehouseDir(name string) bool {
 	if strings.HasPrefix(name, s.nsPrefix+"_") && strings.HasSuffix(name, ".db") {
 		return true
 	}
-	// iceberg-go v0.7.0 JSON-encodes namespaces containing a dotted component. Spoke IDs may
-	// contain dots, so the resulting directory no longer starts with "<prefix>_". Decode only
-	// canonical catalog keys and verify their first component belongs to this exporter.
-	if !strings.HasPrefix(name, encodedNamespacePrefix) || !strings.HasSuffix(name, ".db") {
+	// iceberg-go v0.7.0 JSON-encodes a namespace whose component contains a dot, and an edge-sync
+	// spoke ID may contain one (#1129), so that directory does not start with "<prefix>_" at all.
+	// Decoding through catalogNamespaceKey's own inverse is deliberate: a second, local copy of
+	// the encoding rule is how the exporter would come to disagree with the catalog about which
+	// directories are its own, and a directory it fails to recognise here is walked back in as a
+	// user database -- the harm the whole namespace scheme exists to prevent (#634).
+	if !strings.HasSuffix(name, ".db") {
 		return false
 	}
-	encoded := strings.TrimSuffix(strings.TrimPrefix(name, encodedNamespacePrefix), ".db")
-	var namespace []string
-	if err := json.Unmarshal([]byte(encoded), &namespace); err != nil || len(namespace) == 0 {
-		return false
-	}
-	canonical, err := json.Marshal(namespace)
-	return err == nil && string(canonical) == encoded && strings.HasPrefix(namespace[0], s.nsPrefix+"_")
+	namespace, ok := decodeCatalogNamespace(strings.TrimSuffix(name, ".db"))
+	return ok && namespaceBelongsToPrefix(namespace, s.nsPrefix)
 }
 
 // dirLister is the subset of storage backends that can enumerate immediate subdirectories.
