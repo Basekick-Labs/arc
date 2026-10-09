@@ -42,7 +42,6 @@ jobs:
       # permanently. It also matches `make fmt`, which formats the whole tree.
       - name: Format
         run: |
-          gofmt -d internal/sortkey/sortkey.go
           unformatted=$(gofmt -l .)
           if [ -n "$unformatted" ]; then
             echo "These files are not gofmt-clean. Run: gofmt -w ."
