@@ -94,6 +94,12 @@ func TestUnlinkOne_ReportsReasonAndMeasuredSize(t *testing.T) {
 	}
 }
 
+// Note how this fails if the StagedSize fallback in unlinkOne is removed: with
+// no staged size to find, wasLocal stays false and RecordUnlinkedFile is never
+// called, so it fails on "got 0 unlink reports, want 1" — not on a wrong size.
+// Do not "fix" a future failure here by asserting size 0; that would assert
+// the bug. The size assertion below is what pins the accounting, and the
+// report-count assertion is what pins that the fallback runs at all.
 func TestUnlinkOne_ReportsSizeForStagedFile(t *testing.T) {
 	const path = "db1/cpu/2026/10/03/14/partial.parquet"
 	prefix := []byte("partial")

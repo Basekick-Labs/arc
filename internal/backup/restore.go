@@ -892,8 +892,14 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 				toColdRouted[destPath] = true
 				atomic.AddInt64(&progress.HotBackupFilesRoutedToCold, 1)
 				m.setProgress(progress)
-				// Confirm the committed object before comparing its size. Staged
-				// partials are not complete cold copies and must not skip restore.
+				// Exists is redundant with StatFile since #1178 — a non-negative
+				// StatFile now means a committed object on every backend — and
+				// is kept deliberately, because this is the exact call site
+				// #1178 was filed over. During #1145's review I removed this
+				// Exists as redundant on the strength of a contract the local
+				// backend did not honour, and a contributor's test caught it.
+				// The reading is true now; one extra HEAD per cold-routed file
+				// is a fair price for not re-deriving that conclusion.
 				exists, err := cold.Exists(ctx, destPath)
 				if err != nil {
 					return fmt.Errorf("restore refused: could not check whether the cold copy of %s exists before restoring: %w", destPath, err)

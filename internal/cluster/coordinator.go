@@ -1185,8 +1185,17 @@ func (c *Coordinator) unlinkOne(item deleteRequest, has func(string) bool) {
 		// the ones that never held the file.
 		//
 		n, statErr := c.storage.StatFile(delCtx, item.path)
-		// Preserve this path's accounting for staged bytes without treating a
-		// partial write as a committed object for other StatFile callers.
+		// Staged bytes count HERE, and only here. Asking StagedSize when the
+		// committed file is gone keeps this path's accounting byte-identical
+		// to the behaviour it had while StatFile itself reported partials
+		// (#1178 removed that), without putting a partial in front of every
+		// other StatFile caller.
+		//
+		// It is safe to report a partial's length because of what this path
+		// does with it: flip a tier row to cold or retire a hot one. It never
+		// claims a readable local file, so a short size costs a row's
+		// size_bytes accuracy and nothing else. A caller that did claim
+		// readability would need Exists, which is the trap #1178 closed.
 		if statErr == nil && n < 0 {
 			if si, ok := c.storage.(storage.StagingInspector); ok {
 				n, statErr = si.StagedSize(delCtx, item.path)

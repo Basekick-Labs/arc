@@ -477,7 +477,7 @@ func TestLocalBackend_AppendReader(t *testing.T) {
 
 	// The incomplete transfer is visible only through the staging interface;
 	// StatFile describes the committed object and must report it as absent.
-	si, ok := (Backend)(backend).(StagingInspector)
+	si, ok := any(backend).(StagingInspector)
 	if !ok {
 		t.Fatal("LocalBackend does not implement StagingInspector")
 	}

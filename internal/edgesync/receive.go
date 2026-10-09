@@ -566,9 +566,18 @@ func (g *shortBodyGuard) Read(p []byte) (int, error) {
 // hash it, and return a conflict against content the hub itself produced —
 // wedging that path the same way a stale ".part" once did.
 func (r *Receiver) promote(ctx context.Context, stagingPath, finalPath string, size int64) error {
-	// Clear staging data left by a previous promote before starting a new
-	// destination write. StatFile ignores staged partials; this avoids carrying
-	// stale staging data into the new transfer.
+	// Not load-bearing, and the honest reason is not the obvious one.
+	//
+	// It is NOT needed to stop stale staging bytes reaching the new transfer:
+	// LocalBackend.WriteReader opens the staging file O_TRUNC, so whatever was
+	// there is discarded. And it is no longer needed to stop StatFile
+	// reporting a partial as the final file either, which is what it was for
+	// before #1178 made StatFile committed-only. Removing it leaves the
+	// edgesync suite green, TestReceiver_StalePartDoesNotWedgeThePath
+	// included — that test now passes through the contract instead.
+	//
+	// Kept so an interrupted promote's partial is reclaimed here rather than
+	// sitting on disk until something else sweeps staging.
 	if si := r.staging(); si != nil {
 		if err := si.DeleteStaged(ctx, finalPath); err != nil {
 			r.logger.Debug().Err(err).Str("path", finalPath).Msg("No stale promote staging file to clear")

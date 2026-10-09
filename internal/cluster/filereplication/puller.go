@@ -1056,10 +1056,21 @@ func (p *Puller) statLocal(path string) (int64, error) {
 	if err != nil || size < 0 {
 		return size, err
 	}
-	// StatFile reports only committed objects. Where a staged partial also
-	// exists, confirm the final file again so a concurrent removal cannot make
-	// the earlier size look present. Backends that do not stage (S3, Azure)
-	// fail the assertion and need no extra check.
+	// This block is REDUNDANT since #1178 and is kept as belt only.
+	//
+	// It existed because LocalBackend.StatFile used to fall back to the
+	// ".part" staging file, so a full-size partial left by a crash before the
+	// rename read as "already here" and was never finalised (#963). StatFile
+	// now reports committed objects only, which is exactly the question
+	// presentAtSize asks, so the re-check cannot change the answer for that
+	// case any more.
+	//
+	// Do not mistake it for a concurrent-removal guard: the re-check fires
+	// only when a staged partial happens to exist, so a committed file
+	// removed between the two calls with no ".part" beside it is not caught
+	// at all. The subset it does catch is coincidental. Deleting the block is
+	// safe (nothing in the cluster tree pins it) and is tracked separately;
+	// it is left here only to keep this PR to the contract change.
 	if si, ok := p.cfg.Backend.(storage.StagingInspector); ok {
 		staged, err := si.StagedSize(statCtx, path)
 		if err != nil {
