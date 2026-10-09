@@ -198,6 +198,10 @@ type Coordinator struct {
 	// worker skips such a path rather than unlink a file that is back. Nil
 	// before the puller starts and in tests: no check, unlink.
 	deleteManifestHas func(path string) bool
+	// deleteManifestRefresh is called when a queued unlink finds the path has
+	// been registered again. Its local copy may still be the previous same-size
+	// version, so the current manifest entry must be force-refreshed.
+	deleteManifestRefresh func(path string)
 
 	// tierRecorder, when set, is this node's tier metadata for its own disk.
 	// The puller reports what it pulled and the delete workers report what
@@ -1049,6 +1053,7 @@ func (c *Coordinator) startDeleteWorkers() {
 	stop := make(chan struct{})
 	wg := &sync.WaitGroup{}
 	has := c.deleteManifestHas
+	refresh := c.deleteManifestRefresh
 	c.deletePendingMu.Lock()
 	c.deleteWake = wake
 	c.deletePendingMu.Unlock()
@@ -1056,7 +1061,7 @@ func (c *Coordinator) startDeleteWorkers() {
 	c.deleteWg = wg
 	for i := 0; i < deleteWorkerCount; i++ {
 		wg.Add(1)
-		go c.runDeleteWorker(stop, wake, wg, has)
+		go c.runDeleteWorker(stop, wake, wg, has, refresh)
 	}
 }
 
@@ -1091,7 +1096,7 @@ func (c *Coordinator) stopDeleteWorkers(stop chan struct{}, wg *sync.WaitGroup) 
 // still open it, takes the whole list and unlinks it. Once stop is closed it
 // skips the grace and keeps taking until the list is empty, then exits: Stop
 // has unregistered the FSM callbacks by then, so the list can only shrink.
-func (c *Coordinator) runDeleteWorker(stop <-chan struct{}, wake <-chan struct{}, wg *sync.WaitGroup, has func(string) bool) {
+func (c *Coordinator) runDeleteWorker(stop <-chan struct{}, wake <-chan struct{}, wg *sync.WaitGroup, has func(string) bool, refresh func(string)) {
 	defer wg.Done()
 	for {
 		select {
@@ -1101,7 +1106,7 @@ func (c *Coordinator) runDeleteWorker(stop <-chan struct{}, wake <-chan struct{}
 				if len(batch) == 0 {
 					return
 				}
-				c.unlinkBatch(batch, has)
+				c.unlinkBatch(batch, has, refresh)
 			}
 		case <-wake:
 			select {
@@ -1109,7 +1114,7 @@ func (c *Coordinator) runDeleteWorker(stop <-chan struct{}, wake <-chan struct{}
 				// Stopping: no grace; the branch above drains.
 			case <-time.After(deleteGrace):
 			}
-			c.unlinkBatch(c.takePendingDeletes(), has)
+			c.unlinkBatch(c.takePendingDeletes(), has, refresh)
 		}
 	}
 }
@@ -1119,9 +1124,9 @@ func (c *Coordinator) runDeleteWorker(stop <-chan struct{}, wake <-chan struct{}
 // the drain is exactly when the unlinks must still happen. A path the
 // manifest lists again is skipped — Arc's own file names never repeat, so
 // this guards imports and restores, not a known race.
-func (c *Coordinator) unlinkBatch(batch []deleteRequest, has func(string) bool) {
+func (c *Coordinator) unlinkBatch(batch []deleteRequest, has func(string) bool, refresh func(string)) {
 	for _, item := range batch {
-		c.unlinkOne(item, has)
+		c.unlinkOne(item, has, refresh)
 		c.deleteDone()
 	}
 }
@@ -1181,8 +1186,11 @@ func (c *Coordinator) recordAbandonedFileInTiering(path string, sizeBytes int64)
 	}
 }
 
-func (c *Coordinator) unlinkOne(item deleteRequest, has func(string) bool) {
+func (c *Coordinator) unlinkOne(item deleteRequest, has func(string) bool, refresh func(string)) {
 	if has != nil && has(item.path) {
+		if refresh != nil {
+			refresh(item.path)
+		}
 		c.logger.Debug().
 			Str("path", item.path).
 			Str("reason", item.reason).
@@ -4274,6 +4282,17 @@ func (c *Coordinator) startFilePullerLocked() error {
 		}
 		_, ok := fsm.GetFile(path)
 		return ok
+	}
+	c.deleteManifestRefresh = func(path string) {
+		fsm := raftNode.FSM()
+		if fsm == nil {
+			return
+		}
+		entry, ok := fsm.GetFile(path)
+		if !ok {
+			return
+		}
+		puller.EnqueueContentChanged(entry)
 	}
 	c.startDeleteWorkers()
 
