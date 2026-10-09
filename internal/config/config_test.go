@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/basekick-labs/arc/internal/syscpu"
 	"github.com/spf13/viper"
 )
 
@@ -27,50 +28,18 @@ func TestDatabaseThreadCountDefaultsToZero(t *testing.T) {
 	}
 }
 
-// TestEffectiveCores covers the helper every quota-derived default is built on.
+// TestEffectiveCores_ForwardsToSyscpu pins that config's exported form is the
+// same answer as the package that owns the implementation. The table-driven
+// coverage of the pure form lives in internal/syscpu with the function.
 //
-// Table-driven over the pure form rather than driven through
-// runtime.GOMAXPROCS(n): that is process-global, would slow every other test in
-// the binary, and the values worth testing (0, 128 on a smaller box) are ones a
-// test has no business installing process-wide.
-func TestEffectiveCores(t *testing.T) {
-	cases := []struct {
-		name           string
-		numCPU, gomaxp int
-		want           int
-	}{
-		// The ordinary container case: NumCPU cannot see the CFS quota, GOMAXPROCS
-		// can. This row is #1030.
-		{"quota below machine", 64, 2, 2},
-		{"no quota", 8, 8, 8},
-		{"cpuset only", 2, 2, 2},
-		// GOMAXPROCS env has no clamp in the runtime, so it can exceed the machine.
-		// Verified: GOMAXPROCS=128 on an 8-CPU box reports 128.
-		{"gomaxprocs raised above machine", 8, 128, 8},
-		// An operator-raised GOMAXPROCS below the machine size is honoured. A
-		// deliberate residual, documented on EffectiveCores.
-		{"gomaxprocs between quota and machine", 64, 32, 32},
-		// Degenerate inputs must not yield 0 — a 0 would make the compaction
-		// threads default 0, which means "unset" to the subprocess.
-		{"zero gomaxprocs", 8, 0, 8},
-		{"zero both", 0, 0, 1},
-		{"negative", -1, -1, 1},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := effectiveCores(c.numCPU, c.gomaxp); got != c.want {
-				t.Errorf("effectiveCores(%d, %d) = %d, want %d", c.numCPU, c.gomaxp, got, c.want)
-			}
-		})
-	}
-}
-
-// TestEffectiveCores_MatchesRuntime pins that the exported form reads both
-// runtime values rather than only one of them.
-func TestEffectiveCores_MatchesRuntime(t *testing.T) {
-	want := effectiveCores(runtime.NumCPU(), runtime.GOMAXPROCS(0))
-	if got := EffectiveCores(); got != want {
-		t.Errorf("EffectiveCores() = %d, want %d", got, want)
+// Deliberately weak, and worth saying so rather than overselling it: this
+// compares two live reads, so a forwarder reimplemented as runtime.NumCPU()
+// would still pass on any machine without a CPU quota. What actually holds
+// that line is cmd/arc's TestApplyLicenseCoreLimits_LoadResolvesAutoBeforeLicense,
+// which drives the seam with injected values.
+func TestEffectiveCores_ForwardsToSyscpu(t *testing.T) {
+	if got, want := EffectiveCores(), syscpu.EffectiveCores(); got != want {
+		t.Errorf("EffectiveCores() = %d, want %d (syscpu.EffectiveCores)", got, want)
 	}
 }
 
