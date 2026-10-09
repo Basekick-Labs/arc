@@ -405,12 +405,10 @@ func (m *Manager) runCycle(ctx context.Context) error {
 	var totalErrors int
 	var orphansFound, orphansDeleted, orphanErrors int
 
-	// A primary whose cold listing just failed still holds whatever stale
-	// hot rows the sync would have flipped, so migrating now would select
-	// files that are already in cold and fail on every one of them; and
-	// reconciliation cannot verify cold copies against a backend that
-	// cannot be listed. Both wait for a cycle whose listing succeeds.
-	if m.clusterGate != nil && scanResult.ColdSyncFailed {
+	// If the cold listing failed, the hot rows may be stale for files already
+	// moved to cold. Do not migrate or reconcile from that incomplete view;
+	// both wait for a cycle whose listing succeeds.
+	if scanResult.ColdSyncFailed {
 		m.logger.Warn().Msg("Skipping migration and reconciliation this cycle: the cold tier could not be listed")
 		totalErrors++
 	} else {
@@ -819,11 +817,11 @@ type ScanResult struct {
 	FilesSkipped    int `json:"files_skipped"`
 	Errors          int `json:"errors"`
 	// ColdSynced counts rows the cold-tier sync added or flipped to cold.
-	// Always zero without a cluster gate (see ScanTiers).
+	// Always zero without a usable cold tier (see ScanTiers).
 	ColdSynced int `json:"cold_synced"`
 	// ColdSyncFailed is set when the cold tier could not be listed; the
-	// hot scan still ran, but rows this node holds for files other nodes
-	// moved are stale until a listing succeeds.
+	// hot scan still ran, but this node's tier metadata may be stale until
+	// a listing succeeds.
 	ColdSyncFailed bool `json:"cold_sync_failed,omitempty"`
 	// HotRetired counts hot rows removed because their file is no longer
 	// in hot storage.
@@ -845,7 +843,7 @@ type ScanResult struct {
 }
 
 // ScanTiers brings this node's tier metadata in line with storage: the cold
-// listing first (only when a cluster gate is wired — see
+// listing first (when a usable cold tier is configured — see
 // syncColdTierMetadata), then the hot scan, whose never-downgrade guard
 // (#683) must see the rows the cold pass flipped. The result is never nil,
 // so a caller can act on a partial pass when the hot scan fails.
@@ -916,7 +914,7 @@ func (m *Manager) scanTiers(ctx context.Context) (*ScanResult, []FileMetadata, e
 	result := &ScanResult{}
 	var coldRows []FileMetadata
 	var coldSyncErr error
-	if m.clusterGate != nil && m.coldTierUsable() {
+	if m.coldTierUsable() {
 		synced, rows, err := m.syncColdTierMetadata(ctx)
 		result.ColdSynced = synced
 		coldRows = rows

@@ -161,11 +161,9 @@ func TestRunCycle_PrimaryMigrates(t *testing.T) {
 	}
 }
 
-// Without a gate (OSS, standalone, per-node storage) the cycle must be
-// byte-for-byte what it was: in particular it never lists cold storage,
-// which is the whole blast-radius argument for wiring the gate only in
-// shared-storage mode.
-func TestRunCycle_NilGateNeverListsCold(t *testing.T) {
+// A standalone node with a usable cold tier syncs metadata before migrating,
+// even though it has no cluster gate.
+func TestRunCycle_NilGateSyncsColdAndMigrates(t *testing.T) {
 	m, hot, cold, _, cleanup := setupGatedTest(t)
 	defer cleanup()
 	ctx := context.Background()
@@ -178,8 +176,8 @@ func TestRunCycle_NilGateNeverListsCold(t *testing.T) {
 	if ok, _ := cold.Exists(ctx, gateDailyA); !ok {
 		t.Fatal("ungated node did not migrate")
 	}
-	if n := cold.lists.Load(); n != 0 {
-		t.Fatalf("cold listings = %d, want 0 without a gate", n)
+	if n := cold.lists.Load(); n != 1 {
+		t.Fatalf("cold listings = %d, want one metadata sync before migration", n)
 	}
 	if gated, role := m.MigrationGate(); gated || role != "" {
 		t.Fatalf("MigrationGate without a gate = (%v, %q), want (false, \"\")", gated, role)
