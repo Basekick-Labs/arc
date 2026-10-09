@@ -19,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
@@ -599,7 +600,7 @@ func (b *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 			ContinuationToken: continuationToken,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to list S3 objects: %w", err)
+			return nil, listError("failed to list S3 objects", err)
 		}
 
 		for _, obj := range result.Contents {
@@ -775,6 +776,26 @@ func isNotFoundError(err error) bool {
 		strings.Contains(errStr, "404")
 }
 
+// isNoSuchBucketError reports S3's answer for a bucket that does not exist.
+// The listing methods turn it into ErrStoreNotFound; they do NOT decide that
+// it means "empty" — see that sentinel's doc for why the caller decides.
+func isNoSuchBucketError(err error) bool {
+	var apiErr smithy.APIError
+	return errors.As(err, &apiErr) && apiErr.ErrorCode() == "NoSuchBucket"
+}
+
+// listError wraps a listing failure, tagging the one shape that means "the
+// bucket itself is not there" with ErrStoreNotFound. The SDK's error stays in
+// the chain either way, so a caller can ask either question. Every paginated
+// listing in this file routes its failure through here, which is what keeps
+// the five methods answering one missing bucket the same way.
+func listError(what string, err error) error {
+	if isNoSuchBucketError(err) {
+		return fmt.Errorf("%s: %w: %w", what, err, ErrStoreNotFound)
+	}
+	return fmt.Errorf("%s: %w", what, err)
+}
+
 // prefixedKey validates a storage key and prepends the configured prefix.
 //
 // Returning an error is what makes the contract hold: a new method that builds
@@ -886,7 +907,7 @@ func (b *S3Backend) ListDirectories(ctx context.Context, prefix string) ([]strin
 			ContinuationToken: continuationToken,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to list S3 directories: %w", err)
+			return nil, listError("failed to list S3 directories", err)
 		}
 
 		// CommonPrefixes contains the "directories"
@@ -933,7 +954,7 @@ func (b *S3Backend) ListObjects(ctx context.Context, prefix string) ([]ObjectInf
 			ContinuationToken: continuationToken,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to list S3 objects: %w", err)
+			return nil, listError("failed to list S3 objects", err)
 		}
 
 		for _, obj := range result.Contents {
@@ -986,7 +1007,7 @@ func (b *S3Backend) HasObjectsUnderPrefix(ctx context.Context, prefix string) (b
 			ContinuationToken: continuationToken,
 		})
 		if err != nil {
-			return false, fmt.Errorf("failed to list S3 objects: %w", err)
+			return false, listError("failed to list S3 objects", err)
 		}
 		for _, obj := range result.Contents {
 			if obj.Key == nil {
@@ -1031,7 +1052,7 @@ func (b *S3Backend) ListUnusable(ctx context.Context, prefix string) ([]Unusable
 			ContinuationToken: continuationToken,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to list S3 objects: %w", err)
+			return nil, listError("failed to list S3 objects", err)
 		}
 
 		for _, obj := range result.Contents {

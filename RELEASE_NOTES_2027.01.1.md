@@ -1180,6 +1180,34 @@ Contributed by [@efegokdemir](https://github.com/efegokdemir) in
 [#1117](https://github.com/Basekick-Labs/arc/pull/1117), combined here with
 coverage from both contributions.
 
+### A fresh object store no longer makes the database and table listings fail ([#945](https://github.com/Basekick-Labs/arc/issues/945))
+
+Most S3-compatible stores create the bucket on the first authenticated write,
+so a deployment read before its first write had no bucket yet and every
+listing failed: `GET /api/v1/databases`, `GET /api/v1/databases/{db}/measurements`,
+`SHOW DATABASES` and `SHOW TABLES` all answered 500 with `NoSuchBucket` until
+data arrived. Those four now answer an empty result instead.
+
+The five listing operations on both object-store backends — listing keys,
+listing directories, listing objects, enumerating unusable objects, and
+checking whether a prefix holds any object — report a bucket or container that
+does not exist as a distinct error rather than as an error message, which is
+what lets those four read paths recognise it. Only the structured
+`NoSuchBucket` and `ContainerNotFound` responses are recognised; transport
+failures, authorization failures and every other storage error stay visible,
+and a failed read of a specific object is unchanged.
+
+Everything else that lists storage still treats a store it cannot find as a
+failure, deliberately. Query planning drops a whole tier from a read when a
+listing proves the tier holds no files for the time range, and retention,
+backup, reconciliation and the Iceberg export all decide what to delete or
+publish from a listing. For those, a bucket name with a typo in it answering
+"empty" would not be a slow query or a missing log line — it would be a
+silently wrong answer, or a deletion. The two states produce the same listing
+and only the error tells them apart, so the error is what they get.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#950](https://github.com/Basekick-Labs/arc/pull/950).
+
 ### Float-to-integer conversion rejects the rounded upper bound and NaN ([#936](https://github.com/Basekick-Labs/arc/pull/936))
 
 Converting `math.MaxInt64` to a float rounds it to `2^63`, so the previous

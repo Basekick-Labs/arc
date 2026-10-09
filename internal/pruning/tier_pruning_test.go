@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
 
@@ -21,11 +22,21 @@ type tierMock struct {
 	*mockS3Backend
 	files       map[string][]string // List(prefix) -> object keys
 	errPrefixes map[string]bool     // prefixes whose listings fail
-	requested   []string
+	// storeMissing makes every listing report the bucket itself as absent,
+	// which is a FAILURE and must never read as "verified empty". BOTH
+	// methods have to honour it: a day-level (compacted-file) path is
+	// existence-checked through List, so a mutation that only neutralises
+	// ListDirectories leaves that path unverified and the tier survives for
+	// the wrong reason.
+	storeMissing bool
+	requested    []string
 }
 
 func (m *tierMock) ListDirectories(ctx context.Context, prefix string) ([]string, error) {
 	m.requested = append(m.requested, prefix)
+	if m.storeMissing {
+		return nil, fmt.Errorf("failed to list S3 directories: %w", storage.ErrStoreNotFound)
+	}
 	if m.errPrefixes[prefix] {
 		return nil, fmt.Errorf("injected listing error for %s", prefix)
 	}
@@ -34,6 +45,9 @@ func (m *tierMock) ListDirectories(ctx context.Context, prefix string) ([]string
 
 func (m *tierMock) List(ctx context.Context, prefix string) ([]string, error) {
 	m.requested = append(m.requested, prefix)
+	if m.storeMissing {
+		return nil, fmt.Errorf("failed to list S3 objects: %w", storage.ErrStoreNotFound)
+	}
 	if m.errPrefixes[prefix] {
 		return nil, fmt.Errorf("injected listing error for %s", prefix)
 	}
@@ -79,6 +93,42 @@ func TestPruneTierPaths_RemoteUsesBackendRelativeKeys(t *testing.T) {
 		if strings.HasPrefix(prefix, "tenant1/") || strings.Contains(prefix, "bucket") {
 			t.Fatalf("backend asked to list %q — key must be relative to the backend root (double-prefix bug)", prefix)
 		}
+	}
+}
+
+// The counterpart to TestPruneTierPaths_VerifiedEmptyDropsTier, and the
+// reason the backends report a missing bucket as an error rather than as an
+// empty listing (#945, #950). The two states produce the same *listing* —
+// nothing came back — and only the error tells them apart. If a missing store
+// listed empty, `verified` would stay true, every generated hour path would
+// filter out, and this would return TierPruneEmpty: combineTierPruneResults
+// then contributes no path at all for the tier whenever another tier pruned
+// successfully (the normal hot+cold configuration), so a typo in
+// tiered_storage.cold.s3_bucket would make a windowed query return the hot
+// tier's rows alone with success:true, no truncation flag and nothing above
+// Debug. Keeping it a failure means the tier stays in and DuckDB says so.
+func TestPruneTierPaths_MissingStoreKeepsTheTier(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+	backend := &tierMock{
+		mockS3Backend: &mockS3Backend{existingDirs: map[string][]string{}},
+		files:         map[string][]string{},
+		storeMissing:  true,
+	}
+	glob := "s3://bucket/db/cpu/**/*.parquet"
+
+	paths, outcome := p.PruneTierPaths(context.Background(), glob, "db", "cpu",
+		tierRange(t, "2024-03-15T14:00:00Z", "2024-03-15T16:00:00Z"), backend, false)
+
+	// The tier must stay IN the read. Which non-empty outcome it takes is an
+	// implementation detail — a listing failure keeps the paths unverified,
+	// so this is TierPrunePruned with every generated path — but
+	// TierPruneEmpty is the one answer that would drop the tier, and it must
+	// never be reachable from a store that does not exist.
+	if outcome == TierPruneEmpty {
+		t.Fatal("a missing store was reported as TierPruneEmpty; the tier would be dropped from the read")
+	}
+	if len(paths) == 0 {
+		t.Fatalf("outcome = %v with no paths: the tier contributes nothing to the read", outcome)
 	}
 }
 

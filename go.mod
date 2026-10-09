@@ -35,6 +35,7 @@ require (
 
 require (
 	github.com/apache/iceberg-go v0.7.0
+	github.com/aws/smithy-go v1.28.1
 	github.com/hashicorp/go-msgpack/v2 v2.1.1
 	golang.org/x/sys v0.47.0
 )
@@ -62,7 +63,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sso v1.35.1 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.40.1 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.47.1 // indirect
-	github.com/aws/smithy-go v1.28.1 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
 	github.com/boltdb/bolt v1.3.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect

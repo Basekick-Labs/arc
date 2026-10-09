@@ -739,17 +739,23 @@ func isValidDatabaseName(name string) bool {
 func (h *DatabasesHandler) listDatabases(ctx context.Context) ([]string, error) {
 	var databases []string
 
-	// Use DirectoryLister if available
+	// A store that does not exist yet reads as "no databases", not as a 500.
+	// Most S3-compatible stores create the bucket on the first authenticated
+	// write, so a fresh deployment queried before its first write is in a
+	// state that heals itself (#945). This is one of the four read paths that
+	// opt into that leniency; every other consumer of these listings still
+	// sees the error, because a missing store must not read as "verified
+	// empty" to anything that decides from it. See storage.ErrStoreNotFound.
 	if lister, ok := h.storage.(storage.DirectoryLister); ok {
 		dirs, err := lister.ListDirectories(ctx, "")
-		if err != nil {
+		if err != nil && !storage.IsStoreNotFound(err) {
 			return nil, err
 		}
 		databases = dirs
 	} else {
 		// Fall back to List and extract unique top-level directories
 		files, err := h.storage.List(ctx, "")
-		if err != nil {
+		if err != nil && !storage.IsStoreNotFound(err) {
 			return nil, err
 		}
 		databases = extractTopLevelDirs(files)
@@ -879,10 +885,14 @@ func (h *DatabasesHandler) listMeasurements(ctx context.Context, database string
 	// Use a set to deduplicate measurements from hot and cold tiers
 	measurementSet := make(map[string]bool)
 
-	// Get measurements from hot tier
+	// Get measurements from hot tier. A store that does not exist yet
+	// contributes nothing rather than failing the request, as listDatabases
+	// does and for the same reason (#945, storage.ErrStoreNotFound); the
+	// tiering metadata below still gets its say, so a cold-only measurement
+	// is still listed.
 	if lister, ok := h.storage.(storage.DirectoryLister); ok {
 		dirs, err := lister.ListDirectories(ctx, database+"/")
-		if err != nil {
+		if err != nil && !storage.IsStoreNotFound(err) {
 			return nil, err
 		}
 		for _, m := range dirs {
@@ -891,7 +901,7 @@ func (h *DatabasesHandler) listMeasurements(ctx context.Context, database string
 	} else {
 		// Fall back to List and extract unique subdirectories
 		files, err := h.storage.List(ctx, database+"/")
-		if err != nil {
+		if err != nil && !storage.IsStoreNotFound(err) {
 			return nil, err
 		}
 		for _, m := range extractSubdirectories(files, database) {
