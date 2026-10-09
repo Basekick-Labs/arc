@@ -725,6 +725,8 @@ Raft records a promoted writer before the election goroutine updates the manager
 Raft state in that gap and fail. They now wait for the manager state they assert.
 Runtime election behaviour is unchanged.
 
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1200](https://github.com/Basekick-Labs/arc/pull/1200).
+
 ### Delete API removes the inactive SQL Server prefix scan ([#1077](https://github.com/Basekick-Labs/arc/issues/1077))
 
 The WHERE validator no longer lists or checks `xp_` and `sp_`. The lowercase
