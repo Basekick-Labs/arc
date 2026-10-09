@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -71,7 +72,7 @@ func TestRecoveryRowRangesResumeAcrossBatchSize(t *testing.T) {
 						require.NoError(t, w.MarkFlushed([]string{id}))
 						return nil
 					},
-					CheckpointRecovered: func([]string) error { t.Fatal("partial entry finalized"); return nil },
+					CheckpointRecovered: func(context.Context, []string) error { t.Fatal("partial entry finalized"); return nil },
 				})
 				require.NoError(t, err)
 				require.Equal(t, 2, stats.KeptFiles, "retained source plus unvisited active file")
@@ -104,7 +105,7 @@ func TestRecoveryRowRangesResumeAcrossBatchSize(t *testing.T) {
 						return w.MarkFlushed([]string{id})
 					},
 					BeforeDelete: func(context.Context) error { require.Len(t, seen, 7); return nil },
-					CheckpointRecovered: func(parents []string) error {
+					CheckpointRecovered: func(_ context.Context, parents []string) error {
 						finalized++
 						require.Equal(t, ids, parents)
 						return w.MarkFlushed(parents)
@@ -145,7 +146,7 @@ func TestRecoveryRowRangeFinalizationFailure(t *testing.T) {
 					}
 					return nil
 				},
-				CheckpointRecovered: func([]string) error {
+				CheckpointRecovered: func(context.Context, []string) error {
 					require.Equal(t, "checkpoint", stage, "finalized before successful barrier")
 					return errors.New("checkpoint unavailable")
 				},
@@ -163,7 +164,10 @@ func TestRecoveryRowRangeFinalizationFailure(t *testing.T) {
 				return nil
 			}
 			opts.BeforeDelete = func(context.Context) error { return nil }
-			opts.CheckpointRecovered = func(parents []string) error { require.Equal(t, ids, parents); return w.MarkFlushed(parents) }
+			opts.CheckpointRecovered = func(_ context.Context, parents []string) error {
+				require.Equal(t, ids, parents)
+				return w.MarkFlushed(parents)
+			}
 			stats, err = NewRecovery(dir, zerolog.Nop()).RecoverWithOptions(context.Background(), nil, opts)
 			require.NoError(t, err)
 			require.Zero(t, stats.RecoveredEntries)
@@ -229,7 +233,7 @@ func TestRecoveryRowBatchCancellationKeepsWAL(t *testing.T) {
 	stats, err := NewRecovery(dir, zerolog.Nop()).RecoverWithOptions(ctx, nil, &RecoveryOptions{
 		BatchSize:           1,
 		TrackedRowCallback:  func(context.Context, []map[string]interface{}, string) error { calls++; cancel(); return nil },
-		CheckpointRecovered: func([]string) error { t.Fatal("cancelled entry finalized"); return nil },
+		CheckpointRecovered: func(context.Context, []string) error { t.Fatal("cancelled entry finalized"); return nil },
 	})
 	require.ErrorIs(t, err, context.Canceled)
 	require.Equal(t, 1, calls)
@@ -239,6 +243,11 @@ func TestRecoveryRowBatchCancellationKeepsWAL(t *testing.T) {
 	require.True(t, os.IsNotExist(err), "cancellation must not count as a poison strike")
 }
 
+// A checkpoint range that ends past its entry's row count is a POISON ENTRY,
+// and takes the strike path. It used to abort the whole pass with
+// `return stats, err` and record no strike, so MaxReplayFailures never
+// advanced, the file was never quarantined, and every later file was left
+// unread — permanently, with no operator exit.
 func TestRecoveryRowCheckpointOutOfBoundsKeepsWAL(t *testing.T) {
 	dir := t.TempDir()
 	w := crashRecoveryWriter(t, dir)
@@ -253,9 +262,12 @@ func TestRecoveryRowCheckpointOutOfBoundsKeepsWAL(t *testing.T) {
 			return nil
 		},
 	})
-	require.ErrorContains(t, err, "beyond entry length")
+	require.NoError(t, err, "a poison entry must not abandon the pass")
 	require.Equal(t, 1, stats.KeptFiles)
+	require.Zero(t, stats.QuarantinedFiles)
 	require.FileExists(t, path)
+	require.FileExists(t, path+replayAttemptsSuffix,
+		"the strike must be recorded, or the quarantine threshold never advances")
 }
 
 func TestTrackedRecoveryBatchBound(t *testing.T) {
@@ -264,4 +276,61 @@ func TestTrackedRecoveryBatchBound(t *testing.T) {
 		rows[i] = map[string]interface{}{"index": i}
 	}
 	testTrackedRecoveryBatchBound(t, rows, 3)
+}
+
+// The point of taking the strike path rather than returning: MaxReplayFailures
+// now advances, so the poison file is quarantined and the operator has an exit.
+// Before this, the pass returned with no strike recorded, the condition was
+// permanent, and every later file was left unread forever.
+func TestRecoveryRowCheckpointOutOfBoundsEventuallyQuarantines(t *testing.T) {
+	dir := t.TempDir()
+	poisonWriter := crashRecoveryWriter(t, dir)
+	ids, err := poisonWriter.AppendTracked([]map[string]interface{}{{"index": 0}})
+	require.NoError(t, err)
+	poison := poisonWriter.CurrentFile()
+	require.NoError(t, poisonWriter.MarkFlushed([]string{recoveryRowIdentity(ids[0], 0, 2)}))
+	require.NoError(t, poisonWriter.Close())
+
+	// A healthy file that sorts AFTER the poison one, so reaching it is
+	// evidence the pass did not stop at the poison file.
+	laterWriter := crashRecoveryWriter(t, dir)
+	require.NoError(t, laterWriter.Append([]map[string]interface{}{{"index": 99}}))
+	later := laterWriter.CurrentFile()
+	require.Greater(t, filepath.Base(later), filepath.Base(poison))
+	require.NoError(t, laterWriter.Close())
+
+	recovery := NewRecovery(dir, zerolog.Nop())
+	replayed := 0
+	// Row entries all route through TrackedRowCallback when it is set, so this
+	// counts the LATER file's replay. The poison entry never reaches it: the
+	// coverage check fails first, which passes 1 and 2 assert.
+	opts := func() *RecoveryOptions {
+		return &RecoveryOptions{
+			TrackedRowCallback: func(_ context.Context, records []map[string]interface{}, _ string) error {
+				replayed += len(records)
+				return nil
+			},
+			MaxReplayFailures: 3,
+		}
+	}
+
+	// Strikes 1 and 2 keep the file. The pass still stops at it, as it does for
+	// every other poison shape, so the later file is not reached yet.
+	for pass := 1; pass <= 2; pass++ {
+		stats, err := recovery.RecoverWithOptions(context.Background(), nil, opts())
+		require.NoError(t, err, "pass %d", pass)
+		require.Zero(t, stats.QuarantinedFiles, "pass %d", pass)
+		require.FileExists(t, poison, "pass %d", pass)
+		require.FileExists(t, later, "pass %d", pass)
+		require.Zero(t, replayed, "pass %d stopped at the poison file, as every poison shape does", pass)
+	}
+
+	// Strike 3 quarantines, and the pass then carries on to the later file.
+	stats, err := recovery.RecoverWithOptions(context.Background(), nil, opts())
+	require.NoError(t, err)
+	require.Equal(t, 1, stats.QuarantinedFiles)
+	require.NoFileExists(t, poison, "the poison file is renamed, not deleted")
+	require.FileExists(t, poison+".failed", "quarantine must preserve the original bytes")
+	require.Equal(t, 1, replayed, "the later file must be reached once the poison file is quarantined")
+	require.NoFileExists(t, later)
 }

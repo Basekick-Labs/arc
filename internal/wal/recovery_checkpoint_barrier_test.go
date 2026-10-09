@@ -117,7 +117,7 @@ func testRecoveryCheckpointOnlyBarrier(t *testing.T, rows []map[string]interface
 					return nil
 				},
 				BeforeDelete: func(context.Context) error { t.Fatal("covered ranges triggered a flush"); return nil },
-				CheckpointRecovered: func(parents []string) error {
+				CheckpointRecovered: func(_ context.Context, parents []string) error {
 					finalized++
 					require.Equal(t, ids, parents)
 					require.FileExists(t, path)

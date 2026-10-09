@@ -1,9 +1,15 @@
 # WAL recovery monitoring
 
-Arc exports `arc_wal_dir_bytes`, the current size of `*.wal` files and
-quarantined `*.failed` WAL files. The gauge is sampled every 15 seconds while
-WAL maintenance is running. Quarantined files remain on disk for operator
-inspection and are included in the size.
+Arc exports `arc_wal_dir_bytes`, the current size of **every file in the WAL
+directory**. The gauge is sampled every 15 seconds while WAL maintenance is
+running. Quarantined `*.failed` files, `.wal.recovery` attempt sidecars and
+legacy `.wal.recovered` files all remain on disk and are included, because they
+occupy the volume this alert protects — and they are what accumulates when
+recovery is failing. Point `wal.directory` at a volume reserved for the WAL; on
+a shared path the gauge will include whatever else lives there.
+
+Before 27.01.1 the gauge counted only `*.wal` and `*.failed`, so expect a
+one-time step up on upgrade — enough to trip the growth alert below once.
 
 Two useful starting alerts are:
 
@@ -104,6 +110,26 @@ complete, retain this binary and the complete WAL set or restore a consistent
 paired WAL/storage snapshot; do not perform a blind rollback onto storage that
 has advanced.
 
+**Is the drain finished?** `arc_wal_partial_row_recovery_pending` is `1` while
+the last recovery pass retained a file for which at least one row range of a
+parent entry was replayed, and `0` once a pass ends with none. Those ranges are
+checkpointed on the next flush, so the parent entry can be present on disk with
+part of it already proven durable — which is what an older binary replays in
+full. A `Warn` naming the file count is logged on the same condition, including
+when the pass itself returned an error. Wait for `0` before rolling back:
+
+```promql
+# Do not downgrade while this is 1.
+arc_wal_partial_row_recovery_pending > 0
+```
+
+One limitation to know: the hazard is a property of the directory, while the
+gauge reports **what the last pass observed**. A pass that cannot read a file at
+all — a permission or I/O error before any row range is examined — leaves that
+file's residue in place and still reports `0`, and so does a file rejected for
+an out-of-range checkpoint. Read it alongside
+`arc_wal_quarantined_files_total` and the recovery `Error` lines, not alone.
+
 ## Reclaiming retained and quarantined files
 
 There is no age-based fallback for retained files. A file's age, a successful
@@ -195,9 +221,25 @@ Completed failed replay passes are recorded in a small `<file>.wal.recovery`
 sidecar. Its update is written to a temporary file, synced, renamed atomically,
 and the directory is synced before quarantine can proceed. Restarting Arc no
 longer resets the threshold (three failed passes by default). The sidecar stores
-only a format version, attempt count, file size and modification timestamp;
-it contains no records. A changed size or timestamp starts a new attempt series
-for an operator-repaired file.
+only a format version, attempt count, file size, modification timestamp and,
+when the file's tail could be read, a CRC of its final 64 KiB; it contains no
+records. A changed size, timestamp or tail starts a new attempt series for an
+operator-repaired file. An empty file, or one whose tail cannot be read, stores
+no CRC and keeps the size-and-timestamp comparison alone.
+
+The tail CRC exists because size and modification time cannot see every repair.
+On a filesystem with coarse timestamp granularity — one second on some network
+mounts, which is where repairs happen — a file rewritten **in place** to the
+same length within one tick looks untouched and inherits its strikes. A repair
+that truncates to the last good entry or rewrites the tail changes those bytes
+and is detected. **A repair confined to the middle of a large file still
+inherits its strikes**; to start a new series explicitly, remove the file's
+`.wal.recovery` sidecar, or touch the file so its timestamp moves.
+
+The sidecar's format version is unchanged, so a sidecar written by this version
+is still read by an earlier one — which ignores the tail fields and falls back
+to its own size-and-timestamp comparison. Downgrading does not strand a WAL
+directory on the sidecar format.
 
 Cancellation of recovery and failure of the flush barrier do not add strikes.
 Successful replay clears prior strikes. Attempts interrupted before their
@@ -209,9 +251,16 @@ the WAL when restoring a stopped node, preserving file timestamps. If attempt
 metadata cannot be read or written, recovery reports an error and retains the
 WAL rather than guessing a count. Investigate filesystem permissions, free
 space or malformed metadata before retrying. Sidecars are removed after a
-successful replay or quarantine; cleanup failures are logged. A process crash
-may leave an unreferenced `.wal-recovery-*` temporary file, which is not replayed
-or used as a checkpoint.
+successful replay or quarantine; cleanup failures are logged.
+
+Each recovery pass reclaims its own residue before it reads anything: an
+unreferenced `.wal-recovery-*` temporary file left by a crash, and an attempt
+sidecar whose WAL file is gone. Sidecars are kept whenever the WAL file merely
+cannot be stat'ted, and whenever a quarantined sibling exists, because the
+sidecar is the strike history those files are reconciled against. Legacy
+`.wal.recovered` files are **not** reclaimed automatically and nothing schedules
+their cleanup; after verifying their contents are accounted for, an operator can
+remove them to bring `arc_wal_dir_bytes` down.
 
 ## Recovery wait budget
 
@@ -222,6 +271,14 @@ for queue space or storage completion. Each barrier waits for at most
 deadline. This is a budget for the barrier's wait, not a new timeout started at
 enqueue for each storage write. It does not bound file scanning or the entire
 healthy recovery pass.
+
+The same key bounds a second, different wait: admission of the recovered
+parents' checkpoint to the WAL queue. A value of `0` is documented as "no
+timeout" for flushes but takes the 30-second fallback here, as it does for the
+forced maintenance rotation. The budget covers admission only — once the
+checkpoint entry is queued, recovery waits for it to be written, because
+abandoning that wait would leave the parent's sequence pinned and stop the
+sequence-floor purge from reclaiming anything for the life of the process.
 
 On deadline expiry or the first observed flush failure, recovery retains the
 affected WAL files and retries through normal maintenance. Records not yet

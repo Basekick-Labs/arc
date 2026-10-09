@@ -1115,6 +1115,16 @@ func main() {
 	if walWriter != nil {
 		shutdownCoordinator.Register("wal-purge", shutdownFunc(func() error {
 			if !arrowBuffer.CloseFlushedCleanly() {
+				// Same retention, two different causes. Sending an operator to
+				// "the buffer flush errors logged above" when a recovery pass
+				// merely kept a file points them at logs that do not exist.
+				if arrowBuffer.RetainedForWALRecoveryOnly() {
+					log.Warn().
+						Msg("Retaining WAL files: a WAL recovery pass is still outstanding — files were kept, a flush barrier failed, " +
+							"or the pass returned an error. No buffer flush failed. Those files will be replayed on next startup; " +
+							"do not clear the WAL directory.")
+					return nil
+				}
 				log.Error().
 					Msg("Retaining WAL files: buffer flush did not complete cleanly on shutdown. " +
 						"Unflushed records remain in the WAL and will be replayed on next startup. " +
@@ -1150,6 +1160,24 @@ func main() {
 		if walWriter != nil {
 			startupActiveFile = walWriter.CurrentFile()
 		}
+
+		// Parent finalization waits for WAL queue capacity instead of dropping
+		// on a full queue, the same trade the forced maintenance rotation took
+		// (#1009). It needs its OWN deadline: the startup pass runs on
+		// context.Background(), so threading the pass context alone would bound
+		// nothing. Same source as the rotation timeout below.
+		checkpointRecovered := newCheckpointRecovered(walWriter,
+			time.Duration(cfg.Ingest.FlushTimeoutSeconds)*time.Second)
+
+		// Mirrors RecoveryStats.PartialRowEntries: 1 while the last pass left
+		// partially checkpointed row ranges on disk, which is the state an
+		// older binary replays in full. Makes the downgrade guidance checkable.
+		updatePartialRowRecovery := func(stats *wal.RecoveryStats) {
+			if stats == nil {
+				return
+			}
+			metrics.Get().SetWALPartialRowRecoveryPending(stats.PartialRowEntries > 0)
+		}
 		// NOTE: no MinFileAge here — startup recovery runs exactly once,
 		// before any ingest, so there is no rotation race (the active file
 		// is fully identified by SkipActiveFile), and a just-crashed
@@ -1163,7 +1191,7 @@ func main() {
 			ColumnarCallback:    columnarCallback,
 			TrackedRowCallback:  createTrackedWALRecoveryCallback(arrowBuffer, logger.Get("wal-recovery")),
 			ValidateTrackedRows: validateTrackedWALRecoveryRows,
-			CheckpointRecovered: walWriter.MarkFlushed,
+			CheckpointRecovered: checkpointRecovered,
 			BeforeDelete:        arrowBuffer.NewRecoveryFlushBarrier(),
 			BarrierBatchFiles:   16,
 			BarrierBatchRows:    cfg.Ingest.MaxBufferSize,
@@ -1192,6 +1220,7 @@ func main() {
 			if recoveryStats.KeptFiles > 0 || recoveryStats.BarrierFailures > 0 {
 				recoveryNeedsRetry = true
 			}
+			updatePartialRowRecovery(recoveryStats)
 		}
 		if recoveryNeedsRetry {
 			arrowBuffer.MarkWALRecoveryPending()
@@ -1313,12 +1342,17 @@ func main() {
 							ColumnarCallback:           columnarCallback,
 							TrackedRowCallback:         createTrackedWALRecoveryCallback(arrowBuffer, walLogger),
 							ValidateTrackedRows:        validateTrackedWALRecoveryRows,
-							CheckpointRecovered:        walWriter.MarkFlushed,
+							CheckpointRecovered:        checkpointRecovered,
 							BeforeDelete:               arrowBuffer.NewRecoveryFlushBarrier(),
 							BarrierBatchFiles:          16,
 							BarrierBatchRows:           cfg.Ingest.MaxBufferSize,
 							MaxReplayFailures:          3,
 						})
+						// Before the error branch: the recovery Warn fires from
+						// inside the pass whatever its outcome, so a gauge
+						// updated only on success would contradict it — and a
+						// failed pass is when the residue is most likely.
+						updatePartialRowRecovery(stats)
 						if err != nil {
 							walLogger.Error().Err(err).Msg("WAL recovery after flush failure failed")
 						} else {

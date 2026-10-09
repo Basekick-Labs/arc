@@ -951,7 +951,33 @@ func (w *Writer) AppendRawWithMetaTracked(database string, payload []byte) ([]st
 // MarkFlushed appends a checkpoint after the corresponding data entries have
 // reached durable storage. A failed checkpoint is safe: it can only cause a
 // replay duplicate, never data loss.
+//
+// Admission is non-blocking — a full queue returns ErrWALDropped — because this
+// is the production ingest flush path (ArrowBuffer.markWALFlushed). Completion
+// already blocks on the writer loop's reply. Use MarkFlushedContext from
+// recovery, which needs the opposite trade.
 func (w *Writer) MarkFlushed(hashes []string) error {
+	return w.markFlushed(context.Background(), hashes, false)
+}
+
+// MarkFlushedContext is MarkFlushed with a cancellable, blocking admission wait
+// instead of the drop-on-full enqueue.
+//
+// Recovery's parent finalization runs under the same sustained queue pressure
+// that made the forced maintenance rotation unreliable (#1009) — same pass, same
+// queue — but was left on the dropping path when rotation moved off it. A
+// dropped checkpoint retains the replayed file for another pass, which is safe
+// but is one of the ways a file stays retained long enough to matter.
+//
+// ctx bounds ADMISSION only. Once an entry is admitted the checkpoint will be
+// written, so the reply is waited for unconditionally — see markFlushed. On a
+// cancelled admission or a closed writer this returns an error, so the caller
+// retains the WAL and replays later: at-least-once, never at-most-once.
+func (w *Writer) MarkFlushedContext(ctx context.Context, hashes []string) error {
+	return w.markFlushed(ctx, hashes, true)
+}
+
+func (w *Writer) markFlushed(ctx context.Context, hashes []string, blocking bool) error {
 	if len(hashes) == 0 {
 		return nil
 	}
@@ -973,16 +999,46 @@ func (w *Writer) MarkFlushed(hashes []string) error {
 		binary.BigEndian.PutUint32(entryData[12:16], checksum)
 		copy(entryData[WALEntryHeaderSize:], checkpoint)
 		done := make(chan error, 1)
-		if err := w.tryEnqueueEntry(walEntry{
+		entry := walEntry{
 			data:         entryData,
 			durable:      true,
 			done:         done,
 			foreignProof: w.coversForeignIdentity(hashes[start:end]),
-		}); err != nil {
-			return err
 		}
-		if err := <-done; err != nil {
-			return fmt.Errorf("failed to persist WAL flush checkpoint: %w", err)
+		if blocking {
+			if err := w.enqueueEntryBlocking(ctx, entry); err != nil {
+				return err
+			}
+			// Admission was the only unbounded step and it is now behind us,
+			// so the reply is NOT waited on with ctx.
+			//
+			// Abandoning it here would be a WAL-growth bug, not a timeout: the
+			// writer loop still writes this checkpoint durably, but the
+			// releasePending below would be skipped, so the parent's sequence
+			// stays in pendingSeqs, MinUnflushedSequence holds the purge floor
+			// down, and PurgeFlushed stops at the first retained file — the WAL
+			// never reclaims anything again for the life of the process. That
+			// is the hazard ForgetTracked's own comment describes (#676), and
+			// it does NOT self-heal: a later pass SKIPS the entry because its
+			// checkpoint is durable, so CheckpointRecovered is never called for
+			// that parent a second time.
+			select {
+			case err := <-done:
+				if err != nil {
+					return fmt.Errorf("failed to persist WAL flush checkpoint: %w", err)
+				}
+			case <-w.done:
+				// Shutdown. The release is skipped, but pendingSeqs does not
+				// outlive the process and the caller retains its file.
+				return errors.New("WAL writer is closed")
+			}
+		} else {
+			if err := w.tryEnqueueEntry(entry); err != nil {
+				return err
+			}
+			if err := <-done; err != nil {
+				return fmt.Errorf("failed to persist WAL flush checkpoint: %w", err)
+			}
 		}
 		w.releasePending(hashes[start:end])
 	}
@@ -1107,6 +1163,35 @@ func (w *Writer) appendEnvelopedEntry(dbBytes []byte, envelopeHeaderLen int, pay
 // is what keeps a file holding only checkpoints reclaimable.
 func (w *Writer) tryEnqueue(entryData []byte) error {
 	return w.tryEnqueueEntry(walEntry{data: entryData, untrackedData: true})
+}
+
+// enqueueEntryBlocking waits for queue capacity instead of dropping the entry,
+// using the same FIFO as data so every preceding accepted entry is written
+// first.
+//
+// w.mu is taken only to read w.closed and is released BEFORE the wait: the
+// writer loop needs it to write the entries that free the capacity this wait is
+// for, which is the constraint RotateContext documents. A Close racing the wait
+// is caught by the w.done arm, and that error retains the caller's file rather
+// than claiming a durability proof that was never written.
+func (w *Writer) enqueueEntryBlocking(ctx context.Context, entry walEntry) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	w.mu.Lock()
+	closed := w.closed
+	w.mu.Unlock()
+	if closed {
+		return errors.New("WAL writer is closed")
+	}
+	select {
+	case w.entryChan <- entry:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-w.done:
+		return errors.New("WAL writer is closed")
+	}
 }
 
 func (w *Writer) tryEnqueueEntry(entry walEntry) error {

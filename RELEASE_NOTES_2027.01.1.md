@@ -1620,6 +1620,78 @@ quarantined data is disposable.
 
 Contributed by [@jallegri](https://github.com/jallegri) in [#1118](https://github.com/Basekick-Labs/arc/pull/1118).
 
+### WAL recovery follow-ups: honest shutdown attribution, an exit for a bad checkpoint, and a directory that reclaims itself
+
+Seven findings left open when #1118 merged. None of them lost data; several had
+no operator exit.
+
+**Two metrics shipped in #1118 without being announced.**
+`arc_wal_dir_bytes` is the size of the WAL directory, sampled every 15 seconds,
+and `arc_wal_quarantined_files_total` counts files moved aside after repeated
+replay failures. The [WAL operations guide](docs/operations/wal-recovery.md)
+carries alert expressions for both.
+
+**`arc_wal_dir_bytes` now counts every file in the WAL directory**, not just
+`*.wal` and `*.failed`. The names it skipped — `.wal.recovery` attempt
+sidecars, `.wal-recovery-*` write temporaries, legacy `.wal.recovered` files —
+are exactly what accumulates when recovery is failing, which is the state its
+capacity alert exists for. **Expect a one-time step up on upgrade**, enough to
+trip a growth alert once. Legacy `.wal.recovered` files are still not reclaimed
+automatically; the guide says how to remove them.
+
+**A clean shutdown after a kept WAL file no longer reports a flush failure that
+did not happen.** A startup recovery pass that retained a file, or whose flush
+barrier failed, armed the retry through the same flag the shutdown WAL purge
+reads — so every later shutdown logged, at `Error`, "buffer flush did not
+complete cleanly on shutdown … Investigate the buffer flush errors logged
+above", pointing the operator at logs that do not exist. The WAL is still
+retained, which was always correct; the message is now a `Warn` naming the
+outstanding recovery pass. A genuine flush failure keeps the `Error`, and keeps
+it when both are true.
+
+**A row checkpoint describing rows beyond its entry no longer stalls recovery
+permanently.** It abandoned the whole pass without recording a replay attempt,
+so the quarantine threshold never advanced, the file was never moved aside, and
+every later WAL file was left unread — with no way out. It is now treated as the
+poison entry it is: the file is kept, struck, and quarantined on the third pass,
+with its bytes and checkpoints preserved. Clean files already replayed in the
+same batch are now reclaimed rather than retained alongside it.
+
+**Recovery reclaims its own residue.** Every pass now removes
+`.wal-recovery-*` temporaries left by a crash and attempt sidecars whose WAL
+file is gone — every purge path deleted the `*.wal` and left the sidecar
+behind, for the life of the node. A sidecar is kept when its WAL file merely
+cannot be stat'ted, and when a quarantined sibling exists, because it is the
+strike history those files are reconciled against.
+
+**Recovery's parent checkpoints wait for WAL queue capacity** instead of
+returning `ErrWALDropped`, the same trade the forced maintenance rotation took
+in #1118 — same pass, same queue pressure, but finalization was left on the
+dropping path. `ingest.flush_timeout_seconds` bounds **admission** to the queue;
+a timed-out or refused admission retains the file for a later pass. Once a
+checkpoint is admitted, recovery waits for it to be written: the entry is
+written either way, and abandoning the wait would skip the pending-identity
+release, pin the unflushed sequence floor, and stop the periodic purge from
+reclaiming any WAL file for the life of the process. The ingest flush path is
+unchanged and still admits without blocking.
+
+**A repaired WAL file is more likely to start a fresh attempt series.** The
+attempt sidecar now records a CRC of the file's final 64 KiB alongside its size
+and timestamp. On a filesystem with one-second timestamp granularity — some
+network mounts, which is where repairs happen — a file rewritten in place to the
+same length within one tick looked untouched and inherited its strikes. A repair
+confined to the middle of a large file still does; remove the file's
+`.wal.recovery` sidecar to reset it explicitly. The sidecar format version is
+unchanged, so an earlier binary still reads it.
+
+**New: `arc_wal_partial_row_recovery_pending`.** `1` while the last recovery
+pass retained a file for which at least one row range of a parent entry was
+replayed — the state an older binary would replay in full — and `0` once a pass
+ends with none. This makes the guide's "finish recovery before downgrading"
+checkable instead of advisory. Read it with the quarantine counter and the
+recovery error lines: a pass that cannot read a file at all reports `0` while
+that file's residue remains.
+
 ### The tiering files endpoint rejects an invalid `limit` ([#1135](https://github.com/Basekick-Labs/arc/issues/1135))
 
 `GET /api/v1/tiering/files?limit=-1` returned a 500 and logged a stack trace. The handler read the
@@ -1743,6 +1815,35 @@ These do not change how Arc behaves. They are here because the codebase is the
 thing a new maintainer has to learn, and a refactor that moves a decision from
 four places to one is worth knowing about before you go looking for it in the
 old place.
+
+### `PurgeFlushed` and WAL recovery are now driven by the same test
+
+No test in `internal/wal` ran the writer's sequence-floor purge and a recovery
+pass together, and that interaction is where the row-range proof hazard lives: a
+flush writes a row-range checkpoint into the current file while the entries it
+describes sit in an earlier file recovery retained. A retained file from a
+previous process is not in the writer's own file order, so the purge walk never
+sees it and never stops at it — and the file carrying its only proof is an
+ordinary candidate. Deleting that proof makes the next pass replay rows already
+in storage.
+
+The #1118 fix-up pinned the proof file; nothing pinned the pin.
+`purge_recovery_interaction_test.go` now drives both, and fails if the
+`foreignProof` guard is removed. A companion test takes the inverse direction —
+full coverage replays nothing and reclaims both files — so the first cannot pass
+for the wrong reason.
+
+Two tests were also weaker than their names.
+`TestDirectoryBytesIncludesWALAndQuarantinedFiles` pinned the suffix exclusion
+for arbitrary non-WAL names but had no recovery-artifact fixture, which is the
+exclusion that mattered; it now covers sidecars, write temporaries and legacy
+`.recovered` files, and is named for what it asserts.
+`TestRecoveryAttemptMetadataFailureKeepsWAL`'s `directory` case read as
+unwritable-metadata coverage while only exercising the read path — `os.ReadFile`
+rejects a directory before the write is reached — and is renamed accordingly.
+Those cases also pin that a malformed sidecar still stalls a pass, which is
+deliberate and now says so: the error names the file and removing the sidecar
+clears it, where a bad checkpoint lives inside WAL bytes an operator cannot edit.
 
 ### A quarantine test waited on the counter, not the bookkeeping it asserts ([#1146](https://github.com/Basekick-Labs/arc/issues/1146))
 
