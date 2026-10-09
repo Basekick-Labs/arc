@@ -241,6 +241,17 @@ func (n *Node) Start() error {
 		return fmt.Errorf("failed to create snapshot store: %w", err)
 	}
 	n.snapStore = snapStore
+	snapshots, err := snapStore.List()
+	if err != nil {
+		return fmt.Errorf("failed to list Raft snapshots before startup: %w", err)
+	}
+	if len(snapshots) > 0 {
+		// raft.NewRaft synchronously restores the latest local snapshot. The
+		// coordinator registers its callback before Node.Start so it cannot
+		// miss an immediately installed peer snapshot; suppress only this
+		// known local restore.
+		n.fsm.SuppressNextSnapshotRestoredCallback()
+	}
 
 	// Create Raft instance. Inside NewRaft, hashicorp/raft synchronously
 	// calls fsm.Restore (if a snapshot exists) — path validation in
@@ -253,6 +264,7 @@ func (n *Node) Start() error {
 	// increments — see GHSA-f85q-mvg8-qf37 design notes on
 	// rejectManifestPath).
 	ra, err := raft.NewRaft(raftConfig, n.fsm, logStore, stableStore, snapStore, n.transport)
+	n.fsm.clearSnapshotRestoreCallbackSuppression()
 	if err != nil {
 		return fmt.Errorf("failed to create raft instance: %w", err)
 	}

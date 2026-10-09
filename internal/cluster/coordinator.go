@@ -157,6 +157,17 @@ type Coordinator struct {
 	// per coordinator lifetime, across repeated Start/Stop cycles in tests.
 	catchupOnce sync.Once
 
+	// A remotely installed Raft snapshot can leave local files behind that
+	// were created after the node's last local snapshot but deleted while it
+	// was offline (#1071). The FSM callback only signals; this worker waits
+	// for the leader barrier before invoking the storage reconciliation hook.
+	snapshotRestoreMu         sync.Mutex
+	snapshotRestoreHandler    func(context.Context)
+	snapshotRestoreGeneration uint64
+	snapshotRestoreSyncing    bool
+	snapshotRestorePending    bool
+	snapshotRestoreHandled    bool
+
 	// deletePending holds the local deletes the FSM delete callback has
 	// handed over and the workers have not yet taken. A slice under its own
 	// mutex, unbounded on purpose: the bounded channel it replaces dropped
@@ -668,7 +679,15 @@ func (c *Coordinator) Start() error {
 
 	// Start Raft node if configured (Phase 3)
 	if c.raftNode != nil {
+		if fsm := c.raftNode.FSM(); fsm != nil {
+			// Register before Raft starts so an early peer snapshot cannot be
+			// missed. Node suppresses the callback for its local startup restore.
+			fsm.SetSnapshotRestoredCallback(c.onSnapshotRestored)
+		}
 		if err := c.raftNode.Start(); err != nil {
+			if fsm := c.raftNode.FSM(); fsm != nil {
+				fsm.SetSnapshotRestoredCallback(nil)
+			}
 			return fmt.Errorf("failed to start raft node: %w", err)
 		}
 		c.logger.Info().Msg("Raft consensus started")
@@ -759,6 +778,113 @@ func (c *Coordinator) Start() error {
 		Msg("Cluster coordinator started")
 
 	return nil
+}
+
+// SetPostSnapshotRestoreHandler registers the asynchronous work to run once
+// after a remote snapshot has been installed and the local FSM has caught up
+// through a leader barrier. A restore may arrive before the application has
+// finished constructing its reconciliation worker, so the first completed
+// restore is retained and delivered when the handler is registered.
+func (c *Coordinator) SetPostSnapshotRestoreHandler(handler func(context.Context)) {
+	if handler == nil {
+		return
+	}
+	c.mu.RLock()
+	ctx := c.ctx
+	c.mu.RUnlock()
+
+	c.snapshotRestoreMu.Lock()
+	c.snapshotRestoreHandler = handler
+	deliver := c.snapshotRestorePending && !c.snapshotRestoreHandled
+	if deliver {
+		c.snapshotRestorePending = false
+		c.snapshotRestoreHandled = true
+	}
+	c.snapshotRestoreMu.Unlock()
+	if deliver {
+		go handler(ctx)
+	}
+}
+
+// onSnapshotRestored runs on the Raft FSM goroutine. It must remain
+// non-blocking; the barrier and optional reconciliation run in a goroutine.
+func (c *Coordinator) onSnapshotRestored() {
+	c.snapshotRestoreMu.Lock()
+	if c.snapshotRestoreHandled {
+		c.snapshotRestoreMu.Unlock()
+		return
+	}
+	c.snapshotRestoreGeneration++
+	c.snapshotRestorePending = false
+	if c.snapshotRestoreSyncing {
+		c.snapshotRestoreMu.Unlock()
+		return
+	}
+	c.snapshotRestoreSyncing = true
+	c.snapshotRestoreMu.Unlock()
+	go c.waitAndDispatchSnapshotRestore()
+}
+
+func (c *Coordinator) waitAndDispatchSnapshotRestore() {
+	c.mu.RLock()
+	ctx := c.ctx
+	raftNode := c.raftNode
+	c.mu.RUnlock()
+	if ctx == nil || raftNode == nil {
+		c.snapshotRestoreMu.Lock()
+		c.snapshotRestoreSyncing = false
+		c.snapshotRestoreMu.Unlock()
+		return
+	}
+
+	timeout := time.Duration(c.cfg.ReplicationCatchUpBarrierTimeoutMs) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	for ctx.Err() == nil {
+		c.snapshotRestoreMu.Lock()
+		generation := c.snapshotRestoreGeneration
+		c.snapshotRestoreMu.Unlock()
+
+		waitCtx, cancel := context.WithTimeout(ctx, timeout)
+		err := c.waitForManifestSync(waitCtx, raftNode, timeout)
+		cancel()
+		if err != nil {
+			if ctx.Err() != nil {
+				break
+			}
+			c.logger.Warn().Err(err).Msg("Snapshot restore reconciliation is waiting for the manifest to catch up")
+			timer := time.NewTimer(time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+			case <-timer.C:
+			}
+			continue
+		}
+
+		c.snapshotRestoreMu.Lock()
+		if generation != c.snapshotRestoreGeneration {
+			c.snapshotRestoreMu.Unlock()
+			continue
+		}
+		c.snapshotRestoreSyncing = false
+		handler := c.snapshotRestoreHandler
+		if handler == nil {
+			c.snapshotRestorePending = true
+		} else {
+			c.snapshotRestoreHandled = true
+		}
+		c.snapshotRestoreMu.Unlock()
+		if handler != nil {
+			go handler(ctx)
+		}
+		return
+	}
+
+	c.snapshotRestoreMu.Lock()
+	c.snapshotRestoreSyncing = false
+	c.snapshotRestoreMu.Unlock()
 }
 
 // Stop stops the cluster coordinator gracefully.
@@ -923,6 +1049,7 @@ func (c *Coordinator) Stop() error {
 		if fsm := raftNode.FSM(); fsm != nil {
 			fsm.SetFileCallbacks(nil, nil)
 			fsm.SetFileContentChangedCallback(nil)
+			fsm.SetSnapshotRestoredCallback(nil)
 		}
 	}
 
