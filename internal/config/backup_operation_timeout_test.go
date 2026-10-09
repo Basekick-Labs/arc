@@ -199,16 +199,22 @@ func TestObjectPrefixKeysAreValidatedAtLoad(t *testing.T) {
 	}
 }
 
-// A valid prefix is accepted, and one that can actually mis-resolve is
-// accepted too but carries a load-time warning (#1108). Rejecting it would
-// refuse a configuration existing prefixed-S3 deployments may already run.
+// Every object-store prefix that ValidateObjectPrefix accepts loads without a
+// warning, including one whose last segment is year-shaped.
 //
-// The trigger is THREE or more segments ending in a year-shaped one, which is
-// the exact condition under which the backwards year scan finds the year and
-// has two prefix segments in front of it to return. A one- or two-segment
-// year-tailed prefix resolves correctly, so warning about it would be noise,
-// and a warning operators learn to ignore is worse than none.
-func TestYearShapedPrefixTailWarnsRatherThanRefusing(t *testing.T) {
+// Such a prefix USED to warn: the query path read a database and measurement
+// off the end of a storage path by scanning backwards for a partition year,
+// so a prefix of three or more segments ending in one made it resolve the two
+// prefix segments in front of that year instead. The query path now removes
+// the configured prefix before that scan (#1108), so the shape is no longer
+// special and advising against it would send an operator to rewrite every key
+// in their bucket for nothing.
+//
+// The prefixes below are kept exactly as the warning case listed them, now
+// asserting silence, so the two halves of this change are pinned together:
+// the first group is the shape that warned, the second the shapes that never
+// did.
+func TestYearShapedPrefixTailLoadsWithoutWarning(t *testing.T) {
 	load := func(t *testing.T, prefix string) *Config {
 		t.Helper()
 		t.Chdir(t.TempDir())
@@ -222,48 +228,21 @@ func TestYearShapedPrefixTailWarnsRatherThanRefusing(t *testing.T) {
 		return cfg
 	}
 
-	for _, prefix := range []string{"arc/prod/2026", "arc/prod/2026/", "a/b/2026", "w/x/y/2026"} {
-		cfg := load(t, prefix)
-		if len(cfg.Warnings) != 1 {
-			t.Fatalf("prefix %q produced %d warnings, want 1: %+v", prefix, len(cfg.Warnings), cfg.Warnings)
-		}
-		w := cfg.Warnings[0]
-		if w.Key != "storage.s3_prefix" || w.Value != prefix {
-			t.Errorf("warning = %+v, want key storage.s3_prefix and value %q", w, prefix)
-		}
-		if !strings.Contains(w.Message, "#1108") {
-			t.Errorf("warning does not cite the issue; got %q", w.Message)
-		}
-		if !strings.Contains(w.Message, "zero rows") {
-			t.Errorf("warning does not say what goes wrong; got %q", w.Message)
-		}
-	}
-
-	// No warning. Either the last segment is not year-shaped, or the year is
-	// year-shaped but the prefix is too short for the scan to reach it:
-	//
-	//   "2026"       the year is at index 0 of the path
-	//   "arc/2026"   at index 1
-	//
-	// and the scan starts at index 2, so both fall through to the correct
-	// last-two-segments rule. Pinned from the other side in
-	// TestExtractDBMeasurementFromPathMisparsesAYearShapedPrefixTail.
 	for _, prefix := range []string{
+		// Formerly warned: three or more segments ending in a year.
+		"arc/prod/2026", "arc/prod/2026/", "a/b/2026", "w/x/y/2026",
+		// Never warned: not year-shaped, or too short for the old scan.
 		"arc", "arc/prod", "arc/2026/prod", "1999", "20260", "202",
 		"2026", "2026/", "arc/2026", "arc/2026/",
 	} {
 		if cfg := load(t, prefix); len(cfg.Warnings) != 0 {
-			t.Errorf("prefix %q warned unnecessarily: %+v", prefix, cfg.Warnings)
+			t.Errorf("prefix %q warned: %+v", prefix, cfg.Warnings)
 		}
 	}
 
-	// And no prefix at all is silent.
-	t.Chdir(t.TempDir())
-	cfg, err := Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(cfg.Warnings) != 0 {
-		t.Errorf("a default configuration warned: %+v", cfg.Warnings)
-	}
+	// There is deliberately no "and an unset prefix is silent" case here.
+	// t.Setenv holds for the whole test function, so a Load after the loop
+	// still sees the last prefix it set — the assertion that used to sit here
+	// read as a default-configuration check and was never one. The empty
+	// prefix is covered by TestObjectPrefixKeysAreValidatedAtLoad.
 }

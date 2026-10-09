@@ -51,6 +51,21 @@ func TestExtractDBMeasurementFromPathWithoutConfiguredPrefix(t *testing.T) {
 	}
 }
 
+// A configured prefix whose last segment is year-shaped resolves to the real
+// database and measurement, for both backends that carry a prefix (#1108).
+//
+// Only the two GLOB cases regress the fix; verified by mutation, by disabling
+// the trim and re-running. The other four pass against the unfixed function
+// and are here to pin that the trim does not over-reach:
+//
+//   - the FILE cases were never broken. The scan walks backwards from the end,
+//     so it reaches the partition year at index 5 before the prefix year at
+//     index 2 and answers correctly either way.
+//   - the one- and two-segment prefixes were never broken either, because the
+//     scan stops at `i >= 2` and the prefix year sits at index 0 or 1. That
+//     bound is why the problem needed three prefix segments to appear at all,
+//     and it is the only place that reasoning is now written down — the
+//     load-time warning that used to carry it is gone with the bug.
 func TestExtractDBMeasurementFromPathHandlesYearShapedStoragePrefixes(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

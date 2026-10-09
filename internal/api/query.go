@@ -3779,7 +3779,24 @@ func (h *QueryHandler) extractDBMeasurementFromPath(path string) (database, meas
 
 	// Object-store URIs include the configured key prefix. Remove it before
 	// looking for the database and measurement, since a prefix segment can
-	// itself look like a year.
+	// itself look like a year and the scan below would then read the two
+	// segments in front of it as the database and measurement (#1108).
+	//
+	// TrimPrefix on a path string normally matches mid-segment ("wh" matching
+	// "wh-other"), which is why it needs a note rather than a reader's trust.
+	// It is safe here because the value is never a bare directory name:
+	// ValidateObjectPrefix returns the prefix empty or trailing-slashed
+	// (internal/storage/objectprefix.go), and both fields document that
+	// invariant (s3.go "sanitized, with trailing /", azure.go "validated,
+	// with trailing /"). An empty prefix makes this a no-op.
+	//
+	// h.storage is the HOT backend, and it is the right one even though a
+	// cold tier carries its own, different prefix: every path that reaches
+	// this function is built by h.getStoragePath from h.storage, so the
+	// prefix on the string is always this backend's. Cold globs are built
+	// inside buildMultiTierReadParquet, which is given the database and
+	// measurement and never parses a path back out of one. LocalBackend has
+	// no GetPrefix, so the assertion fails and nothing is trimmed.
 	if backend, ok := h.storage.(interface{ GetPrefix() string }); ok {
 		path = strings.TrimPrefix(path, backend.GetPrefix())
 	}

@@ -542,16 +542,6 @@ no cold tier at all, which is a silent outage until someone reads that one log
 line. A trailing slash is added if you leave it
 off, so `arc` and `arc/` are the same destination.
 
-One caveat worth knowing before you pick a value. If a prefix has three or more
-segments and the last one looks like a year, such as `tenants/eu/2026/`,
-queries against a tiered deployment can return zero rows: the code that works
-out which database and measurement a path belongs to scans backwards for a
-year-shaped segment and finds yours. A one- or two-segment prefix is
-unaffected, because the year then sits too near the front for that scan to use
-it. Arc warns at startup if your prefix has the affected shape. This predates
-the Azure key and affects `storage.s3_prefix` identically; it is tracked in
-[#1108](https://github.com/Basekick-Labs/arc/issues/1108).
-
 ### Backup and restore runs have a configurable timeout ([#1085](https://github.com/Basekick-Labs/arc/issues/1085))
 
 Both runs were bounded by a hardcoded two hours. That is a guess that is
@@ -649,9 +639,27 @@ Three consequences worth knowing before you upgrade:
   be told it is the standby. Enable `cluster.failover_enabled` so exactly one
   holds the lease, or run a single compactor-role node — the same constraint
   Iceberg export already documents.
-### Query path parsing honours year-shaped object-store prefixes ([#1108](https://github.com/Basekick-Labs/arc/issues/1108))
+### A year-shaped storage prefix no longer makes tiered queries return zero rows ([#1108](https://github.com/Basekick-Labs/arc/issues/1108))
 
-Query routing and partition pruning now remove the configured S3 or Azure key prefix before extracting the database and measurement. A multi-segment prefix ending in a year such as `a/b/2026/` no longer makes the parser treat prefix components as the database and measurement.
+If `storage.s3_prefix` or `storage.azure_prefix` had three or more segments and
+the last one looked like a partition year, such as `tenants/eu/2026/`, queries
+against a tiered deployment could return **zero rows with HTTP 200 and no
+error**. Tier routing works out which database and measurement a storage path
+belongs to by scanning backwards for a year-shaped segment; it found the one in
+your prefix and read the two segments in front of it as the database and
+measurement. Nothing was ever written there, the tier-metadata lookup came back
+empty, and the read fell back to a glob under those wrong names.
+
+The prefix is now removed before that scan. If you ran a tiered deployment with
+a prefix of this shape, query results were silently incomplete and are correct
+after upgrading; nothing on disk was affected, so no backfill is needed. Arc
+used to warn about such a prefix at startup and no longer does, because it is
+no longer a hazard — there is no need to change a prefix you already run.
+
+Deployments without tiering were unaffected: the misread names reached only the
+stable-schema anchor lookup, which simply found nothing, and the query still
+read the correct location. Partition pruning was never affected either — it
+parses the glob from the end and always kept the prefix intact.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1156](https://github.com/Basekick-Labs/arc/pull/1156).
 
