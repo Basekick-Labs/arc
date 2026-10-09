@@ -863,9 +863,16 @@ func (m *Manager) applyPulled(ctx context.Context, info *FileMetadata) (bool, er
 	// A false result is also the normal identical-hot-row case. Inspect only
 	// that no-op path so a stale pull refused by the cold-row guard is visible
 	// without adding a read to every successful replication write.
+	// Diagnostic only, so its failure must not turn a no-op that already
+	// succeeded into a failed event: the caller counts any error as a failure
+	// and tells the operator the next tier scan will reconcile, which would be
+	// untrue and would move a metric operators alert on.
 	existing, err := m.metadata.GetFile(ctx, info.Path)
 	if err != nil {
-		return false, err
+		m.logger.Debug().Err(err).
+			Str("path", info.Path).
+			Msg("Could not read the existing tier row to explain a refused hot registration")
+		return false, nil
 	}
 	if existing != nil && (existing.Tier != TierHot || existing.QuarantinedAt != nil) {
 		m.logger.Warn().

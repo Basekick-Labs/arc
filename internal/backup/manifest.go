@@ -436,7 +436,12 @@ type Progress struct {
 	ColdFilesRestoredToHot  int64 `json:"cold_files_restored_to_hot,omitempty"`
 	// ColdFilesSkippedAlreadyCold counts hot-backup files whose matching cold
 	// copy and cold tier row already exist locally, so restore left them there.
-	ColdFilesSkippedAlreadyCold  int64 `json:"cold_files_skipped_already_cold,omitempty"`
+	ColdFilesSkippedAlreadyCold int64 `json:"cold_files_skipped_already_cold,omitempty"`
+	// HotBackupFilesRoutedToCold counts files the backup holds as hot whose
+	// local tier row now says cold, so the restore wrote them to the cold tier
+	// instead of resurrecting a hot copy (#1139). Includes the
+	// ColdFilesSkippedAlreadyCold subset, which needed no write at all.
+	HotBackupFilesRoutedToCold   int64 `json:"hot_backup_files_routed_to_cold,omitempty"`
 	ColdRestoreQuarantineSkipped int64 `json:"cold_restore_quarantine_skipped,omitempty"`
 	ColdRowsNotRecorded          int64 `json:"cold_rows_not_recorded,omitempty"`
 	// Cluster cross-check, backup only (#1083): mirrors of the manifest's
