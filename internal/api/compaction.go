@@ -168,7 +168,10 @@ func (h *CompactionHandler) getStatus(c *fiber.Ctx) error {
 	stats := h.manager.Stats()
 	response := fiber.Map{
 		"manager": fiber.Map{
-			"active_jobs":     stats["active_jobs"],
+			// Read through the accessor, not stats["active_jobs"]: this
+			// field emitted null for the life of the endpoint because
+			// nothing produced that key (#1168).
+			"active_jobs":     h.manager.ActiveJobs(),
 			"total_completed": stats["total_jobs_completed"],
 			"total_failed":    stats["total_jobs_failed"],
 		},
@@ -449,15 +452,17 @@ func (h *CompactionHandler) getActiveJobs(c *fiber.Ctx) error {
 		})
 	}
 
-	stats := h.manager.Stats()
-	activeJobCount := 0
-	if count, ok := stats["active_jobs"].(int); ok {
-		activeJobCount = count
-	}
-
 	return c.JSON(fiber.Map{
-		"active_jobs": activeJobCount,
-		"jobs":        []fiber.Map{}, // TODO: Return actual job details when available
+		// Attempts in flight, the same unit as /history records and
+		// total_jobs_*: a batch the adaptive splitter rescues is several
+		// attempts. Previously asserted .(int) out of Stats() against a key
+		// nothing set, so this answered 0 unconditionally (#1168).
+		"active_jobs": h.manager.ActiveJobs(),
+		"unit":        "attempts",
+		// Empty because no registry of in-flight attempt identities exists:
+		// only the count is tracked. Synthesizing rows from the running
+		// cycle record would invent partitions that may not be in flight.
+		"jobs": []fiber.Map{},
 	})
 }
 
