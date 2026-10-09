@@ -79,6 +79,15 @@ jobs:
       # write/read/list against a real server. The credentials in the
       # identities file match the ones hard-coded by the objectstore tests.
       #
+      # Pulled from GHCR, not Docker Hub. Docker Hub blocked this step on two
+      # consecutive runs on 2026-10-09 — first "toomanyrequests: You have
+      # reached your unauthenticated pull rate limit", then a timeout against
+      # auth.docker.io — which fails Build & Test on every PR before a single
+      # test runs. GitHub Actions has no anonymous pull limit against GHCR, and
+      # the tag is published there by the same upstream project. Verified: the
+      # GHCR image runs with the identical arguments below and the
+      # -tags=objectstore suite passes against it.
+      #
       # docker run, not a service container: the image needs the arguments
       # `server -s3 ...`, and services cannot supply arguments after the
       # image. The host port stays 9000 so ARC_TEST_S3_ENDPOINT and the
@@ -100,7 +109,7 @@ jobs:
           EOF
           docker run -d --name arc-ci-seaweedfs -p 9000:8333 \
             -v /tmp/seaweed-s3.json:/etc/seaweedfs/s3.json:ro \
-            chrislusf/seaweedfs:4.47 server -s3 -s3.port=8333 \
+            ghcr.io/chrislusf/seaweedfs:4.47 server -s3 -s3.port=8333 \
             -s3.config=/etc/seaweedfs/s3.json
           # Poll rather than sleep: the first test would otherwise race
           # startup. Any HTTP answer means the S3 gateway is listening (an
