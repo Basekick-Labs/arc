@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/basekick-labs/arc/internal/syscpu"
 	"github.com/basekick-labs/arc/internal/sysmem"
 	"github.com/spf13/viper"
 )
@@ -2155,40 +2156,15 @@ func parseStringSlice(s string) []string {
 
 // EffectiveCores reports how many CPUs this process may actually use.
 //
-// runtime.NumCPU() is not that number: it reflects cpuset/affinity but NOT a
-// CFS quota, and Kubernetes limits.cpu and docker --cpus are quotas — so a
-// 2-CPU pod on a 64-core host reports 64 (#1026, #1030). runtime.GOMAXPROCS(0)
-// IS quota-aware; since Go 1.25 the runtime computes
-// min(affinity_cpus, max(ceil(quota), 2)) and this module's go directive enables
-// it. Measured on an 8-CPU VM: --cpus=2, --cpus=1.5 and --cpus=0.5 all give 2
-// (the runtime floors at 2), while --cpuset-cpus=0-1 gives NumCPU() == 2.
+// Forwarder: internal/syscpu owns the implementation and the reasoning about
+// quotas, cpusets and the GOMAXPROCS environment variable. It lives there
+// rather than here so internal/license and internal/telemetry can ask the same
+// question without importing this package's dependency closure.
 //
-// The minimum of the two is taken because neither alone is the answer. The
-// GOMAXPROCS environment variable overrides the runtime's detection with no
-// clamp, so GOMAXPROCS=128 on an 8-CPU box really does report 128; NumCPU
-// covers cpuset limits that no quota expresses.
-//
-// Two residuals are deliberate. A GOMAXPROCS between the quota and the machine
-// size is honoured (GOMAXPROCS=32 under --cpus=2 yields 32), and
-// GODEBUG=containermaxprocs=0 disables the runtime's cgroup read altogether.
-// Both are an operator explicitly overriding their own runtime's container
-// awareness. Reading cpu.max here instead would out-guess them at the price of
-// reimplementing, for a third time, the cgroup parsing #1026 deleted.
+// Note for anything reporting a core count OUTWARD: that wants
+// syscpu.CoresAtStartup, not this. See its doc.
 func EffectiveCores() int {
-	return effectiveCores(runtime.NumCPU(), runtime.GOMAXPROCS(0))
-}
-
-// effectiveCores is the pure form, so its table tests need not mutate
-// process-global runtime state to cover it.
-func effectiveCores(numCPU, gomaxprocs int) int {
-	cores := numCPU
-	if gomaxprocs > 0 && gomaxprocs < cores {
-		cores = gomaxprocs
-	}
-	if cores < 1 {
-		cores = 1
-	}
-	return cores
+	return syscpu.EffectiveCores()
 }
 
 // effectiveCoresFn is the seam the config tests inject through. CI runners have

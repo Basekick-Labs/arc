@@ -695,6 +695,55 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Reported core counts account for the CPU quota ([#1039](https://github.com/Basekick-Labs/arc/issues/1039))
+
+`runtime.NumCPU()` reflects a cpuset but not a CFS quota, and Kubernetes
+`limits.cpu` and `docker --cpus` are quotas — so a pod limited to 2 CPUs on a
+64-core node reported **64** both to the license activation server and to fleet
+telemetry. Neither number told anyone the node could only use two.
+
+Both reports now carry the usable count as well as the machine count:
+
+- **License activation** sends a new `usable_cores` field beside the existing
+  `cores`. `cores` keeps reporting the machine's logical CPUs, so the admin
+  console's "Cores" column means what it always meant.
+- **Telemetry** sends a new `usable_cores` field beside `physical_cores` and
+  `logical_cores`, which also keep reporting the machine. No existing field
+  changes, so no fleet series steps down on upgrade.
+
+Three things worth knowing, because they are the questions this invites:
+
+**Machine-bound licenses keep verifying.** The machine fingerprint still reads
+`runtime.NumCPU()`, deliberately and separately: that value is part of what a
+bound license is checked against, so changing it would invalidate every bound
+license in the field. It is unchanged, and a test now fails if anyone sweeps it.
+
+**Neither number is an entitlement input.** The activation server accepts an
+activation whatever the core count and leaves the limit to the client, which
+enforces it at startup across GOMAXPROCS, DuckDB threads and flush workers. The
+reported values are for reporting.
+
+**The reported usable count is taken at process start.** A license enforces
+itself by pinning GOMAXPROCS down to its core limit, so a value read later
+would be `min(quota, licensed_cores)` — on a 64-core machine with a 32-core
+license, a re-activation or a telemetry tick would have reported 32 as the
+node's size, on hardware with no CPU quota at all. Taking the reading before
+anything can pin it keeps one process's reported size stable for its whole life
+and keeps the field's subject the CPU quota rather than the license.
+
+One consequence of that choice, stated rather than left to be discovered: a CPU
+limit changed **in place** without a restart — an in-place pod resize, `docker
+update --cpus` — is not picked up. The Go runtime notices within about a second,
+but the reported value does not, so it stays at whatever the limit was at boot
+until the process restarts. That is the accepted side of the trade: reading live
+instead would be wrong on every licensed node, permanently, rather than on a
+resized one until its next restart.
+
+Cluster join requests are unchanged. The core count there is an enforcement
+input checked against the license's limit, is covered by the join MAC, and is
+read after the limit is applied by design.
+
+
 ### Cancel queries when the client disconnects ([#979](https://github.com/Basekick-Labs/arc/issues/979))
 
 Queries now stop when Arc detects that the client connection has closed before

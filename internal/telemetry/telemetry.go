@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/syscpu"
 	"github.com/rs/zerolog"
 )
 
@@ -85,11 +86,32 @@ type OSInfo struct {
 	Platform     string `json:"platform"`
 }
 
-// CPUInfo contains CPU information
+// usableCoresFn is the seam the payload tests inject through. It is the STARTUP
+// snapshot, not a live read: the collector is constructed long after a licence
+// may have pinned GOMAXPROCS down to its core limit, so a live read would put
+// the licensed count in a field whose subject is the CPU quota. Follows
+// internal/config's effectiveCoresFn: unexported, so no test-only surface
+// escapes.
+var usableCoresFn = syscpu.CoresAtStartup
+
+// CPUInfo contains CPU information.
+//
+// PhysicalCores and LogicalCores are machine facts and keep reporting
+// runtime.NumCPU(), so the fleet series for them stays continuous. UsableCores
+// is what a CPU quota leaves this process, which is the number that was
+// missing: runtime.NumCPU() reflects a cpuset but not a CFS quota, so a pod
+// with limits.cpu=2 on a 64-core node reported 64 and nothing recorded that it
+// could only use 2 (#1039). A third field rather than a redefinition, matching
+// how api/server.go and metrics.go each report num_cpu beside gomaxprocs.
+//
+// No omitempty, matching the three fields around it: a reporter that omits
+// UsableCores writes a null column rather than an absent one, as FrequencyMHz
+// already does on every payload.
 type CPUInfo struct {
 	PhysicalCores *int `json:"physical_cores"`
 	LogicalCores  *int `json:"logical_cores"`
 	FrequencyMHz  *int `json:"frequency_mhz"`
+	UsableCores   *int `json:"usable_cores"`
 }
 
 // MemInfo contains memory information
@@ -235,6 +257,7 @@ func (c *Collector) sendTelemetryCtx(ctx context.Context) {
 func (c *Collector) collectPayload() *TelemetryPayload {
 	// Get CPU info
 	numCPU := runtime.NumCPU()
+	usableCores := usableCoresFn()
 
 	// Get memory info (total system memory via runtime)
 	var memStats runtime.MemStats
@@ -258,6 +281,7 @@ func (c *Collector) collectPayload() *TelemetryPayload {
 			PhysicalCores: &numCPU, // Go doesn't distinguish physical/logical easily
 			LogicalCores:  &numCPU,
 			FrequencyMHz:  nil, // Not easily available in Go without cgo
+			UsableCores:   &usableCores,
 		},
 		Memory: MemInfo{
 			TotalGB: &totalGB,
