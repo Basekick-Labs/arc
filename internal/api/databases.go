@@ -2,12 +2,14 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/fieldschema"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -21,12 +23,33 @@ type DatabasesHandler struct {
 	storage        storage.Backend
 	requestTimeout time.Duration
 	deleteConfig   *config.DeleteConfig
+	coordinator    DatabaseDeleteCoordinator
 	tieringManager *tiering.Manager
 	authManager    *auth.AuthManager
 	rbacManager    RBACChecker
 	logger         zerolog.Logger
 	icebergDropper IcebergCatalogDropper
 	fieldSchema    *fieldschema.Registry // optional, #914: anchors die with their database
+}
+
+// DatabaseDeleteCoordinator supplies the cluster-wide part of database
+// deletion. A nil coordinator preserves standalone behavior.
+type DatabaseDeleteCoordinator interface {
+	IsPrimaryWriter() bool
+	Role() string
+	GetFileManifestByDatabase(database string) []*raft.FileEntry
+	BatchFileOpsInManifestContext(ctx context.Context, ops []raft.BatchFileOp) error
+}
+
+const databaseDeleteManifestChunkSize = 500
+
+// SetCoordinator wires cluster admission and manifest updates into database
+// deletion. Call before RegisterRoutes, alongside the other handler wiring.
+func (h *DatabasesHandler) SetCoordinator(c DatabaseDeleteCoordinator) {
+	if c == nil {
+		return
+	}
+	h.coordinator = c
 }
 
 // SetFieldSchema installs the field schema registry so deleting a database
@@ -539,6 +562,15 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 			"error": "Cannot delete reserved database '" + name + "'",
 		})
 	}
+	if h.coordinator != nil && !h.coordinator.IsPrimaryWriter() {
+		role := h.coordinator.Role()
+		h.logger.Warn().Str("database", name).Str("role", role).
+			Msg("Database deletion rejected: this node is not the primary writer")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": fmt.Sprintf("database delete rejected: node role %q is not primary writer; route to the primary writer", role),
+			"role":  role,
+		})
+	}
 
 	ctx, cancel := h.storageContext(c, h.requestTimeout)
 	defer func() { cancel() }()
@@ -570,11 +602,21 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 			"error": "Failed to list database files",
 		})
 	}
-	// Deletion can make many independent storage calls. Scale the overall
-	// deadline with the number of listed files so a large database is not
-	// abandoned after the same fixed timeout as a small one.
+	var manifestEntries []*raft.FileEntry
+	if h.coordinator != nil {
+		manifestEntries = h.coordinator.GetFileManifestByDatabase(name)
+	}
+	// Deletion can make many independent storage and Raft calls. Scale the
+	// overall deadline with the local and manifest file counts so a large
+	// database is not abandoned after the same fixed timeout as a small one.
 	cancel()
-	ctx, cancel = h.storageContext(c, h.requestTimeout*time.Duration(len(files)+2))
+	ctx, cancel = h.storageContext(c, h.requestTimeout*time.Duration(len(files)+len(manifestEntries)+2))
+	if err := h.deleteDatabaseManifestEntries(ctx, name, manifestEntries); err != nil {
+		h.logger.Error().Err(err).Str("database", name).Msg("Failed to remove database files from the cluster manifest")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to prepare database deletion",
+		})
+	}
 
 	// Delete all files
 	deletedCount := 0
@@ -944,7 +986,52 @@ func (h *DatabasesHandler) databaseExists(ctx context.Context, name string) (boo
 	if err != nil {
 		return false, err
 	}
-	return len(files) > 0, nil
+	if len(files) > 0 {
+		return true, nil
+	}
+	return h.coordinator != nil && len(h.coordinator.GetFileManifestByDatabase(name)) > 0, nil
+}
+
+// deleteDatabaseManifestEntries removes the Raft manifest entries in bounded
+// batches before any local file is deleted. Raft records each successful
+// batch; on failure the caller stops so a retry can continue from the
+// remaining entries while the local copies are still available.
+func (h *DatabasesHandler) deleteDatabaseManifestEntries(ctx context.Context, database string, entries []*raft.FileEntry) error {
+	if h.coordinator == nil {
+		return nil
+	}
+	paths := make([]string, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if entry == nil || entry.Path == "" {
+			continue
+		}
+		if !strings.HasPrefix(entry.Path, database+"/") {
+			return fmt.Errorf("manifest path %q does not belong to database %q", entry.Path, database)
+		}
+		if _, ok := seen[entry.Path]; ok {
+			continue
+		}
+		seen[entry.Path] = struct{}{}
+		paths = append(paths, entry.Path)
+	}
+	sort.Strings(paths)
+
+	for start := 0; start < len(paths); start += databaseDeleteManifestChunkSize {
+		end := min(start+databaseDeleteManifestChunkSize, len(paths))
+		ops := make([]raft.BatchFileOp, 0, end-start)
+		for _, path := range paths[start:end] {
+			payload, err := json.Marshal(raft.DeleteFilePayload{Path: path, Reason: "database-delete"})
+			if err != nil {
+				return fmt.Errorf("marshal manifest delete for %q: %w", path, err)
+			}
+			ops = append(ops, raft.BatchFileOp{Type: raft.CommandDeleteFile, Payload: payload})
+		}
+		if err := h.coordinator.BatchFileOpsInManifestContext(ctx, ops); err != nil {
+			return fmt.Errorf("delete manifest batch %d-%d: %w", start, end, err)
+		}
+	}
+	return nil
 }
 
 func extractTopLevelDirs(files []string) []string {
