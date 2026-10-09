@@ -582,6 +582,11 @@ type ClusterFSM struct {
 	// the snapshot. Acks is nil until the first pause.
 	compactionPause CompactionPauseState
 
+	// restoredFromSnapshot is set by Restore so startup catch-up can verify
+	// only after an actual snapshot restore, rather than hashing every local
+	// file on every normal boot. It is process-lifetime state, not FSM state.
+	restoredFromSnapshot atomic.Bool
+
 	// Callbacks for state changes
 	onNodeAdded          func(*NodeInfo)
 	onNodeRemoved        func(string)
@@ -662,6 +667,14 @@ func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 
 		logger: logger.With().Str("component", "cluster-fsm").Logger(),
 	}
+}
+
+// RestoredFromSnapshot reports whether this FSM instance restored a Raft
+// snapshot during this process lifetime. The flag is intentionally ephemeral:
+// startup catch-up consumes it to decide whether same-size local files need
+// content verification; normal boots keep the cheap size-only path.
+func (f *ClusterFSM) RestoredFromSnapshot() bool {
+	return f.restoredFromSnapshot.Load()
 }
 
 // rejectManifestPath centralizes the FSM-side response to a path that
@@ -2415,6 +2428,7 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	if err := json.NewDecoder(rc).Decode(&snapshot); err != nil {
 		return fmt.Errorf("failed to decode snapshot: %w", err)
 	}
+	f.restoredFromSnapshot.Store(true)
 
 	// Validate every restored manifest path. Entries that fail
 	// validation are LOGGED AT ERROR + SKIPPED (NOT added to f.files)

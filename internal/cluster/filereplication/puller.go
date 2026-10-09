@@ -1045,6 +1045,26 @@ func (p *Puller) EnqueueContentChanged(entry *raft.FileEntry) {
 // disk stalls this the way it stalls every other local I/O. The one presence
 // rule the worker's pre-pull check and the walks' self-origin check share is
 // presentAtSize.
+// localFileMatchesEntry verifies a local file's content against the manifest SHA-256. It is intentionally
+// separate from the normal size-only presence check: startup catch-up is the snapshot-recovery path
+// where a same-size stale object can survive FSM.Restore without a file-registration callback.
+func (p *Puller) localFileMatchesEntry(path, wantSHA string) (bool, error) {
+	if wantSHA == "" {
+		return false, errors.New("filereplication: manifest entry has no SHA-256")
+	}
+	parent := p.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	hashCtx, cancel := context.WithTimeout(parent, 30*time.Second)
+	defer cancel()
+	h := sha256.New()
+	if err := p.cfg.Backend.ReadTo(hashCtx, path, h); err != nil {
+		return false, err
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)) == wantSHA, nil
+}
+
 func (p *Puller) statLocal(path string) (int64, error) {
 	parent := p.ctx
 	if parent == nil { // not started: tests, or a walk driven by hand

@@ -2,6 +2,7 @@ package filereplication
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"sync"
 	"testing"
@@ -10,6 +11,104 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/rs/zerolog"
 )
+
+// TestRunCatchUpDetectsSameSizeStaleCopy verifies the snapshot-recovery regression:
+// a local Parquet with the manifest size but an older SHA must be fetched again.
+func TestRunCatchUpDetectsSameSizeStaleCopy(t *testing.T) {
+	backend := newFakeBackend()
+	oldBody := []byte("old-generation")
+	newBody := []byte("new-generation")
+	// Keep both generations exactly the same size so size-only presence would skip.
+	if len(oldBody) != len(newBody) {
+		t.Fatalf("test bodies must have equal size")
+	}
+	if err := backend.Write(context.Background(), "testdb/cpu/snapshot-stale.parquet", oldBody); err != nil {
+		t.Fatalf("seed local file: %v", err)
+	}
+	hash := sha256.Sum256(newBody)
+	entry := makeEntry("testdb/cpu/snapshot-stale.parquet", "writer-1", int64(len(newBody)))
+	entry.SHA256 = fmt.Sprintf("%x", hash[:])
+
+	fetcher := newFakeFetcher(fakeFetchResult{body: newBody})
+	resolver := staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true}
+	p := newTestPuller(t, backend, fetcher, resolver)
+	p.Start(context.Background())
+	defer p.Stop()
+
+	p.RunCatchUpWithContentVerification(context.Background(), sliceFetcher([]*raft.FileEntry{entry}))
+	stats := waitStats(t, p, func(s map[string]int64) bool { return s["pulled"] == 1 })
+	if stats["pulled"] != 1 {
+		t.Fatalf("same-size stale copy was skipped: %+v", stats)
+	}
+	got, err := backend.Read(context.Background(), entry.Path)
+	if err != nil {
+		t.Fatalf("read repaired file: %v", err)
+	}
+	if string(got) != string(newBody) {
+		t.Fatalf("local content = %q, want %q", got, newBody)
+	}
+}
+
+// TestRunCatchUpSkipsSameSizeMatchingCopy verifies the cheap outcome we want
+// after the content check: an already-correct file is not downloaded again.
+// TestRunCatchUpKeepsSizeOnlyFastPathWithoutSnapshot verifies that ordinary
+// startup does not hash every local file. Content verification is explicitly
+// reserved for the snapshot-restore catch-up path.
+func TestRunCatchUpKeepsSizeOnlyFastPathWithoutSnapshot(t *testing.T) {
+	backend := newFakeBackend()
+	oldBody := []byte("old-generation")
+	newBody := []byte("new-generation")
+	if len(oldBody) != len(newBody) {
+		t.Fatalf("test bodies must have equal size")
+	}
+	if err := backend.Write(context.Background(), "testdb/cpu/normal-boot.parquet", oldBody); err != nil {
+		t.Fatalf("seed local file: %v", err)
+	}
+	hash := sha256.Sum256(newBody)
+	entry := makeEntry("testdb/cpu/normal-boot.parquet", "writer-1", int64(len(newBody)))
+	entry.SHA256 = fmt.Sprintf("%x", hash[:])
+
+	fetcher := newFakeFetcher()
+	resolver := staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true}
+	p := newTestPuller(t, backend, fetcher, resolver)
+	p.Start(context.Background())
+	defer p.Stop()
+
+	p.RunCatchUp(context.Background(), sliceFetcher([]*raft.FileEntry{entry}))
+	stats := waitStats(t, p, func(s map[string]int64) bool { return s["skipped_local"] == 1 })
+	if stats["skipped_local"] != 1 {
+		t.Fatalf("normal catch-up did not keep size-only fast path: %+v", stats)
+	}
+	if fetcher.calls.Load() != 0 {
+		t.Fatalf("normal catch-up unexpectedly fetched same-size file: %d calls", fetcher.calls.Load())
+	}
+}
+
+func TestRunCatchUpSkipsSameSizeMatchingCopy(t *testing.T) {
+	backend := newFakeBackend()
+	body := []byte("current-generation")
+	if err := backend.Write(context.Background(), "testdb/cpu/snapshot-current.parquet", body); err != nil {
+		t.Fatalf("seed local file: %v", err)
+	}
+	hash := sha256.Sum256(body)
+	entry := makeEntry("testdb/cpu/snapshot-current.parquet", "writer-1", int64(len(body)))
+	entry.SHA256 = fmt.Sprintf("%x", hash[:])
+
+	fetcher := newFakeFetcher() // matching content must not hit the network
+	resolver := staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true}
+	p := newTestPuller(t, backend, fetcher, resolver)
+	p.Start(context.Background())
+	defer p.Stop()
+
+	p.RunCatchUpWithContentVerification(context.Background(), sliceFetcher([]*raft.FileEntry{entry}))
+	stats := waitStats(t, p, func(s map[string]int64) bool { return s["catchup_skipped_local"] == 1 })
+	if stats["catchup_skipped_local"] != 1 {
+		t.Fatalf("matching file was not skipped: %+v", stats)
+	}
+	if fetcher.calls.Load() != 0 {
+		t.Fatalf("matching file triggered a fetch: %d calls", fetcher.calls.Load())
+	}
+}
 
 // TestRunCatchUpEnqueuesAllWhenQueueLarge verifies the happy path: a walker
 // fed 10 distinct entries enqueues all of them when the queue is big enough
