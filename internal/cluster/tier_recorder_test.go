@@ -6,10 +6,14 @@ package cluster
 // Start) and deliberately survives into the shutdown drain.
 
 import (
+	"context"
+	"errors"
+	"io"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
 
@@ -87,6 +91,47 @@ func TestUnlinkOne_ReportsReasonAndMeasuredSize(t *testing.T) {
 	// time a delete reaches a worker, and a tier row's size_bytes is NOT NULL.
 	if reports[0].size != int64(len(body)) {
 		t.Fatalf("size = %d, want %d", reports[0].size, len(body))
+	}
+}
+
+func TestUnlinkOne_ReportsSizeForStagedFile(t *testing.T) {
+	const path = "db1/cpu/2026/10/03/14/partial.parquet"
+	prefix := []byte("partial")
+	backend, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatalf("NewLocalBackend: %v", err)
+	}
+	t.Cleanup(func() { _ = backend.Close() })
+
+	pr, pw := io.Pipe()
+	writeErr := make(chan error, 1)
+	go func() {
+		writeErr <- backend.WriteReader(context.Background(), path, pr, int64(len(prefix)+1))
+	}()
+	if _, err := pw.Write(prefix); err != nil {
+		t.Fatalf("write prefix: %v", err)
+	}
+	if err := pw.CloseWithError(errors.New("simulated interrupted transfer")); err != nil {
+		t.Fatalf("close partial transfer: %v", err)
+	}
+	if err := <-writeErr; err == nil {
+		t.Fatal("WriteReader succeeded after an interrupted transfer")
+	}
+
+	rec := &fakeTierRecorder{}
+	c := newDeleteRig(t, backend, false, nil)
+	c.SetTierRecorder(rec)
+	c.enqueueLocalDelete(path, "tiering:migrated")
+
+	reports := waitUnlinkReports(t, rec, 1)
+	if len(reports) != 1 {
+		t.Fatalf("got %d unlink reports, want 1: %+v", len(reports), reports)
+	}
+	if reports[0].size != int64(len(prefix)) {
+		t.Fatalf("size = %d, want staged size %d", reports[0].size, len(prefix))
+	}
+	if size, err := backend.StagedSize(context.Background(), path); err != nil || size != -1 {
+		t.Fatalf("staged size after delete = (%d, %v), want (-1, nil)", size, err)
 	}
 }
 

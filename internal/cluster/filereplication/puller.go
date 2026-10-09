@@ -1056,13 +1056,10 @@ func (p *Puller) statLocal(path string) (int64, error) {
 	if err != nil || size < 0 {
 		return size, err
 	}
-	// LocalBackend.StatFile falls back to the ".part" staging file when the
-	// final file is absent (the resume path wants that). Presence must not:
-	// a full-size .part left by a crash before the rename would read as
-	// "already here" and never be finalised (#963). Where a staged partial
-	// exists, confirm the final file too; without it the answer is "not
-	// here", so the entry is pulled again. Backends that do not stage (S3,
-	// Azure) fail the assertion, and for them StatFile's answer is final.
+	// StatFile reports only committed objects. Where a staged partial also
+	// exists, confirm the final file again so a concurrent removal cannot make
+	// the earlier size look present. Backends that do not stage (S3, Azure)
+	// fail the assertion and need no extra check.
 	if si, ok := p.cfg.Backend.(storage.StagingInspector); ok {
 		staged, err := si.StagedSize(statCtx, path)
 		if err != nil {
@@ -1828,21 +1825,11 @@ func (p *Puller) writeFileTail(ctx context.Context, entry *raft.FileEntry, r io.
 // by a test asserting the backend sees no Delete for a quarantined entry.
 //
 // A resume is sized and hashed from the STAGED partial alone, never from a
-// committed file, and is refused outright when a committed file exists. The
-// refusal is what is load-bearing; sizing and hashing through the staging API
-// is defence in depth, since StatFile and ReadToAt fall back to the staging
-// file exactly when no committed file exists — the only state the refusal lets
-// through. Going through StagedSize/ReadStaged additionally means a committed
-// file appearing between the two calls cannot silently retarget the hash. StatFile prefers the committed object and only falls
-// back to the staging file, and ReadToAt does the same; writeFileTail, by
-// contrast, appends to the staging file (AppendReader). Sizing or hashing with
-// the StatFile/ReadToAt pair therefore hashes the prefix of one file and
-// appends the tail to a different one. Once a rejected fetch stops deleting the
-// committed copy (#999), that is reachable: a committed previous generation
-// shorter than the entry would be hashed as the "prefix", the new tail appended
-// to the staging file, and — whenever the old generation happens to be a byte
-// prefix of the new one — the combined digest VERIFIES and a tail-only file is
-// renamed into place. Same hazard statLocal guards on the presence side (#963).
+// committed file, and is refused outright when a committed file exists. Using
+// the staging interface for both operations also prevents a committed file
+// appearing between the size and read calls from changing which bytes are
+// hashed. ReadToAt can read staged data when no committed file exists, so it
+// must not be paired with a committed-file size when building a resume hash.
 func (p *Puller) tryResumeFromPartial(log zerolog.Logger, entry *raft.FileEntry) (int64, hash.Hash) {
 	si, ok := p.cfg.Backend.(storage.StagingInspector)
 	if !ok {

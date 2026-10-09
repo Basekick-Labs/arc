@@ -220,14 +220,9 @@ func (r *Receiver) Receive(ctx context.Context, spokeID, sourcePath, declaredSHA
 	// duplicate costs no transfer, and a conflict must not consume bytes it
 	// will discard.
 	//
-	// Exists, not StatFile. LocalBackend.StatFile deliberately falls back to
-	// the "{path}.part" staging file when the final file is absent, which is
-	// right for the peer-fetch puller (it wants to know how much of a partial
-	// it already holds) and wrong here: a stale .part left by an interrupted
-	// promote would be read as "the file exists", and the resolveExisting
-	// branch would then fail forever because ReadTo is NOT .part-aware. That
-	// wedges the path permanently — no retry could ever clear it. Exists()
-	// checks only the real file.
+	// Check for a committed file before comparing its digest. A stale staged
+	// partial left by an interrupted promote must not enter the existing-file
+	// branch, where ReadTo cannot read it.
 	// Receipt pre-check BEFORE the storage existence branch (#619): a file
 	// the hub's own compaction consumed no longer exists at finalPath, but
 	// its content was delivered and lives inside a compacted output. Without
@@ -571,11 +566,9 @@ func (g *shortBodyGuard) Read(p []byte) (int, error) {
 // hash it, and return a conflict against content the hub itself produced —
 // wedging that path the same way a stale ".part" once did.
 func (r *Receiver) promote(ctx context.Context, stagingPath, finalPath string, size int64) error {
-	// Clear any stale staging file at the DESTINATION before writing. A
-	// previous promote that died between WriteReader's staging write and its
-	// rename leaves "{finalPath}.part" behind; left in place it makes
-	// StatFile report the final file as present (see the note in Receive) and
-	// would defeat the Exists() guard for any code that still uses StatFile.
+	// Clear staging data left by a previous promote before starting a new
+	// destination write. StatFile ignores staged partials; this avoids carrying
+	// stale staging data into the new transfer.
 	if si := r.staging(); si != nil {
 		if err := si.DeleteStaged(ctx, finalPath); err != nil {
 			r.logger.Debug().Err(err).Str("path", finalPath).Msg("No stale promote staging file to clear")

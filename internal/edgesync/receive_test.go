@@ -752,10 +752,9 @@ func TestReceiver_StalePartDoesNotWedgeThePath(t *testing.T) {
 		t.Fatal("expected the seeded promote failure")
 	}
 
-	// The retry must succeed. LocalBackend.StatFile falls back to the .part
-	// file, so a stale one would be read as "the file already exists" and the
-	// identity branch would then fail forever on ReadTo — wedging this path
-	// permanently, with no retry able to clear it.
+	// The retry must succeed. A stale .part file must not be read as "the file
+	// already exists" and sent to the identity branch, where ReadTo cannot read
+	// it — wedging this path permanently, with no retry able to clear it.
 	res, err := r.Receive(ctx, "rocket-01", testPath, digest, int64(len(content)), 0, bytes.NewReader(content))
 	if err != nil {
 		t.Fatalf("retry after a failed promote: %v — the path is wedged", err)

@@ -475,18 +475,33 @@ func TestLocalBackend_AppendReader(t *testing.T) {
 	_ = pw.CloseWithError(errors.New("simulated transport failure"))
 	<-writeErrCh // ignore the error — we expect it
 
-	// Staging file should exist with the prefix bytes.
+	// The incomplete transfer is visible only through the staging interface;
+	// StatFile describes the committed object and must report it as absent.
+	si, ok := (Backend)(backend).(StagingInspector)
+	if !ok {
+		t.Fatal("LocalBackend does not implement StagingInspector")
+	}
 	size, err := backend.StatFile(ctx, path)
 	if err != nil {
 		t.Fatalf("StatFile after partial write: %v", err)
 	}
-	if size != int64(len(prefix)) {
-		t.Fatalf("expected staging size %d, got %d", len(prefix), size)
+	if size != -1 {
+		t.Fatalf("StatFile after partial write = %d, want -1 for missing committed file", size)
+	}
+	stagedSize, err := si.StagedSize(ctx, path)
+	if err != nil {
+		t.Fatalf("StagedSize after partial write: %v", err)
+	}
+	if stagedSize != int64(len(prefix)) {
+		t.Fatalf("StagedSize after partial write = %d, want %d", stagedSize, len(prefix))
 	}
 
 	// AppendReader appends the tail to the staging file and promotes it.
 	if err := ab.AppendReader(ctx, path, bytes.NewReader(tail), int64(len(tail))); err != nil {
 		t.Fatalf("AppendReader: %v", err)
+	}
+	if size, err := backend.StatFile(ctx, path); err != nil || size != int64(len(fullBody)) {
+		t.Fatalf("StatFile after promoted write = (%d, %v), want (%d, nil)", size, err, len(fullBody))
 	}
 
 	// Final file should now contain the full body.

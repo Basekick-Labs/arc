@@ -89,8 +89,9 @@ type Backend interface {
 	// Returns an error if offset is negative or >= file size.
 	ReadToAt(ctx context.Context, path string, writer io.Writer, offset int64) error
 
-	// StatFile returns the byte size of the file at path.
-	// Returns -1 (and nil error) if the file does not exist.
+	// StatFile returns the byte size of the committed file at path.
+	// Returns -1 (and nil error) if the committed file does not exist. Staged
+	// partials are exposed separately through StagingInspector.
 	// Returns a non-nil error only for unexpected backend failures.
 	StatFile(ctx context.Context, path string) (int64, error)
 

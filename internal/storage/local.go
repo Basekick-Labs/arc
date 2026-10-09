@@ -160,8 +160,8 @@ func (b *LocalBackend) Write(ctx context.Context, path string, data []byte) erro
 // partPath returns the persistent in-progress path for a file being written by
 // WriteReader or AppendReader. Using a deterministic name (rather than a
 // random .tmp) means a partial write that survives a crash or transport error
-// is discoverable by StatFile and ReadToAt, enabling the puller to resume from
-// the last committed byte on the next attempt.
+// is discoverable through StagingInspector and ReadToAt, enabling the puller
+// to resume from the last committed byte on the next attempt.
 func partPath(fullPath string) string {
 	return fullPath + PartSuffix
 }
@@ -475,37 +475,25 @@ func (b *LocalBackend) ReadToAt(ctx context.Context, path string, writer io.Writ
 	return nil
 }
 
-// StatFile returns the byte size of the file at path, or -1 if neither the
-// final file nor its ".part" staging file exist.
+// StatFile returns the byte size of the committed file at path, or -1 if it
+// does not exist.
 // Returns a non-nil error only for unexpected failures.
 //
-// The staging-file fallback serves the puller's resume path, which needs the
-// size of an interrupted download to continue from that byte. It is not a
-// presence check: a staging file at the full size with no final file is an
-// unfinished pull, not a present file (#963). Callers deciding presence
-// confirm the final file through StagingInspector.StagedSize and Exists, as
-// the puller's statLocal does.
+// Staged partials are exposed by StagingInspector.StagedSize; they are not
+// committed objects and must not be reported as present files.
 func (b *LocalBackend) StatFile(ctx context.Context, path string) (int64, error) {
 	fullPath, err := b.validatePath(path)
 	if err != nil {
 		return -1, fmt.Errorf("invalid path: %w", err)
 	}
 	info, err := os.Stat(fullPath)
-	if err == nil {
-		return info.Size(), nil
-	}
-	if !os.IsNotExist(err) {
-		return -1, fmt.Errorf("stat %s: %w", path, err)
-	}
-	// Final file absent — check the staging file.
-	info, err = os.Stat(partPath(fullPath))
-	if err == nil {
-		return info.Size(), nil
-	}
 	if os.IsNotExist(err) {
 		return -1, nil
 	}
-	return -1, fmt.Errorf("stat %s.part: %w", path, err)
+	if err != nil {
+		return -1, fmt.Errorf("stat %s: %w", path, err)
+	}
+	return info.Size(), nil
 }
 
 // AppendReader appends bytes from reader to the ".part" staging file at path.
