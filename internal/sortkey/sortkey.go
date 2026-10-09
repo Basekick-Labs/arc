@@ -22,7 +22,7 @@ func Parse(spec string) Key {
 		suffix := spec[last+1:]
 		if strings.EqualFold(suffix, "asc") || strings.EqualFold(suffix, "desc") {
 			column = strings.TrimSpace(spec[:last])
-		direction = suffix
+			direction = suffix
 		}
 	}
 	return Key{Column: column, Desc: strings.EqualFold(direction, "desc")}
