@@ -877,6 +877,7 @@ type bufferShard struct {
 // then fails for a queueing reason and the batch is dropped as if storage had
 // failed.
 type flushTask struct {
+	taskID      uint64
 	bufferKey   string
 	database    string
 	measurement string
@@ -990,6 +991,16 @@ type ArrowBuffer struct {
 	flushQueue   chan flushTask
 	flushWorkers int
 
+	// asyncFlushPending tracks queued and direct flushes through their storage
+	// writes and WAL checkpoints. Buffer handoffs register under their shard
+	// lock, so a barrier can fence them without holding locks during I/O waits.
+	flushBarrierOnce  sync.Once
+	flushBarrierGate  chan struct{}
+	asyncFlushMu      sync.Mutex
+	asyncFlushNext    uint64
+	asyncFlushPending map[uint64]struct{}
+	asyncFlushChanged chan struct{}
+
 	// closing is the shutdown short-circuit checked by tryEnqueueFlush.
 	// See Close() for the full ordering rationale; senders see this
 	// flag set before the channel could be closed (the channel is
@@ -1086,7 +1097,17 @@ type ArrowBuffer struct {
 	// Flush failure tracking for WAL maintenance.
 	// Set when a storage write fails (S3 outage etc.), cleared after successful recovery.
 	// The periodic WAL goroutine checks this to decide whether WAL replay is needed.
-	hasFlushFailure atomic.Bool
+	hasFlushFailure        atomic.Bool
+	flushFailureGeneration atomic.Uint64
+
+	// walRecoveryPending arms the same recovery as hasFlushFailure, for a
+	// reason that is NOT a flush failure: a recovery pass that kept a file or
+	// failed a barrier. It is a separate flag because hasFlushFailure's other
+	// reader is the shutdown WAL purge, which reports it as "investigate the
+	// buffer flush errors logged above" — an Error naming logs that do not
+	// exist when nothing flushed badly. Retention is right either way; the
+	// attribution was not.
+	walRecoveryPending atomic.Bool
 
 	logger zerolog.Logger
 }
@@ -1162,17 +1183,130 @@ func (b *ArrowBuffer) getShard(bufferKey string) *bufferShard {
 	return b.shards[hash%b.shardCount]
 }
 
-// HasFlushFailure returns true if any flush has failed since the last reset.
-// Used by the periodic WAL maintenance goroutine to decide whether WAL replay
-// is needed (e.g., after an S3 outage where data was cleared from buffers).
+// HasFlushFailure reports whether a WAL recovery pass is warranted: a flush has
+// failed since the last reset (e.g. an S3 outage that cleared buffers), or an
+// earlier recovery pass left work behind. Used by the periodic WAL maintenance
+// goroutine. The disjunction is why splitting the two reasons apart did not
+// change when recovery runs.
 func (b *ArrowBuffer) HasFlushFailure() bool {
-	return b.hasFlushFailure.Load()
+	return b.hasFlushFailure.Load() || b.walRecoveryPending.Load()
 }
 
-// ResetFlushFailure clears the flush failure flag.
-// Called after successful WAL recovery replay.
-func (b *ArrowBuffer) ResetFlushFailure() {
+// FlushFailureGeneration returns the generation used to make recovery-latch
+// resets conditional on no newer flush failure having happened in the meantime.
+func (b *ArrowBuffer) FlushFailureGeneration() uint64 {
+	return b.flushFailureGeneration.Load()
+}
+
+// ResetFlushFailure clears the recovery latch only if no new flush failure has
+// been recorded since expectedGeneration was read. This prevents a successful
+// recovery pass from clearing a concurrent failure.
+func (b *ArrowBuffer) ResetFlushFailure(expectedGeneration uint64) bool {
+	if b.flushFailureGeneration.Load() != expectedGeneration {
+		return false
+	}
+	recoveryPending := b.walRecoveryPending.Load()
 	b.hasFlushFailure.Store(false)
+	b.walRecoveryPending.Store(false)
+	if b.flushFailureGeneration.Load() != expectedGeneration {
+		// Restoring true for the flush flag is correct, not a guess. The only
+		// writer that can bump the generation inside this window is
+		// markFlushFailure, from a live flush worker; MarkWALRecoveryPending's
+		// single caller runs before the maintenance goroutine exists and cannot
+		// race it. Snapshot-restore is for the recovery flag only — asserting a
+		// flush failure that did not happen is the very bug this split fixes.
+		b.hasFlushFailure.Store(true)
+		b.walRecoveryPending.Store(recoveryPending)
+		return false
+	}
+	return true
+}
+
+// MarkWALRecoveryPending marks buffered or replayed data as needing another
+// recovery pass without attributing the failure to a storage flush.
+func (b *ArrowBuffer) MarkWALRecoveryPending() {
+	b.flushFailureGeneration.Add(1)
+	b.walRecoveryPending.Store(true)
+}
+
+// RetainedForWALRecoveryOnly reports whether the shutdown WAL purge must be
+// skipped solely because a recovery pass is still outstanding — every signal
+// that means records were LOST is clear.
+//
+// The shutdown purge uses it to pick its message: a genuine flush failure keeps
+// the Error that tells the operator to investigate flush logs, and this case
+// gets a Warn naming the real cause. Retention is identical either way.
+func (b *ArrowBuffer) RetainedForWALRecoveryOnly() bool {
+	return b.walRecoveryPending.Load() &&
+		!b.closeFailed.Load() &&
+		!b.hasFlushFailure.Load() &&
+		b.walOnlyRecords.Load() == 0 &&
+		b.closeFlushClean.Load()
+}
+
+func (b *ArrowBuffer) beginAsyncFlushTask() uint64 {
+	b.asyncFlushMu.Lock()
+	if b.asyncFlushChanged == nil {
+		b.asyncFlushChanged = make(chan struct{})
+	}
+	if b.asyncFlushPending == nil {
+		b.asyncFlushPending = make(map[uint64]struct{})
+	}
+	b.asyncFlushNext++
+	taskID := b.asyncFlushNext
+	b.asyncFlushPending[taskID] = struct{}{}
+	b.asyncFlushMu.Unlock()
+	return taskID
+}
+
+func (b *ArrowBuffer) completeAsyncFlushTask(taskID uint64) {
+	if taskID == 0 {
+		return
+	}
+	b.asyncFlushMu.Lock()
+	if _, ok := b.asyncFlushPending[taskID]; ok {
+		delete(b.asyncFlushPending, taskID)
+		if b.asyncFlushChanged != nil {
+			close(b.asyncFlushChanged)
+		}
+		b.asyncFlushChanged = make(chan struct{})
+	}
+	b.asyncFlushMu.Unlock()
+}
+
+func (b *ArrowBuffer) asyncFlushFence() uint64 {
+	b.asyncFlushMu.Lock()
+	fence := b.asyncFlushNext
+	b.asyncFlushMu.Unlock()
+	return fence
+}
+
+func (b *ArrowBuffer) waitForAsyncFlushTasksThrough(ctx context.Context, fence uint64) error {
+	for {
+		pending, changed := b.asyncFlushState(fence)
+		if !pending {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
+func (b *ArrowBuffer) asyncFlushState(fence uint64) (bool, <-chan struct{}) {
+	b.asyncFlushMu.Lock()
+	defer b.asyncFlushMu.Unlock()
+	if b.asyncFlushChanged == nil {
+		b.asyncFlushChanged = make(chan struct{})
+	}
+	for taskID := range b.asyncFlushPending {
+		if taskID <= fence {
+			return true, b.asyncFlushChanged
+		}
+	}
+	return false, b.asyncFlushChanged
 }
 
 // markFlushFailure records that buffered data could not be persisted and must
@@ -1281,6 +1415,7 @@ func (b *ArrowBuffer) closeDeadlineBudget() time.Duration {
 
 func (b *ArrowBuffer) markFlushFailure() {
 	b.totalErrors.Add(1)
+	b.flushFailureGeneration.Add(1)
 	b.hasFlushFailure.Store(true)
 	metrics.Get().IncBufferFlushFailures()
 }
@@ -1780,7 +1915,22 @@ func (b *ArrowBuffer) WriteColumnarDirectNoWAL(ctx context.Context, database, me
 	return b.writeColumnarDirect(ctx, database, measurement, columns, "")
 }
 
+// WriteColumnarDirectNoWALWithHashes applies replicated data without writing
+// it again to the WAL, and carries the follower-local WAL identities through
+// to the flush checkpoint.
+func (b *ArrowBuffer) WriteColumnarDirectNoWALWithHashes(ctx context.Context, database, measurement string, columns map[string][]interface{}, hashes []string) error {
+	return b.writeColumnarDirectWithHashes(ctx, database, measurement, columns, hashes)
+}
+
 func (b *ArrowBuffer) writeColumnarDirect(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string) error {
+	var hashes []string
+	if len(walIdentity) == walTrackedIdentityHexLen {
+		hashes = []string{walIdentity}
+	}
+	return b.writeColumnarDirectWithHashes(ctx, database, measurement, columns, hashes)
+}
+
+func (b *ArrowBuffer) writeColumnarDirectWithHashes(ctx context.Context, database, measurement string, columns map[string][]interface{}, walHashes []string) error {
 	// #590: both callers (WAL crash replay, cluster WAL replication) feed
 	// RAW client payloads that never went through the live decode path's
 	// post-processing. Apply it here so replayed data behaves exactly like
@@ -1832,7 +1982,7 @@ func (b *ArrowBuffer) writeColumnarDirect(ctx context.Context, database, measure
 		Columns:     columns,
 		Columnar:    true,
 	}
-	return b.writeColumnarInternal(ctx, database, record, true, walIdentity)
+	return b.writeColumnarInternalWithWALHashes(ctx, database, record, true, walHashes)
 }
 
 // WriteColumnarDirectReplay is WriteColumnarDirectNoWAL for WAL recovery, with
@@ -1848,12 +1998,18 @@ func (b *ArrowBuffer) writeColumnarDirect(ctx context.Context, database, measure
 // duplicates. Inheriting the identity means the eventual flush checkpoints the
 // ORIGINAL entry, and the next pass skips it.
 //
-// Pass the empty string to inherit nothing. Callers MUST do that unless the
-// identity covers exactly the records in this call: the row-format recovery
-// callback explodes one WAL entry into one call per record, so checkpointing
-// the entry when only some of those calls flush would mark data durable that
-// was discarded. See cmd/arc's recovery callbacks.
+// Pass the empty string to inherit nothing. The identity must cover exactly
+// the records in this call. Bounded row replay supplies a versioned row-range
+// identity; checkpointing its parent before all ranges flush would lose data.
 func (b *ArrowBuffer) WriteColumnarDirectReplay(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string) error {
+	if _, start, end, ok := wal.ParseRecoveryRowIdentity(walIdentity); ok {
+		for _, column := range columns {
+			if len(column) != end-start {
+				return fmt.Errorf("replayed WAL row range length %d does not match column length %d", end-start, len(column))
+			}
+		}
+		return b.writeColumnarDirectWithHashes(ctx, database, measurement, columns, []string{walIdentity})
+	}
 	return b.writeColumnarDirect(ctx, database, measurement, columns, walIdentity)
 }
 
@@ -1991,6 +2147,7 @@ func (b *ArrowBuffer) enqueueOrDeferLocked(
 		walHashes: collectWALHashes(shard.buffers[bufferKey]),
 	}
 
+	task.taskID = b.beginAsyncFlushTask()
 	select {
 	case b.flushQueue <- task:
 		b.queueDepth.Add(1)
@@ -2002,10 +2159,12 @@ func (b *ArrowBuffer) enqueueOrDeferLocked(
 		delete(shard.bufferSchemas, bufferKey)
 		return true, false
 	case <-b.ctx.Done():
+		b.completeAsyncFlushTask(task.taskID)
 		// Close cancelled b.ctx between the checks above and this select. The
 		// records stay in the buffer for Close's shard loop.
 		return false, false
 	default:
+		b.completeAsyncFlushTask(task.taskID)
 		// Lost the race against another writer for the last slot.
 		b.markDeferredLocked(shard, bufferKey)
 		return false, true
@@ -2322,13 +2481,21 @@ func (b *ArrowBuffer) writeColumnar(ctx context.Context, database string, record
 }
 
 func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string, record *models.ColumnarRecord, skipWAL bool, inheritedWALIdentity string) error {
+	var inheritedWALHashes []string
+	if skipWAL && len(inheritedWALIdentity) == walTrackedIdentityHexLen {
+		inheritedWALHashes = []string{inheritedWALIdentity}
+	}
+	return b.writeColumnarInternalWithWALHashes(ctx, database, record, skipWAL, inheritedWALHashes)
+}
+
+func (b *ArrowBuffer) writeColumnarInternalWithWALHashes(ctx context.Context, database string, record *models.ColumnarRecord, skipWAL bool, inheritedWALHashes []string) error {
 	// Create buffer key: database/measurement
 	// OPTIMIZATION: String concatenation is faster than fmt.Sprintf (no reflection)
 	bufferKey := database + "/" + record.Measurement
 
 	// WAL: Write to WAL before buffering (if enabled)
 	// Skip WAL during recovery to avoid re-writing recovered data
-	var walHashes []string
+	walHashes := append([]string(nil), inheritedWALHashes...)
 	// A replayed entry writes nothing to the WAL — the copy being replayed is
 	// already on disk — but it DOES carry that copy's identity, so the flush
 	// that eventually persists it checkpoints the original entry and no later
@@ -2337,9 +2504,6 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 	// two legitimately identical payloads share it, so checkpointing one would
 	// make recovery skip the other (#998 moved off content hashes for exactly
 	// this reason). Untracked entries keep replaying as before.
-	if skipWAL && len(inheritedWALIdentity) == walTrackedIdentityHexLen {
-		walHashes = []string{inheritedWALIdentity}
-	}
 	if b.wal != nil && !skipWAL {
 		tracked, canTrack := b.wal.(trackedWALWriter)
 		// ZERO-COPY PATH: Use raw msgpack bytes if available (avoids re-serialization)
@@ -3341,10 +3505,13 @@ func (b *ArrowBuffer) flushWorker(workerID int) {
 			// (#1006). It derives from flushParent, so Close() cancelling
 			// b.ctx does not abort a write already in progress (#1007).
 			flushCtx, flushCancel := b.newFlushContext()
-			// Error is already logged and recorded by flushRecordsAsync via
-			// markFlushFailure; the worker has nowhere to return it to.
-			_ = b.flushRecordsAsync(flushCtx, task.bufferKey, task.database, task.measurement, task.records, task.recordCount, task.walHashes)
-			flushCancel()
+			func() {
+				defer b.completeAsyncFlushTask(task.taskID)
+				// Error is already logged and recorded by flushRecordsAsync via
+				// markFlushFailure; the worker has nowhere to return it to.
+				_ = b.flushRecordsAsync(flushCtx, task.bufferKey, task.database, task.measurement, task.records, task.recordCount, task.walHashes)
+				flushCancel()
+			}()
 		}
 	}
 }
@@ -3658,22 +3825,30 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 	delete(shard.bufferRecordCounts, bufferKey)
 	delete(shard.bufferSchemas, bufferKey)
 
+	// Account for direct (aged/periodic) storage writes as well as queued ones.
+	// Register before releasing shard.mu so a concurrent recovery fence cannot
+	// miss this flush after observing the extracted buffer as empty.
+	taskID := b.beginAsyncFlushTask()
+	completeTask := func() { b.completeAsyncFlushTask(taskID) }
+
 	// Release lock before expensive operations
 	shard.mu.Unlock()
 
 	// Merge typed column batches
 	merged, err := b.mergeBatches(recordsToFlush)
 	if err != nil {
-		shard.mu.Lock() // Re-acquire lock for caller
 		b.markFlushFailure()
+		completeTask()
+		shard.mu.Lock() // Re-acquire lock for caller
 		return fmt.Errorf("failed to merge batches: %w", err)
 	}
 
 	// Flush with data timestamp partitioning
 	startTime := time.Now().UTC()
 	if err := b.flushBufferLockedDataTime(ctx, bufferKey, database, measurement, merged, recordCount, startTime); err != nil {
-		shard.mu.Lock() // Re-acquire lock for caller
 		b.markFlushFailure()
+		completeTask()
+		shard.mu.Lock() // Re-acquire lock for caller
 		b.logger.Warn().
 			Err(err).
 			Str("buffer_key", bufferKey).
@@ -3685,6 +3860,7 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 		return err
 	}
 	b.markWALFlushed(walHashes)
+	completeTask()
 
 	// Re-acquire lock for caller
 	shard.mu.Lock()
@@ -4566,6 +4742,152 @@ func (b *ArrowBuffer) FlushAll(ctx context.Context) error {
 	return lastErr
 }
 
+// NewRecoveryFlushBarrier captures the failure generation BEFORE replay starts.
+// An async replay flush can fail and finish before BeforeDelete is called;
+// waiting for its completion alone cannot prove that its data reached storage.
+// Use one returned barrier for every batch in a recovery pass, then create a
+// new one for the next pass so an older failure does not prevent a healthy retry.
+func (b *ArrowBuffer) NewRecoveryFlushBarrier() func(context.Context) error {
+	generation := b.FlushFailureGeneration()
+	return func(ctx context.Context) error {
+		if err := b.FlushAllAndWait(ctx); err != nil {
+			return err
+		}
+		if current := b.FlushFailureGeneration(); current != generation {
+			return fmt.Errorf("flush failed during WAL recovery (generation %d -> %d); retaining replayed files", generation, current)
+		}
+		return nil
+	}
+}
+
+// FlushAllAndWait snapshots buffer keys, hands their records to the existing
+// bounded worker pool, and fences those tasks plus earlier queued/direct flushes.
+// No shard lock is held while waiting for queue capacity or storage. A timeout
+// or first flush failure stops admission: unsubmitted records stay in buffers;
+// admitted tasks keep their normal independent I/O deadlines and WAL identities.
+// The barrier's total wait budget is one flushTimeout (or the caller's earlier
+// deadline), not one timeout per measurement. Returning an error never proves
+// durability and must not permit WAL deletion. Recovery must also use
+// NewRecoveryFlushBarrier to cover failures that completed before this call.
+func (b *ArrowBuffer) FlushAllAndWait(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	budget := b.flushTimeout
+	if budget <= 0 {
+		budget = 30 * time.Second
+	}
+	if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > budget {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, budget)
+		defer cancel()
+	}
+	generation := b.FlushFailureGeneration()
+	check := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if b.closing.Load() {
+			return ErrBufferClosing
+		}
+		if b.FlushFailureGeneration() != generation {
+			return fmt.Errorf("flush failed while waiting for WAL recovery barrier; retaining replayed files")
+		}
+		return nil
+	}
+	if err := check(); err != nil {
+		return err
+	}
+	b.flushBarrierOnce.Do(func() { b.flushBarrierGate = make(chan struct{}, 1) })
+	// Fast path also avoids installing a cancellation waiter when uncontended.
+	select {
+	case b.flushBarrierGate <- struct{}{}:
+	default:
+		select {
+		case b.flushBarrierGate <- struct{}{}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	defer func() { <-b.flushBarrierGate }()
+
+	locked := 0
+	defer func() {
+		for i := locked - 1; i >= 0; i-- {
+			b.shards[i].mu.Unlock()
+		}
+	}()
+	for i := range b.shards {
+		b.shards[i].mu.Lock()
+		locked++
+	}
+	type pendingBuffer struct {
+		shard *bufferShard
+		key   string
+	}
+	var snapshot []pendingBuffer
+	for shardIdx := range b.shards {
+		shard := b.shards[shardIdx]
+		for key := range shard.buffers {
+			snapshot = append(snapshot, pendingBuffer{shard: shard, key: key})
+		}
+	}
+	for i := locked - 1; i >= 0; i-- {
+		b.shards[i].mu.Unlock()
+	}
+	locked = 0
+
+	for _, item := range snapshot {
+		parts := splitBufferKey(item.key)
+		if len(parts) != 2 {
+			return fmt.Errorf("invalid buffer key %q", item.key)
+		}
+		for {
+			// Observe completion before attempting admission so a completion
+			// between the failed send and the wait cannot be missed.
+			_, changed := b.asyncFlushState(^uint64(0))
+			if err := check(); err != nil {
+				return err
+			}
+			item.shard.mu.Lock()
+			_, exists := item.shard.buffers[item.key]
+			queued := false
+			if exists {
+				queued, _ = b.enqueueOrDeferLocked(item.shard, item.key, parts[0], parts[1], item.shard.bufferRecordCounts[item.key])
+			}
+			item.shard.mu.Unlock()
+			if !exists || queued {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-changed:
+			}
+		}
+	}
+
+	// Every snapshot key was either handed off here or by another flusher.
+	// Those handoffs register under shard.mu before removing their buffers,
+	// so their task IDs are all at or below this fence. Later writes need not
+	// finish for this barrier to succeed.
+	fence := b.asyncFlushFence()
+	for {
+		pending, changed := b.asyncFlushState(fence)
+		if err := check(); err != nil {
+			return err
+		}
+		if !pending {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
 // Close stops the buffer and flushes everything it still holds.
 //
 // Ordering, and why each step is where it is:
@@ -4768,8 +5090,14 @@ func (b *ArrowBuffer) Close() error {
 	//   - no synchronous flush returned an error (flushErrs)
 	//   - no records ended up WAL-only: rejected at enqueue, or still unwritten
 	//     after the drain above (walOnlyRecords)
-	//   - no earlier async flush failed (hasFlushFailure) — the same signal the
-	//     WAL maintenance loop already trusts
+	//   - no earlier async flush failed (hasFlushFailure)
+	//
+	// walRecoveryPending is deliberately NOT consulted here. It means a recovery
+	// pass is outstanding, not that this Close lost anything, and closeFailed is
+	// LATCHING — folding it in would permanently mark the buffer as having lost
+	// data and make RetainedForWALRecoveryOnly unable to ever distinguish the
+	// two cases. CloseFlushedCleanly consults both, so the WAL is still
+	// retained; only the attribution differs.
 	//
 	// The flag is latching: once a Close observes lost data it stays false for
 	// the lifetime of the buffer. closeFailed guards that, so a second Close
@@ -4785,6 +5113,7 @@ func (b *ArrowBuffer) Close() error {
 		Int64("total_flushes", b.totalFlushes.Load()).
 		Int("failed_buffers", len(flushErrs)).
 		Bool("flushed_cleanly", b.closeFlushClean.Load()).
+		Bool("wal_retained", !b.CloseFlushedCleanly()).
 		Msg("ArrowBuffer closed")
 
 	if len(flushErrs) > 0 {
@@ -4855,6 +5184,7 @@ drain:
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer b.completeAsyncFlushTask(task.taskID)
 			defer func() { <-slots }()
 
 			// Built HERE, on slot acquisition, not when the task was drained:
@@ -4941,6 +5271,11 @@ func (b *ArrowBuffer) CloseFlushedCleanly() bool {
 	// can fail after Close computed the flag. A stale "clean" here would purge
 	// a WAL that is still needed.
 	if b.closeFailed.Load() || b.hasFlushFailure.Load() || b.walOnlyRecords.Load() > 0 {
+		return false
+	}
+	// An outstanding recovery pass also has to retain the WAL: the data it
+	// replayed is buffered but unproven, or it never got read at all.
+	if b.walRecoveryPending.Load() {
 		return false
 	}
 	return b.closeFlushClean.Load()

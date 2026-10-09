@@ -1115,6 +1115,16 @@ func main() {
 	if walWriter != nil {
 		shutdownCoordinator.Register("wal-purge", shutdownFunc(func() error {
 			if !arrowBuffer.CloseFlushedCleanly() {
+				// Same retention, two different causes. Sending an operator to
+				// "the buffer flush errors logged above" when a recovery pass
+				// merely kept a file points them at logs that do not exist.
+				if arrowBuffer.RetainedForWALRecoveryOnly() {
+					log.Warn().
+						Msg("Retaining WAL files: a WAL recovery pass is still outstanding — files were kept, a flush barrier failed, " +
+							"or the pass returned an error. No buffer flush failed. Those files will be replayed on next startup; " +
+							"do not clear the WAL directory.")
+					return nil
+				}
 				log.Error().
 					Msg("Retaining WAL files: buffer flush did not complete cleanly on shutdown. " +
 						"Unflushed records remain in the WAL and will be replayed on next startup. " +
@@ -1150,6 +1160,24 @@ func main() {
 		if walWriter != nil {
 			startupActiveFile = walWriter.CurrentFile()
 		}
+
+		// Parent finalization waits for WAL queue capacity instead of dropping
+		// on a full queue, the same trade the forced maintenance rotation took
+		// (#1009). It needs its OWN deadline: the startup pass runs on
+		// context.Background(), so threading the pass context alone would bound
+		// nothing. Same source as the rotation timeout below.
+		checkpointRecovered := newCheckpointRecovered(walWriter,
+			time.Duration(cfg.Ingest.FlushTimeoutSeconds)*time.Second)
+
+		// Mirrors RecoveryStats.PartialRowEntries: 1 while the last pass left
+		// partially checkpointed row ranges on disk, which is the state an
+		// older binary replays in full. Makes the downgrade guidance checkable.
+		updatePartialRowRecovery := func(stats *wal.RecoveryStats) {
+			if stats == nil {
+				return
+			}
+			metrics.Get().SetWALPartialRowRecoveryPending(stats.PartialRowEntries > 0)
+		}
 		// NOTE: no MinFileAge here — startup recovery runs exactly once,
 		// before any ingest, so there is no rotation race (the active file
 		// is fully identified by SkipActiveFile), and a just-crashed
@@ -1158,24 +1186,56 @@ func main() {
 		// for the PERIODIC flush-failure recovery below, where ingest (and
 		// therefore rotation) is live during the scan.
 		recoveryStats, err := walRecovery.RecoverWithOptions(context.Background(), recoveryCallback, &wal.RecoveryOptions{
-			SkipActiveFile:   startupActiveFile,
-			BatchSize:        cfg.WAL.RecoveryBatchSize,
-			ColumnarCallback: columnarCallback,
+			SkipActiveFile:      startupActiveFile,
+			BatchSize:           cfg.WAL.RecoveryBatchSize,
+			ColumnarCallback:    columnarCallback,
+			TrackedRowCallback:  createTrackedWALRecoveryCallback(arrowBuffer, logger.Get("wal-recovery")),
+			ValidateTrackedRows: validateTrackedWALRecoveryRows,
+			CheckpointRecovered: checkpointRecovered,
+			BeforeDelete:        arrowBuffer.NewRecoveryFlushBarrier(),
+			BarrierBatchFiles:   16,
+			BarrierBatchRows:    cfg.Ingest.MaxBufferSize,
+			MaxReplayFailures:   3,
 		})
+		recoveryNeedsRetry := err != nil
 		if err != nil {
 			log.Error().Err(err).Msg("WAL recovery failed")
-		} else if recoveryStats.RecoveredFiles > 0 {
-			// Track recovery metrics
-			metrics.Get().IncWALRecoveryTotal()
-			metrics.Get().IncWALRecoveryRecords(int64(recoveryStats.RecoveredEntries))
-			log.Info().
-				Int("files", recoveryStats.RecoveredFiles).
-				Int("batches", recoveryStats.RecoveredBatches).
-				Int("entries", recoveryStats.RecoveredEntries).
-				Int("corrupted", recoveryStats.CorruptedEntries).
-				Dur("duration", recoveryStats.RecoveryDuration).
-				Msg("WAL recovery complete")
 		}
+		if recoveryStats != nil {
+			if recoveryStats.RecoveredFiles > 0 {
+				// Track recovery metrics
+				metrics.Get().IncWALRecoveryTotal()
+				metrics.Get().IncWALRecoveryRecords(int64(recoveryStats.RecoveredEntries))
+				log.Info().
+					Int("files", recoveryStats.RecoveredFiles).
+					Int("batches", recoveryStats.RecoveredBatches).
+					Int("entries", recoveryStats.RecoveredEntries).
+					Int("corrupted", recoveryStats.CorruptedEntries).
+					Dur("duration", recoveryStats.RecoveryDuration).
+					Msg("WAL recovery complete")
+			}
+			for i := 0; i < recoveryStats.QuarantinedFiles; i++ {
+				metrics.Get().IncWALQuarantinedFiles()
+			}
+			if recoveryStats.KeptFiles > 0 || recoveryStats.BarrierFailures > 0 {
+				recoveryNeedsRetry = true
+			}
+			updatePartialRowRecovery(recoveryStats)
+		}
+		if recoveryNeedsRetry {
+			arrowBuffer.MarkWALRecoveryPending()
+		}
+
+		walSizeLogger := logger.Get("wal-maintenance")
+		updateWALDirectoryBytes := func() {
+			bytes, err := wal.DirectoryBytes(cfg.WAL.Directory)
+			if err != nil {
+				walSizeLogger.Warn().Err(err).Msg("Failed to sample WAL directory size")
+				return
+			}
+			metrics.Get().SetWALDirectoryBytes(bytes)
+		}
+		updateWALDirectoryBytes()
 
 		// Start periodic WAL maintenance goroutine.
 		// Two modes:
@@ -1189,68 +1249,110 @@ func main() {
 			return nil
 		}, shutdown.PriorityBuffer)
 
-		// Safe age threshold, now used ONLY for files whose durability nothing
-		// tracks — a previous process's files, and the untracked entries a
-		// replication follower writes. Tracked files are reclaimed by the
-		// flush floor instead, at any age. 3x MaxBufferAgeMS keeps the old
-		// margin for flush worker delays and clock skew.
-		safeAge := time.Duration(cfg.Ingest.MaxBufferAgeMS) * time.Millisecond * 3
-		if safeAge < 30*time.Second {
-			safeAge = 30 * time.Second
-		}
-
 		recoveryInterval := time.Duration(cfg.WAL.RecoveryIntervalSeconds) * time.Second
 		go func() {
 			ticker := time.NewTicker(recoveryInterval)
 			defer ticker.Stop()
+			bytesTicker := time.NewTicker(15 * time.Second)
+			defer bytesTicker.Stop()
 			walLogger := logger.Get("wal-maintenance")
 
 			for {
 				select {
 				case <-walMaintenanceCtx.Done():
 					return
+				case <-bytesTicker.C:
+					updateWALDirectoryBytes()
 				case <-ticker.C:
 					if arrowBuffer.HasFlushFailure() {
 						// Storage failure detected — replay WAL files to recover data
 						// that was cleared from buffers after failed flush
 						walLogger.Info().Msg("Flush failure detected, attempting WAL recovery")
 
-						// Purge old WAL files first (same as normal path) to avoid replaying
-						// data that was already successfully flushed to parquet before the failure.
+						// ORDER MATTERS, and it is: rotate, barrier, read
+						// checkpoints, purge, recover.
+						//
+						// Rotation comes FIRST so that every append racing this
+						// pass lands in a file whose fate this pass decides.
+						// Barriering first instead leaves a window — between the
+						// barrier returning and the rotation command being
+						// dequeued — in which a tracked append lands in the
+						// file about to become previousActiveFile. That file is
+						// then exempted from MinFileAge below, so recovery
+						// replays an entry no checkpoint covers into a buffer
+						// that still holds the live copy, and nothing
+						// de-duplicates rows.
+						previousActiveFile := ""
+						activeFile := ""
+						var activeCheckpointHashes []string
 						if walWriter != nil {
+							previousActiveFile = walWriter.CurrentFile()
+							rotationTimeout := time.Duration(cfg.Ingest.FlushTimeoutSeconds) * time.Second
+							if rotationTimeout <= 0 {
+								rotationTimeout = 30 * time.Second
+							}
+							rotationCtx, cancelRotation := context.WithTimeout(walMaintenanceCtx, rotationTimeout)
+							rotationErr := walWriter.RotateContext(rotationCtx)
+							cancelRotation()
+							if rotationErr != nil {
+								walLogger.Error().Err(rotationErr).Msg("Failed to rotate WAL before recovery; retaining files for the next pass")
+								continue
+							}
+							activeFile = walWriter.CurrentFile()
+						}
+
+						// Settle older async flushes and all current buffers before
+						// reading checkpoints. Otherwise a checkpoint written by an
+						// in-flight worker could land after recovery's checkpoint scan.
+						//
+						// After the rotation above, this also flushes whatever the
+						// window-era appends put in previousActiveFile, and their
+						// checkpoints land in the NEW active file — which is read
+						// into AdditionalCheckpointHashes below, so recovery skips
+						// them. Appends during the barrier go to the new active
+						// file, which recovery skips entirely.
+						if err := arrowBuffer.FlushAllAndWait(walMaintenanceCtx); err != nil {
+							walLogger.Error().Err(err).Msg("WAL recovery pre-barrier failed; retaining WAL files for the next pass")
+							continue
+						}
+
+						if walWriter != nil {
+							// Read AFTER the barrier, so the checkpoints it just
+							// wrote for previousActiveFile are included.
+							activeCheckpointHashes, err = walWriter.CurrentCheckpointHashes()
+							if err != nil {
+								walLogger.Error().Err(err).Msg("Failed to read active WAL checkpoints; skipping recovery to avoid duplicate replay")
+								continue
+							}
+
 							deleted, purgeErr := walWriter.PurgeFlushed(walWriter.MinUnflushedSequence())
 							if purgeErr != nil {
 								walLogger.Error().Err(purgeErr).Msg("WAL purge before recovery failed")
 							} else if deleted > 0 {
 								walLogger.Info().Int("deleted", deleted).Msg("Purged old WAL files before recovery")
 							}
-							if n, err := walWriter.PurgeUnaccountedOlderThan(safeAge); err != nil {
-								walLogger.Error().Err(err).Msg("WAL unaccounted-file purge before recovery failed")
-							} else if n > 0 {
-								walLogger.Info().Int("deleted", n).Msg("Purged WAL files with no tracked sequences before recovery")
-							}
 						}
-
-						recovery := wal.NewRecovery(cfg.WAL.Directory, walLogger)
-						activeFile := ""
-						var activeCheckpointHashes []string
-						if walWriter != nil {
-							activeFile = walWriter.CurrentFile()
-							// Recovery skips the active file to avoid racing appends, so read
-							// its checkpoint index separately while the writer lock holds it stable.
-							activeCheckpointHashes, err = walWriter.CurrentCheckpointHashes()
-							if err != nil {
-								walLogger.Error().Err(err).Msg("Failed to read active WAL checkpoints; skipping recovery to avoid duplicate replay")
-								continue
-							}
-						}
-						stats, err := recovery.RecoverWithOptions(context.Background(), recoveryCallback, &wal.RecoveryOptions{
+						failureGeneration := arrowBuffer.FlushFailureGeneration()
+						stats, err := walRecovery.RecoverWithOptions(walMaintenanceCtx, recoveryCallback, &wal.RecoveryOptions{
 							SkipActiveFile:             activeFile,
 							AdditionalCheckpointHashes: activeCheckpointHashes,
 							MinFileAge:                 5 * time.Second,
+							MinFileAgeExemptFiles:      []string{previousActiveFile},
 							BatchSize:                  cfg.WAL.RecoveryBatchSize,
 							ColumnarCallback:           columnarCallback,
+							TrackedRowCallback:         createTrackedWALRecoveryCallback(arrowBuffer, walLogger),
+							ValidateTrackedRows:        validateTrackedWALRecoveryRows,
+							CheckpointRecovered:        checkpointRecovered,
+							BeforeDelete:               arrowBuffer.NewRecoveryFlushBarrier(),
+							BarrierBatchFiles:          16,
+							BarrierBatchRows:           cfg.Ingest.MaxBufferSize,
+							MaxReplayFailures:          3,
 						})
+						// Before the error branch: the recovery Warn fires from
+						// inside the pass whatever its outcome, so a gauge
+						// updated only on success would contradict it — and a
+						// failed pass is when the residue is most likely.
+						updatePartialRowRecovery(stats)
 						if err != nil {
 							walLogger.Error().Err(err).Msg("WAL recovery after flush failure failed")
 						} else {
@@ -1260,44 +1362,36 @@ func main() {
 								walLogger.Info().
 									Int("files", stats.RecoveredFiles).
 									Int("entries", stats.RecoveredEntries).
+									Int("kept_files", stats.KeptFiles).
+									Int("barrier_failures", stats.BarrierFailures).
 									Msg("WAL recovery after flush failure complete")
 							}
-							arrowBuffer.ResetFlushFailure()
+							for i := 0; i < stats.QuarantinedFiles; i++ {
+								metrics.Get().IncWALQuarantinedFiles()
+							}
+							if stats.KeptFiles == 0 && stats.BarrierFailures == 0 {
+								if !arrowBuffer.ResetFlushFailure(failureGeneration) {
+									walLogger.Info().Msg("A newer flush failure arrived during WAL recovery; keeping recovery armed")
+								}
+							}
 						}
+						updateWALDirectoryBytes()
 					} else {
-						// Normal operation. Two purges, because two different
-						// things bound WAL size and only one of them can be
-						// reasoned about from flush state:
-						//
-						//   - tracked files: reclaimed strictly below the
-						//     unflushed floor, never by age. Inferring
-						//     durability from wall-clock age is what lost
-						//     acknowledged writes (#966, #1009).
-						//   - files with no tracked sequences: a previous
-						//     process's files, and the untracked entries a
-						//     replication follower writes. No checkpoint will
-						//     ever cover them, so age is the only signal there
-						//     is — and without this a reader node's WAL grows
-						//     until the disk fills.
+						// Tracked files are reclaimed below the durable sequence
+						// floor. Files outside that floor remain for recovery; age
+						// is not evidence that their data reached storage.
 						deleted, err := walWriter.PurgeFlushed(walWriter.MinUnflushedSequence())
 						if err != nil {
 							walLogger.Error().Err(err).Msg("Periodic WAL purge failed")
 						} else if deleted > 0 {
 							walLogger.Info().Int("deleted", deleted).Msg("Periodic WAL cleanup complete")
 						}
-						if n, err := walWriter.PurgeUnaccountedOlderThan(safeAge); err != nil {
-							walLogger.Error().Err(err).Msg("Periodic WAL unaccounted-file purge failed")
-						} else if n > 0 {
-							walLogger.Info().Int("deleted", n).Msg("Purged WAL files with no tracked sequences")
-						}
+						updateWALDirectoryBytes()
 					}
 				}
 			}
 		}()
-		log.Info().
-			Dur("interval", recoveryInterval).
-			Dur("safe_age", safeAge).
-			Msg("Periodic WAL maintenance enabled")
+		log.Info().Dur("interval", recoveryInterval).Msg("Periodic WAL maintenance enabled")
 	}
 
 	// MQTT is initialized after the auth manager (below) so it can share the
@@ -1492,9 +1586,26 @@ func main() {
 	// the gate is consulted at Scheduler.Start() and TriggerNow(). OSS and
 	// standalone deployments pass a nil gate (compactionGate below) and
 	// skip the role check entirely, preserving pre-Phase-4 behavior.
+	//
+	// Two interface variables over ONE gate value (#1152): the schedulers
+	// take compaction.ClusterGate, and the API handler takes
+	// api.CompactionGate, which additionally reports the lease holder so a
+	// refusal can name it. Both are assigned from the same pointer here, so
+	// the manual trigger and the scheduled cycles can never disagree about
+	// whether this node may compact, and setCoordinator below upgrades both
+	// to lease mode at once.
+	//
+	// Both must stay INTERFACE variables assigned only inside this branch.
+	// Declaring either as *compactionClusterGate would hand the handler a
+	// non-nil interface wrapping a nil pointer in OSS, which passes the
+	// handler's nil check and then panics in CanCompact — the #713 shape.
+	// TestCompactionGateNilInterfaceConversionIssue1152 pins this.
 	var compactionGate compaction.ClusterGate
+	var compactionAPIGate api.CompactionGate
 	if cfg.Cluster.Enabled {
-		compactionGate = newCompactionClusterGate(cfg.Cluster.Role)
+		gate := newCompactionClusterGate(cfg.Cluster.Role)
+		compactionGate = gate
+		compactionAPIGate = gate
 	}
 	// Phase 4: completion-manifest directory used by the cluster-mode
 	// subprocess → parent handoff. Empty in OSS (nil gate is what disables
@@ -3479,7 +3590,11 @@ func main() {
 
 	// Register Compaction handler (if compaction is enabled)
 	if compactionManager != nil {
-		compactionHandler := api.NewCompactionHandler(compactionManager, hourlyScheduler, dailyScheduler, authManager, logger.Get("compaction"))
+		// compactionAPIGate wraps the same gate value the schedulers consult,
+		// so the manual trigger and the scheduled cycles can never disagree
+		// about whether this node may compact (#1152). nil outside cluster
+		// mode, and deliberately a nil INTERFACE rather than a typed nil.
+		compactionHandler := api.NewCompactionHandler(compactionManager, hourlyScheduler, dailyScheduler, authManager, compactionAPIGate, logger.Get("compaction"))
 		compactionHandler.RegisterRoutes(server.GetApp())
 
 		// Wire post-compaction cache invalidation.
@@ -4021,7 +4136,7 @@ func main() {
 				// that an OSS or unlicensed node carrying a leftover
 				// cold.enabled=true still boots. The runtime claim therefore
 				// rests on this whole block sitting inside
-				// "if cfg.TieredStorage.Enabled" (cmd/arc/main.go:3860). Were that
+				// "if cfg.TieredStorage.Enabled" (cmd/arc/main.go:3987). Were that
 				// outer gate ever to move, an unvalidated cold.Backend would
 				// reach this switch, fall through in silence and leave
 				// coldBackend nil, with nothing louder than cold_enabled=false
@@ -4137,7 +4252,7 @@ func main() {
 					// one that never starts the scan — a defer would not do,
 					// it being function-scoped to main and so running only
 					// after the shutdown step had already blocked on it.
-					scanCtx, cancelScan := context.WithTimeout(context.Background(), 30*time.Minute)
+					scanCtx, cancelScan := context.WithTimeout(context.Background(), tieringManager.ScanBudget())
 					scanDone := make(chan struct{})
 
 					// Registered as soon as the manager exists, not only once
@@ -4226,16 +4341,40 @@ func main() {
 							defer close(scanDone)
 							defer cancelScan()
 							result, err := tieringManager.ScanTiers(scanCtx)
-							if err != nil {
-								log.Warn().Err(err).Msg("Startup tier scan did not complete; the next migration cycle will scan again")
-								return
+							switch {
+							case errors.Is(err, context.Canceled):
+								// The node is shutting down: the shutdown step
+								// cancels this scan before joining it. Neither
+								// budget is at fault, and telling the operator
+								// to raise one would be wrong - the scan was
+								// interrupted, not short of time.
+								log.Warn().
+									Int("scanned", result.FilesScanned).
+									Msg("Startup tier scan was cancelled because the node is shutting down; the next start will scan again")
+							case err != nil && result.Truncated,
+								err == nil && result.Truncated:
+								// Name the key, and say what a partial scan
+								// costs. Pointing at the next migration cycle
+								// was misleading: every path now shares this
+								// budget, so the cycle will truncate in the
+								// same place, and the manual endpoint carries
+								// the same number too (#1154).
+								log.Warn().Err(err).
+									Dur("scan_timeout", tieringManager.ScanBudget()).
+									Int("scanned", result.FilesScanned).
+									Int("registered", result.FilesRegistered).
+									Msg("Startup tier scan ran out of its budget and stopped part way; tier rows are incomplete and no stale hot row was retired, which costs this node partition pruning. Raise tiered_storage.scan_timeout above the time a full scan takes here. GET /api/v1/tiering/status reports this under last_scan")
+							case err != nil:
+								log.Warn().Err(err).
+									Msg("Startup tier scan did not complete; the next migration cycle will scan again")
+							default:
+								log.Info().
+									Int("scanned", result.FilesScanned).
+									Int("registered", result.FilesRegistered).
+									Int("hot_retired", result.HotRetired).
+									Int("cold_synced", result.ColdSynced).
+									Msg("Startup tier scan completed")
 							}
-							log.Info().
-								Int("scanned", result.FilesScanned).
-								Int("registered", result.FilesRegistered).
-								Int("hot_retired", result.HotRetired).
-								Int("cold_synced", result.ColdSynced).
-								Msg("Startup tier scan completed")
 							// If the scan changed any row — on a node booting
 							// with none, measurements go from nothing to cold
 							// (the sync runs first) to hot and cold — a query
@@ -4243,6 +4382,11 @@ func main() {
 							// the earlier state for up to the cache TTL. A
 							// migration cycle drops the query caches for the
 							// same reason; so does this, at most once per boot.
+							//
+							// Runs for a TRUNCATED scan too: the rows it wrote
+							// before stopping are real, and this used to return
+							// on the error above and leave the query caches
+							// serving the pre-scan answer indefinitely.
 							if result.ColdSynced+result.HotRowsWritten+result.HotRetired > 0 {
 								queryHandler.InvalidateCaches()
 							}
@@ -4280,6 +4424,9 @@ func main() {
 
 		// Wire tiering manager to query handler for multi-tier query routing
 		queryHandler.SetTieringManager(tieringManager)
+		// DELETE rewrites immutable files outside the ingest/replication writers;
+		// keep tier metadata synchronized with the new path.
+		deleteHandler.SetTieringManager(tieringManager)
 		// A completed migration moves files between tiers, so cached pruned
 		// partition paths (pruner + SQL transform caches) go stale and must
 		// be dropped — same reason compaction invalidates them (#662).
@@ -4496,6 +4643,29 @@ func main() {
 				// The known-database check of a scoped backup (#1084) asks
 				// the same tier metadata whether a database is fully cold.
 				backupManager.SetTierLookup(tieringManager)
+				// And the cold-file marker (#1085 stage B3) asks it how many
+				// files a backup is NOT carrying, since only hot storage is
+				// copied.
+				//
+				// Note what this does NOT cover, because it is the case where
+				// the marker would be most useful. The tiering block above is
+				// gated on the LICENCE, not only on cfg.TieredStorage.Enabled,
+				// so on a node without it tieringManager is nil, this line is
+				// never reached and the field is absent — on a deployment whose
+				// files are already out of hot storage and which has stopped
+				// migrating. A licence that lapses while the process RUNS keeps
+				// reporting, because the manager is already built and only the
+				// migration cycle re-checks; it is the restart after a lapse
+				// that goes quiet. Fixing that would mean building a tiering
+				// MetadataStore (and running its schema) on an unlicensed node,
+				// which is the boundary the licence pattern exists to hold, so
+				// the behaviour stays and the field doc says so instead.
+				backupManager.SetColdCounter(tieringManager)
+				// And the cold tier itself (#1086 stage C): the store a backup
+				// reads cold objects from and a restore writes them back to.
+				// Same licence hole as the counter above — an unlicensed node
+				// wires neither, so its backups silently carry no cold data.
+				backupManager.SetColdSource(tieringManager)
 			}
 			backupHandler.RegisterRoutes(server.GetApp())
 			// backup_path is logged only when it IS the destination. Logging
@@ -4520,6 +4690,13 @@ func main() {
 				Bool("cluster_gate", clusterCoordinator != nil).
 				Bool("tier_recorder", tieringManager != nil).
 				Bool("tier_lookup", tieringManager != nil).
+				Bool("cold_counter", tieringManager != nil).
+				// NOT tieringManager != nil like its neighbours: cold can be
+				// configured and disabled, or its backend can have failed to
+				// build while tiering is otherwise up, and a startup line
+				// claiming a cold source in either case would be the kind of
+				// lie that takes an operator a long afternoon.
+				Bool("cold_source", tieringManager != nil && tieringManager.ColdBackend() != nil).
 				Msg("Backup/restore enabled")
 		}
 	}
@@ -4787,6 +4964,81 @@ func createWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolo
 	}
 }
 
+func trackedWALRowTarget(rec map[string]interface{}) (database, measurement string) {
+	for _, key := range []string{"_measurement", "measurement", "m"} {
+		measurement, _ = rec[key].(string)
+		if measurement != "" {
+			break
+		}
+	}
+	for _, key := range []string{"_database", "database"} {
+		database, _ = rec[key].(string)
+		if database != "" {
+			break
+		}
+	}
+	if database == "" {
+		database = "default"
+	}
+	return
+}
+
+// Validate before splitting: a boundary must not hide an invalid mixed-target
+// entry or allow an earlier chunk to be accepted before a missing target.
+func validateTrackedWALRecoveryRows(records []map[string]interface{}) error {
+	var database, measurement string
+	for i, rec := range records {
+		rowDatabase, rowMeasurement := trackedWALRowTarget(rec)
+		if rowMeasurement == "" {
+			return fmt.Errorf("WAL row %d has no measurement", i)
+		}
+		if i == 0 {
+			database, measurement = rowDatabase, rowMeasurement
+		} else if database != rowDatabase || measurement != rowMeasurement {
+			return fmt.Errorf("WAL row entry spans multiple databases or measurements")
+		}
+	}
+	return nil
+}
+
+// createTrackedWALRecoveryCallback restores one bounded row batch as a columnar
+// buffer write. Its identity covers exactly this batch, allowing a later pass
+// to skip durable ranges even if the file-delete barrier did not complete.
+func createTrackedWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolog.Logger) wal.TrackedRecoveryCallback {
+	return func(ctx context.Context, records []map[string]interface{}, walIdentity string) error {
+		if len(records) == 0 {
+			return nil
+		}
+
+		if err := validateTrackedWALRecoveryRows(records); err != nil {
+			return err
+		}
+		database, measurement := trackedWALRowTarget(records[0])
+		columns := make(map[string][]interface{})
+		for rowIndex, rec := range records {
+			for key, value := range rec {
+				switch key {
+				case "_measurement", "measurement", "m", "_database", "database":
+					continue
+				}
+				column, ok := columns[key]
+				if !ok {
+					column = make([]interface{}, len(records))
+					columns[key] = column
+				}
+				column[rowIndex] = value
+			}
+		}
+
+		if err := arrowBuffer.WriteColumnarDirectReplay(ctx, database, measurement, columns, walIdentity); err != nil {
+			walLogger.Error().Err(err).Str("measurement", measurement).Msg("Failed to replay tracked WAL row entry")
+			return err
+		}
+		walLogger.Info().Int("records", len(records)).Msg("WAL recovery: replayed tracked row entry")
+		return nil
+	}
+}
+
 // createColumnarRecoveryCallback creates a WAL recovery callback for columnar entries
 // written via the zero-copy AppendRaw path.
 func createColumnarRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolog.Logger) wal.ColumnarRecoveryCallback {
@@ -4796,8 +5048,8 @@ func createColumnarRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger z
 		}
 		// Inherit the replayed entry's identity: one columnar entry becomes
 		// exactly one buffer write, so a checkpoint for it covers precisely
-		// these records. The row-format callback above deliberately does NOT
-		// inherit — it fans one entry out into one write per record.
+		// these records. Row batches instead inherit their precise row-range
+		// identities when recovery splits an entry.
 		if err := arrowBuffer.WriteColumnarDirectReplay(ctx, database, measurement, columns, walIdentity); err != nil {
 			walLogger.Error().Err(err).Str("database", database).Str("measurement", measurement).Msg("Failed to replay columnar WAL entry")
 			return err
@@ -5010,6 +5262,19 @@ func (g *compactionClusterGate) CanCompact() bool {
 	}
 	// No failover or no lease assigned yet — fall back to static role.
 	return g.capabilities.CanCompact
+}
+
+// LeaseHolder implements api.CompactionGate (#1152): the node ID holding the
+// compactor lease, or "" when this cluster manages no lease — no coordinator,
+// or compactor failover never assigned one (cluster.failover_enabled defaults
+// to false). The trigger endpoint needs the distinction because CanCompact is
+// false for two reasons with different remedies: a lease held elsewhere, which
+// the operator can move, versus a static-role refusal with no lease to move.
+func (g *compactionClusterGate) LeaseHolder() string {
+	if g.coordinator == nil {
+		return ""
+	}
+	return g.coordinator.GetActiveCompactorID()
 }
 
 // CompactionPauseReason implements the scheduler's optional pauseReporter
@@ -5259,6 +5524,15 @@ func (b *backupClusterManifest) ManifestFiles() []backup.ManifestFile {
 	entries := b.coordinator.GetFileManifest()
 	out := make([]backup.ManifestFile, 0, len(entries))
 	for _, e := range entries {
+		// Cold entries stay OUT, and this filter is load-bearing for the cold
+		// backup walk (#1086 stage C) as well as for the reason below.
+		// crossCheckManifest treats this set as the authority on what is
+		// registered data; a cold entry appearing here would make it hold back
+		// or re-delete the very files the cold walk exists to carry. Cold files
+		// are enumerated from the cold store and reconciled against tier rows
+		// instead, and they are deliberately never registered in the Raft
+		// manifest. Do not "fix" the cold walk by letting cold entries through
+		// here.
 		if e == nil || e.Tier == "cold" {
 			continue
 		}

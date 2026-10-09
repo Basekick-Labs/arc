@@ -45,7 +45,7 @@ func TestScanRetiresHotRowsForVanishedFiles(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := m.metadata.RecordColdFile(ctx, row(coldOnly, TierCold, old), old); err != nil {
+	if _, err := m.metadata.RecordColdFile(ctx, row(coldOnly, TierCold, old), old); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.metadata.QuarantineFile(ctx, quarantined, quarantineReasonInvalidPath); err != nil {

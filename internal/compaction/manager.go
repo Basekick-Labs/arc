@@ -25,11 +25,128 @@ var ErrCycleAlreadyRunning = errors.New("compaction cycle already running")
 // for the scheduler, which logs it at Info.
 var ErrCompactionPaused = errors.New("compaction is paused cluster-wide")
 
-// cycleOutcome records only eligible batches actually discovered during
-// this cycle. Unvisited measurements are never counted as unstarted work.
-type cycleOutcome struct {
-	CycleID         int64
-	Status          string
+// Where a cycle came from, recorded on its outcome so an operator can tell
+// their own trigger's cycle from the scheduler's. "unspecified" is the honest
+// label for the public RunCompactionCycle* family: the scheduler reaches the
+// cycle body through runCycleInternal directly, so those exported entries have
+// no production caller today and guessing "scheduler" for them would mislabel
+// whichever caller is added next.
+const (
+	cycleSourceAPI         = "api"
+	cycleSourceScheduler   = "scheduler"
+	cycleSourceUnspecified = "unspecified"
+)
+
+// CycleHistoryLimit bounds the retained cycle outcomes (#1162). Exported so
+// the API can clamp its limit parameter to it.
+//
+// The default schedules are hourly "5 * * * *" plus daily "0 3 * * *", so a
+// completely idle node still burns 25 ids a day -- every tick claims a cycle
+// and records a slot even with zero candidates. 500 is therefore ~20 days at
+// the defaults, and ~41 hours at the "*/5 * * * *" an operator reconciling a
+// large migration might set. 100 (the bound appendJobHistory uses) would have
+// been 4 days and 8.3 hours respectively: short enough that the scheduler's
+// own empty cycles would evict an operator's trigger overnight.
+const CycleHistoryLimit = 500
+
+// cycleFailedPartitionLimit bounds the DISTINCT partitions recorded per cycle.
+//
+// #1162 shipped this as a 10-entry sample, on the assumption that job history
+// could answer the rest once it carried a cycle id. It cannot: every
+// invocation of compactFilesAdaptively writes a job record, and a batch killed
+// for memory splits 30 -> 15 -> 7 -> 3, so ONE failing batch emits four
+// records. The customer case is 80 partitions over ~1,500 batches, so a cycle
+// that fails throughout emits ~6,000 records against a 100-entry job ring --
+// under 2% of the answer. (Even one batch per partition would be ~320, still
+// three times the ring.)
+//
+// This list is the complete answer instead, because it is populated at the
+// outer dispatch level (one call per failed batch, no split-attempt noise) and
+// keyed by partition path, so the many batches of one partition collapse to
+// one entry. The customer case that motivated #1162 is 80 partitions over
+// ~1,500 batches; deduplicated that is 80 entries.
+//
+// 200 distinct partitions is ~16 KB per cycle at typical path lengths. Against
+// CycleHistoryLimit that is a ~8 MB ceiling, reached only if all 500 retained
+// cycles each failed 200+ distinct partitions -- a wholly broken deployment.
+// Typical cost is zero, because a healthy cycle fails nothing.
+const cycleFailedPartitionLimit = 200
+
+// cycleProgress holds a running cycle's live counters. These were locals in
+// runClaimed, which meant a lookup of a running cycle could report its scope
+// and start time but nothing about progress -- useless for the multi-hour
+// cycles this endpoint exists to observe. The outcome record holds a pointer
+// while the cycle runs; the finalizer copies the values out and clears it.
+type cycleProgress struct {
+	discovered      atomic.Int64
+	started         atomic.Int64
+	succeeded       atomic.Int64
+	failed          atomic.Int64
+	interrupted     atomic.Int64
+	discoveryErrors atomic.Int64
+
+	mu sync.Mutex
+	// failedPartitions maps a partition path to how many of its batches
+	// failed, so one entry covers a partition however many batches it was
+	// split into. failedTruncated records that the distinct-partition cap was
+	// reached, so a consumer never reads a capped list as complete.
+	failedPartitions map[string]int
+	failedTruncated  bool
+}
+
+// recordFailure counts a failed batch against its partition. Called once per
+// failed batch from the outer dispatch loop, so the count is in batches while
+// the key space is partitions.
+//
+// A partition already present is always counted, even past the cap: the cap
+// bounds how many DISTINCT partitions are tracked, not how many failures an
+// already-tracked partition may accumulate.
+func (p *cycleProgress) recordFailure(partitionPath string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.failedPartitions == nil {
+		p.failedPartitions = make(map[string]int)
+	}
+	if _, known := p.failedPartitions[partitionPath]; !known && len(p.failedPartitions) >= cycleFailedPartitionLimit {
+		p.failedTruncated = true
+		return
+	}
+	p.failedPartitions[partitionPath]++
+}
+
+// snapshotFailedPartitions copies the map out from under the mutex, with the
+// flag saying whether the distinct-partition cap dropped anything.
+func (p *cycleProgress) snapshotFailedPartitions() (map[string]int, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.failedPartitions) == 0 {
+		return nil, p.failedTruncated
+	}
+	return copyCounts(p.failedPartitions), p.failedTruncated
+}
+
+// CycleRecord is the outcome of one compaction cycle. It records only eligible
+// batches actually discovered during this cycle; unvisited measurements are
+// never counted as unstarted work.
+//
+// Exported because the API serves it per cycle id (#1162). Retained in a
+// bounded in-memory ring -- see CycleHistoryLimit.
+type CycleRecord struct {
+	CycleID int64
+	Status  string
+	Source  string
+
+	// Requested scope. Databases is nil when the cycle covered every database
+	// and Measurement is empty when it covered every measurement -- the cycle
+	// body works on its own expanded copy, so these stay what the caller asked
+	// for, which is what an operator is trying to match against.
+	Databases   []string
+	Measurement string
+	Tiers       []string
+
+	StartedAt  time.Time
+	FinishedAt time.Time // zero while the cycle runs
+
 	Discovered      int64
 	Started         int64
 	Succeeded       int64
@@ -37,6 +154,65 @@ type cycleOutcome struct {
 	Interrupted     int64
 	Unstarted       int64
 	DiscoveryErrors int64
+
+	// Err is the cycle error, truncated. A discovery-error count with no
+	// reason attached is a dead end for whoever has to act on it.
+	Err string
+	// FailedPartitions maps each partition that failed at least one batch to
+	// its failed-batch count. Deduplicated by partition, so this is the list
+	// of partitions to retry, not a sample of failures.
+	FailedPartitions map[string]int
+	// FailedPartitionsTruncated is true when more distinct partitions failed
+	// than cycleFailedPartitionLimit retains.
+	FailedPartitionsTruncated bool
+
+	// progress is non-nil only while the cycle runs, and is read only when
+	// FinishedAt is zero. The finalizer copies the counters into the fields
+	// above and clears it, so a finished outcome never follows the pointer.
+	progress *cycleProgress
+}
+
+// counters returns the outcome with its live counters resolved. A running
+// cycle's numbers come from progress; a finished one already has them.
+func (o CycleRecord) counters() CycleRecord {
+	p := o.progress
+	if p == nil {
+		return o
+	}
+	o.progress = nil
+	// Started is loaded FIRST, deliberately. Every batch is counted in
+	// discovered before started, so S <= D at any instant -- but these are two
+	// separate loads, and a full discover-dispatch-start sequence landing
+	// between them (async preemption can stretch that to milliseconds) would
+	// give Started(t2) > Discovered(t1) and a NEGATIVE Unstarted. Loading the
+	// smaller counter first makes Unstarted = D(t2) - S(t1) >= 0 always,
+	// because discovered is non-decreasing.
+	o.Started = p.started.Load()
+	o.Discovered = p.discovered.Load()
+	o.Succeeded = p.succeeded.Load()
+	o.Failed = p.failed.Load()
+	o.Interrupted = p.interrupted.Load()
+	o.DiscoveryErrors = p.discoveryErrors.Load()
+	o.Unstarted = o.Discovered - o.Started
+	o.FailedPartitions, o.FailedPartitionsTruncated = p.snapshotFailedPartitions()
+	return o
+}
+
+// clone deep-copies the slices so a retained outcome never shares backing
+// storage with a caller outside the lock.
+func (o CycleRecord) clone() CycleRecord {
+	if o.Databases != nil {
+		dbs := make([]string, len(o.Databases))
+		copy(dbs, o.Databases)
+		o.Databases = dbs
+	}
+	if o.Tiers != nil {
+		tiers := make([]string, len(o.Tiers))
+		copy(tiers, o.Tiers)
+		o.Tiers = tiers
+	}
+	o.FailedPartitions = copyCounts(o.FailedPartitions)
+	return o
 }
 
 // Manager orchestrates compaction jobs across all measurements
@@ -80,10 +256,34 @@ type Manager struct {
 	// Tiers
 	Tiers []Tier
 
-	// Job history (jobs run in subprocess, so no activeJobs tracking)
+	// Job history. Each entry is one ATTEMPT (one subprocess invocation), not
+	// one batch: a batch rescued by the adaptive splitter contributes several.
 	jobHistory []map[string]interface{}
 
-	// Cycle management - prevents concurrent compaction cycles
+	// activeJobs counts attempts currently in flight -- incremented once
+	// compactPartition holds the partition lock and decremented by its defer,
+	// so it is the same unit as totalJobsCompleted/Failed/Interrupted and as
+	// jobHistory. Two API surfaces advertised this number long before anything
+	// produced it: /status emitted null and /jobs an unconditional 0 (#1168).
+	// Read it through ActiveJobs(), never by asserting a type out of Stats().
+	activeJobs atomic.Int64
+
+	// Cycle management - prevents concurrent compaction cycles.
+	//
+	// claimMu makes taking the claim and publishing its id one step (#1153).
+	// Without it there is a window between the winner's CompareAndSwap and
+	// its cycleID.Add in which another caller reads the PREVIOUS, finished
+	// cycle's id -- and the trigger endpoint reports that id to an operator,
+	// who has no way to tell it apart from the cycle that is actually
+	// running. Held only around the claim and by the id accessors, never
+	// across cycle work or any I/O.
+	//
+	// It closes that window only for callers that take it. Stats() still
+	// reads cycleRunning and the id as two independent loads, so
+	// /api/v1/compaction/stats can pair cycle_running true with the previous
+	// cycle's id for an instant. Narrow, pre-existing, and not worth
+	// serialising a stats read behind the claim.
+	claimMu      sync.Mutex
 	cycleRunning atomic.Bool
 	cycleID      atomic.Int64
 
@@ -143,9 +343,18 @@ type Manager struct {
 	// hot loop and Stats (which holds mu) can both read it.
 	pauseGate atomic.Pointer[func() bool]
 
-	lastCycle cycleOutcome
-	logger    zerolog.Logger
-	mu        sync.Mutex
+	lastCycle CycleRecord
+
+	// cycleHistory retains the newest CycleHistoryLimit outcomes so a cycle id
+	// can be looked up after the fact (#1162). In memory only, like
+	// jobHistory: this package has no persistence, so the window dies with the
+	// process. Append-only and monotonic in CycleID, which is what lets the
+	// finalizer update the newest entry in place and the lookup treat the first
+	// and last entries as the retained range.
+	cycleHistory []CycleRecord
+
+	logger zerolog.Logger
+	mu     sync.Mutex
 }
 
 // SetPauseGate wires the cluster-wide compaction pause (#1087). The gate is
@@ -303,18 +512,94 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	return m
 }
 
-// appendJobHistory keeps the newest 100 job-stat maps. When trimming is
-// required, copy the retained map references into fresh slice storage so the
-// current history does not keep an older backing array that may retain evicted
-// pointer-containing entries. The maps themselves are intentionally shared.
+// jobAttribution says which cycle dispatched a job and how deep in the
+// adaptive splitter the attempt sits.
+//
+// AttemptDepth matters because job records count ATTEMPTS, not batches: a
+// batch that fails at 30 files and then succeeds as 15+15 writes three
+// records for the same partition path, identical in every other field, and the
+// depth is the only thing that tells them apart.
+//
+// Do NOT read depth-0 failures as the batch failures. recordFailure and
+// failed.Add fire together, and only when compactFilesAdaptively returns an
+// error -- so a batch that fails at depth 0 and is then RESCUED by splitting
+// returns nil, counts as succeeded, and contributes no failed partition, while
+// still leaving a depth-0 success=false record in job history. Depth-0
+// failures therefore exceed failed_batches whenever the splitter rescues
+// anything.
+//
+// The invariant that does hold exactly, and the one to reconcile against:
+//
+//	sum(FailedPartitions values) == Failed    (when not truncated)
+type jobAttribution struct {
+	CycleID      int64
+	AttemptDepth int
+}
+
+// copyCounts copies a partition->count map so a retained one never escapes
+// the lock. One helper rather than three hand-rolled loops, so the "never hand
+// out the retained map" invariant is one line to audit.
+func copyCounts(in map[string]int) map[string]int {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]int, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+// attributeJobToCycle stamps a job record with the cycle that dispatched it.
+//
+// A zero cycle id is omitted entirely rather than recorded as 0: ids start at
+// 1, so a zero would read as a real cycle. Zero means the job ran outside any
+// cycle, which no caller does today -- CompactPartition is exported, and this
+// guard is here so a future direct caller cannot misattribute its jobs.
+//
+// Extracted rather than inlined at the one call site because that call site is
+// inside compactPartition, which runs a real compaction subprocess and cannot
+// be reached from a unit test. Inlined, the guard was unverifiable: a mutation
+// recording cycle_id unconditionally passed the whole suite, because the test
+// fixture seeded history through its own helper and never ran this code.
+func attributeJobToCycle(job map[string]interface{}, attr jobAttribution) {
+	if attr.CycleID > 0 {
+		job["cycle_id"] = attr.CycleID
+	}
+	job["attempt_depth"] = attr.AttemptDepth
+}
+
+// JobHistoryLimit bounds the retained per-job compaction records. Exported so
+// the API can clamp its limit parameter to it.
+const JobHistoryLimit = 100
+
+// appendJobHistory keeps the newest JobHistoryLimit job-stat maps. When
+// trimming is required, copy the retained map references into fresh slice
+// storage so the current history does not keep an older backing array that may
+// retain evicted pointer-containing entries. The maps themselves are
+// intentionally shared.
 func appendJobHistory(history []map[string]interface{}, jobStats map[string]interface{}) []map[string]interface{} {
 	history = append(history, jobStats)
-	if len(history) <= 100 {
+	if len(history) <= JobHistoryLimit {
 		return history
 	}
 
-	retained := make([]map[string]interface{}, 100)
-	copy(retained, history[len(history)-100:])
+	retained := make([]map[string]interface{}, JobHistoryLimit)
+	copy(retained, history[len(history)-JobHistoryLimit:])
+	return retained
+}
+
+// appendCycleHistory keeps the newest CycleHistoryLimit cycle outcomes. Same
+// trim-from-the-front shape as appendJobHistory, so the newest entry stays
+// last -- the invariant the in-place finalizer update relies on.
+func appendCycleHistory(history []CycleRecord, outcome CycleRecord) []CycleRecord {
+	history = append(history, outcome)
+	if len(history) <= CycleHistoryLimit {
+		return history
+	}
+
+	retained := make([]CycleRecord, CycleHistoryLimit)
+	copy(retained, history[len(history)-CycleHistoryLimit:])
 	return retained
 }
 
@@ -619,6 +904,16 @@ func (m *Manager) notifyCompactedOutput(storageKey string) {
 	}
 }
 
+// recoverOrphanedManifests wires cluster completion updates into storage recovery.
+func (m *Manager) recoverOrphanedManifests(ctx context.Context, scope recoveryScope) (int, error) {
+	hooks := recoveryHooks{}
+	if m.CompletionDir != "" {
+		hooks.beforeInputDelete = m.writeRecoveredOutputWrittenManifest
+		hooks.afterInputDelete = m.writeRecoveredSourcesDeletedManifest
+	}
+	return m.ManifestManager.recoverOrphanedManifestsWithHooks(ctx, scope, m.notifyCompactedOutput, m.notifyConsumedInputs, hooks)
+}
+
 // FindCandidates finds partitions that are candidates for compaction across all databases
 func (m *Manager) FindCandidates(ctx context.Context) ([]Candidate, error) {
 	var candidates []Candidate
@@ -681,7 +976,25 @@ func (m *Manager) FindCandidates(ctx context.Context) ([]Candidate, error) {
 // CompactPartition compacts a single partition using subprocess isolation.
 // Running compaction in a subprocess ensures that DuckDB's jemalloc memory
 // is fully released when the subprocess exits, preventing memory retention.
+//
+// Jobs recorded through this exported entry carry no cycle_id: it compacts one
+// partition on its own, outside any cycle. The cycle path goes through
+// compactPartition instead, which attributes the record.
+//
+// The signature is deliberately unchanged. jobAttribution is unexported, so
+// adding it here would have made this method uncallable from outside the
+// package -- and it already has an external caller in
+// cmd/arc/license_compaction_subprocess_test.go.
 func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) error {
+	return m.compactPartition(ctx, candidate, jobAttribution{})
+}
+
+// compactPartition is CompactPartition with job attribution. attr says which
+// cycle dispatched the work and how deep in the adaptive splitter the attempt
+// sits. A zero CycleID means "outside any cycle": the history entry then
+// carries no cycle_id at all, rather than a zero that would read as a real
+// cycle (ids start at 1).
+func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, attr jobAttribution) error {
 	lockKey := filepath.Join(candidate.Database, candidate.PartitionPath)
 
 	// Try to acquire lock
@@ -690,6 +1003,19 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 		return nil
 	}
 	defer m.LockManager.ReleaseLock(lockKey)
+
+	// In flight from here, not from function entry: the lock-skip return above
+	// does no work and is excluded from totalJobs* for the same reason. The
+	// window deliberately covers the post-subprocess bookkeeping (receipt
+	// marking, manifest delete, cache invalidation) -- the attempt is not
+	// finished until those are. Both edges are pinned by tests that observe
+	// the count from inside this function; nothing outside it can see them.
+	//
+	// Deferred so the count cannot leak past a return. It would also survive a
+	// panic, though nothing recovers one here: compaction runs in goroutines
+	// with no recover, so a panic takes the process down regardless.
+	m.activeJobs.Add(1)
+	defer m.activeJobs.Add(-1)
 
 	// Build subprocess config. JobID is generated here (not inside NewJob)
 	// so the parent and subprocess agree on the completion-manifest filename.
@@ -807,6 +1133,7 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 		"partition_path": candidate.PartitionPath,
 		"tier":           candidate.Tier,
 	}
+	attributeJobToCycle(jobStats, attr)
 
 	if result != nil {
 		jobStats["files_compacted"] = result.FilesCompacted
@@ -893,7 +1220,7 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 //     - Split files in half
 //     - Recursively compact each half
 //  3. If batch size <= minBatchSize and still failing, give up
-func (m *Manager) compactFilesAdaptively(ctx context.Context, candidate Candidate, files []string, depth int, stderr string) error {
+func (m *Manager) compactFilesAdaptively(ctx context.Context, candidate Candidate, files []string, depth int, stderr string, cycleID int64) error {
 	// Maximum split depth. Each level halves the batch, so the ladder starts at
 	// whatever compaction.max_files_per_batch produced and bottoms out at
 	// MinFilesPerBatch — e.g. at the default 30: 30 → 15 → 7 → 3 → stop.
@@ -932,7 +1259,7 @@ func (m *Manager) compactFilesAdaptively(ctx context.Context, candidate Candidat
 	}
 
 	// Attempt compaction
-	err := m.CompactPartition(ctx, batchCandidate)
+	err := m.compactPartition(ctx, batchCandidate, jobAttribution{CycleID: cycleID, AttemptDepth: depth})
 	if err == nil {
 		// Success!
 		if depth > 0 {
@@ -1001,16 +1328,118 @@ func (m *Manager) compactFilesAdaptively(ctx context.Context, candidate Candidat
 		Msg("Splitting batch after recoverable failure")
 
 	// Try first half
-	if err := m.compactFilesAdaptively(ctx, candidate, firstHalf, depth+1, errStderr); err != nil {
+	if err := m.compactFilesAdaptively(ctx, candidate, firstHalf, depth+1, errStderr, cycleID); err != nil {
 		return fmt.Errorf("first half failed: %w", err)
 	}
 
 	// Try second half
-	if err := m.compactFilesAdaptively(ctx, candidate, secondHalf, depth+1, errStderr); err != nil {
+	if err := m.compactFilesAdaptively(ctx, candidate, secondHalf, depth+1, errStderr, cycleID); err != nil {
 		return fmt.Errorf("second half failed: %w", err)
 	}
 
 	return nil
+}
+
+// CycleClaim is the exclusive right to run one compaction cycle, with the id
+// that cycle will report. Taking the claim and learning its id is one step, so
+// a caller can answer an operator with the real id before the cycle body
+// starts (#1153) -- the trigger endpoint used to answer with
+// GetCurrentCycleID()+1, a guess made in the handler, while the id was
+// actually assigned later inside the cycle goroutine.
+//
+// The holder MUST call Release, and must arrange for it before any path that
+// can leave the claim behind -- a return OR a recovered panic. An unreleased
+// claim leaves cycleRunning true forever, which stops compaction on the node
+// until it is restarted. Further Release calls are no-ops.
+type CycleClaim struct {
+	// ID is the cycle id this claim will run under. Already published, so
+	// RunningCycleID returns it the moment ClaimCycle returns.
+	ID int64
+
+	m        *Manager
+	released atomic.Bool
+}
+
+// Release gives up the claim. Idempotent: a second call is a no-op rather
+// than clearing cycleRunning under a cycle that claimed it later, which would
+// be a worse bug than the one CycleClaim exists to fix.
+func (c *CycleClaim) Release() {
+	if c == nil || !c.released.CompareAndSwap(false, true) {
+		return
+	}
+	c.m.cycleRunning.Store(false)
+}
+
+// ClaimCycle takes the exclusive right to run one cycle and assigns its id.
+// Returns ErrCycleAlreadyRunning when a cycle already holds the claim.
+//
+// Deliberately silent: the caller decides whether a refusal is worth a log
+// line. runCycleInternalFiltered keeps the scheduler's Warn, and the API
+// handler logs its own refusal, so moving a log in here would double it.
+func (m *Manager) ClaimCycle() (*CycleClaim, error) {
+	m.claimMu.Lock()
+	defer m.claimMu.Unlock()
+
+	if !m.cycleRunning.CompareAndSwap(false, true) {
+		return nil, ErrCycleAlreadyRunning
+	}
+	return &CycleClaim{ID: m.cycleID.Add(1), m: m}, nil
+}
+
+// RunningCycleID is the id of the cycle holding the claim, or of the most
+// recent one when none is held. Takes claimMu, so it never observes the
+// instant between a claim being taken and its id being assigned -- that is
+// the whole point of the mutex, and the reason callers answering an operator
+// should prefer this over GetCurrentCycleID.
+func (m *Manager) RunningCycleID() int64 {
+	m.claimMu.Lock()
+	defer m.claimMu.Unlock()
+	return m.cycleID.Load()
+}
+
+// errInvalidClaim rejects a claim that cannot safely run a cycle. Running on a
+// released claim is the dangerous case: cycleRunning is false, so another
+// cycle can claim and run concurrently -- exactly the exclusivity CycleClaim
+// exists to provide. A claim from another Manager would run this manager's
+// cycle under that one's exclusion.
+var errInvalidClaim = errors.New("compaction: nil, already-released, or foreign cycle claim")
+
+func (m *Manager) checkClaim(claim *CycleClaim) error {
+	if claim == nil || claim.m != m || claim.released.Load() {
+		return errInvalidClaim
+	}
+	return nil
+}
+
+// RunClaimedCycleForTiers runs a cycle the caller already claimed, for the
+// given tiers across all databases. The caller owns the claim and releases
+// it -- including when this returns an error; this never releases it.
+func (m *Manager) RunClaimedCycleForTiers(ctx context.Context, claim *CycleClaim, tierNames []string) error {
+	if err := m.checkClaim(claim); err != nil {
+		return err
+	}
+	return m.runClaimed(ctx, claim.ID, cycleSourceAPI, nil, tierNames, "")
+}
+
+// RunClaimedCycleForDatabase is RunClaimedCycleForTiers scoped to one database.
+func (m *Manager) RunClaimedCycleForDatabase(ctx context.Context, claim *CycleClaim, database string, tierNames []string) error {
+	if err := m.checkClaim(claim); err != nil {
+		return err
+	}
+	return m.runClaimed(ctx, claim.ID, cycleSourceAPI, []string{database}, tierNames, "")
+}
+
+// RunClaimedCycleForMeasurement is RunClaimedCycleForTiers scoped to one
+// measurement of one database. Validates before touching the claim, matching
+// RunCompactionCycleForMeasurement, which validates before claiming.
+func (m *Manager) RunClaimedCycleForMeasurement(ctx context.Context, claim *CycleClaim, database, measurement string, tierNames []string) error {
+	if database == "" || measurement == "" {
+		return fmt.Errorf("database and measurement are required")
+	}
+	if err := m.checkClaim(claim); err != nil {
+		return err
+	}
+	return m.runClaimed(ctx, claim.ID, cycleSourceAPI, []string{database}, tierNames, measurement)
 }
 
 // RunCompactionCycle runs one compaction cycle for all enabled tiers.
@@ -1029,14 +1458,19 @@ func (m *Manager) RunCompactionCycle(ctx context.Context) (int64, error) {
 
 // RunCompactionCycleForTiers runs a complete compaction cycle for specific tiers across all databases.
 // tierNames must be non-empty - specify which tiers to run explicitly.
+//
+// Cycles started through this family are recorded with source "unspecified"
+// (#1162). The scheduler passes cycleSourceScheduler through runCycleInternal
+// directly, so labelling this family "scheduler" would mislabel whichever
+// caller is added next -- today it has none in production.
 func (m *Manager) RunCompactionCycleForTiers(ctx context.Context, tierNames []string) (int64, error) {
-	return m.runCycleInternal(ctx, nil, tierNames)
+	return m.runCycleInternal(ctx, cycleSourceUnspecified, nil, tierNames)
 }
 
 // RunCompactionCycleForDatabase runs a compaction cycle for a single database.
 // tierNames must be non-empty - specify which tiers to run explicitly.
 func (m *Manager) RunCompactionCycleForDatabase(ctx context.Context, database string, tierNames []string) (int64, error) {
-	return m.runCycleInternal(ctx, []string{database}, tierNames)
+	return m.runCycleInternal(ctx, cycleSourceUnspecified, []string{database}, tierNames)
 }
 
 // RunCompactionCycleForMeasurement restricts discovery to one measurement.
@@ -1044,37 +1478,71 @@ func (m *Manager) RunCompactionCycleForMeasurement(ctx context.Context, database
 	if database == "" || measurement == "" {
 		return 0, fmt.Errorf("database and measurement are required")
 	}
-	return m.runCycleInternalFiltered(ctx, []string{database}, tierNames, measurement)
+	return m.runCycleInternalFiltered(ctx, cycleSourceUnspecified, []string{database}, tierNames, measurement)
 }
 
 // runCycleInternal is the shared implementation for compaction cycles.
 // If filterDatabases is non-nil, only those databases are compacted; otherwise all databases are discovered.
-func (m *Manager) runCycleInternal(ctx context.Context, filterDatabases []string, tierNames []string) (int64, error) {
-	return m.runCycleInternalFiltered(ctx, filterDatabases, tierNames, "")
+func (m *Manager) runCycleInternal(ctx context.Context, source string, filterDatabases []string, tierNames []string) (int64, error) {
+	return m.runCycleInternalFiltered(ctx, source, filterDatabases, tierNames, "")
 }
 
-func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases []string, tierNames []string, filterMeasurement string) (cycleID int64, runErr error) {
-	// Prevent concurrent compaction cycles using atomic compare-and-swap
-	if !m.cycleRunning.CompareAndSwap(false, true) {
+// runCycleInternalFiltered claims a cycle and runs it to completion. Every
+// caller that wants the whole operation in one call -- both schedulers and the
+// three RunCompactionCycleFor* entry points -- goes through here, so their
+// behaviour is unchanged by the claim split: same loss Warn, same (0, error)
+// on a lost claim, same release-after-the-finalizer ordering.
+func (m *Manager) runCycleInternalFiltered(ctx context.Context, source string, filterDatabases []string, tierNames []string, filterMeasurement string) (int64, error) {
+	claim, err := m.ClaimCycle()
+	if err != nil {
 		m.logger.Warn().Msg("Compaction cycle already running, skipping")
-		return 0, ErrCycleAlreadyRunning
+		return 0, err
 	}
-	defer m.cycleRunning.Store(false)
+	// Registered before runClaimed is called, and runClaimed's own finalizer
+	// (which waits for active workers) completes before it returns -- so the
+	// release still happens strictly after the last worker, exactly as the
+	// previous defer ordering guaranteed. No worker can outlive the claim.
+	defer claim.Release()
 
-	cycleID = m.cycleID.Add(1)
+	return claim.ID, m.runClaimed(ctx, claim.ID, source, filterDatabases, tierNames, filterMeasurement)
+}
 
+// runClaimed is the cycle body. The caller holds the claim and owns its
+// release; runErr is named because the finalizer mutates it.
+func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, filterDatabases []string, tierNames []string, filterMeasurement string) (runErr error) {
 	var active sync.WaitGroup
-	var discovered atomic.Int64
-	var started atomic.Int64
-	var succeeded atomic.Int64
-	var failed atomic.Int64
-	var interrupted atomic.Int64
-	var discoveryErrors atomic.Int64
+	progress := &cycleProgress{}
+	discovered := &progress.discovered
+	started := &progress.started
+	succeeded := &progress.succeeded
+	failed := &progress.failed
+	interrupted := &progress.interrupted
+	discoveryErrors := &progress.discoveryErrors
 	// pausedSkipped is set by a partition goroutine that stopped between two
 	// of its batches because compaction was paused (#1087). The goroutine
 	// cannot set runErr, and the dispatch loop may already be waiting at the
 	// end of the tier, so it is checked there.
 	var pausedSkipped atomic.Bool
+
+	// The cycle is recorded as "running" before it starts, carrying its scope
+	// and a pointer to the live counters (#1162). Recording only at completion
+	// would make the endpoint 404 in exactly the window it exists for: the
+	// operator triggers, is handed a cycle id, and asks about it immediately.
+	// Nothing can return between here and the finalizer below -- only variable
+	// declarations sit in between -- so the finalizer always finds this entry.
+	startRecord := CycleRecord{
+		CycleID:     cycleID,
+		Status:      "running",
+		Source:      source,
+		Databases:   filterDatabases,
+		Measurement: filterMeasurement,
+		Tiers:       tierNames,
+		StartedAt:   time.Now().UTC(),
+		progress:    progress,
+	}
+	m.mu.Lock()
+	m.cycleHistory = appendCycleHistory(m.cycleHistory, startRecord.clone())
+	m.mu.Unlock()
 
 	// This finalizer also covers every early return. Active workers finish
 	// before the cycle is recorded and before cycleRunning is released.
@@ -1108,9 +1576,15 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 			status = "failed"
 		}
 
-		outcome := cycleOutcome{
+		outcome := CycleRecord{
 			CycleID:         cycleID,
 			Status:          status,
+			Source:          source,
+			Databases:       filterDatabases,
+			Measurement:     filterMeasurement,
+			Tiers:           tierNames,
+			StartedAt:       startRecord.StartedAt,
+			FinishedAt:      time.Now().UTC(),
 			Discovered:      discovered.Load(),
 			Started:         started.Load(),
 			Succeeded:       succeeded.Load(),
@@ -1118,10 +1592,37 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 			Interrupted:     interrupted.Load(),
 			DiscoveryErrors: discoveryErrors.Load(),
 		}
+		outcome.FailedPartitions, outcome.FailedPartitionsTruncated = progress.snapshotFailedPartitions()
 		outcome.Unstarted = outcome.Discovered - outcome.Started
+		if runErr != nil {
+			outcome.Err = truncateCycleError(runErr.Error())
+		}
 
 		m.mu.Lock()
 		m.lastCycle = outcome
+		// Replace the "running" entry this cycle appended at its start.
+		//
+		// Searched for by id rather than assumed to be the newest entry. It IS
+		// the newest one for every path that goes through ClaimCycle, whose CAS
+		// admits one cycle at a time. But RunClaimedCycleFor* is exported and
+		// checkClaim does not stop one claim from driving two concurrent
+		// runClaimed calls, and under that shape assuming the last index would
+		// strand an entry at "running" forever, holding a live progress pointer
+		// and serving a duration that grows without bound.
+		replaced := false
+		for i := len(m.cycleHistory) - 1; i >= 0; i-- {
+			if m.cycleHistory[i].CycleID == cycleID && m.cycleHistory[i].FinishedAt.IsZero() {
+				m.cycleHistory[i] = outcome.clone()
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			m.cycleHistory = appendCycleHistory(m.cycleHistory, outcome.clone())
+			m.logger.Warn().
+				Int64("cycle_id", cycleID).
+				Msg("Compaction cycle history lost its running entry; appended the outcome instead")
+		}
 		m.mu.Unlock()
 
 		event := m.logger.Info()
@@ -1141,20 +1642,20 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 			Msg("Compaction cycle finished")
 	}()
 	if err := ctx.Err(); err != nil {
-		return cycleID, err
+		return err
 	}
 	// The cluster-wide compaction pause (#1087): a cycle that starts while a
 	// restore holds it would stop at its first batch boundary anyway, so it
 	// does not start. Recorded as a "paused" cycle so Stats shows why.
 	if m.Paused() {
 		m.logger.Info().Int64("cycle_id", cycleID).Msg("Compaction cycle not started: compaction is paused cluster-wide")
-		return cycleID, ErrCompactionPaused
+		return ErrCompactionPaused
 	}
 
 	// Require explicit tier names
 	if len(tierNames) == 0 {
 		m.logger.Debug().Int64("cycle_id", cycleID).Msg("No tiers specified, skipping cycle")
-		return cycleID, nil
+		return nil
 	}
 
 	logEvent := m.logger.Info().
@@ -1185,7 +1686,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 		databases, err = m.listDatabases(ctx)
 		if err != nil {
 			m.logger.Error().Err(err).Msg("Failed to list databases for compaction cycle")
-			return cycleID, err
+			return err
 		}
 		// The exclusion list applies to unscoped discovery only — an
 		// explicit filterDatabases scope is operator intent and bypasses
@@ -1201,7 +1702,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 		databases = m.filterExcludedDatabases(databases)
 	}
 	if err := ctx.Err(); err != nil {
-		return cycleID, err
+		return err
 	}
 
 	recoveryDatabases := databases
@@ -1214,7 +1715,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 	// recoveryScope for why a tier-scoped recovery is wrong for the
 	// single-tier schedulers.
 	if m.ManifestManager != nil {
-		recovered, err := m.ManifestManager.recoverOrphanedManifests(ctx, recoveryScope{Databases: recoveryDatabases, Measurement: filterMeasurement}, m.notifyCompactedOutput, m.notifyConsumedInputs)
+		recovered, err := m.recoverOrphanedManifests(ctx, recoveryScope{Databases: recoveryDatabases, Measurement: filterMeasurement})
 		if recovered > 0 {
 			m.mu.Lock()
 			m.totalManifestsRecov += recovered
@@ -1223,7 +1724,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 		}
 		if err != nil {
 			if ctx.Err() != nil {
-				return cycleID, ctx.Err()
+				return ctx.Err()
 			}
 			discoveryErrors.Add(1)
 			m.logger.Warn().Err(err).Msg("Manifest recovery encountered errors")
@@ -1234,7 +1735,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 	dbMeasurements := make(map[string][]string)
 	for _, database := range databases {
 		if err := ctx.Err(); err != nil {
-			return cycleID, err
+			return err
 		}
 		if filterMeasurement != "" {
 			dbMeasurements[database] = []string{filterMeasurement}
@@ -1243,7 +1744,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 		measurements, err := m.listMeasurements(ctx, database)
 		if err != nil {
 			if ctx.Err() != nil {
-				return cycleID, ctx.Err()
+				return ctx.Err()
 			}
 			discoveryErrors.Add(1)
 			m.logger.Error().Err(err).
@@ -1263,7 +1764,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 	// would read it. Each tier lists the measurement itself (#316).
 	for _, tier := range m.Tiers {
 		if err := ctx.Err(); err != nil {
-			return cycleID, err
+			return err
 		}
 		if !tier.IsEnabled() {
 			continue
@@ -1307,7 +1808,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 						Str("tier", tierName).
 						Msg("Tier processing cancelled")
 					wg.Wait()
-					return cycleID, ctx.Err()
+					return ctx.Err()
 				default:
 				}
 				// The cluster-wide compaction pause (#1087) also ends
@@ -1321,14 +1822,14 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 						Str("database", database).
 						Msg("Compaction cycle stopping between measurements: compaction is paused cluster-wide")
 					wg.Wait()
-					return cycleID, ErrCompactionPaused
+					return ErrCompactionPaused
 				}
 
 				candidates, err := tier.FindCandidates(ctx, database, meas)
 				if err != nil {
 					if ctx.Err() != nil {
 						wg.Wait()
-						return cycleID, ctx.Err()
+						return ctx.Err()
 					}
 					discoveryErrors.Add(1)
 					m.logger.Error().Err(err).
@@ -1343,7 +1844,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 				for _, candidate := range candidates {
 					if err := ctx.Err(); err != nil {
 						wg.Wait()
-						return cycleID, err
+						return err
 					}
 					// A slash-carrying database is by construction a
 					// pseudo-database from the namespace expander — received
@@ -1356,7 +1857,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 					filteredCandidate, shouldProcess, manifestErr := m.filterCandidateFilesWithError(ctx, candidate)
 					if err := ctx.Err(); err != nil {
 						wg.Wait()
-						return cycleID, err
+						return err
 					}
 					if manifestErr != nil {
 						// The candidate stays excluded. Record genuine manifest
@@ -1381,7 +1882,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 					}
 					if err := ctx.Err(); err != nil {
 						wg.Wait()
-						return cycleID, err
+						return err
 					}
 					if !shouldProcess {
 						continue
@@ -1406,14 +1907,14 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 					case sem <- struct{}{}:
 					case <-ctx.Done():
 						wg.Wait()
-						return cycleID, ctx.Err()
+						return ctx.Err()
 					}
 					// If both select arms were ready, cancellation still wins
 					// before a new worker can be launched.
 					if err := ctx.Err(); err != nil {
 						<-sem
 						wg.Wait()
-						return cycleID, err
+						return err
 					}
 					// The cluster-wide compaction pause (#1087): no new worker
 					// while a restore holds it. Checked here, with capacity in
@@ -1434,7 +1935,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 							Str("partition", candidate.PartitionPath).
 							Msg("Compaction cycle stopping at a batch boundary: compaction is paused cluster-wide")
 						wg.Wait()
-						return cycleID, ErrCompactionPaused
+						return ErrCompactionPaused
 					}
 					wg.Add(1)
 					active.Add(1)
@@ -1466,7 +1967,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 							if m.compactBatchForTest != nil {
 								err = m.compactBatchForTest(ctx, batch)
 							} else {
-								err = m.compactFilesAdaptively(ctx, batch, batch.Files, 0, "")
+								err = m.compactFilesAdaptively(ctx, batch, batch.Files, 0, "", cycleID)
 							}
 
 							if err != nil {
@@ -1475,6 +1976,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 									return
 								}
 								failed.Add(1)
+								progress.recordFailure(batch.PartitionPath)
 								m.logger.Error().Err(err).
 									Str("partition", batch.PartitionPath).
 									Str("tier", tierName).
@@ -1497,14 +1999,14 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 		// Wait for all jobs in this tier to complete before moving to next tier
 		wg.Wait()
 		if err := ctx.Err(); err != nil {
-			return cycleID, err
+			return err
 		}
 		if pausedSkipped.Load() {
 			m.logger.Info().
 				Int64("cycle_id", cycleID).
 				Str("tier", tierName).
 				Msg("Compaction cycle ended at a batch boundary: compaction is paused cluster-wide")
-			return cycleID, ErrCompactionPaused
+			return ErrCompactionPaused
 		}
 
 		if tierCandidateCount == 0 {
@@ -1530,7 +2032,7 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, filterDatabases 
 	}
 
 	// The finalizer records the terminal outcome and complete counters.
-	return cycleID, nil
+	return nil
 }
 
 // IsCycleRunning returns true if a compaction cycle is currently in progress
@@ -1538,9 +2040,15 @@ func (m *Manager) IsCycleRunning() bool {
 	return m.cycleRunning.Load()
 }
 
-// GetCurrentCycleID returns the current or most recent cycle ID
+// GetCurrentCycleID returns the current or most recent cycle ID.
+//
+// Takes claimMu, so it is identical to RunningCycleID -- kept as the older
+// name because callers outside this package may use it, and deliberately NOT
+// left as a bare atomic load: a caller that picked this one over
+// RunningCycleID would silently reintroduce the window the mutex exists to
+// close (#1153).
 func (m *Manager) GetCurrentCycleID() int64 {
-	return m.cycleID.Load()
+	return m.RunningCycleID()
 }
 
 // listDatabases discovers all databases in storage
@@ -1735,6 +2243,21 @@ func (m *Manager) filterCandidateFilesWithError(ctx context.Context, candidate C
 	return candidate, len(filteredFiles) > 0, nil
 }
 
+// ActiveJobs returns the number of compaction attempts in flight.
+//
+// The unit is attempts, matching total_jobs_* and the /history records: a
+// batch the adaptive splitter rescues is several attempts inside one batch,
+// so this is not a batch count and must not be labelled as one.
+//
+// Typed on purpose. The same number is in Stats() under "active_jobs" for
+// JSON consumers, but reading it from there means asserting a type out of an
+// interface{}, and an assertion that guesses wrong yields a silent zero --
+// which is exactly how /jobs came to report 0 forever (#1168). Callers that
+// need the value use this; the map entry is for marshalling only.
+func (m *Manager) ActiveJobs() int64 {
+	return m.activeJobs.Load()
+}
+
 // Stats returns compaction statistics
 func (m *Manager) Stats() map[string]interface{} {
 	m.mu.Lock()
@@ -1755,6 +2278,7 @@ func (m *Manager) Stats() map[string]interface{} {
 		"total_bytes_saved":       m.totalBytesSaved,
 		"total_bytes_saved_mb":    float64(m.totalBytesSaved) / 1024 / 1024,
 		"total_manifests_recover": m.totalManifestsRecov,
+		"active_jobs":             m.activeJobs.Load(),
 		"cycle_running":           m.cycleRunning.Load(),
 		"current_cycle_id":        m.cycleID.Load(),
 		"exclude_databases":       excluded,
@@ -1772,12 +2296,19 @@ func (m *Manager) Stats() map[string]interface{} {
 		},
 	}
 
-	// Add recent jobs (last 10)
+	// Add recent jobs (last 10). Copied into fresh storage rather than handed
+	// out as a slice of the live ring: the maps are shared by reference either
+	// way, but a caller holding a slice of m.jobHistory's backing array reads
+	// it with no lock, which is one in-place mutation away from a real race.
+	// The 10 here is the /status and dashboard view; GET /compaction/history
+	// serves up to JobHistoryLimit through JobHistory.
 	recentJobs := m.jobHistory
 	if len(recentJobs) > 10 {
 		recentJobs = recentJobs[len(recentJobs)-10:]
 	}
-	stats["recent_jobs"] = recentJobs
+	recentCopy := make([]map[string]interface{}, len(recentJobs))
+	copy(recentCopy, recentJobs)
+	stats["recent_jobs"] = recentCopy
 
 	// Add tier stats
 	if len(m.Tiers) > 0 {
@@ -1965,4 +2496,253 @@ func enabledTiers(tiers []Tier) []Tier {
 		}
 	}
 	return out
+}
+
+// truncateCycleError bounds a retained cycle error. The history holds up to
+// CycleHistoryLimit entries, so an unbounded error string is an unbounded
+// retention cost.
+func truncateCycleError(msg string) string {
+	const limit = 512
+	if len(msg) <= limit {
+		return msg
+	}
+	return msg[:limit] + "... (truncated)"
+}
+
+// CycleHistoryPage is a consistent snapshot of the retained cycle history:
+// the page, the window it sits in, and which cycle is still open. Assembled
+// under one lock acquisition so the fields cannot disagree -- reading them
+// through separate accessors allowed a page that listed no running cycle
+// beside a RunningCycleID naming one that had just started, and vice versa.
+type CycleHistoryPage struct {
+	Cycles   []CycleRecord
+	Retained int
+
+	// Oldest and Newest are meaningless unless HasRange; callers must not
+	// report 0/0 as a range, because ids start at 1.
+	Oldest   int64
+	Newest   int64
+	HasRange bool
+
+	// RunningCycleID is the cycle whose record is still open, if any.
+	RunningCycleID int64
+	HasRunning     bool
+}
+
+// CyclePage returns up to limit retained cycles, newest first, together with
+// the window and running-cycle facts that describe them.
+func (m *Manager) CyclePage(limit int) CycleHistoryPage {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	page := CycleHistoryPage{Retained: len(m.cycleHistory)}
+	if len(m.cycleHistory) == 0 {
+		return page
+	}
+
+	page.Oldest = m.cycleHistory[0].CycleID
+	page.Newest = m.cycleHistory[len(m.cycleHistory)-1].CycleID
+	page.HasRange = true
+
+	if newest := m.cycleHistory[len(m.cycleHistory)-1]; newest.FinishedAt.IsZero() {
+		page.RunningCycleID = newest.CycleID
+		page.HasRunning = true
+	}
+
+	if limit < 1 {
+		return page
+	}
+	if limit > len(m.cycleHistory) {
+		limit = len(m.cycleHistory)
+	}
+	page.Cycles = make([]CycleRecord, 0, limit)
+	for i := len(m.cycleHistory) - 1; i >= len(m.cycleHistory)-limit; i-- {
+		page.Cycles = append(page.Cycles, m.cycleHistory[i].counters().clone())
+	}
+	return page
+}
+
+// CycleLookup resolves a cycle id and, when nothing is retained for it, the
+// window that absence sits in -- both under a single lock acquisition, so the
+// range reported in a 404 is the same snapshot that produced the miss.
+//
+// Deliberately does not consult the claim: that needs claimMu, and nothing in
+// this package establishes an m.mu -> claimMu order. The caller checks the
+// claim after this returns, holding no lock.
+func (m *Manager) CycleLookup(id int64) (rec CycleRecord, found bool, oldest int64, newest int64, hasRange bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if len(m.cycleHistory) > 0 {
+		oldest = m.cycleHistory[0].CycleID
+		newest = m.cycleHistory[len(m.cycleHistory)-1].CycleID
+		hasRange = true
+	}
+	for i := len(m.cycleHistory) - 1; i >= 0; i-- {
+		if m.cycleHistory[i].CycleID == id {
+			return m.cycleHistory[i].counters().clone(), true, oldest, newest, hasRange
+		}
+	}
+	return CycleRecord{}, false, oldest, newest, hasRange
+}
+
+// JobHistoryPage is a consistent view of retained job records: the page, how
+// much matched, and -- when filtered to a cycle -- that cycle's authoritative
+// counters. Assembled under ONE lock acquisition, following the precedent
+// CycleHistoryPage set, so no field can disagree with another. Both rings are
+// guarded by the same mutex, so the cross-check costs nothing extra.
+type JobHistoryPage struct {
+	Jobs    []map[string]interface{}
+	Matched int
+	// Retained is how many job records exist at all. Matched == Retained means
+	// the filter matched everything retained, which for a cycle filter is a
+	// warning: earlier records of that cycle may have been evicted.
+	Retained int
+	RingFull bool
+	// Truncated means "there is more than this page shows", and is decided
+	// here rather than by the caller because only this layer can be tested
+	// against a full ring: nothing outside this package can seed job history,
+	// so a handler-side computation was unverifiable -- a mutation dropping
+	// the eviction half of it passed the whole suite.
+	//
+	// It is NOT simply Matched > len(Jobs). Matched is counted over the ring,
+	// so once the ring is full it is a floor rather than a total: for a
+	// cycle-filtered read, earlier attempts of that cycle may already have
+	// been evicted, and reporting only the page comparison would answer "you
+	// have everything" at exactly that moment.
+	Truncated bool
+	// MayHaveEvicted is the hedged half of Truncated: the ring is full and the
+	// filtered cycle's earliest records may already be gone.
+	MayHaveEvicted     bool
+	TotalJobsCompleted int
+
+	// Cycle cross-check, populated when a cycle filter was applied. The job
+	// ring holds attempts and can be evicted; the cycle record holds the
+	// authoritative outer-level counts and is retained far longer, so it is
+	// the ground truth a page should be compared against.
+	CycleFound                  bool
+	CycleStatus                 string
+	CycleFailedBatches          int64
+	CycleStartedBatches         int64
+	CycleFailedPartitions       map[string]int
+	CycleFailedPartitionsCapped bool
+	OldestRetainedCycle         int64
+	NewestRetainedCycle         int64
+	HasCycleRange               bool
+}
+
+// JobHistory returns retained compaction job records, oldest first within the
+// window, limited to the newest limit entries.
+//
+// cycleID filters to one cycle's jobs; 0 returns every retained job. A limit
+// below 1 is clamped to 1 rather than returning nothing, so Matched always
+// reports the true match count -- a zero Matched must mean "nothing matched",
+// never "you asked wrong".
+//
+// Each record is copied, so the retained ring never escapes the lock. The
+// values are scalars, so a per-map shallow copy is a complete copy.
+// The return is NAMED because the truncation decision is made in a defer:
+// with an unnamed return, `return page` copies the value before the defer runs
+// and the flag is silently dropped.
+func (m *Manager) JobHistory(limit int, cycleID int64) (page JobHistoryPage) {
+	if limit < 1 {
+		limit = 1
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	page = JobHistoryPage{
+		Retained:           len(m.jobHistory),
+		RingFull:           len(m.jobHistory) >= JobHistoryLimit,
+		TotalJobsCompleted: m.totalJobsCompleted,
+	}
+
+	// Oldest retained job record that carries a cycle id. Records are appended
+	// in cycle order, so the first one that has an id has the smallest.
+	var oldestJobCycleID int64
+	for _, job := range m.jobHistory {
+		if id, ok := job["cycle_id"].(int64); ok {
+			oldestJobCycleID = id
+			break
+		}
+	}
+
+	matches := func(job map[string]interface{}) bool {
+		if cycleID <= 0 {
+			return true
+		}
+		id, ok := job["cycle_id"].(int64)
+		return ok && id == cycleID
+	}
+
+	for _, job := range m.jobHistory {
+		if matches(job) {
+			page.Matched++
+		}
+	}
+
+	if cycleID > 0 {
+		if len(m.cycleHistory) > 0 {
+			page.OldestRetainedCycle = m.cycleHistory[0].CycleID
+			page.NewestRetainedCycle = m.cycleHistory[len(m.cycleHistory)-1].CycleID
+			page.HasCycleRange = true
+		}
+		for i := len(m.cycleHistory) - 1; i >= 0; i-- {
+			if m.cycleHistory[i].CycleID != cycleID {
+				continue
+			}
+			rec := m.cycleHistory[i].counters()
+			page.CycleFound = true
+			page.CycleStatus = rec.Status
+			page.CycleFailedBatches = rec.Failed
+			page.CycleStartedBatches = rec.Started
+			page.CycleFailedPartitionsCapped = rec.FailedPartitionsTruncated
+			page.CycleFailedPartitions = copyCounts(rec.FailedPartitions)
+			break
+		}
+	}
+
+	// Decided before the early return so an evicted, fully-matched page is
+	// still flagged.
+	//
+	// The eviction term is NOT simply "the ring is full". A busy node's ring is
+	// permanently full, so that would make this flag constant-true for every
+	// cycle-filtered read and therefore carry no information at all. Cycles are
+	// strictly serialized (cycleRunning CAS) with monotonically increasing ids,
+	// so one cycle's records are contiguous in the ring and the oldest retained
+	// cycle id decides it: strictly older than the filter means nothing of the
+	// filtered cycle was evicted.
+	defer func() {
+		evicted := page.RingFull && cycleID > 0 && oldestJobCycleID > 0 && oldestJobCycleID >= cycleID
+		page.Truncated = page.Matched > len(page.Jobs) || evicted
+		page.MayHaveEvicted = evicted
+	}()
+
+	if page.Matched == 0 {
+		return page
+	}
+
+	// Walk forward so the result stays chronological -- the order this history
+	// has always been served in -- skipping all but the newest `limit`.
+	skip := page.Matched - limit
+	if skip < 0 {
+		skip = 0
+	}
+	page.Jobs = make([]map[string]interface{}, 0, page.Matched-skip)
+	for _, job := range m.jobHistory {
+		if !matches(job) {
+			continue
+		}
+		if skip > 0 {
+			skip--
+			continue
+		}
+		copied := make(map[string]interface{}, len(job))
+		for k, v := range job {
+			copied[k] = v
+		}
+		page.Jobs = append(page.Jobs, copied)
+	}
+	return page
 }

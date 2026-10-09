@@ -224,7 +224,7 @@ func TestBackupRatioFailureNamesCauseAndKeepsStatusSample(t *testing.T) {
 func TestSkipTally_SampleIsBounded(t *testing.T) {
 	var tally skipTally
 	for i := 0; i < 40; i++ {
-		tally.record(fmt.Sprintf("k%d", i), i%2 == 0)
+		tally.record(fmt.Sprintf("k%d", i), i%2 == 0, false)
 	}
 	if len(tally.sample) != unaddressableSampleCap {
 		t.Errorf("sample length = %d, want %d", len(tally.sample), unaddressableSampleCap)
@@ -236,7 +236,7 @@ func TestSkipTally_SampleIsBounded(t *testing.T) {
 		t.Errorf("sample keeps the first %d in order: %v", unaddressableSampleCap, tally.sample)
 	}
 	var none *skipTally
-	none.record("x", true) // must not panic
+	none.record("x", true, false) // must not panic
 }
 
 func TestCheckSkipRatio_MessageNamesCauses(t *testing.T) {

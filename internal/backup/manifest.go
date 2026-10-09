@@ -147,6 +147,79 @@ type Manifest struct {
 	// namespace directories are still excluded: they are never listed).
 	IcebergNamespaceFilesExcluded int64    `json:"iceberg_namespace_files_excluded,omitempty"`
 	IcebergNamespacesExcluded     []string `json:"iceberg_namespaces_excluded,omitempty"`
+	// ColdFilesExcluded counts tier rows whose data this backup does NOT
+	// carry. That one sentence covers both configurations:
+	//
+	//   - with a cold tier this node can read (#1086 stage C), the backup
+	//     carries the cold objects, so the only rows it cannot carry are the
+	//     ones whose object is MISSING from the cold store — data that is
+	//     genuinely gone;
+	//   - with no cold tier, every cold row qualifies, which is exactly what
+	//     this field meant when stage B introduced it.
+	//
+	// It is INFORMATIONAL and
+	// deliberately joins no refusal — see the comment above the incompleteness
+	// refusal in restore.go, which explains why adding it there would prevent
+	// nothing. ColdFilesExcludedDatabases is the per-database breakdown,
+	// because one total over several databases does not tell an operator which
+	// database has data the backup is missing.
+	//
+	// Per leg, like the counters on TargetSlice: a database's cold gap is
+	// attributed to the target its DATA routes to, so the audit target's
+	// manifest reports the audit database's gap and nothing else. Summed into
+	// the run-level view by mergeRunManifests.
+	//
+	// THIS NODE's tier metadata, which is the only view a backup has. On a
+	// cluster where one node migrates and the others learn about it through
+	// the cold-tier metadata sync, a node whose sync has not run or has failed
+	// holds fewer rows than the cluster has cold files and reports the lower
+	// number without an error.
+	//
+	// Zero and absent in FOUR cases, which the JSON cannot distinguish: when
+	// tiering is off; when nothing has been migrated; when the count could not
+	// be taken (the WARN that names the failure is the only record of this
+	// one); and — the one that misleads — when this node has no tiering
+	// LICENCE. The tiering manager is licence-gated at startup, so an
+	// unlicensed node wires no counter even though its cold objects and tier
+	// rows are still there. An absent field is therefore NOT evidence that
+	// nothing was migrated. A licence that lapses while the process runs keeps
+	// reporting; the restart after a lapse does not.
+	ColdFilesExcluded          int64            `json:"cold_files_excluded,omitempty"`
+	ColdFilesExcludedDatabases map[string]int64 `json:"cold_files_excluded_databases,omitempty"`
+	// ColdFiles counts the files in this leg that were read from the COLD tier
+	// (#1086 stage C), with ColdSizeBytes their total. They are also in
+	// TotalFiles, TotalSizeBytes and the per-database inventory, because they
+	// are data the backup carries like any other; this is the figure that says
+	// how much of it came from cold. Zero on a node with no cold tier, and on
+	// every backup taken before stage C.
+	//
+	// The sidecar carries the tier PER FILE, which is what a restore reads;
+	// these are the aggregate an operator sees.
+	ColdFiles     int64 `json:"cold_files,omitempty"`
+	ColdSizeBytes int64 `json:"cold_size_bytes,omitempty"`
+	// ColdObjectsUnrecorded counts cold objects the listing returned that this
+	// node has no tier row for. They ARE in the backup — the listing is the
+	// authority on what exists, and refusing them would mean a node with
+	// incomplete metadata backs up no cold data at all. The count is here
+	// because it is also a report about the node: cold metadata that does not
+	// match the store.
+	//
+	// Not necessarily transient. The tiering cold sync that would record the
+	// missing rows only runs on a cluster with shared storage or replication,
+	// so on a standalone node, and on a local-storage cluster without
+	// replication, nothing will ever record them.
+	ColdObjectsUnrecorded int64 `json:"cold_objects_unrecorded,omitempty"`
+	// ColdDedupSkipped counts paths that were in BOTH the hot and the cold
+	// listing — the window a migration opens by copying to cold before
+	// releasing the hot copy — where the cold copy was taken and the hot one
+	// dropped. One path, one copy, one sidecar row.
+	ColdDedupSkipped int64 `json:"cold_dedup_skipped,omitempty"`
+	// ColdRowsStaleButHot counts tier rows that say cold, have no object in the
+	// cold store, and whose file the backup carried from HOT storage anyway.
+	// NOT a gap — the data is in the backup — but a metadata disagreement an
+	// operator should see, and reachable persistently on a node whose
+	// reconciliation is role gated.
+	ColdRowsStaleButHot int64 `json:"cold_rows_stale_but_hot,omitempty"`
 	// Target names the configured backup target this backup was written to
 	// (#1085 stage B2b-1), absent when it went to backup.local_path as
 	// backups did before targets existed.
@@ -263,6 +336,17 @@ type BackupSummary struct {
 	// one, so a client that reads the single-target field is never handed one
 	// of several.
 	Targets []string `json:"targets,omitempty"`
+	// ColdFilesExcluded is the run-level cold-tier gap: files the backup did
+	// not carry because they are no longer in hot storage. Summed over the
+	// legs, so it is a lower bound whenever PartialView is set, like the other
+	// counts here. The per-database breakdown is on the manifest, and so at
+	// the TOP LEVEL of the detail response — not per target (TargetSlice
+	// carries each leg's total only) and not in this listing row.
+	ColdFilesExcluded int64 `json:"cold_files_excluded,omitempty"`
+	// ColdFiles is how many of TotalFiles came from the cold tier (#1086
+	// stage C), so a listing row shows at a glance whether a backup of a
+	// tiered deployment actually carried the tiered data.
+	ColdFiles int64 `json:"cold_files,omitempty"`
 	// PartialView says the counts above are summed over FEWER legs than
 	// Targets names, because a target would not answer or has not committed.
 	// TotalFiles, TotalBytes and DatabaseCount are then lower bounds, and the
@@ -320,6 +404,51 @@ type Progress struct {
 	// storage root to put them in (the log names the fix).
 	IcebergWarehouseFilesSkipped int64 `json:"iceberg_warehouse_files_skipped,omitempty"`
 	BackupUnaddressableFiles     int64 `json:"backup_unaddressable_files,omitempty"`
+	// ColdFilesExcluded: for a backup, the run-level cold-tier gap, published
+	// once with the other pre-copy decisions — which is BEFORE the copy
+	// phase, so a run that fails later keeps the figure here beside
+	// status="failed". That is deliberate: it was true of the data when it was
+	// taken, and no manifest lands for a failed run, so this is the only place
+	// the gap is visible for one. For a restore,
+	// BackupColdFilesExcluded mirrors the restored backup's own figure, so the
+	// operator can tell data the backup never held from data the restore lost.
+	// The per-database breakdown is NOT here: Progress is published by
+	// setProgress, which takes a shallow copy, so a snapshot must share no
+	// mutable map with the run that is still writing.
+	ColdFilesExcluded       int64 `json:"cold_files_excluded,omitempty"`
+	BackupColdFilesExcluded int64 `json:"backup_cold_files_excluded,omitempty"`
+	// Restore only (#1086 stage C), where a backup carries cold-tier files.
+	// ColdFilesRestoredToCold counts files put back in this node's cold tier
+	// with their tier row recorded, so the query path can route to them.
+	// ColdFilesRestoredToHot counts files the backup read from a cold tier
+	// that landed in HOT storage instead, because this node has no cold tier
+	// (or has one configured but disabled, where a cold write would be
+	// unreadable): the data is here and queryable, it is simply all hot now.
+	// ColdRestoreQuarantineSkipped counts files whose tier row is quarantined
+	// — the bytes were written, the row was left alone, and the file is not
+	// queryable until an operator clears the quarantine.
+	// ColdRowsNotRecorded counts files whose bytes reached the cold store but
+	// whose row could not be written, which is the same unqueryable outcome
+	// from a different cause — and on a node where the cold-metadata sync
+	// never runs (standalone, or a cluster without shared storage or
+	// replication) nothing will write that row later either.
+	ColdFilesRestoredToCold int64 `json:"cold_files_restored_to_cold,omitempty"`
+	ColdFilesRestoredToHot  int64 `json:"cold_files_restored_to_hot,omitempty"`
+	// ColdFilesSkippedAlreadyCold counts hot-backup files whose matching cold
+	// copy and cold tier row already exist locally, so restore left them there.
+	ColdFilesSkippedAlreadyCold int64 `json:"cold_files_skipped_already_cold,omitempty"`
+	// HotBackupFilesRoutedToCold counts files the backup holds as hot whose
+	// local tier row now says cold, so the restore wrote them to the cold tier
+	// instead of resurrecting a hot copy (#1139). Includes the
+	// ColdFilesSkippedAlreadyCold subset, which needed no write at all.
+	HotBackupFilesRoutedToCold int64 `json:"hot_backup_files_routed_to_cold,omitempty"`
+	// ColdRowsSkippedUnverifiable counts files this node holds in cold storage
+	// that the backup carries with no sidecar row, so the restore had nothing to
+	// verify replacement bytes against and left the cold copy untouched (#1139).
+	// These files were NOT restored; the copy on this node is whatever it was.
+	ColdRowsSkippedUnverifiable  int64 `json:"cold_rows_skipped_unverifiable,omitempty"`
+	ColdRestoreQuarantineSkipped int64 `json:"cold_restore_quarantine_skipped,omitempty"`
+	ColdRowsNotRecorded          int64 `json:"cold_rows_not_recorded,omitempty"`
 	// Cluster cross-check, backup only (#1083): mirrors of the manifest's
 	// UnregisteredSkipped/ManifestOnlyFiles and their samples, published once
 	// after the data copy.
@@ -418,6 +547,18 @@ const (
 func mergeRunManifests(legs []*Manifest) *Manifest {
 	if len(legs) == 1 {
 		clone := *legs[0]
+		// The slice fields are aliased, as they always have been, and no
+		// caller appends to them. The breakdown is the manifest's first MAP
+		// field, where an in-place m[k] = v is the natural way to write and
+		// would reach through into the leg, so it is copied rather than
+		// documented as untouchable.
+		if clone.ColdFilesExcludedDatabases != nil {
+			cp := make(map[string]int64, len(clone.ColdFilesExcludedDatabases))
+			for k, v := range clone.ColdFilesExcludedDatabases {
+				cp[k] = v
+			}
+			clone.ColdFilesExcludedDatabases = cp
+		}
 		return &clone
 	}
 	// Run-level fields come from the default leg when it is present, because
@@ -455,6 +596,22 @@ func mergeRunManifests(legs []*Manifest) *Manifest {
 		merged.LeftManifestDuringRun += leg.LeftManifestDuringRun
 		merged.SkippedReconciled += leg.SkippedReconciled
 		merged.IcebergNamespaceFilesExcluded += leg.IcebergNamespaceFilesExcluded
+		merged.ColdFiles += leg.ColdFiles
+		merged.ColdSizeBytes += leg.ColdSizeBytes
+		merged.ColdObjectsUnrecorded += leg.ColdObjectsUnrecorded
+		merged.ColdDedupSkipped += leg.ColdDedupSkipped
+		merged.ColdRowsStaleButHot += leg.ColdRowsStaleButHot
+		merged.ColdFilesExcluded += leg.ColdFilesExcluded
+		if len(leg.ColdFilesExcludedDatabases) > 0 && merged.ColdFilesExcludedDatabases == nil {
+			merged.ColdFilesExcludedDatabases = map[string]int64{}
+		}
+		for db, n := range leg.ColdFilesExcludedDatabases {
+			// Summed rather than assigned for the same reason
+			// mergeDatabaseInfo folds instead of replacing: a database's
+			// anchors and compaction state ride with its data, and a run whose
+			// routing changed between backups could hold one name on two legs.
+			merged.ColdFilesExcludedDatabases[db] += n
+		}
 		merged.SkippedSample = appendSample(merged.SkippedSample, leg.SkippedSample)
 		merged.UnaddressableSample = appendSample(merged.UnaddressableSample, leg.UnaddressableSample)
 		merged.UnregisteredSample = appendSample(merged.UnregisteredSample, leg.UnregisteredSample)
@@ -559,5 +716,7 @@ func SummaryFromManifest(m *Manifest) BackupSummary {
 		LeftManifestDuringRun: m.LeftManifestDuringRun,
 		Target:                m.Target,
 		OwnerInstanceID:       m.OwnerInstanceID,
+		ColdFilesExcluded:     m.ColdFilesExcluded,
+		ColdFiles:             m.ColdFiles,
 	}
 }

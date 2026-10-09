@@ -82,7 +82,7 @@ func TestManualCompactionDeadlineAndScopeIssue915(t *testing.T) {
 	}
 
 	handler := NewCompactionHandler(
-		manager, nil, nil, nil, zerolog.Nop(),
+		manager, nil, nil, nil, nil, zerolog.Nop(),
 	)
 
 	app := fiber.New()

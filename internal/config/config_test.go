@@ -75,18 +75,26 @@ func TestEffectiveCores_MatchesRuntime(t *testing.T) {
 }
 
 func TestDefaultCompactionThreads(t *testing.T) {
-	cases := []struct{ cores, want int }{
-		{1, 1}, // floor: never 0, which the subprocess reads as "unset"
-		{2, 1}, // the headline 2-CPU pod
-		{3, 1},
-		{8, 4},
-		{64, 32},
-		{0, 1},
+	cases := []struct {
+		name                 string
+		cores, maxConcurrent int
+		want                 int
+	}{
+		{"default concurrency keeps half-core behavior", 8, 2, 4},
+		{"two-core limit at default concurrency", 2, 2, 1},
+		{"raised concurrency divides available cores", 16, 4, 4},
+		{"raised concurrency on constrained process", 8, 4, 2},
+		{"zero concurrency uses default", 8, 0, 4},
+		{"negative concurrency uses default", 8, -1, 4},
+		{"minimum one thread", 1, 8, 1},
+		{"zero cores", 0, 2, 1},
 	}
 	for _, c := range cases {
-		if got := defaultCompactionThreads(c.cores); got != c.want {
-			t.Errorf("defaultCompactionThreads(%d) = %d, want %d", c.cores, got, c.want)
-		}
+		t.Run(c.name, func(t *testing.T) {
+			if got := defaultCompactionThreads(c.cores, c.maxConcurrent); got != c.want {
+				t.Errorf("defaultCompactionThreads(%d, %d) = %d, want %d", c.cores, c.maxConcurrent, got, c.want)
+			}
+		})
 	}
 }
 

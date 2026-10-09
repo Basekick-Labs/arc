@@ -204,13 +204,23 @@ type CompactionConfig struct {
 	MemoryLimit string
 
 	// Threads is the DuckDB thread count for EACH compaction subprocess.
-	// 0 (the default) means auto: half of EffectiveCores, minimum 1 — half the
-	// CPUs this process may use, which is the container's CPU quota where there
-	// is one and the machine's core count where there is not (#1030). Before
-	// this key existed, each subprocess used DuckDB's own default, which is the
-	// quota or, unlimited, all cores — so two concurrent jobs could saturate the
-	// machine and starve ingest. Sort and scan buffers scale with threads, so
-	// this also bounds memory.
+	// 0 (the default) means auto: EffectiveCores divided by max(2,
+	// max_concurrent), with a minimum of 1. EffectiveCores reflects the CPUs
+	// available to this process; it does not distinguish a quota, cpuset, or
+	// GOMAXPROCS setting. The default max_concurrent of 2 preserves the previous
+	// half-core value, while higher concurrency divides the thread cap across
+	// subprocesses (#1037).
+	//
+	// Whatever value this ends up with is then subject to the licence cap in
+	// cmd/arc/main.go#applyLicenseCoreLimits (#1036) — the AUTO value included,
+	// not only an explicit one, because Load resolves this sentinel to a
+	// positive number before that runs. The cap applies on a core-limited
+	// licence only; applyLicenseCoreLimits returns early when MaxCores <= 0.
+	//
+	// Before this key existed, each subprocess used DuckDB's own default,
+	// which could allow concurrent jobs to saturate the machine and starve
+	// ingest. Sort and scan buffers also scale with threads, so this bounds
+	// memory.
 	Threads int
 
 	// MaxFilesPerBatch bounds how many files a single compaction job feeds to
@@ -602,6 +612,19 @@ type TieredStorageConfig struct {
 	// Migration history cleanup
 	MigrationHistoryRetentionDays int // How long to keep migration history (default: 90)
 
+	// ScanTimeout bounds ONE tier scan on every path that runs one: the
+	// startup scan, POST /api/v1/tiering/scan, and the pre-migration scan
+	// inside a migration cycle. Default 2h.
+	//
+	// It does NOT replace the migration cycle budget. Inside a cycle the scan
+	// runs on a context derived from the cycle's, so it gets whichever of the
+	// two is shorter and migration keeps the remainder (#1154).
+	//
+	// A value below the time a full scan takes is harmful, not conservative:
+	// hot-row retirement runs only after the whole walk, so a scan that always
+	// truncates never retires a stale row.
+	ScanTimeout time.Duration
+
 	// Cold tier configuration (remote S3/Azure storage)
 	Cold ColdTierConfig
 }
@@ -879,6 +902,14 @@ func Load() (*Config, error) {
 	// 2h or 90s, read the same way as compaction.cycle_timeout above because
 	// that is the only existing duration key and there is no GetDuration call
 	// in this repo.
+	scanTimeout, err := time.ParseDuration(v.GetString("tiered_storage.scan_timeout"))
+	if err != nil || scanTimeout <= 0 {
+		return nil, fmt.Errorf(
+			"invalid tiered_storage.scan_timeout %q: must be a positive Go duration",
+			v.GetString("tiered_storage.scan_timeout"),
+		)
+	}
+
 	backupOperationTimeout, err := time.ParseDuration(v.GetString("backup.operation_timeout"))
 	if err != nil || backupOperationTimeout <= 0 {
 		return nil, fmt.Errorf(
@@ -1194,6 +1225,7 @@ func Load() (*Config, error) {
 			MigrationBatchSize:            v.GetInt("tiered_storage.migration_batch_size"),
 			DefaultHotMaxAgeDays:          v.GetInt("tiered_storage.default_hot_max_age_days"),
 			MigrationHistoryRetentionDays: v.GetInt("tiered_storage.migration_history_retention_days"),
+			ScanTimeout:                   scanTimeout,
 			Cold: ColdTierConfig{
 				Enabled: v.GetBool("tiered_storage.cold.enabled"),
 				// Normalized like storage.backend so cold.Backend == "s3"/"azure"
@@ -1260,7 +1292,7 @@ func Load() (*Config, error) {
 		cfg.Compaction.MemoryLimit = deriveCompactionMemoryLimit(cfg.Database.MemoryLimit, cfg.Compaction.MaxConcurrent)
 	}
 	if cfg.Compaction.Threads == 0 {
-		cfg.Compaction.Threads = getDefaultCompactionThreads()
+		cfg.Compaction.Threads = getDefaultCompactionThreads(cfg.Compaction.MaxConcurrent)
 	}
 
 	// Trim storage identifiers in-place before validating. These build DuckDB
@@ -1392,6 +1424,14 @@ func Load() (*Config, error) {
 		if err := cfg.checkBackupDestinationOverlap(); err != nil {
 			return nil, err
 		}
+	}
+
+	// Refuse a path that reaches read_parquet and could be read as a pattern.
+	// Placed after the backup checks so an overlapping destination is still
+	// reported as itself, and before the storage-identifier trims below, which
+	// do not touch these two keys.
+	if err := cfg.checkParquetReadRootsGlobSafe(); err != nil {
+		return nil, err
 	}
 
 	// Iceberg export is LOCAL-ONLY in v1. The reconciler walks the single configured storage
@@ -1796,7 +1836,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.max_files_per_batch", 30)             // 30 files per DuckDB read_parquet() call; valid range [2, 500]
 	v.SetDefault("compaction.temp_directory", "./data/compaction") // Temp directory for compaction files
 	v.SetDefault("compaction.memory_limit", "")                    // "" = auto: database.memory_limit / max_concurrent (see CompactionConfig.MemoryLimit)
-	v.SetDefault("compaction.threads", 0)                          // 0 = auto: half of EffectiveCores, min 1 (see CompactionConfig.Threads)
+	v.SetDefault("compaction.threads", 0)                          // 0 = auto; see CompactionConfig.Threads
 	// Phase 4: completion-manifest watcher tunables
 	v.SetDefault("compaction.completion_watcher_interval_ms", 1000) // 1s poll rate
 	v.SetDefault("compaction.completion_dir", "")                   // "" = derive from temp_directory
@@ -1982,6 +2022,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("tiered_storage.migration_batch_size", 100)            // 100 files per batch
 	v.SetDefault("tiered_storage.default_hot_max_age_days", 30)         // 30 days in hot tier before archiving
 	v.SetDefault("tiered_storage.migration_history_retention_days", 90) // 90 days migration history
+	v.SetDefault("tiered_storage.scan_timeout", "2h")                   // One tier scan; see TieredStorageConfig.ScanTimeout
 
 	// Cold tier defaults (S3/Azure). Objects are written in the bucket's
 	// default storage class; there is deliberately no class or access-tier key.
@@ -2364,10 +2405,9 @@ func deriveCompactionMemoryLimit(dbLimit string, maxConcurrent int) string {
 	return strconv.FormatFloat(derived, 'f', -1, 64) + m[2]
 }
 
-// getDefaultCompactionThreads is the auto value for compaction.threads: half
-// the CPUs this process may use, minimum 1. With the default max_concurrent of
-// 2, the two subprocesses together use about one process's worth of cores,
-// leaving headroom for the main process's ingest and query work.
+// getDefaultCompactionThreads is the auto value for compaction.threads. It
+// derives from the CPUs this process may use and the maximum number of
+// concurrent subprocesses, with a minimum of one thread per subprocess.
 //
 // Derived from EffectiveCores, not runtime.NumCPU: each compaction job is a
 // separate process in the SAME cgroup, so a 2-CPU pod on a 64-core host ran
@@ -2383,14 +2423,24 @@ func deriveCompactionMemoryLimit(dbLimit string, maxConcurrent int) string {
 // the failing range exactly where this issue was reported. Where a container
 // caps CPU but not memory this default now costs throughput; set the key.
 //
-// The halving hardcodes max_concurrent=2; a higher max_concurrent still
-// oversubscribes. Pre-existing, and tracked separately from #1030.
-func getDefaultCompactionThreads() int {
-	return defaultCompactionThreads(effectiveCoresFn())
+// Two concurrent jobs is the default and keeps the existing half-core
+// per-subprocess behavior. Above that default, divide available cores across
+// the concurrent subprocesses so raising max_concurrent does not multiply the
+// aggregate DuckDB thread count (#1037). This is based on effective available
+// cores, not an attempt to distinguish CPU quotas from cpusets or an operator's
+// GOMAXPROCS setting.
+func getDefaultCompactionThreads(maxConcurrent int) int {
+	return defaultCompactionThreads(effectiveCoresFn(), maxConcurrent)
 }
 
-func defaultCompactionThreads(cores int) int {
-	threads := cores / 2
+func defaultCompactionThreads(cores, maxConcurrent int) int {
+	// The floor of 2 does double duty: it keeps the pre-#1037 half-core default
+	// byte-identical at the default max_concurrent, and it absorbs the
+	// non-positive sentinel the same way compaction.NewManager does (0 means
+	// "use 2"). Load has already rejected a negative max_concurrent, so the only
+	// non-positive value that reaches here is an explicit max_concurrent = 0.
+	divisor := max(2, maxConcurrent)
+	threads := cores / divisor
 	if threads < 1 {
 		threads = 1
 	}

@@ -130,6 +130,28 @@ type backupLeg struct {
 	tally    *skipTally
 	state    []storage.ObjectInfo
 	data     []storage.ObjectInfo
+	// cold are the cold-tier objects this leg carries (#1086 stage C), kept
+	// apart from data rather than merged into it because FIVE mechanisms in
+	// the cluster path would otherwise destroy or misreport them, and none is
+	// visible to a fixture with no cold tier:
+	//
+	//  1. the manifest adapter drops cold entries, so a fully cold scope
+	//     leaves the manifest empty while the listing is not, and
+	//     crossCheckManifest REFUSES the run outright;
+	//  2. that cross-check holds back any data file the manifest lacks, which
+	//     every cold file is;
+	//  3. the end-of-run recheck DELETES the backup object for a sidecar row
+	//     the fresh snapshot lacks — copied, then removed, status green;
+	//  4. the recheck's reconciled pass would label a skipped cold file "not
+	//     missing data", because a cold file is never in the manifest;
+	//  5. a path held back as unregistered is reported "not backed up" even
+	//     when the cold tier supplied it — and that count gates replace-mode
+	//     restore past the skip ratio, so a backup could refuse its own
+	//     restore.
+	//
+	// The cold set bypasses 1-3 by construction; 4 and 5 need explicit
+	// exclusions, in skipTally and in recheckClusterManifest.
+	cold []storage.ObjectInfo
 	// files and bytes are what landed on this leg, for the per-target
 	// progress; skipped is every skip on it, and the two below split that into
 	// the populations the manifest reports apart.
@@ -322,14 +344,26 @@ func (r *backupRun) legFor(path string) *backupLeg {
 // The in-root Iceberg metadata group is NOT routed through here; it goes to
 // the default leg whole, by CLASSIFICATION rather than by routeKey. See the
 // group's own comment in CreateBackup.
-func (r *backupRun) assign(files []storage.ObjectInfo, state bool) {
+// group selects which of a leg's three object sets the files land in.
+type objGroup int
+
+const (
+	groupData objGroup = iota
+	groupState
+	groupCold
+)
+
+func (r *backupRun) assign(files []storage.ObjectInfo, group objGroup) {
 	for _, obj := range files {
 		leg := r.legFor(obj.Path)
-		if state {
+		switch group {
+		case groupState:
 			leg.state = append(leg.state, obj)
-			continue
+		case groupCold:
+			leg.cold = append(leg.cold, obj)
+		default:
+			leg.data = append(leg.data, obj)
 		}
-		leg.data = append(leg.data, obj)
 	}
 }
 
@@ -671,8 +705,49 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 
 	// Partition up front, never inside a write: each leg's files are decided
 	// here and every copy function below takes its leg's destination.
-	run.assign(stateFiles, true)
-	run.assign(dataFiles, false)
+	//
+	// The cold tier is walked BEFORE the assignment, because its dedup
+	// decision removes paths from the hot set (#1086 stage C, decision 2): a
+	// migration copies to cold before releasing the hot copy, so one path can
+	// be in both listings, and the cold copy is the one that cannot vanish
+	// mid-run.
+	//
+	// Built from parquetFiles, the PRE-cross-check listing, not from
+	// dataFiles. A migration deletes the manifest entry before the hot copy,
+	// so there are TWO windows in which a path is in both listings: one where
+	// the entry still stands (the path is in dataFiles) and one where it is
+	// already gone (the cross-check held the path back into xc.unregistered,
+	// so it is absent from dataFiles). Deduping against the reduced list would
+	// miss the second and under-report ColdDedupSkipped. Skipped entirely when
+	// there is no cold tier, so a large non-tiered backup does not build a
+	// map per file for nothing.
+	var hotPaths map[string]struct{}
+	if m.coldBackendOrNil() != nil {
+		hotPaths = make(map[string]struct{}, len(parquetFiles))
+		for _, obj := range parquetFiles {
+			hotPaths[filepath.ToSlash(obj.Path)] = struct{}{}
+		}
+	}
+	cw, err := m.walkColdTier(ctx, sc, hotPaths)
+	if err != nil {
+		progress.Status = "failed"
+		progress.Error = err.Error()
+		return nil, err
+	}
+	if len(cw.dedupPaths) > 0 {
+		kept := make([]storage.ObjectInfo, 0, len(dataFiles))
+		for _, obj := range dataFiles {
+			if _, dup := cw.dedupPaths[filepath.ToSlash(obj.Path)]; dup {
+				continue
+			}
+			kept = append(kept, obj)
+		}
+		dataFiles = kept
+	}
+
+	run.assign(stateFiles, groupState)
+	run.assign(dataFiles, groupData)
+	run.assign(cw.objects, groupCold)
 	// Every leg sidecar ALIASES the one byPath map: it is the first cluster
 	// manifest snapshot, the same immutable reference set for every leg, and
 	// copying it per leg would duplicate an entry per registered file in the
@@ -696,7 +771,24 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 		for _, obj := range leg.data {
 			addToInventory(leg.manifest, leg.dbMap, obj)
 		}
+		// Cold files are inventoried exactly like hot ones: they are data the
+		// backup carries, so TotalFiles, the per-database counts and the byte
+		// sums all include them. ColdFiles is the separate figure that says
+		// how many of them came from the cold tier (#1086 stage C).
+		for _, obj := range leg.cold {
+			addToInventory(leg.manifest, leg.dbMap, obj)
+			leg.manifest.ColdFiles++
+			leg.manifest.ColdSizeBytes += obj.Size
+		}
 	}
+	// The reconciliation counts belong to the run, not to a leg: they are
+	// about this node's cold metadata as a whole, and the gap in particular is
+	// a set of paths no leg copied. Recorded on the default leg's manifest,
+	// which is where the other run-level fields live, and summed into the
+	// merged view from there.
+	run.def.manifest.ColdObjectsUnrecorded = cw.unrecorded
+	run.def.manifest.ColdDedupSkipped = cw.dedupSkipped
+	run.def.manifest.ColdRowsStaleButHot = cw.rowsStaleButHot
 
 	// Scoped (#1084): count the Iceberg namespace metadata left out, now,
 	// with the other pre-copy decisions. It lists the data store, and a
@@ -710,6 +802,14 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 			return nil, err
 		}
 	}
+
+	// The cold-tier gap (#1085 stage B3), with the other pre-copy decisions
+	// and for the same reason: a tier-metadata read that failed after the data
+	// copy would be a query failure over a <id>/data/ nobody can list. OUTSIDE
+	// the Iceberg guard above on purpose — an unscoped backup of a tiered
+	// deployment with Iceberg off is the common case, and it has the same gap.
+	// Never fails the run; see countColdFilesExcluded.
+	m.countColdFilesExcluded(ctx, run, sc, cw)
 
 	// Progress total includes Iceberg metadata files (copied in step 2b) and
 	// compaction state (step 1b) so ProcessedFiles never exceeds TotalFiles.
@@ -786,7 +886,7 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 			m.logger.Info().Int("files", len(leg.state)).Str("target", leg.target.name).
 				Msg("Backed up compaction recovery state")
 		}
-		skipped, err := m.copyDataFiles(ctx, leg, leg.data, leg.sidecar)
+		skipped, err := m.copyDataFiles(ctx, leg, leg.data, leg.sidecar, m.dataStorage, "data storage", "")
 		if err != nil {
 			progress.Status = "failed"
 			progress.Error = err.Error()
@@ -794,6 +894,29 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 			return nil, err
 		}
 		leg.dataSkipped += skipped
+		// The cold tier, after the hot data (#1086 stage C). Its skips go into
+		// leg.dataSkipped like any other data file, NOT into a counter of
+		// their own: SkippedFiles is what the restore subtracts from
+		// TotalFiles to decide how many files it should find, so a cold skip
+		// counted separately would show up as MissingFiles — which in turn
+		// refuses every replace-mode restore. One skip counter, one meaning.
+		//
+		// A cold read failure is fatal inside copyDataFiles, so a skip here is
+		// only ever the key-length case.
+		if len(leg.cold) > 0 {
+			coldSkipped, err := m.copyDataFiles(ctx, leg, leg.cold, leg.sidecar, cw.backend, "cold tier storage", tierCold)
+			if err != nil {
+				progress.Status = "failed"
+				progress.Error = err.Error()
+				run.fail(leg)
+				return nil, err
+			}
+			leg.dataSkipped += coldSkipped
+			m.logger.Info().
+				Int("files", len(leg.cold)).
+				Str("target", leg.target.name).
+				Msg("Backed up cold-tier files")
+		}
 		leg.status = legCopied
 		run.publishTargets()
 	}
@@ -808,7 +931,7 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	// again). What is still unregistered, and what the node still does not
 	// hold, is reported. ROUTED: see recheckClusterManifest.
 	if xc != nil {
-		if err := m.recheckClusterManifest(ctx, run, xc, sc); err != nil {
+		if err := m.recheckClusterManifest(ctx, run, xc, sc, cw.carried); err != nil {
 			progress.Status = "failed"
 			progress.Error = err.Error()
 			run.fail(nil)
@@ -880,7 +1003,7 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	// restore puts it back at its original key, from the default target); it
 	// is simply not on the routed database's target.
 	if len(icebergMetaFiles) > 0 {
-		skipped, err := m.copyDataFiles(ctx, run.def, icebergMetaFiles, nil)
+		skipped, err := m.copyDataFiles(ctx, run.def, icebergMetaFiles, nil, m.dataStorage, "data storage", "")
 		if err != nil {
 			progress.Status = "failed"
 			progress.Error = err.Error()
@@ -1135,7 +1258,19 @@ func (r *backupRun) mergedManifest() *Manifest {
 // sidecar, when non-nil, receives one row per database data file copied, with
 // the SHA-256 of the bytes as they streamed through (#1083). The Iceberg
 // metadata pass passes nil: those files are never registered.
-func (m *Manager) copyDataFiles(ctx context.Context, leg *backupLeg, files []storage.ObjectInfo, sidecar *sidecarBuilder) (int64, error) {
+// src is the store the files are read FROM: the hot data backend, or the cold
+// tier for the cold set (#1086 stage C). tier is "" for hot and tierCold for
+// cold, and it lands on the sidecar row so the restore knows where to put the
+// file back.
+//
+// The tier also decides whether a source-read failure is survivable. For hot
+// it is: the file may have been deleted by compaction or retention between the
+// listing and the copy, so the file is skipped and the run continues. For cold
+// it is NOT, because nothing in Arc ever deletes a cold object — the hot-only
+// DeleteFileInTier is the only tier delete there is — so a cold read failure
+// means the cold store is unreachable, and skipping would turn that into a
+// backup that reports success while missing the data it was asked to carry.
+func (m *Manager) copyDataFiles(ctx context.Context, leg *backupLeg, files []storage.ObjectInfo, sidecar *sidecarBuilder, src storage.Backend, srcName, tier string) (int64, error) {
 	run := leg.run
 	progress := run.progress
 	var skipped int64
@@ -1162,7 +1297,7 @@ func (m *Manager) copyDataFiles(ctx context.Context, leg *backupLeg, files []sto
 		if leg.target.keyTooLong(destPath) {
 			skipped++
 			atomic.AddInt64(&leg.skipped, 1)
-			leg.tally.record(obj.Path, true)
+			leg.tally.record(obj.Path, true, tier == tierCold)
 			m.logger.Warn().
 				Str("path", obj.Path).
 				Str("target", leg.target.name).
@@ -1173,23 +1308,27 @@ func (m *Manager) copyDataFiles(ctx context.Context, leg *backupLeg, files []sto
 			continue
 		}
 
-		written, sha, err := m.streamBackupFileSHA(ctx, leg.target, obj.Path, destPath)
+		written, sha, err := m.streamBackupFileSHA(ctx, leg.target, src, srcName, obj.Path, destPath)
 		if err != nil {
 			// Only a source-read failure is skippable — the file may have been
 			// deleted by compaction/retention between listing and copy. Anything
 			// else (temp file, seek, backup write) means the environment is broken
 			// and continuing would silently drop files from the backup.
-			if !isSourceReadError(err) {
+			//
+			// And never for COLD: see the note on this function. An unreachable
+			// cold store must fail the run, not produce N skips and a green
+			// status.
+			if tier == tierCold || !isSourceReadError(err) {
 				return skipped, fmt.Errorf("failed to back up %s: %w", obj.Path, err)
 			}
 			skipped++
 			atomic.AddInt64(&leg.skipped, 1)
-			leg.tally.record(obj.Path, false)
+			leg.tally.record(obj.Path, false, tier == tierCold)
 			m.logger.Warn().Str("path", obj.Path).Err(err).Msg("Failed to read data file, skipping")
 			continue
 		}
 		if sidecar != nil && isRegistrableDataFile(obj.Path) {
-			if sidecar.add(obj.Path, sha, written, time.Now()) {
+			if sidecar.add(obj.Path, sha, written, time.Now(), tier) {
 				m.logger.Warn().
 					Str("path", obj.Path).
 					Str("sha256", sha).
@@ -1349,7 +1488,13 @@ type skipTally struct {
 
 // record notes one skipped file. A nil tally is a no-op, so a caller without
 // per-run accounting cannot panic.
-func (t *skipTally) record(path string, overlong bool) {
+// cold marks the skip as a COLD-tier file. Such a path goes into the sample —
+// an operator wants to see it — but NOT into paths, which the end-of-run
+// reconciled pass walks to decide whether a skipped file "left the manifest and
+// is therefore not missing data". A cold file is never in the manifest, so it
+// would satisfy that test automatically and be written off as reconciled when
+// it is genuinely missing from the backup (#1086 stage C).
+func (t *skipTally) record(path string, overlong bool, cold bool) {
 	if t == nil {
 		return
 	}
@@ -1358,6 +1503,9 @@ func (t *skipTally) record(path string, overlong bool) {
 	}
 	if len(t.sample) < unaddressableSampleCap {
 		t.sample = append(t.sample, path)
+	}
+	if cold {
+		return
 	}
 	t.paths = append(t.paths, path)
 }
@@ -1473,8 +1621,8 @@ func describeSkips(skipped, overlong int64, maxSourceKeyBytes int) string {
 // streamBackupFile streams a file from data storage to backup storage via a temp file,
 // avoiding loading the entire file into memory (important for large Parquet files).
 // It returns the number of bytes actually copied.
-func (m *Manager) streamBackupFile(ctx context.Context, dest backupTarget, srcPath, destPath string) (int64, error) {
-	written, _, err := m.streamBackupFileSHA(ctx, dest, srcPath, destPath)
+func (m *Manager) streamBackupFile(ctx context.Context, dest backupTarget, src storage.Backend, srcName, srcPath, destPath string) (int64, error) {
+	written, _, err := m.streamBackupFileSHA(ctx, dest, src, srcName, srcPath, destPath)
 	return written, err
 }
 
@@ -1485,7 +1633,12 @@ func (m *Manager) streamBackupFile(ctx context.Context, dest backupTarget, srcPa
 // path and no extra pass over the bytes. The sidecar carries it so a cluster
 // restore can register the file without hashing it again, and peers can
 // verify a pull of the restored file against the manifest.
-func (m *Manager) streamBackupFileSHA(ctx context.Context, dest backupTarget, srcPath, destPath string) (int64, string, error) {
+// src is the store to read FROM and srcName names it in error text: "data
+// storage" for the hot backend, "cold tier storage" for the cold one (#1086
+// stage C). The transport is backend-agnostic — ReadTo is on storage.Backend
+// and the temp file and the destination write do not care — so a local hot
+// tier with an S3 cold one, or the reverse, both work.
+func (m *Manager) streamBackupFileSHA(ctx context.Context, dest backupTarget, src storage.Backend, srcName, srcPath, destPath string) (int64, string, error) {
 	tmpFile, err := createTempFile("arc-backup-*.parquet")
 	if err != nil {
 		return 0, "", fmt.Errorf("failed to create temp file: %w", err)
@@ -1494,13 +1647,13 @@ func (m *Manager) streamBackupFileSHA(ctx context.Context, dest backupTarget, sr
 	defer os.Remove(tmpPath)
 	defer tmpFile.Close()
 
-	// Stream from data storage to temp file, hashing on the way. The hasher
+	// Stream from the source to the temp file, hashing on the way. The hasher
 	// never fails, so trackingWriter still attributes a write error to the
 	// temp file alone.
 	hasher := sha256.New()
 	tw := &trackingWriter{w: tmpFile}
-	if err := m.dataStorage.ReadTo(ctx, srcPath, io.MultiWriter(tw, hasher)); err != nil {
-		return 0, "", classifyReadToFailure(srcPath, err, tw.err, errBackupRead, "data storage")
+	if err := src.ReadTo(ctx, srcPath, io.MultiWriter(tw, hasher)); err != nil {
+		return 0, "", classifyReadToFailure(srcPath, err, tw.err, errBackupRead, srcName)
 	}
 
 	// Size the upload from the temp file rather than the listing: the listing is a
@@ -1705,7 +1858,10 @@ func (m *Manager) crossCheckManifest(ctx context.Context, parquetFiles []storage
 //     leg's manifest, dbMap, sidecar and tally.
 //
 // Its error behaviour is unchanged: a delete that fails still fails the run.
-func (m *Manager) recheckClusterManifest(ctx context.Context, run *backupRun, xc *manifestCrossCheck, sc *scope) error {
+// coldCarried is every path the run's COLD set copied, so a path the cluster
+// manifest no longer lists is not reported as "not backed up" when the cold
+// tier supplied it (#1086 stage C).
+func (m *Manager) recheckClusterManifest(ctx context.Context, run *backupRun, xc *manifestCrossCheck, sc *scope, coldCarried map[string]struct{}) error {
 	progress := run.progress
 	if err := m.cluster.Sync(ctx); err != nil {
 		return fmt.Errorf("backup failed: could not sync the cluster manifest for the end-of-run check: %w", err)
@@ -1730,6 +1886,17 @@ func (m *Manager) recheckClusterManifest(ctx context.Context, run *backupRun, xc
 		var legLeft int64
 		for _, row := range leg.sidecar.rows() {
 			if _, ok := now[row.Path]; ok {
+				continue
+			}
+			// A COLD row is never in the cluster manifest and must never be
+			// deleted on that basis (#1086 stage C). Tiering removes a
+			// migrated file's manifest entry as phase 2 of the migration, and
+			// the manifest adapter drops cold entries anyway, so EVERY cold
+			// row reaches this point as "the manifest stopped listing it" —
+			// and without this guard every cluster backup would delete its
+			// entire cold set here, after copying it, with the status still
+			// reporting success.
+			if row.Tier == tierCold {
 				continue
 			}
 			if err := ctx.Err(); err != nil {
@@ -1785,9 +1952,21 @@ func (m *Manager) recheckClusterManifest(ctx context.Context, run *backupRun, xc
 		p := filepath.ToSlash(obj.Path)
 		if e, ok := now[p]; ok {
 			addLate(obj, e)
-		} else {
-			still = append(still, obj)
+			continue
 		}
+		// Carried from the COLD tier instead (#1086 stage C). This is the
+		// mid-migration shape seen from the other side: phase 2 has deleted
+		// the manifest entry but the hot copy is not released yet, so the
+		// cross-check held the hot file back AND the path never reached
+		// hotPaths, so the cold walk copied it with no dedup. Reporting it as
+		// unregistered_skipped would be false — it IS in the backup — and
+		// that count feeds the skip-ratio refusal of a replace-mode restore,
+		// so a run carrying a few such files could make its own restore
+		// refuse.
+		if _, carried := coldCarried[p]; carried {
+			continue
+		}
+		still = append(still, obj)
 	}
 	// (a) in the manifest but not in the listing: pulled since, or still absent.
 	var absent int64
@@ -1844,7 +2023,7 @@ func (m *Manager) recheckClusterManifest(ctx context.Context, run *backupRun, xc
 			}
 			progress.TotalBytes = run.inventoriedBytes()
 			run.publishTargets()
-			skipped, err := m.copyDataFiles(ctx, leg, files, leg.sidecar)
+			skipped, err := m.copyDataFiles(ctx, leg, files, leg.sidecar, m.dataStorage, "data storage", "")
 			if err != nil {
 				return err
 			}
@@ -2244,7 +2423,7 @@ func (m *Manager) copyStateFiles(ctx context.Context, leg *backupLeg) (int64, er
 			return skipped, fmt.Errorf("backup failed: the backup destination key for compaction recovery state %s on %s is too long to store (destination_key_bytes=%d, maximum_key_bytes=%d, max_source_key_bytes=%d). A restore of a backup missing it would bring back the compacted output AND the inputs it replaced with nothing to reconcile them, so that partition would serve every row twice. Rename the file under %s/ so that its SOURCE KEY is at most max_source_key_bytes bytes",
 				obj.Path, leg.target.describe(), leg.target.destinationKeyBytes(destPath), storage.MaxUsableKeyLen, leg.target.maxSourceKeyBytes(), compactionStateDir)
 		}
-		written, err := m.streamBackupFile(ctx, leg.target, obj.Path, destPath)
+		written, err := m.streamBackupFile(ctx, leg.target, m.dataStorage, "data storage", obj.Path, destPath)
 		if err != nil {
 			if !isSourceReadError(err) {
 				return skipped, fmt.Errorf("failed to back up %s: %w", obj.Path, err)

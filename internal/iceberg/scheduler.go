@@ -224,7 +224,7 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 			s.state[key] = measurementState{fingerprint: fp}
 			return false, nil
 		}
-		hintOK, err := s.exporter.ReconcileMeasurementWithHint(ctx, m.Database, m.Measurement, ArcSchema{}, nil)
+		settled, err := s.exporter.ReconcileMeasurementWithHint(ctx, m.Database, m.Measurement, ArcSchema{}, nil)
 		if err != nil {
 			return false, err
 		}
@@ -233,7 +233,7 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 		// Cache the empty state (nil schema/localFiles) so a permanently-empty
 		// measurement is emptied once, but only once the discovery files are
 		// published — see the equivalent guard on the main path below.
-		if !hintOK {
+		if !settled {
 			delete(s.state, key)
 			return true, nil
 		}
@@ -289,21 +289,26 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 		}
 	}
 
-	hintOK, err := s.exporter.ReconcileMeasurementWithHint(ctx, m.Database, m.Measurement, sc, files)
+	settled, err := s.exporter.ReconcileMeasurementWithHint(ctx, m.Database, m.Measurement, sc, files)
 	if err != nil {
 		return false, err
 	}
 
-	// Cache only when the reader discovery files are current. The snapshot is
-	// committed either way, but caching an unpublished hint would gate this
-	// measurement out of every later pass — and if its file set then goes quiet
-	// (the steady state) the hint would stay stale indefinitely. Leaving the
-	// entry uncached costs one repeated reconcile per tick until it succeeds.
-	if !hintOK {
+	// Cache only when the pass fully settled. The snapshot is committed either way, but
+	// caching an unsettled pass would gate this measurement out of every later one — and if
+	// its file set then goes quiet (the steady state) it would stay unsettled indefinitely.
+	// Leaving the entry uncached costs one repeated reconcile per tick until it succeeds.
+	//
+	// Two things can leave a pass unsettled, and the exporter has already logged which:
+	// unpublished reader discovery files, or a snapshot expiry that failed on a pass whose
+	// removals made the older snapshots unreadable (#1092). Both need the same retry, so this
+	// does not name either — a message claiming the hint when the expiry failed would send an
+	// operator to the wrong place.
+	if !settled {
 		delete(s.state, key)
 		s.logger.Warn().
 			Str("database", m.Database).Str("measurement", m.Measurement).
-			Msg("Iceberg reconcile: reader discovery files not published; will retry next pass")
+			Msg("Iceberg reconcile: pass did not fully settle (see the preceding error for which step); will retry next pass")
 		return true, nil
 	}
 

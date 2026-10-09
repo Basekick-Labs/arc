@@ -158,6 +158,34 @@ type BatchDeleter interface {
 	DeleteBatch(ctx context.Context, paths []string) error
 }
 
+// ErrAdoptUnsupported reports that AdoptFile cannot move the named local file
+// into the backend: the rename is impossible for this pair of paths (most
+// often because they are on different filesystems), or the source filesystem
+// will not let Arc normalize the file mode. The caller must fall back to
+// WriteReader. The underlying cause is wrapped for logging.
+//
+// Nothing has been MOVED: the source file is still at localPath with its
+// contents intact, which is what makes a fallback copy safe. Its permission
+// bits may have been set to 0600 before the attempt failed, so a caller that
+// cares about the source mode must not assume it is unchanged.
+var ErrAdoptUnsupported = errors.New("storage: local file cannot be adopted in place")
+
+// FileAdopter is implemented by a backend whose objects ARE plain local files,
+// so a file the caller has already written on the same filesystem can be moved
+// into place instead of copied through WriteReader.
+//
+// On success the source file at localPath is CONSUMED: it no longer exists and
+// the caller must not read it afterwards. That is the point of the interface
+// and the reason it is opt-in rather than part of Backend. A backend that
+// copies bytes must not implement it, and a caller that still needs the file
+// must not use it.
+//
+// ErrAdoptUnsupported means "this pair of paths cannot be adopted, copy
+// instead" and is not a failure. Any other error is a real one.
+type FileAdopter interface {
+	AdoptFile(ctx context.Context, path, localPath string) error
+}
+
 // ObjectInfo provides metadata about a storage object.
 type ObjectInfo struct {
 	Path         string

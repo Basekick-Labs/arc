@@ -50,6 +50,9 @@ type costRig struct {
 	root    string
 	dataDir string
 	metaDir string
+	// db is the catalog handle. Exposed so a test can close it to make a commit fail
+	// deterministically (see TestExpireSnapshots_ReportsFailureSoThePassIsNotCached).
+	db *sql.DB
 }
 
 func newCostRig(t *testing.T, retain int) *costRig {
@@ -77,7 +80,7 @@ func newCostRig(t *testing.T, retain int) *costRig {
 	// in docs/progress/2026-10-07-issue-1106-iceberg-manifest-collapse.md cannot be reproduced.
 	// Tests that measure the collapse itself turn it back on.
 	exp.collapseThreshold = 0
-	return &costRig{exp: exp, root: root, dataDir: dataDir}
+	return &costRig{exp: exp, root: root, dataDir: dataDir, db: db}
 }
 
 // write creates n Arc-style parquet files and returns their paths.

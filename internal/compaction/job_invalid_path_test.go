@@ -3,12 +3,45 @@ package compaction
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
+
+func TestDownloadSingleFileUsesLocalStoragePath(t *testing.T) {
+	baseDir := t.TempDir()
+	backend, err := storage.NewLocalBackend(baseDir, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("NewLocalBackend: %v", err)
+	}
+	defer backend.Close()
+	const key = "db/cpu/file.parquet"
+	if err := backend.Write(context.Background(), key, []byte("parquet")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	tempDir := t.TempDir()
+
+	job := newDownloadJob(t, backend, []string{key})
+	result := job.downloadSingleFile(context.Background(), tempDir, 0, key)
+	if result.err != nil {
+		t.Fatalf("downloadSingleFile: %v", result.err)
+	}
+	if result.file == nil {
+		t.Fatal("downloadSingleFile returned no file")
+	}
+	wantPath := filepath.Join(baseDir, filepath.FromSlash(key))
+	if result.file.localPath != wantPath {
+		t.Fatalf("localPath = %q, want %q", result.file.localPath, wantPath)
+	}
+	if _, err := os.Stat(filepath.Join(tempDir, fmt.Sprintf("0_%s", filepath.Base(key)))); !os.IsNotExist(err) {
+		t.Fatalf("local input was copied into temp dir, stat err = %v", err)
+	}
+}
 
 // newDownloadJob builds the smallest Job that downloadFiles needs. It is driven
 // directly rather than through Job.Run because running a compaction requires
