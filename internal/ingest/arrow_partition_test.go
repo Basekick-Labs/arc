@@ -16,11 +16,11 @@ func TestGetSortKeys(t *testing.T) {
 		wantKeys        []string
 	}{
 		{
-			name:            "empty config defaults to time",
+			name:            "empty config defaults to descending time",
 			measurement:     "cpu",
 			sortKeysConfig:  map[string][]string{},
-			defaultSortKeys: []string{"time"},
-			wantKeys:        []string{"time"},
+			defaultSortKeys: []string{"time:desc"},
+			wantKeys:        []string{"time:desc"},
 		},
 		{
 			name:            "single key without time appends time",
@@ -70,6 +70,20 @@ func TestGetSortKeys(t *testing.T) {
 			sortKeysConfig:  map[string][]string{},
 			defaultSortKeys: []string{"tag_device"},
 			wantKeys:        []string{"tag_device", "time"},
+		},
+		{
+			name:            "measurement keys inherit descending time default",
+			measurement:     "custom",
+			sortKeysConfig:  map[string][]string{"custom": {"tag_device"}},
+			defaultSortKeys: []string{"time:desc"},
+			wantKeys:        []string{"tag_device", "time:desc"},
+		},
+		{
+			name:            "measurement explicit ascending time is preserved",
+			measurement:     "custom",
+			sortKeysConfig:  map[string][]string{"custom": {"tag_device", "time:asc"}},
+			defaultSortKeys: []string{"time:desc"},
+			wantKeys:        []string{"tag_device", "time:asc"},
 		},
 	}
 
@@ -533,6 +547,33 @@ func TestSortColumnsByKeys(t *testing.T) {
 			},
 			sortKeys:  []string{"time"},
 			wantOrder: []int{1, 2, 0}, // 1000, 2000, 3000
+		},
+		{
+			name: "sort by time descending (single key)",
+			columns: map[string]interface{}{
+				"tag_sensor_id": []string{"A", "B", "C"},
+				"time":          []int64{3000, 1000, 2000},
+			},
+			sortKeys:  []string{"time:desc"},
+			wantOrder: []int{0, 2, 1}, // 3000, 2000, 1000
+		},
+		{
+			name: "sort by time explicitly ascending",
+			columns: map[string]interface{}{
+				"time": []int64{3000, 1000, 2000},
+			},
+			sortKeys:  []string{"time:asc"},
+			wantOrder: []int{1, 2, 0}, // 1000, 2000, 3000
+		},
+		{
+			name: "tag ascending then time descending",
+			columns: map[string]interface{}{
+				"host":  []string{"b", "a", "a", "b"},
+				"time":  []int64{1000, 1000, 2000, 3000},
+				"value": []float64{1, 2, 3, 4},
+			},
+			sortKeys:  []string{"host", "time:desc"},
+			wantOrder: []int{2, 1, 3, 0}, // a/2000, a/1000, b/3000, b/1000
 		},
 		{
 			name: "sort by int64 column then time",

@@ -16,6 +16,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/sortkey"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
@@ -80,7 +81,8 @@ func validateParquetFile(path string) error {
 }
 
 // buildOrderByClause builds an ORDER BY clause from sort keys.
-// Returns an empty string if no sort keys, or "ORDER BY col1, col2, ..." if sort keys exist.
+// Returns an empty string if no sort keys, or an ORDER BY clause honoring
+// optional :asc/:desc suffixes on configured keys.
 // Column names are quoted to handle special characters.
 func buildOrderByClause(sortKeys []string) string {
 	if len(sortKeys) == 0 {
@@ -88,11 +90,16 @@ func buildOrderByClause(sortKeys []string) string {
 	}
 
 	var quotedKeys []string
-	for _, key := range sortKeys {
+	for _, rawKey := range sortKeys {
+		key := sortkey.Parse(rawKey)
 		// Double-quote escaping: DuckDB treats "" inside a quoted identifier as a literal "
 		// (same as PostgreSQL). This prevents identifier breakout even if validation is bypassed.
-		escaped := strings.ReplaceAll(key, `"`, `""`)
-		quotedKeys = append(quotedKeys, fmt.Sprintf(`"%s"`, escaped))
+		escaped := strings.ReplaceAll(key.Column, `"`, `""`)
+		quoted := fmt.Sprintf(`"%s"`, escaped)
+		if key.Desc {
+			quoted += " DESC"
+		}
+		quotedKeys = append(quotedKeys, quoted)
 	}
 
 	return fmt.Sprintf("ORDER BY %s", strings.Join(quotedKeys, ", "))

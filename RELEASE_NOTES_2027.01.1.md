@@ -67,6 +67,15 @@ costs one comparison at startup and removes a class of silent data loss.
 
 ## New features
 
+### Recent time-series rows sort first by default ([#155](https://github.com/Basekick-Labs/arc/issues/155))
+
+Ingest and compaction now sort each Parquet file by `time DESC` by default.
+This makes the common newest-first query pattern align with file row order.
+Set `ingest.default_sort_keys = "time"` to keep the previous ascending order;
+per-measurement sort keys that explicitly include `time` keep their configured
+direction. Existing files retain their current layout until compaction rewrites
+them.
+
 ### Compaction cycles can be looked up by id ([#1162](https://github.com/Basekick-Labs/arc/issues/1162))
 
 `POST /api/v1/compaction/trigger` answers with a `cycle_id`. Until now that id
