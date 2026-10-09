@@ -87,10 +87,18 @@ type Backend interface {
 	// ReadToAt reads data from path starting at the given byte offset and writes
 	// to writer. offset=0 starts at the beginning (equivalent to ReadTo).
 	// Returns an error if offset is negative or >= file size.
+	//
+	// Unlike StatFile below, a backend that stages writes MAY serve a staged
+	// partial when no committed file exists — LocalBackend does, and the
+	// resume path depends on it. So the two are deliberately asymmetric: do
+	// not pair a committed-only StatFile size with a ReadToAt read and assume
+	// both saw the same bytes. Callers needing committed-only bytes confirm
+	// with Exists; callers wanting the partial go through StagingInspector.
 	ReadToAt(ctx context.Context, path string, writer io.Writer, offset int64) error
 
-	// StatFile returns the byte size of the file at path.
-	// Returns -1 (and nil error) if the file does not exist.
+	// StatFile returns the byte size of the committed file at path.
+	// Returns -1 (and nil error) if the committed file does not exist. Staged
+	// partials are exposed separately through StagingInspector.
 	// Returns a non-nil error only for unexpected backend failures.
 	StatFile(ctx context.Context, path string) (int64, error)
 

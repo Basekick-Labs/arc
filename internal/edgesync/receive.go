@@ -220,14 +220,9 @@ func (r *Receiver) Receive(ctx context.Context, spokeID, sourcePath, declaredSHA
 	// duplicate costs no transfer, and a conflict must not consume bytes it
 	// will discard.
 	//
-	// Exists, not StatFile. LocalBackend.StatFile deliberately falls back to
-	// the "{path}.part" staging file when the final file is absent, which is
-	// right for the peer-fetch puller (it wants to know how much of a partial
-	// it already holds) and wrong here: a stale .part left by an interrupted
-	// promote would be read as "the file exists", and the resolveExisting
-	// branch would then fail forever because ReadTo is NOT .part-aware. That
-	// wedges the path permanently — no retry could ever clear it. Exists()
-	// checks only the real file.
+	// Check for a committed file before comparing its digest. A stale staged
+	// partial left by an interrupted promote must not enter the existing-file
+	// branch, where ReadTo cannot read it.
 	// Receipt pre-check BEFORE the storage existence branch (#619): a file
 	// the hub's own compaction consumed no longer exists at finalPath, but
 	// its content was delivered and lives inside a compacted output. Without
@@ -571,11 +566,18 @@ func (g *shortBodyGuard) Read(p []byte) (int, error) {
 // hash it, and return a conflict against content the hub itself produced —
 // wedging that path the same way a stale ".part" once did.
 func (r *Receiver) promote(ctx context.Context, stagingPath, finalPath string, size int64) error {
-	// Clear any stale staging file at the DESTINATION before writing. A
-	// previous promote that died between WriteReader's staging write and its
-	// rename leaves "{finalPath}.part" behind; left in place it makes
-	// StatFile report the final file as present (see the note in Receive) and
-	// would defeat the Exists() guard for any code that still uses StatFile.
+	// Not load-bearing, and the honest reason is not the obvious one.
+	//
+	// It is NOT needed to stop stale staging bytes reaching the new transfer:
+	// LocalBackend.WriteReader opens the staging file O_TRUNC, so whatever was
+	// there is discarded. And it is no longer needed to stop StatFile
+	// reporting a partial as the final file either, which is what it was for
+	// before #1178 made StatFile committed-only. Removing it leaves the
+	// edgesync suite green, TestReceiver_StalePartDoesNotWedgeThePath
+	// included — that test now passes through the contract instead.
+	//
+	// Kept so an interrupted promote's partial is reclaimed here rather than
+	// sitting on disk until something else sweeps staging.
 	if si := r.staging(); si != nil {
 		if err := si.DeleteStaged(ctx, finalPath); err != nil {
 			r.logger.Debug().Err(err).Str("path", finalPath).Msg("No stale promote staging file to clear")

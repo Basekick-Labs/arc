@@ -315,9 +315,7 @@ func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([
 // size tells that content apart from what the Iceberg manifest describes.
 // present=false means the file is gone. Local files are stat'ed directly; any
 // other backend answers through StatFile (Iceberg export is local-only, so
-// that branch only serves wrapped backends in tests — note LocalBackend.StatFile
-// reports a ".part" staging file's size when the final file is absent, which
-// os.Stat on the final path does not).
+// that branch only serves wrapped backends in tests).
 func (s *StorageWalkSource) statSize(ctx context.Context, key, localPath string) (size int64, present bool, err error) {
 	if localPath != "" {
 		st, err := os.Stat(localPath)

@@ -81,7 +81,7 @@ func (f *fakeBackend) WriteReader(ctx context.Context, path string, reader io.Re
 	}
 	// Atomic: read all bytes into a staging key. On success, promote to final key.
 	// On error, leave bytes in the ".part" staging key (same as real LocalBackend)
-	// so resume tests can discover them via StatFile/ReadTo.
+	// so resume tests can discover them via StagingInspector/ReadTo.
 	stagingKey := path + ".part"
 	var buf []byte
 	tmp := make([]byte, 4096)
@@ -171,10 +171,6 @@ func (f *fakeBackend) StatFile(ctx context.Context, path string) (int64, error) 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if data, ok := f.files[path]; ok {
-		return int64(len(data)), nil
-	}
-	// Check staging file (mirrors LocalBackend behaviour).
-	if data, ok := f.files[path+".part"]; ok {
 		return int64(len(data)), nil
 	}
 	return -1, nil
@@ -2140,14 +2136,13 @@ func TestPuller_CatchUpStatus_KeySemantics(t *testing.T) {
 // TestTryResumeFromPartialRefusesCommittedFile pins the guard that makes
 // keeping the committed file on a rejected fetch (#999) safe.
 //
-// A resume hashes a prefix and appends a tail. The prefix used to be read with
-// ReadToAt and sized with StatFile, both of which PREFER the committed object
-// and fall back to the staging file; the tail is appended to the staging file.
-// So once a rejected fetch stops deleting the committed object, a shorter
-// previous generation on disk would be hashed as the "prefix" of the file being
-// fetched while the tail landed in a different file. Whenever the old
-// generation happened to be a byte prefix of the new one the combined digest
-// VERIFIED, and a tail-only file was renamed into place.
+// A resume hashes a prefix and appends a tail. ReadToAt prefers the committed
+// object and falls back to the staging file, while the tail is appended to the
+// staging file. So once a rejected fetch stops deleting the committed object,
+// a shorter previous generation on disk could be hashed as the "prefix" of the
+// file being fetched while the tail landed in a different file. Whenever the
+// old generation happened to be a byte prefix of the new one the combined
+// digest VERIFIED, and a tail-only file was renamed into place.
 //
 // A resume must therefore come from the staged partial alone, and must be
 // refused outright when a committed object exists.

@@ -757,6 +757,39 @@ reachable on deployments that have been running happily without it.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1183](https://github.com/Basekick-Labs/arc/pull/1183).
 
+### Local `StatFile` ignores staged partial writes ([#1178](https://github.com/Basekick-Labs/arc/issues/1178))
+
+`LocalBackend.StatFile` now reports only committed files. In-progress writes
+remain available through `StagingInspector`, so resumable transfers can inspect
+partial data without callers mistaking it for a complete object.
+
+`StatFile` is documented as returning `-1` for an object that does not exist,
+and S3 and Azure always did. The local backend returned the length of the
+`.part` staging file an interrupted transfer leaves behind, so a half-arrived
+file read as a complete one — on the backend single-node installs and tests
+actually use.
+
+It reads as an internal contract fix, but four things a local-storage operator
+can see change with it, all in the safe direction:
+
+- a replicated file still only partly arrived no longer gets a tier row
+  claiming the node holds it;
+- a tier row for a file that is only a partial is now retired by the next
+  scan instead of being kept indefinitely;
+- `DROP DATABASE` no longer reports a spurious "hot object remains after
+  database listing" on its first attempt when a partial is still on disk;
+- a backup counts such a path as absent — and says so in its incomplete
+  sample — instead of recording a partial's size and then failing to copy it.
+
+One asymmetry to know about, because it is the thing most easily got wrong
+from the sentence above: **`ReadToAt` still serves staged data** when no
+committed file exists. The resume path depends on that. So a caller must not
+pair a committed-only `StatFile` size with a `ReadToAt` read and assume both
+saw the same bytes; the interface comments now say so, and making `ReadToAt`
+honest too is tracked separately.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1190](https://github.com/Basekick-Labs/arc/pull/1190).
+
 ### Reported core counts account for the CPU quota ([#1039](https://github.com/Basekick-Labs/arc/issues/1039))
 
 `runtime.NumCPU()` reflects a cpuset but not a CFS quota, and Kubernetes

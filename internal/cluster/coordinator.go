@@ -1184,10 +1184,24 @@ func (c *Coordinator) unlinkOne(item deleteRequest, has func(string) bool) {
 		// every node in the cluster report every manifest delete, including
 		// the ones that never held the file.
 		//
-		// A local backend counts a staging .part as present, which is fine
-		// here: this path only ever flips a row to cold or retires a hot one,
-		// never claims a readable local file.
-		if n, statErr := c.storage.StatFile(delCtx, item.path); statErr == nil && n >= 0 {
+		n, statErr := c.storage.StatFile(delCtx, item.path)
+		// Staged bytes count HERE, and only here. Asking StagedSize when the
+		// committed file is gone keeps this path's accounting byte-identical
+		// to the behaviour it had while StatFile itself reported partials
+		// (#1178 removed that), without putting a partial in front of every
+		// other StatFile caller.
+		//
+		// It is safe to report a partial's length because of what this path
+		// does with it: flip a tier row to cold or retire a hot one. It never
+		// claims a readable local file, so a short size costs a row's
+		// size_bytes accuracy and nothing else. A caller that did claim
+		// readability would need Exists, which is the trap #1178 closed.
+		if statErr == nil && n < 0 {
+			if si, ok := c.storage.(storage.StagingInspector); ok {
+				n, statErr = si.StagedSize(delCtx, item.path)
+			}
+		}
+		if statErr == nil && n >= 0 {
 			sizeBytes = n
 			wasLocal = true
 		}
