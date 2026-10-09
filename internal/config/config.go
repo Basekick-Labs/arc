@@ -17,10 +17,6 @@ import (
 	"github.com/spf13/viper"
 )
 
-// yearShapedSegment matches a path segment that an Arc storage key would read
-// as a partition year. See Config.Warnings and #1108.
-var yearShapedSegment = regexp.MustCompile(`^20\d\d$`)
-
 // LoadWarning is a load-time advisory: a value Arc accepts and keeps, but
 // whose effect an operator is unlikely to have intended. Collected rather than
 // logged because config.Load has no logger and must stay testable without one;
@@ -2079,9 +2075,16 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("backup.operation_timeout", "2h")
 }
 
-// checkObjectPrefix validates one configured object-store key prefix and
-// collects the advisories that apply to it. key is the operator-facing
-// configuration key, so a rejection names the key the operator must change.
+// checkObjectPrefix validates one configured object-store key prefix. key is
+// the operator-facing configuration key, so a rejection names the key the
+// operator must change.
+//
+// It also used to warn about a prefix whose last segment was year-shaped,
+// because the query path then read the two segments BEFORE that year as the
+// database and measurement. That advisory is gone with the cause: the query
+// path removes the configured prefix before it looks for a partition year
+// (#1108), so such a prefix resolves correctly and there is nothing left to
+// advise. A year-shaped tail is now simply a valid prefix.
 //
 // Validated HERE, at load, rather than only inside the backend constructors,
 // for one reason that is not symmetry: a backend-construction failure at the
@@ -2099,39 +2102,6 @@ func setDefaults(v *viper.Viper) {
 func (c *Config) checkObjectPrefix(key, value string) error {
 	if _, err := storage.ValidateObjectPrefix(value); err != nil {
 		return fmt.Errorf("invalid %s: %w", key, err)
-	}
-
-	// A prefix whose LAST segment is year-shaped is accepted, and must stay
-	// accepted: rejecting it would refuse a configuration existing prefixed-S3
-	// deployments may already run. But the query path reads a database and
-	// measurement off the end of a storage path by scanning backwards for a
-	// partition year, so such a prefix can make it resolve the two segments
-	// BEFORE that year. A tiered query then globs a location nothing was
-	// written to and returns zero rows with no error (#1108).
-	//
-	// THREE segments or more, not merely a year-shaped tail, and the bound is
-	// exact rather than cautious. The scan is
-	// `for i := len(parts) - 1; i >= 2; i--` (QueryHandler
-	// .extractDBMeasurementFromPath), and the year sits at index
-	// len(prefixSegments)-1, so it is only visited once the prefix has three
-	// segments — and only then do two prefix segments exist in front of it to
-	// be returned. At one segment ("2026") the year is at index 0 and at two
-	// ("arc/2026") at index 1; both fall through to the correct
-	// last-two-segments rule. Warning about those would train operators to
-	// ignore this, which is worse than not warning at all. The three cases are
-	// pinned empirically in
-	// TestExtractDBMeasurementFromPathMisparsesAYearShapedPrefixTail.
-	trimmed := strings.Trim(value, "/")
-	if trimmed == "" {
-		return nil
-	}
-	segments := strings.Split(trimmed, "/")
-	if len(segments) >= 3 && yearShapedSegment.MatchString(segments[len(segments)-1]) {
-		c.Warnings = append(c.Warnings, LoadWarning{
-			Key:     key,
-			Value:   value,
-			Message: "the last segment of this storage prefix looks like a partition year, which the query path scans for when it reads a database and measurement off a storage path. Tiered queries against such a prefix can return zero rows with no error (#1108). Consider a prefix whose last segment is not four digits beginning 20",
-		})
 	}
 	return nil
 }
