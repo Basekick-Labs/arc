@@ -62,12 +62,21 @@ func testRecoveryFailureAcrossRestarts(t *testing.T, rows []map[string]interface
 	}
 }
 
+// Every case here makes the sidecar UNREADABLE — os.ReadFile rejects a
+// directory before the write path is reached, so "unreadable_is_a_directory"
+// is not write-path coverage despite how it reads. The sidecar WRITE failure
+// has its own cases via the writeReplayAttemptsFn seam.
+//
+// These also pin that a malformed sidecar stalls the pass with no strike, the
+// same shape the out-of-range row checkpoint used to have. It stays, and
+// deliberately: the Error names the file and `rm` of the sidecar clears it,
+// where a bad checkpoint lives inside WAL bytes an operator cannot edit.
 func TestRecoveryAttemptMetadataFailureKeepsWAL(t *testing.T) {
-	for _, kind := range []string{"invalid_json", "unknown_version", "directory"} {
+	for _, kind := range []string{"invalid_json", "unknown_version", "unreadable_is_a_directory"} {
 		t.Run(kind, func(t *testing.T) {
 			dir, files := writeRecoveryFiles(t, 1)
 			path := files[0] + ".recovery"
-			if kind == "directory" {
+			if kind == "unreadable_is_a_directory" {
 				require.NoError(t, os.Mkdir(path, 0700))
 			} else {
 				data := []byte("{")

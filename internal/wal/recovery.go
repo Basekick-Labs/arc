@@ -38,7 +38,19 @@ type RecoveryStats struct {
 	KeptFiles        int
 	BarrierFailures  int
 	QuarantinedFiles int
-	RecoveryDuration time.Duration
+	// PartialRowEntries counts the WAL files this pass left on disk for which at
+	// least one row RANGE of a parent entry was handed off. Their checkpoints
+	// land on the next flush, and a binary without row-range support treats
+	// those identities as inert and replays the parent entry in full — so this
+	// is the state the restart compatibility guidance is about, made checkable.
+	//
+	// It describes what THIS pass observed, so it is a floor on the directory's
+	// residue rather than a census: a file whose replay failed before any range
+	// was handed off contributes nothing, and so does the out-of-range
+	// checkpoint case, which breaks before the ranges are computed even though
+	// a bad coverage map is itself evidence that ranges exist.
+	PartialRowEntries int
+	RecoveryDuration  time.Duration
 }
 
 // RecoveryOptions configures WAL recovery behavior
@@ -72,7 +84,7 @@ type RecoveryOptions struct {
 	// callers use Writer.MarkFlushed to release the original pending sequence.
 	// A failure retains the files for retry. Nil is suitable for synchronous
 	// callbacks with no live writer pending identities to release.
-	CheckpointRecovered func([]string) error
+	CheckpointRecovered func(context.Context, []string) error
 
 	// MinFileAge, when > 0, skips WAL files modified more recently than this.
 	// Defense against the #594 class beyond the SkipActiveFile name match:
@@ -144,6 +156,32 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 	startTime := time.Now()
 	stats := &RecoveryStats{}
 
+	// Files whose replay produced at least one SPLIT tracked entry: row-range
+	// checkpoints now exist for part of a parent entry. Recorded where `split`
+	// is computed, which is BEFORE the span loop that can fail — a counter
+	// bumped after that loop misses the failure case, and the failure case is
+	// precisely the dangerous one (ranges durable, parent entry retained).
+	var splitTrackedFiles []string
+	defer func() {
+		// Count only the ones STILL on disk: a file that replayed, flushed and
+		// was deleted carries no residue. One stat per split file, which on a
+		// steady-state node is none. Deferred so the early returns below —
+		// a read failure, a cancelled context, a failed barrier — report too.
+		for _, path := range splitTrackedFiles {
+			if _, err := os.Stat(path); err == nil {
+				stats.PartialRowEntries++
+			}
+		}
+		if stats.PartialRowEntries == 0 {
+			return
+		}
+		r.logger.Warn().
+			Int("files", stats.PartialRowEntries).
+			Int("kept", stats.KeptFiles).
+			Int("barrier_failures", stats.BarrierFailures).
+			Msg("WAL files retained with partially checkpointed row ranges; a binary without row-range support would replay those entries in full. Drain recovery with this version before downgrading")
+	}()
+
 	if opts == nil {
 		opts = &RecoveryOptions{}
 	}
@@ -165,6 +203,10 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		r.logger.Info().Msg("No WAL directory found, skipping recovery")
 		return stats, nil
 	}
+
+	// Before the file list is taken, and therefore before the no-files return
+	// below: residue accumulates whether or not there is anything to replay.
+	r.sweepRecoveryArtifacts()
 
 	// Find all pending WAL files
 	walFiles, err := r.findWALFiles()
@@ -227,12 +269,16 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 			if len(parents) > 0 {
 				err := ctx.Err()
 				if err == nil {
-					err = opts.CheckpointRecovered(parents)
+					err = opts.CheckpointRecovered(ctx, parents)
 				}
 				if err != nil {
 					stats.BarrierFailures++
 					stats.KeptFiles += len(pendingDelete)
 					recoveryErr = fmt.Errorf("checkpoint recovered WAL row parents: %w", err)
+					r.logger.Error().Err(err).
+						Int("files", len(pendingDelete)).
+						Int("parents", len(parents)).
+						Msg("Failed to checkpoint recovered WAL row parents; keeping replayed files")
 					pendingDelete = nil
 					pendingRows = 0
 					return false
@@ -368,6 +414,7 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		fileRecoveredBatches := 0
 		fileRecoveredEntries := 0
 		var fileRecoveredParents []string
+		hadSplitTracked := false
 
 		for _, entry := range entries {
 			if len(entry.CheckpointHashes) > 0 {
@@ -407,8 +454,32 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 				if opts.TrackedRowCallback != nil {
 					missing, err := uncoveredRecoveryRows(len(entry.Records), rowCoverage[entry.PayloadHash])
 					if err != nil {
-						stats.KeptFiles += len(pendingDelete) + len(walFiles) - fileIndex
-						return stats, err
+						// A coverage map describing rows this entry does not
+						// have is a poison entry, not a reason to abandon the
+						// pass. Returning here recorded NO strike, so
+						// MaxReplayFailures never advanced, the file was never
+						// quarantined, and every later file was left unread —
+						// permanently, with no operator exit. Take the strike
+						// path instead: the file is kept, quarantined on the
+						// third pass, and its bytes and checkpoints are
+						// preserved either way.
+						//
+						// break, not the columnar branch's continue: a bad
+						// coverage map makes the rest of this file's row
+						// accounting untrustworthy, not just this entry's.
+						//
+						// A malformed attempt SIDECAR still aborts the pass
+						// (readReplayAttempts), and deliberately: the Error
+						// names the file and `rm` of the sidecar clears it.
+						// An out-of-range checkpoint lives inside WAL bytes the
+						// operator cannot edit, which is why this one needed an
+						// in-band exit.
+						r.logger.Error().Err(err).
+							Str("file", filepath.Base(walFile)).
+							Int("entry_rows", len(entry.Records)).
+							Msg("WAL row checkpoint describes rows beyond its entry; keeping the file for the replay-failure count")
+						allEntriesSucceeded = false
+						break
 					}
 					if opts.ValidateTrackedRows != nil && len(missing) > 0 {
 						if err := opts.ValidateTrackedRows(entry.Records); err != nil {
@@ -443,6 +514,19 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 							}
 							fileRecoveredBatches++
 							fileRecoveredEntries += end - start
+							if tracked && split && !hadSplitTracked {
+								// After the first SUCCESSFUL handoff, and
+								// before the loop's later breaks. Set before
+								// the loop instead and a FIRST batch that fails
+								// reports a hazard that does not exist: nothing
+								// was handed off, so the parent is wholly
+								// uncheckpointed and an older binary replays it
+								// correctly. Set after the loop instead and the
+								// dangerous case is missed: ranges durable,
+								// a later batch failed, file retained.
+								hadSplitTracked = true
+								splitTrackedFiles = append(splitTrackedFiles, walFile)
+							}
 							start = end
 						}
 						if !allEntriesSucceeded {

@@ -75,7 +75,7 @@ func testTrackedRowRecoveryParquetRestart(t *testing.T, count, firstLimit, retry
 			return b.FlushAllAndWait(ctx)
 		},
 		BeforeDelete:        b.NewRecoveryFlushBarrier(),
-		CheckpointRecovered: w.MarkFlushed,
+		CheckpointRecovered: w.MarkFlushedContext,
 	})
 	require.NoError(t, err)
 	require.Positive(t, stats.KeptFiles)
@@ -101,7 +101,7 @@ func testTrackedRowRecoveryParquetRestart(t *testing.T, count, firstLimit, retry
 			return callback(ctx, batch, id)
 		},
 		BeforeDelete:        b.NewRecoveryFlushBarrier(),
-		CheckpointRecovered: w.MarkFlushed,
+		CheckpointRecovered: w.MarkFlushedContext,
 	})
 	require.NoError(t, err)
 	require.Zero(t, stats.KeptFiles)

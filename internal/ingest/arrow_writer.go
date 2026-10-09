@@ -1100,6 +1100,15 @@ type ArrowBuffer struct {
 	hasFlushFailure        atomic.Bool
 	flushFailureGeneration atomic.Uint64
 
+	// walRecoveryPending arms the same recovery as hasFlushFailure, for a
+	// reason that is NOT a flush failure: a recovery pass that kept a file or
+	// failed a barrier. It is a separate flag because hasFlushFailure's other
+	// reader is the shutdown WAL purge, which reports it as "investigate the
+	// buffer flush errors logged above" — an Error naming logs that do not
+	// exist when nothing flushed badly. Retention is right either way; the
+	// attribution was not.
+	walRecoveryPending atomic.Bool
+
 	logger zerolog.Logger
 }
 
@@ -1174,11 +1183,13 @@ func (b *ArrowBuffer) getShard(bufferKey string) *bufferShard {
 	return b.shards[hash%b.shardCount]
 }
 
-// HasFlushFailure returns true if any flush has failed since the last reset.
-// Used by the periodic WAL maintenance goroutine to decide whether WAL replay
-// is needed (e.g., after an S3 outage where data was cleared from buffers).
+// HasFlushFailure reports whether a WAL recovery pass is warranted: a flush has
+// failed since the last reset (e.g. an S3 outage that cleared buffers), or an
+// earlier recovery pass left work behind. Used by the periodic WAL maintenance
+// goroutine. The disjunction is why splitting the two reasons apart did not
+// change when recovery runs.
 func (b *ArrowBuffer) HasFlushFailure() bool {
-	return b.hasFlushFailure.Load()
+	return b.hasFlushFailure.Load() || b.walRecoveryPending.Load()
 }
 
 // FlushFailureGeneration returns the generation used to make recovery-latch
@@ -1194,9 +1205,18 @@ func (b *ArrowBuffer) ResetFlushFailure(expectedGeneration uint64) bool {
 	if b.flushFailureGeneration.Load() != expectedGeneration {
 		return false
 	}
+	recoveryPending := b.walRecoveryPending.Load()
 	b.hasFlushFailure.Store(false)
+	b.walRecoveryPending.Store(false)
 	if b.flushFailureGeneration.Load() != expectedGeneration {
+		// Restoring true for the flush flag is correct, not a guess. The only
+		// writer that can bump the generation inside this window is
+		// markFlushFailure, from a live flush worker; MarkWALRecoveryPending's
+		// single caller runs before the maintenance goroutine exists and cannot
+		// race it. Snapshot-restore is for the recovery flag only — asserting a
+		// flush failure that did not happen is the very bug this split fixes.
 		b.hasFlushFailure.Store(true)
+		b.walRecoveryPending.Store(recoveryPending)
 		return false
 	}
 	return true
@@ -1206,7 +1226,22 @@ func (b *ArrowBuffer) ResetFlushFailure(expectedGeneration uint64) bool {
 // recovery pass without attributing the failure to a storage flush.
 func (b *ArrowBuffer) MarkWALRecoveryPending() {
 	b.flushFailureGeneration.Add(1)
-	b.hasFlushFailure.Store(true)
+	b.walRecoveryPending.Store(true)
+}
+
+// RetainedForWALRecoveryOnly reports whether the shutdown WAL purge must be
+// skipped solely because a recovery pass is still outstanding — every signal
+// that means records were LOST is clear.
+//
+// The shutdown purge uses it to pick its message: a genuine flush failure keeps
+// the Error that tells the operator to investigate flush logs, and this case
+// gets a Warn naming the real cause. Retention is identical either way.
+func (b *ArrowBuffer) RetainedForWALRecoveryOnly() bool {
+	return b.walRecoveryPending.Load() &&
+		!b.closeFailed.Load() &&
+		!b.hasFlushFailure.Load() &&
+		b.walOnlyRecords.Load() == 0 &&
+		b.closeFlushClean.Load()
 }
 
 func (b *ArrowBuffer) beginAsyncFlushTask() uint64 {
@@ -5055,8 +5090,14 @@ func (b *ArrowBuffer) Close() error {
 	//   - no synchronous flush returned an error (flushErrs)
 	//   - no records ended up WAL-only: rejected at enqueue, or still unwritten
 	//     after the drain above (walOnlyRecords)
-	//   - no earlier async flush failed (hasFlushFailure) — the same signal the
-	//     WAL maintenance loop already trusts
+	//   - no earlier async flush failed (hasFlushFailure)
+	//
+	// walRecoveryPending is deliberately NOT consulted here. It means a recovery
+	// pass is outstanding, not that this Close lost anything, and closeFailed is
+	// LATCHING — folding it in would permanently mark the buffer as having lost
+	// data and make RetainedForWALRecoveryOnly unable to ever distinguish the
+	// two cases. CloseFlushedCleanly consults both, so the WAL is still
+	// retained; only the attribution differs.
 	//
 	// The flag is latching: once a Close observes lost data it stays false for
 	// the lifetime of the buffer. closeFailed guards that, so a second Close
@@ -5072,6 +5113,7 @@ func (b *ArrowBuffer) Close() error {
 		Int64("total_flushes", b.totalFlushes.Load()).
 		Int("failed_buffers", len(flushErrs)).
 		Bool("flushed_cleanly", b.closeFlushClean.Load()).
+		Bool("wal_retained", !b.CloseFlushedCleanly()).
 		Msg("ArrowBuffer closed")
 
 	if len(flushErrs) > 0 {
@@ -5229,6 +5271,11 @@ func (b *ArrowBuffer) CloseFlushedCleanly() bool {
 	// can fail after Close computed the flag. A stale "clean" here would purge
 	// a WAL that is still needed.
 	if b.closeFailed.Load() || b.hasFlushFailure.Load() || b.walOnlyRecords.Load() > 0 {
+		return false
+	}
+	// An outstanding recovery pass also has to retain the WAL: the data it
+	// replayed is buffered but unproven, or it never got read at all.
+	if b.walRecoveryPending.Load() {
 		return false
 	}
 	return b.closeFlushClean.Load()
