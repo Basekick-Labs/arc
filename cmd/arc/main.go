@@ -3749,6 +3749,9 @@ func main() {
 	// Register Databases handler
 	databasesHandler := api.NewDatabasesHandler(storageBackend, &cfg.Delete, authManager, logger.Get("databases"))
 	databasesHandler.SetFieldSchema(fieldSchemaRegistry)
+	if clusterCoordinator != nil {
+		databasesHandler.SetCoordinator(clusterCoordinator)
+	}
 	// Guarded the same way every other SetAuthAndRBAC call is: assigning a nil
 	// *auth.RBACManager into the handler's RBACChecker interface would make its
 	// `rbacManager == nil` guards false for a typed nil.
