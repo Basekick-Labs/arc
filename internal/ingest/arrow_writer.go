@@ -1881,6 +1881,14 @@ func (b *ArrowBuffer) WriteColumnarDirectReplay(ctx context.Context, database, m
 	return b.writeColumnarDirect(ctx, database, measurement, columns, walIdentity, false, "")
 }
 
+// WriteColumnarDirectReplayWithPayloadHash replays a columnar WAL entry while
+// preserving both its checkpoint identity and its content identity. The former
+// prevents replaying a tracked WAL entry twice; the latter must match the live
+// ingest fingerprint used by cluster reconciliation.
+func (b *ArrowBuffer) WriteColumnarDirectReplayWithPayloadHash(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity, payloadHash string) error {
+	return b.writeColumnarDirect(ctx, database, measurement, columns, walIdentity, false, payloadHash)
+}
+
 // WriteTypedColumnarDirect writes a pre-typed column batch to the buffer,
 // bypassing the []interface{} → typed conversion in convertColumnsToTyped.
 // Used by format-specific parsers (e.g., TLE) that know column types at compile time.

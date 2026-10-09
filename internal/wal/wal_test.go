@@ -2,6 +2,8 @@ package wal
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -10,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Basekick-Labs/msgpack/v6"
 	"github.com/rs/zerolog"
 )
 
@@ -268,6 +271,59 @@ func TestReader_ReadAll(t *testing.T) {
 		if rec["measurement"] != "cpu" {
 			t.Errorf("measurement: got %v, want 'cpu'", rec["measurement"])
 		}
+	}
+}
+
+func TestReader_ReconciliationHashUsesInnerMessagePackForTrackedAndReplicatedEntries(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		replicated bool
+	}{
+		{name: "tracked-origin"},
+		{name: "replicated-receiver", replicated: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writer, tmpDir := newTestWriter(t, SyncModeAsync)
+			defer os.RemoveAll(tmpDir)
+			payload, err := msgpack.Marshal(map[string]interface{}{
+				"m": "cpu",
+				"columns": map[string]interface{}{
+					"time":  []interface{}{int64(1735787045000000)},
+					"value": []interface{}{42.0},
+				},
+			})
+			if err != nil {
+				t.Fatalf("marshal payload: %v", err)
+			}
+			if tc.replicated {
+				if err := writer.AppendRawReplicated(envelopePayload([]byte("testdb"), payload)); err != nil {
+					t.Fatalf("append replicated payload: %v", err)
+				}
+			} else {
+				if _, err := writer.AppendRawWithMetaTracked("testdb", payload); err != nil {
+					t.Fatalf("append tracked payload: %v", err)
+				}
+			}
+			walFile := writer.CurrentFile()
+			if err := writer.Close(); err != nil {
+				t.Fatalf("close writer: %v", err)
+			}
+			entries, err := NewReader(walFile, zerolog.Nop()).ReadAll()
+			if err != nil {
+				t.Fatalf("read WAL: %v", err)
+			}
+			if len(entries) != 1 || entries[0].ColumnarData == nil {
+				t.Fatalf("expected one columnar entry, got %#v", entries)
+			}
+			sum := sha256.Sum256(payload)
+			want := hex.EncodeToString(sum[:])
+			if entries[0].ReconciliationHash != want {
+				t.Fatalf("reconciliation hash = %s, want inner-payload hash %s", entries[0].ReconciliationHash, want)
+			}
+			if entries[0].Replicated != tc.replicated {
+				t.Fatalf("replicated = %v, want %v", entries[0].Replicated, tc.replicated)
+			}
+		})
 	}
 }
 

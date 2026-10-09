@@ -4415,7 +4415,7 @@ func createWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolo
 // createColumnarRecoveryCallback creates a WAL recovery callback for columnar entries
 // written via the zero-copy AppendRaw path.
 func createColumnarRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolog.Logger) wal.ColumnarRecoveryCallback {
-	return func(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string) error {
+	return func(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity, reconciliationHash string) error {
 		if database == "" {
 			database = "default"
 		}
@@ -4423,7 +4423,7 @@ func createColumnarRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger z
 		// exactly one buffer write, so a checkpoint for it covers precisely
 		// these records. The row-format callback above deliberately does NOT
 		// inherit — it fans one entry out into one write per record.
-		if err := arrowBuffer.WriteColumnarDirectReplay(ctx, database, measurement, columns, walIdentity); err != nil {
+		if err := arrowBuffer.WriteColumnarDirectReplayWithPayloadHash(ctx, database, measurement, columns, walIdentity, reconciliationHash); err != nil {
 			walLogger.Error().Err(err).Str("database", database).Str("measurement", measurement).Msg("Failed to replay columnar WAL entry")
 			return err
 		}
@@ -4441,15 +4441,15 @@ func createColumnarRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger z
 // crash/restart, so recovered replica rows remain excluded from manifest source
 // registration instead of being re-announced as locally originated files.
 func createColumnarProvenanceRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolog.Logger) wal.ColumnarProvenanceRecoveryCallback {
-	return func(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string, replicated bool) error {
+	return func(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity, reconciliationHash string, replicated bool) error {
 		if database == "" {
 			database = "default"
 		}
 		var err error
 		if replicated {
-			err = arrowBuffer.WriteColumnarDirectReplayReplicated(ctx, database, measurement, columns, walIdentity, walIdentity)
+			err = arrowBuffer.WriteColumnarDirectReplayReplicated(ctx, database, measurement, columns, walIdentity, reconciliationHash)
 		} else {
-			err = arrowBuffer.WriteColumnarDirectReplay(ctx, database, measurement, columns, walIdentity)
+			err = arrowBuffer.WriteColumnarDirectReplayWithPayloadHash(ctx, database, measurement, columns, walIdentity, reconciliationHash)
 		}
 		if err != nil {
 			walLogger.Error().Err(err).Str("database", database).Str("measurement", measurement).Msg("Failed to replay columnar WAL entry with provenance")

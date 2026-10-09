@@ -33,12 +33,13 @@ func NewReader(filePath string, logger zerolog.Logger) *Reader {
 
 // Entry represents a single WAL entry
 type Entry struct {
-	TimestampUS      uint64                   // Microseconds since epoch
-	PayloadHash      string                   // Entry identity: the writer-assigned "instanceSeq" (32 hex) for a tracked entry, else a SHA-256 of the logical payload (64 hex)
-	CheckpointHashes []string                 // Flush checkpoint identities, when present
-	Records          []map[string]interface{} // Row format (from Append path)
-	ColumnarData     *ColumnarEntry           // Columnar format (from AppendRaw path)
-	Replicated       bool                      // Entry was received from another node
+	TimestampUS        uint64                   // Microseconds since epoch
+	PayloadHash        string                   // WAL/checkpoint identity: writer-assigned instanceSeq for tracked entries, otherwise the legacy payload hash
+	ReconciliationHash string                   // SHA-256 of the inner MessagePack payload, independent of WAL envelope/identity markers
+	CheckpointHashes   []string                 // Flush checkpoint identities, when present
+	Records            []map[string]interface{} // Row format (from Append path)
+	ColumnarData       *ColumnarEntry           // Columnar format (from AppendRaw path)
+	Replicated         bool                     // Entry was received from another node
 }
 
 // ColumnarEntry represents a columnar WAL entry written via the zero-copy path
@@ -290,10 +291,11 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 		if colEntry := parseColumnarEntry(rawMap); colEntry != nil {
 			colEntry.Database = database
 			return &Entry{
-				TimestampUS:  timestampUS,
-				PayloadHash:  payloadHashValue,
-				ColumnarData: colEntry,
-				Replicated:   replicated,
+				TimestampUS:        timestampUS,
+				PayloadHash:        payloadHashValue,
+				ReconciliationHash: payloadHash(msgpackData),
+				ColumnarData:       colEntry,
+				Replicated:         replicated,
 			}, nil
 		}
 	}

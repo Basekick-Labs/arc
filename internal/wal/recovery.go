@@ -19,11 +19,11 @@ type RecoveryCallback func(ctx context.Context, records []map[string]interface{}
 // batch can inherit it and have its eventual flush checkpoint the ORIGINAL
 // entry — which is what stops a later pass replaying it again. It is empty for
 // an entry that carries no tracked identity.
-type ColumnarRecoveryCallback func(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string) error
+type ColumnarRecoveryCallback func(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity, reconciliationHash string) error
 
 // ColumnarProvenanceRecoveryCallback additionally reports whether the entry was
 // received from another node. It is optional to preserve existing integrations.
-type ColumnarProvenanceRecoveryCallback func(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string, replicated bool) error
+type ColumnarProvenanceRecoveryCallback func(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity, reconciliationHash string, replicated bool) error
 
 // RecoveryStats holds statistics about WAL recovery
 type RecoveryStats struct {
@@ -193,9 +193,9 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 				// Columnar entry from zero-copy AppendRaw path
 				var replayErr error
 				if opts.ColumnarProvenanceCallback != nil {
-					replayErr = opts.ColumnarProvenanceCallback(ctx, entry.ColumnarData.Database, entry.ColumnarData.Measurement, entry.ColumnarData.Columns, entry.PayloadHash, entry.Replicated)
+					replayErr = opts.ColumnarProvenanceCallback(ctx, entry.ColumnarData.Database, entry.ColumnarData.Measurement, entry.ColumnarData.Columns, entry.PayloadHash, entry.ReconciliationHash, entry.Replicated)
 				} else {
-					replayErr = opts.ColumnarCallback(ctx, entry.ColumnarData.Database, entry.ColumnarData.Measurement, entry.ColumnarData.Columns, entry.PayloadHash)
+					replayErr = opts.ColumnarCallback(ctx, entry.ColumnarData.Database, entry.ColumnarData.Measurement, entry.ColumnarData.Columns, entry.PayloadHash, entry.ReconciliationHash)
 				}
 				if err := replayErr; err != nil {
 					// #590: continue with the remaining entries instead of

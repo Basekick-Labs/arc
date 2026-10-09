@@ -842,7 +842,7 @@ func TestRecovery_SkipsTrackedColumnarEntryAfterRotation(t *testing.T) {
 
 	recovered := 0
 	stats, err := NewRecovery(tmpDir, zerolog.Nop()).RecoverWithOptions(context.Background(), nil, &RecoveryOptions{
-		ColumnarCallback: func(ctx context.Context, database, measurement string, columns map[string][]interface{}, _ string) error {
+		ColumnarCallback: func(ctx context.Context, database, measurement string, columns map[string][]interface{}, _, _ string) error {
 			recovered++
 			return nil
 		},

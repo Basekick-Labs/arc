@@ -49,7 +49,7 @@ func TestColumnarReplayContinuesPastFailedEntry(t *testing.T) {
 	}
 
 	var attempted []string
-	columnarCallback := func(ctx context.Context, database, measurement string, columns map[string][]interface{}, _ string) error {
+	columnarCallback := func(ctx context.Context, database, measurement string, columns map[string][]interface{}, _, _ string) error {
 		attempted = append(attempted, measurement)
 		if measurement == "m0" {
 			return fmt.Errorf("simulated poisoned entry")
