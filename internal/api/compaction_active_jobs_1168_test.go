@@ -91,7 +91,10 @@ func parkInFlightAttempt(t *testing.T) (*compaction.Manager, *fiber.App, func())
 	}
 
 	released := false
-	return manager, app, func() {
+	// Registered as cleanup too: a t.Fatalf between parking and the explicit
+	// release would otherwise leave a goroutine blocked on <-b.release for the
+	// rest of the package run, still holding the lock and the count.
+	release := func() {
 		if released {
 			return
 		}
@@ -100,9 +103,11 @@ func parkInFlightAttempt(t *testing.T) (*compaction.Manager, *fiber.App, func())
 		select {
 		case <-done:
 		case <-time.After(30 * time.Second):
-			t.Fatal("timed out draining the parked attempt")
+			t.Error("timed out draining the parked attempt")
 		}
 	}
+	t.Cleanup(release)
+	return manager, app, release
 }
 
 // TestActiveJobsEndpointReportsAnInFlightAttemptIssue1168 is the test the

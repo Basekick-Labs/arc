@@ -9,6 +9,12 @@ import (
 	"github.com/gofiber/fiber/v2/utils"
 )
 
+// compactionPrefix is matched at a segment boundary, so a sibling path that
+// merely starts with the same characters (/api/v1/compactionfoo) is not a
+// compaction action. Declared const so prefix+"/" folds at compile time
+// instead of concatenating on every audited request.
+const compactionPrefix = "/api/v1/compaction"
+
 // excludedPaths are never audited
 var excludedPaths = map[string]bool{
 	"/health":       true,
@@ -177,15 +183,25 @@ func classifyEvent(method, path string, statusCode int) string {
 	// who polled the status page -- and with HEAD bypassing the include_reads
 	// skip below, that happened at the default configuration (#1168).
 	//
-	// POST keeps the shipped name: /trigger is the only non-GET compaction
-	// route today and audit consumers filter on "compaction.triggered". A new
-	// POST sibling must be given its own action name rather than inheriting
-	// this one -- inheriting it is the mislabelling this fix removes.
+	// POST /trigger keeps the shipped name because audit consumers filter on
+	// "compaction.triggered". A new POST sibling does not inherit it: it gets
+	// "compaction.post" until someone names it deliberately, which is the
+	// safer default -- inheriting "triggered" is the mislabelling fixed here.
 	//
 	// Matched at a segment boundary, so /api/v1/compactionfoo is not a
 	// compaction action. The sibling prefixes below still match mid-segment.
-	if underPrefix(path, "/api/v1/compaction") {
-		if method == "POST" {
+	if path == compactionPrefix || strings.HasPrefix(path, compactionPrefix+"/") {
+		// Keyed on the trigger PATH, not merely on POST. Fiber answers 405 for
+		// a POST to a read route, and those reached the classifier too -- so
+		// method-keying alone would still file them under the trigger action,
+		// the same mislabelling in a rarer shape.
+		//
+		// The trailing slash is trimmed because the router does not require
+		// it to match: StrictRouting is left at its default (false), so
+		// POST /api/v1/compaction/trigger/ reaches the trigger handler and
+		// must not be filed as an ordinary POST. Verified against the router,
+		// not assumed.
+		if method == "POST" && strings.TrimSuffix(path, "/") == compactionPrefix+"/trigger" {
 			return "compaction.triggered"
 		}
 		return "compaction." + strings.ToLower(method)
@@ -198,14 +214,6 @@ func classifyEvent(method, path string, statusCode int) string {
 
 	// Default
 	return "api." + strings.ToLower(method)
-}
-
-// underPrefix reports whether path is prefix itself or sits beneath it,
-// matching only at a segment boundary. Plain strings.HasPrefix matches
-// mid-segment, so "/api/v1/compaction" would also claim
-// "/api/v1/compactionfoo" and audit it as a compaction action.
-func underPrefix(path, prefix string) bool {
-	return path == prefix || strings.HasPrefix(path, prefix+"/")
 }
 
 // extractRBACResource extracts the RBAC resource name from a path like /api/v1/rbac/organizations/...

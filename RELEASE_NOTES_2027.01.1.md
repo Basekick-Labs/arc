@@ -710,6 +710,12 @@ partition lock and deregisters when it returns, so all three surfaces report a
 real number: `/status` (`manager.active_jobs`), `/jobs` (`active_jobs`), and
 `/stats`, which gains the same `active_jobs` key.
 
+An attempt stays counted until it returns, which is *after* the compaction
+subprocess has exited and the parent has finished marking receipts, deleting
+the manifest entry and invalidating caches. For that short tail the attempt is
+counted in both `active_jobs` and `total_completed`, so on a busy node those
+two will not always look disjoint.
+
 **The unit is attempts, not batches.** This is the same unit as the records in
 `/api/v1/compaction/history` and as `total_jobs_completed` / `total_jobs_failed`
 beside it, and `/jobs` now says so explicitly with `"unit": "attempts"`. A
@@ -744,13 +750,30 @@ unaffected. The seven read routes now carry their own method:
 `compaction.get`, and `compaction.head` for the HEAD requests that Fiber
 registers alongside every GET.
 
-**This is visible at the default configuration.** `audit_log.include_reads`
-(default `false`) suppresses GET requests, but it does not suppress HEAD, so a
-`HEAD` against any compaction read route was already being recorded as
-`compaction.triggered` and will now be recorded as `compaction.head`. With
-`include_reads = true` the seven GET routes change from `compaction.triggered`
-to `compaction.get`. If you have a dashboard or alert that counts
-`compaction.triggered` events, it was over-counting and the number will drop.
+**Part of this is visible without changing any audit setting.**
+`audit_log.include_reads` (default `false`) suppresses GET requests but does
+not suppress HEAD, and Arc registers HEAD alongside every GET route — so a
+`HEAD` against a compaction read route was already being recorded as
+`compaction.triggered` and will now be recorded as `compaction.head`. That
+path needs a caller who clears the admin check (the compaction routes are
+admin-only, and a rejected request is already audited as `auth.failed`
+instead), so in practice it means an admin-token monitoring probe, or a
+deployment running with `auth.enabled = false`.
+
+That HEAD requests bypass `include_reads` at all is a separate gap, left
+as-is here: it applies to every audited prefix, not just compaction, so
+closing it belongs in its own change. If a HEAD probe polls a compaction route
+on your deployment, expect one `compaction.head` row per poll at the default
+setting, exactly as you were getting one `compaction.triggered` row before.
+
+With `include_reads = true` the seven GET routes change from
+`compaction.triggered` to `compaction.get`. If you have a dashboard or alert
+that counts `compaction.triggered` events, it was over-counting and the number
+will drop.
+
+A `POST` to a compaction *read* route — which Arc answers with 405 — was also
+recorded as `compaction.triggered`, and is now `compaction.post`. Only
+`POST /api/v1/compaction/trigger` itself carries the trigger action.
 
 The prefix is also matched at a path-segment boundary now, so a request to an
 unrelated path that merely begins with the same characters — `/api/v1/compactionfoo`

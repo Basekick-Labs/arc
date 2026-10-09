@@ -1008,7 +1008,12 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 	// does no work and is excluded from totalJobs* for the same reason. The
 	// window deliberately covers the post-subprocess bookkeeping (receipt
 	// marking, manifest delete, cache invalidation) -- the attempt is not
-	// finished until those are. Deferred, so a panic cannot leak the count.
+	// finished until those are. Both edges are pinned by tests that observe
+	// the count from inside this function; nothing outside it can see them.
+	//
+	// Deferred so the count cannot leak past a return. It would also survive a
+	// panic, though nothing recovers one here: compaction runs in goroutines
+	// with no recover, so a panic takes the process down regardless.
 	m.activeJobs.Add(1)
 	defer m.activeJobs.Add(-1)
 
