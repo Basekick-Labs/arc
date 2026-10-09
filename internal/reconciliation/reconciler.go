@@ -69,6 +69,9 @@ var (
 	// reconciliation this tick (e.g. shared-storage cluster on a node that
 	// is not the active compactor).
 	ErrGated = errors.New("reconciliation: node role is not permitted to run")
+	// ErrStorageOnlyRequiresLocal indicates that the one-shot snapshot
+	// repair was requested for a backend without per-node local storage.
+	ErrStorageOnlyRequiresLocal = errors.New("reconciliation: storage-only snapshot repair requires local storage")
 	// ErrDisabled indicates the reconciler was constructed with cfg.Enabled=false.
 	ErrDisabled = errors.New("reconciliation: feature is disabled")
 	// ErrGateRevoked is wrapped by both sweeps when the cluster gate
@@ -291,6 +294,7 @@ type Run struct {
 	StartedAt   time.Time   `json:"started_at"`
 	FinishedAt  time.Time   `json:"finished_at"`
 	DryRun      bool        `json:"dry_run"`
+	StorageOnly bool        `json:"storage_only,omitempty"`
 	BackendKind BackendKind `json:"backend_kind"`
 	Role        string      `json:"role"`
 
@@ -488,10 +492,25 @@ func (r *Reconciler) snapshotHistoryLocked() []*Run {
 	return out
 }
 
-// Reconcile runs a single reconciliation cycle. Steps 2–7 of the algorithm
-// land in subsequent commits; this stub returns ErrDisabled when disabled
-// and an empty Run otherwise so lifecycle tests can pin down the contract.
+// Reconcile runs a full manifest-vs-storage reconciliation cycle.
 func (r *Reconciler) Reconcile(ctx context.Context, dryRun bool) (*Run, error) {
+	return r.reconcile(ctx, dryRun, false)
+}
+
+// ReconcileOrphanStorage runs only the storage-vs-manifest half of
+// reconciliation. It is used after a remote Raft snapshot replaces this
+// node's manifest: local files that were created after its last local
+// snapshot may no longer be represented by the restored FSM. Restricting
+// this path to local storage keeps the cleanup scoped to this node's tree and
+// leaves the manifest untouched.
+func (r *Reconciler) ReconcileOrphanStorage(ctx context.Context, dryRun bool) (*Run, error) {
+	if r.cfg.BackendKind != BackendLocal {
+		return nil, ErrStorageOnlyRequiresLocal
+	}
+	return r.reconcile(ctx, dryRun, true)
+}
+
+func (r *Reconciler) reconcile(ctx context.Context, dryRun, storageOnly bool) (*Run, error) {
 	if !r.cfg.Enabled {
 		return nil, ErrDisabled
 	}
@@ -500,8 +519,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, dryRun bool) (*Run, error) {
 	}
 	defer r.runState.Store(false)
 
-	if r.gate != nil && !r.gate.ShouldRunStorageScan() && !r.gate.ShouldRunManifestSweep() {
-		return nil, ErrGated
+	if r.gate != nil {
+		if storageOnly {
+			if !r.gate.ShouldRunStorageScan() {
+				return nil, ErrGated
+			}
+		} else if !r.gate.ShouldRunStorageScan() && !r.gate.ShouldRunManifestSweep() {
+			return nil, ErrGated
+		}
 	}
 
 	// Bound the run by ctx + MaxRunDuration. The scheduler also passes
@@ -521,6 +546,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, dryRun bool) (*Run, error) {
 		// otherwise be forced into dry-run with no diagnostic, which
 		// blocks on-demand repairs.
 		DryRun:      dryRun,
+		StorageOnly: storageOnly,
 		BackendKind: r.cfg.BackendKind,
 	}
 	if r.gate != nil {
@@ -530,6 +556,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, dryRun bool) (*Run, error) {
 	r.logger.Info().
 		Str("run_id", run.ID).
 		Bool("dry_run", run.DryRun).
+		Bool("storage_only", run.StorageOnly).
 		Str("backend_kind", string(run.BackendKind)).
 		Str("role", run.Role).
 		Msg("Reconciliation run started")
@@ -537,6 +564,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, dryRun bool) (*Run, error) {
 	r.emitAudit("reconcile.run_started", run, map[string]string{
 		"run_id":       run.ID,
 		"dry_run":      boolStr(run.DryRun),
+		"storage_only": boolStr(run.StorageOnly),
 		"backend_kind": string(run.BackendKind),
 	})
 
@@ -577,10 +605,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, dryRun bool) (*Run, error) {
 
 	graceTotal := r.cfg.GraceWindow + r.cfg.ClockSkewAllowance
 	diff := computeDiff(keys, walkRes.records, time.Now().UTC(), graceTotal, r.cfg.LocalNodeID, r.cfg.BackendKind == BackendLocal)
-	run.OrphanManifestCount = len(diff.orphanManifest)
+	if !storageOnly {
+		run.OrphanManifestCount = len(diff.orphanManifest)
+		run.OrphanManifestSample = sampleStrings(diff.orphanManifest, r.cfg.SamplePathsCap)
+	}
 	run.OrphanStorageCount = len(diff.orphanStorage)
 	run.SkippedGrace = diff.skippedGraceCount
-	run.OrphanManifestSample = sampleStrings(diff.orphanManifest, r.cfg.SamplePathsCap)
 	run.OrphanStorageSample = sampleCandidatePaths(diff.orphanStorage, r.cfg.SamplePathsCap)
 
 	// Step 4: orphan-manifest sweep. Cheap, retryable, no risk of data
@@ -592,7 +622,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, dryRun bool) (*Run, error) {
 	// revocation: the candidates were counted above, the storage half still
 	// runs, and the run completes and says so. The chunk-boundary check
 	// inside the sweep remains the mid-run revocation path.
-	if r.gate != nil && !r.gate.ShouldRunManifestSweep() {
+	if storageOnly {
+		// The remote snapshot is authoritative, but a missing local copy of a
+		// manifest entry can still be in the pull queue. This one-shot repair
+		// only removes unreferenced local files and never mutates the manifest.
+	} else if r.gate != nil && !r.gate.ShouldRunManifestSweep() {
 		run.ManifestSweepHeld = true
 		r.logger.Info().
 			Str("run_id", run.ID).

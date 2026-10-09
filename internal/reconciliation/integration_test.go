@@ -131,6 +131,83 @@ func TestIntegration_RealLocalBackend(t *testing.T) {
 	}
 }
 
+func TestIntegration_SnapshotRestoreStorageRepairOnlyDeletesOldUntrackedFiles(t *testing.T) {
+	tmp := t.TempDir()
+	backend, err := storage.NewLocalBackend(tmp, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("NewLocalBackend: %v", err)
+	}
+	defer backend.Close()
+	ctx := context.Background()
+
+	const prefix = "db/m/2026/04/27/12/"
+	paths := []string{
+		prefix + "in-manifest.parquet",
+		prefix + "stale-after-snapshot.parquet",
+		prefix + "young-untracked.parquet",
+	}
+	for _, path := range paths {
+		if err := backend.Write(ctx, path, []byte("test")); err != nil {
+			t.Fatalf("Write(%q): %v", path, err)
+		}
+	}
+	old := time.Now().UTC().Add(-48 * time.Hour)
+	if err := os.Chtimes(filepath.Join(tmp, paths[1]), old, old); err != nil {
+		t.Fatalf("Chtimes(stale file): %v", err)
+	}
+
+	// This is the post-restart state: the installed snapshot no longer lists
+	// the stale local replica, but it still lists a live file and a separate
+	// missing local copy. The one-shot path must only remove storage orphans.
+	orphanManifest := fileEntry(prefix+"missing-local-copy.parquet", "node-a")
+	coord := newFakeCoordinator(fileEntry(paths[0], "node-a"), orphanManifest)
+	r, err := NewReconciler(
+		Config{
+			Enabled:                  true,
+			BackendKind:              BackendLocal,
+			LocalNodeID:              "node-a",
+			GraceWindow:              time.Hour,
+			ClockSkewAllowance:       time.Minute,
+			DeletePreManifestOrphans: true,
+		},
+		coord, backend, &fakeGate{scan: true, sweep: false}, nil, zerolog.Nop(),
+	)
+	if err != nil {
+		t.Fatalf("NewReconciler: %v", err)
+	}
+
+	run, err := r.ReconcileOrphanStorage(ctx, false)
+	if err != nil {
+		t.Fatalf("ReconcileOrphanStorage: %v", err)
+	}
+	if !run.StorageOnly || run.ManifestDeletes != 0 || run.OrphanManifestCount != 0 {
+		t.Fatalf("snapshot repair touched the manifest: %+v", run)
+	}
+	if run.StorageDeletes != 1 || run.OrphanStorageCount != 1 {
+		t.Fatalf("stale storage file was not reconciled: %+v", run)
+	}
+	if run.SkippedGrace != 1 {
+		t.Fatalf("young untracked file should remain protected by grace window: %+v", run)
+	}
+	if _, ok := coord.GetFileEntry(orphanManifest.Path); !ok {
+		t.Fatal("storage-only snapshot repair removed a manifest entry")
+	}
+	for path, wantExists := range map[string]bool{
+		paths[0]: true,
+		paths[1]: false,
+		paths[2]: true,
+	} {
+		exists, err := backend.Exists(ctx, path)
+		if err != nil {
+			t.Errorf("Exists(%q): %v", path, err)
+			continue
+		}
+		if exists != wantExists {
+			t.Errorf("Exists(%q) = %v, want %v", path, exists, wantExists)
+		}
+	}
+}
+
 // TestIntegration_LocalBackendDirectoryListerFallback exercises the
 // root-walk path: a file in storage that the manifest-derived prefixes
 // don't enumerate. The reconciler must find it via DirectoryLister and

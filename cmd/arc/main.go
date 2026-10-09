@@ -4002,15 +4002,21 @@ func main() {
 
 	// Initialize Reconciliation (Phase 5 manifest-vs-storage drift cleanup).
 	// Enterprise feature riding on FeatureClustering — no separate license
-	// flag, since standalone Arc has no manifest. Off by default; once
-	// enabled, runs on cron with conservative grace window + blast cap.
+	// flag, since standalone Arc has no manifest. The scheduled sweep remains
+	// opt-in; local-storage clusters also use a storage-only, one-shot pass
+	// after a remote Raft snapshot so files beyond a restarted node's local
+	// snapshot cannot remain visible after the manifest has advanced (#1071).
 	var reconciliationScheduler *reconciliation.Scheduler
-	if cfg.Reconciliation.Enabled && clusterCoordinator != nil {
+	if clusterCoordinator != nil {
 		gate := newReconciliationClusterGate(clusterCoordinator, cfg.Storage.Backend, cfg.Cluster.ReplicationEnabled, cfg.Cluster.ReplicationCatchUpEnabled)
-		if !isSharedBackend(cfg.Storage.Backend) && cfg.Cluster.ReplicationEnabled && !cfg.Cluster.ReplicationCatchUpEnabled {
+		if cfg.Reconciliation.Enabled && !isSharedBackend(cfg.Storage.Backend) && cfg.Cluster.ReplicationEnabled && !cfg.Cluster.ReplicationCatchUpEnabled {
 			log.Warn().Msg("cluster.replication_catchup_enabled=false: the reconciler's orphan-manifest sweep is not held until file replication has converged on this node, and a node restored with an empty data disk does not pull back the files it originated. Keep reconciliation in dry run after such a restore, or re-enable the catch-up walker.")
 		}
 		recCfg := reconciliation.Config{
+			// The reconciler is always constructed for a cluster so the
+			// snapshot-recovery path is available even when scheduled
+			// reconciliation is disabled. The scheduler below remains gated by
+			// cfg.Reconciliation.Enabled.
 			Enabled:     true,
 			BackendKind: reconciliationBackendKind(cfg.Storage.Backend),
 			// The coordinator's id, not the raw config value: it generates
@@ -4033,31 +4039,60 @@ func main() {
 		}
 		reconciler, err := reconciliation.NewReconciler(recCfg, clusterCoordinator, storageBackend, gate, auditLogger, logger.Get("reconciliation"))
 		if err != nil {
-			log.Error().Err(err).Msg("Failed to create reconciler — feature disabled")
+			log.Error().Err(err).Msg("Failed to create reconciler — scheduled and snapshot recovery reconciliation unavailable")
 		} else {
-			reconciliationScheduler, err = reconciliation.NewScheduler(reconciliation.SchedulerConfig{
-				Reconciler: reconciler,
-				Schedule:   cfg.Reconciliation.Schedule,
-				Logger:     logger.Get("reconciliation-scheduler"),
-			})
-			if err != nil {
-				log.Error().Err(err).Msg("Failed to create reconciliation scheduler")
-				reconciliationScheduler = nil
-			} else if err := reconciliationScheduler.Start(); err != nil {
-				log.Error().Err(err).Msg("Failed to start reconciliation scheduler")
-				reconciliationScheduler = nil
-			} else {
-				shutdownCoordinator.RegisterHook("reconciliation-scheduler", func(ctx context.Context) error {
-					reconciliationScheduler.Stop()
-					return nil
-				}, shutdown.PriorityScheduler)
-				log.Info().Str("schedule", cfg.Reconciliation.Schedule).
-					Str("backend_kind", string(recCfg.BackendKind)).
-					Bool("dry_run_only", cfg.Reconciliation.ManifestOnlyDryRun).
-					Msg("Reconciliation scheduler started")
+			if recCfg.BackendKind == reconciliation.BackendLocal && clusterCoordinator.HasRaft() {
+				clusterCoordinator.SetPostSnapshotRestoreHandler(func(ctx context.Context) {
+					for {
+						run, err := reconciler.ReconcileOrphanStorage(ctx, false)
+						if errors.Is(err, reconciliation.ErrAlreadyRunning) {
+							select {
+							case <-ctx.Done():
+								return
+							case <-time.After(250 * time.Millisecond):
+								continue
+							}
+						}
+						if err != nil {
+							log.Warn().Err(err).Msg("Post-snapshot local orphan-storage reconciliation failed")
+							return
+						}
+						log.Info().Str("run_id", run.ID).
+							Int("orphans", run.OrphanStorageCount).
+							Int("deleted", run.StorageDeletes).
+							Int("grace_skipped", run.SkippedGrace).
+							Bool("walk_partial", run.WalkPartial).
+							Msg("Post-snapshot local orphan-storage reconciliation completed")
+						return
+					}
+				})
+			}
+
+			if cfg.Reconciliation.Enabled {
+				reconciliationScheduler, err = reconciliation.NewScheduler(reconciliation.SchedulerConfig{
+					Reconciler: reconciler,
+					Schedule:   cfg.Reconciliation.Schedule,
+					Logger:     logger.Get("reconciliation-scheduler"),
+				})
+				if err != nil {
+					log.Error().Err(err).Msg("Failed to create reconciliation scheduler")
+					reconciliationScheduler = nil
+				} else if err := reconciliationScheduler.Start(); err != nil {
+					log.Error().Err(err).Msg("Failed to start reconciliation scheduler")
+					reconciliationScheduler = nil
+				} else {
+					shutdownCoordinator.RegisterHook("reconciliation-scheduler", func(ctx context.Context) error {
+						reconciliationScheduler.Stop()
+						return nil
+					}, shutdown.PriorityScheduler)
+					log.Info().Str("schedule", cfg.Reconciliation.Schedule).
+						Str("backend_kind", string(recCfg.BackendKind)).
+						Bool("dry_run_only", cfg.Reconciliation.ManifestOnlyDryRun).
+						Msg("Reconciliation scheduler started")
+				}
 			}
 		}
-	} else if cfg.Reconciliation.Enabled && clusterCoordinator == nil {
+	} else if cfg.Reconciliation.Enabled {
 		log.Warn().Msg("Reconciliation requires Enterprise clustering (cluster.enabled=true) — feature disabled")
 	}
 
