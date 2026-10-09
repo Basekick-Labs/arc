@@ -727,6 +727,14 @@ validation behavior; keyword, punctuation and file-access checks remain.
 
 Original fix proposed by [@abhicodes-007](https://github.com/abhicodes-007) in [#1078](https://github.com/Basekick-Labs/arc/pull/1078).
 
+### Hot-only databases keep their hot metadata when a cold object is listed ([#1187](https://github.com/Basekick-Labs/arc/issues/1187))
+
+Cold metadata sync now skips objects belonging to databases pinned to the hot
+tier. A cold object left behind by a failed migration can no longer make the
+orphan sweep remove the hot copy.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1192](https://github.com/Basekick-Labs/arc/pull/1192).
+
 ### Cold-tier metadata is rebuilt on standalone nodes ([#1179](https://github.com/Basekick-Labs/arc/issues/1179))
 
 A node with a usable cold tier now reads the cold listing at the start of every

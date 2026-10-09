@@ -1052,6 +1052,13 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 			unparseable++
 			continue
 		}
+		// A failed migration can leave a cold object beside its hot copy
+		// while the metadata still says hot. Do not promote that object to
+		// cold for a database pinned to hot: reconciliation would then
+		// remove the copy the policy requires us to keep.
+		if m.IsHotOnly(ctx, info.Database) {
+			continue
+		}
 		file := &FileMetadata{
 			Path:          obj.Path,
 			Database:      info.Database,
