@@ -290,6 +290,13 @@ enabled = false
 # Queries exceeding this threshold emit a WARN log and increment arc_slow_queries_total
 # slow_query_threshold_ms = 1000
 
+# Cancel a running query when the client connection closes before the response
+# completes. Like Go's net/http request-context behavior, a client that half-closes
+# its write side may be treated as disconnected even if it still reads the response.
+# Disable this for clients that use that request pattern; pending pipelined request
+# bytes also stop disconnect monitoring for the current query.
+# cancel_on_client_disconnect = true
+
 # S3 file caching (improves CTEs, subqueries, dashboard queries)
 enable_s3_cache = false
 s3_cache_size = "128MB"

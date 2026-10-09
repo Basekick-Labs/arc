@@ -695,6 +695,20 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Cancel queries when the client disconnects ([#979](https://github.com/Basekick-Labs/arc/issues/979))
+
+Queries now stop when Arc detects that the client connection has closed before
+the response completes. This follows Go's `net/http` request-context semantics:
+a client that half-closes its write side after sending a request may be treated
+as disconnected even if it still intends to read the response. On upgrade, this
+can make a query that previously completed appear as cancelled with
+`client disconnected` in query history. Set
+`query.cancel_on_client_disconnect = false` to disable cancellation for clients
+that use that half-close pattern. If a pipelined request is already pending,
+Arc leaves its bytes for the HTTP parser and stops monitoring that connection
+for the query, so a later disconnect on the same connection is not observed.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#982](https://github.com/Basekick-Labs/arc/pull/982).
 ### Compaction reports how many jobs are in flight ([#1168](https://github.com/Basekick-Labs/arc/issues/1168))
 
 Two endpoints advertised a count of in-flight compaction work and neither ever

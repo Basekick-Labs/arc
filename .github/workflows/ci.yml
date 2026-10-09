@@ -55,6 +55,11 @@ jobs:
       - name: Build
         run: go build -tags=duckdb_arrow ./...
 
+      # The unsupported-platform fallback for client-disconnect detection is
+      # selected by Windows build tags and is otherwise absent from this Linux CI.
+      - name: Build client-disconnect fallback for Windows
+        run: GOOS=windows GOARCH=amd64 go test ./internal/api/query_disconnect.go ./internal/api/query_disconnect_peek_other.go
+
       - name: Vet
         run: go vet -tags=duckdb_arrow ./...
 
