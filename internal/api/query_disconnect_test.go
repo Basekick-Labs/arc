@@ -66,11 +66,17 @@ func TestWatchClientDisconnectStopsWithQuery(t *testing.T) {
 
 	queryCtx, cancel := context.WithCancel(context.Background())
 	disconnected := make(chan struct{})
-	watchClientDisconnect(queryCtx, serverConn, func() {
+	done := watchClientDisconnect(queryCtx, serverConn, func() {
 		close(disconnected)
 	})
 
 	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("disconnect watcher did not stop after query completion")
+	}
 
 	select {
 	case <-disconnected:

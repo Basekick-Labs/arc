@@ -15,12 +15,15 @@ const clientDisconnectPollInterval = 250 * time.Millisecond
 // monitoring stops for this query and leaves those bytes for the HTTP server.
 // As with net/http request-context cancellation, a client half-close is treated
 // as a disconnect even if it still intends to read the response.
-func watchClientDisconnect(queryCtx context.Context, conn net.Conn, onDisconnect func()) {
+func watchClientDisconnect(queryCtx context.Context, conn net.Conn, onDisconnect func()) <-chan struct{} {
+	done := make(chan struct{})
 	if conn == nil {
-		return
+		close(done)
+		return done
 	}
 
 	go func() {
+		defer close(done)
 		for {
 			select {
 			case <-queryCtx.Done():
@@ -49,4 +52,5 @@ func watchClientDisconnect(queryCtx context.Context, conn net.Conn, onDisconnect
 			}
 		}
 	}()
+	return done
 }
