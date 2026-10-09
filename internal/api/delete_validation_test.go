@@ -79,3 +79,42 @@ func TestValidateWhereClauseMaskingEdgeCases(t *testing.T) {
 		}
 	}
 }
+
+// Column names containing sp_ or xp_ are accepted, and EXEC xp_cmdshell is
+// still refused — by the keyword check, which is what was doing the work all
+// along.
+//
+// #1077 removed the xp_/sp_ prefix scan as dead code: the patterns were
+// lowercase and the clause was upper-cased before matching, so nothing was
+// ever refused by it. This pins that the removal changed no answer, which
+// nothing else did — the delete validator's "legitimate filters" list in
+// query_measurement_security_test.go has no identifier containing either
+// substring.
+//
+// It also pins why the other option #1077 offered — upper-casing the patterns
+// so the check did what its comment claimed — would have been a bug rather
+// than a fix. `resp_time` and `disp_name` are ordinary column names that
+// contain sp_, and the query validator's own test fixture lists both as
+// clauses that must pass. A working prefix scan would have refused every
+// DELETE that mentioned one.
+func TestValidateWhereClauseAcceptsIdentifiersContainingProcedurePrefixes(t *testing.T) {
+	h := &DeleteHandler{}
+
+	for _, where := range []string{
+		`resp_time > 5`,
+		`disp_name = 'x'`,
+		`sp_count > 0`,
+		`xp_total < 10`,
+		`transport_mode = 'air'`,
+		`value = 'sp_who'`,
+	} {
+		if _, err := h.validateWhereClause(where); err != nil {
+			t.Errorf("validateWhereClause(%q) returned error: %v", where, err)
+		}
+	}
+
+	// The keyword check, not the deleted prefix scan, is what refuses this.
+	if _, err := h.validateWhereClause(`1=1; EXEC xp_cmdshell('dir')`); err == nil {
+		t.Error("validateWhereClause accepted EXEC xp_cmdshell; the keyword check must still refuse it")
+	}
+}

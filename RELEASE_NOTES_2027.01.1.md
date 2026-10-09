@@ -718,6 +718,15 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Delete API removes the inactive SQL Server prefix scan ([#1077](https://github.com/Basekick-Labs/arc/issues/1077))
+
+The WHERE validator no longer lists or checks `xp_` and `sp_`. The lowercase
+patterns were compared against an uppercase clause and never rejected a
+request. Removing this inactive SQL Server-specific check preserves existing
+validation behavior; keyword, punctuation and file-access checks remain.
+
+Original fix proposed by [@abhicodes-007](https://github.com/abhicodes-007) in [#1078](https://github.com/Basekick-Labs/arc/pull/1078).
+
 ### Cold-tier metadata is rebuilt on standalone nodes ([#1179](https://github.com/Basekick-Labs/arc/issues/1179))
 
 A node with a usable cold tier now reads the cold listing at the start of every
