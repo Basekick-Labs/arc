@@ -718,6 +718,14 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Cold tier metadata sync batches cache invalidation ([#1188](https://github.com/Basekick-Labs/arc/issues/1188))
+
+When rebuilding metadata from a large cold bucket, sync now writes bounded
+batches and invalidates each database/measurement cache once, rather than once
+per object. Per-object timestamps are preserved.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1197](https://github.com/Basekick-Labs/arc/pull/1197).
+
 ### Delete API removes the inactive SQL Server prefix scan ([#1077](https://github.com/Basekick-Labs/arc/issues/1077))
 
 The WHERE validator no longer lists or checks `xp_` and `sp_`. The lowercase
