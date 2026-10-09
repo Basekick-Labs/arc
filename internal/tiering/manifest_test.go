@@ -35,6 +35,7 @@ type fakeManifest struct {
 	failOnCall int // 1-based: fail exactly this call
 	probe      string
 	seq        *[]string
+	byDatabase map[string][]string
 }
 
 func (f *fakeManifest) DeleteFilesFromManifest(ctx context.Context, paths []string, reason string) error {
@@ -67,7 +68,16 @@ func (f *fakeManifest) ManifestEntry(path string) (int64, bool) {
 	return n, ok
 }
 
+// ManifestEntriesByDatabase models the real FSM, which indexes entries by the
+// manifest entry's Database FIELD (ClusterFSM.filesByDB), NOT by the first
+// path segment. byDatabase lets a test register the mismatch edge-sync
+// actually produces -- Path "{spoke}/{db}/..." under Database "{db}" -- which
+// a path-prefix fake cannot express, and which is what made the unfiltered
+// union delete a spoke's files.
 func (f *fakeManifest) ManifestEntriesByDatabase(database string) []string {
+	if f.byDatabase != nil {
+		return append([]string(nil), f.byDatabase[database]...)
+	}
 	var paths []string
 	for path := range f.entries {
 		if strings.HasPrefix(path, database+"/") {

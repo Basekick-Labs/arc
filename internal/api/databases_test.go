@@ -49,6 +49,8 @@ func (b *orderedDeleteBackend) DeleteBatch(ctx context.Context, paths []string) 
 }
 
 type fakeDatabaseTieringManager struct {
+	roleGated   bool
+	role        string
 	events      *[]string
 	beginErr    error
 	prepareErr  error
@@ -58,6 +60,10 @@ type fakeDatabaseTieringManager struct {
 }
 
 func (m *fakeDatabaseTieringManager) GetMetadata() *tiering.MetadataStore { return nil }
+
+func (m *fakeDatabaseTieringManager) MigrationGate() (bool, string) {
+	return m.roleGated, m.role
+}
 
 func (m *fakeDatabaseTieringManager) DatabaseHasTierRows(context.Context, string) (bool, error) {
 	return m.tierRows, nil

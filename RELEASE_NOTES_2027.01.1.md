@@ -1043,7 +1043,49 @@ Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1145](https:/
 
 ### Database deletion cleans up tiered storage ([#1091](https://github.com/Basekick-Labs/arc/issues/1091))
 
-Deleting a database now removes its tier metadata and cold-tier objects as well as its hot files. In clustered deployments, manifest entries are removed before hot files; if cleanup fails, the database remains available for a retry.
+`DELETE /api/v1/databases/:name` removed the database's hot files and nothing
+else. Its `tier_files` rows survived, and so did its cold-tier objects and
+their storage cost — indefinitely, because the cold sync records what is in the
+cold store and never reverts a row. A database re-created under the same name
+inherited them, and because the query path routes a measurement to cold when a
+cold row exists, those stale rows could point reads at the previous
+incarnation's objects.
+
+Deleting a database now also removes its cold-tier objects and retires its tier
+rows. In a cluster the database's manifest entries are removed before any hot
+object is deleted, in batches, and a manifest failure aborts the deletion
+before anything is removed from storage. The response breaks the count out as
+`hot_files_deleted` and `cold_files_deleted` rather than one total, because the
+cold half is the irreversible part.
+
+Four things worth knowing before you upgrade:
+
+- **Tier-metadata cleanup is node-local.** The node serving the request retires
+  the rows in its own metadata store. Other nodes keep their own rows for that
+  database until the deletion is repeated there, and nothing retires a peer's
+  cold row automatically. On a cluster, issue the DELETE on each node, or
+  expect the database to stay listed on the others.
+- **A database with only cold data is now deletable.** `databaseExists`
+  consults tier rows, so a database whose hot files are already gone can be
+  deleted instead of answering 404 — which is how the stale rows above get
+  cleaned up. The same check makes `POST /api/v1/databases` answer **409** for
+  a name that still carries tier rows; delete it first, then create.
+- **A partial failure keeps the database.** If any file, cold object or tier
+  row cannot be removed, the marker, the field-schema anchors and the Iceberg
+  catalog entry are all left in place and the response is a 500 listing what
+  failed. Re-running the DELETE retries the whole operation. The database is
+  partially deleted in that state, not intact — queries over it return
+  whatever survived.
+- **With `tiered_storage.cold.enabled` off**, a database holding cold rows
+  cannot be finished: there is no backend to delete its objects through or to
+  verify them against, so the rows are retained and the response says so once,
+  naming the key. Re-enable cold storage and repeat the deletion.
+
+A deletion also reserves the tier lifecycle while it runs, so a tier scan or
+migration cannot sweep a tier the deletion has already passed. A delete that
+arrives while a scan or cycle holds that reservation answers 409 naming which
+one; on a cluster node that may not mutate the tiered store it answers 503 and
+names the primary writer to route to.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1166](https://github.com/Basekick-Labs/arc/pull/1166).
 

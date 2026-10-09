@@ -854,10 +854,6 @@ func (m *Manager) ScanTiers(ctx context.Context) (*ScanResult, error) {
 		return &ScanResult{}, ErrScanRunning
 	}
 	defer m.scanRunning.Store(false)
-	if !m.cycleRunning.CompareAndSwap(false, true) {
-		return nil, ErrMigrationCycleRunning
-	}
-	defer m.cycleRunning.Store(false)
 
 	result, _, err := m.scanTiers(ctx)
 	return result, err
