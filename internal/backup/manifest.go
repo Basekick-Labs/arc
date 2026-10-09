@@ -432,8 +432,21 @@ type Progress struct {
 	// from a different cause — and on a node where the cold-metadata sync
 	// never runs (standalone, or a cluster without shared storage or
 	// replication) nothing will write that row later either.
-	ColdFilesRestoredToCold      int64 `json:"cold_files_restored_to_cold,omitempty"`
-	ColdFilesRestoredToHot       int64 `json:"cold_files_restored_to_hot,omitempty"`
+	ColdFilesRestoredToCold int64 `json:"cold_files_restored_to_cold,omitempty"`
+	ColdFilesRestoredToHot  int64 `json:"cold_files_restored_to_hot,omitempty"`
+	// ColdFilesSkippedAlreadyCold counts hot-backup files whose matching cold
+	// copy and cold tier row already exist locally, so restore left them there.
+	ColdFilesSkippedAlreadyCold int64 `json:"cold_files_skipped_already_cold,omitempty"`
+	// HotBackupFilesRoutedToCold counts files the backup holds as hot whose
+	// local tier row now says cold, so the restore wrote them to the cold tier
+	// instead of resurrecting a hot copy (#1139). Includes the
+	// ColdFilesSkippedAlreadyCold subset, which needed no write at all.
+	HotBackupFilesRoutedToCold int64 `json:"hot_backup_files_routed_to_cold,omitempty"`
+	// ColdRowsSkippedUnverifiable counts files this node holds in cold storage
+	// that the backup carries with no sidecar row, so the restore had nothing to
+	// verify replacement bytes against and left the cold copy untouched (#1139).
+	// These files were NOT restored; the copy on this node is whatever it was.
+	ColdRowsSkippedUnverifiable  int64 `json:"cold_rows_skipped_unverifiable,omitempty"`
 	ColdRestoreQuarantineSkipped int64 `json:"cold_restore_quarantine_skipped,omitempty"`
 	ColdRowsNotRecorded          int64 `json:"cold_rows_not_recorded,omitempty"`
 	// Cluster cross-check, backup only (#1083): mirrors of the manifest's

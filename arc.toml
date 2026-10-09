@@ -564,7 +564,7 @@ local_path = "./data/backups"           # Directory for local backups; see the r
 # hardware possible.
 #
 # A backup carries BOTH tiers. With tiered_storage on, the cold-tier objects are
-# backed up too and a restore puts each file back on the tier it came from,
+# backed up too and a restore puts each file back on the tier its local row says it belongs to, which from v27.01.1 can differ from the tier the backup read it from,
 # recording the tier row that makes it queryable. cold_files on the manifest
 # says how many came from cold; it is also in the listing and per target in
 # GET /api/v1/backup/<id>.

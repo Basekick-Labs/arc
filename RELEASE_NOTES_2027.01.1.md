@@ -968,6 +968,65 @@ Three consequences worth knowing before you upgrade:
   holds the lease, or run a single compactor-role node — the same constraint
   Iceberg export already documents.
 
+### A restore no longer resurrects a hot copy of a file that has since migrated ([#1139](https://github.com/Basekick-Labs/arc/issues/1139))
+
+A file that was in the hot tier when a backup was taken, and that tiering
+migrated to cold afterwards, was restored like any other hot file: the bytes
+went back to hot storage and the file was registered in the cluster manifest,
+while the guarded tier upsert refused to move the row off cold and said nothing
+about it. The row and the objects then disagreed, and the query path reads both
+tiers for a measurement that claims both — so the restored rows came back
+**twice** if anything else in that measurement was still hot. They came back
+**not at all** when the measurement had gone entirely cold and the cold object
+was missing or unreadable — the restored copy then sat on disk with nothing
+routing a reader to it.
+
+The local tier row now decides where a restored file belongs, because it is
+this node's current truth and a restore's job is to make the bytes at that
+location correct rather than to re-decide tiering. For a file the backup holds
+as hot whose row says cold:
+
+- a cold object whose size matches the backup's record is already the restored
+  copy, so the write is skipped — counted as `cold_files_skipped_already_cold`;
+- a cold object that is missing, differs in size, or is only a half-finished
+  staging file is overwritten **in cold storage**, where the row says it is;
+- a node with no cold backend configured has nowhere to put it, so it is
+  restored hot and its row forced hot, exactly as before — counted as
+  `cold_files_restored_to_hot`, not as a route to cold;
+- a backup carrying no sidecar row for the file leaves the cold copy **exactly
+  as it is**, counted as `cold_rows_skipped_unverifiable` and named in the log.
+  There is nothing to check replacement bytes against, and overwriting the only
+  copy with unverifiable bytes is worse than not restoring it. Those files are
+  not restored.
+
+The first two cases are counted as `hot_backup_files_routed_to_cold`, and a
+routed write is verified against the sidecar's size and SHA-256 before it
+replaces the cold object — on a standalone node as well as in a cluster. A
+damaged backup therefore fails the restore with `sidecar_mismatch_sample`
+instead of replacing the only copy of the file.
+
+Where a cold backend exists, no hot copy is created for a file whose row says
+cold, so this restore does not create a row/object disagreement — which means
+the tiering orphan sweep, which deletes a hot copy once it confirms a cold one,
+cannot act on a file this restore has just written. It does not clean up
+duplicates an earlier restore already produced; those age out of the sweep's
+window on their own.
+
+Size is the discriminator because a tier row stores no checksum of the backup
+object. On its own that is weak, but migration is a byte-preserving move of the
+same path and the writers that produce new content emit new filenames, so a
+cold object at that path with a matching size is that file. The check looks at
+the final object specifically: on local disk a stat alone reports the size of a
+`.part` staging file, which would let a half-transferred object pass as a
+complete one.
+
+Separately, a replication report refused by the cold-row guard now logs the
+path, the tier that refused it and whether the row is quarantined, instead of
+being dropped silently. The read behind that log cannot fail the event it is
+describing.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1145](https://github.com/Basekick-Labs/arc/pull/1145), carried forward with the routing change.
+
 ### Crash smokes verify acknowledged records after WAL replay
 
 The enterprise-shared crash scenarios restart the killed writer and wait for

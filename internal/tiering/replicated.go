@@ -856,7 +856,41 @@ func (m *Manager) applyPulled(ctx context.Context, info *FileMetadata) (bool, er
 			return false, nil
 		}
 	}
-	return m.metadata.recordHotFileIfNotCold(ctx, info)
+	wrote, err := m.metadata.recordHotFileIfNotCold(ctx, info)
+	if err != nil || wrote {
+		return wrote, err
+	}
+	// A false result is also the normal identical-hot-row case. Inspect only
+	// that no-op path so a stale pull refused by the cold-row guard is visible
+	// without adding a read to every successful replication write.
+	m.logRefusedHotRegistration(ctx, info.Path)
+	return false, nil
+}
+
+// logRefusedHotRegistration explains a hot registration the cold-row guard
+// refused. It returns NOTHING on purpose: the caller has already completed a
+// correct no-op, and any error this read produced must not reach the event
+// loop, which counts an error as a failed event and tells the operator the
+// next tier scan will reconcile. Making that impossible in the signature is
+// worth more than a test asserting it, because there is no seam between the
+// upsert and this read to drive such a test through.
+func (m *Manager) logRefusedHotRegistration(ctx context.Context, path string) {
+	existing, err := m.metadata.GetFile(ctx, path)
+	if err != nil {
+		m.logger.Debug().Err(err).
+			Str("path", path).
+			Msg("Could not read the existing tier row to explain a refused hot registration")
+		return
+	}
+	if existing == nil || (existing.Tier == TierHot && existing.QuarantinedAt == nil) {
+		// The ordinary identical-hot-row no-op, not a refusal.
+		return
+	}
+	m.logger.Warn().
+		Str("path", path).
+		Str("tier", string(existing.Tier)).
+		Bool("quarantined", existing.QuarantinedAt != nil).
+		Msg("Refused to register a hot file over a protected tier row")
 }
 
 // applyUnlinked decides what the removal of this node's local copy means for

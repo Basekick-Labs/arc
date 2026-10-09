@@ -739,6 +739,7 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 	// cold_files_restored_to_hot is always zero — which is exactly the number
 	// an operator restoring onto a cold-less node needs to see.
 	tiers := map[string]string{}
+	backupRows := map[string]ManifestFile{}
 	if m.cluster == nil {
 		for _, leg := range legs {
 			legEntries, ok, err := m.readSidecar(ctx, leg.target, backupID)
@@ -765,6 +766,7 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 				continue
 			}
 			for path, row := range legEntries {
+				backupRows[path] = row
 				if row.Tier != "" {
 					tiers[path] = row.Tier
 				}
@@ -773,6 +775,7 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 	}
 
 	var reg *restoreRegistration
+	var current []ManifestFile
 	if m.cluster != nil {
 		entries := map[string]ManifestFile{}
 		for _, leg := range legs {
@@ -785,6 +788,7 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 			}
 			for path, row := range legEntries {
 				entries[path] = row
+				backupRows[path] = row
 				if row.Tier != "" {
 					tiers[path] = row.Tier
 				}
@@ -793,7 +797,7 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 		if err := m.cluster.Sync(ctx); err != nil {
 			return fmt.Errorf("restore refused: could not sync the cluster manifest before reading it: %w", err)
 		}
-		current := m.cluster.ManifestFiles()
+		current = m.cluster.ManifestFiles()
 		existing := make(map[string]ManifestFile, len(current))
 		for _, e := range current {
 			existing[filepath.ToSlash(e.Path)] = e
@@ -804,10 +808,120 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 			overhead: registerOpOverhead(len(m.cluster.LocalNodeID())),
 			pause:    pause,
 		}
-		if mode == RestoreModeReplace {
-			if err := m.replaceDatabases(ctx, read.merged, allFiles, dataPrefix, allSkipInputs, current, progress, pause); err != nil {
-				return err
+	}
+
+	// A hot file in the backup may since have migrated to this node's cold
+	// tier. Resolve that before replaceDatabases can remove any live data.
+	//
+	// The local tier row decides where the file belongs, not the backup's
+	// sidecar: the row is this node's current truth, and the restore's job is to
+	// make the bytes at that location correct rather than to re-decide tiering.
+	// So a cold row routes the write to COLD, which the cold-sidecar path
+	// already implements end to end — no hot manifest entry (the entry tiering
+	// removed at migration, and whose re-creation is what made #1139 read the
+	// file twice), the cold row recorder instead of the hot report, and the
+	// existing no-cold-backend fallback when this node cannot store cold.
+	//
+	// Routing rather than forcing the row hot is deliberate. A forced hot row is
+	// written by the batched flush long after the bytes land, and until it does
+	// the row still says cold with a recent migrated_at — exactly what
+	// Migrator.ReconcileOrphanedFiles selects. With a cold backend present and a
+	// cold object confirmed, that sweep would delete the hot copy this restore
+	// had just written and leave the stale cold object behind. Keeping the write
+	// on the cold route means tier row and object never disagree, so the sweep
+	// has nothing to act on, and coldToHot below stays reachable only when this
+	// node has no cold backend at all — the precondition its own comment relies
+	// on.
+	//
+	// Size is the discriminator because a tier row stores no checksum of the
+	// backup object. It is weak on its own, but migration is a byte-preserving
+	// move of the SAME path, and the writers that produce new content for a
+	// measurement (compaction, DELETE rewrites) emit new filenames — so a cold
+	// object at this path whose size matches the sidecar is the same file. A
+	// mismatch is therefore the interesting case, and it routes to cold rather
+	// than being trusted either way.
+	alreadyCold := map[string]bool{}
+	skipUnverifiable := map[string]bool{}
+	toColdRouted := map[string]bool{}
+	if m.coldSource != nil {
+		coldRows, err := m.coldSource.ColdRows(ctx)
+		if err != nil {
+			return fmt.Errorf("restore refused: could not read cold tier rows before restoring: %w", err)
+		}
+		cold := m.coldBackendOrNil()
+		for _, leg := range legs {
+			for _, srcPath := range leg.files {
+				// Two HEADs per candidate against an object store, so this loop
+				// is cancellable and publishes, like the write loop below.
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				destPath := filepath.ToSlash(strings.TrimPrefix(srcPath, dataPrefix))
+				if destPath == "" || destPath == filepath.ToSlash(srcPath) || leg.skipInputs[destPath] ||
+					tiers[destPath] == tierCold {
+					continue
+				}
+				if _, isCold := coldRows[destPath]; !isCold {
+					continue
+				}
+				row, hasBackupRow := backupRows[destPath]
+				if cold == nil {
+					// Nowhere to put a cold copy, so the file goes to hot and its
+					// row has to be forced hot or it is invisible. Marking the tier
+					// cold is what reaches that existing branch; it is NOT a route
+					// to cold, so it is not counted as one.
+					tiers[destPath] = tierCold
+					continue
+				}
+				if !hasBackupRow {
+					// No sidecar row, so nothing can check the bytes we would
+					// write, and what we would overwrite is the only copy. Leave it
+					// alone: the row already says cold and the object is already
+					// there, so the node keeps the state it had. Overwriting the
+					// canonical copy with unverifiable bytes is the one outcome
+					// worse than not restoring the file, so this is reported rather
+					// than attempted.
+					skipUnverifiable[destPath] = true
+					atomic.AddInt64(&progress.ColdRowsSkippedUnverifiable, 1)
+					m.logger.Warn().Str("path", destPath).
+						Msg("Backup has no sidecar row for a file this node holds in cold storage; left the cold copy untouched rather than overwriting it with unverifiable bytes")
+					m.setProgress(progress)
+					continue
+				}
+				tiers[destPath] = tierCold
+				toColdRouted[destPath] = true
+				atomic.AddInt64(&progress.HotBackupFilesRoutedToCold, 1)
+				m.setProgress(progress)
+				// Exists AND StatFile, which is not the redundant pair it looks
+				// like: LocalBackend.StatFile falls back to the ".part" staging
+				// file when the final object is absent and returns ITS size
+				// (internal/storage/local.go), so a stat alone reports a
+				// half-transferred object as a complete one — and a matching size
+				// would then skip the restore and leave the staging file as the
+				// only copy. Exists looks only at the final path. The interface
+				// comment on StatFile says it returns -1 when the file does not
+				// exist, which is true of the object stores and not of local disk.
+				exists, err := cold.Exists(ctx, destPath)
+				if err != nil {
+					return fmt.Errorf("restore refused: could not check whether the cold copy of %s exists before restoring: %w", destPath, err)
+				}
+				if !exists {
+					continue
+				}
+				size, err := cold.StatFile(ctx, destPath)
+				if err != nil {
+					return fmt.Errorf("restore refused: could not read the size of cold copy %s before restoring: %w", destPath, err)
+				}
+				if size == row.SizeBytes {
+					alreadyCold[destPath] = true
+				}
 			}
+		}
+	}
+
+	if m.cluster != nil && mode == RestoreModeReplace {
+		if err := m.replaceDatabases(ctx, read.merged, allFiles, dataPrefix, allSkipInputs, current, progress, pause); err != nil {
+			return err
 		}
 	}
 
@@ -862,6 +976,14 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 				atomic.AddInt64(&progress.ConsumedInputsSkipped, 1)
 				continue
 			}
+			if skipUnverifiable[destPath] {
+				continue
+			}
+			if alreadyCold[destPath] {
+				atomic.AddInt64(&progress.ColdFilesSkippedAlreadyCold, 1)
+				m.setProgress(progress)
+				continue
+			}
 
 			// On a cluster a data file is written only when the sidecar describes
 			// it, and only if its bytes match that description (checked on the
@@ -875,6 +997,17 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 			registrable := isRegistrableDataFile(destPath)
 			var pendingRow pendingRegistration
 			var expect *ManifestFile
+			// Standalone has no registration pass, so expect stays nil and
+			// nothing checks the bytes. That was tolerable while an unverified
+			// write landed in HOT storage beside an intact cold object; a routed
+			// write overwrites the canonical copy, so verify it against the same
+			// sidecar row the routing decision already trusted.
+			if expect == nil && toColdRouted[destPath] {
+				if row, ok := backupRows[destPath]; ok {
+					verified := row
+					expect = &verified
+				}
+			}
 			if reg != nil && registrable {
 				pendingRow = reg.lookup(destPath)
 				if !pendingRow.ok {
@@ -1022,6 +1155,15 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 					// The window the #1142 note warned about, and its advice
 					// to run this restore with tiering stopped, were wrong.
 					m.queueHotRow(ctx, batch, destPath, bytesWritten, progress)
+					// Still true after #1139, and load-bearing: a hot-sidecar file
+					// whose local row says cold is ROUTED to cold in the pre-pass
+					// rather than forced hot here, so this branch keeps its single
+					// precondition. Give coldToHot a second assignment and every
+					// paragraph above has to be re-argued — the sweep interaction
+					// first, because with a cold backend present it deletes the hot
+					// copy a restore has just written.
+					//
+
 				}
 				if m.tierRecorder != nil {
 					m.tierRecorder.RecordRestoredFile(destPath, bytesWritten)
