@@ -718,6 +718,13 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Initial writer-election tests wait for the manager's published state ([#1196](https://github.com/Basekick-Labs/arc/issues/1196))
+
+Raft records a promoted writer before the election goroutine updates the manager's
+`primaryID` and clears `failoverInProg`. Under load, the tests could observe the
+Raft state in that gap and fail. They now wait for the manager state they assert.
+Runtime election behaviour is unchanged.
+
 ### Delete API removes the inactive SQL Server prefix scan ([#1077](https://github.com/Basekick-Labs/arc/issues/1077))
 
 The WHERE validator no longer lists or checks `xp_` and `sp_`. The lowercase
