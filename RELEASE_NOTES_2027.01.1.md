@@ -757,6 +757,14 @@ reachable on deployments that have been running happily without it.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1183](https://github.com/Basekick-Labs/arc/pull/1183).
 
+### Local `StatFile` ignores staged partial writes ([#1178](https://github.com/Basekick-Labs/arc/issues/1178))
+
+`LocalBackend.StatFile` now reports only committed files. In-progress writes
+remain available through `StagingInspector`, so resumable transfers can inspect
+partial data without callers mistaking it for a complete object.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1190](https://github.com/Basekick-Labs/arc/pull/1190).
+
 ### Reported core counts account for the CPU quota ([#1039](https://github.com/Basekick-Labs/arc/issues/1039))
 
 `runtime.NumCPU()` reflects a cpuset but not a CFS quota, and Kubernetes
