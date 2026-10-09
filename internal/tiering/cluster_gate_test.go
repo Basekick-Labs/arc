@@ -1,10 +1,11 @@
 package tiering
 
-// Shared-storage clusters: only the primary writer migrates, but every node
-// keeps its tier metadata in sync by listing cold storage, because the query
-// layer routes each node from its own metadata. These tests drive runCycle
-// (RunMigrationCycle after the license check, which the in-package test
-// Manager cannot pass) with a gate that flips between cycles.
+// The cluster gate: only the primary writer migrates, but EVERY node keeps its
+// tier metadata in sync by listing cold storage — standalone included since
+// #1179 — because the query layer routes each node from its own metadata.
+// These tests drive runCycle (RunMigrationCycle after the license check, which
+// the in-package test Manager cannot pass) with a gate that flips between
+// cycles, and one of them with no gate at all.
 
 import (
 	"context"
@@ -509,7 +510,10 @@ func TestScanTiers_ColdSyncedCountsAndNotifies(t *testing.T) {
 }
 
 // A primary whose cold listing failed does not migrate that cycle: its rows
-// for files other nodes moved are stale, and it would select them.
+// for files other nodes moved are stale, and it would select them. Since
+// #1179 an ungated node skips for the same reason — see
+// TestRunCycle_StandaloneSkipsMigrationWhenColdSyncFails, where there are no
+// other nodes and the stale view is this node's own.
 func TestRunCycle_LeaderSkipsMigrationWhenColdListingFails(t *testing.T) {
 	m, hot, cold, gate, cleanup := setupGatedTest(t)
 	defer cleanup()

@@ -80,7 +80,9 @@ type Manager struct {
 	licenseClient *license.Client
 
 	// clusterGate, when non-nil, limits storage mutation to the primary
-	// writer and switches on the cold-tier metadata sync. See ManagerConfig.
+	// writer. It does NOT gate the cold-tier metadata sync: every node with a
+	// usable cold tier syncs, standalone included (#1179), because the query
+	// layer routes from that metadata. See ManagerConfig.
 	clusterGate ClusterGate
 
 	// manifest, when non-nil, is told about every hot copy tiering removes,
@@ -152,10 +154,17 @@ type ManagerConfig struct {
 	// orphan reconciliation) to the primary writer. main.go wires it where
 	// nodes share data — shared-storage mode, and per-node storage with file
 	// replication: there the primary's manifest deletes unlink every
-	// replica, so only one node may migrate. A non-nil gate also switches on
-	// the cold-tier metadata sync in ScanTiers, since other nodes' migrations
-	// are then visible only by listing cold storage. A local-storage cluster
+	// replica, so only one node may migrate. A local-storage cluster
 	// without replication shares nothing and stays ungated.
+	//
+	// It does NOT switch the cold-tier metadata sync on or off. That used to
+	// be written here and was the one place in the package claiming it; the
+	// sync is gated on coldTierUsable alone, so a standalone node rebuilds
+	// cold rows from the bucket too (#1179). Recovery is the case that needs
+	// it — a restored or lost arc.db leaves cold objects that no row claims,
+	// and the query layer then omits the cold glob entirely, so the data is
+	// invisible rather than merely mis-tiered. Nothing else re-derives those
+	// rows.
 	ClusterGate ClusterGate
 
 	// Manifest, when non-nil, keeps the cluster file manifest in step with
@@ -408,8 +417,19 @@ func (m *Manager) runCycle(ctx context.Context) error {
 	// If the cold listing failed, the hot rows may be stale for files already
 	// moved to cold. Do not migrate or reconcile from that incomplete view;
 	// both wait for a cycle whose listing succeeds.
+	//
+	// This is a HALT, not a slow path, and on a node with no cluster gate it
+	// is reachable where it never was before #1179 — so the Warn has to name
+	// the cause. A cold bucket the node may read and write but not LIST is
+	// the likely one: nothing listed cold storage on a standalone node until
+	// the sync ran there, so a least-privilege policy had no reason to grant
+	// it. The other is a cold listing that does not fit in
+	// tiered_storage.scan_timeout, which the sync spends before the hot walk
+	// gets any of it.
 	if scanResult.ColdSyncFailed {
-		m.logger.Warn().Msg("Skipping migration and reconciliation this cycle: the cold tier could not be listed")
+		m.logger.Warn().
+			Dur("scan_timeout", m.scanBudget()).
+			Msg("Cold tier could not be listed, so migration and orphan reconciliation are skipped this cycle and hot storage will keep growing until a listing succeeds. Check that the cold credentials allow listing the bucket or container, and that tiered_storage.scan_timeout covers a full cold listing as well as the hot scan")
 		totalErrors++
 	} else {
 		// Hot -> Cold migrations (2-tier system)
