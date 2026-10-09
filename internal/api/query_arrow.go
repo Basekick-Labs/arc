@@ -619,6 +619,12 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// Execute query using DuckDB's native Arrow API — returns record batches
 	// directly from DuckDB's internal columnar chunks, no row-by-row scanning.
 	reader, conn, err := h.db.ArrowQueryContext(ctx, convertedSQL)
+	// Match the JSON query contract: a data glob with no matches is an empty
+	// result, not a failed query. Keep missing schema anchors as errors because
+	// they invalidate the cached SQL transform.
+	if err != nil && ctx.Err() == nil && isNoFilesFoundError(err) && !h.missingAnchor(err) {
+		reader, err = array.NewRecordReader(arrow.NewSchema([]arrow.Field{}, nil), nil)
+	}
 	if err != nil {
 		// Read the cause before releasing the context: cancel() below turns
 		// ctx.Err() into Canceled for every failure, which would misfile a
@@ -766,7 +772,14 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	}, func(w *bufio.Writer) {
 		// Registered before anything that can panic, so it runs exactly once
 		// whether the writer returns normally or unwinds (#733).
-		defer releaseArrowStreamResourcesFunc(reader, conn, cancel, h.logger)
+		// A no-files fallback has a synthetic reader and a nil *sql.Conn.
+		// Do not box that typed nil: cleanup would call Close on it and
+		// recover a panic before reaching cancel, leaving the timer alive.
+		var streamConn interface{ Close() error }
+		if conn != nil {
+			streamConn = conn
+		}
+		defer releaseArrowStreamResourcesFunc(reader, streamConn, cancel, h.logger)
 		streamW = w
 		totalRows, streamErr := streamArrowIPCFunc(
 			streamCtx, w, reader, schema, castInfo, dictEnabled, ipcCompression, governanceMaxRows, h.logger,

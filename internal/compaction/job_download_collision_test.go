@@ -11,6 +11,11 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// streamingBackend keeps these tests on the streaming path even when the
+// underlying fixture uses local storage. The local fast path is covered by
+// TestDownloadSingleFileUsesLocalStoragePath.
+type streamingBackend struct{ storage.Backend }
+
 func TestDownloadSameBasenameKeepsDistinctContents(t *testing.T) {
 	backend, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
 	if err != nil {
@@ -37,7 +42,7 @@ func TestDownloadSameBasenameKeepsDistinctContents(t *testing.T) {
 		}
 	}
 
-	job := newDownloadJob(t, backend, keys)
+	job := newDownloadJob(t, &streamingBackend{Backend: backend}, keys)
 	tempDir := t.TempDir()
 
 	first := job.downloadSingleFile(ctx, tempDir, 0, keys[0])
@@ -86,7 +91,7 @@ func TestDownloadRejectsExistingTemporaryFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	job := newDownloadJob(t, backend, []string{key})
+	job := newDownloadJob(t, &streamingBackend{Backend: backend}, []string{key})
 	tempDir := t.TempDir()
 	target := filepath.Join(tempDir, "0_a.parquet")
 

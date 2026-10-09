@@ -3,13 +3,16 @@
 package api
 
 import (
+	"bytes"
 	"io"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 
@@ -22,6 +25,10 @@ import (
 // newArrowRegistryRig builds a QueryHandler with a query registry wired the
 // way main.go wires it, and a Fiber app exposing only the Arrow endpoint.
 func newArrowRegistryRig(t *testing.T, queryTimeout, slowThreshold time.Duration) (*fiber.App, *queryregistry.Registry) {
+	return newArrowRegistryRigWithExistingData(t, queryTimeout, slowThreshold, false)
+}
+
+func newArrowRegistryRigWithExistingData(t *testing.T, queryTimeout, slowThreshold time.Duration, seedExistingData bool) (*fiber.App, *queryregistry.Registry) {
 	t.Helper()
 	tmpDir := t.TempDir()
 	logger := zerolog.New(os.Stderr).Level(zerolog.Disabled)
@@ -37,6 +44,19 @@ func newArrowRegistryRig(t *testing.T, queryTimeout, slowThreshold time.Duration
 	}, logger)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if seedExistingData {
+		parquetPath := filepath.Join(tmpDir, "default", "existing_measurement", "2026", "10", "07", "00", "seed.parquet")
+		if err := os.MkdirAll(filepath.Dir(parquetPath), 0o700); err != nil {
+			t.Fatalf("create existing-data fixture directory: %v", err)
+		}
+		copySQL := "COPY (SELECT 1 AS id) TO '" + strings.ReplaceAll(parquetPath, "'", "''") + "' (FORMAT PARQUET)"
+		if _, err := duckdb.DB().Exec(copySQL); err != nil {
+			t.Fatalf("seed existing-data fixture: %v", err)
+		}
+		if info, err := os.Stat(parquetPath); err != nil || info.Size() == 0 {
+			t.Fatalf("existing-data fixture missing or empty: stat=%v info=%v", err, info)
+		}
 	}
 	t.Cleanup(func() { duckdb.Close() })
 	reg := queryregistry.NewRegistry(&queryregistry.RegistryConfig{HistorySize: 16}, logger)
@@ -92,7 +112,7 @@ func TestExecuteQueryArrow_RegistersAndCompletes(t *testing.T) {
 // before streaming leaves a failed entry, not a running one.
 func TestExecuteQueryArrow_FailIsRecorded(t *testing.T) {
 	app, reg := newArrowRegistryRig(t, 30*time.Second, 0)
-	req := httptest.NewRequest("POST", "/api/v1/query/arrow", strings.NewReader(`{"sql":"SELECT * FROM this_measurement_does_not_exist"}`))
+	req := httptest.NewRequest("POST", "/api/v1/query/arrow", strings.NewReader(`{"sql":"SELECT missing_column"}`))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := app.Test(req, 10000)
 	if err != nil {
@@ -108,6 +128,66 @@ func TestExecuteQueryArrow_FailIsRecorded(t *testing.T) {
 	hist := reg.GetHistory(10)
 	if len(hist) != 1 || hist[0].Status != queryregistry.StatusFailed {
 		t.Fatalf("history = %+v, want one failed entry", hist)
+	}
+}
+
+// TestExecuteQueryArrow_NoFilesCompletesAsEmptyIPC keeps the raw Arrow endpoint
+// consistent with /api/v1/query: a missing data glob is an empty result, while
+// a missing field-schema anchor remains an error.
+func TestExecuteQueryArrow_NoFilesCompletesAsEmptyIPC(t *testing.T) {
+	sql := "SELECT * FROM default.empty_measurement"
+	for _, state := range []struct {
+		name             string
+		seedExistingData bool
+	}{
+		{name: "fresh-install", seedExistingData: false},
+		{name: "existing-data-install", seedExistingData: true},
+	} {
+		t.Run(state.name, func(t *testing.T) {
+			app, reg := newArrowRegistryRigWithExistingData(t, 30*time.Second, 0, state.seedExistingData)
+			req := httptest.NewRequest("POST", "/api/v1/query/arrow", strings.NewReader(`{"sql":"`+sql+`"}`))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := app.Test(req, 10000)
+			if err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read response: %v", err)
+			}
+			if resp.StatusCode != 200 {
+				t.Fatalf("status = %d, body = %s; missing data should be an empty Arrow result", resp.StatusCode, body)
+			}
+			if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, "application/vnd.apache.arrow.stream") {
+				t.Fatalf("Content-Type = %q, want Arrow IPC stream", got)
+			}
+			queryID := resp.Header.Get("X-Arc-Query-ID")
+			if queryID == "" {
+				t.Fatal("X-Arc-Query-ID missing for empty Arrow result")
+			}
+			reader, err := ipc.NewReader(bytes.NewReader(body))
+			if err != nil {
+				t.Fatalf("decode empty Arrow IPC stream: %v", err)
+			}
+			defer reader.Release()
+			if fields := reader.Schema().NumFields(); fields != 0 {
+				t.Fatalf("empty result schema has %d fields, want 0", fields)
+			}
+			if reader.Next() {
+				t.Fatalf("empty result unexpectedly contains %d rows", reader.Record().NumRows())
+			}
+			if err := reader.Err(); err != nil {
+				t.Fatalf("read empty Arrow IPC stream: %v", err)
+			}
+			if n := reg.ActiveCount(); n != 0 {
+				t.Fatalf("active queries after empty result = %d, want 0", n)
+			}
+			history := reg.GetHistory(10)
+			if len(history) != 1 || history[0].ID != queryID || history[0].Status != queryregistry.StatusCompleted || history[0].RowCount != 0 {
+				t.Fatalf("history = %+v, want completed/0 for query %s", history, queryID)
+			}
+		})
 	}
 }
 

@@ -197,20 +197,21 @@ func (m *Manager) CountColdFilesByDatabase(ctx context.Context) (map[string]int6
 // stage C). It is how a backup reads cold objects and how a restore writes
 // them back. Implements backup.ColdSource together with the two below.
 //
-// ANDs config.Cold.Enabled, which GetBackendForTier does NOT: an operator who
-// turns cold off keeps the configuration, and every other consumer of the cold
-// backend pairs the two checks (manager.go in the migration gate, the stats
-// and the sync). A backup that walked a disabled cold tier would carry objects
-// the query path refuses to read, because GetGlobPathsForQuery gates the cold
-// glob on exactly this conjunction (router.go).
+// ANDs config.Cold.Enabled. A backup that walked a disabled cold tier would
+// carry objects the query path refuses to read, because GetGlobPathsForQuery
+// gates the cold glob on the same answer.
+//
+// This used to say that GetBackendForTier deliberately did NOT check the flag,
+// and that every other consumer paired the two checks itself. The second half
+// was false: orphan reconciliation did not pair them, and would have deleted
+// hot copies on the strength of an unflagged answer had there been a backend
+// to return (#1143) — there is not, since cmd/arc/main.go constructs one only
+// when the flag is on. Both accessors now answer through coldTierUsable, so
+// they cannot drift if that ever changes.
 //
 // Nil-receiver safe like the reports around it.
 func (m *Manager) ColdBackend() storage.Backend {
-	// config is a POINTER, so it is checked before Cold.Enabled is read.
-	// NewManager always sets it, but "nil-receiver safe" has to mean safe
-	// against a partly-built manager too, which is the shape a caller holding
-	// this as an interface can be handed.
-	if m == nil || m.coldBackend == nil || m.config == nil || !m.config.Cold.Enabled {
+	if !m.coldTierUsable() {
 		return nil
 	}
 	return m.coldBackend
@@ -779,8 +780,10 @@ type coldProbe struct {
 // applyUnlinked applies, so the two agree on which paths needed one. Returns
 // nil when nothing did.
 func (m *Manager) probeColdForChunk(ctx context.Context, chunk []tierEvent, infos []*FileMetadata) map[string]coldProbe {
+	// GetBackendForTier ANDs cold.enabled since #1143, so the flag is not
+	// re-checked here.
 	cold := m.GetBackendForTier(TierCold)
-	if cold == nil || !m.config.Cold.Enabled || m.draining.Load() {
+	if cold == nil || m.draining.Load() {
 		return nil
 	}
 
@@ -896,7 +899,7 @@ func (m *Manager) applyPulled(ctx context.Context, info *FileMetadata) (bool, er
 // Returns whether a row was written.
 func (m *Manager) applyUnlinked(ctx context.Context, info *FileMetadata, reason string, probe *coldProbe) (bool, error) {
 	cold := m.GetBackendForTier(TierCold)
-	if reasonMayBeMigration(reason) && cold != nil && m.config.Cold.Enabled {
+	if reasonMayBeMigration(reason) && cold != nil {
 		// A row that already says cold needs no probe and no write, and
 		// skipping it here is what keeps the existence check off the
 		// high-volume tiering reasons: the manifest sweep and orphan

@@ -23,7 +23,7 @@ func TestCompactionTriggerEchoesExclusions(t *testing.T) {
 		CycleTimeout:     time.Minute,
 		Logger:           zerolog.Nop(),
 	})
-	handler := NewCompactionHandler(manager, nil, nil, nil, zerolog.Nop())
+	handler := NewCompactionHandler(manager, nil, nil, nil, nil, zerolog.Nop())
 	app := fiber.New()
 	handler.RegisterRoutes(app)
 

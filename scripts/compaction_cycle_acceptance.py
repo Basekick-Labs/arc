@@ -16,6 +16,7 @@ from pathlib import Path
 import signal
 import socket
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -153,9 +154,29 @@ enabled = false
         assert result.get('success', True), result
         return result['data']
 
-    def cycle(self, table):
+    def cycle(self, table, local_input_reuse=False):
         before = self.request('/api/v1/compaction/stats')['current_cycle_id']
         started = utc()
+        started_monotonic = time.monotonic()
+        input_bytes = sum(path.stat().st_size for path in self.files(table))
+        peak_temp_bytes = [0]
+        stop_sampling = threading.Event()
+
+        def sample_temp_usage():
+            temp_dir = self.root / 'data' / 'compaction'
+            while not stop_sampling.is_set():
+                total = 0
+                for directory, _, names in os.walk(temp_dir):
+                    for name in names:
+                        try:
+                            total += (Path(directory) / name).stat().st_size
+                        except OSError:
+                            pass
+                peak_temp_bytes[0] = max(peak_temp_bytes[0], total)
+                stop_sampling.wait(.01)
+
+        sampler = threading.Thread(target=sample_temp_usage, daemon=True)
+        sampler.start()
         self.request('/api/v1/compaction/trigger?' + urllib.parse.urlencode(
             {'database': 'acceptance', 'measurement': table, 'tier': 'hourly'}), b'')
         deadline = time.monotonic() + 90
@@ -164,10 +185,22 @@ enabled = false
             stats = self.request('/api/v1/compaction/stats')
             outcome = stats['last_cycle']
             if outcome['cycle_id'] > before and not stats['cycle_running']:
-                return {'started_utc': started, 'finished_utc': utc(), **outcome}
+                stop_sampling.set()
+                sampler.join()
+                return {
+                    'started_utc': started,
+                    'finished_utc': utc(),
+                    'cycle_wall_seconds': time.monotonic() - started_monotonic,
+                    'input_bytes': input_bytes,
+                    'calculated_input_copy_bytes': 0 if local_input_reuse else input_bytes,
+                    'peak_compaction_temp_bytes': peak_temp_bytes[0],
+                    'measured_storage_io': 'not available: parent /metrics does not aggregate compaction subprocess counters',
+                    **outcome,
+                }
             time.sleep(.02)
+        stop_sampling.set()
+        sampler.join()
         raise AssertionError('cycle did not terminate')
-
 
 def cgroup_events():
     try:
@@ -178,12 +211,14 @@ def cgroup_events():
         return None
 
 
-def run(binary, root):
+def run(binary, root, large_perf=False, local_input_reuse=False):
     root.mkdir(parents=True, exist_ok=False)
     arc = Arc(binary, root)
     report = {'started_utc': utc(), 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
               'resources': {'database_memory': '512MB', 'compaction_memory': '512MB', 'threads': 2, 'concurrency': 1, 'batch_files': 7},
               'cgroup_before': cgroup_events(), 'cycles': [],
+              'temp_usage_sampling_interval_ms': 10,
+              'measurement_note': 'input-copy bytes are calculated from input file sizes; storage I/O is not measured',
               'environment': 'native local process; hourly tier triggered manually; no Kubernetes/container limit guarantee'}
     try:
         arc.start('30s')
@@ -192,13 +227,29 @@ def run(binary, root):
             arc.seed(table)
             expected = arc.contents(table)
             count_before = len(arc.files(table))
-            outcome = arc.cycle(table)
+            outcome = arc.cycle(table, local_input_reuse=local_input_reuse)
             count_after = len(arc.files(table))
             assert outcome['status'] == 'completed', outcome
             assert outcome['failed_batches'] == outcome['discovery_errors'] == outcome['interrupted_batches'] == 0, outcome
             assert count_after < count_before, (count_before, count_after)
             assert arc.contents(table) == expected, 'compaction changed logical rows'
             report['cycles'].append({'table': table, 'files_before': count_before, 'files_after': count_after, **outcome})
+
+        if large_perf:
+            table = 'large_perf'
+            arc.seed(table, files=42, rows=25000)
+            expected = arc.contents(table)
+            count_before = len(arc.files(table))
+            outcome = arc.cycle(table, local_input_reuse=local_input_reuse)
+            count_after = len(arc.files(table))
+            assert outcome['status'] == 'completed', outcome
+            assert outcome['failed_batches'] == outcome['discovery_errors'] == 0, outcome
+            assert count_after < count_before, (count_before, count_after)
+            assert arc.contents(table) == expected, 'large compaction changed logical rows'
+            report['large_partition_comparison'] = {
+                'files_before': count_before, 'files_after': count_after,
+                'logical_rows': sum(int(row[-1]) for row in expected), **outcome,
+            }
 
         # Build an interruption workload while changing no resource settings.
         arc.seed('deadline', files=42, rows=2000)
@@ -282,5 +333,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--arc', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--large-perf', action='store_true', help='run a 42-file, 1.05M-row compaction measurement')
+    parser.add_argument('--local-input-reuse', action='store_true', help='report calculated input-copy bytes as zero for local-path reuse')
     args = parser.parse_args()
-    run(args.arc.resolve(), args.output.resolve())
+    run(args.arc.resolve(), args.output.resolve(), args.large_perf, args.local_input_reuse)

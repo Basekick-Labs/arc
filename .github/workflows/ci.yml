@@ -126,6 +126,15 @@ jobs:
           ARC_TEST_S3_ENDPOINT: http://localhost:9000
         run: go test -tags="duckdb_arrow objectstore" ./internal/storage/
 
+      # DELETE rewrite paths have backend-specific cleanup semantics too; keep
+      # the immutable register+delete contract covered against the same live S3
+      # service used by the storage contract tests.
+      - name: Test DELETE rewrite against real object storage
+        env:
+          ARC_TEST_S3_BUCKET: arctest
+          ARC_TEST_S3_ENDPOINT: http://localhost:9000
+        run: go test -tags="duckdb_arrow objectstore" ./internal/api/ -run '^TestReplaceManifestAfterRewriteDeletesOriginalS3Object$'
+
       - name: Stop SeaweedFS
         if: always()
         run: docker rm -f arc-ci-seaweedfs || true

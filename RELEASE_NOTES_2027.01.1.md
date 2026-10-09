@@ -2,13 +2,14 @@
 
 > **Status:** Planned — January 2027 release.
 
-## Upgrade note: two configurations now refuse to start
+## Upgrade note: three configurations now refuse to start
 
-Read this before upgrading if you set either `storage.local_path` or
-`backup.local_path`. Both refusals apply only when `backup.enabled` is true,
-which is the default, and both are decided on **resolved absolute** paths:
-relative spellings, trailing slashes and symlinks are normalised first, and in
-the container image the working directory is `/app`.
+Read this before upgrading if you set `storage.local_path`,
+`backup.local_path` or `compaction.temp_directory`. The first two refusals apply
+only when `backup.enabled` is true, which is the default, and both are decided
+on **resolved absolute** paths: relative spellings, trailing slashes and
+symlinks are normalised first, and in the container image the working directory
+is `/app`. The third applies independently of `backup.enabled`.
 
 **1. The backup destination and the primary storage root may no longer be the
 same directory, and neither may contain the other.** With `backup.local_path`
@@ -28,6 +29,27 @@ backup API silently disabled. An empty *environment variable* still falls
 through to the default, so only an empty value in the config file, or a stray
 space, triggers this.
 
+**3. `storage.local_path` and `compaction.temp_directory` may no longer contain
+a glob metacharacter** — one of `*`, `?`, `[`, `]`, `{`, `}`. All six are legal
+in a POSIX directory name, so `/data/arc[prod]` was an accepted configuration
+before this release.
+
+It cannot stay accepted. Compaction interpolates a full filesystem path into
+DuckDB's `read_parquet()`, which reads its argument as a **pattern**: with a
+metacharacter in the path, Go's literal `os.Open` and DuckDB can resolve the
+same string to **different files**, so a job could validate one file and read
+another, then delete the inputs it never read. The storage root is checked for
+the local backend only, since that is the only one whose paths reach a local
+glob; `compaction.temp_directory` is checked whenever compaction is enabled,
+because inputs from object storage are streamed into it and read back from
+there.
+
+To fix: rename the directory. The refusal names the offending character.
+
+Arc also refuses such a path per-job as defence-in-depth, but that is not where
+an operator should find out: every input would fail identically on every cycle,
+so compaction would never progress while the logs showed jobs completing.
+
 To fix either: move one path outside the other, point `backup.default_target` at
 a configured target, or set `backup.enabled = false`, which skips the check
 entirely.
@@ -44,6 +66,132 @@ them as orphans when reconciliation is enabled and dry-run is off. The check
 costs one comparison at startup and removes a class of silent data loss.
 
 ## New features
+
+### Compaction cycles can be looked up by id ([#1162](https://github.com/Basekick-Labs/arc/issues/1162))
+
+`POST /api/v1/compaction/trigger` answers with a `cycle_id`. Until now that id
+had nowhere to be resolved: `GET /api/v1/compaction/stats` carries a single
+global `last_cycle`, so by the time you polled it could already describe a
+later cycle, and nothing in the payload said which cycle you were looking at
+relative to the one you asked about. Two new admin-only routes close that:
+
+- **`GET /api/v1/compaction/cycles/{id}`** — one cycle.
+- **`GET /api/v1/compaction/cycles?limit=N`** — the retained window, newest
+  first. `limit` defaults to 10.
+
+A record carries more than counters, because counters alone cannot tell one
+cycle from another. Each one reports the **scope** it was asked for
+(`databases`, `measurement`, `tiers`), **when** it ran (`started_at`,
+`finished_at`, `duration_seconds`), and **where it came from** (`source`:
+`api` for a manual trigger, `scheduler` for a scheduled one). If you drive
+compaction one database at a time, this is what separates your trigger's cycle
+from the hourly scheduler's cycle that fired in between.
+
+Failures name themselves, completely. Alongside `failed_batches` a record
+carries `failed_partitions` — an object mapping each partition that failed to
+how many of its batches failed — plus `failed_partition_count` and `error`.
+Previously a failure count was a dead end: there was no way to get from "forty
+batches failed" to which partitions to retry.
+
+The list is deduplicated by partition, which is what makes it the retry list
+rather than a sample. A partition split into nineteen batches that all fail is
+one entry with a count of nineteen, so a cycle over eighty partitions and
+fifteen hundred batches yields eighty entries. Up to **200 distinct
+partitions** are recorded per cycle; past that the record carries
+`failed_partitions_truncated: true` so a capped list is never read as
+complete.
+
+**`GET /api/v1/compaction/history` gains cycle attribution and a working
+`limit`.** Each job record now carries `cycle_id` and `attempt_depth`, and the
+endpoint takes `?cycle_id=N` to show only one cycle's work.
+
+Two things to know about reading it. First, `?limit=N` previously returned at
+most ten records whatever you asked for — `recent_jobs` was truncated to ten
+before the limit was applied — so this is a bug fix, and the parameter now
+works up to the 100 records retained. (`scripts/range_schema_acceptance.py`
+has been requesting `limit=50` and passing only because its target happened to
+land in the last ten.) Second, **these records count attempts, not batches**:
+the adaptive splitter retries a failed batch at half size, and every attempt
+writes its own record with the same `partition_path`. `attempt_depth` tells
+them apart. Do **not** read depth-0 failures as the batch failures: a batch
+that fails at depth 0 and is then rescued by splitting counts as *succeeded*
+and contributes no failed partition, while still leaving a depth-0
+`success: false` record here. The response says `"unit": "attempts"` to make
+that hard to misread, and the rule that does hold exactly is
+`sum(failed_partitions) == failed_batches` on the cycle record, when not
+truncated.
+
+Because attempts multiply, one cycle can emit several hundred records against
+a hundred-record ring. The response is explicit about it rather than quietly
+partial: `matched` is how many retained records matched before `limit` was
+applied — counted over the ring, so on a full ring it is a floor rather than a
+total — `page_size` what you got, and `truncated` whether anything is missing.
+For a **cycle-filtered** read, `truncated` also accounts for eviction, with
+`may_have_evicted_earlier_attempts` saying so; that only fires when the ring is
+full *and* the filtered cycle is old enough to have lost records, so it stays
+informative on a busy node instead of being permanently true. An unfiltered
+read makes no completeness claim — compare `retained` with `capacity` for
+that. A cycle-filtered
+response also carries that cycle's authoritative outer-level counters
+(`cycle_failed_batches`, `cycle_started_batches`, `cycle_failed_partitions`),
+which are retained far longer than the job ring and are the numbers to trust.
+**For "which partitions do I retry", read `failed_partitions` on the cycle
+record** — job history is the attempt-level detail beneath it.
+
+`GET /api/v1/compaction/cycles` (the list) carries `failed_partition_count` but
+not the full map: 500 retained cycles of 200 partitions each would be a
+multi-megabyte response. Fetch the map from `/cycles/{id}` or
+`/history?cycle_id=`.
+
+One smaller shape change: `recent_jobs` in `/api/v1/compaction/stats` was
+`null` on a node that had compacted nothing and is now `[]`.
+
+If the cycle you ask about is no longer retained, the response says
+`cycle_retained: false` with the retained id range, because an empty result
+otherwise reads as "this cycle failed nothing" — the most expensive wrong
+answer the endpoint could give.
+
+A cycle that is still running is visible too, as `status: "running"` with live
+counters and no `finished_at`, so you can watch a long cycle progress rather
+than only read its obituary. A cycle that has been claimed but has not yet
+started — the millisecond or two between the trigger's reply and the cycle
+body starting — answers `status: "claimed"`, a four-field body with no scope
+yet recorded. Note that `GET /cycles` does **not** list a cycle in that state:
+its `running_cycle_id` is derived from the retained history so that the list
+can never contradict itself, which means during those few milliseconds the
+by-id lookup answers `claimed` while the list shows neither the cycle nor a
+`running_cycle_id`. Poll the id the trigger gave you, not the list.
+
+`source` has a third value, `unspecified`, for cycles started through an
+internal entry point that is neither the API nor the scheduler. No shipped
+code path produces it today; it exists so that a future caller is not
+silently misattributed to the scheduler.
+
+The list response also carries `retained`, the number of cycles currently
+held. A cycle's `error` is truncated at 512 bytes with a trailing
+`... (truncated)`, since up to 500 of them are retained at once.
+
+**Three limits worth knowing**, all reported in the 404 body rather than left
+to be discovered:
+
+- **History is in memory and bounded at 500 cycles.** At the default schedules
+  (`compaction.hourly_schedule = "5 * * * *"` plus
+  `compaction.daily_schedule = "0 3 * * *"`) a node consumes 25 cycle ids a day
+  even when every cycle finds nothing to do, so 500 is roughly 20 days. Tighten
+  the hourly schedule and the window shortens proportionally — about 41 hours
+  at `*/5 * * * *`. Nothing is persisted, so a restart empties it.
+- **Cycle ids restart at 1 when the process restarts.** An id recorded before a
+  restart will not resolve afterwards, and it is not a different cycle's id —
+  it is simply gone. The 404 says so instead of claiming the cycle never ran.
+- **Cycles run on the node holding the compactor lease**, and the lookup
+  answers for the node it is asked on. A cycle triggered on another node is not
+  recorded here. On a cluster that manages a compactor lease, the 404 names its
+  holder in `lease_holder`, so the response says where to ask instead — the
+  same datum the trigger's 503 already reports.
+
+`last_cycle` in `/api/v1/compaction/stats` is unchanged, including its field
+names and its meaning: it still describes the most recent *finished* cycle and
+never reports `running`.
 
 ### Scheduled edge-to-hub replication for paid licenses ([#828](https://github.com/Basekick-Labs/arc/issues/828))
 
@@ -547,6 +695,279 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Compaction reports how many jobs are in flight ([#1168](https://github.com/Basekick-Labs/arc/issues/1168))
+
+Two endpoints advertised a count of in-flight compaction work and neither ever
+produced one. `GET /api/v1/compaction/status` emitted
+`"manager": {"active_jobs": null}`, and `GET /api/v1/compaction/jobs` answered
+`"active_jobs": 0` **unconditionally** — including in the middle of a cycle
+with work running — because it read a key the manager never set and fell back
+to zero when the read failed. Nothing tracked the number: compaction jobs run
+in a subprocess, and the count was never added when that design landed.
+
+It is tracked now. An attempt registers as in flight once it holds its
+partition lock and deregisters when it returns, so all three surfaces report a
+real number: `/status` (`manager.active_jobs`), `/jobs` (`active_jobs`), and
+`/stats`, which gains the same `active_jobs` key.
+
+An attempt stays counted until it returns, which is *after* the compaction
+subprocess has exited and the parent has finished marking receipts, deleting
+the manifest entry and invalidating caches. For that short tail the attempt is
+counted in both `active_jobs` and `total_completed`, so on a busy node those
+two will not always look disjoint.
+
+**The unit is attempts, not batches.** This is the same unit as the records in
+`/api/v1/compaction/history` and as `total_jobs_completed` / `total_jobs_failed`
+beside it, and `/jobs` now says so explicitly with `"unit": "attempts"`. A
+batch too large to compact in one pass is split by the adaptive splitter and
+retried at successively smaller sizes, so one batch can account for several
+attempts in sequence. If you are reconciling this against a cycle's
+`discovered_batches` or `failed_batches` from `/api/v1/compaction/cycles/{id}`,
+those are batches and will not match attempt counts.
+
+`/jobs` still returns an empty `"jobs"` array. Only the count is tracked, not
+the identity of each in-flight attempt; the array is there for compatibility
+and listing which partitions are being compacted remains future work.
+
+A partition skipped because another attempt already holds its lock does no work
+and does not register as in flight, matching how it is already excluded from
+the `total_jobs_*` totals.
+
+If you use `arcli compaction status`, the `active` column stops showing `-` and
+starts showing the count, with no client upgrade required.
+
+### Compaction requests are audited per method instead of all as triggers ([#1168](https://github.com/Basekick-Labs/arc/issues/1168))
+
+With audit logging enabled, every request under `/api/v1/compaction` was
+recorded with the action `compaction.triggered` regardless of method — so an
+auditor filtering for who triggered a compaction also got everyone who read the
+status page, the candidate list or the cycle history. The sibling prefixes
+already did this correctly (`mqtt.put`, `tiering.put`).
+
+`POST /api/v1/compaction/trigger` keeps the action `compaction.triggered`, so
+existing filters and alerts on the one action that mutates anything are
+unaffected. The seven read routes now carry their own method:
+`compaction.get`, and `compaction.head` for the HEAD requests that Fiber
+registers alongside every GET.
+
+**Part of this is visible without changing any audit setting.**
+`audit_log.include_reads` (default `false`) suppresses GET requests but does
+not suppress HEAD, and Arc registers HEAD alongside every GET route — so a
+`HEAD` against a compaction read route was already being recorded as
+`compaction.triggered` and will now be recorded as `compaction.head`. That
+path needs a caller who clears the admin check (the compaction routes are
+admin-only, and a rejected request is already audited as `auth.failed`
+instead), so in practice it means an admin-token monitoring probe, or a
+deployment running with `auth.enabled = false`.
+
+That HEAD requests bypass `include_reads` at all is a separate gap, left
+as-is here: it applies to every audited prefix, not just compaction, so
+closing it belongs in its own change. If a HEAD probe polls a compaction route
+on your deployment, expect one `compaction.head` row per poll at the default
+setting, exactly as you were getting one `compaction.triggered` row before.
+
+With `include_reads = true` the seven GET routes change from
+`compaction.triggered` to `compaction.get`. If you have a dashboard or alert
+that counts `compaction.triggered` events, it was over-counting and the number
+will drop.
+
+A `POST` to a compaction *read* route — which Arc answers with 405 — was also
+recorded as `compaction.triggered`, and is now `compaction.post`. Only
+`POST /api/v1/compaction/trigger` itself carries the trigger action.
+
+The prefix is also matched at a path-segment boundary now, so a request to an
+unrelated path that merely begins with the same characters — `/api/v1/compactionfoo`
+— is no longer recorded as a compaction action. The `mqtt` and `tiering`
+prefixes still match mid-segment; that is unchanged here.
+
+Audit logging remains an enterprise feature: it is mounted only when
+`audit_log.enabled` is true and the license includes `audit_logging`, so
+nothing in this fix is reachable on OSS.
+
+### The compaction trigger now claims its cycle before it answers
+
+`POST /api/v1/compaction/trigger` decided whether a cycle was already running
+by reading a flag, then left the actual claim — the compare-and-swap that makes
+a cycle exclusive — to the background goroutine it started afterwards. Two
+things followed.
+
+**Concurrent triggers were accepted when only one could run.** The window
+between the read and the claim is not narrow: the goroutine is scheduled
+lazily, so a handler routinely finished its read *and sent its response* before
+any goroutine claimed. Measured against 32 simultaneous triggers on the old
+code, a substantial fraction were accepted — between 3 and 16, varying by
+machine and scheduler. Each loser's cycle never ran, and while the server did
+log the loss, the caller had been told the trigger succeeded and was handed a
+cycle id belonging to the winner.
+
+**The reported cycle id was a guess.** The response carried "current id plus
+one", computed in the handler, while the id was really assigned later inside
+the cycle. With two drivers, both were told the same id and only one cycle
+existed, so the loser matched that id against `last_cycle` in
+`/api/v1/compaction/stats` and read the winner's counters as its own. Since
+`last_cycle` is a single global record, matching on `cycle_id` is the only way
+an operator can tell whose result they are reading — and it was exactly the
+mechanism that was unsound.
+
+The handler now takes the claim synchronously and reports the id that claim
+assigned. Taking the claim and publishing its id are one step, so a refusal can
+also name the running cycle without ever reporting a previous, finished one.
+
+**Behaviour change:** a second concurrent trigger now gets **409** immediately,
+where it previously got a 200 whose cycle was silently dropped. If you drive
+compaction from more than one place — one process per database, for example —
+you will start seeing those 409s. They are the honest answer to what was
+already happening; the cycle was never going to run. The 409 carries
+`cycle_id`, `is_running`, and is now logged, so a refused trigger leaves a
+trace on the server.
+
+Scheduled compaction behaves exactly as before: the cron path and the internal
+trigger claim and release the cycle in one call, with the same refusal logging
+and the same return values on a lost claim.
+
+### One configurable budget for the tier scan, and a truncated scan you can see ([#1154](https://github.com/Basekick-Labs/arc/issues/1154))
+
+The tier scan runs on four paths, and until now they carried two different
+budgets. A scheduled migration cycle gave the whole cycle 2 hours. The scan at
+startup and `POST /api/v1/tiering/scan` were each capped at **30 minutes**, and
+neither was configurable. The short cap was on both paths an operator reaches
+for, so a warning that the startup scan did not finish pointed at the scheduled
+cycle while the manual endpoint carried the same cap that had just failed.
+
+`tiered_storage.scan_timeout` now bounds the scan on every path, defaulting to
+`2h` so all four agree. It is a Go duration; zero, negative and malformed values
+are refused at startup.
+
+Inside a migration cycle the scan runs on a budget **derived from** the cycle's,
+so it gets whichever is shorter. At the default the two are equal — the cycle
+budget is also 2 hours — so the derivation changes nothing there. It matters once
+the key is set *below* 2 hours: the scan then gives up on its own budget and
+migration, the step that actually moves files, keeps the remainder of the cycle.
+Setting it above 2 hours is harmless, because the cycle still bounds the scan.
+The cycle budget itself is unchanged.
+
+**Why the scan finishing matters.** The scan is the only thing that writes a
+tier row for a compacted file on the node that produced it: the ingest flush
+path and the replication workers are the other writers, and neither sees
+compaction output. A node whose data is largely compacted therefore depends on
+the scan entirely, and a truncated one costs partition pruning — a measurement
+whose remaining rows are all cold drops this node's local files from the read.
+
+**Setting the key below the time a full scan takes is harmful, not
+conservative.** Hot-row retirement runs only after the whole walk, so a scan
+that always truncates never retires a row for a file that has left hot storage.
+
+**A truncated scan is now reported instead of being logged once and forgotten:**
+
+- `ScanResult` carries `truncated`, set on every path that can run out of
+  budget — the cold-tier sync, the hot walk, and the retirement pass, which
+  returns no error of its own and so used to be reported as a complete scan.
+- The partial counts come back rather than being discarded. `POST
+  /api/v1/tiering/scan` answered a bare `500` with `context deadline exceeded`
+  and nothing else; it now answers **503** with the counts and `truncated`, and
+  distinguishes a scan the node cancelled while shutting down from one that ran
+  out of budget. Any other failure keeps its `500`.
+- `GET /api/v1/tiering/status` reports the last scan under `last_scan`. This is
+  the only way a truncated **startup** scan is observable after the fact: it has
+  no HTTP response, and a health check cannot ask the scan endpoint without
+  starting a scan.
+- A truncated scan now invalidates the query caches for what it did reach. The
+  rows it wrote were real, but the query path kept serving its pre-scan answer.
+
+**A second concurrent scan is refused with `409`.** The endpoint has no handler
+deadline and a client disconnecting does not cancel the scan, so an operator who
+gave up on a slow one and retried would start another full scan over the same
+storage root, against the same SQLite handle, each invalidating the tier cache
+the query path reads. A scan inside a migration cycle is deliberately not
+refused — the cycle must always scan, or it would migrate from stale rows.
+
+Fixed alongside: `scanTiers` never copied `HotRowsWritten` out of the walk, so
+every consumer read zero. The cache invalidations keyed on it never fired,
+including the one a standalone node needs on its first boot, when the scan
+writes every hot row it has.
+
+
+### The manual compaction trigger now requires the compactor lease
+
+`POST /api/v1/compaction/trigger` ran a full compaction cycle on whatever node
+received it. It checked whether a cycle was already running *on that process*
+and nothing else — not the node role, not the compactor lease. Only the
+scheduled cycles ever consulted the lease, and `compaction.enabled` defaults to
+true, so every node in a cluster built a compaction manager and served a live,
+unguarded trigger endpoint. A reader, a standby writer or a second compactor
+would all accept one. Readers and non-lease writers are now refused; a second
+compactor-role node still is not, unless compactor failover is enabled — see
+the last bullet below.
+
+That is unsafe because the partition lock is per-process: a trigger sent to a
+non-lease node could select the same partition as the lease holder and delete
+the same input files. With `cluster.replication_enabled` on it is worse and
+needs no second node at all. The completion-manifest watcher — the component
+that registers a compacted output and the deletion of its sources in the Raft
+manifest — starts only on a node that may compact, but the job's own source
+deletion is unconditional. So one trigger on a non-lease node deleted the
+source files from storage while nothing recorded either the new output or the
+deletions: phantom manifest entries pointing at files that are gone, and an
+orphan output no manifest knows about. Nothing re-registers either, and an
+enabled reconciliation sweep deletes the orphan and strips the phantoms.
+
+The trigger now consults the same gate the schedulers use, re-read on every
+request so a lease hand-over or a demotion takes effect without a restart. A
+node that may not compact answers **503** with `can_compact: false`, its
+`role`, and `lease_holder` (empty when the cluster manages no lease). 503
+rather than 409 because this endpoint already answers 409 for a paused cluster
+and for a cycle already in progress, and arcli reports any 409 here as "a
+compaction cycle is already running (cycle N)" — a role rejection has no cycle
+id, so it would have been reported as cycle 0. The remedy is carried in the
+`error` field rather than only in `message`, because arcli renders `error` and
+discards `message`.
+
+The refusal distinguishes the two reasons a node may not compact, because they
+have different remedies. If a lease exists and another node holds it, the
+message names the holder and points at
+`POST /api/v1/cluster/compactor/assign`. If the cluster manages no lease at
+all — the default, since `cluster.failover_enabled` is false — the refusal came
+from the node role, and the message says so and does *not* recommend the assign
+endpoint, which answers "this cluster does not manage a compactor lease" in
+exactly that state.
+
+Read-only compaction routes are unchanged: they report the node's own state,
+which is accurate everywhere.
+
+Three consequences worth knowing before you upgrade:
+
+- **A cluster-configured node whose license check fails now refuses manual
+  triggers** on writer and reader roles. Such a node logs "running in
+  standalone mode" but keeps its configured role, and its scheduler was already
+  gated, so nothing scheduled ever ran there — the manual path was the only one
+  left, and it is now closed. The node still shares storage with its licensed
+  peers, which is why it is gated rather than exempted. Fix the license, or set
+  `cluster.enabled=false` to run it as a genuine standalone node.
+- **If the lease sits on a node that cannot be recovered, compaction stops
+  cluster-wide and the manual trigger is no longer a way around it.** Move the
+  lease with `POST /api/v1/cluster/compactor/assign`; the 503 body says so.
+  That endpoint accepts compactor and writer targets.
+- **A licensed cluster with no compactor-role node now has no manual
+  compaction path.** With explicit `writer` and `reader` roles and
+  `cluster.failover_enabled` at its default `false`, no node has the static
+  capability and no lease exists to hold. Scheduled compaction never ran on
+  those nodes either — the scheduler was already gated — so this configuration
+  was already not compacting, but the manual trigger used to work and now
+  returns 503. Give one node `cluster.role=compactor`, or set
+  `cluster.failover_enabled=true` so the lease can be assigned to a writer.
+- **A cluster whose nodes never set `cluster.role` is still permissive.** Every
+  node is then `role=standalone`, which cannot hold the compactor lease, so the
+  gate falls back to the static role capability — and that is true for
+  standalone. Every node still accepts a trigger, exactly as every node already
+  runs its own scheduled cycles in that configuration. That is a separate
+  pre-existing problem, tracked as #892, and it is not changed here. Set
+  explicit roles on a cluster.
+- **Two compactor-role nodes with failover off both still accept a trigger.**
+  Both have the static capability and no lease is ever assigned, so neither can
+  be told it is the standby. Enable `cluster.failover_enabled` so exactly one
+  holds the lease, or run a single compactor-role node — the same constraint
+  Iceberg export already documents.
+
 ### Crash smokes verify acknowledged records after WAL replay
 
 The enterprise-shared crash scenarios restart the killed writer and wait for
@@ -558,6 +979,29 @@ now exits successfully when it passes.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1004](https://github.com/Basekick-Labs/arc/pull/1004).
 
+### Cluster compaction recovery records outputs before deleting sources ([#1155](https://github.com/Basekick-Labs/arc/issues/1155))
+
+When recovery finds an uploaded compacted file, it now writes the parent-side completion record before removing its inputs, then records the source deletions for Raft. Previously the inputs could go while Raft never learned about the output, leaving a compacted file that no manifest entry described — and on a cluster with `reconciliation.enabled`, an orphan the sweep would eventually delete.
+
+How a failure to write that record is handled depends on whether it can ever clear. A transient failure retains the inputs and the storage manifest, and the next cycle retries. A failure that cannot clear — the stored output disagrees with what the manifest records, or the completion record on disk belongs to a different job — **parks** the manifest under `.quarantined` instead, because retaining it would make recovery re-read and re-hash the whole compacted output on every cycle, for ever. A stored output that is simply shorter than the manifest records is treated as the partial upload it is: the output and the manifest are both discarded so the next cycle redoes the job, which is what Arc already did when the backend could be asked for object sizes directly.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1157](https://github.com/Basekick-Labs/arc/pull/1157).
+
+### Partial DELETE rewrites remain immutable without duplicating data ([#975](https://github.com/Basekick-Labs/arc/issues/975))
+
+Partial DELETE now publishes the surviving rows under a fresh immutable Parquet path and retires the superseded object in every storage mode, including standalone OSS deployments. The rewrite filename is normalized before compaction, tiering and file-time pruning classify it. This closes the same-size/different-content replication class without leaving deleted rows visible through Arc's glob-based query path.
+
+**Two DELETEs that touch the same file no longer merge.** Before this release they did, because the
+rewrite kept the file at its original path, so the second request read what the first had written.
+With immutable rewrites the rewrite phase is serialized, and a request whose source was retired
+while it waited fails with `source file was retired by a concurrent delete, retry the request`
+rather than acting on a stale file list. Retrying it succeeds — the retry rebuilds the affected-file
+list and sees the new path. Nothing is lost and no deleted rows come back, but a client that fires
+overlapping DELETEs (or times out and retries one) will now see that error where it previously saw
+success, and should retry rather than treat it as a failure.
+
+If the old-object delete fails after the manifest commit or standalone publish, Arc reports the storage failure explicitly because the old object can remain query-visible until cleanup. A crash in that window can likewise leave both objects; operators should treat the corresponding error as a signal to inspect the partition before retrying.
+
 ### Compaction subprocess threads respect license and effective-core limits ([#1036](https://github.com/Basekick-Labs/arc/issues/1036))
 
 Each compaction subprocess is now capped at the lower of the license's
@@ -568,6 +1012,90 @@ subprocesses can still request more threads in total than `MaxCores`. Capping a
 previously higher setting can reduce compaction throughput.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1043](https://github.com/Basekick-Labs/arc/pull/1043).
+
+### Raising compaction.max_concurrent no longer multiplies the subprocess thread count ([#1037](https://github.com/Basekick-Labs/arc/issues/1037))
+
+When `compaction.threads` is left at its automatic default, Arc divided the CPUs
+this process may use by two, regardless of how many compaction jobs could run at
+once. The halving hardcoded the default `compaction.max_concurrent = 2`, so an
+operator who raised concurrency got that many subprocesses each still claiming
+half the cores: at `max_concurrent = 4` on 16 CPUs, four jobs at 8 threads
+each. The memory budget already tracked the setting — `compaction.memory_limit`
+divides by `max_concurrent` — so the two derivations disagreed about the same
+knob.
+
+The automatic default is now those CPUs divided by `max(2,
+compaction.max_concurrent)`, minimum 1. "CPUs this process may use" is
+`min(runtime.NumCPU(), runtime.GOMAXPROCS(0))`, which reflects a quota, a
+cpuset, or an explicitly set `GOMAXPROCS` without distinguishing which one
+imposed the limit.
+
+**At the default `max_concurrent = 2` nothing changes** — the divisor is still
+2, so no existing deployment loses compaction throughput on upgrade. Above the
+default it tightens: `max_concurrent = 4` on 16 CPUs now gives 4 threads per
+subprocess rather than 8. That is a deliberate throughput trade in the
+configuration that was oversubscribing, and it is not backed by a workload
+benchmark at raised concurrency — what is measured is that thread count trades
+against the per-subprocess memory budget rather than being uniformly better or
+worse (see #1030 in the 26.09.3 notes for the numbers). An explicit
+`compaction.threads` value is untouched by the automatic default, though the
+licence cap above still applies to it.
+
+The divisor covers compaction subprocesses only. The main process competes for
+the same CPUs and is not accounted for here, so these remain caps on
+parallelism, not reservations.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1041](https://github.com/Basekick-Labs/arc/pull/1041).
+
+### Iceberg snapshot history no longer advertises files Arc has deleted ([#1092](https://github.com/Basekick-Labs/arc/issues/1092))
+
+**Arc does not support Iceberg time travel across compaction, retention or a
+partial DELETE, and the metadata now says so instead of failing on the read.**
+
+Every Arc mechanism that removes a data file — compaction (scheduled hourly by
+default), retention, and both branches of the delete API — removes it from
+storage and from the current Iceberg snapshot. Older snapshots kept naming the
+deleted path, so an external engine time-travelling to one got:
+
+```
+IO Error: Cannot open file ".../cpu_20261008_155058_567682000.parquet": No such file or directory
+```
+
+That is indistinguishable from object storage having lost the object, which is
+the wrong thing for an operator to go and investigate. A reconcile pass that
+removes any path now expires every older snapshot, so the same query returns a
+routine `Could not find snapshot with id ...` — a normal outcome of any
+retention policy, which Iceberg consumers already handle by re-reading the
+current snapshot.
+
+**This loses no readable history.** A removed path is referenced by every
+snapshot from the one that added it onward, so each of those was already
+unreadable. An append-only pass removes nothing and still keeps
+`iceberg.retain_snapshots` snapshots (default 10), because that history does
+work.
+
+Why Arc cannot do real copy-on-write here: Iceberg keeps superseded data files
+alive until the snapshots referencing them expire, but Arc reads a partition
+with a glob, so any superseded file left in place is double-counted by every
+ordinary query — the bug [#1073](https://github.com/Basekick-Labs/arc/pull/1073)
+fixed, where a 3-row table returned 11. The two requirements are in direct
+conflict, and honest metadata is the half Arc can deliver.
+
+**Two limitations worth knowing:**
+
+- The fix applies to the entry point readers use, `version-hint.text`. Arc also
+  keeps `retain_snapshots + 1` older `v<N>.metadata.json` copies for
+  directory-based readers, and those still list the pre-floor snapshots. A
+  consumer that pins one of them directly still gets the `IO Error` until the
+  copy is pruned, roughly `retain_snapshots` passes later.
+- History already broken on an existing deployment is cleaned on that table's
+  next pass that removes something. A table whose file set has gone quiet is
+  skipped by the reconciler, so its stale metadata stays until it changes again.
+
+A pass that drops history logs at `warn` with the before and after snapshot
+counts, so an operator who notices one-deep history finds the reason rather
+than inferring it. A failed expiry now also leaves the measurement uncached, so
+the next pass retries it; previously only a failed version-hint write did that.
 
 ### Database API storage calls now have a deadline ([#1065](https://github.com/Basekick-Labs/arc/issues/1065))
 
@@ -818,6 +1346,31 @@ would destroy a registered file to clean up a write that did no damage.
 `iceberg.retain_snapshots` now updates Iceberg's metadata-file retention properties on existing tables. Reconciliation skips commits when the properties already match.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1095](https://github.com/Basekick-Labs/arc/pull/1095).
+
+### Empty Arrow IPC queries complete successfully ([#731](https://github.com/Basekick-Labs/arc/issues/731))
+
+When a measurement had no Parquet files, `POST /api/v1/query/arrow` returned
+HTTP 500 and recorded the query as failed, unlike the JSON and MessagePack
+paths. It now returns a valid empty Arrow IPC stream and records a completed
+query with zero rows. Empty results release their query timeout context without
+a cleanup panic. Missing field-schema anchors remain errors.
+
+Contributed by [@jallegri](https://github.com/jallegri) in [#1120](https://github.com/Basekick-Labs/arc/pull/1120).
+
+### Behavior change for clustered deployments: backup deletion requires the primary writer ([#1134](https://github.com/Basekick-Labs/arc/issues/1134))
+
+`DELETE /api/v1/backup/:id` now uses the same primary-writer gate as backup
+creation and restore. Previously, a request reaching a reader, standby writer,
+or compactor could delete a backup across that node's configured targets.
+Non-primary nodes now return **503** with `route to the primary writer` before
+accessing backup storage. Direct backup deletion requests, including those from
+`arcli backup delete`, to the primary writer rather than a service address that
+can send them to other nodes.
+
+Eligibility is checked on every request, so promotion and demotion take effect
+without a restart. A deletion already admitted is not cancelled on demotion.
+Standalone and OSS deployments without a cluster coordinator keep their
+existing behavior.
 
 ### Backup and restore are cluster-safe ([#1083](https://github.com/Basekick-Labs/arc/issues/1083))
 
@@ -1081,6 +1634,153 @@ the masker was hardened against in 26.09.1 and 26.09.2.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#937](https://github.com/Basekick-Labs/arc/pull/937).
 
+### Keep replayed WAL files until recovery flushes succeed
+
+WAL recovery now waits for queued and direct flushes before deleting replayed
+files, and retains them if any flush fails during the recovery pass, including
+an asynchronous flush that finishes before the deletion barrier begins. A later
+pass can retry after storage recovers. Periodic cleanup uses the unflushed
+sequence floor instead of file age so a slow flush cannot lose its durable copy
+(#1009, #966).
+
+An incomplete final WAL header or payload after an interrupted append no longer
+counts as a poison entry: complete preceding entries still require a successful
+flush barrier before reclamation. Complete entries with invalid checksums remain
+recovery failures. Checkpoints in quarantined WAL files remain part of recovery's
+durability proof, so a later retry does not replay already-flushed entries merely
+because their checkpoint file was renamed.
+
+Replication followers prepare buffer ownership before appending local WAL.
+Ignored payloads no longer leave an unowned identity that prevents reclamation.
+An entry containing multiple measurements gets a separate local WAL payload and
+identity for each buffer, preserving its database envelope. Flushing one
+measurement cannot checkpoint another measurement's pending rows; rejecting a
+later measurement does not release an earlier buffer's identity. Normal
+single-measurement payloads retain their original bytes. Replication sequence
+and acknowledgement semantics are unchanged.
+
+Recovery barriers now use the configured flush worker pool instead of serial
+per-measurement writes, and release shard locks before waiting. Each barrier
+has a total wait budget of `ingest.flush_timeout_seconds` (30 seconds by default)
+or the caller's earlier deadline. The first observed flush failure stops further
+admission. Unsubmitted records remain buffered; queued/in-flight writes retain
+their normal per-write deadlines and WAL identities. A timeout or failed
+barrier retains the WAL for a later recovery pass, including when storage ignores
+cancellation. Concurrent ingestion can continue while recovery waits.
+
+Completed failed replay attempts now survive process restarts in synced
+per-file `.wal.recovery` sidecars, so repeated restarts cannot reset the poison
+file quarantine threshold. Cancellation and flush-barrier outages do not add
+strikes. Unreadable or unwritable attempt metadata reports an error and retains
+the WAL; quarantine still preserves its original bytes and valid checkpoints.
+The operational guide describes sidecar recovery and cleanup behavior.
+
+Recovery orders ordinary WAL files by their timestamped filenames rather than
+filesystem modification times. Altered or tied mtimes can no longer make it
+reclaim a later checkpoint file before an earlier retained data file, which
+could otherwise cause already-flushed records to be replayed on retry.
+
+Recovery skips redundant flush barriers for batches covered entirely by durable
+checkpoints. Mixed batches still fence all replayed entries, and parent
+checkpoint failures still retain files with fully covered row ranges.
+
+Forced maintenance rotation now waits for WAL queue capacity instead of
+returning `ErrWALDropped` and skipping recovery under sustained queue pressure.
+It preserves FIFO ordering and uses a cancellable wait bounded by
+`ingest.flush_timeout_seconds`. An admitted command may finish after timeout;
+the failed wait keeps recovery pending. Normal append admission is unchanged.
+
+Tracked row recovery now honors `wal.recovery_batch_size`. Durable row-range
+checkpoints let a restart skip the precise persisted portion even after a
+batch-size change; the original entry is checkpointed only after its complete
+flush barrier succeeds. This bounds callback batches, not whole-file decoding
+or total recovery memory. Legacy content-hash entries remain at-least-once.
+Before downgrading to a binary without row-range support, drain recovery with
+this version: older binaries can replay partially completed entries in full.
+See the [restart compatibility guide](docs/operations/wal-recovery.md#bounded-row-replay-and-restart-compatibility).
+
+Retained and quarantined WAL files are not reclaimed by age. The
+[WAL operations guide](docs/operations/wal-recovery.md#reclaiming-retained-and-quarantined-files)
+now documents offline inventory, verified backup, record reconciliation and
+the checkpoint-dependency gate required before an operator reclaims quarantine
+space. It includes a read-only empty-WAL check and a whole-directory relocation
+procedure for capacity shortages. A clean recovery result alone does not prove
+quarantined data is disposable.
+
+Contributed by [@jallegri](https://github.com/jallegri) in [#1118](https://github.com/Basekick-Labs/arc/pull/1118).
+
+### WAL recovery follow-ups: honest shutdown attribution, an exit for a bad checkpoint, and a directory that reclaims itself
+
+Seven findings left open when #1118 merged. None of them lost data; several had
+no operator exit.
+
+**Two metrics shipped in #1118 without being announced.**
+`arc_wal_dir_bytes` is the size of the WAL directory, sampled every 15 seconds,
+and `arc_wal_quarantined_files_total` counts files moved aside after repeated
+replay failures. The [WAL operations guide](docs/operations/wal-recovery.md)
+carries alert expressions for both.
+
+**`arc_wal_dir_bytes` now counts every file in the WAL directory**, not just
+`*.wal` and `*.failed`. The names it skipped — `.wal.recovery` attempt
+sidecars, `.wal-recovery-*` write temporaries, legacy `.wal.recovered` files —
+are exactly what accumulates when recovery is failing, which is the state its
+capacity alert exists for. **Expect a one-time step up on upgrade**, enough to
+trip a growth alert once. Legacy `.wal.recovered` files are still not reclaimed
+automatically; the guide says how to remove them.
+
+**A clean shutdown after a kept WAL file no longer reports a flush failure that
+did not happen.** A startup recovery pass that retained a file, or whose flush
+barrier failed, armed the retry through the same flag the shutdown WAL purge
+reads — so every later shutdown logged, at `Error`, "buffer flush did not
+complete cleanly on shutdown … Investigate the buffer flush errors logged
+above", pointing the operator at logs that do not exist. The WAL is still
+retained, which was always correct; the message is now a `Warn` naming the
+outstanding recovery pass. A genuine flush failure keeps the `Error`, and keeps
+it when both are true.
+
+**A row checkpoint describing rows beyond its entry no longer stalls recovery
+permanently.** It abandoned the whole pass without recording a replay attempt,
+so the quarantine threshold never advanced, the file was never moved aside, and
+every later WAL file was left unread — with no way out. It is now treated as the
+poison entry it is: the file is kept, struck, and quarantined on the third pass,
+with its bytes and checkpoints preserved. Clean files already replayed in the
+same batch are now reclaimed rather than retained alongside it.
+
+**Recovery reclaims its own residue.** Every pass now removes
+`.wal-recovery-*` temporaries left by a crash and attempt sidecars whose WAL
+file is gone — every purge path deleted the `*.wal` and left the sidecar
+behind, for the life of the node. A sidecar is kept when its WAL file merely
+cannot be stat'ted, and when a quarantined sibling exists, because it is the
+strike history those files are reconciled against.
+
+**Recovery's parent checkpoints wait for WAL queue capacity** instead of
+returning `ErrWALDropped`, the same trade the forced maintenance rotation took
+in #1118 — same pass, same queue pressure, but finalization was left on the
+dropping path. `ingest.flush_timeout_seconds` bounds **admission** to the queue;
+a timed-out or refused admission retains the file for a later pass. Once a
+checkpoint is admitted, recovery waits for it to be written: the entry is
+written either way, and abandoning the wait would skip the pending-identity
+release, pin the unflushed sequence floor, and stop the periodic purge from
+reclaiming any WAL file for the life of the process. The ingest flush path is
+unchanged and still admits without blocking.
+
+**A repaired WAL file is more likely to start a fresh attempt series.** The
+attempt sidecar now records a CRC of the file's final 64 KiB alongside its size
+and timestamp. On a filesystem with one-second timestamp granularity — some
+network mounts, which is where repairs happen — a file rewritten in place to the
+same length within one tick looked untouched and inherited its strikes. A repair
+confined to the middle of a large file still does; remove the file's
+`.wal.recovery` sidecar to reset it explicitly. The sidecar format version is
+unchanged, so an earlier binary still reads it.
+
+**New: `arc_wal_partial_row_recovery_pending`.** `1` while the last recovery
+pass retained a file for which at least one row range of a parent entry was
+replayed — the state an older binary would replay in full — and `0` once a pass
+ends with none. This makes the guide's "finish recovery before downgrading"
+checkable instead of advisory. Read it with the quarantine counter and the
+recovery error lines: a pass that cannot read a file at all reports `0` while
+that file's residue remains.
+
 ### The tiering files endpoint rejects an invalid `limit` ([#1135](https://github.com/Basekick-Labs/arc/issues/1135))
 
 `GET /api/v1/tiering/files?limit=-1` returned a 500 and logged a stack trace. The handler read the
@@ -1118,12 +1818,144 @@ fires no registration callbacks (#1071 tracks the snapshot side).
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#907](https://github.com/Basekick-Labs/arc/pull/907).
 
+### Compaction reuses local inputs and validates DuckDB paths ([#969](https://github.com/Basekick-Labs/arc/issues/969))
+
+For local storage, compaction reads Parquet inputs from their existing paths
+instead of first copying them into the compaction temporary directory. This
+removes the input-staging copy, but DuckDB still reads the inputs and compaction
+still writes and uploads its output. Reads therefore remain on the data volume;
+operators who place `compaction.temp_directory` on a separate volume should
+account for that change.
+
+The input-copy byte figure in the acceptance harness is calculated from input
+file sizes, not measured storage I/O. Arc's parent `/metrics` endpoint does not
+aggregate storage counters from compaction subprocesses, so those counters
+cannot measure compaction reads or writes. The optional large-partition run
+records cycle wall time and sampled peak temporary-directory usage; its 10 ms
+sampling interval can miss short-lived peaks.
+
+In a single same-settings comparison with 42 Parquet inputs, 1.05 million rows
+and 9,130,407 input bytes, the baseline and this change completed in 0.905 s
+and 0.894 s. Sampled temporary-directory peaks were 1,878,338 bytes and
+356,610 bytes, respectively. The harness calculates 9,130,407 baseline input
+copy bytes versus zero with local-path reuse; it does not measure total disk
+I/O. This one run does not establish a throughput improvement.
+
+An input that disappears before validation is skipped safely. If it disappears
+after validation and before DuckDB reads it, the batch fails as a permanent
+missing-input error without adaptive splitting or retries; surviving inputs
+remain in storage for the next cycle to rediscover. A permanent failure is now
+recognised in either the subprocess stderr or the parent error, rather than only
+in stderr, so such a batch stops immediately instead of spending its full retry
+budget.
+
+Because DuckDB reads a `read_parquet()` path as a pattern, a path containing a
+glob metacharacter could resolve to a different file than the one Arc named and
+validated. Such a path now **fails the compaction job** rather than skipping the
+file, and the two operator-set directories that reach `read_parquet` are
+refused at startup instead — see the upgrade note at the top of these notes. A
+skipped file would have failed identically on every later cycle, so compaction
+would never have progressed while every metric showed jobs completing.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#990](https://github.com/Basekick-Labs/arc/pull/990).
+
+#### The output side (maintainer follow-up, not part of #990)
+
+Everything above is the input half of #969. The **output** side no longer copies
+either. On a local backend a compacted file is moved into the storage root rather
+than copied into it, so publishing the output costs a rename instead of a full
+read plus a full write of the file.
+
+Two conditions apply, and both are ordinary configuration rather than edge
+cases:
+
+- **The backend has to be local.** On S3 and Azure the upload is a network
+  transfer and nothing changes.
+- **`compaction.temp_directory` has to be on the same filesystem as
+  `storage.local_path`.** They are independently configurable and pointing the
+  temporary directory at a larger or faster volume is the reason the key exists.
+  When they are on different filesystems the rename is impossible and Arc copies
+  exactly as before, logging one warning per job that names both paths. If you
+  see that warning and want the saving, co-locate the two paths.
+
+Do **not** put `compaction.temp_directory` inside `storage.local_path` to
+satisfy that condition. Everything under the storage root is treated as storage:
+the job temporary directory is listed as a database by `SHOW DATABASES`, and a
+backup of the instance sweeps it, so a half-written compaction output can end up
+in a backup. An ordinary query is not affected -- it globs
+`<database>/<measurement>/**/*.parquet`, which a job directory at another top
+level does not match. Use a sibling directory on the same filesystem, which is
+what the defaults (`./data/arc` and `./data/compaction`) already are.
+
+In clustered deployments the output is still read once more, to compute the
+SHA-256 the completion manifest publishes and peers verify their pulled bytes
+against. That digest is now taken before the output is published rather than
+after, because a moved file is no longer there to read. So on a cluster this
+removes one of two passes over the output, not both; a single node writes no
+completion manifest and skips the digest entirely.
+
+`arc_storage_write_bytes_total` counts a moved file exactly as it counted a
+copied one, so the counter is unchanged by this work and is not where the saving
+shows up.
+
 ## Internal changes
 
 These do not change how Arc behaves. They are here because the codebase is the
 thing a new maintainer has to learn, and a refactor that moves a decision from
 four places to one is worth knowing about before you go looking for it in the
 old place.
+
+### `PurgeFlushed` and WAL recovery are now driven by the same test
+
+No test in `internal/wal` ran the writer's sequence-floor purge and a recovery
+pass together, and that interaction is where the row-range proof hazard lives: a
+flush writes a row-range checkpoint into the current file while the entries it
+describes sit in an earlier file recovery retained. A retained file from a
+previous process is not in the writer's own file order, so the purge walk never
+sees it and never stops at it — and the file carrying its only proof is an
+ordinary candidate. Deleting that proof makes the next pass replay rows already
+in storage.
+
+The #1118 fix-up pinned the proof file; nothing pinned the pin.
+`purge_recovery_interaction_test.go` now drives both, and fails if the
+`foreignProof` guard is removed. A companion test takes the inverse direction —
+full coverage replays nothing and reclaims both files — so the first cannot pass
+for the wrong reason.
+
+Two tests were also weaker than their names.
+`TestDirectoryBytesIncludesWALAndQuarantinedFiles` pinned the suffix exclusion
+for arbitrary non-WAL names but had no recovery-artifact fixture, which is the
+exclusion that mattered; it now covers sidecars, write temporaries and legacy
+`.recovered` files, and is named for what it asserts.
+`TestRecoveryAttemptMetadataFailureKeepsWAL`'s `directory` case read as
+unwritable-metadata coverage while only exercising the read path — `os.ReadFile`
+rejects a directory before the write is reached — and is renamed accordingly.
+Those cases also pin that a malformed sidecar still stalls a pass, which is
+deliberate and now says so: the error names the file and removing the sidecar
+clears it, where a bad checkpoint lives inside WAL bytes an operator cannot edit.
+
+### A quarantine test waited on the counter, not the bookkeeping it asserts ([#1146](https://github.com/Basekick-Labs/arc/issues/1146))
+
+`TestPullerQuarantineKeepsTheQueryGateClosed` reddened `Build & Test`
+intermittently with `catchupInflight = 1, want 0`. Nothing was wrong with the
+puller. `totalInvalidPath` is incremented inside `processEntryOnce`, while the
+in-flight bookkeeping the test asserts is released by that function's deferred
+`finishEntry` — so a wait predicate watching only the counter can return in
+between, and the assertion reads the pre-drain state.
+
+This is [#972](https://github.com/Basekick-Labs/arc/issues/972) a second time.
+That issue diagnosed the identical mechanism in
+`TestPullerQuarantineIsIdempotentAcrossReenqueues` and fixed it by adding
+`inflight_count == 0` to that test's wait; the two sibling tests in the same
+file that share the window were never updated. Both now gate on the
+bookkeeping, and `TestPullerQuarantinesUnusableKeyWithoutTouchingPeers` needed
+it too — its shared-metric assertion sat in the same gap, three statements wide.
+
+The assertions keep their teeth: `waitStats` returns the last snapshot on
+timeout rather than failing, so removing the real drain in `finishEntry` still
+fails both tests on the full deadline. Verified, along with the mechanism, by
+temporarily widening the window — a 300 ms sleep after the counter increment
+fails both tests 10/10 before the change and 0/10 after.
 
 ### Cold files are a third object set, not merged into the hot one ([#1086](https://github.com/Basekick-Labs/arc/issues/1086))
 
@@ -1194,6 +2026,10 @@ runs. And the restore writes one row per cold file **synchronously** — the
 asynchronous tier-event path cannot be used, since its handler stats the hot
 backend and its upsert is guarded to hot rows — so a large cold restore is one
 fsync per file. Batching those writes is the obvious next improvement.
+
+### Immutable DELETE rewrite filenames are normalized centrally
+
+Partial DELETEs use the `_rewrite_<unixnano>.parquet` naming convention. The suffix parser now lives in `internal/storage` and is shared by DELETE, compaction, tiering and file-time pruning, so rewritten daily and compacted files retain their logical classification and timestamps.
 
 ### The cold-file marker's shape ([#1085](https://github.com/Basekick-Labs/arc/issues/1085))
 
@@ -1688,16 +2524,99 @@ transaction in `internal/tiering`:
 The cold-tier metadata sync keeps its per-file writes: it records rows it
 discovers one at a time as it walks a listing, and is not a burst.
 
-One pre-existing hazard this makes longer-lived, and worth knowing before
-restoring onto a node whose cold tier is **configured but disabled**: a
-cold-carried file restored into hot storage keeps a row saying cold, with a
-recent `migrated_at`, until the batch flushes. That is what
-`ReconcileOrphanedFiles` looks for, and that sweep is not gated on
-`tiered_storage.cold.enabled` (only migration is), nor is the
-`GetBackendForTier` lookup it verifies the cold copy through. So it can delete
-the hot copy the restore just wrote, and the forced-hot row then lands for a
-file that is gone. The window used to be microseconds and is now up to the rest
-of the restore. The defect is the ungated sweep rather than the batching — with
-cold disabled it deletes hot copies whose cold objects the query path will not
-read, restore or no restore — so it is filed as #1143; until that is fixed, run
-such a restore with tiering stopped.
+**Correction to the paragraph that shipped with the batching change above.**
+It said a cold-carried file restored into hot storage could have that hot copy
+deleted by orphan reconciliation while its forced-hot row was still pending,
+on a node whose cold tier is *configured but disabled*, and advised running
+such a restore with tiering stopped. That was wrong, and the advice is
+withdrawn. The fallback branch is reached only when this node has no usable
+cold backend, and a disabled cold tier has no backend **object** either —
+`cmd/arc/main.go` constructs one only inside `if cold.Enabled`, nothing
+assigns the flag after configuration load, and there is no reload. The sweep
+therefore has nothing to verify a cold copy against and keeps the hot file,
+which is what it already did. No window existed to widen.
+
+**Orphan reconciliation is gated on `tiered_storage.cold.enabled`, and the
+cold accessors no longer disagree** (#1143). Two related pieces of tidying,
+neither of which changes what a correctly configured node does:
+
+- A node with tiering on and cold off ran the orphan sweep and the manifest
+  sweep every migration cycle, and the orphan sweep logged an **error and
+  counted a failure for every ORPHAN it examined, every cycle** — every cold
+  row in its 48-hour window whose hot copy is still present — for work it
+  could never do, since it needs a cold copy to verify and there is no cold
+  backend to verify against. A cold row whose hot copy is gone costs one
+  silent existence check and was never the problem. Both sweeps are now
+  skipped on such a node, so the cycle is quiet and its error count is honest.
+  For the manifest sweep the skip is a pure no-op: it already returned
+  immediately on a nil cold backend.
+
+  Two smaller operator-visible consequences of skipping, rather than letting
+  the sweep run into its keep-everything branch. The orphan sweep also marks a
+  permanently unusable storage key as quarantined, and it does that *before*
+  it looks at the cold tier — so on a cold-disabled node that mark is now
+  deferred until cold comes back, and since the rows age out of the 48-hour
+  window meanwhile, in practice it is not taken. That is harmless while the
+  sweep is not running, because the mark exists to stop the sweep retrying
+  that key. And the per-orphan error was incidentally the only line saying
+  such a node holds a hot copy under a cold row; a skipped cycle now says so
+  once, at debug level, instead of once per orphan at error level.
+- `GetBackendForTier(TierCold)` now ANDs `cold.enabled`, as `ColdBackend()`
+  already did, and both answer through one predicate alongside the migration
+  gate, the tier stats, the cold-metadata sync and the query glob. The old
+  split was documented as deliberate, with a doc comment asserting that every
+  other consumer paired the two checks itself — the orphan sweep did not,
+  which is how this was found. Nothing reachable depended on the difference,
+  because a disabled cold tier has no backend to return; enforcing it in one
+  place means a future change that constructs the backend unconditionally
+  cannot turn that latent inconsistency into a live one.
+
+One claim worth not making: the "no usable cold tier" startup warning on a
+replicating local-storage node is unchanged by this. It keys off
+`GetBackendForTier(TierCold) != nil`, and with cold disabled that was already
+nil before this change, so the warning was already firing. Nothing at that
+call site behaves differently in any reachable configuration.
+
+### `storage.FileAdopter`, and what a compaction-manifest failure does not retry into
+
+`storage.FileAdopter` is a new optional backend interface, in the shape of the
+existing `BatchDeleter`: a backend whose objects really are local files can
+implement `AdoptFile` and take ownership of a file the caller has already
+written, instead of copying it through `WriteReader`. `LocalBackend` implements
+it; `S3Backend` and `AzureBlobBackend` deliberately do not, and a test asserts
+they never will, because the contract **consumes the caller's file** and a
+backend that copies bytes cannot honour that.
+
+`ErrAdoptUnsupported` means "this pair of paths cannot be adopted, copy
+instead" and is not a failure. `AdoptFile` returns it for **any** rename the
+filesystem refuses, not only a cross-device one, and also when the source
+filesystem will not let Arc set the file mode. The reason is the same in both
+cases: before this change the copy was unconditional, so a filesystem that
+refuses either operation would go from "compacts, slowly" to "compaction fails
+every cycle". Falling back is safe for any rename error, because a rename is
+atomic — a failed one moved nothing, and the source the fallback reads is still
+there. Only a caller error (a key that escapes the storage root, a source that
+is not a regular file) is a hard failure, and both are rejected before the
+rename.
+
+The `chmod` is what keeps a moved object at mode `0600`, the same mode
+`WriteReader` gives every other local object; a rename otherwise preserves
+whatever mode DuckDB wrote the output under, which is umask-derived. It runs
+before the rename, so a refused adopt can leave the source file at `0600` — the
+contract on `ErrAdoptUnsupported` says so, since it promises only that nothing
+was moved.
+
+Unlike `WriteReader`, `AdoptFile` does not stage through a `.part` name. That
+name exists so an interrupted *copy* leaves resumable bytes on disk, and a
+rename has no partial state — so renaming straight to the final path is
+strictly stronger: there is no window in which a reader can observe a short
+object.
+
+Separately, a comment in `internal/compaction/job.go` claimed that failing a job
+on a completion-manifest write error means the next cycle retries and the
+cluster eventually sees the output. It does not, and the comment now says so.
+Recovery finds the output present with a matching size, deletes the inputs and
+deletes the compaction manifest without ever writing a completion manifest, so
+the Raft `RegisterFile` never fires and the compacted file ends up with no
+manifest entry describing it. Only the comment changed here; the recovery gap
+is tracked in [#1155](https://github.com/Basekick-Labs/arc/issues/1155).

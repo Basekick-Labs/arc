@@ -41,8 +41,8 @@ import (
 // (tiering tier_files in OSS, Raft manifest in cluster). PhysicalPath is the fully-qualified
 // location iceberg-go reads (file://… local, s3://bucket/prefix/… cold). SizeBytes is the
 // file's current size on storage; together with the path it is the reconcile key, because a
-// file rewritten in place keeps its path (the delete API's partial-match branch, #633) and
-// only the size distinguishes the new content from the manifest entry registered for the old.
+// delete rewrite now publishes a new immutable path, while a backup restore can still replace
+// the bytes represented by a live path.
 type FileRef struct {
 	PhysicalPath string
 	SizeBytes    int64
@@ -546,17 +546,19 @@ func (e *Exporter) ReconcileMeasurement(ctx context.Context, database, measureme
 	return err
 }
 
-// ReconcileMeasurementWithHint is ReconcileMeasurement plus whether the reader
-// discovery files (version-hint.text, v<N>.metadata.json) were published.
+// ReconcileMeasurementWithHint is ReconcileMeasurement plus whether the pass fully
+// SETTLED: the reader discovery files (version-hint.text, v<N>.metadata.json) were
+// published, AND any snapshot-history floor this pass owed actually committed.
 //
-// The scheduler needs this separately from the error: those writes are
-// best-effort with respect to the committed snapshot, but if they fail the
-// caller must NOT cache the measurement's fingerprint, or a file set that then
-// goes quiet is never revisited and the hint stays stale forever.
+// The scheduler needs this separately from the error. Both steps are best-effort with
+// respect to the committed snapshot, but if either fails the caller must NOT cache the
+// measurement's fingerprint, or a file set that then goes quiet is never revisited: the
+// hint would stay stale forever, and metadata that names deleted data files would stay
+// published (#1092).
 //
-// hintOK is true when the discovery files are current, including the case where
-// there was nothing to publish.
-func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, measurement string, sc ArcSchema, current []FileRef) (hintOK bool, err error) {
+// The return is true when there was nothing to do for either step, which is the ordinary
+// converged case.
+func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, measurement string, sc ArcSchema, current []FileRef) (settled bool, err error) {
 	// EnsureTable publishes the discovery files itself when it creates or evolves
 	// the table, so start from whether those writes succeeded. Otherwise a
 	// creation-time failure would be invisible here and the fingerprint would be
@@ -566,7 +568,7 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 	if err != nil {
 		return false, err
 	}
-	hintOK = !e.hintFailed()
+	hintOK := !e.hintFailed()
 
 	want := make(map[string]int64, len(current))
 	for _, f := range current {
@@ -578,8 +580,8 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 	}
 
 	// The diff key is (path, size). A path on both sides with a different size is a file
-	// rewritten in place — the delete API's partial-match branch renames a smaller file over
-	// the original (#633). The manifest entry still describes the old content (record_count,
+	// whose bytes changed without changing its path — for example, a backup restore replacing
+	// an existing object. The manifest entry still describes the old content (record_count,
 	// file_size_in_bytes, column bounds), so external engines keep counting deleted rows and
 	// can mis-plan reads against the shorter file. Such a path is dropped and re-registered
 	// in the same commit.
@@ -638,10 +640,21 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 			Int("skipped", len(skipped)).Strs("files", skipped).
 			Msg("Iceberg: skipped files that could not be partition-mapped (day-straddling time range)")
 	}
-	// Expire old snapshots (+ orphaned manifests/data) so snapshot history and metadata don't
-	// grow unbounded. Best-effort — a failure here doesn't undo the successful reconcile; the
-	// next pass retries. Returns the possibly-newer table so version-hint points at it.
-	committed = e.expireSnapshots(ctx, committed, database, measurement)
+	// Expire old snapshots so snapshot history and metadata don't grow unbounded, and floor
+	// history to the current snapshot when this pass removed any path. A removed path is one
+	// Arc already deleted from the primary backend, so every older snapshot names a file that
+	// is gone and time travel to it fails on the read (#1092). Flooring does not lose
+	// readable history: it drops snapshots that were already unreadable.
+	//
+	// toRemove, not toRemove-minus-rewritten, is the trigger. A rewritten path is in both
+	// lists and still present in storage, but with different bytes, so the older snapshots'
+	// record_count and bounds describe content that no longer exists there — the original
+	// #1092 symptom.
+	//
+	// Best-effort for the retention case: a failure doesn't undo the successful reconcile, and
+	// the next pass retries. NOT best-effort for the floor — see the expireOK handling below,
+	// because only a pass that removes something asks to floor, so there may be no next pass.
+	committed, expireOK := e.expireSnapshots(ctx, committed, database, measurement, expireModeFor(len(toRemove)))
 	hintOK = e.writeVersionHint(ctx, committed) && !e.hintFailed()
 	e.pruneOldVersionFiles(ctx, committed)
 	// After pruneOldVersionFiles, so the on-disk metadata set the sweep reads for
@@ -652,8 +665,24 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 		Int("added", len(toAdd)-len(rewritten)).Int("removed", len(toRemove)-len(rewritten)).
 		Int("reregistered", len(rewritten)).
 		Bool("hint_published", hintOK).
+		Bool("history_settled", expireOK).
 		Msg("Reconciled Iceberg table")
-	return hintOK, nil
+	// A failed floor must not be cached as settled. The scheduler keys its skip gate on the
+	// value returned here, and only a pass that REMOVES a path asks to floor — so unlike the
+	// ordinary retention case there is no guarantee of a next pass to retry on: once the file
+	// set goes quiet the measurement is skipped entirely, leaving metadata that names deleted
+	// files. Reporting not-settled keeps the fingerprint uncached so the next tick re-drives
+	// this measurement, exactly as hintOK already does for a failed version hint.
+	return hintOK && expireOK, nil
+}
+
+// expireModeFor maps a pass's removal count onto the expiry mode. Separate so the tests can
+// pin the mapping without driving a whole reconcile.
+func expireModeFor(removed int) expireMode {
+	if removed > 0 {
+		return floorHistory
+	}
+	return retainConfigured
 }
 
 // replaceDataFilesResilient applies the reconcile diff in ONE commit. The ordinary pass is a
@@ -1021,13 +1050,38 @@ func isPartitionInferenceError(err error) bool {
 // expireSnapshots keeps the last `retain` snapshots for the table (0 = keep all → no-op),
 // deleting older snapshots and their orphaned manifests/data files. Best-effort: on any
 // failure it logs and returns the input table unchanged.
-func (e *Exporter) expireSnapshots(ctx context.Context, tbl *icetable.Table, database, measurement string) *icetable.Table {
+// floorHistory asks expireSnapshots to keep ONLY the snapshot this pass committed,
+// overriding iceberg.retain_snapshots. The caller passes it when the pass removed any
+// path, because such a path is gone from the primary backend and every older snapshot
+// still names it (#1092).
+type expireMode bool
+
+const (
+	retainConfigured expireMode = false
+	floorHistory     expireMode = true
+)
+
+// expireSnapshots trims snapshot history. It returns the possibly-newer table and
+// whether the trim it was asked for actually landed; a caller that asked to floor and
+// got false must not treat the pass as settled (see ReconcileMeasurementWithHint).
+//
+// mode is load-bearing for BOTH gates below, not just the iceberg-go call. The
+// pointless-commit guard compares against the SAME effective value: checking a floor
+// flag after a guard that still read e.retain would make the floor a no-op in the
+// default configuration, since retain_snapshots is 10 and a table with 10 or fewer
+// snapshots returns early. The reproducing table in #1092 had three.
+func (e *Exporter) expireSnapshots(ctx context.Context, tbl *icetable.Table, database, measurement string, mode expireMode) (*icetable.Table, bool) {
 	if e.retain <= 0 {
-		return tbl
+		return tbl, true
 	}
+	effective := e.retain
+	if mode == floorHistory {
+		effective = 1
+	}
+	before := len(tbl.Metadata().Snapshots())
 	// Only expire when there's more history than we intend to keep, to avoid pointless commits.
-	if snaps := tbl.Metadata().Snapshots(); len(snaps) <= e.retain {
-		return tbl
+	if before <= effective {
+		return tbl, true
 	}
 	txn := tbl.NewTransaction()
 	// WithRetainLast is a FLOOR, not a cap: iceberg-go only expires a snapshot when it is BOTH
@@ -1058,24 +1112,42 @@ func (e *Exporter) expireSnapshots(ctx context.Context, tbl *icetable.Table, dat
 	// longer referenced. pruneOldVersionFiles already bounds the v<N>.metadata.json
 	// copies; the rest is one manifest list plus one small manifest per commit — except
 	// a commit that re-registered rewritten paths, which leaves a merged manifest the
-	// size of the table's live file list behind (see manifestMergeOn). Nothing reclaims
-	// those files today.
+	// size of the table's live file list behind (see manifestMergeOn). sweepOrphanMetadata
+	// (#835, on by default) reclaims those, bounded by the reachability rule it documents:
+	// every .avro any on-disk metadata.json can still resolve has to survive.
+	//
+	// No ref-level retention is set anywhere in Arc, so WithRetainLast is what decides:
+	// iceberg-go resolves cmp.Or(ref.MinSnapshotsToKeep, option, property) and only the
+	// option is populated here.
 	if err := txn.ExpireSnapshots(
-		icetable.WithRetainLast(e.retain),
+		icetable.WithRetainLast(effective),
 		icetable.WithOlderThan(0),
 		icetable.WithPostCommit(false),
 	); err != nil {
 		e.logger.Error().Err(err).Str("database", database).Str("measurement", measurement).
+			Bool("floor_history", mode == floorHistory).
 			Msg("Iceberg ExpireSnapshots failed (non-fatal) — snapshot history grows until it recovers")
-		return tbl
+		return tbl, false
 	}
 	expired, err := txn.Commit(ctx)
 	if err != nil {
 		e.logger.Error().Err(err).Str("database", database).Str("measurement", measurement).
+			Bool("floor_history", mode == floorHistory).
 			Msg("Iceberg ExpireSnapshots commit failed (non-fatal) — snapshot history grows until it recovers")
-		return tbl
+		return tbl, false
 	}
-	return expired
+	// Report dropped history only when the floor is what dropped it AND snapshots
+	// actually went away. Gating on the mode alone would warn on a pass that expired
+	// nothing — most visibly at retain_snapshots=1, where the floor equals the
+	// configured value and this function is doing its ordinary job.
+	if after := len(expired.Metadata().Snapshots()); mode == floorHistory && effective < e.retain && after < before {
+		e.logger.Warn().
+			Str("database", database).Str("measurement", measurement).
+			Int("snapshots_before", before).Int("snapshots_after", after).
+			Int("retain_snapshots", e.retain).
+			Msg("Iceberg snapshot history floored to the current snapshot: this pass removed data files from the table, and Arc had already deleted them from storage, so every older snapshot referenced files that are gone. Time travel to them would have failed on the read. Arc does not support Iceberg time travel across compaction, retention or a partial DELETE")
+	}
+	return expired, true
 }
 
 // pruneOldVersionFiles keeps only the newest `retain` v<M>.metadata.json copies and deletes

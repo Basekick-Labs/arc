@@ -159,6 +159,12 @@ type Metrics struct {
 	walDroppedEntries    atomic.Int64 // Entries dropped due to full WAL buffer
 	walFailedWrites      atomic.Int64 // Write failures to WAL file
 	walOversizedPayloads atomic.Int64 // Payloads rejected for exceeding the single-entry cap even after chunking (#677)
+	walDirectoryBytes    atomic.Int64 // Current bytes occupied by every file in the WAL directory
+	walQuarantinedFiles  atomic.Int64 // WAL files isolated after repeated recovery failures
+	// 1 while the last recovery pass left a file on disk for which at least one
+	// row range of a parent entry was handed off — the state an older binary
+	// would replay in full.
+	walPartialRowRecovery atomic.Int64
 
 	// NOTE: no decompression-pool discard counter here (#817). The pooled
 	// codecs it belonged to were replaced by decompressGzipPooled /
@@ -555,6 +561,21 @@ func (m *Metrics) IncWALRecoveryRecords(count int64)  { m.walRecoveryRecords.Add
 func (m *Metrics) IncWALDroppedEntries()              { m.walDroppedEntries.Add(1) }
 func (m *Metrics) IncWALFailedWrites()                { m.walFailedWrites.Add(1) }
 func (m *Metrics) IncWALOversizedPayloads()           { m.walOversizedPayloads.Add(1) }
+func (m *Metrics) SetWALDirectoryBytes(bytes int64)   { m.walDirectoryBytes.Store(bytes) }
+func (m *Metrics) IncWALQuarantinedFiles()            { m.walQuarantinedFiles.Add(1) }
+
+// SetWALPartialRowRecoveryPending records whether the last WAL recovery pass
+// retained a file whose parent entry had row ranges replayed. It makes the
+// operations
+// guide's "drain recovery with this version before downgrading" checkable
+// rather than aspirational.
+func (m *Metrics) SetWALPartialRowRecoveryPending(pending bool) {
+	value := int64(0)
+	if pending {
+		value = 1
+	}
+	m.walPartialRowRecovery.Store(value)
+}
 
 // Decompression Pool Metrics
 
@@ -785,12 +806,15 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"mqtt_reconnects":        m.mqttReconnects.Load(),
 
 		// WAL
-		"wal_records_preserved":  m.walRecordsPreserved.Load(),
-		"wal_recovery_total":     m.walRecoveryTotal.Load(),
-		"wal_recovery_records":   m.walRecoveryRecords.Load(),
-		"wal_dropped_entries":    m.walDroppedEntries.Load(),
-		"wal_failed_writes":      m.walFailedWrites.Load(),
-		"wal_oversized_payloads": m.walOversizedPayloads.Load(),
+		"wal_records_preserved":            m.walRecordsPreserved.Load(),
+		"wal_recovery_total":               m.walRecoveryTotal.Load(),
+		"wal_recovery_records":             m.walRecoveryRecords.Load(),
+		"wal_dropped_entries":              m.walDroppedEntries.Load(),
+		"wal_failed_writes":                m.walFailedWrites.Load(),
+		"wal_oversized_payloads":           m.walOversizedPayloads.Load(),
+		"wal_directory_bytes":              m.walDirectoryBytes.Load(),
+		"wal_quarantined_files":            m.walQuarantinedFiles.Load(),
+		"wal_partial_row_recovery_pending": m.walPartialRowRecovery.Load(),
 
 		// Decompression Pool
 
@@ -1186,6 +1210,18 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_oversized_payloads_total Payloads rejected for exceeding the single-entry cap even after chunking\n"...)
 	b = append(b, "# TYPE arc_wal_oversized_payloads_total counter\n"...)
 	b = appendMetric(b, "arc_wal_oversized_payloads_total", float64(m.walOversizedPayloads.Load()))
+
+	b = append(b, "# HELP arc_wal_dir_bytes Current bytes occupied by every file in the WAL directory\n"...)
+	b = append(b, "# TYPE arc_wal_dir_bytes gauge\n"...)
+	b = appendMetric(b, "arc_wal_dir_bytes", float64(m.walDirectoryBytes.Load()))
+
+	b = append(b, "# HELP arc_wal_quarantined_files_total WAL files isolated after repeated recovery failures\n"...)
+	b = append(b, "# TYPE arc_wal_quarantined_files_total counter\n"...)
+	b = appendMetric(b, "arc_wal_quarantined_files_total", float64(m.walQuarantinedFiles.Load()))
+
+	b = append(b, "# HELP arc_wal_partial_row_recovery_pending 1 when the last WAL recovery pass left a retained file whose parent entry had row ranges replayed\n"...)
+	b = append(b, "# TYPE arc_wal_partial_row_recovery_pending gauge\n"...)
+	b = appendMetric(b, "arc_wal_partial_row_recovery_pending", float64(m.walPartialRowRecovery.Load()))
 
 	// Governance metrics
 	b = append(b, "# HELP arc_governance_rate_limited_total Queries rejected by rate limiting\n"...)
