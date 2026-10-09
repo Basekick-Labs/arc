@@ -65,11 +65,11 @@ func TestGetSortKeys(t *testing.T) {
 			wantKeys:        []string{"tag_bar", "time"},
 		},
 		{
-			name:            "default without time gets time appended",
+			name:            "default without time appends descending time",
 			measurement:     "custom",
 			sortKeysConfig:  map[string][]string{},
 			defaultSortKeys: []string{"tag_device"},
-			wantKeys:        []string{"tag_device", "time"},
+			wantKeys:        []string{"tag_device", "time:desc"},
 		},
 		{
 			name:            "measurement keys inherit descending time default",
