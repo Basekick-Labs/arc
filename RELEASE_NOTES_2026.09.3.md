@@ -991,6 +991,16 @@ well-formed database directory is affected.
 Creating a continuous query requires an admin token, so this was a
 data-integrity bug rather than a vulnerability: no permission check was bypassed
 and no path escaped the storage root.
+
+### Database APIs no longer expose or delete Arc-reserved storage roots ([#1012](https://github.com/Basekick-Labs/arc/issues/1012))
+
+The per-database measurements endpoint now treats Arc's reserved storage roots,
+such as `_schema` and `_compaction_state`, as not found. When database deletion
+is enabled, confirmed DELETE requests for these roots are refused, preserving
+field-schema anchors and compaction state.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1032](https://github.com/Basekick-Labs/arc/pull/1032).
+
 ### A graceful shutdown no longer abandons flushes, and a flush timeout no longer starts before a worker picks the task up ([#1006](https://github.com/Basekick-Labs/arc/issues/1006), [#1007](https://github.com/Basekick-Labs/arc/issues/1007))
 
 Two ways an acknowledged write could reach no storage at all.
