@@ -17,6 +17,7 @@ import (
 	"github.com/basekick-labs/arc/internal/license"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/gofiber/fiber/v2"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog"
@@ -43,12 +44,13 @@ type RetentionHandler struct {
 	// ownsDB records whether this handler opened db itself. When retention
 	// shares the auth database (the default), the handle is borrowed and Close
 	// must leave it to its owner.
-	ownsDB        bool
-	duckdb        *database.DuckDB     // Shared DuckDB for parquet queries
-	coordinator   RetentionCoordinator // nil in standalone mode
-	licenseClient *license.Client      // nil when auth/licensing is disabled
-	authManager   *auth.AuthManager
-	logger        zerolog.Logger
+	ownsDB         bool
+	duckdb         *database.DuckDB     // Shared DuckDB for parquet queries
+	coordinator    RetentionCoordinator // nil in standalone mode
+	tieringManager *tiering.Manager     // optional cold-tier retention
+	licenseClient  *license.Client      // nil when auth/licensing is disabled
+	authManager    *auth.AuthManager
+	logger         zerolog.Logger
 }
 
 // RetentionPolicy represents a retention policy
@@ -230,6 +232,11 @@ func (h *RetentionHandler) warnUnusablePolicies() {
 // Called after construction when cluster mode is enabled.
 func (h *RetentionHandler) SetCoordinator(c RetentionCoordinator) {
 	h.coordinator = c
+}
+
+// SetTieringManager wires cold-tier metadata and storage into retention.
+func (h *RetentionHandler) SetTieringManager(m *tiering.Manager) {
+	h.tieringManager = m
 }
 
 // initTables creates the retention policy tables
@@ -535,7 +542,30 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 	if err != nil {
 		return nil, fmt.Errorf("failed to discover measurements: %w", err)
 	}
-	measurements := discovery.measurements
+	measurements := append([]string(nil), discovery.measurements...)
+
+	// Cold-only measurements are invisible to the hot storage listing. Add
+	// metadata candidates here so retention applies even after every hot copy
+	// has migrated to cold storage (#168).
+	if h.tieringManager != nil {
+		coldFiles, coldErr := h.tieringManager.GetColdFilesForRetention(ctx, policy.Database, "", cutoffDate)
+		if coldErr != nil {
+			return nil, fmt.Errorf("failed to discover cold-tier files: %w", coldErr)
+		}
+		seen := make(map[string]struct{}, len(measurements))
+		for _, measurement := range measurements {
+			seen[measurement] = struct{}{}
+		}
+		for _, file := range coldFiles {
+			if policy.Measurement != nil && *policy.Measurement != "" && file.Measurement != *policy.Measurement {
+				continue
+			}
+			if _, ok := seen[file.Measurement]; !ok {
+				seen[file.Measurement] = struct{}{}
+				measurements = append(measurements, file.Measurement)
+			}
+		}
+	}
 
 	h.logger.Info().Strs("measurements", measurements).Msg("Processing measurements")
 
@@ -563,6 +593,19 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 				h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), err.Error())
 			}
 			return nil, fmt.Errorf("retention aborted for policy %d: %w", policyID, err)
+		}
+
+		if h.tieringManager != nil {
+			coldDeleted, coldFiles, coldErr := h.deleteOldColdFiles(ctx, policy.Database, measurement, cutoffDate, false)
+			totalDeleted += coldDeleted
+			totalFilesDeleted += coldFiles
+			if coldErr != nil {
+				h.logger.Error().Err(coldErr).Str("measurement", measurement).Msg("Failed to process cold-tier retention")
+				if executionID > 0 {
+					h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), coldErr.Error())
+				}
+				return nil, fmt.Errorf("cold-tier retention aborted for policy %d: %w", policyID, coldErr)
+			}
 		}
 	}
 	totalSkipped += discovery.unusable.orphans
@@ -708,7 +751,28 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 			"error": "Failed to discover measurements: " + err.Error(),
 		})
 	}
-	measurements := discovery.measurements
+	measurements := append([]string(nil), discovery.measurements...)
+	if h.tieringManager != nil {
+		coldFiles, coldErr := h.tieringManager.GetColdFilesForRetention(c.Context(), policy.Database, "", cutoffDate)
+		if coldErr != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to discover cold-tier files: " + coldErr.Error(),
+			})
+		}
+		seen := make(map[string]struct{}, len(measurements))
+		for _, measurement := range measurements {
+			seen[measurement] = struct{}{}
+		}
+		for _, file := range coldFiles {
+			if policy.Measurement != nil && *policy.Measurement != "" && file.Measurement != *policy.Measurement {
+				continue
+			}
+			if _, ok := seen[file.Measurement]; !ok {
+				seen[file.Measurement] = struct{}{}
+				measurements = append(measurements, file.Measurement)
+			}
+		}
+	}
 
 	h.logger.Info().Strs("measurements", measurements).Msg("Processing measurements")
 
@@ -737,6 +801,19 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"error": fmt.Sprintf("retention aborted at measurement %q: %s", measurement, err.Error()),
 			})
+		}
+		if h.tieringManager != nil {
+			coldDeleted, coldFiles, coldErr := h.deleteOldColdFiles(c.Context(), policy.Database, measurement, cutoffDate, req.DryRun)
+			totalDeleted += coldDeleted
+			totalFilesDeleted += coldFiles
+			if coldErr != nil {
+				if !req.DryRun && executionID > 0 {
+					h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), coldErr.Error())
+				}
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+					"error": fmt.Sprintf("cold-tier retention aborted at measurement %q: %s", measurement, coldErr.Error()),
+				})
+			}
 		}
 	}
 	totalSkipped += discovery.unusable.orphans
@@ -1161,6 +1238,56 @@ func readParquetPath(backend storage.Backend, key string) (string, error) {
 }
 
 // getFileMaxTimeAndRowCount reads a Parquet file to get max time and row count
+func (h *RetentionHandler) deleteOldColdFiles(ctx context.Context, database, measurement string, cutoffDate time.Time, dryRun bool) (int64, int, error) {
+	if h.tieringManager == nil {
+		return 0, 0, nil
+	}
+	coldBackend := h.tieringManager.GetBackendForTier(tiering.TierCold)
+	if coldBackend == nil {
+		return 0, 0, fmt.Errorf("cold tier backend is not configured")
+	}
+	files, err := h.tieringManager.GetColdFilesForRetention(ctx, database, measurement, cutoffDate)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to list cold-tier retention candidates: %w", err)
+	}
+
+	var deletedRows int64
+	var deletedFiles int
+	for _, file := range files {
+		fullPath, err := readParquetPath(coldBackend, file.Path)
+		if err != nil {
+			h.logger.Warn().Err(err).Str("file", file.Path).Msg("Failed to resolve cold-tier file for retention")
+			continue
+		}
+		maxTime, rowCount, err := h.getFileMaxTimeAndRowCount(ctx, fullPath)
+		if err != nil {
+			h.logger.Warn().Err(err).Str("file", file.Path).Msg("Failed to read cold-tier file metadata")
+			continue
+		}
+		if !maxTime.Before(cutoffDate) {
+			continue
+		}
+
+		h.logger.Info().Str("file", filepath.Base(file.Path)).Str("tier", string(tiering.TierCold)).
+			Time("max_time", maxTime).Int64("rows", rowCount).Bool("dry_run", dryRun).
+			Msg("Cold-tier file eligible for deletion")
+		if dryRun {
+			deletedRows += rowCount
+			deletedFiles++
+			continue
+		}
+		if err := coldBackend.Delete(ctx, file.Path); err != nil {
+			return deletedRows, deletedFiles, fmt.Errorf("failed to delete cold-tier file %q: %w", file.Path, err)
+		}
+		if err := h.tieringManager.DeleteFile(ctx, file.Path); err != nil {
+			return deletedRows, deletedFiles, fmt.Errorf("failed to remove cold-tier metadata for %q: %w", file.Path, err)
+		}
+		deletedRows += rowCount
+		deletedFiles++
+	}
+	return deletedRows, deletedFiles, nil
+}
+
 func (h *RetentionHandler) getFileMaxTimeAndRowCount(ctx context.Context, filePath string) (time.Time, int64, error) {
 	// Use the shared DuckDB connection to avoid memory retention from temporary connections
 	db := h.duckdb.DB()
