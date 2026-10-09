@@ -223,7 +223,7 @@ func (s *Scheduler) runCompaction() {
 	ctx, cancel := context.WithTimeout(context.Background(), s.manager.CycleTimeout)
 	defer cancel()
 
-	cycleID, err := s.manager.runCycleInternal(ctx, cycleSourceScheduler, nil, s.tierNames)
+	cycleID, err := s.manager.RunCompactionCycleForTiers(ctx, s.tierNames)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrCycleAlreadyRunning):
@@ -300,14 +300,8 @@ func (s *Scheduler) TriggerNow(ctx context.Context) (int64, error) {
 
 	s.logger.Info().Msg("Manual compaction trigger")
 
-	// cycleSourceUnspecified, not cycleSourceScheduler: this is the manual
-	// path, as the name and the log line above both say. It has no production
-	// caller today, and labelling it "scheduler" would misattribute whichever
-	// caller is added next -- most plausibly an API route, which is the one
-	// thing "scheduler" must not mean (#1162).
-
 	startTime := time.Now()
-	cycleID, err := s.manager.runCycleInternal(ctx, cycleSourceUnspecified, nil, s.tierNames)
+	cycleID, err := s.manager.RunCompactionCycleForTiers(ctx, s.tierNames)
 	if err != nil {
 		return cycleID, err
 	}

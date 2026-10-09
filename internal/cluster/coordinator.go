@@ -4887,27 +4887,21 @@ func (c *Coordinator) startReceiverWithAddr(writerAddr string) error {
 	return nil
 }
 
-// buildReplicationIngestHandler prepares independently flushable writes before
-// the receiver appends local WAL. Each local identity then belongs to one buffer;
-// ignored payloads mint no identity and multi-measurement rows are split first.
+// buildReplicationIngestHandler creates an IngestHandler that parses WAL envelope
+// payloads and writes them to the local ArrowBuffer (NoWAL variant — the receiver's
+// LocalWAL path already handles WAL persistence).
 func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler {
-	return replication.PreparingIngestHandlerFunc(func(_ context.Context, payload []byte) ([]replication.PreparedWALIngest, error) {
+	return replication.IngestHandlerFunc(func(ctx context.Context, payload []byte) error {
 		// Safety: read-lock to avoid data race with SetIngestBuffer
 		c.mu.RLock()
 		buf := c.ingestBuffer
 		c.mu.RUnlock()
 		if buf == nil {
-			return nil, nil
+			return nil
 		}
 
 		// Parse WAL envelope to extract database name and msgpack payload
 		database, msgpackData := wal.ParseEnvelope(payload, "default")
-		part := func(localPayload []byte, measurement string, columns map[string][]interface{}) replication.PreparedWALIngest {
-			return replication.PreparedWALIngest{Payload: localPayload,
-				Apply: func(ctx context.Context, hashes []string) error {
-					return buf.WriteColumnarDirectNoWALWithHashes(ctx, database, measurement, columns, hashes)
-				}}
-		}
 
 		// Try columnar format first (map with "m" + "columns" keys)
 		var rawMap map[string]interface{}
@@ -4921,7 +4915,7 @@ func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler 
 						}
 					}
 					if len(typedColumns) > 0 {
-						return []replication.PreparedWALIngest{part(payload, measurement, typedColumns)}, nil
+						return buf.WriteColumnarDirectNoWAL(ctx, database, measurement, typedColumns)
 					}
 				}
 			}
@@ -4943,36 +4937,19 @@ func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler 
 					byMeasurement[m] = append(byMeasurement[m], r)
 				}
 			}
-			measurements := make([]string, 0, len(byMeasurement))
-			for measurement := range byMeasurement {
-				measurements = append(measurements, measurement)
-			}
-			sort.Strings(measurements)
-			parts := make([]replication.PreparedWALIngest, 0, len(measurements))
-			for _, measurement := range measurements {
-				rows := byMeasurement[measurement]
+			for measurement, rows := range byMeasurement {
 				columns := rowsToColumns(rows)
 				if len(columns) > 0 {
-					localPayload := payload
-					if len(rows) != len(records) {
-						encoded, err := msgpack.Marshal(map[string]interface{}{"m": measurement, "columns": columns})
-						if err != nil {
-							return nil, fmt.Errorf("prepare replicated rows for %s: %w", measurement, err)
-						}
-						// Preserve the database envelope. Columnar recovery carries
-						// that database explicitly, without relying on row metadata.
-						// The normal single-measurement path reuses its bytes.
-						prefix := payload[:len(payload)-len(msgpackData)]
-						localPayload = append(append(make([]byte, 0, len(prefix)+len(encoded)), prefix...), encoded...)
+					if err := buf.WriteColumnarDirectNoWAL(ctx, database, measurement, columns); err != nil {
+						return fmt.Errorf("write replicated rows for %s: %w", measurement, err)
 					}
-					parts = append(parts, part(localPayload, measurement, columns))
 				}
 			}
-			return parts, nil
+			return nil
 		}
 
 		c.logger.Debug().Int("payload_size", len(payload)).Msg("Skipped unrecognized replicated entry format")
-		return nil, nil
+		return nil
 	})
 }
 
