@@ -5725,11 +5725,19 @@ func (c *Coordinator) ReconcileReplicatedFile(path, contentHash string) {
 		if entry == nil || entry.Path == path || entry.ContentHash != contentHash {
 			continue
 		}
-		sizeBytes, err := c.storage.StatFile(context.Background(), path)
+		ctx := context.Background()
+		// A manifest announcement can arrive before the canonical file transfer.
+		// Never retire the query-visible replica until the canonical path is
+		// actually present in this node's storage.
+		canonicalSize, canonicalErr := c.storage.StatFile(ctx, entry.Path)
+		if canonicalErr != nil || canonicalSize < 0 {
+			continue
+		}
+		sizeBytes, err := c.storage.StatFile(ctx, path)
 		if err != nil || sizeBytes < 0 {
 			return
 		}
-		if err := c.storage.Delete(context.Background(), path); err != nil {
+		if err := c.storage.Delete(ctx, path); err != nil {
 			c.logger.Error().Err(err).Str("path", path).Str("canonical_path", entry.Path).Msg("Failed to retire replicated materialisation after canonical manifest match")
 			return
 		}

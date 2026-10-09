@@ -1038,6 +1038,7 @@ func main() {
 		// Create shared recovery callback to avoid code duplication
 		recoveryCallback := createWALRecoveryCallback(arrowBuffer, logger.Get("wal-recovery"))
 		columnarCallback := createColumnarRecoveryCallback(arrowBuffer, logger.Get("wal-recovery"))
+		columnarProvenanceCallback := createColumnarProvenanceRecoveryCallback(arrowBuffer, logger.Get("wal-recovery"))
 
 		// SkipActiveFile is REQUIRED (#594): the WAL writer was created
 		// above and has already rotated in its active (header-only) file.
@@ -1058,9 +1059,10 @@ func main() {
 		// for the PERIODIC flush-failure recovery below, where ingest (and
 		// therefore rotation) is live during the scan.
 		recoveryStats, err := walRecovery.RecoverWithOptions(context.Background(), recoveryCallback, &wal.RecoveryOptions{
-			SkipActiveFile:   startupActiveFile,
-			BatchSize:        cfg.WAL.RecoveryBatchSize,
-			ColumnarCallback: columnarCallback,
+			SkipActiveFile:             startupActiveFile,
+			BatchSize:                  cfg.WAL.RecoveryBatchSize,
+			ColumnarCallback:           columnarCallback,
+			ColumnarProvenanceCallback: columnarProvenanceCallback,
 		})
 		if err != nil {
 			log.Error().Err(err).Msg("WAL recovery failed")
@@ -1150,6 +1152,7 @@ func main() {
 							MinFileAge:                 5 * time.Second,
 							BatchSize:                  cfg.WAL.RecoveryBatchSize,
 							ColumnarCallback:           columnarCallback,
+							ColumnarProvenanceCallback: columnarProvenanceCallback,
 						})
 						if err != nil {
 							walLogger.Error().Err(err).Msg("WAL recovery after flush failure failed")
@@ -4430,6 +4433,28 @@ func createColumnarRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger z
 			break
 		}
 		walLogger.Info().Str("database", database).Str("measurement", measurement).Int("rows", rowCount).Msg("WAL recovery: replayed columnar entry")
+		return nil
+	}
+}
+
+// createColumnarProvenanceRecoveryCallback preserves replica origin through a
+// crash/restart, so recovered replica rows remain excluded from manifest source
+// registration instead of being re-announced as locally originated files.
+func createColumnarProvenanceRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolog.Logger) wal.ColumnarProvenanceRecoveryCallback {
+	return func(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string, replicated bool) error {
+		if database == "" {
+			database = "default"
+		}
+		var err error
+		if replicated {
+			err = arrowBuffer.WriteColumnarDirectReplayReplicated(ctx, database, measurement, columns, walIdentity, walIdentity)
+		} else {
+			err = arrowBuffer.WriteColumnarDirectReplay(ctx, database, measurement, columns, walIdentity)
+		}
+		if err != nil {
+			walLogger.Error().Err(err).Str("database", database).Str("measurement", measurement).Msg("Failed to replay columnar WAL entry with provenance")
+			return err
+		}
 		return nil
 	}
 }

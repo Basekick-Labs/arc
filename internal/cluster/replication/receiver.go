@@ -737,7 +737,16 @@ func (r *Receiver) applyEntry(entry *ReplicateEntry) error {
 	// Write to local WAL first (if configured). A drop on backpressure
 	// is non-fatal — see function doc.
 	if r.cfg.LocalWAL != nil {
-		if err := r.cfg.LocalWAL.AppendRaw(entry.Payload); err != nil {
+		// Real WAL writers persist replica provenance and deliberately suppress
+		// the outbound replication hook. Keep the legacy interface compatible
+		// with test doubles and alternate WAL implementations.
+		var appendErr error
+		if replicatedWAL, ok := r.cfg.LocalWAL.(interface{ AppendRawReplicated([]byte) error }); ok {
+			appendErr = replicatedWAL.AppendRawReplicated(entry.Payload)
+		} else {
+			appendErr = r.cfg.LocalWAL.AppendRaw(entry.Payload)
+		}
+		if err := appendErr; err != nil {
 			if errors.Is(err, wal.ErrWALDropped) {
 				r.totalLocalWALDropped.Add(1)
 				// Sampled Warn — at most one line per walDropLogIntervalNano.

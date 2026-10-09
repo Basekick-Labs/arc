@@ -889,15 +889,15 @@ func payloadHashFingerprint(hashes []string) string {
 	if len(hashes) == 0 {
 		return ""
 	}
-	seen := make(map[string]struct{}, len(hashes))
+	// Keep duplicate identities: identical payloads can be distinct batches.
+	canonical := make([]string, 0, len(hashes))
 	for _, h := range hashes {
 		if h != "" {
-			seen[h] = struct{}{}
+			canonical = append(canonical, h)
 		}
 	}
-	canonical := make([]string, 0, len(seen))
-	for h := range seen {
-		canonical = append(canonical, h)
+	if len(canonical) == 0 {
+		return ""
 	}
 	sort.Strings(canonical)
 	sum := sha256.Sum256([]byte(strings.Join(canonical, ",")))
@@ -1793,6 +1793,12 @@ func (b *ArrowBuffer) WriteColumnarDirectNoWALReplicated(ctx context.Context, da
 	return b.writeColumnarDirect(ctx, database, measurement, columns, "", true, payloadHash)
 }
 
+// WriteColumnarDirectReplayReplicated replays a replicated WAL entry while
+// preserving its checkpoint identity and suppressing local manifest registration.
+func (b *ArrowBuffer) WriteColumnarDirectReplayReplicated(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity, payloadHash string) error {
+	return b.writeColumnarDirect(ctx, database, measurement, columns, walIdentity, true, payloadHash)
+}
+
 func (b *ArrowBuffer) writeColumnarDirect(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string, replicated bool, payloadHash string) error {
 	// #590: both callers (WAL crash replay, cluster WAL replication) feed
 	// RAW client payloads that never went through the live decode path's
@@ -2347,7 +2353,10 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 	// OPTIMIZATION: String concatenation is faster than fmt.Sprintf (no reflection)
 	bufferKey := database + "/" + record.Measurement
 	if record.Replicated {
-		bufferKey += "/__replicated__"
+		// Use an internal delimiter that cannot be mistaken for another path
+		// component by splitBufferKey. Replication provenance is buffer state,
+		// not part of the logical measurement name.
+		bufferKey += "\x00replicated"
 	}
 
 	// WAL: Write to WAL before buffering (if enabled)
@@ -3332,8 +3341,14 @@ func (b *ArrowBuffer) flushAgedBuffers() {
 	}
 }
 
-// splitBufferKey splits "database/measurement" into [database, measurement]
+// splitBufferKey splits an internal buffer key into [database, measurement].
+// The replication discriminator is deliberately not a path component: it
+// keeps local and replicated batches separate without changing the measurement.
 func splitBufferKey(key string) []string {
+	const replicatedSuffix = "\x00replicated"
+	if len(key) >= len(replicatedSuffix) && key[len(key)-len(replicatedSuffix):] == replicatedSuffix {
+		key = key[:len(key)-len(replicatedSuffix)]
+	}
 	// Find first slash to split database/measurement
 	for i, c := range key {
 		if c == '/' {

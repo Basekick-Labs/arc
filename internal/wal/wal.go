@@ -54,6 +54,9 @@ const (
 	WALEnvelopeMarker   = 0x01
 	WALCheckpointMarker = 0x02
 	WALTrackedMarker    = 0x03
+	// WALReplicatedMarker marks an entry persisted by a receiving replica.
+	// It wraps the logical payload and is removed before envelope parsing.
+	WALReplicatedMarker = 0x04
 )
 
 // ParseEnvelope extracts the database name and msgpack payload from a WAL entry.
@@ -1103,18 +1106,35 @@ func (w *Writer) AppendRaw(payload []byte) error {
 	return w.appendRawEntry(payload)
 }
 
+// AppendRawReplicated persists an entry received from another node without
+// invoking this writer's replication hook. The marker survives restart so WAL
+// recovery can preserve the entry's origin and avoid re-announcing it.
+func (w *Writer) AppendRawReplicated(payload []byte) error {
+	if len(payload)+1 > MaxWALPayloadSize {
+		return oversizedPayloadError(fmt.Errorf("replicated payload size %d exceeds limit %d", len(payload)+1, MaxWALPayloadSize))
+	}
+	marked := make([]byte, 1+len(payload))
+	marked[0] = WALReplicatedMarker
+	copy(marked[1:], payload)
+	return w.appendRawEntryInternal(marked, false)
+}
+
 // appendRawEntry is AppendRaw's single-entry path: checksum, replication
 // hook, and entry assembly for one size-validated payload.
 func (w *Writer) appendRawEntry(payload []byte) error {
+	return w.appendRawEntryInternal(payload, true)
+}
+
+func (w *Writer) appendRawEntryInternal(payload []byte, replicate bool) error {
 	// Calculate checksum (CRC32)
 	checksum := crc32.ChecksumIEEE(payload)
 
 	// Get current timestamp (microseconds since epoch)
 	timestampUS := uint64(time.Now().UnixMicro())
 
-	// Call replication hook before local write (if set)
-	// This enables real-time streaming to reader nodes
-	if w.replicationHook != nil {
+	// Call replication hook before local write (if set), except for entries
+	// received from a peer and persisted with AppendRawReplicated.
+	if replicate && w.replicationHook != nil {
 		w.mu.Lock()
 		w.sequence++
 		seq := w.sequence

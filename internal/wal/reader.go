@@ -38,6 +38,7 @@ type Entry struct {
 	CheckpointHashes []string                 // Flush checkpoint identities, when present
 	Records          []map[string]interface{} // Row format (from Append path)
 	ColumnarData     *ColumnarEntry           // Columnar format (from AppendRaw path)
+	Replicated       bool                      // Entry was received from another node
 }
 
 // ColumnarEntry represents a columnar WAL entry written via the zero-copy path
@@ -259,9 +260,14 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 	}
 	payloadHashValue := payloadHash(payload)
 	logicalPayload := payload
-	if len(payload) >= 17 && payload[0] == WALTrackedMarker {
-		payloadHashValue = fmt.Sprintf("%016x%016x", binary.BigEndian.Uint64(payload[1:9]), binary.BigEndian.Uint64(payload[9:17]))
-		logicalPayload = payload[17:]
+	replicated := len(logicalPayload) > 0 && logicalPayload[0] == WALReplicatedMarker
+	if replicated {
+		logicalPayload = logicalPayload[1:]
+		payloadHashValue = payloadHash(logicalPayload)
+	}
+	if len(logicalPayload) >= 17 && logicalPayload[0] == WALTrackedMarker {
+		payloadHashValue = fmt.Sprintf("%016x%016x", binary.BigEndian.Uint64(logicalPayload[1:9]), binary.BigEndian.Uint64(logicalPayload[9:17]))
+		logicalPayload = logicalPayload[17:]
 	}
 
 	// Parse envelope to extract database name and inner msgpack payload
@@ -274,6 +280,7 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 			TimestampUS: timestampUS,
 			PayloadHash: payloadHashValue,
 			Records:     records,
+			Replicated:  replicated,
 		}, nil
 	}
 
@@ -286,6 +293,7 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 				TimestampUS:  timestampUS,
 				PayloadHash:  payloadHashValue,
 				ColumnarData: colEntry,
+				Replicated:   replicated,
 			}, nil
 		}
 	}

@@ -21,6 +21,10 @@ type RecoveryCallback func(ctx context.Context, records []map[string]interface{}
 // an entry that carries no tracked identity.
 type ColumnarRecoveryCallback func(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string) error
 
+// ColumnarProvenanceRecoveryCallback additionally reports whether the entry was
+// received from another node. It is optional to preserve existing integrations.
+type ColumnarProvenanceRecoveryCallback func(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string, replicated bool) error
+
 // RecoveryStats holds statistics about WAL recovery
 type RecoveryStats struct {
 	RecoveredFiles   int
@@ -48,6 +52,10 @@ type RecoveryOptions struct {
 
 	// ColumnarCallback handles columnar WAL entries from the zero-copy write path
 	ColumnarCallback ColumnarRecoveryCallback
+
+	// ColumnarProvenanceCallback is the provenance-aware variant. When set it
+	// receives the replicated marker preserved by the WAL reader.
+	ColumnarProvenanceCallback ColumnarProvenanceRecoveryCallback
 
 	// MinFileAge, when > 0, skips WAL files modified more recently than this.
 	// Defense against the #594 class beyond the SkipActiveFile name match:
@@ -181,9 +189,15 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 				continue
 			}
 			// Dispatch based on entry format
-			if entry.ColumnarData != nil && opts.ColumnarCallback != nil {
+			if entry.ColumnarData != nil && (opts.ColumnarProvenanceCallback != nil || opts.ColumnarCallback != nil) {
 				// Columnar entry from zero-copy AppendRaw path
-				if err := opts.ColumnarCallback(ctx, entry.ColumnarData.Database, entry.ColumnarData.Measurement, entry.ColumnarData.Columns, entry.PayloadHash); err != nil {
+				var replayErr error
+				if opts.ColumnarProvenanceCallback != nil {
+					replayErr = opts.ColumnarProvenanceCallback(ctx, entry.ColumnarData.Database, entry.ColumnarData.Measurement, entry.ColumnarData.Columns, entry.PayloadHash, entry.Replicated)
+				} else {
+					replayErr = opts.ColumnarCallback(ctx, entry.ColumnarData.Database, entry.ColumnarData.Measurement, entry.ColumnarData.Columns, entry.PayloadHash)
+				}
+				if err := replayErr; err != nil {
 					// #590: continue with the remaining entries instead of
 					// abandoning the rest of the file — one poisoned entry
 					// (e.g. a payload the write path rejects) must not
