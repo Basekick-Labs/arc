@@ -58,3 +58,11 @@ Create the name of the service account to use
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
 {{- end }}
+
+{{- define "arc.bootstrapTokenSecretName" -}}
+{{- if .Values.auth.bootstrapToken.existingSecret -}}
+{{ .Values.auth.bootstrapToken.existingSecret }}
+{{- else -}}
+{{ printf "%s-bootstrap-token" (include "arc.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end -}}
+{{- end }}
