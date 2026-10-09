@@ -1895,6 +1895,17 @@ same two strings is tracked separately in #1077.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#988](https://github.com/Basekick-Labs/arc/pull/988).
 
+### Delete API catches dangerous keywords glued to numbers or literals ([#1080](https://github.com/Basekick-Labs/arc/issues/1080))
+
+The delete endpoint's keyword scan used `\b` directly on the masked WHERE
+clause. Digits and the masker's identifier-shaped placeholders can prevent a
+word boundary, allowing inputs such as `1=1UNION ...` or `host='a'UNION ...`
+to pass this pre-filter. The validator now separates token-start keywords
+from numbers and removes literal placeholders before scanning, matching the
+query endpoint's existing handling.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1081](https://github.com/Basekick-Labs/arc/pull/1081).
+
 ### Delete API WHERE validation no longer rejects SQL words and punctuation inside string literals ([#834](https://github.com/Basekick-Labs/arc/issues/834))
 
 `POST /api/v1/delete` scans the WHERE clause for statement-level SQL before it

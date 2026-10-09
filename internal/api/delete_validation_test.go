@@ -50,6 +50,29 @@ func TestValidateWhereClauseRejectsDangerousTextOutsideLiterals(t *testing.T) {
 	}
 }
 
+func TestValidateWhereClauseRejectsKeywordsGluedToNumbersOrLiterals(t *testing.T) {
+	h := &DeleteHandler{}
+
+	for _, where := range []string{
+		`1=1UNION VALUES (1)`,
+		`host='a'UNION VALUES (1)`,
+	} {
+		if _, err := h.validateWhereClause(where); err == nil {
+			t.Errorf("validateWhereClause(%q) accepted a keyword without a word boundary", where)
+		}
+	}
+
+	for _, where := range []string{
+		`x1union = 1`,
+		`host = 'aUNION'`,
+		`host = 'web1'`,
+	} {
+		if _, err := h.validateWhereClause(where); err != nil {
+			t.Errorf("validateWhereClause(%q) returned error: %v", where, err)
+		}
+	}
+}
+
 // Edge cases the review added on top of the masking: literals that mention a
 // file-I/O function or an identifier that is a keyword stay data; the escaped
 // quote, trailing comment and dollar-tag shapes the masker was hardened

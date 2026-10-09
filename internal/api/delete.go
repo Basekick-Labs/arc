@@ -528,7 +528,11 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 
 	// Check for dangerous SQL keywords using word boundaries to avoid false positives
 	// on column names like "offset" (contains SET), "payload" (contains LOAD), "dataset" (contains SET)
-	if match := dangerousKeywordPattern.FindString(maskedWhere); match != "" {
+	// Match DuckDB's token boundaries when a keyword is glued to a number or a
+	// masked string literal (#1080), as the query validator does.
+	keywordCheck := numberGluedToWord.ReplaceAllString(strings.ToLower(maskedWhere), "$1$2 $3")
+	keywordCheck = maskPlaceholder.ReplaceAllString(keywordCheck, " ")
+	if match := dangerousKeywordPattern.FindString(keywordCheck); match != "" {
 		return false, fmt.Errorf("WHERE clause contains forbidden keyword: %s", strings.ToUpper(match))
 	}
 
