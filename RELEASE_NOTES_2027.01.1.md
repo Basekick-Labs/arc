@@ -695,6 +695,16 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Sync cold-tier metadata on standalone nodes ([#1179](https://github.com/Basekick-Labs/arc/issues/1179))
+
+Standalone nodes with a usable cold tier now sync objects from cold storage into
+local tier metadata before scanning hot storage. This lets query routing find
+cold files after local metadata is missing. If the cold listing fails, the
+migration cycle waits for a successful listing before migrating or reconciling
+files, avoiding decisions based on stale tier metadata.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1183](https://github.com/Basekick-Labs/arc/pull/1183).
+
 ### Reported core counts account for the CPU quota ([#1039](https://github.com/Basekick-Labs/arc/issues/1039))
 
 `runtime.NumCPU()` reflects a cpuset but not a CFS quota, and Kubernetes
