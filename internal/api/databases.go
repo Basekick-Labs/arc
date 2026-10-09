@@ -2,8 +2,10 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,12 +23,21 @@ type DatabasesHandler struct {
 	storage        storage.Backend
 	requestTimeout time.Duration
 	deleteConfig   *config.DeleteConfig
-	tieringManager *tiering.Manager
+	tieringManager databaseTieringManager
 	authManager    *auth.AuthManager
 	rbacManager    RBACChecker
 	logger         zerolog.Logger
 	icebergDropper IcebergCatalogDropper
 	fieldSchema    *fieldschema.Registry // optional, #914: anchors die with their database
+}
+
+type databaseTieringManager interface {
+	GetMetadata() *tiering.MetadataStore
+	DatabaseHasTierRows(ctx context.Context, database string) (bool, error)
+	BeginDatabaseDelete() (func(), error)
+	MigrationGate() (bool, string)
+	PrepareDatabaseDelete(ctx context.Context, database string, hotPaths []string) error
+	CleanupDatabaseDelete(ctx context.Context, database string, hotListed, hotFailed []string) (int, []error)
 }
 
 // SetFieldSchema installs the field schema registry so deleting a database
@@ -218,7 +229,7 @@ func (h *DatabasesHandler) storageContext(c *fiber.Ctx, timeout time.Duration) (
 
 // SetTieringManager sets the tiering manager for multi-tier database/measurement listing.
 // This is called after initialization when tiering is enabled and licensed.
-func (h *DatabasesHandler) SetTieringManager(tm *tiering.Manager) {
+func (h *DatabasesHandler) SetTieringManager(tm databaseTieringManager) {
 	h.tieringManager = tm
 }
 
@@ -533,11 +544,46 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 
-	// Prevent deletion of reserved names
-	if reservedDatabaseNames[strings.ToLower(name)] {
+	// Prevent deletion of reserved names. Two checks, because they answer
+	// different questions: reservedDatabaseNames is the API's list of names a
+	// caller may not name, while storage.IsReservedRootDir is what the storage
+	// layer itself treats as not-a-database (any "_" or "." prefix, so
+	// _schema and _compaction_state included). The second matters more now
+	// than it did: this handler no longer only unlinks local hot files, it
+	// also deletes cold objects and proposes cluster-wide manifest removals.
+	if reservedDatabaseNames[strings.ToLower(name)] || storage.IsReservedRootDir(name) {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 			"error": "Cannot delete reserved database '" + name + "'",
 		})
+	}
+	if h.tieringManager != nil {
+		release, err := h.tieringManager.BeginDatabaseDelete()
+		if err != nil {
+			// Three distinct causes, three distinct remedies: route the
+			// request elsewhere, or wait out a scan, or wait out a cycle.
+			// One message for all three left the operator with nowhere to
+			// look -- a tier scan can hold its flag for tiered_storage
+			// .scan_timeout, two hours by default.
+			if errors.Is(err, tiering.ErrMigrationRoleGated) {
+				gated, role := h.tieringManager.MigrationGate()
+				h.logger.Warn().Bool("gated", gated).Str("role", role).Str("database", name).
+					Msg("Database deletion rejected: this node may not mutate the tiered store")
+				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+					"error": "database deletion rejected: node role " + strconv.Quote(role) +
+						" is not primary writer; route the request to the primary writer",
+					"role": role,
+				})
+			}
+			if errors.Is(err, tiering.ErrScanRunning) {
+				return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+					"error": "database deletion rejected: a tier scan is running and holds the tier lifecycle; retry after it finishes (bounded by tiered_storage.scan_timeout)",
+				})
+			}
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"error": "database deletion rejected: a tier migration cycle is running; retry when it finishes",
+			})
+		}
+		defer release()
 	}
 
 	ctx, cancel := h.storageContext(c, h.requestTimeout)
@@ -575,10 +621,21 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	// abandoned after the same fixed timeout as a small one.
 	cancel()
 	ctx, cancel = h.storageContext(c, h.requestTimeout*time.Duration(len(files)+2))
+	if h.tieringManager != nil {
+		if err := h.tieringManager.PrepareDatabaseDelete(ctx, name, files); err != nil {
+			h.logger.Error().Err(err).Str("database", name).Msg("Failed to remove database files from the cluster manifest")
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to prepare database deletion",
+			})
+		}
+	}
 
 	// Delete all files
 	deletedCount := 0
 	var deleteErrors []string
+	var hotDeleted []string
+	var hotFailed []string
+	coldDeletedCount := 0
 
 	// Try batch delete if available, fall back to individual deletes
 	deleteIndividually := true
@@ -587,6 +644,7 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 			h.logger.Warn().Err(err).Str("database", name).Msg("Batch delete failed, falling back to individual deletes")
 		} else {
 			deletedCount = len(files)
+			hotDeleted = append(hotDeleted, files...)
 			deleteIndividually = false
 		}
 	}
@@ -595,9 +653,19 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 			if err := h.storage.Delete(ctx, file); err != nil {
 				h.logger.Warn().Err(err).Str("file", file).Msg("Failed to delete file")
 				deleteErrors = append(deleteErrors, file+": "+err.Error())
+				hotFailed = append(hotFailed, file)
 			} else {
 				deletedCount++
+				hotDeleted = append(hotDeleted, file)
 			}
+		}
+	}
+	if h.tieringManager != nil {
+		coldDeleted, errs := h.tieringManager.CleanupDatabaseDelete(ctx, name, hotDeleted, hotFailed)
+		coldDeletedCount = coldDeleted
+		deletedCount += coldDeleted
+		for _, err := range errs {
+			deleteErrors = append(deleteErrors, err.Error())
 		}
 	}
 
@@ -607,7 +675,7 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	// common source is an upload that failed after staging bytes, whose final
 	// key never existed, so the loop above never saw it.
 	deletedCount += reclaimStagedPartials(ctx, h.storage, name+"/", h.logger)
-	if h.fieldSchema != nil {
+	if h.fieldSchema != nil && len(deleteErrors) == 0 {
 		// Best effort: a leftover anchor is inert (its measurement has no
 		// files) and is overwritten by the next ingest into a database of
 		// the same name.
@@ -618,12 +686,14 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 
 	// Also delete the .arc-database marker file (not included in List due to hidden file filter)
 	markerPath := name + "/.arc-database"
-	if err := h.storage.Delete(ctx, markerPath); err != nil {
-		h.logger.Warn().Err(err).Str("path", markerPath).Msg("Failed to delete database marker file")
-		deleteErrors = append(deleteErrors, markerPath+": "+err.Error())
-	} else {
-		deletedCount++
-		h.logger.Debug().Str("path", markerPath).Msg("Deleted database marker file")
+	if len(deleteErrors) == 0 {
+		if err := h.storage.Delete(ctx, markerPath); err != nil {
+			h.logger.Warn().Err(err).Str("path", markerPath).Msg("Failed to delete database marker file")
+			deleteErrors = append(deleteErrors, markerPath+": "+err.Error())
+		} else {
+			deletedCount++
+			h.logger.Debug().Str("path", markerPath).Msg("Deleted database marker file")
+		}
 	}
 
 	// Everything List, ListStaged and the marker cover is gone now, so a file
@@ -654,13 +724,6 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		}
 	}
 
-	// Iceberg catalog cleanup AFTER file deletion (#639 item 3): with the
-	// files gone, a racing reconcile pass can only empty tables, never
-	// recreate them. Failures are logged, not returned: the files are
-	// already deleted, catalog residue equals the pre-fix status quo, and
-	// re-running the DELETE retries the cleanup.
-	h.dropIcebergCatalog(ctx, name)
-
 	if len(deleteErrors) > 0 {
 		h.logger.Error().
 			Str("database", name).
@@ -675,6 +738,17 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 
+	// Iceberg catalog cleanup AFTER file deletion (#639 item 3): with the
+	// files gone, a racing reconcile pass can only empty tables, never
+	// recreate them. Failures are logged, not returned: the files are already
+	// deleted and catalog residue equals the pre-fix status quo.
+	//
+	// Now reached only on a fully successful deletion. A partial failure keeps
+	// the database -- marker, anchors and catalog -- so the retry finds it and
+	// finishes the job, rather than stranding a catalog entry for a database
+	// whose files are half gone.
+	h.dropIcebergCatalog(ctx, name)
+
 	h.logger.Info().
 		Str("database", name).
 		Int("files_deleted", deletedCount).
@@ -683,6 +757,11 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"message":       "Database '" + name + "' deleted successfully",
 		"files_deleted": deletedCount,
+		// Broken out because a single total cannot distinguish a hot sweep
+		// from a cold one, and the cold half is the expensive, irreversible
+		// part an operator wants to see (#1091).
+		"hot_files_deleted":  len(hotDeleted),
+		"cold_files_deleted": coldDeletedCount,
 	})
 }
 
@@ -954,7 +1033,13 @@ func (h *DatabasesHandler) databaseExists(ctx context.Context, name string) (boo
 	if err != nil {
 		return false, err
 	}
-	return len(files) > 0, nil
+	if len(files) > 0 {
+		return true, nil
+	}
+	if h.tieringManager != nil {
+		return h.tieringManager.DatabaseHasTierRows(ctx, name)
+	}
+	return false, nil
 }
 
 func extractTopLevelDirs(files []string) []string {
