@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -673,19 +674,20 @@ func stripSQLComments(sql string, hasComments bool) string {
 
 // QueryHandler handles SQL query endpoints
 type QueryHandler struct {
-	db                 *database.DuckDB
-	storage            storage.Backend
-	pruner             *pruning.PartitionPruner
-	fieldSchema        *fieldschema.Registry // nil or disabled: SQL is built exactly as before #914
-	emptyRangeAnchor   bool                  // #928: answer a proven-empty range from a complete anchor alone
-	queryCache         *database.QueryCache
-	logger             zerolog.Logger
-	authManager        *auth.AuthManager
-	rbacManager        RBACChecker
-	debugEnabled       bool // Cached check for debug logging to avoid repeated level checks
-	parallelExecutor   *query.ParallelExecutor
-	queryTimeout       time.Duration // Query timeout (0 = no timeout)
-	slowQueryThreshold time.Duration // Slow query WARN threshold (0 = disabled)
+	db                      *database.DuckDB
+	storage                 storage.Backend
+	pruner                  *pruning.PartitionPruner
+	fieldSchema             *fieldschema.Registry // nil or disabled: SQL is built exactly as before #914
+	emptyRangeAnchor        bool                  // #928: answer a proven-empty range from a complete anchor alone
+	queryCache              *database.QueryCache
+	logger                  zerolog.Logger
+	authManager             *auth.AuthManager
+	rbacManager             RBACChecker
+	debugEnabled            bool // Cached check for debug logging to avoid repeated level checks
+	parallelExecutor        *query.ParallelExecutor
+	queryTimeout            time.Duration // Query timeout (0 = no timeout)
+	disableClientDisconnect bool
+	slowQueryThreshold      time.Duration // Slow query WARN threshold (0 = disabled)
 
 	// Cluster routing support
 	router *cluster.Router
@@ -994,6 +996,37 @@ func NewQueryHandler(db *database.DuckDB, storage storage.Backend, logger zerolo
 		queryTimeout:       queryTimeout,
 		slowQueryThreshold: slowQueryThreshold,
 	}
+}
+
+// SetCancelOnClientDisconnect controls whether query contexts are cancelled
+// when the client connection closes before the response finishes. Some HTTP
+// clients half-close their write side after sending a request; operators can
+// disable this behavior for those clients.
+func (h *QueryHandler) SetCancelOnClientDisconnect(enabled bool) {
+	h.disableClientDisconnect = !enabled
+}
+
+// watchQueryClientDisconnect starts the connection watcher and returns a
+// once-only metric recorder for the later streaming-error path.
+func (h *QueryHandler) watchQueryClientDisconnect(queryCtx context.Context, conn net.Conn, queryID string, cancel context.CancelFunc, path string) func() {
+	var disconnectOnce sync.Once
+	recordDisconnect := func() {
+		disconnectOnce.Do(func() {
+			metrics.Get().IncQueryClientDisconnect(path)
+		})
+	}
+	if h.disableClientDisconnect {
+		return recordDisconnect
+	}
+	watchClientDisconnect(queryCtx, conn, func() {
+		recordDisconnect()
+		h.logger.Warn().Str("query_id", queryID).Msg("Query cancelled after client disconnect")
+		if h.queryRegistry != nil && queryID != "" {
+			h.queryRegistry.CancelWithReason(queryID, "client disconnected")
+		}
+		cancel()
+	})
+	return recordDisconnect
 }
 
 // logSlowQuery emits a WARN log and increments the slow query counter if
@@ -2136,6 +2169,10 @@ localProcessing:
 			// Note: cancelTimeout is called inside the stream writer callback, not deferred here,
 			// because SetBodyStreamWriter runs asynchronously after this function returns.
 		}
+		if cancelTimeout == nil {
+			execCtx, cancelTimeout = context.WithCancel(execCtx)
+		}
+		recordDisconnect := h.watchQueryClientDisconnect(execCtx, c.Context().Conn(), queryID, cancelTimeout, metrics.DisconnectPathSQLJSON)
 		results, err := h.parallelExecutor.ExecutePartitioned(
 			execCtx,
 			parallelInfo.Paths,
@@ -2333,7 +2370,7 @@ localProcessing:
 				}
 				// Per-handler client-disconnect counter (#426).
 				if isClientError(streamErr) {
-					m.IncQueryClientDisconnect(metrics.DisconnectPathSQLJSON)
+					recordDisconnect()
 				}
 				// Warn for client-disconnect / context expiry (headers already
 				// committed, partial result was delivered). Error for genuine
@@ -2372,6 +2409,10 @@ localProcessing:
 			// Note: cancel is called inside the stream writer callback, not deferred here,
 			// because SetBodyStreamWriter runs asynchronously after this function returns.
 		}
+		if cancel == nil {
+			ctx, cancel = context.WithCancel(ctx)
+		}
+		recordDisconnect := h.watchQueryClientDisconnect(ctx, c.Context().Conn(), queryID, cancel, metrics.DisconnectPathSQLJSON)
 
 		// arcx router hook. Decides eligibility on the RAW req.SQL (date_trunc
 		// still intact, before rewriteDateTrunc's epoch rewrite) and, in serve
@@ -2614,7 +2655,7 @@ localProcessing:
 				}
 				// Per-handler client-disconnect counter (#426).
 				if isClientError(streamErr) {
-					m.IncQueryClientDisconnect(metrics.DisconnectPathSQLJSON)
+					recordDisconnect()
 				}
 				// Warn for client-disconnect / context expiry (headers already
 				// committed, partial result was delivered). Error for genuine
@@ -3738,8 +3779,32 @@ func shouldSkipTableConversion(table string) bool {
 // or: {database}/{measurement}/**/*.parquet (relative path)
 // The key insight: database/measurement are always followed by year directories (4-digit numbers)
 func (h *QueryHandler) extractDBMeasurementFromPath(path string) (database, measurement string) {
-	// Normalize path separators
-	path = strings.ReplaceAll(path, "\\", "/")
+	// Backslashes are forbidden in storage keys. A local backend may,
+	// however, have native separators in its trusted root on Windows.
+	if strings.Contains(path, `\`) {
+		local, ok := h.storage.(*storage.LocalBackend)
+		if !ok {
+			return "", ""
+		}
+
+		root := local.GetBasePath()
+		if !strings.HasSuffix(root, string(filepath.Separator)) {
+			root += string(filepath.Separator)
+		}
+
+		// Only the exact local root may contain native separators. Never
+		// normalise a backslash in the database, measurement or file key.
+		if !strings.HasPrefix(path, root) {
+			return "", ""
+		}
+		keyPath := strings.TrimPrefix(path, root)
+		if strings.Contains(keyPath, `\`) {
+			return "", ""
+		}
+
+		// The remaining suffix contains no backslashes; parse it using '/'.
+		path = keyPath
+	}
 
 	// Remove any s3:// or azure:// prefix and bucket name
 	if strings.Contains(path, "://") {
@@ -3751,6 +3816,30 @@ func (h *QueryHandler) extractDBMeasurementFromPath(path string) (database, meas
 				path = path[idx+1:]
 			}
 		}
+	}
+
+	// Object-store URIs include the configured key prefix. Remove it before
+	// looking for the database and measurement, since a prefix segment can
+	// itself look like a year and the scan below would then read the two
+	// segments in front of it as the database and measurement (#1108).
+	//
+	// TrimPrefix on a path string normally matches mid-segment ("wh" matching
+	// "wh-other"), which is why it needs a note rather than a reader's trust.
+	// It is safe here because the value is never a bare directory name:
+	// ValidateObjectPrefix returns the prefix empty or trailing-slashed
+	// (internal/storage/objectprefix.go), and both fields document that
+	// invariant (s3.go "sanitized, with trailing /", azure.go "validated,
+	// with trailing /"). An empty prefix makes this a no-op.
+	//
+	// h.storage is the HOT backend, and it is the right one even though a
+	// cold tier carries its own, different prefix: every path that reaches
+	// this function is built by h.getStoragePath from h.storage, so the
+	// prefix on the string is always this backend's. Cold globs are built
+	// inside buildMultiTierReadParquet, which is given the database and
+	// measurement and never parses a path back out of one. LocalBackend has
+	// no GetPrefix, so the assertion fails and nothing is trimmed.
+	if backend, ok := h.storage.(interface{ GetPrefix() string }); ok {
+		path = strings.TrimPrefix(path, backend.GetPrefix())
 	}
 
 	// Remove glob pattern suffix (**/*.parquet)
@@ -4372,6 +4461,13 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time) error 
 			databases = h.extractTopLevelDirs(files)
 		}
 	}
+	// A store that does not exist yet answers an empty result set, not an
+	// error: the bucket appears on the first authenticated write (#945). Only
+	// the read paths named in that issue opt in — see storage.ErrStoreNotFound
+	// for why a missing store must stay an error everywhere that decides.
+	if storage.IsStoreNotFound(err) {
+		databases, err = nil, nil
+	}
 
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to list databases")
@@ -4471,6 +4567,11 @@ func (h *QueryHandler) handleShowTables(c *fiber.Ctx, start time.Time, database 
 		} else {
 			tables = h.extractTableNames(files, database)
 		}
+	}
+	// As in SHOW DATABASES: a store that does not exist yet is an empty
+	// result set (#945), and nowhere else.
+	if storage.IsStoreNotFound(err) {
+		tables, err = nil, nil
 	}
 
 	if err != nil {
@@ -5369,8 +5470,8 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	timestamp := time.Now().UTC().Format(time.RFC3339)
 
 	// Create context with timeout if configured (0 = no timeout).
-	// Same pattern as POST /api/v1/query: start from UserContext so client
-	// disconnects cancel the query, then wrap with queryTimeout (#308).
+	// Same pattern as POST /api/v1/query: start from UserContext, watch the
+	// client connection for disconnects, then wrap with queryTimeout (#308).
 	// A governance policy's MaxDuration overrides the global timeout (#702),
 	// matching the POST handler's effectiveTimeout semantics.
 	effectiveTimeout := h.queryTimeout
@@ -5428,6 +5529,10 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		// paths below), not deferred here, because SetBodyStreamWriter runs
 		// asynchronously after this function returns.
 	}
+	if cancel == nil {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	recordDisconnect := h.watchQueryClientDisconnect(ctx, c.Context().Conn(), queryID, cancel, metrics.DisconnectPathSQLJSON)
 
 	// Dispositions for the Arrow JSON path, which owns the response once it
 	// reports handled=true and streams asynchronously. Passing these rather
@@ -5557,7 +5662,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 			// uses the pure database/sql streaming JSON path same as the
 			// other sites above, so it shares the sql_json label.
 			if isClientError(streamErr) {
-				m.IncQueryClientDisconnect(metrics.DisconnectPathSQLJSON)
+				recordDisconnect()
 			}
 			// Warn for client-disconnect / context expiry (headers already
 			// committed, partial result was delivered). Error for genuine

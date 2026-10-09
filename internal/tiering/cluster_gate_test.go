@@ -1,10 +1,11 @@
 package tiering
 
-// Shared-storage clusters: only the primary writer migrates, but every node
-// keeps its tier metadata in sync by listing cold storage, because the query
-// layer routes each node from its own metadata. These tests drive runCycle
-// (RunMigrationCycle after the license check, which the in-package test
-// Manager cannot pass) with a gate that flips between cycles.
+// The cluster gate: only the primary writer migrates, but EVERY node keeps its
+// tier metadata in sync by listing cold storage — standalone included since
+// #1179 — because the query layer routes each node from its own metadata.
+// These tests drive runCycle (RunMigrationCycle after the license check, which
+// the in-package test Manager cannot pass) with a gate that flips between
+// cycles, and one of them with no gate at all.
 
 import (
 	"context"
@@ -161,11 +162,9 @@ func TestRunCycle_PrimaryMigrates(t *testing.T) {
 	}
 }
 
-// Without a gate (OSS, standalone, per-node storage) the cycle must be
-// byte-for-byte what it was: in particular it never lists cold storage,
-// which is the whole blast-radius argument for wiring the gate only in
-// shared-storage mode.
-func TestRunCycle_NilGateNeverListsCold(t *testing.T) {
+// A standalone node with a usable cold tier syncs metadata before migrating,
+// even though it has no cluster gate.
+func TestRunCycle_NilGateSyncsColdAndMigrates(t *testing.T) {
 	m, hot, cold, _, cleanup := setupGatedTest(t)
 	defer cleanup()
 	ctx := context.Background()
@@ -178,8 +177,8 @@ func TestRunCycle_NilGateNeverListsCold(t *testing.T) {
 	if ok, _ := cold.Exists(ctx, gateDailyA); !ok {
 		t.Fatal("ungated node did not migrate")
 	}
-	if n := cold.lists.Load(); n != 0 {
-		t.Fatalf("cold listings = %d, want 0 without a gate", n)
+	if n := cold.lists.Load(); n != 1 {
+		t.Fatalf("cold listings = %d, want one metadata sync before migration", n)
 	}
 	if gated, role := m.MigrationGate(); gated || role != "" {
 		t.Fatalf("MigrationGate without a gate = (%v, %q), want (false, \"\")", gated, role)
@@ -285,7 +284,7 @@ func TestSync_FlipsInsertsPreservesAndStamps(t *testing.T) {
 	// C: already known cold, with a migration time that must survive.
 	earlier := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
 	mustWrite(t, cold, gateDailyC)
-	if err := m.metadata.RecordColdFile(ctx, &FileMetadata{
+	if _, err := m.metadata.RecordColdFile(ctx, &FileMetadata{
 		Path: gateDailyC, Database: "db1", Measurement: "cpu", PartitionTime: partition, SizeBytes: 7,
 	}, earlier); err != nil {
 		t.Fatal(err)
@@ -388,7 +387,7 @@ func TestSync_ColdRowWithoutObjectIsLeftAlone(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 	gate.primary.Store(false)
-	if err := m.metadata.RecordColdFile(ctx, &FileMetadata{
+	if _, err := m.metadata.RecordColdFile(ctx, &FileMetadata{
 		Path: gateDailyA, Database: "db1", Measurement: "cpu",
 		PartitionTime: time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC), SizeBytes: 7,
 	}, gateColdModTime); err != nil {
@@ -511,7 +510,10 @@ func TestScanTiers_ColdSyncedCountsAndNotifies(t *testing.T) {
 }
 
 // A primary whose cold listing failed does not migrate that cycle: its rows
-// for files other nodes moved are stale, and it would select them.
+// for files other nodes moved are stale, and it would select them. Since
+// #1179 an ungated node skips for the same reason — see
+// TestRunCycle_StandaloneSkipsMigrationWhenColdSyncFails, where there are no
+// other nodes and the stale view is this node's own.
 func TestRunCycle_LeaderSkipsMigrationWhenColdListingFails(t *testing.T) {
 	m, hot, cold, gate, cleanup := setupGatedTest(t)
 	defer cleanup()
@@ -547,7 +549,7 @@ func TestReconcile_KeepsOnlyCopyWhenColdObjectIsGone(t *testing.T) {
 	row := &FileMetadata{Path: gateDailyA, Database: "db1", Measurement: "cpu", PartitionTime: partition, SizeBytes: 7}
 
 	mustWrite(t, hot, gateDailyA)
-	if err := m.metadata.RecordColdFile(ctx, row, time.Now()); err != nil {
+	if _, err := m.metadata.RecordColdFile(ctx, row, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	found, deleted, failed := m.migrator.ReconcileOrphanedFiles(ctx)
@@ -563,7 +565,7 @@ func TestReconcile_KeepsOnlyCopyWhenColdObjectIsGone(t *testing.T) {
 
 	// With the cold copy present the orphan hot copy is removed as before.
 	mustWrite(t, cold, gateDailyA)
-	if err := m.metadata.RecordColdFile(ctx, row, time.Now()); err != nil {
+	if _, err := m.metadata.RecordColdFile(ctx, row, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	found, deleted, failed = m.migrator.ReconcileOrphanedFiles(ctx)

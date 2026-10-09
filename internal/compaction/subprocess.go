@@ -380,7 +380,20 @@ func forwardSubprocessLine(logger zerolog.Logger, line string) {
 		Msg(line)
 }
 
-// createStorageBackendFromConfig creates a storage backend from subprocess config
+// createStorageBackendFromConfig creates a storage backend from subprocess config.
+//
+// This deliberately does NOT go through the shared storage.NewBackend factory
+// (internal/storage/factory.go) that primary storage, the tiering cold tier and
+// the backup manager use. The subprocess has a credential model of its own, on
+// purpose: credentials are never serialised into the job config, so it MUST
+// read them from the environment the parent set. The S3 case passes none at all
+// and lets the SDK chain pick them up, and the Azure case derives
+// UseManagedIdentity from whether AZURE_STORAGE_KEY is present. The factory
+// itself is indifferent to credentials and its other callers simply forward
+// whatever the operator configured; here the empty credential set IS the
+// contract, and a regression in it surfaces as a failed compaction job in a
+// separate process rather than a failed startup - the hardest place to notice
+// one.
 func createStorageBackendFromConfig(config *SubprocessJobConfig, logger zerolog.Logger) (storage.Backend, error) {
 	switch config.StorageType {
 	case "local":
@@ -420,8 +433,16 @@ func createStorageBackendFromConfig(config *SubprocessJobConfig, logger zerolog.
 		}, logger)
 
 	case "azure":
+		// Same rule as the S3 case above, and for the same reason: every field
+		// AzureBlobBackend.ConfigJSON emits must be parsed and forwarded here.
+		// Prefix in particular is applied to every key the backend touches
+		// (prefixedKey), so dropping it silently reroots the subprocess at the
+		// container root and compaction reads and writes the wrong location.
+		// It defaults to empty, which is why the same omission on the S3 side
+		// went unnoticed.
 		var azureConfig struct {
 			Container   string `json:"container"`
+			Prefix      string `json:"prefix"`
 			AccountName string `json:"account_name"`
 			Endpoint    string `json:"endpoint"`
 		}
@@ -432,6 +453,7 @@ func createStorageBackendFromConfig(config *SubprocessJobConfig, logger zerolog.
 		accountKey := os.Getenv("AZURE_STORAGE_KEY")
 		return storage.NewAzureBlobBackend(&storage.AzureBlobConfig{
 			ContainerName:      azureConfig.Container,
+			Prefix:             azureConfig.Prefix,
 			AccountName:        azureConfig.AccountName,
 			AccountKey:         accountKey,
 			Endpoint:           azureConfig.Endpoint,
@@ -451,6 +473,16 @@ var sqlErrorMarkers = []string{"binder error", "catalog error", "parser error"}
 // memoryErrorMarkers indicate memory pressure; retrying with a smaller batch
 // is exactly the right response.
 var memoryErrorMarkers = []string{"out of memory", "cannot allocate", "memory allocation failed"}
+
+// permanentErrorMarkers are failures no retry can fix: the input is gone or
+// unreadable. Both streams are searched for each one - see ClassifySubprocessError.
+var permanentErrorMarkers = []string{
+	"no files found that match",
+	"permission denied",
+	"no such file",
+	"access denied",
+	"not found",
+}
 
 // ClassifySubprocessError determines if a subprocess error is recoverable via retry.
 // Returns (recoverable, reason) where reason describes the error type.
@@ -522,12 +554,17 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 		}
 	}
 
-	// Non-recoverable errors - don't waste time retrying
-	if strings.Contains(stderrLower, "permission denied") ||
-		strings.Contains(stderrLower, "no such file") ||
-		strings.Contains(stderrLower, "access denied") ||
-		strings.Contains(stderrLower, "not found") {
-		return false, "permanent_error"
+	// Non-recoverable errors - don't waste time retrying. Checked against BOTH
+	// streams, like memoryErrorMarkers above: a subprocess reports a missing
+	// input through stderr, but the parent's own wrapped error carries it in
+	// err, and a marker tested against only one stream leaves the other
+	// classified "unknown" and spending the full retry budget on a failure that
+	// cannot succeed (#969 - an input deleted mid-job cost ~15 subprocess
+	// launches before this was symmetric).
+	for _, marker := range permanentErrorMarkers {
+		if strings.Contains(errLower, marker) || strings.Contains(stderrLower, marker) {
+			return false, "permanent_error"
+		}
 	}
 
 	// Default: treat unknown errors as potentially recoverable once

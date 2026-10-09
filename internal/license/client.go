@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/syscpu"
 	"github.com/rs/zerolog"
 )
 
@@ -127,12 +128,35 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 	return c, nil
 }
 
-// ActivateRequest represents a license activation request
+// usableCoresFn is the seam the activation tests inject through. It is the
+// STARTUP snapshot, not a live read: a licence enforces itself by pinning
+// GOMAXPROCS down to its core limit, and periodic re-validation re-activates
+// long after that pin (see ActivateOrVerify), so a live read would report the
+// licensed count rather than the quota — on bare metal with no quota at all.
+// Follows internal/config's effectiveCoresFn: unexported, so no test-only
+// surface escapes.
+var usableCoresFn = syscpu.CoresAtStartup
+
+// ActivateRequest represents a license activation request.
+//
+// Cores and UsableCores are both sent, and both are needed. Cores is the
+// machine's logical CPU count; UsableCores is what a CPU quota leaves this
+// process, which on a Kubernetes pod with limits.cpu is the smaller and the
+// honest answer to "how big is this node" (#1039). Reporting only one would
+// either lose the machine size the admin UI shows beside MaxCores, or keep
+// over-reporting every containerised deployment by the host's size. An
+// activation server that predates UsableCores ignores the unknown field.
+//
+// Neither is an entitlement input: the server allows activation whatever the
+// core count and leaves the limit to the client, which enforces it in
+// applyLicenseCoreLimits. A future server-side check reading the stored value
+// would have to decide which of these two it means.
 type ActivateRequest struct {
 	LicenseKey         string `json:"license_key"`
 	MachineFingerprint string `json:"machine_fingerprint"`
 	Hostname           string `json:"hostname"`
 	Cores              int    `json:"cores"`
+	UsableCores        int    `json:"usable_cores"`
 }
 
 // ActivateResponse represents the response from license activation.
@@ -165,13 +189,19 @@ func (c *Client) Activate(ctx context.Context) (*License, error) {
 	url := fmt.Sprintf("%s/api/v1/activate", c.serverURL)
 
 	hostname, _ := os.Hostname()
+	// runtime.NumCPU stays the machine figure. It also stays what
+	// fingerprint.go reports, deliberately and separately: that string feeds
+	// the machine fingerprint bound licences are verified against, so it must
+	// not move whatever happens here.
 	cores := runtime.NumCPU()
+	usableCores := usableCoresFn()
 
 	req := &ActivateRequest{
 		LicenseKey:         c.licenseKey,
 		MachineFingerprint: c.fingerprint,
 		Hostname:           hostname,
 		Cores:              cores,
+		UsableCores:        usableCores,
 	}
 
 	jsonData, err := json.Marshal(req)
@@ -184,6 +214,7 @@ func (c *Client) Activate(ctx context.Context) (*License, error) {
 		Str("fingerprint", c.fingerprint[:min(16, len(c.fingerprint))]+"...").
 		Str("hostname", hostname).
 		Int("cores", cores).
+		Int("usable_cores", usableCores).
 		Msg("Activating license")
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonData))
@@ -447,6 +478,16 @@ func (c *Client) CanUseRetentionScheduler() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.license != nil && c.license.CanUseRetentionScheduler()
+}
+
+// CanUseEdgeSyncScheduler reads the current entitlement, including revalidation.
+func (c *Client) CanUseEdgeSyncScheduler() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.license.CanUseEdgeSyncScheduler()
 }
 
 // CanUseTieredStorage returns true if tiered storage is allowed

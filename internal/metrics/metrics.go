@@ -97,6 +97,12 @@ type Metrics struct {
 	compactionBytesWritten       atomic.Int64
 	compactionManifestsRecovered atomic.Int64
 
+	// Scheduled spoke metrics are absent from exports until the network
+	// scheduler starts. A bundle-only or disabled spoke must not look healthy.
+	edgeSyncSpokeSchedulerEnabled atomic.Bool
+	edgeSyncSpokeLastSuccessUnix  atomic.Int64
+	edgeSyncSpokePassFailures     atomic.Int64
+
 	// Auth metrics
 	authRequestsTotal atomic.Int64
 	authCacheHits     atomic.Int64
@@ -149,6 +155,12 @@ type Metrics struct {
 	walDroppedEntries    atomic.Int64 // Entries dropped due to full WAL buffer
 	walFailedWrites      atomic.Int64 // Write failures to WAL file
 	walOversizedPayloads atomic.Int64 // Payloads rejected for exceeding the single-entry cap even after chunking (#677)
+	walDirectoryBytes    atomic.Int64 // Current bytes occupied by every file in the WAL directory
+	walQuarantinedFiles  atomic.Int64 // WAL files isolated after repeated recovery failures
+	// 1 while the last recovery pass left a file on disk for which at least one
+	// row range of a parent entry was handed off — the state an older binary
+	// would replay in full.
+	walPartialRowRecovery atomic.Int64
 
 	// NOTE: no decompression-pool discard counter here (#817). The pooled
 	// codecs it belonged to were replaced by decompressGzipPooled /
@@ -448,6 +460,27 @@ func (m *Metrics) IncCompactionManifestsRecovered(count int64) {
 	m.compactionManifestsRecovered.Add(count)
 }
 
+// EnableEdgeSyncSpokeScheduler makes scheduled network metrics visible.
+// It is called only after the network scheduler has been constructed.
+func (m *Metrics) EnableEdgeSyncSpokeScheduler() {
+	m.edgeSyncSpokeSchedulerEnabled.Store(true)
+}
+
+// RecordEdgeSyncSpokeSuccess records a completed scheduled network pass.
+func (m *Metrics) RecordEdgeSyncSpokeSuccess(at time.Time) {
+	if m.edgeSyncSpokeSchedulerEnabled.Load() {
+		m.edgeSyncSpokeLastSuccessUnix.Store(at.Unix())
+	}
+}
+
+// IncEdgeSyncSpokePassFailures counts failed scheduled passes, excluding
+// skipped overlaps, role-gated attempts and shutdown cancellation.
+func (m *Metrics) IncEdgeSyncSpokePassFailures() {
+	if m.edgeSyncSpokeSchedulerEnabled.Load() {
+		m.edgeSyncSpokePassFailures.Add(1)
+	}
+}
+
 // Auth Metrics
 func (m *Metrics) IncAuthRequests()  { m.authRequestsTotal.Add(1) }
 func (m *Metrics) IncAuthCacheHit()  { m.authCacheHits.Add(1) }
@@ -514,6 +547,21 @@ func (m *Metrics) IncWALRecoveryRecords(count int64)  { m.walRecoveryRecords.Add
 func (m *Metrics) IncWALDroppedEntries()              { m.walDroppedEntries.Add(1) }
 func (m *Metrics) IncWALFailedWrites()                { m.walFailedWrites.Add(1) }
 func (m *Metrics) IncWALOversizedPayloads()           { m.walOversizedPayloads.Add(1) }
+func (m *Metrics) SetWALDirectoryBytes(bytes int64)   { m.walDirectoryBytes.Store(bytes) }
+func (m *Metrics) IncWALQuarantinedFiles()            { m.walQuarantinedFiles.Add(1) }
+
+// SetWALPartialRowRecoveryPending records whether the last WAL recovery pass
+// retained a file whose parent entry had row ranges replayed. It makes the
+// operations
+// guide's "drain recovery with this version before downgrading" checkable
+// rather than aspirational.
+func (m *Metrics) SetWALPartialRowRecoveryPending(pending bool) {
+	value := int64(0)
+	if pending {
+		value = 1
+	}
+	m.walPartialRowRecovery.Store(value)
+}
 
 // Decompression Pool Metrics
 
@@ -619,7 +667,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
 
-	return map[string]interface{}{
+	snapshot := map[string]interface{}{
 		// Process info
 		"uptime_seconds": time.Since(m.startTime).Seconds(),
 
@@ -740,12 +788,15 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"mqtt_reconnects":        m.mqttReconnects.Load(),
 
 		// WAL
-		"wal_records_preserved":  m.walRecordsPreserved.Load(),
-		"wal_recovery_total":     m.walRecoveryTotal.Load(),
-		"wal_recovery_records":   m.walRecoveryRecords.Load(),
-		"wal_dropped_entries":    m.walDroppedEntries.Load(),
-		"wal_failed_writes":      m.walFailedWrites.Load(),
-		"wal_oversized_payloads": m.walOversizedPayloads.Load(),
+		"wal_records_preserved":            m.walRecordsPreserved.Load(),
+		"wal_recovery_total":               m.walRecoveryTotal.Load(),
+		"wal_recovery_records":             m.walRecoveryRecords.Load(),
+		"wal_dropped_entries":              m.walDroppedEntries.Load(),
+		"wal_failed_writes":                m.walFailedWrites.Load(),
+		"wal_oversized_payloads":           m.walOversizedPayloads.Load(),
+		"wal_directory_bytes":              m.walDirectoryBytes.Load(),
+		"wal_quarantined_files":            m.walQuarantinedFiles.Load(),
+		"wal_partial_row_recovery_pending": m.walPartialRowRecovery.Load(),
 
 		// Decompression Pool
 
@@ -799,6 +850,12 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"cluster_rbac_rejected_total":                            m.clusterRBACRejectedTotal.Load(),
 		"cluster_rbac_cascade_rejected_total":                    m.clusterRBACCascadeRejectedTotal.Load(),
 	}
+	if m.edgeSyncSpokeSchedulerEnabled.Load() {
+		snapshot["edge_sync_spoke_scheduler_enabled"] = int64(1)
+		snapshot["edge_sync_spoke_last_success_timestamp_seconds"] = m.edgeSyncSpokeLastSuccessUnix.Load()
+		snapshot["edge_sync_spoke_pass_failures_total"] = m.edgeSyncSpokePassFailures.Load()
+	}
+	return snapshot
 }
 
 // PrometheusFormat returns metrics in Prometheus text exposition format
@@ -997,6 +1054,21 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_compaction_manifests_recovered_total counter\n"...)
 	b = appendMetric(b, "arc_compaction_manifests_recovered_total", float64(m.compactionManifestsRecovered.Load()))
 
+	// Scheduled spoke metrics are absent on disabled and bundle-only nodes.
+	if m.edgeSyncSpokeSchedulerEnabled.Load() {
+		b = append(b, "# HELP arc_edgesync_spoke_scheduler_enabled Whether automatic network spoke sync is enabled\n"...)
+		b = append(b, "# TYPE arc_edgesync_spoke_scheduler_enabled gauge\n"...)
+		b = appendMetric(b, "arc_edgesync_spoke_scheduler_enabled", 1)
+
+		b = append(b, "# HELP arc_edgesync_spoke_last_success_timestamp_seconds Unix timestamp of the last successfully completed scheduled pass, zero if none\n"...)
+		b = append(b, "# TYPE arc_edgesync_spoke_last_success_timestamp_seconds gauge\n"...)
+		b = appendMetric(b, "arc_edgesync_spoke_last_success_timestamp_seconds", float64(m.edgeSyncSpokeLastSuccessUnix.Load()))
+
+		b = append(b, "# HELP arc_edgesync_spoke_pass_failures_total Failed scheduled network sync passes\n"...)
+		b = append(b, "# TYPE arc_edgesync_spoke_pass_failures_total counter\n"...)
+		b = appendMetric(b, "arc_edgesync_spoke_pass_failures_total", float64(m.edgeSyncSpokePassFailures.Load()))
+	}
+
 	// Auth metrics
 	b = append(b, "# HELP arc_auth_requests_total Total authentication requests\n"...)
 	b = append(b, "# TYPE arc_auth_requests_total counter\n"...)
@@ -1104,6 +1176,18 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_oversized_payloads_total Payloads rejected for exceeding the single-entry cap even after chunking\n"...)
 	b = append(b, "# TYPE arc_wal_oversized_payloads_total counter\n"...)
 	b = appendMetric(b, "arc_wal_oversized_payloads_total", float64(m.walOversizedPayloads.Load()))
+
+	b = append(b, "# HELP arc_wal_dir_bytes Current bytes occupied by every file in the WAL directory\n"...)
+	b = append(b, "# TYPE arc_wal_dir_bytes gauge\n"...)
+	b = appendMetric(b, "arc_wal_dir_bytes", float64(m.walDirectoryBytes.Load()))
+
+	b = append(b, "# HELP arc_wal_quarantined_files_total WAL files isolated after repeated recovery failures\n"...)
+	b = append(b, "# TYPE arc_wal_quarantined_files_total counter\n"...)
+	b = appendMetric(b, "arc_wal_quarantined_files_total", float64(m.walQuarantinedFiles.Load()))
+
+	b = append(b, "# HELP arc_wal_partial_row_recovery_pending 1 when the last WAL recovery pass left a retained file whose parent entry had row ranges replayed\n"...)
+	b = append(b, "# TYPE arc_wal_partial_row_recovery_pending gauge\n"...)
+	b = appendMetric(b, "arc_wal_partial_row_recovery_pending", float64(m.walPartialRowRecovery.Load()))
 
 	// Governance metrics
 	b = append(b, "# HELP arc_governance_rate_limited_total Queries rejected by rate limiting\n"...)

@@ -13,6 +13,11 @@ import (
 // dependency on it — the adapter in cmd/arc wraps the coordinator. Nil means
 // no cluster: every use is skipped.
 type ManifestCoordinator interface {
+	// ManifestEntriesByDatabase returns the currently registered hot paths for
+	// one database. Database deletion uses this snapshot to remove entries from
+	// every node before it removes any local storage objects.
+	ManifestEntriesByDatabase(database string) []string
+
 	// DeleteFilesFromManifest proposes ONE Raft entry removing paths from the
 	// manifest. Callers keep a call to manifestChunk paths: every node
 	// applies the entry synchronously and offers each removed local copy to
@@ -52,9 +57,10 @@ const manifestSettle = time.Hour
 const manifestReasonPrefix = "tiering:"
 
 const (
-	manifestReasonMigrated  = manifestReasonPrefix + "migrated"
-	manifestReasonReconcile = manifestReasonPrefix + "reconcile"
-	manifestReasonSweep     = manifestReasonPrefix + "sweep"
+	manifestReasonMigrated       = manifestReasonPrefix + "migrated"
+	manifestReasonReconcile      = manifestReasonPrefix + "reconcile"
+	manifestReasonSweep          = manifestReasonPrefix + "sweep"
+	manifestReasonDatabaseDelete = "database:delete"
 )
 
 // RetryTransient runs fn up to attempts times, waiting base, 2·base, 4·base…

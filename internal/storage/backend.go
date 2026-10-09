@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"time"
 )
 
@@ -11,6 +12,63 @@ import (
 // backends that do not support append writes (S3, Azure Blob Storage).
 // Callers should delete any partial file and retry from byte zero.
 var ErrResumeNotSupported = errors.New("storage: resume not supported by this backend")
+
+// ErrStoreNotFound reports that the bucket or container itself does not
+// exist — not that a key is missing inside it.
+//
+// It exists because "the store is not there" and "the store is there and
+// empty" mean different things to different callers, and only the caller
+// knows which. A fresh deployment reading before its first write wants
+// "no data yet": most S3-compatible stores create the bucket on the first
+// authenticated write, so the state heals itself and a 500 on the read is
+// pure noise (#945). But a caller that DECIDES from a listing — drops a tier
+// from a query, retires a metadata row, reports a backup complete — must
+// never read a missing store as "verified empty", because that turns a
+// misconfigured bucket name into a silently wrong answer.
+//
+// So the backends report it and the few read paths that want leniency opt in
+// with IsStoreNotFound. Everything else keeps failing as it always did. The
+// listing methods wrap it alongside the SDK's own error, so both chains stay
+// inspectable.
+var ErrStoreNotFound = errors.New("storage: bucket or container does not exist")
+
+// IsStoreNotFound reports whether err is a backend saying its bucket or
+// container does not exist. Use it instead of matching the SDKs' shapes:
+// S3 answers NoSuchBucket, Azure answers a ContainerNotFound ResponseError.
+func IsStoreNotFound(err error) bool {
+	return errors.Is(err, ErrStoreNotFound)
+}
+
+// ErrObjectNotFound reports that a key names no object.
+//
+// It exists so a caller can tell "that object is not there" apart from "the
+// store would not answer" with ONE round trip. Without it the only portable
+// way to ask was Exists-then-Read, which doubles the request count on a path
+// that runs once per object — the backup listing reads a manifest per backup,
+// and on a remote destination with a few hundred backups the extra HEAD per
+// backup is what exhausts an API handler's budget on a perfectly healthy
+// store.
+//
+// Each backend wraps it from its own not-found shape; IsNotFound is the
+// predicate to use rather than string-matching, because the shapes differ
+// (an *fs.PathError locally, NoSuchKey on S3, a 404 ResponseError on Azure).
+var ErrObjectNotFound = errors.New("file not found")
+
+// IsNotFound reports whether err is a backend saying the key names no object.
+//
+// Tolerant on purpose: it accepts the wrapped sentinel, a wrapped fs
+// not-exist, and the per-backend shapes the two SDKs produce, because not
+// every error path in this package has been routed through the sentinel and a
+// false "no" here would turn an absent object into a hard failure.
+func IsNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrObjectNotFound) || errors.Is(err, fs.ErrNotExist) {
+		return true
+	}
+	return isNotFoundError(err) || isAzureNotFoundError(err)
+}
 
 // Backend defines the interface for storage backends (local, S3, MinIO)
 type Backend interface {
@@ -126,6 +184,34 @@ type BatchDeleter interface {
 	DeleteBatch(ctx context.Context, paths []string) error
 }
 
+// ErrAdoptUnsupported reports that AdoptFile cannot move the named local file
+// into the backend: the rename is impossible for this pair of paths (most
+// often because they are on different filesystems), or the source filesystem
+// will not let Arc normalize the file mode. The caller must fall back to
+// WriteReader. The underlying cause is wrapped for logging.
+//
+// Nothing has been MOVED: the source file is still at localPath with its
+// contents intact, which is what makes a fallback copy safe. Its permission
+// bits may have been set to 0600 before the attempt failed, so a caller that
+// cares about the source mode must not assume it is unchanged.
+var ErrAdoptUnsupported = errors.New("storage: local file cannot be adopted in place")
+
+// FileAdopter is implemented by a backend whose objects ARE plain local files,
+// so a file the caller has already written on the same filesystem can be moved
+// into place instead of copied through WriteReader.
+//
+// On success the source file at localPath is CONSUMED: it no longer exists and
+// the caller must not read it afterwards. That is the point of the interface
+// and the reason it is opt-in rather than part of Backend. A backend that
+// copies bytes must not implement it, and a caller that still needs the file
+// must not use it.
+//
+// ErrAdoptUnsupported means "this pair of paths cannot be adopted, copy
+// instead" and is not a failure. Any other error is a real one.
+type FileAdopter interface {
+	AdoptFile(ctx context.Context, path, localPath string) error
+}
+
 // ObjectInfo provides metadata about a storage object.
 type ObjectInfo struct {
 	Path         string
@@ -137,6 +223,27 @@ type ObjectInfo struct {
 // This is useful for retention policies that need to check file ages.
 type ObjectLister interface {
 	ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, error)
+}
+
+// PrefixProber answers "is there at least one listable object under this
+// prefix" without listing the prefix.
+//
+// ListObjects is the wrong tool for that question on a large prefix: it walks
+// every file (local) or pages through every key (S3, Azure) and returns them
+// all, when the caller only needs to know whether the first one exists. The
+// backup API asks it for up to 256 database names inside one request timeout,
+// and a database can hold millions of files, so the probe has to stop at the
+// first hit. Implementations apply the same prefix contract (ValidateListPrefix)
+// and the same visibility rule as ListObjects: an object the listing would
+// hide (a dot-prefixed name, a key the contract refuses, a staging partial) is
+// not a hit, so "false" from the probe and "empty" from ListObjects agree. A
+// prefix that names nothing at all is false with a nil error.
+//
+// Optional: callers type-assert and fall back to ListObjects when the backend
+// does not implement it (test fakes that embed the Backend interface, for
+// instance). LocalBackend, S3Backend and AzureBlobBackend all implement it.
+type PrefixProber interface {
+	HasObjectsUnderPrefix(ctx context.Context, prefix string) (bool, error)
 }
 
 // UnusableObject is an object that exists in the store but that no listing

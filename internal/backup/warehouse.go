@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 
@@ -48,6 +49,12 @@ func (m *Manager) configureIcebergWarehouse(cfg *ManagerConfig) {
 	if lb, ok := cfg.DataStorage.(*storage.LocalBackend); ok {
 		root := resolveExistingPath(lb.GetBasePath())
 		if pathWithin(wh, root) {
+			// Remember where under the root it sits: "" for the root itself,
+			// "<sub>/" for the #534 subdirectory layout. A scoped backup
+			// finds the namespace directories it leaves out through it.
+			if rel, err := filepath.Rel(root, wh); err == nil && rel != "." {
+				m.icebergWarehouseKeyPrefix = filepath.ToSlash(rel) + "/"
+			}
 			m.logger.Debug().Str("warehouse", wh).Str("storage_root", root).
 				Msg("Iceberg warehouse is under the storage root; the data listing covers its metadata")
 			return
@@ -57,7 +64,14 @@ func (m *Manager) configureIcebergWarehouse(cfg *ManagerConfig) {
 				Msg("Iceberg warehouse contains the storage root; only its " + m.icebergNSPrefix + "_*.db namespace directories are backed up from it")
 		}
 	}
-	if bp := resolveExistingPath(cfg.BackupPath); pathWithin(bp, wh) {
+	// Containment against the backup destination is a question only a LOCAL
+	// destination has (#1085 stage B2b-1): an object store cannot contain a
+	// directory on this machine. Asking it of cfg.BackupPath while a remote
+	// target is configured would be worse than useless — BackupPath keeps its
+	// "./data/backups" default and is not the destination, so the warning
+	// would name a directory nothing writes to, and resolveExistingPath("")
+	// resolves to the WORKING DIRECTORY, which contains almost everything.
+	if bp := localDestinationPath(cfg); bp != "" && pathWithin(bp, wh) {
 		m.logger.Warn().Str("warehouse", wh).Str("backup_path", bp).
 			Msg("Iceberg warehouse contains the backup directory; only its " + m.icebergNSPrefix + "_*.db namespace directories are backed up from it")
 	}
@@ -67,42 +81,56 @@ func (m *Manager) configureIcebergWarehouse(cfg *ManagerConfig) {
 		Msg("Iceberg warehouse is outside the storage root; backups copy its table metadata separately under " + icebergBackupPrefix + "/")
 }
 
-// resolveExistingPath returns p as an absolute, cleaned path with symlinks
-// resolved. A path that does not exist yet is resolved through its deepest
-// existing ancestor and the remainder is re-joined, so a fresh node whose
-// warehouse sits under a symlinked parent still classifies correctly.
-func resolveExistingPath(p string) string {
-	abs, err := filepath.Abs(p)
-	if err != nil {
-		return filepath.Clean(p)
-	}
-	abs = filepath.Clean(abs)
-	var tail []string
-	cur := abs
-	for {
-		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
-			for i := len(tail) - 1; i >= 0; i-- {
-				resolved = filepath.Join(resolved, tail[i])
-			}
-			return resolved
+// localDestinationPath returns the resolved local directory the DEFAULT
+// backup target will be written to, or "" when that destination is an object
+// store or no local path is configured at all.
+//
+// The default target alone, because this answers one question — can the
+// Iceberg warehouse CONTAIN the backup directory — and a warehouse on this
+// machine can only contain a directory on this machine. A routed target is
+// checked by config.checkBackupDestinationOverlap, which refuses an overlap
+// with primary storage for every target; the warning here is the one thing
+// that needs a path rather than a Destination.
+func localDestinationPath(cfg *ManagerConfig) string {
+	path := cfg.BackupPath
+	if def := defaultConfiguredTarget(cfg); def != nil {
+		if def.Remote {
+			return ""
 		}
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			return abs
-		}
-		tail = append(tail, filepath.Base(cur))
-		cur = parent
+		path = def.Spec.LocalPath
 	}
+	if path == "" {
+		return ""
+	}
+	return resolveExistingPath(path)
 }
 
-// pathWithin reports whether p is dir itself or lies beneath it, matching only
-// at a path boundary: "/data/wh-other" is not within "/data/wh" (#534).
-func pathWithin(p, dir string) bool {
-	sep := string(filepath.Separator)
-	dir = strings.TrimSuffix(filepath.Clean(dir), sep)
-	p = filepath.Clean(p)
-	return p == dir || strings.HasPrefix(p, dir+sep)
+// defaultConfiguredTarget is the member of cfg.Targets that cfg.DefaultTarget
+// names, or nil when no target is configured. A DefaultTarget naming none of
+// them is refused by NewManager, so nil here means "no targets".
+func defaultConfiguredTarget(cfg *ManagerConfig) *Target {
+	for i := range cfg.Targets {
+		if cfg.Targets[i].Name == cfg.DefaultTarget {
+			return &cfg.Targets[i]
+		}
+	}
+	return nil
 }
+
+// resolveExistingPath and pathWithin are storage.ResolveExistingPath and
+// storage.PathWithin.
+//
+// The implementations moved to internal/storage when the backup-destination
+// overlap refusal needed the same two rules (#1085 stage B2b): the refusal
+// runs in config.Load, which cannot import this package, and two
+// independently-maintained copies of a boundary match is exactly how #534's
+// own fix shipped a mid-segment HasPrefix bug. Kept as package-local names so
+// the six call sites in this file and the table tests that pin their
+// behaviour continue to read as they did, and so those tests now exercise the
+// shared implementation rather than a second copy of it.
+func resolveExistingPath(p string) string { return storage.ResolveExistingPath(p) }
+
+func pathWithin(p, dir string) bool { return storage.PathWithin(p, dir) }
 
 // listIcebergWarehouseFiles walks the outside-root warehouse and returns the
 // exporter's table metadata files. The walk is scoped to the exporter's own
@@ -116,10 +144,24 @@ func pathWithin(p, dir string) bool {
 // Symlink entries are skipped. A warehouse that does not exist yet is empty. Any
 // other walk error is fatal: a silently partial warehouse is the bug this fixes.
 func (m *Manager) listIcebergWarehouseFiles() ([]warehouseFile, error) {
+	return m.walkIcebergWarehouse(nil)
+}
+
+// walkIcebergWarehouse is listIcebergWarehouseFiles with an optional filter on
+// the namespace directory: when keep is non-nil, a namespace it declines is
+// skipped whole. A scoped backup uses it to count only its own databases'
+// namespaces (#1084); the unscoped walk passes nil.
+func (m *Manager) walkIcebergWarehouse(keep func(nsDir string) bool) ([]warehouseFile, error) {
 	root := m.icebergWarehouse
 	if _, err := os.Stat(root); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			m.logger.Info().Str("warehouse", root).Msg("Iceberg warehouse does not exist yet; nothing to back up from it")
+			// A scoped count pass (keep != nil) backs nothing up from the
+			// warehouse either way; only the unscoped copy pass says so loud.
+			ev := m.logger.Info()
+			if keep != nil {
+				ev = m.logger.Debug()
+			}
+			ev.Str("warehouse", root).Msg("Iceberg warehouse does not exist yet; nothing to back up from it")
 			return nil, nil
 		}
 		return nil, fmt.Errorf("stat iceberg warehouse %s: %w", root, err)
@@ -163,6 +205,9 @@ func (m *Manager) listIcebergWarehouseFiles() ([]warehouseFile, error) {
 			if !strings.HasPrefix(name, m.icebergNSPrefix+"_") || !strings.HasSuffix(name, ".db") {
 				return fs.SkipDir
 			}
+			if keep != nil && !keep(name) {
+				return fs.SkipDir
+			}
 		case 2: // table directory
 			if !d.IsDir() {
 				return nil
@@ -199,6 +244,61 @@ func (m *Manager) listIcebergWarehouseFiles() ([]warehouseFile, error) {
 	return out, nil
 }
 
+// countExcludedIcebergNamespaces records, for a scoped backup (#1084), how
+// much Iceberg table metadata of the scoped databases it left out and where it
+// is: the namespace directory <prefix>_<db>.db of each scoped database, found
+// under the storage root (at the root itself or under the configured
+// subdirectory, through icebergWarehouseKeyPrefix) with one prefix listing
+// per database, or in the outside-root warehouse with the scoped walk. The
+// in-root listing is of the data store and fails the run like the data
+// listing would; the outside-root walk only counts, so a warehouse that
+// cannot be read is logged and the count left at zero, consistent with the
+// downgraded preflight. Only called when Iceberg export is on.
+func (m *Manager) countExcludedIcebergNamespaces(ctx context.Context, lister storage.ObjectLister, sc *scope, manifest *Manifest) error {
+	if m.icebergWarehouse == "" {
+		for _, name := range sc.names {
+			dir := m.icebergWarehouseKeyPrefix + icebergNamespaceDir(m.icebergNSPrefix, name)
+			objs, err := lister.ListObjects(ctx, dir+"/")
+			if err != nil {
+				return fmt.Errorf("failed to list the Iceberg namespace directory %s: %w", dir, err)
+			}
+			if len(objs) == 0 {
+				continue
+			}
+			manifest.IcebergNamespaceFilesExcluded += int64(len(objs))
+			manifest.IcebergNamespacesExcluded = append(manifest.IcebergNamespacesExcluded, dir)
+		}
+	} else {
+		files, err := m.walkIcebergWarehouse(func(dir string) bool { return sc.ownsIcebergNamespaceDir(dir, m.icebergNSPrefix) })
+		if err != nil {
+			m.logger.Warn().Err(err).Str("warehouse", m.icebergWarehouse).
+				Msg("Could not count the Iceberg namespace metadata this scoped backup leaves out; a scoped backup does not copy the warehouse")
+			return nil
+		}
+		perDir := make(map[string]int64)
+		for _, f := range files {
+			dir, _, _ := strings.Cut(f.rel, "/")
+			perDir[dir]++
+		}
+		dirs := make([]string, 0, len(perDir))
+		for dir := range perDir {
+			dirs = append(dirs, dir)
+		}
+		sort.Strings(dirs)
+		for _, dir := range dirs {
+			manifest.IcebergNamespaceFilesExcluded += perDir[dir]
+			manifest.IcebergNamespacesExcluded = append(manifest.IcebergNamespacesExcluded, dir)
+		}
+	}
+	if manifest.IcebergNamespaceFilesExcluded > 0 {
+		m.logger.Info().
+			Int64("files", manifest.IcebergNamespaceFilesExcluded).
+			Strs("namespaces", manifest.IcebergNamespacesExcluded).
+			Msg("Iceberg table metadata of the scoped databases is not in this backup: the Iceberg catalog is instance-wide and travels with include_metadata, which a scoped backup cannot carry; take an unscoped backup for the Iceberg tables")
+	}
+	return nil
+}
+
 // preflightIcebergWarehouse fails a backup before any data is copied when the
 // outside-root warehouse exists but cannot be read, so a permission problem
 // surfaces in seconds rather than after the whole data set was copied. A
@@ -216,7 +316,16 @@ func (m *Manager) preflightIcebergWarehouse() error {
 // copyIcebergWarehouse copies the walked files under <backupID>/iceberg/<rel>.
 // A source that cannot be opened is skipped and counted, like a data file that
 // vanished between listing and copy; every other failure aborts the backup.
-func (m *Manager) copyIcebergWarehouse(ctx context.Context, backupID string, files []warehouseFile, progress *Progress) (int64, error) {
+//
+// Always the DEFAULT leg (#1085 stage B2b-2), made explicit by taking it as a
+// parameter rather than being incidental: an outside-root warehouse belongs to
+// no database — it is the instance's Iceberg metadata, only useful with the
+// instance-wide SQL catalog, which rides with include_metadata to the same
+// place.
+func (m *Manager) copyIcebergWarehouse(ctx context.Context, leg *backupLeg, files []warehouseFile) (int64, error) {
+	run := leg.run
+	backupID := run.id
+	progress := run.progress
 	var skipped int64
 	for _, f := range files {
 		select {
@@ -225,10 +334,18 @@ func (m *Manager) copyIcebergWarehouse(ctx context.Context, backupID string, fil
 		default:
 		}
 		destPath := backupID + "/" + icebergBackupPrefix + "/" + f.rel
+		// Failing the whole run here is deliberate (#1100), for the same
+		// reason copyStateFiles fails on an unstorable key: absence would not
+		// be detectable. A warehouse is not routed per database and cannot be
+		// partially useful — Iceberg metadata is a graph of cross-references,
+		// so a backup holding all of it but one manifest list restores a
+		// catalog whose tables do not resolve, discovered at read time rather
+		// than at backup time. Only the data path skips, because a skipped
+		// data file is counted, named and still held by the source.
 		if err := storage.ValidateKey(destPath); err != nil {
 			return skipped, fmt.Errorf("iceberg warehouse file %q cannot be stored under a valid backup key: %w", f.rel, err)
 		}
-		written, err := m.streamLocalFileToBackup(ctx, f.abs, destPath)
+		written, err := m.streamLocalFileToBackup(ctx, leg.target, f.abs, destPath)
 		if err != nil {
 			if !isSourceReadError(err) {
 				return skipped, fmt.Errorf("failed to back up iceberg warehouse file %s: %w", f.rel, err)
@@ -239,10 +356,13 @@ func (m *Manager) copyIcebergWarehouse(ctx context.Context, backupID string, fil
 		}
 		atomic.AddInt64(&progress.ProcessedFiles, 1)
 		atomic.AddInt64(&progress.ProcessedBytes, written)
-		m.setProgress(progress)
+		atomic.AddInt64(&leg.files, 1)
+		atomic.AddInt64(&leg.bytes, written)
+		run.publishTargets()
 	}
 	atomic.AddInt64(&progress.SkippedFiles, skipped)
-	m.setProgress(progress)
+	atomic.AddInt64(&leg.skipped, skipped)
+	run.publishTargets()
 	return skipped, nil
 }
 
@@ -250,7 +370,7 @@ func (m *Manager) copyIcebergWarehouse(ctx context.Context, backupID string, fil
 // is opened once and its size taken from that handle, so the declared length
 // matches the bytes streamed. Open and stat failures are source-read errors
 // (skippable); a backup-storage write failure is fatal.
-func (m *Manager) streamLocalFileToBackup(ctx context.Context, srcAbs, destPath string) (int64, error) {
+func (m *Manager) streamLocalFileToBackup(ctx context.Context, dest backupTarget, srcAbs, destPath string) (int64, error) {
 	f, err := os.Open(srcAbs)
 	if err != nil {
 		return 0, fmt.Errorf("%w: open %s: %v", errBackupRead, srcAbs, err)
@@ -260,9 +380,9 @@ func (m *Manager) streamLocalFileToBackup(ctx context.Context, srcAbs, destPath 
 	if err != nil {
 		return 0, fmt.Errorf("%w: stat %s: %v", errBackupRead, srcAbs, err)
 	}
-	if err := m.backupStorage.WriteReader(ctx, destPath, f, info.Size()); err != nil {
-		m.cleanupPartialWrite(ctx, m.backupStorage, destPath)
-		return 0, fmt.Errorf("failed to write to backup storage: %w", err)
+	if err := dest.backend.WriteReader(ctx, destPath, f, info.Size()); err != nil {
+		m.cleanupPartialBackupWrite(ctx, dest, destPath)
+		return 0, fmt.Errorf("failed to write to %s: %w", dest.describe(), err)
 	}
 	return info.Size(), nil
 }
@@ -272,11 +392,17 @@ func (m *Manager) streamLocalFileToBackup(ctx context.Context, srcAbs, destPath 
 // LOCAL configuration, never a path named by the manifest: the manifest is data
 // read from backup storage. The catalog's metadata locations are absolute, so
 // the restore can only work when this node's warehouse is at the source's path.
-func (m *Manager) restoreIcebergWarehouse(ctx context.Context, backupID string, manifest *Manifest, progress *Progress, catalogRestored bool) error {
+//
+// src is the run's ANCHOR leg — the leg whose manifest declared the warehouse —
+// and not whatever target is the default now. A zero-object listing returns nil
+// below, so reading the wrong leg does not fail: it reports a completed restore
+// that wrote no warehouse back, which is #637's failure mode. See
+// runRead.anchor.
+func (m *Manager) restoreIcebergWarehouse(ctx context.Context, src backupTarget, backupID string, manifest *Manifest, progress *Progress, catalogRestored bool) error {
 	prefix := backupID + "/" + icebergBackupPrefix + "/"
-	files, err := m.backupStorage.List(ctx, prefix)
+	files, err := src.backend.List(ctx, prefix)
 	if err != nil {
-		return fmt.Errorf("failed to list backup iceberg warehouse files: %w", err)
+		return fmt.Errorf("failed to list the backup iceberg warehouse files in %s: %w", src.describe(), err)
 	}
 	if len(files) == 0 {
 		return nil
@@ -328,7 +454,7 @@ func (m *Manager) restoreIcebergWarehouse(ctx context.Context, backupID string, 
 		if err != nil {
 			return fmt.Errorf("refusing to restore backup object %s: %w", srcPath, err)
 		}
-		written, err := m.streamRestoreToLocalFile(ctx, srcPath, dest)
+		written, err := m.streamRestoreToLocalFile(ctx, src, srcPath, dest)
 		if err != nil {
 			if !isRestoreReadError(err) {
 				return fmt.Errorf("failed to restore %s: %w", srcPath, err)
@@ -379,7 +505,7 @@ func warehouseRestorePath(root, rel string) (string, error) {
 // streamRestoreToLocalFile streams one backup object to a local file via a
 // temp file in the destination directory and a rename, with Arc's 0600/0700
 // modes. Only a backup-storage read failure is skippable.
-func (m *Manager) streamRestoreToLocalFile(ctx context.Context, srcPath, dest string) (int64, error) {
+func (m *Manager) streamRestoreToLocalFile(ctx context.Context, src backupTarget, srcPath, dest string) (int64, error) {
 	if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
 		return 0, fmt.Errorf("failed to create warehouse directory: %w", err)
 	}
@@ -390,7 +516,7 @@ func (m *Manager) streamRestoreToLocalFile(ctx context.Context, srcPath, dest st
 	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath)
 	tw := &trackingWriter{w: tmp}
-	if err := m.backupStorage.ReadTo(ctx, srcPath, tw); err != nil {
+	if err := src.backend.ReadTo(ctx, srcPath, tw); err != nil {
 		tmp.Close()
 		return 0, classifyReadTo(srcPath, err, tw.err)
 	}

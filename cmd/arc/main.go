@@ -181,6 +181,23 @@ func applyLicenseCoreLimits(lic *license.License, cfg *config.Config) {
 		cfg.Database.ThreadCount = lic.MaxCores
 	}
 
+	// Each compaction subprocess is separate, so the main process's thread
+	// limits cannot constrain its DuckDB threads. Match the other licensed
+	// execution knobs: cap each positive subprocess setting at the license and
+	// at the effective cores available to this process. Do not replace zero:
+	// Config.Load resolves that automatic sentinel in production, while a
+	// directly constructed Config must retain DuckDB's own CPU-aware default.
+	licensedCompactionThreads := min(lic.MaxCores, effective)
+	if cfg.Compaction.Threads > licensedCompactionThreads {
+		log.Info().
+			Int("licensed_cores", lic.MaxCores).
+			Int("effective_cores", effective).
+			Int("configured_threads", cfg.Compaction.Threads).
+			Int("compaction_threads", licensedCompactionThreads).
+			Msg("License/effective core limit applied to compaction subprocess threads")
+		cfg.Compaction.Threads = licensedCompactionThreads
+	}
+
 	if cfg.Ingest.FlushWorkers > lic.MaxCores {
 		cfg.Ingest.FlushWorkers = lic.MaxCores
 		log.Info().
@@ -212,6 +229,14 @@ func main() {
 	// Setup logger
 	logger.Setup(cfg.Log.Level, cfg.Log.Format)
 	log.Info().Str("version", Version).Bool("duckdb_arrow", database.ArrowEnabled).Bool("fips_mode", fips.Enabled()).Msg("Starting Arc...")
+
+	// Load-time advisories about values Arc accepted and kept. config.Load has
+	// no logger, so it collects them and this is the one place they are
+	// emitted. Str fields rather than a formatted message: the value goes in a
+	// structured field so installErrSanitizer cannot mask it.
+	for _, w := range cfg.Warnings {
+		log.Warn().Str("key", w.Key).Str("value", w.Value).Msg(w.Message)
+	}
 
 	// Fail closed: the arc-fips build (fips.BuildTagged) MUST run with the Go
 	// Cryptographic Module actually in FIPS mode. The binary bakes in
@@ -441,6 +466,7 @@ func main() {
 		AzureSASToken:         cfg.Storage.AzureSASToken,
 		AzureEndpoint:         cfg.Storage.AzureEndpoint,
 		AzureContainer:        cfg.Storage.AzureContainer,
+		AzurePrefix:           cfg.Storage.AzurePrefix,
 		// Primary-backend signal for Azure (mirrors S3IsPrimaryBackend): only an
 		// azure/azblob primary backend provisions a primary Azure secret.
 		AzureIsPrimaryBackend: cfg.Storage.Backend == "azure" || cfg.Storage.Backend == "azblob",
@@ -453,6 +479,7 @@ func main() {
 		ColdS3Bucket:       cfg.TieredStorage.Cold.S3Bucket,
 		ColdS3Prefix:       cfg.TieredStorage.Cold.S3Prefix,
 		ColdAzureContainer: cfg.TieredStorage.Cold.AzureContainer,
+		ColdAzurePrefix:    cfg.TieredStorage.Cold.AzurePrefix,
 		// Local storage root used by the DuckDB sandbox to whitelist
 		// Arc-managed file paths in allowed_directories. Always populated
 		// regardless of the configured backend; on S3/Azure-only deployments
@@ -777,25 +804,77 @@ func main() {
 		Int("idle", stats.Idle).
 		Msg("Database connection pool stats")
 
-	// Initialize storage backend
+	// Initialize storage backend.
+	//
+	// The switch maps this deployment's config onto a storage.BackendSpec and
+	// picks the operator-facing wording; storage.NewBackend (internal/storage/
+	// factory.go) owns the construction and its typed-nil guarantee (#713).
+	// What stays here is everything that is this call site's business and
+	// nobody else's: the logger name, the decision that a failure is fatal, the
+	// per-backend messages, and the shutdown registration.
+	//
+	// The switch is on the raw cfg.Storage.Backend so the accepted set is
+	// exactly what it has always been: config.Load lowercases and trims
+	// storage.backend before anything reads it, and already refuses anything
+	// outside the five aliases with "storage.backend %q is invalid". The
+	// default below is therefore unreachable through config today; it keeps its
+	// wording so a caller that ever bypasses that validation still Fatals here,
+	// before a backend is built.
 	var storageBackend storage.Backend
+	storageSpec := storage.BackendSpec{Type: cfg.Storage.Backend}
+	// Both of these have a usable default so that the next backend added below
+	// degrades a message instead of crashing. Every case sets them today and
+	// the default case provably exits, but a new case that fills in the spec
+	// and forgets logStorageReady would call nil AFTER the backend was already
+	// registered, and one that forgets logStorageFatal would Fatal with an
+	// empty message. go vet reports neither.
+	//
+	// The fatal is a closure rather than a message string so each case can put
+	// the values that identify its destination into STRUCTURED fields.
+	// installErrSanitizer masks quoted spans in every logged error, globally
+	// and deliberately, so ANY error whose text quotes the offending value —
+	// an unusable bucket or container name, a credential shape the SDK
+	// rejects, an endpoint it cannot parse — reaches the operator as "...".
+	// A field survives that. Same reason cluster.role reports its value in a
+	// field (see ResolveRole below).
+	//
+	// Note the prefix is no longer among those cases: config.Load validates
+	// every object-store prefix key, so an unusable one is a load-time error
+	// printed before the logger exists and never reaches here. It was the
+	// failure that motivated this closure, and fixing it at the root was the
+	// better half of that change; the closure stays because the reasoning
+	// applies to every other error this line can carry.
+	logStorageFatal := func(err error) {
+		log.Fatal().Err(err).
+			Str("backend", cfg.Storage.Backend).
+			Msg("Failed to initialize storage backend")
+	}
+	logStorageReady := func() {
+		log.Info().
+			Str("backend", cfg.Storage.Backend).
+			Msg("Storage backend initialized")
+	}
 	switch cfg.Storage.Backend {
 	case "local":
-		storageBackend, err = storage.NewLocalBackend(cfg.Storage.LocalPath, logger.Get("storage"))
-		if err != nil {
-			log.Fatal().Err(err).Msg("Failed to initialize local storage backend")
+		storageSpec.LocalPath = cfg.Storage.LocalPath
+		logStorageFatal = func(err error) {
+			log.Fatal().Err(err).
+				Str("backend", cfg.Storage.Backend).
+				Str("path", cfg.Storage.LocalPath).
+				Msg("Failed to initialize local storage backend")
 		}
-		shutdownCoordinator.Register("storage", storageBackend, shutdown.PriorityStorage)
-		log.Info().
-			Str("backend", "local").
-			Str("path", cfg.Storage.LocalPath).
-			Msg("Storage backend initialized")
+		logStorageReady = func() {
+			log.Info().
+				Str("backend", "local").
+				Str("path", cfg.Storage.LocalPath).
+				Msg("Storage backend initialized")
+		}
 
 	case "s3", "minio":
 		// Note: an empty s3_bucket for an S3 primary backend is rejected earlier
 		// in config.Load (before database.New builds the DuckDB secret), so by
 		// here the bucket is guaranteed non-empty.
-		s3Config := &storage.S3Config{
+		storageSpec.S3 = storage.S3Config{
 			Bucket:    cfg.Storage.S3Bucket,
 			Region:    cfg.Storage.S3Region,
 			Endpoint:  cfg.Storage.S3Endpoint,
@@ -805,43 +884,64 @@ func main() {
 			PathStyle: cfg.Storage.S3PathStyle,
 			Prefix:    cfg.Storage.S3Prefix,
 		}
-		storageBackend, err = storage.NewS3Backend(s3Config, logger.Get("storage"))
-		if err != nil {
-			log.Fatal().Err(err).Msg("Failed to initialize S3 storage backend")
+		logStorageFatal = func(err error) {
+			log.Fatal().Err(err).
+				Str("backend", cfg.Storage.Backend).
+				Str("bucket", cfg.Storage.S3Bucket).
+				Str("prefix", cfg.Storage.S3Prefix).
+				Msg("Failed to initialize S3 storage backend")
 		}
-		shutdownCoordinator.Register("storage", storageBackend, shutdown.PriorityStorage)
-		log.Info().
-			Str("backend", cfg.Storage.Backend).
-			Str("bucket", cfg.Storage.S3Bucket).
-			Str("prefix", cfg.Storage.S3Prefix).
-			Str("region", cfg.Storage.S3Region).
-			Str("endpoint", cfg.Storage.S3Endpoint).
-			Msg("Storage backend initialized")
+		logStorageReady = func() {
+			log.Info().
+				Str("backend", cfg.Storage.Backend).
+				Str("bucket", cfg.Storage.S3Bucket).
+				Str("prefix", cfg.Storage.S3Prefix).
+				Str("region", cfg.Storage.S3Region).
+				Str("endpoint", cfg.Storage.S3Endpoint).
+				Msg("Storage backend initialized")
+		}
 
 	case "azure", "azblob":
-		azureConfig := &storage.AzureBlobConfig{
+		storageSpec.Azure = storage.AzureBlobConfig{
 			ConnectionString:   cfg.Storage.AzureConnectionString,
 			AccountName:        cfg.Storage.AzureAccountName,
 			AccountKey:         cfg.Storage.AzureAccountKey,
 			SASToken:           cfg.Storage.AzureSASToken,
 			ContainerName:      cfg.Storage.AzureContainer,
+			Prefix:             cfg.Storage.AzurePrefix,
 			Endpoint:           cfg.Storage.AzureEndpoint,
 			UseManagedIdentity: cfg.Storage.AzureUseManagedIdentity,
 		}
-		storageBackend, err = storage.NewAzureBlobBackend(azureConfig, logger.Get("storage"))
-		if err != nil {
-			log.Fatal().Err(err).Msg("Failed to initialize Azure Blob Storage backend")
+		logStorageFatal = func(err error) {
+			log.Fatal().Err(err).
+				Str("backend", cfg.Storage.Backend).
+				Str("container", cfg.Storage.AzureContainer).
+				Str("prefix", cfg.Storage.AzurePrefix).
+				Msg("Failed to initialize Azure Blob Storage backend")
 		}
-		shutdownCoordinator.Register("storage", storageBackend, shutdown.PriorityStorage)
-		log.Info().
-			Str("backend", cfg.Storage.Backend).
-			Str("container", cfg.Storage.AzureContainer).
-			Str("account", cfg.Storage.AzureAccountName).
-			Msg("Storage backend initialized")
+		logStorageReady = func() {
+			log.Info().
+				Str("backend", cfg.Storage.Backend).
+				Str("container", cfg.Storage.AzureContainer).
+				Str("prefix", cfg.Storage.AzurePrefix).
+				Str("account", cfg.Storage.AzureAccountName).
+				Msg("Storage backend initialized")
+		}
 
 	default:
 		log.Fatal().Str("backend", cfg.Storage.Backend).Msg("Unsupported storage backend (use 'local', 's3', 'minio', 'azure', or 'azblob')")
 	}
+
+	// log.Fatal in the default case exits the process, so by here the backend
+	// type is one of the five aliases and both logStorageFatal and
+	// logStorageReady carry that case's wording rather than the generic
+	// fallbacks they were declared with.
+	storageBackend, err = storage.NewBackend(storageSpec, logger.Get("storage"))
+	if err != nil {
+		logStorageFatal(err)
+	}
+	shutdownCoordinator.Register("storage", storageBackend, shutdown.PriorityStorage)
+	logStorageReady()
 
 	// Pattern 2 shared-storage multi-writer mode startup validation.
 	// Refuses to start under four conditions that would silently break
@@ -1015,6 +1115,16 @@ func main() {
 	if walWriter != nil {
 		shutdownCoordinator.Register("wal-purge", shutdownFunc(func() error {
 			if !arrowBuffer.CloseFlushedCleanly() {
+				// Same retention, two different causes. Sending an operator to
+				// "the buffer flush errors logged above" when a recovery pass
+				// merely kept a file points them at logs that do not exist.
+				if arrowBuffer.RetainedForWALRecoveryOnly() {
+					log.Warn().
+						Msg("Retaining WAL files: a WAL recovery pass is still outstanding — files were kept, a flush barrier failed, " +
+							"or the pass returned an error. No buffer flush failed. Those files will be replayed on next startup; " +
+							"do not clear the WAL directory.")
+					return nil
+				}
 				log.Error().
 					Msg("Retaining WAL files: buffer flush did not complete cleanly on shutdown. " +
 						"Unflushed records remain in the WAL and will be replayed on next startup. " +
@@ -1050,6 +1160,24 @@ func main() {
 		if walWriter != nil {
 			startupActiveFile = walWriter.CurrentFile()
 		}
+
+		// Parent finalization waits for WAL queue capacity instead of dropping
+		// on a full queue, the same trade the forced maintenance rotation took
+		// (#1009). It needs its OWN deadline: the startup pass runs on
+		// context.Background(), so threading the pass context alone would bound
+		// nothing. Same source as the rotation timeout below.
+		checkpointRecovered := newCheckpointRecovered(walWriter,
+			time.Duration(cfg.Ingest.FlushTimeoutSeconds)*time.Second)
+
+		// Mirrors RecoveryStats.PartialRowEntries: 1 while the last pass left
+		// partially checkpointed row ranges on disk, which is the state an
+		// older binary replays in full. Makes the downgrade guidance checkable.
+		updatePartialRowRecovery := func(stats *wal.RecoveryStats) {
+			if stats == nil {
+				return
+			}
+			metrics.Get().SetWALPartialRowRecoveryPending(stats.PartialRowEntries > 0)
+		}
 		// NOTE: no MinFileAge here — startup recovery runs exactly once,
 		// before any ingest, so there is no rotation race (the active file
 		// is fully identified by SkipActiveFile), and a just-crashed
@@ -1058,24 +1186,56 @@ func main() {
 		// for the PERIODIC flush-failure recovery below, where ingest (and
 		// therefore rotation) is live during the scan.
 		recoveryStats, err := walRecovery.RecoverWithOptions(context.Background(), recoveryCallback, &wal.RecoveryOptions{
-			SkipActiveFile:   startupActiveFile,
-			BatchSize:        cfg.WAL.RecoveryBatchSize,
-			ColumnarCallback: columnarCallback,
+			SkipActiveFile:      startupActiveFile,
+			BatchSize:           cfg.WAL.RecoveryBatchSize,
+			ColumnarCallback:    columnarCallback,
+			TrackedRowCallback:  createTrackedWALRecoveryCallback(arrowBuffer, logger.Get("wal-recovery")),
+			ValidateTrackedRows: validateTrackedWALRecoveryRows,
+			CheckpointRecovered: checkpointRecovered,
+			BeforeDelete:        arrowBuffer.NewRecoveryFlushBarrier(),
+			BarrierBatchFiles:   16,
+			BarrierBatchRows:    cfg.Ingest.MaxBufferSize,
+			MaxReplayFailures:   3,
 		})
+		recoveryNeedsRetry := err != nil
 		if err != nil {
 			log.Error().Err(err).Msg("WAL recovery failed")
-		} else if recoveryStats.RecoveredFiles > 0 {
-			// Track recovery metrics
-			metrics.Get().IncWALRecoveryTotal()
-			metrics.Get().IncWALRecoveryRecords(int64(recoveryStats.RecoveredEntries))
-			log.Info().
-				Int("files", recoveryStats.RecoveredFiles).
-				Int("batches", recoveryStats.RecoveredBatches).
-				Int("entries", recoveryStats.RecoveredEntries).
-				Int("corrupted", recoveryStats.CorruptedEntries).
-				Dur("duration", recoveryStats.RecoveryDuration).
-				Msg("WAL recovery complete")
 		}
+		if recoveryStats != nil {
+			if recoveryStats.RecoveredFiles > 0 {
+				// Track recovery metrics
+				metrics.Get().IncWALRecoveryTotal()
+				metrics.Get().IncWALRecoveryRecords(int64(recoveryStats.RecoveredEntries))
+				log.Info().
+					Int("files", recoveryStats.RecoveredFiles).
+					Int("batches", recoveryStats.RecoveredBatches).
+					Int("entries", recoveryStats.RecoveredEntries).
+					Int("corrupted", recoveryStats.CorruptedEntries).
+					Dur("duration", recoveryStats.RecoveryDuration).
+					Msg("WAL recovery complete")
+			}
+			for i := 0; i < recoveryStats.QuarantinedFiles; i++ {
+				metrics.Get().IncWALQuarantinedFiles()
+			}
+			if recoveryStats.KeptFiles > 0 || recoveryStats.BarrierFailures > 0 {
+				recoveryNeedsRetry = true
+			}
+			updatePartialRowRecovery(recoveryStats)
+		}
+		if recoveryNeedsRetry {
+			arrowBuffer.MarkWALRecoveryPending()
+		}
+
+		walSizeLogger := logger.Get("wal-maintenance")
+		updateWALDirectoryBytes := func() {
+			bytes, err := wal.DirectoryBytes(cfg.WAL.Directory)
+			if err != nil {
+				walSizeLogger.Warn().Err(err).Msg("Failed to sample WAL directory size")
+				return
+			}
+			metrics.Get().SetWALDirectoryBytes(bytes)
+		}
+		updateWALDirectoryBytes()
 
 		// Start periodic WAL maintenance goroutine.
 		// Two modes:
@@ -1089,68 +1249,110 @@ func main() {
 			return nil
 		}, shutdown.PriorityBuffer)
 
-		// Safe age threshold, now used ONLY for files whose durability nothing
-		// tracks — a previous process's files, and the untracked entries a
-		// replication follower writes. Tracked files are reclaimed by the
-		// flush floor instead, at any age. 3x MaxBufferAgeMS keeps the old
-		// margin for flush worker delays and clock skew.
-		safeAge := time.Duration(cfg.Ingest.MaxBufferAgeMS) * time.Millisecond * 3
-		if safeAge < 30*time.Second {
-			safeAge = 30 * time.Second
-		}
-
 		recoveryInterval := time.Duration(cfg.WAL.RecoveryIntervalSeconds) * time.Second
 		go func() {
 			ticker := time.NewTicker(recoveryInterval)
 			defer ticker.Stop()
+			bytesTicker := time.NewTicker(15 * time.Second)
+			defer bytesTicker.Stop()
 			walLogger := logger.Get("wal-maintenance")
 
 			for {
 				select {
 				case <-walMaintenanceCtx.Done():
 					return
+				case <-bytesTicker.C:
+					updateWALDirectoryBytes()
 				case <-ticker.C:
 					if arrowBuffer.HasFlushFailure() {
 						// Storage failure detected — replay WAL files to recover data
 						// that was cleared from buffers after failed flush
 						walLogger.Info().Msg("Flush failure detected, attempting WAL recovery")
 
-						// Purge old WAL files first (same as normal path) to avoid replaying
-						// data that was already successfully flushed to parquet before the failure.
+						// ORDER MATTERS, and it is: rotate, barrier, read
+						// checkpoints, purge, recover.
+						//
+						// Rotation comes FIRST so that every append racing this
+						// pass lands in a file whose fate this pass decides.
+						// Barriering first instead leaves a window — between the
+						// barrier returning and the rotation command being
+						// dequeued — in which a tracked append lands in the
+						// file about to become previousActiveFile. That file is
+						// then exempted from MinFileAge below, so recovery
+						// replays an entry no checkpoint covers into a buffer
+						// that still holds the live copy, and nothing
+						// de-duplicates rows.
+						previousActiveFile := ""
+						activeFile := ""
+						var activeCheckpointHashes []string
 						if walWriter != nil {
+							previousActiveFile = walWriter.CurrentFile()
+							rotationTimeout := time.Duration(cfg.Ingest.FlushTimeoutSeconds) * time.Second
+							if rotationTimeout <= 0 {
+								rotationTimeout = 30 * time.Second
+							}
+							rotationCtx, cancelRotation := context.WithTimeout(walMaintenanceCtx, rotationTimeout)
+							rotationErr := walWriter.RotateContext(rotationCtx)
+							cancelRotation()
+							if rotationErr != nil {
+								walLogger.Error().Err(rotationErr).Msg("Failed to rotate WAL before recovery; retaining files for the next pass")
+								continue
+							}
+							activeFile = walWriter.CurrentFile()
+						}
+
+						// Settle older async flushes and all current buffers before
+						// reading checkpoints. Otherwise a checkpoint written by an
+						// in-flight worker could land after recovery's checkpoint scan.
+						//
+						// After the rotation above, this also flushes whatever the
+						// window-era appends put in previousActiveFile, and their
+						// checkpoints land in the NEW active file — which is read
+						// into AdditionalCheckpointHashes below, so recovery skips
+						// them. Appends during the barrier go to the new active
+						// file, which recovery skips entirely.
+						if err := arrowBuffer.FlushAllAndWait(walMaintenanceCtx); err != nil {
+							walLogger.Error().Err(err).Msg("WAL recovery pre-barrier failed; retaining WAL files for the next pass")
+							continue
+						}
+
+						if walWriter != nil {
+							// Read AFTER the barrier, so the checkpoints it just
+							// wrote for previousActiveFile are included.
+							activeCheckpointHashes, err = walWriter.CurrentCheckpointHashes()
+							if err != nil {
+								walLogger.Error().Err(err).Msg("Failed to read active WAL checkpoints; skipping recovery to avoid duplicate replay")
+								continue
+							}
+
 							deleted, purgeErr := walWriter.PurgeFlushed(walWriter.MinUnflushedSequence())
 							if purgeErr != nil {
 								walLogger.Error().Err(purgeErr).Msg("WAL purge before recovery failed")
 							} else if deleted > 0 {
 								walLogger.Info().Int("deleted", deleted).Msg("Purged old WAL files before recovery")
 							}
-							if n, err := walWriter.PurgeUnaccountedOlderThan(safeAge); err != nil {
-								walLogger.Error().Err(err).Msg("WAL unaccounted-file purge before recovery failed")
-							} else if n > 0 {
-								walLogger.Info().Int("deleted", n).Msg("Purged WAL files with no tracked sequences before recovery")
-							}
 						}
-
-						recovery := wal.NewRecovery(cfg.WAL.Directory, walLogger)
-						activeFile := ""
-						var activeCheckpointHashes []string
-						if walWriter != nil {
-							activeFile = walWriter.CurrentFile()
-							// Recovery skips the active file to avoid racing appends, so read
-							// its checkpoint index separately while the writer lock holds it stable.
-							activeCheckpointHashes, err = walWriter.CurrentCheckpointHashes()
-							if err != nil {
-								walLogger.Error().Err(err).Msg("Failed to read active WAL checkpoints; skipping recovery to avoid duplicate replay")
-								continue
-							}
-						}
-						stats, err := recovery.RecoverWithOptions(context.Background(), recoveryCallback, &wal.RecoveryOptions{
+						failureGeneration := arrowBuffer.FlushFailureGeneration()
+						stats, err := walRecovery.RecoverWithOptions(walMaintenanceCtx, recoveryCallback, &wal.RecoveryOptions{
 							SkipActiveFile:             activeFile,
 							AdditionalCheckpointHashes: activeCheckpointHashes,
 							MinFileAge:                 5 * time.Second,
+							MinFileAgeExemptFiles:      []string{previousActiveFile},
 							BatchSize:                  cfg.WAL.RecoveryBatchSize,
 							ColumnarCallback:           columnarCallback,
+							TrackedRowCallback:         createTrackedWALRecoveryCallback(arrowBuffer, walLogger),
+							ValidateTrackedRows:        validateTrackedWALRecoveryRows,
+							CheckpointRecovered:        checkpointRecovered,
+							BeforeDelete:               arrowBuffer.NewRecoveryFlushBarrier(),
+							BarrierBatchFiles:          16,
+							BarrierBatchRows:           cfg.Ingest.MaxBufferSize,
+							MaxReplayFailures:          3,
 						})
+						// Before the error branch: the recovery Warn fires from
+						// inside the pass whatever its outcome, so a gauge
+						// updated only on success would contradict it — and a
+						// failed pass is when the residue is most likely.
+						updatePartialRowRecovery(stats)
 						if err != nil {
 							walLogger.Error().Err(err).Msg("WAL recovery after flush failure failed")
 						} else {
@@ -1160,44 +1362,36 @@ func main() {
 								walLogger.Info().
 									Int("files", stats.RecoveredFiles).
 									Int("entries", stats.RecoveredEntries).
+									Int("kept_files", stats.KeptFiles).
+									Int("barrier_failures", stats.BarrierFailures).
 									Msg("WAL recovery after flush failure complete")
 							}
-							arrowBuffer.ResetFlushFailure()
+							for i := 0; i < stats.QuarantinedFiles; i++ {
+								metrics.Get().IncWALQuarantinedFiles()
+							}
+							if stats.KeptFiles == 0 && stats.BarrierFailures == 0 {
+								if !arrowBuffer.ResetFlushFailure(failureGeneration) {
+									walLogger.Info().Msg("A newer flush failure arrived during WAL recovery; keeping recovery armed")
+								}
+							}
 						}
+						updateWALDirectoryBytes()
 					} else {
-						// Normal operation. Two purges, because two different
-						// things bound WAL size and only one of them can be
-						// reasoned about from flush state:
-						//
-						//   - tracked files: reclaimed strictly below the
-						//     unflushed floor, never by age. Inferring
-						//     durability from wall-clock age is what lost
-						//     acknowledged writes (#966, #1009).
-						//   - files with no tracked sequences: a previous
-						//     process's files, and the untracked entries a
-						//     replication follower writes. No checkpoint will
-						//     ever cover them, so age is the only signal there
-						//     is — and without this a reader node's WAL grows
-						//     until the disk fills.
+						// Tracked files are reclaimed below the durable sequence
+						// floor. Files outside that floor remain for recovery; age
+						// is not evidence that their data reached storage.
 						deleted, err := walWriter.PurgeFlushed(walWriter.MinUnflushedSequence())
 						if err != nil {
 							walLogger.Error().Err(err).Msg("Periodic WAL purge failed")
 						} else if deleted > 0 {
 							walLogger.Info().Int("deleted", deleted).Msg("Periodic WAL cleanup complete")
 						}
-						if n, err := walWriter.PurgeUnaccountedOlderThan(safeAge); err != nil {
-							walLogger.Error().Err(err).Msg("Periodic WAL unaccounted-file purge failed")
-						} else if n > 0 {
-							walLogger.Info().Int("deleted", n).Msg("Purged WAL files with no tracked sequences")
-						}
+						updateWALDirectoryBytes()
 					}
 				}
 			}
 		}()
-		log.Info().
-			Dur("interval", recoveryInterval).
-			Dur("safe_age", safeAge).
-			Msg("Periodic WAL maintenance enabled")
+		log.Info().Dur("interval", recoveryInterval).Msg("Periodic WAL maintenance enabled")
 	}
 
 	// MQTT is initialized after the auth manager (below) so it can share the
@@ -1392,9 +1586,26 @@ func main() {
 	// the gate is consulted at Scheduler.Start() and TriggerNow(). OSS and
 	// standalone deployments pass a nil gate (compactionGate below) and
 	// skip the role check entirely, preserving pre-Phase-4 behavior.
+	//
+	// Two interface variables over ONE gate value (#1152): the schedulers
+	// take compaction.ClusterGate, and the API handler takes
+	// api.CompactionGate, which additionally reports the lease holder so a
+	// refusal can name it. Both are assigned from the same pointer here, so
+	// the manual trigger and the scheduled cycles can never disagree about
+	// whether this node may compact, and setCoordinator below upgrades both
+	// to lease mode at once.
+	//
+	// Both must stay INTERFACE variables assigned only inside this branch.
+	// Declaring either as *compactionClusterGate would hand the handler a
+	// non-nil interface wrapping a nil pointer in OSS, which passes the
+	// handler's nil check and then panics in CanCompact — the #713 shape.
+	// TestCompactionGateNilInterfaceConversionIssue1152 pins this.
 	var compactionGate compaction.ClusterGate
+	var compactionAPIGate api.CompactionGate
 	if cfg.Cluster.Enabled {
-		compactionGate = newCompactionClusterGate(cfg.Cluster.Role)
+		gate := newCompactionClusterGate(cfg.Cluster.Role)
+		compactionGate = gate
+		compactionAPIGate = gate
 	}
 	// Phase 4: completion-manifest directory used by the cluster-mode
 	// subprocess → parent handoff. Empty in OSS (nil gate is what disables
@@ -1654,6 +1865,13 @@ func main() {
 	// Initialize Cluster Coordinator (Enterprise feature)
 	// Clustering enables role-based node separation: writer, reader, compactor
 	var clusterCoordinator *cluster.Coordinator
+	// completionWatcher is the Phase 4 completion watcher, built BEFORE the
+	// coordinator starts (inside the cluster block below) so the compaction
+	// pause quiescer (#1087) can see the pending commits on disk from the
+	// first pause onward; the post-Start block only starts it. nil on every
+	// node without the watcher (no replication, compaction disabled) and when
+	// its construction failed.
+	var completionWatcher *compaction.CompletionWatcher
 	if cfg.Cluster.Enabled {
 		if licenseClient == nil {
 			log.Warn().Msg("Clustering requires enterprise license - running in standalone mode")
@@ -1765,6 +1983,61 @@ func main() {
 					// received bytes. Must be set before Start — the puller is
 					// constructed inside Start when ReplicationEnabled is true.
 					clusterCoordinator.SetStorageBackend(storageBackend)
+
+					// The cluster-wide compaction pause (#1087), wired BEFORE
+					// Start on every cluster node: a pause replayed from the
+					// Raft log fires its callback inside Start, and the
+					// schedulers above already armed cron, so the gate the
+					// cycle consults and the quiescer the ack waits on must
+					// both be in place by then. The completion watcher is
+					// built here too, before Start, because the quiescer must
+					// see the phase-2 commits already pending on disk from the
+					// first pause onward: a watcher built only after Start
+					// would let a pause replayed during Start be acked with a
+					// sources_deleted manifest still waiting, which the
+					// watcher then applies under the restore. Construction is
+					// pure (the bridge stores the coordinator pointer, the
+					// watcher reads nothing until Start); the post-Start block
+					// starts it. compactionManager is nil when compaction is
+					// disabled (the quiescer then acks at once). If Start
+					// fails below the gate stays bound to a coordinator that
+					// never ran, whose FSM holds no pause: CompactionPaused
+					// reads false.
+					expectCompletionWatcher := completionDir != "" && cfg.Compaction.Enabled
+					completionWatcherPollInterval := time.Duration(cfg.Compaction.CompletionWatcherIntervalMS) * time.Millisecond
+					if completionWatcherPollInterval <= 0 {
+						completionWatcherPollInterval = 1 * time.Second
+					}
+					if expectCompletionWatcher {
+						watcher, werr := compaction.NewCompletionWatcher(compaction.CompletionWatcherConfig{
+							Dir:          completionDir,
+							Bridge:       cluster.NewCompactionBridge(clusterCoordinator),
+							PollInterval: completionWatcherPollInterval,
+							ApplyTimeout: 5 * time.Second,
+							// Under a pause the watcher must not re-register an
+							// output_written manifest's output (a restart or a
+							// regained lease would otherwise re-issue phase 1
+							// for an output the restore has just removed);
+							// its sources_deleted applies stay ungated, they
+							// are the drain the pause ack waits for.
+							PauseGate: clusterCoordinator.CompactionPaused,
+							Logger:    logger.Get("compaction-watcher"),
+						})
+						if werr != nil {
+							// The quiescer is told a watcher was expected and
+							// never reports this node idle, so a cluster
+							// restore times out naming it rather than run with
+							// its phase-2 commits unaccounted for.
+							log.Warn().Err(werr).Msg("Failed to construct compaction completion watcher; this node will not acknowledge cluster-wide compaction pauses")
+						} else {
+							completionWatcher = watcher
+						}
+					}
+					clusterCoordinator.SetCompactionQuiescer(newCompactionQuiescer(
+						clusterCoordinator, compactionManager, completionWatcher, expectCompletionWatcher, logger.Get("compaction-pause")))
+					if compactionManager != nil {
+						compactionManager.SetPauseGate(clusterCoordinator.CompactionPaused)
+					}
 
 					if err := clusterCoordinator.Start(); err != nil {
 						log.Error().Err(err).Msg("Failed to start cluster coordinator - running in standalone mode")
@@ -1945,78 +2218,67 @@ func main() {
 						// drains any pending manifests BEFORE Raft goes away
 						// whatever its priority; PriorityCompaction - 1 keeps it
 						// after the schedulers that feed it.
-						if completionDir != "" && cfg.Compaction.Enabled {
-							bridge := cluster.NewCompactionBridge(clusterCoordinator)
-							pollInterval := time.Duration(cfg.Compaction.CompletionWatcherIntervalMS) * time.Millisecond
-							if pollInterval <= 0 {
-								pollInterval = 1 * time.Second
+						// The watcher itself was built before Start (see the
+						// compaction pause wiring above); nil when this node
+						// has none or its construction failed.
+						if completionWatcher != nil {
+							watcher := completionWatcher
+							pollInterval := completionWatcherPollInterval
+							// If this node is already the active compactor (static
+							// RoleCompactor with no failover, or failover already
+							// assigned us), start immediately. Otherwise the FSM
+							// callback will start it dynamically.
+							if capabilities.CanCompact || clusterCoordinator.IsActiveCompactor() {
+								watcher.Start(context.Background())
+								log.Info().
+									Str("completion_dir", completionDir).
+									Dur("poll_interval", pollInterval).
+									Msg("Phase 4 compaction completion watcher started")
 							}
-							watcher, werr := compaction.NewCompletionWatcher(compaction.CompletionWatcherConfig{
-								Dir:          completionDir,
-								Bridge:       bridge,
-								PollInterval: pollInterval,
-								ApplyTimeout: 5 * time.Second,
-								Logger:       logger.Get("compaction-watcher"),
-							})
-							if werr != nil {
-								log.Warn().Err(werr).Msg("Failed to construct compaction completion watcher")
-							} else {
-								// If this node is already the active compactor (static
-								// RoleCompactor with no failover, or failover already
-								// assigned us), start immediately. Otherwise the FSM
-								// callback will start it dynamically.
-								if capabilities.CanCompact || clusterCoordinator.IsActiveCompactor() {
-									watcher.Start(context.Background())
-									log.Info().
-										Str("completion_dir", completionDir).
-										Dur("poll_interval", pollInterval).
-										Msg("Phase 4 compaction completion watcher started")
-								}
 
-								shutdownCoordinator.RegisterHook("compaction-completion-watcher", func(ctx context.Context) error {
-									watcher.Stop()
-									return nil
-								}, shutdown.PriorityCompaction-1)
+							shutdownCoordinator.RegisterHook("compaction-completion-watcher", func(ctx context.Context) error {
+								watcher.Stop()
+								return nil
+							}, shutdown.PriorityCompaction-1)
 
-								// Phase 5: wire OnBecomeCompactor / OnLoseCompactor
-								// callbacks so the scheduler and watcher activate/deactivate
-								// dynamically when the compactor lease moves between nodes.
-								// Dedicated compactor nodes (CanCompact=true) keep the watcher
-								// running regardless of lease state to process orphaned manifests.
-								isDedicatedCompactor := capabilities.CanCompact
-								clusterCoordinator.SetCompactorCallbacks(
-									func() {
-										// OnBecomeCompactor: start scheduler + watcher
-										log.Info().Msg("Phase 5: this node became the active compactor — starting compaction")
-										if hourlyScheduler != nil {
-											if err := hourlyScheduler.Start(); err != nil {
-												log.Error().Err(err).Msg("Failed to start hourly scheduler after failover")
-											}
+							// Phase 5: wire OnBecomeCompactor / OnLoseCompactor
+							// callbacks so the scheduler and watcher activate/deactivate
+							// dynamically when the compactor lease moves between nodes.
+							// Dedicated compactor nodes (CanCompact=true) keep the watcher
+							// running regardless of lease state to process orphaned manifests.
+							isDedicatedCompactor := capabilities.CanCompact
+							clusterCoordinator.SetCompactorCallbacks(
+								func() {
+									// OnBecomeCompactor: start scheduler + watcher
+									log.Info().Msg("Phase 5: this node became the active compactor — starting compaction")
+									if hourlyScheduler != nil {
+										if err := hourlyScheduler.Start(); err != nil {
+											log.Error().Err(err).Msg("Failed to start hourly scheduler after failover")
 										}
-										if dailyScheduler != nil {
-											if err := dailyScheduler.Start(); err != nil {
-												log.Error().Err(err).Msg("Failed to start daily scheduler after failover")
-											}
+									}
+									if dailyScheduler != nil {
+										if err := dailyScheduler.Start(); err != nil {
+											log.Error().Err(err).Msg("Failed to start daily scheduler after failover")
 										}
-										if !isDedicatedCompactor {
-											watcher.Start(context.Background())
-										}
-									},
-									func() {
-										// OnLoseCompactor: stop scheduler + watcher
-										log.Info().Msg("Phase 5: this node lost the active compactor lease — stopping compaction")
-										if hourlyScheduler != nil {
-											hourlyScheduler.Stop()
-										}
-										if dailyScheduler != nil {
-											dailyScheduler.Stop()
-										}
-										if !isDedicatedCompactor {
-											watcher.Stop()
-										}
-									},
-								)
-							}
+									}
+									if !isDedicatedCompactor {
+										watcher.Start(context.Background())
+									}
+								},
+								func() {
+									// OnLoseCompactor: stop scheduler + watcher
+									log.Info().Msg("Phase 5: this node lost the active compactor lease — stopping compaction")
+									if hourlyScheduler != nil {
+										hourlyScheduler.Stop()
+									}
+									if dailyScheduler != nil {
+										dailyScheduler.Stop()
+									}
+									if !isDedicatedCompactor {
+										watcher.Stop()
+									}
+								},
+							)
 						}
 					}
 				}
@@ -2874,6 +3136,7 @@ func main() {
 		// The network agent. Skipped entirely on a fully air-gapped spoke,
 		// which has no hub URL to build a transport from.
 		var syncAgent *edgesync.Agent
+		var automaticSync bool
 		if cfg.EdgeSync.Spoke.Enabled {
 			if cfg.EdgeSync.Spoke.HubToken == "" {
 				log.Warn().Msg("ARC_EDGE_SYNC_HUB_TOKEN is not set; a hub running with auth enabled " +
@@ -2972,6 +3235,49 @@ func main() {
 		}
 		spokeHandler.RegisterRoutes(server.GetApp())
 
+		// Automatic spoke sync is the paid scheduling phase of edge sync. The
+		// existing enabled flag is the operator's explicit opt-in to moving
+		// data off this node; without a valid paid license, the manual
+		// endpoint remains available as before.
+		if syncAgent != nil {
+			if licenseClient != nil && licenseClient.CanUseEdgeSyncScheduler() {
+				var writerGate edgesync.WriterGate
+				if clusterCoordinator != nil {
+					writerGate = newWriterClusterGate(clusterCoordinator)
+				}
+				syncScheduler, err := edgesync.NewScheduler(edgesync.SchedulerConfig{
+					Agent:         syncAgent,
+					LicenseClient: licenseClient,
+					SyncInterval:  cfg.EdgeSync.Spoke.SyncInterval,
+					RetryInterval: cfg.EdgeSync.Spoke.SyncRetryInterval,
+					Enabled:       true,
+					ClusterGate:   writerGate,
+					Metrics:       metrics.Get(),
+					Logger:        spokeLogger,
+				})
+				if err != nil {
+					log.Fatal().Err(err).Msg("Failed to configure the edge sync scheduler; refusing to start")
+				}
+				if err := syncScheduler.Start(); err != nil {
+					log.Fatal().Err(err).Msg("Failed to start the edge sync scheduler; refusing to start")
+				}
+				shutdownCoordinator.RegisterHook("edgesync-scheduler", func(context.Context) error {
+					syncScheduler.Stop()
+					return nil
+				}, shutdown.PriorityScheduler)
+				automaticSync = syncScheduler.IsRunning()
+				if automaticSync {
+					metrics.Get().EnableEdgeSyncSpokeScheduler()
+					spokeLogger.Info().
+						Dur("sync_interval", cfg.EdgeSync.Spoke.SyncInterval).
+						Dur("retry_interval", cfg.EdgeSync.Spoke.SyncRetryInterval).
+						Msg("Paid edge sync scheduler enabled")
+				}
+			} else {
+				spokeLogger.Info().Msg("Automatic edge sync requires a valid paid license; manual sync remains available")
+			}
+		}
+
 		// Reports what is actually enabled: an air-gap-only spoke has no hub
 		// URL and no /run endpoint, so claiming both would send an operator
 		// looking for a route that returns 503.
@@ -2984,9 +3290,17 @@ func main() {
 		}
 		switch {
 		case syncAgent != nil && bundleExporter != nil:
-			evt.Msg("Edge sync spoke enabled; POST /api/v1/spoke-sync/run to sync, /export for an air-gap bundle")
+			if automaticSync {
+				evt.Msg("Edge sync spoke enabled; scheduled and manual network sync are available, /export writes an air-gap bundle")
+			} else {
+				evt.Msg("Edge sync spoke enabled; trigger network sync with POST /api/v1/spoke-sync/run, /export writes an air-gap bundle")
+			}
 		case syncAgent != nil:
-			evt.Msg("Edge sync spoke enabled; trigger a pass with POST /api/v1/spoke-sync/run")
+			if automaticSync {
+				evt.Msg("Edge sync spoke enabled; scheduled sync is active and POST /api/v1/spoke-sync/run triggers a manual pass")
+			} else {
+				evt.Msg("Edge sync spoke enabled; trigger a pass with POST /api/v1/spoke-sync/run")
+			}
 		default:
 			evt.Msg("Edge sync air-gap export enabled; write a bundle with POST /api/v1/spoke-sync/export")
 		}
@@ -3086,6 +3400,7 @@ func main() {
 
 	// Register Query handler with dedicated query timeout and slow query logging
 	queryHandler := api.NewQueryHandler(db, storageBackend, logger.Get("query"), cfg.Query.Timeout, cfg.Query.SlowQueryThresholdMs)
+	queryHandler.SetCancelOnClientDisconnect(cfg.Query.CancelOnClientDisconnect)
 	if authManager != nil && rbacManager != nil {
 		queryHandler.SetAuthAndRBAC(authManager, rbacManager)
 	}
@@ -3275,7 +3590,11 @@ func main() {
 
 	// Register Compaction handler (if compaction is enabled)
 	if compactionManager != nil {
-		compactionHandler := api.NewCompactionHandler(compactionManager, hourlyScheduler, dailyScheduler, authManager, logger.Get("compaction"))
+		// compactionAPIGate wraps the same gate value the schedulers consult,
+		// so the manual trigger and the scheduled cycles can never disagree
+		// about whether this node may compact (#1152). nil outside cluster
+		// mode, and deliberately a nil INTERFACE rather than a typed nil.
+		compactionHandler := api.NewCompactionHandler(compactionManager, hourlyScheduler, dailyScheduler, authManager, compactionAPIGate, logger.Get("compaction"))
 		compactionHandler.RegisterRoutes(server.GetApp())
 
 		// Wire post-compaction cache invalidation.
@@ -3498,6 +3817,15 @@ func main() {
 		exporter, err := iceberg.NewExporter(icebergDB, storageBackend, warehouse, cfg.Iceberg.NamespacePrefix, cfg.Iceberg.RetainSnapshots, logger.Get("iceberg"))
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize Iceberg exporter")
+		}
+		// #835: reclaim the manifest files that expired snapshots and dropped
+		// transactions leave behind. Grace is derived from the reconcile interval
+		// (floored at an hour inside the exporter) so an unreachable manifest is
+		// only deleted once it is far older than any commit or reader in flight.
+		icebergOrphanGrace := iceberg.OrphanGraceFor(time.Duration(cfg.Iceberg.ReconcileInterval) * time.Second)
+		exporter.ConfigureOrphanSweep(cfg.Iceberg.OrphanSweepEnabled, icebergOrphanGrace)
+		if !cfg.Iceberg.OrphanSweepEnabled {
+			log.Warn().Msg("Iceberg orphan metadata sweep is disabled (iceberg.orphan_sweep_enabled=false): the manifest files of expired snapshots are retained indefinitely and are copied into every backup")
 		}
 		// #639 item 3: database deletion clears the Iceberg catalog too.
 		databasesHandler.SetIcebergDropper(exporter)
@@ -3789,49 +4117,83 @@ func main() {
 				log.Error().Err(err).Msg("Failed to open tiering database - feature disabled")
 			} else {
 				// Create cold tier backend (S3 or Azure)
+				//
+				// coldBackend is only ever assigned from a successful
+				// storage.NewBackend, which never returns a typed nil inside a
+				// non-nil interface (#713) — the factory owns that guarantee
+				// now, so neither branch has to hand-roll it. It still matters
+				// here: every "coldBackend != nil" downstream — the startup
+				// tier scan's cold sync, the drainer's existence probe, the
+				// query router's cold glob — would otherwise pass and then
+				// dereference a nil receiver.
+				//
+				// Only s3 and azure are accepted, each with its own logger name
+				// and its own error wording. There is no default case, and what
+				// makes that safe is a CONJUNCTION, not one flag: config.Load
+				// refuses an invalid value with "tiered_storage.cold.backend %q
+				// is invalid" only when tiered_storage.enabled AND
+				// tiered_storage.cold.enabled are both true -- deliberately, so
+				// that an OSS or unlicensed node carrying a leftover
+				// cold.enabled=true still boots. The runtime claim therefore
+				// rests on this whole block sitting inside
+				// "if cfg.TieredStorage.Enabled" (cmd/arc/main.go:3987). Were that
+				// outer gate ever to move, an unvalidated cold.Backend would
+				// reach this switch, fall through in silence and leave
+				// coldBackend nil, with nothing louder than cold_enabled=false
+				// in a later log line to say so.
 				var coldBackend storage.Backend
 				cold := cfg.TieredStorage.Cold
 
 				if cold.Enabled {
 					switch cold.Backend {
 					case "s3":
-						s3Config := &storage.S3Config{
-							Region:    cold.S3Region,
-							Bucket:    cold.S3Bucket,
-							Endpoint:  cold.S3Endpoint,
-							AccessKey: cold.S3AccessKey,
-							SecretKey: cold.S3SecretKey,
-							UseSSL:    cold.S3UseSSL,
-							PathStyle: cold.S3PathStyle,
-							Prefix:    cold.S3Prefix,
+						coldSpec := storage.BackendSpec{
+							Type: "s3",
+							S3: storage.S3Config{
+								Region:    cold.S3Region,
+								Bucket:    cold.S3Bucket,
+								Endpoint:  cold.S3Endpoint,
+								AccessKey: cold.S3AccessKey,
+								SecretKey: cold.S3SecretKey,
+								UseSSL:    cold.S3UseSSL,
+								PathStyle: cold.S3PathStyle,
+								Prefix:    cold.S3Prefix,
+							},
 						}
-						// Assigned through a typed local, never straight into
-						// the interface: a constructor error comes back as a
-						// nil *S3Backend, and an interface holding a typed
-						// nil is not == nil (#713). Stored directly, every
-						// "coldBackend != nil" downstream — the startup tier
-						// scan's cold sync, the drainer's existence probe,
-						// the query router's cold glob — would pass and then
-						// dereference a nil receiver.
-						if b, err := storage.NewS3Backend(s3Config, logger.Get("tiering-cold-s3")); err != nil {
-							log.Error().Err(err).Msg("Failed to create cold tier S3 backend for tiering: the cold tier is unusable on this node until the configuration is fixed")
+						if b, err := storage.NewBackend(coldSpec, logger.Get("tiering-cold-s3")); err != nil {
+							// Identifiers in structured fields: this site logs
+							// and CONTINUES with a nil cold backend, so this
+							// one line is all the operator gets, and
+							// installErrSanitizer masks quoted spans inside
+							// the error itself.
+							log.Error().Err(err).
+								Str("bucket", cold.S3Bucket).
+								Str("prefix", cold.S3Prefix).
+								Msg("Failed to create cold tier S3 backend for tiering: the cold tier is unusable on this node until the configuration is fixed")
 						} else {
 							coldBackend = b
 						}
 
 					case "azure":
-						azureConfig := &storage.AzureBlobConfig{
-							ConnectionString:   cold.AzureConnectionString,
-							AccountName:        cold.AzureAccountName,
-							AccountKey:         cold.AzureAccountKey,
-							SASToken:           cold.AzureSASToken,
-							ContainerName:      cold.AzureContainer,
-							Endpoint:           cold.AzureEndpoint,
-							UseManagedIdentity: cold.AzureUseManagedIdentity,
+						coldSpec := storage.BackendSpec{
+							Type: "azure",
+							Azure: storage.AzureBlobConfig{
+								ConnectionString:   cold.AzureConnectionString,
+								AccountName:        cold.AzureAccountName,
+								AccountKey:         cold.AzureAccountKey,
+								SASToken:           cold.AzureSASToken,
+								ContainerName:      cold.AzureContainer,
+								Prefix:             cold.AzurePrefix,
+								Endpoint:           cold.AzureEndpoint,
+								UseManagedIdentity: cold.AzureUseManagedIdentity,
+							},
 						}
-						// Typed local for the same reason as the S3 branch.
-						if b, err := storage.NewAzureBlobBackend(azureConfig, logger.Get("tiering-cold-azure")); err != nil {
-							log.Error().Err(err).Msg("Failed to create cold tier Azure backend for tiering: the cold tier is unusable on this node until the configuration is fixed")
+						if b, err := storage.NewBackend(coldSpec, logger.Get("tiering-cold-azure")); err != nil {
+							// Same reason as the cold S3 site above.
+							log.Error().Err(err).
+								Str("container", cold.AzureContainer).
+								Str("prefix", cold.AzurePrefix).
+								Msg("Failed to create cold tier Azure backend for tiering: the cold tier is unusable on this node until the configuration is fixed")
 						} else {
 							coldBackend = b
 						}
@@ -3890,7 +4252,7 @@ func main() {
 					// one that never starts the scan — a defer would not do,
 					// it being function-scoped to main and so running only
 					// after the shutdown step had already blocked on it.
-					scanCtx, cancelScan := context.WithTimeout(context.Background(), 30*time.Minute)
+					scanCtx, cancelScan := context.WithTimeout(context.Background(), tieringManager.ScanBudget())
 					scanDone := make(chan struct{})
 
 					// Registered as soon as the manager exists, not only once
@@ -3979,16 +4341,40 @@ func main() {
 							defer close(scanDone)
 							defer cancelScan()
 							result, err := tieringManager.ScanTiers(scanCtx)
-							if err != nil {
-								log.Warn().Err(err).Msg("Startup tier scan did not complete; the next migration cycle will scan again")
-								return
+							switch {
+							case errors.Is(err, context.Canceled):
+								// The node is shutting down: the shutdown step
+								// cancels this scan before joining it. Neither
+								// budget is at fault, and telling the operator
+								// to raise one would be wrong - the scan was
+								// interrupted, not short of time.
+								log.Warn().
+									Int("scanned", result.FilesScanned).
+									Msg("Startup tier scan was cancelled because the node is shutting down; the next start will scan again")
+							case err != nil && result.Truncated,
+								err == nil && result.Truncated:
+								// Name the key, and say what a partial scan
+								// costs. Pointing at the next migration cycle
+								// was misleading: every path now shares this
+								// budget, so the cycle will truncate in the
+								// same place, and the manual endpoint carries
+								// the same number too (#1154).
+								log.Warn().Err(err).
+									Dur("scan_timeout", tieringManager.ScanBudget()).
+									Int("scanned", result.FilesScanned).
+									Int("registered", result.FilesRegistered).
+									Msg("Startup tier scan ran out of its budget and stopped part way; tier rows are incomplete and no stale hot row was retired, which costs this node partition pruning. Raise tiered_storage.scan_timeout above the time a full scan takes here. GET /api/v1/tiering/status reports this under last_scan")
+							case err != nil:
+								log.Warn().Err(err).
+									Msg("Startup tier scan did not complete; the next migration cycle will scan again")
+							default:
+								log.Info().
+									Int("scanned", result.FilesScanned).
+									Int("registered", result.FilesRegistered).
+									Int("hot_retired", result.HotRetired).
+									Int("cold_synced", result.ColdSynced).
+									Msg("Startup tier scan completed")
 							}
-							log.Info().
-								Int("scanned", result.FilesScanned).
-								Int("registered", result.FilesRegistered).
-								Int("hot_retired", result.HotRetired).
-								Int("cold_synced", result.ColdSynced).
-								Msg("Startup tier scan completed")
 							// If the scan changed any row — on a node booting
 							// with none, measurements go from nothing to cold
 							// (the sync runs first) to hot and cold — a query
@@ -3996,6 +4382,11 @@ func main() {
 							// the earlier state for up to the cache TTL. A
 							// migration cycle drops the query caches for the
 							// same reason; so does this, at most once per boot.
+							//
+							// Runs for a TRUNCATED scan too: the rows it wrote
+							// before stopping are real, and this used to return
+							// on the error above and leave the query caches
+							// serving the pre-scan answer indefinitely.
 							if result.ColdSynced+result.HotRowsWritten+result.HotRetired > 0 {
 								queryHandler.InvalidateCaches()
 							}
@@ -4033,6 +4424,9 @@ func main() {
 
 		// Wire tiering manager to query handler for multi-tier query routing
 		queryHandler.SetTieringManager(tieringManager)
+		// DELETE rewrites immutable files outside the ingest/replication writers;
+		// keep tier metadata synchronized with the new path.
+		deleteHandler.SetTieringManager(tieringManager)
 		// A completed migration moves files between tiers, so cached pruned
 		// partition paths (pruner + SQL transform caches) go stale and must
 		// be dropped — same reason compaction invalidates them (#662).
@@ -4091,6 +4485,7 @@ func main() {
 				AccountKey:       cold.AzureAccountKey,
 				SASToken:         cold.AzureSASToken,
 				Container:        cold.AzureContainer,
+				Prefix:           cold.AzurePrefix,
 				Endpoint:         cold.AzureEndpoint,
 			}); err != nil {
 				log.Warn().Err(err).Msg("Failed to configure DuckDB with cold tier Azure credentials")
@@ -4126,9 +4521,84 @@ func main() {
 					Msg("iceberg.warehouse is not a local path; backups cannot include its table metadata")
 			}
 		}
+		// Backup destinations (#1085 stage B2b-1, a set with per-database
+		// routing since B2b-2). A configured target replaces the local
+		// directory entirely; with none, BackupPath is the destination exactly
+		// as before. config.Load has already validated every target, bounded
+		// each key prefix, refused the same database on two targets, and
+		// refused an overlap with primary storage, with the cold tier and
+		// between any two targets — see
+		// config.checkBackupDestinationOverlap, which records what that
+		// refusal actually protects against: a backup that re-copies itself
+		// every run, and the reconciliation sweep deleting the backups.
+		var backupTargets []backup.Target
+		for _, name := range cfg.Backup.TargetNamesSorted() {
+			t := cfg.Backup.Targets[name]
+			keyPrefix, err := t.KeyPrefix()
+			if err != nil {
+				// Unreachable: validateBackupTargets asks for the same prefix
+				// at load and refuses a bad one. Fatal rather than silently
+				// reserving no key headroom, which would turn an overlong key
+				// from a reported skip into a failed write. Per target, so a
+				// routed target with an unusable prefix is as loud as the
+				// default one.
+				log.Fatal().Err(err).Str("target", t.Name).Msg("Backup target prefix is unusable")
+			}
+			backupTargets = append(backupTargets, backup.Target{
+				Name:      t.Name,
+				Spec:      t.BackendSpec(),
+				KeyPrefix: keyPrefix,
+				Remote:    t.IsRemote(),
+			})
+		}
+
+		// Backup owner identity (#1085 stage B2b-1). The CLUSTER when
+		// clustered — a per-node identity would make every writer failover
+		// orphan its own cluster's backups — and a persisted per-instance UUID
+		// standalone. Stored BESIDE the shared database, never inside it, so a
+		// restore cannot make this instance a continuation of the one the
+		// backup came from; see internal/backup/identity.go.
+		//
+		// A failure here is a warning, not a Fatal: an unidentified instance
+		// writes manifests with no owner and reads every manifest as its own,
+		// which is exactly the behaviour of every Arc before this change. It
+		// must never stop a node from booting.
+		backupInstanceID := ""
+		if cfg.Cluster.Enabled {
+			// TRIMMED, and warned about when empty. This string reaches every
+			// manifest and is compared byte-for-byte, so a stray space on one
+			// node makes two nodes of one cluster read each other's backups as
+			// foreign — and an empty cluster name yields an empty identity,
+			// which means "unidentified" and silently disables the filter,
+			// where the standalone path at least warns.
+			//
+			// Note the switch this implies: turning clustering off moves a
+			// node from the cluster name to its own minted UUID, so its own
+			// earlier backups then read as foreign. They are still listable
+			// with include_foreign=true and still restorable; the docs say so.
+			backupInstanceID = strings.TrimSpace(cfg.Cluster.ClusterName)
+			if backupInstanceID == "" {
+				log.Warn().Msg("cluster.enabled is true but cluster.cluster_name is empty: backups will be written without an owner, so every backup at the destination will be listed as this cluster own. Set cluster.cluster_name")
+			}
+		} else if id, idErr := backup.LoadOrCreateInstanceID(cfg.Auth.DBPath); idErr != nil {
+			log.Warn().Err(idErr).Msg("Could not resolve this instance backup identity: backups will be written without an owner and every backup at the destination will be listed as this instance own")
+		} else {
+			backupInstanceID = id
+		}
+
+		// Built once: the ready log below reports its size, and rebuilding it
+		// there would walk every target a second time to answer a question
+		// this map already answers.
+		backupRouting := cfg.Backup.RoutingMap()
+
 		backupManager, err := backup.NewManager(&backup.ManagerConfig{
 			DataStorage:            storageBackend,
 			BackupPath:             cfg.Backup.LocalPath,
+			Targets:                backupTargets,
+			DefaultTarget:          cfg.Backup.DefaultTarget,
+			Routing:                backupRouting,
+			OperationTimeout:       cfg.Backup.OperationTimeout,
+			InstanceID:             backupInstanceID,
 			SQLiteDBPath:           cfg.Auth.DBPath,
 			IcebergCatalogDBPath:   icebergCatalogDBPath,
 			IcebergWarehousePath:   icebergWarehousePath,
@@ -4137,11 +4607,97 @@ func main() {
 			Logger:                 logger.Get("backup"),
 		})
 		if err != nil {
-			log.Error().Err(err).Msg("Failed to initialize backup manager")
+			// This stays "log and skip the whole backup API", and with a
+			// remote target that is still right rather than merely unchanged:
+			// neither NewS3Backend nor NewAzureBlobBackend fails on an
+			// unreachable store — each probes once with a 10 s timeout and
+			// only WARNS (s3.go, azure.go) — so an error here is a
+			// configuration or credential-shape failure, which is as loud and
+			// as permanent as "the local backup directory is unwritable" was.
+			// An unreachable target therefore boots with the API up and
+			// reports per operation, which is the required behaviour.
+			log.Error().Err(err).Str("target", cfg.Backup.DefaultTarget).Msg("Failed to initialize backup manager")
 		} else {
-			backupHandler := api.NewBackupHandler(backupManager, authManager, logger.Get("backup-api"))
+			backupHandler := api.NewBackupHandler(backupManager, authManager, cfg.Backup.OperationTimeout, logger.Get("backup-api"))
+			// Cluster safety (#1083). Only when the coordinator exists: an
+			// interface holding a typed nil *Coordinator is not == nil (#713),
+			// and both setters would then keep a pointer whose methods panic.
+			// The two hooks are independent of each other and of tiering:
+			// clusterCoordinator and tieringManager are each nil in supported
+			// modes (OSS standalone, cluster without tiering, standalone with
+			// tiering), so each gets its own guard.
+			if clusterCoordinator != nil {
+				backupHandler.SetCoordinator(clusterCoordinator)
+				// The manifest hook only where a Raft manifest exists. Without
+				// one (cluster.raft_data_dir unset) GetFileManifest is nil and
+				// every manifest write is a silent no-op, and the backup
+				// manager must not read that as "nothing is data".
+				if clusterCoordinator.HasRaft() {
+					backupManager.SetClusterManifest(&backupClusterManifest{coordinator: clusterCoordinator})
+				} else {
+					log.Warn().Msg("Cluster coordinator has no Raft file manifest: backups run without the manifest cross-check and restores register nothing")
+				}
+			}
+			if tieringManager != nil {
+				backupManager.SetTierRecorder(tieringManager)
+				// The known-database check of a scoped backup (#1084) asks
+				// the same tier metadata whether a database is fully cold.
+				backupManager.SetTierLookup(tieringManager)
+				// And the cold-file marker (#1085 stage B3) asks it how many
+				// files a backup is NOT carrying, since only hot storage is
+				// copied.
+				//
+				// Note what this does NOT cover, because it is the case where
+				// the marker would be most useful. The tiering block above is
+				// gated on the LICENCE, not only on cfg.TieredStorage.Enabled,
+				// so on a node without it tieringManager is nil, this line is
+				// never reached and the field is absent — on a deployment whose
+				// files are already out of hot storage and which has stopped
+				// migrating. A licence that lapses while the process RUNS keeps
+				// reporting, because the manager is already built and only the
+				// migration cycle re-checks; it is the restart after a lapse
+				// that goes quiet. Fixing that would mean building a tiering
+				// MetadataStore (and running its schema) on an unlicensed node,
+				// which is the boundary the licence pattern exists to hold, so
+				// the behaviour stays and the field doc says so instead.
+				backupManager.SetColdCounter(tieringManager)
+				// And the cold tier itself (#1086 stage C): the store a backup
+				// reads cold objects from and a restore writes them back to.
+				// Same licence hole as the counter above — an unlicensed node
+				// wires neither, so its backups silently carry no cold data.
+				backupManager.SetColdSource(tieringManager)
+			}
 			backupHandler.RegisterRoutes(server.GetApp())
-			log.Info().Str("backup_path", cfg.Backup.LocalPath).Msg("Backup/restore enabled")
+			// backup_path is logged only when it IS the destination. Logging
+			// "./data/backups" beside a configured S3 target would say the
+			// backup goes somewhere it does not, and that directory is not
+			// even created in that configuration.
+			ready := log.Info()
+			if len(backupTargets) > 0 {
+				names := make([]string, 0, len(backupTargets))
+				for _, t := range backupTargets {
+					names = append(names, t.Name)
+				}
+				ready = ready.
+					Str("backup_default_target", cfg.Backup.DefaultTarget).
+					Strs("backup_targets", names).
+					Int("routed_databases", len(backupRouting))
+			} else {
+				ready = ready.Str("backup_path", cfg.Backup.LocalPath)
+			}
+			ready.
+				Bool("owner_identity", backupInstanceID != "").
+				Bool("cluster_gate", clusterCoordinator != nil).
+				Bool("tier_recorder", tieringManager != nil).
+				Bool("tier_lookup", tieringManager != nil).
+				Bool("cold_counter", tieringManager != nil).
+				// NOT tieringManager != nil like its neighbours: cold can be
+				// configured and disabled, or its backend can have failed to
+				// build while tiering is otherwise up, and a startup line
+				// claiming a cold source in either case would be the kind of
+				// lie that takes an operator a long afternoon.
+				Bool("cold_source", tieringManager != nil && tieringManager.ColdBackend() != nil).
+				Msg("Backup/restore enabled")
 		}
 	}
 
@@ -4408,6 +4964,81 @@ func createWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolo
 	}
 }
 
+func trackedWALRowTarget(rec map[string]interface{}) (database, measurement string) {
+	for _, key := range []string{"_measurement", "measurement", "m"} {
+		measurement, _ = rec[key].(string)
+		if measurement != "" {
+			break
+		}
+	}
+	for _, key := range []string{"_database", "database"} {
+		database, _ = rec[key].(string)
+		if database != "" {
+			break
+		}
+	}
+	if database == "" {
+		database = "default"
+	}
+	return
+}
+
+// Validate before splitting: a boundary must not hide an invalid mixed-target
+// entry or allow an earlier chunk to be accepted before a missing target.
+func validateTrackedWALRecoveryRows(records []map[string]interface{}) error {
+	var database, measurement string
+	for i, rec := range records {
+		rowDatabase, rowMeasurement := trackedWALRowTarget(rec)
+		if rowMeasurement == "" {
+			return fmt.Errorf("WAL row %d has no measurement", i)
+		}
+		if i == 0 {
+			database, measurement = rowDatabase, rowMeasurement
+		} else if database != rowDatabase || measurement != rowMeasurement {
+			return fmt.Errorf("WAL row entry spans multiple databases or measurements")
+		}
+	}
+	return nil
+}
+
+// createTrackedWALRecoveryCallback restores one bounded row batch as a columnar
+// buffer write. Its identity covers exactly this batch, allowing a later pass
+// to skip durable ranges even if the file-delete barrier did not complete.
+func createTrackedWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolog.Logger) wal.TrackedRecoveryCallback {
+	return func(ctx context.Context, records []map[string]interface{}, walIdentity string) error {
+		if len(records) == 0 {
+			return nil
+		}
+
+		if err := validateTrackedWALRecoveryRows(records); err != nil {
+			return err
+		}
+		database, measurement := trackedWALRowTarget(records[0])
+		columns := make(map[string][]interface{})
+		for rowIndex, rec := range records {
+			for key, value := range rec {
+				switch key {
+				case "_measurement", "measurement", "m", "_database", "database":
+					continue
+				}
+				column, ok := columns[key]
+				if !ok {
+					column = make([]interface{}, len(records))
+					columns[key] = column
+				}
+				column[rowIndex] = value
+			}
+		}
+
+		if err := arrowBuffer.WriteColumnarDirectReplay(ctx, database, measurement, columns, walIdentity); err != nil {
+			walLogger.Error().Err(err).Str("measurement", measurement).Msg("Failed to replay tracked WAL row entry")
+			return err
+		}
+		walLogger.Info().Int("records", len(records)).Msg("WAL recovery: replayed tracked row entry")
+		return nil
+	}
+}
+
 // createColumnarRecoveryCallback creates a WAL recovery callback for columnar entries
 // written via the zero-copy AppendRaw path.
 func createColumnarRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolog.Logger) wal.ColumnarRecoveryCallback {
@@ -4417,8 +5048,8 @@ func createColumnarRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger z
 		}
 		// Inherit the replayed entry's identity: one columnar entry becomes
 		// exactly one buffer write, so a checkpoint for it covers precisely
-		// these records. The row-format callback above deliberately does NOT
-		// inherit — it fans one entry out into one write per record.
+		// these records. Row batches instead inherit their precise row-range
+		// identities when recovery splits an entry.
 		if err := arrowBuffer.WriteColumnarDirectReplay(ctx, database, measurement, columns, walIdentity); err != nil {
 			walLogger.Error().Err(err).Str("database", database).Str("measurement", measurement).Msg("Failed to replay columnar WAL entry")
 			return err
@@ -4559,6 +5190,17 @@ func (a *tieringManifestAdapter) DeleteFilesFromManifest(ctx context.Context, pa
 	return err
 }
 
+func (a *tieringManifestAdapter) ManifestEntriesByDatabase(database string) []string {
+	entries := a.coordinator.GetFileManifestByDatabase(database)
+	paths := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry != nil {
+			paths = append(paths, entry.Path)
+		}
+	}
+	return paths
+}
+
 func (a *tieringManifestAdapter) ManifestEntry(path string) (int64, bool) {
 	entry, ok := a.coordinator.GetFileEntry(path)
 	if !ok || entry == nil {
@@ -4631,6 +5273,32 @@ func (g *compactionClusterGate) CanCompact() bool {
 	}
 	// No failover or no lease assigned yet — fall back to static role.
 	return g.capabilities.CanCompact
+}
+
+// LeaseHolder implements api.CompactionGate (#1152): the node ID holding the
+// compactor lease, or "" when this cluster manages no lease — no coordinator,
+// or compactor failover never assigned one (cluster.failover_enabled defaults
+// to false). The trigger endpoint needs the distinction because CanCompact is
+// false for two reasons with different remedies: a lease held elsewhere, which
+// the operator can move, versus a static-role refusal with no lease to move.
+func (g *compactionClusterGate) LeaseHolder() string {
+	if g.coordinator == nil {
+		return ""
+	}
+	return g.coordinator.GetActiveCompactorID()
+}
+
+// CompactionPauseReason implements the scheduler's optional pauseReporter
+// (#1087): the cluster-wide compaction pause in force, or "" when compaction
+// is not paused or there is no coordinator. Deliberately NOT folded into
+// CanCompact: Scheduler.Start treats a false CanCompact as permanent role
+// gating and never arms cron, so a node that took the compactor lease during
+// a pause would stay idle after the resume.
+func (g *compactionClusterGate) CompactionPauseReason() string {
+	if g.coordinator == nil {
+		return ""
+	}
+	return g.coordinator.CompactionPauseReason()
 }
 
 // Role returns the node's role string for log messages.
@@ -4731,5 +5399,266 @@ func isSharedBackend(backend string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// backupClusterManifest adapts the cluster coordinator to backup.ClusterManifest
+// (#1083). internal/backup cannot import internal/cluster, so the Raft types
+// are mapped here: a ManifestFile becomes a raft.FileEntry stamped with this
+// node as origin and the hot tier, and both directions go through one batched
+// Raft entry per call. The backup manager chunks by count and bytes before
+// calling (its caps mirror the file registrar's), because this node is
+// routinely a Raft follower whose batches are forwarded inside a 1 MiB frame;
+// TestBackupClusterManifest_ChunksFitTheForwardFrame pins that fit.
+//
+// Wired only when the coordinator has a Raft manifest (HasRaft). Every write
+// here still checks, because BatchFileOpsInManifestContext reports success
+// without one and a restore must not believe its files were registered.
+type backupClusterManifest struct {
+	coordinator *cluster.Coordinator
+}
+
+// errNoRaftManifest is returned by every write when the coordinator has no
+// Raft manifest, instead of the coordinator's own nil-success.
+var errNoRaftManifest = errors.New("cluster coordinator has no Raft file manifest (cluster.raft_data_dir unset)")
+
+// Retry budget for a manifest batch refused only because no leader is known
+// or reachable (an election in progress). The file registrar's drain retries
+// the same errors for its shutdown budget; a restore has longer, since the
+// alternative is aborting a run of thousands of files over a few seconds of
+// leader election. Permanent refusals (no quorum, a rejected command) return
+// at once.
+const (
+	backupManifestRetryBudget = 15 * time.Second
+	backupManifestRetryDelay  = 250 * time.Millisecond
+)
+
+// Sync blocks until this node's FSM has caught up with the leader.
+func (b *backupClusterManifest) Sync(ctx context.Context) error {
+	if !b.coordinator.HasRaft() {
+		return errNoRaftManifest
+	}
+	return b.coordinator.SyncManifest(ctx)
+}
+
+// LocalNodeID is the origin stamped on every entry BatchRegister builds.
+func (b *backupClusterManifest) LocalNodeID() string {
+	return b.coordinator.LocalNodeID()
+}
+
+// PauseCompaction takes the cluster-wide compaction pause for a restore
+// (#1087). The coordinator handle satisfies backup.CompactionPause; a nil
+// interface is returned on error so the manager never holds a typed nil.
+func (b *backupClusterManifest) PauseCompaction(ctx context.Context, reason string) (backup.CompactionPause, error) {
+	if !b.coordinator.HasRaft() {
+		return nil, errNoRaftManifest
+	}
+	h, err := b.coordinator.PauseCompaction(ctx, reason)
+	if err != nil {
+		return nil, err
+	}
+	return h, nil
+}
+
+// newCompactionQuiescer builds the hook the coordinator runs on this node
+// when a cluster-wide compaction pause lands (#1087). It returns once no
+// compaction cycle is running and the completion watcher has no
+// sources_deleted manifest left to commit, polling every 250 ms; the cycle
+// stops at its next batch boundary on its own (the pause gate) and the
+// watcher keeps applying during the pause, which is the drain. It returns an
+// error when ctx ends or when the pause ends before this node quiesced, so
+// the coordinator does not ack a pause that is no longer in force.
+//
+// Once no cycle is running no subprocess is alive (the cycle finalizer waits
+// for every worker, each waits for its subprocess), so an output_written
+// manifest still pending at that point is stuck: its subprocess died between
+// the two commit phases and nothing advances it. It is logged with its job
+// IDs and does not hold the ack: the watcher will not delete its inputs from
+// the manifest, so it cannot race the restore.
+//
+// manager and watcher may each be nil (compaction disabled; the watcher is
+// built only with replication): a node with neither quiesces at once. When
+// expectWatcher is true (this node runs compaction with replication, so its
+// commits go through a watcher) and the watcher is nil, its construction
+// failed: the node then NEVER reports idle, because nothing can tell whether
+// a phase-2 commit is pending, and the restore times out naming it.
+func newCompactionQuiescer(coordinator *cluster.Coordinator, manager *compaction.Manager, watcher *compaction.CompletionWatcher, expectWatcher bool, logger zerolog.Logger) func(ctx context.Context) error {
+	return func(ctx context.Context) error {
+		if expectWatcher && watcher == nil {
+			return errors.New("compaction completion watcher not available on this node, so its pending compaction commits cannot be checked; the node will not acknowledge the pause")
+		}
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		warnedStuck := false
+		for {
+			if coordinator != nil && !coordinator.CompactionPaused() {
+				return errors.New("the compaction pause ended before this node quiesced")
+			}
+			idle := manager == nil || !manager.IsCycleRunning()
+			if idle {
+				if w := watcher; w != nil {
+					sourcesDeleted, outputWritten, err := w.PendingCommits()
+					if err != nil {
+						return fmt.Errorf("could not read the pending compaction commits: %w", err)
+					}
+					if sourcesDeleted > 0 {
+						idle = false
+					} else if len(outputWritten) > 0 && !warnedStuck {
+						warnedStuck = true
+						logger.Warn().
+							Strs("job_ids", outputWritten).
+							Msg("Compaction completion manifests are stuck at output_written with no cycle running: their subprocess ended between the two commit phases, nothing advances them and the inputs they name stay registered. They do not hold up the compaction pause")
+					}
+				}
+			}
+			if idle {
+				return nil
+			}
+			select {
+			case <-ctx.Done():
+				detail := "a compaction cycle is still running"
+				if manager == nil || !manager.IsCycleRunning() {
+					detail = "sources_deleted completion manifests are still pending"
+				}
+				return fmt.Errorf("compaction did not quiesce before the deadline (%s): %w", detail, ctx.Err())
+			case <-ticker.C:
+			}
+		}
+	}
+}
+
+// ManifestFiles returns the hot data-file entries of the manifest, one FSM
+// read. Cold entries are left out: tiering removes a migrated file's entry
+// today, so there should be none, but one that did appear would be reported
+// by the backup as a file this node lacks, which it does not — the file moved.
+func (b *backupClusterManifest) ManifestFiles() []backup.ManifestFile {
+	entries := b.coordinator.GetFileManifest()
+	out := make([]backup.ManifestFile, 0, len(entries))
+	for _, e := range entries {
+		// Cold entries stay OUT, and this filter is load-bearing for the cold
+		// backup walk (#1086 stage C) as well as for the reason below.
+		// crossCheckManifest treats this set as the authority on what is
+		// registered data; a cold entry appearing here would make it hold back
+		// or re-delete the very files the cold walk exists to carry. Cold files
+		// are enumerated from the cold store and reconciled against tier rows
+		// instead, and they are deliberately never registered in the Raft
+		// manifest. Do not "fix" the cold walk by letting cold entries through
+		// here.
+		if e == nil || e.Tier == "cold" {
+			continue
+		}
+		out = append(out, backup.ManifestFile{
+			Path:          e.Path,
+			SHA256:        e.SHA256,
+			SizeBytes:     e.SizeBytes,
+			Database:      e.Database,
+			Measurement:   e.Measurement,
+			PartitionTime: e.PartitionTime,
+			CreatedAt:     e.CreatedAt,
+		})
+	}
+	return out
+}
+
+// BatchRegister applies one batch of register operations. Every path is
+// validated here first, because the FSM refuses the WHOLE batch for one bad
+// path and would name none of them; a refusal here names the path so the
+// restore's report is actionable. CreatedAt comes from the sidecar (the
+// manifest entry the backup saw, or the backup time on a standalone source)
+// and is never zero: the FSM refuses a zero created_at rather than fill it in,
+// since time.Now inside Apply would diverge replicas.
+//
+// Registering a path the manifest already lists is not a no-op: the FSM fires
+// its registration callback on every register (one enqueue and a stat per
+// peer), and a changed SHA fires the content-change callback too, so since
+// #907 every peer re-pulls that file from this node.
+func (b *backupClusterManifest) BatchRegister(ctx context.Context, files []backup.ManifestFile) error {
+	if !b.coordinator.HasRaft() {
+		return errNoRaftManifest
+	}
+	ops, err := buildRegisterOps(files, b.coordinator.LocalNodeID())
+	if err != nil {
+		return err
+	}
+	return applyManifestBatchWithRetry(ctx, func(ctx context.Context) error {
+		return b.coordinator.BatchFileOpsInManifestContext(ctx, ops)
+	}, backupManifestRetryBudget, backupManifestRetryDelay)
+}
+
+// buildRegisterOps maps sidecar rows onto register operations stamped with
+// originNodeID. Pure, so the frame-fit test can size what the manager sends.
+func buildRegisterOps(files []backup.ManifestFile, originNodeID string) ([]clusterraft.BatchFileOp, error) {
+	ops := make([]clusterraft.BatchFileOp, 0, len(files))
+	for _, f := range files {
+		if err := clusterraft.ValidateManifestPath(f.Path); err != nil {
+			return nil, fmt.Errorf("register %s: the cluster manifest refuses the path: %w", f.Path, err)
+		}
+		createdAt := f.CreatedAt
+		if createdAt.IsZero() {
+			createdAt = time.Now().UTC()
+		}
+		payload, err := json.Marshal(clusterraft.RegisterFilePayload{File: clusterraft.FileEntry{
+			Path:          f.Path,
+			SHA256:        f.SHA256,
+			SizeBytes:     f.SizeBytes,
+			Database:      f.Database,
+			Measurement:   f.Measurement,
+			PartitionTime: f.PartitionTime,
+			OriginNodeID:  originNodeID,
+			Tier:          "hot",
+			CreatedAt:     createdAt,
+		}})
+		if err != nil {
+			return nil, fmt.Errorf("register %s: marshal payload: %w", f.Path, err)
+		}
+		ops = append(ops, clusterraft.BatchFileOp{Type: clusterraft.CommandRegisterFile, Payload: payload})
+	}
+	return ops, nil
+}
+
+// BatchDelete applies one batch of delete operations stamped with reason. On
+// a local backend the coordinator's FSM delete callback hands each path to the
+// local-delete workers on every node; on a shared backend that callback takes
+// no action and the backup manager removes the objects itself, after this
+// returns (manifest before storage).
+func (b *backupClusterManifest) BatchDelete(ctx context.Context, paths []string, reason string) error {
+	if !b.coordinator.HasRaft() {
+		return errNoRaftManifest
+	}
+	ops := make([]clusterraft.BatchFileOp, 0, len(paths))
+	for _, p := range paths {
+		payload, err := json.Marshal(clusterraft.DeleteFilePayload{Path: p, Reason: reason})
+		if err != nil {
+			return fmt.Errorf("delete %s: marshal payload: %w", p, err)
+		}
+		ops = append(ops, clusterraft.BatchFileOp{Type: clusterraft.CommandDeleteFile, Payload: payload})
+	}
+	return applyManifestBatchWithRetry(ctx, func(ctx context.Context) error {
+		return b.coordinator.BatchFileOpsInManifestContext(ctx, ops)
+	}, backupManifestRetryBudget, backupManifestRetryDelay)
+}
+
+// applyManifestBatchWithRetry runs apply, retrying for up to budget (and
+// while ctx lives) when the refusal is only that no leader is known or
+// reachable, as file_registrar.go's drain does. Any other error, including
+// a quorum loss, returns at once; the last transient error is returned when
+// the budget runs out.
+func applyManifestBatchWithRetry(ctx context.Context, apply func(context.Context) error, budget, delay time.Duration) error {
+	deadline := time.Now().Add(budget)
+	for {
+		err := apply(ctx)
+		if err == nil || !cluster.IsTransientLeaderError(err) {
+			return err
+		}
+		if ctx.Err() != nil || !time.Now().Before(deadline) {
+			return err
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return err
+		case <-timer.C:
+		}
 	}
 }

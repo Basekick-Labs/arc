@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,6 +35,7 @@ type fakeManifest struct {
 	failOnCall int // 1-based: fail exactly this call
 	probe      string
 	seq        *[]string
+	byDatabase map[string][]string
 }
 
 func (f *fakeManifest) DeleteFilesFromManifest(ctx context.Context, paths []string, reason string) error {
@@ -64,6 +66,25 @@ func (f *fakeManifest) DeleteFilesFromManifest(ctx context.Context, paths []stri
 func (f *fakeManifest) ManifestEntry(path string) (int64, bool) {
 	n, ok := f.entries[path]
 	return n, ok
+}
+
+// ManifestEntriesByDatabase models the real FSM, which indexes entries by the
+// manifest entry's Database FIELD (ClusterFSM.filesByDB), NOT by the first
+// path segment. byDatabase lets a test register the mismatch edge-sync
+// actually produces -- Path "{spoke}/{db}/..." under Database "{db}" -- which
+// a path-prefix fake cannot express, and which is what made the unfiltered
+// union delete a spoke's files.
+func (f *fakeManifest) ManifestEntriesByDatabase(database string) []string {
+	if f.byDatabase != nil {
+		return append([]string(nil), f.byDatabase[database]...)
+	}
+	var paths []string
+	for path := range f.entries {
+		if strings.HasPrefix(path, database+"/") {
+			paths = append(paths, path)
+		}
+	}
+	return paths
 }
 
 var manifestPartition = time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC)
@@ -260,7 +281,7 @@ func TestRunCycle_SweepsSettledRowNotJustListedOne(t *testing.T) {
 
 	// A: migrated by this node before the manifest was kept in step.
 	mustWrite(t, cold, gateDailyA)
-	if err := m.metadata.RecordColdFile(ctx, coldRowFor(gateDailyA), time.Now().Add(-2*time.Hour)); err != nil {
+	if _, err := m.metadata.RecordColdFile(ctx, coldRowFor(gateDailyA), time.Now().Add(-2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	// B: first seen by this cycle's cold listing, stamped with the object's
@@ -312,7 +333,7 @@ func TestReconcileOrphans_ReceiptsThenManifestThenHot(t *testing.T) {
 			for _, p := range []string{gateDailyA, gateDailyB} {
 				mustWrite(t, hot, p)
 				mustWrite(t, cold, p)
-				if err := m.metadata.RecordColdFile(ctx, coldRowFor(p), time.Now()); err != nil {
+				if _, err := m.metadata.RecordColdFile(ctx, coldRowFor(p), time.Now()); err != nil {
 					t.Fatal(err)
 				}
 				fake.entries[p] = 7
@@ -374,11 +395,11 @@ func TestReconcileManifest_SweepsOnlySettledVerifiedRows(t *testing.T) {
 		mustWrite(t, cold, p)
 	}
 	for _, p := range []string{swept, wrongSize, notInMan, noObject, quarantined} {
-		if err := m.metadata.RecordColdFile(ctx, coldRowFor(p), settled); err != nil {
+		if _, err := m.metadata.RecordColdFile(ctx, coldRowFor(p), settled); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := m.metadata.RecordColdFile(ctx, coldRowFor(recent), time.Now()); err != nil {
+	if _, err := m.metadata.RecordColdFile(ctx, coldRowFor(recent), time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.metadata.QuarantineFile(ctx, quarantined, quarantineReasonInvalidPath); err != nil {

@@ -55,6 +55,11 @@ enable_wal = true
 # -----------------------------------------------------------------------------
 [storage]
 backend = "local"           # "local" or "s3"
+# Arc REFUSES TO START when the backup destination overlaps this root — see the
+# note on [backup].local_path. Setting this to a PARENT of the backup directory
+# (for example "./data" beside the default backup path "./data/backups") is the
+# shape that boots today and will not boot after the upgrade. An empty value is
+# refused as itself.
 local_path = "./data/arc"
 
 # S3/MinIO (when backend = "s3")
@@ -72,6 +77,20 @@ s3_path_style = true        # MinIO/dev. AWS S3: false
 # Credentials via env: ARC_STORAGE_S3_ACCESS_KEY, ARC_STORAGE_S3_SECRET_KEY
 # On EKS with IRSA, leave both unset: Arc detects AWS_ROLE_ARN +
 # AWS_WEB_IDENTITY_TOKEN_FILE and authenticates via the pod's IAM role.
+#
+# A key prefix confines Arc to one subtree of the bucket or container, so
+# several deployments can share one, and so a backup target can live beside the
+# primary data. Both default to the root. Commented rather than set to "",
+# because a shipped value is the effective configuration for every deployment
+# that does not override it and an empty environment variable does not clear it
+# (see TestShippedArcTomlHasNoLiveColdTierConnectionValues).
+# s3_prefix = "instances/abc123"
+#
+# Azure Blob (when backend = "azure"). Credentials via env:
+# ARC_STORAGE_AZURE_ACCOUNT_NAME, ARC_STORAGE_AZURE_ACCOUNT_KEY (or
+# ARC_STORAGE_AZURE_CONNECTION_STRING).
+# azure_container = ""
+# azure_prefix = "instances/abc123"
 
 # -----------------------------------------------------------------------------
 # Ingestion
@@ -102,21 +121,30 @@ default_sort_keys = ""
 enabled = true
 
 # DuckDB thread count for EACH compaction subprocess.
-# Default: unset (0) = half of the CPUs this process may use, minimum 1.
+# Default: unset (0) = the CPUs this process may use divided by
+# max(2, compaction.max_concurrent), minimum 1. An explicit value is not
+# rewritten by this automatic default.
 # Environment override: ARC_COMPACTION_THREADS=4
 #
 # "CPUs this process may use" is min(runtime.NumCPU(), runtime.GOMAXPROCS(0)):
 # Go derives GOMAXPROCS from the container's CPU quota (cpu.max, or
 # cpu.cfs_quota_us on cgroup v1), while NumCPU catches cpuset limits that no
-# quota expresses. Before 26.09.3 this was half the HOST's core count, so a
-# 2-CPU pod on a 64-core node ran every compaction job with 32 threads (#1030).
+# quota expresses. The derivation does not distinguish which of the two it is
+# reading. Before 26.09.3 this was half the HOST's core count, so a 2-CPU pod
+# on a 64-core node ran every compaction job with 32 threads (#1030).
 #
-# Halving assumes the default max_concurrent = 2. Raising max_concurrent without
-# lowering this oversubscribes: the subprocesses do not share a budget.
+# The divisor tracks max_concurrent because the subprocesses do not share a
+# thread budget: before 27.01.1 it was always 2, so raising max_concurrent gave
+# that many jobs each claiming half the cores (#1037). The default
+# max_concurrent of 2 therefore keeps the previous half-core value exactly; only
+# a raised concurrency tightens. On 16 available CPUs: max_concurrent=2 gives 8
+# threads per subprocess, max_concurrent=4 gives 4.
 #
 # This does not make the total fit the quota. On a 2-CPU quota the two
-# subprocesses take 1 thread each and the main process takes the quota's 2 — 4
-# threads against 2 CPUs. These are caps on parallelism, not reservations.
+# subprocesses take 1 thread each and the main process takes the quota's 2 - 4
+# threads against 2 CPUs. These are caps on parallelism, not reservations, and
+# at least one thread is used even when the CPUs are fewer than the concurrent
+# subprocesses.
 #
 # Three things that change the derived value, all deliberate:
 #   - GOMAXPROCS set ABOVE the quota is honoured, up to the machine's core count.
@@ -124,8 +152,11 @@ enabled = true
 #     giving the pre-26.09.3 host-derived behaviour.
 #   - the runtime floors GOMAXPROCS at 2, so --cpus=0.5 still yields 1 thread.
 #
-# Not licence-capped: this is resolved before the licence is applied, and a
-# subprocess is a separate process. Set it by hand on a core-limited licence.
+# Licence-capped since 27.01.1, on a core-limited licence only: whatever value
+# this ends up with - automatic or explicit, since the automatic one is resolved
+# first - is lowered to min(licensed cores, CPUs this process may use) at
+# startup (#1036). That cap is per subprocess; it does not divide the licence
+# budget across the main process and all subprocesses.
 # threads = 4
 
 # Maximum wall-clock budget for ONE scheduled or manual compaction cycle.
@@ -158,6 +189,35 @@ enabled = true
 # Environment override (whitespace-separated; a name containing spaces
 # needs this TOML array): ARC_COMPACTION_EXCLUDE_DATABASES="staging imports"
 # exclude_databases = ["staging", "imports_backlog"]
+
+# Scratch directory for one compaction job: DuckDB spill plus the compacted
+# output before it is published. Default: "./data/compaction".
+# Environment override: ARC_COMPACTION_TEMP_DIRECTORY=/mnt/fast/compaction
+#
+# Two things about WHERE you point it, both of which matter on a local backend:
+#
+#   - Same filesystem as storage.local_path, and Arc MOVES the finished output
+#     into the storage root instead of copying it, so publishing costs a rename
+#     rather than a full read plus a full write of the file. On a different
+#     filesystem the move is impossible and Arc copies exactly as it used to,
+#     logging one warning per job that names both paths. The defaults
+#     ("./data/arc" and "./data/compaction") are siblings, so this applies out
+#     of the box (#969).
+#   - NOT inside storage.local_path. Everything under the storage root is
+#     treated as storage: the job directory is listed as a database by
+#     SHOW DATABASES, and an instance backup sweeps it, so a half-written
+#     output can land in a backup. A sibling directory satisfies "same
+#     filesystem" without this. Ordinary queries are unaffected either way --
+#     they glob <database>/<measurement>/**/*.parquet.
+#
+# Sizing: this directory needs room for whatever DuckDB spills plus the whole
+# compacted output. Inputs are not staged here on a local backend - they are read
+# from their own paths since 27.01.1 (#969). On a DIFFERENT filesystem from the
+# storage root, the storage root additionally needs room for a second copy of the
+# output while it is being published; on a volume too tight for that, compaction
+# does not fail cleanly - the adaptive splitter halves the batch and reports
+# success, leaving several partly compacted files where one belonged.
+# temp_directory = "./data/compaction"
 
 # Hourly
 hourly_enabled = true
@@ -230,6 +290,13 @@ enabled = false
 # Queries exceeding this threshold emit a WARN log and increment arc_slow_queries_total
 # slow_query_threshold_ms = 1000
 
+# Cancel a running query when the client connection closes before the response
+# completes. Like Go's net/http request-context behavior, a client that half-closes
+# its write side may be treated as disconnected even if it still reads the response.
+# Disable this for clients that use that request pattern; pending pipelined request
+# bytes also stop disconnect monitoring for the current query.
+# cancel_on_client_disconnect = true
+
 # S3 file caching (improves CTEs, subqueries, dashboard queries)
 enable_s3_cache = false
 s3_cache_size = "128MB"
@@ -257,6 +324,20 @@ enabled = false
 # default_max_rows_per_query = 0
 
 # -----------------------------------------------------------------------------
+# Scheduled network spoke sync (valid paid license required, as for CQ/retention).
+# Manual network sync and air-gap bundle export remain available without a license.
+# A network spoke also needs its hub URL, identities and environment-only credentials.
+#
+# [edge_sync.spoke]
+# enabled = false
+# sync_interval = "5m"         # Delay after a completed pass; at least 1s
+# sync_retry_interval = "30s"  # Initial retry; doubles up to sync_interval
+#                             # At least 1s and shorter than sync_interval
+# Environment overrides:
+# ARC_EDGE_SYNC_SPOKE_SYNC_INTERVAL
+# ARC_EDGE_SYNC_SPOKE_SYNC_RETRY_INTERVAL
+#
+# -----------------------------------------------------------------------------
 # Telemetry
 # -----------------------------------------------------------------------------
 [telemetry]
@@ -273,6 +354,38 @@ migration_max_concurrent = 4
 migration_batch_size = 100
 default_hot_max_age_days = 0
 migration_history_retention_days = 90
+
+# Budget for ONE tier scan. Default: "2h". Positive Go duration; zero, negative
+# and malformed values are rejected at startup.
+# Environment override: ARC_TIERED_STORAGE_SCAN_TIMEOUT=4h
+#
+# The scan is what puts a file in the tier metadata the query path routes reads
+# from. It runs on four paths and this one number now bounds all of them: the
+# startup scan, POST /api/v1/tiering/scan, and the pre-migration scan inside a
+# scheduled cycle or POST /api/v1/tiering/migrate. Before 27.01.1 the first two
+# were capped at 30 minutes with no way to change it (#1154).
+#
+# Inside a migration cycle the scan runs on a budget derived from the cycle's,
+# so it gets whichever is shorter. At this default the two are equal (the cycle
+# budget is also 2h), so the derivation changes nothing; it matters once this is
+# set BELOW 2h, where the scan gives up on its own budget and migration - the
+# step that actually moves files - keeps the remainder of the cycle. Setting it
+# ABOVE 2h is harmless: the cycle still bounds the scan.
+#
+# Setting it BELOW the time a full scan takes is harmful, not conservative.
+# Hot-row retirement runs only after the whole walk, so a scan that always
+# truncates never retires a row for a file that has left hot storage, and a
+# measurement whose remaining rows are all cold loses this node's local files
+# from the read. A truncated scan is reported: the log names this key, the
+# result carries "truncated", and GET /api/v1/tiering/status reports it under
+# "last_scan".
+#
+# Size it from the time a full scan takes on your storage root, which is
+# proportional to the number of objects under it rather than to their size. A
+# node whose data is largely compaction output depends on the scan entirely:
+# nothing else writes a tier row for a compacted file on the node that produced
+# it.
+# scan_timeout = "2h"
 
 [tiered_storage.cold]
 enabled = false
@@ -306,6 +419,10 @@ s3_region = "us-east-1"
 azure_container = ""
 azure_endpoint = ""
 azure_use_managed_identity = false
+# A prefix lets the cold tier share one container with the primary store. Left
+# commented for the same reason as the connection values above: a shipped value
+# cannot be cleared by an empty environment variable.
+# azure_prefix = "cold"
 
 # -----------------------------------------------------------------------------
 # Audit Logging (Enterprise)
@@ -318,8 +435,170 @@ include_reads = false           # Log GET/query requests (high volume)
 # Backup & Restore
 # -----------------------------------------------------------------------------
 [backup]
+# BREAKING on upgrade, and it is these two keys that cause it, not the target
+# block below: Arc now REFUSES TO START when the backup destination overlaps
+# primary storage, and with no target configured the destination is
+# local_path. A deployment whose local_path sits inside storage.local_path — or
+# whose storage.local_path is a parent of it, such as "./data" — boots today
+# and will not boot after the upgrade. The defaults below are disjoint and are
+# unaffected. An empty local_path with no target is refused too, where it used
+# to boot with the backup API quietly skipped.
 enabled = true
-local_path = "./data/backups"           # Directory for local backups
+local_path = "./data/backups"           # Directory for local backups; see the refusal note above
+# How long one backup or one restore may run before its context is cancelled.
+# Go duration syntax; must be positive. 2h is the value both were hardcoded to
+# before this key existed.
+# operation_timeout = "2h"
+#
+# A named backup TARGET makes the destination configurable, and it may be remote
+# (#1085). Point default_target at it and local_path above is ignored entirely —
+# the directory is not even created. SEVERAL targets are supported, with
+# per-database routing: `databases = [...]` on a target sends those databases
+# files there and everything else goes to default_target.
+#
+# A routed backup writes one manifest and one file sidecar PER TARGET, each
+# describing its own slice and each naming the whole run, plus an index at
+# <backup_id>/index.json on the default target that names every target the run
+# touched. The listing then returns ONE entry per backup id, with every
+# destination holding a slice of it; a target that will not answer is named in
+# unreachable_targets and the rest of the listing still answers. A delete
+# sweeps every target. A restore reads EVERY target of the run and REFUSES
+# before writing anything if one of them is not configured here, will not
+# answer, or holds no manifest for the id — restoring only the reachable part
+# would report success over a set it did not restore.
+#
+# A database goes to exactly one target: naming it on two is refused at
+# startup. Naming databases on default_target is allowed and does nothing,
+# since everything unrouted goes there already, so put them on the target you
+# want them to go TO: in the example below, default_target is "main" and only
+# [backup.targets.audit] carries `databases`.
+#
+# Only the COMMA separates names. A database name may contain a space, so
+# databases = "my db" is ONE name and databases = ["a", "b"] is two.
+#
+# A target nothing is routed to is INERT: no backup writes to it, and a warning
+# at startup names it. It is not a refusal, because adding the target block and
+# its databases in separate commits is ordinary, and it is deliberately not a
+# leg either — a leg is probed before anything is copied, so a target nothing
+# routes to would otherwise make an unrelated store a precondition of every
+# backup in this instance, including whole-instance ones. The names are storage-root
+# segments, exactly as a scoped backup names them, so an edge-sync spoke is
+# named as the SPOKE: ["prod"] does not mean spoke1/prod.
+#
+# The instance-wide state always goes to default_target whatever the routing
+# says, because it belongs to no one database: the SQLite database, the Iceberg
+# SQL catalog, the Iceberg table metadata, an out-of-root Iceberg warehouse and
+# this config file. A database's own field schema anchors (_schema/<db>/) and
+# compaction recovery state (_compaction_state/<tier>/<db>/) DO travel with its
+# data to its target.
+#
+# Target names are letters, digits and underscore only, and are lowercased. The
+# rule that matters is the HYPHEN: it cannot appear in an environment variable
+# name, so a hyphenated target could be set here and never afterwards
+# overridden from the environment, which is how a credential stays in a config
+# file for good. So "audit-bucket" is REFUSED and "audit_bucket" is not. Case is
+# not a hazard — both this file and the environment are lowercased, so "Audit"
+# and "audit" are one target.
+#
+# Arc REFUSES AT STARTUP a destination that overlaps primary storage or the
+# tiered-storage cold tier, or ANOTHER backup target, for two reasons that are
+# both permanent and both silent (two targets that contain one another are one
+# listing, so each backup leg would enumerate the other objects and deleting
+# one backup id would reach both). A destination inside the storage root is inventoried by the next
+# backup, so each backup copies the previous one in full; on a cluster those
+# files are absent from the Raft manifest, and past the skip ratio every
+# replace-mode restore is refused. And with reconciliation enabled and
+# manifest_only_dry_run off, its sweep DELETES the backups, because a backup
+# data key has nine path segments and the sweep treats seven or more as a
+# managed path.
+#
+# The same applies to a prefix that is a parent of, or sits under, the storage
+# or cold-tier prefix, and every spelling of one endpoint counts as one store:
+# leaving s3_endpoint empty for AWS on one side and writing out
+# "s3.us-east-1.amazonaws.com" on the other does not make them two places. One
+# bucket with DISJOINT prefixes is fine and is the intended shape.
+#
+# default_target = "main"
+#
+# [backup.targets.main]                  # the DEFAULT: everything unrouted goes here
+# type = "local"                         # local, s3, minio, azure or azblob
+# local_path = "/srv/arc-backups"
+#
+# [backup.targets.audit]                 # a ROUTED target: it carries `databases`
+# type = "s3"
+# databases = ["audit", "compliance"]    # these databases go here; everything else to default_target
+#                                        # also "audit,compliance" or
+#                                        # ARC_BACKUP_TARGETS_AUDIT_DATABASES=audit,compliance
+#                                        # the COMMA is the only separator: "my db" is ONE name
+# s3_bucket = "acme-arc-audit-backups"
+# s3_prefix = "arc/backups"
+# s3_region = "us-east-1"
+# s3_endpoint = ""                       # set for MinIO/SeaweedFS
+# s3_use_ssl = true
+# s3_path_style = false                  # required for MinIO
+# s3_access_key = ""                     # prefer ARC_BACKUP_TARGETS_AUDIT_S3_ACCESS_KEY
+# s3_secret_key = ""                     # prefer ARC_BACKUP_TARGETS_AUDIT_S3_SECRET_KEY
+#
+# From the environment ALONE, with nothing in this file, a target takes an extra
+# variable, because a name cannot be discovered from a map that does not exist:
+#   ARC_BACKUP_TARGET_NAMES=main,audit
+#   ARC_BACKUP_TARGETS_MAIN_TYPE=s3
+#   ARC_BACKUP_TARGETS_MAIN_S3_BUCKET=acme-arc-backups
+#   ARC_BACKUP_TARGETS_AUDIT_TYPE=s3
+#   ARC_BACKUP_TARGETS_AUDIT_S3_BUCKET=acme-arc-audit-backups
+#   ARC_BACKUP_TARGETS_AUDIT_DATABASES=audit,compliance
+#   ARC_BACKUP_DEFAULT_TARGET=main
+#
+# With ANY remote target configured, include_config defaults to FALSE for every
+# backup — not only when the DEFAULT target is remote: this file carries every
+# target's own credentials, so a local default plus one remote routed target
+# still means the default would put the keys that unlock that store inside a
+# backup it holds. A request may ask for it explicitly and is warned, naming
+# every remote target whose keys the backup then carries.
+#
+# Backups carry the identity of the instance that wrote them, so two instances
+# sharing one bucket and prefix do not merge listings. On a cluster that
+# identity is cluster.cluster_name, whose default is "arc-cluster" — SET IT, or
+# two unrelated clusters on the default collide. Standalone, Arc mints a UUID
+# and keeps it in a file beside the shared SQLite database. Switching a node
+# from clustered to standalone therefore changes its identity, so its own
+# earlier backups then read as foreign; they stay listable with
+# include_foreign=true and stay restorable. A restore never
+# adopts the identity in the backup it restored: the listing marks another
+# instance backups as foreign_owner, and GET /api/v1/backup?include_foreign=true
+# shows them, with a filtered_foreign count on the plain listing so an empty
+# answer says what it withheld. That is what makes recovery onto fresh
+# hardware possible.
+#
+# A backup carries BOTH tiers. With tiered_storage on, the cold-tier objects are
+# backed up too and a restore puts each file back on the tier its local row says it belongs to, which from v27.01.1 can differ from the tier the backup read it from,
+# recording the tier row that makes it queryable. cold_files on the manifest
+# says how many came from cold; it is also in the listing and per target in
+# GET /api/v1/backup/<id>.
+#
+# So a backup of a tiered deployment is roughly the size of hot PLUS cold.
+# There is deliberately no switch to turn the cold half off — a backup that
+# silently omits most of a database is the problem this solves — so scope the
+# backup with `databases` if you want a smaller one.
+#
+# Restoring onto a node with NO cold tier is supported: those files land in hot
+# storage and the status reports cold_files_restored_to_hot. An UNREACHABLE
+# cold store FAILS the backup rather than producing a smaller one, because
+# nothing in Arc deletes a cold object, so a read that fails means the store is
+# gone rather than the file.
+#
+# WHICH NODE takes the backup now decides what is IN it, not just what a count
+# says: the walk reads THIS node cold store and THIS node tier rows. On a
+# cluster where only the primary migrates, take the backup on the primary
+# writer. Restore there too — a cold restore leaves a tier row, and the stale
+# hot copy it can supersede is removed by a reconciliation that runs only on
+# the migrating node.
+#
+# cold_files_excluded counts tier rows whose data the backup does NOT hold:
+# with a readable cold tier that is the rows whose object is missing from the
+# store, which is data that is genuinely gone. An ABSENT field is not evidence
+# that nothing was migrated — tiering is licence-gated at startup, so a node
+# without the licence carries no cold data and reports nothing about it.
 
 # Query Management (Enterprise)
 # -----------------------------------------------------------------------------

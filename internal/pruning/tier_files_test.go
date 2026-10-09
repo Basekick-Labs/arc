@@ -7,6 +7,7 @@ package pruning
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -133,4 +134,42 @@ func (erringBackend) List(context.Context, string) ([]string, error) {
 
 func (erringBackend) ListDirectories(context.Context, string) ([]string, error) {
 	return nil, errors.New("store unreachable")
+}
+
+// missingStoreBackend answers every listing with the sentinel a backend
+// reports when its bucket or container does not exist — a misnamed
+// tiered_storage.cold.s3_bucket, or one an operator deleted.
+type missingStoreBackend struct{ storage.Backend }
+
+func (missingStoreBackend) List(context.Context, string) ([]string, error) {
+	return nil, fmt.Errorf("failed to list S3 objects: %w", storage.ErrStoreNotFound)
+}
+
+func (missingStoreBackend) ListDirectories(context.Context, string) ([]string, error) {
+	return nil, fmt.Errorf("failed to list S3 directories: %w", storage.ErrStoreNotFound)
+}
+
+// A store that does not exist must leave the question OPEN, exactly as any
+// other listing failure does. It is the one case where an empty answer and a
+// failure are easy to conflate, and conflating them is not a performance bug:
+// TierHasFiles' caller drops the whole tier from the read on (has=false,
+// verified=true), so a cold bucket with a typo in its name would make a query
+// return the hot tier's rows alone with success:true and no truncation
+// signal. #945's leniency belongs to the four read handlers that serve a
+// fresh deployment, never here.
+func TestTierHasFiles_MissingStoreLeavesTheQuestionOpen(t *testing.T) {
+	ctx := context.Background()
+	backend, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatalf("NewLocalBackend: %v", err)
+	}
+
+	if has, verified := TierHasFiles(ctx, missingStoreBackend{backend}, "db1", "cpu"); has || verified {
+		t.Fatalf("missing store: has=%v verified=%v, want (false, false)", has, verified)
+	}
+	// Same answer when the walk is unavailable and only the recursive
+	// fallback runs.
+	if has, verified := TierHasFiles(ctx, noDirBackend{missingStoreBackend{backend}}, "db1", "cpu"); has || verified {
+		t.Fatalf("missing store, no DirectoryLister: has=%v verified=%v, want (false, false)", has, verified)
+	}
 }

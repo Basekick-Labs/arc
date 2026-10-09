@@ -32,6 +32,10 @@ type MigratorConfig struct {
 	Logger        zerolog.Logger
 }
 
+func isDailyCompactedPath(path string) bool {
+	return strings.HasSuffix(storage.StripRewriteSuffix(path), "_daily.parquet")
+}
+
 // ErrCandidateQuarantined is returned by MigrateFile when the candidate's
 // storage key turned out to be permanently unusable and the file index row
 // was marked so it is never selected again (#758). It wraps the backend's
@@ -143,8 +147,9 @@ func (m *Migrator) FindCandidates(ctx context.Context, fromTier, toTier Tier) ([
 			continue
 		}
 
-		// Only migrate daily-compacted files to cold tier
-		if !strings.HasSuffix(file.Path, "_daily.parquet") {
+		// Only migrate daily-compacted files to cold tier. Immutable DELETE
+		// rewrites retain the logical suffix after normalization.
+		if !isDailyCompactedPath(file.Path) {
 			continue
 		}
 
@@ -307,7 +312,24 @@ func (m *Migrator) releaseHotCopies(ctx context.Context, files []MigrationCandid
 			return err
 		}
 		for _, c := range chunk {
+			// Always the HOT backend in the only production caller
+			// (MigrateTier(ctx, TierHot, TierCold)), but GetBackendForTier
+			// can answer nil for cold since #1143, so a cold-to-hot path
+			// added later finds a guard rather than a panic.
+			//
+			// Nothing re-runs this delete, and the comment must not pretend
+			// otherwise (Cluster Operations Checklist item 5): the manifest
+			// entry is already gone for this chunk, and the orphan sweep only
+			// ever removes HOT copies, so a leftover source copy in cold is
+			// an orphan in storage with no manifest entry. The opt-in
+			// reconciliation sweep would delete it after its grace window;
+			// nothing else will.
 			src := m.manager.GetBackendForTier(c.CurrentTier)
+			if src == nil {
+				m.logger.Error().Str("path", c.Path).Str("tier", string(c.CurrentTier)).
+					Msg("No usable backend for the migration source tier, so the copy in it cannot be removed; its manifest entry is already gone and nothing re-runs this delete, leaving an orphan in that tier until an operator or the opt-in reconciliation sweep removes it")
+				continue
+			}
 			if err := src.Delete(ctx, c.Path); err != nil {
 				m.logger.Warn().Err(err).Str("path", c.Path).Msg("Failed to delete source file after migration")
 				// Don't fail the migration - file is in destination, just source cleanup failed
@@ -600,12 +622,17 @@ func (m *Migrator) ReconcileOrphanedFiles(ctx context.Context) (orphansFound, de
 		orphansFound++
 
 		// A cold row written by this node's own migration is proof of a cold
-		// copy; a cold row written by the shared-storage metadata sync is
-		// not. The sync records rows from a cold LISTING, which can catch an
-		// object the primary copied and then rolled back (MigrateFile
-		// deletes the cold object when its UpdateTier fails). Deleting the
-		// hot copy on such a row would lose the file, so require the cold
-		// object first; a row whose cold object is gone goes back to hot so
+		// copy; a cold row written by the metadata sync is not, and since
+		// #1179 that sync runs on every node with a usable cold tier, not
+		// only on shared storage. The sync records rows from a cold LISTING,
+		// and a listing says an object is there, not that it is the complete
+		// and current copy of that path: copyAndFlip leaves the cold object
+		// in place when its UpdateTier fails (see the comment there, which
+		// says why removing it would be worse), so an object can sit in cold
+		// under a row that still says hot until some later pass reconciles
+		// them. Deleting the hot copy on the strength of a listing alone
+		// would lose the file, so require the cold object first; a row whose
+		// cold object is gone goes back to hot so
 		// the primary migrates it again instead of leaving a cold row that
 		// points at nothing.
 		coldBackend := m.manager.GetBackendForTier(TierCold)

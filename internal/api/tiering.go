@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -18,6 +19,12 @@ type TieringHandler struct {
 	authManager   *auth.AuthManager
 	licenseClient *license.Client
 	logger        zerolog.Logger
+	getFiles      func(context.Context, string, string) ([]tiering.FileMetadata, error)
+	// scanTiers and scanBudget are indirected for the same reason getFiles
+	// is: the response classification below is worth testing without
+	// standing up a Manager, a SQLite file and a licence client.
+	scanTiers  func(context.Context) (*tiering.ScanResult, error)
+	scanBudget func() time.Duration
 }
 
 // NewTieringHandler creates a new tiering handler
@@ -27,6 +34,26 @@ func NewTieringHandler(manager *tiering.Manager, authManager *auth.AuthManager, 
 		authManager:   authManager,
 		licenseClient: licenseClient,
 		logger:        logger.With().Str("component", "tiering-api").Logger(),
+		scanTiers:     manager.ScanTiers,
+		scanBudget:    manager.ScanBudget,
+		getFiles: func(ctx context.Context, tierParam, database string) ([]tiering.FileMetadata, error) {
+			var files []tiering.FileMetadata
+			if database != "" {
+				return manager.GetMetadata().GetFilesByDatabase(ctx, database)
+			}
+			if tierParam != "" {
+				tier := tiering.TierFromString(tierParam)
+				return manager.GetMetadata().GetFilesInTier(ctx, tier)
+			}
+			for _, t := range []tiering.Tier{tiering.TierHot, tiering.TierCold} {
+				tierFiles, err := manager.GetMetadata().GetFilesInTier(ctx, t)
+				if err != nil {
+					return nil, err
+				}
+				files = append(files, tierFiles...)
+			}
+			return files, nil
+		},
 	}
 }
 
@@ -56,27 +83,16 @@ func (h *TieringHandler) GetFiles(c *fiber.Ctx) error {
 
 	tierParam := c.Query("tier")
 	database := c.Query("database")
-	limit := c.QueryInt("limit", 100)
-
-	var files []tiering.FileMetadata
-	var err error
-
-	if database != "" {
-		files, err = h.manager.GetMetadata().GetFilesByDatabase(ctx, database)
-	} else if tierParam != "" {
-		tier := tiering.TierFromString(tierParam)
-		files, err = h.manager.GetMetadata().GetFilesInTier(ctx, tier)
-	} else {
-		// Get all files - query each tier (2-tier system: hot and cold)
-		for _, t := range []tiering.Tier{tiering.TierHot, tiering.TierCold} {
-			tierFiles, tierErr := h.manager.GetMetadata().GetFilesInTier(ctx, t)
-			if tierErr != nil {
-				err = tierErr
-				break
-			}
-			files = append(files, tierFiles...)
+	limit := 100
+	if raw := c.Query("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid limit"})
 		}
+		limit = n
 	}
+
+	files, err := h.getFiles(ctx, tierParam, database)
 
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to get tiering files")
@@ -85,8 +101,11 @@ func (h *TieringHandler) GetFiles(c *fiber.Ctx) error {
 		})
 	}
 
-	// Apply limit
-	if len(files) > limit {
+	// limit=0 deliberately means an empty result. Positive limits are
+	// clamped here as a second line of defence even if boundary validation changes.
+	if limit == 0 {
+		files = files[:0]
+	} else if limit > 0 && len(files) > limit {
 		files = files[:limit]
 	}
 
@@ -193,20 +212,82 @@ func (h *TieringHandler) GetStats(c *fiber.Ctx) error {
 	})
 }
 
-// ScanFiles registers every file in hot storage and, on a node with a
-// cluster gate, first learns which files other nodes moved to cold.
+// ScanFiles registers every file in hot storage and, on any node with a usable
+// cold tier, first reads the cold listing — which is what rebuilds cold rows
+// this node has lost and, on a cluster, what shows it the files other nodes
+// moved (#1179).
 // POST /api/v1/tiering/scan
+//
+// Bounded by tiered_storage.scan_timeout, the same budget the startup scan and
+// the pre-migration scan use (#1154). The budget is read from the manager
+// rather than carried on the handler so it cannot be a zero here.
+//
+// Synchronous on purpose. c.Context() is the right parent because it is what
+// makes a server shutdown cancel an in-flight scan, and the handler blocks
+// until the scan returns, so the context never outlives the request. Note it
+// is NOT cancelled when the client disconnects: fasthttp closes
+// RequestCtx.Done only on shutdown, which is why a second scan is refused
+// below rather than left to pile up behind an abandoned curl.
 func (h *TieringHandler) ScanFiles(c *fiber.Ctx) error {
-	ctx, cancel := context.WithTimeout(c.Context(), 30*time.Minute)
+	budget := h.scanBudget()
+	ctx, cancel := context.WithTimeout(c.Context(), budget)
 	defer cancel()
 
-	h.logger.Info().Msg("Starting file scan via API")
+	h.logger.Info().Dur("scan_timeout", budget).Msg("Starting file scan via API")
 
-	result, err := h.manager.ScanTiers(ctx)
-	if err != nil {
+	result, err := h.scanTiers(ctx)
+	switch {
+	case errors.Is(err, tiering.ErrScanRunning):
+		h.logger.Warn().Msg("File scan via API refused: a scan is already running on this node")
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"error":   "A tier scan is already running on this node",
+			"message": "Wait for it to finish and read its result from GET /api/v1/tiering/status, which reports the last scan.",
+		})
+
+	case errors.Is(err, context.DeadlineExceeded):
+		// The scan ran out of budget. The rows it wrote are real, so the
+		// partial counts go back with the error rather than being
+		// discarded: a bare 500 told the operator nothing about how far it
+		// got, or that no stale hot row was retired.
+		h.logger.Warn().Dur("scan_timeout", budget).
+			Int("scanned", result.FilesScanned).
+			Msg("File scan via API ran out of budget and stopped part way")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error":   "The tier scan ran out of its budget and stopped part way",
+			"message": "The rows below were written, but the scan is incomplete and no stale hot rows were retired. Raise tiered_storage.scan_timeout above the time a full scan takes on this node.",
+			"result":  result,
+		})
+
+	case errors.Is(err, context.Canceled):
+		// The ONLY producer of Canceled here is the server shutting down:
+		// fasthttp closes RequestCtx.Done on shutdown and never on a client
+		// disconnect. Saying "raise your budget" would be the wrong advice.
+		h.logger.Warn().Msg("File scan via API cancelled: the node is shutting down")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error":   "The tier scan was cancelled because this node is shutting down",
+			"message": "Retry after the node restarts; the startup scan may have already covered it.",
+			"result":  result,
+		})
+
+	case err != nil:
 		h.logger.Error().Err(err).Msg("Failed to scan files")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": err.Error(),
+			"error":  err.Error(),
+			"result": result,
+		})
+	}
+
+	// A truncation in the retirement tail returns no error of its own, so it
+	// arrives here with err nil. Answering 200 would report a scan that left
+	// stale hot rows behind as a clean one.
+	if result.Truncated {
+		h.logger.Warn().Dur("scan_timeout", budget).
+			Int("scanned", result.FilesScanned).
+			Msg("File scan via API stopped part way")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error":   "The tier scan stopped part way through",
+			"message": "The rows below were written, but the scan is incomplete and no stale hot rows were retired. Raise tiered_storage.scan_timeout above the time a full scan takes on this node.",
+			"result":  result,
 		})
 	}
 

@@ -413,14 +413,22 @@ func TestBuildAzureSecretSQL(t *testing.T) {
 	})
 }
 
-func TestAzureScope(t *testing.T) {
-	tests := []struct{ container, want string }{
-		{"", ""},
-		{"c1", "azure://c1/"},
+func TestAzureSecretScope(t *testing.T) {
+	tests := []struct {
+		container, prefix, want string
+	}{
+		{"", "", ""},                               // no container -> unscoped
+		{"", "p", ""},                              // prefix without container -> unscoped
+		{"c1", "", "azure://c1/"},                  // container only; the pre-#1102 shape
+		{"c1", "data", "azure://c1/data/"},         // container + prefix
+		{"c1", "/data/", "azure://c1/data/"},       // leading/trailing slashes normalized
+		{"c1", "..", "azure://c1/"},                // Clean cannot express it; bare container
+		{"shared", "hot", "azure://shared/hot/"},   // same container, hot half
+		{"shared", "cold", "azure://shared/cold/"}, // and the cold half: distinct scopes
 	}
 	for _, tt := range tests {
-		if got := azureScope(tt.container); got != tt.want {
-			t.Errorf("azureScope(%q) = %q, want %q", tt.container, got, tt.want)
+		if got := azureSecretScope(tt.container, tt.prefix); got != tt.want {
+			t.Errorf("azureSecretScope(%q, %q) = %q, want %q", tt.container, tt.prefix, got, tt.want)
 		}
 	}
 }

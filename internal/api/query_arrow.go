@@ -574,6 +574,10 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	case queryID != "":
 		ctx, cancel = context.WithCancel(baseCtx)
 	}
+	if cancel == nil {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	recordDisconnect := h.watchQueryClientDisconnect(ctx, c.Context().Conn(), queryID, cancel, metrics.DisconnectPathArrowIPC)
 
 	// The arcx hook may install an asynchronous stream writer. A successful
 	// hand-off transfers ownership of cancel and registry disposition to it.
@@ -619,6 +623,12 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// Execute query using DuckDB's native Arrow API — returns record batches
 	// directly from DuckDB's internal columnar chunks, no row-by-row scanning.
 	reader, conn, err := h.db.ArrowQueryContext(ctx, convertedSQL)
+	// Match the JSON query contract: a data glob with no matches is an empty
+	// result, not a failed query. Keep missing schema anchors as errors because
+	// they invalidate the cached SQL transform.
+	if err != nil && ctx.Err() == nil && isNoFilesFoundError(err) && !h.missingAnchor(err) {
+		reader, err = array.NewRecordReader(arrow.NewSchema([]arrow.Field{}, nil), nil)
+	}
 	if err != nil {
 		// Read the cause before releasing the context: cancel() below turns
 		// ctx.Err() into Canceled for every failure, which would misfile a
@@ -639,9 +649,10 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			})
 		}
 		if ctxErr == context.Canceled {
-			// Cancelled through the registry (DELETE /api/v1/queries/:id), which
-			// already recorded the disposition. go-duckdb materializes the Arrow
-			// result inside QueryContext, so an operator cancel that lands during
+			// Cancelled through the registry (DELETE /api/v1/queries/:id or a
+			// client disconnect), which already recorded the disposition.
+			// go-duckdb materializes the Arrow result inside QueryContext, so an
+			// operator cancel that lands during
 			// execution — the common case for a long query — surfaces here as an
 			// error return, not as a mid-stream break with a truncation trailer.
 			m.IncQueryErrors()
@@ -766,7 +777,14 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	}, func(w *bufio.Writer) {
 		// Registered before anything that can panic, so it runs exactly once
 		// whether the writer returns normally or unwinds (#733).
-		defer releaseArrowStreamResourcesFunc(reader, conn, cancel, h.logger)
+		// A no-files fallback has a synthetic reader and a nil *sql.Conn.
+		// Do not box that typed nil: cleanup would call Close on it and
+		// recover a panic before reaching cancel, leaving the timer alive.
+		var streamConn interface{ Close() error }
+		if conn != nil {
+			streamConn = conn
+		}
+		defer releaseArrowStreamResourcesFunc(reader, streamConn, cancel, h.logger)
 		streamW = w
 		totalRows, streamErr := streamArrowIPCFunc(
 			streamCtx, w, reader, schema, castInfo, dictEnabled, ipcCompression, governanceMaxRows, h.logger,
@@ -814,12 +832,10 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			} else if h.queryRegistry != nil && queryID != "" {
 				h.queryRegistry.Fail(queryID, sqlutil.SanitizeErrText(streamErr.Error()))
 			}
-			// Per-handler client-disconnect counter (#426). Lets operators
-			// dashboard the rate without log-scraping. Only fires on
-			// client-side events (disconnect / deadline / context-cancel)
-			// — server-side stream failures stay in IncQueryErrors only.
+			// Per-handler client-disconnect counter (#426). The watcher and this
+			// streaming-error path share a once-only recorder.
 			if isClientError(streamErr) {
-				m.IncQueryClientDisconnect(metrics.DisconnectPathArrowIPC)
+				recordDisconnect()
 			}
 			// Tell the client its Arrow stream is short (#721). Skipped only
 			// when the socket is already gone: a server-side timeout is a

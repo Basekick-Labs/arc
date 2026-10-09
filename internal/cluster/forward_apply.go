@@ -404,7 +404,7 @@ func (c *Coordinator) getOrDialLeader(ctx context.Context, leaderID, leaderAddr 
 
 	// Dial outside the lock.
 	dialTimeout := manifestApplyTimeout(ctx)
-	conn, err := security.Dial("tcp", leaderAddr, dialTimeout, c.tlsConfig)
+	conn, err := security.DialContext(ctx, "tcp", leaderAddr, dialTimeout, c.tlsConfig)
 	if err != nil {
 		return nil, false, fmt.Errorf("dial leader %s (%s): %w", leaderID, leaderAddr, err)
 	}
@@ -611,7 +611,16 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	// one; the reader role, which the capability gate below would refuse for
 	// manifest writes, is exactly the node that needs it (#799).
 	isBarrier := cmd.Type == clusterraft.CommandBarrier
-	if !isManifest && !isAuth && !isRBAC && !isBarrier {
+	// The cluster-wide compaction pause (#1087). Setting it (pause, refresh,
+	// resume) is proposed by the restoring primary writer, so it follows the
+	// manifest role rule; the ack is proposed by every node, readers
+	// included, like the barrier. Both must speak only for the peer that
+	// signed the request: a Set whose requested_by, or an Ack whose node_id,
+	// is another node would let one authenticated peer ack on behalf of the
+	// compactor, which is exactly the guarantee the restore waits for.
+	isPauseSet := cmd.Type == clusterraft.CommandSetCompactionPause
+	isPauseAck := cmd.Type == clusterraft.CommandAckCompactionPause
+	if !isManifest && !isAuth && !isRBAC && !isBarrier && !isPauseSet && !isPauseAck {
 		c.logger.Warn().
 			Str("requesting_node", req.NodeID).
 			Int("cmd_type", int(cmd.Type)).
@@ -619,7 +628,7 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeInvalidCommand, "command type not allowed via forwarding")
 		return
 	}
-	if isManifest && !caps.CanIngest && !caps.CanCompact {
+	if (isManifest || isPauseSet) && !caps.CanIngest && !caps.CanCompact {
 		c.logger.Warn().
 			Str("peer", remoteAddr).
 			Str("requesting_node", req.NodeID).
@@ -627,6 +636,18 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 			Msg("ForwardApply rejected: node role not authorized for manifest mutations")
 		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, "unauthorized role")
 		return
+	}
+	if isPauseSet || isPauseAck {
+		if err := compactionPauseCommandSpeaksFor(&cmd, req.NodeID); err != nil {
+			c.logger.Warn().
+				Err(err).
+				Str("peer", remoteAddr).
+				Str("requesting_node", req.NodeID).
+				Int("cmd_type", int(cmd.Type)).
+				Msg("ForwardApply rejected: compaction pause command names another node")
+			c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, "compaction pause command must name the requesting node")
+			return
+		}
 	}
 
 	// Apply via Node.Apply — this is the same code path local applies

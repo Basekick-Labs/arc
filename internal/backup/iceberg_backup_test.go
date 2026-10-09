@@ -262,7 +262,7 @@ func TestRestore_MissingIcebergCatalogIsSkipped(t *testing.T) {
 		t.Fatalf("NewManager: %v", err)
 	}
 
-	if err := reader.restoreSQLite(ctx, res.Manifest.BackupID); err != nil {
+	if err := reader.restoreSQLite(ctx, reader.defaultDestination(), res.Manifest.BackupID); err != nil {
 		t.Fatalf("restoring a backup without a catalog must not fail: %v", err)
 	}
 	if _, err := os.Stat(catalogDB); err == nil {
@@ -314,7 +314,7 @@ func TestRestore_SeparateIcebergCatalogIsRestored(t *testing.T) {
 	if err := os.Remove(catalogDB); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.restoreSQLite(ctx, res.Manifest.BackupID); err != nil {
+	if err := m.restoreSQLite(ctx, m.defaultDestination(), res.Manifest.BackupID); err != nil {
 		t.Fatalf("restoreSQLite: %v", err)
 	}
 	// Restores are STAGED (#635); the boot apply performs the swap.
@@ -378,7 +378,7 @@ func TestRestoreSQLiteFile_StagesWithoutTouchingLive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := m.restoreSQLiteFile(ctx, "backup-1", "arc.db", dbPath); err != nil {
+	if err := m.restoreSQLiteFile(ctx, m.defaultDestination(), "backup-1", "arc.db", dbPath); err != nil {
 		t.Fatalf("restoreSQLiteFile: %v", err)
 	}
 

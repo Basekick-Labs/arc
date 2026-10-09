@@ -34,6 +34,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/rs/zerolog"
 )
 
@@ -90,6 +92,48 @@ func minioBackend(t *testing.T) *S3Backend {
 		t.Fatalf("S3 backend: %v", err)
 	}
 	return b
+}
+
+// The #945 round trip against a real store: a bucket that does not exist is
+// reported as ErrStoreNotFound (never as an empty success), the first
+// authenticated write creates it, and the listing then shows the object.
+func TestS3MissingBucketReportsStoreNotFoundThenListsFirstWrite(t *testing.T) {
+	base := minioBackend(t)
+	b := &S3Backend{
+		client: base.client,
+		bucket: fmt.Sprintf("arc-missing-%d", time.Now().UnixNano()),
+		logger: zerolog.Nop(),
+	}
+	ctx := context.Background()
+
+	objects, err := b.List(ctx, "")
+	if !IsStoreNotFound(err) {
+		t.Fatalf("List on a bucket that does not exist: err = %v, want ErrStoreNotFound", err)
+	}
+	if len(objects) != 0 {
+		t.Fatalf("List on a missing bucket returned %v alongside its error", objects)
+	}
+
+	const key = "contract/first-write.parquet"
+	if err := b.Write(ctx, key, []byte("PAR1")); err != nil {
+		t.Fatalf("first write to fresh bucket: %v", err)
+	}
+	// Drop the bucket, not just the object. The whole point of this test is
+	// that the write creates a bucket that did not exist, and on SeaweedFS a
+	// bucket is a collection backed by volumes: leaking one per run exhausts
+	// the store's volume budget, and the next run fails on PutObject with an
+	// opaque 500 InternalError that looks nothing like the real cause.
+	t.Cleanup(func() {
+		_ = b.Delete(ctx, key)
+		_, _ = b.client.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(b.bucket)})
+	})
+	objects, err = b.List(ctx, "")
+	if err != nil {
+		t.Fatalf("List after first write: %v", err)
+	}
+	if len(objects) != 1 || objects[0] != key {
+		t.Fatalf("List after first write = %v, want [%s]", objects, key)
+	}
 }
 
 // TestS3RejectsNonInjectiveKeys pins the contract at the backend that has the
@@ -258,6 +302,51 @@ func TestS3ListNeverReturnsUnusableKeys(t *testing.T) {
 		if err := ValidateKey(o.Path); err != nil {
 			t.Errorf("ListObjects returned %q, which this backend refuses: %v", o.Path, err)
 		}
+	}
+}
+
+// TestS3HasObjectsUnderPrefix pins the PrefixProber contract (#1084) against a
+// real store: a prefix with an object is true, an empty one is false, and a
+// prefix whose only key is one ListObjects hides (a directory marker) is
+// false, because the probe applies the listing's visibility rule rather than
+// answering from the raw key count.
+func TestS3HasObjectsUnderPrefix(t *testing.T) {
+	b := minioBackend(t)
+	ctx := context.Background()
+
+	if err := b.Write(ctx, "probe/real/2026/01/01/00/x.parquet", []byte("data")); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+	t.Cleanup(func() { _ = b.Delete(ctx, "probe/real/2026/01/01/00/x.parquet") })
+
+	for prefix, want := range map[string]bool{
+		"probe/real/": true,
+		"probe/rea":   true, // a key prefix on S3, as ListObjects treats it
+		"probe/none/": false,
+		"probe/":      true,
+	} {
+		got, err := b.HasObjectsUnderPrefix(ctx, prefix)
+		if err != nil {
+			t.Errorf("HasObjectsUnderPrefix(%q): %v", prefix, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("HasObjectsUnderPrefix(%q) = %v, want %v", prefix, got, want)
+		}
+	}
+	if _, err := b.HasObjectsUnderPrefix(ctx, "/"); err == nil {
+		t.Error(`HasObjectsUnderPrefix("/") accepted an invalid prefix`)
+	}
+
+	if err := putRawKey(t, b, "probe/marker/dir/"); err != nil {
+		t.Skipf("could not create a directory marker: %v", err)
+	}
+	got, err := b.HasObjectsUnderPrefix(ctx, "probe/marker/")
+	if err != nil {
+		t.Fatalf("HasObjectsUnderPrefix(probe/marker/): %v", err)
+	}
+	if got {
+		t.Error("a prefix holding only a directory marker answered true; ListObjects hides that key, so the probe must too")
 	}
 }
 

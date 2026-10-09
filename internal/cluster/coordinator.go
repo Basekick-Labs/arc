@@ -116,6 +116,19 @@ type Coordinator struct {
 	onBecomeCompactor func()
 	onLoseCompactor   func()
 
+	// compactionQuiescer is main.go's hook for the cluster-wide compaction
+	// pause (#1087): it returns once this node has no compaction batch in
+	// flight and no phase-2 commit pending, or an error when the pause ended
+	// first. nil means this node has nothing to quiesce (no compaction) and
+	// acks at once. Set before Start; read by quiesceAndAck under mu.
+	compactionQuiescer func(ctx context.Context) error
+	// compactionPauseAckInFlight holds the pause generations a quiesceAndAck
+	// is currently running for, under mu, so the two paths that can start
+	// one for the same generation (the FSM callback during log replay in
+	// Start, and ackCompactionPauseIfActive right after it) run the quiescer
+	// and propose the ack once. Lazily allocated; nil until the first pause.
+	compactionPauseAckInFlight map[uint64]struct{}
+
 	// WAL Replication (Phase 3.3)
 	replicationSender   *replication.Sender   // Writer only: sends entries to readers
 	replicationReceiver *replication.Receiver // Reader only: receives entries from writer
@@ -427,6 +440,11 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 			func(id string) { c.onRaftNodeRemoved(id) },
 			func(n *raft.NodeInfo) { c.onRaftNodeUpdated(n) },
 		)
+		// The cluster-wide compaction pause (#1087). Same lock rule as the
+		// callbacks above: this only spawns a goroutine.
+		c.raftFSM.SetCompactionPauseCallback(func(paused bool, generation uint64) {
+			c.onCompactionPauseChanged(paused, generation)
+		})
 
 		raftCfg := &raft.NodeConfig{
 			NodeID:            nodeID,
@@ -662,6 +680,11 @@ func (c *Coordinator) Start() error {
 		// registry. That is #858's worst case, and it is deterministic in a
 		// cluster whose only voter is the node being restarted.
 		go c.registerSelfInFSMWhenLeader()
+
+		// A compaction pause restored from the local snapshot at startup
+		// fires no callback (#1087); quiesce and ack it once a leader is
+		// known. Idempotent with the callback path.
+		go c.ackCompactionPauseIfActive()
 	}
 
 	// Wire the peer file replication puller (Enterprise Phase 2). This runs
@@ -2850,6 +2873,12 @@ func (c *Coordinator) Status() map[string]interface{} {
 	}
 	status["active_compactor"] = leaseStatus
 
+	// The cluster-wide compaction pause a restore takes (#1087): who holds
+	// it, until when, and which nodes have acknowledged it.
+	if c.raftFSM != nil {
+		status["compaction_pause"] = c.CompactionPauseStatus()
+	}
+
 	// Add Raft status if configured (Phase 3)
 	if c.raftNode != nil {
 		raftStats := c.raftNode.Stats()
@@ -4858,21 +4887,27 @@ func (c *Coordinator) startReceiverWithAddr(writerAddr string) error {
 	return nil
 }
 
-// buildReplicationIngestHandler creates an IngestHandler that parses WAL envelope
-// payloads and writes them to the local ArrowBuffer (NoWAL variant — the receiver's
-// LocalWAL path already handles WAL persistence).
+// buildReplicationIngestHandler prepares independently flushable writes before
+// the receiver appends local WAL. Each local identity then belongs to one buffer;
+// ignored payloads mint no identity and multi-measurement rows are split first.
 func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler {
-	return replication.IngestHandlerFunc(func(ctx context.Context, payload []byte) error {
+	return replication.PreparingIngestHandlerFunc(func(_ context.Context, payload []byte) ([]replication.PreparedWALIngest, error) {
 		// Safety: read-lock to avoid data race with SetIngestBuffer
 		c.mu.RLock()
 		buf := c.ingestBuffer
 		c.mu.RUnlock()
 		if buf == nil {
-			return nil
+			return nil, nil
 		}
 
 		// Parse WAL envelope to extract database name and msgpack payload
 		database, msgpackData := wal.ParseEnvelope(payload, "default")
+		part := func(localPayload []byte, measurement string, columns map[string][]interface{}) replication.PreparedWALIngest {
+			return replication.PreparedWALIngest{Payload: localPayload,
+				Apply: func(ctx context.Context, hashes []string) error {
+					return buf.WriteColumnarDirectNoWALWithHashes(ctx, database, measurement, columns, hashes)
+				}}
+		}
 
 		// Try columnar format first (map with "m" + "columns" keys)
 		var rawMap map[string]interface{}
@@ -4886,7 +4921,7 @@ func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler 
 						}
 					}
 					if len(typedColumns) > 0 {
-						return buf.WriteColumnarDirectNoWAL(ctx, database, measurement, typedColumns)
+						return []replication.PreparedWALIngest{part(payload, measurement, typedColumns)}, nil
 					}
 				}
 			}
@@ -4908,19 +4943,36 @@ func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler 
 					byMeasurement[m] = append(byMeasurement[m], r)
 				}
 			}
-			for measurement, rows := range byMeasurement {
+			measurements := make([]string, 0, len(byMeasurement))
+			for measurement := range byMeasurement {
+				measurements = append(measurements, measurement)
+			}
+			sort.Strings(measurements)
+			parts := make([]replication.PreparedWALIngest, 0, len(measurements))
+			for _, measurement := range measurements {
+				rows := byMeasurement[measurement]
 				columns := rowsToColumns(rows)
 				if len(columns) > 0 {
-					if err := buf.WriteColumnarDirectNoWAL(ctx, database, measurement, columns); err != nil {
-						return fmt.Errorf("write replicated rows for %s: %w", measurement, err)
+					localPayload := payload
+					if len(rows) != len(records) {
+						encoded, err := msgpack.Marshal(map[string]interface{}{"m": measurement, "columns": columns})
+						if err != nil {
+							return nil, fmt.Errorf("prepare replicated rows for %s: %w", measurement, err)
+						}
+						// Preserve the database envelope. Columnar recovery carries
+						// that database explicitly, without relying on row metadata.
+						// The normal single-measurement path reuses its bytes.
+						prefix := payload[:len(payload)-len(msgpackData)]
+						localPayload = append(append(make([]byte, 0, len(prefix)+len(encoded)), prefix...), encoded...)
 					}
+					parts = append(parts, part(localPayload, measurement, columns))
 				}
 			}
-			return nil
+			return parts, nil
 		}
 
 		c.logger.Debug().Int("payload_size", len(payload)).Msg("Skipped unrecognized replicated entry format")
-		return nil
+		return nil, nil
 	})
 }
 
@@ -5706,6 +5758,44 @@ func (c *Coordinator) GetFileEntry(path string) (*raft.FileEntry, bool) {
 		return nil, false
 	}
 	return c.raftFSM.GetFile(path)
+}
+
+// HasRaft reports whether this coordinator drives a Raft file manifest, which
+// is so only when cluster.raft_data_dir is set. Without one every manifest
+// write here is a successful no-op and GetFileManifest is nil, so a caller
+// that must tell "no manifest" from "an empty manifest" (the backup manager,
+// #1083) asks this first.
+func (c *Coordinator) HasRaft() bool {
+	return c.raftNode != nil
+}
+
+// SyncManifest blocks until this node's FSM has applied every log entry the
+// leader had committed when the call was made (#1083). It is the barrier the
+// catch-up path takes (waitForManifestSync, #799) with the same budget
+// (replication.catch_up_barrier_timeout_ms, default 30 s). A backup or a
+// restore snapshots the manifest only after it, because the primary writer is
+// routinely a Raft follower and can trail the leader for seconds after a
+// restart; a stale view would call registered files unregistered.
+func (c *Coordinator) SyncManifest(ctx context.Context) error {
+	if c.raftNode == nil {
+		return errors.New("raft not available")
+	}
+	timeout := time.Duration(c.cfg.ReplicationCatchUpBarrierTimeoutMs) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return c.waitForManifestSync(ctx, c.raftNode, timeout)
+}
+
+// IsTransientLeaderError reports whether a manifest apply failed only because
+// no leader is known yet or its address is not in the registry, an election
+// in progress, which a caller may retry for a bounded time the way the file
+// registrar's drain does.
+func IsTransientLeaderError(err error) bool {
+	return isTransientLeaderError(err)
 }
 
 // GetFileManifest returns the current file manifest from the Raft FSM.

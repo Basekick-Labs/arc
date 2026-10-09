@@ -232,6 +232,124 @@ func (b *LocalBackend) WriteReader(ctx context.Context, path string, reader io.R
 	return nil
 }
 
+// renameFile is the rename AdoptFile promotes with. It is a variable so a test
+// can force EXDEV without needing two real filesystems. Deliberately scoped to
+// AdoptFile: WriteReader keeps calling os.Rename directly, so a test that
+// disables the adopt path still exercises a real promotion in the copy
+// fallback it is checking.
+var renameFile = os.Rename
+
+// chmodFile is the mode normalization AdoptFile applies, a variable for the
+// same reason: a filesystem that refuses chmod is hard to arrange in a test.
+var chmodFile = os.Chmod
+
+// AdoptFile implements FileAdopter: it moves an already-written local file into
+// the backend instead of copying it, which is what makes compaction output cost
+// one pass over the bytes instead of two.
+//
+// The source file is CONSUMED on success. On ErrAdoptUnsupported it is still
+// there with its contents intact -- though possibly with its mode set to 0600,
+// see below -- and the caller must copy it through WriteReader instead. That is
+// the normal outcome when compaction.temp_directory sits on a different
+// filesystem from storage.local_path, which operators configure deliberately.
+//
+// Unlike WriteReader this does not stage through a ".part" name. The staging
+// name exists so an interrupted copy leaves resumable bytes on disk; a rename
+// has no partial state, so renaming straight to the final path is strictly
+// stronger -- there is no window in which a reader can observe a short object.
+//
+// ctx is accepted for symmetry with the rest of the interface and is ignored:
+// as with every other LocalBackend write, the operation is not cancellable.
+func (b *LocalBackend) AdoptFile(ctx context.Context, path, localPath string) error {
+	fullPath, err := b.validatePath(path)
+	if err != nil {
+		return fmt.Errorf("invalid path: %w", err)
+	}
+
+	// Only a regular file can become an object. The interface is exported, so
+	// this belongs here rather than in one caller: a directory or a device node
+	// renamed into the storage root would be listed as data.
+	info, err := os.Lstat(localPath)
+	if err != nil {
+		return fmt.Errorf("failed to stat local file: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("refusing to adopt %s: not a regular file", localPath)
+	}
+
+	dir := filepath.Dir(fullPath)
+	if err := b.ensureDir(dir); err != nil {
+		return err
+	}
+
+	// Mode parity with WriteReader, which stages at 0600 (and Write, which uses
+	// os.CreateTemp). A rename preserves the SOURCE mode, and the compaction
+	// output carries whatever umask DuckDB wrote it under, so without this the
+	// adopted object would be more permissive than every object beside it.
+	//
+	// A chmod failure is ErrAdoptUnsupported rather than a hard error, for the
+	// same reason the rename refusals below are: a filesystem that cannot give
+	// Arc 0600 is one to copy out of, and failing the job instead would break a
+	// configuration where WriteReader succeeds today. Note this runs BEFORE the
+	// rename, so a refused adopt can leave the source at 0600; the contract on
+	// ErrAdoptUnsupported says so.
+	if err := chmodFile(localPath, 0600); err != nil {
+		return fmt.Errorf("%w: cannot set mode 0600 on %s: %w", ErrAdoptUnsupported, localPath, err)
+	}
+
+	if err := renameFile(localPath, fullPath); err != nil {
+		// ENOENT first, and it is the only errno worth retrying: it is also the
+		// only one WriteReader retries, for the same cause -- a cached
+		// directory an operator removed under us. Note ENOENT from rename is
+		// ambiguous in a way it is not from OpenFile, because the SOURCE may be
+		// the missing path, so the message below asserts only what is known.
+		if os.IsNotExist(err) {
+			b.dirMu.Lock()
+			delete(b.dirCache, dir)
+			b.dirMu.Unlock()
+			if mkErr := b.ensureDir(dir); mkErr != nil {
+				metrics.Get().IncStorageErrors()
+				return mkErr
+			}
+			if retryErr := renameFile(localPath, fullPath); retryErr != nil {
+				metrics.Get().IncStorageErrors()
+				return fmt.Errorf("failed to adopt local file into %s after re-creating its parent directory: %w",
+					fullPath, retryErr)
+			}
+			// fall through to the success accounting below
+		} else {
+			// Every other refusal means "copy instead", not "fail". EXDEV is
+			// the common one -- Linux rename returns it for any cross-MOUNT
+			// rename even on a single superblock (bind mounts, Docker volumes,
+			// overlay-upper to tmpfs) and macOS returns it across APFS volumes
+			// -- but a filesystem that refuses a cross-directory rename for
+			// some other reason would otherwise go from "compacts, slowly" to
+			// "compaction fails every cycle", which is strictly worse than what
+			// Arc did before this fast path existed. Falling back is safe for
+			// any rename error because rename is atomic: a failed one moved
+			// nothing, and WriteReader reads the source that is still there.
+			return fmt.Errorf("%w: cannot rename %s to %s: %w",
+				ErrAdoptUnsupported, localPath, fullPath, err)
+		}
+	}
+
+	// Accounting parity with WriteReader. These bytes were committed to the
+	// backend even though no copy happened, so the counters must advance or
+	// arc_storage_write_bytes_total would stop reporting compaction output on
+	// local backends. The size comes from the Lstat above rather than from the
+	// caller, so the counter cannot disagree with the file.
+	metrics.Get().IncStorageWrites()
+	metrics.Get().IncStorageWriteBytes(info.Size())
+
+	b.logger.Debug().
+		Str("path", path).
+		Str("local_path", localPath).
+		Int64("size", info.Size()).
+		Msg("Adopted local file in place")
+
+	return nil
+}
+
 // Read reads data from the specified path
 func (b *LocalBackend) Read(ctx context.Context, path string) ([]byte, error) {
 	// Reject the key unless it names something inside the root
@@ -250,7 +368,10 @@ func (b *LocalBackend) Read(ctx context.Context, path string) ([]byte, error) {
 	if err != nil {
 		if os.IsNotExist(err) {
 			metrics.Get().IncStorageErrors()
-			return nil, fmt.Errorf("file not found: %s", path)
+			// Wraps ErrObjectNotFound so a caller can classify with
+			// errors.Is instead of a second round trip. The message is
+			// byte-for-byte what it was.
+			return nil, fmt.Errorf("%w: %s", ErrObjectNotFound, path)
 		}
 		metrics.Get().IncStorageErrors()
 		return nil, fmt.Errorf("failed to read file: %w", err)
@@ -404,19 +525,21 @@ func (b *LocalBackend) AppendReader(ctx context.Context, path string, reader io.
 		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to open staging file for append: %w", err)
 	}
-	defer file.Close()
-
-	written, err := io.Copy(file, reader)
-	if err != nil {
+	// Close exactly once on every path, including a failed copy. Closing
+	// before promotion also makes close errors visible to the caller.
+	written, copyErr := io.Copy(file, reader)
+	closeErr := file.Close()
+	if copyErr != nil {
 		metrics.Get().IncStorageErrors()
-		return fmt.Errorf("failed to append file data: %w", err)
+		return fmt.Errorf("failed to append file data: %w", copyErr)
+	}
+	if closeErr != nil {
+		metrics.Get().IncStorageErrors()
+		return fmt.Errorf("failed to close staging file: %w", closeErr)
 	}
 
-	// After appending, promote staging → final if we've received all expected bytes.
+	// Promote only after a successful copy and close.
 	if written == appendSize {
-		if err := file.Close(); err != nil {
-			return fmt.Errorf("failed to close staging file: %w", err)
-		}
 		if err := os.Rename(stagingPath, fullPath); err != nil {
 			metrics.Get().IncStorageErrors()
 			return fmt.Errorf("failed to promote staging file after append: %w", err)
@@ -712,6 +835,56 @@ func (b *LocalBackend) ListObjects(ctx context.Context, prefix string) ([]Object
 	return results, nil
 }
 
+// errPrefixProbeHit is the sentinel HasObjectsUnderPrefix returns from its walk
+// callback to stop filepath.WalkDir at the first listable file. Never returned
+// to callers.
+var errPrefixProbeHit = errors.New("storage: prefix probe found a listable object")
+
+// HasObjectsUnderPrefix implements PrefixProber: it walks the directory the
+// prefix names and stops at the first file ListObjects would return. A prefix
+// whose directory does not exist is false with a nil error; a directory
+// holding only entries a listing hides (dot-prefixed names, keys the contract
+// refuses, staging partials) is false too, because omittedFromListing is the
+// one rule both share.
+func (b *LocalBackend) HasObjectsUnderPrefix(ctx context.Context, prefix string) (bool, error) {
+	searchPath, err := b.validateListPath(prefix)
+	if err != nil {
+		return false, fmt.Errorf("invalid prefix: %w", err)
+	}
+	err = filepath.WalkDir(searchPath, func(path string, d os.DirEntry, err error) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		relPath, err := filepath.Rel(b.basePath, path)
+		if err != nil {
+			return err
+		}
+		if omittedFromListing(d.Name(), filepath.ToSlash(relPath)) != nil {
+			return nil
+		}
+		return errPrefixProbeHit
+	})
+	if errors.Is(err, errPrefixProbeHit) {
+		return true, nil
+	}
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to probe prefix: %w", err)
+	}
+	return false, nil
+}
+
 // errHiddenName marks an entry a listing skips because its name is
 // dot-prefixed. Not an ErrInvalidPath: the key contract accepts leading dots
 // (ValidateKeySegment does so deliberately), so this is a listing convention
@@ -783,6 +956,42 @@ const (
 	MaxUsableKeyLen        = MaxKeyLen - len(PartSuffix)
 	MaxUsableKeySegmentLen = MaxKeySegmentLen - len(PartSuffix)
 )
+
+// LongestBackupKeySuffix is the longest key a backup appends under a
+// destination's own object-key prefix: a generated backup ID plus the longest
+// FIXED file name a backup writes, "manifest-files.json" — the file sidecar.
+//
+// It lives here, beside the limit it is subtracted from, for the reason
+// MaxUsableKeyLen is exported at all: a caller that BUILDS keys under a
+// configured prefix has to bound the prefix by the same arithmetic, and
+// computing it independently is how a five-byte window opens. ValidateObjectPrefix
+// bounds a prefix at MaxUsableKeyLen on its OWN and the backends then build
+// prefix+key without re-checking the sum (prefixedKey validates the
+// UNPREFIXED key), so nothing else in this package bounds a prefix relative to
+// the keys that will follow it.
+const LongestBackupKeySuffix = len("backup-20060102-150405-12345678/manifest-files.json")
+
+// MaxBackupTargetPrefixLen is the longest object-key prefix a backup
+// destination may carry: past it, the backup's own manifest and file sidecar
+// cannot be stored at all, and the operator-facing "max_source_key_bytes"
+// figure goes negative.
+//
+// Derived, not chosen. At 1019 usable key bytes it is 968, which no real
+// prefix approaches; the value is in the failure being a refusal that names
+// the prefix rather than a feature that silently disappears.
+const MaxBackupTargetPrefixLen = MaxUsableKeyLen - LongestBackupKeySuffix
+
+// CheckBackupTargetPrefix reports whether a backup destination's object-key
+// prefix leaves room for the keys a backup writes under it. key is the
+// operator-facing configuration key, so the refusal names the line to edit.
+func CheckBackupTargetPrefix(key, prefix string) error {
+	if len(prefix) <= MaxBackupTargetPrefixLen {
+		return nil
+	}
+	return fmt.Errorf(
+		"%s is %d bytes, over the %d-byte maximum: a backup writes keys of up to %d bytes under the prefix, so the %d-byte object name limit would reject the backup own manifest and file sidecar",
+		key, len(prefix), MaxBackupTargetPrefixLen, LongestBackupKeySuffix, MaxUsableKeyLen)
+}
 
 // ValidateKey reports whether key names exactly one object.
 //
@@ -1125,9 +1334,10 @@ func (b *LocalBackend) ListUnusable(ctx context.Context, prefix string) ([]Unusa
 		// compaction output as data an operator lost, on every backup, forever,
 		// which is both a constant false alarm and dangerous advice. Such an
 		// object is the staging namespace collision #744 exists to prevent, and
-		// it is reachable through StagingInspector rather than through nothing
-		// (though see #762: no caller enumerates staged partials under the data
-		// root yet, and ListStaged reports them under the base key).
+		// it is reachable through StagingInspector. ListStaged reports staged
+		// partials only when DeleteStaged accepts their stripped key (#772);
+		// database-drop and edge-sync reclaim loops consume that list. Partials
+		// with rejected keys are reported here.
 		if committed, ok := strings.CutSuffix(relPath, PartSuffix); ok && ValidateKey(committed) == nil {
 			if fi, statErr := os.Stat(b.pathPrefix + committed); statErr != nil || !fi.IsDir() {
 				return nil

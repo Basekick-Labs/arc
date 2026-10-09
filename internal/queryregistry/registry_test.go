@@ -137,6 +137,27 @@ func TestRegistry_Cancel(t *testing.T) {
 	}
 }
 
+func TestRegistry_CancelWithReason(t *testing.T) {
+	r := newTestRegistry(10)
+	queryID, ctx := r.Register(context.Background(), "SELECT slow()", 1, "test-token", "127.0.0.1", false, 0)
+
+	if !r.CancelWithReason(queryID, "client disconnected") {
+		t.Fatal("expected CancelWithReason to return true")
+	}
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatal("expected query context to be cancelled")
+	}
+	history := r.GetHistory(0)
+	if len(history) != 1 || history[0].Status != StatusCancelled {
+		t.Fatalf("history = %#v, want one cancelled query", history)
+	}
+	if history[0].Error != "client disconnected" {
+		t.Fatalf("history error = %q, want client disconnect reason", history[0].Error)
+	}
+}
+
 func TestRegistry_Cancel_NotFound(t *testing.T) {
 	r := newTestRegistry(10)
 

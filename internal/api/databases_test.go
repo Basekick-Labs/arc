@@ -16,6 +16,7 @@ import (
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
@@ -25,6 +26,72 @@ type countingBackend struct {
 	storage.Backend
 	listCalls   atomic.Int64
 	existsCalls atomic.Int64
+}
+
+type waitingExistsBackend struct {
+	storage.Backend
+	started chan struct{}
+}
+
+type orderedDeleteBackend struct {
+	storage.Backend
+	events *[]string
+}
+
+func (b *orderedDeleteBackend) Delete(ctx context.Context, path string) error {
+	*b.events = append(*b.events, "hot-delete")
+	return b.Backend.Delete(ctx, path)
+}
+
+func (b *orderedDeleteBackend) DeleteBatch(ctx context.Context, paths []string) error {
+	*b.events = append(*b.events, "hot-delete")
+	return b.Backend.(storage.BatchDeleter).DeleteBatch(ctx, paths)
+}
+
+type fakeDatabaseTieringManager struct {
+	roleGated   bool
+	role        string
+	events      *[]string
+	beginErr    error
+	prepareErr  error
+	cleanupErrs []error
+	tierRows    bool
+	preparePath []string
+}
+
+func (m *fakeDatabaseTieringManager) GetMetadata() *tiering.MetadataStore { return nil }
+
+func (m *fakeDatabaseTieringManager) MigrationGate() (bool, string) {
+	return m.roleGated, m.role
+}
+
+func (m *fakeDatabaseTieringManager) DatabaseHasTierRows(context.Context, string) (bool, error) {
+	return m.tierRows, nil
+}
+
+func (m *fakeDatabaseTieringManager) BeginDatabaseDelete() (func(), error) {
+	*m.events = append(*m.events, "begin")
+	if m.beginErr != nil {
+		return nil, m.beginErr
+	}
+	return func() { *m.events = append(*m.events, "release") }, nil
+}
+
+func (m *fakeDatabaseTieringManager) PrepareDatabaseDelete(_ context.Context, _ string, paths []string) error {
+	*m.events = append(*m.events, "prepare")
+	m.preparePath = append([]string(nil), paths...)
+	return m.prepareErr
+}
+
+func (m *fakeDatabaseTieringManager) CleanupDatabaseDelete(_ context.Context, _ string, hotListed, hotFailed []string) (int, []error) {
+	*m.events = append(*m.events, "cleanup")
+	return 2, m.cleanupErrs
+}
+
+func (b *waitingExistsBackend) Exists(ctx context.Context, _ string) (bool, error) {
+	close(b.started)
+	<-ctx.Done()
+	return false, ctx.Err()
 }
 
 func (c *countingBackend) List(ctx context.Context, prefix string) ([]string, error) {
@@ -79,6 +146,41 @@ func setupTestDatabasesHandler(t *testing.T, deleteEnabled bool) (*DatabasesHand
 	handler.RegisterRoutes(app)
 
 	return handler, app, tmpDir
+}
+
+func TestDatabasesHandlerCreateStorageCallHonorsDeadline(t *testing.T) {
+	backend, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatalf("failed to create LocalBackend: %v", err)
+	}
+	defer backend.Close()
+
+	waitingBackend := &waitingExistsBackend{
+		Backend: backend,
+		started: make(chan struct{}),
+	}
+	handler := NewDatabasesHandler(waitingBackend, nil, nil, zerolog.Nop())
+	handler.requestTimeout = 10 * time.Millisecond
+	app := fiber.New()
+	handler.RegisterRoutes(app)
+
+	req := httptest.NewRequest("POST", "/api/v1/databases", bytes.NewBufferString(`{"name":"testdb"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req, testRequestTimeoutMS)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	select {
+	case <-waitingBackend.started:
+	default:
+		t.Fatal("storage existence check was not called")
+	}
+	if resp.StatusCode != fiber.StatusInternalServerError {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected status 500 after storage timeout, got %d: %s", resp.StatusCode, body)
+	}
 }
 
 // TestDatabasesHandler_List tests listing databases
@@ -438,6 +540,192 @@ func TestDatabasesHandler_Delete(t *testing.T) {
 			t.Error("Expected database files to be deleted")
 		}
 	})
+}
+
+func TestDatabasesHandler_DeleteCoordinatesTierCleanup(t *testing.T) {
+	handler, app, tmpDir := setupTestDatabasesHandler(t, true)
+	defer os.RemoveAll(tmpDir)
+
+	ctx := context.Background()
+	backend, err := storage.NewLocalBackend(tmpDir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	path := "deletedb/cpu/data.parquet"
+	if err := backend.Write(ctx, path, []byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	var events []string
+	handler.storage = &orderedDeleteBackend{Backend: backend, events: &events}
+	tieringManager := &fakeDatabaseTieringManager{events: &events}
+	handler.SetTieringManager(tieringManager)
+
+	req := httptest.NewRequest("DELETE", "/api/v1/databases/deletedb?confirm=true", nil)
+	resp, err := app.Test(req, testRequestTimeoutMS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != fiber.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	if want := []string{"begin", "prepare", "hot-delete", "cleanup", "hot-delete", "release"}; !equalStrings(events, want) {
+		t.Fatalf("operation order = %v, want %v", events, want)
+	}
+	if len(tieringManager.preparePath) != 1 || tieringManager.preparePath[0] != path {
+		t.Fatalf("prepare paths = %v, want [%s]", tieringManager.preparePath, path)
+	}
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if got := result["files_deleted"]; got != float64(4) {
+		t.Fatalf("files_deleted = %v, want 4 (hot file, cold objects, marker)", got)
+	}
+}
+
+func TestDatabasesHandler_DeleteStopsWhenTierPreparationFails(t *testing.T) {
+	handler, app, tmpDir := setupTestDatabasesHandler(t, true)
+	defer os.RemoveAll(tmpDir)
+
+	ctx := context.Background()
+	backend, err := storage.NewLocalBackend(tmpDir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	path := "deletedb/cpu/data.parquet"
+	if err := backend.Write(ctx, path, []byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	var events []string
+	handler.storage = &orderedDeleteBackend{Backend: backend, events: &events}
+	handler.SetTieringManager(&fakeDatabaseTieringManager{
+		events:     &events,
+		prepareErr: fmt.Errorf("manifest unavailable"),
+	})
+
+	req := httptest.NewRequest("DELETE", "/api/v1/databases/deletedb?confirm=true", nil)
+	resp, err := app.Test(req, testRequestTimeoutMS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != fiber.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", resp.StatusCode)
+	}
+	if want := []string{"begin", "prepare", "release"}; !equalStrings(events, want) {
+		t.Fatalf("operation order = %v, want %v", events, want)
+	}
+	if exists, err := backend.Exists(ctx, path); err != nil || !exists {
+		t.Fatalf("hot object after preparation failure: exists=%v err=%v, want present", exists, err)
+	}
+}
+
+func TestDatabasesHandler_DeleteRejectsConcurrentTierCycle(t *testing.T) {
+	handler, app, tmpDir := setupTestDatabasesHandler(t, true)
+	defer os.RemoveAll(tmpDir)
+
+	ctx := context.Background()
+	backend, err := storage.NewLocalBackend(tmpDir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	path := "deletedb/cpu/data.parquet"
+	if err := backend.Write(ctx, path, []byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	var events []string
+	handler.SetTieringManager(&fakeDatabaseTieringManager{
+		events:   &events,
+		beginErr: tiering.ErrMigrationCycleRunning,
+	})
+
+	req := httptest.NewRequest("DELETE", "/api/v1/databases/deletedb?confirm=true", nil)
+	resp, err := app.Test(req, testRequestTimeoutMS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != fiber.StatusConflict {
+		t.Fatalf("expected 409, got %d", resp.StatusCode)
+	}
+	if want := []string{"begin"}; !equalStrings(events, want) {
+		t.Fatalf("operation order = %v, want %v", events, want)
+	}
+	if exists, err := backend.Exists(ctx, path); err != nil || !exists {
+		t.Fatalf("hot object after conflict: exists=%v err=%v, want present", exists, err)
+	}
+}
+
+func TestDatabasesHandler_DeleteFindsColdOnlyDatabase(t *testing.T) {
+	handler, app, tmpDir := setupTestDatabasesHandler(t, true)
+	defer os.RemoveAll(tmpDir)
+
+	var events []string
+	handler.SetTieringManager(&fakeDatabaseTieringManager{events: &events, tierRows: true})
+	req := httptest.NewRequest("DELETE", "/api/v1/databases/coldonly?confirm=true", nil)
+	resp, err := app.Test(req, testRequestTimeoutMS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != fiber.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected cold-only database deletion to succeed, got %d: %s", resp.StatusCode, body)
+	}
+	if want := []string{"begin", "prepare", "cleanup", "release"}; !equalStrings(events, want) {
+		t.Fatalf("operation order = %v, want %v", events, want)
+	}
+}
+
+func TestDatabasesHandler_DeleteKeepsMarkerWhenTierCleanupFails(t *testing.T) {
+	handler, app, tmpDir := setupTestDatabasesHandler(t, true)
+	defer os.RemoveAll(tmpDir)
+
+	ctx := context.Background()
+	backend, err := storage.NewLocalBackend(tmpDir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	marker := "deletedb/.arc-database"
+	if err := backend.Write(ctx, marker, []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	var events []string
+	handler.SetTieringManager(&fakeDatabaseTieringManager{
+		events:      &events,
+		cleanupErrs: []error{fmt.Errorf("cold object could not be deleted")},
+	})
+
+	req := httptest.NewRequest("DELETE", "/api/v1/databases/deletedb?confirm=true", nil)
+	resp, err := app.Test(req, testRequestTimeoutMS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != fiber.StatusInternalServerError {
+		t.Fatalf("expected partial deletion status 500, got %d", resp.StatusCode)
+	}
+	if exists, err := backend.Exists(ctx, marker); err != nil || !exists {
+		t.Fatalf("marker after tier cleanup failure: exists=%v err=%v, want retained for retry", exists, err)
+	}
+}
+
+func equalStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // TestDatabasesHandler_DeleteDisabled tests deleting when delete is disabled

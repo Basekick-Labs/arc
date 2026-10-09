@@ -11,14 +11,29 @@ import (
 	"strings"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/basekick-labs/arc/internal/syscpu"
 	"github.com/basekick-labs/arc/internal/sysmem"
 	"github.com/spf13/viper"
 )
+
+// LoadWarning is a load-time advisory: a value Arc accepts and keeps, but
+// whose effect an operator is unlikely to have intended. Collected rather than
+// logged because config.Load has no logger and must stay testable without one;
+// cmd/arc/main.go emits them once, immediately after Load returns.
+type LoadWarning struct {
+	Key     string // the configuration key, as an operator spells it
+	Value   string // the configured value, verbatim
+	Message string // what the hazard is and what to do
+}
 
 var memoryLimitRe = regexp.MustCompile(`^\d+(\.\d+)?\s*(B|KB|MB|GB|TB|%)?$`)
 
 // Config holds all configuration for Arc
 type Config struct {
+	// Warnings are load-time advisories about accepted values (see
+	// LoadWarning). Emitted by cmd/arc/main.go right after Load; never fatal.
+	Warnings        []LoadWarning
 	Server          ServerConfig
 	Database        DatabaseConfig
 	Storage         StorageConfig
@@ -108,6 +123,7 @@ type StorageConfig struct {
 	AzureAccountKey         string // Storage account key
 	AzureSASToken           string // SAS token for scoped access
 	AzureContainer          string // Container name
+	AzurePrefix             string // Blob-name prefix within the container (e.g., "instances/abc123/")
 	AzureEndpoint           string // Custom endpoint (for Azurite testing)
 	AzureUseManagedIdentity bool   // Use managed identity (Azure-hosted deployments)
 }
@@ -185,13 +201,23 @@ type CompactionConfig struct {
 	MemoryLimit string
 
 	// Threads is the DuckDB thread count for EACH compaction subprocess.
-	// 0 (the default) means auto: half of EffectiveCores, minimum 1 — half the
-	// CPUs this process may use, which is the container's CPU quota where there
-	// is one and the machine's core count where there is not (#1030). Before
-	// this key existed, each subprocess used DuckDB's own default, which is the
-	// quota or, unlimited, all cores — so two concurrent jobs could saturate the
-	// machine and starve ingest. Sort and scan buffers scale with threads, so
-	// this also bounds memory.
+	// 0 (the default) means auto: EffectiveCores divided by max(2,
+	// max_concurrent), with a minimum of 1. EffectiveCores reflects the CPUs
+	// available to this process; it does not distinguish a quota, cpuset, or
+	// GOMAXPROCS setting. The default max_concurrent of 2 preserves the previous
+	// half-core value, while higher concurrency divides the thread cap across
+	// subprocesses (#1037).
+	//
+	// Whatever value this ends up with is then subject to the licence cap in
+	// cmd/arc/main.go#applyLicenseCoreLimits (#1036) — the AUTO value included,
+	// not only an explicit one, because Load resolves this sentinel to a
+	// positive number before that runs. The cap applies on a core-limited
+	// licence only; applyLicenseCoreLimits returns early when MaxCores <= 0.
+	//
+	// Before this key existed, each subprocess used DuckDB's own default,
+	// which could allow concurrent jobs to saturate the machine and starve
+	// ingest. Sort and scan buffers also scale with threads, so this bounds
+	// memory.
 	Threads int
 
 	// MaxFilesPerBatch bounds how many files a single compaction job feeds to
@@ -313,9 +339,18 @@ type EdgeSyncImportConfig struct {
 
 // EdgeSyncSpokeConfig configures the push side of edge sync (#569).
 type EdgeSyncSpokeConfig struct {
-	// Enabled mounts the manual sync controls. Off by default: pushing data
-	// off a box is a deliberate decision.
+	// Enabled opts this node into network sync. Off by default because pushing
+	// data off a box is a deliberate decision. Valid paid licenses also enable
+	// the automatic scheduler; other tiers retain manual triggering.
 	Enabled bool
+
+	// SyncInterval is the delay between scheduled network sync passes. The
+	// scheduler is only started for a valid paid license.
+	SyncInterval time.Duration
+
+	// SyncRetryInterval is the initial delay after a scheduled pass fails.
+	// Consecutive failures double it up to SyncInterval.
+	SyncRetryInterval time.Duration
 
 	// HubURL is the hub's root, e.g. https://ground-station.example.com.
 	HubURL string
@@ -452,6 +487,12 @@ type IcebergConfig struct {
 	ReconcileInterval int    // Seconds between reconcile passes (default 300)
 	CatalogDBPath     string // SQLite catalog path; defaults to the shared auth DB
 	RetainSnapshots   int    // Snapshots (and metadata versions) to keep per table; older are expired (default 10)
+	// OrphanSweepEnabled gates the metadata orphan sweep (#835): deleting the manifest
+	// lists and manifests under a table's metadata directory that no metadata.json still
+	// on disk can reach. Default true. It is the only deleter in the exporter whose work
+	// nothing regenerates, so it gets an off switch; turning it off restores the pre-#835
+	// behaviour, where that metadata grows without bound and is copied into every backup.
+	OrphanSweepEnabled bool
 }
 
 type ContinuousQueryConfig struct {
@@ -473,11 +514,12 @@ type MQTTConfig struct {
 
 // QueryConfig holds configuration for query execution optimizations
 type QueryConfig struct {
-	Timeout              int   // Query execution timeout in seconds (0 = no timeout, default: 300)
-	SlowQueryThresholdMs int   // Slow query WARN threshold in milliseconds (0 = disabled)
-	EnableS3Cache        bool  // Enable S3 file caching for faster repeated reads (useful for CTEs/subqueries)
-	S3CacheSize          int64 // Cache size in bytes (parsed from "128MB", "256MB", etc.)
-	S3CacheTTLSeconds    int   // Cache entry TTL in seconds (default: 3600 = 1 hour)
+	Timeout                  int   // Query execution timeout in seconds (0 = no timeout, default: 300)
+	CancelOnClientDisconnect bool  // Cancel query execution when a client disconnects (default: true)
+	SlowQueryThresholdMs     int   // Slow query WARN threshold in milliseconds (0 = disabled)
+	EnableS3Cache            bool  // Enable S3 file caching for faster repeated reads (useful for CTEs/subqueries)
+	S3CacheSize              int64 // Cache size in bytes (parsed from "128MB", "256MB", etc.)
+	S3CacheTTLSeconds        int   // Cache entry TTL in seconds (default: 3600 = 1 hour)
 	// FileTimePruning (EXPERIMENTAL, 26.09.2) expands the current-hour
 	// partition glob and drops files whose filename flush-timestamp proves
 	// they cannot contain rows in the query's time range. Big win for
@@ -567,6 +609,19 @@ type TieredStorageConfig struct {
 	// Migration history cleanup
 	MigrationHistoryRetentionDays int // How long to keep migration history (default: 90)
 
+	// ScanTimeout bounds ONE tier scan on every path that runs one: the
+	// startup scan, POST /api/v1/tiering/scan, and the pre-migration scan
+	// inside a migration cycle. Default 2h.
+	//
+	// It does NOT replace the migration cycle budget. Inside a cycle the scan
+	// runs on a context derived from the cycle's, so it gets whichever of the
+	// two is shorter and migration keeps the remainder (#1154).
+	//
+	// A value below the time a full scan takes is harmful, not conservative:
+	// hot-row retirement runs only after the whole walk, so a scan that always
+	// truncates never retires a stale row.
+	ScanTimeout time.Duration
+
 	// Cold tier configuration (remote S3/Azure storage)
 	Cold ColdTierConfig
 }
@@ -595,6 +650,7 @@ type ColdTierConfig struct {
 
 	// Azure settings
 	AzureContainer          string // Azure container for cold-tier data
+	AzurePrefix             string // Blob-name prefix within the cold-tier container
 	AzureConnectionString   string // Connection string (simplest auth method)
 	AzureAccountName        string // Storage account name
 	AzureAccountKey         string // Storage account key
@@ -630,8 +686,30 @@ type QueryManagementConfig struct {
 }
 
 type BackupConfig struct {
-	Enabled   bool   // Enable backup/restore API
+	Enabled bool // Enable backup/restore API
+	// LocalPath is the local directory a backup is written to when no target
+	// is configured. It is IGNORED, and the directory is never created, once
+	// DefaultTarget names a target (#1085 stage B2b-1): a deployment whose
+	// backups go to an object store has no reason to grow an empty
+	// ./data/backups, which LocalBackend's constructor would otherwise create
+	// at every boot.
 	LocalPath string // Local directory for backups (default: "./data/backups")
+	// OperationTimeout bounds one backup or one restore run. Both API routes
+	// detach from the request context (Fiber recycles it), so this is the only
+	// thing that stops a wedged run from holding the single-operation lock
+	// forever. Parsed from backup.operation_timeout; always positive.
+	OperationTimeout time.Duration
+	// DefaultTarget names the target in Targets that every backup is written
+	// to, or "" for the LocalPath destination that predates targets. A
+	// configured target with no DefaultTarget pointing at it is a load-time
+	// error, not a silent fall back to LocalPath — see validateBackupTargets.
+	DefaultTarget string
+	// Targets holds the configured backup destinations, keyed by name. Any
+	// number since #1085 stage B2b-2, each optionally naming the databases
+	// routed to it (BackupTargetConfig.Databases); everything unrouted goes to
+	// DefaultTarget. Nil when none is configured, which is the shape every
+	// deployment that has not adopted targets has.
+	Targets map[string]BackupTargetConfig
 }
 
 // ClusterConfig holds configuration for Arc clustering (Enterprise feature)
@@ -817,6 +895,34 @@ func Load() (*Config, error) {
 		)
 	}
 
+	// One backup or restore run gets this long. Go duration syntax, e.g. 30m,
+	// 2h or 90s, read the same way as compaction.cycle_timeout above because
+	// that is the only existing duration key and there is no GetDuration call
+	// in this repo.
+	scanTimeout, err := time.ParseDuration(v.GetString("tiered_storage.scan_timeout"))
+	if err != nil || scanTimeout <= 0 {
+		return nil, fmt.Errorf(
+			"invalid tiered_storage.scan_timeout %q: must be a positive Go duration",
+			v.GetString("tiered_storage.scan_timeout"),
+		)
+	}
+
+	backupOperationTimeout, err := time.ParseDuration(v.GetString("backup.operation_timeout"))
+	if err != nil || backupOperationTimeout <= 0 {
+		return nil, fmt.Errorf(
+			"invalid backup.operation_timeout %q: must be a positive Go duration",
+			v.GetString("backup.operation_timeout"),
+		)
+	}
+
+	// Backup targets (#1085 stage B2b-1). Discovered before the struct is
+	// built because discovery can fail on a target NAME, which is a load-time
+	// error like every other config shape error here.
+	backupTargets, err := loadBackupTargets(v)
+	if err != nil {
+		return nil, err
+	}
+
 	// Build config from Viper (which includes defaults + env vars)
 	cfg := &Config{
 		Server: ServerConfig{
@@ -862,6 +968,7 @@ func Load() (*Config, error) {
 			AzureAccountKey:         v.GetString("storage.azure_account_key"),
 			AzureSASToken:           v.GetString("storage.azure_sas_token"),
 			AzureContainer:          v.GetString("storage.azure_container"),
+			AzurePrefix:             v.GetString("storage.azure_prefix"),
 			AzureEndpoint:           v.GetString("storage.azure_endpoint"),
 			AzureUseManagedIdentity: v.GetBool("storage.azure_use_managed_identity"),
 		},
@@ -913,6 +1020,8 @@ func Load() (*Config, error) {
 			},
 			Spoke: EdgeSyncSpokeConfig{
 				Enabled:                    v.GetBool("edge_sync.spoke.enabled"),
+				SyncInterval:               v.GetDuration("edge_sync.spoke.sync_interval"),
+				SyncRetryInterval:          v.GetDuration("edge_sync.spoke.sync_retry_interval"),
 				HubURL:                     v.GetString("edge_sync.spoke.hub_url"),
 				SpokeID:                    v.GetString("edge_sync.spoke.spoke_id"),
 				HubID:                      v.GetString("edge_sync.spoke.hub_id"),
@@ -978,20 +1087,24 @@ func Load() (*Config, error) {
 			DBPath:  v.GetString("retention.db_path"),
 		},
 		Iceberg: IcebergConfig{
-			Enabled:           v.GetBool("iceberg.enabled"),
-			Warehouse:         v.GetString("iceberg.warehouse"),
-			NamespacePrefix:   v.GetString("iceberg.namespace_prefix"),
-			ReconcileInterval: v.GetInt("iceberg.reconcile_interval"),
-			CatalogDBPath:     v.GetString("iceberg.catalog_db_path"),
-			RetainSnapshots:   v.GetInt("iceberg.retain_snapshots"),
+			Enabled:            v.GetBool("iceberg.enabled"),
+			Warehouse:          v.GetString("iceberg.warehouse"),
+			NamespacePrefix:    v.GetString("iceberg.namespace_prefix"),
+			ReconcileInterval:  v.GetInt("iceberg.reconcile_interval"),
+			CatalogDBPath:      v.GetString("iceberg.catalog_db_path"),
+			RetainSnapshots:    v.GetInt("iceberg.retain_snapshots"),
+			OrphanSweepEnabled: v.GetBool("iceberg.orphan_sweep_enabled"),
 		},
 		ContinuousQuery: ContinuousQueryConfig{
 			Enabled: v.GetBool("continuous_query.enabled"),
 			DBPath:  v.GetString("continuous_query.db_path"),
 		},
 		Backup: BackupConfig{
-			Enabled:   v.GetBool("backup.enabled"),
-			LocalPath: v.GetString("backup.local_path"),
+			Enabled:          v.GetBool("backup.enabled"),
+			LocalPath:        strings.TrimSpace(v.GetString("backup.local_path")),
+			OperationTimeout: backupOperationTimeout,
+			DefaultTarget:    strings.ToLower(strings.TrimSpace(v.GetString("backup.default_target"))),
+			Targets:          backupTargets,
 		},
 		Metrics: MetricsConfig{
 			TimeseriesRetentionMinutes: v.GetInt("metrics.timeseries_retention_minutes"),
@@ -1002,6 +1115,7 @@ func Load() (*Config, error) {
 		},
 		Query: QueryConfig{
 			Timeout:                       v.GetInt("query.timeout"),
+			CancelOnClientDisconnect:      v.GetBool("query.cancel_on_client_disconnect"),
 			SlowQueryThresholdMs:          v.GetInt("query.slow_query_threshold_ms"),
 			FileTimePruning:               v.GetBool("query.file_time_pruning"),
 			FileTimePruningMarginSeconds:  v.GetInt("query.file_time_pruning_margin_seconds"),
@@ -1108,6 +1222,7 @@ func Load() (*Config, error) {
 			MigrationBatchSize:            v.GetInt("tiered_storage.migration_batch_size"),
 			DefaultHotMaxAgeDays:          v.GetInt("tiered_storage.default_hot_max_age_days"),
 			MigrationHistoryRetentionDays: v.GetInt("tiered_storage.migration_history_retention_days"),
+			ScanTimeout:                   scanTimeout,
 			Cold: ColdTierConfig{
 				Enabled: v.GetBool("tiered_storage.cold.enabled"),
 				// Normalized like storage.backend so cold.Backend == "s3"/"azure"
@@ -1122,6 +1237,7 @@ func Load() (*Config, error) {
 				S3PathStyle:             v.GetBool("tiered_storage.cold.s3_path_style"),
 				S3Prefix:                v.GetString("tiered_storage.cold.s3_prefix"),
 				AzureContainer:          v.GetString("tiered_storage.cold.azure_container"),
+				AzurePrefix:             v.GetString("tiered_storage.cold.azure_prefix"),
 				AzureConnectionString:   v.GetString("tiered_storage.cold.azure_connection_string"),
 				AzureAccountName:        v.GetString("tiered_storage.cold.azure_account_name"),
 				AzureAccountKey:         v.GetString("tiered_storage.cold.azure_account_key"),
@@ -1173,7 +1289,7 @@ func Load() (*Config, error) {
 		cfg.Compaction.MemoryLimit = deriveCompactionMemoryLimit(cfg.Database.MemoryLimit, cfg.Compaction.MaxConcurrent)
 	}
 	if cfg.Compaction.Threads == 0 {
-		cfg.Compaction.Threads = getDefaultCompactionThreads()
+		cfg.Compaction.Threads = getDefaultCompactionThreads(cfg.Compaction.MaxConcurrent)
 	}
 
 	// Trim storage identifiers in-place before validating. These build DuckDB
@@ -1190,6 +1306,7 @@ func Load() (*Config, error) {
 	cfg.Storage.AzureConnectionString = strings.TrimSpace(cfg.Storage.AzureConnectionString)
 	cfg.Storage.AzureAccountName = strings.TrimSpace(cfg.Storage.AzureAccountName)
 	cfg.Storage.AzureContainer = strings.TrimSpace(cfg.Storage.AzureContainer)
+	cfg.Storage.AzurePrefix = strings.TrimSpace(cfg.Storage.AzurePrefix)
 	cfg.Storage.AzureEndpoint = strings.TrimSpace(cfg.Storage.AzureEndpoint)
 
 	// Validate the primary storage backend against the supported set and check
@@ -1207,6 +1324,9 @@ func Load() (*Config, error) {
 		if cfg.Storage.S3Bucket == "" {
 			return nil, fmt.Errorf("storage.backend is %q but storage.s3_bucket is empty; set storage.s3_bucket", cfg.Storage.Backend)
 		}
+		if err := cfg.checkObjectPrefix("storage.s3_prefix", cfg.Storage.S3Prefix); err != nil {
+			return nil, err
+		}
 	case "azure", "azblob":
 		// An empty container yields an empty sandbox allowlist entry and opaque
 		// query-time errors. An empty account name is worse: configureAzureAccess
@@ -1222,6 +1342,9 @@ func Load() (*Config, error) {
 		}
 		if cfg.Storage.AzureContainer == "" {
 			return nil, fmt.Errorf("storage.backend is %q but storage.azure_container is empty; set storage.azure_container", cfg.Storage.Backend)
+		}
+		if err := cfg.checkObjectPrefix("storage.azure_prefix", cfg.Storage.AzurePrefix); err != nil {
+			return nil, err
 		}
 	default:
 		return nil, fmt.Errorf("storage.backend %q is invalid; must be \"local\", \"s3\", \"minio\", \"azure\", or \"azblob\"", cfg.Storage.Backend)
@@ -1250,11 +1373,20 @@ func Load() (*Config, error) {
 		cold.AzureConnectionString = strings.TrimSpace(cold.AzureConnectionString)
 		cold.AzureAccountName = strings.TrimSpace(cold.AzureAccountName)
 		cold.AzureContainer = strings.TrimSpace(cold.AzureContainer)
+		cold.AzurePrefix = strings.TrimSpace(cold.AzurePrefix)
 		cold.AzureEndpoint = strings.TrimSpace(cold.AzureEndpoint)
 		switch cold.Backend {
 		case "s3":
 			if cold.S3Bucket == "" {
 				return nil, fmt.Errorf("tiered_storage.cold.enabled is true and backend is \"s3\" but tiered_storage.cold.s3_bucket is empty; set tiered_storage.cold.s3_bucket")
+			}
+			// The cold keys are the asymmetric case and the reason this check
+			// exists at load: an unusable cold prefix fails backend
+			// construction at a call site that logs and CONTINUES with a nil
+			// cold backend, so the tier would be silently dead. See
+			// checkObjectPrefix.
+			if err := cfg.checkObjectPrefix("tiered_storage.cold.s3_prefix", cold.S3Prefix); err != nil {
+				return nil, err
 			}
 		case "azure":
 			if cold.AzureConnectionString == "" && cold.AzureAccountName == "" {
@@ -1263,9 +1395,40 @@ func Load() (*Config, error) {
 			if cold.AzureContainer == "" {
 				return nil, fmt.Errorf("tiered_storage.cold.enabled is true and backend is \"azure\" but tiered_storage.cold.azure_container is empty; set tiered_storage.cold.azure_container")
 			}
+			// Same reason as the cold S3 prefix above.
+			if err := cfg.checkObjectPrefix("tiered_storage.cold.azure_prefix", cold.AzurePrefix); err != nil {
+				return nil, err
+			}
 		default:
 			return nil, fmt.Errorf("tiered_storage.cold.enabled is true but tiered_storage.cold.backend %q is invalid; must be \"s3\" or \"azure\"", cold.Backend)
 		}
+	}
+
+	// Backup destinations (#1085 stage B2b-1), both gated on backup.enabled to
+	// match the runtime: cmd/arc/main.go builds no backup destination when the
+	// API is off, so refusing a configuration nothing would ever read is a
+	// false-positive boot failure of exactly the shape the cold-tier gate
+	// above avoids. A stray default_target left behind after disabling the
+	// interface must not stop a node from booting.
+	//
+	// Target validation first, so a malformed target is reported as itself
+	// rather than as whatever the overlap check made of it; the overlap
+	// refusal second, because it needs a resolved destination.
+	if cfg.Backup.Enabled {
+		if err := cfg.validateBackupTargets(); err != nil {
+			return nil, err
+		}
+		if err := cfg.checkBackupDestinationOverlap(); err != nil {
+			return nil, err
+		}
+	}
+
+	// Refuse a path that reaches read_parquet and could be read as a pattern.
+	// Placed after the backup checks so an overlapping destination is still
+	// reported as itself, and before the storage-identifier trims below, which
+	// do not touch these two keys.
+	if err := cfg.checkParquetReadRootsGlobSafe(); err != nil {
+		return nil, err
 	}
 
 	// Iceberg export is LOCAL-ONLY in v1. The reconciler walks the single configured storage
@@ -1296,6 +1459,20 @@ func Load() (*Config, error) {
 				"it is the number of snapshots kept per table, and values below 1 would leave "+
 				"snapshot and metadata growth unbounded", cfg.Iceberg.RetainSnapshots)
 		}
+		// A dot in the prefix puts a dot in every namespace component Arc builds
+		// (arc_<database>), and iceberg-go v0.7.0 keys such a namespace by a JSON
+		// encoding instead of the plain dotted string. Arc cannot serve that: the
+		// warehouse directory becomes __iceberg_namespace_v1__:[...].db, which its
+		// own warehouse-directory test does not recognise and would walk back in as
+		// a user database, and the percent-encoded metadata location means no
+		// version-hint.text is published for directory-based readers. Refuse at load
+		// rather than build broken tables for every measurement on the node.
+		if strings.Contains(cfg.Iceberg.NamespacePrefix, ".") {
+			return nil, fmt.Errorf("iceberg.namespace_prefix must not contain a dot (got %q): "+
+				"Arc builds one Iceberg namespace component per database as <prefix>_<database>, and a "+
+				"dotted component is addressed differently by the Iceberg catalog, which leaves the "+
+				"table without a readable warehouse directory", cfg.Iceberg.NamespacePrefix)
+		}
 	}
 
 	// The spoke secret must come from the environment. Refuse rather than
@@ -1319,6 +1496,12 @@ func Load() (*Config, error) {
 	}
 
 	if cfg.EdgeSync.Spoke.Enabled {
+		if cfg.EdgeSync.Spoke.SyncInterval < time.Second {
+			return nil, fmt.Errorf("edge_sync.spoke.sync_interval must be at least 1s (got %s)", cfg.EdgeSync.Spoke.SyncInterval)
+		}
+		if cfg.EdgeSync.Spoke.SyncRetryInterval < time.Second || cfg.EdgeSync.Spoke.SyncRetryInterval >= cfg.EdgeSync.Spoke.SyncInterval {
+			return nil, fmt.Errorf("edge_sync.spoke.sync_retry_interval must be at least 1s and shorter than sync_interval (got %s)", cfg.EdgeSync.Spoke.SyncRetryInterval)
+		}
 		if cfg.EdgeSync.Spoke.HubURL == "" {
 			return nil, fmt.Errorf("edge_sync.spoke.enabled=true requires edge_sync.spoke.hub_url")
 		}
@@ -1539,6 +1722,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("storage.s3_region", "us-east-1")
 	v.SetDefault("storage.s3_use_ssl", true)
 	v.SetDefault("storage.s3_path_style", false) // Use virtual-hosted style by default (set true for MinIO)
+	v.SetDefault("storage.azure_prefix", "")     // Container root by default (#1102)
 
 	// Cache defaults
 	v.SetDefault("cache.enabled", true)
@@ -1600,6 +1784,8 @@ func setDefaults(v *viper.Viper) {
 	// zero-value fallbacks so the defaults are visible to an operator reading
 	// the config, and so the documented value and the code cannot drift apart.
 	v.SetDefault("edge_sync.spoke.enabled", false)
+	v.SetDefault("edge_sync.spoke.sync_interval", "5m")
+	v.SetDefault("edge_sync.spoke.sync_retry_interval", "30s")
 	v.SetDefault("edge_sync.spoke.hub_url", "")
 	v.SetDefault("edge_sync.spoke.spoke_id", "")
 	v.SetDefault("edge_sync.spoke.hub_id", "")
@@ -1647,7 +1833,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.max_files_per_batch", 30)             // 30 files per DuckDB read_parquet() call; valid range [2, 500]
 	v.SetDefault("compaction.temp_directory", "./data/compaction") // Temp directory for compaction files
 	v.SetDefault("compaction.memory_limit", "")                    // "" = auto: database.memory_limit / max_concurrent (see CompactionConfig.MemoryLimit)
-	v.SetDefault("compaction.threads", 0)                          // 0 = auto: half of EffectiveCores, min 1 (see CompactionConfig.Threads)
+	v.SetDefault("compaction.threads", 0)                          // 0 = auto; see CompactionConfig.Threads
 	// Phase 4: completion-manifest watcher tunables
 	v.SetDefault("compaction.completion_watcher_interval_ms", 1000) // 1s poll rate
 	v.SetDefault("compaction.completion_dir", "")                   // "" = derive from temp_directory
@@ -1683,6 +1869,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("iceberg.reconcile_interval", 300)          // seconds
 	v.SetDefault("iceberg.catalog_db_path", "./data/arc.db") // shared SQLite DB with auth
 	v.SetDefault("iceberg.retain_snapshots", 10)
+	v.SetDefault("iceberg.orphan_sweep_enabled", true)
 	// iceberg.warehouse defaults at wire time to the storage root (needs the backend)
 
 	// Continuous query defaults
@@ -1698,6 +1885,7 @@ func setDefaults(v *viper.Viper) {
 
 	// Query defaults
 	v.SetDefault("query.timeout", 300)                           // 5 minute query timeout (0 = no timeout)
+	v.SetDefault("query.cancel_on_client_disconnect", true)      // Can be disabled for clients that half-close their write side
 	v.SetDefault("query.slow_query_threshold_ms", 0)             // Disabled by default (0 = no slow query logging)
 	v.SetDefault("query.file_time_pruning", false)               // EXPERIMENTAL (26.09.2), opt-in; planned default-on in 27.01.1 (#659)
 	v.SetDefault("query.file_time_pruning_margin_seconds", 300)  // Writer clock-skew allowance
@@ -1831,6 +2019,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("tiered_storage.migration_batch_size", 100)            // 100 files per batch
 	v.SetDefault("tiered_storage.default_hot_max_age_days", 30)         // 30 days in hot tier before archiving
 	v.SetDefault("tiered_storage.migration_history_retention_days", 90) // 90 days migration history
+	v.SetDefault("tiered_storage.scan_timeout", "2h")                   // One tier scan; see TieredStorageConfig.ScanTimeout
 
 	// Cold tier defaults (S3/Azure). Objects are written in the bucket's
 	// default storage class; there is deliberately no class or access-tier key.
@@ -1844,6 +2033,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("tiered_storage.cold.s3_use_ssl", true)       // HTTPS by default
 	v.SetDefault("tiered_storage.cold.s3_path_style", false)   // Virtual-hosted style for AWS
 	v.SetDefault("tiered_storage.cold.azure_container", "")    // Must be configured for Azure
+	v.SetDefault("tiered_storage.cold.azure_prefix", "")       // Container root by default (#1102)
 	v.SetDefault("tiered_storage.cold.azure_connection_string", "")
 	v.SetDefault("tiered_storage.cold.azure_account_name", "")
 	v.SetDefault("tiered_storage.cold.azure_account_key", "")
@@ -1871,6 +2061,49 @@ func setDefaults(v *viper.Viper) {
 	// Backup defaults
 	v.SetDefault("backup.enabled", true)
 	v.SetDefault("backup.local_path", "./data/backups")
+	// Backup targets (#1085 stage B2b-1). Only the two keys whose names are
+	// fixed can be defaulted here: a target's own fields are
+	// backup.targets.<name>.*, and no name exists until a config file has been
+	// read. setBackupTargetDefaults registers those per discovered target.
+	//
+	// Empty default_target means the destination is backup.local_path, exactly
+	// as before targets existed.
+	v.SetDefault("backup.default_target", "")
+	v.SetDefault("backup.target_names", "")
+	// The value both backup and restore were hardcoded to before #1085, so
+	// leaving it unset changes nothing.
+	v.SetDefault("backup.operation_timeout", "2h")
+}
+
+// checkObjectPrefix validates one configured object-store key prefix. key is
+// the operator-facing configuration key, so a rejection names the key the
+// operator must change.
+//
+// It also used to warn about a prefix whose last segment was year-shaped,
+// because the query path then read the two segments BEFORE that year as the
+// database and measurement. That advisory is gone with the cause: the query
+// path removes the configured prefix before it looks for a partition year
+// (#1108), so such a prefix resolves correctly and there is nothing left to
+// advise. A year-shaped tail is now simply a valid prefix.
+//
+// Validated HERE, at load, rather than only inside the backend constructors,
+// for one reason that is not symmetry: a backend-construction failure at the
+// COLD-tier call site is logged at Error and the process continues with a nil
+// cold backend (cmd/arc/main.go), so an unusable cold prefix would leave the
+// cold tier silently dead. And the error that reports it is logged through
+// zerolog, where installErrSanitizer masks quoted spans globally, so the
+// operator is shown dots for both the value and the offending character. A
+// load-time error is printed before the logger exists, so the value survives.
+// Same reason, same shape, as backup.operation_timeout.
+//
+// The backends keep their own validation: this is defence in depth, and the
+// compaction subprocess and the backup manager build backends without ever
+// passing through Load.
+func (c *Config) checkObjectPrefix(key, value string) error {
+	if _, err := storage.ValidateObjectPrefix(value); err != nil {
+		return fmt.Errorf("invalid %s: %w", key, err)
+	}
+	return nil
 }
 
 // parseStringSlice parses a comma-separated string into a slice of strings.
@@ -1893,40 +2126,15 @@ func parseStringSlice(s string) []string {
 
 // EffectiveCores reports how many CPUs this process may actually use.
 //
-// runtime.NumCPU() is not that number: it reflects cpuset/affinity but NOT a
-// CFS quota, and Kubernetes limits.cpu and docker --cpus are quotas — so a
-// 2-CPU pod on a 64-core host reports 64 (#1026, #1030). runtime.GOMAXPROCS(0)
-// IS quota-aware; since Go 1.25 the runtime computes
-// min(affinity_cpus, max(ceil(quota), 2)) and this module's go directive enables
-// it. Measured on an 8-CPU VM: --cpus=2, --cpus=1.5 and --cpus=0.5 all give 2
-// (the runtime floors at 2), while --cpuset-cpus=0-1 gives NumCPU() == 2.
+// Forwarder: internal/syscpu owns the implementation and the reasoning about
+// quotas, cpusets and the GOMAXPROCS environment variable. It lives there
+// rather than here so internal/license and internal/telemetry can ask the same
+// question without importing this package's dependency closure.
 //
-// The minimum of the two is taken because neither alone is the answer. The
-// GOMAXPROCS environment variable overrides the runtime's detection with no
-// clamp, so GOMAXPROCS=128 on an 8-CPU box really does report 128; NumCPU
-// covers cpuset limits that no quota expresses.
-//
-// Two residuals are deliberate. A GOMAXPROCS between the quota and the machine
-// size is honoured (GOMAXPROCS=32 under --cpus=2 yields 32), and
-// GODEBUG=containermaxprocs=0 disables the runtime's cgroup read altogether.
-// Both are an operator explicitly overriding their own runtime's container
-// awareness. Reading cpu.max here instead would out-guess them at the price of
-// reimplementing, for a third time, the cgroup parsing #1026 deleted.
+// Note for anything reporting a core count OUTWARD: that wants
+// syscpu.CoresAtStartup, not this. See its doc.
 func EffectiveCores() int {
-	return effectiveCores(runtime.NumCPU(), runtime.GOMAXPROCS(0))
-}
-
-// effectiveCores is the pure form, so its table tests need not mutate
-// process-global runtime state to cover it.
-func effectiveCores(numCPU, gomaxprocs int) int {
-	cores := numCPU
-	if gomaxprocs > 0 && gomaxprocs < cores {
-		cores = gomaxprocs
-	}
-	if cores < 1 {
-		cores = 1
-	}
-	return cores
+	return syscpu.EffectiveCores()
 }
 
 // effectiveCoresFn is the seam the config tests inject through. CI runners have
@@ -2143,10 +2351,9 @@ func deriveCompactionMemoryLimit(dbLimit string, maxConcurrent int) string {
 	return strconv.FormatFloat(derived, 'f', -1, 64) + m[2]
 }
 
-// getDefaultCompactionThreads is the auto value for compaction.threads: half
-// the CPUs this process may use, minimum 1. With the default max_concurrent of
-// 2, the two subprocesses together use about one process's worth of cores,
-// leaving headroom for the main process's ingest and query work.
+// getDefaultCompactionThreads is the auto value for compaction.threads. It
+// derives from the CPUs this process may use and the maximum number of
+// concurrent subprocesses, with a minimum of one thread per subprocess.
 //
 // Derived from EffectiveCores, not runtime.NumCPU: each compaction job is a
 // separate process in the SAME cgroup, so a 2-CPU pod on a 64-core host ran
@@ -2162,14 +2369,24 @@ func deriveCompactionMemoryLimit(dbLimit string, maxConcurrent int) string {
 // the failing range exactly where this issue was reported. Where a container
 // caps CPU but not memory this default now costs throughput; set the key.
 //
-// The halving hardcodes max_concurrent=2; a higher max_concurrent still
-// oversubscribes. Pre-existing, and tracked separately from #1030.
-func getDefaultCompactionThreads() int {
-	return defaultCompactionThreads(effectiveCoresFn())
+// Two concurrent jobs is the default and keeps the existing half-core
+// per-subprocess behavior. Above that default, divide available cores across
+// the concurrent subprocesses so raising max_concurrent does not multiply the
+// aggregate DuckDB thread count (#1037). This is based on effective available
+// cores, not an attempt to distinguish CPU quotas from cpusets or an operator's
+// GOMAXPROCS setting.
+func getDefaultCompactionThreads(maxConcurrent int) int {
+	return defaultCompactionThreads(effectiveCoresFn(), maxConcurrent)
 }
 
-func defaultCompactionThreads(cores int) int {
-	threads := cores / 2
+func defaultCompactionThreads(cores, maxConcurrent int) int {
+	// The floor of 2 does double duty: it keeps the pre-#1037 half-core default
+	// byte-identical at the default max_concurrent, and it absorbs the
+	// non-positive sentinel the same way compaction.NewManager does (0 means
+	// "use 2"). Load has already rejected a negative max_concurrent, so the only
+	// non-positive value that reaches here is an explicit max_concurrent = 0.
+	divisor := max(2, maxConcurrent)
+	threads := cores / divisor
 	if threads < 1 {
 		threads = 1
 	}
