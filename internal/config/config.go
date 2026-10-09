@@ -1748,9 +1748,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.flush_workers", getDefaultFlushWorkers())
 	v.SetDefault("ingest.flush_queue_size", getDefaultFlushQueueSize())
 	v.SetDefault("ingest.shard_count", 32)
-	v.SetDefault("ingest.sort_keys", []string{})     // No custom sort keys by default
+	v.SetDefault("ingest.sort_keys", []string{})          // No custom sort keys by default
 	v.SetDefault("ingest.default_sort_keys", "time:desc") // Put recent time-series rows first
-	v.SetDefault("ingest.flush_timeout_seconds", 30) // 30s timeout for storage writes during flush
+	v.SetDefault("ingest.flush_timeout_seconds", 30)      // 30s timeout for storage writes during flush
 	v.SetDefault("ingest.decimal_columns", []string{})
 	v.SetDefault("ingest.default_decimal_columns", "")
 
