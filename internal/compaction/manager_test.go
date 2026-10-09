@@ -762,8 +762,8 @@ func TestManager_GetSortKeys_AppendsTime(t *testing.T) {
 		measurement string
 		want        []string
 	}{
-		{"measurement-specific config gets time appended", "cpu", []string{"host", "time"}},
-		{"default config gets time appended", "mem", []string{"region", "time"}},
+		{"measurement-specific config gets descending time appended", "cpu", []string{"host", "time:desc"}},
+		{"default config gets descending time appended", "mem", []string{"region", "time:desc"}},
 	}
 
 	for _, tt := range tests {

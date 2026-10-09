@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/sortkey"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
@@ -432,7 +433,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 
 	defaultSortKeys := cfg.DefaultSortKeys
 	if defaultSortKeys == nil {
-		defaultSortKeys = []string{"time"} // Default to time-only sorting
+		defaultSortKeys = []string{"time:desc"} // Put recent time-series rows first
 	}
 
 	logger := cfg.Logger.With().Str("component", "compaction-manager").Logger()
@@ -2163,9 +2164,9 @@ func (m *Manager) listMeasurements(ctx context.Context, database string) ([]stri
 
 // GetSortKeys returns sort keys for a measurement.
 // Checks measurement-specific config first, then falls back to default.
-// Always ensures "time" is the last sort key, mirroring the ingest path's
-// getSortKeys in arrow_writer.go, so compacted files keep the same time
-// ordering within each sort group that ingest established.
+// Always ensures "time" is the last sort key, descending by default, mirroring
+// the ingest path's getSortKeys in arrow_writer.go so compacted files preserve
+// the same row ordering that ingest established.
 func (m *Manager) GetSortKeys(measurement string) []string {
 	// Check measurement-specific config
 	var keys []string
@@ -2178,13 +2179,13 @@ func (m *Manager) GetSortKeys(measurement string) []string {
 	// Always ensure "time" is the last sort key.
 	// Skip adding if already present (legacy configs may include it explicitly).
 	for _, k := range keys {
-		if k == "time" {
+		if sortkey.Parse(k).Column == "time" {
 			return keys
 		}
 	}
 
-	// Append "time" - users configure ADDITIONAL sort keys only.
-	return append(keys, "time")
+	// Append the configured time direction, or the DESC default.
+	return append(keys, sortkey.TimeKey(m.DefaultSortKeys))
 }
 
 // filterCandidateFiles removes files that are tracked by manifests from a candidate.

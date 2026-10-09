@@ -65,6 +65,18 @@ func TestParseSortKeys(t *testing.T) {
 			wantErr:         false,
 		},
 		{
+			name: "default key direction is preserved",
+			config: IngestConfig{
+				SortKeys:        []string{"cpu:tag_host,time:desc"},
+				DefaultSortKeys: "time:desc",
+			},
+			wantSortKeys: map[string][]string{
+				"cpu": {"tag_host", "time:desc"},
+			},
+			wantDefaultKeys: []string{"time:desc"},
+			wantErr:         false,
+		},
+		{
 			name: "multiple default sort keys",
 			config: IngestConfig{
 				SortKeys:        []string{},

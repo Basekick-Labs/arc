@@ -142,8 +142,8 @@ type IngestConfig struct {
 	FlushWorkers          int      // Number of workers for async flush (default: 2x CPU, min 8, max 64)
 	FlushQueueSize        int      // Capacity of flush task queue (default: 4x workers, min 100)
 	ShardCount            int      // Number of buffer shards for lock distribution (default: 32)
-	SortKeys              []string // Per-measurement sort keys: "measurement:col1,col2,time"
-	DefaultSortKeys       string   // Default sort keys for measurements not in SortKeys
+	SortKeys              []string // Per-measurement sort keys: "measurement:col1:desc,col2,time:desc"
+	DefaultSortKeys       string   // Default sort keys; a missing time direction defaults to DESC
 	FlushTimeoutSeconds   int      // Timeout for storage writes during flush (default: 30s, 0 = no timeout)
 	DecimalColumns        []string // Per-measurement decimal columns: "measurement:col=precision,scale;col2=p,s"
 	DefaultDecimalColumns string   // Default decimal columns for unmapped measurements
@@ -1748,9 +1748,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.flush_workers", getDefaultFlushWorkers())
 	v.SetDefault("ingest.flush_queue_size", getDefaultFlushQueueSize())
 	v.SetDefault("ingest.shard_count", 32)
-	v.SetDefault("ingest.sort_keys", []string{})     // No custom sort keys by default
-	v.SetDefault("ingest.default_sort_keys", "time") // Default to time-only sorting
-	v.SetDefault("ingest.flush_timeout_seconds", 30) // 30s timeout for storage writes during flush
+	v.SetDefault("ingest.sort_keys", []string{})          // No custom sort keys by default
+	v.SetDefault("ingest.default_sort_keys", "time:desc") // Put recent time-series rows first
+	v.SetDefault("ingest.flush_timeout_seconds", 30)      // 30s timeout for storage writes during flush
 	v.SetDefault("ingest.decimal_columns", []string{})
 	v.SetDefault("ingest.default_decimal_columns", "")
 

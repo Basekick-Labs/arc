@@ -100,9 +100,10 @@ max_buffer_size = 5000000   # Records before flush (default: 50000)
 max_buffer_age_ms = 100   # Max buffer age before flush
 
 # Sort keys for compression/query performance: "measurement:col1,col2"
-# Time column is always appended automatically
+# Add :desc or :asc to a key to set its direction. The time column is appended
+# in descending order by default, so recent rows are first within each file.
 sort_keys = []
-default_sort_keys = ""
+default_sort_keys = "time:desc"
 
 # Parquet dictionary encoding at ingest. Off by default: ingest files are
 # transient (hourly/daily compaction rewrites them via DuckDB, which applies

@@ -29,6 +29,16 @@ func TestBuildOrderByClause(t *testing.T) {
 			want:     `ORDER BY "time"`,
 		},
 		{
+			name:     "descending time key",
+			sortKeys: []string{"time:desc"},
+			want:     `ORDER BY "time" DESC`,
+		},
+		{
+			name:     "ascending time key",
+			sortKeys: []string{"time:asc"},
+			want:     `ORDER BY "time"`,
+		},
+		{
 			name:     "two keys",
 			sortKeys: []string{"tag_sensor_id", "time"},
 			want:     `ORDER BY "tag_sensor_id", "time"`,
@@ -42,6 +52,11 @@ func TestBuildOrderByClause(t *testing.T) {
 			name:     "keys with special characters",
 			sortKeys: []string{"my-column", "tag_host", "time"},
 			want:     `ORDER BY "my-column", "tag_host", "time"`,
+		},
+		{
+			name:     "descending non-time key",
+			sortKeys: []string{"host:desc", "time"},
+			want:     `ORDER BY "host" DESC, "time"`,
 		},
 	}
 
