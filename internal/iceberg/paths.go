@@ -1,6 +1,7 @@
 package iceberg
 
 import (
+	"net/url"
 	"path/filepath"
 	"strings"
 
@@ -37,7 +38,7 @@ func localFileURI(p string) string {
 		// is the path, not the authority: file:///C:/…
 		slashed = "/" + slashed
 	}
-	return "file://" + slashed
+	return (&url.URL{Scheme: "file", Path: slashed}).String()
 }
 
 // DefaultWarehouse returns the Iceberg warehouse root for a backend when none is configured:

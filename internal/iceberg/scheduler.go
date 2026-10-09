@@ -152,6 +152,11 @@ func (s *Scheduler) runPass(ctx context.Context) {
 		s.logger.Error().Err(err).Msg("Iceberg reconcile: failed to enumerate measurements")
 		return
 	}
+	blocked, err := s.exporter.MigrateDottedNamespaces(ctx, measurements)
+	if err != nil {
+		s.logger.Error().Err(err).Msg("Iceberg reconcile: failed to inspect dotted-namespace migration; pass skipped")
+		return
+	}
 	var ok, failed, skipped int
 	seen := make(map[string]struct{}, len(measurements))
 	for _, m := range measurements {
@@ -160,6 +165,12 @@ func (s *Scheduler) runPass(ctx context.Context) {
 		}
 		key := m.Database + "\x00" + m.Measurement
 		seen[key] = struct{}{}
+		if _, blocked := blocked[key]; blocked {
+			s.logger.Warn().Str("database", m.Database).Str("measurement", m.Measurement).
+				Msg("Iceberg reconcile skipped until dotted-namespace migration is reviewed or succeeds")
+			skipped++
+			continue
+		}
 		mctx, cancel := context.WithTimeout(ctx, measurementTimeout)
 		changed, err := s.reconcileOne(mctx, m, key)
 		cancel()

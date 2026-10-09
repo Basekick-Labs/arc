@@ -2,6 +2,7 @@ package iceberg
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -88,7 +89,22 @@ func NewStorageWalkSource(backend storage.Backend, nsPrefix string, logger zerol
 // directory ("<nsPrefix>_<db>.db") written by the exporter, which must be excluded from the
 // data-file walk. Iceberg's SQL catalog names namespace dirs "<namespace>.db".
 func (s *StorageWalkSource) isWarehouseDir(name string) bool {
-	return strings.HasPrefix(name, s.nsPrefix+"_") && strings.HasSuffix(name, ".db")
+	if strings.HasPrefix(name, s.nsPrefix+"_") && strings.HasSuffix(name, ".db") {
+		return true
+	}
+	// iceberg-go v0.7.0 JSON-encodes namespaces containing a dotted component. Spoke IDs may
+	// contain dots, so the resulting directory no longer starts with "<prefix>_". Decode only
+	// canonical catalog keys and verify their first component belongs to this exporter.
+	if !strings.HasPrefix(name, encodedNamespacePrefix) || !strings.HasSuffix(name, ".db") {
+		return false
+	}
+	encoded := strings.TrimSuffix(strings.TrimPrefix(name, encodedNamespacePrefix), ".db")
+	var namespace []string
+	if err := json.Unmarshal([]byte(encoded), &namespace); err != nil || len(namespace) == 0 {
+		return false
+	}
+	canonical, err := json.Marshal(namespace)
+	return err == nil && string(canonical) == encoded && strings.HasPrefix(namespace[0], s.nsPrefix+"_")
 }
 
 // dirLister is the subset of storage backends that can enumerate immediate subdirectories.

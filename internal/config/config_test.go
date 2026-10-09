@@ -440,6 +440,29 @@ func TestLoad_EnvOverride(t *testing.T) {
 	}
 }
 
+func TestLoad_IcebergNamespaceMigrationDryRun(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("ARC_ICEBERG_ENABLED", "true")
+	t.Setenv("ARC_STORAGE_BACKEND", "local")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() default: %v", err)
+	}
+	if !cfg.Iceberg.NamespaceMigrationDryRun {
+		t.Fatal("Iceberg.NamespaceMigrationDryRun default = false, want true")
+	}
+
+	t.Setenv("ARC_ICEBERG_NAMESPACE_MIGRATION_DRY_RUN", "false")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() apply mode: %v", err)
+	}
+	if cfg.Iceberg.NamespaceMigrationDryRun {
+		t.Fatal("Iceberg.NamespaceMigrationDryRun = true, want false from environment")
+	}
+}
+
 func TestLoad_MetricsDefaults(t *testing.T) {
 	// Create a temp dir without config file to test defaults
 	tmpDir, err := os.MkdirTemp("", "arc-config-test")

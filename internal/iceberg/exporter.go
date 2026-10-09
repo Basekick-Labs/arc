@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -51,12 +52,16 @@ type FileRef struct {
 // Exporter maintains Iceberg tables that mirror Arc's Parquet file set. One Exporter per
 // process; ReconcileMeasurement is the unit of work (one measurement's table).
 type Exporter struct {
-	catalog   *sqlcat.Catalog
-	backend   storage.Backend // for writing version-hint.text alongside table metadata
-	warehouse string          // warehouse root URI (file://… or s3://bucket/prefix)
-	nsPrefix  string          // namespace for Iceberg tables (e.g. "arc")
-	retain    int             // snapshots + metadata versions to keep per table (0 = keep all)
-	logger    zerolog.Logger
+	db          *sql.DB
+	catalog     *sqlcat.Catalog
+	catalogName string
+	backend     storage.Backend // for writing version-hint.text alongside table metadata
+	warehouse   string          // warehouse root URI (file://… or s3://bucket/prefix)
+	nsPrefix    string          // namespace for Iceberg tables (e.g. "arc")
+	retain      int             // snapshots + metadata versions to keep per table (0 = keep all)
+	logger      zerolog.Logger
+	// namespaceMigrationDryRun is set once during wiring, before the scheduler starts.
+	namespaceMigrationDryRun bool
 
 	// hintWarned records metadata directories already warned about for
 	// unaddressable version-hint publishing, so a permanent configuration
@@ -133,9 +138,11 @@ func NewExporter(db *sql.DB, backend storage.Backend, warehouse, nsPrefix string
 		return nil, fmt.Errorf("create iceberg sql catalog: %w", err)
 	}
 	return &Exporter{
-		catalog:   cat,
-		backend:   backend,
-		warehouse: strings.TrimSuffix(warehouse, "/"),
+		db:          db,
+		catalog:     cat,
+		catalogName: "arc",
+		backend:     backend,
+		warehouse:   strings.TrimSuffix(warehouse, "/"),
 		// resolvedWarehouse/resolvedRoot are computed lazily on first
 		// warehouseRelKey call (the directories may not exist yet here).
 		nsPrefix: nsPrefix,
@@ -145,9 +152,10 @@ func NewExporter(db *sql.DB, backend storage.Backend, warehouse, nsPrefix string
 		// future callers): the sweep is on, with the grace floor. Never leave the
 		// grace at zero by default — an ungraced sweep would be free to delete a
 		// manifest written moments ago by a commit that has not landed yet.
-		orphanSweepEnabled: true,
-		orphanGrace:        minOrphanGrace,
-		collapseThreshold:  manifestCollapseThreshold,
+		orphanSweepEnabled:       true,
+		orphanGrace:              minOrphanGrace,
+		collapseThreshold:        manifestCollapseThreshold,
+		namespaceMigrationDryRun: true,
 	}, nil
 }
 
@@ -196,59 +204,38 @@ func (e *Exporter) ConfigureOrphanSweep(enabled bool, grace time.Duration) {
 }
 
 // tableIdent maps an Arc (database, measurement) to an Iceberg table identifier under the
-// exporter namespace. Namespace = "<nsPrefix>_<database>" so multiple Arc databases coexist.
-//
-// An edge-sync spoke pseudo-database is "{spoke}/{db}" (#634). The separator is mapped to "."
-// so the namespace stays a single path token: the SQL catalog names namespace directories
-// "<namespace>.db", and an unsanitized slash would nest that directory one level deeper than
-// the warehouse walk expects — which isWarehouseDir would then fail to recognise, feeding the
-// exporter's own metadata back in as a user database. "." is safe because a real Arc database
-// name cannot contain one (letter-first, then [A-Za-z0-9_-]), so "rocket-01/telemetry" can
-// never collide with a real database. Same mapping compaction uses for job IDs (#619).
+// exporter namespace. A local database uses one namespace component; an edge-sync spoke
+// pseudo-database "{spoke}/{db}" uses two (#1129), so its boundary is never folded into a dot.
 func (e *Exporter) tableIdent(database, measurement string) icetable.Identifier {
-	return icetable.Identifier{e.nsPrefix + "_" + sanitizeNamespaceDB(database), measurement}
-}
-
-// sanitizeNamespaceDB maps a database name to a single path-safe namespace token.
-// Plain names pass through unchanged; spoke pseudo-databases lose their separator.
-// checkNamespaceAddressable refuses a database whose Iceberg namespace component would contain a
-// dot. Arc builds ONE component per database — nsPrefix + "_" + sanitizeNamespaceDB(database) — and
-// iceberg-go v0.7.0 addresses a namespace with a dotted component by a JSON encoding rather than by
-// the plain dotted string (catalog/sql: namespaceToString, and namespaceStorageKeys, which
-// deliberately refuses the legacy key because "their legacy key belongs to a different namespace").
-//
-// Three things then go wrong at once, none of them loudly, which is why this is a refusal and not a
-// warning:
-//
-//   - A table created under v0.6.0 is no longer found, so EnsureTable correctly creates a NEW one
-//     and the original table plus its whole snapshot history is orphaned on disk.
-//   - The warehouse directory becomes __iceberg_namespace_v1__:["arc_x.y"].db, which isWarehouseDir
-//     does not recognise (it wants the nsPrefix + "_" … ".db" shape), so Measurements() walks the
-//     exporter's own metadata back in as if it were a user database — the exact harm the "/" to "."
-//     mapping below exists to prevent, one nesting level deeper per pass.
-//   - MetadataLocation() comes back percent-encoded while the directory on disk is not, so
-//     writeVersionHint publishes nowhere and directory-based readers (DuckDB, Spark) cannot resolve
-//     the table at all. The discovery-file failure also declines the scheduler's fingerprint cache,
-//     so the measurement is re-reconciled on every tick forever.
-//
-// Only this measurement fails; the rest of the node's export is unaffected, which matches how a
-// column-type conflict is handled. Reaching it needs a dot in a database name, and Arc's own
-// databases are dot-free by their create-time rule — an edge-sync spoke ID is the one source that
-// permits a single dot (validateSpokeID rejects "/", "\\", ":" and "..", but not "."). The
-// permanent fix is to stop building a dotted component at all, which needs a migration for tables
-// already published under one.
-func checkNamespaceAddressable(nsPrefix, database string) error {
-	if ns := nsPrefix + "_" + sanitizeNamespaceDB(database); strings.Contains(ns, ".") {
-		return fmt.Errorf("iceberg namespace %s contains a dot, which this Iceberg catalog addresses "+
-			"as a different namespace than the one Arc publishes to disk: the table would be "+
-			"unreadable and would shadow any table already exported for this database (database=%s)",
-			ns, database)
+	namespace, err := namespaceIdentifier(e.nsPrefix, database)
+	if err != nil {
+		return nil // callers validate dynamic database names before reaching the catalog
 	}
-	return nil
+	return append(namespace, measurement)
 }
 
-func sanitizeNamespaceDB(database string) string {
-	return strings.ReplaceAll(database, "/", ".")
+// namespaceIdentifier preserves the spoke/database boundary. iceberg-go v0.7.0 supports dotted
+// components through its encoded namespace key; source.go recognizes the encoded warehouse dir.
+func namespaceIdentifier(nsPrefix, database string) (icetable.Identifier, error) {
+	if strings.Contains(nsPrefix, ".") {
+		return nil, fmt.Errorf("iceberg namespace prefix %q contains a dot", nsPrefix)
+	}
+	if strings.Contains(database, "/") {
+		spoke, db, ok := strings.Cut(database, "/")
+		if !ok || spoke == "" || db == "" || strings.Contains(db, "/") || strings.Contains(db, ".") {
+			return nil, fmt.Errorf("invalid spoke database %q: expected {spoke}/{dot-free database}", database)
+		}
+		return icetable.Identifier{nsPrefix + "_" + spoke, db}, nil
+	}
+	if database == "" {
+		return nil, fmt.Errorf("database name is empty")
+	}
+	return icetable.Identifier{nsPrefix + "_" + database}, nil
+}
+
+func checkNamespaceAddressable(nsPrefix, database string) error {
+	_, err := namespaceIdentifier(nsPrefix, database)
+	return err
 }
 
 // ArcSchema describes the typed columns of one measurement, as derived from a Parquet file's
@@ -274,6 +261,9 @@ func (e *Exporter) TableExists(ctx context.Context, database, measurement string
 // need the (bool, error) form so a transient catalog error is not interpreted and cached as a
 // confirmed missing table.
 func (e *Exporter) tableExists(ctx context.Context, database, measurement string) (bool, error) {
+	if err := checkNamespaceAddressable(e.nsPrefix, database); err != nil {
+		return false, err
+	}
 	_, err := e.catalog.LoadTable(ctx, e.tableIdent(database, measurement))
 	if err == nil {
 		return true, nil
@@ -299,7 +289,7 @@ func (e *Exporter) EnsureTable(ctx context.Context, database, measurement string
 		return nil, err
 	}
 	ident := e.tableIdent(database, measurement)
-	ns := icetable.Identifier{ident[0]}
+	ns := ident[:len(ident)-1]
 
 	// Namespace create is idempotent-ish; ignore "already exists".
 	if err := e.catalog.CreateNamespace(ctx, ns, nil); err != nil && !isAlreadyExists(err) {
@@ -1527,12 +1517,12 @@ func (e *Exporter) warehouseRelKey(metaLoc string) (string, bool) {
 	// warn-once "hint unaddressable" mode. Resolution must be SYMMETRIC —
 	// all three values or none — and the two constant sides are cached.
 	e.resolveOnce.Do(func() {
-		e.resolvedWarehouse = resolveFileURI(e.warehouse)
+		e.resolvedWarehouse = decodedURIPath(resolveFileURI(e.warehouse))
 		if e.backend != nil {
-			e.resolvedRoot = resolveFileURI(DefaultWarehouse(e.backend))
+			e.resolvedRoot = decodedURIPath(resolveFileURI(DefaultWarehouse(e.backend)))
 		}
 	})
-	loc := resolveFileURI(metaLoc)
+	loc := decodedURIPath(resolveFileURI(metaLoc))
 	if !isUnderDir(loc, e.resolvedWarehouse) {
 		return "", false
 	}
@@ -1547,16 +1537,28 @@ func (e *Exporter) warehouseRelKey(metaLoc string) (string, bool) {
 	return strings.TrimPrefix(strings.TrimPrefix(loc, e.resolvedRoot), "/"), true
 }
 
+// decodedURIPath returns the URI's logical path without percent escapes for comparisons and
+// backend-relative keys. iceberg-go encodes JSON namespace components in MetadataLocation, while
+// local directories and object keys use their decoded names.
+func decodedURIPath(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" {
+		return raw
+	}
+	return u.Scheme + "://" + u.Host + u.Path
+}
+
 // hardenLocalMetadataPerms chmods a local warehouse table's metadata files to
 // 0600 and its directories to 0700, matching Arc's own writes. Local
 // warehouses only; object stores have no modes. Best-effort: a chmod failure
 // is a consistency nit, never a commit failure.
 func (e *Exporter) hardenLocalMetadataPerms(metaLoc string) {
 	const scheme = "file://"
-	if !strings.HasPrefix(metaLoc, scheme) {
+	resolved := resolveFileURI(metaLoc)
+	if !strings.HasPrefix(resolved, scheme) {
 		return
 	}
-	metaDir := filepath.Dir(filepath.FromSlash(strings.TrimPrefix(metaLoc, scheme)))
+	metaDir := filepath.Dir(filepath.FromSlash(strings.TrimPrefix(resolved, scheme)))
 	entries, err := os.ReadDir(metaDir)
 	if err != nil {
 		return
@@ -1599,7 +1601,11 @@ func resolveFileURI(uri string) string {
 	if !strings.HasPrefix(uri, scheme) {
 		return uri
 	}
-	p := filepath.FromSlash(strings.TrimPrefix(uri, scheme))
+	parsed, err := url.Parse(uri)
+	if err != nil || parsed.Scheme != "file" || parsed.Host != "" {
+		return uri
+	}
+	p := filepath.FromSlash(parsed.Path)
 	if resolved, err := filepath.EvalSymlinks(p); err == nil {
 		return localFileURI(resolved)
 	}
