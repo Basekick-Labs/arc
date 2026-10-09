@@ -65,6 +65,37 @@ copies look like ordinary data files to the reconciliation sweep, which deletes
 them as orphans when reconciliation is enabled and dry-run is off. The check
 costs one comparison at startup and removes a class of silent data loss.
 
+## Upgrade note: a node that cannot list its cold bucket stops migrating
+
+If you run tiering with a cold tier, check that the cold credentials allow
+**listing** the bucket or container, not only reading, writing and deleting
+objects.
+
+From this release every node with a usable cold tier reads the cold listing at
+the start of each tier scan, and a scan whose cold listing fails skips migration
+and orphan reconciliation for that cycle — see "Cold-tier metadata is rebuilt on
+standalone nodes". On clustered nodes both halves already applied. On a
+**standalone** node neither did, so a deployment whose cold policy grants
+`GetObject`, `PutObject` and `DeleteObject` but not `ListBucket` has been
+migrating happily and will stop after upgrading: hot storage keeps growing and
+the cycle logs
+
+> Cold tier could not be listed, so migration and orphan reconciliation are
+> skipped this cycle and hot storage will keep growing until a listing succeeds.
+
+once per cycle. `GET /api/v1/tiering/status` reports it as
+`last_scan.cold_sync_failed`.
+
+The same halt is reachable without a permissions problem: the cold listing is
+spent from `tiered_storage.scan_timeout`, before the hot walk gets any of it. If
+you sized that budget from how long a hot scan takes — which is what `arc.toml`
+suggested — a large cold bucket can now exhaust it. Raise it above the time a
+full cold listing *and* a full hot scan take together.
+
+Nothing changes for a node with `tiered_storage.cold.enabled` off, or one whose
+cold backend failed to construct: the listing is skipped and migration runs as
+before.
+
 ## New features
 
 ### Compaction cycles can be looked up by id ([#1162](https://github.com/Basekick-Labs/arc/issues/1162))
@@ -365,9 +396,11 @@ reverse: tier rows whose object is missing from the store, i.e. data that is
 genuinely gone — and `cold_rows_stale_but_hot` counts the third case, a row
 that says cold whose file is still in hot storage and therefore **is** in the
 backup. That last one matters because without it the backup would report a file
-it holds as permanently gone. On a standalone node, or a cluster without shared
-storage or replication, an unrecorded object is a permanent condition rather
-than a lag — the cold-metadata sync that would record it does not run there.
+it holds as permanently gone. Until 27.01.1 an unrecorded object was a
+permanent condition rather than a lag on a standalone node, or on a cluster
+without shared storage or replication, because the cold-metadata sync did not
+run there; it does now (see "Cold-tier metadata is rebuilt on standalone
+nodes"), so such an object is recorded on the next scan.
 
 `cold_files_excluded` keeps its per-database breakdown in
 `cold_files_excluded_databases`, so tooling built on the stage-B field keeps
@@ -684,6 +717,36 @@ negative or unparseable value is a startup error naming the value rather than
 an unbounded operation.
 
 ## Bug fixes
+
+### Cold-tier metadata is rebuilt on standalone nodes ([#1179](https://github.com/Basekick-Labs/arc/issues/1179))
+
+A node with a usable cold tier now reads the cold listing at the start of every
+tier scan, whatever its cluster role. Previously that step was skipped unless a
+cluster gate was wired, which meant it never ran on a standalone node.
+
+In steady state this changes nothing: a standalone node writes its own cold rows
+as the second phase of its own migration, so the listing finds nothing new. The
+case it exists for is **recovery**, where it is the only mechanism — nothing else
+re-derives a cold row from the bucket:
+
+- a metadata restore that predates the migrations, so the tier rows and the
+  bucket disagree;
+- SQLite loss or corruption, where the cold objects are intact but no row claims
+  them — and the query layer omits the cold glob entirely for a measurement with
+  no cold row, so the data reads as absent rather than mis-tiered;
+- moving a cold bucket to a new standalone node, which until now needed
+  hand-written SQL.
+
+The listing is bounded by `tiered_storage.scan_timeout`, the same budget the hot
+scan uses.
+
+**If the cold listing fails, the migration cycle now skips migration and orphan
+reconciliation** and waits for a cycle whose listing succeeds, rather than acting
+on a view of the tiers it knows is incomplete. That already applied on clustered
+nodes; it now applies everywhere. See the upgrade note above, because it is
+reachable on deployments that have been running happily without it.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1183](https://github.com/Basekick-Labs/arc/pull/1183).
 
 ### Reported core counts account for the CPU quota ([#1039](https://github.com/Basekick-Labs/arc/issues/1039))
 
@@ -2722,9 +2785,12 @@ transaction in `internal/tiering`:
   tier row. Each flush is bounded by its own timeout, so a cancelled restore
   still exits after at most one. Unlike the manifest registration beside it,
   the flush also runs on every exit path: the bytes are already in the cold
-  store, and on a standalone node, or a cluster without shared storage or
-  replication, nothing else ever writes the row, because the cold-metadata
-  sync does not run there.
+  store, and a row the backup does not write is not written by anything else
+  in the same pass. (Before 27.01.1 that was permanent on a standalone node,
+  or on a cluster without shared storage or replication, because the
+  cold-metadata sync did not run there. It does now, so the next scan records
+  it — but the flush still runs on every exit path, because waiting for a scan
+  is not the same as having the row.)
 - **`migrated_at` is still written as text in `2006-01-02 15:04:05`.** The
   column is compared as a string against every other row, and go-sqlite3 binds
   a `time.Time` with its offset appended, so a bound time here would sort
