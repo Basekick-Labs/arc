@@ -726,6 +726,8 @@ transfers. This keeps the read contract aligned with `StatFile` and prevents a
 caller from combining committed-file metadata with bytes from an uncommitted
 partial.
 
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1203](https://github.com/Basekick-Labs/arc/pull/1203).
+
 ### Delete API removes the inactive SQL Server prefix scan ([#1077](https://github.com/Basekick-Labs/arc/issues/1077))
 
 The WHERE validator no longer lists or checks `xp_` and `sp_`. The lowercase
