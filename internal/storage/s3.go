@@ -608,7 +608,7 @@ func (b *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 				// Strip prefix so callers see paths relative to the logical root
 				key := strings.TrimPrefix(*obj.Key, b.prefix)
 				// A listing must never hand back a key this backend would
-				// refuse (#743). Object stores carry "directory marker"
+				// refuse (#743, #1121). Object stores carry "directory marker"
 				// objects whose key ends in a separator, created by consoles
 				// and sync tools, and Arc's own callers feed List output
 				// straight into Read, Exists and Delete. Returning one turns
@@ -617,7 +617,7 @@ func (b *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 				// becomes a hard error, and manifest recovery retries a
 				// permanent error forever. They are not data, so they are
 				// skipped rather than reported.
-				if ValidateKey(key) != nil {
+				if _, err := b.prefixedKey(key); err != nil {
 					continue
 				}
 				objects = append(objects, key)
@@ -796,7 +796,8 @@ func listError(what string, err error) error {
 	return fmt.Errorf("%s: %w", what, err)
 }
 
-// prefixedKey validates a storage key and prepends the configured prefix.
+// prefixedKey validates a storage key and prepends the configured prefix. It
+// also enforces the key-length limit after the prefix is applied (#1121).
 //
 // Returning an error is what makes the contract hold: a new method that builds
 // an S3 key has to deal with it, rather than silently passing an unvalidated
@@ -805,10 +806,7 @@ func listError(what string, err error) error {
 // DuckDB's read_parquet consumes, and iceberg-go writes metadata through its
 // own FileIO. Both are out of scope here (#746).
 func (b *S3Backend) prefixedKey(key string) (string, error) {
-	if err := ValidateKey(key); err != nil {
-		return "", err
-	}
-	return b.prefix + key, nil
+	return prefixObjectKey(b.prefix, key)
 }
 
 // prefixedListPrefix is prefixedKey for enumeration, where "" and a trailing
@@ -961,8 +959,8 @@ func (b *S3Backend) ListObjects(ctx context.Context, prefix string) ([]ObjectInf
 			if obj.Key != nil {
 				key := strings.TrimPrefix(*obj.Key, b.prefix)
 				// See List: a listing never returns a key the backend would
-				// refuse (#743).
-				if ValidateKey(key) != nil {
+				// refuse (#743, #1121).
+				if _, err := b.prefixedKey(key); err != nil {
 					continue
 				}
 				info := ObjectInfo{Path: key}
@@ -1013,7 +1011,8 @@ func (b *S3Backend) HasObjectsUnderPrefix(ctx context.Context, prefix string) (b
 			if obj.Key == nil {
 				continue
 			}
-			if ValidateKey(strings.TrimPrefix(*obj.Key, b.prefix)) == nil {
+			key := strings.TrimPrefix(*obj.Key, b.prefix)
+			if _, err := b.prefixedKey(key); err == nil {
 				return true, nil
 			}
 		}
@@ -1060,7 +1059,7 @@ func (b *S3Backend) ListUnusable(ctx context.Context, prefix string) ([]Unusable
 				continue
 			}
 			key := strings.TrimPrefix(*obj.Key, b.prefix)
-			reason := ValidateKey(key)
+			_, reason := b.prefixedKey(key)
 			if reason == nil {
 				continue // ListObjects returns it
 			}
