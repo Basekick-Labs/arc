@@ -4204,6 +4204,12 @@ func main() {
 					}
 				}
 
+				// The backend is constructed separately from the tiering manager,
+				// so register its lifecycle independently. Do this before creating
+				// the manager as well: a manager-construction error must not leave
+				// the backend's transport open until process teardown.
+				registerTieringColdBackendShutdown(shutdownCoordinator, coldBackend)
+
 				// Where nodes share data — one hot bucket (shared-storage
 				// mode), or per-node disks kept in step by file replication
 				// — only the primary writer among them moves and deletes
@@ -5153,6 +5159,14 @@ func registerClusterCoordinatorShutdown(coordinator *shutdown.Coordinator, stop 
 // tiering's SQLite handle, which this step closes when it owns it.
 func registerTieringShutdown(coordinator *shutdown.Coordinator, stop func() error) {
 	coordinator.Register("tiering", shutdownFunc(stop), shutdown.PriorityCompaction)
+}
+
+// registerTieringColdBackendShutdown closes the separately constructed cold
+// storage backend after tiering has stopped using it.
+func registerTieringColdBackendShutdown(coordinator *shutdown.Coordinator, backend storage.Backend) {
+	if backend != nil {
+		coordinator.Register("tiering-cold-storage", backend, shutdown.PriorityStorage)
+	}
 }
 
 // tieringManifestAdapter implements tiering.ManifestCoordinator over the
