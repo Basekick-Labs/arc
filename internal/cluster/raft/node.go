@@ -386,6 +386,45 @@ func (n *Node) LeaderID() string {
 	return string(id)
 }
 
+// LastContact returns when this node last heard from the Raft leader, as a
+// follower. Zero before the first contact. A leader does not update it; ask
+// IsLeader first.
+func (n *Node) LastContact() time.Time {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.raft == nil {
+		return time.Time{}
+	}
+	return n.raft.LastContact()
+}
+
+// VoterCount returns how many voters this node's locally known Raft
+// configuration holds; 0 when it cannot be read.
+func (n *Node) VoterCount() int {
+	n.mu.RLock()
+	ra := n.raft
+	n.mu.RUnlock()
+	if ra == nil {
+		return 0
+	}
+	future := ra.GetConfiguration()
+	if err := future.Error(); err != nil {
+		return 0
+	}
+	voters := 0
+	for _, srv := range future.Configuration().Servers {
+		if srv.Suffrage == raft.Voter {
+			voters++
+		}
+	}
+	return voters
+}
+
+// ElectionTimeout is the configured election timeout.
+func (n *Node) ElectionTimeout() time.Duration {
+	return n.cfg.ElectionTimeout
+}
+
 // State returns the current Raft state.
 func (n *Node) State() raft.RaftState {
 	n.mu.RLock()

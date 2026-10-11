@@ -283,6 +283,12 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 		}
 	}
 
+	// Refuse the whole import up front if writes are fenced (#1207).
+	if err := h.arrowBuffer.CheckIngestGate(); err != nil {
+		h.totalErrors.Add(1)
+		return respondIngestFenced(c, err)
+	}
+
 	// Feed each measurement into the ArrowBuffer ingest pipeline
 	var totalRows int64
 	importedMeasurements := make([]string, 0, len(columnarByMeasurement))
@@ -297,6 +303,9 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 			// already written the measurements it got through, so the import is
 			// partial either way — a retryable status at least tells the client
 			// to re-run it rather than treating it as a permanent failure.
+			if errors.Is(err, ingest.ErrIngestFenced) {
+				return respondIngestFenced(c, err)
+			}
 			if errors.Is(err, ingest.ErrBufferClosing) || errors.Is(err, ingest.ErrSchemaChurnExceeded) {
 				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 					"error": fmt.Sprintf("import rejected at measurement %q (retry): %v", measurement, err),
@@ -371,6 +380,9 @@ func (e *importError) Error() string {
 // importErrorResponse returns the appropriate HTTP error response for an import error
 func (h *ImportHandler) importErrorResponse(c *fiber.Ctx, err error) error {
 	if ie, ok := err.(*importError); ok {
+		if errors.Is(ie.Err, ingest.ErrIngestFenced) {
+			c.Set(fiber.HeaderRetryAfter, "5")
+		}
 		return c.Status(ie.StatusCode).JSON(fiber.Map{
 			"error": ie.Error(),
 		})
@@ -529,6 +541,9 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 			Str("database", database).
 			Str("measurement", measurement).
 			Msg("TLE import: failed to write to buffer")
+		if errors.Is(err, ingest.ErrIngestFenced) {
+			return respondIngestFenced(c, err)
+		}
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": fmt.Sprintf("failed to ingest measurement %q: %v", measurement, err),
 		})

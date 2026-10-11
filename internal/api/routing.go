@@ -298,6 +298,16 @@ func RespondAlreadyForwarded(c *fiber.Ctx) error {
 	})
 }
 
+// respondIngestFenced answers a write refused because this node may no longer
+// be the primary writer (#1207). 503 with Retry-After so clients retry, by
+// then against the primary; nothing was written, so the retry is safe.
+func respondIngestFenced(c *fiber.Ctx, err error) error {
+	c.Set(fiber.HeaderRetryAfter, "5")
+	return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+		"error": "Write rejected (not the available primary writer, retry): " + err.Error(),
+	})
+}
+
 // HandleRoutingError returns an appropriate error response for routing failures.
 func HandleRoutingError(c *fiber.Ctx, err error) error {
 	switch err {

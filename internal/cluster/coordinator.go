@@ -130,8 +130,12 @@ type Coordinator struct {
 	compactionPauseAckInFlight map[uint64]struct{}
 
 	// WAL Replication (Phase 3.3)
-	replicationSender   *replication.Sender   // Writer only: sends entries to readers
-	replicationReceiver *replication.Receiver // Reader only: receives entries from writer
+	replicationSender *replication.Sender // Writer only: sends entries to readers
+	// ingestFence refuses live writes on a writer that may no longer be the
+	// primary (#1207); nil where it does not apply.
+	ingestFence          atomic.Pointer[ingestFence]
+	ingestFenceListeners []func(fenced bool)
+	replicationReceiver  *replication.Receiver // Reader only: receives entries from writer
 	// replicationReceiverStopped is set by StopReplicationReceiver, which
 	// runs from a shutdown hook without cancelling ctx; the retarget loop
 	// checks it so it cannot start a fresh receiver into buffers that are
@@ -730,6 +734,8 @@ func (c *Coordinator) Start() error {
 			c.logger.Error().Err(err).Msg("Failed to start writer failover manager")
 		}
 	}
+	// Refuse writes on a writer that may no longer be the primary (#1207).
+	c.startIngestFenceLocked()
 
 	// Start compactor failover manager if configured (Phase 5)
 	if c.compactorFailoverMgr != nil {
@@ -2780,6 +2786,9 @@ func (c *Coordinator) MayAcceptIngest() bool {
 	// running the singleton work everywhere, and both were wrong.
 	if c.cfg.SharedStorageMode || node.Role == RoleStandalone || c.writerFailoverMgr == nil {
 		return true
+	}
+	if c.ingestFenced() {
+		return false
 	}
 	return node.IsPrimaryWriter()
 }

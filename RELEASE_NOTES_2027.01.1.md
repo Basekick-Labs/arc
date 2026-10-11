@@ -96,6 +96,57 @@ Nothing changes for a node with `tiered_storage.cold.enabled` off, or one whose
 cold backend failed to construct: the listing is skipped and migration runs as
 before.
 
+## Upgrade note: an isolated primary writer stops accepting writes ([#1207](https://github.com/Basekick-Labs/arc/issues/1207))
+
+This applies to Pattern 1 clusters (local storage) with more than one writer.
+
+A writer cut off from the cluster used to keep acknowledging writes. Ingest was
+never gated on being the primary; only `/ready/write` was. Meanwhile failover
+could promote another writer. The isolated writer's rows then reached the rest
+of the cluster only after the partition healed, or never if its disk failed
+first. A writer also accepted writes whenever they reached it while it was a
+standby, including after it had been replaced as primary.
+
+A writer now refuses writes with `503` and `Retry-After: 5` when:
+- **another writer is the designated primary.** That covers standby writers, and
+  a former primary after failover or a manual hand-over. It needs no failover
+  licence.
+- **it lost contact with the cluster.** It is not the Raft leader and has not
+  heard from the leader for longer than half of `cluster.health_check_interval`
+  × `cluster.unhealthy_threshold` (7.5 s by default, at least 3 s). This rule
+  needs automatic writer failover (`cluster.failover_enabled` and the
+  `writer_failover` licence feature), at least three writers, and Raft. Failover
+  takes longer to notice a lost primary: about 30 s at defaults.
+
+  Once contact returns, writes resume only after contact has held for 2 s and
+  the writer has caught up with the cluster log. That way a writer that was
+  replaced while it was away refuses writes instead of acting on its stale view.
+
+The refusal happens before anything is written, the WAL included, so a client
+retry is safe. A line-protocol or import request that spans several
+measurements is checked once up front. A fence closing in the middle of such a
+request can still leave its earlier measurements written.
+
+`/ready/write` reports not-ready while a writer refuses writes.
+`arc_cluster_ingest_fenced` is 1 while a writer has lost contact; a standby
+refusing writes is normal and does not set it.
+`arc_cluster_ingest_fenced_writes_total` counts refused writes.
+
+MQTT subscriptions on a writer that refuses writes are suspended: disconnected
+without unsubscribing. With `clean_session=false` the broker queues QoS 1 and 2
+messages until writes resume. With `clean_session=true`, or QoS 0, messages
+published meanwhile are lost. Because standby writers always refuse writes, run
+MQTT subscriptions on the primary. On a cluster node, MQTT subscriptions now
+start after the cluster coordinator.
+
+`cluster.ingest_fence_after_ms` overrides the contact delay. It is capped at
+`health_check_interval` × `unhealthy_threshold` and raised to three election
+timeouts. Size client retry buffers for the failover time. The contact rule
+watches Raft. A network failure that blocks only the Raft port, and not the
+cluster heartbeat port, fences the primary while failover sees it as healthy:
+writes stop until Raft connectivity returns. Edge-sync bundles received by a hub
+write directly to storage and are not fenced.
+
 ## Upgrade note: the live WAL replication stream is off ([#888](https://github.com/Basekick-Labs/arc/issues/888))
 
 This applies to clusters where readers or compactors run with both

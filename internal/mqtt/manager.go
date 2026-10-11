@@ -44,6 +44,32 @@ type SubscriptionManager struct {
 	// Running subscribers
 	mu          sync.RWMutex
 	subscribers map[string]*Subscriber
+	// fenced: this node refuses writes (#1207); subscribers stay disconnected
+	// so messages wait at the broker instead of being acknowledged and lost.
+	fenced bool
+}
+
+// SetIngestFenced suspends every subscription while this node's writes are
+// fenced and resumes them when writes are accepted again (#1207). Suspending
+// disconnects without unsubscribing, so with clean_session=false the broker
+// queues QoS 1 and 2 messages until the subscription resumes.
+func (m *SubscriptionManager) SetIngestFenced(fenced bool) {
+	m.mu.Lock()
+	m.fenced = fenced
+	subs := make([]*Subscriber, 0, len(m.subscribers))
+	for _, s := range m.subscribers {
+		if s != nil {
+			subs = append(subs, s)
+		}
+	}
+	m.mu.Unlock()
+	for _, s := range subs {
+		if fenced {
+			s.suspend()
+		} else {
+			s.resume()
+		}
+	}
 }
 
 // Ensure SubscriptionManager implements Manager and Shutdownable
@@ -538,7 +564,11 @@ func (m *SubscriptionManager) startSubscriber(sub *Subscription) error {
 		return ErrSubscriptionNotRunning
 	}
 	m.subscribers[sub.ID] = subscriber
+	fenced := m.fenced
 	m.mu.Unlock()
+	if fenced {
+		subscriber.suspend()
+	}
 
 	m.logger.Info().
 		Str("id", sub.ID).

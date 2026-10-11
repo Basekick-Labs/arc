@@ -162,7 +162,11 @@ type Metrics struct {
 	fileRegistrationOldestPending atomic.Int64 // unix nanos the oldest pending file was flushed; 0 when none
 	fileRegistrationsConfirmed    atomic.Int64 // files registered by the outbox
 	fileRegistrationJournalErrs   atomic.Int64 // registration journal write or fsync failures
-	walQuarantinedFiles           atomic.Int64 // WAL files isolated after repeated recovery failures
+
+	// Ingest fencing (#1207)
+	ingestFenced        atomic.Int64 // 1 while this writer refuses writes
+	ingestFencedWrites  atomic.Int64 // writes refused by the fence
+	walQuarantinedFiles atomic.Int64 // WAL files isolated after repeated recovery failures
 	// 1 while the last recovery pass left a file on disk for which at least one
 	// row range of a parent entry was handed off — the state an older binary
 	// would replay in full.
@@ -563,6 +567,18 @@ func (m *Metrics) SetFileRegistrationOldestPending(ns int64) {
 func (m *Metrics) SetFileRegistrationsConfirmed(n int64) { m.fileRegistrationsConfirmed.Store(n) }
 func (m *Metrics) IncFileRegistrationJournalErrors()     { m.fileRegistrationJournalErrs.Add(1) }
 
+// SetIngestFenced records whether ingest fencing refuses writes (#1207).
+func (m *Metrics) SetIngestFenced(fenced bool) {
+	if fenced {
+		m.ingestFenced.Store(1)
+	} else {
+		m.ingestFenced.Store(0)
+	}
+}
+
+// IncIngestFencedWrites counts a write refused by ingest fencing (#1207).
+func (m *Metrics) IncIngestFencedWrites() { m.ingestFencedWrites.Add(1) }
+
 func (m *Metrics) fileRegistrationOldestPendingSeconds() float64 {
 	ns := m.fileRegistrationOldestPending.Load()
 	if ns == 0 {
@@ -820,6 +836,8 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"file_registrations_pending":       m.fileRegistrationsPending.Load(),
 		"file_registrations_confirmed":     m.fileRegistrationsConfirmed.Load(),
 		"file_registration_journal_errors": m.fileRegistrationJournalErrs.Load(),
+		"ingest_fenced":                    m.ingestFenced.Load(),
+		"ingest_fenced_writes":             m.ingestFencedWrites.Load(),
 		"wal_quarantined_files":            m.walQuarantinedFiles.Load(),
 		"wal_partial_row_recovery_pending": m.walPartialRowRecovery.Load(),
 
@@ -1217,6 +1235,14 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_cluster_file_registrations_confirmed_total Flushed files the registration outbox confirmed in the cluster manifest\n"...)
 	b = append(b, "# TYPE arc_cluster_file_registrations_confirmed_total counter\n"...)
 	b = appendMetric(b, "arc_cluster_file_registrations_confirmed_total", float64(m.fileRegistrationsConfirmed.Load()))
+
+	b = append(b, "# HELP arc_cluster_ingest_fenced 1 while this writer refuses writes because it may no longer be the primary\n"...)
+	b = append(b, "# TYPE arc_cluster_ingest_fenced gauge\n"...)
+	b = appendMetric(b, "arc_cluster_ingest_fenced", float64(m.ingestFenced.Load()))
+
+	b = append(b, "# HELP arc_cluster_ingest_fenced_writes_total Writes refused by ingest fencing\n"...)
+	b = append(b, "# TYPE arc_cluster_ingest_fenced_writes_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_ingest_fenced_writes_total", float64(m.ingestFencedWrites.Load()))
 
 	b = append(b, "# HELP arc_cluster_file_registration_journal_errors_total File registration journal write or fsync failures\n"...)
 	b = append(b, "# TYPE arc_cluster_file_registration_journal_errors_total counter\n"...)

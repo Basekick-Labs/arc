@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -48,6 +49,7 @@ type Subscriber struct {
 	// full lock on every received message (#328).
 	messagesReceived   atomic.Int64
 	messagesFailed     atomic.Int64
+	suspended          atomic.Bool // disconnected while writes are fenced (#1207)
 	bytesReceived      atomic.Int64
 	reconnects         atomic.Int64
 	lastMessageAtNanos atomic.Int64
@@ -373,8 +375,21 @@ func (s *Subscriber) onMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 		return
 	}
 
-	// Decode and write message
-	if err := s.processMessage(msg.Topic(), msg.Payload(), database); err != nil {
+	// Decode and write message. While writes are fenced (#1207) the manager
+	// suspends this subscription, so the broker holds new messages. One that
+	// was already in flight when the fence closed waits briefly for it to lift;
+	// never long, since blocking this handler stalls the client and its
+	// keepalive.
+	err := s.processMessage(msg.Topic(), msg.Payload(), database)
+	for deadline := time.Now().Add(mqttFencedWait); err != nil && errors.Is(err, ingest.ErrIngestFenced) && time.Now().Before(deadline); {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-time.After(mqttFencedRetry):
+		}
+		err = s.processMessage(msg.Topic(), msg.Payload(), database)
+	}
+	if err != nil {
 		s.messagesFailed.Add(1)
 		metrics.Get().IncMQTTMessagesFailed()
 		s.logger.Error().
@@ -385,6 +400,45 @@ func (s *Subscriber) onMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 	} else {
 		metrics.Get().IncMQTTDecodeSuccess()
 	}
+}
+
+// mqttFencedRetry and mqttFencedWait bound how long a message refused by ingest
+// fencing is retried before it is counted failed: far below any keepalive.
+const (
+	mqttFencedRetry = 250 * time.Millisecond
+	mqttFencedWait  = 2 * time.Second
+)
+
+// suspend disconnects from the broker without unsubscribing while writes are
+// fenced (#1207); the session, and with clean_session=false its queued
+// messages, survives.
+func (s *Subscriber) suspend() {
+	s.mu.RLock()
+	running, client := s.running, s.client
+	s.mu.RUnlock()
+	if !running || client == nil || !s.suspended.CompareAndSwap(false, true) {
+		return
+	}
+	client.Disconnect(250)
+	metrics.Get().SetMQTTConnected(false)
+	s.logger.Warn().Msg("MQTT subscription suspended: writes are fenced on this node; messages wait at the broker")
+}
+
+// resume reconnects a suspended subscription; onConnect resubscribes.
+func (s *Subscriber) resume() {
+	s.mu.RLock()
+	running, client := s.running, s.client
+	s.mu.RUnlock()
+	if !running || client == nil || !s.suspended.CompareAndSwap(true, false) {
+		return
+	}
+	token := client.Connect()
+	if !token.WaitTimeout(time.Duration(s.config.ConnectTimeoutSeconds)*time.Second) || token.Error() != nil {
+		s.logger.Error().Err(token.Error()).Msg("MQTT subscription could not reconnect after writes resumed")
+		s.updateStatus(StatusError, "reconnect after ingest fence failed")
+		return
+	}
+	s.logger.Info().Msg("MQTT subscription resumed: writes are accepted again")
 }
 
 // processMessage decodes and writes an MQTT message to the ArrowBuffer
