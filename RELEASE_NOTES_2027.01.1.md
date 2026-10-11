@@ -228,6 +228,47 @@ wrote them.
 
 ## New features
 
+### Experimental: WAL coverage on cluster writers ([#1207](https://github.com/Basekick-Labs/arc/issues/1207))
+
+This is the first step toward letting a standby writer take over the rows a
+failed primary acknowledged but did not flush yet. It is off by default and
+changes nothing unless you set `cluster.wal_coverage = true`.
+
+On a Pattern 1 writer (local storage) with the WAL enabled, the setting:
+- **gives every ingest batch a coverage id.** The id is unique per writer
+  process and measurement, and assigned in commit order. It is written into the
+  batch's WAL entry and into the registration journal with every file the batch
+  is flushed into.
+- **keeps WAL entries until their files are registered.** Before, a WAL entry
+  could be purged once its file was flushed. Now it stays until the cluster
+  manifest has the file. During a manifest outage (lost Raft quorum, for
+  example) the WAL grows with the unregistered data, as the registration journal
+  already does. The hold applies to the running process; after a restart, WAL
+  recovery deletes files by the same rule as before.
+- **refuses a write before it reaches the WAL.** A write the buffer turns away
+  (schema churn, a shard closing during shutdown, a cancelled request) no
+  longer leaves an entry in the WAL that a later recovery would replay.
+
+New metrics:
+- `arc_wal_registered_floor_lag`: batches committed but not yet in a registered
+  file. It returns to 0 when every flushed file is registered; a lost batch
+  (below) stays in it until the process restarts.
+- `arc_wal_coverage_lost_total`: batches whose file settled without being
+  registered (the file was gone or rewritten before registration), or whose
+  flush failed with no complete WAL copy. Those rows are in no registered file.
+  Alert on any increase.
+
+**Rollback warning.** WAL entries written with the setting on use a new format.
+This release reads it, but older releases cannot: they quarantine those entries
+and lose any rows that were not flushed yet. Before rolling a node back to an
+older release, either turn the setting off and restart once, or stop the node
+cleanly so it flushes and purges its WAL. A registration journal written with the
+setting on loads in older releases; they ignore the coverage.
+
+Writes with the setting on cost about 25% more per request when every request
+is a single row to one measurement. With batches of a few hundred rows the
+difference is within measurement noise.
+
 ### Compaction cycles can be looked up by id ([#1162](https://github.com/Basekick-Labs/arc/issues/1162))
 
 `POST /api/v1/compaction/trigger` answers with a `cycle_id`. Until now that id

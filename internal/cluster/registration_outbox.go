@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster/raft"
+	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
@@ -145,6 +146,9 @@ type outboxEntry struct {
 	// inManifest: settled because the manifest has it (registered by this
 	// outbox, or found there already), as opposed to skipped.
 	inManifest bool
+	// vanished: registered, then found gone from storage and taken back out
+	// of the manifest. Its rows are in no registered file.
+	vanished bool
 }
 
 // journalRecord is one journal line. ClusterName pins it to the cluster: a data
@@ -169,7 +173,18 @@ type journalRecord struct {
 	// same batch that registers this file, in case an apply that reported
 	// failure had committed it after all.
 	Supersedes string `json:"supersedes,omitempty"`
+	// Cov is the coverage of the flush group the file belongs to (#1207),
+	// on a coverage-enabled writer; a record carrying it is version 2. Every
+	// file of a group carries the whole group's coverage. Readers before
+	// #1207 ignore the field.
+	Cov *ingest.GroupCoverage `json:"cov,omitempty"`
 }
+
+const journalRecordVersionCoverage = 2
+
+// maxJournalLine bounds one journal line. Far above any real record: a
+// group's coverage folds whole batches into ranges.
+const maxJournalLine = 64 << 20
 
 // Tunables, variables so tests can shrink them.
 var (
@@ -283,11 +298,26 @@ func readJournal(path, clusterName string) ([]journalRecord, int, error) {
 	var adds []journalRecord
 	index := make(map[string]int)
 	foreign := 0
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 64<<10), 1<<20)
-	for sc.Scan() {
+	// Not a bufio.Scanner: its token limit fails the whole read on one long
+	// line, and a failed read makes the node fall back to the registrar that
+	// keeps nothing across restarts. A line over maxJournalLine is skipped
+	// like any other line that does not parse.
+	br := bufio.NewReaderSize(f, 64<<10)
+	var readErr error
+	for {
+		line, err := readJournalLine(br)
+		if err != nil && err != io.EOF {
+			readErr = err
+			break
+		}
+		if len(line) == 0 && err == io.EOF {
+			break
+		}
 		var rec journalRecord
-		if err := json.Unmarshal(sc.Bytes(), &rec); err != nil || rec.Path == "" {
+		if line == nil || json.Unmarshal(line, &rec) != nil || rec.Path == "" {
+			if err == io.EOF {
+				break
+			}
 			continue
 		}
 		if rec.ClusterName != clusterName {
@@ -308,11 +338,14 @@ func readJournal(path, clusterName string) ([]journalRecord, int, error) {
 				delete(index, rec.Path)
 			}
 		}
+		if err == io.EOF {
+			break
+		}
 	}
-	if err := sc.Err(); err != nil {
+	if readErr != nil {
 		// Unreadable past this point: refuse rather than rewrite a partial
 		// set over the journal on load.
-		return nil, 0, fmt.Errorf("read journal: %w", err)
+		return nil, 0, fmt.Errorf("read journal: %w", readErr)
 	}
 	out := adds[:0]
 	for _, rec := range adds {
@@ -323,19 +356,61 @@ func readJournal(path, clusterName string) ([]journalRecord, int, error) {
 	return out, foreign, nil
 }
 
+// readJournalLine reads one line. A line longer than maxJournalLine is
+// consumed without being held in memory and comes back as a nil line with a
+// nil error (or io.EOF at the end), for the caller to skip.
+func readJournalLine(br *bufio.Reader) ([]byte, error) {
+	var line []byte
+	over := false
+	for {
+		chunk, err := br.ReadSlice('\n')
+		if !over {
+			if len(line)+len(chunk) > maxJournalLine {
+				over, line = true, nil
+			} else {
+				line = append(line, chunk...)
+			}
+		}
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		if over {
+			if err == io.EOF {
+				return nil, io.EOF
+			}
+			return nil, err
+		}
+		if line == nil {
+			line = []byte{}
+		}
+		return line, err
+	}
+}
+
 // RegisterFile implements ingest.FileRegistrar. It appends without fsyncing;
 // SyncRegistrations makes the append durable.
 func (r *RegistrationOutbox) RegisterFile(database, measurement, path string, partitionTime time.Time, sizeBytes int64, sha256 string) {
+	r.RegisterCoveredFile(database, measurement, path, partitionTime, sizeBytes, sha256, nil)
+}
+
+// RegisterCoveredFile implements ingest.CoverageFileRegistrar: RegisterFile
+// with the coverage of the file's flush group (#1207), journaled with the
+// record. The file's outcome is reported through cov.Settle.
+func (r *RegistrationOutbox) RegisterCoveredFile(database, measurement, path string, partitionTime time.Time, sizeBytes int64, sha256 string, cov *ingest.GroupCoverage) {
 	rec := journalRecord{
 		Version: journalRecordVersion, Op: journalOpAdd, ClusterName: r.clusterName,
 		Database: database, Measurement: measurement, Path: path,
 		PartitionTime: partitionTime, SizeBytes: sizeBytes, SHA256: sha256,
-		FlushedAt: time.Now().UTC(),
+		FlushedAt: time.Now().UTC(), Cov: cov,
+	}
+	if cov != nil {
+		rec.Version = journalRecordVersionCoverage
 	}
 	r.mu.Lock()
 	switch r.state {
 	case outboxAbandoned:
 		r.mu.Unlock()
+		cov.Settle(path, ingest.CoverageAbandoned)
 		if n := r.dropped.Add(1); n&(n-1) == 0 {
 			r.logger.Warn().Str("path", path).Int64("total_dropped", n).
 				Msg("Cluster manifest unavailable in this start; file not announced to it")
@@ -363,9 +438,13 @@ func (r *RegistrationOutbox) RegisterFile(database, measurement, path string, pa
 func (r *RegistrationOutbox) enqueueLocked(rec journalRecord, added time.Time, fresh bool) {
 	if e, ok := r.byPath[rec.Path]; ok && !e.done {
 		// A second flush to one path is not expected. Keep the latest record
-		// as a new entry, without touching one attempt may be reading.
+		// as a new entry, without touching one attempt may be reading. The
+		// earlier file's rows were overwritten: report them lost.
 		e.done = true
 		r.live--
+		if e.rec.Cov != nil && e.rec.Cov != rec.Cov {
+			go e.rec.Cov.Settle(e.rec.Path, ingest.CoverageLost)
+		}
 	}
 	e := &outboxEntry{rec: rec, added: added, fresh: fresh}
 	r.byPath[rec.Path] = e
@@ -555,16 +634,24 @@ func (r *RegistrationOutbox) IsPending(path string) bool {
 // Abandon is for a start whose cluster coordinator never came up. From here
 // RegisterFile drops instead of journaling, so a node running without its
 // cluster does not grow the journal without bound. The journal keeps what was
-// already pending for the next start.
-func (r *RegistrationOutbox) Abandon() {
+// already pending for the next start. Reports whether this call abandoned it:
+// false after a hand-off, when the drain is running.
+func (r *RegistrationOutbox) Abandon() bool {
 	r.syncMu.Lock()
 	defer r.syncMu.Unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.state != outboxCollecting {
-		return
+		return false
 	}
 	r.state = outboxAbandoned
+	// Nothing in this process will register these files. Their groups stop
+	// holding WAL entries; the journal still carries them for the next start.
+	for _, e := range r.byPath {
+		if !e.done && e.rec.Cov != nil {
+			go e.rec.Cov.Settle(e.rec.Path, ingest.CoverageAbandoned)
+		}
+	}
 	if r.journal != nil {
 		if err := fsyncFile(r.journal); err == nil {
 			r.synced = r.written
@@ -574,6 +661,7 @@ func (r *RegistrationOutbox) Abandon() {
 	}
 	r.logger.Warn().Int("pending", r.live).Str("journal", r.journalPath).
 		Msg("Cluster manifest unavailable in this start; pending file registrations stay in the journal for the next start")
+	return true
 }
 
 // HandOff starts the drain that registers pending files through manifest
@@ -834,6 +922,9 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 			after, errs := r.statAll(context.Background(), store, recheck)
 			for _, e := range recheck {
 				if errs[e] == nil && after[e] < 0 {
+					r.mu.Lock()
+					e.vanished = true
+					r.mu.Unlock()
 					dctx, cancel := context.WithTimeout(context.Background(), outboxAttemptTimeout)
 					if err := manifest.DeleteFileFromManifest(dctx, e.rec.Path, "vanished-before-registration"); err != nil {
 						r.logger.Warn().Err(err).Str("path", e.rec.Path).
@@ -888,6 +979,8 @@ func (r *RegistrationOutbox) ReplacePending(ctx context.Context, oldPath, newPat
 	rec.Path, rec.SizeBytes, rec.SHA256 = newPath, sizeBytes, sha256
 	rec.Supersedes = oldPath
 	added := e.added // keep the backlog age honest
+	// The rewrite carries the group's coverage (rec.Cov) and settles for it;
+	// the old path does not settle at all.
 	r.withdrawLocked(e)
 	r.enqueueLocked(rec, added, true)
 	r.appendLocked(rec)
@@ -918,10 +1011,13 @@ func (r *RegistrationOutbox) Withdraw(ctx context.Context, path string) (withdra
 	}
 	r.withdrawLocked(e)
 	r.advanceHeadLocked()
+	cov := e.rec.Cov
 	r.mu.Unlock()
 	if err := r.SyncRegistrations(); err != nil {
 		r.logger.Warn().Err(err).Str("path", path).Msg("Failed to persist a withdrawn file registration")
 	}
+	// The rows are gone on purpose (a DELETE): they settle.
+	cov.Settle(path, ingest.CoverageWithdrawn)
 	r.publishMetrics()
 	return true, ReplaceSwapped, nil
 }
@@ -1063,10 +1159,23 @@ func (r *RegistrationOutbox) requeue(entries []*outboxEntry) {
 // has since taken out of the manifest on purpose. Compacts the journal when it
 // has grown well past what is pending.
 func (r *RegistrationOutbox) ack(entries []*outboxEntry) {
+	type settlement struct {
+		cov     *ingest.GroupCoverage
+		path    string
+		outcome ingest.CoverageOutcome
+	}
+	var settle []settlement
 	r.mu.Lock()
 	for _, e := range entries {
 		if e.done {
 			continue
+		}
+		if e.rec.Cov != nil {
+			outcome := ingest.CoverageLost
+			if e.inManifest && !e.vanished {
+				outcome = ingest.CoverageRegistered
+			}
+			settle = append(settle, settlement{e.rec.Cov, e.rec.Path, outcome})
 		}
 		e.done = true
 		r.live--
@@ -1093,6 +1202,11 @@ func (r *RegistrationOutbox) ack(entries []*outboxEntry) {
 	r.mu.Unlock()
 	if err := r.SyncRegistrations(); err != nil {
 		r.logger.Warn().Err(err).Msg("Failed to persist file registration acknowledgements")
+	}
+	// After the ack is durable, and outside r.mu: a group that finishes
+	// releases its WAL entries, and nothing below may call back in here.
+	for _, st := range settle {
+		st.cov.Settle(st.path, st.outcome)
 	}
 	r.compact()
 	r.publishMetrics()

@@ -424,10 +424,16 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 				r.logger.Debug().Str("payload_hash", entry.PayloadHash).Msg("Skipping WAL entry covered by flush checkpoint")
 				continue
 			}
+			// A covered entry (#1207) carries its batch coverage to the buffer
+			// so the replayed rows register under their original coverage id.
+			entryCtx := ctx
+			if entry.Coverage != nil {
+				entryCtx = WithReplayCoverage(ctx, ReplayCoverage{Coverage: *entry.Coverage, RowTotal: len(entry.Records)})
+			}
 			// Dispatch based on entry format
 			if entry.ColumnarData != nil && opts.ColumnarCallback != nil {
 				// Columnar entry from zero-copy AppendRaw path
-				if err := opts.ColumnarCallback(ctx, entry.ColumnarData.Database, entry.ColumnarData.Measurement, entry.ColumnarData.Columns, entry.PayloadHash); err != nil {
+				if err := opts.ColumnarCallback(entryCtx, entry.ColumnarData.Database, entry.ColumnarData.Measurement, entry.ColumnarData.Columns, entry.PayloadHash); err != nil {
 					// #590: continue with the remaining entries instead of
 					// abandoning the rest of the file — one poisoned entry
 					// (e.g. a payload the write path rejects) must not
@@ -507,7 +513,7 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 									identity = recoveryRowIdentity(identity, start, end)
 								}
 							}
-							if err := opts.TrackedRowCallback(ctx, entry.Records[start:end], identity); err != nil {
+							if err := opts.TrackedRowCallback(entryCtx, entry.Records[start:end], identity); err != nil {
 								r.logger.Error().Err(err).Msg("Failed to replay tracked WAL row batch")
 								allEntriesSucceeded = false
 								break
