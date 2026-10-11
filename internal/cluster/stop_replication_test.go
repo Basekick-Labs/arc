@@ -1,5 +1,9 @@
 package cluster
 
+// Dormant code (#888): nothing in production reaches the receiver wiring these
+// tests drive, because StartReplication starts no stream. It is kept for the
+// standby-writer stream (#1207), which must not reuse buildReplicationIngestHandler.
+
 // Stopping replication must not deadlock on the coordinator lock, must not
 // leave the WAL hook pointing at a stopped sender, and must not let shutdown
 // wait on a receiver whose connect path ignores the context (#853).

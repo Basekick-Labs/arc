@@ -755,8 +755,9 @@ type ClusterConfig struct {
 	RouteTimeout int // Timeout for forwarded requests in milliseconds (default: 5000)
 	RouteRetries int // Number of retries for failed forwards (default: 3)
 
-	// WAL Replication configuration (Phase 3.3)
-	ReplicationEnabled     bool // Enable WAL replication to readers (default: false)
+	// Replication configuration (Phase 3.3). ReplicationEnabled starts peer file
+	// replication; the live WAL replication stream is not started (#888, #1207).
+	ReplicationEnabled     bool // Enable peer file replication (default: false)
 	ReplicationLagLimit    int  // Max acceptable lag in milliseconds before health degrades (default: 5000)
 	ReplicationBufferSize  int  // Entry buffer size for replication queue (default: 10000)
 	ReplicationAckInterval int  // How often readers send acks in milliseconds (default: 100)

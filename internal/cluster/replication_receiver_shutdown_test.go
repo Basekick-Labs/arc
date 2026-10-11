@@ -1,5 +1,9 @@
 package cluster
 
+// Dormant code (#888): nothing in production reaches the receiver wiring these
+// tests drive, because StartReplication starts no stream. It is kept for the
+// standby-writer stream (#1207), which must not reuse buildReplicationIngestHandler.
+
 import (
 	"context"
 	"testing"
