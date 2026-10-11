@@ -923,7 +923,9 @@ func collectWALHashes(records []interface{}) []string {
 
 // FileRegistrar announces a newly written Parquet file to the cluster-wide
 // manifest. Implementations should be non-blocking — file registration is
-// fire-and-forget from the flush path's perspective. Wired by the cluster
+// fire-and-forget from the flush path's perspective. The one exception is the
+// cluster early registrar before its hand-off, which fsyncs a journal entry
+// so a file flushed during startup survives a crash (#1206). Wired by the cluster
 // coordinator when peer replication is enabled (Enterprise feature).
 //
 // sha256 is a hex-encoded content checksum of the Parquet file bytes.
@@ -931,6 +933,10 @@ func collectWALHashes(records []interface{}) []string {
 type FileRegistrar interface {
 	RegisterFile(database, measurement, path string, partitionTime time.Time, sizeBytes int64, sha256 string)
 }
+
+// fileRegistrarRef boxes a FileRegistrar for atomic.Pointer, which needs one
+// concrete type.
+type fileRegistrarRef struct{ FileRegistrar }
 
 // ArrowBuffer manages buffering and periodic flushing of Arrow data
 // Uses lock sharding to reduce contention across concurrent writes
@@ -952,8 +958,9 @@ type ArrowBuffer struct {
 
 	// Optional file registrar for cluster-wide file manifest (Enterprise peer replication)
 	// Set by cmd/arc/main.go when clustering + peer replication is enabled.
-	// Called asynchronously after each flush — never blocks the flush path.
-	fileRegistrar FileRegistrar
+	// Called after each flush. Atomic because it is set while flush workers
+	// already run (#1206).
+	fileRegistrar atomic.Pointer[fileRegistrarRef]
 
 	// OPTIMIZATION: Shard buffers to reduce lock contention
 	// Configurable via ingest.shard_count (default 32)
@@ -1636,7 +1643,7 @@ func (b *ArrowBuffer) SetTieringManager(tm *tiering.Manager) {
 // asynchronously (non-blocking) — used by peer replication to discover files
 // that need to be pulled from other nodes.
 func (b *ArrowBuffer) SetFileRegistrar(fr FileRegistrar) {
-	b.fileRegistrar = fr
+	b.fileRegistrar.Store(&fileRegistrarRef{fr})
 	b.logger.Info().Msg("File registrar enabled for ArrowBuffer - files will be announced to cluster manifest")
 }
 
@@ -1675,8 +1682,8 @@ func (b *ArrowBuffer) registerFileInTiering(ctx context.Context, database, measu
 	// Announce to cluster-wide file manifest (peer replication).
 	// The registrar implementation MUST be non-blocking — it's called on
 	// the hot flush path.
-	if b.fileRegistrar != nil {
-		b.fileRegistrar.RegisterFile(database, measurement, storagePath, partitionTime, sizeBytes, sha256Hex)
+	if ref := b.fileRegistrar.Load(); ref != nil && ref.FileRegistrar != nil {
+		ref.RegisterFile(database, measurement, storagePath, partitionTime, sizeBytes, sha256Hex)
 	}
 }
 

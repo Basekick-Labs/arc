@@ -1034,6 +1034,14 @@ func main() {
 	if walWriter != nil {
 		arrowBuffer.SetWAL(walWriter)
 	}
+	// Announce files flushed before the cluster coordinator is up (#1206):
+	// startup WAL recovery below, MQTT ingest, and anything else that flushes
+	// while the coordinator starts. Must be set before recovery runs. Handed
+	// off to the live registrar inside the cluster block.
+	earlyRegistrar := newEarlyFileRegistrar(cfg, licenseHasClustering(licenseClient), logger.Get("file-registrar"))
+	if earlyRegistrar != nil {
+		arrowBuffer.SetFileRegistrar(earlyRegistrar)
+	}
 	// Bound ArrowBuffer.Close, which now WAITS for flushes in progress instead
 	// of cancelling them (#1007).
 	//
@@ -2193,7 +2201,18 @@ func main() {
 						// registerFileRegistrarShutdown pin the two ends.
 						fileRegistrar := cluster.NewCoordinatorFileRegistrar(clusterCoordinator, logger.Get("file-registrar"))
 						fileRegistrar.Start(context.Background())
-						arrowBuffer.SetFileRegistrar(fileRegistrar)
+						// HasRaft always holds when earlyRegistrar exists (it
+						// needs raft_data_dir); checked so the hand-off can never
+						// reach a manifest that accepts writes as no-ops.
+						if earlyRegistrar != nil && clusterCoordinator.HasRaft() {
+							// The early registrar stays on the buffer and forwards
+							// to the live one from here, while it registers what
+							// was flushed before this point (#1206).
+							earlyRegistrar.HandOff(clusterCoordinator, storageBackend, fileRegistrar, clusterCoordinator.LocalNodeID())
+							registerEarlyFileRegistrarShutdown(shutdownCoordinator, earlyRegistrar.Stop)
+						} else {
+							arrowBuffer.SetFileRegistrar(fileRegistrar)
+						}
 						registerFileRegistrarShutdown(shutdownCoordinator, fileRegistrar.Stop)
 						log.Info().Msg("Cluster file manifest registrar enabled")
 
@@ -2283,6 +2302,13 @@ func main() {
 				}
 			}
 		}
+	}
+
+	// A cluster block that exited without a coordinator never handed off: stop
+	// journaling, keep what is pending for the next start (#1206). A no-op
+	// after a hand-off.
+	if earlyRegistrar != nil {
+		earlyRegistrar.Abandon()
 	}
 
 	// Phase A: fallback bootstrap. If we deferred the initial-token
@@ -5125,6 +5151,47 @@ func runCompactSubcommand(args []string) {
 type shutdownFunc func() error
 
 func (f shutdownFunc) Close() error { return f() }
+
+// licenseHasClustering mirrors the cluster block's licence gate.
+func licenseHasClustering(lc *license.Client) bool {
+	if lc == nil {
+		return false
+	}
+	lic := lc.GetLicense()
+	return lic != nil && lic.HasFeature(license.FeatureClustering)
+}
+
+// The early registrar's drain registers files flushed before the cluster was
+// up. It must stop before the cluster coordinator stops Raft; what it has not
+// confirmed stays in its journal for the next start (#1206). After the live
+// registrar, so its stop budget does not delay that drain of the final flush.
+func registerEarlyFileRegistrarShutdown(coordinator *shutdown.Coordinator, stop func()) {
+	coordinator.Register("early-file-registrar", shutdownFunc(func() error {
+		stop()
+		return nil
+	}), shutdown.PriorityBuffer+2)
+}
+
+// newEarlyFileRegistrar builds the registrar that holds file registrations
+// until the cluster coordinator is up (#1206), or returns nil where nothing
+// would ever hand it off: no cluster, no clustering licence, or no Raft
+// manifest. Also nil on a role that cannot ingest: a reader or compactor WAL
+// holds only entries received from a writer before #888, and announcing their
+// flushes would spread duplicate rows to every node.
+func newEarlyFileRegistrar(cfg *config.Config, clusteringLicensed bool, logger zerolog.Logger) *cluster.EarlyFileRegistrar {
+	if !cfg.Cluster.Enabled || cfg.Cluster.RaftDataDir == "" || !clusteringLicensed {
+		return nil
+	}
+	if !cluster.ParseRole(cfg.Cluster.Role).GetCapabilities().CanIngest {
+		return nil
+	}
+	r, err := cluster.NewEarlyFileRegistrar(cfg.Cluster.RaftDataDir, cfg.Cluster.ClusterName, logger)
+	if err != nil {
+		logger.Error().Err(err).Msg("Failed to open the pending file registration journal; files flushed before the cluster is up are not announced")
+		return nil
+	}
+	return r
+}
 
 // The registrar must stop after ArrowBuffer finishes its final writes
 // (PriorityBuffer), but before WAL cleanup and the cluster coordinator stop.
