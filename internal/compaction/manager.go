@@ -331,6 +331,11 @@ type Manager struct {
 	// AND from manifest crash-recovery — so the edge sync ledger can mark
 	// it as already-delivered content that must never sync (issue #610).
 	onCompactedOutput func(storageKey string)
+	// isPending reports a file this node flushed that the cluster manifest
+	// has not confirmed yet (#1212). Compacting one races its registration:
+	// the drain can register a source after compaction dropped it, leaving an
+	// entry for a file about to be deleted. Such files wait a cycle.
+	isPending func(path string) bool
 
 	// Nil in production. Deterministic cycle tests may inject a batch
 	// runner without starting an external compaction subprocess.
@@ -633,6 +638,54 @@ func (m *Manager) SetOnCompactedOutput(fn func(storageKey string)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.onCompactedOutput = fn
+}
+
+// SetPendingFilter keeps files still pending cluster registration out of
+// compaction candidates (#1212). Safe to call concurrently with a cycle.
+func (m *Manager) SetPendingFilter(fn func(path string) bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.isPending = fn
+}
+
+// dropPending removes objects still pending cluster registration.
+func (m *Manager) dropPending(objects []string) []string {
+	m.mu.Lock()
+	isPending := m.isPending
+	m.mu.Unlock()
+	if isPending == nil {
+		return objects
+	}
+	kept := objects[:0:0]
+	for _, o := range objects {
+		if !isPending(o) {
+			kept = append(kept, o)
+		}
+	}
+	return kept
+}
+
+// filterPending drops candidate files still pending cluster registration and
+// re-applies the tier's MinFiles to what remains (#1212). Compacting a pending
+// file races its registration: the drain can register a source after
+// compaction dropped it from the manifest, leaving an entry for a file about
+// to be deleted.
+func (m *Manager) filterPending(candidate Candidate, tier Tier) (Candidate, bool) {
+	kept := m.dropPending(candidate.Files)
+	if len(kept) == len(candidate.Files) {
+		return candidate, true
+	}
+	m.logger.Info().
+		Str("partition", candidate.PartitionPath).
+		Str("tier", candidate.Tier).
+		Int("pending", len(candidate.Files)-len(kept)).
+		Msg("Files pending cluster registration wait for the next compaction cycle")
+	if len(kept) < tier.GetMinFiles() {
+		return candidate, false
+	}
+	candidate.Files = kept
+	candidate.FileCount = len(kept)
+	return candidate, true
 }
 
 // filterSyncEligibility drops candidate files the edge sync ledger has not
@@ -963,6 +1016,7 @@ func (m *Manager) FindCandidates(ctx context.Context) ([]Candidate, error) {
 					Msg("Failed to list measurement objects")
 				continue
 			}
+			objects = m.dropPending(objects)
 			for _, tier := range tiers {
 				candidates = append(candidates, tier.FindCandidatesFromListing(database, meas, objects)...)
 			}
@@ -1868,6 +1922,13 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 						m.logger.Debug().
 							Str("partition", candidate.PartitionPath).
 							Msg("Skipping candidate: all files are tracked by manifests")
+						continue
+					}
+
+					// Files still pending cluster registration wait a cycle
+					// (#1212); the tier's MinFiles is re-checked on the rest.
+					filteredCandidate, shouldProcess = m.filterPending(filteredCandidate, tier)
+					if !shouldProcess {
 						continue
 					}
 

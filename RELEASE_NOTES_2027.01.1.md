@@ -841,12 +841,28 @@ delete the journal by hand while it holds records. Records in it are tied to
 them with a warning. Readers and compactors do not keep one: nothing they flush
 should be announced.
 
-Two limits. A row DELETE that rewrites a file before it is registered leaves the
-rewritten file unannounced
-([#1210](https://github.com/Basekick-Labs/arc/issues/1210)). In steady state that
-window is the time a registration takes; while the manifest is unreachable, it
-lasts the whole outage. And files already left unregistered by earlier versions
-are not picked up retroactively.
+Files still waiting for registration are also protected from the paths that
+treat "not in the manifest" as safe to act on
+([#1210](https://github.com/Basekick-Labs/arc/issues/1210),
+[#1212](https://github.com/Basekick-Labs/arc/issues/1212)):
+
+- A row DELETE that rewrites such a file announces the rewrite in its place,
+  and one that removes every row of it withdraws it. Before, the rows that
+  survived a DELETE could stay on that writer only.
+- Compaction leaves such files out of a cycle until they are registered, so it
+  cannot race their registration and leave a manifest entry for a file it is
+  about to delete. A partition left below the tier's minimum file count waits
+  for the next cycle.
+- The reconciliation orphan-storage sweep skips them, and files confirmed in
+  the last minute, and reports how many in the run's `skipped_pending`. Before,
+  a backlog older than the grace window was deleted as orphans.
+
+These checks see only the node's own pending files, so they protect a writer
+from its own DELETEs, compaction and reconciliation. With shared storage they do
+not cover another node acting on a writer's pending files: a DELETE run by the
+leader writer, or compaction and reconciliation on the active compactor
+([#1214](https://github.com/Basekick-Labs/arc/issues/1214)). Files already left
+unregistered by earlier versions are not picked up retroactively.
 
 ### Delete API removes the inactive SQL Server prefix scan ([#1077](https://github.com/Basekick-Labs/arc/issues/1077))
 
