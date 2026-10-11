@@ -389,7 +389,24 @@ func (r *CoordinatorFileRegistrar) process(parent context.Context, reg fileRegis
 	// which waits for the entry in flight — would inherit all of them.
 	ctx, cancel := context.WithTimeout(parent, forwardApplyTimeout)
 	defer cancel()
-	if err := r.coordinator.RegisterFileInManifest(ctx, r.entry(reg)); err != nil {
+	entry := r.entry(reg)
+	err := r.coordinator.RegisterFileInManifest(ctx, entry)
+	// No leader yet, or its address not in the registry: an election, which
+	// on a rolling restart overlaps the first flushes. Retried within the same
+	// deadline, as the shutdown drain does; a single attempt dropped the file.
+	for err != nil && isTransientLeaderError(err) && ctx.Err() == nil {
+		timer := time.NewTimer(registrarDrainRetryDelay)
+		select {
+		case <-ctx.Done():
+		case <-timer.C:
+		}
+		timer.Stop()
+		if ctx.Err() != nil {
+			break
+		}
+		err = r.coordinator.RegisterFileInManifest(ctx, entry)
+	}
+	if err != nil {
 		failed := r.totalApplyErrs.Add(1)
 		// A file on this disk that peers will never hear about, and
 		// nothing re-registers it. Same power-of-2 rate limit as the

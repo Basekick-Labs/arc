@@ -797,6 +797,41 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Rows a cluster writer recovers from its WAL after a crash reach every node ([#1206](https://github.com/Basekick-Labs/arc/issues/1206))
+
+When a cluster writer restarted after a crash, startup WAL recovery wrote the
+rows it had not flushed to Parquet and then deleted the WAL files. Those files
+were never announced to the cluster manifest, because the manifest registrar
+was attached to the ingest buffer only after the cluster coordinator had
+started. Only the writer that wrote them could query those rows: readers and
+the other writers never pulled them. With `reconciliation.enabled`, the
+orphan-storage sweep could delete them after the grace window, and on a writer
+they were the only copy. The same applied to anything else flushed before the
+registrar was attached, such as MQTT ingest, which starts first. With auth
+enabled that window includes waiting up to 30 s for a leader.
+
+A node that ingests (a `writer`, or `standalone` with `cluster.enabled`) now
+announces those files once the cluster is up. Until then it keeps them in
+`pending-registrations.jsonl` in `cluster.raft_data_dir`, written before
+recovery deletes the WAL, so a node killed again during startup still announces
+them on its next start. It checks each file in storage right before registering
+it and skips any that is gone or has changed size, and it keeps retrying until
+a leader accepts them. Readers and compactors do not do this: their WAL holds
+nothing they should announce. The journal disappears once everything in it is
+registered; do not delete it by hand while it exists. Records in it are tied to
+`cluster.cluster_name`, and a node started under a different cluster name drops
+them with a warning.
+
+Two limits. A row DELETE that rewrites such a file before it is registered,
+which needs a leader outage during startup since the HTTP API starts after the
+hand-off, leaves the rewritten file unannounced
+([#1210](https://github.com/Basekick-Labs/arc/issues/1210)). And files already left
+unregistered by earlier versions are not picked up retroactively.
+
+The live registrar also retries a registration that fails only because no
+leader is known yet, within its existing per-file deadline, instead of dropping
+the file.
+
 ### Delete API removes the inactive SQL Server prefix scan ([#1077](https://github.com/Basekick-Labs/arc/issues/1077))
 
 The WHERE validator no longer lists or checks `xp_` and `sp_`. The lowercase
