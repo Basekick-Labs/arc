@@ -335,7 +335,8 @@ type Manager struct {
 	// has not confirmed yet (#1212). Compacting one races its registration:
 	// the drain can register a source after compaction dropped it, leaving an
 	// entry for a file about to be deleted. Such files wait a cycle.
-	isPending func(path string) bool
+	isPending              func(path string) bool
+	syncManifestForPending func(context.Context) error
 
 	// Nil in production. Deterministic cycle tests may inject a batch
 	// runner without starting an external compaction subprocess.
@@ -646,6 +647,14 @@ func (m *Manager) SetPendingFilter(fn func(path string) bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.isPending = fn
+}
+
+// SetPendingManifestSync installs the Raft catch-up barrier used before a
+// cycle relies on the cluster-wide pending-registration filter.
+func (m *Manager) SetPendingManifestSync(fn func(context.Context) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.syncManifestForPending = fn
 }
 
 // dropPending removes objects still pending cluster registration.
@@ -1695,6 +1704,14 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 			Int64("discovery_errors", outcome.DiscoveryErrors).
 			Msg("Compaction cycle finished")
 	}()
+	m.mu.Lock()
+	syncPending := m.syncManifestForPending
+	m.mu.Unlock()
+	if syncPending != nil {
+		if err := syncPending(ctx); err != nil {
+			return fmt.Errorf("sync manifest before pending-registration check: %w", err)
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}

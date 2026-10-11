@@ -39,6 +39,13 @@ func (r *syncingRegistrar) SyncRegistrations() error {
 	return nil
 }
 
+type publishingRegistrar struct{ *syncingRegistrar }
+
+func (r *publishingRegistrar) PublishPendingRegistrations() error {
+	r.log.add("publish")
+	return nil
+}
+
 type orderedWAL struct {
 	checkpointRecordingWAL
 	log *orderLog
@@ -103,7 +110,8 @@ func TestSyncFlushSyncsRegistrationsBeforeTheWALCheckpoint(t *testing.T) {
 	checkRegistrationsSyncedBeforeCheckpoint(t, log.snapshot())
 }
 
-// Without a WAL nothing is ordered by the sync, so a flush pays no fsync.
+// A generic registrar pays no sync without a WAL; the cluster outbox has a
+// separate publish hook because shared-storage maintenance needs its intent.
 func TestFlushWithoutAWALDoesNotSyncRegistrations(t *testing.T) {
 	buffer, _ := newCheckpointBuffer(1000)
 	buffer.wal = nil
@@ -119,5 +127,22 @@ func TestFlushWithoutAWALDoesNotSyncRegistrations(t *testing.T) {
 		if e == "sync" {
 			t.Fatalf("synced registrations with no WAL: %v", log.snapshot())
 		}
+	}
+}
+
+func TestFlushWithoutAWALPublishesClusterPendingRegistrations(t *testing.T) {
+	buffer, _ := newCheckpointBuffer(1000)
+	buffer.wal = nil
+	log := &orderLog{}
+	buffer.SetFileRegistrar(&publishingRegistrar{syncingRegistrar: &syncingRegistrar{log: log}})
+	if err := buffer.writeColumnarInternal(context.Background(), "default", checkpointTestRecord(), false, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := buffer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	events := log.snapshot()
+	if len(events) < 2 || events[len(events)-1] != "publish" {
+		t.Fatalf("no-WAL flush did not publish its pending registration: %v", events)
 	}
 }

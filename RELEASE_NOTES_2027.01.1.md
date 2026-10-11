@@ -1162,13 +1162,13 @@ a file after the grace window, and on a writer it was the only copy.
 A node that ingests (a `writer`, or `standalone` with `cluster.enabled`) now
 records every file it flushes in `pending-registrations.jsonl` in
 `cluster.raft_data_dir`. With the WAL enabled, each flush makes those records
-durable before it checkpoints the WAL, with one fsync per flush; without the WAL
-there is no checkpoint to order and no fsync is added. The node registers the files once
-the cluster is up, in batches, retrying every failure until the manifest
-confirms them. A file that is gone or has changed size by then is skipped. The
-record is removed once the manifest confirms the file, and the journal is
-emptied whenever nothing is pending, so it stays near zero bytes in normal
-operation.
+durable before it checkpoints the WAL, with one fsync per flush. Without a
+WAL, the outbox still syncs the journal before publishing pending intents to
+the cluster. The node registers the files once the cluster is up, in batches,
+retrying every failure until the manifest confirms them. A file that is gone
+or has changed size by then is skipped. The record is removed once the
+manifest confirms the file, and the journal is emptied whenever nothing is
+pending, so it stays near zero bytes in normal operation.
 
 While the manifest cannot be reached, each flushed file adds about 300 bytes to
 the journal on the Raft data volume and about 500 bytes of memory, so a
@@ -1199,12 +1199,20 @@ treat "not in the manifest" as safe to act on
   the last minute, and reports how many in the run's `skipped_pending`. Before,
   a backlog older than the grace window was deleted as orphans.
 
-These checks see only the node's own pending files, so they protect a writer
-from its own DELETEs, compaction and reconciliation. With shared storage they do
-not cover another node acting on a writer's pending files: a DELETE run by the
-leader writer, or compaction and reconciliation on the active compactor
-([#1214](https://github.com/Basekick-Labs/arc/issues/1214)). Files already left
-unregistered by earlier versions are not picked up retroactively.
+Before #1214, these checks saw only the node's own pending files. With shared
+storage they did not cover another node acting on a writer's pending files: a
+DELETE run by the leader writer, or compaction and reconciliation on the active
+compactor. Files already left unregistered by earlier versions are not picked
+up retroactively.
+
+### Shared-storage maintenance sees pending registrations ([#1214](https://github.com/Basekick-Labs/arc/issues/1214))
+
+Writers publish pending file intents through Raft before a flush returns.
+DELETE, compaction and reconciliation synchronise their manifest view before
+checking those intents, so maintenance on another node leaves the file alone
+until its registration is applied. Registering the file and clearing its
+matching intent happen in one Raft batch; snapshots retain outstanding intents
+across node restarts.
 
 ### Delete API removes the inactive SQL Server prefix scan ([#1077](https://github.com/Basekick-Labs/arc/issues/1077))
 

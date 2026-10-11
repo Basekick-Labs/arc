@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -70,6 +71,19 @@ func TestDeleteRewriteOfAPendingFileAnnouncesTheRewrite(t *testing.T) {
 	}
 	if len(coordinator.ops) != 0 {
 		t.Fatalf("manifest ops = %d; a pending swap stays in the outbox", len(coordinator.ops))
+	}
+}
+
+func TestDeleteDoesNotScanAnotherWritersPendingFile(t *testing.T) {
+	_, backend, oldPath, _ := rewriteFixture(t)
+	h := &DeleteHandler{
+		storage:     backend,
+		coordinator: &rewriteManifestCoordinator{pendingPath: oldPath},
+		logger:      zerolog.Nop(),
+	}
+	_, err := h.findAffectedFiles(context.Background(), "db", "cpu", "host = 'h1'", true)
+	if err == nil || !strings.Contains(err.Error(), "awaiting cluster registration") {
+		t.Fatalf("pending file should be rejected before scanning, got %v", err)
 	}
 }
 

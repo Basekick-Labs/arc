@@ -51,6 +51,10 @@ var errManifestFailure = errors.New("cluster manifest update failed")
 // apostrophe because the log masker truncates a line at the first quote.
 var errSourceRetired = errors.New("source file was retired by a concurrent delete, retry the request")
 
+// errPendingRegistration is a transient conflict: a different writer has
+// flushed the file but not yet registered it in the cluster manifest.
+var errPendingRegistration = errors.New("file is awaiting cluster registration")
+
 // parquetRowGroupSize is the row group size used for Parquet rewrites during delete operations.
 // Matches compaction's row group size to limit DuckDB's internal write buffer per group.
 const parquetRowGroupSize = 122880
@@ -350,10 +354,27 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 
 	// Find affected files
 	ctx := c.Context()
-	affected, err := h.findAffectedFiles(ctx, req.Database, req.Measurement, req.Where)
+	if !req.DryRun {
+		if syncer, ok := h.coordinator.(interface {
+			HasRaft() bool
+			SyncManifest(context.Context) error
+		}); ok && syncer.HasRaft() {
+			if err := syncer.SyncManifest(ctx); err != nil {
+				return c.Status(fiber.StatusServiceUnavailable).JSON(DeleteResponse{
+					Success: false,
+					Error:   "Could not synchronise the cluster manifest before delete: " + err.Error(),
+				})
+			}
+		}
+	}
+	affected, err := h.findAffectedFiles(ctx, req.Database, req.Measurement, req.Where, !req.DryRun)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to find affected files")
-		return c.Status(fiber.StatusInternalServerError).JSON(DeleteResponse{
+		status := fiber.StatusInternalServerError
+		if errors.Is(err, errPendingRegistration) {
+			status = fiber.StatusServiceUnavailable
+		}
+		return c.Status(status).JSON(DeleteResponse{
 			Success:         false,
 			Error:           "Failed to find affected files: " + err.Error(),
 			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
@@ -620,7 +641,7 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 }
 
 // findAffectedFiles finds all Parquet files that contain rows matching the WHERE clause
-func (h *DeleteHandler) findAffectedFiles(ctx context.Context, database, measurement, whereClause string) ([]affectedFile, error) {
+func (h *DeleteHandler) findAffectedFiles(ctx context.Context, database, measurement, whereClause string, rejectPending bool) ([]affectedFile, error) {
 	var affected []affectedFile
 
 	// Use storage backend's List method to find parquet files
@@ -635,6 +656,9 @@ func (h *DeleteHandler) findAffectedFiles(ctx context.Context, database, measure
 	for _, f := range files {
 		if !strings.HasSuffix(strings.ToLower(f), ".parquet") {
 			continue
+		}
+		if pending, ok := h.coordinator.(interface{ HasPendingRegistration(string) bool }); rejectPending && ok && pending.HasPendingRegistration(f) {
+			return nil, fmt.Errorf("%w: %s; retry the delete after registration completes", errPendingRegistration, f)
 		}
 		queryPath, err := readParquetPath(h.storage, f)
 		if err != nil {
@@ -783,6 +807,9 @@ func (h *DeleteHandler) countMatchingRowsIndividually(ctx context.Context, files
 // For local storage: uses atomic rename
 // For S3: downloads, processes locally, then uploads
 func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, queryPath, relativePath, whereClause string) (int64, error) {
+	if pending, ok := h.coordinator.(interface{ HasPendingRegistration(string) bool }); ok && pending.HasPendingRegistration(relativePath) {
+		return 0, fmt.Errorf("%w: %s; retry the delete after registration completes", errPendingRegistration, relativePath)
+	}
 	// The affected-file list was built before the rewrite mutex was acquired, so a delete that
 	// won the lock first may already have retired this source and published its survivors under a
 	// new immutable path. Detect that here rather than letting DuckDB report it: the engine

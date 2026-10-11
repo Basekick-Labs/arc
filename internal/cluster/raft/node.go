@@ -845,7 +845,7 @@ func CompactionPauseAckCommand(p AckCompactionPausePayload) (*Command, error) {
 	return &Command{Type: CommandAckCompactionPause, Payload: payload}, nil
 }
 
-// BatchFileOps applies a batch of RegisterFile and DeleteFile operations as a
+// BatchFileOps applies file manifest and pending-registration operations as a
 // single Raft log entry. Reduces compaction manifest apply from O(N) to 1.
 func (n *Node) BatchFileOps(ops []BatchFileOp, timeout time.Duration) error {
 	payload, err := json.Marshal(BatchFileOpsPayload{Ops: ops})

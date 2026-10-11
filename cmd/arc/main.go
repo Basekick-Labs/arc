@@ -1699,6 +1699,7 @@ func main() {
 			completionDir = filepath.Join(cfg.Compaction.TempDirectory, ".completion", "pending")
 		}
 	}
+	var clusterCoordinator *cluster.Coordinator
 	if cfg.Compaction.Enabled {
 		// Build tiers
 		var tiers []compaction.Tier
@@ -1773,11 +1774,18 @@ func main() {
 			Tiers:           tiers,
 			Logger:          logger.Get("compaction"),
 		})
-		if registrationOutbox != nil {
-			// A file pending registration waits a cycle: compacting it races
-			// its registration (#1212).
-			compactionManager.SetPendingFilter(registrationOutbox.IsPending)
-		}
+		// A file pending on any writer waits a cycle: compacting it races
+		// its registration (#1212, #1214). The coordinator is assigned below.
+		compactionManager.SetPendingFilter(func(path string) bool {
+			return (clusterCoordinator != nil && clusterCoordinator.HasPendingRegistration(path)) ||
+				(registrationOutbox != nil && registrationOutbox.IsPending(path))
+		})
+		compactionManager.SetPendingManifestSync(func(ctx context.Context) error {
+			if clusterCoordinator != nil && clusterCoordinator.HasRaft() {
+				return clusterCoordinator.SyncManifest(ctx)
+			}
+			return nil
+		})
 
 		// Issue #610, the disabled-sync leg: compaction is enabled but edge
 		// sync is entirely off, so the spoke block that manages the defer
@@ -1936,7 +1944,6 @@ func main() {
 
 	// Initialize Cluster Coordinator (Enterprise feature)
 	// Clustering enables role-based node separation: writer, reader, compactor
-	var clusterCoordinator *cluster.Coordinator
 	// completionWatcher is the Phase 4 completion watcher, built BEFORE the
 	// coordinator starts (inside the cluster block below) so the compaction
 	// pause quiescer (#1087) can see the pending commits on disk from the
@@ -4163,9 +4170,12 @@ func main() {
 			RecheckConcurrency:       cfg.Reconciliation.RecheckConcurrency,
 		}
 		reconciler, err := reconciliation.NewReconciler(recCfg, clusterCoordinator, storageBackend, gate, auditLogger, logger.Get("reconciliation"))
-		if err == nil && registrationOutbox != nil {
-			// A file pending registration is unregistered, not an orphan (#1212).
-			reconciler.SetPendingFilter(registrationOutbox.HoldsRegistration)
+		if err == nil && clusterCoordinator != nil {
+			// A file pending on any writer is unregistered, not an orphan (#1212, #1214).
+			reconciler.SetPendingFilter(func(path string) bool {
+				return clusterCoordinator.HasPendingRegistration(path) ||
+					(registrationOutbox != nil && registrationOutbox.HoldsRegistration(path))
+			})
 		}
 		if err != nil {
 			log.Error().Err(err).Msg("Failed to create reconciler — feature disabled")

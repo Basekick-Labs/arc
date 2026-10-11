@@ -19,8 +19,9 @@ import (
 )
 
 type rewriteManifestCoordinator struct {
-	entry *raft.FileEntry
-	ops   []raft.BatchFileOp
+	entry       *raft.FileEntry
+	ops         []raft.BatchFileOp
+	pendingPath string
 }
 
 func (c *rewriteManifestCoordinator) BatchFileOpsInManifest(ops []raft.BatchFileOp) error {
@@ -33,6 +34,9 @@ func (c *rewriteManifestCoordinator) GetFileEntry(string) (*raft.FileEntry, bool
 func (c *rewriteManifestCoordinator) IsPrimaryWriter() bool { return true }
 func (c *rewriteManifestCoordinator) Role() string          { return "writer" }
 func (c *rewriteManifestCoordinator) LocalNodeID() string   { return "new-primary" }
+func (c *rewriteManifestCoordinator) HasPendingRegistration(path string) bool {
+	return c.pendingPath != "" && c.pendingPath == path
+}
 
 func TestReplaceManifestAfterRewritePublishesImmutableFile(t *testing.T) {
 	root := t.TempDir()

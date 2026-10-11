@@ -5754,7 +5754,7 @@ func (c *Coordinator) DeleteFileFromManifest(ctx context.Context, path, reason s
 	return nil
 }
 
-// BatchFileOpsInManifest applies a batch of RegisterFile and DeleteFile
+// BatchFileOpsInManifest applies file manifest and pending-registration
 // operations as a single Raft log entry. On the leader the command is applied
 // directly; on a non-leader it is forwarded to the current leader via the
 // peer protocol. This reduces Raft traffic for compaction manifests from
@@ -5875,6 +5875,12 @@ func (c *Coordinator) GetFileEntry(path string) (*raft.FileEntry, bool) {
 		return nil, false
 	}
 	return c.raftFSM.GetFile(path)
+}
+
+// HasPendingRegistration reports whether any node has announced a file that
+// has not yet reached the cluster manifest.
+func (c *Coordinator) HasPendingRegistration(path string) bool {
+	return c.raftFSM != nil && c.raftFSM.HasPendingRegistration(path)
 }
 
 // HasRaft reports whether this coordinator drives a Raft file manifest, which

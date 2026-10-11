@@ -17,6 +17,7 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 )
 
@@ -88,6 +89,9 @@ type RegistrationOutbox struct {
 	// syncMu serialises fsyncs and journal rewrites. Lock order: syncMu, then
 	// mu. Appends take only mu, so they never wait on a fsync.
 	syncMu sync.Mutex
+	// publishMu prevents a delayed duplicate intent proposal from landing after
+	// the drain has atomically registered and cleared the same entry.
+	publishMu sync.Mutex
 
 	mu          sync.Mutex
 	state       outboxState
@@ -147,8 +151,9 @@ const (
 )
 
 type outboxEntry struct {
-	rec   journalRecord
-	added time.Time
+	rec               journalRecord
+	added             time.Time
+	journalGeneration uint64
 	// fresh: flushed by this process and not attempted yet. The file was just
 	// written, so the storage checks are skipped on that first attempt.
 	fresh bool
@@ -171,14 +176,14 @@ type outboxEntry struct {
 	refused bool
 	// ackAt is the journal generation of its ack record; its batches are held
 	// until the journal is synced past it (#1207 S4c).
-	ackAt uint64
+	ackAt     uint64
+	published bool
 }
 
 // journalRecord is one journal line. ClusterName pins it to the cluster: a data
-// directory moved into another cluster must not announce its files there. The
-// node ID is not recorded. Without cluster.node_id it is hostname-PID, which
-// changes with every start on a VM, and the file is on this node's disk either
-// way, so the origin is this process's node ID at hand-off.
+// directory moved into another cluster must not announce its files there.
+// OwnerID is stamped at hand-off and retained across restarts, so cleanup can
+// clear the exact intent originally published even if the node ID changes.
 type journalRecord struct {
 	Version       int       `json:"v,omitempty"`
 	Op            string    `json:"op,omitempty"` // "" (a #1206 record) means add
@@ -200,7 +205,11 @@ type journalRecord struct {
 	// on a coverage-enabled writer; a record carrying it is version 2. Every
 	// file of a group carries the whole group's coverage. Readers before
 	// #1207 ignore the field.
-	Cov *ingest.GroupCoverage `json:"cov,omitempty"`
+	Cov                        *ingest.GroupCoverage `json:"cov,omitempty"`
+	RegistrationID             string                `json:"registration_id,omitempty"`
+	OwnerID                    string                `json:"owner_id,omitempty"`
+	SupersedesRegistrationID   string                `json:"supersedes_registration_id,omitempty"`
+	SupersedesRegistrationPath string                `json:"supersedes_registration_path,omitempty"`
 }
 
 const journalRecordVersionCoverage = 2
@@ -282,6 +291,9 @@ func NewRegistrationOutbox(dir, clusterName string, logger zerolog.Logger) (*Reg
 	}
 	now := time.Now()
 	for _, rec := range loaded {
+		if rec.RegistrationID == "" {
+			rec.RegistrationID = uuid.NewString()
+		}
 		added := now
 		if !rec.FlushedAt.IsZero() {
 			added = rec.FlushedAt
@@ -429,11 +441,16 @@ func (r *RegistrationOutbox) RegisterCoveredFile(database, measurement, path str
 		Database: database, Measurement: measurement, Path: path,
 		PartitionTime: partitionTime, SizeBytes: sizeBytes, SHA256: sha256,
 		FlushedAt: time.Now().UTC(), Cov: cov,
+		RegistrationID: uuid.NewString(),
 	}
 	if cov != nil {
 		rec.Version = journalRecordVersionCoverage
 	}
 	r.mu.Lock()
+	rec.OwnerID = r.nodeID
+	if prior, ok := r.byPath[path]; ok && !prior.done {
+		rec.SupersedesRegistrationID = prior.rec.RegistrationID
+	}
 	switch r.state {
 	case outboxAbandoned:
 		r.mu.Unlock()
@@ -446,14 +463,16 @@ func (r *RegistrationOutbox) RegisterCoveredFile(database, measurement, path str
 	case outboxStopped:
 		// After the shutdown drain: keep it for the next start, durably now,
 		// since no flush sync follows.
-		r.enqueueLocked(rec, time.Now(), true)
+		entry := r.enqueueLocked(rec, time.Now(), true)
 		r.appendLocked(rec)
+		entry.journalGeneration = r.written
 		r.mu.Unlock()
 		_ = r.SyncRegistrations()
 		return
 	}
-	r.enqueueLocked(rec, time.Now(), true)
+	entry := r.enqueueLocked(rec, time.Now(), true)
 	r.appendLocked(rec)
+	entry.journalGeneration = r.written
 	r.mu.Unlock()
 	r.publishMetrics()
 	select {
@@ -462,7 +481,7 @@ func (r *RegistrationOutbox) RegisterCoveredFile(database, measurement, path str
 	}
 }
 
-func (r *RegistrationOutbox) enqueueLocked(rec journalRecord, added time.Time, fresh bool) {
+func (r *RegistrationOutbox) enqueueLocked(rec journalRecord, added time.Time, fresh bool) *outboxEntry {
 	if e, ok := r.byPath[rec.Path]; ok && !e.done {
 		// A second flush to one path is not expected. Keep the latest record
 		// as a new entry, without touching one attempt may be reading. The
@@ -483,6 +502,7 @@ func (r *RegistrationOutbox) enqueueLocked(rec journalRecord, added time.Time, f
 	r.byPath[rec.Path] = e
 	r.queue = append(r.queue, e)
 	r.live++
+	return e
 }
 
 // appendLocked writes one record. On a write error it truncates back to where
@@ -538,24 +558,30 @@ func (r *RegistrationOutbox) markBrokenLocked(err error) {
 // caller arriving after finds its records already covered.
 func (r *RegistrationOutbox) SyncRegistrations() error {
 	r.syncMu.Lock()
-	defer r.syncMu.Unlock()
 	r.mu.Lock()
 	target := r.written
 	if r.synced >= target && !r.broken {
 		r.mu.Unlock()
-		return nil
+		r.syncMu.Unlock()
+		return r.publishPendingRegistrations()
 	}
 	if r.broken {
 		if time.Since(r.lastRewrite) < outboxBrokenRetry {
 			r.mu.Unlock()
+			r.syncMu.Unlock()
 			return errors.New("file registration journal unavailable; held in memory")
 		}
 		err := r.rewriteLocked()
 		r.mu.Unlock()
-		return err
+		r.syncMu.Unlock()
+		if err != nil {
+			return err
+		}
+		return r.publishPendingRegistrations()
 	}
 	if r.journal == nil { // abandoned: nothing is journaled any more
 		r.mu.Unlock()
+		r.syncMu.Unlock()
 		return nil
 	}
 	f := r.journal
@@ -564,16 +590,105 @@ func (r *RegistrationOutbox) SyncRegistrations() error {
 	err := fsyncFile(f) // appends continue on the same fd meanwhile
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if err != nil {
 		r.markBrokenLocked(err)
+		r.mu.Unlock()
+		r.syncMu.Unlock()
 		return err
 	}
 	if target > r.synced {
 		r.synced = target
 	}
 	r.pruneUnsyncedAcksLocked()
-	return nil
+	r.mu.Unlock()
+	r.syncMu.Unlock()
+	return r.publishPendingRegistrations()
+}
+
+// PublishPendingRegistrations makes the journal durable and publishes its
+// intents. It is called for no-WAL flushes, where there is no checkpoint but
+// shared-storage maintenance still needs to observe the new files.
+func (r *RegistrationOutbox) PublishPendingRegistrations() error {
+	return r.SyncRegistrations()
+}
+
+// publishPendingRegistrations makes the journal's live entries visible in the
+// cluster FSM before a flush returns. A loaded journal is published by the
+// drain once it has a coordinator and owner ID.
+func (r *RegistrationOutbox) publishPendingRegistrations() error {
+	r.publishMu.Lock()
+	defer r.publishMu.Unlock()
+	r.mu.Lock()
+	manifest, ownerID, synced := r.manifestRef, r.nodeID, r.synced
+	var entries []*outboxEntry
+	if manifest != nil && ownerID != "" {
+		for _, entry := range r.queue[r.head:] {
+			if entry != nil && !entry.done && !entry.published && entry.journalGeneration <= synced {
+				entries = append(entries, entry)
+			}
+		}
+	}
+	r.mu.Unlock()
+	if len(entries) == 0 {
+		return nil
+	}
+	var chunk []*outboxEntry
+	chunkBytes := 0
+	flushChunk := func() error {
+		if len(chunk) == 0 {
+			return nil
+		}
+		ops := make([]raft.BatchFileOp, 0, len(chunk))
+		for _, entry := range chunk {
+			entryOwnerID := entry.rec.OwnerID
+			if entryOwnerID == "" {
+				entryOwnerID = ownerID
+			}
+			payload, err := json.Marshal(raft.PendingRegistrationPayload{
+				Path: entry.rec.Path, OwnerID: entryOwnerID, RegistrationID: entry.rec.RegistrationID,
+			})
+			if err != nil {
+				return fmt.Errorf("marshal pending registration intent: %w", err)
+			}
+			ops = append(ops, raft.BatchFileOp{Type: raft.CommandSetPendingRegistration, Payload: payload})
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), outboxAttemptTimeout)
+		err := manifest.BatchFileOpsInManifestContext(ctx, ops)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("publish pending registration intents: %w", err)
+		}
+		r.mu.Lock()
+		for _, entry := range chunk {
+			if current, ok := r.byPath[entry.rec.Path]; ok && current == entry && !entry.done {
+				entry.published = true
+			}
+		}
+		r.mu.Unlock()
+		chunk = nil
+		chunkBytes = 0
+		return nil
+	}
+	for _, entry := range entries {
+		entryOwnerID := entry.rec.OwnerID
+		if entryOwnerID == "" {
+			entryOwnerID = ownerID
+		}
+		payload, err := json.Marshal(raft.PendingRegistrationPayload{
+			Path: entry.rec.Path, OwnerID: entryOwnerID, RegistrationID: entry.rec.RegistrationID,
+		})
+		if err != nil {
+			return fmt.Errorf("marshal pending registration intent: %w", err)
+		}
+		if len(chunk) > 0 && chunkBytes+len(payload) > registrarDrainChunkBytes {
+			if err := flushChunk(); err != nil {
+				return err
+			}
+		}
+		chunk = append(chunk, entry)
+		chunkBytes += len(payload)
+	}
+	return flushChunk()
 }
 
 // rewriteLocked replaces the journal with the pending adds and reopens the
@@ -628,6 +743,11 @@ func (r *RegistrationOutbox) rewriteLocked() error {
 	r.broken = false
 	r.fileRecords = n
 	r.synced = r.written
+	for _, e := range r.queue[r.head:] {
+		if e != nil && !e.done {
+			e.journalGeneration = r.synced
+		}
+	}
 	return nil
 }
 
@@ -711,17 +831,30 @@ func (r *RegistrationOutbox) Abandon() bool {
 // HandOff starts the drain that registers pending files through manifest
 // under nodeID, this node's cluster ID. It runs until Stop.
 func (r *RegistrationOutbox) HandOff(manifest OutboxManifest, store OutboxStorage, nodeID string) {
+	r.syncMu.Lock()
 	r.mu.Lock()
 	if r.state != outboxCollecting {
 		r.mu.Unlock()
+		r.syncMu.Unlock()
 		return
 	}
 	r.state = outboxRunning
 	r.nodeID = nodeID
+	// Make the manifest available before HandOff returns. A flush can arrive
+	// before the drain goroutine starts; it must still publish its intent.
+	r.manifestRef, r.storeRef = manifest, store
+	for _, entry := range r.queue[r.head:] {
+		if entry != nil && !entry.done && entry.rec.OwnerID == "" {
+			entry.rec.OwnerID = nodeID
+			r.appendLocked(entry.rec)
+			entry.journalGeneration = r.written
+		}
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
 	n := r.live
 	r.mu.Unlock()
+	r.syncMu.Unlock()
 	if n > 0 {
 		r.logger.Info().Int("files", n).Msg("Registering files flushed before the cluster was up")
 	}
@@ -833,8 +966,23 @@ func (r *RegistrationOutbox) run(ctx context.Context, manifest OutboxManifest, s
 		}
 	}
 	delay, failures = outboxRetryMin, 0
+	for ctx.Err() == nil {
+		if err := r.SyncRegistrations(); err != nil {
+			if !backoff(err, "Could not publish pending file registrations; retrying") {
+				return
+			}
+			continue
+		}
+		break
+	}
 
 	for ctx.Err() == nil {
+		if err := r.publishPendingRegistrations(); err != nil {
+			if !backoff(err, "Failed to publish pending file registrations; retrying") {
+				return
+			}
+			continue
+		}
 		progressed, err := r.attempt(ctx, manifest, store)
 		r.alarm()
 		switch {
@@ -958,13 +1106,49 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 				ops = append(ops, raft.BatchFileOp{Type: raft.CommandDeleteFile, Payload: del})
 			}
 		}
+		if e.rec.SupersedesRegistrationID != "" {
+			oldPath := e.rec.SupersedesRegistrationPath
+			if oldPath == "" {
+				oldPath = e.rec.Path
+			}
+			old := &outboxEntry{rec: journalRecord{
+				Path: oldPath, RegistrationID: e.rec.SupersedesRegistrationID, OwnerID: e.rec.OwnerID,
+			}}
+			if clear, err := r.clearIntentOp(old); err != nil {
+				return false, err
+			} else if clear.Type != 0 {
+				ops = append(ops, clear)
+			}
+		}
+		if clear, err := r.clearIntentOp(e); err != nil {
+			return false, err
+		} else if clear.Type != 0 {
+			ops = append(ops, clear)
+		}
 		sent = append(sent, e)
 		bytes += len(payload)
 	}
 	r.requeue(deferred)
+	sentSet := make(map[*outboxEntry]struct{}, len(sent))
+	for _, e := range sent {
+		sentSet[e] = struct{}{}
+	}
+	for _, e := range settled {
+		if _, wasSent := sentSet[e]; wasSent {
+			continue
+		}
+		if clear, err := r.clearIntentOp(e); err != nil {
+			return false, err
+		} else if clear.Type != 0 {
+			ops = append(ops, clear)
+		}
+	}
 
 	var applyErr error
 	if len(ops) > 0 {
+		// Serialise intent publication with the register-and-clear batch. A
+		// duplicate Set that lands afterwards would recreate a stale intent.
+		r.publishMu.Lock()
 		actx, cancel := context.WithTimeout(ctx, outboxAttemptTimeout)
 		applyErr = manifest.BatchFileOpsInManifestContext(actx, ops)
 		cancel()
@@ -1038,8 +1222,9 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 			}
 			settled = append(settled, sent...)
 		}
+		r.publishMu.Unlock()
 	}
-	if len(settled) > 0 {
+	if len(settled) > 0 && applyErr == nil {
 		r.ack(settled)
 	}
 	return len(settled) > 0, applyErr
@@ -1052,6 +1237,39 @@ func anyCovered(entries []*outboxEntry) bool {
 		}
 	}
 	return false
+}
+
+func (r *RegistrationOutbox) clearIntentOp(e *outboxEntry) (raft.BatchFileOp, error) {
+	r.mu.Lock()
+	ownerID := e.rec.OwnerID
+	if ownerID == "" {
+		ownerID = r.nodeID
+	}
+	r.mu.Unlock()
+	if ownerID == "" {
+		return raft.BatchFileOp{}, nil
+	}
+	payload, err := json.Marshal(raft.PendingRegistrationPayload{
+		Path: e.rec.Path, OwnerID: ownerID, RegistrationID: e.rec.RegistrationID,
+	})
+	if err != nil {
+		return raft.BatchFileOp{}, fmt.Errorf("marshal pending registration clear: %w", err)
+	}
+	return raft.BatchFileOp{Type: raft.CommandClearPendingRegistration, Payload: payload}, nil
+}
+
+func (r *RegistrationOutbox) applyIntentOps(ctx context.Context, ops ...raft.BatchFileOp) error {
+	// Serialise clears with publishers that may have taken a snapshot of the
+	// queue before Withdraw or ReplacePending removed an entry from it.
+	r.publishMu.Lock()
+	defer r.publishMu.Unlock()
+	r.mu.Lock()
+	manifest := r.manifestRef
+	r.mu.Unlock()
+	if manifest == nil || len(ops) == 0 {
+		return nil
+	}
+	return manifest.BatchFileOpsInManifestContext(ctx, ops)
 }
 
 func (r *RegistrationOutbox) markInManifest(e *outboxEntry) {
@@ -1090,19 +1308,32 @@ func (r *RegistrationOutbox) ReplacePending(ctx context.Context, oldPath, newPat
 	rec := e.rec
 	rec.Path, rec.SizeBytes, rec.SHA256 = newPath, sizeBytes, sha256
 	rec.Supersedes = oldPath
+	rec.SupersedesRegistrationID = e.rec.RegistrationID
+	rec.SupersedesRegistrationPath = oldPath
+	rec.RegistrationID = uuid.NewString()
 	added := e.added // keep the backlog age honest
 	// The rewrite carries the group's coverage (rec.Cov) and settles for it;
 	// the old path does not settle at all.
 	r.withdrawLocked(e)
-	r.enqueueLocked(rec, added, true)
+	newEntry := r.enqueueLocked(rec, added, true)
 	r.appendLocked(rec)
+	newEntry.journalGeneration = r.written
 	r.advanceHeadLocked()
 	r.mu.Unlock()
 	if err := r.SyncRegistrations(); err != nil {
-		// Held in memory and registered in this process; only a crash first
-		// loses it.
-		r.logger.Error().Err(err).Str("path", newPath).Str("replaces", oldPath).
-			Msg("Failed to persist a replaced file registration; a crash before it registers leaves the rewrite unannounced")
+		r.restorePendingRecord(e.rec)
+		return ReplaceNotPending, raft.FileEntry{}, fmt.Errorf("persist replacement registration: %w", err)
+	}
+	if clear, err := r.clearIntentOp(&outboxEntry{rec: e.rec}); err != nil {
+		return ReplaceNotPending, raft.FileEntry{}, err
+	} else if clear.Type != 0 {
+		ctx, cancel := context.WithTimeout(ctx, outboxAttemptTimeout)
+		err = r.applyIntentOps(ctx, clear)
+		cancel()
+		if err != nil {
+			r.restorePendingRecord(e.rec)
+			return ReplaceNotPending, raft.FileEntry{}, fmt.Errorf("clear superseded pending registration: %w", err)
+		}
 	}
 	r.publishMetrics()
 	select {
@@ -1121,17 +1352,44 @@ func (r *RegistrationOutbox) Withdraw(ctx context.Context, path string) (withdra
 	if e == nil {
 		return false, outcome, err
 	}
+	rec := e.rec
 	r.withdrawLocked(e)
 	r.advanceHeadLocked()
 	cov := e.rec.Cov
 	r.mu.Unlock()
 	if err := r.SyncRegistrations(); err != nil {
-		r.logger.Warn().Err(err).Str("path", path).Msg("Failed to persist a withdrawn file registration")
+		r.restorePendingRecord(rec)
+		return false, ReplaceNotPending, fmt.Errorf("persist withdrawn registration: %w", err)
+	}
+	if clear, clearErr := r.clearIntentOp(&outboxEntry{rec: rec}); clearErr != nil {
+		return false, ReplaceNotPending, clearErr
+	} else if clear.Type != 0 {
+		ctx, cancel := context.WithTimeout(ctx, outboxAttemptTimeout)
+		clearErr = r.applyIntentOps(ctx, clear)
+		cancel()
+		if clearErr != nil {
+			r.restorePendingRecord(rec)
+			return false, ReplaceNotPending, fmt.Errorf("clear pending registration before delete: %w", clearErr)
+		}
 	}
 	// The rows are gone on purpose (a DELETE): they settle.
 	cov.Settle(path, ingest.CoverageWithdrawn)
 	r.publishMetrics()
 	return true, ReplaceSwapped, nil
+}
+
+func (r *RegistrationOutbox) restorePendingRecord(rec journalRecord) {
+	r.mu.Lock()
+	entry := r.enqueueLocked(rec, time.Now(), false)
+	r.appendLocked(rec)
+	entry.journalGeneration = r.written
+	r.advanceHeadLocked()
+	r.mu.Unlock()
+	r.publishMetrics()
+	select {
+	case r.wake <- struct{}{}:
+	default:
+	}
 }
 
 // settleOrLock waits out an attempt in flight on path, up to
@@ -1233,6 +1491,9 @@ func (r *RegistrationOutbox) nextBatch() []*outboxEntry {
 	i := r.head
 	for ; i < len(r.queue) && len(out) < registrarDrainBatch; i++ {
 		if e := r.queue[i]; e != nil && !e.done {
+			if r.state == outboxRunning && r.manifestRef != nil && !e.published {
+				continue
+			}
 			e.inFlight = true
 			out = append(out, e)
 		}

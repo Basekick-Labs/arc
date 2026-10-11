@@ -668,6 +668,11 @@ func (r *Reconciler) snapshotManifest(ctx context.Context) ([]*raft.FileEntry, e
 		// point. For now return an empty slice so step 1 still completes.
 		return nil, nil
 	}
+	if syncer, ok := r.coord.(interface{ SyncManifest(context.Context) error }); ok {
+		if err := syncer.SyncManifest(ctx); err != nil {
+			return nil, fmt.Errorf("sync manifest before reconciliation snapshot: %w", err)
+		}
+	}
 	manifest := r.coord.GetFileManifest()
 	if len(manifest) > r.cfg.MaxManifestSize {
 		return nil, fmt.Errorf("%w: have %d, max %d", ErrManifestTooLarge, len(manifest), r.cfg.MaxManifestSize)

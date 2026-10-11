@@ -32,6 +32,7 @@ func init() {
 type fakeOutboxManifest struct {
 	mu          sync.Mutex
 	leaderErrs  int
+	leaderGate  chan struct{}
 	batchErrs   []error
 	beforeBatch func(paths []string)
 	registered  map[string]raft.FileEntry
@@ -42,18 +43,24 @@ type fakeOutboxManifest struct {
 	coverage    []raft.InstanceCoverage // coverage carried by registrations
 	supersedes  []string                // Supersedes carried by registrations
 	refuse      func(path string) bool  // a claim refuses this registration
+	pending     map[string]map[string]raft.PendingRegistrationPayload
 }
 
 func newFakeOutboxManifest() *fakeOutboxManifest {
-	return &fakeOutboxManifest{registered: map[string]raft.FileEntry{}, existing: map[string]bool{}}
+	return &fakeOutboxManifest{registered: map[string]raft.FileEntry{}, existing: map[string]bool{}, pending: map[string]map[string]raft.PendingRegistrationPayload{}}
 }
 
 func (m *fakeOutboxManifest) WaitForLeader(time.Duration) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	gate := m.leaderGate
 	if m.leaderErrs > 0 {
 		m.leaderErrs--
+		m.mu.Unlock()
 		return ErrNoLeaderKnown
+	}
+	m.mu.Unlock()
+	if gate != nil {
+		<-gate
 	}
 	return nil
 }
@@ -85,6 +92,10 @@ func (m *fakeOutboxManifest) BatchFileOpsInManifestContext(_ context.Context, op
 	m.mu.Lock()
 	refuse := m.refuse
 	m.mu.Unlock()
+	var pendingOps []struct {
+		set bool
+		p   raft.PendingRegistrationPayload
+	}
 	for i, op := range ops {
 		if op.Type == raft.CommandDeleteFile {
 			var d raft.DeleteFilePayload
@@ -93,6 +104,20 @@ func (m *fakeOutboxManifest) BatchFileOpsInManifestContext(_ context.Context, op
 			}
 			deletes = append(deletes, d.Path)
 			continue
+		}
+		if op.Type == raft.CommandSetPendingRegistration || op.Type == raft.CommandClearPendingRegistration {
+			var p raft.PendingRegistrationPayload
+			if err := json.Unmarshal(op.Payload, &p); err != nil {
+				return err
+			}
+			pendingOps = append(pendingOps, struct {
+				set bool
+				p   raft.PendingRegistrationPayload
+			}{op.Type == raft.CommandSetPendingRegistration, p})
+			continue
+		}
+		if op.Type != raft.CommandRegisterFile {
+			return fmt.Errorf("unsupported test batch operation %d", op.Type)
 		}
 		var p raft.RegisterFilePayload
 		if err := json.Unmarshal(op.Payload, &p); err != nil {
@@ -111,10 +136,15 @@ func (m *fakeOutboxManifest) BatchFileOpsInManifestContext(_ context.Context, op
 		m.mu.Unlock()
 	}
 	m.mu.Lock()
-	m.batches = append(m.batches, paths)
+	if len(paths) > 0 {
+		m.batches = append(m.batches, paths)
+	}
 	hook := m.beforeBatch
+	if len(paths) == 0 {
+		hook = nil
+	}
 	var err error
-	if len(m.batchErrs) > 0 {
+	if len(paths) > 0 && len(m.batchErrs) > 0 {
 		err, m.batchErrs = m.batchErrs[0], m.batchErrs[1:]
 	}
 	m.mu.Unlock()
@@ -134,6 +164,21 @@ func (m *fakeOutboxManifest) BatchFileOpsInManifestContext(_ context.Context, op
 	}
 	for _, p := range deletes {
 		delete(m.registered, p)
+	}
+	for _, op := range pendingOps {
+		byID := m.pending[op.p.Path]
+		if op.set {
+			if byID == nil {
+				byID = make(map[string]raft.PendingRegistrationPayload)
+				m.pending[op.p.Path] = byID
+			}
+			byID[op.p.OwnerID+"\x00"+op.p.RegistrationID] = op.p
+		} else if existing, ok := byID[op.p.OwnerID+"\x00"+op.p.RegistrationID]; ok && existing.OwnerID == op.p.OwnerID {
+			delete(byID, op.p.OwnerID+"\x00"+op.p.RegistrationID)
+			if len(byID) == 0 {
+				delete(m.pending, op.p.Path)
+			}
+		}
 	}
 	m.mu.Unlock()
 	return nil
@@ -280,6 +325,11 @@ func TestOutboxRegistersFilesFlushedBeforeHandOff(t *testing.T) {
 		if e.OriginNodeID != "writer-1" || e.Tier != "hot" || e.Database != "db" || e.Measurement != "cpu" {
 			t.Fatalf("%s registered as %+v", p, e)
 		}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.pending) != 0 {
+		t.Fatalf("pending registration intents remain after manifest registration: %v", m.pending)
 	}
 }
 
@@ -631,6 +681,9 @@ func TestOutboxHandOffStrandsNothing(t *testing.T) {
 		}()
 		r.HandOff(m, &fakeOutboxStorage{sizes: map[string]int64{}}, "writer-1")
 		wg.Wait()
+		if err := r.SyncRegistrations(); err != nil {
+			t.Fatal(err)
+		}
 		waitOutbox(t, "all registered", func() bool { return r.Pending() == 0 })
 		m.mu.Lock()
 		got := len(m.registered)
@@ -916,5 +969,78 @@ func TestOutboxHoldsRegistrationCoversRecentConfirmations(t *testing.T) {
 	}
 	if r.HoldsRegistration(outPathB) {
 		t.Fatal("an unknown file is held")
+	}
+}
+
+func TestOutboxSyncPublishesPendingRegistrationForOtherNodes(t *testing.T) {
+	r := newTestOutbox(t, t.TempDir())
+	manifest := newFakeOutboxManifest()
+	r.mu.Lock()
+	r.nodeID = "writer-1"
+	r.manifestRef = manifest
+	r.mu.Unlock()
+	r.RegisterFile("db", "measurement", "db/measurement/file.parquet", time.Now(), 12, "sum")
+	if err := r.SyncRegistrations(); err != nil {
+		t.Fatal(err)
+	}
+	manifest.mu.Lock()
+	defer manifest.mu.Unlock()
+	if got := len(manifest.pending["db/measurement/file.parquet"]); got != 1 {
+		t.Fatalf("published pending intent count = %d, want 1", got)
+	}
+}
+
+func TestOutboxPublishesFlushBeforeDrainStarts(t *testing.T) {
+	r := newTestOutbox(t, t.TempDir())
+	manifest := newFakeOutboxManifest()
+	manifest.leaderGate = make(chan struct{})
+	r.HandOff(manifest, &fakeOutboxStorage{sizes: map[string]int64{}}, "writer-1")
+	defer func() {
+		close(manifest.leaderGate)
+		r.Stop()
+	}()
+
+	const path = "db/measurement/flush-before-drain.parquet"
+	r.RegisterFile("db", "measurement", path, time.Now(), 12, "sum")
+	if err := r.SyncRegistrations(); err != nil {
+		t.Fatal(err)
+	}
+	manifest.mu.Lock()
+	defer manifest.mu.Unlock()
+	if len(manifest.pending[path]) != 1 {
+		t.Fatalf("flush returned without publishing its pending intent: %#v", manifest.pending[path])
+	}
+}
+
+func TestOutboxClearUsesOwnerPersistedInJournal(t *testing.T) {
+	dir := t.TempDir()
+	r := newTestOutbox(t, dir)
+	register(r, outPathA, 10)
+	r.mu.Lock()
+	entry := r.byPath[outPathA]
+	entry.rec.OwnerID = "original-writer"
+	r.appendLocked(entry.rec)
+	r.mu.Unlock()
+	if err := r.SyncRegistrations(); err != nil {
+		t.Fatal(err)
+	}
+	crash(r)
+
+	restarted := newTestOutbox(t, dir)
+	defer restarted.Stop()
+	restarted.mu.Lock()
+	restarted.nodeID = "new-process-node-id"
+	entry = restarted.byPath[outPathA]
+	restarted.mu.Unlock()
+	clear, err := restarted.clearIntentOp(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload raft.PendingRegistrationPayload
+	if err := json.Unmarshal(clear.Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.OwnerID != "original-writer" {
+		t.Fatalf("clear owner = %q, want original-writer", payload.OwnerID)
 	}
 }

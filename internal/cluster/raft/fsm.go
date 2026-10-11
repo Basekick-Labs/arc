@@ -162,6 +162,12 @@ const (
 	CommandReleaseStreamClaim
 	// CommandInstanceSettled: an origin with nothing left of an earlier process.
 	CommandInstanceSettled
+	// CommandSetPendingRegistration publishes a file registration intent before
+	// the writer checkpoints the WAL. Intents protect shared storage from
+	// destructive maintenance on other nodes.
+	CommandSetPendingRegistration
+	// CommandClearPendingRegistration removes only the matching writer's intent.
+	CommandClearPendingRegistration
 )
 
 // Command represents a command to be applied to the FSM.
@@ -353,16 +359,25 @@ type AssignCompactorPayload struct {
 }
 
 // BatchFileOp is a single operation within a CommandBatchFileOps command.
-// Type must be CommandRegisterFile, CommandDeleteFile, or CommandUpdateFile;
-// any other value causes the FSM to return an error when the batch is applied.
+// Type must be a file operation or pending-registration intent command; any
+// other value causes the FSM to return an error when the batch is applied.
 type BatchFileOp struct {
-	Type    CommandType `json:"type"`    // CommandRegisterFile, CommandDeleteFile, or CommandUpdateFile
+	Type    CommandType `json:"type"`    // file operations and pending-registration intents
 	Payload []byte      `json:"payload"` // Same payload shape as the corresponding single command
 }
 
 // BatchFileOpsPayload is the payload for CommandBatchFileOps.
 type BatchFileOpsPayload struct {
 	Ops []BatchFileOp `json:"ops"`
+}
+
+// PendingRegistrationPayload identifies one writer's pending file intent.
+// RegistrationID prevents a delayed clear from removing a newer intent for
+// the same path and owner.
+type PendingRegistrationPayload struct {
+	Path           string `json:"path"`
+	OwnerID        string `json:"owner_id"`
+	RegistrationID string `json:"registration_id"`
 }
 
 // TokenEntry represents a single API token in the cluster-wide auth state.
@@ -439,11 +454,12 @@ type RotateTokenPayload struct {
 // entries — no version field required. The reverse (newer snapshot decoded
 // by older binary) silently drops the unknown fields per encoding/json.
 type FSMSnapshot struct {
-	Nodes             map[string]*NodeInfo  `json:"nodes"`
-	PrimaryWriterID   string                `json:"primary_writer_id,omitempty"`
-	ActiveCompactorID string                `json:"active_compactor_id,omitempty"`
-	Files             map[string]*FileEntry `json:"files,omitempty"`  // File manifest (peer replication)
-	Tokens            map[int64]*TokenEntry `json:"tokens,omitempty"` // Cluster-wide auth tokens (Phase A)
+	Nodes                map[string]*NodeInfo                             `json:"nodes"`
+	PrimaryWriterID      string                                           `json:"primary_writer_id,omitempty"`
+	ActiveCompactorID    string                                           `json:"active_compactor_id,omitempty"`
+	Files                map[string]*FileEntry                            `json:"files,omitempty"` // File manifest (peer replication)
+	PendingRegistrations map[string]map[string]PendingRegistrationPayload `json:"pending_registrations,omitempty"`
+	Tokens               map[int64]*TokenEntry                            `json:"tokens,omitempty"` // Cluster-wide auth tokens (Phase A)
 	// Phase A.1: Cluster Auth Convergence (RBAC). Secondary indices
 	// (organizationsByName, teamsByOrg, etc.) are intentionally NOT
 	// persisted — Restore rebuilds them from the primary maps after the
@@ -482,11 +498,12 @@ type ClusterFSM struct {
 	applyStarted atomic.Uint64
 	applyDone    atomic.Uint64
 
-	mu                sync.RWMutex
-	nodes             map[string]*NodeInfo
-	primaryWriterID   string                // ID of the current primary writer node
-	activeCompactorID string                // ID of the node currently holding the compactor lease
-	files             map[string]*FileEntry // File manifest (path → entry) for peer replication
+	mu                   sync.RWMutex
+	nodes                map[string]*NodeInfo
+	primaryWriterID      string                                           // ID of the current primary writer node
+	activeCompactorID    string                                           // ID of the node currently holding the compactor lease
+	files                map[string]*FileEntry                            // File manifest (path → entry) for peer replication
+	pendingRegistrations map[string]map[string]PendingRegistrationPayload // path -> owner/registration identity -> intent
 	// Secondary index: database → set of file paths. Maintained alongside
 	// the primary `files` map on register/delete to avoid O(N) scans when
 	// filtering by database.
@@ -697,13 +714,14 @@ type ClusterFSM struct {
 // NewClusterFSM creates a new cluster FSM.
 func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 	return &ClusterFSM{
-		nodes:          make(map[string]*NodeInfo),
-		barriers:       make(map[string]uint64),
-		files:          make(map[string]*FileEntry),
-		filesByDB:      make(map[string]map[string]struct{}),
-		tokens:         make(map[int64]*TokenEntry),
-		tokensByPrefix: make(map[string][]int64),
-		tokensByName:   make(map[string]int64),
+		nodes:                make(map[string]*NodeInfo),
+		barriers:             make(map[string]uint64),
+		files:                make(map[string]*FileEntry),
+		pendingRegistrations: make(map[string]map[string]PendingRegistrationPayload),
+		filesByDB:            make(map[string]map[string]struct{}),
+		tokens:               make(map[int64]*TokenEntry),
+		tokensByPrefix:       make(map[string][]int64),
+		tokensByName:         make(map[string]int64),
 
 		// Phase A.1: RBAC primary maps + secondary indices.
 		organizations:           make(map[int64]*OrganizationEntry),
@@ -1114,6 +1132,10 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.applySetCompactionPause(cmd.Payload)
 	case CommandAckCompactionPause:
 		return f.applyAckCompactionPause(cmd.Payload)
+	case CommandSetPendingRegistration:
+		return f.applyPendingRegistration(cmd.Payload, true)
+	case CommandClearPendingRegistration:
+		return f.applyPendingRegistration(cmd.Payload, false)
 
 	default:
 		return fmt.Errorf("unknown command type: %d", cmd.Type)
@@ -1908,6 +1930,15 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 				return fmt.Errorf("batch file ops: op[%d]: delete file: path is required", i)
 			}
 			decoded[i] = dp
+		case CommandSetPendingRegistration, CommandClearPendingRegistration:
+			var pending PendingRegistrationPayload
+			if err := json.Unmarshal(op.Payload, &pending); err != nil {
+				return fmt.Errorf("batch file ops: op[%d] unmarshal: %w", i, err)
+			}
+			if err := validatePendingRegistration(pending); err != nil {
+				return fmt.Errorf("batch file ops: op[%d]: %w", i, err)
+			}
+			decoded[i] = pending
 		default:
 			return fmt.Errorf("batch file ops: op[%d] unsupported type: %d", i, op.Type)
 		}
@@ -1946,6 +1977,10 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 			emit = f.applyUpdateFileLocked(
 				decoded[i].(UpdateFilePayload), logIndex,
 			)
+		case CommandSetPendingRegistration:
+			f.applyPendingRegistrationLocked(decoded[i].(PendingRegistrationPayload), true)
+		case CommandClearPendingRegistration:
+			f.applyPendingRegistrationLocked(decoded[i].(PendingRegistrationPayload), false)
 		default:
 			// Unreachable after pre-validation. Do not retain the lock
 			// on this defensive error path.
@@ -1966,6 +2001,83 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 		emit()
 	}
 	return nil
+}
+
+func validatePendingRegistration(p PendingRegistrationPayload) error {
+	if err := ValidateManifestPath(p.Path); err != nil {
+		return fmt.Errorf("pending registration path: %w", err)
+	}
+	if p.OwnerID == "" || p.RegistrationID == "" {
+		return fmt.Errorf("pending registration owner_id and registration_id are required")
+	}
+	if len(p.OwnerID) > 256 || len(p.RegistrationID) > 256 {
+		return fmt.Errorf("pending registration owner_id and registration_id must be at most 256 bytes")
+	}
+	return nil
+}
+
+func pendingRegistrationKey(p PendingRegistrationPayload) string {
+	return p.OwnerID + "\x00" + p.RegistrationID
+}
+
+func (f *ClusterFSM) applyPendingRegistration(payload []byte, set bool) interface{} {
+	var p PendingRegistrationPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal pending registration payload: %w", err)
+	}
+	if err := validatePendingRegistration(p); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	f.applyPendingRegistrationLocked(p, set)
+	f.mu.Unlock()
+	return nil
+}
+
+// applyPendingRegistrationLocked applies an exact identity mutation. Clear is
+// a compare-and-delete so a delayed acknowledgement cannot remove a newer
+// registration for the same path and owner.
+func (f *ClusterFSM) applyPendingRegistrationLocked(p PendingRegistrationPayload, set bool) {
+	if set {
+		byID := f.pendingRegistrations[p.Path]
+		if byID == nil {
+			byID = make(map[string]PendingRegistrationPayload)
+			f.pendingRegistrations[p.Path] = byID
+		}
+		byID[pendingRegistrationKey(p)] = p
+		return
+	}
+	byID := f.pendingRegistrations[p.Path]
+	key := pendingRegistrationKey(p)
+	if existing, ok := byID[key]; ok && existing.OwnerID == p.OwnerID {
+		delete(byID, key)
+		if len(byID) == 0 {
+			delete(f.pendingRegistrations, p.Path)
+		}
+	}
+}
+
+// HasPendingRegistration reports whether any writer has an outstanding
+// registration intent for path.
+func (f *ClusterFSM) HasPendingRegistration(path string) bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return len(f.pendingRegistrations[path]) > 0
+}
+
+// GetPendingRegistrations returns a copy of the pending intents for path.
+func (f *ClusterFSM) GetPendingRegistrations(path string) []PendingRegistrationPayload {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	byID := f.pendingRegistrations[path]
+	if len(byID) == 0 {
+		return nil
+	}
+	out := make([]PendingRegistrationPayload, 0, len(byID))
+	for _, pending := range byID {
+		out = append(out, pending)
+	}
+	return out
 }
 
 // rejectToken centralises FSM-side rejection of a malformed token command.
@@ -2449,6 +2561,14 @@ func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 		fileCopy := *file
 		files[path] = &fileCopy
 	}
+	pendingRegistrations := make(map[string]map[string]PendingRegistrationPayload, len(f.pendingRegistrations))
+	for path, byID := range f.pendingRegistrations {
+		copyByID := make(map[string]PendingRegistrationPayload, len(byID))
+		for id, pending := range byID {
+			copyByID[id] = pending
+		}
+		pendingRegistrations[path] = copyByID
+	}
 
 	// Deep copy tokens
 	tokens := make(map[int64]*TokenEntry, len(f.tokens))
@@ -2514,6 +2634,7 @@ func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 		primaryWriterID:        f.primaryWriterID,
 		activeCompactorID:      f.activeCompactorID,
 		files:                  files,
+		pendingRegistrations:   pendingRegistrations,
 		tokens:                 tokens,
 		organizations:          organizations,
 		teams:                  teams,
@@ -2870,6 +2991,22 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	f.primaryWriterID = snapshot.PrimaryWriterID
 	f.activeCompactorID = snapshot.ActiveCompactorID
 	f.files = restoredFiles
+	restoredPending := make(map[string]map[string]PendingRegistrationPayload, len(snapshot.PendingRegistrations))
+	for path, byID := range snapshot.PendingRegistrations {
+		if ValidateManifestPath(path) != nil {
+			continue
+		}
+		for key, pending := range byID {
+			if pending.Path != path || pendingRegistrationKey(pending) != key || validatePendingRegistration(pending) != nil {
+				continue
+			}
+			if restoredPending[path] == nil {
+				restoredPending[path] = make(map[string]PendingRegistrationPayload)
+			}
+			restoredPending[path][key] = pending
+		}
+	}
+	f.pendingRegistrations = restoredPending
 	// Rebuild the database → files secondary index from the restored files
 	f.filesByDB = make(map[string]map[string]struct{}, len(f.files))
 	for path, entry := range f.files {
@@ -3213,11 +3350,12 @@ func (f *ClusterFSM) FileCount() int {
 
 // fsmSnapshot implements raft.FSMSnapshot.
 type fsmSnapshot struct {
-	nodes             map[string]*NodeInfo
-	primaryWriterID   string
-	activeCompactorID string
-	files             map[string]*FileEntry
-	tokens            map[int64]*TokenEntry
+	nodes                map[string]*NodeInfo
+	primaryWriterID      string
+	activeCompactorID    string
+	files                map[string]*FileEntry
+	pendingRegistrations map[string]map[string]PendingRegistrationPayload
+	tokens               map[int64]*TokenEntry
 
 	// Phase A.1: RBAC primary maps (no secondary indices persisted).
 	organizations          map[int64]*OrganizationEntry
@@ -3238,6 +3376,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 		PrimaryWriterID:        s.primaryWriterID,
 		ActiveCompactorID:      s.activeCompactorID,
 		Files:                  s.files,
+		PendingRegistrations:   s.pendingRegistrations,
 		Tokens:                 s.tokens,
 		Organizations:          s.organizations,
 		Teams:                  s.teams,

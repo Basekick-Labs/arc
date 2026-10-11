@@ -3730,27 +3730,37 @@ type FileRegistrationSyncer interface {
 	SyncRegistrations() error
 }
 
+// FileRegistrationPublisher makes registrations visible to cluster peers.
+// It is used without a WAL too: shared-storage maintenance must see a pending
+// file before its flush returns even when there is no checkpoint to order.
+type FileRegistrationPublisher interface {
+	PublishPendingRegistrations() error
+}
+
 // completeFlush runs once a flush's files are written and registered. The
 // registrations are made durable before the WAL checkpoint, so the WAL cannot
-// drop rows whose file the cluster has no durable record of (#1209). One
-// sync per flush, however many hourly files it wrote, and none without a WAL.
+// drop rows whose file the cluster has no durable record of (#1209). The
+// cluster outbox also publishes pending intents before a no-WAL flush returns.
 //
 // A covered flush (#1207) checkpoints without releasing the purge floor: the
 // group releases its WAL entries once every file has settled in the outbox.
 func (b *ArrowBuffer) completeFlush(walHashes []string, group *flushGroup) {
-	// Without a WAL there is no checkpoint to order the sync before, and the
-	// unsynced append already survives a process crash; skipping it keeps
-	// serial flushes (Close, the aged sweep) from paying a fsync each.
-	if ref := b.fileRegistrar.Load(); ref != nil && b.wal != nil {
-		if syncer, ok := ref.FileRegistrar.(FileRegistrationSyncer); ok {
-			if err := syncer.SyncRegistrations(); err != nil {
-				// Checkpointing anyway is deliberate. The registrations are
-				// still held in memory and register in this process; only a
-				// crash before that loses them, leaving a file this writer
-				// alone can query. Withholding the checkpoint would replay
-				// these rows into a second file instead: duplicates on every
-				// node.
-				b.logger.Error().Err(err).Msg("Failed to persist file registrations before the WAL checkpoint")
+	if ref := b.fileRegistrar.Load(); ref != nil {
+		if b.wal != nil {
+			if syncer, ok := ref.FileRegistrar.(FileRegistrationSyncer); ok {
+				if err := syncer.SyncRegistrations(); err != nil {
+					// Checkpointing anyway is deliberate. The registrations are
+					// still held in memory and register in this process; only a
+					// crash before that loses them, leaving a file this writer
+					// alone can query. Withholding the checkpoint would replay
+					// these rows into a second file instead: duplicates on every
+					// node.
+					b.logger.Error().Err(err).Msg("Failed to persist file registrations before the WAL checkpoint")
+				}
+			}
+		} else if publisher, ok := ref.FileRegistrar.(FileRegistrationPublisher); ok {
+			if err := publisher.PublishPendingRegistrations(); err != nil {
+				b.logger.Error().Err(err).Msg("Failed to publish pending file registrations after a no-WAL flush")
 			}
 		}
 	}
