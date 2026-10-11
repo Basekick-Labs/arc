@@ -1214,6 +1214,8 @@ until its registration is applied. Registering the file and clearing its
 matching intent happen in one Raft batch; snapshots retain outstanding intents
 across node restarts.
 
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1217](https://github.com/Basekick-Labs/arc/pull/1217).
+
 ### Delete API removes the inactive SQL Server prefix scan ([#1077](https://github.com/Basekick-Labs/arc/issues/1077))
 
 The WHERE validator no longer lists or checks `xp_` and `sp_`. The lowercase
