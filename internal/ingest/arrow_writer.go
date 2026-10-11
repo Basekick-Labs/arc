@@ -2152,10 +2152,14 @@ func (b *ArrowBuffer) enqueueOrDeferLocked(
 	}
 
 	task.taskID = b.beginAsyncFlushTask()
+	// Reserve the counters before publishing the task: a worker may receive
+	// from flushQueue immediately after the send and decrement them before
+	// this goroutine resumes. Roll the reservation back if the non-blocking
+	// send loses the race or shutdown cancels it.
+	b.queueDepth.Add(1)
+	b.queuedRecords.Add(int64(task.recordCount))
 	select {
 	case b.flushQueue <- task:
-		b.queueDepth.Add(1)
-		b.queuedRecords.Add(int64(task.recordCount))
 		// enqueueOrDeferLocked holds shard.mu; publishBufferMetrics also
 		// scans shards under RLock, which would self-deadlock here. Publish
 		// only the queue counters while the shard lock is held. The sampler
@@ -2170,11 +2174,19 @@ func (b *ArrowBuffer) enqueueOrDeferLocked(
 		delete(shard.bufferSchemas, bufferKey)
 		return true, false
 	case <-b.ctx.Done():
+		b.queueDepth.Add(-1)
+		b.queuedRecords.Add(-int64(task.recordCount))
+		metrics.Get().SetBufferQueueDepth(b.queueDepth.Load())
+		metrics.Get().SetBufferQueuedRecords(b.queuedRecords.Load())
 		b.completeAsyncFlushTask(task.taskID)
 		// Close cancelled b.ctx between the checks above and this select. The
 		// records stay in the buffer for Close's shard loop.
 		return false, false
 	default:
+		b.queueDepth.Add(-1)
+		b.queuedRecords.Add(-int64(task.recordCount))
+		metrics.Get().SetBufferQueueDepth(b.queueDepth.Load())
+		metrics.Get().SetBufferQueuedRecords(b.queuedRecords.Load())
 		b.completeAsyncFlushTask(task.taskID)
 		// Lost the race against another writer for the last slot.
 		b.markDeferredLocked(shard, bufferKey)
