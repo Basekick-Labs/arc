@@ -1353,13 +1353,11 @@ func (h *RetentionHandler) deleteOldColdFiles(ctx context.Context, database, mea
 	for _, file := range files {
 		fullPath, err := readParquetPath(coldBackend, file.Path)
 		if err != nil {
-			h.logger.Warn().Err(err).Str("file", file.Path).Msg("Failed to resolve cold-tier file for retention")
-			continue
+			return deletedRows, deletedFiles, fmt.Errorf("failed to resolve cold-tier file %q for retention: %w", file.Path, err)
 		}
 		maxTime, rowCount, err := h.getFileMaxTimeAndRowCount(ctx, fullPath)
 		if err != nil {
-			h.logger.Warn().Err(err).Str("file", file.Path).Msg("Failed to read cold-tier file metadata")
-			continue
+			return deletedRows, deletedFiles, fmt.Errorf("failed to read cold-tier file %q metadata for retention: %w", file.Path, err)
 		}
 		if !maxTime.Before(cutoffDate) {
 			continue
