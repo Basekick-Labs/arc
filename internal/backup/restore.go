@@ -945,10 +945,9 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 	// reg's pending rows are abandoned on an early return because a failed
 	// restore is re-run and the cluster re-derives its manifest, but a tier
 	// row has no such second chance. The bytes are already in the cold store,
-	// and on a standalone node — or a cluster without shared storage or
-	// replication — nothing ever writes the row, because the cold-metadata
-	// sync does not run there. A file whose bytes landed and whose row was
-	// dropped is unreadable indefinitely.
+	// and a later scan is not a substitute for this flush: until a scan
+	// succeeds the file has no row and is unreadable, including on a standalone
+	// node where cold metadata sync does run.
 	batch := newColdRowBatch()
 	defer func() {
 		m.flushColdRows(ctx, batch, progress)
@@ -1343,8 +1342,8 @@ func (m *Manager) flushColdRowsTo(ctx context.Context, batch *coldRowBatch, prog
 		// transaction per call — so the whole chunk is unrecorded. The bytes
 		// are in storage; only the rows are missing, so those files are not
 		// yet queryable. Warn rather than fail: the rest of the restore is
-		// sound, and on a cluster whose gate runs it the tiering cold sync
-		// records the rows. On a standalone node nothing will.
+		// sound. A later successful tier scan can record the missing rows,
+		// including on a standalone node; until then the files are not queryable.
 		atomic.AddInt64(&progress.ColdRowsNotRecorded, submitted)
 		event := m.logger.Warn().Int64("files", submitted).Err(err)
 		if toCold {
