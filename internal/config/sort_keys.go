@@ -6,15 +6,16 @@ import (
 )
 
 // ParseSortKeys parses sort key configuration from IngestConfig.
-// Format: ["measurement:col1,col2", ...]
+// Format: ["measurement:col1,col2,time:desc", ...]
 //
-// Users only configure ADDITIONAL sort columns - the "time" column is always
-// appended automatically at the usage site (getSortKeys in arrow_writer.go).
+// Users may configure ADDITIONAL sort columns - the "time" column is appended
+// automatically at the usage site (getSortKeys in arrow_writer.go), descending
+// by default unless a direction is explicit.
 // This simplifies configuration: users don't need to remember to include "time".
 //
 // Returns:
 //   - map[measurement][]sortKeys: Per-measurement sort key configuration
-//   - []string: Default sort keys (additional columns before time)
+//   - []string: Default sort keys; time is appended descending when not explicit
 //   - error: If configuration is invalid
 func ParseSortKeys(cfg IngestConfig) (map[string][]string, []string, error) {
 	// Parse measurement-specific sort keys
@@ -48,8 +49,8 @@ func ParseSortKeys(cfg IngestConfig) (map[string][]string, []string, error) {
 		sortKeysMap[measurement] = parsedKeys
 	}
 
-	// Parse default sort keys (additional columns before time)
-	// Empty string means time-only sorting (no additional columns)
+	// Parse default sort keys (additional columns before time).
+	// Empty means no additional columns; time still defaults to descending.
 	var parsedDefaultKeys []string
 	if cfg.DefaultSortKeys != "" {
 		defaultKeys := strings.Split(cfg.DefaultSortKeys, ",")
@@ -64,7 +65,7 @@ func ParseSortKeys(cfg IngestConfig) (map[string][]string, []string, error) {
 
 	// Note: We intentionally don't add "time" here.
 	// The "time" column is always appended at the usage site (getSortKeys).
-	// Empty parsedDefaultKeys means "time-only sorting".
+	// Empty parsedDefaultKeys means "descending time-only sorting".
 
 	return sortKeysMap, parsedDefaultKeys, nil
 }

@@ -26,6 +26,7 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/sortkey"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/basekick-labs/arc/internal/wal"
@@ -1421,8 +1422,8 @@ func (b *ArrowBuffer) markFlushFailure() {
 }
 
 // getSortKeys returns sort keys for a measurement.
-// Users configure ADDITIONAL sort columns - "time" is always appended automatically.
-// This ensures data is always sorted by time within each partition.
+// Users configure ADDITIONAL sort columns - a configured time key or the
+// descending time default is always present within each partition.
 func (b *ArrowBuffer) getSortKeys(measurement string) []string {
 	var keys []string
 
@@ -1437,13 +1438,13 @@ func (b *ArrowBuffer) getSortKeys(measurement string) []string {
 	// Always ensure "time" is the last sort key
 	// Skip adding if already present (backwards compatibility with legacy configs)
 	for _, k := range keys {
-		if k == "time" {
+		if sortkey.Parse(k).Column == "time" {
 			return keys
 		}
 	}
 
-	// Append "time" - users configure ADDITIONAL sort keys only
-	return append(keys, "time")
+	// Append the configured time direction, or the DESC default.
+	return append(keys, sortkey.TimeKey(b.defaultSortKeys))
 }
 
 // getDecimalColumns returns the decimal column config for a measurement.
@@ -1504,7 +1505,7 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 	if err != nil {
 		logger.Warn().Err(err).Msg("Invalid sort keys config, using defaults")
 		sortKeysConfig = make(map[string][]string)
-		defaultSortKeys = []string{"time"}
+		defaultSortKeys = []string{"time:desc"}
 	}
 
 	// Parse decimal column config
@@ -4119,20 +4120,28 @@ func sortColumnsByKeysWithPermutation(columns map[string]interface{}, sortKeys [
 		return nil, nil, fmt.Errorf("no sort keys provided")
 	}
 
-	// FAST PATH: Time-only sort (most common case) - avoid multi-key overhead
-	if len(sortKeys) == 1 && sortKeys[0] == "time" {
+	// FAST PATH: Time-only sort (most common case) - avoid multi-key overhead.
+	if len(sortKeys) == 1 && sortkey.Parse(sortKeys[0]).Column == "time" {
+		key := sortkey.Parse(sortKeys[0])
+		if key.Desc {
+			sorted, indices, err := sortColumnsByTimeOnlyDescendingWithPermutation(columns)
+			return sorted, indices, err
+		}
 		sorted, indices, err := sortColumnsByTimeOnlyWithPermutation(columns)
 		return sorted, indices, err
 	}
 
 	// Validate all sort keys exist and cache column pointers
 	cachedCols := make([]interface{}, len(sortKeys))
+	descending := make([]bool, len(sortKeys))
 	for i, key := range sortKeys {
-		col, exists := columns[key]
+		parsed := sortkey.Parse(key)
+		col, exists := columns[parsed.Column]
 		if !exists {
-			return nil, nil, fmt.Errorf("sort key column not found: %s", key)
+			return nil, nil, fmt.Errorf("sort key column not found: %s", parsed.Column)
 		}
 		cachedCols[i] = col
+		descending[i] = parsed.Desc
 	}
 
 	// Get first column to determine row count
@@ -4167,7 +4176,7 @@ func sortColumnsByKeysWithPermutation(columns map[string]interface{}, sortKeys [
 
 	// Multi-key sort with cached columns (no map lookups in comparator)
 	sort.Slice(indices, func(i, j int) bool {
-		return compareMultiKeyCached(cachedCols, indices[i], indices[j])
+		return compareMultiKeyCached(cachedCols, descending, indices[i], indices[j])
 	})
 
 	// Apply permutation to all columns
@@ -4220,6 +4229,31 @@ func sortColumnsByTimeOnlyWithPermutation(columns map[string]interface{}) (map[s
 	return result, indices, nil
 }
 
+// sortColumnsByTimeOnlyDescendingWithPermutation is the descending counterpart
+// of the common time-only fast path.
+func sortColumnsByTimeOnlyDescendingWithPermutation(columns map[string]interface{}) (map[string]interface{}, []int, error) {
+	timeCol, exists := columns["time"]
+	if !exists {
+		return nil, nil, fmt.Errorf("time column not found")
+	}
+	times, ok := timeCol.([]int64)
+	if !ok {
+		return nil, nil, fmt.Errorf("time column is not []int64")
+	}
+	if len(times) == 0 {
+		return columns, nil, nil
+	}
+	indices := permuteByTimeDescending(times)
+	if indices == nil {
+		return columns, nil, nil
+	}
+	result := make(map[string]interface{}, len(columns))
+	for colName, colData := range columns {
+		result[colName] = applyPermutation(colData, indices)
+	}
+	return result, indices, nil
+}
+
 // radixSkipThreshold: below this row count the comparison sort wins (radix's fixed
 // per-pass overhead isn't amortized), so permuteByTime uses sort.Slice for small buffers.
 const radixSkipThreshold = 4096
@@ -4264,6 +4298,36 @@ func permuteByTime(times []int64) []int {
 	return radixPermuteByTime(times)
 }
 
+// permuteByTimeDescending returns the stable descending-time permutation, or
+// nil when the input is already in descending order.
+func permuteByTimeDescending(times []int64) []int {
+	n := len(times)
+	if n == 0 {
+		return nil
+	}
+	alreadySorted := true
+	for i := 1; i < n; i++ {
+		if times[i] > times[i-1] {
+			alreadySorted = false
+			break
+		}
+	}
+	if alreadySorted {
+		return nil
+	}
+	if n < radixSkipThreshold {
+		indices := make([]int, n)
+		for i := range indices {
+			indices[i] = i
+		}
+		sort.SliceStable(indices, func(i, j int) bool {
+			return times[indices[i]] > times[indices[j]]
+		})
+		return indices
+	}
+	return radixPermuteByTimeOrder(times, true)
+}
+
 // permuteByTimeSort is the comparison-sort path for small buffers.
 func permuteByTimeSort(times []int64) []int {
 	n := len(times)
@@ -4292,6 +4356,10 @@ func radixSortBias(t int64) uint64 {
 // which makes the near-constant high-order bytes (all timestamps near "now") almost free.
 // Stable, which keeps equal-timestamp rows in arrival order.
 func radixPermuteByTime(times []int64) []int {
+	return radixPermuteByTimeOrder(times, false)
+}
+
+func radixPermuteByTimeOrder(times []int64, descending bool) []int {
 	n := len(times)
 	if n == 0 {
 		// Defensive: permuteByTime already short-circuits empty input, but guard here
@@ -4308,10 +4376,10 @@ func radixPermuteByTime(times []int64) []int {
 	for shift := uint(0); shift < 64; shift += 8 {
 		count = [256]int{}
 		for _, ix := range src {
-			count[(radixSortBias(times[ix])>>shift)&0xff]++
+			count[(timeSortKey(times[ix], descending)>>shift)&0xff]++
 		}
 		// Skip this pass if all keys fall in a single bucket (e.g. constant high bytes).
-		if count[(radixSortBias(times[src[0]])>>shift)&0xff] == n {
+		if count[(timeSortKey(times[src[0]], descending)>>shift)&0xff] == n {
 			continue
 		}
 		sum := 0
@@ -4321,7 +4389,7 @@ func radixPermuteByTime(times []int64) []int {
 			sum += c
 		}
 		for _, ix := range src {
-			b := (radixSortBias(times[ix]) >> shift) & 0xff
+			b := (timeSortKey(times[ix], descending) >> shift) & 0xff
 			dst[count[b]] = ix
 			count[b]++
 		}
@@ -4330,51 +4398,60 @@ func radixPermuteByTime(times []int64) []int {
 	return src
 }
 
+func timeSortKey(t int64, descending bool) uint64 {
+	key := radixSortBias(t)
+	if descending {
+		return ^key
+	}
+	return key
+}
+
 // compareMultiKeyCached compares two rows by multiple sort keys using cached column pointers
 // This avoids map lookups on every comparison (called O(n log n) times)
-func compareMultiKeyCached(cachedCols []interface{}, i, j int) bool {
-	for _, col := range cachedCols {
+func compareMultiKeyCached(cachedCols []interface{}, descending []bool, i, j int) bool {
+	for keyIndex, col := range cachedCols {
+		cmp := 0
 		switch c := col.(type) {
 		case []int64:
 			if c[i] < c[j] {
-				return true
+				cmp = -1
+			} else if c[i] > c[j] {
+				cmp = 1
 			}
-			if c[i] > c[j] {
-				return false
-			}
-			// Equal, continue to next key
 
 		case []float64:
 			if c[i] < c[j] {
-				return true
-			}
-			if c[i] > c[j] {
-				return false
+				cmp = -1
+			} else if c[i] > c[j] {
+				cmp = 1
 			}
 
 		case []string:
 			if c[i] < c[j] {
-				return true
-			}
-			if c[i] > c[j] {
-				return false
+				cmp = -1
+			} else if c[i] > c[j] {
+				cmp = 1
 			}
 
 		case []bool:
 			if !c[i] && c[j] { // false < true
-				return true
-			}
-			if c[i] && !c[j] {
-				return false
+				cmp = -1
+			} else if c[i] && !c[j] {
+				cmp = 1
 			}
 
 		case []decimal128.Num:
 			if c[i].Less(c[j]) {
-				return true
+				cmp = -1
+			} else if c[i].Greater(c[j]) {
+				cmp = 1
 			}
-			if c[i].Greater(c[j]) {
-				return false
+		}
+		if cmp != 0 {
+			if keyIndex < len(descending) && descending[keyIndex] {
+				return cmp > 0
 			}
+			return cmp < 0
 		}
 	}
 

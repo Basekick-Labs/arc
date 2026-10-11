@@ -2,6 +2,8 @@ package ingest
 
 import (
 	"math/rand"
+	"reflect"
+	"sort"
 	"testing"
 )
 
@@ -184,6 +186,34 @@ func TestPermuteByTime_MatchesReference(t *testing.T) {
 			if seq[i] != refSeq[i] {
 				t.Fatalf("trial %d: ordered time mismatch at %d (n=%d)", trial, i, n)
 			}
+		}
+	}
+}
+
+func TestPermuteByTimeDescending_MatchesStableReference(t *testing.T) {
+	rng := rand.New(rand.NewSource(155))
+	for trial := 0; trial < 30; trial++ {
+		n := radixSkipThreshold - 300 + rng.Intn(900)
+		times := make([]int64, n)
+		for i := range times {
+			times[i] = rng.Int63n(2000) - 1000
+		}
+		got := permuteByTimeDescending(times)
+		want := make([]int, n)
+		for i := range want {
+			want[i] = i
+		}
+		sort.SliceStable(want, func(i, j int) bool {
+			return times[want[i]] > times[want[j]]
+		})
+		if got == nil {
+			got = make([]int, n)
+			for i := range got {
+				got[i] = i
+			}
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("trial %d: descending permutation differs from stable reference", trial)
 		}
 	}
 }
