@@ -797,40 +797,56 @@ an unbounded operation.
 
 ## Bug fixes
 
-### Rows a cluster writer recovers from its WAL after a crash reach every node ([#1206](https://github.com/Basekick-Labs/arc/issues/1206))
+### Every file a cluster writer flushes reaches the cluster manifest ([#1206](https://github.com/Basekick-Labs/arc/issues/1206), [#1209](https://github.com/Basekick-Labs/arc/issues/1209))
 
-When a cluster writer restarted after a crash, startup WAL recovery wrote the
-rows it had not flushed to Parquet and then deleted the WAL files. Those files
-were never announced to the cluster manifest, because the manifest registrar
-was attached to the ingest buffer only after the cluster coordinator had
-started. Only the writer that wrote them could query those rows: readers and
-the other writers never pulled them. With `reconciliation.enabled`, the
-orphan-storage sweep could delete them after the grace window, and on a writer
-they were the only copy. The same applied to anything else flushed before the
-registrar was attached, such as MQTT ingest, which starts first. With auth
-enabled that window includes waiting up to 30 s for a leader.
+Readers and the other writers learn about a writer's Parquet files from the
+cluster manifest, and a file that never reaches it can be queried on its writer
+only. Several paths lost files that way, with nothing to re-register them:
+
+- **Startup.** The manifest registrar was attached only after the cluster
+  coordinator had started. Files flushed before that, above all by startup WAL
+  recovery after a crash, which then deletes the WAL files, were never
+  announced. MQTT ingest, which starts first, was affected too. With auth
+  enabled the window includes waiting up to 30 s for a leader.
+- **Steady state.** The registrar held a 4096-entry in-memory queue, dropped
+  files when it was full, gave up on a file after one failed attempt (for
+  example while the cluster had no quorum), and kept nothing on disk. A crash
+  between a flush and its registration also lost the file, because the flush
+  checkpoints the WAL right after registering.
+
+With `reconciliation.enabled`, the orphan-storage sweep could then delete such
+a file after the grace window, and on a writer it was the only copy.
 
 A node that ingests (a `writer`, or `standalone` with `cluster.enabled`) now
-announces those files once the cluster is up. Until then it keeps them in
-`pending-registrations.jsonl` in `cluster.raft_data_dir`, written before
-recovery deletes the WAL, so a node killed again during startup still announces
-them on its next start. It checks each file in storage right before registering
-it and skips any that is gone or has changed size, and it keeps retrying until
-a leader accepts them. Readers and compactors do not do this: their WAL holds
-nothing they should announce. The journal disappears once everything in it is
-registered; do not delete it by hand while it exists. Records in it are tied to
+records every file it flushes in `pending-registrations.jsonl` in
+`cluster.raft_data_dir`. With the WAL enabled, each flush makes those records
+durable before it checkpoints the WAL, with one fsync per flush; without the WAL
+there is no checkpoint to order and no fsync is added. The node registers the files once
+the cluster is up, in batches, retrying every failure until the manifest
+confirms them. A file that is gone or has changed size by then is skipped. The
+record is removed once the manifest confirms the file, and the journal is
+emptied whenever nothing is pending, so it stays near zero bytes in normal
+operation.
+
+While the manifest cannot be reached, each flushed file adds about 300 bytes to
+the journal on the Raft data volume and about 500 bytes of memory, so a
+million-file backlog is about 0.3 GB on disk and 0.5 GB in memory. New metrics:
+`arc_cluster_file_registrations_pending`,
+`arc_cluster_file_registration_oldest_pending_seconds`,
+`arc_cluster_file_registrations_confirmed_total` and
+`arc_cluster_file_registration_journal_errors_total`. Once the oldest pending
+file has waited a minute, the node logs at Error every five minutes. Do not
+delete the journal by hand while it holds records. Records in it are tied to
 `cluster.cluster_name`, and a node started under a different cluster name drops
-them with a warning.
+them with a warning. Readers and compactors do not keep one: nothing they flush
+should be announced.
 
-Two limits. A row DELETE that rewrites such a file before it is registered,
-which needs a leader outage during startup since the HTTP API starts after the
-hand-off, leaves the rewritten file unannounced
-([#1210](https://github.com/Basekick-Labs/arc/issues/1210)). And files already left
-unregistered by earlier versions are not picked up retroactively.
-
-The live registrar also retries a registration that fails only because no
-leader is known yet, within its existing per-file deadline, instead of dropping
-the file.
+Two limits. A row DELETE that rewrites a file before it is registered leaves the
+rewritten file unannounced
+([#1210](https://github.com/Basekick-Labs/arc/issues/1210)). In steady state that
+window is the time a registration takes; while the manifest is unreachable, it
+lasts the whole outage. And files already left unregistered by earlier versions
+are not picked up retroactively.
 
 ### Delete API removes the inactive SQL Server prefix scan ([#1077](https://github.com/Basekick-Labs/arc/issues/1077))
 

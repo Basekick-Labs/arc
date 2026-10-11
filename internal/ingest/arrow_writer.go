@@ -923,9 +923,9 @@ func collectWALHashes(records []interface{}) []string {
 
 // FileRegistrar announces a newly written Parquet file to the cluster-wide
 // manifest. Implementations should be non-blocking — file registration is
-// fire-and-forget from the flush path's perspective. The one exception is the
-// cluster early registrar before its hand-off, which fsyncs a journal entry
-// so a file flushed during startup survives a crash (#1206). Wired by the cluster
+// fire-and-forget from the flush path's perspective. The cluster registration
+// outbox appends to a local journal here and is made durable once per flush
+// through FileRegistrationSyncer (#1206, #1209). Wired by the cluster
 // coordinator when peer replication is enabled (Enterprise feature).
 //
 // sha256 is a hex-encoded content checksum of the Parquet file bytes.
@@ -1679,9 +1679,9 @@ func (b *ArrowBuffer) registerFileInTiering(ctx context.Context, database, measu
 		}
 	}
 
-	// Announce to cluster-wide file manifest (peer replication).
-	// The registrar implementation MUST be non-blocking — it's called on
-	// the hot flush path.
+	// Announce to cluster-wide file manifest (peer replication). Called on
+	// the flush path: the registrar must not block on the network. The outbox
+	// only appends here; completeFlush makes it durable once per flush.
 	if ref := b.fileRegistrar.Load(); ref != nil && ref.FileRegistrar != nil {
 		ref.RegisterFile(database, measurement, storagePath, partitionTime, sizeBytes, sha256Hex)
 	}
@@ -3566,8 +3566,39 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 		// WAL will be replayed on restart or via periodic recovery
 		return err
 	}
-	b.markWALFlushed(walHashes)
+	b.completeFlush(walHashes)
 	return nil
+}
+
+// FileRegistrationSyncer is implemented by a FileRegistrar whose RegisterFile
+// only appends to a journal (the cluster registration outbox, #1209). Its
+// SyncRegistrations makes those appends durable.
+type FileRegistrationSyncer interface {
+	SyncRegistrations() error
+}
+
+// completeFlush runs once a flush's files are written and registered. The
+// registrations are made durable before the WAL checkpoint, so the WAL cannot
+// drop rows whose file the cluster has no durable record of (#1209). One
+// sync per flush, however many hourly files it wrote, and none without a WAL.
+func (b *ArrowBuffer) completeFlush(walHashes []string) {
+	// Without a WAL there is no checkpoint to order the sync before, and the
+	// unsynced append already survives a process crash; skipping it keeps
+	// serial flushes (Close, the aged sweep) from paying a fsync each.
+	if ref := b.fileRegistrar.Load(); ref != nil && b.wal != nil {
+		if syncer, ok := ref.FileRegistrar.(FileRegistrationSyncer); ok {
+			if err := syncer.SyncRegistrations(); err != nil {
+				// Checkpointing anyway is deliberate. The registrations are
+				// still held in memory and register in this process; only a
+				// crash before that loses them, leaving a file this writer
+				// alone can query. Withholding the checkpoint would replay
+				// these rows into a second file instead: duplicates on every
+				// node.
+				b.logger.Error().Err(err).Msg("Failed to persist file registrations before the WAL checkpoint")
+			}
+		}
+	}
+	b.markWALFlushed(walHashes)
 }
 
 func (b *ArrowBuffer) markWALFlushed(hashes []string) {
@@ -3866,7 +3897,7 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 		// WAL will be replayed on restart or via periodic recovery
 		return err
 	}
-	b.markWALFlushed(walHashes)
+	b.completeFlush(walHashes)
 	completeTask()
 
 	// Re-acquire lock for caller

@@ -1,6 +1,6 @@
 package main
 
-// #1206: the registrar that announces files flushed before the cluster is up
+// #1206, #1209: the outbox that announces every file this node flushes
 // must be on the ArrowBuffer before anything can flush. These pin the order in
 // main.go itself, so moving the call back below startup recovery fails here.
 
@@ -13,7 +13,7 @@ import (
 	"github.com/rs/zerolog"
 )
 
-func TestEarlyFileRegistrarIsAttachedBeforeAnythingFlushes(t *testing.T) {
+func TestRegistrationOutboxIsAttachedBeforeAnythingFlushes(t *testing.T) {
 	src, err := os.ReadFile("main.go")
 	if err != nil {
 		t.Fatal(err)
@@ -27,26 +27,26 @@ func TestEarlyFileRegistrarIsAttachedBeforeAnythingFlushes(t *testing.T) {
 		}
 		return i
 	}
-	attach := pos("arrowBuffer.SetFileRegistrar(earlyRegistrar)")
+	attach := pos("arrowBuffer.SetFileRegistrar(registrationOutbox)")
 	for _, flusher := range []string{
 		"walRecovery.RecoverWithOptions(", // startup recovery flushes, then deletes the WAL
 		"mqttManager.Start(",              // MQTT ingest
 		"cluster.NewCoordinatorFileRegistrar(",
 	} {
 		if at := pos(flusher); attach > at {
-			t.Errorf("the early registrar is attached after %s; files it flushes reach no manifest", flusher)
+			t.Errorf("the registration outbox is attached after %s; files it flushes reach no manifest", flusher)
 		}
 	}
-	handOff := pos("earlyRegistrar.HandOff(")
+	handOff := pos("registrationOutbox.HandOff(")
 	if start := pos("clusterCoordinator.Start()"); handOff < start {
 		t.Error("the hand-off runs before the cluster coordinator starts")
 	}
-	if abandon := pos("earlyRegistrar.Abandon()"); abandon < handOff {
+	if abandon := pos("registrationOutbox.Abandon()"); abandon < handOff {
 		t.Error("Abandon must follow the cluster block that hands off")
 	}
 }
 
-func TestNewEarlyFileRegistrarOnlyOnANodeThatCanAnnounce(t *testing.T) {
+func TestNewRegistrationOutboxOnlyOnANodeThatCanAnnounce(t *testing.T) {
 	base := func() *config.Config {
 		cfg := &config.Config{}
 		cfg.Cluster.Enabled = true
@@ -72,7 +72,7 @@ func TestNewEarlyFileRegistrarOnlyOnANodeThatCanAnnounce(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := base()
 			tc.mutate(cfg)
-			r := newEarlyFileRegistrar(cfg, tc.licensed, zerolog.Nop())
+			r := newRegistrationOutbox(cfg, tc.licensed, zerolog.Nop())
 			if r != nil {
 				r.Stop()
 			}

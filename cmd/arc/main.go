@@ -1034,13 +1034,14 @@ func main() {
 	if walWriter != nil {
 		arrowBuffer.SetWAL(walWriter)
 	}
-	// Announce files flushed before the cluster coordinator is up (#1206):
-	// startup WAL recovery below, MQTT ingest, and anything else that flushes
-	// while the coordinator starts. Must be set before recovery runs. Handed
-	// off to the live registrar inside the cluster block.
-	earlyRegistrar := newEarlyFileRegistrar(cfg, licenseHasClustering(licenseClient), logger.Get("file-registrar"))
-	if earlyRegistrar != nil {
-		arrowBuffer.SetFileRegistrar(earlyRegistrar)
+	// Every file this node flushes is announced to the cluster manifest
+	// through the registration outbox (#1206, #1209), including startup WAL
+	// recovery below and MQTT ingest, which flush before the coordinator is
+	// up. Must be set before recovery runs; its drain starts in the cluster
+	// block.
+	registrationOutbox := newRegistrationOutbox(cfg, licenseHasClustering(licenseClient), logger.Get("file-registrar"))
+	if registrationOutbox != nil {
+		arrowBuffer.SetFileRegistrar(registrationOutbox)
 	}
 	// Bound ArrowBuffer.Close, which now WAITS for flushes in progress instead
 	// of cancelling them (#1007).
@@ -2199,22 +2200,25 @@ func main() {
 						// Raft outlives the final flush, so the last files land in
 						// the manifest; registerClusterCoordinatorShutdown and
 						// registerFileRegistrarShutdown pin the two ends.
-						fileRegistrar := cluster.NewCoordinatorFileRegistrar(clusterCoordinator, logger.Get("file-registrar"))
-						fileRegistrar.Start(context.Background())
-						// HasRaft always holds when earlyRegistrar exists (it
-						// needs raft_data_dir); checked so the hand-off can never
-						// reach a manifest that accepts writes as no-ops.
-						if earlyRegistrar != nil && clusterCoordinator.HasRaft() {
-							// The early registrar stays on the buffer and forwards
-							// to the live one from here, while it registers what
-							// was flushed before this point (#1206).
-							earlyRegistrar.HandOff(clusterCoordinator, storageBackend, fileRegistrar, clusterCoordinator.LocalNodeID())
-							registerEarlyFileRegistrarShutdown(shutdownCoordinator, earlyRegistrar.Stop)
-						} else {
+						// HasRaft always holds when the outbox exists (it needs
+						// raft_data_dir); checked so the drain can never reach a
+						// manifest that accepts writes as no-ops.
+						switch {
+						case registrationOutbox != nil && clusterCoordinator.HasRaft():
+							registrationOutbox.HandOff(clusterCoordinator, storageBackend, clusterCoordinator.LocalNodeID())
+							registerFileRegistrarShutdown(shutdownCoordinator, registrationOutbox.Stop)
+							log.Info().Msg("Cluster file manifest registration outbox started")
+						case clusterCoordinator.GetLocalNode().GetCapabilities().CanIngest:
+							// No outbox on a node that ingests: its journal could not
+							// be opened. The lossy registrar beats announcing nothing.
+							fileRegistrar := cluster.NewCoordinatorFileRegistrar(clusterCoordinator, logger.Get("file-registrar"))
+							fileRegistrar.Start(context.Background())
 							arrowBuffer.SetFileRegistrar(fileRegistrar)
+							registerFileRegistrarShutdown(shutdownCoordinator, fileRegistrar.Stop)
+							log.Warn().Msg("Cluster file manifest registrar enabled without its journal: a registration that fails is not retried")
 						}
-						registerFileRegistrarShutdown(shutdownCoordinator, fileRegistrar.Stop)
-						log.Info().Msg("Cluster file manifest registrar enabled")
+						// A reader or compactor gets no registrar: nothing it
+						// flushes should be announced (#888, #1206).
 
 						// Phase 5: wire the dynamic compaction gate to the coordinator
 						// so CanCompact() checks the FSM's active compactor lease
@@ -2304,11 +2308,11 @@ func main() {
 		}
 	}
 
-	// A cluster block that exited without a coordinator never handed off: stop
-	// journaling, keep what is pending for the next start (#1206). A no-op
-	// after a hand-off.
-	if earlyRegistrar != nil {
-		earlyRegistrar.Abandon()
+	// A cluster block that exited without a coordinator never started the
+	// outbox drain: stop journaling, keep what is pending for the next start
+	// (#1206). A no-op after a hand-off.
+	if registrationOutbox != nil {
+		registrationOutbox.Abandon()
 	}
 
 	// Phase A: fallback bootstrap. If we deferred the initial-token
@@ -5161,33 +5165,22 @@ func licenseHasClustering(lc *license.Client) bool {
 	return lic != nil && lic.HasFeature(license.FeatureClustering)
 }
 
-// The early registrar's drain registers files flushed before the cluster was
-// up. It must stop before the cluster coordinator stops Raft; what it has not
-// confirmed stays in its journal for the next start (#1206). After the live
-// registrar, so its stop budget does not delay that drain of the final flush.
-func registerEarlyFileRegistrarShutdown(coordinator *shutdown.Coordinator, stop func()) {
-	coordinator.Register("early-file-registrar", shutdownFunc(func() error {
-		stop()
-		return nil
-	}), shutdown.PriorityBuffer+2)
-}
-
-// newEarlyFileRegistrar builds the registrar that holds file registrations
-// until the cluster coordinator is up (#1206), or returns nil where nothing
-// would ever hand it off: no cluster, no clustering licence, or no Raft
-// manifest. Also nil on a role that cannot ingest: a reader or compactor WAL
-// holds only entries received from a writer before #888, and announcing their
-// flushes would spread duplicate rows to every node.
-func newEarlyFileRegistrar(cfg *config.Config, clusteringLicensed bool, logger zerolog.Logger) *cluster.EarlyFileRegistrar {
+// newRegistrationOutbox builds the outbox that announces this node's flushed
+// files to the cluster manifest (#1206, #1209), or returns nil where nothing
+// would ever drain it: no cluster, no clustering licence, or no Raft manifest.
+// Also nil on a role that cannot ingest: a reader or compactor WAL holds only
+// entries received from a writer before #888, and announcing their flushes
+// would spread duplicate rows to every node.
+func newRegistrationOutbox(cfg *config.Config, clusteringLicensed bool, logger zerolog.Logger) *cluster.RegistrationOutbox {
 	if !cfg.Cluster.Enabled || cfg.Cluster.RaftDataDir == "" || !clusteringLicensed {
 		return nil
 	}
 	if !cluster.ParseRole(cfg.Cluster.Role).GetCapabilities().CanIngest {
 		return nil
 	}
-	r, err := cluster.NewEarlyFileRegistrar(cfg.Cluster.RaftDataDir, cfg.Cluster.ClusterName, logger)
+	r, err := cluster.NewRegistrationOutbox(cfg.Cluster.RaftDataDir, cfg.Cluster.ClusterName, logger)
 	if err != nil {
-		logger.Error().Err(err).Msg("Failed to open the pending file registration journal; files flushed before the cluster is up are not announced")
+		logger.Error().Err(err).Msg("Failed to open the file registration journal; files flushed before the cluster is up are not announced, and later ones go through a registrar that does not retry")
 		return nil
 	}
 	return r

@@ -156,7 +156,13 @@ type Metrics struct {
 	walFailedWrites      atomic.Int64 // Write failures to WAL file
 	walOversizedPayloads atomic.Int64 // Payloads rejected for exceeding the single-entry cap even after chunking (#677)
 	walDirectoryBytes    atomic.Int64 // Current bytes occupied by every file in the WAL directory
-	walQuarantinedFiles  atomic.Int64 // WAL files isolated after repeated recovery failures
+
+	// Cluster file registration outbox (#1209)
+	fileRegistrationsPending      atomic.Int64 // files flushed and not yet confirmed in the cluster manifest
+	fileRegistrationOldestPending atomic.Int64 // unix nanos the oldest pending file was flushed; 0 when none
+	fileRegistrationsConfirmed    atomic.Int64 // files registered by the outbox
+	fileRegistrationJournalErrs   atomic.Int64 // registration journal write or fsync failures
+	walQuarantinedFiles           atomic.Int64 // WAL files isolated after repeated recovery failures
 	// 1 while the last recovery pass left a file on disk for which at least one
 	// row range of a parent entry was handed off — the state an older binary
 	// would replay in full.
@@ -548,7 +554,23 @@ func (m *Metrics) IncWALDroppedEntries()              { m.walDroppedEntries.Add(
 func (m *Metrics) IncWALFailedWrites()                { m.walFailedWrites.Add(1) }
 func (m *Metrics) IncWALOversizedPayloads()           { m.walOversizedPayloads.Add(1) }
 func (m *Metrics) SetWALDirectoryBytes(bytes int64)   { m.walDirectoryBytes.Store(bytes) }
-func (m *Metrics) IncWALQuarantinedFiles()            { m.walQuarantinedFiles.Add(1) }
+
+// File registration outbox (#1209).
+func (m *Metrics) SetFileRegistrationsPending(n int64) { m.fileRegistrationsPending.Store(n) }
+func (m *Metrics) SetFileRegistrationOldestPending(ns int64) {
+	m.fileRegistrationOldestPending.Store(ns)
+}
+func (m *Metrics) SetFileRegistrationsConfirmed(n int64) { m.fileRegistrationsConfirmed.Store(n) }
+func (m *Metrics) IncFileRegistrationJournalErrors()     { m.fileRegistrationJournalErrs.Add(1) }
+
+func (m *Metrics) fileRegistrationOldestPendingSeconds() float64 {
+	ns := m.fileRegistrationOldestPending.Load()
+	if ns == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, ns)).Seconds()
+}
+func (m *Metrics) IncWALQuarantinedFiles() { m.walQuarantinedFiles.Add(1) }
 
 // SetWALPartialRowRecoveryPending records whether the last WAL recovery pass
 // retained a file whose parent entry had row ranges replayed. It makes the
@@ -795,6 +817,9 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"wal_failed_writes":                m.walFailedWrites.Load(),
 		"wal_oversized_payloads":           m.walOversizedPayloads.Load(),
 		"wal_directory_bytes":              m.walDirectoryBytes.Load(),
+		"file_registrations_pending":       m.fileRegistrationsPending.Load(),
+		"file_registrations_confirmed":     m.fileRegistrationsConfirmed.Load(),
+		"file_registration_journal_errors": m.fileRegistrationJournalErrs.Load(),
 		"wal_quarantined_files":            m.walQuarantinedFiles.Load(),
 		"wal_partial_row_recovery_pending": m.walPartialRowRecovery.Load(),
 
@@ -1180,6 +1205,22 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_dir_bytes Current bytes occupied by every file in the WAL directory\n"...)
 	b = append(b, "# TYPE arc_wal_dir_bytes gauge\n"...)
 	b = appendMetric(b, "arc_wal_dir_bytes", float64(m.walDirectoryBytes.Load()))
+
+	b = append(b, "# HELP arc_cluster_file_registrations_pending Flushed files not yet confirmed in the cluster manifest\n"...)
+	b = append(b, "# TYPE arc_cluster_file_registrations_pending gauge\n"...)
+	b = appendMetric(b, "arc_cluster_file_registrations_pending", float64(m.fileRegistrationsPending.Load()))
+
+	b = append(b, "# HELP arc_cluster_file_registration_oldest_pending_seconds Age of the oldest flushed file not yet confirmed in the cluster manifest\n"...)
+	b = append(b, "# TYPE arc_cluster_file_registration_oldest_pending_seconds gauge\n"...)
+	b = appendMetric(b, "arc_cluster_file_registration_oldest_pending_seconds", m.fileRegistrationOldestPendingSeconds())
+
+	b = append(b, "# HELP arc_cluster_file_registrations_confirmed_total Flushed files the registration outbox confirmed in the cluster manifest\n"...)
+	b = append(b, "# TYPE arc_cluster_file_registrations_confirmed_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_file_registrations_confirmed_total", float64(m.fileRegistrationsConfirmed.Load()))
+
+	b = append(b, "# HELP arc_cluster_file_registration_journal_errors_total File registration journal write or fsync failures\n"...)
+	b = append(b, "# TYPE arc_cluster_file_registration_journal_errors_total counter\n"...)
+	b = appendMetric(b, "arc_cluster_file_registration_journal_errors_total", float64(m.fileRegistrationJournalErrs.Load()))
 
 	b = append(b, "# HELP arc_wal_quarantined_files_total WAL files isolated after repeated recovery failures\n"...)
 	b = append(b, "# TYPE arc_wal_quarantined_files_total counter\n"...)
