@@ -376,6 +376,9 @@ localProcessing:
 		// refused, not lost: the record is still in the WAL. 503 so the client
 		// retries (elsewhere, during a rolling restart) instead of treating a
 		// shutdown race as a permanent server error.
+		if errors.Is(err, ingest.ErrIngestFenced) {
+			return respondIngestFenced(c, err)
+		}
 		if errors.Is(err, ingest.ErrBufferClosing) {
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 				"error": "Write rejected (server shutting down): " + err.Error(),

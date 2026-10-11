@@ -303,6 +303,13 @@ localProcessing:
 		}
 	}
 
+	// Refuse the whole request up front if writes are fenced (#1207), rather
+	// than part-way through the measurements below.
+	if err := h.buffer.CheckIngestGate(); err != nil {
+		h.totalErrors.Add(1)
+		return respondIngestFenced(c, err)
+	}
+
 	// Write each measurement to the buffer
 	for measurement, record := range columnarByMeasurement {
 		err := h.buffer.WriteColumnarRecord(c.Context(), database, record)
@@ -322,6 +329,9 @@ localProcessing:
 			// refused, not lost: the record is still in the WAL. 503 so the client
 			// retries (elsewhere, during a rolling restart) instead of treating a
 			// shutdown race as a permanent server error.
+			if errors.Is(err, ingest.ErrIngestFenced) {
+				return respondIngestFenced(c, err)
+			}
 			if errors.Is(err, ingest.ErrBufferClosing) {
 				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 					"error": "Write rejected (server shutting down): " + err.Error(),

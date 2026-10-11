@@ -800,6 +800,10 @@ type ClusterConfig struct {
 	FailoverEnabled         bool // Enable automatic writer failover (default: false)
 	FailoverTimeoutSeconds  int  // Timeout for failover operation in seconds (default: 30)
 	FailoverCooldownSeconds int  // Cooldown between failovers in seconds (default: 60)
+	// IngestFenceAfterMs: a Pattern-1 writer with automatic failover refuses
+	// writes after this long without contact from the Raft leader (#1207).
+	// 0 derives it from the failover detection time; capped below it.
+	IngestFenceAfterMs int
 
 	// Cluster security (Enterprise)
 	SharedSecret string // Shared secret for join authentication (HMAC-SHA256). All nodes must share the same value.
@@ -1163,6 +1167,7 @@ func Load() (*Config, error) {
 			CoordinatorAddr:     v.GetString("cluster.coordinator_addr"),
 			AdvertiseAddr:       v.GetString("cluster.advertise_addr"),
 			HealthCheckInterval: v.GetInt("cluster.health_check_interval"),
+			IngestFenceAfterMs:  v.GetInt("cluster.ingest_fence_after_ms"),
 			HealthCheckTimeout:  v.GetInt("cluster.health_check_timeout"),
 			UnhealthyThreshold:  v.GetInt("cluster.unhealthy_threshold"),
 			HeartbeatInterval:   v.GetInt("cluster.heartbeat_interval"),
@@ -1995,9 +2000,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.sharding_route_timeout", 5000)   // 5 second timeout
 
 	// Writer failover defaults (Phase 3)
-	v.SetDefault("cluster.failover_enabled", false) // Disabled by default
-	v.SetDefault("cluster.failover_timeout", 30)    // 30 second failover timeout
-	v.SetDefault("cluster.failover_cooldown", 60)   // 60 second cooldown between failovers
+	v.SetDefault("cluster.failover_enabled", false)  // Disabled by default
+	v.SetDefault("cluster.failover_timeout", 30)     // 30 second failover timeout
+	v.SetDefault("cluster.failover_cooldown", 60)    // 60 second cooldown between failovers
+	v.SetDefault("cluster.ingest_fence_after_ms", 0) // 0 = derived from failover detection (#1207)
 
 	// Cluster security defaults
 	v.SetDefault("cluster.shared_secret", "")

@@ -962,6 +962,9 @@ type ArrowBuffer struct {
 	// already run (#1206).
 	fileRegistrar atomic.Pointer[fileRegistrarRef]
 
+	// ingestGate refuses live writes on a fenced node (#1207).
+	ingestGate atomic.Pointer[func() error]
+
 	// OPTIMIZATION: Shard buffers to reduce lock contention
 	// Configurable via ingest.shard_count (default 32)
 	// Each shard handles ~1/N of measurements where N = shard count
@@ -1829,6 +1832,10 @@ func (b *ArrowBuffer) rowsToColumnar(measurement string, rows []*models.Record) 
 
 // Write adds records to the buffer (for MessagePack handler)
 func (b *ArrowBuffer) Write(ctx context.Context, database string, records interface{}) error {
+	// Checked once for the whole batch, so a fence cannot split it.
+	if err := b.checkIngestGate(); err != nil {
+		return err
+	}
 	// Handle batch of records (from MessagePack decoder)
 	recordList, ok := records.([]interface{})
 	if !ok {
@@ -1888,6 +1895,9 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 // WriteColumnarDirect writes columnar data directly to the buffer
 // This is the preferred method for Line Protocol which already has columnar data
 func (b *ArrowBuffer) WriteColumnarDirect(ctx context.Context, database, measurement string, columns map[string][]interface{}) error {
+	if err := b.checkIngestGate(); err != nil {
+		return err
+	}
 	record := &models.ColumnarRecord{
 		Measurement: measurement,
 		Columns:     columns,
@@ -1899,6 +1909,9 @@ func (b *ArrowBuffer) WriteColumnarDirect(ctx context.Context, database, measure
 // WriteColumnarRecord writes a pre-built ColumnarRecord to the buffer.
 // Preserves TagColumns metadata for Parquet schema (enables auto-dedup in compaction).
 func (b *ArrowBuffer) WriteColumnarRecord(ctx context.Context, database string, record *models.ColumnarRecord) error {
+	if err := b.checkIngestGate(); err != nil {
+		return err
+	}
 	return b.writeColumnar(ctx, database, record)
 }
 
@@ -2024,6 +2037,9 @@ func (b *ArrowBuffer) WriteColumnarDirectReplay(ctx context.Context, database, m
 // bypassing the []interface{} → typed conversion in convertColumnsToTyped.
 // Used by format-specific parsers (e.g., TLE) that know column types at compile time.
 func (b *ArrowBuffer) WriteTypedColumnarDirect(ctx context.Context, database, measurement string, batch *TypedColumnBatch, numRecords int) error {
+	if err := b.checkIngestGate(); err != nil {
+		return err
+	}
 	return b.writeTypedColumnarInternal(ctx, database, measurement, batch, numRecords, false)
 }
 
@@ -2409,6 +2425,32 @@ var ErrSchemaChurnExceeded = errors.New("schema-evolution loop exceeded max iter
 // instead. Handlers map it to 503: the node is shutting down, and the client
 // should retry elsewhere rather than treat it as a permanent server error.
 var ErrBufferClosing = errors.New("arrow buffer is closing: write refused")
+
+// ErrIngestFenced is returned for a live write refused because this node may
+// no longer be the cluster primary writer: it lost contact with the cluster
+// leader, or another writer is the designated primary (#1207). Nothing was
+// written, the WAL included, so a retry against the primary is safe.
+var ErrIngestFenced = errors.New("ingest fenced: this node is not an available primary writer")
+
+// SetIngestGate installs the check every live write passes before anything is
+// written, the WAL included (#1207). It returns nil to admit, or an error
+// wrapping ErrIngestFenced. Replay, recovery and replication paths are never
+// gated.
+func (b *ArrowBuffer) SetIngestGate(gate func() error) {
+	b.ingestGate.Store(&gate)
+}
+
+// CheckIngestGate reports whether live writes are refused right now. A handler
+// that writes one request as several buffer calls checks it once first, so a
+// fence already closed refuses the whole request instead of part of it.
+func (b *ArrowBuffer) CheckIngestGate() error { return b.checkIngestGate() }
+
+func (b *ArrowBuffer) checkIngestGate() error {
+	if g := b.ingestGate.Load(); g != nil && *g != nil {
+		return (*g)()
+	}
+	return nil
+}
 
 // flushOnSchemaChangeLocked is the shared helper used by both columnar
 // write paths to handle schema evolution under the shard lock.

@@ -1568,9 +1568,13 @@ func main() {
 		// Create subscription manager
 		mqttManager = mqtt.NewSubscriptionManager(mqttRepo, encryptor, arrowBuffer, logger.Get("mqtt"))
 
-		// Start manager (loads and starts auto_start subscriptions)
-		if err := mqttManager.Start(context.Background()); err != nil {
-			log.Warn().Err(err).Msg("Some MQTT subscriptions failed to auto-start")
+		// Start manager (loads and starts auto_start subscriptions). On a
+		// cluster node it starts after the coordinator, so its writes pass the
+		// ingest fence from the first message (#1207).
+		if !cfg.Cluster.Enabled {
+			if err := mqttManager.Start(context.Background()); err != nil {
+				log.Warn().Err(err).Msg("Some MQTT subscriptions failed to auto-start")
+			}
 		}
 
 		// Register shutdown hook
@@ -2053,8 +2057,16 @@ func main() {
 						compactionManager.SetPauseGate(clusterCoordinator.CompactionPaused)
 					}
 
+					// Live writes pass the ingest fence (#1207); it admits
+					// everything unless the coordinator starts one. MQTT
+					// subscriptions are suspended while it refuses writes.
+					arrowBuffer.SetIngestGate(clusterCoordinator.IngestGate())
+					if fenceable, ok := mqttManager.(interface{ SetIngestFenced(bool) }); ok {
+						clusterCoordinator.OnIngestFenceChange(fenceable.SetIngestFenced)
+					}
 					if err := clusterCoordinator.Start(); err != nil {
 						log.Error().Err(err).Msg("Failed to start cluster coordinator - running in standalone mode")
+						arrowBuffer.SetIngestGate(nil)
 						clusterCoordinator = nil
 					} else {
 						// Two steps. The inbound replication stream applies entries
@@ -2318,6 +2330,13 @@ func main() {
 	// (#1206). A no-op after a hand-off.
 	if registrationOutbox != nil {
 		registrationOutbox.Abandon()
+	}
+
+	// MQTT on a cluster node starts here, after the ingest fence exists.
+	if mqttManager != nil && cfg.Cluster.Enabled {
+		if err := mqttManager.Start(context.Background()); err != nil {
+			log.Warn().Err(err).Msg("Some MQTT subscriptions failed to auto-start")
+		}
 	}
 
 	// Phase A: fallback bootstrap. If we deferred the initial-token
