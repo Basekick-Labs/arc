@@ -1371,11 +1371,16 @@ func (h *RetentionHandler) deleteOldColdFiles(ctx context.Context, database, mea
 			deletedFiles++
 			continue
 		}
-		if err := coldBackend.Delete(ctx, file.Path); err != nil {
-			return deletedRows, deletedFiles, fmt.Errorf("failed to delete cold-tier file %q: %w", file.Path, err)
-		}
+		// Retire metadata first. If the object delete fails, restore the exact
+		// cold-tier record so subsequent reads and retention runs can still find it.
 		if err := h.tieringManager.DeleteFile(ctx, file.Path); err != nil {
 			return deletedRows, deletedFiles, fmt.Errorf("failed to remove cold-tier metadata for %q: %w", file.Path, err)
+		}
+		if err := coldBackend.Delete(ctx, file.Path); err != nil {
+			if restoreErr := h.tieringManager.RestoreColdFile(ctx, &file); restoreErr != nil {
+				return deletedRows, deletedFiles, fmt.Errorf("failed to delete cold-tier file %q: %w (also failed to restore metadata: %v)", file.Path, err, restoreErr)
+			}
+			return deletedRows, deletedFiles, fmt.Errorf("failed to delete cold-tier file %q: %w", file.Path, err)
 		}
 		deletedRows += rowCount
 		deletedFiles++

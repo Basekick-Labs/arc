@@ -763,6 +763,25 @@ func (m *Manager) DeleteFile(ctx context.Context, path string) error {
 	return m.metadata.DeleteFile(ctx, path)
 }
 
+// RestoreColdFile restores a cold-tier metadata row after a failed object deletion.
+func (m *Manager) RestoreColdFile(ctx context.Context, file *FileMetadata) error {
+	if m == nil || m.metadata == nil {
+		return fmt.Errorf("tiering metadata is not configured")
+	}
+	migratedAt := time.Now().UTC()
+	if file.MigratedAt != nil {
+		migratedAt = *file.MigratedAt
+	}
+	written, err := m.metadata.RecordColdFile(ctx, file, migratedAt)
+	if err != nil {
+		return err
+	}
+	if !written {
+		return fmt.Errorf("cold-tier metadata row for %q was not restored", file.Path)
+	}
+	return nil
+}
+
 // GetColdFilesForRetention returns cold-tier metadata candidates whose
 // partition is older than the supplied cutoff. Retention still reads the
 // Parquet footer before deleting, so partition age is only a discovery index,
