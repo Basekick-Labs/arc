@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -1178,13 +1177,9 @@ func (h *ContinuousQueryHandler) handleGetExecutions(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid query ID"})
 	}
 
-	limit := 50
-	if raw := c.Query("limit"); raw != "" {
-		parsed, parseErr := strconv.Atoi(raw)
-		if parseErr != nil || parsed < 0 || parsed > 1000 {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid limit"})
-		}
-		limit = parsed
+	limit, limitErr := parseExecutionLimit(c.Query("limit"))
+	if limitErr != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid limit"})
 	}
 
 	rows, err := h.sqliteDB.Query(`
