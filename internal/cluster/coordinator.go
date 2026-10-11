@@ -4520,16 +4520,41 @@ func (c *Coordinator) ReplicationReady() bool {
 	return puller.FullyCaughtUp()
 }
 
-// StartReplication starts WAL replication based on node role.
-// - Writers start a Sender to stream entries to readers
-// - Readers start a Receiver to receive entries from the writer
-// This should be called after Start() and SetWAL().
+// StartReplication is where the live WAL replication stream would start. It
+// starts nothing, on every role (#888).
+//
+// The stream reached only readers and compactors, which applied what they
+// received to their own ingest buffer and flushed it to their own Parquet.
+// Queries read every file in storage, so that copy was read alongside the one
+// the node pulled from the primary through the manifest: every replicated row
+// came back twice. A compactor could also register its copy, so every node
+// pulled it and the duplicates were cluster-wide. Neither role can be promoted,
+// so the stream gave failover nothing in exchange.
+//
+// Readers and compactors get their data from the primary's registered Parquet
+// through the file puller, which cluster.replication_enabled still starts in
+// Start. The stream comes back for standby writers only, holding the live
+// window for failover without materialising it (#1207). Until then nothing
+// sends: a not-yet-upgraded reader that still dials in is refused by
+// handleReplicateSync, and by AcceptReplicationConnection behind it, because
+// replicationSender is nil.
 func (c *Coordinator) StartReplication() error {
 	if !c.cfg.ReplicationEnabled {
 		c.logger.Debug().Msg("WAL replication is disabled")
 		return nil
 	}
+	c.logger.Info().Msg("WAL replication stream not started: readers and compactors read registered Parquet from the primary, and the standby-writer stream is not available yet")
+	return nil
+}
 
+// startWALReplicationStream is the stream StartReplication used to start:
+// a Sender on writers, a receiver target loop on every other role.
+//
+// Dormant (#888). Kept for #1207, which reuses the Sender and the
+// primary-tracking target loop for standby writers. That reuse must NOT keep the
+// receiver's ingest handler (buildReplicationIngestHandler): applying received
+// entries to the ArrowBuffer is what materialised the duplicate copy.
+func (c *Coordinator) startWALReplicationStream() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -4902,7 +4927,9 @@ func (c *Coordinator) startReceiverWithAddr(writerAddr string) error {
 }
 
 // buildReplicationIngestHandler prepares independently flushable writes before
-// the receiver appends local WAL. Each local identity then belongs to one buffer;
+// the receiver appends local WAL. It applies received entries to the ArrowBuffer,
+// which flushes them to this node's own Parquet: that is the duplicate copy of
+// #888, so a standby-writer receiver (#1207) must not use it. Each local identity then belongs to one buffer;
 // ignored payloads mint no identity and multi-measurement rows are split first.
 func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler {
 	return replication.PreparingIngestHandlerFunc(func(_ context.Context, payload []byte) ([]replication.PreparedWALIngest, error) {

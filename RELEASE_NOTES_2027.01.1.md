@@ -96,6 +96,85 @@ Nothing changes for a node with `tiered_storage.cold.enabled` off, or one whose
 cold backend failed to construct: the listing is skipped and migration runs as
 before.
 
+## Upgrade note: the live WAL replication stream is off ([#888](https://github.com/Basekick-Labs/arc/issues/888))
+
+This applies to clusters where readers or compactors run with both
+`wal.enabled` and `cluster.replication_enabled`. With default values the Helm
+chart enables the WAL only on writer pods, so a chart-deployed cluster never ran
+the stream on those roles and nothing changes for it. The manifests in
+`deploy/kubernetes-local` did enable it on readers.
+
+**What changed.** Writers no longer start the WAL replication sender, and
+readers and compactors no longer receive from it. Every node with `wal.enabled`
+and `cluster.replication_enabled` logs this once at startup:
+
+> WAL replication stream not started: readers and compactors read registered
+> Parquet from the primary, and the standby-writer stream is not available yet
+
+**Why.** The stream reached only readers and compactors. Each applied what it
+received to its own ingest buffer and flushed it to its own Parquet. Queries
+read every file on the node, so a reader returned every replicated row twice:
+once from its own flush and once from the copy it pulled from the primary. A
+compactor also registered its copy in the cluster manifest, so every node pulled
+it, the primary included, and the duplicates showed up cluster-wide. Neither
+role can be promoted, so the stream gave failover nothing in exchange. It
+returns for standby writers only, holding the primary's unflushed window for
+failover without writing a second copy
+([#1207](https://github.com/Basekick-Labs/arc/issues/1207)).
+
+**What does not change.** `cluster.replication_enabled` still starts peer file
+replication. Readers and compactors get every row by pulling the primary's
+registered Parquet, as they already did for anything flushed. A reader sees a
+new row once the writer flushes it (`ingest.max_buffer_age_ms`) and the file has
+been pulled.
+
+**Metrics.** `arc_replication_lag_entries` and `arc_replication_lag_seconds`
+were reported per connected reader. With no reader connected they have no
+series, and `arc_replication_entries_dropped_total` stays at zero, so alerts
+built on them will not fire. They describe the stream only, not peer file
+replication.
+
+**Upgrade order.** Upgrade readers and compactors first, and stop them
+gracefully. A graceful stop flushes and purges what they received. After a crash,
+the first boot replays those received entries once more and writes one more
+duplicate copy. A reader that is still on the old version keeps dialling the
+writers, and every few seconds until that reader is upgraded an upgraded writer
+refuses it and logs
+
+> Replication sync rejected: not a writer or replication not enabled
+
+**Duplicates already on disk.** Which copies exist depends on the role that
+wrote them.
+
+- **Compactors, and readers that were ever Raft leader.** These copies are
+  registered in the manifest, so every node pulled them. Readers could vote, and
+  so lead, before v26.09.2. A copy that has not been compacted yet is listed in
+  `GET /api/v1/cluster/files` with the compactor or reader as `origin_node_id`
+  and a filename that does not contain `_compacted`. After compaction, the copy
+  and the primary's original are merged into one `_compacted` file.
+  Line-protocol rows are deduplicated in that merge when the primary's original
+  was compacted in the same job. Msgpack rows never are, so their duplicates are
+  inside the compacted files and need to be rewritten.
+- **Other readers.** Their copies exist only on their own disk, outside the
+  manifest, and nothing deletes them: retention, deletes and cold migration do
+  not reach them. Reconciliation finds them as orphan storage. On a local-storage
+  cluster, enable `reconciliation.enabled` on the reader and run
+  `POST /api/v1/reconciliation/trigger` on that reader. That run is a dry run;
+  check `orphan_storage_count` (the sample lists at most
+  `reconciliation.sample_paths_cap` paths). Then delete with
+  `POST /api/v1/reconciliation/trigger?dry_run=false&act=true`. A run deletes at
+  most `reconciliation.max_deletes_per_run` files, and files younger than the
+  grace window (`grace_window_seconds` plus `clock_skew_allowance_seconds`,
+  24 h 5 min by default) are skipped. On shared storage, reconciliation runs only
+  on the active compactor, and a reader's copies are in the shared bucket.
+- **Clusters upgraded from v26.09.2 or earlier.** Replicated line-protocol rows
+  were filed under the `default` database until #889 was fixed in v26.09.3, so
+  some of these copies are in `default`.
+- **Writers.** Do not run orphan-storage cleanup on writers to fix this. A
+  writer's unregistered files can be the only copy of rows it recovered from its
+  WAL after a crash
+  ([#1206](https://github.com/Basekick-Labs/arc/issues/1206)).
+
 ## New features
 
 ### Compaction cycles can be looked up by id ([#1162](https://github.com/Basekick-Labs/arc/issues/1162))

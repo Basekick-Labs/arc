@@ -210,7 +210,7 @@ it to survive losing one. (Pattern 1 multi-writer — per-shard writer ownership
 writer:
   replicas: 3                              # see "Why 3?" below — same answer in both patterns
 reader:
-  replicas: 3                              # readers serve queries and replicate the WAL
+  replicas: 3                              # readers serve queries from pulled Parquet
 cluster:
   failover:
     enabled: true                          # automatic writer + compactor failover

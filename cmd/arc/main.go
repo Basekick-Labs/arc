@@ -2153,16 +2153,15 @@ func main() {
 							}
 						}
 
-						// Wire up WAL replication if enabled
+						// WAL replication stream. StartReplication starts nothing
+						// until the standby-writer stream lands (#888, #1207) and
+						// logs that itself; the file puller that feeds readers is
+						// started by the coordinator regardless.
 						if cfg.Cluster.ReplicationEnabled && walWriter != nil {
 							clusterCoordinator.SetWAL(walWriter)
 							clusterCoordinator.SetIngestBuffer(arrowBuffer)
 							if err := clusterCoordinator.StartReplication(); err != nil {
 								log.Warn().Err(err).Msg("Failed to start WAL replication")
-							} else {
-								log.Info().
-									Bool("is_writer", capabilities.CanIngest).
-									Msg("WAL replication started")
 							}
 						}
 

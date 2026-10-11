@@ -1,5 +1,9 @@
 package cluster
 
+// Dormant code (#888): nothing in production reaches the receiver wiring these
+// tests drive, because StartReplication starts no stream. It is kept for the
+// standby-writer stream (#1207), which must not reuse buildReplicationIngestHandler.
+
 // #885: a replica picked its replication source by ranging the registry map and
 // taking the first healthy writer, with no check of WriterState. In local
 // storage mode only the primary ingests, so a standby writer's Sender has
