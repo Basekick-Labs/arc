@@ -245,13 +245,29 @@ func newUnreachableTargetRig(t *testing.T, name string) *targetRig {
 	}
 	t.Cleanup(func() { dataStorage.Close() })
 
-	// A port nothing listens on: bound, read, released.
+	// An endpoint that refuses every request. The port stays bound for the
+	// whole test and each connection is reset on accept. Releasing the port
+	// instead (bind, read, close) let another test package running in
+	// parallel bind it — a fake S3 server answered, and the handlers saw a
+	// reachable, empty bucket: 404 and 202 instead of 503.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("reserve a port: %v", err)
 	}
 	endpoint := ln.Addr().String()
-	ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			if tc, ok := conn.(*net.TCPConn); ok {
+				_ = tc.SetLinger(0) // RST, not FIN: a refused connection
+			}
+			_ = conn.Close()
+		}
+	}()
+	t.Cleanup(func() { ln.Close() })
 
 	manager, err := backup.NewManager(&backup.ManagerConfig{
 		DataStorage: dataStorage,
