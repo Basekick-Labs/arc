@@ -804,6 +804,12 @@ type ClusterConfig struct {
 	// writes after this long without contact from the Raft leader (#1207).
 	// 0 derives it from the failover detection time; capped below it.
 	IngestFenceAfterMs int
+	// WALCoverage makes a Pattern-1 writer stamp every ingest batch with a
+	// coverage id in its WAL and journal, and hold WAL entries until their
+	// files are registered (#1207). Experimental, default off: a WAL written
+	// with it on cannot be replayed by an Arc older than the release that
+	// introduced it.
+	WALCoverage bool
 
 	// Cluster security (Enterprise)
 	SharedSecret string // Shared secret for join authentication (HMAC-SHA256). All nodes must share the same value.
@@ -1168,6 +1174,7 @@ func Load() (*Config, error) {
 			AdvertiseAddr:       v.GetString("cluster.advertise_addr"),
 			HealthCheckInterval: v.GetInt("cluster.health_check_interval"),
 			IngestFenceAfterMs:  v.GetInt("cluster.ingest_fence_after_ms"),
+			WALCoverage:         v.GetBool("cluster.wal_coverage"),
 			HealthCheckTimeout:  v.GetInt("cluster.health_check_timeout"),
 			UnhealthyThreshold:  v.GetInt("cluster.unhealthy_threshold"),
 			HeartbeatInterval:   v.GetInt("cluster.heartbeat_interval"),
@@ -2004,6 +2011,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.failover_timeout", 30)     // 30 second failover timeout
 	v.SetDefault("cluster.failover_cooldown", 60)    // 60 second cooldown between failovers
 	v.SetDefault("cluster.ingest_fence_after_ms", 0) // 0 = derived from failover detection (#1207)
+	v.SetDefault("cluster.wal_coverage", false)      // experimental (#1207); see Cluster.WALCoverage
 
 	// Cluster security defaults
 	v.SetDefault("cluster.shared_secret", "")

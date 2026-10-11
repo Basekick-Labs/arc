@@ -41,6 +41,7 @@ type Entry struct {
 	CheckpointHashes []string                 // Flush checkpoint identities, when present
 	Records          []map[string]interface{} // Row format (from Append path)
 	ColumnarData     *ColumnarEntry           // Columnar format (from AppendRaw path)
+	Coverage         *Coverage                // Ingest batch coverage, for a covered (0x04) entry (#1207)
 }
 
 // ColumnarEntry represents a columnar WAL entry written via the zero-copy path
@@ -276,9 +277,16 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 	}
 	payloadHashValue := payloadHash(payload)
 	logicalPayload := payload
+	var coverage *Coverage
 	if len(payload) >= 17 && payload[0] == WALTrackedMarker {
 		payloadHashValue = fmt.Sprintf("%016x%016x", binary.BigEndian.Uint64(payload[1:9]), binary.BigEndian.Uint64(payload[9:17]))
 		logicalPayload = payload[17:]
+	} else if len(payload) > 0 && payload[0] == WALCoveredMarker {
+		token, logical, cov, err := parseCoveredPayload(payload)
+		if err != nil {
+			return nil, err
+		}
+		payloadHashValue, logicalPayload, coverage = token, logical, cov
 	}
 
 	// Parse envelope to extract database name and inner msgpack payload
@@ -291,6 +299,7 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 			TimestampUS: timestampUS,
 			PayloadHash: payloadHashValue,
 			Records:     records,
+			Coverage:    coverage,
 		}, nil
 	}
 
@@ -303,6 +312,7 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 				TimestampUS:  timestampUS,
 				PayloadHash:  payloadHashValue,
 				ColumnarData: colEntry,
+				Coverage:     coverage,
 			}, nil
 		}
 	}

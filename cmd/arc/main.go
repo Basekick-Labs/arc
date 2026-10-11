@@ -1043,6 +1043,7 @@ func main() {
 	if registrationOutbox != nil {
 		arrowBuffer.SetFileRegistrar(registrationOutbox)
 	}
+	enableWALCoverage(cfg, arrowBuffer, walWriter, registrationOutbox, logger.Get("arrow"))
 	// Bound ArrowBuffer.Close, which now WAITS for flushes in progress instead
 	// of cancelling them (#1007).
 	//
@@ -2328,8 +2329,11 @@ func main() {
 	// A cluster block that exited without a coordinator never started the
 	// outbox drain: stop journaling, keep what is pending for the next start
 	// (#1206). A no-op after a hand-off.
-	if registrationOutbox != nil {
-		registrationOutbox.Abandon()
+	if registrationOutbox != nil && registrationOutbox.Abandon() {
+		// Nothing registers files in this start, so nothing would release the
+		// WAL entries a covered flush holds for them (#1207). Only when this
+		// call abandoned the outbox: after a hand-off it is a no-op.
+		arrowBuffer.DisableCoverage()
 	}
 
 	// MQTT on a cluster node starts here, after the ingest fence exists.
@@ -5217,6 +5221,30 @@ func newRegistrationOutbox(cfg *config.Config, clusteringLicensed bool, logger z
 		return nil
 	}
 	return r
+}
+
+// enableWALCoverage turns on ingest coverage ids (#1207) where they can be used:
+// cluster.wal_coverage on a Pattern-1 node (local storage) that writes a WAL
+// and announces its files through the journaled registration outbox. Before
+// recovery, so replayed entries keep their coverage.
+func enableWALCoverage(cfg *config.Config, buffer *ingest.ArrowBuffer, walWriter *wal.Writer, outbox *cluster.RegistrationOutbox, logger zerolog.Logger) {
+	if !cfg.Cluster.WALCoverage {
+		return
+	}
+	switch {
+	case cfg.Cluster.SharedStorageMode:
+		logger.Warn().Msg("cluster.wal_coverage is for local-storage clusters; ignored with shared storage")
+		return
+	case walWriter == nil:
+		logger.Warn().Msg("cluster.wal_coverage needs the WAL; ignored with the WAL disabled")
+		return
+	case outbox == nil:
+		logger.Warn().Msg("cluster.wal_coverage needs a clustered writer with its registration journal; ignored")
+		return
+	}
+	if err := buffer.EnableCoverage(); err != nil {
+		logger.Warn().Err(err).Msg("cluster.wal_coverage could not be enabled")
+	}
 }
 
 // The registrar must stop after ArrowBuffer finishes its final writes

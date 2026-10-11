@@ -56,6 +56,9 @@ const (
 	WALEnvelopeMarker   = 0x01
 	WALCheckpointMarker = 0x02
 	WALTrackedMarker    = 0x03
+	// WALCoveredMarker is a tracked entry that also carries the ingest batch's
+	// coverage id in a trailer (#1207); see coverage.go for the layout.
+	WALCoveredMarker = 0x04
 )
 
 // ParseEnvelope extracts the database name and msgpack payload from a WAL entry.
@@ -442,6 +445,10 @@ type ReplicationEntry struct {
 
 	// Payload is the raw msgpack data
 	Payload []byte
+
+	// Coverage identifies the ingest batch the entry belongs to, for entries
+	// appended through PrepareCovered (#1207). Nil otherwise.
+	Coverage *Coverage
 }
 
 // ReplicationHook is called for each WAL entry before it's written locally.
@@ -468,9 +475,11 @@ type Writer struct {
 	done      chan struct{}
 	wg        sync.WaitGroup
 
-	// Replication hook for streaming entries to readers
-	replicationHook ReplicationHook
-	sequence        uint64 // Monotonic sequence counter for replication
+	// Replication hook for streaming entries to readers. Atomic, not under
+	// w.mu: the writer loop holds w.mu across fsync and rotation, and a covered
+	// append fires the hook while its caller holds an ingest shard lock (#1207).
+	replicationHook atomic.Pointer[ReplicationHook]
+	sequence        atomic.Uint64 // Monotonic sequence counter for replication
 	trackedInstance uint64
 
 	// fileSeqs and fileOrder track what this process wrote to each WAL file, so
@@ -957,7 +966,26 @@ func (w *Writer) AppendRawWithMetaTracked(database string, payload []byte) ([]st
 // already blocks on the writer loop's reply. Use MarkFlushedContext from
 // recovery, which needs the opposite trade.
 func (w *Writer) MarkFlushed(hashes []string) error {
-	return w.markFlushed(context.Background(), hashes, false)
+	return w.markFlushed(context.Background(), hashes, false, true)
+}
+
+// MarkFlushedRetained writes the same durable checkpoint as MarkFlushed — so
+// recovery does not replay the entries — but keeps their sequences pending in
+// the purge floor. A covered flush (#1207) holds its WAL entries until the
+// files they became are registered; the caller releases them with
+// ReleaseRegistered once that happens.
+func (w *Writer) MarkFlushedRetained(hashes []string) error {
+	return w.markFlushed(context.Background(), hashes, false, false)
+}
+
+// ReleaseRegistered drops identities checkpointed with MarkFlushedRetained
+// from the purge floor once their files are registered (#1207). Also the
+// release for a checkpoint that failed, exactly as ForgetTracked is today.
+func (w *Writer) ReleaseRegistered(hashes []string) {
+	if len(hashes) == 0 {
+		return
+	}
+	w.releasePending(hashes)
 }
 
 // MarkFlushedContext is MarkFlushed with a cancellable, blocking admission wait
@@ -974,10 +1002,10 @@ func (w *Writer) MarkFlushed(hashes []string) error {
 // cancelled admission or a closed writer this returns an error, so the caller
 // retains the WAL and replays later: at-least-once, never at-most-once.
 func (w *Writer) MarkFlushedContext(ctx context.Context, hashes []string) error {
-	return w.markFlushed(ctx, hashes, true)
+	return w.markFlushed(ctx, hashes, true, true)
 }
 
-func (w *Writer) markFlushed(ctx context.Context, hashes []string, blocking bool) error {
+func (w *Writer) markFlushed(ctx context.Context, hashes []string, blocking, release bool) error {
 	if len(hashes) == 0 {
 		return nil
 	}
@@ -1040,7 +1068,9 @@ func (w *Writer) markFlushed(ctx context.Context, hashes []string, blocking bool
 				return fmt.Errorf("failed to persist WAL flush checkpoint: %w", err)
 			}
 		}
-		w.releasePending(hashes[start:end])
+		if release {
+			w.releasePending(hashes[start:end])
+		}
 	}
 	return nil
 }
@@ -1083,14 +1113,7 @@ func (w *Writer) appendTrackedEntry(logicalPayload []byte) (string, error) {
 	copy(trackedPayload[17:], logicalPayload)
 	checksum := crc32.ChecksumIEEE(trackedPayload)
 	timestampUS := uint64(time.Now().UnixMicro())
-	if w.replicationHook != nil {
-		w.mu.Lock()
-		w.sequence++
-		replicationSequence := w.sequence
-		hook := w.replicationHook
-		w.mu.Unlock()
-		hook(&ReplicationEntry{Sequence: replicationSequence, TimestampUS: timestampUS, Payload: logicalPayload})
-	}
+	w.replicate(&ReplicationEntry{TimestampUS: timestampUS, Payload: logicalPayload})
 	entryData := make([]byte, WALEntryHeaderSize+len(trackedPayload))
 	binary.BigEndian.PutUint32(entryData[0:4], uint32(len(trackedPayload)))
 	binary.BigEndian.PutUint64(entryData[4:12], timestampUS)
@@ -1123,22 +1146,12 @@ func (w *Writer) appendEnvelopedEntry(dbBytes []byte, envelopeHeaderLen int, pay
 	timestampUS := uint64(time.Now().UnixMicro())
 
 	// Replication hook
-	if w.replicationHook != nil {
-		w.mu.Lock()
-		w.sequence++
-		seq := w.sequence
-		hook := w.replicationHook
-		w.mu.Unlock()
-
+	if w.replicationHook.Load() != nil {
 		// Build envelope for replication (unavoidable copy for hook consumers)
 		repPayload := make([]byte, totalPayloadLen)
 		copy(repPayload, envHeader[:envelopeHeaderLen])
 		copy(repPayload[envelopeHeaderLen:], payload)
-		hook(&ReplicationEntry{
-			Sequence:    seq,
-			TimestampUS: timestampUS,
-			Payload:     repPayload,
-		})
+		w.replicate(&ReplicationEntry{TimestampUS: timestampUS, Payload: repPayload})
 	}
 
 	// Build complete WAL entry in one allocation: header + envelope header + payload
@@ -1284,19 +1297,7 @@ func (w *Writer) appendRawEntry(payload []byte) error {
 
 	// Call replication hook before local write (if set)
 	// This enables real-time streaming to reader nodes
-	if w.replicationHook != nil {
-		w.mu.Lock()
-		w.sequence++
-		seq := w.sequence
-		hook := w.replicationHook
-		w.mu.Unlock()
-
-		hook(&ReplicationEntry{
-			Sequence:    seq,
-			TimestampUS: timestampUS,
-			Payload:     payload,
-		})
-	}
+	w.replicate(&ReplicationEntry{TimestampUS: timestampUS, Payload: payload})
 
 	// Build complete entry: header + payload
 	entryData := make([]byte, WALEntryHeaderSize+len(payload))
@@ -1711,15 +1712,26 @@ func (w *Writer) CurrentCheckpointHashes() ([]string, error) {
 // This enables cluster replication by streaming entries to reader nodes.
 // The hook is called synchronously before the entry is written locally.
 func (w *Writer) SetReplicationHook(hook ReplicationHook) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.replicationHook = hook
+	if hook == nil {
+		w.replicationHook.Store(nil)
+	} else {
+		w.replicationHook.Store(&hook)
+	}
 	w.logger.Info().Msg("Replication hook set")
+}
+
+// replicate hands entry to the replication hook, if one is set, stamping the
+// next replication sequence. Lock-free; the hook must not block.
+func (w *Writer) replicate(entry *ReplicationEntry) {
+	hook := w.replicationHook.Load()
+	if hook == nil {
+		return
+	}
+	entry.Sequence = w.sequence.Add(1)
+	(*hook)(entry)
 }
 
 // CurrentSequence returns the current replication sequence number.
 func (w *Writer) CurrentSequence() uint64 {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.sequence
+	return w.sequence.Load()
 }

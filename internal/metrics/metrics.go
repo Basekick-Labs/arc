@@ -149,13 +149,15 @@ type Metrics struct {
 	auditEventsDropped atomic.Int64 // Events discarded before queueing (channel full)
 
 	// WAL metrics
-	walRecordsPreserved  atomic.Int64 // Records preserved in WAL for recovery (flush failures)
-	walRecoveryTotal     atomic.Int64 // Successful WAL recovery operations
-	walRecoveryRecords   atomic.Int64 // Total records recovered from WAL
-	walDroppedEntries    atomic.Int64 // Entries dropped due to full WAL buffer
-	walFailedWrites      atomic.Int64 // Write failures to WAL file
-	walOversizedPayloads atomic.Int64 // Payloads rejected for exceeding the single-entry cap even after chunking (#677)
-	walDirectoryBytes    atomic.Int64 // Current bytes occupied by every file in the WAL directory
+	walRecordsPreserved   atomic.Int64 // Records preserved in WAL for recovery (flush failures)
+	walRegisteredFloorLag atomic.Int64 // committed batches above the registered floor (#1207)
+	walCoverageLost       atomic.Int64 // batches that settled without a registered file (#1207)
+	walRecoveryTotal      atomic.Int64 // Successful WAL recovery operations
+	walRecoveryRecords    atomic.Int64 // Total records recovered from WAL
+	walDroppedEntries     atomic.Int64 // Entries dropped due to full WAL buffer
+	walFailedWrites       atomic.Int64 // Write failures to WAL file
+	walOversizedPayloads  atomic.Int64 // Payloads rejected for exceeding the single-entry cap even after chunking (#677)
+	walDirectoryBytes     atomic.Int64 // Current bytes occupied by every file in the WAL directory
 
 	// Cluster file registration outbox (#1209)
 	fileRegistrationsPending      atomic.Int64 // files flushed and not yet confirmed in the cluster manifest
@@ -552,12 +554,20 @@ func (m *Metrics) IncMQTTReconnects() { m.mqttReconnects.Add(1) }
 
 // WAL Metrics
 func (m *Metrics) IncWALRecordsPreserved(count int64) { m.walRecordsPreserved.Add(count) }
-func (m *Metrics) IncWALRecoveryTotal()               { m.walRecoveryTotal.Add(1) }
-func (m *Metrics) IncWALRecoveryRecords(count int64)  { m.walRecoveryRecords.Add(count) }
-func (m *Metrics) IncWALDroppedEntries()              { m.walDroppedEntries.Add(1) }
-func (m *Metrics) IncWALFailedWrites()                { m.walFailedWrites.Add(1) }
-func (m *Metrics) IncWALOversizedPayloads()           { m.walOversizedPayloads.Add(1) }
-func (m *Metrics) SetWALDirectoryBytes(bytes int64)   { m.walDirectoryBytes.Store(bytes) }
+
+// SetWALRegisteredFloorLag records how many committed ingest batches are not
+// yet below the registered floor of their key (#1207).
+func (m *Metrics) SetWALRegisteredFloorLag(n int64) { m.walRegisteredFloorLag.Store(n) }
+
+// IncWALCoverageLost counts ingest batches that settled without being in a
+// registered file (#1207).
+func (m *Metrics) IncWALCoverageLost(n int64)        { m.walCoverageLost.Add(n) }
+func (m *Metrics) IncWALRecoveryTotal()              { m.walRecoveryTotal.Add(1) }
+func (m *Metrics) IncWALRecoveryRecords(count int64) { m.walRecoveryRecords.Add(count) }
+func (m *Metrics) IncWALDroppedEntries()             { m.walDroppedEntries.Add(1) }
+func (m *Metrics) IncWALFailedWrites()               { m.walFailedWrites.Add(1) }
+func (m *Metrics) IncWALOversizedPayloads()          { m.walOversizedPayloads.Add(1) }
+func (m *Metrics) SetWALDirectoryBytes(bytes int64)  { m.walDirectoryBytes.Store(bytes) }
 
 // File registration outbox (#1209).
 func (m *Metrics) SetFileRegistrationsPending(n int64) { m.fileRegistrationsPending.Store(n) }
@@ -827,6 +837,8 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 
 		// WAL
 		"wal_records_preserved":            m.walRecordsPreserved.Load(),
+		"wal_registered_floor_lag":         m.walRegisteredFloorLag.Load(),
+		"wal_coverage_lost":                m.walCoverageLost.Load(),
 		"wal_recovery_total":               m.walRecoveryTotal.Load(),
 		"wal_recovery_records":             m.walRecoveryRecords.Load(),
 		"wal_dropped_entries":              m.walDroppedEntries.Load(),
@@ -1199,6 +1211,14 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_records_preserved_total Records preserved in WAL for recovery\n"...)
 	b = append(b, "# TYPE arc_wal_records_preserved_total counter\n"...)
 	b = appendMetric(b, "arc_wal_records_preserved_total", float64(m.walRecordsPreserved.Load()))
+
+	b = append(b, "# HELP arc_wal_registered_floor_lag Committed ingest batches not yet below the registered floor of their key (WAL coverage only)\n"...)
+	b = append(b, "# TYPE arc_wal_registered_floor_lag gauge\n"...)
+	b = appendMetric(b, "arc_wal_registered_floor_lag", float64(m.walRegisteredFloorLag.Load()))
+
+	b = append(b, "# HELP arc_wal_coverage_lost_total Ingest batches that settled without being in a registered file (WAL coverage only)\n"...)
+	b = append(b, "# TYPE arc_wal_coverage_lost_total counter\n"...)
+	b = appendMetric(b, "arc_wal_coverage_lost_total", float64(m.walCoverageLost.Load()))
 
 	b = append(b, "# HELP arc_wal_recovery_total Successful WAL recovery operations\n"...)
 	b = append(b, "# TYPE arc_wal_recovery_total counter\n"...)
