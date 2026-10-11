@@ -303,6 +303,9 @@ type Run struct {
 	StorageDeletes      int `json:"storage_deletes"`
 	SkippedGrace        int `json:"skipped_grace"`
 	SkippedRecheck      int `json:"skipped_recheck"`
+	// SkippedPending counts orphan-storage candidates kept because this node
+	// flushed them and the manifest has not confirmed them yet (#1212).
+	SkippedPending int `json:"skipped_pending"`
 
 	// SkippedTransient counts entries a sweep passed over because a storage
 	// call failed in a way that may succeed later (a throttle, a timeout, an
@@ -363,6 +366,10 @@ type Reconciler struct {
 	// trigger), so we belt-and-braces here.
 	runState atomic.Bool
 
+	// isPending reports a file this node flushed that the cluster manifest
+	// has not confirmed yet (#1212): unregistered, but not an orphan.
+	isPending atomic.Pointer[func(string) bool]
+
 	// History is a small fixed-size ring buffer of recent runs. All
 	// access goes through mu. Layout: history is allocated to
 	// runHistoryCap at construction; writes land at history[head] and
@@ -381,6 +388,13 @@ const runHistoryCap = 10
 // NewReconciler constructs a reconciler. coord may be nil only for
 // BackendStandalone — every other mode requires a real coordinator.
 // auditLogger may be nil; audit events are silently dropped in that case.
+
+// SetPendingFilter keeps files still pending cluster registration out of the
+// orphan-storage sweep (#1212). Safe to call while runs are scheduled.
+func (r *Reconciler) SetPendingFilter(fn func(path string) bool) {
+	r.isPending.Store(&fn)
+}
+
 func NewReconciler(
 	cfg Config,
 	coord Coordinator,

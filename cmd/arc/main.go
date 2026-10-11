@@ -1715,6 +1715,11 @@ func main() {
 			Tiers:           tiers,
 			Logger:          logger.Get("compaction"),
 		})
+		if registrationOutbox != nil {
+			// A file pending registration waits a cycle: compacting it races
+			// its registration (#1212).
+			compactionManager.SetPendingFilter(registrationOutbox.IsPending)
+		}
 
 		// Issue #610, the disabled-sync leg: compaction is enabled but edge
 		// sync is entirely off, so the spoke block that manages the defer
@@ -3763,6 +3768,11 @@ func main() {
 	// upload). Cross-handler reuse is fine because the filenames are unique
 	// via os.CreateTemp.
 	deleteHandler := api.NewDeleteHandler(db, storageBackend, &cfg.Delete, authManager, dbConfig.UploadDir, logger.Get("delete"))
+	if registrationOutbox != nil {
+		// A rewrite of a file still pending registration is announced in its
+		// place (#1210).
+		deleteHandler.SetPendingRegistrations(registrationOutbox)
+	}
 	deleteHandler.RegisterRoutes(server.GetApp())
 	if clusterCoordinator != nil {
 		deleteHandler.SetCoordinator(clusterCoordinator)
@@ -4066,6 +4076,10 @@ func main() {
 			RecheckConcurrency:       cfg.Reconciliation.RecheckConcurrency,
 		}
 		reconciler, err := reconciliation.NewReconciler(recCfg, clusterCoordinator, storageBackend, gate, auditLogger, logger.Get("reconciliation"))
+		if err == nil && registrationOutbox != nil {
+			// A file pending registration is unregistered, not an orphan (#1212).
+			reconciler.SetPendingFilter(registrationOutbox.HoldsRegistration)
+		}
 		if err != nil {
 			log.Error().Err(err).Msg("Failed to create reconciler — feature disabled")
 		} else {

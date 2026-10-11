@@ -114,6 +114,13 @@ func (r *Reconciler) sweepOrphanStorage(
 				capReachedInChunk = true
 				break
 			}
+			// The outbox first: a file it confirms between the two checks
+			// would otherwise miss both, and it also knows confirmations this
+			// node's FSM has not applied yet (#1212).
+			if p := r.isPending.Load(); p != nil && (*p)(c.path) {
+				run.SkippedPending++
+				continue
+			}
 			if r.coord != nil {
 				if _, ok := r.coord.GetFileEntry(c.path); ok {
 					run.SkippedRecheck++

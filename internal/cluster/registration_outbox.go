@@ -98,6 +98,12 @@ type RegistrationOutbox struct {
 	head        int
 	byPath      map[string]*outboxEntry
 	live        int // entries not yet acknowledged
+	// recent remembers the last files this outbox confirmed in the manifest,
+	// for ReplacePending: this node's FSM can apply a commit after the leader
+	// confirmed it, so "not in my FSM and not pending" is not proof of absence.
+	recent     map[string]recentConfirm
+	recentRing []string
+	recentNext int
 
 	wake        chan struct{}
 	cancel      context.CancelFunc
@@ -109,6 +115,12 @@ type RegistrationOutbox struct {
 	skipped    atomic.Int64
 	dropped    atomic.Int64
 	lastAlarm  atomic.Int64 // unix nanos of the last backlog alarm
+}
+
+type recentConfirm struct {
+	rec  journalRecord
+	at   time.Time
+	slot int
 }
 
 type outboxState int
@@ -127,6 +139,12 @@ type outboxEntry struct {
 	// written, so the storage checks are skipped on that first attempt.
 	fresh bool
 	done  bool
+	// inFlight: in the batch attempt is working on. ReplacePending waits it
+	// out rather than race a commit.
+	inFlight bool
+	// inManifest: settled because the manifest has it (registered by this
+	// outbox, or found there already), as opposed to skipped.
+	inManifest bool
 }
 
 // journalRecord is one journal line. ClusterName pins it to the cluster: a data
@@ -146,6 +164,11 @@ type journalRecord struct {
 	SHA256        string    `json:"sha256,omitempty"`
 	// FlushedAt keeps the backlog age honest across restarts.
 	FlushedAt time.Time `json:"at,omitempty"`
+	// Supersedes names a file this one replaced before either was registered
+	// (a DELETE rewrite, #1210). The drain deletes it from the manifest in the
+	// same batch that registers this file, in case an apply that reported
+	// failure had committed it after all.
+	Supersedes string `json:"supersedes,omitempty"`
 }
 
 // Tunables, variables so tests can shrink them.
@@ -167,6 +190,16 @@ var (
 	// outboxBrokenRetry spaces out rewrites of a journal that keeps failing,
 	// so a full Raft volume does not cost every flush a rewrite.
 	outboxBrokenRetry = 5 * time.Second
+	// outboxRecentConfirmed bounds how many confirmed paths ReplacePending
+	// can still recognise.
+	outboxRecentConfirmed = 4096
+	// outboxRecentWindow is how long a confirmation is trusted over this
+	// node's FSM: long enough for a commit to apply locally, short enough that
+	// a file compaction has since removed is not reported registered.
+	outboxRecentWindow = time.Minute
+	// outboxReplaceWait caps how long ReplacePending and Withdraw wait out an
+	// attempt in flight, so a DELETE is never held for a whole slow batch.
+	outboxReplaceWait = 30 * time.Second
 	outboxAlarmEvery  = 5 * time.Minute
 	// A journal is rewritten without its acks once it holds this many records
 	// more than twice what is pending.
@@ -190,6 +223,8 @@ func NewRegistrationOutbox(dir, clusterName string, logger zerolog.Logger) (*Reg
 		clusterName: clusterName,
 		logger:      logger.With().Str("component", "file-registrar").Logger(),
 		byPath:      make(map[string]*outboxEntry),
+		recent:      make(map[string]recentConfirm),
+		recentRing:  make([]string, outboxRecentConfirmed),
 		wake:        make(chan struct{}, 1),
 		done:        make(chan struct{}),
 	}
@@ -701,6 +736,13 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 	if len(batch) == 0 {
 		return false, nil
 	}
+	defer func() {
+		r.mu.Lock()
+		for _, e := range batch {
+			e.inFlight = false
+		}
+		r.mu.Unlock()
+	}()
 	var settled, deferred []*outboxEntry
 	// A file flushed by this process within outboxFreshWindow was just
 	// written: it skips the storage checks, which on object storage are a
@@ -715,6 +757,7 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 	r.mu.Unlock()
 	for _, e := range batch {
 		if _, ok := manifest.GetFileEntry(e.rec.Path); ok {
+			r.markInManifest(e)
 			settled = append(settled, e) // already announced
 			continue
 		}
@@ -753,6 +796,11 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 			continue
 		}
 		ops = append(ops, raft.BatchFileOp{Type: raft.CommandRegisterFile, Payload: payload})
+		if e.rec.Supersedes != "" {
+			if del, err := json.Marshal(raft.DeleteFilePayload{Path: e.rec.Supersedes, Reason: "delete-rewrite"}); err == nil {
+				ops = append(ops, raft.BatchFileOp{Type: raft.CommandDeleteFile, Payload: del})
+			}
+		}
 		sent = append(sent, e)
 		bytes += len(payload)
 	}
@@ -771,6 +819,9 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 			r.mu.Unlock()
 		} else {
 			r.registered.Add(int64(len(sent)))
+			for _, e := range sent {
+				r.markInManifest(e)
+			}
 			// A checked file may have been removed between its check and the
 			// commit; an entry no peer can pull keeps a reader query gate red.
 			// Detached from ctx, so a Stop here cannot skip it.
@@ -798,6 +849,141 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 		r.ack(settled)
 	}
 	return len(settled) > 0, applyErr
+}
+
+func (r *RegistrationOutbox) markInManifest(e *outboxEntry) {
+	r.mu.Lock()
+	e.inManifest = true
+	r.mu.Unlock()
+}
+
+// ReplaceOutcome says what ReplacePending found for the old path.
+type ReplaceOutcome int
+
+const (
+	// ReplaceNotPending: the old path is not waiting here; this outbox knows
+	// nothing about it.
+	ReplaceNotPending ReplaceOutcome = iota
+	// ReplaceSwapped: the old path was pending and never registered. It is
+	// withdrawn and the new path is pending in its place, durably.
+	ReplaceSwapped
+	// ReplaceRegistered: the old path reached the manifest while the caller
+	// waited. Replace it there; Entry carries its fields, so the caller does
+	// not depend on this node's FSM having applied the commit yet.
+	ReplaceRegistered
+)
+
+// ReplacePending is for a rewrite of a file that may still be pending, such as
+// a row DELETE (#1210). The rewrite must be announced and the old file must
+// not be, or readers get an entry for a file that is gone and never see the
+// rows that survived. It waits out an attempt in flight on the old path, so it
+// never races a commit.
+func (r *RegistrationOutbox) ReplacePending(ctx context.Context, oldPath, newPath string, sizeBytes int64, sha256 string) (ReplaceOutcome, raft.FileEntry, error) {
+	e, outcome, entry, err := r.settleOrLock(ctx, oldPath)
+	if e == nil {
+		return outcome, entry, err
+	}
+	// r.mu held, e pending and not in flight.
+	rec := e.rec
+	rec.Path, rec.SizeBytes, rec.SHA256 = newPath, sizeBytes, sha256
+	rec.Supersedes = oldPath
+	added := e.added // keep the backlog age honest
+	r.withdrawLocked(e)
+	r.enqueueLocked(rec, added, true)
+	r.appendLocked(rec)
+	r.advanceHeadLocked()
+	r.mu.Unlock()
+	if err := r.SyncRegistrations(); err != nil {
+		// Held in memory and registered in this process; only a crash first
+		// loses it.
+		r.logger.Error().Err(err).Str("path", newPath).Str("replaces", oldPath).
+			Msg("Failed to persist a replaced file registration; a crash before it registers leaves the rewrite unannounced")
+	}
+	r.publishMetrics()
+	select {
+	case r.wake <- struct{}{}:
+	default:
+	}
+	return ReplaceSwapped, raft.FileEntry{}, nil
+}
+
+// Withdraw is for a DELETE that removes a file outright (#1210): a pending
+// file must not be registered after it is gone. Withdrawn reports a pending
+// file taken out; otherwise outcome says whether the file was confirmed in the
+// manifest, so the caller deletes it there.
+func (r *RegistrationOutbox) Withdraw(ctx context.Context, path string) (withdrawn bool, outcome ReplaceOutcome, err error) {
+	e, outcome, _, err := r.settleOrLock(ctx, path)
+	if e == nil {
+		return false, outcome, err
+	}
+	r.withdrawLocked(e)
+	r.advanceHeadLocked()
+	r.mu.Unlock()
+	if err := r.SyncRegistrations(); err != nil {
+		r.logger.Warn().Err(err).Str("path", path).Msg("Failed to persist a withdrawn file registration")
+	}
+	r.publishMetrics()
+	return true, ReplaceSwapped, nil
+}
+
+// settleOrLock waits out an attempt in flight on path, up to
+// outboxReplaceWait. If path is pending it returns its entry with r.mu HELD.
+// Otherwise it returns nil and what is known: confirmed recently (with the
+// entry to use), or not known here.
+func (r *RegistrationOutbox) settleOrLock(ctx context.Context, path string) (*outboxEntry, ReplaceOutcome, raft.FileEntry, error) {
+	deadline := time.Now().Add(outboxReplaceWait)
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	r.mu.Lock()
+	for {
+		e, ok := r.byPath[path]
+		if !ok {
+			rc, confirmed := r.recent[path]
+			r.mu.Unlock()
+			if confirmed && time.Since(rc.at) < outboxRecentWindow {
+				return nil, ReplaceRegistered, r.fileEntry(rc.rec), nil
+			}
+			return nil, ReplaceNotPending, raft.FileEntry{}, nil
+		}
+		if !e.inFlight {
+			if r.state == outboxAbandoned {
+				r.mu.Unlock()
+				return nil, ReplaceNotPending, raft.FileEntry{}, nil
+			}
+			return e, 0, raft.FileEntry{}, nil
+		}
+		r.mu.Unlock()
+		if time.Now().After(deadline) {
+			return nil, ReplaceNotPending, raft.FileEntry{}, errors.New("file registration still in flight; retry the request")
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ReplaceNotPending, raft.FileEntry{}, ctx.Err()
+		case <-tick.C:
+		}
+		r.mu.Lock()
+	}
+}
+
+// withdrawLocked acknowledges a pending entry without registering it.
+func (r *RegistrationOutbox) withdrawLocked(e *outboxEntry) {
+	e.done = true
+	r.live--
+	delete(r.byPath, e.rec.Path)
+	r.appendLocked(journalRecord{Version: journalRecordVersion, Op: journalOpAck, ClusterName: r.clusterName, Path: e.rec.Path})
+}
+
+// HoldsRegistration reports a file that is pending here or was confirmed a
+// moment ago (this node's FSM may not show it yet). For cleanup that must not
+// treat it as an orphan (#1212).
+func (r *RegistrationOutbox) HoldsRegistration(path string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.byPath[path]; ok && !e.done {
+		return true
+	}
+	rc, ok := r.recent[path]
+	return ok && time.Since(rc.at) < outboxRecentWindow
 }
 
 // statAll checks entries in storage with bounded parallelism, each under its
@@ -838,6 +1024,7 @@ func (r *RegistrationOutbox) nextBatch() []*outboxEntry {
 	i := r.head
 	for ; i < len(r.queue) && len(out) < registrarDrainBatch; i++ {
 		if e := r.queue[i]; e != nil && !e.done {
+			e.inFlight = true
 			out = append(out, e)
 		}
 	}
@@ -885,6 +1072,17 @@ func (r *RegistrationOutbox) ack(entries []*outboxEntry) {
 		r.live--
 		if cur, ok := r.byPath[e.rec.Path]; ok && cur == e {
 			delete(r.byPath, e.rec.Path)
+		}
+		if e.inManifest {
+			slot := r.recentNext
+			if old := r.recentRing[slot]; old != "" {
+				if rc, ok := r.recent[old]; ok && rc.slot == slot {
+					delete(r.recent, old) // only if a newer confirmation did not reuse it
+				}
+			}
+			r.recentRing[slot] = e.rec.Path
+			r.recent[e.rec.Path] = recentConfirm{rec: e.rec, at: time.Now(), slot: slot}
+			r.recentNext = (slot + 1) % len(r.recentRing)
 		}
 		r.appendLocked(journalRecord{
 			Version: journalRecordVersion, Op: journalOpAck,

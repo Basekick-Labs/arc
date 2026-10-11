@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
@@ -82,11 +83,14 @@ func freeOSMemoryThrottled() {
 
 // DeleteHandler handles delete operations using file rewrite strategy
 type DeleteHandler struct {
-	db             *database.DuckDB
-	storage        storage.Backend
-	config         *config.DeleteConfig
-	authManager    *auth.AuthManager
-	coordinator    DeleteCoordinator // nil in standalone mode
+	db          *database.DuckDB
+	storage     storage.Backend
+	config      *config.DeleteConfig
+	authManager *auth.AuthManager
+	coordinator DeleteCoordinator // nil in standalone mode
+	// pending is this node's file registration outbox (#1209): a file it
+	// flushed may not be in the manifest yet. nil off ingest nodes.
+	pending        PendingRegistrations
 	tieringManager *tiering.Manager
 	// tempDir is the absolute, sandbox-allowlisted directory used by
 	// rewriteS3File to stage the COPY-rewritten parquet locally before
@@ -197,6 +201,19 @@ func NewDeleteHandler(db *database.DuckDB, storage storage.Backend, cfg *config.
 // gating. Called after construction when cluster mode is enabled.
 func (h *DeleteHandler) SetCoordinator(c DeleteCoordinator) {
 	h.coordinator = c
+}
+
+// PendingRegistrations is the slice of the registration outbox a DELETE
+// needs: cluster.RegistrationOutbox.
+type PendingRegistrations interface {
+	ReplacePending(ctx context.Context, oldPath, newPath string, sizeBytes int64, sha256 string) (cluster.ReplaceOutcome, raft.FileEntry, error)
+	Withdraw(ctx context.Context, path string) (bool, cluster.ReplaceOutcome, error)
+}
+
+// SetPendingRegistrations wires the registration outbox, so a rewrite of a
+// file still pending registration is announced in its place (#1210).
+func (h *DeleteHandler) SetPendingRegistrations(p PendingRegistrations) {
+	h.pending = p
 }
 
 // SetTieringManager wires rewrite/delete metadata updates into tiering.
@@ -800,6 +817,15 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 	if rowsAfter == 0 {
 		h.logger.Info().Str("file", filepath.Base(relativePath)).Int64("deleted", deleted).Msg("All rows deleted, removing file")
 
+		// A file still pending registration must not be registered after it is
+		// gone (#1210). Taken out of the outbox first; if it was confirmed
+		// meanwhile, the manifest delete below removes it.
+		if h.pending != nil {
+			if _, _, err := h.pending.Withdraw(ctx, relativePath); err != nil {
+				return 0, fmt.Errorf("withdraw pending registration for %s: %w", relativePath, err)
+			}
+		}
+
 		// Manifest-before-storage: record the delete in the Raft manifest before
 		// removing from storage. If the manifest update fails (Raft quorum loss),
 		// abort — the file still exists in storage and the next delete will retry.
@@ -1066,12 +1092,72 @@ func (h *DeleteHandler) recordRewriteTiering(ctx context.Context, oldPath, newPa
 	return nil
 }
 
+// rewrittenFileMetadata returns the rewritten file's size and SHA-256: read
+// from disk on local storage, from the upload on object storage. Size -1 when
+// neither applies.
+func (h *DeleteHandler) rewrittenFileMetadata(newPath string, s3 *s3RewriteResult) (int64, string, error) {
+	if lb, ok := h.storage.(*storage.LocalBackend); ok {
+		basePath := lb.GetBasePath()
+		fullPath := filepath.Join(basePath, newPath)
+		if !strings.HasPrefix(fullPath, basePath+string(filepath.Separator)) {
+			return 0, "", fmt.Errorf("path escapes storage root: %s", newPath)
+		}
+		size, sha, err := fileMetadata(fullPath)
+		if err != nil {
+			return 0, "", fmt.Errorf("failed to read rewritten file metadata: %w", err)
+		}
+		return size, sha, nil
+	}
+	if s3 != nil {
+		return s3.sizeBytes, s3.sha256, nil
+	}
+	return -1, "", nil
+}
+
 // replaceManifestAfterRewrite publishes a partial rewrite as a new immutable
 // file. Registering the new path and deleting the old path in one Raft command
 // means followers never have to infer a content change from size/checksum on an
 // existing path (#975).
 func (h *DeleteHandler) replaceManifestAfterRewrite(ctx context.Context, oldPath, newPath string, s3 *s3RewriteResult) error {
 	existing, ok := h.coordinator.GetFileEntry(oldPath)
+	if !ok && h.pending != nil {
+		// Not in the manifest yet may mean pending: flushed by this node and
+		// not confirmed. Then the rewrite is what must be announced, and the
+		// old file must not be (#1210).
+		// On any error here the old file stays authoritative: remove the
+		// rewrite, or this node reads its surviving rows twice.
+		cleanupRewrite := func() {
+			if err := h.storage.Delete(ctx, newPath); err != nil {
+				h.logger.Warn().Err(err).Str("file", newPath).Msg("Failed to clean up a rewrite that was not announced")
+			}
+		}
+		size, sha, err := h.rewrittenFileMetadata(newPath, s3)
+		if err != nil {
+			cleanupRewrite()
+			return err
+		}
+		outcome, entry := cluster.ReplaceNotPending, raft.FileEntry{}
+		if size >= 0 { // the outbox checks a pending file by its size
+			outcome, entry, err = h.pending.ReplacePending(ctx, oldPath, newPath, size, sha)
+		}
+		if err != nil {
+			cleanupRewrite()
+			if ctx.Err() != nil {
+				return err
+			}
+			return errors.Join(errManifestFailure, fmt.Errorf("replace pending registration: %w", err))
+		}
+		switch outcome {
+		case cluster.ReplaceSwapped:
+			if err := h.storage.Delete(ctx, oldPath); err != nil {
+				return fmt.Errorf("failed to delete superseded pending rewrite %q: %w", oldPath, err)
+			}
+			return nil
+		case cluster.ReplaceRegistered:
+			// Confirmed while we looked; this node's FSM may not show it yet.
+			existing, ok = &entry, true
+		}
+	}
 	if !ok {
 		h.logger.Warn().
 			Str("file", oldPath).
@@ -1087,21 +1173,11 @@ func (h *DeleteHandler) replaceManifestAfterRewrite(ctx context.Context, oldPath
 	entry.Path = newPath
 	entry.OriginNodeID = h.coordinator.LocalNodeID()
 
-	if lb, ok := h.storage.(*storage.LocalBackend); ok {
-		basePath := lb.GetBasePath()
-		fullPath := filepath.Join(basePath, newPath)
-		if !strings.HasPrefix(fullPath, basePath+string(filepath.Separator)) {
-			return fmt.Errorf("path escapes storage root: %s", newPath)
-		}
-		size, sha, err := fileMetadata(fullPath)
-		if err != nil {
-			return fmt.Errorf("failed to read rewritten file metadata: %w", err)
-		}
+	if size, sha, err := h.rewrittenFileMetadata(newPath, s3); err != nil {
+		return err
+	} else if size >= 0 {
 		entry.SizeBytes = size
 		entry.SHA256 = sha
-	} else if s3 != nil {
-		entry.SizeBytes = s3.sizeBytes
-		entry.SHA256 = s3.sha256
 	}
 
 	registerPayload, err := json.Marshal(raft.RegisterFilePayload{File: entry})

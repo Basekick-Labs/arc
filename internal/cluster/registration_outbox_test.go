@@ -70,8 +70,16 @@ func (m *fakeOutboxManifest) GetFileEntry(path string) (*raft.FileEntry, bool) {
 
 func (m *fakeOutboxManifest) BatchFileOpsInManifestContext(_ context.Context, ops []raft.BatchFileOp) error {
 	var entries []raft.FileEntry
-	var paths []string
+	var paths, deletes []string
 	for _, op := range ops {
+		if op.Type == raft.CommandDeleteFile {
+			var d raft.DeleteFilePayload
+			if err := json.Unmarshal(op.Payload, &d); err != nil {
+				return err
+			}
+			deletes = append(deletes, d.Path)
+			continue
+		}
 		var p raft.RegisterFilePayload
 		if err := json.Unmarshal(op.Payload, &p); err != nil {
 			return err
@@ -96,6 +104,9 @@ func (m *fakeOutboxManifest) BatchFileOpsInManifestContext(_ context.Context, op
 	m.mu.Lock()
 	for _, e := range entries {
 		m.registered[e.Path] = e
+	}
+	for _, p := range deletes {
+		delete(m.registered, p)
 	}
 	m.mu.Unlock()
 	return nil
@@ -725,5 +736,158 @@ func TestOutboxChecksAFileThatWaitedPastTheFreshWindow(t *testing.T) {
 	waitOutbox(t, "settled", func() bool { return r.Pending() == 0 })
 	if m.isRegistered(tail) {
 		t.Fatal("registered a file deleted while it waited behind a failing batch")
+	}
+}
+
+// #1210: a DELETE rewriting a pending file swaps it for the rewrite, durably.
+func TestOutboxReplacePendingSwapsDurably(t *testing.T) {
+	dir := t.TempDir()
+	r, err := NewRegistrationOutbox(dir, "test-cluster", zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	register(r, outPathA, 10)
+	outcome, _, err := r.ReplacePending(context.Background(), outPathA, outPathB, 7, "new")
+	if err != nil || outcome != ReplaceSwapped {
+		t.Fatalf("outcome %v err %v, want swapped", outcome, err)
+	}
+	crash(r)
+	again := newTestOutbox(t, dir)
+	if again.IsPending(outPathA) || !again.IsPending(outPathB) {
+		t.Fatal("after a restart the swap is lost: the original is pending or the rewrite is not")
+	}
+}
+
+// A batch in flight carrying the original may commit it: ReplacePending waits
+// for the outcome instead of racing the commit, and reports the registration.
+func TestOutboxReplacePendingWaitsOutAnAttemptInFlight(t *testing.T) {
+	r := newTestOutbox(t, t.TempDir())
+	register(r, outPathA, 10)
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	m := newFakeOutboxManifest()
+	m.beforeBatch = func([]string) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+	}
+	r.HandOff(m, &fakeOutboxStorage{sizes: map[string]int64{outPathA: 10}}, "writer-1")
+	<-entered
+
+	type result struct {
+		outcome ReplaceOutcome
+		entry   raft.FileEntry
+	}
+	got := make(chan result, 1)
+	go func() {
+		o, e, _ := r.ReplacePending(context.Background(), outPathA, outPathB, 7, "new")
+		got <- result{o, e}
+	}()
+	select {
+	case res := <-got:
+		t.Fatalf("ReplacePending returned %v while the original was being committed", res.outcome)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	res := <-got
+	if res.outcome != ReplaceRegistered || res.entry.Path != outPathA || res.entry.Database != "db" {
+		t.Fatalf("got %v %+v, want the original reported registered with its fields", res.outcome, res.entry)
+	}
+}
+
+// Confirmed a moment ago and acknowledged: still recognised, because this
+// node's FSM may not have applied the commit yet.
+func TestOutboxReplacePendingRecognisesARecentlyConfirmedFile(t *testing.T) {
+	r := newTestOutbox(t, t.TempDir())
+	m := newFakeOutboxManifest()
+	r.HandOff(m, &fakeOutboxStorage{sizes: map[string]int64{}}, "writer-1")
+	register(r, outPathA, 10)
+	waitOutbox(t, "registered", func() bool { return r.Pending() == 0 })
+	outcome, entry, err := r.ReplacePending(context.Background(), outPathA, outPathB, 7, "new")
+	if err != nil || outcome != ReplaceRegistered || entry.Path != outPathA {
+		t.Fatalf("outcome %v entry %+v err %v, want registered", outcome, entry, err)
+	}
+}
+
+func TestOutboxReplacePendingIgnoresAnUnknownFile(t *testing.T) {
+	r := newTestOutbox(t, t.TempDir())
+	outcome, _, err := r.ReplacePending(context.Background(), outPathA, outPathB, 7, "new")
+	if err != nil || outcome != ReplaceNotPending {
+		t.Fatalf("outcome %v err %v, want not pending", outcome, err)
+	}
+}
+
+// M1: an apply can report failure after the leader committed it. A swap then
+// must still take the old path out of the manifest: the rewrite's batch
+// deletes it.
+func TestOutboxSwappedRewriteDeletesTheOriginalInTheSameBatch(t *testing.T) {
+	// Back off long enough that the swap lands between the failed attempt and
+	// its retry, deterministically.
+	oldMin, oldMax := outboxRetryMin, outboxRetryMax
+	outboxRetryMin, outboxRetryMax = 500*time.Millisecond, 500*time.Millisecond
+	t.Cleanup(func() { outboxRetryMin, outboxRetryMax = oldMin, oldMax })
+
+	r := newTestOutbox(t, t.TempDir())
+	register(r, outPathA, 10)
+	m := newFakeOutboxManifest()
+	m.batchErrs = []error{errors.New("timeout after commit")}
+	m.beforeBatch = func(paths []string) {
+		// First attempt: the leader commits, the caller sees an error.
+		if len(paths) == 1 && paths[0] == outPathA {
+			m.mu.Lock()
+			m.registered[outPathA] = raft.FileEntry{Path: outPathA}
+			m.beforeBatch = nil
+			m.mu.Unlock()
+		}
+	}
+	store := &fakeOutboxStorage{sizes: map[string]int64{outPathA: 10, outPathB: 7}}
+	r.HandOff(m, store, "writer-1")
+	waitOutbox(t, "first attempt failed", func() bool { return len(m.batchLog()) >= 1 })
+
+	outcome, _, err := r.ReplacePending(context.Background(), outPathA, outPathB, 7, "new")
+	if err != nil || outcome != ReplaceSwapped {
+		t.Fatalf("outcome %v err %v, want swapped during the backoff", outcome, err)
+	}
+	waitOutbox(t, "rewrite registered", func() bool { return m.isRegistered(outPathB) })
+	if m.isRegistered(outPathA) {
+		t.Fatal("the original stays in the manifest after its rewrite was registered: a ghost entry")
+	}
+}
+
+func TestOutboxWithdrawTakesAPendingFileOut(t *testing.T) {
+	dir := t.TempDir()
+	r, err := NewRegistrationOutbox(dir, "test-cluster", zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	register(r, outPathA, 10)
+	withdrawn, _, err := r.Withdraw(context.Background(), outPathA)
+	if err != nil || !withdrawn {
+		t.Fatalf("withdrawn=%v err=%v", withdrawn, err)
+	}
+	crash(r)
+	if newTestOutbox(t, dir).IsPending(outPathA) {
+		t.Fatal("a withdrawn file came back after a restart")
+	}
+}
+
+// For cleanup: a file confirmed a moment ago still counts, because this
+// node's FSM may not show it yet.
+func TestOutboxHoldsRegistrationCoversRecentConfirmations(t *testing.T) {
+	r := newTestOutbox(t, t.TempDir())
+	m := newFakeOutboxManifest()
+	r.HandOff(m, &fakeOutboxStorage{sizes: map[string]int64{}}, "writer-1")
+	register(r, outPathA, 10)
+	if !r.HoldsRegistration(outPathA) {
+		t.Fatal("a pending file is not held")
+	}
+	waitOutbox(t, "registered", func() bool { return r.Pending() == 0 })
+	if !r.HoldsRegistration(outPathA) {
+		t.Fatal("a file confirmed a moment ago is not held")
+	}
+	if r.HoldsRegistration(outPathB) {
+		t.Fatal("an unknown file is held")
 	}
 }
