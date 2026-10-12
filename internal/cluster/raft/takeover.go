@@ -31,9 +31,10 @@ import (
 // CapabilityStreamClaims is advertised at join by a node that applies the
 // takeover rules and runs with cluster.stream_takeover (writers: and
 // cluster.wal_coverage). Earlier builds advertised stream_claims_v1 (S4a) and
-// stream_claims_v2 (S4b1a/b, no claimant, no exit on a claim) and never
-// enabled the flag; they block it.
-const CapabilityStreamClaims = "stream_claims_v3"
+// stream_claims_v2 (S4b1a/b, no claimant, no exit on a claim) and
+// stream_claims_v3 (S4b1c1: a leave still orphaned the leaving writer's
+// instances) and never enabled the flag; they block it.
+const CapabilityStreamClaims = "stream_claims_v4"
 
 // Instance status, from its origin's announcements.
 const (
@@ -150,6 +151,12 @@ type keyIndex struct {
 	Floor uint64               `json:"f,omitempty"`
 	Lost  Intervals            `json:"l,omitempty"`
 	Hours map[int64]*hourIndex `json:"h,omitempty"`
+	// LostHours are, per partition hour, the pieces at or below Floor of
+	// files that vanished before any node pulled them (#1207 S4b1c2): their
+	// rows in that hour are in no file, so they are not settled there, while
+	// the batches' rows in other hours, and other rows of the hour, still are.
+	// A piece leaves once Hours covers it again (republished).
+	LostHours map[int64]*hourIndex `json:"lh,omitempty"`
 }
 
 type hourIndex struct {
@@ -162,7 +169,102 @@ func (k *keyIndex) entries() int {
 	for _, h := range k.Hours {
 		n += len(h.Whole) + len(h.Partial)
 	}
+	for _, h := range k.LostHours {
+		n += len(h.Whole) + len(h.Partial)
+	}
 	return n
+}
+
+// floorSettled reports whether batch c is settled by the floor: at or below
+// it and not lost. Per hour, lostPieces may still take rows of it back.
+func (k *keyIndex) floorSettled(c uint64) bool { return c <= k.Floor && !k.Lost.contains(c) }
+
+// lostPieces returns the pieces of batch c whose rows in hour vanished; whole
+// when the whole batch did.
+func (k *keyIndex) lostPieces(c uint64, hour int64) (whole bool, ps []CoveragePiece) {
+	lh := k.LostHours[hour]
+	if lh == nil {
+		return false, nil
+	}
+	if lh.Whole.contains(c) {
+		return true, nil
+	}
+	for _, q := range lh.Partial {
+		if q.CSeq == c {
+			ps = append(ps, q)
+		}
+	}
+	return false, ps
+}
+
+// lostBatches returns the batches with a vanished piece in hour.
+func (k *keyIndex) lostBatches(hour int64) Intervals {
+	lh := k.LostHours[hour]
+	if lh == nil {
+		return nil
+	}
+	out := append(Intervals(nil), lh.Whole...)
+	for _, q := range lh.Partial {
+		out = out.addRange(q.CSeq, q.CSeq)
+	}
+	return out
+}
+
+// floorSettledSet is the batches settled by the floor in every hour: at or
+// below it, not lost, with no vanished piece in any hour. What a claim never
+// takes.
+func (k *keyIndex) floorSettledSet() Intervals {
+	if k == nil || k.Floor == 0 {
+		return nil
+	}
+	s := Intervals{{0, k.Floor}}.minus(k.Lost)
+	for h := range k.LostHours {
+		s = s.minus(k.lostBatches(h))
+	}
+	return s
+}
+
+// pruneLost drops the vanished pieces of hour that Hours covers again.
+func (k *keyIndex) pruneLost(hour int64) {
+	lh, h := k.LostHours[hour], k.Hours[hour]
+	if lh == nil || h == nil {
+		return
+	}
+	lh.Whole = lh.Whole.minus(h.Whole)
+	// A whole vanished batch republished in row or chunk pieces: only batches
+	// with pieces in this hour can be.
+	for _, q := range h.Partial {
+		if lh.Whole.contains(q.CSeq) && piecesCover(h.samePieces(q.CSeq), CoveragePiece{CSeq: q.CSeq}) {
+			lh.Whole = lh.Whole.removeRange(q.CSeq, q.CSeq)
+		}
+	}
+	kept := lh.Partial[:0]
+	for _, q := range lh.Partial {
+		// Re-covered whole, or every row of the batch in pieces (in any row
+		// coordinates), or the vanished rows themselves in the same ones.
+		same := h.samePieces(q.CSeq)
+		if h.Whole.contains(q.CSeq) || piecesCover(same, CoveragePiece{CSeq: q.CSeq}) || piecesCover(same, q) {
+			continue
+		}
+		kept = append(kept, q)
+	}
+	lh.Partial = kept
+	if len(lh.Whole) == 0 && len(lh.Partial) == 0 {
+		delete(k.LostHours, hour)
+	}
+}
+
+func (h *hourIndex) samePieces(c uint64) []CoveragePiece {
+	if h == nil {
+		return nil
+	}
+	var out []CoveragePiece
+	for _, q := range h.Partial {
+		if q.CSeq == c {
+			out = append(out, q)
+		}
+	}
+	return out
 }
 
 // settledWhole returns the batches of [lo, hi] whose rows in hour are, at
@@ -173,7 +275,12 @@ func (k *keyIndex) settledWhole(lo, hi uint64, hour int64) Intervals {
 	}
 	var out Intervals
 	if k.Floor >= lo {
+		// A batch whose rows of this hour all vanished is not settled here;
+		// one with only some rows vanished still has rows in a file.
 		out = Intervals{{lo, minU64(hi, k.Floor)}}.minus(k.Lost)
+		if lh := k.LostHours[hour]; lh != nil {
+			out = out.minus(lh.Whole)
+		}
 	}
 	if h := k.Hours[hour]; h != nil {
 		out = out.union(h.Whole.clip(lo, hi))
@@ -192,8 +299,10 @@ func (k *keyIndex) settledPiece(p CoveragePiece, hour int64) bool {
 	if k == nil {
 		return false
 	}
-	if p.CSeq <= k.Floor && !k.Lost.contains(p.CSeq) {
-		return true
+	if k.floorSettled(p.CSeq) {
+		if whole, lost := k.lostPieces(p.CSeq, hour); !whole && !piecesCover(lost, p) {
+			return true // some rows of p are in a file
+		}
 	}
 	h := k.Hours[hour]
 	if h == nil {
@@ -234,8 +343,13 @@ type takeoverState struct {
 	current   map[string]uint64
 	index     map[uint64]map[string]*keyIndex
 	claims    map[uint64]*StreamClaim
-	entries   int    // index entries across every instance (bounded by maxIndexEntries)
-	gen       uint64 // bumped on every change; not replicated (a reader's cache key)
+	// departed are writers that left gracefully (a restart, usually): their
+	// instances and claims are kept until they re-join, or until the leader
+	// expires the departure (RemoveReasonDepartedExpired). Keyed by node id,
+	// valued by the departure time the leave carried.
+	departed map[string]time.Time
+	entries  int    // index entries across every instance (bounded by maxIndexEntries)
+	gen      uint64 // bumped on every change; not replicated (a reader's cache key)
 }
 
 func newTakeoverState() *takeoverState {
@@ -244,6 +358,7 @@ func newTakeoverState() *takeoverState {
 		current:   map[string]uint64{},
 		index:     map[uint64]map[string]*keyIndex{},
 		claims:    map[uint64]*StreamClaim{},
+		departed:  map[string]time.Time{},
 	}
 }
 
@@ -252,12 +367,13 @@ type takeoverSnapshot struct {
 	Instances []StreamInstance                `json:"instances,omitempty"`
 	Index     map[string]map[string]*keyIndex `json:"index,omitempty"` // instance (hex) -> key
 	Claims    []StreamClaim                   `json:"claims,omitempty"`
+	Departed  map[string]time.Time            `json:"departed,omitempty"`
 }
 
 func instKey(i uint64) string { return fmt.Sprintf("%016x", i) }
 
 func (t *takeoverState) snapshot() *takeoverSnapshot {
-	if len(t.instances) == 0 && len(t.claims) == 0 {
+	if len(t.instances) == 0 && len(t.claims) == 0 && len(t.departed) == 0 {
 		return nil
 	}
 	s := &takeoverSnapshot{Index: map[string]map[string]*keyIndex{}}
@@ -278,6 +394,12 @@ func (t *takeoverState) snapshot() *takeoverSnapshot {
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	for _, id := range ids {
 		s.Claims = append(s.Claims, t.claims[id].clone())
+	}
+	if len(t.departed) > 0 {
+		s.Departed = make(map[string]time.Time, len(t.departed))
+		for id, at := range t.departed {
+			s.Departed[id] = at
+		}
 	}
 	return s
 }
@@ -311,6 +433,9 @@ func restoreTakeover(s *takeoverSnapshot) *takeoverState {
 		c := s.Claims[i]
 		t.claims[c.Instance] = &c
 	}
+	for id, at := range s.Departed {
+		t.departed[id] = at
+	}
 	return t
 }
 
@@ -318,6 +443,12 @@ func (k *keyIndex) clone() *keyIndex {
 	c := &keyIndex{Floor: k.Floor, Lost: append(Intervals(nil), k.Lost...), Hours: make(map[int64]*hourIndex, len(k.Hours))}
 	for h, v := range k.Hours {
 		c.Hours[h] = &hourIndex{Whole: append(Intervals(nil), v.Whole...), Partial: append([]CoveragePiece(nil), v.Partial...)}
+	}
+	if len(k.LostHours) > 0 {
+		c.LostHours = make(map[int64]*hourIndex, len(k.LostHours))
+		for h, v := range k.LostHours {
+			c.LostHours[h] = &hourIndex{Whole: append(Intervals(nil), v.Whole...), Partial: append([]CoveragePiece(nil), v.Partial...)}
+		}
 	}
 	return c
 }
@@ -610,19 +741,26 @@ func (f *ClusterFSM) indexAddLocked(c InstanceCoverage, hour int64) {
 		ki.Hours[hour] = h
 	}
 	var add Intervals
+	lost := ki.lostBatches(hour)
 	for _, r := range normalized(c.Ranges) {
 		if r[1] <= ki.Floor && !ki.Lost.overlaps(r[0], r[1]) {
+			// Settled by the floor, except batches with a vanished piece here.
+			add = append(add, lost.clip(r[0], r[1])...)
 			continue
 		}
 		add = append(add, r)
 	}
-	h.Whole = h.Whole.union(add)
+	h.Whole = h.Whole.union(normalized(add))
 	for _, p := range c.Partial {
-		if p.CSeq <= ki.Floor && !ki.Lost.contains(p.CSeq) {
+		if ki.floorSettled(p.CSeq) && !lost.contains(p.CSeq) {
 			continue
 		}
 		h.Partial = append(h.Partial, p)
 	}
+	if len(h.Whole) == 0 && len(h.Partial) == 0 {
+		delete(ki.Hours, hour)
+	}
+	ki.pruneLost(hour)
 	t.entries += ki.entries() - before
 	whole, partial := 0, 0
 	for _, hh := range ki.Hours {
@@ -659,20 +797,22 @@ func (f *ClusterFSM) indexWouldOverflowLocked(c InstanceCoverage, hour int64, sc
 		}
 		ki = &keyIndex{}
 	}
+	lost := ki.lostBatches(hour)
 	above := func(rs [][2]uint64) Intervals {
 		var out Intervals
 		for _, r := range normalized(rs) {
 			if r[1] <= ki.Floor && !ki.Lost.overlaps(r[0], r[1]) {
+				out = append(out, lost.clip(r[0], r[1])...)
 				continue
 			}
 			out = append(out, r)
 		}
-		return out
+		return normalized(out)
 	}
 	partialsAbove := func(ps []CoveragePiece) int {
 		n := 0
 		for _, p := range ps {
-			if p.CSeq > ki.Floor || ki.Lost.contains(p.CSeq) {
+			if !ki.floorSettled(p.CSeq) || lost.contains(p.CSeq) {
 				n++
 			}
 		}
@@ -718,6 +858,82 @@ func (f *ClusterFSM) indexWouldOverflowLocked(c InstanceCoverage, hour int64, sc
 		}
 	}
 	return t.entries+pending+whole+partial-before > maxIndexEntries
+}
+
+// takeoverVanishedLocked takes back the batches of a file that vanished
+// before any node pulled it: above the floor from the hour's index, at or
+// below it as vanished pieces of that hour. An unfinished claim on the
+// instance grows to take them, so the claimant republishes them and the
+// origin's copies are refused. Caller holds f.mu.
+func (f *ClusterFSM) takeoverVanishedLocked(c InstanceCoverage, hour int64, logIndex uint64) {
+	f.indexSubtractLocked(c, hour)
+	t := f.takeover
+	in := t.instances[c.Instance]
+	ki := t.index[c.Instance][c.Key]
+	if in == nil || in.Untracked || ki == nil || c.Truncated {
+		return
+	}
+	var whole Intervals
+	for _, r := range normalized(c.Ranges) {
+		if r[0] > ki.Floor {
+			continue
+		}
+		whole = whole.union(Intervals{{r[0], minU64(r[1], ki.Floor)}}.minus(ki.Lost))
+	}
+	var partial []CoveragePiece
+	for _, p := range c.Partial {
+		if ki.floorSettled(p.CSeq) {
+			partial = append(partial, p)
+		}
+	}
+	if len(whole) == 0 && len(partial) == 0 {
+		return
+	}
+	before := ki.entries()
+	if ki.LostHours == nil {
+		ki.LostHours = map[int64]*hourIndex{}
+	}
+	lh := ki.LostHours[hour]
+	if lh == nil {
+		lh = &hourIndex{}
+		ki.LostHours[hour] = lh
+	}
+	lh.Whole = lh.Whole.union(whole)
+	lh.Partial = append(lh.Partial, partial...)
+	t.entries += ki.entries() - before
+	t.gen++
+	n := 0
+	for _, h := range ki.LostHours {
+		n += len(h.Whole) + len(h.Partial)
+	}
+	if n > maxKeyLost || t.entries > maxIndexEntries {
+		f.untrackLocked(in, "the vanished pieces of a buffer key are over their bound")
+		return
+	}
+	if k := t.claims[c.Instance]; k.active() && !k.Done {
+		set := k.Set[c.Key].union(whole)
+		for _, p := range partial {
+			set = set.addRange(p.CSeq, p.CSeq)
+		}
+		if len(set) > maxClaimIntervalsPerKey {
+			f.untrackLocked(in, "a claim grew past its bound with vanished batches")
+			return
+		}
+		k.Set[c.Key] = set
+		k.ExtendedAt = logIndex
+	}
+}
+
+// ClaimableSet returns the batches of ivs a claim of (inst, key) would take:
+// all but those settled by the floor in every hour.
+func (f *ClusterFSM) ClaimableSet(inst uint64, key string, ivs Intervals) Intervals {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	s := normalized(ivs)
+	if ki := f.takeover.index[inst][key]; ki != nil {
+		s = s.minus(ki.floorSettledSet())
+	}
+	return s
 }
 
 // indexSubtractLocked removes c's batches for hour: a file that vanished
@@ -864,6 +1080,11 @@ func (f *ClusterFSM) applyAnnounceInstance(payload []byte, logIndex uint64) inte
 				in.Status = InstanceOrphaned
 			}
 			in.AdoptedBy = 0
+			if c := t.claims[id]; c != nil && c.Done && !c.Released {
+				// Published by its claimant, and its origin holds nothing of
+				// it: nothing will ever register it again (as on ClaimDone).
+				f.removeInstanceLocked(id)
+			}
 		}
 	}
 	delete(t.current, p.Origin)
@@ -962,19 +1183,21 @@ func (f *ClusterFSM) applySettleCoverage(payload []byte) interface{} {
 		ki.Floor = s.Floor
 		for hr, h := range ki.Hours {
 			var whole Intervals
+			lostHere := ki.lostBatches(hr)
 			for _, iv := range h.Whole {
 				if iv[1] > ki.Floor {
 					whole = whole.addRange(maxU64(iv[0], ki.Floor+1), iv[1])
 				}
-				// At or below the floor: kept only where lost.
-				for _, l := range ki.Lost.clip(iv[0], minU64(iv[1], ki.Floor)) {
+				// At or below the floor: kept only where lost (in every hour,
+				// or a vanished piece of this one).
+				for _, l := range ki.Lost.union(lostHere).clip(iv[0], minU64(iv[1], ki.Floor)) {
 					whole = whole.addRange(l[0], l[1])
 				}
 			}
 			h.Whole = whole
 			kept := h.Partial[:0]
 			for _, q := range h.Partial {
-				if q.CSeq > ki.Floor || ki.Lost.contains(q.CSeq) {
+				if q.CSeq > ki.Floor || ki.Lost.contains(q.CSeq) || lostHere.contains(q.CSeq) {
 					kept = append(kept, q)
 				}
 			}
@@ -1084,15 +1307,18 @@ func (f *ClusterFSM) applyTakeOverStreamV2(payload []byte, logIndex uint64) inte
 			// Batches settled in every hour (at or below the floor, not
 			// lost) are not claimable. Hours settled above the floor are
 			// filtered by the claimant when it replays.
-			if ki := t.index[c.Instance][k]; ki != nil && ki.Floor > 0 {
-				s = s.minus(Intervals{{0, ki.Floor}}.minus(ki.Lost))
+			if ki := t.index[c.Instance][k]; ki != nil {
+				s = s.minus(ki.floorSettledSet())
 			}
 			if len(s) > 0 {
 				set[k] = s
 			}
 		}
 		if len(set) == 0 {
-			if in != nil {
+			// Only an instance listed with no keys at all reports holding
+			// nothing; a set the floors trimmed to nothing claims nothing and
+			// reports nothing (later keys may still be claimed).
+			if in != nil && len(c.Keys) == 0 {
 				f.reportedEmptyLocked(in, p.By)
 			}
 			continue
@@ -1134,6 +1360,23 @@ func (f *ClusterFSM) removeIfAllReportedLocked(in *StreamInstance) {
 	}
 	for id, n := range f.nodes {
 		if n.Role != "writer" || id == in.Origin {
+			continue
+		}
+		found := false
+		for _, r := range in.ReportedBy {
+			if r == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return
+		}
+	}
+	// A writer that left gracefully may hold the only copy: it must report
+	// too (it can once it re-joins; its departure expires otherwise).
+	for id := range f.takeover.departed {
+		if id == in.Origin {
 			continue
 		}
 		found := false
@@ -1265,8 +1508,8 @@ func (f *ClusterFSM) applyExtendStreamClaim(payload []byte, logIndex uint64) int
 			return errors.New("extend stream claim: a claimed key is malformed or over its bound")
 		}
 		s := normalized(v)
-		if ki := t.index[p.Instance][k]; ki != nil && ki.Floor > 0 {
-			s = s.minus(Intervals{{0, ki.Floor}}.minus(ki.Lost))
+		if ki := t.index[p.Instance][k]; ki != nil {
+			s = s.minus(ki.floorSettledSet())
 		}
 		if len(s) == 0 {
 			continue
@@ -1333,6 +1576,7 @@ func (f *ClusterFSM) applyInstanceSettled(payload []byte) interface{} {
 func (f *ClusterFSM) takeoverNodeRemovedLocked(id string) {
 	t := f.takeover
 	t.gen++
+	delete(t.departed, id) // before the report sweep below: it no longer waits for this node
 	for _, inst := range sortedInstanceIDs(t.instances) {
 		in := t.instances[inst]
 		if in.Origin == id {
@@ -1358,6 +1602,80 @@ func (f *ClusterFSM) takeoverNodeRemovedLocked(id string) {
 				Msg("Stream claim released: its claimant was removed from the cluster")
 		}
 	}
+}
+
+// maxDepartedWriters bounds the departures kept; past it a leave is applied
+// as an operator removal (instances orphaned, claims released).
+const maxDepartedWriters = 256
+
+// takeoverNodeDepartedLocked records a graceful leave of a writer: its
+// instances and claims stay as they are (a restart re-joins and adopts its
+// instances first), so it is not treated as gone. Caller holds f.mu.
+func (f *ClusterFSM) takeoverNodeDepartedLocked(id string, at time.Time) {
+	t := f.takeover
+	if _, ok := t.departed[id]; !ok && len(t.departed) >= maxDepartedWriters {
+		// Full: the departure most likely never to return goes, the oldest
+		// (ties by id, so every node picks the same).
+		oldest := ""
+		for d, at := range t.departed {
+			if oldest == "" || at.Before(t.departed[oldest]) || (at.Equal(t.departed[oldest]) && d < oldest) {
+				oldest = d
+			}
+		}
+		f.logger.Error().Str("node_id", oldest).Int("departed", len(t.departed)).
+			Msg("Too many writers have left the cluster without coming back; the oldest departure is removed from stream takeover as an operator removal would")
+		f.takeoverNodeRemovedLocked(oldest)
+	}
+	t.gen++
+	t.departed[id] = at
+}
+
+// takeoverNodeBackLocked forgets a departure: the node re-joined. Back in
+// another role than writer it will never announce again: its instances are
+// given up as on an operator removal.
+func (f *ClusterFSM) takeoverNodeBackLocked(id, role string) {
+	t := f.takeover
+	if t == nil {
+		return
+	}
+	if _, ok := t.departed[id]; ok {
+		delete(t.departed, id)
+		t.gen++
+	}
+	if role == "writer" || !f.streamClaims {
+		return
+	}
+	for _, in := range t.instances {
+		if in.Origin == id && !in.OriginGone {
+			f.takeoverNodeRemovedLocked(id)
+			return
+		}
+	}
+}
+
+// CurrentInstanceClaimed reports whether origin's current instance has an
+// active claim, finished or not: that process exits for a restart (its next
+// instance is not claimed).
+func (f *ClusterFSM) CurrentInstanceClaimed(origin string) bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	inst, ok := f.takeover.current[origin]
+	if !ok {
+		return false
+	}
+	return f.takeover.claims[inst].active()
+}
+
+// DepartedWriters returns the writers that left gracefully and have not
+// re-joined, with their departure time.
+func (f *ClusterFSM) DepartedWriters() map[string]time.Time {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	out := make(map[string]time.Time, len(f.takeover.departed))
+	for id, at := range f.takeover.departed {
+		out[id] = at
+	}
+	return out
 }
 
 // ---- read access ----
@@ -1458,14 +1776,9 @@ func (f *ClusterFSM) CoveredRows(inst uint64, key string, cseq uint64, chunk, ch
 	if ki == nil {
 		return CoveredRanges, nil, 0, nil
 	}
-	if cseq <= ki.Floor && !ki.Lost.contains(cseq) {
-		return CoveredAll, nil, 0, nil
-	}
-	h := ki.Hours[hour.UTC().Truncate(time.Hour).Unix()]
-	if h == nil {
-		return CoveredRanges, nil, 0, nil
-	}
-	if h.Whole.contains(cseq) {
+	hr := hour.UTC().Truncate(time.Hour).Unix()
+	h := ki.Hours[hr]
+	if h != nil && h.Whole.contains(cseq) {
 		return CoveredAll, nil, 0, nil
 	}
 	chunked := chunks > 1
@@ -1474,6 +1787,43 @@ func (f *ClusterFSM) CoveredRows(inst uint64, key string, cseq uint64, chunk, ch
 	}
 	var ranges [][2]int
 	total := -1
+	if ki.floorSettled(cseq) {
+		// Every row is in a file, except the rows of vanished pieces here.
+		whole, lost := ki.lostPieces(cseq, hr)
+		if !whole {
+			var gone [][2]int
+			for _, q := range lost {
+				if (q.Chunks > 0) != chunked {
+					return CoveredRanges, nil, 0, fmt.Errorf("batch %d of %s vanished in other row coordinates", cseq, key)
+				}
+				if chunked && q.Chunk != chunk {
+					continue
+				}
+				if q.RowTotal == 0 {
+					whole = true // the whole chunk
+					break
+				}
+				if total >= 0 && q.RowTotal != total {
+					return CoveredRanges, nil, 0, fmt.Errorf("batch %d of %s vanished with differing row totals", cseq, key)
+				}
+				total = q.RowTotal
+				gone = append(gone, [2]int{q.RowLo, q.RowHi})
+			}
+			if !whole {
+				if len(gone) == 0 {
+					return CoveredAll, nil, 0, nil
+				}
+				sort.Slice(gone, func(i, j int) bool { return gone[i][0] < gone[j][0] })
+				ranges = complementRanges(gone, total)
+			}
+		}
+	}
+	if h == nil {
+		if total < 0 {
+			return CoveredRanges, nil, 0, nil
+		}
+		return CoveredRanges, ranges, total, nil
+	}
 	for _, q := range h.Partial {
 		if q.CSeq != cseq {
 			continue
@@ -1647,10 +1997,21 @@ func (f *ClusterFSM) CoverageCovered(inst uint64, key string, p CoveragePiece, h
 	if ki == nil {
 		return false
 	}
-	if p.CSeq <= ki.Floor && !ki.Lost.contains(p.CSeq) {
-		return true
+	hr := hour.UTC().Truncate(time.Hour).Unix()
+	h := ki.Hours[hr]
+	if ki.floorSettled(p.CSeq) {
+		whole, lost := ki.lostPieces(p.CSeq, hr)
+		if !whole {
+			// Covered unless a vanished piece overlapping p is not
+			// republished (conservative: the whole vanished piece).
+			for _, q := range lost {
+				if piecesOverlap(p, q) && !(h != nil && (h.Whole.contains(q.CSeq) || piecesCover(h.samePieces(q.CSeq), q))) {
+					return false
+				}
+			}
+			return true
+		}
 	}
-	h := ki.Hours[hour.UTC().Truncate(time.Hour).Unix()]
 	if h == nil {
 		return false
 	}
@@ -1788,10 +2149,12 @@ func (f *ClusterFSM) UncoveredBatches(inst uint64, key string, lo, hi uint64, ho
 	if ki == nil {
 		return all
 	}
+	hr := hour.UTC().Truncate(time.Hour).Unix()
 	if ki.Floor >= lo {
-		all = all.minus(Intervals{{lo, minU64(hi, ki.Floor)}}.minus(ki.Lost))
+		// A batch with a vanished piece here counts as uncovered.
+		all = all.minus(Intervals{{lo, minU64(hi, ki.Floor)}}.minus(ki.Lost).minus(ki.lostBatches(hr)))
 	}
-	if h := ki.Hours[hour.UTC().Truncate(time.Hour).Unix()]; h != nil {
+	if h := ki.Hours[hr]; h != nil {
 		all = all.minus(h.Whole.clip(lo, hi))
 	}
 	return all

@@ -403,3 +403,46 @@ func putRawKey(t *testing.T, b *S3Backend, key string) error {
 	}
 	return nil
 }
+
+// TestS3NotFoundIsTypedAgainstARealStore (#1238): the store's own answers,
+// not idealised XML. A missing key is a missing object through every read
+// and through a HEAD; a missing bucket is ErrStoreNotFound on a read and
+// never a missing object; the key's text ("404", "NotFound") plays no part.
+func TestS3NotFoundIsTypedAgainstARealStore(t *testing.T) {
+	b := minioBackend(t)
+	ctx := context.Background()
+	const key = "contract-1238/NotFoundEvents/2026/10/12/14/x_1760404040404.parquet"
+	// The bucket must exist for a missing KEY to be what the reads find; a
+	// store that creates buckets on the first write (SeaweedFS) needs one.
+	if err := b.Write(ctx, "contract-1238/present.txt", []byte("x")); err != nil {
+		t.Fatalf("seed the bucket: %v", err)
+	}
+
+	_, err := b.Read(ctx, key)
+	if !IsNotFound(err) || IsStoreNotFound(err) {
+		t.Fatalf("Read of a missing key: err = %v, want a missing object", err)
+	}
+	if err := b.ReadToAt(ctx, key, io.Discard, 4); !IsNotFound(err) {
+		t.Fatalf("ranged read of a missing key: err = %v, want a missing object", err)
+	}
+	if size, err := b.StatFile(ctx, key); size != -1 || err != nil {
+		t.Fatalf("StatFile of a missing key = %d, %v; want -1, nil", size, err)
+	}
+	if ok, err := b.Exists(ctx, key); ok || err != nil {
+		t.Fatalf("Exists of a missing key = %v, %v; want false, nil", ok, err)
+	}
+
+	noBucket := &S3Backend{client: b.client, prefix: b.prefix, logger: b.logger,
+		bucket: fmt.Sprintf("arc-1238-missing-%d", time.Now().UnixNano())}
+	_, err = noBucket.Read(ctx, key)
+	if IsNotFound(err) || !IsStoreNotFound(err) {
+		t.Fatalf("Read from a missing bucket: err = %v, want ErrStoreNotFound and not a missing object", err)
+	}
+	// #1242: a HEAD cannot tell, so the backend asks about the bucket.
+	if size, err := noBucket.StatFile(ctx, key); size != -1 || !IsStoreNotFound(err) {
+		t.Fatalf("StatFile in a missing bucket = %d, %v; want ErrStoreNotFound", size, err)
+	}
+	if ok, err := noBucket.Exists(ctx, key); ok || !IsStoreNotFound(err) {
+		t.Fatalf("Exists in a missing bucket = %v, %v; want ErrStoreNotFound", ok, err)
+	}
+}

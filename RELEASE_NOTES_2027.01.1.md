@@ -228,6 +228,12 @@ wrote them.
 
 ## New features
 
+### Writer failover picks the standby with the lowest node id ([#1207](https://github.com/Basekick-Labs/arc/issues/1207))
+
+When several healthy standby writers can replace a failed primary, the leader
+now picks the one with the lowest node id. Before, the choice depended on map
+order and could differ between leaders.
+
 ### Experimental: WAL coverage on cluster writers ([#1207](https://github.com/Basekick-Labs/arc/issues/1207))
 
 This is the first step toward letting a standby writer take over the rows a
@@ -347,6 +353,22 @@ release:
   steps, a claimant releasing its own claim, and a refusal for a claimant file
   the settled index has no room for (the index keeps tracking the writer
   process instead of giving up on it).
+- A writer that leaves the cluster gracefully (a restart, a rolling upgrade)
+  keeps its takeover state while it is gone: when it comes back it picks up its
+  own unflushed batches first, instead of having them taken over. Only an
+  operator node removal gives them up, or the departure expiring after
+  `cluster.stream_takeover_departed_ttl` (default `24h`). Departed writers are
+  listed by the new admin endpoint `GET /api/v1/cluster/stream-claims` and
+  counted by `arc_stream_takeover_departed_writers`. The capability nodes
+  advertise is now `stream_claims_v4`.
+- New setting `cluster.stream_takeover_grace` (default `60s`, at least `10s`):
+  how long a primary that stopped answering may take to come back before the
+  new primary takes over its batches. Not used yet.
+- A file that vanished before any node pulled it now gives its rows back for a
+  takeover, in its partition hour only; the rest of the writer process stays
+  settled.
+- Failover never promotes a writer whose current process another writer has
+  claimed.
 
 Nothing turns takeover on in this release.
 
@@ -980,6 +1002,76 @@ negative or unparseable value is a startup error naming the value rather than
 an unbounded operation.
 
 ## Bug fixes
+
+### Delete API catches dangerous keywords glued to numbers or literals ([#1080](https://github.com/Basekick-Labs/arc/issues/1080))
+
+The delete endpoint's keyword scan used `\b` directly on the masked WHERE
+clause. Digits and the masker's identifier-shaped placeholders can prevent a
+word boundary, allowing inputs such as `1=1UNION ...` or `host='a'UNION ...`
+to pass this pre-filter. The validator now separates token-start keywords
+from numbers and removes literal placeholders before scanning, matching the
+query endpoint's existing handling.
+
+Both endpoints now split off a number the way DuckDB reads it, as one token:
+with `_` separators, a fraction (`1.`, `.5`) and an exponent with or without a
+sign. Before, only a plain digit run was split, so `1e0UNION`, `1.5e3UNION`,
+`1.e1UNION` or `1_0UNION` still hid the keyword from the delete endpoint and
+from the measurement query endpoint's WHERE check, while DuckDB ran them as a
+`UNION`.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1081](https://github.com/Basekick-Labs/arc/pull/1081).
+
+### A storage error that only mentions "404" no longer reads as a missing object ([#1238](https://github.com/Basekick-Labs/arc/issues/1238))
+
+Arc decided whether an S3 or Azure object was missing by looking for `404`,
+`NotFound` or `NoSuchKey` anywhere in the error's text. That text carries the
+request URL (endpoint, bucket, key and, for a backup, the backup id), the
+storage service's request id and, for a connection failure, the local port. So
+an outage, a throttled request or a refused connection could read as "the
+object is not there" whenever one of those happened to contain the digits.
+Arc's file names carry nanosecond timestamps and backup ids carry the time
+they were taken, so this was not rare: an unreachable backup target answered
+`GET /api/v1/backup/{id}` with 404 `Backup not found` for every backup taken
+at a minute such as 14:04, and `POST /api/v1/backup/restore` started a restore
+with a guessed mode (202) instead of refusing. File-existence checks answered
+"absent" in the same cases. Tiering, edge sync, compaction, backup restore and
+the cluster's file replication all branch on those checks.
+
+A missing object is now recognised only from the storage service's own
+answer: `NoSuchKey` on an S3 read, the bodiless 404 of an S3 `HEAD`, and
+`BlobNotFound` on Azure. The backup API answers an unreachable target with 503
+naming the target, as it already did when the error text happened to contain
+no `404`.
+
+Two narrower changes come with it:
+
+- **A missing bucket or container is not a missing object.** Reading an object
+  from an S3 bucket that does not exist (`NoSuchBucket`), or from an Azure
+  container that does not exist, is now an error that says the store is
+  missing, instead of "object not found". The backup API answers 503 for a
+  target whose bucket does not exist, where it answered 404 or started a
+  restore. Checking whether a file exists in a missing bucket or container is
+  an error too ([#1242](https://github.com/Basekick-Labs/arc/issues/1242)): an
+  S3 `HEAD` cannot tell a missing bucket from a missing key, so after a `HEAD`
+  that finds no object Arc asks S3 whether the bucket exists, at most once a
+  minute while it does. An answer other than "no such bucket", including a 403
+  for credentials that may not list the bucket, keeps the object absent, as
+  before. The places that run before a store's first write treat a missing
+  store as empty, because most S3-compatible stores create the bucket on that
+  write: a backup to a new target, a restore into a new cold bucket, an edge
+  hub receiving its first file, and `GET` or `POST /api/v1/databases` on a
+  fresh deployment. Creating a database on a store whose bucket did not exist
+  yet answered 500 before and works now.
+- **A 404 without a storage error code is an error.** A proxy or gateway
+  answering 404 with its own page, rather than the storage service's error, is
+  no longer taken to mean the object is missing. An S3-compatible store that
+  answers a read of a missing key without the `NoSuchKey` code would now
+  surface an error; AWS S3, MinIO and SeaweedFS all
+  send it.
+
+A local backend read of a missing file (`ReadTo`, ranged and staged reads) is
+now recognised as missing on every path, not only when the path contained
+`404`.
 
 ### Updating a continuous query or retention policy no longer resets the fields you leave out ([#1023](https://github.com/Basekick-Labs/arc/issues/1023))
 
@@ -2061,6 +2153,16 @@ database marker. Database details return an error if measurement listing fails,
 rather than reporting a successful response with a zero measurement count.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1067](https://github.com/Basekick-Labs/arc/pull/1067).
+### Object-store prefixes count toward the storage key limit ([#1121](https://github.com/Basekick-Labs/arc/issues/1121))
+
+S3 and Azure now validate the complete object name, including its configured
+prefix, before sending it to the object store. Listings and prefix probes use
+the same check; previously stored over-limit names are omitted from ordinary
+listings and reported by `ListUnusable`. Azure batch deletion applies the same
+check and continues deleting the other valid keys in the batch.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1132](https://github.com/Basekick-Labs/arc/pull/1132).
 
 ### Forwarded writes and WAL replication honor cancellation during TLS setup ([#1064](https://github.com/Basekick-Labs/arc/issues/1064))
 
@@ -2089,8 +2191,10 @@ checking whether a prefix holds any object — report a bucket or container that
 does not exist as a distinct error rather than as an error message, which is
 what lets those four read paths recognise it. Only the structured
 `NoSuchBucket` and `ContainerNotFound` responses are recognised; transport
-failures, authorization failures and every other storage error stay visible,
-and a failed read of a specific object is unchanged.
+failures, authorization failures and every other storage error stay visible.
+A read of a specific object from a missing bucket or container is reported the
+same way since [#1238](https://github.com/Basekick-Labs/arc/issues/1238) (see
+that entry).
 
 Everything else that lists storage still treats a store it cannot find as a
 failure, deliberately. Query planning drops a whole tier from a read when a
@@ -2263,6 +2367,24 @@ merge pass is a new, modest contributor to the growth that switch accepts. One c
 knowing: a merged table's live file list is concentrated in a single manifest, so where losing one
 manifest used to cost a fraction of the file list it now costs all of it, and nothing re-registers
 a lost manifest.
+
+### Backup listings report unreadable manifests instead of hiding backups ([#1123](https://github.com/Basekick-Labs/arc/issues/1123))
+
+When a backup ID was listed but its manifest could not be read or parsed, Arc
+silently skipped it. The listing now reports that destination as incomplete;
+when every configured destination is affected, it returns an error instead of
+an empty successful result. Readable backups on other destinations remain
+available in a partial listing.
+
+An incomplete destination contributes none of its backups, including the ones
+whose manifests read fine, because a listing that silently leaves out a backup
+is the problem this fixes. With a single destination, one manifest that cannot
+be parsed therefore makes `GET /api/v1/backup` answer 503 until it is repaired
+or removed. Retrying does not help in that case; the server log names the
+manifest (`Failed to parse manifest; target listing is incomplete`), and the
+other backups can still be fetched and restored by id.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1138](https://github.com/Basekick-Labs/arc/pull/1138).
 
 ### A backup fails loudly when compaction recovery state cannot be copied ([#1100](https://github.com/Basekick-Labs/arc/issues/1100))
 

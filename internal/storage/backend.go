@@ -28,8 +28,11 @@ var ErrResumeNotSupported = errors.New("storage: resume not supported by this ba
 //
 // So the backends report it and the few read paths that want leniency opt in
 // with IsStoreNotFound. Everything else keeps failing as it always did. The
-// listing methods wrap it alongside the SDK's own error, so both chains stay
-// inspectable.
+// listing methods and the reads (Read, ReadTo, ReadToAt) wrap it alongside
+// the SDK's own error, so both chains stay inspectable; a read of a missing
+// store is never a missing object (#1238). So do StatFile and Exists: an S3
+// HEAD cannot tell a missing bucket from a missing key, so after a HEAD 404 the
+// S3 backend asks HeadBucket (#1242).
 var ErrStoreNotFound = errors.New("storage: bucket or container does not exist")
 
 // IsStoreNotFound reports whether err is a backend saying its bucket or
@@ -51,15 +54,19 @@ func IsStoreNotFound(err error) bool {
 //
 // Each backend wraps it from its own not-found shape; IsNotFound is the
 // predicate to use rather than string-matching, because the shapes differ
-// (an *fs.PathError locally, NoSuchKey on S3, a 404 ResponseError on Azure).
+// (an *fs.PathError locally, NoSuchKey or a HEAD's NotFound on S3, a
+// BlobNotFound ResponseError on Azure).
 var ErrObjectNotFound = errors.New("file not found")
 
 // IsNotFound reports whether err is a backend saying the key names no object.
 //
-// Tolerant on purpose: it accepts the wrapped sentinel, a wrapped fs
-// not-exist, and the per-backend shapes the two SDKs produce, because not
-// every error path in this package has been routed through the sentinel and a
-// false "no" here would turn an absent object into a hard failure.
+// It accepts the wrapped sentinel, a wrapped fs not-exist, and the typed
+// shapes the two SDKs produce (NoSuchKey/NotFound on S3, a non-container 404
+// ResponseError on Azure). It never reads an error's text (#1238): S3 and
+// Azure errors carry the request URL, the request ID and the local port, so a
+// transport failure could contain "404" or "NotFound" and read as an absent
+// object. A missing bucket or container is not a missing object either: it
+// reads as ErrStoreNotFound (IsStoreNotFound).
 func IsNotFound(err error) bool {
 	if err == nil {
 		return false

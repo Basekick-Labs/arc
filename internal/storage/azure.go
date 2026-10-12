@@ -170,8 +170,9 @@ func NewAzureBlobBackend(cfg *AzureBlobConfig, logger zerolog.Logger) (*AzureBlo
 }
 
 // prefixedKey validates a storage key and prepends the configured prefix to
-// build the blob name. The S3 twin is S3Backend.prefixedKey and the two are
-// meant to stay diffable.
+// build the blob name. It also enforces the key-length limit after the prefix
+// is applied (#1121). The S3 twin is S3Backend.prefixedKey and the two are meant
+// to stay diffable.
 //
 // Every key-taking method routes through this, so the contract the other
 // backends enforce (#743) holds here too. One rule matters especially on
@@ -184,10 +185,7 @@ func NewAzureBlobBackend(cfg *AzureBlobConfig, logger zerolog.Logger) (*AzureBlo
 // keys, this is the only place the prefix is added, and every listing strips
 // it again on the way out.
 func (b *AzureBlobBackend) prefixedKey(key string) (string, error) {
-	if err := ValidateKey(key); err != nil {
-		return "", err
-	}
-	return b.prefix + key, nil
+	return prefixObjectKey(b.prefix, key)
 }
 
 // prefixedListPrefix is prefixedKey for enumeration, where "" and a trailing
@@ -221,11 +219,12 @@ func (b *AzureBlobBackend) prefixedListPrefix(prefix string) (string, error) {
 func partitionValidKeys(prefix string, batch []string) (usable []string, rejected []error) {
 	usable = make([]string, 0, len(batch))
 	for _, path := range batch {
-		if err := ValidateKey(path); err != nil {
+		objectName, err := prefixObjectKey(prefix, path)
+		if err != nil {
 			rejected = append(rejected, err)
 			continue
 		}
-		usable = append(usable, prefix+path)
+		usable = append(usable, objectName)
 	}
 	return usable, rejected
 }
@@ -297,7 +296,7 @@ func (b *AzureBlobBackend) Read(ctx context.Context, path string) ([]byte, error
 	resp, err := blobClient.DownloadStream(ctx, nil)
 	if err != nil {
 		recordStorageError(ctx, err)
-		return nil, fmt.Errorf("failed to read from Azure Blob Storage: %w", err)
+		return nil, azureReadError(err)
 	}
 	defer resp.Body.Close()
 
@@ -330,7 +329,7 @@ func (b *AzureBlobBackend) ReadTo(ctx context.Context, path string, writer io.Wr
 	resp, err := blobClient.DownloadStream(ctx, nil)
 	if err != nil {
 		recordStorageError(ctx, err)
-		return fmt.Errorf("failed to read from Azure Blob Storage: %w", err)
+		return azureReadError(err)
 	}
 	defer resp.Body.Close()
 
@@ -370,7 +369,7 @@ func (b *AzureBlobBackend) ReadToAt(ctx context.Context, path string, writer io.
 	resp, err := blobClient.DownloadStream(ctx, opts)
 	if err != nil {
 		recordStorageError(ctx, err)
-		return fmt.Errorf("failed to read from Azure Blob Storage: %w", err)
+		return azureReadError(err)
 	}
 	defer resp.Body.Close()
 
@@ -444,8 +443,8 @@ func (b *AzureBlobBackend) List(ctx context.Context, prefix string) ([]string, e
 				// backup manifest in silence (#1102).
 				key := strings.TrimPrefix(*blobItem.Name, b.prefix)
 				// See S3Backend.List: a listing never returns a key this
-				// backend would refuse (#743).
-				if ValidateKey(key) != nil {
+				// backend would refuse (#743, #1121).
+				if _, err := b.prefixedKey(key); err != nil {
 					continue
 				}
 				blobs = append(blobs, key)
@@ -466,8 +465,8 @@ func (b *AzureBlobBackend) Delete(ctx context.Context, path string) error {
 
 	_, err = blobClient.Delete(ctx, nil)
 	if err != nil {
-		// Check if it's a "not found" error - that's okay
-		if isAzureNotFoundError(err) {
+		// Already gone (the blob, or its whole container) is what Delete wants.
+		if isAzureGoneError(err) {
 			return nil
 		}
 		return fmt.Errorf("failed to delete from Azure Blob Storage: %w", err)
@@ -532,7 +531,7 @@ func (b *AzureBlobBackend) DeleteBatch(ctx context.Context, paths []string) erro
 			if item.Error == nil {
 				continue
 			}
-			if isAzureNotFoundError(item.Error) {
+			if isAzureGoneError(item.Error) {
 				continue
 			}
 			// The service answers with the PREFIXED blob name. Report the
@@ -717,8 +716,8 @@ func (b *AzureBlobBackend) ListObjects(ctx context.Context, prefix string) ([]Ob
 			if blobItem.Name != nil {
 				key := strings.TrimPrefix(*blobItem.Name, b.prefix)
 				// See S3Backend.List: a listing never returns a key this
-				// backend would refuse (#743).
-				if ValidateKey(key) != nil {
+				// backend would refuse (#743, #1121).
+				if _, err := b.prefixedKey(key); err != nil {
 					continue
 				}
 				info := ObjectInfo{
@@ -762,8 +761,11 @@ func (b *AzureBlobBackend) HasObjectsUnderPrefix(ctx context.Context, prefix str
 			return false, azureListError("failed to list Azure blobs", err)
 		}
 		for _, blobItem := range page.Segment.BlobItems {
-			if blobItem.Name != nil && ValidateKey(strings.TrimPrefix(*blobItem.Name, b.prefix)) == nil {
-				return true, nil
+			if blobItem.Name != nil {
+				key := strings.TrimPrefix(*blobItem.Name, b.prefix)
+				if _, err := b.prefixedKey(key); err == nil {
+					return true, nil
+				}
 			}
 		}
 	}
@@ -804,7 +806,7 @@ func (b *AzureBlobBackend) ListUnusable(ctx context.Context, prefix string) ([]U
 				continue
 			}
 			key := strings.TrimPrefix(*blobItem.Name, b.prefix)
-			reason := ValidateKey(key)
+			_, reason := b.prefixedKey(key)
 			if reason == nil {
 				continue // ListObjects returns it
 			}
@@ -858,21 +860,36 @@ func azureListError(what string, err error) error {
 	return fmt.Errorf("%s: %w", what, err)
 }
 
-// isAzureNotFoundError checks if an error indicates the blob doesn't exist
+// isAzureNotFoundError reports Azure saying the blob does not exist: a 404
+// whose x-ms-error-code is BlobNotFound (Azure sends the header on a HEAD
+// too). It reads the response, never the error's text (#1238): a transport
+// failure's text carries the request URL and the local port, either of which
+// can contain "404" or "NotFound". A missing container is a missing store,
+// not a missing blob (see azureReadError); Delete accepts both as "already
+// gone". A 404 with no Azure code (a proxy's page) is an error.
 func isAzureNotFoundError(err error) bool {
 	if err == nil {
 		return false
 	}
-
-	// Check for Azure-specific error response using standard errors.As (handles multi-errors/errors.Join)
+	// errors.As handles wrapping and errors.Join.
 	var respErr *azcore.ResponseError
 	if errors.As(err, &respErr) {
-		return respErr.StatusCode == 404
+		return respErr.StatusCode == 404 && respErr.ErrorCode == "BlobNotFound"
 	}
+	return false
+}
 
-	// Fallback to string matching
-	errStr := err.Error()
-	return strings.Contains(errStr, "BlobNotFound") ||
-		strings.Contains(errStr, "404") ||
-		strings.Contains(errStr, "NotFound")
+// isAzureGoneError is Delete's "nothing to delete": the blob or its container
+// is not there.
+func isAzureGoneError(err error) bool {
+	return isAzureNotFoundError(err) || isAzureContainerNotFoundError(err)
+}
+
+// azureReadError wraps a failed read, tagging a missing container with
+// ErrStoreNotFound the way azureListError does.
+func azureReadError(err error) error {
+	if isAzureContainerNotFoundError(err) {
+		return fmt.Errorf("failed to read from Azure Blob Storage: %w: %w", err, ErrStoreNotFound)
+	}
+	return fmt.Errorf("failed to read from Azure Blob Storage: %w", err)
 }

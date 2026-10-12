@@ -29,6 +29,10 @@ func (storeNotFoundBackend) ListDirectories(context.Context, string) ([]string, 
 	return nil, fmt.Errorf("failed to list S3 directories: %w", storage.ErrStoreNotFound)
 }
 
+func (storeNotFoundBackend) Exists(context.Context, string) (bool, error) {
+	return false, fmt.Errorf("failed to check S3 object existence: %w", storage.ErrStoreNotFound)
+}
+
 // deniedBackend is the control: a listing failure that is NOT a missing
 // store must still reach the client as an error. Without this half, a helper
 // that matched too broadly would turn an authorization failure into an empty
@@ -41,6 +45,10 @@ func (deniedBackend) List(context.Context, string) ([]string, error) {
 
 func (deniedBackend) ListDirectories(context.Context, string) ([]string, error) {
 	return nil, errors.New("api error AccessDenied: access denied")
+}
+
+func (deniedBackend) Exists(context.Context, string) (bool, error) {
+	return false, errors.New("api error AccessDenied: access denied")
 }
 
 // The four read paths #945 names are the only ones that treat a missing store
@@ -116,5 +124,44 @@ func TestGetDatabasesStillFailsOnOtherListingErrors(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusOK {
 		t.Fatal("GET /api/v1/databases returned 200 for an authorization failure")
+	}
+}
+
+// A database on a fresh store does not exist yet: 404, not 500. Both checks
+// are an Exists of the marker, which reports a bucket not created yet as
+// ErrStoreNotFound (#1242), plus a listing that already did (#945).
+func TestGetDatabaseIsNotFoundOnAFreshStore(t *testing.T) {
+	h := NewDatabasesHandler(storeNotFoundBackend{}, nil, nil, zerolog.Nop())
+	app := fiber.New()
+	h.RegisterRoutes(app)
+	for _, path := range []string{"/api/v1/databases/anydb", "/api/v1/databases/anydb/measurements"} {
+		resp, err := app.Test(httptest.NewRequest(http.MethodGet, path, nil), testRequestTimeoutMS)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("GET %s on a fresh store = %d, want 404", path, resp.StatusCode)
+		}
+	}
+	exists, err := h.databaseExists(context.Background(), "anydb")
+	if err != nil || exists {
+		t.Fatalf("databaseExists on a fresh store = %v, %v; want false, nil", exists, err)
+	}
+}
+
+// markerDeniedBackend refuses only the marker check; its listings answer a
+// missing store, so a marker error that was swallowed would read as "no such
+// database" instead of failing.
+type markerDeniedBackend struct{ storeNotFoundBackend }
+
+func (markerDeniedBackend) Exists(context.Context, string) (bool, error) {
+	return false, errors.New("api error AccessDenied: access denied")
+}
+
+// The control: an authorization failure on the marker check is still an error.
+func TestGetDatabaseStillFailsOnOtherErrors(t *testing.T) {
+	h := NewDatabasesHandler(markerDeniedBackend{}, nil, nil, zerolog.Nop())
+	if _, err := h.databaseExists(context.Background(), "anydb"); err == nil {
+		t.Fatal("databaseExists returned nil error for an authorization failure on the marker check")
 	}
 }

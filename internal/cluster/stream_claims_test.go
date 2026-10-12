@@ -189,7 +189,7 @@ func TestForwardApplyClaimWiring(t *testing.T) {
 // The wire name pins the build generation that may enable takeover:
 // builds advertising an older name (no claimant, no exit on a claim) block it.
 func TestStreamClaimsCapabilityName(t *testing.T) {
-	if raft.CapabilityStreamClaims != "stream_claims_v3" {
+	if raft.CapabilityStreamClaims != "stream_claims_v4" {
 		t.Fatalf("capability %q", raft.CapabilityStreamClaims)
 	}
 }

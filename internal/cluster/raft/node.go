@@ -699,7 +699,12 @@ func (n *Node) AddNode(node *NodeInfo, timeout time.Duration) error {
 
 // RemoveNode removes a node from the cluster state via Raft.
 func (n *Node) RemoveNode(nodeID string, timeout time.Duration) error {
-	payload, err := json.Marshal(RemoveNodePayload{NodeID: nodeID})
+	return n.RemoveNodeWithReason(nodeID, "", time.Time{}, timeout)
+}
+
+// RemoveNodeWithReason removes a node, saying why (see RemoveNodePayload).
+func (n *Node) RemoveNodeWithReason(nodeID, reason string, at time.Time, timeout time.Duration) error {
+	payload, err := json.Marshal(RemoveNodePayload{NodeID: nodeID, Reason: reason, At: at})
 	if err != nil {
 		return fmt.Errorf("failed to marshal payload: %w", err)
 	}

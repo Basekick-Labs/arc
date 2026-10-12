@@ -816,6 +816,14 @@ type ClusterConfig struct {
 	// when every node of the cluster opts in (writers with WALCoverage on);
 	// once applied cluster-wide it cannot be turned off. Default off.
 	StreamTakeover bool
+	// StreamTakeoverGrace is how long a primary writer that stopped answering
+	// may take to come back and pick up its own batches before the standby
+	// that took over as primary claims them (#1207). At least 10s.
+	StreamTakeoverGrace time.Duration
+	// StreamTakeoverDepartedTTL is how long a writer that left the cluster
+	// gracefully (a restart, usually) keeps its stream takeover state; past it
+	// the leader removes it as an operator removal would (#1207). At least 1m.
+	StreamTakeoverDepartedTTL time.Duration
 	// StandbyStoreMaxBytes caps the copy a standby writer keeps of what its
 	// primary streams, with WALCoverage on (#1207). Past it the standby stores
 	// nothing until trimming frees room.
@@ -925,6 +933,16 @@ func Load() (*Config, error) {
 	// 2h or 90s, read the same way as compaction.cycle_timeout above because
 	// that is the only existing duration key and there is no GetDuration call
 	// in this repo.
+	// Stream takeover timings (#1207), Go duration syntax.
+	takeoverGrace, err := time.ParseDuration(v.GetString("cluster.stream_takeover_grace"))
+	if err != nil || takeoverGrace < 10*time.Second {
+		return nil, fmt.Errorf("invalid cluster.stream_takeover_grace %q: must be a Go duration of at least 10s", v.GetString("cluster.stream_takeover_grace"))
+	}
+	departedTTL, err := time.ParseDuration(v.GetString("cluster.stream_takeover_departed_ttl"))
+	if err != nil || departedTTL < time.Minute {
+		return nil, fmt.Errorf("invalid cluster.stream_takeover_departed_ttl %q: must be a Go duration of at least 1m", v.GetString("cluster.stream_takeover_departed_ttl"))
+	}
+
 	scanTimeout, err := time.ParseDuration(v.GetString("tiered_storage.scan_timeout"))
 	if err != nil || scanTimeout <= 0 {
 		return nil, fmt.Errorf(
@@ -1179,23 +1197,25 @@ func Load() (*Config, error) {
 			RecheckConcurrency:        v.GetInt("reconciliation.recheck_concurrency"),
 		},
 		Cluster: ClusterConfig{
-			Enabled:                v.GetBool("cluster.enabled"),
-			NodeID:                 v.GetString("cluster.node_id"),
-			Role:                   v.GetString("cluster.role"),
-			ClusterName:            v.GetString("cluster.cluster_name"),
-			Seeds:                  parseStringSlice(v.GetString("cluster.seeds")),
-			CoordinatorAddr:        v.GetString("cluster.coordinator_addr"),
-			AdvertiseAddr:          v.GetString("cluster.advertise_addr"),
-			HealthCheckInterval:    v.GetInt("cluster.health_check_interval"),
-			IngestFenceAfterMs:     v.GetInt("cluster.ingest_fence_after_ms"),
-			WALCoverage:            v.GetBool("cluster.wal_coverage"),
-			StreamTakeover:         v.GetBool("cluster.stream_takeover"),
-			StandbyStoreMaxBytes:   v.GetInt64("cluster.standby_store_max_bytes"),
-			OriginStreamQueueBytes: v.GetInt64("cluster.origin_stream_queue_bytes"),
-			HealthCheckTimeout:     v.GetInt("cluster.health_check_timeout"),
-			UnhealthyThreshold:     v.GetInt("cluster.unhealthy_threshold"),
-			HeartbeatInterval:      v.GetInt("cluster.heartbeat_interval"),
-			HeartbeatTimeout:       v.GetInt("cluster.heartbeat_timeout"),
+			Enabled:                   v.GetBool("cluster.enabled"),
+			NodeID:                    v.GetString("cluster.node_id"),
+			Role:                      v.GetString("cluster.role"),
+			ClusterName:               v.GetString("cluster.cluster_name"),
+			Seeds:                     parseStringSlice(v.GetString("cluster.seeds")),
+			CoordinatorAddr:           v.GetString("cluster.coordinator_addr"),
+			AdvertiseAddr:             v.GetString("cluster.advertise_addr"),
+			HealthCheckInterval:       v.GetInt("cluster.health_check_interval"),
+			IngestFenceAfterMs:        v.GetInt("cluster.ingest_fence_after_ms"),
+			WALCoverage:               v.GetBool("cluster.wal_coverage"),
+			StreamTakeover:            v.GetBool("cluster.stream_takeover"),
+			StreamTakeoverGrace:       takeoverGrace,
+			StreamTakeoverDepartedTTL: departedTTL,
+			StandbyStoreMaxBytes:      v.GetInt64("cluster.standby_store_max_bytes"),
+			OriginStreamQueueBytes:    v.GetInt64("cluster.origin_stream_queue_bytes"),
+			HealthCheckTimeout:        v.GetInt("cluster.health_check_timeout"),
+			UnhealthyThreshold:        v.GetInt("cluster.unhealthy_threshold"),
+			HeartbeatInterval:         v.GetInt("cluster.heartbeat_interval"),
+			HeartbeatTimeout:          v.GetInt("cluster.heartbeat_timeout"),
 			// Raft configuration
 			RaftDataDir:           v.GetString("cluster.raft_data_dir"),
 			RaftBindAddr:          v.GetString("cluster.raft_bind_addr"),
@@ -2029,7 +2049,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.failover_cooldown", 60)    // 60 second cooldown between failovers
 	v.SetDefault("cluster.ingest_fence_after_ms", 0) // 0 = derived from failover detection (#1207)
 	v.SetDefault("cluster.wal_coverage", false)      // experimental (#1207); see Cluster.WALCoverage
-	v.SetDefault("cluster.stream_takeover", false)   // experimental (#1207 S4b); see Cluster.StreamTakeover
+	v.SetDefault("cluster.stream_takeover_grace", "60s")
+	v.SetDefault("cluster.stream_takeover_departed_ttl", "24h")
+	v.SetDefault("cluster.stream_takeover", false) // experimental (#1207 S4b); see Cluster.StreamTakeover
 	v.SetDefault("cluster.standby_store_max_bytes", int64(1<<30))
 	v.SetDefault("cluster.origin_stream_queue_bytes", int64(64<<20))
 

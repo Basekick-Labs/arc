@@ -162,3 +162,26 @@ func (v Intervals) Count() uint64 {
 
 // NormalizedIntervals builds a valid Intervals value from arbitrary pairs.
 func NormalizedIntervals(pairs [][2]uint64) Intervals { return normalized(pairs) }
+
+// complementRanges returns the parts of [0, total) outside the sorted row
+// ranges rs.
+func complementRanges(rs [][2]int, total int) [][2]int {
+	var out [][2]int
+	cur := 0
+	for _, r := range rs {
+		if r[0] > cur {
+			hi := r[0]
+			if hi > total {
+				hi = total
+			}
+			out = append(out, [2]int{cur, hi})
+		}
+		if r[1] > cur {
+			cur = r[1]
+		}
+	}
+	if cur < total {
+		out = append(out, [2]int{cur, total})
+	}
+	return out
+}

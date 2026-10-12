@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -72,7 +73,21 @@ type S3Backend struct {
 	accessKey string // stored for subprocess credential passing
 	secretKey string // stored for subprocess credential passing
 	logger    zerolog.Logger
+	// bucketCheckedAt is when a HeadBucket last answered conclusively
+	// (UnixNano; 0 = not yet), and bucketMissing what it answered. See
+	// confirmObjectAbsent.
+	bucketCheckedAt atomic.Int64
+	bucketMissing   atomic.Bool
 }
+
+// How long one HeadBucket answer is trusted: a bucket that answered (200, or
+// 403 for a principal that may not list it) for a minute, so a busy path
+// asking about absent keys costs at most one extra request per minute; a
+// missing bucket for a few seconds, so its creation is noticed promptly.
+const (
+	bucketConfirmTTL = time.Minute
+	bucketMissingTTL = 5 * time.Second
+)
 
 // S3Config holds S3 backend configuration
 type S3Config struct {
@@ -463,7 +478,7 @@ func (b *S3Backend) Read(ctx context.Context, path string) ([]byte, error) {
 	})
 	if err != nil {
 		recordStorageError(ctx, err)
-		return nil, fmt.Errorf("failed to read from S3: %w", err)
+		return nil, readError(err)
 	}
 	defer result.Body.Close()
 
@@ -497,7 +512,7 @@ func (b *S3Backend) ReadTo(ctx context.Context, path string, writer io.Writer) e
 	})
 	if err != nil {
 		recordStorageError(ctx, err)
-		return fmt.Errorf("failed to read from S3: %w", err)
+		return readError(err)
 	}
 	defer result.Body.Close()
 
@@ -536,7 +551,7 @@ func (b *S3Backend) ReadToAt(ctx context.Context, path string, writer io.Writer,
 	result, err := b.client.GetObject(ctx, input)
 	if err != nil {
 		recordStorageError(ctx, err)
-		return fmt.Errorf("failed to read from S3: %w", err)
+		return readError(err)
 	}
 	defer result.Body.Close()
 
@@ -569,6 +584,9 @@ func (b *S3Backend) StatFile(ctx context.Context, path string) (int64, error) {
 	})
 	if err != nil {
 		if isNotFoundError(err) {
+			if storeErr := b.confirmObjectAbsent(ctx); storeErr != nil {
+				return -1, fmt.Errorf("HeadObject %s: %w", path, storeErr)
+			}
 			return -1, nil
 		}
 		return -1, fmt.Errorf("HeadObject %s: %w", path, err)
@@ -608,7 +626,7 @@ func (b *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 				// Strip prefix so callers see paths relative to the logical root
 				key := strings.TrimPrefix(*obj.Key, b.prefix)
 				// A listing must never hand back a key this backend would
-				// refuse (#743). Object stores carry "directory marker"
+				// refuse (#743, #1121). Object stores carry "directory marker"
 				// objects whose key ends in a separator, created by consoles
 				// and sync tools, and Arc's own callers feed List output
 				// straight into Read, Exists and Delete. Returning one turns
@@ -617,7 +635,7 @@ func (b *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 				// becomes a hard error, and manifest recovery retries a
 				// permanent error forever. They are not data, so they are
 				// skipped rather than reported.
-				if ValidateKey(key) != nil {
+				if _, err := b.prefixedKey(key); err != nil {
 					continue
 				}
 				objects = append(objects, key)
@@ -749,31 +767,102 @@ func (b *S3Backend) Exists(ctx context.Context, path string) (bool, error) {
 		Key:    aws.String(key),
 	})
 	if err != nil {
-		// Check if it's a "not found" error
-		var nsk *types.NoSuchKey
-		if ok := isNotFoundError(err); ok {
+		if isNotFoundError(err) {
+			if storeErr := b.confirmObjectAbsent(ctx); storeErr != nil {
+				return false, fmt.Errorf("failed to check S3 object existence: %w", storeErr)
+			}
 			return false, nil
 		}
-		// Treat other head object errors as "not found" for compatibility
-		if strings.Contains(err.Error(), "NotFound") || strings.Contains(err.Error(), "404") {
-			return false, nil
-		}
-		_ = nsk // silence unused variable warning
 		return false, fmt.Errorf("failed to check S3 object existence: %w", err)
 	}
 
 	return true, nil
 }
 
-// isNotFoundError checks if an error indicates the object doesn't exist
+// isNotFoundError reports S3 saying the key names no object. A GET answers a
+// missing key with NoSuchKey. A HEAD has no body, so the SDK names its 404
+// from the status, NotFound; that name is accepted only from a HEAD, because
+// on a GET it is what any bodiless or non-S3 404 becomes (a proxy's page).
+//
+// It reads the error's type, code and operation, never its text (#1238): the
+// text of every S3 error carries the request URL (endpoint, bucket, key), the
+// request ID and, for a transport failure, the local port, any of which can
+// contain "404" or "NotFound" on an error that means something else.
+//
+// A missing bucket is not a missing key: a GET answers NoSuchBucket, which
+// stays an error (see readError). A HEAD cannot tell the two apart — both are
+// a bodiless 404 — so StatFile and Exists ask HeadBucket after one (see
+// confirmObjectAbsent).
 func isNotFoundError(err error) bool {
 	if err == nil {
 		return false
 	}
-	errStr := err.Error()
-	return strings.Contains(errStr, "NotFound") ||
-		strings.Contains(errStr, "NoSuchKey") ||
-		strings.Contains(errStr, "404")
+	var noSuchKey *types.NoSuchKey
+	if errors.As(err, &noSuchKey) {
+		return true
+	}
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	if apiErr.ErrorCode() != "NotFound" {
+		return false
+	}
+	var opErr *smithy.OperationError
+	return errors.As(err, &opErr) && opErr.OperationName == "HeadObject"
+}
+
+// confirmObjectAbsent tells a missing key from a missing bucket after a HEAD
+// answered 404, which S3 sends, bodiless, for both (#1242). A HeadBucket that
+// answers the bucket is not there turns the answer into ErrStoreNotFound, the
+// same as a read reports it. Any other outcome — the bucket exists, a 403
+// from a principal without s3:ListBucket, a 5xx, a transport failure — leaves
+// the object absent, which is what a HEAD 404 meant before. 200, 403 and a
+// missing bucket are cached (bucketConfirmTTL, bucketMissingTTL); a failure
+// is not, so the next 404 asks again.
+func (b *S3Backend) confirmObjectAbsent(ctx context.Context) error {
+	if at := b.bucketCheckedAt.Load(); at != 0 {
+		ttl := bucketConfirmTTL
+		if b.bucketMissing.Load() {
+			ttl = bucketMissingTTL
+		}
+		if time.Since(time.Unix(0, at)) < ttl {
+			if b.bucketMissing.Load() {
+				return fmt.Errorf("bucket %s: %w", b.bucket, ErrStoreNotFound)
+			}
+			return nil
+		}
+	}
+	_, err := b.client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(b.bucket)})
+	missing, conclusive := false, err == nil
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "NotFound", "NoSuchBucket":
+			missing, conclusive = true, true
+		case "Forbidden", "AccessDenied":
+			conclusive = true
+		}
+	}
+	if conclusive {
+		b.bucketMissing.Store(missing)
+		b.bucketCheckedAt.Store(time.Now().UnixNano())
+	}
+	if missing {
+		// Wraps the HeadBucket answer, not the object's: the object's
+		// NotFound would read as a missing object to IsNotFound.
+		return fmt.Errorf("bucket %s: %w: %w", b.bucket, err, ErrStoreNotFound)
+	}
+	return nil
+}
+
+// readError wraps a failed GET, tagging a missing bucket with ErrStoreNotFound
+// the way listError does, so a caller never mistakes it for a missing key.
+func readError(err error) error {
+	if isNoSuchBucketError(err) {
+		return fmt.Errorf("failed to read from S3: %w: %w", err, ErrStoreNotFound)
+	}
+	return fmt.Errorf("failed to read from S3: %w", err)
 }
 
 // isNoSuchBucketError reports S3's answer for a bucket that does not exist.
@@ -796,7 +885,8 @@ func listError(what string, err error) error {
 	return fmt.Errorf("%s: %w", what, err)
 }
 
-// prefixedKey validates a storage key and prepends the configured prefix.
+// prefixedKey validates a storage key and prepends the configured prefix. It
+// also enforces the key-length limit after the prefix is applied (#1121).
 //
 // Returning an error is what makes the contract hold: a new method that builds
 // an S3 key has to deal with it, rather than silently passing an unvalidated
@@ -805,10 +895,7 @@ func listError(what string, err error) error {
 // DuckDB's read_parquet consumes, and iceberg-go writes metadata through its
 // own FileIO. Both are out of scope here (#746).
 func (b *S3Backend) prefixedKey(key string) (string, error) {
-	if err := ValidateKey(key); err != nil {
-		return "", err
-	}
-	return b.prefix + key, nil
+	return prefixObjectKey(b.prefix, key)
 }
 
 // prefixedListPrefix is prefixedKey for enumeration, where "" and a trailing
@@ -961,8 +1048,8 @@ func (b *S3Backend) ListObjects(ctx context.Context, prefix string) ([]ObjectInf
 			if obj.Key != nil {
 				key := strings.TrimPrefix(*obj.Key, b.prefix)
 				// See List: a listing never returns a key the backend would
-				// refuse (#743).
-				if ValidateKey(key) != nil {
+				// refuse (#743, #1121).
+				if _, err := b.prefixedKey(key); err != nil {
 					continue
 				}
 				info := ObjectInfo{Path: key}
@@ -1013,7 +1100,8 @@ func (b *S3Backend) HasObjectsUnderPrefix(ctx context.Context, prefix string) (b
 			if obj.Key == nil {
 				continue
 			}
-			if ValidateKey(strings.TrimPrefix(*obj.Key, b.prefix)) == nil {
+			key := strings.TrimPrefix(*obj.Key, b.prefix)
+			if _, err := b.prefixedKey(key); err == nil {
 				return true, nil
 			}
 		}
@@ -1060,7 +1148,7 @@ func (b *S3Backend) ListUnusable(ctx context.Context, prefix string) ([]Unusable
 				continue
 			}
 			key := strings.TrimPrefix(*obj.Key, b.prefix)
-			reason := ValidateKey(key)
+			_, reason := b.prefixedKey(key)
 			if reason == nil {
 				continue // ListObjects returns it
 			}

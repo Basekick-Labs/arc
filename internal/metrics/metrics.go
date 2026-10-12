@@ -174,6 +174,7 @@ type Metrics struct {
 
 	streamClaimsEnabled  atomic.Int64 // 1 once stream claims are applied (#1207 S4a)
 	streamClaims         atomic.Int64 // stream claims held in the FSM
+	departedWriters      atomic.Int64 // writers that left gracefully and have not re-joined (#1207)
 	walCoverageRefused   atomic.Int64 // batches whose file was refused: another writer claimed them
 	walRecoveryTotal     atomic.Int64 // Successful WAL recovery operations
 	walRecoveryRecords   atomic.Int64 // Total records recovered from WAL
@@ -613,6 +614,7 @@ func (m *Metrics) IncStandbyStreamGaps()               { m.standbyStreamGaps.Add
 func (m *Metrics) AddStandbyStoreTrimmedBytes(n int64) { m.standbyStoreTrimmedBytes.Add(n) }
 func (m *Metrics) IncStandbyStoreDropped()             { m.standbyStoreDropped.Add(1) }
 func (m *Metrics) AddStandbyStoreEvictedBytes(n int64) { m.standbyStoreEvicted.Add(n) }
+func (m *Metrics) SetDepartedWriters(n int64)          { m.departedWriters.Store(n) }
 func (m *Metrics) SetStreamClaims(enabled bool, claims int64) {
 	if enabled {
 		m.streamClaimsEnabled.Store(1)
@@ -932,6 +934,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"standby_store_pinned_bytes":       m.standbyStorePinned.Load(),
 		"stream_claims_enabled":            m.streamClaimsEnabled.Load(),
 		"stream_claims":                    m.streamClaims.Load(),
+		"stream_takeover_departed_writers": m.departedWriters.Load(),
 		"wal_coverage_refused":             m.walCoverageRefused.Load(),
 		"wal_recovery_total":               m.walRecoveryTotal.Load(),
 		"wal_recovery_records":             m.walRecoveryRecords.Load(),
@@ -1386,6 +1389,9 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_cluster_stream_claims Stream claims held: primary instances a standby writer took over\n"...)
 	b = append(b, "# TYPE arc_cluster_stream_claims gauge\n"...)
 	b = appendMetric(b, "arc_cluster_stream_claims", float64(m.streamClaims.Load()))
+	b = append(b, "# HELP arc_stream_takeover_departed_writers Writers that left the cluster gracefully and have not re-joined; their takeover state expires after cluster.stream_takeover_departed_ttl\n"...)
+	b = append(b, "# TYPE arc_stream_takeover_departed_writers gauge\n"...)
+	b = appendMetric(b, "arc_stream_takeover_departed_writers", float64(m.departedWriters.Load()))
 
 	b = append(b, "# HELP arc_wal_coverage_refused_total Batches whose file the cluster refused because another writer claimed them\n"...)
 	b = append(b, "# TYPE arc_wal_coverage_refused_total counter\n"...)
