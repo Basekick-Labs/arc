@@ -181,6 +181,7 @@ type Metrics struct {
 	walRecoveryRecords   atomic.Int64 // Total records recovered from WAL
 	walDroppedEntries    atomic.Int64 // Entries dropped due to full WAL buffer
 	walFailedWrites      atomic.Int64 // Write failures to WAL file
+	walFailedSyncs       atomic.Int64 // WAL fsync/fdatasync failures
 	walOversizedPayloads atomic.Int64 // Payloads rejected for exceeding the single-entry cap even after chunking (#677)
 	walDirectoryBytes    atomic.Int64 // Current bytes occupied by every file in the WAL directory
 
@@ -646,6 +647,7 @@ func (m *Metrics) IncWALRecoveryTotal()              { m.walRecoveryTotal.Add(1)
 func (m *Metrics) IncWALRecoveryRecords(count int64) { m.walRecoveryRecords.Add(count) }
 func (m *Metrics) IncWALDroppedEntries()             { m.walDroppedEntries.Add(1) }
 func (m *Metrics) IncWALFailedWrites()               { m.walFailedWrites.Add(1) }
+func (m *Metrics) IncWALFailedSyncs()                { m.walFailedSyncs.Add(1) }
 func (m *Metrics) IncWALOversizedPayloads()          { m.walOversizedPayloads.Add(1) }
 func (m *Metrics) SetWALDirectoryBytes(bytes int64)  { m.walDirectoryBytes.Store(bytes) }
 
@@ -949,6 +951,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"wal_recovery_records":             m.walRecoveryRecords.Load(),
 		"wal_dropped_entries":              m.walDroppedEntries.Load(),
 		"wal_failed_writes":                m.walFailedWrites.Load(),
+		"wal_failed_syncs":                 m.walFailedSyncs.Load(),
 		"wal_oversized_payloads":           m.walOversizedPayloads.Load(),
 		"wal_directory_bytes":              m.walDirectoryBytes.Load(),
 		"file_registrations_pending":       m.fileRegistrationsPending.Load(),
@@ -1424,6 +1427,9 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_failed_writes_total WAL write failures\n"...)
 	b = append(b, "# TYPE arc_wal_failed_writes_total counter\n"...)
 	b = appendMetric(b, "arc_wal_failed_writes_total", float64(m.walFailedWrites.Load()))
+	b = append(b, "# HELP arc_wal_failed_syncs_total WAL fsync/fdatasync failures; each forces a rotation to a new WAL file\n"...)
+	b = append(b, "# TYPE arc_wal_failed_syncs_total counter\n"...)
+	b = appendMetric(b, "arc_wal_failed_syncs_total", float64(m.walFailedSyncs.Load()))
 
 	b = append(b, "# HELP arc_wal_oversized_payloads_total Payloads rejected for exceeding the single-entry cap even after chunking\n"...)
 	b = append(b, "# TYPE arc_wal_oversized_payloads_total counter\n"...)

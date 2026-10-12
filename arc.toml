@@ -624,3 +624,8 @@ local_path = "./data/backups"           # Directory for local backups; see the r
 
 [wal]
 enabled = false
+# sync_mode = "fdatasync"   # fdatasync (default), fsync, or async (no sync; a flush checkpoint is still synced)
+# sync_bytes = 1048576      # Request a sync once this many WAL bytes are unsynced (default 1 MiB).
+#                           # Syncs run beside the WAL writer, so this bounds how much written data a
+#                           # sync can leave behind, not ingest throughput. A sync also runs every 100 ms
+#                           # while bytes are unsynced.

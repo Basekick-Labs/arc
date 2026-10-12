@@ -457,6 +457,10 @@ type WALConfig struct {
 	RecoveryIntervalSeconds int    // Interval for periodic WAL recovery in seconds (default: 300 = 5 minutes)
 	RecoveryBatchSize       int    // Max records to replay per batch during recovery (default: 10000)
 	BufferSize              int    // Async write buffer size in entries (default: 10000)
+	// SyncBytes requests a sync once this many WAL bytes are unsynced
+	// (default: 1 MiB). Syncs run beside the writer (#1246), so this bounds how
+	// much written data a sync may leave behind, not the writer's throughput.
+	SyncBytes int64
 }
 
 type TelemetryConfig struct {
@@ -1115,6 +1119,7 @@ func Load() (*Config, error) {
 			RecoveryIntervalSeconds: v.GetInt("wal.recovery_interval_seconds"),
 			RecoveryBatchSize:       v.GetInt("wal.recovery_batch_size"),
 			BufferSize:              v.GetInt("wal.buffer_size"),
+			SyncBytes:               v.GetInt64("wal.sync_bytes"),
 		},
 		Telemetry: TelemetryConfig{
 			Enabled:         v.GetBool("telemetry.enabled"),
@@ -1903,6 +1908,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("wal.recovery_interval_seconds", 300) // Periodic recovery every 5 minutes
 	v.SetDefault("wal.recovery_batch_size", 10000)     // Max records per recovery batch (rate limiting)
 	v.SetDefault("wal.buffer_size", 10000)             // Async write buffer size in entries
+	v.SetDefault("wal.sync_bytes", 1024*1024)          // Request a sync once this many bytes are unsynced
 
 	// Telemetry defaults
 	v.SetDefault("telemetry.enabled", true)                                               // Enabled by default (opt-out)
