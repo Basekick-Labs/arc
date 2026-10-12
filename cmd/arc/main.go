@@ -2226,6 +2226,13 @@ func main() {
 							registrationOutbox.HandOff(clusterCoordinator, storageBackend, clusterCoordinator.LocalNodeID())
 							registerFileRegistrarShutdown(shutdownCoordinator, registrationOutbox.Stop)
 							log.Info().Msg("Cluster file manifest registration outbox started")
+							// #1207 S3: with cluster.wal_coverage, stream committed
+							// batches to standby writers and keep their copy. After
+							// the hand-off: a covered file settles as registered
+							// only through the running outbox.
+							if err := clusterCoordinator.StartOriginStream(walWriter, arrowBuffer); err != nil {
+								log.Warn().Err(err).Msg("Origin stream not started; standby writers keep no copy of unregistered batches")
+							}
 						case clusterCoordinator.GetLocalNode().GetCapabilities().CanIngest:
 							// No outbox on a node that ingests: its journal could not
 							// be opened. The lossy registrar beats announcing nothing.

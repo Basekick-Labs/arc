@@ -205,6 +205,20 @@ func unmarshalPayload(msgType MessageType, payload []byte) (interface{}, error) 
 		}
 		return &ack, nil
 
+	case MsgOriginStreamHello:
+		var hello OriginStreamHello
+		if err := json.Unmarshal(payload, &hello); err != nil {
+			return nil, err
+		}
+		return &hello, nil
+
+	case MsgOriginStreamHelloAck:
+		var ack OriginStreamHelloAck
+		if err := json.Unmarshal(payload, &ack); err != nil {
+			return nil, err
+		}
+		return &ack, nil
+
 	default:
 		return nil, fmt.Errorf("unknown message type: %d", msgType)
 	}

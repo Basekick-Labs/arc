@@ -422,11 +422,24 @@ type FSMSnapshot struct {
 	// CompactionPause: the cluster-wide compaction pause (#1087). nil in a
 	// snapshot taken by an older binary, which Restore reads as "no pause".
 	CompactionPause *CompactionPauseState `json:"compaction_pause,omitempty"`
+	// AppliedIndex: the last command applied when the snapshot was taken
+	// (#1207). Zero in an older snapshot.
+	AppliedIndex uint64 `json:"applied_index,omitempty"`
 }
 
 // ClusterFSM implements the raft.FSM interface for cluster state management.
 // It maintains the authoritative state of nodes in the cluster.
 type ClusterFSM struct {
+	// applyStarted and applyDone are the index of the last command Apply
+	// began and finished (#1207). Only FSM commands count: hashicorp/raft's
+	// AppliedIndex also counts barrier, no-op and configuration entries,
+	// which never reach Apply, so one node's AppliedIndex is not a value
+	// another node's FSM is guaranteed to reach. Everything up to applyDone
+	// is visible to readers; anything visible is at or below applyStarted.
+	// Both are carried in snapshots.
+	applyStarted atomic.Uint64
+	applyDone    atomic.Uint64
+
 	mu                sync.RWMutex
 	nodes             map[string]*NodeInfo
 	primaryWriterID   string                // ID of the current primary writer node
@@ -959,6 +972,10 @@ func (f *ClusterFSM) GetPrimaryWriterID() string {
 // Apply applies a Raft log entry to the FSM.
 // This is called by Raft when a log entry is committed.
 func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
+	f.applyStarted.Store(log.Index)
+	// After the command has been applied, whatever its outcome: a reader of
+	// AppliedDone can rely on every command up to it being visible.
+	defer f.applyDone.Store(log.Index)
 	var cmd Command
 	if err := json.Unmarshal(log.Data, &cmd); err != nil {
 		f.logger.Error().Err(err).Msg("Failed to unmarshal command")
@@ -2384,6 +2401,9 @@ func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 	}
 
 	return &fsmSnapshot{
+		// Raft does not call Apply and Snapshot concurrently, so the two
+		// counters agree here.
+		appliedIndex:           f.applyDone.Load(),
 		nodes:                  nodes,
 		barriers:               barriers,
 		compactionPause:        compactionPause,
@@ -2877,6 +2897,10 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		onCompactionPauseChanged(restoredPause.Active, restoredPause.Generation)
 	}
 
+	// Last, after the restored state is in place: a reader that sees the
+	// index must also see what it covers.
+	f.applyStarted.Store(snapshot.AppliedIndex)
+	f.applyDone.Store(snapshot.AppliedIndex)
 	return nil
 }
 
@@ -2937,6 +2961,14 @@ func (f *ClusterFSM) TotalCores() int {
 }
 
 // GetFile returns a copy of the file entry for the given path, or nil if not found.
+// AppliedDone is the index of the last command this FSM finished applying:
+// every command up to it is visible. See applyStarted.
+func (f *ClusterFSM) AppliedDone() uint64 { return f.applyDone.Load() }
+
+// AppliedStarted is the index of the last command this FSM began applying:
+// anything a reader sees is at or below it.
+func (f *ClusterFSM) AppliedStarted() uint64 { return f.applyStarted.Load() }
+
 func (f *ClusterFSM) GetFile(path string) (*FileEntry, bool) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -3085,6 +3117,7 @@ type fsmSnapshot struct {
 	tokenMemberships       map[int64]*TokenMembershipEntry
 	barriers               map[string]uint64
 	compactionPause        *CompactionPauseState
+	appliedIndex           uint64
 }
 
 // Persist writes the snapshot to the given sink.
@@ -3102,6 +3135,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 		TokenMemberships:       s.tokenMemberships,
 		Barriers:               s.barriers,
 		CompactionPause:        s.compactionPause,
+		AppliedIndex:           s.appliedIndex,
 	}
 
 	data, err := json.Marshal(snapshot)

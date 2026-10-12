@@ -258,6 +258,44 @@ New metrics:
   flush failed with no complete WAL copy. Those rows are in no registered file.
   Alert on any increase.
 
+**Standby writers keep a copy.** With the setting on, the designated primary
+also streams every committed batch to the standby writers. Each standby keeps
+it on disk under `<wal.directory>/received/`, and never applies it. It discards
+a batch once the batch is in a registered file and the standby holds every
+current file of that measurement locally. This is the copy a later release will
+use to let a standby take over the acknowledged rows of a primary that died
+before flushing them. Nothing reads it yet. Details:
+- Standby writers connect to the primary on the cluster port
+  (`cluster.coordinator_addr`). This needs `cluster.shared_secret`, and
+  `cluster.tls_enabled` if the network is untrusted: batches are authenticated
+  but not encrypted without TLS.
+- `cluster.standby_store_max_bytes` (default 1 GiB) caps the copy. Past it, a
+  standby first evicts batches of a primary process that has since restarted.
+  If that is not enough, it keeps nothing new until trimming frees room, and
+  records the missed batches as gaps. The directory counts against the WAL
+  volume but not `arc_wal_dir_bytes`.
+- `cluster.origin_stream_queue_bytes` (default 64 MiB) caps what the primary
+  holds in memory for a standby that is not keeping up. Past it, that standby
+  misses batches; the others do not.
+- A covered file now counts as registered only once the writer's own copy of the
+  manifest shows it. On a writer that is not the Raft leader this adds one Raft
+  barrier per registration batch.
+
+Metrics on the primary: `arc_origin_stream_sessions`,
+`arc_origin_stream_dropped_total`. On standby writers:
+`arc_standby_stream_connected`, `arc_standby_stream_entries_total`,
+`arc_standby_stream_gaps_total`, `arc_standby_store_bytes`,
+`arc_standby_store_incomplete_keys`, `arc_standby_store_trimmed_bytes_total`,
+`arc_standby_store_dropped_total`, `arc_standby_store_evicted_bytes_total`,
+`arc_standby_store_lost_records`, `arc_standby_store_blocked_keys` and
+`arc_standby_store_replaced_bytes`. A measurement stays in
+`arc_standby_store_blocked_keys` while a file of it is not on the standby: a
+file the puller cannot fetch keeps that measurement from being trimmed.
+
+All writers in the cluster must run this release before the setting is turned
+on: a writer from an older release does not understand the standby connection
+and logs it as an unknown message type.
+
 **Rollback warning.** WAL entries written with the setting on use a new format.
 This release reads it, but older releases cannot: they quarantine those entries
 and lose any rows that were not flushed yet. Before rolling a node back to an

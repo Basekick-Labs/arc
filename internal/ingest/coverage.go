@@ -213,6 +213,33 @@ func (b *ArrowBuffer) RegisteredFloors() map[string]uint64 {
 	return cs.tracker.floors()
 }
 
+// KeyRegistration is one buffer key's registration progress for this
+// instance: every cseq at or below Floor, and in Settled, is in a registered
+// file; the cseqs in Lost settled without one.
+type KeyRegistration struct {
+	Floor   uint64
+	Settled [][2]uint64
+	Lost    []uint64
+}
+
+// Bounds on what one progress report carries per key: settled intervals
+// above a floor stop at the first lost batch, which is rare and alarmed.
+const (
+	maxReportedSettled = 1024
+	maxReportedLost    = 1024
+)
+
+// RegistrationProgress reports this instance's per-key progress, for the
+// origin stream to publish to standby writers (#1207). ok is false while
+// coverage is off.
+func (b *ArrowBuffer) RegistrationProgress() (instance uint64, keys map[string]KeyRegistration, ok bool) {
+	cs := b.coverage.Load()
+	if cs == nil {
+		return 0, nil, false
+	}
+	return cs.instance, cs.tracker.progress(), true
+}
+
 // nextCSeqLocked mints the next coverage sequence for key. Caller holds
 // shard.mu, and must commit the batch under the same acquisition.
 func (b *ArrowBuffer) nextCSeqLocked(cs *coverageState, shard *bufferShard, key string) uint64 {
@@ -584,6 +611,28 @@ func (rs *rowSpans) add(lo, hi int) {
 		merged = append(merged, s)
 	}
 	rs.spans = merged
+}
+
+func (t *coverageTracker) progress() map[string]KeyRegistration {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make(map[string]KeyRegistration, len(t.keys))
+	for k, kf := range t.keys {
+		r := KeyRegistration{Floor: kf.floor}
+		for i, iv := range kf.done {
+			if i == maxReportedSettled {
+				break
+			}
+			r.Settled = append(r.Settled, iv)
+		}
+		for _, iv := range kf.lost {
+			for c := iv[0]; c <= iv[1] && len(r.Lost) < maxReportedLost; c++ {
+				r.Lost = append(r.Lost, c)
+			}
+		}
+		out[k] = r
+	}
+	return out
 }
 
 func (t *coverageTracker) floors() map[string]uint64 {
