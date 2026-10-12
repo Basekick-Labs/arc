@@ -1044,6 +1044,14 @@ func main() {
 		arrowBuffer.SetFileRegistrar(registrationOutbox)
 	}
 	enableWALCoverage(cfg, arrowBuffer, walWriter, registrationOutbox, logger.Get("arrow"))
+	// The registration hold (#1207 S4c): WAL entries of a covered batch stay
+	// until its file is registered, across restarts — the outbox journal is
+	// the authority. Wired whatever cluster.wal_coverage says now: a journal
+	// written by a start with it on still holds covered files.
+	walHold := walCoverageHold(registrationOutbox)
+	if walWriter != nil && walHold != nil {
+		walWriter.SetCoverageHold(walHold)
+	}
 	// Bound ArrowBuffer.Close, which now WAITS for flushes in progress instead
 	// of cancelling them (#1007).
 	//
@@ -1141,6 +1149,21 @@ func main() {
 						"Investigate the buffer flush errors logged above before clearing the WAL directory.")
 				return nil
 			}
+			// Files whose batches still wait to register stay for the next
+			// start (#1207 S4c): purge by the same rules as the running node.
+			if registrationOutbox != nil && registrationOutbox.HoldsCoverage() {
+				deleted, err := walWriter.PurgeFlushed(walWriter.MinUnflushedSequence())
+				if err != nil {
+					log.Error().Err(err).Msg("Failed to purge WAL files on shutdown")
+				}
+				released, rerr := walWriter.ReleaseRetained()
+				if rerr != nil {
+					log.Error().Err(rerr).Msg("Failed to release retained WAL files on shutdown")
+				}
+				log.Info().Int("deleted", deleted+released).Int("kept_for_registration", walWriter.HeldFiles()).
+					Msg("Kept WAL files whose batches are waiting for their files to register; the next start keeps them until they do")
+				return nil
+			}
 			deleted, err := walWriter.PurgeAll()
 			if err != nil {
 				log.Error().Err(err).Msg("Failed to purge WAL files on shutdown")
@@ -1206,13 +1229,14 @@ func main() {
 			BarrierBatchFiles:   16,
 			BarrierBatchRows:    cfg.Ingest.MaxBufferSize,
 			MaxReplayFailures:   3,
+			Held:                walHold,
 		})
 		recoveryNeedsRetry := err != nil
 		if err != nil {
 			log.Error().Err(err).Msg("WAL recovery failed")
 		}
 		if recoveryStats != nil {
-			if recoveryStats.RecoveredFiles > 0 {
+			if recoveryStats.RecoveredFiles > 0 || len(recoveryStats.Retained) > 0 {
 				// Track recovery metrics
 				metrics.Get().IncWALRecoveryTotal()
 				metrics.Get().IncWALRecoveryRecords(int64(recoveryStats.RecoveredEntries))
@@ -1221,6 +1245,7 @@ func main() {
 					Int("batches", recoveryStats.RecoveredBatches).
 					Int("entries", recoveryStats.RecoveredEntries).
 					Int("corrupted", recoveryStats.CorruptedEntries).
+					Int("retained", len(recoveryStats.Retained)).
 					Dur("duration", recoveryStats.RecoveryDuration).
 					Msg("WAL recovery complete")
 			}
@@ -1234,6 +1259,10 @@ func main() {
 		}
 		if recoveryNeedsRetry {
 			arrowBuffer.MarkWALRecoveryPending()
+		}
+		if walWriter != nil && recoveryStats != nil {
+			walWriter.AdoptRetained(recoveryStats.Retained)
+			metrics.Get().SetWALHeldFiles(int64(walWriter.HeldFiles()))
 		}
 
 		walSizeLogger := logger.Get("wal-maintenance")
@@ -1266,6 +1295,7 @@ func main() {
 			bytesTicker := time.NewTicker(15 * time.Second)
 			defer bytesTicker.Stop()
 			walLogger := logger.Get("wal-maintenance")
+			var lastHeldWarn time.Time
 
 			for {
 				select {
@@ -1357,7 +1387,11 @@ func main() {
 							BarrierBatchFiles:          16,
 							BarrierBatchRows:           cfg.Ingest.MaxBufferSize,
 							MaxReplayFailures:          3,
+							Held:                       walHold,
 						})
+						if walWriter != nil && stats != nil {
+							walWriter.AdoptRetained(stats.Retained)
+						}
 						// Before the error branch: the recovery Warn fires from
 						// inside the pass whatever its outcome, so a gauge
 						// updated only on success would contradict it — and a
@@ -1397,6 +1431,20 @@ func main() {
 							walLogger.Info().Int("deleted", deleted).Msg("Periodic WAL cleanup complete")
 						}
 						updateWALDirectoryBytes()
+					}
+					// Files recovery retained for the registration hold
+					// (#1207 S4c) go once their batches are registered.
+					if walWriter != nil {
+						if _, err := walWriter.ReleaseRetained(); err != nil {
+							walLogger.Error().Err(err).Msg("Releasing retained WAL files failed")
+						}
+						held := walWriter.HeldFiles()
+						metrics.Get().SetWALHeldFiles(int64(held))
+						if held > 0 && time.Since(lastHeldWarn) >= 10*time.Minute {
+							lastHeldWarn = time.Now()
+							walLogger.Warn().Int("files", held).
+								Msg("WAL files are kept until the files their batches were flushed into are registered; the WAL grows while registrations cannot land (see arc_cluster_file_registration_oldest_pending_seconds)")
+						}
 					}
 				}
 			}
@@ -5232,6 +5280,15 @@ func newRegistrationOutbox(cfg *config.Config, clusteringLicensed bool, logger z
 		return nil
 	}
 	return r
+}
+
+// walCoverageHold returns the registration hold source for the WAL (#1207
+// S4c), or nil on a node without a registration outbox.
+func walCoverageHold(outbox *cluster.RegistrationOutbox) func() wal.CoverageHold {
+	if outbox == nil {
+		return nil
+	}
+	return outbox.CoverageHold
 }
 
 // enableWALCoverage turns on ingest coverage ids (#1207) where they can be used:

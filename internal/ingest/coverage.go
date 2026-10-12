@@ -73,6 +73,11 @@ type GroupCoverage struct {
 	// (see MarshalJSON): a reader never takes it for a complete coverage.
 	RangesOmitted  int `json:"ranges_omitted,omitempty"`
 	PartialOmitted int `json:"partial_omitted,omitempty"`
+	// Bounds is, per instance, the lowest and highest batch of the whole
+	// coverage. Journaled only with a truncated copy, and never truncated
+	// itself, so a reader still knows which WAL entries the group needs
+	// (#1207 S4c). Readers before S4c ignore it.
+	Bounds []CoverageRange `json:"bounds,omitempty"`
 
 	// onSettle receives each file's outcome. Nil on coverage loaded from a
 	// journal: the group that would act on it belonged to an earlier process.
@@ -98,6 +103,9 @@ const (
 func (g GroupCoverage) MarshalJSON() ([]byte, error) {
 	type plain GroupCoverage
 	out := plain(g)
+	if len(out.Ranges) > maxJournalRanges || len(out.Partial) > maxJournalPartial {
+		out.Bounds = g.bounds()
+	}
 	if n := len(out.Ranges); n > maxJournalRanges {
 		out.Ranges, out.RangesOmitted = out.Ranges[:maxJournalRanges], out.RangesOmitted+n-maxJournalRanges
 	}
@@ -105,6 +113,60 @@ func (g GroupCoverage) MarshalJSON() ([]byte, error) {
 		out.Partial, out.PartialOmitted = out.Partial[:maxJournalPartial], out.PartialOmitted+n-maxJournalPartial
 	}
 	return json.Marshal(out)
+}
+
+// bounds returns, per instance, the lowest and highest batch the coverage
+// holds, ordered by instance.
+func (g GroupCoverage) bounds() []CoverageRange {
+	if len(g.Bounds) > 0 && g.RangesOmitted+g.PartialOmitted > 0 {
+		return g.Bounds // a truncated copy: its lists are incomplete
+	}
+	by := map[uint64]*CoverageRange{}
+	note := func(inst, lo, hi uint64) {
+		if b := by[inst]; b == nil {
+			by[inst] = &CoverageRange{Instance: inst, Lo: lo, Hi: hi}
+		} else {
+			if lo < b.Lo {
+				b.Lo = lo
+			}
+			if hi > b.Hi {
+				b.Hi = hi
+			}
+		}
+	}
+	for _, r := range g.Ranges {
+		note(r.Instance, r.Lo, r.Hi)
+	}
+	for _, p := range g.Partial {
+		note(p.Instance, p.CSeq, p.CSeq)
+	}
+	out := make([]CoverageRange, 0, len(by))
+	for _, b := range by {
+		out = append(out, *b)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Instance < out[j].Instance })
+	return out
+}
+
+// HeldSpans is what the WAL must keep for this coverage until its file
+// registers: every listed range and partial batch, plus the bounds of a
+// truncated copy. ok is false for a truncated copy journaled before S4c,
+// which has no bounds: what it needs is unknown.
+func (g *GroupCoverage) HeldSpans() (spans []CoverageRange, ok bool) {
+	if g == nil {
+		return nil, true
+	}
+	spans = append(spans, g.Ranges...)
+	for _, p := range g.Partial {
+		spans = append(spans, CoverageRange{Instance: p.Instance, Lo: p.CSeq, Hi: p.CSeq})
+	}
+	if g.RangesOmitted+g.PartialOmitted > 0 {
+		if len(g.Bounds) == 0 {
+			return spans, false
+		}
+		spans = append(spans, g.Bounds...)
+	}
+	return spans, true
 }
 
 // CoverageOutcome is how one file of a group left the registration outbox.

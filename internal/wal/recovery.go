@@ -51,6 +51,13 @@ type RecoveryStats struct {
 	// a bad coverage map is itself evidence that ranges exist.
 	PartialRowEntries int
 	RecoveryDuration  time.Duration
+	// Retained lists the files this pass replayed (or found checkpointed) but
+	// kept because a batch in them is still waiting for its file to register
+	// (#1207 S4c), and every file after the first such one: a later file can
+	// hold the only checkpoint for an earlier one's entries. Not failures: they
+	// are not counted in KeptFiles; the writer deletes them through
+	// ReleaseRetained once nothing in them is held.
+	Retained []RetainedFile
 }
 
 // RecoveryOptions configures WAL recovery behavior
@@ -122,6 +129,11 @@ type RecoveryOptions struct {
 	// MaxReplayFailures is the number of failed replay passes before a poison
 	// WAL file is quarantined as .wal.failed. Defaults to 3.
 	MaxReplayFailures int
+
+	// Held returns the registration hold (#1207 S4c). It is consulted after
+	// each barrier, so the batches this pass just replayed are in it. Nil
+	// holds nothing.
+	Held func() CoverageHold
 }
 
 // Recovery manages WAL recovery operations
@@ -231,10 +243,14 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		entries int
 		batches int
 		parents []string
+		cov     coverageSet
 	}
 	var pendingDelete []recoveredWALFile
 	pendingRows := 0
 	var recoveryErr error
+	// retaining is set by the first file kept for the registration hold; no
+	// later file of this pass is deleted after it.
+	retaining := false
 	flushPending := func() bool {
 		if len(pendingDelete) == 0 {
 			return true
@@ -285,7 +301,24 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 				}
 			}
 		}
+		var hold CoverageHold
+		if opts.Held != nil {
+			hold = opts.Held()
+		}
 		for index, recovered := range pendingDelete {
+			if retaining || recovered.cov.held(hold) {
+				if !retaining {
+					r.logger.Info().Str("file", filepath.Base(recovered.path)).
+						Msg("Keeping a recovered WAL file: batches in it are waiting for their files to register")
+				}
+				retaining = true
+				// The empty-file delete and quarantine below are not gated by
+				// this: neither file carries proof another file needs.
+				stats.Retained = append(stats.Retained, RetainedFile{Path: recovered.path, Coverage: recovered.cov.spans()})
+				stats.RecoveredBatches += recovered.batches
+				stats.RecoveredEntries += recovered.entries
+				continue
+			}
 			if err := os.Remove(recovered.path); err != nil {
 				if !os.IsNotExist(err) {
 					stats.KeptFiles += len(pendingDelete) - index
@@ -415,10 +448,16 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		fileRecoveredEntries := 0
 		var fileRecoveredParents []string
 		hadSplitTracked := false
+		fileCov := make(coverageSet)
 
 		for _, entry := range entries {
 			if len(entry.CheckpointHashes) > 0 {
 				continue
+			}
+			// Before the checkpoint skip: a batch already flushed is held
+			// until its file registers, like one replayed now.
+			if entry.Coverage != nil {
+				fileCov.add(entry.Coverage.Instance, entry.Coverage.Key, entry.Coverage.CSeq)
 			}
 			if _, ok := flushed[entry.PayloadHash]; ok {
 				r.logger.Debug().Str("payload_hash", entry.PayloadHash).Msg("Skipping WAL entry covered by flush checkpoint")
@@ -597,13 +636,13 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 		if allEntriesSucceeded && len(entries) > 0 {
 			r.clearReplayFailure(walFile)
 			if fileRecoveredBatches == 0 || opts.BeforeDelete == nil {
-				pendingDelete = append(pendingDelete, recoveredWALFile{path: walFile, entries: fileRecoveredEntries, batches: fileRecoveredBatches, parents: fileRecoveredParents})
+				pendingDelete = append(pendingDelete, recoveredWALFile{path: walFile, entries: fileRecoveredEntries, batches: fileRecoveredBatches, parents: fileRecoveredParents, cov: fileCov})
 				if !flushPending() {
 					stats.KeptFiles += len(walFiles) - fileIndex - 1
 					break
 				}
 			} else {
-				pendingDelete = append(pendingDelete, recoveredWALFile{path: walFile, entries: fileRecoveredEntries, batches: fileRecoveredBatches, parents: fileRecoveredParents})
+				pendingDelete = append(pendingDelete, recoveredWALFile{path: walFile, entries: fileRecoveredEntries, batches: fileRecoveredBatches, parents: fileRecoveredParents, cov: fileCov})
 				pendingRows += fileRecoveredEntries
 				rowsReached := opts.BarrierBatchRows > 0 && pendingRows >= opts.BarrierBatchRows
 				if len(pendingDelete) >= barrierBatchFiles || rowsReached {
