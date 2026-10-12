@@ -19,10 +19,12 @@ type ColumnarRecord struct {
 	Columnar    bool                     `json:"_columnar"` // Marker for columnar format
 	Columns     map[string][]interface{} `json:"columns"`   // Column name -> array of values
 	TagColumns  []string                 `json:"-"`         // Tag column names (for Parquet metadata, enables auto-dedup)
-	// DedupTime, when true, makes compaction dedup this data on the time column
-	// even when TagColumns is empty (keeping one row per timestamp). Set ONLY by
-	// producers whose data model guarantees one row per (tags, time) — continuous
-	// queries (#521). MUST stay false for raw ingest, where many distinct rows
+	// DedupTime, when true, marks this data as one row per timestamp, which lets
+	// compaction dedup it on the time column even when TagColumns is empty. It
+	// describes this record only: compaction dedups on time alone only when
+	// every file of a batch carries the mark and each is unique on time
+	// (#1227). Set ONLY by continuous queries for a run whose output is one row
+	// per time (#521). MUST stay false for raw ingest, where many distinct rows
 	// legitimately share a timestamp and time-only dedup would destroy data.
 	DedupTime  bool   `json:"-"`
 	TimeUnit   string `json:"_time_unit,omitempty"`

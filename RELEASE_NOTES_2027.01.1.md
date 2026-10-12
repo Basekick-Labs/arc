@@ -1022,9 +1022,75 @@ report failed runs if its output today repeats a (`tag_columns`, `time`) key
 with different values. Compaction was already reducing that output to one row
 per key, deleting the rest.
 
-The same hazard exists for a continuous query that declares no `tag_columns` at
-all. That one is in compaction, and is tracked separately in
-[#1227](https://github.com/Basekick-Labs/arc/issues/1227).
+The same hazard for a continuous query that declares no `tag_columns` at all
+was in compaction. It is fixed in this release; see the next entry.
+
+### Compaction no longer deletes rows from a grouped continuous query without `tag_columns` ([#1227](https://github.com/Basekick-Labs/arc/issues/1227))
+
+A continuous query with no `tag_columns` marks each run's output for
+deduplication on `time` alone, but only when that run produced one row per
+timestamp ([#521](https://github.com/Basekick-Labs/arc/issues/521)). Compaction
+then applied time-only deduplication to a whole batch of files if **any** one
+of them carried the mark. The ingest buffer did the same when it merged several
+runs into one flush.
+
+So a query that groups by a column but does not declare it in `tag_columns`
+(`GROUP BY host` with no `tag_columns`) lost rows whenever its windows
+differed:
+
+- A window in which one host reported produced one row per timestamp, and was
+  marked.
+- A window in which two hosts reported was not marked.
+- Once both landed in the same hourly partition, compaction kept one row per
+  timestamp across all of it. Every host but one was deleted from the
+  multi-host windows.
+
+Nothing reported it.
+
+The mark now describes only the file that carries it. A batch is deduplicated
+on `time` alone only when **every** file carries the mark, and each file is
+checked to really hold one row per timestamp. In every other case, a batch that
+holds continuous-query output keeps all its distinct rows and drops only rows
+identical in every column, such as a copy replayed from the WAL.
+
+Compacted files now carry the mark when time-only deduplication ran on them. A
+window re-emitted after its hour was compacted still collapses against the
+compacted copy.
+
+The ingest buffer keeps the mark on a flush only if every write merged into it
+carried it. When two marked emissions of the same window meet in one flush (a
+scheduled run and a manual execute, a retry), the flush keeps the later row
+for each timestamp, which is what compaction did with them before.
+
+**What changes for existing data:**
+
+- **Files already compacted before the upgrade carry no mark**, so they are
+  never deduplicated on time again. A re-emitted window that lands in one of
+  those hours collapses only if its rows are identical to the compacted ones;
+  otherwise both versions stay. The same applies to files rewritten by
+  `DELETE`, which drops the mark, and to a run of more than 100,000 rows, which
+  is never marked.
+- **A file marked by an earlier version that holds several rows per timestamp**
+  is detected and not deduplicated on `time`. Compaction logs:
+
+  ```
+  A file marked arc:dedup_time holds several rows per time; deduplicating identical rows only
+  ```
+
+- **Rows already deleted by this bug cannot be recovered by the upgrade.**
+  Re-running the affected windows (`POST /api/v1/continuous_queries/:id/execute`)
+  writes them again.
+
+**Still not supported: two producers writing one destination without
+`tag_columns`.** Examples are two continuous queries writing the same
+measurement, or a manual backfill whose series differ from the scheduled run.
+Each producer's files can be one row per timestamp on their own, yet hold
+different series at the same timestamp, and they are still collapsed on
+`time`. Declare `tag_columns` for every grouping column, or give each
+continuous query its own destination.
+
+A failure to read a file's tag metadata now skips deduplication for that batch.
+Before, it could fall through to deduplication on `time` alone over tagged data.
 
 ### The WAL is reclaimed again after a crash recovery ([#1222](https://github.com/Basekick-Labs/arc/issues/1222))
 
