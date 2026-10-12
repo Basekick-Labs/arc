@@ -347,9 +347,9 @@ type takeoverState struct {
 	// instances and claims are kept until they re-join, or until the leader
 	// expires the departure (RemoveReasonDepartedExpired). Keyed by node id,
 	// valued by the departure time the leave carried.
-	departed  map[string]time.Time
-	entries   int    // index entries across every instance (bounded by maxIndexEntries)
-	gen       uint64 // bumped on every change; not replicated (a reader's cache key)
+	departed map[string]time.Time
+	entries  int    // index entries across every instance (bounded by maxIndexEntries)
+	gen      uint64 // bumped on every change; not replicated (a reader's cache key)
 }
 
 func newTakeoverState() *takeoverState {
