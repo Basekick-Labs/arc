@@ -678,7 +678,7 @@ func (m *Manager) PreviewMigration(ctx context.Context, fromTier, toTier Tier, d
 	if m.roleGated() {
 		return nil, ErrMigrationRoleGated
 	}
-	if !m.licenseClient.CanUseTieredStorage() {
+	if m.licenseClient != nil && !m.licenseClient.CanUseTieredStorage() {
 		return nil, fmt.Errorf("tiered storage license is not available")
 	}
 	if fromTier != TierHot || toTier != TierCold {
