@@ -23,7 +23,7 @@ type markerFixture struct {
 }
 
 const (
-	marked     = `{'arc:dedup_time': 'true'}`
+	marked     = `{'arc:dedup_exact': 'true'}`
 	t1         = `TIMESTAMPTZ '2026-01-01 00:00:00+00'`
 	t2         = `TIMESTAMPTZ '2026-01-01 00:01:00+00'`
 	t3         = `TIMESTAMPTZ '2026-01-01 00:02:00+00'`
@@ -35,6 +35,7 @@ type markerEnv struct {
 	db  *sql.DB
 	dir string
 	n   int
+	raw bool
 }
 
 func newMarkerEnv(t *testing.T) *markerEnv {
@@ -76,6 +77,9 @@ func (e *markerEnv) compact(paths ...string) (string, []string, bool, string) {
 	if err != nil {
 		e.t.Fatalf("compactFiles: %v\nlog:\n%s", err, logs.String())
 	}
+	if e.raw {
+		return out, nil, false, logs.String()
+	}
 	rows, err := e.db.Query(fmt.Sprintf(
 		`SELECT coalesce(host, '-'), minute("time"), v FROM read_parquet('%s', union_by_name=true)`, escapeSQLPath(out)))
 	if err != nil {
@@ -95,11 +99,19 @@ func (e *markerEnv) compact(paths ...string) (string, []string, bool, string) {
 	sort.Strings(got)
 	var marker string
 	err = e.db.QueryRow(fmt.Sprintf(
-		`SELECT value FROM parquet_kv_metadata('%s') WHERE key = 'arc:dedup_time'`, escapeSQLPath(out))).Scan(&marker)
+		`SELECT value FROM parquet_kv_metadata('%s') WHERE key = 'arc:dedup_exact'`, escapeSQLPath(out))).Scan(&marker)
 	if err != nil && err != sql.ErrNoRows {
 		e.t.Fatalf("read output marker: %v", err)
 	}
 	return out, got, marker == "true", logs.String()
+}
+
+// compactRaw compacts without reading the output as host/minute/v rows, for
+// fixtures with other columns.
+func (e *markerEnv) compactRaw(paths ...string) (string, []string, bool, string) {
+	e.raw = true
+	defer func() { e.raw = false }()
+	return e.compact(paths...)
 }
 
 func row(host, at string, v float64) string {
@@ -116,150 +128,133 @@ func expectRows(t *testing.T, got []string, want ...string) {
 	}
 }
 
-// The #1227 bug: a grouped continuous query with no tag_columns marks a window
-// that held one series and not one that held two. Before the fix one marked
-// file made the batch dedup on time, and host b's row at minute 1 was deleted.
-func TestCompactFiles_OneMarkedFileNoLongerCollapsesTheBatch(t *testing.T) {
+const tagged = `{'arc:tags': 'host'}`
+
+// #1232: rows that share tags and time but differ in a field are different
+// data. Before, compaction kept one row per (host, time) and deleted the rest —
+// a correction, or a re-sent point with a new value, was lost. Only a row
+// identical in every column collapses.
+func TestCompactFiles_TaggedKeepsRowsThatDifferInAField(t *testing.T) {
+	e := newMarkerEnv(t)
+	a := e.write(markerFixture{rows: union(row("a", t1, 1), row("b", t1, 5)), kv: tagged})
+	b := e.write(markerFixture{rows: union(row("a", t1, 2), row("b", t1, 5)), kv: tagged})
+	_, got, outMarked, _ := e.compact(a, b)
+	expectRows(t, got, "a@0=1", "a@0=2", "b@0=5")
+	if outMarked {
+		t.Error("tagged output carries arc:dedup_time")
+	}
+}
+
+// Two writes of the same series and time carrying different fields are both
+// kept: one row per key would drop one write's fields.
+func TestCompactFiles_PartialWritesAreBothKept(t *testing.T) {
+	e := newMarkerEnv(t)
+	a := e.write(markerFixture{rows: `SELECT 'a' AS host, ` + t1 + ` AS "time", 1::DOUBLE AS usage`, kv: tagged})
+	b := e.write(markerFixture{rows: `SELECT 'a' AS host, ` + t1 + ` AS "time", 5::DOUBLE AS temp`, kv: tagged})
+	out, _, _, _ := e.compactRaw(a, b)
+	var n, usage, temp int
+	if err := e.db.QueryRow(fmt.Sprintf(`SELECT count(*), count(usage), count(temp) FROM read_parquet('%s', union_by_name=true)`,
+		escapeSQLPath(out))).Scan(&n, &usage, &temp); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 || usage != 1 || temp != 1 {
+		t.Errorf("rows=%d usage=%d temp=%d, want both partial writes kept", n, usage, temp)
+	}
+}
+
+// A tagless file shares a tagged partition: its rows have NULL in the tag
+// column. Key matching must treat NULLs as equal (IS NOT DISTINCT FROM), or
+// those rows match no key and drop out of the output entirely.
+func TestCompactFiles_NullTagKeysAreNeitherLostNorDuplicated(t *testing.T) {
+	e := newMarkerEnv(t)
+	a := e.write(markerFixture{rows: row("a", t1, 1), kv: tagged})
+	b := e.write(markerFixture{rows: `SELECT ` + t1 + ` AS "time", 7::DOUBLE AS v`})
+	c := e.write(markerFixture{rows: `SELECT ` + t1 + ` AS "time", 7::DOUBLE AS v UNION ALL SELECT ` + t2 + `, 8::DOUBLE`})
+	_, got, _, _ := e.compact(a, b, c)
+	expectRows(t, got, "a@0=1", "-@0=7", "-@1=8")
+}
+
+// The #1227 case: a grouped continuous query with no tag_columns, one window
+// with one series and one with two. Every distinct row survives, and the
+// output stays marked so a later pass checks it again.
+func TestCompactFiles_GroupedTaglessContinuousQueryKeepsEverySeries(t *testing.T) {
 	e := newMarkerEnv(t)
 	a := e.write(markerFixture{rows: row("a", t1, 1), kv: marked})
-	b := e.write(markerFixture{rows: union(row("a", t2, 2), row("b", t2, 3))})
+	b := e.write(markerFixture{rows: union(row("a", t2, 2), row("b", t2, 3)), kv: marked})
 	_, got, outMarked, _ := e.compact(a, b)
 	expectRows(t, got, "a@0=1", "a@1=2", "b@1=3")
-	if outMarked {
-		t.Error("output of a mixed batch carries arc:dedup_time")
-	}
-}
-
-// What #521 built the marker for still works: two emissions of the same window
-// by a no-group-by continuous query collapse, and the output keeps the marker
-// so a later compaction can dedup a further re-emission against it. Which of
-// the two equal-time rows survives is not asserted: the dedup window orders by
-// time alone, so the tie-break is arbitrary (pre-existing).
-func TestCompactFiles_AllMarkedReEmissionCollapsesAndStaysMarked(t *testing.T) {
-	e := newMarkerEnv(t)
-	a := e.write(markerFixture{rows: union(row("-", t1, 1), row("-", t2, 2)), kv: marked})
-	b := e.write(markerFixture{rows: row("-", t1, 1.5), kv: marked})
-	out, got, outMarked, _ := e.compact(a, b)
-	if len(got) != 2 {
-		t.Fatalf("rows = %v, want one per minute", got)
-	}
 	if !outMarked {
-		t.Fatal("output of time-only dedup does not carry arc:dedup_time")
-	}
-
-	// The next hourly pass, or the daily tier, sees the compacted output plus a
-	// further re-emission: still one row per time.
-	c := e.write(markerFixture{rows: row("-", t2, 9), kv: marked})
-	_, got, outMarked, _ = e.compact(out, c)
-	if len(got) != 2 {
-		t.Errorf("re-emission against a compacted output: rows = %v, want one per minute", got)
-	}
-	if !outMarked {
-		t.Error("second-pass output lost the marker")
-	}
-
-	// A compacted output plus an unmarked file is a mixed batch.
-	d := e.write(markerFixture{rows: row("-", t3, 4)})
-	_, _, outMarked, _ = e.compact(out, d)
-	if outMarked {
-		t.Error("a compaction with an unmarked input produced a marked output")
+		t.Error("tagless exact-row output lost the marker")
 	}
 }
 
-// A file marked by a build before #1227 can hold several rows per time (the
-// buffer ORed the marker across the batches of a flush). The marker is not
-// trusted on its own: such a batch keeps every distinct row.
-func TestCompactFiles_MarkedFileNotUniqueOnTimeIsNotTimeDeduped(t *testing.T) {
-	e := newMarkerEnv(t)
-	poisoned := e.write(markerFixture{rows: union(row("a", t1, 1), row("b", t1, 2)), kv: marked})
-	clean := e.write(markerFixture{rows: row("c", t2, 3), kv: marked})
-	_, got, outMarked, log := e.compact(poisoned, clean)
-	expectRows(t, got, "a@0=1", "b@0=2", "c@1=3")
-	if outMarked {
-		t.Error("output carries arc:dedup_time though an input was not unique on time")
-	}
-	if !strings.Contains(log, "holds several rows per time") {
-		t.Errorf("no warning naming the cause; log:\n%s", log)
-	}
-}
-
-// The uniqueness probe compares time the way compaction does — normalized — so
-// a file holding the same instant spelled twice (a VARCHAR epoch and an ISO
-// string) is not unique. Comparing the raw values would call it unique and
-// time-dedup two series into one.
-func TestCompactFiles_UniquenessProbeNormalizesTime(t *testing.T) {
-	e := newMarkerEnv(t)
-	spelled := e.write(markerFixture{
-		rows: `SELECT 'a' AS host, '1767225600000000' AS "time", 1::DOUBLE AS v
-		       UNION ALL SELECT 'b', '2026-01-01 00:00:00+00', 2::DOUBLE`,
-		kv: marked})
-	other := e.write(markerFixture{rows: `SELECT 'c' AS host, '2026-01-01 00:01:00+00' AS "time", 3::DOUBLE AS v`, kv: marked})
-	_, got, _, _ := e.compact(spelled, other)
-	expectRows(t, got, "a@0=1", "b@0=2", "c@1=3")
-}
-
-// A batch mixing marked and unmarked files drops rows identical in every
-// column — a WAL-replayed or replicated copy — and keeps everything else,
-// including a re-emission whose values changed.
-func TestCompactFiles_MixedBatchDropsOnlyExactCopies(t *testing.T) {
+// Continuous-query output: an identical copy of a window (WAL replay, a retry
+// over unchanged data) collapses even when the copy is unmarked; a re-run whose
+// value changed is kept beside the original. A further copy against the
+// compacted output still collapses: the output is marked.
+func TestCompactFiles_ContinuousQueryCopiesCollapseReRunsAreKept(t *testing.T) {
 	e := newMarkerEnv(t)
 	original := e.write(markerFixture{rows: union(row("-", t1, 1), row("-", t2, 2)), kv: marked})
-	replayed := e.write(markerFixture{rows: union(row("-", t1, 1), row("-", t2, 2.5))})
-	_, got, outMarked, _ := e.compact(original, replayed)
+	replayed := e.write(markerFixture{rows: row("-", t1, 1)})
+	rerun := e.write(markerFixture{rows: row("-", t2, 2.5), kv: marked})
+	out, got, outMarked, _ := e.compact(original, replayed, rerun)
 	expectRows(t, got, "-@0=1", "-@1=2", "-@1=2.5")
-	if outMarked {
-		t.Error("output of exact-row dedup carries arc:dedup_time")
+	if !outMarked {
+		t.Fatal("output not marked")
 	}
+	again := e.write(markerFixture{rows: row("-", t1, 1)})
+	_, got, _, _ = e.compact(out, again)
+	expectRows(t, got, "-@0=1", "-@1=2", "-@1=2.5")
 }
 
-// Raw ingest without tags or markers is untouched, identical rows included.
+// Raw ingest without tags or a marker is untouched, identical rows included.
 func TestCompactFiles_UnmarkedTaglessBatchKeepsEveryRow(t *testing.T) {
 	e := newMarkerEnv(t)
 	a := e.write(markerFixture{rows: row("a", t1, 1)})
 	b := e.write(markerFixture{rows: row("a", t1, 1)})
+	_, got, outMarked, _ := e.compact(a, b)
+	expectRows(t, got, "a@0=1", "a@0=1")
+	if outMarked {
+		t.Error("undeduplicated output is marked")
+	}
+}
+
+// Only the value "true" marks a file.
+func TestCompactFiles_MarkerMustBeTrue(t *testing.T) {
+	e := newMarkerEnv(t)
+	a := e.write(markerFixture{rows: row("a", t1, 1), kv: `{'arc:dedup_time': 'false'}`})
+	b := e.write(markerFixture{rows: row("a", t1, 1), kv: `{'arc:dedup_time': 'false'}`})
 	_, got, _, _ := e.compact(a, b)
 	expectRows(t, got, "a@0=1", "a@0=1")
 }
 
-// A tag-read failure used to fall through to the marker, so a batch of marked
-// files carrying tags could be deduped on time alone. It now skips dedup.
+// A tag-read failure skips dedup for the batch rather than guessing a key.
 func TestCompactFiles_TagReadErrorSkipsDedup(t *testing.T) {
 	e := newMarkerEnv(t)
 	bad := `{'arc:dedup_time': 'true', 'arc:tags': 'host;drop'}`
 	a := e.write(markerFixture{rows: row("a", t1, 1), kv: bad})
-	b := e.write(markerFixture{rows: row("b", t1, 2), kv: marked})
-	_, got, outMarked, _ := e.compact(a, b)
-	expectRows(t, got, "a@0=1", "b@0=2")
-	if outMarked {
-		t.Error("output marked though no time-only dedup ran")
-	}
-}
-
-// A legacy file carrying both arc:tags and the marker dedups on (tags, time)
-// and its output is NOT marked: it holds several rows per time, and compacted
-// output carries no arc:tags to say which. Marking it would let the daily tier
-// dedup it on time alone.
-func TestCompactFiles_TaggedOutputIsNeverMarked(t *testing.T) {
-	e := newMarkerEnv(t)
-	both := `{'arc:dedup_time': 'true', 'arc:tags': 'host'}`
-	a := e.write(markerFixture{rows: union(row("a", t1, 1), row("b", t1, 2)), kv: both})
-	b := e.write(markerFixture{rows: row("a", t1, 1), kv: both})
-	out1, got, outMarked, _ := e.compact(a, b)
-	expectRows(t, got, "a@0=1", "b@0=2")
-	if outMarked {
-		t.Fatal("tagged dedup produced a marked output")
-	}
-	c := e.write(markerFixture{rows: union(row("c", t1, 3), row("d", t1, 4)), kv: both})
-	out2, _, _, _ := e.compact(c)
-	_, got, _, _ = e.compact(out1, out2)
-	expectRows(t, got, "a@0=1", "b@0=2", "c@0=3", "d@0=4")
-}
-
-// Only the value "true" marks a file; anything else is unmarked.
-func TestCompactFiles_MarkerMustBeTrue(t *testing.T) {
-	e := newMarkerEnv(t)
-	a := e.write(markerFixture{rows: row("a", t1, 1), kv: `{'arc:dedup_time': 'false'}`})
-	b := e.write(markerFixture{rows: row("b", t1, 2), kv: marked})
+	b := e.write(markerFixture{rows: row("a", t1, 1), kv: marked})
 	_, got, _, _ := e.compact(a, b)
+	expectRows(t, got, "a@0=1", "a@0=1")
+}
+
+// Files written before #1232 carry the older arc:dedup_time key; it still opts
+// the batch in. Compacted output is marked with the new key only, so a
+// rolled-back build — which reads arc:dedup_time as "dedup on time alone" —
+// never sees it.
+func TestCompactFiles_LegacyMarkerStillOptsIn(t *testing.T) {
+	e := newMarkerEnv(t)
+	legacy := `{'arc:dedup_time': 'true'}`
+	a := e.write(markerFixture{rows: union(row("a", t1, 1), row("b", t1, 2)), kv: legacy})
+	b := e.write(markerFixture{rows: row("a", t1, 1)})
+	out, got, outMarked, _ := e.compact(a, b)
 	expectRows(t, got, "a@0=1", "b@0=2")
+	if !outMarked {
+		t.Error("output not marked with arc:dedup_exact")
+	}
+	var n int
+	if err := e.db.QueryRow(fmt.Sprintf(`SELECT count(*) FROM parquet_kv_metadata('%s') WHERE key = 'arc:dedup_time'`,
+		escapeSQLPath(out))).Scan(&n); err != nil || n != 0 {
+		t.Errorf("output carries the legacy arc:dedup_time key (count %d, err %v)", n, err)
+	}
 }

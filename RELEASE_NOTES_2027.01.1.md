@@ -1024,97 +1024,78 @@ in the same statement as the write.
 This replaces the 26.09.3 advice to send the whole definition on every `PUT`.
 Clients that do so keep working unchanged.
 
-**A continuous query whose `tag_columns` no longer match its query now fails
-its run instead of losing rows.** Compaction keeps one row per
-(tag values, time) in a measurement that declares `tag_columns`. Say the query
-groups by `host, region` but `tag_columns` lists only `host`. Compaction then
-deletes every region's row but one for each host and window. Nothing reported
-it.
+Leaving `tag_columns` out of an update that changes the query keeps the stored
+list. That can no longer cost rows: compaction removes only rows identical in
+every column, see the next entry.
 
-With this change, leaving `tag_columns` out of an update that changes the query
-keeps the old list, which made this mismatch easier to reach. So before a run
-writes anything, it now checks that no two output rows share the declared tag
-values and `time` while differing in another column. Rows identical in every
-column are allowed, since dropping one of them loses nothing. If the check
-fails, the run writes nothing and is recorded as failed, with an error naming
-`tag_columns`. A manual `POST /api/v1/continuous_queries/:id/execute` returns
-`422` in that case. The window is not marked processed, so it runs again once
-`tag_columns` lists every grouping column of the query.
+### Compaction removes only exact duplicate rows ([#1232](https://github.com/Basekick-Labs/arc/issues/1232), [#1227](https://github.com/Basekick-Labs/arc/issues/1227))
 
-**Check this before upgrading:** after the upgrade, a continuous query will
-report failed runs if its output today repeats a (`tag_columns`, `time`) key
-with different values. Compaction was already reducing that output to one row
-per key, deleting the rest.
+Compaction deduplicated a measurement by a key: one row per tag values and
+`time` when the files carry tag metadata, or one row per `time` for
+continuous-query output without `tag_columns`. Every other row sharing that key
+was deleted, whatever its field values. Which row survived was arbitrary; in
+practice it was the one in the oldest file. This lost data in several ways,
+none of them reported:
 
-The same hazard for a continuous query that declares no `tag_columns` at all
-was in compaction. It is fixed in this release; see the next entry.
+- **A corrected or re-sent point disappeared.** A second write with the same
+  tags and time but a new value was deleted, and the old value kept.
+- **Two writes of the same point with different fields lost one of them.** For
+  example, `usage=1` from one write and `temp=5` from another, same series and
+  time. Two inputs reporting the same series is a common source of this.
+- **A grouped continuous query without `tag_columns` lost series.** For example
+  `GROUP BY host` with no `tag_columns` declared. A window in which one host
+  reported was marked for time-only deduplication. Once it shared a partition
+  with a window in which several hosts reported, every host but one was
+  deleted from the multi-host windows.
+- **A continuous query whose `tag_columns` did not cover its grouping lost
+  rows.** For example, it groups by `host, region` but lists only `host`.
 
-### Compaction no longer deletes rows from a grouped continuous query without `tag_columns` ([#1227](https://github.com/Basekick-Labs/arc/issues/1227))
+**Compaction now removes a row only when another row is identical to it in
+every column**: time, every tag and every field. Rows that share their tags and
+time but differ anywhere are different data, and all are kept. The tag columns,
+or `time` for continuous-query output without them, only narrow where whole
+rows are compared. On typical measurements, and on very wide sparse ones,
+compaction costs about the same as before. A partition in which most rows are
+duplicates costs more, up to about half again as long. An hour replayed whole
+from the WAL is one example.
 
-A continuous query with no `tag_columns` marks each run's output for
-deduplication on `time` alone, but only when that run produced one row per
-timestamp ([#521](https://github.com/Basekick-Labs/arc/issues/521)). Compaction
-then applied time-only deduplication to a whole batch of files if **any** one
-of them carried the mark. The ingest buffer did the same when it merged several
-runs into one flush.
+What is still removed:
+- a copy replayed from the WAL;
+- a retried write;
+- a replicated copy;
+- any other byte-for-byte duplicate.
 
-So a query that groups by a column but does not declare it in `tag_columns`
-(`GROUP BY host` with no `tag_columns`) lost rows whenever its windows
-differed:
+**Behaviour changes:**
 
-- A window in which one host reported produced one row per timestamp, and was
-  marked.
-- A window in which two hosts reported was not marked.
-- Once both landed in the same hourly partition, compaction kept one row per
-  timestamp across all of it. Every host but one was deleted from the
-  multi-host windows.
+- **Re-sending a point with a new value no longer replaces the old one.** Both
+  rows stay, and queries see both: `count` counts two, `avg` averages them.
+  Delete the old row explicitly if it must go.
+- **Re-running a continuous-query window usually leaves a second row.** This
+  covers a retry, a run after a crash, and a manual `execute` of a window
+  already processed. Floating-point aggregates (`avg`, `sum`, `stddev`) are not
+  bit-for-bit reproducible across runs, so the re-run's value almost always
+  differs in its last digits and is kept beside the first. A re-run with late
+  data is kept beside the first by design.
+- **Declaring fewer `tag_columns` than the query groups by no longer loses
+  rows.**
+- **Tagless raw rows are deduplicated only alongside continuous-query output.**
+  Raw ingest without tags is still never deduplicated, unless its rows share a
+  partition with continuous-query output. Those rows then get the same
+  exact-row check.
+- **`0.0` and `-0.0` count as equal**, and so do two NaN values.
+- **Duplicates split across compaction batches can stay.** A pair split by the
+  batching of a large partition, or between a compacted file and a WAL-replayed
+  one, may stay as a duplicate. That was already the case before.
 
-Nothing reported it.
+Rows this bug already deleted cannot be recovered by the upgrade.
 
-The mark now describes only the file that carries it. A batch is deduplicated
-on `time` alone only when **every** file carries the mark, and each file is
-checked to really hold one row per timestamp. In every other case, a batch that
-holds continuous-query output keeps all its distinct rows and drops only rows
-identical in every column, such as a copy replayed from the WAL.
-
-Compacted files now carry the mark when time-only deduplication ran on them. A
-window re-emitted after its hour was compacted still collapses against the
-compacted copy.
-
-The ingest buffer keeps the mark on a flush only if every write merged into it
-carried it. When two marked emissions of the same window meet in one flush (a
-scheduled run and a manual execute, a retry), the flush keeps the later row
-for each timestamp, which is what compaction did with them before.
-
-**What changes for existing data:**
-
-- **Files already compacted before the upgrade carry no mark**, so they are
-  never deduplicated on time again. A re-emitted window that lands in one of
-  those hours collapses only if its rows are identical to the compacted ones;
-  otherwise both versions stay. The same applies to files rewritten by
-  `DELETE`, which drops the mark, and to a run of more than 100,000 rows, which
-  is never marked.
-- **A file marked by an earlier version that holds several rows per timestamp**
-  is detected and not deduplicated on `time`. Compaction logs:
-
-  ```
-  A file marked arc:dedup_time holds several rows per time; deduplicating identical rows only
-  ```
-
-- **Rows already deleted by this bug cannot be recovered by the upgrade.**
-  Re-running the affected windows (`POST /api/v1/continuous_queries/:id/execute`)
-  writes them again.
-
-**Still not supported: two producers writing one destination without
-`tag_columns`.** Examples are two continuous queries writing the same
-measurement, or a manual backfill whose series differ from the scheduled run.
-Each producer's files can be one row per timestamp on their own, yet hold
-different series at the same timestamp, and they are still collapsed on
-`time`. Declare `tag_columns` for every grouping column, or give each
-continuous query its own destination.
-
-A failure to read a file's tag metadata now skips deduplication for that batch.
-Before, it could fall through to deduplication on `time` alone over tagged data.
+**Rollback:** continuous-query output without `tag_columns` is now marked with a
+new Parquet key, `arc:dedup_exact`, instead of `arc:dedup_time`. Earlier
+versions read `arc:dedup_time` as "keep one row per timestamp". If they saw it
+on this release's output, which can hold several rows per timestamp, they would
+delete rows. They ignore the new key, so a rolled-back or not-yet-upgraded node
+leaves that output undeduplicated rather than losing rows. Files marked
+`arc:dedup_time` by earlier versions are still recognised.
 
 ### The WAL is reclaimed again after a crash recovery ([#1222](https://github.com/Basekick-Labs/arc/issues/1222))
 
