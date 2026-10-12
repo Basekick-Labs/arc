@@ -552,6 +552,7 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 			AutoFailover:    c.autoFailover,
 			FailoverTimeout: time.Duration(cfg.Config.FailoverTimeoutSeconds) * time.Second,
 			CooldownPeriod:  time.Duration(cfg.Config.FailoverCooldownSeconds) * time.Second,
+			Eligible:        c.writerEligible,
 			Logger:          cfg.Logger,
 		})
 
@@ -758,6 +759,9 @@ func (c *Coordinator) Start() error {
 	// Refuse writes on a writer that may no longer be the primary (#1207).
 	c.startIngestFenceLocked()
 	go c.streamClaimsMetricsLoop(c.ctx)
+	if c.cfg.StreamTakeover && c.raftNode != nil {
+		go c.departedExpiryLoop(c.ctx)
+	}
 	if c.cfg.StreamTakeover && c.raftNode != nil && c.takeoverOrigin.Load() != nil {
 		go c.streamTakeoverOriginLoop(c.ctx)
 	}
@@ -2349,7 +2353,9 @@ func (c *Coordinator) handleLeaveNotify(leave *protocol.LeaveNotify) {
 		if err := c.raftNode.RemoveServer(leave.NodeID, 5*time.Second); err != nil {
 			c.logger.Error().Err(err).Str("node_id", leave.NodeID).Msg("Failed to remove node from Raft")
 		}
-		if err := c.raftNode.RemoveNode(leave.NodeID, 5*time.Second); err != nil {
+		// A leave is graceful, usually a restart: stream takeover keeps the
+		// writer's instances and claims until it is back (#1207).
+		if err := c.raftNode.RemoveNodeWithReason(leave.NodeID, raft.RemoveReasonLeave, time.Now().UTC(), 5*time.Second); err != nil {
 			c.logger.Error().Err(err).Str("node_id", leave.NodeID).Msg("Failed to remove node from FSM")
 		}
 	}

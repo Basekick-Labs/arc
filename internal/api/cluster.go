@@ -175,6 +175,25 @@ func (h *ClusterHandler) RegisterRoutes(app *fiber.App) {
 		votersGroup.Use(auth.RequireAdmin(h.authManager))
 	}
 	votersGroup.Post("/converge", h.handleConvergeVoters)
+
+	// Admin-only: stream takeover state (#1207).
+	takeoverGroup := app.Group("/api/v1/cluster/stream-claims")
+	if h.authManager != nil {
+		takeoverGroup.Use(auth.RequireAdmin(h.authManager))
+	}
+	takeoverGroup.Get("", h.handleGetStreamClaims)
+}
+
+// handleGetStreamClaims returns the writer processes, claims and departed
+// writers of stream takeover, from this node's manifest.
+func (h *ClusterHandler) handleGetStreamClaims(c *fiber.Ctx) error {
+	if h.coordinator == nil {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"success": false,
+			"error":   "clustering is not enabled on this node",
+		})
+	}
+	return c.JSON(h.coordinator.StreamTakeover())
 }
 
 // convergeVotersRequest is the body of POST /api/v1/cluster/voters/converge.

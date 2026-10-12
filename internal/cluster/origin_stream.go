@@ -174,12 +174,24 @@ func (st *originStream) trimReady(c *Coordinator) originstream.TrimReadiness {
 			return out
 		}
 		applied := fsm.AppliedDone()
+		// An origin with an unfinished claim on one of its instances keeps
+		// every record (#1207): a claimant publishes from them, and a vanished
+		// file can make batches below the origin's floors claimable again.
+		// Per origin: a trim key does not name the instance.
+		claimed := map[string]bool{}
+		if fsm.StreamClaimsEnabled() {
+			for _, st := range fsm.TakeoverInstanceStates() {
+				if st.Claimed && !st.ClaimDone && !st.ClaimRelease {
+					claimed[st.Origin] = true
+				}
+			}
+		}
 		type dbm struct{ db, measurement string }
 		wanted := map[dbm][]originstream.TrimKey{}
 		dbs := map[string]bool{}
 		for _, k := range keys {
 			db, m, ok := strings.Cut(k.Key, "/")
-			if !ok || applied < k.AppliedIndex {
+			if !ok || applied < k.AppliedIndex || claimed[k.Origin] {
 				continue
 			}
 			wanted[dbm{db, m}] = append(wanted[dbm{db, m}], k)

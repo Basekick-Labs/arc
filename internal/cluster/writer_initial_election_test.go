@@ -383,3 +383,40 @@ func TestRouteWrite_PrefersTheElectedPrimary(t *testing.T) {
 		t.Fatalf("GetPrimaryWriter() = %v; want writer-2, which is what RouteWrite prefers before it falls back to round-robin", got)
 	}
 }
+
+// #1207: a writer whose current process another writer claimed is never
+// selected, including as the self fallback; selection is in id order.
+func TestSelectPrimarySkipsIneligibleWriters(t *testing.T) {
+	local := NewNode("writer-3", "writer-3", RoleWriter, "test-cluster")
+	local.UpdateState(StateHealthy)
+	reg := NewRegistry(&RegistryConfig{LocalNode: local, MaxNodes: 8, Logger: testLogger()})
+	for _, id := range []string{"writer-2", "writer-1"} {
+		n := NewNode(id, id, RoleWriter, "test-cluster")
+		n.UpdateState(StateHealthy)
+		n.SetWriterState(WriterStateStandby)
+		if err := reg.Register(n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claimed := map[string]bool{}
+	mgr := NewWriterFailoverManager(&WriterFailoverConfig{Registry: reg, Logger: testLogger(),
+		Eligible: func(id string) bool { return !claimed[id] }})
+	if got := mgr.selectPrimary("writer-3", false); got != "writer-1" {
+		t.Fatalf("selected %q, want the lowest id writer-1", got)
+	}
+	claimed["writer-1"] = true
+	if got := mgr.selectPrimary("writer-3", false); got != "writer-2" {
+		t.Fatalf("selected %q, want writer-2", got)
+	}
+	claimed["writer-2"] = true
+	if got := mgr.selectPrimary("writer-3", false); got != "" {
+		t.Fatalf("selected %q with every other writer claimed", got)
+	}
+	if got := mgr.selectPrimary("writer-3", true); got != "writer-3" {
+		t.Fatalf("self fallback %q", got)
+	}
+	claimed["writer-3"] = true
+	if got := mgr.selectPrimary("writer-3", true); got != "" {
+		t.Fatalf("a claimed writer selected as its own fallback: %q", got)
+	}
+}
