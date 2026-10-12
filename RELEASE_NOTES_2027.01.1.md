@@ -2348,6 +2348,14 @@ when every configured destination is affected, it returns an error instead of
 an empty successful result. Readable backups on other destinations remain
 available in a partial listing.
 
+An incomplete destination contributes none of its backups, including the ones
+whose manifests read fine, because a listing that silently leaves out a backup
+is the problem this fixes. With a single destination, one manifest that cannot
+be parsed therefore makes `GET /api/v1/backup` answer 503 until it is repaired
+or removed. Retrying does not help in that case; the server log names the
+manifest (`Failed to parse manifest; target listing is incomplete`), and the
+other backups can still be fetched and restored by id.
+
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1138](https://github.com/Basekick-Labs/arc/pull/1138).
 
 ### A backup fails loudly when compaction recovery state cannot be copied ([#1100](https://github.com/Basekick-Labs/arc/issues/1100))

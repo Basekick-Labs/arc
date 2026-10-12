@@ -371,7 +371,10 @@ func (h *BackupHandler) ListBackups(c *fiber.Ctx) error {
 		// Reached only when EVERY target failed; a partial failure is a 200
 		// naming the unreachable ones.
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-			"error":   fmt.Sprintf("could not list backups: %s is unreachable or unreadable; retry, or check the destination configuration", describeTargets(targets)),
+			// Also reached when a destination answers but one of its
+			// manifests cannot be read or parsed (#1123): a retry does not fix
+			// that, and the server log names the manifest.
+			"error":   fmt.Sprintf("could not list backups: %s is unreachable, or holds a backup manifest that cannot be read (the server log names it); retry, or check the destination", describeTargets(targets)),
 			"target":  h.manager.TargetName(),
 			"targets": targets,
 		})
