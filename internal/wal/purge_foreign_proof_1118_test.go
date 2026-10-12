@@ -10,12 +10,16 @@ import (
 )
 
 // A checkpoint covering a row-range identity, or a whole-entry token from an
-// earlier writer instance, describes entries in a file recovery RETAINED. That
-// file is absent from w.fileOrder, so the purge walk cannot see it and cannot
-// stop at it — and the file holding the checkpoint is the only record that
-// those entries were flushed. Deleting it makes recovery replay rows that are
-// already in storage: permanent duplicates for a measurement without tags,
-// which is the hazard PurgeFlushed's own doc comment describes.
+// earlier writer instance, can describe entries in a file an earlier process
+// wrote and recovery RETAINED. That file is absent from w.fileOrder, so the
+// purge walk cannot see it and cannot stop at it — and the file holding the
+// checkpoint is the only record that those entries were flushed. Deleting it
+// makes recovery replay rows that are already in storage: permanent
+// duplicates for a measurement without tags, which is the hazard
+// PurgeFlushed's own doc comment describes.
+//
+// The pin holds only while such a file exists (#1222): each case plants one,
+// and checks that the pin lifts once it is gone.
 func TestPurgeFlushedPinsFilesHoldingForeignProof(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -53,6 +57,11 @@ func TestPurgeFlushedPinsFilesHoldingForeignProof(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
+			// A file an earlier process left, which recovery retained.
+			earlier := filepath.Join(dir, "arc-19700101_000000.000000000.wal")
+			if err := os.WriteFile(earlier, []byte("ARCW"), 0600); err != nil {
+				t.Fatal(err)
+			}
 			writer, err := NewWriter(&WriterConfig{
 				WALDir: dir, SyncMode: SyncModeFsync, MaxSizeBytes: 100 * 1024 * 1024, Logger: zerolog.Nop(),
 			})
@@ -87,6 +96,17 @@ func TestPurgeFlushedPinsFilesHoldingForeignProof(t *testing.T) {
 				}
 			} else if present && deleted == 0 {
 				t.Fatalf("a file holding only this process's own checkpoint was pinned; nothing would ever reclaim it")
+			}
+
+			// Recovery removes the earlier file: the proof vouches for nothing.
+			if err := os.Remove(earlier); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := writer.PurgeFlushed(writer.MinUnflushedSequence()); err != nil {
+				t.Fatalf("PurgeFlushed: %v", err)
+			}
+			if _, statErr := os.Stat(proofFile); !os.IsNotExist(statErr) {
+				t.Fatalf("the proof file outlived the earlier file it vouched for; the WAL is never reclaimed again (#1222): %v", statErr)
 			}
 		})
 	}
