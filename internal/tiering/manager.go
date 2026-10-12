@@ -697,7 +697,7 @@ func (m *Manager) TriggerFilteredMigration(ctx context.Context, fromTier, toTier
 	if m.roleGated() {
 		return 0, 0, ErrMigrationRoleGated
 	}
-	if !m.licenseClient.CanUseTieredStorage() {
+	if m.licenseClient != nil && !m.licenseClient.CanUseTieredStorage() {
 		return 0, 0, nil
 	}
 	if fromTier != TierHot || toTier != TierCold {
