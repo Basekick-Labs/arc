@@ -152,12 +152,27 @@ type Metrics struct {
 	walRecordsPreserved   atomic.Int64 // Records preserved in WAL for recovery (flush failures)
 	walRegisteredFloorLag atomic.Int64 // committed batches above the registered floor (#1207)
 	walCoverageLost       atomic.Int64 // batches that settled without a registered file (#1207)
-	walRecoveryTotal      atomic.Int64 // Successful WAL recovery operations
-	walRecoveryRecords    atomic.Int64 // Total records recovered from WAL
-	walDroppedEntries     atomic.Int64 // Entries dropped due to full WAL buffer
-	walFailedWrites       atomic.Int64 // Write failures to WAL file
-	walOversizedPayloads  atomic.Int64 // Payloads rejected for exceeding the single-entry cap even after chunking (#677)
-	walDirectoryBytes     atomic.Int64 // Current bytes occupied by every file in the WAL directory
+
+	// Origin stream and standby store (#1207 S3).
+	originStreamSessions     atomic.Int64 // standby sessions this primary is sending to
+	originStreamDropped      atomic.Int64 // batches not sent to a standby (its queue was full)
+	standbyStreamConnected   atomic.Int64 // 1 while this standby receives from its primary
+	standbyStreamEntries     atomic.Int64 // batches (or chunks) stored
+	standbyStreamGaps        atomic.Int64 // times a gap was found in what this standby holds
+	standbyStoreBytes        atomic.Int64
+	standbyStoreIncomplete   atomic.Int64 // keys with a known gap above the floor
+	standbyStoreTrimmedBytes atomic.Int64
+	standbyStoreDropped      atomic.Int64 // batches not stored: the store was at its cap
+	standbyStoreEvicted      atomic.Int64 // bytes of replaced primary instances evicted at the cap
+	standbyStoreLost         atomic.Int64 // batches held that the primary reported lost
+	standbyStoreBlocked      atomic.Int64 // keys whose trim waits on files not yet here
+	standbyStoreReplaced     atomic.Int64 // bytes held for replaced primary instances
+	walRecoveryTotal         atomic.Int64 // Successful WAL recovery operations
+	walRecoveryRecords       atomic.Int64 // Total records recovered from WAL
+	walDroppedEntries        atomic.Int64 // Entries dropped due to full WAL buffer
+	walFailedWrites          atomic.Int64 // Write failures to WAL file
+	walOversizedPayloads     atomic.Int64 // Payloads rejected for exceeding the single-entry cap even after chunking (#677)
+	walDirectoryBytes        atomic.Int64 // Current bytes occupied by every file in the WAL directory
 
 	// Cluster file registration outbox (#1209)
 	fileRegistrationsPending      atomic.Int64 // files flushed and not yet confirmed in the cluster manifest
@@ -561,7 +576,32 @@ func (m *Metrics) SetWALRegisteredFloorLag(n int64) { m.walRegisteredFloorLag.St
 
 // IncWALCoverageLost counts ingest batches that settled without being in a
 // registered file (#1207).
-func (m *Metrics) IncWALCoverageLost(n int64)        { m.walCoverageLost.Add(n) }
+func (m *Metrics) IncWALCoverageLost(n int64) { m.walCoverageLost.Add(n) }
+
+// Origin stream and standby store (#1207 S3).
+func (m *Metrics) SetOriginStreamSessions(n int64) { m.originStreamSessions.Store(n) }
+func (m *Metrics) IncOriginStreamDropped()         { m.originStreamDropped.Add(1) }
+func (m *Metrics) SetStandbyStreamConnected(c bool) {
+	if c {
+		m.standbyStreamConnected.Store(1)
+	} else {
+		m.standbyStreamConnected.Store(0)
+	}
+}
+func (m *Metrics) IncStandbyStreamEntries()            { m.standbyStreamEntries.Add(1) }
+func (m *Metrics) IncStandbyStreamGaps()               { m.standbyStreamGaps.Add(1) }
+func (m *Metrics) AddStandbyStoreTrimmedBytes(n int64) { m.standbyStoreTrimmedBytes.Add(n) }
+func (m *Metrics) IncStandbyStoreDropped()             { m.standbyStoreDropped.Add(1) }
+func (m *Metrics) AddStandbyStoreEvictedBytes(n int64) { m.standbyStoreEvicted.Add(n) }
+func (m *Metrics) SetStandbyStoreTrimState(lost, blocked, replacedBytes int64) {
+	m.standbyStoreLost.Store(lost)
+	m.standbyStoreBlocked.Store(blocked)
+	m.standbyStoreReplaced.Store(replacedBytes)
+}
+func (m *Metrics) SetStandbyStore(bytes, incomplete int64) {
+	m.standbyStoreBytes.Store(bytes)
+	m.standbyStoreIncomplete.Store(incomplete)
+}
 func (m *Metrics) IncWALRecoveryTotal()              { m.walRecoveryTotal.Add(1) }
 func (m *Metrics) IncWALRecoveryRecords(count int64) { m.walRecoveryRecords.Add(count) }
 func (m *Metrics) IncWALDroppedEntries()             { m.walDroppedEntries.Add(1) }
@@ -839,6 +879,19 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"wal_records_preserved":            m.walRecordsPreserved.Load(),
 		"wal_registered_floor_lag":         m.walRegisteredFloorLag.Load(),
 		"wal_coverage_lost":                m.walCoverageLost.Load(),
+		"origin_stream_sessions":           m.originStreamSessions.Load(),
+		"origin_stream_dropped":            m.originStreamDropped.Load(),
+		"standby_stream_connected":         m.standbyStreamConnected.Load(),
+		"standby_stream_entries":           m.standbyStreamEntries.Load(),
+		"standby_stream_gaps":              m.standbyStreamGaps.Load(),
+		"standby_store_bytes":              m.standbyStoreBytes.Load(),
+		"standby_store_incomplete_keys":    m.standbyStoreIncomplete.Load(),
+		"standby_store_trimmed_bytes":      m.standbyStoreTrimmedBytes.Load(),
+		"standby_store_dropped":            m.standbyStoreDropped.Load(),
+		"standby_store_evicted_bytes":      m.standbyStoreEvicted.Load(),
+		"standby_store_lost_records":       m.standbyStoreLost.Load(),
+		"standby_store_blocked_keys":       m.standbyStoreBlocked.Load(),
+		"standby_store_replaced_bytes":     m.standbyStoreReplaced.Load(),
 		"wal_recovery_total":               m.walRecoveryTotal.Load(),
 		"wal_recovery_records":             m.walRecoveryRecords.Load(),
 		"wal_dropped_entries":              m.walDroppedEntries.Load(),
@@ -1219,6 +1272,58 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_coverage_lost_total Ingest batches that settled without being in a registered file (WAL coverage only)\n"...)
 	b = append(b, "# TYPE arc_wal_coverage_lost_total counter\n"...)
 	b = appendMetric(b, "arc_wal_coverage_lost_total", float64(m.walCoverageLost.Load()))
+
+	b = append(b, "# HELP arc_origin_stream_sessions Standby writers this primary is streaming committed batches to\n"...)
+	b = append(b, "# TYPE arc_origin_stream_sessions gauge\n"...)
+	b = appendMetric(b, "arc_origin_stream_sessions", float64(m.originStreamSessions.Load()))
+
+	b = append(b, "# HELP arc_origin_stream_dropped_total Batches not sent to a standby because its send queue was full\n"...)
+	b = append(b, "# TYPE arc_origin_stream_dropped_total counter\n"...)
+	b = appendMetric(b, "arc_origin_stream_dropped_total", float64(m.originStreamDropped.Load()))
+
+	b = append(b, "# HELP arc_standby_stream_connected 1 while this standby writer receives from its primary\n"...)
+	b = append(b, "# TYPE arc_standby_stream_connected gauge\n"...)
+	b = appendMetric(b, "arc_standby_stream_connected", float64(m.standbyStreamConnected.Load()))
+
+	b = append(b, "# HELP arc_standby_stream_entries_total Batches stored by this standby writer\n"...)
+	b = append(b, "# TYPE arc_standby_stream_entries_total counter\n"...)
+	b = appendMetric(b, "arc_standby_stream_entries_total", float64(m.standbyStreamEntries.Load()))
+
+	b = append(b, "# HELP arc_standby_stream_gaps_total Gaps found in the batches this standby writer holds\n"...)
+	b = append(b, "# TYPE arc_standby_stream_gaps_total counter\n"...)
+	b = appendMetric(b, "arc_standby_stream_gaps_total", float64(m.standbyStreamGaps.Load()))
+
+	b = append(b, "# HELP arc_standby_store_bytes Bytes held in the standby store\n"...)
+	b = append(b, "# TYPE arc_standby_store_bytes gauge\n"...)
+	b = appendMetric(b, "arc_standby_store_bytes", float64(m.standbyStoreBytes.Load()))
+
+	b = append(b, "# HELP arc_standby_store_incomplete_keys Measurements with a gap in the standby store above the registered floor\n"...)
+	b = append(b, "# TYPE arc_standby_store_incomplete_keys gauge\n"...)
+	b = appendMetric(b, "arc_standby_store_incomplete_keys", float64(m.standbyStoreIncomplete.Load()))
+
+	b = append(b, "# HELP arc_standby_store_trimmed_bytes_total Bytes trimmed from the standby store\n"...)
+	b = append(b, "# TYPE arc_standby_store_trimmed_bytes_total counter\n"...)
+	b = appendMetric(b, "arc_standby_store_trimmed_bytes_total", float64(m.standbyStoreTrimmedBytes.Load()))
+
+	b = append(b, "# HELP arc_standby_store_dropped_total Batches not stored because the standby store was at its cap\n"...)
+	b = append(b, "# TYPE arc_standby_store_dropped_total counter\n"...)
+	b = appendMetric(b, "arc_standby_store_dropped_total", float64(m.standbyStoreDropped.Load()))
+
+	b = append(b, "# HELP arc_standby_store_evicted_bytes_total Bytes of replaced primary instances evicted from the standby store at its cap\n"...)
+	b = append(b, "# TYPE arc_standby_store_evicted_bytes_total counter\n"...)
+	b = appendMetric(b, "arc_standby_store_evicted_bytes_total", float64(m.standbyStoreEvicted.Load()))
+
+	b = append(b, "# HELP arc_standby_store_lost_records Batches held by this standby that the primary reported lost (kept: possibly the only copy)\n"...)
+	b = append(b, "# TYPE arc_standby_store_lost_records gauge\n"...)
+	b = appendMetric(b, "arc_standby_store_lost_records", float64(m.standbyStoreLost.Load()))
+
+	b = append(b, "# HELP arc_standby_store_blocked_keys Measurements whose trim waits on files not yet present on this standby\n"...)
+	b = append(b, "# TYPE arc_standby_store_blocked_keys gauge\n"...)
+	b = appendMetric(b, "arc_standby_store_blocked_keys", float64(m.standbyStoreBlocked.Load()))
+
+	b = append(b, "# HELP arc_standby_store_replaced_bytes Bytes held for primary instances that have since restarted\n"...)
+	b = append(b, "# TYPE arc_standby_store_replaced_bytes gauge\n"...)
+	b = appendMetric(b, "arc_standby_store_replaced_bytes", float64(m.standbyStoreReplaced.Load()))
 
 	b = append(b, "# HELP arc_wal_recovery_total Successful WAL recovery operations\n"...)
 	b = append(b, "# TYPE arc_wal_recovery_total counter\n"...)

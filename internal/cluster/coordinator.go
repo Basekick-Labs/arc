@@ -134,6 +134,7 @@ type Coordinator struct {
 	// ingestFence refuses live writes on a writer that may no longer be the
 	// primary (#1207); nil where it does not apply.
 	ingestFence          atomic.Pointer[ingestFence]
+	originStream         *originStream // #1207 S3; guarded by mu
 	ingestFenceListeners []func(fenced bool)
 	replicationReceiver  *replication.Receiver // Reader only: receives entries from writer
 	// replicationReceiverStopped is set by StopReplicationReceiver, which
@@ -850,6 +851,9 @@ func (c *Coordinator) Stop() error {
 		return nil
 	}
 	c.broadcastLeave()
+	// Before c.mu is taken: stopOriginStream takes it, and joins goroutines
+	// that read coordinator state.
+	c.stopOriginStream()
 
 	c.mu.Lock()
 	if !c.running || c.stopping {
@@ -1770,6 +1774,10 @@ func (c *Coordinator) handlePeerConnection(conn net.Conn) {
 	case protocol.MsgReplicateSync:
 		c.handleReplicateSync(conn, msg.Payload.(*protocol.ReplicateSync))
 		closeConn = false // Sender takes ownership
+
+	case protocol.MsgOriginStreamHello:
+		// The origin stream server owns the connection once it accepts.
+		closeConn = !c.handleOriginStreamHello(conn, msg.Payload.(*protocol.OriginStreamHello))
 
 	case protocol.MsgFetchFile:
 		// The fetch handler streams the body for the lifetime of the

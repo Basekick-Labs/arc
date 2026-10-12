@@ -58,7 +58,39 @@ const (
 	// to apply the forwarded command. Includes a success/error status so
 	// the caller can distinguish "applied" from "leader rejected".
 	MsgForwardApplyAck MessageType = 0x31
+
+	// Origin stream (#1207): a standby writer dials the primary and receives
+	// every ingest batch the primary commits, to keep a copy until the
+	// batch's files are registered. MsgOriginStreamHello opens it; the
+	// primary answers MsgOriginStreamHelloAck and then owns the connection
+	// (internal/cluster/originstream frames follow).
+	MsgOriginStreamHello    MessageType = 0x40
+	MsgOriginStreamHelloAck MessageType = 0x41
 )
+
+// OriginStreamHello is sent by a standby writer to open the origin stream.
+// HMAC: security.ComputeOriginStreamHelloHMAC.
+type OriginStreamHello struct {
+	// Version is the origin stream protocol the standby speaks; covered by
+	// the HMAC. The primary refuses one it does not speak.
+	Version     int    `json:"version"`
+	NodeID      string `json:"node_id"`
+	ClusterName string `json:"cluster_name"`
+	Nonce       string `json:"nonce"`
+	Timestamp   int64  `json:"timestamp"`
+	HMAC        string `json:"hmac"`
+}
+
+// OriginStreamHelloAck answers a hello. Error is set on refusal. Instance is
+// the primary's current WAL writer instance (hex). The HMAC binds the reply
+// to the hello's nonce: security.ComputeOriginStreamHelloAckHMAC.
+type OriginStreamHelloAck struct {
+	OriginNodeID string `json:"origin_node_id"`
+	Instance     string `json:"instance,omitempty"`
+	Error        string `json:"error,omitempty"`
+	Timestamp    int64  `json:"timestamp"`
+	HMAC         string `json:"hmac"`
+}
 
 // String returns the string representation of a message type.
 func (m MessageType) String() string {
@@ -75,6 +107,10 @@ func (m MessageType) String() string {
 		return "HeartbeatAck"
 	case MsgLeaveNotify:
 		return "LeaveNotify"
+	case MsgOriginStreamHello:
+		return "OriginStreamHello"
+	case MsgOriginStreamHelloAck:
+		return "OriginStreamHelloAck"
 	case MsgReplicateSync:
 		return "ReplicateSync"
 	case MsgReplicateSyncAck:

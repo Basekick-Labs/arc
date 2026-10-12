@@ -149,6 +149,10 @@ type outboxEntry struct {
 	// vanished: registered, then found gone from storage and taken back out
 	// of the manifest. Its rows are in no registered file.
 	vanished bool
+	// committed: the manifest accepted it, but this node's FSM had not
+	// applied it when the attempt ended. Not sent again; settled once this
+	// node sees it (#1207).
+	committed bool
 }
 
 // journalRecord is one journal line. ClusterName pins it to the cluster: a data
@@ -836,7 +840,7 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 	// written: it skips the storage checks, which on object storage are a
 	// request each. Anything older, or loaded from the journal, may have been
 	// deleted or rewritten while it waited.
-	var candidates, toCheck []*outboxEntry
+	var candidates, toCheck, waiting []*outboxEntry
 	r.mu.Lock()
 	checked := make(map[*outboxEntry]bool, len(batch))
 	for _, e := range batch {
@@ -849,9 +853,29 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 			settled = append(settled, e) // already announced
 			continue
 		}
+		if e.committed {
+			waiting = append(waiting, e) // committed; waiting for this FSM
+			continue
+		}
 		candidates = append(candidates, e)
 		if checked[e] {
 			toCheck = append(toCheck, e)
+		}
+	}
+	// A committed file this FSM still does not show after a successful
+	// barrier was committed and then removed (compaction or a DELETE got to
+	// it first): it was registered, so it settles as such.
+	if len(waiting) > 0 {
+		bctx, cancel := context.WithTimeout(ctx, outboxAttemptTimeout)
+		berr := manifest.SyncManifest(bctx)
+		cancel()
+		for _, e := range waiting {
+			if _, ok := manifest.GetFileEntry(e.rec.Path); ok || berr == nil {
+				r.markInManifest(e)
+				settled = append(settled, e)
+			} else {
+				deferred = append(deferred, e)
+			}
 		}
 	}
 	sizes, statErrs := r.statAll(ctx, store, toCheck)
@@ -933,6 +957,26 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 					cancel()
 				}
 			}
+			// A covered file settles as registered only once this node's
+			// FSM has applied the registration: the floors that settle
+			// advances are published with this node's applied index, and a
+			// standby trusts every file below it to be in its own FSM
+			// (#1207). A forwarded commit returns before this node applies
+			// it. Uncovered files keep settling at once.
+			if anyCovered(sent) {
+				bctx, cancel := context.WithTimeout(ctx, outboxAttemptTimeout)
+				berr := manifest.SyncManifest(bctx)
+				cancel()
+				if berr != nil {
+					r.mu.Lock()
+					for _, e := range sent {
+						e.committed = true
+					}
+					r.mu.Unlock()
+					r.requeue(sent)
+					sent = nil
+				}
+			}
 			settled = append(settled, sent...)
 		}
 	}
@@ -940,6 +984,15 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 		r.ack(settled)
 	}
 	return len(settled) > 0, applyErr
+}
+
+func anyCovered(entries []*outboxEntry) bool {
+	for _, e := range entries {
+		if e.rec.Cov != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *RegistrationOutbox) markInManifest(e *outboxEntry) {

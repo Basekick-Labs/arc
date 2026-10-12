@@ -5,13 +5,16 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/rs/zerolog"
 )
@@ -239,5 +242,84 @@ func TestOutboxSecondAddToAPathSettlesTheFirstLost(t *testing.T) {
 	}
 	if got := second.outcomes(outPathA); len(got) != 0 {
 		t.Fatalf("the current registration settled early: %v", got)
+	}
+}
+
+// laggingManifest commits like the leader would, but this node's FSM does not
+// show the commit (and the barrier fails) until caughtUp is set.
+type laggingManifest struct {
+	*fakeOutboxManifest
+	caughtUp atomic.Bool
+	syncs    atomic.Int64
+}
+
+func (m *laggingManifest) GetFileEntry(path string) (*raft.FileEntry, bool) {
+	if !m.caughtUp.Load() {
+		return nil, false
+	}
+	return m.fakeOutboxManifest.GetFileEntry(path)
+}
+
+// SyncManifest: the outbox's start-up catch-up (the first call) succeeds;
+// barriers after a commit fail until caughtUp.
+func (m *laggingManifest) SyncManifest(context.Context) error {
+	if m.syncs.Add(1) == 1 || m.caughtUp.Load() {
+		return nil
+	}
+	return errors.New("barrier timed out")
+}
+
+// A covered file settles as registered only once this node's FSM shows it:
+// the floors it advances are published with this node's applied index
+// (#1207 S3). It is not sent again meanwhile.
+func TestOutboxCoveredSettlesOnlyOnceVisibleHere(t *testing.T) {
+	r := newTestOutbox(t, t.TempDir())
+	l := &settleLog{}
+	registerCovered(r, outPathA, 10, testCov(l))
+	m := &laggingManifest{fakeOutboxManifest: newFakeOutboxManifest()}
+	r.HandOff(m, &fakeOutboxStorage{sizes: map[string]int64{outPathA: 10}}, "writer-1")
+	// The commit's barrier fails; the file is then only re-checked against
+	// this node's FSM, never sent again.
+	waitOutbox(t, "the post-commit barrier", func() bool { return m.syncs.Load() >= 2 })
+	time.Sleep(100 * time.Millisecond) // several retry rounds at the test backoff
+	if got := l.outcomes(outPathA); len(got) != 0 {
+		t.Fatalf("settled %v before this node applied the registration", got)
+	}
+	if n := len(m.batchLog()); n != 1 {
+		t.Fatalf("committed file sent %d times, want once", n)
+	}
+	m.caughtUp.Store(true)
+	if got := l.wait(t, outPathA); got != ingest.CoverageRegistered {
+		t.Fatalf("outcome = %v, want registered", got)
+	}
+}
+
+// Uncovered files keep settling at once, without the barrier.
+func TestOutboxUncoveredSkipsTheBarrier(t *testing.T) {
+	r := newTestOutbox(t, t.TempDir())
+	register(r, outPathA, 10)
+	m := &laggingManifest{fakeOutboxManifest: newFakeOutboxManifest()}
+	r.HandOff(m, &fakeOutboxStorage{sizes: map[string]int64{outPathA: 10}}, "writer-1")
+	waitOutbox(t, "settled", func() bool { return r.Pending() == 0 })
+	if n := m.syncs.Load(); n != 1 {
+		t.Fatalf("barriers = %d, want only the start-up catch-up", n)
+	}
+}
+
+// A committed file that compaction or a DELETE removed before this node
+// caught up settles once a barrier succeeds: it was registered.
+func TestOutboxCommittedThenRemovedSettles(t *testing.T) {
+	r := newTestOutbox(t, t.TempDir())
+	l := &settleLog{}
+	registerCovered(r, outPathA, 10, testCov(l))
+	m := &laggingManifest{fakeOutboxManifest: newFakeOutboxManifest()}
+	r.HandOff(m, &fakeOutboxStorage{sizes: map[string]int64{outPathA: 10}}, "writer-1")
+	waitOutbox(t, "the post-commit barrier", func() bool { return m.syncs.Load() >= 2 })
+	m.mu.Lock()
+	delete(m.registered, outPathA) // compacted away before this FSM saw it
+	m.mu.Unlock()
+	m.caughtUp.Store(true)
+	if got := l.wait(t, outPathA); got != ingest.CoverageRegistered {
+		t.Fatalf("outcome = %v, want registered", got)
 	}
 }

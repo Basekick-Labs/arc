@@ -810,6 +810,14 @@ type ClusterConfig struct {
 	// with it on cannot be replayed by an Arc older than the release that
 	// introduced it.
 	WALCoverage bool
+	// StandbyStoreMaxBytes caps the copy a standby writer keeps of what its
+	// primary streams, with WALCoverage on (#1207). Past it the standby stores
+	// nothing until trimming frees room.
+	StandbyStoreMaxBytes int64
+	// OriginStreamQueueBytes caps what a primary holds in memory for one
+	// standby writer that is not keeping up; past it that standby misses
+	// batches (a gap in its copy).
+	OriginStreamQueueBytes int64
 
 	// Cluster security (Enterprise)
 	SharedSecret string // Shared secret for join authentication (HMAC-SHA256). All nodes must share the same value.
@@ -1165,20 +1173,22 @@ func Load() (*Config, error) {
 			RecheckConcurrency:        v.GetInt("reconciliation.recheck_concurrency"),
 		},
 		Cluster: ClusterConfig{
-			Enabled:             v.GetBool("cluster.enabled"),
-			NodeID:              v.GetString("cluster.node_id"),
-			Role:                v.GetString("cluster.role"),
-			ClusterName:         v.GetString("cluster.cluster_name"),
-			Seeds:               parseStringSlice(v.GetString("cluster.seeds")),
-			CoordinatorAddr:     v.GetString("cluster.coordinator_addr"),
-			AdvertiseAddr:       v.GetString("cluster.advertise_addr"),
-			HealthCheckInterval: v.GetInt("cluster.health_check_interval"),
-			IngestFenceAfterMs:  v.GetInt("cluster.ingest_fence_after_ms"),
-			WALCoverage:         v.GetBool("cluster.wal_coverage"),
-			HealthCheckTimeout:  v.GetInt("cluster.health_check_timeout"),
-			UnhealthyThreshold:  v.GetInt("cluster.unhealthy_threshold"),
-			HeartbeatInterval:   v.GetInt("cluster.heartbeat_interval"),
-			HeartbeatTimeout:    v.GetInt("cluster.heartbeat_timeout"),
+			Enabled:                v.GetBool("cluster.enabled"),
+			NodeID:                 v.GetString("cluster.node_id"),
+			Role:                   v.GetString("cluster.role"),
+			ClusterName:            v.GetString("cluster.cluster_name"),
+			Seeds:                  parseStringSlice(v.GetString("cluster.seeds")),
+			CoordinatorAddr:        v.GetString("cluster.coordinator_addr"),
+			AdvertiseAddr:          v.GetString("cluster.advertise_addr"),
+			HealthCheckInterval:    v.GetInt("cluster.health_check_interval"),
+			IngestFenceAfterMs:     v.GetInt("cluster.ingest_fence_after_ms"),
+			WALCoverage:            v.GetBool("cluster.wal_coverage"),
+			StandbyStoreMaxBytes:   v.GetInt64("cluster.standby_store_max_bytes"),
+			OriginStreamQueueBytes: v.GetInt64("cluster.origin_stream_queue_bytes"),
+			HealthCheckTimeout:     v.GetInt("cluster.health_check_timeout"),
+			UnhealthyThreshold:     v.GetInt("cluster.unhealthy_threshold"),
+			HeartbeatInterval:      v.GetInt("cluster.heartbeat_interval"),
+			HeartbeatTimeout:       v.GetInt("cluster.heartbeat_timeout"),
 			// Raft configuration
 			RaftDataDir:           v.GetString("cluster.raft_data_dir"),
 			RaftBindAddr:          v.GetString("cluster.raft_bind_addr"),
@@ -2012,6 +2022,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.failover_cooldown", 60)    // 60 second cooldown between failovers
 	v.SetDefault("cluster.ingest_fence_after_ms", 0) // 0 = derived from failover detection (#1207)
 	v.SetDefault("cluster.wal_coverage", false)      // experimental (#1207); see Cluster.WALCoverage
+	v.SetDefault("cluster.standby_store_max_bytes", int64(1<<30))
+	v.SetDefault("cluster.origin_stream_queue_bytes", int64(64<<20))
 
 	// Cluster security defaults
 	v.SetDefault("cluster.shared_secret", "")

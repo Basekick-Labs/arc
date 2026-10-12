@@ -481,3 +481,69 @@ func ValidateReplicationCheckpointHMAC(sharedSecret, nonce, senderNodeID, cluste
 	}
 	return nil
 }
+
+// ComputeOriginStreamHelloHMAC authenticates a standby writer opening the
+// origin stream (#1207). Its own label, so no other cluster MAC replays here.
+//
+// Format: "origin-stream-hello" \x00 version \x00 nonce \x00 nodeID \x00 clusterName \x00 timestamp
+func ComputeOriginStreamHelloHMAC(sharedSecret string, version int, nonce, nodeID, clusterName string, timestamp int64) string {
+	return hex.EncodeToString(computeRawHMAC(sharedSecret, originHelloMessage(version, nonce, nodeID, clusterName, timestamp)))
+}
+
+func originHelloMessage(version int, nonce, nodeID, clusterName string, timestamp int64) string {
+	return fmt.Sprintf("origin-stream-hello\x00%d\x00%s\x00%s\x00%s\x00%d", version, nonce, nodeID, clusterName, timestamp)
+}
+
+// ValidateOriginStreamHelloHMAC checks a hello's MAC and freshness.
+func ValidateOriginStreamHelloHMAC(sharedSecret string, version int, nonce, nodeID, clusterName string, timestamp int64, receivedMAC string, tolerance time.Duration) error {
+	if err := checkHMACTimestamp("origin-stream-hello", timestamp, tolerance); err != nil {
+		return err
+	}
+	expected := computeRawHMAC(sharedSecret, originHelloMessage(version, nonce, nodeID, clusterName, timestamp))
+	if !constantTimeHexEqual(expected, receivedMAC) {
+		return fmt.Errorf("origin-stream-hello HMAC validation failed: shared secret mismatch or malformed MAC")
+	}
+	return nil
+}
+
+// ComputeOriginStreamHelloAckHMAC authenticates the primary's answer, bound
+// to the hello's nonce so a recorded answer cannot be replayed to a new hello.
+//
+// Format: "origin-stream-hello-ack" \x00 helloNonce \x00 originNodeID \x00 instance \x00 error \x00 timestamp
+func ComputeOriginStreamHelloAckHMAC(sharedSecret, helloNonce, originNodeID, instance, errText string, timestamp int64) string {
+	return hex.EncodeToString(computeRawHMAC(sharedSecret, fmt.Sprintf("origin-stream-hello-ack\x00%s\x00%s\x00%s\x00%s\x00%d", helloNonce, originNodeID, instance, errText, timestamp)))
+}
+
+// ValidateOriginStreamHelloAckHMAC checks the primary's answer.
+func ValidateOriginStreamHelloAckHMAC(sharedSecret, helloNonce, originNodeID, instance, errText string, timestamp int64, receivedMAC string, tolerance time.Duration) error {
+	if err := checkHMACTimestamp("origin-stream-hello-ack", timestamp, tolerance); err != nil {
+		return err
+	}
+	expected := computeRawHMAC(sharedSecret, fmt.Sprintf("origin-stream-hello-ack\x00%s\x00%s\x00%s\x00%s\x00%d", helloNonce, originNodeID, instance, errText, timestamp))
+	if !constantTimeHexEqual(expected, receivedMAC) {
+		return fmt.Errorf("origin-stream-hello-ack HMAC validation failed: shared secret mismatch or malformed MAC")
+	}
+	return nil
+}
+
+// DeriveOriginStreamSessionKey derives the origin stream's per-connection key
+// from the shared secret and the hello nonce. A different HKDF info string
+// from the replication session, so the two keys never coincide.
+func DeriveOriginStreamSessionKey(sharedSecret, helloNonce string) ([]byte, error) {
+	key, err := hkdf.Key(sha256.New, []byte(sharedSecret), []byte(helloNonce), "arc-origin-stream-session:", 32)
+	if err != nil {
+		return nil, fmt.Errorf("derive origin stream session key: %w", err)
+	}
+	return key, nil
+}
+
+func checkHMACTimestamp(label string, timestamp int64, tolerance time.Duration) error {
+	drift := time.Now().Unix() - timestamp
+	if drift < 0 {
+		drift = -drift
+	}
+	if drift > int64(tolerance.Seconds()) {
+		return fmt.Errorf("%s auth timestamp expired or out of tolerance (drift: %ds, tolerance: %ds)", label, drift, int64(tolerance.Seconds()))
+	}
+	return nil
+}
