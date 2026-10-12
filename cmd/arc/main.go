@@ -1042,6 +1042,11 @@ func main() {
 	registrationOutbox := newRegistrationOutbox(cfg, licenseHasClustering(licenseClient), logger.Get("file-registrar"))
 	if registrationOutbox != nil {
 		arrowBuffer.SetFileRegistrar(registrationOutbox)
+		// Refused registrations are parked out of the query path (#1207
+		// S4b); a move a crash interrupted is finished here.
+		if lb, ok := storageBackend.(*storage.LocalBackend); ok {
+			registrationOutbox.SetLocalParking(cluster.LocalParking{Base: lb.GetBasePath()})
+		}
 	}
 	enableWALCoverage(cfg, arrowBuffer, walWriter, registrationOutbox, logger.Get("arrow"))
 	// The registration hold (#1207 S4c): WAL entries of a covered batch stay
@@ -2122,6 +2127,33 @@ func main() {
 					// coverage actually took effect on this node (#1207).
 					_, _, coverageActive := arrowBuffer.RegistrationProgress()
 					clusterCoordinator.SetWALCoverageActive(coverageActive)
+					// Stream takeover, origin side (#1207 S4b): announce this
+					// writer instance, and hold writes and registrations until
+					// it is, once the cluster has takeover on.
+					if cfg.Cluster.StreamTakeover && coverageActive && registrationOutbox != nil && walWriter != nil {
+						base := ""
+						if lb, ok := storageBackend.(*storage.LocalBackend); ok {
+							base = lb.GetBasePath()
+						}
+						walDir := cfg.WAL.Directory
+						walLog := logger.Get("wal")
+						clusterCoordinator.SetTakeoverOrigin(cluster.TakeoverOrigin{
+							Instance:    walWriter.TrackedInstance(),
+							WALDir:      walDir,
+							JournalDir:  cfg.Cluster.RaftDataDir,
+							StorageBase: base,
+							Holds: func() ([]uint64, error) {
+								onDisk, err := wal.InstancesOnDisk(walDir, walWriter.CurrentFile(), walLog)
+								if err != nil {
+									return nil, err
+								}
+								return append(registrationOutbox.Instances(), onDisk...), nil
+							},
+							Progress:    arrowBuffer.AccountedProgress,
+							SentCovered: func() bool { return registrationOutbox.CoveredSent() > 0 },
+						})
+						registrationOutbox.SetSendGate(clusterCoordinator.TakeoverSendGate())
+					}
 					if err := clusterCoordinator.Start(); err != nil {
 						log.Error().Err(err).Msg("Failed to start cluster coordinator - running in standalone mode")
 						arrowBuffer.SetIngestGate(nil)
@@ -4580,6 +4612,10 @@ func main() {
 
 		// Wire tiering manager to arrow buffer for automatic file registration
 		arrowBuffer.SetTieringManager(tieringManager)
+		if registrationOutbox != nil {
+			// Parked refused files leave the tiering metadata (#1207 S4b).
+			registrationOutbox.SetParkingTieringDrop(tieringManager.DeleteFile)
+		}
 		log.Info().Msg("Tiering manager wired to arrow buffer for auto-registration")
 
 		// The cluster layer's tier recorder is wired where the manager is

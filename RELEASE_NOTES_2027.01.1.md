@@ -319,6 +319,18 @@ release:
 - The cluster manifest has the rules that will refuse a second copy of a
   batch, and the origin's copy of batches a standby took over.
 
+- A refused registration will be parked rather than left in place: the file
+  moves out of every query path to `<storage>/_refused/`, its WAL entries stay
+  held, and it is deleted only once each of its rows is in a registered file
+  this node holds. A DELETE that touches a parked file is refused (retry later).
+  Records live in `refused-registrations.jsonl` next to the registration
+  journal. Metrics: `arc_wal_parked_files`, `arc_wal_parked_bytes`.
+- Writers with the setting on will announce each process to the cluster before
+  accepting writes, once takeover is on: until the announcement applies, writes
+  get a retryable 503. Each writer records its last process in
+  `instance.last` files in the WAL directory, the Raft data directory and
+  `<storage>/_instances/`.
+
 Nothing turns takeover on in this release.
 
 **Rollback warning.** WAL entries written with the setting on use a new format.

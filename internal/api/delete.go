@@ -1156,6 +1156,11 @@ func (h *DeleteHandler) replaceManifestAfterRewrite(ctx context.Context, oldPath
 		case cluster.ReplaceRegistered:
 			// Confirmed while we looked; this node's FSM may not show it yet.
 			existing, ok = &entry, true
+		case cluster.ReplaceParked:
+			// Refused and parked while we looked (#1207): the rewrite must
+			// not be announced in its place.
+			cleanupRewrite()
+			return errors.Join(errManifestFailure, cluster.ErrRegistrationParked)
 		}
 	}
 	if !ok {

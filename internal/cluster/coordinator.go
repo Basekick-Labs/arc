@@ -143,6 +143,10 @@ type Coordinator struct {
 	streamClaimsBlockers atomic.Pointer[[]string]
 	walCoverageActive    atomic.Bool // SetWALCoverageActive
 	ingestFenceListeners []func(fenced bool)
+	takeoverOrigin       atomic.Pointer[takeoverOriginState] // SetTakeoverOrigin (#1207 S4b)
+	pauseNotifyMu        sync.Mutex                          // ingestPauseChanged
+	pauseNotified        bool
+	pauseState           bool
 	replicationReceiver  *replication.Receiver // Reader only: receives entries from writer
 	// replicationReceiverStopped is set by StopReplicationReceiver, which
 	// runs from a shutdown hook without cancelling ctx; the retarget loop
@@ -745,6 +749,9 @@ func (c *Coordinator) Start() error {
 	// Refuse writes on a writer that may no longer be the primary (#1207).
 	c.startIngestFenceLocked()
 	go c.streamClaimsMetricsLoop(c.ctx)
+	if c.cfg.StreamTakeover && c.raftNode != nil && c.takeoverOrigin.Load() != nil {
+		go c.streamTakeoverOriginLoop(c.ctx)
+	}
 
 	// Start compactor failover manager if configured (Phase 5)
 	if c.compactorFailoverMgr != nil {

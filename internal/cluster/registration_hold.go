@@ -56,12 +56,52 @@ func (h coverageHold) merge() {
 }
 
 // CoverageHold returns the current hold. Cheap when nothing changed since the
-// last call; rebuilt from the pending entries otherwise.
+// last call; rebuilt from the pending and parked entries otherwise.
 func (r *RegistrationOutbox) CoverageHold() wal.CoverageHold {
+	return r.coverageHold(0)
+}
+
+func (r *RegistrationOutbox) coverageHold(retry int) wal.CoverageHold {
+	r.mu.Lock()
+	tk := r.takeover
+	r.mu.Unlock()
+	var tkGen uint64
+	if tk != nil {
+		tkGen = tk.TakeoverGeneration()
+	}
+	r.mu.Lock()
+	if r.hold != nil && r.holdBuiltGen == r.holdGen && r.holdBuiltSynced == r.synced && r.holdBuiltTk == tkGen {
+		h := r.hold
+		r.mu.Unlock()
+		return h
+	}
+	gen := r.holdGen
+	var parked []journalRecord
+	for _, e := range r.parked {
+		parked = append(parked, e.rec.Rec)
+	}
+	r.mu.Unlock()
+	// Outside the lock: it reads the cluster manifest.
+	var parkedSpans [][]ingest.CoverageRange
+	var parkedKeys []string
+	for _, rec := range parked {
+		parkedSpans = append(parkedSpans, parkedHoldSpans(rec, tk))
+		key := ""
+		if rec.Cov != nil {
+			key = rec.Cov.Key
+		}
+		parkedKeys = append(parkedKeys, key)
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.hold != nil && r.holdBuiltGen == r.holdGen && r.holdBuiltSynced == r.synced {
-		return r.hold
+	if r.holdGen != gen && retry < 3 {
+		// A file was parked or settled while the manifest was read: one
+		// that left byPath meanwhile would be in neither view. Rebuild.
+		r.mu.Unlock()
+		h := r.coverageHold(retry + 1)
+		r.mu.Lock()
+		return h
 	}
 	h := coverageHold{}
 	seen := map[*ingest.GroupCoverage]bool{} // a group's files share one coverage
@@ -84,8 +124,13 @@ func (r *RegistrationOutbox) CoverageHold() wal.CoverageHold {
 	for _, e := range r.unsyncedAcks {
 		addEntry(e)
 	}
+	for i, spans := range parkedSpans {
+		for _, s := range spans {
+			h.add(s.Instance, parkedKeys[i], s.Lo, s.Hi)
+		}
+	}
 	h.merge()
-	r.hold, r.holdBuiltGen, r.holdBuiltSynced = h, r.holdGen, r.synced
+	r.hold, r.holdBuiltGen, r.holdBuiltSynced, r.holdBuiltTk = h, gen, r.synced, tkGen
 	return h
 }
 

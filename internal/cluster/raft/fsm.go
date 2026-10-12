@@ -1049,16 +1049,22 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 	case CommandTakeOverStream:
 		return f.applyTakeOverStream(cmd.Payload)
 	case CommandAnnounceInstance:
+		defer f.bumpTakeoverGen()
 		return f.applyAnnounceInstance(cmd.Payload, log.Index)
 	case CommandSettleCoverage:
+		defer f.bumpTakeoverGen()
 		return f.applySettleCoverage(cmd.Payload)
 	case CommandTakeOverStreamV2:
+		defer f.bumpTakeoverGen()
 		return f.applyTakeOverStreamV2(cmd.Payload, log.Index)
 	case CommandClaimDone:
+		defer f.bumpTakeoverGen()
 		return f.applyClaimDone(cmd.Payload)
 	case CommandReleaseStreamClaim:
+		defer f.bumpTakeoverGen()
 		return f.applyReleaseStreamClaim(cmd.Payload)
 	case CommandInstanceSettled:
+		defer f.bumpTakeoverGen()
 		return f.applyInstanceSettled(cmd.Payload)
 	case CommandDeleteFile:
 		return f.applyDeleteFile(cmd.Payload)
@@ -2858,11 +2864,13 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		(restoredPause.Active && prevPause.Generation != restoredPause.Generation)
 	f.compactionPause = restoredPause
 	// Stream claims: absent from an older snapshot, which means off.
+	prevGen := f.takeover.gen
 	f.streamClaims, f.takeover = false, newTakeoverState()
 	if sc := snapshot.StreamClaims; sc != nil {
 		f.streamClaims = sc.Enabled
 		f.takeover = restoreTakeover(sc.Takeover)
 	}
+	f.takeover.gen = prevGen + 1
 	onCompactionPauseChanged := f.onCompactionPauseChanged
 	f.nodes = restoredNodes
 	f.barriers = restoredBarriers

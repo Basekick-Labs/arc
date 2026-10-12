@@ -257,7 +257,10 @@ func (c *Coordinator) startIngestFenceLocked() {
 		lastContact: c.raftNode.LastContact,
 		catchUp:     c.SyncManifest,
 	}
-	f.onChange = append(f.onChange, c.ingestFenceListeners...)
+	// Listeners hear the combined state (fence or takeover gate), in order.
+	if len(c.ingestFenceListeners) > 0 {
+		f.onChange = append(f.onChange, func(bool) { c.ingestPauseChanged() })
+	}
 	// Decide before publishing, so the fence never starts open on a node that
 	// should be refusing. evaluate takes no coordinator lock.
 	f.evaluate()
@@ -282,6 +285,9 @@ func (c *Coordinator) startIngestFenceLocked() {
 // It admits everything until (and unless) the fence starts. Lock-free.
 func (c *Coordinator) IngestGate() func() error {
 	return func() error {
+		if c.takeoverGateClosed() {
+			return fmt.Errorf("%w: %v", ingest.ErrIngestFenced, errTakeoverAnnouncing)
+		}
 		if f := c.ingestFence.Load(); f != nil {
 			return f.gate()
 		}
