@@ -1,8 +1,10 @@
 package wal
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -24,6 +26,10 @@ type Reader struct {
 	// TruncatedEntries counts incomplete entries at EOF after an interrupted
 	// append. These are not corrupt complete entries and cannot be replayed.
 	TruncatedEntries int64
+	// UndecodableEntries counts intact entries whose payload this build
+	// cannot decode. They are returned with DecodeErr set, and are included
+	// in TotalEntries.
+	UndecodableEntries int64
 }
 
 // NewReader creates a new WAL reader
@@ -42,6 +48,10 @@ type Entry struct {
 	Records          []map[string]interface{} // Row format (from Append path)
 	ColumnarData     *ColumnarEntry           // Columnar format (from AppendRaw path)
 	Coverage         *Coverage                // Ingest batch coverage, for a covered (0x04) entry (#1207)
+	// DecodeErr is set for an entry whose bytes are intact (checksum valid)
+	// but whose payload this build cannot decode. Its identity is still known,
+	// so recovery can tell whether it was already flushed (#1225).
+	DecodeErr error
 }
 
 // ColumnarEntry represents a columnar WAL entry written via the zero-copy path
@@ -92,11 +102,17 @@ func (r *Reader) ReadAll() ([]Entry, error) {
 			break
 		}
 		if err != nil {
-			r.logger.Warn().Err(err).Msg("Skipping incomplete WAL entry")
+			r.logger.Warn().Err(err).Msg("Skipping unreadable WAL entry")
 			r.CorruptedEntries++
 			continue
 		}
 
+		if entry.DecodeErr != nil {
+			r.UndecodableEntries++
+			// Debug: recovery skips it when it was flushed, and logs it
+			// at Error when it was not.
+			r.logger.Debug().Err(entry.DecodeErr).Str("payload_hash", entry.PayloadHash).Msg("WAL entry payload cannot be decoded")
+		}
 		entries = append(entries, *entry)
 		r.TotalEntries++
 	}
@@ -110,6 +126,66 @@ func (r *Reader) ReadAll() ([]Entry, error) {
 		Msg("WAL read complete")
 
 	return entries, nil
+}
+
+// ReadTrackedIdentities returns the identity tokens of the intact tracked
+// (0x03) and covered (0x04) entries of a WAL file, without decoding their
+// payloads (#1225). A damaged entry is counted in CorruptedEntries and
+// skipped; a torn tail ends the scan.
+func (r *Reader) ReadTrackedIdentities() ([]string, error) {
+	f, err := os.Open(r.filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open WAL file: %w", err)
+	}
+	defer f.Close()
+	var header [WALFileHeaderSize]byte
+	if _, err := io.ReadFull(f, header[:]); err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to read WAL file header: %w", err)
+	}
+	if !bytes.Equal(header[0:4], WALMagic) {
+		return nil, fmt.Errorf("invalid WAL magic bytes")
+	}
+	var ids []string
+	rd := bufio.NewReaderSize(f, 1<<20)
+	for {
+		var entryHeader [WALEntryHeaderSize]byte
+		if _, err := io.ReadFull(rd, entryHeader[:]); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return ids, nil
+			}
+			return ids, fmt.Errorf("failed to read WAL entry header: %w", err)
+		}
+		payloadLen := binary.BigEndian.Uint32(entryHeader[0:4])
+		if payloadLen > MaxWALPayloadSize {
+			// The length cannot be trusted, so nothing after it can be found.
+			r.CorruptedEntries++
+			return ids, nil
+		}
+		payload := make([]byte, payloadLen)
+		if _, err := io.ReadFull(rd, payload); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return ids, nil
+			}
+			return ids, fmt.Errorf("failed to read WAL payload: %w", err)
+		}
+		if crc32.ChecksumIEEE(payload) != binary.BigEndian.Uint32(entryHeader[12:16]) {
+			r.CorruptedEntries++
+			continue
+		}
+		switch {
+		case len(payload) >= 17 && payload[0] == WALTrackedMarker:
+			ids = append(ids, fmt.Sprintf("%016x%016x", binary.BigEndian.Uint64(payload[1:9]), binary.BigEndian.Uint64(payload[9:17])))
+		case len(payload) > 0 && payload[0] == WALCoveredMarker:
+			if token, _, _, err := parseCoveredPayload(payload); err == nil {
+				ids = append(ids, token)
+			} else {
+				r.CorruptedEntries++
+			}
+		}
+	}
 }
 
 // ReadCheckpointHashes scans a WAL file for flush checkpoints without
@@ -317,12 +393,33 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 		}
 	}
 
-	return nil, fmt.Errorf("failed to deserialize: unrecognized WAL entry format")
+	return &Entry{
+		TimestampUS: timestampUS,
+		PayloadHash: payloadHashValue,
+		Coverage:    coverage,
+		DecodeErr:   errors.New("unrecognized WAL entry format"),
+	}, nil
+}
+
+// MeasurementName reads the "m" of a columnar payload the way ingest does
+// (ingest.extractMeasurement): a string as is, an integer as
+// "measurement_<n>". The WAL keeps the payload the client sent, so a reader
+// that accepted only a string failed every entry written with an integer
+// measurement (#1225).
+func MeasurementName(m interface{}) (string, bool) {
+	switch v := m.(type) {
+	case string:
+		return v, true
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return fmt.Sprintf("measurement_%v", v), true
+	default:
+		return "", false
+	}
 }
 
 // parseColumnarEntry extracts measurement and columns from a raw msgpack map
 func parseColumnarEntry(rawMap map[string]interface{}) *ColumnarEntry {
-	m, ok := rawMap["m"].(string)
+	m, ok := MeasurementName(rawMap["m"])
 	if !ok {
 		return nil
 	}

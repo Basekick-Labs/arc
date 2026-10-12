@@ -1052,6 +1052,15 @@ func main() {
 	if walWriter != nil && walHold != nil {
 		walWriter.SetCoverageHold(walHold)
 	}
+	// A file recovery quarantines no longer holds replayable entries: the
+	// writer stops waiting for those of this process (#1225). Only the
+	// periodic pass can quarantine a file this process wrote; at startup
+	// every file is an earlier one and this only forgets the path.
+	walQuarantined := func(path, quarantinedAs string) {
+		if walWriter != nil {
+			walWriter.Quarantined(path, quarantinedAs)
+		}
+	}
 	// Bound ArrowBuffer.Close, which now WAITS for flushes in progress instead
 	// of cancelling them (#1007).
 	//
@@ -1230,6 +1239,7 @@ func main() {
 			BarrierBatchRows:    cfg.Ingest.MaxBufferSize,
 			MaxReplayFailures:   3,
 			Held:                walHold,
+			OnQuarantine:        walQuarantined,
 		})
 		recoveryNeedsRetry := err != nil
 		if err != nil {
@@ -1248,9 +1258,6 @@ func main() {
 					Int("retained", len(recoveryStats.Retained)).
 					Dur("duration", recoveryStats.RecoveryDuration).
 					Msg("WAL recovery complete")
-			}
-			for i := 0; i < recoveryStats.QuarantinedFiles; i++ {
-				metrics.Get().IncWALQuarantinedFiles()
 			}
 			if recoveryStats.KeptFiles > 0 || recoveryStats.BarrierFailures > 0 {
 				recoveryNeedsRetry = true
@@ -1388,6 +1395,7 @@ func main() {
 							BarrierBatchRows:           cfg.Ingest.MaxBufferSize,
 							MaxReplayFailures:          3,
 							Held:                       walHold,
+							OnQuarantine:               walQuarantined,
 						})
 						if walWriter != nil && stats != nil {
 							walWriter.AdoptRetained(stats.Retained)
@@ -1409,9 +1417,6 @@ func main() {
 									Int("kept_files", stats.KeptFiles).
 									Int("barrier_failures", stats.BarrierFailures).
 									Msg("WAL recovery after flush failure complete")
-							}
-							for i := 0; i < stats.QuarantinedFiles; i++ {
-								metrics.Get().IncWALQuarantinedFiles()
 							}
 							if stats.KeptFiles == 0 && stats.BarrierFailures == 0 {
 								if !arrowBuffer.ResetFlushFailure(failureGeneration) {

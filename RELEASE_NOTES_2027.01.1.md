@@ -968,6 +968,46 @@ Nothing to configure. A WAL directory that grew under this bug is reclaimed
 when the node restarts on this release: startup recovery deletes the files
 whose entries are already flushed.
 
+### A write with a numeric measurement no longer poisons its WAL file ([#1225](https://github.com/Basekick-Labs/arc/issues/1225))
+
+A columnar MessagePack write may name its measurement with an integer
+(`"m": 5`), and ingest stores it as `measurement_5`. The WAL keeps the payload
+as the client sent it, and WAL recovery accepted only a string. Recovery
+therefore failed the whole WAL file holding such a write, including entries
+that were already flushed, and replayed no later files in that pass. After
+three failed passes it quarantined the file as `.wal.failed`, and every
+unflushed entry in it was no longer replayed.
+
+Recovery now names an integer measurement exactly as ingest does. A WAL file
+that failed for this reason and is still in the WAL directory replays on the
+next pass. One already quarantined stays quarantined. Do not simply rename it
+back to `.wal`: recovery would replay every entry in it, including ones
+already stored, and duplicate them. Follow the quarantine procedure in
+`docs/operations/wal-recovery.md`.
+
+More generally, an intact WAL entry whose payload cannot be decoded no longer
+fails its file when its flush checkpoint shows it is already in storage.
+
+### A quarantined WAL file no longer stops the WAL purge until restart ([#1225](https://github.com/Basekick-Labs/arc/issues/1225))
+
+The recovery that runs after a failed flush can quarantine a WAL file this
+process wrote. The writer was not told, and kept waiting for that file's
+unflushed entries. From then on the periodic WAL purge deleted no WAL file
+until the process restarted, and the WAL directory grew with ingest.
+
+When recovery quarantines a file, the writer now stops waiting for the
+entries in it and the purge continues. It logs:
+
+```
+Released the pending WAL entries of a quarantined WAL file so the WAL purge can continue; keep the quarantined file, it holds those entries and may hold flush proof for other WAL files
+```
+
+New metric: `arc_wal_quarantine_released_entries_total`. Keep `.wal.failed`
+files until you have dealt with them: they hold the entries that could not be
+replayed. Renaming one back to `.wal` now duplicates more readily than before:
+the purge may already have deleted the later WAL file that proved its other
+entries were stored.
+
 ### Two WAL rotations in the same clock tick no longer share a file
 
 WAL files are named by the time they are created. Two rotations within one
