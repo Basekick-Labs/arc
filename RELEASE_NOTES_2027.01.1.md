@@ -243,8 +243,14 @@ On a Pattern 1 writer (local storage) with the WAL enabled, the setting:
   could be purged once its file was flushed. Now it stays until the cluster
   manifest has the file. During a manifest outage (lost Raft quorum, for
   example) the WAL grows with the unregistered data, as the registration journal
-  already does. The hold applies to the running process; after a restart, WAL
-  recovery deletes files by the same rule as before.
+  already does. The hold survives restarts: WAL recovery keeps a file whose
+  batches still wait to register, along with every file after it, and the node
+  deletes them once the registrations land. A clean shutdown keeps them too,
+  instead of purging the whole WAL. A start whose cluster does not come up keeps
+  them until a later start registers them, logged at Error.
+  `arc_wal_held_files` counts the files kept for this reason, and a Warn every
+  10 minutes reports how many while any are held. The hold covers files journaled with
+  coverage even after the setting is turned off.
 - **refuses a write before it reaches the WAL.** A write the buffer turns away
   (schema churn, a shard closing during shutdown, a cancelled request) no
   longer leaves an entry in the WAL that a later recovery would replay.
@@ -961,6 +967,14 @@ WAL purge stopped at a file holding flush proof for an earlier process WAL file;
 Nothing to configure. A WAL directory that grew under this bug is reclaimed
 when the node restarts on this release: startup recovery deletes the files
 whose entries are already flushed.
+
+### Two WAL rotations in the same clock tick no longer share a file
+
+WAL files are named by the time they are created. Two rotations within one
+clock tick (one microsecond on macOS) produced the same name, and the second
+appended to the first file instead of starting a new one. A rotation now
+refuses to open an existing file and moves the name one microsecond later, so
+names still sort in rotation order.
 
 ### A forwarded file registration must name the forwarding node as its origin ([#1207](https://github.com/Basekick-Labs/arc/issues/1207))
 

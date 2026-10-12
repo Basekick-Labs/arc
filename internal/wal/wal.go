@@ -403,6 +403,11 @@ type walEntry struct {
 	// The destination file is therefore pinned while such a file exists; see
 	// Writer.PurgeFlushed.
 	foreignProof bool
+	// covKey and covSeq are the buffer key and coverage sequence of a covered
+	// data entry (#1207), recorded against the file it lands in so the purge
+	// can keep a file whose batches are not registered yet.
+	covKey string
+	covSeq uint64
 }
 
 // fileSeqState is what the purge needs to know about one WAL file this process
@@ -422,6 +427,8 @@ type fileSeqState struct {
 	hasForeignProof bool
 	// hasUntrackedData is set when an untracked data entry lands here.
 	hasUntrackedData bool
+	// cov is the coverage of the covered entries written here (#1207 S4c).
+	cov coverageSet
 }
 
 // WriterConfig holds configuration for WAL writer
@@ -499,6 +506,10 @@ type Writer struct {
 	// put there by an operator), and only recovery may delete it. Guarded by
 	// w.mu.
 	created map[string]struct{}
+	// coverageHold is the source of the registration hold (#1207 S4c); adopted
+	// holds the earlier-process files recovery retained for it. Guarded by w.mu.
+	coverageHold func() CoverageHold
+	adopted      map[string]RetainedFile
 	// pinnedOn is the earlier-process file the last purge pass found keeping
 	// a foreign-proof pin, for logging only on change. Guarded by w.mu.
 	pinnedOn        string
@@ -797,20 +808,35 @@ func (w *Writer) RotateContext(ctx context.Context) error {
 	}
 }
 
+// walNow names WAL files; a variable so a test can freeze it.
+var walNow = time.Now
+
 // rotate creates a new WAL file.
 // The new file is opened and its header written BEFORE the old file is closed,
 // so a failure to create or initialize the new file leaves the old file intact
 // (no nil w.currentFile that would panic on the next write).
 func (w *Writer) rotate() error {
-	// Generate new filename
-	timestamp := time.Now().UTC().Format("20060102_150405.000000000")
-	filename := fmt.Sprintf("arc-%s.wal", timestamp)
-	newPath := filepath.Join(w.config.WALDir, filename)
-
-	// Open new file first — if this fails, old file is still valid
-	newFile, err := os.OpenFile(newPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
-	if err != nil {
-		return fmt.Errorf("failed to create WAL file: %w", err)
+	// Open new file first — if this fails, old file is still valid. O_EXCL:
+	// two rotations in one clock tick (or a second writer on the directory
+	// just after a restart) would otherwise append to the SAME file, and a
+	// file another process wrote would be taken for this one's. On a clash
+	// the name moves a microsecond later, which keeps name order = rotation
+	// order.
+	now := walNow().UTC()
+	var newPath, filename string
+	var newFile *os.File
+	var err error
+	for attempt := 0; ; attempt++ {
+		filename = fmt.Sprintf("arc-%s.wal", now.Format("20060102_150405.000000000"))
+		newPath = filepath.Join(w.config.WALDir, filename)
+		newFile, err = os.OpenFile(newPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL|os.O_APPEND, 0600)
+		if err == nil {
+			break
+		}
+		if !os.IsExist(err) || attempt >= 1000 {
+			return fmt.Errorf("failed to create WAL file: %w", err)
+		}
+		now = now.Add(time.Microsecond)
 	}
 
 	// Write WAL header to new file
@@ -1459,6 +1485,12 @@ func (w *Writer) noteWrittenLocked(entry walEntry) {
 	if entry.seq > state.maxSeq {
 		state.maxSeq = entry.seq
 	}
+	if entry.covSeq != 0 {
+		if state.cov == nil {
+			state.cov = make(coverageSet)
+		}
+		state.cov.add(w.trackedInstance, entry.covKey, entry.covSeq)
+	}
 }
 
 // listWALFilesFn lists the *.wal files in dir. A variable so tests can make
@@ -1668,6 +1700,7 @@ func (w *Writer) MinUnflushedSequence() uint64 {
 func (w *Writer) PurgeFlushed(minUnflushedSeq uint64) (int, error) {
 	// Listed outside w.mu: the writer loop holds it across fsync.
 	listed, listErr := listWALFilesFn(w.config.WALDir)
+	hold := w.currentHold()
 	w.mu.Lock()
 	earlier, pinned := w.earlierFileLocked(listed, listErr)
 	activePath := w.currentPath
@@ -1701,6 +1734,13 @@ func (w *Writer) PurgeFlushed(minUnflushedSeq uint64) (int, error) {
 				w.logger.Info().Str("file", filepath.Base(path)).Str("waiting_on", filepath.Base(earlier)).
 					Msg("WAL purge stopped at a file holding flush proof for an earlier process WAL file; it resumes once recovery has removed that file")
 			}
+			break
+		}
+		// A batch whose file is not registered yet keeps its WAL entries
+		// (#1207 S4c), whatever the floor says: the floor is released by
+		// recovery checkpoints and by an abandoned outbox, the registration
+		// hold only by the registration itself.
+		if state.cov.held(hold) {
 			break
 		}
 		// maxSeq == 0 means the file holds no tracked data at all (checkpoints

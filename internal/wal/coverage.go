@@ -199,7 +199,7 @@ func (p *PreparedAppend) Commit(cseq uint64) ([]string, error) {
 				Instance: p.w.trackedInstance, Key: p.key, CSeq: cseq, Chunk: e.chunk, Chunks: uint16(len(p.entries)),
 			}})
 		}
-		if err := p.w.tryEnqueueEntry(walEntry{data: e.data, seq: e.seq}); err != nil {
+		if err := p.w.tryEnqueueEntry(walEntry{data: e.data, seq: e.seq, covKey: p.key, covSeq: cseq}); err != nil {
 			p.release(i)
 			return tokens, err
 		}

@@ -116,6 +116,15 @@ type RegistrationOutbox struct {
 	manifestRef OutboxManifest // kept for the final pass in Stop
 	storeRef    OutboxStorage
 
+	// The registration hold (registration_hold.go). holdGen counts changes to
+	// the held set; unsyncedAcks are acknowledged entries whose ack is not
+	// durable yet.
+	holdGen         uint64
+	hold            coverageHold
+	holdBuiltGen    uint64
+	holdBuiltSynced uint64
+	unsyncedAcks    []*outboxEntry
+
 	registered atomic.Int64
 	skipped    atomic.Int64
 	dropped    atomic.Int64
@@ -160,6 +169,9 @@ type outboxEntry struct {
 	// refused: the manifest refused it for good — another writer claimed
 	// its rows (#1207). Settled without registering; the file stays.
 	refused bool
+	// ackAt is the journal generation of its ack record; its batches are held
+	// until the journal is synced past it (#1207 S4c).
+	ackAt uint64
 }
 
 // journalRecord is one journal line. ClusterName pins it to the cluster: a data
@@ -289,6 +301,10 @@ func NewRegistrationOutbox(dir, clusterName string, logger zerolog.Logger) (*Reg
 	if r.live > 0 {
 		r.logger.Info().Int("files", r.live).
 			Msg("Loaded file registrations a previous start did not confirm; they are registered once the cluster is up")
+	}
+	if n := r.unknownHoldsLocked(); n > 0 {
+		r.logger.Warn().Int("files", n).
+			Msg("Pending file registrations with truncated coverage from an older release: their WAL entries are not held until they register")
 	}
 	r.publishMetrics()
 	return r, nil
@@ -453,11 +469,17 @@ func (r *RegistrationOutbox) enqueueLocked(rec journalRecord, added time.Time, f
 		// earlier file's rows were overwritten: report them lost.
 		e.done = true
 		r.live--
+		if e.rec.Cov != nil {
+			r.holdGen++
+		}
 		if e.rec.Cov != nil && e.rec.Cov != rec.Cov {
 			go e.rec.Cov.Settle(e.rec.Path, ingest.CoverageLost)
 		}
 	}
 	e := &outboxEntry{rec: rec, added: added, fresh: fresh}
+	if rec.Cov != nil {
+		r.holdGen++
+	}
 	r.byPath[rec.Path] = e
 	r.queue = append(r.queue, e)
 	r.live++
@@ -550,6 +572,7 @@ func (r *RegistrationOutbox) SyncRegistrations() error {
 	if target > r.synced {
 		r.synced = target
 	}
+	r.pruneUnsyncedAcksLocked()
 	return nil
 }
 
@@ -672,6 +695,16 @@ func (r *RegistrationOutbox) Abandon() bool {
 	}
 	r.logger.Warn().Int("pending", r.live).Str("journal", r.journalPath).
 		Msg("Cluster manifest unavailable in this start; pending file registrations stay in the journal for the next start")
+	covered := 0
+	for _, e := range r.byPath {
+		if !e.done && e.rec.Cov != nil {
+			covered++
+		}
+	}
+	if covered > 0 {
+		r.logger.Error().Int("files", covered).
+			Msg("WAL entries of files waiting to register are kept until a start with the cluster registers them; the WAL grows with them")
+	}
 	return true
 }
 
@@ -1148,6 +1181,7 @@ func (r *RegistrationOutbox) withdrawLocked(e *outboxEntry) {
 	r.live--
 	delete(r.byPath, e.rec.Path)
 	r.appendLocked(journalRecord{Version: journalRecordVersion, Op: journalOpAck, ClusterName: r.clusterName, Path: e.rec.Path})
+	r.noteAckLocked(e)
 }
 
 // HoldsRegistration reports a file that is pending here or was confirmed a
@@ -1281,6 +1315,7 @@ func (r *RegistrationOutbox) ack(entries []*outboxEntry) {
 			Version: journalRecordVersion, Op: journalOpAck,
 			ClusterName: r.clusterName, Path: e.rec.Path,
 		})
+		r.noteAckLocked(e)
 	}
 	r.advanceHeadLocked()
 	r.mu.Unlock()

@@ -151,6 +151,7 @@ type Metrics struct {
 	// WAL metrics
 	walRecordsPreserved   atomic.Int64 // Records preserved in WAL for recovery (flush failures)
 	walRegisteredFloorLag atomic.Int64 // committed batches above the registered floor (#1207)
+	walHeldFiles          atomic.Int64 // WAL files kept for batches whose files wait to register (#1207 S4c)
 	walCoverageLost       atomic.Int64 // batches that settled without a registered file (#1207)
 
 	// Origin stream and standby store (#1207 S3).
@@ -578,6 +579,10 @@ func (m *Metrics) IncWALRecordsPreserved(count int64) { m.walRecordsPreserved.Ad
 // yet below the registered floor of their key (#1207).
 func (m *Metrics) SetWALRegisteredFloorLag(n int64) { m.walRegisteredFloorLag.Store(n) }
 
+// SetWALHeldFiles reports the WAL files kept because batches in them are
+// waiting for their files to register (#1207 S4c).
+func (m *Metrics) SetWALHeldFiles(n int64) { m.walHeldFiles.Store(n) }
+
 // IncWALCoverageLost counts ingest batches that settled without being in a
 // registered file (#1207).
 func (m *Metrics) IncWALCoverageLost(n int64) { m.walCoverageLost.Add(n) }
@@ -891,6 +896,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		// WAL
 		"wal_records_preserved":            m.walRecordsPreserved.Load(),
 		"wal_registered_floor_lag":         m.walRegisteredFloorLag.Load(),
+		"wal_held_files":                   m.walHeldFiles.Load(),
 		"wal_coverage_lost":                m.walCoverageLost.Load(),
 		"origin_stream_sessions":           m.originStreamSessions.Load(),
 		"origin_stream_dropped":            m.originStreamDropped.Load(),
@@ -1284,6 +1290,7 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_registered_floor_lag Committed ingest batches not yet below the registered floor of their key (WAL coverage only)\n"...)
 	b = append(b, "# TYPE arc_wal_registered_floor_lag gauge\n"...)
 	b = appendMetric(b, "arc_wal_registered_floor_lag", float64(m.walRegisteredFloorLag.Load()))
+	b = appendMetric(b, "arc_wal_held_files", float64(m.walHeldFiles.Load()))
 
 	b = append(b, "# HELP arc_wal_coverage_lost_total Ingest batches that settled without being in a registered file (WAL coverage only)\n"...)
 	b = append(b, "# TYPE arc_wal_coverage_lost_total counter\n"...)
