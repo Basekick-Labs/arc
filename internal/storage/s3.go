@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -72,7 +73,21 @@ type S3Backend struct {
 	accessKey string // stored for subprocess credential passing
 	secretKey string // stored for subprocess credential passing
 	logger    zerolog.Logger
+	// bucketCheckedAt is when a HeadBucket last answered conclusively
+	// (UnixNano; 0 = not yet), and bucketMissing what it answered. See
+	// confirmObjectAbsent.
+	bucketCheckedAt atomic.Int64
+	bucketMissing   atomic.Bool
 }
+
+// How long one HeadBucket answer is trusted: a bucket that answered (200, or
+// 403 for a principal that may not list it) for a minute, so a busy path
+// asking about absent keys costs at most one extra request per minute; a
+// missing bucket for a few seconds, so its creation is noticed promptly.
+const (
+	bucketConfirmTTL = time.Minute
+	bucketMissingTTL = 5 * time.Second
+)
 
 // S3Config holds S3 backend configuration
 type S3Config struct {
@@ -569,6 +584,9 @@ func (b *S3Backend) StatFile(ctx context.Context, path string) (int64, error) {
 	})
 	if err != nil {
 		if isNotFoundError(err) {
+			if storeErr := b.confirmObjectAbsent(ctx); storeErr != nil {
+				return -1, fmt.Errorf("HeadObject %s: %w", path, storeErr)
+			}
 			return -1, nil
 		}
 		return -1, fmt.Errorf("HeadObject %s: %w", path, err)
@@ -750,6 +768,9 @@ func (b *S3Backend) Exists(ctx context.Context, path string) (bool, error) {
 	})
 	if err != nil {
 		if isNotFoundError(err) {
+			if storeErr := b.confirmObjectAbsent(ctx); storeErr != nil {
+				return false, fmt.Errorf("failed to check S3 object existence: %w", storeErr)
+			}
 			return false, nil
 		}
 		return false, fmt.Errorf("failed to check S3 object existence: %w", err)
@@ -770,8 +791,8 @@ func (b *S3Backend) Exists(ctx context.Context, path string) (bool, error) {
 //
 // A missing bucket is not a missing key: a GET answers NoSuchBucket, which
 // stays an error (see readError). A HEAD cannot tell the two apart — both are
-// a bodiless 404 — so StatFile and Exists still report a missing bucket as an
-// absent object.
+// a bodiless 404 — so StatFile and Exists ask HeadBucket after one (see
+// confirmObjectAbsent).
 func isNotFoundError(err error) bool {
 	if err == nil {
 		return false
@@ -789,6 +810,50 @@ func isNotFoundError(err error) bool {
 	}
 	var opErr *smithy.OperationError
 	return errors.As(err, &opErr) && opErr.OperationName == "HeadObject"
+}
+
+// confirmObjectAbsent tells a missing key from a missing bucket after a HEAD
+// answered 404, which S3 sends, bodiless, for both (#1242). A HeadBucket that
+// answers the bucket is not there turns the answer into ErrStoreNotFound, the
+// same as a read reports it. Any other outcome — the bucket exists, a 403
+// from a principal without s3:ListBucket, a 5xx, a transport failure — leaves
+// the object absent, which is what a HEAD 404 meant before. 200, 403 and a
+// missing bucket are cached (bucketConfirmTTL, bucketMissingTTL); a failure
+// is not, so the next 404 asks again.
+func (b *S3Backend) confirmObjectAbsent(ctx context.Context) error {
+	if at := b.bucketCheckedAt.Load(); at != 0 {
+		ttl := bucketConfirmTTL
+		if b.bucketMissing.Load() {
+			ttl = bucketMissingTTL
+		}
+		if time.Since(time.Unix(0, at)) < ttl {
+			if b.bucketMissing.Load() {
+				return fmt.Errorf("bucket %s: %w", b.bucket, ErrStoreNotFound)
+			}
+			return nil
+		}
+	}
+	_, err := b.client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(b.bucket)})
+	missing, conclusive := false, err == nil
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "NotFound", "NoSuchBucket":
+			missing, conclusive = true, true
+		case "Forbidden", "AccessDenied":
+			conclusive = true
+		}
+	}
+	if conclusive {
+		b.bucketMissing.Store(missing)
+		b.bucketCheckedAt.Store(time.Now().UnixNano())
+	}
+	if missing {
+		// Wraps the HeadBucket answer, not the object's: the object's
+		// NotFound would read as a missing object to IsNotFound.
+		return fmt.Errorf("bucket %s: %w: %w", b.bucket, err, ErrStoreNotFound)
+	}
+	return nil
 }
 
 // readError wraps a failed GET, tagging a missing bucket with ErrStoreNotFound

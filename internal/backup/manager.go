@@ -393,7 +393,9 @@ func withDestinationTimeout(ctx context.Context) (context.Context, context.Cance
 func (m *Manager) probeDestination(ctx context.Context, dest backupTarget, backupID string) error {
 	probeCtx, cancel := withDestinationTimeout(ctx)
 	defer cancel()
-	if _, err := dest.backend.Exists(probeCtx, backupID+"/manifest.json"); err != nil {
+	// A bucket that does not exist yet has answered too: most S3-compatible
+	// stores create it on the first write, which is this run's (#1242).
+	if _, err := dest.backend.Exists(probeCtx, backupID+"/manifest.json"); err != nil && !storage.IsStoreNotFound(err) {
 		return fmt.Errorf("%s did not answer: %w", dest.describe(), err)
 	}
 	return nil

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -49,11 +50,19 @@ func s3BackendFor(t *testing.T, h http.HandlerFunc) *S3Backend {
 	}
 }
 
-// s3Answer answers every request with status, an x-amz-request-id holding
-// "404", and an S3 XML error body when code is set (HEAD gets no body).
+// s3Answer answers every object request with status, an x-amz-request-id
+// holding "404", and an S3 XML error body when code is set (HEAD gets no
+// body). The bucket itself (a HEAD of "/arc404") exists unless code is
+// NoSuchBucket.
 func s3Answer(status int, code string, contentType string, body string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("x-amz-request-id", "REQ404NotFound404")
+		if r.Method == http.MethodHead && strings.TrimSuffix(r.URL.Path, "/") == "/arc404" {
+			if code == "NoSuchBucket" {
+				w.WriteHeader(http.StatusNotFound)
+			}
+			return
+		}
 		if contentType != "" {
 			w.Header().Set("Content-Type", contentType)
 		}
@@ -93,7 +102,7 @@ func TestS3ClassifiesAMissingObjectByItsTypeNotItsText(t *testing.T) {
 		stat    outcome // StatFile, Exists (HEAD)
 	}{
 		{"missing key", s3Answer(404, "NoSuchKey", "application/xml", ""), absent, absent},
-		{"missing bucket", s3Answer(404, "NoSuchBucket", "application/xml", ""), storeGone, absent}, // a HEAD cannot tell
+		{"missing bucket", s3Answer(404, "NoSuchBucket", "application/xml", ""), storeGone, storeGone},
 		{"proxy 404 page", s3Answer(404, "", "text/html", "<html>404 Not Found</html>"), failure, absent},
 		{"slow down whose request id holds 404", s3Answer(503, "SlowDown", "application/xml", ""), failure, failure},
 		{"connection dropped", hangUp, failure, failure},
@@ -124,12 +133,18 @@ func TestS3ClassifiesAMissingObjectByItsTypeNotItsText(t *testing.T) {
 
 			size, err := b.StatFile(ctx, textTrapKey)
 			exists, existsErr := b.Exists(ctx, textTrapKey)
-			if tt.stat == absent {
+			switch tt.stat {
+			case absent:
 				if size != -1 || err != nil || exists || existsErr != nil {
 					t.Errorf("StatFile = %d, %v; Exists = %v, %v; want -1, nil and false, nil", size, err, exists, existsErr)
 				}
-			} else if err == nil || existsErr == nil {
-				t.Errorf("StatFile = %d, %v; Exists = %v, %v; want errors, not an absent object", size, err, exists, existsErr)
+			case storeGone:
+				check("StatFile", err, storeGone)
+				check("Exists", existsErr, storeGone)
+			default:
+				if err == nil || existsErr == nil {
+					t.Errorf("StatFile = %d, %v; Exists = %v, %v; want errors, not an absent object", size, err, exists, existsErr)
+				}
 			}
 		})
 	}
@@ -254,5 +269,50 @@ func TestLocalReadsOfAMissingFileAreNotFound(t *testing.T) {
 		if !IsNotFound(err) {
 			t.Errorf("%s of a missing file: err = %v, want IsNotFound", op, err)
 		}
+	}
+}
+
+// TestS3HeadConfirmsTheBucketOncePerTTL (#1242): a HEAD 404 is a missing key
+// unless HeadBucket says the bucket is missing. A conclusive answer (200, a
+// 403 from a principal without s3:ListBucket, a missing bucket) is cached; a
+// 5xx is not, and leaves the object absent, as before.
+func TestS3HeadConfirmsTheBucketOncePerTTL(t *testing.T) {
+	ctx := context.Background()
+	for _, tt := range []struct {
+		name         string
+		bucketStatus int
+		wantChecks   int64 // HeadBucket requests over three StatFile calls
+	}{
+		{"bucket exists", http.StatusOK, 1},
+		{"no permission to check", http.StatusForbidden, 1},
+		{"bucket missing", http.StatusNotFound, 1},
+		{"check fails", http.StatusServiceUnavailable, 3},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var checks atomic.Int64
+			b := s3BackendFor(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodHead && strings.TrimSuffix(r.URL.Path, "/") == "/arc404" {
+					checks.Add(1)
+					w.WriteHeader(tt.bucketStatus)
+					return
+				}
+				w.WriteHeader(http.StatusNotFound)
+			})
+			for i := 0; i < 3; i++ {
+				size, err := b.StatFile(ctx, textTrapKey)
+				if tt.bucketStatus == http.StatusNotFound {
+					if size != -1 || !IsStoreNotFound(err) || IsNotFound(err) {
+						t.Fatalf("StatFile = %d, %v; want ErrStoreNotFound", size, err)
+					}
+					continue
+				}
+				if size != -1 || err != nil {
+					t.Fatalf("StatFile = %d, %v; want -1, nil", size, err)
+				}
+			}
+			if n := checks.Load(); n != tt.wantChecks {
+				t.Fatalf("HeadBucket requests = %d, want %d", n, tt.wantChecks)
+			}
+		})
 	}
 }

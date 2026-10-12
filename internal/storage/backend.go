@@ -30,8 +30,9 @@ var ErrResumeNotSupported = errors.New("storage: resume not supported by this ba
 // with IsStoreNotFound. Everything else keeps failing as it always did. The
 // listing methods and the reads (Read, ReadTo, ReadToAt) wrap it alongside
 // the SDK's own error, so both chains stay inspectable; a read of a missing
-// store is never a missing object (#1238). An S3 HEAD (StatFile, Exists)
-// cannot tell a missing bucket from a missing key and reports it as absent.
+// store is never a missing object (#1238). So do StatFile and Exists: an S3
+// HEAD cannot tell a missing bucket from a missing key, so after a HEAD 404 the
+// S3 backend asks HeadBucket (#1242).
 var ErrStoreNotFound = errors.New("storage: bucket or container does not exist")
 
 // IsStoreNotFound reports whether err is a backend saying its bucket or
@@ -65,8 +66,7 @@ var ErrObjectNotFound = errors.New("file not found")
 // Azure errors carry the request URL, the request ID and the local port, so a
 // transport failure could contain "404" or "NotFound" and read as an absent
 // object. A missing bucket or container is not a missing object either: it
-// reads as ErrStoreNotFound (IsStoreNotFound), except through an S3 HEAD,
-// which cannot tell the two apart.
+// reads as ErrStoreNotFound (IsStoreNotFound).
 func IsNotFound(err error) bool {
 	if err == nil {
 		return false
