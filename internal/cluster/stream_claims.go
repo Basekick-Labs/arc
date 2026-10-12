@@ -29,6 +29,9 @@ import (
 // (SetWALCoverageActive): the flag implies every such node stamps coverage
 // on its files. Other roles apply the FSM rules and advertise them always.
 func (c *Coordinator) localCapabilities() []string {
+	if !c.cfg.StreamTakeover {
+		return nil
+	}
 	if c.localNode.Role.GetCapabilities().CanIngest && !c.walCoverageActive.Load() {
 		return nil
 	}
@@ -98,7 +101,7 @@ func (c *Coordinator) streamClaimsEnableLoop(ctx context.Context) {
 
 // maybeEnableStreamClaims is one pass of the enable loop.
 func (c *Coordinator) maybeEnableStreamClaims() {
-	if c.raftNode == nil || c.cfg.SharedStorageMode || !c.cfg.WALCoverage {
+	if c.raftNode == nil || c.cfg.SharedStorageMode || !c.cfg.WALCoverage || !c.cfg.StreamTakeover {
 		return
 	}
 	fsm := c.raftNode.FSM()

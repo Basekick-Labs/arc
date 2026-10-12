@@ -3,7 +3,6 @@ package ingest
 import (
 	"fmt"
 	"math"
-	"time"
 
 	"github.com/Basekick-Labs/msgpack/v6"
 	"github.com/Basekick-Labs/msgpack/v6/msgpcode"
@@ -160,20 +159,11 @@ func (d *MessagePackDecoder) tryDecodeColumnarTyped(data []byte) (*TypedColumnar
 		return nil, false
 	}
 
-	// Missing/omitted time column: generate now-µs for every row, matching
-	// decodeColumnar's behavior (including the Warn so users know their data
-	// lacked timestamps).
+	// Missing/omitted time column: leave it to the generic path, which
+	// generates the time and keeps it in the WAL entry (#1207). This path's
+	// WAL fallback for a payload it cannot store raw drops NULLs.
 	if _, ok := typed["time"]; !ok {
-		d.logger.Warn().
-			Str("measurement", measurement).
-			Int("row_count", numRecords).
-			Msg("Data missing 'time' column - generating UTC timestamps")
-		nowMicros := time.Now().UTC().UnixMicro()
-		arr := make([]int64, numRecords)
-		for i := range arr {
-			arr[i] = nowMicros
-		}
-		typed["time"] = arr
+		return nil, false
 	}
 
 	if sanitized > 0 {

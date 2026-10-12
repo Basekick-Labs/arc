@@ -79,9 +79,55 @@ type GroupCoverage struct {
 	// (#1207 S4c). Readers before S4c ignore it.
 	Bounds []CoverageRange `json:"bounds,omitempty"`
 
+	// File is the part of the coverage with rows in this one file, when the
+	// group wrote several (one per partition hour). Nil when the file holds
+	// rows of every piece (a group with one file). The cluster manifest
+	// records it per file, exactly (#1207 S4b).
+	File *FileCoverage `json:"file,omitempty"`
+
 	// onSettle receives each file's outcome. Nil on coverage loaded from a
 	// journal: the group that would act on it belonged to an earlier process.
 	onSettle func(path string, outcome CoverageOutcome)
+}
+
+// FileCoverage lists the pieces with at least one row in one file of a group.
+type FileCoverage struct {
+	Ranges  []CoverageRange `json:"ranges,omitempty"`
+	Partial []CoveragePiece `json:"partial,omitempty"`
+	// Omitted is set when the lists were capped: the file's coverage is not
+	// known exactly.
+	Omitted bool `json:"omitted,omitempty"`
+}
+
+// FilePieces returns the coverage of this file: the File part when set,
+// otherwise the whole group. exact is false when either was truncated.
+func (g *GroupCoverage) FilePieces() (ranges []CoverageRange, partial []CoveragePiece, exact bool) {
+	if g == nil {
+		return nil, nil, true
+	}
+	if g.File != nil {
+		return g.File.Ranges, g.File.Partial, !g.File.Omitted
+	}
+	return g.Ranges, g.Partial, g.RangesOmitted+g.PartialOmitted == 0
+}
+
+// forFile returns a copy of g for one file holding rows of pieces only. The
+// copy settles through the same group.
+func (g *GroupCoverage) forFile(pieces []CoveragePiece) *GroupCoverage {
+	if g == nil {
+		return nil
+	}
+	c := *g
+	ranges, partial := foldPieces(pieces)
+	fc := &FileCoverage{Ranges: ranges, Partial: partial}
+	if len(fc.Ranges) > maxJournalRanges {
+		fc.Ranges, fc.Omitted = fc.Ranges[:maxJournalRanges], true
+	}
+	if len(fc.Partial) > maxJournalPartial {
+		fc.Partial, fc.Omitted = fc.Partial[:maxJournalPartial], true
+	}
+	c.File = fc
+	return &c
 }
 
 // NewGroupCoverage builds a GroupCoverage whose Settle calls onSettle. The
@@ -361,6 +407,7 @@ type flushGroup struct {
 	cs     *coverageState
 	key    string
 	pieces []CoveragePiece
+	spans  []coverageSpan
 	tokens []string
 
 	mu           sync.Mutex
@@ -384,7 +431,64 @@ func (b *ArrowBuffer) newFlushGroup(key string, records []interface{}, tokens []
 	if len(pieces) == 0 {
 		return nil
 	}
-	return &flushGroup{b: b, cs: cs, key: key, pieces: pieces, tokens: tokens, settled: make(map[string]struct{})}
+	return &flushGroup{b: b, cs: cs, key: key, pieces: pieces, spans: coverageRowSpans(records), tokens: tokens, settled: make(map[string]struct{})}
+}
+
+// coverageSpan is the rows [lo, hi) a batch occupies in the merged batch of
+// its flush, and the batch's coverage.
+type coverageSpan struct {
+	lo, hi int
+	pieces []CoveragePiece
+}
+
+// coverageRowSpans lays out records as mergeBatches concatenates them: in
+// order, each as long as its time column. Captured when the group is built:
+// the async flush drops the records once merged.
+func coverageRowSpans(records []interface{}) []coverageSpan {
+	var spans []coverageSpan
+	off := 0
+	for _, record := range records {
+		var cols map[string]interface{}
+		var cov []CoveragePiece
+		switch r := record.(type) {
+		case *TypedColumnBatch:
+			cols, cov = r.Data, r.Coverage
+		case map[string]interface{}:
+			cols = r
+		}
+		n := 0
+		if t, ok := cols["time"].([]int64); ok {
+			n = len(t)
+		}
+		if len(cov) > 0 && n > 0 {
+			spans = append(spans, coverageSpan{lo: off, hi: off + n, pieces: cov})
+		}
+		off += n
+	}
+	return spans
+}
+
+// piecesAt returns the pieces of the batches holding at least one of rows,
+// which are ascending row indices of the merged batch.
+func (g *flushGroup) piecesAt(rows []int) []CoveragePiece {
+	if g == nil {
+		return nil
+	}
+	var out []CoveragePiece
+	s := 0
+	for _, r := range rows {
+		for s < len(g.spans) && g.spans[s].hi <= r {
+			s++
+		}
+		if s == len(g.spans) {
+			break
+		}
+		if r >= g.spans[s].lo {
+			out = append(out, g.spans[s].pieces...)
+			s++ // each batch once
+		}
+	}
+	return out
 }
 
 // coverage is what the registrar receives for each of the group's files.

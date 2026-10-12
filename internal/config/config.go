@@ -810,6 +810,12 @@ type ClusterConfig struct {
 	// with it on cannot be replayed by an Arc older than the release that
 	// introduced it.
 	WALCoverage bool
+	// StreamTakeover opts this node into stream takeover (#1207 S4b): a
+	// standby writer taking over from a primary that died publishes the
+	// batches it received that no registered file holds. Takes effect only
+	// when every node of the cluster opts in (writers with WALCoverage on);
+	// once applied cluster-wide it cannot be turned off. Default off.
+	StreamTakeover bool
 	// StandbyStoreMaxBytes caps the copy a standby writer keeps of what its
 	// primary streams, with WALCoverage on (#1207). Past it the standby stores
 	// nothing until trimming frees room.
@@ -1183,6 +1189,7 @@ func Load() (*Config, error) {
 			HealthCheckInterval:    v.GetInt("cluster.health_check_interval"),
 			IngestFenceAfterMs:     v.GetInt("cluster.ingest_fence_after_ms"),
 			WALCoverage:            v.GetBool("cluster.wal_coverage"),
+			StreamTakeover:         v.GetBool("cluster.stream_takeover"),
 			StandbyStoreMaxBytes:   v.GetInt64("cluster.standby_store_max_bytes"),
 			OriginStreamQueueBytes: v.GetInt64("cluster.origin_stream_queue_bytes"),
 			HealthCheckTimeout:     v.GetInt("cluster.health_check_timeout"),
@@ -2022,6 +2029,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.failover_cooldown", 60)    // 60 second cooldown between failovers
 	v.SetDefault("cluster.ingest_fence_after_ms", 0) // 0 = derived from failover detection (#1207)
 	v.SetDefault("cluster.wal_coverage", false)      // experimental (#1207); see Cluster.WALCoverage
+	v.SetDefault("cluster.stream_takeover", false)   // experimental (#1207 S4b); see Cluster.StreamTakeover
 	v.SetDefault("cluster.standby_store_max_bytes", int64(1<<30))
 	v.SetDefault("cluster.origin_stream_queue_bytes", int64(64<<20))
 

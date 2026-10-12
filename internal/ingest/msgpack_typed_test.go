@@ -203,10 +203,6 @@ func TestTypedDecodeEquivalence(t *testing.T) {
 				"time": []interface{}{1.7e15, 1.7e15},
 				"v":    []interface{}{int64(1), int64(2)},
 			}}, false},
-		{"missing_time_generated", map[string]interface{}{
-			"m": "cpu", "columns": map[string]interface{}{
-				"v": []interface{}{int64(1), int64(2)},
-			}}, true},
 		{"small_fixints", map[string]interface{}{
 			"m": "cpu", "columns": map[string]interface{}{
 				"time": []interface{}{int64(1700000000000000)},

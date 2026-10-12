@@ -144,9 +144,24 @@ const (
 	// CommandEnableStreamClaims turns stream claims on, once, when every node
 	// supports them (#1207). See stream_claims.go.
 	CommandEnableStreamClaims
-	// CommandTakeOverStream claims a dead primary instance's batches for the
-	// writer taking over from it (#1207).
+	// CommandTakeOverStream was the S4a watermark claim; never proposed and
+	// now refused. See CommandTakeOverStreamV2.
 	CommandTakeOverStream
+	// Stream takeover (#1207 S4b), see takeover.go. Every one is refused
+	// until the stream claims flag is applied.
+	//
+	// CommandAnnounceInstance: a writer starting a new process.
+	CommandAnnounceInstance
+	// CommandSettleCoverage: an origin raising its instance's settled floors.
+	CommandSettleCoverage
+	// CommandTakeOverStreamV2: a writer claiming batches of a dead writer.
+	CommandTakeOverStreamV2
+	// CommandClaimDone: a claimant finished publishing its claim.
+	CommandClaimDone
+	// CommandReleaseStreamClaim: an operator releasing a lost claimant's claim.
+	CommandReleaseStreamClaim
+	// CommandInstanceSettled: an origin with nothing left of an earlier process.
+	CommandInstanceSettled
 )
 
 // Command represents a command to be applied to the FSM.
@@ -219,14 +234,25 @@ type FileEntry struct {
 	Tier          string    `json:"tier"`           // "hot" or "cold"
 	CreatedAt     time.Time `json:"created_at"`     // When the file was first registered
 	LSN           uint64    `json:"lsn"`            // Raft log index at registration (for ordering)
+	// Coverage is the batches of each writer instance with rows in the file
+	// (#1207 S4b). Set only by the FSM, from RegisterFilePayload.Cov2 while
+	// stream takeover is enabled; a client-supplied value is ignored.
+	Coverage []InstanceCoverage `json:"cov2,omitempty"`
 }
 
 // RegisterFilePayload is the payload for CommandRegisterFile.
 type RegisterFilePayload struct {
 	File FileEntry `json:"file"`
-	// Coverage is the file's batch coverage, sent only once stream claims
-	// are enabled (#1207); the claim rule reads it. Not stored with the file.
-	Coverage []FileCoverage `json:"coverage,omitempty"`
+	// Cov2 is the file's exact batch coverage (#1207 S4b), sent whenever the
+	// writer has it; an FSM without stream takeover enabled ignores it.
+	Cov2 []InstanceCoverage `json:"cov2,omitempty"`
+	// Supersedes names the file this registration replaces (a rewrite of a
+	// file still pending registration). When that file is deleted in the
+	// same batch, its batches move to this one instead of duplicating.
+	Supersedes string `json:"supersedes,omitempty"`
+	// InheritFrom names a registered file this one rewrites (a row DELETE):
+	// the file takes over that file's coverage.
+	InheritFrom string `json:"inherit_from,omitempty"`
 }
 
 // DeleteFilePayload is the payload for CommandDeleteFile.
@@ -611,9 +637,9 @@ type ClusterFSM struct {
 	// the snapshot. Acks is nil until the first pause.
 	compactionPause CompactionPauseState
 
-	// Stream claims (#1207 S4a), under mu. See stream_claims.go.
+	// Stream claims (#1207), under mu. See stream_claims.go, takeover.go.
 	streamClaims bool
-	claims       map[uint64]*StreamClaim
+	takeover     *takeoverState
 
 	// Callbacks for state changes
 	onNodeAdded          func(*NodeInfo)
@@ -692,6 +718,7 @@ func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 		tokenMembershipsByPair:  make(map[int64]map[int64]int64),
 		tokenMembershipsByToken: make(map[int64]map[int64]struct{}),
 		tokenMembershipsByTeam:  make(map[int64]map[int64]struct{}),
+		takeover:                newTakeoverState(),
 
 		logger: logger.With().Str("component", "cluster-fsm").Logger(),
 	}
@@ -1021,6 +1048,18 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.applyEnableStreamClaims(cmd.Payload)
 	case CommandTakeOverStream:
 		return f.applyTakeOverStream(cmd.Payload)
+	case CommandAnnounceInstance:
+		return f.applyAnnounceInstance(cmd.Payload, log.Index)
+	case CommandSettleCoverage:
+		return f.applySettleCoverage(cmd.Payload)
+	case CommandTakeOverStreamV2:
+		return f.applyTakeOverStreamV2(cmd.Payload, log.Index)
+	case CommandClaimDone:
+		return f.applyClaimDone(cmd.Payload)
+	case CommandReleaseStreamClaim:
+		return f.applyReleaseStreamClaim(cmd.Payload)
+	case CommandInstanceSettled:
+		return f.applyInstanceSettled(cmd.Payload)
 	case CommandDeleteFile:
 		return f.applyDeleteFile(cmd.Payload)
 	case CommandAssignCompactor:
@@ -1307,6 +1346,9 @@ func (f *ClusterFSM) applyRemoveNode(payload []byte) interface{} {
 	if f.primaryWriterID == p.NodeID {
 		f.primaryWriterID = ""
 	}
+	if f.streamClaims {
+		f.takeoverNodeRemovedLocked(p.NodeID)
+	}
 	callback := f.onNodeRemoved
 	f.mu.Unlock()
 
@@ -1485,6 +1527,7 @@ func (f *ClusterFSM) applyRegisterFile(payload []byte, logIndex uint64) interfac
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return fmt.Errorf("failed to unmarshal register file payload: %w", err)
 	}
+	sanitizeCoverage(&p)
 	return f.applyRegisterFileStruct(p, logIndex)
 }
 
@@ -1510,11 +1553,11 @@ func (f *ClusterFSM) applyRegisterFileStruct(p RegisterFilePayload, logIndex uin
 	}
 
 	f.mu.Lock()
-	if f.claimConflictLocked(p) {
+	if refused, ok := f.takeoverRefusalLocked(p, nil, nil); ok {
 		f.mu.Unlock()
-		return &StreamClaimConflictError{Ops: []int{0}}
+		return &StreamClaimConflictError{Ops: []RefusedOp{refused}}
 	}
-	emit := f.applyRegisterFileLocked(p, logIndex)
+	emit := f.applyRegisterFileLocked(p, logIndex, f.inheritedCoverageLocked(p))
 	f.mu.Unlock()
 
 	if emit != nil {
@@ -1525,10 +1568,11 @@ func (f *ClusterFSM) applyRegisterFileStruct(p RegisterFilePayload, logIndex uin
 
 // applyRegisterFileLocked mutates the manifest with f.mu already held.
 // Its returned event must be delivered only after unlocking.
-func (f *ClusterFSM) applyRegisterFileLocked(p RegisterFilePayload, logIndex uint64) func() {
+func (f *ClusterFSM) applyRegisterFileLocked(p RegisterFilePayload, logIndex uint64, inherited []InstanceCoverage) func() {
 	// Stamp the LSN from the Raft log index (deterministic across all nodes).
 	p.File.LSN = logIndex
 	entry := p.File
+	f.takeoverRegisteredLocked(p, &entry, inherited)
 	old, existed := f.files[entry.Path]
 	contentChanged := existed && (old.SHA256 != entry.SHA256 || old.SizeBytes != entry.SizeBytes)
 	// If the file was already registered under a different database (unlikely
@@ -1605,6 +1649,14 @@ func (f *ClusterFSM) applyDeleteFileStruct(p DeleteFilePayload) interface{} {
 // the path was not in the manifest (idempotent delete, nothing to announce).
 func (f *ClusterFSM) applyDeleteFileLocked(p DeleteFilePayload) func() {
 	existing, existed := f.files[p.Path]
+	if existed && f.streamClaims && p.Reason == DeleteReasonVanished {
+		// No node can ever serve a file that vanished before it was
+		// pulled: its batches are not settled (#1207 S4b). Every other
+		// delete (compaction, retention, DELETE) keeps them settled.
+		for _, c := range existing.Coverage {
+			f.indexSubtractLocked(c, fileHour(*existing))
+		}
+	}
 	delete(f.files, p.Path)
 	if existed {
 		// Remove from the database → files secondary index
@@ -1689,6 +1741,12 @@ func (f *ClusterFSM) applyUpdateFileLocked(p UpdateFilePayload, logIndex uint64)
 	p.File.LSN = logIndex
 	entry := p.File
 	old, existed := f.files[entry.Path]
+	// Coverage is the FSM's own record of the file's batches: an update
+	// keeps it, whatever the client sent (#1207 S4b).
+	entry.Coverage = nil
+	if existed {
+		entry.Coverage = old.Coverage
+	}
 	contentChanged := existed && (old.SHA256 != entry.SHA256 || old.SizeBytes != entry.SizeBytes)
 	// If the database changed (defensive), remove the old secondary index entry first.
 	if existed && old.Database != entry.Database {
@@ -1785,7 +1843,6 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 	// variants directly without re-unmarshalling. Each payload is
 	// decoded exactly once; all operation types retain decoded payloads.
 	decoded := make([]any, len(p.Ops))
-	var claimConflicts []int
 	for i, op := range p.Ops {
 		switch op.Type {
 		case CommandRegisterFile:
@@ -1810,14 +1867,7 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 			if rp.File.CreatedAt.IsZero() {
 				return fmt.Errorf("batch file ops: op[%d]: register file: created_at is required", i)
 			}
-			// Collected, not returned at once: the outbox settles every
-			// refused op in one round instead of one per Raft entry.
-			f.mu.RLock()
-			conflict := f.claimConflictLocked(rp)
-			f.mu.RUnlock()
-			if conflict && len(claimConflicts) < maxConflictOpsReported {
-				claimConflicts = append(claimConflicts, i)
-			}
+			sanitizeCoverage(&rp)
 			decoded[i] = rp
 		case CommandUpdateFile:
 			var up UpdateFilePayload
@@ -1863,8 +1913,15 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 		}
 	}
 
-	if len(claimConflicts) > 0 {
-		return &StreamClaimConflictError{Ops: claimConflicts}
+	// Stream takeover rules (#1207 S4b), after every op decoded. Collected,
+	// not returned at once: the outbox settles every refused op in one round
+	// instead of one per Raft entry.
+	inherited := make([][]InstanceCoverage, len(p.Ops))
+	f.mu.RLock()
+	refused := f.batchTakeoverRefusalsLocked(p.Ops, decoded, inherited)
+	f.mu.RUnlock()
+	if len(refused) > 0 {
+		return &StreamClaimConflictError{Ops: refused}
 	}
 
 	// Every payload has already passed the complete pre-validation pass.
@@ -1879,7 +1936,7 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 		switch op.Type {
 		case CommandRegisterFile:
 			emit = f.applyRegisterFileLocked(
-				decoded[i].(RegisterFilePayload), logIndex,
+				decoded[i].(RegisterFilePayload), logIndex, inherited[i],
 			)
 		case CommandDeleteFile:
 			emit = f.applyDeleteFileLocked(
@@ -2442,8 +2499,8 @@ func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 	}
 
 	var claimsState *streamClaimsState
-	if f.streamClaims || len(f.claims) > 0 {
-		claimsState = &streamClaimsState{Enabled: f.streamClaims, Claims: f.claimsListLocked()}
+	if tk := f.takeover.snapshot(); f.streamClaims || tk != nil {
+		claimsState = &streamClaimsState{Enabled: f.streamClaims, Takeover: tk}
 	}
 
 	return &fsmSnapshot{
@@ -2801,16 +2858,10 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		(restoredPause.Active && prevPause.Generation != restoredPause.Generation)
 	f.compactionPause = restoredPause
 	// Stream claims: absent from an older snapshot, which means off.
-	f.streamClaims, f.claims = false, nil
+	f.streamClaims, f.takeover = false, newTakeoverState()
 	if sc := snapshot.StreamClaims; sc != nil {
 		f.streamClaims = sc.Enabled
-		if len(sc.Claims) > 0 {
-			f.claims = make(map[uint64]*StreamClaim, len(sc.Claims))
-			for i := range sc.Claims {
-				c := sc.Claims[i]
-				f.claims[c.Instance] = &c
-			}
-		}
+		f.takeover = restoreTakeover(sc.Takeover)
 	}
 	onCompactionPauseChanged := f.onCompactionPauseChanged
 	f.nodes = restoredNodes
