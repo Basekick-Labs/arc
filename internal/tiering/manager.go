@@ -675,6 +675,18 @@ func (m *Manager) coldTierUsable() bool {
 // PreviewMigration returns the currently indexed candidates for a manual
 // filtered migration without copying, flipping metadata, or deleting files.
 func (m *Manager) PreviewMigration(ctx context.Context, fromTier, toTier Tier, database, measurement string) ([]MigrationCandidate, error) {
+	if m.roleGated() {
+		return nil, ErrMigrationRoleGated
+	}
+	if !m.licenseClient.CanUseTieredStorage() {
+		return nil, fmt.Errorf("tiered storage license is not available")
+	}
+	if fromTier != TierHot || toTier != TierCold {
+		return nil, fmt.Errorf("unsupported migration: %s -> %s (only hot -> cold supported)", fromTier, toTier)
+	}
+	if !m.coldTierUsable() {
+		return nil, fmt.Errorf("cold tier is not enabled")
+	}
 	return m.migrator.FindCandidatesFiltered(ctx, fromTier, toTier, database, measurement)
 }
 

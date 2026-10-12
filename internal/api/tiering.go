@@ -166,8 +166,16 @@ func (h *TieringHandler) TriggerMigration(c *fiber.Ctx) error {
 	if req.DryRun {
 		candidates, err := h.manager.PreviewMigration(ctx, fromTier, toTier, req.Database, req.Measurement)
 		if err != nil {
+			if errors.Is(err, tiering.ErrMigrationRoleGated) {
+				_, role := h.manager.MigrationGate()
+				h.logger.Info().Str("role", role).Msg("Manual migration preview rejected: node is not the primary writer")
+				status, body := migrationRoleGatedResponse(role)
+				return c.Status(status).JSON(body)
+			}
 			h.logger.Error().Err(err).Msg("Failed to preview migration")
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to preview migration"})
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"error": err.Error(),
+			})
 		}
 		var totalBytes int64
 		for _, candidate := range candidates {
