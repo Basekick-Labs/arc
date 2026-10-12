@@ -968,17 +968,7 @@ func (r *RegistrationOutbox) run(ctx context.Context, manifest OutboxManifest, s
 	delay, failures = outboxRetryMin, 0
 	for ctx.Err() == nil {
 		if err := r.SyncRegistrations(); err != nil {
-			if !backoff(err, "Could not publish pending file registrations; retrying") {
-				return
-			}
-			continue
-		}
-		break
-	}
-
-	for ctx.Err() == nil {
-		if err := r.publishPendingRegistrations(); err != nil {
-			if !backoff(err, "Failed to publish pending file registrations; retrying") {
+			if !backoff(err, "Could not sync and publish pending file registrations; retrying") {
 				return
 			}
 			continue

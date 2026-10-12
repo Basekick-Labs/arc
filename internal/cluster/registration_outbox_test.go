@@ -284,6 +284,7 @@ func journalSize(t *testing.T, dir string) int64 {
 const (
 	outPathA = "db/cpu/2026/10/11/10/cpu_a.parquet"
 	outPathB = "db/cpu/2026/10/11/10/cpu_b.parquet"
+	outPathC = "db/cpu/2026/10/11/10/cpu_c.parquet"
 )
 
 func register(r *RegistrationOutbox, path string, size int64) {
@@ -386,9 +387,11 @@ func TestOutboxChecksNoStorageOnAFreshFilesFirstAttempt(t *testing.T) {
 	r := newTestOutbox(t, t.TempDir())
 	m := newFakeOutboxManifest()
 	store := &fakeOutboxStorage{sizes: map[string]int64{outPathA: 10}}
-	r.HandOff(m, store, "writer-1")
 	register(r, outPathA, 10)
-	waitOutbox(t, "registered", func() bool { return m.isRegistered(outPathA) })
+	r.HandOff(m, store, "writer-1")
+	waitOutbox(t, "seed registration", func() bool { return m.isRegistered(outPathA) })
+	register(r, outPathB, 10)
+	waitOutbox(t, "registered after the drain became idle", func() bool { return m.isRegistered(outPathB) })
 	if n := store.stats.Load(); n != 0 {
 		t.Fatalf("%d storage checks for a file registered on its first attempt", n)
 	}
@@ -958,16 +961,18 @@ func TestOutboxWithdrawTakesAPendingFileOut(t *testing.T) {
 func TestOutboxHoldsRegistrationCoversRecentConfirmations(t *testing.T) {
 	r := newTestOutbox(t, t.TempDir())
 	m := newFakeOutboxManifest()
-	r.HandOff(m, &fakeOutboxStorage{sizes: map[string]int64{}}, "writer-1")
 	register(r, outPathA, 10)
-	if !r.HoldsRegistration(outPathA) {
+	r.HandOff(m, &fakeOutboxStorage{sizes: map[string]int64{}}, "writer-1")
+	waitOutbox(t, "seed registration", func() bool { return m.isRegistered(outPathA) })
+	register(r, outPathB, 10)
+	if !r.HoldsRegistration(outPathB) {
 		t.Fatal("a pending file is not held")
 	}
-	waitOutbox(t, "registered", func() bool { return r.Pending() == 0 })
-	if !r.HoldsRegistration(outPathA) {
+	waitOutbox(t, "registered", func() bool { return m.isRegistered(outPathB) })
+	if !r.HoldsRegistration(outPathB) {
 		t.Fatal("a file confirmed a moment ago is not held")
 	}
-	if r.HoldsRegistration(outPathB) {
+	if r.HoldsRegistration(outPathC) {
 		t.Fatal("an unknown file is held")
 	}
 }
