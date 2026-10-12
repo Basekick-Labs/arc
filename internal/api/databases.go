@@ -26,6 +26,7 @@ type DatabasesHandler struct {
 	requestTimeout time.Duration
 	deleteConfig   *config.DeleteConfig
 	coordinator    DatabaseDeleteCoordinator
+	gateNonPrimary bool
 	tieringManager databaseTieringManager
 	authManager    *auth.AuthManager
 	rbacManager    RBACChecker
@@ -50,24 +51,33 @@ type DatabaseDeleteCoordinator interface {
 	Role() string
 	GetFileManifestByDatabase(database string) []*raft.FileEntry
 	BatchFileOpsInManifestContext(ctx context.Context, ops []raft.BatchFileOp) error
+	SyncManifest(ctx context.Context) error
 }
 
 // databaseDeleteManifestChunkSize bounds each Raft proposal of manifest
-// deletes, like the tiering manager's manifestChunk.
-const databaseDeleteManifestChunkSize = 500
+// deletes; the same 200 as the tiering manager's manifestChunk. A batch a
+// non-leader primary forwards travels in a 1 MiB frame with its payload
+// encoded several times over, so 500 near-limit paths could exceed it.
+const databaseDeleteManifestChunkSize = 200
 
 // databaseDeleteManifestReason is the DeleteFilePayload reason for a database
 // drop. Same value as tiering's manifestReasonDatabaseDelete, so a peer treats
 // the unlink identically whichever path proposed it.
 const databaseDeleteManifestReason = "database:delete"
 
-// SetCoordinator wires cluster admission and manifest updates into database
-// deletion. Call before RegisterRoutes, alongside the other handler wiring.
-func (h *DatabasesHandler) SetCoordinator(c DatabaseDeleteCoordinator) {
+// SetCoordinator wires cluster manifest updates into database deletion, and
+// with gateNonPrimary the primary-writer admission check. Pass gateNonPrimary
+// under the same condition the tiering manager's writer gate is wired
+// (shared storage or replication), so a cluster answers the same way whether
+// tiered storage is enabled or not: without either, nodes share nothing, the
+// manifest delete unlinks nothing on peers, and each node may delete its own
+// files. Call before RegisterRoutes, alongside the other handler wiring.
+func (h *DatabasesHandler) SetCoordinator(c DatabaseDeleteCoordinator, gateNonPrimary bool) {
 	if c == nil {
 		return
 	}
 	h.coordinator = c
+	h.gateNonPrimary = gateNonPrimary
 }
 
 // SetFieldSchema installs the field schema registry so deleting a database
@@ -614,7 +624,7 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 			})
 		}
 		defer release()
-	} else if h.coordinator != nil && !h.coordinator.IsPrimaryWriter() {
+	} else if h.coordinator != nil && h.gateNonPrimary && !h.coordinator.IsPrimaryWriter() {
 		// No tiering manager: nothing above gated the request, so refuse a
 		// node that is not the primary writer here, as the row delete API and
 		// retention do (#1094). With tiering enabled, BeginDatabaseDelete
@@ -659,7 +669,14 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 	var manifestEntries []*raft.FileEntry
-	if h.coordinator != nil {
+	if h.coordinator != nil && h.tieringManager == nil {
+		// The snapshot below is this node's FSM, which can trail the leader;
+		// catch up first so registrations other writers just committed are
+		// included. A failure is logged, not fatal: the manifest batches
+		// below go through the leader and fail on their own if it is gone.
+		if err := h.coordinator.SyncManifest(ctx); err != nil {
+			h.logger.Warn().Err(err).Str("database", name).Msg("Could not sync the manifest before deleting the database; using this node's view")
+		}
 		manifestEntries = h.coordinator.GetFileManifestByDatabase(name)
 	}
 	// Deletion can make many independent storage and Raft calls. Scale the
@@ -677,7 +694,7 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 				"error": "Failed to prepare database deletion",
 			})
 		}
-	} else if err := h.deleteDatabaseManifestEntries(ctx, name, manifestEntries); err != nil {
+	} else if err := h.deleteDatabaseManifestEntries(ctx, name, files, manifestEntries); err != nil {
 		// #1094: a cluster without tiering has no tiering manager, so the
 		// manifest entries are removed here, with the same rules.
 		h.logger.Error().Err(err).Str("database", name).Msg("Failed to remove database files from the cluster manifest")
@@ -1132,11 +1149,26 @@ func (h *DatabasesHandler) databaseManifestPaths(database string, entries []*raf
 // batches before any local file is deleted. Raft records each successful
 // batch; on failure the caller stops so a retry can continue from the
 // remaining entries while the local copies are still available.
-func (h *DatabasesHandler) deleteDatabaseManifestEntries(ctx context.Context, database string, entries []*raft.FileEntry) error {
+func (h *DatabasesHandler) deleteDatabaseManifestEntries(ctx context.Context, database string, localFiles []string, entries []*raft.FileEntry) error {
 	if h.coordinator == nil {
 		return nil
 	}
+	// The local listing joins the manifest snapshot, as in the tiering
+	// manager's PrepareDatabaseDelete: a file this node holds may be
+	// registered under another Database field (an edge-sync hub indexes a
+	// spoke's files by the spoke's own database name), or not yet registered.
 	paths := h.databaseManifestPaths(database, entries)
+	seen := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		seen[p] = struct{}{}
+	}
+	for _, p := range localFiles {
+		if _, ok := seen[p]; !ok && strings.HasPrefix(p, database+"/") {
+			seen[p] = struct{}{}
+			paths = append(paths, p)
+		}
+	}
+	sort.Strings(paths)
 
 	for start := 0; start < len(paths); start += databaseDeleteManifestChunkSize {
 		end := min(start+databaseDeleteManifestChunkSize, len(paths))

@@ -17,6 +17,7 @@ import (
 )
 
 type databaseDeleteCoordinatorFake struct {
+	synced      int
 	primary     bool
 	role        string
 	entries     []*raft.FileEntry
@@ -28,7 +29,11 @@ type databaseDeleteCoordinatorFake struct {
 }
 
 func (f *databaseDeleteCoordinatorFake) IsPrimaryWriter() bool { return f.primary }
-func (f *databaseDeleteCoordinatorFake) Role() string          { return f.role }
+func (f *databaseDeleteCoordinatorFake) SyncManifest(context.Context) error {
+	f.synced++
+	return nil
+}
+func (f *databaseDeleteCoordinatorFake) Role() string { return f.role }
 
 func (f *databaseDeleteCoordinatorFake) GetFileManifestByDatabase(database string) []*raft.FileEntry {
 	var out []*raft.FileEntry
@@ -113,7 +118,7 @@ func TestDatabasesHandler_Delete1094RejectsNonPrimaryWriter(t *testing.T) {
 			handler, app, tmpDir := setupTestDatabasesHandler(t, true)
 			t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
 			coordinator := &databaseDeleteCoordinatorFake{role: role, primary: false}
-			handler.SetCoordinator(coordinator)
+			handler.SetCoordinator(coordinator, true)
 
 			resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/db?confirm=true", nil), testRequestTimeoutMS)
 			if err != nil {
@@ -162,7 +167,7 @@ func TestDatabasesHandler_Delete1094ManifestFirstChunkedAndRetryable(t *testing.
 		failOnBatch: 2,
 	}
 	handler.storage = &databaseDeleteRecordingBackend{Backend: backend, events: &events}
-	handler.SetCoordinator(coordinator)
+	handler.SetCoordinator(coordinator, true)
 
 	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/db?confirm=true", nil), testRequestTimeoutMS)
 	if err != nil {
@@ -267,7 +272,7 @@ func TestDatabasesHandler_Delete1094SkipsEdgeSyncSpokeEntries(t *testing.T) {
 			{Path: "rocket-01/telemetry/cpu/b.parquet", Database: "telemetry"},
 		},
 	}
-	handler.SetCoordinator(coordinator)
+	handler.SetCoordinator(coordinator, true)
 
 	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/telemetry?confirm=true", nil), testRequestTimeoutMS)
 	if err != nil {
@@ -309,7 +314,7 @@ func TestDatabasesHandler_Delete1094TieringManagerOwnsManifestRemoval(t *testing
 		role:    "reader",
 		entries: []*raft.FileEntry{{Path: "db/cpu/a.parquet", Database: "db"}},
 	}
-	handler.SetCoordinator(coordinator)
+	handler.SetCoordinator(coordinator, true)
 
 	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/db?confirm=true", nil), testRequestTimeoutMS)
 	if err != nil {
@@ -324,5 +329,69 @@ func TestDatabasesHandler_Delete1094TieringManagerOwnsManifestRemoval(t *testing
 	}
 	if len(events) == 0 || events[0] != "begin" {
 		t.Fatalf("tiering events = %v, want the tiering manager's begin/prepare/cleanup", events)
+	}
+}
+
+// A file this node holds but the manifest snapshot does not list under the
+// database — an edge-sync hub indexes a spoke namespace's files by the spoke's
+// own database name, or the file is not registered yet — is proposed too, as
+// the tiering manager's PrepareDatabaseDelete does with its hot listing. The
+// manifest is synced before the snapshot is read.
+func TestDatabasesHandler_Delete1094ProposesLocalFilesMissingFromTheManifest(t *testing.T) {
+	handler, app, tmpDir := setupTestDatabasesHandler(t, true)
+	t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
+	ctx := context.Background()
+	for _, p := range []string{"rocket-01/.arc-database", "rocket-01/telemetry/cpu/a.parquet"} {
+		if err := handler.storage.Write(ctx, p, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	coordinator := &databaseDeleteCoordinatorFake{primary: true, role: "writer",
+		entries: []*raft.FileEntry{{Path: "rocket-01/telemetry/cpu/a.parquet", Database: "telemetry"}}}
+	handler.SetCoordinator(coordinator, true)
+
+	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/rocket-01?confirm=true", nil), testRequestTimeoutMS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var proposed []string
+	for _, b := range coordinator.batches {
+		proposed = append(proposed, b...)
+	}
+	if len(proposed) != 1 || proposed[0] != "rocket-01/telemetry/cpu/a.parquet" {
+		t.Fatalf("proposed = %v, want the locally listed file", proposed)
+	}
+	if coordinator.synced == 0 {
+		t.Error("manifest not synced before reading the snapshot")
+	}
+}
+
+// Without shared storage or replication the cluster gate is off, as the
+// tiering manager's is: nodes share nothing and each may delete its own files.
+func TestDatabasesHandler_Delete1094UngatedWithoutSharedStorageOrReplication(t *testing.T) {
+	handler, app, tmpDir := setupTestDatabasesHandler(t, true)
+	t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
+	ctx := context.Background()
+	if err := handler.storage.Write(ctx, "db/.arc-database", []byte("marker")); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.storage.Write(ctx, "db/cpu/a.parquet", []byte("hot")); err != nil {
+		t.Fatal(err)
+	}
+	coordinator := &databaseDeleteCoordinatorFake{primary: false, role: "reader",
+		entries: []*raft.FileEntry{{Path: "db/cpu/a.parquet", Database: "db"}}}
+	handler.SetCoordinator(coordinator, false)
+
+	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/db?confirm=true", nil), testRequestTimeoutMS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("status = %d, want 200 on an ungated cluster", resp.StatusCode)
 	}
 }
