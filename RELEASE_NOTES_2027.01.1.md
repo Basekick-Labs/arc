@@ -1814,7 +1814,8 @@ incarnation's objects.
 Deleting a database now also removes its cold-tier objects and retires its tier
 rows. In a cluster the database's manifest entries are removed before any hot
 object is deleted, in batches, and a manifest failure aborts the deletion
-before anything is removed from storage. The response breaks the count out as
+before anything is removed from storage (with tiered storage disabled, see
+[#1094](https://github.com/Basekick-Labs/arc/issues/1094) below). The response breaks the count out as
 `hot_files_deleted` and `cold_files_deleted` rather than one total, because the
 cold half is the irreversible part.
 
@@ -1848,6 +1849,51 @@ one; on a cluster node that may not mutate the tiered store it answers 503 and
 names the primary writer to route to.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1166](https://github.com/Basekick-Labs/arc/pull/1166).
+
+### Database deletion on a cluster without tiered storage reaches every node ([#1094](https://github.com/Basekick-Labs/arc/issues/1094))
+
+The cluster half of the #1091 fix above runs through the tiered-storage
+manager. That manager exists only when `tiered_storage.enabled` is on, so a
+cluster without tiered storage kept the old behaviour: `DELETE
+/api/v1/databases/:name` deleted the database's files on the node that served
+it and nowhere else. Two things followed:
+
+- **Other nodes kept their copies.** Readers and the compactor kept their
+  replicas and kept answering queries for the dropped database.
+- **The manifest still listed the files.** A backup reported them as
+  manifest-only, and the re-pull path could copy them back onto the primary.
+
+The handler now takes the same steps on such a cluster:
+
+- **Primary only:** a node that is not the primary writer answers **503**,
+  naming its role. This applies on clusters with shared storage or
+  replication, the same rule as with tiered storage enabled. Without either,
+  nodes share nothing, so each node may still delete its own files.
+- **Manifest first:** the database's manifest entries are removed in batches
+  of 500 before any local file is deleted, so every node's delete worker
+  unlinks its copy.
+- **Abort on failure:** a failed batch aborts with a 500 before the local
+  sweep. Retry the request; batches already applied stay applied.
+- **Edge-sync spokes untouched:** on a hub, a spoke's database of the same
+  name is not touched, since its files live under `{spoke}/{db}/`.
+- **Database visible from the manifest:** a database the manifest still lists
+  counts as existing on a node that holds none of its files locally. So
+  `DELETE` there no longer answers 404, `GET /api/v1/databases/:name` finds
+  it, and `POST` answers 409 for that name.
+
+**With tiered storage enabled**, nothing changes: the tiered-storage manager
+already performs these steps. **Standalone**, nothing changes.
+
+Two limits, unchanged by this fix:
+- **In-memory unlink queue:** a peer's delete worker queues the unlink in
+  memory. If that node restarts or loses the primary before the unlink runs,
+  its copy stays on disk with no manifest entry.
+- **Leader change mid-delete:** a leader election during the deletion fails
+  the request after some batches were applied. Retry it. Tracked, with the
+  pending-registration follow-up, in
+  [#1236](https://github.com/Basekick-Labs/arc/issues/1236).
+
+Contributed by [@jallegri](https://github.com/jallegri) in [#1176](https://github.com/Basekick-Labs/arc/pull/1176).
 
 ### Crash smokes verify acknowledged records after WAL replay
 
