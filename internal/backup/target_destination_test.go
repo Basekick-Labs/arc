@@ -608,6 +608,60 @@ func TestListBackupsOnlyConsidersBackupIDDirectories(t *testing.T) {
 	}
 }
 
+// manifestFaultDestination makes a candidate backup's manifest unreadable or
+// malformed while leaving listing and every other object operation available.
+type manifestFaultDestination struct {
+	*storage.LocalBackend
+	path string
+	data []byte
+	err  error
+}
+
+func (b *manifestFaultDestination) Read(ctx context.Context, path string) ([]byte, error) {
+	if path == b.path {
+		return b.data, b.err
+	}
+	return b.LocalBackend.Read(ctx, path)
+}
+
+// A directory listing can succeed while every manifest fetch fails. Returning
+// an empty successful result would tell an operator their backups are gone
+// rather than unavailable. A malformed commit record is equally unreadable to
+// the listing and must be surfaced too.
+func TestListBackupsDoesNotReportEmptyWhenManifestIsUnreadable(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		data []byte
+		err  error
+	}{
+		{name: "read failure", err: errors.New("simulated manifest read failure")},
+		{name: "malformed manifest", data: []byte("not json")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			m := newBackupAt(t, t.TempDir(), "")
+			result, err := m.CreateBackup(ctx, BackupOptions{})
+			if err != nil {
+				t.Fatalf("CreateBackup: %v", err)
+			}
+
+			m.backupStorage = &manifestFaultDestination{
+				LocalBackend: m.backupStorage.(*storage.LocalBackend),
+				path:         result.Manifest.BackupID + "/manifest.json",
+				data:         tc.data,
+				err:          tc.err,
+			}
+			_, err = m.ListBackups(ctx)
+			if err == nil {
+				t.Fatal("ListBackups succeeded after a candidate manifest could not be read; want an error rather than an incomplete answer")
+			}
+			if !strings.Contains(err.Error(), result.Manifest.BackupID+"/manifest.json") {
+				t.Errorf("ListBackups error = %q, want it to name the unreadable manifest", err)
+			}
+		})
+	}
+}
+
 // countingDestination records which listing call the manager makes.
 type countingDestination struct {
 	storage.Backend

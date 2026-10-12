@@ -2340,6 +2340,24 @@ knowing: a merged table's live file list is concentrated in a single manifest, s
 manifest used to cost a fraction of the file list it now costs all of it, and nothing re-registers
 a lost manifest.
 
+### Backup listings report unreadable manifests instead of hiding backups ([#1123](https://github.com/Basekick-Labs/arc/issues/1123))
+
+When a backup ID was listed but its manifest could not be read or parsed, Arc
+silently skipped it. The listing now reports that destination as incomplete;
+when every configured destination is affected, it returns an error instead of
+an empty successful result. Readable backups on other destinations remain
+available in a partial listing.
+
+An incomplete destination contributes none of its backups, including the ones
+whose manifests read fine, because a listing that silently leaves out a backup
+is the problem this fixes. With a single destination, one manifest that cannot
+be parsed therefore makes `GET /api/v1/backup` answer 503 until it is repaired
+or removed. Retrying does not help in that case; the server log names the
+manifest (`Failed to parse manifest; target listing is incomplete`), and the
+other backups can still be fetched and restored by id.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1138](https://github.com/Basekick-Labs/arc/pull/1138).
+
 ### A backup fails loudly when compaction recovery state cannot be copied ([#1100](https://github.com/Basekick-Labs/arc/issues/1100))
 
 Object stores cap a key at 1024 bytes, and a backup writes every source key
