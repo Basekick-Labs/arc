@@ -981,6 +981,49 @@ an unbounded operation.
 
 ## Bug fixes
 
+### A storage error that only mentions "404" no longer reads as a missing object ([#1238](https://github.com/Basekick-Labs/arc/issues/1238))
+
+Arc decided whether an S3 or Azure object was missing by looking for `404`,
+`NotFound` or `NoSuchKey` anywhere in the error's text. That text carries the
+request URL (endpoint, bucket, key and, for a backup, the backup id), the
+storage service's request id and, for a connection failure, the local port. So
+an outage, a throttled request or a refused connection could read as "the
+object is not there" whenever one of those happened to contain the digits.
+Arc's file names carry nanosecond timestamps and backup ids carry the time
+they were taken, so this was not rare: an unreachable backup target answered
+`GET /api/v1/backup/{id}` with 404 `Backup not found` for every backup taken
+at a minute such as 14:04, and `POST /api/v1/backup/restore` started a restore
+with a guessed mode (202) instead of refusing. File-existence checks answered
+"absent" in the same cases. Tiering, edge sync, compaction, backup restore and
+the cluster's file replication all branch on those checks.
+
+A missing object is now recognised only from the storage service's own
+answer: `NoSuchKey` on an S3 read, the bodiless 404 of an S3 `HEAD`, and
+`BlobNotFound` on Azure. The backup API answers an unreachable target with 503
+naming the target, as it already did when the error text happened to contain
+no `404`.
+
+Two narrower changes come with it:
+
+- **A missing bucket or container is not a missing object.** Reading an object
+  from an S3 bucket that does not exist (`NoSuchBucket`), or from an Azure
+  container that does not exist, is now an error that says the store is
+  missing, instead of "object not found". The backup API answers 503 for a
+  target whose bucket does not exist, where it answered 404 or started a
+  restore. On Azure, checking whether a file exists in a missing container is
+  an error too. An S3 `HEAD` cannot tell a missing bucket from a missing key,
+  so on S3 that check still answers "absent".
+- **A 404 without a storage error code is an error.** A proxy or gateway
+  answering 404 with its own page, rather than the storage service's error, is
+  no longer taken to mean the object is missing. An S3-compatible store that
+  answers a read of a missing key without the `NoSuchKey` code would now
+  surface an error; AWS S3, MinIO and SeaweedFS all
+  send it.
+
+A local backend read of a missing file (`ReadTo`, ranged and staged reads) is
+now recognised as missing on every path, not only when the path contained
+`404`.
+
 ### Updating a continuous query or retention policy no longer resets the fields you leave out ([#1023](https://github.com/Basekick-Labs/arc/issues/1023))
 
 `PUT /api/v1/continuous_queries/:id` and `PUT /api/v1/retention/:id` wrote
@@ -2079,8 +2122,10 @@ checking whether a prefix holds any object — report a bucket or container that
 does not exist as a distinct error rather than as an error message, which is
 what lets those four read paths recognise it. Only the structured
 `NoSuchBucket` and `ContainerNotFound` responses are recognised; transport
-failures, authorization failures and every other storage error stay visible,
-and a failed read of a specific object is unchanged.
+failures, authorization failures and every other storage error stay visible.
+A read of a specific object from a missing bucket or container is reported the
+same way since [#1238](https://github.com/Basekick-Labs/arc/issues/1238) (see
+that entry).
 
 Everything else that lists storage still treats a store it cannot find as a
 failure, deliberately. Query planning drops a whole tier from a read when a

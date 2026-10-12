@@ -395,7 +395,7 @@ func (b *LocalBackend) ReadTo(ctx context.Context, path string, writer io.Writer
 	if err != nil {
 		metrics.Get().IncStorageErrors()
 		if os.IsNotExist(err) {
-			return fmt.Errorf("file not found: %s", path)
+			return fmt.Errorf("%w: %s", ErrObjectNotFound, path)
 		}
 		return fmt.Errorf("failed to open file: %w", err)
 	}
@@ -444,7 +444,7 @@ func (b *LocalBackend) ReadToAt(ctx context.Context, path string, writer io.Writ
 	if err != nil {
 		metrics.Get().IncStorageErrors()
 		if os.IsNotExist(err) {
-			return fmt.Errorf("file not found: %s", path)
+			return fmt.Errorf("%w: %s", ErrObjectNotFound, path)
 		}
 		return fmt.Errorf("failed to open file: %w", err)
 	}
@@ -1227,7 +1227,7 @@ func (b *LocalBackend) ReadStaged(ctx context.Context, key string, writer io.Wri
 	if err != nil {
 		metrics.Get().IncStorageErrors()
 		if os.IsNotExist(err) {
-			return fmt.Errorf("file not found: %s", key)
+			return fmt.Errorf("%w: %s", ErrObjectNotFound, key)
 		}
 		return fmt.Errorf("failed to open staged file: %w", err)
 	}

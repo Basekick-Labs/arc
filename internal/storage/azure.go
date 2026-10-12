@@ -297,7 +297,7 @@ func (b *AzureBlobBackend) Read(ctx context.Context, path string) ([]byte, error
 	resp, err := blobClient.DownloadStream(ctx, nil)
 	if err != nil {
 		recordStorageError(ctx, err)
-		return nil, fmt.Errorf("failed to read from Azure Blob Storage: %w", err)
+		return nil, azureReadError(err)
 	}
 	defer resp.Body.Close()
 
@@ -330,7 +330,7 @@ func (b *AzureBlobBackend) ReadTo(ctx context.Context, path string, writer io.Wr
 	resp, err := blobClient.DownloadStream(ctx, nil)
 	if err != nil {
 		recordStorageError(ctx, err)
-		return fmt.Errorf("failed to read from Azure Blob Storage: %w", err)
+		return azureReadError(err)
 	}
 	defer resp.Body.Close()
 
@@ -370,7 +370,7 @@ func (b *AzureBlobBackend) ReadToAt(ctx context.Context, path string, writer io.
 	resp, err := blobClient.DownloadStream(ctx, opts)
 	if err != nil {
 		recordStorageError(ctx, err)
-		return fmt.Errorf("failed to read from Azure Blob Storage: %w", err)
+		return azureReadError(err)
 	}
 	defer resp.Body.Close()
 
@@ -466,8 +466,8 @@ func (b *AzureBlobBackend) Delete(ctx context.Context, path string) error {
 
 	_, err = blobClient.Delete(ctx, nil)
 	if err != nil {
-		// Check if it's a "not found" error - that's okay
-		if isAzureNotFoundError(err) {
+		// Already gone (the blob, or its whole container) is what Delete wants.
+		if isAzureGoneError(err) {
 			return nil
 		}
 		return fmt.Errorf("failed to delete from Azure Blob Storage: %w", err)
@@ -532,7 +532,7 @@ func (b *AzureBlobBackend) DeleteBatch(ctx context.Context, paths []string) erro
 			if item.Error == nil {
 				continue
 			}
-			if isAzureNotFoundError(item.Error) {
+			if isAzureGoneError(item.Error) {
 				continue
 			}
 			// The service answers with the PREFIXED blob name. Report the
@@ -858,21 +858,36 @@ func azureListError(what string, err error) error {
 	return fmt.Errorf("%s: %w", what, err)
 }
 
-// isAzureNotFoundError checks if an error indicates the blob doesn't exist
+// isAzureNotFoundError reports Azure saying the blob does not exist: a 404
+// whose x-ms-error-code is BlobNotFound (Azure sends the header on a HEAD
+// too). It reads the response, never the error's text (#1238): a transport
+// failure's text carries the request URL and the local port, either of which
+// can contain "404" or "NotFound". A missing container is a missing store,
+// not a missing blob (see azureReadError); Delete accepts both as "already
+// gone". A 404 with no Azure code (a proxy's page) is an error.
 func isAzureNotFoundError(err error) bool {
 	if err == nil {
 		return false
 	}
-
-	// Check for Azure-specific error response using standard errors.As (handles multi-errors/errors.Join)
+	// errors.As handles wrapping and errors.Join.
 	var respErr *azcore.ResponseError
 	if errors.As(err, &respErr) {
-		return respErr.StatusCode == 404
+		return respErr.StatusCode == 404 && respErr.ErrorCode == "BlobNotFound"
 	}
+	return false
+}
 
-	// Fallback to string matching
-	errStr := err.Error()
-	return strings.Contains(errStr, "BlobNotFound") ||
-		strings.Contains(errStr, "404") ||
-		strings.Contains(errStr, "NotFound")
+// isAzureGoneError is Delete's "nothing to delete": the blob or its container
+// is not there.
+func isAzureGoneError(err error) bool {
+	return isAzureNotFoundError(err) || isAzureContainerNotFoundError(err)
+}
+
+// azureReadError wraps a failed read, tagging a missing container with
+// ErrStoreNotFound the way azureListError does.
+func azureReadError(err error) error {
+	if isAzureContainerNotFoundError(err) {
+		return fmt.Errorf("failed to read from Azure Blob Storage: %w: %w", err, ErrStoreNotFound)
+	}
+	return fmt.Errorf("failed to read from Azure Blob Storage: %w", err)
 }
