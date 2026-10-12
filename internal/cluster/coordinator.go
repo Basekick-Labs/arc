@@ -195,10 +195,18 @@ type Coordinator struct {
 	// deleteWg is per Start: Stop's wait is bounded, and a WaitGroup that a
 	// later Start reused while that wait was still parked would panic.
 	deleteWg *sync.WaitGroup
-	// deleteManifestHas answers whether the manifest lists a path again; a
+	// deleteManifestRelisted answers whether the manifest lists a path again; a
 	// worker skips such a path rather than unlink a file that is back. Nil
 	// before the puller starts and in tests: no check, unlink.
-	deleteManifestHas func(path string) bool
+	// When the path is listed it also forces a refresh of the local copy,
+	// which may be the previous version at the same size (#798), and reports
+	// what the puller did with it.
+	deleteManifestRelisted func(path string) (listed bool, refresh filereplication.RefreshOutcome)
+	// deleteRelistedLogged and deleteRelistedWarned throttle the logs of a
+	// kept relisted path: restores re-register in bulk, and a shutdown drain
+	// warns for every relisted path still pending.
+	deleteRelistedLogged atomic.Int64
+	deleteRelistedWarned atomic.Int64
 
 	// tierRecorder, when set, is this node's tier metadata for its own disk.
 	// The puller reports what it pulled and the delete workers report what
@@ -1049,7 +1057,7 @@ func (c *Coordinator) startDeleteWorkers() {
 	wake := make(chan struct{}, 1)
 	stop := make(chan struct{})
 	wg := &sync.WaitGroup{}
-	has := c.deleteManifestHas
+	relisted := c.deleteManifestRelisted
 	c.deletePendingMu.Lock()
 	c.deleteWake = wake
 	c.deletePendingMu.Unlock()
@@ -1057,7 +1065,7 @@ func (c *Coordinator) startDeleteWorkers() {
 	c.deleteWg = wg
 	for i := 0; i < deleteWorkerCount; i++ {
 		wg.Add(1)
-		go c.runDeleteWorker(stop, wake, wg, has)
+		go c.runDeleteWorker(stop, wake, wg, relisted)
 	}
 }
 
@@ -1092,7 +1100,7 @@ func (c *Coordinator) stopDeleteWorkers(stop chan struct{}, wg *sync.WaitGroup) 
 // still open it, takes the whole list and unlinks it. Once stop is closed it
 // skips the grace and keeps taking until the list is empty, then exits: Stop
 // has unregistered the FSM callbacks by then, so the list can only shrink.
-func (c *Coordinator) runDeleteWorker(stop <-chan struct{}, wake <-chan struct{}, wg *sync.WaitGroup, has func(string) bool) {
+func (c *Coordinator) runDeleteWorker(stop <-chan struct{}, wake <-chan struct{}, wg *sync.WaitGroup, relisted func(string) (bool, filereplication.RefreshOutcome)) {
 	defer wg.Done()
 	for {
 		select {
@@ -1102,7 +1110,7 @@ func (c *Coordinator) runDeleteWorker(stop <-chan struct{}, wake <-chan struct{}
 				if len(batch) == 0 {
 					return
 				}
-				c.unlinkBatch(batch, has)
+				c.unlinkBatch(batch, relisted)
 			}
 		case <-wake:
 			select {
@@ -1110,7 +1118,7 @@ func (c *Coordinator) runDeleteWorker(stop <-chan struct{}, wake <-chan struct{}
 				// Stopping: no grace; the branch above drains.
 			case <-time.After(deleteGrace):
 			}
-			c.unlinkBatch(c.takePendingDeletes(), has)
+			c.unlinkBatch(c.takePendingDeletes(), relisted)
 		}
 	}
 }
@@ -1118,11 +1126,17 @@ func (c *Coordinator) runDeleteWorker(stop <-chan struct{}, wake <-chan struct{}
 // unlinkBatch removes each local copy. Deletes run against a fresh context,
 // not the coordinator's: that one is already cancelled during a stop, and
 // the drain is exactly when the unlinks must still happen. A path the
-// manifest lists again is skipped — Arc's own file names never repeat, so
-// this guards imports and restores, not a known race.
-func (c *Coordinator) unlinkBatch(batch []deleteRequest, has func(string) bool) {
+// manifest lists again is kept: a delete followed by a re-registration of
+// the same path inside deleteGrace reaches the worker that way (#798). Since
+// #1073 Arc's DELETE rewrites and compaction publish fresh paths, so the
+// producers that reuse one are restores, imports, edge-sync and external Raft
+// writers. The kept copy may be the previous version at the same size, which
+// the puller's size check would accept, so the deleteManifestRelisted hook
+// asks the puller for a refresh that hashes the local copy first (it may
+// already be the new version) and unlinkOne reports what became of it.
+func (c *Coordinator) unlinkBatch(batch []deleteRequest, relisted func(string) (bool, filereplication.RefreshOutcome)) {
 	for _, item := range batch {
-		c.unlinkOne(item, has)
+		c.unlinkOne(item, relisted)
 		c.deleteDone()
 	}
 }
@@ -1182,13 +1196,56 @@ func (c *Coordinator) recordAbandonedFileInTiering(path string, sizeBytes int64)
 	}
 }
 
-func (c *Coordinator) unlinkOne(item deleteRequest, has func(string) bool) {
-	if has != nil && has(item.path) {
-		c.logger.Debug().
+// logKeptRelistedPath reports a local copy kept because the manifest lists its
+// path again. The copy is never unlinked here, whatever the refresh did: this
+// node may hold the only copy of the path (its origin), and an unlinked file
+// is gone while a stale one is still served until the refresh lands.
+func (c *Coordinator) logKeptRelistedPath(item deleteRequest, refresh filereplication.RefreshOutcome) {
+	switch refresh {
+	case filereplication.RefreshQueued, filereplication.RefreshSkippedSelf:
+		// Restores and imports can re-register paths in bulk: log the first
+		// one and then at powers of two, as the puller's queue-full warning.
+		n := c.deleteRelistedLogged.Add(1)
+		if n&(n-1) != 0 {
+			return
+		}
+		msg := "Local delete skipped: the manifest lists the path again; refreshing the local copy unless it already is the listed version"
+		if refresh == filereplication.RefreshSkippedSelf {
+			msg = "Local delete skipped: the manifest lists the path again; this node is its origin, nothing to refresh"
+		}
+		c.logger.Info().
 			Str("path", item.path).
 			Str("reason", item.reason).
-			Msg("Local delete skipped: the manifest lists the path again")
+			Int64("total_kept", n).
+			Msg(msg)
 		return
+	}
+	n := c.deleteRelistedWarned.Add(1)
+	if n&(n-1) != 0 {
+		return
+	}
+	switch refresh {
+	case filereplication.RefreshDropped:
+		c.logger.Warn().
+			Str("path", item.path).
+			Str("reason", item.reason).
+			Int64("total_warned", n).
+			Msg("Local delete skipped: the manifest lists the path again, but the file puller queue is full; the local copy may be the previous version until the path's next arrival or the periodic reconciliation (#1182)")
+	default:
+		c.logger.Warn().
+			Str("path", item.path).
+			Str("reason", item.reason).
+			Int64("total_warned", n).
+			Msg("Local delete skipped: the manifest lists the path again, but the file puller is stopped; the local copy is kept and may be the previous version (#1182)")
+	}
+}
+
+func (c *Coordinator) unlinkOne(item deleteRequest, relisted func(string) (bool, filereplication.RefreshOutcome)) {
+	if relisted != nil {
+		if listed, refresh := relisted(item.path); listed {
+			c.logKeptRelistedPath(item, refresh)
+			return
+		}
 	}
 	// One budget for the stat and the delete together. Both are a syscall on
 	// a local backend, which is the only backend this path runs on.
@@ -4268,13 +4325,16 @@ func (c *Coordinator) startFilePullerLocked() error {
 	// nudge. Before each unlink a worker asks the manifest whether it lists
 	// the path again; a nil FSM cannot answer, and the manifest is what
 	// asked for the delete, so that reads as "not listed".
-	c.deleteManifestHas = func(path string) bool {
+	c.deleteManifestRelisted = func(path string) (bool, filereplication.RefreshOutcome) {
 		fsm := raftNode.FSM()
 		if fsm == nil {
-			return false
+			return false, filereplication.RefreshInvalid
 		}
-		_, ok := fsm.GetFile(path)
-		return ok
+		entry, ok := fsm.GetFile(path)
+		if !ok {
+			return false, filereplication.RefreshInvalid
+		}
+		return true, puller.EnqueueVerifyContent(entry)
 	}
 	c.startDeleteWorkers()
 
