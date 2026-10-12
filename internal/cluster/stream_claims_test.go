@@ -188,3 +188,18 @@ func TestLocalCapabilitiesFollowTheEffectiveCoverage(t *testing.T) {
 		t.Fatal("a reader does not advertise stream claims")
 	}
 }
+
+// An oversized capability list is refused at join even without a secret.
+func TestJoinRefusesOversizedCapabilities(t *testing.T) {
+	c := originRig(t, "writer-1", RoleWriter)
+	c.cfg.SharedSecret = ""
+	many := make([]string, security.MaxJoinCapabilities+1)
+	for i := range many {
+		many[i] = "x"
+	}
+	req := &protocol.JoinRequest{NodeID: "reader-8", NodeName: "reader-8", Role: string(RoleReader), ClusterName: "test-cluster",
+		RaftAddr: "127.0.0.1:1", APIAddr: "127.0.0.1:2", CoordAddr: "127.0.0.1:3", Capabilities: many}
+	if resp := deliverJoin(t, c, req); resp != nil && resp.Success {
+		t.Fatal("an oversized capability list joined")
+	}
+}

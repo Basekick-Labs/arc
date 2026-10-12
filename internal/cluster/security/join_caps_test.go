@@ -28,3 +28,24 @@ func TestJoinCapsHMAC(t *testing.T) {
 		}
 	}
 }
+
+func TestJoinCapabilitiesAreBounded(t *testing.T) {
+	many := make([]string, MaxJoinCapabilities+1)
+	for i := range many {
+		many[i] = "c"
+	}
+	long := []string{string(make([]byte, MaxJoinCapabilityLen+1))}
+	for name, caps := range map[string][]string{"too many": many, "too long": long, "empty": {""}} {
+		if CheckJoinCapabilities(caps) == nil {
+			t.Errorf("%s capabilities accepted", name)
+		}
+		f := JoinAuthFields{NodeID: "w1"}
+		ts := time.Now().Unix()
+		if ValidateJoinCapsHMAC("s", "n", ts, f, caps, ComputeJoinCapsHMAC("s", "n", ts, f, caps), time.Minute) == nil {
+			t.Errorf("%s capabilities validated", name)
+		}
+	}
+	if CheckJoinCapabilities([]string{"stream_claims_v1"}) != nil || CheckJoinCapabilities(nil) != nil {
+		t.Fatal("normal capabilities refused")
+	}
+}

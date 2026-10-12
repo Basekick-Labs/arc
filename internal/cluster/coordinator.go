@@ -1887,6 +1887,7 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 		}
 		// Capabilities are outside the first MAC (an older leader would
 		// refuse a field it does not know); the second one covers them.
+		// Bounded first, also when no secret is configured (below).
 		if len(req.Capabilities) > 0 {
 			if err := security.ValidateJoinCapsHMAC(c.cfg.SharedSecret, req.AuthNonce, req.AuthTimestamp,
 				joinAuthFields(req), req.Capabilities, req.AuthHMAC2, security.HMACTimestampTolerance); err != nil {
@@ -1895,6 +1896,14 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 				return
 			}
 		}
+	}
+
+	// Bound the advertised capabilities whether or not a secret is set:
+	// they are stored on the node record and replicated (#1207).
+	if err := security.CheckJoinCapabilities(req.Capabilities); err != nil {
+		c.logger.Warn().Str("node_id", req.NodeID).Int("capabilities", len(req.Capabilities)).Msg("Join rejected: capabilities exceed their bounds")
+		c.sendJoinError(conn, req, joinAuthFailedMsg)
+		return
 	}
 
 	// Validate the role the joiner presents.
