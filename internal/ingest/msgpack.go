@@ -245,7 +245,13 @@ func (d *MessagePackDecoder) decodeColumnar(payload *models.MsgPackPayload, rawD
 
 	// Ensure 'time' column exists
 	timeCol, hasTime := payload.Columns["time"]
+	// The WAL must keep the time this write was acknowledged with (#1207): a
+	// replay of the raw payload would generate the replay time instead, and
+	// land the rows in another hour. Without a time column the WAL entry is
+	// built from the decoded columns, generated time included.
+	walPayload := rawData
 	if !hasTime || timeCol == nil || len(timeCol) == 0 {
+		walPayload = nil
 		// Generate timestamps if missing - log warning so users know their data lacked timestamps
 		d.logger.Warn().
 			Str("measurement", measurement).
@@ -279,8 +285,8 @@ func (d *MessagePackDecoder) decodeColumnar(payload *models.MsgPackPayload, rawD
 		Measurement: measurement,
 		Columnar:    true,
 		Columns:     payload.Columns,
-		TimeUnit:    "us",    // microseconds
-		RawPayload:  rawData, // Zero-copy: store original msgpack bytes for WAL
+		TimeUnit:    "us",       // microseconds
+		RawPayload:  walPayload, // Zero-copy: store original msgpack bytes for WAL
 	}, nil
 }
 

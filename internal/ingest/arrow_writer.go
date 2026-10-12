@@ -3919,6 +3919,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		sizeBytes   int64
 		sha256Hex   string
 		records     int
+		pieces      []CoveragePiece
 	}
 	written := make([]tieringEntry, 0, len(hourBuckets))
 
@@ -3958,6 +3959,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 			sizeBytes:   int64(len(parquetData)),
 			sha256Hex:   parquetSumHex,
 			records:     splitRecordCount,
+			pieces:      group.piecesAt(bucket.indices),
 		})
 
 		b.logger.Info().
@@ -3973,7 +3975,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	totalWritten := 0
 	cov := groupCoverage(group, len(written))
 	for _, e := range written {
-		b.registerFileInTiering(ctx, database, measurement, e.storagePath, e.bucketTime, e.sizeBytes, e.sha256Hex, cov)
+		b.registerFileInTiering(ctx, database, measurement, e.storagePath, e.bucketTime, e.sizeBytes, e.sha256Hex, cov.forFile(e.pieces))
 		totalWritten += e.records
 	}
 

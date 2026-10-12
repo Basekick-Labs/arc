@@ -38,9 +38,10 @@ type fakeOutboxManifest struct {
 	deleted     []string
 	batches     [][]string
 	existing    map[string]bool
-	claims      bool                   // StreamClaimsEnabled
-	coverage    []raft.FileCoverage    // coverage carried by registrations
-	refuse      func(path string) bool // a claim refuses this registration
+	claims      bool                    // StreamClaimsEnabled
+	coverage    []raft.InstanceCoverage // coverage carried by registrations
+	supersedes  []string                // Supersedes carried by registrations
+	refuse      func(path string) bool  // a claim refuses this registration
 }
 
 func newFakeOutboxManifest() *fakeOutboxManifest {
@@ -80,7 +81,7 @@ func (m *fakeOutboxManifest) GetFileEntry(path string) (*raft.FileEntry, bool) {
 func (m *fakeOutboxManifest) BatchFileOpsInManifestContext(_ context.Context, ops []raft.BatchFileOp) error {
 	var entries []raft.FileEntry
 	var paths, deletes []string
-	var refused []int
+	var refused []raft.RefusedOp
 	m.mu.Lock()
 	refuse := m.refuse
 	m.mu.Unlock()
@@ -100,10 +101,13 @@ func (m *fakeOutboxManifest) BatchFileOpsInManifestContext(_ context.Context, op
 		entries = append(entries, p.File)
 		paths = append(paths, p.File.Path)
 		if refuse != nil && refuse(p.File.Path) {
-			refused = append(refused, i)
+			refused = append(refused, raft.RefusedOp{Op: i, Kind: raft.RefusedClaimed})
 		}
 		m.mu.Lock()
-		m.coverage = append(m.coverage, p.Coverage...)
+		m.coverage = append(m.coverage, p.Cov2...)
+		if p.Supersedes != "" {
+			m.supersedes = append(m.supersedes, p.Supersedes)
+		}
 		m.mu.Unlock()
 	}
 	m.mu.Lock()

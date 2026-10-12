@@ -587,7 +587,11 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		cmd.Type == clusterraft.CommandBatchFileOps
 	// A stream claim (#1207) is proposed by the writer taking over, for
 	// itself.
-	isTakeOver := cmd.Type == clusterraft.CommandTakeOverStream
+	isTakeOver := cmd.Type == clusterraft.CommandTakeOverStreamV2 ||
+		cmd.Type == clusterraft.CommandAnnounceInstance ||
+		cmd.Type == clusterraft.CommandSettleCoverage ||
+		cmd.Type == clusterraft.CommandClaimDone ||
+		cmd.Type == clusterraft.CommandInstanceSettled
 	isAuth := cmd.Type == clusterraft.CommandCreateToken ||
 		cmd.Type == clusterraft.CommandUpdateToken ||
 		cmd.Type == clusterraft.CommandRevokeToken ||
@@ -861,13 +865,45 @@ func manifestCommandSpeaksFor(cmd *clusterraft.Command, nodeID string) error {
 				}
 			}
 		}
-	case clusterraft.CommandTakeOverStream:
-		var p clusterraft.TakeOverStreamPayload
+	case clusterraft.CommandTakeOverStreamV2:
+		var p clusterraft.TakeOverStreamV2Payload
 		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
 			return err
 		}
 		if p.By != nodeID {
 			return fmt.Errorf("stream claim for %q is not by the requesting node", p.By)
+		}
+	case clusterraft.CommandClaimDone:
+		var p clusterraft.ClaimDonePayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.By != nodeID {
+			return fmt.Errorf("claim done for %q is not by the requesting node", p.By)
+		}
+	case clusterraft.CommandAnnounceInstance:
+		var p clusterraft.AnnounceInstancePayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.Origin != nodeID {
+			return fmt.Errorf("instance announcement for %q is not by the requesting node", p.Origin)
+		}
+	case clusterraft.CommandSettleCoverage:
+		var p clusterraft.SettleCoveragePayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.Origin != nodeID {
+			return fmt.Errorf("coverage settlement for %q is not by the requesting node", p.Origin)
+		}
+	case clusterraft.CommandInstanceSettled:
+		var p clusterraft.InstanceSettledPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.Origin != nodeID {
+			return fmt.Errorf("instance settlement for %q is not by the requesting node", p.Origin)
 		}
 	}
 	return nil

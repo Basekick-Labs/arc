@@ -923,7 +923,6 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 	var ops []raft.BatchFileOp
 	var sent []*outboxEntry
 	opEntry := map[int]*outboxEntry{} // register op index -> entry
-	withCoverage := manifest.StreamClaimsEnabled()
 	bytes := 0
 	for _, e := range candidates {
 		if bytes >= registrarDrainChunkBytes {
@@ -942,10 +941,9 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 				continue
 			}
 		}
-		rp := raft.RegisterFilePayload{File: r.fileEntry(e.rec)}
-		if withCoverage {
-			rp.Coverage = fileCoverage(e.rec.Cov)
-		}
+		// Coverage goes with every covered file: an FSM without stream
+		// takeover ignores it, one with it needs it from the first file.
+		rp := raft.RegisterFilePayload{File: r.fileEntry(e.rec), Cov2: fileCoverage(e.rec.Cov), Supersedes: e.rec.Supersedes}
 		payload, err := json.Marshal(rp)
 		if err != nil || raft.ValidateManifestPath(e.rec.Path) != nil {
 			r.skipped.Add(1)
@@ -1011,7 +1009,7 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 					e.vanished = true
 					r.mu.Unlock()
 					dctx, cancel := context.WithTimeout(context.Background(), outboxAttemptTimeout)
-					if err := manifest.DeleteFileFromManifest(dctx, e.rec.Path, "vanished-before-registration"); err != nil {
+					if err := manifest.DeleteFileFromManifest(dctx, e.rec.Path, raft.DeleteReasonVanished); err != nil {
 						r.logger.Warn().Err(err).Str("path", e.rec.Path).
 							Msg("File vanished while being registered and its manifest entry could not be removed")
 					}
@@ -1441,8 +1439,8 @@ func (r *RegistrationOutbox) fileEntry(rec journalRecord) raft.FileEntry {
 // leave the original file registered.
 func (r *RegistrationOutbox) refuseClaimed(ctx context.Context, manifest OutboxManifest, err error, opEntry map[int]*outboxEntry) []*outboxEntry {
 	var out []*outboxEntry
-	for _, i := range raft.StreamClaimConflictOps(err) {
-		e := opEntry[i]
+	for _, op := range raft.StreamClaimConflictOps(err) {
+		e := opEntry[op.Op]
 		if e == nil {
 			continue
 		}
@@ -1461,36 +1459,57 @@ func (r *RegistrationOutbox) refuseClaimed(ctx context.Context, manifest OutboxM
 		e.refused = true
 		r.mu.Unlock()
 		out = append(out, e)
-		r.logger.Warn().Str("path", e.rec.Path).
-			Msg("File registration refused: another writer took over these rows; the file is kept and not registered")
+		r.logger.Warn().Str("path", e.rec.Path).Str("kind", op.Kind).
+			Msg("File registration refused by the stream takeover rules; the file is kept and not registered")
 	}
 	return out
 }
 
-// fileCoverage is the part of a group's coverage the claim rule reads: per
-// instance, the lowest batch. A coverage the journal truncated is marked so
-// the rule refuses conservatively.
-func fileCoverage(cov *ingest.GroupCoverage) []raft.FileCoverage {
+// fileCoverage is a file's exact coverage as the cluster manifest records
+// it, per writer instance (#1207 S4b). Over maxFileCoverageBytes it is sent
+// truncated: the manifest then refuses nothing on its account, and the
+// instance stops being tracked for takeover.
+func fileCoverage(cov *ingest.GroupCoverage) []raft.InstanceCoverage {
 	if cov == nil {
 		return nil
 	}
-	truncated := cov.RangesOmitted > 0 || cov.PartialOmitted > 0
-	min := map[uint64]uint64{}
-	note := func(inst, c uint64) {
-		if m, ok := min[inst]; !ok || c < m {
-			min[inst] = c
+	ranges, partial, exact := cov.FilePieces()
+	by := map[uint64]*raft.InstanceCoverage{}
+	get := func(inst uint64) *raft.InstanceCoverage {
+		if c := by[inst]; c != nil {
+			return c
+		}
+		c := &raft.InstanceCoverage{Instance: inst, Key: cov.Key, Truncated: !exact}
+		by[inst] = c
+		return c
+	}
+	for _, rg := range ranges {
+		c := get(rg.Instance)
+		c.Ranges = append(c.Ranges, [2]uint64{rg.Lo, rg.Hi})
+	}
+	for _, p := range partial {
+		c := get(p.Instance)
+		c.Partial = append(c.Partial, raft.CoveragePiece{CSeq: p.CSeq, Chunk: p.Chunk, Chunks: p.Chunks, RowLo: p.RowLo, RowHi: p.RowHi, RowTotal: p.RowTotal})
+	}
+	if !exact {
+		// The journal truncated it: name the instances, list nothing.
+		for _, b := range cov.Bounds {
+			get(b.Instance)
 		}
 	}
-	for _, rg := range cov.Ranges {
-		note(rg.Instance, rg.Lo)
-	}
-	for _, p := range cov.Partial {
-		note(p.Instance, p.CSeq)
-	}
-	out := make([]raft.FileCoverage, 0, len(min))
-	for inst, c := range min {
-		out = append(out, raft.FileCoverage{Instance: inst, Key: cov.Key, MinCSeq: c, Truncated: truncated})
+	out := make([]raft.InstanceCoverage, 0, len(by))
+	for _, c := range by {
+		out = append(out, *c)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Instance < out[j].Instance })
+	if raw, err := json.Marshal(out); err == nil && len(raw) > maxFileCoverageBytes {
+		for i := range out {
+			out[i].Ranges, out[i].Partial, out[i].Truncated = nil, nil, true
+		}
+	}
 	return out
 }
+
+// maxFileCoverageBytes bounds one registration's coverage, so a batch of
+// registrations stays within the 1 MiB forward frame.
+const maxFileCoverageBytes = 64 << 10

@@ -748,7 +748,7 @@ func (h *ClusterHandler) handleGetFiles(c *fiber.Ctx) error {
 		}
 
 		return c.JSON(fiber.Map{
-			"files":       files,
+			"files":       withoutCoverage(files),
 			"total":       len(files),
 			"next_cursor": nextCursor,
 		})
@@ -763,9 +763,21 @@ func (h *ClusterHandler) handleGetFiles(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{
-		"files": files,
+		"files": withoutCoverage(files),
 		"total": len(files),
 	})
+}
+
+// withoutCoverage returns copies of files without their batch coverage
+// (#1207 S4b): it is cluster-internal, and would multiply a page's size.
+func withoutCoverage(files []*clusterraft.FileEntry) []*clusterraft.FileEntry {
+	out := make([]*clusterraft.FileEntry, len(files))
+	for i, f := range files {
+		cp := *f
+		cp.Coverage = nil
+		out[i] = &cp
+	}
+	return out
 }
 
 // paginateSlice applies cursor-based pagination to an in-memory slice.

@@ -1180,7 +1180,10 @@ func (h *DeleteHandler) replaceManifestAfterRewrite(ctx context.Context, oldPath
 		entry.SHA256 = sha
 	}
 
-	registerPayload, err := json.Marshal(raft.RegisterFilePayload{File: entry})
+	// The rewrite holds the old file's rows minus the deleted ones: it takes
+	// over the old file's batch coverage (#1207 S4b).
+	entry.Coverage = nil
+	registerPayload, err := json.Marshal(raft.RegisterFilePayload{File: entry, InheritFrom: oldPath})
 	if err != nil {
 		return fmt.Errorf("%w: marshal replacement register: %v", errManifestFailure, err)
 	}

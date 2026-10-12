@@ -30,6 +30,7 @@ var capList = []string{raft.CapabilityStreamClaims}
 func TestStreamClaimsEnableWaitsForEveryNode(t *testing.T) {
 	c := originRig(t, "writer-1", RoleWriter)
 	c.cfg.WALCoverage = true
+	c.cfg.StreamTakeover = true
 	// The rig's raft server is "raft-1": it must be a capable node too.
 	capNodes(t, c, map[string][]string{"raft-1": capList, "writer-1": capList, "writer-2": capList, "reader-1": nil})
 	c.maybeEnableStreamClaims()
@@ -72,6 +73,7 @@ func TestStreamClaimsJoinGate(t *testing.T) {
 	c.streamClaimsMu.Unlock()
 	release()
 	c.cfg.WALCoverage = true
+	c.cfg.StreamTakeover = true
 	capNodes(t, c, map[string][]string{"raft-1": capList, "writer-1": capList, "writer-2": capList, "reader-1": capList})
 	c.maybeEnableStreamClaims()
 	waitFSM(t, c.StreamClaimsEnabled)
@@ -98,7 +100,12 @@ func TestManifestCommandSpeaksFor(t *testing.T) {
 		{Type: raft.CommandRegisterFile, Payload: reg("w1")},
 		{Type: raft.CommandRegisterFile, Payload: reg("w2")},
 	}})
-	take, _ := json.Marshal(raft.TakeOverStreamPayload{By: "w2"})
+	take, _ := json.Marshal(raft.TakeOverStreamV2Payload{By: "w2"})
+	done, _ := json.Marshal(raft.ClaimDonePayload{By: "w2"})
+	ann, _ := json.Marshal(raft.AnnounceInstancePayload{Origin: "w2"})
+	settle, _ := json.Marshal(raft.SettleCoveragePayload{Origin: "w2"})
+	settled, _ := json.Marshal(raft.InstanceSettledPayload{Origin: "w2"})
+	own, _ := json.Marshal(raft.AnnounceInstancePayload{Origin: "w1"})
 	for name, tc := range map[string]struct {
 		cmd raft.Command
 		ok  bool
@@ -107,7 +114,12 @@ func TestManifestCommandSpeaksFor(t *testing.T) {
 		"another origin":       {raft.Command{Type: raft.CommandRegisterFile, Payload: reg("w2")}, false},
 		"no origin":            {raft.Command{Type: raft.CommandRegisterFile, Payload: reg("")}, false},
 		"batch with a foreign": {raft.Command{Type: raft.CommandBatchFileOps, Payload: batch}, false},
-		"claim for another":    {raft.Command{Type: raft.CommandTakeOverStream, Payload: take}, false},
+		"claim for another":    {raft.Command{Type: raft.CommandTakeOverStreamV2, Payload: take}, false},
+		"done for another":     {raft.Command{Type: raft.CommandClaimDone, Payload: done}, false},
+		"announce another":     {raft.Command{Type: raft.CommandAnnounceInstance, Payload: ann}, false},
+		"settle another":       {raft.Command{Type: raft.CommandSettleCoverage, Payload: settle}, false},
+		"settled another":      {raft.Command{Type: raft.CommandInstanceSettled, Payload: settled}, false},
+		"own announcement":     {raft.Command{Type: raft.CommandAnnounceInstance, Payload: own}, true},
 	} {
 		err := manifestCommandSpeaksFor(&tc.cmd, "w1")
 		if (err == nil) != tc.ok {
@@ -122,19 +134,29 @@ func TestForwardApplyClaimWiring(t *testing.T) {
 	c := originRig(t, "writer-1", RoleWriter)
 	c.raftFSM = c.raftNode.FSM()
 	c.cfg.WALCoverage = true
+	c.cfg.StreamTakeover = true
 	if ack := forwardOnce(t, c, "writer-2", registerFileCommand(t, "testdb/cpu/2026/10/12/10/spoof.parquet", "writer-1")); ack.Status == "ok" || ack.Code != protocol.ForwardCodeAuth {
 		t.Fatalf("spoofed origin: %+v", ack)
 	}
 	capNodes(t, c, map[string][]string{"raft-1": capList, "writer-1": capList, "writer-2": capList, "reader-1": capList})
 	c.maybeEnableStreamClaims()
 	waitFSM(t, c.StreamClaimsEnabled)
-	take, _ := json.Marshal(raft.TakeOverStreamPayload{Instance: 7, Origin: "writer-1", By: "writer-2", Epoch: 1, W: map[string]uint64{"testdb/cpu": 10}, Now: time.Now()})
-	if ack := forwardOnce(t, c, "writer-2", &raft.Command{Type: raft.CommandTakeOverStream, Payload: take}); ack.Status != "ok" {
+	// writer-1 runs instance 7, restarts on new disks as 8: 7 is orphaned,
+	// and any healthy writer may claim it.
+	for _, inst := range []uint64{7, 8} {
+		ann, _ := json.Marshal(raft.AnnounceInstancePayload{Origin: "writer-1", Instance: inst, FreshStart: true})
+		if err := c.raftNode.Apply(&raft.Command{Type: raft.CommandAnnounceInstance, Payload: ann}, 5*time.Second); err != nil {
+			t.Fatalf("announce %d: %v", inst, err)
+		}
+	}
+	take, _ := json.Marshal(raft.TakeOverStreamV2Payload{Origin: "writer-1", By: "writer-2", Now: time.Now(),
+		Claims: []raft.ClaimSet{{Instance: 7, Keys: map[string]raft.Intervals{"testdb/cpu": {{1, 10}}}}}})
+	if ack := forwardOnce(t, c, "writer-2", &raft.Command{Type: raft.CommandTakeOverStreamV2, Payload: take}); ack.Status != "ok" {
 		t.Fatalf("claim: %+v", ack)
 	}
 	entry := makeFileEntry("testdb/cpu/2026/10/12/10/claimed.parquet", []byte("x"), "writer-2")
 	entry.CreatedAt = time.Now()
-	raw, _ := json.Marshal(raft.RegisterFilePayload{File: entry, Coverage: []raft.FileCoverage{{Instance: 7, Key: "testdb/cpu", MinCSeq: 3}}})
+	raw, _ := json.Marshal(raft.RegisterFilePayload{File: entry, Cov2: []raft.InstanceCoverage{{Instance: 7, Key: "testdb/cpu", Ranges: [][2]uint64{{3, 3}}}}})
 	ack := forwardOnce(t, c, "writer-2", &raft.Command{Type: raft.CommandRegisterFile, Payload: raw})
 	if ack.Status == "ok" || ack.Code != protocol.ForwardCodeClaimConflict {
 		t.Fatalf("claimed rows: %+v, want claim_conflict", ack)
@@ -171,11 +193,17 @@ func TestJoinCarriesCapabilitiesToTheNodeRecord(t *testing.T) {
 	})
 }
 
-// A join from a writer without coverage in effect advertises nothing; with
-// it, stream claims.
+// A node advertises stream claims only with cluster.stream_takeover on; a
+// writer also needs coverage in effect.
 func TestLocalCapabilitiesFollowTheEffectiveCoverage(t *testing.T) {
 	c := originRig(t, "writer-1", RoleWriter)
 	c.cfg.WALCoverage = true // the setting alone is not enough
+	c.SetWALCoverageActive(true)
+	if caps := c.localCapabilities(); len(caps) != 0 {
+		t.Fatalf("advertised %v without cluster.stream_takeover", caps)
+	}
+	c.cfg.StreamTakeover = true
+	c.SetWALCoverageActive(false)
 	if caps := c.localCapabilities(); len(caps) != 0 {
 		t.Fatalf("advertised %v without coverage in effect", caps)
 	}
@@ -184,6 +212,10 @@ func TestLocalCapabilitiesFollowTheEffectiveCoverage(t *testing.T) {
 		t.Fatalf("advertised %v with coverage in effect", caps)
 	}
 	reader := originRig(t, "reader-1", RoleReader)
+	if caps := reader.localCapabilities(); len(caps) != 0 {
+		t.Fatal("a reader advertised stream claims without cluster.stream_takeover")
+	}
+	reader.cfg.StreamTakeover = true
 	if caps := reader.localCapabilities(); !hasCapability(caps, raft.CapabilityStreamClaims) {
 		t.Fatal("a reader does not advertise stream claims")
 	}

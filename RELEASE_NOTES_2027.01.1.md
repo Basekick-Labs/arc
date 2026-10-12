@@ -302,12 +302,24 @@ All writers in the cluster must run this release before the setting is turned
 on: a writer from an older release does not understand the standby connection
 and logs it as an unknown message type.
 
-**Groundwork for takeover (inert).** Nodes now advertise, when they join, whether
-they can apply stream claims, the rule that will let a standby writer take
-over a failed primary's rows without duplicating them. The advertisement is
-covered by its own MAC next to the existing join MAC, so a rolling upgrade
-keeps working against a leader from an older release. Nothing turns stream
-claims on in this release, and nothing changes until a later release does.
+**Groundwork for takeover (inert).** Nothing here changes behaviour in this
+release:
+- A new setting, `cluster.stream_takeover` (default off), opts a node into
+  stream takeover. Takeover lets a standby writer publish the rows a failed
+  primary acknowledged but never registered, exactly once. It needs every node
+  of the cluster to opt in, writers with `cluster.wal_coverage` on.
+- Only nodes with the setting on advertise takeover support when they join.
+  The advertisement is covered by its own MAC next to the existing join MAC, so
+  a rolling upgrade keeps working against a leader from an older release.
+- A covered file's registration carries the exact batches it holds. When a
+  flush spans several partition hours, each hour's file lists only the batches
+  with rows in it. This is the one cost of `cluster.wal_coverage` without
+  takeover: up to 64 KiB per registration in the Raft log, usually a few
+  bytes, which a cluster without takeover discards.
+- The cluster manifest has the rules that will refuse a second copy of a
+  batch, and the origin's copy of batches a standby took over.
+
+Nothing turns takeover on in this release.
 
 **Rollback warning.** WAL entries written with the setting on use a new format.
 This release reads it, but older releases cannot: they quarantine those entries
@@ -1053,6 +1065,18 @@ WAL purge stopped at a file holding flush proof for an earlier process WAL file;
 Nothing to configure. A WAL directory that grew under this bug is reclaimed
 when the node restarts on this release: startup recovery deletes the files
 whose entries are already flushed.
+
+### Rows written without a time column keep their ingest time after a WAL replay ([#1207](https://github.com/Basekick-Labs/arc/issues/1207))
+
+A columnar MessagePack write without a `time` column gets the time it was
+ingested. The WAL kept the payload as the client sent it, without that time.
+A replay of the entry after a crash, or after a failed flush, generated the
+time again, as the replay time. The rows landed with a later timestamp than
+the one they were acknowledged with, possibly in a later hour partition.
+
+The WAL entry of such a write now holds the generated time. These writes no
+longer take the typed fast decode path, which cannot keep the time in the WAL.
+Writes that carry a `time` column are unchanged.
 
 ### A write with a numeric measurement no longer poisons its WAL file ([#1225](https://github.com/Basekick-Labs/arc/issues/1225))
 

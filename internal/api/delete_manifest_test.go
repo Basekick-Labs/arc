@@ -84,6 +84,10 @@ func TestReplaceManifestAfterRewritePublishesImmutableFile(t *testing.T) {
 	if registerPayload.File.Path != newPath {
 		t.Fatalf("registered path = %q, want %q", registerPayload.File.Path, newPath)
 	}
+	// The rewrite takes over the old file's batch coverage (#1207 S4b).
+	if registerPayload.InheritFrom != oldPath || len(registerPayload.File.Coverage) != 0 {
+		t.Fatalf("InheritFrom = %q, coverage %v; want %q and none", registerPayload.InheritFrom, registerPayload.File.Coverage, oldPath)
+	}
 	if registerPayload.File.OriginNodeID != "new-primary" {
 		t.Fatalf("OriginNodeID = %q, want new-primary", registerPayload.File.OriginNodeID)
 	}
@@ -282,5 +286,13 @@ func TestRewriteReportsSourceRetiredByConcurrentDelete(t *testing.T) {
 	}
 	if _, err := h.rewriteFileWithoutDeletedRows(context.Background(), full, relativePath, "host = 'h1'"); errors.Is(err, errSourceRetired) {
 		t.Errorf("a present source was reported as retired: %v", err)
+	}
+}
+
+func TestClusterFilesListingOmitsCoverage(t *testing.T) {
+	in := []*raft.FileEntry{{Path: "p", Coverage: []raft.InstanceCoverage{{Instance: 1, Key: "k"}}}}
+	out := withoutCoverage(in)
+	if len(out) != 1 || out[0].Path != "p" || out[0].Coverage != nil || in[0].Coverage == nil {
+		t.Fatalf("out %+v, in %+v", out[0], in[0])
 	}
 }
