@@ -627,6 +627,12 @@ func TestTakeoverIsDeterministic(t *testing.T) {
 		x.batch(regOp(t, regPayload("b", "w2", hourB, cov(7, "db/mem", 1, 4))), regOp(t, regPayload("c", "w2", hourB, cov(7, "db/mem", 4, 6))))
 		x.ok(CommandSettleCoverage, SettleCoveragePayload{Origin: "w2", Instance: 7, Keys: map[string]KeySettlement{"db/cpu": {Floor: 2}, "db/mem": {Floor: 1}}})
 		x.claim("w1", "w2", 7, "db/cpu", 1, 20)
+		// #1207 S4b1c2: vanished pieces below the floor and departures.
+		x.register(regPayload("d", "w3", hourA, cov(9, "db/cpu", 3, 3), cov(9, "db/mem", 1, 2)))
+		x.ok(CommandSettleCoverage, SettleCoveragePayload{Origin: "w3", Instance: 9, Keys: map[string]KeySettlement{"db/cpu": {Floor: 3}, "db/mem": {Floor: 2}}})
+		x.ok(CommandDeleteFile, DeleteFilePayload{Path: "d", Reason: DeleteReasonVanished})
+		x.ok(CommandRemoveNode, RemoveNodePayload{NodeID: "w3", Reason: RemoveReasonLeave, At: t0})
+		x.ok(CommandRemoveNode, RemoveNodePayload{NodeID: "r1", Reason: RemoveReasonLeave, At: t0})
 		snaps = append(snaps, persist(t, x.f))
 	}
 	for i := 1; i < len(snaps); i++ {

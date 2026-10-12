@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/basekick-labs/arc/internal/syscpu"
 	"github.com/spf13/viper"
@@ -1299,4 +1300,31 @@ func TestLoad_CompactionMaxFilesPerBatch(t *testing.T) {
 			t.Errorf("Compaction.MaxFilesPerBatch = %d, want 5 (from env)", cfg.Compaction.MaxFilesPerBatch)
 		}
 	})
+}
+
+// #1207: stream takeover timings are Go durations with a floor.
+func TestLoad_StreamTakeoverTimings(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Cluster.StreamTakeoverGrace != 60*time.Second || cfg.Cluster.StreamTakeoverDepartedTTL != 24*time.Hour {
+		t.Fatalf("defaults %v %v", cfg.Cluster.StreamTakeoverGrace, cfg.Cluster.StreamTakeoverDepartedTTL)
+	}
+	for _, tc := range []struct{ key, val string }{
+		{"ARC_CLUSTER_STREAM_TAKEOVER_GRACE", "5s"},
+		{"ARC_CLUSTER_STREAM_TAKEOVER_GRACE", "soon"},
+		{"ARC_CLUSTER_STREAM_TAKEOVER_DEPARTED_TTL", "30s"},
+	} {
+		t.Setenv(tc.key, tc.val)
+		if _, err := Load(); err == nil {
+			t.Errorf("%s=%s accepted", tc.key, tc.val)
+		}
+		os.Unsetenv(tc.key)
+	}
 }

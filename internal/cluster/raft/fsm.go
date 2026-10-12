@@ -198,7 +198,21 @@ type AddNodePayload struct {
 // RemoveNodePayload is the payload for CommandRemoveNode.
 type RemoveNodePayload struct {
 	NodeID string `json:"node_id"`
+	// Reason says why the node goes (#1207 S4b1c2): RemoveReasonLeave for a
+	// graceful leave (usually a restart), RemoveReasonDepartedExpired for the
+	// leader expiring a departure; empty for an operator removal.
+	Reason string `json:"reason,omitempty"`
+	// At is the departure time: set on a leave, and on an expiry it must equal
+	// the recorded departure (a re-join in between makes the expiry a no-op).
+	// Zero on an operator removal.
+	At time.Time `json:"at"`
 }
+
+// Node removal reasons.
+const (
+	RemoveReasonLeave           = "leave"
+	RemoveReasonDepartedExpired = "departed-expired"
+)
 
 // UpdateNodePayload is the payload for CommandUpdateNode.
 type UpdateNodePayload struct {
@@ -487,6 +501,7 @@ type ClusterFSM struct {
 	mu                sync.RWMutex
 	nodes             map[string]*NodeInfo
 	primaryWriterID   string                // ID of the current primary writer node
+	primaryFast       atomic.Value          // string; mirror of primaryWriterID for lock-free reads (setPrimaryLocked)
 	activeCompactorID string                // ID of the node currently holding the compactor lease
 	files             map[string]*FileEntry // File manifest (path → entry) for peer replication
 	// Secondary index: database → set of file paths. Maintained alongside
@@ -1011,6 +1026,20 @@ func (f *ClusterFSM) TokenCount() int {
 	return len(f.tokens)
 }
 
+// setPrimaryLocked assigns the designated primary and its lock-free mirror.
+// Every assignment goes through it. Caller holds f.mu.
+func (f *ClusterFSM) setPrimaryLocked(id string) {
+	f.primaryWriterID = id
+	f.primaryFast.Store(id)
+}
+
+// PrimaryWriterIDFast returns the designated primary without taking the FSM
+// lock (the ingest gate reads it on every write).
+func (f *ClusterFSM) PrimaryWriterIDFast() string {
+	id, _ := f.primaryFast.Load().(string)
+	return id
+}
+
 // GetPrimaryWriterID returns the current primary writer node ID.
 func (f *ClusterFSM) GetPrimaryWriterID() string {
 	f.mu.RLock()
@@ -1325,6 +1354,7 @@ func (f *ClusterFSM) applyAddNode(payload []byte) interface{} {
 		p.Node.WriterState = "primary"
 	}
 	f.nodes[p.Node.ID] = &p.Node
+	f.takeoverNodeBackLocked(p.Node.ID, p.Node.Role)
 	callback := f.onNodeAdded
 	f.mu.Unlock()
 
@@ -1347,6 +1377,26 @@ func (f *ClusterFSM) applyRemoveNode(payload []byte) interface{} {
 	}
 
 	f.mu.Lock()
+	if p.Reason == RemoveReasonDepartedExpired {
+		// Only the departure the leader saw: a writer that re-joined (or left
+		// again) since is not expired.
+		at, ok := f.takeover.departed[p.NodeID]
+		if _, member := f.nodes[p.NodeID]; !ok || member || !at.Equal(p.At) {
+			f.mu.Unlock()
+			return nil
+		}
+	}
+	if p.Reason == RemoveReasonLeave && f.streamClaims {
+		// A second leave for a writer already departed (a duplicate, or an
+		// apply that reported failure but committed): nothing changes.
+		if _, member := f.nodes[p.NodeID]; !member {
+			if _, gone := f.takeover.departed[p.NodeID]; gone {
+				f.mu.Unlock()
+				return nil
+			}
+		}
+	}
+	removed := f.nodes[p.NodeID]
 	delete(f.nodes, p.NodeID)
 	// Removing the designated primary has to release the designation, or the
 	// record names a node that no longer exists and the election — which only
@@ -1355,10 +1405,17 @@ func (f *ClusterFSM) applyRemoveNode(payload []byte) interface{} {
 	// cluster: no primary, no retention, no continuous queries, no deletes,
 	// and nothing saying why (#872).
 	if f.primaryWriterID == p.NodeID {
-		f.primaryWriterID = ""
+		f.setPrimaryLocked("")
 	}
 	if f.streamClaims {
-		f.takeoverNodeRemovedLocked(p.NodeID)
+		// A writer leaving gracefully is usually restarting: its instances and
+		// claims stay, so it adopts its own instances first when it is back.
+		// Only an operator removal (or an expired departure) gives them up.
+		if p.Reason == RemoveReasonLeave && removed != nil && removed.Role == "writer" {
+			f.takeoverNodeDepartedLocked(p.NodeID, p.At)
+		} else {
+			f.takeoverNodeRemovedLocked(p.NodeID)
+		}
 	}
 	callback := f.onNodeRemoved
 	f.mu.Unlock()
@@ -1382,6 +1439,7 @@ func (f *ClusterFSM) applyUpdateNode(payload []byte) interface{} {
 
 	f.mu.Lock()
 	f.nodes[p.Node.ID] = &p.Node
+	f.takeoverNodeBackLocked(p.Node.ID, p.Node.Role)
 	callback := f.onNodeUpdated
 	f.mu.Unlock()
 
@@ -1467,7 +1525,7 @@ func (f *ClusterFSM) applyPromoteWriter(payload []byte) interface{} {
 
 	// Promote new primary
 	newNode.WriterState = "primary"
-	f.primaryWriterID = p.NodeID
+	f.setPrimaryLocked(p.NodeID)
 	callback := f.onWriterPromoted
 	f.mu.Unlock()
 
@@ -1503,7 +1561,7 @@ func (f *ClusterFSM) applyDemoteWriter(payload []byte) interface{} {
 	// cluster free to elect, and the caller reads this field to decide.
 	cleared := false
 	if f.primaryWriterID == p.NodeID {
-		f.primaryWriterID = ""
+		f.setPrimaryLocked("")
 		cleared = true
 	}
 	callback := f.onWriterDemoted
@@ -1665,7 +1723,7 @@ func (f *ClusterFSM) applyDeleteFileLocked(p DeleteFilePayload) func() {
 		// pulled: its batches are not settled (#1207 S4b). Every other
 		// delete (compaction, retention, DELETE) keeps them settled.
 		for _, c := range existing.Coverage {
-			f.indexSubtractLocked(c, fileHour(*existing))
+			f.takeoverVanishedLocked(c, fileHour(*existing), f.applyStarted.Load())
 		}
 	}
 	delete(f.files, p.Path)
@@ -2880,7 +2938,7 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	f.nodes = restoredNodes
 	f.barriers = restoredBarriers
 	f.barrierOrder = restoredOrder
-	f.primaryWriterID = snapshot.PrimaryWriterID
+	f.setPrimaryLocked(snapshot.PrimaryWriterID)
 	f.activeCompactorID = snapshot.ActiveCompactorID
 	f.files = restoredFiles
 	// Rebuild the database → files secondary index from the restored files

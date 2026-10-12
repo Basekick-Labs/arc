@@ -6,6 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/rs/zerolog"
+
 	"github.com/basekick-labs/arc/internal/cluster/originstream"
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 )
@@ -109,5 +112,101 @@ func TestStandbyEvictPolicy(t *testing.T) {
 	// its origin publishes it, so only under pressure.
 	if got := p.tier(info(0x11)); got != originstream.EvictUnderPressure {
 		t.Errorf("released claim, adopted, healthy origin: tier %d", got)
+	}
+}
+
+// A trim pass keeps every record of an origin with an unfinished claim.
+func TestTrimWaitsForAnUnfinishedClaim(t *testing.T) {
+	c, _ := takeoverOriginRig(t, true)
+	store, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.storage = store
+	pass := (&originStream{present: map[string]int64{}}).trimReady(c)
+	idx := c.raftNode.FSM().AppliedDone()
+	k := originstream.TrimKey{Origin: "writer-2", Key: "db/cpu", AppliedIndex: idx}
+	ready := func() bool { return pass(context.Background(), []originstream.TrimKey{k})[k] }
+	if !ready() {
+		t.Fatal("no file and no claim: not ready")
+	}
+	propose(t, c, raft.CommandAnnounceInstance, raft.AnnounceInstancePayload{Origin: "writer-2", Instance: 0x10, FreshStart: true})
+	propose(t, c, raft.CommandTakeOverStreamV2, raft.TakeOverStreamV2Payload{Origin: "writer-2", By: "writer-1", Now: time.Now(),
+		Claims: []raft.ClaimSet{{Instance: 0x10, Keys: map[string]raft.Intervals{"db/cpu": {{1, 5}}}}}})
+	if ready() {
+		t.Fatal("trimmed while a claim on the origin is unfinished")
+	}
+	epoch := c.raftNode.FSM().ClaimsBy("writer-1")[0].Epoch
+	propose(t, c, raft.CommandClaimDone, raft.ClaimDonePayload{Instance: 0x10, By: "writer-1", Epoch: epoch})
+	if !ready() {
+		t.Fatal("not ready after the claim finished")
+	}
+}
+
+// The leader expires a departure older than the TTL, as an operator removal
+// would; a younger one stays.
+func TestExpireDeparted(t *testing.T) {
+	c, _ := takeoverOriginRig(t, true)
+	propose(t, c, raft.CommandAnnounceInstance, raft.AnnounceInstancePayload{Origin: "writer-2", Instance: 0x10, FreshStart: true})
+	now := time.Now()
+	if err := c.raftNode.RemoveNodeWithReason("writer-2", raft.RemoveReasonLeave, now.Add(-2*time.Hour), 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.raftNode.RemoveNodeWithReason("reader-1", raft.RemoveReasonLeave, now, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	fsm := c.raftNode.FSM()
+	if d := fsm.DepartedWriters(); len(d) != 1 {
+		t.Fatalf("a reader leaving is not a departed writer: %v", d)
+	}
+	c.expireDeparted(now, 3*time.Hour)
+	if len(fsm.DepartedWriters()) != 1 {
+		t.Fatal("expired before the TTL")
+	}
+	c.expireDeparted(now, time.Hour)
+	if len(fsm.DepartedWriters()) != 0 {
+		t.Fatal("not expired after the TTL")
+	}
+	for _, in := range fsm.StreamInstances() {
+		if in.Instance == 0x10 && (in.Status != raft.InstanceOrphaned || !in.OriginGone) {
+			t.Fatalf("expired writer's instance %+v", in)
+		}
+	}
+}
+
+func TestStreamTakeoverView(t *testing.T) {
+	c, _ := takeoverOriginRig(t, true)
+	c.cfg.StreamTakeoverDepartedTTL = time.Hour
+	propose(t, c, raft.CommandAnnounceInstance, raft.AnnounceInstancePayload{Origin: "writer-2", Instance: 0x10, FreshStart: true})
+	propose(t, c, raft.CommandAnnounceInstance, raft.AnnounceInstancePayload{Origin: "writer-2", Instance: 0x11, Holds: []uint64{0x10}, FreshStart: true})
+	propose(t, c, raft.CommandTakeOverStreamV2, raft.TakeOverStreamV2Payload{Origin: "writer-2", By: "writer-1", Now: time.Now(),
+		Claims: []raft.ClaimSet{{Instance: 0x10, Keys: map[string]raft.Intervals{"db/cpu": {{1, 5}}, "db/mem": {{2, 3}}}}, {Instance: 0x11}}})
+	at := time.Now().UTC().Truncate(time.Second)
+	if err := c.raftNode.RemoveNodeWithReason("writer-2", raft.RemoveReasonLeave, at, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	v := c.StreamTakeover()
+	if !v.Enabled || len(v.Instances) != 2 || v.Instances[0].Instance != "0000000000000010" || v.Instances[0].AdoptedBy != "0000000000000011" {
+		t.Fatalf("instances %+v", v.Instances)
+	}
+	if len(v.Claims) != 1 || v.Claims[0].Keys != 2 || v.Claims[0].Batches != 7 || v.Claims[0].By != "writer-1" {
+		t.Fatalf("claims %+v", v.Claims)
+	}
+	if len(v.Departed) != 1 || v.Departed[0].NodeID != "writer-2" || !v.Departed[0].ExpiresAt.Equal(at.Add(time.Hour)) {
+		t.Fatalf("departed %+v", v.Departed)
+	}
+}
+
+// A writer whose current process is claimed is not eligible as primary.
+func TestWriterEligibility(t *testing.T) {
+	c, _ := takeoverOriginRig(t, true)
+	propose(t, c, raft.CommandAnnounceInstance, raft.AnnounceInstancePayload{Origin: "writer-2", Instance: 0x10, FreshStart: true})
+	if !c.writerEligible("writer-2") {
+		t.Fatal("ineligible without a claim")
+	}
+	propose(t, c, raft.CommandTakeOverStreamV2, raft.TakeOverStreamV2Payload{Origin: "writer-2", By: "writer-1", Now: time.Now(),
+		Claims: []raft.ClaimSet{{Instance: 0x10, Keys: map[string]raft.Intervals{"db/cpu": {{1, 5}}}}}})
+	if c.writerEligible("writer-2") || !c.writerEligible("writer-1") {
+		t.Fatal("eligibility does not follow the claim")
 	}
 }

@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,6 +31,12 @@ type WriterFailoverConfig struct {
 
 	// UnhealthyThreshold is consecutive unhealthy checks before triggering failover
 	UnhealthyThreshold int
+
+	// Eligible, when set, says whether a writer may be designated primary
+	// (#1207: not one whose current instance another writer claimed). It
+	// takes the FSM read lock; it is called under m.mu, which is safe because
+	// FSM callbacks fire after the FSM lock is released.
+	Eligible func(nodeID string) bool
 
 	// AutoFailover allows this manager to REPLACE a primary writer that has
 	// gone away. Electing the first one is not gated on it.
@@ -465,7 +472,7 @@ func (m *WriterFailoverManager) executeFailover(oldPrimaryID string, allowSelf b
 	if newPrimaryID == "" {
 		m.logger.Error().
 			Str("old_primary", oldPrimaryID).
-			Msg("No healthy standby writer available for failover")
+			Msg("No healthy writer can take over as primary (none healthy, or each one has its current process claimed by a stream takeover)")
 		m.completeFailover("", false)
 		return
 	}
@@ -528,18 +535,20 @@ func (m *WriterFailoverManager) selectNewPrimary(excludeNodeID string) string {
 // filters to healthy nodes, so re-selecting the excluded node can never
 // resurrect a dead one.
 func (m *WriterFailoverManager) selectPrimary(excludeNodeID string, allowSelf bool) string {
-	// GetStandbyWriters and GetWriters already filter for healthy nodes
-	for _, node := range m.cfg.Registry.GetStandbyWriters() {
-		if node.ID != excludeNodeID {
+	eligible := func(id string) bool { return m.cfg.Eligible == nil || m.cfg.Eligible(id) }
+	// GetStandbyWriters and GetWriters already filter for healthy nodes. In
+	// id order, so every leader picks the same writer.
+	for _, node := range sortedNodes(m.cfg.Registry.GetStandbyWriters()) {
+		if node.ID != excludeNodeID && eligible(node.ID) {
 			return node.ID
 		}
 	}
-	for _, node := range m.cfg.Registry.GetWriters() {
-		if node.ID != excludeNodeID {
+	for _, node := range sortedNodes(m.cfg.Registry.GetWriters()) {
+		if node.ID != excludeNodeID && eligible(node.ID) {
 			return node.ID
 		}
 	}
-	if allowSelf && excludeNodeID != "" {
+	if allowSelf && excludeNodeID != "" && eligible(excludeNodeID) {
 		for _, node := range m.cfg.Registry.GetWriters() {
 			if node.ID == excludeNodeID {
 				return node.ID
@@ -547,6 +556,11 @@ func (m *WriterFailoverManager) selectPrimary(excludeNodeID string, allowSelf bo
 		}
 	}
 	return ""
+}
+
+func sortedNodes(nodes []*Node) []*Node {
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
+	return nodes
 }
 
 // completeFailover marks failover as complete.

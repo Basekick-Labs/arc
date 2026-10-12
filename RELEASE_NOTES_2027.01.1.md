@@ -228,6 +228,12 @@ wrote them.
 
 ## New features
 
+### Writer failover picks the standby with the lowest node id ([#1207](https://github.com/Basekick-Labs/arc/issues/1207))
+
+When several healthy standby writers can replace a failed primary, the leader
+now picks the one with the lowest node id. Before, the choice depended on map
+order and could differ between leaders.
+
 ### Experimental: WAL coverage on cluster writers ([#1207](https://github.com/Basekick-Labs/arc/issues/1207))
 
 This is the first step toward letting a standby writer take over the rows a
@@ -347,6 +353,22 @@ release:
   steps, a claimant releasing its own claim, and a refusal for a claimant file
   the settled index has no room for (the index keeps tracking the writer
   process instead of giving up on it).
+- A writer that leaves the cluster gracefully (a restart, a rolling upgrade)
+  keeps its takeover state while it is gone: when it comes back it picks up its
+  own unflushed batches first, instead of having them taken over. Only an
+  operator node removal gives them up, or the departure expiring after
+  `cluster.stream_takeover_departed_ttl` (default `24h`). Departed writers are
+  listed by the new admin endpoint `GET /api/v1/cluster/stream-claims` and
+  counted by `arc_stream_takeover_departed_writers`. The capability nodes
+  advertise is now `stream_claims_v4`.
+- New setting `cluster.stream_takeover_grace` (default `60s`, at least `10s`):
+  how long a primary that stopped answering may take to come back before the
+  new primary takes over its batches. Not used yet.
+- A file that vanished before any node pulled it now gives its rows back for a
+  takeover, in its partition hour only; the rest of the writer process stays
+  settled.
+- Failover never promotes a writer whose current process another writer has
+  claimed.
 
 Nothing turns takeover on in this release.
 
