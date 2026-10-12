@@ -26,15 +26,16 @@ func execCompaction(ctx context.Context, db *sql.DB, fileListSQL, orderByClause,
 	if err != nil {
 		return err
 	}
+	mode := legacyDedupMode(tagColumns, dedupTime)
 	defer func() {
-		if len(tagColumns) > 0 || dedupTime {
+		if mode != dedupNone {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			_, _ = conn.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS "+dedupStagingTable)
 		}
 		conn.Close()
 	}()
-	for _, stmt := range buildCompactionQuery(fileListSQL, orderByClause, outputFile, tagColumns, dedupTime) {
+	for _, stmt := range buildCompactionQuery(fileListSQL, orderByClause, outputFile, tagColumns, mode) {
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {
 			return err
 		}
