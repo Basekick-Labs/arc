@@ -1,14 +1,20 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/maphash"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -98,19 +104,28 @@ type ContinuousQuery struct {
 	UpdatedAt             string   `json:"updated_at"`
 }
 
-// ContinuousQueryRequest represents a request to create/update a CQ
+// ContinuousQueryRequest represents a request to create/update a CQ.
+//
+// Every field distinguishes an absent key from a null one (#1023). Create
+// requires name, database, both measurements, query and interval. Update is a
+// partial update: an absent key keeps the stored value, a present one is
+// validated with the create rules and written, and null clears the four
+// fields that can be empty (description, tag_columns, retention_days,
+// delete_source_after_days); null on any other field is refused. Before #1023
+// every field was written unconditionally, so a PUT that left out is_active
+// stored false and stopped the continuous query with a 200.
 type ContinuousQueryRequest struct {
-	Name                   string   `json:"name"`
-	Description            *string  `json:"description"`
-	Database               string   `json:"database"`
-	SourceMeasurement      string   `json:"source_measurement"`
-	DestinationMeasurement string   `json:"destination_measurement"`
-	Query                  string   `json:"query"`
-	Interval               string   `json:"interval"`
-	TagColumns             []string `json:"tag_columns"`
-	RetentionDays          *int     `json:"retention_days"`
-	DeleteSourceAfterDays  *int     `json:"delete_source_after_days"`
-	IsActive               bool     `json:"is_active"`
+	Name                   optionalField[string]   `json:"name"`
+	Description            optionalField[string]   `json:"description"`
+	Database               optionalField[string]   `json:"database"`
+	SourceMeasurement      optionalField[string]   `json:"source_measurement"`
+	DestinationMeasurement optionalField[string]   `json:"destination_measurement"`
+	Query                  optionalField[string]   `json:"query"`
+	Interval               optionalField[string]   `json:"interval"`
+	TagColumns             optionalField[[]string] `json:"tag_columns"`
+	RetentionDays          optionalField[int]      `json:"retention_days"`
+	DeleteSourceAfterDays  optionalField[int]      `json:"delete_source_after_days"`
+	IsActive               optionalField[bool]     `json:"is_active"`
 }
 
 // ExecuteCQRequest represents a request to execute a CQ
@@ -287,11 +302,13 @@ func (h *ContinuousQueryHandler) RegisterRoutes(app *fiber.App) {
 }
 
 // validateCQDefinition applies the field rules a stored continuous-query
-// definition must satisfy. Both create and update call it.
+// definition must satisfy. Both create and update call it: create requires
+// every one of these fields, update checks the ones the body carries and
+// leaves the rest as stored (#1023).
 //
-// Shared because PUT replaces the whole row: handleUpdate's UPDATE writes every
-// column (see it), so any field it does not validate is a field a partial body
-// silently blanks. The two handlers had drifted far apart — update checked
+// Shared because the two handlers had drifted far apart while PUT still wrote
+// every column (before #1023), so any field update did not validate was a
+// field a partial body silently blanked. Update checked
 // database (#995) and destination_measurement-only-if-present, and nothing
 // else, so a PUT carrying just a database blanked the name, both measurements,
 // the query and the interval. validateCQQuery documents its empty case as
@@ -306,8 +323,8 @@ func (h *ContinuousQueryHandler) RegisterRoutes(app *fiber.App) {
 //
 //   - destination_measurement names a measurement Arc is about to CREATE, so it
 //     gets isValidMeasurementName, the create-time rule every client-facing
-//     ingest endpoint applies. handleCreate already did; update now does so
-//     unconditionally.
+//     ingest endpoint applies. handleCreate already did; update applies it
+//     whenever the body carries the field.
 //   - source_measurement names one that ALREADY EXISTS, so it gets the
 //     read-path rule instead: isSafeStoragePathSegment plus the glob rule, the
 //     same pair handleDelete and the retention handler apply to a stored
@@ -318,37 +335,57 @@ func (h *ContinuousQueryHandler) RegisterRoutes(app *fiber.App) {
 //     Arc has no rename endpoint, so refusing them would orphan readable data
 //     with no remedy. isSafeStoragePathSegment makes the same argument for
 //     database names in its own doc comment.
-func validateCQDefinition(req *ContinuousQueryRequest) error {
-	if req.Name == "" {
-		return errors.New("name is required")
+func validateCQDefinition(req *ContinuousQueryRequest, create bool) error {
+	// required reports whether the field must be checked, and refuses it when
+	// it is missing on create, or present but null or empty on either.
+	required := func(name string, f optionalField[string]) (bool, error) {
+		switch {
+		case !f.Set:
+			if create {
+				return false, fmt.Errorf("%s is required", name)
+			}
+			return false, nil
+		case f.Null:
+			return false, fmt.Errorf("%s may not be null", name)
+		case f.Value == "":
+			return false, fmt.Errorf("%s is required", name)
+		}
+		return true, nil
 	}
-	if req.Database == "" {
-		return errors.New("database is required")
+
+	if _, err := required("name", req.Name); err != nil {
+		return err
 	}
-	if !isValidDatabaseName(req.Database) {
+	if ok, err := required("database", req.Database); err != nil {
+		return err
+	} else if ok && !isValidDatabaseName(req.Database.Value) {
 		return errors.New("invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)")
 	}
-	if req.SourceMeasurement == "" {
-		return errors.New("source_measurement is required")
+	if ok, err := required("source_measurement", req.SourceMeasurement); err != nil {
+		return err
+	} else if ok {
+		if err := validateCQSourceMeasurement(req.SourceMeasurement.Value); err != nil {
+			return fmt.Errorf("invalid source_measurement: %w", err)
+		}
 	}
-	if err := validateCQSourceMeasurement(req.SourceMeasurement); err != nil {
-		return fmt.Errorf("invalid source_measurement: %w", err)
-	}
-	if req.DestinationMeasurement == "" {
-		return errors.New("destination_measurement is required")
-	}
-	if !isValidMeasurementName(req.DestinationMeasurement) {
+	if ok, err := required("destination_measurement", req.DestinationMeasurement); err != nil {
+		return err
+	} else if ok && !isValidMeasurementName(req.DestinationMeasurement.Value) {
 		return errors.New("invalid destination_measurement: must start with a letter and contain only alphanumeric characters, underscores, or hyphens")
 	}
-	if req.Query == "" {
-		return errors.New("query is required")
+	queryOK, err := required("query", req.Query)
+	if err != nil {
+		return err
 	}
-	if req.Interval == "" {
-		return errors.New("interval is required")
+	if _, err := required("interval", req.Interval); err != nil {
+		return err
 	}
 	// Validate query has required placeholders
-	if !strings.Contains(req.Query, "{start_time}") || !strings.Contains(req.Query, "{end_time}") {
+	if queryOK && (!strings.Contains(req.Query.Value, "{start_time}") || !strings.Contains(req.Query.Value, "{end_time}")) {
 		return errors.New("query must contain {start_time} and {end_time} placeholders")
+	}
+	if req.IsActive.Null {
+		return errors.New("is_active may not be null")
 	}
 	return nil
 }
@@ -398,24 +435,32 @@ func (h *ContinuousQueryHandler) handleCreate(c *fiber.Ctx) error {
 	}
 
 	// Validate
-	if err := validateCQDefinition(&req); err != nil {
+	if err := validateCQDefinition(&req, true); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
 	// Run the shared SQL validator over the definition before storing it.
-	if err := validateCQQuery(req.Query); err != nil {
+	if err := validateCQQuery(req.Query.Value); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
 	// Validate tag columns before storing — they end up in Parquet arc:tags
 	// metadata and compaction's PARTITION BY, so unsafe names must be rejected
 	// at the boundary (#521).
-	if err := validateTagColumns(req.TagColumns); err != nil {
+	if err := validateTagColumns(req.TagColumns.Value); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
-	tagColumnsJSON, err := encodeTagColumns(req.TagColumns)
+	tagColumnsJSON, err := encodeTagColumns(req.TagColumns.Value)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to encode tag_columns"})
+	}
+
+	// An absent is_active means active, which is what the column's DEFAULT
+	// TRUE always said; the handler used to insert the zero value instead, so a
+	// body without the key created a continuous query that never ran (#1023).
+	isActive := true
+	if req.IsActive.Set {
+		isActive = req.IsActive.Value
 	}
 
 	// Insert query
@@ -423,12 +468,12 @@ func (h *ContinuousQueryHandler) handleCreate(c *fiber.Ctx) error {
 		INSERT INTO continuous_queries
 		(name, description, database, source_measurement, destination_measurement, query, interval, tag_columns, retention_days, delete_source_after_days, is_active)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, req.Name, req.Description, req.Database, req.SourceMeasurement, req.DestinationMeasurement, req.Query, req.Interval, tagColumnsJSON, req.RetentionDays, req.DeleteSourceAfterDays, req.IsActive)
+	`, req.Name.Value, req.Description.ptr(), req.Database.Value, req.SourceMeasurement.Value, req.DestinationMeasurement.Value, req.Query.Value, req.Interval.Value, tagColumnsJSON, req.RetentionDays.ptr(), req.DeleteSourceAfterDays.ptr(), isActive)
 
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint") {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": fmt.Sprintf("Continuous query with name '%s' already exists", req.Name),
+				"error": fmt.Sprintf("Continuous query with name '%s' already exists", req.Name.Value),
 			})
 		}
 		h.logger.Error().Err(err).Msg("Failed to create continuous query")
@@ -438,13 +483,13 @@ func (h *ContinuousQueryHandler) handleCreate(c *fiber.Ctx) error {
 	}
 
 	queryID, _ := result.LastInsertId()
-	h.logger.Info().Int64("query_id", queryID).Str("name", req.Name).Msg("Created continuous query")
+	h.logger.Info().Int64("query_id", queryID).Str("name", req.Name.Value).Msg("Created continuous query")
 
 	// Kick the scheduler using the data we already have — avoids a redundant
 	// SQLite read that could race with the just-committed INSERT on a
 	// multi-connection pool.
 	if h.scheduler != nil {
-		if err := h.scheduler.StartJobDirect(queryID, req.Name, req.Interval, req.IsActive); err != nil {
+		if err := h.scheduler.StartJobDirect(queryID, req.Name.Value, req.Interval.Value, isActive); err != nil {
 			h.logger.Warn().Err(err).Int64("query_id", queryID).Msg("Failed to start CQ job after create")
 		}
 	}
@@ -505,44 +550,64 @@ func (h *ContinuousQueryHandler) handleUpdate(c *fiber.Ctx) error {
 		})
 	}
 
-	// The same rules create applies, for the reason the UPDATE below makes
-	// unavoidable: it overwrites every column, so a field this does not require
-	// is a field a partial body blanks (#995 for database, #1011 for the rest).
-	if err := validateCQDefinition(&req); err != nil {
+	// A partial update (#1023): each field the body carries gets the rule
+	// create applies to it; an absent one keeps its stored value, which was
+	// validated when it was stored and is re-validated before each run
+	// (#1010, #1011). No rule here spans two fields, so a field can be checked
+	// without reading the others.
+	if err := validateCQDefinition(&req, false); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	if err := validateTagColumns(req.TagColumns); err != nil {
+	if err := validateTagColumns(req.TagColumns.Value); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	// UPDATE overwrites the stored definition, so the new body needs the same
-	// validation handleCreate applies — otherwise a create-time check is
-	// trivially bypassed by creating a benign CQ and immediately updating it.
-	if err := validateCQQuery(req.Query); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	// A new query needs the same validation handleCreate applies — otherwise a
+	// create-time check is trivially bypassed by creating a benign CQ and
+	// immediately updating it.
+	if req.Query.hasValue() {
+		if err := validateCQQuery(req.Query.Value); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
 	}
 
-	tagColumnsJSON, err := encodeTagColumns(req.TagColumns)
+	tagColumnsJSON, err := encodeTagColumns(req.TagColumns.Value)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to encode tag_columns"})
 	}
 
-	result, err := h.sqliteDB.Exec(`
-		UPDATE continuous_queries SET
-			name = ?, description = ?, database = ?, source_measurement = ?,
-			destination_measurement = ?, query = ?, interval = ?, tag_columns = ?, retention_days = ?,
-			delete_source_after_days = ?, is_active = ?, updated_at = CURRENT_TIMESTAMP
-		WHERE id = ?
-	`, req.Name, req.Description, req.Database, req.SourceMeasurement, req.DestinationMeasurement, req.Query, req.Interval, tagColumnsJSON, req.RetentionDays, req.DeleteSourceAfterDays, req.IsActive, queryID)
+	// A column is written only when the body carries its key, so a PUT that
+	// leaves one out keeps the stored value (#1023). One statement, not a
+	// read-modify-write, so a concurrent PUT cannot be lost in between.
+	set := []updateColumn{
+		{"name", req.Name.Set, req.Name.Value},
+		{"description", req.Description.Set, req.Description.ptr()},
+		{"database", req.Database.Set, req.Database.Value},
+		{"source_measurement", req.SourceMeasurement.Set, req.SourceMeasurement.Value},
+		{"destination_measurement", req.DestinationMeasurement.Set, req.DestinationMeasurement.Value},
+		{"query", req.Query.Set, req.Query.Value},
+		{"interval", req.Interval.Set, req.Interval.Value},
+		{"tag_columns", req.TagColumns.Set, tagColumnsJSON},
+		{"retention_days", req.RetentionDays.Set, req.RetentionDays.ptr()},
+		{"delete_source_after_days", req.DeleteSourceAfterDays.Set, req.DeleteSourceAfterDays.ptr()},
+		{"is_active", req.IsActive.Set, req.IsActive.Value},
+	}
+	assignments, args := buildUpdateSet(set)
+	if len(args) == 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "no fields to update"})
+	}
+	result, err := h.sqliteDB.Exec(
+		"UPDATE continuous_queries SET "+assignments+", updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+		append(args, queryID)...)
 
 	if err != nil {
-		// Mapped the way handleCreate maps it: name is UNIQUE, and #1011 makes
-		// it mandatory on update, so a body carrying another definition's name
-		// is now an ordinary mistake rather than an internal failure.
+		// Mapped the way handleCreate maps it: name is UNIQUE, so a body
+		// carrying another definition's name is an ordinary mistake rather
+		// than an internal failure.
 		if strings.Contains(err.Error(), "UNIQUE constraint") {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": fmt.Sprintf("Continuous query with name %q already exists", req.Name),
+				"error": fmt.Sprintf("Continuous query with name %q already exists", req.Name.Value),
 			})
 		}
 		h.logger.Error().Err(err).Msg("Failed to update continuous query")
@@ -804,7 +869,12 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 		h.recordExecution(int64(queryID), executionID, "failed", startTime, endTime, nil, 0, executionDuration, err.Error())
 
 		h.logger.Error().Err(err).Str("query_name", cq.Name).Msg("Continuous query execution failed")
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+		status := fiber.StatusInternalServerError
+		if errors.Is(err, errCQTagKeyNotUnique) {
+			// The definition is wrong, not the server: say so with a 422.
+			status = fiber.StatusUnprocessableEntity
+		}
+		return c.Status(status).JSON(fiber.Map{
 			"error": "Execution failed: " + err.Error(),
 		})
 	}
@@ -905,7 +975,7 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	// name rule to it only in #995. So a row stored by any build before that,
 	// or by an older build, or written straight into the shared metadata
 	// SQLite, can carry anything. handleUpdate was a fourth route until the
-	// same change: it writes database unconditionally, so a partial PUT stored
+	// same change: it wrote database unconditionally, so a partial PUT stored
 	// an empty one.
 	//
 	// GetStoragePath below already refuses the glob metacharacters, but that
@@ -1125,6 +1195,28 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 				Str("query_name", cq.Name).
 				Str("tag_column", name).
 				Msg("Declared tag_column is not an output column of the CQ; skipping (would otherwise wedge compaction)")
+		}
+	}
+
+	// Declared tags drive compaction's dedup on (tags, time), which deletes every
+	// row but one per key. That is only safe if the key is unique in what this
+	// run writes: tag_columns that no longer cover the query's grouping (the
+	// query gained a GROUP BY column, the tags were not updated) would make
+	// compaction delete real rows. Checking only skips the marker is not enough —
+	// compaction unions arc:tags across every file of a partition, and the
+	// buffer across every batch of a flush, so this run's rows would still be
+	// deduped on another run's tags. The run fails instead: nothing is written,
+	// the execution is recorded as failed with this reason, and the watermark
+	// does not advance, so the window is re-run once tag_columns is fixed
+	// (#1023, which made an omitted tag_columns keep the stored list).
+	if len(tagColumns) > 0 {
+		if err := tagTimeKeyIsUnique(columnarData, tagColumns); err != nil {
+			if errors.Is(err, errCQTagKeyNotUnique) {
+				return 0, fmt.Errorf("continuous query %q declares tag_columns %v, which do not identify one row per timestamp in its output, "+
+					"so compaction would delete rows on that key; list every grouping column of the query in tag_columns: %w",
+					cq.Name, tagColumns, err)
+			}
+			return 0, fmt.Errorf("continuous query %q output: %w", cq.Name, err)
 		}
 	}
 
@@ -1427,6 +1519,150 @@ func timeColumnIsUnique(times []interface{}) bool {
 		seen[t] = struct{}{}
 	}
 	return true
+}
+
+// errCQTagKeyNotUnique marks a run refused because its declared tag_columns
+// do not identify one row per timestamp — a definition problem the operator
+// fixes, not a server fault.
+var errCQTagKeyNotUnique = errors.New("duplicate tag_columns and time key")
+
+// tagTimeKeyIsUnique returns errCQTagKeyNotUnique when two output rows share
+// the same (tag values..., time) key — the key compaction dedups a measurement
+// on when arc:tags names those columns — but differ in some other column.
+// Rows identical in every column are allowed: compaction keeping one of them
+// loses nothing, and a raw-copy continuous query over a not-yet-compacted
+// window legitimately carries them (client retries, WAL replay).
+//
+// The key is encoded with each value's type and length, so a NULL tag, an
+// empty string and the string "<nil>" stay distinct (DuckDB partitions NULLs
+// together, apart from ""), and a []byte, which is not a comparable map key,
+// still works. The set holds 64-bit hashes of those encodings; a hit compares
+// the two whole rows, so a hash collision between different keys is caught
+// there too and fails the run rather than risking a deletion. There is no row
+// cap, unlike timeColumnIsUnique: tagged output is legitimately large, and it
+// is already held in memory twice.
+//
+// A time that is not a number the writer accepts (a string that did not parse
+// as RFC3339, or null) is reported as its own error: the writer refuses it
+// anyway, and its key could not be compared with compaction's normalised one.
+func tagTimeKeyIsUnique(columnarData map[string][]interface{}, tagColumns []string) error {
+	times := columnarData["time"]
+	if len(times) <= 1 {
+		return nil
+	}
+	cols := make([][]interface{}, len(tagColumns))
+	for i, name := range tagColumns {
+		cols[i] = columnarData[name]
+	}
+	allCols := make([]string, 0, len(columnarData))
+	for name := range columnarData {
+		allCols = append(allCols, name)
+	}
+	sort.Strings(allCols)
+
+	seed := maphash.MakeSeed()
+	firstRow := make(map[uint64]int, len(times))
+	var buf []byte
+	for row, t := range times {
+		micros, ok := cqTimeMicros(t)
+		if !ok {
+			return fmt.Errorf("row %d has a time of type %T, which is not a timestamp", row, t)
+		}
+		buf = buf[:0]
+		for _, col := range cols {
+			buf = appendKeyValue(buf, valueAt(col, row))
+		}
+		buf = binary.BigEndian.AppendUint64(buf, uint64(micros))
+		h := maphash.Bytes(seed, buf)
+		earlier, dup := firstRow[h]
+		if !dup {
+			firstRow[h] = row
+			continue
+		}
+		if !bytes.Equal(encodeRow(columnarData, allCols, earlier), encodeRow(columnarData, allCols, row)) {
+			return fmt.Errorf("%w: rows %d and %d have the same tags and time but differ in another column", errCQTagKeyNotUnique, earlier, row)
+		}
+	}
+	return nil
+}
+
+// cqTimeMicros converts an output time the way the writer does: any integer or
+// float kind, already in microseconds by the time this runs.
+func cqTimeMicros(v interface{}) (int64, bool) {
+	switch x := v.(type) {
+	case int64:
+		return x, true
+	case int:
+		return int64(x), true
+	case int32:
+		return int64(x), true
+	case int16:
+		return int64(x), true
+	case int8:
+		return int64(x), true
+	case uint64:
+		return int64(x), x <= math.MaxInt64
+	case uint32:
+		return int64(x), true
+	case uint16:
+		return int64(x), true
+	case uint8:
+		return int64(x), true
+	case uint:
+		return int64(x), uint64(x) <= math.MaxInt64
+	case float64:
+		return int64(x), true
+	case float32:
+		return int64(x), true
+	}
+	return 0, false
+}
+
+func valueAt(col []interface{}, row int) interface{} {
+	if row < len(col) {
+		return col[row]
+	}
+	return nil
+}
+
+// encodeRow encodes every column of one output row, in a fixed column order.
+func encodeRow(columnarData map[string][]interface{}, cols []string, row int) []byte {
+	var buf []byte
+	for _, name := range cols {
+		buf = appendKeyValue(buf, valueAt(columnarData[name], row))
+	}
+	return buf
+}
+
+// appendKeyValue appends a self-delimiting encoding of v: its Go type, then its
+// value's length and bytes.
+func appendKeyValue(buf []byte, v interface{}) []byte {
+	var repr string
+	switch x := v.(type) {
+	case nil:
+		repr = ""
+	case string:
+		repr = x
+	case []byte:
+		repr = string(x)
+	case float64:
+		if x == 0 { // -0 and 0 are one value to DuckDB
+			x = 0
+		}
+		repr = strconv.FormatFloat(x, 'g', -1, 64)
+	case float32:
+		if x == 0 {
+			x = 0
+		}
+		repr = strconv.FormatFloat(float64(x), 'g', -1, 32)
+	default:
+		repr = fmt.Sprint(x)
+	}
+	typ := fmt.Sprintf("%T", v)
+	buf = binary.AppendUvarint(buf, uint64(len(typ)))
+	buf = append(buf, typ...)
+	buf = binary.AppendUvarint(buf, uint64(len(repr)))
+	return append(buf, repr...)
 }
 
 // validateTagColumns rejects tag column names that aren't safe SQL identifiers.
