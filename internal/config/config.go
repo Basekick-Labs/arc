@@ -554,8 +554,7 @@ type QueryConfig struct {
 
 // LicenseConfig holds configuration for enterprise license validation
 type LicenseConfig struct {
-	Enabled bool   // Enable license validation (default: false)
-	Key     string // License key (ARC-ENT-XXXX-XXXX-XXXX-XXXX)
+	Key string // License key (ARC-ENT-XXXX-XXXX-XXXX-XXXX)
 	// FilePath points at an offline license file downloaded from the
 	// activation server admin ({license_file, license_signature}). When set it
 	// WINS over Key: the license is verified entirely from disk against the
@@ -1155,7 +1154,6 @@ func Load() (*Config, error) {
 			S3CacheTTLSeconds:             v.GetInt("query.s3_cache_ttl_seconds"),
 		},
 		License: LicenseConfig{
-			Enabled:  v.GetBool("license.enabled"),
 			Key:      v.GetString("license.key"),
 			FilePath: strings.TrimSpace(v.GetString("license.file_path")),
 		},
@@ -1935,9 +1933,8 @@ func setDefaults(v *viper.Viper) {
 
 	// License defaults (Enterprise features)
 	// Note: Server URL and validation interval are hardcoded in internal/license/client.go
-	v.SetDefault("license.enabled", false) // Disabled by default
-	v.SetDefault("license.key", "")        // Must be provided
-	v.SetDefault("license.file_path", "")  // Offline license file (air-gapped); wins over license.key
+	v.SetDefault("license.key", "")       // Must be provided
+	v.SetDefault("license.file_path", "") // Offline license file (air-gapped); wins over license.key
 
 	// Scheduler defaults (Enterprise features)
 	// Note: CQ and retention schedulers are auto-enabled when their features are enabled AND license allows
