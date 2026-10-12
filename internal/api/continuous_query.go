@@ -91,10 +91,7 @@ type ContinuousQuery struct {
 	// TagColumns are the output columns that are grouping dimensions (not
 	// aggregates). They are written as Parquet `arc:tags` metadata so that
 	// compaction can dedup CQ output on (tags, time), making re-emitted windows
-	// idempotent (#521). When empty, a run whose output is one row per time is
-	// marked for time-only dedup; otherwise only exact duplicate rows collapse
-	// at compaction, and a re-emitted window with changed values accumulates
-	// (#1227).
+	// idempotent (#521). Empty means no dedup key — duplicate windows accumulate.
 	TagColumns            []string `json:"tag_columns"`
 	RetentionDays         *int     `json:"retention_days"`
 	DeleteSourceAfterDays *int     `json:"delete_source_after_days"`

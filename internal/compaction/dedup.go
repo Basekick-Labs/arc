@@ -46,47 +46,13 @@ func readTagColumnsFromParquetFiles(ctx context.Context, db *sql.DB, filePaths [
 	return result, nil
 }
 
-// dedupMode is how a compaction batch removes duplicate rows.
-type dedupMode int
-
-const (
-	// dedupNone keeps every row: raw ingest without tag metadata.
-	dedupNone dedupMode = iota
-	// dedupTagsTime keeps one row per (tags..., time): files carry arc:tags.
-	dedupTagsTime
-	// dedupTimeOnly keeps one row per time. Only for a tagless batch in which
-	// every file carries arc:dedup_time and is itself unique on time — the
-	// output of a continuous query with no grouping (#521, #1227). Its output
-	// is marked in turn, so a later compaction can dedup against it.
-	dedupTimeOnly
-	// dedupExactRows drops only rows identical in every column: a tagless
-	// batch that holds continuous-query output (some file is marked) but does
-	// not qualify for dedupTimeOnly. That removes WAL-replayed or replicated
-	// copies and keeps every distinct row (#1227).
-	dedupExactRows
-)
-
-func (m dedupMode) String() string {
-	switch m {
-	case dedupTagsTime:
-		return "tags_time"
-	case dedupTimeOnly:
-		return "time_only"
-	case dedupExactRows:
-		return "exact_rows"
-	}
-	return "none"
-}
-
-// readDedupTimeMarkers counts the given Parquet files that carry the
-// "arc:dedup_time" marker. The marker says only that its own file was written
-// one row per time — continuous-query output (#521). It says nothing about the
-// other files of the batch, which is why compaction needs the count rather
-// than "any": before #1227 one marked file made the whole batch dedup on time,
-// so a grouped continuous query without tag_columns lost every series but one
-// in its multi-series windows.
-func readDedupTimeMarkers(ctx context.Context, db *sql.DB, filePaths []string) (int, error) {
-	marked := 0
+// readDedupTimeFromParquetFiles reports whether ANY of the given Parquet files
+// carries the "arc:dedup_time" marker. That marker is written only by producers
+// whose data model is one-row-per-(tags,time) — continuous queries (#521) — and
+// tells compaction it is safe to dedup on time even when there are no tag
+// columns. A missing marker (all raw-ingest files) returns false, so ingest
+// dedup behavior is unchanged.
+func readDedupTimeFromParquetFiles(ctx context.Context, db *sql.DB, filePaths []string) (bool, error) {
 	for _, filePath := range filePaths {
 		query := fmt.Sprintf(
 			`SELECT value FROM parquet_kv_metadata('%s') WHERE key = 'arc:dedup_time'`,
@@ -98,36 +64,13 @@ func readDedupTimeMarkers(ctx context.Context, db *sql.DB, filePaths []string) (
 			continue
 		}
 		if err != nil {
-			return 0, fmt.Errorf("failed to read parquet dedup_time metadata: %w", err)
+			return false, fmt.Errorf("failed to read parquet dedup_time metadata: %w", err)
 		}
 		if val == "true" {
-			marked++
+			return true, nil
 		}
 	}
-	return marked, nil
-}
-
-// sourceFileColumn names the read_parquet filename column the uniqueness probe
-// groups by; chosen so it cannot collide with a data column.
-const sourceFileColumn = "__arc_source_file"
-
-// filesUniqueOnTime reports whether every file in the list holds at most one
-// row per normalized time. The marker is trusted only alongside this check:
-// files written before #1227 could carry it while holding several series per
-// time (the ingest buffer used to OR the marker across the batches of a
-// flush), and a producer bug would look the same. Time is normalized exactly
-// as the compaction read normalizes it, so a VARCHAR epoch and a TIMESTAMPTZ
-// of the same instant count as one time here as they will in the dedup.
-func filesUniqueOnTime(ctx context.Context, db *sql.DB, fileListSQL string) (bool, error) {
-	query := fmt.Sprintf(
-		`SELECT count(*) FROM (SELECT %s, %s AS t FROM %s GROUP BY ALL HAVING count(*) > 1)`,
-		sourceFileColumn, timeNormalizeExpr,
-		sqlutil.ReadParquet(fileListSQL, "union_by_name=true", "filename='"+sourceFileColumn+"'"))
-	var dupKeys int64
-	if err := db.QueryRowContext(ctx, query).Scan(&dupKeys); err != nil {
-		return false, fmt.Errorf("failed to probe per-file time uniqueness: %w", err)
-	}
-	return dupKeys == 0, nil
+	return false, nil
 }
 
 // readTagColumnsFromParquet reads the "arc:tags" metadata from a single Parquet file.
@@ -191,19 +134,20 @@ const dedupStagingTable = "arc_compaction_staged"
 // buildCompactionQuery builds the DuckDB statement(s) for compaction. It returns
 // a slice of statements to execute in order on the same connection.
 //
-// mode dedupNone returns a single standard COPY (zero overhead). Every other
-// mode returns two statements (CREATE OR REPLACE TEMP TABLE ... AS <normalized
-// read> ; COPY <dedup over the table>) — see the long comment on the dedup
-// branch for why a temp table is required rather than a CTE or subquery.
+// Dedup runs when tagColumns is non-empty OR dedupTime is set. Without either,
+// returns a single standard COPY (zero overhead). When deduping, returns two
+// statements (CREATE OR REPLACE TEMP TABLE ... AS <normalized read> ; COPY
+// <dedup window over the table>) — see the long comment on the dedup branch for
+// why a temp table is required rather than a CTE or subquery.
 //
-// dedupTagsTime keys on (tagColumns..., "time"); dedupTimeOnly on "time" alone,
-// which Job.decideDedup chooses only for a tagless batch whose every file is
-// marked and unique on time (#521, #1227); dedupExactRows keeps one copy of
-// each fully identical row.
-func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColumns []string, mode dedupMode) []string {
+// The dedup key is (tagColumns..., "time"). With no tag columns but dedupTime
+// set (a no-group-by continuous query, #521), the key is "time" alone — one row
+// per timestamp. This is safe ONLY because dedupTime is written exclusively by
+// producers whose data is one-row-per-time; raw ingest never sets it.
+func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColumns []string, dedupTime bool) []string {
 	escapedOutput := escapeSQLPath(outputFile)
 
-	if mode == dedupNone {
+	if len(tagColumns) == 0 && !dedupTime {
 		// Standard compaction — no dedup overhead.
 		// Normalize "time" to TIMESTAMP so a partition that mixes file schemas
 		// (some time=TIMESTAMP, some time=VARCHAR from a misbehaving writer)
@@ -221,9 +165,7 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 	`, timeNormalizeReplace, sqlutil.ReadParquet(fileListSQL, "union_by_name=true"), orderByClause, escapedOutput)}
 	}
 
-	// Dedup compaction. Every mode stages the normalized read in a temp table
-	// first; the window modes then keep one row per (tags, time) or per time,
-	// and dedupExactRows keeps one copy of each identical row.
+	// Dedup compaction — keep one row per unique (tags, time) key.
 	//
 	// The "time" normalization MUST be fully materialized into a typed relation
 	// BEFORE the dedup window binds. This requires a real temp table, not a CTE
@@ -259,51 +201,9 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 	// PARTITION BY all tag columns + time: rows with identical (tags, time) are
 	// duplicates; one is kept. This is the dedup key, not the output order — the
 	// output is sorted by the separate orderByClause (time).
-	stage := fmt.Sprintf(
-		`CREATE OR REPLACE TEMP TABLE %s AS SELECT * REPLACE (%s) FROM %s`,
-		dedupStagingTable, timeNormalizeReplace, sqlutil.ReadParquet(fileListSQL, "union_by_name=true"))
-
-	if mode == dedupExactRows {
-		// Only rows identical in every column collapse: a replayed or
-		// replicated copy. The output stays unmarked — it may hold several
-		// rows per time.
-		// DISTINCT is a hash aggregate, which does not keep insertion order,
-		// so without configured sort keys the output is ordered by time
-		// explicitly rather than left scrambled.
-		order := orderByClause
-		if order == "" {
-			order = `ORDER BY "time"`
-		}
-		return []string{stage, fmt.Sprintf(`
-		COPY (
-			SELECT DISTINCT * FROM %s
-			%s
-		) TO '%s' (
-			FORMAT PARQUET,
-			COMPRESSION ZSTD,
-			COMPRESSION_LEVEL 3,
-			ROW_GROUP_SIZE 122880
-		)
-	`, dedupStagingTable, order, escapedOutput)}
-	}
-
-	// A compacted file is marked arc:dedup_time if and only if time-only dedup
-	// ran on it, so it really is one row per time and a later compaction (the
-	// next hourly pass, the daily tier) can dedup a re-emitted window against
-	// it. Never under dedupTagsTime: that output is one row per (tags, time),
-	// several per time, and it carries no arc:tags to say so (#1227).
-	kvMetadata := ""
-	if mode == dedupTimeOnly {
-		kvMetadata = `,
-			KV_METADATA {'arc:dedup_time': 'true'}`
-	}
-
 	// Build the PARTITION BY key: all tag columns plus "time". When there are no
-	// tag columns (dedupTimeOnly), the key is "time" alone — build the list
-	// without a dangling leading comma.
-	if mode == dedupTimeOnly {
-		tagColumns = nil
-	}
+	// tag columns (a no-group-by CQ reaching here via dedupTime), the key is
+	// "time" alone — build the list without a dangling leading comma.
 	quotedKeys := make([]string, 0, len(tagColumns)+1)
 	for _, tag := range tagColumns {
 		// Double-quote escaping: DuckDB treats "" inside a quoted identifier as a literal "
@@ -313,6 +213,10 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 	}
 	quotedKeys = append(quotedKeys, `"time"`)
 	partitionBy := strings.Join(quotedKeys, ", ")
+
+	stage := fmt.Sprintf(
+		`CREATE OR REPLACE TEMP TABLE %s AS SELECT * REPLACE (%s) FROM %s`,
+		dedupStagingTable, timeNormalizeReplace, sqlutil.ReadParquet(fileListSQL, "union_by_name=true"))
 
 	copyOut := fmt.Sprintf(`
 		COPY (
@@ -326,9 +230,9 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 			FORMAT PARQUET,
 			COMPRESSION ZSTD,
 			COMPRESSION_LEVEL 3,
-			ROW_GROUP_SIZE 122880%s
+			ROW_GROUP_SIZE 122880
 		)
-	`, dedupStagingTable, partitionBy, orderByClause, escapedOutput, kvMetadata)
+	`, dedupStagingTable, partitionBy, orderByClause, escapedOutput)
 
 	return []string{stage, copyOut}
 }
@@ -354,10 +258,7 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 //   - epoch-microseconds written as a string ("1717689600000000") →
 //     make_timestamptz(BIGINT micros). Arc stores time as microseconds, which is
 //     exactly make_timestamptz's unit; it yields a UTC-anchored TIMESTAMPTZ.
-const timeNormalizeReplace = timeNormalizeExpr + ` AS "time"`
-
-// timeNormalizeExpr is the expression timeNormalizeReplace binds to "time".
-const timeNormalizeExpr = `COALESCE(TRY_CAST("time" AS TIMESTAMPTZ), make_timestamptz(TRY_CAST("time" AS BIGINT)))`
+const timeNormalizeReplace = `COALESCE(TRY_CAST("time" AS TIMESTAMPTZ), make_timestamptz(TRY_CAST("time" AS BIGINT))) AS "time"`
 
 // parquetFilesHaveTimeColumn reports whether the unified schema of the given
 // Parquet files contains a "time" column. DESCRIBE over read_parquet reads
