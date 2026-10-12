@@ -83,7 +83,7 @@ func (r *Reader) ReadAll() ([]Entry, error) {
 
 	// Verify magic bytes
 	if !bytes.Equal(header[0:4], WALMagic) {
-		return nil, fmt.Errorf("invalid WAL magic bytes")
+		return nil, errBadWALMagic
 	}
 
 	// Check version
@@ -128,6 +128,9 @@ func (r *Reader) ReadAll() ([]Entry, error) {
 	return entries, nil
 }
 
+// errBadWALMagic: the file does not start with the WAL magic bytes.
+var errBadWALMagic = errors.New("invalid WAL magic bytes")
+
 // ReadTrackedIdentities returns the identity tokens of the intact tracked
 // (0x03) and covered (0x04) entries of a WAL file, without decoding their
 // payloads (#1225). A damaged entry is counted in CorruptedEntries and
@@ -146,7 +149,7 @@ func (r *Reader) ReadTrackedIdentities() ([]string, error) {
 		return nil, fmt.Errorf("failed to read WAL file header: %w", err)
 	}
 	if !bytes.Equal(header[0:4], WALMagic) {
-		return nil, fmt.Errorf("invalid WAL magic bytes")
+		return nil, errBadWALMagic
 	}
 	var ids []string
 	rd := bufio.NewReaderSize(f, 1<<20)
@@ -209,7 +212,7 @@ func (r *Reader) ReadCheckpointHashes() ([]string, error) {
 		return nil, fmt.Errorf("failed to read WAL file header: %w", err)
 	}
 	if !bytes.Equal(header[0:4], WALMagic) {
-		return nil, fmt.Errorf("invalid WAL magic bytes")
+		return nil, errBadWALMagic
 	}
 	version := binary.BigEndian.Uint16(header[4:6])
 	if version != WALVersion {

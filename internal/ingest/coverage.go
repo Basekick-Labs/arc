@@ -234,6 +234,11 @@ const (
 	// writer took over these rows (#1207). The group keeps its WAL entries:
 	// the rows above the claim are re-flushed from them. The floor holds.
 	CoverageRefused
+	// CoverageResolved: a refused file whose rows are all in registered
+	// files now (another writer published them): its parked copy is gone.
+	// Once every refused file of a group is resolved, the group releases its
+	// WAL entries. The floor keeps treating its batches as lost.
+	CoverageResolved
 )
 
 func (o CoverageOutcome) String() string {
@@ -246,6 +251,8 @@ func (o CoverageOutcome) String() string {
 		return "lost"
 	case CoverageRefused:
 		return "refused"
+	case CoverageResolved:
+		return "resolved"
 	default:
 		return "abandoned"
 	}
@@ -418,6 +425,10 @@ type flushGroup struct {
 	lost         bool
 	refused      bool
 	finished     bool
+	// refusedOpen are the refused files not resolved yet; released is set
+	// once the WAL entries of a refused group are let go.
+	refusedOpen map[string]struct{}
+	released    bool
 }
 
 // newFlushGroup builds the coverage of an extracted buffer. Nil when coverage
@@ -551,6 +562,10 @@ func foldPieces(pieces []CoveragePiece) ([]CoverageRange, []CoveragePiece) {
 }
 
 func (g *flushGroup) settle(path string, outcome CoverageOutcome) {
+	if outcome == CoverageResolved {
+		g.resolve(path)
+		return
+	}
 	g.mu.Lock()
 	if _, dup := g.settled[path]; dup || g.finished {
 		g.mu.Unlock()
@@ -562,6 +577,10 @@ func (g *flushGroup) settle(path string, outcome CoverageOutcome) {
 	}
 	if outcome == CoverageRefused {
 		g.refused = true
+		if g.refusedOpen == nil {
+			g.refusedOpen = map[string]struct{}{}
+		}
+		g.refusedOpen[path] = struct{}{}
 	}
 	g.mu.Unlock()
 	if outcome == CoverageLost {
@@ -595,12 +614,19 @@ func (g *flushGroup) maybeFinish() {
 	refused := g.refused
 	g.mu.Unlock()
 	if refused {
-		// Keep the WAL entries: the rows above the claim are re-flushed
-		// from them (#1207). Held for the life of the process.
+		// Keep the WAL entries until every refused file is resolved: the
+		// rows nobody else published are re-flushed from them (#1207).
 		metrics.Get().IncWALCoverageRefused(int64(len(g.pieces)))
 		g.b.logger.Warn().Str("buffer_key", g.key).Int("batches", len(g.pieces)).
 			Msg("A flushed file was refused: another writer took over these rows; its WAL entries are kept")
 		g.cs.tracker.settleKey(g.key, g.pieces, false)
+		g.mu.Lock()
+		release := len(g.refusedOpen) == 0 && !g.released
+		g.released = g.released || release
+		g.mu.Unlock()
+		if release {
+			g.cs.wal.ReleaseRegistered(g.tokens)
+		}
 		return
 	}
 	g.cs.wal.ReleaseRegistered(g.tokens)
@@ -864,4 +890,90 @@ func (b *ArrowBuffer) commitCoverageLocked(cs *coverageState, covered bool, prep
 	}
 	batch.Coverage = []CoveragePiece{piece}
 	return err
+}
+
+// resolve records that a refused file's rows are all in registered files.
+// When the group finished refused and every refused file is resolved, its WAL
+// entries are released. The tracker already counted the batches lost: they
+// stay so (another writer published them).
+func (g *flushGroup) resolve(path string) {
+	g.mu.Lock()
+	delete(g.refusedOpen, path)
+	release := g.finished && g.refused && len(g.refusedOpen) == 0 && !g.released
+	if release {
+		g.released = true
+	}
+	g.mu.Unlock()
+	if release {
+		g.cs.wal.ReleaseRegistered(g.tokens)
+	}
+}
+
+// KeySettlement is one key's accounted progress (#1207 S4b): every batch at
+// or below Floor is either in a registered file or listed in Lost (settled
+// without one). Unlike the registered floor, it moves past lost batches.
+type KeySettlement struct {
+	Floor uint64
+	Lost  [][2]uint64
+}
+
+// maxAccountedLost bounds the lost intervals one key reports; the accounted
+// floor stops below the first one that does not fit.
+const maxAccountedLost = 1024
+
+// accounted returns the accounted progress of every key, walking on from
+// from[key] (a floor already reported) when it is above the registered floor:
+// only lost batches above it are listed again.
+func (t *coverageTracker) accounted(from map[string]uint64) map[string]KeySettlement {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make(map[string]KeySettlement, len(t.keys))
+	for k, kf := range t.keys {
+		s := KeySettlement{Floor: kf.floor}
+		if f := from[k]; f > s.Floor {
+			s.Floor = f
+		}
+		di, li := 0, 0
+		for {
+			next := s.Floor + 1
+			for di < len(kf.done) && kf.done[di][1] < next {
+				di++ // below a floor already reported
+			}
+			if di < len(kf.done) && kf.done[di][0] <= next {
+				s.Floor = kf.done[di][1]
+				di++
+				continue
+			}
+			for li < len(kf.lost) && kf.lost[li][1] < next {
+				li++ // lost below the registered floor: already accounted
+			}
+			if li < len(kf.lost) && kf.lost[li][0] <= next {
+				if kf.lost[li][1] < next {
+					li++
+					continue
+				}
+				if len(s.Lost) == maxAccountedLost {
+					break
+				}
+				s.Lost = append(s.Lost, [2]uint64{next, kf.lost[li][1]})
+				s.Floor = kf.lost[li][1]
+				li++
+				continue
+			}
+			break
+		}
+		out[k] = s
+	}
+	return out
+}
+
+// AccountedProgress reports this instance's accounted progress per key, for
+// the stream takeover settlement (#1207 S4b). ok is false while coverage is
+// off.
+func (b *ArrowBuffer) AccountedProgress(from map[string]uint64) (instance uint64, keys map[string]KeySettlement, ok bool) {
+	cs := b.coverage.Load()
+	if cs == nil {
+		return 0, nil, false
+	}
+	return cs.instance, cs.tracker.accounted(from), true
 }

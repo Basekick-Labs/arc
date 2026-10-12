@@ -229,3 +229,35 @@ func (c *Coordinator) streamClaimsMetricsLoop(ctx context.Context) {
 		}
 	}
 }
+
+// CoverageCovered, CoveringFiles and TakeoverGeneration read the takeover
+// state of this node's FSM for the registration outbox (TakeoverReader).
+func (c *Coordinator) CoverageCovered(inst uint64, key string, p raft.CoveragePiece, hour time.Time) bool {
+	if c.raftNode == nil || c.raftNode.FSM() == nil {
+		return false
+	}
+	return c.raftNode.FSM().CoverageCovered(inst, key, p, hour)
+}
+
+func (c *Coordinator) UncoveredBatches(inst uint64, key string, lo, hi uint64, hour time.Time) raft.Intervals {
+	if c.raftNode == nil || c.raftNode.FSM() == nil {
+		return raft.Intervals{{lo, hi}}
+	}
+	return c.raftNode.FSM().UncoveredBatches(inst, key, lo, hi, hour)
+}
+
+func (c *Coordinator) CoveringFilesOf(database, measurement string, hour time.Time, inst uint64, key string, set raft.Intervals) []raft.FileEntry {
+	if c.raftNode == nil || c.raftNode.FSM() == nil {
+		return nil
+	}
+	return c.raftNode.FSM().CoveringFilesOf(database, measurement, hour, inst, key, set)
+}
+
+func (c *Coordinator) TakeoverGeneration() uint64 {
+	if c.raftNode == nil || c.raftNode.FSM() == nil {
+		return 0
+	}
+	return c.raftNode.FSM().TakeoverGeneration()
+}
+
+var _ TakeoverReader = (*Coordinator)(nil)
