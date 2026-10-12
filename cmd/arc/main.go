@@ -1005,6 +1005,7 @@ func main() {
 			MaxSizeBytes: int64(cfg.WAL.MaxSizeMB) * 1024 * 1024,
 			MaxAge:       time.Duration(cfg.WAL.MaxAgeSeconds) * time.Second,
 			BufferSize:   cfg.WAL.BufferSize,
+			SyncBytes:    cfg.WAL.SyncBytes,
 			Logger:       logger.Get("wal"),
 		})
 		if err != nil {

@@ -1066,6 +1066,58 @@ an unbounded operation.
 
 ## Bug fixes
 
+### WAL-on ingest is no longer capped by one writer's fsync latency ([#1246](https://github.com/Basekick-Labs/arc/issues/1246))
+
+With the WAL enabled, ingest topped out at a rate set by the storage's fsync
+latency, not by CPU or disk bandwidth. One goroutine wrote every WAL entry and
+ran `fdatasync` itself every 1 MiB, and on every buffer flush's checkpoint,
+waiting each time for the disk to answer. On AWS gp3 that is about 170 MB/s of
+WAL, roughly 3.5M points/s of MessagePack, and it was the same on a 4-, 8- or
+16-vCPU server. Above it the WAL queue fills and entries are dropped. The
+write is still acknowledged, so those rows have no WAL copy until the next
+flush writes them to Parquet, and a crash in that window loses them.
+`arc_wal_dropped_entries_total` counts these drops.
+
+Syncs now run on their own goroutine, beside the writer (group commit). The
+writer keeps appending while a sync is in flight, and one sync covers
+everything written before it started, so throughput follows the disk's
+bandwidth instead of its round-trip time.
+
+Measured on m7i.4xlarge with the sizing campaign's gp3 volume (500 MB/s, 6,000
+IOPS), MessagePack, 8 workers × 5,000-record batches, WAL on with
+`fdatasync`, the same builds before and after this change:
+
+| Offered | WAL entries dropped, before | after | WAL disk writes, before | after |
+|---|---|---|---|---|
+| 4M rows/s, 120 s | 2,637 | 0 | 195 MB/s | 226 MB/s |
+| 6M rows/s, 30 s | 7,379 | 0 | 144 MB/s | 284 MB/s |
+| 8M rows/s, 30 s | 20,797 | 0 | 148 MB/s | 357 MB/s |
+| 10M rows/s, 30 s | 34,625 | 0 | 156 MB/s | 408 MB/s |
+
+Write p95 stayed at 2.0–2.3 ms in every run. The WAL-on figures in the sizing
+guide were measured before this change.
+
+Durability is unchanged:
+
+- A flush checkpoint is still answered only after a sync that covers it, in
+  every sync mode, `async` included.
+- A data sync is still requested once 1 MiB is unsynced, and every 100 ms
+  while anything is unsynced.
+- A rotation still syncs the old file before it is closed.
+
+A failed sync is now reported to the checkpoints it covered, as before. It also
+makes the writer move to a new WAL file, because Linux reports a lost
+write-back only once, and a later sync of the same file can succeed over data
+it never wrote. Failed syncs are counted in the new `arc_wal_failed_syncs_total`.
+
+`wal.sync_bytes` (default 1048576, `ARC_WAL_SYNC_BYTES`) sets the byte
+threshold. It bounds how much written data a sync may leave behind, not ingest
+throughput. A negative value is refused at startup.
+
+Above the new ceiling, when the WAL queue is full, an entry is still dropped and
+the write still acknowledged. What admission should do instead is
+[#676](https://github.com/Basekick-Labs/arc/issues/676).
+
 ### Delete API catches dangerous keywords glued to numbers or literals ([#1080](https://github.com/Basekick-Labs/arc/issues/1080))
 
 The delete endpoint's keyword scan used `\b` directly on the masked WHERE
