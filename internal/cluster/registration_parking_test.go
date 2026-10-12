@@ -358,3 +358,36 @@ func TestCrashBetweenRemoveAndResolvedRecord(t *testing.T) {
 		t.Fatal("a parked file at neither path kept its record")
 	}
 }
+
+// InstanceFiles lists pending and parked files with the pieces of one
+// instance and the claim they publish it under.
+func TestInstanceFiles(t *testing.T) {
+	_, base, r, m, l := parkingRig(t)
+	writeData(t, base, outPathB, 20)
+	cov := testCov(&settleLog{})
+	cov.Ranges = []ingest.CoverageRange{{Instance: 4, Lo: 1, Hi: 2}, {Instance: 9, Lo: 10, Hi: 12}}
+	cov.Partial = []ingest.CoveragePiece{{Instance: 9, CSeq: 20, RowLo: 0, RowHi: 5, RowTotal: 10}}
+	cov.Epochs = map[uint64]uint64{9: 77}
+	registerCovered(r, outPathB, 20, cov)
+	if got := r.InstanceFiles(4); len(got) != 1 || got[0].Path != outPathB || got[0].Epoch != 0 || len(got[0].Ranges) != 1 {
+		t.Fatalf("instance 4: %+v", got)
+	}
+	got := r.InstanceFiles(9)
+	if len(got) != 2 || got[1].Path != outPathB || got[1].Epoch != 77 || len(got[1].Partial) != 1 || got[1].Parked || !got[1].Exact {
+		t.Fatalf("instance 9 pending: %+v", got)
+	}
+	m.refuse = func(p string) bool { return p == outPathA }
+	r.HandOff(m, &fakeOutboxStorage{sizes: map[string]int64{outPathA: 10, outPathB: 20}}, "writer-1")
+	l.wait(t, outPathA)
+	waitOutbox(t, "drained", func() bool { return r.Pending() == 0 })
+	if err := r.SyncRegistrations(); err != nil { // the ack of B is durable
+		t.Fatal(err)
+	}
+	got = r.InstanceFiles(9)
+	if len(got) != 1 || got[0].Path != outPathA || !got[0].Parked || got[0].Kind != raft.RefusedClaimed {
+		t.Fatalf("instance 9 after the drain: %+v", got)
+	}
+	if len(r.InstanceFiles(5)) != 0 {
+		t.Fatal("an instance with no files")
+	}
+}

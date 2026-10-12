@@ -47,12 +47,18 @@ type Store struct {
 	segBytes int64
 	logger   zerolog.Logger
 
-	mu        sync.Mutex
-	instances map[instanceID]*instanceDir
-	current   map[string]uint64 // origin -> instance of its latest session
-	bytes     int64
-	capped    bool
-	lastWarn  time.Time
+	mu          sync.Mutex
+	instances   map[instanceID]*instanceDir
+	current     map[string]uint64 // origin -> instance of its latest session
+	bytes       int64
+	capped      bool
+	lastWarn    time.Time
+	lastPin     time.Time
+	lastPinCalc time.Time
+	// evictable, when set (stream takeover on), decides which instances the
+	// cap may evict; see SetEvictable.
+	evictable   EvictPolicy
+	evictActive func() bool
 }
 
 type instanceID struct {
@@ -340,10 +346,11 @@ func (s *Store) Append(origin string, e *Entry) error {
 	rec := encodeRecord(e)
 	if s.maxBytes > 0 {
 		if s.bytes+int64(len(rec)) > s.maxBytes {
-			s.evictReplacedLocked(int64(resumeFraction * float64(s.maxBytes)))
+			s.evictLocked(int64(resumeFraction * float64(s.maxBytes)))
 		}
 		if s.capped && float64(s.bytes) < resumeFraction*float64(s.maxBytes) {
 			s.capped = false
+			metrics.Get().SetStandbyStorePinned(0)
 			s.logger.Info().Int64("bytes", s.bytes).Msg("Standby store back under its cap; storing batches again")
 		}
 		if !s.capped && s.bytes+int64(len(rec)) > s.maxBytes {
@@ -352,6 +359,9 @@ func (s *Store) Append(origin string, e *Entry) error {
 				Msg("Standby store reached cluster.standby_store_max_bytes; batches are not kept until it is trimmed")
 		}
 		if s.capped {
+			if policy := s.policyLocked(); policy != nil {
+				s.pinnedWarnLocked(policy)
+			}
 			s.dropLocked(d, e)
 			return nil
 		}
@@ -410,15 +420,44 @@ func (s *Store) warnLocked(err error, msg string) {
 	s.logger.Warn().Err(err).Msg(msg)
 }
 
-// evictReplacedLocked removes instances whose origin has a newer current
-// instance, oldest first, until the store is at or under target.
-func (s *Store) evictReplacedLocked(target int64) {
-	var victims []*instanceDir
+// evictLocked frees room under the cap until the store is at or under
+// target. Without a policy: instances whose origin has a newer current
+// instance, oldest first. With one (stream takeover): the instances it
+// allows, then those it allows only under pressure, oldest first in each.
+func (s *Store) evictLocked(target int64) {
+	policy := s.policyLocked()
+	if policy == nil {
+		var victims []*instanceDir
+		for id, d := range s.instances {
+			if s.replacedLocked(id) && len(d.segs) > 0 {
+				victims = append(victims, d)
+			}
+		}
+		s.evictDirsLocked(victims, target)
+		return
+	}
+	tiers := [2][]*instanceDir{}
 	for id, d := range s.instances {
-		if cur, ok := s.current[id.origin]; ok && cur != id.instance && len(d.segs) > 0 {
-			victims = append(victims, d)
+		if len(d.segs) == 0 {
+			continue
+		}
+		switch policy(s.instanceInfoLocked(id, d)) {
+		case EvictFirst:
+			tiers[0] = append(tiers[0], d)
+		case EvictUnderPressure:
+			tiers[1] = append(tiers[1], d)
 		}
 	}
+	s.evictDirsLocked(tiers[0], target)
+	s.evictDirsLocked(tiers[1], target)
+}
+
+func (s *Store) replacedLocked(id instanceID) bool {
+	cur, ok := s.current[id.origin]
+	return ok && cur != id.instance
+}
+
+func (s *Store) evictDirsLocked(victims []*instanceDir, target int64) {
 	sort.Slice(victims, func(i, j int) bool { return victims[i].created.Before(victims[j].created) })
 	for _, d := range victims {
 		if s.bytes <= target {
@@ -438,7 +477,7 @@ func (s *Store) evictReplacedLocked(target int64) {
 		s.bytes -= freed
 		metrics.Get().AddStandbyStoreEvictedBytes(freed)
 		s.logger.Warn().Str("origin", d.id.origin).Str("instance", fmt.Sprintf("%016x", d.id.instance)).Int64("bytes", freed).
-			Msg("Standby store evicted batches of a replaced primary instance to stay under its cap")
+			Msg("Standby store evicted the batches of a primary instance to stay under its cap")
 	}
 }
 

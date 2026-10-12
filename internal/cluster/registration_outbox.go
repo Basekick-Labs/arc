@@ -217,6 +217,12 @@ type journalRecord struct {
 
 const journalRecordVersionCoverage = 2
 
+// journalRecordVersionClaim marks a record whose coverage carries claim
+// epochs (Cov.Epochs, a claimant replay, #1207 S4b1c). An older reader drops
+// the epochs and sends the file unclaimed: the manifest refuses it as
+// claimed, and it is parked, never published twice.
+const journalRecordVersionClaim = 3
+
 // maxJournalLine bounds one journal line. Far above any real record: a
 // group's coverage folds whole batches into ranges.
 const maxJournalLine = 64 << 20
@@ -457,6 +463,9 @@ func (r *RegistrationOutbox) RegisterCoveredFile(database, measurement, path str
 	}
 	if cov != nil {
 		rec.Version = journalRecordVersionCoverage
+		if len(cov.Epochs) > 0 {
+			rec.Version = journalRecordVersionClaim
+		}
 	}
 	r.mu.Lock()
 	switch r.state {
@@ -1547,7 +1556,7 @@ func fileCoverage(cov *ingest.GroupCoverage) []raft.InstanceCoverage {
 		if c := by[inst]; c != nil {
 			return c
 		}
-		c := &raft.InstanceCoverage{Instance: inst, Key: cov.Key, Truncated: !exact}
+		c := &raft.InstanceCoverage{Instance: inst, Key: cov.Key, Truncated: !exact, ClaimEpoch: cov.Epochs[inst]}
 		by[inst] = c
 		return c
 	}

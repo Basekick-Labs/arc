@@ -140,6 +140,7 @@ type Coordinator struct {
 	// with the enable proposal on the leader. See stream_claims.go.
 	streamClaimsMu       sync.Mutex
 	streamClaimsProposer atomic.Bool // the enable loop runs (not in S4a)
+	nodeIDWarn           sync.Once   // stream takeover without an explicit node id, logged once
 	streamClaimsBlockers atomic.Pointer[[]string]
 	walCoverageActive    atomic.Bool // SetWALCoverageActive
 	ingestFenceListeners []func(fenced bool)

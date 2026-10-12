@@ -49,6 +49,10 @@ type CoveragePiece struct {
 	// failed flush leaves the batch for recovery to replay. A batch whose WAL
 	// append was dropped is replayable by nothing. Not persisted.
 	replayable bool
+	// claimEpoch is set on the pieces of a claimant replay (ReplayClaimed):
+	// the claim the rows are published under. The group carries it per
+	// instance (GroupCoverage.Epochs).
+	claimEpoch uint64
 }
 
 func (p CoveragePiece) whole() bool { return p.Chunks == 0 && p.RowTotal == 0 }
@@ -84,6 +88,12 @@ type GroupCoverage struct {
 	// rows of every piece (a group with one file). The cluster manifest
 	// records it per file, exactly (#1207 S4b).
 	File *FileCoverage `json:"file,omitempty"`
+
+	// Epochs is, per instance, the stream claim a claimant publishes these
+	// batches under (#1207 S4b1c). Absent on everything else. A group whose
+	// pieces of one instance name different claims carries ConflictEpoch for
+	// it, which no claim has: the manifest refuses the file.
+	Epochs map[uint64]uint64 `json:"ep,omitempty"`
 
 	// onSettle receives each file's outcome. Nil on coverage loaded from a
 	// journal: the group that would act on it belonged to an earlier process.
@@ -434,7 +444,10 @@ type flushGroup struct {
 // newFlushGroup builds the coverage of an extracted buffer. Nil when coverage
 // is off or none of the batches carries any.
 func (b *ArrowBuffer) newFlushGroup(key string, records []interface{}, tokens []string) *flushGroup {
-	cs := b.coverage.Load()
+	return b.newFlushGroupWith(b.coverage.Load(), key, records, tokens)
+}
+
+func (b *ArrowBuffer) newFlushGroupWith(cs *coverageState, key string, records []interface{}, tokens []string) *flushGroup {
 	if cs == nil {
 		return nil
 	}
@@ -515,7 +528,50 @@ func (g *flushGroup) coverage(files int) *GroupCoverage {
 		onSettle: g.settle,
 	}
 	gc.Ranges, gc.Partial = foldPieces(g.pieces)
+	gc.Epochs = claimEpochs(g.pieces)
 	return gc
+}
+
+// ConflictEpoch marks an instance whose pieces in one group name different
+// claims. Claim epochs are log indexes, never this value.
+const ConflictEpoch = ^uint64(0)
+
+// claimEpochs collects the claim epoch of each instance of pieces. An
+// instance whose pieces name different claims, or some a claim and some
+// none, gets ConflictEpoch.
+func claimEpochs(pieces []CoveragePiece) map[uint64]uint64 {
+	claimed := false
+	for _, p := range pieces {
+		if p.claimEpoch != 0 {
+			claimed = true
+			break
+		}
+	}
+	if !claimed {
+		return nil // every live flush: nothing to collect
+	}
+	var out map[uint64]uint64
+	unclaimed := map[uint64]bool{}
+	for _, p := range pieces {
+		if p.claimEpoch == 0 {
+			unclaimed[p.Instance] = true
+			continue
+		}
+		if out == nil {
+			out = map[uint64]uint64{}
+		}
+		if e, ok := out[p.Instance]; ok && e != p.claimEpoch {
+			out[p.Instance] = ConflictEpoch
+		} else {
+			out[p.Instance] = p.claimEpoch
+		}
+	}
+	for inst := range out {
+		if unclaimed[inst] {
+			out[inst] = ConflictEpoch
+		}
+	}
+	return out
 }
 
 // foldPieces folds whole pieces into maximal ranges per instance and returns
@@ -583,7 +639,10 @@ func (g *flushGroup) settle(path string, outcome CoverageOutcome) {
 		g.refusedOpen[path] = struct{}{}
 	}
 	g.mu.Unlock()
-	if outcome == CoverageLost {
+	if outcome == CoverageLost && g.claimReplay() {
+		g.b.logger.Warn().Str("buffer_key", g.key).Str("path", path).
+			Msg("A claimed replay file settled without being registered; the claimant publishes its rows again")
+	} else if outcome == CoverageLost {
 		metrics.Get().IncWALCoverageLost(1)
 		g.b.logger.Error().Str("buffer_key", g.key).Str("path", path).
 			Msg("A flushed file settled without being registered; its rows are in no registered file and the registered floor of this key stops below them")
@@ -613,6 +672,13 @@ func (g *flushGroup) maybeFinish() {
 	lost := g.lost || !g.announced
 	refused := g.refused
 	g.mu.Unlock()
+	if refused && g.claimReplay() {
+		// No WAL entries here: the file is parked, and the claimant decides
+		// what to publish again.
+		g.b.logger.Warn().Str("buffer_key", g.key).Int("batches", len(g.pieces)).
+			Msg("A claimed replay file was refused and parked")
+		return
+	}
 	if refused {
 		// Keep the WAL entries until every refused file is resolved: the
 		// rows nobody else published are re-flushed from them (#1207).
@@ -629,8 +695,26 @@ func (g *flushGroup) maybeFinish() {
 		}
 		return
 	}
+	if g.claimReplay() {
+		return
+	}
 	g.cs.wal.ReleaseRegistered(g.tokens)
 	g.cs.tracker.settleKey(g.key, g.pieces, !lost)
+}
+
+// claimReplay reports whether the group publishes claimed batches of
+// another writer (ReplayClaimed): no WAL entries of this writer, and nothing
+// for this writer's tracker.
+func (g *flushGroup) claimReplay() bool {
+	if len(g.tokens) > 0 || len(g.pieces) == 0 {
+		return false
+	}
+	for _, p := range g.pieces {
+		if p.claimEpoch == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // failed handles a flush that wrote and registered nothing. Pieces whose

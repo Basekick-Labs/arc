@@ -84,6 +84,9 @@ func newCoverageBuffer(t *testing.T, maxBufferSize int, reg *coverageRegistrar) 
 		FlushQueueSize: 64,
 	}
 	b := NewArrowBuffer(cfg, &mockStorageBackend{}, zerolog.New(io.Discard))
+	// Closed before the WAL (cleanups run last-in first-out): a buffer left
+	// open keeps publishing the process-wide buffer gauges other tests read.
+	t.Cleanup(func() { _ = b.Close() })
 	b.SetWAL(w)
 	if reg != nil {
 		b.SetFileRegistrar(reg)

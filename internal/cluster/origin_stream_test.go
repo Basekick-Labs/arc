@@ -47,7 +47,7 @@ func originRig(t *testing.T, localID string, role NodeRole) *Coordinator {
 	}
 	waitFSM(t, func() bool { return raftNode.FSM().GetPrimaryWriterID() == "writer-1" })
 	c := &Coordinator{
-		cfg:        &config.ClusterConfig{SharedSecret: osSecret, ClusterName: "test-cluster"},
+		cfg:        &config.ClusterConfig{SharedSecret: osSecret, ClusterName: "test-cluster", NodeID: localID},
 		registry:   reg,
 		localNode:  local,
 		raftNode:   raftNode,

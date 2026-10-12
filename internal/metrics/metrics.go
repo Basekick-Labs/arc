@@ -170,6 +170,7 @@ type Metrics struct {
 	standbyStoreLost         atomic.Int64 // batches held that the primary reported lost
 	standbyStoreBlocked      atomic.Int64 // keys whose trim waits on files not yet here
 	standbyStoreReplaced     atomic.Int64 // bytes held for replaced primary instances
+	standbyStorePinned       atomic.Int64 // bytes the store may not evict (stream takeover)
 
 	streamClaimsEnabled  atomic.Int64 // 1 once stream claims are applied (#1207 S4a)
 	streamClaims         atomic.Int64 // stream claims held in the FSM
@@ -626,6 +627,7 @@ func (m *Metrics) SetStandbyStoreTrimState(lost, blocked, replacedBytes int64) {
 	m.standbyStoreBlocked.Store(blocked)
 	m.standbyStoreReplaced.Store(replacedBytes)
 }
+func (m *Metrics) SetStandbyStorePinned(n int64) { m.standbyStorePinned.Store(n) }
 func (m *Metrics) SetStandbyStore(bytes, incomplete int64) {
 	m.standbyStoreBytes.Store(bytes)
 	m.standbyStoreIncomplete.Store(incomplete)
@@ -927,6 +929,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"standby_store_lost_records":       m.standbyStoreLost.Load(),
 		"standby_store_blocked_keys":       m.standbyStoreBlocked.Load(),
 		"standby_store_replaced_bytes":     m.standbyStoreReplaced.Load(),
+		"standby_store_pinned_bytes":       m.standbyStorePinned.Load(),
 		"stream_claims_enabled":            m.streamClaimsEnabled.Load(),
 		"stream_claims":                    m.streamClaims.Load(),
 		"wal_coverage_refused":             m.walCoverageRefused.Load(),
@@ -1372,6 +1375,9 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_standby_store_replaced_bytes Bytes held for primary instances that have since restarted\n"...)
 	b = append(b, "# TYPE arc_standby_store_replaced_bytes gauge\n"...)
 	b = appendMetric(b, "arc_standby_store_replaced_bytes", float64(m.standbyStoreReplaced.Load()))
+	b = append(b, "# HELP arc_standby_store_pinned_bytes Bytes of the standby store kept for a possible stream takeover; not evicted at the cap\n"...)
+	b = append(b, "# TYPE arc_standby_store_pinned_bytes gauge\n"...)
+	b = appendMetric(b, "arc_standby_store_pinned_bytes", float64(m.standbyStorePinned.Load()))
 
 	b = append(b, "# HELP arc_cluster_stream_claims_enabled 1 once stream claims are enabled in the cluster\n"...)
 	b = append(b, "# TYPE arc_cluster_stream_claims_enabled gauge\n"...)

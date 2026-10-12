@@ -162,6 +162,8 @@ const (
 	CommandReleaseStreamClaim
 	// CommandInstanceSettled: an origin with nothing left of an earlier process.
 	CommandInstanceSettled
+	// CommandExtendStreamClaim: a claimant adding keys to its unfinished claim.
+	CommandExtendStreamClaim
 )
 
 // Command represents a command to be applied to the FSM.
@@ -1066,6 +1068,9 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 	case CommandInstanceSettled:
 		defer f.bumpTakeoverGen()
 		return f.applyInstanceSettled(cmd.Payload)
+	case CommandExtendStreamClaim:
+		defer f.bumpTakeoverGen()
+		return f.applyExtendStreamClaim(cmd.Payload, log.Index)
 	case CommandDeleteFile:
 		return f.applyDeleteFile(cmd.Payload)
 	case CommandAssignCompactor:
