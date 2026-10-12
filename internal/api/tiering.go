@@ -25,17 +25,21 @@ type TieringHandler struct {
 	// standing up a Manager, a SQLite file and a licence client.
 	scanTiers  func(context.Context) (*tiering.ScanResult, error)
 	scanBudget func() time.Duration
+	// previewMigration is indirected so the dry_run HTTP contract (filter
+	// propagation and response shape) can be tested without a Manager.
+	previewMigration func(ctx context.Context, from, to tiering.Tier, database, measurement string) ([]tiering.MigrationCandidate, error)
 }
 
 // NewTieringHandler creates a new tiering handler
 func NewTieringHandler(manager *tiering.Manager, authManager *auth.AuthManager, licenseClient *license.Client, logger zerolog.Logger) *TieringHandler {
 	return &TieringHandler{
-		manager:       manager,
-		authManager:   authManager,
-		licenseClient: licenseClient,
-		logger:        logger.With().Str("component", "tiering-api").Logger(),
-		scanTiers:     manager.ScanTiers,
-		scanBudget:    manager.ScanBudget,
+		manager:          manager,
+		authManager:      authManager,
+		licenseClient:    licenseClient,
+		logger:           logger.With().Str("component", "tiering-api").Logger(),
+		scanTiers:        manager.ScanTiers,
+		scanBudget:       manager.ScanBudget,
+		previewMigration: manager.PreviewMigration,
 		getFiles: func(ctx context.Context, tierParam, database string) ([]tiering.FileMetadata, error) {
 			var files []tiering.FileMetadata
 			if database != "" {
@@ -164,7 +168,7 @@ func (h *TieringHandler) TriggerMigration(c *fiber.Ctx) error {
 		Msg("Manual migration triggered")
 
 	if req.DryRun {
-		candidates, err := h.manager.PreviewMigration(ctx, fromTier, toTier, req.Database, req.Measurement)
+		candidates, err := h.previewMigration(ctx, fromTier, toTier, req.Database, req.Measurement)
 		if err != nil {
 			if errors.Is(err, tiering.ErrMigrationRoleGated) {
 				_, role := h.manager.MigrationGate()
