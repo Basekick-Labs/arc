@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"sync/atomic"
 	"testing"
 
 	"github.com/basekick-labs/arc/internal/ingest"
@@ -83,7 +84,13 @@ func TestCoverageHoldWaitsForTheAckToBeDurable(t *testing.T) {
 	}
 	origSync, origRetry := fsyncFile, outboxBrokenRetry
 	t.Cleanup(func() { fsyncFile, outboxBrokenRetry = origSync, origRetry })
-	fsyncFile = func(*os.File) error { return errors.New("disk gone") }
+	var syncCalls atomic.Int64
+	fsyncFile = func(f *os.File) error {
+		if syncCalls.Add(1) == 1 {
+			return origSync(f)
+		}
+		return errors.New("disk gone")
+	}
 	outboxBrokenRetry = 0
 
 	r.HandOff(newFakeOutboxManifest(), &fakeOutboxStorage{sizes: map[string]int64{outPathA: 10}}, "writer-1")
