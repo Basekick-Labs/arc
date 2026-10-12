@@ -188,6 +188,28 @@ func joinFields(nonce string, ts int64, f JoinAuthFields) []string {
 	}
 }
 
+// MsgTypeJoinCaps labels the second join MAC, which also covers the
+// capabilities (#1207). Its own label, so neither MAC can stand in for the
+// other.
+const MsgTypeJoinCaps MsgType = "join-caps"
+
+func joinCapsFields(nonce string, ts int64, f JoinAuthFields, caps []string) []string {
+	out := append(joinFields(nonce, ts, f), strconv.Itoa(len(caps)))
+	return append(out, caps...)
+}
+
+// ComputeJoinCapsHMAC signs every field of a join request and its
+// capabilities.
+func ComputeJoinCapsHMAC(sharedSecret, nonce string, timestamp int64, f JoinAuthFields, caps []string) string {
+	return hex.EncodeToString(computeHandshakeMACRaw(sharedSecret, MsgTypeJoinCaps, joinCapsFields(nonce, timestamp, f, caps)...))
+}
+
+// ValidateJoinCapsHMAC verifies the capabilities MAC. Freshness and replay
+// are the first MAC's job: both are over the same nonce and timestamp.
+func ValidateJoinCapsHMAC(sharedSecret, nonce string, timestamp int64, f JoinAuthFields, caps []string, receivedMAC string, tolerance time.Duration) error {
+	return validateHandshakeMAC(sharedSecret, MsgTypeJoinCaps, timestamp, tolerance, receivedMAC, joinCapsFields(nonce, timestamp, f, caps)...)
+}
+
 // ComputeJoinHMAC signs every field of a join request.
 func ComputeJoinHMAC(sharedSecret, nonce string, timestamp int64, f JoinAuthFields) string {
 	return hex.EncodeToString(computeHandshakeMACRaw(sharedSecret, MsgTypeJoin, joinFields(nonce, timestamp, f)...))

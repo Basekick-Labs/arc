@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -41,6 +42,9 @@ type OutboxManifest interface {
 	GetFileEntry(path string) (*raft.FileEntry, bool)
 	BatchFileOpsInManifestContext(ctx context.Context, ops []raft.BatchFileOp) error
 	DeleteFileFromManifest(ctx context.Context, path, reason string) error
+	// StreamClaimsEnabled reports whether this node's FSM has stream claims
+	// on: registrations then carry their coverage (#1207).
+	StreamClaimsEnabled() bool
 }
 
 // OutboxStorage reports a file's size, -1 when it does not exist.
@@ -153,6 +157,9 @@ type outboxEntry struct {
 	// applied it when the attempt ended. Not sent again; settled once this
 	// node sees it (#1207).
 	committed bool
+	// refused: the manifest refused it for good — another writer claimed
+	// its rows (#1207). Settled without registering; the file stays.
+	refused bool
 }
 
 // journalRecord is one journal line. ClusterName pins it to the cluster: a data
@@ -882,6 +889,8 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 
 	var ops []raft.BatchFileOp
 	var sent []*outboxEntry
+	opEntry := map[int]*outboxEntry{} // register op index -> entry
+	withCoverage := manifest.StreamClaimsEnabled()
 	bytes := 0
 	for _, e := range candidates {
 		if bytes >= registrarDrainChunkBytes {
@@ -900,13 +909,18 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 				continue
 			}
 		}
-		payload, err := json.Marshal(raft.RegisterFilePayload{File: r.fileEntry(e.rec)})
+		rp := raft.RegisterFilePayload{File: r.fileEntry(e.rec)}
+		if withCoverage {
+			rp.Coverage = fileCoverage(e.rec.Cov)
+		}
+		payload, err := json.Marshal(rp)
 		if err != nil || raft.ValidateManifestPath(e.rec.Path) != nil {
 			r.skipped.Add(1)
 			r.logger.Warn().Str("path", e.rec.Path).Msg("Pending file registration has a path the cluster manifest refuses; dropped")
 			settled = append(settled, e)
 			continue
 		}
+		opEntry[len(ops)] = e
 		ops = append(ops, raft.BatchFileOp{Type: raft.CommandRegisterFile, Payload: payload})
 		if e.rec.Supersedes != "" {
 			if del, err := json.Marshal(raft.DeleteFilePayload{Path: e.rec.Supersedes, Reason: "delete-rewrite"}); err == nil {
@@ -923,7 +937,21 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 		actx, cancel := context.WithTimeout(ctx, outboxAttemptTimeout)
 		applyErr = manifest.BatchFileOpsInManifestContext(actx, ops)
 		cancel()
-		if applyErr != nil {
+		if applyErr != nil && raft.IsStreamClaimConflict(applyErr) {
+			// Terminal for the named ops; the rest go again next round.
+			refused := r.refuseClaimed(ctx, manifest, applyErr, opEntry)
+			settled = append(settled, refused...)
+			if len(refused) > 0 {
+				applyErr = nil
+			} else {
+				r.logger.Warn().Err(applyErr).Msg("File registrations refused for a stream claim, but the refused files could not be identified; retrying")
+			}
+			r.mu.Lock()
+			for _, e := range sent {
+				e.fresh = false
+			}
+			r.mu.Unlock()
+		} else if applyErr != nil {
 			r.mu.Lock()
 			for _, e := range sent {
 				e.fresh = false
@@ -1225,7 +1253,10 @@ func (r *RegistrationOutbox) ack(entries []*outboxEntry) {
 		}
 		if e.rec.Cov != nil {
 			outcome := ingest.CoverageLost
-			if e.inManifest && !e.vanished {
+			switch {
+			case e.refused:
+				outcome = ingest.CoverageRefused
+			case e.inManifest && !e.vanished:
 				outcome = ingest.CoverageRegistered
 			}
 			settle = append(settle, settlement{e.rec.Cov, e.rec.Path, outcome})
@@ -1367,4 +1398,64 @@ func (r *RegistrationOutbox) fileEntry(rec journalRecord) raft.FileEntry {
 		Tier:          "hot",
 		CreatedAt:     time.Now().UTC(),
 	}
+}
+
+// refuseClaimed marks the entries of the ops a claim conflict names as
+// refused and returns them for settling. A refused rewrite's paired delete is
+// still applied on its own: a DELETE whose earlier apply committed must not
+// leave the original file registered.
+func (r *RegistrationOutbox) refuseClaimed(ctx context.Context, manifest OutboxManifest, err error, opEntry map[int]*outboxEntry) []*outboxEntry {
+	var out []*outboxEntry
+	for _, i := range raft.StreamClaimConflictOps(err) {
+		e := opEntry[i]
+		if e == nil {
+			continue
+		}
+		if e.rec.Supersedes != "" {
+			// Settle only once the paired delete commits; otherwise retry the
+			// entry next round (it is refused again, and the delete retried).
+			dctx, cancel := context.WithTimeout(ctx, outboxAttemptTimeout)
+			derr := manifest.DeleteFileFromManifest(dctx, e.rec.Supersedes, "delete-rewrite")
+			cancel()
+			if derr != nil {
+				r.logger.Warn().Err(derr).Str("path", e.rec.Supersedes).Msg("Could not remove the file a refused rewrite replaced; retrying")
+				continue
+			}
+		}
+		r.mu.Lock()
+		e.refused = true
+		r.mu.Unlock()
+		out = append(out, e)
+		r.logger.Warn().Str("path", e.rec.Path).
+			Msg("File registration refused: another writer took over these rows; the file is kept and not registered")
+	}
+	return out
+}
+
+// fileCoverage is the part of a group's coverage the claim rule reads: per
+// instance, the lowest batch. A coverage the journal truncated is marked so
+// the rule refuses conservatively.
+func fileCoverage(cov *ingest.GroupCoverage) []raft.FileCoverage {
+	if cov == nil {
+		return nil
+	}
+	truncated := cov.RangesOmitted > 0 || cov.PartialOmitted > 0
+	min := map[uint64]uint64{}
+	note := func(inst, c uint64) {
+		if m, ok := min[inst]; !ok || c < m {
+			min[inst] = c
+		}
+	}
+	for _, rg := range cov.Ranges {
+		note(rg.Instance, rg.Lo)
+	}
+	for _, p := range cov.Partial {
+		note(p.Instance, p.CSeq)
+	}
+	out := make([]raft.FileCoverage, 0, len(min))
+	for inst, c := range min {
+		out = append(out, raft.FileCoverage{Instance: inst, Key: cov.Key, MinCSeq: c, Truncated: truncated})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Instance < out[j].Instance })
+	return out
 }

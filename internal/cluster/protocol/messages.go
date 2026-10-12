@@ -187,6 +187,15 @@ type JoinRequest struct {
 	AuthNonce     string `json:"auth_nonce,omitempty"`
 	AuthTimestamp int64  `json:"auth_timestamp,omitempty"`
 	AuthHMAC      string `json:"auth_hmac,omitempty"`
+
+	// Capabilities this node's build supports (#1207), e.g. stream_claims_v1.
+	// Outside AuthHMAC on purpose: an older leader validates AuthHMAC over the
+	// fields it knows, so adding one there would refuse every upgraded node
+	// during a rolling upgrade. AuthHMAC2 covers the same fields plus
+	// Capabilities; a leader that reads Capabilities requires it. Stripping
+	// both only makes the node look like an older build.
+	Capabilities []string `json:"capabilities,omitempty"`
+	AuthHMAC2    string   `json:"auth_hmac2,omitempty"`
 }
 
 // NodeInfo represents a node in the cluster (used in JoinResponse).
@@ -408,7 +417,16 @@ const (
 	// Callers MAY retry — the failure could be transient (Raft timeout,
 	// FSM apply panic recovery, etc.).
 	ForwardCodeApplyFailed ForwardApplyCode = "apply_failed"
+	// ForwardCodeClaimConflict: the FSM refused registrations of rows another
+	// writer has claimed (#1207). Terminal: retrying cannot succeed. The
+	// message names the refused op indexes.
+	ForwardCodeClaimConflict ForwardApplyCode = "claim_conflict"
 	// ForwardCodeRaftUnavailable: the recipient's Raft node is nil or
 	// not running. Caller should not retry against this peer.
 	ForwardCodeRaftUnavailable ForwardApplyCode = "raft_unavailable"
 )
+
+// GetNodeID and GetCapabilities let the leader's stream claims join gate
+// read a join request without importing this package's types into raft.
+func (r *JoinRequest) GetNodeID() string         { return r.NodeID }
+func (r *JoinRequest) GetCapabilities() []string { return r.Capabilities }

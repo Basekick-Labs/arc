@@ -6,6 +6,7 @@ package cluster
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -322,4 +323,59 @@ func TestOutboxCommittedThenRemovedSettles(t *testing.T) {
 	if got := l.wait(t, outPathA); got != ingest.CoverageRegistered {
 		t.Fatalf("outcome = %v, want registered", got)
 	}
+}
+
+// With stream claims on, registrations carry their coverage: per instance,
+// the lowest batch.
+func TestOutboxSendsCoverageOnlyWithStreamClaims(t *testing.T) {
+	r := newTestOutbox(t, t.TempDir())
+	cov := testCov(&settleLog{})
+	cov.Ranges = []ingest.CoverageRange{{Instance: 9, Lo: 3, Hi: 7}, {Instance: 4, Lo: 20, Hi: 30}}
+	registerCovered(r, outPathA, 10, cov)
+	m := newFakeOutboxManifest()
+	m.claims = true
+	r.HandOff(m, &fakeOutboxStorage{sizes: map[string]int64{outPathA: 10}}, "writer-1")
+	waitOutbox(t, "registered", func() bool { return m.isRegistered(outPathA) })
+	m.mu.Lock()
+	got := fmt.Sprint(m.coverage)
+	m.mu.Unlock()
+	if got != "[{4 db/cpu 20 false 0} {9 db/cpu 3 false 0}]" {
+		t.Fatalf("coverage sent = %s", got)
+	}
+
+	r2 := newTestOutbox(t, t.TempDir())
+	registerCovered(r2, outPathB, 10, testCov(&settleLog{}))
+	m2 := newFakeOutboxManifest()
+	r2.HandOff(m2, &fakeOutboxStorage{sizes: map[string]int64{outPathB: 10}}, "writer-1")
+	waitOutbox(t, "registered", func() bool { return m2.isRegistered(outPathB) })
+	if len(m2.coverage) != 0 {
+		t.Fatal("coverage sent before stream claims are on: an older FSM would ignore it")
+	}
+}
+
+// A claim refusal is terminal for the named file only: it settles as
+// refused, the file is not deleted, and the rest of the batch registers.
+func TestOutboxClaimRefusalSettlesOnlyTheRefusedFile(t *testing.T) {
+	r := newTestOutbox(t, t.TempDir())
+	l := &settleLog{}
+	registerCovered(r, outPathA, 10, testCov(l))
+	registerCovered(r, outPathB, 20, testCov(l))
+	m := newFakeOutboxManifest()
+	m.claims = true
+	m.refuse = func(p string) bool { return p == outPathA }
+	store := &fakeOutboxStorage{sizes: map[string]int64{outPathA: 10, outPathB: 20}}
+	r.HandOff(m, store, "writer-1")
+	if got := l.wait(t, outPathA); got != ingest.CoverageRefused {
+		t.Fatalf("refused file outcome = %v", got)
+	}
+	if got := l.wait(t, outPathB); got != ingest.CoverageRegistered {
+		t.Fatalf("other file outcome = %v", got)
+	}
+	if m.isRegistered(outPathA) {
+		t.Fatal("refused file registered")
+	}
+	if size, _ := store.StatFile(context.Background(), outPathA); size != 10 {
+		t.Fatal("refused file deleted")
+	}
+	waitOutbox(t, "nothing pending", func() bool { return r.Pending() == 0 })
 }

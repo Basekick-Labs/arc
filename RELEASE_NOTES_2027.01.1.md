@@ -296,6 +296,13 @@ All writers in the cluster must run this release before the setting is turned
 on: a writer from an older release does not understand the standby connection
 and logs it as an unknown message type.
 
+**Groundwork for takeover (inert).** Nodes now advertise, when they join, whether
+they can apply stream claims, the rule that will let a standby writer take
+over a failed primary's rows without duplicating them. The advertisement is
+covered by its own MAC next to the existing join MAC, so a rolling upgrade
+keeps working against a leader from an older release. Nothing turns stream
+claims on in this release, and nothing changes until a later release does.
+
 **Rollback warning.** WAL entries written with the setting on use a new format.
 This release reads it, but older releases cannot: they quarantine those entries
 and lose any rows that were not flushed yet. Before rolling a node back to an
@@ -926,6 +933,19 @@ negative or unparseable value is a startup error naming the value rather than
 an unbounded operation.
 
 ## Bug fixes
+
+### A forwarded file registration must name the forwarding node as its origin ([#1207](https://github.com/Basekick-Labs/arc/issues/1207))
+
+A cluster node that is not the Raft leader forwards its file registrations to
+the leader. The leader checked that the forwarding node was a known member
+allowed to register files, but not that each file named that node as its
+origin. Any authenticated member could register a file as if another node had
+written it. Peers pull a file from its origin, and the upcoming standby-writer
+takeover decides which writer's files to accept by origin.
+
+The leader now refuses a forwarded registration whose origin is not the
+forwarding node. Every node in this release stamps its own id, so nothing
+legitimate is refused.
 
 ### Every file a cluster writer flushes reaches the cluster manifest ([#1206](https://github.com/Basekick-Labs/arc/issues/1206), [#1209](https://github.com/Basekick-Labs/arc/issues/1209))
 

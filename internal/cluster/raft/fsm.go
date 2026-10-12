@@ -141,6 +141,12 @@ const (
 	// compactor lease holder (or every compactor-role node when no lease is
 	// assigned) regardless (cluster.compactionPauseWaitSet).
 	CommandAckCompactionPause
+	// CommandEnableStreamClaims turns stream claims on, once, when every node
+	// supports them (#1207). See stream_claims.go.
+	CommandEnableStreamClaims
+	// CommandTakeOverStream claims a dead primary instance's batches for the
+	// writer taking over from it (#1207).
+	CommandTakeOverStream
 )
 
 // Command represents a command to be applied to the FSM.
@@ -161,6 +167,10 @@ type NodeInfo struct {
 	Version     string `json:"version"`
 	WriterState string `json:"writer_state,omitempty"` // "primary", "standby", or "" for non-writers
 	CoreCount   int    `json:"core_count"`             // Number of CPU cores on this node
+	// Capabilities advertised by the node's build at its last join (#1207).
+	// Replaced on every join, so a node rolled back to an older build loses
+	// them. Older builds ignore the field.
+	Capabilities []string `json:"capabilities,omitempty"`
 }
 
 // AddNodePayload is the payload for CommandAddNode.
@@ -214,6 +224,9 @@ type FileEntry struct {
 // RegisterFilePayload is the payload for CommandRegisterFile.
 type RegisterFilePayload struct {
 	File FileEntry `json:"file"`
+	// Coverage is the file's batch coverage, sent only once stream claims
+	// are enabled (#1207); the claim rule reads it. Not stored with the file.
+	Coverage []FileCoverage `json:"coverage,omitempty"`
 }
 
 // DeleteFilePayload is the payload for CommandDeleteFile.
@@ -425,6 +438,9 @@ type FSMSnapshot struct {
 	// AppliedIndex: the last command applied when the snapshot was taken
 	// (#1207). Zero in an older snapshot.
 	AppliedIndex uint64 `json:"applied_index,omitempty"`
+	// StreamClaims: the flag and the claims (#1207). nil in an older
+	// snapshot, read as "off, none".
+	StreamClaims *streamClaimsState `json:"stream_claims,omitempty"`
 }
 
 // ClusterFSM implements the raft.FSM interface for cluster state management.
@@ -594,6 +610,10 @@ type ClusterFSM struct {
 	// compactionPause is the cluster-wide compaction pause (#1087). Part of
 	// the snapshot. Acks is nil until the first pause.
 	compactionPause CompactionPauseState
+
+	// Stream claims (#1207 S4a), under mu. See stream_claims.go.
+	streamClaims bool
+	claims       map[uint64]*StreamClaim
 
 	// Callbacks for state changes
 	onNodeAdded          func(*NodeInfo)
@@ -997,6 +1017,10 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.applyDemoteWriter(cmd.Payload)
 	case CommandRegisterFile:
 		return f.applyRegisterFile(cmd.Payload, log.Index)
+	case CommandEnableStreamClaims:
+		return f.applyEnableStreamClaims(cmd.Payload)
+	case CommandTakeOverStream:
+		return f.applyTakeOverStream(cmd.Payload)
 	case CommandDeleteFile:
 		return f.applyDeleteFile(cmd.Payload)
 	case CommandAssignCompactor:
@@ -1486,6 +1510,10 @@ func (f *ClusterFSM) applyRegisterFileStruct(p RegisterFilePayload, logIndex uin
 	}
 
 	f.mu.Lock()
+	if f.claimConflictLocked(p) {
+		f.mu.Unlock()
+		return &StreamClaimConflictError{Ops: []int{0}}
+	}
 	emit := f.applyRegisterFileLocked(p, logIndex)
 	f.mu.Unlock()
 
@@ -1757,6 +1785,7 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 	// variants directly without re-unmarshalling. Each payload is
 	// decoded exactly once; all operation types retain decoded payloads.
 	decoded := make([]any, len(p.Ops))
+	var claimConflicts []int
 	for i, op := range p.Ops {
 		switch op.Type {
 		case CommandRegisterFile:
@@ -1780,6 +1809,14 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 			// this check is refused atomically up front.
 			if rp.File.CreatedAt.IsZero() {
 				return fmt.Errorf("batch file ops: op[%d]: register file: created_at is required", i)
+			}
+			// Collected, not returned at once: the outbox settles every
+			// refused op in one round instead of one per Raft entry.
+			f.mu.RLock()
+			conflict := f.claimConflictLocked(rp)
+			f.mu.RUnlock()
+			if conflict && len(claimConflicts) < maxConflictOpsReported {
+				claimConflicts = append(claimConflicts, i)
 			}
 			decoded[i] = rp
 		case CommandUpdateFile:
@@ -1824,6 +1861,10 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 		default:
 			return fmt.Errorf("batch file ops: op[%d] unsupported type: %d", i, op.Type)
 		}
+	}
+
+	if len(claimConflicts) > 0 {
+		return &StreamClaimConflictError{Ops: claimConflicts}
 	}
 
 	// Every payload has already passed the complete pre-validation pass.
@@ -2400,7 +2441,13 @@ func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 		compactionPause = &cp
 	}
 
+	var claimsState *streamClaimsState
+	if f.streamClaims || len(f.claims) > 0 {
+		claimsState = &streamClaimsState{Enabled: f.streamClaims, Claims: f.claimsListLocked()}
+	}
+
 	return &fsmSnapshot{
+		streamClaims: claimsState,
 		// Raft does not call Apply and Snapshot concurrently, so the two
 		// counters agree here.
 		appliedIndex:           f.applyDone.Load(),
@@ -2753,6 +2800,18 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	pauseChanged := prevPause.Active != restoredPause.Active ||
 		(restoredPause.Active && prevPause.Generation != restoredPause.Generation)
 	f.compactionPause = restoredPause
+	// Stream claims: absent from an older snapshot, which means off.
+	f.streamClaims, f.claims = false, nil
+	if sc := snapshot.StreamClaims; sc != nil {
+		f.streamClaims = sc.Enabled
+		if len(sc.Claims) > 0 {
+			f.claims = make(map[uint64]*StreamClaim, len(sc.Claims))
+			for i := range sc.Claims {
+				c := sc.Claims[i]
+				f.claims[c.Instance] = &c
+			}
+		}
+	}
 	onCompactionPauseChanged := f.onCompactionPauseChanged
 	f.nodes = restoredNodes
 	f.barriers = restoredBarriers
@@ -3118,6 +3177,7 @@ type fsmSnapshot struct {
 	barriers               map[string]uint64
 	compactionPause        *CompactionPauseState
 	appliedIndex           uint64
+	streamClaims           *streamClaimsState
 }
 
 // Persist writes the snapshot to the given sink.
@@ -3136,6 +3196,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 		Barriers:               s.barriers,
 		CompactionPause:        s.compactionPause,
 		AppliedIndex:           s.appliedIndex,
+		StreamClaims:           s.streamClaims,
 	}
 
 	data, err := json.Marshal(snapshot)
