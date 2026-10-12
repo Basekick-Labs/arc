@@ -1010,9 +1010,18 @@ Two narrower changes come with it:
   container that does not exist, is now an error that says the store is
   missing, instead of "object not found". The backup API answers 503 for a
   target whose bucket does not exist, where it answered 404 or started a
-  restore. On Azure, checking whether a file exists in a missing container is
-  an error too. An S3 `HEAD` cannot tell a missing bucket from a missing key,
-  so on S3 that check still answers "absent".
+  restore. Checking whether a file exists in a missing bucket or container is
+  an error too ([#1242](https://github.com/Basekick-Labs/arc/issues/1242)): an
+  S3 `HEAD` cannot tell a missing bucket from a missing key, so after a `HEAD`
+  that finds no object Arc asks S3 whether the bucket exists, at most once a
+  minute while it does. An answer other than "no such bucket", including a 403
+  for credentials that may not list the bucket, keeps the object absent, as
+  before. The places that run before a store's first write treat a missing
+  store as empty, because most S3-compatible stores create the bucket on that
+  write: a backup to a new target, a restore into a new cold bucket, an edge
+  hub receiving its first file, and `GET` or `POST /api/v1/databases` on a
+  fresh deployment. Creating a database on a store whose bucket did not exist
+  yet answered 500 before and works now.
 - **A 404 without a storage error code is an error.** A proxy or gateway
   answering 404 with its own page, rather than the storage service's error, is
   no longer taken to mean the object is missing. An S3-compatible store that

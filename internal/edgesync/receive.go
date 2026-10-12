@@ -249,7 +249,9 @@ func (r *Receiver) Receive(ctx context.Context, spokeID, sourcePath, declaredSHA
 	}
 
 	exists, err := r.backend.Exists(ctx, finalPath)
-	if err != nil {
+	// A hub bucket that does not exist yet holds nothing: the staging write
+	// below is what creates it on most S3-compatible stores (#1242).
+	if err != nil && !storage.IsStoreNotFound(err) {
 		return nil, fmt.Errorf("%w: stat %q: %w", ErrReceiveInternal, finalPath, err)
 	}
 	if exists {

@@ -233,6 +233,10 @@ func (r *Reconciler) confirmPresent(ctx context.Context, spokeID string, entries
 			defer func() { <-sem }()
 
 			present, err := r.backend.Exists(checkCtx, NamespacedPath(spokeID, path))
+			if storage.IsStoreNotFound(err) {
+				// No hub bucket yet: nothing is present (#1242).
+				present, err = false, nil
+			}
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {

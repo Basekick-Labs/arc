@@ -412,6 +412,11 @@ func TestS3NotFoundIsTypedAgainstARealStore(t *testing.T) {
 	b := minioBackend(t)
 	ctx := context.Background()
 	const key = "contract-1238/NotFoundEvents/2026/10/12/14/x_1760404040404.parquet"
+	// The bucket must exist for a missing KEY to be what the reads find; a
+	// store that creates buckets on the first write (SeaweedFS) needs one.
+	if err := b.Write(ctx, "contract-1238/present.txt", []byte("x")); err != nil {
+		t.Fatalf("seed the bucket: %v", err)
+	}
 
 	_, err := b.Read(ctx, key)
 	if !IsNotFound(err) || IsStoreNotFound(err) {
@@ -427,10 +432,17 @@ func TestS3NotFoundIsTypedAgainstARealStore(t *testing.T) {
 		t.Fatalf("Exists of a missing key = %v, %v; want false, nil", ok, err)
 	}
 
-	noBucket := *b
-	noBucket.bucket = fmt.Sprintf("arc-1238-missing-%d", time.Now().UnixNano())
+	noBucket := &S3Backend{client: b.client, prefix: b.prefix, logger: b.logger,
+		bucket: fmt.Sprintf("arc-1238-missing-%d", time.Now().UnixNano())}
 	_, err = noBucket.Read(ctx, key)
 	if IsNotFound(err) || !IsStoreNotFound(err) {
 		t.Fatalf("Read from a missing bucket: err = %v, want ErrStoreNotFound and not a missing object", err)
+	}
+	// #1242: a HEAD cannot tell, so the backend asks about the bucket.
+	if size, err := noBucket.StatFile(ctx, key); size != -1 || !IsStoreNotFound(err) {
+		t.Fatalf("StatFile in a missing bucket = %d, %v; want ErrStoreNotFound", size, err)
+	}
+	if ok, err := noBucket.Exists(ctx, key); ok || !IsStoreNotFound(err) {
+		t.Fatalf("Exists in a missing bucket = %v, %v; want ErrStoreNotFound", ok, err)
 	}
 }

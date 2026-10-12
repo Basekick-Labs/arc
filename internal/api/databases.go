@@ -504,6 +504,11 @@ func (h *DatabasesHandler) handleListMeasurements(c *fiber.Ctx) error {
 	// and list measurements in a single operation.
 	markerPath := name + "/.arc-database"
 	markerExists, err := h.storage.Exists(ctx, markerPath)
+	if storage.IsStoreNotFound(err) {
+		// A bucket created on first write holds no marker yet, as
+		// listMeasurements below treats it (#945, #1242).
+		markerExists, err = false, nil
+	}
 	if err != nil {
 		h.logger.Error().Err(err).Str("database", name).Msg("Failed to check database marker")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -1091,9 +1096,14 @@ func (h *DatabasesHandler) listMeasurements(ctx context.Context, database string
 func (h *DatabasesHandler) databaseExists(ctx context.Context, name string) (bool, error) {
 	// Optimized: Check for database marker file directly instead of listing all databases.
 	// A database exists if it has a .arc-database marker file OR has any content.
+	//
+	// A bucket that does not exist yet (most S3-compatible stores create it
+	// on the first write) holds neither a marker nor content, so a missing
+	// store reads as "no such database" rather than failing the request: the
+	// first write after a create is what makes the bucket (#945, #1242).
 	markerPath := name + "/.arc-database"
 	exists, err := h.storage.Exists(ctx, markerPath)
-	if err != nil {
+	if err != nil && !storage.IsStoreNotFound(err) {
 		return false, err
 	}
 	if exists {
@@ -1103,7 +1113,7 @@ func (h *DatabasesHandler) databaseExists(ctx context.Context, name string) (boo
 	// Fallback: Check if there's any content in the database directory
 	// (for databases created before marker files were introduced)
 	files, err := h.storage.List(ctx, name+"/")
-	if err != nil {
+	if err != nil && !storage.IsStoreNotFound(err) {
 		return false, err
 	}
 	if len(files) > 0 {
