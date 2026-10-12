@@ -814,15 +814,15 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 
 	// Auto-dedup: decide from the files' metadata how this batch removes
 	// duplicate rows (see decideDedup).
-	tagColumns, mode := j.decideDedup(ctx, db, validLocalPaths, fileListSQL)
+	tagColumns, mode := j.decideDedup(ctx, db, validLocalPaths)
 
 	// Build and execute compaction statement(s) (with dedup if tag metadata found).
-	// The dedup path returns two statements (CREATE OR REPLACE TEMP TABLE + COPY).
-	// A DuckDB TEMP table is connection-local, and database/sql does NOT guarantee
-	// two sequential ExecContext calls share a pooled connection — so the COPY
-	// could land on a different connection and fail to see the staged table. We
-	// pin both statements to a single dedicated connection via db.Conn. Closing it
-	// also deterministically drops the temp table (no leak on partial failure).
+	// The dedup path returns three statements (two CREATE OR REPLACE TEMP TABLE,
+	// then the COPY). A DuckDB TEMP table is connection-local, and database/sql
+	// does NOT guarantee sequential ExecContext calls share a pooled connection —
+	// so a later statement could land on a different connection and fail to see
+	// the temp tables. We pin all of them to a single dedicated connection via
+	// db.Conn, and drop both temp tables explicitly before it is returned.
 	dedupBranch := mode != dedupNone
 	stmts := buildCompactionQuery(fileListSQL, orderByClause, outputFile, tagColumns, mode)
 
@@ -862,6 +862,7 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			_, _ = conn.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS "+dedupStagingTable)
+			_, _ = conn.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS "+dedupKeysTable)
 		}
 		conn.Close()
 	}()
@@ -896,7 +897,7 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 		rowsAfter, err := countParquetRows(ctx, db, fmt.Sprintf("[%s]", sqlutil.QuoteStringLiteral(outputFile)))
 		if err != nil {
 			// Warn for the same reason as the before-count above: this file was
-			// written by the COPY two statements earlier.
+			// written by the COPY just above.
 			j.logger.Warn().Err(err).Msg("Failed to count parquet rows after deduplication")
 		} else if rowsAfter > 0 && rowsAfter < rowsBefore {
 			deduped := rowsBefore - rowsAfter
@@ -916,30 +917,24 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	return outputFile, nil
 }
 
-// decideDedup chooses how a compaction batch removes duplicate rows, from the
-// files' Parquet metadata:
+// decideDedup chooses whether a compaction batch removes duplicate rows, and
+// the key that narrows where whole rows are compared, from the files' Parquet
+// metadata:
 //
-//   - arc:tags on any file (union across files, for schema evolution): one row
-//     per (tags..., time).
-//   - no tags, and no file marked arc:dedup_time: no dedup — raw ingest.
-//   - no tags, every file marked and each unique on time: one row per time.
-//     The no-group-by continuous query #521 built the marker for.
-//   - no tags, otherwise (some files unmarked, or a marked file holding several
-//     rows per time): drop only rows identical in every column.
+//   - arc:tags on any file (union across files, for schema evolution): exact
+//     rows, keyed by (tags..., time).
+//   - no tags, any file carrying the continuous-query marker: exact
+//     rows, keyed by time.
+//   - otherwise: no dedup — raw ingest without tags is left alone.
 //
-// The last two replaced "any file marked → dedup the batch on time" (#1227).
-// A marker describes only its own file: a grouped continuous query without
-// tag_columns marks the windows that happened to hold one series and not the
-// others, so "any" collapsed every series but one in the multi-series windows.
-// Files without a marker that still belong here — a WAL-replayed or
-// replicated copy, a DELETE rewrite, output compacted before #1227, a run too
-// large to check — keep their rows, and their exact copies collapse.
+// Exact rows (#1232): a row is dropped only when another is identical in every
+// column. Before, the key alone decided — one row per (tags, time), or per
+// time for marked output — so a correction, a partial write of other fields,
+// or a re-run continuous-query window with late data lost every row but one.
 //
-// Every failure reading metadata fails toward keeping rows: a tag read error
-// skips dedup entirely (time-only dedup over tagged data would lose rows), a
-// marker read error skips it too, and a uniqueness probe error drops to
-// exact-row dedup.
-func (j *Job) decideDedup(ctx context.Context, db *sql.DB, localPaths []string, fileListSQL string) ([]string, dedupMode) {
+// A failure reading metadata skips dedup for the batch: keeping a duplicate
+// is recoverable, guessing a key is not.
+func (j *Job) decideDedup(ctx context.Context, db *sql.DB, localPaths []string) ([]string, dedupMode) {
 	if len(localPaths) == 0 {
 		return nil, dedupNone
 	}
@@ -952,39 +947,22 @@ func (j *Job) decideDedup(ctx context.Context, db *sql.DB, localPaths []string, 
 		j.logger.Info().
 			Strs("tag_columns", tags).
 			Int("files", len(localPaths)).
-			Msg("Auto-dedup enabled: found tag metadata in parquet files")
-		return tags, dedupTagsTime
+			Msg("Auto-dedup enabled: found tag metadata in parquet files, removing exact duplicate rows")
+		return tags, dedupExact
 	}
 
-	marked, err := readDedupTimeMarkers(ctx, db, localPaths)
+	marked, err := readAnyContinuousQueryMarker(ctx, db, localPaths)
 	if err != nil {
-		j.logger.Warn().Err(err).Msg("Failed to read dedup_time metadata from parquet, skipping dedup")
+		j.logger.Warn().Err(err).Msg("Failed to read dedup marker metadata from parquet, skipping dedup")
 		return nil, dedupNone
 	}
-	if marked == 0 {
+	if !marked {
 		return nil, dedupNone
-	}
-	if marked == len(localPaths) {
-		unique, err := filesUniqueOnTime(ctx, db, fileListSQL)
-		switch {
-		case err != nil:
-			j.logger.Warn().Err(err).Msg("Failed to verify that marked files are unique on time; deduplicating identical rows only")
-		case unique:
-			j.logger.Info().
-				Int("files", len(localPaths)).
-				Msg("Auto-dedup enabled: every file carries the arc:dedup_time marker, deduping on time")
-			return nil, dedupTimeOnly
-		default:
-			j.logger.Warn().
-				Int("files", len(localPaths)).
-				Msg("A file marked arc:dedup_time holds several rows per time; deduplicating identical rows only")
-		}
 	}
 	j.logger.Info().
 		Int("files", len(localPaths)).
-		Int("marked_files", marked).
-		Msg("Auto-dedup: continuous-query output without a time-only guarantee, deduplicating identical rows only")
-	return nil, dedupExactRows
+		Msg("Auto-dedup enabled: continuous-query output, removing exact duplicate rows")
+	return nil, dedupExact
 }
 
 // uploadFile publishes the compacted output to storage.

@@ -622,12 +622,13 @@ func (w *ArrowWriter) inferSchema(columns map[string]interface{}, tagColumns []s
 		metaValues = append(metaValues, strings.Join(sorted, ","))
 	}
 
-	// Mark the file as one row per time. Written only for continuous-query
-	// output that is (#521). Compaction dedups on "time" alone only when every
-	// file of a batch carries this and each is unique on time (#1227). Raw
-	// ingest never sets it.
+	// Mark continuous-query output without tag columns (#521): it opts the
+	// file into exact-row dedup at compaction, keyed by time (#1232). Raw
+	// ingest never sets it. Not the older arc:dedup_time key: builds before
+	// #1232 read that as "dedup on time alone" and would delete rows from
+	// this output if a node were rolled back.
 	if dedupTime {
-		metaKeys = append(metaKeys, "arc:dedup_time")
+		metaKeys = append(metaKeys, "arc:dedup_exact")
 		metaValues = append(metaValues, "true")
 	}
 
@@ -655,7 +656,7 @@ func (w *ArrowWriter) inferSchema(columns map[string]interface{}, tagColumns []s
 // validity is an optional map of column name → []bool where false means null.
 // Columns without a validity entry (or when validity is nil) are treated as fully valid.
 // tagColumns optionally lists which columns are tags (stored as Parquet metadata for compaction dedup).
-// dedupTime, when true, marks the file with arc:dedup_time: it is one row per time (see ColumnarRecord.DedupTime).
+// dedupTime, when true, marks the file with arc:dedup_exact: continuous-query output (see ColumnarRecord.DedupTime).
 // decimalCols optionally maps column names to DecimalSpec for Decimal128 type inference.
 func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement string, columns map[string]interface{}, validity map[string][]bool, tagColumns []string, dedupTime bool, decimalCols map[string]config.DecimalSpec) ([]byte, error) {
 	data, _, err := w.writeParquetColumnarWithSchema(ctx, measurement, columns, validity, tagColumns, dedupTime, decimalCols)
@@ -828,9 +829,8 @@ type TypedColumnBatch struct {
 	Validity   map[string][]bool      // per-column null bitmap; nil entry = all valid
 	TagColumns []string               // tag column names (for Parquet metadata, enables auto-dedup)
 	// DedupTime propagates ColumnarRecord.DedupTime: when true, the Parquet
-	// footer gets an arc:dedup_time marker saying the file is one row per time.
-	// A merge keeps it only if every batch had it (#1227). See
-	// ColumnarRecord.DedupTime — CQ output only (#521).
+	// footer gets an arc:dedup_exact marker. A merge keeps it if any batch had
+	// it. See ColumnarRecord.DedupTime — CQ output only (#521).
 	DedupTime bool
 	Signature string   // sorted column-name string; cached to avoid per-write recomputation
 	WALHashes []string // identities of WAL entries represented by this batch
@@ -1940,14 +1940,13 @@ func (b *ArrowBuffer) WriteColumnarRecord(ctx context.Context, database string, 
 //
 // Note (#521): the WAL stores flattened rows and does NOT carry TagColumns or
 // the DedupTime marker (both are json:"-"), so a Parquet file produced purely
-// from WAL replay has neither arc:tags nor arc:dedup_time. For arc:tags this
-// self-heals: compaction unions tags across all files in a partition, so a
-// replayed file dedups against any tagged sibling. arc:dedup_time does not
-// combine that way since #1227 — time-only dedup needs every file marked — so
-// a batch holding a replayed file drops only rows identical in every column,
-// which is what the replayed copy of a row is. A replayed copy whose sibling
-// lands in another compaction batch stays a duplicate until both meet: never
-// data loss. Propagating the markers through the WAL is a separate, larger
+// from WAL replay has neither arc:tags nor the continuous-query marker.
+// Compaction unions tags and reads the marker across all files of a batch, so
+// a replayed file is deduped against any tagged or marked raw sibling in the
+// same batch — exact-row (#1232), so the replayed copy of a row collapses and
+// nothing else does. It is NOT deduped against a compacted file (compacted
+// tagged output carries no arc:tags) or a sibling in another batch: that copy
+// stays a duplicate. Never data loss. Propagating the markers through the WAL is a separate, larger
 // change (WAL schema).
 // WriteColumnarDirectNoWAL writes a replayed or replicated columnar payload into
 // the buffer without appending it to the WAL. It inherits no WAL identity; use
@@ -2693,7 +2692,7 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALHashes(ctx context.Context, da
 
 	// Propagate tag column names for Parquet metadata (enables auto-dedup in compaction)
 	typedColumns.TagColumns = record.TagColumns
-	// Propagate the dedup-on-time marker (CQ output only — see ColumnarRecord.DedupTime)
+	// Propagate the continuous-query dedup marker (CQ output only — see ColumnarRecord.DedupTime)
 	typedColumns.DedupTime = record.DedupTime
 	typedColumns.WALHashes = walHashes
 
@@ -4116,14 +4115,11 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 
 	// Union of tag columns across all batches (for Parquet metadata)
 	tagColumnSet := make(map[string]struct{})
-	// Dedup-time marker: the merged output carries it only if EVERY batch did.
-	// It says the data is one row per time, which is a property of each batch
-	// on its own, not of their union: a grouped continuous query without
-	// tag_columns marks a window that held one series and not one that held
-	// several, and ORing them made compaction collapse the latter (#1227). A
-	// batch without it — another run, a WAL-replayed map batch, a raw write to
-	// the same measurement — clears it.
-	mergedDedupTime := true
+	// Dedup-time marker: the merged output carries it if ANY batch did. It
+	// marks continuous-query output, which opts the file into exact-row dedup
+	// at compaction (#1232) — and exact-row dedup never deletes a row that
+	// differs from the others, so marking a mix is safe.
+	mergedDedupTime := false
 
 	// First pass: count total rows using time column
 	for _, batch := range batches {
@@ -4137,12 +4133,11 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 			for _, tag := range b.TagColumns {
 				tagColumnSet[tag] = struct{}{}
 			}
-			if !b.DedupTime {
-				mergedDedupTime = false
+			if b.DedupTime {
+				mergedDedupTime = true
 			}
 		case map[string]interface{}:
 			cols = b
-			mergedDedupTime = false
 		default:
 			return nil, fmt.Errorf("invalid batch type: %T", batch)
 		}
@@ -4311,54 +4306,7 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 		}
 	}
 
-	out := &TypedColumnBatch{Data: merged, Validity: mergedValidity, TagColumns: mergedTagColumns, DedupTime: mergedDedupTime}
-	if mergedDedupTime {
-		out = keepLastRowPerTime(out)
-	}
-	return out, nil
-}
-
-// keepLastRowPerTime applies, to a merge of batches that each carried the
-// arc:dedup_time marker, the rule compaction applies to such files: one row
-// per time. Each batch is one row per time on its own, but two of them can be
-// two emissions of the same window — a scheduled run and a manual execute, a
-// retry — and their merge would be a marked file holding two rows per time.
-// Compaction does not trust such a file (it cannot tell it from one that
-// holds several series per time), so it would keep both rows and leave the
-// hour unmarked for good (#1227). The later row wins: batches merge in
-// arrival order, so it is the newer emission. When the time column is not the
-// int64 the buffer normally holds, the merge cannot be checked and loses the
-// marker instead.
-func keepLastRowPerTime(batch *TypedColumnBatch) *TypedColumnBatch {
-	times, ok := batch.Data["time"].([]int64)
-	if !ok {
-		batch.DedupTime = false
-		return batch
-	}
-	last := make(map[int64]int, len(times))
-	for i, t := range times {
-		last[t] = i
-	}
-	if len(last) == len(times) {
-		return batch
-	}
-	// sliceColumnsByIndices copies a column of any other type whole, which
-	// would leave it the wrong length: lose the marker rather than drop rows.
-	for _, col := range batch.Data {
-		switch col.(type) {
-		case []int64, []float64, []string, []bool, []decimal128.Num:
-		default:
-			batch.DedupTime = false
-			return batch
-		}
-	}
-	keep := make([]int, 0, len(last))
-	for i, t := range times {
-		if last[t] == i {
-			keep = append(keep, i)
-		}
-	}
-	return sliceTypedColumnBatchByIndices(batch, keep)
+	return &TypedColumnBatch{Data: merged, Validity: mergedValidity, TagColumns: mergedTagColumns, DedupTime: mergedDedupTime}, nil
 }
 
 // sortColumnsByTime sorts all columns by the time column in-place
