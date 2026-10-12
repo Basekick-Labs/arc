@@ -677,3 +677,46 @@ func TestFrameSizesAreBoundedBeforeAllocation(t *testing.T) {
 		t.Fatal("the store accepted an entry it cannot frame")
 	}
 }
+
+// FlushFloors returns only once every session wrote the current floors.
+func TestFlushFloorsWaitsForTheWrite(t *testing.T) {
+	floors := &Floors{Instance: 1, AppliedIndex: 7, Keys: map[string]KeyFloor{"db/a": {Floor: 3}}}
+	srv := NewServer(0, func() *Floors { return floors }, zerolog.Nop())
+	srv.Start()
+	defer srv.Stop()
+	a, b := net.Pipe()
+	defer b.Close()
+	srv.Accept("s", a, testKey)
+	read := func() byte {
+		typ, _, err := readFrame(b, testKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return typ
+	}
+	if typ := read(); typ != frameFloors {
+		t.Fatalf("first frame %d", typ)
+	}
+	// The standby does not read: the floors cannot be written.
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := srv.FlushFloors(ctx); err == nil {
+		t.Fatal("FlushFloors returned before the floors were written")
+	}
+	got := make(chan byte, 4)
+	go func() {
+		for {
+			typ, _, err := readFrame(b, testKey)
+			if err != nil {
+				return
+			}
+			got <- typ
+		}
+	}()
+	if err := srv.FlushFloors(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if typ := <-got; typ != frameFloors {
+		t.Fatalf("frame %d", typ)
+	}
+}

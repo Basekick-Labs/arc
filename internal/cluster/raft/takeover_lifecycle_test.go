@@ -129,7 +129,8 @@ func TestTrimmedSetIsNotAReport(t *testing.T) {
 }
 
 // An instance whose claim finished and that its origin then closes (restart,
-// nothing held) is removed, as on ClaimDone.
+// nothing held) is removed once every other writer finished a claim of it
+// or reported holding nothing, as on ClaimDone.
 func TestClosedAfterDoneIsRemoved(t *testing.T) {
 	x := takeoverFSM(t)
 	x.announce("w3", 9, Continuity{})
@@ -142,8 +143,12 @@ func TestClosedAfterDoneIsRemoved(t *testing.T) {
 		t.Fatal("a finished claim on the current instance is still a claim")
 	}
 	x.announce("w3", 10, Continuity{WAL: 9, Journal: 9, Storage: 9})
+	if x.inst(9) == nil {
+		t.Fatal("closed instance removed while w2 may hold batches the claimant lacked")
+	}
+	x.ok(CommandTakeOverStreamV2, TakeOverStreamV2Payload{Origin: "w3", By: "w2", Now: t0, Claims: []ClaimSet{{Instance: 9}}})
 	if x.inst(9) != nil {
-		t.Fatal("closed instance with a finished claim kept")
+		t.Fatal("closed instance with a finished claim kept after every writer answered")
 	}
 	if x.f.CurrentInstanceClaimed("w3") {
 		t.Fatal("the new instance is not claimed")

@@ -2,7 +2,9 @@ package originstream
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -46,6 +48,9 @@ type session struct {
 	floors *Floors // latest floors not yet sent
 	closed bool
 	seq    uint64
+	// floorsSet counts setFloors calls; floorsWritten is the count whose
+	// floors were last written (FlushFloors waits on it).
+	floorsSet, floorsWritten uint64
 }
 
 const (
@@ -165,11 +170,67 @@ func (s *Server) Accept(node string, conn net.Conn, sessionKey []byte) {
 	}()
 }
 
-func (ss *session) setFloors(f *Floors) {
+func (ss *session) setFloors(f *Floors) uint64 {
 	ss.mu.Lock()
+	defer ss.mu.Unlock()
 	ss.floors = f
+	ss.floorsSet++
 	ss.cond.Signal()
-	ss.mu.Unlock()
+	return ss.floorsSet
+}
+
+// flushed reports whether the floors of setFloors call gen (or later) were
+// written (done and ok), or the session ended first (done, not ok).
+func (ss *session) flushed(gen uint64) (done, ok bool) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	if ss.floorsWritten >= gen {
+		return true, true
+	}
+	return ss.closed, false
+}
+
+// FlushFloors sends the current floors to every session and waits until
+// each wrote them (or ended), or ctx ends. A writer leaving the cluster
+// calls it last, so its standbys know every batch it registered (#1207).
+func (s *Server) FlushFloors(ctx context.Context) error {
+	f := s.floors()
+	if f == nil {
+		return nil
+	}
+	s.mu.Lock()
+	type wait struct {
+		ss  *session
+		gen uint64
+	}
+	waits := make([]wait, 0, len(s.sessions))
+	for _, ss := range s.sessions {
+		waits = append(waits, wait{ss, ss.setFloors(f)})
+	}
+	s.mu.Unlock()
+	t := time.NewTicker(10 * time.Millisecond)
+	defer t.Stop()
+	var lost []string
+	for _, w := range waits {
+		for {
+			done, ok := w.ss.flushed(w.gen)
+			if done {
+				if !ok {
+					lost = append(lost, w.ss.node)
+				}
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-t.C:
+			}
+		}
+	}
+	if len(lost) > 0 {
+		return fmt.Errorf("origin stream sessions ended before the floors were sent: %v", lost)
+	}
+	return nil
 }
 
 // markClosed stops the session under its lock; closeConn closes the
@@ -207,6 +268,7 @@ func (ss *session) run() {
 		ss.queue = nil
 		f := ss.floors
 		ss.floors = nil
+		gen := ss.floorsSet
 		ss.mu.Unlock()
 		for _, e := range batch {
 			if !validEntry(e) {
@@ -237,6 +299,9 @@ func (ss *session) run() {
 				ss.logger.Warn().Err(err).Msg("Origin stream session ended writing registration progress")
 				return
 			}
+			ss.mu.Lock()
+			ss.floorsWritten = gen
+			ss.mu.Unlock()
 		}
 	}
 }

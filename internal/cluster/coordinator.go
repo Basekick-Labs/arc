@@ -139,12 +139,14 @@ type Coordinator struct {
 	// Stream claims (#1207 S4a): streamClaimsMu serializes the join gate
 	// with the enable proposal on the leader. See stream_claims.go.
 	streamClaimsMu       sync.Mutex
-	streamClaimsProposer atomic.Bool // the enable loop runs (not in S4a)
+	streamClaimsProposer atomic.Bool // the enable loop runs
 	nodeIDWarn           sync.Once   // stream takeover without an explicit node id, logged once
 	streamClaimsBlockers atomic.Pointer[[]string]
 	walCoverageActive    atomic.Bool // SetWALCoverageActive
 	ingestFenceListeners []func(fenced bool)
 	takeoverOrigin       atomic.Pointer[takeoverOriginState] // SetTakeoverOrigin (#1207 S4b)
+	claimedExit          atomic.Bool                         // another writer claimed this process: refuse writes, exit (#1207)
+	claimant             atomic.Pointer[claimant]            // StartOriginStream with stream takeover (#1207)
 	pauseNotifyMu        sync.Mutex                          // ingestPauseChanged
 	pauseNotified        bool
 	pauseState           bool
@@ -692,6 +694,13 @@ func (c *Coordinator) Start() error {
 	// "simplify" this by passing a TTL.
 	c.nonceCache = security.NewNonceCache(security.HMACTimestampTolerance)
 
+	// Before the accept loop: a join admitted from now on goes through the
+	// stream claims gate's slow path (#1207). Any node with the setting may
+	// propose the flag (a reader can be the Raft leader); coverage is a
+	// writer's requirement, carried by its advertised capability.
+	proposer := c.cfg.StreamTakeover && c.raftNode != nil && !c.cfg.SharedStorageMode
+	c.streamClaimsProposer.Store(proposer)
+
 	// Start Raft node if configured (Phase 3)
 	if c.raftNode != nil {
 		if err := c.raftNode.Start(); err != nil {
@@ -759,8 +768,12 @@ func (c *Coordinator) Start() error {
 	// Refuse writes on a writer that may no longer be the primary (#1207).
 	c.startIngestFenceLocked()
 	go c.streamClaimsMetricsLoop(c.ctx)
+	if proposer {
+		go c.streamClaimsEnableLoop(c.ctx)
+	}
 	if c.cfg.StreamTakeover && c.raftNode != nil {
 		go c.departedExpiryLoop(c.ctx)
+		go c.streamClaimAutoReleaseLoop(c.ctx)
 	}
 	if c.cfg.StreamTakeover && c.raftNode != nil && c.takeoverOrigin.Load() != nil {
 		go c.streamTakeoverOriginLoop(c.ctx)
@@ -878,6 +891,7 @@ func (c *Coordinator) Stop() error {
 	if !c.leaving.CompareAndSwap(false, true) {
 		return nil
 	}
+	c.finalTakeoverReport()
 	c.broadcastLeave()
 	// Before c.mu is taken: stopOriginStream takes it, and joins goroutines
 	// that read coordinator state.

@@ -316,6 +316,10 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 
+	if !req.DryRun && takeoverBusy(h.coordinator, req.Database, req.Measurement) {
+		return respondTakeoverBusy(c, "delete")
+	}
+
 	// Validate WHERE clause
 	isFullTableDelete, err := h.validateWhereClause(req.Where)
 	if err != nil {
@@ -1223,4 +1227,22 @@ func (h *DeleteHandler) replaceManifestAfterRewrite(ctx context.Context, oldPath
 		return fmt.Errorf("manifest committed but failed to delete superseded rewrite %q: %w", oldPath, err)
 	}
 	return nil
+}
+
+// takeoverBusy asks the coordinator, when it can tell, whether a stream
+// takeover is publishing rows of db/measurement (#1207): a delete applied
+// before them would be undone by them.
+func takeoverBusy(coord any, db, measurement string) bool {
+	b, ok := coord.(interface {
+		StreamTakeoverBusy(db, measurement string) bool
+	})
+	return ok && b.StreamTakeoverBusy(db, measurement)
+}
+
+func respondTakeoverBusy(c *fiber.Ctx, what string) error {
+	c.Set(fiber.HeaderRetryAfter, "30")
+	return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+		"success": false,
+		"error":   what + " rejected: a stream takeover is publishing rows a writer acknowledged before it failed; retry shortly",
+	})
 }

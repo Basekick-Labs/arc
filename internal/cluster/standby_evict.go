@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"slices"
 	"sync"
 
 	"github.com/basekick-labs/arc/internal/cluster/originstream"
@@ -56,8 +57,12 @@ func (p *standbyEvictPolicy) tier(in originstream.InstanceInfo) int {
 		return originstream.EvictNever
 	case st.Untracked:
 		return originstream.EvictFirst // can never be claimed
+	case st.Claimed && st.ClaimDone && !st.ClaimRelease && slices.Contains(st.Finished, p.c.localNode.ID):
+		return originstream.EvictFirst // published, what this node held included
 	case st.Claimed && st.ClaimDone && !st.ClaimRelease:
-		return originstream.EvictFirst // published
+		// Published by another writer: this copy may hold batches that
+		// writer lacked, which this node claims next (a follow-up).
+		return originstream.EvictUnderPressure
 	case !in.Floors:
 		return originstream.EvictNever // the origin reported nothing yet
 	case st.Status == raft.InstanceAdopted && p.c.originHealthy(st.Origin):
