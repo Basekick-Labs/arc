@@ -397,10 +397,11 @@ type walEntry struct {
 	untrackedData bool
 	// foreignProof marks a CHECKPOINT entry that covers at least one identity
 	// this process did not mint: a row-range identity, or a whole-entry token
-	// from an earlier writer instance. Both describe entries in a file that
-	// recovery retained, and such a file is absent from w.fileOrder — so the
-	// purge walk cannot see it and cannot stop at it. The destination file is
-	// therefore pinned; see Writer.PurgeFlushed.
+	// from an earlier writer instance. Either can describe entries in a file
+	// an earlier process wrote and recovery retained, which is absent from
+	// w.fileOrder — so the purge walk cannot see it and cannot stop at it.
+	// The destination file is therefore pinned while such a file exists; see
+	// Writer.PurgeFlushed.
 	foreignProof bool
 }
 
@@ -413,10 +414,11 @@ type fileSeqState struct {
 	// file can hold a non-contiguous set. The bound is all the purge rule needs
 	// — see Writer.PurgeFlushed.
 	maxSeq uint64
-	// hasForeignProof is set when a checkpoint covering an identity from a
-	// retained file this process did not create lands here. Such a file is the
-	// only record that those entries were flushed, and the file they describe
-	// is not in w.fileOrder, so no ordering rule protects it.
+	// hasForeignProof is set when a checkpoint covering an identity this
+	// process did not mint lands here. While a WAL file an earlier process
+	// wrote still exists, this file can be the only record that its entries
+	// were flushed, and that file is not in w.fileOrder, so no ordering rule
+	// protects it.
 	hasForeignProof bool
 	// hasUntrackedData is set when an untracked data entry lands here.
 	hasUntrackedData bool
@@ -489,8 +491,17 @@ type Writer struct {
 	// backwards under a clock step, rotation order cannot. Files created by a
 	// PREVIOUS process appear in neither, which is deliberate: nothing here
 	// knows whether their data was flushed, so only recovery may delete them.
-	fileSeqs        map[string]*fileSeqState
-	fileOrder       []string
+	fileSeqs  map[string]*fileSeqState
+	fileOrder []string
+	// created holds every WAL file this process rotated in, including ones
+	// that rotated out empty and so never reached fileSeqs. A *.wal file in
+	// the directory that is not in it was written by an earlier process (or
+	// put there by an operator), and only recovery may delete it. Guarded by
+	// w.mu.
+	created map[string]struct{}
+	// pinnedOn is the earlier-process file the last purge pass found keeping
+	// a foreign-proof pin, for logging only on change. Guarded by w.mu.
+	pinnedOn        string
 	trackedSequence uint64
 	// pendingSeqs holds the tracked sequences this process has appended that no
 	// durable flush checkpoint covers yet. Its minimum is the floor that makes
@@ -565,6 +576,7 @@ func NewWriter(cfg *WriterConfig) (*Writer, error) {
 		lastSyncTime:    time.Now(),
 		entryChan:       make(chan walEntry, cfg.BufferSize),
 		fileSeqs:        make(map[string]*fileSeqState),
+		created:         make(map[string]struct{}),
 		pendingSeqs:     make(map[uint64]struct{}),
 		done:            make(chan struct{}),
 		trackedInstance: trackedInstance,
@@ -810,6 +822,9 @@ func (w *Writer) rotate() error {
 	n, err := newFile.Write(header[:])
 	if err != nil {
 		newFile.Close()
+		// Remove the headerless file: nothing else will, and a *.wal this
+		// writer did not record pins the purge as an earlier process file.
+		_ = os.Remove(newPath)
 		return fmt.Errorf("failed to write WAL header: %w", err)
 	}
 
@@ -825,6 +840,7 @@ func (w *Writer) rotate() error {
 	// Swap to new file
 	w.currentFile = newFile
 	w.currentPath = newPath
+	w.created[newPath] = struct{}{}
 	w.currentSize = int64(n)
 	w.startTime = time.Now()
 	w.lastSyncTime = time.Now()
@@ -1445,9 +1461,52 @@ func (w *Writer) noteWrittenLocked(entry walEntry) {
 	}
 }
 
+// listWALFilesFn lists the *.wal files in dir. A variable so tests can make
+// the listing fail.
+var listWALFilesFn = listWALFiles
+
+// listWALFiles lists with ReadDir rather than filepath.Glob, which reports no
+// I/O error: an unreadable directory would read as an empty one.
+func listWALFiles(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, e := range entries {
+		if e.Type().IsRegular() && strings.HasSuffix(e.Name(), ".wal") {
+			out = append(out, filepath.Join(dir, e.Name()))
+		}
+	}
+	return out, nil
+}
+
+// earlierFileLocked reports whether a foreign-proof file must stay pinned: a
+// *.wal file in the directory that this process did not create still exists
+// (returned), or the directory could not be listed — the pin fails closed.
+// Caller holds w.mu.
+func (w *Writer) earlierFileLocked(listed []string, listErr error) (string, bool) {
+	if listErr != nil {
+		w.logger.Warn().Err(listErr).Msg("Could not list the WAL directory; WAL files holding flush proof for earlier process files stay pinned")
+		return "", true
+	}
+	for _, path := range listed {
+		if _, ok := w.created[path]; !ok {
+			return path, true
+		}
+	}
+	if w.pinnedOn != "" {
+		w.logger.Info().Str("file", filepath.Base(w.pinnedOn)).
+			Msg("Earlier process WAL file is gone; WAL purge no longer pinned by its flush proof")
+		w.pinnedOn = ""
+	}
+	return "", false
+}
+
 // forgetFileLocked drops a deleted file from the purge bookkeeping. Caller
 // holds w.mu.
 func (w *Writer) forgetFileLocked(path string) {
+	delete(w.created, path)
 	if _, ok := w.fileSeqs[path]; !ok {
 		return
 	}
@@ -1486,9 +1545,10 @@ func (w *Writer) trackedTokenSeq(token string) (uint64, bool) {
 // construction covers part of an entry recovery replayed), or a whole-entry
 // token minted by an earlier writer instance.
 //
-// The file such a checkpoint lands in must not be purged by sequence — the
-// entries it vouches for live in a file absent from w.fileOrder, so the walk in
-// PurgeFlushed cannot reach them to stop there.
+// The file such a checkpoint lands in must not be purged by sequence while an
+// earlier process's WAL file remains — the entries it vouches for can live in
+// such a file, absent from w.fileOrder, so the walk in PurgeFlushed cannot
+// reach them to stop there.
 func (w *Writer) coversForeignIdentity(hashes []string) bool {
 	for _, h := range hashes {
 		if strings.HasPrefix(h, recoveryRowPrefix) {
@@ -1606,7 +1666,10 @@ func (w *Writer) MinUnflushedSequence() uint64 {
 //
 // Returns the number of files deleted.
 func (w *Writer) PurgeFlushed(minUnflushedSeq uint64) (int, error) {
+	// Listed outside w.mu: the writer loop holds it across fsync.
+	listed, listErr := listWALFilesFn(w.config.WALDir)
 	w.mu.Lock()
+	earlier, pinned := w.earlierFileLocked(listed, listErr)
 	activePath := w.currentPath
 	candidates := make([]string, 0, len(w.fileOrder))
 	for _, path := range w.fileOrder {
@@ -1622,11 +1685,22 @@ func (w *Writer) PurgeFlushed(minUnflushedSeq uint64) (int, error) {
 		// the only record that those entries were flushed, and that file is not
 		// in w.fileOrder, so the ordering rule above cannot protect it.
 		// Deleting this one makes recovery replay rows that are already in
-		// storage. Pinning is deliberately conservative: the pin lasts until
-		// this process exits, and only files written while a retained file
-		// existed can carry it, so the bound is the outage window rather than
-		// the lifetime of the node.
-		if state.hasForeignProof {
+		// storage — so it is pinned while any file an earlier process wrote
+		// remains. Once recovery has deleted or quarantined them all, the
+		// proof vouches for nothing: every crash replay writes such a
+		// checkpoint, and a pin for the life of the process stopped this walk
+		// for good (#1222).
+		//
+		// A row-range checkpoint for an entry in one of this process's own
+		// files needs no pin: that parent's sequence stays pending until
+		// recovery checkpoints it, so its file precedes this one in the walk
+		// and stops it.
+		if state.hasForeignProof && pinned {
+			if earlier != "" && w.pinnedOn != earlier {
+				w.pinnedOn = earlier
+				w.logger.Info().Str("file", filepath.Base(path)).Str("waiting_on", filepath.Base(earlier)).
+					Msg("WAL purge stopped at a file holding flush proof for an earlier process WAL file; it resumes once recovery has removed that file")
+			}
 			break
 		}
 		// maxSeq == 0 means the file holds no tracked data at all (checkpoints

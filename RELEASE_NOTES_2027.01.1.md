@@ -934,6 +934,34 @@ an unbounded operation.
 
 ## Bug fixes
 
+### The WAL is reclaimed again after a crash recovery ([#1222](https://github.com/Basekick-Labs/arc/issues/1222))
+
+After a restart that replayed WAL entries from the previous run, the periodic
+WAL purge stopped deleting files for the rest of the process's life. The WAL
+directory then grew with ingest until a clean shutdown. A node that crashed
+once and kept running for days kept every WAL file it wrote, until disk
+pressure. One object-store outage could do the same with no crash at all: the
+recovery that runs after a failed flush replays a large entry in row ranges.
+
+The cause was a safeguard that never lifted. A replayed entry's flush records
+a checkpoint for the earlier run's entry, and that checkpoint can be the only
+proof that the entry was flushed. The purge therefore never deleted the file
+holding it, nor any file after it. The proof matters only while a WAL file
+from an earlier run still exists. Recovery deletes that file as soon as its
+entries are durable, so the safeguard was holding back files for no reason.
+
+The purge now keeps such a file only while a WAL file this process did not
+write is still in the directory. If the directory cannot be listed, it keeps
+it. While it waits, it logs the file it is waiting on:
+
+```
+WAL purge stopped at a file holding flush proof for an earlier process WAL file; it resumes once recovery has removed that file
+```
+
+Nothing to configure. A WAL directory that grew under this bug is reclaimed
+when the node restarts on this release: startup recovery deletes the files
+whose entries are already flushed.
+
 ### A forwarded file registration must name the forwarding node as its origin ([#1207](https://github.com/Basekick-Labs/arc/issues/1207))
 
 A cluster node that is not the Raft leader forwards its file registrations to
