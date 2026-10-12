@@ -128,8 +128,11 @@ func readFrame(r io.Reader, key []byte) (byte, []byte, error) {
 	return hdr[4], body, nil
 }
 
+// maxKeyLen bounds a coverage key on the wire: its length travels as a u16.
+const maxKeyLen = 1<<16 - 1
+
 func entryHead(seq uint64, e *Entry) []byte {
-	h := make([]byte, entryFixed+len(e.Key))
+	h := make([]byte, entryFixed+len(e.Key)) // len(e.Key) <= maxKeyLen: checked by validEntry
 	binary.BigEndian.PutUint64(h[0:], seq)
 	binary.BigEndian.PutUint64(h[8:], e.TimestampUS)
 	binary.BigEndian.PutUint64(h[16:], e.Instance)
@@ -139,6 +142,13 @@ func entryHead(seq uint64, e *Entry) []byte {
 	binary.BigEndian.PutUint16(h[36:], uint16(len(e.Key)))
 	copy(h[entryFixed:], e.Key)
 	return h
+}
+
+// validEntry reports whether e can be framed: its key fits the u16 length
+// field and the whole frame fits maxFrame. Checked before any allocation
+// sized from e.
+func validEntry(e *Entry) bool {
+	return len(e.Key) <= maxKeyLen && len(e.Payload) <= maxFrame-(1+entryFixed+maxKeyLen+macLen)
 }
 
 func parseEntry(body []byte) (uint64, *Entry, error) {
@@ -168,6 +178,11 @@ func floorsHead(seq uint64, f *Floors) ([]byte, error) {
 	js, err := json.Marshal(f)
 	if err != nil {
 		return nil, err
+	}
+	// Bounded before the allocation: a floors report this large cannot be
+	// framed, and the size arithmetic must not overflow.
+	if len(js) > maxFrame-(1+8+macLen) {
+		return nil, fmt.Errorf("origin stream floors report too large: %d bytes for %d keys", len(js), len(f.Keys))
 	}
 	h := make([]byte, 8+len(js))
 	binary.BigEndian.PutUint64(h, seq)

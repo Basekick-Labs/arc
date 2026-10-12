@@ -334,6 +334,9 @@ func (s *Store) Append(origin string, e *Entry) error {
 	if err != nil {
 		return err
 	}
+	if !validEntry(e) {
+		return fmt.Errorf("standby store: entry for %q cannot be stored (key %d bytes, payload %d bytes)", e.Key, len(e.Key), len(e.Payload))
+	}
 	rec := encodeRecord(e)
 	if s.maxBytes > 0 {
 		if s.bytes+int64(len(rec)) > s.maxBytes {
@@ -439,6 +442,8 @@ func (s *Store) evictReplacedLocked(target int64) {
 	}
 }
 
+// encodeRecord frames e for a segment. The caller has checked validEntry, so
+// the size arithmetic stays far below overflow.
 func encodeRecord(e *Entry) []byte {
 	n := recordFixed - 8 + len(e.Key) + len(e.Payload)
 	rec := make([]byte, 8+n)

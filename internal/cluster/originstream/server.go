@@ -77,6 +77,9 @@ func (s *Server) Hook(re *wal.ReplicationEntry) {
 	if re == nil || re.Coverage == nil {
 		return
 	}
+	if len(re.Coverage.Key) > maxKeyLen || len(re.Payload) > maxFrame {
+		return // cannot be framed; the WAL caps both far below this
+	}
 	e := &Entry{
 		TimestampUS: re.TimestampUS,
 		Instance:    re.Coverage.Instance,
@@ -206,6 +209,12 @@ func (ss *session) run() {
 		ss.floors = nil
 		ss.mu.Unlock()
 		for _, e := range batch {
+			if !validEntry(e) {
+				ss.mu.Lock()
+				ss.bytes -= entrySize(e)
+				ss.mu.Unlock()
+				continue
+			}
 			ss.seq++
 			err := ss.write(frameEntry, entryHead(ss.seq, e), e.Payload)
 			ss.mu.Lock()

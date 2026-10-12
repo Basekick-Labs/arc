@@ -654,3 +654,26 @@ func TestRestartWithEverythingTrimmedContinuesAtTheFloor(t *testing.T) {
 		t.Fatalf("gaps %v after a restart at the floor", g)
 	}
 }
+
+// Sizes are bounded before any allocation sized from them (code scanning
+// go/allocation-size-overflow).
+func TestFrameSizesAreBoundedBeforeAllocation(t *testing.T) {
+	keys := map[string]KeyFloor{}
+	big := string(bytes.Repeat([]byte("k"), 60000))
+	for i := 0; len(keys) < 2000; i++ {
+		keys[fmt.Sprintf("%s-%d", big, i)] = KeyFloor{Floor: 1}
+	}
+	if _, err := floorsHead(1, &Floors{Instance: 1, Keys: keys}); err == nil {
+		t.Fatal("a floors report larger than a frame was accepted")
+	}
+	if validEntry(&Entry{Key: string(bytes.Repeat([]byte("k"), maxKeyLen+1))}) {
+		t.Fatal("a key longer than its u16 length field was accepted")
+	}
+	if validEntry(&Entry{Key: "db/a", Payload: make([]byte, maxFrame)}) {
+		t.Fatal("a payload larger than a frame was accepted")
+	}
+	s := openTestStore(t, t.TempDir(), 0)
+	if err := s.Append("p", &Entry{Instance: 1, Key: string(bytes.Repeat([]byte("k"), maxKeyLen+1)), CSeq: 1, Chunks: 1}); err == nil {
+		t.Fatal("the store accepted an entry it cannot frame")
+	}
+}
