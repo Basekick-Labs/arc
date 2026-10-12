@@ -28,8 +28,17 @@ import (
 // ingests advertises stream claims only when coverage is in effect on it
 // (SetWALCoverageActive): the flag implies every such node stamps coverage
 // on its files. Other roles apply the FSM rules and advertise them always.
+// Claims name nodes, so a node without an explicit cluster.node_id (the
+// default is hostname-PID, which changes at every restart on bare metal)
+// never advertises them.
 func (c *Coordinator) localCapabilities() []string {
 	if !c.cfg.StreamTakeover {
+		return nil
+	}
+	if c.cfg.NodeID == "" {
+		c.nodeIDWarn.Do(func() {
+			c.logger.Error().Msg("cluster.stream_takeover needs an explicit cluster.node_id: stream takeover stays off on this node, and the cluster cannot enable it while this node is a member")
+		})
 		return nil
 	}
 	if c.localNode.Role.GetCapabilities().CanIngest && !c.walCoverageActive.Load() {
@@ -229,3 +238,35 @@ func (c *Coordinator) streamClaimsMetricsLoop(ctx context.Context) {
 		}
 	}
 }
+
+// CoverageCovered, CoveringFiles and TakeoverGeneration read the takeover
+// state of this node's FSM for the registration outbox (TakeoverReader).
+func (c *Coordinator) CoverageCovered(inst uint64, key string, p raft.CoveragePiece, hour time.Time) bool {
+	if c.raftNode == nil || c.raftNode.FSM() == nil {
+		return false
+	}
+	return c.raftNode.FSM().CoverageCovered(inst, key, p, hour)
+}
+
+func (c *Coordinator) UncoveredBatches(inst uint64, key string, lo, hi uint64, hour time.Time) raft.Intervals {
+	if c.raftNode == nil || c.raftNode.FSM() == nil {
+		return raft.Intervals{{lo, hi}}
+	}
+	return c.raftNode.FSM().UncoveredBatches(inst, key, lo, hi, hour)
+}
+
+func (c *Coordinator) CoveringFilesOf(database, measurement string, hour time.Time, inst uint64, key string, set raft.Intervals) []raft.FileEntry {
+	if c.raftNode == nil || c.raftNode.FSM() == nil {
+		return nil
+	}
+	return c.raftNode.FSM().CoveringFilesOf(database, measurement, hour, inst, key, set)
+}
+
+func (c *Coordinator) TakeoverGeneration() uint64 {
+	if c.raftNode == nil || c.raftNode.FSM() == nil {
+		return 0
+	}
+	return c.raftNode.FSM().TakeoverGeneration()
+}
+
+var _ TakeoverReader = (*Coordinator)(nil)

@@ -1,20 +1,14 @@
 package api
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/maphash"
-	"math"
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -89,9 +83,11 @@ type ContinuousQuery struct {
 	Query                  string  `json:"query"`
 	Interval               string  `json:"interval"`
 	// TagColumns are the output columns that are grouping dimensions (not
-	// aggregates). They are written as Parquet `arc:tags` metadata so that
-	// compaction can dedup CQ output on (tags, time), making re-emitted windows
-	// idempotent (#521). Empty means no dedup key — duplicate windows accumulate.
+	// aggregates). They are written as Parquet `arc:tags` metadata and narrow
+	// where compaction compares rows (#521). Compaction removes only rows
+	// identical in every column (#1232): an identical copy of a window
+	// collapses, and a re-emitted window whose values changed is kept beside
+	// the original, with or without tag columns.
 	TagColumns            []string `json:"tag_columns"`
 	RetentionDays         *int     `json:"retention_days"`
 	DeleteSourceAfterDays *int     `json:"delete_source_after_days"`
@@ -445,7 +441,7 @@ func (h *ContinuousQueryHandler) handleCreate(c *fiber.Ctx) error {
 	}
 
 	// Validate tag columns before storing — they end up in Parquet arc:tags
-	// metadata and compaction's PARTITION BY, so unsafe names must be rejected
+	// metadata and compaction's dedup query, so unsafe names must be rejected
 	// at the boundary (#521).
 	if err := validateTagColumns(req.TagColumns.Value); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
@@ -869,12 +865,7 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 		h.recordExecution(int64(queryID), executionID, "failed", startTime, endTime, nil, 0, executionDuration, err.Error())
 
 		h.logger.Error().Err(err).Str("query_name", cq.Name).Msg("Continuous query execution failed")
-		status := fiber.StatusInternalServerError
-		if errors.Is(err, errCQTagKeyNotUnique) {
-			// The definition is wrong, not the server: say so with a 422.
-			status = fiber.StatusUnprocessableEntity
-		}
-		return c.Status(status).JSON(fiber.Map{
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Execution failed: " + err.Error(),
 		})
 	}
@@ -933,7 +924,8 @@ func wrapSourceMeasurement(query, database, measurement, readParquetExpr string)
 // executeAggregation runs the aggregation query and writes results.
 // startTime is the window's inclusive left boundary — it stamps output rows
 // when the aggregation query does not select a time column, so re-runs of the
-// same window produce identical (tags, time) rows that dedup at compaction (#521).
+// same window land on the same (tags, time), and an identical one collapses at
+// compaction (#521, #1232).
 // The window's end time is intentionally unused here: output rows are labelled by
 // the window START (bucket-start convention), so only startTime is needed.
 // SetFieldSchema installs the field schema registry (#914).
@@ -1169,8 +1161,9 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	// with the WINDOW START time — not time.Now() (#521). time.Now() gave rows a
 	// wall-clock ingestion timestamp (wrong for a time-series) and made a re-run
 	// of the same window produce rows with a DIFFERENT timestamp, so they could
-	// never be deduped. The window start is stable across re-runs, so duplicate
-	// emissions land at the identical (tags, time) and collapse at compaction.
+	// never be deduped. The window start is stable across re-runs, so an
+	// identical re-emission collapses at compaction; one whose values differ is
+	// kept beside it (#1232).
 	if _, hasTime := columnarData["time"]; !hasTime {
 		windowMicro := startTime.UTC().UnixMicro()
 		times := make([]interface{}, len(records))
@@ -1182,7 +1175,7 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 
 	// Determine which declared tag columns are actually present in the output.
 	// A tag name that isn't an output column must NOT reach the Parquet arc:tags
-	// metadata: compaction's dedup builds `PARTITION BY "<tag>", "time"` from that
+	// metadata: compaction's dedup groups by `"<tag>", "time"` from that
 	// metadata, and a name with no matching column fails to bind and wedges the
 	// whole partition (it can never compact). Intersecting here makes a stale or
 	// mistaken tag_columns entry harmless rather than a compaction wedge (#521).
@@ -1198,52 +1191,13 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 		}
 	}
 
-	// Declared tags drive compaction's dedup on (tags, time), which deletes every
-	// row but one per key. That is only safe if the key is unique in what this
-	// run writes: tag_columns that no longer cover the query's grouping (the
-	// query gained a GROUP BY column, the tags were not updated) would make
-	// compaction delete real rows. Checking only skips the marker is not enough —
-	// compaction unions arc:tags across every file of a partition, and the
-	// buffer across every batch of a flush, so this run's rows would still be
-	// deduped on another run's tags. The run fails instead: nothing is written,
-	// the execution is recorded as failed with this reason, and the watermark
-	// does not advance, so the window is re-run once tag_columns is fixed
-	// (#1023, which made an omitted tag_columns keep the stored list).
-	if len(tagColumns) > 0 {
-		if err := tagTimeKeyIsUnique(columnarData, tagColumns); err != nil {
-			if errors.Is(err, errCQTagKeyNotUnique) {
-				return 0, fmt.Errorf("continuous query %q declares tag_columns %v, which do not identify one row per timestamp in its output, "+
-					"so compaction would delete rows on that key; list every grouping column of the query in tag_columns: %w",
-					cq.Name, tagColumns, err)
-			}
-			return 0, fmt.Errorf("continuous query %q output: %w", cq.Name, err)
-		}
-	}
-
-	// Decide whether to mark this output for time-only dedup (#521). This ONLY
-	// matters when there are no tag columns — with tags, arc:tags already drives
-	// dedup on (tags, time). The marker makes compaction dedup on time ALONE, so
-	// it is safe ONLY if time is a unique key in the output (one row per window).
-	//
-	// CRITICAL: we must NOT assume "no tag columns" means "one row per window". A
-	// grouped CQ (e.g. GROUP BY host) whose operator forgot to declare
-	// tag_columns produces MULTIPLE rows per timestamp with no tags — marking it
-	// for time-only dedup would make compaction keep one row per timestamp and
-	// silently DELETE every series but one. So we verify uniqueness against the
-	// actual output and, if time repeats without tags, skip the marker and warn
-	// the operator to declare tag_columns.
-	dedupTime := false
-	if len(tagColumns) == 0 {
-		if timeColumnIsUnique(columnarData["time"]) {
-			dedupTime = true
-		} else {
-			h.logger.Warn().
-				Str("query_name", cq.Name).
-				Msg("CQ output has multiple rows per timestamp but no tag_columns declared; " +
-					"skipping time-only dedup to avoid data loss. Declare tag_columns for the " +
-					"grouping dimensions to make this CQ idempotent (#521).")
-		}
-	}
+	// Output without tag columns is marked arc:dedup_exact (#521, #1232), which opts it
+	// into exact-row dedup at compaction, keyed by time: an identical copy of a
+	// window (a WAL replay) collapses, and a re-run whose values differ is kept
+	// beside the original (#1232). Every such output is marked — exact-row dedup
+	// cannot delete a row that differs, so no shape of output makes the marker
+	// unsafe. Output with tag columns is deduped the same way through arc:tags.
+	dedupTime := len(tagColumns) == 0
 
 	// Write using WriteColumnarRecord so TagColumns (and the dedup-time marker)
 	// are preserved as Parquet metadata, enabling compaction to dedup CQ output.
@@ -1331,7 +1285,7 @@ func (h *ContinuousQueryHandler) getQuery(queryID int64) (*ContinuousQuery, erro
 	tags, decErr := decodeTagColumns(tagColumnsRaw)
 	if decErr != nil {
 		h.logger.Warn().Err(decErr).Str("query_name", q.Name).
-			Msg("Ignoring corrupt tag_columns; CQ will not dedup until it is re-saved (#521)")
+			Msg("Ignoring corrupt tag_columns; CQ output is written without tags until it is re-saved (#521)")
 	}
 	q.TagColumns = tags
 
@@ -1395,7 +1349,7 @@ func (h *ContinuousQueryHandler) getQueries(database, isActiveStr string) ([]Con
 		tags, decErr := decodeTagColumns(tagColumnsRaw)
 		if decErr != nil {
 			h.logger.Warn().Err(decErr).Str("query_name", q.Name).
-				Msg("Ignoring corrupt tag_columns; CQ will not dedup until it is re-saved (#521)")
+				Msg("Ignoring corrupt tag_columns; CQ output is written without tags until it is re-saved (#521)")
 		}
 		q.TagColumns = tags
 		queries = append(queries, q)
@@ -1470,7 +1424,7 @@ func encodeTagColumns(tags []string) (*string, error) {
 // empty value (pre-migration rows, or CQs created without tags) decodes to nil
 // with no error. A non-empty value that fails to parse (corruption, a bad manual
 // edit) returns an error so the caller can warn — silently returning nil would
-// revert a CQ to no-dedup behavior with no signal, letting duplicates accumulate.
+// drop the CQ's tag columns from its output metadata with no signal.
 func decodeTagColumns(raw *string) ([]string, error) {
 	if raw == nil || *raw == "" {
 		return nil, nil
@@ -1482,192 +1436,9 @@ func decodeTagColumns(raw *string) ([]string, error) {
 	return tags, nil
 }
 
-// maxUniquenessCheckRows caps how many rows timeColumnIsUnique will scan before
-// giving up and reporting "not unique" (i.e. not dedup-safe). A tagless CQ that
-// legitimately produces one row per window is tiny (one row per interval), so a
-// large output almost certainly means a grouping CQ that forgot to declare
-// tag_columns — exactly the case where time-only dedup would be unsafe. Bounding
-// the scan avoids building a huge map for that misconfiguration, and failing
-// closed (treat as not-unique → skip the marker) is the safe direction.
-const maxUniquenessCheckRows = 100_000
-
-// timeColumnIsUnique reports whether the time column has no duplicate values —
-// i.e. time alone is a unique key for the output. Used to decide whether a
-// tagless CQ is safe to mark for time-only dedup (#521): if two rows share a
-// timestamp with no tag to distinguish them, time-only dedup would lose one, so
-// the marker must be withheld. An empty/absent column is trivially unique.
-//
-// Fails closed: an output larger than maxUniquenessCheckRows returns false
-// (not dedup-safe) rather than building an unbounded map — a tagless CQ that big
-// is almost certainly a mis-declared grouping CQ, which must NOT be marked.
-func timeColumnIsUnique(times []interface{}) bool {
-	if len(times) <= 1 {
-		return true
-	}
-	if len(times) > maxUniquenessCheckRows {
-		return false
-	}
-	seen := make(map[interface{}]struct{}, len(times))
-	for _, t := range times {
-		// Comparable key: the time column is normalized to int64 micros before
-		// this runs, but be defensive about the underlying type. interface{}
-		// values are comparable as map keys when the dynamic type is comparable
-		// (all our time representations — int64, string, time.Time — are).
-		if _, dup := seen[t]; dup {
-			return false
-		}
-		seen[t] = struct{}{}
-	}
-	return true
-}
-
-// errCQTagKeyNotUnique marks a run refused because its declared tag_columns
-// do not identify one row per timestamp — a definition problem the operator
-// fixes, not a server fault.
-var errCQTagKeyNotUnique = errors.New("duplicate tag_columns and time key")
-
-// tagTimeKeyIsUnique returns errCQTagKeyNotUnique when two output rows share
-// the same (tag values..., time) key — the key compaction dedups a measurement
-// on when arc:tags names those columns — but differ in some other column.
-// Rows identical in every column are allowed: compaction keeping one of them
-// loses nothing, and a raw-copy continuous query over a not-yet-compacted
-// window legitimately carries them (client retries, WAL replay).
-//
-// The key is encoded with each value's type and length, so a NULL tag, an
-// empty string and the string "<nil>" stay distinct (DuckDB partitions NULLs
-// together, apart from ""), and a []byte, which is not a comparable map key,
-// still works. The set holds 64-bit hashes of those encodings; a hit compares
-// the two whole rows, so a hash collision between different keys is caught
-// there too and fails the run rather than risking a deletion. There is no row
-// cap, unlike timeColumnIsUnique: tagged output is legitimately large, and it
-// is already held in memory twice.
-//
-// A time that is not a number the writer accepts (a string that did not parse
-// as RFC3339, or null) is reported as its own error: the writer refuses it
-// anyway, and its key could not be compared with compaction's normalised one.
-func tagTimeKeyIsUnique(columnarData map[string][]interface{}, tagColumns []string) error {
-	times := columnarData["time"]
-	if len(times) <= 1 {
-		return nil
-	}
-	cols := make([][]interface{}, len(tagColumns))
-	for i, name := range tagColumns {
-		cols[i] = columnarData[name]
-	}
-	allCols := make([]string, 0, len(columnarData))
-	for name := range columnarData {
-		allCols = append(allCols, name)
-	}
-	sort.Strings(allCols)
-
-	seed := maphash.MakeSeed()
-	firstRow := make(map[uint64]int, len(times))
-	var buf []byte
-	for row, t := range times {
-		micros, ok := cqTimeMicros(t)
-		if !ok {
-			return fmt.Errorf("row %d has a time of type %T, which is not a timestamp", row, t)
-		}
-		buf = buf[:0]
-		for _, col := range cols {
-			buf = appendKeyValue(buf, valueAt(col, row))
-		}
-		buf = binary.BigEndian.AppendUint64(buf, uint64(micros))
-		h := maphash.Bytes(seed, buf)
-		earlier, dup := firstRow[h]
-		if !dup {
-			firstRow[h] = row
-			continue
-		}
-		if !bytes.Equal(encodeRow(columnarData, allCols, earlier), encodeRow(columnarData, allCols, row)) {
-			return fmt.Errorf("%w: rows %d and %d have the same tags and time but differ in another column", errCQTagKeyNotUnique, earlier, row)
-		}
-	}
-	return nil
-}
-
-// cqTimeMicros converts an output time the way the writer does: any integer or
-// float kind, already in microseconds by the time this runs.
-func cqTimeMicros(v interface{}) (int64, bool) {
-	switch x := v.(type) {
-	case int64:
-		return x, true
-	case int:
-		return int64(x), true
-	case int32:
-		return int64(x), true
-	case int16:
-		return int64(x), true
-	case int8:
-		return int64(x), true
-	case uint64:
-		return int64(x), x <= math.MaxInt64
-	case uint32:
-		return int64(x), true
-	case uint16:
-		return int64(x), true
-	case uint8:
-		return int64(x), true
-	case uint:
-		return int64(x), uint64(x) <= math.MaxInt64
-	case float64:
-		return int64(x), true
-	case float32:
-		return int64(x), true
-	}
-	return 0, false
-}
-
-func valueAt(col []interface{}, row int) interface{} {
-	if row < len(col) {
-		return col[row]
-	}
-	return nil
-}
-
-// encodeRow encodes every column of one output row, in a fixed column order.
-func encodeRow(columnarData map[string][]interface{}, cols []string, row int) []byte {
-	var buf []byte
-	for _, name := range cols {
-		buf = appendKeyValue(buf, valueAt(columnarData[name], row))
-	}
-	return buf
-}
-
-// appendKeyValue appends a self-delimiting encoding of v: its Go type, then its
-// value's length and bytes.
-func appendKeyValue(buf []byte, v interface{}) []byte {
-	var repr string
-	switch x := v.(type) {
-	case nil:
-		repr = ""
-	case string:
-		repr = x
-	case []byte:
-		repr = string(x)
-	case float64:
-		if x == 0 { // -0 and 0 are one value to DuckDB
-			x = 0
-		}
-		repr = strconv.FormatFloat(x, 'g', -1, 64)
-	case float32:
-		if x == 0 {
-			x = 0
-		}
-		repr = strconv.FormatFloat(float64(x), 'g', -1, 32)
-	default:
-		repr = fmt.Sprint(x)
-	}
-	typ := fmt.Sprintf("%T", v)
-	buf = binary.AppendUvarint(buf, uint64(len(typ)))
-	buf = append(buf, typ...)
-	buf = binary.AppendUvarint(buf, uint64(len(repr)))
-	return append(buf, repr...)
-}
-
 // validateTagColumns rejects tag column names that aren't safe SQL identifiers.
 // The names are emitted verbatim into the Parquet arc:tags metadata and later
-// interpolated into compaction's `PARTITION BY "<name>"` dedup query, so an
+// interpolated into compaction's dedup query as `"<name>"`, so an
 // unsafe name must never reach storage — validate at the API boundary. Rules
 // match internal/compaction/dedup.go#isValidIdentifier (alphanumeric, '_', '-').
 func validateTagColumns(tags []string) error {
@@ -1676,7 +1447,7 @@ func validateTagColumns(tags []string) error {
 			return fmt.Errorf("tag column name must not be empty")
 		}
 		// "time" is never a valid tag: compaction always appends "time" to the
-		// dedup key, so declaring it would produce PARTITION BY "time", "time".
+		// dedup key, so declaring it would group by "time", "time".
 		if strings.EqualFold(name, "time") {
 			return fmt.Errorf("tag column %q is reserved: time is always part of the dedup key and must not be listed", name)
 		}

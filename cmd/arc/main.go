@@ -1042,6 +1042,11 @@ func main() {
 	registrationOutbox := newRegistrationOutbox(cfg, licenseHasClustering(licenseClient), logger.Get("file-registrar"))
 	if registrationOutbox != nil {
 		arrowBuffer.SetFileRegistrar(registrationOutbox)
+		// Refused registrations are parked out of the query path (#1207
+		// S4b); a move a crash interrupted is finished here.
+		if lb, ok := storageBackend.(*storage.LocalBackend); ok {
+			registrationOutbox.SetLocalParking(cluster.LocalParking{Base: lb.GetBasePath()})
+		}
 	}
 	enableWALCoverage(cfg, arrowBuffer, walWriter, registrationOutbox, logger.Get("arrow"))
 	// The registration hold (#1207 S4c): WAL entries of a covered batch stay
@@ -2129,6 +2134,33 @@ func main() {
 					// coverage actually took effect on this node (#1207).
 					_, _, coverageActive := arrowBuffer.RegistrationProgress()
 					clusterCoordinator.SetWALCoverageActive(coverageActive)
+					// Stream takeover, origin side (#1207 S4b): announce this
+					// writer instance, and hold writes and registrations until
+					// it is, once the cluster has takeover on.
+					if cfg.Cluster.StreamTakeover && coverageActive && registrationOutbox != nil && walWriter != nil {
+						base := ""
+						if lb, ok := storageBackend.(*storage.LocalBackend); ok {
+							base = lb.GetBasePath()
+						}
+						walDir := cfg.WAL.Directory
+						walLog := logger.Get("wal")
+						clusterCoordinator.SetTakeoverOrigin(cluster.TakeoverOrigin{
+							Instance:    walWriter.TrackedInstance(),
+							WALDir:      walDir,
+							JournalDir:  cfg.Cluster.RaftDataDir,
+							StorageBase: base,
+							Holds: func() ([]uint64, error) {
+								onDisk, err := wal.InstancesOnDisk(walDir, walWriter.CurrentFile(), walLog)
+								if err != nil {
+									return nil, err
+								}
+								return append(registrationOutbox.Instances(), onDisk...), nil
+							},
+							Progress:    arrowBuffer.AccountedProgress,
+							SentCovered: func() bool { return registrationOutbox.CoveredSent() > 0 },
+						})
+						registrationOutbox.SetSendGate(clusterCoordinator.TakeoverSendGate())
+					}
 					if err := clusterCoordinator.Start(); err != nil {
 						log.Error().Err(err).Msg("Failed to start cluster coordinator - running in standalone mode")
 						arrowBuffer.SetIngestGate(nil)
@@ -3883,6 +3915,9 @@ func main() {
 	// Register Databases handler
 	databasesHandler := api.NewDatabasesHandler(storageBackend, &cfg.Delete, authManager, logger.Get("databases"))
 	databasesHandler.SetFieldSchema(fieldSchemaRegistry)
+	if clusterCoordinator != nil {
+		databasesHandler.SetCoordinator(clusterCoordinator, cfg.Cluster.SharedStorageMode || cfg.Cluster.ReplicationEnabled)
+	}
 	// Guarded the same way every other SetAuthAndRBAC call is: assigning a nil
 	// *auth.RBACManager into the handler's RBACChecker interface would make its
 	// `rbacManager == nil` guards false for a typed nil.
@@ -4590,6 +4625,10 @@ func main() {
 
 		// Wire tiering manager to arrow buffer for automatic file registration
 		arrowBuffer.SetTieringManager(tieringManager)
+		if registrationOutbox != nil {
+			// Parked refused files leave the tiering metadata (#1207 S4b).
+			registrationOutbox.SetParkingTieringDrop(tieringManager.DeleteFile)
+		}
 		log.Info().Msg("Tiering manager wired to arrow buffer for auto-registration")
 
 		// The cluster layer's tier recorder is wired where the manager is
@@ -5108,41 +5147,11 @@ func createWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolo
 	}
 }
 
-func trackedWALRowTarget(rec map[string]interface{}) (database, measurement string) {
-	for _, key := range []string{"_measurement", "measurement", "m"} {
-		measurement, _ = rec[key].(string)
-		if measurement != "" {
-			break
-		}
-	}
-	for _, key := range []string{"_database", "database"} {
-		database, _ = rec[key].(string)
-		if database != "" {
-			break
-		}
-	}
-	if database == "" {
-		database = "default"
-	}
-	return
-}
-
 // Validate before splitting: a boundary must not hide an invalid mixed-target
 // entry or allow an earlier chunk to be accepted before a missing target.
 func validateTrackedWALRecoveryRows(records []map[string]interface{}) error {
-	var database, measurement string
-	for i, rec := range records {
-		rowDatabase, rowMeasurement := trackedWALRowTarget(rec)
-		if rowMeasurement == "" {
-			return fmt.Errorf("WAL row %d has no measurement", i)
-		}
-		if i == 0 {
-			database, measurement = rowDatabase, rowMeasurement
-		} else if database != rowDatabase || measurement != rowMeasurement {
-			return fmt.Errorf("WAL row entry spans multiple databases or measurements")
-		}
-	}
-	return nil
+	_, _, err := ingest.ValidateWALRows(records)
+	return err
 }
 
 // createTrackedWALRecoveryCallback restores one bounded row batch as a columnar
@@ -5154,24 +5163,9 @@ func createTrackedWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger
 			return nil
 		}
 
-		if err := validateTrackedWALRecoveryRows(records); err != nil {
+		database, measurement, columns, err := ingest.WALRowsToColumns(records)
+		if err != nil {
 			return err
-		}
-		database, measurement := trackedWALRowTarget(records[0])
-		columns := make(map[string][]interface{})
-		for rowIndex, rec := range records {
-			for key, value := range rec {
-				switch key {
-				case "_measurement", "measurement", "m", "_database", "database":
-					continue
-				}
-				column, ok := columns[key]
-				if !ok {
-					column = make([]interface{}, len(records))
-					columns[key] = column
-				}
-				column[rowIndex] = value
-			}
 		}
 
 		if err := arrowBuffer.WriteColumnarDirectReplay(ctx, database, measurement, columns, walIdentity); err != nil {

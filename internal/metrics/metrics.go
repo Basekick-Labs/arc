@@ -152,6 +152,8 @@ type Metrics struct {
 	walRecordsPreserved   atomic.Int64 // Records preserved in WAL for recovery (flush failures)
 	walRegisteredFloorLag atomic.Int64 // committed batches above the registered floor (#1207)
 	walHeldFiles          atomic.Int64 // WAL files kept for batches whose files wait to register (#1207 S4c)
+	walParkedFiles        atomic.Int64 // refused registrations parked out of the query path (#1207 S4b)
+	walParkedBytes        atomic.Int64
 	walCoverageLost       atomic.Int64 // batches that settled without a registered file (#1207)
 
 	// Origin stream and standby store (#1207 S3).
@@ -168,6 +170,7 @@ type Metrics struct {
 	standbyStoreLost         atomic.Int64 // batches held that the primary reported lost
 	standbyStoreBlocked      atomic.Int64 // keys whose trim waits on files not yet here
 	standbyStoreReplaced     atomic.Int64 // bytes held for replaced primary instances
+	standbyStorePinned       atomic.Int64 // bytes the store may not evict (stream takeover)
 
 	streamClaimsEnabled  atomic.Int64 // 1 once stream claims are applied (#1207 S4a)
 	streamClaims         atomic.Int64 // stream claims held in the FSM
@@ -584,6 +587,13 @@ func (m *Metrics) SetWALRegisteredFloorLag(n int64) { m.walRegisteredFloorLag.St
 // waiting for their files to register (#1207 S4c).
 func (m *Metrics) SetWALHeldFiles(n int64) { m.walHeldFiles.Store(n) }
 
+// SetWALParked reports the refused file registrations parked out of the
+// query path, and their bytes (#1207 S4b).
+func (m *Metrics) SetWALParked(files, bytes int64) {
+	m.walParkedFiles.Store(files)
+	m.walParkedBytes.Store(bytes)
+}
+
 // IncWALCoverageLost counts ingest batches that settled without being in a
 // registered file (#1207).
 func (m *Metrics) IncWALCoverageLost(n int64) { m.walCoverageLost.Add(n) }
@@ -617,6 +627,7 @@ func (m *Metrics) SetStandbyStoreTrimState(lost, blocked, replacedBytes int64) {
 	m.standbyStoreBlocked.Store(blocked)
 	m.standbyStoreReplaced.Store(replacedBytes)
 }
+func (m *Metrics) SetStandbyStorePinned(n int64) { m.standbyStorePinned.Store(n) }
 func (m *Metrics) SetStandbyStore(bytes, incomplete int64) {
 	m.standbyStoreBytes.Store(bytes)
 	m.standbyStoreIncomplete.Store(incomplete)
@@ -902,6 +913,8 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"wal_records_preserved":            m.walRecordsPreserved.Load(),
 		"wal_registered_floor_lag":         m.walRegisteredFloorLag.Load(),
 		"wal_held_files":                   m.walHeldFiles.Load(),
+		"wal_parked_files":                 m.walParkedFiles.Load(),
+		"wal_parked_bytes":                 m.walParkedBytes.Load(),
 		"wal_coverage_lost":                m.walCoverageLost.Load(),
 		"origin_stream_sessions":           m.originStreamSessions.Load(),
 		"origin_stream_dropped":            m.originStreamDropped.Load(),
@@ -916,6 +929,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"standby_store_lost_records":       m.standbyStoreLost.Load(),
 		"standby_store_blocked_keys":       m.standbyStoreBlocked.Load(),
 		"standby_store_replaced_bytes":     m.standbyStoreReplaced.Load(),
+		"standby_store_pinned_bytes":       m.standbyStorePinned.Load(),
 		"stream_claims_enabled":            m.streamClaimsEnabled.Load(),
 		"stream_claims":                    m.streamClaims.Load(),
 		"wal_coverage_refused":             m.walCoverageRefused.Load(),
@@ -1298,6 +1312,14 @@ func (m *Metrics) PrometheusFormat() string {
 	b = appendMetric(b, "arc_wal_registered_floor_lag", float64(m.walRegisteredFloorLag.Load()))
 	b = appendMetric(b, "arc_wal_held_files", float64(m.walHeldFiles.Load()))
 
+	b = append(b, "# HELP arc_wal_parked_files Refused file registrations parked out of the query path until their rows are registered elsewhere\n"...)
+	b = append(b, "# TYPE arc_wal_parked_files gauge\n"...)
+	b = appendMetric(b, "arc_wal_parked_files", float64(m.walParkedFiles.Load()))
+
+	b = append(b, "# HELP arc_wal_parked_bytes Bytes of parked refused files\n"...)
+	b = append(b, "# TYPE arc_wal_parked_bytes gauge\n"...)
+	b = appendMetric(b, "arc_wal_parked_bytes", float64(m.walParkedBytes.Load()))
+
 	b = append(b, "# HELP arc_wal_coverage_lost_total Ingest batches that settled without being in a registered file (WAL coverage only)\n"...)
 	b = append(b, "# TYPE arc_wal_coverage_lost_total counter\n"...)
 	b = appendMetric(b, "arc_wal_coverage_lost_total", float64(m.walCoverageLost.Load()))
@@ -1353,6 +1375,9 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_standby_store_replaced_bytes Bytes held for primary instances that have since restarted\n"...)
 	b = append(b, "# TYPE arc_standby_store_replaced_bytes gauge\n"...)
 	b = appendMetric(b, "arc_standby_store_replaced_bytes", float64(m.standbyStoreReplaced.Load()))
+	b = append(b, "# HELP arc_standby_store_pinned_bytes Bytes of the standby store kept for a possible stream takeover; not evicted at the cap\n"...)
+	b = append(b, "# TYPE arc_standby_store_pinned_bytes gauge\n"...)
+	b = appendMetric(b, "arc_standby_store_pinned_bytes", float64(m.standbyStorePinned.Load()))
 
 	b = append(b, "# HELP arc_cluster_stream_claims_enabled 1 once stream claims are enabled in the cluster\n"...)
 	b = append(b, "# TYPE arc_cluster_stream_claims_enabled gauge\n"...)

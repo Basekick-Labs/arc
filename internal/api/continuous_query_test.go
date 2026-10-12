@@ -418,38 +418,6 @@ func TestContinuousQueryDatabaseValidation(t *testing.T) {
 	}
 }
 
-func TestTimeColumnIsUnique(t *testing.T) {
-	tests := []struct {
-		name  string
-		times []interface{}
-		want  bool
-	}{
-		{"empty is unique", nil, true},
-		{"single is unique", []interface{}{int64(100)}, true},
-		{"distinct int64 times", []interface{}{int64(100), int64(200), int64(300)}, true},
-		{"duplicate int64 times (grouped, no tags)", []interface{}{int64(100), int64(100)}, false},
-		{"duplicate among distinct", []interface{}{int64(100), int64(200), int64(100)}, false},
-		{"distinct strings", []interface{}{"2026-01-01", "2026-01-02"}, true},
-		{"duplicate strings", []interface{}{"2026-01-01", "2026-01-01"}, false},
-	}
-	// Fails closed above the scan cap: an all-distinct output larger than the cap
-	// returns false (not dedup-safe) rather than building an unbounded map.
-	huge := make([]interface{}, maxUniquenessCheckRows+1)
-	for i := range huge {
-		huge[i] = int64(i)
-	}
-	if timeColumnIsUnique(huge) {
-		t.Errorf("expected false for output larger than the uniqueness-check cap (fail closed)")
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := timeColumnIsUnique(tt.times); got != tt.want {
-				t.Errorf("timeColumnIsUnique(%v) = %v, want %v", tt.times, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestValidateTagColumnsRejectsTime(t *testing.T) {
 	for _, name := range []string{"time", "TIME", "Time"} {
 		if err := validateTagColumns([]string{name}); err == nil {

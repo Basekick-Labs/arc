@@ -139,3 +139,26 @@ func normalized(pairs [][2]uint64) Intervals {
 	}
 	return out
 }
+
+// Exported set operations for the claimant (package cluster).
+
+// Contains reports whether x is in v.
+func (v Intervals) Contains(x uint64) bool { return v.contains(x) }
+
+// Minus returns v without every interval of w.
+func (v Intervals) Minus(w Intervals) Intervals { return v.minus(w) }
+
+// Union returns v with every interval of w.
+func (v Intervals) Union(w Intervals) Intervals { return v.union(w) }
+
+// Count is the number of sequences in v.
+func (v Intervals) Count() uint64 {
+	var n uint64
+	for _, iv := range v {
+		n += iv[1] - iv[0] + 1
+	}
+	return n
+}
+
+// NormalizedIntervals builds a valid Intervals value from arbitrary pairs.
+func NormalizedIntervals(pairs [][2]uint64) Intervals { return normalized(pairs) }

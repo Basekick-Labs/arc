@@ -61,6 +61,10 @@ func (c *Coordinator) StartOriginStream(walWriter *wal.Writer, buffer *ingest.Ar
 	if c.cfg.StandbyStoreMaxBytes <= 0 {
 		c.logger.Warn().Msg("cluster.standby_store_max_bytes is not positive: the standby store has no cap")
 	}
+	if c.cfg.StreamTakeover {
+		policy := &standbyEvictPolicy{c: c}
+		store.SetEvictable(policy.tier, policy.active)
+	}
 	fsm := c.raftNode.FSM()
 	st := &originStream{wal: walWriter, store: store, done: make(chan struct{}), present: map[string]int64{}}
 	st.server = originstream.NewServer(c.cfg.OriginStreamQueueBytes, func() *originstream.Floors {

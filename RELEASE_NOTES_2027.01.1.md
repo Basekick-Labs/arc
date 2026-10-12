@@ -319,6 +319,35 @@ release:
 - The cluster manifest has the rules that will refuse a second copy of a
   batch, and the origin's copy of batches a standby took over.
 
+- A refused registration will be parked rather than left in place: the file
+  moves out of every query path to `<storage>/_refused/`, its WAL entries stay
+  held, and it is deleted only once each of its rows is in a registered file
+  this node holds. A DELETE that touches a parked file is refused (retry later).
+  Records live in `refused-registrations.jsonl` next to the registration
+  journal. Metrics: `arc_wal_parked_files`, `arc_wal_parked_bytes`.
+- Writers with the setting on will announce each process to the cluster before
+  accepting writes, once takeover is on: until the announcement applies, writes
+  get a retryable 503. Each writer records its last process in
+  `instance.last` files in the WAL directory, the Raft data directory and
+  `<storage>/_instances/`.
+- `cluster.stream_takeover` now needs an explicit `cluster.node_id`. Takeover
+  claims name nodes, and the default node id (host name and process id)
+  changes at every restart outside Kubernetes. A node with the setting on and
+  no `cluster.node_id` logs an error and does not advertise takeover support,
+  so the cluster cannot turn takeover on while that node is a member.
+- Once takeover is on, the standby store no longer evicts, at its cap, the
+  batches of a writer process that a takeover could still need. When the store
+  is full and holds such batches of a process its writer has since restarted,
+  new batches are not kept and an error is logged; the new gauge
+  `arc_standby_store_pinned_bytes` shows how much the store keeps that it would
+  otherwise have evicted.
+- The parts a standby will use to publish the batches it takes over are in
+  place, unused: reading the standby store back, writing those batches to
+  Parquet without touching the WAL or the live buffers, a claim that grows in
+  steps, a claimant releasing its own claim, and a refusal for a claimant file
+  the settled index has no room for (the index keeps tracking the writer
+  process instead of giving up on it).
+
 Nothing turns takeover on in this release.
 
 **Rollback warning.** WAL entries written with the setting on use a new format.
@@ -1012,31 +1041,78 @@ in the same statement as the write.
 This replaces the 26.09.3 advice to send the whole definition on every `PUT`.
 Clients that do so keep working unchanged.
 
-**A continuous query whose `tag_columns` no longer match its query now fails
-its run instead of losing rows.** Compaction keeps one row per
-(tag values, time) in a measurement that declares `tag_columns`. Say the query
-groups by `host, region` but `tag_columns` lists only `host`. Compaction then
-deletes every region's row but one for each host and window. Nothing reported
-it.
+Leaving `tag_columns` out of an update that changes the query keeps the stored
+list. That can no longer cost rows: compaction removes only rows identical in
+every column, see the next entry.
 
-With this change, leaving `tag_columns` out of an update that changes the query
-keeps the old list, which made this mismatch easier to reach. So before a run
-writes anything, it now checks that no two output rows share the declared tag
-values and `time` while differing in another column. Rows identical in every
-column are allowed, since dropping one of them loses nothing. If the check
-fails, the run writes nothing and is recorded as failed, with an error naming
-`tag_columns`. A manual `POST /api/v1/continuous_queries/:id/execute` returns
-`422` in that case. The window is not marked processed, so it runs again once
-`tag_columns` lists every grouping column of the query.
+### Compaction removes only exact duplicate rows ([#1232](https://github.com/Basekick-Labs/arc/issues/1232), [#1227](https://github.com/Basekick-Labs/arc/issues/1227))
 
-**Check this before upgrading:** after the upgrade, a continuous query will
-report failed runs if its output today repeats a (`tag_columns`, `time`) key
-with different values. Compaction was already reducing that output to one row
-per key, deleting the rest.
+Compaction deduplicated a measurement by a key: one row per tag values and
+`time` when the files carry tag metadata, or one row per `time` for
+continuous-query output without `tag_columns`. Every other row sharing that key
+was deleted, whatever its field values. Which row survived was arbitrary; in
+practice it was the one in the oldest file. This lost data in several ways,
+none of them reported:
 
-The same hazard exists for a continuous query that declares no `tag_columns` at
-all. That one is in compaction, and is tracked separately in
-[#1227](https://github.com/Basekick-Labs/arc/issues/1227).
+- **A corrected or re-sent point disappeared.** A second write with the same
+  tags and time but a new value was deleted, and the old value kept.
+- **Two writes of the same point with different fields lost one of them.** For
+  example, `usage=1` from one write and `temp=5` from another, same series and
+  time. Two inputs reporting the same series is a common source of this.
+- **A grouped continuous query without `tag_columns` lost series.** For example
+  `GROUP BY host` with no `tag_columns` declared. A window in which one host
+  reported was marked for time-only deduplication. Once it shared a partition
+  with a window in which several hosts reported, every host but one was
+  deleted from the multi-host windows.
+- **A continuous query whose `tag_columns` did not cover its grouping lost
+  rows.** For example, it groups by `host, region` but lists only `host`.
+
+**Compaction now removes a row only when another row is identical to it in
+every column**: time, every tag and every field. Rows that share their tags and
+time but differ anywhere are different data, and all are kept. The tag columns,
+or `time` for continuous-query output without them, only narrow where whole
+rows are compared. On typical measurements, and on very wide sparse ones,
+compaction costs about the same as before. A partition in which most rows are
+duplicates costs more, up to about half again as long. An hour replayed whole
+from the WAL is one example.
+
+What is still removed:
+- a copy replayed from the WAL;
+- a retried write;
+- a replicated copy;
+- any other byte-for-byte duplicate.
+
+**Behaviour changes:**
+
+- **Re-sending a point with a new value no longer replaces the old one.** Both
+  rows stay, and queries see both: `count` counts two, `avg` averages them.
+  Delete the old row explicitly if it must go.
+- **Re-running a continuous-query window usually leaves a second row.** This
+  covers a retry, a run after a crash, and a manual `execute` of a window
+  already processed. Floating-point aggregates (`avg`, `sum`, `stddev`) are not
+  bit-for-bit reproducible across runs, so the re-run's value almost always
+  differs in its last digits and is kept beside the first. A re-run with late
+  data is kept beside the first by design.
+- **Declaring fewer `tag_columns` than the query groups by no longer loses
+  rows.**
+- **Tagless raw rows are deduplicated only alongside continuous-query output.**
+  Raw ingest without tags is still never deduplicated, unless its rows share a
+  partition with continuous-query output. Those rows then get the same
+  exact-row check.
+- **`0.0` and `-0.0` count as equal**, and so do two NaN values.
+- **Duplicates split across compaction batches can stay.** A pair split by the
+  batching of a large partition, or between a compacted file and a WAL-replayed
+  one, may stay as a duplicate. That was already the case before.
+
+Rows this bug already deleted cannot be recovered by the upgrade.
+
+**Rollback:** continuous-query output without `tag_columns` is now marked with a
+new Parquet key, `arc:dedup_exact`, instead of `arc:dedup_time`. Earlier
+versions read `arc:dedup_time` as "keep one row per timestamp". If they saw it
+on this release's output, which can hold several rows per timestamp, they would
+delete rows. They ignore the new key, so a rolled-back or not-yet-upgraded node
+leaves that output undeduplicated rather than losing rows. Files marked
+`arc:dedup_time` by earlier versions are still recognised.
 
 ### The WAL is reclaimed again after a crash recovery ([#1222](https://github.com/Basekick-Labs/arc/issues/1222))
 
@@ -1765,7 +1841,8 @@ incarnation's objects.
 Deleting a database now also removes its cold-tier objects and retires its tier
 rows. In a cluster the database's manifest entries are removed before any hot
 object is deleted, in batches, and a manifest failure aborts the deletion
-before anything is removed from storage. The response breaks the count out as
+before anything is removed from storage (with tiered storage disabled, see
+[#1094](https://github.com/Basekick-Labs/arc/issues/1094) below). The response breaks the count out as
 `hot_files_deleted` and `cold_files_deleted` rather than one total, because the
 cold half is the irreversible part.
 
@@ -1800,6 +1877,51 @@ names the primary writer to route to.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1166](https://github.com/Basekick-Labs/arc/pull/1166).
 
+### Database deletion on a cluster without tiered storage reaches every node ([#1094](https://github.com/Basekick-Labs/arc/issues/1094))
+
+The cluster half of the #1091 fix above runs through the tiered-storage
+manager. That manager exists only when `tiered_storage.enabled` is on, so a
+cluster without tiered storage kept the old behaviour: `DELETE
+/api/v1/databases/:name` deleted the database's files on the node that served
+it and nowhere else. Two things followed:
+
+- **Other nodes kept their copies.** Readers and the compactor kept their
+  replicas and kept answering queries for the dropped database.
+- **The manifest still listed the files.** A backup reported them as
+  manifest-only, and the re-pull path could copy them back onto the primary.
+
+The handler now takes the same steps on such a cluster:
+
+- **Primary only:** a node that is not the primary writer answers **503**,
+  naming its role. This applies on clusters with shared storage or
+  replication, the same rule as with tiered storage enabled. Without either,
+  nodes share nothing, so each node may still delete its own files.
+- **Manifest first:** the database's manifest entries are removed in batches
+  of 500 before any local file is deleted, so every node's delete worker
+  unlinks its copy.
+- **Abort on failure:** a failed batch aborts with a 500 before the local
+  sweep. Retry the request; batches already applied stay applied.
+- **Edge-sync spokes untouched:** on a hub, a spoke's database of the same
+  name is not touched, since its files live under `{spoke}/{db}/`.
+- **Database visible from the manifest:** a database the manifest still lists
+  counts as existing on a node that holds none of its files locally. So
+  `DELETE` there no longer answers 404, `GET /api/v1/databases/:name` finds
+  it, and `POST` answers 409 for that name.
+
+**With tiered storage enabled**, nothing changes: the tiered-storage manager
+already performs these steps. **Standalone**, nothing changes.
+
+Two limits, unchanged by this fix:
+- **In-memory unlink queue:** a peer's delete worker queues the unlink in
+  memory. If that node restarts or loses the primary before the unlink runs,
+  its copy stays on disk with no manifest entry.
+- **Leader change mid-delete:** a leader election during the deletion fails
+  the request after some batches were applied. Retry it. Tracked, with the
+  pending-registration follow-up, in
+  [#1236](https://github.com/Basekick-Labs/arc/issues/1236).
+
+Contributed by [@jallegri](https://github.com/jallegri) in [#1176](https://github.com/Basekick-Labs/arc/pull/1176).
+
 ### Crash smokes verify acknowledged records after WAL replay
 
 The enterprise-shared crash scenarios restart the killed writer and wait for
@@ -1821,7 +1943,7 @@ Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1157](https:/
 
 ### Partial DELETE rewrites remain immutable without duplicating data ([#975](https://github.com/Basekick-Labs/arc/issues/975))
 
-Partial DELETE now publishes the surviving rows under a fresh immutable Parquet path and retires the superseded object in every storage mode, including standalone OSS deployments. The rewrite filename is normalized before compaction, tiering and file-time pruning classify it. This closes the same-size/different-content replication class without leaving deleted rows visible through Arc's glob-based query path.
+Partial DELETE now publishes the surviving rows under a fresh immutable Parquet path and retires the superseded object in every storage mode, including standalone OSS deployments. The rewrite filename is normalized before compaction, tiering and file-time pruning classify it. This closes the same-size/different-content replication class for DELETE rewrites, without leaving deleted rows visible through Arc's glob-based query path. Producers that still reuse a path (restores, imports, edge-sync after the hub deleted it) are covered by the #798 entry.
 
 **Two DELETEs that touch the same file no longer merge.** Before this release they did, because the
 rewrite kept the file at its original path, so the second request read what the first had written.
@@ -2670,13 +2792,58 @@ node without the file. On shared-storage clusters, where every node reads the
 writer's own object, forced refreshes are off: the object is never re-uploaded
 by a reader.
 
-Two shapes stay outside this fix: a delete followed by a same-size
-re-registration of the same path inside the delete grace window, which the
-registrar sees as a new file rather than a change; and a rewrite a node learns
-of from a Raft snapshot rather than from the log, since a snapshot restore
-fires no registration callbacks (#1071 tracks the snapshot side).
+A delete followed by a same-size re-registration of the same path is now
+refreshed too. The re-registration arrives as a new file, not a change, so it
+was not forced; and a reader's local delete waits a short grace period before
+it unlinks, so when the path was listed again by then the delete kept the
+local copy, which then passed the size check with the old bytes. The delete
+now asks for a refresh of the path whenever it keeps a copy for that reason.
+The copy is never unlinked there, because the node may hold the only one: it
+stays readable until the new version is installed.
 
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#907](https://github.com/Basekick-Labs/arc/pull/907).
+That refresh hashes the local copy first and downloads only when it is not the
+listed version. A node that never held the old version pulls the new one
+through the registration, and a re-registration with unchanged content needs
+nothing, so neither downloads the file twice. The node logs it (the first
+time, then at every power of two):
+
+```
+Local delete skipped: the manifest lists the path again; refreshing the local copy unless it already is the listed version
+```
+
+Three counters in `replication_catchup_status` on `GET /api/v1/cluster` (and
+in the query gate's 503 body) show this working. They count every forced
+refresh, including the content-change refreshes above, not only this path:
+`forced_refresh` counts forced refreshes that downloaded the file,
+`refresh_verified` counts refreshes whose local copy was already the listed
+version, and `refresh_pending` is the number of failed or dropped forced
+refreshes waiting for their path's next arrival.
+
+If the refresh cannot be queued, the line is a warning, and the local copy
+may be the previous version for a while. When the node is shutting down the
+refresh is lost; when the pull queue is full it is retried on the path's next
+arrival or the periodic reconciliation.
+
+Since [#975](https://github.com/Basekick-Labs/arc/issues/975), Arc's DELETE
+rewrites and compaction publish new files under fresh paths, so these shapes
+come only from producers that reuse a path: restores, imports, edge-sync
+after the hub deleted the path, and external Raft writers. Two gaps remain for them:
+
+- A forced refresh that fails, or is dropped, is remembered in memory only. A
+  restart forgets it, and the startup catch-up then accepts the old copy by its
+  size and reports the node caught up. With
+  `cluster.replication_catchup_enabled = false`, nothing retries it at all.
+  [#1182](https://github.com/Basekick-Labs/arc/issues/1182) tracks this.
+- A rewrite a node learns of from a Raft snapshot rather than from the log
+  fires no callback, so the old copy is kept.
+  The snapshot-restore work is tracked in
+  [#1071](https://github.com/Basekick-Labs/arc/issues/1071).
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#907](https://github.com/Basekick-Labs/arc/pull/907), and by
+[@jallegri](https://github.com/jallegri) in
+[#1173](https://github.com/Basekick-Labs/arc/pull/1173) (delete then
+re-register).
 
 ### Compaction reuses local inputs and validates DuckDB paths ([#969](https://github.com/Basekick-Labs/arc/issues/969))
 

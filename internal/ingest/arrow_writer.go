@@ -622,12 +622,13 @@ func (w *ArrowWriter) inferSchema(columns map[string]interface{}, tagColumns []s
 		metaValues = append(metaValues, strings.Join(sorted, ","))
 	}
 
-	// Mark data as safe to dedup on time even without tag columns. Written only
-	// by producers whose data model is one-row-per-(tags,time) — continuous
-	// queries (#521). Compaction reads this to dedup a no-group-by CQ's duplicate
-	// window emissions (PARTITION BY "time" alone). Raw ingest never sets it.
+	// Mark continuous-query output without tag columns (#521): it opts the
+	// file into exact-row dedup at compaction, keyed by time (#1232). Raw
+	// ingest never sets it. Not the older arc:dedup_time key: builds before
+	// #1232 read that as "dedup on time alone" and would delete rows from
+	// this output if a node were rolled back.
 	if dedupTime {
-		metaKeys = append(metaKeys, "arc:dedup_time")
+		metaKeys = append(metaKeys, "arc:dedup_exact")
 		metaValues = append(metaValues, "true")
 	}
 
@@ -655,7 +656,7 @@ func (w *ArrowWriter) inferSchema(columns map[string]interface{}, tagColumns []s
 // validity is an optional map of column name → []bool where false means null.
 // Columns without a validity entry (or when validity is nil) are treated as fully valid.
 // tagColumns optionally lists which columns are tags (stored as Parquet metadata for compaction dedup).
-// dedupTime, when true, marks the file with arc:dedup_time so compaction dedups on time even with no tags.
+// dedupTime, when true, marks the file with arc:dedup_exact: continuous-query output (see ColumnarRecord.DedupTime).
 // decimalCols optionally maps column names to DecimalSpec for Decimal128 type inference.
 func (w *ArrowWriter) WriteParquetColumnar(ctx context.Context, measurement string, columns map[string]interface{}, validity map[string][]bool, tagColumns []string, dedupTime bool, decimalCols map[string]config.DecimalSpec) ([]byte, error) {
 	data, _, err := w.writeParquetColumnarWithSchema(ctx, measurement, columns, validity, tagColumns, dedupTime, decimalCols)
@@ -828,8 +829,8 @@ type TypedColumnBatch struct {
 	Validity   map[string][]bool      // per-column null bitmap; nil entry = all valid
 	TagColumns []string               // tag column names (for Parquet metadata, enables auto-dedup)
 	// DedupTime propagates ColumnarRecord.DedupTime: when true, the Parquet
-	// footer gets an arc:dedup_time marker so compaction dedups on time even with
-	// no tag columns. See ColumnarRecord.DedupTime — CQ output only (#521).
+	// footer gets an arc:dedup_exact marker. A merge keeps it if any batch had
+	// it. See ColumnarRecord.DedupTime — CQ output only (#521).
 	DedupTime bool
 	Signature string   // sorted column-name string; cached to avoid per-write recomputation
 	WALHashes []string // identities of WAL entries represented by this batch
@@ -1939,13 +1940,14 @@ func (b *ArrowBuffer) WriteColumnarRecord(ctx context.Context, database string, 
 //
 // Note (#521): the WAL stores flattened rows and does NOT carry TagColumns or
 // the DedupTime marker (both are json:"-"), so a Parquet file produced purely
-// from WAL replay has neither arc:tags nor arc:dedup_time. In practice this
-// self-heals: compaction unions metadata across all files in a partition, so
-// a replayed file dedups against any marked sibling written normally for the
-// same window. It only fails to dedup if the replayed copy and a marked copy
-// land in different compaction batches — a transient duplicate, never data
-// loss. This matches the pre-existing arc:tags WAL behavior; propagating the
-// markers through the WAL is a separate, larger change (WAL schema).
+// from WAL replay has neither arc:tags nor the continuous-query marker.
+// Compaction unions tags and reads the marker across all files of a batch, so
+// a replayed file is deduped against any tagged or marked raw sibling in the
+// same batch — exact-row (#1232), so the replayed copy of a row collapses and
+// nothing else does. It is NOT deduped against a compacted file (compacted
+// tagged output carries no arc:tags) or a sibling in another batch: that copy
+// stays a duplicate. Never data loss. Propagating the markers through the WAL is a separate, larger
+// change (WAL schema).
 // WriteColumnarDirectNoWAL writes a replayed or replicated columnar payload into
 // the buffer without appending it to the WAL. It inherits no WAL identity; use
 // WriteColumnarDirectReplay when replaying an entry whose identity should be
@@ -2690,7 +2692,7 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALHashes(ctx context.Context, da
 
 	// Propagate tag column names for Parquet metadata (enables auto-dedup in compaction)
 	typedColumns.TagColumns = record.TagColumns
-	// Propagate the dedup-on-time marker (CQ output only — see ColumnarRecord.DedupTime)
+	// Propagate the continuous-query dedup marker (CQ output only — see ColumnarRecord.DedupTime)
 	typedColumns.DedupTime = record.DedupTime
 	typedColumns.WALHashes = walHashes
 
@@ -4123,9 +4125,10 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 
 	// Union of tag columns across all batches (for Parquet metadata)
 	tagColumnSet := make(map[string]struct{})
-	// Dedup-time marker is sticky: if ANY merged batch carries it, the output
-	// does (all writes to one measurement share the same producer, so this only
-	// ORs identical values in practice — the OR is defensive).
+	// Dedup-time marker: the merged output carries it if ANY batch did. It
+	// marks continuous-query output, which opts the file into exact-row dedup
+	// at compaction (#1232) — and exact-row dedup never deletes a row that
+	// differs from the others, so marking a mix is safe.
 	mergedDedupTime := false
 
 	// First pass: count total rows using time column

@@ -106,6 +106,11 @@ func TestManifestCommandSpeaksFor(t *testing.T) {
 	settle, _ := json.Marshal(raft.SettleCoveragePayload{Origin: "w2"})
 	settled, _ := json.Marshal(raft.InstanceSettledPayload{Origin: "w2"})
 	own, _ := json.Marshal(raft.AnnounceInstancePayload{Origin: "w1"})
+	extend, _ := json.Marshal(raft.ExtendStreamClaimPayload{By: "w2"})
+	ownExtend, _ := json.Marshal(raft.ExtendStreamClaimPayload{By: "w1"})
+	release, _ := json.Marshal(raft.ReleaseStreamClaimPayload{By: "w2"})
+	ownRelease, _ := json.Marshal(raft.ReleaseStreamClaimPayload{By: "w1"})
+	operatorRelease, _ := json.Marshal(raft.ReleaseStreamClaimPayload{})
 	for name, tc := range map[string]struct {
 		cmd raft.Command
 		ok  bool
@@ -120,6 +125,11 @@ func TestManifestCommandSpeaksFor(t *testing.T) {
 		"settle another":       {raft.Command{Type: raft.CommandSettleCoverage, Payload: settle}, false},
 		"settled another":      {raft.Command{Type: raft.CommandInstanceSettled, Payload: settled}, false},
 		"own announcement":     {raft.Command{Type: raft.CommandAnnounceInstance, Payload: own}, true},
+		"extend for another":   {raft.Command{Type: raft.CommandExtendStreamClaim, Payload: extend}, false},
+		"own extension":        {raft.Command{Type: raft.CommandExtendStreamClaim, Payload: ownExtend}, true},
+		"release another":      {raft.Command{Type: raft.CommandReleaseStreamClaim, Payload: release}, false},
+		"own release":          {raft.Command{Type: raft.CommandReleaseStreamClaim, Payload: ownRelease}, true},
+		"operator release":     {raft.Command{Type: raft.CommandReleaseStreamClaim, Payload: operatorRelease}, false},
 	} {
 		err := manifestCommandSpeaksFor(&tc.cmd, "w1")
 		if (err == nil) != tc.ok {
@@ -160,6 +170,27 @@ func TestForwardApplyClaimWiring(t *testing.T) {
 	ack := forwardOnce(t, c, "writer-2", &raft.Command{Type: raft.CommandRegisterFile, Payload: raw})
 	if ack.Status == "ok" || ack.Code != protocol.ForwardCodeClaimConflict {
 		t.Fatalf("claimed rows: %+v, want claim_conflict", ack)
+	}
+	// The claimant extends and releases its own claim through the leader.
+	var epoch uint64
+	for _, cl := range c.raftNode.FSM().ClaimsBy("writer-2") {
+		epoch = cl.Epoch
+	}
+	ext, _ := json.Marshal(raft.ExtendStreamClaimPayload{Instance: 7, By: "writer-2", Epoch: epoch, Keys: map[string]raft.Intervals{"testdb/mem": {{1, 2}}}})
+	if ack := forwardOnce(t, c, "writer-2", &raft.Command{Type: raft.CommandExtendStreamClaim, Payload: ext}); ack.Status != "ok" {
+		t.Fatalf("extend: %+v", ack)
+	}
+	rel, _ := json.Marshal(raft.ReleaseStreamClaimPayload{Instance: 7, Epoch: epoch, By: "writer-2"})
+	if ack := forwardOnce(t, c, "writer-2", &raft.Command{Type: raft.CommandReleaseStreamClaim, Payload: rel}); ack.Status != "ok" {
+		t.Fatalf("release: %+v", ack)
+	}
+}
+
+// The wire name pins the build generation that may enable takeover:
+// builds advertising an older name (no claimant, no exit on a claim) block it.
+func TestStreamClaimsCapabilityName(t *testing.T) {
+	if raft.CapabilityStreamClaims != "stream_claims_v3" {
+		t.Fatalf("capability %q", raft.CapabilityStreamClaims)
 	}
 }
 
@@ -218,6 +249,12 @@ func TestLocalCapabilitiesFollowTheEffectiveCoverage(t *testing.T) {
 	reader.cfg.StreamTakeover = true
 	if caps := reader.localCapabilities(); !hasCapability(caps, raft.CapabilityStreamClaims) {
 		t.Fatal("a reader does not advertise stream claims")
+	}
+	// Claims name nodes: without an explicit node id (hostname-PID by
+	// default) the node never advertises them.
+	reader.cfg.NodeID = ""
+	if caps := reader.localCapabilities(); len(caps) != 0 {
+		t.Fatalf("advertised %v without an explicit cluster.node_id", caps)
 	}
 }
 

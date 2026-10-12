@@ -9,7 +9,7 @@ import (
 // single string for the string-assertion unit tests below. The dedup path
 // returns two statements (CREATE TEMP TABLE + COPY); the standard path one.
 func buildCompactionSQL(fileListSQL, orderByClause, outputFile string, tagColumns []string, dedupTime bool) string {
-	return strings.Join(buildCompactionQuery(fileListSQL, orderByClause, outputFile, tagColumns, dedupTime), "\n;\n")
+	return strings.Join(buildCompactionQuery(fileListSQL, orderByClause, outputFile, tagColumns, legacyDedupMode(tagColumns, dedupTime)), "\n;\n")
 }
 
 func TestBuildCompactionQuery_NoDedup(t *testing.T) {
@@ -33,74 +33,11 @@ func TestBuildCompactionQueryDisablesHivePartitioning(t *testing.T) {
 	}
 }
 
-func TestBuildCompactionQuery_WithDedup(t *testing.T) {
-	query := buildCompactionSQL(
-		"['a.parquet', 'b.parquet']",
-		`ORDER BY "time"`,
-		"/tmp/out.parquet",
-		[]string{"host", "region"},
-		false,
-	)
-
-	if !strings.Contains(query, "ROW_NUMBER") {
-		t.Error("expected ROW_NUMBER with dedup keys")
-	}
-	if !strings.Contains(query, `PARTITION BY "host", "region", "time"`) {
-		t.Error("expected PARTITION BY with tag columns and time")
-	}
-	// Dedup uses QUALIFY (not a SELECT *, ROW_NUMBER ... ) WHERE rn=1 subquery):
-	// the subquery/star-expansion form mis-binds time under union_by_name. See
-	// buildCompactionQuery for the full explanation.
-	if !strings.Contains(query, "QUALIFY ROW_NUMBER") {
-		t.Errorf("expected QUALIFY ROW_NUMBER dedup form, got: %s", query)
-	}
-	if strings.Contains(query, "__dedup_rn") {
-		t.Error("expected no __dedup_rn subquery column (QUALIFY form has no helper column)")
-	}
-	// time must be normalized to TIMESTAMPTZ so mixed-type partitions reconcile.
-	if !strings.Contains(query, "make_timestamptz") {
-		t.Error("expected time normalized via make_timestamptz")
-	}
-	if !strings.Contains(query, `ORDER BY "time"`) {
-		t.Error("expected outer ORDER BY clause")
-	}
-}
-
 func TestBuildCompactionQuery_EmptyDedup(t *testing.T) {
 	query := buildCompactionSQL("['a.parquet']", "", "/tmp/out.parquet", []string{}, false)
 
 	if strings.Contains(query, "ROW_NUMBER") {
 		t.Error("expected no ROW_NUMBER with empty dedup keys")
-	}
-}
-
-// TestBuildCompactionQuery_DedupTimeOnly covers the #521 no-group-by CQ path:
-// no tag columns but dedupTime=true → dedup on "time" alone (PARTITION BY "time"
-// with no leading comma).
-func TestBuildCompactionQuery_DedupTimeOnly(t *testing.T) {
-	query := buildCompactionSQL("['a.parquet', 'b.parquet']", `ORDER BY "time"`, "/tmp/out.parquet", nil, true)
-
-	if !strings.Contains(query, "QUALIFY ROW_NUMBER") {
-		t.Errorf("expected dedup (QUALIFY ROW_NUMBER) when dedupTime is set, got: %s", query)
-	}
-	if !strings.Contains(query, `PARTITION BY "time"`) {
-		t.Errorf("expected PARTITION BY \"time\" alone, got: %s", query)
-	}
-	// Must NOT have a dangling leading comma from an empty tag list.
-	if strings.Contains(query, `PARTITION BY , "time"`) || strings.Contains(query, `PARTITION BY ,"time"`) {
-		t.Errorf("dangling comma in PARTITION BY with no tags: %s", query)
-	}
-	if !strings.Contains(query, "make_timestamptz") {
-		t.Error("dedup-time branch must still normalize time to TIMESTAMPTZ")
-	}
-}
-
-// TestBuildCompactionQuery_DedupTimeWithTags: dedupTime is a no-op when tags are
-// already present — the key stays (tags, time), same as the tag-only branch.
-func TestBuildCompactionQuery_DedupTimeWithTags(t *testing.T) {
-	withFlag := buildCompactionSQL("['a.parquet']", "", "/tmp/o.parquet", []string{"host"}, true)
-	if !strings.Contains(withFlag, `PARTITION BY "host", "time"`) {
-		t.Errorf("expected (host, time) key when both tags and dedupTime present, got: %s", withFlag)
 	}
 }
 
@@ -182,5 +119,64 @@ func TestBuildCompactionQuery_DedupNonDedupBothNormalizeTime(t *testing.T) {
 		if !strings.Contains(q, "make_timestamptz") || !strings.Contains(q, "TIMESTAMPTZ") {
 			t.Errorf("%s branch does not normalize time to TIMESTAMPTZ:\n%s", name, q)
 		}
+	}
+}
+
+// legacyDedupMode maps the (tags, dedupTime) pair older tests pass onto the
+// mode decideDedup chooses: either one makes the batch an exact-row dedup.
+func legacyDedupMode(tagColumns []string, dedupTime bool) dedupMode {
+	if len(tagColumns) > 0 || dedupTime {
+		return dedupExact
+	}
+	return dedupNone
+}
+
+// Exact-row dedup (#1232): rows whose (tags, time) key is unique are copied as
+// they are; for keys that repeat, one copy of each distinct row is kept. The
+// key never decides on its own that rows are duplicates.
+func TestBuildCompactionQuery_ExactRows(t *testing.T) {
+	stmts := buildCompactionQuery("['a.parquet']", `ORDER BY "time"`, "/tmp/o.parquet", []string{"host", "region"}, dedupExact)
+	if len(stmts) != 3 {
+		t.Fatalf("got %d statements, want stage + keys + copy", len(stmts))
+	}
+	q := strings.Join(stmts, "\n;\n")
+	for _, want := range []string{
+		`GROUP BY ALL HAVING count(*) > 1`,
+		`SELECT "host", "region", "time" FROM ` + dedupStagingTable,
+		`k."host" IS NOT DISTINCT FROM s."host" AND k."region" IS NOT DISTINCT FROM s."region" AND k."time" IS NOT DISTINCT FROM s."time"`,
+		`WHERE NOT EXISTS`,
+		`SELECT DISTINCT * FROM ` + dedupStagingTable + ` s WHERE EXISTS`,
+		`make_timestamptz`,
+	} {
+		if !strings.Contains(q, want) {
+			t.Errorf("exact-row query lacks %q:\n%s", want, q)
+		}
+	}
+	if strings.Contains(q, "ROW_NUMBER") || strings.Contains(q, "PARTITION BY") {
+		t.Errorf("exact-row query still keeps one row per key:\n%s", q)
+	}
+	if strings.Contains(q, "KV_METADATA") {
+		t.Errorf("tagged exact-row output is marked:\n%s", q)
+	}
+}
+
+// With no tags (continuous-query output) the key is time alone and the output
+// stays marked so a later pass checks it again. UNION ALL + DISTINCT keep no
+// order, so the output is ordered by time when no sort keys are configured,
+// and by the sort keys when they are.
+func TestBuildCompactionQuery_ExactRowsTaglessOrderAndMarker(t *testing.T) {
+	q := strings.Join(buildCompactionQuery("['a.parquet']", "", "/tmp/o.parquet", nil, dedupExact), "\n;\n")
+	if !strings.Contains(q, `SELECT "time" FROM `+dedupStagingTable) || strings.Contains(q, `SELECT , "time"`) {
+		t.Errorf("tagless key is not time alone:\n%s", q)
+	}
+	if !strings.Contains(q, `KV_METADATA {'arc:dedup_exact': 'true'}`) {
+		t.Errorf("tagless exact-row output is not marked:\n%s", q)
+	}
+	if !strings.Contains(q, `ORDER BY "time"`) {
+		t.Errorf("no ORDER BY fallback without sort keys:\n%s", q)
+	}
+	q = strings.Join(buildCompactionQuery("['a.parquet']", `ORDER BY "host", "time"`, "/tmp/o.parquet", nil, dedupExact), "\n;\n")
+	if !strings.Contains(q, `ORDER BY "host", "time"`) {
+		t.Errorf("configured sort keys ignored:\n%s", q)
 	}
 }

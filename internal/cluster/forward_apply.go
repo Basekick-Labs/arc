@@ -591,7 +591,9 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		cmd.Type == clusterraft.CommandAnnounceInstance ||
 		cmd.Type == clusterraft.CommandSettleCoverage ||
 		cmd.Type == clusterraft.CommandClaimDone ||
-		cmd.Type == clusterraft.CommandInstanceSettled
+		cmd.Type == clusterraft.CommandInstanceSettled ||
+		cmd.Type == clusterraft.CommandExtendStreamClaim ||
+		cmd.Type == clusterraft.CommandReleaseStreamClaim
 	isAuth := cmd.Type == clusterraft.CommandCreateToken ||
 		cmd.Type == clusterraft.CommandUpdateToken ||
 		cmd.Type == clusterraft.CommandRevokeToken ||
@@ -880,6 +882,24 @@ func manifestCommandSpeaksFor(cmd *clusterraft.Command, nodeID string) error {
 		}
 		if p.By != nodeID {
 			return fmt.Errorf("claim done for %q is not by the requesting node", p.By)
+		}
+	case clusterraft.CommandExtendStreamClaim:
+		var p clusterraft.ExtendStreamClaimPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.By != nodeID {
+			return fmt.Errorf("stream claim extension for %q is not by the requesting node", p.By)
+		}
+	case clusterraft.CommandReleaseStreamClaim:
+		// Forwarded, only a claimant releasing its own claim; an operator
+		// release is proposed on the leader and never forwarded.
+		var p clusterraft.ReleaseStreamClaimPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.By == "" || p.By != nodeID {
+			return fmt.Errorf("stream claim release for %q is not by the requesting node", p.By)
 		}
 	case clusterraft.CommandAnnounceInstance:
 		var p clusterraft.AnnounceInstancePayload
