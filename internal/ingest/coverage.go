@@ -122,6 +122,10 @@ const (
 	// CoverageAbandoned: the outbox stopped without a cluster; nothing will
 	// ever register the file. The WAL hold is released; the floor holds.
 	CoverageAbandoned
+	// CoverageRefused: the cluster refused the file for good — another
+	// writer took over these rows (#1207). The group keeps its WAL entries:
+	// the rows above the claim are re-flushed from them. The floor holds.
+	CoverageRefused
 )
 
 func (o CoverageOutcome) String() string {
@@ -132,6 +136,8 @@ func (o CoverageOutcome) String() string {
 		return "withdrawn"
 	case CoverageLost:
 		return "lost"
+	case CoverageRefused:
+		return "refused"
 	default:
 		return "abandoned"
 	}
@@ -301,6 +307,7 @@ type flushGroup struct {
 	settled      map[string]struct{}
 	checkpointed bool
 	lost         bool
+	refused      bool
 	finished     bool
 }
 
@@ -387,6 +394,9 @@ func (g *flushGroup) settle(path string, outcome CoverageOutcome) {
 	if outcome == CoverageLost || outcome == CoverageAbandoned {
 		g.lost = true
 	}
+	if outcome == CoverageRefused {
+		g.refused = true
+	}
 	g.mu.Unlock()
 	if outcome == CoverageLost {
 		metrics.Get().IncWALCoverageLost(1)
@@ -416,7 +426,17 @@ func (g *flushGroup) maybeFinish() {
 	// A flush that succeeded without registering a file put the rows in no
 	// registered file. Not reachable today; release rather than pin the WAL.
 	lost := g.lost || !g.announced
+	refused := g.refused
 	g.mu.Unlock()
+	if refused {
+		// Keep the WAL entries: the rows above the claim are re-flushed
+		// from them (#1207). Held for the life of the process.
+		metrics.Get().IncWALCoverageRefused(int64(len(g.pieces)))
+		g.b.logger.Warn().Str("buffer_key", g.key).Int("batches", len(g.pieces)).
+			Msg("A flushed file was refused: another writer took over these rows; its WAL entries are kept")
+		g.cs.tracker.settleKey(g.key, g.pieces, false)
+		return
+	}
 	g.cs.wal.ReleaseRegistered(g.tokens)
 	g.cs.tracker.settleKey(g.key, g.pieces, !lost)
 }

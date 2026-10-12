@@ -585,6 +585,9 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	isManifest := cmd.Type == clusterraft.CommandRegisterFile ||
 		cmd.Type == clusterraft.CommandDeleteFile ||
 		cmd.Type == clusterraft.CommandBatchFileOps
+	// A stream claim (#1207) is proposed by the writer taking over, for
+	// itself.
+	isTakeOver := cmd.Type == clusterraft.CommandTakeOverStream
 	isAuth := cmd.Type == clusterraft.CommandCreateToken ||
 		cmd.Type == clusterraft.CommandUpdateToken ||
 		cmd.Type == clusterraft.CommandRevokeToken ||
@@ -620,7 +623,7 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	// compactor, which is exactly the guarantee the restore waits for.
 	isPauseSet := cmd.Type == clusterraft.CommandSetCompactionPause
 	isPauseAck := cmd.Type == clusterraft.CommandAckCompactionPause
-	if !isManifest && !isAuth && !isRBAC && !isBarrier && !isPauseSet && !isPauseAck {
+	if !isManifest && !isAuth && !isRBAC && !isBarrier && !isPauseSet && !isPauseAck && !isTakeOver {
 		c.logger.Warn().
 			Str("requesting_node", req.NodeID).
 			Int("cmd_type", int(cmd.Type)).
@@ -628,7 +631,7 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeInvalidCommand, "command type not allowed via forwarding")
 		return
 	}
-	if (isManifest || isPauseSet) && !caps.CanIngest && !caps.CanCompact {
+	if ((isManifest || isPauseSet) && !caps.CanIngest && !caps.CanCompact) || (isTakeOver && !caps.CanIngest) {
 		c.logger.Warn().
 			Str("peer", remoteAddr).
 			Str("requesting_node", req.NodeID).
@@ -650,6 +653,19 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		}
 	}
 
+	if isManifest || isTakeOver {
+		if err := manifestCommandSpeaksFor(&cmd, req.NodeID); err != nil {
+			c.logger.Warn().
+				Err(err).
+				Str("peer", remoteAddr).
+				Str("requesting_node", req.NodeID).
+				Int("cmd_type", int(cmd.Type)).
+				Msg("ForwardApply rejected: command speaks for another node")
+			c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, "command must name the requesting node")
+			return
+		}
+	}
+
 	// Apply via Node.Apply — this is the same code path local applies
 	// take, so the FSM handler doesn't need to know whether the command
 	// originated locally or via forwarding.
@@ -665,7 +681,11 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		// this, every follower would see the same canned "raft apply
 		// failed" string and fail to recognise legitimate idempotency
 		// signals. PR #451 round-3 internal review.
-		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeApplyFailed, err.Error())
+		code := protocol.ForwardCodeApplyFailed
+		if clusterraft.IsStreamClaimConflict(err) {
+			code = protocol.ForwardCodeClaimConflict
+		}
+		c.sendForwardApplyError(conn, req.Nonce, code, err.Error())
 		return
 	}
 
@@ -807,4 +827,48 @@ func (c *Coordinator) leaderCoordinatorAddress(leaderID string) string {
 		}
 	}
 	return ""
+}
+
+// manifestCommandSpeaksFor refuses a forwarded manifest or claim command
+// that names another node (#1207): a registration's origin, and a claim's
+// claimant, must be the peer that signed the request. Every in-tree
+// registration stamps the local node as origin, so this refuses nothing
+// legitimate; without it one authenticated peer could register files as
+// another, which the stream claim rule keys on.
+func manifestCommandSpeaksFor(cmd *clusterraft.Command, nodeID string) error {
+	checkRegister := func(raw []byte) error {
+		var p clusterraft.RegisterFilePayload
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return err
+		}
+		if p.File.OriginNodeID != nodeID {
+			return fmt.Errorf("register file origin %q is not the requesting node", p.File.OriginNodeID)
+		}
+		return nil
+	}
+	switch cmd.Type {
+	case clusterraft.CommandRegisterFile:
+		return checkRegister(cmd.Payload)
+	case clusterraft.CommandBatchFileOps:
+		var b clusterraft.BatchFileOpsPayload
+		if err := json.Unmarshal(cmd.Payload, &b); err != nil {
+			return err
+		}
+		for i, op := range b.Ops {
+			if op.Type == clusterraft.CommandRegisterFile {
+				if err := checkRegister(op.Payload); err != nil {
+					return fmt.Errorf("op[%d]: %w", i, err)
+				}
+			}
+		}
+	case clusterraft.CommandTakeOverStream:
+		var p clusterraft.TakeOverStreamPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.By != nodeID {
+			return fmt.Errorf("stream claim for %q is not by the requesting node", p.By)
+		}
+	}
+	return nil
 }

@@ -133,8 +133,15 @@ type Coordinator struct {
 	replicationSender *replication.Sender // Writer only: sends entries to readers
 	// ingestFence refuses live writes on a writer that may no longer be the
 	// primary (#1207); nil where it does not apply.
-	ingestFence          atomic.Pointer[ingestFence]
-	originStream         *originStream // #1207 S3; guarded by mu
+	ingestFence  atomic.Pointer[ingestFence]
+	originStream *originStream // #1207 S3; guarded by mu
+
+	// Stream claims (#1207 S4a): streamClaimsMu serializes the join gate
+	// with the enable proposal on the leader. See stream_claims.go.
+	streamClaimsMu       sync.Mutex
+	streamClaimsProposer atomic.Bool // the enable loop runs (not in S4a)
+	streamClaimsBlockers atomic.Pointer[[]string]
+	walCoverageActive    atomic.Bool // SetWALCoverageActive
 	ingestFenceListeners []func(fenced bool)
 	replicationReceiver  *replication.Receiver // Reader only: receives entries from writer
 	// replicationReceiverStopped is set by StopReplicationReceiver, which
@@ -737,6 +744,7 @@ func (c *Coordinator) Start() error {
 	}
 	// Refuse writes on a writer that may no longer be the primary (#1207).
 	c.startIngestFenceLocked()
+	go c.streamClaimsMetricsLoop(c.ctx)
 
 	// Start compactor failover manager if configured (Phase 5)
 	if c.compactorFailoverMgr != nil {
@@ -1601,6 +1609,8 @@ func (c *Coordinator) tryJoinViaSeed(seedAddr string) error {
 		CoordAddr:   c.cfg.AdvertiseAddr,
 		Version:     c.localNode.Version,
 		CoreCount:   runtime.GOMAXPROCS(0), // Report current GOMAXPROCS as core count
+		// Outside the first MAC; covered by AuthHMAC2 below (#1207).
+		Capabilities: c.localCapabilities(),
 	}
 
 	// If RaftAdvertiseAddr is empty, use RaftBindAddr.
@@ -1624,6 +1634,9 @@ func (c *Coordinator) tryJoinViaSeed(seedAddr string) error {
 		req.AuthTimestamp = time.Now().Unix()
 		req.AuthNonce = nonce
 		req.AuthHMAC = security.ComputeJoinHMAC(c.cfg.SharedSecret, nonce, req.AuthTimestamp, joinAuthFields(req))
+		if len(req.Capabilities) > 0 {
+			req.AuthHMAC2 = security.ComputeJoinCapsHMAC(c.cfg.SharedSecret, nonce, req.AuthTimestamp, joinAuthFields(req), req.Capabilities)
+		}
 	}
 
 	// Send join request
@@ -1872,6 +1885,25 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 			c.sendJoinError(conn, req, joinAuthFailedMsg)
 			return
 		}
+		// Capabilities are outside the first MAC (an older leader would
+		// refuse a field it does not know); the second one covers them.
+		// Bounded first, also when no secret is configured (below).
+		if len(req.Capabilities) > 0 {
+			if err := security.ValidateJoinCapsHMAC(c.cfg.SharedSecret, req.AuthNonce, req.AuthTimestamp,
+				joinAuthFields(req), req.Capabilities, req.AuthHMAC2, security.HMACTimestampTolerance); err != nil {
+				c.logger.Warn().Err(err).Str("node_id", req.NodeID).Msg("Join rejected: capabilities authentication failed")
+				c.sendJoinError(conn, req, joinAuthFailedMsg)
+				return
+			}
+		}
+	}
+
+	// Bound the advertised capabilities whether or not a secret is set:
+	// they are stored on the node record and replicated (#1207).
+	if err := security.CheckJoinCapabilities(req.Capabilities); err != nil {
+		c.logger.Warn().Str("node_id", req.NodeID).Int("capabilities", len(req.Capabilities)).Msg("Join rejected: capabilities exceed their bounds")
+		c.sendJoinError(conn, req, joinAuthFailedMsg)
+		return
 	}
 
 	// Validate the role the joiner presents.
@@ -1943,6 +1975,24 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 	// POST /api/v1/cluster/voters/converge drives (#880); nothing converges
 	// automatically, deliberately.
 	if c.raftNode != nil {
+		// Before AddVoter/AddNonvoter: once a node is in the Raft
+		// configuration it applies the log, so an older build must be
+		// turned away here, not after (#1207).
+		why, release := c.streamClaimsJoinGate(req)
+		if why != "" {
+			c.logger.Error().Str("node_id", req.NodeID).Str("role", req.Role).Str("reason", why).
+				Msg("Join refused: the node does not support stream claims")
+			c.sendJoinError(conn, req, why)
+			return
+		}
+		joinGateReleased := false
+		releaseGate := func() {
+			if !joinGateReleased {
+				joinGateReleased = true
+				release()
+			}
+		}
+		defer releaseGate()
 		votes := node.Role.VotesInElections()
 		var addErr error
 		if votes {
@@ -1983,20 +2033,23 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 
 		// Then add node info to FSM
 		nodeInfo := &raft.NodeInfo{
-			ID:          req.NodeID,
-			Name:        req.NodeName,
-			Role:        req.Role,
-			ClusterName: req.ClusterName,
-			Address:     req.CoordAddr,
-			APIAddress:  req.APIAddr,
-			State:       string(StateHealthy),
-			Version:     req.Version,
-			CoreCount:   req.CoreCount,
+			ID:           req.NodeID,
+			Name:         req.NodeName,
+			Role:         req.Role,
+			ClusterName:  req.ClusterName,
+			Address:      req.CoordAddr,
+			APIAddress:   req.APIAddr,
+			State:        string(StateHealthy),
+			Version:      req.Version,
+			CoreCount:    req.CoreCount,
+			Capabilities: req.Capabilities,
 		}
 		if err := c.raftNode.AddNode(nodeInfo, 5*time.Second); err != nil {
 			c.logger.Error().Err(err).Str("node_id", req.NodeID).Msg("Failed to add node to FSM")
 			// Node was added to Raft but not FSM - this is ok, FSM will sync eventually
 		}
+		// Not across the network reply below.
+		releaseGate()
 	} else {
 		// No Raft, just register locally
 		if err := c.registry.Register(node); err != nil {
@@ -2909,6 +2962,11 @@ func (c *Coordinator) Status() map[string]interface{} {
 	if c.raftFSM != nil {
 		status["compaction_pause"] = c.CompactionPauseStatus()
 	}
+	// Stream claims (#1207): whether they are on, how many are held, and
+	// which nodes keep them off.
+	if c.raftNode != nil {
+		status["stream_claims"] = c.StreamClaimsStatus()
+	}
 
 	// Add Raft status if configured (Phase 3)
 	if c.raftNode != nil {
@@ -3764,15 +3822,16 @@ func (c *Coordinator) registerSelfInFSMWhenLeader() {
 
 	// Register ourselves in the FSM
 	nodeInfo := &raft.NodeInfo{
-		ID:          c.localNode.ID,
-		Name:        c.localNode.Name,
-		Role:        string(c.localNode.Role),
-		ClusterName: c.cfg.ClusterName,
-		Address:     c.cfg.AdvertiseAddr,
-		APIAddress:  c.localNode.APIAddress,
-		State:       string(StateHealthy),
-		Version:     c.localNode.Version,
-		CoreCount:   runtime.GOMAXPROCS(0), // Leader's core count
+		ID:           c.localNode.ID,
+		Name:         c.localNode.Name,
+		Role:         string(c.localNode.Role),
+		ClusterName:  c.cfg.ClusterName,
+		Address:      c.cfg.AdvertiseAddr,
+		APIAddress:   c.localNode.APIAddress,
+		State:        string(StateHealthy),
+		Version:      c.localNode.Version,
+		CoreCount:    runtime.GOMAXPROCS(0), // Leader's core count
+		Capabilities: c.localCapabilities(),
 	}
 
 	if err := c.raftNode.AddNode(nodeInfo, 5*time.Second); err != nil {

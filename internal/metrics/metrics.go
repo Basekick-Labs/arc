@@ -167,12 +167,16 @@ type Metrics struct {
 	standbyStoreLost         atomic.Int64 // batches held that the primary reported lost
 	standbyStoreBlocked      atomic.Int64 // keys whose trim waits on files not yet here
 	standbyStoreReplaced     atomic.Int64 // bytes held for replaced primary instances
-	walRecoveryTotal         atomic.Int64 // Successful WAL recovery operations
-	walRecoveryRecords       atomic.Int64 // Total records recovered from WAL
-	walDroppedEntries        atomic.Int64 // Entries dropped due to full WAL buffer
-	walFailedWrites          atomic.Int64 // Write failures to WAL file
-	walOversizedPayloads     atomic.Int64 // Payloads rejected for exceeding the single-entry cap even after chunking (#677)
-	walDirectoryBytes        atomic.Int64 // Current bytes occupied by every file in the WAL directory
+
+	streamClaimsEnabled  atomic.Int64 // 1 once stream claims are applied (#1207 S4a)
+	streamClaims         atomic.Int64 // stream claims held in the FSM
+	walCoverageRefused   atomic.Int64 // batches whose file was refused: another writer claimed them
+	walRecoveryTotal     atomic.Int64 // Successful WAL recovery operations
+	walRecoveryRecords   atomic.Int64 // Total records recovered from WAL
+	walDroppedEntries    atomic.Int64 // Entries dropped due to full WAL buffer
+	walFailedWrites      atomic.Int64 // Write failures to WAL file
+	walOversizedPayloads atomic.Int64 // Payloads rejected for exceeding the single-entry cap even after chunking (#677)
+	walDirectoryBytes    atomic.Int64 // Current bytes occupied by every file in the WAL directory
 
 	// Cluster file registration outbox (#1209)
 	fileRegistrationsPending      atomic.Int64 // files flushed and not yet confirmed in the cluster manifest
@@ -593,6 +597,15 @@ func (m *Metrics) IncStandbyStreamGaps()               { m.standbyStreamGaps.Add
 func (m *Metrics) AddStandbyStoreTrimmedBytes(n int64) { m.standbyStoreTrimmedBytes.Add(n) }
 func (m *Metrics) IncStandbyStoreDropped()             { m.standbyStoreDropped.Add(1) }
 func (m *Metrics) AddStandbyStoreEvictedBytes(n int64) { m.standbyStoreEvicted.Add(n) }
+func (m *Metrics) SetStreamClaims(enabled bool, claims int64) {
+	if enabled {
+		m.streamClaimsEnabled.Store(1)
+	} else {
+		m.streamClaimsEnabled.Store(0)
+	}
+	m.streamClaims.Store(claims)
+}
+func (m *Metrics) IncWALCoverageRefused(n int64) { m.walCoverageRefused.Add(n) }
 func (m *Metrics) SetStandbyStoreTrimState(lost, blocked, replacedBytes int64) {
 	m.standbyStoreLost.Store(lost)
 	m.standbyStoreBlocked.Store(blocked)
@@ -892,6 +905,9 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"standby_store_lost_records":       m.standbyStoreLost.Load(),
 		"standby_store_blocked_keys":       m.standbyStoreBlocked.Load(),
 		"standby_store_replaced_bytes":     m.standbyStoreReplaced.Load(),
+		"stream_claims_enabled":            m.streamClaimsEnabled.Load(),
+		"stream_claims":                    m.streamClaims.Load(),
+		"wal_coverage_refused":             m.walCoverageRefused.Load(),
 		"wal_recovery_total":               m.walRecoveryTotal.Load(),
 		"wal_recovery_records":             m.walRecoveryRecords.Load(),
 		"wal_dropped_entries":              m.walDroppedEntries.Load(),
@@ -1324,6 +1340,18 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_standby_store_replaced_bytes Bytes held for primary instances that have since restarted\n"...)
 	b = append(b, "# TYPE arc_standby_store_replaced_bytes gauge\n"...)
 	b = appendMetric(b, "arc_standby_store_replaced_bytes", float64(m.standbyStoreReplaced.Load()))
+
+	b = append(b, "# HELP arc_cluster_stream_claims_enabled 1 once stream claims are enabled in the cluster\n"...)
+	b = append(b, "# TYPE arc_cluster_stream_claims_enabled gauge\n"...)
+	b = appendMetric(b, "arc_cluster_stream_claims_enabled", float64(m.streamClaimsEnabled.Load()))
+
+	b = append(b, "# HELP arc_cluster_stream_claims Stream claims held: primary instances a standby writer took over\n"...)
+	b = append(b, "# TYPE arc_cluster_stream_claims gauge\n"...)
+	b = appendMetric(b, "arc_cluster_stream_claims", float64(m.streamClaims.Load()))
+
+	b = append(b, "# HELP arc_wal_coverage_refused_total Batches whose file the cluster refused because another writer claimed them\n"...)
+	b = append(b, "# TYPE arc_wal_coverage_refused_total counter\n"...)
+	b = appendMetric(b, "arc_wal_coverage_refused_total", float64(m.walCoverageRefused.Load()))
 
 	b = append(b, "# HELP arc_wal_recovery_total Successful WAL recovery operations\n"...)
 	b = append(b, "# TYPE arc_wal_recovery_total counter\n"...)

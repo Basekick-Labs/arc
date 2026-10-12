@@ -139,9 +139,9 @@ var ErrHandshakeReplay = errors.New("security: handshake nonce already used")
 // raft_auth.go using the older NUL format, and passing one here would compile
 // but produce a MAC no validator computes.
 func computeHandshakeMACRaw(sharedSecret string, label MsgType, fields ...string) []byte {
-	all := make([]string, 0, len(fields)+1)
-	all = append(all, string(label))
-	all = append(all, fields...)
+	// No size arithmetic on fields: some come from the wire (join
+	// capabilities), and append sizes the slice safely.
+	all := append([]string{string(label)}, fields...)
 	return computeRawHMAC(sharedSecret, canonicalSyncInput(all...))
 }
 
@@ -186,6 +186,54 @@ func joinFields(nonce string, ts int64, f JoinAuthFields) []string {
 		f.RaftAddr, f.APIAddr, f.CoordAddr, f.Version,
 		strconv.Itoa(f.CoreCount), strconv.FormatInt(ts, 10),
 	}
+}
+
+// MsgTypeJoinCaps labels the second join MAC, which also covers the
+// capabilities (#1207). Its own label, so neither MAC can stand in for the
+// other.
+const MsgTypeJoinCaps MsgType = "join-caps"
+
+// Bounds on advertised capabilities (#1207): a join carries a handful, and
+// anything beyond these is refused before any MAC is computed over it.
+const (
+	MaxJoinCapabilities  = 16
+	MaxJoinCapabilityLen = 64
+)
+
+// ErrJoinCapabilities refuses an oversized capability list.
+var ErrJoinCapabilities = errors.New("security: join capabilities exceed their bounds")
+
+// CheckJoinCapabilities reports whether caps is within the bounds.
+func CheckJoinCapabilities(caps []string) error {
+	if len(caps) > MaxJoinCapabilities {
+		return ErrJoinCapabilities
+	}
+	for _, c := range caps {
+		if len(c) == 0 || len(c) > MaxJoinCapabilityLen {
+			return ErrJoinCapabilities
+		}
+	}
+	return nil
+}
+
+func joinCapsFields(nonce string, ts int64, f JoinAuthFields, caps []string) []string {
+	out := append(joinFields(nonce, ts, f), strconv.Itoa(len(caps)))
+	return append(out, caps...)
+}
+
+// ComputeJoinCapsHMAC signs every field of a join request and its
+// capabilities.
+func ComputeJoinCapsHMAC(sharedSecret, nonce string, timestamp int64, f JoinAuthFields, caps []string) string {
+	return hex.EncodeToString(computeHandshakeMACRaw(sharedSecret, MsgTypeJoinCaps, joinCapsFields(nonce, timestamp, f, caps)...))
+}
+
+// ValidateJoinCapsHMAC verifies the capabilities MAC. Freshness and replay
+// are the first MAC's job: both are over the same nonce and timestamp.
+func ValidateJoinCapsHMAC(sharedSecret, nonce string, timestamp int64, f JoinAuthFields, caps []string, receivedMAC string, tolerance time.Duration) error {
+	if err := CheckJoinCapabilities(caps); err != nil {
+		return err
+	}
+	return validateHandshakeMAC(sharedSecret, MsgTypeJoinCaps, timestamp, tolerance, receivedMAC, joinCapsFields(nonce, timestamp, f, caps)...)
 }
 
 // ComputeJoinHMAC signs every field of a join request.

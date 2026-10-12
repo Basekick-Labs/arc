@@ -623,3 +623,28 @@ func TestCoverageTrackerBoundedAfterLoss(t *testing.T) {
 		t.Fatalf("lag = %d, want 1 (the lost batch)", lag)
 	}
 }
+
+// A file refused because another writer claimed its rows keeps the group's
+// WAL entries: the rows above the claim are re-flushed from them (#1207).
+func TestCoverageRefusedKeepsTheWAL(t *testing.T) {
+	reg := &coverageRegistrar{}
+	b, w := newCoverageBuffer(t, 1000, reg)
+	before := metrics.Get().Snapshot()["wal_coverage_refused"].(int64)
+	if err := b.writeColumnarInternal(context.Background(), "db", coverageRecord("cpu", 1), false, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.FlushAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	reg.settleAll(CoverageRefused)
+	if got := w.PendingUnflushedCount(); got != 1 {
+		t.Fatalf("pending = %d, want 1: a refused file must keep its WAL entries", got)
+	}
+	if f := b.RegisteredFloors()["db/cpu"]; f != 0 {
+		t.Fatalf("floor = %d, want 0", f)
+	}
+	if after := metrics.Get().Snapshot()["wal_coverage_refused"].(int64); after != before+1 {
+		t.Fatalf("wal_coverage_refused %d -> %d", before, after)
+	}
+	_ = b.Close()
+}

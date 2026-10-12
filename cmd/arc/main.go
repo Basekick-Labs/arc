@@ -2065,6 +2065,10 @@ func main() {
 					if fenceable, ok := mqttManager.(interface{ SetIngestFenced(bool) }); ok {
 						clusterCoordinator.OnIngestFenceChange(fenceable.SetIngestFenced)
 					}
+					// The join advertises stream claims support only when WAL
+					// coverage actually took effect on this node (#1207).
+					_, _, coverageActive := arrowBuffer.RegistrationProgress()
+					clusterCoordinator.SetWALCoverageActive(coverageActive)
 					if err := clusterCoordinator.Start(); err != nil {
 						log.Error().Err(err).Msg("Failed to start cluster coordinator - running in standalone mode")
 						arrowBuffer.SetIngestGate(nil)

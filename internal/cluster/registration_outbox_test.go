@@ -38,6 +38,9 @@ type fakeOutboxManifest struct {
 	deleted     []string
 	batches     [][]string
 	existing    map[string]bool
+	claims      bool                   // StreamClaimsEnabled
+	coverage    []raft.FileCoverage    // coverage carried by registrations
+	refuse      func(path string) bool // a claim refuses this registration
 }
 
 func newFakeOutboxManifest() *fakeOutboxManifest {
@@ -56,6 +59,12 @@ func (m *fakeOutboxManifest) WaitForLeader(time.Duration) error {
 
 func (m *fakeOutboxManifest) SyncManifest(context.Context) error { return nil }
 
+func (m *fakeOutboxManifest) StreamClaimsEnabled() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.claims
+}
+
 func (m *fakeOutboxManifest) GetFileEntry(path string) (*raft.FileEntry, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -71,7 +80,11 @@ func (m *fakeOutboxManifest) GetFileEntry(path string) (*raft.FileEntry, bool) {
 func (m *fakeOutboxManifest) BatchFileOpsInManifestContext(_ context.Context, ops []raft.BatchFileOp) error {
 	var entries []raft.FileEntry
 	var paths, deletes []string
-	for _, op := range ops {
+	var refused []int
+	m.mu.Lock()
+	refuse := m.refuse
+	m.mu.Unlock()
+	for i, op := range ops {
 		if op.Type == raft.CommandDeleteFile {
 			var d raft.DeleteFilePayload
 			if err := json.Unmarshal(op.Payload, &d); err != nil {
@@ -86,6 +99,12 @@ func (m *fakeOutboxManifest) BatchFileOpsInManifestContext(_ context.Context, op
 		}
 		entries = append(entries, p.File)
 		paths = append(paths, p.File.Path)
+		if refuse != nil && refuse(p.File.Path) {
+			refused = append(refused, i)
+		}
+		m.mu.Lock()
+		m.coverage = append(m.coverage, p.Coverage...)
+		m.mu.Unlock()
 	}
 	m.mu.Lock()
 	m.batches = append(m.batches, paths)
@@ -100,6 +119,10 @@ func (m *fakeOutboxManifest) BatchFileOpsInManifestContext(_ context.Context, op
 	}
 	if err != nil {
 		return err
+	}
+	if len(refused) > 0 {
+		// As a forwarded refusal arrives: text only.
+		return errors.New("leader rejected (claim_conflict): " + (&raft.StreamClaimConflictError{Ops: refused}).Error())
 	}
 	m.mu.Lock()
 	for _, e := range entries {
