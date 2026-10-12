@@ -1916,7 +1916,7 @@ Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1157](https:/
 
 ### Partial DELETE rewrites remain immutable without duplicating data ([#975](https://github.com/Basekick-Labs/arc/issues/975))
 
-Partial DELETE now publishes the surviving rows under a fresh immutable Parquet path and retires the superseded object in every storage mode, including standalone OSS deployments. The rewrite filename is normalized before compaction, tiering and file-time pruning classify it. This closes the same-size/different-content replication class without leaving deleted rows visible through Arc's glob-based query path.
+Partial DELETE now publishes the surviving rows under a fresh immutable Parquet path and retires the superseded object in every storage mode, including standalone OSS deployments. The rewrite filename is normalized before compaction, tiering and file-time pruning classify it. This closes the same-size/different-content replication class for DELETE rewrites, without leaving deleted rows visible through Arc's glob-based query path. Producers that still reuse a path (restores, imports, edge-sync after the hub deleted it) are covered by the #798 entry.
 
 **Two DELETEs that touch the same file no longer merge.** Before this release they did, because the
 rewrite kept the file at its original path, so the second request read what the first had written.
@@ -2765,13 +2765,58 @@ node without the file. On shared-storage clusters, where every node reads the
 writer's own object, forced refreshes are off: the object is never re-uploaded
 by a reader.
 
-Two shapes stay outside this fix: a delete followed by a same-size
-re-registration of the same path inside the delete grace window, which the
-registrar sees as a new file rather than a change; and a rewrite a node learns
-of from a Raft snapshot rather than from the log, since a snapshot restore
-fires no registration callbacks (#1071 tracks the snapshot side).
+A delete followed by a same-size re-registration of the same path is now
+refreshed too. The re-registration arrives as a new file, not a change, so it
+was not forced; and a reader's local delete waits a short grace period before
+it unlinks, so when the path was listed again by then the delete kept the
+local copy, which then passed the size check with the old bytes. The delete
+now asks for a refresh of the path whenever it keeps a copy for that reason.
+The copy is never unlinked there, because the node may hold the only one: it
+stays readable until the new version is installed.
 
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#907](https://github.com/Basekick-Labs/arc/pull/907).
+That refresh hashes the local copy first and downloads only when it is not the
+listed version. A node that never held the old version pulls the new one
+through the registration, and a re-registration with unchanged content needs
+nothing, so neither downloads the file twice. The node logs it (the first
+time, then at every power of two):
+
+```
+Local delete skipped: the manifest lists the path again; refreshing the local copy unless it already is the listed version
+```
+
+Three counters in `replication_catchup_status` on `GET /api/v1/cluster` (and
+in the query gate's 503 body) show this working. They count every forced
+refresh, including the content-change refreshes above, not only this path:
+`forced_refresh` counts forced refreshes that downloaded the file,
+`refresh_verified` counts refreshes whose local copy was already the listed
+version, and `refresh_pending` is the number of failed or dropped forced
+refreshes waiting for their path's next arrival.
+
+If the refresh cannot be queued, the line is a warning, and the local copy
+may be the previous version for a while. When the node is shutting down the
+refresh is lost; when the pull queue is full it is retried on the path's next
+arrival or the periodic reconciliation.
+
+Since [#975](https://github.com/Basekick-Labs/arc/issues/975), Arc's DELETE
+rewrites and compaction publish new files under fresh paths, so these shapes
+come only from producers that reuse a path: restores, imports, edge-sync
+after the hub deleted the path, and external Raft writers. Two gaps remain for them:
+
+- A forced refresh that fails, or is dropped, is remembered in memory only. A
+  restart forgets it, and the startup catch-up then accepts the old copy by its
+  size and reports the node caught up. With
+  `cluster.replication_catchup_enabled = false`, nothing retries it at all.
+  [#1182](https://github.com/Basekick-Labs/arc/issues/1182) tracks this.
+- A rewrite a node learns of from a Raft snapshot rather than from the log
+  fires no callback, so the old copy is kept.
+  The snapshot-restore work is tracked in
+  [#1071](https://github.com/Basekick-Labs/arc/issues/1071).
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#907](https://github.com/Basekick-Labs/arc/pull/907), and by
+[@jallegri](https://github.com/jallegri) in
+[#1173](https://github.com/Basekick-Labs/arc/pull/1173) (delete then
+re-register).
 
 ### Compaction reuses local inputs and validates DuckDB paths ([#969](https://github.com/Basekick-Labs/arc/issues/969))
 

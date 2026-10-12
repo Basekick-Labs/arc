@@ -12,6 +12,7 @@ package filereplication
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash"
@@ -113,6 +114,13 @@ type pullRequest struct {
 	// A superseding version must be fetched even if the previous version
 	// already left a file of the same size at this path.
 	force bool
+	// verifyLocal (with force) hashes a local copy of the manifest's size
+	// before downloading, and skips the download when the copy already is
+	// the manifest's version. Set only for the delete worker's refresh of a
+	// relisted path, which cannot tell whether this node already pulled the
+	// new bytes. A verify request never causes a wrong skip: the hash is
+	// compared with the request's own entry, after the superseded check.
+	verifyLocal bool
 }
 
 // requestReplacesCurrent reports whether an incoming callback should replace
@@ -312,11 +320,16 @@ type Puller struct {
 	// deletion clears the marker.
 	refreshPending map[string]struct{}
 	inflightCount  atomic.Int64
+	// refreshPendingCount mirrors len(refreshPending) for Stats, which stays
+	// lock-free; updated in the same critical sections as the map.
+	refreshPendingCount atomic.Int64
 
 	// Metrics (atomic for lock-free observability)
 	totalEnqueued          atomic.Int64
 	totalSkippedSelf       atomic.Int64 // origin is self — no pull needed
 	totalSkippedLocal      atomic.Int64 // file fully present locally
+	totalForcedRefresh     atomic.Int64 // forced requests that bypassed the size check
+	totalRefreshVerified   atomic.Int64 // verify requests whose local copy already matched
 	totalSkippedDup        atomic.Int64 // already enqueued / in-flight
 	totalSkippedSuperseded atomic.Int64 // current manifest is newer than request
 	totalPulled            atomic.Int64 // successful pulls
@@ -577,11 +590,11 @@ func (p *Puller) finishEntry(path string, source enqueueSource, failed, succeede
 	}
 	if failed && stillWanted {
 		if active := p.inflight[path]; active != nil && active.force {
-			p.refreshPending[path] = struct{}{}
+			p.markRefreshPendingLocked(path)
 		}
 	}
 	if succeeded {
-		delete(p.refreshPending, path)
+		p.clearRefreshPendingLocked(path)
 		p.clearCatchUpFailureLocked(path)
 		p.clearCatchUpDropLocked(path)
 	}
@@ -590,6 +603,22 @@ func (p *Puller) finishEntry(path string, source enqueueSource, failed, succeede
 	}
 	p.removeInflightOnlyLocked(path)
 	return nil
+}
+
+// markRefreshPendingLocked and clearRefreshPendingLocked keep
+// refreshPendingCount equal to len(refreshPending). Called with inflightMu.
+func (p *Puller) markRefreshPendingLocked(path string) {
+	if _, ok := p.refreshPending[path]; !ok {
+		p.refreshPending[path] = struct{}{}
+		p.refreshPendingCount.Add(1)
+	}
+}
+
+func (p *Puller) clearRefreshPendingLocked(path string) {
+	if _, ok := p.refreshPending[path]; ok {
+		delete(p.refreshPending, path)
+		p.refreshPendingCount.Add(-1)
+	}
 }
 
 // markQuarantinedForLog records that a path has been reported as permanently
@@ -808,7 +837,7 @@ func (p *Puller) forgetCatchUpPathLocked(path string) (hadFailure, hadDrop, hadT
 	p.clearCatchUpDropLocked(path)
 	p.removeCatchUpTagLocked(path)
 	delete(p.quarantinedPaths, path)
-	delete(p.refreshPending, path)
+	p.clearRefreshPendingLocked(path)
 	delete(p.staleKeptPaths, path)
 	return hadFailure, hadDrop, hadTag
 }
@@ -1034,9 +1063,89 @@ func (p *Puller) Enqueue(entry *raft.FileEntry) {
 	p.enqueue(entry, enqueueSourceReactive, false)
 }
 
-// EnqueueContentChanged submits an FSM-signalled content change.
-func (p *Puller) EnqueueContentChanged(entry *raft.FileEntry) {
-	p.enqueue(entry, enqueueSourceReactive, true)
+// RefreshOutcome is what EnqueueContentChanged did with a forced refresh.
+type RefreshOutcome uint8
+
+const (
+	// RefreshQueued: the refresh is queued, or handed to the path's
+	// in-flight pull, or an equal forced request is already waiting.
+	RefreshQueued RefreshOutcome = iota
+	// RefreshSkippedSelf: this node is the entry's origin, so its copy is
+	// the version the manifest describes.
+	RefreshSkippedSelf
+	// RefreshDropped: the queue was full. The path is remembered in memory
+	// and the next arrival of the path is forced; a restart forgets it
+	// (#1182).
+	RefreshDropped
+	// RefreshStopped: the puller is stopped, so nothing will run the
+	// refresh.
+	RefreshStopped
+	// RefreshInvalid: a nil entry.
+	RefreshInvalid
+)
+
+func (o RefreshOutcome) String() string {
+	switch o {
+	case RefreshQueued:
+		return "queued"
+	case RefreshSkippedSelf:
+		return "skipped_self"
+	case RefreshDropped:
+		return "dropped"
+	case RefreshStopped:
+		return "stopped"
+	case RefreshInvalid:
+		return "invalid"
+	}
+	return fmt.Sprintf("RefreshOutcome(%d)", uint8(o))
+}
+
+// EnqueueContentChanged submits an FSM-signalled content change. The FSM
+// callback ignores the outcome; the delete worker, which keeps a file the
+// manifest lists again, reports it. Safe on the FSM apply goroutine: Stopped
+// takes p.mu, which is never held across a wait.
+func (p *Puller) EnqueueContentChanged(entry *raft.FileEntry) RefreshOutcome {
+	return p.enqueueRefresh(entry, false)
+}
+
+// EnqueueVerifyContent is EnqueueContentChanged for a refresh that may find
+// the new version already on disk: the delete worker keeps a path the
+// manifest lists again, and this node may have pulled the new bytes through
+// the registration in the meantime, or never held the old ones. A local copy
+// of the manifest's size is hashed first and the download is skipped when it
+// matches. Any read error or mismatch downloads as a forced refresh would.
+func (p *Puller) EnqueueVerifyContent(entry *raft.FileEntry) RefreshOutcome {
+	return p.enqueueRefresh(entry, true)
+}
+
+func (p *Puller) enqueueRefresh(entry *raft.FileEntry, verifyLocal bool) RefreshOutcome {
+	result := p.enqueueRequest(entry, enqueueSourceReactive, true, verifyLocal)
+	// Checked after the enqueue, not before: a Stop that lands between a
+	// check and the send would leave the request in a queue no worker reads.
+	// A refresh queued earlier and still waiting when Stop runs is dropped
+	// with the queue and reported as queued; the in-memory retry marker dies
+	// with the process either way (#1182).
+	if p.Stopped() {
+		return RefreshStopped
+	}
+	switch result {
+	case enqueueResultEnqueued, enqueueResultSkippedDuplicate:
+		return RefreshQueued
+	case enqueueResultSkippedSelf:
+		return RefreshSkippedSelf
+	case enqueueResultDropped:
+		return RefreshDropped
+	default:
+		return RefreshInvalid
+	}
+}
+
+// Stopped reports whether Stop has run. A puller that was never started is
+// not stopped: its queue is read once Start runs.
+func (p *Puller) Stopped() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.started && p.ctx.Err() != nil
 }
 
 // statLocal sizes the local copy of a path. The timeout bounds a backend
@@ -1101,6 +1210,10 @@ func presentAtSize(localSize int64, statErr error, want int64) bool {
 }
 
 func (p *Puller) enqueue(entry *raft.FileEntry, source enqueueSource, force bool) enqueueResult {
+	return p.enqueueRequest(entry, source, force, false)
+}
+
+func (p *Puller) enqueueRequest(entry *raft.FileEntry, source enqueueSource, force, verifyLocal bool) enqueueResult {
 	if entry == nil {
 		return enqueueResultInvalid
 	}
@@ -1109,6 +1222,7 @@ func (p *Puller) enqueue(entry *raft.FileEntry, source enqueueSource, force bool
 	if force && !p.cfg.ForceContentRefresh {
 		force = false
 	}
+	verifyLocal = verifyLocal && force
 	// Fast-path: a reactive register of a self-origin file means this node
 	// just wrote it; nothing to pull. The walks reach here for a self-origin
 	// entry only after checking the disk (RepullMissingSelfOrigin), so the
@@ -1122,7 +1236,7 @@ func (p *Puller) enqueue(entry *raft.FileEntry, source enqueueSource, force bool
 	// Snapshot the callback's entry before retaining it: the caller may
 	// subsequently mutate its FileEntry.
 	entryCopy := *entry
-	request := &pullRequest{entry: &entryCopy, source: source, force: force}
+	request := &pullRequest{entry: &entryCopy, source: source, force: force, verifyLocal: verifyLocal}
 
 	p.inflightMu.Lock()
 	if active, exists := p.inflight[entry.Path]; exists {
@@ -1163,7 +1277,7 @@ func (p *Puller) enqueue(entry *raft.FileEntry, source enqueueSource, force bool
 
 	default:
 		if request.force {
-			p.refreshPending[entry.Path] = struct{}{}
+			p.markRefreshPendingLocked(entry.Path)
 		}
 		p.inflightMu.Unlock()
 
@@ -1207,6 +1321,9 @@ func (p *Puller) Stats() map[string]int64 {
 		"enqueued":                           p.totalEnqueued.Load(),
 		"skipped_self":                       p.totalSkippedSelf.Load(),
 		"skipped_local":                      p.totalSkippedLocal.Load(),
+		"forced_refresh":                     p.totalForcedRefresh.Load(),
+		"refresh_verified":                   p.totalRefreshVerified.Load(),
+		"refresh_pending":                    p.refreshPendingCount.Load(),
 		"skipped_dup":                        p.totalSkippedDup.Load(),
 		"skipped_superseded":                 p.totalSkippedSuperseded.Load(),
 		"skipped_gone":                       p.totalSkippedGone.Load(),
@@ -1360,6 +1477,13 @@ func (p *Puller) CatchUpStatus() map[string]int64 {
 		// failed -> catchupFailed, and no retry can fix it until some peer
 		// holds the checksum the manifest names.
 		"checksum_mismatch_exhausted": p.totalChecksumMismatchExhausted.Load(),
+		// Same-size rewrites (#798): forced refreshes that downloaded, ones
+		// whose local copy was already the listed version, and failed or
+		// dropped ones waiting for the path's next arrival. refresh_pending
+		// lives in memory and a restart clears it (#1182).
+		"forced_refresh":   p.totalForcedRefresh.Load(),
+		"refresh_verified": p.totalRefreshVerified.Load(),
+		"refresh_pending":  p.refreshPendingCount.Load(),
 
 		// Catch-up-batch-scoped counters (added in 26.06.1 for the query
 		// gate). Non-zero means the gate is closed for a reason FullyCaughtUp
@@ -1425,6 +1549,8 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 	// the give-up path (after RetryMaxAttempts) and the success path
 	// (pulledFromPeer) respectively. They're never both true.
 	var failed, succeeded bool
+	// verified keeps the local hash to one per request across retry attempts.
+	var verified bool
 
 	// Remove from the inflight set when we're done, whether success or failure.
 	// This keeps the set bounded even if a worker panics — Go's defer runs on
@@ -1495,6 +1621,15 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 				p.totalSkippedLocal.Add(1)
 				succeeded = true // File is already here — same as a fresh pull from the gate's perspective.
 				return
+			} else if request.verifyLocal && !verified {
+				// Once per request, not per attempt: a mismatch stays one.
+				verified = true
+				if p.localCopyMatches(log, entry) {
+					p.totalSkippedLocal.Add(1)
+					p.totalRefreshVerified.Add(1)
+					succeeded = true
+					return
+				}
 			}
 		}
 		if errors.Is(statErr, storage.ErrInvalidPath) {
@@ -1595,6 +1730,9 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 				p.recordPulledFile(entry.Path, entry.SizeBytes)
 				pulledFromPeer = true
 				succeeded = true // Signal to processEntry's defer to clear any prior catch-up failure for this path.
+				if request.force {
+					p.totalForcedRefresh.Add(1)
+				}
 				break
 			}
 			lastErr = err
@@ -1815,6 +1953,40 @@ func (p *Puller) writeFileTail(ctx context.Context, entry *raft.FileEntry, r io.
 		return ab.AppendReader(ctx, entry.Path, r, tailBytes)
 	}
 	return p.cfg.Backend.WriteReader(ctx, entry.Path, r, entry.SizeBytes)
+}
+
+// localCopyMatches hashes the committed local copy of entry.Path and reports
+// whether it is the manifest's version. ReadTo, never ReadToAt: ReadToAt falls
+// back to the staged ".part" file (#1199), which is not the copy a query
+// reads. LocalBackend.ReadTo does not watch the context, so the hasher does:
+// a read past the deadline or a Stop fails, and the caller downloads. The read
+// counts in the storage read-bytes metric like any other local read.
+func (p *Puller) localCopyMatches(log zerolog.Logger, entry *raft.FileEntry) bool {
+	if entry.SHA256 == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(p.ctx, 30*time.Second)
+	defer cancel()
+	h := sha256.New()
+	if err := p.cfg.Backend.ReadTo(ctx, entry.Path, &ctxWriter{ctx: ctx, w: h}); err != nil {
+		log.Debug().Err(err).Str("path", entry.Path).
+			Msg("Could not hash the local copy; downloading the manifest version")
+		return false
+	}
+	return hex.EncodeToString(h.Sum(nil)) == entry.SHA256
+}
+
+// ctxWriter fails a write once ctx is done, so a copy into it stops early.
+type ctxWriter struct {
+	ctx context.Context
+	w   io.Writer
+}
+
+func (c *ctxWriter) Write(b []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.w.Write(b)
 }
 
 // tryResumeFromPartial checks whether a partial file exists on disk for entry
