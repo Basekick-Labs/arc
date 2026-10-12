@@ -186,9 +186,10 @@ type Metrics struct {
 	fileRegistrationJournalErrs   atomic.Int64 // registration journal write or fsync failures
 
 	// Ingest fencing (#1207)
-	ingestFenced        atomic.Int64 // 1 while this writer refuses writes
-	ingestFencedWrites  atomic.Int64 // writes refused by the fence
-	walQuarantinedFiles atomic.Int64 // WAL files isolated after repeated recovery failures
+	ingestFenced          atomic.Int64 // 1 while this writer refuses writes
+	ingestFencedWrites    atomic.Int64 // writes refused by the fence
+	walQuarantinedFiles   atomic.Int64 // WAL files isolated after repeated recovery failures
+	walQuarantineReleased atomic.Int64 // pending WAL entries released because their file was quarantined (#1225)
 	// 1 while the last recovery pass left a file on disk for which at least one
 	// row range of a parent entry was handed off — the state an older binary
 	// would replay in full.
@@ -656,6 +657,10 @@ func (m *Metrics) fileRegistrationOldestPendingSeconds() float64 {
 }
 func (m *Metrics) IncWALQuarantinedFiles() { m.walQuarantinedFiles.Add(1) }
 
+// AddWALQuarantineReleased counts pending WAL entries the writer stopped
+// waiting for because recovery quarantined their file (#1225).
+func (m *Metrics) AddWALQuarantineReleased(n int64) { m.walQuarantineReleased.Add(n) }
+
 // SetWALPartialRowRecoveryPending records whether the last WAL recovery pass
 // retained a file whose parent entry had row ranges replayed. It makes the
 // operations
@@ -926,6 +931,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"ingest_fenced":                    m.ingestFenced.Load(),
 		"ingest_fenced_writes":             m.ingestFencedWrites.Load(),
 		"wal_quarantined_files":            m.walQuarantinedFiles.Load(),
+		"wal_quarantine_released_entries":  m.walQuarantineReleased.Load(),
 		"wal_partial_row_recovery_pending": m.walPartialRowRecovery.Load(),
 
 		// Decompression Pool
@@ -1411,6 +1417,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_quarantined_files_total WAL files isolated after repeated recovery failures\n"...)
 	b = append(b, "# TYPE arc_wal_quarantined_files_total counter\n"...)
 	b = appendMetric(b, "arc_wal_quarantined_files_total", float64(m.walQuarantinedFiles.Load()))
+
+	b = append(b, "# HELP arc_wal_quarantine_released_entries_total Pending WAL entries the writer stopped waiting for because their file was quarantined\n"...)
+	b = append(b, "# TYPE arc_wal_quarantine_released_entries_total counter\n"...)
+	b = appendMetric(b, "arc_wal_quarantine_released_entries_total", float64(m.walQuarantineReleased.Load()))
 
 	b = append(b, "# HELP arc_wal_partial_row_recovery_pending 1 when the last WAL recovery pass left a retained file whose parent entry had row ranges replayed\n"...)
 	b = append(b, "# TYPE arc_wal_partial_row_recovery_pending gauge\n"...)

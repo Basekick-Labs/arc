@@ -137,7 +137,7 @@ func TestReplayFailureFallsBackWhenSidecarCannotBeWritten(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a sidecar that cannot be written must not abort the pass: %v", err)
 	}
-	if !quarantined {
+	if quarantined == "" {
 		t.Fatal("the file was neither quarantined nor counted; the poison file stays and every later file is never reached")
 	}
 	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
@@ -164,7 +164,7 @@ func TestUnwritableSidecarStillAccumulatesInMemory(t *testing.T) {
 		if err != nil {
 			t.Fatalf("pass %d: %v", pass, err)
 		}
-		if quarantined {
+		if quarantined != "" {
 			t.Fatalf("pass %d quarantined before reaching maxAttempts 3", pass)
 		}
 	}
@@ -172,7 +172,7 @@ func TestUnwritableSidecarStillAccumulatesInMemory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("third pass: %v", err)
 	}
-	if !quarantined {
+	if quarantined == "" {
 		t.Fatal("three failed passes did not quarantine; the in-memory fallback is not accumulating, so a full volume retries for ever")
 	}
 }

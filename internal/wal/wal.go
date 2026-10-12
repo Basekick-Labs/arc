@@ -1551,6 +1551,59 @@ func (w *Writer) forgetFileLocked(path string) {
 	}
 }
 
+// Quarantined tells the writer that recovery moved path to quarantinedAs
+// after repeated replay failures (#1225). If this process wrote it, entries in
+// it may still be waiting for a flush: recovery can no longer replay them
+// from it, so keeping them pending would hold the purge floor at this file for
+// the life of the process, and no WAL file would be reclaimed again (#676).
+// Their sequences are released. Returns how many were.
+//
+// Every pending entry of the file is released, including any this pass
+// replayed into a buffer: if that flush fails too, nothing can replay it
+// again. Nothing else owns them: only the periodic recovery pass quarantines
+// a file this process wrote, after a rotation and a flush of every buffer.
+//
+// The sequences come from the quarantined file itself. An entry whose bytes
+// are damaged has no readable identity; its sequence stays pending until a
+// restart.
+func (w *Writer) Quarantined(path, quarantinedAs string) int {
+	w.mu.Lock()
+	_, own := w.created[path]
+	w.forgetFileLocked(path)
+	w.mu.Unlock()
+	if !own {
+		return 0
+	}
+	reader := NewReader(quarantinedAs, w.logger)
+	ids, err := reader.ReadTrackedIdentities()
+	if err != nil {
+		w.logger.Warn().Err(err).Str("file", filepath.Base(quarantinedAs)).
+			Msg("Could not read a quarantined WAL file; its pending entries hold the WAL purge until a restart")
+	}
+	released := 0
+	w.pendingMu.Lock()
+	for _, id := range ids {
+		if seq, ok := w.trackedTokenSeq(id); ok {
+			if _, pending := w.pendingSeqs[seq]; pending {
+				delete(w.pendingSeqs, seq)
+				released++
+			}
+		}
+	}
+	w.pendingMu.Unlock()
+	if released > 0 {
+		metrics.Get().AddWALQuarantineReleased(int64(released))
+		// Warn, not Error: recovery already logged the failure at Error.
+		w.logger.Warn().Str("file", filepath.Base(quarantinedAs)).Int("entries", released).
+			Msg("Released the pending WAL entries of a quarantined WAL file so the WAL purge can continue. Keep the quarantined file: it holds those entries. Do not rename it back to .wal: the flush proof for its other entries may be gone, and they would be written again")
+	}
+	if reader.CorruptedEntries > 0 {
+		w.logger.Warn().Str("file", filepath.Base(quarantinedAs)).Int64("damaged", reader.CorruptedEntries).
+			Msg("Quarantined WAL file has damaged entries; any of them still pending holds the WAL purge until a restart")
+	}
+	return released
+}
+
 // trackedTokenSeq recovers the sequence from an identity token minted by this
 // process. Tokens are "%016x%016x" of the writer instance and the sequence
 // (appendTrackedEntry), so a foreign token — one inherited from a replayed

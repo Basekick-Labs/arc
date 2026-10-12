@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
 
@@ -33,6 +34,10 @@ type RecoveryStats struct {
 	RecoveredFiles   int
 	RecoveredBatches int
 	RecoveredEntries int
+	// CorruptedEntries counts entries this pass could not replay: damaged
+	// ones, ones whose replay failed, and intact ones that cannot be decoded
+	// and were not flushed. An undecodable entry already flushed is skipped
+	// like any other flushed entry, and not counted.
 	CorruptedEntries int
 	SkippedFiles     int
 	KeptFiles        int
@@ -134,6 +139,10 @@ type RecoveryOptions struct {
 	// each barrier, so the batches this pass just replayed are in it. Nil
 	// holds nothing.
 	Held func() CoverageHold
+
+	// OnQuarantine is called after a WAL file is moved to quarantinedAs, so
+	// the writer can stop waiting for the entries in it (#1225).
+	OnQuarantine func(path, quarantinedAs string)
 }
 
 // Recovery manages WAL recovery operations
@@ -347,20 +356,31 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 			recoveryErr = err
 			return false
 		}
-		quarantined, quarantineErr := r.noteReplayFailure(path, maxReplayFailures)
+		quarantinedAs, quarantineErr := r.noteReplayFailure(path, maxReplayFailures)
+		if quarantinedAs != "" {
+			// Renamed, even if the directory sync after it failed: the file
+			// is out of the WAL directory either way.
+			if quarantineErr != nil {
+				r.logger.Warn().Err(quarantineErr).Str("file", filepath.Base(path)).
+					Msg("Quarantined WAL file, but the WAL directory could not be synced after the rename")
+			}
+			stats.QuarantinedFiles++
+			metrics.Get().IncWALQuarantinedFiles()
+			r.logger.Error().Err(cause).
+				Str("file", filepath.Base(path)).
+				Str("quarantined_as", filepath.Base(quarantinedAs)).
+				Int("attempts", maxReplayFailures).
+				Msg("Quarantined WAL file after repeated recovery failures")
+			if opts.OnQuarantine != nil {
+				opts.OnQuarantine(path, quarantinedAs)
+			}
+			return true
+		}
 		if quarantineErr != nil {
 			stats.KeptFiles++
 			recoveryErr = fmt.Errorf("persist WAL replay failure for %q: %w", path, quarantineErr)
 			r.logger.Error().Err(quarantineErr).Str("file", path).Msg("Failed to quarantine repeatedly failing WAL file")
 			return false
-		}
-		if quarantined {
-			stats.QuarantinedFiles++
-			r.logger.Error().Err(cause).
-				Str("file", filepath.Base(path)).
-				Int("attempts", maxReplayFailures).
-				Msg("Quarantined WAL file after repeated recovery failures")
-			return true
 		}
 		stats.KeptFiles++
 		return false
@@ -461,6 +481,15 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 			}
 			if _, ok := flushed[entry.PayloadHash]; ok {
 				r.logger.Debug().Str("payload_hash", entry.PayloadHash).Msg("Skipping WAL entry covered by flush checkpoint")
+				continue
+			}
+			// After the checkpoint skip: an entry already in storage needs no
+			// decoding, and must not fail its file (#1225).
+			if entry.DecodeErr != nil {
+				r.logger.Error().Err(entry.DecodeErr).Str("file", filepath.Base(walFile)).Str("payload_hash", entry.PayloadHash).
+					Msg("WAL entry cannot be decoded and was not flushed; keeping the file for the replay-failure count")
+				allEntriesSucceeded = false
+				stats.CorruptedEntries++
 				continue
 			}
 			// A covered entry (#1207) carries its batch coverage to the buffer
@@ -705,12 +734,18 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 // moves it out of the recovery glob after the configured threshold. The
 // quarantined file remains on disk for operator inspection; it is never
 // discarded as part of recovery.
-func (r *Recovery) noteReplayFailure(path string, maxAttempts int) (bool, error) {
+// It returns the quarantine path once the file was renamed, even when the
+// directory sync after the rename failed.
+//
+// The attempt sidecar is removed only after a durable rename: if the rename
+// is lost in a crash, the file comes back with its strikes and is
+// quarantined again on the next pass.
+func (r *Recovery) noteReplayFailure(path string, maxAttempts int) (string, error) {
 	r.failuresMu.Lock()
 	defer r.failuresMu.Unlock()
 	attempts, err := readReplayAttempts(path)
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	if attempts < maxAttempts {
 		attempts++
@@ -741,7 +776,7 @@ func (r *Recovery) noteReplayFailure(path string, maxAttempts int) (bool, error)
 			Msg("Could not persist the WAL replay-failure count; counting this pass in memory only, so quarantine may need more passes after a restart")
 	}
 	if attempts < maxAttempts {
-		return false, nil
+		return "", nil
 	}
 
 	quarantinePath := path + ".failed"
@@ -749,15 +784,19 @@ func (r *Recovery) noteReplayFailure(path string, maxAttempts int) (bool, error)
 		quarantinePath = fmt.Sprintf("%s.%d.failed", path, time.Now().UnixNano())
 	}
 	if err := os.Rename(path, quarantinePath); err != nil {
-		return false, err
+		return "", err
 	}
-	if err := syncRecoveryDirectory(filepath.Dir(path)); err != nil {
-		return false, err
+	if err := syncQuarantineDirFn(filepath.Dir(path)); err != nil {
+		return quarantinePath, err
 	}
 	r.removeReplayAttempts(path)
 	delete(r.localFailures, path)
-	return true, nil
+	return quarantinePath, nil
 }
+
+// syncQuarantineDirFn syncs the WAL directory after a quarantine rename. A
+// variable so tests can make it fail.
+var syncQuarantineDirFn = syncRecoveryDirectory
 
 func (r *Recovery) clearReplayFailure(path string) {
 	r.failuresMu.Lock()

@@ -251,3 +251,15 @@ func TestReplicationRejectedMeasurementKeepsEarlierOwner(t *testing.T) {
 	require.NoError(t, buffer.NewRecoveryFlushBarrier()(context.Background()))
 	require.Zero(t, w.PendingUnflushedCount(), "only the accepted buffer owns a pending identity")
 }
+
+// #1225: an integer measurement is accepted by ingest as "measurement_<n>";
+// the follower used to drop such an entry (Debug log) while counting it
+// applied.
+func TestReplicationAppliesIntegerMeasurement(t *testing.T) {
+	sender, receiver, w, _ := replicationOwnershipFixture(t, true)
+	sendOwnershipPayload(t, sender, receiver, map[string]interface{}{
+		"m":       7,
+		"columns": map[string]interface{}{"time": []interface{}{int64(1700000000000000)}, "value": []interface{}{int64(1)}},
+	})
+	require.Equal(t, 1, w.PendingUnflushedCount(), "the entry was not applied to the buffer")
+}

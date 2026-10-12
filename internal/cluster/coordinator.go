@@ -5029,7 +5029,7 @@ func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler 
 		// Try columnar format first (map with "m" + "columns" keys)
 		var rawMap map[string]interface{}
 		if err := msgpack.Unmarshal(msgpackData, &rawMap); err == nil {
-			if measurement, ok := rawMap["m"].(string); ok && measurement != "" {
+			if measurement, ok := wal.MeasurementName(rawMap["m"]); ok && measurement != "" {
 				if columns, ok := rawMap["columns"].(map[string]interface{}); ok && len(columns) > 0 {
 					typedColumns := make(map[string][]interface{}, len(columns))
 					for k, v := range columns {
@@ -5088,7 +5088,7 @@ func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler 
 			return parts, nil
 		}
 
-		c.logger.Debug().Int("payload_size", len(payload)).Msg("Skipped unrecognized replicated entry format")
+		c.logger.Warn().Int("payload_size", len(payload)).Msg("Skipped unrecognized replicated entry format; its rows are not applied on this node")
 		return nil, nil
 	})
 }
