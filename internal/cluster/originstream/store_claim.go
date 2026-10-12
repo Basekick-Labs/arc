@@ -129,13 +129,7 @@ func (s *Store) Received(origin string, instance uint64) map[string][][2]uint64 
 	}
 	out := map[string][][2]uint64{}
 	for key, k := range d.keys {
-		var have intervalSet
-		for _, seg := range d.segs {
-			for _, iv := range seg.cseqs[key] {
-				have = have.withRange(iv[0], iv[1])
-			}
-		}
-		have = have.clip(1, k.last).minus(k.gaps)
+		have := d.wholeLocked(key, k)
 		if d.floors != nil {
 			if kf, ok := d.floors.Keys[key]; ok {
 				have = have.minus(kf.registered())
@@ -146,6 +140,54 @@ func (s *Store) Received(origin string, instance uint64) map[string][][2]uint64 
 		}
 	}
 	return out
+}
+
+// Held returns, per key, the batches of an instance stored here received
+// whole, whatever the origin's floors say: a claimant asks the manifest what
+// of them is registered (#1207). Received is Held minus the floors.
+func (s *Store) Held(origin string, instance uint64) map[string][][2]uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d := s.instances[instanceID{origin, instance}]
+	if d == nil {
+		return nil
+	}
+	out := map[string][][2]uint64{}
+	for key, k := range d.keys {
+		if have := d.wholeLocked(key, k); len(have) > 0 {
+			out[key] = have
+		}
+	}
+	return out
+}
+
+// Registered returns, per key, the batches of an instance its origin's
+// floors (as last received) say are in a registered file in every hour.
+func (s *Store) Registered(origin string, instance uint64) map[string][][2]uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d := s.instances[instanceID{origin, instance}]
+	if d == nil || d.floors == nil {
+		return nil
+	}
+	out := map[string][][2]uint64{}
+	for key, kf := range d.floors.Keys {
+		if r := kf.registered(); len(r) > 0 {
+			out[key] = r
+		}
+	}
+	return out
+}
+
+// wholeLocked is the batches of key stored and received whole.
+func (d *instanceDir) wholeLocked(key string, k *keyState) intervalSet {
+	var have intervalSet
+	for _, seg := range d.segs {
+		for _, iv := range seg.cseqs[key] {
+			have = have.withRange(iv[0], iv[1])
+		}
+	}
+	return have.clip(1, k.last).minus(k.gaps)
 }
 
 // Record is one stored record.

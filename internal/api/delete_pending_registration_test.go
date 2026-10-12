@@ -9,15 +9,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/cluster/raft"
+	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
 
@@ -173,5 +178,41 @@ func TestDeleteRewriteRemovesTheRewriteWhenTheSwapFails(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, oldPath)); err != nil {
 		t.Fatalf("the original was removed although it stays authoritative: %v", err)
+	}
+}
+
+// busyRewriteCoordinator is a primary whose stream takeover is publishing
+// rows of db/cpu (#1207).
+type busyRewriteCoordinator struct{ rewriteManifestCoordinator }
+
+func (busyRewriteCoordinator) StreamTakeoverBusy(db, measurement string) bool {
+	return db == "db" && measurement == "cpu"
+}
+
+func TestRowDeleteWaitsForAStreamTakeover(t *testing.T) {
+	h := &DeleteHandler{config: &config.DeleteConfig{Enabled: true}, coordinator: &busyRewriteCoordinator{}, logger: zerolog.Nop()}
+	app := fiber.New()
+	h.RegisterRoutes(app)
+	send := func(body string) *http.Response {
+		req := httptest.NewRequest("POST", "/api/v1/delete", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := app.Test(req, 5000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+	resp := send(`{"database":"db","measurement":"cpu","where":"time > 0"}`)
+	if resp.StatusCode != fiber.StatusServiceUnavailable || resp.Header.Get("Retry-After") != "30" {
+		t.Fatalf("busy key: %d %q", resp.StatusCode, resp.Header.Get("Retry-After"))
+	}
+	// Past the gate, these stop at the next check (confirmation): 400.
+	resp = send(`{"database":"db","measurement":"mem","where":"time > 0"}`)
+	if resp.StatusCode != fiber.StatusBadRequest {
+		t.Fatalf("a delete of another measurement: %d", resp.StatusCode)
+	}
+	resp = send(`{"database":"db","measurement":"cpu","where":"","dry_run":true}`)
+	if resp.StatusCode != fiber.StatusBadRequest {
+		t.Fatalf("a dry run: %d", resp.StatusCode)
 	}
 }

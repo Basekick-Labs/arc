@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -48,6 +49,10 @@ type TakeoverOrigin struct {
 	// SentCovered reports whether this instance already sent a covered
 	// registration: if so its announcement is not a fresh start.
 	SentCovered func() bool
+	// OnClaimed runs once when another writer claims this process's
+	// instance: the process must exit and restart (a new instance). Writes
+	// are already refused when it runs.
+	OnClaimed func()
 }
 
 const (
@@ -65,6 +70,7 @@ type takeoverOriginState struct {
 	prev       raft.Continuity // markers read before this process overwrote them
 	knownOn    atomic.Bool     // this node has seen the flag applied (now or before)
 	announced  atomic.Bool
+	settleMu   sync.Mutex // settleCoverage: the origin loop and the final report
 	lastFloors map[string]uint64
 	retryAt    map[uint64]time.Time // InstanceSettled backoff per instance
 	retryWait  map[uint64]time.Duration
@@ -99,12 +105,33 @@ func (c *Coordinator) takeoverGateClosed() bool {
 	return st != nil && st.knownOn.Load() && !st.announced.Load()
 }
 
+// takeoverDesignationRefuses reports whether another writer is the
+// designated primary while stream takeover is on here (#1207): a write
+// acknowledged by a standby could be claimed by nobody. Read synchronously
+// from the manifest, unlike the ingest fence, which evaluates on a ticker.
+func (c *Coordinator) takeoverDesignationRefuses() bool {
+	st := c.takeoverOrigin.Load()
+	if st == nil || !st.knownOn.Load() || c.raftNode == nil {
+		return false
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return false
+	}
+	d := fsm.PrimaryWriterIDFast()
+	return d != "" && d != c.localNode.ID
+}
+
 // TakeoverSendGate is the registration outbox's send gate.
 func (c *Coordinator) TakeoverSendGate() func() bool {
 	return func() bool { return !c.takeoverGateClosed() }
 }
 
-var errTakeoverAnnouncing = errors.New("ingest paused: announcing this writer instance to the cluster (stream takeover); retry shortly")
+var (
+	errTakeoverAnnouncing = errors.New("ingest paused: announcing this writer instance to the cluster (stream takeover); retry shortly")
+	errTakeoverClaimed    = errors.New("ingest refused: another writer took over this writer process (stream takeover); it is restarting, write to the primary writer")
+	errNotDesignated      = errors.New("ingest refused: this node is not the designated primary writer; write to the primary writer")
+)
 
 // readInstanceMarker returns the instance a marker names, 0 when it is
 // missing or unreadable (which fails safe: no continuity).
@@ -217,6 +244,9 @@ func (c *Coordinator) takeoverOriginPass(ctx context.Context, st *takeoverOrigin
 		c.ingestPauseChanged()
 		c.logger.Info().Str("instance", fmt.Sprintf("%016x", st.cfg.Instance)).Msg("Writer instance announced to the cluster (stream takeover)")
 	}
+	if c.checkInstanceClaimed(st) {
+		return
+	}
 	if time.Since(*lastSettle) >= takeoverSettleEvery {
 		*lastSettle = time.Now()
 		if err := c.settleCoverage(ctx, st); err != nil {
@@ -226,6 +256,72 @@ func (c *Coordinator) takeoverOriginPass(ctx context.Context, st *takeoverOrigin
 	if time.Since(*lastSettled) >= takeoverSettledEvery {
 		*lastSettled = time.Now()
 		c.settleInstances(ctx, st)
+	}
+}
+
+// checkInstanceClaimed reports whether another writer claimed this
+// process's instance (#1207 E1): its batches are being published by the
+// claimant, so nothing more of this instance may be acknowledged. Writes are
+// refused at once and the process exits for a restart, which starts a new,
+// unclaimed instance. Only this process's instance counts: an earlier one it
+// adopted may be claimed (its own copies then park) without stopping it.
+func (c *Coordinator) checkInstanceClaimed(st *takeoverOriginState) bool {
+	if c.claimedExit.Load() {
+		return true
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return false
+	}
+	state, ok := fsm.TakeoverInstanceStates()[st.cfg.Instance]
+	if !ok || !state.Claimed || state.ClaimRelease {
+		return false
+	}
+	var claim raft.StreamClaim
+	for _, cl := range fsm.StreamClaims() {
+		if cl.Instance == st.cfg.Instance {
+			claim = cl
+		}
+	}
+	if claim.Released || claim.By == "" || claim.By == c.localNode.ID {
+		return false
+	}
+	if !c.claimedExit.CompareAndSwap(false, true) {
+		return true
+	}
+	c.ingestPauseChanged()
+	c.logger.Error().Str("instance", fmt.Sprintf("%016x", st.cfg.Instance)).Str("claimant", claim.By).Uint64("epoch", claim.Epoch).
+		Msg("Another writer took over the batches of this writer process (stream takeover): writes are refused and the process exits for a restart")
+	if st.cfg.OnClaimed != nil {
+		go st.cfg.OnClaimed()
+	}
+	return true
+}
+
+// finalTakeoverReport runs before a graceful leave, after the final flush
+// and the registrar drain (#1207): the cluster and the standbys learn every
+// batch this writer registered, so a takeover of what it leaves behind
+// claims only what is really unregistered.
+func (c *Coordinator) finalTakeoverReport() {
+	st := c.takeoverOrigin.Load()
+	if st == nil || !st.announced.Load() || c.claimedExit.Load() {
+		return
+	}
+	if fsm := c.raftNode.FSM(); fsm == nil || !fsm.StreamClaimsEnabled() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.settleCoverage(ctx, st); err != nil {
+		c.logger.Warn().Err(err).Msg("Final report of settled batches failed; a takeover may claim batches this writer registered (the index refuses their duplicates)")
+	}
+	c.mu.RLock()
+	ost := c.originStream
+	c.mu.RUnlock()
+	if ost != nil {
+		if err := ost.server.FlushFloors(ctx); err != nil {
+			c.logger.Warn().Err(err).Msg("Final registration progress not sent to every standby writer")
+		}
 	}
 }
 
@@ -300,6 +396,8 @@ func (c *Coordinator) settleCoverage(ctx context.Context, st *takeoverOriginStat
 	if st.cfg.Progress == nil {
 		return nil
 	}
+	st.settleMu.Lock()
+	defer st.settleMu.Unlock()
 	if st.lastFloors == nil {
 		st.lastFloors = map[string]uint64{}
 	}
@@ -396,7 +494,7 @@ func (c *Coordinator) ingestPauseChanged() {
 	go func() {
 		c.pauseNotifyMu.Lock()
 		defer c.pauseNotifyMu.Unlock()
-		paused := c.ingestFenced() || c.takeoverGateClosed()
+		paused := c.ingestFenced() || c.takeoverGateClosed() || c.claimedExit.Load()
 		if c.pauseNotified && c.pauseState == paused {
 			return
 		}

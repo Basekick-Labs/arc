@@ -274,9 +274,9 @@ New metrics:
 also streams every committed batch to the standby writers. Each standby keeps
 it on disk under `<wal.directory>/received/`, and never applies it. It discards
 a batch once the batch is in a registered file and the standby holds every
-current file of that measurement locally. This is the copy a later release will
-use to let a standby take over the acknowledged rows of a primary that died
-before flushing them. Nothing reads it yet. Details:
+current file of that measurement locally. This is the copy stream takeover
+(below) publishes the acknowledged rows of a primary that died before
+flushing them from. Details:
 - Standby writers connect to the primary on the cluster port
   (`cluster.coordinator_addr`). This needs `cluster.shared_secret`, and
   `cluster.tls_enabled` if the network is untrusted: batches are authenticated
@@ -308,8 +308,8 @@ All writers in the cluster must run this release before the setting is turned
 on: a writer from an older release does not understand the standby connection
 and logs it as an unknown message type.
 
-**Groundwork for takeover (inert).** Nothing here changes behaviour in this
-release:
+**Stream takeover building blocks.** Nothing here changes behaviour unless
+every node sets `cluster.stream_takeover` (see "Stream takeover" below):
 - A new setting, `cluster.stream_takeover` (default off), opts a node into
   stream takeover. Takeover lets a standby writer publish the rows a failed
   primary acknowledged but never registered, exactly once. It needs every node
@@ -325,13 +325,13 @@ release:
 - The cluster manifest has the rules that will refuse a second copy of a
   batch, and the origin's copy of batches a standby took over.
 
-- A refused registration will be parked rather than left in place: the file
+- A refused registration is parked rather than left in place: the file
   moves out of every query path to `<storage>/_refused/`, its WAL entries stay
   held, and it is deleted only once each of its rows is in a registered file
   this node holds. A DELETE that touches a parked file is refused (retry later).
   Records live in `refused-registrations.jsonl` next to the registration
   journal. Metrics: `arc_wal_parked_files`, `arc_wal_parked_bytes`.
-- Writers with the setting on will announce each process to the cluster before
+- Writers with the setting on announce each process to the cluster before
   accepting writes, once takeover is on: until the announcement applies, writes
   get a retryable 503. Each writer records its last process in
   `instance.last` files in the WAL directory, the Raft data directory and
@@ -347,30 +347,93 @@ release:
   new batches are not kept and an error is logged; the new gauge
   `arc_standby_store_pinned_bytes` shows how much the store keeps that it would
   otherwise have evicted.
-- The parts a standby will use to publish the batches it takes over are in
-  place, unused: reading the standby store back, writing those batches to
-  Parquet without touching the WAL or the live buffers, a claim that grows in
-  steps, a claimant releasing its own claim, and a refusal for a claimant file
-  the settled index has no room for (the index keeps tracking the writer
-  process instead of giving up on it).
+- A standby publishes the batches it takes over straight to Parquet, without
+  touching the WAL or the live buffers; a claim grows in steps; a claimant
+  releases its own claim when its copy is gone; and a claimant file the
+  settled index has no room for is refused (the index keeps tracking the
+  writer process instead of giving up on it).
 - A writer that leaves the cluster gracefully (a restart, a rolling upgrade)
   keeps its takeover state while it is gone: when it comes back it picks up its
   own unflushed batches first, instead of having them taken over. Only an
   operator node removal gives them up, or the departure expiring after
   `cluster.stream_takeover_departed_ttl` (default `24h`). Departed writers are
   listed by the new admin endpoint `GET /api/v1/cluster/stream-claims` and
-  counted by `arc_stream_takeover_departed_writers`. The capability nodes
-  advertise is now `stream_claims_v4`.
+  counted by `arc_stream_takeover_departed_writers`.
 - New setting `cluster.stream_takeover_grace` (default `60s`, at least `10s`):
   how long a primary that stopped answering may take to come back before the
-  new primary takes over its batches. Not used yet.
+  new primary takes over its batches.
 - A file that vanished before any node pulled it now gives its rows back for a
   takeover, in its partition hour only; the rest of the writer process stays
   settled.
 - Failover never promotes a writer whose current process another writer has
   claimed.
 
-Nothing turns takeover on in this release.
+**Stream takeover (live, opt-in).** With `cluster.stream_takeover = true` on
+every node (writers also need `cluster.wal_coverage = true` and an explicit
+`cluster.node_id`), the cluster turns takeover on by itself once every node
+advertises support (`stream_claims_v5`; builds that advertised `v1` to `v4`
+block it). From then on:
+- **A dead primary's acknowledged rows are published by the new primary.**
+  When the primary stops answering and failover designates another writer,
+  that writer waits `cluster.stream_takeover_grace`, then claims every batch
+  of the old primary it holds in its standby copy that is not in a registered
+  file, replays them to Parquet, and registers them. The cluster manifest
+  refuses any row registered twice, so a batch the old primary registered
+  before it died, in whole or in part, is published once.
+- **A writer whose process was claimed exits with code 3.** If the old
+  primary was only cut off and comes back, it refuses writes (503) the moment
+  it sees the claim, flushes, and exits with status 3 so the restart policy
+  starts it again; its next process is not claimed. Run writers under a
+  restart policy that restarts on a non-zero exit (systemd
+  `Restart=on-failure`, Kubernetes, Docker `restart: on-failure` or
+  `unless-stopped`). Its copies of the claimed batches are parked, not
+  registered. A writer that is the Raft leader steps down as it exits.
+- **A primary that restarts within the grace keeps its own batches.** A
+  restart, crash or rolling upgrade that brings the writer back with its
+  volumes before the grace ends takes nothing over: the writer announces the
+  earlier process and publishes it itself. A graceful shutdown first reports
+  everything it registered, so a takeover after it claims only what is really
+  unregistered.
+- **Standby writers refuse writes** (503, retryable) while another writer is
+  the designated primary, checked on every write.
+- **Copies a standby holds that the new primary lacked are published too.**
+  Once a claim finishes, any other writer that holds batches of the old
+  process the claim did not publish claims those (each writer once per
+  process), as long as the old primary has not come back with a new process
+  and is not the designated primary. A process its writer gave up (it
+  restarted without it) is published by any writer holding it, at once.
+- **DELETEs wait for a takeover.** `POST /api/v1/delete` and
+  `DELETE /api/v1/databases/{name}` answer 503 with `Retry-After: 30` while a
+  claim of that measurement is unfinished, while the primary holds batches
+  of a gone writer it may claim, or, after a claim finished, until every
+  writer the primary hears from has claimed what it holds or reported
+  holding nothing (at most twice the grace plus 20 seconds): a DELETE
+  applied first would be undone by the replay of rows acknowledged before
+  it.
+- **Operator controls** (admin):
+  `GET /api/v1/cluster/stream-claims` lists processes and claims;
+  `POST /api/v1/cluster/stream-claims/{instance}/release` with
+  `{"epoch": n}` releases an unfinished claim (any writer may claim it again,
+  the same one included), and with `{"epoch": n, "abandon": true}` finishes
+  it, irreversibly: batches it has not published are left to their origin,
+  which loses them when the origin is gone, and the claimant drops its copy
+  (every batch the claim held is reported unreplayable). Leader only (409 elsewhere). The leader also
+  releases an unfinished claim by itself when its claimant has been gone for
+  the grace.
+- New gauge `arc_stream_takeover_oldest_claim_age_seconds`: how long the
+  oldest unfinished claim has been open. A claim whose replay keeps failing
+  (a full disk, for example) is never given up on by itself, and DELETEs of
+  its measurements wait: alert on this gauge.
+- A file naming a writer process the cluster already accounted for and
+  removed is refused and parked (a writer coming back after its departure
+  expired, with an old volume), so it cannot duplicate rows a takeover
+  published.
+
+What takeover does not cover: rows a primary acknowledged but had not
+streamed to any standby yet when its volume was lost (the replication lag,
+usually milliseconds); and rows of a file that mixes claimed batches with
+batches nobody else holds, which stay parked until a later release
+re-publishes them.
 
 **Rollback warning.** WAL entries written with the setting on use a new format.
 This release reads it, but older releases cannot: they quarantine those entries

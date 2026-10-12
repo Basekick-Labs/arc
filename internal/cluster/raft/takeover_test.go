@@ -498,7 +498,12 @@ func TestClaimDoneDropsUnreplayableAndCollectsClosedInstances(t *testing.T) {
 	x.refused(CommandClaimDone, ClaimDonePayload{Instance: 7, By: "w1", Epoch: epoch})
 	x.refused(CommandClaimDone, ClaimDonePayload{Instance: 7, By: "w3", Epoch: epoch + 1})
 	x.ok(CommandClaimDone, ClaimDonePayload{Instance: 7, By: "w3", Epoch: epoch, Unreplayable: map[string]Intervals{"db/cpu": {{4, 4}}}})
-	// Orphaned and done: nothing will ever register it again.
+	// Orphaned and done: nothing will ever register it again, once w1 (the
+	// other writer) said it holds nothing more of it.
+	if x.inst(7) == nil {
+		t.Fatal("orphaned instance removed before every writer answered")
+	}
+	x.ok(CommandTakeOverStreamV2, TakeOverStreamV2Payload{Origin: "w2", By: "w1", Now: t0, Claims: []ClaimSet{{Instance: 7}}})
 	if x.inst(7) != nil || x.f.StreamClaimCount() != 0 {
 		t.Fatalf("orphaned instance kept after its claim finished: %+v", x.inst(7))
 	}
@@ -633,6 +638,13 @@ func TestTakeoverIsDeterministic(t *testing.T) {
 		x.ok(CommandDeleteFile, DeleteFilePayload{Path: "d", Reason: DeleteReasonVanished})
 		x.ok(CommandRemoveNode, RemoveNodePayload{NodeID: "w3", Reason: RemoveReasonLeave, At: t0})
 		x.ok(CommandRemoveNode, RemoveNodePayload{NodeID: "r1", Reason: RemoveReasonLeave, At: t0})
+		// #1207 S4b1c2a2: abandon, follow-up claims, tombstones.
+		x.announce("w1", 20, Continuity{})
+		x.announce("w1", 21, Continuity{}) // 20 orphaned
+		e := x.claim("w2", "w1", 20, "db/cpu", 1, 3)
+		x.ok(CommandClaimDone, ClaimDonePayload{Instance: 20, Epoch: e, Abandon: true})
+		x.ok(CommandSettleCoverage, SettleCoveragePayload{Origin: "w1", Instance: 21, Keys: map[string]KeySettlement{"db/cpu": {Floor: 1}}})
+		x.f.removeInstanceLocked(21) // a tombstone (as the report sweep would)
 		snaps = append(snaps, persist(t, x.f))
 	}
 	for i := 1; i < len(snaps); i++ {

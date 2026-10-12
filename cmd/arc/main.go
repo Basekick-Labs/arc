@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -2151,6 +2152,12 @@ func main() {
 							},
 							Progress:    arrowBuffer.AccountedProgress,
 							SentCovered: func() bool { return registrationOutbox.CoveredSent() > 0 },
+							// Another writer took this process's batches over: exit
+							// non-zero so the restart policy starts a new instance.
+							OnClaimed: func() {
+								exitCode.Store(exitCodeInstanceClaimed)
+								shutdownCoordinator.TriggerShutdown()
+							},
 						})
 						registrationOutbox.SetSendGate(clusterCoordinator.TakeoverSendGate())
 					}
@@ -2319,9 +2326,15 @@ func main() {
 							// batches to standby writers and keep their copy. After
 							// the hand-off: a covered file settles as registered
 							// only through the running outbox.
-							if err := clusterCoordinator.StartOriginStream(walWriter, arrowBuffer); err != nil {
+							if err := clusterCoordinator.StartOriginStream(walWriter, arrowBuffer, registrationOutbox); err != nil {
 								log.Warn().Err(err).Msg("Origin stream not started; standby writers keep no copy of unregistered batches")
 							}
+							// The stream claimant replays through the buffer and the
+							// outbox: a hook, so it stops before either component.
+							shutdownCoordinator.RegisterHook("stream-claimant", func(context.Context) error {
+								clusterCoordinator.StopClaimant()
+								return nil
+							}, shutdown.PriorityIngest)
 						case clusterCoordinator.GetLocalNode().GetCapabilities().CanIngest:
 							// No outbox on a node that ingests: its journal could not
 							// be opened. The lossy registrar beats announcing nothing.
@@ -4973,11 +4986,27 @@ func main() {
 	// Perform graceful shutdown of all components
 	if err := shutdownCoordinator.Shutdown(); err != nil {
 		log.Error().Err(err).Msg("Shutdown completed with errors")
+		if code := exitCode.Load(); code != 0 {
+			os.Exit(int(code))
+		}
 		os.Exit(1)
 	}
 
 	log.Info().Msg("Arc shutdown complete")
+	if code := exitCode.Load(); code != 0 {
+		log.Warn().Int32("exit_code", code).Msg("Exiting non-zero so the restart policy starts this writer again")
+		os.Exit(int(code))
+	}
 }
+
+// exitCode, when set, is the process exit status after a graceful shutdown.
+var exitCode atomic.Int32
+
+// exitCodeInstanceClaimed: another writer took over this writer process's
+// batches (stream takeover, #1207). The process must be restarted: its next
+// instance is not claimed. A restart policy that restarts only on failure
+// (systemd Restart=on-failure, Kubernetes) restarts it.
+const exitCodeInstanceClaimed = 3
 
 // sharedSQLiteHandle returns the SQLite handle a feature should use for the
 // shared metadata database, preferring the auth manager's existing connection.

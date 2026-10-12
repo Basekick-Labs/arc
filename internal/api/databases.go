@@ -601,6 +601,9 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 			"error": "Cannot delete reserved database '" + name + "'",
 		})
 	}
+	if takeoverBusy(h.coordinator, name, "") {
+		return respondTakeoverBusy(c, "database deletion")
+	}
 	if h.tieringManager != nil {
 		release, err := h.tieringManager.BeginDatabaseDelete()
 		if err != nil {

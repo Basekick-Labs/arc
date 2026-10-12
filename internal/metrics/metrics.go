@@ -175,6 +175,7 @@ type Metrics struct {
 	streamClaimsEnabled  atomic.Int64 // 1 once stream claims are applied (#1207 S4a)
 	streamClaims         atomic.Int64 // stream claims held in the FSM
 	departedWriters      atomic.Int64 // writers that left gracefully and have not re-joined (#1207)
+	oldestClaimAge       atomic.Int64 // seconds the oldest unfinished stream claim has been open (#1207)
 	walCoverageRefused   atomic.Int64 // batches whose file was refused: another writer claimed them
 	walRecoveryTotal     atomic.Int64 // Successful WAL recovery operations
 	walRecoveryRecords   atomic.Int64 // Total records recovered from WAL
@@ -615,6 +616,13 @@ func (m *Metrics) AddStandbyStoreTrimmedBytes(n int64) { m.standbyStoreTrimmedBy
 func (m *Metrics) IncStandbyStoreDropped()             { m.standbyStoreDropped.Add(1) }
 func (m *Metrics) AddStandbyStoreEvictedBytes(n int64) { m.standbyStoreEvicted.Add(n) }
 func (m *Metrics) SetDepartedWriters(n int64)          { m.departedWriters.Store(n) }
+
+// SetOldestStreamClaimAge records how long the oldest unfinished stream
+// claim has been open, in seconds (0: none).
+func (m *Metrics) SetOldestStreamClaimAge(seconds int64) {
+	m.oldestClaimAge.Store(seconds)
+}
+
 func (m *Metrics) SetStreamClaims(enabled bool, claims int64) {
 	if enabled {
 		m.streamClaimsEnabled.Store(1)
@@ -935,6 +943,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"stream_claims_enabled":            m.streamClaimsEnabled.Load(),
 		"stream_claims":                    m.streamClaims.Load(),
 		"stream_takeover_departed_writers": m.departedWriters.Load(),
+		"stream_takeover_oldest_claim_age": m.oldestClaimAge.Load(),
 		"wal_coverage_refused":             m.walCoverageRefused.Load(),
 		"wal_recovery_total":               m.walRecoveryTotal.Load(),
 		"wal_recovery_records":             m.walRecoveryRecords.Load(),
@@ -1392,6 +1401,9 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_stream_takeover_departed_writers Writers that left the cluster gracefully and have not re-joined; their takeover state expires after cluster.stream_takeover_departed_ttl\n"...)
 	b = append(b, "# TYPE arc_stream_takeover_departed_writers gauge\n"...)
 	b = appendMetric(b, "arc_stream_takeover_departed_writers", float64(m.departedWriters.Load()))
+	b = append(b, "# HELP arc_stream_takeover_oldest_claim_age_seconds How long the oldest unfinished stream claim has been open (0: none); a claim that does not finish keeps DELETEs of its measurements waiting\n"...)
+	b = append(b, "# TYPE arc_stream_takeover_oldest_claim_age_seconds gauge\n"...)
+	b = appendMetric(b, "arc_stream_takeover_oldest_claim_age_seconds", float64(m.oldestClaimAge.Load()))
 
 	b = append(b, "# HELP arc_wal_coverage_refused_total Batches whose file the cluster refused because another writer claimed them\n"...)
 	b = append(b, "# TYPE arc_wal_coverage_refused_total counter\n"...)

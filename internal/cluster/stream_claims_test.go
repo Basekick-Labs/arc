@@ -48,14 +48,20 @@ func TestStreamClaimsEnableWaitsForEveryNode(t *testing.T) {
 	}
 }
 
-func TestStreamClaimsEnableNeedsCoverageOnTheLeader(t *testing.T) {
+// The leader proposes only with cluster.stream_takeover set. Coverage is a
+// writer's requirement, carried by the capability it advertises: a leader
+// without it (a reader) still proposes.
+func TestStreamClaimsEnableNeedsTheSettingOnTheLeader(t *testing.T) {
 	c := originRig(t, "writer-1", RoleWriter)
 	capNodes(t, c, map[string][]string{"raft-1": capList, "writer-1": capList, "writer-2": capList, "reader-1": capList})
 	c.maybeEnableStreamClaims()
 	time.Sleep(200 * time.Millisecond)
 	if c.StreamClaimsEnabled() {
-		t.Fatal("enabled with cluster.wal_coverage off")
+		t.Fatal("enabled with cluster.stream_takeover off on the leader")
 	}
+	c.cfg.StreamTakeover = true
+	c.maybeEnableStreamClaims()
+	waitFSM(t, c.StreamClaimsEnabled)
 }
 
 // Once enabled, a join without the capability is refused before it enters
@@ -189,7 +195,7 @@ func TestForwardApplyClaimWiring(t *testing.T) {
 // The wire name pins the build generation that may enable takeover:
 // builds advertising an older name (no claimant, no exit on a claim) block it.
 func TestStreamClaimsCapabilityName(t *testing.T) {
-	if raft.CapabilityStreamClaims != "stream_claims_v4" {
+	if raft.CapabilityStreamClaims != "stream_claims_v5" {
 		t.Fatalf("capability %q", raft.CapabilityStreamClaims)
 	}
 }

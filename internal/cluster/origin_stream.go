@@ -37,7 +37,11 @@ type originStream struct {
 
 // StartOriginStream starts both sides. Call after Start, on a writer whose
 // buffer has coverage enabled. A no-op elsewhere.
-func (c *Coordinator) StartOriginStream(walWriter *wal.Writer, buffer *ingest.ArrowBuffer) error {
+//
+// With cluster.stream_takeover it also starts the claimant (#1207), which
+// publishes a gone writer's unregistered batches from the store; outbox is
+// this node's registration outbox (the claimant's files go through it).
+func (c *Coordinator) StartOriginStream(walWriter *wal.Writer, buffer *ingest.ArrowBuffer, outbox *RegistrationOutbox) error {
 	if !c.cfg.WALCoverage || c.cfg.SharedStorageMode || c.raftNode == nil || walWriter == nil || buffer == nil {
 		return nil
 	}
@@ -109,6 +113,23 @@ func (c *Coordinator) StartOriginStream(walWriter *wal.Writer, buffer *ingest.Ar
 		client.Run(ctx)
 	}()
 	go c.originStreamPrimaryWatch(ctx, st)
+	if c.cfg.StreamTakeover && outbox != nil {
+		cl := newClaimant(c, store, outbox, buffer, func(ctx context.Context, origin string, keys []string) bool {
+			tk := make([]originstream.TrimKey, len(keys))
+			for i, k := range keys {
+				tk[i] = originstream.TrimKey{Origin: origin, Key: k}
+			}
+			got := st.keysLocal(ctx, c, tk, func(originstream.TrimKey) bool { return false })
+			for _, k := range tk {
+				if !got[k] {
+					return false
+				}
+			}
+			return true
+		})
+		cl.start(ctx)
+		c.claimant.Store(cl)
+	}
 
 	c.mu.Lock()
 	c.originStream = st
@@ -168,81 +189,109 @@ func (c *Coordinator) originStreamPrimaryWatch(ctx context.Context, st *originSt
 // immutable); the cache keeps only paths still current.
 func (st *originStream) trimReady(c *Coordinator) originstream.TrimReadiness {
 	return func(ctx context.Context, keys []originstream.TrimKey) map[originstream.TrimKey]bool {
-		out := make(map[originstream.TrimKey]bool, len(keys))
 		fsm := c.raftNode.FSM()
 		if fsm == nil {
-			return out
+			return map[originstream.TrimKey]bool{}
 		}
 		applied := fsm.AppliedDone()
 		// An origin with an unfinished claim on one of its instances keeps
 		// every record (#1207): a claimant publishes from them, and a vanished
 		// file can make batches below the origin's floors claimable again.
-		// Per origin: a trim key does not name the instance.
-		claimed := map[string]bool{}
+		// So does an origin this node does not hear from: it may be dead, and
+		// its records claimed once the grace ends; trimming them between the
+		// claimant reading what it holds and the claim applying would claim
+		// batches it no longer has. Per origin: a trim key does not name the
+		// instance.
+		held := map[string]bool{}
 		if fsm.StreamClaimsEnabled() {
 			for _, st := range fsm.TakeoverInstanceStates() {
 				if st.Claimed && !st.ClaimDone && !st.ClaimRelease {
-					claimed[st.Origin] = true
+					held[st.Origin] = true
 				}
 			}
 		}
-		type dbm struct{ db, measurement string }
-		wanted := map[dbm][]originstream.TrimKey{}
-		dbs := map[string]bool{}
-		for _, k := range keys {
-			db, m, ok := strings.Cut(k.Key, "/")
-			if !ok || applied < k.AppliedIndex || claimed[k.Origin] {
-				continue
+		return st.keysLocal(ctx, c, keys, func(k originstream.TrimKey) bool {
+			if applied < k.AppliedIndex || held[k.Origin] {
+				return true
 			}
-			wanted[dbm{db, m}] = append(wanted[dbm{db, m}], k)
-			dbs[db] = true
-		}
-		present := map[string]int64{}
-		st.presentMu.Lock()
-		prev := st.present
-		st.presentMu.Unlock()
-		for db := range dbs {
-			byMeasurement := map[string]bool{} // measurement -> every hot file present
-			for _, f := range fsm.GetFilesByDatabase(db) {
-				if f.Tier != "" && f.Tier != "hot" {
-					continue // in shared object storage, not on any node's disk
-				}
-				m := f.Measurement
-				if _, seen := byMeasurement[m]; !seen {
-					byMeasurement[m] = true
-				}
-				if _, care := wanted[dbm{db, m}]; !care || !byMeasurement[m] {
-					continue
-				}
-				if size, ok := prev[f.Path]; ok && size == f.SizeBytes {
-					present[f.Path] = size
-					continue
-				}
-				got, err := c.storage.StatFile(ctx, f.Path)
-				if err != nil || got != f.SizeBytes {
-					byMeasurement[m] = false
-					continue
-				}
-				present[f.Path] = got
+			if fsm.StreamClaimsEnabled() && !c.originHealthy(k.Origin) {
+				return true
 			}
-			for key, ks := range wanted {
-				if key.db != db {
-					continue
-				}
-				ok, seen := byMeasurement[key.measurement]
-				if !seen {
-					ok = true // no current hot file: deleted or tiered, nothing to hold
-				}
-				for _, k := range ks {
-					out[k] = ok
-				}
-			}
-		}
-		st.presentMu.Lock()
-		st.present = present
-		st.presentMu.Unlock()
+			return false
+		})
+	}
+}
+
+// keysLocal reports, per key not skipped, whether every current hot file of
+// the key's measurement is present here at its size. Compaction and DELETE
+// rewrites replace files, and their outputs are current, so a batch whose
+// file was rewritten counts only once the rewrite is here too.
+//
+// Each database's files are listed once per call. A file verified present
+// stays verified while it is in the manifest at the same size (files are
+// immutable); the cache keeps only paths still current.
+func (st *originStream) keysLocal(ctx context.Context, c *Coordinator, keys []originstream.TrimKey, skip func(originstream.TrimKey) bool) map[originstream.TrimKey]bool {
+	out := make(map[originstream.TrimKey]bool, len(keys))
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
 		return out
 	}
+	type dbm struct{ db, measurement string }
+	wanted := map[dbm][]originstream.TrimKey{}
+	dbs := map[string]bool{}
+	for _, k := range keys {
+		db, m, ok := strings.Cut(k.Key, "/")
+		if !ok || skip(k) {
+			continue
+		}
+		wanted[dbm{db, m}] = append(wanted[dbm{db, m}], k)
+		dbs[db] = true
+	}
+	present := map[string]int64{}
+	st.presentMu.Lock()
+	prev := st.present
+	st.presentMu.Unlock()
+	for db := range dbs {
+		byMeasurement := map[string]bool{} // measurement -> every hot file present
+		for _, f := range fsm.GetFilesByDatabase(db) {
+			if f.Tier != "" && f.Tier != "hot" {
+				continue // in shared object storage, not on any node's disk
+			}
+			m := f.Measurement
+			if _, seen := byMeasurement[m]; !seen {
+				byMeasurement[m] = true
+			}
+			if _, care := wanted[dbm{db, m}]; !care || !byMeasurement[m] {
+				continue
+			}
+			if size, ok := prev[f.Path]; ok && size == f.SizeBytes {
+				present[f.Path] = size
+				continue
+			}
+			got, err := c.storage.StatFile(ctx, f.Path)
+			if err != nil || got != f.SizeBytes {
+				byMeasurement[m] = false
+				continue
+			}
+			present[f.Path] = got
+		}
+		for key, ks := range wanted {
+			if key.db != db {
+				continue
+			}
+			ok, seen := byMeasurement[key.measurement]
+			if !seen {
+				ok = true // no current hot file: deleted or tiered, nothing to hold
+			}
+			for _, k := range ks {
+				out[k] = ok
+			}
+		}
+	}
+	st.presentMu.Lock()
+	st.present = present
+	st.presentMu.Unlock()
+	return out
 }
 
 // handleOriginStreamHello answers a standby writer opening the origin
@@ -310,6 +359,15 @@ func (c *Coordinator) sendOriginStreamAck(conn net.Conn, nonce, instance, errTex
 		HMAC: security.ComputeOriginStreamHelloAckHMAC(c.cfg.SharedSecret, nonce, c.localNode.ID, instance, errText, ts),
 	}
 	return protocol.SendMessage(conn, &protocol.Message{Type: protocol.MsgOriginStreamHelloAck, Payload: ack}, 10*time.Second) == nil
+}
+
+// StopClaimant stops the stream claimant (#1207), if it runs. Call before
+// the ingest buffer and the registration outbox shut down: a replay writes
+// through both.
+func (c *Coordinator) StopClaimant() {
+	if cl := c.claimant.Load(); cl != nil {
+		cl.stop()
+	}
 }
 
 // stopOriginStream stops both sides; part of the coordinator shutdown.

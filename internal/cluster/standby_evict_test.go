@@ -127,6 +127,16 @@ func TestTrimWaitsForAnUnfinishedClaim(t *testing.T) {
 	idx := c.raftNode.FSM().AppliedDone()
 	k := originstream.TrimKey{Origin: "writer-2", Key: "db/cpu", AppliedIndex: idx}
 	ready := func() bool { return pass(context.Background(), []originstream.TrimKey{k})[k] }
+	// An origin this node does not hear from may be dead: its records wait
+	// for a claim (or its return).
+	if ready() {
+		t.Fatal("trimmed the records of an origin that is not heard from")
+	}
+	peer := NewNode("writer-2", "writer-2", RoleWriter, "test-cluster")
+	peer.UpdateState(StateHealthy)
+	if err := c.registry.Register(peer); err != nil {
+		t.Fatal(err)
+	}
 	if !ready() {
 		t.Fatal("no file and no claim: not ready")
 	}
@@ -208,5 +218,27 @@ func TestWriterEligibility(t *testing.T) {
 		Claims: []raft.ClaimSet{{Instance: 0x10, Keys: map[string]raft.Intervals{"db/cpu": {{1, 5}}}}}})
 	if c.writerEligible("writer-2") || !c.writerEligible("writer-1") {
 		t.Fatal("eligibility does not follow the claim")
+	}
+}
+
+// A claim another writer finished may have lacked batches this copy holds
+// (a follow-up claims them): evicted only under pressure.
+func TestStandbyEvictPolicyAfterAnotherClaimant(t *testing.T) {
+	c, _ := takeoverOriginRig(t, true)
+	p := &standbyEvictPolicy{c: c}
+	if err := c.raftNode.AddNode(&raft.NodeInfo{ID: "writer-3", Name: "writer-3", Role: string(RoleWriter), ClusterName: "test-cluster", Address: "writer-3:9100", State: string(StateHealthy)}, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.raftNode.PromoteWriter("writer-3", "writer-1", 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	waitFSM(t, func() bool { return c.designatedPrimaryWriterID() == "writer-3" })
+	propose(t, c, raft.CommandAnnounceInstance, raft.AnnounceInstancePayload{Origin: "writer-2", Instance: 0x20, FreshStart: true})
+	propose(t, c, raft.CommandTakeOverStreamV2, raft.TakeOverStreamV2Payload{Origin: "writer-2", By: "writer-3", Now: time.Now(),
+		Claims: []raft.ClaimSet{{Instance: 0x20, Keys: map[string]raft.Intervals{"db/cpu": {{1, 5}}}}}})
+	e := c.raftNode.FSM().ClaimsBy("writer-3")[0].Epoch
+	propose(t, c, raft.CommandClaimDone, raft.ClaimDonePayload{Instance: 0x20, By: "writer-3", Epoch: e})
+	if got := p.tier(originstream.InstanceInfo{Origin: "writer-2", Instance: 0x20, Floors: true}); got != originstream.EvictUnderPressure {
+		t.Fatalf("another writer finished: tier %d", got)
 	}
 }

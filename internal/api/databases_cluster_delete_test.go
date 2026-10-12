@@ -395,3 +395,33 @@ func TestDatabasesHandler_Delete1094UngatedWithoutSharedStorageOrReplication(t *
 		t.Fatalf("status = %d, want 200 on an ungated cluster", resp.StatusCode)
 	}
 }
+
+// takeoverBusyCoordinator is a primary whose stream takeover is publishing
+// rows of database "db" (#1207).
+type takeoverBusyCoordinator struct {
+	databaseDeleteCoordinatorFake
+	asked []string
+}
+
+func (f *takeoverBusyCoordinator) StreamTakeoverBusy(db, measurement string) bool {
+	f.asked = append(f.asked, db+"/"+measurement)
+	return db == "db"
+}
+
+func TestDatabasesHandler_DeleteWaitsForAStreamTakeover(t *testing.T) {
+	handler, app, tmpDir := setupTestDatabasesHandler(t, true)
+	t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
+	coordinator := &takeoverBusyCoordinator{databaseDeleteCoordinatorFake: databaseDeleteCoordinatorFake{role: "writer", primary: true}}
+	handler.SetCoordinator(coordinator, true)
+	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/db?confirm=true", nil), testRequestTimeoutMS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != fiber.StatusServiceUnavailable || resp.Header.Get("Retry-After") != "30" {
+		t.Fatalf("status = %d retry-after %q, want 503 with Retry-After 30", resp.StatusCode, resp.Header.Get("Retry-After"))
+	}
+	if len(coordinator.batches) != 0 || strings.Join(coordinator.asked, ",") != "db/" {
+		t.Fatalf("batches %v asked %v", coordinator.batches, coordinator.asked)
+	}
+}
