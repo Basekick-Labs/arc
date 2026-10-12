@@ -4,6 +4,7 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -186,5 +187,26 @@ func TestStaleTakeoverMarkerIsCleared(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(d.journal, takeoverOnMarkerName)); err == nil {
 		t.Fatal("stale marker kept")
+	}
+}
+
+// Batches of another writer's instance held here (a claimant's replay files)
+// are not announced as this origin's holds.
+func TestAnnouncementLeavesOutOtherWritersInstances(t *testing.T) {
+	c, d := takeoverOriginRig(t, true)
+	raw, _ := json.Marshal(raft.AnnounceInstancePayload{Origin: "writer-2", Instance: 0x900, FreshStart: true})
+	if err := c.applyOrForward(context.Background(), &raft.Command{Type: raft.CommandAnnounceInstance, Payload: raw}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeOnMarker(d.journal); err != nil {
+		t.Fatal(err)
+	}
+	c.SetTakeoverOrigin(d.origin(0x100, noHolds, nil))
+	c.originPass(t)
+	c.takeoverOrigin.Store(nil)
+	c.SetTakeoverOrigin(d.origin(0x200, func() ([]uint64, error) { return []uint64{0x100, 0x900, 0x200}, nil }, nil))
+	holds, err := c.announcedHolds(c.takeoverOrigin.Load())
+	if err != nil || len(holds) != 1 || holds[0] != 0x100 {
+		t.Fatalf("announced holds %v, %v", holds, err)
 	}
 }

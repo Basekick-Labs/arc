@@ -653,6 +653,70 @@ func (r *RegistrationOutbox) Instances() []uint64 {
 	return out
 }
 
+// InstanceFile is one file of this outbox holding batches of a writer
+// instance: pending (sent or not), acknowledged with the ack not yet
+// durable, or parked after a refusal.
+type InstanceFile struct {
+	Path          string
+	Key           string
+	PartitionTime time.Time
+	Epoch         uint64 // the claim the file publishes the instance under; 0 when none
+	Ranges        [][2]uint64
+	Partial       []ingest.CoveragePiece
+	Exact         bool // the coverage lists every piece of the file
+	Parked        bool
+	Kind          string // the refusal kind of a parked file
+}
+
+// InstanceFiles returns the files holding batches of inst, for a claimant
+// working out what of its claim is still on its way (#1207 S4b1c).
+func (r *RegistrationOutbox) InstanceFiles(inst uint64) []InstanceFile {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []InstanceFile
+	add := func(rec journalRecord, parked bool, kind string) {
+		cov := rec.Cov
+		if cov == nil {
+			return
+		}
+		ranges, partial, exact := cov.FilePieces()
+		f := InstanceFile{Path: rec.Path, Key: cov.Key, PartitionTime: rec.PartitionTime, Epoch: cov.Epochs[inst],
+			Exact: exact, Parked: parked, Kind: kind}
+		for _, rg := range ranges {
+			if rg.Instance == inst {
+				f.Ranges = append(f.Ranges, [2]uint64{rg.Lo, rg.Hi})
+			}
+		}
+		for _, p := range partial {
+			if p.Instance == inst {
+				f.Partial = append(f.Partial, p)
+			}
+		}
+		held := len(f.Ranges)+len(f.Partial) > 0
+		if !exact {
+			for _, b := range cov.Bounds {
+				held = held || b.Instance == inst
+			}
+		}
+		if held {
+			out = append(out, f)
+		}
+	}
+	for _, e := range r.byPath {
+		if !e.done {
+			add(e.rec, false, "")
+		}
+	}
+	for _, e := range r.unsyncedAcks {
+		add(e.rec, false, "")
+	}
+	for _, e := range r.parked {
+		add(e.rec.Rec, true, e.rec.Kind)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
+}
+
 // SetParkingTieringDrop installs the tiering row removal for parked files once
 // tiering is up, and removes the rows of files parked before it was.
 func (r *RegistrationOutbox) SetParkingTieringDrop(drop func(ctx context.Context, path string) error) {

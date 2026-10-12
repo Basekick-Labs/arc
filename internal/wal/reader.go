@@ -368,18 +368,23 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 		payloadHashValue, logicalPayload, coverage = token, logical, cov
 	}
 
+	e := DecodeLogical(logicalPayload)
+	e.TimestampUS, e.PayloadHash, e.Coverage = timestampUS, payloadHashValue, coverage
+	return e, nil
+}
+
+// DecodeLogical decodes a logical WAL payload ([0x01][dbLen][db][msgpack] or
+// bare msgpack): row form into Records, columnar form into ColumnarData, and
+// anything else into an entry carrying DecodeErr. The standby store keeps
+// these payloads as the origin wrote them (#1207).
+func DecodeLogical(logicalPayload []byte) *Entry {
 	// Parse envelope to extract database name and inner msgpack payload
 	database, msgpackData := ParseEnvelope(logicalPayload, "")
 
 	// Try row format first (array of maps from Append path)
 	var records []map[string]interface{}
 	if err := msgpack.Unmarshal(msgpackData, &records); err == nil {
-		return &Entry{
-			TimestampUS: timestampUS,
-			PayloadHash: payloadHashValue,
-			Records:     records,
-			Coverage:    coverage,
-		}, nil
+		return &Entry{Records: records}
 	}
 
 	// Try columnar format (map with m + columns from AppendRaw path)
@@ -387,21 +392,11 @@ func (r *Reader) readEntry(f *os.File) (*Entry, error) {
 	if err := msgpack.Unmarshal(msgpackData, &rawMap); err == nil {
 		if colEntry := parseColumnarEntry(rawMap); colEntry != nil {
 			colEntry.Database = database
-			return &Entry{
-				TimestampUS:  timestampUS,
-				PayloadHash:  payloadHashValue,
-				ColumnarData: colEntry,
-				Coverage:     coverage,
-			}, nil
+			return &Entry{ColumnarData: colEntry}
 		}
 	}
 
-	return &Entry{
-		TimestampUS: timestampUS,
-		PayloadHash: payloadHashValue,
-		Coverage:    coverage,
-		DecodeErr:   errors.New("unrecognized WAL entry format"),
-	}, nil
+	return &Entry{DecodeErr: errors.New("unrecognized WAL entry format")}
 }
 
 // MeasurementName reads the "m" of a columnar payload the way ingest does

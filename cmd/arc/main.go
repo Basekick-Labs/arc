@@ -5137,41 +5137,11 @@ func createWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolo
 	}
 }
 
-func trackedWALRowTarget(rec map[string]interface{}) (database, measurement string) {
-	for _, key := range []string{"_measurement", "measurement", "m"} {
-		measurement, _ = rec[key].(string)
-		if measurement != "" {
-			break
-		}
-	}
-	for _, key := range []string{"_database", "database"} {
-		database, _ = rec[key].(string)
-		if database != "" {
-			break
-		}
-	}
-	if database == "" {
-		database = "default"
-	}
-	return
-}
-
 // Validate before splitting: a boundary must not hide an invalid mixed-target
 // entry or allow an earlier chunk to be accepted before a missing target.
 func validateTrackedWALRecoveryRows(records []map[string]interface{}) error {
-	var database, measurement string
-	for i, rec := range records {
-		rowDatabase, rowMeasurement := trackedWALRowTarget(rec)
-		if rowMeasurement == "" {
-			return fmt.Errorf("WAL row %d has no measurement", i)
-		}
-		if i == 0 {
-			database, measurement = rowDatabase, rowMeasurement
-		} else if database != rowDatabase || measurement != rowMeasurement {
-			return fmt.Errorf("WAL row entry spans multiple databases or measurements")
-		}
-	}
-	return nil
+	_, _, err := ingest.ValidateWALRows(records)
+	return err
 }
 
 // createTrackedWALRecoveryCallback restores one bounded row batch as a columnar
@@ -5183,24 +5153,9 @@ func createTrackedWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger
 			return nil
 		}
 
-		if err := validateTrackedWALRecoveryRows(records); err != nil {
+		database, measurement, columns, err := ingest.WALRowsToColumns(records)
+		if err != nil {
 			return err
-		}
-		database, measurement := trackedWALRowTarget(records[0])
-		columns := make(map[string][]interface{})
-		for rowIndex, rec := range records {
-			for key, value := range rec {
-				switch key {
-				case "_measurement", "measurement", "m", "_database", "database":
-					continue
-				}
-				column, ok := columns[key]
-				if !ok {
-					column = make([]interface{}, len(records))
-					columns[key] = column
-				}
-				column[rowIndex] = value
-			}
 		}
 
 		if err := arrowBuffer.WriteColumnarDirectReplay(ctx, database, measurement, columns, walIdentity); err != nil {

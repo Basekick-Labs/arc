@@ -28,8 +28,17 @@ import (
 // ingests advertises stream claims only when coverage is in effect on it
 // (SetWALCoverageActive): the flag implies every such node stamps coverage
 // on its files. Other roles apply the FSM rules and advertise them always.
+// Claims name nodes, so a node without an explicit cluster.node_id (the
+// default is hostname-PID, which changes at every restart on bare metal)
+// never advertises them.
 func (c *Coordinator) localCapabilities() []string {
 	if !c.cfg.StreamTakeover {
+		return nil
+	}
+	if c.cfg.NodeID == "" {
+		c.nodeIDWarn.Do(func() {
+			c.logger.Error().Msg("cluster.stream_takeover needs an explicit cluster.node_id: stream takeover stays off on this node, and the cluster cannot enable it while this node is a member")
+		})
 		return nil
 	}
 	if c.localNode.Role.GetCapabilities().CanIngest && !c.walCoverageActive.Load() {

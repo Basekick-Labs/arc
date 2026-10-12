@@ -237,15 +237,28 @@ func writeOnMarker(dir string) error {
 	return writeInstanceMarker(path, 1)
 }
 
-func (c *Coordinator) announceInstance(ctx context.Context, st *takeoverOriginState) error {
+// announcedHolds is the instances of this origin, other than the current
+// one, with batches still held here: at most maxAnnouncedHolds.
+func (c *Coordinator) announcedHolds(st *takeoverOriginState) ([]uint64, error) {
 	var holds []uint64
 	if st.cfg.Holds != nil {
 		all, err := st.cfg.Holds()
 		if err != nil {
-			return fmt.Errorf("list the writer instances held here: %w", err)
+			return nil, fmt.Errorf("list the writer instances held here: %w", err)
+		}
+		// Another writer's instance held here (a claimant's replay files
+		// of it) is not this origin's to adopt: the manifest ignores it, and
+		// it would crowd this origin's own out of the announcement cap.
+		foreign := map[uint64]bool{}
+		if fsm := c.raftNode.FSM(); fsm != nil {
+			for _, in := range fsm.StreamInstances() {
+				if in.Origin != c.localNode.ID {
+					foreign[in.Instance] = true
+				}
+			}
 		}
 		for _, h := range all {
-			if h != st.cfg.Instance && h != 0 {
+			if h != st.cfg.Instance && h != 0 && !foreign[h] {
 				holds = append(holds, h)
 			}
 		}
@@ -256,6 +269,14 @@ func (c *Coordinator) announceInstance(ctx context.Context, st *takeoverOriginSt
 		c.logger.Error().Int("held", len(holds)).Int("announced", maxAnnouncedHolds).
 			Msg("This writer holds batches of more earlier processes than one announcement carries; the others are treated as lost by this node")
 		holds = holds[:maxAnnouncedHolds]
+	}
+	return holds, nil
+}
+
+func (c *Coordinator) announceInstance(ctx context.Context, st *takeoverOriginState) error {
+	holds, err := c.announcedHolds(st)
+	if err != nil {
+		return err
 	}
 	raw, err := json.Marshal(raft.AnnounceInstancePayload{Origin: c.localNode.ID, Instance: st.cfg.Instance,
 		Continuity: st.prev, Holds: holds, FreshStart: st.cfg.SentCovered == nil || !st.cfg.SentCovered()})

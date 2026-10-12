@@ -330,6 +330,23 @@ release:
   get a retryable 503. Each writer records its last process in
   `instance.last` files in the WAL directory, the Raft data directory and
   `<storage>/_instances/`.
+- `cluster.stream_takeover` now needs an explicit `cluster.node_id`. Takeover
+  claims name nodes, and the default node id (host name and process id)
+  changes at every restart outside Kubernetes. A node with the setting on and
+  no `cluster.node_id` logs an error and does not advertise takeover support,
+  so the cluster cannot turn takeover on while that node is a member.
+- Once takeover is on, the standby store no longer evicts, at its cap, the
+  batches of a writer process that a takeover could still need. When the store
+  is full and holds such batches of a process its writer has since restarted,
+  new batches are not kept and an error is logged; the new gauge
+  `arc_standby_store_pinned_bytes` shows how much the store keeps that it would
+  otherwise have evicted.
+- The parts a standby will use to publish the batches it takes over are in
+  place, unused: reading the standby store back, writing those batches to
+  Parquet without touching the WAL or the live buffers, a claim that grows in
+  steps, a claimant releasing its own claim, and a refusal for a claimant file
+  the settled index has no room for (the index keeps tracking the writer
+  process instead of giving up on it).
 
 Nothing turns takeover on in this release.
 

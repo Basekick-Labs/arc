@@ -392,3 +392,33 @@ func TestOutboxClaimRefusalSettlesOnlyTheRefusedFile(t *testing.T) {
 	}
 	waitOutbox(t, "nothing pending", func() bool { return r.Pending() == 0 })
 }
+
+// A claimant's coverage carries its claim epoch per instance through the
+// journal (version 3) into the registration (#1207 S4b1c).
+func TestOutboxJournalsClaimEpochs(t *testing.T) {
+	dir := t.TempDir()
+	first, err := NewRegistrationOutbox(dir, "test-cluster", zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cov := testCov(&settleLog{})
+	cov.Ranges = append(cov.Ranges, ingest.CoverageRange{Instance: 4, Lo: 1, Hi: 2})
+	cov.Epochs = map[uint64]uint64{9: 77}
+	registerCovered(first, outPathA, 10, cov)
+	if err := first.SyncRegistrations(); err != nil {
+		t.Fatal(err)
+	}
+	crash(first)
+	raw, _ := os.ReadFile(filepath.Join(dir, RegistrationJournal))
+	if !strings.Contains(string(raw), `"v":3`) || !strings.Contains(string(raw), `"ep":{"9":77}`) {
+		t.Fatalf("journal does not carry the epochs:\n%s", raw)
+	}
+	second := newTestOutbox(t, dir)
+	second.mu.Lock()
+	a := second.byPath[outPathA]
+	second.mu.Unlock()
+	got := fileCoverage(a.rec.Cov)
+	if len(got) != 2 || got[0].Instance != 4 || got[0].ClaimEpoch != 0 || got[1].Instance != 9 || got[1].ClaimEpoch != 77 {
+		t.Fatalf("file coverage %+v", got)
+	}
+}
