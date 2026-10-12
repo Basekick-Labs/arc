@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -67,14 +68,104 @@ type RetentionPolicy struct {
 	UpdatedAt           string  `json:"updated_at"`
 }
 
-// RetentionPolicyRequest represents a request to create/update a policy
+// RetentionPolicyRequest represents a request to create/update a policy.
+//
+// Every field distinguishes an absent key from a null one (#1023). Create
+// requires name, database and retention_days; buffer_days and is_active keep
+// their long-standing create defaults of 0 and false when absent. Update is a
+// partial update: an absent key keeps the stored value and a present one is
+// validated and written. Only measurement can be null (it means the whole
+// database, as an empty string always has).
+//
+// Before #1023 update wrote every column from the body, so a PUT that left out
+// measurement widened a measurement-pinned policy to delete across the whole
+// database, one that left out buffer_days moved the cutoff in by the stored
+// buffer, and one that left out is_active stopped the policy — all with a 200.
 type RetentionPolicyRequest struct {
-	Name          string  `json:"name"`
-	Database      string  `json:"database"`
-	Measurement   *string `json:"measurement"`
-	RetentionDays int     `json:"retention_days"`
-	BufferDays    int     `json:"buffer_days"`
-	IsActive      bool    `json:"is_active"`
+	Name          optionalField[string] `json:"name"`
+	Database      optionalField[string] `json:"database"`
+	Measurement   optionalField[string] `json:"measurement"`
+	RetentionDays optionalField[int]    `json:"retention_days"`
+	BufferDays    optionalField[int]    `json:"buffer_days"`
+	IsActive      optionalField[bool]   `json:"is_active"`
+}
+
+// validateRetentionPolicyRequest applies the per-field rules to the fields the
+// body carries, and on create requires name, database and retention_days. The
+// one rule that spans two fields, retention_days > buffer_days, is checked here
+// on create (an absent buffer_days is 0) and, on update, only when the body
+// carries both; otherwise handleUpdate enforces it against the stored values in
+// the UPDATE itself.
+func validateRetentionPolicyRequest(req *RetentionPolicyRequest, create bool) error {
+	present := func(name string, set, null bool) (bool, error) {
+		switch {
+		case !set:
+			if create {
+				return false, fmt.Errorf("%s is required", name)
+			}
+			return false, nil
+		case null:
+			return false, fmt.Errorf("%s may not be null", name)
+		}
+		return true, nil
+	}
+
+	if ok, err := present("name", req.Name.Set, req.Name.Null); err != nil {
+		return err
+	} else if ok && req.Name.Value == "" {
+		return errors.New("name is required")
+	}
+	// Both names are concatenated into a storage prefix by
+	// getMeasurementsToProcess and deleteOldFiles, and the row is replayed by
+	// the scheduler forever, so an unvalidated one is a policy that fails on
+	// every run long after the request that created it (#741).
+	if ok, err := present("database", req.Database.Set, req.Database.Null); err != nil {
+		return err
+	} else if ok {
+		if req.Database.Value == "" {
+			return errors.New("database is required")
+		}
+		if !isSafeStoragePathSegment(req.Database.Value) {
+			return fmt.Errorf("invalid database name %q: may not be empty, contain a separator, or start with a dot", req.Database.Value)
+		}
+	}
+	if req.Measurement.hasValue() && req.Measurement.Value != "" && !isSafeStoragePathSegment(req.Measurement.Value) {
+		return fmt.Errorf("invalid measurement name %q: may not contain a separator or start with a dot", req.Measurement.Value)
+	}
+	if ok, err := present("retention_days", req.RetentionDays.Set, req.RetentionDays.Null); err != nil {
+		return err
+	} else if ok && req.RetentionDays.Value <= 0 {
+		return errors.New("retention_days must be greater than 0")
+	}
+	if req.BufferDays.Null {
+		return errors.New("buffer_days may not be null")
+	}
+	// A negative buffer moves the cutoff forward, so the policy deletes data
+	// younger than retention_days. Create accepted one before #1023.
+	if req.BufferDays.Set && req.BufferDays.Value < 0 {
+		return errors.New("buffer_days may not be negative")
+	}
+	if req.IsActive.Null {
+		return errors.New("is_active may not be null")
+	}
+	if req.RetentionDays.hasValue() && req.RetentionDays.Value <= req.BufferDays.Value {
+		// On create an absent buffer_days is 0; on update this compares only
+		// when both are carried, and the UPDATE checks the stored values.
+		if create || req.BufferDays.Set {
+			return errors.New("retention_days must be greater than buffer_days")
+		}
+	}
+	return nil
+}
+
+// measurementColumn is the stored form of a measurement field: an empty string
+// and null both mean the whole database, and are both stored as NULL so GET
+// returns one shape for them.
+func measurementColumn(f optionalField[string]) *string {
+	if !f.hasValue() || f.Value == "" {
+		return nil
+	}
+	return f.ptr()
 }
 
 // ExecuteRetentionRequest represents a request to execute a policy
@@ -329,43 +420,23 @@ func (h *RetentionHandler) handleCreate(c *fiber.Ctx) error {
 	}
 
 	// Validate
-	if req.Name == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "name is required"})
-	}
-	if req.Database == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "database is required"})
-	}
-	// Both fields are concatenated into a storage prefix by
-	// getMeasurementsToProcess and deleteOldFiles, and the row is replayed by
-	// the scheduler forever, so an unvalidated one is a policy that fails on
-	// every run long after the request that created it (#741).
-	if !isSafeStoragePathSegment(req.Database) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": fmt.Sprintf("invalid database name %q: may not be empty, contain a separator, or start with a dot", req.Database),
-		})
-	}
-	if req.Measurement != nil && *req.Measurement != "" && !isSafeStoragePathSegment(*req.Measurement) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": fmt.Sprintf("invalid measurement name %q: may not contain a separator or start with a dot", *req.Measurement),
-		})
-	}
-	if req.RetentionDays <= 0 {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "retention_days must be greater than 0"})
-	}
-	if req.RetentionDays <= req.BufferDays {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "retention_days must be greater than buffer_days"})
+	if err := validateRetentionPolicyRequest(&req, true); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	// Insert policy
+	// Insert policy. An absent buffer_days or is_active keeps the create
+	// defaults this endpoint has always applied (0 and false) rather than the
+	// column defaults: flipping is_active to the schema's TRUE would make a
+	// policy created by an existing client start deleting data.
 	result, err := h.db.Exec(`
 		INSERT INTO retention_policies (name, database, measurement, retention_days, buffer_days, is_active)
 		VALUES (?, ?, ?, ?, ?, ?)
-	`, req.Name, req.Database, req.Measurement, req.RetentionDays, req.BufferDays, req.IsActive)
+	`, req.Name.Value, req.Database.Value, measurementColumn(req.Measurement), req.RetentionDays.Value, req.BufferDays.Value, req.IsActive.Value)
 
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint") {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": fmt.Sprintf("Retention policy with name '%s' already exists", req.Name),
+				"error": fmt.Sprintf("Retention policy with name '%s' already exists", req.Name.Value),
 			})
 		}
 		h.logger.Error().Err(err).Msg("Failed to create retention policy")
@@ -375,7 +446,7 @@ func (h *RetentionHandler) handleCreate(c *fiber.Ctx) error {
 	}
 
 	policyID, _ := result.LastInsertId()
-	h.logger.Info().Int64("policy_id", policyID).Str("name", req.Name).Msg("Created retention policy")
+	h.logger.Info().Int64("policy_id", policyID).Str("name", req.Name.Value).Msg("Created retention policy")
 
 	// Return created policy
 	policy, err := h.getPolicy(policyID)
@@ -430,32 +501,43 @@ func (h *RetentionHandler) handleUpdate(c *fiber.Ctx) error {
 		})
 	}
 
-	// Validate. Update writes both name fields verbatim, so it can put a row
-	// into exactly the state create now refuses (#741).
-	if req.RetentionDays <= req.BufferDays {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "retention_days must be greater than buffer_days",
-		})
-	}
-	if !isSafeStoragePathSegment(req.Database) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": fmt.Sprintf("invalid database name %q: may not be empty, contain a separator, or start with a dot", req.Database),
-		})
-	}
-	if req.Measurement != nil && *req.Measurement != "" && !isSafeStoragePathSegment(*req.Measurement) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": fmt.Sprintf("invalid measurement name %q: may not contain a separator or start with a dot", *req.Measurement),
-		})
+	// A partial update (#1023): each field the body carries is validated with
+	// the create rules (an update that writes a name verbatim could otherwise
+	// store exactly what create refuses, #741), and an absent one keeps its
+	// stored value.
+	if err := validateRetentionPolicyRequest(&req, false); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	result, err := h.db.Exec(`
-		UPDATE retention_policies SET
-			name = ?, database = ?, measurement = ?, retention_days = ?,
-			buffer_days = ?, is_active = ?, updated_at = CURRENT_TIMESTAMP
-		WHERE id = ?
-	`, req.Name, req.Database, req.Measurement, req.RetentionDays, req.BufferDays, req.IsActive, policyID)
+	set := []updateColumn{
+		{"name", req.Name.Set, req.Name.Value},
+		{"database", req.Database.Set, req.Database.Value},
+		{"measurement", req.Measurement.Set, measurementColumn(req.Measurement)},
+		{"retention_days", req.RetentionDays.Set, req.RetentionDays.Value},
+		{"buffer_days", req.BufferDays.Set, req.BufferDays.Value},
+		{"is_active", req.IsActive.Set, req.IsActive.Value},
+	}
+	assignments, args := buildUpdateSet(set)
+	if len(args) == 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "no fields to update"})
+	}
+
+	// retention_days > buffer_days spans two columns, and a body may carry
+	// either one alone, so it is checked against the values the row will hold
+	// — the body's where it carries one, the stored one where it does not — in
+	// the same statement that writes them, so no concurrent PUT can slip in
+	// between a read and the write. A stored NULL buffer reads as 0.
+	result, err := h.db.Exec(
+		"UPDATE retention_policies SET "+assignments+", updated_at = CURRENT_TIMESTAMP"+
+			" WHERE id = ? AND COALESCE(?, retention_days) > COALESCE(?, buffer_days, 0)",
+		append(args, policyID, req.RetentionDays.ptr(), req.BufferDays.ptr())...)
 
 	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint") {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": fmt.Sprintf("Retention policy with name %q already exists", req.Name.Value),
+			})
+		}
 		h.logger.Error().Err(err).Msg("Failed to update retention policy")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to update retention policy",
@@ -464,7 +546,22 @@ func (h *RetentionHandler) handleUpdate(c *fiber.Ctx) error {
 
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Retention policy not found"})
+		// Either no such policy, or the row's values would break the
+		// retention/buffer rule; tell them apart.
+		var exists int
+		err := h.db.QueryRow("SELECT 1 FROM retention_policies WHERE id = ?", policyID).Scan(&exists)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Retention policy not found"})
+		case err != nil:
+			h.logger.Error().Err(err).Msg("Failed to update retention policy")
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to update retention policy",
+			})
+		}
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "retention_days must be greater than buffer_days",
+		})
 	}
 
 	h.logger.Info().Int("policy_id", policyID).Msg("Updated retention policy")

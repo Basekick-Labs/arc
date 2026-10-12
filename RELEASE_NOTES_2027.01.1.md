@@ -940,6 +940,92 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Updating a continuous query or retention policy no longer resets the fields you leave out ([#1023](https://github.com/Basekick-Labs/arc/issues/1023))
+
+`PUT /api/v1/continuous_queries/:id` and `PUT /api/v1/retention/:id` wrote
+every column from the request body. Any field the body left out was stored as
+its zero value, and the call still returned `200`:
+
+- **A continuous query stopped producing.** Leaving out `is_active` stored
+  `false`, and the scheduler stopped the job and did not restart it. The only
+  signals were `is_active: false` in the response and a debug log line.
+  Leaving out `tag_columns` removed the dedup key compaction uses for the
+  query's output ([#521](https://github.com/Basekick-Labs/arc/issues/521)).
+- **A retention policy could delete more than it was set to.** Leaving out
+  `measurement` turned a policy pinned to one measurement into one that
+  deletes across the whole database. Leaving out `buffer_days` brought the
+  cutoff forward by the stored buffer, so data that many days younger was
+  deleted. Leaving out `is_active` paused the policy.
+
+**Both endpoints now take a partial update.** A field the body leaves out keeps
+its stored value. A field the body carries is checked with the same rules
+create applies, then written. So `{"is_active": false}` on its own pauses
+either kind of object. That is the request the Launchpad and Arc Cloud
+retention pause buttons and the Python client's update methods already send:
+it returned `400` before, and now works. A body with no fields at all is refused with `400`.
+
+`null` clears a field where an empty value means something:
+
+| Endpoint | Fields `null` clears | `null` refused (`400`) |
+|---|---|---|
+| Continuous query | `description`, `tag_columns`, `retention_days`, `delete_source_after_days` | `name`, `database`, `source_measurement`, `destination_measurement`, `query`, `interval`, `is_active` |
+| Retention policy | `measurement` (applies the policy to the whole database) | `name`, `database`, `retention_days`, `buffer_days`, `is_active` |
+
+`retention_days` must still be greater than `buffer_days`. When the body
+carries only one of the two, the other is the stored value, and the check runs
+in the same statement as the write.
+
+**What changes for API clients:**
+
+- **To clear a field, send `null`. Leaving the field out no longer clears
+  it.** This matters for an edit form that drops empty fields from the body:
+  clearing a continuous query's `description`, `retention_days` or
+  `delete_source_after_days`, or setting a pinned retention policy back to
+  "all measurements", is now ignored instead of applied. For a retention
+  policy, that means it keeps deleting only the measurement it was pinned to.
+- **Creating a continuous query without `is_active` now creates an active
+  one.** The column has always defaulted to active, but create stored `false`
+  instead, so such a query never ran. Send `"is_active": false` to create one
+  paused. Retention policies keep their create defaults on purpose
+  (`is_active` false, `buffer_days` 0): turning `is_active` on by default would
+  make policies that existing clients create start deleting data.
+- **A negative `buffer_days` is refused** on create and update. It moved the
+  cutoff the other way, deleting data younger than `retention_days`.
+- **A duplicate retention-policy name on update is now a `400`,** as on create,
+  instead of a `500`.
+- **An empty `measurement` on a retention policy is stored as `null`.** Both
+  have always meant the whole database. `GET` now returns `null` for both
+  instead of returning whichever one was sent.
+
+This replaces the 26.09.3 advice to send the whole definition on every `PUT`.
+Clients that do so keep working unchanged.
+
+**A continuous query whose `tag_columns` no longer match its query now fails
+its run instead of losing rows.** Compaction keeps one row per
+(tag values, time) in a measurement that declares `tag_columns`. Say the query
+groups by `host, region` but `tag_columns` lists only `host`. Compaction then
+deletes every region's row but one for each host and window. Nothing reported
+it.
+
+With this change, leaving `tag_columns` out of an update that changes the query
+keeps the old list, which made this mismatch easier to reach. So before a run
+writes anything, it now checks that no two output rows share the declared tag
+values and `time` while differing in another column. Rows identical in every
+column are allowed, since dropping one of them loses nothing. If the check
+fails, the run writes nothing and is recorded as failed, with an error naming
+`tag_columns`. A manual `POST /api/v1/continuous_queries/:id/execute` returns
+`422` in that case. The window is not marked processed, so it runs again once
+`tag_columns` lists every grouping column of the query.
+
+**Check this before upgrading:** after the upgrade, a continuous query will
+report failed runs if its output today repeats a (`tag_columns`, `time`) key
+with different values. Compaction was already reducing that output to one row
+per key, deleting the rest.
+
+The same hazard exists for a continuous query that declares no `tag_columns` at
+all. That one is in compaction, and is tracked separately in
+[#1227](https://github.com/Basekick-Labs/arc/issues/1227).
+
 ### The WAL is reclaimed again after a crash recovery ([#1222](https://github.com/Basekick-Labs/arc/issues/1222))
 
 After a restart that replayed WAL entries from the previous run, the periodic
