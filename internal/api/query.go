@@ -841,10 +841,15 @@ var (
 	// they are SQL Server procedure prefixes DuckDB has no notion of, and as
 	// substrings they refused any identifier containing them. The delete API's
 	// copy of the same two strings is tracked in #1077.
-	// numberGluedToWord matches a digit run at a token start that runs straight
-	// into letters, so `1UNION` can be split into `1 UNION` before the
-	// whole-word keyword scan.
-	numberGluedToWord = regexp.MustCompile(`(^|[^A-Za-z0-9_])([0-9]+)([a-z])`)
+	// numberGluedToWord matches a numeric literal at a token start that runs
+	// straight into letters, so `1UNION` can be split into `1 UNION` before the
+	// whole-word keyword scan. The literal is DuckDB's whole number token, not
+	// just its first digit run: digits with `_` separators, an optional
+	// fraction (`1.`, `.5`, `1.5`) and an optional exponent with or without a
+	// sign. DuckDB lexes `1e0UNION` and `1_0.5e1UNION` as a number then UNION;
+	// a digit-run-only match split those as `1 e0union`, which left no word
+	// boundary before the keyword (#1080). Runs on lower-cased input.
+	numberGluedToWord = regexp.MustCompile(`(^|[^A-Za-z0-9_.])((?:[0-9][0-9_]*(?:\.[0-9_]*)?|\.[0-9][0-9_]*)(?:e[+-]?[0-9][0-9_]*)?)([a-z])`)
 	// maskPlaceholder matches the lower-cased placeholders sqlutil.MaskStringLiterals
 	// leaves for string literals and quoted identifiers.
 	maskPlaceholder        = regexp.MustCompile(`__(?:str|ident)_[0-9]+__`)

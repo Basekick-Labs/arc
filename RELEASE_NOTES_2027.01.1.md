@@ -1003,6 +1003,24 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Delete API catches dangerous keywords glued to numbers or literals ([#1080](https://github.com/Basekick-Labs/arc/issues/1080))
+
+The delete endpoint's keyword scan used `\b` directly on the masked WHERE
+clause. Digits and the masker's identifier-shaped placeholders can prevent a
+word boundary, allowing inputs such as `1=1UNION ...` or `host='a'UNION ...`
+to pass this pre-filter. The validator now separates token-start keywords
+from numbers and removes literal placeholders before scanning, matching the
+query endpoint's existing handling.
+
+Both endpoints now split off a number the way DuckDB reads it, as one token:
+with `_` separators, a fraction (`1.`, `.5`) and an exponent with or without a
+sign. Before, only a plain digit run was split, so `1e0UNION`, `1.5e3UNION`,
+`1.e1UNION` or `1_0UNION` still hid the keyword from the delete endpoint and
+from the measurement query endpoint's WHERE check, while DuckDB ran them as a
+`UNION`.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1081](https://github.com/Basekick-Labs/arc/pull/1081).
+
 ### A storage error that only mentions "404" no longer reads as a missing object ([#1238](https://github.com/Basekick-Labs/arc/issues/1238))
 
 Arc decided whether an S3 or Azure object was missing by looking for `404`,
