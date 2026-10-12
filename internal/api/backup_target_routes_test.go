@@ -300,6 +300,29 @@ func newUnreachableTargetRig(t *testing.T, name string) *targetRig {
 	return &targetRig{app: app, manager: manager}
 }
 
+// TestUnreachableTargetWhoseURLHolds404IsNotAMissingBackup is #1238 made
+// deterministic. The SDK's transport error carries the request URL, and a
+// backup id stamps its time: one taken at 14:04:04 put "404" in every request
+// for it, so an unreachable target answered "Backup not found" (GET) and
+// started a restore with a guessed mode (POST, 202) instead of 503. CI hit the
+// same misreading by chance, through a local port in the 40400s.
+func TestUnreachableTargetWhoseURLHolds404IsNotAMissingBackup(t *testing.T) {
+	const id = "backup-20261007-140404-abcdef01"
+	rig := newUnreachableTargetRig(t, "audit")
+
+	if status, payload := rig.do(t, http.MethodGet, "/api/v1/backup/"+id, ""); status != fiber.StatusServiceUnavailable {
+		t.Fatalf("GET /api/v1/backup/%s = %d %v, want 503: the target is unreachable, not missing the backup", id, status, payload)
+	}
+	status, payload := rig.do(t, http.MethodPost, "/api/v1/backup/restore",
+		`{"backup_id":"`+id+`","confirm":true,"restore_metadata":false}`)
+	if status != fiber.StatusServiceUnavailable {
+		t.Fatalf("POST /api/v1/backup/restore = %d %v, want 503", status, payload)
+	}
+	if p := rig.manager.GetProgress(); p != nil {
+		t.Errorf("a restore was started (progress %+v)", p)
+	}
+}
+
 // TestUnreachableTargetIsReportedPerOperationNamingTheTarget is the shape the
 // unreachable-target matrix row fixes: the API comes up, and each operation
 // says which destination is unreachable rather than hanging or claiming the

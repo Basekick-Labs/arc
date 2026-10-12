@@ -463,7 +463,7 @@ func (b *S3Backend) Read(ctx context.Context, path string) ([]byte, error) {
 	})
 	if err != nil {
 		recordStorageError(ctx, err)
-		return nil, fmt.Errorf("failed to read from S3: %w", err)
+		return nil, readError(err)
 	}
 	defer result.Body.Close()
 
@@ -497,7 +497,7 @@ func (b *S3Backend) ReadTo(ctx context.Context, path string, writer io.Writer) e
 	})
 	if err != nil {
 		recordStorageError(ctx, err)
-		return fmt.Errorf("failed to read from S3: %w", err)
+		return readError(err)
 	}
 	defer result.Body.Close()
 
@@ -536,7 +536,7 @@ func (b *S3Backend) ReadToAt(ctx context.Context, path string, writer io.Writer,
 	result, err := b.client.GetObject(ctx, input)
 	if err != nil {
 		recordStorageError(ctx, err)
-		return fmt.Errorf("failed to read from S3: %w", err)
+		return readError(err)
 	}
 	defer result.Body.Close()
 
@@ -749,31 +749,55 @@ func (b *S3Backend) Exists(ctx context.Context, path string) (bool, error) {
 		Key:    aws.String(key),
 	})
 	if err != nil {
-		// Check if it's a "not found" error
-		var nsk *types.NoSuchKey
-		if ok := isNotFoundError(err); ok {
+		if isNotFoundError(err) {
 			return false, nil
 		}
-		// Treat other head object errors as "not found" for compatibility
-		if strings.Contains(err.Error(), "NotFound") || strings.Contains(err.Error(), "404") {
-			return false, nil
-		}
-		_ = nsk // silence unused variable warning
 		return false, fmt.Errorf("failed to check S3 object existence: %w", err)
 	}
 
 	return true, nil
 }
 
-// isNotFoundError checks if an error indicates the object doesn't exist
+// isNotFoundError reports S3 saying the key names no object. A GET answers a
+// missing key with NoSuchKey. A HEAD has no body, so the SDK names its 404
+// from the status, NotFound; that name is accepted only from a HEAD, because
+// on a GET it is what any bodiless or non-S3 404 becomes (a proxy's page).
+//
+// It reads the error's type, code and operation, never its text (#1238): the
+// text of every S3 error carries the request URL (endpoint, bucket, key), the
+// request ID and, for a transport failure, the local port, any of which can
+// contain "404" or "NotFound" on an error that means something else.
+//
+// A missing bucket is not a missing key: a GET answers NoSuchBucket, which
+// stays an error (see readError). A HEAD cannot tell the two apart — both are
+// a bodiless 404 — so StatFile and Exists still report a missing bucket as an
+// absent object.
 func isNotFoundError(err error) bool {
 	if err == nil {
 		return false
 	}
-	errStr := err.Error()
-	return strings.Contains(errStr, "NotFound") ||
-		strings.Contains(errStr, "NoSuchKey") ||
-		strings.Contains(errStr, "404")
+	var noSuchKey *types.NoSuchKey
+	if errors.As(err, &noSuchKey) {
+		return true
+	}
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	if apiErr.ErrorCode() != "NotFound" {
+		return false
+	}
+	var opErr *smithy.OperationError
+	return errors.As(err, &opErr) && opErr.OperationName == "HeadObject"
+}
+
+// readError wraps a failed GET, tagging a missing bucket with ErrStoreNotFound
+// the way listError does, so a caller never mistakes it for a missing key.
+func readError(err error) error {
+	if isNoSuchBucketError(err) {
+		return fmt.Errorf("failed to read from S3: %w: %w", err, ErrStoreNotFound)
+	}
+	return fmt.Errorf("failed to read from S3: %w", err)
 }
 
 // isNoSuchBucketError reports S3's answer for a bucket that does not exist.

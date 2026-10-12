@@ -1135,6 +1135,10 @@ func TestATransportFailureIsNeverClassifiedAsAMissingObject(t *testing.T) {
 		"context deadline exceeded",
 		"operation error S3: GetObject, exceeded maximum number of attempts, 3",
 		"RequestError: send request failed",
+		// #1238: a URL, a local port or a request id holding "404".
+		`operation error S3: GetObject, https response error StatusCode: 0, RequestID: , HostID: , request send failed, Get "http://127.0.0.1:40404/b/backups/backup-20261007-140404-abcdef01/manifest.json": dial tcp 127.0.0.1:40404: connect: connection refused`,
+		"read tcp 127.0.0.1:40412->127.0.0.1:9000: read: connection reset by peer",
+		"https response error StatusCode: 503, RequestID: 404NotFound, api error SlowDown",
 	} {
 		if storage.IsNotFound(errors.New(msg)) {
 			t.Errorf("storage.IsNotFound(%q) = true, want false: a transport failure is not an absent object", msg)
