@@ -632,7 +632,18 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	// compactor, which is exactly the guarantee the restore waits for.
 	isPauseSet := cmd.Type == clusterraft.CommandSetCompactionPause
 	isPauseAck := cmd.Type == clusterraft.CommandAckCompactionPause
-	if !isManifest && !isAuth && !isRBAC && !isBarrier && !isPauseSet && !isPauseAck && !isTakeOver {
+	// Compaction commit (#1207 d2): a compactor stages, commits, aborts,
+	// finalizes and reverts its jobs (the manifest role rule: the compactor
+	// lease can sit on a writer); any node that pulled a staged output
+	// (readers included) reports holding it. Each names the requesting node.
+	isCompaction := cmd.Type == clusterraft.CommandStageCompaction ||
+		cmd.Type == clusterraft.CommandCommitCompaction ||
+		cmd.Type == clusterraft.CommandAbortCompaction ||
+		cmd.Type == clusterraft.CommandFinalizeCompaction ||
+		cmd.Type == clusterraft.CommandRevertCompaction ||
+		cmd.Type == clusterraft.CommandCleanupCompaction
+	isCompactionHeld := cmd.Type == clusterraft.CommandCompactionHeld
+	if !isManifest && !isAuth && !isRBAC && !isBarrier && !isPauseSet && !isPauseAck && !isTakeOver && !isCompaction && !isCompactionHeld {
 		c.logger.Warn().
 			Str("requesting_node", req.NodeID).
 			Int("cmd_type", int(cmd.Type)).
@@ -640,7 +651,7 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeInvalidCommand, "command type not allowed via forwarding")
 		return
 	}
-	if ((isManifest || isPauseSet) && !caps.CanIngest && !caps.CanCompact) || (isTakeOver && !caps.CanIngest) {
+	if ((isManifest || isPauseSet) && !caps.CanIngest && !caps.CanCompact) || (isTakeOver && !caps.CanIngest) || (isCompaction && !caps.CanIngest && !caps.CanCompact) {
 		c.logger.Warn().
 			Str("peer", remoteAddr).
 			Str("requesting_node", req.NodeID).
@@ -662,7 +673,7 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		}
 	}
 
-	if isManifest || isTakeOver {
+	if isManifest || isTakeOver || isCompaction || isCompactionHeld {
 		if err := manifestCommandSpeaksFor(&cmd, req.NodeID); err != nil {
 			c.logger.Warn().
 				Err(err).
@@ -951,6 +962,62 @@ func manifestCommandSpeaksFor(cmd *clusterraft.Command, nodeID string) error {
 		}
 		if p.By != nodeID {
 			return fmt.Errorf("deleted batch settlement for %q is not by the requesting node", p.By)
+		}
+	case clusterraft.CommandStageCompaction:
+		var p clusterraft.StageCompactionPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.Origin != nodeID {
+			return fmt.Errorf("compaction stage for %q is not by the requesting node", p.Origin)
+		}
+	case clusterraft.CommandCommitCompaction:
+		var p clusterraft.CommitCompactionPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.Origin != nodeID {
+			return fmt.Errorf("compaction commit for %q is not by the requesting node", p.Origin)
+		}
+	case clusterraft.CommandCompactionHeld:
+		var p clusterraft.CompactionHeldPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.Node != nodeID {
+			return fmt.Errorf("compaction held for %q is not by the requesting node", p.Node)
+		}
+	case clusterraft.CommandAbortCompaction:
+		var p clusterraft.AbortCompactionPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.By != nodeID {
+			return fmt.Errorf("compaction abort for %q is not by the requesting node", p.By)
+		}
+	case clusterraft.CommandFinalizeCompaction:
+		var p clusterraft.FinalizeCompactionPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.By != nodeID || p.Override {
+			return fmt.Errorf("compaction finalize for %q is not by the requesting node, or overrides (leader only)", p.By)
+		}
+	case clusterraft.CommandRevertCompaction:
+		var p clusterraft.RevertCompactionPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.By != nodeID || p.Override {
+			return fmt.Errorf("compaction revert for %q is not by the requesting node, or overrides (leader only)", p.By)
+		}
+	case clusterraft.CommandCleanupCompaction:
+		var p clusterraft.CleanupCompactionPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.By != nodeID {
+			return fmt.Errorf("compaction cleanup for %q is not by the requesting node", p.By)
 		}
 	}
 	return nil

@@ -236,12 +236,12 @@ func TestLocalCapabilitiesFollowTheEffectiveCoverage(t *testing.T) {
 	c := originRig(t, "writer-1", RoleWriter)
 	c.cfg.WALCoverage = true // the setting alone is not enough
 	c.SetWALCoverageActive(true)
-	if caps := c.localCapabilities(); len(caps) != 0 {
+	if caps := c.localCapabilities(); hasCapability(caps, raft.CapabilityStreamClaims) {
 		t.Fatalf("advertised %v without cluster.stream_takeover", caps)
 	}
 	c.cfg.StreamTakeover = true
 	c.SetWALCoverageActive(false)
-	if caps := c.localCapabilities(); len(caps) != 0 {
+	if caps := c.localCapabilities(); hasCapability(caps, raft.CapabilityStreamClaims) {
 		t.Fatalf("advertised %v without coverage in effect", caps)
 	}
 	c.SetWALCoverageActive(true)
@@ -249,7 +249,7 @@ func TestLocalCapabilitiesFollowTheEffectiveCoverage(t *testing.T) {
 		t.Fatalf("advertised %v with coverage in effect", caps)
 	}
 	reader := originRig(t, "reader-1", RoleReader)
-	if caps := reader.localCapabilities(); len(caps) != 0 {
+	if caps := reader.localCapabilities(); hasCapability(caps, raft.CapabilityStreamClaims) {
 		t.Fatal("a reader advertised stream claims without cluster.stream_takeover")
 	}
 	reader.cfg.StreamTakeover = true
@@ -259,8 +259,14 @@ func TestLocalCapabilitiesFollowTheEffectiveCoverage(t *testing.T) {
 	// Claims name nodes: without an explicit node id (hostname-PID by
 	// default) the node never advertises them.
 	reader.cfg.NodeID = ""
-	if caps := reader.localCapabilities(); len(caps) != 0 {
+	if caps := reader.localCapabilities(); hasCapability(caps, raft.CapabilityStreamClaims) {
 		t.Fatalf("advertised %v without an explicit cluster.node_id", caps)
+	}
+	// Compaction commit (#1207 d2) needs nothing of the node.
+	for _, n := range []*Coordinator{c, reader} {
+		if !hasCapability(n.localCapabilities(), raft.CapabilityCompactionCommit) {
+			t.Fatalf("%s does not advertise compaction commit", n.localNode.ID)
+		}
 	}
 }
 

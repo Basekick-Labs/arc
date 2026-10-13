@@ -34,19 +34,27 @@ import (
 // default is hostname-PID, which changes at every restart on bare metal)
 // never advertises them.
 func (c *Coordinator) localCapabilities() []string {
+	// Compaction commit (#1207 d2) needs nothing of the node: every build
+	// that applies its rules advertises it.
+	caps := []string{raft.CapabilityCompactionCommit}
+	if c.streamClaimsCapable() {
+		caps = append(caps, raft.CapabilityStreamClaims)
+	}
+	return caps
+}
+
+// streamClaimsCapable reports whether this node advertises stream claims.
+func (c *Coordinator) streamClaimsCapable() bool {
 	if !c.cfg.StreamTakeover {
-		return nil
+		return false
 	}
 	if c.cfg.NodeID == "" {
 		c.nodeIDWarn.Do(func() {
 			c.logger.Error().Msg("cluster.stream_takeover needs an explicit cluster.node_id: stream takeover stays off on this node, and the cluster cannot enable it while this node is a member")
 		})
-		return nil
+		return false
 	}
-	if c.localNode.Role.GetCapabilities().CanIngest && !c.walCoverageActive.Load() {
-		return nil
-	}
-	return []string{raft.CapabilityStreamClaims}
+	return !c.localNode.Role.GetCapabilities().CanIngest || c.walCoverageActive.Load()
 }
 
 // SetWALCoverageActive records whether WAL coverage actually took effect on
@@ -156,10 +164,15 @@ func (c *Coordinator) maybeEnableStreamClaims() {
 // capability, and any Raft server that is not a capable FSM node (a member
 // whose AddNode never applied could run anything).
 func streamClaimsCandidates(fsmNodes []*raft.NodeInfo, config func() ([]string, error)) ([]string, []string) {
+	return capabilityCandidates(fsmNodes, config, raft.CapabilityStreamClaims)
+}
+
+// capabilityCandidates is streamClaimsCandidates for any capability.
+func capabilityCandidates(fsmNodes []*raft.NodeInfo, config func() ([]string, error), capability string) ([]string, []string) {
 	capable := map[string]bool{}
 	var nodes, blockers []string
 	for _, n := range fsmNodes {
-		if hasCapability(n.Capabilities, raft.CapabilityStreamClaims) {
+		if hasCapability(n.Capabilities, capability) {
 			capable[n.ID] = true
 			nodes = append(nodes, n.ID)
 		} else {
