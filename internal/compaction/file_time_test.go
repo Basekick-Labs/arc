@@ -44,7 +44,7 @@ func TestExtractNewestFileTimeCompactionFormats(t *testing.T) {
 		{"nondecimal batch", "cpu_20261010_123456_123456789_b1x_compacted.parquet", time.Time{}},
 		{"nonASCII batch", "cpu_20261010_123456_123456789_b١_compacted.parquet", time.Time{}},
 		{"missing measurement", "_20261010_123456_123456789_b1_compacted.parquet", time.Time{}},
-		{"invalid daily not rescued", "cpu_20260230_123456_20261010_b1_daily.parquet", time.Time{}},
+		{"invalid date batched daily", "cpu_20260230_123456_20261010_b1_daily.parquet", time.Time{}},
 		{"invalid daily date", "cpu_20260230_daily.parquet", time.Time{}},
 		{"date-only hourly unsupported", "cpu_20261010_compacted.parquet", time.Time{}},
 		{"batch raw unsupported", "cpu_20261010_123456_123456789_b1.parquet", time.Time{}},

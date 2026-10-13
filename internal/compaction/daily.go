@@ -253,8 +253,9 @@ func (t *DailyTier) groupDayPartitions(database, measurement string, objects []s
 }
 
 // extractNewestFileTime extracts the newest file creation time from a list of file paths.
-// Supports raw files, tier outputs with optional nanos and batch numbers,
-// and legacy date-only daily outputs. Timestamp fields are read from the tail
+// Supports raw files and tier outputs with optional nanos and batch numbers.
+// A date-only daily name ({measurement}_{YYYYMMDD}_daily) is also accepted,
+// though no Go release has written one. Timestamp fields are read from the tail
 // because measurement names may contain underscores. Precision stays at seconds.
 // Returns zero time if no valid timestamps found.
 func extractNewestFileTime(files []string) time.Time {
@@ -294,7 +295,9 @@ func extractNewestFileTime(files []string) time.Time {
 				if err == nil && fileTime.After(newest) {
 					newest = fileTime
 				}
-				continue // Invalid batch timestamps must not fall back to legacy daily dates.
+				// The batched shape ends here either way: neither legacy split
+				// nor the date-only form can parse a name ending in nanos_bN.
+				continue
 			}
 			if n < 2 {
 				continue
