@@ -2100,7 +2100,10 @@ func main() {
 							// its sources_deleted applies stay ungated, they
 							// are the drain the pause ack waits for.
 							PauseGate: clusterCoordinator.CompactionPaused,
-							Logger:    logger.Get("compaction-watcher"),
+							// The staged compaction commit (#1207 d2a2a).
+							Staged:  clusterCoordinator.StagedCommitter(),
+							Storage: storageBackend,
+							Logger:  logger.Get("compaction-watcher"),
 						})
 						if werr != nil {
 							// The quiescer is told a watcher was expected and
@@ -2110,6 +2113,16 @@ func main() {
 							log.Warn().Err(werr).Msg("Failed to construct compaction completion watcher; this node will not acknowledge cluster-wide compaction pauses")
 						} else {
 							completionWatcher = watcher
+							if compactionManager != nil {
+								watcher.SetStagedObservers(compactionManager.BeforeStagedCommit, compactionManager.FinishStaged)
+								compactionManager.SetStagedCommit(clusterCoordinator.StagedCompactionMode,
+									clusterCoordinator.CompactionInputLookup, watcher.LocallyStagedInput)
+							}
+							var holds func(string) bool
+							if registrationOutbox != nil {
+								holds = registrationOutbox.HoldsRegistration
+							}
+							clusterCoordinator.SetStagedCompactionHooks(watcher.HasStagedJob, holds)
 						}
 					}
 					clusterCoordinator.SetCompactionQuiescer(newCompactionQuiescer(
@@ -4225,6 +4238,11 @@ func main() {
 		if err == nil && registrationOutbox != nil {
 			// A file pending registration is unregistered, not an orphan (#1212).
 			reconciler.SetPendingFilter(registrationOutbox.HoldsRegistration)
+		}
+		if err == nil {
+			// A committed compaction output moving into place here is not an
+			// orphan entry (#1207 d2a2a).
+			reconciler.SetHeldFilter(clusterCoordinator.CompactionOutputHeld)
 		}
 		if err != nil {
 			log.Error().Err(err).Msg("Failed to create reconciler — feature disabled")

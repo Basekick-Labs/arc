@@ -6,6 +6,7 @@ package reconciliation
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -35,5 +36,32 @@ func TestReconcile_KeepsAFileStillPendingRegistration(t *testing.T) {
 	}
 	if run.SkippedPending != 1 {
 		t.Fatalf("SkippedPending = %d, want 1", run.SkippedPending)
+	}
+}
+
+// #1207 d2a2a: a committed compaction output still moving into place here is
+// registered and briefly absent, not an orphan entry.
+func TestReconcile_KeepsAManifestEntryHeldForAdoption(t *testing.T) {
+	now := time.Now().UTC()
+	const held = "db/m/2026/04/27/12/held.parquet"
+	const missing = "db/m/2026/04/27/12/missing.parquet"
+	coord := newFakeCoordinator(fileEntry(held, "node-a"), fileEntry(missing, "node-a"))
+	store := newFakeBackend()
+	store.put("db/m/2026/04/27/12/a.parquet", now.Add(-2*time.Hour))
+	r := newReconciler(t, Config{Enabled: true, BackendKind: BackendShared}, coord, store, &fakeGate{scan: true, sweep: true})
+	r.SetHeldFilter(func(path string) bool { return path == held })
+	run, err := r.Reconcile(context.Background(), false)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if run.SkippedHeld != 1 || run.ManifestDeletes != 1 {
+		t.Fatalf("held %d manifest deletes %d", run.SkippedHeld, run.ManifestDeletes)
+	}
+	for _, call := range coord.batchCalls {
+		for _, op := range call {
+			if strings.Contains(string(op.Payload), held) {
+				t.Fatal("the held entry was deleted")
+			}
+		}
 	}
 }

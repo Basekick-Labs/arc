@@ -69,7 +69,24 @@ const (
 	// from storage. The watcher applies both RegisterFile and DeleteFile
 	// in this state and then removes the manifest file.
 	CompletionStateSourcesDeleted CompletionState = "sources_deleted"
+
+	// CompletionStateStaged (#1207 d2a2a, compaction commit on, local
+	// storage): the output is durable at StagedKey, under a reserved root no
+	// query reads, and the inputs are untouched. The watcher stages the job
+	// in the cluster, waits for another node to hold the output, and commits
+	// it: the output is registered and the inputs deleted in one entry, only
+	// if every input is still registered as the job read it. Outputs stays
+	// empty, so a build without this state never registers the output at a
+	// path where nothing is.
+	CompletionStateStaged CompletionState = "staged"
 )
+
+// StagedInput is one input of a staged job as the job read it.
+type StagedInput struct {
+	Path      string `json:"path"`
+	SizeBytes int64  `json:"size_bytes"`
+	SHA256    string `json:"sha256"`
+}
 
 // CompactedOutput describes a single compacted file produced by a job. All
 // fields are required when the enclosing manifest is in state
@@ -110,8 +127,13 @@ type CompletionManifest struct {
 	State          CompletionState   `json:"state"`           // lifecycle phase; drives watcher behavior
 	Outputs        []CompactedOutput `json:"outputs"`         // set when State >= output_written
 	DeletedSources []string          `json:"deleted_sources"` // set when State == sources_deleted; storage-relative paths
-	CreatedAt      time.Time         `json:"created_at"`      // when the manifest was first written
-	UpdatedAt      time.Time         `json:"updated_at"`      // bumped on every state transition
+	// Staged state only: where the output waits, the output it becomes, and
+	// the inputs the commit deletes.
+	StagedKey    string           `json:"staged_key,omitempty"`
+	StagedOutput *CompactedOutput `json:"staged_output,omitempty"`
+	Inputs       []StagedInput    `json:"inputs,omitempty"`
+	CreatedAt    time.Time        `json:"created_at"` // when the manifest was first written
+	UpdatedAt    time.Time        `json:"updated_at"` // bumped on every state transition
 }
 
 // writeCompletionManifest serializes m to {dir}/{JobID}.json atomically via

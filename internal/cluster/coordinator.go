@@ -143,7 +143,9 @@ type Coordinator struct {
 	nodeIDWarn           sync.Once   // stream takeover without an explicit node id, logged once
 	streamClaimsBlockers atomic.Pointer[[]string]
 	// compactionCommit: the #1207 d2 flag's join gate and blockers.
-	compactionCommit     compactionCommitGate
+	compactionCommit compactionCommitGate
+	// staged: the staged compaction commit, replica side (#1207 d2a2a).
+	staged               stagedReplica
 	walCoverageActive    atomic.Bool // SetWALCoverageActive
 	ingestFenceListeners []func(fenced bool)
 	takeoverOrigin       atomic.Pointer[takeoverOriginState] // SetTakeoverOrigin (#1207 S4b)
@@ -443,6 +445,7 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 		stopCh:              make(chan struct{}),
 		replicationRetarget: make(chan struct{}, 1),
 		logger:              logger,
+		staged:              stagedReplica{fetching: map[string]bool{}, wake: make(chan struct{}, 1), goneSince: map[string]time.Time{}},
 	}
 
 	if tlsCfg != nil {
@@ -1279,6 +1282,9 @@ func (c *Coordinator) unlinkOne(item deleteRequest, relisted func(string) (bool,
 			return
 		}
 	}
+	// A compaction input stays readable until this node's staged copy of
+	// the output is in place (#1207 d2a2a; bounded).
+	c.waitStagedAdoption(item.reason)
 	// One budget for the stat and the delete together. Both are a syscall on
 	// a local backend, which is the only backend this path runs on.
 	delCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -2611,6 +2617,15 @@ func (c *Coordinator) handleFetchFile(conn net.Conn, req *protocol.FetchFileRequ
 		return
 	}
 	entry, ok := fsm.GetFile(sanitized)
+	if !ok {
+		// A staged compaction output (#1207 d2a2a): served only while its
+		// job is staged, from the key the FSM entry names, with the
+		// output's checksum and size.
+		if st, staged := fsm.StagedCompactionByKey(sanitized); staged {
+			sanitized = raft.StagedCompactionKey(st.Job, st.Output.Path)
+			entry, ok = &raft.FileEntry{Path: sanitized, SHA256: st.Output.SHA256, SizeBytes: st.Output.SizeBytes}, true
+		}
+	}
 	if !ok {
 		c.logger.Debug().
 			Str("peer", remoteAddr).
@@ -4321,6 +4336,9 @@ func (c *Coordinator) startFilePullerLocked() error {
 		CatchUpQueueHighWater:   c.cfg.ReplicationCatchUpQueueHighWater,
 		ReconciliationInterval:  time.Duration(c.cfg.ReplicationReconciliationIntervalSeconds) * time.Second,
 		ReconciliationGate:      c.canRunFileReconciliation,
+		// A committed compaction output this node holds staged is moved
+		// into place instead of pulled (#1207 d2a2a).
+		AdoptStaged: c.adoptStagedForPull,
 		// Lets the puller stop pulling, and stop counting against the query
 		// gate, an entry that left the manifest while its pull was queued or
 		// in flight (#759, #795), while also identifying superseding versions.
@@ -4451,6 +4469,16 @@ func (c *Coordinator) startFilePullerLocked() error {
 	puller.Start(context.Background())
 	c.puller = puller
 	c.fetcher = fetchClient
+	// The staged compaction commit (#1207 d2a2a), once the puller and the
+	// fetch client it uses are in place: pull staged outputs, move committed
+	// ones into place, sweep leftovers; abort orphans as leader. This node
+	// holds staged outputs from here on, and says so at its join.
+	if c.storage.Type() == "local" {
+		fsm.SetCompactionCallbacks(c.onCompactionStaged, c.onCompactionGone, c.onCompactionCommitted)
+		go c.stagedReplicaLoop(c.ctx)
+		c.staged.replicaReady.Store(true)
+	}
+	go c.stagedLeaderLoop(c.ctx)
 	if backend.Type() == "local" {
 		go c.vanishedSweepLoop(c.ctx)
 	}

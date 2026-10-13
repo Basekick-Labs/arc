@@ -306,6 +306,9 @@ type Run struct {
 	// SkippedPending counts orphan-storage candidates kept because this node
 	// flushed them and the manifest has not confirmed them yet (#1212).
 	SkippedPending int `json:"skipped_pending"`
+	// SkippedHeld counts orphan-manifest candidates kept because the file
+	// is moving into place here (a committed compaction output).
+	SkippedHeld int `json:"skipped_held,omitempty"`
 
 	// SkippedTransient counts entries a sweep passed over because a storage
 	// call failed in a way that may succeed later (a throttle, a timeout, an
@@ -370,6 +373,11 @@ type Reconciler struct {
 	// has not confirmed yet (#1212): unregistered, but not an orphan.
 	isPending atomic.Pointer[func(string) bool]
 
+	// isHeld reports a manifest entry absent here on purpose for a moment
+	// (#1207 d2a2a): a committed compaction output still moving into place
+	// from its staged copy. Not an orphan.
+	isHeld atomic.Pointer[func(string) bool]
+
 	// History is a small fixed-size ring buffer of recent runs. All
 	// access goes through mu. Layout: history is allocated to
 	// runHistoryCap at construction; writes land at history[head] and
@@ -393,6 +401,12 @@ const runHistoryCap = 10
 // orphan-storage sweep (#1212). Safe to call while runs are scheduled.
 func (r *Reconciler) SetPendingFilter(fn func(path string) bool) {
 	r.isPending.Store(&fn)
+}
+
+// SetHeldFilter keeps manifest entries that are on their way to this node
+// out of the orphan-manifest sweep (#1207 d2a2a).
+func (r *Reconciler) SetHeldFilter(fn func(path string) bool) {
+	r.isHeld.Store(&fn)
 }
 
 func NewReconciler(
