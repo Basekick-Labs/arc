@@ -131,6 +131,8 @@ func TestValidateTagColumns(t *testing.T) {
 		{"quote rejected (injection guard)", []string{"host\""}, true},
 		{"paren rejected", []string{"count(*)"}, true},
 		{"dot rejected", []string{"db.host"}, true},
+		{"leading underscore rejected (column not stored)", []string{"_host"}, true},
+		{"inner underscore valid", []string{"data_center_"}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

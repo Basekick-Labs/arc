@@ -1451,6 +1451,11 @@ func validateTagColumns(tags []string) error {
 		if strings.EqualFold(name, "time") {
 			return fmt.Errorf("tag column %q is reserved: time is always part of the dedup key and must not be listed", name)
 		}
+		// Arc does not store a column whose name starts with '_', so such a tag
+		// would name nothing in the output files (#1258).
+		if strings.HasPrefix(name, "_") {
+			return fmt.Errorf("invalid tag column %q: names starting with an underscore are not stored", name)
+		}
 		for _, c := range name {
 			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
 				return fmt.Errorf("invalid tag column %q: only alphanumeric, underscore, and hyphen are allowed", name)

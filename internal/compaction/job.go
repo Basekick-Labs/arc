@@ -817,10 +817,12 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	// instead of surfacing a Binder Error every cycle. A probe FAILURE is not a
 	// skip — proceed and let the compaction query produce the authoritative
 	// error, so a transient read problem doesn't silently strand a partition.
-	hasTime, err := parquetFilesHaveTimeColumn(ctx, db, fileListSQL)
+	// The same probe gives decideDedup the columns its tag names must match.
+	columns, err := parquetFilesColumns(ctx, db, fileListSQL)
 	if err != nil {
 		j.logger.Warn().Err(err).Msg("Failed to probe parquet schema for time column; attempting compaction anyway")
-	} else if !hasTime {
+		columns = nil
+	} else if !hasTimeColumn(columns) {
 		return "", errNoTimeColumn
 	}
 
@@ -830,7 +832,7 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 
 	// Auto-dedup: decide from the files' metadata how this batch removes
 	// duplicate rows (see decideDedup).
-	tagColumns, mode := j.decideDedup(ctx, db, validLocalPaths)
+	tagColumns, mode := j.decideDedup(ctx, db, validLocalPaths, columns)
 
 	// Build and execute compaction statement(s) (with dedup if tag metadata found).
 	// The dedup path returns three statements (two CREATE OR REPLACE TEMP TABLE,
@@ -948,9 +950,12 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 // time for marked output — so a correction, a partial write of other fields,
 // or a re-run continuous-query window with late data lost every row but one.
 //
+// Tag names the files have no column for are left out of the key (#1258);
+// columns is nil when the schema probe failed, and then every name is kept.
+//
 // A failure reading metadata skips dedup for the batch: keeping a duplicate
 // is recoverable, guessing a key is not.
-func (j *Job) decideDedup(ctx context.Context, db *sql.DB, localPaths []string) ([]string, dedupMode) {
+func (j *Job) decideDedup(ctx context.Context, db *sql.DB, localPaths []string, columns map[string]string) ([]string, dedupMode) {
 	if len(localPaths) == 0 {
 		return nil, dedupNone
 	}
@@ -958,6 +963,16 @@ func (j *Job) decideDedup(ctx context.Context, db *sql.DB, localPaths []string) 
 	if err != nil {
 		j.logger.Warn().Err(err).Msg("Failed to read tag metadata from parquet, skipping dedup")
 		return nil, dedupNone
+	}
+	if columns != nil {
+		var missing []string
+		tags, missing = tagsWithColumns(tags, columns)
+		if len(missing) > 0 {
+			j.logger.Warn().
+				Strs("missing_tag_columns", missing).
+				Strs("tag_columns", tags).
+				Msg("Tag metadata names columns the files do not have; deduplicating on the remaining tags")
+		}
 	}
 	if len(tags) > 0 {
 		j.logger.Info().
