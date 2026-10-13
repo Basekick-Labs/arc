@@ -1079,6 +1079,9 @@ type ArrowBuffer struct {
 	// every write to a hot measurement, and an unsampled line per deferral
 	// floods the log exactly when an operator needs to read it.
 	flushDeferredLastLogNano atomic.Int64
+	// tagDropLastLogNano is the sampler timestamp for the Warn that names tag
+	// columns left out of a file's arc:tags (writableTagColumns).
+	tagDropLastLogNano atomic.Int64
 
 	// closeFlushClean records whether Close()'s final flush persisted every
 	// buffered record. False until Close() completes successfully, so callers
@@ -4092,6 +4095,11 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	minTime := time.UnixMicro(globalMin).UTC()
 	maxTime := time.UnixMicro(globalMax).UTC()
 
+	// The tag names written to the files' arc:tags metadata: only names
+	// compaction can use (#1258). The field-schema registry still gets the
+	// names as sent, for column ordering.
+	fileTags := b.fileTagColumns(database, measurement, merged)
+
 	// Log warning if data is significantly old or in the future
 	now := time.Now().UTC()
 	if minTime.Before(now.AddDate(0, 0, -7)) {
@@ -4114,7 +4122,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		// Single hour - sort once and write one file
 		sorted := sortTypedColumnBatchByKeys(merged, sortKeys)
 
-		parquetData, fileSchema, err := b.writer.writeParquetColumnarWithSchema(ctx, measurement, sorted.Data, sorted.Validity, sorted.TagColumns, sorted.DedupTime, decimalCols)
+		parquetData, fileSchema, err := b.writer.writeParquetColumnarWithSchema(ctx, measurement, sorted.Data, sorted.Validity, fileTags, sorted.DedupTime, decimalCols)
 		if err != nil {
 			return fmt.Errorf("failed to write Parquet: %w", err)
 		}
@@ -4195,7 +4203,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		sorted := sortTypedColumnBatchByKeys(hourBatch, sortKeys)
 
 		// Write Parquet file for this hour
-		parquetData, fileSchema, err := b.writer.writeParquetColumnarWithSchema(ctx, measurement, sorted.Data, sorted.Validity, sorted.TagColumns, sorted.DedupTime, decimalCols)
+		parquetData, fileSchema, err := b.writer.writeParquetColumnarWithSchema(ctx, measurement, sorted.Data, sorted.Validity, fileTags, sorted.DedupTime, decimalCols)
 		if err != nil {
 			return fmt.Errorf("failed to write Parquet for hour %d: %w", hourID, err)
 		}

@@ -8,6 +8,9 @@ MessagePack columnar payloads now accept an optional `tag_keys` field to
 identify tag columns explicitly. Generic and typed decoding, WAL recovery
 and replication preserve these names for downstream tag metadata and
 compaction deduplication. Payloads without `tag_keys` remain supported.
+A name that would stop compaction, such as one that is not a column of the
+data, is left out with a warning, and the write succeeds
+([#1258](https://github.com/Basekick-Labs/arc/issues/1258)).
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir)
 in [#905](https://github.com/Basekick-Labs/arc/pull/905).
@@ -1136,6 +1139,45 @@ negative or unparseable value is a startup error naming the value rather than
 an unbounded operation.
 
 ## Bug fixes
+
+### A tag name with no matching column no longer stops a partition from compacting ([#1258](https://github.com/Basekick-Labs/arc/issues/1258))
+
+Ingest records each file's tag names in its `arc:tags` metadata, and
+compaction deduplicates on them. A name with no column of that name in the
+files could not be used by compaction, so every cycle failed the same way and
+the partition never compacted. Because compaction combines the tag names of
+all files in a partition, one such file was enough to stop the whole
+measurement-hour. Three inputs produced these names:
+
+- A MessagePack `tag_keys` entry that is not a column of the payload, such as
+  a typo, or a name containing a comma. New in this release.
+- A line-protocol tag key that starts with `_`. Arc does not store columns
+  whose name starts with `_`, but it still recorded the key as a tag. This
+  affects earlier releases.
+- A line-protocol tag key with an escaped comma (`a\,b=1`). The metadata
+  separates names with commas, so it read back as two tags, `a` and `b`. This
+  affects earlier releases.
+
+Ingest no longer records a tag name that is empty, is `time`, contains a
+comma, starts with `_`, repeats an earlier name, or is not a column of the
+data being written. Names are matched to columns exactly, including case. The
+rows are always written, and a warning names what was left out. The warning
+is logged at most once per second.
+
+Compaction now ignores tag names its files have no column for and
+deduplicates on the remaining ones. Partitions stuck by files from earlier
+releases compact again without any action. Deduplication still removes only
+rows that are identical in every column, so a shorter tag list never makes
+two different rows equal.
+
+Tag names with other characters, such as the dot in OTel-style keys like
+`service.name`, are handled as before. They are kept, and compaction skips
+deduplication for any batch of files that includes one.
+
+Creating or updating a continuous query now refuses a `tag_columns` entry
+that starts with `_`, because Arc does not store those columns. A query
+already saved with one keeps running, and that name is left out of its
+output's tag metadata.
 
 ### Compaction works with Azure storage on a connection string or SAS token ([#1104](https://github.com/Basekick-Labs/arc/issues/1104))
 

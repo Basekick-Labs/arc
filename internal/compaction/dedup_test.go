@@ -180,3 +180,21 @@ func TestBuildCompactionQuery_ExactRowsTaglessOrderAndMarker(t *testing.T) {
 		t.Errorf("configured sort keys ignored:\n%s", q)
 	}
 }
+
+// Tag names are matched to the files' columns ignoring ASCII case, as DuckDB
+// binds them, and nothing else: the Kelvin sign folds to "k" under Unicode
+// rules, but DuckDB keeps the two names apart, so a match on it would keep a
+// name that cannot bind (#1258).
+func TestTagsWithColumns(t *testing.T) {
+	cols := map[string]string{"time": "time", asciiLower("Host"): "Host", "key": "key"}
+	kept, missing := tagsWithColumns([]string{"host", "HOST", "\u212Aey", "region"}, cols)
+	if want := []string{"host", "HOST"}; strings.Join(kept, ",") != strings.Join(want, ",") {
+		t.Errorf("kept = %v, want %v", kept, want)
+	}
+	if want := []string{"\u212Aey", "region"}; strings.Join(missing, ",") != strings.Join(want, ",") {
+		t.Errorf("missing = %v, want %v", missing, want)
+	}
+	if !hasTimeColumn(cols) || hasTimeColumn(map[string]string{"time": "Time"}) {
+		t.Error("hasTimeColumn must match a column named exactly time")
+	}
+}
