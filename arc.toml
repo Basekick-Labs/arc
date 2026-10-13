@@ -96,6 +96,12 @@ s3_path_style = true        # MinIO/dev. AWS S3: false
 # Ingestion
 # -----------------------------------------------------------------------------
 [ingest]
+# max_buffer_size is a per-measurement trigger; held memory is roughly
+# active_measurements * max_buffer_size * bytes_per_record. The age trigger
+# often fires first. Lower either setting to reduce held memory (more, smaller
+# Parquet files); raise them when storage is fast and files are too small.
+# Arc exports approximate buffered-byte and oldest-unflushed-age gauges, and
+# warns when buffered bytes reach 50% of the detected process memory limit.
 max_buffer_size = 5000000   # Records before flush (default: 50000)
 max_buffer_age_ms = 100   # Max buffer age before flush
 

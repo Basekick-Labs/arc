@@ -156,6 +156,8 @@ func (c *TimeSeriesCollector) collect() {
 			"buffer_queue_depth":          m.bufferQueueDepth.Load(),
 			"buffer_records_queued":       m.bufferRecordsQueued.Load(),
 			"buffer_records_inflight":     m.bufferRecordsInflight.Load(),
+			"buffer_bytes_buffered":       m.bufferBytesBuffered.Load(),
+			"buffer_oldest_unflushed_ms":  m.bufferOldestAgeNS.Load() / int64(time.Millisecond),
 			"buffer_flushes_total":        m.bufferFlushesTotal.Load(),
 			"buffer_errors_total":         m.bufferErrorsTotal.Load(),
 			"buffer_flush_failures_total": m.bufferFlushFailures.Load(),

@@ -184,6 +184,8 @@ func TestTimeSeriesCollector_CollectedMetrics(t *testing.T) {
 			"buffer_queue_depth",
 			"buffer_records_queued",
 			"buffer_records_inflight",
+			"buffer_bytes_buffered",
+			"buffer_oldest_unflushed_ms",
 			"buffer_flushes_total",
 			"buffer_flush_failures_total",
 			"storage_writes_total",

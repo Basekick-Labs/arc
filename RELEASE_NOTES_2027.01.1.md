@@ -1286,6 +1286,32 @@ They also appear as `buffer_records_queued` and `buffer_records_inflight` in
 count with a flat buffered one means storage is the bottleneck, not the write
 rate.
 
+### Ingest reports buffered memory in bytes, and warns before it becomes a problem ([#1025](https://github.com/Basekick-Labs/arc/issues/1025))
+
+Ingest buffers grow with active measurements, `max_buffer_size` and slow
+storage, and Arc does not cap them. Until now the only signal was a record count,
+and bytes per record vary more than 100x between workloads, so it could not
+answer how much memory ingest holds. Three new gauges and a warning do:
+
+- `arc_buffer_bytes_buffered`: approximate bytes held by ingest, across
+  buffers, the flush queue and writes in progress. MessagePack writes count
+  their payload size; other writes estimate from their columns.
+- `arc_buffer_oldest_unflushed_seconds`: age of the oldest record not yet in
+  storage, including queued and in-flight flushes. It is what a crash would
+  lose without the WAL.
+- `arc_buffer_memory_limit_bytes` and `arc_buffer_memory_pressure`: the memory
+  limit Arc detected (the container limit where there is one) and whether
+  buffered bytes have reached half of it.
+
+When buffered bytes reach 50% of the limit, Arc logs a warning naming the two
+settings that reduce held memory: `ingest.max_buffer_size` and
+`ingest.max_buffer_age_ms`. Lowering either flushes sooner, at the cost of more,
+smaller Parquet files and more compaction work. The warning fires once per
+episode: it re-arms only after usage falls below 40%. Arc still rejects nothing
+and caps nothing.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1040](https://github.com/Basekick-Labs/arc/pull/1040).
+
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1042](https://github.com/Basekick-Labs/arc/pull/1042).
 
 ### Arc's own storage roots are no longer treated as databases ([#1012](https://github.com/Basekick-Labs/arc/issues/1012))
