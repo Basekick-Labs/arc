@@ -1043,6 +1043,43 @@ func (m *Manager) CompactPartition(ctx context.Context, candidate Candidate) err
 	return m.compactPartition(ctx, candidate, jobAttribution{})
 }
 
+// subprocessJob builds the job a compaction subprocess runs for candidate.
+func (m *Manager) subprocessJob(candidate Candidate, jobID string) *SubprocessJobConfig {
+	config := &SubprocessJobConfig{
+		Database:      candidate.Database,
+		Measurement:   candidate.Measurement,
+		PartitionPath: candidate.PartitionPath,
+		Files:         candidate.Files,
+		Tier:          candidate.Tier,
+		BatchNumber:   candidate.BatchNumber,
+		TempDirectory: m.TempDirectory,
+		MemoryLimit:   m.MemoryLimit,
+		Threads:       m.Threads,
+		SortKeys:      m.GetSortKeys(candidate.Measurement),
+		StorageType:   m.StorageBackend.Type(),
+		StorageConfig: m.StorageBackend.ConfigJSON(),
+		// Phase 4: cluster-mode fields. CompletionDir is empty in OSS
+		// (Manager.CompletionDir is never set), so the subprocess's
+		// clusterMode() returns false and no completion manifest is
+		// written — behavior is byte-identical to pre-Phase-4.
+		JobID:         jobID,
+		CompletionDir: m.CompletionDir,
+		PartitionTime: candidate.PartitionTime,
+	}
+	// When the hub observes consumed inputs (#619), the subprocess leaves
+	// the crash-recovery manifest in place and THIS process deletes it after
+	// receipt marking commits — the manifest-before-storage discipline
+	// applied to bookkeeping: a crash in the window re-fires the marks via
+	// recovery instead of silently losing them.
+	m.mu.Lock()
+	config.ParentFinalizesManifest = m.onConsumedInputs != nil
+	m.mu.Unlock()
+
+	// The storage credentials travel in the job itself, over stdin (#1104).
+	config.Credentials = subprocessCredentials(m.StorageBackend)
+	return config
+}
+
 // compactPartition is CompactPartition with job attribution. attr says which
 // cycle dispatched the work and how deep in the adaptive splitter the attempt
 // sits. A zero CycleID means "outside any cycle": the history entry then
@@ -1096,54 +1133,10 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 		time.Now().UnixNano(),
 		candidate.BatchNumber,
 	)
-	config := &SubprocessJobConfig{
-		Database:      candidate.Database,
-		Measurement:   candidate.Measurement,
-		PartitionPath: candidate.PartitionPath,
-		Files:         candidate.Files,
-		Tier:          candidate.Tier,
-		BatchNumber:   candidate.BatchNumber,
-		TempDirectory: m.TempDirectory,
-		MemoryLimit:   m.MemoryLimit,
-		Threads:       m.Threads,
-		SortKeys:      m.GetSortKeys(candidate.Measurement),
-		StorageType:   m.StorageBackend.Type(),
-		StorageConfig: m.StorageBackend.ConfigJSON(),
-		// Phase 4: cluster-mode fields. CompletionDir is empty in OSS
-		// (Manager.CompletionDir is never set), so the subprocess's
-		// clusterMode() returns false and no completion manifest is
-		// written — behavior is byte-identical to pre-Phase-4.
-		JobID:         jobID,
-		CompletionDir: m.CompletionDir,
-		PartitionTime: candidate.PartitionTime,
-	}
-	// When the hub observes consumed inputs (#619), the subprocess leaves
-	// the crash-recovery manifest in place and THIS process deletes it after
-	// receipt marking commits — the manifest-before-storage discipline
-	// applied to bookkeeping: a crash in the window re-fires the marks via
-	// recovery instead of silently losing them.
-	m.mu.Lock()
-	config.ParentFinalizesManifest = m.onConsumedInputs != nil
-	m.mu.Unlock()
-
-	// Build extra environment variables for subprocess (storage credentials)
-	var extraEnv []string
-	if azureBackend, ok := m.StorageBackend.(*storage.AzureBlobBackend); ok {
-		if key := azureBackend.GetAccountKey(); key != "" {
-			extraEnv = append(extraEnv, "AZURE_STORAGE_KEY="+key)
-		}
-	}
-	if s3Backend, ok := m.StorageBackend.(*storage.S3Backend); ok {
-		if accessKey := s3Backend.GetAccessKey(); accessKey != "" {
-			extraEnv = append(extraEnv, "AWS_ACCESS_KEY_ID="+accessKey)
-		}
-		if secretKey := s3Backend.GetSecretKey(); secretKey != "" {
-			extraEnv = append(extraEnv, "AWS_SECRET_ACCESS_KEY="+secretKey)
-		}
-	}
+	config := m.subprocessJob(candidate, jobID)
 
 	// Run compaction in subprocess for memory isolation
-	result, err := RunJobInSubprocess(ctx, config, m.logger, extraEnv...)
+	result, err := RunJobInSubprocess(ctx, config, m.logger)
 
 	// Always clean up temp directories for this partition after subprocess completes.
 	// The subprocess has its own defer cleanup, but if it crashes or gets OOM-killed,

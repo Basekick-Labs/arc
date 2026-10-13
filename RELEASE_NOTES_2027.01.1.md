@@ -1127,6 +1127,32 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Compaction works with Azure storage on a connection string or SAS token ([#1104](https://github.com/Basekick-Labs/arc/issues/1104))
+
+Compaction runs in a separate process, and that process authenticated to Azure
+Blob Storage its own way: with the account key, or with managed identity when
+there was none. Azure primary storage that used either of the other two
+authentication methods the configuration accepts could not compact. Every
+compaction job failed, and data stayed in its small ingest files:
+
+- **`storage.azure_connection_string`** with no `azure_account_name`: every job
+  failed with `no valid Azure authentication method configured`.
+- **A connection string together with an account name and key:** the compaction
+  process used the key against the public Azure endpoint instead of the endpoint
+  in the connection string (Azurite, sovereign clouds).
+- **`storage.azure_sas_token`:** the compaction process fell back to managed
+  identity, which fails outside Azure.
+
+The compaction process now gets the same credentials as the server and builds
+its storage connection the same way. Account-key, managed-identity and S3
+deployments were not affected.
+
+The credentials now travel in the job the server hands the compaction process,
+not in its environment. If the binary is downgraded while the server keeps
+running, the older compaction process looks for them in the environment and
+compaction fails until the server is restarted. An upgrade in place is
+handled.
+
 ### Retention policies apply to the cold tier ([#168](https://github.com/Basekick-Labs/arc/issues/168))
 
 With tiered storage, retention deleted expired files from local storage only.
@@ -3705,14 +3731,9 @@ instead of having to know about it.
 
 Two things stayed where they were, both on purpose:
 
-- **The compaction subprocess keeps its own factory.** It runs in a separate
-  process and receives its job as JSON, and credentials are deliberately never
-  written into that JSON: S3 credentials come from the environment the parent
-  set, and Azure infers managed-identity use from whether `AZURE_STORAGE_KEY`
-  is present. Every other caller passes whatever the operator configured, so
-  routing the subprocess through the shared constructor would make its
-  empty-credential spec look like a mistake rather than the contract. A comment
-  there explains this and points at the shared constructor.
+- **The compaction subprocess kept its own factory here.** It has since moved to
+  the shared constructor too, receiving the parent's credentials in its job
+  (#1104, under Bug fixes).
 - **Credential refreshing is unrelated to this code.** The refresher
   (`internal/database/credrefresh.go`, from #600 and #601) refreshes *DuckDB
   secrets* so the query engine can keep reading an object store with temporary
