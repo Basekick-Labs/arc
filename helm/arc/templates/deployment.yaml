@@ -13,9 +13,17 @@ spec:
       {{- include "arc.selectorLabels" . | nindent 6 }}
   template:
     metadata:
-      {{- with .Values.podAnnotations }}
+      {{- if or .Values.podAnnotations .Values.arc.config.enabled }}
       annotations:
+        {{- if .Values.arc.config.enabled }}
+        {{- /* The config is mounted with subPath, which kubelet never
+             refreshes. Roll the pod when it changes, or an upgrade keeps
+             the old file. */}}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- end }}
       labels:
         {{- include "arc.labels" . | nindent 8 }}

@@ -1,5 +1,6 @@
 # Binaries
 /arc
+/cmd/arc/arc
 arc-*
 !helm/arc-*/
 !helm/arc/

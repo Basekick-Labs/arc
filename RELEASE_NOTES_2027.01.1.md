@@ -1178,11 +1178,28 @@ throughput. A negative value is refused at startup.
 Above the new ceiling, when the WAL queue is full, an entry is still dropped and
 the write still acknowledged. What admission should do instead is
 [#676](https://github.com/Basekick-Labs/arc/issues/676).
-### Restore OSS Helm chart configuration resources ([#1194](https://github.com/Basekick-Labs/arc/issues/1194))
 
-The OSS chart now renders the ConfigMap mounted when `arc.config.enabled` is
-set. New chart templates are no longer hidden by the binary ignore rule, and
-the chart can pass a bootstrap token through a generated or existing Secret.
+### OSS Helm chart: `arc.config.enabled` no longer leaves the pod unable to start ([#1194](https://github.com/Basekick-Labs/arc/issues/1194))
+
+With `arc.config.enabled=true`, the OSS chart mounted an `arc.toml` ConfigMap
+that no template created, so the pod never started (`MountVolume.SetUp failed
+for volume "config"`). `helm lint` and `helm template` both passed. The template existed
+but was never committed: the `.gitignore` rule for the `arc` binary also
+matched the `helm/arc/` directory, so new chart files were silently ignored.
+The rule now matches only the binary at the repository root and a binary
+built inside `cmd/arc`.
+
+- **The ConfigMap renders**, and a change to `arc.config.contents` now rolls
+  the pod on `helm upgrade`. The file is mounted with `subPath`, which a
+  running pod never refreshes, so without the roll an upgrade kept the old
+  config.
+- **New `auth.bootstrapToken` values** set the initial admin token, from a
+  chart-created Secret (`value`) or your own (`existingSecret`, key
+  `bootstrap-token`), as the Enterprise chart already does. Arc uses it on
+  first run only; once tokens exist it is ignored.
+- **Both charts refuse a bootstrap token shorter than 32 characters** at
+  render time. Arc rejects such a token, logs one error and starts with no
+  admin token, so the install looked healthy and nobody could log in.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1198](https://github.com/Basekick-Labs/arc/pull/1198).
 
@@ -1308,8 +1325,7 @@ Two narrower changes come with it:
   answering 404 with its own page, rather than the storage service's error, is
   no longer taken to mean the object is missing. An S3-compatible store that
   answers a read of a missing key without the `NoSuchKey` code would now
-  surface an error; AWS S3, MinIO and SeaweedFS all
-  send it.
+  surface an error; AWS S3 and SeaweedFS both send it.
 
 A local backend read of a missing file (`ReadTo`, ranged and staged reads) is
 now recognised as missing on every path, not only when the path contained
