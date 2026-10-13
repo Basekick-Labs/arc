@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	hraft "github.com/hashicorp/raft"
 	"github.com/rs/zerolog"
@@ -27,6 +29,7 @@ import (
 
 // fsmCoordinator is a primary writer whose manifest is an in-memory FSM.
 type fsmCoordinator struct {
+	mu      sync.Mutex
 	t       *testing.T
 	fsm     *raft.ClusterFSM
 	idx     uint64
@@ -40,6 +43,21 @@ type fsmCoordinator struct {
 	onSync  func()
 	db      *database.DuckDB
 	root    string
+	ops     []raft.BatchFileOp
+}
+
+// expectSHA returns the checksum the DELETE expected of path in its ops.
+func (c *fsmCoordinator) expectSHA(path string) (string, bool) {
+	for _, op := range c.ops {
+		if op.Type != raft.CommandDeleteFile {
+			continue
+		}
+		var p raft.DeleteFilePayload
+		if json.Unmarshal(op.Payload, &p) == nil && p.Path == path {
+			return p.ExpectSHA, true
+		}
+	}
+	return "", false
 }
 
 func (c *fsmCoordinator) apply(typ raft.CommandType, p any) error {
@@ -48,6 +66,8 @@ func (c *fsmCoordinator) apply(typ raft.CommandType, p any) error {
 		c.t.Fatal(err)
 	}
 	data, _ := json.Marshal(raft.Command{Type: typ, Payload: raw})
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.idx++
 	if res := c.fsm.Apply(&hraft.Log{Index: c.idx, Data: data}); res != nil {
 		if err, ok := res.(error); ok {
@@ -59,6 +79,7 @@ func (c *fsmCoordinator) apply(typ raft.CommandType, p any) error {
 
 func (c *fsmCoordinator) BatchFileOpsInManifest(ops []raft.BatchFileOp) error {
 	c.batches++
+	c.ops = append(c.ops, ops...)
 	if c.onBatch != nil {
 		c.onBatch(c.batches)
 	}
@@ -76,6 +97,18 @@ func (c *fsmCoordinator) SyncManifest(context.Context) error {
 	}
 	return c.syncErr
 }
+func (c *fsmCoordinator) ManifestHotFiles(database, measurement string) []raft.FileEntry {
+	var out []raft.FileEntry
+	for _, f := range c.fsm.GetFilesByDatabase(database) {
+		if (f.Tier == "" || f.Tier == "hot") && strings.HasPrefix(f.Path, database+"/"+measurement+"/") {
+			out = append(out, *f)
+		}
+	}
+	return out
+}
+
+var _ compactionCommitter = (*fsmCoordinator)(nil)
+
 func (c *fsmCoordinator) WaitLocalFiles(context.Context, string, string, time.Duration) ([]string, error) {
 	c.waits++
 	return c.missing, nil
@@ -102,6 +135,7 @@ func casEntry(t *testing.T, root, rel string) raft.FileEntry {
 // then drops its copy of the input. missing is what WaitLocalFiles reports.
 func raceDelete(t *testing.T, where string, missing []string, extra ...string) (int, string, *fsmCoordinator, string) {
 	t.Helper()
+	shortDeleteWait(t)
 	root, backend, db := recordsDuckDB(t)
 	const a = "db/cpu/2026/10/11/10/cpu_a.parquet"
 	const o = "db/cpu/2026/10/11/10/cpu_o.parquet"
@@ -137,7 +171,11 @@ func raceDelete(t *testing.T, where string, missing []string, extra ...string) (
 			t.Fatal(err)
 		}
 		// The output may not be here yet.
-		c.missing = missing
+		if len(missing) > 0 {
+			if err := os.Remove(filepath.Join(root, o)); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 	h := NewDeleteHandler(db, backend, &config.DeleteConfig{Enabled: true, MaxRowsPerDelete: 1000, ConfirmationThreshold: 1000}, nil, t.TempDir(), zerolog.Nop())
 	h.SetCoordinator(c)
@@ -174,8 +212,8 @@ func TestDeleteScansAgainWhenACompactionReplacedTheFile(t *testing.T) {
 	if code != 200 || out.DeletedCount != 2 {
 		t.Fatalf("delete: %d %s", code, raw)
 	}
-	if c.waits != 2 {
-		t.Fatalf("waited for local files %d times, want before each scan", c.waits)
+	if c.syncs != 2 {
+		t.Fatalf("scanned %d times, want 2", c.syncs)
 	}
 	// Exactly one registered file, the rewrite of the output, without h1.
 	files := c.fsm.GetFilesByDatabase("db")
@@ -214,8 +252,8 @@ func TestDeleteScansAgainOnAFullFileDelete(t *testing.T) {
 // The output is not on this node: the DELETE does not scan without it.
 func TestDeleteRescanWaitsForTheOutput(t *testing.T) {
 	code, raw, c, _ := raceDelete(t, "host = 'h1'", []string{"db/cpu/2026/10/11/10/cpu_o.parquet"})
-	if code != 503 || !strings.Contains(raw, "not on this node") || c.waits != 2 {
-		t.Fatalf("got %d (waits %d): %s", code, c.waits, raw)
+	if code != 503 || !strings.Contains(raw, "not on this node") || !strings.Contains(raw, "cpu_o.parquet") || c.syncs != 2 {
+		t.Fatalf("got %d (scans %d): %s", code, c.syncs, raw)
 	}
 }
 
@@ -475,8 +513,8 @@ func TestDeleteUsesTheChecksumItScanned(t *testing.T) {
 			}
 		}
 		code, _, raw := sendDelete(t, h, `{"database":"db","measurement":"cpu","where":"`+where+`","confirm":true}`)
-		if code != 200 || c.waits != 2 {
-			t.Fatalf("%s: %d after %d waits: %s", where, code, c.waits, raw)
+		if code != 200 || c.syncs != 2 {
+			t.Fatalf("%s: %d after %d scans: %s", where, code, c.syncs, raw)
 		}
 	}
 }
@@ -498,8 +536,8 @@ func TestDeleteDoesNotRetryAFailedFileAfterAChange(t *testing.T) {
 		}
 	}
 	code, out, raw := sendDelete(t, h, `{"database":"db","measurement":"cpu","where":"host = 'h1'","confirm":true}`)
-	if code != 207 || len(out.FailedFiles) != 1 || out.DeletedCount != 2 || c.waits != 2 {
-		t.Fatalf("%d after %d waits: %s", code, c.waits, raw)
+	if code != 207 || len(out.FailedFiles) != 1 || out.DeletedCount != 2 || c.syncs != 2 {
+		t.Fatalf("%d after %d scans: %s", code, c.syncs, raw)
 	}
 }
 
@@ -553,29 +591,295 @@ func TestDeleteScanCatchesUpWithTheManifest(t *testing.T) {
 	}
 }
 
-// With compaction commit on (stream takeover off), the DELETE waits for the
-// manifest files of the measurement before it scans: the inputs of a
-// compaction are unregistered once it commits, and its output may not be here
-// yet. Without the wait the DELETE answered success having deleted nothing.
-func TestDeleteWaitsForManifestFilesBeforeTheScan(t *testing.T) {
+// shortDeleteWait bounds how long a DELETE waits for missing files.
+func shortDeleteWait(t *testing.T) {
+	t.Helper()
+	old := deleteLocalWait
+	deleteLocalWait = 400 * time.Millisecond
+	t.Cleanup(func() { deleteLocalWait = old })
+}
+
+// With compaction commit on, a file the manifest lists for the measurement
+// and this node does not have stops the DELETE (503) instead of being
+// skipped; allow_unreachable runs without it and reports it; a dry run does
+// not wait and reports it; with the flag off nothing waits.
+func TestDeleteWaitsForManifestFilesMissingHere(t *testing.T) {
+	shortDeleteWait(t)
 	const body = `{"database":"db","measurement":"cpu","where":"host = 'h1'","confirm":true}`
-	c, h, _ := casCluster(t, casA)
-	c.missing = []string{casO}
+	c, h, root := casCluster(t, casA, casO)
+	if err := os.Remove(filepath.Join(root, casO)); err != nil {
+		t.Fatal(err)
+	}
 	code, out, raw := sendDelete(t, h, body)
-	if code != 503 || c.waits != 1 || len(out.UnreachableFiles) != 1 || out.DeletedCount != 0 {
-		t.Fatalf("%d after %d waits: %s", code, c.waits, raw)
+	if code != 503 || len(out.UnreachableFiles) != 1 || out.UnreachableFiles[0] != casO || out.DeletedCount != 0 {
+		t.Fatalf("%d: %s", code, raw)
 	}
 	code, out, raw = sendDelete(t, h, strings.Replace(body, `"confirm":true`, `"confirm":true,"allow_unreachable":true`, 1))
 	if code != 200 || out.DeletedCount != 2 || len(out.UnreachableFiles) != 1 {
 		t.Fatalf("allowed: %d %s", code, raw)
 	}
-	// A dry run does not wait; with the flag off nothing waits.
-	waits := c.waits
-	if code, _, raw = sendDelete(t, h, `{"database":"db","measurement":"cpu","where":"host = 'h2'","dry_run":true}`); code != 200 || c.waits != waits {
+	began := time.Now()
+	code, out, raw = sendDelete(t, h, `{"database":"db","measurement":"cpu","where":"host = 'h2'","dry_run":true}`)
+	if code != 200 || len(out.UnreachableFiles) != 1 || time.Since(began) > deleteLocalWait {
 		t.Fatalf("dry run: %d %s", code, raw)
 	}
 	c.active = false
-	if code, _, raw = sendDelete(t, h, `{"database":"db","measurement":"cpu","where":"host = 'h2'","confirm":true}`); code != 200 || c.waits != waits {
+	if code, _, raw = sendDelete(t, h, `{"database":"db","measurement":"cpu","where":"host = 'h2'","confirm":true}`); code != 200 {
 		t.Fatalf("flag off: %d %s", code, raw)
 	}
+}
+
+// Every matching row is in the output, which is not here: the DELETE does
+// not answer success having deleted nothing, even with allow_unreachable,
+// without naming the file it skipped.
+func TestDeleteReportsTheMissingFileWhenNothingMatched(t *testing.T) {
+	shortDeleteWait(t)
+	c, h, root := casCluster(t, casO)
+	_ = c
+	if err := os.Remove(filepath.Join(root, casO)); err != nil {
+		t.Fatal(err)
+	}
+	code, out, raw := sendDelete(t, h, `{"database":"db","measurement":"cpu","where":"host = 'h1'","confirm":true,"allow_unreachable":true}`)
+	if code != 200 || out.DeletedCount != 0 || len(out.UnreachableFiles) != 1 {
+		t.Fatalf("%d %s", code, raw)
+	}
+}
+
+// A compaction commits between the DELETE's listing and its catch-up with
+// the manifest: the listing has the input, which the catch-up unregisters,
+// and not the output. The scan set is the manifest's, so the output is
+// scanned (here at once, or once it arrives); before, the DELETE answered
+// success having deleted nothing and the output kept the rows.
+func TestDeleteScansAnOutputCommittedAfterTheListing(t *testing.T) {
+	for _, late := range []bool{false, true} {
+		shortDeleteWait(t)
+		c, h, root := casCluster(t, casA)
+		committed := false
+		c.onSync = func() {
+			if committed {
+				return
+			}
+			committed = true
+			c.compact("j1", casA, casO)
+			if late {
+				// Not here yet: it arrives while the DELETE waits.
+				full := filepath.Join(root, casO)
+				raw, err := os.ReadFile(full)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(full); err != nil {
+					t.Fatal(err)
+				}
+				go func() {
+					time.Sleep(100 * time.Millisecond)
+					_ = os.WriteFile(full, raw, 0o600)
+				}()
+			}
+		}
+		code, out, raw := sendDelete(t, h, `{"database":"db","measurement":"cpu","where":"host = 'h1'","confirm":true}`)
+		if code != 200 || out.DeletedCount != 2 || len(out.FilesProcessed) != 1 || out.FilesProcessed[0] != "cpu_o.parquet" {
+			t.Fatalf("late=%v: %d %s", late, code, raw)
+		}
+		for _, f := range c.fsm.GetFilesByDatabase("db") {
+			if n := countParquet(t, c.db, filepath.Join(root, f.Path), "host = 'h1'"); n != 0 {
+				t.Fatalf("late=%v: %s keeps %d deleted rows", late, f.Path, n)
+			}
+		}
+		// The output is rewritten against the content the manifest lists.
+		if sha, ok := c.expectSHA(casO); !ok || sha == "" {
+			t.Fatalf("late=%v: the output's delete op expected %q (found %v)", late, sha, ok)
+		}
+	}
+}
+
+// The output found through the manifest is rewritten against the checksum
+// the scan read, not the one registered when the DELETE gets to it.
+func TestDeleteExpectsTheScannedChecksumOfAnOutputFromTheManifest(t *testing.T) {
+	shortDeleteWait(t)
+	c, h, root := casCluster(t, casA)
+	var scanned string
+	c.onSync = func() {
+		if scanned != "" {
+			return
+		}
+		c.compact("j1", casA, casO)
+		e, _ := c.fsm.GetFile(casO)
+		scanned = e.SHA256
+	}
+	c.onBatch = func(n int) {
+		if n != 1 {
+			return
+		}
+		e, _ := c.fsm.GetFile(casO)
+		cp := *e
+		cp.SHA256 = "replaced"
+		if err := c.apply(raft.CommandRegisterFile, raft.RegisterFilePayload{File: cp}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, _, raw := sendDelete(t, h, `{"database":"db","measurement":"cpu","where":"host = 'h1'","confirm":true}`)
+	if sha, ok := c.expectSHA(casO); !ok || sha != scanned {
+		t.Fatalf("first delete op of the output expected %q, want the scanned %q: %s", sha, scanned, raw)
+	}
+	_ = root
+}
+
+// A file at the path but not at the size the manifest lists is not the
+// registered file: it is waited for like a missing one.
+func TestDeleteWaitsForAManifestFileAtTheWrongSize(t *testing.T) {
+	shortDeleteWait(t)
+	c, h, root := casCluster(t, casA)
+	committed := false
+	c.onSync = func() {
+		if committed {
+			return
+		}
+		committed = true
+		c.compact("j1", casA, casO)
+		if err := os.WriteFile(filepath.Join(root, casO), []byte("partial"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	code, out, raw := sendDelete(t, h, `{"database":"db","measurement":"cpu","where":"host = 'h1'","confirm":true}`)
+	if code != 503 || len(out.UnreachableFiles) != 1 || out.UnreachableFiles[0] != casO {
+		t.Fatalf("%d %s", code, raw)
+	}
+}
+
+// A file the manifest stops listing while the DELETE waits for it (a second
+// compaction replaced it, tiering moved it) is not waited for any longer.
+func TestDeleteStopsWaitingForAFileTheManifestDropped(t *testing.T) {
+	old := deleteLocalWait
+	deleteLocalWait = 5 * time.Second
+	t.Cleanup(func() { deleteLocalWait = old })
+	c, h, root := casCluster(t, casA, casO)
+	if err := os.Remove(filepath.Join(root, casO)); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		raw, _ := json.Marshal(raft.Command{Type: raft.CommandDeleteFile, Payload: mustJSON(t, raft.DeleteFilePayload{Path: casO, Reason: "test"})})
+		c.mu.Lock()
+		c.idx++
+		c.fsm.Apply(&hraft.Log{Index: c.idx, Data: raw})
+		c.mu.Unlock()
+	}()
+	began := time.Now()
+	code, out, raw := sendDelete(t, h, `{"database":"db","measurement":"cpu","where":"host = 'h1'","confirm":true}`)
+	if code != 200 || out.DeletedCount != 2 || len(out.UnreachableFiles) != 0 || time.Since(began) > 3*time.Second {
+		t.Fatalf("%d after %v: %s", code, time.Since(began), raw)
+	}
+}
+
+// Each scan waits its own time: a compaction replacing a file late in a long
+// DELETE still gets its output waited for in the scan after the change.
+func TestDeleteWaitsAgainInALaterRound(t *testing.T) {
+	shortDeleteWait(t)
+	c, h, root := casCluster(t, casA)
+	c.onBatch = func(n int) {
+		if n != 1 {
+			return
+		}
+		// A DELETE that ran longer than one wait so far.
+		time.Sleep(deleteLocalWait + 100*time.Millisecond)
+		c.compact("j1", casA, casO)
+		full := filepath.Join(root, casO)
+		body, err := os.ReadFile(full)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(full); err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			_ = os.WriteFile(full, body, 0o600)
+		}()
+	}
+	code, out, raw := sendDelete(t, h, `{"database":"db","measurement":"cpu","where":"host = 'h1'","confirm":true}`)
+	if code != 200 || out.DeletedCount != 2 || len(out.UnreachableFiles) != 0 {
+		t.Fatalf("%d %s", code, raw)
+	}
+}
+
+// statFailing fails StatFile for one path.
+type statFailing struct {
+	*storage.LocalBackend
+	path string
+}
+
+func (b statFailing) StatFile(ctx context.Context, p string) (int64, error) {
+	if p == b.path {
+		return -1, errors.New("injected stat failure")
+	}
+	return b.LocalBackend.StatFile(ctx, p)
+}
+
+// A manifest file the scan cannot check (a storage error, not a missing
+// file) fails the DELETE with that error instead of being waited for and
+// reported as not on this node.
+func TestDeleteReportsAStorageErrorOnAManifestFile(t *testing.T) {
+	shortDeleteWait(t)
+	c, _, root := casCluster(t, casA, casO)
+	if err := os.Remove(filepath.Join(root, casO)); err != nil {
+		t.Fatal(err)
+	}
+	local, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewDeleteHandler(c.db, statFailing{LocalBackend: local, path: casO}, &config.DeleteConfig{Enabled: true, MaxRowsPerDelete: 1000, ConfirmationThreshold: 1000}, nil, t.TempDir(), zerolog.Nop())
+	h.SetCoordinator(c)
+	code, out, raw := sendDelete(t, h, `{"database":"db","measurement":"cpu","where":"host = 'h1'","confirm":true}`)
+	if code != 500 || len(out.UnreachableFiles) != 0 || !strings.Contains(raw, "injected stat failure") {
+		t.Fatalf("%d %s", code, raw)
+	}
+}
+
+// A listed file at another size than the manifest's is not the registered
+// file: it is not scanned, and waited for like a missing one.
+func TestDeleteChecksTheSizeOfListedFiles(t *testing.T) {
+	shortDeleteWait(t)
+	c, h, root := casCluster(t, casA)
+	e, _ := c.fsm.GetFile(casA)
+	cp := *e
+	cp.SizeBytes++
+	if err := c.apply(raft.CommandRegisterFile, raft.RegisterFilePayload{File: cp}); err != nil {
+		t.Fatal(err)
+	}
+	_ = root
+	code, out, raw := sendDelete(t, h, `{"database":"db","measurement":"cpu","where":"host = 'h1'","confirm":true}`)
+	if code != 503 || len(out.UnreachableFiles) != 1 || out.UnreachableFiles[0] != casA {
+		t.Fatalf("%d %s", code, raw)
+	}
+}
+
+// A file the manifest lists in the cold tier is not this node's to scan: it
+// does not stop the DELETE.
+func TestDeleteIgnoresColdManifestFiles(t *testing.T) {
+	shortDeleteWait(t)
+	c, h, root := casCluster(t, casA)
+	writeRecordsParquet(t, c.db, root, casO)
+	cold := casEntry(t, root, casO)
+	cold.Tier = "cold"
+	if err := c.apply(raft.CommandRegisterFile, raft.RegisterFilePayload{File: cold}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, casO)); err != nil {
+		t.Fatal(err)
+	}
+	code, out, raw := sendDelete(t, h, `{"database":"db","measurement":"cpu","where":"host = 'h1'","confirm":true}`)
+	if code != 200 || out.DeletedCount != 2 || len(out.UnreachableFiles) != 0 {
+		t.Fatalf("%d %s", code, raw)
+	}
+}
+
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }

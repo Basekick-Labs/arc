@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster"
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 )
 
 // The cluster coordinator is what production wires in.
@@ -33,6 +35,17 @@ type compactionCommitter interface {
 	// SyncManifest returns once this node applied everything the leader
 	// had committed.
 	SyncManifest(ctx context.Context) error
+	// ManifestHotFiles is what the manifest lists under database/measurement/.
+	ManifestHotFiles(database, measurement string) []raft.FileEntry
+}
+
+// scanOpts: how a DELETE scan treats files the manifest lists that are not
+// in storage here yet.
+type scanOpts struct {
+	// wait for them, up to deleteLocalWait per scan (not on a dry run).
+	wait bool
+	// allowUnreachable: scan without the ones still missing then.
+	allowUnreachable bool
 }
 
 // errManifestNotSynced: this node could not catch up with the cluster
@@ -51,64 +64,146 @@ type registrationHolder interface {
 	HoldsRegistration(path string) bool
 }
 
-// registeredOrPending keeps the listed files the manifest lists (with their
-// checksum) or this node's outbox still holds, and logs the rest. The local
-// manifest is caught up with the leader first: a registration acknowledged
-// by the leader (a rewrite of an earlier DELETE) may not have applied here.
-func (h *DeleteHandler) registeredOrPending(ctx context.Context, files []fileInfo) ([]fileInfo, map[string]string, error) {
-	if c, ok := h.coordinator.(compactionCommitter); ok {
-		if err := c.SyncManifest(ctx); err != nil {
-			return nil, nil, fmt.Errorf("%w: %v", errManifestNotSynced, err)
-		}
+// scanSet is what a DELETE scans once compaction commit is on: the files
+// the manifest lists for the measurement, read once after this node caught
+// up with the leader, plus the listed files this node's outbox still holds.
+// Other listed files are not data (a compaction output before its commit, an
+// input after it). The listing alone is not enough: a compaction that
+// commits between the listing and the catch-up has an output the listing
+// missed, and inputs the catch-up drops; scanning only the listing then finds
+// nothing and the output brings the rows back.
+//
+// A manifest file not here at its size is waited for (opts), the manifest
+// read again on each poll so a file it stops listing meanwhile is no longer
+// waited for. Still missing, it stops the DELETE with errUnreachableFiles
+// unless opts.allowUnreachable; it is returned as unreachable either way.
+func (h *DeleteHandler) scanSet(ctx context.Context, database, measurement string, listed []fileInfo, opts scanOpts) ([]fileInfo, map[string]string, []string, error) {
+	c, ok := h.coordinator.(compactionCommitter)
+	if !ok {
+		return listed, nil, nil, nil
 	}
+	if err := c.SyncManifest(ctx); err != nil {
+		return nil, nil, nil, fmt.Errorf("%w: %v", errManifestNotSynced, err)
+	}
+	manifest := hotByPath(c.ManifestHotFiles(database, measurement))
+	// A listed file is complete (local storage stages writes under a name
+	// List omits; an object appears whole), but on local storage a size check
+	// is a cheap guard against reading other content than the registered.
+	statListed := h.storage.Type() == "local"
 	holder, _ := h.pending.(registrationHolder)
 	shas := make(map[string]string)
-	kept := files[:0]
+	inListing := make(map[string]bool, len(listed))
+	kept := make([]fileInfo, 0, len(listed))
 	var skipped []string
-	for _, f := range files {
-		if e, ok := h.coordinator.GetFileEntry(f.relativePath); ok {
-			shas[f.relativePath] = e.SHA256
-			kept = append(kept, f)
+	for _, f := range listed {
+		inListing[f.relativePath] = true
+		e, ok := manifest[f.relativePath]
+		if !ok {
+			// Registered but not under the hot entries of the measurement
+			// (another tier, or an entry indexed under another database), or
+			// held by the outbox.
+			if other, reg := h.coordinator.GetFileEntry(f.relativePath); reg {
+				shas[f.relativePath] = other.SHA256
+				kept = append(kept, f)
+				continue
+			}
+			if holder != nil && holder.HoldsRegistration(f.relativePath) {
+				kept = append(kept, f)
+				continue
+			}
+			skipped = append(skipped, f.relativePath)
 			continue
 		}
-		if holder != nil && holder.HoldsRegistration(f.relativePath) {
-			kept = append(kept, f)
-			continue
+		if statListed {
+			size, err := h.storage.StatFile(ctx, f.relativePath)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("failed to check %s: %w", f.relativePath, err)
+			}
+			if size != e.SizeBytes {
+				inListing[f.relativePath] = false
+				continue
+			}
 		}
-		skipped = append(skipped, f.relativePath)
+		shas[f.relativePath] = e.SHA256
+		kept = append(kept, f)
 	}
 	if len(skipped) > 0 {
 		h.logger.Info().Int("files", len(skipped)).Strs("sample", skipped[:min(len(skipped), 5)]).
 			Msg("Delete skipped files in storage the cluster manifest does not list (compaction output not committed yet, or an input already replaced)")
 	}
-	return kept, shas, nil
+	// Manifest files the listing did not have (or not at their size): here
+	// by now, or waited for.
+	deadline := time.Now().Add(deleteLocalWait)
+	found := make(map[string]bool)
+	var absent []string
+	for {
+		absent = absent[:0]
+		for _, path := range sortedPaths(manifest) {
+			e := manifest[path]
+			if inListing[path] || found[path] || !strings.HasSuffix(strings.ToLower(path), ".parquet") {
+				continue
+			}
+			size, err := h.storage.StatFile(ctx, path)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("failed to check %s: %w", path, err)
+			}
+			if size != e.SizeBytes {
+				absent = append(absent, path)
+				continue
+			}
+			queryPath, err := readParquetPath(h.storage, path)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("manifest file %q has no usable storage path: %w", path, err)
+			}
+			found[path] = true
+			kept = append(kept, fileInfo{queryPath: queryPath, relativePath: path})
+			shas[path] = e.SHA256
+		}
+		if len(absent) == 0 || !opts.wait || !time.Now().Before(deadline) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, nil, nil, ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+		// The manifest again: a file it no longer lists (replaced, moved to
+		// the cold tier, removed) is not waited for.
+		manifest = hotByPath(c.ManifestHotFiles(database, measurement))
+	}
+	unreachable := append([]string(nil), absent...)
+	if len(unreachable) > 0 && opts.wait && !opts.allowUnreachable {
+		return nil, nil, unreachable, errUnreachableFiles
+	}
+	return kept, shas, unreachable, nil
 }
 
-// rescanAfterChange waits until the files the manifest lists for the
-// measurement (the compaction's output among them) are on this node, then
-// scans again. Files still missing are returned; unless allowUnreachable,
-// they stop the DELETE.
-func (h *DeleteHandler) rescanAfterChange(ctx context.Context, database, measurement, where string, allowUnreachable bool) ([]affectedFile, []string, error) {
-	var missing []string
-	if c, ok := h.coordinator.(compactionCommitter); ok {
-		var err error
-		if missing, err = c.WaitLocalFiles(ctx, database, measurement, deleteLocalWait); err != nil {
-			return nil, nil, err
-		}
-		if len(missing) > 0 && !allowUnreachable {
-			return nil, missing, errUnreachableFiles
-		}
+func hotByPath(files []raft.FileEntry) map[string]raft.FileEntry {
+	m := make(map[string]raft.FileEntry, len(files))
+	for _, f := range files {
+		m[f.Path] = f
 	}
-	affected, err := h.findAffectedFiles(ctx, database, measurement, where)
-	return affected, missing, err
+	return m
 }
 
-// mergeUnreachable adds the files in more to list, once each.
-func mergeUnreachable(list, more []string) []string {
-	for _, m := range more {
-		if !slices.Contains(list, m) {
-			list = append(list, m)
-		}
+func sortedPaths(m map[string]raft.FileEntry) []string {
+	out := make([]string, 0, len(m))
+	for p := range m {
+		out = append(out, p)
 	}
-	return list
+	sort.Strings(out)
+	return out
+}
+
+// rescanAfterChange scans again after files changed under the DELETE (a
+// compaction replaced them): the scan set waits for the compaction's output
+// (scanSet). Files still missing are returned; unless allowUnreachable, they
+// stop the DELETE.
+func (h *DeleteHandler) rescanAfterChange(ctx context.Context, database, measurement, where string, opts scanOpts) ([]affectedFile, []string, error) {
+	return h.findAffectedFiles(ctx, database, measurement, where, opts)
+}
+
+// isContextErr: the request was cancelled or timed out (retryable).
+func isContextErr(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }

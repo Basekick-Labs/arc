@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster/raft"
@@ -201,6 +202,23 @@ func (c *Coordinator) MissingLocalFiles(ctx context.Context, database, measureme
 	}
 	sort.Strings(missing)
 	return missing, nil
+}
+
+// ManifestHotFiles returns the hot manifest files of database (by its
+// Database field) whose path is under database/measurement/: what a DELETE of
+// that measurement must scan (#1207 d2).
+func (c *Coordinator) ManifestHotFiles(database, measurement string) []raft.FileEntry {
+	if c == nil || c.raftNode == nil {
+		return nil
+	}
+	prefix := database + "/" + measurement + "/"
+	var out []raft.FileEntry
+	for _, f := range c.raftNode.FSM().GetFilesByDatabase(database) {
+		if (f.Tier == "" || f.Tier == "hot") && strings.HasPrefix(f.Path, prefix) {
+			out = append(out, *f)
+		}
+	}
+	return out
 }
 
 // WaitLocalFiles waits, up to budget, until MissingLocalFiles is empty, and
