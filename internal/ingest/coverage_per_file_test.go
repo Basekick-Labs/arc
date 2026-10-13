@@ -136,7 +136,7 @@ func TestRefusedGroupReleasesOnceResolved(t *testing.T) {
 	if len(files) != 2 || w.PendingUnflushedCount() == 0 {
 		t.Fatalf("files %d, pending %d", len(files), w.PendingUnflushedCount())
 	}
-	files[0].cov.Settle(files[0].path, CoverageResolved)
+	files[0].cov.Settle(files[0].path, CoverageDeleted)
 	if w.PendingUnflushedCount() == 0 {
 		t.Fatal("released with a refused file still unresolved")
 	}

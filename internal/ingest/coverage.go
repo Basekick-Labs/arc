@@ -249,6 +249,9 @@ const (
 	// Once every refused file of a group is resolved, the group releases its
 	// WAL entries. The floor keeps treating its batches as lost.
 	CoverageResolved
+	// CoverageDeleted: a durable DELETE record removed every row in the
+	// parked file's scope, so its WAL hold can be released without publication.
+	CoverageDeleted
 )
 
 func (o CoverageOutcome) String() string {
@@ -263,6 +266,8 @@ func (o CoverageOutcome) String() string {
 		return "refused"
 	case CoverageResolved:
 		return "resolved"
+	case CoverageDeleted:
+		return "deleted"
 	default:
 		return "abandoned"
 	}
@@ -618,7 +623,7 @@ func foldPieces(pieces []CoveragePiece) ([]CoverageRange, []CoveragePiece) {
 }
 
 func (g *flushGroup) settle(path string, outcome CoverageOutcome) {
-	if outcome == CoverageResolved {
+	if outcome == CoverageResolved || outcome == CoverageDeleted {
 		g.resolve(path)
 		return
 	}

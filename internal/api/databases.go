@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/fieldschema"
@@ -1250,7 +1251,10 @@ func (h *DatabasesHandler) deleteDatabaseManifestEntries(ctx context.Context, da
 			}
 			ops = append(ops, raft.BatchFileOp{Type: raft.CommandDeleteFile, Payload: payload})
 		}
-		if err := h.coordinator.BatchFileOpsInManifestContext(ctx, ops); err != nil {
+		err := tiering.RetryTransient(ctx, 4, time.Second, func() error {
+			return h.coordinator.BatchFileOpsInManifestContext(ctx, ops)
+		}, cluster.IsTransientLeaderError)
+		if err != nil {
 			return fmt.Errorf("delete manifest batch %d-%d: %w", start, end, err)
 		}
 	}

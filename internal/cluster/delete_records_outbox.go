@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -243,7 +244,153 @@ func (r *RegistrationOutbox) WithdrawDatabase(ctx context.Context, database stri
 			errs = append(errs, fmt.Errorf("%s: %w", p, err))
 		}
 	}
+	if record == 0 {
+		// A parked file may be the only remaining copy of acknowledged rows.
+		// Without a durable DELETE record there is no proof those rows belong
+		// to this database deletion, so keep the file and make the caller retry
+		// only after the cluster can record the deletion.
+		r.mu.Lock()
+		for p, e := range r.parked {
+			if e.rec.Rec.Database == database {
+				errs = append(errs, fmt.Errorf("%s: parked data has no durable database-delete record", p))
+			}
+		}
+		r.mu.Unlock()
+		return errors.Join(errs...)
+	}
+	r.mu.Lock()
+	parked := make([]string, 0)
+	for p, e := range r.parked {
+		if e.rec.Rec.Database == database {
+			parked = append(parked, p)
+		}
+	}
+	r.mu.Unlock()
+	for _, p := range parked {
+		if err := r.withdrawParkedForDelete(ctx, p, record); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", p, err))
+		}
+	}
 	return errors.Join(errs...)
+}
+
+// withdrawParkedForDelete removes a parked file only after a durable database
+// DELETE covers all of its batches. Its journal intent is fsynced before the
+// unlink, so a restart can finish the operation idempotently.
+func (r *RegistrationOutbox) withdrawParkedForDelete(ctx context.Context, path string, record uint64) error {
+	h := r.deleteHooks.Load()
+	if record == 0 || h == nil || h.Records == nil || h.Remove == nil {
+		return errors.New("a durable database-delete record and storage hooks are required to remove parked data")
+	}
+	r.mu.Lock()
+	e, ok := r.parked[path]
+	if !ok {
+		r.mu.Unlock()
+		return nil
+	}
+	if pending, ok := r.byPath[path]; ok && !pending.done {
+		r.mu.Unlock()
+		return errors.New("parked registration is still in flight; retry the database deletion")
+	}
+	pr := e.rec
+	r.mu.Unlock()
+	if pr.DeleteRecord != 0 && pr.DeleteRecord != record {
+		return fmt.Errorf("parked file already has delete record %d", pr.DeleteRecord)
+	}
+	if pr.Rec.Cov == nil {
+		return errors.New("parked file has no batch coverage; preserving it because the delete scope cannot be verified")
+	}
+	cov := fileCoverage(pr.Rec.Cov)
+	records, _ := h.Records(cov, 0)
+	var matched *raft.DeleteRecord
+	for i := range records {
+		if records[i].ID == record && records[i].Database == pr.Rec.Database && records[i].Measurement == "" && records[i].Where == "" {
+			matched = &records[i]
+			break
+		}
+	}
+	if matched == nil {
+		return fmt.Errorf("delete record %d does not durably cover parked file %s", record, path)
+	}
+	for _, c := range cov {
+		if !matched.Covers(c) {
+			return fmt.Errorf("parked file %s has batches outside database-delete record %d; preserving it", path, record)
+		}
+	}
+	var self uint64
+	if h.Instance != nil {
+		self = h.Instance()
+	}
+	hour := pr.Rec.PartitionTime.UTC().Truncate(time.Hour).Unix()
+	for _, c := range cov {
+		if c.Instance == self && self != 0 {
+			continue
+		}
+		if h.Settle == nil {
+			return errors.New("the delete settler is not installed; preserving parked data")
+		}
+		sctx, cancel := context.WithTimeout(ctx, outboxAttemptTimeout)
+		err := h.Settle(sctx, raft.SettleDeletedPayload{By: r.nodeID, Hour: hour, Coverage: c, Records: []uint64{record}})
+		cancel()
+		if err != nil {
+			return fmt.Errorf("settle parked batches for delete record %d: %w", record, err)
+		}
+	}
+
+	r.parkMu.Lock()
+	defer r.parkMu.Unlock()
+	r.mu.Lock()
+	e, ok = r.parked[path]
+	if !ok {
+		r.mu.Unlock()
+		return nil
+	}
+	if e.rec.DeleteRecord != 0 && e.rec.DeleteRecord != record {
+		r.mu.Unlock()
+		return fmt.Errorf("parked file already has delete record %d", e.rec.DeleteRecord)
+	}
+	if e.rec.DeleteRecord == 0 {
+		pr = e.rec
+		pr.Op = parkOpDeleting
+		pr.DeleteRecord = record
+		if err := r.appendRefused(pr); err != nil {
+			r.mu.Unlock()
+			return fmt.Errorf("persist parked delete intent: %w", err)
+		}
+		e.rec = pr
+	}
+	r.mu.Unlock()
+
+	removePath := e.rec.Rec.Path
+	if e.rec.Held != "" {
+		removePath = e.rec.Held
+	}
+	if err := h.Remove(ctx, removePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove parked file %s: %w", removePath, err)
+	}
+	done := e.rec
+	done.Op = parkOpResolved
+	done.At = time.Now().UTC()
+	if err := r.appendRefused(done); err != nil {
+		return fmt.Errorf("persist parked delete completion: %w", err)
+	}
+	r.mu.Lock()
+	delete(r.parked, path)
+	r.holdGen++
+	r.resolvedSinceCompact++
+	compact := r.resolvedSinceCompact > len(r.parked)+16 || len(r.parked) == 0
+	if compact {
+		r.resolvedSinceCompact = 0
+	}
+	r.mu.Unlock()
+	if compact {
+		if err := r.compactRefused(); err != nil {
+			r.logger.Warn().Err(err).Msg("Could not compact the refused registration journal")
+		}
+	}
+	e.rec.Rec.Cov.Settle(path, ingest.CoverageDeleted)
+	r.publishMetrics()
+	return nil
 }
 
 // SetDeleteSeen notes that the pending file at path was written with DELETE

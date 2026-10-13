@@ -1357,6 +1357,19 @@ nodes keeping it off in `blocking_nodes`). Until then DELETE behaves as
 before. From then on a node running an earlier release cannot join. See the
 upgrade note below about rolling a node back.
 
+### Database deletion drains refused registrations parked under `_refused` ([#1236](https://github.com/Basekick-Labs/arc/issues/1236))
+
+Database deletion also drains refused registrations parked under
+`_refused/<database>`. It removes a parked copy only when the durable database
+DELETE record covers every batch it holds, settles those batches as deleted,
+and journals the unlink so an interrupted deletion can finish after restart.
+If coverage crosses the DELETE boundary or the record cannot be confirmed, the
+request returns a retryable error and keeps the parked bytes. The no-tiering
+path now retries transient leader changes for manifest batches, like the
+tiering path does.
+
+Contributed by [@jallegri](https://github.com/jallegri) in [#1252](https://github.com/Basekick-Labs/arc/pull/1252).
+
 ### Delete API catches dangerous keywords glued to numbers or literals ([#1080](https://github.com/Basekick-Labs/arc/issues/1080))
 
 The delete endpoint's keyword scan used `\b` directly on the masked WHERE
