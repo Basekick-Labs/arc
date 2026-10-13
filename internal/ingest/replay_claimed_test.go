@@ -335,3 +335,26 @@ func TestReplayClaimedTwoRangesInOneHour(t *testing.T) {
 		t.Fatalf("partial %v", partial)
 	}
 }
+
+// An origin republish has no claim; a claimant replay needs one.
+func TestReplayClaimedOriginMode(t *testing.T) {
+	reg := &coverageRegistrar{}
+	b, _ := newCoverageBuffer(t, 1000, reg)
+	rec := ClaimedRecord{CSeq: 1, Chunks: 1, Entry: columnarEntry("db", "cpu", []int64{usAt(rcH1, 1)}, []interface{}{1.0}), Keep: keepAll}
+	for _, bad := range []ClaimedReplay{
+		{Database: "db", Measurement: "cpu", Instance: 1, Epoch: 0, Records: []ClaimedRecord{rec}},
+		{Database: "db", Measurement: "cpu", Instance: 1, Epoch: 5, Origin: true, Records: []ClaimedRecord{rec}},
+	} {
+		if _, err := b.ReplayClaimed(context.Background(), bad); err == nil {
+			t.Fatalf("accepted %+v", bad)
+		}
+	}
+	out, err := b.ReplayClaimed(context.Background(), ClaimedReplay{Database: "db", Measurement: "cpu", Instance: 1, Origin: true, Records: []ClaimedRecord{rec}})
+	if err != nil || len(out) != 1 || out[0].Outcome != ReplayWritten {
+		t.Fatalf("out %+v err %v", out, err)
+	}
+	files := reg.snapshot()
+	if len(files) != 1 || len(files[0].cov.Epochs) != 0 || files[0].cov.Ranges[0].Instance != 1 {
+		t.Fatalf("files %+v", files)
+	}
+}

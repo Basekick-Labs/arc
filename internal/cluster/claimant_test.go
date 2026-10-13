@@ -32,6 +32,7 @@ type claimantRigT struct {
 	outbox  *RegistrationOutbox
 	buffer  *ingest.ArrowBuffer
 	backend storage.Backend
+	wal     *wal.Writer
 	hour    time.Time
 }
 
@@ -84,7 +85,7 @@ func newClaimantRig(t *testing.T) *claimantRigT {
 	})
 	cl.grace = time.Minute
 	c.claimant.Store(cl)
-	return &claimantRigT{c: c, cl: cl, store: store, outbox: outbox, buffer: buffer, backend: backend,
+	return &claimantRigT{c: c, cl: cl, store: store, outbox: outbox, buffer: buffer, backend: backend, wal: w,
 		hour: time.Date(2026, 10, 12, 10, 0, 0, 0, time.UTC)}
 }
 
@@ -184,6 +185,10 @@ func TestClaimantSkipsRowsTheOriginRegistered(t *testing.T) {
 	r := newClaimantRig(t)
 	ctx := context.Background()
 	r.stored(t, 1, 2)
+	// Pulled here: a claim finishes only once every file of the instance is.
+	if err := r.backend.Write(ctx, "db/cpu/origin.parquet", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
 	propose(t, r.c, raft.CommandRegisterFile, raft.RegisterFilePayload{
 		File: raft.FileEntry{Path: "db/cpu/origin.parquet", SHA256: "x", SizeBytes: 1, Database: "db", Measurement: "cpu",
 			PartitionTime: r.hour, OriginNodeID: clOrigin, CreatedAt: time.Now()},
@@ -791,8 +796,10 @@ func TestClaimantDropsATombstonedCopy(t *testing.T) {
 	r := newClaimantRig(t)
 	ctx := context.Background()
 	r.stored(t, 1, 1)
-	// writer-2 restarts without it: orphaned; writer-1 claims, publishes.
-	propose(t, r.c, raft.CommandAnnounceInstance, raft.AnnounceInstancePayload{Origin: clOrigin, Instance: 0x600, FreshStart: true})
+	// writer-2 restarts on the same disks without it: closed; writer-1
+	// claims, publishes.
+	propose(t, r.c, raft.CommandAnnounceInstance, raft.AnnounceInstancePayload{Origin: clOrigin, Instance: 0x600, FreshStart: true,
+		Continuity: raft.Continuity{WAL: clInst, Journal: clInst, Storage: clInst}})
 	r.cl.pass(ctx)
 	waitFSM(t, func() bool { return r.outbox.Pending() == 0 })
 	r.cl.pass(ctx)

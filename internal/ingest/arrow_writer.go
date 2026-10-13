@@ -974,6 +974,8 @@ type ArrowBuffer struct {
 
 	// coverage is set by EnableCoverage (#1207); nil when coverage is off.
 	coverage atomic.Pointer[coverageState]
+	// claimedBatch splits flushes by claim (#1207 S4b1c2b, flush_split.go).
+	claimedBatch claimedBatchPtr
 
 	// ingestGate refuses live writes on a fenced node (#1207).
 	ingestGate atomic.Pointer[func() error]
@@ -3684,6 +3686,20 @@ func (b *ArrowBuffer) flushWorker(workerID int) {
 // WAL-only. markFlushFailure alone cannot say — hasFlushFailure is a
 // process-wide latch with no per-task attribution.
 func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database, measurement string, records []interface{}, recordCount int, walHashes []string, group *flushGroup) error {
+	if parts := b.splitForCoverage(bufferKey, records); parts != nil {
+		// Each class is its own group and file set (flush_split.go); the
+		// group built for the whole buffer is never announced.
+		for i := range records {
+			records[i] = nil // the parts hold them
+		}
+		var first error
+		for _, p := range parts {
+			if err := b.flushRecordsAsync(ctx, bufferKey, database, measurement, p.records, p.rows, p.walHashes, p.group); err != nil && first == nil {
+				first = err
+			}
+		}
+		return first
+	}
 	startTime := time.Now()
 
 	// Merge typed column batches
@@ -3998,6 +4014,25 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 	return nil
 }
 
+// flushPartSync flushes one class of a split synchronous flush.
+func (b *ArrowBuffer) flushPartSync(ctx context.Context, bufferKey, database, measurement string, p flushPart) error {
+	merged, err := b.mergeBatches(p.records)
+	if err != nil {
+		b.markFlushFailure()
+		p.group.failed()
+		return fmt.Errorf("failed to merge batches: %w", err)
+	}
+	if err := b.flushBufferLockedDataTime(ctx, bufferKey, database, measurement, merged, p.rows, time.Now().UTC(), p.group); err != nil {
+		b.markFlushFailure()
+		p.group.failed()
+		b.logger.Warn().Err(err).Str("buffer_key", bufferKey).Int("records", p.rows).
+			Msg("Flush failed - data preserved in WAL for recovery")
+		return err
+	}
+	b.completeFlush(p.walHashes, p.group)
+	return nil
+}
+
 // flushBufferLocked writes buffered data to Parquet and storage (synchronous version for periodic flush)
 // Note: Caller must hold shard.mu lock
 func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard, bufferKey, database, measurement string) error {
@@ -4042,6 +4077,19 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 
 	// Release lock before expensive operations
 	shard.mu.Unlock()
+
+	if parts := b.splitForCoverage(bufferKey, recordsToFlush); parts != nil {
+		// Each class is its own group and file set (flush_split.go).
+		var first error
+		for _, p := range parts {
+			if err := b.flushPartSync(ctx, bufferKey, database, measurement, p); err != nil && first == nil {
+				first = err
+			}
+		}
+		completeTask()
+		shard.mu.Lock() // Re-acquire lock for caller
+		return first
+	}
 
 	// Merge typed column batches
 	merged, err := b.mergeBatches(recordsToFlush)

@@ -466,6 +466,9 @@ func TestFetchClientErrFileNotOnPeerCodeNotFound(t *testing.T) {
 	if !errors.Is(err, ErrFileNotOnPeer) {
 		t.Errorf("expected ErrFileNotOnPeer, got %v", err)
 	}
+	if errors.Is(err, ErrNotInPeerManifest) {
+		t.Errorf("storage miss reported as a manifest miss: %v", err)
+	}
 }
 
 // TestFetchClientErrFileNotOnPeerCodeManifest verifies Code="manifest" (file
@@ -489,6 +492,10 @@ func TestFetchClientErrFileNotOnPeerCodeManifest(t *testing.T) {
 	}
 	if !errors.Is(err, ErrFileNotOnPeer) {
 		t.Errorf("expected ErrFileNotOnPeer, got %v", err)
+	}
+	// Its manifest may only trail the requester's (#1207 S4b1c2b).
+	if !errors.Is(err, ErrNotInPeerManifest) {
+		t.Errorf("expected ErrNotInPeerManifest, got %v", err)
 	}
 }
 
@@ -525,6 +532,9 @@ func TestFetchClientErrFileNotOnPeerPhase2Fallback(t *testing.T) {
 			}
 			if !errors.Is(err, ErrFileNotOnPeer) {
 				t.Errorf("expected ErrFileNotOnPeer for reason %q (Phase 2 peer fallback), got %v", tc.reason, err)
+			}
+			if errors.Is(err, ErrNotInPeerManifest) != (tc.name == "not_in_manifest") {
+				t.Errorf("manifest miss for reason %q: %v", tc.reason, err)
 			}
 		})
 	}

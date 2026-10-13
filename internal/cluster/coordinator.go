@@ -172,6 +172,16 @@ type Coordinator struct {
 	// puller is the background worker pool that downloads files from peers.
 	// Nil when peer replication is disabled or the license forbids it.
 	puller *filereplication.Puller
+	// fetcher is the puller's fetch client: the stream claimant probes peers
+	// for a file with it (#1207 S4b1c2b).
+	fetcher filereplication.Fetcher
+	// pendingRegistration reports whether a path waits for registration in
+	// this writer's outbox (nil on other nodes).
+	pendingRegistration atomic.Pointer[func(string) bool]
+	// republishSeen is when this node first saw each adopted instance with a
+	// claim record (DELETE gate, republishBusy).
+	republishMu   sync.Mutex
+	republishSeen map[uint64]time.Time
 	// catchupOnce guarantees the Phase 3 catch-up walker runs at most once
 	// per coordinator lifetime, across repeated Start/Stop cycles in tests.
 	catchupOnce sync.Once
@@ -4426,6 +4436,10 @@ func (c *Coordinator) startFilePullerLocked() error {
 	// Start the puller workers.
 	puller.Start(context.Background())
 	c.puller = puller
+	c.fetcher = fetchClient
+	if backend.Type() == "local" {
+		go c.vanishedSweepLoop(c.ctx)
+	}
 
 	c.logger.Info().
 		Int("workers", pullerCfg.Workers).
