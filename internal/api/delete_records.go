@@ -188,8 +188,15 @@ func (h *DeleteHandler) RewriteForRecords(ctx context.Context, relativePath stri
 // be on this node, where the DELETE scans. It returns the ones still missing
 // when the caller allowed them (their rows are not deleted), or
 // errUnreachableFiles.
-func (h *DeleteHandler) waitLocalFiles(ctx context.Context, rec deleteRecorder, database, measurement string, allowUnreachable bool) (missing []string, err error) {
-	missing, err = rec.WaitLocalFiles(ctx, database, measurement, deleteLocalWait)
+// localFileWaiter waits until the manifest files of a measurement are on
+// this node: the DELETE recorder (stream takeover) or the compaction commit
+// side of the coordinator.
+type localFileWaiter interface {
+	WaitLocalFiles(ctx context.Context, database, measurement string, budget time.Duration) ([]string, error)
+}
+
+func (h *DeleteHandler) waitLocalFiles(ctx context.Context, w localFileWaiter, database, measurement string, allowUnreachable bool) (missing []string, err error) {
+	missing, err = w.WaitLocalFiles(ctx, database, measurement, deleteLocalWait)
 	if err != nil {
 		return nil, err
 	}

@@ -1219,7 +1219,17 @@ deleted rows.
 A DELETE also leaves alone files in storage that the cluster manifest does not
 list and this node is not registering, such as a compaction output not yet
 committed. It first catches up with the cluster manifest, so a file registered
-a moment ago is not missed; if it cannot, it answers `503`. Before, rewriting such a file deleted it and left its rewrite
+a moment ago is not missed; if it cannot, it answers `503`.
+
+With compaction commit on, a DELETE also waits before its first scan until
+every file the cluster manifest lists for the measurement is on the node (up to
+30 s), as it already did with stream takeover. Without that wait, a DELETE that
+ran just after a compaction committed, before its output reached the node,
+found none of the compaction's rows and answered success having deleted
+nothing. A file still missing after 30 s answers `503` listing it in
+`unreachable_files`; `allow_unreachable: true` runs the DELETE without it.
+This now applies on clusters without stream takeover too. A dry run does not
+wait. Before, rewriting such a file deleted it and left its rewrite
 unregistered, so it never replicated.
 
 The cluster turns this on by itself once every node runs this release (`GET
