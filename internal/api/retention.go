@@ -45,11 +45,13 @@ type RetentionHandler struct {
 	// ownsDB records whether this handler opened db itself. When retention
 	// shares the auth database (the default), the handle is borrowed and Close
 	// must leave it to its owner.
-	ownsDB         bool
-	duckdb         *database.DuckDB     // Shared DuckDB for parquet queries
-	coordinator    RetentionCoordinator // nil in standalone mode
-	tieringManager *tiering.Manager     // optional cold-tier retention
-	licenseClient  *license.Client      // nil when auth/licensing is disabled
+	ownsDB      bool
+	duckdb      *database.DuckDB     // Shared DuckDB for parquet queries
+	coordinator RetentionCoordinator // nil in standalone mode
+	coldTier    coldRetentionTier    // nil without tiering: retention is hot-only
+	// coldDeleteHook replaces the cold object delete in tests; nil in production.
+	coldDeleteHook func(ctx context.Context, backend storage.Backend, path string) error
+	licenseClient  *license.Client // nil when auth/licensing is disabled
 	authManager    *auth.AuthManager
 	logger         zerolog.Logger
 }
@@ -185,8 +187,15 @@ type ExecuteRetentionResponse struct {
 	// SkippedFiles counts files whose stored key could not be resolved to a
 	// readable path, so they were neither examined nor deleted and never will
 	// be. Omitted when zero, which is every healthy deployment.
-	SkippedFiles         int      `json:"skipped_files,omitempty"`
-	SkippedReason        string   `json:"skipped_reason,omitempty"`
+	SkippedFiles  int    `json:"skipped_files,omitempty"`
+	SkippedReason string `json:"skipped_reason,omitempty"`
+	// Cold tier (#168). DeletedCount and FilesDeleted include these. In a dry
+	// run they are what a real run would delete. ColdFilesSkipped counts cold
+	// files retention could not examine or delete; ColdSkippedReason says why.
+	ColdFilesDeleted     int      `json:"cold_files_deleted,omitempty"`
+	ColdRowsDeleted      int64    `json:"cold_rows_deleted,omitempty"`
+	ColdFilesSkipped     int      `json:"cold_files_skipped,omitempty"`
+	ColdSkippedReason    string   `json:"cold_skipped_reason,omitempty"`
 	ExecutionTimeMs      float64  `json:"execution_time_ms"`
 	DryRun               bool     `json:"dry_run"`
 	CutoffDate           string   `json:"cutoff_date"`
@@ -325,9 +334,24 @@ func (h *RetentionHandler) SetCoordinator(c RetentionCoordinator) {
 	h.coordinator = c
 }
 
-// SetTieringManager wires cold-tier metadata and storage into retention.
+// coldRetentionTier is what retention needs from tiering to apply a policy to
+// the cold tier (#168). *tiering.Manager satisfies it.
+type coldRetentionTier interface {
+	// ColdBackend is nil when this node has no usable cold tier.
+	ColdBackend() storage.Backend
+	GetColdFilesForRetention(ctx context.Context, database string, cutoff time.Time) ([]tiering.FileMetadata, error)
+	RetireColdRows(ctx context.Context, paths []string) (int, error)
+	RevertColdRowToHot(ctx context.Context, path string) error
+	NotifyColdFilesRemoved(n int)
+}
+
+// SetTieringManager makes retention apply its policies to the cold tier too.
 func (h *RetentionHandler) SetTieringManager(m *tiering.Manager) {
-	h.tieringManager = m
+	if m == nil {
+		h.coldTier = nil
+		return
+	}
+	h.coldTier = m
 }
 
 // initTables creates the retention policy tables
@@ -639,30 +663,11 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 	if err != nil {
 		return nil, fmt.Errorf("failed to discover measurements: %w", err)
 	}
-	measurements := append([]string(nil), discovery.measurements...)
-
-	// Cold-only measurements are invisible to the hot storage listing. Add
-	// metadata candidates here so retention applies even after every hot copy
-	// has migrated to cold storage (#168).
-	if h.tieringManager != nil {
-		coldFiles, coldErr := h.tieringManager.GetColdFilesForRetention(ctx, policy.Database, "", cutoffDate)
-		if coldErr != nil {
-			return nil, fmt.Errorf("failed to discover cold-tier files: %w", coldErr)
-		}
-		seen := make(map[string]struct{}, len(measurements))
-		for _, measurement := range measurements {
-			seen[measurement] = struct{}{}
-		}
-		for _, file := range coldFiles {
-			if policy.Measurement != nil && *policy.Measurement != "" && file.Measurement != *policy.Measurement {
-				continue
-			}
-			if _, ok := seen[file.Measurement]; !ok {
-				seen[file.Measurement] = struct{}{}
-				measurements = append(measurements, file.Measurement)
-			}
-		}
-	}
+	// Cold-only measurements are invisible to the hot listing, so the cold
+	// tier adds its own (#168).
+	cold := h.planColdRetention(ctx, policy, cutoffDate)
+	defer h.notifyColdRemoved(cold)
+	measurements := cold.addMeasurements(discovery.measurements)
 
 	h.logger.Info().Strs("measurements", measurements).Msg("Processing measurements")
 
@@ -692,17 +697,16 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 			return nil, fmt.Errorf("retention aborted for policy %d: %w", policyID, err)
 		}
 
-		if h.tieringManager != nil {
-			coldDeleted, coldFiles, coldErr := h.deleteOldColdFiles(ctx, policy.Database, measurement, cutoffDate, false)
-			totalDeleted += coldDeleted
-			totalFilesDeleted += coldFiles
-			if coldErr != nil {
-				h.logger.Error().Err(coldErr).Str("measurement", measurement).Msg("Failed to process cold-tier retention")
-				if executionID > 0 {
-					h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), coldErr.Error())
-				}
-				return nil, fmt.Errorf("cold-tier retention aborted for policy %d: %w", policyID, coldErr)
+		// Only a cancelled context stops the cold pass; everything else it
+		// cannot do is counted in cold, so hot retention always runs.
+		coldRows, coldFiles, coldErr := h.deleteOldColdFiles(ctx, cold, measurement, cutoffDate, false)
+		totalDeleted += coldRows
+		totalFilesDeleted += coldFiles
+		if coldErr != nil {
+			if executionID > 0 {
+				h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), coldErr.Error())
 			}
+			return nil, fmt.Errorf("retention aborted for policy %d: %w", policyID, coldErr)
 		}
 	}
 	totalSkipped += discovery.unusable.orphans
@@ -717,6 +721,8 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 	// not do what the policy asks, so it must not be recorded as a clean
 	// "completed": the whole failure mode #746 fixed was retention reporting
 	// success while deleting nothing.
+	coldReason := cold.skippedReason()
+	cold.logSkipped(h.logger, policy.Database)
 	if executionID > 0 {
 		status, detail := "completed", ""
 		if totalSkipped > 0 {
@@ -725,6 +731,10 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 			h.logger.Error().Int("skipped_files", totalSkipped).Str("database", policy.Database).
 				Strs("sample", formatUnusableSamples(discovery.unusable)).
 				Msg("Retention could not resolve some files; their data will never age out")
+		}
+		if coldReason != "" {
+			status = "completed_with_errors"
+			detail = joinRetentionDetail(detail, coldReason)
 		}
 		h.recordExecutionComplete(executionID, status, totalDeleted, executionTime, detail)
 	}
@@ -742,6 +752,10 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 		FilesDeleted:         totalFilesDeleted,
 		SkippedFiles:         totalSkipped,
 		SkippedReason:        skippedReason(totalSkipped),
+		ColdFilesDeleted:     cold.filesDeleted,
+		ColdRowsDeleted:      cold.rowsDeleted,
+		ColdFilesSkipped:     cold.skippedTotal(),
+		ColdSkippedReason:    coldReason,
 		ExecutionTimeMs:      executionTime,
 		DryRun:               false,
 		CutoffDate:           cutoffDate.Format(time.RFC3339),
@@ -848,28 +862,11 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 			"error": "Failed to discover measurements: " + err.Error(),
 		})
 	}
-	measurements := append([]string(nil), discovery.measurements...)
-	if h.tieringManager != nil {
-		coldFiles, coldErr := h.tieringManager.GetColdFilesForRetention(c.Context(), policy.Database, "", cutoffDate)
-		if coldErr != nil {
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-				"error": "Failed to discover cold-tier files: " + coldErr.Error(),
-			})
-		}
-		seen := make(map[string]struct{}, len(measurements))
-		for _, measurement := range measurements {
-			seen[measurement] = struct{}{}
-		}
-		for _, file := range coldFiles {
-			if policy.Measurement != nil && *policy.Measurement != "" && file.Measurement != *policy.Measurement {
-				continue
-			}
-			if _, ok := seen[file.Measurement]; !ok {
-				seen[file.Measurement] = struct{}{}
-				measurements = append(measurements, file.Measurement)
-			}
-		}
-	}
+	// Cold-only measurements are invisible to the hot listing, so the cold
+	// tier adds its own (#168).
+	cold := h.planColdRetention(c.Context(), policy, cutoffDate)
+	defer h.notifyColdRemoved(cold)
+	measurements := cold.addMeasurements(discovery.measurements)
 
 	h.logger.Info().Strs("measurements", measurements).Msg("Processing measurements")
 
@@ -899,18 +896,18 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 				"error": fmt.Sprintf("retention aborted at measurement %q: %s", measurement, err.Error()),
 			})
 		}
-		if h.tieringManager != nil {
-			coldDeleted, coldFiles, coldErr := h.deleteOldColdFiles(c.Context(), policy.Database, measurement, cutoffDate, req.DryRun)
-			totalDeleted += coldDeleted
-			totalFilesDeleted += coldFiles
-			if coldErr != nil {
-				if !req.DryRun && executionID > 0 {
-					h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), coldErr.Error())
-				}
-				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-					"error": fmt.Sprintf("cold-tier retention aborted at measurement %q: %s", measurement, coldErr.Error()),
-				})
+		// Only a cancelled context stops the cold pass; everything else it
+		// cannot do is counted in cold, so hot retention always runs.
+		coldRows, coldFiles, coldErr := h.deleteOldColdFiles(c.Context(), cold, measurement, cutoffDate, req.DryRun)
+		totalDeleted += coldRows
+		totalFilesDeleted += coldFiles
+		if coldErr != nil {
+			if !req.DryRun && executionID > 0 {
+				h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), coldErr.Error())
 			}
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": fmt.Sprintf("retention aborted at measurement %q: %s", measurement, coldErr.Error()),
+			})
 		}
 	}
 	totalSkipped += discovery.unusable.orphans
@@ -931,12 +928,14 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 			Strs("sample", formatUnusableSamples(discovery.unusable)).
 			Msg("Retention could not resolve some files; their data will never age out")
 	}
+	coldReason := cold.skippedReason()
+	cold.logSkipped(h.logger, policy.Database)
 	if !req.DryRun && executionID > 0 {
 		status := "completed"
-		if totalSkipped > 0 {
+		if totalSkipped > 0 || coldReason != "" {
 			status = "completed_with_errors"
 		}
-		h.recordExecutionComplete(executionID, status, totalDeleted, executionTime, skipDetail)
+		h.recordExecutionComplete(executionID, status, totalDeleted, executionTime, joinRetentionDetail(skipDetail, coldReason))
 	}
 
 	h.logger.Info().
@@ -953,6 +952,10 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 		FilesDeleted:         totalFilesDeleted,
 		SkippedFiles:         totalSkipped,
 		SkippedReason:        skipDetail,
+		ColdFilesDeleted:     cold.filesDeleted,
+		ColdRowsDeleted:      cold.rowsDeleted,
+		ColdFilesSkipped:     cold.skippedTotal(),
+		ColdSkippedReason:    coldReason,
 		ExecutionTimeMs:      executionTime,
 		DryRun:               req.DryRun,
 		CutoffDate:           cutoffDate.Format(time.RFC3339),
@@ -1335,59 +1338,6 @@ func readParquetPath(backend storage.Backend, key string) (string, error) {
 }
 
 // getFileMaxTimeAndRowCount reads a Parquet file to get max time and row count
-func (h *RetentionHandler) deleteOldColdFiles(ctx context.Context, database, measurement string, cutoffDate time.Time, dryRun bool) (int64, int, error) {
-	if h.tieringManager == nil {
-		return 0, 0, nil
-	}
-	coldBackend := h.tieringManager.GetBackendForTier(tiering.TierCold)
-	if coldBackend == nil {
-		return 0, 0, fmt.Errorf("cold tier backend is not configured")
-	}
-	files, err := h.tieringManager.GetColdFilesForRetention(ctx, database, measurement, cutoffDate)
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to list cold-tier retention candidates: %w", err)
-	}
-
-	var deletedRows int64
-	var deletedFiles int
-	for _, file := range files {
-		fullPath, err := readParquetPath(coldBackend, file.Path)
-		if err != nil {
-			return deletedRows, deletedFiles, fmt.Errorf("failed to resolve cold-tier file %q for retention: %w", file.Path, err)
-		}
-		maxTime, rowCount, err := h.getFileMaxTimeAndRowCount(ctx, fullPath)
-		if err != nil {
-			return deletedRows, deletedFiles, fmt.Errorf("failed to read cold-tier file %q metadata for retention: %w", file.Path, err)
-		}
-		if !maxTime.Before(cutoffDate) {
-			continue
-		}
-
-		h.logger.Info().Str("file", filepath.Base(file.Path)).Str("tier", string(tiering.TierCold)).
-			Time("max_time", maxTime).Int64("rows", rowCount).Bool("dry_run", dryRun).
-			Msg("Cold-tier file eligible for deletion")
-		if dryRun {
-			deletedRows += rowCount
-			deletedFiles++
-			continue
-		}
-		// Retire metadata first. If the object delete fails, restore the exact
-		// cold-tier record so subsequent reads and retention runs can still find it.
-		if err := h.tieringManager.DeleteFile(ctx, file.Path); err != nil {
-			return deletedRows, deletedFiles, fmt.Errorf("failed to remove cold-tier metadata for %q: %w", file.Path, err)
-		}
-		if err := coldBackend.Delete(ctx, file.Path); err != nil {
-			if restoreErr := h.tieringManager.RestoreColdFile(ctx, &file); restoreErr != nil {
-				return deletedRows, deletedFiles, fmt.Errorf("failed to delete cold-tier file %q: %w (also failed to restore metadata: %v)", file.Path, err, restoreErr)
-			}
-			return deletedRows, deletedFiles, fmt.Errorf("failed to delete cold-tier file %q: %w", file.Path, err)
-		}
-		deletedRows += rowCount
-		deletedFiles++
-	}
-	return deletedRows, deletedFiles, nil
-}
-
 func (h *RetentionHandler) getFileMaxTimeAndRowCount(ctx context.Context, filePath string) (time.Time, int64, error) {
 	// Use the shared DuckDB connection to avoid memory retention from temporary connections
 	db := h.duckdb.DB()

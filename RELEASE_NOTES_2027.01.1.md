@@ -1127,6 +1127,37 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Retention policies apply to the cold tier ([#168](https://github.com/Basekick-Labs/arc/issues/168))
+
+With tiered storage, retention deleted expired files from local storage only.
+Files tiering had moved to the cold tier were kept forever, so cold storage grew
+without bound, and a measurement whose data had all moved to cold was never
+examined at all.
+
+A policy now covers the cold tier too. After each measurement's local files,
+retention checks the cold files whose partition starts before the cutoff. A
+file is deleted from cold storage when every row in it is older than the
+cutoff, then its tier row is removed. Measurements that exist only in the cold
+tier are processed. The scheduled run, manual execution and dry runs all
+include the cold tier.
+
+The execute response reports the cold tier separately in `cold_files_deleted`
+and `cold_rows_deleted`. These are also included in `deleted_count` and
+`files_deleted`.
+
+The cold tier never stops local retention. A cold file that cannot be read or
+deleted, a quarantined one, and the cold rows on a node with
+`tiered_storage.cold.enabled` off are left in place. They are counted in
+`cold_files_skipped`, explained in `cold_skipped_reason`, and the execution is
+recorded as `completed_with_errors`. A tier row whose cold object is already
+gone is removed, or pointed back at the local copy of the file when one exists.
+
+Backups now tolerate a cold object that retention deletes while a backup is
+running. The object is skipped and counted like a local file that disappears
+mid-run. Any other cold read failure still fails the backup.
+
+Contributed by [@lecodev-26](https://github.com/lecodev-26) in [#1053](https://github.com/Basekick-Labs/arc/pull/1053).
+
 ### Compaction waits for recent compaction outputs again ([#1235](https://github.com/Basekick-Labs/arc/issues/1235))
 
 Each tier skips a partition while its newest file is younger than the tier's

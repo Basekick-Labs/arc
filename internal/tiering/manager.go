@@ -763,49 +763,57 @@ func (m *Manager) DeleteFile(ctx context.Context, path string) error {
 	return m.metadata.DeleteFile(ctx, path)
 }
 
-// RestoreColdFile restores a cold-tier metadata row after a failed object deletion.
-func (m *Manager) RestoreColdFile(ctx context.Context, file *FileMetadata) error {
+// GetColdFilesForRetention returns the cold rows of one database whose
+// partition starts before cutoff: every cold file that can hold a row older
+// than cutoff, since a file's rows are never older than its partition start.
+// The partition is only the index. Retention reads each file's max(time)
+// before it deletes anything. Quarantined rows are included so retention can
+// report them; it never acts on one (#758).
+func (m *Manager) GetColdFilesForRetention(ctx context.Context, database string, cutoff time.Time) ([]FileMetadata, error) {
 	if m == nil || m.metadata == nil {
-		return fmt.Errorf("tiering metadata is not configured")
+		return nil, nil
 	}
-	migratedAt := time.Now().UTC()
-	if file.MigratedAt != nil {
-		migratedAt = *file.MigratedAt
-	}
-	written, err := m.metadata.RecordColdFile(ctx, file, migratedAt)
-	if err != nil {
-		return err
-	}
-	if !written {
-		return fmt.Errorf("cold-tier metadata row for %q was not restored", file.Path)
-	}
-	return nil
+	return m.metadata.GetColdFilesForRetention(ctx, database, cutoff)
 }
 
-// GetColdFilesForRetention returns cold-tier metadata candidates whose
-// partition is older than the supplied cutoff. Retention still reads the
-// Parquet footer before deleting, so partition age is only a discovery index,
-// not the retention decision itself.
-func (m *Manager) GetColdFilesForRetention(ctx context.Context, database, measurement string, cutoff time.Time) ([]FileMetadata, error) {
-	age := time.Since(cutoff)
-	if age < 0 {
-		age = 0
+// RetireColdRows removes the cold rows of objects retention deleted or found
+// already gone. A row that is no longer cold is left alone. Reports how many
+// rows were removed; on error, how many were removed before it.
+func (m *Manager) RetireColdRows(ctx context.Context, paths []string) (int, error) {
+	if m == nil || m.metadata == nil {
+		return 0, nil
 	}
-	files, err := m.metadata.GetFilesOlderThan(ctx, TierCold, age)
-	if err != nil {
-		return nil, err
-	}
-	filtered := files[:0]
-	for _, file := range files {
-		if file.Database != database {
-			continue
+	removed := 0
+	for _, path := range paths {
+		ok, err := m.metadata.DeleteFileInTier(ctx, path, TierCold, time.Time{})
+		if err != nil {
+			return removed, err
 		}
-		if measurement != "" && file.Measurement != measurement {
-			continue
+		if ok {
+			removed++
 		}
-		filtered = append(filtered, file)
 	}
-	return filtered, nil
+	return removed, nil
+}
+
+// RevertColdRowToHot points a cold row whose cold object is gone back at the
+// hot copy of the same file, as orphan reconciliation does. Deleting the row
+// instead would unregister a hot file the query path still has to read.
+func (m *Manager) RevertColdRowToHot(ctx context.Context, path string) error {
+	if m == nil || m.metadata == nil {
+		return nil
+	}
+	return m.metadata.UpdateTier(ctx, path, TierHot)
+}
+
+// NotifyColdFilesRemoved drops the query caches after retention removed cold
+// objects. A cached read can still name the cold tier's glob, and a glob that
+// now matches nothing turns the whole read into "no files".
+func (m *Manager) NotifyColdFilesRemoved(n int) {
+	if m == nil {
+		return
+	}
+	m.notifyMigrationComplete(n, 0)
 }
 
 // GetStatus returns the current tiering status
