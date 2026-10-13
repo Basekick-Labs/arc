@@ -196,3 +196,97 @@ func TestBufferMetrics_FlushCountersMove(t *testing.T) {
 		t.Fatalf("buffer_records_written = %d, want %d: the buffer's written count is not published (#802)", got, wantWritten)
 	}
 }
+
+// newGatedMetricsBuffer is a one-worker buffer over storage that blocks every
+// write until release is closed.
+func newGatedMetricsBuffer(t *testing.T) (*ArrowBuffer, *gatedStorageBackend, func()) {
+	t.Helper()
+	release := make(chan struct{})
+	releaseFlushes := func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}
+	backend := &gatedStorageBackend{
+		hangingStorageBackend: newHangingStorage(0, 0),
+		release:               release,
+		started:               make(chan struct{}, 16),
+		completed:             make(chan struct{}, 16),
+	}
+	buf := NewArrowBuffer(bufferMetricsConfig(), backend, zerolog.New(io.Discard))
+	t.Cleanup(func() {
+		releaseFlushes()
+		_ = buf.Close()
+	})
+	return buf, backend, releaseFlushes
+}
+
+func writeMetricsRecords(t *testing.T, buf *ArrowBuffer, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		if err := buf.Write(context.Background(), "default", []interface{}{bufferMetricsRecord()}); err != nil {
+			t.Fatalf("Write %d: %v", i, err)
+		}
+	}
+}
+
+func awaitStarted(t *testing.T, backend *gatedStorageBackend) {
+	t.Helper()
+	select {
+	case <-backend.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("flush did not reach the blocked storage backend")
+	}
+}
+
+// A synchronous flush (FlushAll, the flush before a DELETE, Close) takes the
+// records out of the buffer without queueing them: they count as in flight
+// while the write runs, and only then leave every gauge.
+func TestBufferMetricsCountSynchronousFlushesInFlight(t *testing.T) {
+	buf, backend, release := newGatedMetricsBuffer(t)
+	writeMetricsRecords(t, buf, 6) // below MaxBufferSize: nothing is queued
+	done := make(chan error, 1)
+	go func() { done <- buf.FlushAll(context.Background()) }()
+	awaitStarted(t, backend)
+	awaitBufferRecordMetrics(t, 0, 6)
+	release()
+	if err := <-done; err != nil {
+		t.Fatalf("FlushAll: %v", err)
+	}
+	awaitBufferRecordMetrics(t, 0, 0)
+}
+
+// Close's drain flushes the tasks still queued itself: each moves from queued
+// to in flight like a worker's would, and the gauges end at zero.
+func TestBufferMetricsCloseDrainMovesQueuedToInFlight(t *testing.T) {
+	buf, backend, release := newGatedMetricsBuffer(t)
+	writeMetricsRecords(t, buf, 10) // task 1: the only worker takes it and blocks
+	awaitStarted(t, backend)
+	writeMetricsRecords(t, buf, 20) // tasks 2 and 3 wait in the queue
+	awaitBufferRecordMetrics(t, 20, 10)
+
+	done := make(chan int, 1)
+	go func() { done <- buf.drainAndFlushQueue(time.Now().Add(time.Minute)) }()
+	awaitStarted(t, backend) // the drain is flushing one task (parallelism 1)
+	awaitBufferRecordMetrics(t, 10, 20)
+	release()
+	<-done
+	awaitBufferRecordMetrics(t, 0, 0)
+}
+
+// A drain past Close's deadline writes nothing: the dropped tasks leave the
+// queued gauge rather than staying there forever.
+func TestBufferMetricsCloseDropReleasesQueued(t *testing.T) {
+	buf, backend, _ := newGatedMetricsBuffer(t)
+	writeMetricsRecords(t, buf, 10)
+	awaitStarted(t, backend)
+	writeMetricsRecords(t, buf, 20)
+	awaitBufferRecordMetrics(t, 20, 10)
+
+	if unwritten := buf.drainAndFlushQueue(time.Now().Add(-time.Second)); unwritten != 20 {
+		t.Fatalf("drain past the deadline left %d records unwritten, want 20", unwritten)
+	}
+	awaitBufferRecordMetrics(t, 0, 10)
+}

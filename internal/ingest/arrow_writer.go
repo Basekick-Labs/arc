@@ -4125,6 +4125,12 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 	taskID := b.beginAsyncFlushTask()
 	completeTask := func() { b.completeAsyncFlushTask(taskID) }
 
+	// The records have left the buffer and never enter the flush queue, so
+	// they count as in flight until the write ends; otherwise no gauge sees a
+	// synchronous flush (FlushAll, the flush before a DELETE, Close) at all.
+	b.adjustFlushRecordMetrics(0, int64(recordCount))
+	defer b.adjustFlushRecordMetrics(0, -int64(recordCount))
+
 	// Release lock before expensive operations
 	shard.mu.Unlock()
 

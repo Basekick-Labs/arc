@@ -1254,12 +1254,27 @@ throughput. A negative value is refused at startup.
 Above the new ceiling, when the WAL queue is full, an entry is still dropped and
 the write still acknowledged. What admission should do instead is
 [#676](https://github.com/Basekick-Labs/arc/issues/676).
-### Flush metrics report queued and in-flight records ([#1038](https://github.com/Basekick-Labs/arc/issues/1038))
 
-Prometheus now exposes separate record-count gauges for flush batches waiting
-in the queue and batches currently being written. Together with
-`arc_buffer_records_buffered`, these show records retained across all three
-ingest stages without changing flush or write behaviour.
+### Ingest memory is visible while flushes back up ([#1038](https://github.com/Basekick-Labs/arc/issues/1038))
+
+`arc_buffer_records_buffered` counts only records still in a buffer. A record
+handed to the flush queue, or being written, left that gauge while it was still
+in memory. So under backpressure, when ingest holds the most, the gauge could
+read 0: in one measurement it stayed at 0 for 40 seconds while 43 million
+queued rows were written out.
+
+Two new gauges cover the rest, and the three sum to the records ingest holds
+in memory:
+
+- `arc_buffer_records_queued`: records in flush tasks waiting for a worker.
+- `arc_buffer_records_inflight`: records being written to storage, including
+  synchronous flushes (`FlushAll`, the flush before a DELETE, shutdown).
+
+They also appear as `buffer_records_queued` and `buffer_records_inflight` in
+`GET /api/v1/metrics` and `/metrics` as JSON, under `buffer` in
+`GET /api/v1/metrics/endpoints`, and in the stored time series. A climbing queued
+count with a flat buffered one means storage is the bottleneck, not the write
+rate.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1042](https://github.com/Basekick-Labs/arc/pull/1042).
 
