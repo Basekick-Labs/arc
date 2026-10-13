@@ -1074,7 +1074,7 @@ bypass the protection for recent writes. Legacy date-only daily filenames
 are also recognized. Existing timestamp precision and the historical daily
 age-check bypass remain unchanged.
 
-Contributed by [@jallegri](https://github.com/jallegri) for [#1235](https://github.com/Basekick-Labs/arc/issues/1235).
+Contributed by [@jallegri](https://github.com/jallegri) in [#1250](https://github.com/Basekick-Labs/arc/pull/1250).
 
 ### WAL-on ingest is no longer capped by one writer's fsync latency ([#1246](https://github.com/Basekick-Labs/arc/issues/1246))
 
