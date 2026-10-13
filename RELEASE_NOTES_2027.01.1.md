@@ -2877,6 +2877,15 @@ thing a new maintainer has to learn, and a refactor that moves a decision from
 four places to one is worth knowing about before you go looking for it in the
 old place.
 
+### The unused `license.enabled` setting is removed ([#1195](https://github.com/Basekick-Labs/arc/issues/1195))
+
+`license.enabled` (`ARC_LICENSE_ENABLED`) was read into the config and never
+used. Enterprise is enabled by `license.file_path` or `license.key` alone, and
+that does not change. A leftover `enabled` key or environment variable is
+still ignored, and Arc starts as before.
+
+Contributed by [@lecodev-26](https://github.com/lecodev-26) in [#1241](https://github.com/Basekick-Labs/arc/pull/1241).
+
 ### `PurgeFlushed` and WAL recovery are now driven by the same test
 
 No test in `internal/wal` ran the writer's sequence-floor purge and a recovery
