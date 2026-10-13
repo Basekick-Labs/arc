@@ -25,6 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
 
@@ -122,6 +123,16 @@ type CompletionWatcherConfig struct {
 	// waits for. nil means never paused.
 	PauseGate func() bool
 
+	// Staged commit (#1207 d2a2a); nil Staged means no staged manifests are
+	// expected. Storage is this node's backend (the staged copy, the output,
+	// the inputs). BeforeCommit runs before a job's commit is proposed,
+	// OnCommitted after it applied and the output is in place, with the
+	// inputs consumed (its error retries the job's finish).
+	Staged       StagedCommitter
+	Storage      storage.Backend
+	BeforeCommit func(output string)
+	OnCommitted  func(inputs []string) error
+
 	// Logger receives structured log output. Defaults to Nop if zero.
 	Logger zerolog.Logger
 }
@@ -166,6 +177,12 @@ type CompletionWatcher struct {
 	// the pause ends, so the log line lands once per pause, not per tick.
 	// Same goroutine rule as registeredOutputs.
 	pauseSkipLogged bool
+
+	// Staged commit state (#1207 d2a2a): per-job memory (loop goroutine
+	// only), what other goroutines read, and the orphan sweep's pace.
+	stagedJobs      map[string]*stagedJobState
+	reg             stagedRegistry
+	lastOrphanSweep time.Time
 
 	// Metrics (atomic for lock-free observability via Stats)
 	pollsTotal         atomic.Int64 // total scan cycles attempted
@@ -273,7 +290,10 @@ func (w *CompletionWatcher) PendingCommits() (sourcesDeleted int, outputWritten 
 			outputWritten = append(outputWritten, manifest.JobID)
 		}
 	}
-	return sourcesDeleted, outputWritten, nil
+	// A staged job in its commit branch has deleted its inputs from the
+	// manifest and is finishing; the pause waits for it like a phase 2.
+	// Staged jobs before their commit end at the pause on their own.
+	return sourcesDeleted + w.committingCount(), outputWritten, nil
 }
 
 // Stats returns a point-in-time snapshot of the watcher's metrics, suitable
@@ -334,6 +354,10 @@ func (w *CompletionWatcher) poll(ctx context.Context) {
 		w.logger.Warn().Err(err).Str("dir", w.cfg.Dir).Msg("Failed to list pending completion manifests")
 		return
 	}
+	if w.cfg.Staged != nil {
+		w.refreshStagedInputs(paths)
+		w.abortOrphanStaged(ctx)
+	}
 	if len(paths) == 0 {
 		return
 	}
@@ -377,6 +401,10 @@ func (w *CompletionWatcher) applyOne(ctx context.Context, path string) {
 	// The watcher ignores them until the subprocess advances the state.
 	// Orphan cleanup for stuck writing_output is handled separately by
 	// Manager.CleanupOrphanedCompletionManifests at startup.
+	if manifest.State == CompletionStateStaged {
+		w.applyStaged(ctx, path, manifest)
+		return
+	}
 	if manifest.State == CompletionStateWritingOutput {
 		return
 	}

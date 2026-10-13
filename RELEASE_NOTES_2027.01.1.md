@@ -1341,9 +1341,9 @@ also applies to the later scans; files it skipped are listed in
 `unreachable_files`.
 
 This covers a compaction that commits while the DELETE runs. The opposite
-order is still open: a compaction that read a file before the DELETE rewrote
-it, and commits after the DELETE, still registers an output that holds the
-deleted rows.
+order, a compaction that read a file before the DELETE rewrote it and commits
+after the DELETE, is covered on local storage by the staged compaction commit
+below. On object storage (S3, Azure) it is still open.
 
 A DELETE also leaves alone files in storage that the cluster manifest does not
 list and this node is not registering, such as a compaction output not yet
@@ -1389,6 +1389,56 @@ now retried for about 7 seconds, as on the tiered-storage path. A longer
 election still fails the request; retrying it completes the deletion.
 
 Contributed by [@jallegri](https://github.com/jallegri) in [#1252](https://github.com/Basekick-Labs/arc/pull/1252).
+
+### Compaction no longer loses rows when the compactor's disk fails, or brings deleted rows back ([#1207](https://github.com/Basekick-Labs/arc/issues/1207))
+
+On a cluster with local storage, a compaction registered its output and
+deleted its inputs in two steps, after it had already removed its own copies
+of the inputs. Nothing checked that the inputs were still the files it had
+read. Two things went wrong:
+
+- The other nodes removed their copies of the inputs as soon as the deletes
+  applied, while the output existed only on the compactor until they pulled
+  it. If the compactor's disk was lost in that window, the rows were gone on
+  every node.
+- A row DELETE that rewrote an input while the job ran left the job's output,
+  built from the input as it was before the DELETE, registered next to the
+  rewrite. The deleted rows came back and the others were doubled.
+
+Now, once compaction commit is on (see the DELETE entry above), a compaction
+on local storage is staged first:
+
+1. The compactor writes its output under `_compaction_staged/` in its storage,
+   where no query reads it, and leaves its inputs alone.
+2. It stages the job in the cluster. Every other node that keeps a local copy
+   of the data pulls the staged output, makes it durable and reports holding
+   it.
+3. Once at least one other node holds it, the compactor commits. The cluster
+   registers the output and deletes the inputs in one step, only if every
+   input is still registered exactly as the job read it. Each node holding the
+   staged copy moves it into place, so it never pulls the output again.
+
+If an input changed (a DELETE, retention, tiering or another compaction got
+there first), the commit is refused and the job is dropped. Its inputs were
+never touched, so nothing is lost, and a later cycle compacts the partition
+again. A compaction pause (a cluster restore) drops jobs that have not
+committed yet.
+
+What to expect:
+
+- A staged output takes disk space on every node that holds it until the
+  commit, then replaces the inputs.
+- If no other node that keeps local copies is up, a staged job waits for one
+  and is dropped after 10 minutes (longer for a large output), then
+  recompacted on a later cycle. Compaction makes no progress while the
+  compactor is the only node holding data.
+- A node that missed a commit moves its staged copy into place when it
+  catches up; one that has no copy pulls the output as before.
+- A job staged by a compactor that crashed is aborted when the compactor
+  restarts, or by the leader 10 minutes after the compactor stopped
+  answering.
+
+Object storage (S3, Azure) still uses the previous flow in this release.
 
 ### Delete API catches dangerous keywords glued to numbers or literals ([#1080](https://github.com/Basekick-Labs/arc/issues/1080))
 

@@ -337,6 +337,15 @@ type Manager struct {
 	// entry for a file about to be deleted. Such files wait a cycle.
 	isPending func(path string) bool
 
+	// Staged commit (#1207 d2a2a), guarded by mu: stagedMode reports whether
+	// a job launched now is staged (the cluster's compaction commit is on
+	// and storage is local); inputLookup describes a candidate as the
+	// cluster manifest lists it; locallyStaged reports an input of a job this
+	// node staged and the cluster has not seen yet.
+	stagedMode    func() bool
+	inputLookup   InputLookup
+	locallyStaged func(path string) bool
+
 	// Nil in production. Deterministic cycle tests may inject a batch
 	// runner without starting an external compaction subprocess.
 	compactBatchForTest func(context.Context, Candidate) error
@@ -1133,10 +1142,26 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 		time.Now().UnixNano(),
 		candidate.BatchNumber,
 	)
+	jobID = boundJobID(jobID)
+	var stagedInputs map[string]StagedInput
+	if staged, files, inputs := m.stagedCandidate(ctx, candidate); staged {
+		if len(files) < 2 {
+			m.logger.Info().Str("partition", lockKey).Int("eligible", len(files)).
+				Msg("Too few files the cluster manifest lists unchanged; the partition waits for the next compaction cycle")
+			return nil
+		}
+		candidate.Files, candidate.FileCount, stagedInputs = files, len(files), inputs
+	}
 	config := m.subprocessJob(candidate, jobID)
+	config.Staged, config.Inputs = stagedInputs != nil, stagedInputs
+	if config.Staged {
+		// A staged job writes no crash-recovery manifest: the watcher marks
+		// the receipts at its commit.
+		config.ParentFinalizesManifest = false
+	}
 
 	// Run compaction in subprocess for memory isolation
-	result, err := RunJobInSubprocess(ctx, config, m.logger)
+	result, err := runJobInSubprocess(ctx, config, m.logger)
 
 	// Always clean up temp directories for this partition after subprocess completes.
 	// The subprocess has its own defer cleanup, but if it crashes or gets OOM-killed,
@@ -1212,6 +1237,20 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 	// cache_httpfs and parquet_metadata_cache still reference them.
 	// Edge sync compacted-output observer (issue #610): record the output
 	// in the sync ledger before anything can discover it as a new file.
+	// A staged job's output is not in place and its inputs are not consumed
+	// until the cluster commits it: the watcher runs these then (FinishStaged).
+	if config.Staged {
+		if jobSucceeded {
+			m.logger.Debug().Str("job_id", config.JobID).Msg("Compaction output staged; observers run at its commit")
+		}
+		if err != nil {
+			return err
+		}
+		if result != nil && !result.Success {
+			return errors.New(result.Error)
+		}
+		return nil
+	}
 	if jobSucceeded && result != nil {
 		m.notifyCompactedOutput(result.OutputFile)
 	}

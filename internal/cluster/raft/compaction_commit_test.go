@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path"
 	"strings"
 	"testing"
 	"time"
@@ -41,6 +42,19 @@ func ccStage(job string, object bool) StageCompactionPayload {
 	out := ccFile("o-"+job+".parquet", "so-"+job, 25)
 	out.OriginNodeID = "someone-else"
 	return StageCompactionPayload{Job: job, Origin: "w2", Output: out, Inputs: ccInputs(), Object: object, Now: t0}
+}
+
+// ccFresh registers two inputs of its own for job and stages over them.
+func (x *tkFSM) ccFresh(job string, object bool) StageCompactionPayload {
+	x.t.Helper()
+	p := ccStage(job, object)
+	p.Inputs = nil
+	for _, n := range []string{"a", "b"} {
+		e := ccFile(job+"-"+n+".parquet", "s-"+job+n, 10)
+		x.ok(CommandRegisterFile, RegisterFilePayload{File: e})
+		p.Inputs = append(p.Inputs, CompactionInput{Path: e.Path, SizeBytes: 10, SHA256: e.SHA256})
+	}
+	return p
 }
 
 func ccCommit(job string) CommitCompactionPayload {
@@ -111,7 +125,7 @@ func TestStageCompactionRules(t *testing.T) {
 		"size":   func(p *StageCompactionPayload) { p.Inputs[0].SizeBytes = 11 },
 		"sha":    func(p *StageCompactionPayload) { p.Inputs[1].SHA256 = "old" },
 	} {
-		p := ccStage("j-"+name, false)
+		p := x.ccFresh("j-"+name, false)
 		mut(&p)
 		if r := x.conflict(CommandStageCompaction, p); r != CompactionInputsChanged {
 			t.Fatalf("%s: reason %s", name, r)
@@ -120,17 +134,17 @@ func TestStageCompactionRules(t *testing.T) {
 	cold := ccFile("c.parquet", "sc", 5)
 	cold.Tier = "cold"
 	x.ok(CommandRegisterFile, RegisterFilePayload{File: cold})
-	p := ccStage("j-cold", false)
+	p := x.ccFresh("j-cold", false)
 	p.Inputs = append(p.Inputs, CompactionInput{Path: cold.Path, SizeBytes: 5, SHA256: "sc"})
 	if r := x.conflict(CommandStageCompaction, p); r != CompactionInputsChanged {
 		t.Fatalf("cold input: reason %s", r)
 	}
 
 	// Malformed stages are errors, not conflicts.
-	dup := ccStage("j-dup", false)
+	dup := x.ccFresh("j-dup", false)
 	dup.Inputs = append(dup.Inputs, dup.Inputs[0])
 	x.refused(CommandStageCompaction, dup)
-	foreign := ccStage("j-foreign", false)
+	foreign := x.ccFresh("j-foreign", false)
 	foreign.Output.Measurement = "mem"
 	x.refused(CommandStageCompaction, foreign)
 	empty := ccStage("j-empty", false)
@@ -139,6 +153,12 @@ func TestStageCompactionRules(t *testing.T) {
 	bad := ccStage("j-bad", false)
 	bad.Output.Path = "../etc/passwd"
 	x.refused(CommandStageCompaction, bad)
+	// An output is a new hot file: the compaction tier, or no tier, is not one.
+	for _, tier := range []string{"hourly", "", "cold"} {
+		wrong := x.ccFresh("j-tier-"+tier, false)
+		wrong.Output.Tier = tier
+		x.refused(CommandStageCompaction, wrong)
+	}
 
 	// An output path already registered.
 	taken := ccStage("j-taken", false)
@@ -154,9 +174,9 @@ func TestStageCompactionRules(t *testing.T) {
 func TestStageCompactionBound(t *testing.T) {
 	x := ccFSM(t)
 	for i := 0; i < maxStagedCompactions; i++ {
-		x.ok(CommandStageCompaction, ccStage(fmt.Sprintf("j%d", i), false))
+		x.ok(CommandStageCompaction, x.ccFresh(fmt.Sprintf("j%d", i), false))
 	}
-	if r := x.conflict(CommandStageCompaction, ccStage("one-more", false)); r != CompactionFull {
+	if r := x.conflict(CommandStageCompaction, x.ccFresh("one-more", false)); r != CompactionFull {
 		t.Fatalf("reason %s", r)
 	}
 }
@@ -175,7 +195,7 @@ func TestCompactionHeld(t *testing.T) {
 	if len(s.Holders) != 2 || s.Holders[0] != "r1" || s.Holders[1] != "w3" {
 		t.Fatalf("holders %v", s.Holders)
 	}
-	x.ok(CommandStageCompaction, ccStage("obj", true))
+	x.ok(CommandStageCompaction, x.ccFresh("obj", true))
 	x.refused(CommandCompactionHeld, CompactionHeldPayload{Job: "obj", Node: "r1", SHA256: "so-obj"})
 }
 
@@ -321,6 +341,7 @@ func TestCommitCompactionRules(t *testing.T) {
 		t.Fatalf("after resume: reason %s", r)
 	}
 	// A job staged after the resume commits.
+	x.ok(CommandAbortCompaction, AbortCompactionPayload{Job: "j1", By: "w2"})
 	x.ok(CommandStageCompaction, ccStage("j2", false))
 	x.ok(CommandCommitCompaction, ccCommit("j2"))
 }
@@ -483,11 +504,11 @@ func TestStageCompactionRefusedWhilePaused(t *testing.T) {
 func TestRemoveNodeDropsItsStagedJobs(t *testing.T) {
 	x := ccFSM(t)
 	x.ok(CommandStageCompaction, ccStage("j1", false))
-	other := ccStage("j2", false)
+	other := x.ccFresh("j2", false)
 	other.Origin = "w3"
 	x.ok(CommandStageCompaction, other)
 	x.ok(CommandCompactionHeld, CompactionHeldPayload{Job: "j2", Node: "w2", SHA256: "so-j2"})
-	x.ok(CommandStageCompaction, ccStage("obj", true))
+	x.ok(CommandStageCompaction, x.ccFresh("obj", true))
 	x.ok(CommandCommitCompaction, ccCommit("obj"))
 	x.ok(CommandRemoveNode, RemoveNodePayload{NodeID: "w2"})
 	if _, ok := x.f.StagedCompactionByJob("j1"); ok {
@@ -653,13 +674,181 @@ func TestCompactionOutputPathReusedIsNotTheJobs(t *testing.T) {
 	x.f.mu.Unlock()
 
 	// Finalize after the job ended, with the path now someone else's.
-	x.ok(CommandRegisterFile, RegisterFilePayload{File: ccFile("a.parquet", "sa", 10)})
-	x.ok(CommandRegisterFile, RegisterFilePayload{File: ccFile("b.parquet", "sb", 20)})
-	x.ok(CommandStageCompaction, ccStage("obj2", true))
+	x.ok(CommandStageCompaction, x.ccFresh("obj2", true))
 	x.ok(CommandCommitCompaction, ccCommit("obj2"))
 	x.ok(CommandRevertCompaction, RevertCompactionPayload{Job: "obj2", By: "w2"})
 	x.ok(CommandRegisterFile, RegisterFilePayload{File: ccFile("o-obj2.parquet", "so-obj2", 25)})
 	if r := x.conflict(CommandFinalizeCompaction, FinalizeCompactionPayload{Job: "obj2", By: "w2", Output: ccHour + "o-obj2.parquet"}); r != CompactionUnknownJob {
 		t.Fatalf("finalize over a reused path: %s", r)
+	}
+}
+
+// #1207 d2a2a.
+
+func TestStageCompactionJobIDs(t *testing.T) {
+	x := ccFSM(t)
+	for _, job := range []string{"..", ".", ".hidden", "a/b", "a b", "a\\b", strings.Repeat("j", maxCompactionJobLen+1)} {
+		p := ccStage("ok", false)
+		p.Job = job
+		x.refused(CommandStageCompaction, p)
+	}
+	x.ok(CommandStageCompaction, ccStage("db.ns_cpu_2026_10_13_10_1791_b1", false))
+	if got := StagedCompactionKey("j1", "db/cpu/2026/10/13/10/o.parquet"); got != "_compaction_staged/j1/o.parquet" {
+		t.Fatalf("staged key %q", got)
+	}
+}
+
+// An input or the output of a staged job is not staged again until that job
+// ends.
+func TestStageCompactionRefusesAnotherJobsFiles(t *testing.T) {
+	x := ccFSM(t)
+	x.ok(CommandStageCompaction, ccStage("j1", false))
+	if r := x.conflict(CommandStageCompaction, ccStage("j2", false)); r != CompactionInputStaged {
+		t.Fatalf("same inputs: %s", r)
+	}
+	out := x.ccFresh("j3", false)
+	out.Output.Path = ccHour + "o-j1.parquet"
+	if r := x.conflict(CommandStageCompaction, out); r != CompactionInputStaged {
+		t.Fatalf("same output: %s", r)
+	}
+	x.ok(CommandAbortCompaction, AbortCompactionPayload{Job: "j1", By: "w2"})
+	x.ok(CommandStageCompaction, ccStage("j2", false))
+	x.ok(CommandCommitCompaction, ccCommit("j2"))
+	x.f.mu.RLock()
+	n := len(x.f.stagedPaths)
+	x.f.mu.RUnlock()
+	if n != 0 {
+		t.Fatalf("index keeps %d paths after the commit", n)
+	}
+}
+
+// A local job commits only once MinHolders other nodes hold its output.
+func TestCommitCompactionWaitsForHolders(t *testing.T) {
+	x := ccFSM(t)
+	p := ccStage("j1", false)
+	p.MinHolders = 1
+	x.ok(CommandStageCompaction, p)
+	if r := x.conflict(CommandCommitCompaction, ccCommit("j1")); r != CompactionHolders {
+		t.Fatalf("reason %s", r)
+	}
+	x.ok(CommandCompactionHeld, CompactionHeldPayload{Job: "j1", Node: "r1", SHA256: "so-j1"})
+	x.ok(CommandCommitCompaction, ccCommit("j1"))
+	bad := x.ccFresh("j2", false)
+	bad.MinHolders = 2
+	x.refused(CommandStageCompaction, bad)
+	obj := x.ccFresh("j3", true)
+	obj.MinHolders = 1
+	x.refused(CommandStageCompaction, obj)
+	// The holder removed before the commit no longer counts.
+	q := x.ccFresh("j4", false)
+	q.MinHolders = 1
+	x.ok(CommandStageCompaction, q)
+	x.ok(CommandCompactionHeld, CompactionHeldPayload{Job: "j4", Node: "r1", SHA256: "so-j4"})
+	x.ok(CommandRemoveNode, RemoveNodePayload{NodeID: "r1"})
+	if r := x.conflict(CommandCommitCompaction, ccCommit("j4")); r != CompactionHolders {
+		t.Fatalf("after the holder left: %s", r)
+	}
+}
+
+// The callbacks: staged, gone for an ending without a commit, and for a
+// commit the committed event before the output's registration and the
+// inputs' deletes.
+func TestCompactionCallbacks(t *testing.T) {
+	x := ccFSM(t)
+	var ev []string
+	x.f.SetFileCallbacks(func(e *FileEntry) { ev = append(ev, "register "+path.Base(e.Path)) },
+		func(p, _ string) { ev = append(ev, "delete "+path.Base(p)) })
+	x.f.SetCompactionCallbacks(
+		func(s StagedCompaction) { ev = append(ev, "staged "+s.Job) },
+		func(s StagedCompaction) { ev = append(ev, "gone "+s.Job) },
+		func(job string, out FileEntry) { ev = append(ev, "committed "+job+" "+path.Base(out.Path)) })
+	x.ok(CommandStageCompaction, ccStage("j1", false))
+	x.ok(CommandAbortCompaction, AbortCompactionPayload{Job: "j1", By: "w2"})
+	x.ok(CommandStageCompaction, ccStage("j2", false))
+	x.ok(CommandCommitCompaction, ccCommit("j2"))
+	q := x.ccFresh("j3", false)
+	x.ok(CommandStageCompaction, q)
+	x.ok(CommandRemoveNode, RemoveNodePayload{NodeID: "w2"})
+	want := "staged j1|gone j1|staged j2|committed j2 o-j2.parquet|register o-j2.parquet|delete a.parquet|delete b.parquet|" +
+		"register j3-a.parquet|register j3-b.parquet|staged j3|gone j3"
+	if got := strings.Join(ev, "|"); got != want {
+		t.Fatalf("events\n got %s\nwant %s", got, want)
+	}
+}
+
+// A restore announces the staged jobs it adds and the ones it drops.
+func TestCompactionCallbacksOnRestore(t *testing.T) {
+	a := ccFSM(t)
+	a.ok(CommandStageCompaction, ccStage("j1", false))
+	snap1 := snapshotBytes(t, a.f)
+	a.ok(CommandCommitCompaction, ccCommit("j1"))
+	a.ok(CommandStageCompaction, a.ccFresh("j2", false))
+	snap2 := snapshotBytes(t, a.f)
+
+	f := newTestFSM()
+	var ev []string
+	f.SetCompactionCallbacks(
+		func(s StagedCompaction) { ev = append(ev, "staged "+s.Job) },
+		func(s StagedCompaction) { ev = append(ev, "gone "+s.Job) },
+		func(string, FileEntry) { ev = append(ev, "committed") })
+	for _, raw := range [][]byte{snap1, snap2} {
+		if err := f.Restore(io.NopCloser(bytes.NewReader(raw))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := strings.Join(ev, "|"); got != "staged j1|staged j2|gone j1" {
+		t.Fatalf("events %s", got)
+	}
+	if _, ok := f.StagedCompactionByKey(StagedCompactionKey("j2", ccHour+"o-j2.parquet")); !ok {
+		t.Fatal("restored index misses j2")
+	}
+}
+
+func TestStagedCompactionByKey(t *testing.T) {
+	x := ccFSM(t)
+	x.ok(CommandStageCompaction, ccStage("j1", false))
+	key := StagedCompactionKey("j1", ccHour+"o-j1.parquet")
+	if s, ok := x.f.StagedCompactionByKey(key); !ok || s.Job != "j1" {
+		t.Fatalf("lookup: %+v %v", s, ok)
+	}
+	for _, k := range []string{"_compaction_staged/j1/other.parquet", "_compaction_staged/j2/o-j1.parquet", "x/j1/o-j1.parquet", "_compaction_staged/j1", ccHour + "o-j1.parquet"} {
+		if _, ok := x.f.StagedCompactionByKey(k); ok {
+			t.Fatalf("%s served", k)
+		}
+	}
+	x.ok(CommandCommitCompaction, ccCommit("j1"))
+	if _, ok := x.f.StagedCompactionByKey(key); ok {
+		t.Fatal("served after the commit")
+	}
+}
+
+func snapshotBytes(t *testing.T, f *ClusterFSM) []byte {
+	t.Helper()
+	snap, err := f.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := snap.Persist(&testSnapshotSink{Writer: &buf}); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// A restore rebuilds which files staged jobs own.
+func TestRestoreRebuildsStagedPaths(t *testing.T) {
+	a := ccFSM(t)
+	a.ok(CommandStageCompaction, ccStage("j1", false))
+	raw := snapshotBytes(t, a.f)
+	b := takeoverFSM(t)
+	if err := b.f.Restore(io.NopCloser(bytes.NewReader(raw))); err != nil {
+		t.Fatal(err)
+	}
+	b.idx = a.idx
+	if !b.f.StagedCompactionOwns(ccHour+"a.parquet") || !b.f.StagedCompactionOwns(ccHour+"o-j1.parquet") {
+		t.Fatal("restored FSM does not know what j1 owns")
+	}
+	if r := b.conflict(CommandStageCompaction, ccStage("j2", false)); r != CompactionInputStaged {
+		t.Fatalf("restored: %s", r)
 	}
 }

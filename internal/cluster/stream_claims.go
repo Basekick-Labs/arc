@@ -37,6 +37,9 @@ func (c *Coordinator) localCapabilities() []string {
 	// Compaction commit (#1207 d2) needs nothing of the node: every build
 	// that applies its rules advertises it.
 	caps := []string{raft.CapabilityCompactionCommit}
+	if c.keepsLocalReplicas() {
+		caps = append(caps, CapabilityLocalReplica)
+	}
 	if c.streamClaimsCapable() {
 		caps = append(caps, raft.CapabilityStreamClaims)
 	}

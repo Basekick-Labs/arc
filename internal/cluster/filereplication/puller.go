@@ -255,6 +255,12 @@ type Config struct {
 	// block. nil means no tiering on this node.
 	RecordAbandonedFile func(path string, sizeBytes int64)
 
+	// AdoptStaged, when set, moves this node's staged copy of a committed
+	// compaction output into place instead of pulling it (#1207 d2a2a): true
+	// when the output is now at its path. Tried before any fetch of an entry
+	// with a CompactionJob.
+	AdoptStaged func(ctx context.Context, entry *raft.FileEntry) (bool, error)
+
 	// Logger receives structured log output.
 	Logger zerolog.Logger
 }
@@ -328,6 +334,7 @@ type Puller struct {
 	totalEnqueued          atomic.Int64
 	totalSkippedSelf       atomic.Int64 // origin is self — no pull needed
 	totalSkippedLocal      atomic.Int64 // file fully present locally
+	totalAdopted           atomic.Int64 // compaction outputs moved into place from a staged copy (#1207)
 	totalForcedRefresh     atomic.Int64 // forced requests that bypassed the size check
 	totalRefreshVerified   atomic.Int64 // verify requests whose local copy already matched
 	totalSkippedDup        atomic.Int64 // already enqueued / in-flight
@@ -1662,6 +1669,13 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 			return
 		}
 
+		// A committed compaction output this node holds staged (#1207
+		// d2a2a): moved into place, no fetch.
+		if p.adoptStaged(log, entry) {
+			succeeded = true
+			return
+		}
+
 		// Resolve candidate peers fresh on each attempt so topology changes
 		// (node failover, rescheduling) are picked up automatically.
 		peers := p.cfg.PeerResolver.ResolvePeers(entry.OriginNodeID, entry.Path)
@@ -2158,3 +2172,57 @@ var ErrNotInPeerManifest = errors.New("filereplication: file not in the peer's m
 // zero — not fall through to another peer, since the file exists there and
 // the offset is simply invalid or stale.
 var ErrBadOffset = errors.New("filereplication: bad byte offset")
+
+// adoptStaged moves a staged copy of entry into place (#1207 d2a2a) and
+// reports whether entry is now at its path and still wanted. An output that
+// left the manifest while it moved is removed again.
+func (p *Puller) adoptStaged(log zerolog.Logger, entry *raft.FileEntry) bool {
+	if entry.CompactionJob == "" || p.cfg.AdoptStaged == nil {
+		return false
+	}
+	adopted, err := p.cfg.AdoptStaged(p.ctx, entry)
+	if err != nil {
+		log.Debug().Err(err).Str("path", entry.Path).Msg("Staged compaction output not adoptable; pulling it")
+	}
+	if !adopted {
+		return false
+	}
+	if _, wanted := p.manifestEntry(entry.Path); !wanted {
+		p.totalSkippedGone.Add(1)
+		p.deleteFile(log, entry.Path)
+		return false
+	}
+	p.totalAdopted.Add(1)
+	if p.cfg.RecordPulledFile != nil {
+		p.cfg.RecordPulledFile(entry.Path, entry.SizeBytes)
+	}
+	return true
+}
+
+// AdoptNow moves a committed compaction output into place from this node's
+// staged copy right away, holding the path's in-flight slot so a pull of the
+// same path cannot run beside it (#1207 d2a2a). When the slot is taken, the
+// request holding it adopts before it fetches. Reports whether the output is
+// at its path.
+func (p *Puller) AdoptNow(entry *raft.FileEntry) bool {
+	if entry == nil || !p.inflightAdd(entry.Path) {
+		return false
+	}
+	adopted := p.adoptStaged(p.logger.With().Str("component", "file-puller").Logger(), entry)
+	p.inflightRemove(entry.Path)
+	if !adopted {
+		// Holding the slot made the registration's own pull of this path a
+		// duplicate and dropped it: queue it now.
+		p.enqueue(entry, enqueueSourceReactive, false)
+	}
+	return adopted
+}
+
+// PullOwn pulls entry even when this node is its origin (#1207 d2a2a): a
+// committed compaction output whose staged copy this node lost.
+func (p *Puller) PullOwn(entry *raft.FileEntry) {
+	if entry == nil {
+		return
+	}
+	p.enqueueRequest(entry, enqueueSourceCatchUp, true, false)
+}

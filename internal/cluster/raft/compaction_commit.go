@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -97,6 +98,12 @@ const (
 	// CompactionInputsRegistered: a revert whose input paths are registered
 	// again.
 	CompactionInputsRegistered = "inputs-registered"
+	// CompactionInputStaged: an input (or the output path) belongs to another
+	// staged job (#1207 d2a2a).
+	CompactionInputStaged = "input-staged"
+	// CompactionHolders: a local job's commit before MinHolders other nodes
+	// hold its staged output.
+	CompactionHolders = "holders"
 )
 
 // CompactionInput is one input of a staged job as the job read it.
@@ -122,14 +129,17 @@ type CompactionInput struct {
 // Finalize and revert are proposed by the job's compactor, or by the leader
 // with Override once that compactor is gone; nothing else can race them.
 type StagedCompaction struct {
-	Job        string      `json:"job"`
-	Origin     string      `json:"origin"`
-	Output     FileEntry   `json:"output"`
-	Inputs     []FileEntry `json:"inputs"`
-	Object     bool        `json:"object,omitempty"`
-	Holders    []string    `json:"holders,omitempty"`
-	Finalizing bool        `json:"finalizing,omitempty"`
-	Finalized  bool        `json:"finalized,omitempty"`
+	Job     string      `json:"job"`
+	Origin  string      `json:"origin"`
+	Output  FileEntry   `json:"output"`
+	Inputs  []FileEntry `json:"inputs"`
+	Object  bool        `json:"object,omitempty"`
+	Holders []string    `json:"holders,omitempty"`
+	// MinHolders: other nodes that must hold the staged output before the
+	// commit (local storage; 0 when no other node keeps local replicas).
+	MinHolders int  `json:"min_holders,omitempty"`
+	Finalizing bool `json:"finalizing,omitempty"`
+	Finalized  bool `json:"finalized,omitempty"`
 	// PauseGen is the compaction pause generation when the job was staged:
 	// a pause that started since (a restore) refuses its commit.
 	PauseGen uint64    `json:"pause_gen,omitempty"`
@@ -147,12 +157,39 @@ type EnableCompactionCommitPayload struct {
 // StageCompactionPayload stages a job. Output is the entry the commit will
 // register (its OriginNodeID and CompactionJob are set by the FSM).
 type StageCompactionPayload struct {
-	Job    string            `json:"job"`
-	Origin string            `json:"origin"`
-	Output FileEntry         `json:"output"`
-	Inputs []CompactionInput `json:"inputs"`
-	Object bool              `json:"object,omitempty"`
-	Now    time.Time         `json:"now"`
+	Job        string            `json:"job"`
+	Origin     string            `json:"origin"`
+	Output     FileEntry         `json:"output"`
+	Inputs     []CompactionInput `json:"inputs"`
+	Object     bool              `json:"object,omitempty"`
+	MinHolders int               `json:"min_holders,omitempty"`
+	Now        time.Time         `json:"now"`
+}
+
+// StagedCompactionKey is where a local job's output waits for its commit, on
+// the compactor and on every node that pulls it: under a reserved root no
+// query, listing or orphan walk reads.
+func StagedCompactionKey(job, outputPath string) string {
+	return StagedCompactionRoot + "/" + job + "/" + path.Base(outputPath)
+}
+
+// StagedCompactionRoot is the reserved storage root of staged outputs.
+const StagedCompactionRoot = "_compaction_staged"
+
+// validCompactionJob reports whether job is safe as a path segment and a
+// delete reason: letters, digits, "_", "-", "." with no leading "." (so
+// never "." or "..").
+func validCompactionJob(job string) bool {
+	if job == "" || len(job) > maxCompactionJobLen || job[0] == '.' {
+		return false
+	}
+	for _, r := range job {
+		ok := r == '_' || r == '-' || r == '.' || (r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // CompactionHeldPayload: Node holds the staged output of Job, at SHA256,
@@ -353,14 +390,25 @@ func (f *ClusterFSM) applyStageCompaction(payload []byte, logIndex uint64) inter
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return fmt.Errorf("failed to unmarshal stage compaction payload: %w", err)
 	}
-	if p.Job == "" || len(p.Job) > maxCompactionJobLen || p.Origin == "" {
-		return errors.New("stage compaction: job and origin are required")
+	if !validCompactionJob(p.Job) || p.Origin == "" {
+		return errors.New("stage compaction: a job id of letters, digits, _ - . (not leading .) and an origin are required")
 	}
 	if err := ValidateManifestPath(p.Output.Path); err != nil {
 		return f.rejectManifestPath("stage compaction", p.Output.Path, logIndex, err)
 	}
+	if err := ValidateManifestPath(StagedCompactionKey(p.Job, p.Output.Path)); err != nil {
+		return f.rejectManifestPath("stage compaction", StagedCompactionKey(p.Job, p.Output.Path), logIndex, err)
+	}
+	if p.MinHolders < 0 || p.MinHolders > 1 || (p.Object && p.MinHolders != 0) {
+		return fmt.Errorf("stage compaction: min holders %d", p.MinHolders)
+	}
 	if p.Output.CreatedAt.IsZero() || p.Output.SHA256 == "" {
 		return errors.New("stage compaction: output created_at and sha256 are required")
+	}
+	if p.Output.Tier != "hot" {
+		// A compaction output is a new hot file; any other tier would read as
+		// already moved to cold storage and never be moved into place.
+		return fmt.Errorf("stage compaction: output tier %q (want hot)", p.Output.Tier)
 	}
 	if len(p.Inputs) == 0 || len(p.Inputs) > MaxCompactionInputs {
 		return fmt.Errorf("stage compaction: %d inputs (want 1..%d)", len(p.Inputs), MaxCompactionInputs)
@@ -388,6 +436,16 @@ func (f *ClusterFSM) applyStageCompaction(payload []byte, logIndex uint64) inter
 	if len(f.staged) >= maxStagedCompactions {
 		return &CompactionConflictError{Job: p.Job, Reason: CompactionFull}
 	}
+	// Two staged jobs over one file could both stage; only one could commit,
+	// and the other would have made every node pull its output for nothing.
+	if _, taken := f.stagedPaths[p.Output.Path]; taken {
+		return &CompactionConflictError{Job: p.Job, Reason: CompactionInputStaged}
+	}
+	for _, in := range p.Inputs {
+		if _, taken := f.stagedPaths[in.Path]; taken {
+			return &CompactionConflictError{Job: p.Job, Reason: CompactionInputStaged}
+		}
+	}
 	seen := map[string]bool{}
 	var inputs []FileEntry
 	for _, in := range p.Inputs {
@@ -411,12 +469,18 @@ func (f *ClusterFSM) applyStageCompaction(payload []byte, logIndex uint64) inter
 	if out.Tier == "" {
 		out.Tier = "hot"
 	}
-	f.staged[p.Job] = &StagedCompaction{
-		Job: p.Job, Origin: p.Origin, Output: out, Inputs: inputs, Object: p.Object,
+	st := &StagedCompaction{
+		Job: p.Job, Origin: p.Origin, Output: out, Inputs: inputs, Object: p.Object, MinHolders: p.MinHolders,
 		PauseGen: f.compactionPause.Generation, At: p.Now, Index: logIndex,
 	}
+	f.staged[p.Job] = st
+	f.indexStagedLocked(st)
 	f.logger.Debug().Str("job", p.Job).Str("output", out.Path).Int("inputs", len(inputs)).Bool("object", p.Object).
 		Msg("Compaction staged")
+	if cb := f.onCompactionStaged; cb != nil {
+		c := copyStaged(st)
+		f.pendingEvents = append(f.pendingEvents, func() { cb(c) })
+	}
 	return nil
 }
 
@@ -484,6 +548,10 @@ func (f *ClusterFSM) applyCommitCompaction(payload []byte, logIndex uint64) inte
 		f.mu.Unlock()
 		return &CompactionConflictError{Job: p.Job, Reason: CompactionPaused}
 	}
+	if !s.Object && len(s.Holders) < s.MinHolders {
+		f.mu.Unlock()
+		return &CompactionConflictError{Job: p.Job, Reason: CompactionHolders}
+	}
 	for _, in := range s.Inputs {
 		if !f.inputUnchangedLocked(CompactionInput{Path: in.Path, SizeBytes: in.SizeBytes, SHA256: in.SHA256}) {
 			f.mu.Unlock()
@@ -495,6 +563,13 @@ func (f *ClusterFSM) applyCommitCompaction(payload []byte, logIndex uint64) inte
 		return &CompactionConflictError{Job: p.Job, Reason: CompactionOutputExists}
 	}
 	var events []func()
+	// Announced first: a node holding the staged copy moves it into place
+	// before the registration makes it pull the output, and before the input
+	// deletes queue their unlinks.
+	if cb := f.onCompactionCommitted; cb != nil && !s.Object {
+		out, job := s.Output, p.Job
+		events = append(events, func() { cb(job, out) })
+	}
 	if emit := f.applyRegisterFileLocked(RegisterFilePayload{File: s.Output}, logIndex, nil); emit != nil {
 		events = append(events, emit)
 	}
@@ -507,7 +582,7 @@ func (f *ClusterFSM) applyCommitCompaction(payload []byte, logIndex uint64) inte
 	if s.Object {
 		s.Finalizing, s.Holders = true, nil
 	} else {
-		delete(f.staged, p.Job)
+		f.unstageLocked(p.Job, false)
 	}
 	f.mu.Unlock()
 	for _, emit := range events {
@@ -533,7 +608,7 @@ func (f *ClusterFSM) applyAbortCompaction(payload []byte) interface{} {
 	if s.Finalizing {
 		return &CompactionConflictError{Job: p.Job, Reason: CompactionFinalizing}
 	}
-	delete(f.staged, p.Job)
+	f.unstageLocked(p.Job, true)
 	f.logger.Info().Str("job", p.Job).Str("by", p.By).Str("reason", p.Reason).Msg("Staged compaction aborted")
 	return nil
 }
@@ -584,7 +659,7 @@ func (f *ClusterFSM) applyCleanupCompaction(payload []byte) interface{} {
 	if !s.Finalized {
 		return &CompactionConflictError{Job: p.Job, Reason: CompactionNotFinalized}
 	}
-	delete(f.staged, p.Job)
+	f.unstageLocked(p.Job, true)
 	return nil
 }
 
@@ -640,7 +715,7 @@ func (f *ClusterFSM) applyRevertCompaction(payload []byte, logIndex uint64) inte
 			r.Coverage, r.CoverageInherited = in.Coverage, in.CoverageInherited
 		}
 	}
-	delete(f.staged, p.Job)
+	f.unstageLocked(p.Job, true)
 	f.mu.Unlock()
 	f.logger.Warn().Str("job", p.Job).Str("by", p.By).Int("inputs", len(s.Inputs)).
 		Msg("Compaction reverted: its output never reached storage, its inputs are registered again")
@@ -657,7 +732,7 @@ func (f *ClusterFSM) applyRevertCompaction(payload []byte, logIndex uint64) inte
 func (f *ClusterFSM) compactionNodeRemovedLocked(id string) {
 	for job, s := range f.staged {
 		if s.Origin == id && !s.Finalizing {
-			delete(f.staged, job)
+			f.unstageLocked(job, true)
 			continue
 		}
 		kept := s.Holders[:0]
@@ -716,15 +791,125 @@ func (f *ClusterFSM) snapshotCompactionCommitLocked() *compactionCommitState {
 }
 
 func (f *ClusterFSM) restoreCompactionCommitLocked(st *compactionCommitState) {
-	f.compactionCommit, f.staged = false, map[string]*StagedCompaction{}
-	if st == nil {
-		return
-	}
-	f.compactionCommit = st.Enabled
-	for _, s := range st.Staged {
-		if s != nil && s.Job != "" {
-			c := copyStaged(s)
-			f.staged[s.Job] = &c
+	prev := f.staged
+	f.compactionCommit, f.staged, f.stagedPaths = false, map[string]*StagedCompaction{}, map[string]string{}
+	if st != nil {
+		f.compactionCommit = st.Enabled
+		for _, s := range st.Staged {
+			if s != nil && s.Job != "" {
+				c := copyStaged(s)
+				f.staged[s.Job] = &c
+				f.indexStagedLocked(&c)
+			}
 		}
 	}
+	// The difference, as the commands that made it would have announced it.
+	for job, s := range f.staged {
+		if _, had := prev[job]; !had && f.onCompactionStaged != nil {
+			c, cb := copyStaged(s), f.onCompactionStaged
+			f.pendingEvents = append(f.pendingEvents, func() { cb(c) })
+		}
+	}
+	for job, s := range prev {
+		if _, kept := f.staged[job]; !kept && f.onCompactionGone != nil {
+			c, cb := copyStaged(s), f.onCompactionGone
+			f.pendingEvents = append(f.pendingEvents, func() { cb(c) })
+		}
+	}
+}
+
+// indexStagedLocked records the paths a staged job owns: its inputs and its
+// output.
+func (f *ClusterFSM) indexStagedLocked(s *StagedCompaction) {
+	f.stagedPaths[s.Output.Path] = s.Job
+	for _, in := range s.Inputs {
+		f.stagedPaths[in.Path] = s.Job
+	}
+}
+
+// unstageLocked removes a staged job. gone: it ended without a local commit
+// (aborted, removed, reverted, cleaned up), announced to onCompactionGone
+// after the apply; a commit announces itself instead.
+func (f *ClusterFSM) unstageLocked(job string, gone bool) {
+	s, ok := f.staged[job]
+	if !ok {
+		return
+	}
+	delete(f.staged, job)
+	for p, j := range f.stagedPaths {
+		if j == job {
+			delete(f.stagedPaths, p)
+		}
+	}
+	if cb := f.onCompactionGone; gone && cb != nil {
+		c := copyStaged(s)
+		f.pendingEvents = append(f.pendingEvents, func() { cb(c) })
+	}
+}
+
+// deliverCompactionEvents runs the staged-commit callbacks an apply queued,
+// with f.mu released.
+func (f *ClusterFSM) deliverCompactionEvents() {
+	f.mu.Lock()
+	ev := f.pendingEvents
+	f.pendingEvents = nil
+	f.mu.Unlock()
+	for _, e := range ev {
+		e()
+	}
+}
+
+// SetCompactionCallbacks registers the staged-commit callbacks (#1207 d2a2a):
+// staged when a job is staged, gone when one ends without a local commit
+// (aborted, its compactor removed), committed when a local job commits,
+// before the output's registration and the inputs' deletes are announced.
+// A restore announces the difference: staged for jobs it adds, gone for jobs
+// it drops (a dropped job may have committed: the handler checks whether its
+// output is registered). Callbacks must not block.
+func (f *ClusterFSM) SetCompactionCallbacks(staged func(StagedCompaction), gone func(StagedCompaction), committed func(job string, output FileEntry)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onCompactionStaged, f.onCompactionGone, f.onCompactionCommitted = staged, gone, committed
+}
+
+// StagedCompactionByKey returns the uncommitted local job whose staged output
+// lives at key, for the fetch server.
+func (f *ClusterFSM) StagedCompactionByKey(key string) (StagedCompaction, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	parts := strings.SplitN(key, "/", 3)
+	if len(parts) != 3 || parts[0] != StagedCompactionRoot {
+		return StagedCompaction{}, false
+	}
+	s, ok := f.staged[parts[1]]
+	if !ok || s.Object || s.Finalizing || StagedCompactionKey(s.Job, s.Output.Path) != key {
+		return StagedCompaction{}, false
+	}
+	return copyStaged(s), true
+}
+
+// StagedCompactionOwns reports whether path is an input or the output of a
+// staged job.
+func (f *ClusterFSM) StagedCompactionOwns(path string) bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	_, ok := f.stagedPaths[path]
+	return ok
+}
+
+// FileByCompactionJob returns the registered file a compaction job's commit
+// registered (a scan: for leftover staged directories only).
+func (f *ClusterFSM) FileByCompactionJob(job string) (*FileEntry, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if job == "" {
+		return nil, false
+	}
+	for _, e := range f.files {
+		if e.CompactionJob == job {
+			c := *e
+			return &c, true
+		}
+	}
+	return nil, false
 }

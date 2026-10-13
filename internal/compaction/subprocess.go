@@ -84,6 +84,9 @@ type SubprocessJobConfig struct {
 	// sentinel checked via IsZero, and this is internal parent↔subprocess IPC,
 	// not a user-facing field — matches the plain tag on completion.go's twin.
 	PartitionTime time.Time `json:"partition_time"`
+	// Staged commit (#1207 d2a2a): see JobConfig.Staged.
+	Staged bool                   `json:"staged,omitempty"`
+	Inputs map[string]StagedInput `json:"inputs,omitempty"`
 }
 
 // SubprocessJobResult is returned by the subprocess via stdout as JSON.
@@ -256,6 +259,8 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 		CompletionDir:           config.CompletionDir,
 		PartitionTime:           config.PartitionTime,
 		ParentFinalizesManifest: config.ParentFinalizesManifest,
+		Staged:                  config.Staged,
+		Inputs:                  config.Inputs,
 	})
 
 	// Use signal-aware context so the subprocess can cancel DuckDB queries

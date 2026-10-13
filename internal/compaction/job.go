@@ -150,6 +150,10 @@ type Job struct {
 	// marking commits (#619). See SubprocessJobConfig.ParentFinalizesManifest.
 	ParentFinalizesManifest bool
 
+	// staged / inputs: see JobConfig.Staged (#1207 d2a2a).
+	staged bool
+	inputs map[string]StagedInput
+
 	// OutputStorageKey is the storage-relative key of the compacted output,
 	// set once the output name is fixed (before upload). Empty for jobs that
 	// produce no output (all sources vanished, or no time column).
@@ -201,6 +205,12 @@ type JobConfig struct {
 
 	// ParentFinalizesManifest — see Job.ParentFinalizesManifest (#619).
 	ParentFinalizesManifest bool
+
+	// Staged (#1207 d2a2a): write the output to its staged key, keep the
+	// inputs, and hand the job to the watcher in state "staged". Inputs
+	// describes every file of Files as the cluster manifest lists it.
+	Staged bool
+	Inputs map[string]StagedInput
 
 	// JobID, if set, overrides the auto-generated JobID. Phase 4 uses this
 	// so the parent (which spawns the subprocess) and the subprocess agree
@@ -254,6 +264,8 @@ func NewJob(cfg *JobConfig) *Job {
 		Status:                  JobStatusPending,
 		CompletionDir:           cfg.CompletionDir,
 		ParentFinalizesManifest: cfg.ParentFinalizesManifest,
+		staged:                  cfg.Staged,
+		inputs:                  cfg.Inputs,
 		PartitionTime:           cfg.PartitionTime,
 		logger:                  cfg.Logger.With().Str("job_id", jobID).Logger(),
 		db:                      cfg.DB,
@@ -398,6 +410,10 @@ func (j *Job) Run(ctx context.Context) error {
 	// to the parent (compactFiles returns the local temp path, which no
 	// parent-side consumer can match against storage listings).
 	j.OutputStorageKey = compactedKey
+
+	if j.staged {
+		return j.runStaged(ctx, compactedFile, compactedKey, outputSHA)
+	}
 
 	// Write manifest BEFORE upload to enable crash recovery
 	// If we crash after upload but before deletion, the manifest allows recovery

@@ -717,6 +717,14 @@ type ClusterFSM struct {
 	// StageCompaction and their end.
 	compactionCommit bool
 	staged           map[string]*StagedCompaction
+	// stagedPaths: input and output paths of staged jobs -> job (derived).
+	stagedPaths map[string]string
+	// Staged-commit callbacks (#1207 d2a2a) and the events an apply queued
+	// for them, delivered once f.mu is released.
+	onCompactionStaged    func(StagedCompaction)
+	onCompactionGone      func(StagedCompaction)
+	onCompactionCommitted func(job string, output FileEntry)
+	pendingEvents         []func()
 
 	// Callbacks for state changes
 	onNodeAdded          func(*NodeInfo)
@@ -797,6 +805,7 @@ func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 		tokenMembershipsByTeam:  make(map[int64]map[int64]struct{}),
 		takeover:                newTakeoverState(),
 		staged:                  map[string]*StagedCompaction{},
+		stagedPaths:             map[string]string{},
 
 		logger: logger.With().Str("component", "cluster-fsm").Logger(),
 	}
@@ -1125,6 +1134,7 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 	case CommandAddNode:
 		return f.applyAddNode(cmd.Payload)
 	case CommandRemoveNode:
+		defer f.deliverCompactionEvents()
 		return f.applyRemoveNode(cmd.Payload)
 	case CommandUpdateNode:
 		return f.applyUpdateNode(cmd.Payload)
@@ -1173,18 +1183,22 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 	case CommandEnableCompactionCommit:
 		return f.applyEnableCompactionCommit(cmd.Payload)
 	case CommandStageCompaction:
+		defer f.deliverCompactionEvents()
 		return f.applyStageCompaction(cmd.Payload, log.Index)
 	case CommandCompactionHeld:
 		return f.applyCompactionHeld(cmd.Payload)
 	case CommandCommitCompaction:
 		return f.applyCommitCompaction(cmd.Payload, log.Index)
 	case CommandAbortCompaction:
+		defer f.deliverCompactionEvents()
 		return f.applyAbortCompaction(cmd.Payload)
 	case CommandFinalizeCompaction:
 		return f.applyFinalizeCompaction(cmd.Payload)
 	case CommandRevertCompaction:
+		defer f.deliverCompactionEvents()
 		return f.applyRevertCompaction(cmd.Payload, log.Index)
 	case CommandCleanupCompaction:
+		defer f.deliverCompactionEvents()
 		return f.applyCleanupCompaction(cmd.Payload)
 	case CommandDeleteFile:
 		return f.applyDeleteFile(cmd.Payload)
@@ -3179,6 +3193,10 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 			onNodeRemoved(id)
 		}
 	}
+	// Before the removed files are announced: a dropped staged job whose
+	// output the snapshot registers is adopted from its staged copy while its
+	// inputs' unlinks wait.
+	f.deliverCompactionEvents()
 	if onFileDeleted != nil {
 		for _, path := range removedFiles {
 			onFileDeleted(path, UnlinkReasonSnapshotRemoved)
