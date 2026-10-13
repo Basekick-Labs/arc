@@ -253,9 +253,9 @@ func (t *DailyTier) groupDayPartitions(database, measurement string, objects []s
 }
 
 // extractNewestFileTime extracts the newest file creation time from a list of file paths.
-// Supports two formats:
-// - Hourly files: {measurement}_{YYYYMMDD_HHMMSS}_{nanos}.parquet
-// - Daily files: {measurement}_{YYYYMMDD}_daily.parquet
+// Supports raw files, tier outputs with optional nanos and batch numbers,
+// and legacy date-only daily outputs. Timestamp fields are read from the tail
+// because measurement names may contain underscores. Precision stays at seconds.
 // Returns zero time if no valid timestamps found.
 func extractNewestFileTime(files []string) time.Time {
 	var newest time.Time
@@ -281,7 +281,22 @@ func extractNewestFileTime(files []string) time.Time {
 		if tierSuffix != "" {
 			filename = strings.TrimSuffix(filename, tierSuffix)
 			fileParts := strings.Split(filename, "_")
-			if len(fileParts) < 3 {
+			n := len(fileParts)
+			// Current outputs end in YYYYMMDD_HHMMSS_nanos_bN. Recognize
+			// that shape before the legacy parsers, without treating a
+			// legacy opaque nanos field beginning with "b" as a batch.
+			if n >= 5 && len(fileParts[n-4]) == 8 && len(fileParts[n-3]) == 6 && strings.HasPrefix(fileParts[n-1], "b") {
+				if strings.Join(fileParts[:n-4], "_") == "" ||
+					!decimalFileTimeSegment(fileParts[n-2]) || !decimalFileTimeSegment(fileParts[n-1][1:]) {
+					continue
+				}
+				fileTime, err := time.Parse("20060102_150405", fileParts[n-4]+"_"+fileParts[n-3])
+				if err == nil && fileTime.After(newest) {
+					newest = fileTime
+				}
+				continue // Invalid batch timestamps must not fall back to legacy daily dates.
+			}
+			if n < 2 {
 				continue
 			}
 			// Try parsing last two parts as YYYYMMDD_HHMMSS (old format without nanos)
@@ -291,6 +306,9 @@ func extractNewestFileTime(files []string) time.Time {
 				// New format with nanos: ..._YYYYMMDD_HHMMSS_nanos — skip nanos, take 3rd and 2nd from end
 				dateTimePart = fileParts[len(fileParts)-3] + "_" + fileParts[len(fileParts)-2]
 				fileTime, err = time.Parse("20060102_150405", dateTimePart)
+			}
+			if err != nil && tierSuffix == "_daily" && len(fileParts[n-1]) == 8 {
+				fileTime, err = time.Parse("20060102", fileParts[n-1])
 			}
 			if err == nil && fileTime.After(newest) {
 				newest = fileTime
@@ -321,6 +339,19 @@ func extractNewestFileTime(files []string) time.Time {
 	}
 
 	return newest
+}
+
+// Check digits without converting nanos or a batch number to a bounded integer.
+func decimalFileTimeSegment(segment string) bool {
+	if segment == "" {
+		return false
+	}
+	for i := 0; i < len(segment); i++ {
+		if segment[i] < '0' || segment[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // isHourLevelFile reports whether a storage path names an HOUR-level file —

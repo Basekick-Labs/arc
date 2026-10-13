@@ -1066,6 +1066,16 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Compaction recognizes timestamps in batched output files
+
+The recent-file age checks for hourly and daily compaction now recognize
+`_b<N>_compacted` and `_b<N>_daily` outputs, so newly compacted files do not
+bypass the protection for recent writes. Legacy date-only daily filenames
+are also recognized. Existing timestamp precision and the historical daily
+age-check bypass remain unchanged.
+
+Contributed by [@jallegri](https://github.com/jallegri) for [#1235](https://github.com/Basekick-Labs/arc/issues/1235).
+
 ### WAL-on ingest is no longer capped by one writer's fsync latency ([#1246](https://github.com/Basekick-Labs/arc/issues/1246))
 
 With the WAL enabled, ingest topped out at a rate set by the storage's fsync
