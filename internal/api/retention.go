@@ -18,6 +18,7 @@ import (
 	"github.com/basekick-labs/arc/internal/license"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/gofiber/fiber/v2"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog"
@@ -44,12 +45,15 @@ type RetentionHandler struct {
 	// ownsDB records whether this handler opened db itself. When retention
 	// shares the auth database (the default), the handle is borrowed and Close
 	// must leave it to its owner.
-	ownsDB        bool
-	duckdb        *database.DuckDB     // Shared DuckDB for parquet queries
-	coordinator   RetentionCoordinator // nil in standalone mode
-	licenseClient *license.Client      // nil when auth/licensing is disabled
-	authManager   *auth.AuthManager
-	logger        zerolog.Logger
+	ownsDB      bool
+	duckdb      *database.DuckDB     // Shared DuckDB for parquet queries
+	coordinator RetentionCoordinator // nil in standalone mode
+	coldTier    coldRetentionTier    // nil without tiering: retention is hot-only
+	// coldDeleteHook replaces the cold object delete in tests; nil in production.
+	coldDeleteHook func(ctx context.Context, backend storage.Backend, path string) error
+	licenseClient  *license.Client // nil when auth/licensing is disabled
+	authManager    *auth.AuthManager
+	logger         zerolog.Logger
 }
 
 // RetentionPolicy represents a retention policy
@@ -183,8 +187,15 @@ type ExecuteRetentionResponse struct {
 	// SkippedFiles counts files whose stored key could not be resolved to a
 	// readable path, so they were neither examined nor deleted and never will
 	// be. Omitted when zero, which is every healthy deployment.
-	SkippedFiles         int      `json:"skipped_files,omitempty"`
-	SkippedReason        string   `json:"skipped_reason,omitempty"`
+	SkippedFiles  int    `json:"skipped_files,omitempty"`
+	SkippedReason string `json:"skipped_reason,omitempty"`
+	// Cold tier (#168). DeletedCount and FilesDeleted include these. In a dry
+	// run they are what a real run would delete. ColdFilesSkipped counts cold
+	// files retention could not examine or delete; ColdSkippedReason says why.
+	ColdFilesDeleted     int      `json:"cold_files_deleted,omitempty"`
+	ColdRowsDeleted      int64    `json:"cold_rows_deleted,omitempty"`
+	ColdFilesSkipped     int      `json:"cold_files_skipped,omitempty"`
+	ColdSkippedReason    string   `json:"cold_skipped_reason,omitempty"`
 	ExecutionTimeMs      float64  `json:"execution_time_ms"`
 	DryRun               bool     `json:"dry_run"`
 	CutoffDate           string   `json:"cutoff_date"`
@@ -321,6 +332,26 @@ func (h *RetentionHandler) warnUnusablePolicies() {
 // Called after construction when cluster mode is enabled.
 func (h *RetentionHandler) SetCoordinator(c RetentionCoordinator) {
 	h.coordinator = c
+}
+
+// coldRetentionTier is what retention needs from tiering to apply a policy to
+// the cold tier (#168). *tiering.Manager satisfies it.
+type coldRetentionTier interface {
+	// ColdBackend is nil when this node has no usable cold tier.
+	ColdBackend() storage.Backend
+	GetColdFilesForRetention(ctx context.Context, database string, cutoff time.Time) ([]tiering.FileMetadata, error)
+	RetireColdRows(ctx context.Context, paths []string) (int, error)
+	RevertColdRowToHot(ctx context.Context, path string) error
+	NotifyColdFilesRemoved(n int)
+}
+
+// SetTieringManager makes retention apply its policies to the cold tier too.
+func (h *RetentionHandler) SetTieringManager(m *tiering.Manager) {
+	if m == nil {
+		h.coldTier = nil
+		return
+	}
+	h.coldTier = m
 }
 
 // initTables creates the retention policy tables
@@ -632,7 +663,11 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 	if err != nil {
 		return nil, fmt.Errorf("failed to discover measurements: %w", err)
 	}
-	measurements := discovery.measurements
+	// Cold-only measurements are invisible to the hot listing, so the cold
+	// tier adds its own (#168).
+	cold := h.planColdRetention(ctx, policy, cutoffDate)
+	defer h.notifyColdRemoved(cold)
+	measurements := cold.addMeasurements(discovery.measurements)
 
 	h.logger.Info().Strs("measurements", measurements).Msg("Processing measurements")
 
@@ -661,6 +696,18 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 			}
 			return nil, fmt.Errorf("retention aborted for policy %d: %w", policyID, err)
 		}
+
+		// Only a cancelled context stops the cold pass; everything else it
+		// cannot do is counted in cold, so hot retention always runs.
+		coldRows, coldFiles, coldErr := h.deleteOldColdFiles(ctx, cold, measurement, cutoffDate, false)
+		totalDeleted += coldRows
+		totalFilesDeleted += coldFiles
+		if coldErr != nil {
+			if executionID > 0 {
+				h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), coldErr.Error())
+			}
+			return nil, fmt.Errorf("retention aborted for policy %d: %w", policyID, coldErr)
+		}
 	}
 	totalSkipped += discovery.unusable.orphans
 
@@ -674,6 +721,8 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 	// not do what the policy asks, so it must not be recorded as a clean
 	// "completed": the whole failure mode #746 fixed was retention reporting
 	// success while deleting nothing.
+	coldReason := cold.skippedReason()
+	cold.logSkipped(h.logger, policy.Database)
 	if executionID > 0 {
 		status, detail := "completed", ""
 		if totalSkipped > 0 {
@@ -682,6 +731,10 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 			h.logger.Error().Int("skipped_files", totalSkipped).Str("database", policy.Database).
 				Strs("sample", formatUnusableSamples(discovery.unusable)).
 				Msg("Retention could not resolve some files; their data will never age out")
+		}
+		if coldReason != "" {
+			status = "completed_with_errors"
+			detail = joinRetentionDetail(detail, coldReason)
 		}
 		h.recordExecutionComplete(executionID, status, totalDeleted, executionTime, detail)
 	}
@@ -699,6 +752,10 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 		FilesDeleted:         totalFilesDeleted,
 		SkippedFiles:         totalSkipped,
 		SkippedReason:        skippedReason(totalSkipped),
+		ColdFilesDeleted:     cold.filesDeleted,
+		ColdRowsDeleted:      cold.rowsDeleted,
+		ColdFilesSkipped:     cold.skippedTotal(),
+		ColdSkippedReason:    coldReason,
 		ExecutionTimeMs:      executionTime,
 		DryRun:               false,
 		CutoffDate:           cutoffDate.Format(time.RFC3339),
@@ -805,7 +862,11 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 			"error": "Failed to discover measurements: " + err.Error(),
 		})
 	}
-	measurements := discovery.measurements
+	// Cold-only measurements are invisible to the hot listing, so the cold
+	// tier adds its own (#168).
+	cold := h.planColdRetention(c.Context(), policy, cutoffDate)
+	defer h.notifyColdRemoved(cold)
+	measurements := cold.addMeasurements(discovery.measurements)
 
 	h.logger.Info().Strs("measurements", measurements).Msg("Processing measurements")
 
@@ -835,6 +896,19 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 				"error": fmt.Sprintf("retention aborted at measurement %q: %s", measurement, err.Error()),
 			})
 		}
+		// Only a cancelled context stops the cold pass; everything else it
+		// cannot do is counted in cold, so hot retention always runs.
+		coldRows, coldFiles, coldErr := h.deleteOldColdFiles(c.Context(), cold, measurement, cutoffDate, req.DryRun)
+		totalDeleted += coldRows
+		totalFilesDeleted += coldFiles
+		if coldErr != nil {
+			if !req.DryRun && executionID > 0 {
+				h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), coldErr.Error())
+			}
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": fmt.Sprintf("retention aborted at measurement %q: %s", measurement, coldErr.Error()),
+			})
+		}
 	}
 	totalSkipped += discovery.unusable.orphans
 
@@ -854,12 +928,14 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 			Strs("sample", formatUnusableSamples(discovery.unusable)).
 			Msg("Retention could not resolve some files; their data will never age out")
 	}
+	coldReason := cold.skippedReason()
+	cold.logSkipped(h.logger, policy.Database)
 	if !req.DryRun && executionID > 0 {
 		status := "completed"
-		if totalSkipped > 0 {
+		if totalSkipped > 0 || coldReason != "" {
 			status = "completed_with_errors"
 		}
-		h.recordExecutionComplete(executionID, status, totalDeleted, executionTime, skipDetail)
+		h.recordExecutionComplete(executionID, status, totalDeleted, executionTime, joinRetentionDetail(skipDetail, coldReason))
 	}
 
 	h.logger.Info().
@@ -876,6 +952,10 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 		FilesDeleted:         totalFilesDeleted,
 		SkippedFiles:         totalSkipped,
 		SkippedReason:        skipDetail,
+		ColdFilesDeleted:     cold.filesDeleted,
+		ColdRowsDeleted:      cold.rowsDeleted,
+		ColdFilesSkipped:     cold.skippedTotal(),
+		ColdSkippedReason:    coldReason,
 		ExecutionTimeMs:      executionTime,
 		DryRun:               req.DryRun,
 		CutoffDate:           cutoffDate.Format(time.RFC3339),
