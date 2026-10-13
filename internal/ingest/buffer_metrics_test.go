@@ -267,10 +267,19 @@ func TestBufferMetricsWarnAtMemoryThreshold(t *testing.T) {
 	if got := snapshotInt(t, "buffer_memory_pressure"); got != 0 {
 		t.Fatalf("buffer_memory_pressure = %d below threshold, want 0", got)
 	}
+	// Hovering at the threshold, as flushes and writes alternate, warns once.
+	buf.bufferBytesBuffered.Store(50)
+	buf.publishBufferMemoryMetrics()
+	if got := strings.Count(logs.String(), "Ingest buffers are using a large share"); got != 1 {
+		t.Fatalf("memory pressure warning logged %d times while hovering at the threshold, want 1", got)
+	}
+	// Falling below the 40% re-arm point and crossing again warns again.
+	buf.bufferBytesBuffered.Store(39)
+	buf.publishBufferMemoryMetrics()
 	buf.bufferBytesBuffered.Store(50)
 	buf.publishBufferMemoryMetrics()
 	if got := strings.Count(logs.String(), "Ingest buffers are using a large share"); got != 2 {
-		t.Fatalf("memory pressure warning logged %d times after crossing threshold twice, want 2", got)
+		t.Fatalf("memory pressure warning logged %d times after re-arming and crossing again, want 2", got)
 	}
 }
 
@@ -408,4 +417,100 @@ func TestBufferMetricsCloseDropReleasesQueued(t *testing.T) {
 		t.Fatalf("drain past the deadline left %d records unwritten, want 20", unwritten)
 	}
 	awaitBufferRecordMetrics(t, 0, 10)
+}
+
+func metricsTypedBatch() *TypedColumnBatch {
+	return &TypedColumnBatch{
+		Data: map[string]interface{}{
+			"time":  []int64{1, 2, 3},
+			"value": []float64{1, 2, 3},
+		},
+		TagColumns: []string{},
+		Signature:  "time:i64,value:f64",
+	}
+}
+
+// The MessagePack fast path and WAL replay write through writeTypedColumnarRaw,
+// which is most production ingest. A batch with a raw payload counts the
+// payload's length; one without counts its column estimate. A synchronous
+// flush releases both bytes and age.
+func TestBufferBytesCountTypedAndRawWrites(t *testing.T) {
+	buf := NewArrowBuffer(bufferMetricsConfig(), &mockStorageBackend{}, zerolog.New(io.Discard))
+	t.Cleanup(func() { _ = buf.Close() })
+	ctx := context.Background()
+
+	if err := buf.writeTypedColumnarRaw(ctx, "default", "raw", metricsTypedBatch(), 3, make([]byte, 1000), true); err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.bufferBytesBuffered.Load(); got != 1000 {
+		t.Fatalf("bytes after a raw-payload write = %d, want the payload length 1000", got)
+	}
+	if err := buf.writeTypedColumnarInternal(ctx, "default", "typed", metricsTypedBatch(), 3, true); err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.bufferBytesBuffered.Load(); got != 1000+48 {
+		t.Fatalf("bytes after a typed write = %d, want 1000 + 48 (two 3-value 8-byte columns)", got)
+	}
+	if buf.oldestUnflushedAge() <= 0 {
+		t.Fatal("oldest unflushed age is zero with two buffers waiting")
+	}
+
+	if err := buf.FlushAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.bufferBytesBuffered.Load(); got != 0 {
+		t.Fatalf("bytes after FlushAll = %d, want 0", got)
+	}
+	if age := buf.oldestUnflushedAge(); age != 0 {
+		t.Fatalf("oldest unflushed age after FlushAll = %v, want 0", age)
+	}
+}
+
+// Records still in a shard buffer age from the buffer's first write.
+func TestBufferOldestAgeCoversShardBuffers(t *testing.T) {
+	buf := NewArrowBuffer(bufferMetricsConfig(), &mockStorageBackend{}, zerolog.New(io.Discard))
+	t.Cleanup(func() { _ = buf.Close() })
+	writeMetricsRecords(t, buf, 1) // below MaxBufferSize: stays in the shard
+	time.Sleep(150 * time.Millisecond)
+	if age := buf.oldestUnflushedAge(); age < 150*time.Millisecond {
+		t.Fatalf("oldest unflushed age = %v, want at least 150ms for a buffer written 150ms ago", age)
+	}
+}
+
+// A drain past Close's deadline drops its tasks: their bytes and ages leave
+// the gauges, and only the worker's in-flight task remains.
+func TestBufferBytesReleasedByCloseDrop(t *testing.T) {
+	buf, backend, _ := newGatedMetricsBuffer(t)
+	writeMetricsRecords(t, buf, 10) // task 1: in flight, blocked
+	awaitStarted(t, backend)
+	writeMetricsRecords(t, buf, 20) // tasks 2 and 3: queued
+	awaitBufferRecordMetrics(t, 20, 10)
+	before := buf.bufferBytesBuffered.Load()
+
+	buf.drainAndFlushQueue(time.Now().Add(-time.Second))
+	if got := buf.bufferBytesBuffered.Load(); got*3 != before {
+		t.Fatalf("bytes after dropping 2 of 3 equal tasks = %d, want a third of %d", got, before)
+	}
+	buf.flushTimesMu.Lock()
+	tracked := len(buf.flushTimes)
+	buf.flushTimesMu.Unlock()
+	if tracked != 1 {
+		t.Fatalf("%d flushes still tracked for age, want 1 (the in-flight task)", tracked)
+	}
+}
+
+func TestBufferMemoryGaugesInPrometheus(t *testing.T) {
+	m := metrics.Get()
+	m.SetBufferBytesBuffered(1234)
+	m.SetBufferOldestAge(2 * time.Second)
+	t.Cleanup(func() {
+		m.SetBufferBytesBuffered(0)
+		m.SetBufferOldestAge(0)
+	})
+	out := m.PrometheusFormat()
+	for _, want := range []string{"arc_buffer_bytes_buffered 1234", "arc_buffer_oldest_unflushed_seconds 2"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("Prometheus output missing %q", want)
+		}
+	}
 }

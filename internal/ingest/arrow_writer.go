@@ -38,6 +38,10 @@ const (
 	flushTypeAsync             = "async"
 	flushTypeSync              = "sync"
 	bufferMemoryWarningPercent = 50
+	// bufferMemoryRearmPercent is where the warning re-arms after firing.
+	// Below the warning threshold, so usage hovering at 50% (each flush takes
+	// it under, the next writes back over) logs once rather than per flush.
+	bufferMemoryRearmPercent = 40
 )
 
 // sharedArrowAllocator is a package-level shared allocator for Arrow operations.
@@ -1441,7 +1445,7 @@ func (b *ArrowBuffer) checkBufferMemoryPressure(bytes int64) bool {
 				Int("max_buffer_age_ms", b.config.MaxBufferAgeMS).
 				Msg("Ingest buffers are using a large share of available memory; lower max_buffer_size or max_buffer_age_ms to flush sooner, at the cost of more smaller Parquet files")
 		}
-	} else {
+	} else if b.memoryLimitBytes == 0 || uint64(bytes) < b.memoryLimitBytes*bufferMemoryRearmPercent/100 {
 		b.bufferMemoryWarning.Store(false)
 	}
 	return pressure
