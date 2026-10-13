@@ -630,6 +630,8 @@ func (s *Server) endpointMetricsHandler(c *fiber.Ctx) error {
 		},
 		"buffer": fiber.Map{
 			"records_buffered":     snapshot["buffer_records_buffered"],
+			"records_queued":       snapshot["buffer_records_queued"],
+			"records_inflight":     snapshot["buffer_records_inflight"],
 			"records_written":      snapshot["buffer_records_written"],
 			"flushes_total":        snapshot["buffer_flushes_total"],
 			"errors_total":         snapshot["buffer_errors_total"],

@@ -992,6 +992,9 @@ type ArrowBuffer struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	// Serializes flush-record counter transitions with their exported gauges.
+	flushRecordMetricsMu sync.Mutex
+
 	// flushParent is the parent of every flush I/O context. It is derived
 	// with context.WithoutCancel(b.ctx), so b.cancel() — which exists to stop
 	// the metrics sampler, the periodic flush and the workers' receive loops —
@@ -1111,6 +1114,8 @@ type ArrowBuffer struct {
 	// alert on a non-zero rate.
 	totalSchemaChurnExceeded atomic.Int64
 	queueDepth               atomic.Int64 // Current flush queue depth
+	queuedRecords            atomic.Int64
+	inflightRecords          atomic.Int64
 
 	// walDropLogSampler debounces the WAL-dropped Warn so a sustained
 	// burst of backpressure produces ~one log line per second instead
@@ -1343,8 +1348,8 @@ func (b *ArrowBuffer) asyncFlushState(fence uint64) (bool, <-chan struct{}) {
 // records_buffered and queue_depth permanently zero (#802).
 //
 // Called after a flush completes and whenever the flush queue depth changes.
-// All reads are atomic loads and the sets are atomic stores, so this adds no
-// locking to the flush path.
+// The flush-record counters use a separate lock to keep each counter transition
+// and its exported gauges consistent across concurrent workers.
 func (b *ArrowBuffer) publishBufferMetrics() {
 	m := metrics.Get()
 	m.SetBufferFlushes(b.totalFlushes.Load())
@@ -1352,6 +1357,45 @@ func (b *ArrowBuffer) publishBufferMetrics() {
 	m.SetBufferQueueDepth(b.queueDepth.Load())
 	m.SetBufferErrors(b.totalErrors.Load())
 	m.SetBufferRecordsBuffered(b.currentBufferedRecords())
+	b.publishFlushRecordMetrics()
+}
+
+func (b *ArrowBuffer) publishFlushRecordMetrics() {
+	b.flushRecordMetricsMu.Lock()
+	defer b.flushRecordMetricsMu.Unlock()
+	b.publishFlushRecordMetricsLocked()
+}
+
+func (b *ArrowBuffer) publishFlushRecordMetricsLocked() {
+	m := metrics.Get()
+	m.SetBufferRecordsQueued(b.queuedRecords.Load())
+	m.SetBufferRecordsInflight(b.inflightRecords.Load())
+}
+
+func (b *ArrowBuffer) adjustFlushRecordMetrics(queuedDelta, inflightDelta int64) {
+	b.flushRecordMetricsMu.Lock()
+	defer b.flushRecordMetricsMu.Unlock()
+	b.queuedRecords.Add(queuedDelta)
+	b.inflightRecords.Add(inflightDelta)
+	b.publishFlushRecordMetricsLocked()
+}
+
+func (b *ArrowBuffer) markFlushTaskInFlight(task flushTask) {
+	count := int64(task.recordCount)
+	b.adjustFlushRecordMetrics(-count, count)
+}
+
+func (b *ArrowBuffer) finishQueuedFlushTask(task flushTask) {
+	b.adjustFlushRecordMetrics(-int64(task.recordCount), 0)
+}
+
+func (b *ArrowBuffer) finishFlushTask(task flushTask) {
+	b.adjustFlushRecordMetrics(0, -int64(task.recordCount))
+}
+
+func (b *ArrowBuffer) flushTrackedTask(ctx context.Context, task flushTask) error {
+	defer b.finishFlushTask(task)
+	return b.flushRecordsAsync(ctx, task.bufferKey, task.database, task.measurement, task.records, task.recordCount, task.walHashes, task.group)
 }
 
 // countDeferredBuffers counts buffers whose records no worker could take. Also
@@ -2206,6 +2250,8 @@ func (b *ArrowBuffer) enqueueOrDeferLocked(
 		walHashes: collectWALHashes(shard.buffers[bufferKey]),
 	}
 	task.group = b.newFlushGroup(bufferKey, task.records, task.walHashes)
+	queuedRecords := int64(task.recordCount)
+	b.adjustFlushRecordMetrics(queuedRecords, 0)
 
 	task.taskID = b.beginAsyncFlushTask()
 	select {
@@ -2220,11 +2266,13 @@ func (b *ArrowBuffer) enqueueOrDeferLocked(
 		return true, false
 	case <-b.ctx.Done():
 		b.completeAsyncFlushTask(task.taskID)
+		b.adjustFlushRecordMetrics(-queuedRecords, 0)
 		// Close cancelled b.ctx between the checks above and this select. The
 		// records stay in the buffer for Close's shard loop.
 		return false, false
 	default:
 		b.completeAsyncFlushTask(task.taskID)
+		b.adjustFlushRecordMetrics(-queuedRecords, 0)
 		// Lost the race against another writer for the last slot.
 		b.markDeferredLocked(shard, bufferKey)
 		return false, true
@@ -3663,6 +3711,7 @@ func (b *ArrowBuffer) flushWorker(workerID int) {
 				return
 			}
 			metrics.Get().SetBufferQueueDepth(b.queueDepth.Add(-1))
+			b.markFlushTaskInFlight(task)
 			// Signal here, not only after the flush: the queue slot frees at
 			// RECEIVE, so waiting for completion delays the drain by a whole
 			// flush time and lets the write path win the slot instead.
@@ -3684,7 +3733,7 @@ func (b *ArrowBuffer) flushWorker(workerID int) {
 				defer b.completeAsyncFlushTask(task.taskID)
 				// Error is already logged and recorded by flushRecordsAsync via
 				// markFlushFailure; the worker has nowhere to return it to.
-				_ = b.flushRecordsAsync(flushCtx, task.bufferKey, task.database, task.measurement, task.records, task.recordCount, task.walHashes, task.group)
+				_ = b.flushTrackedTask(flushCtx, task)
 				flushCancel()
 			}()
 		}
@@ -4087,6 +4136,12 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 	// miss this flush after observing the extracted buffer as empty.
 	taskID := b.beginAsyncFlushTask()
 	completeTask := func() { b.completeAsyncFlushTask(taskID) }
+
+	// The records have left the buffer and never enter the flush queue, so
+	// they count as in flight until the write ends; otherwise no gauge sees a
+	// synchronous flush (FlushAll, the flush before a DELETE, Close) at all.
+	b.adjustFlushRecordMetrics(0, int64(recordCount))
+	defer b.adjustFlushRecordMetrics(0, -int64(recordCount))
 
 	// Release lock before expensive operations
 	shard.mu.Unlock()
@@ -5503,6 +5558,7 @@ drain:
 			// slot, which is #1006 all over again inside Close.
 			flushCtx, flushCancel, ok := b.closeFlushContext(deadline)
 			if !ok {
+				b.finishQueuedFlushTask(task)
 				mu.Lock()
 				unwrit += task.recordCount
 				mu.Unlock()
@@ -5510,7 +5566,8 @@ drain:
 			}
 			defer flushCancel()
 
-			if err := b.flushRecordsAsync(flushCtx, task.bufferKey, task.database, task.measurement, task.records, task.recordCount, task.walHashes, task.group); err != nil {
+			b.markFlushTaskInFlight(task)
+			if err := b.flushTrackedTask(flushCtx, task); err != nil {
 				mu.Lock()
 				unwrit += task.recordCount
 				mu.Unlock()
