@@ -215,6 +215,9 @@ func TestRetentionCreate(t *testing.T) {
 		{"missing database", `{"name":"b","retention_days":30}`, "database is required"},
 		{"retention not above buffer", `{"name":"b","database":"db","retention_days":7,"buffer_days":7}`, "retention_days must be greater than buffer_days"},
 		{"null is_active", `{"name":"b","database":"db","retention_days":30,"is_active":null}`, "is_active may not be null"},
+		// Arc's own storage roots, not databases (#1012).
+		{"reserved _schema", `{"name":"b","database":"_schema","retention_days":30}`, "is reserved for Arc's own storage"},
+		{"reserved _compaction_state", `{"name":"b","database":"_compaction_state","retention_days":30}`, "is reserved for Arc's own storage"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			status, body := sendCQ(t, app, "POST", "/retention", tc.body)

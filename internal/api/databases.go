@@ -446,6 +446,12 @@ func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
 			"error": fmt.Sprintf("invalid database name %q", name),
 		})
 	}
+	// Arc's own state, not a database: the list hides it, so this does too (#1012).
+	if storage.IsReservedRootDir(name) {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"error": "Database '" + name + "' not found",
+		})
+	}
 
 	// Gate on the resolved database, the same bar `SHOW TABLES FROM db`
 	// applies. Checked AFTER name validation so an invalid name is a 400

@@ -991,7 +991,6 @@ well-formed database directory is affected.
 Creating a continuous query requires an admin token, so this was a
 data-integrity bug rather than a vulnerability: no permission check was bypassed
 and no path escaped the storage root.
-
 ### A graceful shutdown no longer abandons flushes, and a flush timeout no longer starts before a worker picks the task up ([#1006](https://github.com/Basekick-Labs/arc/issues/1006), [#1007](https://github.com/Basekick-Labs/arc/issues/1007))
 
 Two ways an acknowledged write could reach no storage at all.

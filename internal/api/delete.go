@@ -316,6 +316,13 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 			Error:   "database name contains invalid characters",
 		})
 	}
+	// Arc's own state (_schema anchors, _compaction_state), not a database (#1012).
+	if storage.IsReservedRootDir(req.Database) {
+		return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{
+			Success: false,
+			Error:   "database name is reserved for Arc's own storage",
+		})
+	}
 	if !isSafeStoragePathSegment(req.Measurement) || storage.ValidateGlobSafe(req.Measurement) != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{
 			Success: false,
