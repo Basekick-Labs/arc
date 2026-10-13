@@ -390,3 +390,45 @@ func TestUntrackKeepsFloors(t *testing.T) {
 		t.Fatalf("floor %d", got)
 	}
 }
+
+func TestDeleteRecordCoversParkedFileCoverage(t *testing.T) {
+	record := DeleteRecord{
+		Database: "db",
+		Before:   []RecordScope{{Instance: 2, Acked: true, Marks: map[string]uint64{"db/cpu": 5}}},
+	}
+	if !record.Covers(InstanceCoverage{Instance: 2, Key: "db/cpu", Ranges: [][2]uint64{{3, 5}}}) {
+		t.Fatal("record did not cover an in-scope range")
+	}
+	for _, coverage := range []InstanceCoverage{
+		{Instance: 2, Key: "db/cpu", Ranges: [][2]uint64{{3, 7}}},
+		{Instance: 2, Key: "db/cpu", Partial: []CoveragePiece{{CSeq: 6, RowTotal: 20, RowHi: 20}}},
+		{Instance: 3, Key: "db/cpu", Ranges: [][2]uint64{{1, 1}}},
+		{Instance: 2, Key: "db/mem", Ranges: [][2]uint64{{1, 1}}},
+	} {
+		if record.Covers(coverage) {
+			t.Fatalf("record unexpectedly covered %+v", coverage)
+		}
+	}
+	if record.Covers(InstanceCoverage{Instance: 2, Key: "db/cpu", Truncated: true}) {
+		t.Fatal("record covered truncated acknowledged coverage")
+	}
+	unacked := DeleteRecord{Database: "db", Before: []RecordScope{{Instance: 2}}}
+	if !unacked.Covers(InstanceCoverage{Instance: 2, Key: "db/cpu", Truncated: true}) {
+		t.Fatal("unacknowledged process was not treated as fully in scope")
+	}
+	// A coverage that lists no batch proves nothing.
+	if unacked.Covers(InstanceCoverage{Instance: 2, Key: "db/cpu"}) {
+		t.Fatal("record covered a coverage listing no batches")
+	}
+	// Truncated coverage of another database's key, on an instance whose
+	// whole stream is in scope for this one.
+	if unacked.Covers(InstanceCoverage{Instance: 2, Key: "other/cpu", Truncated: true}) {
+		t.Fatal("record covered truncated coverage of another database")
+	}
+	// The deleting writer's own truncated stream: its marks are a prefix, so
+	// a truncated listing cannot be proven inside them.
+	own := DeleteRecord{Database: "db", Own: 2, OwnMarks: map[string]uint64{"db/cpu": 5}}
+	if own.Covers(InstanceCoverage{Instance: 2, Key: "db/cpu", Truncated: true}) {
+		t.Fatal("record covered the deleting writer's own truncated stream")
+	}
+}

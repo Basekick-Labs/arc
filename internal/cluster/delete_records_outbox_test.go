@@ -3,6 +3,8 @@ package cluster
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -24,6 +26,7 @@ type recordHooks struct {
 	settleE  error
 	removed  []string
 	instance uint64
+	removeFn func(context.Context, string) error
 }
 
 func (h *recordHooks) hooks() *DeleteRecordHooks {
@@ -57,10 +60,101 @@ func (h *recordHooks) hooks() *DeleteRecordHooks {
 		Instance: func() uint64 { return h.instance },
 		Remove: func(_ context.Context, path string) error {
 			h.mu.Lock()
-			defer h.mu.Unlock()
 			h.removed = append(h.removed, path)
+			fn := h.removeFn
+			h.mu.Unlock()
+			if fn != nil {
+				return fn(context.Background(), path)
+			}
 			return nil
 		},
+	}
+}
+
+func TestOutboxWithdrawDatabaseDeletesParkedFileUnderDurableRecord(t *testing.T) {
+	_, base, r, m, l := parkingRig(t)
+	r.HandOff(m, &fakeOutboxStorage{sizes: map[string]int64{outPathA: 10}}, "writer-1")
+	if got := l.wait(t, outPathA); got != ingest.CoverageRefused {
+		t.Fatalf("parked outcome = %v", got)
+	}
+	h := &recordHooks{
+		instance: 1,
+		recs:     []raft.DeleteRecord{{ID: 40, Database: "db", Before: []raft.RecordScope{{Instance: 9}}}},
+		removeFn: func(_ context.Context, path string) error {
+			return os.Remove(filepath.Join(base, filepath.FromSlash(path)))
+		},
+	}
+	r.SetDeleteRecordHooks(h.hooks())
+	if err := r.WithdrawDatabase(context.Background(), "db", 40); err != nil {
+		t.Fatal(err)
+	}
+	if r.IsParked(outPathA) || r.HoldsRegistration(outPathA) || exists(base, "_refused/"+outPathA) {
+		t.Fatal("durably deleted parked registration remains held")
+	}
+	h.get(func(h *recordHooks) {
+		if len(h.removed) != 1 || h.removed[0] != "_refused/"+outPathA {
+			t.Fatalf("removed %v", h.removed)
+		}
+		if len(h.settled) != 1 || h.settled[0].Records[0] != 40 {
+			t.Fatalf("settled %+v", h.settled)
+		}
+	})
+}
+
+func TestOutboxWithdrawDatabaseFinishesParkedDeleteAfterRestart(t *testing.T) {
+	dir, base, r, m, l := parkingRig(t)
+	r.HandOff(m, &fakeOutboxStorage{sizes: map[string]int64{outPathA: 10}}, "writer-1")
+	l.wait(t, outPathA)
+	removeAttempts := 0
+	h := &recordHooks{
+		instance: 1,
+		recs:     []raft.DeleteRecord{{ID: 40, Database: "db", Before: []raft.RecordScope{{Instance: 9}}}},
+		removeFn: func(_ context.Context, path string) error {
+			removeAttempts++
+			if removeAttempts == 1 {
+				_ = os.Remove(filepath.Join(base, filepath.FromSlash(path)))
+				return errors.New("interrupted after physical unlink")
+			}
+			return os.Remove(filepath.Join(base, filepath.FromSlash(path)))
+		},
+	}
+	r.SetDeleteRecordHooks(h.hooks())
+	if err := r.WithdrawDatabase(context.Background(), "db", 40); err == nil {
+		t.Fatal("expected first physical removal to fail")
+	}
+	crash(r)
+	r = newTestOutbox(t, dir)
+	r.SetLocalParking(LocalParking{Base: base})
+	if !r.IsParked(outPathA) {
+		t.Fatal("restart discarded the durable delete entry before WAL settlement")
+	}
+	r.SetDeleteRecordHooks(h.hooks())
+	if err := r.WithdrawDatabase(context.Background(), "db", 40); err != nil {
+		t.Fatal(err)
+	}
+	if r.IsParked(outPathA) || exists(base, "_refused/"+outPathA) || removeAttempts != 2 {
+		t.Fatalf("parked=%v file=%v remove attempts=%d", r.IsParked(outPathA), exists(base, "_refused/"+outPathA), removeAttempts)
+	}
+}
+
+func TestOutboxWithdrawDatabasePreservesParkedFileWithoutFullDeleteScope(t *testing.T) {
+	_, base, r, m, l := parkingRig(t)
+	r.HandOff(m, &fakeOutboxStorage{sizes: map[string]int64{outPathA: 10}}, "writer-1")
+	l.wait(t, outPathA)
+	h := &recordHooks{
+		instance: 1,
+		recs:     []raft.DeleteRecord{{ID: 40, Database: "db", Before: []raft.RecordScope{{Instance: 9, Acked: true, Marks: map[string]uint64{"db/cpu": 5}}}}},
+		removeFn: func(context.Context, string) error {
+			t.Fatal("removed a parked file with mixed delete coverage")
+			return nil
+		},
+	}
+	r.SetDeleteRecordHooks(h.hooks())
+	if err := r.WithdrawDatabase(context.Background(), "db", 40); err == nil {
+		t.Fatal("expected mixed coverage to refuse deletion")
+	}
+	if !r.IsParked(outPathA) || !exists(base, "_refused/"+outPathA) {
+		t.Fatal("parked data was not preserved")
 	}
 }
 

@@ -1357,6 +1357,29 @@ nodes keeping it off in `blocking_nodes`). Until then DELETE behaves as
 before. From then on a node running an earlier release cannot join. See the
 upgrade note below about rolling a node back.
 
+### Deleting a database also removes its parked files, and survives a leader change ([#1236](https://github.com/Basekick-Labs/arc/issues/1236))
+
+With stream takeover on, a file whose registration the cluster refused is
+parked under `_refused/<database>/`, and its WAL entries are kept until it is
+resolved. `DELETE /api/v1/databases/{name}` did not see those files: they and
+their WAL entries outlived the database, and a later re-flush could bring the
+deleted data back. Database deletion now removes them.
+
+A parked file can be the only copy of acknowledged rows, so it is removed only
+when the cluster's record of this database deletion covers every batch in it.
+Its batches are then settled as deleted and its WAL entries released. The
+removal is journaled first, so a deletion interrupted by a crash finishes on its
+own after the restart. If the record does not cover a file, or a registration
+for it is still in flight, the request fails with a retryable 503 and the file
+is kept.
+
+On clusters without tiered storage, a leader election during the deletion used
+to fail the request with a 500 after some manifest batches were applied. It is
+now retried for about 7 seconds, as on the tiered-storage path. A longer
+election still fails the request; retrying it completes the deletion.
+
+Contributed by [@jallegri](https://github.com/jallegri) in [#1252](https://github.com/Basekick-Labs/arc/pull/1252).
+
 ### Delete API catches dangerous keywords glued to numbers or literals ([#1080](https://github.com/Basekick-Labs/arc/issues/1080))
 
 The delete endpoint's keyword scan used `\b` directly on the masked WHERE
@@ -2370,10 +2393,8 @@ Two limits, unchanged by this fix:
 - **In-memory unlink queue:** a peer's delete worker queues the unlink in
   memory. If that node restarts or loses the primary before the unlink runs,
   its copy stays on disk with no manifest entry.
-- **Leader change mid-delete:** a leader election during the deletion fails
-  the request after some batches were applied. Retry it. Tracked, with the
-  pending-registration follow-up, in
-  [#1236](https://github.com/Basekick-Labs/arc/issues/1236).
+- **Leader change mid-delete:** fixed by #1236 (below): a leader change is
+  retried for about 7 seconds, as on the tiered-storage path.
 
 Contributed by [@jallegri](https://github.com/jallegri) in [#1176](https://github.com/Basekick-Labs/arc/pull/1176).
 

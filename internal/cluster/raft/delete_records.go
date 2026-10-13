@@ -123,6 +123,33 @@ func (r *DeleteRecord) coverageScope(c InstanceCoverage) (any, all bool) {
 	return any, all && any
 }
 
+// Covers reports whether every batch named by a file's coverage is in this
+// DELETE's scope. Truncated coverage is provable only for an unacknowledged
+// process, whose entire stream is in scope.
+func (r *DeleteRecord) Covers(c InstanceCoverage) bool {
+	// Checked first because the truncated branch below reads only the
+	// instance's scope, which says nothing about which database a key is in.
+	if !r.MatchesKey(c.Key) {
+		return false
+	}
+	if c.Truncated {
+		if c.Instance == r.Own && r.Own != 0 {
+			return false
+		}
+		s := r.scopeOf(c.Instance)
+		return s != nil && !s.Acked
+	}
+	if len(c.Ranges) == 0 && len(c.Partial) == 0 {
+		return false
+	}
+	for _, iv := range c.cseqs() {
+		if !r.InScope(c.Instance, c.Key, iv[0]) || !r.InScope(c.Instance, c.Key, iv[1]) {
+			return false
+		}
+	}
+	return true
+}
+
 func (r *DeleteRecord) clone() DeleteRecord {
 	c := *r
 	c.OwnMarks = cloneMarks(r.OwnMarks)
