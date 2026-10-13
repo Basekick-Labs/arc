@@ -107,7 +107,7 @@ func raceDelete(t *testing.T, where string, missing []string, extra ...string) (
 	const o = "db/cpu/2026/10/11/10/cpu_o.parquet"
 	writeRecordsParquet(t, db, root, a)
 	fsm := raft.NewClusterFSM(zerolog.Nop())
-	c := &fsmCoordinator{t: t, fsm: fsm, active: true, missing: missing, db: db, root: root}
+	c := &fsmCoordinator{t: t, fsm: fsm, active: true, db: db, root: root}
 	for _, n := range []string{"w1", "w2"} {
 		if err := c.apply(raft.CommandAddNode, raft.AddNodePayload{Node: raft.NodeInfo{ID: n, Role: "writer", State: "healthy"}}); err != nil {
 			t.Fatal(err)
@@ -136,6 +136,8 @@ func raceDelete(t *testing.T, where string, missing []string, extra ...string) (
 		if err := os.Remove(filepath.Join(root, a)); err != nil {
 			t.Fatal(err)
 		}
+		// The output may not be here yet.
+		c.missing = missing
 	}
 	h := NewDeleteHandler(db, backend, &config.DeleteConfig{Enabled: true, MaxRowsPerDelete: 1000, ConfirmationThreshold: 1000}, nil, t.TempDir(), zerolog.Nop())
 	h.SetCoordinator(c)
@@ -172,8 +174,8 @@ func TestDeleteScansAgainWhenACompactionReplacedTheFile(t *testing.T) {
 	if code != 200 || out.DeletedCount != 2 {
 		t.Fatalf("delete: %d %s", code, raw)
 	}
-	if c.waits != 1 {
-		t.Fatalf("waited for local files %d times, want once before the second scan", c.waits)
+	if c.waits != 2 {
+		t.Fatalf("waited for local files %d times, want before each scan", c.waits)
 	}
 	// Exactly one registered file, the rewrite of the output, without h1.
 	files := c.fsm.GetFilesByDatabase("db")
@@ -212,7 +214,7 @@ func TestDeleteScansAgainOnAFullFileDelete(t *testing.T) {
 // The output is not on this node: the DELETE does not scan without it.
 func TestDeleteRescanWaitsForTheOutput(t *testing.T) {
 	code, raw, c, _ := raceDelete(t, "host = 'h1'", []string{"db/cpu/2026/10/11/10/cpu_o.parquet"})
-	if code != 503 || !strings.Contains(raw, "not on this node") || c.waits != 1 {
+	if code != 503 || !strings.Contains(raw, "not on this node") || c.waits != 2 {
 		t.Fatalf("got %d (waits %d): %s", code, c.waits, raw)
 	}
 }
@@ -473,7 +475,7 @@ func TestDeleteUsesTheChecksumItScanned(t *testing.T) {
 			}
 		}
 		code, _, raw := sendDelete(t, h, `{"database":"db","measurement":"cpu","where":"`+where+`","confirm":true}`)
-		if code != 200 || c.waits != 1 {
+		if code != 200 || c.waits != 2 {
 			t.Fatalf("%s: %d after %d waits: %s", where, code, c.waits, raw)
 		}
 	}
@@ -496,7 +498,7 @@ func TestDeleteDoesNotRetryAFailedFileAfterAChange(t *testing.T) {
 		}
 	}
 	code, out, raw := sendDelete(t, h, `{"database":"db","measurement":"cpu","where":"host = 'h1'","confirm":true}`)
-	if code != 207 || len(out.FailedFiles) != 1 || out.DeletedCount != 2 || c.waits != 1 {
+	if code != 207 || len(out.FailedFiles) != 1 || out.DeletedCount != 2 || c.waits != 2 {
 		t.Fatalf("%d after %d waits: %s", code, c.waits, raw)
 	}
 }
@@ -548,5 +550,32 @@ func TestDeleteScanCatchesUpWithTheManifest(t *testing.T) {
 	c.syncErr = errors.New("no leader")
 	if code, _, raw = sendDelete(t, h, `{"database":"db","measurement":"cpu","where":"host = 'h2'","confirm":true}`); code != 503 || !strings.Contains(raw, "catch up") {
 		t.Fatalf("not synced: %d %s", code, raw)
+	}
+}
+
+// With compaction commit on (stream takeover off), the DELETE waits for the
+// manifest files of the measurement before it scans: the inputs of a
+// compaction are unregistered once it commits, and its output may not be here
+// yet. Without the wait the DELETE answered success having deleted nothing.
+func TestDeleteWaitsForManifestFilesBeforeTheScan(t *testing.T) {
+	const body = `{"database":"db","measurement":"cpu","where":"host = 'h1'","confirm":true}`
+	c, h, _ := casCluster(t, casA)
+	c.missing = []string{casO}
+	code, out, raw := sendDelete(t, h, body)
+	if code != 503 || c.waits != 1 || len(out.UnreachableFiles) != 1 || out.DeletedCount != 0 {
+		t.Fatalf("%d after %d waits: %s", code, c.waits, raw)
+	}
+	code, out, raw = sendDelete(t, h, strings.Replace(body, `"confirm":true`, `"confirm":true,"allow_unreachable":true`, 1))
+	if code != 200 || out.DeletedCount != 2 || len(out.UnreachableFiles) != 1 {
+		t.Fatalf("allowed: %d %s", code, raw)
+	}
+	// A dry run does not wait; with the flag off nothing waits.
+	waits := c.waits
+	if code, _, raw = sendDelete(t, h, `{"database":"db","measurement":"cpu","where":"host = 'h2'","dry_run":true}`); code != 200 || c.waits != waits {
+		t.Fatalf("dry run: %d %s", code, raw)
+	}
+	c.active = false
+	if code, _, raw = sendDelete(t, h, `{"database":"db","measurement":"cpu","where":"host = 'h2'","confirm":true}`); code != 200 || c.waits != waits {
+		t.Fatalf("flag off: %d %s", code, raw)
 	}
 }

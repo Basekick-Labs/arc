@@ -382,8 +382,17 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		}
 	}
 	var unreachable []string
+	// With compaction commit on, the scan sees only files the manifest lists
+	// (#1207 d2): one listed and not here yet (a compaction output on its
+	// way) must arrive first, or its rows are missed.
+	var waiter localFileWaiter
 	if rec != nil {
-		if unreachable, err = h.waitLocalFiles(ctx, rec, req.Database, req.Measurement, req.AllowUnreachable); err != nil {
+		waiter = rec
+	} else if c, ok := h.coordinator.(compactionCommitter); ok && !req.DryRun && c.CompactionCommitActive() {
+		waiter = c
+	}
+	if waiter != nil {
+		if unreachable, err = h.waitLocalFiles(ctx, waiter, req.Database, req.Measurement, req.AllowUnreachable); err != nil {
 			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete rejected: " + err.Error() + "; retry, or set allow_unreachable=true to skip them", UnreachableFiles: unreachable})
 		}
 	}
