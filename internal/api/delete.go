@@ -389,25 +389,28 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		}
 	}
 	var unreachable []string
-	// With compaction commit on, the scan sees only files the manifest lists
-	// (#1207 d2): one listed and not here yet (a compaction output on its
-	// way) must arrive first, or its rows are missed.
-	var waiter localFileWaiter
+	// With compaction commit on, the scan set is the manifest's (#1207 d2):
+	// a file it lists that is not here yet (a compaction output on its way)
+	// is waited for.
+	scan := scanOpts{wait: !req.DryRun, allowUnreachable: req.AllowUnreachable}
 	if rec != nil {
-		waiter = rec
-	} else if c, ok := h.coordinator.(compactionCommitter); ok && !req.DryRun && c.CompactionCommitActive() {
-		waiter = c
-	}
-	if waiter != nil {
-		if unreachable, err = h.waitLocalFiles(ctx, waiter, req.Database, req.Measurement, req.AllowUnreachable); err != nil {
+		if unreachable, err = h.waitLocalFiles(ctx, rec, req.Database, req.Measurement, req.AllowUnreachable); err != nil {
 			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete rejected: " + err.Error() + "; retry, or set allow_unreachable=true to skip them", UnreachableFiles: unreachable})
 		}
 	}
 
 	// Find affected files
-	affected, err := h.findAffectedFiles(ctx, req.Database, req.Measurement, where)
-	if errors.Is(err, errManifestNotSynced) {
+	affected, unlisted, err := h.findAffectedFiles(ctx, req.Database, req.Measurement, where, scan)
+	if casActive(h.coordinator) {
+		// The scan checked every manifest file of the measurement: what it
+		// could not find is what is unreachable now.
+		unreachable = unlisted
+	}
+	if errors.Is(err, errManifestNotSynced) || isContextErr(err) {
 		return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete rejected: " + err.Error() + "; retry shortly"})
+	}
+	if errors.Is(err, errUnreachableFiles) {
+		return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete rejected: " + err.Error() + "; retry, or set allow_unreachable=true to skip them", UnreachableFiles: unreachable})
 	}
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to find affected files")
@@ -424,13 +427,14 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		h.db.ClearHTTPCache()
 		freeOSMemoryThrottled()
 		return c.JSON(DeleteResponse{
-			Success:         true,
-			DeletedCount:    0,
-			AffectedFiles:   0,
-			RewrittenFiles:  0,
-			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
-			DryRun:          req.DryRun,
-			FilesProcessed:  []string{},
+			Success:          true,
+			DeletedCount:     0,
+			AffectedFiles:    0,
+			RewrittenFiles:   0,
+			ExecutionTimeMs:  float64(time.Since(start).Milliseconds()),
+			DryRun:           req.DryRun,
+			FilesProcessed:   []string{},
+			UnreachableFiles: unreachable,
 		})
 	}
 
@@ -472,13 +476,14 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		}
 
 		return c.JSON(DeleteResponse{
-			Success:         true,
-			DeletedCount:    totalToDelete,
-			AffectedFiles:   len(affected),
-			RewrittenFiles:  0,
-			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
-			DryRun:          true,
-			FilesProcessed:  fileNames,
+			Success:          true,
+			DeletedCount:     totalToDelete,
+			AffectedFiles:    len(affected),
+			RewrittenFiles:   0,
+			ExecutionTimeMs:  float64(time.Since(start).Milliseconds()),
+			DryRun:           true,
+			FilesProcessed:   fileNames,
+			UnreachableFiles: unreachable,
 		})
 	}
 
@@ -504,8 +509,14 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		if unreachable, err = h.waitLocalFiles(ctx, rec, req.Database, req.Measurement, req.AllowUnreachable); err != nil {
 			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete recorded, not run: " + err.Error() + "; rows the cluster replays later are already filtered; retry, or set allow_unreachable=true to skip them", UnreachableFiles: unreachable})
 		}
-		if affected, err = h.findAffectedFiles(ctx, req.Database, req.Measurement, where); errors.Is(err, errManifestNotSynced) {
+		affected, unlisted, err = h.findAffectedFiles(ctx, req.Database, req.Measurement, where, scan)
+		if casActive(h.coordinator) {
+			unreachable = unlisted
+		}
+		if errors.Is(err, errManifestNotSynced) || isContextErr(err) {
 			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete recorded, not run: " + err.Error() + "; retry shortly"})
+		} else if errors.Is(err, errUnreachableFiles) {
+			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete recorded, not run: " + err.Error() + "; rows the cluster replays later are already filtered; retry, or set allow_unreachable=true to skip them", UnreachableFiles: unreachable})
 		} else if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(DeleteResponse{
 				Success: false, Error: "Delete recorded, not run: failed to find affected files: " + err.Error(),
@@ -613,8 +624,8 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		h.logger.Info().Int("files", len(changed)).Int("round", round+1).
 			Msg("Files changed under the delete (compaction replaced them); scanning again")
 		var missing []string
-		affected, missing, err = h.rescanAfterChange(ctx, req.Database, req.Measurement, where, req.AllowUnreachable)
-		unreachable = mergeUnreachable(unreachable, missing)
+		affected, missing, err = h.rescanAfterChange(ctx, req.Database, req.Measurement, where, scan)
+		unreachable = missing
 		if err != nil {
 			return incomplete(err.Error())
 		}
@@ -763,14 +774,14 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 }
 
 // findAffectedFiles finds all Parquet files that contain rows matching the WHERE clause
-func (h *DeleteHandler) findAffectedFiles(ctx context.Context, database, measurement, whereClause string) ([]affectedFile, error) {
+func (h *DeleteHandler) findAffectedFiles(ctx context.Context, database, measurement, whereClause string, opts scanOpts) ([]affectedFile, []string, error) {
 	var affected []affectedFile
 
 	// Use storage backend's List method to find parquet files
 	prefix := fmt.Sprintf("%s/%s/", database, measurement)
 	files, err := h.storage.List(ctx, prefix)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list files: %w", err)
+		return nil, nil, fmt.Errorf("failed to list files: %w", err)
 	}
 
 	// Filter for parquet files and convert to query paths
@@ -784,7 +795,7 @@ func (h *DeleteHandler) findAffectedFiles(ctx context.Context, database, measure
 			// A delete must not silently leave matching rows behind, so an
 			// unusable key aborts rather than being skipped: the caller reports
 			// how many rows it removed, and skipping would make that a lie.
-			return nil, fmt.Errorf("listed file %q has no usable storage path: %w", f, err)
+			return nil, nil, fmt.Errorf("listed file %q has no usable storage path: %w", f, err)
 		}
 		parquetFiles = append(parquetFiles, fileInfo{
 			queryPath:    queryPath,
@@ -792,20 +803,22 @@ func (h *DeleteHandler) findAffectedFiles(ctx context.Context, database, measure
 		})
 	}
 
-	// With compaction commit on (#1207 d2), only files the cluster lists, or
-	// this node is still registering, are the DELETE's: anything else in
-	// storage is not data yet (a compaction output before its commit) or no
-	// longer (an input after it), and rewriting it would orphan the rewrite.
+	// With compaction commit on (#1207 d2), the files the cluster lists, or
+	// this node is still registering, are the DELETE's (scanSet): anything
+	// else in storage is not data yet (a compaction output before its commit)
+	// or no longer (an input after it), and rewriting it would orphan the
+	// rewrite.
 	var shas map[string]string
+	var unreachable []string
 	if casActive(h.coordinator) {
-		if parquetFiles, shas, err = h.registeredOrPending(ctx, parquetFiles); err != nil {
-			return nil, err
+		if parquetFiles, shas, unreachable, err = h.scanSet(ctx, database, measurement, parquetFiles, opts); err != nil {
+			return nil, unreachable, err
 		}
 	}
 
 	if len(parquetFiles) == 0 {
 		h.logger.Warn().Str("prefix", prefix).Msg("No parquet files found for measurement")
-		return affected, nil
+		return affected, unreachable, nil
 	}
 
 	h.logger.Info().Int("file_count", len(parquetFiles)).Msg("Scanning parquet files for matching rows")
@@ -817,13 +830,13 @@ func (h *DeleteHandler) findAffectedFiles(ctx context.Context, database, measure
 		// Fallback to individual queries if batch fails (e.g., schema mismatch)
 		h.logger.Warn().Err(err).Msg("Batch count failed, falling back to individual queries")
 		if affected, err = h.countMatchingRowsIndividually(ctx, parquetFiles, whereClause); err != nil {
-			return affected, err
+			return affected, unreachable, err
 		}
 	}
 	for i := range affected {
 		affected[i].sha = shas[affected[i].relativePath]
 	}
-	return affected, nil
+	return affected, unreachable, nil
 }
 
 // fileInfo holds query and relative paths for a parquet file

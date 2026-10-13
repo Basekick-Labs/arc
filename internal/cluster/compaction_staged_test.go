@@ -618,3 +618,22 @@ func TestEndStagedCopyPullsWhenTheCopyIsIncomplete(t *testing.T) {
 		t.Fatal("the committed output was not pulled")
 	}
 }
+
+// ManifestHotFiles lists the hot entries under database/measurement/ only.
+func TestManifestHotFiles(t *testing.T) {
+	r := stagedRig(t)
+	a := r.register("a.parquet")
+	cold := raft.FileEntry{Path: stHour + "cold.parquet", SHA256: "c", SizeBytes: 1, Database: "testdb",
+		Measurement: "cpu", OriginNodeID: "writer-1", Tier: "cold", CreatedAt: time.Now()}
+	other := raft.FileEntry{Path: "testdb/cpu_load/2026/10/13/10/x.parquet", SHA256: "x", SizeBytes: 1, Database: "testdb",
+		Measurement: "cpu_load", OriginNodeID: "writer-1", Tier: "hot", CreatedAt: time.Now()}
+	for _, e := range []raft.FileEntry{cold, other} {
+		if err := r.c.raftNode.RegisterFile(e, 5*time.Second); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := r.c.ManifestHotFiles("testdb", "cpu")
+	if len(got) != 1 || got[0].Path != a.Path {
+		t.Fatalf("got %+v", got)
+	}
+}

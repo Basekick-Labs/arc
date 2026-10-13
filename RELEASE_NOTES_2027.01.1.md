@@ -1399,16 +1399,22 @@ list and this node is not registering, such as a compaction output not yet
 committed. It first catches up with the cluster manifest, so a file registered
 a moment ago is not missed; if it cannot, it answers `503`.
 
-With compaction commit on, a DELETE also waits before its first scan until
-every file the cluster manifest lists for the measurement is on the node (up to
-30 s), as it already did with stream takeover. Without that wait, a DELETE that
-ran just after a compaction committed, before its output reached the node,
-found none of the compaction's rows and answered success having deleted
-nothing. A file still missing after 30 s answers `503` listing it in
-`unreachable_files`; `allow_unreachable: true` runs the DELETE without it.
-This now applies on clusters without stream takeover too. A dry run does not
-wait. Before, rewriting such a file deleted it and left its rewrite
-unregistered, so it never replicated.
+With compaction commit on, a DELETE scans the files the cluster manifest lists
+for the measurement, read after it caught up with the manifest, not only the
+files it found in storage. A compaction can commit between the DELETE's
+storage listing and that catch-up: the listing then has the compaction's
+inputs, which the manifest no longer lists, and not its output. The DELETE
+used to skip the inputs, never see the output, and answer success having
+deleted nothing, while the output kept the rows.
+
+A file the manifest lists that is not on the node yet is waited for (up to
+30 s per scan; the manifest is read again meanwhile, so a file it stops listing
+is not waited for). A file still missing then answers `503` listing it
+in `unreachable_files`; `allow_unreachable: true` runs the DELETE without it
+and lists it in `unreachable_files`, including when nothing matched. A dry run
+does not wait, and lists the files it could not count. This applies on
+clusters without stream takeover too. Before, rewriting such a file deleted it
+and left its rewrite unregistered, so it never replicated.
 
 The cluster turns this on by itself once every node runs this release (`GET
 /api/v1/cluster` shows `compaction_commit.enabled`, and on the leader the
