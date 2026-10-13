@@ -36,6 +36,30 @@ func TestQueryCache_GetSet(t *testing.T) {
 	}
 }
 
+func TestQueryCache_MetadataIsCopiedOnSetAndGet(t *testing.T) {
+	cache := NewQueryCache(time.Minute, 100)
+	metadata := []string{"db1\x00cpu"}
+	cache.SetWithMetadata("SELECT * FROM db1.cpu", "SELECT * FROM read_parquet(...) ", metadata)
+	metadata[0] = "db2\x00secret"
+
+	_, got, ok := cache.GetWithMetadata("SELECT * FROM db1.cpu")
+	if !ok {
+		t.Fatal("expected cache hit")
+	}
+	if len(got) != 1 || got[0] != "db1\x00cpu" {
+		t.Fatalf("metadata after Set was mutated: %q", got)
+	}
+	got[0] = "db3\x00secret"
+
+	_, again, ok := cache.GetWithMetadata("SELECT * FROM db1.cpu")
+	if !ok {
+		t.Fatal("expected second cache hit")
+	}
+	if len(again) != 1 || again[0] != "db1\x00cpu" {
+		t.Fatalf("metadata after Get was mutated: %q", again)
+	}
+}
+
 func TestQueryCache_Expiration(t *testing.T) {
 	cache := NewQueryCache(10*time.Millisecond, 100)
 
