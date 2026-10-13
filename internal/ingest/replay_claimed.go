@@ -41,6 +41,11 @@ type ClaimedReplay struct {
 	Database, Measurement string
 	Instance, Epoch       uint64
 	Records               []ClaimedRecord
+	// Origin: the origin republishes batches of one of its earlier
+	// instances from its WAL (#1207 S4b1c2b): no claim (Epoch 0), the
+	// batches keep their own identity, and the manifest arbitrates them
+	// like any copy of the origin's.
+	Origin bool
 }
 
 // ReplayOutcome is what became of one record's rows in one hour.
@@ -116,8 +121,8 @@ func (b *ArrowBuffer) ReplayClaimed(ctx context.Context, r ClaimedReplay) ([]Hou
 	if b.closing.Load() {
 		return nil, ErrReplayClosed
 	}
-	if r.Epoch == 0 || r.Instance == 0 || r.Database == "" || r.Measurement == "" {
-		return nil, errors.New("claimed replay: instance, epoch and target are required")
+	if (r.Epoch == 0) != r.Origin || r.Instance == 0 || r.Database == "" || r.Measurement == "" {
+		return nil, errors.New("claimed replay: instance, target and an epoch (none for an origin republish) are required")
 	}
 	if len(r.Records) > maxReplayRecords {
 		return nil, ErrReplayTooLarge

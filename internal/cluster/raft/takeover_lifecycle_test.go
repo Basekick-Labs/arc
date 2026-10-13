@@ -109,7 +109,7 @@ func TestDepartedWriterMustReport(t *testing.T) {
 	}
 	x.ok(CommandAddNode, AddNodePayload{Node: NodeInfo{ID: "w2", Role: "writer", State: "healthy"}})
 	report("w2")
-	if x.inst(9) != nil {
+	if !x.ended(9) {
 		t.Fatal("not removed once every writer reported")
 	}
 }
@@ -292,7 +292,7 @@ func TestDepartedOriginNeedNotReport(t *testing.T) {
 	for _, by := range []string{"w1", "w2"} {
 		x.ok(CommandTakeOverStreamV2, TakeOverStreamV2Payload{Origin: "w3", By: by, Now: t0, Claims: []ClaimSet{{Instance: 9}}})
 	}
-	if x.inst(9) != nil {
+	if !x.ended(9) {
 		t.Fatal("waited for the departed origin itself to report")
 	}
 }

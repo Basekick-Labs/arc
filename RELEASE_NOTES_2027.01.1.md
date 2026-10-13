@@ -371,7 +371,7 @@ every node sets `cluster.stream_takeover` (see "Stream takeover" below):
 **Stream takeover (live, opt-in).** With `cluster.stream_takeover = true` on
 every node (writers also need `cluster.wal_coverage = true` and an explicit
 `cluster.node_id`), the cluster turns takeover on by itself once every node
-advertises support (`stream_claims_v5`; builds that advertised `v1` to `v4`
+advertises support (`stream_claims_v6`; builds that advertised `v1` to `v5`
 block it). From then on:
 - **A dead primary's acknowledged rows are published by the new primary.**
   When the primary stops answering and failover designates another writer,
@@ -424,16 +424,35 @@ block it). From then on:
   oldest unfinished claim has been open. A claim whose replay keeps failing
   (a full disk, for example) is never given up on by itself, and DELETEs of
   its measurements wait: alert on this gauge.
-- A file naming a writer process the cluster already accounted for and
-  removed is refused and parked (a writer coming back after its departure
-  expired, with an old volume), so it cannot duplicate rows a takeover
-  published.
+- **An old primary that comes back with its volume publishes the rest.**
+  Rows it acknowledged that no standby held (the replication lag), and rows
+  the new primary could not publish, are in its WAL: it reads them back and
+  publishes them, once, and its copies of rows a takeover already published
+  are refused and removed. Flushes never put batches another writer claimed in
+  the same file as batches nobody claimed, nor batches of two processes of the
+  writer, so a refusal never holds back rows nobody else has. DELETEs of
+  those measurements wait while it does (at most 10 minutes).
+- **A writer the cluster gave up on is retired, not forgotten.** When every
+  writer has finished with a process of a writer that was removed, or whose
+  departure expired, the process is kept as `retired` (the last 256), with
+  what was registered of it: if that writer comes back with the volume after
+  all, it publishes exactly the rows nobody registered. Copies of an older
+  retired process are refused and parked.
+- **Files nobody pulled are not left behind.** A file the old primary
+  registered counts as published, but if no other node pulled it before the
+  primary's volume was lost, its rows are gone. So, for every file of the old
+  process whose rows its standby copy holds, a claim finishes only once the
+  new primary holds the file too. If every node, asked directly, says it does
+  not have it (or no node could answer for it during twice the grace), the
+  file is removed from the manifest and its rows are published from the
+  standby copy; a node that later comes back with a copy of it removes that
+  copy. A file the standby copy could not publish again is never removed and
+  does not hold the claim. New gauge `arc_stream_takeover_unpulled_files`:
+  files the new primary still waits for.
 
 What takeover does not cover: rows a primary acknowledged but had not
 streamed to any standby yet when its volume was lost (the replication lag,
-usually milliseconds); and rows of a file that mixes claimed batches with
-batches nobody else holds, which stay parked until a later release
-re-publishes them.
+usually milliseconds) and that it never comes back with.
 
 **Rollback warning.** WAL entries written with the setting on use a new format.
 This release reads it, but older releases cannot: they quarantine those entries

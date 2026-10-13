@@ -42,6 +42,10 @@ type originStream struct {
 // publishes a gone writer's unregistered batches from the store; outbox is
 // this node's registration outbox (the claimant's files go through it).
 func (c *Coordinator) StartOriginStream(walWriter *wal.Writer, buffer *ingest.ArrowBuffer, outbox *RegistrationOutbox) error {
+	if outbox != nil {
+		pending := outbox.IsPending
+		c.pendingRegistration.Store(&pending)
+	}
 	if !c.cfg.WALCoverage || c.cfg.SharedStorageMode || c.raftNode == nil || walWriter == nil || buffer == nil {
 		return nil
 	}
@@ -113,6 +117,9 @@ func (c *Coordinator) StartOriginStream(walWriter *wal.Writer, buffer *ingest.Ar
 		client.Run(ctx)
 	}()
 	go c.originStreamPrimaryWatch(ctx, st)
+	if c.cfg.StreamTakeover {
+		buffer.SetClaimedBatch(fsm.ClaimedFromOrigin)
+	}
 	if c.cfg.StreamTakeover && outbox != nil {
 		cl := newClaimant(c, store, outbox, buffer, func(ctx context.Context, origin string, keys []string) bool {
 			tk := make([]originstream.TrimKey, len(keys))
@@ -127,6 +134,11 @@ func (c *Coordinator) StartOriginStream(walWriter *wal.Writer, buffer *ingest.Ar
 			}
 			return true
 		})
+		if dir := filepath.Dir(walWriter.CurrentFile()); walWriter.CurrentFile() != "" {
+			cl.republish = newRepublisher(c, outbox, buffer, dir, walWriter.TrackedInstance)
+			cl.republish.current = walWriter.CurrentFile
+			outbox.SetParkedCovered(cl.republish.ParkedCovered)
+		}
 		cl.start(ctx)
 		c.claimant.Store(cl)
 	}

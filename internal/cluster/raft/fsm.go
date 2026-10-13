@@ -254,6 +254,10 @@ type FileEntry struct {
 	// (#1207 S4b). Set only by the FSM, from RegisterFilePayload.Cov2 while
 	// stream takeover is enabled; a client-supplied value is ignored.
 	Coverage []InstanceCoverage `json:"cov2,omitempty"`
+	// CoverageInherited: Coverage came from the file a DELETE rewrite
+	// replaced (rows of it were deleted): never republished from a standby
+	// copy, which still holds the deleted rows.
+	CoverageInherited bool `json:"cov2_inherited,omitempty"`
 }
 
 // RegisterFilePayload is the payload for CommandRegisterFile.
@@ -1725,6 +1729,7 @@ func (f *ClusterFSM) applyDeleteFileLocked(p DeleteFilePayload) func() {
 		for _, c := range existing.Coverage {
 			f.takeoverVanishedLocked(c, fileHour(*existing), f.applyStarted.Load())
 		}
+		f.takeoverNoteVanishedLocked(*existing)
 	}
 	delete(f.files, p.Path)
 	if existed {

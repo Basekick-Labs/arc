@@ -36,6 +36,7 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster/originstream"
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/ingest"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/wal"
 	"github.com/rs/zerolog"
 )
@@ -97,6 +98,18 @@ type claimWork struct {
 	// failed counts consecutive passes a record's flush failed.
 	failed map[recID]int
 	warned bool
+	// vanishedAt is the claim's VanishedAt done was computed against: a
+	// vanished file takes registered batches back, so done is recomputed.
+	vanishedAt uint64
+	// local are the files of the instance verified here at their size.
+	local map[string]int64
+	// unknownSince is when nobody could first answer for a missing file.
+	unknownSince map[string]time.Time
+	// unrepublishable: missing files the standby copy cannot publish again
+	// (logged once).
+	unrepublishable map[string]bool
+	unpulled        int
+	unpulledAt      time.Time // last check while files were missing
 }
 
 type claimBackoff struct {
@@ -123,6 +136,12 @@ type claimant struct {
 	currentSeen     map[string]instanceSeen
 	backoff         map[uint64]*claimBackoff
 	work            map[uint64]*claimWork
+	// probe asks a peer whether it holds a file (nil: Coordinator.probeFile
+	// when peer replication is on).
+	probe func(ctx context.Context, addr string, e raft.FileEntry) probeAnswer
+	// republish publishes parked batches of earlier instances of this
+	// writer from its WAL (nil in tests that do not need it).
+	republish *republisher
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -177,6 +196,7 @@ func (cl *claimant) stop() {
 func (cl *claimant) run(ctx context.Context) {
 	t := time.NewTicker(claimantEvery)
 	defer t.Stop()
+	var lastRepublish time.Time
 	for {
 		select {
 		case <-ctx.Done():
@@ -184,6 +204,12 @@ func (cl *claimant) run(ctx context.Context) {
 		case <-t.C:
 		}
 		cl.pass(ctx)
+		// Same goroutine: both write through the buffer, which stop waits
+		// for before it shuts down.
+		if cl.republish != nil && !cl.c.claimedExit.Load() && time.Since(lastRepublish) >= republishEvery {
+			lastRepublish = time.Now()
+			cl.republish.pass(ctx)
+		}
 	}
 }
 
@@ -219,6 +245,15 @@ func (cl *claimant) pass(ctx context.Context) {
 		claims[k.Instance] = k
 	}
 	cl.trigger(ctx, fsm, instances, claims, now)
+	mine := map[uint64]bool{}
+	for _, k := range fsm.ClaimsBy(self) {
+		mine[k.Instance] = !k.Released && !k.Done
+	}
+	for id := range cl.work {
+		if !mine[id] {
+			delete(cl.work, id) // its claim ended or went (instance removed)
+		}
+	}
 	for _, k := range fsm.ClaimsBy(self) {
 		if k.Released || k.Done {
 			delete(cl.work, k.Instance)
@@ -233,6 +268,11 @@ func (cl *claimant) pass(ctx context.Context) {
 		}
 		cl.replayClaim(ctx, fsm, k, tracked)
 	}
+	unpulled := 0
+	for _, w := range cl.work {
+		unpulled += w.unpulled
+	}
+	metrics.Get().SetStreamTakeoverUnpulledFiles(int64(unpulled))
 	cl.dropStale(ctx, fsm, byID, claims)
 }
 
@@ -261,7 +301,7 @@ const (
 // primary's id; healthy: this node hears from the instance's writer. It
 // mirrors the manifest's rules (takeover.go followUpOpenLocked).
 func claimKindOf(in raft.StreamInstance, claims map[uint64]raft.StreamClaim, self, designated string, healthy bool) claimKind {
-	if in.Origin == self || in.Untracked {
+	if in.Origin == self || in.Untracked || in.Status == raft.InstanceRetired {
 		return claimNone
 	}
 	k, claimed := claims[in.Instance]
@@ -544,8 +584,14 @@ func (cl *claimant) workFor(k raft.StreamClaim) *claimWork {
 	w := cl.work[k.Instance]
 	if w == nil || w.epoch != k.Epoch {
 		w = &claimWork{epoch: k.Epoch, done: map[recID]bool{}, chunks: map[recID]uint16{},
-			unreplayable: map[string]raft.Intervals{}, failed: map[recID]int{}}
+			unreplayable: map[string]raft.Intervals{}, failed: map[recID]int{}, vanishedAt: k.VanishedAt,
+			local: map[string]int64{}, unknownSince: map[string]time.Time{}, unrepublishable: map[string]bool{}}
 		cl.work[k.Instance] = w
+	}
+	if w.vanishedAt != k.VanishedAt {
+		// Batches found registered may be registered no more: replay them
+		// again (Keep subtracts what still is).
+		w.done, w.vanishedAt = map[recID]bool{}, k.VanishedAt
 	}
 	return w
 }
@@ -617,6 +663,11 @@ func (cl *claimant) replayClaim(ctx context.Context, fsm *raft.ClusterFSM, k raf
 		if len(fsm.ClaimableSet(k.Instance, key, raft.Intervals(ivs)).Minus(k.Set[key])) > 0 {
 			return
 		}
+	}
+	// Every registered file of it here, or gone from every node and taken
+	// back (then published again next pass).
+	if tracked && !cl.unpulledSettled(ctx, fsm, k, w) {
+		return
 	}
 	cl.finish(ctx, k, w)
 }
@@ -916,6 +967,8 @@ func (cl *claimant) dropStale(ctx context.Context, fsm *raft.ClusterFSM, byID ma
 		case claimed && ((k.Done && k.By == self) || slices.Contains(k.FinishedBy, self)):
 		case !known && fsm.Tombstoned(info.Instance):
 			// Published or settled, and removed with its claim.
+		case known && in.Origin == info.Origin && in.Status == raft.InstanceRetired:
+			// Every writer finished with it; its origin publishes the rest.
 		case known && in.Origin == info.Origin && info.Origin != designatedID && cl.c.originHealthy(info.Origin) &&
 			len(cl.claimable(fsm, info.Origin, []raft.StreamInstance{in})) == 0:
 			// Frozen: this node no longer receives from that writer.
@@ -979,6 +1032,9 @@ func (c *Coordinator) StreamTakeoverBusy(db, measurement string) bool {
 			}
 		}
 	}
+	if c.republishBusy(fsm, match, time.Now()) {
+		return true
+	}
 	cl := c.claimant.Load()
 	if cl == nil {
 		return false
@@ -1019,6 +1075,58 @@ func (c *Coordinator) StreamTakeoverBusy(db, measurement string) bool {
 		}
 	}
 	return false
+}
+
+// republishWindow bounds how long DELETEs wait for an origin that came back
+// to republish what nobody registered of an instance taken over: it does so
+// from its WAL within a few passes of adopting it.
+const republishWindow = 10 * time.Minute
+
+// republishBusy reports whether an origin back with an instance taken over
+// (adopted, with a claim record) may still republish rows of a matching key
+// from its WAL: rows acknowledged before the DELETE, which it would not
+// remove. Bounded by republishWindow from when this node first saw it.
+func (c *Coordinator) republishBusy(fsm *raft.ClusterFSM, match func(string) bool, now time.Time) bool {
+	claims := map[uint64]raft.StreamClaim{}
+	for _, k := range fsm.StreamClaims() {
+		claims[k.Instance] = k
+	}
+	c.republishMu.Lock()
+	defer c.republishMu.Unlock()
+	if c.republishSeen == nil {
+		c.republishSeen = map[uint64]time.Time{}
+	}
+	live := map[uint64]bool{}
+	busy := false
+	for _, in := range fsm.StreamInstances() {
+		k, claimed := claims[in.Instance]
+		if in.Status != raft.InstanceAdopted || !claimed {
+			continue
+		}
+		live[in.Instance] = true
+		first, ok := c.republishSeen[in.Instance]
+		if !ok {
+			first = now
+			c.republishSeen[in.Instance] = now
+		}
+		if busy || now.Sub(first) >= republishWindow {
+			continue
+		}
+		keys := fsm.InstanceKeys(in.Instance)
+		for key := range k.Set {
+			keys = append(keys, key)
+		}
+		for key := range k.Unreplayable {
+			keys = append(keys, key)
+		}
+		busy = slices.ContainsFunc(keys, match)
+	}
+	for id := range c.republishSeen {
+		if !live[id] {
+			delete(c.republishSeen, id)
+		}
+	}
+	return busy
 }
 
 // followUpWindow is how long after a claim ended DELETEs wait for the other

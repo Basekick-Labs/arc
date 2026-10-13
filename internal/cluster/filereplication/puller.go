@@ -2147,6 +2147,11 @@ var ErrChecksumMismatch = errors.New("filereplication: checksum mismatch")
 // original writer is gone but other peers still hold the file.
 var ErrFileNotOnPeer = errors.New("filereplication: file not on peer")
 
+// ErrNotInPeerManifest wraps ErrFileNotOnPeer when the peer refused the
+// fetch because its manifest has no entry for the file (it may trail the
+// requester's), as opposed to its storage not holding a file it lists.
+var ErrNotInPeerManifest = errors.New("filereplication: file not in the peer's manifest")
+
 // ErrBadOffset is returned by Fetcher implementations when the server rejects
 // the requested byte offset (negative, >= file size, or backend doesn't
 // support seeks). The puller should delete any partial file and retry from

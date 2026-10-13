@@ -136,6 +136,8 @@ type RegistrationOutbox struct {
 	sendGate             atomic.Pointer[func() bool]
 	resolvedSinceCompact int
 	coveredSent          atomic.Int64 // covered registrations sent (FreshStart)
+	// parkedCovered: the republisher's verdicts (SetParkedCovered).
+	parkedCovered atomic.Pointer[ParkedCoveredFunc]
 
 	registered atomic.Int64
 	skipped    atomic.Int64
