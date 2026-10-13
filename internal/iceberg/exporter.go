@@ -1222,8 +1222,11 @@ func (e *Exporter) pruneOldVersionFiles(ctx context.Context, tbl *icetable.Table
 // reach has to survive. The normal single-writer reconcile calls this after delete-after-commit
 // and pruneOldVersionFiles. Still, a restore or another catalog writer can move the current
 // metadata location, or rewrite a retained v<N>.metadata.json in place, while this scan is running.
-// The sweep reloads the catalog, re-lists the directory, and recomputes reachability immediately
-// before deletion to reject that stale scan.
+// So reachability is not computed from the first listing at all: after it, the sweep reloads the
+// catalog, re-lists the directory and computes reachability from that final listing, then checks
+// the catalog once more, and only then deletes. Every check finishes before the first delete
+// (#1125, after the guard in @efegokdemir's #923). A commit landing during the deletes themselves
+// is not covered; the window is narrowed to the delete loop, not closed.
 //
 // Deletions are restricted to names ending ".avro" DIRECTLY under the table's metadata directory.
 // That is what keeps the blast radius off everything else: Arc's data files are .parquet and live
@@ -1238,12 +1241,20 @@ func (e *Exporter) pruneOldVersionFiles(ctx context.Context, tbl *icetable.Table
 // Best-effort with respect to the reconcile: this runs after the pass has committed, so a failure
 // here never undoes a snapshot. Single-writer, like the rest of the reconcile path.
 func (e *Exporter) sweepOrphanMetadata(ctx context.Context, tbl *icetable.Table) {
-	e.sweepOrphanMetadataWithHook(ctx, tbl, nil)
+	e.sweepOrphanMetadataWithHooks(ctx, tbl, nil)
 }
 
-// sweepOrphanMetadataWithHook keeps a deterministic seam for the race between the initial
-// reachability scan and the final validation. Production callers pass nil.
-func (e *Exporter) sweepOrphanMetadataWithHook(ctx context.Context, tbl *icetable.Table, afterFirstReachability func()) {
+// sweepHooks are test seams into the windows sweepOrphanMetadata defends. Production passes nil.
+type sweepHooks struct {
+	afterListing func()                                          // after the first listing, before any re-check
+	finalListing func([]storage.ObjectInfo) []storage.ObjectInfo // rewrites the final listing
+	beforeDelete func()                                          // after the final reachability pass, before the last catalog check
+}
+
+func (e *Exporter) sweepOrphanMetadataWithHooks(ctx context.Context, tbl *icetable.Table, hooks *sweepHooks) {
+	if hooks == nil {
+		hooks = &sweepHooks{}
+	}
 	if !e.orphanSweepEnabled || e.backend == nil {
 		return
 	}
@@ -1272,13 +1283,12 @@ func (e *Exporter) sweepOrphanMetadataWithHook(ctx context.Context, tbl *icetabl
 		return
 	}
 
-	// Split the listing into entry points (metadata.json) and candidates (.avro old enough to be
-	// past the grace). Candidates are collected first so a directory whose .avro files are ALL
-	// young costs one listing and no metadata reads at all. That is the young-table case, not the
-	// steady state: once a table has history, its retained versions keep old-but-reachable
-	// manifests around, so most passes do walk every metadata.json here. The walk stays cheap
-	// because reachableManifestNames dedupes the manifest-list reads, which are the I/O.
-	var metaKeys []string
+	// Candidates are the .avro files old enough to be past the grace. They are collected first so
+	// a directory whose .avro files are ALL young costs one listing and no metadata reads at all.
+	// That is the young-table case, not the steady state: once a table has history, its retained
+	// versions keep old-but-reachable manifests around, so most passes do walk every metadata.json
+	// below. The walk stays cheap because reachableManifestNames dedupes the manifest-list reads,
+	// which are the I/O.
 	var candidates []string
 	candidateSet := make(map[string]struct{})
 	young := 0
@@ -1296,11 +1306,7 @@ func (e *Exporter) sweepOrphanMetadataWithHook(ctx context.Context, tbl *icetabl
 		if path.Dir(o.Path) != dirKey {
 			continue
 		}
-		base := path.Base(o.Path)
-		switch {
-		case strings.HasSuffix(base, ".metadata.json"):
-			metaKeys = append(metaKeys, o.Path)
-		case strings.HasSuffix(base, ".avro"):
+		if base := path.Base(o.Path); strings.HasSuffix(base, ".avro") {
 			if time.Since(o.LastModified) < e.orphanGrace {
 				young++
 				continue
@@ -1312,29 +1318,8 @@ func (e *Exporter) sweepOrphanMetadataWithHook(ctx context.Context, tbl *icetabl
 	if len(candidates) == 0 {
 		return
 	}
-	if len(metaKeys) == 0 {
-		e.logger.Warn().Str("dir", dirKey).
-			Msg("Iceberg orphan sweep: no metadata files were listed, skipping (nothing deleted)")
-		return
-	}
-
-	_, err = e.reachableManifestNames(ctx, tbl, metaKeys)
-	if err != nil {
-		// Loud, not Debug: a sweep that cannot establish reachability reclaims nothing, every
-		// pass, and an operator watching the metadata directory grow deserves the reason.
-		//
-		// It can also stay that way. Recovery needs the unreadable metadata.json to be retired by
-		// pruneOldVersionFiles or delete-after-commit, which takes further commits on this table —
-		// and a table whose file set has stopped changing gets no further passes at all (the
-		// scheduler fingerprint-gates it). So a warehouse restored with its .avro set lagging its
-		// metadata.json set can leave this table unswept until the files are reconciled by hand.
-		// That is the fail-closed direction and the right one, but it is not self-healing.
-		e.logger.Warn().Err(err).Str("dir", dirKey).
-			Msg("Iceberg orphan sweep: could not establish the reachable manifest set, skipping (nothing deleted)")
-		return
-	}
-	if afterFirstReachability != nil {
-		afterFirstReachability()
+	if hooks.afterListing != nil {
+		hooks.afterListing()
 	}
 
 	// Re-read the catalog pointer before trusting the first listing. If another reconcile or a
@@ -1359,7 +1344,10 @@ func (e *Exporter) sweepOrphanMetadataWithHook(ctx context.Context, tbl *icetabl
 			Msg("Iceberg orphan sweep: final directory listing failed, skipping (nothing deleted)")
 		return
 	}
-	finalMetaKeys := make([]string, 0, len(metaKeys))
+	if hooks.finalListing != nil {
+		finalObjects = hooks.finalListing(finalObjects)
+	}
+	var finalMetaKeys []string
 	finalCandidates := make([]string, 0, len(candidates))
 	for _, o := range finalObjects {
 		if path.Dir(o.Path) != dirKey {
@@ -1380,9 +1368,11 @@ func (e *Exporter) sweepOrphanMetadataWithHook(ctx context.Context, tbl *icetabl
 			finalCandidates = append(finalCandidates, o.Path)
 		}
 	}
+	// With no entry points every candidate would read as unreachable. A table always has its
+	// current metadata.json here, so a listing without one is incomplete, not proof.
 	if len(finalMetaKeys) == 0 {
 		e.logger.Warn().Str("dir", dirKey).
-			Msg("Iceberg orphan sweep: no metadata files remained in the final listing, skipping (nothing deleted)")
+			Msg("Iceberg orphan sweep: the listing returned no metadata files, skipping (nothing deleted)")
 		return
 	}
 	if len(finalCandidates) == 0 {
@@ -1393,8 +1383,17 @@ func (e *Exporter) sweepOrphanMetadataWithHook(ctx context.Context, tbl *icetabl
 	// in place even when the catalog's MetadataLocation did not move.
 	finalReachable, err := e.reachableManifestNames(ctx, latest, finalMetaKeys)
 	if err != nil {
+		// Loud, not Debug: a sweep that cannot establish reachability reclaims nothing, every
+		// pass, and an operator watching the metadata directory grow deserves the reason.
+		//
+		// It can also stay that way. Recovery needs the unreadable metadata.json to be retired by
+		// pruneOldVersionFiles or delete-after-commit, which takes further commits on this table —
+		// and a table whose file set has stopped changing gets no further passes at all (the
+		// scheduler fingerprint-gates it). So a warehouse restored with its .avro set lagging its
+		// metadata.json set can leave this table unswept until the files are reconciled by hand.
+		// That is the fail-closed direction and the right one, but it is not self-healing.
 		e.logger.Warn().Err(err).Str("dir", dirKey).
-			Msg("Iceberg orphan sweep: final reachability scan failed, skipping (nothing deleted)")
+			Msg("Iceberg orphan sweep: could not establish the reachable manifest set, skipping (nothing deleted)")
 		return
 	}
 
@@ -1411,6 +1410,9 @@ func (e *Exporter) sweepOrphanMetadataWithHook(ctx context.Context, tbl *icetabl
 
 	// Confirm once more immediately before deletion so a catalog commit that raced the final
 	// reachability pass cannot make this candidate set stale.
+	if hooks.beforeDelete != nil {
+		hooks.beforeDelete()
+	}
 	confirmed, err := e.catalog.LoadTable(ctx, tbl.Identifier())
 	if err != nil {
 		e.logger.Warn().Err(err).Str("dir", dirKey).

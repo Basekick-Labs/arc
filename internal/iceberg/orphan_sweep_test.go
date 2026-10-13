@@ -300,7 +300,7 @@ func TestSweepOrphanMetadata_RechecksReachabilityAfterMetadataChanges(t *testing
 
 	mustDelete := r.plantOrphan(t, "00000000-0000-0000-0000-00000000ba01-m1.avro", 3*time.Hour)
 	var appearedAfterListing string
-	r.exp.sweepOrphanMetadataWithHook(ctx, r.load(t, ctx), func() {
+	r.exp.sweepOrphanMetadataWithHooks(ctx, r.load(t, ctx), &sweepHooks{afterListing: func() {
 		if err := os.WriteFile(retainedMetadata, seedMetadata, 0o600); err != nil {
 			t.Fatalf("rewrite retained metadata: %v", err)
 		}
@@ -309,7 +309,7 @@ func TestSweepOrphanMetadata_RechecksReachabilityAfterMetadataChanges(t *testing
 		if err := os.WriteFile(lateMetadata, seedMetadata, 0o600); err != nil {
 			t.Fatalf("write late metadata: %v", err)
 		}
-	})
+	}})
 
 	if !exists(t, newlyReachable) {
 		t.Errorf("sweep deleted %s after a retained metadata file became able to reach it", filepath.Base(newlyReachable))
@@ -330,12 +330,12 @@ func TestSweepOrphanMetadata_AbortsWhenCatalogMetadataMoves(t *testing.T) {
 	mustKeep := r.plantOrphan(t, "00000000-0000-0000-0000-00000000ba03-m1.avro", 3*time.Hour)
 	before := r.load(t, ctx).MetadataLocation()
 
-	r.exp.sweepOrphanMetadataWithHook(ctx, r.load(t, ctx), func() {
+	r.exp.sweepOrphanMetadataWithHooks(ctx, r.load(t, ctx), &sweepHooks{afterListing: func() {
 		r.exp.ConfigureOrphanSweep(false, time.Hour)
 		// Re-register a previously removed file to publish a newer catalog metadata location.
 		r.pass(t, ctx, append(append([]string(nil), live...), filepath.Join(r.root, "mydb", "cpu", "2026", "07", "14", "15", "a.parquet"))...)
 		r.exp.ConfigureOrphanSweep(true, time.Hour)
-	})
+	}})
 
 	after := r.load(t, ctx).MetadataLocation()
 	if after == before {
@@ -353,14 +353,80 @@ func TestSweepOrphanMetadata_AbortsOnFinalReachabilityError(t *testing.T) {
 	mustKeep := r.plantOrphan(t, "00000000-0000-0000-0000-00000000ba04-m1.avro", 3*time.Hour)
 	malformedMetadata := filepath.Join(r.metaDir, "9000001-malformed.metadata.json")
 
-	r.exp.sweepOrphanMetadataWithHook(ctx, r.load(t, ctx), func() {
+	r.exp.sweepOrphanMetadataWithHooks(ctx, r.load(t, ctx), &sweepHooks{afterListing: func() {
 		if err := os.WriteFile(malformedMetadata, []byte("not json"), 0o600); err != nil {
 			t.Fatalf("write malformed late metadata: %v", err)
 		}
-	})
+	}})
 
 	if !exists(t, mustKeep) {
 		t.Error("sweep deleted a candidate despite an incomplete final reachability scan")
+	}
+}
+
+// The last catalog check runs after the final reachability pass, immediately before the deletes.
+// A commit landing in that window must stop the sweep.
+func TestSweepOrphanMetadata_AbortsWhenCatalogMovesBeforeDelete(t *testing.T) {
+	ctx := context.Background()
+	r := newSweepRig(t, 1)
+	live, _, _ := r.churnWithSeedMetadata(t, ctx)
+	mustKeep := r.plantOrphan(t, "00000000-0000-0000-0000-00000000ba05-m1.avro", 3*time.Hour)
+	before := r.load(t, ctx).MetadataLocation()
+
+	r.exp.sweepOrphanMetadataWithHooks(ctx, r.load(t, ctx), &sweepHooks{beforeDelete: func() {
+		r.exp.ConfigureOrphanSweep(false, time.Hour)
+		r.pass(t, ctx, append(append([]string(nil), live...), filepath.Join(r.root, "mydb", "cpu", "2026", "07", "14", "15", "a.parquet"))...)
+		r.exp.ConfigureOrphanSweep(true, time.Hour)
+	}})
+
+	if r.load(t, ctx).MetadataLocation() == before {
+		t.Fatal("test did not move the catalog metadata location")
+	}
+	if !exists(t, mustKeep) {
+		t.Error("sweep deleted a candidate after the catalog moved between the final reachability pass and the deletes")
+	}
+}
+
+// A final listing with no metadata.json has no entry points, so every candidate would read as
+// unreachable. The sweep must treat it as incomplete and delete nothing.
+func TestSweepOrphanMetadata_SkipsWhenTheFinalListingHasNoMetadata(t *testing.T) {
+	ctx := context.Background()
+	r := newSweepRig(t, 1)
+	r.churnWithSeedMetadata(t, ctx)
+	mustKeep := r.plantOrphan(t, "00000000-0000-0000-0000-00000000ba06-m1.avro", 3*time.Hour)
+
+	r.exp.sweepOrphanMetadataWithHooks(ctx, r.load(t, ctx), &sweepHooks{finalListing: func(objs []storage.ObjectInfo) []storage.ObjectInfo {
+		var kept []storage.ObjectInfo
+		for _, o := range objs {
+			if !strings.HasSuffix(o.Path, ".metadata.json") {
+				kept = append(kept, o)
+			}
+		}
+		return kept
+	}})
+
+	if !exists(t, mustKeep) {
+		t.Error("sweep deleted a candidate on a listing with no metadata files")
+	}
+}
+
+// A candidate rewritten after the first listing is young again by the final one, and the grace
+// applies to what the final listing says.
+func TestSweepOrphanMetadata_GraceAppliesToTheFinalListing(t *testing.T) {
+	ctx := context.Background()
+	r := newSweepRig(t, 1)
+	r.churnWithSeedMetadata(t, ctx)
+	rewritten := r.plantOrphan(t, "00000000-0000-0000-0000-00000000ba07-m1.avro", 3*time.Hour)
+
+	r.exp.sweepOrphanMetadataWithHooks(ctx, r.load(t, ctx), &sweepHooks{afterListing: func() {
+		now := time.Now()
+		if err := os.Chtimes(rewritten, now, now); err != nil {
+			t.Fatalf("touch candidate: %v", err)
+		}
+	}})
+
+	if !exists(t, rewritten) {
+		t.Error("sweep deleted a candidate that was rewritten after the first listing")
 	}
 }
 
