@@ -71,7 +71,7 @@ func TestReplaceManifestAfterRewritePublishesImmutableFile(t *testing.T) {
 	}}
 	h := &DeleteHandler{storage: backend, coordinator: coordinator}
 
-	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, nil); err != nil {
+	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, nil, ""); err != nil {
 		t.Fatalf("replace manifest: %v", err)
 	}
 	if len(coordinator.ops) != 2 {
@@ -139,7 +139,7 @@ func TestReplaceManifestAfterRewriteDeletesUnmanifestedSource(t *testing.T) {
 
 	coordinator := &rewriteManifestCoordinator{}
 	h := &DeleteHandler{storage: backend, coordinator: coordinator, logger: zerolog.Nop()}
-	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, nil); err != nil {
+	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(root, oldPath)); !os.IsNotExist(err) {
@@ -178,7 +178,7 @@ func TestPartialRewriteStandaloneDeletesOriginal(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := &DeleteHandler{db: db, storage: backend, logger: logger}
-	if _, err := h.rewriteFileWithoutDeletedRows(context.Background(), full, oldPath, "host = 'h1'"); err != nil {
+	if _, err := h.rewriteFileWithoutDeletedRows(context.Background(), full, oldPath, "host = 'h1'", ""); err != nil {
 		t.Fatal(err)
 	}
 	files, err := backend.List(context.Background(), filepath.Dir(oldPath))
@@ -233,7 +233,7 @@ func TestReplaceManifestAfterRewriteDeletesOriginalObject(t *testing.T) {
 	remote := &struct{ storage.Backend }{Backend: local}
 	h := &DeleteHandler{storage: remote, coordinator: c, logger: zerolog.Nop()}
 	s3 := &s3RewriteResult{newPath: newPath, sizeBytes: 3, sha256: "remote-test"}
-	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, s3); err != nil {
+	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, s3, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(oldFull); !os.IsNotExist(err) {
@@ -270,7 +270,7 @@ func TestRewriteReportsSourceRetiredByConcurrentDelete(t *testing.T) {
 	h := &DeleteHandler{db: db, storage: backend, logger: logger}
 
 	// The source is absent, exactly as it is for the request that loses the mutex race.
-	_, err = h.rewriteFileWithoutDeletedRows(context.Background(), full, relativePath, "host = 'h1'")
+	_, err = h.rewriteFileWithoutDeletedRows(context.Background(), full, relativePath, "host = 'h1'", "")
 	if err == nil {
 		t.Fatal("rewrite of a retired source returned no error")
 	}
@@ -288,7 +288,7 @@ func TestRewriteReportsSourceRetiredByConcurrentDelete(t *testing.T) {
 	if _, err := db.DB().Exec(fmt.Sprintf("COPY src2 TO %q (FORMAT PARQUET)", full)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.rewriteFileWithoutDeletedRows(context.Background(), full, relativePath, "host = 'h1'"); errors.Is(err, errSourceRetired) {
+	if _, err := h.rewriteFileWithoutDeletedRows(context.Background(), full, relativePath, "host = 'h1'", ""); errors.Is(err, errSourceRetired) {
 		t.Errorf("a present source was reported as retired: %v", err)
 	}
 }

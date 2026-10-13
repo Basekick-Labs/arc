@@ -285,8 +285,17 @@ func (c *Coordinator) startIngestFenceLocked() {
 // It admits everything until (and unless) the fence starts. Lock-free.
 func (c *Coordinator) IngestGate() func() error {
 	return func() error {
+		if c.claimedExit.Load() {
+			return fmt.Errorf("%w: %w", ingest.ErrIngestFenced, errTakeoverClaimed)
+		}
 		if c.takeoverGateClosed() {
-			return fmt.Errorf("%w: %v", ingest.ErrIngestFenced, errTakeoverAnnouncing)
+			return fmt.Errorf("%w: %w", ingest.ErrIngestFenced, errTakeoverAnnouncing)
+		}
+		if c.takeoverDesignationRefuses() {
+			return fmt.Errorf("%w: %w", ingest.ErrIngestFenced, errNotDesignated)
+		}
+		if c.deleteAckOwed() {
+			return fmt.Errorf("%w: %w", ingest.ErrIngestFenced, errDeleteAckPending)
 		}
 		if f := c.ingestFence.Load(); f != nil {
 			return f.gate()

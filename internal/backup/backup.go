@@ -63,6 +63,13 @@ func isSourceReadError(err error) bool {
 	return errors.Is(err, errBackupRead)
 }
 
+// objectGone reports whether the store answers, by type, that the object does
+// not exist. A failed check is not an answer.
+func objectGone(ctx context.Context, src storage.Backend, path string) bool {
+	size, err := src.StatFile(ctx, path)
+	return err == nil && size < 0
+}
+
 // BackupOptions controls what gets backed up and where.
 type BackupOptions struct {
 	IncludeMetadata bool // back up the SQLite database
@@ -709,8 +716,8 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	// The cold tier is walked BEFORE the assignment, because its dedup
 	// decision removes paths from the hot set (#1086 stage C, decision 2): a
 	// migration copies to cold before releasing the hot copy, so one path can
-	// be in both listings, and the cold copy is the one that cannot vanish
-	// mid-run.
+	// be in both listings, and the cold copy is the one that vanishes mid-run
+	// only when retention deletes it (#168).
 	//
 	// Built from parquetFiles, the PRE-cross-check listing, not from
 	// dataFiles. A migration deletes the manifest entry before the hot copy,
@@ -1266,10 +1273,11 @@ func (r *backupRun) mergedManifest() *Manifest {
 // The tier also decides whether a source-read failure is survivable. For hot
 // it is: the file may have been deleted by compaction or retention between the
 // listing and the copy, so the file is skipped and the run continues. For cold
-// it is NOT, because nothing in Arc ever deletes a cold object — the hot-only
-// DeleteFileInTier is the only tier delete there is — so a cold read failure
-// means the cold store is unreachable, and skipping would turn that into a
-// backup that reports success while missing the data it was asked to carry.
+// it is only when the object is verifiably gone: retention deletes expired cold
+// objects (#168), so one can vanish between the listing and the copy. Any other
+// cold read failure, or one whose object cannot be checked, means the cold
+// store is unreachable, and skipping would turn that into a backup that reports
+// success while missing the data it was asked to carry.
 func (m *Manager) copyDataFiles(ctx context.Context, leg *backupLeg, files []storage.ObjectInfo, sidecar *sidecarBuilder, src storage.Backend, srcName, tier string) (int64, error) {
 	run := leg.run
 	progress := run.progress
@@ -1315,10 +1323,10 @@ func (m *Manager) copyDataFiles(ctx context.Context, leg *backupLeg, files []sto
 			// else (temp file, seek, backup write) means the environment is broken
 			// and continuing would silently drop files from the backup.
 			//
-			// And never for COLD: see the note on this function. An unreachable
-			// cold store must fail the run, not produce N skips and a green
-			// status.
-			if tier == tierCold || !isSourceReadError(err) {
+			// For COLD, only when the object is verifiably gone: see the note
+			// on this function. An unreachable cold store must fail the run,
+			// not produce N skips and a green status.
+			if !isSourceReadError(err) || (tier == tierCold && !objectGone(ctx, src, obj.Path)) {
 				return skipped, fmt.Errorf("failed to back up %s: %w", obj.Path, err)
 			}
 			skipped++

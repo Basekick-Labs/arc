@@ -437,8 +437,8 @@ type WriterConfig struct {
 	SyncMode     SyncMode      // Sync mode: fsync, fdatasync, async
 	MaxSizeBytes int64         // Rotate WAL when it reaches this size (default: 100MB)
 	MaxAge       time.Duration // Rotate WAL after this duration (default: 1 hour)
-	SyncInterval time.Duration // Sync at most this often (default: 100ms, 0 = sync every write)
-	SyncBytes    int64         // Sync after this many bytes written (default: 1MB, 0 = no byte threshold)
+	SyncInterval time.Duration // Request a sync at least this often while bytes are unsynced (default: 100ms; 0 = default)
+	SyncBytes    int64         // Request a sync once this many bytes are unsynced (default: 1MB; 0 = default)
 	BufferSize   int           // Size of async write buffer (default: 10000)
 	Logger       zerolog.Logger
 }
@@ -475,9 +475,51 @@ type Writer struct {
 	currentSize int64
 	startTime   time.Time
 
-	// Batched sync tracking
-	lastSyncTime   time.Time // Last time we synced
-	bytesSinceSync int64     // Bytes written since last sync
+	// Group commit (#1246). The writer loop never waits for a sync: it writes,
+	// publishes how far it has written, and nudges the syncer goroutine, which
+	// runs fdatasync beside it. A sync covers every byte written before it
+	// started, so one sync answers every durable entry written by then. The
+	// fields below are guarded by syncMu, which is never held across I/O and is
+	// always taken AFTER w.mu when both are held. The syncer never takes w.mu:
+	// w.mu is held across full-file scans (CurrentCheckpointHashes).
+	syncMu sync.Mutex
+	// syncTarget is the file the published bytes are in, and syncGen counts
+	// rotations: a sync whose file was rotated away while it ran must not
+	// advance anything, because the rotation synced and answered that file.
+	syncTarget *os.File
+	syncGen    uint64
+	// writtenBytes counts every byte written since the writer started, across
+	// files; syncedBytes is the writtenBytes value the last completed sync
+	// covered. Unsynced bytes are writtenBytes - syncedBytes.
+	writtenBytes uint64
+	syncedBytes  uint64
+	// syncWaiters are durable entries (flush checkpoints) written but not yet
+	// covered by a sync, in write order. Each is answered exactly once: by the
+	// syncer, by a rotation, or by the shutdown drain.
+	syncWaiters []syncWaiter
+	// syncReq nudges the syncer; capacity 1, so a nudge never blocks and
+	// nudges coalesce. requestedBytes is the writtenBytes value of the last
+	// byte-threshold nudge; writer loop only, no lock.
+	syncReq        chan struct{}
+	requestedBytes uint64
+	// syncFailed asks the writer loop to rotate: Linux reports a writeback
+	// error once, so a later fdatasync on the same file can succeed over pages
+	// that were lost, and a checkpoint appended there could prove nothing.
+	syncFailed atomic.Bool
+	// syncErr is sticky for the current file: once a sync of it fails, every
+	// later completion for it answers its waiters with this error, because a
+	// later sync can succeed over pages whose loss was already reported.
+	// Cleared when the writer rotates to a new file. Guarded by syncMu.
+	syncErr error
+	// syncIOMu serialises the syncs themselves (the syncer's and the inline
+	// ones at rotation and shutdown), and is held until the result is
+	// recorded, so a failure is recorded before any other sync of the file
+	// can start. Lock order: w.mu, then syncIOMu, then syncMu; the syncer
+	// takes only the last two.
+	syncIOMu sync.Mutex
+	// rotateRetryAt delays the next rotation attempt after one failed, so a
+	// full disk is not retried on every entry. Writer loop only.
+	rotateRetryAt time.Time
 
 	// Async write buffer
 	entryChan chan walEntry
@@ -522,8 +564,8 @@ type Writer struct {
 	// sequence (see appendTrackedEntry), so a release can recover it without
 	// a second map. Guarded by pendingMu rather than w.mu, deliberately — the
 	// per-record append path must stay off the writer lock, which is held
-	// across file writes, fsync, rotation, and the full-file scan in
-	// CurrentCheckpointHashes.
+	// across file writes, rotation (which syncs the old file), and the
+	// full-file scan in CurrentCheckpointHashes.
 	pendingMu   sync.Mutex
 	pendingSeqs map[uint64]struct{}
 	closed      bool
@@ -532,6 +574,7 @@ type Writer struct {
 	TotalEntries   int64
 	TotalBytes     int64
 	TotalSyncs     int64
+	FailedSyncs    int64 // Syncs that returned an error
 	TotalRotations int64
 	DroppedEntries int64 // Entries dropped due to full buffer
 	FailedWrites   int64 // Write failures to current WAL file
@@ -567,6 +610,9 @@ func NewWriter(cfg *WriterConfig) (*Writer, error) {
 	if cfg.SyncInterval == 0 {
 		cfg.SyncInterval = 100 * time.Millisecond
 	}
+	if cfg.SyncBytes < 0 {
+		return nil, fmt.Errorf("wal.sync_bytes must not be negative, got %d", cfg.SyncBytes)
+	}
 	if cfg.SyncBytes == 0 {
 		cfg.SyncBytes = 1024 * 1024 // 1MB
 	}
@@ -584,8 +630,8 @@ func NewWriter(cfg *WriterConfig) (*Writer, error) {
 	w := &Writer{
 		config:          *cfg,
 		logger:          cfg.Logger.With().Str("component", "wal-writer").Logger(),
-		lastSyncTime:    time.Now(),
 		entryChan:       make(chan walEntry, cfg.BufferSize),
+		syncReq:         make(chan struct{}, 1),
 		fileSeqs:        make(map[string]*fileSeqState),
 		created:         make(map[string]struct{}),
 		pendingSeqs:     make(map[uint64]struct{}),
@@ -619,14 +665,27 @@ func NewWriter(cfg *WriterConfig) (*Writer, error) {
 		Dur("sync_interval", cfg.SyncInterval).
 		Int64("sync_bytes", cfg.SyncBytes).
 		Int("buffer_size", cfg.BufferSize).
-		Msg("WAL writer initialized (async mode)")
+		Msg("WAL writer initialized (async append, group commit)")
 
 	return w, nil
 }
 
-// writerLoop is the background goroutine that writes entries to disk
+// syncWaiter is a durable entry waiting for a sync that covers it: target is
+// writtenBytes just after the entry was written.
+type syncWaiter struct {
+	target uint64
+	done   chan error
+}
+
+// writerLoop is the background goroutine that writes entries to disk. It owns
+// the syncer goroutine for its lifetime, so a test that pauses and restarts the
+// loop restarts the syncer with it.
 func (w *Writer) writerLoop() {
 	defer w.wg.Done()
+
+	stopSyncer := make(chan struct{})
+	syncerDone := make(chan struct{})
+	go w.syncerLoop(stopSyncer, syncerDone)
 
 	syncTicker := time.NewTicker(w.config.SyncInterval)
 	defer syncTicker.Stop()
@@ -635,31 +694,31 @@ func (w *Writer) writerLoop() {
 		select {
 		case entry := <-w.entryChan:
 			w.processEntry(entry)
+			w.rotateIfSyncFailed()
 
 		case <-syncTicker.C:
-			// Periodic sync
-			w.mu.Lock()
-			if w.bytesSinceSync > 0 {
-				w.sync()
-				w.lastSyncTime = time.Now()
-				w.bytesSinceSync = 0
-				atomic.AddInt64(&w.TotalSyncs, 1)
+			// Bounds how long written bytes stay unsynced when the byte
+			// threshold is not reached.
+			if w.config.SyncMode != SyncModeAsync && w.unsyncedBytes() > 0 {
+				w.nudgeSyncer()
 			}
-			w.mu.Unlock()
+			w.rotateIfSyncFailed()
 
 		case <-w.done:
-			// Drain remaining entries before shutdown
+			// Drain remaining entries before shutdown. The syncer keeps
+			// running meanwhile, so checkpoints written here are still
+			// answered by it.
 			for {
 				select {
 				case entry := <-w.entryChan:
 					w.processEntry(entry)
 				default:
-					// No more entries, final sync and exit
+					// Stop the syncer first, so the final sync below is the only
+					// sync left, then answer every waiter still pending.
+					close(stopSyncer)
+					<-syncerDone
 					w.mu.Lock()
-					if w.bytesSinceSync > 0 {
-						w.sync()
-						atomic.AddInt64(&w.TotalSyncs, 1)
-					}
+					w.syncCurrentLocked()
 					w.mu.Unlock()
 					return
 				}
@@ -668,21 +727,151 @@ func (w *Writer) writerLoop() {
 	}
 }
 
+// syncerLoop runs every sync the writer loop requests, beside it (#1246). It
+// never takes w.mu.
+func (w *Writer) syncerLoop(stop <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	for {
+		select {
+		case <-w.syncReq:
+		case <-stop:
+			return
+		}
+		w.syncIOMu.Lock()
+		w.syncMu.Lock()
+		f, gen, target := w.syncTarget, w.syncGen, w.writtenBytes
+		forceData := len(w.syncWaiters) > 0
+		skip := f == nil || target <= w.syncedBytes ||
+			(!forceData && w.config.SyncMode == SyncModeAsync)
+		w.syncMu.Unlock()
+		if skip {
+			w.syncIOMu.Unlock()
+			continue
+		}
+		// target was read after the writes it counts had returned, and a sync
+		// covers every write completed before it starts, so a successful sync
+		// covers target.
+		err := w.syncFile(f, forceData)
+		w.syncMu.Lock()
+		if gen == w.syncGen {
+			w.completeSyncLocked(target, err, true)
+		}
+		// Otherwise the file was rotated away before this sync ran: the
+		// rotation synced it, answered its waiters and closed it, so this
+		// result (often os.ErrClosed) describes nothing still pending.
+		w.syncMu.Unlock()
+		w.syncIOMu.Unlock()
+	}
+}
+
+// completeSyncLocked records a sync covering target and answers the waiters it
+// covers. Caller holds syncMu. A failed sync still advances syncedBytes: the
+// waiters it covered get the error, and retrying cannot recover pages the
+// kernel already reported lost. The error then sticks to the file, and
+// requestRotate asks the writer loop to move to a new one (the rotation path
+// passes false: it is already rotating).
+func (w *Writer) completeSyncLocked(target uint64, err error, requestRotate bool) {
+	if target > w.syncedBytes {
+		w.syncedBytes = target
+	}
+	if err != nil {
+		atomic.AddInt64(&w.FailedSyncs, 1)
+		metrics.Get().IncWALFailedSyncs()
+		if w.syncErr == nil {
+			w.syncErr = err
+		}
+		if requestRotate {
+			w.syncFailed.Store(true)
+		}
+		w.logger.Error().Err(err).Msg("WAL sync failed; flush checkpoints in this WAL file fail until it is rotated")
+	}
+	atomic.AddInt64(&w.TotalSyncs, 1)
+	answer := w.syncErr
+	n := 0
+	for _, wt := range w.syncWaiters {
+		if wt.target > target {
+			break
+		}
+		wt.done <- answer
+		close(wt.done)
+		n++
+	}
+	w.syncWaiters = w.syncWaiters[n:]
+}
+
+// syncCurrentLocked syncs the current file inline and answers every waiter.
+// Rotation and shutdown use it; caller holds w.mu. It waits for a sync already
+// running on the syncer, so their results cannot interleave.
+func (w *Writer) syncCurrentLocked() {
+	w.syncIOMu.Lock()
+	defer w.syncIOMu.Unlock()
+	w.syncMu.Lock()
+	f, target := w.syncTarget, w.writtenBytes
+	forceData := len(w.syncWaiters) > 0
+	skip := f == nil || (target <= w.syncedBytes && !forceData) ||
+		(!forceData && w.config.SyncMode == SyncModeAsync)
+	w.syncMu.Unlock()
+	if skip {
+		return
+	}
+	err := w.syncFile(f, forceData)
+	w.syncMu.Lock()
+	w.completeSyncLocked(target, err, false)
+	w.syncMu.Unlock()
+}
+
+// unsyncedBytes reports written bytes no completed sync covers yet.
+func (w *Writer) unsyncedBytes() uint64 {
+	w.syncMu.Lock()
+	defer w.syncMu.Unlock()
+	return w.writtenBytes - w.syncedBytes
+}
+
+// nudgeSyncer requests a sync without blocking; nudges coalesce.
+func (w *Writer) nudgeSyncer() {
+	select {
+	case w.syncReq <- struct{}{}:
+	default:
+	}
+}
+
+// rotateIfSyncFailed rotates after a failed sync, on the writer loop. A failed
+// rotation (a full disk, a permission change) is retried at most once a second
+// rather than on every entry.
+func (w *Writer) rotateIfSyncFailed() {
+	if !w.syncFailed.Load() || time.Now().Before(w.rotateRetryAt) {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.rotate(); err != nil {
+		w.rotateRetryAt = time.Now().Add(time.Second)
+		w.logger.Error().Err(err).Msg("Failed to rotate WAL after a sync failure; will retry")
+		return
+	}
+	w.syncFailed.Store(false)
+}
+
 func (w *Writer) processEntry(entry walEntry) {
-	err := w.writeEntry(entry)
+	deferred, err := w.writeEntry(entry)
+	if deferred {
+		return // answered by the sync that covers it
+	}
 	if entry.done != nil {
 		entry.done <- err
 		close(entry.done)
 	}
 }
 
-// writeEntry writes a single entry to the WAL file (called from writerLoop)
-func (w *Writer) writeEntry(entry walEntry) error {
+// writeEntry writes a single entry to the WAL file (called from writerLoop).
+// deferred reports that the entry's reply was handed to the syncer: a durable
+// entry is answered once a sync covering it completes, not here.
+func (w *Writer) writeEntry(entry walEntry) (deferred bool, err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	if entry.rotate {
-		return w.rotate()
+		return false, w.rotate()
 	}
 
 	// Write entry
@@ -696,7 +885,7 @@ func (w *Writer) writeEntry(entry walEntry) error {
 		// permission change, file deleted). A new file might succeed.
 		if rotErr := w.rotate(); rotErr != nil {
 			w.logger.Error().Err(rotErr).Msg("Rotation after write failure also failed, entry lost")
-			return rotErr
+			return false, rotErr
 		}
 
 		// Retry write on the new file. If the original write failed partway
@@ -710,7 +899,7 @@ func (w *Writer) writeEntry(entry walEntry) error {
 			atomic.AddInt64(&w.FailedWrites, 1)
 			metrics.Get().IncWALFailedWrites()
 			w.logger.Error().Err(err).Msg("Retry write after rotation also failed, entry lost")
-			return err
+			return false, err
 		}
 	}
 
@@ -725,35 +914,39 @@ func (w *Writer) writeEntry(entry walEntry) error {
 
 	bytesWritten := int64(n)
 	w.currentSize += bytesWritten
-	w.bytesSinceSync += bytesWritten
 
 	// Update metrics
 	atomic.AddInt64(&w.TotalEntries, 1)
 	atomic.AddInt64(&w.TotalBytes, bytesWritten)
 
+	// Publish the write, and hand a durable entry's reply to the syncer. The
+	// writer does not wait for the sync (#1246): a durable entry is answered
+	// once a sync that started after this write completes, and the entries
+	// behind it are written meanwhile.
+	w.syncMu.Lock()
+	w.writtenBytes += uint64(bytesWritten)
+	if entry.durable && entry.done != nil {
+		w.syncWaiters = append(w.syncWaiters, syncWaiter{target: w.writtenBytes, done: entry.done})
+		deferred = true
+	}
+	written := w.writtenBytes
+	w.syncMu.Unlock()
 	if entry.durable {
-		if err := dataSync(w.currentFile); err != nil {
-			w.logger.Error().Err(err).Msg("WAL checkpoint sync failed")
-			return err
-		}
-		w.lastSyncTime = time.Now()
-		w.bytesSinceSync = 0
-		atomic.AddInt64(&w.TotalSyncs, 1)
-	} else if w.bytesSinceSync >= w.config.SyncBytes {
-		w.sync()
-		w.lastSyncTime = time.Now()
-		w.bytesSinceSync = 0
-		atomic.AddInt64(&w.TotalSyncs, 1)
+		w.nudgeSyncer()
+	} else if w.config.SyncMode != SyncModeAsync && written-w.requestedBytes >= uint64(w.config.SyncBytes) {
+		w.requestedBytes = written
+		w.nudgeSyncer()
 	}
 
-	// Check if rotation needed
+	// Check if rotation needed. A rotation syncs the old file and answers
+	// every waiter, including this entry's.
 	age := time.Since(w.startTime)
 	if w.currentSize >= w.config.MaxSizeBytes || age >= w.config.MaxAge {
 		if err := w.rotate(); err != nil {
 			w.logger.Error().Err(err).Msg("Failed to rotate WAL")
 		}
 	}
-	return nil
+	return deferred, nil
 }
 
 // Rotate closes the active WAL file and starts a new one, and does not return
@@ -854,23 +1047,34 @@ func (w *Writer) rotate() error {
 		return fmt.Errorf("failed to write WAL header: %w", err)
 	}
 
-	// New file is ready — now close the old one (sync any pending data first)
-	if w.currentFile != nil {
-		if w.bytesSinceSync > 0 {
-			w.sync()
-			atomic.AddInt64(&w.TotalSyncs, 1)
-		}
-		w.currentFile.Close()
+	// New file is ready — now close the old one. Sync it first and answer
+	// every waiting durable entry: all of them were written to it. This runs
+	// whatever the sync mode when a durable entry waits, so an async-mode
+	// checkpoint is still synced before it is answered.
+	oldFile := w.currentFile
+	if oldFile != nil {
+		w.syncCurrentLocked()
 	}
 
-	// Swap to new file
+	// Swap to the new file BEFORE closing the old one. The generation moves
+	// under syncMu, so a sync the syncer starts on the old handle afterwards
+	// (and finds closed) is recognised as stale instead of being counted as a
+	// failure of the new file. The sticky error belonged to the old file.
 	w.currentFile = newFile
 	w.currentPath = newPath
 	w.created[newPath] = struct{}{}
 	w.currentSize = int64(n)
 	w.startTime = time.Now()
-	w.lastSyncTime = time.Now()
-	w.bytesSinceSync = 0
+	w.syncMu.Lock()
+	w.syncTarget = newFile
+	w.syncGen++
+	w.syncErr = nil
+	w.writtenBytes += uint64(n)
+	w.syncedBytes = w.writtenBytes
+	w.syncMu.Unlock()
+	if oldFile != nil {
+		oldFile.Close()
+	}
 	atomic.AddInt64(&w.TotalRotations, 1)
 
 	w.logger.Info().Str("file", filename).Msg("WAL rotated")
@@ -1352,28 +1556,30 @@ func (w *Writer) appendRawEntry(payload []byte) error {
 }
 
 // sync syncs the WAL file to disk based on sync mode
-func (w *Writer) sync() {
-	if w.currentFile == nil {
-		return
-	}
-
-	var syncErr error
-	switch w.config.SyncMode {
-	case SyncModeFsync:
+// syncFile syncs f according to the sync mode. forceData syncs file data even
+// in async mode: a durable entry is never answered without a sync.
+func (w *Writer) syncFile(f *os.File, forceData bool) error {
+	switch {
+	case w.config.SyncMode == SyncModeFsync:
 		// Full sync: data + metadata
-		syncErr = w.currentFile.Sync()
-	case SyncModeFdatasync:
+		return syncFileFn(f, true)
+	case w.config.SyncMode == SyncModeFdatasync || forceData:
 		// Data sync only. Real fdatasync(2) on Linux; a full Sync elsewhere,
 		// where Go does not expose it (see datasync_other.go).
-		syncErr = dataSync(w.currentFile)
-	case SyncModeAsync:
-		// No explicit sync, rely on OS buffer cache
-		return
+		return syncFileFn(f, false)
+	default:
+		// Async: no explicit sync, rely on the OS buffer cache.
+		return nil
 	}
+}
 
-	if syncErr != nil {
-		w.logger.Error().Err(syncErr).Msg("WAL sync failed")
+// syncFileFn performs the sync; full selects fsync over fdatasync. A variable
+// so tests can hold a sync in flight.
+var syncFileFn = func(f *os.File, full bool) error {
+	if full {
+		return f.Sync()
 	}
+	return dataSync(f)
 }
 
 // Close closes the WAL writer
@@ -1751,7 +1957,8 @@ func (w *Writer) MinUnflushedSequence() uint64 {
 //
 // Returns the number of files deleted.
 func (w *Writer) PurgeFlushed(minUnflushedSeq uint64) (int, error) {
-	// Listed outside w.mu: the writer loop holds it across fsync.
+	// Listed outside w.mu: the writer loop holds it across rotation, which
+	// syncs the old file.
 	listed, listErr := listWALFilesFn(w.config.WALDir)
 	hold := w.currentHold()
 	w.mu.Lock()
@@ -1845,6 +2052,7 @@ func (w *Writer) Stats() map[string]interface{} {
 		"total_entries":       atomic.LoadInt64(&w.TotalEntries),
 		"total_bytes":         atomic.LoadInt64(&w.TotalBytes),
 		"total_syncs":         atomic.LoadInt64(&w.TotalSyncs),
+		"failed_syncs":        atomic.LoadInt64(&w.FailedSyncs),
 		"total_rotations":     atomic.LoadInt64(&w.TotalRotations),
 		"dropped_entries":     atomic.LoadInt64(&w.DroppedEntries),
 		// The purge floor's working set. Climbs while flushes fail and does

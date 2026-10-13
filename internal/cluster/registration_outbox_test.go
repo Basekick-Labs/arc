@@ -44,10 +44,12 @@ type fakeOutboxManifest struct {
 	supersedes  []string                // Supersedes carried by registrations
 	refuse      func(path string) bool  // a claim refuses this registration
 	pending     map[string]map[string]raft.PendingRegistrationPayload
+	refuseKind  string            // the refusal's kind (default claimed)
+	deleteSeen  map[string]uint64 // DeleteSeen carried by registrations
 }
 
 func newFakeOutboxManifest() *fakeOutboxManifest {
-	return &fakeOutboxManifest{registered: map[string]raft.FileEntry{}, existing: map[string]bool{}, pending: map[string]map[string]raft.PendingRegistrationPayload{}}
+	return &fakeOutboxManifest{registered: map[string]raft.FileEntry{}, existing: map[string]bool{}, pending: map[string]map[string]raft.PendingRegistrationPayload{}, deleteSeen: map[string]uint64{}}
 }
 
 func (m *fakeOutboxManifest) WaitForLeader(time.Duration) error {
@@ -125,8 +127,18 @@ func (m *fakeOutboxManifest) BatchFileOpsInManifestContext(_ context.Context, op
 		}
 		entries = append(entries, p.File)
 		paths = append(paths, p.File.Path)
+		m.mu.Lock()
+		kind := m.refuseKind
+		if m.deleteSeen == nil {
+			m.deleteSeen = map[string]uint64{}
+		}
+		m.deleteSeen[p.File.Path] = p.DeleteSeen
+		m.mu.Unlock()
+		if kind == "" {
+			kind = raft.RefusedClaimed
+		}
 		if refuse != nil && refuse(p.File.Path) {
-			refused = append(refused, raft.RefusedOp{Op: i, Kind: raft.RefusedClaimed})
+			refused = append(refused, raft.RefusedOp{Op: i, Kind: kind})
 		}
 		m.mu.Lock()
 		m.coverage = append(m.coverage, p.Cov2...)

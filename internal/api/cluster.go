@@ -182,6 +182,7 @@ func (h *ClusterHandler) RegisterRoutes(app *fiber.App) {
 		takeoverGroup.Use(auth.RequireAdmin(h.authManager))
 	}
 	takeoverGroup.Get("", h.handleGetStreamClaims)
+	takeoverGroup.Post("/:instance/release", h.handleReleaseStreamClaim)
 }
 
 // handleGetStreamClaims returns the writer processes, claims and departed
@@ -194,6 +195,53 @@ func (h *ClusterHandler) handleGetStreamClaims(c *fiber.Ctx) error {
 		})
 	}
 	return c.JSON(h.coordinator.StreamTakeover())
+}
+
+// releaseStreamClaimRequest is the body of
+// POST /api/v1/cluster/stream-claims/:instance/release. The epoch names the
+// claim: a later claim of the same instance is not released by mistake.
+type releaseStreamClaimRequest struct {
+	Epoch uint64 `json:"epoch"`
+	// Abandon finishes the claim instead: its unpublished batches are left
+	// to their origin (lost when the origin is gone).
+	Abandon bool `json:"abandon"`
+}
+
+// handleReleaseStreamClaim releases an unfinished stream claim whose
+// claimant cannot finish it, so another writer may take the instance over,
+// or abandons it ({"abandon": true}).
+// The instance is the 16-digit hex id the GET lists. Leader only.
+func (h *ClusterHandler) handleReleaseStreamClaim(c *fiber.Ctx) error {
+	if h.coordinator == nil {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"success": false,
+			"error":   "clustering is not enabled on this node",
+		})
+	}
+	inst, err := strconv.ParseUint(c.Params("instance"), 16, 64)
+	if err != nil || inst == 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"success": false, "error": "instance must be the hex id listed by GET /api/v1/cluster/stream-claims"})
+	}
+	var req releaseStreamClaimRequest
+	if err := json.Unmarshal(c.Body(), &req); err != nil || req.Epoch == 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"success": false, "error": "body must be {\"epoch\": n}, the epoch GET /api/v1/cluster/stream-claims lists for the claim"})
+	}
+	if err := h.coordinator.ReleaseStreamClaim(inst, req.Epoch, req.Abandon); err != nil {
+		status := fiber.StatusInternalServerError
+		switch {
+		case errors.Is(err, cluster.ErrStreamClaimNotFound):
+			status = fiber.StatusNotFound
+		case errors.Is(err, cluster.ErrStreamClaimFinished),
+			errors.Is(err, cluster.ErrNotLeaderForTopology),
+			errors.Is(err, cluster.ErrClusterRaftNotConfigured):
+			status = fiber.StatusConflict
+		}
+		if status == fiber.StatusInternalServerError {
+			h.logger.Error().Err(err).Msg("Failed to release a stream claim")
+		}
+		return c.Status(status).JSON(fiber.Map{"success": false, "error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"success": true, "instance": fmt.Sprintf("%016x", inst), "epoch": req.Epoch, "abandoned": req.Abandon})
 }
 
 // convergeVotersRequest is the body of POST /api/v1/cluster/voters/converge.

@@ -106,6 +106,12 @@ type DeleteHandler struct {
 	tempDir   string
 	rewriteMu sync.Mutex
 	logger    zerolog.Logger
+	// flusher is the ingest buffer: a DELETE flushes the rows acknowledged
+	// before it first (nil on nodes that do not ingest).
+	flusher DeleteFlusher
+	// recordID is the DELETE record of the rewrite running (under
+	// rewriteMu), 0 without one.
+	recordID uint64
 }
 
 // DeleteRequest represents a delete operation request
@@ -115,6 +121,10 @@ type DeleteRequest struct {
 	Where       string `json:"where"`
 	DryRun      bool   `json:"dry_run"`
 	Confirm     bool   `json:"confirm"`
+	// AllowUnreachable runs the DELETE although files the cluster manifest
+	// lists are not on this node (stream takeover): their rows are not
+	// deleted, and the response names them.
+	AllowUnreachable bool `json:"allow_unreachable,omitempty"`
 }
 
 // DeleteResponse represents a delete operation response
@@ -127,7 +137,10 @@ type DeleteResponse struct {
 	DryRun          bool     `json:"dry_run"`
 	FilesProcessed  []string `json:"files_processed"`
 	FailedFiles     []string `json:"failed_files,omitempty"`
-	Error           string   `json:"error,omitempty"`
+	// UnreachableFiles are manifest files this node did not have: with
+	// allow_unreachable, skipped; without it, why the DELETE was refused.
+	UnreachableFiles []string `json:"unreachable_files,omitempty"`
+	Error            string   `json:"error,omitempty"`
 }
 
 // DeleteConfigResponse represents delete configuration info
@@ -144,6 +157,9 @@ type affectedFile struct {
 	path         string
 	matchCount   int64
 	relativePath string
+	// sha is the file's manifest checksum when it was scanned, with
+	// compaction commit on (#1207 d2); "" for a file pending registration.
+	sha string
 }
 
 // Dangerous punctuation patterns for WHERE clause validation (exact substring match)
@@ -304,6 +320,13 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 			Error:   "database name contains invalid characters",
 		})
 	}
+	// Arc's own state (_schema anchors, _compaction_state), not a database (#1012).
+	if storage.IsReservedRootDir(req.Database) {
+		return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{
+			Success: false,
+			Error:   "database name is reserved for Arc's own storage",
+		})
+	}
 	if !isSafeStoragePathSegment(req.Measurement) || storage.ValidateGlobSafe(req.Measurement) != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{
 			Success: false,
@@ -352,7 +375,6 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		Bool("dry_run", req.DryRun).
 		Msg("Processing delete request")
 
-	// Find affected files
 	ctx := c.Context()
 	if !req.DryRun {
 		if syncer, ok := h.coordinator.(interface {
@@ -367,7 +389,43 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 			}
 		}
 	}
-	affected, err := h.findAffectedFiles(ctx, req.Database, req.Measurement, req.Where, !req.DryRun)
+	// With stream takeover on, the DELETE is recorded in the cluster and
+	// applied again to rows acknowledged before it that reach a file later
+	// (#1207 d1): its time functions are fixed to now.
+	var rec deleteRecorder
+	var marks map[string]uint64
+	where := req.Where
+	if !req.DryRun {
+		if rec = recorderOf(h.coordinator); rec != nil {
+			if where, err = pinDeleteTime(req.Where, deleteNow()); err != nil {
+				return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{Success: false, Error: err.Error()})
+			}
+		}
+		if marks, err = h.flushBeforeDelete(ctx, req.Database, req.Measurement); err != nil {
+			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete rejected: " + err.Error() + "; retry shortly"})
+		}
+	}
+	var unreachable []string
+	// With compaction commit on, the scan sees only files the manifest lists
+	// (#1207 d2): one listed and not here yet (a compaction output on its
+	// way) must arrive first, or its rows are missed.
+	var waiter localFileWaiter
+	if rec != nil {
+		waiter = rec
+	} else if c, ok := h.coordinator.(compactionCommitter); ok && !req.DryRun && c.CompactionCommitActive() {
+		waiter = c
+	}
+	if waiter != nil {
+		if unreachable, err = h.waitLocalFiles(ctx, waiter, req.Database, req.Measurement, req.AllowUnreachable); err != nil {
+			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete rejected: " + err.Error() + "; retry, or set allow_unreachable=true to skip them", UnreachableFiles: unreachable})
+		}
+	}
+
+	// Find affected files
+	affected, err := h.findAffectedFiles(ctx, req.Database, req.Measurement, where, !req.DryRun)
+	if errors.Is(err, errManifestNotSynced) {
+		return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete rejected: " + err.Error() + "; retry shortly"})
+	}
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to find affected files")
 		status := fiber.StatusInternalServerError
@@ -381,7 +439,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 
-	if len(affected) == 0 {
+	if len(affected) == 0 && rec == nil {
 		// findAffectedFiles scanned parquet files via read_parquet — clear the cache even though
 		// no rows matched, to avoid accumulating metadata for files that may later be deleted.
 		h.db.ClearHTTPCache()
@@ -450,8 +508,44 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	// same source must not both read and publish from the same pre-delete
 	// snapshot. DELETE is already dominated by Parquet rewrite I/O; serialize
 	// the rewrite phase rather than letting one request multiply another.
+	// Held from the record on: the outbox applies records to pending files
+	// under it too, and must not rewrite one between the scan and its use.
 	h.rewriteMu.Lock()
 	defer h.rewriteMu.Unlock()
+	h.recordID = 0
+	if rec != nil {
+		// Recorded before the rewrite: rows of its scope that reach a file
+		// from now on are rewritten without the matching ones. Then the
+		// files registered before it are scanned again, here.
+		id, err := rec.RecordDelete(ctx, req.Database, req.Measurement, where, marks)
+		if err != nil {
+			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete not run: recording it in the cluster failed or could not be confirmed (" + err.Error() + "); it may already apply to rows replayed later; retry to run it"})
+		}
+		h.recordID = id
+		if unreachable, err = h.waitLocalFiles(ctx, rec, req.Database, req.Measurement, req.AllowUnreachable); err != nil {
+			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete recorded, not run: " + err.Error() + "; rows the cluster replays later are already filtered; retry, or set allow_unreachable=true to skip them", UnreachableFiles: unreachable})
+		}
+		if affected, err = h.findAffectedFiles(ctx, req.Database, req.Measurement, where, true); errors.Is(err, errManifestNotSynced) {
+			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete recorded, not run: " + err.Error() + "; retry shortly"})
+		} else if errors.Is(err, errPendingRegistration) {
+			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete recorded, not run: " + err.Error() + "; retry after registration completes"})
+		} else if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(DeleteResponse{
+				Success: false, Error: "Delete recorded, not run: failed to find affected files: " + err.Error(),
+				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+			})
+		}
+		var again int64
+		for _, f := range affected {
+			again += f.matchCount
+		}
+		if again > totalToDelete {
+			// Files that arrived since the first count; the DELETE is
+			// recorded already, so it runs on them too.
+			h.logger.Warn().Int64("counted", totalToDelete).Int64("now", again).
+				Msg("More rows match the delete than when it was checked against its limits; files arrived since")
+		}
+	}
 
 	h.logger.Info().
 		Int("file_count", len(affected)).
@@ -462,45 +556,91 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	var rewrittenCount int
 	processedFiles := make([]string, 0, len(affected))
 	failedFiles := make([]string, 0, len(affected))
+	// Across the scans after files changed under the DELETE (#1207 d2): every
+	// file it looked at, and those that failed (not retried by a later scan).
+	seen := make(map[string]bool, len(affected))
+	failed := map[string]bool{}
 
-	for _, f := range affected {
-		deleted, err := h.rewriteFileWithoutDeletedRows(ctx, f.path, f.relativePath, req.Where)
-		if err != nil {
-			// Post-rewrite bookkeeping/storage failures still mean the rows were
-			// removed from the newly published file. rewriteFileWithoutDeletedRows
-			// returns zero only when the manifest was not committed and the old
-			// file remains authoritative.
-			totalDeleted += deleted
-			h.logger.Error().Err(err).Str("file", f.path).Msg("Failed to rewrite file")
-			// Manifest failures are non-transient (Raft quorum loss) — abort the
-			// entire operation to avoid deleting files from storage without a
-			// corresponding manifest record.
-			if errors.Is(err, errManifestFailure) {
-				h.db.ClearHTTPCache()
-				freeOSMemoryThrottled()
-				return c.Status(fiber.StatusInternalServerError).JSON(DeleteResponse{
-					Success:         false,
-					Error:           "Delete aborted: " + err.Error(),
-					DeletedCount:    totalDeleted,
-					AffectedFiles:   len(affected),
-					RewrittenFiles:  rewrittenCount,
-					FilesProcessed:  processedFiles,
-					FailedFiles:     failedFiles,
-					ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
-				})
+	for round := 0; ; round++ {
+		var changed []string
+		for _, f := range affected {
+			if failed[f.relativePath] {
+				continue
 			}
-			failedFiles = append(failedFiles, filepath.Base(f.path))
-			continue
+			seen[f.relativePath] = true
+			deleted, err := h.rewriteFileWithoutDeletedRows(ctx, f.path, f.relativePath, where, f.sha)
+			if err != nil && casActive(h.coordinator) && (errors.Is(err, errFileChanged) || errors.Is(err, errSourceRetired)) {
+				// A compaction replaced the file while this DELETE ran (#1207
+				// d2): its output holds the rows now. Scanned again below.
+				changed = append(changed, f.relativePath)
+				continue
+			}
+			if err != nil {
+				// Post-rewrite bookkeeping/storage failures still mean the rows were
+				// removed from the newly published file. rewriteFileWithoutDeletedRows
+				// returns zero only when the manifest was not committed and the old
+				// file remains authoritative.
+				totalDeleted += deleted
+				h.logger.Error().Err(err).Str("file", f.path).Msg("Failed to rewrite file")
+				// Manifest failures are non-transient (Raft quorum loss) — abort the
+				// entire operation to avoid deleting files from storage without a
+				// corresponding manifest record.
+				if errors.Is(err, errManifestFailure) {
+					h.db.ClearHTTPCache()
+					freeOSMemoryThrottled()
+					return c.Status(fiber.StatusInternalServerError).JSON(DeleteResponse{
+						Success:         false,
+						Error:           "Delete aborted: " + err.Error(),
+						DeletedCount:    totalDeleted,
+						AffectedFiles:   len(seen),
+						RewrittenFiles:  rewrittenCount,
+						FilesProcessed:  processedFiles,
+						FailedFiles:     failedFiles,
+						ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+					})
+				}
+				failed[f.relativePath] = true
+				failedFiles = append(failedFiles, filepath.Base(f.path))
+				continue
+			}
+			totalDeleted += deleted
+
+			rewrittenCount++
+			processedFiles = append(processedFiles, filepath.Base(f.path))
+
+			h.logger.Debug().
+				Str("file", filepath.Base(f.path)).
+				Int64("deleted", deleted).
+				Msg("Processed file")
 		}
-		totalDeleted += deleted
-
-		rewrittenCount++
-		processedFiles = append(processedFiles, filepath.Base(f.path))
-
-		h.logger.Debug().
-			Str("file", filepath.Base(f.path)).
-			Int64("deleted", deleted).
-			Msg("Processed file")
+		if len(changed) == 0 {
+			break
+		}
+		incomplete := func(why string) error {
+			h.db.ClearHTTPCache()
+			freeOSMemoryThrottled()
+			return respondDeleteUnavailable(c, DeleteResponse{
+				Error:            "Delete incomplete: " + why + "; the rows of the other files are deleted; retry to finish",
+				DeletedCount:     totalDeleted,
+				AffectedFiles:    len(seen),
+				RewrittenFiles:   rewrittenCount,
+				FilesProcessed:   processedFiles,
+				FailedFiles:      failedFiles,
+				UnreachableFiles: unreachable,
+				ExecutionTimeMs:  float64(time.Since(start).Milliseconds()),
+			})
+		}
+		if round+1 >= deleteChangedRounds {
+			return incomplete(fmt.Sprintf("%d files kept changing under it (compaction)", len(changed)))
+		}
+		h.logger.Info().Int("files", len(changed)).Int("round", round+1).
+			Msg("Files changed under the delete (compaction replaced them); scanning again")
+		var missing []string
+		affected, missing, err = h.rescanAfterChange(ctx, req.Database, req.Measurement, where, req.AllowUnreachable)
+		unreachable = mergeUnreachable(unreachable, missing)
+		if err != nil {
+			return incomplete(err.Error())
+		}
 	}
 
 	// Clear DuckDB parquet metadata/data cache and release memory back to OS.
@@ -517,18 +657,19 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		Msg("Delete operation completed")
 
 	resp := DeleteResponse{
-		Success:         len(failedFiles) == 0,
-		DeletedCount:    totalDeleted,
-		AffectedFiles:   len(affected),
-		RewrittenFiles:  rewrittenCount,
-		ExecutionTimeMs: executionTime,
-		DryRun:          false,
-		FilesProcessed:  processedFiles,
-		FailedFiles:     failedFiles,
+		Success:          len(failedFiles) == 0,
+		DeletedCount:     totalDeleted,
+		AffectedFiles:    len(seen),
+		RewrittenFiles:   rewrittenCount,
+		ExecutionTimeMs:  executionTime,
+		DryRun:           false,
+		FilesProcessed:   processedFiles,
+		FailedFiles:      failedFiles,
+		UnreachableFiles: unreachable,
 	}
 
 	if len(failedFiles) > 0 {
-		resp.Error = fmt.Sprintf("%d of %d files failed to process", len(failedFiles), len(affected))
+		resp.Error = fmt.Sprintf("%d of %d files failed to process", len(failedFiles), len(seen))
 		return c.Status(fiber.StatusMultiStatus).JSON(resp)
 	}
 
@@ -677,6 +818,17 @@ func (h *DeleteHandler) findAffectedFiles(ctx context.Context, database, measure
 		})
 	}
 
+	// With compaction commit on (#1207 d2), only files the cluster lists, or
+	// this node is still registering, are the DELETE's: anything else in
+	// storage is not data yet (a compaction output before its commit) or no
+	// longer (an input after it), and rewriting it would orphan the rewrite.
+	var shas map[string]string
+	if casActive(h.coordinator) {
+		if parquetFiles, shas, err = h.registeredOrPending(ctx, parquetFiles); err != nil {
+			return nil, err
+		}
+	}
+
 	if len(parquetFiles) == 0 {
 		h.logger.Warn().Str("prefix", prefix).Msg("No parquet files found for measurement")
 		return affected, nil
@@ -690,9 +842,13 @@ func (h *DeleteHandler) findAffectedFiles(ctx context.Context, database, measure
 	if err != nil {
 		// Fallback to individual queries if batch fails (e.g., schema mismatch)
 		h.logger.Warn().Err(err).Msg("Batch count failed, falling back to individual queries")
-		return h.countMatchingRowsIndividually(ctx, parquetFiles, whereClause)
+		if affected, err = h.countMatchingRowsIndividually(ctx, parquetFiles, whereClause); err != nil {
+			return affected, err
+		}
 	}
-
+	for i := range affected {
+		affected[i].sha = shas[affected[i].relativePath]
+	}
 	return affected, nil
 }
 
@@ -810,7 +966,7 @@ func (h *DeleteHandler) countMatchingRowsIndividually(ctx context.Context, files
 // rewriteFileWithoutDeletedRows rewrites a Parquet file excluding rows that match the WHERE clause
 // For local storage: uses atomic rename
 // For S3: downloads, processes locally, then uploads
-func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, queryPath, relativePath, whereClause string) (int64, error) {
+func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, queryPath, relativePath, whereClause, scanSHA string) (int64, error) {
 	if pending, ok := h.coordinator.(interface{ HasPendingRegistration(string) bool }); ok && pending.HasPendingRegistration(relativePath) {
 		return 0, fmt.Errorf("%w: %s; retry the delete after registration completes", errPendingRegistration, relativePath)
 	}
@@ -852,7 +1008,14 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 		// gone (#1210). Taken out of the outbox first; if it was confirmed
 		// meanwhile, the manifest delete below removes it.
 		if h.pending != nil {
-			if _, _, err := h.pending.Withdraw(ctx, relativePath); err != nil {
+			withdraw := h.pending.Withdraw
+			if w, ok := h.pending.(deleteWithdrawer); ok && h.recordID != 0 {
+				// Batches of another writer process settle as deleted too.
+				withdraw = func(ctx context.Context, path string) (bool, cluster.ReplaceOutcome, error) {
+					return w.WithdrawForDelete(ctx, path, h.recordID)
+				}
+			}
+			if _, _, err := withdraw(ctx, relativePath); err != nil {
 				return 0, fmt.Errorf("withdraw pending registration for %s: %w", relativePath, err)
 			}
 		}
@@ -861,11 +1024,26 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 		// removing from storage. If the manifest update fails (Raft quorum loss),
 		// abort — the file still exists in storage and the next delete will retry.
 		if h.coordinator != nil {
-			payload, err := json.Marshal(raft.DeleteFilePayload{Path: relativePath, Reason: "delete"})
+			// With compaction commit on, the delete removes the content this
+			// DELETE read, never a file a compaction replaced meanwhile (#1207 d2).
+			expect := ""
+			if casActive(h.coordinator) {
+				expect = scanSHA
+				if expect == "" {
+					// Pending when scanned: confirmed since, or withdrawn above.
+					if e, ok := h.coordinator.GetFileEntry(relativePath); ok {
+						expect = e.SHA256
+					}
+				}
+			}
+			payload, err := json.Marshal(raft.DeleteFilePayload{Path: relativePath, Reason: "delete", ExpectSHA: expect})
 			if err != nil {
 				return 0, fmt.Errorf("%w: marshal failed for %s: %v", errManifestFailure, relativePath, err)
 			}
 			if err := h.coordinator.BatchFileOpsInManifest([]raft.BatchFileOp{{Type: raft.CommandDeleteFile, Payload: payload}}); err != nil {
+				if raft.IsManifestChanged(err) {
+					return 0, fmt.Errorf("%w: %s", errFileChanged, filepath.Base(relativePath))
+				}
 				return 0, fmt.Errorf("%w: %v", errManifestFailure, err)
 			}
 		}
@@ -907,8 +1085,8 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 		return rewroteDeleted, nil
 	}
 	if h.coordinator != nil {
-		if err := h.replaceManifestAfterRewrite(ctx, relativePath, rewrittenPath, s3Result); err != nil {
-			if errors.Is(err, errManifestFailure) {
+		if err := h.replaceManifestAfterRewrite(ctx, relativePath, rewrittenPath, s3Result, scanSHA); err != nil {
+			if errors.Is(err, errManifestFailure) || errors.Is(err, errFileChanged) {
 				return 0, err
 			}
 			return rewroteDeleted, err
@@ -1149,7 +1327,7 @@ func (h *DeleteHandler) rewrittenFileMetadata(newPath string, s3 *s3RewriteResul
 // file. Registering the new path and deleting the old path in one Raft command
 // means followers never have to infer a content change from size/checksum on an
 // existing path (#975).
-func (h *DeleteHandler) replaceManifestAfterRewrite(ctx context.Context, oldPath, newPath string, s3 *s3RewriteResult) error {
+func (h *DeleteHandler) replaceManifestAfterRewrite(ctx context.Context, oldPath, newPath string, s3 *s3RewriteResult, scanSHA string) error {
 	existing, ok := h.coordinator.GetFileEntry(oldPath)
 	if !ok && h.pending != nil {
 		// Not in the manifest yet may mean pending: flushed by this node and
@@ -1180,6 +1358,10 @@ func (h *DeleteHandler) replaceManifestAfterRewrite(ctx context.Context, oldPath
 		}
 		switch outcome {
 		case cluster.ReplaceSwapped:
+			if st, ok := h.pending.(deleteSeenStamper); ok && h.recordID != 0 {
+				// Rewritten with this DELETE: no second pass for its record.
+				st.SetDeleteSeen(newPath, h.recordID)
+			}
 			if err := h.storage.Delete(ctx, oldPath); err != nil {
 				return fmt.Errorf("failed to delete superseded pending rewrite %q: %w", oldPath, err)
 			}
@@ -1193,6 +1375,15 @@ func (h *DeleteHandler) replaceManifestAfterRewrite(ctx context.Context, oldPath
 			cleanupRewrite()
 			return errors.Join(errManifestFailure, cluster.ErrRegistrationParked)
 		}
+	}
+	if !ok && casActive(h.coordinator) {
+		// Gone from the manifest since the scan (a compaction replaced it):
+		// its rows live in the compaction's output, which a scan finds. The
+		// file itself is not this DELETE's to remove.
+		if err := h.storage.Delete(ctx, newPath); err != nil {
+			h.logger.Warn().Err(err).Str("file", newPath).Msg("Failed to clean up a rewrite that was not announced")
+		}
+		return fmt.Errorf("%w: %s", errFileChanged, filepath.Base(oldPath))
 	}
 	if !ok {
 		h.logger.Warn().
@@ -1219,11 +1410,21 @@ func (h *DeleteHandler) replaceManifestAfterRewrite(ctx context.Context, oldPath
 	// The rewrite holds the old file's rows minus the deleted ones: it takes
 	// over the old file's batch coverage (#1207 S4b).
 	entry.Coverage = nil
-	registerPayload, err := json.Marshal(raft.RegisterFilePayload{File: entry, InheritFrom: oldPath})
+	// With compaction commit on, both ops apply only to the content this
+	// DELETE read: a compaction that replaced the file meanwhile wins, and
+	// the DELETE scans again (#1207 d2).
+	expect := ""
+	if casActive(h.coordinator) {
+		expect = scanSHA
+		if expect == "" {
+			expect = existing.SHA256
+		}
+	}
+	registerPayload, err := json.Marshal(raft.RegisterFilePayload{File: entry, InheritFrom: oldPath, InheritSHA: expect})
 	if err != nil {
 		return fmt.Errorf("%w: marshal replacement register: %v", errManifestFailure, err)
 	}
-	deletePayload, err := json.Marshal(raft.DeleteFilePayload{Path: oldPath, Reason: "delete-rewrite"})
+	deletePayload, err := json.Marshal(raft.DeleteFilePayload{Path: oldPath, Reason: "delete-rewrite", ExpectSHA: expect})
 	if err != nil {
 		return fmt.Errorf("%w: marshal replacement delete: %v", errManifestFailure, err)
 	}
@@ -1236,6 +1437,9 @@ func (h *DeleteHandler) replaceManifestAfterRewrite(ctx context.Context, oldPath
 		// orphan if publication failed. The cleanup is best-effort.
 		if cleanupErr := h.storage.Delete(ctx, newPath); cleanupErr != nil {
 			h.logger.Warn().Err(cleanupErr).Str("file", newPath).Msg("Failed to clean up unregistered rewrite")
+		}
+		if raft.IsManifestChanged(err) {
+			return fmt.Errorf("%w: %s", errFileChanged, filepath.Base(oldPath))
 		}
 		return errors.Join(errManifestFailure, fmt.Errorf("replace rewritten file in manifest: %w", err))
 	}
@@ -1250,4 +1454,11 @@ func (h *DeleteHandler) replaceManifestAfterRewrite(ctx context.Context, oldPath
 		return fmt.Errorf("manifest committed but failed to delete superseded rewrite %q: %w", oldPath, err)
 	}
 	return nil
+}
+
+// respondDeleteUnavailable answers 503 with a retry hint.
+func respondDeleteUnavailable(c *fiber.Ctx, resp DeleteResponse) error {
+	resp.Success = false
+	c.Set(fiber.HeaderRetryAfter, "30")
+	return c.Status(fiber.StatusServiceUnavailable).JSON(resp)
 }

@@ -164,6 +164,40 @@ const (
 	CommandInstanceSettled
 	// CommandExtendStreamClaim: a claimant adding keys to its unfinished claim.
 	CommandExtendStreamClaim
+	// CommandRecordDelete: the primary recording a row DELETE (#1207 d1).
+	CommandRecordDelete
+	// CommandRecordDeleteAck: a writer acknowledging a DELETE record that
+	// names its current instance.
+	CommandRecordDeleteAck
+	// CommandSettleDeleted: a writer settling batches a DELETE removed every
+	// row of.
+	CommandSettleDeleted
+	// Compaction commit (#1207 d2), see compaction_commit.go. Every one but
+	// the enable is refused until the flag is applied.
+	//
+	// CommandEnableCompactionCommit turns the flag on, once, when every node
+	// supports it.
+	CommandEnableCompactionCommit
+	// CommandStageCompaction: a compactor staging a job's output and inputs.
+	CommandStageCompaction
+	// CommandCompactionHeld: a node holding a staged output durably.
+	CommandCompactionHeld
+	// CommandCommitCompaction: a compactor registering a staged output and
+	// deleting its inputs, if they are unchanged.
+	CommandCommitCompaction
+	// CommandAbortCompaction: dropping a staged job.
+	CommandAbortCompaction
+	// CommandFinalizeCompaction: an object-store job whose output is in the
+	// bucket; its input objects are deleted next.
+	CommandFinalizeCompaction
+	// CommandRevertCompaction: an object-store job whose output never
+	// reached the bucket; its inputs are registered again.
+	CommandRevertCompaction
+	// CommandCleanupCompaction: a finalized object-store job whose input
+	// objects are gone.
+	CommandCleanupCompaction
+	// Pending-registration commands are appended after the current command set
+	// so existing wire numbers remain unchanged.
 	// CommandSetPendingRegistration publishes a file registration intent before
 	// the writer checkpoints the WAL. Intents protect shared storage from
 	// destructive maintenance on other nodes.
@@ -260,6 +294,13 @@ type FileEntry struct {
 	// (#1207 S4b). Set only by the FSM, from RegisterFilePayload.Cov2 while
 	// stream takeover is enabled; a client-supplied value is ignored.
 	Coverage []InstanceCoverage `json:"cov2,omitempty"`
+	// CoverageInherited: Coverage came from the file a DELETE rewrite
+	// replaced (rows of it were deleted): never republished from a standby
+	// copy, which still holds the deleted rows.
+	CoverageInherited bool `json:"cov2_inherited,omitempty"`
+	// CompactionJob: the compaction job whose commit registered the file
+	// (#1207 d2). Set only by the FSM; a client-supplied value is ignored.
+	CompactionJob string `json:"compaction_job,omitempty"`
 }
 
 // RegisterFilePayload is the payload for CommandRegisterFile.
@@ -275,12 +316,23 @@ type RegisterFilePayload struct {
 	// InheritFrom names a registered file this one rewrites (a row DELETE):
 	// the file takes over that file's coverage.
 	InheritFrom string `json:"inherit_from,omitempty"`
+	// InheritSHA is the checksum of InheritFrom the rewrite was made from.
+	// With compaction commit on, the registration is refused unless
+	// InheritFrom is still registered (at InheritSHA when set) (#1207 d2).
+	InheritSHA string `json:"inherit_sha,omitempty"`
+	// DeleteSeen is the newest DELETE record the file's rows were filtered
+	// against (#1207 d1); 0 when none was applied to it.
+	DeleteSeen uint64 `json:"delete_seen,omitempty"`
 }
 
 // DeleteFilePayload is the payload for CommandDeleteFile.
 type DeleteFilePayload struct {
 	Path   string `json:"path"`
 	Reason string `json:"reason,omitempty"` // "retention", "compaction", "manual"
+	// ExpectSHA, with compaction commit on, refuses the delete unless the
+	// file is registered with this checksum (#1207 d2): a row DELETE removes
+	// the content it read, never a file that changed under it.
+	ExpectSHA string `json:"expect_sha,omitempty"`
 }
 
 // BarrierPayload is the payload for CommandBarrier. Token is chosen by the
@@ -499,6 +551,9 @@ type FSMSnapshot struct {
 	// StreamClaims: the flag and the claims (#1207). nil in an older
 	// snapshot, read as "off, none".
 	StreamClaims *streamClaimsState `json:"stream_claims,omitempty"`
+	// CompactionCommit: the flag and the staged jobs (#1207 d2). nil in an
+	// older snapshot, or before the flag was applied.
+	CompactionCommit *compactionCommitState `json:"compaction_commit,omitempty"`
 }
 
 // ClusterFSM implements the raft.FSM interface for cluster state management.
@@ -514,13 +569,17 @@ type ClusterFSM struct {
 	applyStarted atomic.Uint64
 	applyDone    atomic.Uint64
 
-	mu                   sync.RWMutex
-	nodes                map[string]*NodeInfo
-	primaryWriterID      string                                           // ID of the current primary writer node
-	primaryFast          atomic.Value                                     // string; mirror of primaryWriterID (setPrimaryLocked)
-	activeCompactorID    string                                           // ID of the node currently holding the compactor lease
-	files                map[string]*FileEntry                            // File manifest (path → entry) for peer replication
-	pendingRegistrations map[string]map[string]PendingRegistrationPayload // path -> owner/registration identity -> intent
+	mu              sync.RWMutex
+	nodes           map[string]*NodeInfo
+	primaryWriterID string       // ID of the current primary writer node
+	primaryFast     atomic.Value // string; mirror of primaryWriterID for lock-free reads (setPrimaryLocked)
+	// unackedDeletes: the instances a live DELETE record names that have not
+	// acknowledged it, for the lock-free ingest gate (delete_records.go).
+	unackedDeletes    atomic.Pointer[map[uint64]bool]
+	activeCompactorID string                // ID of the node currently holding the compactor lease
+	files             map[string]*FileEntry // File manifest (path → entry) for peer replication
+	// path -> owner/registration identity -> intent.
+	pendingRegistrations map[string]map[string]PendingRegistrationPayload
 	// Secondary index: database → set of file paths. Maintained alongside
 	// the primary `files` map on register/delete to avoid O(N) scans when
 	// filtering by database.
@@ -674,6 +733,10 @@ type ClusterFSM struct {
 	// Stream claims (#1207), under mu. See stream_claims.go, takeover.go.
 	streamClaims bool
 	takeover     *takeoverState
+	// compactionCommit is the #1207 d2 flag; staged holds the jobs between
+	// StageCompaction and their end.
+	compactionCommit bool
+	staged           map[string]*StagedCompaction
 
 	// Callbacks for state changes
 	onNodeAdded          func(*NodeInfo)
@@ -754,6 +817,7 @@ func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 		tokenMembershipsByToken: make(map[int64]map[int64]struct{}),
 		tokenMembershipsByTeam:  make(map[int64]map[int64]struct{}),
 		takeover:                newTakeoverState(),
+		staged:                  map[string]*StagedCompaction{},
 
 		logger: logger.With().Str("component", "cluster-fsm").Logger(),
 	}
@@ -1118,6 +1182,31 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 	case CommandExtendStreamClaim:
 		defer f.bumpTakeoverGen()
 		return f.applyExtendStreamClaim(cmd.Payload, log.Index)
+	case CommandRecordDelete:
+		defer f.bumpTakeoverGen()
+		return f.applyRecordDelete(cmd.Payload, log.Index)
+	case CommandRecordDeleteAck:
+		defer f.bumpTakeoverGen()
+		return f.applyRecordDeleteAck(cmd.Payload)
+	case CommandSettleDeleted:
+		defer f.bumpTakeoverGen()
+		return f.applySettleDeleted(cmd.Payload)
+	case CommandEnableCompactionCommit:
+		return f.applyEnableCompactionCommit(cmd.Payload)
+	case CommandStageCompaction:
+		return f.applyStageCompaction(cmd.Payload, log.Index)
+	case CommandCompactionHeld:
+		return f.applyCompactionHeld(cmd.Payload)
+	case CommandCommitCompaction:
+		return f.applyCommitCompaction(cmd.Payload, log.Index)
+	case CommandAbortCompaction:
+		return f.applyAbortCompaction(cmd.Payload)
+	case CommandFinalizeCompaction:
+		return f.applyFinalizeCompaction(cmd.Payload)
+	case CommandRevertCompaction:
+		return f.applyRevertCompaction(cmd.Payload, log.Index)
+	case CommandCleanupCompaction:
+		return f.applyCleanupCompaction(cmd.Payload)
 	case CommandDeleteFile:
 		return f.applyDeleteFile(cmd.Payload)
 	case CommandAssignCompactor:
@@ -1420,6 +1509,7 @@ func (f *ClusterFSM) applyRemoveNode(payload []byte) interface{} {
 	}
 	removed := f.nodes[p.NodeID]
 	delete(f.nodes, p.NodeID)
+	f.compactionNodeRemovedLocked(p.NodeID)
 	// Removing the designated primary has to release the designation, or the
 	// record names a node that no longer exists and the election — which only
 	// runs when nothing is designated — never fires again. Removing the dead
@@ -1619,6 +1709,7 @@ func (f *ClusterFSM) applyRegisterFile(payload []byte, logIndex uint64) interfac
 		return fmt.Errorf("failed to unmarshal register file payload: %w", err)
 	}
 	sanitizeCoverage(&p)
+	p.File.CompactionJob = ""
 	return f.applyRegisterFileStruct(p, logIndex)
 }
 
@@ -1644,6 +1735,10 @@ func (f *ClusterFSM) applyRegisterFileStruct(p RegisterFilePayload, logIndex uin
 	}
 
 	f.mu.Lock()
+	if p.InheritFrom != "" && f.compactionCommit && !f.registeredAtLocked(p.InheritFrom, p.InheritSHA) {
+		f.mu.Unlock()
+		return &ManifestChangedError{Paths: []string{p.InheritFrom}}
+	}
 	if refused, ok := f.takeoverRefusalLocked(p, nil, nil); ok {
 		f.mu.Unlock()
 		return &StreamClaimConflictError{Ops: []RefusedOp{refused}}
@@ -1726,6 +1821,10 @@ func (f *ClusterFSM) applyDeleteFileStruct(p DeleteFilePayload) interface{} {
 	}
 
 	f.mu.Lock()
+	if p.ExpectSHA != "" && f.compactionCommit && !f.registeredAtLocked(p.Path, p.ExpectSHA) {
+		f.mu.Unlock()
+		return &ManifestChangedError{Paths: []string{p.Path}}
+	}
 	emit := f.applyDeleteFileLocked(p)
 	f.mu.Unlock()
 
@@ -1747,6 +1846,7 @@ func (f *ClusterFSM) applyDeleteFileLocked(p DeleteFilePayload) func() {
 		for _, c := range existing.Coverage {
 			f.takeoverVanishedLocked(c, fileHour(*existing), f.applyStarted.Load())
 		}
+		f.takeoverNoteVanishedLocked(*existing)
 	}
 	delete(f.files, p.Path)
 	if existed {
@@ -1837,6 +1937,11 @@ func (f *ClusterFSM) applyUpdateFileLocked(p UpdateFilePayload, logIndex uint64)
 	entry.Coverage = nil
 	if existed {
 		entry.Coverage = old.Coverage
+	}
+	// So is the compaction job that registered it (#1207 d2).
+	entry.CompactionJob = ""
+	if existed {
+		entry.CompactionJob = old.CompactionJob
 	}
 	contentChanged := existed && (old.SHA256 != entry.SHA256 || old.SizeBytes != entry.SizeBytes)
 	// If the database changed (defensive), remove the old secondary index entry first.
@@ -1959,6 +2064,7 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 				return fmt.Errorf("batch file ops: op[%d]: register file: created_at is required", i)
 			}
 			sanitizeCoverage(&rp)
+			rp.File.CompactionJob = ""
 			decoded[i] = rp
 		case CommandUpdateFile:
 			var up UpdateFilePayload
@@ -2018,8 +2124,12 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 	// instead of one per Raft entry.
 	inherited := make([][]InstanceCoverage, len(p.Ops))
 	f.mu.RLock()
+	changed := f.manifestCASRefusalsLocked(p.Ops, decoded)
 	refused := f.batchTakeoverRefusalsLocked(p.Ops, decoded, inherited)
 	f.mu.RUnlock()
+	if len(changed) > 0 {
+		return &ManifestChangedError{Paths: changed}
+	}
 	if len(refused) > 0 {
 		return &StreamClaimConflictError{Ops: refused}
 	}
@@ -2693,7 +2803,8 @@ func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 	}
 
 	return &fsmSnapshot{
-		streamClaims: claimsState,
+		compactionCommit: f.snapshotCompactionCommitLocked(),
+		streamClaims:     claimsState,
 		// Raft does not call Apply and Snapshot concurrently, so the two
 		// counters agree here.
 		appliedIndex:           f.applyDone.Load(),
@@ -3055,6 +3166,8 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		f.takeover = restoreTakeover(sc.Takeover)
 	}
 	f.takeover.gen = prevGen + 1
+	f.refreshUnackedDeletesLocked()
+	f.restoreCompactionCommitLocked(snapshot.CompactionCommit)
 	onCompactionPauseChanged := f.onCompactionPauseChanged
 	f.nodes = restoredNodes
 	f.barriers = restoredBarriers
@@ -3438,6 +3551,7 @@ type fsmSnapshot struct {
 	compactionPause        *CompactionPauseState
 	appliedIndex           uint64
 	streamClaims           *streamClaimsState
+	compactionCommit       *compactionCommitState
 }
 
 // Persist writes the snapshot to the given sink.
@@ -3458,6 +3572,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 		CompactionPause:        s.compactionPause,
 		AppliedIndex:           s.appliedIndex,
 		StreamClaims:           s.streamClaims,
+		CompactionCommit:       s.compactionCommit,
 	}
 
 	data, err := json.Marshal(snapshot)

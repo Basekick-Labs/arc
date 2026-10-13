@@ -527,15 +527,20 @@ func (r *RegistrationOutbox) parkedResolvable(ctx context.Context, e *parkedEntr
 	if !exact {
 		return false
 	}
+	covered := r.parkedCoveredFunc()
 	sets := map[uint64]raft.Intervals{}
 	for _, rg := range ranges {
-		if len(tk.UncoveredBatches(rg.Instance, rec.Cov.Key, rg.Lo, rg.Hi, rec.PartitionTime)) > 0 {
-			return false
+		for _, iv := range tk.UncoveredBatches(rg.Instance, rec.Cov.Key, rg.Lo, rg.Hi, rec.PartitionTime) {
+			for c := iv[0]; c <= iv[1]; c++ {
+				if !covered(rg.Instance, rec.Cov.Key, c, rec.PartitionTime) {
+					return false
+				}
+			}
 		}
 		sets[rg.Instance] = append(sets[rg.Instance], [2]uint64{rg.Lo, rg.Hi})
 	}
 	for _, p := range partial {
-		if !tk.CoverageCovered(p.Instance, rec.Cov.Key, rawPiece(p), rec.PartitionTime) {
+		if !tk.CoverageCovered(p.Instance, rec.Cov.Key, rawPiece(p), rec.PartitionTime) && !covered(p.Instance, rec.Cov.Key, p.CSeq, rec.PartitionTime) {
 			return false
 		}
 		sets[p.Instance] = append(sets[p.Instance], [2]uint64{p.CSeq, p.CSeq})
@@ -596,6 +601,27 @@ func (r *RegistrationOutbox) resolve(e *parkedEntry, p *LocalParking) error {
 	metrics.Get().SetWALParked(r.parkedStats())
 	r.logger.Info().Str("path", e.rec.Rec.Path).Msg("Parked file removed: every one of its rows is in a registered file this node holds")
 	return nil
+}
+
+// ParkedCoveredFunc reports whether every parked row of a batch in an hour
+// is registered, where the manifest cannot tell (a whole batch republished
+// in chunks or row ranges, #1207 S4b1c2b).
+type ParkedCoveredFunc func(inst uint64, key string, cseq uint64, hour time.Time) bool
+
+// SetParkedCovered installs the republisher's verdicts for the resolution.
+func (r *RegistrationOutbox) SetParkedCovered(fn ParkedCoveredFunc) {
+	if fn == nil {
+		r.parkedCovered.Store(nil)
+		return
+	}
+	r.parkedCovered.Store(&fn)
+}
+
+func (r *RegistrationOutbox) parkedCoveredFunc() ParkedCoveredFunc {
+	if p := r.parkedCovered.Load(); p != nil {
+		return *p
+	}
+	return func(uint64, string, uint64, time.Time) bool { return false }
 }
 
 // IsParked reports whether path is a parked registration.

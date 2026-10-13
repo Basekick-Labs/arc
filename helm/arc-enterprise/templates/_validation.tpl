@@ -17,6 +17,7 @@ that template, so validation fires exactly once).
 {{- include "arc-enterprise.validate.license" . -}}
 {{- include "arc-enterprise.validate.sharedSecret" . -}}
 {{- include "arc-enterprise.validate.tls" . -}}
+{{- include "arc-enterprise.validate.bootstrapToken" . -}}
 {{- /* Mode/shape checks (IRSA-with-bundled and external creds) run before
      the bundled-credentials check, so an operator who misconfigured the
      mode gets the pointed message, not a generic missing-creds one. */ -}}
@@ -69,6 +70,19 @@ the chart does not generate certificates. Enforced only when TLS is on.
 {{- define "arc-enterprise.validate.tls" -}}
 {{- if and .Values.cluster.tls.enabled (not .Values.cluster.tls.existingSecret) -}}
 {{- fail "cluster.tls.existingSecret is required when cluster.tls.enabled=true" -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Arc refuses a bootstrap token shorter than 32 characters, logs one error and
+starts with no admin token, so the install looks healthy and nobody can log
+in. Checked only when the chart creates the Secret from the value.
+*/}}
+{{- define "arc-enterprise.validate.bootstrapToken" -}}
+{{- if and (not .Values.auth.bootstrapToken.existingSecret) .Values.auth.bootstrapToken.value -}}
+{{- if lt (len .Values.auth.bootstrapToken.value) 32 -}}
+{{- fail "auth.bootstrapToken.value must be at least 32 characters long" -}}
+{{- end -}}
 {{- end -}}
 {{- end }}
 

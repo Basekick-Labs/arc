@@ -784,6 +784,27 @@ func (s *MetadataStore) GetFilesOlderThan(ctx context.Context, tier Tier, maxAge
 	return s.scanFiles(rows)
 }
 
+// GetColdFilesForRetention returns one database's cold rows whose partition
+// starts before partitionBefore, quarantined rows included (retention counts
+// them and leaves them alone). Filtered in SQL: the table holds every
+// database's rows, and this runs once per retention execution.
+func (s *MetadataStore) GetColdFilesForRetention(ctx context.Context, database string, partitionBefore time.Time) ([]FileMetadata, error) {
+	query := `
+		SELECT ` + tierFileColumns + `
+		FROM tier_files
+		WHERE tier = ? AND database = ? AND partition_time < ?
+		ORDER BY measurement ASC, partition_time ASC
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, string(TierCold), database, partitionBefore.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("failed to query cold files for retention: %w", err)
+	}
+	defer rows.Close()
+
+	return s.scanFiles(rows)
+}
+
 // GetRecentlyMigratedFiles retrieves files in a tier that were migrated within the given window.
 // Used by reconciliation to limit the working set to recently-migrated files.
 // Quarantined rows are excluded for the same reason as in GetFilesOlderThan.

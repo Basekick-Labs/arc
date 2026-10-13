@@ -457,6 +457,10 @@ type WALConfig struct {
 	RecoveryIntervalSeconds int    // Interval for periodic WAL recovery in seconds (default: 300 = 5 minutes)
 	RecoveryBatchSize       int    // Max records to replay per batch during recovery (default: 10000)
 	BufferSize              int    // Async write buffer size in entries (default: 10000)
+	// SyncBytes requests a sync once this many WAL bytes are unsynced
+	// (default: 1 MiB). Syncs run beside the writer (#1246), so this bounds how
+	// much written data a sync may leave behind, not the writer's throughput.
+	SyncBytes int64
 }
 
 type TelemetryConfig struct {
@@ -554,8 +558,7 @@ type QueryConfig struct {
 
 // LicenseConfig holds configuration for enterprise license validation
 type LicenseConfig struct {
-	Enabled bool   // Enable license validation (default: false)
-	Key     string // License key (ARC-ENT-XXXX-XXXX-XXXX-XXXX)
+	Key string // License key (ARC-ENT-XXXX-XXXX-XXXX-XXXX)
 	// FilePath points at an offline license file downloaded from the
 	// activation server admin ({license_file, license_signature}). When set it
 	// WINS over Key: the license is verified entirely from disk against the
@@ -1115,6 +1118,7 @@ func Load() (*Config, error) {
 			RecoveryIntervalSeconds: v.GetInt("wal.recovery_interval_seconds"),
 			RecoveryBatchSize:       v.GetInt("wal.recovery_batch_size"),
 			BufferSize:              v.GetInt("wal.buffer_size"),
+			SyncBytes:               v.GetInt64("wal.sync_bytes"),
 		},
 		Telemetry: TelemetryConfig{
 			Enabled:         v.GetBool("telemetry.enabled"),
@@ -1173,7 +1177,6 @@ func Load() (*Config, error) {
 			S3CacheTTLSeconds:             v.GetInt("query.s3_cache_ttl_seconds"),
 		},
 		License: LicenseConfig{
-			Enabled:  v.GetBool("license.enabled"),
 			Key:      v.GetString("license.key"),
 			FilePath: strings.TrimSpace(v.GetString("license.file_path")),
 		},
@@ -1903,6 +1906,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("wal.recovery_interval_seconds", 300) // Periodic recovery every 5 minutes
 	v.SetDefault("wal.recovery_batch_size", 10000)     // Max records per recovery batch (rate limiting)
 	v.SetDefault("wal.buffer_size", 10000)             // Async write buffer size in entries
+	v.SetDefault("wal.sync_bytes", 1024*1024)          // Request a sync once this many bytes are unsynced
 
 	// Telemetry defaults
 	v.SetDefault("telemetry.enabled", true)                                               // Enabled by default (opt-out)
@@ -1955,9 +1959,8 @@ func setDefaults(v *viper.Viper) {
 
 	// License defaults (Enterprise features)
 	// Note: Server URL and validation interval are hardcoded in internal/license/client.go
-	v.SetDefault("license.enabled", false) // Disabled by default
-	v.SetDefault("license.key", "")        // Must be provided
-	v.SetDefault("license.file_path", "")  // Offline license file (air-gapped); wins over license.key
+	v.SetDefault("license.key", "")       // Must be provided
+	v.SetDefault("license.file_path", "") // Offline license file (air-gapped); wins over license.key
 
 	// Scheduler defaults (Enterprise features)
 	// Note: CQ and retention schedulers are auto-enabled when their features are enabled AND license allows

@@ -175,11 +175,14 @@ type Metrics struct {
 	streamClaimsEnabled  atomic.Int64 // 1 once stream claims are applied (#1207 S4a)
 	streamClaims         atomic.Int64 // stream claims held in the FSM
 	departedWriters      atomic.Int64 // writers that left gracefully and have not re-joined (#1207)
+	oldestClaimAge       atomic.Int64 // seconds the oldest unfinished stream claim has been open (#1207)
+	unpulledFiles        atomic.Int64 // files of claimed instances this claimant does not hold yet (#1207)
 	walCoverageRefused   atomic.Int64 // batches whose file was refused: another writer claimed them
 	walRecoveryTotal     atomic.Int64 // Successful WAL recovery operations
 	walRecoveryRecords   atomic.Int64 // Total records recovered from WAL
 	walDroppedEntries    atomic.Int64 // Entries dropped due to full WAL buffer
 	walFailedWrites      atomic.Int64 // Write failures to WAL file
+	walFailedSyncs       atomic.Int64 // WAL fsync/fdatasync failures
 	walOversizedPayloads atomic.Int64 // Payloads rejected for exceeding the single-entry cap even after chunking (#677)
 	walDirectoryBytes    atomic.Int64 // Current bytes occupied by every file in the WAL directory
 
@@ -615,6 +618,19 @@ func (m *Metrics) AddStandbyStoreTrimmedBytes(n int64) { m.standbyStoreTrimmedBy
 func (m *Metrics) IncStandbyStoreDropped()             { m.standbyStoreDropped.Add(1) }
 func (m *Metrics) AddStandbyStoreEvictedBytes(n int64) { m.standbyStoreEvicted.Add(n) }
 func (m *Metrics) SetDepartedWriters(n int64)          { m.departedWriters.Store(n) }
+
+// SetOldestStreamClaimAge records how long the oldest unfinished stream
+// claim has been open, in seconds (0: none).
+func (m *Metrics) SetOldestStreamClaimAge(seconds int64) {
+	m.oldestClaimAge.Store(seconds)
+}
+
+// SetStreamTakeoverUnpulledFiles sets how many registered files of the
+// instances this node is claiming it does not hold yet.
+func (m *Metrics) SetStreamTakeoverUnpulledFiles(n int64) {
+	m.unpulledFiles.Store(n)
+}
+
 func (m *Metrics) SetStreamClaims(enabled bool, claims int64) {
 	if enabled {
 		m.streamClaimsEnabled.Store(1)
@@ -638,6 +654,7 @@ func (m *Metrics) IncWALRecoveryTotal()              { m.walRecoveryTotal.Add(1)
 func (m *Metrics) IncWALRecoveryRecords(count int64) { m.walRecoveryRecords.Add(count) }
 func (m *Metrics) IncWALDroppedEntries()             { m.walDroppedEntries.Add(1) }
 func (m *Metrics) IncWALFailedWrites()               { m.walFailedWrites.Add(1) }
+func (m *Metrics) IncWALFailedSyncs()                { m.walFailedSyncs.Add(1) }
 func (m *Metrics) IncWALOversizedPayloads()          { m.walOversizedPayloads.Add(1) }
 func (m *Metrics) SetWALDirectoryBytes(bytes int64)  { m.walDirectoryBytes.Store(bytes) }
 
@@ -935,11 +952,14 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"stream_claims_enabled":            m.streamClaimsEnabled.Load(),
 		"stream_claims":                    m.streamClaims.Load(),
 		"stream_takeover_departed_writers": m.departedWriters.Load(),
+		"stream_takeover_oldest_claim_age": m.oldestClaimAge.Load(),
+		"stream_takeover_unpulled_files":   m.unpulledFiles.Load(),
 		"wal_coverage_refused":             m.walCoverageRefused.Load(),
 		"wal_recovery_total":               m.walRecoveryTotal.Load(),
 		"wal_recovery_records":             m.walRecoveryRecords.Load(),
 		"wal_dropped_entries":              m.walDroppedEntries.Load(),
 		"wal_failed_writes":                m.walFailedWrites.Load(),
+		"wal_failed_syncs":                 m.walFailedSyncs.Load(),
 		"wal_oversized_payloads":           m.walOversizedPayloads.Load(),
 		"wal_directory_bytes":              m.walDirectoryBytes.Load(),
 		"file_registrations_pending":       m.fileRegistrationsPending.Load(),
@@ -1392,6 +1412,12 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_stream_takeover_departed_writers Writers that left the cluster gracefully and have not re-joined; their takeover state expires after cluster.stream_takeover_departed_ttl\n"...)
 	b = append(b, "# TYPE arc_stream_takeover_departed_writers gauge\n"...)
 	b = appendMetric(b, "arc_stream_takeover_departed_writers", float64(m.departedWriters.Load()))
+	b = append(b, "# HELP arc_stream_takeover_oldest_claim_age_seconds How long the oldest unfinished stream claim has been open (0: none); a claim that does not finish keeps DELETEs of its measurements waiting\n"...)
+	b = append(b, "# TYPE arc_stream_takeover_oldest_claim_age_seconds gauge\n"...)
+	b = appendMetric(b, "arc_stream_takeover_oldest_claim_age_seconds", float64(m.oldestClaimAge.Load()))
+	b = append(b, "# HELP arc_stream_takeover_unpulled_files Registered files of the writer instances this node is taking over that it does not hold yet; a claim finishes only once it holds them, or they are found gone from every node\n"...)
+	b = append(b, "# TYPE arc_stream_takeover_unpulled_files gauge\n"...)
+	b = appendMetric(b, "arc_stream_takeover_unpulled_files", float64(m.unpulledFiles.Load()))
 
 	b = append(b, "# HELP arc_wal_coverage_refused_total Batches whose file the cluster refused because another writer claimed them\n"...)
 	b = append(b, "# TYPE arc_wal_coverage_refused_total counter\n"...)
@@ -1412,6 +1438,9 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_failed_writes_total WAL write failures\n"...)
 	b = append(b, "# TYPE arc_wal_failed_writes_total counter\n"...)
 	b = appendMetric(b, "arc_wal_failed_writes_total", float64(m.walFailedWrites.Load()))
+	b = append(b, "# HELP arc_wal_failed_syncs_total WAL fsync/fdatasync failures; each forces a rotation to a new WAL file\n"...)
+	b = append(b, "# TYPE arc_wal_failed_syncs_total counter\n"...)
+	b = appendMetric(b, "arc_wal_failed_syncs_total", float64(m.walFailedSyncs.Load()))
 
 	b = append(b, "# HELP arc_wal_oversized_payloads_total Payloads rejected for exceeding the single-entry cap even after chunking\n"...)
 	b = append(b, "# TYPE arc_wal_oversized_payloads_total counter\n"...)

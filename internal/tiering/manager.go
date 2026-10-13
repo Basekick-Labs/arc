@@ -763,6 +763,59 @@ func (m *Manager) DeleteFile(ctx context.Context, path string) error {
 	return m.metadata.DeleteFile(ctx, path)
 }
 
+// GetColdFilesForRetention returns the cold rows of one database whose
+// partition starts before cutoff: every cold file that can hold a row older
+// than cutoff, since a file's rows are never older than its partition start.
+// The partition is only the index. Retention reads each file's max(time)
+// before it deletes anything. Quarantined rows are included so retention can
+// report them; it never acts on one (#758).
+func (m *Manager) GetColdFilesForRetention(ctx context.Context, database string, cutoff time.Time) ([]FileMetadata, error) {
+	if m == nil || m.metadata == nil {
+		return nil, nil
+	}
+	return m.metadata.GetColdFilesForRetention(ctx, database, cutoff)
+}
+
+// RetireColdRows removes the cold rows of objects retention deleted or found
+// already gone. A row that is no longer cold is left alone. Reports how many
+// rows were removed; on error, how many were removed before it.
+func (m *Manager) RetireColdRows(ctx context.Context, paths []string) (int, error) {
+	if m == nil || m.metadata == nil {
+		return 0, nil
+	}
+	removed := 0
+	for _, path := range paths {
+		ok, err := m.metadata.DeleteFileInTier(ctx, path, TierCold, time.Time{})
+		if err != nil {
+			return removed, err
+		}
+		if ok {
+			removed++
+		}
+	}
+	return removed, nil
+}
+
+// RevertColdRowToHot points a cold row whose cold object is gone back at the
+// hot copy of the same file, as orphan reconciliation does. Deleting the row
+// instead would unregister a hot file the query path still has to read.
+func (m *Manager) RevertColdRowToHot(ctx context.Context, path string) error {
+	if m == nil || m.metadata == nil {
+		return nil
+	}
+	return m.metadata.UpdateTier(ctx, path, TierHot)
+}
+
+// NotifyColdFilesRemoved drops the query caches after retention removed cold
+// objects. A cached read can still name the cold tier's glob, and a glob that
+// now matches nothing turns the whole read into "no files".
+func (m *Manager) NotifyColdFilesRemoved(n int) {
+	if m == nil {
+		return
+	}
+	m.notifyMigrationComplete(n, 0)
+}
+
 // GetStatus returns the current tiering status
 func (m *Manager) GetStatus(ctx context.Context) (*StatusResponse, error) {
 	status := &StatusResponse{

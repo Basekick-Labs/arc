@@ -139,12 +139,19 @@ type Coordinator struct {
 	// Stream claims (#1207 S4a): streamClaimsMu serializes the join gate
 	// with the enable proposal on the leader. See stream_claims.go.
 	streamClaimsMu       sync.Mutex
-	streamClaimsProposer atomic.Bool // the enable loop runs (not in S4a)
+	streamClaimsProposer atomic.Bool // the enable loop runs
 	nodeIDWarn           sync.Once   // stream takeover without an explicit node id, logged once
 	streamClaimsBlockers atomic.Pointer[[]string]
+	// compactionCommit: the #1207 d2 flag's join gate and blockers.
+	compactionCommit     compactionCommitGate
 	walCoverageActive    atomic.Bool // SetWALCoverageActive
 	ingestFenceListeners []func(fenced bool)
 	takeoverOrigin       atomic.Pointer[takeoverOriginState] // SetTakeoverOrigin (#1207 S4b)
+	claimedExit          atomic.Bool                         // another writer claimed this process: refuse writes, exit (#1207)
+	claimant             atomic.Pointer[claimant]            // StartOriginStream with stream takeover (#1207)
+	deleteRecords        atomic.Pointer[deleteRecordState]   // StartOriginStream with stream takeover (#1207 d1)
+	deleteRewriter       atomic.Pointer[DeleteRewriter]      // SetDeleteRewriter
+	deleteOutbox         atomic.Pointer[RegistrationOutbox]  // the outbox the DELETE hooks are on
 	pauseNotifyMu        sync.Mutex                          // ingestPauseChanged
 	pauseNotified        bool
 	pauseState           bool
@@ -170,6 +177,12 @@ type Coordinator struct {
 	// puller is the background worker pool that downloads files from peers.
 	// Nil when peer replication is disabled or the license forbids it.
 	puller *filereplication.Puller
+	// fetcher is the puller's fetch client: the stream claimant probes peers
+	// for a file with it (#1207 S4b1c2b).
+	fetcher filereplication.Fetcher
+	// pendingRegistration reports whether a path waits for registration in
+	// this writer's outbox (nil on other nodes).
+	pendingRegistration atomic.Pointer[func(string) bool]
 	// catchupOnce guarantees the Phase 3 catch-up walker runs at most once
 	// per coordinator lifetime, across repeated Start/Stop cycles in tests.
 	catchupOnce sync.Once
@@ -692,6 +705,13 @@ func (c *Coordinator) Start() error {
 	// "simplify" this by passing a TTL.
 	c.nonceCache = security.NewNonceCache(security.HMACTimestampTolerance)
 
+	// Before the accept loop: a join admitted from now on goes through the
+	// stream claims gate's slow path (#1207). Any node with the setting may
+	// propose the flag (a reader can be the Raft leader); coverage is a
+	// writer's requirement, carried by its advertised capability.
+	proposer := c.cfg.StreamTakeover && c.raftNode != nil && !c.cfg.SharedStorageMode
+	c.streamClaimsProposer.Store(proposer)
+
 	// Start Raft node if configured (Phase 3)
 	if c.raftNode != nil {
 		if err := c.raftNode.Start(); err != nil {
@@ -759,8 +779,15 @@ func (c *Coordinator) Start() error {
 	// Refuse writes on a writer that may no longer be the primary (#1207).
 	c.startIngestFenceLocked()
 	go c.streamClaimsMetricsLoop(c.ctx)
+	if proposer {
+		go c.streamClaimsEnableLoop(c.ctx)
+	}
+	if c.raftNode != nil {
+		go c.compactionCommitEnableLoop(c.ctx)
+	}
 	if c.cfg.StreamTakeover && c.raftNode != nil {
 		go c.departedExpiryLoop(c.ctx)
+		go c.streamClaimAutoReleaseLoop(c.ctx)
 	}
 	if c.cfg.StreamTakeover && c.raftNode != nil && c.takeoverOrigin.Load() != nil {
 		go c.streamTakeoverOriginLoop(c.ctx)
@@ -878,6 +905,7 @@ func (c *Coordinator) Stop() error {
 	if !c.leaving.CompareAndSwap(false, true) {
 		return nil
 	}
+	c.finalTakeoverReport()
 	c.broadcastLeave()
 	// Before c.mu is taken: stopOriginStream takes it, and joins goroutines
 	// that read coordinator state.
@@ -2054,10 +2082,19 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 			c.sendJoinError(conn, req, why)
 			return
 		}
+		ccWhy, ccRelease := c.compactionCommitJoinGate(req)
+		if ccWhy != "" {
+			release()
+			c.logger.Error().Str("node_id", req.NodeID).Str("role", req.Role).Str("reason", ccWhy).
+				Msg("Join refused: the node does not support compaction commit")
+			c.sendJoinError(conn, req, ccWhy)
+			return
+		}
 		joinGateReleased := false
 		releaseGate := func() {
 			if !joinGateReleased {
 				joinGateReleased = true
+				ccRelease()
 				release()
 			}
 		}
@@ -3037,6 +3074,7 @@ func (c *Coordinator) Status() map[string]interface{} {
 	// which nodes keep them off.
 	if c.raftNode != nil {
 		status["stream_claims"] = c.StreamClaimsStatus()
+		status["compaction_commit"] = c.CompactionCommitStatus()
 	}
 
 	// Add Raft status if configured (Phase 3)
@@ -4412,6 +4450,10 @@ func (c *Coordinator) startFilePullerLocked() error {
 	// Start the puller workers.
 	puller.Start(context.Background())
 	c.puller = puller
+	c.fetcher = fetchClient
+	if backend.Type() == "local" {
+		go c.vanishedSweepLoop(c.ctx)
+	}
 
 	c.logger.Info().
 		Int("workers", pullerCfg.Workers).

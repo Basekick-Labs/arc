@@ -33,7 +33,25 @@ type DatabasesHandler struct {
 	logger         zerolog.Logger
 	icebergDropper IcebergCatalogDropper
 	fieldSchema    *fieldschema.Registry // optional, #914: anchors die with their database
+	// flusher and pending: a database deletion flushes the rows acknowledged
+	// before it and withdraws its pending registrations (#1207 d1).
+	flusher DeleteFlusher
+	pending DatabasePendingRegistrations
 }
+
+// DatabasePendingRegistrations withdraws every pending registration of a
+// database, so none registers after it is gone.
+type DatabasePendingRegistrations interface {
+	// record is the deletion's DELETE record (0 without one): batches of
+	// another writer process settle as deleted by it.
+	WithdrawDatabase(ctx context.Context, database string, record uint64) error
+}
+
+// SetFlusher installs the ingest buffer (nil on nodes that do not ingest).
+func (h *DatabasesHandler) SetFlusher(f DeleteFlusher) { h.flusher = f }
+
+// SetPendingRegistrations installs this node's registration outbox.
+func (h *DatabasesHandler) SetPendingRegistrations(p DatabasePendingRegistrations) { h.pending = p }
 
 type databaseTieringManager interface {
 	GetMetadata() *tiering.MetadataStore
@@ -428,6 +446,12 @@ func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
 			"error": fmt.Sprintf("invalid database name %q", name),
 		})
 	}
+	// Arc's own state, not a database: the list hides it, so this does too (#1012).
+	if storage.IsReservedRootDir(name) {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"error": "Database '" + name + "' not found",
+		})
+	}
 
 	// Gate on the resolved database, the same bar `SHOW TABLES FROM db`
 	// applies. Checked AFTER name validation so an invalid name is a 400
@@ -487,6 +511,11 @@ func (h *DatabasesHandler) handleListMeasurements(c *fiber.Ctx) error {
 	if !isSafeStoragePathSegment(name) {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": fmt.Sprintf("invalid database name %q", name),
+		})
+	}
+	if storage.IsReservedRootDir(name) {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"error": "Database '" + name + "' not found",
 		})
 	}
 
@@ -663,6 +692,37 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "Database '" + name + "' not found",
 		})
+	}
+
+	// Rows acknowledged before the deletion and not in a file yet are flushed
+	// first, so they go with it. With stream takeover on, it is recorded in
+	// the cluster: rows of the database acknowledged before it that reach a
+	// file later are dropped (#1207 d1).
+	marks, err := flushBeforeDelete(ctx, h.flusher, name, "")
+	if err != nil {
+		c.Set(fiber.HeaderRetryAfter, "30")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "database deletion rejected: " + err.Error() + "; retry shortly",
+		})
+	}
+	var recordID uint64
+	if rec := recorderOf(h.coordinator); rec != nil {
+		if recordID, err = rec.RecordDelete(ctx, name, "", "", marks); err != nil {
+			c.Set(fiber.HeaderRetryAfter, "30")
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"error": "database deletion not run: recording it in the cluster failed or could not be confirmed (" + err.Error() + "); it may already apply to rows replayed later; retry to run it",
+			})
+		}
+	}
+	if h.pending != nil {
+		// Before any file is removed: an entry left pending would settle as
+		// lost once its file is gone, and stay claimable.
+		if err := h.pending.WithdrawDatabase(ctx, name, recordID); err != nil {
+			c.Set(fiber.HeaderRetryAfter, "30")
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"error": "database deletion not run: pending file registrations could not be withdrawn (" + err.Error() + "); retry shortly",
+			})
+		}
 	}
 
 	// List all files in the database
