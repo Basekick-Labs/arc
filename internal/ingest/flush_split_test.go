@@ -78,3 +78,72 @@ func TestAsyncFlushSplitsClaimedBatches(t *testing.T) {
 		t.Fatalf("files %d", len(files))
 	}
 }
+
+// Batches a DELETE record holds and batches it does not never share a file
+// (#1207 d1): the record is applied to a file as a whole.
+func TestFlushSplitsByDeleteScope(t *testing.T) {
+	reg := &coverageRegistrar{}
+	b, _ := newCoverageBuffer(t, 1000000, reg)
+	b.SetDeleteScope(func(_ uint64, key string, cseq uint64) []uint64 {
+		if key == "db/cpu" && cseq <= 2 {
+			return []uint64{40}
+		}
+		return nil
+	})
+	ctx := context.Background()
+	for i := 0; i < 4; i++ {
+		if err := b.WriteColumnarRecord(ctx, "db", coverageRecord("cpu", float64(i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := b.FlushAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	files := reg.snapshot()
+	if len(files) != 2 {
+		t.Fatalf("files %d", len(files))
+	}
+	got := map[uint64]int{}
+	for i, f := range files {
+		for _, r := range f.cov.Ranges {
+			for c := r.Lo; c <= r.Hi; c++ {
+				got[c] = i
+			}
+		}
+	}
+	if len(got) != 4 || got[1] != got[2] || got[3] != got[4] || got[1] == got[3] {
+		t.Fatalf("batches by file %v", got)
+	}
+}
+
+// A DELETE flushes only its database's (or measurement's) buffers, and the
+// marks are the batches acknowledged so far per key.
+func TestFlushScopeAndWaitAndMarks(t *testing.T) {
+	reg := &coverageRegistrar{}
+	b, _ := newCoverageBuffer(t, 1000000, reg)
+	ctx := context.Background()
+	for _, m := range []string{"cpu", "cpu", "mem"} {
+		if err := b.WriteColumnarRecord(ctx, "db", coverageRecord(m, 1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := b.WriteColumnarRecord(ctx, "dbx", coverageRecord("cpu", 1)); err != nil {
+		t.Fatal(err)
+	}
+	m, err := b.FlushScopeAndWait(ctx, "db", "cpu")
+	if err != nil || len(m) != 1 || m["db/cpu"] != 2 {
+		t.Fatalf("marks %v %v", m, err)
+	}
+	if files := reg.snapshot(); len(files) != 1 || files[0].cov.Key != "db/cpu" {
+		t.Fatalf("flushed %d files", len(files))
+	}
+	// db/cpu has nothing buffered any more: its mark still comes back.
+	m, err = b.FlushScopeAndWait(ctx, "db", "")
+	if err != nil || len(m) != 2 || m["db/mem"] != 1 || m["db/cpu"] != 2 {
+		t.Fatalf("database marks %v %v", m, err)
+	}
+	files := reg.snapshot()
+	if len(files) != 2 || files[1].cov.Key != "db/mem" {
+		t.Fatalf("database flush: %d files", len(files))
+	}
+}

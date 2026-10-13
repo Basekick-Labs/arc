@@ -1,6 +1,9 @@
 package ingest
 
-import "sync/atomic"
+import (
+	"fmt"
+	"sync/atomic"
+)
 
 // Flush split (#1207 S4b1c2b).
 //
@@ -12,7 +15,9 @@ import "sync/atomic"
 // claimed: each class is flushed as its own group, and the rows nobody
 // claimed register at once instead of waiting in a parked file. That also
 // covers a batch whose WAL append was dropped, which no later republish
-// could read back.
+// could read back. Nor does it mix batches a DELETE record holds with
+// batches it does not (#1207 d1): the record is applied to a file as a
+// whole, before it registers.
 
 // ClaimedBatchFunc reports whether the manifest would refuse a file of the
 // origin holding batch cseq of (instance, key) as claimed by another writer.
@@ -29,6 +34,22 @@ func (b *ArrowBuffer) SetClaimedBatch(fn ClaimedBatchFunc) {
 
 type claimedBatchPtr = atomic.Pointer[ClaimedBatchFunc]
 
+// DeleteScopeFunc returns the DELETE records holding batch cseq of
+// (instance, key) in their scope (#1207 d1). A file is rewritten with a
+// record as a whole, so batches with different answers never share one.
+type DeleteScopeFunc func(instance uint64, key string, cseq uint64) []uint64
+
+// SetDeleteScope installs the DELETE scope predicate (nil: none).
+func (b *ArrowBuffer) SetDeleteScope(fn DeleteScopeFunc) {
+	if fn == nil {
+		b.deleteScope.Store(nil)
+		return
+	}
+	b.deleteScope.Store(&fn)
+}
+
+type deleteScopePtr = atomic.Pointer[DeleteScopeFunc]
+
 // flushPart is one class of an extracted buffer.
 type flushPart struct {
 	records   []interface{}
@@ -41,6 +62,7 @@ type flushClass struct {
 	covered  bool
 	instance uint64
 	claimed  bool
+	scope    string // the DELETE records holding its batches
 }
 
 // splitForCoverage returns the classes of records, in order, each with its
@@ -52,6 +74,10 @@ func (b *ArrowBuffer) splitForCoverage(key string, records []interface{}) []flus
 	var claimed ClaimedBatchFunc
 	if p := b.claimedBatch.Load(); p != nil {
 		claimed = *p
+	}
+	var scope DeleteScopeFunc
+	if p := b.deleteScope.Load(); p != nil {
+		scope = *p
 	}
 	classOf := func(record interface{}) flushClass {
 		batch, ok := record.(*TypedColumnBatch)
@@ -66,6 +92,12 @@ func (b *ArrowBuffer) splitForCoverage(key string, records []interface{}) []flus
 					break
 				}
 			}
+		}
+		if scope != nil {
+			// The pieces of one batch are one batch (chunks of it): the first
+			// answers for all.
+			p := batch.Coverage[0]
+			c.scope = fmt.Sprint(scope(p.Instance, key, p.CSeq))
 		}
 		return c
 	}

@@ -55,6 +55,12 @@ func (c *Coordinator) StartOriginStream(walWriter *wal.Writer, buffer *ingest.Ar
 	if _, _, ok := buffer.RegistrationProgress(); !ok {
 		return nil // coverage did not come up on this buffer
 	}
+	if c.cfg.StreamTakeover && outbox != nil {
+		// Before anything below can fail: this writer announces its process
+		// either way, so DELETE records name it, and it must acknowledge them
+		// and apply them to the files it registers (#1207 d1).
+		c.startDeleteRecords(c.ctx, buffer, walWriter.TrackedInstance, outbox)
+	}
 	if c.cfg.SharedSecret == "" {
 		return fmt.Errorf("the origin stream needs cluster.shared_secret")
 	}

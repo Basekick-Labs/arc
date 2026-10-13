@@ -593,7 +593,10 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		cmd.Type == clusterraft.CommandClaimDone ||
 		cmd.Type == clusterraft.CommandInstanceSettled ||
 		cmd.Type == clusterraft.CommandExtendStreamClaim ||
-		cmd.Type == clusterraft.CommandReleaseStreamClaim
+		cmd.Type == clusterraft.CommandReleaseStreamClaim ||
+		cmd.Type == clusterraft.CommandRecordDelete ||
+		cmd.Type == clusterraft.CommandRecordDeleteAck ||
+		cmd.Type == clusterraft.CommandSettleDeleted
 	isAuth := cmd.Type == clusterraft.CommandCreateToken ||
 		cmd.Type == clusterraft.CommandUpdateToken ||
 		cmd.Type == clusterraft.CommandRevokeToken ||
@@ -924,6 +927,30 @@ func manifestCommandSpeaksFor(cmd *clusterraft.Command, nodeID string) error {
 		}
 		if p.Origin != nodeID {
 			return fmt.Errorf("instance settlement for %q is not by the requesting node", p.Origin)
+		}
+	case clusterraft.CommandRecordDelete:
+		var p clusterraft.RecordDeletePayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.Origin != nodeID {
+			return fmt.Errorf("delete record for %q is not by the requesting node", p.Origin)
+		}
+	case clusterraft.CommandRecordDeleteAck:
+		var p clusterraft.RecordDeleteAckPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.Origin != nodeID {
+			return fmt.Errorf("delete record acknowledgement for %q is not by the requesting node", p.Origin)
+		}
+	case clusterraft.CommandSettleDeleted:
+		var p clusterraft.SettleDeletedPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.By != nodeID {
+			return fmt.Errorf("deleted batch settlement for %q is not by the requesting node", p.By)
 		}
 	}
 	return nil

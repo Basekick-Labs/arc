@@ -294,6 +294,9 @@ func (c *Coordinator) IngestGate() func() error {
 		if c.takeoverDesignationRefuses() {
 			return fmt.Errorf("%w: %w", ingest.ErrIngestFenced, errNotDesignated)
 		}
+		if c.deleteAckOwed() {
+			return fmt.Errorf("%w: %w", ingest.ErrIngestFenced, errDeleteAckPending)
+		}
 		if f := c.ingestFence.Load(); f != nil {
 			return f.gate()
 		}

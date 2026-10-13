@@ -364,6 +364,22 @@ type StreamTakeoverView struct {
 	Instances []StreamTakeoverInstance `json:"instances"`
 	Claims    []StreamTakeoverClaim    `json:"claims"`
 	Departed  []StreamTakeoverDeparted `json:"departed_writers"`
+	// DeleteRecords are the DELETEs kept until every writer process they
+	// name has settled the batches before them (#1207 d1).
+	DeleteRecords []StreamTakeoverDeleteRecord `json:"delete_records"`
+}
+
+// StreamTakeoverDeleteRecord is one DELETE kept for stream takeover.
+// Waiting lists the writer processes (hex) that may still publish batches
+// acknowledged before it; Unacknowledged those that have not reported them.
+type StreamTakeoverDeleteRecord struct {
+	ID             uint64    `json:"id"`
+	Origin         string    `json:"origin"`
+	Database       string    `json:"database"`
+	Measurement    string    `json:"measurement,omitempty"`
+	Where          string    `json:"where,omitempty"`
+	At             time.Time `json:"at"`
+	Unacknowledged []string  `json:"unacknowledged,omitempty"`
 }
 
 // StreamTakeoverInstance is one writer process the cluster knows.
@@ -431,6 +447,16 @@ func (c *Coordinator) StreamTakeover() StreamTakeoverView {
 		v.Departed = append(v.Departed, StreamTakeoverDeparted{NodeID: id, Since: at, ExpiresAt: at.Add(ttl)})
 	}
 	sort.Slice(v.Departed, func(i, j int) bool { return v.Departed[i].NodeID < v.Departed[j].NodeID })
+	v.DeleteRecords = []StreamTakeoverDeleteRecord{}
+	for _, r := range fsm.DeleteRecords() {
+		dr := StreamTakeoverDeleteRecord{ID: r.ID, Origin: r.Origin, Database: r.Database, Measurement: r.Measurement, Where: r.Where, At: r.At}
+		for _, sc := range r.Before {
+			if !sc.Acked {
+				dr.Unacknowledged = append(dr.Unacknowledged, hex(sc.Instance))
+			}
+		}
+		v.DeleteRecords = append(v.DeleteRecords, dr)
+	}
 	return v
 }
 

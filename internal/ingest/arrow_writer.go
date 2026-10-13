@@ -976,6 +976,7 @@ type ArrowBuffer struct {
 	coverage atomic.Pointer[coverageState]
 	// claimedBatch splits flushes by claim (#1207 S4b1c2b, flush_split.go).
 	claimedBatch claimedBatchPtr
+	deleteScope  deleteScopePtr
 
 	// ingestGate refuses live writes on a fenced node (#1207).
 	ingestGate atomic.Pointer[func() error]
@@ -5030,6 +5031,28 @@ func (b *ArrowBuffer) NewRecoveryFlushBarrier() func(context.Context) error {
 // durability and must not permit WAL deletion. Recovery must also use
 // NewRecoveryFlushBarrier to cover failures that completed before this call.
 func (b *ArrowBuffer) FlushAllAndWait(ctx context.Context) error {
+	return b.flushAndWait(ctx, nil, nil)
+}
+
+// FlushScopeAndWait is FlushAllAndWait for the buffer keys of one database
+// (measurement "" = all of them): a row DELETE flushes the rows acknowledged
+// before it, so it sees them in files (#1207 d1). It returns, per key, the
+// last coverage sequence minted when the key's buffer was handed to the
+// flush, read under the same lock: every batch at or below it is in the
+// flush, every batch above it in a later one, so no file holds batches on
+// both sides of it.
+func (b *ArrowBuffer) FlushScopeAndWait(ctx context.Context, database, measurement string) (map[string]uint64, error) {
+	marks := map[string]uint64{}
+	err := b.flushAndWait(ctx, func(key string) bool { return keyInScope(key, database, measurement) }, marks)
+	return marks, err
+}
+
+func keyInScope(key, database, measurement string) bool {
+	parts := splitBufferKey(key)
+	return len(parts) == 2 && parts[0] == database && (measurement == "" || parts[1] == measurement)
+}
+
+func (b *ArrowBuffer) flushAndWait(ctx context.Context, match func(key string) bool, marks map[string]uint64) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -5089,7 +5112,18 @@ func (b *ArrowBuffer) FlushAllAndWait(ctx context.Context) error {
 	for shardIdx := range b.shards {
 		shard := b.shards[shardIdx]
 		for key := range shard.buffers {
-			snapshot = append(snapshot, pendingBuffer{shard: shard, key: key})
+			if match == nil || match(key) {
+				snapshot = append(snapshot, pendingBuffer{shard: shard, key: key})
+			}
+		}
+		if marks != nil {
+			// Keys with nothing buffered: every batch minted is in a file
+			// or on its way. A buffered key's mark is read at its hand-off.
+			for key, c := range shard.cseqs {
+				if _, buffered := shard.buffers[key]; c > 0 && !buffered && match(key) {
+					marks[key] = c
+				}
+			}
 		}
 	}
 	for i := locked - 1; i >= 0; i-- {
@@ -5114,6 +5148,11 @@ func (b *ArrowBuffer) FlushAllAndWait(ctx context.Context) error {
 			queued := false
 			if exists {
 				queued, _ = b.enqueueOrDeferLocked(item.shard, item.key, parts[0], parts[1], item.shard.bufferRecordCounts[item.key])
+			}
+			if marks != nil && (!exists || queued) {
+				if c := item.shard.cseqs[item.key]; c > 0 {
+					marks[item.key] = c
+				}
 			}
 			item.shard.mu.Unlock()
 			if !exists || queued {

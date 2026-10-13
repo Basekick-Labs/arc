@@ -37,7 +37,7 @@ import (
 // tombstones, no abandon) and stream_claims_v5 (S4b1c2a2: a finished claim
 // still refused the origin's copies, orphaned instances were removed, no
 // vanished list) and never enabled the flag; they block it.
-const CapabilityStreamClaims = "stream_claims_v6"
+const CapabilityStreamClaims = "stream_claims_v7"
 
 // Instance status, from its origin's announcements.
 const (
@@ -61,6 +61,10 @@ const (
 	// it would stop the index tracking the instance, and nothing could then
 	// arbitrate the origin's copies against the claimant's.
 	RefusedFull = "full"
+	// RefusedDeleted: a file holding batches a DELETE record covers that was
+	// not rewritten with that record (#1207 d1). The writer applies the
+	// record to it and proposes it again.
+	RefusedDeleted = "deleted"
 )
 
 // Bounds on the replicated takeover state, which every node keeps and
@@ -407,6 +411,12 @@ type takeoverState struct {
 	// its origin came back with its volume) must take it out of its query
 	// path, since the rows were published again from another copy.
 	vanished []VanishedFile
+
+	// records are the live DELETE records, by ID (delete_records.go).
+	records []*DeleteRecord
+	// untrackedFloors are the settled floors of untracked instances, which
+	// have no index: a DELETE record is collected by them (delete_records.go).
+	untrackedFloors map[uint64]map[string]KeySettlement
 }
 
 func newTakeoverState() *takeoverState {
@@ -417,6 +427,8 @@ func newTakeoverState() *takeoverState {
 		claims:     map[uint64]*StreamClaim{},
 		departed:   map[string]time.Time{},
 		removedSet: map[uint64]bool{},
+
+		untrackedFloors: map[uint64]map[string]KeySettlement{},
 	}
 }
 
@@ -428,6 +440,9 @@ type takeoverSnapshot struct {
 	Departed  map[string]time.Time            `json:"departed,omitempty"`
 	Removed   []uint64                        `json:"removed,omitempty"`
 	Vanished  []VanishedFile                  `json:"vanished,omitempty"`
+	Records   []DeleteRecord                  `json:"delete_records,omitempty"`
+	// UntrackedFloors: instance (hex) -> key -> floor.
+	UntrackedFloors map[string]map[string]KeySettlement `json:"untracked_floors,omitempty"`
 }
 
 // VanishedFile is a file deleted from the manifest as vanished.
@@ -506,7 +521,7 @@ func (f *ClusterFSM) VanishedFiles() []VanishedFile {
 func instKey(i uint64) string { return fmt.Sprintf("%016x", i) }
 
 func (t *takeoverState) snapshot() *takeoverSnapshot {
-	if len(t.instances) == 0 && len(t.claims) == 0 && len(t.departed) == 0 && len(t.removed) == 0 && len(t.vanished) == 0 {
+	if len(t.instances) == 0 && len(t.claims) == 0 && len(t.departed) == 0 && len(t.removed) == 0 && len(t.vanished) == 0 && len(t.records) == 0 && len(t.untrackedFloors) == 0 {
 		return nil
 	}
 	s := &takeoverSnapshot{Index: map[string]map[string]*keyIndex{}}
@@ -536,6 +551,19 @@ func (t *takeoverState) snapshot() *takeoverSnapshot {
 	}
 	s.Removed = append([]uint64(nil), t.removed...)
 	s.Vanished = append([]VanishedFile(nil), t.vanished...)
+	for _, r := range t.records {
+		s.Records = append(s.Records, r.clone())
+	}
+	if len(t.untrackedFloors) > 0 {
+		s.UntrackedFloors = map[string]map[string]KeySettlement{}
+		for id, keys := range t.untrackedFloors {
+			cp := make(map[string]KeySettlement, len(keys))
+			for k, v := range keys {
+				cp[k] = KeySettlement{Floor: v.Floor, Lost: append(Intervals(nil), v.Lost...)}
+			}
+			s.UntrackedFloors[instKey(id)] = cp
+		}
+	}
 	return s
 }
 
@@ -580,6 +608,17 @@ func restoreTakeover(s *takeoverSnapshot) *takeoverState {
 	t.vanished = append([]VanishedFile(nil), s.Vanished...)
 	if len(t.vanished) > maxVanishedPaths {
 		t.vanished = t.vanished[len(t.vanished)-maxVanishedPaths:]
+	}
+	for i := range s.Records {
+		r := s.Records[i].clone()
+		t.records = append(t.records, &r)
+	}
+	sort.SliceStable(t.records, func(i, j int) bool { return t.records[i].ID < t.records[j].ID })
+	for hex, keys := range s.UntrackedFloors {
+		var id uint64
+		if _, err := fmt.Sscanf(hex, "%016x", &id); err == nil {
+			t.untrackedFloors[id] = keys
+		}
 	}
 	return t
 }
@@ -789,6 +828,11 @@ func (f *ClusterFSM) takeoverRefusalLocked(p RegisterFilePayload, scratch, repla
 				!k.active() || k.Epoch != c.ClaimEpoch || c.Truncated || !insideSet(c, k.Set[c.Key]) {
 				return RefusedOp{Kind: RefusedStale, Instance: c.Instance, Epoch: c.ClaimEpoch}, true
 			}
+		}
+		// DELETE records next: a file holding batches acknowledged before a
+		// DELETE must carry its rows minus the deleted ones.
+		if r, ok := f.deletedRefusalLocked(c, p.DeleteSeen); ok {
+			return r, true
 		}
 		in := t.instances[c.Instance]
 		if in == nil && t.removedSet[c.Instance] {
@@ -1262,6 +1306,16 @@ func (f *ClusterFSM) untrackLocked(in *StreamInstance, why string) {
 		return
 	}
 	in.Untracked = true
+	// Its floors keep counting for the DELETE records naming it.
+	keys := map[string]KeySettlement{}
+	for k, ki := range f.takeover.index[in.Instance] {
+		if ki.Floor > 0 {
+			keys[k] = KeySettlement{Floor: ki.Floor, Lost: append(Intervals(nil), ki.Lost...)}
+		}
+	}
+	if len(keys) > 0 {
+		f.takeover.untrackedFloors[in.Instance] = keys
+	}
 	f.dropIndexLocked(in.Instance)
 	f.logger.Error().Str("instance", instKey(in.Instance)).Str("origin", in.Origin).Str("reason", why).
 		Msg("Stream takeover stopped tracking a writer instance; a failover from it cannot take over its unflushed batches")
@@ -1292,6 +1346,8 @@ func (f *ClusterFSM) removeInstanceLocked(inst uint64) {
 	}
 	delete(t.instances, inst)
 	delete(t.claims, inst)
+	delete(t.untrackedFloors, inst)
+	f.gcDeleteRecordsLocked()
 }
 
 // ---- commands ----
@@ -1429,6 +1485,7 @@ func (f *ClusterFSM) applySettleCoverage(payload []byte) interface{} {
 		return fmt.Errorf("settle coverage: %s is not the current instance of %s", instKey(p.Instance), p.Origin)
 	}
 	if in.Untracked {
+		f.untrackedSettleLocked(p)
 		return nil
 	}
 	keys := make([]string, 0, len(p.Keys))
@@ -1504,6 +1561,7 @@ func (f *ClusterFSM) applySettleCoverage(payload []byte) interface{} {
 			return nil
 		}
 	}
+	f.gcDeleteRecordsLocked()
 	return nil
 }
 
