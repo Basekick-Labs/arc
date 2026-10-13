@@ -1817,6 +1817,26 @@ Arc leaves its bytes for the HTTP parser and stops monitoring that connection
 for the query, so a later disconnect on the same connection is not observed.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#982](https://github.com/Basekick-Labs/arc/pull/982).
+
+### Iceberg orphan sweep re-checks the table before deleting ([#1125](https://github.com/Basekick-Labs/arc/issues/1125))
+
+The orphan metadata sweep (#835) decided which manifest files no metadata
+version references from one listing, then deleted them. A reference that
+appeared in between was missed: a commit by another writer, a restore, or a
+retained `v<N>.metadata.json` rewritten in place. The sweep could then delete a
+manifest that had just become reachable. Arc's own reconciler does not race
+itself here, so the window was open only to another process or a restore
+writing the same warehouse.
+
+The sweep now reloads the catalog and re-lists the metadata directory after the
+first listing. It works out reachability from that final listing, checks the
+catalog once more, and only then deletes. It skips the pass, deleting nothing,
+if the catalog moved, a check fails, or the listing has no metadata files.
+Files that appear after the first listing are never deleted in that pass. A
+commit landing during the deletes themselves is still not covered.
+
+Contributed by [@jallegri](https://github.com/jallegri) in [#1174](https://github.com/Basekick-Labs/arc/pull/1174), after the guard in [@efegokdemir](https://github.com/efegokdemir)'s [#923](https://github.com/Basekick-Labs/arc/pull/923).
+
 ### Compaction reports how many jobs are in flight ([#1168](https://github.com/Basekick-Labs/arc/issues/1168))
 
 Two endpoints advertised a count of in-flight compaction work and neither ever
