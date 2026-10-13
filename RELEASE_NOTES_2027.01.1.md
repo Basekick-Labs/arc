@@ -1127,6 +1127,25 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Compaction waits for recent compaction outputs again ([#1235](https://github.com/Basekick-Labs/arc/issues/1235))
+
+Each tier skips a partition while its newest file is younger than the tier's
+`min_age_hours`, so compaction does not race late writes. Since 26.09.1,
+compaction outputs carry a batch number (`_b<N>_compacted`, `_b<N>_daily`), and
+the check could not read their timestamp, so it ignored them.
+
+The visible effect was on the daily tier, whose inputs are mostly hourly
+outputs. A day whose every hour had been hourly-compacted passed the check
+whatever its age. With the default schedule it was compacted at the first
+03:00 run after the day, while late writes could still be arriving.
+
+The check reads these names again. Such a day now waits until its newest hourly
+output is `daily_min_age_hours` old: with the defaults, the second 03:00 run
+after the day, as before 26.09.1. Days older than
+`daily_skip_file_age_check_days` (default 7) are not checked, as before.
+
+Contributed by [@jallegri](https://github.com/jallegri) in [#1250](https://github.com/Basekick-Labs/arc/pull/1250).
+
 ### WAL-on ingest is no longer capped by one writer's fsync latency ([#1246](https://github.com/Basekick-Labs/arc/issues/1246))
 
 With the WAL enabled, ingest topped out at a rate set by the storage's fsync
