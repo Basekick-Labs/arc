@@ -127,6 +127,11 @@ func (r *DeleteRecord) coverageScope(c InstanceCoverage) (any, all bool) {
 // DELETE's scope. Truncated coverage is provable only for an unacknowledged
 // process, whose entire stream is in scope.
 func (r *DeleteRecord) Covers(c InstanceCoverage) bool {
+	// Checked first because the truncated branch below reads only the
+	// instance's scope, which says nothing about which database a key is in.
+	if !r.MatchesKey(c.Key) {
+		return false
+	}
 	if c.Truncated {
 		if c.Instance == r.Own && r.Own != 0 {
 			return false

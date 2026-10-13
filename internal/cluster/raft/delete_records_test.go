@@ -416,4 +416,19 @@ func TestDeleteRecordCoversParkedFileCoverage(t *testing.T) {
 	if !unacked.Covers(InstanceCoverage{Instance: 2, Key: "db/cpu", Truncated: true}) {
 		t.Fatal("unacknowledged process was not treated as fully in scope")
 	}
+	// A coverage that lists no batch proves nothing.
+	if unacked.Covers(InstanceCoverage{Instance: 2, Key: "db/cpu"}) {
+		t.Fatal("record covered a coverage listing no batches")
+	}
+	// Truncated coverage of another database's key, on an instance whose
+	// whole stream is in scope for this one.
+	if unacked.Covers(InstanceCoverage{Instance: 2, Key: "other/cpu", Truncated: true}) {
+		t.Fatal("record covered truncated coverage of another database")
+	}
+	// The deleting writer's own truncated stream: its marks are a prefix, so
+	// a truncated listing cannot be proven inside them.
+	own := DeleteRecord{Database: "db", Own: 2, OwnMarks: map[string]uint64{"db/cpu": 5}}
+	if own.Covers(InstanceCoverage{Instance: 2, Key: "db/cpu", Truncated: true}) {
+		t.Fatal("record covered the deleting writer's own truncated stream")
+	}
 }
