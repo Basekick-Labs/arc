@@ -5135,10 +5135,14 @@ func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler 
 
 		// Parse WAL envelope to extract database name and msgpack payload
 		database, msgpackData := wal.ParseEnvelope(payload, "default")
-		part := func(localPayload []byte, measurement string, columns map[string][]interface{}) replication.PreparedWALIngest {
+		part := func(localPayload []byte, measurement string, columns map[string][]interface{}, tags ...[]string) replication.PreparedWALIngest {
+			var tagColumns []string
+			if len(tags) > 0 {
+				tagColumns = tags[0]
+			}
 			return replication.PreparedWALIngest{Payload: localPayload,
 				Apply: func(ctx context.Context, hashes []string) error {
-					return buf.WriteColumnarDirectNoWALWithHashes(ctx, database, measurement, columns, hashes)
+					return buf.WriteColumnarDirectNoWALWithHashesAndTagColumns(ctx, database, measurement, columns, hashes, tagColumns)
 				}}
 		}
 
@@ -5154,7 +5158,15 @@ func (c *Coordinator) buildReplicationIngestHandler() replication.IngestHandler 
 						}
 					}
 					if len(typedColumns) > 0 {
-						return []replication.PreparedWALIngest{part(payload, measurement, typedColumns)}, nil
+						tagColumns := make([]string, 0)
+						if rawTagColumns, ok := rawMap["tag_keys"].([]interface{}); ok {
+							for _, rawTag := range rawTagColumns {
+								if tag, ok := rawTag.(string); ok {
+									tagColumns = append(tagColumns, tag)
+								}
+							}
+						}
+						return []replication.PreparedWALIngest{part(payload, measurement, typedColumns, tagColumns)}, nil
 					}
 				}
 			}

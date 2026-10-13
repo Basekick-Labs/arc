@@ -1941,40 +1941,45 @@ func (b *ArrowBuffer) WriteColumnarRecord(ctx context.Context, database string, 
 // WriteColumnarDirectNoWAL writes columnar data without writing to WAL.
 // Used during WAL recovery to avoid re-writing recovered data back to WAL.
 //
-// Note (#521): the WAL stores flattened rows and does NOT carry TagColumns or
-// the DedupTime marker (both are json:"-"), so a Parquet file produced purely
-// from WAL replay has neither arc:tags nor the continuous-query marker.
-// Compaction unions tags and reads the marker across all files of a batch, so
-// a replayed file is deduped against any tagged or marked raw sibling in the
-// same batch — exact-row (#1232), so the replayed copy of a row collapses and
-// nothing else does. It is NOT deduped against a compacted file (compacted
-// tagged output carries no arc:tags) or a sibling in another batch: that copy
-// stays a duplicate. Never data loss. Propagating the markers through the WAL is a separate, larger
-// change (WAL schema).
+// Raw MessagePack WAL entries preserve tag_keys through recovery so replayed
+// files keep their arc:tags metadata. The row-format fallback and DedupTime
+// marker remain separate WAL format concerns.
 // WriteColumnarDirectNoWAL writes a replayed or replicated columnar payload into
 // the buffer without appending it to the WAL. It inherits no WAL identity; use
 // WriteColumnarDirectReplay when replaying an entry whose identity should be
 // checkpointed once the batch reaches storage.
 func (b *ArrowBuffer) WriteColumnarDirectNoWAL(ctx context.Context, database, measurement string, columns map[string][]interface{}) error {
-	return b.writeColumnarDirect(ctx, database, measurement, columns, "")
+	return b.writeColumnarDirect(ctx, database, measurement, columns, "", nil)
 }
 
 // WriteColumnarDirectNoWALWithHashes applies replicated data without writing
 // it again to the WAL, and carries the follower-local WAL identities through
 // to the flush checkpoint.
 func (b *ArrowBuffer) WriteColumnarDirectNoWALWithHashes(ctx context.Context, database, measurement string, columns map[string][]interface{}, hashes []string) error {
-	return b.writeColumnarDirectWithHashes(ctx, database, measurement, columns, hashes)
+	return b.writeColumnarDirectWithHashes(ctx, database, measurement, columns, hashes, nil)
 }
 
-func (b *ArrowBuffer) writeColumnarDirect(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string) error {
+// WriteColumnarDirectNoWALWithHashesAndTagColumns also preserves replicated
+// MessagePack tag metadata while checkpointing the follower-local WAL entries.
+func (b *ArrowBuffer) WriteColumnarDirectNoWALWithHashesAndTagColumns(ctx context.Context, database, measurement string, columns map[string][]interface{}, hashes []string, tagColumns []string) error {
+	return b.writeColumnarDirectWithHashes(ctx, database, measurement, columns, hashes, tagColumns)
+}
+
+// WriteColumnarDirectNoWALWithTagColumns replays columnar data without
+// rewriting it to the WAL while preserving MessagePack tag metadata.
+func (b *ArrowBuffer) WriteColumnarDirectNoWALWithTagColumns(ctx context.Context, database, measurement string, columns map[string][]interface{}, tagColumns []string) error {
+	return b.writeColumnarDirect(ctx, database, measurement, columns, "", tagColumns)
+}
+
+func (b *ArrowBuffer) writeColumnarDirect(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string, tagColumns []string) error {
 	var hashes []string
 	if len(walIdentity) == walTrackedIdentityHexLen {
 		hashes = []string{walIdentity}
 	}
-	return b.writeColumnarDirectWithHashes(ctx, database, measurement, columns, hashes)
+	return b.writeColumnarDirectWithHashes(ctx, database, measurement, columns, hashes, tagColumns)
 }
 
-func (b *ArrowBuffer) writeColumnarDirectWithHashes(ctx context.Context, database, measurement string, columns map[string][]interface{}, walHashes []string) error {
+func (b *ArrowBuffer) writeColumnarDirectWithHashes(ctx context.Context, database, measurement string, columns map[string][]interface{}, walHashes []string, tagColumns []string) error {
 	// #590: both callers (WAL crash replay, cluster WAL replication) feed
 	// RAW client payloads that never went through the live decode path's
 	// post-processing. Apply it here so replayed data behaves exactly like
@@ -2024,6 +2029,7 @@ func (b *ArrowBuffer) writeColumnarDirectWithHashes(ctx context.Context, databas
 	record := &models.ColumnarRecord{
 		Measurement: measurement,
 		Columns:     columns,
+		TagColumns:  tagColumns,
 		Columnar:    true,
 	}
 	return b.writeColumnarInternalWithWALHashes(ctx, database, record, true, walHashes)
@@ -2046,15 +2052,21 @@ func (b *ArrowBuffer) writeColumnarDirectWithHashes(ctx context.Context, databas
 // the records in this call. Bounded row replay supplies a versioned row-range
 // identity; checkpointing its parent before all ranges flush would lose data.
 func (b *ArrowBuffer) WriteColumnarDirectReplay(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string) error {
+	return b.WriteColumnarDirectReplayWithTagColumns(ctx, database, measurement, columns, walIdentity, nil)
+}
+
+// WriteColumnarDirectReplayWithTagColumns preserves MessagePack tag metadata
+// while carrying the WAL identity into the replayed buffer.
+func (b *ArrowBuffer) WriteColumnarDirectReplayWithTagColumns(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string, tagColumns []string) error {
 	if _, start, end, ok := wal.ParseRecoveryRowIdentity(walIdentity); ok {
 		for _, column := range columns {
 			if len(column) != end-start {
 				return fmt.Errorf("replayed WAL row range length %d does not match column length %d", end-start, len(column))
 			}
 		}
-		return b.writeColumnarDirectWithHashes(ctx, database, measurement, columns, []string{walIdentity})
+		return b.writeColumnarDirectWithHashes(ctx, database, measurement, columns, []string{walIdentity}, tagColumns)
 	}
-	return b.writeColumnarDirect(ctx, database, measurement, columns, walIdentity)
+	return b.writeColumnarDirect(ctx, database, measurement, columns, walIdentity, tagColumns)
 }
 
 // WriteTypedColumnarDirect writes a pre-typed column batch to the buffer,

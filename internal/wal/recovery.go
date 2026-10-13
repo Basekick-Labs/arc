@@ -26,8 +26,13 @@ type TrackedRecoveryCallback func(ctx context.Context, records []map[string]inte
 // walIdentity is the identity of the entry being replayed, so the re-buffered
 // batch can inherit it and have its eventual flush checkpoint the ORIGINAL
 // entry — which is what stops a later pass replaying it again. It is empty for
-// an entry that carries no tracked identity.
+// an entry that carries no tracked identity. database may be empty if the WAL
+// entry predates the envelope format (defaults to "default").
 type ColumnarRecoveryCallback func(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string) error
+
+// ColumnarRecoveryCallbackWithTagColumns also receives tag metadata preserved
+// in raw MessagePack entries. When set, it takes precedence over ColumnarCallback.
+type ColumnarRecoveryCallbackWithTagColumns func(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string, tagColumns []string) error
 
 // RecoveryStats holds statistics about WAL recovery
 type RecoveryStats struct {
@@ -82,6 +87,9 @@ type RecoveryOptions struct {
 
 	// ColumnarCallback handles columnar WAL entries from the zero-copy write path
 	ColumnarCallback ColumnarRecoveryCallback
+
+	// ColumnarCallbackWithTagColumns preserves raw MessagePack tag metadata.
+	ColumnarCallbackWithTagColumns ColumnarRecoveryCallbackWithTagColumns
 
 	// TrackedRowCallback handles row-format entries in batches bounded by
 	// BatchSize. Legacy content-hash entries inherit no checkpoint identity.
@@ -499,9 +507,15 @@ func (r *Recovery) RecoverWithOptions(ctx context.Context, callback RecoveryCall
 				entryCtx = WithReplayCoverage(ctx, ReplayCoverage{Coverage: *entry.Coverage, RowTotal: len(entry.Records)})
 			}
 			// Dispatch based on entry format
-			if entry.ColumnarData != nil && opts.ColumnarCallback != nil {
+			if entry.ColumnarData != nil && (opts.ColumnarCallback != nil || opts.ColumnarCallbackWithTagColumns != nil) {
 				// Columnar entry from zero-copy AppendRaw path
-				if err := opts.ColumnarCallback(entryCtx, entry.ColumnarData.Database, entry.ColumnarData.Measurement, entry.ColumnarData.Columns, entry.PayloadHash); err != nil {
+				var err error
+				if opts.ColumnarCallbackWithTagColumns != nil {
+					err = opts.ColumnarCallbackWithTagColumns(entryCtx, entry.ColumnarData.Database, entry.ColumnarData.Measurement, entry.ColumnarData.Columns, entry.PayloadHash, entry.ColumnarData.TagColumns)
+				} else {
+					err = opts.ColumnarCallback(entryCtx, entry.ColumnarData.Database, entry.ColumnarData.Measurement, entry.ColumnarData.Columns, entry.PayloadHash)
+				}
+				if err != nil {
 					// #590: continue with the remaining entries instead of
 					// abandoning the rest of the file — one poisoned entry
 					// (e.g. a payload the write path rejects) must not

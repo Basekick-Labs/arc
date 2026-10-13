@@ -2,6 +2,16 @@
 
 > **Status:** Planned — January 2027 release.
 
+## New: MessagePack columnar tag keys (#275)
+
+MessagePack columnar payloads now accept an optional `tag_keys` field to
+identify tag columns explicitly. Generic and typed decoding, WAL recovery
+and replication preserve these names for downstream tag metadata and
+compaction deduplication. Payloads without `tag_keys` remain supported.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir)
+in [#905](https://github.com/Basekick-Labs/arc/pull/905).
+
 ## Upgrade note: three configurations now refuse to start
 
 Read this before upgrading if you set `storage.local_path`,

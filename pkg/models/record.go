@@ -41,6 +41,7 @@ type MsgPackPayload struct {
 
 	// Columnar format
 	Columns map[string][]interface{} `msgpack:"columns,omitempty"`
+	TagKeys []string                 `msgpack:"tag_keys,omitempty"`
 
 	// Batch format
 	Batch []interface{} `msgpack:"batch,omitempty"`
