@@ -132,6 +132,10 @@ func validateRetentionPolicyRequest(req *RetentionPolicyRequest, create bool) er
 		if !isSafeStoragePathSegment(req.Database.Value) {
 			return fmt.Errorf("invalid database name %q: may not be empty, contain a separator, or start with a dot", req.Database.Value)
 		}
+		// Arc's own state (_schema anchors, _compaction_state), not a database (#1012).
+		if storage.IsReservedRootDir(req.Database.Value) {
+			return fmt.Errorf("database name %q is reserved for Arc's own storage", req.Database.Value)
+		}
 	}
 	if req.Measurement.hasValue() && req.Measurement.Value != "" && !isSafeStoragePathSegment(req.Measurement.Value) {
 		return fmt.Errorf("invalid measurement name %q: may not contain a separator or start with a dot", req.Measurement.Value)
@@ -317,6 +321,9 @@ func (h *RetentionHandler) warnUnusablePolicies() {
 		if !isSafeStoragePathSegment(database) {
 			h.logger.Warn().Str("policy", name).Str("database", database).
 				Msg("Retention policy has an unusable database name and will fail every run; update or delete it")
+		} else if storage.IsReservedRootDir(database) {
+			h.logger.Warn().Str("policy", name).Str("database", database).
+				Msg("Retention policy targets a storage root Arc reserves for its own state, not a database; delete it")
 		}
 		if measurement.Valid && measurement.String != "" && !isSafeStoragePathSegment(measurement.String) {
 			h.logger.Warn().Str("policy", name).Str("measurement", measurement.String).

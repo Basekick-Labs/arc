@@ -1229,6 +1229,25 @@ Above the new ceiling, when the WAL queue is full, an entry is still dropped and
 the write still acknowledged. What admission should do instead is
 [#676](https://github.com/Basekick-Labs/arc/issues/676).
 
+### Arc's own storage roots are no longer treated as databases ([#1012](https://github.com/Basekick-Labs/arc/issues/1012))
+
+`_schema` (the field-schema anchors of every database) and `_compaction_state`
+are directories Arc keeps for itself at the storage root. `GET /api/v1/databases`
+hid them, but the database-scoped endpoints accepted their names:
+`GET /api/v1/databases/_schema/measurements` listed the anchor tree as if the real
+databases were measurements. That made `_schema` look like a stray database to
+delete.
+
+They are now refused wherever a database is named:
+
+- `GET /api/v1/databases/{name}` and `/measurements`: 404.
+- `DELETE /api/v1/databases/{name}`: 403, as before.
+- Creating or updating a retention policy, and `POST /api/v1/delete`: 400.
+
+A stored retention policy on one of these roots logs a warning at startup.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1032](https://github.com/Basekick-Labs/arc/pull/1032).
+
 ### OSS Helm chart: `arc.config.enabled` no longer leaves the pod unable to start ([#1194](https://github.com/Basekick-Labs/arc/issues/1194))
 
 With `arc.config.enabled=true`, the OSS chart mounted an `arc.toml` ConfigMap
