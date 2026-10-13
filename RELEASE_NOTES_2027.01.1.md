@@ -147,6 +147,19 @@ cluster heartbeat port, fences the primary while failover sees it as healthy:
 writes stop until Raft connectivity returns. Edge-sync bundles received by a hub
 write directly to storage and are not fenced.
 
+## Upgrade note: compaction commit stays on once enabled ([#1207](https://github.com/Basekick-Labs/arc/issues/1207))
+
+A cluster enables compaction commit by itself once every node runs this
+release (`compaction_commit.enabled` in `GET /api/v1/cluster`). The flag stays
+on, and a node running an earlier release can no longer join.
+
+Do not roll a node back to an earlier release in place after that. The earlier
+release skips the new cluster log commands and ignores their checks, so its
+view of the cluster manifest silently diverges from the other nodes. To run an
+earlier release on a node, remove the node from the cluster, wipe its data
+directory, and join it fresh. To roll back the whole cluster, restore it from a
+backup taken before the upgrade.
+
 ## Upgrade note: the live WAL replication stream is off ([#888](https://github.com/Basekick-Labs/arc/issues/888))
 
 This applies to clusters where readers or compactors run with both
@@ -1179,6 +1192,41 @@ for WAL recovery), both answer 503 with `Retry-After: 30` instead.
 A database deletion also withdraws the files of that database still waiting to
 be registered in the cluster manifest, so none registers after the database is
 gone.
+
+### A DELETE no longer publishes a rewrite of a file a compaction replaced ([#1207](https://github.com/Basekick-Labs/arc/issues/1207))
+
+On a cluster, `POST /api/v1/delete` scans the files of the measurement, then
+publishes a rewrite of each file without the deleted rows. A compaction of the
+same hour could replace one of those files in between. The DELETE then still
+registered its rewrite of the replaced file, next to the compaction's output,
+which still held the deleted rows. The deleted rows came back and the others
+were counted twice.
+
+Now a DELETE's manifest update applies only while the file is still registered
+with the content the DELETE read. If a compaction replaced it, the DELETE
+waits until the compaction's output reaches the node (up to 30 s), scans
+again, and deletes from the output. After three rounds of files
+changing under it, it answers `503` and lists the files it did process; the
+rows of those files are deleted. Retry to finish. `allow_unreachable: true`
+also applies to the later scans; files it skipped are listed in
+`unreachable_files`.
+
+This covers a compaction that commits while the DELETE runs. The opposite
+order is still open: a compaction that read a file before the DELETE rewrote
+it, and commits after the DELETE, still registers an output that holds the
+deleted rows.
+
+A DELETE also leaves alone files in storage that the cluster manifest does not
+list and this node is not registering, such as a compaction output not yet
+committed. It first catches up with the cluster manifest, so a file registered
+a moment ago is not missed; if it cannot, it answers `503`. Before, rewriting such a file deleted it and left its rewrite
+unregistered, so it never replicated.
+
+The cluster turns this on by itself once every node runs this release (`GET
+/api/v1/cluster` shows `compaction_commit.enabled`, and on the leader the
+nodes keeping it off in `blocking_nodes`). Until then DELETE behaves as
+before. From then on a node running an earlier release cannot join. See the
+upgrade note below about rolling a node back.
 
 ### Delete API catches dangerous keywords glued to numbers or literals ([#1080](https://github.com/Basekick-Labs/arc/issues/1080))
 

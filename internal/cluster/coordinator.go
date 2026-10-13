@@ -142,6 +142,8 @@ type Coordinator struct {
 	streamClaimsProposer atomic.Bool // the enable loop runs
 	nodeIDWarn           sync.Once   // stream takeover without an explicit node id, logged once
 	streamClaimsBlockers atomic.Pointer[[]string]
+	// compactionCommit: the #1207 d2 flag's join gate and blockers.
+	compactionCommit     compactionCommitGate
 	walCoverageActive    atomic.Bool // SetWALCoverageActive
 	ingestFenceListeners []func(fenced bool)
 	takeoverOrigin       atomic.Pointer[takeoverOriginState] // SetTakeoverOrigin (#1207 S4b)
@@ -779,6 +781,9 @@ func (c *Coordinator) Start() error {
 	go c.streamClaimsMetricsLoop(c.ctx)
 	if proposer {
 		go c.streamClaimsEnableLoop(c.ctx)
+	}
+	if c.raftNode != nil {
+		go c.compactionCommitEnableLoop(c.ctx)
 	}
 	if c.cfg.StreamTakeover && c.raftNode != nil {
 		go c.departedExpiryLoop(c.ctx)
@@ -2077,10 +2082,19 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 			c.sendJoinError(conn, req, why)
 			return
 		}
+		ccWhy, ccRelease := c.compactionCommitJoinGate(req)
+		if ccWhy != "" {
+			release()
+			c.logger.Error().Str("node_id", req.NodeID).Str("role", req.Role).Str("reason", ccWhy).
+				Msg("Join refused: the node does not support compaction commit")
+			c.sendJoinError(conn, req, ccWhy)
+			return
+		}
 		joinGateReleased := false
 		releaseGate := func() {
 			if !joinGateReleased {
 				joinGateReleased = true
+				ccRelease()
 				release()
 			}
 		}
@@ -3060,6 +3074,7 @@ func (c *Coordinator) Status() map[string]interface{} {
 	// which nodes keep them off.
 	if c.raftNode != nil {
 		status["stream_claims"] = c.StreamClaimsStatus()
+		status["compaction_commit"] = c.CompactionCommitStatus()
 	}
 
 	// Add Raft status if configured (Phase 3)
