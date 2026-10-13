@@ -1140,6 +1140,14 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Query transformations cannot read storage scopes outside RBAC ([#1261](https://github.com/Basekick-Labs/arc/pull/1261))
+
+Queries now check the database and measurement scopes resolved by the transform
+before execution. This prevents a file reader or replacement scan from accessing
+storage that was not authorised by the query's RBAC check.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1261](https://github.com/Basekick-Labs/arc/pull/1261).
+
 ### A tag name with no matching column no longer stops a partition from compacting ([#1258](https://github.com/Basekick-Labs/arc/issues/1258))
 
 Ingest records each file's tag names in its `arc:tags` metadata, and
