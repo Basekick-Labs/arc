@@ -25,9 +25,11 @@ type AzureBlobBackend struct {
 	containerName string
 	prefix        string // blob-name prefix within the container (validated, with trailing /)
 	accountName   string
-	accountKey    string // Stored for subprocess credential passing
 	endpoint      string
-	logger        zerolog.Logger
+	// auth keeps every credential the backend was built with, so the
+	// compaction subprocess can rebuild it the same way (see Credentials).
+	auth   AzureBlobConfig
+	logger zerolog.Logger
 }
 
 // AzureBlobConfig holds Azure Blob Storage backend configuration
@@ -149,9 +151,14 @@ func NewAzureBlobBackend(cfg *AzureBlobConfig, logger zerolog.Logger) (*AzureBlo
 		containerName: cfg.ContainerName,
 		prefix:        prefix,
 		accountName:   cfg.AccountName,
-		accountKey:    cfg.AccountKey,
 		endpoint:      endpoint,
-		logger:        log,
+		auth: AzureBlobConfig{
+			ConnectionString:   cfg.ConnectionString,
+			AccountKey:         cfg.AccountKey,
+			SASToken:           cfg.SASToken,
+			UseManagedIdentity: cfg.UseManagedIdentity,
+		},
+		logger: log,
 	}
 
 	// Test connection by checking if container exists
@@ -599,13 +606,19 @@ func (b *AzureBlobBackend) GetAccountName() string {
 	return b.accountName
 }
 
-// GetAccountKey returns the account key (for subprocess credential passing)
-// GetAccountKey returns the Azure storage account key. It exists solely for
-// subprocess credential passing (compaction workers). The returned value is a
-// plaintext secret — callers MUST NOT log it, store it, or transmit it
-// outside the subprocess environment.
-func (b *AzureBlobBackend) GetAccountKey() string {
-	return b.accountKey
+// Credentials returns the authentication the backend was built with: the
+// connection string, account key, SAS token and managed-identity flag, and no
+// other field. It exists solely so the compaction subprocess can rebuild the
+// backend with the SAME authentication (#1104): ConfigJSON deliberately
+// carries no secrets, and passing only the account key made a backend built
+// from a connection string or a SAS token fall back to managed identity in the
+// subprocess. NewAzureBlobBackend picks among these by its own precedence, so
+// handing all of them over reproduces the parent's choice.
+//
+// The values are plaintext secrets: callers MUST NOT log, store or transmit
+// them anywhere but the subprocess's job input.
+func (b *AzureBlobBackend) Credentials() AzureBlobConfig {
+	return b.auth
 }
 
 // Type returns the storage type identifier
