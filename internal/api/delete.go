@@ -102,6 +102,12 @@ type DeleteHandler struct {
 	tempDir   string
 	rewriteMu sync.Mutex
 	logger    zerolog.Logger
+	// flusher is the ingest buffer: a DELETE flushes the rows acknowledged
+	// before it first (nil on nodes that do not ingest).
+	flusher DeleteFlusher
+	// recordID is the DELETE record of the rewrite running (under
+	// rewriteMu), 0 without one.
+	recordID uint64
 }
 
 // DeleteRequest represents a delete operation request
@@ -111,6 +117,10 @@ type DeleteRequest struct {
 	Where       string `json:"where"`
 	DryRun      bool   `json:"dry_run"`
 	Confirm     bool   `json:"confirm"`
+	// AllowUnreachable runs the DELETE although files the cluster manifest
+	// lists are not on this node (stream takeover): their rows are not
+	// deleted, and the response names them.
+	AllowUnreachable bool `json:"allow_unreachable,omitempty"`
 }
 
 // DeleteResponse represents a delete operation response
@@ -123,7 +133,10 @@ type DeleteResponse struct {
 	DryRun          bool     `json:"dry_run"`
 	FilesProcessed  []string `json:"files_processed"`
 	FailedFiles     []string `json:"failed_files,omitempty"`
-	Error           string   `json:"error,omitempty"`
+	// UnreachableFiles are manifest files this node did not have: with
+	// allow_unreachable, skipped; without it, why the DELETE was refused.
+	UnreachableFiles []string `json:"unreachable_files,omitempty"`
+	Error            string   `json:"error,omitempty"`
 }
 
 // DeleteConfigResponse represents delete configuration info
@@ -316,10 +329,6 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 
-	if !req.DryRun && takeoverBusy(h.coordinator, req.Database, req.Measurement) {
-		return respondTakeoverBusy(c, "delete")
-	}
-
 	// Validate WHERE clause
 	isFullTableDelete, err := h.validateWhereClause(req.Where)
 	if err != nil {
@@ -352,9 +361,32 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		Bool("dry_run", req.DryRun).
 		Msg("Processing delete request")
 
-	// Find affected files
 	ctx := c.Context()
-	affected, err := h.findAffectedFiles(ctx, req.Database, req.Measurement, req.Where)
+	// With stream takeover on, the DELETE is recorded in the cluster and
+	// applied again to rows acknowledged before it that reach a file later
+	// (#1207 d1): its time functions are fixed to now.
+	var rec deleteRecorder
+	var marks map[string]uint64
+	where := req.Where
+	if !req.DryRun {
+		if rec = recorderOf(h.coordinator); rec != nil {
+			if where, err = pinDeleteTime(req.Where, deleteNow()); err != nil {
+				return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{Success: false, Error: err.Error()})
+			}
+		}
+		if marks, err = h.flushBeforeDelete(ctx, req.Database, req.Measurement); err != nil {
+			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete rejected: " + err.Error() + "; retry shortly"})
+		}
+	}
+	var unreachable []string
+	if rec != nil {
+		if unreachable, err = h.waitLocalFiles(ctx, rec, req.Database, req.Measurement, req.AllowUnreachable); err != nil {
+			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete rejected: " + err.Error() + "; retry, or set allow_unreachable=true to skip them", UnreachableFiles: unreachable})
+		}
+	}
+
+	// Find affected files
+	affected, err := h.findAffectedFiles(ctx, req.Database, req.Measurement, where)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to find affected files")
 		return c.Status(fiber.StatusInternalServerError).JSON(DeleteResponse{
@@ -364,7 +396,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 
-	if len(affected) == 0 {
+	if len(affected) == 0 && rec == nil {
 		// findAffectedFiles scanned parquet files via read_parquet — clear the cache even though
 		// no rows matched, to avoid accumulating metadata for files that may later be deleted.
 		h.db.ClearHTTPCache()
@@ -433,8 +465,40 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	// same source must not both read and publish from the same pre-delete
 	// snapshot. DELETE is already dominated by Parquet rewrite I/O; serialize
 	// the rewrite phase rather than letting one request multiply another.
+	// Held from the record on: the outbox applies records to pending files
+	// under it too, and must not rewrite one between the scan and its use.
 	h.rewriteMu.Lock()
 	defer h.rewriteMu.Unlock()
+	h.recordID = 0
+	if rec != nil {
+		// Recorded before the rewrite: rows of its scope that reach a file
+		// from now on are rewritten without the matching ones. Then the
+		// files registered before it are scanned again, here.
+		id, err := rec.RecordDelete(ctx, req.Database, req.Measurement, where, marks)
+		if err != nil {
+			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete not run: recording it in the cluster failed or could not be confirmed (" + err.Error() + "); it may already apply to rows replayed later; retry to run it"})
+		}
+		h.recordID = id
+		if unreachable, err = h.waitLocalFiles(ctx, rec, req.Database, req.Measurement, req.AllowUnreachable); err != nil {
+			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete recorded, not run: " + err.Error() + "; rows the cluster replays later are already filtered; retry, or set allow_unreachable=true to skip them", UnreachableFiles: unreachable})
+		}
+		if affected, err = h.findAffectedFiles(ctx, req.Database, req.Measurement, where); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(DeleteResponse{
+				Success: false, Error: "Delete recorded, not run: failed to find affected files: " + err.Error(),
+				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+			})
+		}
+		var again int64
+		for _, f := range affected {
+			again += f.matchCount
+		}
+		if again > totalToDelete {
+			// Files that arrived since the first count; the DELETE is
+			// recorded already, so it runs on them too.
+			h.logger.Warn().Int64("counted", totalToDelete).Int64("now", again).
+				Msg("More rows match the delete than when it was checked against its limits; files arrived since")
+		}
+	}
 
 	h.logger.Info().
 		Int("file_count", len(affected)).
@@ -447,7 +511,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	failedFiles := make([]string, 0, len(affected))
 
 	for _, f := range affected {
-		deleted, err := h.rewriteFileWithoutDeletedRows(ctx, f.path, f.relativePath, req.Where)
+		deleted, err := h.rewriteFileWithoutDeletedRows(ctx, f.path, f.relativePath, where)
 		if err != nil {
 			// Post-rewrite bookkeeping/storage failures still mean the rows were
 			// removed from the newly published file. rewriteFileWithoutDeletedRows
@@ -500,14 +564,15 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		Msg("Delete operation completed")
 
 	resp := DeleteResponse{
-		Success:         len(failedFiles) == 0,
-		DeletedCount:    totalDeleted,
-		AffectedFiles:   len(affected),
-		RewrittenFiles:  rewrittenCount,
-		ExecutionTimeMs: executionTime,
-		DryRun:          false,
-		FilesProcessed:  processedFiles,
-		FailedFiles:     failedFiles,
+		Success:          len(failedFiles) == 0,
+		DeletedCount:     totalDeleted,
+		AffectedFiles:    len(affected),
+		RewrittenFiles:   rewrittenCount,
+		ExecutionTimeMs:  executionTime,
+		DryRun:           false,
+		FilesProcessed:   processedFiles,
+		FailedFiles:      failedFiles,
+		UnreachableFiles: unreachable,
 	}
 
 	if len(failedFiles) > 0 {
@@ -829,7 +894,14 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 		// gone (#1210). Taken out of the outbox first; if it was confirmed
 		// meanwhile, the manifest delete below removes it.
 		if h.pending != nil {
-			if _, _, err := h.pending.Withdraw(ctx, relativePath); err != nil {
+			withdraw := h.pending.Withdraw
+			if w, ok := h.pending.(deleteWithdrawer); ok && h.recordID != 0 {
+				// Batches of another writer process settle as deleted too.
+				withdraw = func(ctx context.Context, path string) (bool, cluster.ReplaceOutcome, error) {
+					return w.WithdrawForDelete(ctx, path, h.recordID)
+				}
+			}
+			if _, _, err := withdraw(ctx, relativePath); err != nil {
 				return 0, fmt.Errorf("withdraw pending registration for %s: %w", relativePath, err)
 			}
 		}
@@ -1157,6 +1229,10 @@ func (h *DeleteHandler) replaceManifestAfterRewrite(ctx context.Context, oldPath
 		}
 		switch outcome {
 		case cluster.ReplaceSwapped:
+			if st, ok := h.pending.(deleteSeenStamper); ok && h.recordID != 0 {
+				// Rewritten with this DELETE: no second pass for its record.
+				st.SetDeleteSeen(newPath, h.recordID)
+			}
 			if err := h.storage.Delete(ctx, oldPath); err != nil {
 				return fmt.Errorf("failed to delete superseded pending rewrite %q: %w", oldPath, err)
 			}
@@ -1229,20 +1305,9 @@ func (h *DeleteHandler) replaceManifestAfterRewrite(ctx context.Context, oldPath
 	return nil
 }
 
-// takeoverBusy asks the coordinator, when it can tell, whether a stream
-// takeover is publishing rows of db/measurement (#1207): a delete applied
-// before them would be undone by them.
-func takeoverBusy(coord any, db, measurement string) bool {
-	b, ok := coord.(interface {
-		StreamTakeoverBusy(db, measurement string) bool
-	})
-	return ok && b.StreamTakeoverBusy(db, measurement)
-}
-
-func respondTakeoverBusy(c *fiber.Ctx, what string) error {
+// respondDeleteUnavailable answers 503 with a retry hint.
+func respondDeleteUnavailable(c *fiber.Ctx, resp DeleteResponse) error {
+	resp.Success = false
 	c.Set(fiber.HeaderRetryAfter, "30")
-	return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-		"success": false,
-		"error":   what + " rejected: a stream takeover is publishing rows a writer acknowledged before it failed; retry shortly",
-	})
+	return c.Status(fiber.StatusServiceUnavailable).JSON(resp)
 }

@@ -3906,9 +3906,15 @@ func main() {
 		// place (#1210).
 		deleteHandler.SetPendingRegistrations(registrationOutbox)
 	}
+	// A DELETE flushes the rows acknowledged before it first, so it sees them
+	// in files (#1207 d1).
+	deleteHandler.SetFlusher(arrowBuffer)
 	deleteHandler.RegisterRoutes(server.GetApp())
 	if clusterCoordinator != nil {
 		deleteHandler.SetCoordinator(clusterCoordinator)
+		// DELETE records are applied to pending files with the DELETE's own
+		// rewrite (#1207 d1).
+		clusterCoordinator.SetDeleteRewriter(deleteHandler.RewriteForRecords)
 	}
 	if cfg.Delete.Enabled {
 		log.Info().
@@ -3922,6 +3928,10 @@ func main() {
 	// Register Databases handler
 	databasesHandler := api.NewDatabasesHandler(storageBackend, &cfg.Delete, authManager, logger.Get("databases"))
 	databasesHandler.SetFieldSchema(fieldSchemaRegistry)
+	databasesHandler.SetFlusher(arrowBuffer)
+	if registrationOutbox != nil {
+		databasesHandler.SetPendingRegistrations(registrationOutbox)
+	}
 	if clusterCoordinator != nil {
 		databasesHandler.SetCoordinator(clusterCoordinator, cfg.Cluster.SharedStorageMode || cfg.Cluster.ReplicationEnabled)
 	}

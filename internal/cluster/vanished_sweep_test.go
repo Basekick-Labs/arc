@@ -88,34 +88,3 @@ func TestVanishedSweepWaitsForThePendingGuard(t *testing.T) {
 		t.Fatalf("swept without the guard: %v", got)
 	}
 }
-
-// An origin back with an instance taken over (adopted, with a claim
-// record) keeps DELETEs of its keys waiting, for a bounded time.
-func TestRepublishKeepsDeletesWaiting(t *testing.T) {
-	r := newClaimantRig(t)
-	fsm := r.c.raftNode.FSM()
-	propose(t, r.c, raft.CommandTakeOverStreamV2, raft.TakeOverStreamV2Payload{Origin: clOrigin, By: "writer-1", Now: time.Now(),
-		Claims: []raft.ClaimSet{{Instance: clInst, Keys: map[string]raft.Intervals{clKey: {{1, 1}}}}}})
-	k, _ := r.claim(t)
-	propose(t, r.c, raft.CommandClaimDone, raft.ClaimDonePayload{Instance: clInst, By: "writer-1", Epoch: k.Epoch, Now: time.Now()})
-	match := func(db, m string) func(string) bool {
-		return func(key string) bool { return key == db+"/"+m }
-	}
-	now := time.Now()
-	if r.c.republishBusy(fsm, match("db", "cpu"), now) {
-		t.Fatal("busy while the instance is current")
-	}
-	propose(t, r.c, raft.CommandAnnounceInstance, raft.AnnounceInstancePayload{Origin: clOrigin, Instance: 0x600, FreshStart: true, Holds: []uint64{clInst}})
-	if !r.c.republishBusy(fsm, match("db", "cpu"), now) {
-		t.Fatal("not busy while its origin republishes")
-	}
-	if !r.c.StreamTakeoverBusy("db", "cpu") || r.c.StreamTakeoverBusy("db", "mem") {
-		t.Fatal("DELETE gate")
-	}
-	if r.c.republishBusy(fsm, match("db", "mem"), now) {
-		t.Fatal("busy for another key")
-	}
-	if r.c.republishBusy(fsm, match("db", "cpu"), now.Add(republishWindow)) {
-		t.Fatal("busy past the window")
-	}
-}

@@ -164,6 +164,14 @@ const (
 	CommandInstanceSettled
 	// CommandExtendStreamClaim: a claimant adding keys to its unfinished claim.
 	CommandExtendStreamClaim
+	// CommandRecordDelete: the primary recording a row DELETE (#1207 d1).
+	CommandRecordDelete
+	// CommandRecordDeleteAck: a writer acknowledging a DELETE record that
+	// names its current instance.
+	CommandRecordDeleteAck
+	// CommandSettleDeleted: a writer settling batches a DELETE removed every
+	// row of.
+	CommandSettleDeleted
 )
 
 // Command represents a command to be applied to the FSM.
@@ -273,6 +281,9 @@ type RegisterFilePayload struct {
 	// InheritFrom names a registered file this one rewrites (a row DELETE):
 	// the file takes over that file's coverage.
 	InheritFrom string `json:"inherit_from,omitempty"`
+	// DeleteSeen is the newest DELETE record the file's rows were filtered
+	// against (#1207 d1); 0 when none was applied to it.
+	DeleteSeen uint64 `json:"delete_seen,omitempty"`
 }
 
 // DeleteFilePayload is the payload for CommandDeleteFile.
@@ -502,10 +513,13 @@ type ClusterFSM struct {
 	applyStarted atomic.Uint64
 	applyDone    atomic.Uint64
 
-	mu                sync.RWMutex
-	nodes             map[string]*NodeInfo
-	primaryWriterID   string                // ID of the current primary writer node
-	primaryFast       atomic.Value          // string; mirror of primaryWriterID for lock-free reads (setPrimaryLocked)
+	mu              sync.RWMutex
+	nodes           map[string]*NodeInfo
+	primaryWriterID string       // ID of the current primary writer node
+	primaryFast     atomic.Value // string; mirror of primaryWriterID for lock-free reads (setPrimaryLocked)
+	// unackedDeletes: the instances a live DELETE record names that have not
+	// acknowledged it, for the lock-free ingest gate (delete_records.go).
+	unackedDeletes    atomic.Pointer[map[uint64]bool]
 	activeCompactorID string                // ID of the node currently holding the compactor lease
 	files             map[string]*FileEntry // File manifest (path → entry) for peer replication
 	// Secondary index: database → set of file paths. Maintained alongside
@@ -1104,6 +1118,15 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 	case CommandExtendStreamClaim:
 		defer f.bumpTakeoverGen()
 		return f.applyExtendStreamClaim(cmd.Payload, log.Index)
+	case CommandRecordDelete:
+		defer f.bumpTakeoverGen()
+		return f.applyRecordDelete(cmd.Payload, log.Index)
+	case CommandRecordDeleteAck:
+		defer f.bumpTakeoverGen()
+		return f.applyRecordDeleteAck(cmd.Payload)
+	case CommandSettleDeleted:
+		defer f.bumpTakeoverGen()
+		return f.applySettleDeleted(cmd.Payload)
 	case CommandDeleteFile:
 		return f.applyDeleteFile(cmd.Payload)
 	case CommandAssignCompactor:
@@ -2939,6 +2962,7 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		f.takeover = restoreTakeover(sc.Takeover)
 	}
 	f.takeover.gen = prevGen + 1
+	f.refreshUnackedDeletesLocked()
 	onCompactionPauseChanged := f.onCompactionPauseChanged
 	f.nodes = restoredNodes
 	f.barriers = restoredBarriers

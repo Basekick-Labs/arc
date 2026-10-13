@@ -147,6 +147,9 @@ type Coordinator struct {
 	takeoverOrigin       atomic.Pointer[takeoverOriginState] // SetTakeoverOrigin (#1207 S4b)
 	claimedExit          atomic.Bool                         // another writer claimed this process: refuse writes, exit (#1207)
 	claimant             atomic.Pointer[claimant]            // StartOriginStream with stream takeover (#1207)
+	deleteRecords        atomic.Pointer[deleteRecordState]   // StartOriginStream with stream takeover (#1207 d1)
+	deleteRewriter       atomic.Pointer[DeleteRewriter]      // SetDeleteRewriter
+	deleteOutbox         atomic.Pointer[RegistrationOutbox]  // the outbox the DELETE hooks are on
 	pauseNotifyMu        sync.Mutex                          // ingestPauseChanged
 	pauseNotified        bool
 	pauseState           bool
@@ -178,10 +181,6 @@ type Coordinator struct {
 	// pendingRegistration reports whether a path waits for registration in
 	// this writer's outbox (nil on other nodes).
 	pendingRegistration atomic.Pointer[func(string) bool]
-	// republishSeen is when this node first saw each adopted instance with a
-	// claim record (DELETE gate, republishBusy).
-	republishMu   sync.Mutex
-	republishSeen map[uint64]time.Time
 	// catchupOnce guarantees the Phase 3 catch-up walker runs at most once
 	// per coordinator lifetime, across repeated Start/Stop cycles in tests.
 	catchupOnce sync.Once

@@ -128,16 +128,10 @@ func TestClaimantPublishesADeadPrimarysBatchesOnce(t *testing.T) {
 	r.stored(t, 1, 3)
 	r.stored(t, 2, 2)
 
-	// Within the grace: nothing is claimed, but a DELETE of the key waits.
+	// Within the grace: nothing is claimed.
 	r.cl.pass(ctx)
 	if _, ok := r.claim(t); ok {
 		t.Fatal("claimed within the grace")
-	}
-	if !r.c.StreamTakeoverBusy("db", "cpu") || !r.c.StreamTakeoverBusy("db", "") {
-		t.Fatal("a DELETE of a key about to be claimed is not gated")
-	}
-	if r.c.StreamTakeoverBusy("db", "mem") || r.c.StreamTakeoverBusy("other", "") {
-		t.Fatal("a DELETE of another key is gated")
 	}
 
 	r.afterGrace()
@@ -164,13 +158,10 @@ func TestClaimantPublishesADeadPrimarysBatchesOnce(t *testing.T) {
 	if len(files) == 0 {
 		t.Fatal("no file registered")
 	}
-	// Finished: the store copy goes (every file is local), and DELETEs pass.
+	// Finished: the store copy goes (every file is local).
 	r.cl.pass(ctx)
 	if r.store.Held(clOrigin, clInst) != nil {
 		t.Fatal("store copy of a finished claim kept")
-	}
-	if r.c.StreamTakeoverBusy("db", "cpu") {
-		t.Fatal("DELETE still gated after the claim finished")
 	}
 	// Nothing is published twice.
 	before := len(fsm.GetFilesByDatabase("db"))
@@ -472,36 +463,6 @@ func TestDesignationGate(t *testing.T) {
 	}
 }
 
-// The DELETE gate reads the manifest and the store at request time: no
-// claimant pass is needed for a just-designated primary to hold DELETEs.
-func TestStreamTakeoverBusyAtRequestTime(t *testing.T) {
-	r := newClaimantRig(t)
-	if r.c.StreamTakeoverBusy("db", "cpu") {
-		t.Fatal("nothing stored, nothing claimed: busy")
-	}
-	r.stored(t, 1, 1)
-	if !r.c.StreamTakeoverBusy("db", "cpu") {
-		t.Fatal("a dead writer's batches stored here, no pass yet: a DELETE was let through")
-	}
-	// The writer is back: nothing to claim.
-	peer := NewNode(clOrigin, clOrigin, RoleWriter, "test-cluster")
-	peer.UpdateState(StateHealthy)
-	if err := r.c.registry.Register(peer); err != nil {
-		t.Fatal(err)
-	}
-	if r.c.StreamTakeoverBusy("db", "cpu") {
-		t.Fatal("a live writer's batches block DELETEs")
-	}
-	off, _ := takeoverOriginRig(t, false)
-	if off.StreamTakeoverBusy("db", "cpu") {
-		t.Fatal("flag off: busy")
-	}
-	var nilCoord *Coordinator
-	if nilCoord.StreamTakeoverBusy("db", "cpu") {
-		t.Fatal("nil coordinator: busy")
-	}
-}
-
 // Another writer finished a claim whose copy lacked a batch this node holds:
 // this node claims the rest (a follow-up claim), though not the primary.
 func TestClaimantFollowUpClaim(t *testing.T) {
@@ -691,18 +652,6 @@ func TestClaimantDropsAFrozenCopy(t *testing.T) {
 	}
 }
 
-// Another writer's unfinished claim holds DELETEs of its keys, whatever
-// this node's store holds.
-func TestStreamTakeoverBusyForAnotherClaimant(t *testing.T) {
-	r := newClaimantRig(t)
-	propose(t, r.c, raft.CommandAnnounceInstance, raft.AnnounceInstancePayload{Origin: clOrigin, Instance: 0x600, FreshStart: true})
-	propose(t, r.c, raft.CommandTakeOverStreamV2, raft.TakeOverStreamV2Payload{Origin: clOrigin, By: "writer-1", Now: time.Now(),
-		Claims: []raft.ClaimSet{{Instance: clInst, Keys: map[string]raft.Intervals{"db/mem": {{1, 2}}}}}})
-	if !r.c.StreamTakeoverBusy("db", "mem") || r.c.StreamTakeoverBusy("db", "cpu") {
-		t.Fatal("an unfinished claim does not hold DELETEs of its key alone")
-	}
-}
-
 // A claim that opened with part of what this node holds grows to the rest.
 func TestClaimantExtendsItsClaim(t *testing.T) {
 	r := newClaimantRig(t)
@@ -741,53 +690,6 @@ func TestClaimantParkedFileOfItsClaim(t *testing.T) {
 	if k, _ = r.claim(t); !k.Done || k.Unreplayable[clKey].Count() != 1 || !k.Unreplayable[clKey].Contains(2) {
 		t.Fatalf("claim %+v", k)
 	}
-}
-
-// DELETEs wait for every writer this node hears from to answer an ended
-// claim (a follow-up claim, or a report of holding nothing), within a
-// window after it ended.
-func TestStreamTakeoverBusyWaitsForFollowUps(t *testing.T) {
-	r := newClaimantRig(t)
-	ctx := context.Background()
-	propose(t, r.c, raft.CommandTakeOverStreamV2, raft.TakeOverStreamV2Payload{Origin: clOrigin, By: "writer-1", Now: time.Now(),
-		Claims: []raft.ClaimSet{{Instance: clInst, Keys: map[string]raft.Intervals{clKey: {{1, 1}}}}}})
-	k, _ := r.claim(t)
-	propose(t, r.c, raft.CommandClaimDone, raft.ClaimDonePayload{Instance: clInst, By: "writer-1", Epoch: k.Epoch, Now: time.Now().UTC()})
-	if r.c.StreamTakeoverBusy("db", "cpu") {
-		t.Fatal("no other writer heard from: busy")
-	}
-	w3 := NewNode("writer-3", "writer-3", RoleWriter, "test-cluster")
-	w3.UpdateState(StateHealthy)
-	if err := r.c.registry.Register(w3); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.c.raftNode.AddNode(&raft.NodeInfo{ID: "writer-3", Name: "writer-3", Role: string(RoleWriter), ClusterName: "test-cluster", Address: "writer-3:9100", State: string(StateHealthy)}, 5*time.Second); err != nil {
-		t.Fatal(err)
-	}
-	if !r.c.StreamTakeoverBusy("db", "cpu") || r.c.StreamTakeoverBusy("db", "mem") {
-		t.Fatal("a writer that may follow up does not hold DELETEs of the claim's key alone")
-	}
-	propose(t, r.c, raft.CommandTakeOverStreamV2, raft.TakeOverStreamV2Payload{Origin: clOrigin, By: "writer-3", Now: time.Now(),
-		Claims: []raft.ClaimSet{{Instance: clInst}}})
-	if r.c.StreamTakeoverBusy("db", "cpu") {
-		t.Fatal("every writer answered: still busy")
-	}
-	// Past the window, an unanswered writer no longer holds DELETEs.
-	propose(t, r.c, raft.CommandAnnounceInstance, raft.AnnounceInstancePayload{Origin: clOrigin, Instance: 0x700, FreshStart: true})
-	propose(t, r.c, raft.CommandAnnounceInstance, raft.AnnounceInstancePayload{Origin: clOrigin, Instance: 0x701, FreshStart: true})
-	propose(t, r.c, raft.CommandTakeOverStreamV2, raft.TakeOverStreamV2Payload{Origin: clOrigin, By: "writer-1", Now: time.Now(),
-		Claims: []raft.ClaimSet{{Instance: 0x700, Keys: map[string]raft.Intervals{"db/mem": {{1, 1}}}}}})
-	var e uint64
-	for _, x := range r.c.raftNode.FSM().StreamClaims() {
-		if x.Instance == 0x700 {
-			e = x.Epoch
-		}
-	}
-	propose(t, r.c, raft.CommandClaimDone, raft.ClaimDonePayload{Instance: 0x700, By: "writer-1", Epoch: e, Now: time.Now().Add(-time.Hour).UTC()})
-	if r.c.StreamTakeoverBusy("db", "mem") {
-		t.Fatal("busy past the follow-up window")
-	}
-	_ = ctx
 }
 
 // The copy of an instance removed with its claim (every writer answered)

@@ -138,6 +138,8 @@ type RegistrationOutbox struct {
 	coveredSent          atomic.Int64 // covered registrations sent (FreshStart)
 	// parkedCovered: the republisher's verdicts (SetParkedCovered).
 	parkedCovered atomic.Pointer[ParkedCoveredFunc]
+	// deleteHooks apply DELETE records to pending files (delete_records_outbox.go).
+	deleteHooks atomic.Pointer[DeleteRecordHooks]
 
 	registered atomic.Int64
 	skipped    atomic.Int64
@@ -215,6 +217,10 @@ type journalRecord struct {
 	// file of a group carries the whole group's coverage. Readers before
 	// #1207 ignore the field.
 	Cov *ingest.GroupCoverage `json:"cov,omitempty"`
+	// DeleteSeen is the newest DELETE record the file was rewritten with
+	// (#1207 d1); readers before d1 ignore it, and the manifest then refuses
+	// such a file as deleted until it is rewritten again.
+	DeleteSeen uint64 `json:"ds,omitempty"`
 }
 
 const journalRecordVersionCoverage = 2
@@ -997,7 +1003,15 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 		}
 		// Coverage goes with every covered file: an FSM without stream
 		// takeover ignores it, one with it needs it from the first file.
-		rp := raft.RegisterFilePayload{File: r.fileEntry(e.rec), Cov2: fileCoverage(e.rec.Cov), Supersedes: e.rec.Supersedes}
+		cov2 := fileCoverage(e.rec.Cov)
+		switch r.applyDeleteRecords(ctx, e, cov2) {
+		case applyDefer:
+			deferred = append(deferred, e)
+			continue
+		case applyGone:
+			continue
+		}
+		rp := raft.RegisterFilePayload{File: r.fileEntry(e.rec), Cov2: cov2, Supersedes: e.rec.Supersedes, DeleteSeen: e.rec.DeleteSeen}
 		payload, err := json.Marshal(rp)
 		if err != nil || raft.ValidateManifestPath(e.rec.Path) != nil {
 			r.skipped.Add(1)
@@ -1027,10 +1041,12 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 		cancel()
 		if applyErr != nil && raft.IsStreamClaimConflict(applyErr) {
 			// Terminal for the named ops; the rest go again next round.
-			refused := r.refuseClaimed(ctx, manifest, applyErr, opEntry)
+			refused, waiting := r.refuseClaimed(ctx, manifest, applyErr, opEntry)
 			settled = append(settled, refused...)
 			if len(refused) > 0 {
 				applyErr = nil
+			} else if waiting > 0 {
+				applyErr = errDeletedRefusal
 			} else {
 				r.logger.Warn().Err(applyErr).Msg("File registrations refused for a stream claim, but the refused files could not be identified; retrying")
 			}
@@ -1118,8 +1134,9 @@ func (r *RegistrationOutbox) markInManifest(e *outboxEntry) {
 }
 
 // ErrRegistrationParked refuses a DELETE of a file the stream takeover rules
-// refused and parked (#1207): its rows are re-flushed from the WAL later, so
-// a DELETE now would be undone. Retryable once the parked file is resolved.
+// refused and parked (#1207) while the DELETE was rewriting it: the file is
+// out of the query path, and its rows are published again from the WAL with
+// the DELETE's record applied. Retryable once the parked file is resolved.
 var ErrRegistrationParked = errors.New("the file was refused by the stream takeover rules and is parked; retry the DELETE later")
 
 // ReplaceOutcome says what ReplacePending found for the old path.
@@ -1308,7 +1325,8 @@ func (r *RegistrationOutbox) nextBatch() []*outboxEntry {
 	var out []*outboxEntry
 	i := r.head
 	for ; i < len(r.queue) && len(out) < registrarDrainBatch; i++ {
-		if e := r.queue[i]; e != nil && !e.done {
+		// One in flight already is held by a DELETE settling it.
+		if e := r.queue[i]; e != nil && !e.done && !e.inFlight {
 			e.inFlight = true
 			out = append(out, e)
 		}
@@ -1510,15 +1528,21 @@ func (r *RegistrationOutbox) fileEntry(rec journalRecord) raft.FileEntry {
 }
 
 // refuseClaimed parks the entries of the ops a takeover refusal names and
-// returns them for settling. It runs while they are in flight, so a DELETE
+// returns them for settling; waiting counts entries refused for a DELETE
+// record, which stay pending. It runs while they are in flight, so a DELETE
 // of one waits. A refused rewrite's paired delete is still applied on its
 // own: a DELETE whose earlier apply committed must not leave the original
 // file registered. An entry that cannot be parked stays pending.
-func (r *RegistrationOutbox) refuseClaimed(ctx context.Context, manifest OutboxManifest, err error, opEntry map[int]*outboxEntry) []*outboxEntry {
-	var out []*outboxEntry
+func (r *RegistrationOutbox) refuseClaimed(ctx context.Context, manifest OutboxManifest, err error, opEntry map[int]*outboxEntry) (out []*outboxEntry, waiting int) {
 	for _, op := range raft.StreamClaimConflictOps(err) {
 		e := opEntry[op.Op]
 		if e == nil {
+			continue
+		}
+		if op.Kind == raft.RefusedDeleted {
+			// Not parked: it stays pending, and the next attempt applies the
+			// record this node may not have applied yet (#1207 d1).
+			waiting++
 			continue
 		}
 		if e.rec.Supersedes != "" {
@@ -1541,7 +1565,7 @@ func (r *RegistrationOutbox) refuseClaimed(ctx context.Context, manifest OutboxM
 		r.mu.Unlock()
 		out = append(out, e)
 	}
-	return out
+	return out, waiting
 }
 
 // fileCoverage is a file's exact coverage as the cluster manifest records

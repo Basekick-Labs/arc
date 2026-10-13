@@ -371,7 +371,7 @@ every node sets `cluster.stream_takeover` (see "Stream takeover" below):
 **Stream takeover (live, opt-in).** With `cluster.stream_takeover = true` on
 every node (writers also need `cluster.wal_coverage = true` and an explicit
 `cluster.node_id`), the cluster turns takeover on by itself once every node
-advertises support (`stream_claims_v6`; builds that advertised `v1` to `v5`
+advertises support (`stream_claims_v7`; builds that advertised `v1` to `v6`
 block it). From then on:
 - **A dead primary's acknowledged rows are published by the new primary.**
   When the primary stops answering and failover designates another writer,
@@ -402,14 +402,44 @@ block it). From then on:
   process), as long as the old primary has not come back with a new process
   and is not the designated primary. A process its writer gave up (it
   restarted without it) is published by any writer holding it, at once.
-- **DELETEs wait for a takeover.** `POST /api/v1/delete` and
-  `DELETE /api/v1/databases/{name}` answer 503 with `Retry-After: 30` while a
-  claim of that measurement is unfinished, while the primary holds batches
-  of a gone writer it may claim, or, after a claim finished, until every
-  writer the primary hears from has claimed what it holds or reported
-  holding nothing (at most twice the grace plus 20 seconds): a DELETE
-  applied first would be undone by the replay of rows acknowledged before
-  it.
+- **A DELETE stays deleted through a takeover.** With takeover on, a row
+  DELETE (`POST /api/v1/delete`) or a database deletion
+  (`DELETE /api/v1/databases/{name}`) is recorded in the cluster before it
+  runs. Rows acknowledged before it that are not in a registered file yet (a
+  standby's copy a takeover replays, an old primary's WAL, a writer's pending
+  files) are rewritten without the rows it removes before they are
+  registered, with the DELETE's own SQL, and the cluster manifest refuses any
+  such file that was not. Rows acknowledged after the DELETE's own flush
+  are outside the record (a write concurrent with the DELETE may or may not
+  be deleted). So:
+  - the DELETE no longer waits for a takeover (the 503 "a stream takeover is
+    publishing rows" is gone);
+  - `now()`, `current_timestamp`, `current_date` and the other per-statement
+    time functions in the WHERE clause are fixed to the time the DELETE ran,
+    in UTC, so a later replay matches the same rows; `random()`, `uuid()`,
+    `nextval()` and similar are refused (400);
+  - the primary first waits (up to 30 seconds) for every file the manifest
+    lists of the measurement to be on its disk, since the DELETE rewrites
+    the files it has. A file that does not arrive answers 503 with
+    `unreachable_files`; set `"allow_unreachable": true` to run the DELETE
+    anyway: the response lists the files it skipped, and their rows are not
+    deleted;
+  - each writer acknowledges every DELETE with the batches it had accepted at
+    that point, and refuses writes (503, retryable) for the moment it takes
+    (about 100 ms);
+  - for a few seconds, a node that is not the primary can still show deleted
+    rows in a file it has just written and not registered yet. The primary
+    never does once the DELETE has answered;
+  - the cluster keeps at most 256 DELETEs until every writer process they
+    name has settled the batches that came before. Past that, the oldest one
+    that only retired writer processes still hold is dropped, and those
+    processes are removed (their copies are parked if they come back);
+    otherwise a DELETE answers 503 until older ones settle. A writer that is
+    down, and neither back nor given up on (removed, or its departure
+    expired), holds every DELETE made while it is down.
+    `GET /api/v1/cluster/stream-claims` lists the DELETEs kept
+    (`delete_records`) and the writer processes that have not reported their
+    batches for each (`unacknowledged`).
 - **Operator controls** (admin):
   `GET /api/v1/cluster/stream-claims` lists processes and claims;
   `POST /api/v1/cluster/stream-claims/{instance}/release` with
@@ -422,16 +452,15 @@ block it). From then on:
   the grace.
 - New gauge `arc_stream_takeover_oldest_claim_age_seconds`: how long the
   oldest unfinished claim has been open. A claim whose replay keeps failing
-  (a full disk, for example) is never given up on by itself, and DELETEs of
-  its measurements wait: alert on this gauge.
+  (a full disk, for example) is never given up on by itself: alert on this
+  gauge.
 - **An old primary that comes back with its volume publishes the rest.**
   Rows it acknowledged that no standby held (the replication lag), and rows
   the new primary could not publish, are in its WAL: it reads them back and
   publishes them, once, and its copies of rows a takeover already published
   are refused and removed. Flushes never put batches another writer claimed in
   the same file as batches nobody claimed, nor batches of two processes of the
-  writer, so a refusal never holds back rows nobody else has. DELETEs of
-  those measurements wait while it does (at most 10 minutes).
+  writer, so a refusal never holds back rows nobody else has.
 - **A writer the cluster gave up on is retired, not forgotten.** When every
   writer has finished with a process of a writer that was removed, or whose
   departure expired, the process is kept as `retired` (the last 256), with
@@ -1136,6 +1165,20 @@ throughput. A negative value is refused at startup.
 Above the new ceiling, when the WAL queue is full, an entry is still dropped and
 the write still acknowledged. What admission should do instead is
 [#676](https://github.com/Basekick-Labs/arc/issues/676).
+
+### A DELETE removes rows that were still buffered ([#1207](https://github.com/Basekick-Labs/arc/issues/1207))
+
+`POST /api/v1/delete` and `DELETE /api/v1/databases/{name}` only ever looked at
+Parquet files. Rows written shortly before (still in the ingest buffer, not yet
+flushed) were left out, and showed up once the buffer flushed. Now both flush
+the buffered rows of that measurement (or database) first and wait for them to
+reach files, so every row acknowledged before the request is deleted. A dry run
+does not flush. While an earlier flush failure is outstanding (its rows wait
+for WAL recovery), both answer 503 with `Retry-After: 30` instead.
+
+A database deletion also withdraws the files of that database still waiting to
+be registered in the cluster manifest, so none registers after the database is
+gone.
 
 ### Delete API catches dangerous keywords glued to numbers or literals ([#1080](https://github.com/Basekick-Labs/arc/issues/1080))
 
