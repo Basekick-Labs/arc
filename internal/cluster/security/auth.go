@@ -526,6 +526,60 @@ func ValidateOriginStreamHelloAckHMAC(sharedSecret, helloNonce, originNodeID, in
 	return nil
 }
 
+// ComputePendingRegistrationsQueryHMAC authenticates a reconciler asking a
+// node for its pending registrations (#1214).
+//
+// Format: "pending-registrations-query" \x00 nonce \x00 nodeID \x00 clusterName \x00 timestamp
+func ComputePendingRegistrationsQueryHMAC(sharedSecret, nonce, nodeID, clusterName string, timestamp int64) string {
+	return hex.EncodeToString(computeRawHMAC(sharedSecret, pendingQueryMessage(nonce, nodeID, clusterName, timestamp)))
+}
+
+func pendingQueryMessage(nonce, nodeID, clusterName string, timestamp int64) string {
+	return fmt.Sprintf("pending-registrations-query\x00%s\x00%s\x00%s\x00%d", nonce, nodeID, clusterName, timestamp)
+}
+
+// ValidatePendingRegistrationsQueryHMAC checks a query's MAC and freshness.
+func ValidatePendingRegistrationsQueryHMAC(sharedSecret, nonce, nodeID, clusterName string, timestamp int64, receivedMAC string, tolerance time.Duration) error {
+	if err := checkHMACTimestamp("pending-registrations-query", timestamp, tolerance); err != nil {
+		return err
+	}
+	expected := computeRawHMAC(sharedSecret, pendingQueryMessage(nonce, nodeID, clusterName, timestamp))
+	if !constantTimeHexEqual(expected, receivedMAC) {
+		return fmt.Errorf("pending-registrations-query HMAC validation failed: shared secret mismatch or malformed MAC")
+	}
+	return nil
+}
+
+// ComputePendingRegistrationsReplyHMAC authenticates a node's answer, bound to
+// the query's nonce so a recorded answer cannot be replayed to a new query,
+// and over a SHA-256 digest of the paths so none can be stripped on the way.
+//
+// Format: "pending-registrations-reply" \x00 queryNonce \x00 nodeID \x00 clusterName \x00 status \x00 sha256(paths, NUL-separated) \x00 timestamp
+func ComputePendingRegistrationsReplyHMAC(sharedSecret, queryNonce, nodeID, clusterName, status string, paths []string, timestamp int64) string {
+	return hex.EncodeToString(computeRawHMAC(sharedSecret, pendingReplyMessage(queryNonce, nodeID, clusterName, status, paths, timestamp)))
+}
+
+func pendingReplyMessage(queryNonce, nodeID, clusterName, status string, paths []string, timestamp int64) string {
+	h := sha256.New()
+	for _, p := range paths {
+		h.Write([]byte(p))
+		h.Write([]byte{0})
+	}
+	return fmt.Sprintf("pending-registrations-reply\x00%s\x00%s\x00%s\x00%s\x00%x\x00%d", queryNonce, nodeID, clusterName, status, h.Sum(nil), timestamp)
+}
+
+// ValidatePendingRegistrationsReplyHMAC checks a node's answer.
+func ValidatePendingRegistrationsReplyHMAC(sharedSecret, queryNonce, nodeID, clusterName, status string, paths []string, timestamp int64, receivedMAC string, tolerance time.Duration) error {
+	if err := checkHMACTimestamp("pending-registrations-reply", timestamp, tolerance); err != nil {
+		return err
+	}
+	expected := computeRawHMAC(sharedSecret, pendingReplyMessage(queryNonce, nodeID, clusterName, status, paths, timestamp))
+	if !constantTimeHexEqual(expected, receivedMAC) {
+		return fmt.Errorf("pending-registrations-reply HMAC validation failed: shared secret mismatch, paths tampered, or malformed MAC")
+	}
+	return nil
+}
+
 // DeriveOriginStreamSessionKey derives the origin stream's per-connection key
 // from the shared secret and the hello nonce. A different HKDF info string
 // from the replication session, so the two keys never coincide.

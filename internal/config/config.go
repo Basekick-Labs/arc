@@ -581,7 +581,7 @@ type SchedulerConfig struct {
 type ReconciliationConfig struct {
 	Enabled                   bool   // Off by default — explicit operator opt-in
 	Schedule                  string // Cron schedule (default: "17 4 * * *" = 04:17 daily)
-	GraceWindowSeconds        int    // Orphan storage files younger than this are NEVER deleted (default: 86400 = 24h)
+	GraceWindowSeconds        int    // Orphan storage files younger than this are NEVER deleted (default: 86400 = 24h; minimum 3600, a lower value is raised to it)
 	ClockSkewAllowanceSeconds int    // Added to grace window (default: 300 = 5m)
 	PerPrefixTimeoutSeconds   int    // Per-prefix List timeout (default: 300 = 5m)
 	MaxRunDurationSeconds     int    // Overall run timeout (default: 1800 = 30m)

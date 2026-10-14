@@ -140,6 +140,9 @@ type RegistrationOutbox struct {
 	parkedCovered atomic.Pointer[ParkedCoveredFunc]
 	// deleteHooks apply DELETE records to pending files (delete_records_outbox.go).
 	deleteHooks atomic.Pointer[DeleteRecordHooks]
+	// publisher publishes the pending set to a shared object store
+	// (pending_registrations.go, #1214); nil elsewhere. Under mu.
+	publisher *pendingPublisher
 
 	registered atomic.Int64
 	skipped    atomic.Int64
@@ -492,6 +495,9 @@ func (r *RegistrationOutbox) RegisterCoveredFile(database, measurement, path str
 		r.appendLocked(rec)
 		r.mu.Unlock()
 		_ = r.SyncRegistrations()
+		// Stop has published already: this file goes in the list too, before
+		// the node leaves the cluster (#1214). CoverForLeave tries again.
+		_ = r.publishPending(true)
 		return
 	}
 	r.enqueueLocked(rec, time.Now(), true)
@@ -717,6 +723,16 @@ func (r *RegistrationOutbox) IsPending(path string) bool {
 // already pending for the next start. Reports whether this call abandoned it:
 // false after a hand-off, when the drain is running.
 func (r *RegistrationOutbox) Abandon() bool {
+	if !r.abandon() {
+		return false
+	}
+	// No drain will register what is pending in this start: the orphan sweep
+	// learns of it from the published list (#1214).
+	r.publishForStop()
+	return true
+}
+
+func (r *RegistrationOutbox) abandon() bool {
 	r.syncMu.Lock()
 	defer r.syncMu.Unlock()
 	r.mu.Lock()
@@ -782,7 +798,13 @@ func (r *RegistrationOutbox) HandOff(manifest OutboxManifest, store OutboxStorag
 // Stop ends the drain, then spends at most outboxStopBudget registering what
 // is still pending, so the final flush lands in the manifest before Raft
 // stops. What is left stays in the journal for the next start.
+//
+// What is still pending is then published to the shared object store
+// (#1214), on every return path, with retries: this node leaves the cluster
+// after Stop (the coordinator stops later), and a node that left is no longer
+// asked. The coordinator does not broadcast the leave unless CoverForLeave.
 func (r *RegistrationOutbox) Stop() {
+	defer r.publishForStop()
 	r.mu.Lock()
 	cancel, done, state := r.cancel, r.done, r.state
 	if state == outboxRunning || state == outboxCollecting {
@@ -868,6 +890,7 @@ func (r *RegistrationOutbox) run(ctx context.Context, manifest OutboxManifest, s
 			return
 		}
 		r.alarm()
+		r.maybePublish()
 		if err := manifest.WaitForLeader(outboxLeaderWait); err != nil {
 			if !backoff(err, "No cluster leader yet; file registrations wait") {
 				return
@@ -897,6 +920,7 @@ func (r *RegistrationOutbox) run(ctx context.Context, manifest OutboxManifest, s
 		}
 		progressed, err := r.attempt(ctx, manifest, store)
 		r.alarm()
+		r.maybePublish()
 		switch {
 		case err != nil:
 			if !backoff(err, "Failed to register files in the cluster manifest; retrying") {
@@ -1066,16 +1090,24 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 			for _, e := range sent {
 				r.markInManifest(e)
 			}
-			// A checked file may have been removed between its check and the
-			// commit; an entry no peer can pull keeps a reader query gate red.
-			// Detached from ctx, so a Stop here cannot skip it.
-			var recheck []*outboxEntry
-			for _, e := range sent {
-				if checked[e] {
-					recheck = append(recheck, e)
-				}
+			// A file may have been removed before the commit, after its check
+			// or, for a fresh one, after its flush: on a shared object store a
+			// peer's DELETE, retention or database delete removes an object
+			// the manifest does not list yet (#1214). Every sent file is
+			// checked, fresh ones included, so the entry does not outlive its
+			// object; an entry no peer can pull keeps a reader query gate red.
+			// One stat per registered file, after the commit and off the flush
+			// path. A failed stat counts as present. Not cancelled with the
+			// drain, so a Stop does not skip it, but bounded by Stop's budget:
+			// the final pass's own deadline, or outboxStopBudget.
+			recheck := sent
+			rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), outboxStopBudget)
+			if dl, ok := ctx.Deadline(); ok {
+				rcancel()
+				rctx, rcancel = context.WithDeadline(context.WithoutCancel(ctx), dl)
 			}
-			after, errs := r.statAll(context.Background(), store, recheck)
+			after, errs := r.statAll(rctx, store, recheck)
+			rcancel()
 			for _, e := range recheck {
 				if errs[e] == nil && after[e] < 0 {
 					r.mu.Lock()
