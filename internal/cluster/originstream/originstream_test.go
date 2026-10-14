@@ -211,11 +211,11 @@ func TestStoreTrimNeedsFloorsAndLocalFiles(t *testing.T) {
 		t.Fatalf("trimmed without the files: %+v", s.Stats())
 	}
 	var asked uint64
-	if _, _ = s.Trim(context.Background(), func(_ context.Context, keys []TrimKey) map[TrimKey]bool {
-		out := map[TrimKey]bool{}
-		for _, k := range keys {
+	if _, _ = s.Trim(context.Background(), func(_ context.Context, reqs []TrimRequest) []bool {
+		out := make([]bool, len(reqs))
+		for i, k := range reqs {
 			asked = k.AppliedIndex
-			out[k] = k.Origin == "p" && k.Key == "db/a"
+			out[i] = k.Origin == "p" && k.Key == "db/a"
 		}
 		return out
 	}); s.Stats().Segments != 2 {
@@ -522,15 +522,15 @@ func rawEntryFrame(key []byte, seq uint64, e *Entry) []byte {
 	return buf.Bytes()
 }
 
-func allReady(_ context.Context, keys []TrimKey) map[TrimKey]bool {
-	out := map[TrimKey]bool{}
-	for _, k := range keys {
-		out[k] = true
+func allReady(_ context.Context, reqs []TrimRequest) []bool {
+	out := make([]bool, len(reqs))
+	for i := range reqs {
+		out[i] = true
 	}
 	return out
 }
 
-func noneReady(context.Context, []TrimKey) map[TrimKey]bool { return map[TrimKey]bool{} }
+func noneReady(_ context.Context, reqs []TrimRequest) []bool { return make([]bool, len(reqs)) }
 
 type blockingCloseConn struct {
 	net.Conn

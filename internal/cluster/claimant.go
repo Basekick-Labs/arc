@@ -132,9 +132,9 @@ type claimant struct {
 	store  claimantStore
 	outbox claimantOutbox
 	replay claimantReplayer
-	// filesLocal reports whether every current hot file of each key's
-	// measurement is here (the store copy may go).
-	filesLocal func(ctx context.Context, origin string, keys []string) bool
+	// filesLocal reports whether every current hot file holding rows of the
+	// instance's batches of those keys is here (the store copy may go).
+	filesLocal func(ctx context.Context, instance uint64, keys []string) bool
 	grace      time.Duration
 	now        func() time.Time
 	logger     zerolog.Logger
@@ -162,7 +162,7 @@ type instanceSeen struct {
 	at       time.Time
 }
 
-func newClaimant(c *Coordinator, store claimantStore, outbox claimantOutbox, replay claimantReplayer, filesLocal func(context.Context, string, []string) bool) *claimant {
+func newClaimant(c *Coordinator, store claimantStore, outbox claimantOutbox, replay claimantReplayer, filesLocal func(context.Context, uint64, []string) bool) *claimant {
 	grace := c.cfg.StreamTakeoverGrace
 	if grace <= 0 {
 		grace = defaultTakeoverGrace
@@ -970,7 +970,7 @@ func (cl *claimant) finish(ctx context.Context, k raft.StreamClaim, w *claimWork
 }
 
 // dropStale removes store copies this node no longer needs, once every
-// current file of their keys is here: an instance this node finished a claim
+// current file holding rows of their batches is here: an instance this node finished a claim
 // of, one removed with its claim, and one of a writer it hears from but no
 // longer receives from (not the designated primary) with nothing claimable
 // left. A writer this node does not hear from keeps its copy: it may be
@@ -1006,7 +1006,7 @@ func (cl *claimant) dropStale(ctx context.Context, fsm *raft.ClusterFSM, byID ma
 		for key := range k.Set {
 			keys = append(keys, key)
 		}
-		if !cl.filesLocal(ctx, info.Origin, keys) {
+		if !cl.filesLocal(ctx, info.Instance, keys) {
 			continue
 		}
 		if err := cl.store.DropInstance(info.Origin, info.Instance); err != nil {

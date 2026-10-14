@@ -99,18 +99,26 @@ type keyState struct {
 	gaps      intervalSet // cseqs this standby is missing, at least in part
 }
 
-// TrimKey is one (instance, key) a trim pass needs a readiness answer for.
+// TrimKey is one (instance, key) of a primary's stream.
 type TrimKey struct {
 	Origin       string
+	Instance     uint64
 	Key          string
 	AppliedIndex uint64
 }
 
-// TrimReadiness reports, for each key, whether every file of its measurement
-// is present on this node, given that the primary's floors are complete as
-// of the primary's applied index. Called without the store lock, once per
-// pass for every key that has segments to trim. The coordinator implements it.
-type TrimReadiness func(ctx context.Context, keys []TrimKey) map[TrimKey]bool
+// TrimRequest asks whether the batches CSeqs of one key, all registered per
+// the floors, may be dropped: whether the files holding their rows are on
+// this node, given that the floors are complete as of AppliedIndex (#1266).
+type TrimRequest struct {
+	TrimKey
+	CSeqs [][2]uint64
+}
+
+// TrimReadiness answers each request, in order. Called without the store
+// lock, once per pass, with one request per (segment, key) to trim. The
+// coordinator implements it.
+type TrimReadiness func(ctx context.Context, reqs []TrimRequest) []bool
 
 const (
 	defaultSegmentBytes = 64 << 20
@@ -165,6 +173,7 @@ func (s *Store) loadInstance(id instanceID, dir string) (*instanceDir, error) {
 	if raw, err := os.ReadFile(filepath.Join(dir, floorsFile)); err == nil {
 		var f Floors
 		if json.Unmarshal(raw, &f) == nil {
+			sortFloors(&f)
 			d.floors = &f
 			// Start each key from its floor: everything at or below it is
 			// registered, and segments trimmed before the restart must not
@@ -582,8 +591,17 @@ func (s *Store) AcceptFloors(origin string, f *Floors) error {
 		return err
 	}
 	syncDir(d.dir)
+	sortFloors(f)
 	d.floors = f
 	return nil
+}
+
+// sortFloors sorts each key's settled intervals once, for registeredRange,
+// which runs per segment and key on every trim pass.
+func sortFloors(f *Floors) {
+	for _, kf := range f.Keys {
+		sort.Slice(kf.Settled, func(i, j int) bool { return kf.Settled[i][0] < kf.Settled[j][0] })
+	}
 }
 
 func writeFileSync(path string, data []byte) error {
@@ -605,7 +623,7 @@ func writeFileSync(path string, data []byte) error {
 type trimCandidate struct {
 	d    *instanceDir
 	seg  *segment
-	keys []TrimKey
+	reqs []int // indexes into the pass's requests
 	// size when the candidate was chosen. Readiness runs without the lock and
 	// the primary keeps streaming into the open segment: a segment that grew
 	// meanwhile holds batches nobody vetted (not registered yet) and is kept
@@ -620,7 +638,7 @@ type trimCandidate struct {
 func (s *Store) Trim(ctx context.Context, ready TrimReadiness) (int64, error) {
 	s.mu.Lock()
 	var cands []trimCandidate
-	need := map[TrimKey]bool{}
+	var reqs []TrimRequest
 	lost := 0
 	for _, d := range s.instances {
 		if d.floors == nil {
@@ -632,36 +650,45 @@ func (s *Store) Trim(ctx context.Context, ready TrimReadiness) (int64, error) {
 			if !ok {
 				continue
 			}
-			cands = append(cands, trimCandidate{d: d, seg: seg, keys: keys, size: seg.size})
+			c := trimCandidate{d: d, seg: seg, size: seg.size}
 			for _, k := range keys {
-				need[k] = true
+				// Copied: the open segment's intervals grow under the lock.
+				ivs := append([][2]uint64(nil), seg.cseqs[k.Key]...)
+				c.reqs = append(c.reqs, len(reqs))
+				reqs = append(reqs, TrimRequest{TrimKey: k, CSeqs: ivs})
 			}
+			cands = append(cands, c)
 		}
 	}
 	s.mu.Unlock()
 
-	var answers map[TrimKey]bool
+	var answers []bool
 	blocked := 0
-	if len(need) > 0 {
-		keys := make([]TrimKey, 0, len(need))
-		for k := range need {
-			keys = append(keys, k)
+	if len(reqs) > 0 {
+		answers = ready(ctx, reqs)
+		if len(answers) != len(reqs) {
+			answers = nil // a malformed answer trims nothing
 		}
-		answers = ready(ctx, keys)
-		for _, k := range keys {
-			if !answers[k] {
-				blocked++
+		// Blocked: measurements (per origin) with a registered batch that
+		// may not go yet, whatever holds it: a file not here, this FSM
+		// behind, a claim or an origin not heard from.
+		type mk struct{ origin, key string }
+		waiting := map[mk]bool{}
+		for i, r := range reqs {
+			if answers == nil || !answers[i] {
+				waiting[mk{r.Origin, r.Key}] = true
 			}
 		}
+		blocked = len(waiting)
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var freed int64
 	for _, c := range cands {
-		allReady := true
-		for _, k := range c.keys {
-			if !answers[k] {
+		allReady := answers != nil
+		for _, i := range c.reqs {
+			if !allReady || !answers[i] {
 				allReady = false
 				break
 			}
@@ -706,7 +733,7 @@ func (d *instanceDir) covered(seg *segment) ([]TrimKey, bool) {
 				return nil, false
 			}
 		}
-		keys = append(keys, TrimKey{Origin: d.id.origin, Key: key, AppliedIndex: d.floors.AppliedIndex})
+		keys = append(keys, TrimKey{Origin: d.id.origin, Instance: d.id.instance, Key: key, AppliedIndex: d.floors.AppliedIndex})
 	}
 	return keys, true
 }
@@ -759,15 +786,14 @@ func (s *Store) replacedBytesLocked() int64 {
 }
 
 // registeredRange reports whether every cseq in [lo, hi] is at or below the
-// floor or in a settled interval.
+// floor or in a settled interval. Settled is sorted when the floors are
+// accepted or loaded (sortFloors); unsorted, it can only answer false.
 func (kf KeyFloor) registeredRange(lo, hi uint64) bool {
 	cur := lo
 	if cur <= kf.Floor {
 		cur = kf.Floor + 1
 	}
-	settled := append([][2]uint64(nil), kf.Settled...)
-	sort.Slice(settled, func(i, j int) bool { return settled[i][0] < settled[j][0] })
-	for _, iv := range settled {
+	for _, iv := range kf.Settled {
 		if cur > hi {
 			break
 		}

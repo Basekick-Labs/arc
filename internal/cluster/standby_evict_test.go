@@ -123,10 +123,10 @@ func TestTrimWaitsForAnUnfinishedClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.storage = store
-	pass := (&originStream{present: map[string]int64{}}).trimReady(c)
+	pass := (&originStream{}).trimReady(c)
 	idx := c.raftNode.FSM().AppliedDone()
-	k := originstream.TrimKey{Origin: "writer-2", Key: "db/cpu", AppliedIndex: idx}
-	ready := func() bool { return pass(context.Background(), []originstream.TrimKey{k})[k] }
+	r := originstream.TrimRequest{TrimKey: originstream.TrimKey{Origin: "writer-2", Instance: 0x10, Key: "db/cpu", AppliedIndex: idx}, CSeqs: [][2]uint64{{1, 5}}}
+	ready := func() bool { return pass(context.Background(), []originstream.TrimRequest{r})[0] }
 	// An origin this node does not hear from may be dead: its records wait
 	// for a claim (or its return).
 	if ready() {
