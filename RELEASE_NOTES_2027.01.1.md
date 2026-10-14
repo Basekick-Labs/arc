@@ -1166,6 +1166,36 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Writes sent to any writer reach the primary, and a forwarded write is never sent twice ([#1270](https://github.com/Basekick-Labs/arc/issues/1270))
+
+With stream takeover on, a standby writer refuses writes (503), and the
+Enterprise chart's writer Service sends writes to every writer. On a QA cluster
+a client behind the Service saw 18 to 33 refused batches per run in steady
+state, and tens of thousands during a failover.
+
+- A standby writer now forwards a write to the primary when it can trust its
+  view: it is in steady contact with the cluster leader, no stream-takeover
+  state holds it, and the primary is healthy. Otherwise it still answers 503.
+  A forwarded write makes one hop at most.
+- A forwarded write (from a standby, a reader or a compactor) is sent once.
+  Before, the router retried a write that timed out after it was sent, which
+  could write its rows two or more times.
+  - If the writer could not be reached, nothing was written: `503` with
+    `Retry-After` and `X-Arc-Ingest-Fenced`.
+  - If the write was sent but no answer came back in
+    `cluster.write_forward_timeout_ms` (default 60000), it may have been
+    written: `504`. It is never answered `502`.
+- Readers and compactors forward writes to the writer the cluster designates as
+  primary, even when their own view of writer states is incomplete.
+- A node that binds every interface advertises its API as `:<port>`, with no
+  host. A forward to such a node dialed the sender itself: a reader's write
+  failed (508), and so did a standby's. The host is now taken from the node's
+  cluster address.
+- The body is forwarded as received. A compressed body was decompressed
+  without the size cap and sent on under its original `Content-Encoding`.
+- `arc_cluster_writes_forwarded_total{result}`: `ok`, `refused`, `error`,
+  `unavailable`, `ambiguous`.
+- Import endpoints, MQTT and continuous queries on a standby still answer 503.
 ### Stream takeover publishes the rows of unpulled files in one go, not in waves ([#1269](https://github.com/Basekick-Labs/arc/issues/1269))
 
 When a primary writer dies with files nobody had pulled yet, the new primary

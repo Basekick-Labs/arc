@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net/http"
 
@@ -82,17 +83,16 @@ func isClientForwardingHeader(canonicalKey string) bool {
 // Lifecycle: every caller in this codebase (lineprotocol.go, msgpack.go,
 // tle.go, query.go) invokes the returned *http.Request synchronously
 // within the Fiber handler — they pass it to router.RouteWrite/RouteQuery
-// (which blocks on http.Client.Do, and internally already buffers the body
-// via io.ReadAll for retry support, see internal/cluster/router.go
-// forwardRequest), then read+close the response
+// (which blocks on http.Client.Do; queries are buffered for retries, writes
+// are streamed once and never retried, see internal/cluster/router.go), then
+// read+close the response
 // body inside CopyResponse, then return. fasthttp does not recycle the
 // RequestCtx until after the handler returns (fasthttp server.go
 // releaseCtx is post-handler), so wrapping c.Body() in bytes.NewReader
 // directly is safe and avoids a copy that can be large at max payload
-// (up to 1GB). Using c.Context() (returns *fasthttp.RequestCtx which
-// implements context.Context) is also correct here — it propagates
-// client-disconnect cancellation to the forwarded request, which
-// c.UserContext() (returns context.Background()) does NOT.
+// (up to 1GB). c.Context() is a *fasthttp.RequestCtx; its Done() closes only
+// on server shutdown, so a forward keeps running after its client leaves, as a
+// local write would. Its value is only a parent for the forward's timeout.
 //
 // If a future refactor moves any of this work to a background goroutine
 // or stream writer, those properties no longer hold and the caller
@@ -104,9 +104,11 @@ func BuildHTTPRequest(c *fiber.Ctx) (*http.Request, error) {
 	url := c.BaseURL() + c.OriginalURL()
 
 	// Wrap fasthttp's body slice directly — synchronous-handler lifecycle
-	// argument above. Router.forwardRequest then io.ReadAll's it into its
-	// own buffer for retry support before issuing http.Client.Do.
-	body := bytes.NewReader(c.Body())
+	// argument above. The RAW body, as received: c.Body() would decompress a
+	// gzip/deflate/brotli body without the size cap the write handlers apply,
+	// then forward it under its original Content-Encoding (#1270). The peer
+	// decodes it with its own caps.
+	body := bytes.NewReader(c.Request().Body())
 
 	// c.Context() propagates client-disconnect cancellation to the
 	// forwarded request (so the backend stops processing if the original
@@ -316,9 +318,57 @@ const IngestFencedHeader = "X-Arc-Ingest-Fenced"
 // per-request line for an expected fence refusal (#1268).
 const ingestFencedLocal = "arc.ingest_fenced"
 
+// forwardStandbyWrite forwards a write that reached a standby writer to the
+// primary writer instead of refusing it (#1270), when the cluster can name
+// one this node trusts (Coordinator.WriteForwardTarget). It must run before
+// the handler reads or writes anything. handled=false: process locally (the
+// local path refuses with 503 if this node may not take writes).
+func forwardStandbyWrite(router *cluster.Router, c *fiber.Ctx) (handled bool, err error) {
+	if c.Get(ForwardedByHeader) != "" {
+		return false, nil // one hop at most
+	}
+	node, ok := router.StandbyWriteTarget()
+	if !ok {
+		return false, nil
+	}
+	req, err := BuildHTTPRequest(c)
+	if err != nil {
+		return false, nil
+	}
+	resp, err := router.ForwardWriteTo(c.Context(), node, req)
+	if err != nil {
+		return true, respondWriteForwardError(c, err)
+	}
+	return true, CopyResponse(c, resp)
+}
+
+// respondWriteForwardError answers a forwarded write that failed. Not
+// reached: 503 like a fence refusal (nothing was written, retry). Sent but no
+// answer: 504, because the writer may have written it and a retry may
+// duplicate rows. Never 502 (#1270).
+func respondWriteForwardError(c *fiber.Ctx, err error) error {
+	switch {
+	case errors.Is(err, cluster.ErrWriteForwardUnavailable):
+		// The cause (with peer addresses) is logged; clients get the class.
+		ingest.LogRefusal(c.Path(), err)
+		c.Locals(ingestFencedLocal, true)
+		c.Set(IngestFencedHeader, "1")
+		c.Set(fiber.HeaderRetryAfter, "5")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "Write rejected (the primary writer could not be reached; nothing was written, retry)",
+		})
+	case errors.Is(err, cluster.ErrWriteForwardAmbiguous):
+		return c.Status(fiber.StatusGatewayTimeout).JSON(fiber.Map{
+			"error": "Write forwarded to the primary writer got no answer in time; it may have been written",
+		})
+	}
+	return HandleRoutingError(c, err)
+}
+
 // respondIngestFenced answers a write refused because this node may no longer
 // be the primary writer (#1207). 503 with Retry-After so clients retry, by
-// then against the primary; nothing was written, so the retry is safe.
+// then against the primary; nothing was written on this node (nor, for a
+// forward that could not connect, on the primary), so the retry is safe.
 //
 // The refusal is logged per reason, at most every ingest.RefusalLogEvery
 // (#1268): during a failover every client write is refused, and one line per

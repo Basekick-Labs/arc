@@ -225,6 +225,61 @@ func (f *ingestFence) setLocked(reason string, contact bool) {
 	}
 }
 
+// inSteadyContact reports whether this writer is in contact with the Raft
+// leader now and is not recovering from a lost contact (barrier and exit hold
+// done): its view of the designation can be trusted to forward writes (#1270).
+// Stricter than evaluate (no voters/other-writers condition: a forward is
+// never needed for safety, so a doubt keeps the local 503). Without the
+// contact rule (no automatic failover) contact is not tracked and the FSM's
+// view is used as is; the primary re-checks its own gate on arrival.
+func (f *ingestFence) inSteadyContact() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.lostContact {
+		return false
+	}
+	if !f.contactRule || f.isLeader() {
+		return true
+	}
+	lc := f.lastContact()
+	return !lc.IsZero() && f.now().Sub(lc) <= f.fenceAfter
+}
+
+// WriteForwardTarget names the primary writer a write that reaches this
+// standby writer is forwarded to, instead of refusing it (#1270). It answers
+// only when this node may trust its view: a Pattern 1 writer in steady contact
+// with the leader, not held by a stream takeover gate (claimed, announcing, a
+// DELETE acknowledgement) — those keep their 503 — and the designated primary
+// is another node, healthy, with an API address. Never derived from a refusal
+// error, and counts nothing.
+func (c *Coordinator) WriteForwardTarget() (*Node, bool) {
+	if c.cfg.SharedStorageMode || c.raftNode == nil || c.localNode == nil || c.localNode.Role != RoleWriter {
+		return nil, false
+	}
+	// The designation first: on the primary (every write it takes) this is
+	// the only check that runs.
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return nil, false
+	}
+	d := fsm.PrimaryWriterIDFast()
+	if d == "" || d == c.localNode.ID {
+		return nil, false
+	}
+	if c.claimedExit.Load() || c.takeoverGateClosed() || c.deleteAckOwed() {
+		return nil, false
+	}
+	f := c.ingestFence.Load()
+	if f == nil || !f.inSteadyContact() {
+		return nil, false
+	}
+	n, ok := c.registry.Get(d)
+	if !ok || n.Role != RoleWriter || !n.IsHealthy() || n.APIAddress == "" {
+		return nil, false
+	}
+	return n, true
+}
+
 // gate is the ArrowBuffer ingest gate.
 func (f *ingestFence) gate() error {
 	if !f.fenced.Load() {

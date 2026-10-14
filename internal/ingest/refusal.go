@@ -19,6 +19,10 @@ const (
 	RefusalNotDesignated = "not_designated" // stream takeover: not the designated primary
 	RefusalDeleteAck     = "delete_ack"     // acknowledging a DELETE record
 	RefusalOther         = "other"          // an ErrIngestFenced without a reason
+	// RefusalForwardUnreachable: a standby writer could not reach the primary
+	// it forwards writes to (#1270); counted in
+	// arc_cluster_writes_forwarded_total, not in the fenced-writes counter.
+	RefusalForwardUnreachable = "forward_unreachable"
 )
 
 // RefusalError is the reason inside an ErrIngestFenced error: the cluster gate

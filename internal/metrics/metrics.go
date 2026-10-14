@@ -206,6 +206,7 @@ type Metrics struct {
 	// Ingest fencing (#1207)
 	ingestFenced          atomic.Int64                           // 1 while this writer refuses writes
 	ingestFencedWrites    [len(IngestFencedReasons)]atomic.Int64 // live writes refused, by reason (#1268)
+	writesForwarded       [len(WriteForwardResults)]atomic.Int64 // writes forwarded to a writer, by result (#1270)
 	walQuarantinedFiles   atomic.Int64                           // WAL files isolated after repeated recovery failures
 	walQuarantineReleased atomic.Int64                           // pending WAL entries released because their file was quarantined (#1225)
 	// 1 while the last recovery pass left a file on disk for which at least one
@@ -743,6 +744,33 @@ func (m *Metrics) IncIngestFencedWrites(reason string) {
 		}
 	}
 	m.ingestFencedWrites[len(IngestFencedReasons)-1].Add(1)
+}
+
+// WriteForwardResults are the result labels of
+// arc_cluster_writes_forwarded_total (#1270).
+var WriteForwardResults = [...]string{"ok", "refused", "error", "unavailable", "ambiguous"}
+
+// IncWritesForwarded counts one write this node forwarded to a writer, by
+// result: ok (2xx), refused (the writer's own fence refusal, 503), error (any
+// other answer), unavailable (nothing sent: nothing written), ambiguous (sent,
+// no answer: may have been written).
+func (m *Metrics) IncWritesForwarded(result string) {
+	for i, r := range WriteForwardResults {
+		if r == result {
+			m.writesForwarded[i].Add(1)
+			return
+		}
+	}
+}
+
+// WritesForwardedFor returns the forwarded writes counted under result.
+func (m *Metrics) WritesForwardedFor(result string) int64 {
+	for i, r := range WriteForwardResults {
+		if r == result {
+			return m.writesForwarded[i].Load()
+		}
+	}
+	return 0
 }
 
 // IngestFencedReasons are the reason labels of
@@ -1634,6 +1662,12 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_cluster_ingest_fenced_writes_total counter\n"...)
 	for i, r := range IngestFencedReasons {
 		b = appendMetricWithLabel(b, "arc_cluster_ingest_fenced_writes_total", "reason", r, float64(m.ingestFencedWrites[i].Load()))
+	}
+
+	b = append(b, "# HELP arc_cluster_writes_forwarded_total Writes this node forwarded to a writer (a reader or compactor, or a standby writer forwarding to the primary), by result\n"...)
+	b = append(b, "# TYPE arc_cluster_writes_forwarded_total counter\n"...)
+	for i, r := range WriteForwardResults {
+		b = appendMetricWithLabel(b, "arc_cluster_writes_forwarded_total", "result", r, float64(m.writesForwarded[i].Load()))
 	}
 
 	b = append(b, "# HELP arc_cluster_file_registration_journal_errors_total File registration journal write or fsync failures\n"...)

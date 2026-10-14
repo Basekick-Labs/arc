@@ -212,15 +212,23 @@ func (h *LineProtocolHandler) handleWrite(c *fiber.Ctx, database string, precisi
 			goto localProcessing
 		}
 		if err != nil {
-			h.logger.Error().Err(err).Msg("Failed to route write request")
+			if !errors.Is(err, cluster.ErrWriteForwardUnavailable) && !errors.Is(err, cluster.ErrWriteForwardAmbiguous) {
+				h.logger.Error().Err(err).Msg("Failed to route write request")
+			}
 			h.totalErrors.Add(1)
-			return HandleRoutingError(c, err)
+			return respondWriteForwardError(c, err)
 		}
 
 		return CopyResponse(c, resp)
 	}
 
 localProcessing:
+	// A standby writer forwards the write to the primary instead of refusing
+	// it, when the cluster names one it can trust (#1270). Before anything is
+	// read or written here.
+	if handled, err := forwardStandbyWrite(h.router, c); handled {
+		return err
+	}
 	// Shared decompressRequest (in tle.go) handles gzip/zstd/uncompressed
 	// dispatch with a hard 100MB output cap. CRITICAL invariants kept by
 	// that helper:

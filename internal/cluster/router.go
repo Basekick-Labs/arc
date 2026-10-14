@@ -3,9 +3,13 @@ package cluster
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"sync"
 	"sync/atomic"
@@ -39,6 +43,16 @@ var (
 
 	// ErrRoutingFailed indicates the request could not be routed after all retries.
 	ErrRoutingFailed = fmt.Errorf("routing failed after all retries")
+
+	// ErrWriteForwardUnavailable: a forwarded write could not reach the
+	// writer (no connection was made), so nothing was written there; the
+	// client may retry (#1270).
+	ErrWriteForwardUnavailable = errors.New("the primary writer could not be reached; nothing was written, retry")
+
+	// ErrWriteForwardAmbiguous: a forwarded write was sent but no answer came
+	// back in time. The writer may have written it; a retry may duplicate
+	// rows (#1270).
+	ErrWriteForwardAmbiguous = errors.New("the forwarded write got no answer in time; it may or may not have been written")
 
 	// ErrLocalNodeCanHandle indicates the local node can handle this request directly.
 	ErrLocalNodeCanHandle = fmt.Errorf("local node can handle request")
@@ -80,14 +94,29 @@ type RouterConfig struct {
 	// identical on every cluster node). When empty, defaults to
 	// "http" (back-compat).
 	Scheme string
+
+	// Designated returns the writer the cluster designates as primary
+	// (Pattern 1), "" when there is none (Pattern 2, no Raft). Writes are
+	// forwarded to it rather than to the registry's view of writer states,
+	// which a join can leave empty (#1267, #1270).
+	Designated func() string
+
+	// StandbyWriteTarget, when set, names the primary writer a write that
+	// arrives at this standby writer should be forwarded to (#1270).
+	StandbyWriteTarget func() (*Node, bool)
+
+	// WriteTimeout bounds one forwarded write, upload and processing
+	// included. Default 60 s: forwarded writes are never retried once sent.
+	WriteTimeout time.Duration
 }
 
 // Router routes requests to appropriate nodes in the cluster.
 // The coordinator node uses this to forward writes to writers and queries to readers.
 type Router struct {
-	cfg        *RouterConfig
-	httpClient *http.Client
-	logger     zerolog.Logger
+	cfg         *RouterConfig
+	httpClient  *http.Client
+	writeClient *http.Client
+	logger      zerolog.Logger
 
 	// Round-robin index for reader selection
 	readerIndex atomic.Uint64
@@ -118,6 +147,9 @@ func NewRouter(cfg *RouterConfig) *Router {
 	if cfg.Scheme == "" {
 		cfg.Scheme = "http"
 	}
+	if cfg.WriteTimeout == 0 {
+		cfg.WriteTimeout = 60 * time.Second
+	}
 
 	transport := cfg.Transport
 	if transport == nil {
@@ -133,6 +165,10 @@ func NewRouter(cfg *RouterConfig) *Router {
 		httpClient: &http.Client{
 			Timeout:   cfg.Timeout,
 			Transport: transport,
+		},
+		writeClient: &http.Client{
+			Timeout:   cfg.WriteTimeout,
+			Transport: writeTransport(transport),
 		},
 		logger:      cfg.Logger.With().Str("component", "cluster-router").Logger(),
 		activeConns: make(map[string]*atomic.Int64),
@@ -157,8 +193,12 @@ func (r *Router) RouteWrite(ctx context.Context, req *http.Request) (*http.Respo
 		return nil, ErrLocalNodeCanHandle
 	}
 
-	// Prefer the designated primary writer (legacy single-writer + failover).
-	writer := r.cfg.Registry.GetPrimaryWriter()
+	// The designated primary (Pattern 1), then the registry's primary, then
+	// round robin across healthy writers (Pattern 2, or the failover window).
+	writer := r.designatedWriter()
+	if writer == nil {
+		writer = r.cfg.Registry.GetPrimaryWriter()
+	}
 	if writer == nil {
 		// Fall back to round-robin across healthy writers. In Pattern 2
 		// multi-writer mode this is the always-taken path (no primary
@@ -174,7 +214,133 @@ func (r *Router) RouteWrite(ctx context.Context, req *http.Request) (*http.Respo
 		writer = r.selectWriter(writers)
 	}
 
-	return r.forwardRequest(ctx, writer, req)
+	return r.ForwardWriteTo(ctx, writer, req)
+}
+
+// designatedWriter is the designated primary when it is a healthy writer
+// this node can address.
+func (r *Router) designatedWriter() *Node {
+	if r.cfg.Designated == nil {
+		return nil
+	}
+	id := r.cfg.Designated()
+	if id == "" {
+		return nil
+	}
+	n, ok := r.cfg.Registry.Get(id)
+	if !ok || n.Role != RoleWriter || !n.IsHealthy() || n.APIAddress == "" {
+		return nil
+	}
+	return n
+}
+
+// StandbyWriteTarget reports the primary writer a write arriving at this
+// standby writer should be forwarded to (#1270). Nil-safe.
+func (r *Router) StandbyWriteTarget() (*Node, bool) {
+	if r == nil || r.cfg.StandbyWriteTarget == nil {
+		return nil, false
+	}
+	return r.cfg.StandbyWriteTarget()
+}
+
+// ForwardWriteTo forwards a write to node once. A write is never retried once
+// sent: the writer may have written it before an error or a timeout, and a
+// retry would duplicate its rows (#1270). A connection that could not be made
+// is ErrWriteForwardUnavailable (nothing was sent); a timeout or broken
+// connection after sending is ErrWriteForwardAmbiguous.
+func (r *Router) ForwardWriteTo(ctx context.Context, node *Node, req *http.Request) (*http.Response, error) {
+	// Whether any of the request left this node decides what a failure
+	// means, not the error's type: a dead host shows up as a timeout, a TLS
+	// failure as EOF.
+	var sent atomic.Bool
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		WroteHeaders: func() { sent.Store(true) },
+	})
+	resp, err := r.doForwardOnce(ctx, r.writeClient, node, req)
+	switch {
+	case err == nil:
+		switch {
+		case resp.StatusCode >= 200 && resp.StatusCode < 300:
+			metrics.Get().IncWritesForwarded("ok")
+		case resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get(IngestFencedResponseHeader) != "":
+			metrics.Get().IncWritesForwarded("refused")
+		default:
+			metrics.Get().IncWritesForwarded("error")
+		}
+		return resp, nil
+	case !sent.Load():
+		metrics.Get().IncWritesForwarded("unavailable")
+		r.logger.Debug().Err(err).Str("node_id", node.ID).Msg("Forwarded write could not reach the writer")
+		return nil, fmt.Errorf("%w: %v", ErrWriteForwardUnavailable, err)
+	default:
+		metrics.Get().IncWritesForwarded("ambiguous")
+		r.logger.Warn().Err(err).Str("node_id", node.ID).Msg("Forwarded write sent but unanswered; it may have been written")
+		return nil, fmt.Errorf("%w: %v", ErrWriteForwardAmbiguous, err)
+	}
+}
+
+// apiHostPort is the address to reach node's HTTP API at. A node that binds
+// every interface advertises its API as ":<port>" (cmd/arc main.go): that
+// has no host, and dialing it reaches this node itself. The host is then the
+// one of its cluster coordinator address, which the cluster already dials
+// (#1270: on the QA rig every forward looped back to the sender).
+func apiHostPort(node *Node) string {
+	host, port, err := net.SplitHostPort(node.APIAddress)
+	if err != nil || (host != "" && host != "0.0.0.0" && host != "::") {
+		return node.APIAddress
+	}
+	if ch, _, err := net.SplitHostPort(node.Address); err == nil && ch != "" {
+		return net.JoinHostPort(ch, port)
+	}
+	return node.APIAddress
+}
+
+// IngestFencedResponseHeader is the header a writer sets on a 503 that
+// refused a write it may not take (api.IngestFencedHeader; the packages do
+// not import each other).
+const IngestFencedResponseHeader = "X-Arc-Ingest-Fenced"
+
+// writeForwardDialTimeout bounds opening a connection (and its TLS
+// handshake) for a forwarded write: a dead writer must answer "unreachable,
+// nothing written" quickly, not after the whole write timeout.
+const writeForwardDialTimeout = 5 * time.Second
+
+// writeTransport is base with dial and TLS handshake timeouts.
+func writeTransport(base *http.Transport) *http.Transport {
+	t := base.Clone()
+	t.DialContext = (&net.Dialer{Timeout: writeForwardDialTimeout, KeepAlive: 30 * time.Second}).DialContext
+	t.TLSHandshakeTimeout = writeForwardDialTimeout
+	return t
+}
+
+// doForwardOnce sends req to node without buffering its body: a forwarded
+// write is sent once, so the body is streamed as is (no second copy of a
+// payload that can be large).
+func (r *Router) doForwardOnce(ctx context.Context, client *http.Client, node *Node, originalReq *http.Request) (*http.Response, error) {
+	r.incrementConns(node.ID)
+	defer r.decrementConns(node.ID)
+	targetURL := (&url.URL{
+		Scheme:   r.cfg.Scheme,
+		Host:     apiHostPort(node),
+		Path:     originalReq.URL.Path,
+		RawPath:  originalReq.URL.RawPath,
+		RawQuery: originalReq.URL.RawQuery,
+	}).String()
+	forwardReq, err := http.NewRequestWithContext(ctx, originalReq.Method, targetURL, originalReq.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create forward request: %w", err)
+	}
+	forwardReq.ContentLength = originalReq.ContentLength
+	forwardReq.GetBody = originalReq.GetBody
+	for key, values := range originalReq.Header {
+		for _, value := range values {
+			forwardReq.Header.Add(key, value)
+		}
+	}
+	forwardReq.Header.Set("X-Forwarded-For", originalReq.RemoteAddr)
+	forwardReq.Header.Set("X-Arc-Forwarded-By", r.cfg.LocalNode.ID)
+	forwardReq.Header.Set("X-Arc-Original-Host", originalReq.Host)
+	return client.Do(forwardReq)
 }
 
 // selectWriter applies the configured load-balance strategy to a
@@ -288,7 +454,7 @@ func (r *Router) forwardRequest(ctx context.Context, node *Node, req *http.Reque
 				Msg("Retrying request forward")
 		}
 
-		resp, err := r.doForward(ctx, node, req)
+		resp, err := r.doForward(ctx, r.httpClient, node, req)
 		if err == nil {
 			return resp, nil
 		}
@@ -310,7 +476,7 @@ func (r *Router) forwardRequest(ctx context.Context, node *Node, req *http.Reque
 }
 
 // doForward performs a single forward attempt to the specified node.
-func (r *Router) doForward(ctx context.Context, node *Node, originalReq *http.Request) (*http.Response, error) {
+func (r *Router) doForward(ctx context.Context, client *http.Client, node *Node, originalReq *http.Request) (*http.Response, error) {
 	// Track active connections for least_connections strategy
 	r.incrementConns(node.ID)
 	defer r.decrementConns(node.ID)
@@ -326,7 +492,7 @@ func (r *Router) doForward(ctx context.Context, node *Node, originalReq *http.Re
 	// containing spaces or non-ASCII bytes are forwarded intact.
 	targetURL := (&url.URL{
 		Scheme:   r.cfg.Scheme,
-		Host:     node.APIAddress,
+		Host:     apiHostPort(node),
 		Path:     originalReq.URL.Path,
 		RawPath:  originalReq.URL.RawPath,
 		RawQuery: originalReq.URL.RawQuery,
@@ -364,7 +530,7 @@ func (r *Router) doForward(ctx context.Context, node *Node, originalReq *http.Re
 
 	// Execute the request
 	start := time.Now()
-	resp, err := r.httpClient.Do(forwardReq)
+	resp, err := client.Do(forwardReq)
 	elapsed := time.Since(start)
 
 	if err != nil {

@@ -545,6 +545,16 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 		Logger:    cfg.Logger,
 		Transport: security.NewClusterHTTPTransport(tlsCfg),
 		Scheme:    security.SchemeForServer(cfg.ServerTLSEnabled),
+		// Pattern 1 only: in shared storage every writer takes writes and a
+		// designation left over in the state must not pin them to one.
+		Designated: func() string {
+			if c.cfg.SharedStorageMode {
+				return ""
+			}
+			return c.designatedPrimaryWriterID()
+		},
+		StandbyWriteTarget: c.WriteForwardTarget,
+		WriteTimeout:       time.Duration(cfg.Config.WriteForwardTimeoutMs) * time.Millisecond,
 	})
 
 	// Initialize writer failover manager (Phase 3) — requires license and Raft.
