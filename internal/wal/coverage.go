@@ -224,6 +224,9 @@ func (p *PreparedAppend) release(from int) {
 		delete(p.w.pendingSeqs, e.seq)
 	}
 	p.w.pendingMu.Unlock()
+	if from < len(p.entries) {
+		p.w.signalPurge() // the floor may have moved (#676)
+	}
 }
 
 // TrackedInstance is this writer's instance id: the prefix of every identity

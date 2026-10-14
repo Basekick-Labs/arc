@@ -1170,6 +1170,41 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Flushed WAL files are deleted within seconds, not every five minutes ([#676](https://github.com/Basekick-Labs/arc/issues/676))
+
+A WAL file whose data had reached storage was deleted only on the periodic
+WAL pass, every `wal.recovery_interval_seconds` (default 300 s). Between
+passes the WAL kept everything already flushed: at 1M rows/s that is about
+7 GB, enough to fill a writer's volume on its own. Arc now checks as soon as
+a WAL file rotates or a flush completes, at most once per second, so the WAL
+holds roughly ingest rate × buffer age plus the file being written. On a test
+node ingesting 1M rows/s for two minutes, the WAL peaked at 7.3 GB before and
+81 MiB after, with every row in storage either way. Files whose data has not
+reached storage are kept as before; the periodic pass still runs.
+
+Two failures on a full WAL volume are fixed:
+
+- **A WAL that could never be purged again.** An entry that could not be
+  written, and whose buffer then failed to flush, kept the WAL from deleting
+  any later file until a restart, so the volume stayed full even after
+  storage came back. The entry is now released when it is lost.
+- **A failed write that could hide the entries after it.** A write that
+  failed part-way left a partial entry at the end of the file, and the next
+  entry written after it could not be read back on replay. Arc now cuts the
+  partial entry off before writing again, and on a full disk it no longer
+  creates and removes a new WAL file for every failed write.
+
+New metrics: `arc_wal_disk_full_writes_total` (entries lost because the disk
+was full) and `arc_wal_recovered_writes_total` (writes that failed and then
+succeeded on a new file). `arc_wal_failed_writes_total` now counts entries
+that could not be written; a write failure that a retry recovers is no longer
+counted there.
+
+Rejecting writes when the WAL volume runs low, and starting a node on a full
+volume, follow in a separate change. Ideas from
+[@jallegri](https://github.com/jallegri)'s
+[#1115](https://github.com/Basekick-Labs/arc/pull/1115) shaped both changes.
+
 ### Two flushes in one clock tick no longer overwrite each other's file ([#1282](https://github.com/Basekick-Labs/arc/issues/1282))
 
 A flushed Parquet file was named from the wall clock alone. Flush workers run
