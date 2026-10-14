@@ -840,7 +840,8 @@ type ClusterConfig struct {
 	StreamTakeoverDepartedTTL time.Duration
 	// StandbyStoreMaxBytes caps the copy a standby writer keeps of what its
 	// primary streams, with WALCoverage on (#1207). Past it the standby stores
-	// nothing until trimming frees room.
+	// nothing until trimming frees room. 0 (default): a quarter of the WAL
+	// volume, at least 1 GiB; negative: no cap (#1266).
 	StandbyStoreMaxBytes int64
 	// OriginStreamQueueBytes caps what a primary holds in memory for one
 	// standby writer that is not keeping up; past it that standby misses
@@ -2086,8 +2087,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.wal_coverage", false)      // experimental (#1207); see Cluster.WALCoverage
 	v.SetDefault("cluster.stream_takeover_grace", "60s")
 	v.SetDefault("cluster.stream_takeover_departed_ttl", "24h")
-	v.SetDefault("cluster.stream_takeover", false) // experimental (#1207 S4b); see Cluster.StreamTakeover
-	v.SetDefault("cluster.standby_store_max_bytes", int64(1<<30))
+	v.SetDefault("cluster.stream_takeover", false)            // experimental (#1207 S4b); see Cluster.StreamTakeover
+	v.SetDefault("cluster.standby_store_max_bytes", int64(0)) // 0 = a quarter of the WAL volume, min 1 GiB (#1266)
 	v.SetDefault("cluster.origin_stream_queue_bytes", int64(64<<20))
 	v.SetDefault("cluster.stale_local_sweep", true) // #1071
 	v.SetDefault("cluster.stale_local_sweep_max_fraction", 0.5)
