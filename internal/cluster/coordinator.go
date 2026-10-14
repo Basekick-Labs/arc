@@ -149,13 +149,15 @@ type Coordinator struct {
 	repair               manifestRepairState // shared object store manifest repair (#1207)
 	walCoverageActive    atomic.Bool         // SetWALCoverageActive
 	ingestFenceListeners []func(fenced bool)
-	takeoverOrigin       atomic.Pointer[takeoverOriginState] // SetTakeoverOrigin (#1207 S4b)
-	claimedExit          atomic.Bool                         // another writer claimed this process: refuse writes, exit (#1207)
-	claimant             atomic.Pointer[claimant]            // StartOriginStream with stream takeover (#1207)
-	deleteRecords        atomic.Pointer[deleteRecordState]   // StartOriginStream with stream takeover (#1207 d1)
-	deleteRewriter       atomic.Pointer[DeleteRewriter]      // SetDeleteRewriter
-	deleteOutbox         atomic.Pointer[RegistrationOutbox]  // the outbox the DELETE hooks are on
-	pauseNotifyMu        sync.Mutex                          // ingestPauseChanged
+	takeoverOrigin       atomic.Pointer[takeoverOriginState]      // SetTakeoverOrigin (#1207 S4b)
+	claimedExit          atomic.Bool                              // another writer claimed this process: refuse writes, exit (#1207)
+	claimant             atomic.Pointer[claimant]                 // StartOriginStream with stream takeover (#1207)
+	deleteRecords        atomic.Pointer[deleteRecordState]        // StartOriginStream with stream takeover (#1207 d1)
+	deleteRewriter       atomic.Pointer[DeleteRewriter]           // SetDeleteRewriter
+	deleteOutbox         atomic.Pointer[RegistrationOutbox]       // the outbox the DELETE hooks are on
+	pendingRegs          atomic.Pointer[PendingRegistrationsFunc] // SetPendingRegistrations (#1214)
+	leaveGate            atomic.Pointer[func() bool]              // SetLeaveGate (#1214)
+	pauseNotifyMu        sync.Mutex                               // ingestPauseChanged
 	pauseNotified        bool
 	pauseState           bool
 	replicationReceiver  *replication.Receiver // Reader only: receives entries from writer
@@ -371,10 +373,7 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	}
 
 	// Generate node ID if not provided
-	nodeID := cfg.Config.NodeID
-	if nodeID == "" {
-		nodeID = generateNodeID()
-	}
+	nodeID := ResolveNodeID(cfg.Config.NodeID)
 
 	// Create local node
 	localNode := NewNode(nodeID, nodeID, role, cfg.Config.ClusterName)
@@ -930,7 +929,15 @@ func (c *Coordinator) Stop() error {
 		return nil
 	}
 	c.finalTakeoverReport()
-	c.broadcastLeave()
+	if g := c.leaveGate.Load(); g != nil && !(*g)() {
+		// A node that left is no longer asked what it has pending, and its
+		// pending set is in no published list: staying in the cluster keeps
+		// its files from the orphan sweep (#1214), which it holds until this
+		// node returns or is removed.
+		c.logger.Error().Msg("Not leaving the cluster at shutdown: files pending registration here could not be published to the shared store; the orphan-storage sweep is held until this node returns or is removed from the cluster")
+	} else {
+		c.broadcastLeave()
+	}
 	// Before c.mu is taken: stopOriginStream takes it, and joins goroutines
 	// that read coordinator state.
 	c.stopOriginStream()
@@ -1926,6 +1933,9 @@ func (c *Coordinator) handlePeerConnection(conn net.Conn) {
 	case protocol.MsgOriginStreamHello:
 		// The origin stream server owns the connection once it accepts.
 		closeConn = !c.handleOriginStreamHello(conn, msg.Payload.(*protocol.OriginStreamHello))
+
+	case protocol.MsgPendingRegistrationsQuery:
+		c.handlePendingRegistrationsQuery(conn, msg.Payload.(*protocol.PendingRegistrationsQuery))
 
 	case protocol.MsgFetchFile:
 		// The fetch handler streams the body for the lifetime of the
@@ -3842,6 +3852,27 @@ func (c *Coordinator) checkConvergeSafety(voters, planned []string, allowSingleV
 	return remaining, nil
 }
 
+// SetLeaveGate makes Stop broadcast the leave only when gate allows it: the
+// registration outbox's CoverForLeave (#1214).
+func (c *Coordinator) SetLeaveGate(gate func() bool) {
+	if gate == nil {
+		c.leaveGate.Store(nil)
+		return
+	}
+	c.leaveGate.Store(&gate)
+}
+
+// ResolveNodeID is the node ID a coordinator configured with cluster.node_id
+// = configured runs under: configured, or generateNodeID's when it is empty.
+// For what must be keyed by the node ID before the coordinator exists (the
+// registration outbox's published pending list, #1214).
+func ResolveNodeID(configured string) string {
+	if configured != "" {
+		return configured
+	}
+	return generateNodeID()
+}
+
 // generateNodeID generates a unique node ID with sufficient entropy.
 // Uses 8 bytes (64 bits) of randomness plus timestamp for collision resistance.
 func generateNodeID() string {
@@ -4729,6 +4760,10 @@ func (c *Coordinator) waitForManifestSync(ctx context.Context, raftNode *raft.No
 			break
 		}
 		var rejected *ForwardRejectedError
+		if errors.As(lastErr, &rejected) && rejected.Code == protocol.ForwardCodeInvalidCommand {
+			// A leader that does not know the command at all.
+			return fmt.Errorf("follower barrier not accepted by the leader: %w: %w", raft.ErrBarrierUnsupported, lastErr)
+		}
 		if errors.As(lastErr, &rejected) && rejected.Code != protocol.ForwardCodeApplyFailed {
 			return fmt.Errorf("follower barrier not accepted by the leader: %w", lastErr)
 		}

@@ -199,11 +199,15 @@ type Metrics struct {
 	fileRegistrationsConfirmed    atomic.Int64 // files registered by the outbox
 	fileRegistrationJournalErrs   atomic.Int64 // registration journal write or fsync failures
 
+	// Reconciliation (#1214): 1 while the last run held its orphan-storage
+	// sweep because what other nodes have pending could not be established.
+	reconciliationStorageSweepHeld atomic.Int64
+
 	// Ingest fencing (#1207)
-	ingestFenced          atomic.Int64 // 1 while this writer refuses writes
-	ingestFencedWrites    atomic.Int64 // writes refused by the fence
-	walQuarantinedFiles   atomic.Int64 // WAL files isolated after repeated recovery failures
-	walQuarantineReleased atomic.Int64 // pending WAL entries released because their file was quarantined (#1225)
+	ingestFenced          atomic.Int64                           // 1 while this writer refuses writes
+	ingestFencedWrites    [len(IngestFencedReasons)]atomic.Int64 // live writes refused, by reason (#1268)
+	walQuarantinedFiles   atomic.Int64                           // WAL files isolated after repeated recovery failures
+	walQuarantineReleased atomic.Int64                           // pending WAL entries released because their file was quarantined (#1225)
 	// 1 while the last recovery pass left a file on disk for which at least one
 	// row range of a parent entry was handed off — the state an older binary
 	// would replay in full.
@@ -697,6 +701,21 @@ func (m *Metrics) IncWALFailedSyncs()                { m.walFailedSyncs.Add(1) }
 func (m *Metrics) IncWALOversizedPayloads()          { m.walOversizedPayloads.Add(1) }
 func (m *Metrics) SetWALDirectoryBytes(bytes int64)  { m.walDirectoryBytes.Store(bytes) }
 
+// SetReconciliationStorageSweepHeld records whether the last reconciliation
+// run held its orphan-storage sweep (#1214).
+func (m *Metrics) SetReconciliationStorageSweepHeld(held bool) {
+	v := int64(0)
+	if held {
+		v = 1
+	}
+	m.reconciliationStorageSweepHeld.Store(v)
+}
+
+// ReconciliationStorageSweepHeld reports the last value set.
+func (m *Metrics) ReconciliationStorageSweepHeld() bool {
+	return m.reconciliationStorageSweepHeld.Load() == 1
+}
+
 // File registration outbox (#1209).
 func (m *Metrics) SetFileRegistrationsPending(n int64) { m.fileRegistrationsPending.Store(n) }
 func (m *Metrics) SetFileRegistrationOldestPending(ns int64) {
@@ -714,8 +733,41 @@ func (m *Metrics) SetIngestFenced(fenced bool) {
 	}
 }
 
-// IncIngestFencedWrites counts a write refused by ingest fencing (#1207).
-func (m *Metrics) IncIngestFencedWrites() { m.ingestFencedWrites.Add(1) }
+// IncIngestFencedWrites counts a live write refused by the ingest gate (#1207),
+// under its reason (#1268).
+func (m *Metrics) IncIngestFencedWrites(reason string) {
+	for i, r := range IngestFencedReasons {
+		if r == reason {
+			m.ingestFencedWrites[i].Add(1)
+			return
+		}
+	}
+	m.ingestFencedWrites[len(IngestFencedReasons)-1].Add(1)
+}
+
+// IngestFencedReasons are the reason labels of
+// arc_cluster_ingest_fenced_writes_total, in export order (#1268). They match
+// cluster's Refusal constants; anything else counts as "other", the last.
+var IngestFencedReasons = [...]string{"contact", "standby", "claimed", "announcing", "not_designated", "delete_ack", "other"} // ingest.Refusal*
+
+// IngestFencedWritesFor returns the refusals counted under reason ("other" for
+// an unknown one).
+func (m *Metrics) IngestFencedWritesFor(reason string) int64 {
+	for i, r := range IngestFencedReasons {
+		if r == reason {
+			return m.ingestFencedWrites[i].Load()
+		}
+	}
+	return m.ingestFencedWrites[len(IngestFencedReasons)-1].Load()
+}
+
+func (m *Metrics) ingestFencedWritesTotal() int64 {
+	var n int64
+	for i := range m.ingestFencedWrites {
+		n += m.ingestFencedWrites[i].Load()
+	}
+	return n
+}
 
 func (m *Metrics) fileRegistrationOldestPendingSeconds() float64 {
 	ns := m.fileRegistrationOldestPending.Load()
@@ -1002,47 +1054,48 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"mqtt_reconnects":        m.mqttReconnects.Load(),
 
 		// WAL
-		"wal_records_preserved":            m.walRecordsPreserved.Load(),
-		"wal_registered_floor_lag":         m.walRegisteredFloorLag.Load(),
-		"wal_held_files":                   m.walHeldFiles.Load(),
-		"wal_parked_files":                 m.walParkedFiles.Load(),
-		"wal_parked_bytes":                 m.walParkedBytes.Load(),
-		"wal_coverage_lost":                m.walCoverageLost.Load(),
-		"origin_stream_sessions":           m.originStreamSessions.Load(),
-		"origin_stream_dropped":            m.originStreamDropped.Load(),
-		"standby_stream_connected":         m.standbyStreamConnected.Load(),
-		"standby_stream_entries":           m.standbyStreamEntries.Load(),
-		"standby_stream_gaps":              m.standbyStreamGaps.Load(),
-		"standby_store_bytes":              m.standbyStoreBytes.Load(),
-		"standby_store_incomplete_keys":    m.standbyStoreIncomplete.Load(),
-		"standby_store_trimmed_bytes":      m.standbyStoreTrimmedBytes.Load(),
-		"standby_store_dropped":            m.standbyStoreDropped.Load(),
-		"standby_store_evicted_bytes":      m.standbyStoreEvicted.Load(),
-		"standby_store_lost_records":       m.standbyStoreLost.Load(),
-		"standby_store_blocked_keys":       m.standbyStoreBlocked.Load(),
-		"standby_store_replaced_bytes":     m.standbyStoreReplaced.Load(),
-		"standby_store_pinned_bytes":       m.standbyStorePinned.Load(),
-		"stream_claims_enabled":            m.streamClaimsEnabled.Load(),
-		"stream_claims":                    m.streamClaims.Load(),
-		"stream_takeover_departed_writers": m.departedWriters.Load(),
-		"stream_takeover_oldest_claim_age": m.oldestClaimAge.Load(),
-		"stream_takeover_unpulled_files":   m.unpulledFiles.Load(),
-		"wal_coverage_refused":             m.walCoverageRefused.Load(),
-		"wal_recovery_total":               m.walRecoveryTotal.Load(),
-		"wal_recovery_records":             m.walRecoveryRecords.Load(),
-		"wal_dropped_entries":              m.walDroppedEntries.Load(),
-		"wal_failed_writes":                m.walFailedWrites.Load(),
-		"wal_failed_syncs":                 m.walFailedSyncs.Load(),
-		"wal_oversized_payloads":           m.walOversizedPayloads.Load(),
-		"wal_directory_bytes":              m.walDirectoryBytes.Load(),
-		"file_registrations_pending":       m.fileRegistrationsPending.Load(),
-		"file_registrations_confirmed":     m.fileRegistrationsConfirmed.Load(),
-		"file_registration_journal_errors": m.fileRegistrationJournalErrs.Load(),
-		"ingest_fenced":                    m.ingestFenced.Load(),
-		"ingest_fenced_writes":             m.ingestFencedWrites.Load(),
-		"wal_quarantined_files":            m.walQuarantinedFiles.Load(),
-		"wal_quarantine_released_entries":  m.walQuarantineReleased.Load(),
-		"wal_partial_row_recovery_pending": m.walPartialRowRecovery.Load(),
+		"wal_records_preserved":             m.walRecordsPreserved.Load(),
+		"wal_registered_floor_lag":          m.walRegisteredFloorLag.Load(),
+		"wal_held_files":                    m.walHeldFiles.Load(),
+		"wal_parked_files":                  m.walParkedFiles.Load(),
+		"wal_parked_bytes":                  m.walParkedBytes.Load(),
+		"wal_coverage_lost":                 m.walCoverageLost.Load(),
+		"origin_stream_sessions":            m.originStreamSessions.Load(),
+		"origin_stream_dropped":             m.originStreamDropped.Load(),
+		"standby_stream_connected":          m.standbyStreamConnected.Load(),
+		"standby_stream_entries":            m.standbyStreamEntries.Load(),
+		"standby_stream_gaps":               m.standbyStreamGaps.Load(),
+		"standby_store_bytes":               m.standbyStoreBytes.Load(),
+		"standby_store_incomplete_keys":     m.standbyStoreIncomplete.Load(),
+		"standby_store_trimmed_bytes":       m.standbyStoreTrimmedBytes.Load(),
+		"standby_store_dropped":             m.standbyStoreDropped.Load(),
+		"standby_store_evicted_bytes":       m.standbyStoreEvicted.Load(),
+		"standby_store_lost_records":        m.standbyStoreLost.Load(),
+		"standby_store_blocked_keys":        m.standbyStoreBlocked.Load(),
+		"standby_store_replaced_bytes":      m.standbyStoreReplaced.Load(),
+		"standby_store_pinned_bytes":        m.standbyStorePinned.Load(),
+		"stream_claims_enabled":             m.streamClaimsEnabled.Load(),
+		"stream_claims":                     m.streamClaims.Load(),
+		"stream_takeover_departed_writers":  m.departedWriters.Load(),
+		"stream_takeover_oldest_claim_age":  m.oldestClaimAge.Load(),
+		"stream_takeover_unpulled_files":    m.unpulledFiles.Load(),
+		"wal_coverage_refused":              m.walCoverageRefused.Load(),
+		"wal_recovery_total":                m.walRecoveryTotal.Load(),
+		"wal_recovery_records":              m.walRecoveryRecords.Load(),
+		"wal_dropped_entries":               m.walDroppedEntries.Load(),
+		"wal_failed_writes":                 m.walFailedWrites.Load(),
+		"wal_failed_syncs":                  m.walFailedSyncs.Load(),
+		"wal_oversized_payloads":            m.walOversizedPayloads.Load(),
+		"wal_directory_bytes":               m.walDirectoryBytes.Load(),
+		"file_registrations_pending":        m.fileRegistrationsPending.Load(),
+		"reconciliation_storage_sweep_held": m.reconciliationStorageSweepHeld.Load(),
+		"file_registrations_confirmed":      m.fileRegistrationsConfirmed.Load(),
+		"file_registration_journal_errors":  m.fileRegistrationJournalErrs.Load(),
+		"ingest_fenced":                     m.ingestFenced.Load(),
+		"ingest_fenced_writes":              m.ingestFencedWritesTotal(),
+		"wal_quarantined_files":             m.walQuarantinedFiles.Load(),
+		"wal_quarantine_released_entries":   m.walQuarantineReleased.Load(),
+		"wal_partial_row_recovery_pending":  m.walPartialRowRecovery.Load(),
 
 		// Decompression Pool
 
@@ -1557,6 +1610,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_wal_dir_bytes gauge\n"...)
 	b = appendMetric(b, "arc_wal_dir_bytes", float64(m.walDirectoryBytes.Load()))
 
+	b = append(b, "# HELP arc_reconciliation_storage_sweep_held 1 while the last reconciliation run held its orphan-storage sweep because a node that can ingest did not answer, or a published pending-registration list could not be read; a node that stays down holds it until it returns or is removed from the cluster\n"...)
+	b = append(b, "# TYPE arc_reconciliation_storage_sweep_held gauge\n"...)
+	b = appendMetric(b, "arc_reconciliation_storage_sweep_held", float64(m.reconciliationStorageSweepHeld.Load()))
+
 	b = append(b, "# HELP arc_cluster_file_registrations_pending Flushed files not yet confirmed in the cluster manifest\n"...)
 	b = append(b, "# TYPE arc_cluster_file_registrations_pending gauge\n"...)
 	b = appendMetric(b, "arc_cluster_file_registrations_pending", float64(m.fileRegistrationsPending.Load()))
@@ -1573,9 +1630,11 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_cluster_ingest_fenced gauge\n"...)
 	b = appendMetric(b, "arc_cluster_ingest_fenced", float64(m.ingestFenced.Load()))
 
-	b = append(b, "# HELP arc_cluster_ingest_fenced_writes_total Writes refused by ingest fencing\n"...)
+	b = append(b, "# HELP arc_cluster_ingest_fenced_writes_total Live writes refused because this node may not accept ingest, by reason (gate refusals: a retried MQTT message or CQ write counts each attempt)\n"...)
 	b = append(b, "# TYPE arc_cluster_ingest_fenced_writes_total counter\n"...)
-	b = appendMetric(b, "arc_cluster_ingest_fenced_writes_total", float64(m.ingestFencedWrites.Load()))
+	for i, r := range IngestFencedReasons {
+		b = appendMetricWithLabel(b, "arc_cluster_ingest_fenced_writes_total", "reason", r, float64(m.ingestFencedWrites[i].Load()))
+	}
 
 	b = append(b, "# HELP arc_cluster_file_registration_journal_errors_total File registration journal write or fsync failures\n"...)
 	b = append(b, "# TYPE arc_cluster_file_registration_journal_errors_total counter\n"...)

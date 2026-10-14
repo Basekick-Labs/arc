@@ -1044,6 +1044,12 @@ func main() {
 	registrationOutbox := newRegistrationOutbox(cfg, licenseHasClustering(licenseClient), logger.Get("file-registrar"))
 	if registrationOutbox != nil {
 		arrowBuffer.SetFileRegistrar(registrationOutbox)
+		// On a shared object store the writer publishes what it has pending
+		// for the orphan sweep, which runs on another node (#1214). Set
+		// before the hand-off or an abandon, which both publish.
+		if cluster.IsSharedObjectStore(storageBackend) {
+			registrationOutbox.SetPendingPublisher(storageBackend, cluster.ResolveNodeID(cfg.Cluster.NodeID))
+		}
 		// Refused registrations are parked out of the query path (#1207
 		// S4b); a move a crash interrupted is finished here.
 		if lb, ok := storageBackend.(*storage.LocalBackend); ok {
@@ -2317,9 +2323,12 @@ func main() {
 						// component, so a hook here would stop before the buffer
 						// flushed — that was #1014):
 						//   arrow-buffer        (30) — final flush, enqueues each file
-						//   file-registrar      (31) — drains the queue into Raft
+						//   file-registrar      (31) — drains the queue into Raft, then
+						//                              publishes what is still pending
+						//                              (shared object store, #1214)
 						//   wal-purge           (35) — removes the WAL those files cover
-						//   cluster-coordinator (50) — puller.Stop(), then raftNode.Stop()
+						//   cluster-coordinator (50) — leave broadcast, puller.Stop(),
+						//                              then raftNode.Stop()
 						//
 						// Raft outlives the final flush, so the last files land in
 						// the manifest; registerClusterCoordinatorShutdown and
@@ -2331,6 +2340,12 @@ func main() {
 						case registrationOutbox != nil && clusterCoordinator.HasRaft():
 							registrationOutbox.HandOff(clusterCoordinator, storageBackend, clusterCoordinator.LocalNodeID())
 							registerFileRegistrarShutdown(shutdownCoordinator, registrationOutbox.Stop)
+							// The orphan sweep asks this node what it has pending
+							// registration (#1214).
+							clusterCoordinator.SetPendingRegistrations(registrationOutbox.PendingPaths)
+							// Nor does it leave the cluster at shutdown while files
+							// pending here are in no published list (#1214).
+							clusterCoordinator.SetLeaveGate(registrationOutbox.CoverForLeave)
 							log.Info().Msg("Cluster file manifest registration outbox started")
 							// #1207 S3: with cluster.wal_coverage, stream committed
 							// batches to standby writers and keep their copy. After
@@ -4252,6 +4267,18 @@ func main() {
 			// orphan entry (#1207 d2a2a).
 			reconciler.SetHeldFilter(clusterCoordinator.CompactionOutputHeld)
 			reconciler.SetCompactionOwnedFilter(clusterCoordinator.CompactionOwns)
+			// On a shared object store the sweep runs on the active
+			// compactor, which has no outbox: what the writers have pending,
+			// asked of each and read from their published lists, is not an
+			// orphan, and a writer that cannot tell holds the sweep (#1214).
+			// The reconciler uses it only with BackendShared.
+			reconciler.SetRemotePendingSource(func(ctx context.Context) reconciliation.RemotePending {
+				paths, held := clusterCoordinator.PendingRegistrationsElsewhere(ctx)
+				return reconciliation.RemotePending{Paths: paths, Held: held}
+			})
+			// A compaction output manifest repair adopts is not an orphan
+			// either, whichever of the two gets to it first (#1214).
+			reconciler.SetAdoptableFilter(clusterCoordinator.AdoptableObject)
 		}
 		if err != nil {
 			log.Error().Err(err).Msg("Failed to create reconciler — feature disabled")

@@ -143,7 +143,8 @@ request can still leave its earlier measurements written.
 `/ready/write` reports not-ready while a writer refuses writes.
 `arc_cluster_ingest_fenced` is 1 while a writer has lost contact; a standby
 refusing writes is normal and does not set it.
-`arc_cluster_ingest_fenced_writes_total` counts refused writes.
+`arc_cluster_ingest_fenced_writes_total` counts refused writes, by `reason` (see
+the bug fix for [#1268](https://github.com/Basekick-Labs/arc/issues/1268)).
 
 MQTT subscriptions on a writer that refuses writes are suspended: disconnected
 without unsubscribing. With `clean_session=false` the broker queues QoS 1 and 2
@@ -1174,6 +1175,91 @@ into the open segment meanwhile, and the trim deleted that segment with the
 batches that had just arrived, which were not registered yet. Had the primary
 then failed with its volume, a stream takeover could not have published those
 rows. A segment that grew during the check is now kept until the next pass.
+
+### The reconciler no longer deletes files a writer has not registered yet ([#1214](https://github.com/Basekick-Labs/arc/issues/1214))
+
+On shared storage, each writer uploads a flushed file to the bucket first,
+then registers it in the cluster manifest. A writer that cannot reach the
+cluster leader keeps the file pending until it can. The orphan reconciler
+runs on the active compactor, which cannot see another writer's pending
+files. Once such a file was older than the grace window, the reconciler
+deleted it as an orphan. When the writer came back, the file was gone, and
+because the writer had already released those rows from its WAL, the
+acknowledged rows were lost. A compactor partitioned from the leader could do
+the same to files the rest of the cluster had registered, because it compared
+the bucket against its own stale copy of the manifest.
+
+A reconciliation run now:
+
+- Catches up with the cluster leader before each sweep. Without a reachable
+  leader, the run stops before deleting anything (`abort_reason`
+  `manifest_not_synced`, or `leader_barrier_unsupported` when the leader runs
+  an older release).
+- Asks every node that can ingest (writers) which files it still has pending,
+  over an authenticated cluster message. If any of them does not answer, the
+  storage half of the run is held: nothing is deleted from storage, the run
+  reports `storage_sweep_held` with `storage_sweep_held_reason` naming the
+  node, and the new gauge `arc_reconciliation_storage_sweep_held` is 1. A
+  writer that is down, or a node that was decommissioned but never removed
+  from the cluster, holds the storage sweep until it is back or removed.
+- Skips every file listed in the bucket under `_registration_pending/`. Each
+  writer writes its pending files there when it stops and whenever a file
+  stays pending for more than a minute, and removes the list once everything
+  is registered. A writer that stops with files pending does not leave the
+  cluster until that list is written, so it keeps holding the sweep if the
+  list cannot be written.
+- Skips compaction outputs that the manifest repair will adopt.
+
+The skips are counted in the new run fields `skipped_pending_remote` and
+`skipped_adoptable`.
+
+`reconciliation.grace_window_seconds` now has a minimum of one hour. A
+smaller value is raised to one hour with a warning.
+
+During a rolling upgrade, the storage sweep stays held until every writer
+runs this release, because older writers do not answer the new message.
+
+Two smaller fixes on shared storage:
+
+- **DELETE during a rolling upgrade.** While compaction commit is not yet on,
+  a row DELETE that reaches a file another writer flushed less than an hour
+  ago and has not registered yet now leaves that file as it is and answers
+  `503` with `Retry-After`. It used to rewrite the file without registering
+  the rewrite, and the reconciler later deleted the rewrite with its surviving
+  rows. If other files also failed, the answer is `207` and names both.
+- **Ghost manifest entries.** A writer now checks, after registering, that
+  each file it just flushed still exists. A file another node deleted in the
+  meantime is removed from the manifest again, instead of being left as an
+  entry with no object that made DELETEs on that measurement answer `503`
+  until the hourly repair.
+
+
+### A failover no longer floods the logs with two errors per refused write ([#1268](https://github.com/Basekick-Labs/arc/issues/1268))
+
+A writer that refuses writes (it lost contact with the cluster leader, another
+writer is the primary, or a stream takeover holds it) logged two ERR lines for
+every refused request: `Failed to write to Arrow buffer` and
+`HTTP request error status=503`. During a failover a client retrying at a few
+hundred writes per second produced over a thousand lines per second. Kubernetes
+rotated the container logs within seconds, and the lines that explained the
+failover were gone.
+
+- A refused write is logged once per reason every 30 seconds, at WARN:
+  `Writes refused on this node (retryable)`, with the reason, where the write
+  came from, the error, and how many refusals were not logged since the last
+  line. A new reason logs at once, so a standby's routine refusals never hide a
+  primary that fences itself.
+- The refusal is no longer counted in `arc_ingest_errors_total`, on every write
+  path (MessagePack, line protocol, TLE, the import endpoints, MQTT).
+- The answer is unchanged: `503` with `Retry-After: 5`. It also carries
+  `X-Arc-Ingest-Fenced: 1`. A reader or compactor that forwarded the write logs
+  the refusal the same way (reason `forwarded`), not once per request.
+- `arc_cluster_ingest_fenced_writes_total` has a `reason` label: `contact`,
+  `standby`, `claimed`, `announcing`, `not_designated`, `delete_ack`, `other`.
+  It now also counts the stream-takeover refusals, which it missed before. Sum
+  by reason for the old total. A refusal is counted per attempt: an MQTT message
+  retried while refused counts once per retry.
+- Other 503s (shutting down, schema churn) are still logged per request.
 
 ### A new Raft leader no longer re-promotes a dead primary writer, or fails over a healthy one ([#1267](https://github.com/Basekick-Labs/arc/issues/1267))
 

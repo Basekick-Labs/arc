@@ -392,6 +392,14 @@ func (s *Subscriber) onMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 	if err != nil {
 		s.messagesFailed.Add(1)
 		metrics.Get().IncMQTTMessagesFailed()
+		if errors.Is(err, ingest.ErrIngestFenced) {
+			// Still refused after the wait: logged by reason, at most every
+			// 30 s, not once per message (#1268). The takeover gates do not
+			// suspend the subscription, so this repeats per message for as long
+			// as one is refusing.
+			ingest.LogRefusal("mqtt "+msg.Topic(), err)
+			return
+		}
 		s.logger.Error().
 			Err(err).
 			Str("topic", msg.Topic()).

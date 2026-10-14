@@ -55,6 +55,10 @@ type ingestFence struct {
 
 	fenced atomic.Bool
 	reason atomic.Value // string
+	// refusal is the error a refused write carries: the reason text and its
+	// class (contact or standby) stored together, so a write never pairs one
+	// state's text with another's class (#1268).
+	refusal atomic.Pointer[ingest.RefusalError]
 
 	mu          sync.Mutex
 	lostContact bool      // fenced for contact (as opposed to designation)
@@ -193,6 +197,11 @@ func (f *ingestFence) setLocked(reason string, contact bool) {
 	prev, _ := f.reason.Load().(string)
 	now := reason != ""
 	f.reason.Store(reason)
+	class := ingest.RefusalStandby
+	if contact {
+		class = ingest.RefusalContact
+	}
+	f.refusal.Store(&ingest.RefusalError{Reason: class, Text: reason})
 	f.fenced.Store(now)
 	// The alert gauge is for contact loss only: a standby writer refusing
 	// writes is its normal state, not an incident.
@@ -221,10 +230,28 @@ func (f *ingestFence) gate() error {
 	if !f.fenced.Load() {
 		return nil
 	}
-	metrics.Get().IncIngestFencedWrites()
-	reason, _ := f.reason.Load().(string)
-	return fmt.Errorf("%w: %s", ingest.ErrIngestFenced, reason)
+	r := f.refusal.Load()
+	if r == nil { // fenced is stored after refusal; not reachable
+		return ingest.ErrIngestFenced
+	}
+	return fmt.Errorf("%w: %w", ingest.ErrIngestFenced, r)
 }
+
+// Refusal reasons, the label of arc_cluster_ingest_fenced_writes_total and
+// the key refusals are logged by (#1268); defined in ingest, which the API and
+// MQTT share. A standby writer refusing is its normal state; contact, claimed
+// and delete_ack on the primary are not.
+const (
+	RefusalContact       = ingest.RefusalContact
+	RefusalStandby       = ingest.RefusalStandby
+	RefusalClaimed       = ingest.RefusalClaimed
+	RefusalAnnouncing    = ingest.RefusalAnnouncing
+	RefusalNotDesignated = ingest.RefusalNotDesignated
+	RefusalDeleteAck     = ingest.RefusalDeleteAck
+)
+
+// IngestRefusalReason is ingest.RefusalReason.
+func IngestRefusalReason(err error) string { return ingest.RefusalReason(err) }
 
 // startIngestFenceLocked builds and runs the fence where a primary is elected:
 // Raft with local storage. The contact rule also needs automatic failover. The
@@ -285,23 +312,32 @@ func (c *Coordinator) startIngestFenceLocked() {
 // It admits everything until (and unless) the fence starts. Lock-free.
 func (c *Coordinator) IngestGate() func() error {
 	return func() error {
-		if c.claimedExit.Load() {
-			return fmt.Errorf("%w: %w", ingest.ErrIngestFenced, errTakeoverClaimed)
+		err := c.ingestRefusal()
+		if err != nil {
+			metrics.Get().IncIngestFencedWrites(IngestRefusalReason(err))
 		}
-		if c.takeoverGateClosed() {
-			return fmt.Errorf("%w: %w", ingest.ErrIngestFenced, errTakeoverAnnouncing)
-		}
-		if c.takeoverDesignationRefuses() {
-			return fmt.Errorf("%w: %w", ingest.ErrIngestFenced, errNotDesignated)
-		}
-		if c.deleteAckOwed() {
-			return fmt.Errorf("%w: %w", ingest.ErrIngestFenced, errDeleteAckPending)
-		}
-		if f := c.ingestFence.Load(); f != nil {
-			return f.gate()
-		}
-		return nil
+		return err
 	}
+}
+
+// ingestRefusal is IngestGate's check, uncounted.
+func (c *Coordinator) ingestRefusal() error {
+	if c.claimedExit.Load() {
+		return fmt.Errorf("%w: %w", ingest.ErrIngestFenced, errTakeoverClaimed)
+	}
+	if c.takeoverGateClosed() {
+		return fmt.Errorf("%w: %w", ingest.ErrIngestFenced, errTakeoverAnnouncing)
+	}
+	if c.takeoverDesignationRefuses() {
+		return fmt.Errorf("%w: %w", ingest.ErrIngestFenced, errNotDesignated)
+	}
+	if c.deleteAckOwed() {
+		return fmt.Errorf("%w: %w", ingest.ErrIngestFenced, errDeleteAckPending)
+	}
+	if f := c.ingestFence.Load(); f != nil {
+		return f.gate()
+	}
+	return nil
 }
 
 // OnIngestFenceChange registers fn to run (in its own goroutine) whenever the

@@ -88,7 +88,9 @@ func (h *ImportHandler) handleCSVImport(c *fiber.Ctx) error {
 	result, ierr := h.importCSV(c.Context(), database, measurement, &limitedReader{r: f, limit: maxImportSize}, opts, fileHeader.Size)
 	if ierr != nil {
 		h.totalErrors.Add(1)
-		h.logger.Error().Err(ierr).Str("database", database).Str("measurement", measurement).Msg("CSV import failed")
+		if !errors.Is(ierr, ingest.ErrIngestFenced) { // a fence refusal is logged by reason (#1268)
+			h.logger.Error().Err(ierr).Str("database", database).Str("measurement", measurement).Msg("CSV import failed")
+		}
 		return h.importErrorResponse(c, ierr)
 	}
 
@@ -303,7 +305,9 @@ func (h *ImportHandler) handleParquetImport(c *fiber.Ctx) error {
 	result, ierr := h.importParquet(c.Context(), database, measurement, data, opts)
 	if ierr != nil {
 		h.totalErrors.Add(1)
-		h.logger.Error().Err(ierr).Str("database", database).Str("measurement", measurement).Msg("Parquet import failed")
+		if !errors.Is(ierr, ingest.ErrIngestFenced) { // a fence refusal is logged by reason (#1268)
+			h.logger.Error().Err(ierr).Str("database", database).Str("measurement", measurement).Msg("Parquet import failed")
+		}
 		return h.importErrorResponse(c, ierr)
 	}
 
