@@ -65,6 +65,10 @@ type TierRecorder interface {
 	// may come from an operator and so is a hint rather than proof of what
 	// happened to the file.
 	RecordUnlinkedFile(path, reason string, sizeBytes int64)
+	// RecordMissingFile reports a path that left the manifest while this
+	// node no longer had the file (its own compaction or retention removed
+	// it first): a hot row it still holds for the path is stale (#1271).
+	RecordMissingFile(path string)
 }
 
 // deleteWorkerCount is the number of goroutines draining the pending local
@@ -1325,7 +1329,14 @@ func (c *Coordinator) unlinkOne(item deleteRequest, relisted func(string) (bool,
 	}
 	// A compaction input stays readable until this node's staged copy of
 	// the output is in place (#1207 d2a2a; bounded).
-	c.waitStagedAdoption(item.reason)
+	// The wait can last seconds: a path registered again meanwhile keeps its
+	// fresh copy. Read again only after a wait (#1271).
+	if c.waitStagedAdoption(item.reason) && relisted != nil {
+		if listed, refresh := relisted(item.path); listed {
+			c.logKeptRelistedPath(item, refresh)
+			return
+		}
+	}
 	// One budget for the stat and the delete together. Both are a syscall on
 	// a local backend, which is the only backend this path runs on.
 	delCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1338,6 +1349,9 @@ func (c *Coordinator) unlinkOne(item deleteRequest, relisted func(string) (bool,
 	var (
 		sizeBytes int64
 		wasLocal  bool
+		// statOK: the stat answered (present or absent), so "absent" can be
+		// reported as such (#1271).
+		statOK bool
 	)
 	recorder := c.tierRecorderSnapshot()
 	if recorder != nil {
@@ -1363,6 +1377,7 @@ func (c *Coordinator) unlinkOne(item deleteRequest, relisted func(string) (bool,
 				n, statErr = si.StagedSize(delCtx, item.path)
 			}
 		}
+		statOK = statErr == nil
 		if statErr == nil && n >= 0 {
 			sizeBytes = n
 			wasLocal = true
@@ -1398,11 +1413,20 @@ func (c *Coordinator) unlinkOne(item deleteRequest, relisted func(string) (bool,
 			Str("reason", item.reason).
 			Msg("Phase 4 local delete worker: removed local copy")
 		c.forgetLocal(item.path)
-		if wasLocal && recorder != nil {
+		switch {
+		case wasLocal && recorder != nil:
 			// Only for a file this node actually held: the tier row for a
-			// path a node never had is not its to write, and without the stat
-			// above every node would report every manifest delete.
+			// path a node never had is not its to write. Every other node
+			// reports the path as missing below, which only retires a hot row
+			// it may still hold.
 			recorder.RecordUnlinkedFile(item.path, item.reason, sizeBytes)
+		case recorder != nil && statOK:
+			// Not here when the worker came to remove it (the stat said so):
+			// this node's own compaction or retention removed it first. Any
+			// hot row this node holds for the path is stale; a node that
+			// never held it has none, and the event is a no-op there (#1271).
+			// A failed stat reports nothing, as before.
+			recorder.RecordMissingFile(item.path)
 		}
 	}
 }
