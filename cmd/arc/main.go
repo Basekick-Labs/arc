@@ -1315,7 +1315,24 @@ func main() {
 			bytesTicker := time.NewTicker(15 * time.Second)
 			defer bytesTicker.Stop()
 			walLogger := logger.Get("wal-maintenance")
-			var lastHeldWarn time.Time
+			purgePass := &walPurgePass{writer: walWriter, logger: walLogger}
+
+			// Prompt purge (#676): the writer hints on every rotation and
+			// floor release, and the purge runs here, at most once a second
+			// with a trailing pass, so it never interleaves with the
+			// recovery pass below. The periodic tick stays as a backstop.
+			// The directory-size sample stays on its own ticker.
+			var purgeHint <-chan struct{}
+			if walWriter != nil {
+				purgeHint = walWriter.PurgeHint()
+			}
+			promptPurge := newWALPurgeLimiter(walPromptPurgeInterval, purgePass.prompt)
+			defer promptPurge.stop()
+			// One pass at start: files startup recovery retained, and flush
+			// proof it unpinned (#1222), need not wait for the first rotation.
+			if walWriter != nil {
+				promptPurge.hint()
+			}
 
 			for {
 				select {
@@ -1323,6 +1340,10 @@ func main() {
 					return
 				case <-bytesTicker.C:
 					updateWALDirectoryBytes()
+				case <-purgeHint:
+					promptPurge.hint()
+				case <-promptPurge.trailing():
+					promptPurge.fire()
 				case <-ticker.C:
 					if arrowBuffer.HasFlushFailure() {
 						// Storage failure detected — replay WAL files to recover data
@@ -1438,6 +1459,9 @@ func main() {
 							}
 						}
 						updateWALDirectoryBytes()
+						// Recovery may have deleted earlier process files
+						// that pinned this process's flush proof (#1222).
+						promptPurge.hint()
 					} else {
 						// Tracked files are reclaimed below the durable sequence
 						// floor. Files outside that floor remain for recovery; age
@@ -1453,16 +1477,7 @@ func main() {
 					// Files recovery retained for the registration hold
 					// (#1207 S4c) go once their batches are registered.
 					if walWriter != nil {
-						if _, err := walWriter.ReleaseRetained(); err != nil {
-							walLogger.Error().Err(err).Msg("Releasing retained WAL files failed")
-						}
-						held := walWriter.HeldFiles()
-						metrics.Get().SetWALHeldFiles(int64(held))
-						if held > 0 && time.Since(lastHeldWarn) >= 10*time.Minute {
-							lastHeldWarn = time.Now()
-							walLogger.Warn().Int("files", held).
-								Msg("WAL files are kept until the files their batches were flushed into are registered; the WAL grows while registrations cannot land (see arc_cluster_file_registration_oldest_pending_seconds)")
-						}
+						purgePass.releaseRetained()
 					}
 				}
 			}

@@ -86,6 +86,13 @@ func (s coverageSet) add(instance uint64, key string, cseq uint64) {
 	s[k] = v
 }
 
+// contains reports whether cseq of instance and key is in the set.
+func (s coverageSet) contains(instance uint64, key string, cseq uint64) bool {
+	v := s[coverageSetKey{instance, key}]
+	i := sort.Search(len(v), func(i int) bool { return v[i][1] >= cseq })
+	return i < len(v) && v[i][0] <= cseq
+}
+
 func (s coverageSet) held(h CoverageHold) bool {
 	if h == nil {
 		return false
@@ -244,6 +251,9 @@ func (w *Writer) ReleaseRetained() (int, error) {
 	deleted := 0
 	for _, path := range candidates {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			if deleted > 0 {
+				w.signalPurge()
+			}
 			return deleted, err // stop: a later file may hold this one's proof
 		}
 		deleted++
@@ -254,6 +264,9 @@ func (w *Writer) ReleaseRetained() (int, error) {
 	if deleted > 0 {
 		w.logger.Info().Int("deleted", deleted).Str("last", filepath.Base(candidates[deleted-1])).
 			Msg("Deleted retained WAL files whose batches are registered")
+		// An earlier process file gone can unpin this process's files that
+		// hold flush proof for it (#1222): let the purge look again (#676).
+		w.signalPurge()
 	}
 	return deleted, nil
 }

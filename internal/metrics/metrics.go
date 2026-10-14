@@ -191,7 +191,9 @@ type Metrics struct {
 	walRecoveryTotal     atomic.Int64 // Successful WAL recovery operations
 	walRecoveryRecords   atomic.Int64 // Total records recovered from WAL
 	walDroppedEntries    atomic.Int64 // Entries dropped due to full WAL buffer
-	walFailedWrites      atomic.Int64 // Write failures to WAL file
+	walFailedWrites      atomic.Int64 // WAL entries lost to a failed write (#676)
+	walDiskFullWrites    atomic.Int64 // Of those, lost to ENOSPC or EDQUOT
+	walRecoveredWrites   atomic.Int64 // Failed WAL writes the retry on a new file recovered
 	walFailedSyncs       atomic.Int64 // WAL fsync/fdatasync failures
 	walOversizedPayloads atomic.Int64 // Payloads rejected for exceeding the single-entry cap even after chunking (#677)
 	walDirectoryBytes    atomic.Int64 // Current bytes occupied by every file in the WAL directory
@@ -714,6 +716,8 @@ func (m *Metrics) IncWALRecoveryTotal()              { m.walRecoveryTotal.Add(1)
 func (m *Metrics) IncWALRecoveryRecords(count int64) { m.walRecoveryRecords.Add(count) }
 func (m *Metrics) IncWALDroppedEntries()             { m.walDroppedEntries.Add(1) }
 func (m *Metrics) IncWALFailedWrites()               { m.walFailedWrites.Add(1) }
+func (m *Metrics) IncWALDiskFullWrites()             { m.walDiskFullWrites.Add(1) }
+func (m *Metrics) IncWALRecoveredWrites()            { m.walRecoveredWrites.Add(1) }
 func (m *Metrics) IncWALFailedSyncs()                { m.walFailedSyncs.Add(1) }
 func (m *Metrics) IncWALOversizedPayloads()          { m.walOversizedPayloads.Add(1) }
 func (m *Metrics) SetWALDirectoryBytes(bytes int64)  { m.walDirectoryBytes.Store(bytes) }
@@ -1131,6 +1135,8 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"wal_recovery_records":              m.walRecoveryRecords.Load(),
 		"wal_dropped_entries":               m.walDroppedEntries.Load(),
 		"wal_failed_writes":                 m.walFailedWrites.Load(),
+		"wal_disk_full_writes":              m.walDiskFullWrites.Load(),
+		"wal_recovered_writes":              m.walRecoveredWrites.Load(),
 		"wal_failed_syncs":                  m.walFailedSyncs.Load(),
 		"wal_oversized_payloads":            m.walOversizedPayloads.Load(),
 		"wal_directory_bytes":               m.walDirectoryBytes.Load(),
@@ -1654,9 +1660,15 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_wal_dropped_entries_total counter\n"...)
 	b = appendMetric(b, "arc_wal_dropped_entries_total", float64(m.walDroppedEntries.Load()))
 
-	b = append(b, "# HELP arc_wal_failed_writes_total WAL write failures\n"...)
+	b = append(b, "# HELP arc_wal_failed_writes_total WAL entries lost to a failed write (not written to any WAL file)\n"...)
 	b = append(b, "# TYPE arc_wal_failed_writes_total counter\n"...)
 	b = appendMetric(b, "arc_wal_failed_writes_total", float64(m.walFailedWrites.Load()))
+	b = append(b, "# HELP arc_wal_disk_full_writes_total WAL entries lost to a write that failed with ENOSPC or EDQUOT (a subset of arc_wal_failed_writes_total)\n"...)
+	b = append(b, "# TYPE arc_wal_disk_full_writes_total counter\n"...)
+	b = appendMetric(b, "arc_wal_disk_full_writes_total", float64(m.walDiskFullWrites.Load()))
+	b = append(b, "# HELP arc_wal_recovered_writes_total Failed WAL writes that succeeded on a new WAL file; nothing was lost\n"...)
+	b = append(b, "# TYPE arc_wal_recovered_writes_total counter\n"...)
+	b = appendMetric(b, "arc_wal_recovered_writes_total", float64(m.walRecoveredWrites.Load()))
 	b = append(b, "# HELP arc_wal_failed_syncs_total WAL fsync/fdatasync failures; each forces a rotation to a new WAL file\n"...)
 	b = append(b, "# TYPE arc_wal_failed_syncs_total counter\n"...)
 	b = appendMetric(b, "arc_wal_failed_syncs_total", float64(m.walFailedSyncs.Load()))
