@@ -200,10 +200,10 @@ type Metrics struct {
 	fileRegistrationJournalErrs   atomic.Int64 // registration journal write or fsync failures
 
 	// Ingest fencing (#1207)
-	ingestFenced          atomic.Int64 // 1 while this writer refuses writes
-	ingestFencedWrites    atomic.Int64 // writes refused by the fence
-	walQuarantinedFiles   atomic.Int64 // WAL files isolated after repeated recovery failures
-	walQuarantineReleased atomic.Int64 // pending WAL entries released because their file was quarantined (#1225)
+	ingestFenced          atomic.Int64                           // 1 while this writer refuses writes
+	ingestFencedWrites    [len(IngestFencedReasons)]atomic.Int64 // live writes refused, by reason (#1268)
+	walQuarantinedFiles   atomic.Int64                           // WAL files isolated after repeated recovery failures
+	walQuarantineReleased atomic.Int64                           // pending WAL entries released because their file was quarantined (#1225)
 	// 1 while the last recovery pass left a file on disk for which at least one
 	// row range of a parent entry was handed off — the state an older binary
 	// would replay in full.
@@ -714,8 +714,41 @@ func (m *Metrics) SetIngestFenced(fenced bool) {
 	}
 }
 
-// IncIngestFencedWrites counts a write refused by ingest fencing (#1207).
-func (m *Metrics) IncIngestFencedWrites() { m.ingestFencedWrites.Add(1) }
+// IncIngestFencedWrites counts a live write refused by the ingest gate (#1207),
+// under its reason (#1268).
+func (m *Metrics) IncIngestFencedWrites(reason string) {
+	for i, r := range IngestFencedReasons {
+		if r == reason {
+			m.ingestFencedWrites[i].Add(1)
+			return
+		}
+	}
+	m.ingestFencedWrites[len(IngestFencedReasons)-1].Add(1)
+}
+
+// IngestFencedReasons are the reason labels of
+// arc_cluster_ingest_fenced_writes_total, in export order (#1268). They match
+// cluster's Refusal constants; anything else counts as "other", the last.
+var IngestFencedReasons = [...]string{"contact", "standby", "claimed", "announcing", "not_designated", "delete_ack", "other"} // ingest.Refusal*
+
+// IngestFencedWritesFor returns the refusals counted under reason ("other" for
+// an unknown one).
+func (m *Metrics) IngestFencedWritesFor(reason string) int64 {
+	for i, r := range IngestFencedReasons {
+		if r == reason {
+			return m.ingestFencedWrites[i].Load()
+		}
+	}
+	return m.ingestFencedWrites[len(IngestFencedReasons)-1].Load()
+}
+
+func (m *Metrics) ingestFencedWritesTotal() int64 {
+	var n int64
+	for i := range m.ingestFencedWrites {
+		n += m.ingestFencedWrites[i].Load()
+	}
+	return n
+}
 
 func (m *Metrics) fileRegistrationOldestPendingSeconds() float64 {
 	ns := m.fileRegistrationOldestPending.Load()
@@ -1039,7 +1072,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"file_registrations_confirmed":     m.fileRegistrationsConfirmed.Load(),
 		"file_registration_journal_errors": m.fileRegistrationJournalErrs.Load(),
 		"ingest_fenced":                    m.ingestFenced.Load(),
-		"ingest_fenced_writes":             m.ingestFencedWrites.Load(),
+		"ingest_fenced_writes":             m.ingestFencedWritesTotal(),
 		"wal_quarantined_files":            m.walQuarantinedFiles.Load(),
 		"wal_quarantine_released_entries":  m.walQuarantineReleased.Load(),
 		"wal_partial_row_recovery_pending": m.walPartialRowRecovery.Load(),
@@ -1573,9 +1606,11 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_cluster_ingest_fenced gauge\n"...)
 	b = appendMetric(b, "arc_cluster_ingest_fenced", float64(m.ingestFenced.Load()))
 
-	b = append(b, "# HELP arc_cluster_ingest_fenced_writes_total Writes refused by ingest fencing\n"...)
+	b = append(b, "# HELP arc_cluster_ingest_fenced_writes_total Live writes refused because this node may not accept ingest, by reason (gate refusals: a retried MQTT message or CQ write counts each attempt)\n"...)
 	b = append(b, "# TYPE arc_cluster_ingest_fenced_writes_total counter\n"...)
-	b = appendMetric(b, "arc_cluster_ingest_fenced_writes_total", float64(m.ingestFencedWrites.Load()))
+	for i, r := range IngestFencedReasons {
+		b = appendMetricWithLabel(b, "arc_cluster_ingest_fenced_writes_total", "reason", r, float64(m.ingestFencedWrites[i].Load()))
+	}
 
 	b = append(b, "# HELP arc_cluster_file_registration_journal_errors_total File registration journal write or fsync failures\n"...)
 	b = append(b, "# TYPE arc_cluster_file_registration_journal_errors_total counter\n"...)

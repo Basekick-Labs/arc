@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/basekick-labs/arc/internal/cluster"
+	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/gofiber/fiber/v2"
 )
 
@@ -203,6 +204,14 @@ func CopyResponse(c *fiber.Ctx, resp *http.Response) error {
 		return err
 	}
 
+	// A fence refusal from the node the write was forwarded to is the expected
+	// answer during a failover: logged here by reason, not per request (#1268).
+	// Only once the body arrived: a failed copy is a real proxy error.
+	if resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get(IngestFencedHeader) != "" {
+		c.Locals(ingestFencedLocal, true)
+		ingest.LogRefusal("forwarded "+c.Path(), &ingest.RefusalError{Reason: "forwarded", Text: "the node this write was forwarded to refused it (503)"})
+	}
+
 	return c.Send(body)
 }
 
@@ -298,10 +307,26 @@ func RespondAlreadyForwarded(c *fiber.Ctx) error {
 	})
 }
 
+// IngestFencedHeader marks a 503 that refused a write because the node may not
+// accept ingest (#1268): a node that forwarded the write recognises the
+// expected refusal in the copied response and does not log it per request.
+const IngestFencedHeader = "X-Arc-Ingest-Fenced"
+
+// ingestFencedLocal is the request flag the request logger reads to skip its
+// per-request line for an expected fence refusal (#1268).
+const ingestFencedLocal = "arc.ingest_fenced"
+
 // respondIngestFenced answers a write refused because this node may no longer
 // be the primary writer (#1207). 503 with Retry-After so clients retry, by
 // then against the primary; nothing was written, so the retry is safe.
+//
+// The refusal is logged per reason, at most every ingest.RefusalLogEvery
+// (#1268): during a failover every client write is refused, and one line per
+// request rotated away the logs that explain the failover.
 func respondIngestFenced(c *fiber.Ctx, err error) error {
+	ingest.LogRefusal(c.Path(), err)
+	c.Locals(ingestFencedLocal, true)
+	c.Set(IngestFencedHeader, "1")
 	c.Set(fiber.HeaderRetryAfter, "5")
 	return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 		"error": "Write rejected (not the available primary writer, retry): " + err.Error(),
