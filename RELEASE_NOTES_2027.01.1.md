@@ -160,6 +160,31 @@ cluster heartbeat port, fences the primary while failover sees it as healthy:
 writes stop until Raft connectivity returns. Edge-sync bundles received by a hub
 write directly to storage and are not fenced.
 
+## Upgrade note: Raft pre-vote ([#1272](https://github.com/Basekick-Labs/arc/issues/1272))
+
+Arc 27.01.1 moves to hashicorp/raft v1.7.3 and runs the Raft pre-vote round by
+default. A writer that cannot hear the leader no longer raises its term on
+every election timeout. Before, when the leader reached it again, the higher
+term made a healthy leader step down: restarting one standby writer cost the
+cluster a leader change.
+
+**Rolling upgrade from an earlier release.** A node running an older release
+does not answer pre-vote, and an upgraded node counts that as a refusal. While
+the cluster runs both versions, if the leader dies and the two survivors are one
+old and one upgraded node with the more recent log, neither becomes leader until
+the restarted node rejoins on 27.01.1. Upgrade writers one at a time, and wait
+for each to rejoin before the next. To rule the window out completely, set
+`cluster.raft_pre_vote = false` (environment `ARC_CLUSTER_RAFT_PRE_VOTE=false`)
+on every node for the upgrade, then remove it (one more rolling restart) once
+every node runs 27.01.1.
+
+During the mixed window, old nodes log `failed to decode incoming command ...
+unknown rpc type` and upgraded nodes log `failed to make requestVote RPC` when
+an election runs. Both stop once every node is upgraded.
+
+A leadership transfer now returns only after the leader actually stepped down
+(up to one election timeout), and reports a timeout if it did not.
+
 ## Upgrade note: compaction commit stays on once enabled ([#1207](https://github.com/Basekick-Labs/arc/issues/1207))
 
 A cluster enables compaction commit by itself once every node runs this

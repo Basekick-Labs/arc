@@ -1351,3 +1351,26 @@ func TestLoad_StaleLocalSweepMaxFraction(t *testing.T) {
 		t.Fatalf("%+v", cfg.Cluster)
 	}
 }
+
+// Raft pre-vote is on by default and can be turned off for a rolling upgrade
+// from a release without it (#1272).
+func TestLoad_RaftPreVote(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Cluster.RaftPreVote {
+		t.Fatal("cluster.raft_pre_vote defaults to off")
+	}
+	t.Setenv("ARC_CLUSTER_RAFT_PRE_VOTE", "false")
+	if cfg, err = Load(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Cluster.RaftPreVote {
+		t.Fatal("ARC_CLUSTER_RAFT_PRE_VOTE=false ignored")
+	}
+}
