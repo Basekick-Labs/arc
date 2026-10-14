@@ -34,6 +34,9 @@ type originStream struct {
 
 	presentMu sync.Mutex
 	present   map[string]int64 // paths verified present locally, at their size
+
+	spaceDone chan struct{} // the free-space watcher exited
+
 }
 
 // StartOriginStream starts both sides. Call after Start, on a writer whose
@@ -69,13 +72,12 @@ func (c *Coordinator) StartOriginStream(walWriter *wal.Writer, buffer *ingest.Ar
 		return fmt.Errorf("the origin stream needs the storage backend")
 	}
 	root := filepath.Join(filepath.Dir(walWriter.CurrentFile()), "received")
-	store, err := originstream.OpenStore(root, c.cfg.StandbyStoreMaxBytes, c.logger.With().Str("component", "standby-store").Logger())
+	maxBytes := c.standbyStoreCap(filepath.Dir(root))
+	store, err := originstream.OpenStore(root, maxBytes, c.logger.With().Str("component", "standby-store").Logger())
 	if err != nil {
 		return err
 	}
-	if c.cfg.StandbyStoreMaxBytes <= 0 {
-		c.logger.Warn().Msg("cluster.standby_store_max_bytes is not positive: the standby store has no cap")
-	}
+
 	if c.cfg.StreamTakeover {
 		policy := &standbyEvictPolicy{c: c}
 		store.SetEvictable(policy.tier, policy.active)
@@ -107,6 +109,11 @@ func (c *Coordinator) StartOriginStream(walWriter *wal.Writer, buffer *ingest.Ar
 
 	ctx, cancel := context.WithCancel(c.ctx)
 	st.cancel = cancel
+	st.spaceDone = make(chan struct{})
+	go func() {
+		defer close(st.spaceDone)
+		c.watchStandbyStoreSpace(ctx, store, root)
+	}()
 	client := originstream.NewClient(originstream.ClientConfig{
 		Store:        store,
 		LocalNodeID:  c.localNode.ID,
@@ -405,5 +412,102 @@ func (c *Coordinator) stopOriginStream() {
 	case <-st.done:
 	case <-time.After(5 * time.Second):
 	}
+	if st.spaceDone != nil {
+		<-st.spaceDone // never touches a closed store
+	}
 	_ = st.store.Close()
+}
+
+// standbyStoreAutoShare and standbyStoreMinCap size the default standby store
+// cap: a quarter of the WAL volume, at least 1 GiB (#1266).
+const (
+	standbyStoreAutoShare  = 4
+	standbyStoreMinCap     = int64(1) << 30
+	standbyStoreMaxAutoCap = int64(32) << 30
+)
+
+// standbyStoreCap resolves cluster.standby_store_max_bytes: > 0 as given,
+// < 0 no cap, 0 (the default) a quarter of the filesystem holding dir (at
+// least 1 GiB). On a volume that does not enforce its size (k3s local-path,
+// hostPath, docker named volumes) the filesystem is the host's disk.
+func (c *Coordinator) standbyStoreCap(dir string) int64 {
+	switch v := c.cfg.StandbyStoreMaxBytes; {
+	case v > 0:
+		c.logger.Info().Int64("max_bytes", v).Msg("Standby store cap set by cluster.standby_store_max_bytes")
+		return v
+	case v < 0:
+		c.logger.Warn().Msg("cluster.standby_store_max_bytes is negative: the standby store has no cap")
+		return 0
+	}
+	total, _, err := diskSpace(dir)
+	if err != nil {
+		c.logger.Warn().Err(err).Int64("max_bytes", standbyStoreMinCap).Msg("Could not size the standby store cap from its volume; using 1 GiB")
+		return standbyStoreMinCap
+	}
+	// Capped at standbyStoreMaxAutoCap: a store at its cap is read whole at
+	// startup, and on a host disk a quarter can be hundreds of GiB.
+	capBytes := min(max(int64(total/standbyStoreAutoShare), standbyStoreMinCap), standbyStoreMaxAutoCap)
+	if standbyStoreReserve(total) >= total {
+		c.logger.Warn().Uint64("volume_bytes", total).
+			Msg("The WAL volume is smaller than the standby store's free-space reserve (2 GiB): with WAL coverage on, this standby keeps no copy of the primary's batches")
+	}
+	c.logger.Info().Uint64("volume_bytes", total).Int64("max_bytes", capBytes).
+		Msg("Standby store cap: a quarter of its volume (cluster.standby_store_max_bytes = 0)")
+	return capBytes
+}
+
+// Free-space reserve of the standby store's volume (#1266): below the
+// reserve the store stops keeping batches, so the WAL and the Parquet files
+// it shares the volume with keep their room; it resumes once a further
+// standbyStoreReserveResume is free. The store must give way BEFORE the WAL's
+// own disk gate (#676: off at its 512 MiB reserve plus two WAL files, ~712
+// MiB at defaults), or a standby fills the volume and is under disk pressure
+// the moment it is promoted: the 2 GiB floor keeps the reserve above it.
+const (
+	standbyStoreSpaceEvery    = 5 * time.Second
+	standbyStoreReserveMin    = uint64(2) << 30
+	standbyStoreReserveShare  = 10 // percent of the volume
+	standbyStoreReserveResume = uint64(1) << 30
+)
+
+// diskSpace is originstream.DiskSpace; a var for tests.
+var diskSpace = originstream.DiskSpace
+
+// lowSpaceNext is the reserve's state after a reading, with hysteresis.
+func lowSpaceNext(low bool, total, avail uint64) bool {
+	reserve := standbyStoreReserve(total)
+	switch {
+	case !low && avail < reserve:
+		return true
+	case low && avail >= reserve+standbyStoreReserveResume:
+		return false
+	}
+	return low
+}
+
+func standbyStoreReserve(total uint64) uint64 {
+	return max(total/100*standbyStoreReserveShare, standbyStoreReserveMin)
+}
+
+// watchStandbyStoreSpace checks the store's volume on its own tick.
+func (c *Coordinator) watchStandbyStoreSpace(ctx context.Context, store *originstream.Store, root string) {
+	t := time.NewTicker(standbyStoreSpaceEvery)
+	defer t.Stop()
+	low, warned := false, false
+	for {
+		total, avail, err := diskSpace(root)
+		switch {
+		case err == nil && total > 0:
+			low = lowSpaceNext(low, total, avail)
+			store.SetLowSpace(low, avail, standbyStoreReserve(total))
+		case !warned:
+			warned = true
+			c.logger.Warn().Err(err).Msg("Cannot read the standby store volume's free space; its free-space reserve is not enforced")
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
 }

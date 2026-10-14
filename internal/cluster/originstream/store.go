@@ -59,6 +59,13 @@ type Store struct {
 	// cap may evict; see SetEvictable.
 	evictable   EvictPolicy
 	evictActive func() bool
+	// lowSpace: the filesystem holding the store is below its free-space
+	// reserve; new batches are dropped (recorded as gaps) until it recovers
+	// (#1266). Set by SetLowSpace.
+	lowSpace bool
+	// trimWanted asks the trim loop for a pass now: the store just crossed
+	// half its cap (#1266).
+	trimWanted chan struct{}
 }
 
 type instanceID struct {
@@ -120,7 +127,8 @@ func OpenStore(root string, maxBytes int64, logger zerolog.Logger) (*Store, erro
 		return nil, fmt.Errorf("create standby store: %w", err)
 	}
 	s := &Store{root: root, maxBytes: maxBytes, segBytes: defaultSegmentBytes, logger: logger,
-		instances: map[instanceID]*instanceDir{}, current: map[string]uint64{}}
+		instances: map[instanceID]*instanceDir{}, current: map[string]uint64{}, trimWanted: make(chan struct{}, 1)}
+	metrics.Get().SetStandbyStoreMaxBytes(maxBytes)
 	origins, err := os.ReadDir(root)
 	if err != nil {
 		return nil, err
@@ -344,19 +352,28 @@ func (s *Store) Append(origin string, e *Entry) error {
 		return fmt.Errorf("standby store: entry for %q cannot be stored (key %d bytes, payload %d bytes)", e.Key, len(e.Key), len(e.Payload))
 	}
 	rec := encodeRecord(e)
+	if s.lowSpace {
+		// Below the free-space reserve: the volume is shared with the WAL and
+		// the Parquet files, and the store is what gives way (#1266).
+		s.dropLocked(d, e)
+		return nil
+	}
+	if s.maxBytes > 0 && s.bytes < s.maxBytes/2 && s.bytes+int64(len(rec)) >= s.maxBytes/2 {
+		select {
+		case s.trimWanted <- struct{}{}:
+		default:
+		}
+	}
 	if s.maxBytes > 0 {
 		if s.bytes+int64(len(rec)) > s.maxBytes {
 			s.evictLocked(int64(resumeFraction * float64(s.maxBytes)))
 		}
-		if s.capped && float64(s.bytes) < resumeFraction*float64(s.maxBytes) {
-			s.capped = false
-			metrics.Get().SetStandbyStorePinned(0)
-			s.logger.Info().Int64("bytes", s.bytes).Msg("Standby store back under its cap; storing batches again")
-		}
+		s.recheckCappedLocked()
 		if !s.capped && s.bytes+int64(len(rec)) > s.maxBytes {
 			s.capped = true
+			metrics.Get().SetStandbyStoreCapped(true)
 			s.logger.Warn().Int64("bytes", s.bytes).Int64("max_bytes", s.maxBytes).
-				Msg("Standby store reached cluster.standby_store_max_bytes; batches are not kept until it is trimmed")
+				Msg("Standby store reached cluster.standby_store_max_bytes; batches are not kept until it is trimmed (alert on arc_standby_store_dropped_total)")
 		}
 		if s.capped {
 			if policy := s.policyLocked(); policy != nil {
@@ -666,6 +683,9 @@ func (s *Store) Trim(ctx context.Context, ready TrimReadiness) (int64, error) {
 	for _, d := range s.instances {
 		d.dropRegisteredGaps()
 	}
+	if s.maxBytes > 0 {
+		s.recheckCappedLocked()
+	}
 	metrics.Get().AddStandbyStoreTrimmedBytes(freed)
 	metrics.Get().SetStandbyStoreTrimState(int64(lost), int64(blocked), s.replacedBytesLocked())
 	s.publishLocked()
@@ -803,6 +823,46 @@ func (s *Store) statsLocked() Stats {
 func (s *Store) publish() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.publishLocked()
+}
+
+// recheckCappedLocked leaves the capped state once the store is back under
+// 90 % of its cap. Called on every Append and after Trim and eviction, so the
+// state clears when the primary has gone quiet too (#1266).
+func (s *Store) recheckCappedLocked() {
+	if s.capped && float64(s.bytes) < resumeFraction*float64(s.maxBytes) {
+		s.capped = false
+		metrics.Get().SetStandbyStoreCapped(false)
+		metrics.Get().SetStandbyStorePinned(0)
+		s.logger.Info().Int64("bytes", s.bytes).Msg("Standby store back under its cap; storing batches again")
+	}
+}
+
+// TrimWanted fires when the store crosses half its cap: the trim loop runs a
+// pass then rather than at its next tick (#1266).
+func (s *Store) TrimWanted() <-chan struct{} { return s.trimWanted }
+
+// SetLowSpace reports whether the store's filesystem is below its free-space
+// reserve. Entering it first evicts what the eviction policy allows (as under
+// the cap's pressure), then new batches are dropped until it leaves (#1266).
+func (s *Store) SetLowSpace(low bool, availBytes, reserveBytes uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if low == s.lowSpace {
+		return
+	}
+	s.lowSpace = low
+	metrics.Get().SetStandbyStoreLowSpace(low)
+	if low {
+		s.evictLocked(0)
+		if s.maxBytes > 0 {
+			s.recheckCappedLocked()
+		}
+		s.logger.Warn().Uint64("available_bytes", availBytes).Uint64("reserve_bytes", reserveBytes).
+			Msg("The standby store's volume is below its free-space reserve; new batches are not kept until space returns (the WAL and Parquet files on the same volume come first)")
+	} else {
+		s.logger.Info().Uint64("available_bytes", availBytes).Msg("Standby store volume back above its free-space reserve; storing batches again")
+	}
 	s.publishLocked()
 }
 

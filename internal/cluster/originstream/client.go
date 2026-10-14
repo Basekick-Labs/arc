@@ -39,9 +39,14 @@ type Client struct {
 }
 
 const (
-	readIdle      = 3 * floorsHeartbeat
-	syncEvery     = 100 * time.Millisecond
-	trimEvery     = 30 * time.Second
+	readIdle  = 3 * floorsHeartbeat
+	syncEvery = 100 * time.Millisecond
+	// trimEvery: at ~1M rows/s 30 s of a primary's stream is already about a
+	// gigabyte, so a 30 s cadence alone filled the default cap (#1266).
+	trimEvery = 5 * time.Second
+	// trimSoonest rate-limits the extra passes the store asks for when it
+	// crosses half its cap.
+	trimSoonest   = time.Second
 	retargetEvery = time.Second
 	backoffMin    = time.Second
 	backoffMax    = 30 * time.Second
@@ -207,16 +212,34 @@ func (c *Client) session(ctx context.Context, node, addr string) error {
 func (c *Client) trimLoop(ctx context.Context) {
 	t := time.NewTicker(trimEvery)
 	defer t.Stop()
+	soon := time.NewTimer(time.Hour)
+	soon.Stop()
+	defer soon.Stop()
+	var last time.Time
+	trim := func() {
+		last = time.Now()
+		if freed, err := c.cfg.Store.Trim(ctx, c.cfg.Ready); err != nil {
+			c.cfg.Logger.Warn().Err(err).Msg("Standby store trim failed")
+		} else if freed > 0 {
+			c.cfg.Logger.Debug().Int64("bytes", freed).Msg("Standby store trimmed")
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if freed, err := c.cfg.Store.Trim(ctx, c.cfg.Ready); err != nil {
-				c.cfg.Logger.Warn().Err(err).Msg("Standby store trim failed")
-			} else if freed > 0 {
-				c.cfg.Logger.Debug().Int64("bytes", freed).Msg("Standby store trimmed")
+			trim()
+		case <-c.cfg.Store.TrimWanted():
+			// Rate-limited, never dropped: too soon after the last pass,
+			// it runs when the limit allows.
+			if wait := trimSoonest - time.Since(last); wait > 0 {
+				soon.Reset(wait)
+			} else {
+				trim()
 			}
+		case <-soon.C:
+			trim()
 		}
 	}
 }

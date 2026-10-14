@@ -333,11 +333,15 @@ flushing them from. Details:
   (`cluster.coordinator_addr`). This needs `cluster.shared_secret`, and
   `cluster.tls_enabled` if the network is untrusted: batches are authenticated
   but not encrypted without TLS.
-- `cluster.standby_store_max_bytes` (default 1 GiB) caps the copy. Past it, a
-  standby first evicts batches of a primary process that has since restarted.
-  If that is not enough, it keeps nothing new until trimming frees room, and
-  records the missed batches as gaps. The directory counts against the WAL
-  volume but not `arc_wal_dir_bytes`.
+- `cluster.standby_store_max_bytes` caps the copy. The default `0` means a
+  quarter of the WAL volume, at least 1 GiB; a negative value means no cap.
+  Past the cap, a standby first evicts batches of a primary process that has
+  since restarted. If that is not enough, it keeps nothing new until trimming
+  frees room, and records the missed batches as gaps. The copy is trimmed every
+  5 seconds, and at once when it passes half its cap. The directory counts
+  against the WAL volume but not `arc_wal_dir_bytes`. The store also stops
+  keeping batches while the volume has less than 10 % (at least 2 GiB) free
+  (see the bug fix for [#1266](https://github.com/Basekick-Labs/arc/issues/1266)).
 - `cluster.origin_stream_queue_bytes` (default 64 MiB) caps what the primary
   holds in memory for a standby that is not keeping up. Past it, that standby
   misses batches; the others do not.
@@ -1165,6 +1169,40 @@ negative or unparseable value is a startup error naming the value rather than
 an unbounded operation.
 
 ## Bug fixes
+
+### A standby writer's copy of the stream is trimmed every 5 seconds, sized from its volume, and gives way when the volume runs low ([#1266](https://github.com/Basekick-Labs/arc/issues/1266))
+
+With WAL coverage on, a standby writer keeps a copy of the primary's batches
+until their files are registered and on the standby. That copy was trimmed
+every 30 seconds against a fixed 1 GiB cap. At about a million rows a second,
+30 seconds of stream is already about a gigabyte. On a QA cluster both standbys
+dropped 27-31 % of the primary's batches in a 30-second run, and a takeover in
+that window could not have published those rows.
+
+- The copy is trimmed every 5 seconds, and as soon as it passes half its cap.
+  Same QA run with the 1 GiB cap, while the standbys' pulls kept up: no batch
+  dropped, and the copy stayed under 160 MB. When a standby's pulls fall behind
+  (right after a restart, or with many files in the current hour), a
+  measurement's batches are trimmed only once every current file of it is on
+  the standby, so the copy can still fill: watch
+  `arc_standby_store_blocked_keys`. Trimming per batch is the remaining part of
+  #1266.
+- `cluster.standby_store_max_bytes` defaults to a quarter of the WAL volume, at
+  least 1 GiB and at most 32 GiB (a full store is read whole at startup). The
+  startup log names the volume size and the cap. On a volume
+  that does not enforce its size (k3s `local-path`, `hostPath`, Docker named
+  volumes) the volume is the host's disk.
+- Free-space reserve: below 10 % of the volume free (at least 2 GiB), the store
+  keeps no new batches, first evicting what it may evict. It resumes 1 GiB
+  above that, so the WAL (and the Parquet files, when local storage is on the
+  same volume) keep their room. On a volume of 2 GiB or less the store keeps
+  nothing; the startup log says so.
+- The capped state now clears when trimming frees room even if the primary has
+  gone quiet.
+- New gauges: `arc_standby_store_capped`, `arc_standby_store_low_space`,
+  `arc_standby_store_max_bytes`. Alert on
+  `increase(arc_standby_store_dropped_total[5m]) > 0`: it counts batches a
+  takeover could not publish.
 
 ### Writes sent to any writer reach the primary, and a forwarded write is never sent twice ([#1270](https://github.com/Basekick-Labs/arc/issues/1270))
 

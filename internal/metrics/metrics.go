@@ -178,6 +178,9 @@ type Metrics struct {
 	standbyStoreBlocked      atomic.Int64 // keys whose trim waits on files not yet here
 	standbyStoreReplaced     atomic.Int64 // bytes held for replaced primary instances
 	standbyStorePinned       atomic.Int64 // bytes the store may not evict (stream takeover)
+	standbyStoreCapped       atomic.Int64 // 1 while the store refuses batches at its cap (#1266)
+	standbyStoreLowSpace     atomic.Int64 // 1 while the store's volume is below its free-space reserve (#1266)
+	standbyStoreMaxBytes     atomic.Int64 // the store's effective cap, 0 = none (#1266)
 
 	streamClaimsEnabled  atomic.Int64 // 1 once stream claims are applied (#1207 S4a)
 	streamClaims         atomic.Int64 // stream claims held in the FSM
@@ -690,6 +693,19 @@ func (m *Metrics) SetStandbyStoreTrimState(lost, blocked, replacedBytes int64) {
 	m.standbyStoreReplaced.Store(replacedBytes)
 }
 func (m *Metrics) SetStandbyStorePinned(n int64) { m.standbyStorePinned.Store(n) }
+
+// SetStandbyStoreCapped, SetStandbyStoreLowSpace and SetStandbyStoreMaxBytes
+// report the standby store's cap state (#1266).
+func (m *Metrics) SetStandbyStoreCapped(v bool)    { m.standbyStoreCapped.Store(b2i(v)) }
+func (m *Metrics) SetStandbyStoreLowSpace(v bool)  { m.standbyStoreLowSpace.Store(b2i(v)) }
+func (m *Metrics) SetStandbyStoreMaxBytes(n int64) { m.standbyStoreMaxBytes.Store(n) }
+
+func b2i(v bool) int64 {
+	if v {
+		return 1
+	}
+	return 0
+}
 func (m *Metrics) SetStandbyStore(bytes, incomplete int64) {
 	m.standbyStoreBytes.Store(bytes)
 	m.standbyStoreIncomplete.Store(incomplete)
@@ -1102,6 +1118,9 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"standby_store_blocked_keys":        m.standbyStoreBlocked.Load(),
 		"standby_store_replaced_bytes":      m.standbyStoreReplaced.Load(),
 		"standby_store_pinned_bytes":        m.standbyStorePinned.Load(),
+		"standby_store_capped":              m.standbyStoreCapped.Load(),
+		"standby_store_low_space":           m.standbyStoreLowSpace.Load(),
+		"standby_store_max_bytes":           m.standbyStoreMaxBytes.Load(),
 		"stream_claims_enabled":             m.streamClaimsEnabled.Load(),
 		"stream_claims":                     m.streamClaims.Load(),
 		"stream_takeover_departed_writers":  m.departedWriters.Load(),
@@ -1589,6 +1608,18 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_standby_store_pinned_bytes Bytes of the standby store kept for a possible stream takeover; not evicted at the cap\n"...)
 	b = append(b, "# TYPE arc_standby_store_pinned_bytes gauge\n"...)
 	b = appendMetric(b, "arc_standby_store_pinned_bytes", float64(m.standbyStorePinned.Load()))
+
+	b = append(b, "# HELP arc_standby_store_capped 1 while the standby store refuses batches at its cap (cluster.standby_store_max_bytes)\n"...)
+	b = append(b, "# TYPE arc_standby_store_capped gauge\n"...)
+	b = appendMetric(b, "arc_standby_store_capped", float64(m.standbyStoreCapped.Load()))
+
+	b = append(b, "# HELP arc_standby_store_low_space 1 while the standby store's volume is below its free-space reserve (batches not kept)\n"...)
+	b = append(b, "# TYPE arc_standby_store_low_space gauge\n"...)
+	b = appendMetric(b, "arc_standby_store_low_space", float64(m.standbyStoreLowSpace.Load()))
+
+	b = append(b, "# HELP arc_standby_store_max_bytes The standby store's effective cap in bytes (0 = no cap)\n"...)
+	b = append(b, "# TYPE arc_standby_store_max_bytes gauge\n"...)
+	b = appendMetric(b, "arc_standby_store_max_bytes", float64(m.standbyStoreMaxBytes.Load()))
 
 	b = append(b, "# HELP arc_cluster_stream_claims_enabled 1 once stream claims are enabled in the cluster\n"...)
 	b = append(b, "# TYPE arc_cluster_stream_claims_enabled gauge\n"...)
