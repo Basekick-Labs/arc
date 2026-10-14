@@ -44,7 +44,7 @@ import (
 
 // CapabilityCompactionCommit is advertised at join by every build that
 // applies the rules above.
-const CapabilityCompactionCommit = "compaction_commit_v1"
+const CapabilityCompactionCommit = "compaction_commit_v2"
 
 // Bounds on the replicated compaction state.
 const (
@@ -88,12 +88,14 @@ const (
 	// already (finalized), or a cleanup of a job that is not.
 	CompactionFinalized    = "finalized"
 	CompactionNotFinalized = "not-finalized"
-	// CompactionNotOrigin: a finalize or revert by a node other than the
-	// job's compactor, without the leader's override.
-	CompactionNotOrigin = "not-origin"
-	// CompactionOutputGone: a revert of a job whose output left the manifest
-	// (a DELETE, retention or DROP removed it): its inputs are not wanted
-	// back.
+	// CompactionNotFinisher: a finalize, revert or cleanup by a node that
+	// does not hold the job's finisher lease (#1207 d2a2b).
+	CompactionNotFinisher = "not-finisher"
+	// CompactionClaimed: a finisher claim while another node's lease is live.
+	CompactionClaimed = "claimed"
+	// CompactionOutputGone: a finalize of a job whose output left the
+	// manifest, or a revert after an intended removal (a DELETE, retention,
+	// DROP): its inputs are not wanted back.
 	CompactionOutputGone = "output-gone"
 	// CompactionInputsRegistered: a revert whose input paths are registered
 	// again.
@@ -115,19 +117,22 @@ type CompactionInput struct {
 
 // StagedCompaction is a compaction job between StageCompaction and its end.
 //
-// Object marks a job on an object store: there is no staged copy to pull (the
-// bucket is the durable store). Its states after the commit:
+// Object marks a job on an object store (#1207 d2a2b): its output waits in the
+// bucket under StagedCompactionKey, and there is no copy to pull. Its states
+// after the commit:
 //
 //   - Finalizing: the output is registered and the inputs are not, but the
-//     output may not be in the bucket yet (its compactor uploads it now) and
-//     the input objects are still there, so reads see the inputs' rows.
-//     Inputs keep their full entries: RevertCompaction registers them again
-//     if the output never reaches the bucket.
-//   - Finalized (FinalizeCompaction): the output is in the bucket; the input
-//     objects are deleted next, by any node (CleanupCompaction ends the job).
+//     output may not be at its path yet (a finisher copies it there) and the
+//     input objects are still there, so reads see the inputs' rows. Inputs
+//     keep their full entries: RevertCompaction registers them again.
+//   - Finalized (FinalizeCompaction): the output is at its path and the input
+//     objects are deleted; the finisher removes the staged object, then
+//     CleanupCompaction ends the job.
 //
-// Finalize and revert are proposed by the job's compactor, or by the leader
-// with Override once that compactor is gone; nothing else can race them.
+// One node at a time finishes a committed job: the holder of its finisher
+// lease (ClaimFinisher, FinisherNode). Finalize, Revert and Cleanup are
+// refused from any other node. The lease is judged by the claimants' own
+// clocks, the same exposure a compaction pause's expiry accepts.
 type StagedCompaction struct {
 	Job     string      `json:"job"`
 	Origin  string      `json:"origin"`
@@ -140,6 +145,18 @@ type StagedCompaction struct {
 	MinHolders int  `json:"min_holders,omitempty"`
 	Finalizing bool `json:"finalizing,omitempty"`
 	Finalized  bool `json:"finalized,omitempty"`
+	// FinalizingAt is the commit's time (proposer clock) of an object job.
+	FinalizingAt time.Time `json:"finalizing_at,omitempty"`
+	// FinisherNode holds the finisher lease since ClaimedAt.
+	FinisherNode string    `json:"finisher_node,omitempty"`
+	ClaimedAt    time.Time `json:"claimed_at,omitempty"`
+	// OutputGoneReason is the delete reason that removed a finalizing job's
+	// output from the manifest: it decides whether the inputs go too.
+	OutputGoneReason string `json:"output_gone_reason,omitempty"`
+	// Wedged: a finalizing job whose output was removed by something that
+	// does not account for its rows, and whose inputs are gone too. It waits
+	// for an operator (AbortCompaction).
+	Wedged bool `json:"wedged,omitempty"`
 	// PauseGen is the compaction pause generation when the job was staged:
 	// a pause that started since (a restore) refuses its commit.
 	PauseGen uint64    `json:"pause_gen,omitempty"`
@@ -219,32 +236,59 @@ type AbortCompactionPayload struct {
 	Reason string `json:"reason,omitempty"`
 }
 
-// FinalizeCompactionPayload: a finalizing job's output is in the bucket.
-// Output names it, so a finalize retried after the job ended is recognised.
-// Override: proposed by the leader for a compactor that is gone (never
-// forwarded).
+// FinalizeCompactionPayload: a finalizing job's output is at its path and
+// its input objects are deleted. Output names it, so a finalize retried after
+// the job ended is recognised.
 type FinalizeCompactionPayload struct {
-	Job      string `json:"job"`
-	By       string `json:"by"`
-	Output   string `json:"output"`
-	Override bool   `json:"override,omitempty"`
+	Job    string `json:"job"`
+	By     string `json:"by"`
+	Output string `json:"output"`
 }
 
-// RevertCompactionPayload undoes a finalizing job whose output never reached
-// the bucket: the output entry is removed and the inputs registered again.
-// Override as for FinalizeCompactionPayload.
+// RevertCompactionPayload undoes a finalizing job: its output entry, if it is
+// still the job's, is removed and the inputs registered again (their objects
+// are still in the bucket). Now is judged against a compaction pause.
 type RevertCompactionPayload struct {
-	Job      string `json:"job"`
-	By       string `json:"by"`
-	Override bool   `json:"override,omitempty"`
+	Job string    `json:"job"`
+	By  string    `json:"by"`
+	Now time.Time `json:"now"`
 }
 
-// CleanupCompactionPayload ends a finalized job: its input objects are gone.
-// Any node may propose it (deleting an unregistered input object again is
-// harmless).
+// CleanupCompactionPayload ends a finalized job (its staged object removed),
+// or one whose output left the manifest and whose input objects By deleted
+// (InputsDeleted).
 type CleanupCompactionPayload struct {
-	Job string `json:"job"`
-	By  string `json:"by"`
+	Job           string `json:"job"`
+	By            string `json:"by"`
+	InputsDeleted bool   `json:"inputs_deleted,omitempty"`
+}
+
+// ClaimFinisherPayload takes or renews the finisher lease of a finalizing
+// job. Wedged also marks it as waiting for an operator.
+type ClaimFinisherPayload struct {
+	Job    string    `json:"job"`
+	By     string    `json:"by"`
+	Now    time.Time `json:"now"`
+	Wedged bool      `json:"wedged,omitempty"`
+}
+
+// FinisherLease is how long a finisher claim holds without renewal.
+const FinisherLease = 5 * time.Minute
+
+// OutputGoneAccounted reports a delete reason that accounts for the rows of
+// the output it removed (#1207 d2a2b): the DELETE that rewrote or deleted it,
+// retention, a database deletion, a move to the cold tier, a restore. The
+// inputs of a finalizing job hold the same rows and go too. Any other remover
+// (the reconciler's orphan sweep) does not: the inputs are registered again.
+func OutputGoneAccounted(reason string) bool {
+	switch {
+	case reason == "delete", reason == "delete-rewrite", reason == "database:delete",
+		reason == "tiering:migrated", reason == "restore:replace":
+		return true
+	case strings.HasPrefix(reason, "retention:"):
+		return true
+	}
+	return false
 }
 
 // compactionCommitState is the snapshot form; nil until the flag was applied.
@@ -580,7 +624,7 @@ func (f *ClusterFSM) applyCommitCompaction(payload []byte, logIndex uint64) inte
 		}
 	}
 	if s.Object {
-		s.Finalizing, s.Holders = true, nil
+		s.Finalizing, s.Holders, s.FinalizingAt = true, nil, p.Now
 	} else {
 		f.unstageLocked(p.Job, false)
 	}
@@ -605,11 +649,11 @@ func (f *ClusterFSM) applyAbortCompaction(payload []byte) interface{} {
 	if !ok {
 		return nil
 	}
-	if s.Finalizing {
+	if s.Finalizing && !s.Wedged {
 		return &CompactionConflictError{Job: p.Job, Reason: CompactionFinalizing}
 	}
 	f.unstageLocked(p.Job, true)
-	f.logger.Info().Str("job", p.Job).Str("by", p.By).Str("reason", p.Reason).Msg("Staged compaction aborted")
+	f.logger.Info().Str("job", p.Job).Str("by", p.By).Str("reason", p.Reason).Bool("wedged", s.Wedged).Msg("Staged compaction aborted")
 	return nil
 }
 
@@ -635,8 +679,11 @@ func (f *ClusterFSM) applyFinalizeCompaction(payload []byte) interface{} {
 	if !s.Finalizing {
 		return &CompactionConflictError{Job: p.Job, Reason: CompactionNotFinalizing}
 	}
-	if s.Origin != p.By && !p.Override {
-		return &CompactionConflictError{Job: p.Job, Reason: CompactionNotOrigin}
+	if s.FinisherNode != p.By {
+		return &CompactionConflictError{Job: p.Job, Reason: CompactionNotFinisher}
+	}
+	if e, reg := f.files[s.Output.Path]; !reg || e.CompactionJob != p.Job || e.SHA256 != s.Output.SHA256 {
+		return &CompactionConflictError{Job: p.Job, Reason: CompactionOutputGone}
 	}
 	s.Finalized = true
 	return nil
@@ -656,8 +703,14 @@ func (f *ClusterFSM) applyCleanupCompaction(payload []byte) interface{} {
 	if !ok {
 		return nil
 	}
+	if s.FinisherNode != p.By {
+		return &CompactionConflictError{Job: p.Job, Reason: CompactionNotFinisher}
+	}
 	if !s.Finalized {
-		return &CompactionConflictError{Job: p.Job, Reason: CompactionNotFinalized}
+		e, reg := f.files[s.Output.Path]
+		if !p.InputsDeleted || (reg && e.CompactionJob == p.Job) {
+			return &CompactionConflictError{Job: p.Job, Reason: CompactionNotFinalized}
+		}
 	}
 	f.unstageLocked(p.Job, true)
 	return nil
@@ -686,11 +739,19 @@ func (f *ClusterFSM) applyRevertCompaction(payload []byte, logIndex uint64) inte
 		f.mu.Unlock()
 		return &CompactionConflictError{Job: p.Job, Reason: CompactionFinalized}
 	}
-	if s.Origin != p.By && !p.Override {
+	if s.FinisherNode != p.By {
 		f.mu.Unlock()
-		return &CompactionConflictError{Job: p.Job, Reason: CompactionNotOrigin}
+		return &CompactionConflictError{Job: p.Job, Reason: CompactionNotFinisher}
 	}
-	if e, reg := f.files[s.Output.Path]; !reg || e.CompactionJob != p.Job || e.SHA256 != s.Output.SHA256 {
+	// Not refused under a compaction pause: a committed job drains through
+	// it (the pause is acknowledged only once none is finalizing), and a
+	// revert may be how it ends. Nothing commits while paused, so a revert
+	// never runs after a restore read the manifest.
+	// The output, if still registered, must be this job's; if it left, only
+	// a remover that does not account for its rows lets the inputs back.
+	e, reg := f.files[s.Output.Path]
+	ownOutput := reg && e.CompactionJob == p.Job && e.SHA256 == s.Output.SHA256
+	if (reg && !ownOutput) || (!reg && OutputGoneAccounted(s.OutputGoneReason)) {
 		f.mu.Unlock()
 		return &CompactionConflictError{Job: p.Job, Reason: CompactionOutputGone}
 	}
@@ -701,8 +762,10 @@ func (f *ClusterFSM) applyRevertCompaction(payload []byte, logIndex uint64) inte
 		}
 	}
 	var events []func()
-	if emit := f.applyDeleteFileLocked(DeleteFilePayload{Path: s.Output.Path, Reason: "compaction-revert:" + p.Job}); emit != nil {
-		events = append(events, emit)
+	if ownOutput {
+		if emit := f.applyDeleteFileLocked(DeleteFilePayload{Path: s.Output.Path, Reason: "compaction-revert:" + p.Job}); emit != nil {
+			events = append(events, emit)
+		}
 	}
 	for _, in := range s.Inputs {
 		if emit := f.applyRegisterFileLocked(RegisterFilePayload{File: in}, logIndex, nil); emit != nil {
@@ -717,12 +780,59 @@ func (f *ClusterFSM) applyRevertCompaction(payload []byte, logIndex uint64) inte
 	}
 	f.unstageLocked(p.Job, true)
 	f.mu.Unlock()
-	f.logger.Warn().Str("job", p.Job).Str("by", p.By).Int("inputs", len(s.Inputs)).
-		Msg("Compaction reverted: its output never reached storage, its inputs are registered again")
+	f.logger.Warn().Str("job", p.Job).Str("by", p.By).Int("inputs", len(s.Inputs)).Str("output_gone_reason", s.OutputGoneReason).
+		Msg("Compaction reverted: its output could not be put in place, its inputs are registered again")
 	for _, emit := range events {
 		emit()
 	}
 	return nil
+}
+
+func (f *ClusterFSM) applyClaimFinisher(payload []byte) interface{} {
+	var p ClaimFinisherPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal claim finisher payload: %w", err)
+	}
+	if p.By == "" || p.Now.IsZero() {
+		return errors.New("claim finisher: by and now are required")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.compactionCommit {
+		return errors.New("claim finisher: compaction commit is not enabled")
+	}
+	s, ok := f.staged[p.Job]
+	if !ok {
+		return &CompactionConflictError{Job: p.Job, Reason: CompactionUnknownJob}
+	}
+	if !s.Finalizing {
+		return &CompactionConflictError{Job: p.Job, Reason: CompactionNotFinalizing}
+	}
+	if s.FinisherNode != "" && s.FinisherNode != p.By && p.Now.Sub(s.ClaimedAt) <= FinisherLease {
+		return &CompactionConflictError{Job: p.Job, Reason: CompactionClaimed}
+	}
+	s.FinisherNode, s.ClaimedAt = p.By, p.Now
+	if p.Wedged && !s.Wedged {
+		s.Wedged = true
+		f.logger.Error().Str("job", p.Job).Str("by", p.By).Str("output_gone_reason", s.OutputGoneReason).
+			Msg("Compaction cannot finish: its output left the manifest without its rows accounted for, and its input objects are gone; check its data, then end it with POST /api/v1/cluster/compaction-jobs/{job}/abort")
+	}
+	return nil
+}
+
+// noteStagedOutputGoneLocked records why a finalizing job's output left the
+// manifest (#1207 d2a2b).
+func (f *ClusterFSM) noteStagedOutputGoneLocked(path, reason string) {
+	job, ok := f.stagedPaths[path]
+	if !ok {
+		return
+	}
+	if s := f.staged[job]; s != nil && s.Finalizing && s.Output.Path == path && s.OutputGoneReason == "" {
+		s.OutputGoneReason = reason
+		if reason == "" {
+			s.OutputGoneReason = "unknown"
+		}
+	}
 }
 
 // compactionNodeRemovedLocked drops what a removed node held in staged jobs:
@@ -760,10 +870,17 @@ func (f *ClusterFSM) manifestCASRefusalsLocked(ops []BatchFileOp, decoded []any)
 			if rp.InheritFrom != "" && !f.registeredAtLocked(rp.InheritFrom, rp.InheritSHA) {
 				refused = append(refused, rp.InheritFrom)
 			}
+			if f.adoptRefusedLocked(rp) {
+				refused = append(refused, rp.File.Path)
+			}
 		case CommandDeleteFile:
 			dp := decoded[i].(DeleteFilePayload)
 			if dp.ExpectSHA != "" && !f.registeredAtLocked(dp.Path, dp.ExpectSHA) {
 				refused = append(refused, dp.Path)
+			}
+		case CommandUpdateFile:
+			if up := decoded[i].(UpdateFilePayload); f.updateRefusedLocked(up) {
+				refused = append(refused, up.File.Path)
 			}
 		}
 	}

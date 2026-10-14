@@ -47,7 +47,7 @@ func stagedRig(t *testing.T) *stagedRigT {
 	t.Cleanup(func() { _ = b.Close() })
 	c.storage = b
 	c.cfg.ReplicationEnabled = true
-	c.staged = stagedReplica{fetching: map[string]bool{}, wake: make(chan struct{}, 1), goneSince: map[string]time.Time{}}
+	c.staged = stagedReplica{fetching: map[string]bool{}, wake: make(chan struct{}, 1), finisherWake: make(chan struct{}, 1), finishing: map[string]bool{}, goneSince: map[string]time.Time{}}
 	c.staged.replicaReady.Store(true)
 	all := []string{raft.CapabilityCompactionCommit}
 	capNodes(t, c, map[string][]string{"raft-1": all, "writer-1": all, "writer-2": all,

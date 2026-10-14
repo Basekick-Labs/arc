@@ -687,7 +687,7 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 	var totalSkipped int
 
 	for _, measurement := range measurements {
-		deleted, filesDeleted, skipped, err := h.deleteOldFiles(ctx, policy.Database, measurement, cutoffDate, false, fmt.Sprintf("retention:%d", policyID))
+		deleted, filesDeleted, skipped, err := h.deleteOldFiles(ctx, policy.Database, measurement, cutoffDate, false, retentionManifestReason(policyID))
 		// Accumulate before error check: deleteOldFiles returns partial progress
 		// on abort so the execution record reflects all completed work accurately.
 		totalDeleted += deleted
@@ -889,7 +889,7 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 	var totalSkipped int
 
 	for _, measurement := range measurements {
-		deleted, filesDeleted, skipped, err := h.deleteOldFiles(c.Context(), policy.Database, measurement, cutoffDate, req.DryRun, fmt.Sprintf("retention:%d", policyID))
+		deleted, filesDeleted, skipped, err := h.deleteOldFiles(c.Context(), policy.Database, measurement, cutoffDate, req.DryRun, retentionManifestReason(policyID))
 		totalSkipped += skipped
 		totalSkipped += discovery.unusable.counts[measurement]
 		totalDeleted += deleted
@@ -1434,4 +1434,11 @@ func (h *RetentionHandler) removeDirectoryTree(ctx context.Context, remover stor
 
 	parent := filepath.Dir(dir)
 	return 1 + h.removeDirectoryTree(ctx, remover, parent)
+}
+
+// retentionManifestReason is the manifest delete reason of a retention
+// policy's run: a compaction whose output it removes deletes its inputs too
+// (raft.OutputGoneAccounted, #1207 d2a2b).
+func retentionManifestReason[T int | int64](policyID T) string {
+	return fmt.Sprintf("retention:%d", policyID)
 }

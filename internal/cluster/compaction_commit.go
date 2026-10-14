@@ -121,9 +121,16 @@ func (c *Coordinator) CompactionCommitActive() bool {
 
 // CompactionCommitStatus is the /cluster status view.
 type CompactionCommitStatus struct {
-	Enabled  bool     `json:"enabled"`
-	Staged   int      `json:"staged"`
-	Blocking []string `json:"blocking_nodes,omitempty"`
+	Enabled bool `json:"enabled"`
+	Staged  int  `json:"staged"`
+	// Finalizing: committed object-store jobs whose finisher has not ended
+	// them; Wedged: those of them waiting for an operator (#1207 d2a2b).
+	Finalizing int      `json:"finalizing,omitempty"`
+	Wedged     []string `json:"wedged_jobs,omitempty"`
+	Blocking   []string `json:"blocking_nodes,omitempty"`
+	// Repair: the last shared object store manifest repair this node ran
+	// as leader (#1207).
+	Repair *ManifestRepairStatus `json:"manifest_repair,omitempty"`
 }
 
 // CompactionCommitStatus reports the flag, the staged jobs, and on the
@@ -136,9 +143,18 @@ func (c *Coordinator) CompactionCommitStatus() CompactionCommitStatus {
 	if fsm := c.raftNode.FSM(); fsm != nil {
 		st.Enabled = fsm.CompactionCommitEnabled()
 		st.Staged = fsm.StagedCompactionCount()
+		for _, s := range fsm.StagedCompactions() {
+			if s.Object && s.Finalizing {
+				st.Finalizing++
+				if s.Wedged {
+					st.Wedged = append(st.Wedged, s.Job)
+				}
+			}
+		}
 	}
 	if b := c.compactionCommit.blockers.Load(); b != nil && !st.Enabled && c.raftNode.IsLeader() {
 		st.Blocking = *b
 	}
+	st.Repair = c.manifestRepairStatus()
 	return st
 }

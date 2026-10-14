@@ -496,3 +496,94 @@ func TestRetryTransient(t *testing.T) {
 		t.Fatalf("cancelled ctx: err=%v calls=%d, want the context error after 1 call with no wait", err, calls)
 	}
 }
+
+// ownedManifest is a fakeManifest that knows the files a staged compaction
+// owns (#1207 d2a2b); calls counts CompactionOwns, and ownedFrom makes the
+// answer true from that call on.
+type ownedManifest struct {
+	*fakeManifest
+	calls     int
+	ownedFrom int
+}
+
+func (o *ownedManifest) CompactionOwns(string) bool {
+	o.calls++
+	return o.ownedFrom > 0 && o.calls >= o.ownedFrom
+}
+
+// A file a compaction owns, or one the manifest does not list, is not
+// migrated; one a compaction took over during the copy loses its cold copy
+// and stays hot (#1207 d2a2b).
+func TestCopyAndFlip_LeavesFilesACompactionHolds(t *testing.T) {
+	m, hot, cold, _, cleanup := setupGatedTest(t)
+	defer cleanup()
+	ctx := context.Background()
+	fake := &fakeManifest{hot: hot, entries: map[string]int64{}}
+	owned := &ownedManifest{fakeManifest: fake}
+	m.manifest = owned
+	mustWrite(t, hot, gateDailyA)
+	recordHotRow(t, m, gateDailyA, manifestPartition)
+
+	// Registered, and a compaction takes it over during the copy.
+	fake.entries[gateDailyA] = 7
+	owned.calls, owned.ownedFrom = 0, 2
+	err := m.migrator.copyAndFlip(ctx, candidateFor(gateDailyA))
+	if !errors.Is(err, errHeldByCompaction) {
+		t.Fatalf("err %v", err)
+	}
+	if ok, _ := cold.Exists(ctx, gateDailyA); ok {
+		t.Fatal("cold copy kept for a file a compaction took over")
+	}
+	if got := fileMeta(t, m, gateDailyA).Tier; got != TierHot {
+		t.Fatalf("tier %s", got)
+	}
+	if ok, _ := hot.Exists(ctx, gateDailyA); !ok {
+		t.Fatal("hot copy gone")
+	}
+
+	// Owned from the start: nothing copied.
+	owned.calls, owned.ownedFrom = 0, 1
+	if err := m.migrator.copyAndFlip(ctx, candidateFor(gateDailyA)); err == nil {
+		t.Fatal("migrated a file a compaction owns")
+	}
+	if ok, _ := cold.Exists(ctx, gateDailyA); ok {
+		t.Fatal("cold copy of an owned file")
+	}
+}
+
+// A compaction that commits over a file between its flip and the release of
+// its hot copy: the cold copy goes, the file is hot again, and neither its
+// manifest entry nor its hot copy is touched (the finisher owns them).
+func TestMigrateBatch_DropsAFileACompactionTookOver(t *testing.T) {
+	m, hot, cold, _, cleanup := setupGatedTest(t)
+	defer cleanup()
+	ctx := context.Background()
+	fake := &fakeManifest{hot: hot, entries: map[string]int64{}}
+	owned := &ownedManifest{fakeManifest: fake, ownedFrom: 3} // the copy's two checks pass
+	m.manifest = owned
+	mustWrite(t, hot, gateDailyA)
+	recordHotRow(t, m, gateDailyA, manifestPartition)
+	fake.entries[gateDailyA] = 7
+
+	m.migrator.MigrateBatch(ctx, []MigrationCandidate{candidateFor(gateDailyA)})
+	if ok, _ := cold.Exists(ctx, gateDailyA); ok {
+		t.Fatal("cold copy kept for a file a compaction took over")
+	}
+	if ok, _ := hot.Exists(ctx, gateDailyA); !ok {
+		t.Fatal("hot copy removed")
+	}
+	if got := fileMeta(t, m, gateDailyA).Tier; got != TierHot {
+		t.Fatalf("tier %s", got)
+	}
+	if len(fake.calls) != 0 {
+		t.Fatalf("manifest proposals %+v", fake.calls)
+	}
+}
+
+// raft.OutputGoneAccounted trusts this reason by its text (#1207 d2a2b):
+// renaming it must change both.
+func TestMigratedReasonIsTheAccountedOne(t *testing.T) {
+	if manifestReasonMigrated != "tiering:migrated" {
+		t.Fatalf("reason %q: update raft.OutputGoneAccounted too", manifestReasonMigrated)
+	}
+}

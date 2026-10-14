@@ -121,6 +121,10 @@ func (r *Reconciler) sweepOrphanStorage(
 				run.SkippedPending++
 				continue
 			}
+			if o := r.isOwned.Load(); o != nil && (*o)(c.path) {
+				run.SkippedHeld++
+				continue
+			}
 			if r.coord != nil {
 				if _, ok := r.coord.GetFileEntry(c.path); ok {
 					run.SkippedRecheck++

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -104,4 +105,29 @@ func TestCompactionQuiescerIssue1087(t *testing.T) {
 			t.Fatalf("quiesce with only a stuck output_written manifest: %v", err)
 		}
 	})
+}
+
+// quiescerFake is the cluster side of the quiescer.
+type quiescerFake struct{ finalizing atomic.Int64 }
+
+func (q *quiescerFake) CompactionPaused() bool     { return true }
+func (q *quiescerFake) FinalizingCompactions() int { return int(q.finalizing.Load()) }
+
+// A committed object-store compaction of any node holds the pause until its
+// finisher ends it (#1207 d2a2b).
+func TestCompactionQuiescerWaitsForFinalizingCompactions(t *testing.T) {
+	cluster := &quiescerFake{}
+	cluster.finalizing.Store(1)
+	q := newCompactionQuiescer(cluster, nil, nil, false, zerolog.Nop())
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer cancel()
+	if err := q(ctx); err == nil || !strings.Contains(err.Error(), "being finished") {
+		t.Fatalf("a finalizing compaction did not hold the quiesce: %v", err)
+	}
+	cluster.finalizing.Store(0)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel2()
+	if err := q(ctx2); err != nil {
+		t.Fatalf("nothing finalizing: %v", err)
+	}
 }

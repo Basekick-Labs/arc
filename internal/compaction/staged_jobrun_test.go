@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -20,7 +21,30 @@ import (
 // #1207 d2a2a: a staged job writes its output to the staged key, durable,
 // keeps its inputs, writes no crash-recovery storage manifest, and hands the
 // watcher a "staged" completion manifest naming exactly what it read.
-func TestJobRunStaged(t *testing.T) {
+func TestJobRunStaged(t *testing.T) { testJobRunStaged(t, false) }
+
+// #1207 d2a2b: on an object store the staged output is written with its
+// checksum recorded on the object.
+func TestJobRunStagedObject(t *testing.T) { testJobRunStaged(t, true) }
+
+// objectOnly is an object store over a backend, hiding its local-only
+// interfaces (moves, adoption).
+type objectOnly struct {
+	storage.Backend
+	meta map[string]string
+}
+
+func (o *objectOnly) WriteReaderWithSHA(ctx context.Context, p string, r io.Reader, size int64, sha string) error {
+	o.meta[p] = sha
+	return o.Backend.WriteReader(ctx, p, r, size)
+}
+func (o *objectOnly) CopyObject(context.Context, string, string, int64, string) error { return nil }
+func (o *objectOnly) ObjectSHA(ctx context.Context, p string) (int64, string, error) {
+	size, err := o.Backend.StatFile(ctx, p)
+	return size, o.meta[p], err
+}
+
+func testJobRunStaged(t *testing.T, object bool) {
 	ctx := context.Background()
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
@@ -58,11 +82,16 @@ func TestJobRunStaged(t *testing.T) {
 		sum := sha256.Sum256(data)
 		inputs[key] = StagedInput{Path: key, SizeBytes: int64(len(data)), SHA256: hex.EncodeToString(sum[:])}
 	}
+	var jobBackend storage.Backend = backend
+	obj := &objectOnly{Backend: backend, meta: map[string]string{}}
+	if object {
+		jobBackend = obj
+	}
 	run := func(job string, ins map[string]StagedInput) (*Job, string, error) {
 		completionDir := filepath.Join(t.TempDir(), "completion")
 		j := NewJob(&JobConfig{
 			Measurement: "cpu", PartitionPath: partition, Files: keys,
-			StorageBackend: backend, Database: "testdb", Tier: "hourly",
+			StorageBackend: jobBackend, Database: "testdb", Tier: "hourly",
 			TempDirectory: tempDir, Logger: zerolog.Nop(), DB: db,
 			ManifestManager: NewManifestManager(backend, zerolog.Nop()),
 			JobID:           job, CompletionDir: completionDir,
@@ -109,6 +138,12 @@ func TestJobRunStaged(t *testing.T) {
 	sum := sha256.Sum256(staged)
 	if m.StagedOutput.SHA256 != hex.EncodeToString(sum[:]) || m.StagedOutput.SizeBytes != int64(len(staged)) {
 		t.Fatal("staged output does not match the manifest")
+	}
+	if m.StagedObject != object {
+		t.Fatalf("staged object %v", m.StagedObject)
+	}
+	if object && obj.meta[m.StagedKey] != m.StagedOutput.SHA256 {
+		t.Fatalf("checksum recorded on the staged object: %q", obj.meta[m.StagedKey])
 	}
 	for _, in := range m.Inputs {
 		if in != inputs[in.Path] {

@@ -11,6 +11,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/cluster/originstream"
 	"github.com/basekick-labs/arc/internal/cluster/protocol"
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/wal"
@@ -272,7 +273,7 @@ func (st *originStream) keysLocal(ctx context.Context, c *Coordinator, keys []or
 	for db := range dbs {
 		byMeasurement := map[string]bool{} // measurement -> every hot file present
 		for _, f := range fsm.GetFilesByDatabase(db) {
-			if f.Tier != "" && f.Tier != "hot" {
+			if !raft.HotTier(f.Tier) {
 				continue // in shared object storage, not on any node's disk
 			}
 			m := f.Measurement

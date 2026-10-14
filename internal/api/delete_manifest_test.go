@@ -296,3 +296,56 @@ func TestClusterFilesListingOmitsCoverage(t *testing.T) {
 		t.Fatalf("out %+v, in %+v", out[0], in[0])
 	}
 }
+
+// finalizingRewriteCoordinator: compaction commit on, and the rewritten file
+// is the output of a committed object-store compaction over input.
+type finalizingRewriteCoordinator struct {
+	rewriteManifestCoordinator
+	output, input string
+}
+
+func (c *finalizingRewriteCoordinator) CompactionCommitActive() bool { return true }
+func (c *finalizingRewriteCoordinator) WaitLocalFiles(context.Context, string, string, time.Duration) ([]string, error) {
+	return nil, nil
+}
+func (c *finalizingRewriteCoordinator) SyncManifest(context.Context) error { return nil }
+func (c *finalizingRewriteCoordinator) ManifestHotFiles(string, string) []raft.FileEntry {
+	return nil
+}
+func (c *finalizingRewriteCoordinator) FinalizingObjectInputs(path string) []string {
+	if path == c.output {
+		return []string{c.input}
+	}
+	return nil
+}
+
+// The rewrite path object stores take: once the rewrite of a finalizing
+// output is published, that job's input objects go (#1207 d2a2b).
+func TestReplaceManifestAfterRewriteRemovesFinalizingInputs(t *testing.T) {
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = backend.Close() })
+	const oldPath = "db/cpu/out_compacted.parquet"
+	const newPath = "db/cpu/out_compacted_rewrite_1.parquet"
+	const input = "db/cpu/in.parquet"
+	for _, p := range []string{oldPath, newPath, input} {
+		if err := backend.Write(context.Background(), p, []byte(p)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := &finalizingRewriteCoordinator{
+		rewriteManifestCoordinator: rewriteManifestCoordinator{entry: &raft.FileEntry{Path: oldPath, Database: "db", Measurement: "cpu",
+			Tier: "hot", CreatedAt: time.Now(), SHA256: "s", SizeBytes: int64(len(oldPath))}},
+		output: oldPath, input: input,
+	}
+	h := &DeleteHandler{storage: backend, coordinator: c, logger: zerolog.Nop()}
+	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, nil, "s"); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := backend.Exists(context.Background(), input); ok {
+		t.Fatal("the input of the rewritten output was kept")
+	}
+}

@@ -28,8 +28,11 @@ type AzureBlobBackend struct {
 	endpoint      string
 	// auth keeps every credential the backend was built with, so the
 	// compaction subprocess can rebuild it the same way (see Credentials).
-	auth   AzureBlobConfig
-	logger zerolog.Logger
+	auth AzureBlobConfig
+	// tokenCred is the Entra credential of managed-identity auth: it
+	// authorises a server-side copy's source (CopyObject).
+	tokenCred azcore.TokenCredential
+	logger    zerolog.Logger
 }
 
 // AzureBlobConfig holds Azure Blob Storage backend configuration
@@ -83,6 +86,7 @@ func NewAzureBlobBackend(cfg *AzureBlobConfig, logger zerolog.Logger) (*AzureBlo
 
 	var client *azblob.Client
 	var endpoint string
+	var tokenCred azcore.TokenCredential
 
 	// Try authentication methods in order of preference
 	switch {
@@ -136,6 +140,7 @@ func NewAzureBlobBackend(cfg *AzureBlobConfig, logger zerolog.Logger) (*AzureBlo
 		if credErr != nil {
 			return nil, fmt.Errorf("failed to create managed identity credential: %w", credErr)
 		}
+		tokenCred = cred
 		client, err = azblob.NewClient(endpoint, cred, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create Azure client with managed identity: %w", err)
@@ -147,6 +152,7 @@ func NewAzureBlobBackend(cfg *AzureBlobConfig, logger zerolog.Logger) (*AzureBlo
 	}
 
 	backend := &AzureBlobBackend{
+		tokenCred:     tokenCred,
 		client:        client,
 		containerName: cfg.ContainerName,
 		prefix:        prefix,
@@ -243,6 +249,11 @@ func (b *AzureBlobBackend) Write(ctx context.Context, path string, data []byte) 
 
 // WriteReader writes data from a reader to Azure Blob Storage
 func (b *AzureBlobBackend) WriteReader(ctx context.Context, path string, reader io.Reader, size int64) error {
+	return b.writeReader(ctx, path, reader, size, nil)
+}
+
+// writeReader is WriteReader with user metadata on the blob (nil: none).
+func (b *AzureBlobBackend) writeReader(ctx context.Context, path string, reader io.Reader, size int64, meta map[string]string) error {
 	key, err := b.prefixedKey(path)
 	if err != nil {
 		return err
@@ -261,6 +272,7 @@ func (b *AzureBlobBackend) WriteReader(ctx context.Context, path string, reader 
 		HTTPHeaders: &blob.HTTPHeaders{
 			BlobContentType: &contentType,
 		},
+		Metadata: azureMetadata(meta),
 	})
 	if err != nil {
 		recordStorageError(ctx, err)

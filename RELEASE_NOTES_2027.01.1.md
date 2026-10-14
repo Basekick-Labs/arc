@@ -1433,8 +1433,8 @@ also applies to the later scans; files it skipped are listed in
 
 This covers a compaction that commits while the DELETE runs. The opposite
 order, a compaction that read a file before the DELETE rewrote it and commits
-after the DELETE, is covered on local storage by the staged compaction commit
-below. On object storage (S3, Azure) it is still open.
+after the DELETE, is covered by the staged compaction commit below, on local
+and object storage.
 
 A DELETE also leaves alone files in storage that the cluster manifest does not
 list and this node is not registering, such as a compaction output not yet
@@ -1535,7 +1535,114 @@ What to expect:
   restarts, or by the leader 10 minutes after the compactor stopped
   answering.
 
-Object storage (S3, Azure) still uses the previous flow in this release.
+The second problem existed on object storage (S3, Azure) too, where a
+compaction is now staged as well:
+
+1. The compactor uploads its output under `_compaction_staged/` in the bucket,
+   recording its checksum on the object, and leaves its inputs alone.
+2. It stages and commits the job at once (there is no copy to wait for on
+   other nodes: the bucket is shared). The commit registers the output and
+   unregisters the inputs only if every input is still registered exactly as
+   the job read it.
+3. A finisher copies the staged object to the output's path inside the store
+   (S3 CopyObject, or a multipart copy above 5 GiB; Azure Put Blob From URL,
+   or blocks from URL above 5000 MiB), deletes the input objects, and ends
+   the job. The output appears at its path only once complete. If Azure
+   refuses the server-side copy (some Entra or managed-identity setups), the
+   finisher copies the bytes through the node instead.
+
+The job's compactor runs the finisher at once; if it is gone, the leader takes
+the job over after 5 minutes. One node at a time finishes a job (a lease in
+the cluster state).
+
+Between the commit and the copy, reads see the inputs' rows (the input objects
+are still there), and a DELETE on that measurement waits for the output, up to
+30 s per scan, then answers `503`; retry it. A DELETE that rewrites or deletes
+the output removes the job's input objects at once. Between the copy and the
+input deletes, reads see both, for a moment, as before this change.
+
+If the output leaves the cluster manifest before the finisher runs:
+
+- removed by a DELETE, retention, a database deletion, tiering or a restore:
+  its rows were dealt with, and the input objects are deleted too;
+- removed by anything else (the reconciler's orphan sweep): the inputs are
+  registered again, if all their objects are there;
+- otherwise the job is marked wedged: `GET /api/v1/cluster` lists it under
+  `compaction_commit.wedged_jobs`, the cluster logs an error, and nothing is
+  deleted. Check the data, then end it with
+  `POST /api/v1/cluster/compaction-jobs/{job}/abort` (admin).
+
+A compaction pause (a cluster restore) waits for committed jobs to finish
+before it takes effect; jobs not yet committed are dropped. A backup taken
+while a job finishes copies its output from the staged object, and leaves the
+input objects out. Tiering does not move a file a compaction owns. The leader
+removes staged objects no job owns after 6 hours; on S3, add a lifecycle rule
+that aborts incomplete multipart uploads, as for any bucket Arc writes to.
+
+New metrics: `arc_compaction_finished_total` (committed jobs their finisher
+ended), `arc_compaction_wedged_total` (jobs marked wedged) and
+`arc_compaction_copy_fallback_total` (copies Azure refused to do server-side).
+`GET /api/v1/cluster` reports `compaction_commit.finalizing` and
+`compaction_commit.wedged_jobs`.
+
+On a shared bucket, compaction now also keeps the cluster manifest. Until now,
+a cluster on S3 or Azure with `cluster.replication_enabled = false` (as the
+Helm chart and the docs set it for shared storage) never ran the compaction
+completion watcher. So compaction never updated the cluster manifest there:
+
+- its outputs stayed unregistered;
+- the inputs it consumed stayed listed after their objects were deleted.
+
+Queries were not affected, since they read the bucket. Every cluster node now
+runs the watcher, whatever its storage.
+
+On every cluster, compaction used to register its outputs with the compaction
+tier (`hourly`, `daily`) as their tier, which the staged compaction commit
+does not take as inputs. They are now registered `hot`. The leader's manifest
+repair (below) moves older entries to `hot`, each only if it has not changed
+since it was read, and a DELETE scans them as hot files meanwhile.
+
+To bring an upgraded cluster's manifest back in line with its bucket, the
+leader repairs it. The first run comes 2 minutes after a node becomes leader,
+then the repair runs hourly (10 minutes after a run that stopped early). It
+waits while a compaction pause is in force. On a shared bucket, with stream
+claims off, each run also does two things:
+
+- It drops a hot entry whose object is gone, unless a finalizing compaction is
+  still copying that object into place.
+- It registers a compaction output the manifest does not list, once the output
+  is over an hour old, unless tiering records it as cold. A compaction output
+  is a `*_compacted.parquet` file in an hour directory or a `*_daily.parquet`
+  file in a day directory. Each one is read for its checksum, at most 1000
+  objects or 10 GiB per run; the rest waits for the next run. On a large
+  bucket, the first repairs after an upgrade can take a while. While outputs
+  of a measurement wait, its stale entries are kept.
+
+Other objects the manifest does not list are left to the reconciler. These
+are leftovers of a delete that failed after its manifest change. The repair
+registers compaction outputs well before the reconciler's 24-hour orphan
+grace, so the reconciler no longer counts them as orphans.
+
+A DELETE on a shared bucket scans what queries read, so it works before the
+repair has run:
+
+- A listed file whose object is gone is skipped, not waited for.
+- An object the manifest does not list is scanned too. Its rewrite is
+  registered (an unregistered rewrite would be an orphan the reconciler
+  removes); when every row matches, it is removed. With stream claims on, such
+  an object is left alone, as before.
+- The input objects of a committed job that has not finished yet are skipped,
+  because its output holds their rows.
+
+As on replication clusters, a node that lost the compactor role while it
+still had unprocessed completion manifests keeps a cluster-wide compaction
+pause (a restore) from taking effect until it compacts again or restarts.
+
+New metrics: `arc_manifest_repair_dropped_total`,
+`arc_manifest_repair_adopted_total` and the gauge
+`arc_manifest_repair_pending`. On the leader, `GET /api/v1/cluster` reports
+the last repair under `compaction_commit.manifest_repair` (`dropped`,
+`adopted`, `retiered`, `pending`, `error`).
 
 ### Delete API catches dangerous keywords glued to numbers or literals ([#1080](https://github.com/Basekick-Labs/arc/issues/1080))
 

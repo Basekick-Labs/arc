@@ -132,6 +132,9 @@ type CompletionWatcherConfig struct {
 	Storage      storage.Backend
 	BeforeCommit func(output string)
 	OnCommitted  func(inputs []string) error
+	// OnFinished runs when an object job's finisher ended it, its input
+	// objects deleted (#1207 d2a2b).
+	OnFinished func()
 
 	// Logger receives structured log output. Defaults to Nop if zero.
 	Logger zerolog.Logger

@@ -363,6 +363,12 @@ func TestCommitCompactionPauseInForce(t *testing.T) {
 	x.ok(CommandCommitCompaction, late)
 }
 
+// claimFinisher takes the finisher lease of job for by at now.
+func (x *tkFSM) claimFinisher(job, by string, now time.Time) {
+	x.t.Helper()
+	x.ok(CommandClaimFinisher, ClaimFinisherPayload{Job: job, By: by, Now: now})
+}
+
 func TestCommitCompactionObjectFinalizeAndRevert(t *testing.T) {
 	x := ccFSM(t)
 	cov := []InstanceCoverage{{Instance: 7, Key: "db/cpu", Ranges: [][2]uint64{{1, 2}}}}
@@ -372,7 +378,7 @@ func TestCommitCompactionObjectFinalizeAndRevert(t *testing.T) {
 	x.ok(CommandStageCompaction, ccStage("obj", true))
 	x.ok(CommandCommitCompaction, ccCommit("obj"))
 	s, ok := x.f.StagedCompactionByJob("obj")
-	if !ok || !s.Finalizing {
+	if !ok || !s.Finalizing || !s.FinalizingAt.Equal(ccCommit("obj").Now) {
 		t.Fatalf("object job: %+v %v", s, ok)
 	}
 	if _, ok := x.has(ccHour + "a.parquet"); ok {
@@ -383,13 +389,12 @@ func TestCommitCompactionObjectFinalizeAndRevert(t *testing.T) {
 		t.Fatalf("reason %s", r)
 	}
 
-	// The output never reached the bucket: the inputs come back as they were.
-	// Only the compactor, or the leader overriding for a compactor that is
-	// gone, may decide that.
-	if r := x.conflict(CommandRevertCompaction, RevertCompactionPayload{Job: "obj", By: "w3"}); r != CompactionNotOrigin {
+	// Only the holder of the finisher lease may revert.
+	if r := x.conflict(CommandRevertCompaction, RevertCompactionPayload{Job: "obj", By: "w3", Now: t0}); r != CompactionNotFinisher {
 		t.Fatalf("reason %s", r)
 	}
-	x.ok(CommandRevertCompaction, RevertCompactionPayload{Job: "obj", By: "w3", Override: true})
+	x.claimFinisher("obj", "w3", t0)
+	x.ok(CommandRevertCompaction, RevertCompactionPayload{Job: "obj", By: "w3", Now: t0})
 	if _, ok := x.has(ccHour + "o-obj.parquet"); ok {
 		t.Fatal("reverted output still registered")
 	}
@@ -408,12 +413,16 @@ func TestCommitCompactionObjectFinalizeAndRevert(t *testing.T) {
 		t.Fatalf("reason %s", r)
 	}
 	x.ok(CommandCommitCompaction, ccCommit("obj2"))
-	if r := x.conflict(CommandCleanupCompaction, CleanupCompactionPayload{Job: "obj2", By: "r1"}); r != CompactionNotFinalized {
+	if r := x.conflict(CommandFinalizeCompaction, fin); r != CompactionNotFinisher {
+		t.Fatalf("finalize without the lease: %s", r)
+	}
+	x.claimFinisher("obj2", "w2", t0)
+	if r := x.conflict(CommandCleanupCompaction, CleanupCompactionPayload{Job: "obj2", By: "w2"}); r != CompactionNotFinalized {
 		t.Fatalf("cleanup before finalize: %s", r)
 	}
 	other := fin
 	other.By = "w3"
-	if r := x.conflict(CommandFinalizeCompaction, other); r != CompactionNotOrigin {
+	if r := x.conflict(CommandFinalizeCompaction, other); r != CompactionNotFinisher {
 		t.Fatalf("reason %s", r)
 	}
 	x.ok(CommandFinalizeCompaction, fin)
@@ -421,12 +430,15 @@ func TestCommitCompactionObjectFinalizeAndRevert(t *testing.T) {
 	if !ok || !s.Finalized {
 		t.Fatalf("finalized: %+v %v", s, ok)
 	}
-	// A finalized job cannot be reverted: its input objects are being deleted.
-	if r := x.conflict(CommandRevertCompaction, RevertCompactionPayload{Job: "obj2", By: "w2"}); r != CompactionFinalized {
+	// A finalized job cannot be reverted: its input objects are deleted.
+	if r := x.conflict(CommandRevertCompaction, RevertCompactionPayload{Job: "obj2", By: "w2", Now: t0}); r != CompactionFinalized {
 		t.Fatalf("reason %s", r)
 	}
 	x.ok(CommandFinalizeCompaction, fin) // retried while finalized
-	x.ok(CommandCleanupCompaction, CleanupCompactionPayload{Job: "obj2", By: "r1"})
+	if r := x.conflict(CommandCleanupCompaction, CleanupCompactionPayload{Job: "obj2", By: "r1"}); r != CompactionNotFinisher {
+		t.Fatalf("cleanup without the lease: %s", r)
+	}
+	x.ok(CommandCleanupCompaction, CleanupCompactionPayload{Job: "obj2", By: "w2"})
 	if _, ok := x.f.StagedCompactionByJob("obj2"); ok {
 		t.Fatal("cleaned-up job still staged")
 	}
@@ -436,14 +448,141 @@ func TestCommitCompactionObjectFinalizeAndRevert(t *testing.T) {
 		t.Fatal("finalize removed the output")
 	}
 	// A finalize retried after a revert removed the output is refused: the
-	// compactor must not delete the input objects.
+	// finisher must not delete the input objects.
 	x.ok(CommandRegisterFile, RegisterFilePayload{File: ccFile("a.parquet", "sa", 10)})
 	x.ok(CommandRegisterFile, RegisterFilePayload{File: ccFile("b.parquet", "sb", 20)})
 	x.ok(CommandStageCompaction, ccStage2("obj3"))
 	x.ok(CommandCommitCompaction, ccCommit("obj3"))
-	x.ok(CommandRevertCompaction, RevertCompactionPayload{Job: "obj3", By: "w2"})
+	x.claimFinisher("obj3", "w2", t0)
+	x.ok(CommandRevertCompaction, RevertCompactionPayload{Job: "obj3", By: "w2", Now: t0})
 	if r := x.conflict(CommandFinalizeCompaction, FinalizeCompactionPayload{Job: "obj3", By: "w2", Output: ccHour + "o-obj3.parquet"}); r != CompactionUnknownJob {
 		t.Fatalf("finalize after revert: %s", r)
+	}
+}
+
+// The finisher lease: one holder at a time, renewable, taken over once it
+// expires by the claimants' clocks; only finalizing jobs.
+func TestClaimFinisherLease(t *testing.T) {
+	x := ccFSM(t)
+	x.ok(CommandStageCompaction, ccStage("obj", true))
+	if r := x.conflict(CommandClaimFinisher, ClaimFinisherPayload{Job: "obj", By: "w2", Now: t0}); r != CompactionNotFinalizing {
+		t.Fatalf("claim before the commit: %s", r)
+	}
+	x.ok(CommandCommitCompaction, ccCommit("obj"))
+	x.claimFinisher("obj", "w2", t0)
+	x.claimFinisher("obj", "w2", t0.Add(time.Minute)) // renew
+	if r := x.conflict(CommandClaimFinisher, ClaimFinisherPayload{Job: "obj", By: "w3", Now: t0.Add(time.Minute + FinisherLease)}); r != CompactionClaimed {
+		t.Fatalf("claim of a live lease: %s", r)
+	}
+	x.claimFinisher("obj", "w3", t0.Add(time.Minute+FinisherLease+time.Second))
+	if s, _ := x.f.StagedCompactionByJob("obj"); s.FinisherNode != "w3" {
+		t.Fatalf("holder %q", s.FinisherNode)
+	}
+	if r := x.conflict(CommandClaimFinisher, ClaimFinisherPayload{Job: "zz", By: "w3", Now: t0}); r != CompactionUnknownJob {
+		t.Fatalf("unknown job: %s", r)
+	}
+	x.refused(CommandClaimFinisher, ClaimFinisherPayload{Job: "obj", By: "", Now: t0})
+	x.refused(CommandClaimFinisher, ClaimFinisherPayload{Job: "obj", By: "w3"})
+}
+
+// The reason an output left the manifest decides the end of its job: a
+// remover that accounts for its rows lets the finisher delete the inputs
+// (cleanup with InputsDeleted); any other lets them back (revert).
+func TestObjectOutputGoneReason(t *testing.T) {
+	for _, tc := range []struct {
+		reason    string
+		accounted bool
+	}{
+		{"delete", true}, {"delete-rewrite", true}, {"database:delete", true}, {"retention:7", true},
+		{"tiering:migrated", true}, {"restore:replace", true},
+		{"reconcile-orphan-manifest", false}, {"tiering:reconcile", false}, {"tiering:sweep", false},
+		{DeleteReasonVanished, false}, {"operator", false}, {"", false},
+	} {
+		if OutputGoneAccounted(tc.reason) != tc.accounted {
+			t.Fatalf("%q accounted=%v", tc.reason, !tc.accounted)
+		}
+		x := ccFSM(t)
+		x.ok(CommandStageCompaction, ccStage("obj", true))
+		x.ok(CommandCommitCompaction, ccCommit("obj"))
+		x.ok(CommandDeleteFile, DeleteFilePayload{Path: ccHour + "o-obj.parquet", Reason: tc.reason})
+		s, _ := x.f.StagedCompactionByJob("obj")
+		want := tc.reason
+		if want == "" {
+			want = "unknown"
+		}
+		if s.OutputGoneReason != want {
+			t.Fatalf("%q recorded as %q", tc.reason, s.OutputGoneReason)
+		}
+		x.claimFinisher("obj", "w2", t0)
+		if r := x.conflict(CommandFinalizeCompaction, FinalizeCompactionPayload{Job: "obj", By: "w2", Output: ccHour + "o-obj.parquet"}); r != CompactionOutputGone {
+			t.Fatalf("%q: finalize after the output left: %s", tc.reason, r)
+		}
+		rev := RevertCompactionPayload{Job: "obj", By: "w2", Now: t0}
+		if tc.accounted {
+			if r := x.conflict(CommandRevertCompaction, rev); r != CompactionOutputGone {
+				t.Fatalf("%q: revert: %s", tc.reason, r)
+			}
+			if r := x.conflict(CommandCleanupCompaction, CleanupCompactionPayload{Job: "obj", By: "w2"}); r != CompactionNotFinalized {
+				t.Fatalf("%q: cleanup without InputsDeleted: %s", tc.reason, r)
+			}
+			x.ok(CommandCleanupCompaction, CleanupCompactionPayload{Job: "obj", By: "w2", InputsDeleted: true})
+			if _, ok := x.has(ccHour + "a.parquet"); ok {
+				t.Fatalf("%q: inputs back", tc.reason)
+			}
+		} else {
+			x.ok(CommandRevertCompaction, rev)
+			if _, ok := x.has(ccHour + "a.parquet"); !ok {
+				t.Fatalf("%q: inputs not back", tc.reason)
+			}
+		}
+		if _, ok := x.f.StagedCompactionByJob("obj"); ok {
+			t.Fatalf("%q: job not ended", tc.reason)
+		}
+	}
+	// Cleanup with InputsDeleted while the output is still the job's: refused.
+	x := ccFSM(t)
+	x.ok(CommandStageCompaction, ccStage("obj", true))
+	x.ok(CommandCommitCompaction, ccCommit("obj"))
+	x.claimFinisher("obj", "w2", t0)
+	if r := x.conflict(CommandCleanupCompaction, CleanupCompactionPayload{Job: "obj", By: "w2", InputsDeleted: true}); r != CompactionNotFinalized {
+		t.Fatalf("cleanup with the output registered: %s", r)
+	}
+}
+
+// A committed job drains through a compaction pause: finalize, cleanup and
+// revert all apply (the pause is acknowledged only once none is finalizing).
+func TestObjectFinishThroughAPause(t *testing.T) {
+	x := ccFSM(t)
+	x.ok(CommandStageCompaction, ccStage("obj", true))
+	x.ok(CommandCommitCompaction, ccCommit("obj"))
+	x.ok(CommandStageCompaction, x.ccFresh("obj2", true))
+	x.ok(CommandCommitCompaction, ccCommit("obj2"))
+	x.ok(CommandSetCompactionPause, SetCompactionPausePayload{Paused: true, Generation: 1, RequestedBy: "w1", Now: t0, ExpiresAt: t0.Add(time.Minute)})
+	x.claimFinisher("obj", "w2", t0)
+	x.ok(CommandRevertCompaction, RevertCompactionPayload{Job: "obj", By: "w2", Now: t0})
+	x.claimFinisher("obj2", "w2", t0)
+	x.ok(CommandFinalizeCompaction, FinalizeCompactionPayload{Job: "obj2", By: "w2", Output: ccHour + "o-obj2.parquet"})
+	x.ok(CommandCleanupCompaction, CleanupCompactionPayload{Job: "obj2", By: "w2"})
+}
+
+// A finalizing job marked wedged waits for an operator: an abort ends it
+// without touching the manifest.
+func TestWedgedObjectJobAborts(t *testing.T) {
+	x := ccFSM(t)
+	x.ok(CommandStageCompaction, ccStage("obj", true))
+	x.ok(CommandCommitCompaction, ccCommit("obj"))
+	x.ok(CommandDeleteFile, DeleteFilePayload{Path: ccHour + "o-obj.parquet", Reason: "reconcile-orphan-manifest"})
+	x.ok(CommandClaimFinisher, ClaimFinisherPayload{Job: "obj", By: "w2", Now: t0, Wedged: true})
+	s, _ := x.f.StagedCompactionByJob("obj")
+	if !s.Wedged {
+		t.Fatal("not wedged")
+	}
+	x.ok(CommandAbortCompaction, AbortCompactionPayload{Job: "obj", By: "w1", Reason: "operator"})
+	if _, ok := x.f.StagedCompactionByJob("obj"); ok {
+		t.Fatal("wedged job not aborted")
+	}
+	if _, ok := x.has(ccHour + "a.parquet"); ok {
+		t.Fatal("abort registered an input")
 	}
 }
 
@@ -477,6 +616,7 @@ func TestCompactionCommandsRefusedWithFlagOff(t *testing.T) {
 		CommandFinalizeCompaction: FinalizeCompactionPayload{Job: "j1", By: "w2"},
 		CommandCleanupCompaction:  CleanupCompactionPayload{Job: "j1", By: "w2"},
 		CommandRevertCompaction:   RevertCompactionPayload{Job: "j1", By: "w2"},
+		CommandClaimFinisher:      ClaimFinisherPayload{Job: "j1", By: "w2", Now: t0},
 	} {
 		res := x.apply(typ, p)
 		err, _ := res.(error)
@@ -547,28 +687,30 @@ func TestUpdateFileKeepsCompactionJob(t *testing.T) {
 func TestRevertCompactionRefusals(t *testing.T) {
 	x := ccFSM(t)
 	x.ok(CommandStageCompaction, ccStage("obj", true))
-	if r := x.conflict(CommandRevertCompaction, RevertCompactionPayload{Job: "obj", By: "w3"}); r != CompactionNotFinalizing {
+	if r := x.conflict(CommandRevertCompaction, RevertCompactionPayload{Job: "obj", By: "w3", Now: t0}); r != CompactionNotFinalizing {
 		t.Fatalf("reason %s", r)
 	}
 	x.ok(CommandCommitCompaction, ccCommit("obj"))
-	if r := x.conflict(CommandRevertCompaction, RevertCompactionPayload{Job: "obj", By: "w3"}); r != CompactionNotOrigin {
+	if r := x.conflict(CommandRevertCompaction, RevertCompactionPayload{Job: "obj", By: "w3", Now: t0}); r != CompactionNotFinisher {
 		t.Fatalf("reason %s", r)
 	}
+	x.claimFinisher("obj", "w2", t0)
 	// An input path registered again (a restore) refuses the revert.
 	x.ok(CommandRegisterFile, RegisterFilePayload{File: ccFile("b.parquet", "sb", 20)})
-	if r := x.conflict(CommandRevertCompaction, RevertCompactionPayload{Job: "obj", By: "w2"}); r != CompactionInputsRegistered {
+	if r := x.conflict(CommandRevertCompaction, RevertCompactionPayload{Job: "obj", By: "w2", Now: t0}); r != CompactionInputsRegistered {
 		t.Fatalf("reason %s", r)
 	}
 	x.ok(CommandDeleteFile, DeleteFilePayload{Path: ccHour + "b.parquet"})
-	// The output left the manifest (a DELETE or DROP): nothing to revert.
+	// The output left the manifest by a DELETE: its rows are accounted for,
+	// the inputs are not wanted back.
 	x.ok(CommandDeleteFile, DeleteFilePayload{Path: ccHour + "o-obj.parquet", Reason: "delete"})
-	if r := x.conflict(CommandRevertCompaction, RevertCompactionPayload{Job: "obj", By: "w2"}); r != CompactionOutputGone {
+	if r := x.conflict(CommandRevertCompaction, RevertCompactionPayload{Job: "obj", By: "w2", Now: t0}); r != CompactionOutputGone {
 		t.Fatalf("reason %s", r)
 	}
 	if _, ok := x.has(ccHour + "a.parquet"); ok {
 		t.Fatal("refused revert registered an input")
 	}
-	if r := x.conflict(CommandRevertCompaction, RevertCompactionPayload{Job: "zz", By: "w3"}); r != CompactionUnknownJob {
+	if r := x.conflict(CommandRevertCompaction, RevertCompactionPayload{Job: "zz", By: "w3", Now: t0}); r != CompactionUnknownJob {
 		t.Fatalf("reason %s", r)
 	}
 }
@@ -656,9 +798,10 @@ func TestCompactionOutputPathReusedIsNotTheJobs(t *testing.T) {
 	x := ccFSM(t)
 	x.ok(CommandStageCompaction, ccStage("obj", true))
 	x.ok(CommandCommitCompaction, ccCommit("obj"))
+	x.claimFinisher("obj", "w2", t0)
 	x.ok(CommandDeleteFile, DeleteFilePayload{Path: ccHour + "o-obj.parquet", Reason: "delete"})
 	x.ok(CommandRegisterFile, RegisterFilePayload{File: ccFile("o-obj.parquet", "so-obj", 25)})
-	if r := x.conflict(CommandRevertCompaction, RevertCompactionPayload{Job: "obj", By: "w2"}); r != CompactionOutputGone {
+	if r := x.conflict(CommandRevertCompaction, RevertCompactionPayload{Job: "obj", By: "w2", Now: t0}); r != CompactionOutputGone {
 		t.Fatalf("revert over a reused path: %s", r)
 	}
 	x.ok(CommandDeleteFile, DeleteFilePayload{Path: ccHour + "o-obj.parquet"})
@@ -666,8 +809,11 @@ func TestCompactionOutputPathReusedIsNotTheJobs(t *testing.T) {
 	x.f.mu.Lock()
 	x.f.files[other.Path] = &FileEntry{Path: other.Path, SHA256: "other", CompactionJob: "obj", Database: "db"}
 	x.f.mu.Unlock()
-	if r := x.conflict(CommandRevertCompaction, RevertCompactionPayload{Job: "obj", By: "w2"}); r != CompactionOutputGone {
+	if r := x.conflict(CommandRevertCompaction, RevertCompactionPayload{Job: "obj", By: "w2", Now: t0}); r != CompactionOutputGone {
 		t.Fatalf("revert over another content: %s", r)
+	}
+	if r := x.conflict(CommandFinalizeCompaction, FinalizeCompactionPayload{Job: "obj", By: "w2", Output: other.Path}); r != CompactionOutputGone {
+		t.Fatalf("finalize over another content: %s", r)
 	}
 	x.f.mu.Lock()
 	delete(x.f.files, other.Path)
@@ -676,7 +822,8 @@ func TestCompactionOutputPathReusedIsNotTheJobs(t *testing.T) {
 	// Finalize after the job ended, with the path now someone else's.
 	x.ok(CommandStageCompaction, x.ccFresh("obj2", true))
 	x.ok(CommandCommitCompaction, ccCommit("obj2"))
-	x.ok(CommandRevertCompaction, RevertCompactionPayload{Job: "obj2", By: "w2"})
+	x.claimFinisher("obj2", "w2", t0)
+	x.ok(CommandRevertCompaction, RevertCompactionPayload{Job: "obj2", By: "w2", Now: t0})
 	x.ok(CommandRegisterFile, RegisterFilePayload{File: ccFile("o-obj2.parquet", "so-obj2", 25)})
 	if r := x.conflict(CommandFinalizeCompaction, FinalizeCompactionPayload{Job: "obj2", By: "w2", Output: ccHour + "o-obj2.parquet"}); r != CompactionUnknownJob {
 		t.Fatalf("finalize over a reused path: %s", r)
@@ -850,5 +997,31 @@ func TestRestoreRebuildsStagedPaths(t *testing.T) {
 	}
 	if r := b.conflict(CommandStageCompaction, ccStage("j2", false)); r != CompactionInputStaged {
 		t.Fatalf("restored: %s", r)
+	}
+}
+
+// An output replaced in place (a register or an update with other content)
+// is recorded as gone: a revert then finds its path taken.
+func TestObjectOutputReplacedInPlace(t *testing.T) {
+	for _, update := range []bool{false, true} {
+		x := ccFSM(t)
+		x.ok(CommandStageCompaction, ccStage("obj", true))
+		x.ok(CommandCommitCompaction, ccCommit("obj"))
+		e, _ := x.has(ccHour + "o-obj.parquet")
+		other := *e
+		other.SHA256 = "other"
+		if update {
+			x.ok(CommandUpdateFile, UpdateFilePayload{File: other})
+		} else {
+			x.ok(CommandRegisterFile, RegisterFilePayload{File: other})
+		}
+		s, _ := x.f.StagedCompactionByJob("obj")
+		if s.OutputGoneReason != "replaced" {
+			t.Fatalf("update=%v: reason %q", update, s.OutputGoneReason)
+		}
+		x.claimFinisher("obj", "w2", t0)
+		if r := x.conflict(CommandRevertCompaction, RevertCompactionPayload{Job: "obj", By: "w2", Now: t0}); r != CompactionOutputGone {
+			t.Fatalf("update=%v: revert %s", update, r)
+		}
 	}
 }

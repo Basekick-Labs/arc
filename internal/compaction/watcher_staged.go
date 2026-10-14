@@ -51,6 +51,10 @@ type stagedJobState struct {
 	observed    bool
 	committedAt time.Time
 	forcedAt    time.Time
+	// committed / consumed: an object job this node committed, and whose
+	// observers ran (#1207 d2a2b).
+	committed bool
+	consumed  bool
 }
 
 // stagedRegistry is the watcher state other goroutines read: the jobs in
@@ -132,7 +136,8 @@ func stagedJobOf(m *CompletionManifest) (StagedJob, bool) {
 		m.StagedKey != StagedKey(m.JobID, m.StagedOutput.Path) {
 		return StagedJob{}, false
 	}
-	return StagedJob{JobID: m.JobID, StagedKey: m.StagedKey, Output: *m.StagedOutput, Inputs: m.Inputs}, true
+	return StagedJob{JobID: m.JobID, StagedKey: m.StagedKey, Output: *m.StagedOutput, Inputs: m.Inputs,
+		Object: m.StagedObject, CreatedAt: m.CreatedAt}, true
 }
 
 // applyStaged drives one staged manifest one step.
@@ -151,6 +156,10 @@ func (w *CompletionWatcher) applyStaged(ctx context.Context, path string, m *Com
 	st := w.stagedState(job.JobID)
 	if err := sc.SyncManifest(ctx); err != nil {
 		w.manifestsNotLeader.Add(1)
+		return
+	}
+	if job.Object {
+		w.applyStagedObject(ctx, path, job, st)
 		return
 	}
 	status := sc.Status(job)
@@ -228,6 +237,168 @@ func (w *CompletionWatcher) applyStaged(ctx context.Context, path string, m *Com
 	default:
 		w.logger.Debug().Err(err).Str("job_id", job.JobID).Msg("Committing the compaction deferred; retrying")
 	}
+}
+
+// stagedObjectMaxAge: an object job's staged output older than this when it
+// would be staged is dropped instead (#1207 d2a2b): a sweep removes staged
+// objects no job owns after a while, and must never race a late stage.
+const stagedObjectMaxAge = 30 * time.Minute
+
+// applyStagedObject drives a staged job on an object store one step (#1207
+// d2a2b). Its output waits in the bucket; there are no holders: the stage is
+// followed by the commit at once. After the commit, the job's finisher (see
+// the cluster package) copies the output into place, deletes the input
+// objects and ends the job; this node then drops its manifest. The input
+// objects are never deleted here: until the commit they are the data, after
+// it the finisher owns them.
+func (w *CompletionWatcher) applyStagedObject(ctx context.Context, path string, job StagedJob, st *stagedJobState) {
+	sc := w.cfg.Staged
+	status := sc.Status(job)
+	if status.Finalizing || status.Committed {
+		w.commitStagedObject(ctx, path, job, st, status)
+		return
+	}
+	if st.committed {
+		// Committed here, and the job ended (finished, or its output left
+		// the manifest and the finisher cleaned up).
+		w.dropStagedObjectManifest(path, job, "finished")
+		return
+	}
+	if w.pausedByGate() {
+		// A restore may replace the manifest: no uncommitted job stays
+		// staged across it.
+		if status.Staged {
+			if err := sc.Abort(ctx, job.JobID, "compaction paused"); err != nil {
+				return
+			}
+		}
+		w.endStagedObject(ctx, path, job, "a compaction pause started")
+		return
+	}
+	if !status.Staged {
+		if st.staged {
+			w.endStagedObject(ctx, path, job, "the cluster dropped the staged job")
+			return
+		}
+		if !job.CreatedAt.IsZero() && time.Since(job.CreatedAt) > stagedObjectMaxAge {
+			w.endStagedObject(ctx, path, job, "the staged output is too old to stage")
+			return
+		}
+		ok, err := w.verifyStagedObject(ctx, job)
+		if err != nil {
+			w.logger.Debug().Err(err).Str("job_id", job.JobID).Msg("Checking the staged output failed; retrying")
+			return
+		}
+		if !ok {
+			w.endStagedObject(ctx, path, job, "the staged output is missing or damaged")
+			return
+		}
+		out, err := sc.Stage(ctx, job)
+		switch out {
+		case StagedOK:
+			st.staged, st.stagedAt = true, time.Now()
+		case StagedCommitted:
+			w.commitStagedObject(ctx, path, job, st, sc.Status(job))
+			return
+		case StagedRefused:
+			w.endStagedObject(ctx, path, job, "the cluster refused to stage it: "+errText(err))
+			return
+		default:
+			w.logger.Debug().Err(err).Str("job_id", job.JobID).Msg("Staging the compaction deferred; retrying")
+			return
+		}
+	}
+	st.staged = true
+	if !st.observed && w.cfg.BeforeCommit != nil {
+		w.cfg.BeforeCommit(job.Output.Path)
+		st.observed = true
+	}
+	out, err := sc.Commit(ctx, job)
+	switch out {
+	case StagedOK, StagedCommitted:
+		w.commitStagedObject(ctx, path, job, st, sc.Status(job))
+	case StagedRefused:
+		if aerr := sc.Abort(ctx, job.JobID, "commit refused"); aerr != nil {
+			return
+		}
+		w.endStagedObject(ctx, path, job, "the cluster refused the commit: "+errText(err))
+	default:
+		w.logger.Debug().Err(err).Str("job_id", job.JobID).Msg("Committing the compaction deferred; retrying")
+	}
+}
+
+// commitStagedObject: the object job is committed. Its observers run once
+// here, on its compactor; the manifest stays until the finisher ended the
+// job.
+func (w *CompletionWatcher) commitStagedObject(ctx context.Context, path string, job StagedJob, st *stagedJobState, status StagedStatus) {
+	st.committed = true
+	w.setCommitting(job.JobID, true)
+	if !st.consumed && w.cfg.OnCommitted != nil {
+		inputs := make([]string, 0, len(job.Inputs))
+		for _, in := range job.Inputs {
+			inputs = append(inputs, in.Path)
+		}
+		if err := w.cfg.OnCommitted(inputs); err != nil {
+			w.logger.Warn().Err(err).Str("job_id", job.JobID).Msg("Compaction committed; its observers failed, retrying")
+			return
+		}
+	}
+	st.consumed = true
+	if status.Finalizing {
+		return
+	}
+	w.dropStagedObjectManifest(path, job, "finished")
+}
+
+// dropStagedObjectManifest removes an object job's manifest once the cluster
+// ended the job.
+func (w *CompletionWatcher) dropStagedObjectManifest(path string, job StagedJob, why string) {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		w.logger.Warn().Err(err).Str("path", path).Msg("Could not remove the completion manifest; retrying")
+		return
+	}
+	delete(w.stagedJobs, job.JobID)
+	w.setCommitting(job.JobID, false)
+	w.manifestsApplied.Add(1)
+	if w.cfg.OnFinished != nil {
+		w.cfg.OnFinished()
+	}
+	w.logger.Info().Str("job_id", job.JobID).Str("output", job.Output.Path).Str("end", why).
+		Msg("Compaction committed")
+}
+
+// verifyStagedObject checks an object job's staged output: its size and the
+// checksum it records. An error is a failed check, to retry.
+func (w *CompletionWatcher) verifyStagedObject(ctx context.Context, job StagedJob) (bool, error) {
+	copier, ok := w.cfg.Storage.(storage.ObjectCopier)
+	if !ok {
+		return false, nil
+	}
+	size, sha, err := copier.ObjectSHA(ctx, job.StagedKey)
+	if err != nil {
+		return false, err
+	}
+	return size == job.Output.SizeBytes && sha == job.Output.SHA256, nil
+}
+
+// endStagedObject drops an object job that did not commit here (or ended
+// while this node was down): its staged object and manifest. Its input
+// objects are the data and stay.
+func (w *CompletionWatcher) endStagedObject(ctx context.Context, path string, job StagedJob, why string) {
+	if err := w.cfg.Storage.Delete(ctx, job.StagedKey); err != nil && !storage.IsNotFound(err) {
+		w.logger.Warn().Err(err).Str("job_id", job.JobID).Msg("Could not remove the staged output; retrying")
+		return
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return
+	}
+	delete(w.stagedJobs, job.JobID)
+	w.setCommitting(job.JobID, false)
+	if w.cfg.OnFinished != nil {
+		w.cfg.OnFinished()
+	}
+	w.logger.Warn().Str("job_id", job.JobID).Str("reason", why).
+		Msg("Staged compaction ended without a commit by this node; its inputs are untouched unless the cluster committed it")
 }
 
 // verifyStaged checks the staged copy: its size every time, its checksum
@@ -376,4 +547,9 @@ func errText(err error) string {
 // observers, which exist once the watcher does). Call before Start.
 func (w *CompletionWatcher) SetStagedObservers(before func(output string), committed func(inputs []string) error) {
 	w.cfg.BeforeCommit, w.cfg.OnCommitted = before, committed
+}
+
+// SetStagedFinished sets OnFinished. Call before Start.
+func (w *CompletionWatcher) SetStagedFinished(finished func()) {
+	w.cfg.OnFinished = finished
 }
