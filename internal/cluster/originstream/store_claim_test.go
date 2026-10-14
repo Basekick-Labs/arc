@@ -228,7 +228,7 @@ func TestDropInstanceDuringTrim(t *testing.T) {
 	if err := s.AcceptFloors("o", &Floors{Instance: 7, Keys: map[string]KeyFloor{"k": {Floor: 1}}}); err != nil {
 		t.Fatal(err)
 	}
-	ready := func(ctx context.Context, keys []TrimKey) map[TrimKey]bool {
+	ready := func(ctx context.Context, keys []TrimRequest) []bool {
 		if err := s.DropInstance("o", 7); err != nil {
 			t.Error(err)
 		}

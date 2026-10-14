@@ -70,20 +70,8 @@ func newClaimantRig(t *testing.T) *claimantRigT {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	st := &originStream{present: map[string]int64{}}
-	cl := newClaimant(c, store, outbox, buffer, func(ctx context.Context, origin string, keys []string) bool {
-		tk := make([]originstream.TrimKey, len(keys))
-		for i, k := range keys {
-			tk[i] = originstream.TrimKey{Origin: origin, Key: k}
-		}
-		got := st.keysLocal(ctx, c, tk, func(originstream.TrimKey) bool { return false })
-		for _, k := range tk {
-			if !got[k] {
-				return false
-			}
-		}
-		return true
-	})
+	st := &originStream{}
+	cl := newClaimant(c, store, outbox, buffer, st.instanceFilesLocal(c))
 	cl.grace = time.Minute
 	c.claimant.Store(cl)
 	return &claimantRigT{c: c, cl: cl, store: store, outbox: outbox, buffer: buffer, backend: backend, wal: w,
@@ -630,6 +618,11 @@ func TestClaimantDropsAFrozenCopy(t *testing.T) {
 	r := newClaimantRig(t)
 	ctx := context.Background()
 	r.stored(t, 1, 1)
+	// The batch's file, registered as the origin registers it, then settled;
+	// it is not here yet.
+	propose(t, r.c, raft.CommandRegisterFile, raft.RegisterFilePayload{File: raft.FileEntry{Path: "db/cpu/remote.parquet", SHA256: "x",
+		SizeBytes: 3, Database: "db", Measurement: "cpu", PartitionTime: r.hour, OriginNodeID: clOrigin, CreatedAt: time.Now()},
+		Cov2: []raft.InstanceCoverage{{Instance: clInst, Key: clKey, Ranges: [][2]uint64{{1, 1}}}}})
 	propose(t, r.c, raft.CommandSettleCoverage, raft.SettleCoveragePayload{Origin: clOrigin, Instance: clInst,
 		Keys: map[string]raft.KeySettlement{clKey: {Floor: 1}}})
 	r.cl.pass(ctx)
@@ -641,12 +634,13 @@ func TestClaimantDropsAFrozenCopy(t *testing.T) {
 	if err := r.c.registry.Register(peer); err != nil {
 		t.Fatal(err)
 	}
-	// A current file of the key is not here yet: the copy waits.
-	propose(t, r.c, raft.CommandRegisterFile, raft.RegisterFilePayload{File: raft.FileEntry{Path: "db/cpu/remote.parquet", SHA256: "x",
-		SizeBytes: 3, Database: "db", Measurement: "cpu", PartitionTime: r.hour, OriginNodeID: clOrigin, CreatedAt: time.Now()}})
+	// A compaction output of the key, not here either, does not matter.
+	propose(t, r.c, raft.CommandRegisterFile, raft.RegisterFilePayload{File: raft.FileEntry{Path: "db/cpu/compacted.parquet", SHA256: "y",
+		SizeBytes: 5, Database: "db", Measurement: "cpu", PartitionTime: r.hour, OriginNodeID: "compactor-1", CreatedAt: time.Now()}})
+	// The file holding the batch's rows is not here yet: the copy waits.
 	r.cl.pass(ctx)
 	if r.store.Held(clOrigin, clInst) == nil {
-		t.Fatal("dropped a copy while a file of its key is not here")
+		t.Fatal("dropped a copy while the file holding its batch is not here")
 	}
 	if err := r.backend.Write(ctx, "db/cpu/remote.parquet", []byte("abc")); err != nil {
 		t.Fatal(err)

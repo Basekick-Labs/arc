@@ -841,7 +841,7 @@ type ClusterConfig struct {
 	// StandbyStoreMaxBytes caps the copy a standby writer keeps of what its
 	// primary streams, with WALCoverage on (#1207). Past it the standby stores
 	// nothing until trimming frees room. 0 (default): a quarter of the WAL
-	// volume, at least 1 GiB; negative: no cap (#1266).
+	// volume, at least 1 GiB and at most 32 GiB; negative: no cap (#1266).
 	StandbyStoreMaxBytes int64
 	// OriginStreamQueueBytes caps what a primary holds in memory for one
 	// standby writer that is not keeping up; past it that standby misses

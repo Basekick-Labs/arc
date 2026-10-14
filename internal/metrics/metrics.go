@@ -1604,7 +1604,7 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_standby_store_lost_records gauge\n"...)
 	b = appendMetric(b, "arc_standby_store_lost_records", float64(m.standbyStoreLost.Load()))
 
-	b = append(b, "# HELP arc_standby_store_blocked_keys Measurements whose trim waits on files not yet present on this standby\n"...)
+	b = append(b, "# HELP arc_standby_store_blocked_keys Measurements with registered batches this standby may not trim yet (a file holding them not here, its FSM behind, a claim, or an origin not heard from)\n"...)
 	b = append(b, "# TYPE arc_standby_store_blocked_keys gauge\n"...)
 	b = appendMetric(b, "arc_standby_store_blocked_keys", float64(m.standbyStoreBlocked.Load()))
 

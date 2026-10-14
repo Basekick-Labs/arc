@@ -356,9 +356,11 @@ Metrics on the primary: `arc_origin_stream_sessions`,
 `arc_standby_store_incomplete_keys`, `arc_standby_store_trimmed_bytes_total`,
 `arc_standby_store_dropped_total`, `arc_standby_store_evicted_bytes_total`,
 `arc_standby_store_lost_records`, `arc_standby_store_blocked_keys` and
-`arc_standby_store_replaced_bytes`. A measurement stays in
-`arc_standby_store_blocked_keys` while a file of it is not on the standby: a
-file the puller cannot fetch keeps that measurement from being trimmed.
+`arc_standby_store_replaced_bytes`. `arc_standby_store_blocked_keys` counts
+the measurements with registered batches the standby may not trim yet: a file
+holding their rows is not on the standby (a file the puller cannot fetch keeps
+those batches), the standby's manifest is behind the primary's, a claim is
+open, or the primary is not heard from.
 
 All writers in the cluster must run this release before the setting is turned
 on: a writer from an older release does not understand the standby connection
@@ -1235,12 +1237,23 @@ that window could not have published those rows.
 
 - The copy is trimmed every 5 seconds, and as soon as it passes half its cap.
   Same QA run with the 1 GiB cap, while the standbys' pulls kept up: no batch
-  dropped, and the copy stayed under 160 MB. When a standby's pulls fall behind
-  (right after a restart, or with many files in the current hour), a
-  measurement's batches are trimmed only once every current file of it is on
-  the standby, so the copy can still fill: watch
-  `arc_standby_store_blocked_keys`. Trimming per batch is the remaining part of
-  #1266.
+  dropped, and the copy stayed under 160 MB.
+- A batch may leave the copy once the files holding its rows (by their
+  coverage) are on the standby; a segment of the copy goes when all its batches
+  may. Before, a measurement's batches waited until every current file of the
+  measurement was there, so one unpulled file (the newest flush, or a
+  compaction output) held back every batch of the measurement, in every
+  segment: when a standby's pulls fell behind, right after a restart or a
+  catch-up, the copy filled and 20-35 % of the batches were dropped on the QA
+  cluster. Same cluster now, 1.11M rows/s with a standby restarted mid-run and
+  a 1 GiB cap: no batch dropped, the copy peaked at 434 MB; a primary killed at
+  that rate came back exact (107,405,000 rows stored of 107,405,000 acked, the
+  last 799,000 published from the copy). Rows that sit only in a file
+  without coverage of the batch (a compaction output) were never republished
+  from the copy; the compaction commit keeps those (peers pull an output before
+  its inputs are deleted). With stream takeover off, nothing claims from the
+  copy, and a batch goes once it is registered. `arc_standby_store_blocked_keys`
+  counts the measurements with batches that may not go yet.
 - `cluster.standby_store_max_bytes` defaults to a quarter of the WAL volume, at
   least 1 GiB and at most 32 GiB (a full store is read whole at startup). The
   startup log names the volume size and the cap. On a volume

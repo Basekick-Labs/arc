@@ -23,8 +23,8 @@ import (
 // could publish again, or the file is found on no node (or nobody answers
 // for it during twice the grace): then it is deleted from the manifest as
 // vanished, which takes its batches back, and the claim publishes them from
-// the standby copy (the copy usually keeps them: a standby trims a key only
-// once every current file of it is here).
+// the standby copy (the copy keeps them: a standby trims a batch only once
+// every current file holding its rows is here, #1266).
 
 type probeAnswer int
 
