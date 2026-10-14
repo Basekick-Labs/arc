@@ -1166,6 +1166,18 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Tier status no longer lists files the node's own compaction or retention removed ([#1271](https://github.com/Basekick-Labs/arc/issues/1271))
+
+On a cluster with local storage, a node's tiering metadata kept a `hot` row for
+every file that node itself had removed before the cluster's delete reached it:
+the inputs of its own compactions (the dedicated compactor) and the files its
+retention run removed. `GET /api/v1/tiering/status` and `/files` reported files
+that no longer existed until the next daily tier cycle retired them (465 extra
+rows on a QA compactor after one compaction cycle).
+
+The node now retires those rows as the delete arrives, after checking the file
+is really gone. A `cold` row is never touched. A path registered again while a
+compaction input waited for its staged output also keeps its fresh copy now.
 ### A standby writer no longer drops batches it received while trimming its copy ([#1266](https://github.com/Basekick-Labs/arc/issues/1266))
 
 A standby writer trims its copy of the primary's stream once the batches are in

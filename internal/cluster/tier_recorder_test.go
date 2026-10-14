@@ -8,7 +8,10 @@ package cluster
 import (
 	"context"
 	"errors"
+	"github.com/basekick-labs/arc/internal/compaction"
 	"io"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -27,6 +30,19 @@ type fakeTierRecorder struct {
 	mu       sync.Mutex
 	pulled   []string
 	unlinked []unlinkReport
+	missing  []string
+}
+
+func (r *fakeTierRecorder) RecordMissingFile(path string) {
+	r.mu.Lock()
+	r.missing = append(r.missing, path)
+	r.mu.Unlock()
+}
+
+func (r *fakeTierRecorder) missingReports() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.missing...)
 }
 
 func (r *fakeTierRecorder) RecordReplicatedFile(path string, sizeBytes int64) {
@@ -158,6 +174,91 @@ func TestUnlinkOne_DoesNotReportAPathThisNodeNeverHeld(t *testing.T) {
 	if reports := rec.unlinkReports(); len(reports) != 0 {
 		t.Fatalf("reported a path this node never held: %+v", reports)
 	}
+	// It is reported as missing instead: a hot row this node may still hold
+	// for it (its own compaction or retention removed the file) is stale;
+	// with no row the event is a no-op (#1271).
+	if got := rec.missingReports(); len(got) != 1 {
+		t.Fatalf("missing reports %v, want the one path", got)
+	}
+}
+
+// A file present at the delete is reported unlinked, not missing.
+func TestUnlinkOne_PresentFileIsNotReportedMissing(t *testing.T) {
+	backend := newMemBackend()
+	const path = "db1/cpu/2026/10/03/14/a.parquet"
+	if err := backend.Write(nil, path, []byte("x")); err != nil { //nolint:staticcheck // memBackend ignores ctx
+		t.Fatal(err)
+	}
+	rec := &fakeTierRecorder{}
+	c := newDeleteRig(t, backend, false, nil)
+	c.SetTierRecorder(rec)
+	c.enqueueLocalDelete(path, "compaction:job-1")
+	if got := waitUnlinkReports(t, rec, 1); len(got) != 1 {
+		t.Fatalf("unlink reports %+v", got)
+	}
+	if got := rec.missingReports(); len(got) != 0 {
+		t.Fatalf("also reported missing: %v", got)
+	}
+}
+
+// The manifest is read again after a real staged-adoption wait: a path
+// registered again during it keeps its copy (#1271 review). Without a wait the
+// manifest is asked once.
+func TestUnlinkOne_RelistedDuringTheWaitKeepsTheFile(t *testing.T) {
+	dir := t.TempDir()
+	backend, err := storage.NewLocalBackend(dir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const path = "db1/cpu/2026/10/03/14/a.parquet"
+	ctx := context.Background()
+	if err := backend.Write(ctx, path, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	// The job's staged output is still being adopted: its directory exists
+	// for a while.
+	staged := compaction.StagedJobDir("job-1") + "/out.parquet"
+	if err := backend.Write(ctx, staged, []byte("y")); err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	asked := 0
+	listed := false
+	has := func(string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		asked++
+		return listed
+	}
+	c := newDeleteRig(t, backend, false, has)
+	c.enqueueLocalDelete(path, "compaction:job-1")
+	// Past the worker's grace (deleteGrace): it has asked once and is waiting
+	// for the staged output.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		mu.Lock()
+		n := asked
+		mu.Unlock()
+		if n >= 1 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(200 * time.Millisecond)
+	mu.Lock()
+	listed = true // registered again while the worker waits
+	mu.Unlock()
+	_ = backend.Delete(ctx, staged)
+	_ = os.RemoveAll(filepath.Join(dir, compaction.StagedJobDir("job-1")))
+	time.Sleep(900 * time.Millisecond)
+	if n, _ := backend.StatFile(ctx, path); n < 0 {
+		t.Fatal("a path listed again during the wait lost its copy")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if asked != 2 {
+		t.Fatalf("manifest asked %d times, want 2 (before and after the wait)", asked)
+	}
 }
 
 // The tiering manager is constructed long after the coordinator starts, so the
@@ -226,4 +327,22 @@ func TestTierRecorderWrappers_NilRecorderIsANoOp(t *testing.T) {
 	c := &Coordinator{logger: zerolog.Nop()}
 	c.recordPulledFileInTiering("db1/cpu/2026/10/03/14/a.parquet", 1)
 	c.recordUnlinkedFileInTiering("db1/cpu/2026/10/03/14/a.parquet", "compaction:7", 1)
+}
+
+type statFailBackend struct{ *memBackend }
+
+func (b statFailBackend) StatFile(context.Context, string) (int64, error) {
+	return -1, errors.New("stat failed")
+}
+
+// A failed stat says nothing about the file: no missing report (#1271 review).
+func TestUnlinkOne_FailedStatReportsNothing(t *testing.T) {
+	rec := &fakeTierRecorder{}
+	c := newDeleteRig(t, statFailBackend{newMemBackend()}, false, nil)
+	c.SetTierRecorder(rec)
+	c.enqueueLocalDelete("db1/cpu/2026/10/03/14/a.parquet", "tiering:migrated")
+	time.Sleep(900 * time.Millisecond)
+	if got := rec.missingReports(); len(got) != 0 {
+		t.Fatalf("reported missing on a failed stat: %v", got)
+	}
 }
