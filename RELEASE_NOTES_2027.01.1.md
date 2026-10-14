@@ -1140,6 +1140,37 @@ an unbounded operation.
 
 ## Bug fixes
 
+### A new Raft leader no longer re-promotes a dead primary writer, or fails over a healthy one ([#1267](https://github.com/Basekick-Labs/arc/issues/1267))
+
+When a node joined the cluster after the primary writer was designated, its
+registry lost that writer's `primary` state: the join response carries no writer
+state. If that node later became the Raft leader, its failover manager saw no
+primary at all:
+
+- If the primary had just died, the new leader "failed over" within three health
+  checks to the lowest-id writer still marked healthy. That was the dead primary
+  itself while its heartbeats were not yet stale. The no-op promotion counted as
+  a success and started the 60 s `cluster.failover_cooldown`, so writes were
+  refused for 83 s on a QA cluster instead of about 35 s.
+- If the primary was alive and not the lowest id, the new leader failed it over
+  for no reason.
+
+Now:
+
+- Failover decisions use the cluster's designated primary (the Raft state) and
+  that node's health, not the registry's writer state. A join keeps the writer
+  state it knows.
+- Re-promoting the designated primary is not a failover.
+- Only a completed failover starts the cooldown. A failed attempt is retried on
+  the next health check (5 s). A writer the cluster state refuses to promote is
+  skipped for a minute; a Raft error (lost leadership, timeout) does not count
+  against it.
+- A promotion Raft committed is a success, even when the failover's wait times
+  out.
+- `GET /api/v1/cluster` reports each node's `writer_state`, the
+  `primary_writer_id`, and `writer_failover` (on the Raft leader: failed
+  attempts, the last failure and its reason, the last failover).
+
 ### A tag name with no matching column no longer stops a partition from compacting ([#1258](https://github.com/Basekick-Labs/arc/issues/1258))
 
 Ingest records each file's tag names in its `arc:tags` metadata, and

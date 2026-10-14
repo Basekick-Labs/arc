@@ -1822,6 +1822,12 @@ func (c *Coordinator) handleJoinResponse(msg *protocol.Message, seedAddr string,
 			node := NewNode(nodeInfo.ID, nodeInfo.Name, ParseRole(nodeInfo.Role), c.cfg.ClusterName)
 			node.SetAddresses(nodeInfo.CoordAddr, nodeInfo.APIAddr)
 			node.UpdateState(NodeState(nodeInfo.State))
+			// The response carries no writer state, and Register replaces the
+			// entry: keep what this node already knows (Raft replay or a
+			// promotion callback may have set it before the join returned),
+			// else take the FSM's. Losing it made a later Raft leader see no
+			// primary and fail over the designated one (#1267).
+			node.SetWriterState(c.knownWriterState(nodeInfo.ID))
 			if err := c.registry.Register(node); err != nil {
 				c.logger.Warn().Err(err).Str("node_id", nodeInfo.ID).Msg("Failed to register peer node")
 			}
@@ -3068,6 +3074,9 @@ func (c *Coordinator) Status() map[string]interface{} {
 			"version":        node.Version,
 			"last_heartbeat": node.GetLastHeartbeat(),
 			"stats":          node.GetStats(),
+			// This node's view of the writer state (#1267: a view that had
+			// lost it was invisible).
+			"writer_state": node.GetWriterState(),
 			// Which node holds the compactor lease was previously visible
 			// only in a log line emitted once, at assignment time. An
 			// operator asking "why is my dedicated compactor idle?" had
@@ -3103,6 +3112,15 @@ func (c *Coordinator) Status() map[string]interface{} {
 		leaseStatus["preemption"] = preempt
 	}
 	status["active_compactor"] = leaseStatus
+
+	// The designated primary writer and this node's failover manager: the
+	// manager acts only on the Raft leader, so read this there (#1267).
+	if c.writerFailoverMgr != nil {
+		if c.raftFSM != nil {
+			status["primary_writer_id"] = c.raftFSM.GetPrimaryWriterID()
+		}
+		status["writer_failover"] = c.writerFailoverMgr.Stats()
+	}
 
 	// The cluster-wide compaction pause a restore takes (#1087): who holds
 	// it, until when, and which nodes have acknowledged it.
@@ -4099,11 +4117,28 @@ func (c *Coordinator) onRaftNodeUpdated(n *raft.NodeInfo) {
 	c.registry.Register(node)
 }
 
+// knownWriterState is the writer state this node knows for id: the FSM's
+// record of the node, which the registry's is derived from and so is never
+// behind, else the registry entry's (#1267). The join can race the replay
+// callbacks either way; the next promotion callback corrects the registry.
+func (c *Coordinator) knownWriterState(id string) WriterState {
+	if c.raftFSM != nil {
+		if n, ok := c.raftFSM.GetNode(id); ok && n != nil && n.WriterState != "" {
+			return WriterState(n.WriterState)
+		}
+	}
+	if existing, ok := c.registry.Get(id); ok {
+		return existing.GetWriterState()
+	}
+	return WriterStateNone
+}
+
 // onWriterPromoted is called when the FSM promotes a new primary writer.
 // It updates the local registry to reflect the new writer states.
 func (c *Coordinator) onWriterPromoted(newPrimaryID, oldPrimaryID string) {
-	// Demote old primary in registry
-	if oldPrimaryID != "" {
+	// Demote old primary in registry. Not when the same node is promoted
+	// again: that would flip it to standby and back (#1267).
+	if oldPrimaryID != "" && oldPrimaryID != newPrimaryID {
 		if oldNode, exists := c.registry.Get(oldPrimaryID); exists {
 			oldNode.SetWriterState(WriterStateStandby)
 			c.registry.Register(oldNode)
