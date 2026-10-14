@@ -581,24 +581,28 @@ func (c *Coordinator) sweepStagedDirs(ctx context.Context) {
 // waitStagedAdoption delays the unlink of a compaction input while this node
 // holds a staged copy of the job's output not yet moved into place, so local
 // reads do not lose the rows in between (bounded).
-func (c *Coordinator) waitStagedAdoption(reason string) {
+// It reports whether it waited at all (#1271: the caller then reads the
+// manifest again).
+func (c *Coordinator) waitStagedAdoption(reason string) (waited bool) {
 	job, ok := strings.CutPrefix(reason, "compaction:")
 	if !ok || job == "" || c.storage == nil {
-		return
+		return false
 	}
 	v, _ := c.staged.waitUntil.LoadOrStore(job, time.Now().Add(stagedDeleteWait))
 	deadline := v.(time.Time)
 	for time.Now().Before(deadline) {
 		ok, err := c.storage.Exists(c.ctx, compaction.StagedJobDir(job))
 		if err != nil || !ok {
-			return
+			return waited
 		}
+		waited = true
 		select {
 		case <-c.ctx.Done():
-			return
+			return waited
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
+	return waited
 }
 
 // stagedLeaderLoop, on the leader, aborts staged jobs whose compactor has
