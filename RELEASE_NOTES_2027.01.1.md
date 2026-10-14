@@ -1170,6 +1170,25 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Two flushes in one clock tick no longer overwrite each other's file ([#1282](https://github.com/Basekick-Labs/arc/issues/1282))
+
+A flushed Parquet file was named from the wall clock alone. Flush workers run
+concurrently, and two flushes of the same measurement and hour that read the
+same clock value got the same name: the second upload replaced the first. Both
+flushes reported success and the WAL checkpointed both, so the first file's
+rows were lost after they had been acknowledged. On a macOS rig (the clock
+resolves microseconds) at 1M rows/s for 120 s, 29 of 2000 files collided and
+1.74M of 120M rows were lost. Linux clocks resolve nanoseconds, so collisions
+there were rarer but possible, and likelier on VMs and containers with coarse
+clocks. Every backend overwrote silently.
+
+Each name a process issues is now unique: when the clock repeats, the name's
+time moves 1 ns past the last one issued. The name format is unchanged, so
+existing files and older binaries read the same. Compaction outputs and DELETE
+rewrites use the same stamp. Two nodes writing to one bucket (shared-storage
+multi-writer) are not kept apart by this; their clocks would have to agree to
+the nanosecond.
+
 ### A standby writer's copy of the stream is trimmed every 5 seconds, sized from its volume, and gives way when the volume runs low ([#1266](https://github.com/Basekick-Labs/arc/issues/1266))
 
 With WAL coverage on, a standby writer keeps a copy of the primary's batches
