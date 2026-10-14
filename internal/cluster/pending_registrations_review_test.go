@@ -124,6 +124,13 @@ func TestCoordinatorLeavesOnlyWithItsPendingSetPublished(t *testing.T) {
 				t.Fatal(err)
 			}
 			_ = c.Stop()
+			// The listener counts on its own goroutine, which may run after
+			// Stop returns: wait for a leave that is expected, and give one
+			// that is not the same time to show up.
+			deadline := time.Now().Add(2 * time.Second)
+			for broadcasts.Load() == 0 && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
 			if got := broadcasts.Load() > 0; got != tc.leaves {
 				t.Fatalf("left the cluster: %v, want %v", got, tc.leaves)
 			}
