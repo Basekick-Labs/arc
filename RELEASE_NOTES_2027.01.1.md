@@ -1166,6 +1166,16 @@ an unbounded operation.
 
 ## Bug fixes
 
+### A standby writer no longer drops batches it received while trimming its copy ([#1266](https://github.com/Basekick-Labs/arc/issues/1266))
+
+A standby writer trims its copy of the primary's stream once the batches are in
+registered files that are on this node. Trimming chose its segments, then
+checked the files without holding the store lock. The primary kept streaming
+into the open segment meanwhile, and the trim deleted that segment with the
+batches that had just arrived, which were not registered yet. Had the primary
+then failed with its volume, a stream takeover could not have published those
+rows. A segment that grew during the check is now kept until the next pass.
+
 ### The reconciler no longer deletes files a writer has not registered yet ([#1214](https://github.com/Basekick-Labs/arc/issues/1214))
 
 On shared storage, each writer uploads a flushed file to the bucket first,
@@ -1250,6 +1260,7 @@ failover were gone.
   by reason for the old total. A refusal is counted per attempt: an MQTT message
   retried while refused counts once per retry.
 - Other 503s (shutting down, schema churn) are still logged per request.
+
 ### A new Raft leader no longer re-promotes a dead primary writer, or fails over a healthy one ([#1267](https://github.com/Basekick-Labs/arc/issues/1267))
 
 When a node joined the cluster after the primary writer was designated, its

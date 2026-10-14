@@ -589,6 +589,11 @@ type trimCandidate struct {
 	d    *instanceDir
 	seg  *segment
 	keys []TrimKey
+	// size when the candidate was chosen. Readiness runs without the lock and
+	// the primary keeps streaming into the open segment: a segment that grew
+	// meanwhile holds batches nobody vetted (not registered yet) and is kept
+	// (#1266).
+	size int64
 }
 
 // Trim discards every segment whose records are all registered and held.
@@ -610,7 +615,7 @@ func (s *Store) Trim(ctx context.Context, ready TrimReadiness) (int64, error) {
 			if !ok {
 				continue
 			}
-			cands = append(cands, trimCandidate{d: d, seg: seg, keys: keys})
+			cands = append(cands, trimCandidate{d: d, seg: seg, keys: keys, size: seg.size})
 			for _, k := range keys {
 				need[k] = true
 			}
@@ -644,7 +649,7 @@ func (s *Store) Trim(ctx context.Context, ready TrimReadiness) (int64, error) {
 				break
 			}
 		}
-		if !allReady || !c.d.holds(c.seg) {
+		if !allReady || !c.d.holds(c.seg) || c.seg.size != c.size {
 			continue
 		}
 		if c.d.cur != nil && c.d.segs[len(c.d.segs)-1] == c.seg {
