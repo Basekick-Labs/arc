@@ -51,9 +51,9 @@ func TestCycleWorkerWaitCancellationAccountingIssue915(t *testing.T) {
 
 	manager.ManifestManager = nil
 	manager.MaxConcurrent = 1
+	manager.MaxFilesPerBatch = 2
 
 	started := make(chan struct{})
-	secondFiltered := make(chan struct{})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -64,27 +64,18 @@ func TestCycleWorkerWaitCancellationAccountingIssue915(t *testing.T) {
 		return ctx.Err()
 	}
 
-	filterCalls := 0
-	manager.SetSyncEligibility(func(
-		_ context.Context, paths []string,
-	) (map[string]bool, error) {
-		filterCalls++
-		if filterCalls == 2 {
-			close(secondFiltered)
-		}
-		eligible := make(map[string]bool, len(paths))
-		for _, path := range paths {
-			eligible[path] = true
-		}
-		return eligible, nil
-	})
+	candidate := candidateIssue915("partition-one")
+	candidate.Files = []string{
+		"one.parquet",
+		"two.parquet",
+		"three.parquet",
+		"four.parquet",
+	}
+	candidate.FileCount = len(candidate.Files)
 
 	manager.Tiers = []Tier{cycleTierIssue915{
 		find: func(context.Context, string, string) ([]Candidate, error) {
-			return []Candidate{
-				candidateIssue915("partition-one"),
-				candidateIssue915("partition-two"),
-			}, nil
+			return []Candidate{candidate}, nil
 		},
 	}}
 
@@ -96,12 +87,12 @@ func TestCycleWorkerWaitCancellationAccountingIssue915(t *testing.T) {
 		done <- err
 	}()
 
-	for _, signal := range []<-chan struct{}{started, secondFiltered} {
-		select {
-		case <-signal:
-		case <-time.After(10 * time.Second):
-			t.Fatal("cycle did not reach expected worker/capacity state")
-		}
+	// The candidate is split into two batches before its worker starts, so
+	// this signal guarantees both batches have been counted as discovered.
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("cycle did not start the first batch")
 	}
 
 	cancel()
