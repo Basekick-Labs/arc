@@ -72,6 +72,12 @@ const unlinkReasonAbandonedPull = "replication:abandoned"
 // the other.
 const unlinkReasonSnapshotRemoved = "snapshot:removed"
 
+// unlinkReasonStaleLocal is a copy the stale-local sweep removed: the
+// cluster deleted it while this node missed the delete, for a reason the
+// node never learned (#1071). Mirrored in internal/cluster
+// (UnlinkReasonStaleLocal).
+const unlinkReasonStaleLocal = "stale-local"
+
 // tierEventStopDrainTimeout is the whole drain's budget once Stop has been
 // signalled; each chunk gets what is left of it. Short on purpose: Stop runs
 // on the shutdown timeout that every remaining hook and component shares, so a
@@ -764,7 +770,8 @@ func (m *Manager) applyTierEventChunk(chunk []tierEvent, touched map[tierEventKe
 func reasonMayBeMigration(reason string) bool {
 	return strings.HasPrefix(reason, manifestReasonPrefix) ||
 		reason == unlinkReasonAbandonedPull ||
-		reason == unlinkReasonSnapshotRemoved
+		reason == unlinkReasonSnapshotRemoved ||
+		reason == unlinkReasonStaleLocal
 }
 
 // coldProbe is the answer of one cold-tier existence check.

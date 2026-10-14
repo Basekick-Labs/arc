@@ -1487,6 +1487,56 @@ election still fails the request; retrying it completes the deletion.
 
 Contributed by [@jallegri](https://github.com/jallegri) in [#1252](https://github.com/Basekick-Labs/arc/pull/1252).
 
+### A node that missed a delete removes its stale copy ([#1071](https://github.com/Basekick-Labs/arc/issues/1071))
+
+On a cluster with local storage, each node removes its own copy of a file when
+the cluster manifest drops it. A node missed that when it was down while the
+file was deleted and rejoined from the leader's snapshot, or when it crashed
+with the removal still queued (or the removal failed). The copy stayed on its
+disk, and its queries kept returning the deleted rows, or duplicates of
+compacted ones, until the opt-in orphan sweep removed it. A rig reproduced it:
+a reader down while a measurement was deleted kept all 6 files and returned
+the 50 deleted rows after it rejoined.
+
+Each node now records the local files it has seen registered, in
+`seen-local.log` in `cluster.raft_data_dir`. Every 5 minutes it syncs with the
+leader and removes a recorded file the manifest no longer lists, when:
+
+- the node's manifest has applied past the file's registration;
+- the file has been unlisted for 10 minutes (two passes that ran: a pass
+  skipped for a compaction pause or a failed sync starts the wait again);
+- it is not waiting to register on this node, not held by an edge-sync
+  delivery, not part of a compaction in progress, and not in the cold tier on
+  this node (an unreadable tier record counts as cold);
+- it is still the same file (size, modification time and inode). The copy is
+  moved aside under `_stale_local/` and checked again there before it is
+  deleted, so a file written to the path meanwhile goes back.
+
+A file the node never saw registered is never removed by this sweep: a writer's
+flushed files not yet registered, a restore in progress, edge-sync deliveries,
+and copies left over from before the upgrade (those stay for the reconciler's
+orphan sweep). In the rig above, the reader removed the 6 copies within two
+passes and kept the others.
+
+A pass that would remove more than `cluster.stale_local_sweep_max_fraction`
+(default `0.5`) of the node's tracked files, and at least 1000, removes
+nothing: a manifest rolled back by an unsafe Raft recovery looks like that.
+The node logs an error and `arc_stale_local_blocked` reads `1`; if the
+deletes are real (a long outage with heavy retention), raise the setting and
+restart the node. A value of 0 or below, or not a number, is refused at
+startup.
+
+The sweep is on by default (`cluster.stale_local_sweep`) on local storage with
+`cluster.replication_enabled`, and stops with
+`cluster.replication_catchup_enabled = false`. It holds about 150–200 bytes
+of memory per local file, and a journal of up to about 1.5 times that on the
+Raft volume; if the journal cannot be written, the node stops tracking (and
+removing) until a restart and `arc_stale_local_tracking_failed` reads `1`.
+`GET /api/v1/cluster` reports the last pass under `stale_local`. New metrics:
+`arc_stale_local_unlinked_total`, `arc_stale_local_tracked`,
+`arc_stale_local_blocked` and `arc_stale_local_tracking_failed`. An earlier
+release ignores `seen-local.log` and `_stale_local/`.
+
 ### Compaction no longer loses rows when the compactor's disk fails, or brings deleted rows back ([#1207](https://github.com/Basekick-Labs/arc/issues/1207))
 
 On a cluster with local storage, a compaction registered its output and
@@ -3605,9 +3655,11 @@ after the hub deleted the path, and external Raft writers. Two gaps remain for t
   `cluster.replication_catchup_enabled = false`, nothing retries it at all.
   [#1182](https://github.com/Basekick-Labs/arc/issues/1182) tracks this.
 - A rewrite a node learns of from a Raft snapshot rather than from the log
-  fires no callback, so the old copy is kept.
-  The snapshot-restore work is tracked in
-  [#1071](https://github.com/Basekick-Labs/arc/issues/1071).
+  fires no callback. Since the fix for
+  [#1071](https://github.com/Basekick-Labs/arc/issues/1071) (below), the
+  node's next replication walk has a copy it recorded under the earlier
+  registration re-checked and pulled again if its content differs; a copy
+  from before the upgrade is not recorded, so it is still kept.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in
 [#907](https://github.com/Basekick-Labs/arc/pull/907), and by

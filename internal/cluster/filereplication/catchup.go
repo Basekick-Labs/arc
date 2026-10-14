@@ -252,6 +252,9 @@ func (p *Puller) walkManifest(ctx context.Context, fetch func(cursor string, lim
 			if entry == nil {
 				continue
 			}
+			if p.cfg.ObserveListed != nil {
+				p.cfg.ObserveListed(entry)
+			}
 
 			// Backpressure: if the queue is above the high-water mark, sleep
 			// briefly to let workers drain.

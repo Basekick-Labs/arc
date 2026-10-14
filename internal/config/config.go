@@ -835,6 +835,16 @@ type ClusterConfig struct {
 	// standby writer that is not keeping up; past it that standby misses
 	// batches (a gap in its copy).
 	OriginStreamQueueBytes int64
+	// StaleLocalSweep removes a local replica this node saw registered once
+	// the cluster manifest no longer lists it, when the delete that should
+	// have removed it was missed: the node was down, or crashed with the
+	// unlink queued (#1071). Local storage with replication only. Default on.
+	StaleLocalSweep bool
+	// StaleLocalSweepMaxFraction stops a sweep pass that would remove more
+	// than this fraction of the files the node tracks (and at least 1000):
+	// a manifest rolled back by an unsafe recovery must not take every local
+	// copy with it. Raise it to let a refused pass run. Default 0.5.
+	StaleLocalSweepMaxFraction float64
 
 	// Cluster security (Enterprise)
 	SharedSecret string // Shared secret for join authentication (HMAC-SHA256). All nodes must share the same value.
@@ -944,6 +954,11 @@ func Load() (*Config, error) {
 	departedTTL, err := time.ParseDuration(v.GetString("cluster.stream_takeover_departed_ttl"))
 	if err != nil || departedTTL < time.Minute {
 		return nil, fmt.Errorf("invalid cluster.stream_takeover_departed_ttl %q: must be a Go duration of at least 1m", v.GetString("cluster.stream_takeover_departed_ttl"))
+	}
+
+	// math.IsNaN via self-comparison: NaN would disable the breaker silently.
+	if f := v.GetFloat64("cluster.stale_local_sweep_max_fraction"); f != f || f <= 0 {
+		return nil, fmt.Errorf("invalid cluster.stale_local_sweep_max_fraction %v: must be a number above 0 (above 1 never refuses a pass)", v.Get("cluster.stale_local_sweep_max_fraction"))
 	}
 
 	scanTimeout, err := time.ParseDuration(v.GetString("tiered_storage.scan_timeout"))
@@ -1200,25 +1215,27 @@ func Load() (*Config, error) {
 			RecheckConcurrency:        v.GetInt("reconciliation.recheck_concurrency"),
 		},
 		Cluster: ClusterConfig{
-			Enabled:                   v.GetBool("cluster.enabled"),
-			NodeID:                    v.GetString("cluster.node_id"),
-			Role:                      v.GetString("cluster.role"),
-			ClusterName:               v.GetString("cluster.cluster_name"),
-			Seeds:                     parseStringSlice(v.GetString("cluster.seeds")),
-			CoordinatorAddr:           v.GetString("cluster.coordinator_addr"),
-			AdvertiseAddr:             v.GetString("cluster.advertise_addr"),
-			HealthCheckInterval:       v.GetInt("cluster.health_check_interval"),
-			IngestFenceAfterMs:        v.GetInt("cluster.ingest_fence_after_ms"),
-			WALCoverage:               v.GetBool("cluster.wal_coverage"),
-			StreamTakeover:            v.GetBool("cluster.stream_takeover"),
-			StreamTakeoverGrace:       takeoverGrace,
-			StreamTakeoverDepartedTTL: departedTTL,
-			StandbyStoreMaxBytes:      v.GetInt64("cluster.standby_store_max_bytes"),
-			OriginStreamQueueBytes:    v.GetInt64("cluster.origin_stream_queue_bytes"),
-			HealthCheckTimeout:        v.GetInt("cluster.health_check_timeout"),
-			UnhealthyThreshold:        v.GetInt("cluster.unhealthy_threshold"),
-			HeartbeatInterval:         v.GetInt("cluster.heartbeat_interval"),
-			HeartbeatTimeout:          v.GetInt("cluster.heartbeat_timeout"),
+			Enabled:                    v.GetBool("cluster.enabled"),
+			NodeID:                     v.GetString("cluster.node_id"),
+			Role:                       v.GetString("cluster.role"),
+			ClusterName:                v.GetString("cluster.cluster_name"),
+			Seeds:                      parseStringSlice(v.GetString("cluster.seeds")),
+			CoordinatorAddr:            v.GetString("cluster.coordinator_addr"),
+			AdvertiseAddr:              v.GetString("cluster.advertise_addr"),
+			HealthCheckInterval:        v.GetInt("cluster.health_check_interval"),
+			IngestFenceAfterMs:         v.GetInt("cluster.ingest_fence_after_ms"),
+			WALCoverage:                v.GetBool("cluster.wal_coverage"),
+			StreamTakeover:             v.GetBool("cluster.stream_takeover"),
+			StreamTakeoverGrace:        takeoverGrace,
+			StreamTakeoverDepartedTTL:  departedTTL,
+			StandbyStoreMaxBytes:       v.GetInt64("cluster.standby_store_max_bytes"),
+			OriginStreamQueueBytes:     v.GetInt64("cluster.origin_stream_queue_bytes"),
+			StaleLocalSweep:            v.GetBool("cluster.stale_local_sweep"),
+			StaleLocalSweepMaxFraction: v.GetFloat64("cluster.stale_local_sweep_max_fraction"),
+			HealthCheckTimeout:         v.GetInt("cluster.health_check_timeout"),
+			UnhealthyThreshold:         v.GetInt("cluster.unhealthy_threshold"),
+			HeartbeatInterval:          v.GetInt("cluster.heartbeat_interval"),
+			HeartbeatTimeout:           v.GetInt("cluster.heartbeat_timeout"),
 			// Raft configuration
 			RaftDataDir:           v.GetString("cluster.raft_data_dir"),
 			RaftBindAddr:          v.GetString("cluster.raft_bind_addr"),
@@ -2057,6 +2074,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.stream_takeover", false) // experimental (#1207 S4b); see Cluster.StreamTakeover
 	v.SetDefault("cluster.standby_store_max_bytes", int64(1<<30))
 	v.SetDefault("cluster.origin_stream_queue_bytes", int64(64<<20))
+	v.SetDefault("cluster.stale_local_sweep", true) // #1071
+	v.SetDefault("cluster.stale_local_sweep_max_fraction", 0.5)
 
 	// Cluster security defaults
 	v.SetDefault("cluster.shared_secret", "")
