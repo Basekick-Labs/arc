@@ -1166,6 +1166,26 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Stream takeover publishes the rows of unpulled files in one go, not in waves ([#1269](https://github.com/Basekick-Labs/arc/issues/1269))
+
+When a primary writer dies with files nobody had pulled yet, the new primary
+waits twice `cluster.stream_takeover_grace` for some node to answer for each
+file, then publishes its rows again from its copy of the stream. Only 32 files
+were checked at a time, and a file's wait started only when it was first
+checked, so with more files their rows came back in waves about three minutes
+apart. On a QA cluster with 70 such files, the rows took 10 minutes to be
+complete after the crash.
+
+- Every missing file's wait starts when the takeover sees it missing, from the
+  start of the claim, while the rest of the claim replays.
+- Each check asks first about the files whose wait is over, then the ones not
+  asked yet. A file is still published again only on an answer from that
+  check.
+- After files are taken back, the next check runs on the next pass, not 30 s
+  later. A check spends at most 10 seconds asking; slow peers make it take more
+  checks, not block the takeover.
+
+The grace itself is unchanged.
 ### A standby writer no longer drops batches it received while trimming its copy ([#1266](https://github.com/Basekick-Labs/arc/issues/1266))
 
 A standby writer trims its copy of the primary's stream once the batches are in

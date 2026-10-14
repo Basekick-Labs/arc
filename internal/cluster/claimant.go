@@ -110,6 +110,16 @@ type claimWork struct {
 	unrepublishable map[string]bool
 	unpulled        int
 	unpulledAt      time.Time // last check while files were missing
+	// lastProbed is when each missing file was last asked about: a check
+	// asks the oldest first, so every missing file is asked about in turn
+	// (#1269).
+	lastProbed map[string]time.Time
+	// justVanished: a check of this pass took files back. Their batches are
+	// replayed from the next pass (VanishedAt resets done), so this pass must
+	// not finish the claim. That the next pass sees the new VanishedAt rests on
+	// pass() starting with SyncManifest: a barrier after the delete, applied
+	// here before ClaimsBy is read.
+	justVanished bool
 }
 
 type claimBackoff struct {
@@ -585,7 +595,8 @@ func (cl *claimant) workFor(k raft.StreamClaim) *claimWork {
 	if w == nil || w.epoch != k.Epoch {
 		w = &claimWork{epoch: k.Epoch, done: map[recID]bool{}, chunks: map[recID]uint16{},
 			unreplayable: map[string]raft.Intervals{}, failed: map[recID]int{}, vanishedAt: k.VanishedAt,
-			local: map[string]int64{}, unknownSince: map[string]time.Time{}, unrepublishable: map[string]bool{}}
+			local: map[string]int64{}, unknownSince: map[string]time.Time{}, unrepublishable: map[string]bool{},
+			lastProbed: map[string]time.Time{}}
 		cl.work[k.Instance] = w
 	}
 	if w.vanishedAt != k.VanishedAt {
@@ -608,6 +619,18 @@ func (cl *claimant) replayClaim(ctx context.Context, fsm *raft.ClusterFSM, k raf
 	}
 	w := cl.workFor(k)
 	inst := fmt.Sprintf("%016x", k.Instance)
+
+	// Start looking for the origin's files nobody pulled now, not after the
+	// first replay round: their wait (twice the grace) runs while the rest
+	// of the claim replays (#1269). Finishing still needs them settled below.
+	if tracked {
+		w.justVanished = false
+		_ = cl.unpulledSettled(ctx, fsm, k, w)
+		if w.justVanished {
+			w.justVanished = false
+			return
+		}
+	}
 
 	// Files of this claim still on their way: their batches wait.
 	inflight := map[string]raft.Intervals{}

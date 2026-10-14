@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"sort"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster/filereplication"
@@ -40,6 +41,10 @@ const (
 
 // unpulledEvery throttles the check of one claim while files are missing.
 const unpulledEvery = 30 * time.Second
+
+// unpulledCheckBudget bounds the probes of one check (each up to
+// unpulledProbeTimeout per member); the rest wait for the next check.
+const unpulledCheckBudget = 10 * time.Second
 
 // unpulledSettled reports whether every hot file of k's instance that this
 // node could republish is here at its size; it pursues the missing ones.
@@ -96,28 +101,61 @@ func (cl *claimant) unpulledSettled(ctx context.Context, fsm *raft.ClusterFSM, k
 			delete(w.unknownSince, p)
 		}
 	}
+	for p := range w.lastProbed {
+		if !current[p] {
+			delete(w.lastProbed, p)
+		}
+	}
 	w.unpulled = len(missing)
 	if len(missing) == 0 {
 		w.unpulledAt = time.Time{}
 		return true
 	}
+	// Every missing file's wait starts the first time it is seen missing, not
+	// when it first gets a probe: with more than maxUnpulledProbesPerPass
+	// missing, later files used to start their wait only after earlier ones
+	// were settled, and their rows came back in waves minutes apart (#1269).
+	for _, f := range missing {
+		if _, ok := w.unknownSince[f.Path]; !ok {
+			w.unknownSince[f.Path] = now
+		}
+	}
+	// Ask in this order: files whose wait is over, then files never asked
+	// about, then the least recently asked. A file is taken back only on an
+	// answer from this check, so each still needs one when its wait ends.
+	sort.SliceStable(missing, func(i, j int) bool {
+		ei := now.Sub(w.unknownSince[missing[i].Path]) >= 2*cl.grace
+		ej := now.Sub(w.unknownSince[missing[j].Path]) >= 2*cl.grace
+		if ei != ej {
+			return ei
+		}
+		return w.lastProbed[missing[i].Path].Before(w.lastProbed[missing[j].Path])
+	})
+	deadline := now.Add(unpulledCheckBudget)
+	vanished := false
 	for i, f := range missing {
-		if i >= maxUnpulledProbesPerPass {
+		if i >= maxUnpulledProbesPerPass || (i > 0 && cl.now().After(deadline)) {
 			break
 		}
+		w.lastProbed[f.Path] = now
 		switch cl.locate(ctx, fsm, f, probe) {
 		case probeHas:
-			delete(w.unknownSince, f.Path) // the puller fetches it from there
+			// The puller fetches it from there; should it still be missing
+			// here later, its wait starts over.
+			w.unknownSince[f.Path] = now
 		case probeAbsent:
-			cl.vanish(ctx, fsm, k, f, probeAbsent)
+			vanished = cl.vanish(ctx, fsm, k, f, probeAbsent) || vanished
 		default:
-			since, ok := w.unknownSince[f.Path]
-			if !ok {
-				w.unknownSince[f.Path] = now
-			} else if now.Sub(since) >= 2*cl.grace {
-				cl.vanish(ctx, fsm, k, f, probeUnknown)
+			if now.Sub(w.unknownSince[f.Path]) >= 2*cl.grace {
+				vanished = cl.vanish(ctx, fsm, k, f, probeUnknown) || vanished
 			}
 		}
+	}
+	if vanished {
+		// The next check runs as soon as the files published again are
+		// registered, not unpulledEvery later (#1269).
+		w.unpulledAt = time.Time{}
+		w.justVanished = true
 	}
 	return false
 }
@@ -174,18 +212,19 @@ func (cl *claimant) locate(ctx context.Context, fsm *raft.ClusterFSM, f raft.Fil
 	return probeAbsent
 }
 
-// vanish deletes f from the manifest as vanished.
-func (cl *claimant) vanish(ctx context.Context, fsm *raft.ClusterFSM, k raft.StreamClaim, f raft.FileEntry, ans probeAnswer) {
+// vanish deletes f from the manifest as vanished; reports whether it did.
+func (cl *claimant) vanish(ctx context.Context, fsm *raft.ClusterFSM, k raft.StreamClaim, f raft.FileEntry, ans probeAnswer) bool {
 	if cur, ok := fsm.GetFile(f.Path); !ok || cur.SHA256 != f.SHA256 || cur.SizeBytes != f.SizeBytes {
-		return
+		return false
 	}
 	if err := cl.c.DeleteFileFromManifest(ctx, f.Path, raft.DeleteReasonVanished); err != nil {
 		cl.logger.Warn().Err(err).Str("path", f.Path).Msg("Removing a file no node holds from the manifest failed; retrying")
-		return
+		return false
 	}
 	cl.logger.Warn().Str("path", f.Path).Str("origin", k.Origin).Str("instance", fmt.Sprintf("%016x", k.Instance)).
 		Bool("unanswered", ans == probeUnknown).
 		Msg("A registered file of a writer that is gone is on no node; it was removed from the manifest and its rows are published again from the standby copy")
+	return true
 }
 
 // probeFile asks the peer at addr whether it holds e: a fetch at the end of
