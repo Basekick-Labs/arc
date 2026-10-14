@@ -762,7 +762,12 @@ type ClusterConfig struct {
 
 	// Request routing configuration (Phase 3)
 	RouteTimeout int // Timeout for forwarded requests in milliseconds (default: 5000)
-	RouteRetries int // Number of retries for failed forwards (default: 3)
+	// WriteForwardTimeoutMs bounds one write forwarded to a writer, upload
+	// and processing included (default 60000). Forwarded writes are never
+	// retried once sent (#1270); a write that times out after being sent is
+	// answered 504 (it may have been written).
+	WriteForwardTimeoutMs int
+	RouteRetries          int // Number of retries for failed forwards (default: 3)
 
 	// Replication configuration (Phase 3.3). ReplicationEnabled starts peer file
 	// replication; the live WAL replication stream is not started (#888, #1207).
@@ -1253,8 +1258,9 @@ func Load() (*Config, error) {
 			RaftSnapshotThreshold: v.GetInt("cluster.raft_snapshot_threshold"),
 			RaftPreVote:           v.GetBool("cluster.raft_pre_vote"),
 			// Routing configuration
-			RouteTimeout: v.GetInt("cluster.route_timeout"),
-			RouteRetries: v.GetInt("cluster.route_retries"),
+			RouteTimeout:          v.GetInt("cluster.route_timeout"),
+			WriteForwardTimeoutMs: v.GetInt("cluster.write_forward_timeout_ms"),
+			RouteRetries:          v.GetInt("cluster.route_retries"),
 			// Replication configuration
 			ReplicationEnabled:     v.GetBool("cluster.replication_enabled"),
 			ReplicationLagLimit:    v.GetInt("cluster.replication_lag_limit"),
@@ -2043,8 +2049,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.raft_pre_vote", true)            // #1272; see Cluster.RaftPreVote
 
 	// Request routing defaults (Phase 3)
-	v.SetDefault("cluster.route_timeout", 5000) // 5 second timeout for forwards
-	v.SetDefault("cluster.route_retries", 3)    // 3 retries for failed forwards
+	v.SetDefault("cluster.route_timeout", 5000)             // 5 second timeout for forwards
+	v.SetDefault("cluster.write_forward_timeout_ms", 60000) // #1270; see Cluster.WriteForwardTimeoutMs
+	v.SetDefault("cluster.route_retries", 3)                // 3 retries for failed forwards
 
 	// WAL Replication defaults (Phase 3.3)
 	v.SetDefault("cluster.replication_enabled", false)     // Disabled by default
