@@ -245,6 +245,10 @@ type Config struct {
 	// later and can be absent entirely, so the return value — not the hook
 	// being non-nil — is what tier_registered counts.
 	RecordPulledFile func(path string, sizeBytes int64) bool
+	// ObserveListed, when set, sees every entry the catch-up and periodic
+	// reconciliation walks visit (the stale-local sweep records the ones
+	// present here, #1071). Runs inline in the walk: it must be cheap.
+	ObserveListed func(entry *raft.FileEntry)
 
 	// RecordAbandonedFile, when set, is called for a file this node had just
 	// finished pulling when it found the path gone from the manifest and

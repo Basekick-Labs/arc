@@ -537,3 +537,20 @@ func TestPeriodicReconciliationStopsOnCancellation(t *testing.T) {
 		t.Fatal("Puller.Stop did not cancel periodic reconciliation")
 	}
 }
+
+// The walks show every entry they visit to ObserveListed (#1071).
+func TestWalkObservesListedEntries(t *testing.T) {
+	p := newTestPuller(t, newFakeBackend(), newRepeatingFetcher([]byte("x")),
+		staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
+	var seen []string
+	p.cfg.ObserveListed = func(e *raft.FileEntry) { seen = append(seen, e.Path) }
+	p.Start(context.Background())
+	defer p.Stop()
+	entry := makeEntry("testdb/cpu/observed.parquet", "writer-1", 1)
+	p.RunCatchUp(context.Background(), func(string, int) ([]*raft.FileEntry, string, error) {
+		return []*raft.FileEntry{entry}, "", nil
+	})
+	if len(seen) != 1 || seen[0] != entry.Path {
+		t.Fatalf("observed %v", seen)
+	}
+}

@@ -3084,7 +3084,8 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	// this FSM instance's state: in a running process that is the fully
 	// applied manifest; after a restart it is the local snapshot hashicorp/raft
 	// loaded, so files registered after that snapshot and deleted during the
-	// outage are not in either map and are left to the orphan sweep (#1071).
+	// outage are not in either map; the coordinator's stale-local sweep
+	// removes those (#1071).
 	var removedFiles []string
 	for path := range f.files {
 		if _, stillThere := restoredFiles[path]; !stillThere {
@@ -3344,6 +3345,14 @@ func (f *ClusterFSM) AppliedDone() uint64 { return f.applyDone.Load() }
 // AppliedStarted is the index of the last command this FSM began applying:
 // anything a reader sees is at or below it.
 func (f *ClusterFSM) AppliedStarted() uint64 { return f.applyStarted.Load() }
+
+// HasFile reports whether the manifest lists path, without copying its entry.
+func (f *ClusterFSM) HasFile(path string) bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	_, ok := f.files[path]
+	return ok
+}
 
 func (f *ClusterFSM) GetFile(path string) (*FileEntry, bool) {
 	f.mu.RLock()

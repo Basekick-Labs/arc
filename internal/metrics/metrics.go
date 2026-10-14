@@ -278,6 +278,12 @@ type Metrics struct {
 	manifestRepairDroppedTotal atomic.Int64
 	manifestRepairAdoptedTotal atomic.Int64
 	manifestRepairPending      atomic.Int64
+	// staleLocal*: the stale-local sweep's removals, tracked files and
+	// whether its breaker refused the last pass (#1071).
+	staleLocalUnlinkedTotal atomic.Int64
+	staleLocalTracked       atomic.Int64
+	staleLocalBlocked       atomic.Int64
+	staleLocalTrackingFail  atomic.Int64
 
 	// clusterLocalDeletePending is the number of manifest deletes a
 	// per-node-storage cluster node has been told about and has not yet
@@ -780,6 +786,19 @@ func (m *Metrics) IncManifestRepairAdopted() { m.manifestRepairAdoptedTotal.Add(
 // left for a later run (its read budget reached).
 func (m *Metrics) SetManifestRepairPending(n int64) { m.manifestRepairPending.Store(n) }
 
+// IncStaleLocalUnlinked counts a local copy the stale-local sweep removed.
+func (m *Metrics) IncStaleLocalUnlinked() { m.staleLocalUnlinkedTotal.Add(1) }
+
+// SetStaleLocalTracked publishes how many local files the sweep tracks.
+func (m *Metrics) SetStaleLocalTracked(n int64) { m.staleLocalTracked.Store(n) }
+
+// SetStaleLocalBlocked publishes 1 while the sweep's breaker refuses passes.
+func (m *Metrics) SetStaleLocalBlocked(n int64) { m.staleLocalBlocked.Store(n) }
+
+// SetStaleLocalTrackingFailed publishes 1 while the sweep cannot track files
+// (its journal could not be opened or written).
+func (m *Metrics) SetStaleLocalTrackingFailed(n int64) { m.staleLocalTrackingFail.Store(n) }
+
 // SetClusterLocalDeletePending publishes how many manifest deletes are still
 // waiting for a local unlink on this node.
 func (m *Metrics) SetClusterLocalDeletePending(n int64) { m.clusterLocalDeletePending.Store(n) }
@@ -1050,6 +1069,10 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"manifest_repair_dropped_total":          m.manifestRepairDroppedTotal.Load(),
 		"manifest_repair_adopted_total":          m.manifestRepairAdoptedTotal.Load(),
 		"manifest_repair_pending":                m.manifestRepairPending.Load(),
+		"stale_local_unlinked_total":             m.staleLocalUnlinkedTotal.Load(),
+		"stale_local_tracked":                    m.staleLocalTracked.Load(),
+		"stale_local_blocked":                    m.staleLocalBlocked.Load(),
+		"stale_local_tracking_failed":            m.staleLocalTrackingFail.Load(),
 		// Cluster local delete workers (per-node storage with replication)
 		"cluster_local_delete_pending":                  m.clusterLocalDeletePending.Load(),
 		"compaction_manifests_parked_unparseable_total": m.compactionManifestsParkedUnparseableTotal.Load(),
@@ -1639,6 +1662,19 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_manifest_repair_pending Compaction outputs the last cluster manifest repair left for a later run (its read budget reached). Falls to zero as the repairs after an upgrade catch up.\n"...)
 	b = append(b, "# TYPE arc_manifest_repair_pending gauge\n"...)
 	b = appendMetric(b, "arc_manifest_repair_pending", float64(m.manifestRepairPending.Load()))
+
+	b = append(b, "# HELP arc_stale_local_unlinked_total Local copies this node removed because the cluster deleted them while the node missed the delete (down, or crashed with the unlink queued).\n"...)
+	b = append(b, "# TYPE arc_stale_local_unlinked_total counter\n"...)
+	b = appendMetric(b, "arc_stale_local_unlinked_total", float64(m.staleLocalUnlinkedTotal.Load()))
+	b = append(b, "# HELP arc_stale_local_tracked Local files this node saw registered and tracks for the stale-local sweep.\n"...)
+	b = append(b, "# TYPE arc_stale_local_tracked gauge\n"...)
+	b = appendMetric(b, "arc_stale_local_tracked", float64(m.staleLocalTracked.Load()))
+	b = append(b, "# HELP arc_stale_local_blocked 1 while the stale-local sweep refuses to run because it would remove more than cluster.stale_local_sweep_max_fraction of this node's files.\n"...)
+	b = append(b, "# TYPE arc_stale_local_blocked gauge\n"...)
+	b = appendMetric(b, "arc_stale_local_blocked", float64(m.staleLocalBlocked.Load()))
+	b = append(b, "# HELP arc_stale_local_tracking_failed 1 while this node cannot track its local files for the stale-local sweep (its journal in raft_data_dir could not be opened or written); copies whose delete it misses then stay until a restart.\n"...)
+	b = append(b, "# TYPE arc_stale_local_tracking_failed gauge\n"...)
+	b = appendMetric(b, "arc_stale_local_tracking_failed", float64(m.staleLocalTrackingFail.Load()))
 
 	b = append(b, "# HELP arc_cluster_local_delete_pending Manifest deletes this per-node-storage cluster node has been told about and has not yet unlinked locally. Returns to zero within a grace period of every burst; a value that keeps climbing means the delete workers cannot keep up with retention or a compaction backlog.\n"...)
 	b = append(b, "# TYPE arc_cluster_local_delete_pending gauge\n"...)

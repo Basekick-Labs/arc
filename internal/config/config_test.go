@@ -1328,3 +1328,26 @@ func TestLoad_StreamTakeoverTimings(t *testing.T) {
 		os.Unsetenv(tc.key)
 	}
 }
+
+// A breaker fraction that is not a number above 0 is refused: NaN or 0 would
+// disable or misread the stale-local sweep's breaker (#1071).
+func TestLoad_StaleLocalSweepMaxFraction(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+	for _, v := range []string{"0", "-1", "NaN"} {
+		t.Setenv("ARC_CLUSTER_STALE_LOCAL_SWEEP_MAX_FRACTION", v)
+		if _, err := Load(); err == nil {
+			t.Fatalf("%s accepted", v)
+		}
+	}
+	t.Setenv("ARC_CLUSTER_STALE_LOCAL_SWEEP_MAX_FRACTION", "2")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Cluster.StaleLocalSweepMaxFraction != 2 || !cfg.Cluster.StaleLocalSweep {
+		t.Fatalf("%+v", cfg.Cluster)
+	}
+}

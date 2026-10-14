@@ -186,6 +186,9 @@ type Coordinator struct {
 	// pendingRegistration reports whether a path waits for registration in
 	// this writer's outbox (nil on other nodes).
 	pendingRegistration atomic.Pointer[func(string) bool]
+	// stale is the stale-local sweep (#1071), on local storage with
+	// replication.
+	stale staleLocalState
 	// catchupOnce guarantees the Phase 3 catch-up walker runs at most once
 	// per coordinator lifetime, across repeated Start/Stop cycles in tests.
 	catchupOnce sync.Once
@@ -1026,6 +1029,7 @@ func (c *Coordinator) Stop() error {
 	if deleteStop != nil {
 		c.stopDeleteWorkers(deleteStop, deleteWg)
 	}
+	c.stopStaleLocal()
 
 	if healthChecker != nil {
 		healthChecker.Stop()
@@ -1218,6 +1222,7 @@ func (c *Coordinator) tierRecorderSnapshot() TierRecorder {
 // life, while the recorder is attached later and is absent on a node without
 // tiering, so this return value is what distinguishes the two.
 func (c *Coordinator) recordPulledFileInTiering(path string, sizeBytes int64) bool {
+	c.noteLocalRegistered(path)
 	r := c.tierRecorderSnapshot()
 	if r == nil {
 		return false
@@ -1242,6 +1247,7 @@ const tierReasonAbandonedPull = "replication:abandoned"
 
 // recordAbandonedFileInTiering is the puller's RecordAbandonedFile hook.
 func (c *Coordinator) recordAbandonedFileInTiering(path string, sizeBytes int64) {
+	c.forgetLocal(path)
 	if r := c.tierRecorderSnapshot(); r != nil {
 		r.RecordUnlinkedFile(path, tierReasonAbandonedPull, sizeBytes)
 	}
@@ -1355,6 +1361,7 @@ func (c *Coordinator) unlinkOne(item deleteRequest, relisted func(string) (bool,
 		// it either, because every path to it addresses the same
 		// unusable key.
 		metrics.Get().IncStorageInvalidPathQuarantined()
+		c.forgetLocal(item.path)
 		c.logger.Error().
 			Err(err).
 			Str("path", item.path).
@@ -1371,6 +1378,7 @@ func (c *Coordinator) unlinkOne(item deleteRequest, relisted func(string) (bool,
 			Str("path", item.path).
 			Str("reason", item.reason).
 			Msg("Phase 4 local delete worker: removed local copy")
+		c.forgetLocal(item.path)
 		if wasLocal && recorder != nil {
 			// Only for a file this node actually held: the tier row for a
 			// path a node never had is not its to write, and without the stat
@@ -3107,6 +3115,10 @@ func (c *Coordinator) Status() map[string]interface{} {
 		status["stream_claims"] = c.StreamClaimsStatus()
 		status["compaction_commit"] = c.CompactionCommitStatus()
 	}
+	// The stale-local sweep's last pass (#1071), where it runs.
+	if st := c.StaleLocalStatus(); st != nil {
+		status["stale_local"] = st
+	}
 
 	// Add Raft status if configured (Phase 3)
 	if c.raftNode != nil {
@@ -4374,6 +4386,7 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// to exist before the thing it reports to does.
 		RecordPulledFile:    c.recordPulledFileInTiering,
 		RecordAbandonedFile: c.recordAbandonedFileInTiering,
+		ObserveListed:       c.observeListed,
 		Logger:              c.logger,
 	}
 
@@ -4381,6 +4394,8 @@ func (c *Coordinator) startFilePullerLocked() error {
 	if err != nil {
 		return fmt.Errorf("construct puller: %w", err)
 	}
+	verify := func(e *raft.FileEntry) { puller.EnqueueVerifyContent(e) }
+	c.stale.verifyContent.Store(&verify)
 
 	// Wire the FSM callback. applyRegisterFile fires onFileRegistered for
 	// every Raft commit — including entries from other applyRegisterFile
@@ -4415,6 +4430,7 @@ func (c *Coordinator) startFilePullerLocked() error {
 		return true, puller.EnqueueVerifyContent(entry)
 	}
 	c.startDeleteWorkers()
+	c.startStaleLocalLocked()
 
 	// CONTRACT for every FSM callback (#797, #813): they run synchronously
 	// on the Raft apply goroutine. Since #813 neither Coordinator.Stop nor
@@ -4435,9 +4451,11 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// FSM apply goroutine is on the Raft hot path. Enqueue is non-blocking
 		// (drops on full queue) so this is safe.
 		puller.Enqueue(entry)
+		c.noteLocalRegistered(entry.Path)
 	}
 	onContentChanged := func(entry *raft.FileEntry) {
 		puller.EnqueueContentChanged(entry)
+		c.noteLocalRegistered(entry.Path)
 	}
 	onDelete := func(path string, reason string) {
 		// Phase 4: the callback runs synchronously from applyDeleteFile on

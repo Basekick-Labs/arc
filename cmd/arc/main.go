@@ -2357,6 +2357,15 @@ func main() {
 						// A reader or compactor gets no registrar: nothing it
 						// flushes should be announced (#888, #1206).
 
+						// The stale-local sweep (#1071) may run from here: a
+						// path waiting to register in this writer's outbox is
+						// never a stale copy. Nil elsewhere: nothing waits.
+						if registrationOutbox != nil {
+							clusterCoordinator.SetStaleLocalPending(registrationOutbox.HoldsRegistration)
+						} else {
+							clusterCoordinator.SetStaleLocalPending(nil)
+						}
+
 						// Phase 5: wire the dynamic compaction gate to the coordinator
 						// so CanCompact() checks the FSM's active compactor lease
 						// when failover is configured.
@@ -2985,6 +2994,7 @@ func main() {
 			Index:        hubIndex,
 			Logger:       logger.Get("edgesync"),
 			RegisterFile: registerFile,
+			HoldPath:     edgeSyncHoldPath(clusterCoordinator),
 			RecordActivity: func(ctx context.Context, spokeID string, files, bytes int64) {
 				// Best-effort: a failed counter update must not fail a
 				// verified transfer, so this logs and returns.
@@ -3100,6 +3110,7 @@ func main() {
 				Index:        hubIndex,
 				Logger:       importLogger,
 				RegisterFile: collector.Register,
+				HoldPath:     edgeSyncHoldPath(clusterCoordinator),
 				RecordActivity: func(ctx context.Context, spokeID string, files, bytes int64) {
 					if err := spokeRegistry.RecordActivity(ctx, spokeID, files, bytes); err != nil {
 						importLogger.Warn().Err(err).Str("spoke_id", spokeID).
@@ -3158,6 +3169,7 @@ func main() {
 				HubID:         cfg.EdgeSync.HubID,
 				MaxFiles:      cfg.EdgeSync.Import.MaxFiles,
 				FlushManifest: flushManifest,
+				HoldPaths:     edgeSyncHoldPaths(clusterCoordinator),
 				Logger:        importLogger,
 			})
 			if err != nil {
@@ -4625,13 +4637,11 @@ func main() {
 	// Register Tiering API handlers (always register, handlers check if manager is nil)
 	if tieringManager != nil {
 		if clusterCoordinator != nil {
-			// The manifest repair never registers a path tiering records
-			// as cold: a hot copy it failed to delete (#1207).
-			meta := tieringManager.GetMetadata()
-			clusterCoordinator.SetColdPathCheck(func(ctx context.Context, path string) bool {
-				f, err := meta.GetFile(ctx, path)
-				return err == nil && f != nil && f.Tier == tiering.TierCold
-			})
+			// The manifest repair never registers, and the stale-local
+			// sweep never removes, a path tiering records as cold: a hot
+			// copy its delete missed (#1207, #1071). A metadata error
+			// answers cold: both then leave the path alone.
+			clusterCoordinator.SetColdPathCheck(tierColdCheck(tieringManager.GetMetadata().GetFile))
 		}
 		if retentionHandler != nil {
 			retentionHandler.SetTieringManager(tieringManager)
@@ -5961,5 +5971,31 @@ func applyManifestBatchWithRetry(ctx context.Context, apply func(context.Context
 			return err
 		case <-timer.C:
 		}
+	}
+}
+
+// edgeSyncHoldPath keeps a cluster node's stale-local sweep away from a path
+// edge sync is about to register (#1071); nil without a coordinator.
+func edgeSyncHoldPath(c *cluster.Coordinator) func(string) func() {
+	if c == nil {
+		return nil
+	}
+	return func(path string) func() { return c.HoldLocalPaths([]string{path}) }
+}
+
+// edgeSyncHoldPaths is edgeSyncHoldPath for a whole bundle import.
+func edgeSyncHoldPaths(c *cluster.Coordinator) func([]string) func() {
+	if c == nil {
+		return nil
+	}
+	return c.HoldLocalPaths
+}
+
+// tierColdCheck answers whether tiering records path as cold on this node; a
+// metadata error answers cold, so callers leave the path alone.
+func tierColdCheck(get func(ctx context.Context, path string) (*tiering.FileMetadata, error)) func(context.Context, string) bool {
+	return func(ctx context.Context, path string) bool {
+		f, err := get(ctx, path)
+		return err != nil || (f != nil && f.Tier == tiering.TierCold)
 	}
 }
