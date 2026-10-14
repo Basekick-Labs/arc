@@ -501,6 +501,7 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 			HeartbeatTimeout:  time.Duration(cfg.Config.RaftHeartbeatTimeout) * time.Millisecond,
 			SnapshotInterval:  time.Duration(cfg.Config.RaftSnapshotInterval) * time.Second,
 			SnapshotThreshold: uint64(cfg.Config.RaftSnapshotThreshold),
+			PreVoteDisabled:   !cfg.Config.RaftPreVote,
 			Logger:            cfg.Logger,
 			TLSConfig:         tlsCfg,
 			SharedSecret:      cfg.Config.SharedSecret,
@@ -517,6 +518,7 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 			Str("raft_data_dir", cfg.Config.RaftDataDir).
 			Str("raft_bind_addr", cfg.Config.RaftBindAddr).
 			Bool("raft_bootstrap", cfg.Config.RaftBootstrap).
+			Bool("raft_pre_vote", cfg.Config.RaftPreVote).
 			Msg("Raft consensus initialized")
 	}
 

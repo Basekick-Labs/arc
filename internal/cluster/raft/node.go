@@ -43,6 +43,12 @@ type NodeConfig struct {
 	SnapshotThreshold uint64
 	TrailingLogs      uint64
 
+	// PreVoteDisabled turns off the Raft pre-vote round (#1272). Off by
+	// default (pre-vote runs): a node that cannot hear the leader then keeps
+	// its term instead of raising it on every election timeout and forcing
+	// the leader to step down when it reaches it again.
+	PreVoteDisabled bool
+
 	Logger zerolog.Logger
 
 	// TLSConfig for encrypted Raft transport (nil = plain TCP)
@@ -152,6 +158,7 @@ func (n *Node) Start() error {
 
 	// Use zerolog adapter for raft's internal logging
 	raftConfig.Logger = newZerologAdapter(n.logger, "raft")
+	raftConfig.PreVoteDisabled = n.cfg.PreVoteDisabled
 
 	// Only override non-zero values to preserve sensible defaults
 	if n.cfg.ElectionTimeout > 0 {

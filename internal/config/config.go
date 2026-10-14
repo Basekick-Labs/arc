@@ -753,6 +753,12 @@ type ClusterConfig struct {
 	RaftHeartbeatTimeout  int    // Raft heartbeat timeout in milliseconds (default: 500)
 	RaftSnapshotInterval  int    // Snapshot interval in seconds (default: 300)
 	RaftSnapshotThreshold int    // Number of logs before snapshot (default: 10000)
+	// RaftPreVote runs the Raft pre-vote round before an election (#1272): a
+	// writer that cannot hear the leader no longer raises its term and makes
+	// the healthy leader step down when it reaches it. Default true. Set false
+	// while rolling a cluster up from a release before 27.01.1, whose nodes do
+	// not answer pre-vote (see the upgrade notes).
+	RaftPreVote bool
 
 	// Request routing configuration (Phase 3)
 	RouteTimeout int // Timeout for forwarded requests in milliseconds (default: 5000)
@@ -1245,6 +1251,7 @@ func Load() (*Config, error) {
 			RaftHeartbeatTimeout:  v.GetInt("cluster.raft_heartbeat_timeout"),
 			RaftSnapshotInterval:  v.GetInt("cluster.raft_snapshot_interval"),
 			RaftSnapshotThreshold: v.GetInt("cluster.raft_snapshot_threshold"),
+			RaftPreVote:           v.GetBool("cluster.raft_pre_vote"),
 			// Routing configuration
 			RouteTimeout: v.GetInt("cluster.route_timeout"),
 			RouteRetries: v.GetInt("cluster.route_retries"),
@@ -2033,6 +2040,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.raft_heartbeat_timeout", 500)    // 500ms heartbeat timeout
 	v.SetDefault("cluster.raft_snapshot_interval", 300)    // 5 minutes snapshot interval
 	v.SetDefault("cluster.raft_snapshot_threshold", 10000) // 10k logs before snapshot
+	v.SetDefault("cluster.raft_pre_vote", true)            // #1272; see Cluster.RaftPreVote
 
 	// Request routing defaults (Phase 3)
 	v.SetDefault("cluster.route_timeout", 5000) // 5 second timeout for forwards
