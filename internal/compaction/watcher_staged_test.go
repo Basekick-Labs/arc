@@ -28,6 +28,9 @@ type fakeCommitter struct {
 	held       map[string]bool
 	own        []string
 	calls      []string
+	// afterStage: the status once a stage applies (a commit by an earlier
+	// run of this job).
+	afterStage *StagedStatus
 }
 
 func (f *fakeCommitter) Stage(_ context.Context, job StagedJob) (StagedOutcome, error) {
@@ -35,12 +38,15 @@ func (f *fakeCommitter) Stage(_ context.Context, job StagedJob) (StagedOutcome, 
 	if f.stageOut == StagedOK {
 		f.status.Staged = true
 	}
+	if f.afterStage != nil {
+		f.status = *f.afterStage
+	}
 	return f.stageOut, errors.New("stage answer")
 }
 func (f *fakeCommitter) Commit(_ context.Context, job StagedJob) (StagedOutcome, error) {
 	f.calls = append(f.calls, "commit "+job.JobID)
 	if f.commitOut == StagedOK || f.commitOut == StagedCommitted {
-		f.status = StagedStatus{Committed: true}
+		f.status = StagedStatus{Committed: true, Finalizing: job.Object}
 		for _, in := range job.Inputs {
 			delete(f.registered, in.Path)
 		}

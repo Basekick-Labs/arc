@@ -111,6 +111,15 @@ func (h *DeleteHandler) scanSet(ctx context.Context, database, measurement strin
 				kept = append(kept, f)
 				continue
 			}
+			if so, shared := sharedObjectStore(h.coordinator); shared {
+				// What a query reads (#1207): an adopted compaction output,
+				// or an object no manifest change covers.
+				if h.sharedUnlisted(so, f.relativePath) {
+					shas[f.relativePath] = unmanagedSHA
+					kept = append(kept, f)
+					continue
+				}
+			}
 			skipped = append(skipped, f.relativePath)
 			continue
 		}
@@ -135,6 +144,7 @@ func (h *DeleteHandler) scanSet(ctx context.Context, database, measurement strin
 	// by now, or waited for.
 	deadline := time.Now().Add(deleteLocalWait)
 	found := make(map[string]bool)
+	so, shared := sharedObjectStore(h.coordinator)
 	var absent []string
 	for {
 		absent = absent[:0]
@@ -143,9 +153,17 @@ func (h *DeleteHandler) scanSet(ctx context.Context, database, measurement strin
 			if inListing[path] || found[path] || !strings.HasSuffix(strings.ToLower(path), ".parquet") {
 				continue
 			}
+			// Held first: an output copied into place and ended between a
+			// stat and the check would read as gone.
+			held := shared && so.CompactionOutputHeld(path)
 			size, err := h.storage.StatFile(ctx, path)
 			if err != nil {
 				return nil, nil, nil, fmt.Errorf("failed to check %s: %w", path, err)
+			}
+			if size < 0 && shared && !held {
+				// Gone from the shared store: no node will ever have it.
+				found[path] = true
+				continue
 			}
 			if size != e.SizeBytes {
 				absent = append(absent, path)
@@ -206,4 +224,65 @@ func (h *DeleteHandler) rescanAfterChange(ctx context.Context, database, measure
 // isContextErr: the request was cancelled or timed out (retryable).
 func isContextErr(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// sharedObjectScanner is the coordinator on a shared object store (#1207):
+// every node reads one bucket, so what a query reads is the listing, and a
+// manifest entry whose object is gone is gone rather than not here yet.
+type sharedObjectScanner interface {
+	SharedObjectStore() bool
+	// ManifestAdoption: objects the manifest does not list may be
+	// registered (the rewrite of one a DELETE scanned).
+	ManifestAdoption() bool
+	CompactionOwns(path string) bool
+	CompactionOutputHeld(path string) bool
+	AdoptRewrite(ctx context.Context, path string, size int64, sha string) (raft.FileEntry, error)
+}
+
+// sharedObjectStore returns the coordinator as a sharedObjectScanner when
+// the cluster is on a shared object store with compaction commit on.
+func sharedObjectStore(coord any) (sharedObjectScanner, bool) {
+	so, ok := coord.(sharedObjectScanner)
+	if !ok || !casActive(coord) || !so.SharedObjectStore() {
+		return nil, false
+	}
+	return so, true
+}
+
+// unmanagedSHA marks a scanned file no manifest entry covers (on a shared
+// object store): its rewrite is registered as a new file, its removal
+// leaves the manifest alone.
+const unmanagedSHA = "unmanaged"
+
+// sharedUnlisted reports whether a DELETE scans an object of the listing the
+// manifest does not list, on a shared object store, where queries read it:
+// not a staged compaction's input (its rows are in the output, which the
+// DELETE scans, and its finisher removes it), and only where its rewrite can
+// be registered (else the rewrite would be an orphan the reconciler removes).
+// The repair registers compaction outputs the manifest lost; a DELETE never
+// does (it would read them whole before its limits are checked).
+func (h *DeleteHandler) sharedUnlisted(so sharedObjectScanner, path string) bool {
+	return so.ManifestAdoption() && !so.CompactionOwns(path)
+}
+
+// finalizingInputs is the coordinator's view of a committed object-store
+// compaction whose output a DELETE just removed (#1207 d2a2b).
+type finalizingInputs interface {
+	FinalizingObjectInputs(path string) []string
+}
+
+// dropFinalizingInputs removes the input objects of the committed compaction
+// whose output path this DELETE rewrote or deleted: they hold the same rows,
+// unregistered, and reads glob them until the job's finisher removes them.
+func (h *DeleteHandler) dropFinalizingInputs(ctx context.Context, path string) {
+	f, ok := h.coordinator.(finalizingInputs)
+	if !ok || !casActive(h.coordinator) {
+		return
+	}
+	for _, in := range f.FinalizingObjectInputs(path) {
+		if err := h.storage.Delete(ctx, in); err != nil {
+			h.logger.Warn().Err(err).Str("file", in).Str("output", path).
+				Msg("Could not remove an input of the compaction whose output the delete replaced; its finisher removes it")
+		}
+	}
 }

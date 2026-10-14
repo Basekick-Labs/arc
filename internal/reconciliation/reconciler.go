@@ -306,8 +306,10 @@ type Run struct {
 	// SkippedPending counts orphan-storage candidates kept because this node
 	// flushed them and the manifest has not confirmed them yet (#1212).
 	SkippedPending int `json:"skipped_pending"`
-	// SkippedHeld counts orphan-manifest candidates kept because the file
-	// is moving into place here (a committed compaction output).
+	// SkippedHeld counts candidates a compaction commit still holds:
+	// orphan-manifest entries whose file is moving into place (a committed
+	// compaction output), and orphan-storage files a staged compaction owns
+	// (#1207 d2a2b).
 	SkippedHeld int `json:"skipped_held,omitempty"`
 
 	// SkippedTransient counts entries a sweep passed over because a storage
@@ -377,6 +379,10 @@ type Reconciler struct {
 	// (#1207 d2a2a): a committed compaction output still moving into place
 	// from its staged copy. Not an orphan.
 	isHeld atomic.Pointer[func(string) bool]
+	// isOwned reports a file a staged compaction owns: the input objects of
+	// a committed object-store job are unregistered but still the data until
+	// its finisher puts the output in place (#1207 d2a2b).
+	isOwned atomic.Pointer[func(string) bool]
 
 	// History is a small fixed-size ring buffer of recent runs. All
 	// access goes through mu. Layout: history is allocated to
@@ -407,6 +413,12 @@ func (r *Reconciler) SetPendingFilter(fn func(path string) bool) {
 // out of the orphan-manifest sweep (#1207 d2a2a).
 func (r *Reconciler) SetHeldFilter(fn func(path string) bool) {
 	r.isHeld.Store(&fn)
+}
+
+// SetCompactionOwnedFilter keeps files a staged compaction owns out of the
+// orphan-storage sweep (#1207 d2a2b).
+func (r *Reconciler) SetCompactionOwnedFilter(fn func(path string) bool) {
+	r.isOwned.Store(&fn)
 }
 
 func NewReconciler(

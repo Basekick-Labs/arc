@@ -1683,9 +1683,11 @@ func main() {
 	}
 	// Phase 4: completion-manifest directory used by the cluster-mode
 	// subprocess → parent handoff. Empty in OSS (nil gate is what disables
-	// the handoff inside job.go via clusterMode()). Populated only when
-	// clustering + peer replication are BOTH enabled — that's when readers
-	// actually need the Raft manifest update to pull the compacted file.
+	// the handoff inside job.go via clusterMode()). Set on every cluster
+	// node (completionDirFor): the watcher keeps the Raft manifest in step
+	// with compaction, which readers pulling the compacted file need under
+	// replication, and the DELETE scan set and the staged compaction commit
+	// need on shared storage too (#1207).
 	//
 	// Security: explicitly create the base TempDirectory with 0700 perms
 	// BEFORE the inner .completion/pending subdirs. os.MkdirAll would
@@ -1693,17 +1695,10 @@ func main() {
 	// letting a co-located attacker inject completion manifests before the
 	// inner dir's 0700 closes the window. This is a no-op when the dir
 	// already exists with correct perms.
-	completionDir := ""
-	if cfg.Cluster.Enabled && cfg.Cluster.ReplicationEnabled {
+	completionDir := completionDirFor(cfg)
+	if completionDir != "" {
 		if err := os.MkdirAll(cfg.Compaction.TempDirectory, 0o700); err != nil {
 			log.Fatal().Err(err).Str("dir", cfg.Compaction.TempDirectory).Msg("Failed to create compaction temp directory with 0700 perms")
-		}
-		// Honor an explicit compaction.completion_dir override if set;
-		// otherwise derive under {temp_directory}/.completion/pending.
-		if cfg.Compaction.CompletionDir != "" {
-			completionDir = cfg.Compaction.CompletionDir
-		} else {
-			completionDir = filepath.Join(cfg.Compaction.TempDirectory, ".completion", "pending")
 		}
 	}
 	if cfg.Compaction.Enabled {
@@ -2115,6 +2110,7 @@ func main() {
 							completionWatcher = watcher
 							if compactionManager != nil {
 								watcher.SetStagedObservers(compactionManager.BeforeStagedCommit, compactionManager.FinishStaged)
+								watcher.SetStagedFinished(compactionManager.StagedFinished)
 								compactionManager.SetStagedCommit(clusterCoordinator.StagedCompactionMode,
 									clusterCoordinator.CompactionInputLookup, watcher.LocallyStagedInput)
 							}
@@ -4243,6 +4239,7 @@ func main() {
 			// A committed compaction output moving into place here is not an
 			// orphan entry (#1207 d2a2a).
 			reconciler.SetHeldFilter(clusterCoordinator.CompactionOutputHeld)
+			reconciler.SetCompactionOwnedFilter(clusterCoordinator.CompactionOwns)
 		}
 		if err != nil {
 			log.Error().Err(err).Msg("Failed to create reconciler — feature disabled")
@@ -4627,6 +4624,15 @@ func main() {
 
 	// Register Tiering API handlers (always register, handlers check if manager is nil)
 	if tieringManager != nil {
+		if clusterCoordinator != nil {
+			// The manifest repair never registers a path tiering records
+			// as cold: a hot copy it failed to delete (#1207).
+			meta := tieringManager.GetMetadata()
+			clusterCoordinator.SetColdPathCheck(func(ctx context.Context, path string) bool {
+				f, err := meta.GetFile(ctx, path)
+				return err == nil && f != nil && f.Tier == tiering.TierCold
+			})
+		}
 		if retentionHandler != nil {
 			retentionHandler.SetTieringManager(tieringManager)
 		}
@@ -5319,6 +5325,22 @@ func licenseHasClustering(lc *license.Client) bool {
 	return lic != nil && lic.HasFeature(license.FeatureClustering)
 }
 
+// completionDirFor is the compaction completion-manifest directory of a
+// cluster node, "" outside a cluster. Every cluster node gets one, whatever
+// its storage: until #1207 only replication did, so on shared storage no
+// watcher ran and compaction never updated the cluster manifest (outputs
+// unregistered, consumed inputs still listed). An explicit
+// compaction.completion_dir wins over {temp_directory}/.completion/pending.
+func completionDirFor(cfg *config.Config) string {
+	if !cfg.Cluster.Enabled {
+		return ""
+	}
+	if cfg.Compaction.CompletionDir != "" {
+		return cfg.Compaction.CompletionDir
+	}
+	return filepath.Join(cfg.Compaction.TempDirectory, ".completion", "pending")
+}
+
 // newRegistrationOutbox builds the outbox that announces this node's flushed
 // files to the cluster manifest (#1206, #1209), or returns nil where nothing
 // would ever drain it: no cluster, no clustering licence, or no Raft manifest.
@@ -5449,6 +5471,10 @@ func (a *tieringManifestAdapter) ManifestEntriesByDatabase(database string) []st
 		}
 	}
 	return paths
+}
+
+func (a *tieringManifestAdapter) CompactionOwns(path string) bool {
+	return a.coordinator.CompactionOwns(path)
 }
 
 func (a *tieringManifestAdapter) ManifestEntry(path string) (int64, bool) {
@@ -5668,6 +5694,16 @@ type backupClusterManifest struct {
 	coordinator *cluster.Coordinator
 }
 
+// StagedOutputKey and CompactionOwns: committed object-store compactions
+// (#1207 d2a2b), see backup.StagedOutputs.
+func (b *backupClusterManifest) StagedOutputKey(path string) (string, bool) {
+	return b.coordinator.StagedOutputKey(path)
+}
+
+func (b *backupClusterManifest) CompactionOwns(path string) bool {
+	return b.coordinator.CompactionOwns(path)
+}
+
 // errNoRaftManifest is returned by every write when the coordinator has no
 // Raft manifest, instead of the coordinator's own nil-success.
 var errNoRaftManifest = errors.New("cluster coordinator has no Raft file manifest (cluster.raft_data_dir unset)")
@@ -5732,7 +5768,13 @@ func (b *backupClusterManifest) PauseCompaction(ctx context.Context, reason stri
 // commits go through a watcher) and the watcher is nil, its construction
 // failed: the node then NEVER reports idle, because nothing can tell whether
 // a phase-2 commit is pending, and the restore times out naming it.
-func newCompactionQuiescer(coordinator *cluster.Coordinator, manager *compaction.Manager, watcher *compaction.CompletionWatcher, expectWatcher bool, logger zerolog.Logger) func(ctx context.Context) error {
+// quiescerCluster is the coordinator's side of the quiescer.
+type quiescerCluster interface {
+	CompactionPaused() bool
+	FinalizingCompactions() int
+}
+
+func newCompactionQuiescer(coordinator quiescerCluster, manager *compaction.Manager, watcher *compaction.CompletionWatcher, expectWatcher bool, logger zerolog.Logger) func(ctx context.Context) error {
 	return func(ctx context.Context) error {
 		if expectWatcher && watcher == nil {
 			return errors.New("compaction completion watcher not available on this node, so its pending compaction commits cannot be checked; the node will not acknowledge the pause")
@@ -5745,6 +5787,12 @@ func newCompactionQuiescer(coordinator *cluster.Coordinator, manager *compaction
 				return errors.New("the compaction pause ended before this node quiesced")
 			}
 			idle := manager == nil || !manager.IsCycleRunning()
+			// A committed object-store compaction drains through the pause:
+			// its finisher deletes input objects a restore may bring back
+			// (#1207 d2a2b). Any node's job counts, its compactor may be gone.
+			if idle && coordinator != nil && coordinator.FinalizingCompactions() > 0 {
+				idle = false
+			}
 			if idle {
 				if w := watcher; w != nil {
 					sourcesDeleted, outputWritten, err := w.PendingCommits()
@@ -5769,6 +5817,9 @@ func newCompactionQuiescer(coordinator *cluster.Coordinator, manager *compaction
 				detail := "a compaction cycle is still running"
 				if manager == nil || !manager.IsCycleRunning() {
 					detail = "sources_deleted completion manifests are still pending"
+					if coordinator != nil && coordinator.FinalizingCompactions() > 0 {
+						detail = "committed compactions are still being finished"
+					}
 				}
 				return fmt.Errorf("compaction did not quiesce before the deadline (%s): %w", detail, ctx.Err())
 			case <-ticker.C:

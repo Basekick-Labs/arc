@@ -95,7 +95,7 @@ func (b *CompactionBridge) RegisterCompactedFile(ctx context.Context, file compa
 		// routes replicas' pulls back to us. The FSM's applyRegisterFile
 		// stamps LSN from the Raft log index; we leave it zero.
 		OriginNodeID: b.coord.LocalNodeID(),
-		Tier:         file.Tier,
+		Tier:         "hot", // the storage tier; file.Tier names the compaction tier
 		CreatedAt:    file.CreatedAt,
 	}
 
@@ -179,7 +179,7 @@ func (b *CompactionBridge) BatchFileOps(ctx context.Context, registers []compact
 			Measurement:   file.Measurement,
 			PartitionTime: file.PartitionTime,
 			OriginNodeID:  b.coord.LocalNodeID(),
-			Tier:          file.Tier,
+			Tier:          "hot", // the storage tier; file.Tier names the compaction tier
 			CreatedAt:     file.CreatedAt,
 		}})
 		if err != nil {

@@ -253,6 +253,11 @@ func (b *S3Backend) Write(ctx context.Context, path string, data []byte) error {
 // (ErrBodyLength on a mismatch, nothing committed), and the source must end
 // — EOF or error — once the declared bytes have been read.
 func (b *S3Backend) WriteReader(ctx context.Context, path string, reader io.Reader, size int64) error {
+	return b.writeReader(ctx, path, reader, size, nil)
+}
+
+// writeReader is WriteReader with user metadata on the object (nil: none).
+func (b *S3Backend) writeReader(ctx context.Context, path string, reader io.Reader, size int64, meta map[string]string) error {
 	key, err := b.prefixedKey(path)
 	if err != nil {
 		return err
@@ -272,9 +277,9 @@ func (b *S3Backend) WriteReader(ctx context.Context, path string, reader io.Read
 		if !seekable && size > 0 {
 			reader = &exactLengthReader{ctx: ctx, r: reader, want: size}
 		}
-		return b.writeMultipart(ctx, path, reader, size, contentType, start)
+		return b.writeMultipart(ctx, path, reader, size, contentType, start, meta)
 	case !seekable && size > multipartPartSize:
-		return b.writeMultipart(ctx, path, &exactLengthReader{ctx: ctx, r: reader, want: size}, size, contentType, start)
+		return b.writeMultipart(ctx, path, &exactLengthReader{ctx: ctx, r: reader, want: size}, size, contentType, start, meta)
 	case !seekable:
 		// The request never leaves the process if the body is wrong, so this
 		// is the caller's error, not a storage error: not counted, and not
@@ -294,6 +299,7 @@ func (b *S3Backend) WriteReader(ctx context.Context, path string, reader io.Read
 		Body:          reader,
 		ContentLength: aws.Int64(size),
 		ContentType:   aws.String(contentType),
+		Metadata:      meta,
 	})
 	if err != nil {
 		recordStorageError(ctx, err)
@@ -325,7 +331,7 @@ func (b *S3Backend) WriteReader(ctx context.Context, path string, reader io.Read
 // A failed multipart upload is aborted, but only while ctx is live — a
 // cancelled context leaves parts behind, so a bucket that receives these
 // should carry an AbortIncompleteMultipartUpload lifecycle rule.
-func (b *S3Backend) writeMultipart(ctx context.Context, path string, reader io.Reader, size int64, contentType string, start time.Time) error {
+func (b *S3Backend) writeMultipart(ctx context.Context, path string, reader io.Reader, size int64, contentType string, start time.Time, meta map[string]string) error {
 	key, err := b.prefixedKey(path)
 	if err != nil {
 		return err
@@ -335,6 +341,7 @@ func (b *S3Backend) writeMultipart(ctx context.Context, path string, reader io.R
 		Key:         aws.String(key),
 		Body:        reader,
 		ContentType: aws.String(contentType),
+		Metadata:    meta,
 	})
 	if err != nil {
 		// A length mismatch is the caller's error, counted and logged the

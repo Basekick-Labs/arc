@@ -883,3 +883,57 @@ func mustJSON(t *testing.T, v any) []byte {
 	}
 	return raw
 }
+
+// FinalizingObjectInputs as the coordinator answers it (#1207 d2a2b).
+func (c *fsmCoordinator) FinalizingObjectInputs(path string) []string {
+	var out []string
+	for _, s := range c.fsm.StagedCompactions() {
+		if !s.Object || !s.Finalizing || s.Output.Path != path {
+			continue
+		}
+		for _, in := range s.Inputs {
+			if _, reg := c.fsm.GetFile(in.Path); !reg {
+				out = append(out, in.Path)
+			}
+		}
+	}
+	return out
+}
+
+// A DELETE that rewrites the output of a committed object-store compaction
+// removes that job's input objects at once: they hold the rows it deleted,
+// unregistered, and reads glob them until the finisher runs (#1207 d2a2b).
+func TestDeleteRemovesTheInputsOfAFinalizingOutput(t *testing.T) {
+	c, h, root := casCluster(t, casA, casB)
+	e, _ := c.fsm.GetFile(casA)
+	writeRecordsParquet(t, c.db, root, casO)
+	oe := casEntry(t, root, casO)
+	if err := c.apply(raft.CommandStageCompaction, raft.StageCompactionPayload{Job: "j1", Origin: "w2", Output: oe, Object: true,
+		Inputs: []raft.CompactionInput{{Path: casA, SizeBytes: e.SizeBytes, SHA256: e.SHA256}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.apply(raft.CommandCommitCompaction, raft.CommitCompactionPayload{Job: "j1", Origin: "w2", Output: casO, SHA256: oe.SHA256}); err != nil {
+		t.Fatal(err)
+	}
+	code, out, raw := sendDelete(t, h, `{"database":"db","measurement":"cpu","where":"host = 'h1'","confirm":true}`)
+	if code != 200 || out.DeletedCount != 4 {
+		t.Fatalf("%d %s", code, raw)
+	}
+	if _, err := os.Stat(filepath.Join(root, casA)); !os.IsNotExist(err) {
+		t.Fatalf("input of the rewritten output kept: %v", err)
+	}
+	// Without a finalizing job behind it, a rewrite removes only its source.
+	if ins := c.FinalizingObjectInputs(casB); len(ins) != 0 {
+		t.Fatalf("inputs for an ordinary file: %v", ins)
+	}
+}
+
+// The delete reasons this package stamps on removals that account for a
+// compaction output's rows are the ones the finisher trusts (#1207 d2a2b).
+func TestOutputGoneAccountedReasons(t *testing.T) {
+	for _, r := range []string{deleteManifestReason, deleteRewriteManifestReason, databaseDeleteManifestReason, retentionManifestReason(7), retentionManifestReason(int64(9))} {
+		if !raft.OutputGoneAccounted(r) {
+			t.Fatalf("%q not accounted", r)
+		}
+	}
+}

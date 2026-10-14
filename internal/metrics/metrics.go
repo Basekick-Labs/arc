@@ -264,6 +264,20 @@ type Metrics struct {
 	// no backend can address. Those entries are dropped from their work set, so
 	// this counter is the only place the condition is aggregated.
 	storageInvalidPathQuarantinedTotal atomic.Int64
+	// compactionCopyFallbackTotal counts compaction outputs an object store
+	// refused to copy server-side, copied through the node instead;
+	// compactionFinishedTotal, committed object-store compactions their
+	// finisher ended; compactionWedgedTotal, those marked wedged for an
+	// operator (#1207 d2a2b).
+	compactionCopyFallbackTotal atomic.Int64
+	compactionFinishedTotal     atomic.Int64
+	compactionWedgedTotal       atomic.Int64
+	// manifestRepairDroppedTotal / manifestRepairAdoptedTotal: entries the
+	// shared-object-store manifest repair dropped (object gone) and objects
+	// it registered (compaction outputs the manifest never listed) (#1207).
+	manifestRepairDroppedTotal atomic.Int64
+	manifestRepairAdoptedTotal atomic.Int64
+	manifestRepairPending      atomic.Int64
 
 	// clusterLocalDeletePending is the number of manifest deletes a
 	// per-node-storage cluster node has been told about and has not yet
@@ -751,6 +765,21 @@ func (m *Metrics) IncClusterManifestRejectedPaths() { m.clusterManifestRejectedP
 // to counting it here is a loop that retries the same key forever.
 func (m *Metrics) IncStorageInvalidPathQuarantined() { m.storageInvalidPathQuarantinedTotal.Add(1) }
 
+// IncCompactionCopyFallback, IncCompactionFinished, IncCompactionWedged: the
+// staged compaction commit on an object store (#1207 d2a2b).
+func (m *Metrics) IncCompactionCopyFallback() { m.compactionCopyFallbackTotal.Add(1) }
+func (m *Metrics) IncCompactionFinished()     { m.compactionFinishedTotal.Add(1) }
+func (m *Metrics) IncCompactionWedged()       { m.compactionWedgedTotal.Add(1) }
+
+// IncManifestRepairDropped, IncManifestRepairAdopted: the shared-object-store
+// manifest repair (#1207).
+func (m *Metrics) IncManifestRepairDropped() { m.manifestRepairDroppedTotal.Add(1) }
+func (m *Metrics) IncManifestRepairAdopted() { m.manifestRepairAdoptedTotal.Add(1) }
+
+// SetManifestRepairPending publishes the compaction outputs the last repair
+// left for a later run (its read budget reached).
+func (m *Metrics) SetManifestRepairPending(n int64) { m.manifestRepairPending.Store(n) }
+
 // SetClusterLocalDeletePending publishes how many manifest deletes are still
 // waiting for a local unlink on this node.
 func (m *Metrics) SetClusterLocalDeletePending(n int64) { m.clusterLocalDeletePending.Store(n) }
@@ -1015,6 +1044,12 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		// Cluster FSM security (Enterprise)
 		"cluster_manifest_rejected_paths_total":  m.clusterManifestRejectedPathsTotal.Load(),
 		"storage_invalid_path_quarantined_total": m.storageInvalidPathQuarantinedTotal.Load(),
+		"compaction_copy_fallback_total":         m.compactionCopyFallbackTotal.Load(),
+		"compaction_finished_total":              m.compactionFinishedTotal.Load(),
+		"compaction_wedged_total":                m.compactionWedgedTotal.Load(),
+		"manifest_repair_dropped_total":          m.manifestRepairDroppedTotal.Load(),
+		"manifest_repair_adopted_total":          m.manifestRepairAdoptedTotal.Load(),
+		"manifest_repair_pending":                m.manifestRepairPending.Load(),
 		// Cluster local delete workers (per-node storage with replication)
 		"cluster_local_delete_pending":                  m.clusterLocalDeletePending.Load(),
 		"compaction_manifests_parked_unparseable_total": m.compactionManifestsParkedUnparseableTotal.Load(),
@@ -1592,6 +1627,18 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_storage_invalid_path_quarantined_total Total entries dropped from a cleanup, reconciliation or replication work set because a storage key was permanently unusable. Non-zero growth means a stored key (compaction manifest, cluster manifest entry, edge-sync ledger row) names something no storage backend can address; the entry is no longer retried and needs operator action.\n"...)
 	b = append(b, "# TYPE arc_storage_invalid_path_quarantined_total counter\n"...)
 	b = appendMetric(b, "arc_storage_invalid_path_quarantined_total", float64(m.storageInvalidPathQuarantinedTotal.Load()))
+	b = appendMetric(b, "arc_compaction_copy_fallback_total", float64(m.compactionCopyFallbackTotal.Load()))
+	b = appendMetric(b, "arc_compaction_finished_total", float64(m.compactionFinishedTotal.Load()))
+	b = appendMetric(b, "arc_compaction_wedged_total", float64(m.compactionWedgedTotal.Load()))
+	b = append(b, "# HELP arc_manifest_repair_dropped_total Cluster manifest entries the shared object store repair dropped because their object is gone (#1207). Growth after the first repairs following an upgrade means something removes objects without updating the manifest.\n"...)
+	b = append(b, "# TYPE arc_manifest_repair_dropped_total counter\n"...)
+	b = appendMetric(b, "arc_manifest_repair_dropped_total", float64(m.manifestRepairDroppedTotal.Load()))
+	b = append(b, "# HELP arc_manifest_repair_adopted_total Compaction outputs in the shared object store the repair registered in the cluster manifest, which compaction never listed before #1207. Growth after the first repairs following an upgrade means compaction outputs are not being registered.\n"...)
+	b = append(b, "# TYPE arc_manifest_repair_adopted_total counter\n"...)
+	b = appendMetric(b, "arc_manifest_repair_adopted_total", float64(m.manifestRepairAdoptedTotal.Load()))
+	b = append(b, "# HELP arc_manifest_repair_pending Compaction outputs the last cluster manifest repair left for a later run (its read budget reached). Falls to zero as the repairs after an upgrade catch up.\n"...)
+	b = append(b, "# TYPE arc_manifest_repair_pending gauge\n"...)
+	b = appendMetric(b, "arc_manifest_repair_pending", float64(m.manifestRepairPending.Load()))
 
 	b = append(b, "# HELP arc_cluster_local_delete_pending Manifest deletes this per-node-storage cluster node has been told about and has not yet unlinked locally. Returns to zero within a grace period of every burst; a value that keeps climbing means the delete workers cannot keep up with retention or a compaction backlog.\n"...)
 	b = append(b, "# TYPE arc_cluster_local_delete_pending gauge\n"...)

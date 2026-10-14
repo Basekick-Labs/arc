@@ -196,6 +196,9 @@ const (
 	// CommandCleanupCompaction: a finalized object-store job whose input
 	// objects are gone.
 	CommandCleanupCompaction
+	// CommandClaimFinisher: a node taking (or renewing) the lease to finish
+	// a committed object-store job (#1207 d2a2b).
+	CommandClaimFinisher
 )
 
 // Command represents a command to be applied to the FSM.
@@ -295,6 +298,20 @@ type FileEntry struct {
 	CompactionJob string `json:"compaction_job,omitempty"`
 }
 
+// HotTier reports whether a manifest tier is the hot (primary storage) tier:
+// "" or "hot", or the compaction tier name ("hourly", "daily") that
+// compaction registered its outputs with before #1207 (the bridge stamps
+// "hot" now, and the leader moves older entries to "hot"). Tiering marks a
+// file "cold". Not for FSM Apply: log replay must decide as it did when the
+// entry was first applied.
+func HotTier(tier string) bool {
+	switch tier {
+	case "", "hot", "hourly", "daily":
+		return true
+	}
+	return false
+}
+
 // RegisterFilePayload is the payload for CommandRegisterFile.
 type RegisterFilePayload struct {
 	File FileEntry `json:"file"`
@@ -315,6 +332,12 @@ type RegisterFilePayload struct {
 	// DeleteSeen is the newest DELETE record the file's rows were filtered
 	// against (#1207 d1); 0 when none was applied to it.
 	DeleteSeen uint64 `json:"delete_seen,omitempty"`
+	// Adopt registers an object already in a shared object store that the
+	// manifest lost (#1207: shared-storage compaction never registered its
+	// outputs). With compaction commit on, it is refused if the path is
+	// registered or a staged compaction owns it: a finalizing job's input
+	// is out of the manifest on purpose, and the finisher deletes it.
+	Adopt bool `json:"adopt,omitempty"`
 }
 
 // DeleteFilePayload is the payload for CommandDeleteFile.
@@ -410,6 +433,32 @@ func IsCompactionPauseConflict(err error) bool {
 // UpdateFilePayload is the payload for CommandUpdateFile.
 type UpdateFilePayload struct {
 	File FileEntry `json:"file"`
+	// ExpectSHA / ExpectTier, with compaction commit on, refuse the update
+	// unless the file is registered with this checksum / in this tier
+	// (#1207: the leader moving a file registered in a compaction tier to
+	// "hot" must not undo a change made meanwhile, such as tiering).
+	ExpectSHA  string `json:"expect_sha,omitempty"`
+	ExpectTier string `json:"expect_tier,omitempty"`
+}
+
+// updateRefusedLocked reports whether an update's expectation fails.
+func (f *ClusterFSM) updateRefusedLocked(p UpdateFilePayload) bool {
+	if !f.compactionCommit || (p.ExpectSHA == "" && p.ExpectTier == "") {
+		return false
+	}
+	e, ok := f.files[p.File.Path]
+	return !ok || (p.ExpectSHA != "" && e.SHA256 != p.ExpectSHA) || (p.ExpectTier != "" && e.Tier != p.ExpectTier)
+}
+
+// adoptRefusedLocked reports whether an adoption (RegisterFilePayload.Adopt)
+// is refused: the path is registered, or a staged compaction owns it.
+func (f *ClusterFSM) adoptRefusedLocked(p RegisterFilePayload) bool {
+	if !p.Adopt || !f.compactionCommit {
+		return false
+	}
+	_, registered := f.files[p.File.Path]
+	_, owned := f.stagedPaths[p.File.Path]
+	return registered || owned
 }
 
 // AssignCompactorPayload is the payload for CommandAssignCompactor.
@@ -1200,6 +1249,8 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 	case CommandCleanupCompaction:
 		defer f.deliverCompactionEvents()
 		return f.applyCleanupCompaction(cmd.Payload)
+	case CommandClaimFinisher:
+		return f.applyClaimFinisher(cmd.Payload)
 	case CommandDeleteFile:
 		return f.applyDeleteFile(cmd.Payload)
 	case CommandAssignCompactor:
@@ -1724,6 +1775,10 @@ func (f *ClusterFSM) applyRegisterFileStruct(p RegisterFilePayload, logIndex uin
 	}
 
 	f.mu.Lock()
+	if f.adoptRefusedLocked(p) {
+		f.mu.Unlock()
+		return &ManifestChangedError{Paths: []string{p.File.Path}}
+	}
 	if p.InheritFrom != "" && f.compactionCommit && !f.registeredAtLocked(p.InheritFrom, p.InheritSHA) {
 		f.mu.Unlock()
 		return &ManifestChangedError{Paths: []string{p.InheritFrom}}
@@ -1750,6 +1805,10 @@ func (f *ClusterFSM) applyRegisterFileLocked(p RegisterFilePayload, logIndex uin
 	f.takeoverRegisteredLocked(p, &entry, inherited)
 	old, existed := f.files[entry.Path]
 	contentChanged := existed && (old.SHA256 != entry.SHA256 || old.SizeBytes != entry.SizeBytes)
+	if existed && (contentChanged || old.CompactionJob != entry.CompactionJob) {
+		// A finalizing job's output replaced in place (#1207 d2a2b).
+		f.noteStagedOutputGoneLocked(entry.Path, "replaced")
+	}
 	// If the file was already registered under a different database (unlikely
 	// but possible if an operator moves a file across databases), remove the
 	// old index entry first to keep filesByDB consistent.
@@ -1839,6 +1898,7 @@ func (f *ClusterFSM) applyDeleteFileLocked(p DeleteFilePayload) func() {
 	}
 	delete(f.files, p.Path)
 	if existed {
+		f.noteStagedOutputGoneLocked(p.Path, p.Reason)
 		// Remove from the database → files secondary index
 		if idx, ok := f.filesByDB[existing.Database]; ok {
 			delete(idx, p.Path)
@@ -1900,6 +1960,10 @@ func (f *ClusterFSM) applyUpdateFileStruct(p UpdateFilePayload, logIndex uint64)
 	}
 
 	f.mu.Lock()
+	if f.updateRefusedLocked(p) {
+		f.mu.Unlock()
+		return &ManifestChangedError{Paths: []string{p.File.Path}}
+	}
 	emit := f.applyUpdateFileLocked(p, logIndex)
 	f.mu.Unlock()
 
@@ -1933,6 +1997,9 @@ func (f *ClusterFSM) applyUpdateFileLocked(p UpdateFilePayload, logIndex uint64)
 		entry.CompactionJob = old.CompactionJob
 	}
 	contentChanged := existed && (old.SHA256 != entry.SHA256 || old.SizeBytes != entry.SizeBytes)
+	if contentChanged {
+		f.noteStagedOutputGoneLocked(entry.Path, "replaced")
+	}
 	// If the database changed (defensive), remove the old secondary index entry first.
 	if existed && old.Database != entry.Database {
 		if oldIdx, ok := f.filesByDB[old.Database]; ok {
@@ -3326,6 +3393,18 @@ func (f *ClusterFSM) GetFilesByDatabase(database string) []*FileEntry {
 		}
 	}
 	return files
+}
+
+// FileDatabases returns the databases the manifest lists files of, sorted.
+func (f *ClusterFSM) FileDatabases() []string {
+	f.mu.RLock()
+	out := make([]string, 0, len(f.filesByDB))
+	for db := range f.filesByDB {
+		out = append(out, db)
+	}
+	f.mu.RUnlock()
+	sort.Strings(out)
+	return out
 }
 
 // GetFilesPaginated returns a page of file entries using cursor-based

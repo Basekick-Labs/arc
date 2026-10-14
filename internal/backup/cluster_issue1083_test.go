@@ -1408,3 +1408,94 @@ func TestPartitionTimeFromPath(t *testing.T) {
 		}
 	}
 }
+
+// stagedClusterManifest is a fakeClusterManifest that knows committed
+// object-store compactions (#1207 d2a2b).
+type stagedClusterManifest struct {
+	*fakeClusterManifest
+	stagedKeys map[string]string
+	owned      map[string]bool
+}
+
+func (s *stagedClusterManifest) StagedOutputKey(path string) (string, bool) {
+	k, ok := s.stagedKeys[path]
+	return k, ok
+}
+func (s *stagedClusterManifest) CompactionOwns(path string) bool { return s.owned[path] }
+
+// A backup taken while a committed object-store compaction is finalizing:
+// its output is registered but still at its staged key, its inputs are
+// unregistered but in storage. The output is backed up at its own path from
+// the staged copy; the inputs are left out and not reported as unregistered
+// data; the staged root is not copied.
+func TestBackup_FinalizingObjectCompaction(t *testing.T) {
+	ctx := context.Background()
+	data := mustLocalBackend(t, t.TempDir(), zerolog.Nop())
+	const (
+		partition = "db/cpu/2026/01/01/00"
+		output    = partition + "/x_compacted.parquet"
+		staged    = "_compaction_staged/j1/x_compacted.parquet"
+		inputA    = partition + "/a.parquet"
+		other     = "db/cpu/2026/01/01/01/other.parquet"
+	)
+	outBytes, aBytes, otherBytes := []byte("OUT-compacted"), []byte("IN-a"), []byte("OTHER")
+	mustWrite(t, data, inputA, aBytes)
+	mustWrite(t, data, staged, outBytes)
+	mustWrite(t, data, other, otherBytes)
+	cm := &stagedClusterManifest{
+		fakeClusterManifest: &fakeClusterManifest{entries: []ManifestFile{entryFor(output, outBytes), entryFor(other, otherBytes)}},
+		stagedKeys:          map[string]string{output: staged},
+		owned:               map[string]bool{inputA: true, output: true},
+	}
+	backupDir := t.TempDir()
+	m := newClusterManager(t, data, backupDir, cm, nil)
+	res, err := m.CreateBackup(ctx, BackupOptions{})
+	if err != nil {
+		t.Fatalf("CreateBackup: %v", err)
+	}
+	mf := res.Manifest
+	if mf.ManifestOnlyFiles != 0 || mf.UnregisteredSkipped != 0 || mf.TotalFiles != 2 || mf.AuxiliaryFiles != 0 {
+		t.Errorf("manifest-only=%d unregistered=%d total=%d aux=%d, want 0 0 2 0", mf.ManifestOnlyFiles, mf.UnregisteredSkipped, mf.TotalFiles, mf.AuxiliaryFiles)
+	}
+	backupStore := mustLocalBackend(t, backupDir, zerolog.Nop())
+	got, err := backupStore.Read(ctx, mf.BackupID+"/data/"+output)
+	if err != nil || string(got) != string(outBytes) {
+		t.Fatalf("output in the backup: %q %v", got, err)
+	}
+	for _, k := range []string{inputA, staged} {
+		if existsIn(t, backupStore, mf.BackupID+"/data/"+k) {
+			t.Errorf("%s is in the backup", k)
+		}
+	}
+}
+
+// The compaction finished between the snapshot and the copy: its staged
+// copy is gone and its output is at its path; the copy reads it there.
+func TestCopyDataFiles_StagedSourceGoneReadsTheFinalKey(t *testing.T) {
+	ctx := context.Background()
+	data := mustLocalBackend(t, t.TempDir(), zerolog.Nop())
+	const output = "db/cpu/2026/01/01/00/x_compacted.parquet"
+	outBytes := []byte("OUT-compacted")
+	mustWrite(t, data, output, outBytes)
+	backupDir := t.TempDir()
+	m := newClusterManager(t, data, backupDir, &fakeClusterManifest{}, nil)
+	progress := &Progress{Operation: "backup", BackupID: "b1", Status: "running", TotalFiles: 1}
+	leg := testLeg(m, "b1", progress)
+	leg.run.sourceOf = map[string]string{output: "_compaction_staged/j1/x_compacted.parquet"}
+	skipped, err := m.copyDataFiles(ctx, leg, []storage.ObjectInfo{{Path: output, Size: int64(len(outBytes))}}, nil, m.dataStorage, "data storage", "")
+	if err != nil || skipped != 0 {
+		t.Fatalf("skipped %d err %v", skipped, err)
+	}
+	got, err := mustLocalBackend(t, backupDir, zerolog.Nop()).Read(ctx, "b1/data/"+output)
+	if err != nil || string(got) != string(outBytes) {
+		t.Fatalf("output in the backup: %q %v", got, err)
+	}
+}
+
+// raft.OutputGoneAccounted trusts this reason by its text (#1207 d2a2b):
+// renaming it must change both.
+func TestRestoreReplaceReasonIsTheAccountedOne(t *testing.T) {
+	if restoreReplaceReason != "restore:replace" {
+		t.Fatalf("reason %q: update raft.OutputGoneAccounted too", restoreReplaceReason)
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"path"
 	"time"
 
@@ -41,6 +42,10 @@ type StagedJob struct {
 	StagedKey string
 	Output    CompactedOutput
 	Inputs    []StagedInput
+	// Object: the staged output is in the object store (#1207 d2a2b).
+	Object bool
+	// CreatedAt is when the job staged its output.
+	CreatedAt time.Time
 }
 
 // StagedOutcome is how the cluster answered a stage or commit.
@@ -66,6 +71,9 @@ type StagedStatus struct {
 	Committed  bool // its output is registered by this job
 	Holders    int
 	MinHolders int
+	// Finalizing: an object job committed and not ended; a finisher puts
+	// its output in place (#1207 d2a2b).
+	Finalizing bool
 }
 
 // StagedCommitter is the cluster side of the staged commit.
@@ -104,9 +112,10 @@ type InputLookup func(path string) (size int64, sha string, ok bool)
 // manifest is written: nothing here deletes inputs, so there is nothing to
 // recover, and the staged job keeps them out of other jobs.
 func (j *Job) runStaged(ctx context.Context, compactedFile, compactedKey, outputSHA string) error {
-	mover, ok := j.StorageBackend.(storage.ObjectMover)
-	if !ok || !j.clusterMode() || outputSHA == "" {
-		return j.fail(fmt.Errorf("staged compaction needs a local backend in cluster mode"))
+	mover, local := j.StorageBackend.(storage.ObjectMover)
+	copier, object := j.StorageBackend.(storage.ObjectCopier)
+	if (!local && !object) || !j.clusterMode() || outputSHA == "" {
+		return j.fail(fmt.Errorf("staged compaction needs a local or object store backend in cluster mode"))
 	}
 	inputs := make([]StagedInput, 0, len(j.compactedFiles))
 	for _, f := range j.compactedFiles {
@@ -117,11 +126,17 @@ func (j *Job) runStaged(ctx context.Context, compactedFile, compactedKey, output
 		inputs = append(inputs, in)
 	}
 	stagedKey := StagedKey(j.JobID, compactedKey)
-	if err := j.uploadFile(ctx, compactedFile, stagedKey); err != nil {
+	if local {
+		if err := j.uploadFile(ctx, compactedFile, stagedKey); err != nil {
+			return j.fail(fmt.Errorf("failed to write the staged output: %w", err))
+		}
+		if err := mover.Sync(ctx, stagedKey); err != nil {
+			return j.fail(fmt.Errorf("failed to make the staged output durable: %w", err))
+		}
+	} else if err := uploadStagedObject(ctx, copier, compactedFile, stagedKey, outputSHA); err != nil {
+		// The object store: the output waits in the bucket, recording its
+		// checksum (#1207 d2a2b).
 		return j.fail(fmt.Errorf("failed to write the staged output: %w", err))
-	}
-	if err := mover.Sync(ctx, stagedKey); err != nil {
-		return j.fail(fmt.Errorf("failed to make the staged output durable: %w", err))
 	}
 	now := time.Now().UTC()
 	out := CompactedOutput{
@@ -132,7 +147,7 @@ func (j *Job) runStaged(ctx context.Context, compactedFile, compactedKey, output
 	m := &CompletionManifest{
 		JobID: j.JobID, Database: canonicalManifestDatabase(j.Database), Measurement: j.Measurement,
 		PartitionPath: j.PartitionPath, Tier: j.Tier, State: CompletionStateStaged,
-		StagedKey: stagedKey, StagedOutput: &out, Inputs: inputs,
+		StagedKey: stagedKey, StagedOutput: &out, Inputs: inputs, StagedObject: !local,
 		CreatedAt: now, UpdatedAt: now,
 	}
 	if err := writeCompletionManifest(j.CompletionDir, m); err != nil {
@@ -171,8 +186,14 @@ func (m *Manager) stagedCandidate(ctx context.Context, candidate Candidate) (boo
 		if !ok || (local != nil && local(f)) {
 			continue
 		}
-		if got, err := m.StorageBackend.StatFile(ctx, f); err != nil || got != size {
-			continue
+		// On local storage the file must be here at its size. An object
+		// store is the same for every node, and the job reads every input
+		// whole: a request per file here would only repeat that (the stage
+		// then checks the size and checksum the manifest lists).
+		if _, object := m.StorageBackend.(storage.ObjectCopier); !object {
+			if got, err := m.StorageBackend.StatFile(ctx, f); err != nil || got != size {
+				continue
+			}
 		}
 		inputs[f] = StagedInput{Path: f, SizeBytes: size, SHA256: sha}
 		files = append(files, f)
@@ -219,4 +240,30 @@ func boundJobID(id string) string {
 	}
 	sum := sha256.Sum256([]byte(id))
 	return id[:maxJobIDLen-17] + "_" + hex.EncodeToString(sum[:8])
+}
+
+// uploadStagedObject writes a staged output to the object store, recording
+// its checksum on the object.
+func uploadStagedObject(ctx context.Context, copier storage.ObjectCopier, localPath, key, sha string) error {
+	file, err := os.Open(localPath)
+	if err != nil {
+		return fmt.Errorf("failed to open local file: %w", err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat local file: %w", err)
+	}
+	return copier.WriteReaderWithSHA(ctx, key, file, info.Size(), sha)
+}
+
+// StagedFinished runs, for an object job its finisher ended (input objects
+// deleted), the cache invalidation (#1207 d2a2b).
+func (m *Manager) StagedFinished() {
+	m.mu.Lock()
+	onComplete := m.onCompactionComplete
+	m.mu.Unlock()
+	if onComplete != nil {
+		onComplete()
+	}
 }

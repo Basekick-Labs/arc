@@ -146,7 +146,8 @@ type Coordinator struct {
 	compactionCommit compactionCommitGate
 	// staged: the staged compaction commit, replica side (#1207 d2a2a).
 	staged               stagedReplica
-	walCoverageActive    atomic.Bool // SetWALCoverageActive
+	repair               manifestRepairState // shared object store manifest repair (#1207)
+	walCoverageActive    atomic.Bool         // SetWALCoverageActive
 	ingestFenceListeners []func(fenced bool)
 	takeoverOrigin       atomic.Pointer[takeoverOriginState] // SetTakeoverOrigin (#1207 S4b)
 	claimedExit          atomic.Bool                         // another writer claimed this process: refuse writes, exit (#1207)
@@ -445,7 +446,7 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 		stopCh:              make(chan struct{}),
 		replicationRetarget: make(chan struct{}, 1),
 		logger:              logger,
-		staged:              stagedReplica{fetching: map[string]bool{}, wake: make(chan struct{}, 1), goneSince: map[string]time.Time{}},
+		staged:              stagedReplica{fetching: map[string]bool{}, wake: make(chan struct{}, 1), finisherWake: make(chan struct{}, 1), finishing: map[string]bool{}, goneSince: map[string]time.Time{}},
 	}
 
 	if tlsCfg != nil {
@@ -787,6 +788,21 @@ func (c *Coordinator) Start() error {
 	}
 	if c.raftNode != nil {
 		go c.compactionCommitEnableLoop(c.ctx)
+	}
+	// The staged compaction commit on an object store (#1207 d2a2b): the
+	// leader aborts jobs of a compactor that is gone, and committed jobs are
+	// finished. Replication plays no part (the bucket is shared).
+	if c.raftNode != nil && c.storage != nil && c.stagedObject() {
+		if v := os.Getenv("ARC_TEST_FINISHER_DELAY"); v != "" {
+			if d, err := time.ParseDuration(v); err == nil {
+				objectFinisherDelay = d
+			}
+		}
+		go c.stagedLeaderLoop(c.ctx)
+		go c.objectFinisherLoop(c.ctx)
+	}
+	if c.raftNode != nil {
+		go c.manifestRepairLoop(c.ctx)
 	}
 	if c.cfg.StreamTakeover && c.raftNode != nil {
 		go c.departedExpiryLoop(c.ctx)
@@ -4477,8 +4493,8 @@ func (c *Coordinator) startFilePullerLocked() error {
 		fsm.SetCompactionCallbacks(c.onCompactionStaged, c.onCompactionGone, c.onCompactionCommitted)
 		go c.stagedReplicaLoop(c.ctx)
 		c.staged.replicaReady.Store(true)
+		go c.stagedLeaderLoop(c.ctx)
 	}
-	go c.stagedLeaderLoop(c.ctx)
 	if backend.Type() == "local" {
 		go c.vanishedSweepLoop(c.ctx)
 	}

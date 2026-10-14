@@ -1007,7 +1007,13 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 		// Manifest-before-storage: record the delete in the Raft manifest before
 		// removing from storage. If the manifest update fails (Raft quorum loss),
 		// abort — the file still exists in storage and the next delete will retry.
-		if h.coordinator != nil {
+		if scanSHA == unmanagedSHA {
+			// No manifest entry covered it when scanned (a shared object
+			// store): one that does now is scanned again.
+			if _, reg := h.coordinator.GetFileEntry(relativePath); reg {
+				return 0, fmt.Errorf("%w: %s", errFileChanged, filepath.Base(relativePath))
+			}
+		} else if h.coordinator != nil {
 			// With compaction commit on, the delete removes the content this
 			// DELETE read, never a file a compaction replaced meanwhile (#1207 d2).
 			expect := ""
@@ -1020,7 +1026,7 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 					}
 				}
 			}
-			payload, err := json.Marshal(raft.DeleteFilePayload{Path: relativePath, Reason: "delete", ExpectSHA: expect})
+			payload, err := json.Marshal(raft.DeleteFilePayload{Path: relativePath, Reason: deleteManifestReason, ExpectSHA: expect})
 			if err != nil {
 				return 0, fmt.Errorf("%w: marshal failed for %s: %v", errManifestFailure, relativePath, err)
 			}
@@ -1041,6 +1047,7 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 			h.logger.Warn().Err(err).Str("file", relativePath).Msg("Failed to delete file from storage after manifest update")
 			return deleted, nil
 		}
+		h.dropFinalizingInputs(ctx, relativePath)
 		return deleted, nil
 	}
 
@@ -1313,6 +1320,40 @@ func (h *DeleteHandler) rewrittenFileMetadata(newPath string, s3 *s3RewriteResul
 // existing path (#975).
 func (h *DeleteHandler) replaceManifestAfterRewrite(ctx context.Context, oldPath, newPath string, s3 *s3RewriteResult, scanSHA string) error {
 	existing, ok := h.coordinator.GetFileEntry(oldPath)
+	if scanSHA == unmanagedSHA {
+		// No manifest entry covered it when scanned (a shared object store,
+		// #1207): the rewrite replaces it in storage only. One that covers
+		// it now is scanned again.
+		cleanup := func() {
+			if err := h.storage.Delete(ctx, newPath); err != nil {
+				h.logger.Warn().Err(err).Str("file", newPath).Msg("Failed to clean up a rewrite that was not announced")
+			}
+		}
+		if ok {
+			cleanup()
+			return fmt.Errorf("%w: %s", errFileChanged, filepath.Base(oldPath))
+		}
+		// The rewrite is registered, or it would be an orphan the
+		// reconciler removes with the rows this DELETE kept.
+		so, shared := sharedObjectStore(h.coordinator)
+		size, sha, err := h.rewrittenFileMetadata(newPath, s3)
+		if err == nil && (!shared || size < 0) {
+			err = errors.New("no shared object store to register the rewrite in")
+		}
+		if err == nil {
+			_, err = so.AdoptRewrite(ctx, newPath, size, sha)
+		}
+		if err != nil {
+			cleanup()
+			return errors.Join(errManifestFailure, fmt.Errorf("register the rewrite of %s: %w", filepath.Base(oldPath), err))
+		}
+		if err := h.storage.Delete(ctx, oldPath); err != nil {
+			h.logger.Error().Err(err).Str("file", oldPath).Str("new_file", newPath).
+				Msg("Rewrite registered but failed to delete the superseded object; it may remain visible to glob queries until cleanup succeeds")
+			return fmt.Errorf("rewrite registered but failed to delete superseded object %q: %w", oldPath, err)
+		}
+		return nil
+	}
 	if !ok && h.pending != nil {
 		// Not in the manifest yet may mean pending: flushed by this node and
 		// not confirmed. Then the rewrite is what must be announced, and the
@@ -1408,7 +1449,7 @@ func (h *DeleteHandler) replaceManifestAfterRewrite(ctx context.Context, oldPath
 	if err != nil {
 		return fmt.Errorf("%w: marshal replacement register: %v", errManifestFailure, err)
 	}
-	deletePayload, err := json.Marshal(raft.DeleteFilePayload{Path: oldPath, Reason: "delete-rewrite", ExpectSHA: expect})
+	deletePayload, err := json.Marshal(raft.DeleteFilePayload{Path: oldPath, Reason: deleteRewriteManifestReason, ExpectSHA: expect})
 	if err != nil {
 		return fmt.Errorf("%w: marshal replacement delete: %v", errManifestFailure, err)
 	}
@@ -1437,8 +1478,17 @@ func (h *DeleteHandler) replaceManifestAfterRewrite(ctx context.Context, oldPath
 			Msg("Manifest committed but failed to delete superseded rewrite; the old object may remain visible to glob queries until cleanup succeeds")
 		return fmt.Errorf("manifest committed but failed to delete superseded rewrite %q: %w", oldPath, err)
 	}
+	h.dropFinalizingInputs(ctx, oldPath)
 	return nil
 }
+
+// The manifest delete reasons of a row DELETE: a file it deleted whole, and
+// the file a rewrite replaced. A compaction whose output either removes
+// deletes its inputs too (raft.OutputGoneAccounted, #1207 d2a2b).
+const (
+	deleteManifestReason        = "delete"
+	deleteRewriteManifestReason = "delete-rewrite"
+)
 
 // respondDeleteUnavailable answers 503 with a retry hint.
 func respondDeleteUnavailable(c *fiber.Ctx, resp DeleteResponse) error {

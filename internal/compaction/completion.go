@@ -131,9 +131,12 @@ type CompletionManifest struct {
 	// the inputs the commit deletes.
 	StagedKey    string           `json:"staged_key,omitempty"`
 	StagedOutput *CompactedOutput `json:"staged_output,omitempty"`
-	Inputs       []StagedInput    `json:"inputs,omitempty"`
-	CreatedAt    time.Time        `json:"created_at"` // when the manifest was first written
-	UpdatedAt    time.Time        `json:"updated_at"` // bumped on every state transition
+	// StagedObject: the staged output is in the object store, not on this
+	// node (#1207 d2a2b).
+	StagedObject bool          `json:"staged_object,omitempty"`
+	Inputs       []StagedInput `json:"inputs,omitempty"`
+	CreatedAt    time.Time     `json:"created_at"` // when the manifest was first written
+	UpdatedAt    time.Time     `json:"updated_at"` // bumped on every state transition
 }
 
 // writeCompletionManifest serializes m to {dir}/{JobID}.json atomically via
