@@ -1233,7 +1233,7 @@ type s3RewriteResult struct {
 func rewritePath(relativePath string) string {
 	logicalPath := storage.StripRewriteSuffix(relativePath)
 	base := strings.TrimSuffix(logicalPath, filepath.Ext(logicalPath))
-	return fmt.Sprintf("%s_rewrite_%d.parquet", base, time.Now().UTC().UnixNano())
+	return fmt.Sprintf("%s_rewrite_%d.parquet", base, storage.NameTime(time.Now()).UnixNano())
 }
 
 // rewriteS3File handles file rewrite for S3 storage
