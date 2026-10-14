@@ -115,8 +115,7 @@ func (c *Coordinator) StagedCompactionMode() bool {
 
 // stagedObject reports whether staged jobs here are object-store jobs.
 func (c *Coordinator) stagedObject() bool {
-	_, object := c.storage.(storage.ObjectCopier)
-	return object && c.storage.Type() != "local"
+	return IsSharedObjectStore(c.storage)
 }
 
 // CompactionInputLookup describes path as the cluster manifest lists it, for

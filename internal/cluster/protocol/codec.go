@@ -219,6 +219,20 @@ func unmarshalPayload(msgType MessageType, payload []byte) (interface{}, error) 
 		}
 		return &ack, nil
 
+	case MsgPendingRegistrationsQuery:
+		var q PendingRegistrationsQuery
+		if err := json.Unmarshal(payload, &q); err != nil {
+			return nil, err
+		}
+		return &q, nil
+
+	case MsgPendingRegistrationsReply:
+		var reply PendingRegistrationsReply
+		if err := json.Unmarshal(payload, &reply); err != nil {
+			return nil, err
+		}
+		return &reply, nil
+
 	default:
 		return nil, fmt.Errorf("unknown message type: %d", msgType)
 	}

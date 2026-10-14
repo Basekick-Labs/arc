@@ -66,7 +66,51 @@ const (
 	// (internal/cluster/originstream frames follow).
 	MsgOriginStreamHello    MessageType = 0x40
 	MsgOriginStreamHelloAck MessageType = 0x41
+
+	// Pending registrations (#1214): before the orphan-storage sweep deletes
+	// unregistered objects on a shared object store, the reconciler asks
+	// every node that can ingest which files it flushed and has not
+	// registered yet. A node before #1214 closes the connection on the
+	// unknown type, which the asker treats as no answer.
+	MsgPendingRegistrationsQuery MessageType = 0x50
+	MsgPendingRegistrationsReply MessageType = 0x51
 )
+
+// PendingRegistrationsQuery asks a node for the files it flushed that the
+// cluster manifest does not list yet, whenever they were flushed.
+// HMAC: security.ComputePendingRegistrationsQueryHMAC.
+type PendingRegistrationsQuery struct {
+	NodeID      string `json:"node_id"`
+	ClusterName string `json:"cluster_name"`
+	Nonce       string `json:"nonce"`
+	Timestamp   int64  `json:"timestamp"`
+	HMAC        string `json:"hmac"`
+}
+
+// Pending registrations reply statuses.
+const (
+	// PendingStatusOK: Paths is every file pending registration on the node.
+	PendingStatusOK = "ok"
+	// PendingStatusTooMany: more such files than one reply can carry.
+	PendingStatusTooMany = "too_many"
+	// PendingStatusUnknown: the node ingests but has no registration journal
+	// (it could not be opened), so it cannot tell.
+	PendingStatusUnknown = "unknown"
+	// PendingStatusRefused: the query failed authentication or validation.
+	PendingStatusRefused = "refused"
+)
+
+// PendingRegistrationsReply answers a query. The HMAC binds the reply to the
+// query's nonce and covers a digest of Paths, so neither a recorded reply nor
+// one with paths stripped is accepted:
+// security.ComputePendingRegistrationsReplyHMAC.
+type PendingRegistrationsReply struct {
+	NodeID    string   `json:"node_id"`
+	Status    string   `json:"status"`
+	Paths     []string `json:"paths,omitempty"`
+	Timestamp int64    `json:"timestamp"`
+	HMAC      string   `json:"hmac"`
+}
 
 // OriginStreamHello is sent by a standby writer to open the origin stream.
 // HMAC: security.ComputeOriginStreamHelloHMAC.
@@ -111,6 +155,10 @@ func (m MessageType) String() string {
 		return "OriginStreamHello"
 	case MsgOriginStreamHelloAck:
 		return "OriginStreamHelloAck"
+	case MsgPendingRegistrationsQuery:
+		return "PendingRegistrationsQuery"
+	case MsgPendingRegistrationsReply:
+		return "PendingRegistrationsReply"
 	case MsgReplicateSync:
 		return "ReplicateSync"
 	case MsgReplicateSyncAck:
