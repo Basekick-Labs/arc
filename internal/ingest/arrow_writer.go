@@ -5190,6 +5190,10 @@ func sliceColumnsByIndices(columns map[string]interface{}, indices []int) map[st
 	return result
 }
 
+// flushNameNow is the clock a flushed file's name is read from; a test
+// freezes it.
+var flushNameNow = time.Now
+
 // generateStoragePath creates a hierarchical storage path for partition pruning
 // Format: {database}/{measurement}/{YYYY}/{MM}/{DD}/{HH}/{measurement}_{timestamp}_{nanos}.parquet
 //
@@ -5204,9 +5208,10 @@ func (b *ArrowBuffer) generateStoragePath(database, measurement string, partitio
 	day := partitionTime.Format("02")
 	hour := partitionTime.Format("15")
 
-	// Filename includes measurement, timestamp, and nanos for uniqueness
-	// Use current time for filename to avoid collisions
-	now := time.Now().UTC()
+	// Filename includes measurement, timestamp, and nanos. Flush workers run
+	// concurrently, so the clock alone repeats; storage.NameTime makes the
+	// stamp unique in the process (#1282).
+	now := storage.NameTime(flushNameNow())
 	timestamp := now.Format("20060102_150405")
 	nanos := now.UnixNano() % 1_000_000_000
 
