@@ -18,7 +18,7 @@ import (
 // it with the batches it had acknowledged, and the outbox applies live
 // records to the files it registers (delete_records_outbox.go).
 
-var errDeleteAckPending = errors.New("ingest paused: acknowledging a DELETE to the cluster (stream takeover); retry shortly")
+var errDeleteAckPending error = &ingest.RefusalError{Reason: RefusalDeleteAck, Text: "ingest paused: acknowledging a DELETE to the cluster (stream takeover); retry shortly"}
 
 // deleteAckEvery paces the acknowledgement loop; a record is acknowledged
 // within about one tick of applying here.

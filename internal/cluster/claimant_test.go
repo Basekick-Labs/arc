@@ -6,6 +6,7 @@ package cluster
 import (
 	"context"
 	"errors"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -448,8 +449,12 @@ func TestDesignationGate(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFSM(t, func() bool { return c.designatedPrimaryWriterID() == "writer-2" })
+	before := metrics.Get().IngestFencedWritesFor(RefusalNotDesignated)
 	if err := c.IngestGate()(); !errors.Is(err, errNotDesignated) {
 		t.Fatalf("a standby accepted a write: %v", err)
+	}
+	if d := metrics.Get().IngestFencedWritesFor(RefusalNotDesignated) - before; d != 1 {
+		t.Fatalf("the designation refusal counted %d times (#1268)", d)
 	}
 	// Takeover not known on here: the gate is the fence's business.
 	off, d2 := takeoverOriginRig(t, false)

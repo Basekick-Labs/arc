@@ -143,7 +143,8 @@ request can still leave its earlier measurements written.
 `/ready/write` reports not-ready while a writer refuses writes.
 `arc_cluster_ingest_fenced` is 1 while a writer has lost contact; a standby
 refusing writes is normal and does not set it.
-`arc_cluster_ingest_fenced_writes_total` counts refused writes.
+`arc_cluster_ingest_fenced_writes_total` counts refused writes, by `reason` (see
+the bug fix for [#1268](https://github.com/Basekick-Labs/arc/issues/1268)).
 
 MQTT subscriptions on a writer that refuses writes are suspended: disconnected
 without unsubscribing. With `clean_session=false` the broker queues QoS 1 and 2
@@ -1165,6 +1166,32 @@ an unbounded operation.
 
 ## Bug fixes
 
+### A failover no longer floods the logs with two errors per refused write ([#1268](https://github.com/Basekick-Labs/arc/issues/1268))
+
+A writer that refuses writes (it lost contact with the cluster leader, another
+writer is the primary, or a stream takeover holds it) logged two ERR lines for
+every refused request: `Failed to write to Arrow buffer` and
+`HTTP request error status=503`. During a failover a client retrying at a few
+hundred writes per second produced over a thousand lines per second. Kubernetes
+rotated the container logs within seconds, and the lines that explained the
+failover were gone.
+
+- A refused write is logged once per reason every 30 seconds, at WARN:
+  `Writes refused on this node (retryable)`, with the reason, where the write
+  came from, the error, and how many refusals were not logged since the last
+  line. A new reason logs at once, so a standby's routine refusals never hide a
+  primary that fences itself.
+- The refusal is no longer counted in `arc_ingest_errors_total`, on every write
+  path (MessagePack, line protocol, TLE, the import endpoints, MQTT).
+- The answer is unchanged: `503` with `Retry-After: 5`. It also carries
+  `X-Arc-Ingest-Fenced: 1`. A reader or compactor that forwarded the write logs
+  the refusal the same way (reason `forwarded`), not once per request.
+- `arc_cluster_ingest_fenced_writes_total` has a `reason` label: `contact`,
+  `standby`, `claimed`, `announcing`, `not_designated`, `delete_ack`, `other`.
+  It now also counts the stream-takeover refusals, which it missed before. Sum
+  by reason for the old total. A refusal is counted per attempt: an MQTT message
+  retried while refused counts once per retry.
+- Other 503s (shutting down, schema churn) are still logged per request.
 ### A new Raft leader no longer re-promotes a dead primary writer, or fails over a healthy one ([#1267](https://github.com/Basekick-Labs/arc/issues/1267))
 
 When a node joined the cluster after the primary writer was designated, its

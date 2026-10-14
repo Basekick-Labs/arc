@@ -367,6 +367,11 @@ localProcessing:
 	}
 
 	if err := h.arrowBuffer.Write(ctx, database, records); err != nil {
+		// A fence refusal is expected during a failover: logged by reason,
+		// not counted as an ingest error (#1268).
+		if errors.Is(err, ingest.ErrIngestFenced) {
+			return respondIngestFenced(c, err)
+		}
 		h.logger.Error().Err(err).Msg("Failed to write to Arrow buffer")
 		metrics.Get().IncIngestErrors()
 		// Schema-churn rejection is retryable — surface as 503 so
@@ -376,9 +381,6 @@ localProcessing:
 		// refused, not lost: the record is still in the WAL. 503 so the client
 		// retries (elsewhere, during a rolling restart) instead of treating a
 		// shutdown race as a permanent server error.
-		if errors.Is(err, ingest.ErrIngestFenced) {
-			return respondIngestFenced(c, err)
-		}
 		if errors.Is(err, ingest.ErrBufferClosing) {
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 				"error": "Write rejected (server shutting down): " + err.Error(),

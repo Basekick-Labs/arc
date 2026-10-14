@@ -3,7 +3,6 @@ package cluster
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -128,9 +127,9 @@ func (c *Coordinator) TakeoverSendGate() func() bool {
 }
 
 var (
-	errTakeoverAnnouncing = errors.New("ingest paused: announcing this writer instance to the cluster (stream takeover); retry shortly")
-	errTakeoverClaimed    = errors.New("ingest refused: another writer took over this writer process (stream takeover); it is restarting, write to the primary writer")
-	errNotDesignated      = errors.New("ingest refused: this node is not the designated primary writer; write to the primary writer")
+	errTakeoverAnnouncing error = &ingest.RefusalError{Reason: RefusalAnnouncing, Text: "ingest paused: announcing this writer instance to the cluster (stream takeover); retry shortly"}
+	errTakeoverClaimed    error = &ingest.RefusalError{Reason: RefusalClaimed, Text: "ingest refused: another writer took over this writer process (stream takeover); it is restarting, write to the primary writer"}
+	errNotDesignated      error = &ingest.RefusalError{Reason: RefusalNotDesignated, Text: "ingest refused: this node is not the designated primary writer; write to the primary writer"}
 )
 
 // readInstanceMarker returns the instance a marker names, 0 when it is

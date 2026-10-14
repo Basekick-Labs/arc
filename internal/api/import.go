@@ -295,6 +295,9 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 	for measurement, record := range columnarByMeasurement {
 		if err := h.arrowBuffer.WriteColumnarRecord(c.Context(), database, record); err != nil {
 			h.totalErrors.Add(1)
+			if errors.Is(err, ingest.ErrIngestFenced) {
+				return respondIngestFenced(c, err) // logged by reason (#1268)
+			}
 			h.logger.Error().Err(err).
 				Str("database", database).
 				Str("measurement", measurement).
@@ -303,9 +306,6 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 			// already written the measurements it got through, so the import is
 			// partial either way — a retryable status at least tells the client
 			// to re-run it rather than treating it as a permanent failure.
-			if errors.Is(err, ingest.ErrIngestFenced) {
-				return respondIngestFenced(c, err)
-			}
 			if errors.Is(err, ingest.ErrBufferClosing) || errors.Is(err, ingest.ErrSchemaChurnExceeded) {
 				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 					"error": fmt.Sprintf("import rejected at measurement %q (retry): %v", measurement, err),
@@ -377,10 +377,16 @@ func (e *importError) Error() string {
 	return e.Message
 }
 
+// Unwrap exposes the cause, so errors.Is sees a fence refusal (#1268).
+func (e *importError) Unwrap() error { return e.Err }
+
 // importErrorResponse returns the appropriate HTTP error response for an import error
 func (h *ImportHandler) importErrorResponse(c *fiber.Ctx, err error) error {
 	if ie, ok := err.(*importError); ok {
 		if errors.Is(ie.Err, ingest.ErrIngestFenced) {
+			ingest.LogRefusal(c.Path(), ie.Err)
+			c.Locals(ingestFencedLocal, true)
+			c.Set(IngestFencedHeader, "1")
 			c.Set(fiber.HeaderRetryAfter, "5")
 		}
 		return c.Status(ie.StatusCode).JSON(fiber.Map{
@@ -537,13 +543,13 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 	totalRows := int64(numRecords)
 	if err := h.arrowBuffer.WriteTypedColumnarDirect(c.Context(), database, measurement, batch, numRecords); err != nil {
 		h.totalErrors.Add(1)
+		if errors.Is(err, ingest.ErrIngestFenced) {
+			return respondIngestFenced(c, err) // logged by reason (#1268)
+		}
 		h.logger.Error().Err(err).
 			Str("database", database).
 			Str("measurement", measurement).
 			Msg("TLE import: failed to write to buffer")
-		if errors.Is(err, ingest.ErrIngestFenced) {
-			return respondIngestFenced(c, err)
-		}
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": fmt.Sprintf("failed to ingest measurement %q: %v", measurement, err),
 		})
