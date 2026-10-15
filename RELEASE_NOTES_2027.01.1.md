@@ -1541,10 +1541,8 @@ peaked at 2.2 GiB.
   before. A request body cut short answers `400` for every format.
 - A `200` still means every row is in the write buffer and the WAL (when
   enabled); the files follow as their flushes finish.
-- Files sorted by time make about as many files as before. An unsorted file
-  that spans many hours makes many more small files (each chunk's flush writes
-  one file per hour it touches) until compaction merges them; sort large files
-  by time before importing.
+- Rows are written grouped by hour, so an unsorted file makes about one file
+  per hour as before (see "Imports group rows by hour" below).
 - TLE files are parsed whole, as before, but read once.
 
 ### NULLs survive a WAL replay; `time` and the WAL's own names are no longer column names
@@ -1577,6 +1575,43 @@ Three ways a crash and WAL replay changed data, and two names that broke it:
   part-way. Line-protocol imports refuse such a file (`400`, nothing
   written). `/write` drops only those points, writes the others, and answers
   `400` "partial write: N points dropped", as InfluxDB does.
+
+### Imports group rows by hour, and line protocol is parsed straight into typed columns
+
+Chunked imports (above) wrote each chunk's flush as one file per hour it
+touched, so an unsorted file made a file per hour per chunk. On a QA host, a
+4M-row file shuffled over a year (8,760 hours) made 455,420 files as line
+protocol and 350,398 as CSV or Parquet. Now each makes 8,760, with identical
+per-hour counts and sums. Peak RSS for the three imports went from 2.2 GB to
+1.2 GB. Times: line protocol 27.6 s to 16.5 s; CSV 8.6 s to 11.2 s and
+Parquet 5.6 s to 7.4 s (about 30% slower: rows are copied into their hour
+groups before writing).
+
+- **Hour grouping.** An import holds its parsed rows, grouped by hour, up to
+  half its memory allowance, then writes them one batch per measurement and
+  hour (at most a million cells per write). A file sorted by time writes as
+  before; an unsorted one makes about one file per hour per window of that
+  size. Deployments with `ingest.decimal_columns` set keep writing
+  line-protocol imports chunk by chunk, so the WAL keeps decimal values as
+  sent.
+- **Typed line-protocol parse.** Each chunk is parsed straight into typed
+  columns, without a map per tag and field per line: a 197 MB line-protocol
+  import now adds 25 MB of memory (71 MB before). The result is the same as
+  before (checked against the old path over a fixed corpus and 2.6 million
+  fuzzed inputs).
+- **A line whose keys land in one column is refused** (`400`, nothing
+  written): a tag `x`, a field `x` (stored as `x_value`) and a field
+  `x_value`. Before, which of the two values was kept depended on map order.
+- **Failures:** an import that fails before its first window is written
+  (a corrupt Parquet page found while writing, for example) now writes
+  nothing and answers the plain error, not a `500` with `rows_written`. A
+  failure part-way still answers `500` with `rows_written`, which now counts
+  written rows across hours, not a leading part of the file.
+- **WAL accounting:** CSV, Parquet and TLE imports wrote their WAL entries
+  without the database envelope and without charging them to the import's
+  WAL reservation (#676), so during a long import the disk gate counted those
+  bytes twice: once as reserved, once as written. They are now charged as
+  appended, as line-protocol writes already were.
 
 ### Stream takeover publishes the rows of unpulled files in one go, not in waves ([#1269](https://github.com/Basekick-Labs/arc/issues/1269))
 

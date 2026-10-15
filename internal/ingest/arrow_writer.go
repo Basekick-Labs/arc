@@ -3262,14 +3262,21 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 		} else {
 			walRecords := typedBatchToWALRecords(database, measurement, typedColumns, numRecords, b.getDecimalColumns(measurement))
 			if len(walRecords) > 0 {
+				// With the database envelope, as the columnar path writes its
+				// row entries (#889), and charged to the request's WAL
+				// reservation as appended (#676): uncharged, a long import held
+				// its whole reservation while its WAL bytes also landed on the
+				// volume, so the disk gate counted them twice.
+				rowPayload, marshalErr := msgpack.Marshal(walRecords)
 				var err error
-				if canTrack {
-					walHashes, err = tracked.AppendTracked(walRecords)
+				if marshalErr != nil {
+					err = marshalErr
+				} else if canTrack {
+					walHashes, err = tracked.AppendRawWithMetaTracked(database, rowPayload)
 				} else {
-					err = b.wal.Append(walRecords)
+					err = b.wal.AppendRawWithMeta(database, rowPayload)
 				}
-				// The marshalled size is not known here; the records are
-				// charged at their reservation, released when the request ends.
+				consumeWALReservation(ctx, len(rowPayload))
 				if err != nil {
 					b.recordWALError(err, func(ev *zerolog.Event) {
 						ev.Str("database", database).
