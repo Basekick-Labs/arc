@@ -1172,6 +1172,14 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Query execution metrics distinguish DuckDB and Arcx
+
+Prometheus now exports query execution outcomes and a latency histogram by
+engine, including failed executions. The existing aggregate query counters
+remain available.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1292](https://github.com/Basekick-Labs/arc/pull/1292).
+
 ### In shared storage, a DELETE no longer leaves rows another writer has not flushed ([#1265](https://github.com/Basekick-Labs/arc/issues/1265))
 
 In shared storage (`cluster.shared_storage_mode`) every writer takes writes,
