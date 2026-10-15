@@ -73,6 +73,9 @@ func executeArrowJSONQuery(
 			if onComplete != nil {
 				onComplete(0)
 			}
+			m.IncQuerySuccess()
+			m.IncQueryRows(0)
+			m.RecordQueryLatency(time.Since(start).Microseconds())
 			c.JSON(QueryResponse{
 				Success:         true,
 				Columns:         []string{},
@@ -91,6 +94,7 @@ func executeArrowJSONQuery(
 			}
 			m.IncQueryErrors()
 			m.IncQueryTimeouts()
+			m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, false, time.Since(start).Microseconds())
 			if onTimeout != nil {
 				onTimeout()
 			}
@@ -116,6 +120,7 @@ func executeArrowJSONQuery(
 			cancel()
 		}
 		m.IncQueryErrors()
+		m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, false, time.Since(start).Microseconds())
 		if onFail != nil {
 			onFail(err.Error())
 		}
@@ -192,6 +197,7 @@ func executeArrowJSONQuery(
 
 		if streamErr != nil {
 			m.IncQueryErrors()
+			m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, false, time.Since(start).Microseconds())
 			if errors.Is(streamErr, context.DeadlineExceeded) {
 				m.IncQueryTimeouts()
 				if onTimeout != nil {

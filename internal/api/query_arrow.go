@@ -638,7 +638,9 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			cancel()
 		}
 		if effectiveTimeout > 0 && ctxErr == context.DeadlineExceeded {
+			m.IncQueryErrors()
 			m.IncQueryTimeouts()
+			m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, false, time.Since(start).Microseconds())
 			if h.queryRegistry != nil && queryID != "" {
 				h.queryRegistry.TimedOut(queryID)
 			}
@@ -656,6 +658,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			// execution — the common case for a long query — surfaces here as an
 			// error return, not as a mid-stream break with a truncation trailer.
 			m.IncQueryErrors()
+			m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, false, time.Since(start).Microseconds())
 			h.logger.Warn().Str("sql", sqlutil.ForLog(req.SQL)).Str("query_id", queryID).Msg("Arrow query cancelled")
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"success": false,
@@ -663,6 +666,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			})
 		}
 		m.IncQueryErrors()
+		m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, false, time.Since(start).Microseconds())
 		if h.queryRegistry != nil && queryID != "" {
 			h.queryRegistry.Fail(queryID, sqlutil.SanitizeErrText(err.Error()))
 		}
@@ -819,6 +823,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 
 		if streamErr != nil {
 			m.IncQueryErrors()
+			m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, false, time.Since(start).Microseconds())
 			// Disposition, mirroring executeQuery: a deadline that fires
 			// mid-stream is a timeout (and counts as one — the pre-stream
 			// branch above already did, this path never had it); everything
