@@ -269,7 +269,11 @@ func TestPeriodicReconciliationSchedulerRestoresDeletedManifestFile(t *testing.T
 		return nil, "", nil
 	}
 	p.RunCatchUp(context.Background(), manifest)
-	waitStats(t, p, func(s map[string]int64) bool { return s["pulled"] == 1 })
+	// Settled, not just pulled: a worker counts the pull before it clears
+	// the path's catch-up tag, so catchup_inflight can still read 1 here.
+	waitStats(t, p, func(s map[string]int64) bool {
+		return s["pulled"] == 1 && s["catchup_inflight"] == 0 && s["catchup_completed_at"] != 0
+	})
 
 	if err := backend.Delete(context.Background(), entry.Path); err != nil {
 		t.Fatalf("delete local file: %v", err)
