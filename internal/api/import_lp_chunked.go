@@ -240,11 +240,18 @@ func coerceFirstValues(rec *models.ColumnarRecord, kinds map[string]lpKind) {
 			}
 			switch k {
 			case lpInt:
+				// The validation pass checked the values fit; the bounds are
+				// checked again at the conversion. A value that does not fit is
+				// left as is, and the buffer refuses it.
 				switch x := v.(type) {
 				case float64:
-					col[i] = int64(x) // fits: checked by the validation pass
+					if lpValueFits(lpInt, x) {
+						col[i] = int64(x)
+					}
 				case uint64:
-					col[i] = int64(x)
+					if x <= math.MaxInt64 {
+						col[i] = int64(x)
+					}
 				}
 			case lpFloat:
 				switch x := v.(type) {
