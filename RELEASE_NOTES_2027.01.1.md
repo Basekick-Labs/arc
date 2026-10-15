@@ -1172,6 +1172,14 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Time-bounded arcx queries avoid listing unrelated partitions ([#661](https://github.com/Basekick-Labs/arc/issues/661))
+
+The arcx router now uses validated time bounds to list only matching hour or
+day partitions for date-trunc queries and flat AND scans. Other query shapes
+keep the existing full-list fallback.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1293](https://github.com/Basekick-Labs/arc/pull/1293).
+
 ### In shared storage, a DELETE no longer leaves rows another writer has not flushed ([#1265](https://github.com/Basekick-Labs/arc/issues/1265))
 
 In shared storage (`cluster.shared_storage_mode`) every writer takes writes,
