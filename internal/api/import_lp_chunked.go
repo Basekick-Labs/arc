@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"sort"
 
 	"github.com/basekick-labs/arc/internal/ingest"
@@ -246,9 +247,10 @@ func coerceFirstValues(rec *models.ColumnarRecord, kinds map[string]lpKind) {
 				switch x := v.(type) {
 				case float64:
 					// float64(MaxInt64) is 2^63, so "<" is the exact bound;
-					// NaN fails both comparisons.
+					// NaN fails both comparisons. big.Float.Int64 truncates
+					// toward zero as int64(x) does in range.
 					if x < math.MaxInt64 && x >= math.MinInt64 {
-						col[i] = int64(x)
+						col[i], _ = new(big.Float).SetFloat64(x).Int64()
 					}
 				case uint64:
 					if x <= math.MaxInt64 {
