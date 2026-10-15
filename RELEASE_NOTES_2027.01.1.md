@@ -1172,6 +1172,14 @@ an unbounded operation.
 
 ## Bug fixes
 
+### ArcX Arrow IPC honours the governance row cap ([#727](https://github.com/Basekick-Labs/arc/issues/727))
+
+ArcX-served Arrow IPC responses now enforce `MaxRows` and declare trailers for
+truncation, execution time and capped rows, consistent with the DuckDB path.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1294](https://github.com/Basekick-Labs/arc/pull/1294).
+
 ### In shared storage, a DELETE no longer leaves rows another writer has not flushed ([#1265](https://github.com/Basekick-Labs/arc/issues/1265))
 
 In shared storage (`cluster.shared_storage_mode`) every writer takes writes,
