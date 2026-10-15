@@ -245,7 +245,9 @@ func coerceFirstValues(rec *models.ColumnarRecord, kinds map[string]lpKind) {
 				// left as is, and the buffer refuses it.
 				switch x := v.(type) {
 				case float64:
-					if lpValueFits(lpInt, x) {
+					// float64(MaxInt64) is 2^63, so "<" is the exact bound;
+					// NaN fails both comparisons.
+					if x < math.MaxInt64 && x >= math.MinInt64 {
 						col[i] = int64(x)
 					}
 				case uint64:
