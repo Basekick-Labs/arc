@@ -16,8 +16,6 @@ import (
 // in main.go's registration order, and checks the invariants the sequence
 // exists for:
 //
-//   - the replication receiver (a hook) is gone before the Arrow buffer
-//     closes (#853);
 //   - the file registrar drains after the Arrow buffer's final flush and
 //     while the coordinator — Raft — is still up, so the final files reach
 //     the manifest before the WAL that covers them is purged (#1014);
@@ -30,7 +28,6 @@ import (
 func TestClusterShutdownOrderKeepsRaftAliveForTheFinalFlush(t *testing.T) {
 	coordinator := shutdown.New(5*time.Second, zerolog.Nop())
 	var order []string
-	receiverRunning := true
 	raftAlive := true
 	var queued, manifest []string
 
@@ -38,9 +35,6 @@ func TestClusterShutdownOrderKeepsRaftAliveForTheFinalFlush(t *testing.T) {
 	// hooks, the cluster block, tiering.
 	coordinator.Register("arrow-buffer", shutdownFunc(func() error {
 		order = append(order, "arrow-buffer")
-		if receiverRunning {
-			return fmt.Errorf("arrow-buffer closed with the replication receiver still applying into it")
-		}
 		queued = append(queued, "shutdown.parquet")
 		return nil
 	}), shutdown.PriorityBuffer)
@@ -61,11 +55,6 @@ func TestClusterShutdownOrderKeepsRaftAliveForTheFinalFlush(t *testing.T) {
 		return nil
 	}, shutdown.PriorityScheduler)
 
-	coordinator.RegisterHook("cluster-replication-receiver", func(context.Context) error {
-		order = append(order, "cluster-replication-receiver")
-		receiverRunning = false
-		return nil
-	}, shutdown.PriorityIngest)
 	registerClusterCoordinatorShutdown(coordinator, func() error {
 		order = append(order, "cluster-coordinator")
 		raftAlive = false
@@ -96,7 +85,7 @@ func TestClusterShutdownOrderKeepsRaftAliveForTheFinalFlush(t *testing.T) {
 		t.Fatalf("manifest after shutdown = %v, want [shutdown.parquet] (order %v)", manifest, order)
 	}
 	want := []string{
-		"cluster-replication-receiver", "retention-scheduler",
+		"retention-scheduler",
 		"arrow-buffer", "file-registrar", "wal-purge", "cluster-coordinator", "tiering",
 	}
 	if !reflect.DeepEqual(order, want) {

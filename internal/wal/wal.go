@@ -1609,9 +1609,8 @@ func (w *Writer) appendTrackedEntry(logicalPayload []byte) (string, error) {
 	// Everything after this — the Sprintf, the CRC, and above all the
 	// synchronous replication hook below — sits between them otherwise, and a
 	// sequence counted in trackedSequence but absent from pendingSeqs is a
-	// sequence the floor does not protect. With a replication hook set that
-	// window spans a channel send to the replication sender (no hook is
-	// installed while the stream is off, #888).
+	// sequence the floor does not protect. With a replication hook set (the
+	// origin stream, #1207) that window spans its hook call.
 	w.pendingMu.Lock()
 	seq := atomic.AddUint64(&w.trackedSequence, 1)
 	w.pendingSeqs[seq] = struct{}{}

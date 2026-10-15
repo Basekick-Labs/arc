@@ -2237,20 +2237,12 @@ func main() {
 						arrowBuffer.SetIngestGate(nil)
 						clusterCoordinator = nil
 					} else {
-						// Two steps. The inbound replication stream applies entries
-						// through the ingest handler, so it must be gone before the
-						// Arrow buffer and WAL close (#853); those are components,
-						// every hook runs before any component, and PriorityIngest
-						// puts it with the other ingest paths. The coordinator
-						// itself is a COMPONENT: it owns Raft and must outlive the
-						// arrow-buffer flush and the file-registrar drain, which are
-						// components too (#1014). The schedulers that ask it whether
-						// they may run are hooks at PriorityScheduler, so they have
-						// already quiesced by the time any component runs.
-						shutdownCoordinator.RegisterHook("cluster-replication-receiver", func(context.Context) error {
-							clusterCoordinator.StopReplicationReceiver()
-							return nil
-						}, shutdown.PriorityIngest)
+						// The coordinator is a COMPONENT: it owns Raft and must
+						// outlive the arrow-buffer flush and the file-registrar
+						// drain, which are components too (#1014). The schedulers
+						// that ask it whether they may run are hooks at
+						// PriorityScheduler, so they have already quiesced by the
+						// time any component runs.
 						registerClusterCoordinatorShutdown(shutdownCoordinator, clusterCoordinator.Stop)
 
 						localNode := clusterCoordinator.GetLocalNode()
@@ -2344,18 +2336,6 @@ func main() {
 										runInitialTokenBootstrap()
 									}
 								}
-							}
-						}
-
-						// WAL replication stream. StartReplication starts nothing
-						// until the standby-writer stream lands (#888, #1207) and
-						// logs that itself; the file puller that feeds readers is
-						// started by the coordinator regardless.
-						if cfg.Cluster.ReplicationEnabled && walWriter != nil {
-							clusterCoordinator.SetWAL(walWriter)
-							clusterCoordinator.SetIngestBuffer(arrowBuffer)
-							if err := clusterCoordinator.StartReplication(); err != nil {
-								log.Warn().Err(err).Msg("Failed to start WAL replication")
 							}
 						}
 
