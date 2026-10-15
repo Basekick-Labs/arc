@@ -1593,7 +1593,10 @@ groups before writing).
   before; an unsorted one makes about one file per hour per window of that
   size. Deployments with `ingest.decimal_columns` set keep writing
   line-protocol imports chunk by chunk, so the WAL keeps decimal values as
-  sent.
+  sent. Only the import endpoints group: the write endpoints (msgpack, line
+  protocol, `/write`, `/api/v2/write`) are unchanged and leave a random-order
+  backfill's small files to compaction. For a large backfill, use an import
+  endpoint or send the data sorted by time.
 - **Typed line-protocol parse.** Each chunk is parsed straight into typed
   columns, without a map per tag and field per line: a 197 MB line-protocol
   import now adds 25 MB of memory (71 MB before). The result is the same as
