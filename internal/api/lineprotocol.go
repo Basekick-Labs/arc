@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -272,6 +273,12 @@ localProcessing:
 		})
 	}
 
+	if !h.buffer.HasDecimalColumns() {
+		return h.writeTyped(c, body, database, precision)
+	}
+
+	// Decimal columns (ingest.decimal_columns) are converted by the buffer's
+	// typing from any value: records, then that typing.
 	// Parse line protocol with timestamp precision
 	records := h.parser.ParseBatchWithPrecision(body, precision)
 
@@ -400,6 +407,161 @@ localProcessing:
 
 	// InfluxDB returns 204 No Content on success
 	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// writeTyped writes a line-protocol body parsed straight into typed columns
+// (no per-line maps or boxed values). Each column is typed by its first value
+// in the body, as before. A point that cannot be written as one row (a `time`
+// key, two keys landing in one column, a value that does not fit its column's
+// type) is dropped, the rest are written, and the answer is a "partial write"
+// 400, as InfluxDB does.
+func (h *LineProtocolHandler) writeTyped(c *fiber.Ctx, body []byte, database, precision string) error {
+	batches, rows, drops, err := h.parser.ParseLPWrite(body, precision)
+	if err != nil {
+		h.totalErrors.Add(1)
+		metrics.Get().IncIngestErrors()
+		h.logger.Error().Err(err).Str("database", database).Msg("Failed to parse line protocol")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Write failed: " + err.Error()})
+	}
+	dropped := 0
+	for _, d := range drops {
+		dropped += d.Points
+	}
+
+	total := 0
+	measurements := make([]string, 0, len(batches))
+	for m, n := range rows {
+		total += n
+		measurements = append(measurements, m)
+	}
+	if total == 0 {
+		h.totalErrors.Add(1)
+		if dropped > 0 {
+			h.logDrops(database, drops)
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": partialWriteMessage(drops, dropped, false)})
+		}
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "No valid records in request"})
+	}
+	sort.Strings(measurements)
+
+	h.totalRecords.Add(int64(total))
+
+	if h.rbacManager != nil { // not license-gated; see CheckWritePermissions
+		if err := h.checkWritePermissions(c, database, measurements); err != nil {
+			h.totalErrors.Add(1)
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": err.Error()})
+		}
+	}
+	// Validate measurement names (prevent control chars that break S3 XML responses)
+	for _, m := range measurements {
+		if !isValidMeasurementName(m) {
+			h.totalErrors.Add(1)
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": fmt.Sprintf("invalid measurement name %q: must start with a letter and contain only alphanumeric characters, underscores, or hyphens", m),
+			})
+		}
+	}
+
+	// Refuse the whole request up front if writes are fenced (#1207) or the
+	// WAL volume is under disk pressure (#676); see the record path above.
+	writeCtx, release, err := h.buffer.AdmitRequest(c.Context(), int64(len(body)))
+	if err != nil {
+		h.totalErrors.Add(1)
+		return respondWriteRefused(c, err)
+	}
+	defer release()
+
+	for _, m := range measurements {
+		if err := h.buffer.WriteTypedColumnarDirect(writeCtx, database, m, batches[m], rows[m]); err != nil {
+			h.totalErrors.Add(1)
+			if ingest.IsWriteRefusal(err) {
+				return respondWriteRefused(c, err)
+			}
+			metrics.Get().IncIngestErrors()
+			h.logger.Error().Err(err).Str("database", database).Str("measurement", m).Int("records", rows[m]).Msg("Failed to write to Arrow buffer")
+			if errors.Is(err, ingest.ErrBufferClosing) {
+				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Write rejected (server shutting down): " + err.Error()})
+			}
+			if errors.Is(err, ingest.ErrSchemaChurnExceeded) {
+				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Write rejected (schema churn): " + err.Error()})
+			}
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Write failed: " + err.Error()})
+		}
+	}
+
+	m := metrics.Get()
+	m.IncLineProtocolRequests()
+	m.IncLineProtocolRecords(int64(total))
+	m.IncLineProtocolBytes(int64(len(body)))
+	m.IncIngestRecords(int64(total))
+	m.IncIngestBytes(int64(len(body)))
+	m.IncIngestBatches()
+
+	if dropped > 0 {
+		h.totalErrors.Add(1)
+		h.logDrops(database, drops)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": partialWriteMessage(drops, dropped, true)})
+	}
+	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// maxDropLogLines bounds the Error lines one request's drops log: a body of
+// many measurements could otherwise log a line per measurement.
+const maxDropLogLines = 10
+
+// logDrops logs a write's dropped points loudly (they are data a client sent
+// and Arc did not store): one Error line per measurement, column and reason,
+// up to maxDropLogLines, then one line counting the rest. Called once the
+// request's outcome is known, so a refused request logs no drops.
+func (h *LineProtocolHandler) logDrops(database string, drops []ingest.LPDrop) {
+	for i, d := range drops {
+		if i == maxDropLogLines {
+			rest := 0
+			for _, r := range drops[i:] {
+				rest += r.Points
+			}
+			h.logger.Error().
+				Str("database", database).
+				Int("points_dropped", rest).
+				Int("reasons", len(drops)-i).
+				Msg("Line protocol points dropped (partial write): more measurements and columns")
+			return
+		}
+		ev := h.logger.Error().
+			Str("database", database).
+			Str("measurement", d.Measurement).
+			Int("points_dropped", d.Points).
+			Str("reason", d.Reason)
+		if d.Column != "" {
+			ev = ev.Str("column", d.Column)
+		}
+		if d.Reason == ingest.LPDropKind {
+			ev = ev.Str("column_type", d.Kind.String()).Str("value_type", d.ValueType)
+		}
+		ev.Msg("Line protocol points dropped (partial write)")
+	}
+}
+
+// partialWriteMessage is InfluxDB's "partial write" answer: how many points
+// were dropped and why.
+func partialWriteMessage(drops []ingest.LPDrop, dropped int, wroteRest bool) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "partial write: %d points dropped:", dropped)
+	for i, d := range drops {
+		if i == 5 {
+			fmt.Fprintf(&b, " (and %d more)", len(drops)-i)
+			break
+		}
+		if d.Column != "" {
+			fmt.Fprintf(&b, " %d in %q column %q: %s;", d.Points, d.Measurement, d.Column, d.Reason)
+		} else {
+			fmt.Fprintf(&b, " %d in %q: %s;", d.Points, d.Measurement, d.Reason)
+		}
+	}
+	if wroteRest {
+		b.WriteString(" the other points were written")
+	}
+	return b.String()
 }
 
 // Stats returns Line Protocol handler statistics

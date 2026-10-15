@@ -1,11 +1,34 @@
 package ingest
 
 import (
+	"bytes"
+	"math"
 	"testing"
 
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
+
+	"github.com/Basekick-Labs/msgpack/v6"
+	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/stretchr/testify/require"
 )
+
+// typedBatchToWALRecords decodes encodeTypedWALRows' entry, as WAL replay
+// reads it.
+func typedBatchToWALRecords(database, measurement string, batch *TypedColumnBatch, numRecords int, decimalCols map[string]config.DecimalSpec) []map[string]interface{} {
+	payload, err := encodeTypedWALRows(database, measurement, batch, numRecords, decimalCols)
+	if err != nil {
+		panic(err)
+	}
+	if payload == nil {
+		return nil
+	}
+	var rows []map[string]interface{}
+	if err := msgpack.Unmarshal(payload, &rows); err != nil {
+		panic(err)
+	}
+	return rows
+}
 
 // The time column is never left out of a WAL row, even if a Validity entry
 // marks it: a row without time is a poison entry on replay.
@@ -30,6 +53,18 @@ func TestWALRowTargetKeysWin(t *testing.T) {
 	db, m := WALRowTarget(rows[0])
 	require.Equal(t, "d", db)
 	require.Equal(t, "m", m)
+
+	// One key each: the user column is left out, not shadowed by a later
+	// duplicate (which a decoder may resolve either way).
+	payload, err := encodeTypedWALRows("d", "m", batch, 1, nil)
+	require.NoError(t, err)
+	dec := msgpack.NewDecoder(bytes.NewReader(payload))
+	n, err := dec.DecodeArrayLen()
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+	keys, err := dec.DecodeMapLen()
+	require.NoError(t, err)
+	require.Equal(t, len(rows[0]), keys, "a WAL row has duplicate keys")
 }
 
 // Rows from older clients name their target with "measurement" / "database"
@@ -98,4 +133,43 @@ func TestWALRowDatabaseColumnIsAColumn(t *testing.T) {
 	require.Equal(t, "default", db)
 	require.Equal(t, "cpu", m)
 	require.Equal(t, []interface{}{"prod"}, cols["database"])
+}
+
+// The typed WAL entry decodes as msgpack.Marshal of one map per row decoded
+// (the form it replaced): every type, NULLs, decimals, a target-key column.
+func TestEncodeTypedWALRowsMatchesRowMaps(t *testing.T) {
+	dec := decimal128.FromI64(12345)
+	batch := &TypedColumnBatch{
+		Data: map[string]interface{}{
+			"time":      []int64{1, 2, 3},
+			"i":         []int64{-1, 0, math.MaxInt64},
+			"f":         []float64{1.5, math.Inf(1), -0.0},
+			"s":         []string{"", "x", "héllo"},
+			"b":         []bool{true, false, true},
+			"d":         []decimal128.Num{dec, dec, dec},
+			"_database": []string{"evil", "evil", "evil"},
+		},
+		Validity: map[string][]bool{"i": {true, false, true}, "s": {false, false, false}},
+	}
+	decimals := map[string]config.DecimalSpec{"d": {Scale: 2}}
+	want := make([]map[string]interface{}, 3)
+	for i := range want {
+		row := map[string]interface{}{
+			"time": batch.Data["time"].([]int64)[i],
+			"f":    batch.Data["f"].([]float64)[i],
+			"b":    batch.Data["b"].([]bool)[i],
+			"d":    123.45,
+		}
+		if i != 1 {
+			row["i"] = batch.Data["i"].([]int64)[i]
+		}
+		row["_database"] = "d"
+		row["_measurement"] = "m"
+		want[i] = row
+	}
+	raw, err := msgpack.Marshal(want)
+	require.NoError(t, err)
+	var wantRows []map[string]interface{}
+	require.NoError(t, msgpack.Unmarshal(raw, &wantRows))
+	require.Equal(t, wantRows, typedBatchToWALRecords("d", "m", batch, 3, decimals))
 }

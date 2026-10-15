@@ -149,9 +149,13 @@ func typedPath(p *LineProtocolParser, data []byte, precision string, kinds map[s
 }
 
 func diffBuffer(t *testing.T) *ArrowBuffer {
-	b := NewArrowBuffer(&config.IngestConfig{MaxBufferSize: 10, MaxBufferAgeMS: 600000, Compression: "snappy", FlushWorkers: 1, FlushQueueSize: 1, ShardCount: 1, DataPageVersion: "2.0"}, &mockStorageBackend{}, zerolog.New(io.Discard))
+	b := newDiffBufferForFuzz()
 	t.Cleanup(func() { b.Close() })
 	return b
+}
+
+func newDiffBufferForFuzz() *ArrowBuffer {
+	return NewArrowBuffer(&config.IngestConfig{MaxBufferSize: 10, MaxBufferAgeMS: 600000, Compression: "snappy", FlushWorkers: 1, FlushQueueSize: 1, ShardCount: 1, DataPageVersion: "2.0"}, &mockStorageBackend{}, zerolog.New(io.Discard))
 }
 
 // checkSamePath asserts both paths agree on data; it reports whether the
@@ -247,7 +251,7 @@ func FuzzLPTypedMatchesRecordPath(f *testing.F) {
 	for _, c := range lpDiffCorpus {
 		f.Add(c)
 	}
-	buf := NewArrowBuffer(&config.IngestConfig{MaxBufferSize: 10, MaxBufferAgeMS: 600000, Compression: "snappy", FlushWorkers: 1, FlushQueueSize: 1, ShardCount: 1, DataPageVersion: "2.0"}, &mockStorageBackend{}, zerolog.New(io.Discard))
+	buf := newDiffBufferForFuzz()
 	defer buf.Close()
 	f.Fuzz(func(t *testing.T, data string) {
 		checkSamePath(t, buf, []byte(data), "ns")

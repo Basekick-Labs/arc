@@ -305,6 +305,7 @@ func (c *lpColumn) data() interface{} {
 type lpMeasurement struct {
 	time []int64
 	cols map[string]*lpColumn
+	hint int // capacity of a new column
 }
 
 // ParseLPTyped parses a line-protocol chunk straight into one typed batch per
@@ -315,37 +316,110 @@ type lpMeasurement struct {
 // (when set) is skipped. A value that does not fit its column's kind is an
 // error.
 func (p *LineProtocolParser) ParseLPTyped(data []byte, precision, filter string, kinds map[string]map[string]LPKind) (map[string]*TypedColumnBatch, map[string]int, error) {
+	if kinds == nil {
+		kinds = map[string]map[string]LPKind{} // every column is then "has no kind"
+	}
+	batches, rows, _, err := p.parseLPTyped(data, precision, filter, kinds)
+	return batches, rows, err
+}
+
+// LPDrop counts the points of a write dropped for one reason, measurement
+// and column.
+type LPDrop struct {
+	Measurement string
+	Column      string // "" for the time key
+	Reason      string // LPDropTime, LPDropSameColumn, LPDropKind
+	Kind        LPKind // the column's kind (LPDropKind)
+	ValueType   string // the dropped value's Go type (LPDropKind)
+	Points      int
+}
+
+// Reasons a write drops a point.
+const (
+	LPDropTime       = "a tag or field named \"time\" (time is the timestamp)"
+	LPDropSameColumn = "two keys of one line write one column (a field named like a tag is stored as \"<name>_value\")"
+	LPDropKind       = "a value that does not fit its column's type (the column's first value decides it)"
+)
+
+// ParseLPWrite is ParseLPTyped for a write: each column is typed by its first
+// value in data, as a write of the body's records typed it, and a point that
+// cannot be written as one row is dropped (counted in drops) while the rest
+// are written, as InfluxDB does: a point with a `time` key, one whose keys
+// land in one column, one with a value that does not fit its column's type.
+// A dropped point sets no column's type.
+func (p *LineProtocolParser) ParseLPWrite(data []byte, precision string) (map[string]*TypedColumnBatch, map[string]int, []LPDrop, error) {
+	return p.parseLPTyped(data, precision, "", nil)
+}
+
+// lpMaxColumnHint bounds the rows a new column reserves up front.
+const lpMaxColumnHint = 1 << 16
+
+type lpDropKey struct{ measurement, column, reason string }
+
+func (p *LineProtocolParser) parseLPTyped(data []byte, precision, filter string, kinds map[string]map[string]LPKind) (map[string]*TypedColumnBatch, map[string]int, []LPDrop, error) {
+	infer := kinds == nil
+	// The first measurement's columns are sized for the whole body: exact for
+	// a body of one measurement (the common write), at most the body's line
+	// count per column otherwise. Later measurements grow by append: sizing
+	// each of them for the body would reserve measurements x lines x columns.
+	// Capped: blank, comment and invalid lines count but add no rows, and a
+	// larger body grows by append from the cap.
+	hint := min(bytes.Count(data, []byte{'\n'})+1, lpMaxColumnHint)
 	ms := map[string]*lpMeasurement{}
+	var drops map[lpDropKey]*LPDrop
+	drop := func(l *LPLine, column, reason string, kind LPKind, v interface{}) {
+		if drops == nil {
+			drops = map[lpDropKey]*LPDrop{}
+		}
+		key := lpDropKey{l.Measurement, column, reason}
+		d := drops[key]
+		if d == nil {
+			d = &LPDrop{Measurement: l.Measurement, Column: column, Reason: reason, Kind: kind}
+			if v != nil {
+				d.ValueType = fmt.Sprintf("%T", v)
+			}
+			drops[key] = d
+		}
+		d.Points++
+	}
 	err := p.LexBatch(data, precision, func(l *LPLine) error {
 		if filter != "" && l.Measurement != filter {
 			return nil
 		}
-		mk := kinds[l.Measurement]
 		m := ms[l.Measurement]
+		if infer && !lpPointFits(l, m, drop) {
+			return nil
+		}
+		mk := kinds[l.Measurement]
 		if m == nil {
-			m = &lpMeasurement{cols: map[string]*lpColumn{}}
+			m = &lpMeasurement{cols: map[string]*lpColumn{}, time: make([]int64, 0, hint), hint: hint}
 			ms[l.Measurement] = m
+			hint = 0
 		}
 		row := len(m.time)
 		m.time = append(m.time, l.Timestamp)
-		col := func(name string, tag bool) (*lpColumn, error) {
+		col := func(name string, tag bool, v interface{}) (*lpColumn, error) {
 			c := m.cols[name]
 			if c == nil {
 				k := LPKindString
-				if !tag {
+				switch {
+				case tag:
+				case infer:
+					k = LPKindOf(v)
+				default:
 					k = mk[name]
 				}
 				if k == LPKindNone {
 					return nil, fmt.Errorf("measurement %q column %q has no kind", l.Measurement, name)
 				}
-				c = &lpColumn{kind: k, tag: tag}
+				c = newLPColumn(k, tag, m.hint)
 				m.cols[name] = c
 			}
 			c.tag = c.tag || tag
 			return c, nil
 		}
 		for _, t := range l.Tags {
-			c, err := col(t.Key, true)
+			c, err := col(t.Key, true, t.Value)
 			if err != nil {
 				return err
 			}
@@ -355,7 +429,7 @@ func (p *LineProtocolParser) ParseLPTyped(data []byte, precision, filter string,
 		}
 		for _, f := range l.Fields {
 			name := LPFieldColumn(l, f.Key)
-			c, err := col(name, false)
+			c, err := col(name, false, f.Value)
 			if err != nil {
 				return err
 			}
@@ -366,17 +440,17 @@ func (p *LineProtocolParser) ParseLPTyped(data []byte, precision, filter string,
 		return nil
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	out := make(map[string]*TypedColumnBatch, len(ms))
 	rows := make(map[string]int, len(ms))
 	for name, m := range ms {
 		n := len(m.time)
 		b := &TypedColumnBatch{Data: make(map[string]interface{}, len(m.cols)+1), Validity: map[string][]bool{}}
-		b.Data["time"] = m.time
+		b.Data["time"] = exactSlice(m.time)
 		for cname, c := range m.cols {
 			c.pad(n)
-			b.Data[cname] = c.data()
+			b.Data[cname] = c.exactData()
 			if c.valid != nil {
 				b.Validity[cname] = c.valid
 			}
@@ -384,11 +458,107 @@ func (p *LineProtocolParser) ParseLPTyped(data []byte, precision, filter string,
 				b.TagColumns = append(b.TagColumns, cname)
 			}
 		}
-		sort.Strings(b.TagColumns)
+		if len(b.TagColumns) > 1 {
+			sort.Strings(b.TagColumns)
+		}
 		out[name] = b
 		rows[name] = n
 	}
-	return out, rows, nil
+	var dropped []LPDrop
+	for _, d := range drops {
+		dropped = append(dropped, *d)
+	}
+	sort.Slice(dropped, func(i, j int) bool {
+		if dropped[i].Measurement != dropped[j].Measurement {
+			return dropped[i].Measurement < dropped[j].Measurement
+		}
+		if dropped[i].Column != dropped[j].Column {
+			return dropped[i].Column < dropped[j].Column
+		}
+		return dropped[i].Reason < dropped[j].Reason
+	})
+	return out, rows, dropped, nil
+}
+
+// lpPointFits reports whether l can be written as one row of m (nil: the
+// measurement has no rows yet); if not, it records why with drop. It checks
+// the whole line before any of it is written, so a dropped point leaves no
+// partial row and sets no column's type.
+func lpPointFits(l *LPLine, m *lpMeasurement, drop func(l *LPLine, column, reason string, kind LPKind, v interface{})) bool {
+	if _, found := LPLineTimeKey(l); found {
+		drop(l, "", LPDropTime, LPKindNone, nil)
+		return false
+	}
+	if column, clash := LPLineColumnClash(l); clash {
+		drop(l, column, LPDropSameColumn, LPKindNone, nil)
+		return false
+	}
+	kindOf := func(column string) (LPKind, bool) {
+		if m == nil {
+			return LPKindNone, false
+		}
+		if c := m.cols[column]; c != nil {
+			return c.kind, true
+		}
+		return LPKindNone, false
+	}
+	for _, t := range l.Tags {
+		if k, ok := kindOf(t.Key); ok && k != LPKindString {
+			drop(l, t.Key, LPDropKind, k, t.Value)
+			return false
+		}
+	}
+	for _, f := range l.Fields {
+		column := LPFieldColumn(l, f.Key)
+		k, ok := kindOf(column)
+		if !ok {
+			k = LPKindOf(f.Value) // a new column: its first value must fit it too
+		}
+		if !LPValueFits(k, f.Value) {
+			drop(l, column, LPDropKind, k, f.Value)
+			return false
+		}
+	}
+	return true
+}
+
+func newLPColumn(k LPKind, tag bool, hint int) *lpColumn {
+	c := &lpColumn{kind: k, tag: tag}
+	switch k {
+	case LPKindInt:
+		c.ints = make([]int64, 0, hint)
+	case LPKindFloat:
+		c.flts = make([]float64, 0, hint)
+	case LPKindString:
+		c.strs = make([]string, 0, hint)
+	case LPKindBool:
+		c.bools = make([]bool, 0, hint)
+	}
+	return c
+}
+
+// exactData is data with no more than 1/8 unused capacity: the buffer counts
+// a batch's bytes by length, so slack would be held unseen until the flush.
+func (c *lpColumn) exactData() interface{} {
+	switch c.kind {
+	case LPKindInt:
+		return exactSlice(c.ints)
+	case LPKindFloat:
+		return exactSlice(c.flts)
+	case LPKindString:
+		return exactSlice(c.strs)
+	default:
+		return exactSlice(c.bools)
+	}
+}
+
+func exactSlice[T any](v []T) []T {
+	if cap(v) > len(v)+len(v)/8 {
+		out := make([]T, len(v))
+		copy(out, v)
+		return out
+	}
+	return v
 }
 
 // LPLineTimeKey reports a tag or field of l named "time" (see

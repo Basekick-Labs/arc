@@ -1616,6 +1616,36 @@ groups before writing).
   bytes twice: once as reserved, once as written. They are now charged as
   appended, as line-protocol writes already were.
 
+### Line-protocol writes are parsed straight into typed columns, and drop only the points that do not fit
+
+The line-protocol write endpoints (`/write`, `/api/v2/write`,
+`/api/v1/write/line-protocol`) now parse a request straight into typed
+columns, as line-protocol imports do (above), instead of a map per tag and
+field per line. In-process benchmarks (1,000-line requests, Apple M3 Max)
+moved from 4.18M to 7.61M rows/s for the `sustained_bench` IoT shape with the
+WAL off, and from 2.26M to 4.48M with the WAL on; other shapes gained 24% to
+98%, with 8% to 41% fewer allocations per request.
+
+- **A point that does not fit is dropped, not the whole measurement.** A
+  column is still typed by its first value in the request. A later point
+  whose value does not fit (a string in a float column, a number in a tag
+  column, an unsigned value above the int64 range or NaN/Inf in an integer
+  column) is dropped, and every other point is written, the same measurement
+  included. Before, such a value failed that measurement's write with a
+  `500` after other measurements of the request might already have been
+  written. A point whose keys land in one column (a tag `x`, a field `x`
+  stored as `x_value`, and a field `x_value`) is dropped too; before, which
+  value was kept depended on map order.
+- **The answer** is `400` "partial write: N points dropped: ..." naming the
+  measurement, column and reason, as InfluxDB does (the `time` key drops
+  above answer the same way). Each request logs its drops at Error level, one
+  line per measurement, column and reason (up to 10, then one line counting
+  the rest), only when the request was otherwise written.
+- **WAL entries** for typed writes (line protocol, and CSV, Parquet and TLE
+  imports) are encoded straight from the columns. A line-protocol entry now
+  holds the value the buffer stored (an integer column's `2.9` is `2`).
+- Deployments with `ingest.decimal_columns` set keep the previous write path.
+
 ### Stream takeover publishes the rows of unpulled files in one go, not in waves ([#1269](https://github.com/Basekick-Labs/arc/issues/1269))
 
 When a primary writer dies with files nobody had pulled yet, the new primary
