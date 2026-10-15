@@ -2081,15 +2081,20 @@ func (p *Puller) verifyLocalCopy(log zerolog.Logger, entry *raft.FileEntry) loca
 	h := sha256.New()
 	w := &progressWriter{ctxWriter: ctxWriter{ctx: ctx, w: h}}
 	w.last.Store(time.Now().UnixNano())
+	stall := localHashStall
+	watched := make(chan struct{})
+	// Joined before returning: nothing of this hash outlives the call.
+	defer func() { cancel(); <-watched }()
 	go func() {
-		t := time.NewTicker(min(time.Second, localHashStall/4))
+		defer close(watched)
+		t := time.NewTicker(min(time.Second, stall/4))
 		defer t.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case now := <-t.C:
-				if now.UnixNano()-w.last.Load() > int64(localHashStall) {
+				if now.UnixNano()-w.last.Load() > int64(stall) {
 					cancel()
 					return
 				}
