@@ -1444,7 +1444,42 @@ state, and tens of thousands during a failover.
   without the size cap and sent on under its original `Content-Encoding`.
 - `arc_cluster_writes_forwarded_total{result}`: `ok`, `refused`, `error`,
   `unavailable`, `ambiguous`.
-- Import endpoints, MQTT and continuous queries on a standby still answer 503.
+- MQTT and continuous queries on a standby still answer 503; imports forward
+  (#1070 below).
+
+### Imports sent to a reader, a compactor or a standby writer reach a writer ([#1070](https://github.com/Basekick-Labs/arc/issues/1070))
+
+The import endpoints (`/api/v1/import/csv`, `parquet`, `lp`, `tle`) never
+forwarded. A reader or a compactor imported the file into its own buffer,
+outside the writer's WAL, and a standby writer refused it with `503`.
+
+- A reader or a compactor forwards an import to a writer, and a standby writer
+  forwards it to the primary, by the rules of the other write endpoints
+  (#1270 above): once, with the upload as received, one hop at most. `503`
+  with `Retry-After` and `X-Arc-Ingest-Fenced` means nothing was written; `504`
+  means it was sent and may have been written.
+- A forwarded import is not bound by `cluster.write_forward_timeout_ms`, so a
+  large import is not answered `504` while the writer is still importing it.
+  It is bound by `cluster.import_forward_timeout_ms` (new, default `3600000`,
+  1 hour; `0` = no bound), a backstop for a writer that never answers: the
+  forward is not cancelled when the client gives up, and until then the
+  forwarding node holds the upload.
+- An upload larger than the 500 MB import limit is refused with `413` by the
+  node that received it, before it is forwarded.
+- A line-protocol import with several measurements that stopped after some of
+  them were written answered `503` "retry", as if nothing had been written:
+  with `X-Arc-Ingest-Fenced` when the node was fenced part-way, without it when
+  the buffer was closing.
+  A re-run wrote the earlier measurements again. It now answers `500` without
+  those headers, with `written_measurements` and `stopped_at_measurement`. A
+  refusal before anything is written is still `503`.
+- An import whose rows were all accepted and whose flush then failed says the
+  rows may still be stored; check before running the file again.
+- A forwarded import is logged by the audit log of both nodes, as other
+  forwarded writes are.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1075](https://github.com/Basekick-Labs/arc/pull/1075).
+
 ### Stream takeover publishes the rows of unpulled files in one go, not in waves ([#1269](https://github.com/Basekick-Labs/arc/issues/1269))
 
 When a primary writer dies with files nobody had pulled yet, the new primary

@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -81,7 +82,7 @@ func isClientForwardingHeader(canonicalKey string) bool {
 // forwarding via the router.
 //
 // Lifecycle: every caller in this codebase (lineprotocol.go, msgpack.go,
-// tle.go, query.go) invokes the returned *http.Request synchronously
+// import.go, tle.go, query.go) invokes the returned *http.Request synchronously
 // within the Fiber handler — they pass it to router.RouteWrite/RouteQuery
 // (which blocks on http.Client.Do; queries are buffered for retries, writes
 // are streamed once and never retried, see internal/cluster/router.go), then
@@ -110,10 +111,10 @@ func BuildHTTPRequest(c *fiber.Ctx) (*http.Request, error) {
 	// decodes it with its own caps.
 	body := bytes.NewReader(c.Request().Body())
 
-	// c.Context() propagates client-disconnect cancellation to the
-	// forwarded request (so the backend stops processing if the original
-	// client gave up). c.UserContext() would default to context.Background
-	// and lose that signal.
+	// c.Context() ends the forwarded request when this server shuts down.
+	// It does NOT end it when the client disconnects: fasthttp closes a
+	// request's Done() only at shutdown, so a forward runs until the peer
+	// answers or the router's client timeout (#1070).
 	req, err := http.NewRequestWithContext(c.Context(), c.Method(), url, body)
 	if err != nil {
 		return nil, err
@@ -356,6 +357,16 @@ const ingestFencedLocal = "arc.ingest_fenced"
 // the handler reads or writes anything. handled=false: process locally (the
 // local path refuses with 503 if this node may not take writes).
 func forwardStandbyWrite(router *cluster.Router, c *fiber.Ctx) (handled bool, err error) {
+	return forwardStandby(router, c, router.ForwardWriteTo)
+}
+
+// forwardStandbyImport is forwardStandbyWrite for an import: same target and
+// rules, the import timeout (Router.ForwardImportTo, #1070).
+func forwardStandbyImport(router *cluster.Router, c *fiber.Ctx) (handled bool, err error) {
+	return forwardStandby(router, c, router.ForwardImportTo)
+}
+
+func forwardStandby(router *cluster.Router, c *fiber.Ctx, forward func(context.Context, *cluster.Node, *http.Request) (*http.Response, error)) (handled bool, err error) {
 	if c.Get(ForwardedByHeader) != "" {
 		return false, nil // one hop at most
 	}
@@ -367,7 +378,7 @@ func forwardStandbyWrite(router *cluster.Router, c *fiber.Ctx) (handled bool, er
 	if err != nil {
 		return false, nil
 	}
-	resp, err := router.ForwardWriteTo(c.Context(), node, req)
+	resp, err := forward(c.Context(), node, req)
 	if err != nil {
 		return true, respondWriteForwardError(c, err)
 	}
@@ -391,7 +402,7 @@ func respondWriteForwardError(c *fiber.Ctx, err error) error {
 		})
 	case errors.Is(err, cluster.ErrWriteForwardAmbiguous):
 		return c.Status(fiber.StatusGatewayTimeout).JSON(fiber.Map{
-			"error": "Write forwarded to the primary writer got no answer in time; it may have been written",
+			"error": "Write forwarded to the primary writer got no answer; it may have been written",
 		})
 	}
 	return HandleRoutingError(c, err)

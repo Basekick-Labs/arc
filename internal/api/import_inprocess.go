@@ -34,6 +34,9 @@ const maxImportSize = 500 * 1024 * 1024 // 500MB
 // DuckDB sandbox allowlist.
 func (h *ImportHandler) handleCSVImport(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
+	if handled, err := h.forwardWriteIfNeeded(c); handled {
+		return err
+	}
 	start := time.Now()
 
 	database, measurement, errResp := h.importPreamble(c)
@@ -245,7 +248,7 @@ func (h *ImportHandler) importCSV(ctx fiberContext, database, measurement string
 		return nil, &importError{StatusCode: importBufferStatus(err), Message: "failed to ingest CSV data", Err: err}
 	}
 	if err := h.arrowBuffer.FlushAll(ctx); err != nil {
-		return nil, &importError{StatusCode: fiber.StatusInternalServerError, Message: "failed to flush imported data", Err: err}
+		return nil, &importError{StatusCode: fiber.StatusInternalServerError, Message: importFlushFailed, Err: err}
 	}
 
 	return buildImportResult(database, measurement, header, opts.timeColumn, timeMicros), nil
@@ -259,6 +262,9 @@ func (h *ImportHandler) importCSV(ctx fiberContext, database, measurement string
 // ingests it through the ArrowBuffer pipeline. No DuckDB queries against the file.
 func (h *ImportHandler) handleParquetImport(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
+	if handled, err := h.forwardWriteIfNeeded(c); handled {
+		return err
+	}
 	start := time.Now()
 
 	database, measurement, errResp := h.importPreamble(c)
@@ -409,7 +415,7 @@ func (h *ImportHandler) importParquet(ctx fiberContext, database, measurement st
 		return nil, &importError{StatusCode: importBufferStatus(err), Message: "failed to ingest parquet data", Err: err}
 	}
 	if err := h.arrowBuffer.FlushAll(ctx); err != nil {
-		return nil, &importError{StatusCode: fiber.StatusInternalServerError, Message: "failed to flush imported data", Err: err}
+		return nil, &importError{StatusCode: fiber.StatusInternalServerError, Message: importFlushFailed, Err: err}
 	}
 
 	return buildImportResult(database, measurement, header, opts.timeColumn, timeMicros), nil
