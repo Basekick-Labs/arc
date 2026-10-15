@@ -58,6 +58,14 @@ type CompactionBridge struct {
 	coord bridgeCoordinator
 }
 
+// noteWritten reports a compaction output this node wrote (#1182), where the
+// coordinator tracks what local copies hold.
+func (b *CompactionBridge) noteWritten(path, sha string) {
+	if n, ok := b.coord.(interface{ NoteLocalWritten(path, sha string) }); ok {
+		n.NoteLocalWritten(path, sha)
+	}
+}
+
 // NewCompactionBridge constructs a bridge bound to the given coordinator.
 //
 // Panics if coord is nil — construction-time failure is louder than a
@@ -99,6 +107,8 @@ func (b *CompactionBridge) RegisterCompactedFile(ctx context.Context, file compa
 		CreatedAt:    file.CreatedAt,
 	}
 
+	// The output is on this node's disk as the subprocess wrote it (#1182).
+	b.noteWritten(file.Path, file.SHA256)
 	if err := b.coord.RegisterFileInManifest(ctx, entry); err != nil {
 		// Map known leader-resolution errors to ErrNotLeader so the
 		// watcher recognizes them as transient retry conditions and
@@ -171,6 +181,7 @@ func (b *CompactionBridge) BatchFileOps(ctx context.Context, registers []compact
 	ops := make([]raft.BatchFileOp, 0, len(registers)+len(deletes))
 
 	for _, file := range registers {
+		b.noteWritten(file.Path, file.SHA256) // #1182
 		payload, err := json.Marshal(raft.RegisterFilePayload{File: raft.FileEntry{
 			Path:          file.Path,
 			SHA256:        file.SHA256,

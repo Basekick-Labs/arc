@@ -15,14 +15,19 @@ import (
 // files this node saw registered (#1071).
 const seenLocalJournal = "seen-local.log"
 
-const seenLocalHeader = "arc-seen-local v1 "
+// v2 (#1182): sha is what the file holds, no longer the checksum the manifest
+// listed when the file was seen; a v1 journal is dropped (unreleased).
+const seenLocalHeader = "arc-seen-local v2 "
 
 // seenRecord identifies the local file a path held when this node saw it
 // registered: the file must still be that one (size, mtime, inode) before the
 // stale-local sweep may remove it, and lsn is the manifest index of the
 // registration, so a manifest that has not applied that far yet never makes it
-// look unlisted. sha is the first 64 bits of the registered checksum: a later
-// registration with another one means the content changed.
+// look unlisted. sha is the first 64 bits of the checksum this node knows that
+// file holds (#1182): set when it pulled, wrote or hashed the file, kept while
+// the file stays the same one, and 0 when unknown. A manifest that lists
+// another checksum for the path while the file is unchanged means the copy is
+// stale. The evidence is as durable as the file's own rename.
 type seenRecord struct {
 	size  int64
 	mtime int64 // UnixNano
@@ -229,6 +234,32 @@ func (s *seenLocal) add(path string, r seenRecord) {
 	}
 	s.set[path] = r
 	s.appendLocked(addLine(path, r))
+}
+
+// update replaces path's record with what fn returns from the current one,
+// under the set's lock, so a pull's evidence and a walk that read the record
+// before it cannot undo each other. fn returning false writes nothing.
+func (s *seenLocal) update(path string, fn func(old seenRecord, ok bool) (seenRecord, bool)) {
+	if strings.ContainsAny(path, "\t\n") {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failed != nil {
+		return
+	}
+	old, ok := s.set[path]
+	r, write := fn(old, ok)
+	if !write || (ok && old == r) {
+		return
+	}
+	s.set[path] = r
+	s.appendLocked(addLine(path, r))
+}
+
+// sameFile reports whether two records describe the same local file.
+func sameFile(a, b seenRecord) bool {
+	return a.size == b.size && a.mtime == b.mtime && a.ino == b.ino
 }
 
 // remove forgets path; a path not in the set writes nothing.

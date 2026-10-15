@@ -4302,15 +4302,17 @@ func (c *Coordinator) startFilePullerLocked() error {
 		RecordPulledFile:    c.recordPulledFileInTiering,
 		RecordAbandonedFile: c.recordAbandonedFileInTiering,
 		ObserveListed:       c.observeListed,
-		Logger:              c.logger,
+		// What each local copy holds (#1182): recorded after a pull or a
+		// hash, so a restart never trusts a stale same-size copy.
+		LocalStamp:    c.localStampFor,
+		RecordContent: c.recordLocalContent,
+		Logger:        c.logger,
 	}
 
 	puller, err := filereplication.New(pullerCfg)
 	if err != nil {
 		return fmt.Errorf("construct puller: %w", err)
 	}
-	verify := func(e *raft.FileEntry) { puller.EnqueueVerifyContent(e) }
-	c.stale.verifyContent.Store(&verify)
 
 	// Wire the FSM callback. applyRegisterFile fires onFileRegistered for
 	// every Raft commit — including entries from other applyRegisterFile
@@ -4539,6 +4541,9 @@ func (c *Coordinator) runCatchUpOnce() {
 		// stable for the lifetime of the node — hashicorp/raft never
 		// replaces the FSM instance once set. The nil guard above ensures
 		// the capture is safe even if the puller outlives the coordinator.
+		// The walk judges each local copy by the journal of what it holds
+		// (#1182): never walk before it is open.
+		c.waitStaleLocalOpen(ctx)
 		puller.RunCatchUp(ctx, func(cursor string, limit int) ([]*raft.FileEntry, string, error) {
 			return fsm.GetFilesPaginated(cursor, limit)
 		})

@@ -2411,6 +2411,9 @@ func main() {
 						// path waiting to register in this writer's outbox is
 						// never a stale copy. Nil elsewhere: nothing waits.
 						if registrationOutbox != nil {
+							// What a flushed file holds, so a restart never
+							// has to hash it to trust it (#1182).
+							registrationOutbox.SetLocalWritten(clusterCoordinator.NoteLocalWritten)
 							clusterCoordinator.SetStaleLocalPending(registrationOutbox.HoldsRegistration)
 						} else {
 							clusterCoordinator.SetStaleLocalPending(nil)

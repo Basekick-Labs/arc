@@ -248,7 +248,23 @@ type Config struct {
 	// ObserveListed, when set, sees every entry the catch-up and periodic
 	// reconciliation walks visit (the stale-local sweep records the ones
 	// present here, #1071). Runs inline in the walk: it must be cheap.
-	ObserveListed func(entry *raft.FileEntry)
+	//
+	// Its verdict says whether this node knows the copy at the path holds the
+	// entry's content (#1182): a copy it cannot vouch for is refreshed by the
+	// walk under the walk's own source, so the startup walk's gate waits for
+	// it. nil, or ListedTrusted, keeps the size-only presence check.
+	ObserveListed func(entry *raft.FileEntry) ListedVerdict
+
+	// LocalStamp, when set, returns an opaque identity of the committed local
+	// file at path (false when there is none). A hash is recorded only when
+	// the stamps before and after it are equal.
+	LocalStamp func(path string) (string, bool)
+
+	// RecordContent, when set, records that the local file at entry.Path
+	// holds checksum sha (#1182): after a pull (stamp "" = as it is now) or
+	// a hash (stamp = the file that was read). Called on a pull worker while
+	// it holds the path's slot; must not block.
+	RecordContent func(entry *raft.FileEntry, stamp, sha string)
 
 	// RecordAbandonedFile, when set, is called for a file this node had just
 	// finished pulling when it found the path gone from the manifest and
@@ -338,6 +354,8 @@ type Puller struct {
 	totalEnqueued          atomic.Int64
 	totalSkippedSelf       atomic.Int64 // origin is self — no pull needed
 	totalSkippedLocal      atomic.Int64 // file fully present locally
+	totalVerifyUnreadable  atomic.Int64 // a walk's hash of a local copy failed (#1182)
+	totalSuspectListed     atomic.Int64 // walk entries whose local copy was refreshed (#1182)
 	totalAdopted           atomic.Int64 // compaction outputs moved into place from a staged copy (#1207)
 	totalForcedRefresh     atomic.Int64 // forced requests that bypassed the size check
 	totalRefreshVerified   atomic.Int64 // verify requests whose local copy already matched
@@ -578,11 +596,13 @@ func (p *Puller) finishEntry(path string, source enqueueSource, failed, succeede
 	if next := p.pending[path]; next != nil &&
 		(p.ctx == nil || p.ctx.Err() == nil) {
 		delete(p.pending, path)
-		// A failed forced refresh must not hand off to an ordinary request
-		// that could skip the still-stale same-size local copy.
-		if failed {
-			if active := p.inflight[path]; active != nil && active.force {
-				next.force = true
+		// A forced refresh that did not land (failed, or superseded before
+		// it pulled) must not hand off to an ordinary request that could
+		// skip the still-stale same-size local copy (#1182).
+		if !succeeded {
+			if active := p.inflight[path]; active != nil {
+				next.force = next.force || active.force
+				next.verifyLocal = next.verifyLocal || active.verifyLocal
 			}
 		}
 		// The superseding request inherits the existing catch-up ownership.
@@ -1257,9 +1277,16 @@ func (p *Puller) enqueueRequest(entry *raft.FileEntry, source enqueueSource, for
 		}
 
 		if current != nil && (requestReplacesCurrent(request.entry, current.entry) ||
-			(request.force && !current.force)) {
+			(request.force && !current.force) || (request.verifyLocal && !current.verifyLocal)) {
 			// This is a new manifest version, not a duplicate. Keep just
 			// the latest pending version to bound memory under rapid updates.
+			// The kept one carries the replaced one's force and verify: a
+			// tier update must not turn a forced refresh of a stale copy into
+			// a size-only check (#1182).
+			if waiting := p.pending[entry.Path]; waiting != nil {
+				request.force = request.force || waiting.force
+				request.verifyLocal = request.verifyLocal || waiting.verifyLocal
+			}
 			p.pending[entry.Path] = request
 			p.totalEnqueued.Add(1)
 			p.inflightMu.Unlock()
@@ -1335,6 +1362,8 @@ func (p *Puller) Stats() map[string]int64 {
 		"forced_refresh":                     p.totalForcedRefresh.Load(),
 		"refresh_verified":                   p.totalRefreshVerified.Load(),
 		"refresh_pending":                    p.refreshPendingCount.Load(),
+		"listed_unvouched":                   p.totalSuspectListed.Load(),
+		"verify_unreadable":                  p.totalVerifyUnreadable.Load(),
 		"skipped_dup":                        p.totalSkippedDup.Load(),
 		"skipped_superseded":                 p.totalSkippedSuperseded.Load(),
 		"skipped_gone":                       p.totalSkippedGone.Load(),
@@ -1609,7 +1638,8 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 			// size-only presence cannot falsely settle the readiness gate. A
 			// late reactive duplicate can use the local fast path; its paired
 			// content-change callback is delivered synchronously by the FSM.
-			p.enqueue(&current, request.source, request.source == enqueueSourceCatchUp)
+			p.enqueueRequest(&current, request.source,
+				request.force || request.source == enqueueSourceCatchUp, request.verifyLocal)
 			return
 		}
 
@@ -1635,11 +1665,23 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 			} else if request.verifyLocal && !verified {
 				// Once per request, not per attempt: a mismatch stays one.
 				verified = true
-				if p.localCopyMatches(log, entry) {
+				switch p.verifyLocalCopy(log, entry) {
+				case localCopyMatched:
 					p.totalSkippedLocal.Add(1)
 					p.totalRefreshVerified.Add(1)
 					succeeded = true
 					return
+				case localCopyUnreadable:
+					// A walk asked because it does not know what the copy
+					// holds (#1182): a copy it could not hash (a slow disk
+					// past the deadline) is not downloaded again over the
+					// network, it is checked on the next walk. It still
+					// counts as unsettled, so the startup gate waits.
+					if request.source != enqueueSourceReactive {
+						p.totalVerifyUnreadable.Add(1)
+						failed = true
+						return
+					}
 				}
 			}
 		}
@@ -1727,7 +1769,7 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 					p.totalSkippedSuperseded.Add(1)
 					// The bytes just fetched match this request's checksum. Keep
 					// that valid local copy until the queued successor replaces it.
-					p.enqueue(&current, request.source, true)
+					p.enqueueRequest(&current, request.source, true, request.verifyLocal)
 					return
 				}
 				p.totalPulled.Add(1)
@@ -1746,6 +1788,9 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 				// against the manifest checksum. A rewrite landing between
 				// here and the write is corrected by the next pull.
 				p.recordPulledFile(entry.Path, entry.SizeBytes)
+				// The bytes were checked against entry's checksum on the way
+				// in: what this path now holds is known (#1182).
+				p.recordContent(entry, "", entry.SHA256)
 				pulledFromPeer = true
 				succeeded = true // Signal to processEntry's defer to clear any prior catch-up failure for this path.
 				if request.force {
@@ -1868,6 +1913,16 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 		}
 		p.sleepBackoff(attempt)
 	}
+	// Only the last attempt finding no candidate peer reaches here. That is
+	// a pull that did not happen, not one that is done: without this the
+	// startup gate went green over a file it never fetched, or over a local
+	// copy it could not vouch for (#1182).
+	if p.ctx.Err() == nil {
+		p.totalFailed.Add(1)
+		failed = true
+		log.Error().Str("path", entry.Path).Str("origin_node_id", entry.OriginNodeID).
+			Msg("File pull giving up: no candidate peer in any attempt (will be retried by next FSM callback or catch-up scan)")
+	}
 	return
 }
 
@@ -1973,25 +2028,75 @@ func (p *Puller) writeFileTail(ctx context.Context, entry *raft.FileEntry, r io.
 	return p.cfg.Backend.WriteReader(ctx, entry.Path, r, entry.SizeBytes)
 }
 
-// localCopyMatches hashes the committed local copy of entry.Path and reports
+// localCopyVerdict is what hashing the committed local copy found.
+type localCopyVerdict uint8
+
+const (
+	localCopyMismatched localCopyVerdict = iota
+	localCopyMatched
+	localCopyUnreadable
+)
+
+// localHashFloor and localHashRate size the hash deadline: a fixed 30 s made
+// a large replica on a busy disk read as a mismatch and pulled it again in
+// full (#1182).
+const (
+	localHashFloor = 30 * time.Second
+	localHashRate  = 50 << 20 // bytes per second
+)
+
+func localHashDeadline(size int64) time.Duration {
+	d := time.Duration(size/localHashRate) * time.Second
+	return max(d, localHashFloor)
+}
+
+// verifyLocalCopy hashes the committed local copy of entry.Path and reports
 // whether it is the manifest's version. ReadTo, never ReadToAt: ReadToAt falls
 // back to the staged ".part" file (#1199), which is not the copy a query
 // reads. LocalBackend.ReadTo does not watch the context, so the hasher does:
-// a read past the deadline or a Stop fails, and the caller downloads. The read
-// counts in the storage read-bytes metric like any other local read.
-func (p *Puller) localCopyMatches(log zerolog.Logger, entry *raft.FileEntry) bool {
+// a read past the deadline or a Stop fails. The read counts in the storage
+// read-bytes metric like any other local read.
+//
+// The checksum it computed is recorded against the copy, match or not, when
+// the copy was the same file before and after the read (#1182): a later walk
+// then knows a mismatch without hashing again, and a manifest that later
+// names those bytes matches without a download.
+func (p *Puller) verifyLocalCopy(log zerolog.Logger, entry *raft.FileEntry) localCopyVerdict {
 	if entry.SHA256 == "" {
-		return false
+		return localCopyMismatched
 	}
-	ctx, cancel := context.WithTimeout(p.ctx, 30*time.Second)
+	before, stamped := p.localStamp(entry.Path)
+	ctx, cancel := context.WithTimeout(p.ctx, localHashDeadline(entry.SizeBytes))
 	defer cancel()
 	h := sha256.New()
 	if err := p.cfg.Backend.ReadTo(ctx, entry.Path, &ctxWriter{ctx: ctx, w: h}); err != nil {
 		log.Debug().Err(err).Str("path", entry.Path).
-			Msg("Could not hash the local copy; downloading the manifest version")
-		return false
+			Msg("Could not hash the local copy")
+		return localCopyUnreadable
 	}
-	return hex.EncodeToString(h.Sum(nil)) == entry.SHA256
+	sum := hex.EncodeToString(h.Sum(nil))
+	if after, ok := p.localStamp(entry.Path); stamped && ok && after == before {
+		p.recordContent(entry, before, sum)
+	}
+	if sum == entry.SHA256 {
+		return localCopyMatched
+	}
+	return localCopyMismatched
+}
+
+// localStamp and recordContent are the nil-safe wrappers around the
+// LocalStamp and RecordContent hooks.
+func (p *Puller) localStamp(path string) (string, bool) {
+	if p.cfg.LocalStamp == nil {
+		return "", false
+	}
+	return p.cfg.LocalStamp(path)
+}
+
+func (p *Puller) recordContent(entry *raft.FileEntry, stamp, sha string) {
+	if p.cfg.RecordContent != nil {
+		p.cfg.RecordContent(entry, stamp, sha)
+	}
 }
 
 // ctxWriter fails a write once ctx is done, so a copy into it stops early.
