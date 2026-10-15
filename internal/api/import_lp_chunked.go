@@ -119,6 +119,22 @@ func scanLPImport(upload *importUpload, precision, filter string, isDecimal func
 				continue
 			}
 			scan.records++
+			if kind, found := ingest.LPRecordTimeKey(rec); found {
+				bad = &importError{StatusCode: fiber.StatusBadRequest, Message: fmt.Sprintf("measurement %q has a %s named \"time\"; time is the timestamp and cannot be a tag or field key", rec.Measurement, kind)}
+				return errStopScan
+			}
+			for name := range rec.Tags {
+				if ingest.IsWALTargetColumnName(name) {
+					bad = &importError{StatusCode: fiber.StatusBadRequest, Message: fmt.Sprintf("measurement %q has a tag named %q, a name kept for internal use", rec.Measurement, name)}
+					return errStopScan
+				}
+			}
+			for name := range rec.Fields {
+				if ingest.IsWALTargetColumnName(name) {
+					bad = &importError{StatusCode: fiber.StatusBadRequest, Message: fmt.Sprintf("measurement %q has a field named %q, a name kept for internal use", rec.Measurement, name)}
+					return errStopScan
+				}
+			}
 			fields, seen := scan.kinds[rec.Measurement]
 			if !seen {
 				if !isValidMeasurementName(rec.Measurement) {

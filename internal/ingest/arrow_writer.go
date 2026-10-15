@@ -1944,18 +1944,22 @@ func (b *ArrowBuffer) columnarToWALRecords(database string, record *models.Colum
 		return nil
 	}
 
-	// Convert columnar to row format
+	// Convert columnar to row format (NULL cells: see allNil). The target keys
+	// go in last, so a user column cannot replace them.
+	keepNulls := make(map[string]bool, len(record.Columns))
+	for colName, colData := range record.Columns {
+		keepNulls[colName] = allNil(colData)
+	}
 	records := make([]map[string]interface{}, numRows)
 	for i := 0; i < numRows; i++ {
-		row := map[string]interface{}{
-			"_database":    database,
-			"_measurement": record.Measurement,
-		}
+		row := make(map[string]interface{}, len(record.Columns)+2)
 		for colName, colData := range record.Columns {
-			if i < len(colData) {
+			if i < len(colData) && (colData[i] != nil || keepNulls[colName]) {
 				row[colName] = colData[i]
 			}
 		}
+		row["_database"] = database
+		row["_measurement"] = record.Measurement
 		records[i] = row
 	}
 
@@ -3200,10 +3204,8 @@ func (b *ArrowBuffer) writeTypedColumnarInternal(ctx context.Context, database, 
 // msgpack payload for the zero-copy WAL path. When rawPayload is non-empty
 // the WAL stores the original client bytes (AppendRawWithMeta, same as
 // writeColumnarInternal's fast path); otherwise the typed batch is
-// transposed to row records — the pre-existing typed fallback, which is
-// lossy for NULLs (typedBatchToWALRecords ignores Validity; see plan doc).
-// The typed msgpack decode path always supplies rawPayload, so it never
-// takes the lossy fallback.
+// transposed to row records (typedBatchToWALRecords), NULL cells left out.
+// The typed msgpack decode path always supplies rawPayload.
 func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measurement string, typedColumns *TypedColumnBatch, numRecords int, rawPayload []byte, skipWAL bool) error {
 	bufferKey := database + "/" + measurement
 	if len(rawPayload) > 0 {
@@ -3424,20 +3426,54 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 	return nil
 }
 
+// allNil reports whether every value of a column is nil.
+//
+// NULL cells in a row-form WAL entry: in a column with any value in the
+// entry a NULL cell is left out of its row, and replay rebuilds it as NULL
+// (WALRowsToColumns); a recovery batch holding none of the column's values
+// then has no such column, rather than an all-NULL string column next to
+// files where the column is a number (read_parquet union_by_name would type
+// it VARCHAR). In a columnar entry (line protocol, msgpack) a column NULL in
+// every row is written as explicit nils, so replay writes the all-NULL
+// column the live write wrote (#337). A typed entry (imports) leaves it out
+// too: its live write kept the column's type, which the row form cannot
+// carry, and an all-NULL replay would come back as a string column. The time
+// column is never NULL.
+func allNil(col []interface{}) bool {
+	for _, v := range col {
+		if v != nil {
+			return false
+		}
+	}
+	return len(col) > 0
+}
+
 // typedBatchToWALRecords converts a TypedColumnBatch to row-format records for WAL storage.
-// This is the WAL fallback path for typed batches (e.g., TLE) that don't have raw msgpack bytes.
+// This is the WAL fallback path for typed batches without raw msgpack bytes:
+// the CSV, Parquet and TLE imports. A NULL cell (Validity) is left out of its
+// row, even in a column NULL in every row (see allNil). Before, the slot's
+// zero value was written, so a NULL came back from replay as 0, "" or false.
 func typedBatchToWALRecords(database, measurement string, batch *TypedColumnBatch, numRecords int, decimalCols map[string]config.DecimalSpec) []map[string]interface{} {
 	if numRecords == 0 {
 		return nil
 	}
 
+	// Per column, its NULL bitmap (nil = no NULLs). The time column is never
+	// NULL.
+	nulls := make(map[string][]bool, len(batch.Validity))
+	for colName, valid := range batch.Validity {
+		if colName != "time" && len(valid) > 0 {
+			nulls[colName] = valid
+		}
+	}
+
 	records := make([]map[string]interface{}, numRecords)
 	for i := 0; i < numRecords; i++ {
-		row := map[string]interface{}{
-			"_database":    database,
-			"_measurement": measurement,
-		}
+		row := make(map[string]interface{}, len(batch.Data)+2)
 		for colName, colData := range batch.Data {
+			if valid := nulls[colName]; i < len(valid) && !valid[i] {
+				continue
+			}
 			switch arr := colData.(type) {
 			case []int64:
 				if i < len(arr) {
@@ -3469,6 +3505,9 @@ func typedBatchToWALRecords(database, measurement string, batch *TypedColumnBatc
 				}
 			}
 		}
+		// The target keys go in last, so a user column cannot replace them.
+		row["_database"] = database
+		row["_measurement"] = measurement
 		records[i] = row
 	}
 
