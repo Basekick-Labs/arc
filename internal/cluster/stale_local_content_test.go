@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -259,5 +260,123 @@ func TestStatusReportsLocalCopyTrust(t *testing.T) {
 	r.c.stale.seen.Load().close()
 	if got := r.c.Status()["local_copy_trust"]; got != "size_only" {
 		t.Fatalf("local_copy_trust after a failure = %v", got)
+	}
+}
+
+// The outbox, attached as main does, reports each flushed file, and its
+// pending registrations hold the sweep off; no outbox still lets it start.
+func TestAttachStaleLocalOutbox(t *testing.T) {
+	r := staleRig(t)
+	r.c.stale.ready.Store(false)
+	o := newTestOutbox(t, t.TempDir())
+	r.c.AttachStaleLocalOutbox(o)
+	if !r.c.stale.ready.Load() || r.c.stale.pending.Load() == nil {
+		t.Fatal("outbox not attached to the sweep")
+	}
+	key := staleHour + "f.parquet"
+	r.write(key, "rows f")
+	o.RegisterFile("testdb", "cpu", key, time.Now(), 6, strings.Repeat("a", 64))
+	if _, ok := r.c.stale.written[key]; !ok {
+		t.Fatal("a flushed file was not reported")
+	}
+	r2 := staleRig(t)
+	r2.c.stale.ready.Store(false)
+	r2.c.AttachStaleLocalOutbox(nil)
+	if !r2.c.stale.ready.Load() {
+		t.Fatal("no outbox: the sweep never starts")
+	}
+}
+
+// Producer evidence: dropped after its TTL, bounded in number (an existing
+// path still updates at the cap), and never kept where tracking does not run.
+func TestWrittenEvidenceBounds(t *testing.T) {
+	r := staleRig(t)
+	key := staleHour + "w.parquet"
+	r.write(key, "rows w")
+	r.c.NoteLocalWritten(key, strings.Repeat("a", 64))
+	ev := r.c.stale.written[key]
+	ev.at = time.Now().Add(-staleLocalWrittenTTL - time.Minute)
+	r.c.stale.written[key] = ev
+	r.c.staleLocalPass(context.Background())
+	if _, ok := r.c.stale.written[key]; ok {
+		t.Fatal("evidence past its TTL kept")
+	}
+
+	r.c.NoteLocalWritten(key, strings.Repeat("a", 64))
+	for i := 0; len(r.c.stale.written) < staleLocalWrittenMax; i++ {
+		r.c.stale.written[strconv.Itoa(i)] = writtenEvidence{at: time.Now()}
+	}
+	other := staleHour + "n.parquet"
+	r.write(other, "rows n")
+	r.c.NoteLocalWritten(other, strings.Repeat("b", 64))
+	if _, ok := r.c.stale.written[other]; ok || len(r.c.stale.written) != staleLocalWrittenMax {
+		t.Fatalf("evidence past the cap stored (%d)", len(r.c.stale.written))
+	}
+	r.c.NoteLocalWritten(key, strings.Repeat("c", 64))
+	if r.c.stale.written[key].rec.sha != shaPrefix(strings.Repeat("c", 64)) {
+		t.Fatal("an existing path did not update at the cap")
+	}
+
+	off := staleRig(t)
+	off.c.stale.feed = nil
+	off.write(key, "rows w")
+	off.c.NoteLocalWritten(key, strings.Repeat("a", 64))
+	if len(off.c.stale.written) != 0 {
+		t.Fatal("evidence kept where tracking does not run")
+	}
+}
+
+// A journal that cannot be opened still releases the startup walk, which then
+// trusts sizes as before.
+func TestJournalOpenFailureReleasesTheWalk(t *testing.T) {
+	r := staleRig(t)
+	r.c.stale.seen.Load().close()
+	r.c.stale.seen.Store(nil)
+	r.c.cfg.RaftDataDir = t.TempDir()
+	if err := os.Mkdir(filepath.Join(r.c.cfg.RaftDataDir, seenLocalJournal), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	r.c.stale.opened = make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.c.stale.wg.Add(1)
+	go r.c.staleLocalRun(ctx)
+	done := make(chan struct{})
+	go func() { r.c.waitStaleLocalOpen(context.Background()); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the walk waits forever on a journal that failed to open")
+	}
+	if r.c.stale.seen.Load() != nil {
+		t.Fatal("tracking started over a failed journal")
+	}
+	r.c.stale.wg.Wait()
+}
+
+// The direct guards behind the walk's verdict and the evidence it records.
+func TestStaleLocalVerdictGuards(t *testing.T) {
+	r := staleRig(t)
+	key := staleHour + "a.parquet"
+	r.register(key, "rows a")
+	e, _ := r.c.raftNode.FSM().GetFile(key)
+	empty := *e
+	empty.SHA256 = ""
+	if v := r.c.observeListed(&empty); v != filereplication.ListedTrusted {
+		t.Fatalf("no listed checksum: %v, want trusted", v)
+	}
+	stamp, _ := r.c.localStampFor(key)
+	wrong := *e
+	wrong.SizeBytes++
+	r.c.recordLocalContent(&wrong, stamp, e.SHA256)
+	if rec, _ := r.c.stale.seen.Load().get(key); rec.sha != 0 {
+		t.Fatal("a checksum recorded for a file of another size")
+	}
+	// An identical update writes no journal line.
+	before := r.c.stale.seen.Load().records
+	r.walk()
+	r.walk()
+	if got := r.c.stale.seen.Load().records; got != before {
+		t.Fatalf("journal lines %d -> %d for unchanged records", before, got)
 	}
 }

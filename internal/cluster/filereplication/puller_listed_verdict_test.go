@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -366,5 +368,91 @@ func TestForceSurvivesAReplacingPlainRequest(t *testing.T) {
 	p.pending[verdictPath] = &pullRequest{entry: &tier}
 	if next := p.finishEntry(verdictPath, enqueueSourceReactive, false, true, true); next == nil || next.force {
 		t.Fatalf("hand-off after a pull = %+v, want plain", next)
+	}
+}
+
+// A hash records what it found even when that is not the manifest's checksum,
+// so the next walk knows the copy is stale instead of hashing it again.
+func TestHashRecordsAMismatchingChecksum(t *testing.T) {
+	r := newVerdictRig(t, nil, ListedUnverified, nil)
+	if err := r.local.Write(context.Background(), verdictPath, staleBody); err != nil {
+		t.Fatal(err)
+	}
+	r.catchUp(t, entryFor(verdictPath, currentBody))
+	if sha, _ := r.recorded(verdictPath); sha != entryFor(verdictPath, staleBody).SHA256 {
+		t.Fatalf("recorded %q, want the checksum of the bytes hashed", sha)
+	}
+}
+
+// A file replaced while it was hashed is not recorded: the checksum belongs to
+// the bytes that were read, not to whatever the path holds now.
+func TestHashOfAReplacedFileIsNotRecorded(t *testing.T) {
+	var n atomic.Int64
+	r := newVerdictRig(t, nil, ListedUnverified, func(c *Config) {
+		c.LocalStamp = func(string) (string, bool) { return strconv.FormatInt(n.Add(1), 10), true }
+	})
+	if err := r.local.Write(context.Background(), verdictPath, currentBody); err != nil {
+		t.Fatal(err)
+	}
+	stats := r.catchUp(t, entryFor(verdictPath, currentBody))
+	if stats["refresh_verified"] != 1 {
+		t.Fatalf("stats=%v, want the hash to have run", stats)
+	}
+	if sha, ok := r.recorded(verdictPath); ok {
+		t.Fatalf("recorded %q for a file replaced during its hash", sha)
+	}
+}
+
+// A walk's force+verify request superseded before it pulled is re-queued
+// for the current version with both kept (by the re-queue, and again by the
+// hand-off from the request that did not land): the copy, which already holds
+// the current version, is hashed and kept, not downloaded.
+func TestSupersededBeforeThePullKeepsVerify(t *testing.T) {
+	current := entryFor(verdictPath, currentBody)
+	current.LSN = 2
+	r := newVerdictRig(t, currentBody, ListedUnverified, func(c *Config) {
+		c.ManifestEntry = func(string) (raft.FileEntry, bool) { return *current, true }
+	})
+	if err := r.local.Write(context.Background(), verdictPath, currentBody); err != nil {
+		t.Fatal(err)
+	}
+	old := entryFor(verdictPath, staleBody)
+	old.LSN = 1
+	stats := r.catchUp(t, old)
+	waitStats(t, r.p, func(s map[string]int64) bool { return s["refresh_verified"] == 1 })
+	if r.fetcher.calls.Load() != 0 || stats["skipped_superseded"] != 1 {
+		t.Fatalf("fetches=%d stats=%v, want the current version hashed, not downloaded", r.fetcher.calls.Load(), stats)
+	}
+}
+
+// Superseded after the pull: the successor keeps verify, so the bytes just
+// pulled are hashed against the current version before any download.
+func TestSupersededAfterThePullKeepsVerify(t *testing.T) {
+	midBody := []byte("mid same-size payload")
+	pulled := entryFor(verdictPath, midBody)
+	pulled.LSN = 1
+	current := entryFor(verdictPath, currentBody)
+	current.LSN = 2
+	var stamps atomic.Int64
+	var r *verdictRig
+	r = newVerdictRig(t, midBody, ListedUnverified, func(c *Config) {
+		c.ManifestEntry = func(string) (raft.FileEntry, bool) {
+			if r.fetcher.calls.Load() == 0 {
+				return *pulled, true
+			}
+			return *current, true
+		}
+		stamp := c.LocalStamp
+		c.LocalStamp = func(p string) (string, bool) { stamps.Add(1); return stamp(p) }
+	})
+	if err := r.local.Write(context.Background(), verdictPath, staleBody); err != nil {
+		t.Fatal(err)
+	}
+	r.catchUp(t, pulled)
+	waitStats(t, r.p, func(s map[string]int64) bool { return s["skipped_superseded"] == 1 })
+	waitStats(t, r.p, func(s map[string]int64) bool { return s["inflight_count"] == 0 && s["queue_depth"] == 0 })
+	// Two stamps per hash: the stale copy, then the pulled one.
+	if got := stamps.Load(); got != 4 {
+		t.Fatalf("stamps=%d, want two hashes (the successor hashed before downloading)", got)
 	}
 }

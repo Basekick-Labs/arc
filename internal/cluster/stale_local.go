@@ -158,6 +158,19 @@ func (c *Coordinator) SetStaleLocalPending(fn func(path string) bool) {
 	c.stale.ready.Store(true)
 }
 
+// AttachStaleLocalOutbox wires this node's registration outbox (nil when it
+// registers nothing) into the sweep and lets it start: a path waiting in the
+// outbox is never a stale copy, and each file the outbox flushes is reported
+// for what it holds, so a restart never has to hash it to trust it (#1182).
+func (c *Coordinator) AttachStaleLocalOutbox(o *RegistrationOutbox) {
+	if o == nil {
+		c.SetStaleLocalPending(nil)
+		return
+	}
+	o.SetLocalWritten(c.NoteLocalWritten)
+	c.SetStaleLocalPending(o.HoldsRegistration)
+}
+
 // HoldLocalPaths keeps the sweep away from paths about to be registered by a
 // producer that registers a file it did not write just now (edge sync's
 // redelivery re-registers the file it finds at the path). It waits for an

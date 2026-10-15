@@ -637,3 +637,26 @@ func TestManifestHotFiles(t *testing.T) {
 		t.Fatalf("got %+v", got)
 	}
 }
+
+// A staged output moved into place is recorded for what it holds, so the next
+// walk trusts it without hashing (#1182).
+func TestAdoptedStagedOutputIsRecorded(t *testing.T) {
+	r := stagedRig(t)
+	r.c.cfg.RaftDataDir = t.TempDir()
+	seen, err := openSeenLocal(r.c.cfg.RaftDataDir, r.c.cfg.ClusterName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(seen.close)
+	r.c.stale.seen.Store(seen)
+	r.c.stale.base = r.root
+	job := r.job("j1")
+	r.commitJob(job)
+	e, _ := r.c.raftNode.FSM().GetFile(job.Output.Path)
+	if ok, err := r.c.adoptStaged(context.Background(), e); !ok || err != nil {
+		t.Fatalf("adopt: %v %v", ok, err)
+	}
+	if rec, ok := seen.get(job.Output.Path); !ok || rec.sha != shaPrefix(e.SHA256) {
+		t.Fatalf("record %+v %v, want the output's checksum", rec, ok)
+	}
+}
