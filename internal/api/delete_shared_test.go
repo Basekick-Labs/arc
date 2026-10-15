@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 )
@@ -112,6 +113,50 @@ func TestDeleteSharedStoreUnlistedObject(t *testing.T) {
 	}
 	if len(c.rewrites) != 1 {
 		t.Fatalf("a whole-file delete registered something: %v", c.rewrites)
+	}
+}
+
+// ageObject backdates an object past unregisteredFreshAge: no writer's
+// outbox registers it without looking at it again.
+func ageObject(t *testing.T, root, p string) {
+	t.Helper()
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(filepath.Join(root, p), old, old); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// #1265: in shared storage an unlisted object younger than
+// unregisteredFreshAge is another writer's flush its outbox may register
+// without looking at it again: rewritten or removed now, it would be
+// registered after it is gone. It is left as it is and the DELETE answers
+// 503; once older it is deleted from. (Outside shared storage only one node
+// writes, and TestDeleteSharedStoreUnlistedObject rewrites a fresh one.)
+func TestDeleteSharedStoreLeavesAFreshUnlistedObject(t *testing.T) {
+	for _, where := range []string{"host = 'h1'", "v > 0"} { // a rewrite, and a whole-file delete
+		t.Run(where, func(t *testing.T) {
+			c, h, root := peerFlushCluster(t, casA)
+			writeRecordsParquet(t, c.db, root, casB)
+			before := countParquet(t, c.db, filepath.Join(root, casB), where)
+			body := `{"database":"db","measurement":"cpu","where":"` + where + `","confirm":true}`
+			code, out, raw := sendDelete(t, h, body)
+			if code != 503 || len(out.FailedFiles) != 1 || out.FailedFiles[0] != "cpu_b.parquet" {
+				t.Fatalf("%d %s", code, raw)
+			}
+			if n := countParquet(t, c.db, filepath.Join(root, casB), where); n != before {
+				t.Fatalf("the fresh object was changed: %d matching rows left", n)
+			}
+			if len(c.rewrites) != 0 {
+				t.Fatalf("rewrites registered: %v", c.rewrites)
+			}
+			ageObject(t, root, casB)
+			if code, _, raw := sendDelete(t, h, body); code != 200 {
+				t.Fatalf("aged: %d %s", code, raw)
+			}
+			if _, err := os.Stat(filepath.Join(root, casB)); err == nil {
+				t.Fatal("the aged object was kept")
+			}
+		})
 	}
 }
 

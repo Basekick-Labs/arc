@@ -1172,6 +1172,50 @@ an unbounded operation.
 
 ## Bug fixes
 
+### In shared storage, a DELETE no longer leaves rows another writer has not flushed ([#1265](https://github.com/Basekick-Labs/arc/issues/1265))
+
+In shared storage (`cluster.shared_storage_mode`) every writer takes writes,
+and a DELETE runs on the primary only. It flushed the primary's own buffer
+before it scanned, but not the others'. Rows another writer had acknowledged
+and still buffered reached storage after the scan and stayed, and the DELETE
+answered success. A database deletion did the same: the other writers' rows
+recreated the database after it answered success.
+
+Before it scans, the primary now asks every other node of the cluster
+(readers and compactors too: they can buffer rows from MQTT or an import) to
+flush its buffered rows of the DELETE's scope, and waits for the files they
+flushed to be in the cluster manifest. A node that does not answer, or whose
+files do not register within 30 seconds, is named in a new `unflushed_nodes`
+field, and the DELETE answers 503 with `Retry-After`. `allow_unreachable=true`
+runs it anyway and leaves the rows those nodes hold, as it already did for
+manifest files a node does not have. The database deletion takes the same
+parameter as `?allow_unreachable=true`.
+
+On a three-writer test cluster on SeaweedFS, a DELETE sent to the primary
+while another writer still buffered 500 matching rows left all 500 before
+the fix, and none after it. A database deletion left 200 rows that recreated
+it, and none after. Under steady ingest into all three writers, 12 of 12
+DELETEs answered 200, in 0.25 to 0.8 seconds.
+
+Also fixed on a shared object store: a DELETE could remove or rewrite another
+writer's file in the seconds before that writer registered it, and the
+writer then registered a file that no longer existed. A DELETE now leaves an
+unregistered file under two minutes old as it is and answers 503; a retry
+finds it registered. A database deletion checks for such files before it
+changes anything, and leaves a file that is flushed while it runs.
+
+Without a WAL, one failed flush no longer refuses every later DELETE on the
+node until a restart. With the WAL on, a DELETE is still refused while a
+failed flush's rows wait for WAL recovery, since recovery would bring them
+back after it.
+
+**Upgrade note.** A node before this release does not answer the flush
+request, so DELETEs in a shared-storage cluster answer 503 until every node
+runs this release, unless `allow_unreachable` is set. A node that crashed and
+is still listed in the cluster is asked too, so it blocks DELETEs until it
+returns or is removed. Set `cluster.node_id` so a restarted node does not come
+back under a new id and leave its old entry behind.
+
 ### Flushed WAL files are deleted within seconds, not every five minutes ([#676](https://github.com/Basekick-Labs/arc/issues/676))
 
 A WAL file whose data had reached storage was deleted only on the periodic

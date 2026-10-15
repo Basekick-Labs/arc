@@ -74,6 +74,14 @@ const (
 	// unknown type, which the asker treats as no answer.
 	MsgPendingRegistrationsQuery MessageType = 0x50
 	MsgPendingRegistrationsReply MessageType = 0x51
+
+	// Flush scope (#1265): in shared storage every writer takes writes, so
+	// before a DELETE scans, the primary asks every node to flush the rows
+	// of its scope it has buffered and to name the files it flushed that
+	// wait for registration. A node before #1265 closes the connection on
+	// the unknown type, which the asker treats as no answer.
+	MsgFlushScopeRequest MessageType = 0x52
+	MsgFlushScopeReply   MessageType = 0x53
 )
 
 // PendingRegistrationsQuery asks a node for the files it flushed that the
@@ -105,6 +113,46 @@ const (
 // one with paths stripped is accepted:
 // security.ComputePendingRegistrationsReplyHMAC.
 type PendingRegistrationsReply struct {
+	NodeID    string   `json:"node_id"`
+	Status    string   `json:"status"`
+	Paths     []string `json:"paths,omitempty"`
+	Timestamp int64    `json:"timestamp"`
+	HMAC      string   `json:"hmac"`
+}
+
+// FlushScopeRequest asks a node to flush its buffered rows of Database
+// (Measurement "" = all of them). HMAC:
+// security.ComputeFlushScopeRequestHMAC.
+type FlushScopeRequest struct {
+	NodeID      string `json:"node_id"`
+	ClusterName string `json:"cluster_name"`
+	Database    string `json:"database"`
+	Measurement string `json:"measurement,omitempty"`
+	Nonce       string `json:"nonce"`
+	Timestamp   int64  `json:"timestamp"`
+	HMAC        string `json:"hmac"`
+}
+
+// Flush scope reply statuses.
+const (
+	// FlushStatusOK: flushed; Paths is every file of the scope still
+	// waiting to register on the node.
+	FlushStatusOK = "ok"
+	// FlushStatusUntracked: flushed, but the node has no registration
+	// journal, so it cannot name the files waiting to register.
+	FlushStatusUntracked = "untracked"
+	// FlushStatusFailed: the flush failed or timed out, or an earlier one
+	// failed and its rows wait for WAL recovery.
+	FlushStatusFailed = "flush_failed"
+	// FlushStatusTooMany: more pending files than one reply can carry.
+	FlushStatusTooMany = "too_many"
+	// FlushStatusRefused: the request failed authentication or validation.
+	FlushStatusRefused = "refused"
+)
+
+// FlushScopeReply answers a FlushScopeRequest, bound to its nonce and
+// scope, over a digest of Paths: security.ComputeFlushScopeReplyHMAC.
+type FlushScopeReply struct {
 	NodeID    string   `json:"node_id"`
 	Status    string   `json:"status"`
 	Paths     []string `json:"paths,omitempty"`
@@ -159,6 +207,10 @@ func (m MessageType) String() string {
 		return "PendingRegistrationsQuery"
 	case MsgPendingRegistrationsReply:
 		return "PendingRegistrationsReply"
+	case MsgFlushScopeRequest:
+		return "FlushScopeRequest"
+	case MsgFlushScopeReply:
+		return "FlushScopeReply"
 	case MsgReplicateSync:
 		return "ReplicateSync"
 	case MsgReplicateSyncAck:
