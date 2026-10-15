@@ -706,6 +706,22 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 			"error": "database deletion rejected: " + err.Error() + "; retry shortly",
 		})
 	}
+	// In shared storage the other nodes flush their buffered rows of the
+	// database first (#1265), under a deadline of their own: the request's
+	// storage deadline is spent by the local flush.
+	fctx, fcancel := h.storageContext(c, deletePeerFlushBudget)
+	unflushed, err := flushPeersBeforeDelete(fctx, h.coordinator, name, "", c.QueryBool("allow_unreachable"))
+	fcancel()
+	if err != nil {
+		c.Set(fiber.HeaderRetryAfter, "30")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error":           "database deletion rejected: " + err.Error(),
+			"unflushed_nodes": unflushed,
+		})
+	}
+	// What this node holds for registration before it withdraws it: not a
+	// peer's file on its way to the manifest.
+	localHeld := h.locallyHeld(ctx, name)
 	var recordID uint64
 	if rec := recorderOf(h.coordinator); rec != nil {
 		if recordID, err = rec.RecordDelete(ctx, name, "", "", marks); err != nil {
@@ -732,6 +748,15 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		h.logger.Error().Err(err).Str("database", name).Msg("Failed to list database files")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to list database files",
+		})
+	}
+	if fresh := h.freshUnregistered(ctx, files, localHeld); len(fresh) > 0 {
+		// Another writer's flush still on its way to the manifest: deleted
+		// now, it would be registered after it is gone (#1265). A retry
+		// finds it registered.
+		c.Set(fiber.HeaderRetryAfter, "5")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": fmt.Sprintf("database deletion not run: %d file(s) another writer flushed are not registered in the cluster manifest yet (first: %s); retry shortly", len(fresh), fresh[0]),
 		})
 	}
 	var manifestEntries []*raft.FileEntry
@@ -893,7 +918,7 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		Int("files_deleted", deletedCount).
 		Msg("Deleted database")
 
-	return c.JSON(fiber.Map{
+	resp := fiber.Map{
 		"message":       "Database '" + name + "' deleted successfully",
 		"files_deleted": deletedCount,
 		// Broken out because a single total cannot distinguish a hot sweep
@@ -901,7 +926,68 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		// part an operator wants to see (#1091).
 		"hot_files_deleted":  len(hotDeleted),
 		"cold_files_deleted": coldDeletedCount,
+	}
+	if len(unflushed) > 0 {
+		// allow_unreachable: the rows these nodes hold were left.
+		resp["unflushed_nodes"] = unflushed
+	}
+	return c.JSON(resp)
+}
+
+// deletePeerFlushBudget bounds the flush a database deletion asks of the
+// other nodes in shared storage (#1265): their flush, then the registration
+// of what they flushed.
+var deletePeerFlushBudget = 90 * time.Second
+
+// databaseFileHolder is the registration outbox's view of a file it holds.
+type databaseFileHolder interface {
+	HoldsRegistration(path string) bool
+}
+
+// locallyHeld lists the files of the database this node's outbox holds for
+// registration, on a shared object store with a manifest (nil elsewhere).
+func (h *DatabasesHandler) locallyHeld(ctx context.Context, name string) map[string]bool {
+	holder, ok := h.pending.(databaseFileHolder)
+	if !ok || !sharedManifest(h.coordinator) {
+		return nil
+	}
+	files, err := h.storage.List(ctx, name+"/")
+	if err != nil {
+		return nil
+	}
+	held := map[string]bool{}
+	for _, f := range files {
+		if holder.HoldsRegistration(f) {
+			held[f] = true
+		}
+	}
+	return held
+}
+
+// freshUnregistered returns the Parquet files of a shared object store that
+// no manifest entry covers, this node did not hold, and are younger than
+// unregisteredFreshAge: another writer's flush its outbox may register
+// without looking at it again (#1265).
+func (h *DatabasesHandler) freshUnregistered(ctx context.Context, files []string, localHeld map[string]bool) []string {
+	reg, ok := h.coordinator.(interface {
+		GetFileEntry(path string) (*raft.FileEntry, bool)
 	})
+	if !ok || !sharedManifest(h.coordinator) {
+		return nil
+	}
+	var fresh []string
+	for _, f := range files {
+		if !strings.HasSuffix(strings.ToLower(f), ".parquet") || localHeld[f] {
+			continue
+		}
+		if _, listed := reg.GetFileEntry(f); listed {
+			continue
+		}
+		if age, known := objectAge(ctx, h.storage, f); known && age < unregisteredFreshAge {
+			fresh = append(fresh, f)
+		}
+	}
+	return fresh
 }
 
 // Helper functions

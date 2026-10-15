@@ -580,6 +580,58 @@ func ValidatePendingRegistrationsReplyHMAC(sharedSecret, queryNonce, nodeID, clu
 	return nil
 }
 
+// ComputeFlushScopeRequestHMAC authenticates a flush scope request (#1265).
+//
+// Format: "flush-scope-request" \x00 nonce \x00 nodeID \x00 clusterName \x00 database \x00 measurement \x00 timestamp
+func ComputeFlushScopeRequestHMAC(sharedSecret, nonce, nodeID, clusterName, database, measurement string, timestamp int64) string {
+	return hex.EncodeToString(computeRawHMAC(sharedSecret, flushScopeRequestMessage(nonce, nodeID, clusterName, database, measurement, timestamp)))
+}
+
+func flushScopeRequestMessage(nonce, nodeID, clusterName, database, measurement string, timestamp int64) string {
+	return fmt.Sprintf("flush-scope-request\x00%s\x00%s\x00%s\x00%s\x00%s\x00%d", nonce, nodeID, clusterName, database, measurement, timestamp)
+}
+
+// ValidateFlushScopeRequestHMAC checks a request's MAC and freshness.
+func ValidateFlushScopeRequestHMAC(sharedSecret, nonce, nodeID, clusterName, database, measurement string, timestamp int64, receivedMAC string, tolerance time.Duration) error {
+	if err := checkHMACTimestamp("flush-scope-request", timestamp, tolerance); err != nil {
+		return err
+	}
+	expected := computeRawHMAC(sharedSecret, flushScopeRequestMessage(nonce, nodeID, clusterName, database, measurement, timestamp))
+	if !constantTimeHexEqual(expected, receivedMAC) {
+		return fmt.Errorf("flush-scope-request HMAC validation failed: shared secret mismatch or malformed MAC")
+	}
+	return nil
+}
+
+// ComputeFlushScopeReplyHMAC authenticates a node's answer, bound to the
+// request's nonce and scope, over a SHA-256 digest of the paths.
+//
+// Format: "flush-scope-reply" \x00 requestNonce \x00 nodeID \x00 clusterName \x00 database \x00 measurement \x00 status \x00 sha256(paths, NUL-separated) \x00 timestamp
+func ComputeFlushScopeReplyHMAC(sharedSecret, requestNonce, nodeID, clusterName, database, measurement, status string, paths []string, timestamp int64) string {
+	return hex.EncodeToString(computeRawHMAC(sharedSecret, flushScopeReplyMessage(requestNonce, nodeID, clusterName, database, measurement, status, paths, timestamp)))
+}
+
+func flushScopeReplyMessage(requestNonce, nodeID, clusterName, database, measurement, status string, paths []string, timestamp int64) string {
+	h := sha256.New()
+	for _, p := range paths {
+		h.Write([]byte(p))
+		h.Write([]byte{0})
+	}
+	return fmt.Sprintf("flush-scope-reply\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%x\x00%d", requestNonce, nodeID, clusterName, database, measurement, status, h.Sum(nil), timestamp)
+}
+
+// ValidateFlushScopeReplyHMAC checks a node's answer.
+func ValidateFlushScopeReplyHMAC(sharedSecret, requestNonce, nodeID, clusterName, database, measurement, status string, paths []string, timestamp int64, receivedMAC string, tolerance time.Duration) error {
+	if err := checkHMACTimestamp("flush-scope-reply", timestamp, tolerance); err != nil {
+		return err
+	}
+	expected := computeRawHMAC(sharedSecret, flushScopeReplyMessage(requestNonce, nodeID, clusterName, database, measurement, status, paths, timestamp))
+	if !constantTimeHexEqual(expected, receivedMAC) {
+		return fmt.Errorf("flush-scope-reply HMAC validation failed: shared secret mismatch, paths tampered, or malformed MAC")
+	}
+	return nil
+}
+
 // DeriveOriginStreamSessionKey derives the origin stream's per-connection key
 // from the shared secret and the hello nonce. A different HKDF info string
 // from the replication session, so the two keys never coincide.

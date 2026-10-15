@@ -61,28 +61,50 @@ func onlyNotRegistered(failed, notRegistered int) bool {
 
 // mayBePendingElsewhere reports an unregistered object younger than the
 // reconciler's grace floor, or of unknown age: one a peer may still be
-// registering (#1214). Its age comes from the store's listing, or else from
-// the flush time in an Arc file name (a rewrite's name, <logical>_rewrite_
-// <nanos>.parquet, does not match and is of unknown age).
+// registering (#1214).
 func (h *DeleteHandler) mayBePendingElsewhere(ctx context.Context, path string) bool {
-	if ol, ok := h.storage.(storage.ObjectLister); ok {
+	age, known := objectAge(ctx, h.storage, path)
+	return !known || age < reconciliation.MinGraceWindow
+}
+
+// objectAge is how long ago the object at path was written: from the store's
+// listing, or else from the flush time in an Arc file name (a rewrite's name,
+// <logical>_rewrite_<nanos>.parquet, does not match and is of unknown age).
+func objectAge(ctx context.Context, store storage.Backend, path string) (time.Duration, bool) {
+	if ol, ok := store.(storage.ObjectLister); ok {
 		if objs, err := ol.ListObjects(ctx, path); err == nil {
 			for _, o := range objs {
 				if o.Path == path && !o.LastModified.IsZero() {
-					return time.Since(o.LastModified) < reconciliation.MinGraceWindow
+					return time.Since(o.LastModified), true
 				}
 			}
 		}
 	}
 	m := flushedFileName.FindStringSubmatch(filepath.Base(path))
 	if m == nil {
-		return true
+		return 0, false
 	}
 	flushed, err := time.Parse("20060102150405", m[1]+m[2])
 	if err != nil {
-		return true
+		return 0, false
 	}
-	return time.Since(flushed) < reconciliation.MinGraceWindow
+	return time.Since(flushed), true
+}
+
+// unregisteredFreshAge is how young an unregistered object on a shared store
+// is left alone by a DELETE (#1265): a writer's registration outbox skips
+// its storage check for a file it flushed within 30s, so a file the DELETE
+// rewrote or removed that soon would be registered after it is gone, a
+// manifest entry with no object. Twice that and more, for clock skew between
+// the store and the writer.
+var unregisteredFreshAge = 2 * time.Minute
+
+// freshUnregistered reports an object no manifest entry covers that a
+// writer may be about to register without looking at it again. Unknown age
+// is not fresh: such an object (a rewrite's name) is no flush.
+func (h *DeleteHandler) freshUnregistered(ctx context.Context, path string) bool {
+	age, known := objectAge(ctx, h.storage, path)
+	return known && age < unregisteredFreshAge
 }
 
 // flushedFileName matches a flushed file's name,
@@ -191,7 +213,11 @@ type DeleteResponse struct {
 	// UnreachableFiles are manifest files this node did not have: with
 	// allow_unreachable, skipped; without it, why the DELETE was refused.
 	UnreachableFiles []string `json:"unreachable_files,omitempty"`
-	Error            string   `json:"error,omitempty"`
+	// UnflushedNodes are other nodes whose buffered rows of the scope could
+	// not be flushed first (shared storage, #1265): with allow_unreachable,
+	// the rows they hold are left; without it, why the DELETE was refused.
+	UnflushedNodes []string `json:"unflushed_nodes,omitempty"`
+	Error          string   `json:"error,omitempty"`
 }
 
 // DeleteConfigResponse represents delete configuration info
@@ -432,6 +458,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	// (#1207 d1): its time functions are fixed to now.
 	var rec deleteRecorder
 	var marks map[string]uint64
+	var unflushed []string
 	where := req.Where
 	if !req.DryRun {
 		if rec = recorderOf(h.coordinator); rec != nil {
@@ -441,6 +468,9 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		}
 		if marks, err = h.flushBeforeDelete(ctx, req.Database, req.Measurement); err != nil {
 			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete rejected: " + err.Error() + "; retry shortly"})
+		}
+		if unflushed, err = flushPeersBeforeDelete(ctx, h.coordinator, req.Database, req.Measurement, req.AllowUnreachable); err != nil {
+			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete rejected: " + err.Error(), UnflushedNodes: unflushed})
 		}
 	}
 	var unreachable []string
@@ -490,6 +520,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 			DryRun:           req.DryRun,
 			FilesProcessed:   []string{},
 			UnreachableFiles: unreachable,
+			UnflushedNodes:   unflushed,
 		})
 	}
 
@@ -539,6 +570,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 			DryRun:           true,
 			FilesProcessed:   fileNames,
 			UnreachableFiles: unreachable,
+			UnflushedNodes:   unflushed,
 		})
 	}
 
@@ -676,6 +708,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 				FilesProcessed:   processedFiles,
 				FailedFiles:      failedFiles,
 				UnreachableFiles: unreachable,
+				UnflushedNodes:   unflushed,
 				ExecutionTimeMs:  float64(time.Since(start).Milliseconds()),
 			})
 		}
@@ -715,6 +748,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		FilesProcessed:   processedFiles,
 		FailedFiles:      failedFiles,
 		UnreachableFiles: unreachable,
+		UnflushedNodes:   unflushed,
 	}
 
 	if !onlyNotRegistered(len(failedFiles), len(notRegistered)) {
@@ -1033,6 +1067,11 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 	// rewrite phase, so nothing can retire the file between this check and the read below.
 	if size, statErr := h.storage.StatFile(ctx, relativePath); statErr == nil && size < 0 {
 		return 0, fmt.Errorf("%w: %s", errSourceRetired, filepath.Base(relativePath))
+	}
+	if scanSHA == unmanagedSHA && h.freshUnregistered(ctx, relativePath) {
+		// A writer's flush still on its way to the manifest (#1265): left
+		// as it is, and the DELETE retried, which finds it registered.
+		return 0, fmt.Errorf("%w: %s", errNotRegisteredYet, filepath.Base(relativePath))
 	}
 
 	// Use the shared DuckDB connection to avoid memory retention from temporary connections

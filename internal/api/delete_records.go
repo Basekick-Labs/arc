@@ -80,6 +80,31 @@ func flushBeforeDelete(ctx context.Context, f DeleteFlusher, database, measureme
 	return marks, nil
 }
 
+// peerFlusher is the coordinator's side of the flush a DELETE asks of the
+// other nodes in shared storage (#1265).
+type peerFlusher interface {
+	PeerFlushActive() bool
+	FlushPeersForDelete(ctx context.Context, database, measurement string) ([]string, error)
+}
+
+// flushPeersBeforeDelete flushes the rows of the scope the other nodes of a
+// shared-storage cluster buffer, so a DELETE removes those acknowledged
+// before it. unflushed names the nodes that could not; the DELETE is refused
+// for them unless allowUnreachable.
+func flushPeersBeforeDelete(ctx context.Context, coord any, database, measurement string, allowUnreachable bool) (unflushed []string, err error) {
+	pf, ok := coord.(peerFlusher)
+	if !ok || !pf.PeerFlushActive() {
+		return nil, nil
+	}
+	if unflushed, err = pf.FlushPeersForDelete(ctx, database, measurement); err != nil {
+		return nil, fmt.Errorf("could not flush the rows other nodes buffer (%v); retry shortly", err)
+	}
+	if len(unflushed) > 0 && !allowUnreachable {
+		return unflushed, fmt.Errorf("%d other node(s) could not flush their buffered rows of this scope first, so the delete would not see them; retry, or set allow_unreachable=true to leave the rows they hold", len(unflushed))
+	}
+	return unflushed, nil
+}
+
 // Time functions DuckDB evaluates per statement. A DELETE record is applied
 // again later (to rows replayed after a failover), so each is fixed to the
 // DELETE's own time first, in UTC (the engine's time zone).

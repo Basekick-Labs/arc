@@ -233,6 +233,20 @@ func unmarshalPayload(msgType MessageType, payload []byte) (interface{}, error) 
 		}
 		return &reply, nil
 
+	case MsgFlushScopeRequest:
+		var q FlushScopeRequest
+		if err := json.Unmarshal(payload, &q); err != nil {
+			return nil, err
+		}
+		return &q, nil
+
+	case MsgFlushScopeReply:
+		var reply FlushScopeReply
+		if err := json.Unmarshal(payload, &reply); err != nil {
+			return nil, err
+		}
+		return &reply, nil
+
 	default:
 		return nil, fmt.Errorf("unknown message type: %d", msgType)
 	}

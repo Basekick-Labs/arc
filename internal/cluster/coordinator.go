@@ -164,6 +164,7 @@ type Coordinator struct {
 	deleteRewriter       atomic.Pointer[DeleteRewriter]           // SetDeleteRewriter
 	deleteOutbox         atomic.Pointer[RegistrationOutbox]       // the outbox the DELETE hooks are on
 	pendingRegs          atomic.Pointer[PendingRegistrationsFunc] // SetPendingRegistrations (#1214)
+	scopeFlusher         atomic.Pointer[DeleteScopeFlusher]       // SetDeleteScopeFlusher (#1265)
 	leaveGate            atomic.Pointer[func() bool]              // SetLeaveGate (#1214)
 	pauseNotifyMu        sync.Mutex                               // ingestPauseChanged
 	pauseNotified        bool
@@ -1974,6 +1975,9 @@ func (c *Coordinator) handlePeerConnection(conn net.Conn) {
 
 	case protocol.MsgPendingRegistrationsQuery:
 		c.handlePendingRegistrationsQuery(conn, msg.Payload.(*protocol.PendingRegistrationsQuery))
+
+	case protocol.MsgFlushScopeRequest:
+		c.handleFlushScopeRequest(conn, msg.Payload.(*protocol.FlushScopeRequest))
 
 	case protocol.MsgFetchFile:
 		// The fetch handler streams the body for the lifetime of the

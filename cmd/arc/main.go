@@ -2228,6 +2228,10 @@ func main() {
 						})
 						registrationOutbox.SetSendGate(clusterCoordinator.TakeoverSendGate())
 					}
+					// A DELETE in shared storage asks every node to flush its
+					// buffered rows of the scope first (#1265). Before Start, so
+					// no request finds the node without its buffer.
+					clusterCoordinator.SetDeleteScopeFlusher(arrowBuffer)
 					if err := clusterCoordinator.Start(); err != nil {
 						log.Error().Err(err).Msg("Failed to start cluster coordinator - running in standalone mode")
 						arrowBuffer.SetIngestGate(nil)
