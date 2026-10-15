@@ -1480,6 +1480,73 @@ outside the writer's WAL, and a standby writer refused it with `503`.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1075](https://github.com/Basekick-Labs/arc/pull/1075).
 
+### Bulk imports no longer hold the whole file in memory several times
+
+The import endpoints (`/api/v1/import/csv`, `parquet`, `lp`, `tle`) read the
+upload, parsed all of it, and wrote it in one go. On a QA cluster a 172 MB
+line-protocol file OOM-killed a writer with a 3 GiB limit; since #1070 a reader
+or a standby forwards such an import to the primary, so the primary took the
+hit and failed over. Live memory one import adds, measured from the moment the
+handler starts (the request body is already held), WAL off (the WAL adds more
+to the old numbers):
+
+| File | Before | Now |
+|---|---|---|
+| Line protocol, 197 MB | +3.8 GB | +71 MB |
+| CSV, 175 MB | +1.1 GB | +27 MB |
+| Parquet, 274 MB, one row group | +1.6 GB | +77 MB |
+
+On the QA cluster (writers limited to 3 GiB) the 172 MB file that OOM-killed
+the primary now imports in 16 s, and 499 MB line protocol, 452 MB CSV and
+478 MB Parquet imports through a reader or a standby complete with exact row
+counts and no restarts; the primary, which also holds the forwarded body,
+peaked at 2.2 GiB.
+
+- The file is read in place in the request body. Before, it was copied twice
+  more (the multipart form, then a full read).
+- Line protocol, CSV and Parquet are processed in chunks (about 4 MB of line
+  protocol; 100,000 CSV or Parquet rows, fewer for wide files: at most a
+  million CSV cells or two million Parquet values), and each chunk is written
+  before the next is read. Parquet column chunks are read a buffer at a time.
+- An import's writes are paced to the flushes: what it has written and not yet
+  flushed stays under an eighth of the memory limit (64 MB to 512 MB) above
+  what the buffer held when it started. Over that it flushes its database's
+  buffers and waits; if the buffered rows stay above the limit for two
+  minutes, it stops (a failure part-way, below).
+- One import writes at a time on a node. Imports sent together are validated
+  together and written one after the other: concurrent write passes would add
+  up their allowances. Every request body is held in memory while it waits.
+  A forwarded import waiting its turn on the writer still counts down
+  `cluster.import_forward_timeout_ms` on the node that forwarded it, so a
+  `504` there can mean it was still queued.
+- A validation pass reads the whole file, chunk by chunk, before anything is
+  written, so a bad file is still refused with nothing written: a bad time
+  value, an invalid measurement name, a measurement the token may not write,
+  a CSV parse error. CSV column types are still decided by the whole column,
+  and a line-protocol field's type by its first value in the file. Line
+  protocol is also refused (`400`) when a column mixes strings or booleans with
+  numbers (a field, or a field and a tag of the same name in other lines), or
+  a line is longer than 64 MB; before, a mixed column failed while being
+  written. Decimal columns (`ingest.decimal_columns`) convert any value, as
+  before.
+- An import that fails after part of it was written (the node is fenced, the
+  buffer is closing, flushes are not keeping up, a later part of the file
+  cannot be decoded) answers `500` with `rows_written` and
+  `written_measurements`, and no `Retry-After`: running the whole file again
+  writes those rows again.
+- A request with a `Content-Encoding` header other than `identity` is refused
+  with `415`; compress the file itself (gzip line protocol) instead. Before,
+  the server decompressed such a body with no size limit.
+- A `file` form field sent without a filename is not taken as the upload, as
+  before. A request body cut short answers `400` for every format.
+- A `200` still means every row is in the write buffer and the WAL (when
+  enabled); the files follow as their flushes finish.
+- Files sorted by time make about as many files as before. An unsorted file
+  that spans many hours makes many more small files (each chunk's flush writes
+  one file per hour it touches) until compaction merges them; sort large files
+  by time before importing.
+- TLE files are parsed whole, as before, but read once.
+
 ### Stream takeover publishes the rows of unpulled files in one go, not in waves ([#1269](https://github.com/Basekick-Labs/arc/issues/1269))
 
 When a primary writer dies with files nobody had pulled yet, the new primary
