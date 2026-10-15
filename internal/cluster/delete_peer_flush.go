@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"net"
 	"sort"
 	"strings"
@@ -44,7 +46,13 @@ var (
 	// the manifest.
 	peerRegisterWait = 30 * time.Second
 	// peerRegisterPoll spaces the manifest checks of that wait.
-	peerRegisterPoll = 200 * time.Millisecond
+	peerRegisterPoll = 500 * time.Millisecond
+	// peerDialTimeout bounds connecting to a node: one that is down costs
+	// this, not the whole flush budget.
+	peerDialTimeout = 5 * time.Second
+	// flushReplyBudget bounds the path bytes one reply carries, as for the
+	// pending-registrations query.
+	flushReplyBudget = pendingReplyBudget
 )
 
 // SetDeleteScopeFlusher installs this node's ingest buffer, which a peer
@@ -122,7 +130,14 @@ func (c *Coordinator) handleFlushScopeRequest(conn net.Conn, q *protocol.FlushSc
 // localFlushAnswer flushes this node's buffered rows of the scope and lists
 // its files of the scope still waiting to register.
 func (c *Coordinator) localFlushAnswer(database, measurement string) (string, []string) {
-	if fp := c.scopeFlusher.Load(); fp != nil {
+	fp := c.scopeFlusher.Load()
+	if fp == nil && c.localNode != nil && c.localNode.GetCapabilities().CanIngest {
+		// A node that takes writes and has no buffer installed cannot say
+		// its rows are in a file.
+		c.logger.Warn().Str("database", database).Msg("Flush for a DELETE refused: this node's ingest buffer is not installed")
+		return protocol.FlushStatusFailed, nil
+	}
+	if fp != nil {
 		f := *fp
 		if f.HasFlushFailure() {
 			c.logger.Warn().Str("database", database).Msg("Flush for a DELETE refused: an earlier flush failed and its rows wait for WAL recovery")
@@ -138,16 +153,22 @@ func (c *Coordinator) localFlushAnswer(database, measurement string) (string, []
 	}
 	fn := c.pendingRegs.Load()
 	if fn == nil {
-		if c.scopeFlusher.Load() == nil {
+		if fp == nil {
 			return protocol.FlushStatusOK, nil
 		}
 		return protocol.FlushStatusUntracked, nil
 	}
-	all, tooMany := (*fn)(pendingReplyBudget)
-	if tooMany {
-		return protocol.FlushStatusTooMany, nil
+	// The budget is for the scope's files: files pending in other databases
+	// do not make this answer too big.
+	all, _ := (*fn)(math.MaxInt)
+	scoped := pathsInScope(all, database, measurement)
+	size := 0
+	for _, p := range scoped {
+		if size += len(p) + 3; size > flushReplyBudget {
+			return protocol.FlushStatusTooMany, nil
+		}
 	}
-	return protocol.FlushStatusOK, pathsInScope(all, database, measurement)
+	return protocol.FlushStatusOK, scoped
 }
 
 // pathsInScope returns the paths under database/ (database/measurement/).
@@ -187,7 +208,7 @@ func (c *Coordinator) requestPeerFlush(ctx context.Context, nodeID, addr, databa
 	}
 	ctx, cancel := context.WithTimeout(ctx, peerFlushTimeout)
 	defer cancel()
-	conn, err := security.DialContext(ctx, "tcp", addr, peerFlushTimeout, c.tlsConfig)
+	conn, err := security.DialContext(ctx, "tcp", addr, peerDialTimeout, c.tlsConfig)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}
@@ -208,9 +229,16 @@ func (c *Coordinator) requestPeerFlush(ctx context.Context, nodeID, addr, databa
 	if err := protocol.SendMessage(conn, &protocol.Message{Type: protocol.MsgFlushScopeRequest, Payload: q}, peerFlushTimeout); err != nil {
 		return nil, fmt.Errorf("send: %w", err)
 	}
-	msg, err := protocol.ReceiveMessage(conn, peerFlushTimeout)
+	wait := peerFlushTimeout
+	if dl, ok := ctx.Deadline(); ok {
+		wait = min(wait, time.Until(dl))
+	}
+	msg, err := protocol.ReceiveMessage(conn, wait)
 	if err != nil {
-		return nil, fmt.Errorf("%w (a node before this release closes the connection): %v", errNoFlushAnswer, err)
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, fmt.Errorf("%w: it closed the connection (a node before this release does)", errNoFlushAnswer)
+		}
+		return nil, fmt.Errorf("%w: %v", errNoFlushAnswer, err)
 	}
 	reply, ok := msg.Payload.(*protocol.FlushScopeReply)
 	if !ok || msg.Type != protocol.MsgFlushScopeReply {
@@ -226,9 +254,10 @@ func (c *Coordinator) requestPeerFlush(ctx context.Context, nodeID, addr, databa
 	case protocol.FlushStatusOK:
 		return pathsInScope(reply.Paths, database, measurement), nil
 	case protocol.FlushStatusUntracked:
-		// Its files are not named: a DELETE refuses to rewrite an
-		// unregistered file that young (delete_cas.go), so they cannot be
-		// lost to it, and any older one is in the scan.
+		// Its files are not named: a DELETE refuses to rewrite or remove an
+		// unregistered file that young (DeleteHandler.freshUnregistered,
+		// DatabasesHandler.freshUnregistered), so they cannot be lost to it,
+		// and any older one is in the scan.
 		return nil, nil
 	case protocol.FlushStatusFailed:
 		return nil, fmt.Errorf("%w: its flush failed, or an earlier one did and its rows wait for WAL recovery", errNoFlushAnswer)
@@ -270,7 +299,7 @@ func (c *Coordinator) FlushPeersForDelete(ctx context.Context, database, measure
 		}
 		addr := c.leaderCoordinatorAddress(n.ID)
 		if addr == "" {
-			fail(c.unflushedLine(n.ID, "no coordinator address"))
+			fail(c.unflushedLine(n.ID, "no coordinator address", true))
 			continue
 		}
 		wg.Add(1)
@@ -278,7 +307,7 @@ func (c *Coordinator) FlushPeersForDelete(ctx context.Context, database, measure
 			defer wg.Done()
 			paths, err := c.requestPeerFlush(ctx, id, addr, database, measurement)
 			if err != nil {
-				fail(c.unflushedLine(id, err.Error()))
+				fail(c.unflushedLine(id, err.Error(), true))
 				return
 			}
 			mu.Lock()
@@ -294,7 +323,7 @@ func (c *Coordinator) FlushPeersForDelete(ctx context.Context, database, measure
 		return nil, err
 	}
 	for id, paths := range late {
-		fail(c.unflushedLine(id, fmt.Sprintf("%d flushed file(s) not registered in the cluster manifest after %s (first: %s)", len(paths), peerRegisterWait, paths[0])))
+		fail(c.unflushedLine(id, fmt.Sprintf("%d file(s) it flushed for the delete are not registered in the cluster manifest after %s (first: %s)", len(paths), peerRegisterWait, paths[0]), false))
 	}
 	sort.Strings(unflushed)
 	return unflushed, nil
@@ -308,9 +337,15 @@ func (c *Coordinator) waitPeerRegistrations(ctx context.Context, waitFor map[str
 		return nil, nil
 	}
 	deadline := time.Now().Add(peerRegisterWait)
-	for {
-		if err := c.SyncManifest(ctx); err != nil {
-			return nil, fmt.Errorf("could not catch up with the cluster manifest: %w", err)
+	for first := true; ; first = false {
+		if !first {
+			// Caught up only after a miss, within what is left of the wait.
+			sctx, cancel := context.WithDeadline(ctx, deadline)
+			err := c.SyncManifest(sctx)
+			cancel()
+			if err != nil && ctx.Err() != nil {
+				return nil, fmt.Errorf("could not catch up with the cluster manifest: %w", err)
+			}
 		}
 		for p := range waitFor {
 			if _, ok := c.GetFileEntry(p); ok {
@@ -345,13 +380,17 @@ func (c *Coordinator) waitPeerRegistrations(ctx context.Context, waitFor map[str
 }
 
 // unflushedLine names a node whose buffered rows a DELETE could not see,
-// with its health and how to clear it.
-func (c *Coordinator) unflushedLine(nodeID, why string) string {
+// with its health and how to clear it. unanswered: the node did not flush;
+// else it flushed, and its registrations are behind.
+func (c *Coordinator) unflushedLine(nodeID, why string, unanswered bool) string {
 	state := "unknown"
 	if c.registry != nil {
 		if n, ok := c.registry.Get(nodeID); ok {
 			state = string(n.GetState())
 		}
+	}
+	if !unanswered {
+		return fmt.Sprintf("node %s (state %s): %s; its registration outbox is behind (arc_cluster_file_registrations_pending and arc_cluster_file_registration_oldest_pending_seconds on that node): retry once it drains", nodeID, state, why)
 	}
 	return fmt.Sprintf("node %s (state %s): %s; bring it back, remove it from the cluster if it is gone for good, or set allow_unreachable=true to leave the rows it holds", nodeID, state, why)
 }

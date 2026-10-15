@@ -100,8 +100,9 @@ func objectAge(ctx context.Context, store storage.Backend, path string) (time.Du
 var unregisteredFreshAge = 2 * time.Minute
 
 // freshUnregistered reports an object no manifest entry covers that a
-// writer may be about to register without looking at it again. Unknown age
-// is not fresh: such an object (a rewrite's name) is no flush.
+// writer may be about to register without looking at it again. Of unknown
+// age it is not: an object store always dates its objects, so that is a
+// file of a local backend no other writer shares.
 func (h *DeleteHandler) freshUnregistered(ctx context.Context, path string) bool {
 	age, known := objectAge(ctx, h.storage, path)
 	return known && age < unregisteredFreshAge
@@ -1068,7 +1069,7 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 	if size, statErr := h.storage.StatFile(ctx, relativePath); statErr == nil && size < 0 {
 		return 0, fmt.Errorf("%w: %s", errSourceRetired, filepath.Base(relativePath))
 	}
-	if scanSHA == unmanagedSHA && h.freshUnregistered(ctx, relativePath) {
+	if scanSHA == unmanagedSHA && peerFlushOn(h.coordinator) && h.freshUnregistered(ctx, relativePath) {
 		// A writer's flush still on its way to the manifest (#1265): left
 		// as it is, and the DELETE retried, which finds it registered.
 		return 0, fmt.Errorf("%w: %s", errNotRegisteredYet, filepath.Base(relativePath))

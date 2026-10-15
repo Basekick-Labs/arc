@@ -80,11 +80,18 @@ func flushBeforeDelete(ctx context.Context, f DeleteFlusher, database, measureme
 	return marks, nil
 }
 
-// peerFlusher is the coordinator's side of the flush a DELETE asks of the
+// PeerFlusher is the coordinator's side of the flush a DELETE asks of the
 // other nodes in shared storage (#1265).
-type peerFlusher interface {
+type PeerFlusher interface {
 	PeerFlushActive() bool
 	FlushPeersForDelete(ctx context.Context, database, measurement string) ([]string, error)
+}
+
+// peerFlushOn reports a coordinator of a shared-storage cluster, where
+// other nodes take writes too.
+func peerFlushOn(coord any) bool {
+	pf, ok := coord.(PeerFlusher)
+	return ok && pf.PeerFlushActive()
 }
 
 // flushPeersBeforeDelete flushes the rows of the scope the other nodes of a
@@ -92,10 +99,10 @@ type peerFlusher interface {
 // before it. unflushed names the nodes that could not; the DELETE is refused
 // for them unless allowUnreachable.
 func flushPeersBeforeDelete(ctx context.Context, coord any, database, measurement string, allowUnreachable bool) (unflushed []string, err error) {
-	pf, ok := coord.(peerFlusher)
-	if !ok || !pf.PeerFlushActive() {
+	if !peerFlushOn(coord) {
 		return nil, nil
 	}
+	pf := coord.(PeerFlusher)
 	if unflushed, err = pf.FlushPeersForDelete(ctx, database, measurement); err != nil {
 		return nil, fmt.Errorf("could not flush the rows other nodes buffer (%v); retry shortly", err)
 	}

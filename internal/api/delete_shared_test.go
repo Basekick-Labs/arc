@@ -85,7 +85,6 @@ func TestDeleteSharedStoreGoneEntry(t *testing.T) {
 func TestDeleteSharedStoreUnlistedObject(t *testing.T) {
 	c, h, root := sharedCluster(t, casA)
 	writeRecordsParquet(t, c.db, root, casB)
-	ageObject(t, root, casB)
 	code, out, raw := sendDelete(t, h, deleteH1)
 	if code != 200 || out.DeletedCount != 4 || out.AffectedFiles != 2 {
 		t.Fatalf("%d %s", code, raw)
@@ -105,7 +104,6 @@ func TestDeleteSharedStoreUnlistedObject(t *testing.T) {
 		}
 	}
 	writeRecordsParquet(t, c.db, root, casO)
-	ageObject(t, root, casO)
 	code, _, raw = sendDelete(t, h, `{"database":"db","measurement":"cpu","where":"v > 0","confirm":true}`)
 	if code != 200 {
 		t.Fatalf("whole: %d %s", code, raw)
@@ -128,14 +126,16 @@ func ageObject(t *testing.T, root, p string) {
 	}
 }
 
-// #1265: an unlisted object younger than unregisteredFreshAge is another
-// writer's flush its outbox may register without looking at it again:
-// rewritten or removed now, it would be registered after it is gone. It is
-// left as it is and the DELETE answers 503; once older it is deleted from.
+// #1265: in shared storage an unlisted object younger than
+// unregisteredFreshAge is another writer's flush its outbox may register
+// without looking at it again: rewritten or removed now, it would be
+// registered after it is gone. It is left as it is and the DELETE answers
+// 503; once older it is deleted from. (Outside shared storage only one node
+// writes, and TestDeleteSharedStoreUnlistedObject rewrites a fresh one.)
 func TestDeleteSharedStoreLeavesAFreshUnlistedObject(t *testing.T) {
 	for _, where := range []string{"host = 'h1'", "v > 0"} { // a rewrite, and a whole-file delete
 		t.Run(where, func(t *testing.T) {
-			c, h, root := sharedCluster(t, casA)
+			c, h, root := peerFlushCluster(t, casA)
 			writeRecordsParquet(t, c.db, root, casB)
 			before := countParquet(t, c.db, filepath.Join(root, casB), where)
 			body := `{"database":"db","measurement":"cpu","where":"` + where + `","confirm":true}`

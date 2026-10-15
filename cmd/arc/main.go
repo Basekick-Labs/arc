@@ -2231,7 +2231,7 @@ func main() {
 					// A DELETE in shared storage asks every node to flush its
 					// buffered rows of the scope first (#1265). Before Start, so
 					// no request finds the node without its buffer.
-					clusterCoordinator.SetDeleteScopeFlusher(arrowBuffer)
+					clusterCoordinator.SetDeleteScopeFlusher(deleteFlusher(arrowBuffer, walWriter))
 					if err := clusterCoordinator.Start(); err != nil {
 						log.Error().Err(err).Msg("Failed to start cluster coordinator - running in standalone mode")
 						arrowBuffer.SetIngestGate(nil)
@@ -3999,7 +3999,7 @@ func main() {
 	}
 	// A DELETE flushes the rows acknowledged before it first, so it sees them
 	// in files (#1207 d1).
-	deleteHandler.SetFlusher(arrowBuffer)
+	deleteHandler.SetFlusher(deleteFlusher(arrowBuffer, walWriter))
 	deleteHandler.RegisterRoutes(server.GetApp())
 	if clusterCoordinator != nil {
 		deleteHandler.SetCoordinator(clusterCoordinator)
@@ -4019,7 +4019,7 @@ func main() {
 	// Register Databases handler
 	databasesHandler := api.NewDatabasesHandler(storageBackend, &cfg.Delete, authManager, logger.Get("databases"))
 	databasesHandler.SetFieldSchema(fieldSchemaRegistry)
-	databasesHandler.SetFlusher(arrowBuffer)
+	databasesHandler.SetFlusher(deleteFlusher(arrowBuffer, walWriter))
 	if registrationOutbox != nil {
 		databasesHandler.SetPendingRegistrations(registrationOutbox)
 	}
@@ -5452,6 +5452,28 @@ func newRegistrationOutbox(cfg *config.Config, clusteringLicensed bool, logger z
 		return nil
 	}
 	return r
+}
+
+// The coordinator is what a DELETE asks to flush the other nodes (#1265).
+var _ api.PeerFlusher = (*cluster.Coordinator)(nil)
+
+// noWALDeleteFlusher is the ingest buffer of a node without a WAL as a
+// DELETE's flush sees it. A DELETE refuses while an earlier flush failure is
+// outstanding because those rows wait for WAL recovery, which would bring
+// them back after it. Without a WAL there is no recovery: the rows of a
+// failed flush are gone, and the latch, which only recovery clears, would
+// refuse every DELETE on this node, and in shared storage on every node,
+// until a restart.
+type noWALDeleteFlusher struct{ *ingest.ArrowBuffer }
+
+func (noWALDeleteFlusher) HasFlushFailure() bool { return false }
+
+// deleteFlusher is the buffer a DELETE flushes before it scans.
+func deleteFlusher(buffer *ingest.ArrowBuffer, walWriter *wal.Writer) cluster.DeleteScopeFlusher {
+	if walWriter == nil {
+		return noWALDeleteFlusher{buffer}
+	}
+	return buffer
 }
 
 // walCoverageHold returns the registration hold source for the WAL (#1207

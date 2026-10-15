@@ -186,3 +186,79 @@ func TestDatabaseDeleteFlushesOtherNodesFirst(t *testing.T) {
 		t.Fatalf("allowed: %d %s", code, body)
 	}
 }
+
+// heldOutbox is this node's registration outbox as a database deletion sees
+// it: what it holds, until the deletion withdraws it.
+type heldOutbox struct{ held map[string]bool }
+
+func (o *heldOutbox) HoldsRegistration(p string) bool { return o.held[p] }
+
+func (o *heldOutbox) WithdrawDatabase(context.Context, string, uint64) error {
+	o.held = map[string]bool{}
+	return nil
+}
+
+// A fresh unregistered file this node held for registration is its own,
+// withdrawn by the deletion: deleted with the database, not a reason to 503.
+func TestDatabaseDeleteRemovesItsOwnFreshFiles(t *testing.T) {
+	c, _, root := peerFlushCluster(t, casA)
+	h := newDatabasesTestHandler(t, root)
+	h.SetCoordinator(c, true)
+	writeRecordsParquet(t, c.db, root, casB)
+	h.SetPendingRegistrations(&heldOutbox{held: map[string]bool{casB: true}})
+	if code, body := sendDatabaseDelete(t, h, "db", ""); code != 200 {
+		t.Fatalf("%d %s", code, body)
+	}
+	if _, err := os.Stat(filepath.Join(root, casB)); err == nil {
+		t.Fatal("this node's own file was kept")
+	}
+}
+
+// A file flushed while the deletion runs (after it checked for unregistered
+// files) holds rows written during it: left, not deleted, so its writer
+// does not register a file that is gone.
+func TestDatabaseDeleteLeavesAFlushThatLandsWhileItRuns(t *testing.T) {
+	c, _, root := peerFlushCluster(t, casA)
+	h := newDatabasesTestHandler(t, root)
+	h.SetCoordinator(c, true)
+	h.SetPendingRegistrations(&landingOutbox{land: func() { writeRecordsParquet(t, c.db, root, casO) }})
+	if code, body := sendDatabaseDelete(t, h, "db", ""); code != 200 {
+		t.Fatalf("%d %s", code, body)
+	}
+	if _, err := os.Stat(filepath.Join(root, casA)); err == nil {
+		t.Fatal("the registered file was kept")
+	}
+	if _, err := os.Stat(filepath.Join(root, casO)); err != nil {
+		t.Fatal("the flush that landed during the deletion was deleted")
+	}
+}
+
+// landingOutbox runs land when the deletion withdraws its registrations:
+// between its check and its listing.
+type landingOutbox struct{ land func() }
+
+func (o *landingOutbox) HoldsRegistration(string) bool { return false }
+
+func (o *landingOutbox) WithdrawDatabase(context.Context, string, uint64) error {
+	o.land()
+	return nil
+}
+
+// listlessBackend hides the object listing, so an object's age comes from
+// its name alone.
+type listlessBackend struct{ storage.Backend }
+
+// Of unknown age (no listing, not a flush's name) an object is not fresh:
+// left alone it would block a DELETE for ever.
+func TestFreshUnregisteredOfUnknownAge(t *testing.T) {
+	_, h, root := peerFlushCluster(t)
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { backend.Close() })
+	h.storage = listlessBackend{backend}
+	if h.freshUnregistered(context.Background(), "db/cpu/2026/10/11/10/cpu_a_rewrite_123.parquet") {
+		t.Fatal("an object of unknown age read as fresh")
+	}
+}

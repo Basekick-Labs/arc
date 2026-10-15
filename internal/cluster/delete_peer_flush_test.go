@@ -11,6 +11,10 @@ import (
 
 	"github.com/basekick-labs/arc/internal/cluster/protocol"
 	"github.com/basekick-labs/arc/internal/cluster/security"
+	"github.com/basekick-labs/arc/internal/config"
+	"github.com/basekick-labs/arc/internal/ingest"
+	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/rs/zerolog"
 )
 
 // #1265: in shared storage a DELETE asks every other node to flush its
@@ -108,7 +112,7 @@ func TestFlushScopeStatuses(t *testing.T) {
 		{"flush failure outstanding", &fakeScopeFlusher{failed: true}, true, "flush failed"},
 		{"flush error", &fakeScopeFlusher{err: errors.New("disk full")}, true, "flush failed"},
 		{"no journal", &fakeScopeFlusher{}, false, ""},
-		{"no buffer", nil, false, ""},
+		{"a writer without its buffer", nil, false, "flush failed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rig := flushRig(t)
@@ -253,13 +257,13 @@ func TestFlushPeersForDeleteLateRegistration(t *testing.T) {
 	w1.onFlush = func() { register(outbox, flushHour+"cpu_a.parquet", 10) }
 	flushResponder(t, rig, "writer-1", w1, outbox)
 	flushResponder(t, rig, "writer-2", &fakeScopeFlusher{}, nil)
-	flushResponder(t, rig, "reader-1", nil, nil)
+	flushResponder(t, rig, "reader-1", &fakeScopeFlusher{}, nil)
 
 	unflushed, err := rig.FlushPeersForDelete(context.Background(), "db", "cpu")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(unflushed) != 1 || !strings.Contains(unflushed[0], "writer-1") || !strings.Contains(unflushed[0], "cpu_a.parquet") {
+	if len(unflushed) != 1 || !strings.Contains(unflushed[0], "writer-1") || !strings.Contains(unflushed[0], "cpu_a.parquet") || !strings.Contains(unflushed[0], "outbox") {
 		t.Fatalf("unflushed %v, want writer-1 and its file", unflushed)
 	}
 }
@@ -287,5 +291,145 @@ func TestValidFlushScope(t *testing.T) {
 		if got := validFlushScope(tc.db, tc.m); got != tc.ok {
 			t.Errorf("validFlushScope(%q, %q) = %v, want %v", tc.db, tc.m, got, tc.ok)
 		}
+	}
+}
+
+// A reply from another node than the one asked is not trusted, even with a
+// valid MAC.
+func TestFlushScopeReplyFromAnotherNode(t *testing.T) {
+	rig := flushRig(t)
+	serveListener(t, rig, "writer-1", func(conn net.Conn) {
+		defer conn.Close()
+		msg, err := protocol.ReceiveMessage(conn, 5*time.Second)
+		if err != nil {
+			return
+		}
+		q := msg.Payload.(*protocol.FlushScopeRequest)
+		ts := time.Now().Unix()
+		reply := &protocol.FlushScopeReply{NodeID: "writer-9", Status: protocol.FlushStatusOK, Timestamp: ts,
+			HMAC: security.ComputeFlushScopeReplyHMAC(osSecret, q.Nonce, "writer-9", "test-cluster", q.Database, q.Measurement, protocol.FlushStatusOK, nil, ts)}
+		_ = protocol.SendMessage(conn, &protocol.Message{Type: protocol.MsgFlushScopeReply, Payload: reply}, 5*time.Second)
+	})
+	_, err := rig.requestPeerFlush(context.Background(), "writer-1", rig.leaderCoordinatorAddress("writer-1"), "db", "cpu")
+	if !errors.Is(err, errNoFlushAnswer) || !strings.Contains(err.Error(), "writer-9") {
+		t.Fatalf("a reply as another node was trusted: %v", err)
+	}
+}
+
+// A flushed file that is gone from storage (its writer withdrew it, or
+// settled it as lost) will never register: not waited for.
+func TestFlushPeersForDeleteDoesNotWaitForAGoneFile(t *testing.T) {
+	rig := flushRig(t)
+	store, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rig.storage = store
+	outbox := newTestOutbox(t, t.TempDir())
+	w1 := &fakeScopeFlusher{}
+	w1.onFlush = func() { register(outbox, flushHour+"cpu_gone.parquet", 10) }
+	flushResponder(t, rig, "writer-1", w1, outbox)
+	flushResponder(t, rig, "writer-2", &fakeScopeFlusher{}, nil)
+	flushResponder(t, rig, "reader-1", &fakeScopeFlusher{}, nil)
+	start := time.Now()
+	unflushed, err := rig.FlushPeersForDelete(context.Background(), "db", "cpu")
+	if err != nil || len(unflushed) != 0 {
+		t.Fatalf("unflushed %v err %v", unflushed, err)
+	}
+	if time.Since(start) > peerRegisterWait/2 {
+		t.Fatalf("waited %s for a file that is gone", time.Since(start))
+	}
+}
+
+// The node running the DELETE is not asked: it flushed itself already, and
+// asking would dial its own coordinator.
+func TestFlushPeersForDeleteSkipsItself(t *testing.T) {
+	rig := flushRig(t)
+	rig.localNode = NewNode("writer-1", "writer-1", RoleWriter, "test-cluster")
+	flushResponder(t, rig, "writer-2", &fakeScopeFlusher{}, nil)
+	flushResponder(t, rig, "reader-1", &fakeScopeFlusher{}, nil)
+	unflushed, err := rig.FlushPeersForDelete(context.Background(), "db", "cpu")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range unflushed {
+		if strings.Contains(line, "writer-1") {
+			t.Fatalf("the node asked itself: %v", unflushed)
+		}
+	}
+}
+
+// A node that cannot ingest and has no buffer has nothing to flush.
+func TestFlushScopeNodeWithoutIngest(t *testing.T) {
+	rig := flushRig(t)
+	pendingResponder(t, rig, "reader-1", RoleReader, nil, osSecret)
+	paths, err := rig.requestPeerFlush(context.Background(), "reader-1", rig.leaderCoordinatorAddress("reader-1"), "db", "cpu")
+	if err != nil || len(paths) != 0 {
+		t.Fatalf("paths %v err %v", paths, err)
+	}
+}
+
+// The reply budget is for the scope's files: many files pending in another
+// database do not make the answer too big, as many of the scope do.
+func TestFlushScopeReplyBudgetIsTheScopes(t *testing.T) {
+	old := flushReplyBudget
+	flushReplyBudget = 500
+	t.Cleanup(func() { flushReplyBudget = old })
+	rig := flushRig(t)
+	outbox := newTestOutbox(t, t.TempDir())
+	for i := 0; i < 20; i++ {
+		outbox.RegisterFile("other", "cpu", "other/cpu/2026/10/11/10/cpu_"+strings.Repeat("x", i+1)+".parquet", time.Now(), 10, "abc")
+	}
+	flushResponder(t, rig, "writer-1", &fakeScopeFlusher{}, outbox)
+	if _, err := rig.requestPeerFlush(context.Background(), "writer-1", rig.leaderCoordinatorAddress("writer-1"), "db", "cpu"); err != nil {
+		t.Fatalf("other databases' files counted against the scope: %v", err)
+	}
+	for i := 0; i < 20; i++ {
+		register(outbox, flushHour+"cpu_"+strings.Repeat("y", i+1)+".parquet", 10)
+	}
+	_, err := rig.requestPeerFlush(context.Background(), "writer-1", rig.leaderCoordinatorAddress("writer-1"), "db", "cpu")
+	if !errors.Is(err, errNoFlushAnswer) || !strings.Contains(err.Error(), "more files") {
+		t.Fatalf("err %v, want too many", err)
+	}
+}
+
+// End to end with a real ingest buffer and registration outbox on the other
+// writer: rows it acknowledged and still buffers (a buffer age of ten
+// minutes) are in a registered file when the call returns. Without the call
+// they are in no file.
+func TestFlushPeersForDeleteFlushesARealBuffer(t *testing.T) {
+	rig := flushRig(t)
+	backend, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rig.storage = backend
+	buffer := ingest.NewArrowBuffer(&config.IngestConfig{MaxBufferSize: 1000000, MaxBufferAgeMS: 600000,
+		Compression: "snappy", ShardCount: 4, FlushWorkers: 2, FlushQueueSize: 8}, backend, zerolog.Nop())
+	t.Cleanup(func() { _ = buffer.Close() })
+	outbox := newTestOutbox(t, t.TempDir())
+	buffer.SetFileRegistrar(outbox)
+	outbox.HandOff(rigManifest{rig}, backend, "writer-1")
+	flushResponder(t, rig, "writer-1", buffer, outbox)
+	flushResponder(t, rig, "writer-2", &fakeScopeFlusher{}, nil)
+	flushResponder(t, rig, "reader-1", &fakeScopeFlusher{}, nil)
+
+	ts := time.Date(2026, 10, 11, 10, 0, 0, 0, time.UTC).UnixMicro()
+	if err := buffer.WriteColumnarDirect(context.Background(), "db", "cpu", map[string][]interface{}{"time": {ts, ts + 1}, "value": {1.0, 2.0}}); err != nil {
+		t.Fatal(err)
+	}
+	if files, _ := backend.List(context.Background(), "db/cpu/"); len(files) != 0 {
+		t.Fatalf("precondition: rows already in a file: %v", files)
+	}
+	unflushed, err := rig.FlushPeersForDelete(context.Background(), "db", "cpu")
+	if err != nil || len(unflushed) != 0 {
+		t.Fatalf("unflushed %v err %v", unflushed, err)
+	}
+	files, err := backend.List(context.Background(), "db/cpu/")
+	if err != nil || len(files) != 1 {
+		t.Fatalf("files %v err %v, want the flushed one", files, err)
+	}
+	if _, ok := rig.GetFileEntry(files[0]); !ok {
+		t.Fatalf("%s not registered when the call returned", files[0])
 	}
 }
