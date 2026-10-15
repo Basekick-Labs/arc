@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -375,24 +374,27 @@ func (s *Subscriber) onMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 		return
 	}
 
-	// Decode and write message. While writes are fenced (#1207) the manager
-	// suspends this subscription, so the broker holds new messages. One that
-	// was already in flight when the fence closed waits briefly for it to lift;
-	// never long, since blocking this handler stalls the client and its
-	// keepalive.
-	err := s.processMessage(msg.Topic(), msg.Payload(), database)
-	for deadline := time.Now().Add(mqttFencedWait); err != nil && errors.Is(err, ingest.ErrIngestFenced) && time.Now().Before(deadline); {
+	// Decode and write message. While writes are fenced (#1207) or the WAL
+	// volume is under disk pressure (#676) the manager suspends this
+	// subscription, so the broker holds new messages. One that was already in
+	// flight when the refusal started waits briefly for it to lift; never
+	// long, since blocking this handler stalls the client and its keepalive.
+	err := s.processMessage(s.ctx, msg.Topic(), msg.Payload(), database)
+	// A retry is the same message: a disk pressure refusal of it is counted
+	// once in arc_wal_disk_pressure_rejections_total (#676).
+	retryCtx := ingest.WithRefusalCounted(s.ctx)
+	for deadline := time.Now().Add(mqttFencedWait); err != nil && ingest.IsWriteRefusal(err) && time.Now().Before(deadline); {
 		select {
 		case <-s.ctx.Done():
 			return
 		case <-time.After(mqttFencedRetry):
 		}
-		err = s.processMessage(msg.Topic(), msg.Payload(), database)
+		err = s.processMessage(retryCtx, msg.Topic(), msg.Payload(), database)
 	}
 	if err != nil {
 		s.messagesFailed.Add(1)
 		metrics.Get().IncMQTTMessagesFailed()
-		if errors.Is(err, ingest.ErrIngestFenced) {
+		if ingest.IsWriteRefusal(err) {
 			// Still refused after the wait: logged by reason, at most every
 			// 30 s, not once per message (#1268). The takeover gates do not
 			// suspend the subscription, so this repeats per message for as long
@@ -418,9 +420,9 @@ const (
 )
 
 // suspend disconnects from the broker without unsubscribing while writes are
-// fenced (#1207); the session, and with clean_session=false its queued
-// messages, survives.
-func (s *Subscriber) suspend() {
+// refused (#1207, #676); the session, and with clean_session=false its queued
+// messages, survives. why completes the log line.
+func (s *Subscriber) suspend(why string) {
 	s.mu.RLock()
 	running, client := s.running, s.client
 	s.mu.RUnlock()
@@ -429,7 +431,7 @@ func (s *Subscriber) suspend() {
 	}
 	client.Disconnect(250)
 	metrics.Get().SetMQTTConnected(false)
-	s.logger.Warn().Msg("MQTT subscription suspended: writes are fenced on this node; messages wait at the broker")
+	s.logger.Warn().Msg("MQTT subscription suspended: " + why + "; messages wait at the broker (clean_session=false sessions only)")
 }
 
 // resume reconnects a suspended subscription; onConnect resubscribes.
@@ -443,14 +445,14 @@ func (s *Subscriber) resume() {
 	token := client.Connect()
 	if !token.WaitTimeout(time.Duration(s.config.ConnectTimeoutSeconds)*time.Second) || token.Error() != nil {
 		s.logger.Error().Err(token.Error()).Msg("MQTT subscription could not reconnect after writes resumed")
-		s.updateStatus(StatusError, "reconnect after ingest fence failed")
+		s.updateStatus(StatusError, "reconnect after writes resumed failed")
 		return
 	}
 	s.logger.Info().Msg("MQTT subscription resumed: writes are accepted again")
 }
 
 // processMessage decodes and writes an MQTT message to the ArrowBuffer
-func (s *Subscriber) processMessage(topic string, payload []byte, database string) error {
+func (s *Subscriber) processMessage(ctx context.Context, topic string, payload []byte, database string) error {
 	// Try to decode as MessagePack first (check magic bytes)
 	if len(payload) > 0 {
 		records, err := s.decodePayload(topic, payload)
@@ -458,8 +460,14 @@ func (s *Subscriber) processMessage(topic string, payload []byte, database strin
 			return fmt.Errorf("failed to decode payload: %w", err)
 		}
 
-		// Write to ArrowBuffer
-		if err := s.arrowBuffer.Write(s.ctx, database, records); err != nil {
+		// Write to ArrowBuffer, the payload's size reserved against the WAL
+		// volume's free space (#676).
+		writeCtx, release, err := s.arrowBuffer.AdmitRequest(ctx, int64(len(payload)))
+		if err != nil {
+			return fmt.Errorf("failed to write to buffer: %w", err)
+		}
+		defer release()
+		if err := s.arrowBuffer.Write(writeCtx, database, records); err != nil {
 			return fmt.Errorf("failed to write to buffer: %w", err)
 		}
 	}

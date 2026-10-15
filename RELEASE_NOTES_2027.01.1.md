@@ -1202,10 +1202,77 @@ succeeded on a new file). `arc_wal_failed_writes_total` now counts entries
 that could not be written; a write failure that a retry recovers is no longer
 counted there.
 
-Rejecting writes when the WAL volume runs low, and starting a node on a full
-volume, follow in a separate change. Ideas from
-[@jallegri](https://github.com/jallegri)'s
-[#1115](https://github.com/Basekick-Labs/arc/pull/1115) shaped both changes.
+Ideas from [@jallegri](https://github.com/jallegri)'s
+[#1115](https://github.com/Basekick-Labs/arc/pull/1115) shaped this change and
+the next one.
+
+### A writer whose WAL volume runs low refuses writes instead of losing them ([#676](https://github.com/Basekick-Labs/arc/issues/676))
+
+With the WAL on, a write was acknowledged before its WAL entry reached the
+disk. On a full volume the entry could not be written: the client had its
+204 and the data was lost if the buffer holding it did not flush. A volume
+that filled completely also kept the node from starting again, since the WAL
+could not write its first file header.
+
+Arc now checks the free space on the WAL volume every second, and also at once
+after a rotation or a failed write. Between checks it counts every byte queued
+for the WAL, so a burst cannot run past the limit. Below
+`wal.disk_min_free_mb` of free space, live writes are refused with
+**503 Service Unavailable**, `Retry-After: 5` and the header
+`X-Arc-Ingest-Refused: wal_disk`. Nothing from a refused request is written,
+so retrying it is safe. Each request reserves its size (its body, decompressed)
+when it is admitted, so a large request, or several at once, is refused before
+it can run the volume past that level. Writes are accepted again once free
+space is back above that level plus two WAL files (`wal.max_size_mb`), and no
+sooner than 5 s after they were first refused.
+
+- Every write path is covered: MessagePack, line protocol, TLE, the LP, TLE,
+  CSV and Parquet imports, continuous queries and MQTT. A scheduled continuous
+  query run is skipped, with a warning at most once a minute and no failed
+  execution recorded, and the next run covers its window; a manual execute
+  answers the same 503. MQTT subscriptions disconnect as soon as writes are
+  refused and reconnect once they have been accepted again, no sooner than 5 s
+  after disconnecting. Subscriptions with
+  `clean_session=false` and QoS 1 or 2 find their messages queued at the
+  broker. Subscriptions with `clean_session=true` lose what is published in
+  the meantime.
+- A request is refused whole or accepted whole: a line protocol write that
+  spans several measurements is never half written.
+- WAL replay, recovery and replication are never refused.
+- `/health` and `/ready` are unaffected.
+
+A 64 MiB reserve file, `.arc-wal-reserve`, is kept in the WAL directory. A
+node that starts with less than 32 MiB free on the WAL volume deletes it
+before anything else writes there, logs an error and starts. The reserve is
+created again once writes are accepted and there is room for it above the
+level at which they resume. With the WAL or `disk_pressure_enabled` turned
+off, a reserve left by an earlier start is removed.
+
+New settings (all `[wal]`, with `ARC_WAL_*` environment variables):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `disk_pressure_enabled` | `true` | Turns the check and the reserve file on or off. |
+| `disk_min_free_mb` | `0` | Free space below which writes are refused. `0` = max(512, 2 × `max_size_mb`). It is capped at a fifth of the volume, with a warning, so a setting too large for a small volume does not refuse every write. |
+| `max_directory_mb` | `0` | Cap on the WAL directory's size (`0` = none). Use it where free space does not show the real limit: a Kubernetes `emptyDir` reports the node's disk, not its `sizeLimit`. A cap below four WAL files (4 × `max_size_mb`) is raised to that at start, with a warning, so the check can always clear. Quarantined `*.failed` files do not count against it. |
+
+The "WAL enabled" startup line logs the effective reserve, the level at which
+writes resume and the cap. The Helm charts take
+`arc.wal.diskPressureEnabled`, `diskMinFreeMB` and `maxDirectoryMB`
+(`writer.wal.*` in arc-enterprise). With `persistence.enabled: false`, the OSS
+chart caps the WAL at 80% of the new `persistence.emptyDirSizeLimitMB`, or at
+1024 MB when no size limit is set.
+
+New metrics: `arc_wal_disk_pressure` (1 while writes are refused),
+`arc_wal_disk_free_bytes`, `arc_wal_disk_pressure_rejections_total` and
+`arc_wal_disk_stat_errors_total`. When the free space cannot be read, the
+check lets writes through and this counter goes up. Refusals are logged once
+per 30 s, not once per request.
+
+**Windows:** a standby writer's store now reads its volume's size and free
+space on Windows too. Its automatic cap (a quarter of the volume) and its
+free-space reserve were not enforced there before (the cap fell back to
+1 GiB); they now are, as on Linux and macOS.
 
 ### Two flushes in one clock tick no longer overwrite each other's file ([#1282](https://github.com/Basekick-Labs/arc/issues/1282))
 

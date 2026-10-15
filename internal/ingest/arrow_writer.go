@@ -991,6 +991,10 @@ type ArrowBuffer struct {
 
 	// ingestGate refuses live writes on a fenced node (#1207).
 	ingestGate atomic.Pointer[func() error]
+	// walDiskGate refuses live writes under WAL volume disk pressure (#676).
+	// A slot of its own: the cluster wiring replaces ingestGate. Nil unless
+	// the WAL is enabled with wal.disk_pressure_enabled.
+	walDiskGate atomic.Pointer[WALDiskGate]
 
 	// OPTIMIZATION: Shard buffers to reduce lock contention
 	// Configurable via ingest.shard_count (default 32)
@@ -2065,7 +2069,7 @@ func (b *ArrowBuffer) rowsToColumnar(measurement string, rows []*models.Record) 
 // Write adds records to the buffer (for MessagePack handler)
 func (b *ArrowBuffer) Write(ctx context.Context, database string, records interface{}) error {
 	// Checked once for the whole batch, so a fence cannot split it.
-	if err := b.checkIngestGate(); err != nil {
+	if err := b.checkIngestGate(ctx); err != nil {
 		return err
 	}
 	// Handle batch of records (from MessagePack decoder)
@@ -2127,7 +2131,7 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 // WriteColumnarDirect writes columnar data directly to the buffer
 // This is the preferred method for Line Protocol which already has columnar data
 func (b *ArrowBuffer) WriteColumnarDirect(ctx context.Context, database, measurement string, columns map[string][]interface{}) error {
-	if err := b.checkIngestGate(); err != nil {
+	if err := b.checkIngestGate(ctx); err != nil {
 		return err
 	}
 	record := &models.ColumnarRecord{
@@ -2141,7 +2145,7 @@ func (b *ArrowBuffer) WriteColumnarDirect(ctx context.Context, database, measure
 // WriteColumnarRecord writes a pre-built ColumnarRecord to the buffer.
 // Preserves TagColumns metadata for Parquet schema (enables auto-dedup in compaction).
 func (b *ArrowBuffer) WriteColumnarRecord(ctx context.Context, database string, record *models.ColumnarRecord) error {
-	if err := b.checkIngestGate(); err != nil {
+	if err := b.checkIngestGate(ctx); err != nil {
 		return err
 	}
 	return b.writeColumnar(ctx, database, record)
@@ -2282,7 +2286,7 @@ func (b *ArrowBuffer) WriteColumnarDirectReplayWithTagColumns(ctx context.Contex
 // bypassing the []interface{} → typed conversion in convertColumnsToTyped.
 // Used by format-specific parsers (e.g., TLE) that know column types at compile time.
 func (b *ArrowBuffer) WriteTypedColumnarDirect(ctx context.Context, database, measurement string, batch *TypedColumnBatch, numRecords int) error {
-	if err := b.checkIngestGate(); err != nil {
+	if err := b.checkIngestGate(ctx); err != nil {
 		return err
 	}
 	return b.writeTypedColumnarInternal(ctx, database, measurement, batch, numRecords, false)
@@ -2697,11 +2701,149 @@ func (b *ArrowBuffer) SetIngestGate(gate func() error) {
 // CheckIngestGate reports whether live writes are refused right now. A handler
 // that writes one request as several buffer calls checks it once first, so a
 // fence already closed refuses the whole request instead of part of it.
-func (b *ArrowBuffer) CheckIngestGate() error { return b.checkIngestGate() }
+//
+// It reserves nothing and does not mark the request admitted for disk
+// pressure: a handler that writes a request uses AdmitRequest instead.
+func (b *ArrowBuffer) CheckIngestGate() error { return b.checkIngestGate(context.Background()) }
 
-func (b *ArrowBuffer) checkIngestGate() error {
+// WALDiskGate is the WAL volume disk pressure gate (#676), wal.DiskMonitor
+// in production.
+type WALDiskGate interface {
+	// Pressure reports whether live writes are refused now.
+	Pressure() bool
+	// Reserve admits a request of about n WAL bytes, charging them against
+	// the free space until Release; false refuses it. Reservations of
+	// concurrent requests see each other.
+	Reserve(n int64) bool
+	// Release returns reserved bytes not (or no longer) needed.
+	Release(n int64)
+}
+
+// PressureFunc adapts a pressure check to a WALDiskGate that reserves
+// nothing: Reserve admits whenever there is no pressure.
+type PressureFunc func() bool
+
+func (f PressureFunc) Pressure() bool     { return f() }
+func (f PressureFunc) Reserve(int64) bool { return !f() }
+func (f PressureFunc) Release(int64)      {}
+
+// SetWALDiskGate installs the WAL volume disk pressure gate (#676). Nil
+// removes it. Like the ingest gate, replay, recovery and replication paths
+// are never gated.
+func (b *ArrowBuffer) SetWALDiskGate(g WALDiskGate) {
+	if g == nil {
+		b.walDiskGate.Store(nil)
+		return
+	}
+	b.walDiskGate.Store(&g)
+}
+
+// walDiskAdmittedKey carries the *walReservation of a request admitted as a
+// whole (AdmitRequest).
+type walDiskAdmittedKey struct{}
+
+// refusalCountedKey marks a context whose refusal is already counted in
+// arc_wal_disk_pressure_rejections_total: a retry of the same write (MQTT)
+// must not count again.
+type refusalCountedKey struct{}
+
+// WithRefusalCounted returns ctx marked so a WAL disk pressure refusal of a
+// write under it is not counted again (#676): a caller retrying one message
+// counts it once.
+func WithRefusalCounted(ctx context.Context) context.Context {
+	return context.WithValue(ctx, refusalCountedKey{}, true)
+}
+
+// walReservation is the part of an admitted request's reserved WAL bytes not
+// yet appended to the WAL. Appends consume it, so a byte is charged once:
+// as a reservation until it is queued, then as queued.
+type walReservation struct {
+	gate WALDiskGate
+	left atomic.Int64
+}
+
+// consume moves n appended bytes out of the reservation.
+func (r *walReservation) consume(n int64) {
+	for {
+		left := r.left.Load()
+		take := min(left, n)
+		if take <= 0 {
+			return
+		}
+		if r.left.CompareAndSwap(left, left-take) {
+			r.gate.Release(take)
+			return
+		}
+	}
+}
+
+// release returns whatever the request did not append. Idempotent.
+func (r *walReservation) release() {
+	if left := r.left.Swap(0); left > 0 {
+		r.gate.Release(left)
+	}
+}
+
+// consumeWALReservation charges n bytes just appended to the WAL to the
+// request's reservation, if the write runs under one.
+func consumeWALReservation(ctx context.Context, n int) {
+	if r, ok := ctx.Value(walDiskAdmittedKey{}).(*walReservation); ok && n > 0 {
+		r.consume(int64(n))
+	}
+}
+
+func noRelease() {}
+
+// AdmitRequest checks every gate once for a request and returns the context
+// to write it under and a release to defer. walBytes is the best estimate of
+// what the request appends to the WAL (its body, decompressed where known):
+// it is reserved against the WAL volume's free space, so a large request, or
+// several at once, cannot run the volume past its reserve, and released as
+// the request's appends reach the WAL queue, or when release runs. Writes
+// under the context skip their own disk pressure check, so pressure that
+// starts part-way cannot leave the request half written; fencing is still
+// checked per call. With no disk gate ctx is returned unchanged.
+func (b *ArrowBuffer) AdmitRequest(ctx context.Context, walBytes int64) (context.Context, func(), error) {
 	if g := b.ingestGate.Load(); g != nil && *g != nil {
-		return (*g)()
+		if err := (*g)(); err != nil {
+			return ctx, noRelease, err
+		}
+	}
+	gp := b.walDiskGate.Load()
+	if gp == nil {
+		return ctx, noRelease, nil
+	}
+	g := *gp
+	walBytes = max(walBytes, 0)
+	if !g.Reserve(walBytes) {
+		countWALDiskRefusal(ctx)
+		return ctx, noRelease, ErrWALDiskPressure
+	}
+	r := &walReservation{gate: g}
+	r.left.Store(walBytes)
+	return context.WithValue(ctx, walDiskAdmittedKey{}, r), r.release, nil
+}
+
+func countWALDiskRefusal(ctx context.Context) {
+	if counted, _ := ctx.Value(refusalCountedKey{}).(bool); !counted {
+		metrics.Get().IncWALDiskPressureRejections()
+	}
+}
+
+func (b *ArrowBuffer) checkIngestGate(ctx context.Context) error {
+	if g := b.ingestGate.Load(); g != nil && *g != nil {
+		if err := (*g)(); err != nil {
+			return err
+		}
+	}
+	// Order matters for the common path: no gate, then no pressure, and only
+	// under pressure the context lookup.
+	if g := b.walDiskGate.Load(); g != nil && (*g).Pressure() {
+		if _, admitted := ctx.Value(walDiskAdmittedKey{}).(*walReservation); admitted {
+			return nil
+		}
+		countWALDiskRefusal(ctx)
+		return ErrWALDiskPressure
 	}
 	return nil
 }
@@ -2830,6 +2972,7 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALHashes(ctx context.Context, da
 		}
 		if err == nil && len(payload) > 0 {
 			prep, err = cs.wal.PrepareCovered(database, bufferKey, payload)
+			consumeWALReservation(ctx, len(payload))
 		}
 		if err != nil {
 			b.recordWALError(err, func(ev *zerolog.Event) {
@@ -2849,6 +2992,7 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALHashes(ctx context.Context, da
 			} else {
 				err = b.wal.AppendRawWithMeta(database, record.RawPayload)
 			}
+			consumeWALReservation(ctx, len(record.RawPayload))
 			if err != nil {
 				// Don't fail the write — WAL is for durability, not
 				// correctness. recordWALError differentiates backpressure
@@ -2877,6 +3021,7 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALHashes(ctx context.Context, da
 				} else {
 					err = b.wal.AppendRawWithMeta(database, rowPayload)
 				}
+				consumeWALReservation(ctx, len(rowPayload))
 				if err != nil {
 					b.recordWALError(err, func(ev *zerolog.Event) {
 						ev.Str("database", database).
@@ -3104,6 +3249,7 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 		}
 		if err == nil && len(payload) > 0 {
 			prep, err = cs.wal.PrepareCovered(database, bufferKey, payload)
+			consumeWALReservation(ctx, len(payload))
 		}
 		if err != nil {
 			b.recordWALError(err, func(ev *zerolog.Event) {
@@ -3122,6 +3268,7 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 			} else {
 				err = b.wal.AppendRawWithMeta(database, rawPayload)
 			}
+			consumeWALReservation(ctx, len(rawPayload))
 			if err != nil {
 				b.recordWALError(err, func(ev *zerolog.Event) {
 					ev.Str("database", database).
@@ -3138,6 +3285,8 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 				} else {
 					err = b.wal.Append(walRecords)
 				}
+				// The marshalled size is not known here; the records are
+				// charged at their reservation, released when the request ends.
 				if err != nil {
 					b.recordWALError(err, func(ev *zerolog.Event) {
 						ev.Str("database", database).

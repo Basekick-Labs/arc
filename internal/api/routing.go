@@ -212,6 +212,12 @@ func CopyResponse(c *fiber.Ctx, resp *http.Response) error {
 	if resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get(IngestFencedHeader) != "" {
 		c.Locals(ingestFencedLocal, true)
 		ingest.LogRefusal("forwarded "+c.Path(), &ingest.RefusalError{Reason: "forwarded", Text: "the node this write was forwarded to refused it (503)"})
+	} else if resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get(IngestRefusedHeader) != "" {
+		// Likewise a node-local refusal there, such as WAL disk pressure
+		// (#676), logged by the reason it sent.
+		c.Locals(ingestRefusedLocal, true)
+		reason := forwardedRefusalReason(resp.Header.Get(IngestRefusedHeader))
+		ingest.LogRefusal("forwarded "+c.Path(), &ingest.WriteRefusal{Reason: reason, Text: "the node this write was forwarded to refused it (503, " + reason + ")"})
 	}
 
 	return c.Send(body)
@@ -314,6 +320,32 @@ func RespondAlreadyForwarded(c *fiber.Ctx) error {
 // expected refusal in the copied response and does not log it per request.
 const IngestFencedHeader = "X-Arc-Ingest-Fenced"
 
+// IngestRefusedHeader marks a 503 that refused a write for a node-local,
+// transient condition (ingest.WriteRefusal, #676); its value is the reason,
+// e.g. "wal_disk". Nothing was written and a retry, to this node too, is
+// safe. A forwarding node and the request logger recognise it like
+// IngestFencedHeader.
+const IngestRefusedHeader = "X-Arc-Ingest-Refused"
+
+// ingestRefusedLocal is the request flag the request logger reads to skip its
+// per-request line for a WriteRefusal (#676).
+const ingestRefusedLocal = "arc.ingest_refused"
+
+// forwardedRefusalReason is the log reason for a refusal a peer sent in
+// IngestRefusedHeader: the header comes from another node, so only a short
+// lower-case token is taken as a reason key.
+func forwardedRefusalReason(v string) string {
+	if v == "" || len(v) > 32 {
+		return "forwarded"
+	}
+	for _, r := range v {
+		if (r < 'a' || r > 'z') && r != '_' {
+			return "forwarded"
+		}
+	}
+	return "forwarded_" + v
+}
+
 // ingestFencedLocal is the request flag the request logger reads to skip its
 // per-request line for an expected fence refusal (#1268).
 const ingestFencedLocal = "arc.ingest_fenced"
@@ -381,6 +413,30 @@ func respondIngestFenced(c *fiber.Ctx, err error) error {
 	return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 		"error": "Write rejected (not the available primary writer, retry): " + err.Error(),
 	})
+}
+
+// respondIngestRefused answers a write refused for a node-local, transient
+// condition (ingest.WriteRefusal), such as WAL volume disk pressure (#676):
+// 503, Retry-After, and the reason in IngestRefusedHeader. Logged per reason
+// at most every ingest.RefusalLogEvery, not per request.
+func respondIngestRefused(c *fiber.Ctx, err error) error {
+	reason := ingest.RefusalReason(err)
+	ingest.LogRefusal(c.Path(), err)
+	c.Locals(ingestRefusedLocal, true)
+	c.Set(IngestRefusedHeader, reason)
+	c.Set(fiber.HeaderRetryAfter, "5")
+	return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+		"error": "Write rejected (retry): " + err.Error(),
+	})
+}
+
+// respondWriteRefused answers any refused live write (ingest.IsWriteRefusal):
+// a fence with respondIngestFenced, anything else with respondIngestRefused.
+func respondWriteRefused(c *fiber.Ctx, err error) error {
+	if errors.Is(err, ingest.ErrIngestFenced) {
+		return respondIngestFenced(c, err)
+	}
+	return respondIngestRefused(c, err)
 }
 
 // HandleRoutingError returns an appropriate error response for routing failures.

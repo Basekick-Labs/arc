@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -44,18 +45,148 @@ type SubscriptionManager struct {
 	// Running subscribers
 	mu          sync.RWMutex
 	subscribers map[string]*Subscriber
-	// fenced: this node refuses writes (#1207); subscribers stay disconnected
-	// so messages wait at the broker instead of being acknowledged and lost.
-	fenced bool
+	// suspended holds the reasons this node refuses writes (suspendFenced,
+	// suspendWALDisk); while any is set, subscribers stay disconnected so
+	// messages wait at the broker instead of being acknowledged and lost. A
+	// set, not a bool: a cluster unfence must not resume subscriptions while
+	// the WAL volume is still under disk pressure (#676). Guarded by mu.
+	suspended suspendReasons
+	// applyMu orders suspend/resume calls, so two reasons changing at once
+	// cannot apply their results out of order.
+	applyMu sync.Mutex
+
+	// WAL disk pressure, with a minimum time in each state (#676): a gate
+	// that flaps would otherwise disconnect and reconnect every subscription
+	// with it. Guarded by diskMu.
+	diskMu       sync.Mutex
+	diskOn       bool        // the state applied to suspended
+	diskWant     bool        // the latest state reported
+	diskChanged  time.Time   // when diskOn last changed
+	diskTimer    *time.Timer // a pending apply; nil when none
+	diskMinState time.Duration
+}
+
+// registerStarted publishes a started subscriber and suspends it if any
+// reason holds. Under applyMu: a suspend or resume running at the same time
+// either already sees it in the map or has finished before it reads the
+// reasons, so it never ends in the wrong state (#676).
+func (m *SubscriptionManager) registerStarted(id string, subscriber *Subscriber) error {
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
+	m.mu.Lock()
+	cur, reserved := m.subscribers[id]
+	if !reserved || cur != nil {
+		m.mu.Unlock()
+		return ErrSubscriptionNotRunning
+	}
+	m.subscribers[id] = subscriber
+	reasons := m.suspended
+	m.mu.Unlock()
+	if reasons != 0 {
+		subscriber.suspend(reasons.describe())
+	}
+	return nil
+}
+
+// suspendReasons is a set of reasons subscriptions are suspended.
+type suspendReasons uint8
+
+const (
+	suspendFenced  suspendReasons = 1 << iota // writes fenced (#1207)
+	suspendWALDisk                            // WAL volume disk pressure (#676)
+)
+
+// mqttDiskMinState is the least time subscriptions stay suspended for WAL disk
+// pressure before they resume (#676). Suspending is never delayed: every
+// message accepted while writes are refused would be lost.
+const mqttDiskMinState = 5 * time.Second
+
+func (r suspendReasons) describe() string {
+	switch {
+	case r&suspendFenced != 0 && r&suspendWALDisk != 0:
+		return "writes are fenced on this node and its WAL volume is under disk pressure"
+	case r&suspendWALDisk != 0:
+		return "the WAL volume is under disk pressure"
+	default:
+		return "writes are fenced on this node"
+	}
 }
 
 // SetIngestFenced suspends every subscription while this node's writes are
-// fenced and resumes them when writes are accepted again (#1207). Suspending
-// disconnects without unsubscribing, so with clean_session=false the broker
-// queues QoS 1 and 2 messages until the subscription resumes.
+// fenced and resumes them when writes are accepted again (#1207), unless
+// another reason still holds them (#676). Suspending disconnects without
+// unsubscribing, so with clean_session=false the broker queues QoS 1 and 2
+// messages until the subscription resumes.
 func (m *SubscriptionManager) SetIngestFenced(fenced bool) {
+	m.setSuspendReason(suspendFenced, fenced)
+}
+
+// SetWALDiskPressure suspends every subscription while the WAL volume is
+// under disk pressure and resumes them once it clears and no other reason
+// holds them (#676). Suspension is applied at once; resuming waits until the
+// subscriptions have been suspended for mqttDiskMinState, and happens then
+// only if the pressure is still clear.
+//
+// A subscription with clean_session=true still loses the messages published
+// while it is suspended: the broker keeps no session for it. Only
+// clean_session=false (with QoS 1 or 2) queues them at the broker.
+func (m *SubscriptionManager) SetWALDiskPressure(on bool) {
+	m.diskMu.Lock()
+	defer m.diskMu.Unlock()
+	m.diskWant = on
+	if on == m.diskOn || m.diskTimer != nil {
+		// Nothing to change, or a pending apply reads diskWant when it runs.
+		return
+	}
+	var wait time.Duration
+	if !on {
+		minState := m.diskMinState
+		if minState == 0 {
+			minState = mqttDiskMinState
+		}
+		wait = max(0, minState-time.Since(m.diskChanged))
+	}
+	// Applied off the caller's goroutine: the caller is the WAL disk monitor,
+	// and suspending disconnects every subscription in turn.
+	m.diskTimer = time.AfterFunc(wait, m.applyPendingDisk)
+}
+
+// applyPendingDisk applies the latest reported disk pressure state, unless it
+// was undone before the minimum time ran out.
+func (m *SubscriptionManager) applyPendingDisk() {
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
+	m.diskMu.Lock()
+	m.diskTimer = nil
+	if m.diskWant == m.diskOn {
+		m.diskMu.Unlock()
+		return
+	}
+	on := m.diskWant
+	m.diskOn = on
+	m.diskChanged = time.Now()
+	m.diskMu.Unlock()
+	m.setSuspendReasonLocked(suspendWALDisk, on)
+}
+
+// setSuspendReason sets or clears one reason and suspends or resumes every
+// subscription by whether any reason is left.
+func (m *SubscriptionManager) setSuspendReason(reason suspendReasons, set bool) {
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
+	m.setSuspendReasonLocked(reason, set)
+}
+
+// setSuspendReasonLocked is setSuspendReason with applyMu held. Lock order:
+// applyMu, then diskMu or mu.
+func (m *SubscriptionManager) setSuspendReasonLocked(reason suspendReasons, set bool) {
 	m.mu.Lock()
-	m.fenced = fenced
+	if set {
+		m.suspended |= reason
+	} else {
+		m.suspended &^= reason
+	}
+	reasons := m.suspended
 	subs := make([]*Subscriber, 0, len(m.subscribers))
 	for _, s := range m.subscribers {
 		if s != nil {
@@ -64,8 +195,8 @@ func (m *SubscriptionManager) SetIngestFenced(fenced bool) {
 	}
 	m.mu.Unlock()
 	for _, s := range subs {
-		if fenced {
-			s.suspend()
+		if reasons != 0 {
+			s.suspend(reasons.describe())
 		} else {
 			s.resume()
 		}
@@ -556,18 +687,9 @@ func (m *SubscriptionManager) startSubscriber(sub *Subscription) error {
 		return err
 	}
 
-	m.mu.Lock()
-	cur, reserved := m.subscribers[sub.ID]
-	if !reserved || cur != nil {
-		m.mu.Unlock()
+	if err := m.registerStarted(sub.ID, subscriber); err != nil {
 		_ = subscriber.Stop()
-		return ErrSubscriptionNotRunning
-	}
-	m.subscribers[sub.ID] = subscriber
-	fenced := m.fenced
-	m.mu.Unlock()
-	if fenced {
-		subscriber.suspend()
+		return err
 	}
 
 	m.logger.Info().

@@ -13,6 +13,7 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster/protocol"
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/cluster/security"
+	"github.com/basekick-labs/arc/internal/diskspace"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/wal"
 )
@@ -487,12 +488,15 @@ const (
 	standbyStoreReserveResume = uint64(1) << 30
 )
 
-// diskSpace is originstream.DiskSpace; a var for tests.
-var diskSpace = originstream.DiskSpace
+// diskSpace is diskspace.Space; a var for tests.
+var diskSpace = diskspace.Space
 
 // lowSpaceNext is the reserve's state after a reading, with hysteresis.
 func lowSpaceNext(low bool, total, avail uint64) bool {
-	reserve := standbyStoreReserve(total)
+	return lowSpaceNextAt(low, avail, standbyStoreReserve(total))
+}
+
+func lowSpaceNextAt(low bool, avail, reserve uint64) bool {
 	switch {
 	case !low && avail < reserve:
 		return true
@@ -506,6 +510,36 @@ func standbyStoreReserve(total uint64) uint64 {
 	return max(total/100*standbyStoreReserveShare, standbyStoreReserveMin)
 }
 
+// standbyStoreWALMargin is how far the store's reserve stays above the WAL
+// disk gate's off-point when that is set large (#676).
+const standbyStoreWALMargin = uint64(512) << 20
+
+// SetWALDiskOffPoint gives the standby store the WAL disk gate's off-point on
+// a volume of total bytes (wal.DiskPressureLevels, #676), so the store's
+// reserve stays above it whatever wal.disk_min_free_mb is: the store gives way
+// before the WAL gate turns on. At the WAL defaults (an off-point near 712
+// MiB) the 2 GiB floor already is, so nothing changes. Set before the origin
+// stream starts.
+func (c *Coordinator) SetWALDiskOffPoint(offPoint func(total uint64) uint64) {
+	c.walDiskOffPoint.Store(&offPoint)
+}
+
+// standbyLowSpaceNext is the store's low-space state after a reading, and the
+// reserve it was judged against.
+func (c *Coordinator) standbyLowSpaceNext(low bool, total, avail uint64) (bool, uint64) {
+	reserve := c.standbyReserve(total)
+	return lowSpaceNextAt(low, avail, reserve), reserve
+}
+
+// standbyReserve is the store's free-space reserve on a volume of total bytes.
+func (c *Coordinator) standbyReserve(total uint64) uint64 {
+	r := standbyStoreReserve(total)
+	if f := c.walDiskOffPoint.Load(); f != nil && *f != nil {
+		r = max(r, (*f)(total)+standbyStoreWALMargin)
+	}
+	return r
+}
+
 // watchStandbyStoreSpace checks the store's volume on its own tick.
 func (c *Coordinator) watchStandbyStoreSpace(ctx context.Context, store *originstream.Store, root string) {
 	t := time.NewTicker(standbyStoreSpaceEvery)
@@ -515,8 +549,9 @@ func (c *Coordinator) watchStandbyStoreSpace(ctx context.Context, store *origins
 		total, avail, err := diskSpace(root)
 		switch {
 		case err == nil && total > 0:
-			low = lowSpaceNext(low, total, avail)
-			store.SetLowSpace(low, avail, standbyStoreReserve(total))
+			var reserve uint64
+			low, reserve = c.standbyLowSpaceNext(low, total, avail)
+			store.SetLowSpace(low, avail, reserve)
 		case !warned:
 			warned = true
 			c.logger.Warn().Err(err).Msg("Cannot read the standby store volume's free space; its free-space reserve is not enforced")

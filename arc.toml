@@ -635,3 +635,13 @@ enabled = false
 #                           # Syncs run beside the WAL writer, so this bounds how much written data a
 #                           # sync can leave behind, not ingest throughput. A sync also runs every 100 ms
 #                           # while bytes are unsynced.
+# WAL volume disk pressure (#676): while the WAL volume's free space is below
+# disk_min_free_mb, live writes are refused with 503 + Retry-After (nothing is
+# written; clients retry) instead of being accepted and then lost to a full disk.
+# Writes resume once free space is back above the reserve plus two WAL files.
+# A 64 MiB reserve file (.arc-wal-reserve) is kept in the WAL directory and is
+# released at start when the volume is full, so Arc can still boot.
+# disk_pressure_enabled = true
+# disk_min_free_mb = 0      # 0 = max(512, 2 x max_size_mb); clamped to a fifth of the volume
+# max_directory_mb = 0      # Cap on the WAL directory's bytes (0 = none), for volumes whose free
+#                           # space does not show their limit, e.g. a Kubernetes emptyDir with a sizeLimit

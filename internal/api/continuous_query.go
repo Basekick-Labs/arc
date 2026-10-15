@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -47,9 +48,11 @@ type ContinuousQueryHandler struct {
 	db          *database.DuckDB
 	storage     storage.Backend
 	arrowBuffer *ingest.ArrowBuffer
-	fieldSchema *fieldschema.Registry // optional, #914
-	config      *config.ContinuousQueryConfig
-	sqliteDB    *sql.DB
+	// lastSkipLogNano samples logSkippedRun (#676).
+	lastSkipLogNano atomic.Int64
+	fieldSchema     *fieldschema.Registry // optional, #914
+	config          *config.ContinuousQueryConfig
+	sqliteDB        *sql.DB
 	// ownsDB records whether this handler opened sqliteDB itself. When CQ
 	// shares the auth database (the default), the handle is borrowed and Close
 	// must leave it to its owner.
@@ -704,6 +707,14 @@ func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (
 
 	// Execute the aggregation query using DuckDB
 	recordsWritten, err := h.executeAggregation(ctx, cq, executedQuery, startTime, endTime)
+	if err != nil && ingest.IsWriteRefusal(err) {
+		// Writes are refused (fenced, or WAL volume disk pressure, #676): the
+		// run is skipped, not failed. No execution row, which would be one
+		// more write to the volume under pressure; last_processed_time stays,
+		// so the next run covers this window. Logged at most once a minute.
+		h.logSkippedRun(cq.Name, err)
+		return nil, fmt.Errorf("execution skipped: %w", err)
+	}
 	if err != nil {
 		executionDuration := time.Since(start).Seconds()
 
@@ -864,6 +875,10 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 		// Record failed execution
 		h.recordExecution(int64(queryID), executionID, "failed", startTime, endTime, nil, 0, executionDuration, err.Error())
 
+		if ingest.IsWriteRefusal(err) {
+			// Refused, not failed: 503 and retryable, logged by reason (#676).
+			return respondWriteRefused(c, err)
+		}
 		h.logger.Error().Err(err).Str("query_name", cq.Name).Msg("Continuous query execution failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Execution failed: " + err.Error(),
@@ -958,6 +973,16 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	// GET /api/v1/continuous_queries/:id/executions.
 	if err := ValidateSQLRequest(query); err != nil {
 		return 0, fmt.Errorf("stored continuous-query definition %q is not valid SQL to execute: %w", cq.Name, err)
+	}
+
+	// A run whose output would be refused (fenced, or WAL volume disk
+	// pressure, #676) fails before it queries: the aggregation can spill to
+	// the same volume. Both callers record a failed execution and leave
+	// last_processed_time alone, so the next scheduled run covers the window.
+	if h.arrowBuffer != nil {
+		if err := h.arrowBuffer.CheckIngestGate(); err != nil {
+			return 0, fmt.Errorf("failed to write records: %w", err)
+		}
 	}
 
 	// SECURITY: the stored database name is re-checked for the same reason the
@@ -1214,6 +1239,21 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	}
 
 	return int64(len(records)), nil
+}
+
+// cqSkipLogEvery samples the log of runs skipped because writes are refused.
+const cqSkipLogEvery = time.Minute
+
+// logSkippedRun logs a run skipped because writes are refused, at most once
+// every cqSkipLogEvery across all continuous queries.
+func (h *ContinuousQueryHandler) logSkippedRun(name string, err error) {
+	now := time.Now().UnixNano()
+	last := h.lastSkipLogNano.Load()
+	if now-last < int64(cqSkipLogEvery) || !h.lastSkipLogNano.CompareAndSwap(last, now) {
+		return
+	}
+	h.logger.Warn().Err(err).Str("query_name", name).
+		Msg("Continuous query runs skipped: writes are refused on this node (retryable); the next run covers the window (sampled: at most one line a minute)")
 }
 
 // handleGetExecutions returns execution history for a query

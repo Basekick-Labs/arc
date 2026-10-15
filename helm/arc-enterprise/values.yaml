@@ -208,6 +208,12 @@ writer:
   wal:
     enabled: true                  # durable ingest — strongly recommended for Enterprise
     syncMode: fdatasync            # fdatasync | fsync | async
+    # WAL volume disk pressure (#676): below diskMinFreeMB of free space on the
+    # writer's data volume, live writes get 503 + Retry-After (nothing written)
+    # instead of being accepted and lost to a full disk.
+    diskPressureEnabled: true
+    diskMinFreeMB: 0               # 0 = max(512, 2 x wal.max_size_mb), at most a fifth of the volume
+    maxDirectoryMB: 0              # cap on the WAL directory's bytes; 0 = none (the PVC's free space is the signal)
   nodeSelector: {}
   tolerations: []
   affinity: {}

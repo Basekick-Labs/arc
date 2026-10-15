@@ -197,6 +197,11 @@ type Metrics struct {
 	walFailedSyncs       atomic.Int64 // WAL fsync/fdatasync failures
 	walOversizedPayloads atomic.Int64 // Payloads rejected for exceeding the single-entry cap even after chunking (#677)
 	walDirectoryBytes    atomic.Int64 // Current bytes occupied by every file in the WAL directory
+	// WAL volume disk pressure (#676)
+	walDiskPressure           atomic.Int64 // 1 while live writes are refused for the WAL volume's free space
+	walDiskFreeBytes          atomic.Int64 // Free bytes on the WAL volume at the last sample
+	walDiskPressureRejections atomic.Int64 // Live writes refused for WAL volume disk pressure
+	walDiskStatErrors         atomic.Int64 // Failed reads of the WAL volume's free space (the gate fails open)
 
 	// Cluster file registration outbox (#1209)
 	fileRegistrationsPending      atomic.Int64 // files flushed and not yet confirmed in the cluster manifest
@@ -722,6 +727,19 @@ func (m *Metrics) IncWALFailedSyncs()                { m.walFailedSyncs.Add(1) }
 func (m *Metrics) IncWALOversizedPayloads()          { m.walOversizedPayloads.Add(1) }
 func (m *Metrics) SetWALDirectoryBytes(bytes int64)  { m.walDirectoryBytes.Store(bytes) }
 
+// SetWALDiskPressure records whether live writes are refused because the WAL
+// volume is low on free space (#676).
+func (m *Metrics) SetWALDiskPressure(on bool) {
+	if on {
+		m.walDiskPressure.Store(1)
+	} else {
+		m.walDiskPressure.Store(0)
+	}
+}
+func (m *Metrics) SetWALDiskFreeBytes(bytes int64) { m.walDiskFreeBytes.Store(bytes) }
+func (m *Metrics) IncWALDiskPressureRejections()   { m.walDiskPressureRejections.Add(1) }
+func (m *Metrics) IncWALDiskStatErrors()           { m.walDiskStatErrors.Add(1) }
+
 // SetReconciliationStorageSweepHeld records whether the last reconciliation
 // run held its orphan-storage sweep (#1214).
 func (m *Metrics) SetReconciliationStorageSweepHeld(held bool) {
@@ -1140,6 +1158,10 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"wal_failed_syncs":                  m.walFailedSyncs.Load(),
 		"wal_oversized_payloads":            m.walOversizedPayloads.Load(),
 		"wal_directory_bytes":               m.walDirectoryBytes.Load(),
+		"wal_disk_pressure":                 m.walDiskPressure.Load(),
+		"wal_disk_free_bytes":               m.walDiskFreeBytes.Load(),
+		"wal_disk_pressure_rejections":      m.walDiskPressureRejections.Load(),
+		"wal_disk_stat_errors":              m.walDiskStatErrors.Load(),
 		"file_registrations_pending":        m.fileRegistrationsPending.Load(),
 		"reconciliation_storage_sweep_held": m.reconciliationStorageSweepHeld.Load(),
 		"file_registrations_confirmed":      m.fileRegistrationsConfirmed.Load(),
@@ -1680,6 +1702,19 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_dir_bytes Current bytes occupied by every file in the WAL directory\n"...)
 	b = append(b, "# TYPE arc_wal_dir_bytes gauge\n"...)
 	b = appendMetric(b, "arc_wal_dir_bytes", float64(m.walDirectoryBytes.Load()))
+
+	b = append(b, "# HELP arc_wal_disk_pressure 1 while live writes are refused (503) because the WAL volume is low on free space or the WAL directory is at wal.max_directory_mb\n"...)
+	b = append(b, "# TYPE arc_wal_disk_pressure gauge\n"...)
+	b = appendMetric(b, "arc_wal_disk_pressure", float64(m.walDiskPressure.Load()))
+	b = append(b, "# HELP arc_wal_disk_free_bytes Bytes available on the WAL volume at the last sample\n"...)
+	b = append(b, "# TYPE arc_wal_disk_free_bytes gauge\n"...)
+	b = appendMetric(b, "arc_wal_disk_free_bytes", float64(m.walDiskFreeBytes.Load()))
+	b = append(b, "# HELP arc_wal_disk_pressure_rejections_total Live writes refused for WAL volume disk pressure; nothing was written, clients retry\n"...)
+	b = append(b, "# TYPE arc_wal_disk_pressure_rejections_total counter\n"...)
+	b = appendMetric(b, "arc_wal_disk_pressure_rejections_total", float64(m.walDiskPressureRejections.Load()))
+	b = append(b, "# HELP arc_wal_disk_stat_errors_total Failed reads of the WAL volume's free space; the disk pressure gate fails open while they fail\n"...)
+	b = append(b, "# TYPE arc_wal_disk_stat_errors_total counter\n"...)
+	b = appendMetric(b, "arc_wal_disk_stat_errors_total", float64(m.walDiskStatErrors.Load()))
 
 	b = append(b, "# HELP arc_reconciliation_storage_sweep_held 1 while the last reconciliation run held its orphan-storage sweep because a node that can ingest did not answer, or a published pending-registration list could not be read; a node that stays down holds it until it returns or is removed from the cluster\n"...)
 	b = append(b, "# TYPE arc_reconciliation_storage_sweep_held gauge\n"...)

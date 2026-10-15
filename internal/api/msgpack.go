@@ -374,11 +374,18 @@ localProcessing:
 		}
 	}
 
-	if err := h.arrowBuffer.Write(ctx, database, records); err != nil {
+	// Admit the whole request, its size reserved against the WAL volume's
+	// free space (#676); a fence or disk pressure refuses it here.
+	writeCtx, release, aerr := h.arrowBuffer.AdmitRequest(ctx, int64(len(payload)))
+	if aerr != nil {
+		return respondWriteRefused(c, aerr)
+	}
+	defer release()
+	if err := h.arrowBuffer.Write(writeCtx, database, records); err != nil {
 		// A fence refusal is expected during a failover: logged by reason,
 		// not counted as an ingest error (#1268).
-		if errors.Is(err, ingest.ErrIngestFenced) {
-			return respondIngestFenced(c, err)
+		if ingest.IsWriteRefusal(err) {
+			return respondWriteRefused(c, err)
 		}
 		h.logger.Error().Err(err).Msg("Failed to write to Arrow buffer")
 		metrics.Get().IncIngestErrors()

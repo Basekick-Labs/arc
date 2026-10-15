@@ -95,6 +95,10 @@ type Coordinator struct {
 	localNode     *Node
 	healthChecker *HealthChecker
 
+	// walDiskOffPoint is the WAL disk gate's off-point by volume size, for
+	// the standby store's reserve (#676); nil when the gate is off.
+	walDiskOffPoint atomic.Pointer[func(total uint64) uint64]
+
 	// Raft consensus (Phase 3)
 	raftNode *raft.Node
 	raftFSM  *raft.ClusterFSM

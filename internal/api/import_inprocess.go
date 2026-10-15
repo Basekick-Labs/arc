@@ -85,10 +85,19 @@ func (h *ImportHandler) handleCSVImport(c *fiber.Ctx) error {
 	// end-of-file and silently import a truncated file with a 200 response).
 	// Pass the upload size so importCSV can pre-size per-column buffers once it
 	// knows the column count (a size-only estimate over-allocates for wide files).
-	result, ierr := h.importCSV(c.Context(), database, measurement, &limitedReader{r: f, limit: maxImportSize}, opts, fileHeader.Size)
+	// Admit before parsing the file: refused when fenced (#1207), or when
+	// its size does not fit the WAL volume's free space (#676), which stays
+	// reserved for it until the import ends.
+	writeCtx, release, aerr := h.arrowBuffer.AdmitRequest(c.Context(), fileHeader.Size)
+	if aerr != nil {
+		h.totalErrors.Add(1)
+		return respondWriteRefused(c, aerr)
+	}
+	defer release()
+	result, ierr := h.importCSV(writeCtx, database, measurement, &limitedReader{r: f, limit: maxImportSize}, opts, fileHeader.Size)
 	if ierr != nil {
 		h.totalErrors.Add(1)
-		if !errors.Is(ierr, ingest.ErrIngestFenced) { // a fence refusal is logged by reason (#1268)
+		if !ingest.IsWriteRefusal(ierr) { // a refused write is logged by reason (#1268)
 			h.logger.Error().Err(ierr).Str("database", database).Str("measurement", measurement).Msg("CSV import failed")
 		}
 		return h.importErrorResponse(c, ierr)
@@ -302,10 +311,19 @@ func (h *ImportHandler) handleParquetImport(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "file is empty"})
 	}
 
-	result, ierr := h.importParquet(c.Context(), database, measurement, data, opts)
+	// Admit before parsing the file: refused when fenced (#1207), or when
+	// its size does not fit the WAL volume's free space (#676), which stays
+	// reserved for it until the import ends.
+	writeCtx, release, aerr := h.arrowBuffer.AdmitRequest(c.Context(), int64(len(data)))
+	if aerr != nil {
+		h.totalErrors.Add(1)
+		return respondWriteRefused(c, aerr)
+	}
+	defer release()
+	result, ierr := h.importParquet(writeCtx, database, measurement, data, opts)
 	if ierr != nil {
 		h.totalErrors.Add(1)
-		if !errors.Is(ierr, ingest.ErrIngestFenced) { // a fence refusal is logged by reason (#1268)
+		if !ingest.IsWriteRefusal(ierr) { // a refused write is logged by reason (#1268)
 			h.logger.Error().Err(ierr).Str("database", database).Str("measurement", measurement).Msg("Parquet import failed")
 		}
 		return h.importErrorResponse(c, ierr)
@@ -1209,7 +1227,7 @@ func (lr *limitedReader) Read(p []byte) (int, error) {
 // import that raced a shutdown, or hit sustained schema churn, is not reported
 // as a permanent server error.
 func importBufferStatus(err error) int {
-	if errors.Is(err, ingest.ErrBufferClosing) || errors.Is(err, ingest.ErrSchemaChurnExceeded) || errors.Is(err, ingest.ErrIngestFenced) {
+	if errors.Is(err, ingest.ErrBufferClosing) || errors.Is(err, ingest.ErrSchemaChurnExceeded) || ingest.IsWriteRefusal(err) {
 		return fiber.StatusServiceUnavailable
 	}
 	return fiber.StatusInternalServerError
