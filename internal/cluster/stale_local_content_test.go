@@ -360,17 +360,20 @@ func TestStaleLocalVerdictGuards(t *testing.T) {
 	key := staleHour + "a.parquet"
 	r.register(key, "rows a")
 	e, _ := r.c.raftNode.FSM().GetFile(key)
-	empty := *e
-	empty.SHA256 = ""
-	if v := r.c.observeListed(&empty); v != filereplication.ListedTrusted {
-		t.Fatalf("no listed checksum: %v, want trusted", v)
-	}
+	r.walk()
 	stamp, _ := r.c.localStampFor(key)
 	wrong := *e
 	wrong.SizeBytes++
 	r.c.recordLocalContent(&wrong, stamp, e.SHA256)
 	if rec, _ := r.c.stale.seen.Load().get(key); rec.sha != 0 {
 		t.Fatal("a checksum recorded for a file of another size")
+	}
+	// A listing with no checksum is never suspect, whatever the copy holds.
+	r.c.recordLocalContent(e, stamp, e.SHA256)
+	empty := *e
+	empty.SHA256 = ""
+	if v := r.c.observeListed(&empty); v != filereplication.ListedTrusted {
+		t.Fatalf("no listed checksum: %v, want trusted", v)
 	}
 	// An identical update writes no journal line.
 	before := r.c.stale.seen.Load().records
