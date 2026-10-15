@@ -42,7 +42,9 @@ type manifestWalkResult struct {
 // double-pulling) and the workers' backend checks; the one check it makes
 // itself is the disk presence of a self-origin entry when
 // RepullMissingSelfOrigin is on (otherwise such entries are skipped outright,
-// as enqueue does for the reactive path). All actual fetch work flows through
+// as enqueue does for the reactive path), and ObserveListed's verdict on the
+// local copy (#1182): a copy this node cannot vouch for is enqueued as a
+// forced refresh, hashed first when its content is unknown. All actual fetch work flows through
 // the same code path that Phase 2 reactive pulls use, which means the same
 // retry, backoff, checksum, and metrics behavior applies automatically.
 //
@@ -276,7 +278,8 @@ func (p *Puller) walkManifest(ctx context.Context, fetch func(cursor string, lim
 			// to be other bytes. Never on a shared backend, where nothing is
 			// pulled over the writer's own object, nor for an entry with no
 			// checksum to compare with.
-			suspect := verdict != ListedTrusted && p.cfg.ForceContentRefresh && entry.SHA256 != ""
+			suspect := verdict != ListedTrusted && p.cfg.ForceContentRefresh && entry.SHA256 != "" &&
+				(entry.OriginNodeID != p.cfg.SelfNodeID || p.cfg.RepullMissingSelfOrigin)
 
 			// Backpressure: if the queue is above the high-water mark, sleep
 			// briefly to let workers drain.

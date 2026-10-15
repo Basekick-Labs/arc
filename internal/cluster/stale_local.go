@@ -344,7 +344,7 @@ func (c *Coordinator) waitStaleLocalOpen(ctx context.Context) {
 // tracking (not running, or failed) the size alone decides, as before.
 func (c *Coordinator) observeListed(e *raft.FileEntry) filereplication.ListedVerdict {
 	seen := c.stale.seen.Load()
-	if seen == nil || seen.err() != nil || !sweepablePath(e.Path) {
+	if seen == nil || seen.err() != nil || !sweepablePath(e.Path) || !journalablePath(e.Path) {
 		return filereplication.ListedTrusted
 	}
 	r, present := c.observeLocal(e)
@@ -383,6 +383,7 @@ func (c *Coordinator) observeLocal(e *raft.FileEntry) (seenRecord, bool) {
 		switch {
 		case had && sameFile(old, cur):
 			r.sha = old.sha
+			r.lsn = max(old.lsn, e.LSN)
 		case wok:
 			r.sha = wsha
 		}
@@ -477,9 +478,12 @@ func (c *Coordinator) recordLocalContent(e *raft.FileEntry, stamp, sha string) {
 	if fsm := c.raftNode.FSM(); fsm == nil || !fsm.HasFile(e.Path) {
 		return
 	}
-	seen.update(e.Path, func(seenRecord, bool) (seenRecord, bool) {
+	seen.update(e.Path, func(old seenRecord, had bool) (seenRecord, bool) {
 		r := cur
 		r.lsn, r.sha = e.LSN, shaPrefix(sha)
+		if had && sameFile(old, cur) {
+			r.lsn = max(old.lsn, e.LSN) // a long hash must not move the index back
+		}
 		return r, true
 	})
 }

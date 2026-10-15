@@ -58,6 +58,9 @@ type CompactionBridge struct {
 	coord bridgeCoordinator
 }
 
+// The coordinator is what the bridge reports outputs to (#1182).
+var _ interface{ NoteLocalWritten(path, sha string) } = (*Coordinator)(nil)
+
 // noteWritten reports a compaction output this node wrote (#1182), where the
 // coordinator tracks what local copies hold.
 func (b *CompactionBridge) noteWritten(path, sha string) {

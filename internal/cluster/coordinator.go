@@ -1281,13 +1281,13 @@ func (c *Coordinator) logKeptRelistedPath(item deleteRequest, refresh filereplic
 			Str("path", item.path).
 			Str("reason", item.reason).
 			Int64("total_warned", n).
-			Msg("Local delete skipped: the manifest lists the path again, but the file puller queue is full; the local copy may be the previous version until the path's next arrival or the periodic reconciliation (#1182)")
+			Msg("Local delete skipped: the manifest lists the path again, but the file puller queue is full; the local copy may be the previous version until the path's next arrival or the next manifest walk, which finds it stale (#1182)")
 	default:
 		c.logger.Warn().
 			Str("path", item.path).
 			Str("reason", item.reason).
 			Int64("total_warned", n).
-			Msg("Local delete skipped: the manifest lists the path again, but the file puller is stopped; the local copy is kept and may be the previous version (#1182)")
+			Msg("Local delete skipped: the manifest lists the path again, but the file puller is stopped; the local copy is kept and may be the previous version until the next start's walk finds it stale (#1182)")
 	}
 }
 
@@ -2995,6 +2995,16 @@ func (c *Coordinator) Status() map[string]interface{} {
 	}
 	if puller != nil {
 		status["replication_catchup_status"] = puller.CatchUpStatus()
+		// How the walks judge a same-size local copy (#1182): by what this
+		// node recorded it holds, or by its size alone when that record is
+		// not kept (tracking failed or not open yet).
+		if c.staleLocalEnabled() {
+			trust := "size_only"
+			if seen := c.stale.seen.Load(); seen != nil && seen.err() == nil {
+				trust = "recorded"
+			}
+			status["local_copy_trust"] = trust
+		}
 	}
 
 	// The compactor lease, and specifically whether it sits on a node that

@@ -1991,7 +1991,10 @@ startup.
 
 The sweep is on by default (`cluster.stale_local_sweep`) on local storage with
 `cluster.replication_enabled`, and stops with
-`cluster.replication_catchup_enabled = false`. It holds about 150–200 bytes
+`cluster.replication_catchup_enabled = false`. The tracking it removes by also
+records what each local copy holds (#1182, below), so it runs with
+`cluster.stale_local_sweep = false` too: that setting stops the removals only,
+and the status then reads `removals_off: true`. It holds about 150–200 bytes
 of memory per local file, and a journal of up to about 1.5 times that on the
 Raft volume; if the journal cannot be written, the node stops tracking (and
 removing) until a restart and `arc_stale_local_tracking_failed` reads `1`.
@@ -4094,31 +4097,69 @@ refreshes waiting for their path's next arrival.
 
 If the refresh cannot be queued, the line is a warning, and the local copy
 may be the previous version for a while. When the node is shutting down the
-refresh is lost; when the pull queue is full it is retried on the path's next
-arrival or the periodic reconciliation.
+refresh is lost until the next start's walk; when the pull queue is full it is
+retried on the path's next arrival or the next manifest walk.
 
 Since [#975](https://github.com/Basekick-Labs/arc/issues/975), Arc's DELETE
 rewrites and compaction publish new files under fresh paths, so these shapes
 come only from producers that reuse a path: restores, imports, edge-sync
-after the hub deleted the path, and external Raft writers. Two gaps remain for them:
-
-- A forced refresh that fails, or is dropped, is remembered in memory only. A
-  restart forgets it, and the startup catch-up then accepts the old copy by its
-  size and reports the node caught up. With
-  `cluster.replication_catchup_enabled = false`, nothing retries it at all.
-  [#1182](https://github.com/Basekick-Labs/arc/issues/1182) tracks this.
-- A rewrite a node learns of from a Raft snapshot rather than from the log
-  fires no callback. Since the fix for
-  [#1071](https://github.com/Basekick-Labs/arc/issues/1071) (below), the
-  node's next replication walk has a copy it recorded under the earlier
-  registration re-checked and pulled again if its content differs; a copy
-  from before the upgrade is not recorded, so it is still kept.
+after the hub deleted the path, and external Raft writers. A forced refresh
+that fails or is dropped, then a restart, and a rewrite a node learns of from
+a Raft snapshot (which fires no callback) are covered by
+[#1182](https://github.com/Basekick-Labs/arc/issues/1182) (below): the next
+manifest walk finds such a copy stale and refreshes it. With
+`cluster.replication_catchup_enabled = false` there are no walks, and nothing
+retries it.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in
 [#907](https://github.com/Basekick-Labs/arc/pull/907), and by
 [@jallegri](https://github.com/jallegri) in
 [#1173](https://github.com/Basekick-Labs/arc/pull/1173) (delete then
 re-register).
+
+### A restarted replica no longer trusts a stale copy of the same size ([#1182](https://github.com/Basekick-Labs/arc/issues/1182))
+
+On a cluster with local storage, when the manifest listed new content at a
+path a node already held at the same size, and the node's refresh of it
+failed (no peer reachable that held the new bytes), a restart lost the retry:
+the startup catch-up accepted the old copy by its size, the query gate went
+green, and the node served the old bytes until something else rewrote the
+path. A restore of a backup, edge-sync after the hub deleted a path, and name
+collisions from writers on an older release produce such content changes.
+
+Each node now records what each local copy holds: the checksum it pulled,
+hashed, or wrote itself (a flush, a compaction output), kept while the file
+stays the same one. The startup catch-up and every periodic walk compare that
+with the manifest. A copy known to hold other bytes is pulled again; a copy
+whose content the node does not know is hashed first and pulled only if it
+differs. These refreshes count in the startup batch, so with
+`cluster.query_gate_on_catchup` the gate stays red until each is settled, and
+a node that cannot refresh one reports it in `catchup_failed`. A copy is
+never removed by this: when no peer serves the listed bytes, the node keeps
+its copy and retries on the next walk.
+
+**Upgrade cost.** A node upgraded from an earlier release has no record of
+its copies, so its first start hashes every local file once at the manifest
+size, on the pull workers, in the background (a full read of the node's data:
+roughly 5 to 15 minutes per 500 GB). Pulls of new files queue behind it; with
+the query gate on, the gate waits for it. Later starts hash only what changed.
+
+Also:
+
+- A pull that found no candidate peer in any attempt finished as if it had
+  succeeded, so the startup gate could go green over a file the node never
+  fetched. It now counts as failed (`no_peer_exhausted`).
+- A hash of a local copy is bounded by a 30 s stall, not a deadline, so a
+  large copy on a busy disk is read to the end instead of downloaded again.
+- New counters in `replication_catchup_status`: `listed_unvouched` (walk
+  entries refreshed because the node could not vouch for the copy),
+  `verify_unreadable` (hashes that could not be read; the next walk retries)
+  and `no_peer_exhausted`. `GET /api/v1/cluster` reports `local_copy_trust`:
+  `recorded`, or `size_only` when the record cannot be kept (the tracking
+  journal failed or is not open yet).
+- The tracking journal (`seen-local.log`, from #1071) moves to version 2; a
+  version 1 journal from a pre-release build is loaded with every checksum
+  unknown, so those copies are hashed once.
 
 ### Compaction reuses local inputs and validates DuckDB paths ([#969](https://github.com/Basekick-Labs/arc/issues/969))
 

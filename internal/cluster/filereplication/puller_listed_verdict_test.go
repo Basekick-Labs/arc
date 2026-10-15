@@ -220,12 +220,111 @@ func (unreadableBackend) ReadTo(context.Context, string, io.Writer) error {
 	return errors.New("disk too slow")
 }
 
-func TestLocalHashDeadlineScalesWithSize(t *testing.T) {
-	if d := localHashDeadline(1 << 20); d != localHashFloor {
-		t.Fatalf("small file deadline %v", d)
+// slowBackend reads the local file in small chunks, pausing between them, or
+// stalls after the first chunk.
+type slowBackend struct {
+	storage.Backend
+	pause time.Duration
+	stall bool
+}
+
+func (b slowBackend) ReadTo(ctx context.Context, path string, w io.Writer) error {
+	body, err := b.Backend.Read(ctx, path)
+	if err != nil {
+		return err
 	}
-	if d := localHashDeadline(10 << 30); d <= localHashFloor || d != time.Duration((10<<30)/localHashRate)*time.Second {
-		t.Fatalf("10 GiB deadline %v", d)
+	for i := 0; i < len(body); i += 4 {
+		if _, err := w.Write(body[i:min(i+4, len(body))]); err != nil {
+			return err
+		}
+		if b.stall {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		time.Sleep(b.pause)
+	}
+	return nil
+}
+
+// A hash is bounded by a stall, not a deadline (#1182, review H1): a copy read
+// slowly but steadily is hashed to the end however long it takes; one that
+// stops reading is given up after the stall.
+func TestVerifyLocalCopyIsBoundedByAStall(t *testing.T) {
+	old := localHashStall
+	localHashStall = 150 * time.Millisecond
+	t.Cleanup(func() { localHashStall = old })
+	ctx := context.Background()
+	slow := newVerdictRig(t, currentBody, ListedUnverified, func(c *Config) {
+		c.Backend = slowBackend{Backend: c.Backend, pause: 40 * time.Millisecond} // ~240 ms in all
+	})
+	if err := slow.local.Write(ctx, verdictPath, currentBody); err != nil {
+		t.Fatal(err)
+	}
+	e := entryFor(verdictPath, currentBody)
+	if got := slow.p.verifyLocalCopy(zerolog.Nop(), e); got != localCopyMatched {
+		t.Fatalf("a slow steady hash = %v, want matched", got)
+	}
+	stalled := newVerdictRig(t, currentBody, ListedUnverified, func(c *Config) {
+		c.Backend = slowBackend{Backend: c.Backend, stall: true}
+	})
+	if err := stalled.local.Write(ctx, verdictPath, currentBody); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if got := stalled.p.verifyLocalCopy(zerolog.Nop(), e); got != localCopyUnreadable {
+		t.Fatalf("a stalled hash = %v, want unreadable", got)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("a stalled hash took %v", d)
+	}
+}
+
+// A walk's hash that could not be read does not leave the path pending a
+// forced refresh, which would make the next plain request download it in full
+// (#1182, review M1).
+func TestUnreadableHashDoesNotMarkTheRefreshPending(t *testing.T) {
+	r := newVerdictRig(t, currentBody, ListedUnverified, func(c *Config) {
+		c.Backend = unreadableBackend{c.Backend}
+	})
+	if err := r.local.Write(context.Background(), verdictPath, currentBody); err != nil {
+		t.Fatal(err)
+	}
+	stats := r.catchUp(t, entryFor(verdictPath, currentBody))
+	if stats["refresh_pending"] != 0 || stats["verify_unreadable"] != 1 {
+		t.Fatalf("stats=%v, want nothing pending", stats)
+	}
+	r.p.Enqueue(entryFor(verdictPath, currentBody)) // a later plain arrival
+	waitStats(t, r.p, func(s map[string]int64) bool { return s["inflight_count"] == 0 && s["skipped_local"] >= 1 })
+	if r.fetcher.calls.Load() != 0 {
+		t.Fatal("a plain arrival after an unreadable hash downloaded the file")
+	}
+}
+
+// A self-origin copy is never refreshed by the walk where self-origin pulls
+// are off (a shared backend): the request would be skipped and its gate tag
+// never cleared (#1182, review L5).
+func TestCatchUpLeavesSelfOriginAloneWithoutRepull(t *testing.T) {
+	r := newVerdictRig(t, currentBody, ListedStale, func(c *Config) { c.RepullMissingSelfOrigin = false })
+	if err := r.local.Write(context.Background(), verdictPath, staleBody); err != nil {
+		t.Fatal(err)
+	}
+	e := entryFor(verdictPath, currentBody)
+	e.OriginNodeID = "reader-1"
+	stats := r.catchUp(t, e)
+	if stats["listed_unvouched"] != 0 || !r.p.FullyCaughtUp() {
+		t.Fatalf("stats=%v gate=%v", stats, r.p.CatchUpStatus())
+	}
+}
+
+// A pull that finds no candidate peer in any attempt is a failure: the
+// startup gate does not go green over a file it never fetched.
+func TestNoCandidatePeerCountsAsFailed(t *testing.T) {
+	r := newVerdictRig(t, currentBody, ListedTrusted, func(c *Config) {
+		c.PeerResolver = staticResolver{ok: false}
+	})
+	stats := r.catchUp(t, entryFor(verdictPath, currentBody))
+	if stats["no_peer_exhausted"] != 1 || stats["failed"] != 1 || r.p.FullyCaughtUp() {
+		t.Fatalf("stats=%v gate=%v", stats, r.p.CatchUpStatus())
 	}
 }
 

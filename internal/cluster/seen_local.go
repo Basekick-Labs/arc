@@ -16,8 +16,12 @@ import (
 const seenLocalJournal = "seen-local.log"
 
 // v2 (#1182): sha is what the file holds, no longer the checksum the manifest
-// listed when the file was seen; a v1 journal is dropped (unreleased).
-const seenLocalHeader = "arc-seen-local v2 "
+// listed when the file was seen. A v1 journal's records are loaded with the
+// checksum unknown: still removable by the sweep, hashed once by the walk.
+const (
+	seenLocalHeader   = "arc-seen-local v2 "
+	seenLocalHeaderV1 = "arc-seen-local v1 "
+)
 
 // seenRecord identifies the local file a path held when this node saw it
 // registered: the file must still be that one (size, mtime, inode) before the
@@ -100,17 +104,27 @@ func (s *seenLocal) load() error {
 	defer f.Close()
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
-	first := true
+	first, v1 := true, false
 	for sc.Scan() {
 		line := sc.Text()
 		if first {
 			first = false
-			if line != seenLocalHeader+s.cluster {
+			switch line {
+			case seenLocalHeader + s.cluster:
+			case seenLocalHeaderV1 + s.cluster:
+				v1 = true
+			default:
 				return nil // another cluster's, or unreadable: start empty
 			}
 			continue
 		}
 		applySeenLine(s.set, line)
+	}
+	if v1 {
+		for p, r := range s.set {
+			r.sha = 0
+			s.set[p] = r
+		}
 	}
 	if err := sc.Err(); err != nil {
 		// A line too long to be ours ends the read; what came before stands.
@@ -237,10 +251,13 @@ func (s *seenLocal) add(path string, r seenRecord) {
 }
 
 // update replaces path's record with what fn returns from the current one,
-// under the set's lock, so a pull's evidence and a walk that read the record
-// before it cannot undo each other. fn returning false writes nothing.
+// under the set's lock, so fn decides from the record as it is. The caller's
+// stat is taken before the lock, so a walk can still write back an older file
+// identity with an unknown checksum after a pull recorded the new one; that
+// costs one hash on the next walk and never pairs the current file with a
+// wrong checksum. fn returning false writes nothing.
 func (s *seenLocal) update(path string, fn func(old seenRecord, ok bool) (seenRecord, bool)) {
-	if strings.ContainsAny(path, "\t\n") {
+	if !journalablePath(path) {
 		return
 	}
 	s.mu.Lock()
@@ -255,6 +272,11 @@ func (s *seenLocal) update(path string, fn func(old seenRecord, ok bool) (seenRe
 	}
 	s.set[path] = r
 	s.appendLocked(addLine(path, r))
+}
+
+// journalablePath: a path the journal's line format can hold.
+func journalablePath(path string) bool {
+	return !strings.ContainsAny(path, "\t\n")
 }
 
 // sameFile reports whether two records describe the same local file.

@@ -203,8 +203,9 @@ func TestWaitStaleLocalOpen(t *testing.T) {
 	<-done
 }
 
-// A v1 journal (whose sha was the listed checksum, not the file's) is dropped.
-func TestSeenLocalDropsAV1Journal(t *testing.T) {
+// A v1 journal's sha was the listed checksum, not the file's: its records load
+// with the checksum unknown, so the sweep keeps them and the walk hashes once.
+func TestSeenLocalLoadsAV1JournalAsUnknown(t *testing.T) {
 	dir := t.TempDir()
 	v1 := "arc-seen-local v1 c\na\t" + staleHour + "a.parquet\t6\t1\t2\t3\t4\n"
 	if err := os.WriteFile(filepath.Join(dir, seenLocalJournal), []byte(v1), 0o600); err != nil {
@@ -215,7 +216,48 @@ func TestSeenLocalDropsAV1Journal(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.close()
-	if s.len() != 0 {
-		t.Fatalf("v1 records loaded: %d", s.len())
+	r, ok := s.get(staleHour + "a.parquet")
+	if !ok || r.sha != 0 || r.size != 6 || r.lsn != 3 {
+		t.Fatalf("v1 record %+v ok=%v, want it loaded with sha 0", r, ok)
+	}
+}
+
+// A record's index never moves back: a long hash that started before a tier
+// update records the older index on the same file (#1182, review L1).
+func TestStaleLocalIndexNeverMovesBack(t *testing.T) {
+	r := staleRig(t)
+	key := staleHour + "a.parquet"
+	r.registerWritten(key, "rows a")
+	r.walk()
+	cur, _ := r.c.raftNode.FSM().GetFile(key)
+	old := *cur
+	old.LSN--
+	r.c.recordLocalContent(&old, "", cur.SHA256)
+	if rec, _ := r.c.stale.seen.Load().get(key); rec.lsn != cur.LSN {
+		t.Fatalf("index %d, want %d", rec.lsn, cur.LSN)
+	}
+}
+
+// A path the journal cannot hold keeps the size-only check, instead of being
+// hashed on every walk (#1182, review L2).
+func TestStaleLocalUnjournalablePathIsTrusted(t *testing.T) {
+	r := staleRig(t)
+	e := &raft.FileEntry{Path: staleHour + "a\tb.parquet", SHA256: strings.Repeat("a", 64), SizeBytes: 6}
+	r.write(e.Path, "rows a")
+	if v := r.c.observeListed(e); v != filereplication.ListedTrusted {
+		t.Fatalf("verdict %v", v)
+	}
+}
+
+// The cluster status says how same-size copies are judged.
+func TestStatusReportsLocalCopyTrust(t *testing.T) {
+	r := staleRig(t)
+	r.c.puller = &filereplication.Puller{}
+	if got := r.c.Status()["local_copy_trust"]; got != "recorded" {
+		t.Fatalf("local_copy_trust = %v", got)
+	}
+	r.c.stale.seen.Load().close()
+	if got := r.c.Status()["local_copy_trust"]; got != "size_only" {
+		t.Fatalf("local_copy_trust after a failure = %v", got)
 	}
 }
