@@ -199,7 +199,7 @@ earlier release on a node, remove the node from the cluster, wipe its data
 directory, and join it fresh. To roll back the whole cluster, restore it from a
 backup taken before the upgrade.
 
-## Upgrade note: the live WAL replication stream is off ([#888](https://github.com/Basekick-Labs/arc/issues/888))
+## Upgrade note: the live WAL replication stream is removed ([#888](https://github.com/Basekick-Labs/arc/issues/888), [#1181](https://github.com/Basekick-Labs/arc/issues/1181))
 
 This applies to clusters where readers or compactors run with both
 `wal.enabled` and `cluster.replication_enabled`. With default values the Helm
@@ -207,12 +207,10 @@ chart enables the WAL only on writer pods, so a chart-deployed cluster never ran
 the stream on those roles and nothing changes for it. The manifests in
 `deploy/kubernetes-local` did enable it on readers.
 
-**What changed.** Writers no longer start the WAL replication sender, and
-readers and compactors no longer receive from it. Every node with `wal.enabled`
-and `cluster.replication_enabled` logs this once at startup:
-
-> WAL replication stream not started: readers and compactors read registered
-> Parquet from the primary, and the standby-writer stream is not available yet
+**What changed.** Writers no longer run the WAL replication sender, and
+readers and compactors no longer receive from it: the stream is removed. Its
+`cluster.replication_lag_limit`, `cluster.replication_buffer_size` and
+`cluster.replication_ack_interval` settings are ignored if set.
 
 **Why.** The stream reached only readers and compactors. Each applied what it
 received to its own ingest buffer and flushed it to its own Parquet. Queries
@@ -220,9 +218,9 @@ read every file on the node, so a reader returned every replicated row twice:
 once from its own flush and once from the copy it pulled from the primary. A
 compactor also registered its copy in the cluster manifest, so every node pulled
 it, the primary included, and the duplicates showed up cluster-wide. Neither
-role can be promoted, so the stream gave failover nothing in exchange. It
-returns for standby writers only, holding the primary's unflushed window for
-failover without writing a second copy
+role can be promoted, so the stream gave failover nothing in exchange. Standby
+writers hold the primary's unflushed window through a separate stream that
+writes no second copy
 ([#1207](https://github.com/Basekick-Labs/arc/issues/1207)).
 
 **What does not change.** `cluster.replication_enabled` still starts peer file
@@ -231,20 +229,20 @@ registered Parquet, as they already did for anything flushed. A reader sees a
 new row once the writer flushes it (`ingest.max_buffer_age_ms`) and the file has
 been pulled.
 
-**Metrics.** `arc_replication_lag_entries` and `arc_replication_lag_seconds`
-were reported per connected reader. With no reader connected they have no
-series, and `arc_replication_entries_dropped_total` stays at zero, so alerts
-built on them will not fire. They describe the stream only, not peer file
-replication.
+**Metrics.** `arc_replication_lag_entries`, `arc_replication_lag_seconds` and
+`arc_replication_entries_dropped_total` are removed, and
+`replication_entries_dropped_total` from the JSON metrics. They described the
+stream only, not peer file replication; remove alerts built on them.
 
 **Upgrade order.** Upgrade readers and compactors first, and stop them
 gracefully. A graceful stop flushes and purges what they received. After a crash,
 the first boot replays those received entries once more and writes one more
 duplicate copy. A reader that is still on the old version keeps dialling the
 writers, and every few seconds until that reader is upgraded an upgraded writer
-refuses it and logs
+refuses it, closes the connection and logs
 
-> Replication sync rejected: not a writer or replication not enabled
+> Replication sync rejected: this release has no WAL replication stream;
+> upgrade the reader
 
 **Duplicates already on disk.** Which copies exist depends on the role that
 wrote them.
@@ -3327,12 +3325,11 @@ check and continues deleting the other valid keys in the batch.
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in
 [#1132](https://github.com/Basekick-Labs/arc/pull/1132).
 
-### Forwarded writes and WAL replication honor cancellation during TLS setup ([#1064](https://github.com/Basekick-Labs/arc/issues/1064))
+### Forwarded writes honor cancellation during TLS setup ([#1064](https://github.com/Basekick-Labs/arc/issues/1064))
 
-Leader forwarding and WAL replication now pass their existing contexts into
-peer dials, so cancellation interrupts a stalled TLS handshake instead of
-waiting for the dial timeout. Regression tests cover leader-dial cancellation,
-the receiver's cancellation error, and receiver shutdown during TLS setup.
+Leader forwarding now passes its existing context into peer dials, so
+cancellation interrupts a stalled TLS handshake instead of waiting for the dial
+timeout. Regression tests cover leader-dial cancellation.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in
 [#1068](https://github.com/Basekick-Labs/arc/pull/1068) and
