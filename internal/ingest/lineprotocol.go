@@ -47,8 +47,9 @@ func (p *LineProtocolParser) parseBatchInternal(data []byte, precision string, v
 	lines := bytes.Split(data, []byte{'\n'})
 	records := make([]*models.Record, 0, len(lines))
 
+	var l LPLine // its slices are reused line to line
 	for _, line := range lines {
-		record := p.parseLineWithPrecision(line, precision, validUTF8)
+		record := p.parseLineInto(line, precision, validUTF8, &l)
 		if record != nil {
 			records = append(records, record)
 		}
@@ -81,31 +82,82 @@ func (p *LineProtocolParser) ParseBatchWithPrecision(data []byte, precision stri
 // parseLineWithPrecision parses a single LP line with custom timestamp precision.
 // Converts the raw timestamp to microseconds based on the given precision.
 func (p *LineProtocolParser) parseLineWithPrecision(line []byte, precision string, validUTF8 bool) *models.Record {
+	var l LPLine
+	return p.parseLineInto(line, precision, validUTF8, &l)
+}
+
+// parseLineInto is parseLineWithPrecision with l's slices reused.
+func (p *LineProtocolParser) parseLineInto(line []byte, precision string, validUTF8 bool, l *LPLine) *models.Record {
+	if !p.lexLine(line, precision, validUTF8, l) {
+		return nil
+	}
+	tags := make(map[string]string, len(l.Tags))
+	for _, t := range l.Tags {
+		tags[t.Key] = t.Value
+	}
+	fields := make(map[string]interface{}, len(l.Fields))
+	for _, f := range l.Fields {
+		fields[f.Key] = f.Value
+	}
+	return &models.Record{
+		Measurement: l.Measurement,
+		Tags:        tags,
+		Fields:      fields,
+		Timestamp:   l.Timestamp,
+	}
+}
+
+// LPTag is a tag of a line-protocol line.
+type LPTag struct{ Key, Value string }
+
+// LPField is a field of a line-protocol line; Value is int64, uint64,
+// float64, string or bool.
+type LPField struct {
+	Key   string
+	Value interface{}
+}
+
+// LPLine is one parsed line-protocol line, its tags and fields in line order
+// as written (a key may repeat; the last occurrence is the line's value, as
+// in a Record's maps).
+type LPLine struct {
+	Measurement string
+	Tags        []LPTag
+	Fields      []LPField
+	Timestamp   int64 // microseconds
+}
+
+// lpNow is the clock for a line without a usable timestamp. A var for tests.
+var lpNow = func() int64 { return time.Now().UnixMicro() }
+
+// lexLine parses line into l (its slices reused). It reports false for a
+// line that is blank, a comment, or not a point (no measurement, no field).
+// Every line-protocol parse goes through it.
+func (p *LineProtocolParser) lexLine(line []byte, precision string, validUTF8 bool, l *LPLine) bool {
 	line = bytes.TrimSpace(line)
 	if len(line) == 0 || line[0] == '#' {
-		return nil
+		return false
 	}
 
 	parts := p.splitLine(line)
 	if len(parts) < 2 {
-		return nil
+		return false
 	}
 
-	measurement, tags := p.parseMeasurementTags(parts[0])
-	if measurement == "" {
-		return nil
+	l.Measurement, l.Tags = p.parseMeasurementTagsInto(parts[0], l.Tags[:0])
+	if l.Measurement == "" {
+		return false
 	}
 
-	fields := p.parseFields(parts[1], validUTF8)
-	if len(fields) == 0 {
-		return nil
+	l.Fields = p.parseFieldsInto(parts[1], validUTF8, l.Fields[:0])
+	if len(l.Fields) == 0 {
+		return false
 	}
 
-	var timestamp int64
 	if len(parts) >= 3 {
 		rawTs, err := strconv.ParseInt(string(bytes.TrimSpace(parts[2])), 10, 64)
 		if err != nil {
-			timestamp = time.Now().UnixMicro()
+			l.Timestamp = lpNow()
 		} else {
 			// Guard against multiplication overflow for ms and s precisions.
 			// strconv.ParseInt already returns ErrRange (handled above) for values
@@ -114,33 +166,27 @@ func (p *LineProtocolParser) parseLineWithPrecision(line []byte, precision strin
 			// us and ns need no guard: us is stored as-is, ns is divided (never overflows).
 			switch precision {
 			case "us":
-				timestamp = rawTs
+				l.Timestamp = rawTs
 			case "ms":
 				if rawTs <= math.MaxInt64/1000 && rawTs >= math.MinInt64/1000 {
-					timestamp = rawTs * 1000
+					l.Timestamp = rawTs * 1000
 				} else {
-					timestamp = time.Now().UnixMicro()
+					l.Timestamp = lpNow()
 				}
 			case "s":
 				if rawTs <= math.MaxInt64/1_000_000 && rawTs >= math.MinInt64/1_000_000 {
-					timestamp = rawTs * 1_000_000
+					l.Timestamp = rawTs * 1_000_000
 				} else {
-					timestamp = time.Now().UnixMicro()
+					l.Timestamp = lpNow()
 				}
 			default: // ns → μs
-				timestamp = rawTs / 1000
+				l.Timestamp = rawTs / 1000
 			}
 		}
 	} else {
-		timestamp = time.Now().UnixMicro()
+		l.Timestamp = lpNow()
 	}
-
-	return &models.Record{
-		Measurement: measurement,
-		Tags:        tags,
-		Fields:      fields,
-		Timestamp:   timestamp,
-	}
+	return true
 }
 
 // splitOnDelimiter splits data on an unescaped delimiter, respecting escaped chars and quoted strings.
@@ -229,36 +275,31 @@ func (p *LineProtocolParser) splitOnComma(data []byte) [][]byte {
 	return splitOnDelimiter(data, ',')
 }
 
-// parseMeasurementTags parses measurement name and tags
+// parseMeasurementTagsInto parses the measurement name and appends the
+// tags to dst, in line order.
 // Format: measurement[,tag=value,...]
-func (p *LineProtocolParser) parseMeasurementTags(part []byte) (string, map[string]string) {
+func (p *LineProtocolParser) parseMeasurementTagsInto(part []byte, dst []LPTag) (string, []LPTag) {
 	// Split on unescaped commas
 	components := p.splitOnComma(part)
 
 	if len(components) == 0 {
-		return "", nil
+		return "", dst
 	}
 
 	measurement := p.unescape(components[0])
-	tags := make(map[string]string)
-
 	for _, component := range components[1:] {
 		idx := bytes.IndexByte(component, '=')
 		if idx > 0 {
-			key := p.unescape(component[:idx])
-			value := p.unescape(component[idx+1:])
-			tags[key] = value
+			dst = append(dst, LPTag{Key: p.unescape(component[:idx]), Value: p.unescape(component[idx+1:])})
 		}
 	}
-
-	return measurement, tags
+	return measurement, dst
 }
 
-// parseFields parses field set
+// parseFieldsInto appends the fields with a value to dst, in line order (a
+// field whose value does not parse is left out).
 // Format: field_key=field_value[,field_key=field_value...]
-func (p *LineProtocolParser) parseFields(part []byte, validUTF8 bool) map[string]interface{} {
-	fields := make(map[string]interface{})
-
+func (p *LineProtocolParser) parseFieldsInto(part []byte, validUTF8 bool, dst []LPField) []LPField {
 	// Split on unescaped commas
 	fieldParts := p.splitOnComma(part)
 
@@ -272,11 +313,10 @@ func (p *LineProtocolParser) parseFields(part []byte, validUTF8 bool) map[string
 		value := p.parseFieldValue(fieldPart[idx+1:], validUTF8)
 
 		if value != nil {
-			fields[key] = value
+			dst = append(dst, LPField{Key: key, Value: value})
 		}
 	}
-
-	return fields
+	return dst
 }
 
 // parseFieldValue parses field value based on InfluxDB type indicators

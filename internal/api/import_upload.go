@@ -252,6 +252,7 @@ type importWriter struct {
 	measRows map[string]int64
 	order    []string
 	release  func()
+	grouper  *ingest.HourGrouper
 }
 
 // importBufferedAllowance is how many bytes an import may have written and
@@ -272,6 +273,15 @@ var importFlushWait = 2 * time.Minute
 
 // importAllowanceOverride replaces importBufferedAllowance when > 0. Tests.
 var importAllowanceOverride int64
+
+// importGroupBudgetOverride, when >= 0, replaces the grouping budget (half
+// the allowance); 0 writes every chunk as it comes. Tests.
+var importGroupBudgetOverride int64 = -1
+
+// importGroupCells caps one grouped write at this many cells (rows x
+// columns), the size of today's chunks: a write's WAL row maps stay that
+// size. A var for tests.
+var importGroupCells = 1_000_000
 
 // importWriteHook, when set, sees the row count of every write an import
 // makes. Tests.
@@ -295,14 +305,71 @@ func newImportWriter(ctx context.Context, buf *ingest.ArrowBuffer, database stri
 	if importAllowanceOverride > 0 {
 		allowance = importAllowanceOverride
 	}
+	// Half the allowance holds parsed rows grouped by hour (HourGrouper);
+	// the rest is for written rows waiting for their flush.
+	budget := allowance / 2
+	if importGroupBudgetOverride >= 0 {
+		budget = importGroupBudgetOverride
+	}
 	return &importWriter{
 		buf:      buf,
 		database: database,
-		limit:    buf.BufferedBytes() + allowance,
+		limit:    buf.BufferedBytes() + max(allowance-budget, 1),
 		maxWait:  importFlushWait,
 		measRows: map[string]int64{},
 		release:  func() { <-importWriteGate },
+		grouper:  ingest.NewHourGrouper(budget),
 	}, nil
+}
+
+// add takes a parsed batch of measurement. The batches are held, grouped by
+// hour, until the grouping budget, then written: an unsorted file then makes
+// about one file per hour per window of the budget's size, not one per hour
+// per chunk (#1070 follow-up).
+func (w *importWriter) add(ctx context.Context, measurement string, batch *ingest.TypedColumnBatch, rows int) error {
+	if w.grouper.Add(measurement, batch, rows) {
+		return w.drain(ctx)
+	}
+	return nil
+}
+
+// drain writes what the grouper holds, one batch per measurement and hour,
+// paced to the flushes.
+func (w *importWriter) drain(ctx context.Context) error {
+	return w.grouper.Drain(importGroupCells, func(measurement string, batch *ingest.TypedColumnBatch, rows int) error {
+		if err := w.buf.WriteTypedColumnarDirect(ctx, w.database, measurement, batch, rows); err != nil {
+			if w.started() {
+				return w.partial(err, measurement)
+			}
+			return err
+		}
+		w.wrote(measurement, int64(rows))
+		if err := w.pace(ctx); err != nil {
+			return w.partial(err, "")
+		}
+		return nil
+	})
+}
+
+// importWriteError answers an error of add or end: a failure part-way as is,
+// any other as an import error with the buffer's status (nothing written).
+func importWriteError(err error, message string) error {
+	if err == nil {
+		return nil
+	}
+	if pe, ok := asImportPartial(err); ok {
+		return pe
+	}
+	return &importError{StatusCode: importBufferStatus(err), Message: message, Err: err}
+}
+
+// end writes what the grouper still holds. Call after the last add, before
+// the final flush, with the write gate still held.
+func (w *importWriter) end(ctx context.Context) error {
+	if w.grouper.Empty() {
+		return nil
+	}
+	return w.drain(ctx)
 }
 
 // close releases the write gate.

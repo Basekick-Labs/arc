@@ -48,6 +48,9 @@ type chunkedImport struct {
 
 func newChunkedImport(t *testing.T, maxBufferSize int) *chunkedImport {
 	t.Helper()
+	// Every chunk written as it comes (no hour grouping), so these tests
+	// see the chunking itself; grouping tests set their own budget.
+	setVar(t, &importGroupBudgetOverride, 0)
 	dir := t.TempDir()
 	backend, err := storage.NewLocalBackend(dir, zerolog.Nop())
 	require.NoError(t, err)

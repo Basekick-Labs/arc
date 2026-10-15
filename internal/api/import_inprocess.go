@@ -355,17 +355,7 @@ func (h *ImportHandler) importCSV(c *fiber.Ctx, database, measurement string, up
 		}
 		cols["time"] = tm
 		batch := &ingest.TypedColumnBatch{Data: cols, Validity: validity}
-		if err := h.arrowBuffer.WriteTypedColumnarDirect(writeCtx, database, measurement, batch, len(tm)); err != nil {
-			if w.started() {
-				return w.partial(err, measurement)
-			}
-			return &importError{StatusCode: importBufferStatus(err), Message: "failed to ingest CSV data", Err: err}
-		}
-		w.wrote(measurement, int64(len(tm)))
-		if err := w.pace(writeCtx); err != nil {
-			return w.partial(err, "")
-		}
-		return nil
+		return importWriteError(w.add(writeCtx, measurement, batch, len(tm)), "failed to ingest CSV data")
 	}); ierr != nil {
 		if pe, ok := asImportPartial(ierr.Err); ok {
 			return nil, pe
@@ -374,6 +364,9 @@ func (h *ImportHandler) importCSV(c *fiber.Ctx, database, measurement string, up
 			return nil, w.partial(ierr, "")
 		}
 		return nil, ierr
+	}
+	if err := w.finish(importWriteError(w.end(writeCtx), "failed to ingest CSV data")); err != nil {
+		return nil, err
 	}
 	// Hand what is still buffered to the flush: the rows are in the buffer and
 	// the WAL (when enabled); files follow as their flushes finish.
@@ -621,18 +614,11 @@ func (h *ImportHandler) importParquet(ctx fiberContext, database, measurement st
 		}
 		cols["time"] = timeMicros
 		batch := &ingest.TypedColumnBatch{Data: cols, Validity: validity}
-		if err := h.arrowBuffer.WriteTypedColumnarDirect(ctx, database, measurement, batch, len(timeMicros)); err != nil {
-			if w.started() {
-				return w.partial(err, measurement)
-			}
-			return &importError{StatusCode: importBufferStatus(err), Message: "failed to ingest parquet data", Err: err}
-		}
-		w.wrote(measurement, int64(len(timeMicros)))
-		if err := w.pace(ctx); err != nil {
-			return w.partial(err, "")
-		}
-		return nil
+		return importWriteError(w.add(ctx, measurement, batch, len(timeMicros)), "failed to ingest parquet data")
 	})); err != nil {
+		return nil, err
+	}
+	if err := w.finish(importWriteError(w.end(ctx), "failed to ingest parquet data")); err != nil {
 		return nil, err
 	}
 	// Hand what is still buffered to the flush: the rows are in the buffer and

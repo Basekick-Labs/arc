@@ -188,6 +188,18 @@ func TestLPImportRefusedPartWayAcrossChunks(t *testing.T) {
 // only) after rows were written is a failure part-way, not a rejected file.
 func TestParquetDecodeErrorAfterWritesIsPartial(t *testing.T) {
 	setVar(t, &parquetBatchRows, 5)
+	data := corruptSecondRowGroupParquet(t)
+	ci := newChunkedImport(t, 1000)
+	status, body := ci.post(t, "/api/v1/import/parquet?db=d&measurement=m", data)
+	require.Equal(t, http.StatusInternalServerError, status, body)
+	require.EqualValues(t, 5, body["rows_written"])
+}
+
+// corruptSecondRowGroupParquet is a 10-row file of two row groups whose
+// second v page header is garbage: the time column (all the validation pass
+// reads) is intact.
+func corruptSecondRowGroupParquet(t *testing.T) []byte {
+	t.Helper()
 	sc := arrow.NewSchema([]arrow.Field{{Name: "time", Type: arrow.FixedWidthTypes.Timestamp_us}, {Name: "v", Type: arrow.PrimitiveTypes.Int64}}, nil)
 	b := array.NewRecordBuilder(memory.DefaultAllocator, sc)
 	for i := 0; i < 10; i++ {
@@ -210,10 +222,20 @@ func TestParquetDecodeErrorAfterWritesIsPartial(t *testing.T) {
 	for i := int64(0); i < 8; i++ {
 		data[off+i] = 0xFF // the second row group's v page header
 	}
+	return data
+}
+
+// With hour grouping, a decode error before any window was written is a
+// rejected file: nothing written, not a failure part-way.
+func TestParquetDecodeErrorBeforeAnyWriteIsClean(t *testing.T) {
+	setVar(t, &parquetBatchRows, 5)
+	data := corruptSecondRowGroupParquet(t)
 	ci := newChunkedImport(t, 1000)
+	setVar(t, &importGroupBudgetOverride, 64<<20)
 	status, body := ci.post(t, "/api/v1/import/parquet?db=d&measurement=m", data)
-	require.Equal(t, http.StatusInternalServerError, status, body)
-	require.EqualValues(t, 5, body["rows_written"])
+	require.Equal(t, http.StatusUnprocessableEntity, status, body)
+	require.Nil(t, body["rows_written"])
+	require.Empty(t, ci.writes)
 }
 
 // A wide CSV file is chunked by cells, not only rows.
@@ -369,4 +391,24 @@ func TestImportBodyCutShort(t *testing.T) {
 		require.Equal(t, http.StatusBadRequest, resp.StatusCode, tc.path)
 		require.Empty(t, ci.writes)
 	}
+}
+
+// Two keys of one line that land in one column (a field named like a tag
+// goes to "<name>_value") are refused before anything is written: the typed
+// write would give that row two values and shift the column.
+func TestLPImportRefusesKeysSharingAColumn(t *testing.T) {
+	for _, lp := range []string{
+		"cpu,host=x host=1i,host_value=2i 1700000000000000000\ncpu,host=y host=3i 1700000001000000000\n",
+		"cpu,a=t,a_value=u a=\"p\" 1700000000000000000\ncpu,a=t2 a=\"q\" 1700000001000000000\n",
+	} {
+		ci := newChunkedImport(t, 10)
+		status, body := ci.post(t, "/api/v1/import/lp?db=d", []byte(lp))
+		require.Equal(t, http.StatusBadRequest, status, body)
+		require.Empty(t, ci.writes)
+	}
+	// A tag and a field of the same name alone are fine (the field is
+	// "<name>_value").
+	ci := newChunkedImport(t, 10)
+	status, body := ci.post(t, "/api/v1/import/lp?db=d", []byte("cpu,host=x host=1i 1700000000000000000\n"))
+	require.Equal(t, http.StatusOK, status, body)
 }
