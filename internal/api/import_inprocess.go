@@ -248,7 +248,7 @@ func (h *ImportHandler) importCSV(ctx fiberContext, database, measurement string
 		return nil, &importError{StatusCode: importBufferStatus(err), Message: "failed to ingest CSV data", Err: err}
 	}
 	if err := h.arrowBuffer.FlushAll(ctx); err != nil {
-		return nil, &importError{StatusCode: fiber.StatusInternalServerError, Message: "failed to flush imported data", Err: err}
+		return nil, &importError{StatusCode: fiber.StatusInternalServerError, Message: importFlushFailed, Err: err}
 	}
 
 	return buildImportResult(database, measurement, header, opts.timeColumn, timeMicros), nil
@@ -415,7 +415,7 @@ func (h *ImportHandler) importParquet(ctx fiberContext, database, measurement st
 		return nil, &importError{StatusCode: importBufferStatus(err), Message: "failed to ingest parquet data", Err: err}
 	}
 	if err := h.arrowBuffer.FlushAll(ctx); err != nil {
-		return nil, &importError{StatusCode: fiber.StatusInternalServerError, Message: "failed to flush imported data", Err: err}
+		return nil, &importError{StatusCode: fiber.StatusInternalServerError, Message: importFlushFailed, Err: err}
 	}
 
 	return buildImportResult(database, measurement, header, opts.timeColumn, timeMicros), nil

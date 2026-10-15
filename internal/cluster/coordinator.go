@@ -540,6 +540,7 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 		},
 		StandbyWriteTarget: c.WriteForwardTarget,
 		WriteTimeout:       time.Duration(cfg.Config.WriteForwardTimeoutMs) * time.Millisecond,
+		ImportTimeout:      time.Duration(max(cfg.Config.ImportForwardTimeoutMs, 0)) * time.Millisecond,
 	})
 
 	// Initialize writer failover manager (Phase 3) — requires license and Raft.

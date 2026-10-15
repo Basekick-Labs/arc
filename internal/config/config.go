@@ -789,7 +789,13 @@ type ClusterConfig struct {
 	// retried once sent (#1270); a write that times out after being sent is
 	// answered 504 (it may have been written).
 	WriteForwardTimeoutMs int
-	RouteRetries          int // Number of retries for failed forwards (default: 3)
+	// ImportForwardTimeoutMs bounds one import (/api/v1/import/*) forwarded
+	// to a writer, upload and processing included (default 3600000, 0 = no
+	// bound). A backstop, not a deadline: a forward is not cancelled when its
+	// client gives up, so this is what frees the forwarding node from a writer
+	// that never answers (#1070).
+	ImportForwardTimeoutMs int
+	RouteRetries           int // Number of retries for failed forwards (default: 3)
 
 	// ReplicationEnabled starts peer file replication. The WAL replication
 	// stream it once started too is gone (#888, #1181); its
@@ -1283,9 +1289,10 @@ func Load() (*Config, error) {
 			RaftSnapshotThreshold: v.GetInt("cluster.raft_snapshot_threshold"),
 			RaftPreVote:           v.GetBool("cluster.raft_pre_vote"),
 			// Routing configuration
-			RouteTimeout:          v.GetInt("cluster.route_timeout"),
-			WriteForwardTimeoutMs: v.GetInt("cluster.write_forward_timeout_ms"),
-			RouteRetries:          v.GetInt("cluster.route_retries"),
+			RouteTimeout:           v.GetInt("cluster.route_timeout"),
+			WriteForwardTimeoutMs:  v.GetInt("cluster.write_forward_timeout_ms"),
+			ImportForwardTimeoutMs: v.GetInt("cluster.import_forward_timeout_ms"),
+			RouteRetries:           v.GetInt("cluster.route_retries"),
 			// Replication configuration
 			ReplicationEnabled: v.GetBool("cluster.replication_enabled"),
 			// Peer file replication (Enterprise Phase 2)
@@ -2090,9 +2097,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.raft_pre_vote", true)            // #1272; see Cluster.RaftPreVote
 
 	// Request routing defaults (Phase 3)
-	v.SetDefault("cluster.route_timeout", 5000)             // 5 second timeout for forwards
-	v.SetDefault("cluster.write_forward_timeout_ms", 60000) // #1270; see Cluster.WriteForwardTimeoutMs
-	v.SetDefault("cluster.route_retries", 3)                // 3 retries for failed forwards
+	v.SetDefault("cluster.route_timeout", 5000)                // 5 second timeout for forwards
+	v.SetDefault("cluster.write_forward_timeout_ms", 60000)    // #1270; see Cluster.WriteForwardTimeoutMs
+	v.SetDefault("cluster.import_forward_timeout_ms", 3600000) // #1070; see Cluster.ImportForwardTimeoutMs
+	v.SetDefault("cluster.route_retries", 3)                   // 3 retries for failed forwards
 
 	v.SetDefault("cluster.replication_enabled", false) // Disabled by default
 	// Peer file replication (Enterprise Phase 2)

@@ -98,12 +98,23 @@ func (h *ImportHandler) SetRouter(router *cluster.Router) {
 	h.router = router
 }
 
+// forwardWriteIfNeeded sends an import to a writer when this node may not
+// take it (#1070): a reader or compactor forwards it like any other write,
+// and a standby writer forwards it to the primary (#1270). It runs before the
+// handler reads the upload, so nothing has been written when it forwards.
+// Sent once, never retried, bounded by cluster.import_forward_timeout_ms
+// (Router.RouteImport).
+// handled=false: import locally.
 func (h *ImportHandler) forwardWriteIfNeeded(c *fiber.Ctx) (bool, error) {
 	switch WriteForwardDecision(h.router, c) {
 	case ForwardAlreadyForwarded:
 		h.totalErrors.Add(1)
 		return true, RespondAlreadyForwarded(c)
 	case ForwardToPeer:
+		if importTooLargeToForward(c) {
+			h.totalErrors.Add(1)
+			return true, respondImportTooLarge(c)
+		}
 		req, err := BuildHTTPRequest(c)
 		if err != nil {
 			h.totalErrors.Add(1)
@@ -113,19 +124,40 @@ func (h *ImportHandler) forwardWriteIfNeeded(c *fiber.Ctx) (bool, error) {
 			})
 		}
 
-		resp, err := h.router.RouteWrite(c.Context(), req)
+		resp, err := h.router.RouteImport(c.Context(), req)
 		if err == cluster.ErrLocalNodeCanHandle {
-			return false, nil
+			break
 		}
 		if err != nil {
+			if !errors.Is(err, cluster.ErrWriteForwardUnavailable) && !errors.Is(err, cluster.ErrWriteForwardAmbiguous) {
+				h.logger.Error().Err(err).Msg("Failed to route import request")
+			}
 			h.totalErrors.Add(1)
-			h.logger.Error().Err(err).Msg("Failed to route import request")
-			return true, HandleRoutingError(c, err)
+			return true, respondWriteForwardError(c, err)
 		}
 		return true, CopyResponse(c, resp)
-	default:
-		return false, nil
 	}
+	if _, ok := h.router.StandbyWriteTarget(); ok && c.Get(ForwardedByHeader) == "" && importTooLargeToForward(c) {
+		h.totalErrors.Add(1)
+		return true, respondImportTooLarge(c)
+	}
+	return forwardStandbyImport(h.router, c)
+}
+
+// maxForwardedImportBody is the largest upload forwarded: maxImportSize plus
+// room for the multipart framing around the file. A larger one holds a file
+// the writer would refuse with 413 after it crossed the cluster network
+// (#1070). A var for tests.
+var maxForwardedImportBody = maxImportSize + 1<<20
+
+func importTooLargeToForward(c *fiber.Ctx) bool {
+	return len(c.Request().Body()) > maxForwardedImportBody
+}
+
+func respondImportTooLarge(c *fiber.Ctx) error {
+	return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
+		"error": fmt.Sprintf("file exceeds maximum import size of %d bytes", maxImportSize),
+	})
 }
 
 // RegisterRoutes registers import API routes. Import endpoints write
@@ -339,6 +371,22 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 	for measurement, record := range columnarByMeasurement {
 		if err := h.arrowBuffer.WriteColumnarRecord(writeCtx, database, record); err != nil {
 			h.totalErrors.Add(1)
+			if len(importedMeasurements) > 0 {
+				// Part of the import is written: a retryable answer (503,
+				// Retry-After, the fenced or refused header) would promise
+				// nothing was, and a re-run duplicates the written rows
+				// (#1070).
+				h.logger.Error().Err(err).
+					Str("database", database).
+					Str("measurement", measurement).
+					Strs("written", importedMeasurements).
+					Msg("LP import: failed part-way")
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+					"error":                  fmt.Sprintf("import stopped at measurement %q after writing %d measurement(s); re-running the whole file writes their rows again: %v", measurement, len(importedMeasurements), err),
+					"written_measurements":   importedMeasurements,
+					"stopped_at_measurement": measurement,
+				})
+			}
 			if ingest.IsWriteRefusal(err) {
 				return respondWriteRefused(c, err) // logged by reason (#1268)
 			}
@@ -346,10 +394,8 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 				Str("database", database).
 				Str("measurement", measurement).
 				Msg("LP import: failed to write to buffer")
-			// 503 for the two retryable buffer states. Note this loop has
-			// already written the measurements it got through, so the import is
-			// partial either way — a retryable status at least tells the client
-			// to re-run it rather than treating it as a permanent failure.
+			// 503 for the two retryable buffer states: no earlier measurement
+			// of this import was written (a partial import answered above).
 			if errors.Is(err, ingest.ErrBufferClosing) || errors.Is(err, ingest.ErrSchemaChurnExceeded) {
 				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 					"error": fmt.Sprintf("import rejected at measurement %q (retry): %v", measurement, err),
@@ -371,7 +417,7 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 		h.totalErrors.Add(1)
 		h.logger.Error().Err(err).Str("database", database).Msg("LP import: flush failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "failed to flush imported data: " + err.Error(),
+			"error": importFlushFailed + ": " + err.Error(),
 		})
 	}
 
@@ -423,6 +469,11 @@ func (e *importError) Error() string {
 
 // Unwrap exposes the cause, so errors.Is sees a refused write (#1268, #676).
 func (e *importError) Unwrap() error { return e.Err }
+
+// importFlushFailed answers an import whose rows were all written to the
+// buffer and whose flush then failed: they may still be stored, and running the
+// file again writes them again (#1070).
+const importFlushFailed = "failed to flush imported data; the rows were accepted and may still be stored, check before running the file again"
 
 // importErrorResponse returns the appropriate HTTP error response for an import error
 func (h *ImportHandler) importErrorResponse(c *fiber.Ctx, err error) error {
@@ -623,7 +674,7 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 		h.totalErrors.Add(1)
 		h.logger.Error().Err(err).Str("database", database).Msg("TLE import: flush failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "failed to flush imported data: " + err.Error(),
+			"error": importFlushFailed + ": " + err.Error(),
 		})
 	}
 

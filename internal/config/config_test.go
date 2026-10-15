@@ -1374,3 +1374,26 @@ func TestLoad_RaftPreVote(t *testing.T) {
 		t.Fatal("ARC_CLUSTER_RAFT_PRE_VOTE=false ignored")
 	}
 }
+
+// A forwarded import is bounded by a 1 h backstop by default, settable, 0 =
+// no bound (#1070).
+func TestLoad_ImportForwardTimeout(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Cluster.ImportForwardTimeoutMs != 3600000 {
+		t.Fatalf("cluster.import_forward_timeout_ms default %d, want 3600000", cfg.Cluster.ImportForwardTimeoutMs)
+	}
+	t.Setenv("ARC_CLUSTER_IMPORT_FORWARD_TIMEOUT_MS", "0")
+	if cfg, err = Load(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Cluster.ImportForwardTimeoutMs != 0 {
+		t.Fatalf("ARC_CLUSTER_IMPORT_FORWARD_TIMEOUT_MS=0 gave %d", cfg.Cluster.ImportForwardTimeoutMs)
+	}
+}

@@ -52,7 +52,7 @@ var (
 	// ErrWriteForwardAmbiguous: a forwarded write was sent but no answer came
 	// back in time. The writer may have written it; a retry may duplicate
 	// rows (#1270).
-	ErrWriteForwardAmbiguous = errors.New("the forwarded write got no answer in time; it may or may not have been written")
+	ErrWriteForwardAmbiguous = errors.New("the forwarded write got no answer (timed out or the connection broke); it may or may not have been written")
 
 	// ErrLocalNodeCanHandle indicates the local node can handle this request directly.
 	ErrLocalNodeCanHandle = fmt.Errorf("local node can handle request")
@@ -108,15 +108,21 @@ type RouterConfig struct {
 	// WriteTimeout bounds one forwarded write, upload and processing
 	// included. Default 60 s: forwarded writes are never retried once sent.
 	WriteTimeout time.Duration
+
+	// ImportTimeout bounds one forwarded import, upload and processing
+	// included; 0 = no bound (#1070). A backstop far above any import's
+	// duration (cluster.import_forward_timeout_ms, default 1 h).
+	ImportTimeout time.Duration
 }
 
 // Router routes requests to appropriate nodes in the cluster.
 // The coordinator node uses this to forward writes to writers and queries to readers.
 type Router struct {
-	cfg         *RouterConfig
-	httpClient  *http.Client
-	writeClient *http.Client
-	logger      zerolog.Logger
+	cfg          *RouterConfig
+	httpClient   *http.Client
+	writeClient  *http.Client
+	importClient *http.Client
+	logger       zerolog.Logger
 
 	// Round-robin index for reader selection
 	readerIndex atomic.Uint64
@@ -170,6 +176,19 @@ func NewRouter(cfg *RouterConfig) *Router {
 			Timeout:   cfg.WriteTimeout,
 			Transport: writeTransport(transport),
 		},
+		// Not the write timeout: a local import has no server-side bound,
+		// and a 500 MB import can outlast any write timeout. A 504 while the
+		// writer is still importing would invite a re-run that duplicates
+		// rows (#1070). ImportTimeout is only a backstop: a forward is not
+		// cancelled when its client gives up (fasthttp ends a request's
+		// context only at shutdown), so without it a writer that never
+		// answers would hold this node's goroutine, connection and upload.
+		// Dial and TLS handshake stay bounded; TCP keepalive ends a
+		// connection to a writer that vanished, but only after minutes.
+		importClient: &http.Client{
+			Timeout:   cfg.ImportTimeout,
+			Transport: writeTransport(transport),
+		},
 		logger:      cfg.Logger.With().Str("component", "cluster-router").Logger(),
 		activeConns: make(map[string]*atomic.Int64),
 	}
@@ -188,6 +207,26 @@ func NewRouter(cfg *RouterConfig) *Router {
 //     Pattern 2 path; also a strict improvement in legacy mode during
 //     the failover window where GetPrimaryWriter() can return nil).
 func (r *Router) RouteWrite(ctx context.Context, req *http.Request) (*http.Response, error) {
+	writer, err := r.writeTarget()
+	if err != nil {
+		return nil, err
+	}
+	return r.ForwardWriteTo(ctx, writer, req)
+}
+
+// RouteImport is RouteWrite for an import (/api/v1/import/*): the same
+// writer, sent once, bounded by ImportTimeout instead of WriteTimeout (#1070).
+func (r *Router) RouteImport(ctx context.Context, req *http.Request) (*http.Response, error) {
+	writer, err := r.writeTarget()
+	if err != nil {
+		return nil, err
+	}
+	return r.ForwardImportTo(ctx, writer, req)
+}
+
+// writeTarget picks the writer a write from this node goes to, or
+// ErrLocalNodeCanHandle when this node ingests itself.
+func (r *Router) writeTarget() (*Node, error) {
 	// Check if local node can handle writes
 	if r.cfg.LocalNode != nil && r.cfg.LocalNode.Role.GetCapabilities().CanIngest {
 		return nil, ErrLocalNodeCanHandle
@@ -213,8 +252,7 @@ func (r *Router) RouteWrite(ctx context.Context, req *http.Request) (*http.Respo
 		}
 		writer = r.selectWriter(writers)
 	}
-
-	return r.ForwardWriteTo(ctx, writer, req)
+	return writer, nil
 }
 
 // designatedWriter is the designated primary when it is a healthy writer
@@ -249,6 +287,16 @@ func (r *Router) StandbyWriteTarget() (*Node, bool) {
 // is ErrWriteForwardUnavailable (nothing was sent); a timeout or broken
 // connection after sending is ErrWriteForwardAmbiguous.
 func (r *Router) ForwardWriteTo(ctx context.Context, node *Node, req *http.Request) (*http.Response, error) {
+	return r.forwardWriteOnce(ctx, r.writeClient, node, req)
+}
+
+// ForwardImportTo is ForwardWriteTo for an import, bounded by ImportTimeout
+// instead of WriteTimeout (#1070).
+func (r *Router) ForwardImportTo(ctx context.Context, node *Node, req *http.Request) (*http.Response, error) {
+	return r.forwardWriteOnce(ctx, r.importClient, node, req)
+}
+
+func (r *Router) forwardWriteOnce(ctx context.Context, client *http.Client, node *Node, req *http.Request) (*http.Response, error) {
 	// Whether any of the request left this node decides what a failure
 	// means, not the error's type: a dead host shows up as a timeout, a TLS
 	// failure as EOF.
@@ -256,7 +304,7 @@ func (r *Router) ForwardWriteTo(ctx context.Context, node *Node, req *http.Reque
 	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
 		WroteHeaders: func() { sent.Store(true) },
 	})
-	resp, err := r.doForwardOnce(ctx, r.writeClient, node, req)
+	resp, err := r.doForwardOnce(ctx, client, node, req)
 	switch {
 	case err == nil:
 		switch {
@@ -498,39 +546,22 @@ func (r *Router) doForward(ctx context.Context, client *http.Client, node *Node,
 		RawQuery: originalReq.URL.RawQuery,
 	}).String()
 
-	// Use GetBody when available so large payloads can be streamed from a
-	// replayable source on each attempt without an additional full-body copy.
-	// Requests without a replayable body keep the buffering fallback needed
-	// for retries.
+	// Read and buffer the body so it can be retried
 	var bodyBytes []byte
-	var body io.Reader
 	if originalReq.Body != nil {
-		if originalReq.GetBody != nil {
-			var err error
-			body, err = originalReq.GetBody()
-			if err != nil {
-				return nil, fmt.Errorf("failed to recreate request body: %w", err)
-			}
-		} else {
-			var err error
-			bodyBytes, err = io.ReadAll(originalReq.Body)
-			if err != nil {
-				return nil, fmt.Errorf("failed to read request body: %w", err)
-			}
-			// Reset the original request body for potential retries.
-			originalReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-			body = bytes.NewReader(bodyBytes)
+		var err error
+		bodyBytes, err = io.ReadAll(originalReq.Body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read request body: %w", err)
 		}
+		// Reset the original request body for potential retries
+		originalReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}
 
 	// Create forwarded request
-	forwardReq, err := http.NewRequestWithContext(ctx, originalReq.Method, targetURL, body)
+	forwardReq, err := http.NewRequestWithContext(ctx, originalReq.Method, targetURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create forward request: %w", err)
-	}
-	if originalReq.Body != nil && originalReq.GetBody != nil {
-		forwardReq.ContentLength = originalReq.ContentLength
-		forwardReq.GetBody = originalReq.GetBody
 	}
 
 	// Copy headers
