@@ -599,6 +599,9 @@ func TestClaimantAbsentBatches(t *testing.T) {
 		Keys: map[string]originstream.KeyFloor{clKey: {Settled: [][2]uint64{{3, 3}}}}}); err != nil {
 		t.Fatal(err)
 	}
+	if err := r.store.Sync(); err != nil { // floors apply once durable
+		t.Fatal(err)
+	}
 	propose(t, r.c, raft.CommandTakeOverStreamV2, raft.TakeOverStreamV2Payload{Origin: clOrigin, By: "writer-1", Now: time.Now(),
 		Claims: []raft.ClaimSet{{Instance: clInst, Keys: map[string]raft.Intervals{clKey: {{1, 3}}}}}})
 	r.cl.pass(ctx)

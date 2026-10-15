@@ -22,6 +22,9 @@ func TestCappedClearsAfterTrim(t *testing.T) {
 	if err := s.AcceptFloors("p", &Floors{Instance: 1, AppliedIndex: 9, Keys: map[string]KeyFloor{"db/a": {Floor: 4}}}); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.Sync(); err != nil { // floors apply once durable
+		t.Fatal(err)
+	}
 	if _, err := s.Trim(context.Background(), allReady); err != nil {
 		t.Fatal(err)
 	}

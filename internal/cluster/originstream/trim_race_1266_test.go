@@ -19,6 +19,9 @@ func TestTrimKeepsBatchesAppendedDuringReadiness(t *testing.T) {
 	if err := s.AcceptFloors("p", &Floors{Instance: 1, AppliedIndex: 9, Keys: map[string]KeyFloor{"db/a": {Floor: 2}}}); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.Sync(); err != nil { // floors apply once durable
+		t.Fatal(err)
+	}
 	if _, err := s.Trim(context.Background(), func(ctx context.Context, reqs []TrimRequest) []bool {
 		// The primary streams batch 3 while readiness runs.
 		if err := s.Append("p", ent(1, "db/a", 3)); err != nil {
