@@ -137,3 +137,29 @@ func TestClusterFSM_Restore_DroppedFilesWithNoCallbackAreJustDropped(t *testing.
 		t.Error("file dropped by snapshot is still in the manifest")
 	}
 }
+
+func TestClusterFSM_Restore_NotifiesAfterSnapshotInstall(t *testing.T) {
+	fsm := NewClusterFSM(zerolog.Nop())
+	startupFile := makeFileEntry("db/cpu/2026/04/11/14/startup.parquet", "db", "cpu", 1024)
+	installedFile := makeFileEntry("db/cpu/2026/04/11/14/installed.parquet", "db", "cpu", 1024)
+
+	// Node registers the callback before startup, but suppresses the known local
+	// snapshot restore so only a later peer-installed snapshot triggers it.
+	called := 0
+	fsm.SetSnapshotRestoredCallback(func() {
+		called++
+		if _, exists := fsm.GetFile(installedFile.Path); !exists {
+			t.Error("snapshot callback ran before the restored manifest became visible")
+		}
+	})
+	fsm.SuppressNextSnapshotRestoredCallback()
+	restoreFrom(t, fsm, FSMSnapshot{Files: map[string]*FileEntry{startupFile.Path: &startupFile}})
+	if called != 0 {
+		t.Fatal("local startup snapshot should not trigger the callback")
+	}
+
+	restoreFrom(t, fsm, FSMSnapshot{Files: map[string]*FileEntry{installedFile.Path: &installedFile}})
+	if called != 1 {
+		t.Fatalf("snapshot callback calls = %d, want 1", called)
+	}
+}

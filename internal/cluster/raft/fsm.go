@@ -776,15 +776,17 @@ type ClusterFSM struct {
 	pendingEvents         []func()
 
 	// Callbacks for state changes
-	onNodeAdded          func(*NodeInfo)
-	onNodeRemoved        func(string)
-	onNodeUpdated        func(*NodeInfo)
-	onWriterPromoted     func(newPrimaryID, oldPrimaryID string)
-	onWriterDemoted      func(nodeID string)
-	onCompactorAssigned  func(newCompactorID, oldCompactorID string)
-	onFileRegistered     func(*FileEntry)
-	onFileContentChanged func(*FileEntry)
-	onFileDeleted        func(path string, reason string)
+	onNodeAdded                          func(*NodeInfo)
+	onNodeRemoved                        func(string)
+	onNodeUpdated                        func(*NodeInfo)
+	onWriterPromoted                     func(newPrimaryID, oldPrimaryID string)
+	onWriterDemoted                      func(nodeID string)
+	onCompactorAssigned                  func(newCompactorID, oldCompactorID string)
+	onFileRegistered                     func(*FileEntry)
+	onFileContentChanged                 func(*FileEntry)
+	onFileDeleted                        func(path string, reason string)
+	onSnapshotRestored                   func()
+	suppressNextSnapshotRestoredCallback bool
 	// Auth-state callbacks: invoked from every node's apply path so the
 	// node's local AuthManager can materialise the change into its
 	// SQLite cache (and invalidate the in-memory verify-token cache).
@@ -1019,6 +1021,29 @@ func (f *ClusterFSM) SetFileCallbacks(onRegistered func(*FileEntry), onDeleted f
 	defer f.mu.Unlock()
 	f.onFileRegistered = onRegistered
 	f.onFileDeleted = onDeleted
+}
+
+// SetSnapshotRestoredCallback sets a non-blocking notification for every
+// snapshot restore except the local startup snapshot, which Node suppresses.
+func (f *ClusterFSM) SetSnapshotRestoredCallback(callback func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onSnapshotRestored = callback
+}
+
+// SuppressNextSnapshotRestoredCallback suppresses the notification for the
+// next Restore call. Node uses this when a local snapshot exists before
+// raft.NewRaft synchronously restores it during startup.
+func (f *ClusterFSM) SuppressNextSnapshotRestoredCallback() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.suppressNextSnapshotRestoredCallback = true
+}
+
+func (f *ClusterFSM) clearSnapshotRestoreCallbackSuppression() {
+	f.mu.Lock()
+	f.suppressNextSnapshotRestoredCallback = false
+	f.mu.Unlock()
 }
 
 // SetFileContentChangedCallback registers the callback used when a file's
@@ -3220,6 +3245,11 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	onNodeAdded := f.onNodeAdded
 	onNodeRemoved := f.onNodeRemoved
 	onFileDeleted := f.onFileDeleted
+	onSnapshotRestored := f.onSnapshotRestored
+	if f.suppressNextSnapshotRestoredCallback {
+		f.suppressNextSnapshotRestoredCallback = false
+		onSnapshotRestored = nil
+	}
 	f.mu.Unlock()
 
 	f.logger.Info().
@@ -3272,6 +3302,9 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	}
 	if pauseChanged && onCompactionPauseChanged != nil {
 		onCompactionPauseChanged(restoredPause.Active, restoredPause.Generation)
+	}
+	if onSnapshotRestored != nil {
+		onSnapshotRestored()
 	}
 
 	// Last, after the restored state is in place: a reader that sees the
