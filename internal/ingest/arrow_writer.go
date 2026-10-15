@@ -5352,6 +5352,28 @@ func (b *ArrowBuffer) generateStoragePath(database, measurement string, partitio
 // FlushAll flushes all buffered data to storage
 func (b *ArrowBuffer) FlushAll(ctx context.Context) error {
 	b.logger.Info().Msg("Flushing all buffers...")
+	err := b.flushMatching(ctx, nil)
+	b.logger.Info().Msg("All buffers flushed")
+	return err
+}
+
+// FlushScope is FlushAll for the buffers of one database: what they hold is
+// flushed now, as FlushAll does. It does not wait for flushes already
+// queued. A bulk import calls it when its rows are not flushing fast enough
+// on their own (#1070 follow-up).
+func (b *ArrowBuffer) FlushScope(ctx context.Context, database string) error {
+	return b.flushMatching(ctx, func(key string) bool { return keyInScope(key, database, "") })
+}
+
+// IsDecimalColumn reports whether a column of a measurement is configured
+// as decimal (ingest.decimal_columns): its values are converted to decimal
+// whatever their type.
+func (b *ArrowBuffer) IsDecimalColumn(measurement, column string) bool {
+	_, ok := b.getDecimalColumns(measurement)[column]
+	return ok
+}
+
+func (b *ArrowBuffer) flushMatching(ctx context.Context, match func(key string) bool) error {
 
 	var lastErr error
 
@@ -5364,7 +5386,9 @@ func (b *ArrowBuffer) FlushAll(ctx context.Context) error {
 		// Copy keys to avoid modifying map while iterating
 		keys := make([]string, 0, len(shard.buffers))
 		for key := range shard.buffers {
-			keys = append(keys, key)
+			if match == nil || match(key) {
+				keys = append(keys, key)
+			}
 		}
 
 		for _, key := range keys {
@@ -5396,8 +5420,6 @@ func (b *ArrowBuffer) FlushAll(ctx context.Context) error {
 
 		shard.mu.Unlock()
 	}
-
-	b.logger.Info().Msg("All buffers flushed")
 	return lastErr
 }
 
