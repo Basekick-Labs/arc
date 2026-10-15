@@ -3920,6 +3920,14 @@ an unbounded operation.
 
 ## Bug fixes
 
+### ArcX Arrow IPC honours the governance row cap ([#727](https://github.com/Basekick-Labs/arc/issues/727))
+
+ArcX-served Arrow IPC responses now enforce `MaxRows` and declare trailers for
+truncation, execution time and capped rows, consistent with the DuckDB path.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in
+[#1294](https://github.com/Basekick-Labs/arc/pull/1294).
+
 ### Fix: a plain-path `iceberg.warehouse` inside the storage root is recognised ([#1616](https://github.com/Basekick-Labs/arc/issues/1616))
 
 On local storage, `iceberg.warehouse` set to a plain path (for example
