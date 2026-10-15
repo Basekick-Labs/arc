@@ -262,3 +262,28 @@ func TestFreshUnregisteredOfUnknownAge(t *testing.T) {
 		t.Fatal("an object of unknown age read as fresh")
 	}
 }
+
+// Outside shared storage only this node writes: a database deletion does
+// not wait on a fresh unregistered object.
+func TestDatabaseDeleteOutsideSharedStorageDoesNotWait(t *testing.T) {
+	c, _, root := peerFlushCluster(t, casA)
+	c.inactive = true
+	h := newDatabasesTestHandler(t, root)
+	h.SetCoordinator(c, true)
+	writeRecordsParquet(t, c.db, root, casB)
+	if code, body := sendDatabaseDelete(t, h, "db", ""); code != 200 {
+		t.Fatalf("%d %s", code, body)
+	}
+}
+
+// A compaction's staged output is not another writer's flush.
+func TestDatabaseDeleteDoesNotWaitOnACompactionOutput(t *testing.T) {
+	c, _, root := peerFlushCluster(t, casA)
+	h := newDatabasesTestHandler(t, root)
+	h.SetCoordinator(c, true)
+	writeRecordsParquet(t, c.db, root, casO)
+	c.owned[casO] = true
+	if code, body := sendDatabaseDelete(t, h, "db", ""); code != 200 {
+		t.Fatalf("%d %s", code, body)
+	}
+}
