@@ -1281,13 +1281,13 @@ func (c *Coordinator) logKeptRelistedPath(item deleteRequest, refresh filereplic
 			Str("path", item.path).
 			Str("reason", item.reason).
 			Int64("total_warned", n).
-			Msg("Local delete skipped: the manifest lists the path again, but the file puller queue is full; the local copy may be the previous version until the path's next arrival or the periodic reconciliation (#1182)")
+			Msg("Local delete skipped: the manifest lists the path again, but the file puller queue is full; the local copy may be the previous version until the path's next arrival or the next manifest walk, which finds it stale (#1182)")
 	default:
 		c.logger.Warn().
 			Str("path", item.path).
 			Str("reason", item.reason).
 			Int64("total_warned", n).
-			Msg("Local delete skipped: the manifest lists the path again, but the file puller is stopped; the local copy is kept and may be the previous version (#1182)")
+			Msg("Local delete skipped: the manifest lists the path again, but the file puller is stopped; the local copy is kept and may be the previous version until the next start's walk finds it stale (#1182)")
 	}
 }
 
@@ -2995,6 +2995,16 @@ func (c *Coordinator) Status() map[string]interface{} {
 	}
 	if puller != nil {
 		status["replication_catchup_status"] = puller.CatchUpStatus()
+		// How the walks judge a same-size local copy (#1182): by what this
+		// node recorded it holds, or by its size alone when that record is
+		// not kept (tracking failed or not open yet).
+		if c.staleLocalEnabled() {
+			trust := "size_only"
+			if seen := c.stale.seen.Load(); seen != nil && seen.err() == nil {
+				trust = "recorded"
+			}
+			status["local_copy_trust"] = trust
+		}
 	}
 
 	// The compactor lease, and specifically whether it sits on a node that
@@ -4302,15 +4312,17 @@ func (c *Coordinator) startFilePullerLocked() error {
 		RecordPulledFile:    c.recordPulledFileInTiering,
 		RecordAbandonedFile: c.recordAbandonedFileInTiering,
 		ObserveListed:       c.observeListed,
-		Logger:              c.logger,
+		// What each local copy holds (#1182): recorded after a pull or a
+		// hash, so a restart never trusts a stale same-size copy.
+		LocalStamp:    c.localStampFor,
+		RecordContent: c.recordLocalContent,
+		Logger:        c.logger,
 	}
 
 	puller, err := filereplication.New(pullerCfg)
 	if err != nil {
 		return fmt.Errorf("construct puller: %w", err)
 	}
-	verify := func(e *raft.FileEntry) { puller.EnqueueVerifyContent(e) }
-	c.stale.verifyContent.Store(&verify)
 
 	// Wire the FSM callback. applyRegisterFile fires onFileRegistered for
 	// every Raft commit — including entries from other applyRegisterFile
@@ -4539,6 +4551,9 @@ func (c *Coordinator) runCatchUpOnce() {
 		// stable for the lifetime of the node — hashicorp/raft never
 		// replaces the FSM instance once set. The nil guard above ensures
 		// the capture is safe even if the puller outlives the coordinator.
+		// The walk judges each local copy by the journal of what it holds
+		// (#1182): never walk before it is open.
+		c.waitStaleLocalOpen(ctx)
 		puller.RunCatchUp(ctx, func(cursor string, limit int) ([]*raft.FileEntry, string, error) {
 			return fsm.GetFilesPaginated(cursor, limit)
 		})

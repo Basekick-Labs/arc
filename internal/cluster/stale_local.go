@@ -7,11 +7,13 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/cluster/filereplication"
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -66,9 +68,19 @@ type staleLocalState struct {
 	// ready is set once main has wired it (or said there is none).
 	pending atomic.Pointer[func(string) bool]
 	ready   atomic.Bool
-	// verifyContent asks the puller to re-check a listed copy's content.
-	verifyContent atomic.Pointer[func(*raft.FileEntry)]
-	wg            sync.WaitGroup
+	// opened is closed once the sweep goroutine has opened the journal or
+	// failed to: the startup walk waits for it, so it never runs without the
+	// evidence it judges local copies by (#1182).
+	opened chan struct{}
+	wg     sync.WaitGroup
+
+	// written is the evidence a producer on this node reports for a file it
+	// just wrote and is about to register (a flush, a compaction output):
+	// the file's identity and checksum, taken when the path's record is
+	// created after the manifest lists it (#1182). Never a record before
+	// then: a record is what the sweep removes by.
+	writtenMu sync.Mutex
+	written   map[string]writtenEvidence
 
 	holdMu    sync.Mutex
 	holdCond  *sync.Cond
@@ -82,6 +94,20 @@ type staleLocalState struct {
 	status        *StaleLocalStatus
 }
 
+type writtenEvidence struct {
+	rec seenRecord
+	at  time.Time
+}
+
+// staleLocalWrittenMax bounds the producer evidence waiting for its path to be
+// listed; past it a new file is hashed once instead. Evidence older than
+// staleLocalWrittenTTL (a registration that never applied) is dropped by the
+// pass.
+const (
+	staleLocalWrittenMax = 1 << 16
+	staleLocalWrittenTTL = time.Hour
+)
+
 // StaleLocalStatus is the last pass, for the cluster status.
 type StaleLocalStatus struct {
 	LastRun  *time.Time `json:"last_run,omitempty"`
@@ -89,7 +115,10 @@ type StaleLocalStatus struct {
 	Unlinked int        `json:"unlinked"`
 	Waiting  int        `json:"waiting"`
 	Blocked  bool       `json:"blocked,omitempty"`
-	Error    string     `json:"error,omitempty"`
+	// RemovalsOff: cluster.stale_local_sweep=false; copies are still tracked
+	// for what they hold (#1182), none is removed.
+	RemovalsOff bool   `json:"removals_off,omitempty"`
+	Error       string `json:"error,omitempty"`
 }
 
 // StaleLocalStatus reports the sweep's last pass (nil when it does not run).
@@ -127,6 +156,19 @@ func (c *Coordinator) SetStaleLocalPending(fn func(path string) bool) {
 		c.stale.pending.Store(&fn)
 	}
 	c.stale.ready.Store(true)
+}
+
+// AttachStaleLocalOutbox wires this node's registration outbox (nil when it
+// registers nothing) into the sweep and lets it start: a path waiting in the
+// outbox is never a stale copy, and each file the outbox flushes is reported
+// for what it holds, so a restart never has to hash it to trust it (#1182).
+func (c *Coordinator) AttachStaleLocalOutbox(o *RegistrationOutbox) {
+	if o == nil {
+		c.SetStaleLocalPending(nil)
+		return
+	}
+	o.SetLocalWritten(c.NoteLocalWritten)
+	c.SetStaleLocalPending(o.HoldsRegistration)
 }
 
 // HoldLocalPaths keeps the sweep away from paths about to be registered by a
@@ -188,9 +230,11 @@ func (s *staleLocalState) endUnlink(path string) {
 }
 
 // staleLocalEnabled: local storage with replication, where the delete workers
-// own local unlinks, and somewhere to keep the journal.
+// own local unlinks, and somewhere to keep the journal. The journal also
+// carries what each local copy holds (#1182), so it is kept with
+// cluster.stale_local_sweep off too; the setting stops only the removals.
 func (c *Coordinator) staleLocalEnabled() bool {
-	return c.cfg.StaleLocalSweep && c.cfg.ReplicationEnabled && c.cfg.ReplicationCatchUpEnabled &&
+	return c.cfg.ReplicationEnabled && c.cfg.ReplicationCatchUpEnabled &&
 		c.cfg.RaftDataDir != "" && c.storage != nil && c.storage.Type() == "local"
 }
 
@@ -209,6 +253,7 @@ func (c *Coordinator) startStaleLocalLocked() {
 	s.base = bp.GetBasePath()
 	s.feed = make(chan string, staleLocalFeedQueue)
 	s.firstUnlisted = map[string]time.Time{}
+	s.opened = make(chan struct{})
 	s.every, s.confirm = staleLocalEvery, staleLocalConfirm
 	// A rig knob, as ARC_TEST_FINISHER_DELAY: passes this often, confirmed
 	// after two of them.
@@ -237,11 +282,13 @@ func (c *Coordinator) staleLocalRun(ctx context.Context) {
 	c.removeStaleAsides()
 	seen, err := openSeenLocal(c.cfg.RaftDataDir, c.cfg.ClusterName)
 	if err != nil {
-		c.logger.Error().Err(err).Msg("Stale local copy tracking not started; copies whose delete this node misses stay on disk")
+		s.markOpened()
+		c.logger.Error().Err(err).Msg("Stale local copy tracking not started; copies whose delete this node misses stay on disk, and a local copy is trusted by its size alone")
 		c.setStaleStatus(StaleLocalStatus{Error: "tracking not started: " + err.Error()})
 		return
 	}
 	s.seen.Store(seen)
+	s.markOpened()
 	t := time.NewTicker(s.every)
 	defer t.Stop()
 	syncT := time.NewTicker(time.Second)
@@ -254,7 +301,7 @@ func (c *Coordinator) staleLocalRun(ctx context.Context) {
 			seen.sync()
 		case p := <-s.feed:
 			if e, ok := c.raftNode.FSM().GetFile(p); ok {
-				c.observeLocal(e, true)
+				c.observeLocal(e)
 			}
 		case <-t.C:
 			c.staleLocalPass(ctx)
@@ -282,55 +329,176 @@ func (c *Coordinator) forgetLocal(path string) {
 	}
 }
 
-// observeListed is the replication walks' hook: it records copies present
-// here, and has a copy this node recorded under an earlier registration of
-// the path with another checksum re-checked, since its content may be the old
-// one (a snapshot install fires no callback for a path registered again while
-// the node was away). A new index with the same checksum (a tier update) only
-// moves the record.
-func (c *Coordinator) observeListed(e *raft.FileEntry) {
-	seen := c.stale.seen.Load()
-	if seen == nil || !sweepablePath(e.Path) {
+func (s *staleLocalState) markOpened() {
+	if s.opened != nil {
+		close(s.opened)
+	}
+}
+
+// waitStaleLocalOpen blocks until the journal is open or failed to open (no
+// timer: it is a local file read, and the startup walk it holds already waits
+// for a leader and a barrier). Returns at once where tracking does not run.
+func (c *Coordinator) waitStaleLocalOpen(ctx context.Context) {
+	if c.stale.opened == nil {
 		return
 	}
-	if r, ok := seen.get(e.Path); ok && r.lsn != e.LSN {
-		cur, ok := localIdentity(c.stalePath(e.Path))
-		if ok && cur.size == r.size && cur.mtime == r.mtime && cur.ino == r.ino {
-			sha := shaPrefix(e.SHA256)
-			if sha != r.sha {
-				if fn := c.stale.verifyContent.Load(); fn != nil {
-					(*fn)(e)
-				}
-			}
-			if cur.size == e.SizeBytes {
-				cur.lsn, cur.sha = e.LSN, sha
-				seen.add(e.Path, cur)
-			}
-			return
-		}
+	select {
+	case <-c.stale.opened:
+	case <-ctx.Done():
 	}
-	c.observeLocal(e, false)
+}
+
+// observeListed is the replication walks' hook: it records copies present
+// here and says whether this node knows the copy holds the listed checksum
+// (#1182). A copy it never saw pulled, written or hashed is unverified; one
+// whose file is unchanged since it was known to hold another checksum is
+// stale: the content-change callback that would have refreshed it was lost to
+// a restart, a shutdown drain, or a snapshot install that fires none. With no
+// tracking (not running, or failed) the size alone decides, as before.
+func (c *Coordinator) observeListed(e *raft.FileEntry) filereplication.ListedVerdict {
+	seen := c.stale.seen.Load()
+	if seen == nil || seen.err() != nil || !sweepablePath(e.Path) || !journalablePath(e.Path) {
+		return filereplication.ListedTrusted
+	}
+	r, present := c.observeLocal(e)
+	if !present || e.SHA256 == "" || seen.err() != nil {
+		return filereplication.ListedTrusted
+	}
+	switch r.sha {
+	case shaPrefix(e.SHA256):
+		return filereplication.ListedTrusted
+	case 0:
+		return filereplication.ListedUnverified
+	default:
+		return filereplication.ListedStale
+	}
 }
 
 // observeLocal records entry's local copy if it is there at the manifest
-// size. Without force, a record already at the entry's index and size is
-// trusted (the walk: no stat per file per pass).
-func (c *Coordinator) observeLocal(e *raft.FileEntry, force bool) {
+// size, and returns the record. An unchanged file keeps the checksum it was
+// known to hold: a registration of new content at the path says nothing
+// about the bytes here (#1182). A new file takes a producer's evidence for
+// it, else is unknown until a pull or a hash says.
+func (c *Coordinator) observeLocal(e *raft.FileEntry) (seenRecord, bool) {
 	seen := c.stale.seen.Load()
 	if seen == nil || !sweepablePath(e.Path) {
+		return seenRecord{}, false
+	}
+	cur, ok := localIdentity(c.stalePath(e.Path))
+	if !ok || cur.size != e.SizeBytes {
+		return seenRecord{}, false
+	}
+	wsha, wok := c.takeWritten(e.Path, cur)
+	var out seenRecord
+	seen.update(e.Path, func(old seenRecord, had bool) (seenRecord, bool) {
+		r := cur
+		r.lsn = e.LSN
+		switch {
+		case had && sameFile(old, cur):
+			r.sha = old.sha
+			r.lsn = max(old.lsn, e.LSN)
+		case wok:
+			r.sha = wsha
+		}
+		out = r
+		return r, true
+	})
+	return out, true
+}
+
+// NoteLocalWritten is a producer's evidence (#1182): this node just wrote
+// path with checksum sha and is about to register it. Taken when the path's
+// record is created, if the file is still that one; without it the file is
+// hashed once. Never blocks for long; a no-op where tracking does not run.
+func (c *Coordinator) NoteLocalWritten(path, sha string) {
+	s := &c.stale
+	if s.feed == nil || !sweepablePath(path) {
 		return
 	}
-	if !force {
-		if r, ok := seen.get(e.Path); ok && r.lsn == e.LSN && r.size == e.SizeBytes {
-			return
+	cur, ok := localIdentity(c.stalePath(path))
+	if !ok {
+		return
+	}
+	cur.sha = shaPrefix(sha)
+	s.writtenMu.Lock()
+	defer s.writtenMu.Unlock()
+	if s.written == nil {
+		s.written = map[string]writtenEvidence{}
+	}
+	if _, ok := s.written[path]; !ok && len(s.written) >= staleLocalWrittenMax {
+		return
+	}
+	s.written[path] = writtenEvidence{rec: cur, at: time.Now()}
+}
+
+// takeWritten consumes the producer evidence for path if it describes cur.
+func (c *Coordinator) takeWritten(path string, cur seenRecord) (uint64, bool) {
+	s := &c.stale
+	s.writtenMu.Lock()
+	defer s.writtenMu.Unlock()
+	ev, ok := s.written[path]
+	if !ok {
+		return 0, false
+	}
+	delete(s.written, path)
+	if !sameFile(ev.rec, cur) {
+		return 0, false
+	}
+	return ev.rec.sha, true
+}
+
+// expireWritten drops evidence whose registration never applied.
+func (c *Coordinator) expireWritten(now time.Time) {
+	s := &c.stale
+	s.writtenMu.Lock()
+	defer s.writtenMu.Unlock()
+	for p, ev := range s.written {
+		if now.Sub(ev.at) > staleLocalWrittenTTL {
+			delete(s.written, p)
 		}
 	}
-	r, ok := localIdentity(c.stalePath(e.Path))
-	if !ok || r.size != e.SizeBytes {
+}
+
+// localStampFor is the puller's LocalStamp hook.
+func (c *Coordinator) localStampFor(path string) (string, bool) {
+	if c.stale.base == "" || !sweepablePath(path) {
+		return "", false
+	}
+	r, ok := localIdentity(c.stalePath(path))
+	if !ok {
+		return "", false
+	}
+	return stampOf(r), true
+}
+
+func stampOf(r seenRecord) string {
+	return strconv.FormatInt(r.size, 10) + ":" + strconv.FormatInt(r.mtime, 10) + ":" + strconv.FormatUint(r.ino, 10)
+}
+
+// recordLocalContent is the puller's RecordContent hook, and what a staged
+// compaction output moved into place reports: the local file at e.Path holds
+// sha (#1182). stamp, when set, is the file that was hashed; a file replaced
+// since is left to the next walk. Only for a path the manifest lists.
+func (c *Coordinator) recordLocalContent(e *raft.FileEntry, stamp, sha string) {
+	seen := c.stale.seen.Load()
+	if seen == nil || e == nil || !sweepablePath(e.Path) {
 		return
 	}
-	r.lsn, r.sha = e.LSN, shaPrefix(e.SHA256)
-	seen.add(e.Path, r)
+	cur, ok := localIdentity(c.stalePath(e.Path))
+	if !ok || cur.size != e.SizeBytes || (stamp != "" && stamp != stampOf(cur)) {
+		return
+	}
+	if fsm := c.raftNode.FSM(); fsm == nil || !fsm.HasFile(e.Path) {
+		return
+	}
+	seen.update(e.Path, func(old seenRecord, had bool) (seenRecord, bool) {
+		r := cur
+		r.lsn, r.sha = e.LSN, shaPrefix(sha)
+		if had && sameFile(old, cur) {
+			r.lsn = max(old.lsn, e.LSN) // a long hash must not move the index back
+		}
+		return r, true
+	})
 }
 
 func (c *Coordinator) stalePath(path string) string {
@@ -374,6 +542,19 @@ func (c *Coordinator) staleLocalPass(ctx context.Context) {
 	}
 	if err := seen.err(); err != nil {
 		skip("tracking stopped: " + err.Error())
+		return
+	}
+	c.expireWritten(now)
+	if !c.cfg.StaleLocalSweep {
+		// Removals off: still drop the records of files gone from the disk,
+		// which the candidate scan below would have done.
+		clear(s.firstUnlisted)
+		for p := range seen.unlisted(c.raftNode.FSM().HasFile) {
+			if _, ok := localIdentity(c.stalePath(p)); !ok {
+				seen.remove(p)
+			}
+		}
+		st.RemovalsOff = true
 		return
 	}
 	if !s.ready.Load() {

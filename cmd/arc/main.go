@@ -2410,11 +2410,8 @@ func main() {
 						// The stale-local sweep (#1071) may run from here: a
 						// path waiting to register in this writer's outbox is
 						// never a stale copy. Nil elsewhere: nothing waits.
-						if registrationOutbox != nil {
-							clusterCoordinator.SetStaleLocalPending(registrationOutbox.HoldsRegistration)
-						} else {
-							clusterCoordinator.SetStaleLocalPending(nil)
-						}
+						// It also reports what each flushed file holds (#1182).
+						clusterCoordinator.AttachStaleLocalOutbox(registrationOutbox)
 
 						// Phase 5: wire the dynamic compaction gate to the coordinator
 						// so CanCompact() checks the FSM's active compactor lease

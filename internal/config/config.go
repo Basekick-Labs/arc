@@ -872,6 +872,8 @@ type ClusterConfig struct {
 	// the cluster manifest no longer lists it, when the delete that should
 	// have removed it was missed: the node was down, or crashed with the
 	// unlink queued (#1071). Local storage with replication only. Default on.
+	// Off stops the removals only: the tracking behind them also records what
+	// each local copy holds, which the manifest walks judge copies by (#1182).
 	StaleLocalSweep bool
 	// StaleLocalSweepMaxFraction stops a sweep pass that would remove more
 	// than this fraction of the files the node tracks (and at least 1000):
