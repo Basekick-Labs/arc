@@ -1271,6 +1271,41 @@ that window could not have published those rows.
   `increase(arc_standby_store_dropped_total[5m]) > 0`: it counts batches a
   takeover could not publish.
 
+### A standby writer keeps up with the primary's stream at a million rows a second ([#1287](https://github.com/Basekick-Labs/arc/issues/1287))
+
+With stream takeover on, a primary acknowledges a write before any standby has
+it and sends every batch to each standby through an in-memory queue
+(`cluster.origin_stream_queue_bytes`, 64 MiB). A standby that does not read in
+time misses batches: they are gaps in its copy, and until their files are
+registered they exist only on the primary, so a primary lost with its volume in
+that window takes acknowledged rows with it.
+
+A standby flushed its copy to disk every 100 ms while holding the lock the
+receiving session appends under. On a QA cluster at 1.15-1.2M rows/s that lock
+was held for 22-30 % of the time, up to 430 ms at once, the 64 MiB queue (about
+1.8 s of stream) overflowed, and the primary dropped 1,200-18,662 batches per
+standby in two minutes (about 6.6 % in one run).
+
+- The standby store now does its disk work without that lock: fsyncs, the
+  fsync of a full segment, new directory entries, the primary's floors, and
+  removing trimmed or evicted files (renamed away under the lock, deleted
+  after it; a restart deletes any left).
+- The floors apply once their file is durable, so trimming never runs ahead of
+  what a restart reads back.
+- An fsync that fails starts a new segment for the next batches: the failed
+  one's unsynced pages may be gone, and a second fsync would not say so.
+- Same QA cluster: 0 batches dropped by the primary and 0 gaps at 1.24M rows/s.
+  A primary killed at that rate and held down: 90,701,000 rows stored of
+  90,701,000 acknowledged in one run, 107,616,000 of 107,618,000 in another.
+  The 2 batches were acknowledged but neither streamed nor written to the WAL
+  when the process was killed: both happen after the acknowledgement, so the
+  newest few milliseconds of writes are on no standby and on no disk when a
+  primary dies without warning.
+
+Alert on `increase(arc_origin_stream_dropped_total[5m]) > 0` on the primary
+and `increase(arc_standby_stream_gaps_total[5m]) > 0` on standbys: either means
+acknowledged rows were, for a while, on the primary only.
+
 ### Writes sent to any writer reach the primary, and a forwarded write is never sent twice ([#1270](https://github.com/Basekick-Labs/arc/issues/1270))
 
 With stream takeover on, a standby writer refuses writes (503), and the

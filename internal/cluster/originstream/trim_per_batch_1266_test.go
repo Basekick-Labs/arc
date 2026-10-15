@@ -23,6 +23,9 @@ func TestTrimAsksPerSegmentAndKey(t *testing.T) {
 	if err := s.AcceptFloors("p", f); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.Sync(); err != nil { // floors apply once durable
+		t.Fatal(err)
+	}
 	var asked []TrimRequest
 	ready := func(_ context.Context, reqs []TrimRequest) []bool {
 		asked = reqs
@@ -67,6 +70,9 @@ func TestTrimBlockedKeysPerOriginAndKey(t *testing.T) {
 		if err := s.AcceptFloors("p", &Floors{Instance: inst, AppliedIndex: 9, Keys: map[string]KeyFloor{"db/a": {Floor: 1}}}); err != nil {
 			t.Fatal(err)
 		}
+		if err := s.Sync(); err != nil { // floors apply once durable
+			t.Fatal(err)
+		}
 	}
 	if _, err := s.Trim(context.Background(), noneReady); err != nil {
 		t.Fatal(err)
@@ -86,6 +92,9 @@ func TestTrimMalformedAnswerTrimsNothing(t *testing.T) {
 		}
 	}
 	if err := s.AcceptFloors("p", &Floors{Instance: 7, AppliedIndex: 9, Keys: map[string]KeyFloor{"db/a": {Floor: 2}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Sync(); err != nil { // floors apply once durable
 		t.Fatal(err)
 	}
 	if _, err := s.Trim(context.Background(), func(context.Context, []TrimRequest) []bool { return []bool{true} }); err != nil {
@@ -110,6 +119,9 @@ func TestTrimUnsortedSettledFloors(t *testing.T) {
 		}
 		f := &Floors{Instance: 7, AppliedIndex: 9, Keys: map[string]KeyFloor{"db/a": {Settled: [][2]uint64{{3, 4}, {1, 2}}}}}
 		if err := s.AcceptFloors("p", f); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Sync(); err != nil { // floors apply once durable
 			t.Fatal(err)
 		}
 		if reopen {

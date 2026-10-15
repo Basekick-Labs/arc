@@ -41,6 +41,9 @@ func TestReceived(t *testing.T) {
 		"db/cpu": {Floor: 1, Settled: [][2]uint64{{4, 4}}}}}); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.Sync(); err != nil { // floors apply once durable
+		t.Fatal(err)
+	}
 	if got := fmt.Sprint(s.Received("o", 7)); got != "map[db/cpu:[[2 2] [5 5]] db/mem:[[1 1]]]" {
 		t.Fatalf("after floors: %s", got)
 	}
@@ -226,6 +229,9 @@ func TestDropInstanceDuringTrim(t *testing.T) {
 	s := openTestStore(t, t.TempDir(), 0)
 	mustAppend(t, s, "o", ent(7, "k", 1), ent(8, "k", 1))
 	if err := s.AcceptFloors("o", &Floors{Instance: 7, Keys: map[string]KeyFloor{"k": {Floor: 1}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Sync(); err != nil { // floors apply once durable
 		t.Fatal(err)
 	}
 	ready := func(ctx context.Context, keys []TrimRequest) []bool {

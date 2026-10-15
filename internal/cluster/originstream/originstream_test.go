@@ -177,6 +177,9 @@ func TestStoreCapStopsAndResumes(t *testing.T) {
 	if err := s.AcceptFloors("p", &Floors{Instance: 1, AppliedIndex: 1, Keys: map[string]KeyFloor{"db/a": {Floor: 20}}}); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.Sync(); err != nil { // floors apply once durable
+		t.Fatal(err)
+	}
 	if _, err := s.Trim(context.Background(), allReady); err != nil {
 		t.Fatal(err)
 	}
@@ -207,6 +210,9 @@ func TestStoreTrimNeedsFloorsAndLocalFiles(t *testing.T) {
 	if err := s.AcceptFloors("p", f); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.Sync(); err != nil { // floors apply once durable
+		t.Fatal(err)
+	}
 	if _, _ = s.Trim(context.Background(), noneReady); s.Stats().Segments != 6 {
 		t.Fatalf("trimmed without the files: %+v", s.Stats())
 	}
@@ -228,6 +234,9 @@ func TestStoreTrimNeedsFloorsAndLocalFiles(t *testing.T) {
 	_ = s.Close()
 	r := openTestStore(t, dir, 0)
 	if err := r.AcceptFloors("p", &Floors{Instance: 1, AppliedIndex: 9, Keys: map[string]KeyFloor{"db/a": {Floor: 6, Lost: []uint64{3}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Sync(); err != nil { // floors apply once durable
 		t.Fatal(err)
 	}
 	_ = r.Close()
@@ -362,6 +371,13 @@ func TestEndToEndEntriesAndFloors(t *testing.T) {
 	waitFor(t, "floors persisted", func() bool {
 		raw, err := os.ReadFile(filepath.Join(store.root, "primary", fmt.Sprintf("%016x", p.instance), floorsFile))
 		return err == nil && bytes.Contains(raw, []byte(`"f":50`))
+	})
+	// Applied once durable (#1287).
+	waitFor(t, "floors applied", func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		d := store.instances[instanceID{"primary", p.instance}]
+		return d != nil && d.floors != nil && d.floors.Keys["db/a"].Floor == 50
 	})
 	if _, err := store.Trim(context.Background(), allReady); err != nil {
 		t.Fatal(err)
@@ -592,6 +608,9 @@ func TestReopenAfterTrimInventsNoGaps(t *testing.T) {
 	if err := s.AcceptFloors("p", &Floors{Instance: 1, Keys: map[string]KeyFloor{"db/a": {Floor: 2, Settled: [][2]uint64{{4, 5}}}}}); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.Sync(); err != nil { // floors apply once durable
+		t.Fatal(err)
+	}
 	if _, err := s.Trim(context.Background(), allReady); err != nil {
 		t.Fatal(err)
 	}
@@ -643,6 +662,9 @@ func TestRestartWithEverythingTrimmedContinuesAtTheFloor(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir, 0)
 	if err := s.AcceptFloors("p", &Floors{Instance: 1, Keys: map[string]KeyFloor{"db/a": {Floor: 10}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Sync(); err != nil { // floors apply once durable
 		t.Fatal(err)
 	}
 	_ = s.Close()

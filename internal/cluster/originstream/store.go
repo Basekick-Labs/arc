@@ -47,7 +47,34 @@ type Store struct {
 	segBytes int64
 	logger   zerolog.Logger
 
-	mu          sync.Mutex
+	// syncMu serializes whole Sync calls (the session's ticker, its final
+	// sync, Close), so a Sync returns only once every append before it is
+	// durable even while another one is still writing. Lock order: syncMu,
+	// then mu; nothing fsyncs while holding mu (#1287): the receiving
+	// session appends under mu, and a primary drops what a standby does not
+	// read in time.
+	syncMu sync.Mutex
+	// fsync syncs a file; nil is (*os.File).Sync. Tests park it.
+	fsync func(*os.File) error
+	// removeAll removes a renamed-away path; nil is os.RemoveAll. Tests
+	// observe it.
+	removeAll func(string) error
+
+	mu sync.Mutex
+	// Durability work deferred to the next Sync, done without mu: segment
+	// files rolled over (synced, then closed), directories with a new entry,
+	// floors received (written, then applied), and renamed-away paths to
+	// remove (also removed by Trim after it unlocks).
+	retired       map[*segment]*os.File
+	dirsToSync    map[string]bool
+	pendingFloors map[*instanceDir]*Floors
+	unlink        []string
+	// forgotten: files closed because their segment was removed; an fsync
+	// of one may fail closed, which is not an error. Reset per Sync.
+	forgotten map[*os.File]bool
+	trimSeq   int
+	closed    bool
+
 	instances   map[instanceID]*instanceDir
 	current     map[string]uint64 // origin -> instance of its latest session
 	bytes       int64
@@ -74,15 +101,18 @@ type instanceID struct {
 }
 
 type instanceDir struct {
-	id      instanceID
-	dir     string
-	segs    []*segment
-	keys    map[string]*keyState
-	floors  *Floors
-	cur     *os.File
-	dirty   bool
-	nextN   int
-	created time.Time
+	id     instanceID
+	dir    string
+	segs   []*segment
+	keys   map[string]*keyState
+	floors *Floors
+	cur    *os.File
+	dirty  bool
+	// rollNext: an fsync of cur failed; its pages may be lost, and a later
+	// fsync would not say so. The next append starts a new segment.
+	rollNext bool
+	nextN    int
+	created  time.Time
 }
 
 type segment struct {
@@ -124,7 +154,10 @@ const (
 	defaultSegmentBytes = 64 << 20
 	recordFixed         = 4 + 4 + 8 + 2 + 2 + 2
 	floorsFile          = "floors.json"
-	resumeFraction      = 0.9
+	// trimSuffix marks a segment or instance directory renamed away under
+	// the lock, to be removed after it (#1287).
+	trimSuffix     = ".trim"
+	resumeFraction = 0.9
 )
 
 // OpenStore opens the store at root, rebuilding its index from disk. A
@@ -135,7 +168,9 @@ func OpenStore(root string, maxBytes int64, logger zerolog.Logger) (*Store, erro
 		return nil, fmt.Errorf("create standby store: %w", err)
 	}
 	s := &Store{root: root, maxBytes: maxBytes, segBytes: defaultSegmentBytes, logger: logger,
-		instances: map[instanceID]*instanceDir{}, current: map[string]uint64{}, trimWanted: make(chan struct{}, 1)}
+		instances: map[instanceID]*instanceDir{}, current: map[string]uint64{}, trimWanted: make(chan struct{}, 1),
+		retired: map[*segment]*os.File{}, dirsToSync: map[string]bool{}, pendingFloors: map[*instanceDir]*Floors{},
+		forgotten: map[*os.File]bool{}}
 	metrics.Get().SetStandbyStoreMaxBytes(maxBytes)
 	origins, err := os.ReadDir(root)
 	if err != nil {
@@ -150,6 +185,11 @@ func OpenStore(root string, maxBytes int64, logger zerolog.Logger) (*Store, erro
 			return nil, err
 		}
 		for _, in := range insts {
+			if strings.HasSuffix(in.Name(), trimSuffix) {
+				// Dropped before a restart; its removal did not finish.
+				_ = os.RemoveAll(filepath.Join(root, o.Name(), in.Name()))
+				continue
+			}
 			inst, err := strconv.ParseUint(in.Name(), 16, 64)
 			if err != nil || !in.IsDir() {
 				continue
@@ -181,6 +221,12 @@ func (s *Store) loadInstance(id instanceID, dir string) (*instanceDir, error) {
 			for key, kf := range f.Keys {
 				d.keys[key] = &keyState{last: kf.Floor}
 			}
+		}
+	}
+	if stale, _ := filepath.Glob(filepath.Join(dir, "*"+trimSuffix)); len(stale) > 0 {
+		// Trimmed or evicted before a restart; the removal did not finish.
+		for _, p := range stale {
+			_ = os.Remove(p)
 		}
 	}
 	names, err := filepath.Glob(filepath.Join(dir, "seg-*.recv"))
@@ -332,7 +378,7 @@ func (s *Store) instance(id instanceID) (*instanceDir, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	syncDir(filepath.Dir(dir))
+	s.dirsToSync[filepath.Dir(dir)] = true
 	d := &instanceDir{id: id, dir: dir, keys: map[string]*keyState{}, created: time.Now()}
 	s.instances[id] = d
 	return d, nil
@@ -353,6 +399,9 @@ func (s *Store) SetCurrent(origin string, instance uint64) {
 func (s *Store) Append(origin string, e *Entry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return errStoreClosed
+	}
 	d, err := s.instance(instanceID{origin, e.Instance})
 	if err != nil {
 		return err
@@ -400,8 +449,7 @@ func (s *Store) Append(origin string, e *Entry) error {
 		// Cut the torn record off so the segment reads back clean, and
 		// start the next append in a new segment.
 		_ = d.cur.Truncate(seg.size)
-		_ = d.cur.Close()
-		d.cur = nil
+		s.retireLocked(seg, d)
 		if errors.Is(err, syscall.ENOSPC) {
 			// A full disk is a cap the operator did not set: keep the
 			// session, record the batch as missing.
@@ -489,13 +537,10 @@ func (s *Store) evictDirsLocked(victims []*instanceDir, target int64) {
 		if s.bytes <= target {
 			return
 		}
-		if d.cur != nil {
-			_ = d.cur.Close()
-			d.cur = nil
-		}
+		s.forgetLocked(d, d.segs...)
 		var freed int64
 		for _, seg := range d.segs {
-			if err := os.Remove(seg.path); err == nil || errors.Is(err, os.ErrNotExist) {
+			if err := s.removeLocked(seg.path); err == nil {
 				freed += seg.size
 			}
 		}
@@ -525,20 +570,19 @@ func encodeRecord(e *Entry) []byte {
 }
 
 func (s *Store) currentSegment(d *instanceDir) (*segment, error) {
-	if d.cur != nil && len(d.segs) > 0 && d.segs[len(d.segs)-1].size < s.segBytes {
+	if d.cur != nil && !d.rollNext && len(d.segs) > 0 && d.segs[len(d.segs)-1].size < s.segBytes {
 		return d.segs[len(d.segs)-1], nil
 	}
-	if d.cur != nil {
-		_ = d.cur.Sync()
-		_ = d.cur.Close()
-		d.cur = nil
+	if d.cur != nil && len(d.segs) > 0 {
+		s.retireLocked(d.segs[len(d.segs)-1], d)
 	}
+	d.rollNext = false
 	seg := &segment{n: d.nextN, path: filepath.Join(d.dir, fmt.Sprintf("seg-%08d.recv", d.nextN)), cseqs: map[string]intervalSet{}}
 	f, err := os.OpenFile(seg.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	syncDir(d.dir)
+	s.dirsToSync[d.dir] = true
 	d.nextN++
 	d.cur = f
 	d.segs = append(d.segs, seg)
@@ -552,39 +596,172 @@ func syncDir(dir string) {
 	}
 }
 
-// Sync makes every append so far durable. Called on a short ticker by the
-// receiving session: the primary's own WAL is asynchronous, so a per-entry
-// fsync here would buy nothing.
-func (s *Store) Sync() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var first error
-	for _, d := range s.instances {
-		if !d.dirty || d.cur == nil {
-			continue
+// retireLocked hands d's open file, which holds seg, to the next Sync, which
+// syncs and closes it. Always, even with nothing dirty: a Sync in flight may
+// still owe it an fsync (it clears dirty before it syncs), and syncing a
+// clean file is cheap.
+func (s *Store) retireLocked(seg *segment, d *instanceDir) {
+	s.retired[seg] = d.cur
+	d.cur, d.dirty = nil, false
+}
+
+// forgetLocked closes, without syncing, the files of d's segments being
+// removed: a retired one, and the open one if it is among them.
+func (s *Store) forgetLocked(d *instanceDir, segs ...*segment) {
+	for _, seg := range segs {
+		if f, ok := s.retired[seg]; ok {
+			_ = f.Close()
+			s.forgotten[f] = true
+			delete(s.retired, seg)
 		}
-		if err := d.cur.Sync(); err != nil && first == nil {
+		if d.cur != nil && len(d.segs) > 0 && d.segs[len(d.segs)-1] == seg {
+			_ = d.cur.Close()
+			s.forgotten[d.cur] = true
+			d.cur, d.dirty = nil, false
+		}
+	}
+}
+
+// removeLocked renames path away (a metadata operation) so its name can be
+// reused at once and a restart deletes it, and queues the removal for after
+// the lock.
+func (s *Store) removeLocked(path string) error {
+	// Unique: a directory left by an earlier removal that failed must not
+	// make this rename fail.
+	s.trimSeq++
+	gone := fmt.Sprintf("%s.%d%s", path, s.trimSeq, trimSuffix)
+	if err := os.Rename(path, gone); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	s.unlink = append(s.unlink, gone)
+	return nil
+}
+
+func (s *Store) drainUnlink() {
+	s.mu.Lock()
+	paths := s.unlink
+	s.unlink = nil
+	s.mu.Unlock()
+	for _, p := range paths {
+		remove := os.RemoveAll
+		if s.removeAll != nil {
+			remove = s.removeAll
+		}
+		if err := remove(p); err != nil {
+			// Left for the next open, which removes it.
+			s.logger.Warn().Err(err).Str("path", p).Msg("Standby store could not remove a trimmed file")
+		}
+	}
+}
+
+func (s *Store) syncFile(f *os.File) error {
+	if s.fsync != nil {
+		return s.fsync(f)
+	}
+	return f.Sync()
+}
+
+// Sync makes every append so far durable, writes and then applies the
+// floors received, and removes what was renamed away. Called on a short
+// ticker by the receiving session: the primary's own WAL is asynchronous, so
+// a per-entry fsync here would buy nothing. It fsyncs without the store
+// lock, so appends go on meanwhile (#1287).
+func (s *Store) Sync() error {
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
+	s.mu.Lock()
+	s.forgotten = map[*os.File]bool{} // no file of an earlier Sync is in flight
+	retired := s.retired
+	s.retired = map[*segment]*os.File{}
+	dirs := s.dirsToSync
+	s.dirsToSync = map[string]bool{}
+	type open struct {
+		d *instanceDir
+		f *os.File
+	}
+	var opens []open
+	for _, d := range s.instances {
+		if d.dirty && d.cur != nil {
+			// Cleared first: an append from here on is for the next Sync.
+			opens = append(opens, open{d, d.cur})
+			d.dirty = false
+		}
+	}
+	floors := s.pendingFloors
+	s.pendingFloors = map[*instanceDir]*Floors{}
+	s.mu.Unlock()
+
+	var first error
+	// A file closed meanwhile because its segment was trimmed, evicted or
+	// dropped no longer needs its records; any other failure is one.
+	failed := func(f *os.File, err error) bool {
+		if err == nil {
+			return false
+		}
+		if errors.Is(err, os.ErrClosed) {
+			s.mu.Lock()
+			gone := s.forgotten[f]
+			s.mu.Unlock()
+			if gone {
+				return false
+			}
+		}
+		if first == nil {
 			first = err
 		}
-		d.dirty = false
+		return true
 	}
+	for _, f := range retired {
+		failed(f, s.syncFile(f))
+		_ = f.Close()
+	}
+	for dir := range dirs {
+		syncDir(dir)
+	}
+	for _, o := range opens {
+		if failed(o.f, s.syncFile(o.f)) {
+			s.mu.Lock()
+			if o.d.cur == o.f {
+				o.d.rollNext = true
+			}
+			s.mu.Unlock()
+		}
+	}
+	for d, f := range floors {
+		if err := s.writeFloors(d, f); err != nil {
+			s.mu.Lock()
+			live := s.instances[d.id] == d // a dropped instance needs none
+			if live && s.pendingFloors[d] == nil {
+				s.pendingFloors[d] = f // written again next time
+			}
+			s.mu.Unlock()
+			if live {
+				s.logger.Warn().Err(err).Str("origin", d.id.origin).Msg("Standby store could not record the primary's floors; retrying (trimming waits for them)")
+			}
+		}
+	}
+	s.drainUnlink()
 	return first
 }
 
-// AcceptFloors records the primary's floors for its instance durably.
-func (s *Store) AcceptFloors(origin string, f *Floors) error {
+// writeFloors makes f durable for d, then applies it: Trim trims only
+// against floors a restart reads back.
+func (s *Store) writeFloors(d *instanceDir, f *Floors) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	d, err := s.instance(instanceID{origin, f.Instance})
-	if err != nil {
-		return err
+	live := s.instances[d.id] == d
+	s.mu.Unlock()
+	if !live {
+		return nil // dropped: not written into a directory made again since
 	}
 	raw, err := json.Marshal(f)
 	if err != nil {
 		return err
 	}
 	tmp := filepath.Join(d.dir, floorsFile+".tmp")
-	if err := writeFileSync(tmp, raw); err != nil {
+	if err := s.writeFileSync(tmp, raw); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, filepath.Join(d.dir, floorsFile)); err != nil {
@@ -592,7 +769,26 @@ func (s *Store) AcceptFloors(origin string, f *Floors) error {
 	}
 	syncDir(d.dir)
 	sortFloors(f)
-	d.floors = f
+	s.mu.Lock()
+	if s.instances[d.id] == d {
+		d.floors = f
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+// AcceptFloors records the primary's floors for its instance. They are
+// written by the next Sync and apply once durable; a newer set replaces one
+// not written yet. Nothing here touches the disk but a new instance's
+// directory: the receiving session calls it once a second (#1287).
+func (s *Store) AcceptFloors(origin string, f *Floors) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, err := s.instance(instanceID{origin, f.Instance})
+	if err != nil {
+		return err
+	}
+	s.pendingFloors[d] = f
 	return nil
 }
 
@@ -604,7 +800,7 @@ func sortFloors(f *Floors) {
 	}
 }
 
-func writeFileSync(path string, data []byte) error {
+func (s *Store) writeFileSync(path string, data []byte) error {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
@@ -613,7 +809,7 @@ func writeFileSync(path string, data []byte) error {
 		f.Close()
 		return err
 	}
-	if err := f.Sync(); err != nil {
+	if err := s.syncFile(f); err != nil {
 		f.Close()
 		return err
 	}
@@ -636,6 +832,7 @@ type trimCandidate struct {
 // the segments the floors cover, ask readiness for their keys unlocked, then
 // delete those still present whose keys are all ready.
 func (s *Store) Trim(ctx context.Context, ready TrimReadiness) (int64, error) {
+	defer s.drainUnlink() // after the lock below is released
 	s.mu.Lock()
 	var cands []trimCandidate
 	var reqs []TrimRequest
@@ -696,11 +893,8 @@ func (s *Store) Trim(ctx context.Context, ready TrimReadiness) (int64, error) {
 		if !allReady || !c.d.holds(c.seg) || c.seg.size != c.size {
 			continue
 		}
-		if c.d.cur != nil && c.d.segs[len(c.d.segs)-1] == c.seg {
-			_ = c.d.cur.Close()
-			c.d.cur = nil
-		}
-		if err := os.Remove(c.seg.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		s.forgetLocked(c.d, c.seg)
+		if err := s.removeLocked(c.seg.path); err != nil {
 			continue
 		}
 		c.d.remove(c.seg)
@@ -806,6 +1000,9 @@ func (kf KeyFloor) registeredRange(lo, hi uint64) bool {
 
 // Close syncs and closes open segments.
 func (s *Store) Close() error {
+	s.mu.Lock()
+	s.closed = true // a session still running past its stop appends nothing more
+	s.mu.Unlock()
 	err := s.Sync()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -817,6 +1014,8 @@ func (s *Store) Close() error {
 	}
 	return err
 }
+
+var errStoreClosed = errors.New("standby store is closed")
 
 // Stats is a snapshot for metrics and tests.
 type Stats struct {
