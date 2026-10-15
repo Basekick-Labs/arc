@@ -188,8 +188,8 @@ func (d *MessagePackDecoder) tryDecodeColumnarTyped(data []byte) (*TypedColumnar
 	}
 
 	// Missing/omitted time column: leave it to the generic path, which
-	// generates the time and keeps it in the WAL entry (#1207). This path's
-	// WAL fallback for a payload it cannot store raw drops NULLs.
+	// generates the time and keeps it in the WAL entry (#1207): this path
+	// stores the client's payload raw, which has no time to replay.
 	if _, ok := typed["time"]; !ok {
 		return nil, false
 	}

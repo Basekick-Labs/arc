@@ -282,6 +282,27 @@ localProcessing:
 		})
 	}
 
+	// A point with a tag or field named "time" is dropped, and the rest are
+	// written, as InfluxDB does: a field would silently replace the
+	// timestamp, a tag would fail the write part-way. The answer is then a
+	// "partial write" 400.
+	droppedTime := 0
+	kept := records[:0]
+	for _, rec := range records {
+		if _, found := ingest.LPRecordTimeKey(rec); found {
+			droppedTime++
+			continue
+		}
+		kept = append(kept, rec)
+	}
+	records = kept
+	if len(records) == 0 {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("partial write: %d points dropped: a tag or field named \"time\" (time is the timestamp)", droppedTime),
+		})
+	}
+
 	h.totalRecords.Add(int64(len(records)))
 
 	// Convert to columnar format grouped by measurement
@@ -369,6 +390,13 @@ localProcessing:
 	m.IncIngestRecords(int64(len(records)))
 	m.IncIngestBytes(int64(len(body)))
 	m.IncIngestBatches()
+
+	if droppedTime > 0 {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("partial write: %d points dropped: a tag or field named \"time\" (time is the timestamp); the other points were written", droppedTime),
+		})
+	}
 
 	// InfluxDB returns 204 No Content on success
 	return c.SendStatus(fiber.StatusNoContent)

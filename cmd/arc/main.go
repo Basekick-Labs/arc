@@ -5234,31 +5234,16 @@ func createWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolo
 			return nil
 		}
 		for _, rec := range records {
-			// Extract measurement from recovered record
-			// WAL row format uses underscore-prefixed keys: _measurement, _database
-			measurement, _ := rec["_measurement"].(string)
-			if measurement == "" {
-				measurement, _ = rec["measurement"].(string)
-			}
-			if measurement == "" {
-				measurement, _ = rec["m"].(string)
-			}
+			database, measurement := ingest.WALRowTarget(rec)
 			if measurement == "" {
 				continue // Skip records without measurement
 			}
 
-			database, _ := rec["_database"].(string)
-			if database == "" {
-				database, _ = rec["database"].(string)
-			}
-			if database == "" {
-				database = "default"
-			}
-
-			// Build columnar record from recovered data
+			// Build columnar record from recovered data: the same columns
+			// WALRowsToColumns reads (target keys left out).
 			columns := make(map[string][]interface{})
 			for key, value := range rec {
-				if key == "_measurement" || key == "measurement" || key == "m" || key == "_database" || key == "database" {
+				if ingest.IsWALRowTargetKey(rec, key) {
 					continue
 				}
 				columns[key] = []interface{}{value}

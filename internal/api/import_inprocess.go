@@ -719,6 +719,12 @@ func validateImportHeader(header []string, timeColumn string) (int, *importError
 				Message:    fmt.Sprintf("duplicate column name %q in file; column names must be unique", name),
 			}
 		}
+		if ingest.IsWALTargetColumnName(name) && name != timeColumn { // the time column is renamed "time"
+			return -1, &importError{
+				StatusCode: fiber.StatusBadRequest,
+				Message:    fmt.Sprintf("column name %q is kept for internal use; rename the column", name),
+			}
+		}
 		seen[name] = struct{}{}
 		if name == timeColumn {
 			timeIdx = i

@@ -1547,6 +1547,37 @@ peaked at 2.2 GiB.
   by time before importing.
 - TLE files are parsed whole, as before, but read once.
 
+### NULLs survive a WAL replay; `time` and the WAL's own names are no longer column names
+
+Three ways a crash and WAL replay changed data, and two names that broke it:
+
+- **CSV, Parquet and TLE imports:** an empty cell or a null value was written
+  into the WAL as `0`, `""` or `false`. If the node crashed before the rows
+  were flushed, replay stored those values instead of NULL. NULLs now replay
+  as NULL. WAL entries written before this release still hold the values.
+- **Sparse columns:** replay re-reads an entry in batches of
+  `wal.recovery_batch_size` (10,000) rows. A batch holding none of a column's
+  values wrote that column as an all-NULL text column, and once that file
+  existed, `sum()` on the column failed for the whole hour with
+  `sum(VARCHAR)`. On a QA run (20,000 line-protocol points, a field set only
+  in the first 5,000, `kill -9` before the flush) main failed `sum(v)` after
+  restart; it now returns the right total. A line-protocol or msgpack column
+  NULL in every row of an entry still replays as the all-NULL column the live
+  write wrote; an import's (CSV/Parquet/TLE) is left out, since the replay
+  cannot know its type. Entries already in the WAL when you upgrade keep their
+  old form and can replay as before, once.
+- **Columns named `measurement`, `m` or `database`** were dropped on replay,
+  and a column named `_database` or `_measurement` sent its rows to another
+  database or measurement. Those three names now replay as columns. Imports
+  refuse `_measurement` and `_database` as column, tag or field names (`400`,
+  nothing written); through `/write` such a column is still lost on replay,
+  but no longer moves its rows.
+- **A tag or field named `time`:** a field silently replaced the point's
+  timestamp (`time=5i` stored the point in 1970), and a tag failed the write
+  part-way. Line-protocol imports refuse such a file (`400`, nothing
+  written). `/write` drops only those points, writes the others, and answers
+  `400` "partial write: N points dropped", as InfluxDB does.
+
 ### Stream takeover publishes the rows of unpulled files in one go, not in waves ([#1269](https://github.com/Basekick-Labs/arc/issues/1269))
 
 When a primary writer dies with files nobody had pulled yet, the new primary

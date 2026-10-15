@@ -504,3 +504,17 @@ func BatchToColumnar(records []*models.Record) map[string]*models.ColumnarRecord
 
 	return result
 }
+
+// LPRecordTimeKey reports a tag or field of record named "time": a tag
+// would overwrite the time column with strings (BatchToColumnar fills it
+// first), and a field would silently replace the timestamp. InfluxDB rejects
+// both. kind is "tag" or "field".
+func LPRecordTimeKey(record *models.Record) (kind string, found bool) {
+	if _, ok := record.Tags["time"]; ok {
+		return "tag", true
+	}
+	if _, ok := record.Fields["time"]; ok {
+		return "field", true
+	}
+	return "", false
+}
