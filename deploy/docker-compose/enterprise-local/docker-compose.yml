@@ -19,7 +19,7 @@ x-arc-env: &arc-env
   ARC_CLUSTER_COORDINATOR_ADDR: ":9100"
   ARC_CLUSTER_RAFT_BIND_ADDR: ":9200"
   # Shared secret authenticates HMAC for inter-node cluster traffic
-  # (peer-fetch, leader-forward apply, WAL replication handshake, and
+  # (peer-fetch, leader-forward apply, the standby-writer origin stream, and
   # — since v26.06.1 — the Phase A token-replication forward-apply
   # path). Required on every node; the value MUST be identical across
   # the cluster. Sourced from the .env file alongside this compose

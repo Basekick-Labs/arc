@@ -174,8 +174,8 @@ spec:
               value: "local"
             - name: ARC_STORAGE_LOCAL_PATH
               value: "/app/data/storage"
-            # No WAL: a reader takes no writes, and it does not consume the
-            # WAL replication stream (#888).
+            # No WAL: a reader takes no writes, and there is no WAL
+            # replication stream to consume (#888, #1181).
             # Reader MUST have replication enabled to pull data files
             - name: ARC_CLUSTER_REPLICATION_ENABLED
               value: "true"

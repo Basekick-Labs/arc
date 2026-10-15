@@ -2165,25 +2165,6 @@ func (b *ArrowBuffer) WriteColumnarDirectNoWAL(ctx context.Context, database, me
 	return b.writeColumnarDirect(ctx, database, measurement, columns, "", nil)
 }
 
-// WriteColumnarDirectNoWALWithHashes applies replicated data without writing
-// it again to the WAL, and carries the follower-local WAL identities through
-// to the flush checkpoint.
-func (b *ArrowBuffer) WriteColumnarDirectNoWALWithHashes(ctx context.Context, database, measurement string, columns map[string][]interface{}, hashes []string) error {
-	return b.writeColumnarDirectWithHashes(ctx, database, measurement, columns, hashes, nil)
-}
-
-// WriteColumnarDirectNoWALWithHashesAndTagColumns also preserves replicated
-// MessagePack tag metadata while checkpointing the follower-local WAL entries.
-func (b *ArrowBuffer) WriteColumnarDirectNoWALWithHashesAndTagColumns(ctx context.Context, database, measurement string, columns map[string][]interface{}, hashes []string, tagColumns []string) error {
-	return b.writeColumnarDirectWithHashes(ctx, database, measurement, columns, hashes, tagColumns)
-}
-
-// WriteColumnarDirectNoWALWithTagColumns replays columnar data without
-// rewriting it to the WAL while preserving MessagePack tag metadata.
-func (b *ArrowBuffer) WriteColumnarDirectNoWALWithTagColumns(ctx context.Context, database, measurement string, columns map[string][]interface{}, tagColumns []string) error {
-	return b.writeColumnarDirect(ctx, database, measurement, columns, "", tagColumns)
-}
-
 func (b *ArrowBuffer) writeColumnarDirect(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string, tagColumns []string) error {
 	var hashes []string
 	if len(walIdentity) == walTrackedIdentityHexLen {
@@ -2193,7 +2174,7 @@ func (b *ArrowBuffer) writeColumnarDirect(ctx context.Context, database, measure
 }
 
 func (b *ArrowBuffer) writeColumnarDirectWithHashes(ctx context.Context, database, measurement string, columns map[string][]interface{}, walHashes []string, tagColumns []string) error {
-	// #590: both callers (WAL crash replay, cluster WAL replication) feed
+	// #590: WAL crash replay feeds
 	// RAW client payloads that never went through the live decode path's
 	// post-processing. Apply it here so replayed data behaves exactly like
 	// live-ingested data:

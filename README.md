@@ -379,7 +379,7 @@ arc/
 │   ├── auth/             # Token authentication and RBAC
 │   ├── backup/           # Backup and restore (data, metadata, config)
 │   ├── circuitbreaker/   # Resilience patterns (retry, backoff)
-│   ├── cluster/          # Raft consensus, node roles, WAL replication
+│   ├── cluster/          # Raft consensus, node roles, peer file replication, standby stream
 │   ├── compaction/       # Tiered hourly/daily Parquet file merging
 │   ├── config/           # TOML configuration with env var overrides
 │   ├── database/         # Query engine and connection management

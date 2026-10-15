@@ -19,10 +19,12 @@ const (
 	// MsgLeaveNotify is sent when a node is gracefully leaving.
 	MsgLeaveNotify
 
-	// WAL Replication messages (Phase 3.3) - start at 0x10 to avoid conflicts
-	// MsgReplicateSync is sent by a reader to request replication sync.
-	MsgReplicateSync MessageType = 0x10
-	// MsgReplicateSyncAck is sent by the writer in response to sync request.
+	// WAL replication handshake (Phase 3.3). The stream is gone (#888,
+	// #1181): a reader of a release before 27.01.1 still sends
+	// MsgReplicateSync until it is upgraded, and a writer answers it with a
+	// refusing MsgReplicateSyncAck. Reserved: never reuse 0x10-0x1F while
+	// such readers can exist.
+	MsgReplicateSync    MessageType = 0x10
 	MsgReplicateSyncAck MessageType = 0x11
 
 	// Peer file replication messages (Enterprise Phase 2) - start at 0x20
@@ -228,40 +230,22 @@ func (m MessageType) String() string {
 	}
 }
 
-// ReplicateSync is sent by a reader node to request WAL replication.
-//
-// The six auth-bound fields (Nonce / Timestamp / HMAC / ClusterName /
-// the existing ReaderID acting as senderID / and SupportsBinaryEntries)
-// carry the application-layer HMAC over the handshake. Computed by
-// security.ComputeReplicateSyncHMAC at the reader, validated by
-// security.ValidateReplicateSyncHMAC at the writer before the
-// connection is accepted. See GHSA-wfgr-8x84-22q7 / CVE-2026-48106.
-//
-// The auth fields are required when cluster.shared_secret is configured;
-// when it's empty the receiver refuses every request (refuse-when-
-// unconfigured posture, same as cache-invalidate from PR #444).
+// ReplicateSync is what a reader of a release before 27.01.1 sends to request
+// the WAL replication stream. It is decoded only to be refused (#1181): every
+// request gets the same answer, so its HMAC fields (GHSA-wfgr-8x84-22q7) are
+// not checked.
 type ReplicateSync struct {
 	ReaderID          string `json:"reader_id"`
 	LastKnownSequence uint64 `json:"last_known_seq"`
 
-	// Application-layer authentication fields (GHSA-wfgr-8x84-22q7).
-	// Validated against cluster.shared_secret by the writer before
-	// the connection is accepted into the replication sender.
+	// Authentication fields of the old handshake (GHSA-wfgr-8x84-22q7).
 	Nonce       string `json:"nonce,omitempty"`
 	ClusterName string `json:"cluster_name,omitempty"`
 	Timestamp   int64  `json:"timestamp,omitempty"`
 	HMAC        string `json:"hmac,omitempty"`
 
-	// SupportsBinaryEntries advertises that this reader understands
-	// MsgReplicateEntryBin frames (#698), letting the writer send WAL
-	// entry payloads as raw bytes instead of JSON + base64 (whose 4/3
-	// inflation made entries above ~75MB unsendable).
-	//
-	// Covered by the replicate-sync HMAC (#714). Originally left out
-	// because folding it in would break mixed-version handshakes —
-	// that no longer applies since 26.09.2 made the coordinator
-	// handshake a hard cutover anyway, so this rides along with the
-	// same coordinated-restart release.
+	// SupportsBinaryEntries is what an old reader sent to ask for binary
+	// entry frames (#698); decoded and ignored.
 	SupportsBinaryEntries bool `json:"bin_entries,omitempty"`
 }
 
