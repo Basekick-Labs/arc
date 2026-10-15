@@ -283,20 +283,24 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 		}
 	}
 
-	// Refuse the whole import up front if writes are fenced (#1207).
-	if err := h.arrowBuffer.CheckIngestGate(); err != nil {
+	// Refuse the whole import up front if writes are fenced (#1207) or the
+	// WAL volume is under disk pressure (#676); the admitted context keeps
+	// pressure that starts part-way from splitting it.
+	writeCtx, release, err := h.arrowBuffer.AdmitRequest(c.Context(), int64(len(data)))
+	if err != nil {
 		h.totalErrors.Add(1)
-		return respondIngestFenced(c, err)
+		return respondWriteRefused(c, err)
 	}
+	defer release()
 
 	// Feed each measurement into the ArrowBuffer ingest pipeline
 	var totalRows int64
 	importedMeasurements := make([]string, 0, len(columnarByMeasurement))
 	for measurement, record := range columnarByMeasurement {
-		if err := h.arrowBuffer.WriteColumnarRecord(c.Context(), database, record); err != nil {
+		if err := h.arrowBuffer.WriteColumnarRecord(writeCtx, database, record); err != nil {
 			h.totalErrors.Add(1)
-			if errors.Is(err, ingest.ErrIngestFenced) {
-				return respondIngestFenced(c, err) // logged by reason (#1268)
+			if ingest.IsWriteRefusal(err) {
+				return respondWriteRefused(c, err) // logged by reason (#1268)
 			}
 			h.logger.Error().Err(err).
 				Str("database", database).
@@ -377,16 +381,24 @@ func (e *importError) Error() string {
 	return e.Message
 }
 
-// Unwrap exposes the cause, so errors.Is sees a fence refusal (#1268).
+// Unwrap exposes the cause, so errors.Is sees a refused write (#1268, #676).
 func (e *importError) Unwrap() error { return e.Err }
 
 // importErrorResponse returns the appropriate HTTP error response for an import error
 func (h *ImportHandler) importErrorResponse(c *fiber.Ctx, err error) error {
 	if ie, ok := err.(*importError); ok {
-		if errors.Is(ie.Err, ingest.ErrIngestFenced) {
+		switch {
+		case errors.Is(ie.Err, ingest.ErrIngestFenced):
 			ingest.LogRefusal(c.Path(), ie.Err)
 			c.Locals(ingestFencedLocal, true)
 			c.Set(IngestFencedHeader, "1")
+			c.Set(fiber.HeaderRetryAfter, "5")
+		case ingest.IsWriteRefusal(ie.Err):
+			// WAL disk pressure and the like (#676): the headers of
+			// respondIngestRefused; the status is ie.StatusCode (503).
+			ingest.LogRefusal(c.Path(), ie.Err)
+			c.Locals(ingestRefusedLocal, true)
+			c.Set(IngestRefusedHeader, ingest.RefusalReason(ie.Err))
 			c.Set(fiber.HeaderRetryAfter, "5")
 		}
 		return c.Status(ie.StatusCode).JSON(fiber.Map{
@@ -541,10 +553,18 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 
 	// Write directly to the ArrowBuffer ingest pipeline (typed path)
 	totalRows := int64(numRecords)
-	if err := h.arrowBuffer.WriteTypedColumnarDirect(c.Context(), database, measurement, batch, numRecords); err != nil {
+	// Admit the whole request, its size reserved against the WAL volume's
+	// free space (#676); a fence or disk pressure refuses it here.
+	writeCtx, release, aerr := h.arrowBuffer.AdmitRequest(c.Context(), int64(len(data)))
+	if aerr != nil {
 		h.totalErrors.Add(1)
-		if errors.Is(err, ingest.ErrIngestFenced) {
-			return respondIngestFenced(c, err) // logged by reason (#1268)
+		return respondWriteRefused(c, aerr)
+	}
+	defer release()
+	if err := h.arrowBuffer.WriteTypedColumnarDirect(writeCtx, database, measurement, batch, numRecords); err != nil {
+		h.totalErrors.Add(1)
+		if ingest.IsWriteRefusal(err) {
+			return respondWriteRefused(c, err) // logged by reason (#1268)
 		}
 		h.logger.Error().Err(err).
 			Str("database", database).

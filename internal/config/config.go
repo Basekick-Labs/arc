@@ -461,6 +461,28 @@ type WALConfig struct {
 	// (default: 1 MiB). Syncs run beside the writer (#1246), so this bounds how
 	// much written data a sync may leave behind, not the writer's throughput.
 	SyncBytes int64
+	// DiskPressureEnabled refuses live writes (503, retryable) while the WAL
+	// volume is low on free space, and keeps the WAL reserve file (#676).
+	// Default true; only acts with the WAL enabled.
+	DiskPressureEnabled bool
+	// DiskMinFreeMB is the free space below which live writes are refused.
+	// 0 (default) = max(512, 2 x max_size_mb); clamped to a fifth of the
+	// volume. Negative is rejected.
+	DiskMinFreeMB int
+	// MaxDirectoryMB caps the WAL directory's bytes, for a volume whose free
+	// space does not show the limit that applies (an emptyDir with a
+	// sizeLimit). 0 (default) = no cap. Negative is rejected.
+	MaxDirectoryMB int
+}
+
+// WALMinDirectoryMB is the least wal.max_directory_mb accepted for a
+// wal.max_size_mb (0 = the 100 MB default): four WAL files, the active one,
+// the two-file band the disk gate clears below, and one of margin (#676).
+func WALMinDirectoryMB(maxSizeMB int) int {
+	if maxSizeMB <= 0 {
+		maxSizeMB = 100
+	}
+	return 4 * maxSizeMB
 }
 
 type TelemetryConfig struct {
@@ -1146,6 +1168,9 @@ func Load() (*Config, error) {
 			RecoveryBatchSize:       v.GetInt("wal.recovery_batch_size"),
 			BufferSize:              v.GetInt("wal.buffer_size"),
 			SyncBytes:               v.GetInt64("wal.sync_bytes"),
+			DiskPressureEnabled:     v.GetBool("wal.disk_pressure_enabled"),
+			DiskMinFreeMB:           v.GetInt("wal.disk_min_free_mb"),
+			MaxDirectoryMB:          v.GetInt("wal.max_directory_mb"),
 		},
 		Telemetry: TelemetryConfig{
 			Enabled:         v.GetBool("telemetry.enabled"),
@@ -1356,6 +1381,22 @@ func Load() (*Config, error) {
 	}
 	if err := validateCompactionMemoryLimit(cfg.Compaction.MemoryLimit); err != nil {
 		return nil, err
+	}
+	if cfg.WAL.DiskMinFreeMB < 0 {
+		return nil, fmt.Errorf("invalid wal.disk_min_free_mb value: %d (must be >= 0; 0 = max(512, 2 x wal.max_size_mb))", cfg.WAL.DiskMinFreeMB)
+	}
+	if cfg.WAL.MaxDirectoryMB < 0 {
+		return nil, fmt.Errorf("invalid wal.max_directory_mb value: %d (must be >= 0; 0 = no cap)", cfg.WAL.MaxDirectoryMB)
+	}
+	// The cap must hold the active WAL file, the band the gate clears below
+	// and a file of margin, or the gate could never clear (#676).
+	if minDir := WALMinDirectoryMB(cfg.WAL.MaxSizeMB); cfg.WAL.MaxDirectoryMB > 0 && cfg.WAL.MaxDirectoryMB < minDir {
+		cfg.Warnings = append(cfg.Warnings, LoadWarning{
+			Key:     "wal.max_directory_mb",
+			Value:   strconv.Itoa(cfg.WAL.MaxDirectoryMB),
+			Message: fmt.Sprintf("wal.max_directory_mb is below four WAL files (4 x wal.max_size_mb = %d MB): raised to %d MB, or the WAL disk gate could never clear once on", minDir, minDir),
+		})
+		cfg.WAL.MaxDirectoryMB = minDir
 	}
 	if cfg.Compaction.Threads < 0 {
 		return nil, fmt.Errorf("invalid compaction.threads value: %d (must be >= 0; 0 = auto)", cfg.Compaction.Threads)
@@ -1938,6 +1979,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("wal.recovery_batch_size", 10000)     // Max records per recovery batch (rate limiting)
 	v.SetDefault("wal.buffer_size", 10000)             // Async write buffer size in entries
 	v.SetDefault("wal.sync_bytes", 1024*1024)          // Request a sync once this many bytes are unsynced
+	v.SetDefault("wal.disk_pressure_enabled", true)    // Refuse writes (503) while the WAL volume is low on space (#676)
+	v.SetDefault("wal.disk_min_free_mb", 0)            // 0 = max(512, 2 x max_size_mb), at most a fifth of the volume
+	v.SetDefault("wal.max_directory_mb", 0)            // 0 = no cap on the WAL directory's bytes
 
 	// Telemetry defaults
 	v.SetDefault("telemetry.enabled", true)                                               // Enabled by default (opt-out)

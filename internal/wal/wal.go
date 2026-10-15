@@ -545,6 +545,21 @@ type Writer struct {
 	// EDQUOT and cleared by the next successful entry write (#676). See
 	// DiskFullObserved.
 	diskFull atomic.Bool
+	// diskFullEvents counts every write or rotation that failed with ENOSPC or
+	// EDQUOT, so the disk pressure monitor sees each new one even while
+	// diskFull stays set (#676).
+	diskFullEvents atomic.Uint64
+	// diskHint wakes the disk pressure monitor (DiskMonitor) at once: a
+	// rotation finished, or a write found the disk full. Capacity 1, never a
+	// blocking send.
+	diskHint chan struct{}
+	// enqueuedBytes counts the bytes of every entry admitted to the write
+	// queue, and processedBytes those the writer loop has finished with
+	// (written or lost). The disk pressure gate charges enqueued bytes against
+	// the free space of its last sample, so it is exact between samples, and
+	// enqueued - processed is what a sample's free space does not show yet.
+	enqueuedBytes  atomic.Uint64
+	processedBytes atomic.Uint64
 	// recoveredLogNano samples the log of a failed write the retry on a new
 	// file recovered.
 	recoveredLogNano atomic.Int64
@@ -675,6 +690,7 @@ func NewWriter(cfg *WriterConfig) (*Writer, error) {
 		entryChan:       make(chan walEntry, cfg.BufferSize),
 		syncReq:         make(chan struct{}, 1),
 		purgeHint:       make(chan struct{}, 1),
+		diskHint:        make(chan struct{}, 1),
 		fileSeqs:        make(map[string]*fileSeqState),
 		created:         make(map[string]struct{}),
 		pendingSeqs:     make(map[uint64]struct{}),
@@ -737,6 +753,7 @@ func (w *Writer) writerLoop() {
 		select {
 		case entry := <-w.entryChan:
 			w.processEntry(entry)
+			w.processedBytes.Add(uint64(len(entry.data)))
 			w.rotateIfSyncFailed()
 
 		case <-syncTicker.C:
@@ -755,6 +772,7 @@ func (w *Writer) writerLoop() {
 				select {
 				case entry := <-w.entryChan:
 					w.processEntry(entry)
+					w.processedBytes.Add(uint64(len(entry.data)))
 				default:
 					// Stop the syncer first, so the final sync below is the only
 					// sync left, then answer every waiter still pending.
@@ -1069,7 +1087,7 @@ func (w *Writer) appendLocked(data []byte) (int, error) {
 		return n, nil
 	}
 	if isDiskFull(err) {
-		w.diskFull.Store(true)
+		w.noteDiskFull()
 	}
 	if n > 0 {
 		if terr := truncateFileFn(w.currentFile, w.currentSize); terr != nil {
@@ -1147,6 +1165,30 @@ func (w *Writer) PurgeHint() <-chan struct{} {
 func (w *Writer) signalPurge() {
 	select {
 	case w.purgeHint <- struct{}{}:
+	default:
+	}
+}
+
+// ActiveFileBytes is the size of the WAL file being written, header
+// included (#676).
+func (w *Writer) ActiveFileBytes() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.currentSize
+}
+
+// noteDiskFull records a write or rotation that failed because the volume or
+// the quota was full, and wakes the disk pressure monitor.
+func (w *Writer) noteDiskFull() {
+	w.diskFull.Store(true)
+	w.diskFullEvents.Add(1)
+	w.signalDisk()
+}
+
+// signalDisk never blocks, so it is safe under w.mu.
+func (w *Writer) signalDisk() {
+	select {
+	case w.diskHint <- struct{}{}:
 	default:
 	}
 }
@@ -1237,7 +1279,7 @@ func (w *Writer) rotate() error {
 		}
 		if !os.IsExist(err) || attempt >= 1000 {
 			if isDiskFull(err) {
-				w.diskFull.Store(true)
+				w.noteDiskFull()
 			}
 			return fmt.Errorf("failed to create WAL file: %w", err)
 		}
@@ -1253,7 +1295,7 @@ func (w *Writer) rotate() error {
 	n, err := writeFileFn(newFile, header[:])
 	if err != nil {
 		if isDiskFull(err) {
-			w.diskFull.Store(true)
+			w.noteDiskFull()
 		}
 		newFile.Close()
 		// Remove the headerless file: nothing else will, and a *.wal this
@@ -1300,6 +1342,7 @@ func (w *Writer) rotate() error {
 	if oldFile != nil {
 		w.signalPurge()
 	}
+	w.signalDisk()
 	return nil
 }
 
@@ -1669,6 +1712,7 @@ func (w *Writer) enqueueEntryBlocking(ctx context.Context, entry walEntry) error
 	}
 	select {
 	case w.entryChan <- entry:
+		w.enqueuedBytes.Add(uint64(len(entry.data)))
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -1689,6 +1733,9 @@ func (w *Writer) tryEnqueueEntry(entry walEntry) error {
 	}
 	select {
 	case w.entryChan <- entry:
+		// Only an admitted entry reaches the disk: a dropped one must not
+		// count against the disk pressure budget (#676).
+		w.enqueuedBytes.Add(uint64(len(entry.data)))
 		return nil
 	default:
 		atomic.AddInt64(&w.DroppedEntries, 1)

@@ -317,6 +317,13 @@ WAL env vars for writers. Enabled by default for Enterprise durability.
   value: "/app/data/wal"
 - name: ARC_WAL_SYNC_MODE
   value: {{ .Values.writer.wal.syncMode | quote }}
+{{- /* WAL volume disk pressure (#676): 503 instead of losing writes to a full volume. */}}
+- name: ARC_WAL_DISK_PRESSURE_ENABLED
+  value: {{ ternary "true" "false" (ne .Values.writer.wal.diskPressureEnabled false) | quote }}
+- name: ARC_WAL_DISK_MIN_FREE_MB
+  value: {{ .Values.writer.wal.diskMinFreeMB | default 0 | int | quote }}
+- name: ARC_WAL_MAX_DIRECTORY_MB
+  value: {{ .Values.writer.wal.maxDirectoryMB | default 0 | int | quote }}
 {{- end }}
 {{- end }}
 

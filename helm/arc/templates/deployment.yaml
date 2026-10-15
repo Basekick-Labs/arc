@@ -62,6 +62,14 @@ spec:
               value: {{ .Values.arc.wal.enabled | quote }}
             - name: ARC_WAL_DIRECTORY
               value: {{ .Values.arc.wal.directory | quote }}
+            # WAL volume disk pressure (#676): 503 instead of losing writes
+            # to a full volume.
+            - name: ARC_WAL_DISK_PRESSURE_ENABLED
+              value: {{ ternary "true" "false" (ne .Values.arc.wal.diskPressureEnabled false) | quote }}
+            - name: ARC_WAL_DISK_MIN_FREE_MB
+              value: {{ .Values.arc.wal.diskMinFreeMB | default 0 | int | quote }}
+            - name: ARC_WAL_MAX_DIRECTORY_MB
+              value: {{ include "arc.walMaxDirectoryMB" . | quote }}
             {{- with .Values.arc.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -115,7 +123,12 @@ spec:
           persistentVolumeClaim:
             claimName: {{ .Values.persistence.existingClaim | default (include "arc.fullname" .) }}
           {{- else }}
+          {{- if gt (int (.Values.persistence.emptyDirSizeLimitMB | default 0)) 0 }}
+          emptyDir:
+            sizeLimit: {{ printf "%dMi" (int .Values.persistence.emptyDirSizeLimitMB) }}
+          {{- else }}
           emptyDir: {}
+          {{- end }}
           {{- end }}
         {{- if .Values.arc.config.enabled }}
         - name: config

@@ -311,21 +311,25 @@ localProcessing:
 		}
 	}
 
-	// Refuse the whole request up front if writes are fenced (#1207), rather
-	// than part-way through the measurements below.
-	if err := h.buffer.CheckIngestGate(); err != nil {
+	// Refuse the whole request up front if writes are fenced (#1207) or the
+	// WAL volume is under disk pressure (#676), rather than part-way through
+	// the measurements below. The admitted context skips the per-call disk
+	// pressure check, so pressure starting mid-request cannot split it.
+	writeCtx, release, err := h.buffer.AdmitRequest(c.Context(), int64(len(body)))
+	if err != nil {
 		h.totalErrors.Add(1)
-		return respondIngestFenced(c, err)
+		return respondWriteRefused(c, err)
 	}
+	defer release()
 
 	// Write each measurement to the buffer
 	for measurement, record := range columnarByMeasurement {
-		err := h.buffer.WriteColumnarRecord(c.Context(), database, record)
+		err := h.buffer.WriteColumnarRecord(writeCtx, database, record)
 		if err != nil {
 			h.totalErrors.Add(1)
 			// Logged by reason, not as an ingest error (#1268).
-			if errors.Is(err, ingest.ErrIngestFenced) {
-				return respondIngestFenced(c, err)
+			if ingest.IsWriteRefusal(err) {
+				return respondWriteRefused(c, err)
 			}
 			metrics.Get().IncIngestErrors()
 			h.logger.Error().

@@ -949,8 +949,11 @@ func requestLogger(logger zerolog.Logger) fiber.Handler {
 
 		// OPTIMIZATION: Only log errors (status >= 400) to save 20% CPU
 		// Profiling showed request logging consuming 19.62% of CPU time.
-		// A fence refusal is expected and logged by reason elsewhere (#1268).
-		if fenced, _ := c.Locals(ingestFencedLocal).(bool); status >= 400 && !fenced {
+		// A fence refusal, or another refused write (#676), is expected and
+		// logged by reason elsewhere (#1268).
+		fenced, _ := c.Locals(ingestFencedLocal).(bool)
+		refused, _ := c.Locals(ingestRefusedLocal).(bool)
+		if status >= 400 && !fenced && !refused {
 			logEvent := logger.Warn()
 			if status >= 500 {
 				logEvent = logger.Error()

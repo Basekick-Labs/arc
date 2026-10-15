@@ -261,6 +261,12 @@ func main() {
 		log.Fatal().Msg("Arc was built without -tags=duckdb_arrow; refusing to start. The Arrow query path is required: rebuild with `make build` (or `go build -tags=duckdb_arrow ./cmd/arc`).")
 	}
 
+	// The WAL reserve file (#676), before anything writes to the data volume
+	// (the staged restores below, SQLite, the registration journal, the WAL
+	// header): on a full volume it is released so this start has room, and
+	// with the WAL or its disk gate turned off it is removed.
+	prepareWALReserveAtBoot(cfg, logger.Get("wal"))
+
 	// Apply staged metadata restores BEFORE anything opens the SQLite
 	// databases (#635): the restore API only stages; the swap happens here,
 	// where no connection, pool, or sidecar can be live. The same paths are
@@ -997,6 +1003,7 @@ func main() {
 	// Initialize WAL writer (if enabled) - recovery happens after ArrowBuffer is ready
 	var walWriter *wal.Writer
 	var walRecovery *wal.Recovery
+	var walDisk *wal.DiskMonitor
 	if cfg.WAL.Enabled {
 		var err error
 		walWriter, err = wal.NewWriter(&wal.WriterConfig{
@@ -1016,12 +1023,27 @@ func main() {
 		// Prepare recovery (will run after ArrowBuffer is created)
 		walRecovery = wal.NewRecovery(cfg.WAL.Directory, logger.Get("wal"))
 
-		log.Info().
+		// WAL volume disk pressure (#676): armed before the first write.
+		walDisk = startWALDiskMonitor(cfg, walWriter)
+		if walDisk != nil {
+			shutdownCoordinator.Register("wal-disk-monitor", walDisk, shutdown.PriorityWAL)
+		}
+
+		walLog := log.Info().
 			Str("directory", cfg.WAL.Directory).
 			Str("sync_mode", cfg.WAL.SyncMode).
 			Int("max_size_mb", cfg.WAL.MaxSizeMB).
 			Int("max_age_seconds", cfg.WAL.MaxAgeSeconds).
-			Msg("WAL enabled")
+			Bool("disk_pressure_enabled", walDisk != nil)
+		if walDisk != nil {
+			reserve, offPoint := walDisk.Levels()
+			walLog = walLog.
+				Int("disk_min_free_mb_configured", cfg.WAL.DiskMinFreeMB).
+				Int64("disk_reserve_bytes", reserve).
+				Int64("disk_pressure_off_bytes", offPoint).
+				Int("max_directory_mb", cfg.WAL.MaxDirectoryMB)
+		}
+		walLog.Msg("WAL enabled")
 	} else {
 		log.Info().Msg("WAL is DISABLED - data durability relies on immediate Parquet flushes")
 	}
@@ -1035,6 +1057,9 @@ func main() {
 	arrowBuffer := ingest.NewArrowBuffer(&cfg.Ingest, storageBackend, logger.Get("arrow"))
 	if walWriter != nil {
 		arrowBuffer.SetWAL(walWriter)
+	}
+	if walDisk != nil {
+		arrowBuffer.SetWALDiskGate(walDisk)
 	}
 	// Every file this node flushes is announced to the cluster manifest
 	// through the registration outbox (#1206, #1209), including startup WAL
@@ -1648,7 +1673,13 @@ func main() {
 		}
 
 		// Create subscription manager
-		mqttManager = mqtt.NewSubscriptionManager(mqttRepo, encryptor, arrowBuffer, logger.Get("mqtt"))
+		subscriptionManager := mqtt.NewSubscriptionManager(mqttRepo, encryptor, arrowBuffer, logger.Get("mqtt"))
+		mqttManager = subscriptionManager
+		// Subscriptions wait at the broker while the WAL volume is under disk
+		// pressure (#676), as while writes are fenced.
+		if walDisk != nil {
+			walDisk.OnChange(subscriptionManager.SetWALDiskPressure)
+		}
 
 		// Start manager (loads and starts auto_start subscriptions). On a
 		// cluster node it starts after the coordinator, so its writes pass the
@@ -2078,6 +2109,11 @@ func main() {
 					// received bytes. Must be set before Start — the puller is
 					// constructed inside Start when ReplicationEnabled is true.
 					clusterCoordinator.SetStorageBackend(storageBackend)
+					// The standby store's free-space reserve stays above the
+					// WAL disk gate's off-point (#676).
+					if walDisk != nil {
+						clusterCoordinator.SetWALDiskOffPoint(walDiskOffPoint(cfg))
+					}
 
 					// The cluster-wide compaction pause (#1087), wired BEFORE
 					// Start on every cluster node: a pause replayed from the

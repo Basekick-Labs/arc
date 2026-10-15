@@ -217,11 +217,19 @@ localProcessing:
 	}
 
 	// Write directly to the buffer (typed path — skips convertColumnsToTyped)
-	if err := h.buffer.WriteTypedColumnarDirect(c.Context(), database, measurement, batch, numRecords); err != nil {
+	// Admit the whole request, its size reserved against the WAL volume's
+	// free space (#676); a fence or disk pressure refuses it here.
+	writeCtx, release, aerr := h.buffer.AdmitRequest(c.Context(), int64(len(body)))
+	if aerr != nil {
+		h.totalErrors.Add(1)
+		return respondWriteRefused(c, aerr)
+	}
+	defer release()
+	if err := h.buffer.WriteTypedColumnarDirect(writeCtx, database, measurement, batch, numRecords); err != nil {
 		h.totalErrors.Add(1)
 		// Logged by reason, not as an ingest error (#1268).
-		if errors.Is(err, ingest.ErrIngestFenced) {
-			return respondIngestFenced(c, err)
+		if ingest.IsWriteRefusal(err) {
+			return respondWriteRefused(c, err)
 		}
 		metrics.Get().IncIngestErrors()
 		h.logger.Error().
