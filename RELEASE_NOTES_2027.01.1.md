@@ -3914,15 +3914,6 @@ recovery failures. Checkpoints in quarantined WAL files remain part of recovery'
 durability proof, so a later retry does not replay already-flushed entries merely
 because their checkpoint file was renamed.
 
-Replication followers prepare buffer ownership before appending local WAL.
-Ignored payloads no longer leave an unowned identity that prevents reclamation.
-An entry containing multiple measurements gets a separate local WAL payload and
-identity for each buffer, preserving its database envelope. Flushing one
-measurement cannot checkpoint another measurement's pending rows; rejecting a
-later measurement does not release an earlier buffer's identity. Normal
-single-measurement payloads retain their original bytes. Replication sequence
-and acknowledgement semantics are unchanged.
-
 Recovery barriers now use the configured flush worker pool instead of serial
 per-measurement writes, and release shard locks before waiting. Each barrier
 has a total wait budget of `ingest.flush_timeout_seconds` (30 seconds by default)

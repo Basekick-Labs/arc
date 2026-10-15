@@ -367,8 +367,7 @@ func ValidateFlushScopeReplyHMAC(sharedSecret, requestNonce, nodeID, clusterName
 }
 
 // DeriveOriginStreamSessionKey derives the origin stream's per-connection key
-// from the shared secret and the hello nonce. A different HKDF info string
-// from the replication session, so the two keys never coincide.
+// from the shared secret and the hello nonce, under its own HKDF info string.
 func DeriveOriginStreamSessionKey(sharedSecret, helloNonce string) ([]byte, error) {
 	key, err := hkdf.Key(sha256.New, []byte(sharedSecret), []byte(helloNonce), "arc-origin-stream-session:", 32)
 	if err != nil {

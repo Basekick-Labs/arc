@@ -13,9 +13,11 @@ import (
 
 // A reader of a release before 27.01.1 still dials writers for the WAL
 // replication stream during an upgrade (#888). The stream is gone (#1181):
-// the writer answers with a refusal and closes the connection. Before #1181
-// the refusal left the connection open (handlePeerConnection had handed it to
-// a Sender that no longer exists), one socket per retry, every few seconds.
+// the writer answers every request with a refusal and closes the connection.
+// Before #1181 a request that passed the HMAC check reached a refusal that
+// left the connection open (handlePeerConnection had handed it to a Sender
+// that no longer existed), one socket per retry, every few seconds; this
+// request carries no valid MAC, which now gets the same answer.
 func TestLegacyReaderIsRefusedAndTheConnectionClosed(t *testing.T) {
 	c := &Coordinator{
 		cfg:       &config.ClusterConfig{ReplicationEnabled: true, SharedSecret: "s", ClusterName: "test-cluster"},

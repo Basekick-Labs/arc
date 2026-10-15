@@ -244,16 +244,8 @@ type ReplicateSync struct {
 	Timestamp   int64  `json:"timestamp,omitempty"`
 	HMAC        string `json:"hmac,omitempty"`
 
-	// SupportsBinaryEntries advertises that this reader understands
-	// MsgReplicateEntryBin frames (#698), letting the writer send WAL
-	// entry payloads as raw bytes instead of JSON + base64 (whose 4/3
-	// inflation made entries above ~75MB unsendable).
-	//
-	// Covered by the replicate-sync HMAC (#714). Originally left out
-	// because folding it in would break mixed-version handshakes —
-	// that no longer applies since 26.09.2 made the coordinator
-	// handshake a hard cutover anyway, so this rides along with the
-	// same coordinated-restart release.
+	// SupportsBinaryEntries is what an old reader sent to ask for binary
+	// entry frames (#698); decoded and ignored.
 	SupportsBinaryEntries bool `json:"bin_entries,omitempty"`
 }
 

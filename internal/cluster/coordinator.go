@@ -1918,7 +1918,7 @@ func (c *Coordinator) handlePeerConnection(conn net.Conn) {
 		Msg("Received peer message")
 
 	// For most message types, we close the connection after handling.
-	// Exception: MsgReplicateSync - the sender takes ownership of the connection.
+	// Exceptions: MsgOriginStreamHello and MsgFetchFile, whose handlers own it.
 	closeConn := true
 
 	switch msg.Type {
@@ -2460,7 +2460,9 @@ func (c *Coordinator) handleLeaveNotify(leave *protocol.LeaveNotify) {
 // still dials writers for the WAL replication stream (#888) until it is
 // upgraded: the stream is gone (#1181), so every request gets the same
 // refusal, authenticated or not, and the connection is closed. Readers get
-// their data from the registered Parquet through the file puller.
+// their data from the registered Parquet through the file puller. The
+// refusal says the stream is gone to any dialer, authenticated or not: on
+// the cluster port, which tells no more than the node's release.
 func (c *Coordinator) refuseReplicateSync(conn net.Conn, syncReq *protocol.ReplicateSync) {
 	c.logger.Warn().
 		Str("peer", conn.RemoteAddr().String()).
@@ -2483,8 +2485,8 @@ func (c *Coordinator) refuseReplicateSync(conn net.Conn, syncReq *protocol.Repli
 //  7. On any error before or during the ack, send {status=error, error=...}.
 //
 // This handler does NOT honor the 10-second read timeout from the dispatch
-// loop — it holds the connection open for the duration of the body stream,
-// same as MsgReplicateSync. The puller on the other side uses its own
+// loop — it holds the connection open for the duration of the body stream.
+// The puller on the other side uses its own
 // per-fetch timeout (cluster.replication_fetch_timeout_ms).
 func (c *Coordinator) handleFetchFile(conn net.Conn, req *protocol.FetchFileRequest) {
 	defer conn.Close()
@@ -2711,12 +2713,8 @@ func (c *Coordinator) sendFetchError(conn net.Conn, code protocol.AckErrorCode, 
 	}
 }
 
-// sendReplicationSyncError writes a uniform ReplicateSyncAck error
-// response on the connection and closes it. Used by handleReplicateSync
-// for every rejection path (missing/bad HMAC, self-addressed, wrong
-// cluster name, replay, shared secret unconfigured) so an attacker
-// cannot probe to distinguish rejection reasons. See
-// GHSA-wfgr-8x84-22q7 / CVE-2026-48106.
+// sendReplicationSyncError writes a ReplicateSyncAck refusal on the
+// connection and closes it (refuseReplicateSync).
 func (c *Coordinator) sendReplicationSyncError(conn net.Conn, reason string) {
 	ack := &protocol.ReplicateSyncAck{
 		CurrentSequence: 0,

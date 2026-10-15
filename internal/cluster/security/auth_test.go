@@ -1,6 +1,7 @@
 package security
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -357,7 +358,7 @@ func TestValidateCacheInvalidateHMAC_FieldBinding(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------
-// Replication protocol HMAC tests (GHSA-wfgr-8x84-22q7 / CVE-2026-48106)
+// Cross-endpoint HMAC label binding
 // ----------------------------------------------------------------------
 
 func TestHMAC_LabelBinding_NoCrossEndpointReplay(t *testing.T) {
@@ -396,5 +397,19 @@ func TestHMAC_LabelBinding_NoCrossEndpointReplay(t *testing.T) {
 	}
 	if err := ValidateJoinHMAC(secret, nonce, ts, JoinAuthFields{NodeID: nodeID, ClusterName: clusterName}, cacheMAC, 5*time.Minute); err == nil {
 		t.Error("cache MAC accepted by join validator")
+	}
+}
+
+// The origin stream's session key against an HKDF-SHA256 computed outside Go
+// (salt = the hello nonce, IKM = the shared secret): swapping the stdlib
+// hkdf.Key arguments, which both sides of a connection would do alike, fails
+// here.
+func TestDeriveOriginStreamSessionKey_KnownAnswer(t *testing.T) {
+	key, err := DeriveOriginStreamSessionKey("cluster-secret", "0123456789abcdef0123456789abcdef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprintf("%x", key); got != "44f44bbf54e68b804c61476384b968e8c210b9ee8bb9bb644d8e7f52a29b71de" {
+		t.Fatalf("key %s, want 44f44bbf54e68b804c61476384b968e8c210b9ee8bb9bb644d8e7f52a29b71de", got)
 	}
 }

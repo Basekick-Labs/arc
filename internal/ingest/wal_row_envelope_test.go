@@ -28,7 +28,7 @@ func TestLineProtocolWALEntriesCarryTheirDatabase(t *testing.T) {
 		t.Fatalf("wal.NewWriter: %v", err)
 	}
 
-	// Capture what the replication sender would receive.
+	// Capture what the replication hook (the origin stream) receives.
 	var (
 		mu       sync.Mutex
 		streamed [][]byte
