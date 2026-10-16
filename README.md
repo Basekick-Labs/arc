@@ -106,29 +106,28 @@ See Arc in action: [https://basekick.net/demos](https://basekick.net/demos)
 Benchmarked on Apple MacBook Pro M3 Max (14 cores, 36GB RAM, 1TB NVMe).
 Test config: 12 concurrent workers, 1000-record batches, columnar data.
 
-### Ingestion (August 2026)
+### Ingestion (October 2026)
 
 | Protocol | Throughput | p50 Latency | p99 Latency |
 |----------|------------|-------------|-------------|
-| MessagePack Columnar | **37.2M rec/s** | 0.27ms | 1.18ms |
-| MessagePack + Zstd | 24.9M rec/s | 0.42ms | 1.53ms |
-| MessagePack + GZIP | 24.6M rec/s | 0.42ms | 1.53ms |
-| Line Protocol | 8.9M rec/s | 1.11ms | 3.89ms |
+| MessagePack Columnar | **38.1M rec/s** | 0.26ms | 1.19ms |
+| MessagePack + Zstd | 30.3M rec/s | 0.35ms | 1.23ms |
+| MessagePack + GZIP | 26.4M rec/s | 0.39ms | 1.36ms |
+| Line Protocol | 9.3M rec/s | 1.07ms | 3.34ms |
 
 All rows measured over a 60-second sustained run. The MessagePack Columnar row is
-**2,235,912,000 records ingested in 60 seconds** — and that's not rows streamed into
+**2,288,281,000 records ingested in 60 seconds** — and that's not rows streamed into
 a memory buffer: every record was received over HTTP, decoded, time-sorted, and
-durably written to disk as queryable Parquet, at 0.27ms median latency, on a laptop.
+durably written to disk as queryable Parquet, at 0.26ms median latency, on a laptop.
 
-The MessagePack Columnar and Line Protocol rows were re-measured in October 2026 on
-main (ships in **27.01.1**): MessagePack Columnar was 34.0M rec/s (p99 1.40ms) in
-August; Line Protocol was 4.7M rec/s before line-protocol writes began parsing
-straight into typed columns (#1299), and wrote 536,806,000 records in 60 seconds.
+These numbers ship in **27.01.1**. Since 26.09.1 (34.0M, 24.9M, 24.6M and 4.7M
+rec/s): line-protocol writes parse straight into typed columns (#1299), and
+flushes copy each column once less on the way to Parquet.
 
-These numbers ship in **26.09.1**: ingest no longer dictionary-encodes Parquet
-(compaction re-encodes files anyway) and the msgpack columnar path now decodes
-payloads directly into typed column arrays, eliminating per-value allocations —
-see the 26.09.1 release notes.
+26.09.1 stopped dictionary-encoding Parquet at ingest (compaction re-encodes
+files anyway) and made the msgpack columnar path decode payloads directly into
+typed column arrays, eliminating per-value allocations — see the 26.09.1
+release notes.
 
 ### Compaction
 
