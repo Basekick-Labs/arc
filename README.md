@@ -110,19 +110,20 @@ Test config: 12 concurrent workers, 1000-record batches, columnar data.
 
 | Protocol | Throughput | p50 Latency | p99 Latency |
 |----------|------------|-------------|-------------|
-| MessagePack Columnar | **34.0M rec/s** | 0.29ms | 1.40ms |
+| MessagePack Columnar | **37.2M rec/s** | 0.27ms | 1.18ms |
 | MessagePack + Zstd | 24.9M rec/s | 0.42ms | 1.53ms |
 | MessagePack + GZIP | 24.6M rec/s | 0.42ms | 1.53ms |
 | Line Protocol | 8.9M rec/s | 1.11ms | 3.89ms |
 
 All rows measured over a 60-second sustained run. The MessagePack Columnar row is
-**2,043,451,000 records ingested in 60 seconds** — and that's not rows streamed into
+**2,235,912,000 records ingested in 60 seconds** — and that's not rows streamed into
 a memory buffer: every record was received over HTTP, decoded, time-sorted, and
-durably written to disk as queryable Parquet, at 0.29ms median latency, on a laptop.
+durably written to disk as queryable Parquet, at 0.27ms median latency, on a laptop.
 
-The Line Protocol row was re-measured in October 2026, after line-protocol writes
-began parsing straight into typed columns (#1299, ships in **27.01.1**): 536,806,000 records in 60 seconds,
-up from 4.7M rec/s.
+The MessagePack Columnar and Line Protocol rows were re-measured in October 2026 on
+main (ships in **27.01.1**): MessagePack Columnar was 34.0M rec/s (p99 1.40ms) in
+August; Line Protocol was 4.7M rec/s before line-protocol writes began parsing
+straight into typed columns (#1299), and wrote 536,806,000 records in 60 seconds.
 
 These numbers ship in **26.09.1**: ingest no longer dictionary-encodes Parquet
 (compaction re-encodes files anyway) and the msgpack columnar path now decodes
