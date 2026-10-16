@@ -231,3 +231,21 @@ func TestWALReplayKeepsColumnsNamedLikeTargetKeys(t *testing.T) {
 	require.Equal(t, "y", column(t, tables, "m")[0])
 	require.Equal(t, "prod", column(t, tables, "database")[0])
 }
+
+// A line-protocol write (typed parse, typed WAL entry) replays with its
+// values, types and NULL cells.
+func TestLPWriteReplaysFromTypedWALEntry(t *testing.T) {
+	tables := replayed(t, 10000, func(b *ingest.ArrowBuffer) {
+		body := "m,host=a i=0i,f=1.5,s=\"x\",b=t 1700000000000000000\n" +
+			"m,host=b i=1i,f=2 1700000001000000000\n" +
+			"m i=2i,s=\"z\" 1700000002000000000\n"
+		batches, rows, drops, err := ingest.NewLineProtocolParser().ParseLPWrite([]byte(body), "ns")
+		require.NoError(t, err)
+		require.Empty(t, drops)
+		require.NoError(t, b.WriteTypedColumnarDirect(context.Background(), "test", "m", batches["m"], rows["m"]))
+	})
+	require.Equal(t, map[int64]interface{}{0: 1.5, 1: 2.0, 2: nil}, column(t, tables, "f"))
+	require.Equal(t, map[int64]interface{}{0: "x", 1: nil, 2: "z"}, column(t, tables, "s"))
+	require.Equal(t, map[int64]interface{}{0: true, 1: nil, 2: nil}, column(t, tables, "b"))
+	require.Equal(t, map[int64]interface{}{0: "a", 1: "b", 2: nil}, column(t, tables, "host"))
+}

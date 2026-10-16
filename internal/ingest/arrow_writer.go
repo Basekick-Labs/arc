@@ -3204,7 +3204,7 @@ func (b *ArrowBuffer) writeTypedColumnarInternal(ctx context.Context, database, 
 // msgpack payload for the zero-copy WAL path. When rawPayload is non-empty
 // the WAL stores the original client bytes (AppendRawWithMeta, same as
 // writeColumnarInternal's fast path); otherwise the typed batch is
-// transposed to row records (typedBatchToWALRecords), NULL cells left out.
+// encoded as row entries (encodeTypedWALRows), NULL cells left out.
 // The typed msgpack decode path always supplies rawPayload.
 func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measurement string, typedColumns *TypedColumnBatch, numRecords int, rawPayload []byte, skipWAL bool) error {
 	bufferKey := database + "/" + measurement
@@ -3226,9 +3226,7 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 		payload := rawPayload
 		var err error
 		if len(payload) == 0 {
-			if walRecords := typedBatchToWALRecords(database, measurement, typedColumns, numRecords, b.getDecimalColumns(measurement)); len(walRecords) > 0 {
-				payload, err = msgpack.Marshal(walRecords)
-			}
+			payload, err = encodeTypedWALRows(database, measurement, typedColumns, numRecords, b.getDecimalColumns(measurement))
 		}
 		if err == nil && len(payload) > 0 {
 			prep, err = cs.wal.PrepareCovered(database, bufferKey, payload)
@@ -3260,14 +3258,13 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 				})
 			}
 		} else {
-			walRecords := typedBatchToWALRecords(database, measurement, typedColumns, numRecords, b.getDecimalColumns(measurement))
-			if len(walRecords) > 0 {
+			rowPayload, marshalErr := encodeTypedWALRows(database, measurement, typedColumns, numRecords, b.getDecimalColumns(measurement))
+			if len(rowPayload) > 0 || marshalErr != nil {
 				// With the database envelope, as the columnar path writes its
 				// row entries (#889), and charged to the request's WAL
 				// reservation as appended (#676): uncharged, a long import held
 				// its whole reservation while its WAL bytes also landed on the
 				// volume, so the disk gate counted them twice.
-				rowPayload, marshalErr := msgpack.Marshal(walRecords)
 				var err error
 				if marshalErr != nil {
 					err = marshalErr
@@ -3281,7 +3278,7 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 					b.recordWALError(err, func(ev *zerolog.Event) {
 						ev.Str("database", database).
 							Str("measurement", measurement).
-							Int("records", len(walRecords))
+							Int("records", numRecords)
 					})
 				}
 			}
@@ -3455,70 +3452,115 @@ func allNil(col []interface{}) bool {
 	return len(col) > 0
 }
 
-// typedBatchToWALRecords converts a TypedColumnBatch to row-format records for WAL storage.
-// This is the WAL fallback path for typed batches without raw msgpack bytes:
-// the CSV, Parquet and TLE imports. A NULL cell (Validity) is left out of its
-// row, even in a column NULL in every row (see allNil). Before, the slot's
-// zero value was written, so a NULL came back from replay as 0, "" or false.
-func typedBatchToWALRecords(database, measurement string, batch *TypedColumnBatch, numRecords int, decimalCols map[string]config.DecimalSpec) []map[string]interface{} {
+// encodeTypedWALRows encodes a TypedColumnBatch as a WAL row entry: the
+// msgpack array of row maps msgpack.Marshal makes of one map per row (each
+// column's cell, then "_database" and "_measurement"), written straight from
+// the typed columns with no per-row maps or boxed cells. This is the WAL
+// fallback for typed batches without raw msgpack bytes: line-protocol writes
+// and the CSV, Parquet, line-protocol and TLE imports. A NULL cell (Validity)
+// is left out of its row, even in a column NULL in every row (see allNil).
+// A column named like a target key is left out: the target keys win.
+func encodeTypedWALRows(database, measurement string, batch *TypedColumnBatch, numRecords int, decimalCols map[string]config.DecimalSpec) ([]byte, error) {
 	if numRecords == 0 {
-		return nil
+		return nil, nil
 	}
-
-	// Per column, its NULL bitmap (nil = no NULLs). The time column is never
-	// NULL.
-	nulls := make(map[string][]bool, len(batch.Validity))
-	for colName, valid := range batch.Validity {
-		if colName != "time" && len(valid) > 0 {
-			nulls[colName] = valid
+	type walCol struct {
+		name  string
+		data  interface{}
+		valid []bool // nil: no NULLs
+		scale int32
+	}
+	cols := make([]walCol, 0, len(batch.Data))
+	for name, data := range batch.Data {
+		if name == "_database" || name == "_measurement" {
+			continue
 		}
+		c := walCol{name: name, data: data}
+		// The time column is never NULL.
+		if valid := batch.Validity[name]; name != "time" && len(valid) > 0 {
+			c.valid = valid
+		}
+		if spec, ok := decimalCols[name]; ok {
+			c.scale = spec.Scale
+		}
+		cols = append(cols, c)
+	}
+	sort.Slice(cols, func(i, j int) bool { return cols[i].name < cols[j].name })
+	present := func(c *walCol, i int) bool {
+		if i < len(c.valid) && !c.valid[i] {
+			return false
+		}
+		switch arr := c.data.(type) {
+		case []int64:
+			return i < len(arr)
+		case []float64:
+			return i < len(arr)
+		case []string:
+			return i < len(arr)
+		case []bool:
+			return i < len(arr)
+		case []decimal128.Num:
+			return i < len(arr)
+		}
+		return false
 	}
 
-	records := make([]map[string]interface{}, numRecords)
+	var buf bytes.Buffer
+	enc := msgpack.NewEncoder(&buf)
+	if err := enc.EncodeArrayLen(numRecords); err != nil {
+		return nil, err
+	}
 	for i := 0; i < numRecords; i++ {
-		row := make(map[string]interface{}, len(batch.Data)+2)
-		for colName, colData := range batch.Data {
-			if valid := nulls[colName]; i < len(valid) && !valid[i] {
+		n := 2
+		for k := range cols {
+			if present(&cols[k], i) {
+				n++
+			}
+		}
+		if err := enc.EncodeMapLen(n); err != nil {
+			return nil, err
+		}
+		for k := range cols {
+			c := &cols[k]
+			if !present(c, i) {
 				continue
 			}
-			switch arr := colData.(type) {
+			if err := enc.EncodeString(c.name); err != nil {
+				return nil, err
+			}
+			var err error
+			switch arr := c.data.(type) {
 			case []int64:
-				if i < len(arr) {
-					row[colName] = arr[i]
-				}
+				err = enc.EncodeInt64(arr[i])
 			case []float64:
-				if i < len(arr) {
-					row[colName] = arr[i]
-				}
+				err = enc.EncodeFloat64(arr[i])
 			case []string:
-				if i < len(arr) {
-					row[colName] = arr[i]
-				}
+				err = enc.EncodeString(arr[i])
 			case []bool:
-				if i < len(arr) {
-					row[colName] = arr[i]
-				}
+				err = enc.EncodeBool(arr[i])
 			case []decimal128.Num:
 				// WAL stores decimals as float64 (lossy but WAL is recovery-only)
-				if i < len(arr) {
-					s := int32(0)
-					if decimalCols != nil {
-						if spec, ok := decimalCols[colName]; ok {
-							s = spec.Scale
-						}
-					}
-					f := arr[i].ToBigFloat(s)
-					row[colName], _ = f.Float64()
-				}
+				f, _ := arr[i].ToBigFloat(c.scale).Float64()
+				err = enc.EncodeFloat64(f)
+			}
+			if err != nil {
+				return nil, err
 			}
 		}
-		// The target keys go in last, so a user column cannot replace them.
-		row["_database"] = database
-		row["_measurement"] = measurement
-		records[i] = row
+		if err := enc.EncodeString("_database"); err != nil {
+			return nil, err
+		}
+		if err := enc.EncodeString(database); err != nil {
+			return nil, err
+		}
+		if err := enc.EncodeString("_measurement"); err != nil {
+			return nil, err
+		}
+		if err := enc.EncodeString(measurement); err != nil {
+			return nil, err
+		}
 	}
-
-	return records
+	return buf.Bytes(), nil
 }
 
 // convertColumnsToTyped converts []interface{} columns to typed arrays with null tracking.
