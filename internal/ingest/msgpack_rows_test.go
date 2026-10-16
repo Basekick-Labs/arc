@@ -12,7 +12,6 @@ import (
 	"math/rand"
 	"sort"
 	"testing"
-	"time"
 
 	"github.com/Basekick-Labs/msgpack/v6"
 	"github.com/basekick-labs/arc/pkg/models"
@@ -488,19 +487,36 @@ func TestRowsTypedSanitizesTags(t *testing.T) {
 	require.NotEqual(t, "us\xff", want)
 }
 
-// A row with very many keys decodes in linear time (a pairwise repeated-key
-// check took 7 s for 100,000 keys).
-func TestRowsTypedManyKeysLinear(t *testing.T) {
-	fields := make(map[string]interface{}, 100000)
-	tags := make(map[string]interface{}, 100000)
-	for i := 0; i < 100000; i++ {
+// A row with enough keys exercises the map-backed duplicate check in keySet.
+func TestRowsTypedManyKeys(t *testing.T) {
+	const keyCount = 128
+	fields := make(map[string]interface{}, keyCount)
+	tags := make(map[string]interface{}, keyCount)
+	for i := 0; i < keyCount; i++ {
 		fields[fmt.Sprintf("f%d", i)] = 1.0
 		tags[fmt.Sprintf("t%d", i)] = "x"
 	}
 	payload := mustMarshal(t, map[string]interface{}{"m": "cpu", "t": int64(1700000000), "fields": fields, "tags": tags})
-	start := time.Now()
-	_, rows, _, hit := rowsTyped(t, payload)
+	decoded, rows, _, hit := rowsTyped(t, payload)
 	require.True(t, hit)
 	require.Equal(t, 1, rows["cpu"])
-	require.Less(t, time.Since(start), 2*time.Second)
+	require.Len(t, decoded["cpu"].cols, 2*keyCount+2) // fields, tags, host, and time
+}
+
+func TestKeySetSwitchesToMapPastLinearThreshold(t *testing.T) {
+	var keys keySet
+	for i := 0; i < keySetLinear; i++ {
+		require.True(t, keys.add(fmt.Sprintf("key-%d", i)))
+	}
+	require.Nil(t, keys.set, "small maps should keep using the linear scan")
+	require.False(t, keys.add("key-0"), "duplicate keys must still be rejected before the transition")
+
+	require.True(t, keys.add("transition"))
+	require.NotNil(t, keys.set, "large maps must switch to map-backed duplicate detection")
+	require.Len(t, keys.set, keySetLinear+1)
+	for i := 0; i < keySetLinear; i++ {
+		require.Contains(t, keys.set, fmt.Sprintf("key-%d", i))
+		require.False(t, keys.add(fmt.Sprintf("key-%d", i)), "duplicate keys must be rejected after the transition")
+	}
+	require.False(t, keys.add("transition"))
 }
