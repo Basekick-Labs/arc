@@ -1712,6 +1712,37 @@ their size; each is now a `400`:
   columns, could be read differently by the fast and the generic decoder;
   such payloads now take the generic decoder, which decides.
 
+### Row-format msgpack writes are decoded straight into typed columns, keep the client's host tag, and drop only the points that do not fit
+
+Row-format msgpack (`{"m", "t", "h", "fields", "tags"}`, alone, in an array,
+or in `{"batch": [...]}`: the Python client's `write_records`) went through a
+map per row and per field, then a regrouping into columns. It is now decoded
+straight into typed columns per measurement. In-process (1,000 rows per
+request, M3 Max): 359 µs to 139 µs with the WAL off, 595 µs to 264 µs with it
+on, half the bytes and allocations.
+
+- **The client's host tag is kept.** A row without `h` had its `host` tag
+  replaced by `unknown`, so every row the Python client wrote (it sends
+  `tags`, never `h`) was stored as `host=unknown`. Now `h` sets the host
+  when sent, the row's own `host` tag is kept when not, and `unknown` is
+  written only when neither is there, as before.
+- **Points that do not fit are dropped, not the measurement** (as line
+  protocol writes, above): a value that does not fit its column's type (the
+  first value in the request decides), a tag or field named `time`, or two
+  keys of one row landing in one column. The others are written and the
+  answer is `400` "partial write: N points dropped"; the drops are logged
+  at Error. Before, a value of the wrong type failed the measurement's write
+  with a `500`; a field named `time` corrupted the time column; and a row
+  with a tag `x` and a field `x_value`, next to a row with a field `x`,
+  was accepted with a `204` and then made every flush of the buffer fail,
+  retried forever (or, depending on map order, panicked the flush and the
+  process). Rows still decoded the old way (decimal deployments, rows with
+  an unusual value type such as a float32 or a non-string tag) now get the
+  same treatment: the rows that cannot be written are dropped and the
+  answer is the same `400` partial write; MQTT logs them at Error and
+  writes the rest.
+- Tag values are made valid UTF-8, as field values already were.
+
 ### Stream takeover publishes the rows of unpulled files in one go, not in waves ([#1269](https://github.com/Basekick-Labs/arc/issues/1269))
 
 When a primary writer dies with files nobody had pulled yet, the new primary

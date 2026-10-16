@@ -341,3 +341,24 @@ func withoutTime(item map[string]interface{}) map[string]interface{} {
 	delete(cols, "time")
 	return item
 }
+
+// A row-format msgpack write (typed decode, typed WAL row entries) replays
+// with its values, NULLs and the client's host tag.
+func TestMsgPackRowsReplay(t *testing.T) {
+	tables := replayed(t, 10000, func(b *ingest.ArrowBuffer) {
+		payload, err := msgpack.Marshal([]interface{}{
+			map[string]interface{}{"m": "m", "t": int64(1700000000000), "tags": map[string]interface{}{"host": "ha"}, "fields": map[string]interface{}{"i": int64(0), "v": 0.5}},
+			map[string]interface{}{"m": "m", "t": int64(1700000000001), "tags": map[string]interface{}{"host": "hb"}, "fields": map[string]interface{}{"i": int64(1), "v": nil}},
+		})
+		require.NoError(t, err)
+		dec := ingest.NewMessagePackDecoder(zerolog.Nop())
+		dec.SetTypedDecodeEnabled(true)
+		recs, err := dec.Decode(payload)
+		require.NoError(t, err)
+		_, typed := recs.([]interface{})[0].(*ingest.TypedColumnarRecord)
+		require.True(t, typed)
+		require.NoError(t, b.Write(context.Background(), "test", recs))
+	})
+	require.Equal(t, map[int64]interface{}{0: 0.5, 1: nil}, column(t, tables, "v"))
+	require.Equal(t, map[int64]interface{}{0: "ha", 1: "hb"}, column(t, tables, "host"))
+}

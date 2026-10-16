@@ -301,8 +301,9 @@ localProcessing:
 			Msg("Decompressed payload")
 	}
 
-	// Decode MessagePack
-	records, err := h.decoder.Decode(payload)
+	// Decode MessagePack. Typed row-format decoding drops points it cannot
+	// write (line protocol's rules) and reports them; the rest are written.
+	records, recordCount, drops, err := h.decoder.DecodeWithDrops(payload)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to decode MessagePack")
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -325,14 +326,11 @@ localProcessing:
 	// data-corruption race. Copy at the boundary before it can escape.
 	database := strings.Clone(c.Get("x-arc-database"))
 
-	// Get record count based on type
-	var recordCount int
-	switch v := records.(type) {
-	case []interface{}:
-		recordCount = len(v)
-	default:
-		recordCount = 1
+	dropped := 0
+	for _, d := range drops {
+		dropped += d.Points
 	}
+	recordCount -= dropped // records written
 
 	h.logger.Debug().
 		Int("records", recordCount).
@@ -351,6 +349,12 @@ localProcessing:
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)",
 		})
+	}
+
+	if recordCount == 0 && dropped > 0 {
+		// Every point dropped: nothing to write (as line protocol answers).
+		logPointDrops(h.logger, "MessagePack", database, drops)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": partialWriteMessage(drops, dropped, false)})
 	}
 
 	// Extract measurements for validation and RBAC
@@ -381,7 +385,19 @@ localProcessing:
 		return respondWriteRefused(c, aerr)
 	}
 	defer release()
-	if err := h.arrowBuffer.Write(writeCtx, database, records); err != nil {
+	err = h.arrowBuffer.Write(writeCtx, database, records)
+	var rowDrops *ingest.PointsDroppedError
+	if errors.As(err, &rowDrops) {
+		// Rows the record path could not write (the others were written):
+		// a partial write, like the typed path's drops.
+		drops = append(drops, rowDrops.Drops...)
+		for _, d := range rowDrops.Drops {
+			dropped += d.Points
+			recordCount -= d.Points
+		}
+		err = nil
+	}
+	if err != nil {
 		// A fence refusal is expected during a failover: logged by reason,
 		// not counted as an ingest error (#1268).
 		if ingest.IsWriteRefusal(err) {
@@ -419,6 +435,11 @@ localProcessing:
 	m.IncIngestRecords(int64(recordCount))
 	m.IncIngestBytes(int64(len(payload)))
 	m.IncIngestBatches()
+
+	if dropped > 0 {
+		logPointDrops(h.logger, "MessagePack", database, drops)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": partialWriteMessage(drops, dropped, true)})
+	}
 
 	// Return 204 No Content (InfluxDB compatible)
 	return c.SendStatus(fiber.StatusNoContent)

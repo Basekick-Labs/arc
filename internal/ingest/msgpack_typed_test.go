@@ -410,14 +410,15 @@ func TestTypedDecodeWriteTimeRejects(t *testing.T) {
 }
 
 // TestTypedDecodeFallbackFormats: formats outside the typed scope must still
-// decode via the generic path (row format; arrays and batch of columnar
-// maps are typed, see msgpack_typed_arrays_test.go) and produce identical
+// decode via the generic path (compact "f" rows; columnar arrays and batch,
+// and row format, are typed: msgpack_typed_arrays_test.go,
+// msgpack_rows_test.go) and produce identical
 // results with the typed flag on.
 func TestTypedDecodeFallbackFormats(t *testing.T) {
 	payloads := map[string]interface{}{
-		"row_format": map[string]interface{}{
+		"row_format_compact_fields": map[string]interface{}{
 			"m": "cpu", "t": int64(1700000000000), "h": "srv",
-			"fields": map[string]interface{}{"v": int64(1)},
+			"f": []interface{}{int64(1), 2.5},
 		},
 	}
 	for name, p := range payloads {

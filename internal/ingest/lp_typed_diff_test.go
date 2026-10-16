@@ -274,7 +274,7 @@ func TestLPTypedRefusesTwoValuesForOneRow(t *testing.T) {
 	p := NewLineProtocolParser()
 	_, _, err := p.ParseLPTyped([]byte("cpu,host=x host=1i,host_value=2i\ncpu,host=y host=3i"), "ns", "",
 		map[string]map[string]LPKind{"cpu": {"host": LPKindString, "host_value": LPKindInt}})
-	require.ErrorContains(t, err, "two keys of one line")
+	require.ErrorContains(t, err, "two keys of one point")
 }
 
 // TypeColumnarRecord types a columnar record's columns as a write of it
