@@ -414,22 +414,15 @@ func (m *Manager) runCycle(ctx context.Context) error {
 	var totalErrors int
 	var orphansFound, orphansDeleted, orphanErrors int
 
-	// If the cold listing failed, the hot rows may be stale for files already
-	// moved to cold. Do not migrate or reconcile from that incomplete view;
-	// both wait for a cycle whose listing succeeds.
+	// If cold metadata synchronization failed, the hot rows may be stale for
+	// files already moved to cold. Do not migrate or reconcile from that
+	// incomplete view; retry on a later successful synchronization.
 	//
-	// This is a HALT, not a slow path, and on a node with no cluster gate it
-	// is reachable where it never was before #1179 — so the Warn has to name
-	// the cause. A cold bucket the node may read and write but not LIST is
-	// the likely one: nothing listed cold storage on a standalone node until
-	// the sync ran there, so a least-privilege policy had no reason to grant
-	// it. The other is a cold listing that does not fit in
-	// tiered_storage.scan_timeout, which the sync spends before the hot walk
-	// gets any of it.
+	// This also covers SQLite persistence and transaction errors, not only
+	// storage listing failures, so keep the operator message cause-neutral.
 	if scanResult.ColdSyncFailed {
 		m.logger.Warn().
-			Dur("scan_timeout", m.scanBudget()).
-			Msg("Cold tier could not be listed, so migration and orphan reconciliation are skipped this cycle and hot storage will keep growing until a listing succeeds. Check that the cold credentials allow listing the bucket or container, and that tiered_storage.scan_timeout covers a full cold listing as well as the hot scan")
+			Msg("Cold tier metadata sync failed, so migration and orphan reconciliation are skipped this cycle; retry after the sync succeeds")
 		totalErrors++
 	} else {
 		// Hot -> Cold migrations (2-tier system)
@@ -894,7 +887,7 @@ type ScanResult struct {
 	ColdSynced int `json:"cold_synced"`
 	// ColdSyncFailed is set when the cold tier could not be listed; the
 	// hot scan still ran, but this node's tier metadata may be stale until
-	// a listing succeeds.
+	// cold metadata synchronization succeeds.
 	ColdSyncFailed bool `json:"cold_sync_failed,omitempty"`
 	// HotRetired counts hot rows removed because their file is no longer
 	// in hot storage.
@@ -1036,6 +1029,18 @@ func isBudgetExpiry(err error) bool {
 	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
 }
 
+const coldTierMetadataBatchSize = 1000
+
+// coldSyncHooks expose only the persistence boundaries needed for deterministic
+// tests. Production callers pass nil and incur no hook behavior.
+type coldSyncHooks struct {
+	beforeBatchCommit  func() error
+	afterBatchCommit   func() error
+	afterBatchPersist  func()
+	afterFallbackWrite func()
+	onBatch            func(length, capacity int)
+}
+
 // syncColdTierMetadata makes this node's metadata reflect what is in cold
 // storage. In a gated cluster — shared storage, or per-node storage with
 // file replication — only the primary writer migrates, but the query layer
@@ -1053,6 +1058,10 @@ func isBudgetExpiry(err error) bool {
 // it worked from — those loaded plus those recorded — for the manifest
 // sweep.
 func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata, error) {
+	return m.syncColdTierMetadataWithHooks(ctx, nil)
+}
+
+func (m *Manager) syncColdTierMetadataWithHooks(ctx context.Context, hooks *coldSyncHooks) (int, []FileMetadata, error) {
 	lister, ok := m.coldBackend.(storage.ObjectLister)
 	if !ok {
 		return 0, nil, fmt.Errorf("cold backend does not support ListObjects")
@@ -1080,10 +1089,98 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 		unseen[f.Path] = true
 	}
 
-	synced, unparseable, quarantined := 0, 0, 0
+	unparseable := 0
+	synced, quarantined := 0, 0
+	touched := make(map[tierCacheScope]struct{})
+	defer m.metadata.invalidateTierCacheScopes(touched)
+	partialFailureCount := 0
+	var firstPartialErr error
+	batch := make([]FileMetadata, 0, coldTierMetadataBatchSize)
+
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		if hooks != nil && hooks.onBatch != nil {
+			hooks.onBatch(len(batch), cap(batch))
+		}
+		var beforeCommit func() error
+		var afterCommit func() error
+		if hooks != nil {
+			beforeCommit = hooks.beforeBatchCommit
+			afterCommit = hooks.afterBatchCommit
+		}
+		notWritten, batchScopes, outcomeUnknown, batchErr := m.metadata.recordColdFilesBatch(ctx, batch, time.Time{}, beforeCommit, afterCommit)
+		if batchErr == nil {
+			for scope := range batchScopes {
+				touched[scope] = struct{}{}
+			}
+			quarantinedPaths := make(map[string]struct{}, len(notWritten))
+			for _, path := range notWritten {
+				quarantinedPaths[path] = struct{}{}
+			}
+			for _, file := range batch {
+				if _, skipped := quarantinedPaths[file.Path]; skipped {
+					quarantined++
+					continue
+				}
+				synced++
+				coldRows = append(coldRows, file)
+			}
+			if hooks != nil && hooks.afterBatchPersist != nil {
+				hooks.afterBatchPersist()
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			batch = batch[:0]
+			return nil
+		}
+
+		if outcomeUnknown {
+			for scope := range batchScopes {
+				touched[scope] = struct{}{}
+			}
+			return fmt.Errorf("cold metadata batch outcome is unresolved: %w", batchErr)
+		}
+
+		m.logger.Warn().Int("files", len(batch)).Err(batchErr).Msg("Cold metadata batch rolled back; retrying rows individually")
+		for _, file := range batch {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			migratedAt := time.Time{}
+			if file.MigratedAt != nil {
+				migratedAt = *file.MigratedAt
+			}
+			wrote, err := m.metadata.recordColdFile(ctx, &file, migratedAt)
+			if err != nil {
+				partialFailureCount++
+				if firstPartialErr == nil {
+					firstPartialErr = fmt.Errorf("record cold file %s: %w", file.Path, err)
+					m.logger.Warn().Str("path", file.Path).Err(err).Msg("Failed to record cold file; additional row failures are counted")
+				}
+				continue
+			}
+			if !wrote {
+				quarantined++
+				continue
+			}
+			touched[tierCacheScope{database: file.Database, measurement: file.Measurement}] = struct{}{}
+			synced++
+			coldRows = append(coldRows, file)
+			if hooks != nil && hooks.afterFallbackWrite != nil {
+				hooks.afterFallbackWrite()
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		batch = batch[:0]
+		return nil
+	}
+
 	for _, obj := range objects {
-		// Past the deadline every remaining upsert would fail and log; stop
-		// with what was recorded — the next cycle continues from there.
 		if err := ctx.Err(); err != nil {
 			return synced, coldRows, err
 		}
@@ -1099,43 +1196,34 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 		}
 		info, err := m.parseFilePath(obj.Path)
 		if err != nil {
-			// Counted, not logged per file: a cold bucket shared with
-			// something else (an Iceberg warehouse, say) would fire on
-			// every object, every cycle.
 			unparseable++
 			continue
 		}
-		file := &FileMetadata{
-			Path:          obj.Path,
-			Database:      info.Database,
-			Measurement:   info.Measurement,
-			PartitionTime: info.PartitionTime,
-			SizeBytes:     obj.Size,
-			CreatedAt:     obj.LastModified,
-		}
-		wrote, err := m.metadata.RecordColdFile(ctx, file, obj.LastModified)
-		if err != nil {
-			m.logger.Warn().Str("path", obj.Path).Err(err).Msg("Failed to record cold file, skipping")
-			continue
-		}
-		if !wrote {
-			// Quarantined (#1086 stage C added that guard). The row is
-			// already the record that this key is unusable, and before the
-			// guard every cycle re-upserted it for as long as the listing
-			// kept returning the object. Not counted as synced and not
-			// appended to coldRows: the sweep must not act on it either.
-			quarantined++
-			continue
-		}
-		synced++
-		// As recorded: the sweep needs the tier and the migration stamp.
 		migratedAt := obj.LastModified
 		if migratedAt.IsZero() {
 			migratedAt = time.Now()
 		}
-		file.Tier = TierCold
-		file.MigratedAt = &migratedAt
-		coldRows = append(coldRows, *file)
+		batch = append(batch, FileMetadata{
+			Path:          obj.Path,
+			Database:      info.Database,
+			Measurement:   info.Measurement,
+			PartitionTime: info.PartitionTime,
+			Tier:          TierCold,
+			SizeBytes:     obj.Size,
+			CreatedAt:     obj.LastModified,
+			MigratedAt:    &migratedAt,
+		})
+		if len(batch) == cap(batch) {
+			if err := flush(); err != nil {
+				return synced, coldRows, err
+			}
+		}
+	}
+	if err := flush(); err != nil {
+		return synced, coldRows, err
+	}
+	if err := ctx.Err(); err != nil {
+		return synced, coldRows, err
 	}
 
 	if len(unseen) > 0 {
@@ -1158,7 +1246,10 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 		Int("synced", synced).
 		Int("unparseable", unparseable).
 		Int("quarantined_skipped", quarantined).
-		Msg("Cold tier metadata sync completed")
+		Msg("Cold tier metadata sync finished")
+	if partialFailureCount > 0 {
+		return synced, coldRows, fmt.Errorf("failed to record %d cold metadata rows during fallback; first failure: %w", partialFailureCount, firstPartialErr)
+	}
 	return synced, coldRows, nil
 }
 
