@@ -2067,6 +2067,14 @@ throughput. A negative value is refused at startup.
 Above the new ceiling, when the WAL queue is full, an entry is still dropped and
 the write still acknowledged. What admission should do instead is
 [#676](https://github.com/Basekick-Labs/arc/issues/676).
+### Initial writer-election tests wait for the manager's published state ([#1196](https://github.com/Basekick-Labs/arc/issues/1196))
+
+Raft records a promoted writer before the election goroutine updates the manager's
+`primaryID` and clears `failoverInProg`. Under load, the tests could observe the
+Raft state in that gap and fail. They now wait for the manager state they assert.
+Runtime election behaviour is unchanged.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1200](https://github.com/Basekick-Labs/arc/pull/1200).
 
 ### Ingest memory is visible while flushes back up ([#1038](https://github.com/Basekick-Labs/arc/issues/1038))
 
