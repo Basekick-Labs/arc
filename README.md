@@ -394,7 +394,6 @@ arc/
 │   ├── metrics/          # Prometheus metrics
 │   ├── mqtt/             # MQTT subscriber — topic-to-measurement ingestion
 │   ├── pruning/          # Query-time partition pruning
-│   ├── query/            # Parallel partition executor
 │   ├── queryregistry/    # Active/completed query tracking
 │   ├── scheduler/        # Continuous queries and retention policies
 │   ├── shutdown/         # Graceful shutdown coordinator

@@ -1170,6 +1170,35 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Aggregates over several hours no longer return one result per hour on `/api/v1/query`
+
+Since 26.02.1, a JSON query with the database in the `x-arc-database`
+header, one table, no quoted strings or comments, and a time range covering
+three or more hour partitions (a typical dashboard query, such as
+`SELECT COUNT(*) FROM cpu WHERE time > NOW() - INTERVAL 6 hour`) was fanned
+out as one DuckDB query per hour, and the per-hour results were
+concatenated. The response was a `200` with wrong data:
+
+- `COUNT(*)`, `SUM`, `AVG`, `MIN`, `MAX` and `GROUP BY` returned one row
+  per hour instead of one result;
+- `ORDER BY ... LIMIT n` returned up to `n` rows per hour, unordered across
+  hours; `DISTINCT` and window functions were also applied per hour.
+
+The same shape also failed in two other ways:
+
+- each hour held a DuckDB connection until the response was sent, so a
+  query over more hours than free connections (`database.max_connections`,
+  at least 4) never answered;
+- on `/api/v1/query/msgpack` it failed with `500` "Parser Error: syntax
+  error at or near "{"".
+
+The fan-out is removed: the hours a query selects are read in one
+`read_parquet` list, which DuckDB scans in parallel itself (measured over
+12 hour partitions: the same time for a full scan, faster for a filtered
+one). `/api/v1/query/arrow` was not affected. The query-management API still
+reports `is_parallel` and `partition_count`; they are now always `false` and
+omitted.
+
 ### In shared storage, a DELETE no longer leaves rows another writer has not flushed ([#1265](https://github.com/Basekick-Labs/arc/issues/1265))
 
 In shared storage (`cluster.shared_storage_mode`) every writer takes writes,
