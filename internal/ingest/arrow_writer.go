@@ -2066,94 +2066,118 @@ func (b *ArrowBuffer) columnarToWALRecords(database string, record *models.Colum
 // to the columnar format expected by the Arrow writer.
 //
 // The conversion:
-// - time column: populated from Record.Timestamp (microseconds) or Record.Time
-// - Tag columns: stored directly by tag name (matches Line Protocol behavior)
-// - Field columns: stored directly by field name (conflicts get "_value" suffix)
-func (b *ArrowBuffer) rowsToColumnar(measurement string, rows []*models.Record) *models.ColumnarRecord {
+//   - time column: populated from Record.Timestamp (microseconds) or Record.Time
+//   - Tag columns: stored directly by tag name (matches Line Protocol behavior)
+//   - Field columns: stored directly by field name; a field named like a tag
+//     of any row goes to "<name>_value"
+//
+// Each row gives each column at most one value. A row that cannot (two of its
+// keys land in one column: a tag "x_value" or a literal field "x_value" next
+// to a field "x" renamed for a tag "x"; or a tag or field named "time", the
+// timestamp's column) is left out and returned in drops. Before, such a row
+// made one column longer than the others: the write succeeded and its flush
+// failed, or panicked, every time.
+func (b *ArrowBuffer) rowsToColumnar(measurement string, rows []*models.Record) (*models.ColumnarRecord, []LPDrop) {
 	if len(rows) == 0 {
 		return &models.ColumnarRecord{
 			Measurement: measurement,
 			Columnar:    true,
 			Columns:     make(map[string][]interface{}),
-		}
+		}, nil
 	}
 
-	// Pre-allocate columns map - estimate based on first record
-	firstRow := rows[0]
-	estimatedCols := 1 + len(firstRow.Tags) + len(firstRow.Fields) // time + tags + fields
-	columns := make(map[string][]interface{}, estimatedCols)
-
-	// Initialize time column
-	columns["time"] = make([]interface{}, 0, len(rows))
-
-	// First pass: collect all unique column names across all rows
-	// This handles schema variations where different rows may have different fields/tags
+	// Tag names of every row: a field named like one is written to
+	// "<name>_value" (the naming line protocol uses per line).
 	allTags := make(map[string]struct{})
-	allFields := make(map[string]struct{})
 	for _, row := range rows {
 		for tag := range row.Tags {
 			allTags[tag] = struct{}{}
 		}
-		for field := range row.Fields {
-			allFields[field] = struct{}{}
-		}
 	}
 
-	// Initialize columns for all tags and fields
-	// Tags are stored directly by name (matching Line Protocol behavior)
-	// Fields that conflict with tags get "_value" suffix
-	for tag := range allTags {
-		columns[tag] = make([]interface{}, 0, len(rows))
+	// Each kept row's cells by final column name.
+	type rowCells struct {
+		ts    int64
+		cells map[string]interface{}
 	}
-	for field := range allFields {
-		if _, hasTag := allTags[field]; hasTag {
-			columns[field+"_value"] = make([]interface{}, 0, len(rows))
-		} else {
-			columns[field] = make([]interface{}, 0, len(rows))
-		}
-	}
-
-	// Second pass: populate columns with values
+	kept := make([]rowCells, 0, len(rows))
+	tagCols := make(map[string]struct{})
+	var timeKey, clash int
+	var clashCol string
 	for _, row := range rows {
-		// Handle timestamp: prefer Timestamp (microseconds) if set, otherwise convert Time
-		var timestamp int64
-		if row.Timestamp != 0 {
-			timestamp = row.Timestamp
-		} else if !row.Time.IsZero() {
-			timestamp = row.Time.UnixMicro()
-		} else {
-			// Use current time if no timestamp provided
-			timestamp = time.Now().UnixMicro()
+		_, tagTime := row.Tags["time"]
+		_, fieldTime := row.Fields["time"]
+		if tagTime || fieldTime {
+			timeKey++
+			continue
 		}
-		columns["time"] = append(columns["time"], timestamp)
+		cells := make(map[string]interface{}, len(row.Tags)+len(row.Fields))
+		bad := false
+		for tag, v := range row.Tags {
+			cells[tag] = v
+		}
+		for field, v := range row.Fields {
+			col := field
+			if _, isTag := allTags[field]; isTag {
+				col = field + "_value"
+			}
+			if _, taken := cells[col]; taken {
+				bad, clashCol = true, col
+				break
+			}
+			cells[col] = v
+		}
+		if bad {
+			clash++
+			continue
+		}
+		var ts int64
+		switch {
+		case row.Timestamp != 0:
+			ts = row.Timestamp
+		case !row.Time.IsZero():
+			ts = row.Time.UnixMicro()
+		default:
+			ts = time.Now().UnixMicro()
+		}
+		for tag := range row.Tags {
+			tagCols[tag] = struct{}{}
+		}
+		kept = append(kept, rowCells{ts: ts, cells: cells})
+	}
 
-		// Add tag values (nil for missing tags to maintain column alignment)
-		for tag := range allTags {
-			if val, ok := row.Tags[tag]; ok {
-				columns[tag] = append(columns[tag], val)
-			} else {
-				columns[tag] = append(columns[tag], nil)
-			}
-		}
+	var drops []LPDrop
+	if timeKey > 0 {
+		drops = append(drops, LPDrop{Measurement: measurement, Reason: LPDropTime, Points: timeKey})
+	}
+	if clash > 0 {
+		drops = append(drops, LPDrop{Measurement: measurement, Column: clashCol, Reason: LPDropSameColumn, Points: clash})
+	}
 
-		// Add field values (nil for missing fields to maintain column alignment)
-		// Fields that conflict with tags get "_value" suffix
-		for field := range allFields {
-			colName := field
-			if _, hasTag := allTags[field]; hasTag {
-				colName = field + "_value"
-			}
-			if val, ok := row.Fields[field]; ok {
-				columns[colName] = append(columns[colName], val)
-			} else {
-				columns[colName] = append(columns[colName], nil)
-			}
+	// Every column any kept row has a value for; one cell per row each.
+	names := make(map[string]struct{})
+	for _, r := range kept {
+		for col := range r.cells {
+			names[col] = struct{}{}
 		}
+	}
+	columns := make(map[string][]interface{}, len(names)+1)
+	times := make([]interface{}, len(kept))
+	for i, r := range kept {
+		times[i] = r.ts
+	}
+	columns["time"] = times
+	for col := range names {
+		vals := make([]interface{}, len(kept))
+		for i, r := range kept {
+			vals[i] = r.cells[col] // nil when the row has none: NULL
+		}
+		columns[col] = vals
 	}
 
 	// Collect tag column names for Parquet metadata (enables auto-dedup in compaction)
-	tagColumns := make([]string, 0, len(allTags))
-	for tag := range allTags {
+	tagColumns := make([]string, 0, len(tagCols))
+	for tag := range tagCols {
 		tagColumns = append(tagColumns, tag)
 	}
 
@@ -2162,7 +2186,7 @@ func (b *ArrowBuffer) rowsToColumnar(measurement string, rows []*models.Record) 
 		Columnar:    true,
 		Columns:     columns,
 		TagColumns:  tagColumns,
-	}
+	}, drops
 }
 
 // Write adds records to the buffer (for MessagePack handler)
@@ -2215,16 +2239,45 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 	}
 
 	// Convert grouped row records to columnar format and write
+	var drops []LPDrop
 	for measurement, rowRecords := range rowRecordsByMeasurement {
-		columnar := b.rowsToColumnar(measurement, rowRecords)
+		columnar, dropped := b.rowsToColumnar(measurement, rowRecords)
+		drops = append(drops, dropped...)
+		if len(columnar.Columns["time"]) == 0 {
+			continue // every row was dropped
+		}
 		if err := b.writeColumnar(ctx, database, columnar); err != nil {
 			b.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to write converted row records")
 			b.totalErrors.Add(1)
 			return err
 		}
 	}
+	if len(drops) > 0 {
+		sort.Slice(drops, func(i, j int) bool {
+			if drops[i].Measurement != drops[j].Measurement {
+				return drops[i].Measurement < drops[j].Measurement
+			}
+			return drops[i].Reason < drops[j].Reason
+		})
+		return &PointsDroppedError{Drops: drops}
+	}
 
 	return nil
+}
+
+// PointsDroppedError is Write's answer when it left out row records it could
+// not write as one row each (see rowsToColumnar) and wrote all the others:
+// the caller reports a partial write.
+type PointsDroppedError struct {
+	Drops []LPDrop
+}
+
+func (e *PointsDroppedError) Error() string {
+	n := 0
+	for _, d := range e.Drops {
+		n += d.Points
+	}
+	return fmt.Sprintf("%d points dropped, the others were written", n)
 }
 
 // WriteColumnarDirect writes columnar data directly to the buffer
