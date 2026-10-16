@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/basekick-labs/arc/internal/syscpu"
 	"github.com/spf13/viper"
@@ -1299,4 +1300,100 @@ func TestLoad_CompactionMaxFilesPerBatch(t *testing.T) {
 			t.Errorf("Compaction.MaxFilesPerBatch = %d, want 5 (from env)", cfg.Compaction.MaxFilesPerBatch)
 		}
 	})
+}
+
+// #1207: stream takeover timings are Go durations with a floor.
+func TestLoad_StreamTakeoverTimings(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Cluster.StreamTakeoverGrace != 60*time.Second || cfg.Cluster.StreamTakeoverDepartedTTL != 24*time.Hour {
+		t.Fatalf("defaults %v %v", cfg.Cluster.StreamTakeoverGrace, cfg.Cluster.StreamTakeoverDepartedTTL)
+	}
+	for _, tc := range []struct{ key, val string }{
+		{"ARC_CLUSTER_STREAM_TAKEOVER_GRACE", "5s"},
+		{"ARC_CLUSTER_STREAM_TAKEOVER_GRACE", "soon"},
+		{"ARC_CLUSTER_STREAM_TAKEOVER_DEPARTED_TTL", "30s"},
+	} {
+		t.Setenv(tc.key, tc.val)
+		if _, err := Load(); err == nil {
+			t.Errorf("%s=%s accepted", tc.key, tc.val)
+		}
+		os.Unsetenv(tc.key)
+	}
+}
+
+// A breaker fraction that is not a number above 0 is refused: NaN or 0 would
+// disable or misread the stale-local sweep's breaker (#1071).
+func TestLoad_StaleLocalSweepMaxFraction(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+	for _, v := range []string{"0", "-1", "NaN"} {
+		t.Setenv("ARC_CLUSTER_STALE_LOCAL_SWEEP_MAX_FRACTION", v)
+		if _, err := Load(); err == nil {
+			t.Fatalf("%s accepted", v)
+		}
+	}
+	t.Setenv("ARC_CLUSTER_STALE_LOCAL_SWEEP_MAX_FRACTION", "2")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Cluster.StaleLocalSweepMaxFraction != 2 || !cfg.Cluster.StaleLocalSweep {
+		t.Fatalf("%+v", cfg.Cluster)
+	}
+}
+
+// Raft pre-vote is on by default and can be turned off for a rolling upgrade
+// from a release without it (#1272).
+func TestLoad_RaftPreVote(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Cluster.RaftPreVote {
+		t.Fatal("cluster.raft_pre_vote defaults to off")
+	}
+	t.Setenv("ARC_CLUSTER_RAFT_PRE_VOTE", "false")
+	if cfg, err = Load(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Cluster.RaftPreVote {
+		t.Fatal("ARC_CLUSTER_RAFT_PRE_VOTE=false ignored")
+	}
+}
+
+// A forwarded import is bounded by a 1 h backstop by default, settable, 0 =
+// no bound (#1070).
+func TestLoad_ImportForwardTimeout(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Cluster.ImportForwardTimeoutMs != 3600000 {
+		t.Fatalf("cluster.import_forward_timeout_ms default %d, want 3600000", cfg.Cluster.ImportForwardTimeoutMs)
+	}
+	t.Setenv("ARC_CLUSTER_IMPORT_FORWARD_TIMEOUT_MS", "0")
+	if cfg, err = Load(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Cluster.ImportForwardTimeoutMs != 0 {
+		t.Fatalf("ARC_CLUSTER_IMPORT_FORWARD_TIMEOUT_MS=0 gave %d", cfg.Cluster.ImportForwardTimeoutMs)
+	}
 }

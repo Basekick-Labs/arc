@@ -38,9 +38,12 @@ type fakeOutboxManifest struct {
 	deleted     []string
 	batches     [][]string
 	existing    map[string]bool
-	claims      bool                   // StreamClaimsEnabled
-	coverage    []raft.FileCoverage    // coverage carried by registrations
-	refuse      func(path string) bool // a claim refuses this registration
+	claims      bool                    // StreamClaimsEnabled
+	coverage    []raft.InstanceCoverage // coverage carried by registrations
+	supersedes  []string                // Supersedes carried by registrations
+	refuse      func(path string) bool  // a claim refuses this registration
+	refuseKind  string                  // the refusal's kind (default claimed)
+	deleteSeen  map[string]uint64       // DeleteSeen carried by registrations
 }
 
 func newFakeOutboxManifest() *fakeOutboxManifest {
@@ -80,7 +83,7 @@ func (m *fakeOutboxManifest) GetFileEntry(path string) (*raft.FileEntry, bool) {
 func (m *fakeOutboxManifest) BatchFileOpsInManifestContext(_ context.Context, ops []raft.BatchFileOp) error {
 	var entries []raft.FileEntry
 	var paths, deletes []string
-	var refused []int
+	var refused []raft.RefusedOp
 	m.mu.Lock()
 	refuse := m.refuse
 	m.mu.Unlock()
@@ -99,11 +102,24 @@ func (m *fakeOutboxManifest) BatchFileOpsInManifestContext(_ context.Context, op
 		}
 		entries = append(entries, p.File)
 		paths = append(paths, p.File.Path)
+		m.mu.Lock()
+		kind := m.refuseKind
+		if m.deleteSeen == nil {
+			m.deleteSeen = map[string]uint64{}
+		}
+		m.deleteSeen[p.File.Path] = p.DeleteSeen
+		m.mu.Unlock()
+		if kind == "" {
+			kind = raft.RefusedClaimed
+		}
 		if refuse != nil && refuse(p.File.Path) {
-			refused = append(refused, i)
+			refused = append(refused, raft.RefusedOp{Op: i, Kind: kind})
 		}
 		m.mu.Lock()
-		m.coverage = append(m.coverage, p.Coverage...)
+		m.coverage = append(m.coverage, p.Cov2...)
+		if p.Supersedes != "" {
+			m.supersedes = append(m.supersedes, p.Supersedes)
+		}
 		m.mu.Unlock()
 	}
 	m.mu.Lock()
@@ -283,9 +299,13 @@ func TestOutboxRegistersFilesFlushedBeforeHandOff(t *testing.T) {
 func TestOutboxDropsNothingInSteadyState(t *testing.T) {
 	r := newTestOutbox(t, t.TempDir())
 	m := newFakeOutboxManifest()
-	store := &fakeOutboxStorage{sizes: map[string]int64{}}
-	r.HandOff(m, store, "writer-1")
 	const n = 10000
+	// The flushed files exist: every one is checked after its commit (#1214).
+	store := &fakeOutboxStorage{sizes: map[string]int64{}}
+	for i := 0; i < n; i++ {
+		store.sizes[fmt.Sprintf("db/cpu/2026/10/11/10/f%05d.parquet", i)] = 1
+	}
+	r.HandOff(m, store, "writer-1")
 	for i := 0; i < n; i++ {
 		register(r, fmt.Sprintf("db/cpu/2026/10/11/10/f%05d.parquet", i), 1)
 	}
@@ -326,17 +346,50 @@ func TestOutboxRetriesEveryFailure(t *testing.T) {
 	waitOutbox(t, "registered after failures", func() bool { return m.isRegistered(outPathA) })
 }
 
-// A file flushed by this process was just written: its first attempt costs no
-// storage request. On object storage each check is one.
-func TestOutboxChecksNoStorageOnAFreshFilesFirstAttempt(t *testing.T) {
+// A file flushed by this process was just written: its first attempt skips
+// the check before the commit. On object storage each check is one request,
+// so the only one it costs is the recheck after the commit (#1214).
+func TestOutboxChecksAFreshFileOnlyAfterItsCommit(t *testing.T) {
 	r := newTestOutbox(t, t.TempDir())
 	m := newFakeOutboxManifest()
 	store := &fakeOutboxStorage{sizes: map[string]int64{outPathA: 10}}
+	var before atomic.Int64
+	before.Store(-1)
+	m.beforeBatch = func([]string) { before.Store(store.stats.Load()) }
 	r.HandOff(m, store, "writer-1")
 	register(r, outPathA, 10)
-	waitOutbox(t, "registered", func() bool { return m.isRegistered(outPathA) })
-	if n := store.stats.Load(); n != 0 {
-		t.Fatalf("%d storage checks for a file registered on its first attempt", n)
+	waitOutbox(t, "settled", func() bool { return r.Pending() == 0 })
+	if !m.isRegistered(outPathA) {
+		t.Fatal("not registered")
+	}
+	if n := before.Load(); n != 0 {
+		t.Fatalf("%d storage checks before the commit of a file on its first attempt", n)
+	}
+	if n := store.stats.Load(); n != 1 {
+		t.Fatalf("%d storage checks in all, want the one recheck after the commit", n)
+	}
+}
+
+// #1214: on a shared object store a peer's DELETE, retention or database
+// delete can remove a fresh file between its flush and its commit. The fresh
+// file skips the check before the commit, so the recheck after it is what
+// takes the entry back out; without it the manifest keeps a ghost.
+func TestOutboxRemovesTheEntryOfAFreshFileDeletedBeforeItsCommit(t *testing.T) {
+	r := newTestOutbox(t, t.TempDir())
+	m := newFakeOutboxManifest()
+	store := &fakeOutboxStorage{sizes: map[string]int64{outPathA: 10}}
+	m.beforeBatch = func([]string) { store.remove(outPathA) }
+	r.HandOff(m, store, "writer-1")
+	register(r, outPathA, 10)
+	waitOutbox(t, "settled", func() bool { return r.Pending() == 0 })
+	if m.isRegistered(outPathA) {
+		t.Fatalf("a fresh file deleted before its commit was left in the manifest (deleted=%v)", m.deleted)
+	}
+	m.mu.Lock()
+	deleted := append([]string(nil), m.deleted...)
+	m.mu.Unlock()
+	if len(deleted) != 1 || deleted[0] != outPathA {
+		t.Fatalf("manifest deletes %v, want the vanished file", deleted)
 	}
 }
 
@@ -617,6 +670,10 @@ func TestOutboxHandOffStrandsNothing(t *testing.T) {
 		r := newTestOutbox(t, t.TempDir())
 		m := newFakeOutboxManifest()
 		const n = 50
+		store := &fakeOutboxStorage{sizes: map[string]int64{}}
+		for j := 0; j < n; j++ {
+			store.sizes[fmt.Sprintf("db/cpu/2026/10/11/10/s%02d.parquet", j)] = 1
+		}
 		var wg sync.WaitGroup
 		wg.Add(1)
 		go func() {
@@ -625,7 +682,7 @@ func TestOutboxHandOffStrandsNothing(t *testing.T) {
 				register(r, fmt.Sprintf("db/cpu/2026/10/11/10/s%02d.parquet", j), 1)
 			}
 		}()
-		r.HandOff(m, &fakeOutboxStorage{sizes: map[string]int64{}}, "writer-1")
+		r.HandOff(m, store, "writer-1")
 		wg.Wait()
 		waitOutbox(t, "all registered", func() bool { return r.Pending() == 0 })
 		m.mu.Lock()
@@ -696,7 +753,7 @@ func TestOutboxStopIsBounded(t *testing.T) {
 func TestOutboxStopRegistersTheFinalFlush(t *testing.T) {
 	r := newTestOutbox(t, t.TempDir())
 	m := newFakeOutboxManifest()
-	r.HandOff(m, &fakeOutboxStorage{sizes: map[string]int64{}}, "writer-1")
+	r.HandOff(m, &fakeOutboxStorage{sizes: map[string]int64{outPathA: 10}}, "writer-1")
 	register(r, outPathA, 10)
 	r.Stop()
 	if !m.isRegistered(outPathA) {

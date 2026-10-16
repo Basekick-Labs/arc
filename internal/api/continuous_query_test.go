@@ -131,6 +131,8 @@ func TestValidateTagColumns(t *testing.T) {
 		{"quote rejected (injection guard)", []string{"host\""}, true},
 		{"paren rejected", []string{"count(*)"}, true},
 		{"dot rejected", []string{"db.host"}, true},
+		{"leading underscore rejected (column not stored)", []string{"_host"}, true},
+		{"inner underscore valid", []string{"data_center_"}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -359,11 +361,20 @@ func TestContinuousQueryDatabaseValidation(t *testing.T) {
 			wantError: "invalid database name",
 		},
 		{
-			name:      "PUT requires database",
+			// An omitted database keeps the stored one since #1023; an empty
+			// one is still refused rather than blanking the column.
+			name:      "PUT refuses an empty database",
 			method:    "PUT",
-			body:      `{` + validFields + `}`,
+			body:      `{` + validFields + `,"database":""}`,
 			seedQuery: true,
 			wantError: "database is required",
+		},
+		{
+			name:      "PUT refuses a null database",
+			method:    "PUT",
+			body:      `{` + validFields + `,"database":null}`,
+			seedQuery: true,
+			wantError: "database may not be null",
 		},
 	}
 
@@ -409,38 +420,6 @@ func TestContinuousQueryDatabaseValidation(t *testing.T) {
 	}
 }
 
-func TestTimeColumnIsUnique(t *testing.T) {
-	tests := []struct {
-		name  string
-		times []interface{}
-		want  bool
-	}{
-		{"empty is unique", nil, true},
-		{"single is unique", []interface{}{int64(100)}, true},
-		{"distinct int64 times", []interface{}{int64(100), int64(200), int64(300)}, true},
-		{"duplicate int64 times (grouped, no tags)", []interface{}{int64(100), int64(100)}, false},
-		{"duplicate among distinct", []interface{}{int64(100), int64(200), int64(100)}, false},
-		{"distinct strings", []interface{}{"2026-01-01", "2026-01-02"}, true},
-		{"duplicate strings", []interface{}{"2026-01-01", "2026-01-01"}, false},
-	}
-	// Fails closed above the scan cap: an all-distinct output larger than the cap
-	// returns false (not dedup-safe) rather than building an unbounded map.
-	huge := make([]interface{}, maxUniquenessCheckRows+1)
-	for i := range huge {
-		huge[i] = int64(i)
-	}
-	if timeColumnIsUnique(huge) {
-		t.Errorf("expected false for output larger than the uniqueness-check cap (fail closed)")
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := timeColumnIsUnique(tt.times); got != tt.want {
-				t.Errorf("timeColumnIsUnique(%v) = %v, want %v", tt.times, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestValidateTagColumnsRejectsTime(t *testing.T) {
 	for _, name := range []string{"time", "TIME", "Time"} {
 		if err := validateTagColumns([]string{name}); err == nil {
@@ -456,8 +435,9 @@ func TestValidateTagColumnsRejectsTime(t *testing.T) {
 // A continuous query's measurement names are storage path segments of every
 // run, and until #1011 neither boundary applied a rule to source_measurement
 // while update applied one to destination_measurement only if the body
-// happened to carry it. Since the UPDATE overwrites every column, a partial
-// PUT stored blanks.
+// happened to carry it. Since the UPDATE then overwrote every column, a
+// partial PUT stored blanks. (Since #1023 an omitted field keeps its stored
+// value; a present one is still validated, which is what these cases check.)
 //
 // The two fields deliberately get different rules — the destination names a
 // measurement Arc creates, the source names one that already exists — so the
@@ -470,12 +450,14 @@ func TestContinuousQueryMeasurementValidation(t *testing.T) {
 	// every field at most once: a duplicate JSON key would leave the case
 	// resting on the decoder resolving it last-wins.
 	const rest = `"name":"test","database":"db","query":"SELECT * FROM src WHERE time >= {start_time} AND time < {end_time}","interval":"1h"`
+	// absent leaves a field out of the body; "" sends it empty.
+	const absent = "\x00absent"
 	body := func(source, destination string) string {
 		b := "{" + rest
-		if source != "" {
+		if source != absent {
 			b += `,"source_measurement":"` + source + `"`
 		}
-		if destination != "" {
+		if destination != absent {
 			b += `,"destination_measurement":"` + destination + `"`
 		}
 		return b + "}"
@@ -512,17 +494,26 @@ func TestContinuousQueryMeasurementValidation(t *testing.T) {
 			wantError: "invalid source_measurement",
 		},
 		{
-			name:      "PUT requires source_measurement",
+			// Omitting it keeps the stored value since #1023 (see
+			// TestCQUpdateOmittedRequiredFieldsKeepStoredValues); sending it
+			// empty is still refused.
+			name:      "PUT refuses an empty source_measurement",
 			method:    "PUT",
 			body:      body("", "dst"),
 			wantError: "source_measurement is required",
 		},
 		{
 			// 200 before #1011, and it blanked the column.
-			name:      "PUT requires destination_measurement",
+			name:      "PUT refuses an empty destination_measurement",
 			method:    "PUT",
 			body:      body("src", ""),
 			wantError: "destination_measurement is required",
+		},
+		{
+			name:      "POST requires source_measurement",
+			method:    "POST",
+			body:      body(absent, "dst"),
+			wantError: "source_measurement is required",
 		},
 		{
 			// The control: this one was already refused, by the
@@ -537,9 +528,9 @@ func TestContinuousQueryMeasurementValidation(t *testing.T) {
 			// validateCQQuery returns nil for an empty query because "the
 			// caller's own required-field check" reports it, which update
 			// did not have.
-			name:      "PUT requires query",
+			name:      "PUT refuses an empty query",
 			method:    "PUT",
-			body:      `{"name":"test","database":"db","source_measurement":"src","destination_measurement":"dst","interval":"1h"}`,
+			body:      `{"name":"test","database":"db","source_measurement":"src","destination_measurement":"dst","query":"","interval":"1h"}`,
 			wantError: "query is required",
 		},
 	}
@@ -609,9 +600,9 @@ func doCQRequest(t *testing.T, method, body string) (*http.Response, string) {
 	return resp, string(raw)
 }
 
-// handleUpdate maps a UNIQUE name collision the way handleCreate does. #1011
-// makes name mandatory on update, so a body carrying another definition's name
-// is an ordinary mistake, and it used to answer 500.
+// handleUpdate maps a UNIQUE name collision the way handleCreate does: a body
+// carrying another definition's name is an ordinary mistake, and it used to
+// answer 500.
 func TestContinuousQueryUpdateRejectsDuplicateName(t *testing.T) {
 	h := newSQLiteOnlyCQHandler(t, filepath.Join(t.TempDir(), "cq.db"))
 	defer h.sqliteDB.Close()

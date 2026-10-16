@@ -35,6 +35,7 @@ package tiering
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -71,6 +72,12 @@ const unlinkReasonAbandonedPull = "replication:abandoned"
 // internal/cluster/raft (UnlinkReasonSnapshotRemoved); neither package imports
 // the other.
 const unlinkReasonSnapshotRemoved = "snapshot:removed"
+
+// unlinkReasonStaleLocal is a copy the stale-local sweep removed: the
+// cluster deleted it while this node missed the delete, for a reason the
+// node never learned (#1071). Mirrored in internal/cluster
+// (UnlinkReasonStaleLocal).
+const unlinkReasonStaleLocal = "stale-local"
 
 // tierEventStopDrainTimeout is the whole drain's budget once Stop has been
 // signalled; each chunk gets what is left of it. Short on purpose: Stop runs
@@ -115,6 +122,11 @@ const (
 	// "it is gone" is decided from evidence, not from the reason — see
 	// applyUnlinked.
 	tierEventUnlinked
+	// tierEventMissing: the path left the cluster manifest and this node did
+	// not have the file when it went to remove it — something on this node
+	// had already removed it (its own compaction or retention run). Only a
+	// hot row this node still holds is retired; nothing about cold (#1271).
+	tierEventMissing
 )
 
 // tierEvent is one queued report.
@@ -395,6 +407,19 @@ func (m *Manager) RecordUnlinkedFile(path, reason string, sizeBytes int64) {
 		return
 	}
 	m.enqueueTierEvent(tierEvent{kind: tierEventUnlinked, path: path, reason: reason, sizeBytes: sizeBytes})
+}
+
+// RecordMissingFile reports a path that left the cluster manifest while this
+// node no longer had the file: its own compaction or retention run removed it
+// before the delete reached this node's worker, which then had nothing to
+// unlink (#1271). A hot row this node still holds for it is retired, once the
+// file is confirmed gone at apply time; a cold row is never touched and the
+// cold tier is not consulted. Never blocks; nil-receiver safe.
+func (m *Manager) RecordMissingFile(path string) {
+	if m == nil {
+		return
+	}
+	m.enqueueTierEvent(tierEvent{kind: tierEventMissing, path: path})
 }
 
 func (m *Manager) enqueueTierEvent(ev tierEvent) {
@@ -735,6 +760,8 @@ func (m *Manager) applyTierEventChunk(chunk []tierEvent, touched map[tierEventKe
 				probe = &p
 			}
 			wrote, err = m.applyUnlinked(ctx, info, ev.reason, probe)
+		case tierEventMissing:
+			wrote, err = m.applyMissing(ctx, info)
 		}
 
 		switch {
@@ -764,7 +791,8 @@ func (m *Manager) applyTierEventChunk(chunk []tierEvent, touched map[tierEventKe
 func reasonMayBeMigration(reason string) bool {
 	return strings.HasPrefix(reason, manifestReasonPrefix) ||
 		reason == unlinkReasonAbandonedPull ||
-		reason == unlinkReasonSnapshotRemoved
+		reason == unlinkReasonSnapshotRemoved ||
+		reason == unlinkReasonStaleLocal
 }
 
 // coldProbe is the answer of one cold-tier existence check.
@@ -993,6 +1021,37 @@ func (m *Manager) applyUnlinked(ctx context.Context, info *FileMetadata, reason 
 	if wrote {
 		// retireHotRow read them off the row that existed; prefer those over
 		// the path-derived pair in case an older row used another convention.
+		info.Database = database
+		info.Measurement = measurement
+	}
+	return wrote, err
+}
+
+// applyMissing retires the hot row of a path this node no longer holds. The
+// file is stat'ed again first: between the delete and this apply the path can
+// have been registered again and pulled (the queue would hold that pull ahead
+// of this event), and a hot row retired for a file on disk costs its
+// measurement the local glob once its other rows are cold. A stat that fails
+// keeps the row too; the next tier scan decides. Tier-conditional: a cold row
+// is never removed.
+func (m *Manager) applyMissing(ctx context.Context, info *FileMetadata) (bool, error) {
+	if m.hotBackend == nil {
+		return false, nil
+	}
+	// Most nodes reporting a path missing never held it: no row, nothing to
+	// stat or delete.
+	if existing, err := m.metadata.GetFile(ctx, info.Path); err != nil || existing == nil || existing.Tier != TierHot {
+		return false, err
+	}
+	n, err := m.hotBackend.StatFile(ctx, info.Path)
+	if err != nil {
+		return false, fmt.Errorf("confirm %s is gone before retiring its hot row: %w", info.Path, err)
+	}
+	if n >= 0 {
+		return false, nil
+	}
+	wrote, database, measurement, err := m.metadata.retireHotRow(ctx, info.Path)
+	if wrote {
 		info.Database = database
 		info.Measurement = measurement
 	}

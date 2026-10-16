@@ -337,10 +337,12 @@ func (h *BackupHandler) CreateBackup(c *fiber.Ctx) error {
 // GET /api/v1/backup
 //
 // With several configured targets (#1085 stage B2b-2) the listing fans out
-// over all of them and unions by backup ID. A target that will not answer is
-// NAMED in unreachable_targets and the response is still 200: one dead store
-// must not hide the backups on the others. 503 is kept for the case it was
-// introduced for — nothing could be read at all.
+// over all of them and unions by backup ID. A target that cannot provide a
+// complete listing, including one with an unreadable manifest, is NAMED in
+// unreachable_targets and the response is still 200: one failed store must
+// not hide the backups on the others. 503 is returned when no target can
+// provide a complete listing; one unreadable destination is not a trustworthy
+// answer for a single-target setup.
 func (h *BackupHandler) ListBackups(c *fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(c.Context(), 30*time.Second)
 	defer cancel()
@@ -369,7 +371,10 @@ func (h *BackupHandler) ListBackups(c *fiber.Ctx) error {
 		// Reached only when EVERY target failed; a partial failure is a 200
 		// naming the unreachable ones.
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-			"error":   fmt.Sprintf("could not list backups: %s is unreachable or unreadable; retry, or check the destination configuration", describeTargets(targets)),
+			// Also reached when a destination answers but one of its
+			// manifests cannot be read or parsed (#1123): a retry does not fix
+			// that, and the server log names the manifest.
+			"error":   fmt.Sprintf("could not list backups: %s is unreachable, or holds a backup manifest that cannot be read (the server log names it); retry, or check the destination", describeTargets(targets)),
 			"target":  h.manager.TargetName(),
 			"targets": targets,
 		})

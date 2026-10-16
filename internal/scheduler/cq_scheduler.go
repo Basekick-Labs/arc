@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/api"
+	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/license"
 	"github.com/rs/zerolog"
 )
@@ -352,6 +353,13 @@ func (s *CQScheduler) executeJob(job *cqJob) {
 		Msg("Executing scheduled CQ")
 
 	resp, err := s.cqHandler.ExecuteCQ(ctx, job.cqID)
+	if err != nil && ingest.IsWriteRefusal(err) {
+		// Skipped while writes are refused (#676); the handler logs it,
+		// sampled. Not an Error per tick.
+		s.logger.Debug().Err(err).Int64("cq_id", job.cqID).Str("cq_name", job.cqName).
+			Msg("Scheduled CQ skipped: writes are refused")
+		return
+	}
 	if err != nil {
 		s.logger.Error().
 			Err(err).

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -10,6 +11,8 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/cluster"
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/fieldschema"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -23,13 +26,33 @@ type DatabasesHandler struct {
 	storage        storage.Backend
 	requestTimeout time.Duration
 	deleteConfig   *config.DeleteConfig
+	coordinator    DatabaseDeleteCoordinator
+	gateNonPrimary bool
 	tieringManager databaseTieringManager
 	authManager    *auth.AuthManager
 	rbacManager    RBACChecker
 	logger         zerolog.Logger
 	icebergDropper IcebergCatalogDropper
 	fieldSchema    *fieldschema.Registry // optional, #914: anchors die with their database
+	// flusher and pending: a database deletion flushes the rows acknowledged
+	// before it and withdraws its pending registrations (#1207 d1).
+	flusher DeleteFlusher
+	pending DatabasePendingRegistrations
 }
+
+// DatabasePendingRegistrations withdraws every pending registration of a
+// database, so none registers after it is gone.
+type DatabasePendingRegistrations interface {
+	// record is the deletion's DELETE record (0 without one): batches of
+	// another writer process settle as deleted by it.
+	WithdrawDatabase(ctx context.Context, database string, record uint64) error
+}
+
+// SetFlusher installs the ingest buffer (nil on nodes that do not ingest).
+func (h *DatabasesHandler) SetFlusher(f DeleteFlusher) { h.flusher = f }
+
+// SetPendingRegistrations installs this node's registration outbox.
+func (h *DatabasesHandler) SetPendingRegistrations(p DatabasePendingRegistrations) { h.pending = p }
 
 type databaseTieringManager interface {
 	GetMetadata() *tiering.MetadataStore
@@ -38,6 +61,42 @@ type databaseTieringManager interface {
 	MigrationGate() (bool, string)
 	PrepareDatabaseDelete(ctx context.Context, database string, hotPaths []string) error
 	CleanupDatabaseDelete(ctx context.Context, database string, hotListed, hotFailed []string) (int, []error)
+}
+
+// DatabaseDeleteCoordinator supplies the cluster-wide part of database
+// deletion. A nil coordinator preserves standalone behavior.
+type DatabaseDeleteCoordinator interface {
+	IsPrimaryWriter() bool
+	Role() string
+	GetFileManifestByDatabase(database string) []*raft.FileEntry
+	BatchFileOpsInManifestContext(ctx context.Context, ops []raft.BatchFileOp) error
+	SyncManifest(ctx context.Context) error
+}
+
+// databaseDeleteManifestChunkSize bounds each Raft proposal of manifest
+// deletes; the same 200 as the tiering manager's manifestChunk. A batch a
+// non-leader primary forwards travels in a 1 MiB frame with its payload
+// encoded several times over, so 500 near-limit paths could exceed it.
+const databaseDeleteManifestChunkSize = 200
+
+// databaseDeleteManifestReason is the DeleteFilePayload reason for a database
+// drop. Same value as tiering's manifestReasonDatabaseDelete, so a peer treats
+// the unlink identically whichever path proposed it.
+const databaseDeleteManifestReason = "database:delete"
+
+// SetCoordinator wires cluster manifest updates into database deletion, and
+// with gateNonPrimary the primary-writer admission check. Pass gateNonPrimary
+// under the same condition the tiering manager's writer gate is wired
+// (shared storage or replication), so a cluster answers the same way whether
+// tiered storage is enabled or not: without either, nodes share nothing, the
+// manifest delete unlinks nothing on peers, and each node may delete its own
+// files. Call before RegisterRoutes, alongside the other handler wiring.
+func (h *DatabasesHandler) SetCoordinator(c DatabaseDeleteCoordinator, gateNonPrimary bool) {
+	if c == nil {
+		return
+	}
+	h.coordinator = c
+	h.gateNonPrimary = gateNonPrimary
 }
 
 // SetFieldSchema installs the field schema registry so deleting a database
@@ -388,6 +447,12 @@ func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
 			"error": fmt.Sprintf("invalid database name %q", name),
 		})
 	}
+	// Arc's own state, not a database: the list hides it, so this does too (#1012).
+	if storage.IsReservedRootDir(name) {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"error": "Database '" + name + "' not found",
+		})
+	}
 
 	// Gate on the resolved database, the same bar `SHOW TABLES FROM db`
 	// applies. Checked AFTER name validation so an invalid name is a 400
@@ -449,6 +514,11 @@ func (h *DatabasesHandler) handleListMeasurements(c *fiber.Ctx) error {
 			"error": fmt.Sprintf("invalid database name %q", name),
 		})
 	}
+	if storage.IsReservedRootDir(name) {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"error": "Database '" + name + "' not found",
+		})
+	}
 
 	// Gate on the resolved database, the same bar `SHOW TABLES FROM db`
 	// applies. Checked AFTER name validation so an invalid name is a 400
@@ -464,6 +534,11 @@ func (h *DatabasesHandler) handleListMeasurements(c *fiber.Ctx) error {
 	// and list measurements in a single operation.
 	markerPath := name + "/.arc-database"
 	markerExists, err := h.storage.Exists(ctx, markerPath)
+	if storage.IsStoreNotFound(err) {
+		// A bucket created on first write holds no marker yet, as
+		// listMeasurements below treats it (#945, #1242).
+		markerExists, err = false, nil
+	}
 	if err != nil {
 		h.logger.Error().Err(err).Str("database", name).Msg("Failed to check database marker")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -584,6 +659,18 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 			})
 		}
 		defer release()
+	} else if h.coordinator != nil && h.gateNonPrimary && !h.coordinator.IsPrimaryWriter() {
+		// No tiering manager: nothing above gated the request, so refuse a
+		// node that is not the primary writer here, as the row delete API and
+		// retention do (#1094). With tiering enabled, BeginDatabaseDelete
+		// already answers this case.
+		role := h.coordinator.Role()
+		h.logger.Warn().Str("database", name).Str("role", role).
+			Msg("Database deletion rejected: this node is not the primary writer")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": fmt.Sprintf("database delete rejected: node role %q is not primary writer; route to the primary writer", role),
+			"role":  role,
+		})
 	}
 
 	ctx, cancel := h.storageContext(c, h.requestTimeout)
@@ -608,6 +695,70 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 
+	// Rows acknowledged before the deletion and not in a file yet are flushed
+	// first, so they go with it. With stream takeover on, it is recorded in
+	// the cluster: rows of the database acknowledged before it that reach a
+	// file later are dropped (#1207 d1).
+	marks, err := flushBeforeDelete(ctx, h.flusher, name, "")
+	if err != nil {
+		c.Set(fiber.HeaderRetryAfter, "30")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "database deletion rejected: " + err.Error() + "; retry shortly",
+		})
+	}
+	// In shared storage the other nodes flush their buffered rows of the
+	// database first (#1265), under a deadline of their own: the request's
+	// storage deadline is spent by the local flush.
+	fctx, fcancel := h.storageContext(c, deletePeerFlushBudget)
+	unflushed, err := flushPeersBeforeDelete(fctx, h.coordinator, name, "", c.QueryBool("allow_unreachable"))
+	fcancel()
+	if err != nil {
+		c.Set(fiber.HeaderRetryAfter, "30")
+		body := fiber.Map{"error": "database deletion rejected: " + err.Error()}
+		if len(unflushed) > 0 {
+			body["unflushed_nodes"] = unflushed
+		}
+		return c.Status(fiber.StatusServiceUnavailable).JSON(body)
+	}
+	// The local flush may have spent the storage deadline: a new one from here.
+	cancel()
+	ctx, cancel = h.storageContext(c, h.requestTimeout)
+	// Before anything changes: another writer's flush still on its way to the
+	// manifest, deleted now, would be registered after it is gone (#1265). A
+	// retry finds it registered.
+	preListed, fresh, err := h.peerFlushesInFlight(ctx, name)
+	if err != nil {
+		h.logger.Error().Err(err).Str("database", name).Msg("Failed to list database files")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to list database files",
+		})
+	}
+	if len(fresh) > 0 {
+		c.Set(fiber.HeaderRetryAfter, "5")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": fmt.Sprintf("database deletion not run: %d file(s) another writer flushed are not registered in the cluster manifest yet (first: %s); retry shortly", len(fresh), fresh[0]),
+		})
+	}
+	var recordID uint64
+	if rec := recorderOf(h.coordinator); rec != nil {
+		if recordID, err = rec.RecordDelete(ctx, name, "", "", marks); err != nil {
+			c.Set(fiber.HeaderRetryAfter, "30")
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"error": "database deletion not run: recording it in the cluster failed or could not be confirmed (" + err.Error() + "); it may already apply to rows replayed later; retry to run it",
+			})
+		}
+	}
+	if h.pending != nil {
+		// Before any file is removed: an entry left pending would settle as
+		// lost once its file is gone, and stay claimable.
+		if err := h.pending.WithdrawDatabase(ctx, name, recordID); err != nil {
+			c.Set(fiber.HeaderRetryAfter, "30")
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"error": "database deletion not run: pending file registrations could not be withdrawn (" + err.Error() + "); retry shortly",
+			})
+		}
+	}
+
 	// List all files in the database
 	files, err := h.storage.List(ctx, name+"/")
 	if err != nil {
@@ -616,18 +767,40 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 			"error": "Failed to list database files",
 		})
 	}
-	// Deletion can make many independent storage calls. Scale the overall
-	// deadline with the number of listed files so a large database is not
-	// abandoned after the same fixed timeout as a small one.
+	files = h.withoutLateFlushes(ctx, name, files, preListed)
+	var manifestEntries []*raft.FileEntry
+	if h.coordinator != nil && h.tieringManager == nil {
+		// The snapshot below is this node's FSM, which can trail the leader;
+		// catch up first so registrations other writers just committed are
+		// included. A failure is logged, not fatal: the manifest batches
+		// below go through the leader and fail on their own if it is gone.
+		if err := h.coordinator.SyncManifest(ctx); err != nil {
+			h.logger.Warn().Err(err).Str("database", name).Msg("Could not sync the manifest before deleting the database; using this node's view")
+		}
+		manifestEntries = h.coordinator.GetFileManifestByDatabase(name)
+	}
+	// Deletion can make many independent storage and Raft calls. Scale the
+	// overall deadline with the local and manifest file counts so a large
+	// database is not abandoned after the same fixed timeout as a small one.
 	cancel()
-	ctx, cancel = h.storageContext(c, h.requestTimeout*time.Duration(len(files)+2))
+	ctx, cancel = h.storageContext(c, h.requestTimeout*time.Duration(len(files)+len(manifestEntries)+2))
 	if h.tieringManager != nil {
+		// #1091: the tiering manager removes the manifest entries itself
+		// (hot listing plus manifest snapshot, chunked, edge-sync spoke paths
+		// skipped) before any hot file is deleted.
 		if err := h.tieringManager.PrepareDatabaseDelete(ctx, name, files); err != nil {
 			h.logger.Error().Err(err).Str("database", name).Msg("Failed to remove database files from the cluster manifest")
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"error": "Failed to prepare database deletion",
 			})
 		}
+	} else if err := h.deleteDatabaseManifestEntries(ctx, name, files, manifestEntries); err != nil {
+		// #1094: a cluster without tiering has no tiering manager, so the
+		// manifest entries are removed here, with the same rules.
+		h.logger.Error().Err(err).Str("database", name).Msg("Failed to remove database files from the cluster manifest")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to prepare database deletion",
+		})
 	}
 
 	// Delete all files
@@ -754,7 +927,7 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		Int("files_deleted", deletedCount).
 		Msg("Deleted database")
 
-	return c.JSON(fiber.Map{
+	resp := fiber.Map{
 		"message":       "Database '" + name + "' deleted successfully",
 		"files_deleted": deletedCount,
 		// Broken out because a single total cannot distinguish a hot sweep
@@ -762,7 +935,96 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		// part an operator wants to see (#1091).
 		"hot_files_deleted":  len(hotDeleted),
 		"cold_files_deleted": coldDeletedCount,
-	})
+	}
+	if len(unflushed) > 0 {
+		// allow_unreachable: the rows these nodes hold were left.
+		resp["unflushed_nodes"] = unflushed
+	}
+	return c.JSON(resp)
+}
+
+// deletePeerFlushBudget bounds the flush a database deletion asks of the
+// other nodes in shared storage (#1265): their flush, then the registration
+// of what they flushed.
+var deletePeerFlushBudget = 90 * time.Second
+
+// databaseFileHolder is the registration outbox's view of a file it holds.
+type databaseFileHolder interface {
+	HoldsRegistration(path string) bool
+}
+
+// unregisteredFlush reports a Parquet file of a shared object store no
+// manifest entry covers, no compaction owns, and younger than
+// unregisteredFreshAge: a writer's flush its outbox may register without
+// looking at it again (#1265).
+func (h *DatabasesHandler) unregisteredFlush(ctx context.Context, path string) bool {
+	if !strings.HasSuffix(strings.ToLower(path), ".parquet") {
+		return false
+	}
+	if reg, ok := h.coordinator.(interface {
+		GetFileEntry(path string) (*raft.FileEntry, bool)
+	}); ok {
+		if _, listed := reg.GetFileEntry(path); listed {
+			return false
+		}
+	}
+	if so, ok := h.coordinator.(interface{ CompactionOwns(path string) bool }); ok && so.CompactionOwns(path) {
+		return false
+	}
+	age, known := objectAge(ctx, h.storage, path)
+	return known && age < unregisteredFreshAge
+}
+
+// peerFlushesInFlight lists the database in shared storage (nil elsewhere)
+// and returns, of what it lists, the files another writer flushed that are
+// not registered yet. This node's own pending files are not among them: the
+// deletion withdraws those.
+func (h *DatabasesHandler) peerFlushesInFlight(ctx context.Context, name string) (listed map[string]bool, fresh []string, err error) {
+	if !peerFlushOn(h.coordinator) || !sharedManifest(h.coordinator) {
+		return nil, nil, nil
+	}
+	if err := h.coordinator.SyncManifest(ctx); err != nil {
+		h.logger.Warn().Err(err).Str("database", name).Msg("Could not sync the manifest before checking for unregistered files; using this node's view")
+	}
+	files, err := h.storage.List(ctx, name+"/")
+	if err != nil {
+		return nil, nil, err
+	}
+	holder, _ := h.pending.(databaseFileHolder)
+	listed = make(map[string]bool, len(files))
+	for _, f := range files {
+		listed[f] = true
+		if holder != nil && holder.HoldsRegistration(f) {
+			continue
+		}
+		if h.unregisteredFlush(ctx, f) {
+			fresh = append(fresh, f)
+		}
+	}
+	return listed, fresh, nil
+}
+
+// withoutLateFlushes leaves out of the deletion the unregistered flushes
+// that appeared since peerFlushesInFlight listed the database: rows written
+// while it ran, whose writer would register the file after it is gone.
+func (h *DatabasesHandler) withoutLateFlushes(ctx context.Context, name string, files []string, listed map[string]bool) []string {
+	if listed == nil {
+		return files
+	}
+	kept := files[:0:0]
+	var late []string
+	for _, f := range files {
+		if !listed[f] && h.unregisteredFlush(ctx, f) {
+			late = append(late, f)
+			continue
+		}
+		kept = append(kept, f)
+	}
+	if len(late) > 0 {
+		h.logger.Warn().Str("database", name).Int("files", len(late)).Strs("sample", late[:min(len(late), 5)]).
+			Msg("Database deletion left files flushed while it ran and not registered yet; they hold rows written during the deletion")
+	}
+	return kept
 }
 
 // Helper functions
@@ -1018,9 +1280,14 @@ func (h *DatabasesHandler) listMeasurements(ctx context.Context, database string
 func (h *DatabasesHandler) databaseExists(ctx context.Context, name string) (bool, error) {
 	// Optimized: Check for database marker file directly instead of listing all databases.
 	// A database exists if it has a .arc-database marker file OR has any content.
+	//
+	// A bucket that does not exist yet (most S3-compatible stores create it
+	// on the first write) holds neither a marker nor content, so a missing
+	// store reads as "no such database" rather than failing the request: the
+	// first write after a create is what makes the bucket (#945, #1242).
 	markerPath := name + "/.arc-database"
 	exists, err := h.storage.Exists(ctx, markerPath)
-	if err != nil {
+	if err != nil && !storage.IsStoreNotFound(err) {
 		return false, err
 	}
 	if exists {
@@ -1030,16 +1297,91 @@ func (h *DatabasesHandler) databaseExists(ctx context.Context, name string) (boo
 	// Fallback: Check if there's any content in the database directory
 	// (for databases created before marker files were introduced)
 	files, err := h.storage.List(ctx, name+"/")
-	if err != nil {
+	if err != nil && !storage.IsStoreNotFound(err) {
 		return false, err
 	}
 	if len(files) > 0 {
 		return true, nil
 	}
 	if h.tieringManager != nil {
-		return h.tieringManager.DatabaseHasTierRows(ctx, name)
+		hasRows, err := h.tieringManager.DatabaseHasTierRows(ctx, name)
+		if err != nil || hasRows {
+			return hasRows, err
+		}
 	}
-	return false, nil
+	// A cluster node may hold none of the database's files locally while the
+	// manifest still lists them on peers (#1094).
+	return h.coordinator != nil && len(h.databaseManifestPaths(name, h.coordinator.GetFileManifestByDatabase(name))) > 0, nil
+}
+
+// databaseManifestPaths returns the manifest paths that belong to the database
+// by path, sorted and de-duplicated. The manifest indexes entries by their
+// Database FIELD, which for an edge-sync hub is the spoke's own database name
+// while the path is namespaced {spoke}/{db}/... (internal/edgesync/receive.go).
+// Those entries belong to the spoke and are skipped, as the tiering manager's
+// PrepareDatabaseDelete skips them: proposing them would unlink a spoke's
+// files on every node.
+func (h *DatabasesHandler) databaseManifestPaths(database string, entries []*raft.FileEntry) []string {
+	prefix := database + "/"
+	paths := make([]string, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if entry == nil || !strings.HasPrefix(entry.Path, prefix) {
+			continue
+		}
+		if _, ok := seen[entry.Path]; ok {
+			continue
+		}
+		seen[entry.Path] = struct{}{}
+		paths = append(paths, entry.Path)
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+// deleteDatabaseManifestEntries removes the Raft manifest entries in bounded
+// batches before any local file is deleted. Raft records each successful
+// batch; on failure the caller stops so a retry can continue from the
+// remaining entries while the local copies are still available.
+func (h *DatabasesHandler) deleteDatabaseManifestEntries(ctx context.Context, database string, localFiles []string, entries []*raft.FileEntry) error {
+	if h.coordinator == nil {
+		return nil
+	}
+	// The local listing joins the manifest snapshot, as in the tiering
+	// manager's PrepareDatabaseDelete: a file this node holds may be
+	// registered under another Database field (an edge-sync hub indexes a
+	// spoke's files by the spoke's own database name), or not yet registered.
+	paths := h.databaseManifestPaths(database, entries)
+	seen := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		seen[p] = struct{}{}
+	}
+	for _, p := range localFiles {
+		if _, ok := seen[p]; !ok && strings.HasPrefix(p, database+"/") {
+			seen[p] = struct{}{}
+			paths = append(paths, p)
+		}
+	}
+	sort.Strings(paths)
+
+	for start := 0; start < len(paths); start += databaseDeleteManifestChunkSize {
+		end := min(start+databaseDeleteManifestChunkSize, len(paths))
+		ops := make([]raft.BatchFileOp, 0, end-start)
+		for _, path := range paths[start:end] {
+			payload, err := json.Marshal(raft.DeleteFilePayload{Path: path, Reason: databaseDeleteManifestReason})
+			if err != nil {
+				return fmt.Errorf("marshal manifest delete for %q: %w", path, err)
+			}
+			ops = append(ops, raft.BatchFileOp{Type: raft.CommandDeleteFile, Payload: payload})
+		}
+		err := tiering.RetryTransient(ctx, 4, time.Second, func() error {
+			return h.coordinator.BatchFileOpsInManifestContext(ctx, ops)
+		}, cluster.IsTransientLeaderError)
+		if err != nil {
+			return fmt.Errorf("delete manifest batch %d-%d: %w", start, end, err)
+		}
+	}
+	return nil
 }
 
 func extractTopLevelDirs(files []string) []string {

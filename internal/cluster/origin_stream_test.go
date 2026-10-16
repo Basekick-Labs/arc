@@ -47,7 +47,7 @@ func originRig(t *testing.T, localID string, role NodeRole) *Coordinator {
 	}
 	waitFSM(t, func() bool { return raftNode.FSM().GetPrimaryWriterID() == "writer-1" })
 	c := &Coordinator{
-		cfg:        &config.ClusterConfig{SharedSecret: osSecret, ClusterName: "test-cluster"},
+		cfg:        &config.ClusterConfig{SharedSecret: osSecret, ClusterName: "test-cluster", NodeID: localID},
 		registry:   reg,
 		localNode:  local,
 		raftNode:   raftNode,
@@ -157,59 +157,101 @@ func TestOriginStreamTarget(t *testing.T) {
 	}
 }
 
-// The trim guard: this FSM must have applied what the primary had, and
-// every current hot file of the measurement must be here at its size —
-// a compaction output included.
-func TestOriginStreamTrimReady(t *testing.T) {
+// The trim guard with stream claims off: nothing claims from the copy, so
+// only this FSM's progress bounds the trim; files do not matter (#1266).
+func TestOriginStreamTrimReadyClaimsOff(t *testing.T) {
 	c := originRig(t, "writer-2", RoleWriter)
+	store, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.storage = store
+	pass := (&originStream{}).trimReady(c)
+	ready := func(idx uint64) bool {
+		return pass(context.Background(), []originstream.TrimRequest{{TrimKey: originstream.TrimKey{Origin: "writer-1", Instance: 1, Key: "db/cpu", AppliedIndex: idx}, CSeqs: [][2]uint64{{1, 5}}}})[0]
+	}
+	if err := c.raftNode.RegisterFile(raft.FileEntry{Path: "db/cpu/a.parquet", Database: "db", Measurement: "cpu", SizeBytes: 3, Tier: "hot", OriginNodeID: "writer-1", CreatedAt: time.Now(), SHA256: "x", PartitionTime: time.Now()}, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	idx := c.raftNode.FSM().AppliedDone()
+	if !ready(idx) {
+		t.Fatal("claims off: not ready with this FSM caught up")
+	}
+	if ready(idx + 1000) {
+		t.Fatal("ready before this FSM applied the primary's index")
+	}
+}
+
+// The trim guard with stream claims on: a request waits only for the files
+// whose coverage holds its batches. An unpulled file of other batches, or an
+// unpulled compaction output, does not hold it back (#1266).
+func TestOriginStreamTrimReadyPerBatch(t *testing.T) {
+	c, _ := takeoverOriginRig(t, true)
 	dir := t.TempDir()
 	store, err := storage.NewLocalBackend(dir, zerolog.Nop())
 	if err != nil {
 		t.Fatal(err)
 	}
 	c.storage = store
-	st := &originStream{present: map[string]int64{}}
-	pass := st.trimReady(c)
-	ready := func(origin, key string, idx uint64) bool {
-		k := originstream.TrimKey{Origin: origin, Key: key, AppliedIndex: idx}
-		return pass(context.Background(), []originstream.TrimKey{k})[k]
-	}
-	reg := func(path string, size int64) {
-		t.Helper()
-		if err := c.raftNode.RegisterFile(raft.FileEntry{Path: path, Database: "db", Measurement: "cpu", SizeBytes: size, Tier: "hot", OriginNodeID: "writer-1", CreatedAt: time.Now(), SHA256: "x", PartitionTime: time.Now()}, 5*time.Second); err != nil {
-			t.Fatal(err)
-		}
-	}
-	reg("db/cpu/2026/10/11/10/a.parquet", 3)
-	idx := c.raftNode.FSM().AppliedDone()
-	if ready("writer-1", "db/cpu", idx) {
-		t.Fatal("ready while the file is not here")
-	}
-	if err := store.Write(context.Background(), "db/cpu/2026/10/11/10/a.parquet", []byte("abc")); err != nil {
+	peer := NewNode("writer-2", "writer-2", RoleWriter, "test-cluster")
+	peer.UpdateState(StateHealthy)
+	if err := c.registry.Register(peer); err != nil {
 		t.Fatal(err)
 	}
-	if !ready("writer-1", "db/cpu", idx) {
-		t.Fatal("not ready with every file here")
+	propose(t, c, raft.CommandAnnounceInstance, raft.AnnounceInstancePayload{Origin: "writer-2", Instance: 0x10, FreshStart: true})
+	propose(t, c, raft.CommandAnnounceInstance, raft.AnnounceInstancePayload{Origin: "writer-2", Instance: 0x11})
+	hour := time.Now().Truncate(time.Hour)
+	reg := func(path string, size int64, cov ...raft.InstanceCoverage) {
+		t.Helper()
+		propose(t, c, raft.CommandRegisterFile, raft.RegisterFilePayload{
+			File: raft.FileEntry{Path: path, SHA256: path, SizeBytes: size, Database: "db", Measurement: "cpu",
+				PartitionTime: hour, OriginNodeID: "writer-2", CreatedAt: time.Now()}, Cov2: cov})
 	}
-	// Every file this FSM knows is here, but it has not applied what the
-	// primary had: a registration it has not seen could be missing.
-	if ready("writer-1", "db/cpu", idx+1000) {
+	reg("db/cpu/old.parquet", 3, raft.InstanceCoverage{Instance: 0x10, Key: "db/cpu", Ranges: [][2]uint64{{1, 5}}})
+	reg("db/cpu/new.parquet", 4, raft.InstanceCoverage{Instance: 0x10, Key: "db/cpu", Ranges: [][2]uint64{{6, 9}}})
+	reg("db/cpu/compacted.parquet", 5)
+	idx := c.raftNode.FSM().AppliedDone()
+	st := &originStream{}
+	pass := st.trimReady(c)
+	ask := func(inst uint64, lo, hi uint64) bool {
+		return pass(context.Background(), []originstream.TrimRequest{{TrimKey: originstream.TrimKey{Origin: "writer-2", Instance: inst, Key: "db/cpu", AppliedIndex: idx}, CSeqs: [][2]uint64{{lo, hi}}}})[0]
+	}
+	if ask(0x10, 1, 5) {
+		t.Fatal("ready while the file holding the batches is not here")
+	}
+	// A path verified at another size is not taken from the cache.
+	st.trimPresent = map[string]int64{"db/cpu/old.parquet": 9}
+	if ask(0x10, 1, 5) {
+		t.Fatal("ready from a cache entry at another size")
+	}
+	if err := store.Write(context.Background(), "db/cpu/old.parquet", []byte("ab")); err != nil {
+		t.Fatal(err)
+	}
+	if ask(0x10, 1, 5) {
+		t.Fatal("ready with the file here at another size")
+	}
+	if err := store.Write(context.Background(), "db/cpu/old.parquet", []byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	if !ask(0x10, 1, 5) {
+		t.Fatal("not ready: an unpulled file of other batches or a compaction output held it back")
+	}
+	if ask(0x10, 5, 6) || ask(0x10, 6, 9) {
+		t.Fatal("ready while a file holding some of the batches is not here")
+	}
+	if !ask(0x11, 1, 9) {
+		t.Fatal("an untracked instance is never claimed: its batches need no file")
+	}
+	// The order: an FSM behind the floors answers no before anything else,
+	// even for an untracked instance.
+	r := originstream.TrimRequest{TrimKey: originstream.TrimKey{Origin: "writer-2", Instance: 0x11, Key: "db/cpu", AppliedIndex: idx + 1000}, CSeqs: [][2]uint64{{1, 1}}}
+	if pass(context.Background(), []originstream.TrimRequest{r})[0] {
 		t.Fatal("ready before this FSM applied the primary's index")
 	}
-	// A compaction output registered later is current: required too.
-	reg("db/cpu/2026/10/11/10/compacted.parquet", 5)
-	if ready("writer-1", "db/cpu", idx) {
-		t.Fatal("ready while a current file (a compaction output) is missing")
-	}
-	// Another measurement does not matter.
-	if err := c.raftNode.RegisterFile(raft.FileEntry{Path: "db/mem/x.parquet", Database: "db", Measurement: "mem", SizeBytes: 9, Tier: "hot", CreatedAt: time.Now(), SHA256: "x", PartitionTime: time.Now()}, 5*time.Second); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Write(context.Background(), "db/cpu/2026/10/11/10/compacted.parquet", []byte("12345")); err != nil {
-		t.Fatal(err)
-	}
-	if !ready("writer-1", "db/cpu", idx) {
-		t.Fatal("another measurement's missing file blocked this one")
+	// An origin this node does not hear from keeps everything.
+	peer.UpdateState(StateUnhealthy)
+	if ask(0x11, 1, 9) || ask(0x10, 1, 5) {
+		t.Fatal("trimmed the records of an origin that is not heard from")
 	}
 }
 
@@ -221,4 +263,71 @@ func newTestWALWriter(t *testing.T) *wal.Writer {
 	}
 	t.Cleanup(func() { _ = w.Close() })
 	return w
+}
+
+// Batches a standby kept while stream claims were off belong to an instance
+// that, once the flag turns on, announces as not a fresh start: it is
+// untracked and never claimed, so its batches still need no file (#1266).
+func TestOriginStreamTrimReadyClaimsTurnOn(t *testing.T) {
+	c, _ := takeoverOriginRig(t, false)
+	store, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.storage = store
+	peer := NewNode("writer-2", "writer-2", RoleWriter, "test-cluster")
+	peer.UpdateState(StateHealthy)
+	if err := c.registry.Register(peer); err != nil {
+		t.Fatal(err)
+	}
+	pass := (&originStream{}).trimReady(c)
+	ask := func() bool {
+		idx := c.raftNode.FSM().AppliedDone()
+		return pass(context.Background(), []originstream.TrimRequest{{TrimKey: originstream.TrimKey{Origin: "writer-2", Instance: 0x20, Key: "db/cpu", AppliedIndex: idx}, CSeqs: [][2]uint64{{1, 5}}}})[0]
+	}
+	if !ask() {
+		t.Fatal("claims off: not ready")
+	}
+	capNodes(t, c, map[string][]string{"raft-1": capList, "writer-1": capList, "writer-2": capList, "reader-1": capList})
+	c.maybeEnableStreamClaims()
+	waitFSM(t, c.StreamClaimsEnabled)
+	propose(t, c, raft.CommandAnnounceInstance, raft.AnnounceInstancePayload{Origin: "writer-2", Instance: 0x20})
+	propose(t, c, raft.CommandRegisterFile, raft.RegisterFilePayload{
+		File: raft.FileEntry{Path: "db/cpu/late.parquet", SHA256: "x", SizeBytes: 3, Database: "db", Measurement: "cpu",
+			PartitionTime: time.Now().Truncate(time.Hour), OriginNodeID: "writer-2", CreatedAt: time.Now()},
+		Cov2: []raft.InstanceCoverage{{Instance: 0x20, Key: "db/cpu", Ranges: [][2]uint64{{1, 5}}}}})
+	if !ask() {
+		t.Fatal("an instance announced after the flag (not a fresh start) held its batches for a file")
+	}
+}
+
+// The claimant drops a copy it no longer needs once the files holding the
+// instance's rows of those keys are here; a compaction output does not hold
+// it back.
+func TestInstanceFilesLocal(t *testing.T) {
+	c, _ := takeoverOriginRig(t, true)
+	store, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.storage = store
+	propose(t, c, raft.CommandAnnounceInstance, raft.AnnounceInstancePayload{Origin: "writer-2", Instance: 0x30, FreshStart: true})
+	hour := time.Now().Truncate(time.Hour)
+	reg := func(path string, cov ...raft.InstanceCoverage) {
+		propose(t, c, raft.CommandRegisterFile, raft.RegisterFilePayload{
+			File: raft.FileEntry{Path: path, SHA256: path, SizeBytes: 3, Database: "db", Measurement: "cpu",
+				PartitionTime: hour, OriginNodeID: "writer-2", CreatedAt: time.Now()}, Cov2: cov})
+	}
+	reg("db/cpu/i30.parquet", raft.InstanceCoverage{Instance: 0x30, Key: "db/cpu", Ranges: [][2]uint64{{1, 5}}})
+	reg("db/cpu/compacted.parquet")
+	local := (&originStream{}).instanceFilesLocal(c)
+	if local(context.Background(), 0x30, []string{"db/cpu"}) {
+		t.Fatal("local without the instance's file")
+	}
+	if err := store.Write(context.Background(), "db/cpu/i30.parquet", []byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	if !local(context.Background(), 0x30, []string{"db/cpu"}) {
+		t.Fatal("a missing compaction output held the drop back")
+	}
 }

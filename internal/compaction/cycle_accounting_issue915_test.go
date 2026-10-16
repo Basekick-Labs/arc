@@ -3,6 +3,7 @@ package compaction
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -64,12 +65,11 @@ func TestCycleWorkerWaitCancellationAccountingIssue915(t *testing.T) {
 		return ctx.Err()
 	}
 
-	filterCalls := 0
+	var filterCalls atomic.Int32
 	manager.SetSyncEligibility(func(
 		_ context.Context, paths []string,
 	) (map[string]bool, error) {
-		filterCalls++
-		if filterCalls == 2 {
+		if filterCalls.Add(1) == 2 {
 			close(secondFiltered)
 		}
 		eligible := make(map[string]bool, len(paths))
@@ -102,6 +102,20 @@ func TestCycleWorkerWaitCancellationAccountingIssue915(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatal("cycle did not reach expected worker/capacity state")
 		}
+	}
+	// The second batch is counted as discovered after its eligibility
+	// callback returns, and a cancel between the two ends discovery before
+	// it is counted (#1136). Cancel once the running cycle reports it.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		rec, found, _, _, _ := manager.CycleLookup(manager.RunningCycleID())
+		if found && rec.Discovered == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the running cycle never counted the second batch as discovered: %+v", rec)
+		}
+		time.Sleep(time.Millisecond)
 	}
 
 	cancel()

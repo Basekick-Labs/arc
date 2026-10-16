@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -47,9 +48,11 @@ type ContinuousQueryHandler struct {
 	db          *database.DuckDB
 	storage     storage.Backend
 	arrowBuffer *ingest.ArrowBuffer
-	fieldSchema *fieldschema.Registry // optional, #914
-	config      *config.ContinuousQueryConfig
-	sqliteDB    *sql.DB
+	// lastSkipLogNano samples logSkippedRun (#676).
+	lastSkipLogNano atomic.Int64
+	fieldSchema     *fieldschema.Registry // optional, #914
+	config          *config.ContinuousQueryConfig
+	sqliteDB        *sql.DB
 	// ownsDB records whether this handler opened sqliteDB itself. When CQ
 	// shares the auth database (the default), the handle is borrowed and Close
 	// must leave it to its owner.
@@ -83,9 +86,11 @@ type ContinuousQuery struct {
 	Query                  string  `json:"query"`
 	Interval               string  `json:"interval"`
 	// TagColumns are the output columns that are grouping dimensions (not
-	// aggregates). They are written as Parquet `arc:tags` metadata so that
-	// compaction can dedup CQ output on (tags, time), making re-emitted windows
-	// idempotent (#521). Empty means no dedup key — duplicate windows accumulate.
+	// aggregates). They are written as Parquet `arc:tags` metadata and narrow
+	// where compaction compares rows (#521). Compaction removes only rows
+	// identical in every column (#1232): an identical copy of a window
+	// collapses, and a re-emitted window whose values changed is kept beside
+	// the original, with or without tag columns.
 	TagColumns            []string `json:"tag_columns"`
 	RetentionDays         *int     `json:"retention_days"`
 	DeleteSourceAfterDays *int     `json:"delete_source_after_days"`
@@ -98,19 +103,28 @@ type ContinuousQuery struct {
 	UpdatedAt             string   `json:"updated_at"`
 }
 
-// ContinuousQueryRequest represents a request to create/update a CQ
+// ContinuousQueryRequest represents a request to create/update a CQ.
+//
+// Every field distinguishes an absent key from a null one (#1023). Create
+// requires name, database, both measurements, query and interval. Update is a
+// partial update: an absent key keeps the stored value, a present one is
+// validated with the create rules and written, and null clears the four
+// fields that can be empty (description, tag_columns, retention_days,
+// delete_source_after_days); null on any other field is refused. Before #1023
+// every field was written unconditionally, so a PUT that left out is_active
+// stored false and stopped the continuous query with a 200.
 type ContinuousQueryRequest struct {
-	Name                   string   `json:"name"`
-	Description            *string  `json:"description"`
-	Database               string   `json:"database"`
-	SourceMeasurement      string   `json:"source_measurement"`
-	DestinationMeasurement string   `json:"destination_measurement"`
-	Query                  string   `json:"query"`
-	Interval               string   `json:"interval"`
-	TagColumns             []string `json:"tag_columns"`
-	RetentionDays          *int     `json:"retention_days"`
-	DeleteSourceAfterDays  *int     `json:"delete_source_after_days"`
-	IsActive               bool     `json:"is_active"`
+	Name                   optionalField[string]   `json:"name"`
+	Description            optionalField[string]   `json:"description"`
+	Database               optionalField[string]   `json:"database"`
+	SourceMeasurement      optionalField[string]   `json:"source_measurement"`
+	DestinationMeasurement optionalField[string]   `json:"destination_measurement"`
+	Query                  optionalField[string]   `json:"query"`
+	Interval               optionalField[string]   `json:"interval"`
+	TagColumns             optionalField[[]string] `json:"tag_columns"`
+	RetentionDays          optionalField[int]      `json:"retention_days"`
+	DeleteSourceAfterDays  optionalField[int]      `json:"delete_source_after_days"`
+	IsActive               optionalField[bool]     `json:"is_active"`
 }
 
 // ExecuteCQRequest represents a request to execute a CQ
@@ -287,11 +301,13 @@ func (h *ContinuousQueryHandler) RegisterRoutes(app *fiber.App) {
 }
 
 // validateCQDefinition applies the field rules a stored continuous-query
-// definition must satisfy. Both create and update call it.
+// definition must satisfy. Both create and update call it: create requires
+// every one of these fields, update checks the ones the body carries and
+// leaves the rest as stored (#1023).
 //
-// Shared because PUT replaces the whole row: handleUpdate's UPDATE writes every
-// column (see it), so any field it does not validate is a field a partial body
-// silently blanks. The two handlers had drifted far apart — update checked
+// Shared because the two handlers had drifted far apart while PUT still wrote
+// every column (before #1023), so any field update did not validate was a
+// field a partial body silently blanked. Update checked
 // database (#995) and destination_measurement-only-if-present, and nothing
 // else, so a PUT carrying just a database blanked the name, both measurements,
 // the query and the interval. validateCQQuery documents its empty case as
@@ -306,8 +322,8 @@ func (h *ContinuousQueryHandler) RegisterRoutes(app *fiber.App) {
 //
 //   - destination_measurement names a measurement Arc is about to CREATE, so it
 //     gets isValidMeasurementName, the create-time rule every client-facing
-//     ingest endpoint applies. handleCreate already did; update now does so
-//     unconditionally.
+//     ingest endpoint applies. handleCreate already did; update applies it
+//     whenever the body carries the field.
 //   - source_measurement names one that ALREADY EXISTS, so it gets the
 //     read-path rule instead: isSafeStoragePathSegment plus the glob rule, the
 //     same pair handleDelete and the retention handler apply to a stored
@@ -318,37 +334,57 @@ func (h *ContinuousQueryHandler) RegisterRoutes(app *fiber.App) {
 //     Arc has no rename endpoint, so refusing them would orphan readable data
 //     with no remedy. isSafeStoragePathSegment makes the same argument for
 //     database names in its own doc comment.
-func validateCQDefinition(req *ContinuousQueryRequest) error {
-	if req.Name == "" {
-		return errors.New("name is required")
+func validateCQDefinition(req *ContinuousQueryRequest, create bool) error {
+	// required reports whether the field must be checked, and refuses it when
+	// it is missing on create, or present but null or empty on either.
+	required := func(name string, f optionalField[string]) (bool, error) {
+		switch {
+		case !f.Set:
+			if create {
+				return false, fmt.Errorf("%s is required", name)
+			}
+			return false, nil
+		case f.Null:
+			return false, fmt.Errorf("%s may not be null", name)
+		case f.Value == "":
+			return false, fmt.Errorf("%s is required", name)
+		}
+		return true, nil
 	}
-	if req.Database == "" {
-		return errors.New("database is required")
+
+	if _, err := required("name", req.Name); err != nil {
+		return err
 	}
-	if !isValidDatabaseName(req.Database) {
+	if ok, err := required("database", req.Database); err != nil {
+		return err
+	} else if ok && !isValidDatabaseName(req.Database.Value) {
 		return errors.New("invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)")
 	}
-	if req.SourceMeasurement == "" {
-		return errors.New("source_measurement is required")
+	if ok, err := required("source_measurement", req.SourceMeasurement); err != nil {
+		return err
+	} else if ok {
+		if err := validateCQSourceMeasurement(req.SourceMeasurement.Value); err != nil {
+			return fmt.Errorf("invalid source_measurement: %w", err)
+		}
 	}
-	if err := validateCQSourceMeasurement(req.SourceMeasurement); err != nil {
-		return fmt.Errorf("invalid source_measurement: %w", err)
-	}
-	if req.DestinationMeasurement == "" {
-		return errors.New("destination_measurement is required")
-	}
-	if !isValidMeasurementName(req.DestinationMeasurement) {
+	if ok, err := required("destination_measurement", req.DestinationMeasurement); err != nil {
+		return err
+	} else if ok && !isValidMeasurementName(req.DestinationMeasurement.Value) {
 		return errors.New("invalid destination_measurement: must start with a letter and contain only alphanumeric characters, underscores, or hyphens")
 	}
-	if req.Query == "" {
-		return errors.New("query is required")
+	queryOK, err := required("query", req.Query)
+	if err != nil {
+		return err
 	}
-	if req.Interval == "" {
-		return errors.New("interval is required")
+	if _, err := required("interval", req.Interval); err != nil {
+		return err
 	}
 	// Validate query has required placeholders
-	if !strings.Contains(req.Query, "{start_time}") || !strings.Contains(req.Query, "{end_time}") {
+	if queryOK && (!strings.Contains(req.Query.Value, "{start_time}") || !strings.Contains(req.Query.Value, "{end_time}")) {
 		return errors.New("query must contain {start_time} and {end_time} placeholders")
+	}
+	if req.IsActive.Null {
+		return errors.New("is_active may not be null")
 	}
 	return nil
 }
@@ -398,24 +434,32 @@ func (h *ContinuousQueryHandler) handleCreate(c *fiber.Ctx) error {
 	}
 
 	// Validate
-	if err := validateCQDefinition(&req); err != nil {
+	if err := validateCQDefinition(&req, true); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
 	// Run the shared SQL validator over the definition before storing it.
-	if err := validateCQQuery(req.Query); err != nil {
+	if err := validateCQQuery(req.Query.Value); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
 	// Validate tag columns before storing — they end up in Parquet arc:tags
-	// metadata and compaction's PARTITION BY, so unsafe names must be rejected
+	// metadata and compaction's dedup query, so unsafe names must be rejected
 	// at the boundary (#521).
-	if err := validateTagColumns(req.TagColumns); err != nil {
+	if err := validateTagColumns(req.TagColumns.Value); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
-	tagColumnsJSON, err := encodeTagColumns(req.TagColumns)
+	tagColumnsJSON, err := encodeTagColumns(req.TagColumns.Value)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to encode tag_columns"})
+	}
+
+	// An absent is_active means active, which is what the column's DEFAULT
+	// TRUE always said; the handler used to insert the zero value instead, so a
+	// body without the key created a continuous query that never ran (#1023).
+	isActive := true
+	if req.IsActive.Set {
+		isActive = req.IsActive.Value
 	}
 
 	// Insert query
@@ -423,12 +467,12 @@ func (h *ContinuousQueryHandler) handleCreate(c *fiber.Ctx) error {
 		INSERT INTO continuous_queries
 		(name, description, database, source_measurement, destination_measurement, query, interval, tag_columns, retention_days, delete_source_after_days, is_active)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, req.Name, req.Description, req.Database, req.SourceMeasurement, req.DestinationMeasurement, req.Query, req.Interval, tagColumnsJSON, req.RetentionDays, req.DeleteSourceAfterDays, req.IsActive)
+	`, req.Name.Value, req.Description.ptr(), req.Database.Value, req.SourceMeasurement.Value, req.DestinationMeasurement.Value, req.Query.Value, req.Interval.Value, tagColumnsJSON, req.RetentionDays.ptr(), req.DeleteSourceAfterDays.ptr(), isActive)
 
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint") {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": fmt.Sprintf("Continuous query with name '%s' already exists", req.Name),
+				"error": fmt.Sprintf("Continuous query with name '%s' already exists", req.Name.Value),
 			})
 		}
 		h.logger.Error().Err(err).Msg("Failed to create continuous query")
@@ -438,13 +482,13 @@ func (h *ContinuousQueryHandler) handleCreate(c *fiber.Ctx) error {
 	}
 
 	queryID, _ := result.LastInsertId()
-	h.logger.Info().Int64("query_id", queryID).Str("name", req.Name).Msg("Created continuous query")
+	h.logger.Info().Int64("query_id", queryID).Str("name", req.Name.Value).Msg("Created continuous query")
 
 	// Kick the scheduler using the data we already have — avoids a redundant
 	// SQLite read that could race with the just-committed INSERT on a
 	// multi-connection pool.
 	if h.scheduler != nil {
-		if err := h.scheduler.StartJobDirect(queryID, req.Name, req.Interval, req.IsActive); err != nil {
+		if err := h.scheduler.StartJobDirect(queryID, req.Name.Value, req.Interval.Value, isActive); err != nil {
 			h.logger.Warn().Err(err).Int64("query_id", queryID).Msg("Failed to start CQ job after create")
 		}
 	}
@@ -505,44 +549,64 @@ func (h *ContinuousQueryHandler) handleUpdate(c *fiber.Ctx) error {
 		})
 	}
 
-	// The same rules create applies, for the reason the UPDATE below makes
-	// unavoidable: it overwrites every column, so a field this does not require
-	// is a field a partial body blanks (#995 for database, #1011 for the rest).
-	if err := validateCQDefinition(&req); err != nil {
+	// A partial update (#1023): each field the body carries gets the rule
+	// create applies to it; an absent one keeps its stored value, which was
+	// validated when it was stored and is re-validated before each run
+	// (#1010, #1011). No rule here spans two fields, so a field can be checked
+	// without reading the others.
+	if err := validateCQDefinition(&req, false); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	if err := validateTagColumns(req.TagColumns); err != nil {
+	if err := validateTagColumns(req.TagColumns.Value); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	// UPDATE overwrites the stored definition, so the new body needs the same
-	// validation handleCreate applies — otherwise a create-time check is
-	// trivially bypassed by creating a benign CQ and immediately updating it.
-	if err := validateCQQuery(req.Query); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	// A new query needs the same validation handleCreate applies — otherwise a
+	// create-time check is trivially bypassed by creating a benign CQ and
+	// immediately updating it.
+	if req.Query.hasValue() {
+		if err := validateCQQuery(req.Query.Value); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
 	}
 
-	tagColumnsJSON, err := encodeTagColumns(req.TagColumns)
+	tagColumnsJSON, err := encodeTagColumns(req.TagColumns.Value)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to encode tag_columns"})
 	}
 
-	result, err := h.sqliteDB.Exec(`
-		UPDATE continuous_queries SET
-			name = ?, description = ?, database = ?, source_measurement = ?,
-			destination_measurement = ?, query = ?, interval = ?, tag_columns = ?, retention_days = ?,
-			delete_source_after_days = ?, is_active = ?, updated_at = CURRENT_TIMESTAMP
-		WHERE id = ?
-	`, req.Name, req.Description, req.Database, req.SourceMeasurement, req.DestinationMeasurement, req.Query, req.Interval, tagColumnsJSON, req.RetentionDays, req.DeleteSourceAfterDays, req.IsActive, queryID)
+	// A column is written only when the body carries its key, so a PUT that
+	// leaves one out keeps the stored value (#1023). One statement, not a
+	// read-modify-write, so a concurrent PUT cannot be lost in between.
+	set := []updateColumn{
+		{"name", req.Name.Set, req.Name.Value},
+		{"description", req.Description.Set, req.Description.ptr()},
+		{"database", req.Database.Set, req.Database.Value},
+		{"source_measurement", req.SourceMeasurement.Set, req.SourceMeasurement.Value},
+		{"destination_measurement", req.DestinationMeasurement.Set, req.DestinationMeasurement.Value},
+		{"query", req.Query.Set, req.Query.Value},
+		{"interval", req.Interval.Set, req.Interval.Value},
+		{"tag_columns", req.TagColumns.Set, tagColumnsJSON},
+		{"retention_days", req.RetentionDays.Set, req.RetentionDays.ptr()},
+		{"delete_source_after_days", req.DeleteSourceAfterDays.Set, req.DeleteSourceAfterDays.ptr()},
+		{"is_active", req.IsActive.Set, req.IsActive.Value},
+	}
+	assignments, args := buildUpdateSet(set)
+	if len(args) == 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "no fields to update"})
+	}
+	result, err := h.sqliteDB.Exec(
+		"UPDATE continuous_queries SET "+assignments+", updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+		append(args, queryID)...)
 
 	if err != nil {
-		// Mapped the way handleCreate maps it: name is UNIQUE, and #1011 makes
-		// it mandatory on update, so a body carrying another definition's name
-		// is now an ordinary mistake rather than an internal failure.
+		// Mapped the way handleCreate maps it: name is UNIQUE, so a body
+		// carrying another definition's name is an ordinary mistake rather
+		// than an internal failure.
 		if strings.Contains(err.Error(), "UNIQUE constraint") {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": fmt.Sprintf("Continuous query with name %q already exists", req.Name),
+				"error": fmt.Sprintf("Continuous query with name %q already exists", req.Name.Value),
 			})
 		}
 		h.logger.Error().Err(err).Msg("Failed to update continuous query")
@@ -643,6 +707,14 @@ func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (
 
 	// Execute the aggregation query using DuckDB
 	recordsWritten, err := h.executeAggregation(ctx, cq, executedQuery, startTime, endTime)
+	if err != nil && ingest.IsWriteRefusal(err) {
+		// Writes are refused (fenced, or WAL volume disk pressure, #676): the
+		// run is skipped, not failed. No execution row, which would be one
+		// more write to the volume under pressure; last_processed_time stays,
+		// so the next run covers this window. Logged at most once a minute.
+		h.logSkippedRun(cq.Name, err)
+		return nil, fmt.Errorf("execution skipped: %w", err)
+	}
 	if err != nil {
 		executionDuration := time.Since(start).Seconds()
 
@@ -803,6 +875,10 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 		// Record failed execution
 		h.recordExecution(int64(queryID), executionID, "failed", startTime, endTime, nil, 0, executionDuration, err.Error())
 
+		if ingest.IsWriteRefusal(err) {
+			// Refused, not failed: 503 and retryable, logged by reason (#676).
+			return respondWriteRefused(c, err)
+		}
 		h.logger.Error().Err(err).Str("query_name", cq.Name).Msg("Continuous query execution failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Execution failed: " + err.Error(),
@@ -863,7 +939,8 @@ func wrapSourceMeasurement(query, database, measurement, readParquetExpr string)
 // executeAggregation runs the aggregation query and writes results.
 // startTime is the window's inclusive left boundary — it stamps output rows
 // when the aggregation query does not select a time column, so re-runs of the
-// same window produce identical (tags, time) rows that dedup at compaction (#521).
+// same window land on the same (tags, time), and an identical one collapses at
+// compaction (#521, #1232).
 // The window's end time is intentionally unused here: output rows are labelled by
 // the window START (bucket-start convention), so only startTime is needed.
 // SetFieldSchema installs the field schema registry (#914).
@@ -898,6 +975,16 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 		return 0, fmt.Errorf("stored continuous-query definition %q is not valid SQL to execute: %w", cq.Name, err)
 	}
 
+	// A run whose output would be refused (fenced, or WAL volume disk
+	// pressure, #676) fails before it queries: the aggregation can spill to
+	// the same volume. Both callers record a failed execution and leave
+	// last_processed_time alone, so the next scheduled run covers the window.
+	if h.arrowBuffer != nil {
+		if err := h.arrowBuffer.CheckIngestGate(); err != nil {
+			return 0, fmt.Errorf("failed to write records: %w", err)
+		}
+	}
+
 	// SECURITY: the stored database name is re-checked for the same reason the
 	// query above is. It becomes a storage path segment on both sides of the
 	// run — the source glob built below, and the destination write at the end
@@ -905,7 +992,7 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	// name rule to it only in #995. So a row stored by any build before that,
 	// or by an older build, or written straight into the shared metadata
 	// SQLite, can carry anything. handleUpdate was a fourth route until the
-	// same change: it writes database unconditionally, so a partial PUT stored
+	// same change: it wrote database unconditionally, so a partial PUT stored
 	// an empty one.
 	//
 	// GetStoragePath below already refuses the glob metacharacters, but that
@@ -1099,8 +1186,9 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	// with the WINDOW START time — not time.Now() (#521). time.Now() gave rows a
 	// wall-clock ingestion timestamp (wrong for a time-series) and made a re-run
 	// of the same window produce rows with a DIFFERENT timestamp, so they could
-	// never be deduped. The window start is stable across re-runs, so duplicate
-	// emissions land at the identical (tags, time) and collapse at compaction.
+	// never be deduped. The window start is stable across re-runs, so an
+	// identical re-emission collapses at compaction; one whose values differ is
+	// kept beside it (#1232).
 	if _, hasTime := columnarData["time"]; !hasTime {
 		windowMicro := startTime.UTC().UnixMicro()
 		times := make([]interface{}, len(records))
@@ -1112,7 +1200,7 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 
 	// Determine which declared tag columns are actually present in the output.
 	// A tag name that isn't an output column must NOT reach the Parquet arc:tags
-	// metadata: compaction's dedup builds `PARTITION BY "<tag>", "time"` from that
+	// metadata: compaction's dedup groups by `"<tag>", "time"` from that
 	// metadata, and a name with no matching column fails to bind and wedges the
 	// whole partition (it can never compact). Intersecting here makes a stale or
 	// mistaken tag_columns entry harmless rather than a compaction wedge (#521).
@@ -1128,30 +1216,13 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 		}
 	}
 
-	// Decide whether to mark this output for time-only dedup (#521). This ONLY
-	// matters when there are no tag columns — with tags, arc:tags already drives
-	// dedup on (tags, time). The marker makes compaction dedup on time ALONE, so
-	// it is safe ONLY if time is a unique key in the output (one row per window).
-	//
-	// CRITICAL: we must NOT assume "no tag columns" means "one row per window". A
-	// grouped CQ (e.g. GROUP BY host) whose operator forgot to declare
-	// tag_columns produces MULTIPLE rows per timestamp with no tags — marking it
-	// for time-only dedup would make compaction keep one row per timestamp and
-	// silently DELETE every series but one. So we verify uniqueness against the
-	// actual output and, if time repeats without tags, skip the marker and warn
-	// the operator to declare tag_columns.
-	dedupTime := false
-	if len(tagColumns) == 0 {
-		if timeColumnIsUnique(columnarData["time"]) {
-			dedupTime = true
-		} else {
-			h.logger.Warn().
-				Str("query_name", cq.Name).
-				Msg("CQ output has multiple rows per timestamp but no tag_columns declared; " +
-					"skipping time-only dedup to avoid data loss. Declare tag_columns for the " +
-					"grouping dimensions to make this CQ idempotent (#521).")
-		}
-	}
+	// Output without tag columns is marked arc:dedup_exact (#521, #1232), which opts it
+	// into exact-row dedup at compaction, keyed by time: an identical copy of a
+	// window (a WAL replay) collapses, and a re-run whose values differ is kept
+	// beside the original (#1232). Every such output is marked — exact-row dedup
+	// cannot delete a row that differs, so no shape of output makes the marker
+	// unsafe. Output with tag columns is deduped the same way through arc:tags.
+	dedupTime := len(tagColumns) == 0
 
 	// Write using WriteColumnarRecord so TagColumns (and the dedup-time marker)
 	// are preserved as Parquet metadata, enabling compaction to dedup CQ output.
@@ -1168,6 +1239,21 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	}
 
 	return int64(len(records)), nil
+}
+
+// cqSkipLogEvery samples the log of runs skipped because writes are refused.
+const cqSkipLogEvery = time.Minute
+
+// logSkippedRun logs a run skipped because writes are refused, at most once
+// every cqSkipLogEvery across all continuous queries.
+func (h *ContinuousQueryHandler) logSkippedRun(name string, err error) {
+	now := time.Now().UnixNano()
+	last := h.lastSkipLogNano.Load()
+	if now-last < int64(cqSkipLogEvery) || !h.lastSkipLogNano.CompareAndSwap(last, now) {
+		return
+	}
+	h.logger.Warn().Err(err).Str("query_name", name).
+		Msg("Continuous query runs skipped: writes are refused on this node (retryable); the next run covers the window (sampled: at most one line a minute)")
 }
 
 // handleGetExecutions returns execution history for a query
@@ -1239,7 +1325,7 @@ func (h *ContinuousQueryHandler) getQuery(queryID int64) (*ContinuousQuery, erro
 	tags, decErr := decodeTagColumns(tagColumnsRaw)
 	if decErr != nil {
 		h.logger.Warn().Err(decErr).Str("query_name", q.Name).
-			Msg("Ignoring corrupt tag_columns; CQ will not dedup until it is re-saved (#521)")
+			Msg("Ignoring corrupt tag_columns; CQ output is written without tags until it is re-saved (#521)")
 	}
 	q.TagColumns = tags
 
@@ -1303,7 +1389,7 @@ func (h *ContinuousQueryHandler) getQueries(database, isActiveStr string) ([]Con
 		tags, decErr := decodeTagColumns(tagColumnsRaw)
 		if decErr != nil {
 			h.logger.Warn().Err(decErr).Str("query_name", q.Name).
-				Msg("Ignoring corrupt tag_columns; CQ will not dedup until it is re-saved (#521)")
+				Msg("Ignoring corrupt tag_columns; CQ output is written without tags until it is re-saved (#521)")
 		}
 		q.TagColumns = tags
 		queries = append(queries, q)
@@ -1378,7 +1464,7 @@ func encodeTagColumns(tags []string) (*string, error) {
 // empty value (pre-migration rows, or CQs created without tags) decodes to nil
 // with no error. A non-empty value that fails to parse (corruption, a bad manual
 // edit) returns an error so the caller can warn — silently returning nil would
-// revert a CQ to no-dedup behavior with no signal, letting duplicates accumulate.
+// drop the CQ's tag columns from its output metadata with no signal.
 func decodeTagColumns(raw *string) ([]string, error) {
 	if raw == nil || *raw == "" {
 		return nil, nil
@@ -1390,48 +1476,9 @@ func decodeTagColumns(raw *string) ([]string, error) {
 	return tags, nil
 }
 
-// maxUniquenessCheckRows caps how many rows timeColumnIsUnique will scan before
-// giving up and reporting "not unique" (i.e. not dedup-safe). A tagless CQ that
-// legitimately produces one row per window is tiny (one row per interval), so a
-// large output almost certainly means a grouping CQ that forgot to declare
-// tag_columns — exactly the case where time-only dedup would be unsafe. Bounding
-// the scan avoids building a huge map for that misconfiguration, and failing
-// closed (treat as not-unique → skip the marker) is the safe direction.
-const maxUniquenessCheckRows = 100_000
-
-// timeColumnIsUnique reports whether the time column has no duplicate values —
-// i.e. time alone is a unique key for the output. Used to decide whether a
-// tagless CQ is safe to mark for time-only dedup (#521): if two rows share a
-// timestamp with no tag to distinguish them, time-only dedup would lose one, so
-// the marker must be withheld. An empty/absent column is trivially unique.
-//
-// Fails closed: an output larger than maxUniquenessCheckRows returns false
-// (not dedup-safe) rather than building an unbounded map — a tagless CQ that big
-// is almost certainly a mis-declared grouping CQ, which must NOT be marked.
-func timeColumnIsUnique(times []interface{}) bool {
-	if len(times) <= 1 {
-		return true
-	}
-	if len(times) > maxUniquenessCheckRows {
-		return false
-	}
-	seen := make(map[interface{}]struct{}, len(times))
-	for _, t := range times {
-		// Comparable key: the time column is normalized to int64 micros before
-		// this runs, but be defensive about the underlying type. interface{}
-		// values are comparable as map keys when the dynamic type is comparable
-		// (all our time representations — int64, string, time.Time — are).
-		if _, dup := seen[t]; dup {
-			return false
-		}
-		seen[t] = struct{}{}
-	}
-	return true
-}
-
 // validateTagColumns rejects tag column names that aren't safe SQL identifiers.
 // The names are emitted verbatim into the Parquet arc:tags metadata and later
-// interpolated into compaction's `PARTITION BY "<name>"` dedup query, so an
+// interpolated into compaction's dedup query as `"<name>"`, so an
 // unsafe name must never reach storage — validate at the API boundary. Rules
 // match internal/compaction/dedup.go#isValidIdentifier (alphanumeric, '_', '-').
 func validateTagColumns(tags []string) error {
@@ -1440,9 +1487,14 @@ func validateTagColumns(tags []string) error {
 			return fmt.Errorf("tag column name must not be empty")
 		}
 		// "time" is never a valid tag: compaction always appends "time" to the
-		// dedup key, so declaring it would produce PARTITION BY "time", "time".
+		// dedup key, so declaring it would group by "time", "time".
 		if strings.EqualFold(name, "time") {
 			return fmt.Errorf("tag column %q is reserved: time is always part of the dedup key and must not be listed", name)
+		}
+		// Arc does not store a column whose name starts with '_', so such a tag
+		// would name nothing in the output files (#1258).
+		if strings.HasPrefix(name, "_") {
+			return fmt.Errorf("invalid tag column %q: names starting with an underscore are not stored", name)
 		}
 		for _, c := range name {
 			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {

@@ -325,31 +325,45 @@ func TestOutboxCommittedThenRemovedSettles(t *testing.T) {
 	}
 }
 
-// With stream claims on, registrations carry their coverage: per instance,
-// the lowest batch.
-func TestOutboxSendsCoverageOnlyWithStreamClaims(t *testing.T) {
+// Registrations carry their exact coverage per instance whether or not
+// stream takeover is on (an FSM without it ignores the field; one with it
+// must have it from the first file), and only this file's part of a group.
+func TestOutboxSendsExactCoverage(t *testing.T) {
 	r := newTestOutbox(t, t.TempDir())
 	cov := testCov(&settleLog{})
 	cov.Ranges = []ingest.CoverageRange{{Instance: 9, Lo: 3, Hi: 7}, {Instance: 4, Lo: 20, Hi: 30}}
 	registerCovered(r, outPathA, 10, cov)
 	m := newFakeOutboxManifest()
-	m.claims = true
 	r.HandOff(m, &fakeOutboxStorage{sizes: map[string]int64{outPathA: 10}}, "writer-1")
 	waitOutbox(t, "registered", func() bool { return m.isRegistered(outPathA) })
 	m.mu.Lock()
 	got := fmt.Sprint(m.coverage)
 	m.mu.Unlock()
-	if got != "[{4 db/cpu 20 false 0} {9 db/cpu 3 false 0}]" {
+	if got != "[{4 db/cpu [[20 30]] [] false 0} {9 db/cpu [[3 7]] [] false 0}]" {
 		t.Fatalf("coverage sent = %s", got)
 	}
+}
 
-	r2 := newTestOutbox(t, t.TempDir())
-	registerCovered(r2, outPathB, 10, testCov(&settleLog{}))
-	m2 := newFakeOutboxManifest()
-	r2.HandOff(m2, &fakeOutboxStorage{sizes: map[string]int64{outPathB: 10}}, "writer-1")
-	waitOutbox(t, "registered", func() bool { return m2.isRegistered(outPathB) })
-	if len(m2.coverage) != 0 {
-		t.Fatal("coverage sent before stream claims are on: an older FSM would ignore it")
+func TestFileCoverageUsesTheFilePartAndCapsItsSize(t *testing.T) {
+	cov := testCov(&settleLog{})
+	cov.Ranges = []ingest.CoverageRange{{Instance: 9, Lo: 1, Hi: 9}}
+	cov.File = &ingest.FileCoverage{Ranges: []ingest.CoverageRange{{Instance: 9, Lo: 4, Hi: 5}},
+		Partial: []ingest.CoveragePiece{{Instance: 9, CSeq: 7, Chunk: 1, Chunks: 2}}}
+	got := fileCoverage(cov)
+	if len(got) != 1 || fmt.Sprint(got[0].Ranges) != "[[4 5]]" || len(got[0].Partial) != 1 || got[0].Partial[0].Chunks != 2 || got[0].Truncated {
+		t.Fatalf("file coverage %+v", got)
+	}
+	cov.File.Omitted = true
+	if got := fileCoverage(cov); !got[0].Truncated {
+		t.Fatal("an omitted file coverage was sent as exact")
+	}
+	big := testCov(&settleLog{})
+	for i := uint64(0); i < 4000; i++ {
+		big.Ranges = append(big.Ranges, ingest.CoverageRange{Instance: 9, Lo: 1e12 + 2*i, Hi: 1e12 + 2*i})
+	}
+	got = fileCoverage(big)
+	if !got[0].Truncated || len(got[0].Ranges) != 0 {
+		t.Fatal("a coverage over the size cap was sent in full")
 	}
 }
 
@@ -361,7 +375,6 @@ func TestOutboxClaimRefusalSettlesOnlyTheRefusedFile(t *testing.T) {
 	registerCovered(r, outPathA, 10, testCov(l))
 	registerCovered(r, outPathB, 20, testCov(l))
 	m := newFakeOutboxManifest()
-	m.claims = true
 	m.refuse = func(p string) bool { return p == outPathA }
 	store := &fakeOutboxStorage{sizes: map[string]int64{outPathA: 10, outPathB: 20}}
 	r.HandOff(m, store, "writer-1")
@@ -378,4 +391,34 @@ func TestOutboxClaimRefusalSettlesOnlyTheRefusedFile(t *testing.T) {
 		t.Fatal("refused file deleted")
 	}
 	waitOutbox(t, "nothing pending", func() bool { return r.Pending() == 0 })
+}
+
+// A claimant's coverage carries its claim epoch per instance through the
+// journal (version 3) into the registration (#1207 S4b1c).
+func TestOutboxJournalsClaimEpochs(t *testing.T) {
+	dir := t.TempDir()
+	first, err := NewRegistrationOutbox(dir, "test-cluster", zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cov := testCov(&settleLog{})
+	cov.Ranges = append(cov.Ranges, ingest.CoverageRange{Instance: 4, Lo: 1, Hi: 2})
+	cov.Epochs = map[uint64]uint64{9: 77}
+	registerCovered(first, outPathA, 10, cov)
+	if err := first.SyncRegistrations(); err != nil {
+		t.Fatal(err)
+	}
+	crash(first)
+	raw, _ := os.ReadFile(filepath.Join(dir, RegistrationJournal))
+	if !strings.Contains(string(raw), `"v":3`) || !strings.Contains(string(raw), `"ep":{"9":77}`) {
+		t.Fatalf("journal does not carry the epochs:\n%s", raw)
+	}
+	second := newTestOutbox(t, dir)
+	second.mu.Lock()
+	a := second.byPath[outPathA]
+	second.mu.Unlock()
+	got := fileCoverage(a.rec.Cov)
+	if len(got) != 2 || got[0].Instance != 4 || got[0].ClaimEpoch != 0 || got[1].Instance != 9 || got[1].ClaimEpoch != 77 {
+		t.Fatalf("file coverage %+v", got)
+	}
 }

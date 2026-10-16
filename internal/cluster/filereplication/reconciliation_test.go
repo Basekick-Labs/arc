@@ -269,7 +269,11 @@ func TestPeriodicReconciliationSchedulerRestoresDeletedManifestFile(t *testing.T
 		return nil, "", nil
 	}
 	p.RunCatchUp(context.Background(), manifest)
-	waitStats(t, p, func(s map[string]int64) bool { return s["pulled"] == 1 })
+	// Settled, not just pulled: a worker counts the pull before it clears
+	// the path's catch-up tag, so catchup_inflight can still read 1 here.
+	waitStats(t, p, func(s map[string]int64) bool {
+		return s["pulled"] == 1 && s["catchup_inflight"] == 0 && s["catchup_completed_at"] != 0
+	})
 
 	if err := backend.Delete(context.Background(), entry.Path); err != nil {
 		t.Fatalf("delete local file: %v", err)
@@ -535,5 +539,22 @@ func TestPeriodicReconciliationStopsOnCancellation(t *testing.T) {
 	case <-stopDone:
 	case <-time.After(time.Second):
 		t.Fatal("Puller.Stop did not cancel periodic reconciliation")
+	}
+}
+
+// The walks show every entry they visit to ObserveListed (#1071).
+func TestWalkObservesListedEntries(t *testing.T) {
+	p := newTestPuller(t, newFakeBackend(), newRepeatingFetcher([]byte("x")),
+		staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
+	var seen []string
+	p.cfg.ObserveListed = func(e *raft.FileEntry) ListedVerdict { seen = append(seen, e.Path); return ListedTrusted }
+	p.Start(context.Background())
+	defer p.Stop()
+	entry := makeEntry("testdb/cpu/observed.parquet", "writer-1", 1)
+	p.RunCatchUp(context.Background(), func(string, int) ([]*raft.FileEntry, string, error) {
+		return []*raft.FileEntry{entry}, "", nil
+	})
+	if len(seen) != 1 || seen[0] != entry.Path {
+		t.Fatalf("observed %v", seen)
 	}
 }

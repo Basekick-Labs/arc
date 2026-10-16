@@ -901,6 +901,10 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 				// The reading is true now; one extra HEAD per cold-routed file
 				// is a fair price for not re-deriving that conclusion.
 				exists, err := cold.Exists(ctx, destPath)
+				if storage.IsStoreNotFound(err) {
+					// A cold bucket not created yet holds no copy (#1242).
+					exists, err = false, nil
+				}
 				if err != nil {
 					return fmt.Errorf("restore refused: could not check whether the cold copy of %s exists before restoring: %w", destPath, err)
 				}

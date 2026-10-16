@@ -1,6 +1,9 @@
 package storage
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestS3BackendPrefixedKey(t *testing.T) {
 	backend := &S3Backend{prefix: "instances/abc123/"}
@@ -40,5 +43,27 @@ func TestS3BackendPrefixedKey(t *testing.T) {
 	}
 	if got != "mydb/cpu/file.parquet" {
 		t.Errorf("prefixedKey with no prefix = %q, want %q", got, "mydb/cpu/file.parquet")
+	}
+}
+
+func TestS3BackendPrefixedKeyValidatesTheCompleteObjectName(t *testing.T) {
+	backend := &S3Backend{prefix: "p/"}
+	keyAtLimit := strings.Repeat("x/", 508) + "x"
+	keyOverLimit := strings.Repeat("x/", 508) + "xx"
+
+	if got := len(backend.prefix + keyAtLimit); got != MaxUsableKeyLen {
+		t.Fatalf("fixture object name is %d bytes, want %d", got, MaxUsableKeyLen)
+	}
+	if _, err := backend.prefixedKey(keyAtLimit); err != nil {
+		t.Fatalf("prefixedKey rejected an object name at the limit: %v", err)
+	}
+
+	if got := len(backend.prefix + keyOverLimit); got != MaxUsableKeyLen+1 {
+		t.Fatalf("fixture object name is %d bytes, want %d", got, MaxUsableKeyLen+1)
+	}
+	if _, err := backend.prefixedKey(keyOverLimit); err == nil {
+		t.Fatal("prefixedKey accepted an object name over the limit")
+	} else if !strings.Contains(err.Error(), backend.prefix+keyOverLimit) {
+		t.Errorf("error %q does not identify the complete object name", err)
 	}
 }

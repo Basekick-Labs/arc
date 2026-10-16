@@ -1,6 +1,6 @@
 # Arc
 
-[![Ingestion](https://img.shields.io/badge/ingestion-34M%2B%20rec%2Fs-brightgreen)](https://github.com/basekick-labs/arc)
+[![Ingestion](https://img.shields.io/badge/ingestion-38M%2B%20rec%2Fs-brightgreen)](https://github.com/basekick-labs/arc)
 [![Query](https://img.shields.io/badge/query-8.42M%20rows%2Fs-blue)](https://github.com/basekick-labs/arc)
 [![Go](https://img.shields.io/badge/go-1.26+-00ADD8?logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
@@ -10,7 +10,7 @@
 [![Discord](https://img.shields.io/badge/discord-join-7289da?logo=discord)](https://discord.gg/nxnWfUxsdm)
 [![GitHub](https://img.shields.io/github/stars/basekick-labs/arc?style=social)](https://github.com/basekick-labs/arc)
 
-Open, SQL-native time-series database for telemetry you need to keep. Arc ingests 34M+ records/sec, stores data as standard Parquet on infrastructure you own, and lets you query recent and historical data together. InfluxDB Line Protocol and Telegraf compatible. Single binary. AGPL-3.0.
+Open, SQL-native time-series database for telemetry you need to keep. Arc ingests 38M+ records/sec, stores data as standard Parquet on infrastructure you own, and lets you query recent and historical data together. InfluxDB Line Protocol and Telegraf compatible. Single binary. AGPL-3.0.
 
 > **Prefer a UI?** [**Arc Launchpad**](https://github.com/Basekick-Labs/launchpad) is a self-hosted web console for the Arc instances you run — SQL console, schema explorer, logs, monitoring, and management for tokens, retention, alerts, continuous queries, and MQTT ingestion. Deploy it alongside Arc with Docker Compose. [Docs](https://docs.basekick.net/launchpad).
 >
@@ -106,24 +106,28 @@ See Arc in action: [https://basekick.net/demos](https://basekick.net/demos)
 Benchmarked on Apple MacBook Pro M3 Max (14 cores, 36GB RAM, 1TB NVMe).
 Test config: 12 concurrent workers, 1000-record batches, columnar data.
 
-### Ingestion (August 2026)
+### Ingestion (October 2026)
 
 | Protocol | Throughput | p50 Latency | p99 Latency |
 |----------|------------|-------------|-------------|
-| MessagePack Columnar | **34.0M rec/s** | 0.29ms | 1.40ms |
-| MessagePack + Zstd | 24.9M rec/s | 0.42ms | 1.53ms |
-| MessagePack + GZIP | 24.6M rec/s | 0.42ms | 1.53ms |
-| Line Protocol | 4.7M rec/s | 2.19ms | 6.61ms |
+| MessagePack Columnar | **38.1M rec/s** | 0.26ms | 1.19ms |
+| MessagePack + Zstd | 30.3M rec/s | 0.35ms | 1.23ms |
+| MessagePack + GZIP | 26.4M rec/s | 0.39ms | 1.36ms |
+| Line Protocol | 9.3M rec/s | 1.07ms | 3.38Ms |
 
 All rows measured over a 60-second sustained run. The MessagePack Columnar row is
-**2,043,451,000 records ingested in 60 seconds** — and that's not rows streamed into
+**2,288,281,000 records ingested in 60 seconds** — and that's not rows streamed into
 a memory buffer: every record was received over HTTP, decoded, time-sorted, and
-durably written to disk as queryable Parquet, at 0.29ms median latency, on a laptop.
+durably written to disk as queryable Parquet, at 0.26ms median latency, on a laptop.
 
-These numbers ship in **26.09.1**: ingest no longer dictionary-encodes Parquet
-(compaction re-encodes files anyway) and the msgpack columnar path now decodes
-payloads directly into typed column arrays, eliminating per-value allocations —
-see the 26.09.1 release notes.
+These numbers ship in **27.01.1**. Since 26.09.1 (34.0M, 24.9M, 24.6M and 4.7M
+rec/s): line-protocol writes parse straight into typed columns (#1299), and
+flushes copy each column once less on the way to Parquet.
+
+26.09.1 stopped dictionary-encoding Parquet at ingest (compaction re-encodes
+files anyway) and made the msgpack columnar path decode payloads directly into
+typed column arrays, eliminating per-value allocations — see the 26.09.1
+release notes.
 
 ### Compaction
 
@@ -379,7 +383,7 @@ arc/
 │   ├── auth/             # Token authentication and RBAC
 │   ├── backup/           # Backup and restore (data, metadata, config)
 │   ├── circuitbreaker/   # Resilience patterns (retry, backoff)
-│   ├── cluster/          # Raft consensus, node roles, WAL replication
+│   ├── cluster/          # Raft consensus, node roles, peer file replication, standby stream
 │   ├── compaction/       # Tiered hourly/daily Parquet file merging
 │   ├── config/           # TOML configuration with env var overrides
 │   ├── database/         # Query engine and connection management
@@ -390,7 +394,6 @@ arc/
 │   ├── metrics/          # Prometheus metrics
 │   ├── mqtt/             # MQTT subscriber — topic-to-measurement ingestion
 │   ├── pruning/          # Query-time partition pruning
-│   ├── query/            # Parallel partition executor
 │   ├── queryregistry/    # Active/completed query tracking
 │   ├── scheduler/        # Continuous queries and retention policies
 │   ├── shutdown/         # Graceful shutdown coordinator

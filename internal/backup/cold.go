@@ -262,13 +262,14 @@ func (m *Manager) walkColdTier(ctx context.Context, sc *scope, hot map[string]st
 		if _, hotHas := hot[p]; hotHas {
 			// Mid-migration: a migration copies to cold BEFORE deleting the
 			// manifest entry and the hot copy, so one path can be in both
-			// listings. The COLD copy wins. The cold object is canonical and
-			// nothing in Arc ever deletes one, so it cannot vanish mid-run —
-			// the hot side can, and if it does, the end-of-run manifest
-			// recheck deletes the hot copy from the backup and the file ends
-			// up in neither set. Taking cold also agrees with the tier row,
-			// which the migration already flipped before releasing the hot
-			// copy.
+			// listings. The COLD copy wins. The cold object is canonical: only
+			// retention deletes one (#168), and only once its data is past
+			// the policy's cutoff, which the hot copy of the same file is
+			// too. The hot side can vanish mid-run, and if it does, the
+			// end-of-run manifest recheck deletes the hot copy from the
+			// backup and the file ends up in neither set. Taking cold also
+			// agrees with the tier row, which the migration already flipped
+			// before releasing the hot copy.
 			w.dedupPaths[p] = struct{}{}
 			w.dedupSkipped++
 		}

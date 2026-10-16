@@ -19,10 +19,12 @@ const (
 	// MsgLeaveNotify is sent when a node is gracefully leaving.
 	MsgLeaveNotify
 
-	// WAL Replication messages (Phase 3.3) - start at 0x10 to avoid conflicts
-	// MsgReplicateSync is sent by a reader to request replication sync.
-	MsgReplicateSync MessageType = 0x10
-	// MsgReplicateSyncAck is sent by the writer in response to sync request.
+	// WAL replication handshake (Phase 3.3). The stream is gone (#888,
+	// #1181): a reader of a release before 27.01.1 still sends
+	// MsgReplicateSync until it is upgraded, and a writer answers it with a
+	// refusing MsgReplicateSyncAck. Reserved: never reuse 0x10-0x1F while
+	// such readers can exist.
+	MsgReplicateSync    MessageType = 0x10
 	MsgReplicateSyncAck MessageType = 0x11
 
 	// Peer file replication messages (Enterprise Phase 2) - start at 0x20
@@ -66,7 +68,99 @@ const (
 	// (internal/cluster/originstream frames follow).
 	MsgOriginStreamHello    MessageType = 0x40
 	MsgOriginStreamHelloAck MessageType = 0x41
+
+	// Pending registrations (#1214): before the orphan-storage sweep deletes
+	// unregistered objects on a shared object store, the reconciler asks
+	// every node that can ingest which files it flushed and has not
+	// registered yet. A node before #1214 closes the connection on the
+	// unknown type, which the asker treats as no answer.
+	MsgPendingRegistrationsQuery MessageType = 0x50
+	MsgPendingRegistrationsReply MessageType = 0x51
+
+	// Flush scope (#1265): in shared storage every writer takes writes, so
+	// before a DELETE scans, the primary asks every node to flush the rows
+	// of its scope it has buffered and to name the files it flushed that
+	// wait for registration. A node before #1265 closes the connection on
+	// the unknown type, which the asker treats as no answer.
+	MsgFlushScopeRequest MessageType = 0x52
+	MsgFlushScopeReply   MessageType = 0x53
 )
+
+// PendingRegistrationsQuery asks a node for the files it flushed that the
+// cluster manifest does not list yet, whenever they were flushed.
+// HMAC: security.ComputePendingRegistrationsQueryHMAC.
+type PendingRegistrationsQuery struct {
+	NodeID      string `json:"node_id"`
+	ClusterName string `json:"cluster_name"`
+	Nonce       string `json:"nonce"`
+	Timestamp   int64  `json:"timestamp"`
+	HMAC        string `json:"hmac"`
+}
+
+// Pending registrations reply statuses.
+const (
+	// PendingStatusOK: Paths is every file pending registration on the node.
+	PendingStatusOK = "ok"
+	// PendingStatusTooMany: more such files than one reply can carry.
+	PendingStatusTooMany = "too_many"
+	// PendingStatusUnknown: the node ingests but has no registration journal
+	// (it could not be opened), so it cannot tell.
+	PendingStatusUnknown = "unknown"
+	// PendingStatusRefused: the query failed authentication or validation.
+	PendingStatusRefused = "refused"
+)
+
+// PendingRegistrationsReply answers a query. The HMAC binds the reply to the
+// query's nonce and covers a digest of Paths, so neither a recorded reply nor
+// one with paths stripped is accepted:
+// security.ComputePendingRegistrationsReplyHMAC.
+type PendingRegistrationsReply struct {
+	NodeID    string   `json:"node_id"`
+	Status    string   `json:"status"`
+	Paths     []string `json:"paths,omitempty"`
+	Timestamp int64    `json:"timestamp"`
+	HMAC      string   `json:"hmac"`
+}
+
+// FlushScopeRequest asks a node to flush its buffered rows of Database
+// (Measurement "" = all of them). HMAC:
+// security.ComputeFlushScopeRequestHMAC.
+type FlushScopeRequest struct {
+	NodeID      string `json:"node_id"`
+	ClusterName string `json:"cluster_name"`
+	Database    string `json:"database"`
+	Measurement string `json:"measurement,omitempty"`
+	Nonce       string `json:"nonce"`
+	Timestamp   int64  `json:"timestamp"`
+	HMAC        string `json:"hmac"`
+}
+
+// Flush scope reply statuses.
+const (
+	// FlushStatusOK: flushed; Paths is every file of the scope still
+	// waiting to register on the node.
+	FlushStatusOK = "ok"
+	// FlushStatusUntracked: flushed, but the node has no registration
+	// journal, so it cannot name the files waiting to register.
+	FlushStatusUntracked = "untracked"
+	// FlushStatusFailed: the flush failed or timed out, or an earlier one
+	// failed and its rows wait for WAL recovery.
+	FlushStatusFailed = "flush_failed"
+	// FlushStatusTooMany: more pending files than one reply can carry.
+	FlushStatusTooMany = "too_many"
+	// FlushStatusRefused: the request failed authentication or validation.
+	FlushStatusRefused = "refused"
+)
+
+// FlushScopeReply answers a FlushScopeRequest, bound to its nonce and
+// scope, over a digest of Paths: security.ComputeFlushScopeReplyHMAC.
+type FlushScopeReply struct {
+	NodeID    string   `json:"node_id"`
+	Status    string   `json:"status"`
+	Paths     []string `json:"paths,omitempty"`
+	Timestamp int64    `json:"timestamp"`
+	HMAC      string   `json:"hmac"`
+}
 
 // OriginStreamHello is sent by a standby writer to open the origin stream.
 // HMAC: security.ComputeOriginStreamHelloHMAC.
@@ -111,6 +205,14 @@ func (m MessageType) String() string {
 		return "OriginStreamHello"
 	case MsgOriginStreamHelloAck:
 		return "OriginStreamHelloAck"
+	case MsgPendingRegistrationsQuery:
+		return "PendingRegistrationsQuery"
+	case MsgPendingRegistrationsReply:
+		return "PendingRegistrationsReply"
+	case MsgFlushScopeRequest:
+		return "FlushScopeRequest"
+	case MsgFlushScopeReply:
+		return "FlushScopeReply"
 	case MsgReplicateSync:
 		return "ReplicateSync"
 	case MsgReplicateSyncAck:
@@ -128,40 +230,22 @@ func (m MessageType) String() string {
 	}
 }
 
-// ReplicateSync is sent by a reader node to request WAL replication.
-//
-// The six auth-bound fields (Nonce / Timestamp / HMAC / ClusterName /
-// the existing ReaderID acting as senderID / and SupportsBinaryEntries)
-// carry the application-layer HMAC over the handshake. Computed by
-// security.ComputeReplicateSyncHMAC at the reader, validated by
-// security.ValidateReplicateSyncHMAC at the writer before the
-// connection is accepted. See GHSA-wfgr-8x84-22q7 / CVE-2026-48106.
-//
-// The auth fields are required when cluster.shared_secret is configured;
-// when it's empty the receiver refuses every request (refuse-when-
-// unconfigured posture, same as cache-invalidate from PR #444).
+// ReplicateSync is what a reader of a release before 27.01.1 sends to request
+// the WAL replication stream. It is decoded only to be refused (#1181): every
+// request gets the same answer, so its HMAC fields (GHSA-wfgr-8x84-22q7) are
+// not checked.
 type ReplicateSync struct {
 	ReaderID          string `json:"reader_id"`
 	LastKnownSequence uint64 `json:"last_known_seq"`
 
-	// Application-layer authentication fields (GHSA-wfgr-8x84-22q7).
-	// Validated against cluster.shared_secret by the writer before
-	// the connection is accepted into the replication sender.
+	// Authentication fields of the old handshake (GHSA-wfgr-8x84-22q7).
 	Nonce       string `json:"nonce,omitempty"`
 	ClusterName string `json:"cluster_name,omitempty"`
 	Timestamp   int64  `json:"timestamp,omitempty"`
 	HMAC        string `json:"hmac,omitempty"`
 
-	// SupportsBinaryEntries advertises that this reader understands
-	// MsgReplicateEntryBin frames (#698), letting the writer send WAL
-	// entry payloads as raw bytes instead of JSON + base64 (whose 4/3
-	// inflation made entries above ~75MB unsendable).
-	//
-	// Covered by the replicate-sync HMAC (#714). Originally left out
-	// because folding it in would break mixed-version handshakes —
-	// that no longer applies since 26.09.2 made the coordinator
-	// handshake a hard cutover anyway, so this rides along with the
-	// same coordinated-restart release.
+	// SupportsBinaryEntries is what an old reader sent to ask for binary
+	// entry frames (#698); decoded and ignored.
 	SupportsBinaryEntries bool `json:"bin_entries,omitempty"`
 }
 

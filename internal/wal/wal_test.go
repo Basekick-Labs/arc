@@ -191,6 +191,7 @@ func TestWriter_Stats(t *testing.T) {
 		"total_entries",
 		"total_bytes",
 		"total_syncs",
+		"failed_syncs",
 		"total_rotations",
 		"dropped_entries",
 		"buffer_size",

@@ -56,6 +56,11 @@ type ImporterConfig struct {
 	// Nil in standalone mode, where there is no manifest.
 	FlushManifest func(ctx context.Context, files []*ReceivedFile) error
 
+	// HoldPaths, when set, is held on every path of a bundle until its last
+	// manifest batch is flushed: a file already at its path is re-registered
+	// without being written (Coordinator.HoldLocalPaths, #1071).
+	HoldPaths func(paths []string) (release func())
+
 	Logger zerolog.Logger
 }
 
@@ -76,6 +81,7 @@ type Importer struct {
 	mu sync.Mutex
 
 	receiver      *Receiver
+	holdPaths     func(paths []string) (release func())
 	collector     *CollectingRegistrar
 	index         *BundleIndex
 	registry      *Registry
@@ -112,6 +118,7 @@ func NewImporter(cfg ImporterConfig) (*Importer, error) {
 
 	return &Importer{
 		receiver:      cfg.Receiver,
+		holdPaths:     cfg.HoldPaths,
 		collector:     cfg.Collector,
 		index:         cfg.Index,
 		registry:      cfg.Registry,
@@ -306,6 +313,14 @@ func (i *Importer) Import(ctx context.Context, dir string) (*ImportResult, error
 // the difference between one Raft proposal per 1000 files and one per file.
 func (i *Importer) commitAll(ctx context.Context, r *BundleReader, spokeID string, entries []BundleEntry, res *ImportResult) error {
 	i.collector.Reset()
+	if i.holdPaths != nil {
+		paths := make([]string, 0, len(entries))
+		for _, e := range entries {
+			paths = append(paths, NamespacedPath(spokeID, e.Path))
+		}
+		release := i.holdPaths(paths)
+		defer release()
+	}
 
 	flush := func() error {
 		files := i.collector.Drain()

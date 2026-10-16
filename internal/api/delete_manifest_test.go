@@ -67,7 +67,7 @@ func TestReplaceManifestAfterRewritePublishesImmutableFile(t *testing.T) {
 	}}
 	h := &DeleteHandler{storage: backend, coordinator: coordinator}
 
-	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, nil); err != nil {
+	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, nil, ""); err != nil {
 		t.Fatalf("replace manifest: %v", err)
 	}
 	if len(coordinator.ops) != 2 {
@@ -83,6 +83,10 @@ func TestReplaceManifestAfterRewritePublishesImmutableFile(t *testing.T) {
 	}
 	if registerPayload.File.Path != newPath {
 		t.Fatalf("registered path = %q, want %q", registerPayload.File.Path, newPath)
+	}
+	// The rewrite takes over the old file's batch coverage (#1207 S4b).
+	if registerPayload.InheritFrom != oldPath || len(registerPayload.File.Coverage) != 0 {
+		t.Fatalf("InheritFrom = %q, coverage %v; want %q and none", registerPayload.InheritFrom, registerPayload.File.Coverage, oldPath)
 	}
 	if registerPayload.File.OriginNodeID != "new-primary" {
 		t.Fatalf("OriginNodeID = %q, want new-primary", registerPayload.File.OriginNodeID)
@@ -131,7 +135,7 @@ func TestReplaceManifestAfterRewriteDeletesUnmanifestedSource(t *testing.T) {
 
 	coordinator := &rewriteManifestCoordinator{}
 	h := &DeleteHandler{storage: backend, coordinator: coordinator, logger: zerolog.Nop()}
-	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, nil); err != nil {
+	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(root, oldPath)); !os.IsNotExist(err) {
@@ -170,7 +174,7 @@ func TestPartialRewriteStandaloneDeletesOriginal(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := &DeleteHandler{db: db, storage: backend, logger: logger}
-	if _, err := h.rewriteFileWithoutDeletedRows(context.Background(), full, oldPath, "host = 'h1'"); err != nil {
+	if _, err := h.rewriteFileWithoutDeletedRows(context.Background(), full, oldPath, "host = 'h1'", ""); err != nil {
 		t.Fatal(err)
 	}
 	files, err := backend.List(context.Background(), filepath.Dir(oldPath))
@@ -225,7 +229,7 @@ func TestReplaceManifestAfterRewriteDeletesOriginalObject(t *testing.T) {
 	remote := &struct{ storage.Backend }{Backend: local}
 	h := &DeleteHandler{storage: remote, coordinator: c, logger: zerolog.Nop()}
 	s3 := &s3RewriteResult{newPath: newPath, sizeBytes: 3, sha256: "remote-test"}
-	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, s3); err != nil {
+	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, s3, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(oldFull); !os.IsNotExist(err) {
@@ -262,7 +266,7 @@ func TestRewriteReportsSourceRetiredByConcurrentDelete(t *testing.T) {
 	h := &DeleteHandler{db: db, storage: backend, logger: logger}
 
 	// The source is absent, exactly as it is for the request that loses the mutex race.
-	_, err = h.rewriteFileWithoutDeletedRows(context.Background(), full, relativePath, "host = 'h1'")
+	_, err = h.rewriteFileWithoutDeletedRows(context.Background(), full, relativePath, "host = 'h1'", "")
 	if err == nil {
 		t.Fatal("rewrite of a retired source returned no error")
 	}
@@ -280,7 +284,68 @@ func TestRewriteReportsSourceRetiredByConcurrentDelete(t *testing.T) {
 	if _, err := db.DB().Exec(fmt.Sprintf("COPY src2 TO %q (FORMAT PARQUET)", full)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.rewriteFileWithoutDeletedRows(context.Background(), full, relativePath, "host = 'h1'"); errors.Is(err, errSourceRetired) {
+	if _, err := h.rewriteFileWithoutDeletedRows(context.Background(), full, relativePath, "host = 'h1'", ""); errors.Is(err, errSourceRetired) {
 		t.Errorf("a present source was reported as retired: %v", err)
+	}
+}
+
+func TestClusterFilesListingOmitsCoverage(t *testing.T) {
+	in := []*raft.FileEntry{{Path: "p", Coverage: []raft.InstanceCoverage{{Instance: 1, Key: "k"}}}}
+	out := withoutCoverage(in)
+	if len(out) != 1 || out[0].Path != "p" || out[0].Coverage != nil || in[0].Coverage == nil {
+		t.Fatalf("out %+v, in %+v", out[0], in[0])
+	}
+}
+
+// finalizingRewriteCoordinator: compaction commit on, and the rewritten file
+// is the output of a committed object-store compaction over input.
+type finalizingRewriteCoordinator struct {
+	rewriteManifestCoordinator
+	output, input string
+}
+
+func (c *finalizingRewriteCoordinator) CompactionCommitActive() bool { return true }
+func (c *finalizingRewriteCoordinator) WaitLocalFiles(context.Context, string, string, time.Duration) ([]string, error) {
+	return nil, nil
+}
+func (c *finalizingRewriteCoordinator) SyncManifest(context.Context) error { return nil }
+func (c *finalizingRewriteCoordinator) ManifestHotFiles(string, string) []raft.FileEntry {
+	return nil
+}
+func (c *finalizingRewriteCoordinator) FinalizingObjectInputs(path string) []string {
+	if path == c.output {
+		return []string{c.input}
+	}
+	return nil
+}
+
+// The rewrite path object stores take: once the rewrite of a finalizing
+// output is published, that job's input objects go (#1207 d2a2b).
+func TestReplaceManifestAfterRewriteRemovesFinalizingInputs(t *testing.T) {
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = backend.Close() })
+	const oldPath = "db/cpu/out_compacted.parquet"
+	const newPath = "db/cpu/out_compacted_rewrite_1.parquet"
+	const input = "db/cpu/in.parquet"
+	for _, p := range []string{oldPath, newPath, input} {
+		if err := backend.Write(context.Background(), p, []byte(p)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := &finalizingRewriteCoordinator{
+		rewriteManifestCoordinator: rewriteManifestCoordinator{entry: &raft.FileEntry{Path: oldPath, Database: "db", Measurement: "cpu",
+			Tier: "hot", CreatedAt: time.Now(), SHA256: "s", SizeBytes: int64(len(oldPath))}},
+		output: oldPath, input: input,
+	}
+	h := &DeleteHandler{storage: backend, coordinator: c, logger: zerolog.Nop()}
+	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, nil, "s"); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := backend.Exists(context.Background(), input); ok {
+		t.Fatal("the input of the rewritten output was kept")
 	}
 }

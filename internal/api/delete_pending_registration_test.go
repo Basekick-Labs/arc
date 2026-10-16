@@ -56,7 +56,7 @@ func TestDeleteRewriteOfAPendingFileAnnouncesTheRewrite(t *testing.T) {
 
 	coordinator := &rewriteManifestCoordinator{}
 	h := &DeleteHandler{storage: backend, coordinator: coordinator, pending: outbox, logger: zerolog.Nop()}
-	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, nil); err != nil {
+	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	if outbox.IsPending(oldPath) {
@@ -95,7 +95,7 @@ func TestDeleteRewriteOfAJustRegisteredFileReplacesItInTheManifest(t *testing.T)
 		pending: fixedPending{outcome: cluster.ReplaceRegistered, entry: raft.FileEntry{
 			Path: oldPath, Database: "db", Measurement: "cpu", Tier: "hot", CreatedAt: time.Now(),
 		}}}
-	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, nil); err != nil {
+	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	if len(coordinator.ops) != 2 || coordinator.ops[0].Type != raft.CommandRegisterFile || coordinator.ops[1].Type != raft.CommandDeleteFile {
@@ -142,7 +142,7 @@ func TestDeleteOfEveryRowWithdrawsAPendingFile(t *testing.T) {
 	outbox.RegisterFile("db", "cpu", oldPath, time.Now(), 1, "x")
 
 	h := &DeleteHandler{db: db, storage: backend, coordinator: &rewriteManifestCoordinator{}, pending: outbox, logger: logger}
-	if _, err := h.rewriteFileWithoutDeletedRows(context.Background(), full, oldPath, "host = 'h1'"); err != nil {
+	if _, err := h.rewriteFileWithoutDeletedRows(context.Background(), full, oldPath, "host = 'h1'", ""); err != nil {
 		t.Fatal(err)
 	}
 	if outbox.IsPending(oldPath) {
@@ -165,7 +165,7 @@ func (failingPending) Withdraw(context.Context, string) (bool, cluster.ReplaceOu
 func TestDeleteRewriteRemovesTheRewriteWhenTheSwapFails(t *testing.T) {
 	root, backend, oldPath, newPath := rewriteFixture(t)
 	h := &DeleteHandler{storage: backend, coordinator: &rewriteManifestCoordinator{}, pending: failingPending{}, logger: zerolog.Nop()}
-	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, nil); err == nil {
+	if err := h.replaceManifestAfterRewrite(context.Background(), oldPath, newPath, nil, ""); err == nil {
 		t.Fatal("a failed swap was reported as success")
 	}
 	if _, err := os.Stat(filepath.Join(root, newPath)); !os.IsNotExist(err) {

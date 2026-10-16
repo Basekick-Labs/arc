@@ -19,11 +19,11 @@ type ColumnarRecord struct {
 	Columnar    bool                     `json:"_columnar"` // Marker for columnar format
 	Columns     map[string][]interface{} `json:"columns"`   // Column name -> array of values
 	TagColumns  []string                 `json:"-"`         // Tag column names (for Parquet metadata, enables auto-dedup)
-	// DedupTime, when true, makes compaction dedup this data on the time column
-	// even when TagColumns is empty (keeping one row per timestamp). Set ONLY by
-	// producers whose data model guarantees one row per (tags, time) — continuous
-	// queries (#521). MUST stay false for raw ingest, where many distinct rows
-	// legitimately share a timestamp and time-only dedup would destroy data.
+	// DedupTime, when true, marks this data as continuous-query output without
+	// tag columns (#521). It opts the written file into exact-row dedup at
+	// compaction, keyed by time: only rows identical in every column collapse
+	// (#1232). Set ONLY by continuous queries; raw ingest without tags is not
+	// deduplicated.
 	DedupTime  bool   `json:"-"`
 	TimeUnit   string `json:"_time_unit,omitempty"`
 	RawPayload []byte `json:"-"` // Original msgpack bytes for zero-copy WAL
@@ -41,6 +41,7 @@ type MsgPackPayload struct {
 
 	// Columnar format
 	Columns map[string][]interface{} `msgpack:"columns,omitempty"`
+	TagKeys []string                 `msgpack:"tag_keys,omitempty"`
 
 	// Batch format
 	Batch []interface{} `msgpack:"batch,omitempty"`

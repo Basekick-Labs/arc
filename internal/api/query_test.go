@@ -863,6 +863,9 @@ func TestValidateWhereClauseQueryMaskingEdgeCases(t *testing.T) {
 		`tag = $$drop$$`,
 		`tag = E'delete'`,
 		`x1union = 1`,
+		`x = 1e5`,
+		`x = 1.5e-3 AND y = .25`,
+		`a.b1union = 1`,
 	} {
 		if err := validateWhereClauseQuery(where); err != nil {
 			t.Errorf("validateWhereClauseQuery(%q) rejected valid input: %v", where, err)
@@ -878,6 +881,15 @@ func TestValidateWhereClauseQueryMaskingEdgeCases(t *testing.T) {
 		// A keyword glued to a literal has no word boundary against the masker's placeholder.
 		`host='a'union select 1`,
 		`host='a'UNION SELECT * FROM users`,
+		// Every DuckDB number shape lexes as one token before the keyword (#1080).
+		`x = 1e0UNION SELECT 1`,
+		`x = 1.5e3UNION SELECT 1`,
+		`x = 1E+2UNION SELECT 1`,
+		`x = 1.UNION SELECT 1`,
+		`x = .5UNION SELECT 1`,
+		`x = 1.e1UNION SELECT 1`,
+		`x = 1_000.5e1_0UNION SELECT 1`,
+		`x = 1_0UNION SELECT 1`,
 	} {
 		if err := validateWhereClauseQuery(where); err == nil {
 			t.Errorf("validateWhereClauseQuery(%q) accepted unsafe input", where)

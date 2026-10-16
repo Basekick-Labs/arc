@@ -49,6 +49,10 @@ type CoveragePiece struct {
 	// failed flush leaves the batch for recovery to replay. A batch whose WAL
 	// append was dropped is replayable by nothing. Not persisted.
 	replayable bool
+	// claimEpoch is set on the pieces of a claimant replay (ReplayClaimed):
+	// the claim the rows are published under. The group carries it per
+	// instance (GroupCoverage.Epochs).
+	claimEpoch uint64
 }
 
 func (p CoveragePiece) whole() bool { return p.Chunks == 0 && p.RowTotal == 0 }
@@ -73,10 +77,67 @@ type GroupCoverage struct {
 	// (see MarshalJSON): a reader never takes it for a complete coverage.
 	RangesOmitted  int `json:"ranges_omitted,omitempty"`
 	PartialOmitted int `json:"partial_omitted,omitempty"`
+	// Bounds is, per instance, the lowest and highest batch of the whole
+	// coverage. Journaled only with a truncated copy, and never truncated
+	// itself, so a reader still knows which WAL entries the group needs
+	// (#1207 S4c). Readers before S4c ignore it.
+	Bounds []CoverageRange `json:"bounds,omitempty"`
+
+	// File is the part of the coverage with rows in this one file, when the
+	// group wrote several (one per partition hour). Nil when the file holds
+	// rows of every piece (a group with one file). The cluster manifest
+	// records it per file, exactly (#1207 S4b).
+	File *FileCoverage `json:"file,omitempty"`
+
+	// Epochs is, per instance, the stream claim a claimant publishes these
+	// batches under (#1207 S4b1c). Absent on everything else. A group whose
+	// pieces of one instance name different claims carries ConflictEpoch for
+	// it, which no claim has: the manifest refuses the file.
+	Epochs map[uint64]uint64 `json:"ep,omitempty"`
 
 	// onSettle receives each file's outcome. Nil on coverage loaded from a
 	// journal: the group that would act on it belonged to an earlier process.
 	onSettle func(path string, outcome CoverageOutcome)
+}
+
+// FileCoverage lists the pieces with at least one row in one file of a group.
+type FileCoverage struct {
+	Ranges  []CoverageRange `json:"ranges,omitempty"`
+	Partial []CoveragePiece `json:"partial,omitempty"`
+	// Omitted is set when the lists were capped: the file's coverage is not
+	// known exactly.
+	Omitted bool `json:"omitted,omitempty"`
+}
+
+// FilePieces returns the coverage of this file: the File part when set,
+// otherwise the whole group. exact is false when either was truncated.
+func (g *GroupCoverage) FilePieces() (ranges []CoverageRange, partial []CoveragePiece, exact bool) {
+	if g == nil {
+		return nil, nil, true
+	}
+	if g.File != nil {
+		return g.File.Ranges, g.File.Partial, !g.File.Omitted
+	}
+	return g.Ranges, g.Partial, g.RangesOmitted+g.PartialOmitted == 0
+}
+
+// forFile returns a copy of g for one file holding rows of pieces only. The
+// copy settles through the same group.
+func (g *GroupCoverage) forFile(pieces []CoveragePiece) *GroupCoverage {
+	if g == nil {
+		return nil
+	}
+	c := *g
+	ranges, partial := foldPieces(pieces)
+	fc := &FileCoverage{Ranges: ranges, Partial: partial}
+	if len(fc.Ranges) > maxJournalRanges {
+		fc.Ranges, fc.Omitted = fc.Ranges[:maxJournalRanges], true
+	}
+	if len(fc.Partial) > maxJournalPartial {
+		fc.Partial, fc.Omitted = fc.Partial[:maxJournalPartial], true
+	}
+	c.File = fc
+	return &c
 }
 
 // NewGroupCoverage builds a GroupCoverage whose Settle calls onSettle. The
@@ -98,6 +159,9 @@ const (
 func (g GroupCoverage) MarshalJSON() ([]byte, error) {
 	type plain GroupCoverage
 	out := plain(g)
+	if len(out.Ranges) > maxJournalRanges || len(out.Partial) > maxJournalPartial {
+		out.Bounds = g.bounds()
+	}
 	if n := len(out.Ranges); n > maxJournalRanges {
 		out.Ranges, out.RangesOmitted = out.Ranges[:maxJournalRanges], out.RangesOmitted+n-maxJournalRanges
 	}
@@ -105,6 +169,60 @@ func (g GroupCoverage) MarshalJSON() ([]byte, error) {
 		out.Partial, out.PartialOmitted = out.Partial[:maxJournalPartial], out.PartialOmitted+n-maxJournalPartial
 	}
 	return json.Marshal(out)
+}
+
+// bounds returns, per instance, the lowest and highest batch the coverage
+// holds, ordered by instance.
+func (g GroupCoverage) bounds() []CoverageRange {
+	if len(g.Bounds) > 0 && g.RangesOmitted+g.PartialOmitted > 0 {
+		return g.Bounds // a truncated copy: its lists are incomplete
+	}
+	by := map[uint64]*CoverageRange{}
+	note := func(inst, lo, hi uint64) {
+		if b := by[inst]; b == nil {
+			by[inst] = &CoverageRange{Instance: inst, Lo: lo, Hi: hi}
+		} else {
+			if lo < b.Lo {
+				b.Lo = lo
+			}
+			if hi > b.Hi {
+				b.Hi = hi
+			}
+		}
+	}
+	for _, r := range g.Ranges {
+		note(r.Instance, r.Lo, r.Hi)
+	}
+	for _, p := range g.Partial {
+		note(p.Instance, p.CSeq, p.CSeq)
+	}
+	out := make([]CoverageRange, 0, len(by))
+	for _, b := range by {
+		out = append(out, *b)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Instance < out[j].Instance })
+	return out
+}
+
+// HeldSpans is what the WAL must keep for this coverage until its file
+// registers: every listed range and partial batch, plus the bounds of a
+// truncated copy. ok is false for a truncated copy journaled before S4c,
+// which has no bounds: what it needs is unknown.
+func (g *GroupCoverage) HeldSpans() (spans []CoverageRange, ok bool) {
+	if g == nil {
+		return nil, true
+	}
+	spans = append(spans, g.Ranges...)
+	for _, p := range g.Partial {
+		spans = append(spans, CoverageRange{Instance: p.Instance, Lo: p.CSeq, Hi: p.CSeq})
+	}
+	if g.RangesOmitted+g.PartialOmitted > 0 {
+		if len(g.Bounds) == 0 {
+			return spans, false
+		}
+		spans = append(spans, g.Bounds...)
+	}
+	return spans, true
 }
 
 // CoverageOutcome is how one file of a group left the registration outbox.
@@ -126,6 +244,14 @@ const (
 	// writer took over these rows (#1207). The group keeps its WAL entries:
 	// the rows above the claim are re-flushed from them. The floor holds.
 	CoverageRefused
+	// CoverageResolved: a refused file whose rows are all in registered
+	// files now (another writer published them): its parked copy is gone.
+	// Once every refused file of a group is resolved, the group releases its
+	// WAL entries. The floor keeps treating its batches as lost.
+	CoverageResolved
+	// CoverageDeleted: a durable DELETE record removed every row in the
+	// parked file's scope, so its WAL hold can be released without publication.
+	CoverageDeleted
 )
 
 func (o CoverageOutcome) String() string {
@@ -138,6 +264,10 @@ func (o CoverageOutcome) String() string {
 		return "lost"
 	case CoverageRefused:
 		return "refused"
+	case CoverageResolved:
+		return "resolved"
+	case CoverageDeleted:
+		return "deleted"
 	default:
 		return "abandoned"
 	}
@@ -168,6 +298,9 @@ type coveredWALWriter interface {
 	TrackedInstance() uint64
 	MarkFlushedRetained(hashes []string) error
 	ReleaseRegistered(hashes []string)
+	// CoverageLost reports a batch whose WAL entry the writer failed to write
+	// after it was enqueued (#676): recovery will never replay it.
+	CoverageLost(key string, cseq uint64) bool
 }
 
 // coverageState is installed by EnableCoverage.
@@ -299,6 +432,7 @@ type flushGroup struct {
 	cs     *coverageState
 	key    string
 	pieces []CoveragePiece
+	spans  []coverageSpan
 	tokens []string
 
 	mu           sync.Mutex
@@ -309,12 +443,19 @@ type flushGroup struct {
 	lost         bool
 	refused      bool
 	finished     bool
+	// refusedOpen are the refused files not resolved yet; released is set
+	// once the WAL entries of a refused group are let go.
+	refusedOpen map[string]struct{}
+	released    bool
 }
 
 // newFlushGroup builds the coverage of an extracted buffer. Nil when coverage
 // is off or none of the batches carries any.
 func (b *ArrowBuffer) newFlushGroup(key string, records []interface{}, tokens []string) *flushGroup {
-	cs := b.coverage.Load()
+	return b.newFlushGroupWith(b.coverage.Load(), key, records, tokens)
+}
+
+func (b *ArrowBuffer) newFlushGroupWith(cs *coverageState, key string, records []interface{}, tokens []string) *flushGroup {
 	if cs == nil {
 		return nil
 	}
@@ -322,7 +463,64 @@ func (b *ArrowBuffer) newFlushGroup(key string, records []interface{}, tokens []
 	if len(pieces) == 0 {
 		return nil
 	}
-	return &flushGroup{b: b, cs: cs, key: key, pieces: pieces, tokens: tokens, settled: make(map[string]struct{})}
+	return &flushGroup{b: b, cs: cs, key: key, pieces: pieces, spans: coverageRowSpans(records), tokens: tokens, settled: make(map[string]struct{})}
+}
+
+// coverageSpan is the rows [lo, hi) a batch occupies in the merged batch of
+// its flush, and the batch's coverage.
+type coverageSpan struct {
+	lo, hi int
+	pieces []CoveragePiece
+}
+
+// coverageRowSpans lays out records as mergeBatches concatenates them: in
+// order, each as long as its time column. Captured when the group is built:
+// the async flush drops the records once merged.
+func coverageRowSpans(records []interface{}) []coverageSpan {
+	var spans []coverageSpan
+	off := 0
+	for _, record := range records {
+		var cols map[string]interface{}
+		var cov []CoveragePiece
+		switch r := record.(type) {
+		case *TypedColumnBatch:
+			cols, cov = r.Data, r.Coverage
+		case map[string]interface{}:
+			cols = r
+		}
+		n := 0
+		if t, ok := cols["time"].([]int64); ok {
+			n = len(t)
+		}
+		if len(cov) > 0 && n > 0 {
+			spans = append(spans, coverageSpan{lo: off, hi: off + n, pieces: cov})
+		}
+		off += n
+	}
+	return spans
+}
+
+// piecesAt returns the pieces of the batches holding at least one of rows,
+// which are ascending row indices of the merged batch.
+func (g *flushGroup) piecesAt(rows []int) []CoveragePiece {
+	if g == nil {
+		return nil
+	}
+	var out []CoveragePiece
+	s := 0
+	for _, r := range rows {
+		for s < len(g.spans) && g.spans[s].hi <= r {
+			s++
+		}
+		if s == len(g.spans) {
+			break
+		}
+		if r >= g.spans[s].lo {
+			out = append(out, g.spans[s].pieces...)
+			s++ // each batch once
+		}
+	}
+	return out
 }
 
 // coverage is what the registrar receives for each of the group's files.
@@ -338,7 +536,50 @@ func (g *flushGroup) coverage(files int) *GroupCoverage {
 		onSettle: g.settle,
 	}
 	gc.Ranges, gc.Partial = foldPieces(g.pieces)
+	gc.Epochs = claimEpochs(g.pieces)
 	return gc
+}
+
+// ConflictEpoch marks an instance whose pieces in one group name different
+// claims. Claim epochs are log indexes, never this value.
+const ConflictEpoch = ^uint64(0)
+
+// claimEpochs collects the claim epoch of each instance of pieces. An
+// instance whose pieces name different claims, or some a claim and some
+// none, gets ConflictEpoch.
+func claimEpochs(pieces []CoveragePiece) map[uint64]uint64 {
+	claimed := false
+	for _, p := range pieces {
+		if p.claimEpoch != 0 {
+			claimed = true
+			break
+		}
+	}
+	if !claimed {
+		return nil // every live flush: nothing to collect
+	}
+	var out map[uint64]uint64
+	unclaimed := map[uint64]bool{}
+	for _, p := range pieces {
+		if p.claimEpoch == 0 {
+			unclaimed[p.Instance] = true
+			continue
+		}
+		if out == nil {
+			out = map[uint64]uint64{}
+		}
+		if e, ok := out[p.Instance]; ok && e != p.claimEpoch {
+			out[p.Instance] = ConflictEpoch
+		} else {
+			out[p.Instance] = p.claimEpoch
+		}
+	}
+	for inst := range out {
+		if unclaimed[inst] {
+			out[inst] = ConflictEpoch
+		}
+	}
+	return out
 }
 
 // foldPieces folds whole pieces into maximal ranges per instance and returns
@@ -385,6 +626,10 @@ func foldPieces(pieces []CoveragePiece) ([]CoverageRange, []CoveragePiece) {
 }
 
 func (g *flushGroup) settle(path string, outcome CoverageOutcome) {
+	if outcome == CoverageResolved || outcome == CoverageDeleted {
+		g.resolve(path)
+		return
+	}
 	g.mu.Lock()
 	if _, dup := g.settled[path]; dup || g.finished {
 		g.mu.Unlock()
@@ -396,9 +641,16 @@ func (g *flushGroup) settle(path string, outcome CoverageOutcome) {
 	}
 	if outcome == CoverageRefused {
 		g.refused = true
+		if g.refusedOpen == nil {
+			g.refusedOpen = map[string]struct{}{}
+		}
+		g.refusedOpen[path] = struct{}{}
 	}
 	g.mu.Unlock()
-	if outcome == CoverageLost {
+	if outcome == CoverageLost && g.claimReplay() {
+		g.b.logger.Warn().Str("buffer_key", g.key).Str("path", path).
+			Msg("A claimed replay file settled without being registered; the claimant publishes its rows again")
+	} else if outcome == CoverageLost {
 		metrics.Get().IncWALCoverageLost(1)
 		g.b.logger.Error().Str("buffer_key", g.key).Str("path", path).
 			Msg("A flushed file settled without being registered; its rows are in no registered file and the registered floor of this key stops below them")
@@ -428,30 +680,64 @@ func (g *flushGroup) maybeFinish() {
 	lost := g.lost || !g.announced
 	refused := g.refused
 	g.mu.Unlock()
+	if refused && g.claimReplay() {
+		// No WAL entries here: the file is parked, and the claimant decides
+		// what to publish again.
+		g.b.logger.Warn().Str("buffer_key", g.key).Int("batches", len(g.pieces)).
+			Msg("A claimed replay file was refused and parked")
+		return
+	}
 	if refused {
-		// Keep the WAL entries: the rows above the claim are re-flushed
-		// from them (#1207). Held for the life of the process.
+		// Keep the WAL entries until every refused file is resolved: the
+		// rows nobody else published are re-flushed from them (#1207).
 		metrics.Get().IncWALCoverageRefused(int64(len(g.pieces)))
 		g.b.logger.Warn().Str("buffer_key", g.key).Int("batches", len(g.pieces)).
 			Msg("A flushed file was refused: another writer took over these rows; its WAL entries are kept")
 		g.cs.tracker.settleKey(g.key, g.pieces, false)
+		g.mu.Lock()
+		release := len(g.refusedOpen) == 0 && !g.released
+		g.released = g.released || release
+		g.mu.Unlock()
+		if release {
+			g.cs.wal.ReleaseRegistered(g.tokens)
+		}
+		return
+	}
+	if g.claimReplay() {
 		return
 	}
 	g.cs.wal.ReleaseRegistered(g.tokens)
 	g.cs.tracker.settleKey(g.key, g.pieces, !lost)
 }
 
+// claimReplay reports whether the group publishes claimed batches of
+// another writer (ReplayClaimed): no WAL entries of this writer, and nothing
+// for this writer's tracker.
+func (g *flushGroup) claimReplay() bool {
+	if len(g.tokens) > 0 || len(g.pieces) == 0 {
+		return false
+	}
+	for _, p := range g.pieces {
+		if p.claimEpoch == 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // failed handles a flush that wrote and registered nothing. Pieces whose
 // every WAL entry is in the WAL stay unsettled: recovery replays them and the
 // replay registers them. A piece with no complete WAL copy is gone for good,
-// and its cseq holds the floor.
+// and its cseq holds the floor. That includes a piece whose entries were
+// enqueued (replayable) but which the WAL writer then failed to write (#676):
+// it is in no WAL file, so no replay would ever settle it.
 func (g *flushGroup) failed() {
 	if g == nil {
 		return
 	}
 	var gone []CoveragePiece
 	for _, p := range g.pieces {
-		if !p.replayable {
+		if !p.replayable || (p.Instance == g.cs.instance && g.cs.wal.CoverageLost(g.key, p.CSeq)) {
 			gone = append(gone, p)
 		}
 	}
@@ -698,4 +984,90 @@ func (b *ArrowBuffer) commitCoverageLocked(cs *coverageState, covered bool, prep
 	}
 	batch.Coverage = []CoveragePiece{piece}
 	return err
+}
+
+// resolve records that a refused file's rows are all in registered files.
+// When the group finished refused and every refused file is resolved, its WAL
+// entries are released. The tracker already counted the batches lost: they
+// stay so (another writer published them).
+func (g *flushGroup) resolve(path string) {
+	g.mu.Lock()
+	delete(g.refusedOpen, path)
+	release := g.finished && g.refused && len(g.refusedOpen) == 0 && !g.released
+	if release {
+		g.released = true
+	}
+	g.mu.Unlock()
+	if release {
+		g.cs.wal.ReleaseRegistered(g.tokens)
+	}
+}
+
+// KeySettlement is one key's accounted progress (#1207 S4b): every batch at
+// or below Floor is either in a registered file or listed in Lost (settled
+// without one). Unlike the registered floor, it moves past lost batches.
+type KeySettlement struct {
+	Floor uint64
+	Lost  [][2]uint64
+}
+
+// maxAccountedLost bounds the lost intervals one key reports; the accounted
+// floor stops below the first one that does not fit.
+const maxAccountedLost = 1024
+
+// accounted returns the accounted progress of every key, walking on from
+// from[key] (a floor already reported) when it is above the registered floor:
+// only lost batches above it are listed again.
+func (t *coverageTracker) accounted(from map[string]uint64) map[string]KeySettlement {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make(map[string]KeySettlement, len(t.keys))
+	for k, kf := range t.keys {
+		s := KeySettlement{Floor: kf.floor}
+		if f := from[k]; f > s.Floor {
+			s.Floor = f
+		}
+		di, li := 0, 0
+		for {
+			next := s.Floor + 1
+			for di < len(kf.done) && kf.done[di][1] < next {
+				di++ // below a floor already reported
+			}
+			if di < len(kf.done) && kf.done[di][0] <= next {
+				s.Floor = kf.done[di][1]
+				di++
+				continue
+			}
+			for li < len(kf.lost) && kf.lost[li][1] < next {
+				li++ // lost below the registered floor: already accounted
+			}
+			if li < len(kf.lost) && kf.lost[li][0] <= next {
+				if kf.lost[li][1] < next {
+					li++
+					continue
+				}
+				if len(s.Lost) == maxAccountedLost {
+					break
+				}
+				s.Lost = append(s.Lost, [2]uint64{next, kf.lost[li][1]})
+				s.Floor = kf.lost[li][1]
+				li++
+				continue
+			}
+			break
+		}
+		out[k] = s
+	}
+	return out
+}
+
+// AccountedProgress reports this instance's accounted progress per key, for
+// the stream takeover settlement (#1207 S4b). ok is false while coverage is
+// off.
+func (b *ArrowBuffer) AccountedProgress(from map[string]uint64) (instance uint64, keys map[string]KeySettlement, ok bool) {
+	cs := b.coverage.Load()
+	if cs == nil {
+		return 0, nil, false
+	}
+	return cs.instance, cs.tracker.accounted(from), true
 }

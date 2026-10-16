@@ -84,6 +84,9 @@ func newCoverageBuffer(t *testing.T, maxBufferSize int, reg *coverageRegistrar) 
 		FlushQueueSize: 64,
 	}
 	b := NewArrowBuffer(cfg, &mockStorageBackend{}, zerolog.New(io.Discard))
+	// Closed before the WAL (cleanups run last-in first-out): a buffer left
+	// open keeps publishing the process-wide buffer gauges other tests read.
+	t.Cleanup(func() { _ = b.Close() })
 	b.SetWAL(w)
 	if reg != nil {
 		b.SetFileRegistrar(reg)
@@ -645,6 +648,43 @@ func TestCoverageRefusedKeepsTheWAL(t *testing.T) {
 	}
 	if after := metrics.Get().Snapshot()["wal_coverage_refused"].(int64); after != before+1 {
 		t.Fatalf("wal_coverage_refused %d -> %d", before, after)
+	}
+	_ = b.Close()
+}
+
+// lostCoverageWAL is the real WAL with CoverageLost answered by the test.
+type lostCoverageWAL struct {
+	coveredWALWriter
+	lost map[uint64]bool
+}
+
+func (l lostCoverageWAL) CoverageLost(_ string, cseq uint64) bool { return l.lost[cseq] }
+
+// #676: a batch whose WAL entry was enqueued but then lost to a failed write
+// has no WAL copy either; a failed flush settles it as lost instead of
+// leaving it for a replay that cannot come. Another instance's piece (a
+// replayed one) is not this writer's to judge.
+func TestCoverageFailedFlushSettlesAnEntryTheWALLost(t *testing.T) {
+	reg := &coverageRegistrar{}
+	b, _ := newCoverageBuffer(t, 1000, reg)
+	cs := b.coverage.Load()
+	real := cs.wal
+	cs.wal = lostCoverageWAL{coveredWALWriter: real, lost: map[uint64]bool{1: true, 5: true}}
+	defer func() { cs.wal = real }()
+
+	before := metrics.Get().Snapshot()["wal_coverage_lost"].(int64)
+	g := &flushGroup{b: b, cs: cs, key: "db/x", settled: map[string]struct{}{}, pieces: []CoveragePiece{
+		{Instance: cs.instance, CSeq: 1, replayable: true},     // enqueued, then lost
+		{Instance: cs.instance, CSeq: 3, replayable: true},     // in the WAL
+		{Instance: cs.instance + 1, CSeq: 5, replayable: true}, // another instance's replay
+	}}
+	g.failed()
+	if after := metrics.Get().Snapshot()["wal_coverage_lost"].(int64); after != before+1 {
+		t.Fatalf("wal_coverage_lost %d -> %d, want +1 for the batch the WAL lost", before, after)
+	}
+	cs.tracker.settleKey("db/x", []CoveragePiece{{Instance: cs.instance, CSeq: 2}, {Instance: cs.instance, CSeq: 3}}, true)
+	if got := cs.tracker.accounted(nil)["db/x"]; got.Floor != 3 || len(got.Lost) != 1 || got.Lost[0] != [2]uint64{1, 1} {
+		t.Fatalf("accounted %+v, want floor 3 with cseq 1 lost", got)
 	}
 	_ = b.Close()
 }

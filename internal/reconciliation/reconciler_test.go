@@ -26,6 +26,20 @@ type fakeCoordinator struct {
 	manifest   map[string]*raft.FileEntry
 	batchErr   error // returned by BatchFileOpsInManifest when set
 	batchCalls [][]raft.BatchFileOp
+	syncErr    error // returned by SyncManifest when set
+	syncCalls  int
+	// syncFn, when set, answers SyncManifest call n (1-based) instead.
+	syncFn func(n int) error
+}
+
+func (f *fakeCoordinator) SyncManifest(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.syncCalls++
+	if f.syncFn != nil {
+		return f.syncFn(f.syncCalls)
+	}
+	return f.syncErr
 }
 
 func newFakeCoordinator(entries ...*raft.FileEntry) *fakeCoordinator {
@@ -1503,6 +1517,10 @@ func (c *racingCoordinator) GetFileEntry(path string) (*raft.FileEntry, bool) {
 
 func (c *racingCoordinator) BatchFileOpsInManifest(ops []raft.BatchFileOp) error {
 	return c.inner.BatchFileOpsInManifest(ops)
+}
+
+func (c *racingCoordinator) SyncManifest(ctx context.Context) error {
+	return c.inner.SyncManifest(ctx)
 }
 
 // ---- Helpers ----

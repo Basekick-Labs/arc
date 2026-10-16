@@ -85,6 +85,11 @@ type RegistrationOutbox struct {
 	clusterName string
 	logger      zerolog.Logger
 
+	// localWritten, when set, is told about each file this node just
+	// flushed, before it is announced: the evidence of what the local file
+	// holds (#1182).
+	localWritten atomic.Pointer[func(path, sha256 string)]
+
 	// syncMu serialises fsyncs and journal rewrites. Lock order: syncMu, then
 	// mu. Appends take only mu, so they never wait on a fsync.
 	syncMu sync.Mutex
@@ -115,6 +120,34 @@ type RegistrationOutbox struct {
 	done        chan struct{}
 	manifestRef OutboxManifest // kept for the final pass in Stop
 	storeRef    OutboxStorage
+
+	// The registration hold (registration_hold.go). holdGen counts changes to
+	// the held set; unsyncedAcks are acknowledged entries whose ack is not
+	// durable yet.
+	holdGen         uint64
+	hold            coverageHold
+	holdBuiltGen    uint64
+	holdBuiltSynced uint64
+	holdBuiltTk     uint64 // the manifest's takeover generation the hold was built at
+	unsyncedAcks    []*outboxEntry
+
+	// Parked registrations (registration_parking.go), under mu; parkMu
+	// serialises parking, resolving and the refused journal.
+	refusedPath          string
+	parkMu               sync.Mutex
+	parked               map[string]*parkedEntry
+	parking              *LocalParking
+	takeover             TakeoverReader // set at HandOff when the manifest provides it
+	sendGate             atomic.Pointer[func() bool]
+	resolvedSinceCompact int
+	coveredSent          atomic.Int64 // covered registrations sent (FreshStart)
+	// parkedCovered: the republisher's verdicts (SetParkedCovered).
+	parkedCovered atomic.Pointer[ParkedCoveredFunc]
+	// deleteHooks apply DELETE records to pending files (delete_records_outbox.go).
+	deleteHooks atomic.Pointer[DeleteRecordHooks]
+	// publisher publishes the pending set to a shared object store
+	// (pending_registrations.go, #1214); nil elsewhere. Under mu.
+	publisher *pendingPublisher
 
 	registered atomic.Int64
 	skipped    atomic.Int64
@@ -160,6 +193,9 @@ type outboxEntry struct {
 	// refused: the manifest refused it for good — another writer claimed
 	// its rows (#1207). Settled without registering; the file stays.
 	refused bool
+	// ackAt is the journal generation of its ack record; its batches are held
+	// until the journal is synced past it (#1207 S4c).
+	ackAt uint64
 }
 
 // journalRecord is one journal line. ClusterName pins it to the cluster: a data
@@ -189,9 +225,19 @@ type journalRecord struct {
 	// file of a group carries the whole group's coverage. Readers before
 	// #1207 ignore the field.
 	Cov *ingest.GroupCoverage `json:"cov,omitempty"`
+	// DeleteSeen is the newest DELETE record the file was rewritten with
+	// (#1207 d1); readers before d1 ignore it, and the manifest then refuses
+	// such a file as deleted until it is rewritten again.
+	DeleteSeen uint64 `json:"ds,omitempty"`
 }
 
 const journalRecordVersionCoverage = 2
+
+// journalRecordVersionClaim marks a record whose coverage carries claim
+// epochs (Cov.Epochs, a claimant replay, #1207 S4b1c). An older reader drops
+// the epochs and sends the file unclaimed: the manifest refuses it as
+// claimed, and it is parked, never published twice.
+const journalRecordVersionClaim = 3
 
 // maxJournalLine bounds one journal line. Far above any real record: a
 // group's coverage folds whole batches into ranges.
@@ -246,6 +292,7 @@ func NewRegistrationOutbox(dir, clusterName string, logger zerolog.Logger) (*Reg
 	}
 	r := &RegistrationOutbox{
 		journalPath: filepath.Join(dir, RegistrationJournal),
+		refusedPath: filepath.Join(dir, RefusedRegistrationJournal),
 		clusterName: clusterName,
 		logger:      logger.With().Str("component", "file-registrar").Logger(),
 		byPath:      make(map[string]*outboxEntry),
@@ -268,8 +315,16 @@ func NewRegistrationOutbox(dir, clusterName string, logger zerolog.Logger) (*Reg
 		r.logger.Warn().Int("records", foreign).Str("journal", r.journalPath).
 			Msg("Pending file registrations written for another cluster were dropped from the journal")
 	}
+	if r.parked, err = loadRefused(r.refusedPath, clusterName); err != nil {
+		return nil, err
+	}
 	now := time.Now()
 	for _, rec := range loaded {
+		if _, parked := r.parked[rec.Path]; parked {
+			// Parked before the ack reached this journal: the refused
+			// record wins.
+			continue
+		}
 		added := now
 		if !rec.FlushedAt.IsZero() {
 			added = rec.FlushedAt
@@ -289,6 +344,14 @@ func NewRegistrationOutbox(dir, clusterName string, logger zerolog.Logger) (*Reg
 	if r.live > 0 {
 		r.logger.Info().Int("files", r.live).
 			Msg("Loaded file registrations a previous start did not confirm; they are registered once the cluster is up")
+	}
+	if len(r.parked) > 0 {
+		r.logger.Warn().Int("files", len(r.parked)).
+			Msg("Loaded parked refused files: their rows are kept until they are registered elsewhere")
+	}
+	if n := r.unknownHoldsLocked(); n > 0 {
+		r.logger.Warn().Int("files", n).
+			Msg("Pending file registrations with truncated coverage from an older release: their WAL entries are not held until they register")
 	}
 	r.publishMetrics()
 	return r, nil
@@ -398,6 +461,13 @@ func readJournalLine(br *bufio.Reader) ([]byte, error) {
 	}
 }
 
+// SetLocalWritten wires the hook told about each flushed file (#1182).
+func (r *RegistrationOutbox) SetLocalWritten(fn func(path, sha256 string)) {
+	if fn != nil {
+		r.localWritten.Store(&fn)
+	}
+}
+
 // RegisterFile implements ingest.FileRegistrar. It appends without fsyncing;
 // SyncRegistrations makes the append durable.
 func (r *RegistrationOutbox) RegisterFile(database, measurement, path string, partitionTime time.Time, sizeBytes int64, sha256 string) {
@@ -408,6 +478,9 @@ func (r *RegistrationOutbox) RegisterFile(database, measurement, path string, pa
 // with the coverage of the file's flush group (#1207), journaled with the
 // record. The file's outcome is reported through cov.Settle.
 func (r *RegistrationOutbox) RegisterCoveredFile(database, measurement, path string, partitionTime time.Time, sizeBytes int64, sha256 string, cov *ingest.GroupCoverage) {
+	if fn := r.localWritten.Load(); fn != nil {
+		(*fn)(path, sha256)
+	}
 	rec := journalRecord{
 		Version: journalRecordVersion, Op: journalOpAdd, ClusterName: r.clusterName,
 		Database: database, Measurement: measurement, Path: path,
@@ -416,6 +489,9 @@ func (r *RegistrationOutbox) RegisterCoveredFile(database, measurement, path str
 	}
 	if cov != nil {
 		rec.Version = journalRecordVersionCoverage
+		if len(cov.Epochs) > 0 {
+			rec.Version = journalRecordVersionClaim
+		}
 	}
 	r.mu.Lock()
 	switch r.state {
@@ -434,6 +510,9 @@ func (r *RegistrationOutbox) RegisterCoveredFile(database, measurement, path str
 		r.appendLocked(rec)
 		r.mu.Unlock()
 		_ = r.SyncRegistrations()
+		// Stop has published already: this file goes in the list too, before
+		// the node leaves the cluster (#1214). CoverForLeave tries again.
+		_ = r.publishPending(true)
 		return
 	}
 	r.enqueueLocked(rec, time.Now(), true)
@@ -453,11 +532,17 @@ func (r *RegistrationOutbox) enqueueLocked(rec journalRecord, added time.Time, f
 		// earlier file's rows were overwritten: report them lost.
 		e.done = true
 		r.live--
+		if e.rec.Cov != nil {
+			r.holdGen++
+		}
 		if e.rec.Cov != nil && e.rec.Cov != rec.Cov {
 			go e.rec.Cov.Settle(e.rec.Path, ingest.CoverageLost)
 		}
 	}
 	e := &outboxEntry{rec: rec, added: added, fresh: fresh}
+	if rec.Cov != nil {
+		r.holdGen++
+	}
 	r.byPath[rec.Path] = e
 	r.queue = append(r.queue, e)
 	r.live++
@@ -550,6 +635,7 @@ func (r *RegistrationOutbox) SyncRegistrations() error {
 	if target > r.synced {
 		r.synced = target
 	}
+	r.pruneUnsyncedAcksLocked()
 	return nil
 }
 
@@ -639,7 +725,11 @@ func (r *RegistrationOutbox) IsPending(path string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, ok := r.byPath[path]
-	return ok && !e.done
+	if ok && !e.done {
+		return true
+	}
+	_, parked := r.parked[path] // left in place when it could not be moved
+	return parked
 }
 
 // Abandon is for a start whose cluster coordinator never came up. From here
@@ -648,6 +738,16 @@ func (r *RegistrationOutbox) IsPending(path string) bool {
 // already pending for the next start. Reports whether this call abandoned it:
 // false after a hand-off, when the drain is running.
 func (r *RegistrationOutbox) Abandon() bool {
+	if !r.abandon() {
+		return false
+	}
+	// No drain will register what is pending in this start: the orphan sweep
+	// learns of it from the published list (#1214).
+	r.publishForStop()
+	return true
+}
+
+func (r *RegistrationOutbox) abandon() bool {
 	r.syncMu.Lock()
 	defer r.syncMu.Unlock()
 	r.mu.Lock()
@@ -672,6 +772,16 @@ func (r *RegistrationOutbox) Abandon() bool {
 	}
 	r.logger.Warn().Int("pending", r.live).Str("journal", r.journalPath).
 		Msg("Cluster manifest unavailable in this start; pending file registrations stay in the journal for the next start")
+	covered := 0
+	for _, e := range r.byPath {
+		if !e.done && e.rec.Cov != nil {
+			covered++
+		}
+	}
+	if covered > 0 {
+		r.logger.Error().Int("files", covered).
+			Msg("WAL entries of files waiting to register are kept until a start with the cluster registers them; the WAL grows with them")
+	}
 	return true
 }
 
@@ -688,17 +798,28 @@ func (r *RegistrationOutbox) HandOff(manifest OutboxManifest, store OutboxStorag
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
 	n := r.live
+	if tk, ok := manifest.(TakeoverReader); ok {
+		r.takeover = tk
+	}
+	r.holdGen++
 	r.mu.Unlock()
 	if n > 0 {
 		r.logger.Info().Int("files", n).Msg("Registering files flushed before the cluster was up")
 	}
 	go r.run(ctx, manifest, store)
+	go r.resolveParkedLoop(ctx, manifest, store)
 }
 
 // Stop ends the drain, then spends at most outboxStopBudget registering what
 // is still pending, so the final flush lands in the manifest before Raft
 // stops. What is left stays in the journal for the next start.
+//
+// What is still pending is then published to the shared object store
+// (#1214), on every return path, with retries: this node leaves the cluster
+// after Stop (the coordinator stops later), and a node that left is no longer
+// asked. The coordinator does not broadcast the leave unless CoverForLeave.
 func (r *RegistrationOutbox) Stop() {
+	defer r.publishForStop()
 	r.mu.Lock()
 	cancel, done, state := r.cancel, r.done, r.state
 	if state == outboxRunning || state == outboxCollecting {
@@ -723,7 +844,8 @@ func (r *RegistrationOutbox) Stop() {
 	r.mu.Unlock()
 	ctx, cancelFinal := context.WithTimeout(context.Background(), outboxStopBudget)
 	defer cancelFinal()
-	for manifest != nil && ctx.Err() == nil {
+	gate := r.sendGate.Load()
+	for manifest != nil && ctx.Err() == nil && (gate == nil || (*gate)()) {
 		progressed, err := r.attempt(ctx, manifest, store)
 		if err != nil || !progressed {
 			break
@@ -783,6 +905,7 @@ func (r *RegistrationOutbox) run(ctx context.Context, manifest OutboxManifest, s
 			return
 		}
 		r.alarm()
+		r.maybePublish()
 		if err := manifest.WaitForLeader(outboxLeaderWait); err != nil {
 			if !backoff(err, "No cluster leader yet; file registrations wait") {
 				return
@@ -802,8 +925,17 @@ func (r *RegistrationOutbox) run(ctx context.Context, manifest OutboxManifest, s
 	delay, failures = outboxRetryMin, 0
 
 	for ctx.Err() == nil {
+		// Stream takeover (#1207): with it on, nothing registers before this
+		// writer instance is announced to the cluster.
+		if gate := r.sendGate.Load(); gate != nil && !(*gate)() {
+			if !sleep(outboxRetryMin) {
+				return
+			}
+			continue
+		}
 		progressed, err := r.attempt(ctx, manifest, store)
 		r.alarm()
+		r.maybePublish()
 		switch {
 		case err != nil:
 			if !backoff(err, "Failed to register files in the cluster manifest; retrying") {
@@ -890,7 +1022,6 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 	var ops []raft.BatchFileOp
 	var sent []*outboxEntry
 	opEntry := map[int]*outboxEntry{} // register op index -> entry
-	withCoverage := manifest.StreamClaimsEnabled()
 	bytes := 0
 	for _, e := range candidates {
 		if bytes >= registrarDrainChunkBytes {
@@ -909,10 +1040,17 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 				continue
 			}
 		}
-		rp := raft.RegisterFilePayload{File: r.fileEntry(e.rec)}
-		if withCoverage {
-			rp.Coverage = fileCoverage(e.rec.Cov)
+		// Coverage goes with every covered file: an FSM without stream
+		// takeover ignores it, one with it needs it from the first file.
+		cov2 := fileCoverage(e.rec.Cov)
+		switch r.applyDeleteRecords(ctx, e, cov2) {
+		case applyDefer:
+			deferred = append(deferred, e)
+			continue
+		case applyGone:
+			continue
 		}
+		rp := raft.RegisterFilePayload{File: r.fileEntry(e.rec), Cov2: cov2, Supersedes: e.rec.Supersedes, DeleteSeen: e.rec.DeleteSeen}
 		payload, err := json.Marshal(rp)
 		if err != nil || raft.ValidateManifestPath(e.rec.Path) != nil {
 			r.skipped.Add(1)
@@ -922,6 +1060,9 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 		}
 		opEntry[len(ops)] = e
 		ops = append(ops, raft.BatchFileOp{Type: raft.CommandRegisterFile, Payload: payload})
+		if len(rp.Cov2) > 0 {
+			r.coveredSent.Add(1)
+		}
 		if e.rec.Supersedes != "" {
 			if del, err := json.Marshal(raft.DeleteFilePayload{Path: e.rec.Supersedes, Reason: "delete-rewrite"}); err == nil {
 				ops = append(ops, raft.BatchFileOp{Type: raft.CommandDeleteFile, Payload: del})
@@ -939,10 +1080,12 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 		cancel()
 		if applyErr != nil && raft.IsStreamClaimConflict(applyErr) {
 			// Terminal for the named ops; the rest go again next round.
-			refused := r.refuseClaimed(ctx, manifest, applyErr, opEntry)
+			refused, waiting := r.refuseClaimed(ctx, manifest, applyErr, opEntry)
 			settled = append(settled, refused...)
 			if len(refused) > 0 {
 				applyErr = nil
+			} else if waiting > 0 {
+				applyErr = errDeletedRefusal
 			} else {
 				r.logger.Warn().Err(applyErr).Msg("File registrations refused for a stream claim, but the refused files could not be identified; retrying")
 			}
@@ -962,23 +1105,31 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 			for _, e := range sent {
 				r.markInManifest(e)
 			}
-			// A checked file may have been removed between its check and the
-			// commit; an entry no peer can pull keeps a reader query gate red.
-			// Detached from ctx, so a Stop here cannot skip it.
-			var recheck []*outboxEntry
-			for _, e := range sent {
-				if checked[e] {
-					recheck = append(recheck, e)
-				}
+			// A file may have been removed before the commit, after its check
+			// or, for a fresh one, after its flush: on a shared object store a
+			// peer's DELETE, retention or database delete removes an object
+			// the manifest does not list yet (#1214). Every sent file is
+			// checked, fresh ones included, so the entry does not outlive its
+			// object; an entry no peer can pull keeps a reader query gate red.
+			// One stat per registered file, after the commit and off the flush
+			// path. A failed stat counts as present. Not cancelled with the
+			// drain, so a Stop does not skip it, but bounded by Stop's budget:
+			// the final pass's own deadline, or outboxStopBudget.
+			recheck := sent
+			rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), outboxStopBudget)
+			if dl, ok := ctx.Deadline(); ok {
+				rcancel()
+				rctx, rcancel = context.WithDeadline(context.WithoutCancel(ctx), dl)
 			}
-			after, errs := r.statAll(context.Background(), store, recheck)
+			after, errs := r.statAll(rctx, store, recheck)
+			rcancel()
 			for _, e := range recheck {
 				if errs[e] == nil && after[e] < 0 {
 					r.mu.Lock()
 					e.vanished = true
 					r.mu.Unlock()
 					dctx, cancel := context.WithTimeout(context.Background(), outboxAttemptTimeout)
-					if err := manifest.DeleteFileFromManifest(dctx, e.rec.Path, "vanished-before-registration"); err != nil {
+					if err := manifest.DeleteFileFromManifest(dctx, e.rec.Path, raft.DeleteReasonVanished); err != nil {
 						r.logger.Warn().Err(err).Str("path", e.rec.Path).
 							Msg("File vanished while being registered and its manifest entry could not be removed")
 					}
@@ -1029,6 +1180,12 @@ func (r *RegistrationOutbox) markInManifest(e *outboxEntry) {
 	r.mu.Unlock()
 }
 
+// ErrRegistrationParked refuses a DELETE of a file the stream takeover rules
+// refused and parked (#1207) while the DELETE was rewriting it: the file is
+// out of the query path, and its rows are published again from the WAL with
+// the DELETE's record applied. Retryable once the parked file is resolved.
+var ErrRegistrationParked = errors.New("the file was refused by the stream takeover rules and is parked; retry the DELETE later")
+
 // ReplaceOutcome says what ReplacePending found for the old path.
 type ReplaceOutcome int
 
@@ -1043,6 +1200,10 @@ const (
 	// waited. Replace it there; Entry carries its fields, so the caller does
 	// not depend on this node's FSM having applied the commit yet.
 	ReplaceRegistered
+	// ReplaceParked: the old path was refused by the stream takeover rules
+	// and parked (#1207). It is not registered and not pending; the caller
+	// must not rewrite it (its rows are re-flushed from the WAL later).
+	ReplaceParked
 )
 
 // ReplacePending is for a rewrite of a file that may still be pending, such as
@@ -1088,6 +1249,9 @@ func (r *RegistrationOutbox) ReplacePending(ctx context.Context, oldPath, newPat
 func (r *RegistrationOutbox) Withdraw(ctx context.Context, path string) (withdrawn bool, outcome ReplaceOutcome, err error) {
 	e, outcome, _, err := r.settleOrLock(ctx, path)
 	if e == nil {
+		if outcome == ReplaceParked && err == nil {
+			err = ErrRegistrationParked
+		}
 		return false, outcome, err
 	}
 	r.withdrawLocked(e)
@@ -1114,6 +1278,10 @@ func (r *RegistrationOutbox) settleOrLock(ctx context.Context, path string) (*ou
 	r.mu.Lock()
 	for {
 		e, ok := r.byPath[path]
+		if _, parked := r.parked[path]; !ok && parked {
+			r.mu.Unlock()
+			return nil, ReplaceParked, raft.FileEntry{}, nil
+		}
 		if !ok {
 			rc, confirmed := r.recent[path]
 			r.mu.Unlock()
@@ -1148,6 +1316,7 @@ func (r *RegistrationOutbox) withdrawLocked(e *outboxEntry) {
 	r.live--
 	delete(r.byPath, e.rec.Path)
 	r.appendLocked(journalRecord{Version: journalRecordVersion, Op: journalOpAck, ClusterName: r.clusterName, Path: e.rec.Path})
+	r.noteAckLocked(e)
 }
 
 // HoldsRegistration reports a file that is pending here or was confirmed a
@@ -1157,6 +1326,9 @@ func (r *RegistrationOutbox) HoldsRegistration(path string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if e, ok := r.byPath[path]; ok && !e.done {
+		return true
+	}
+	if _, ok := r.parked[path]; ok {
 		return true
 	}
 	rc, ok := r.recent[path]
@@ -1200,7 +1372,8 @@ func (r *RegistrationOutbox) nextBatch() []*outboxEntry {
 	var out []*outboxEntry
 	i := r.head
 	for ; i < len(r.queue) && len(out) < registrarDrainBatch; i++ {
-		if e := r.queue[i]; e != nil && !e.done {
+		// One in flight already is held by a DELETE settling it.
+		if e := r.queue[i]; e != nil && !e.done && !e.inFlight {
 			e.inFlight = true
 			out = append(out, e)
 		}
@@ -1281,6 +1454,7 @@ func (r *RegistrationOutbox) ack(entries []*outboxEntry) {
 			Version: journalRecordVersion, Op: journalOpAck,
 			ClusterName: r.clusterName, Path: e.rec.Path,
 		})
+		r.noteAckLocked(e)
 	}
 	r.advanceHeadLocked()
 	r.mu.Unlock()
@@ -1400,15 +1574,22 @@ func (r *RegistrationOutbox) fileEntry(rec journalRecord) raft.FileEntry {
 	}
 }
 
-// refuseClaimed marks the entries of the ops a claim conflict names as
-// refused and returns them for settling. A refused rewrite's paired delete is
-// still applied on its own: a DELETE whose earlier apply committed must not
-// leave the original file registered.
-func (r *RegistrationOutbox) refuseClaimed(ctx context.Context, manifest OutboxManifest, err error, opEntry map[int]*outboxEntry) []*outboxEntry {
-	var out []*outboxEntry
-	for _, i := range raft.StreamClaimConflictOps(err) {
-		e := opEntry[i]
+// refuseClaimed parks the entries of the ops a takeover refusal names and
+// returns them for settling; waiting counts entries refused for a DELETE
+// record, which stay pending. It runs while they are in flight, so a DELETE
+// of one waits. A refused rewrite's paired delete is still applied on its
+// own: a DELETE whose earlier apply committed must not leave the original
+// file registered. An entry that cannot be parked stays pending.
+func (r *RegistrationOutbox) refuseClaimed(ctx context.Context, manifest OutboxManifest, err error, opEntry map[int]*outboxEntry) (out []*outboxEntry, waiting int) {
+	for _, op := range raft.StreamClaimConflictOps(err) {
+		e := opEntry[op.Op]
 		if e == nil {
+			continue
+		}
+		if op.Kind == raft.RefusedDeleted {
+			// Not parked: it stays pending, and the next attempt applies the
+			// record this node may not have applied yet (#1207 d1).
+			waiting++
 			continue
 		}
 		if e.rec.Supersedes != "" {
@@ -1422,40 +1603,63 @@ func (r *RegistrationOutbox) refuseClaimed(ctx context.Context, manifest OutboxM
 				continue
 			}
 		}
+		if perr := r.park(e, op); perr != nil {
+			r.logger.Error().Err(perr).Str("path", e.rec.Path).Msg("Could not park a refused file registration; it stays pending and is retried")
+			continue
+		}
 		r.mu.Lock()
 		e.refused = true
 		r.mu.Unlock()
 		out = append(out, e)
-		r.logger.Warn().Str("path", e.rec.Path).
-			Msg("File registration refused: another writer took over these rows; the file is kept and not registered")
+	}
+	return out, waiting
+}
+
+// fileCoverage is a file's exact coverage as the cluster manifest records
+// it, per writer instance (#1207 S4b). Over maxFileCoverageBytes it is sent
+// truncated: the manifest then refuses nothing on its account, and the
+// instance stops being tracked for takeover.
+func fileCoverage(cov *ingest.GroupCoverage) []raft.InstanceCoverage {
+	if cov == nil {
+		return nil
+	}
+	ranges, partial, exact := cov.FilePieces()
+	by := map[uint64]*raft.InstanceCoverage{}
+	get := func(inst uint64) *raft.InstanceCoverage {
+		if c := by[inst]; c != nil {
+			return c
+		}
+		c := &raft.InstanceCoverage{Instance: inst, Key: cov.Key, Truncated: !exact, ClaimEpoch: cov.Epochs[inst]}
+		by[inst] = c
+		return c
+	}
+	for _, rg := range ranges {
+		c := get(rg.Instance)
+		c.Ranges = append(c.Ranges, [2]uint64{rg.Lo, rg.Hi})
+	}
+	for _, p := range partial {
+		c := get(p.Instance)
+		c.Partial = append(c.Partial, raft.CoveragePiece{CSeq: p.CSeq, Chunk: p.Chunk, Chunks: p.Chunks, RowLo: p.RowLo, RowHi: p.RowHi, RowTotal: p.RowTotal})
+	}
+	if !exact {
+		// The journal truncated it: name the instances, list nothing.
+		for _, b := range cov.Bounds {
+			get(b.Instance)
+		}
+	}
+	out := make([]raft.InstanceCoverage, 0, len(by))
+	for _, c := range by {
+		out = append(out, *c)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Instance < out[j].Instance })
+	if raw, err := json.Marshal(out); err == nil && len(raw) > maxFileCoverageBytes {
+		for i := range out {
+			out[i].Ranges, out[i].Partial, out[i].Truncated = nil, nil, true
+		}
 	}
 	return out
 }
 
-// fileCoverage is the part of a group's coverage the claim rule reads: per
-// instance, the lowest batch. A coverage the journal truncated is marked so
-// the rule refuses conservatively.
-func fileCoverage(cov *ingest.GroupCoverage) []raft.FileCoverage {
-	if cov == nil {
-		return nil
-	}
-	truncated := cov.RangesOmitted > 0 || cov.PartialOmitted > 0
-	min := map[uint64]uint64{}
-	note := func(inst, c uint64) {
-		if m, ok := min[inst]; !ok || c < m {
-			min[inst] = c
-		}
-	}
-	for _, rg := range cov.Ranges {
-		note(rg.Instance, rg.Lo)
-	}
-	for _, p := range cov.Partial {
-		note(p.Instance, p.CSeq)
-	}
-	out := make([]raft.FileCoverage, 0, len(min))
-	for inst, c := range min {
-		out = append(out, raft.FileCoverage{Instance: inst, Key: cov.Key, MinCSeq: c, Truncated: truncated})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Instance < out[j].Instance })
-	return out
-}
+// maxFileCoverageBytes bounds one registration's coverage, so a batch of
+// registrations stays within the 1 MiB forward frame.
+const maxFileCoverageBytes = 64 << 10

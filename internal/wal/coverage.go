@@ -199,7 +199,7 @@ func (p *PreparedAppend) Commit(cseq uint64) ([]string, error) {
 				Instance: p.w.trackedInstance, Key: p.key, CSeq: cseq, Chunk: e.chunk, Chunks: uint16(len(p.entries)),
 			}})
 		}
-		if err := p.w.tryEnqueueEntry(walEntry{data: e.data, seq: e.seq}); err != nil {
+		if err := p.w.tryEnqueueEntry(walEntry{data: e.data, seq: e.seq, covKey: p.key, covSeq: cseq}); err != nil {
 			p.release(i)
 			return tokens, err
 		}
@@ -224,6 +224,9 @@ func (p *PreparedAppend) release(from int) {
 		delete(p.w.pendingSeqs, e.seq)
 	}
 	p.w.pendingMu.Unlock()
+	if from < len(p.entries) {
+		p.w.signalPurge() // the floor may have moved (#676)
+	}
 }
 
 // TrackedInstance is this writer's instance id: the prefix of every identity

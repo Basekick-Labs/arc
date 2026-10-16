@@ -19,13 +19,32 @@ const dataSyncSupported = true
 // saving is the inode's other metadata (timestamps), so the win over fsync is
 // real but modest — larger on rotational and network-backed storage than on
 // NVMe.
+//
+// It runs through SyscallConn().Control, not f.Fd(), because the WAL syncs on
+// its own goroutine while the writer rotates (#1246). Fd() hands back the raw
+// descriptor number without holding the file open, so a Close on the writer
+// goroutine could release the number and a later open (the next WAL file, a
+// Parquet temp file) could reuse it, and fdatasync would then flush the wrong
+// file and report success. Control holds a reference for the duration of the
+// call, and on a file already closed it returns os.ErrClosed instead.
 func dataSync(f *os.File) error {
-	// Repeat on EINTR: a signal can interrupt fdatasync before it completes,
-	// and returning early would report durability that was not achieved.
-	for {
-		err := syscall.Fdatasync(int(f.Fd()))
-		if err != syscall.EINTR {
-			return err
-		}
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return err
 	}
+	var syncErr error
+	if err := rc.Control(func(fd uintptr) {
+		// Repeat on EINTR: a signal can interrupt fdatasync before it
+		// completes, and returning early would report durability that was not
+		// achieved.
+		for {
+			syncErr = syscall.Fdatasync(int(fd))
+			if syncErr != syscall.EINTR {
+				return
+			}
+		}
+	}); err != nil {
+		return err
+	}
+	return syncErr
 }

@@ -35,6 +35,11 @@ type stubState struct {
 	aborted    int
 }
 
+type stubListObject struct {
+	key  string
+	size int64
+}
+
 // s3Stub is the minimum of S3 the SDK needs to complete a PutObject or a
 // multipart upload: 200 for HEAD, an UploadId for the multipart initiate,
 // an ETag for each part, and a non-empty completion document (the SDK
@@ -47,6 +52,7 @@ type s3Stub struct {
 	completed []string
 	aborted   []string
 	uploads   int
+	list      []stubListObject
 }
 
 func newS3Stub(t *testing.T) *s3Stub {
@@ -63,6 +69,22 @@ func (s *s3Stub) handle(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch {
+	case r.Method == http.MethodGet && q.Get("list-type") == "2":
+		prefix := q.Get("prefix")
+		count := 0
+		for _, obj := range s.list {
+			if strings.HasPrefix(obj.key, prefix) {
+				count++
+			}
+		}
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><Name>b</Name><Prefix>%s</Prefix><KeyCount>%d</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>`, prefix, count)
+		for _, obj := range s.list {
+			if strings.HasPrefix(obj.key, prefix) {
+				_, _ = fmt.Fprintf(w, `<Contents><Key>%s</Key><LastModified>2026-10-08T00:00:00Z</LastModified><ETag>"obj"</ETag><Size>%d</Size><StorageClass>STANDARD</StorageClass></Contents>`, obj.key, obj.size)
+			}
+		}
+		_, _ = io.WriteString(w, `</ListBucketResult>`)
 	case r.Method == http.MethodHead:
 		w.WriteHeader(http.StatusOK)
 	case r.Method == http.MethodPost && q.Has("uploads"):
@@ -108,9 +130,13 @@ func (s *s3Stub) snapshot() stubState {
 }
 
 func stubBackend(t *testing.T, s *s3Stub) *S3Backend {
+	return stubBackendWithPrefix(t, s, "")
+}
+
+func stubBackendWithPrefix(t *testing.T, s *s3Stub, prefix string) *S3Backend {
 	t.Helper()
 	b, err := NewS3Backend(&S3Config{
-		Bucket: "b", Region: "us-east-1", Endpoint: s.srv.URL,
+		Bucket: "b", Region: "us-east-1", Endpoint: s.srv.URL, Prefix: prefix,
 		AccessKey: "k", SecretKey: "s", PathStyle: true, UseSSL: false,
 	}, zerolog.Nop())
 	if err != nil {

@@ -1,7 +1,9 @@
 # Binaries
-arc
+/arc
+/cmd/arc/arc
 arc-*
 !helm/arc-*/
+!helm/arc/
 *.exe
 *.dll
 *.so
