@@ -1679,6 +1679,39 @@ worker, and a column with an empty name (`{"": [...]}` in msgpack) panicked
 every flush of its measurement, taking the process down. They are now
 skipped wherever a flush merges columns or builds a schema.
 
+### Telegraf and batch msgpack writes take the fast path; a few bytes can no longer exhaust a node's memory
+
+**Telegraf arrays and `{"batch": [...]}`.** Telegraf's Arc output sends a
+top-level array of columnar maps whenever a flush holds more than one
+measurement, and the Python client's `encode_batch` sends `{"batch": [...]}`.
+Both went through the generic decoder (every value boxed), and each item's
+WAL entry was rebuilt as one map per row. Each item now goes through the
+typed columnar decoder, and its WAL entry is the item's own bytes, as a
+single columnar map's is. In-process (1,000-row requests, M3 Max), a
+Telegraf-shaped request went from 306 µs to 80 µs with the WAL on, and a
+batch request from 284 µs to 55 µs (43 µs to 29 µs with the WAL off), with
+42% to 81% fewer bytes allocated per request. If any
+item is not a columnar map the typed decoder can take (a row-format item,
+one without a time column), the whole request is decoded as before. Tag
+columns (`tag_keys`) of array and batch items now survive a WAL replay; the
+row-form entries lost them.
+
+**Malformed payloads.** Four msgpack payloads did harm out of proportion to
+their size; each is now a `400`:
+
+- A value declaring more bytes than the request holds: five bytes
+  (`c6 7f ff ff ff`, "2 GB of binary follow") made the decoder allocate 2 GB
+  before failing, so a few concurrent requests could exhaust a node's memory.
+  A column declaring a million values in a 25-byte request allocated 16 MB.
+- Arrays nested a few million deep (a few MB of `0x91`) overflowed the
+  decoder's stack, which kills the process. Nesting is capped at 64 levels;
+  real payloads use four or five.
+- A map with a `nil` key panicked inside the decoder (a `500` with a stack
+  trace in the log).
+- A column name repeated in `columns`, or an extension value next to the
+  columns, could be read differently by the fast and the generic decoder;
+  such payloads now take the generic decoder, which decides.
+
 ### Stream takeover publishes the rows of unpulled files in one go, not in waves ([#1269](https://github.com/Basekick-Labs/arc/issues/1269))
 
 When a primary writer dies with files nobody had pulled yet, the new primary

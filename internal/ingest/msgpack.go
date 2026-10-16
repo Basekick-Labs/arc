@@ -55,10 +55,10 @@ func (d *MessagePackDecoder) Decode(data []byte) (interface{}, error) {
 	// path on any shape it doesn't handle — the generic path remains the
 	// authority on accept/reject behavior.
 	if d.typedEnabled {
-		if rec, ok := d.tryDecodeColumnarTyped(data); ok {
+		if recs, ok := d.tryDecodeTyped(data); ok {
 			d.typedHits.Add(1)
-			d.totalDecoded.Add(1)
-			return []interface{}{rec}, nil
+			d.totalDecoded.Add(uint64(len(recs)))
+			return recs, nil
 		}
 		d.typedMisses.Add(1)
 	}
@@ -66,8 +66,14 @@ func (d *MessagePackDecoder) Decode(data []byte) (interface{}, error) {
 	// IMPORTANT: Decode to generic interface{} first to handle both map and array formats
 	// Telegraf and other clients may send data in array-encoded format which would fail
 	// if we try to decode directly into a struct
+	// Lengths first: the library allocates a value's declared length before
+	// reading it (see msgpackValueEnd).
+	if !msgpackFramingOK(data) {
+		d.totalErrors.Add(1)
+		return nil, fmt.Errorf("failed to unmarshal msgpack: truncated payload or a declared length past its end")
+	}
 	var rawPayload interface{}
-	if err := msgpack.Unmarshal(data, &rawPayload); err != nil {
+	if err := unmarshalGeneric(data, &rawPayload); err != nil {
 		d.totalErrors.Add(1)
 		return nil, fmt.Errorf("failed to unmarshal msgpack: %w", err)
 	}
@@ -112,6 +118,19 @@ func (d *MessagePackDecoder) Decode(data []byte) (interface{}, error) {
 
 	d.totalDecoded.Add(uint64(len(results)))
 	return results, nil
+}
+
+// unmarshalGeneric is msgpack.Unmarshal into an interface{}, with a panic in
+// the decoder turned into an error: a map with a nil key (four bytes:
+// 0x91 0x81 0xc0 0x30) panics inside the library's generic map decoding, and
+// a malformed payload is the client's error, not a 500 with a stack trace.
+func unmarshalGeneric(data []byte, v *interface{}) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("malformed payload: %v", r)
+		}
+	}()
+	return msgpack.Unmarshal(data, v)
 }
 
 // decodeMapPayload decodes a map[string]interface{} payload

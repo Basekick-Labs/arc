@@ -12,7 +12,7 @@ import (
 )
 
 // mustMarshal encodes a payload with the same msgpack library clients use.
-func mustMarshal(t *testing.T, v interface{}) []byte {
+func mustMarshal(t testing.TB, v interface{}) []byte {
 	t.Helper()
 	b, err := msgpack.Marshal(v)
 	if err != nil {
@@ -410,35 +410,14 @@ func TestTypedDecodeWriteTimeRejects(t *testing.T) {
 }
 
 // TestTypedDecodeFallbackFormats: formats outside the typed scope must still
-// decode via the generic path (batch, array, row) and produce identical
+// decode via the generic path (row format; arrays and batch of columnar
+// maps are typed, see msgpack_typed_arrays_test.go) and produce identical
 // results with the typed flag on.
 func TestTypedDecodeFallbackFormats(t *testing.T) {
 	payloads := map[string]interface{}{
-		"batch_format": map[string]interface{}{
-			"batch": []interface{}{
-				map[string]interface{}{
-					"m": "cpu", "columns": map[string]interface{}{
-						"time": []interface{}{int64(1700000000000000)},
-						"v":    []interface{}{int64(1)},
-					}},
-			}},
 		"row_format": map[string]interface{}{
 			"m": "cpu", "t": int64(1700000000000), "h": "srv",
 			"fields": map[string]interface{}{"v": int64(1)},
-		},
-		"batch_key_wins_over_columns": map[string]interface{}{
-			"batch": []interface{}{
-				map[string]interface{}{
-					"m": "cpu", "columns": map[string]interface{}{
-						"time": []interface{}{int64(1700000000000000)},
-						"v":    []interface{}{int64(1)},
-					}},
-			},
-			"columns": map[string]interface{}{
-				"time":    []interface{}{int64(1700000000000000)},
-				"ignored": []interface{}{int64(9)},
-			},
-			"m": "wrong",
 		},
 	}
 	for name, p := range payloads {

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Basekick-Labs/msgpack/v6"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
@@ -29,9 +30,18 @@ import (
 
 // replayed writes through write into a buffer with a WAL, never flushing it,
 // then replays the WAL through the production tracked callback with
-// recovery batches of batchSize into a second buffer, and returns the
-// Parquet files that replay wrote.
+// recovery batches of batchSize into a second buffer (raw columnar entries
+// through the production columnar callback), and returns the Parquet files
+// that replay wrote.
 func replayed(t *testing.T, batchSize int, write func(b *ingest.ArrowBuffer)) []arrow.Table {
+	t.Helper()
+	tables, _ := replayedWithTags(t, batchSize, write)
+	return tables
+}
+
+// replayedWithTags is replayed, plus each replayed file's arc:tags metadata
+// (the tag columns the replayed write carried).
+func replayedWithTags(t *testing.T, batchSize int, write func(b *ingest.ArrowBuffer)) ([]arrow.Table, []string) {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -55,15 +65,17 @@ func replayed(t *testing.T, batchSize int, write func(b *ingest.ArrowBuffer)) []
 	t.Cleanup(func() { _ = dst.Close(); _ = w.Close() })
 	callback := createTrackedWALRecoveryCallback(dst, zerolog.Nop())
 	_, err = wal.NewRecovery(walDir, zerolog.Nop()).RecoverWithOptions(ctx, nil, &wal.RecoveryOptions{
-		SkipActiveFile:      w.CurrentFile(),
-		BatchSize:           batchSize,
-		ValidateTrackedRows: validateTrackedWALRecoveryRows,
-		TrackedRowCallback:  callback,
+		SkipActiveFile:                 w.CurrentFile(),
+		BatchSize:                      batchSize,
+		ValidateTrackedRows:            validateTrackedWALRecoveryRows,
+		TrackedRowCallback:             callback,
+		ColumnarCallbackWithTagColumns: createColumnarRecoveryCallback(dst, zerolog.Nop()),
 	})
 	require.NoError(t, err)
 	require.NoError(t, dst.FlushAllAndWait(ctx))
 
 	var tables []arrow.Table
+	var tags []string
 	require.NoError(t, filepath.Walk(replayRoot, func(p string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() || !strings.HasSuffix(p, ".parquet") {
 			return err
@@ -74,6 +86,11 @@ func replayed(t *testing.T, batchSize int, write func(b *ingest.ArrowBuffer)) []
 		pf, err := file.NewParquetReader(f)
 		require.NoError(t, err)
 		defer pf.Close()
+		if v := pf.MetaData().KeyValueMetadata().FindValue("arc:tags"); v != nil {
+			tags = append(tags, *v)
+		} else {
+			tags = append(tags, "")
+		}
 		fr, err := pqarrow.NewFileReader(pf, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
 		require.NoError(t, err)
 		tbl, err := fr.ReadTable(ctx)
@@ -83,7 +100,7 @@ func replayed(t *testing.T, batchSize int, write func(b *ingest.ArrowBuffer)) []
 		return nil
 	}))
 	require.NotEmpty(t, tables)
-	return tables
+	return tables, tags
 }
 
 // column returns the replayed values of a column across the files, keyed by
@@ -248,4 +265,79 @@ func TestLPWriteReplaysFromTypedWALEntry(t *testing.T) {
 	require.Equal(t, map[int64]interface{}{0: "x", 1: nil, 2: "z"}, column(t, tables, "s"))
 	require.Equal(t, map[int64]interface{}{0: true, 1: nil, 2: nil}, column(t, tables, "b"))
 	require.Equal(t, map[int64]interface{}{0: "a", 1: "b", 2: nil}, column(t, tables, "host"))
+}
+
+// A Telegraf-style array of columnar maps is written item by item, each item's
+// WAL entry its own client bytes; the WAL copies them, so the request buffer
+// being reused after the write (fasthttp does) changes nothing, and replay
+// gives the values, NULLs and tag columns back. A payload that takes the
+// generic path (a row item in the array) replays too.
+func TestMsgPackArrayReplaysFromItemEntries(t *testing.T) {
+	item := func(m string, ids ...int64) map[string]interface{} {
+		var tm, ii, host, v []interface{}
+		for _, id := range ids {
+			tm = append(tm, int64(1700000000000)+id) // ms, as Telegraf sends
+			ii = append(ii, id)
+			host = append(host, "h"+string(rune('a'+id)))
+			if id%2 == 0 {
+				v = append(v, float64(id)+0.5)
+			} else {
+				v = append(v, nil)
+			}
+		}
+		return map[string]interface{}{"m": m, "tag_keys": []interface{}{"host"},
+			"columns": map[string]interface{}{"time": tm, "i": ii, "host": host, "v": v}}
+	}
+	for _, tc := range []struct {
+		name  string
+		items []interface{}
+		typed bool
+	}{
+		{"typed items", []interface{}{item("m", 0, 1), item("m", 2, 3)}, true},
+		{"generic fallback", []interface{}{item("m", 0, 1), item("m", 2, 3), withoutTime(item("m", 4))}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tables, tags := replayedWithTags(t, 10000, func(b *ingest.ArrowBuffer) {
+				payload, err := msgpack.Marshal(tc.items)
+				require.NoError(t, err)
+				dec := ingest.NewMessagePackDecoder(zerolog.Nop())
+				dec.SetTypedDecodeEnabled(true)
+				recs, err := dec.Decode(payload)
+				require.NoError(t, err)
+				_, isTyped := recs.([]interface{})[0].(*ingest.TypedColumnarRecord)
+				require.Equal(t, tc.typed, isTyped)
+				require.NoError(t, b.Write(context.Background(), "test", recs))
+				for i := range payload {
+					payload[i] = 0 // the request buffer is reused
+				}
+			})
+			got := map[int64]interface{}{}
+			for k, v := range column(t, tables, "v") {
+				got[k] = v
+			}
+			require.Equal(t, 0.5, got[0])
+			require.Nil(t, got[1])
+			require.Equal(t, 2.5, got[2])
+			require.Nil(t, got[3])
+			// Raw columnar entries keep tag_keys; row entries (the generic
+			// path's form for array items) do not.
+			if tc.typed {
+				for _, tg := range tags {
+					require.Contains(t, tg, "host", "a replayed file lost its tag columns: %q", tags)
+				}
+			}
+			hosts := column(t, tables, "host")
+			for id, want := range map[int64]string{0: "ha", 1: "hb", 2: "hc", 3: "hd"} {
+				require.Equal(t, want, hosts[id])
+			}
+		})
+	}
+}
+
+// withoutTime drops an item's time column: the typed path refuses it (its
+// generated time must reach the WAL), so the whole payload is generic.
+func withoutTime(item map[string]interface{}) map[string]interface{} {
+	cols := item["columns"].(map[string]interface{})
+	delete(cols, "time")
+	return item
 }
