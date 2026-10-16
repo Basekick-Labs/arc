@@ -1646,6 +1646,39 @@ WAL off, and from 2.26M to 4.48M with the WAL on; other shapes gained 24% to
   holds the value the buffer stored (an integer column's `2.9` is `2`).
 - Deployments with `ingest.decimal_columns` set keep the previous write path.
 
+### Flushes copy each column once less, and two column names no longer crash a flush
+
+Every flush (msgpack, line protocol, imports, WAL replay) builds its Parquet
+file with fewer copies of the buffered data:
+
+- **Sorted merge.** A flush used to concatenate every column of its buffered
+  writes into one batch, then copy every column again in time order. When the
+  measurement sorts by time alone and the flush spans one hour (the common
+  live-ingest case), it now sorts the time column and writes every other
+  column once, straight from the buffered writes, in that order. The files
+  are the same, row order included.
+- **No copy into Arrow.** Integer, float and timestamp columns go to the
+  Parquet writer as they are, instead of being copied into Arrow builders;
+  string, boolean and decimal builders are sized once instead of growing.
+- **Parquet output buffer** sized from the measurement's last file of at
+  least 1,024 rows (never past the write's own column bytes) instead of
+  growing by doubling.
+
+In-process benchmarks (1,000-row requests through the handlers, Apple M3
+Max) allocate 16% to 28% fewer bytes per msgpack columnar request and 5% to
+11% fewer per line-protocol request, at the same speed or slightly faster.
+End to end with `sustained_bench` on the same laptop (12 workers, WAL off):
+msgpack columnar 37.2M to 38.1M rec/s, line protocol 8.94M to 9.32M rec/s
+(p99 3.89 ms to 3.34 ms), and msgpack throughput declines less over a
+60-second run (38.5M to 35.6M before, 39.0M to 37.0M now).
+
+**Fixed: a column named `_...` or with an empty name crashed the node.** Such
+columns are never stored, but a flush still merged them: a `_x` column sent
+as an integer in one request and a float in the next panicked the flush
+worker, and a column with an empty name (`{"": [...]}` in msgpack) panicked
+every flush of its measurement, taking the process down. They are now
+skipped wherever a flush merges columns or builds a schema.
+
 ### Stream takeover publishes the rows of unpulled files in one go, not in waves ([#1269](https://github.com/Basekick-Labs/arc/issues/1269))
 
 When a primary writer dies with files nobody had pulled yet, the new primary
