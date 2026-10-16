@@ -1,6 +1,6 @@
 # Arc
 
-[![Ingestion](https://img.shields.io/badge/ingestion-34M%2B%20rec%2Fs-brightgreen)](https://github.com/basekick-labs/arc)
+[![Ingestion](https://img.shields.io/badge/ingestion-38M%2B%20rec%2Fs-brightgreen)](https://github.com/basekick-labs/arc)
 [![Query](https://img.shields.io/badge/query-8.42M%20rows%2Fs-blue)](https://github.com/basekick-labs/arc)
 [![Go](https://img.shields.io/badge/go-1.26+-00ADD8?logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
@@ -10,7 +10,7 @@
 [![Discord](https://img.shields.io/badge/discord-join-7289da?logo=discord)](https://discord.gg/nxnWfUxsdm)
 [![GitHub](https://img.shields.io/github/stars/basekick-labs/arc?style=social)](https://github.com/basekick-labs/arc)
 
-Open, SQL-native time-series database for telemetry you need to keep. Arc ingests 34M+ records/sec, stores data as standard Parquet on infrastructure you own, and lets you query recent and historical data together. InfluxDB Line Protocol and Telegraf compatible. Single binary. AGPL-3.0.
+Open, SQL-native time-series database for telemetry you need to keep. Arc ingests 38M+ records/sec, stores data as standard Parquet on infrastructure you own, and lets you query recent and historical data together. InfluxDB Line Protocol and Telegraf compatible. Single binary. AGPL-3.0.
 
 > **Prefer a UI?** [**Arc Launchpad**](https://github.com/Basekick-Labs/launchpad) is a self-hosted web console for the Arc instances you run — SQL console, schema explorer, logs, monitoring, and management for tokens, retention, alerts, continuous queries, and MQTT ingestion. Deploy it alongside Arc with Docker Compose. [Docs](https://docs.basekick.net/launchpad).
 >
@@ -113,7 +113,7 @@ Test config: 12 concurrent workers, 1000-record batches, columnar data.
 | MessagePack Columnar | **38.1M rec/s** | 0.26ms | 1.19ms |
 | MessagePack + Zstd | 30.3M rec/s | 0.35ms | 1.23ms |
 | MessagePack + GZIP | 26.4M rec/s | 0.39ms | 1.36ms |
-| Line Protocol | 9.3M rec/s | 1.07ms | 3.34ms |
+| Line Protocol | 9.3M rec/s | 1.07ms | 3.38Ms |
 
 All rows measured over a 60-second sustained run. The MessagePack Columnar row is
 **2,288,281,000 records ingested in 60 seconds** — and that's not rows streamed into
