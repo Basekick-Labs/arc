@@ -132,11 +132,11 @@ type Metrics struct {
 	// dbQueriesTotal and dbQueryErrorsTotal are NOT wired, deliberately.
 	//
 	// Counting them at the DuckDB wrapper (DuckDB.Query/QueryContext/Exec)
-	// misses the hot path: the query handler runs through
-	// query.ParallelExecutor, which holds the raw *sql.DB and never passes
-	// through those wrappers. A counter named "total" that silently omits most
-	// queries is the failure mode #801 was filed for, so it is better absent
-	// than partial. Use arc_query_requests_total / arc_query_errors_total,
+	// misses the hot path: shipped builds answer queries through
+	// DuckDB.ArrowQueryContext (and the arcx engine, when built), which never
+	// pass through those wrappers. A counter named "total" that silently
+	// omits most queries is the failure mode #801 was filed for, so it is
+	// better absent than partial. Use arc_query_requests_total / arc_query_errors_total,
 	// which are counted at every API entry point (#809).
 	dbQueriesTotal     atomic.Int64
 	dbQueryErrorsTotal atomic.Int64
