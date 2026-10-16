@@ -3304,7 +3304,10 @@ func (b *ArrowBuffer) writeTypedColumnarInternal(ctx context.Context, database, 
 func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measurement string, typedColumns *TypedColumnBatch, numRecords int, rawPayload []byte, skipWAL bool) error {
 	bufferKey := database + "/" + measurement
 	if len(rawPayload) > 0 {
-		typedColumns.estimatedBytes = int64(len(rawPayload))
+		// The payload's size, but at least 8 bytes a cell: a NULL is one
+		// byte of msgpack and a full cell in memory (Telegraf's columns are
+		// mostly NULLs).
+		typedColumns.estimatedBytes = max(int64(len(rawPayload)), int64(numRecords)*int64(len(typedColumns.Data))*8)
 	} else if typedColumns.estimatedBytes <= 0 {
 		typedColumns.estimatedBytes = estimateTypedColumnBatchBytes(typedColumns)
 	}
