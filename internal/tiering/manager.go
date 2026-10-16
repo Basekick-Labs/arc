@@ -985,6 +985,12 @@ func isBudgetExpiry(err error) bool {
 
 const coldTierMetadataBatchSize = 1000
 
+// appendColdTierMetadataBatch bounds the metadata held between SQLite writes.
+func appendColdTierMetadataBatch(batch []FileMetadata, file FileMetadata) ([]FileMetadata, bool) {
+	batch = append(batch, file)
+	return batch, len(batch) >= coldTierMetadataBatchSize
+}
+
 // syncColdTierMetadata makes this node's metadata reflect what is in cold
 // storage. In a gated cluster — shared storage, or per-node storage with
 // file replication — only the primary writer migrates, but the query layer
@@ -1029,13 +1035,74 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 		unseen[f.Path] = true
 	}
 
-	files := make([]FileMetadata, 0, len(objects))
+	synced := 0
+	quarantined := 0
+	touched := make(map[tierCacheScope]struct{})
+	defer m.metadata.invalidateTierCacheScopes(touched)
+	batch := make([]FileMetadata, 0, coldTierMetadataBatchSize)
+	flushBatch := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+
+		notWritten, batchScopes, err := m.metadata.recordColdFilesBatch(ctx, batch, time.Time{})
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			// Preserve the former per-file error handling if one bad row makes
+			// an atomic batch fail: record the rest and report only that row.
+			m.logger.Warn().Int("files", len(batch)).Err(err).Msg("Failed to record cold file batch, retrying files individually")
+			for _, file := range batch {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				migratedAt := time.Time{}
+				if file.MigratedAt != nil {
+					migratedAt = *file.MigratedAt
+				}
+				wrote, err := m.metadata.recordColdFile(ctx, &file, migratedAt)
+				if err != nil {
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						return ctxErr
+					}
+					m.logger.Warn().Str("path", file.Path).Err(err).Msg("Failed to record cold file, skipping")
+					continue
+				}
+				if !wrote {
+					quarantined++
+					continue
+				}
+				touched[tierCacheScope{database: file.Database, measurement: file.Measurement}] = struct{}{}
+				synced++
+				coldRows = append(coldRows, file)
+			}
+			return nil
+		}
+		for scope := range batchScopes {
+			touched[scope] = struct{}{}
+		}
+		quarantinedPaths := make(map[string]struct{}, len(notWritten))
+		for _, path := range notWritten {
+			quarantinedPaths[path] = struct{}{}
+		}
+		for _, file := range batch {
+			if _, ok := quarantinedPaths[file.Path]; ok {
+				// A quarantined row is already the record that this key is
+				// unusable. Do not count it or let the manifest sweep act on it.
+				quarantined++
+				continue
+			}
+			synced++
+			coldRows = append(coldRows, file)
+		}
+		return nil
+	}
+
 	unparseable := 0
 	for _, obj := range objects {
-		// Stop before issuing the batch. No rows discovered in this pass have
-		// been committed yet, so the next cycle will retry them all.
 		if err := ctx.Err(); err != nil {
-			return 0, coldRows, err
+			return synced, coldRows, err
 		}
 		if !strings.HasSuffix(obj.Path, ".parquet") {
 			continue
@@ -1069,67 +1136,17 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 		}
 		file.Tier = TierCold
 		file.MigratedAt = &migratedAt
-		files = append(files, *file)
+		var full bool
+		batch, full = appendColdTierMetadataBatch(batch, *file)
+		if full {
+			if err := flushBatch(); err != nil {
+				return synced, coldRows, err
+			}
+			batch = batch[:0]
+		}
 	}
-
-	synced := 0
-	quarantined := 0
-	touched := make(map[tierCacheScope]struct{})
-	defer m.metadata.invalidateTierCacheScopes(touched)
-	for start := 0; start < len(files); start += coldTierMetadataBatchSize {
-		end := min(start+coldTierMetadataBatchSize, len(files))
-		batch := files[start:end]
-
-		// Keep each transaction bounded so a large cold bucket does not hold
-		// the shared SQLite connection for the whole listing. Cache invalidation
-		// is deferred until all chunks finish and deduplicated across the scan.
-		notWritten, batchScopes, err := m.metadata.recordColdFilesBatch(ctx, batch, time.Time{})
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return synced, coldRows, ctxErr
-			}
-			// Preserve the former per-file error handling if one bad row makes
-			// an atomic batch fail: record the rest and report only that row.
-			m.logger.Warn().Int("files", len(batch)).Err(err).Msg("Failed to record cold file batch, retrying files individually")
-			for _, file := range batch {
-				if err := ctx.Err(); err != nil {
-					return synced, coldRows, err
-				}
-				migratedAt := time.Time{}
-				if file.MigratedAt != nil {
-					migratedAt = *file.MigratedAt
-				}
-				wrote, err := m.metadata.RecordColdFile(ctx, &file, migratedAt)
-				if err != nil {
-					m.logger.Warn().Str("path", file.Path).Err(err).Msg("Failed to record cold file, skipping")
-					continue
-				}
-				if !wrote {
-					quarantined++
-					continue
-				}
-				synced++
-				coldRows = append(coldRows, file)
-			}
-			continue
-		}
-		for scope := range batchScopes {
-			touched[scope] = struct{}{}
-		}
-		quarantinedPaths := make(map[string]struct{}, len(notWritten))
-		for _, path := range notWritten {
-			quarantinedPaths[path] = struct{}{}
-		}
-		for _, file := range batch {
-			if _, ok := quarantinedPaths[file.Path]; ok {
-				// A quarantined row is already the record that this key is
-				// unusable. Do not count it or let the manifest sweep act on it.
-				quarantined++
-				continue
-			}
-			synced++
-			coldRows = append(coldRows, file)
-		}
+	if err := flushBatch(); err != nil {
+		return synced, coldRows, err
 	}
 
 	if len(unseen) > 0 {

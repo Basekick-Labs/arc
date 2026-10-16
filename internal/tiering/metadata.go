@@ -392,6 +392,17 @@ const sqliteTimestampLayout = "2006-01-02 15:04:05"
 // for a file it just put in the cold store, where silently acting on a
 // quarantined path would be a new way to lose the record of an unusable key.
 func (s *MetadataStore) RecordColdFile(ctx context.Context, file *FileMetadata, migratedAt time.Time) (bool, error) {
+	wrote, err := s.recordColdFile(ctx, file, migratedAt)
+	if wrote {
+		s.invalidateTierCache(file.Database, file.Measurement)
+	}
+	return wrote, err
+}
+
+// recordColdFile writes one cold row without invalidating the tier cache. The
+// caller must invalidate the row's database/measurement after it has finished
+// recording a batch of files.
+func (s *MetadataStore) recordColdFile(ctx context.Context, file *FileMetadata, migratedAt time.Time) (bool, error) {
 	if migratedAt.IsZero() {
 		migratedAt = time.Now()
 	}
@@ -428,7 +439,6 @@ func (s *MetadataStore) RecordColdFile(ctx context.Context, file *FileMetadata, 
 		// Quarantined, so nothing changed and nothing cached is stale.
 		return false, nil
 	}
-	s.invalidateTierCache(file.Database, file.Measurement)
 	return true, nil
 }
 
