@@ -312,7 +312,12 @@ func TestParquetSizeHintBounded(t *testing.T) {
 	big := write(200000)
 	require.LessOrEqual(t, cap(big), 2*len(big)+raw, "first large file")
 	next := write(200000)
-	require.LessOrEqual(t, cap(next), len(next)+len(next)/8+4096+16<<10, "sized from the last large file (plus allocator rounding)")
+	// The hint: the last file's bytes per row (rounded up), times rows,
+	// plus 1/8 and 4 KiB; plus allocator rounding.
+	perRow := len(big)/200000 + 1
+	hint := perRow*200000 + perRow*200000/8 + 4096
+	require.LessOrEqual(t, cap(next), hint+64<<10, "sized from the last large file")
+	require.GreaterOrEqual(t, cap(next), len(next))
 	require.LessOrEqual(t, cap(next), raw+64<<10)
 
 	// A hint learned from wide rows never reserves past a narrow write's own
