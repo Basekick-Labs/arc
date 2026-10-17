@@ -93,6 +93,8 @@ func executeArrowMsgPackQuery(
 			if onComplete != nil {
 				onComplete(0)
 			}
+			m.IncQuerySuccess()
+			m.RecordQueryLatency(time.Since(start).Microseconds())
 			_ = respondEmptySuccess(c, timestamp, start)
 			return 0, true
 		}
@@ -104,6 +106,7 @@ func executeArrowMsgPackQuery(
 			}
 			m.IncQueryErrors()
 			m.IncQueryTimeouts()
+			m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, false, time.Since(start).Microseconds())
 			if onTimeout != nil {
 				onTimeout()
 			}
@@ -128,6 +131,7 @@ func executeArrowMsgPackQuery(
 			cancel()
 		}
 		m.IncQueryErrors()
+		m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, false, time.Since(start).Microseconds())
 		if onFail != nil {
 			onFail(err.Error())
 		}
@@ -188,6 +192,7 @@ func executeArrowMsgPackQuery(
 		if errors.Is(drainErr, context.DeadlineExceeded) {
 			m.IncQueryErrors()
 			m.IncQueryTimeouts()
+			m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, false, time.Since(start).Microseconds())
 			if onTimeout != nil {
 				onTimeout()
 			}
@@ -195,6 +200,7 @@ func executeArrowMsgPackQuery(
 			return -1, true
 		}
 		m.IncQueryErrors()
+		m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, false, time.Since(start).Microseconds())
 		if onFail != nil {
 			onFail(drainErr.Error())
 		}
@@ -261,6 +267,7 @@ func executeArrowMsgPackQuery(
 
 		if streamErr != nil {
 			m.IncQueryErrors()
+			m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, false, time.Since(start).Microseconds())
 			if errors.Is(streamErr, context.DeadlineExceeded) {
 				m.IncQueryTimeouts()
 				if onTimeout != nil {

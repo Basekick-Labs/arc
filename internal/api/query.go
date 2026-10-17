@@ -2272,6 +2272,7 @@ localProcessing:
 		if isNoFilesFoundError(err) && !h.missingAnchor(err) {
 			h.logger.Info().Str("sql", sqlutil.ForLog(req.SQL)).Msg("No files found for measurement, returning empty result")
 			m.IncQuerySuccess()
+			m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, true, time.Since(start).Microseconds())
 			if h.queryRegistry != nil && queryID != "" {
 				h.queryRegistry.Complete(queryID, 0)
 			}
@@ -2286,6 +2287,7 @@ localProcessing:
 		}
 
 		m.IncQueryErrors()
+		m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, false, time.Since(start).Microseconds())
 		// Check if it was a timeout
 		if effectiveTimeout > 0 && ctxErr == context.DeadlineExceeded {
 			m.IncQueryTimeouts()
@@ -2327,6 +2329,7 @@ localProcessing:
 			cancel()
 		}
 		m.IncQueryErrors()
+		m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, false, time.Since(start).Microseconds())
 		h.logger.Error().Err(err).Msg("Failed to get column names")
 		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 			Success:         false,
@@ -2394,6 +2397,7 @@ localProcessing:
 		// signal. See review/query-path-criticals C5.
 		if streamErr != nil {
 			m.IncQueryErrors()
+			m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, false, time.Since(start).Microseconds())
 			if h.queryRegistry != nil && queryID != "" {
 				if errors.Is(streamErr, context.DeadlineExceeded) {
 					h.queryRegistry.TimedOut(queryID)
@@ -5186,6 +5190,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 			cancel()
 		}
 		m.IncQueryErrors()
+		m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, false, time.Since(start).Microseconds())
 		if effectiveTimeout > 0 && ctx.Err() == context.DeadlineExceeded {
 			m.IncQueryTimeouts()
 			if onTimeout != nil {
@@ -5219,6 +5224,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 			cancel()
 		}
 		m.IncQueryErrors()
+		m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, false, time.Since(start).Microseconds())
 		if onFail != nil {
 			onFail(sqlutil.SanitizeErrText(err.Error()))
 		}
@@ -5275,6 +5281,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 
 		if streamErr != nil {
 			m.IncQueryErrors()
+			m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, false, time.Since(start).Microseconds())
 			// Per-handler client-disconnect counter (#426). queryMeasurement
 			// uses the pure database/sql streaming JSON path same as the
 			// other sites above, so it shares the sql_json label.
