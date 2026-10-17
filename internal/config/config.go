@@ -789,14 +789,19 @@ type ClusterConfig struct {
 	// retried once sent (#1270); a write that times out after being sent is
 	// answered 504 (it may have been written).
 	WriteForwardTimeoutMs int
-	RouteRetries          int // Number of retries for failed forwards (default: 3)
+	// ImportForwardTimeoutMs bounds one import (/api/v1/import/*) forwarded
+	// to a writer, upload and processing included (default 3600000, 0 = no
+	// bound). A backstop, not a deadline: a forward is not cancelled when its
+	// client gives up, so this is what frees the forwarding node from a writer
+	// that never answers (#1070).
+	ImportForwardTimeoutMs int
+	RouteRetries           int // Number of retries for failed forwards (default: 3)
 
-	// Replication configuration (Phase 3.3). ReplicationEnabled starts peer file
-	// replication; the live WAL replication stream is not started (#888, #1207).
-	ReplicationEnabled     bool // Enable peer file replication (default: false)
-	ReplicationLagLimit    int  // Max acceptable lag in milliseconds before health degrades (default: 5000)
-	ReplicationBufferSize  int  // Entry buffer size for replication queue (default: 10000)
-	ReplicationAckInterval int  // How often readers send acks in milliseconds (default: 100)
+	// ReplicationEnabled starts peer file replication. The WAL replication
+	// stream it once started too is gone (#888, #1181); its
+	// replication_lag_limit, replication_buffer_size and
+	// replication_ack_interval keys are ignored.
+	ReplicationEnabled bool // Enable peer file replication (default: false)
 
 	// Peer file replication configuration (Enterprise Phase 2)
 	// These gate and tune the background puller that replicates Parquet files
@@ -873,6 +878,8 @@ type ClusterConfig struct {
 	// the cluster manifest no longer lists it, when the delete that should
 	// have removed it was missed: the node was down, or crashed with the
 	// unlink queued (#1071). Local storage with replication only. Default on.
+	// Off stops the removals only: the tracking behind them also records what
+	// each local copy holds, which the manifest walks judge copies by (#1182).
 	StaleLocalSweep bool
 	// StaleLocalSweepMaxFraction stops a sweep pass that would remove more
 	// than this fraction of the files the node tracks (and at least 1000):
@@ -1284,14 +1291,12 @@ func Load() (*Config, error) {
 			RaftSnapshotThreshold: v.GetInt("cluster.raft_snapshot_threshold"),
 			RaftPreVote:           v.GetBool("cluster.raft_pre_vote"),
 			// Routing configuration
-			RouteTimeout:          v.GetInt("cluster.route_timeout"),
-			WriteForwardTimeoutMs: v.GetInt("cluster.write_forward_timeout_ms"),
-			RouteRetries:          v.GetInt("cluster.route_retries"),
+			RouteTimeout:           v.GetInt("cluster.route_timeout"),
+			WriteForwardTimeoutMs:  v.GetInt("cluster.write_forward_timeout_ms"),
+			ImportForwardTimeoutMs: v.GetInt("cluster.import_forward_timeout_ms"),
+			RouteRetries:           v.GetInt("cluster.route_retries"),
 			// Replication configuration
-			ReplicationEnabled:     v.GetBool("cluster.replication_enabled"),
-			ReplicationLagLimit:    v.GetInt("cluster.replication_lag_limit"),
-			ReplicationBufferSize:  v.GetInt("cluster.replication_buffer_size"),
-			ReplicationAckInterval: v.GetInt("cluster.replication_ack_interval"),
+			ReplicationEnabled: v.GetBool("cluster.replication_enabled"),
 			// Peer file replication (Enterprise Phase 2)
 			ReplicationPullWorkers:                   v.GetInt("cluster.replication_pull_workers"),
 			ReplicationQueueSize:                     v.GetInt("cluster.replication_queue_size"),
@@ -2094,15 +2099,12 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.raft_pre_vote", true)            // #1272; see Cluster.RaftPreVote
 
 	// Request routing defaults (Phase 3)
-	v.SetDefault("cluster.route_timeout", 5000)             // 5 second timeout for forwards
-	v.SetDefault("cluster.write_forward_timeout_ms", 60000) // #1270; see Cluster.WriteForwardTimeoutMs
-	v.SetDefault("cluster.route_retries", 3)                // 3 retries for failed forwards
+	v.SetDefault("cluster.route_timeout", 5000)                // 5 second timeout for forwards
+	v.SetDefault("cluster.write_forward_timeout_ms", 60000)    // #1270; see Cluster.WriteForwardTimeoutMs
+	v.SetDefault("cluster.import_forward_timeout_ms", 3600000) // #1070; see Cluster.ImportForwardTimeoutMs
+	v.SetDefault("cluster.route_retries", 3)                   // 3 retries for failed forwards
 
-	// WAL Replication defaults (Phase 3.3)
-	v.SetDefault("cluster.replication_enabled", false)     // Disabled by default
-	v.SetDefault("cluster.replication_lag_limit", 5000)    // 5 second lag limit
-	v.SetDefault("cluster.replication_buffer_size", 10000) // 10k entry buffer
-	v.SetDefault("cluster.replication_ack_interval", 100)  // 100ms ack interval
+	v.SetDefault("cluster.replication_enabled", false) // Disabled by default
 	// Peer file replication (Enterprise Phase 2)
 	v.SetDefault("cluster.replication_pull_workers", 4)          // 4 concurrent pullers
 	v.SetDefault("cluster.replication_queue_size", 1024)         // 1024-entry callback queue

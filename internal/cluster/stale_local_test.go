@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/cluster/filereplication"
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
@@ -78,6 +79,19 @@ func (r *staleRigT) register(key, body string) {
 
 // unregister deletes key from the manifest; no delete callback is wired, as
 // on a node that was down when the delete applied.
+// registerWritten is register for a file this node wrote: the producer's
+// evidence is reported first, as the outbox does for a flush (#1182).
+func (r *staleRigT) registerWritten(key, body string) {
+	r.t.Helper()
+	r.write(key, body)
+	r.c.NoteLocalWritten(key, strings.Repeat("a", 64))
+	e := raft.FileEntry{Path: key, SHA256: strings.Repeat("a", 64), SizeBytes: int64(len(body)), Database: "testdb",
+		Measurement: "cpu", OriginNodeID: "writer-1", Tier: "hot", CreatedAt: time.Now()}
+	if err := r.c.raftNode.RegisterFile(e, 5*time.Second); err != nil {
+		r.t.Fatal(err)
+	}
+}
+
 func (r *staleRigT) unregister(key string) {
 	r.t.Helper()
 	raw, _ := json.Marshal(raft.DeleteFilePayload{Path: key, Reason: "retention"})
@@ -91,11 +105,14 @@ func (r *staleRigT) exists(key string) bool {
 	return err == nil
 }
 
-// walk is the replication walk's hook over the whole manifest.
-func (r *staleRigT) walk() {
+// walk is the replication walk's hook over the whole manifest; it returns the
+// hook's verdict per path.
+func (r *staleRigT) walk() map[string]filereplication.ListedVerdict {
+	out := map[string]filereplication.ListedVerdict{}
 	for _, e := range r.c.raftNode.FSM().GetAllFiles() {
-		r.c.observeListed(e)
+		out[e.Path] = r.c.observeListed(e)
 	}
+	return out
 }
 
 // pass: the replication walk, then a sweep pass (as they run on a node).
@@ -491,7 +508,7 @@ func TestStaleLocalFeedsAndForgets(t *testing.T) {
 	}
 	p := <-r.c.stale.feed
 	e, _ := r.c.raftNode.FSM().GetFile(p)
-	r.c.observeLocal(e, true)
+	r.c.observeLocal(e)
 	if _, ok := r.c.stale.seen.Load().get(key); !ok {
 		t.Fatal("not tracked")
 	}
@@ -499,7 +516,7 @@ func TestStaleLocalFeedsAndForgets(t *testing.T) {
 	if _, ok := r.c.stale.seen.Load().get(key); ok {
 		t.Fatal("an abandoned pull is still tracked")
 	}
-	r.c.observeLocal(e, true)
+	r.c.observeLocal(e)
 	r.c.unlinkOne(deleteRequest{path: key, reason: "retention"}, nil)
 	if _, ok := r.c.stale.seen.Load().get(key); ok {
 		t.Fatal("a copy the delete workers removed is still tracked")
@@ -546,43 +563,37 @@ func TestRemoveStaleAsides(t *testing.T) {
 // re-checked, once.
 func TestStaleLocalRechecksARegisteredAgainCopy(t *testing.T) {
 	r := staleRig(t)
-	var verified []string
-	fn := func(e *raft.FileEntry) { verified = append(verified, e.Path) }
-	r.c.stale.verifyContent.Store(&fn)
 	key := staleHour + "a.parquet"
-	r.register(key, "rows a")
-	r.walk()
+	r.registerWritten(key, "rows a")
+	if v := r.walk()[key]; v != filereplication.ListedTrusted {
+		t.Fatalf("a copy this node wrote: %v", v)
+	}
 	e := raft.FileEntry{Path: key, SHA256: strings.Repeat("c", 64), SizeBytes: 6, Database: "testdb",
 		Measurement: "cpu", OriginNodeID: "writer-1", Tier: "hot", CreatedAt: time.Now()}
 	r.unregister(key)
 	if err := r.c.raftNode.RegisterFile(e, 5*time.Second); err != nil { // the old copy left in place
 		t.Fatal(err)
 	}
-	r.walk()
-	r.walk()
-	if len(verified) != 1 || verified[0] != key {
-		t.Fatalf("verified %v", verified)
+	for i := 0; i < 2; i++ { // every walk, until something refreshes it
+		if v := r.walk()[key]; v != filereplication.ListedStale {
+			t.Fatalf("walk %d: %v, want stale", i, v)
+		}
 	}
-	// A new index with the same checksum (a tier update) is not re-checked.
-	e.Tier = "hot"
+	// A new index with the same checksum (a tier update) leaves it stale.
 	raw, _ := json.Marshal(raft.UpdateFilePayload{File: e})
 	if err := r.c.raftNode.Apply(&raft.Command{Type: raft.CommandUpdateFile, Payload: raw}, 5*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	r.walk()
-	if len(verified) != 1 {
-		t.Fatalf("a same-checksum update was re-checked: %v", verified)
+	if v := r.walk()[key]; v != filereplication.ListedStale {
+		t.Fatalf("after a tier update: %v", v)
 	}
-	// A copy replaced by a pull is recorded afresh, not re-checked.
+	// A copy replaced by a pull is recorded with what it was pulled as.
 	r.write(key+".tmp", "rows b")
 	_ = os.Rename(filepath.Join(r.root, key+".tmp"), filepath.Join(r.root, key))
-	r.unregister(key)
-	if err := r.c.raftNode.RegisterFile(e, 5*time.Second); err != nil {
-		t.Fatal(err)
-	}
-	r.walk()
-	if len(verified) != 1 {
-		t.Fatalf("a replaced copy was re-checked: %v", verified)
+	cur, _ := r.c.raftNode.FSM().GetFile(key)
+	r.c.recordLocalContent(cur, "", cur.SHA256)
+	if v := r.walk()[key]; v != filereplication.ListedTrusted {
+		t.Fatalf("a pulled copy: %v", v)
 	}
 }
 
@@ -635,7 +646,6 @@ func TestStaleLocalEnabled(t *testing.T) {
 		t.Fatal("off on a local replica node")
 	}
 	for name, mod := range map[string]func(c *Coordinator){
-		"sweep off":      func(c *Coordinator) { c.cfg.StaleLocalSweep = false },
 		"no replication": func(c *Coordinator) { c.cfg.ReplicationEnabled = false },
 		"catch-up off":   func(c *Coordinator) { c.cfg.ReplicationCatchUpEnabled = false },
 		"no raft dir":    func(c *Coordinator) { c.cfg.RaftDataDir = "" },
@@ -796,11 +806,8 @@ func TestStaleLocalSkippedPassRestartsTheClock(t *testing.T) {
 // re-reading each one on every node would compete with queries.
 func TestStaleLocalRetierIsNotReChecked(t *testing.T) {
 	r := staleRig(t)
-	var verified []string
-	fn := func(e *raft.FileEntry) { verified = append(verified, e.Path) }
-	r.c.stale.verifyContent.Store(&fn)
 	key := staleHour + "a.parquet"
-	r.register(key, "rows a")
+	r.registerWritten(key, "rows a")
 	r.walk()
 	e, _ := r.c.raftNode.FSM().GetFile(key)
 	e.Tier = "hot"
@@ -808,8 +815,7 @@ func TestStaleLocalRetierIsNotReChecked(t *testing.T) {
 	if err := r.c.raftNode.Apply(&raft.Command{Type: raft.CommandUpdateFile, Payload: raw}, 5*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	r.walk()
-	if len(verified) != 0 {
-		t.Fatalf("re-checked %v", verified)
+	if v := r.walk()[key]; v != filereplication.ListedTrusted {
+		t.Fatalf("a re-tiered copy: %v", v)
 	}
 }

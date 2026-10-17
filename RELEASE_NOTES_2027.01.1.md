@@ -199,7 +199,7 @@ earlier release on a node, remove the node from the cluster, wipe its data
 directory, and join it fresh. To roll back the whole cluster, restore it from a
 backup taken before the upgrade.
 
-## Upgrade note: the live WAL replication stream is off ([#888](https://github.com/Basekick-Labs/arc/issues/888))
+## Upgrade note: the live WAL replication stream is removed ([#888](https://github.com/Basekick-Labs/arc/issues/888), [#1181](https://github.com/Basekick-Labs/arc/issues/1181))
 
 This applies to clusters where readers or compactors run with both
 `wal.enabled` and `cluster.replication_enabled`. With default values the Helm
@@ -207,12 +207,10 @@ chart enables the WAL only on writer pods, so a chart-deployed cluster never ran
 the stream on those roles and nothing changes for it. The manifests in
 `deploy/kubernetes-local` did enable it on readers.
 
-**What changed.** Writers no longer start the WAL replication sender, and
-readers and compactors no longer receive from it. Every node with `wal.enabled`
-and `cluster.replication_enabled` logs this once at startup:
-
-> WAL replication stream not started: readers and compactors read registered
-> Parquet from the primary, and the standby-writer stream is not available yet
+**What changed.** Writers no longer run the WAL replication sender, and
+readers and compactors no longer receive from it: the stream is removed. Its
+`cluster.replication_lag_limit`, `cluster.replication_buffer_size` and
+`cluster.replication_ack_interval` settings are ignored if set.
 
 **Why.** The stream reached only readers and compactors. Each applied what it
 received to its own ingest buffer and flushed it to its own Parquet. Queries
@@ -220,9 +218,9 @@ read every file on the node, so a reader returned every replicated row twice:
 once from its own flush and once from the copy it pulled from the primary. A
 compactor also registered its copy in the cluster manifest, so every node pulled
 it, the primary included, and the duplicates showed up cluster-wide. Neither
-role can be promoted, so the stream gave failover nothing in exchange. It
-returns for standby writers only, holding the primary's unflushed window for
-failover without writing a second copy
+role can be promoted, so the stream gave failover nothing in exchange. Standby
+writers hold the primary's unflushed window through a separate stream that
+writes no second copy
 ([#1207](https://github.com/Basekick-Labs/arc/issues/1207)).
 
 **What does not change.** `cluster.replication_enabled` still starts peer file
@@ -231,20 +229,20 @@ registered Parquet, as they already did for anything flushed. A reader sees a
 new row once the writer flushes it (`ingest.max_buffer_age_ms`) and the file has
 been pulled.
 
-**Metrics.** `arc_replication_lag_entries` and `arc_replication_lag_seconds`
-were reported per connected reader. With no reader connected they have no
-series, and `arc_replication_entries_dropped_total` stays at zero, so alerts
-built on them will not fire. They describe the stream only, not peer file
-replication.
+**Metrics.** `arc_replication_lag_entries`, `arc_replication_lag_seconds` and
+`arc_replication_entries_dropped_total` are removed, and
+`replication_entries_dropped_total` from the JSON metrics. They described the
+stream only, not peer file replication; remove alerts built on them.
 
 **Upgrade order.** Upgrade readers and compactors first, and stop them
 gracefully. A graceful stop flushes and purges what they received. After a crash,
 the first boot replays those received entries once more and writes one more
 duplicate copy. A reader that is still on the old version keeps dialling the
 writers, and every few seconds until that reader is upgraded an upgraded writer
-refuses it and logs
+refuses it, closes the connection and logs
 
-> Replication sync rejected: not a writer or replication not enabled
+> Replication sync rejected: this release has no WAL replication stream;
+> upgrade the reader
 
 **Duplicates already on disk.** Which copies exist depends on the role that
 wrote them.
@@ -1172,6 +1170,35 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Aggregates over several hours no longer return one result per hour on `/api/v1/query`
+
+Since 26.02.1, a JSON query with the database in the `x-arc-database`
+header, one table, no quoted strings or comments, and a time range covering
+three or more hour partitions (a typical dashboard query, such as
+`SELECT COUNT(*) FROM cpu WHERE time > NOW() - INTERVAL 6 hour`) was fanned
+out as one DuckDB query per hour, and the per-hour results were
+concatenated. The response was a `200` with wrong data:
+
+- `COUNT(*)`, `SUM`, `AVG`, `MIN`, `MAX` and `GROUP BY` returned one row
+  per hour instead of one result;
+- `ORDER BY ... LIMIT n` returned up to `n` rows per hour, unordered across
+  hours; `DISTINCT` and window functions were also applied per hour.
+
+The same shape also failed in two other ways:
+
+- each hour held a DuckDB connection until the response was sent, so a
+  query over more hours than free connections (`database.max_connections`,
+  at least 4) never answered;
+- on `/api/v1/query/msgpack` it failed with `500` "Parser Error: syntax
+  error at or near "{"".
+
+The fan-out is removed: the hours a query selects are read in one
+`read_parquet` list, which DuckDB scans in parallel itself (measured over
+12 hour partitions: the same time for a full scan, faster for a filtered
+one). `/api/v1/query/arrow` was not affected. The query-management API still
+reports `is_parallel` and `partition_count`; they are now always `false` and
+omitted.
+
 ### Query execution metrics distinguish DuckDB and Arcx
 
 Prometheus now exports query execution outcomes and a latency histogram by
@@ -1454,7 +1481,305 @@ state, and tens of thousands during a failover.
   without the size cap and sent on under its original `Content-Encoding`.
 - `arc_cluster_writes_forwarded_total{result}`: `ok`, `refused`, `error`,
   `unavailable`, `ambiguous`.
-- Import endpoints, MQTT and continuous queries on a standby still answer 503.
+- MQTT and continuous queries on a standby still answer 503; imports forward
+  (#1070 below).
+
+### Imports sent to a reader, a compactor or a standby writer reach a writer ([#1070](https://github.com/Basekick-Labs/arc/issues/1070))
+
+The import endpoints (`/api/v1/import/csv`, `parquet`, `lp`, `tle`) never
+forwarded. A reader or a compactor imported the file into its own buffer,
+outside the writer's WAL, and a standby writer refused it with `503`.
+
+- A reader or a compactor forwards an import to a writer, and a standby writer
+  forwards it to the primary, by the rules of the other write endpoints
+  (#1270 above): once, with the upload as received, one hop at most. `503`
+  with `Retry-After` and `X-Arc-Ingest-Fenced` means nothing was written; `504`
+  means it was sent and may have been written.
+- A forwarded import is not bound by `cluster.write_forward_timeout_ms`, so a
+  large import is not answered `504` while the writer is still importing it.
+  It is bound by `cluster.import_forward_timeout_ms` (new, default `3600000`,
+  1 hour; `0` = no bound), a backstop for a writer that never answers: the
+  forward is not cancelled when the client gives up, and until then the
+  forwarding node holds the upload.
+- An upload larger than the 500 MB import limit is refused with `413` by the
+  node that received it, before it is forwarded.
+- A line-protocol import with several measurements that stopped after some of
+  them were written answered `503` "retry", as if nothing had been written:
+  with `X-Arc-Ingest-Fenced` when the node was fenced part-way, without it when
+  the buffer was closing.
+  A re-run wrote the earlier measurements again. It now answers `500` without
+  those headers, with `written_measurements` and `stopped_at_measurement`. A
+  refusal before anything is written is still `503`.
+- An import whose rows were all accepted and whose flush then failed says the
+  rows may still be stored; check before running the file again.
+- A forwarded import is logged by the audit log of both nodes, as other
+  forwarded writes are.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1075](https://github.com/Basekick-Labs/arc/pull/1075).
+
+### Bulk imports no longer hold the whole file in memory several times
+
+The import endpoints (`/api/v1/import/csv`, `parquet`, `lp`, `tle`) read the
+upload, parsed all of it, and wrote it in one go. On a QA cluster a 172 MB
+line-protocol file OOM-killed a writer with a 3 GiB limit; since #1070 a reader
+or a standby forwards such an import to the primary, so the primary took the
+hit and failed over. Live memory one import adds, measured from the moment the
+handler starts (the request body is already held), WAL off (the WAL adds more
+to the old numbers):
+
+| File | Before | Now |
+|---|---|---|
+| Line protocol, 197 MB | +3.8 GB | +71 MB |
+| CSV, 175 MB | +1.1 GB | +27 MB |
+| Parquet, 274 MB, one row group | +1.6 GB | +77 MB |
+
+On the QA cluster (writers limited to 3 GiB) the 172 MB file that OOM-killed
+the primary now imports in 16 s, and 499 MB line protocol, 452 MB CSV and
+478 MB Parquet imports through a reader or a standby complete with exact row
+counts and no restarts; the primary, which also holds the forwarded body,
+peaked at 2.2 GiB.
+
+- The file is read in place in the request body. Before, it was copied twice
+  more (the multipart form, then a full read).
+- Line protocol, CSV and Parquet are processed in chunks (about 4 MB of line
+  protocol; 100,000 CSV or Parquet rows, fewer for wide files: at most a
+  million CSV cells or two million Parquet values), and each chunk is written
+  before the next is read. Parquet column chunks are read a buffer at a time.
+- An import's writes are paced to the flushes: what it has written and not yet
+  flushed stays under an eighth of the memory limit (64 MB to 512 MB) above
+  what the buffer held when it started. Over that it flushes its database's
+  buffers and waits; if the buffered rows stay above the limit for two
+  minutes, it stops (a failure part-way, below).
+- One import writes at a time on a node. Imports sent together are validated
+  together and written one after the other: concurrent write passes would add
+  up their allowances. Every request body is held in memory while it waits.
+  A forwarded import waiting its turn on the writer still counts down
+  `cluster.import_forward_timeout_ms` on the node that forwarded it, so a
+  `504` there can mean it was still queued.
+- A validation pass reads the whole file, chunk by chunk, before anything is
+  written, so a bad file is still refused with nothing written: a bad time
+  value, an invalid measurement name, a measurement the token may not write,
+  a CSV parse error. CSV column types are still decided by the whole column,
+  and a line-protocol field's type by its first value in the file. Line
+  protocol is also refused (`400`) when a column mixes strings or booleans with
+  numbers (a field, or a field and a tag of the same name in other lines), or
+  a line is longer than 64 MB; before, a mixed column failed while being
+  written. Decimal columns (`ingest.decimal_columns`) convert any value, as
+  before.
+- An import that fails after part of it was written (the node is fenced, the
+  buffer is closing, flushes are not keeping up, a later part of the file
+  cannot be decoded) answers `500` with `rows_written` and
+  `written_measurements`, and no `Retry-After`: running the whole file again
+  writes those rows again.
+- A request with a `Content-Encoding` header other than `identity` is refused
+  with `415`; compress the file itself (gzip line protocol) instead. Before,
+  the server decompressed such a body with no size limit.
+- A `file` form field sent without a filename is not taken as the upload, as
+  before. A request body cut short answers `400` for every format.
+- A `200` still means every row is in the write buffer and the WAL (when
+  enabled); the files follow as their flushes finish.
+- Rows are written grouped by hour, so an unsorted file makes about one file
+  per hour as before (see "Imports group rows by hour" below).
+- TLE files are parsed whole, as before, but read once.
+
+### NULLs survive a WAL replay; `time` and the WAL's own names are no longer column names
+
+Three ways a crash and WAL replay changed data, and two names that broke it:
+
+- **CSV, Parquet and TLE imports:** an empty cell or a null value was written
+  into the WAL as `0`, `""` or `false`. If the node crashed before the rows
+  were flushed, replay stored those values instead of NULL. NULLs now replay
+  as NULL. WAL entries written before this release still hold the values.
+- **Sparse columns:** replay re-reads an entry in batches of
+  `wal.recovery_batch_size` (10,000) rows. A batch holding none of a column's
+  values wrote that column as an all-NULL text column, and once that file
+  existed, `sum()` on the column failed for the whole hour with
+  `sum(VARCHAR)`. On a QA run (20,000 line-protocol points, a field set only
+  in the first 5,000, `kill -9` before the flush) main failed `sum(v)` after
+  restart; it now returns the right total. A line-protocol or msgpack column
+  NULL in every row of an entry still replays as the all-NULL column the live
+  write wrote; an import's (CSV/Parquet/TLE) is left out, since the replay
+  cannot know its type. Entries already in the WAL when you upgrade keep their
+  old form and can replay as before, once.
+- **Columns named `measurement`, `m` or `database`** were dropped on replay,
+  and a column named `_database` or `_measurement` sent its rows to another
+  database or measurement. Those three names now replay as columns. Imports
+  refuse `_measurement` and `_database` as column, tag or field names (`400`,
+  nothing written); through `/write` such a column is still lost on replay,
+  but no longer moves its rows.
+- **A tag or field named `time`:** a field silently replaced the point's
+  timestamp (`time=5i` stored the point in 1970), and a tag failed the write
+  part-way. Line-protocol imports refuse such a file (`400`, nothing
+  written). `/write` drops only those points, writes the others, and answers
+  `400` "partial write: N points dropped", as InfluxDB does.
+
+### Imports group rows by hour, and line protocol is parsed straight into typed columns
+
+Chunked imports (above) wrote each chunk's flush as one file per hour it
+touched, so an unsorted file made a file per hour per chunk. On a QA host, a
+4M-row file shuffled over a year (8,760 hours) made 455,420 files as line
+protocol and 350,398 as CSV or Parquet. Now each makes 8,760, with identical
+per-hour counts and sums. Peak RSS for the three imports went from 2.2 GB to
+1.2 GB. Times: line protocol 27.6 s to 16.5 s; CSV 8.6 s to 11.2 s and
+Parquet 5.6 s to 7.4 s (about 30% slower: rows are copied into their hour
+groups before writing).
+
+- **Hour grouping.** An import holds its parsed rows, grouped by hour, up to
+  half its memory allowance, then writes them one batch per measurement and
+  hour (at most a million cells per write). A file sorted by time writes as
+  before; an unsorted one makes about one file per hour per window of that
+  size. Deployments with `ingest.decimal_columns` set keep writing
+  line-protocol imports chunk by chunk, so the WAL keeps decimal values as
+  sent. Only the import endpoints group: the write endpoints (msgpack, line
+  protocol, `/write`, `/api/v2/write`) are unchanged and leave a random-order
+  backfill's small files to compaction. For a large backfill, use an import
+  endpoint or send the data sorted by time.
+- **Typed line-protocol parse.** Each chunk is parsed straight into typed
+  columns, without a map per tag and field per line: a 197 MB line-protocol
+  import now adds 25 MB of memory (71 MB before). The result is the same as
+  before (checked against the old path over a fixed corpus and 2.6 million
+  fuzzed inputs).
+- **A line whose keys land in one column is refused** (`400`, nothing
+  written): a tag `x`, a field `x` (stored as `x_value`) and a field
+  `x_value`. Before, which of the two values was kept depended on map order.
+- **Failures:** an import that fails before its first window is written
+  (a corrupt Parquet page found while writing, for example) now writes
+  nothing and answers the plain error, not a `500` with `rows_written`. A
+  failure part-way still answers `500` with `rows_written`, which now counts
+  written rows across hours, not a leading part of the file.
+- **WAL accounting:** CSV, Parquet and TLE imports wrote their WAL entries
+  without the database envelope and without charging them to the import's
+  WAL reservation (#676), so during a long import the disk gate counted those
+  bytes twice: once as reserved, once as written. They are now charged as
+  appended, as line-protocol writes already were.
+
+### Line-protocol writes are parsed straight into typed columns, and drop only the points that do not fit
+
+The line-protocol write endpoints (`/write`, `/api/v2/write`,
+`/api/v1/write/line-protocol`) now parse a request straight into typed
+columns, as line-protocol imports do (above), instead of a map per tag and
+field per line. In-process benchmarks (1,000-line requests, Apple M3 Max)
+moved from 4.18M to 7.61M rows/s for the `sustained_bench` IoT shape with the
+WAL off, and from 2.26M to 4.48M with the WAL on; other shapes gained 24% to
+98%, with 8% to 41% fewer allocations per request.
+
+- **A point that does not fit is dropped, not the whole measurement.** A
+  column is still typed by its first value in the request. A later point
+  whose value does not fit (a string in a float column, a number in a tag
+  column, an unsigned value above the int64 range or NaN/Inf in an integer
+  column) is dropped, and every other point is written, the same measurement
+  included. Before, such a value failed that measurement's write with a
+  `500` after other measurements of the request might already have been
+  written. A point whose keys land in one column (a tag `x`, a field `x`
+  stored as `x_value`, and a field `x_value`) is dropped too; before, which
+  value was kept depended on map order.
+- **The answer** is `400` "partial write: N points dropped: ..." naming the
+  measurement, column and reason, as InfluxDB does (the `time` key drops
+  above answer the same way). Each request logs its drops at Error level, one
+  line per measurement, column and reason (up to 10, then one line counting
+  the rest), only when the request was otherwise written.
+- **WAL entries** for typed writes (line protocol, and CSV, Parquet and TLE
+  imports) are encoded straight from the columns. A line-protocol entry now
+  holds the value the buffer stored (an integer column's `2.9` is `2`).
+- Deployments with `ingest.decimal_columns` set keep the previous write path.
+
+### Flushes copy each column once less, and two column names no longer crash a flush
+
+Every flush (msgpack, line protocol, imports, WAL replay) builds its Parquet
+file with fewer copies of the buffered data:
+
+- **Sorted merge.** A flush used to concatenate every column of its buffered
+  writes into one batch, then copy every column again in time order. When the
+  measurement sorts by time alone and the flush spans one hour (the common
+  live-ingest case), it now sorts the time column and writes every other
+  column once, straight from the buffered writes, in that order. The files
+  are the same, row order included.
+- **No copy into Arrow.** Integer, float and timestamp columns go to the
+  Parquet writer as they are, instead of being copied into Arrow builders;
+  string, boolean and decimal builders are sized once instead of growing.
+- **Parquet output buffer** sized from the measurement's last file of at
+  least 1,024 rows (never past the write's own column bytes) instead of
+  growing by doubling.
+
+In-process benchmarks (1,000-row requests through the handlers, Apple M3
+Max) allocate 16% to 28% fewer bytes per msgpack columnar request and 5% to
+11% fewer per line-protocol request, at the same speed or slightly faster.
+End to end with `sustained_bench` on the same laptop (12 workers, WAL off):
+msgpack columnar 37.2M to 38.1M rec/s, line protocol 8.94M to 9.32M rec/s
+(p99 3.89 ms to 3.34 ms), and msgpack throughput declines less over a
+60-second run (38.5M to 35.6M before, 39.0M to 37.0M now).
+
+**Fixed: a column named `_...` or with an empty name crashed the node.** Such
+columns are never stored, but a flush still merged them: a `_x` column sent
+as an integer in one request and a float in the next panicked the flush
+worker, and a column with an empty name (`{"": [...]}` in msgpack) panicked
+every flush of its measurement, taking the process down. They are now
+skipped wherever a flush merges columns or builds a schema.
+
+### Telegraf and batch msgpack writes take the fast path; a few bytes can no longer exhaust a node's memory
+
+**Telegraf arrays and `{"batch": [...]}`.** Telegraf's Arc output sends a
+top-level array of columnar maps whenever a flush holds more than one
+measurement, and the Python client's `encode_batch` sends `{"batch": [...]}`.
+Both went through the generic decoder (every value boxed), and each item's
+WAL entry was rebuilt as one map per row. Each item now goes through the
+typed columnar decoder, and its WAL entry is the item's own bytes, as a
+single columnar map's is. In-process (1,000-row requests, M3 Max), a
+Telegraf-shaped request went from 306 µs to 80 µs with the WAL on, and a
+batch request from 284 µs to 55 µs (43 µs to 29 µs with the WAL off), with
+42% to 81% fewer bytes allocated per request. If any
+item is not a columnar map the typed decoder can take (a row-format item,
+one without a time column), the whole request is decoded as before. Tag
+columns (`tag_keys`) of array and batch items now survive a WAL replay; the
+row-form entries lost them.
+
+**Malformed payloads.** Four msgpack payloads did harm out of proportion to
+their size; each is now a `400`:
+
+- A value declaring more bytes than the request holds: five bytes
+  (`c6 7f ff ff ff`, "2 GB of binary follow") made the decoder allocate 2 GB
+  before failing, so a few concurrent requests could exhaust a node's memory.
+  A column declaring a million values in a 25-byte request allocated 16 MB.
+- Arrays nested a few million deep (a few MB of `0x91`) overflowed the
+  decoder's stack, which kills the process. Nesting is capped at 64 levels;
+  real payloads use four or five.
+- A map with a `nil` key panicked inside the decoder (a `500` with a stack
+  trace in the log).
+- A column name repeated in `columns`, or an extension value next to the
+  columns, could be read differently by the fast and the generic decoder;
+  such payloads now take the generic decoder, which decides.
+
+### Row-format msgpack writes are decoded straight into typed columns, keep the client's host tag, and drop only the points that do not fit
+
+Row-format msgpack (`{"m", "t", "h", "fields", "tags"}`, alone, in an array,
+or in `{"batch": [...]}`: the Python client's `write_records`) went through a
+map per row and per field, then a regrouping into columns. It is now decoded
+straight into typed columns per measurement. In-process (1,000 rows per
+request, M3 Max): 359 µs to 139 µs with the WAL off, 595 µs to 264 µs with it
+on, half the bytes and allocations.
+
+- **The client's host tag is kept.** A row without `h` had its `host` tag
+  replaced by `unknown`, so every row the Python client wrote (it sends
+  `tags`, never `h`) was stored as `host=unknown`. Now `h` sets the host
+  when sent, the row's own `host` tag is kept when not, and `unknown` is
+  written only when neither is there, as before.
+- **Points that do not fit are dropped, not the measurement** (as line
+  protocol writes, above): a value that does not fit its column's type (the
+  first value in the request decides), a tag or field named `time`, or two
+  keys of one row landing in one column. The others are written and the
+  answer is `400` "partial write: N points dropped"; the drops are logged
+  at Error. Before, a value of the wrong type failed the measurement's write
+  with a `500`; a field named `time` corrupted the time column; and a row
+  with a tag `x` and a field `x_value`, next to a row with a field `x`,
+  was accepted with a `204` and then made every flush of the buffer fail,
+  retried forever (or, depending on map order, panicked the flush and the
+  process). Rows still decoded the old way (decimal deployments, rows with
+  an unusual value type such as a float32 or a non-string tag) now get the
+  same treatment: the rows that cannot be written are dropped and the
+  answer is the same `400` partial write; MQTT logs them at Error and
+  writes the rest.
+- Tag values are made valid UTF-8, as field values already were.
+
 ### Stream takeover publishes the rows of unpulled files in one go, not in waves ([#1269](https://github.com/Basekick-Labs/arc/issues/1269))
 
 When a primary writer dies with files nobody had pulled yet, the new primary
@@ -2001,7 +2326,10 @@ startup.
 
 The sweep is on by default (`cluster.stale_local_sweep`) on local storage with
 `cluster.replication_enabled`, and stops with
-`cluster.replication_catchup_enabled = false`. It holds about 150–200 bytes
+`cluster.replication_catchup_enabled = false`. The tracking it removes by also
+records what each local copy holds (#1182, below), so it runs with
+`cluster.stale_local_sweep = false` too: that setting stops the removals only,
+and the status then reads `removals_off: true`. It holds about 150–200 bytes
 of memory per local file, and a journal of up to about 1.5 times that on the
 Raft volume; if the journal cannot be written, the node stops tracking (and
 removing) until a restart and `arc_stale_local_tracking_failed` reads `1`.
@@ -3335,12 +3663,11 @@ check and continues deleting the other valid keys in the batch.
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in
 [#1132](https://github.com/Basekick-Labs/arc/pull/1132).
 
-### Forwarded writes and WAL replication honor cancellation during TLS setup ([#1064](https://github.com/Basekick-Labs/arc/issues/1064))
+### Forwarded writes honor cancellation during TLS setup ([#1064](https://github.com/Basekick-Labs/arc/issues/1064))
 
-Leader forwarding and WAL replication now pass their existing contexts into
-peer dials, so cancellation interrupts a stalled TLS handshake instead of
-waiting for the dial timeout. Regression tests cover leader-dial cancellation,
-the receiver's cancellation error, and receiver shutdown during TLS setup.
+Leader forwarding now passes its existing context into peer dials, so
+cancellation interrupts a stalled TLS handshake instead of waiting for the dial
+timeout. Regression tests cover leader-dial cancellation.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in
 [#1068](https://github.com/Basekick-Labs/arc/pull/1068) and
@@ -3925,15 +4252,6 @@ recovery failures. Checkpoints in quarantined WAL files remain part of recovery'
 durability proof, so a later retry does not replay already-flushed entries merely
 because their checkpoint file was renamed.
 
-Replication followers prepare buffer ownership before appending local WAL.
-Ignored payloads no longer leave an unowned identity that prevents reclamation.
-An entry containing multiple measurements gets a separate local WAL payload and
-identity for each buffer, preserving its database envelope. Flushing one
-measurement cannot checkpoint another measurement's pending rows; rejecting a
-later measurement does not release an earlier buffer's identity. Normal
-single-measurement payloads retain their original bytes. Replication sequence
-and acknowledgement semantics are unchanged.
-
 Recovery barriers now use the configured flush worker pool instead of serial
 per-measurement writes, and release shard locks before waiting. Each barrier
 has a total wait budget of `ingest.flush_timeout_seconds` (30 seconds by default)
@@ -4114,31 +4432,69 @@ refreshes waiting for their path's next arrival.
 
 If the refresh cannot be queued, the line is a warning, and the local copy
 may be the previous version for a while. When the node is shutting down the
-refresh is lost; when the pull queue is full it is retried on the path's next
-arrival or the periodic reconciliation.
+refresh is lost until the next start's walk; when the pull queue is full it is
+retried on the path's next arrival or the next manifest walk.
 
 Since [#975](https://github.com/Basekick-Labs/arc/issues/975), Arc's DELETE
 rewrites and compaction publish new files under fresh paths, so these shapes
 come only from producers that reuse a path: restores, imports, edge-sync
-after the hub deleted the path, and external Raft writers. Two gaps remain for them:
-
-- A forced refresh that fails, or is dropped, is remembered in memory only. A
-  restart forgets it, and the startup catch-up then accepts the old copy by its
-  size and reports the node caught up. With
-  `cluster.replication_catchup_enabled = false`, nothing retries it at all.
-  [#1182](https://github.com/Basekick-Labs/arc/issues/1182) tracks this.
-- A rewrite a node learns of from a Raft snapshot rather than from the log
-  fires no callback. Since the fix for
-  [#1071](https://github.com/Basekick-Labs/arc/issues/1071) (below), the
-  node's next replication walk has a copy it recorded under the earlier
-  registration re-checked and pulled again if its content differs; a copy
-  from before the upgrade is not recorded, so it is still kept.
+after the hub deleted the path, and external Raft writers. A forced refresh
+that fails or is dropped, then a restart, and a rewrite a node learns of from
+a Raft snapshot (which fires no callback) are covered by
+[#1182](https://github.com/Basekick-Labs/arc/issues/1182) (below): the next
+manifest walk finds such a copy stale and refreshes it. With
+`cluster.replication_catchup_enabled = false` there are no walks, and nothing
+retries it.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in
 [#907](https://github.com/Basekick-Labs/arc/pull/907), and by
 [@jallegri](https://github.com/jallegri) in
 [#1173](https://github.com/Basekick-Labs/arc/pull/1173) (delete then
 re-register).
+
+### A restarted replica no longer trusts a stale copy of the same size ([#1182](https://github.com/Basekick-Labs/arc/issues/1182))
+
+On a cluster with local storage, when the manifest listed new content at a
+path a node already held at the same size, and the node's refresh of it
+failed (no peer reachable that held the new bytes), a restart lost the retry:
+the startup catch-up accepted the old copy by its size, the query gate went
+green, and the node served the old bytes until something else rewrote the
+path. A restore of a backup, edge-sync after the hub deleted a path, and name
+collisions from writers on an older release produce such content changes.
+
+Each node now records what each local copy holds: the checksum it pulled,
+hashed, or wrote itself (a flush, a compaction output), kept while the file
+stays the same one. The startup catch-up and every periodic walk compare that
+with the manifest. A copy known to hold other bytes is pulled again; a copy
+whose content the node does not know is hashed first and pulled only if it
+differs. These refreshes count in the startup batch, so with
+`cluster.query_gate_on_catchup` the gate stays red until each is settled, and
+a node that cannot refresh one reports it in `catchup_failed`. A copy is
+never removed by this: when no peer serves the listed bytes, the node keeps
+its copy and retries on the next walk.
+
+**Upgrade cost.** A node upgraded from an earlier release has no record of
+its copies, so its first start hashes every local file once at the manifest
+size, on the pull workers, in the background (a full read of the node's data:
+roughly 5 to 15 minutes per 500 GB). Pulls of new files queue behind it; with
+the query gate on, the gate waits for it. Later starts hash only what changed.
+
+Also:
+
+- A pull that found no candidate peer in any attempt finished as if it had
+  succeeded, so the startup gate could go green over a file the node never
+  fetched. It now counts as failed (`no_peer_exhausted`).
+- A hash of a local copy is bounded by a 30 s stall, not a deadline, so a
+  large copy on a busy disk is read to the end instead of downloaded again.
+- New counters in `replication_catchup_status`: `listed_unvouched` (walk
+  entries refreshed because the node could not vouch for the copy),
+  `verify_unreadable` (hashes that could not be read; the next walk retries)
+  and `no_peer_exhausted`. `GET /api/v1/cluster` reports `local_copy_trust`:
+  `recorded`, or `size_only` when the record cannot be kept (the tracking
+  journal failed or is not open yet).
+- The tracking journal (`seen-local.log`, from #1071) moves to version 2; a
+  version 1 journal from a pre-release build is loaded with every checksum
+  unknown, so those copies are hashed once.
 
 ### Compaction reuses local inputs and validates DuckDB paths ([#969](https://github.com/Basekick-Labs/arc/issues/969))
 

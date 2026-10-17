@@ -134,11 +134,11 @@ type Metrics struct {
 	// dbQueriesTotal and dbQueryErrorsTotal are NOT wired, deliberately.
 	//
 	// Counting them at the DuckDB wrapper (DuckDB.Query/QueryContext/Exec)
-	// misses the hot path: the query handler runs through
-	// query.ParallelExecutor, which holds the raw *sql.DB and never passes
-	// through those wrappers. A counter named "total" that silently omits most
-	// queries is the failure mode #801 was filed for, so it is better absent
-	// than partial. Use arc_query_requests_total / arc_query_errors_total,
+	// misses the hot path: shipped builds answer queries through
+	// DuckDB.ArrowQueryContext (and the arcx engine, when built), which never
+	// pass through those wrappers. A counter named "total" that silently
+	// omits most queries is the failure mode #801 was filed for, so it is
+	// better absent than partial. Use arc_query_requests_total / arc_query_errors_total,
 	// which are counted at every API entry point (#809).
 	dbQueriesTotal     atomic.Int64
 	dbQueryErrorsTotal atomic.Int64
@@ -242,26 +242,6 @@ type Metrics struct {
 	queryMgmtActiveQueries  atomic.Int64 // Currently running tracked queries (gauge)
 	queryMgmtCancelledTotal atomic.Int64 // Total queries cancelled via API
 	queryMgmtHistorySize    atomic.Int64 // Completed queries in history buffer (gauge)
-
-	// Replication metrics
-	replicationEntriesDroppedTotal atomic.Int64 // Total replication entries dropped due to full buffer
-	//
-	// There is deliberately no sequence-gap counter here (#810). A gap cannot
-	// occur silently on a replication connection: the receiver requires each
-	// checkpoint's LastSequence to equal exactly what it has applied, and both
-	// ends carry a cumulative SHA-256 over every payload, so a skipped entry
-	// diverges the hashes. Either check drops the connection
-	// (internal/cluster/replication/receiver.go). Failing closed at the
-	// receive path is strictly stronger than a counter scraped after the fact
-	// — the same shape as Kafka's OutOfOrderSequenceException or Raft's
-	// prevLogIndex rejection. The signal operators actually need here is
-	// replication LAG, which is the provider below (#819).
-
-	// The active writer supplies per-peer lag samples on demand at scrape
-	// time. No historical peer IDs or unbounded time series are retained in
-	// the collector.
-	replicationLagMu       sync.RWMutex
-	replicationLagProvider *replicationLagRegistration
 
 	// Cluster FSM security metrics (Enterprise only — only mutated when
 	// the Raft FSM is constructed, which is gated by cluster.enabled +
@@ -955,9 +935,6 @@ func (m *Metrics) SetQueryMgmtActiveQueries(n int64) { m.queryMgmtActiveQueries.
 func (m *Metrics) IncQueryMgmtCancelled()            { m.queryMgmtCancelledTotal.Add(1) }
 func (m *Metrics) SetQueryMgmtHistorySize(n int64)   { m.queryMgmtHistorySize.Store(n) }
 
-// Replication Metrics
-func (m *Metrics) IncReplicationEntriesDropped() { m.replicationEntriesDroppedTotal.Add(1) }
-
 // IncClusterManifestRejectedPaths increments the cluster FSM
 // path-rejection counter. Called from internal/cluster/raft/fsm.go
 // when ValidateManifestPath refuses a Register/Update/Restore path.
@@ -1269,9 +1246,6 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"query_mgmt_active_queries":  m.queryMgmtActiveQueries.Load(),
 		"query_mgmt_cancelled_total": m.queryMgmtCancelledTotal.Load(),
 		"query_mgmt_history_size":    m.queryMgmtHistorySize.Load(),
-
-		// Replication
-		"replication_entries_dropped_total": m.replicationEntriesDroppedTotal.Load(),
 
 		// Cluster FSM security (Enterprise)
 		"cluster_manifest_rejected_paths_total":  m.clusterManifestRejectedPathsTotal.Load(),
@@ -1909,25 +1883,6 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_query_mgmt_history_size Completed queries in history buffer\n"...)
 	b = append(b, "# TYPE arc_query_mgmt_history_size gauge\n"...)
 	b = appendMetric(b, "arc_query_mgmt_history_size", float64(m.queryMgmtHistorySize.Load()))
-
-	// Replication metrics
-	lagSamples := m.replicationLagSamples()
-	b = append(b, "# HELP arc_replication_lag_entries Writer entries not yet acknowledged by each connected replication reader, including entries a full replication buffer dropped\n"...)
-	b = append(b, "# TYPE arc_replication_lag_entries gauge\n"...)
-	for _, sample := range lagSamples {
-		b = appendReplicationLagMetric(b, "arc_replication_lag_entries", sample.Peer, float64(sample.Entries))
-	}
-	b = append(b, "# HELP arc_replication_lag_seconds Age in seconds of the oldest unacknowledged WAL entry per connected replication reader; a lower bound once the reader is more than cluster.replication_buffer_size entries behind\n"...)
-	b = append(b, "# TYPE arc_replication_lag_seconds gauge\n"...)
-	for _, sample := range lagSamples {
-		if sample.HasSeconds {
-			b = appendReplicationLagMetric(b, "arc_replication_lag_seconds", sample.Peer, sample.Seconds)
-		}
-	}
-
-	b = append(b, "# HELP arc_replication_entries_dropped_total Total replication entries dropped due to full buffer\n"...)
-	b = append(b, "# TYPE arc_replication_entries_dropped_total counter\n"...)
-	b = appendMetric(b, "arc_replication_entries_dropped_total", float64(m.replicationEntriesDroppedTotal.Load()))
 
 	// Cluster FSM security metrics (Enterprise — see GHSA-f85q-mvg8-qf37)
 	b = append(b, "# HELP arc_cluster_manifest_rejected_paths_total Total manifest path proposals refused by the cluster FSM. Non-zero growth indicates a peer/snapshot/log entry proposed a path validation refused (URL scheme, absolute, parent-traversal, NUL, oversize).\n"...)

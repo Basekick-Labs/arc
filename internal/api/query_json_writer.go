@@ -37,7 +37,7 @@ const (
 // as forced syscalls on a healthy connection; 1000 is the compromise.
 const jsonFlushInterval = 1000
 
-// rowScanner is the interface satisfied by both *sql.Rows and *MergedRowIterator.
+// rowScanner is the interface *sql.Rows satisfies (an interface for tests).
 type rowScanner interface {
 	Next() bool
 	Scan(dest ...interface{}) error

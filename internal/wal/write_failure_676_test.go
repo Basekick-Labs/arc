@@ -110,14 +110,30 @@ func faultTestWriter(t *testing.T, maxSize int64) *Writer {
 	return w
 }
 
+// entriesDone is how many entries the writer loop has finished with: each
+// one ends written, lost, or dropped before the queue.
+func entriesDone(w *Writer) int64 {
+	return atomic.LoadInt64(&w.TotalEntries) + atomic.LoadInt64(&w.FailedWrites) + atomic.LoadInt64(&w.DroppedEntries)
+}
+
+// waitEntriesDone waits until the writer loop has finished with n entries
+// after before. Waiting for the queue to drain was not enough: the entry
+// being written (a failed write, a rotation, the retry) could still be in
+// flight under load.
+func waitEntriesDone(t *testing.T, w *Writer, before, n int64) {
+	t.Helper()
+	require.Eventually(t, func() bool { return entriesDone(w) >= before+n }, 10*time.Second, time.Millisecond, "writer loop did not finish the entries")
+}
+
 // appendOne appends one tracked entry and waits until the writer loop has
 // processed it.
 func appendOne(t *testing.T, w *Writer, v int) string {
 	t.Helper()
+	before := entriesDone(w)
 	ids, err := w.AppendTracked([]map[string]interface{}{{"m": "t", "v": v}})
 	require.NoError(t, err)
 	require.Len(t, ids, 1)
-	waitForPurgeTestDrain(t, w)
+	waitEntriesDone(t, w, before, 1)
 	return ids[0]
 }
 
@@ -125,11 +141,12 @@ func appendOne(t *testing.T, w *Writer, v int) string {
 // inside one rotation backoff), then waits for the writer loop.
 func appendBurst(t *testing.T, w *Writer, n int) {
 	t.Helper()
+	before := entriesDone(w)
 	for i := 0; i < n; i++ {
 		_, err := w.AppendTracked([]map[string]interface{}{{"m": "t", "v": i}})
 		require.NoError(t, err)
 	}
-	waitForPurgeTestDrain(t, w)
+	waitEntriesDone(t, w, before, int64(n))
 }
 
 // readIdentities reads every *.wal file in dir in name order and returns the

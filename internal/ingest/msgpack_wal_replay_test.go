@@ -87,29 +87,6 @@ func TestMessagePackTagColumnsSurviveWALRecovery(t *testing.T) {
 	}
 }
 
-func TestReplicatedColumnarTagsPreserveWALHashes(t *testing.T) {
-	buffer := newReplayTestBuffer(t, t.TempDir())
-	t.Cleanup(func() { _ = buffer.Close() })
-	identity := strings.Repeat("a", walTrackedIdentityHexLen)
-	err := buffer.WriteColumnarDirectNoWALWithHashesAndTagColumns(context.Background(), "default", "cpu",
-		map[string][]interface{}{"time": {int64(1_700_000_000_000_000)}, "host": {"node-1"}},
-		[]string{identity}, []string{"host"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	shard := buffer.getShard("default/cpu")
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-	items := shard.buffers["default/cpu"]
-	if len(items) != 1 {
-		t.Fatalf("buffer entries = %d, want 1", len(items))
-	}
-	batch := items[0].(*TypedColumnBatch)
-	if !reflect.DeepEqual(batch.TagColumns, []string{"host"}) || !reflect.DeepEqual(batch.WALHashes, []string{identity}) {
-		t.Fatalf("replicated batch lost metadata: tags=%v WAL=%v", batch.TagColumns, batch.WALHashes)
-	}
-}
-
 func TestTaggedReplayRejectsMismatchedRowRange(t *testing.T) {
 	buffer := newReplayTestBuffer(t, t.TempDir())
 	t.Cleanup(func() { _ = buffer.Close() })

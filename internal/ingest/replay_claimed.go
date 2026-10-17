@@ -383,7 +383,7 @@ func (b *ArrowBuffer) flushClaimedGroup(ctx context.Context, cs *coverageState, 
 	}
 	taskID := b.beginAsyncFlushTask()
 	defer b.completeAsyncFlushTask(taskID)
-	merged, err := b.mergeBatches(records)
+	merged, err := b.mergeBatchesForFlush(r.Measurement, records)
 	if err != nil {
 		group.failed()
 		return fmt.Errorf("merge claimed batches: %w", err)
