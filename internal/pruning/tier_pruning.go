@@ -71,10 +71,16 @@ func (p *PartitionPruner) PruneTierPaths(ctx context.Context, tierGlob, database
 	}
 
 	verified := true
+	generated := paths
 	if strings.HasPrefix(tierGlob, "s3://") || strings.HasPrefix(tierGlob, "azure://") {
 		paths, verified = p.filterTierRemotePaths(ctx, paths, backend, rootURL)
 	} else {
 		paths = p.filterExistingLocalPaths(paths)
+	}
+	// A live partition left out because it has no files yet: the SQL
+	// transform cache must not keep a result made without it.
+	if p.liveWindow().droppedLive(generated, paths) {
+		markVolatile(ctx)
 	}
 
 	if len(paths) == 0 {
@@ -111,12 +117,9 @@ func (p *PartitionPruner) filterTierRemotePaths(ctx context.Context, paths []str
 	}
 
 	verified := true
+	live := p.liveWindow()
 	// hourDirs groups hour-level paths by their backend-relative parent (day)
 	// directory, listed once each.
-	type hourEntry struct {
-		path   string
-		target string // hour segment, e.g. "14"
-	}
 	hourDirs := make(map[string][]hourEntry)
 	var dayPaths []string // day-level compacted-file globs, checked individually
 
@@ -149,7 +152,9 @@ func (p *PartitionPruner) filterTierRemotePaths(ctx context.Context, paths []str
 	for parent, entries := range hourDirs {
 		cacheKey := "tier:dirs:" + rootURL + parent
 		var children []string
-		if cached, ok := p.globCache.get(cacheKey); ok {
+		// A cached listing missing a live hour is listed again: the hour may
+		// have appeared since.
+		if cached, ok := p.globCache.get(cacheKey); ok && !listingMissesLive(cached, entries, live) {
 			children = cached
 		} else {
 			listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -224,4 +229,31 @@ func (p *PartitionPruner) filterTierRemotePaths(ctx context.Context, paths []str
 		Bool("verified", verified).
 		Msg("Filtered tier remote paths")
 	return existing, verified
+}
+
+// hourEntry is an hour-level partition path and its hour segment ("14").
+type hourEntry struct {
+	path   string
+	target string
+}
+
+// listingMissesLive reports whether a cached child listing lacks a live hour
+// among entries.
+func listingMissesLive(children []string, entries []hourEntry, live liveWindow) bool {
+	for _, e := range entries {
+		if !live.isLive(e.path) {
+			continue
+		}
+		found := false
+		for _, c := range children {
+			if c == e.target {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return true
+		}
+	}
+	return false
 }

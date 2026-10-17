@@ -161,11 +161,14 @@ func freeOSMemoryThrottled() {
 
 // DeleteHandler handles delete operations using file rewrite strategy
 type DeleteHandler struct {
-	db          *database.DuckDB
-	storage     storage.Backend
-	config      *config.DeleteConfig
-	authManager *auth.AuthManager
-	coordinator DeleteCoordinator // nil in standalone mode
+	// onFilesRemoved invalidates the query caches (and the cluster's) after
+	// files were removed or rewritten: see SetOnFilesRemoved.
+	onFilesRemoved func()
+	db             *database.DuckDB
+	storage        storage.Backend
+	config         *config.DeleteConfig
+	authManager    *auth.AuthManager
+	coordinator    DeleteCoordinator // nil in standalone mode
 	// pending is this node's file registration outbox (#1209): a file it
 	// flushed may not be in the manifest yet. nil off ingest nodes.
 	pending        PendingRegistrations
@@ -666,6 +669,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 				// corresponding manifest record.
 				if errors.Is(err, errManifestFailure) {
 					h.db.ClearHTTPCache()
+					h.filesRemoved()
 					freeOSMemoryThrottled()
 					return c.Status(fiber.StatusInternalServerError).JSON(DeleteResponse{
 						Success:         false,
@@ -700,6 +704,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		}
 		incomplete := func(why string) error {
 			h.db.ClearHTTPCache()
+			h.filesRemoved()
 			freeOSMemoryThrottled()
 			return respondDeleteUnavailable(c, DeleteResponse{
 				Error:            "Delete incomplete: " + why + "; the rows of the other files are deleted; retry to finish",
@@ -728,6 +733,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 
 	// Clear DuckDB parquet metadata/data cache and release memory back to OS.
 	h.db.ClearHTTPCache()
+	h.filesRemoved()
 	freeOSMemoryThrottled()
 
 	executionTime := float64(time.Since(start).Milliseconds())
@@ -1621,4 +1627,18 @@ func respondDeleteUnavailable(c *fiber.Ctx, resp DeleteResponse) error {
 	resp.Success = false
 	c.Set(fiber.HeaderRetryAfter, "30")
 	return c.Status(fiber.StatusServiceUnavailable).JSON(resp)
+}
+
+// SetOnFilesRemoved sets the function called after this handler removed or
+// rewrote parquet files: the query caches hold pruned partition lists, and one
+// naming a removed hour makes DuckDB report "No files found", which a query
+// answers as an empty result until the cache expires.
+func (h *DeleteHandler) SetOnFilesRemoved(fn func()) {
+	h.onFilesRemoved = fn
+}
+
+func (h *DeleteHandler) filesRemoved() {
+	if h.onFilesRemoved != nil {
+		h.onFilesRemoved()
+	}
 }

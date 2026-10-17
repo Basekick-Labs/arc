@@ -1199,6 +1199,41 @@ one). `/api/v1/query/arrow` was not affected. The query-management API still
 reports `is_parallel` and `partition_count`; they are now always `false` and
 omitted.
 
+### A new hour is queryable at its first flush; DELETE, retention and database delete no longer break query results
+
+The query path caches which hour partitions exist, for up to a minute and
+longer when its caches chain:
+
+- **A new hour was missing.** A query whose range reached the current hour
+  (`time > NOW() - INTERVAL 1 hour`, a range without an end, or an end at or
+  after the current hour) run before that hour's first flush left the hour
+  out, and every repeat of that query for the next minute or more answered
+  without it, even after the hour had data. Dashboards that refresh every
+  few seconds lost the newest hour after each hour boundary. Tiered
+  deployments (a cold tier configured) were affected the same way.
+- **DELETE and retention emptied query results.** After a DELETE removed
+  every row of an hour, or retention removed an hour's files, a repeat of a
+  query whose range covered that hour answered `200` with no rows at all,
+  including the rows of the hours still there, until the cache expired.
+- **A dropped and re-created database answered empty.** After
+  `DELETE /api/v1/databases/{name}`, a repeat of a query over that database
+  failed once ("No files found") and then answered `200` with no rows until
+  the cache expired, even once new data was written.
+
+Compaction already cleared these caches. DELETE (including one that stops
+part-way), retention (including a run that aborts part-way; not a dry run)
+and database delete now clear them the same way, on every node of a cluster
+that has `cluster.shared_secret` set.
+
+The current hour's absence is no longer cached, nor the previous hour's for
+the first 5 minutes after the boundary (rows stamped just before the hour can
+flush just after it). A cached list made before an hour started is never
+used after it. Once the current hour has files, queries are cached as
+before; until then, a repeated query checks again which hours exist: one
+directory read locally, one directory listing on S3 or Azure. Hours that
+have not started yet are cached as absent, as before: rows stamped in the
+future show up within about two and a half minutes of their flush.
+
 ### In shared storage, a DELETE no longer leaves rows another writer has not flushed ([#1265](https://github.com/Basekick-Labs/arc/issues/1265))
 
 In shared storage (`cluster.shared_storage_mode`) every writer takes writes,

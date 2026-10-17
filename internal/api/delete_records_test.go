@@ -216,9 +216,16 @@ func TestDeleteRecordsTheDeleteBeforeRewriting(t *testing.T) {
 	body := `{"database":"db","measurement":"cpu","where":"host = 'h1' AND v < 100","confirm":true}`
 
 	h, events, rc, _ := setup(true, nil)
+	invalidated := 0
+	h.SetOnFilesRemoved(func() { invalidated++ })
 	code, out := send(h, body)
 	if code != 200 || out.DeletedCount != 2 {
 		t.Fatalf("delete: %d %+v", code, out)
+	}
+	// The rewrite invalidates the query caches (a cached pruned list could
+	// name a file it removed).
+	if invalidated != 1 {
+		t.Fatalf("query caches invalidated %d times, want 1", invalidated)
 	}
 	if rc.marks["db/cpu"] != 4 {
 		t.Fatalf("the record does not carry the flush marks: %v", rc.marks)

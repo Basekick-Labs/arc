@@ -39,9 +39,12 @@ type RetentionCoordinator interface {
 
 // RetentionHandler handles retention policy operations
 type RetentionHandler struct {
-	storage storage.Backend
-	config  *config.RetentionConfig
-	db      *sql.DB // SQLite for policy metadata
+	// onFilesRemoved invalidates the query caches (and the cluster's) after
+	// files were removed or rewritten: see SetOnFilesRemoved.
+	onFilesRemoved func()
+	storage        storage.Backend
+	config         *config.RetentionConfig
+	db             *sql.DB // SQLite for policy metadata
 	// ownsDB records whether this handler opened db itself. When retention
 	// shares the auth database (the default), the handle is borrowed and Close
 	// must leave it to its owner.
@@ -701,6 +704,7 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 			if executionID > 0 {
 				h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), err.Error())
 			}
+			h.clearCachesAfterRun(false) // files of earlier measurements may be gone
 			return nil, fmt.Errorf("retention aborted for policy %d: %w", policyID, err)
 		}
 
@@ -713,13 +717,14 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 			if executionID > 0 {
 				h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), coldErr.Error())
 			}
+			h.clearCachesAfterRun(false)
 			return nil, fmt.Errorf("retention aborted for policy %d: %w", policyID, coldErr)
 		}
 	}
 	totalSkipped += discovery.unusable.orphans
 
 	// Clear DuckDB parquet metadata/data cache and release memory back to OS.
-	h.duckdb.ClearHTTPCache()
+	h.clearCachesAfterRun(false)
 	freeOSMemoryThrottled()
 
 	executionTime := float64(time.Since(start).Milliseconds())
@@ -899,6 +904,7 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 			if !req.DryRun && executionID > 0 {
 				h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), err.Error())
 			}
+			h.clearCachesAfterRun(req.DryRun) // files of earlier measurements may be gone
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"error": fmt.Sprintf("retention aborted at measurement %q: %s", measurement, err.Error()),
 			})
@@ -912,6 +918,7 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 			if !req.DryRun && executionID > 0 {
 				h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), coldErr.Error())
 			}
+			h.clearCachesAfterRun(req.DryRun)
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"error": fmt.Sprintf("retention aborted at measurement %q: %s", measurement, coldErr.Error()),
 			})
@@ -921,7 +928,7 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 
 	// Clear DuckDB parquet metadata/data cache — dry runs also populate the cache via
 	// read_parquet calls in getFileMaxTimeAndRowCount, so always clear regardless of dry run.
-	h.duckdb.ClearHTTPCache()
+	h.clearCachesAfterRun(req.DryRun)
 	freeOSMemoryThrottled()
 
 	executionTime := float64(time.Since(start).Milliseconds())
@@ -1441,4 +1448,21 @@ func (h *RetentionHandler) removeDirectoryTree(ctx context.Context, remover stor
 // (raft.OutputGoneAccounted, #1207 d2a2b).
 func retentionManifestReason[T int | int64](policyID T) string {
 	return fmt.Sprintf("retention:%d", policyID)
+}
+
+// SetOnFilesRemoved sets the function called after this handler removed or
+// rewrote parquet files: the query caches hold pruned partition lists, and one
+// naming a removed hour makes DuckDB report "No files found", which a query
+// answers as an empty result until the cache expires.
+func (h *RetentionHandler) SetOnFilesRemoved(fn func()) {
+	h.onFilesRemoved = fn
+}
+
+// clearCachesAfterRun clears DuckDB's parquet cache and, unless the run was
+// a dry run (it removed nothing), the query caches.
+func (h *RetentionHandler) clearCachesAfterRun(dryRun bool) {
+	h.duckdb.ClearHTTPCache()
+	if !dryRun && h.onFilesRemoved != nil {
+		h.onFilesRemoved()
+	}
 }

@@ -129,7 +129,7 @@ func TestEmptyRangeProofRemote(t *testing.T) {
 		if remote.listDirCalls != 4 || remote.listCalls != 0 {
 			t.Fatalf("listDir=%d list=%d", remote.listDirCalls, remote.listCalls)
 		}
-		if _, _, ok := p.partitionCache.get(p.partitionCache.cacheKey(glob, sql)); ok {
+		if _, _, ok := p.partitionCache.get(p.partitionCache.cacheKey(glob, sql, p.liveEpoch())); ok {
 			t.Fatal("proven-empty verdict must not be cached")
 		}
 		// A second identical query re-proves from listings younger than
@@ -220,7 +220,7 @@ func TestEmptyRangeProofRemote(t *testing.T) {
 		if optimized || result != glob {
 			t.Fatalf("result=%v optimized=%v", result, optimized)
 		}
-		if _, _, ok := p.partitionCache.get(p.partitionCache.cacheKey(glob, sql)); !ok {
+		if _, _, ok := p.partitionCache.get(p.partitionCache.cacheKey(glob, sql, p.liveEpoch())); !ok {
 			t.Fatal("the plain fallback verdict is still cached")
 		}
 		// A cached fallback verdict does not stand in for a proof.
