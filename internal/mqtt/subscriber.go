@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -468,6 +469,20 @@ func (s *Subscriber) processMessage(ctx context.Context, topic string, payload [
 		}
 		defer release()
 		if err := s.arrowBuffer.Write(writeCtx, database, records); err != nil {
+			var dropped *ingest.PointsDroppedError
+			if errors.As(err, &dropped) {
+				// The other points were written; these could not be.
+				for _, d := range dropped.Drops {
+					s.logger.Error().
+						Str("topic", topic).
+						Str("measurement", d.Measurement).
+						Str("column", d.Column).
+						Str("reason", d.Reason).
+						Int("points_dropped", d.Points).
+						Msg("MQTT points dropped (partial write)")
+				}
+				return nil
+			}
 			return fmt.Errorf("failed to write to buffer: %w", err)
 		}
 	}

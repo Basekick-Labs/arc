@@ -706,7 +706,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	if h.queryRegistry != nil {
 		var queryCtx context.Context
 		queryID, queryCtx = h.queryRegistry.Register(
-			c.UserContext(), req.SQL, tokenID, tokenName, c.IP(), false, 0,
+			c.UserContext(), req.SQL, tokenID, tokenName, c.IP(),
 		)
 		c.Set("X-Arc-Query-ID", queryID)
 		baseCtx = queryCtx

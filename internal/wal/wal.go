@@ -444,12 +444,9 @@ type WriterConfig struct {
 	Logger       zerolog.Logger
 }
 
-// ReplicationEntry represents a WAL entry for replication.
-// This is passed to the replication hook for streaming to readers.
+// ReplicationEntry is a WAL entry as the replication hook receives it: the
+// origin stream (#1207) sends it to standby writers.
 type ReplicationEntry struct {
-	// Sequence is a monotonically increasing number for ordering
-	Sequence uint64
-
 	// TimestampUS is the entry timestamp in microseconds since epoch
 	TimestampUS uint64
 
@@ -461,8 +458,8 @@ type ReplicationEntry struct {
 	Coverage *Coverage
 }
 
-// ReplicationHook is called for each WAL entry before it's written locally.
-// This enables real-time streaming of entries to reader nodes.
+// ReplicationHook is called for each WAL entry before it's written locally:
+// the origin stream's, on a primary writer with WAL coverage (#1207).
 type ReplicationHook func(entry *ReplicationEntry)
 
 // Writer is a Write-Ahead Log writer with configurable durability
@@ -583,7 +580,6 @@ type Writer struct {
 	// w.mu: the writer loop holds w.mu across fsync and rotation, and a covered
 	// append fires the hook while its caller holds an ingest shard lock (#1207).
 	replicationHook atomic.Pointer[ReplicationHook]
-	sequence        atomic.Uint64 // Monotonic sequence counter for replication
 	trackedInstance uint64
 
 	// fileSeqs and fileOrder track what this process wrote to each WAL file, so
@@ -1609,9 +1605,8 @@ func (w *Writer) appendTrackedEntry(logicalPayload []byte) (string, error) {
 	// Everything after this — the Sprintf, the CRC, and above all the
 	// synchronous replication hook below — sits between them otherwise, and a
 	// sequence counted in trackedSequence but absent from pendingSeqs is a
-	// sequence the floor does not protect. With a replication hook set that
-	// window spans a channel send to the replication sender (no hook is
-	// installed while the stream is off, #888).
+	// sequence the floor does not protect. With a replication hook set (the
+	// origin stream, #1207) that window spans its hook call.
 	w.pendingMu.Lock()
 	seq := atomic.AddUint64(&w.trackedSequence, 1)
 	w.pendingSeqs[seq] = struct{}{}
@@ -2388,9 +2383,9 @@ func (w *Writer) CurrentCheckpointHashes() ([]string, error) {
 	return NewReader(w.currentPath, w.logger).ReadCheckpointHashes()
 }
 
-// SetReplicationHook sets the hook function called for each WAL entry.
-// This enables cluster replication by streaming entries to reader nodes.
-// The hook is called synchronously before the entry is written locally.
+// SetReplicationHook sets the hook function called for each WAL entry (the
+// origin stream's, #1207). The hook is called synchronously before the entry
+// is written locally.
 func (w *Writer) SetReplicationHook(hook ReplicationHook) {
 	if hook == nil {
 		w.replicationHook.Store(nil)
@@ -2400,18 +2395,12 @@ func (w *Writer) SetReplicationHook(hook ReplicationHook) {
 	w.logger.Info().Msg("Replication hook set")
 }
 
-// replicate hands entry to the replication hook, if one is set, stamping the
-// next replication sequence. Lock-free; the hook must not block.
+// replicate hands entry to the replication hook, if one is set. Lock-free;
+// the hook must not block.
 func (w *Writer) replicate(entry *ReplicationEntry) {
 	hook := w.replicationHook.Load()
 	if hook == nil {
 		return
 	}
-	entry.Sequence = w.sequence.Add(1)
 	(*hook)(entry)
-}
-
-// CurrentSequence returns the current replication sequence number.
-func (w *Writer) CurrentSequence() uint64 {
-	return w.sequence.Load()
 }

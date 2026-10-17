@@ -547,7 +547,7 @@ func TestWalkObservesListedEntries(t *testing.T) {
 	p := newTestPuller(t, newFakeBackend(), newRepeatingFetcher([]byte("x")),
 		staticResolver{nodeID: "writer-1", addrs: []string{"1.2.3.4:9100"}, ok: true})
 	var seen []string
-	p.cfg.ObserveListed = func(e *raft.FileEntry) { seen = append(seen, e.Path) }
+	p.cfg.ObserveListed = func(e *raft.FileEntry) ListedVerdict { seen = append(seen, e.Path); return ListedTrusted }
 	p.Start(context.Background())
 	defer p.Stop()
 	entry := makeEntry("testdb/cpu/observed.parquet", "writer-1", 1)

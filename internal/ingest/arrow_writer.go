@@ -19,6 +19,7 @@ import (
 	"github.com/Basekick-Labs/msgpack/v6"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/bitutil"
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet"
@@ -48,15 +49,6 @@ const (
 // memory.GoAllocator is documented as thread-safe for concurrent use.
 // Using a shared instance avoids allocator overhead per-write operation.
 var sharedArrowAllocator = memory.NewGoAllocator()
-
-// int64SliceToTimestamps reinterprets a []int64 as []arrow.Timestamp without copying.
-// Safe because arrow.Timestamp is defined as `type Timestamp int64` (identical layout).
-// LIFETIME: the caller must ensure src is not GC'd or reallocated while the returned
-// slice or any Arrow array/builder built from it is still alive. Use only within the
-// same stack frame as src.
-func int64SliceToTimestamps(src []int64) []arrow.Timestamp {
-	return *(*[]arrow.Timestamp)(unsafe.Pointer(&src))
-}
 
 // getFlushMessageType returns the human-readable flush type message for logging
 func getFlushMessageType(flushType string) string {
@@ -199,6 +191,12 @@ func (c *schemaLRUCache) evictLRU() {
 
 // ArrowWriter handles Arrow schema inference and Parquet writing
 type ArrowWriter struct {
+	// fileBytesPerRow is, per measurement, the Parquet bytes per row of its
+	// last file (int64 in a sync.Map): the next file's output buffer is sized
+	// from it instead of growing by doubling.
+	fileBytesPerRow sync.Map
+	hintEntries     atomic.Int64
+
 	compression       compress.Compression
 	useDictionary     bool
 	numericDictionary bool
@@ -445,13 +443,22 @@ func sortColumnsTimeFirst(colNames []string) {
 // =============================================================================
 
 // getSchema gets or infers Arrow schema for columnar data (LRU cached per measurement)
+// unstoredColumn reports a column name that is never written to Parquet: an
+// empty name, or one starting with "_" (internal). Such a column is skipped
+// wherever columns are merged or given a schema; its type is not part of a
+// buffer's signature, so two batches of one buffer may disagree on it, and an
+// empty name has no first byte to test.
+func unstoredColumn(name string) bool {
+	return len(name) == 0 || name[0] == '_'
+}
+
 func (w *ArrowWriter) getSchema(measurement string, columns map[string]interface{}, tagColumns []string, dedupTime bool, decimalCols map[string]config.DecimalSpec) (*arrow.Schema, error) {
 	// Create cache key from column names and types
 	var colNames []string
 	var typeNames []string
 
 	for name := range columns {
-		if name[0] == '_' {
+		if unstoredColumn(name) {
 			continue // Skip internal columns
 		}
 		colNames = append(colNames, name)
@@ -567,7 +574,7 @@ func (w *ArrowWriter) inferSchema(columns map[string]interface{}, tagColumns []s
 
 	for name, col := range columns {
 		// Skip internal metadata columns
-		if name[0] == '_' {
+		if unstoredColumn(name) {
 			continue
 		}
 
@@ -713,42 +720,49 @@ func (w *ArrowWriter) writeParquetColumnarWithSchema(ctx context.Context, measur
 
 		switch field.Type.ID() {
 		case arrow.INT64:
-			builder := array.NewInt64Builder(mem)
-			builders[i] = builder
-			if intCol, ok := col.([]int64); ok {
-				builder.AppendValues(intCol, colValidity)
-			} else {
+			intCol, ok := col.([]int64)
+			if !ok {
 				return nil, nil, fmt.Errorf("column %s: expected []int64, got %T", field.Name, col)
 			}
-			arrays[i] = builder.NewArray()
+			data, err := fixedWidthArrayData(field.Type, arrow.Int64Traits.CastToBytes(intCol), len(intCol), colValidity)
+			if err != nil {
+				return nil, nil, fmt.Errorf("column %s: %w", field.Name, err)
+			}
+			arrays[i] = array.NewInt64Data(data)
 
 		case arrow.TIMESTAMP:
-			builder := array.NewTimestampBuilder(mem, arrow.FixedWidthTypes.Timestamp_us.(*arrow.TimestampType))
-			builders[i] = builder
-			if intCol, ok := col.([]int64); ok {
-				// MEMORY FIX: Zero-copy conversion from []int64 to []arrow.Timestamp
-				// This avoids allocating a temporary slice on every write
-				tsValues := int64SliceToTimestamps(intCol)
-				builder.AppendValues(tsValues, colValidity)
-			} else {
+			intCol, ok := col.([]int64)
+			if !ok {
 				return nil, nil, fmt.Errorf("column %s: expected []int64 for timestamp, got %T", field.Name, col)
 			}
-			arrays[i] = builder.NewArray()
+			data, err := fixedWidthArrayData(field.Type, arrow.Int64Traits.CastToBytes(intCol), len(intCol), colValidity)
+			if err != nil {
+				return nil, nil, fmt.Errorf("column %s: %w", field.Name, err)
+			}
+			arrays[i] = array.NewTimestampData(data)
 
 		case arrow.FLOAT64:
-			builder := array.NewFloat64Builder(mem)
-			builders[i] = builder
-			if floatCol, ok := col.([]float64); ok {
-				builder.AppendValues(floatCol, colValidity)
-			} else {
+			floatCol, ok := col.([]float64)
+			if !ok {
 				return nil, nil, fmt.Errorf("column %s: expected []float64, got %T", field.Name, col)
 			}
-			arrays[i] = builder.NewArray()
+			data, err := fixedWidthArrayData(field.Type, arrow.Float64Traits.CastToBytes(floatCol), len(floatCol), colValidity)
+			if err != nil {
+				return nil, nil, fmt.Errorf("column %s: %w", field.Name, err)
+			}
+			arrays[i] = array.NewFloat64Data(data)
 
 		case arrow.STRING:
 			builder := array.NewStringBuilder(mem)
 			builders[i] = builder
 			if strCol, ok := col.([]string); ok {
+				// Sized once: the builder otherwise grows by doubling.
+				size := 0
+				for _, v := range strCol {
+					size += len(v)
+				}
+				builder.Reserve(len(strCol))
+				builder.ReserveData(size)
 				builder.AppendValues(strCol, colValidity)
 			} else {
 				return nil, nil, fmt.Errorf("column %s: expected []string, got %T", field.Name, col)
@@ -759,6 +773,7 @@ func (w *ArrowWriter) writeParquetColumnarWithSchema(ctx context.Context, measur
 			builder := array.NewBooleanBuilder(mem)
 			builders[i] = builder
 			if boolCol, ok := col.([]bool); ok {
+				builder.Reserve(len(boolCol))
 				builder.AppendValues(boolCol, colValidity)
 			} else {
 				return nil, nil, fmt.Errorf("column %s: expected []bool, got %T", field.Name, col)
@@ -770,6 +785,7 @@ func (w *ArrowWriter) writeParquetColumnarWithSchema(ctx context.Context, measur
 			builder := array.NewDecimal128Builder(mem, dt)
 			builders[i] = builder
 			if decCol, ok := col.([]decimal128.Num); ok {
+				builder.Reserve(len(decCol))
 				builder.AppendValues(decCol, colValidity)
 			} else {
 				return nil, nil, fmt.Errorf("column %s: expected []decimal128.Num, got %T", field.Name, col)
@@ -781,18 +797,95 @@ func (w *ArrowWriter) writeParquetColumnarWithSchema(ctx context.Context, measur
 		}
 	}
 
-	data, err := w.writeRecordToParquet(schema, arrays)
+	rows := 0
+	if len(arrays) > 0 {
+		rows = arrays[0].Len()
+	}
+	data, err := w.writeRecordToParquet(schema, arrays, w.parquetSizeHint(measurement, rows, arrays))
+	if err == nil && rows >= minRowsForSizeHint {
+		if w.hintEntries.Load() >= maxSizeHintEntries {
+			w.fileBytesPerRow.Clear()
+			w.hintEntries.Store(0)
+		}
+		if _, loaded := w.fileBytesPerRow.Swap(measurement, int64(len(data)/rows+1)); !loaded {
+			w.hintEntries.Add(1)
+		}
+	}
 	return data, schema, err
 }
 
+// Parquet output buffer sizing: a measurement's bytes per row are learned
+// only from files of at least minRowsForSizeHint rows (a small file is mostly
+// footer, and would size the next large file far too big), and the hint never
+// exceeds the write's own column bytes (plus a footer allowance) or
+// maxParquetSizeHint. The learned values are dropped once maxSizeHintEntries
+// measurements have one.
+const (
+	maxParquetSizeHint = 256 << 20
+	minRowsForSizeHint = 1024
+	maxSizeHintEntries = 10000
+)
+
+// parquetSizeHint is the output buffer size to reserve for a file of rows
+// rows built from arrays, or 0 for none.
+func (w *ArrowWriter) parquetSizeHint(measurement string, rows int, arrays []arrow.Array) int {
+	v, ok := w.fileBytesPerRow.Load(measurement)
+	if !ok || rows == 0 {
+		return 0
+	}
+	perRow := v.(int64)
+	hint := perRow*int64(rows) + perRow*int64(rows)/8 + 4096
+	var raw int64
+	for _, a := range arrays {
+		for _, b := range a.Data().Buffers() {
+			if b != nil {
+				raw += int64(b.Len())
+			}
+		}
+	}
+	return int(min(hint, raw+64<<10, maxParquetSizeHint))
+}
+
+// fixedWidthArrayData is the Arrow data of a fixed-width column over the
+// column's own memory: values are not copied (the flush owns the slice until
+// the file is written, and an Arrow buffer over Go memory frees nothing on
+// Release). Only a NULL bitmap is built, when the column has NULLs
+// (valid[i] false). An empty valid means all valid, and one of another length
+// is an error, as for the builders the other column types use.
+func fixedWidthArrayData(dt arrow.DataType, values []byte, n int, valid []bool) (arrow.ArrayData, error) {
+	var nullBitmap *memory.Buffer
+	nulls := 0
+	if len(valid) != 0 {
+		if len(valid) != n {
+			return nil, fmt.Errorf("NULL bitmap has %d entries for %d values", len(valid), n)
+		}
+		bits := make([]byte, bitutil.BytesForBits(int64(n)))
+		for i, ok := range valid {
+			if ok {
+				bitutil.SetBit(bits, i)
+			} else {
+				nulls++
+			}
+		}
+		if nulls > 0 {
+			nullBitmap = memory.NewBufferBytes(bits)
+		}
+	}
+	return array.NewData(dt, n, []*memory.Buffer{nullBitmap, memory.NewBufferBytes(values)}, nil, nulls, 0), nil
+}
+
 // writeRecordToParquet writes Arrow arrays to Parquet bytes
-func (w *ArrowWriter) writeRecordToParquet(schema *arrow.Schema, arrays []arrow.Array) ([]byte, error) {
+func (w *ArrowWriter) writeRecordToParquet(schema *arrow.Schema, arrays []arrow.Array, sizeHint int) ([]byte, error) {
 	// Create record batch
 	record := array.NewRecord(schema, arrays, -1)
 	defer record.Release()
 
-	// Write to Parquet
+	// Write to Parquet, into a buffer sized for the file when a hint is known
+	// (growing by doubling allocates about twice the file).
 	var buf bytes.Buffer
+	if sizeHint > 0 {
+		buf.Grow(sizeHint)
+	}
 
 	// Schema-aware writer properties (see writerPropsFor for the
 	// per-configuration dictionary tiers).
@@ -1130,9 +1223,11 @@ type ArrowBuffer struct {
 	totalRecordsBuffered atomic.Int64
 	totalRecordsWritten  atomic.Int64
 	totalFlushes         atomic.Int64
-	totalErrors          atomic.Int64
-	totalWALErrors       atomic.Int64 // WAL write failures (real I/O / serialization errors)
-	totalWALDropped      atomic.Int64 // WAL backpressure drops (entry queued but channel full)
+	// sortedMerges counts flushes merged in sorted order (mergeSortedByTime).
+	sortedMerges    atomic.Int64
+	totalErrors     atomic.Int64
+	totalWALErrors  atomic.Int64 // WAL write failures (real I/O / serialization errors)
+	totalWALDropped atomic.Int64 // WAL backpressure drops (entry queued but channel full)
 	// totalSchemaChurnExceeded counts requests rejected because the
 	// schema-evolution flush loop hit schemaEvolutionMaxIters under
 	// sustained concurrent schema rotation against the same
@@ -1191,7 +1286,7 @@ func getColumnSignature(columns map[string]interface{}) string {
 	entries := make([]colEntry, 0, len(columns))
 	size := -1 // first entry adds 0 commas; each subsequent adds 1
 	for name, val := range columns {
-		if len(name) == 0 || name[0] == '_' {
+		if unstoredColumn(name) {
 			continue // skip empty and internal columns
 		}
 		var typ string
@@ -1944,18 +2039,22 @@ func (b *ArrowBuffer) columnarToWALRecords(database string, record *models.Colum
 		return nil
 	}
 
-	// Convert columnar to row format
+	// Convert columnar to row format (NULL cells: see allNil). The target keys
+	// go in last, so a user column cannot replace them.
+	keepNulls := make(map[string]bool, len(record.Columns))
+	for colName, colData := range record.Columns {
+		keepNulls[colName] = allNil(colData)
+	}
 	records := make([]map[string]interface{}, numRows)
 	for i := 0; i < numRows; i++ {
-		row := map[string]interface{}{
-			"_database":    database,
-			"_measurement": record.Measurement,
-		}
+		row := make(map[string]interface{}, len(record.Columns)+2)
 		for colName, colData := range record.Columns {
-			if i < len(colData) {
+			if i < len(colData) && (colData[i] != nil || keepNulls[colName]) {
 				row[colName] = colData[i]
 			}
 		}
+		row["_database"] = database
+		row["_measurement"] = record.Measurement
 		records[i] = row
 	}
 
@@ -1967,94 +2066,118 @@ func (b *ArrowBuffer) columnarToWALRecords(database string, record *models.Colum
 // to the columnar format expected by the Arrow writer.
 //
 // The conversion:
-// - time column: populated from Record.Timestamp (microseconds) or Record.Time
-// - Tag columns: stored directly by tag name (matches Line Protocol behavior)
-// - Field columns: stored directly by field name (conflicts get "_value" suffix)
-func (b *ArrowBuffer) rowsToColumnar(measurement string, rows []*models.Record) *models.ColumnarRecord {
+//   - time column: populated from Record.Timestamp (microseconds) or Record.Time
+//   - Tag columns: stored directly by tag name (matches Line Protocol behavior)
+//   - Field columns: stored directly by field name; a field named like a tag
+//     of any row goes to "<name>_value"
+//
+// Each row gives each column at most one value. A row that cannot (two of its
+// keys land in one column: a tag "x_value" or a literal field "x_value" next
+// to a field "x" renamed for a tag "x"; or a tag or field named "time", the
+// timestamp's column) is left out and returned in drops. Before, such a row
+// made one column longer than the others: the write succeeded and its flush
+// failed, or panicked, every time.
+func (b *ArrowBuffer) rowsToColumnar(measurement string, rows []*models.Record) (*models.ColumnarRecord, []LPDrop) {
 	if len(rows) == 0 {
 		return &models.ColumnarRecord{
 			Measurement: measurement,
 			Columnar:    true,
 			Columns:     make(map[string][]interface{}),
-		}
+		}, nil
 	}
 
-	// Pre-allocate columns map - estimate based on first record
-	firstRow := rows[0]
-	estimatedCols := 1 + len(firstRow.Tags) + len(firstRow.Fields) // time + tags + fields
-	columns := make(map[string][]interface{}, estimatedCols)
-
-	// Initialize time column
-	columns["time"] = make([]interface{}, 0, len(rows))
-
-	// First pass: collect all unique column names across all rows
-	// This handles schema variations where different rows may have different fields/tags
+	// Tag names of every row: a field named like one is written to
+	// "<name>_value" (the naming line protocol uses per line).
 	allTags := make(map[string]struct{})
-	allFields := make(map[string]struct{})
 	for _, row := range rows {
 		for tag := range row.Tags {
 			allTags[tag] = struct{}{}
 		}
-		for field := range row.Fields {
-			allFields[field] = struct{}{}
-		}
 	}
 
-	// Initialize columns for all tags and fields
-	// Tags are stored directly by name (matching Line Protocol behavior)
-	// Fields that conflict with tags get "_value" suffix
-	for tag := range allTags {
-		columns[tag] = make([]interface{}, 0, len(rows))
+	// Each kept row's cells by final column name.
+	type rowCells struct {
+		ts    int64
+		cells map[string]interface{}
 	}
-	for field := range allFields {
-		if _, hasTag := allTags[field]; hasTag {
-			columns[field+"_value"] = make([]interface{}, 0, len(rows))
-		} else {
-			columns[field] = make([]interface{}, 0, len(rows))
-		}
-	}
-
-	// Second pass: populate columns with values
+	kept := make([]rowCells, 0, len(rows))
+	tagCols := make(map[string]struct{})
+	var timeKey, clash int
+	var clashCol string
 	for _, row := range rows {
-		// Handle timestamp: prefer Timestamp (microseconds) if set, otherwise convert Time
-		var timestamp int64
-		if row.Timestamp != 0 {
-			timestamp = row.Timestamp
-		} else if !row.Time.IsZero() {
-			timestamp = row.Time.UnixMicro()
-		} else {
-			// Use current time if no timestamp provided
-			timestamp = time.Now().UnixMicro()
+		_, tagTime := row.Tags["time"]
+		_, fieldTime := row.Fields["time"]
+		if tagTime || fieldTime {
+			timeKey++
+			continue
 		}
-		columns["time"] = append(columns["time"], timestamp)
+		cells := make(map[string]interface{}, len(row.Tags)+len(row.Fields))
+		bad := false
+		for tag, v := range row.Tags {
+			cells[tag] = v
+		}
+		for field, v := range row.Fields {
+			col := field
+			if _, isTag := allTags[field]; isTag {
+				col = field + "_value"
+			}
+			if _, taken := cells[col]; taken {
+				bad, clashCol = true, col
+				break
+			}
+			cells[col] = v
+		}
+		if bad {
+			clash++
+			continue
+		}
+		var ts int64
+		switch {
+		case row.Timestamp != 0:
+			ts = row.Timestamp
+		case !row.Time.IsZero():
+			ts = row.Time.UnixMicro()
+		default:
+			ts = time.Now().UnixMicro()
+		}
+		for tag := range row.Tags {
+			tagCols[tag] = struct{}{}
+		}
+		kept = append(kept, rowCells{ts: ts, cells: cells})
+	}
 
-		// Add tag values (nil for missing tags to maintain column alignment)
-		for tag := range allTags {
-			if val, ok := row.Tags[tag]; ok {
-				columns[tag] = append(columns[tag], val)
-			} else {
-				columns[tag] = append(columns[tag], nil)
-			}
-		}
+	var drops []LPDrop
+	if timeKey > 0 {
+		drops = append(drops, LPDrop{Measurement: measurement, Reason: LPDropTime, Points: timeKey})
+	}
+	if clash > 0 {
+		drops = append(drops, LPDrop{Measurement: measurement, Column: clashCol, Reason: LPDropSameColumn, Points: clash})
+	}
 
-		// Add field values (nil for missing fields to maintain column alignment)
-		// Fields that conflict with tags get "_value" suffix
-		for field := range allFields {
-			colName := field
-			if _, hasTag := allTags[field]; hasTag {
-				colName = field + "_value"
-			}
-			if val, ok := row.Fields[field]; ok {
-				columns[colName] = append(columns[colName], val)
-			} else {
-				columns[colName] = append(columns[colName], nil)
-			}
+	// Every column any kept row has a value for; one cell per row each.
+	names := make(map[string]struct{})
+	for _, r := range kept {
+		for col := range r.cells {
+			names[col] = struct{}{}
 		}
+	}
+	columns := make(map[string][]interface{}, len(names)+1)
+	times := make([]interface{}, len(kept))
+	for i, r := range kept {
+		times[i] = r.ts
+	}
+	columns["time"] = times
+	for col := range names {
+		vals := make([]interface{}, len(kept))
+		for i, r := range kept {
+			vals[i] = r.cells[col] // nil when the row has none: NULL
+		}
+		columns[col] = vals
 	}
 
 	// Collect tag column names for Parquet metadata (enables auto-dedup in compaction)
-	tagColumns := make([]string, 0, len(allTags))
-	for tag := range allTags {
+	tagColumns := make([]string, 0, len(tagCols))
+	for tag := range tagCols {
 		tagColumns = append(tagColumns, tag)
 	}
 
@@ -2063,7 +2186,7 @@ func (b *ArrowBuffer) rowsToColumnar(measurement string, rows []*models.Record) 
 		Columnar:    true,
 		Columns:     columns,
 		TagColumns:  tagColumns,
-	}
+	}, drops
 }
 
 // Write adds records to the buffer (for MessagePack handler)
@@ -2116,16 +2239,45 @@ func (b *ArrowBuffer) Write(ctx context.Context, database string, records interf
 	}
 
 	// Convert grouped row records to columnar format and write
+	var drops []LPDrop
 	for measurement, rowRecords := range rowRecordsByMeasurement {
-		columnar := b.rowsToColumnar(measurement, rowRecords)
+		columnar, dropped := b.rowsToColumnar(measurement, rowRecords)
+		drops = append(drops, dropped...)
+		if len(columnar.Columns["time"]) == 0 {
+			continue // every row was dropped
+		}
 		if err := b.writeColumnar(ctx, database, columnar); err != nil {
 			b.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to write converted row records")
 			b.totalErrors.Add(1)
 			return err
 		}
 	}
+	if len(drops) > 0 {
+		sort.Slice(drops, func(i, j int) bool {
+			if drops[i].Measurement != drops[j].Measurement {
+				return drops[i].Measurement < drops[j].Measurement
+			}
+			return drops[i].Reason < drops[j].Reason
+		})
+		return &PointsDroppedError{Drops: drops}
+	}
 
 	return nil
+}
+
+// PointsDroppedError is Write's answer when it left out row records it could
+// not write as one row each (see rowsToColumnar) and wrote all the others:
+// the caller reports a partial write.
+type PointsDroppedError struct {
+	Drops []LPDrop
+}
+
+func (e *PointsDroppedError) Error() string {
+	n := 0
+	for _, d := range e.Drops {
+		n += d.Points
+	}
+	return fmt.Sprintf("%d points dropped, the others were written", n)
 }
 
 // WriteColumnarDirect writes columnar data directly to the buffer
@@ -2165,25 +2317,6 @@ func (b *ArrowBuffer) WriteColumnarDirectNoWAL(ctx context.Context, database, me
 	return b.writeColumnarDirect(ctx, database, measurement, columns, "", nil)
 }
 
-// WriteColumnarDirectNoWALWithHashes applies replicated data without writing
-// it again to the WAL, and carries the follower-local WAL identities through
-// to the flush checkpoint.
-func (b *ArrowBuffer) WriteColumnarDirectNoWALWithHashes(ctx context.Context, database, measurement string, columns map[string][]interface{}, hashes []string) error {
-	return b.writeColumnarDirectWithHashes(ctx, database, measurement, columns, hashes, nil)
-}
-
-// WriteColumnarDirectNoWALWithHashesAndTagColumns also preserves replicated
-// MessagePack tag metadata while checkpointing the follower-local WAL entries.
-func (b *ArrowBuffer) WriteColumnarDirectNoWALWithHashesAndTagColumns(ctx context.Context, database, measurement string, columns map[string][]interface{}, hashes []string, tagColumns []string) error {
-	return b.writeColumnarDirectWithHashes(ctx, database, measurement, columns, hashes, tagColumns)
-}
-
-// WriteColumnarDirectNoWALWithTagColumns replays columnar data without
-// rewriting it to the WAL while preserving MessagePack tag metadata.
-func (b *ArrowBuffer) WriteColumnarDirectNoWALWithTagColumns(ctx context.Context, database, measurement string, columns map[string][]interface{}, tagColumns []string) error {
-	return b.writeColumnarDirect(ctx, database, measurement, columns, "", tagColumns)
-}
-
 func (b *ArrowBuffer) writeColumnarDirect(ctx context.Context, database, measurement string, columns map[string][]interface{}, walIdentity string, tagColumns []string) error {
 	var hashes []string
 	if len(walIdentity) == walTrackedIdentityHexLen {
@@ -2193,7 +2326,7 @@ func (b *ArrowBuffer) writeColumnarDirect(ctx context.Context, database, measure
 }
 
 func (b *ArrowBuffer) writeColumnarDirectWithHashes(ctx context.Context, database, measurement string, columns map[string][]interface{}, walHashes []string, tagColumns []string) error {
-	// #590: both callers (WAL crash replay, cluster WAL replication) feed
+	// #590: WAL crash replay feeds
 	// RAW client payloads that never went through the live decode path's
 	// post-processing. Apply it here so replayed data behaves exactly like
 	// live-ingested data:
@@ -3219,14 +3352,15 @@ func (b *ArrowBuffer) writeTypedColumnarInternal(ctx context.Context, database, 
 // msgpack payload for the zero-copy WAL path. When rawPayload is non-empty
 // the WAL stores the original client bytes (AppendRawWithMeta, same as
 // writeColumnarInternal's fast path); otherwise the typed batch is
-// transposed to row records — the pre-existing typed fallback, which is
-// lossy for NULLs (typedBatchToWALRecords ignores Validity; see plan doc).
-// The typed msgpack decode path always supplies rawPayload, so it never
-// takes the lossy fallback.
+// encoded as row entries (encodeTypedWALRows), NULL cells left out.
+// The typed msgpack decode path always supplies rawPayload.
 func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measurement string, typedColumns *TypedColumnBatch, numRecords int, rawPayload []byte, skipWAL bool) error {
 	bufferKey := database + "/" + measurement
 	if len(rawPayload) > 0 {
-		typedColumns.estimatedBytes = int64(len(rawPayload))
+		// The payload's size, but at least 8 bytes a cell: a NULL is one
+		// byte of msgpack and a full cell in memory (Telegraf's columns are
+		// mostly NULLs).
+		typedColumns.estimatedBytes = max(int64(len(rawPayload)), int64(numRecords)*int64(len(typedColumns.Data))*8)
 	} else if typedColumns.estimatedBytes <= 0 {
 		typedColumns.estimatedBytes = estimateTypedColumnBatchBytes(typedColumns)
 	}
@@ -3243,9 +3377,7 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 		payload := rawPayload
 		var err error
 		if len(payload) == 0 {
-			if walRecords := typedBatchToWALRecords(database, measurement, typedColumns, numRecords, b.getDecimalColumns(measurement)); len(walRecords) > 0 {
-				payload, err = msgpack.Marshal(walRecords)
-			}
+			payload, err = encodeTypedWALRows(database, measurement, typedColumns, numRecords, b.getDecimalColumns(measurement))
 		}
 		if err == nil && len(payload) > 0 {
 			prep, err = cs.wal.PrepareCovered(database, bufferKey, payload)
@@ -3277,21 +3409,27 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 				})
 			}
 		} else {
-			walRecords := typedBatchToWALRecords(database, measurement, typedColumns, numRecords, b.getDecimalColumns(measurement))
-			if len(walRecords) > 0 {
+			rowPayload, marshalErr := encodeTypedWALRows(database, measurement, typedColumns, numRecords, b.getDecimalColumns(measurement))
+			if len(rowPayload) > 0 || marshalErr != nil {
+				// With the database envelope, as the columnar path writes its
+				// row entries (#889), and charged to the request's WAL
+				// reservation as appended (#676): uncharged, a long import held
+				// its whole reservation while its WAL bytes also landed on the
+				// volume, so the disk gate counted them twice.
 				var err error
-				if canTrack {
-					walHashes, err = tracked.AppendTracked(walRecords)
+				if marshalErr != nil {
+					err = marshalErr
+				} else if canTrack {
+					walHashes, err = tracked.AppendRawWithMetaTracked(database, rowPayload)
 				} else {
-					err = b.wal.Append(walRecords)
+					err = b.wal.AppendRawWithMeta(database, rowPayload)
 				}
-				// The marshalled size is not known here; the records are
-				// charged at their reservation, released when the request ends.
+				consumeWALReservation(ctx, len(rowPayload))
 				if err != nil {
 					b.recordWALError(err, func(ev *zerolog.Event) {
 						ev.Str("database", database).
 							Str("measurement", measurement).
-							Int("records", len(walRecords))
+							Int("records", numRecords)
 					})
 				}
 			}
@@ -3443,55 +3581,137 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 	return nil
 }
 
-// typedBatchToWALRecords converts a TypedColumnBatch to row-format records for WAL storage.
-// This is the WAL fallback path for typed batches (e.g., TLE) that don't have raw msgpack bytes.
-func typedBatchToWALRecords(database, measurement string, batch *TypedColumnBatch, numRecords int, decimalCols map[string]config.DecimalSpec) []map[string]interface{} {
+// allNil reports whether every value of a column is nil.
+//
+// NULL cells in a row-form WAL entry: in a column with any value in the
+// entry a NULL cell is left out of its row, and replay rebuilds it as NULL
+// (WALRowsToColumns); a recovery batch holding none of the column's values
+// then has no such column, rather than an all-NULL string column next to
+// files where the column is a number (read_parquet union_by_name would type
+// it VARCHAR). In a columnar entry (line protocol, msgpack) a column NULL in
+// every row is written as explicit nils, so replay writes the all-NULL
+// column the live write wrote (#337). A typed entry (imports) leaves it out
+// too: its live write kept the column's type, which the row form cannot
+// carry, and an all-NULL replay would come back as a string column. The time
+// column is never NULL.
+func allNil(col []interface{}) bool {
+	for _, v := range col {
+		if v != nil {
+			return false
+		}
+	}
+	return len(col) > 0
+}
+
+// encodeTypedWALRows encodes a TypedColumnBatch as a WAL row entry: the
+// msgpack array of row maps msgpack.Marshal makes of one map per row (each
+// column's cell, then "_database" and "_measurement"), written straight from
+// the typed columns with no per-row maps or boxed cells. This is the WAL
+// fallback for typed batches without raw msgpack bytes: line-protocol writes
+// and the CSV, Parquet, line-protocol and TLE imports. A NULL cell (Validity)
+// is left out of its row, even in a column NULL in every row (see allNil).
+// A column named like a target key is left out: the target keys win.
+func encodeTypedWALRows(database, measurement string, batch *TypedColumnBatch, numRecords int, decimalCols map[string]config.DecimalSpec) ([]byte, error) {
 	if numRecords == 0 {
-		return nil
+		return nil, nil
+	}
+	type walCol struct {
+		name  string
+		data  interface{}
+		valid []bool // nil: no NULLs
+		scale int32
+	}
+	cols := make([]walCol, 0, len(batch.Data))
+	for name, data := range batch.Data {
+		if name == "_database" || name == "_measurement" {
+			continue
+		}
+		c := walCol{name: name, data: data}
+		// The time column is never NULL.
+		if valid := batch.Validity[name]; name != "time" && len(valid) > 0 {
+			c.valid = valid
+		}
+		if spec, ok := decimalCols[name]; ok {
+			c.scale = spec.Scale
+		}
+		cols = append(cols, c)
+	}
+	sort.Slice(cols, func(i, j int) bool { return cols[i].name < cols[j].name })
+	present := func(c *walCol, i int) bool {
+		if i < len(c.valid) && !c.valid[i] {
+			return false
+		}
+		switch arr := c.data.(type) {
+		case []int64:
+			return i < len(arr)
+		case []float64:
+			return i < len(arr)
+		case []string:
+			return i < len(arr)
+		case []bool:
+			return i < len(arr)
+		case []decimal128.Num:
+			return i < len(arr)
+		}
+		return false
 	}
 
-	records := make([]map[string]interface{}, numRecords)
+	var buf bytes.Buffer
+	enc := msgpack.NewEncoder(&buf)
+	if err := enc.EncodeArrayLen(numRecords); err != nil {
+		return nil, err
+	}
 	for i := 0; i < numRecords; i++ {
-		row := map[string]interface{}{
-			"_database":    database,
-			"_measurement": measurement,
-		}
-		for colName, colData := range batch.Data {
-			switch arr := colData.(type) {
-			case []int64:
-				if i < len(arr) {
-					row[colName] = arr[i]
-				}
-			case []float64:
-				if i < len(arr) {
-					row[colName] = arr[i]
-				}
-			case []string:
-				if i < len(arr) {
-					row[colName] = arr[i]
-				}
-			case []bool:
-				if i < len(arr) {
-					row[colName] = arr[i]
-				}
-			case []decimal128.Num:
-				// WAL stores decimals as float64 (lossy but WAL is recovery-only)
-				if i < len(arr) {
-					s := int32(0)
-					if decimalCols != nil {
-						if spec, ok := decimalCols[colName]; ok {
-							s = spec.Scale
-						}
-					}
-					f := arr[i].ToBigFloat(s)
-					row[colName], _ = f.Float64()
-				}
+		n := 2
+		for k := range cols {
+			if present(&cols[k], i) {
+				n++
 			}
 		}
-		records[i] = row
+		if err := enc.EncodeMapLen(n); err != nil {
+			return nil, err
+		}
+		for k := range cols {
+			c := &cols[k]
+			if !present(c, i) {
+				continue
+			}
+			if err := enc.EncodeString(c.name); err != nil {
+				return nil, err
+			}
+			var err error
+			switch arr := c.data.(type) {
+			case []int64:
+				err = enc.EncodeInt64(arr[i])
+			case []float64:
+				err = enc.EncodeFloat64(arr[i])
+			case []string:
+				err = enc.EncodeString(arr[i])
+			case []bool:
+				err = enc.EncodeBool(arr[i])
+			case []decimal128.Num:
+				// WAL stores decimals as float64 (lossy but WAL is recovery-only)
+				f, _ := arr[i].ToBigFloat(c.scale).Float64()
+				err = enc.EncodeFloat64(f)
+			}
+			if err != nil {
+				return nil, err
+			}
+		}
+		if err := enc.EncodeString("_database"); err != nil {
+			return nil, err
+		}
+		if err := enc.EncodeString(database); err != nil {
+			return nil, err
+		}
+		if err := enc.EncodeString("_measurement"); err != nil {
+			return nil, err
+		}
+		if err := enc.EncodeString(measurement); err != nil {
+			return nil, err
+		}
 	}
-
-	return records
+	return buf.Bytes(), nil
 }
 
 // convertColumnsToTyped converts []interface{} columns to typed arrays with null tracking.
@@ -4098,7 +4318,7 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 	startTime := time.Now()
 
 	// Merge typed column batches
-	merged, err := b.mergeBatches(records)
+	merged, err := b.mergeBatchesForFlush(measurement, records)
 
 	// MEMORY FIX: Clear batch references immediately after merge to allow GC
 	// The merged map now owns all the data, original batches can be collected
@@ -4416,7 +4636,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 
 // flushPartSync flushes one class of a split synchronous flush.
 func (b *ArrowBuffer) flushPartSync(ctx context.Context, bufferKey, database, measurement string, p flushPart) error {
-	merged, err := b.mergeBatches(p.records)
+	merged, err := b.mergeBatchesForFlush(measurement, p.records)
 	if err != nil {
 		b.markFlushFailure()
 		p.group.failed()
@@ -4505,7 +4725,7 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 	}
 
 	// Merge typed column batches
-	merged, err := b.mergeBatches(recordsToFlush)
+	merged, err := b.mergeBatchesForFlush(measurement, recordsToFlush)
 	if err != nil {
 		b.markFlushFailure()
 		group.failed()
@@ -4610,6 +4830,9 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 
 		// Collect column types
 		for name, col := range cols {
+			if unstoredColumn(name) {
+				continue // never written, and its type may differ per batch
+			}
 			if _, seen := colTypes[name]; !seen {
 				var ct string
 				switch col.(type) {
@@ -4643,7 +4866,13 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 		case map[string]interface{}:
 			cols = b
 		}
-		if len(cols) < len(colTypes) {
+		stored := 0
+		for name := range cols {
+			if !unstoredColumn(name) {
+				stored++
+			}
+		}
+		if stored < len(colTypes) {
 			hasSparseColumns = true
 			break
 		}
@@ -4697,6 +4926,9 @@ func (b *ArrowBuffer) mergeBatches(batches []interface{}) (*TypedColumnBatch, er
 
 		// Copy each column's data at the current row offset
 		for name, col := range cols {
+			if unstoredColumn(name) {
+				continue
+			}
 			switch v := col.(type) {
 			case []int64:
 				copy(merged[name].([]int64)[rowOffset:], v)
@@ -5371,6 +5603,28 @@ func (b *ArrowBuffer) generateStoragePath(database, measurement string, partitio
 // FlushAll flushes all buffered data to storage
 func (b *ArrowBuffer) FlushAll(ctx context.Context) error {
 	b.logger.Info().Msg("Flushing all buffers...")
+	err := b.flushMatching(ctx, nil)
+	b.logger.Info().Msg("All buffers flushed")
+	return err
+}
+
+// FlushScope is FlushAll for the buffers of one database: what they hold is
+// flushed now, as FlushAll does. It does not wait for flushes already
+// queued. A bulk import calls it when its rows are not flushing fast enough
+// on their own (#1070 follow-up).
+func (b *ArrowBuffer) FlushScope(ctx context.Context, database string) error {
+	return b.flushMatching(ctx, func(key string) bool { return keyInScope(key, database, "") })
+}
+
+// IsDecimalColumn reports whether a column of a measurement is configured
+// as decimal (ingest.decimal_columns): its values are converted to decimal
+// whatever their type.
+func (b *ArrowBuffer) IsDecimalColumn(measurement, column string) bool {
+	_, ok := b.getDecimalColumns(measurement)[column]
+	return ok
+}
+
+func (b *ArrowBuffer) flushMatching(ctx context.Context, match func(key string) bool) error {
 
 	var lastErr error
 
@@ -5383,7 +5637,9 @@ func (b *ArrowBuffer) FlushAll(ctx context.Context) error {
 		// Copy keys to avoid modifying map while iterating
 		keys := make([]string, 0, len(shard.buffers))
 		for key := range shard.buffers {
-			keys = append(keys, key)
+			if match == nil || match(key) {
+				keys = append(keys, key)
+			}
 		}
 
 		for _, key := range keys {
@@ -5415,8 +5671,6 @@ func (b *ArrowBuffer) FlushAll(ctx context.Context) error {
 
 		shard.mu.Unlock()
 	}
-
-	b.logger.Info().Msg("All buffers flushed")
 	return lastErr
 }
 

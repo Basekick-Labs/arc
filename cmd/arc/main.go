@@ -2237,20 +2237,12 @@ func main() {
 						arrowBuffer.SetIngestGate(nil)
 						clusterCoordinator = nil
 					} else {
-						// Two steps. The inbound replication stream applies entries
-						// through the ingest handler, so it must be gone before the
-						// Arrow buffer and WAL close (#853); those are components,
-						// every hook runs before any component, and PriorityIngest
-						// puts it with the other ingest paths. The coordinator
-						// itself is a COMPONENT: it owns Raft and must outlive the
-						// arrow-buffer flush and the file-registrar drain, which are
-						// components too (#1014). The schedulers that ask it whether
-						// they may run are hooks at PriorityScheduler, so they have
-						// already quiesced by the time any component runs.
-						shutdownCoordinator.RegisterHook("cluster-replication-receiver", func(context.Context) error {
-							clusterCoordinator.StopReplicationReceiver()
-							return nil
-						}, shutdown.PriorityIngest)
+						// The coordinator is a COMPONENT: it owns Raft and must
+						// outlive the arrow-buffer flush and the file-registrar
+						// drain, which are components too (#1014). The schedulers
+						// that ask it whether they may run are hooks at
+						// PriorityScheduler, so they have already quiesced by the
+						// time any component runs.
 						registerClusterCoordinatorShutdown(shutdownCoordinator, clusterCoordinator.Stop)
 
 						localNode := clusterCoordinator.GetLocalNode()
@@ -2347,18 +2339,6 @@ func main() {
 							}
 						}
 
-						// WAL replication stream. StartReplication starts nothing
-						// until the standby-writer stream lands (#888, #1207) and
-						// logs that itself; the file puller that feeds readers is
-						// started by the coordinator regardless.
-						if cfg.Cluster.ReplicationEnabled && walWriter != nil {
-							clusterCoordinator.SetWAL(walWriter)
-							clusterCoordinator.SetIngestBuffer(arrowBuffer)
-							if err := clusterCoordinator.StartReplication(); err != nil {
-								log.Warn().Err(err).Msg("Failed to start WAL replication")
-							}
-						}
-
 						// Wire up peer file replication (Enterprise Phase 1 + Phase 2).
 						//
 						// Phase 1 — the registrar is non-blocking: it enqueues file
@@ -2430,11 +2410,8 @@ func main() {
 						// The stale-local sweep (#1071) may run from here: a
 						// path waiting to register in this writer's outbox is
 						// never a stale copy. Nil elsewhere: nothing waits.
-						if registrationOutbox != nil {
-							clusterCoordinator.SetStaleLocalPending(registrationOutbox.HoldsRegistration)
-						} else {
-							clusterCoordinator.SetStaleLocalPending(nil)
-						}
+						// It also reports what each flushed file holds (#1182).
+						clusterCoordinator.AttachStaleLocalOutbox(registrationOutbox)
 
 						// Phase 5: wire the dynamic compaction gate to the coordinator
 						// so CanCompact() checks the FSM's active compactor lease
@@ -3699,6 +3676,7 @@ func main() {
 		if router != nil {
 			msgpackHandler.SetRouter(router)
 			lineProtocolHandler.SetRouter(router)
+			importHandler.SetRouter(router)
 			tleHandler.SetRouter(router)
 			queryHandler.SetRouter(router)
 			log.Info().Msg("Cluster router wired to API handlers for request forwarding")
@@ -5256,31 +5234,16 @@ func createWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolo
 			return nil
 		}
 		for _, rec := range records {
-			// Extract measurement from recovered record
-			// WAL row format uses underscore-prefixed keys: _measurement, _database
-			measurement, _ := rec["_measurement"].(string)
-			if measurement == "" {
-				measurement, _ = rec["measurement"].(string)
-			}
-			if measurement == "" {
-				measurement, _ = rec["m"].(string)
-			}
+			database, measurement := ingest.WALRowTarget(rec)
 			if measurement == "" {
 				continue // Skip records without measurement
 			}
 
-			database, _ := rec["_database"].(string)
-			if database == "" {
-				database, _ = rec["database"].(string)
-			}
-			if database == "" {
-				database = "default"
-			}
-
-			// Build columnar record from recovered data
+			// Build columnar record from recovered data: the same columns
+			// WALRowsToColumns reads (target keys left out).
 			columns := make(map[string][]interface{})
 			for key, value := range rec {
-				if key == "_measurement" || key == "measurement" || key == "m" || key == "_database" || key == "database" {
+				if ingest.IsWALRowTargetKey(rec, key) {
 					continue
 				}
 				columns[key] = []interface{}{value}

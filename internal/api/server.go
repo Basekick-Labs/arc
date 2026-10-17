@@ -159,19 +159,7 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 	}
 
 	// Create Fiber app with config
-	app := fiber.New(fiber.Config{
-		AppName:               "Arc Time-Series Database",
-		ReadTimeout:           config.ReadTimeout,
-		WriteTimeout:          config.WriteTimeout,
-		IdleTimeout:           config.IdleTimeout,
-		BodyLimit:             int(config.MaxPayloadSize),
-		DisableStartupMessage: true,
-		ErrorHandler:          customErrorHandler(logger),
-		// CRITICAL: Disable automatic request body parsing to preserve gzip-compressed payloads
-		DisablePreParseMultipartForm: true,
-		// StreamRequestBody allows us to handle compressed bodies manually
-		StreamRequestBody: false, // Keep false to get full body at once
-	})
+	app := fiber.New(appConfig(config, logger))
 
 	// Middleware
 	app.Use(recover.New(recover.Config{
@@ -970,5 +958,25 @@ func requestLogger(logger zerolog.Logger) fiber.Handler {
 		}
 
 		return err
+	}
+}
+
+// appConfig is the Fiber configuration of the HTTP server. Tests that need a
+// request to reach a handler as it does in production build their app from it
+// (#1070: with multipart pre-parsing off, an upload stays in the request body
+// as received and is forwarded as is).
+func appConfig(config *ServerConfig, logger zerolog.Logger) fiber.Config {
+	return fiber.Config{
+		AppName:               "Arc Time-Series Database",
+		ReadTimeout:           config.ReadTimeout,
+		WriteTimeout:          config.WriteTimeout,
+		IdleTimeout:           config.IdleTimeout,
+		BodyLimit:             int(config.MaxPayloadSize),
+		DisableStartupMessage: true,
+		ErrorHandler:          customErrorHandler(logger),
+		// CRITICAL: Disable automatic request body parsing to preserve gzip-compressed payloads
+		DisablePreParseMultipartForm: true,
+		// StreamRequestBody allows us to handle compressed bodies manually
+		StreamRequestBody: false, // Keep false to get full body at once
 	}
 }

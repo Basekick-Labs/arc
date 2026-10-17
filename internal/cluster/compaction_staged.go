@@ -339,13 +339,16 @@ func (c *Coordinator) adoptStagedCopy(ctx context.Context, e *raft.FileEntry, pr
 	}
 	// Moved after the output left the manifest (a DELETE or retention
 	// removed it): not data any more.
-	if cur, ok := c.raftNode.FSM().GetFile(e.Path); !ok || cur.CompactionJob != e.CompactionJob || cur.SHA256 != e.SHA256 {
+	cur, ok := c.raftNode.FSM().GetFile(e.Path)
+	if !ok || cur.CompactionJob != e.CompactionJob || cur.SHA256 != e.SHA256 {
 		_ = c.storage.Delete(ctx, e.Path)
 		return false, errors.New("the output left the manifest while it moved into place")
 	}
 	if !c.stagedLocalJob(e.CompactionJob) {
 		_ = mover.RemoveAll(ctx, dir)
 	}
+	// This node's compactor wrote these bytes: what the path holds (#1182).
+	c.recordLocalContent(cur, "", cur.SHA256)
 	c.logger.Debug().Str("job", e.CompactionJob).Str("path", e.Path).Msg("Committed compaction output moved into place from its staged copy")
 	return true, nil
 }

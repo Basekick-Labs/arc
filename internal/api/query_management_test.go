@@ -59,7 +59,7 @@ func TestQueryManagement_ListActiveQueries_WithRunning(t *testing.T) {
 	app, registry := setupQueryManagementTest(t)
 
 	// Register a query but don't complete it
-	registry.Register(context.Background(), "SELECT * FROM test", 1, "test-token", "127.0.0.1", false, 0)
+	registry.Register(context.Background(), "SELECT * FROM test", 1, "test-token", "127.0.0.1")
 
 	req, _ := http.NewRequest("GET", "/api/v1/queries/active", nil)
 	resp, err := app.Test(req, -1)
@@ -87,7 +87,7 @@ func TestQueryManagement_ListHistory_Empty(t *testing.T) {
 func TestQueryManagement_ListHistory_WithCompleted(t *testing.T) {
 	app, registry := setupQueryManagementTest(t)
 
-	id, _ := registry.Register(context.Background(), "SELECT 1", 1, "test-token", "127.0.0.1", false, 0)
+	id, _ := registry.Register(context.Background(), "SELECT 1", 1, "test-token", "127.0.0.1")
 	registry.Complete(id, 10)
 
 	req, _ := http.NewRequest("GET", "/api/v1/queries/history", nil)
@@ -104,7 +104,7 @@ func TestQueryManagement_ListHistory_WithLimit(t *testing.T) {
 	app, registry := setupQueryManagementTest(t)
 
 	for i := 0; i < 5; i++ {
-		id, _ := registry.Register(context.Background(), "SELECT 1", 1, "tok", "127.0.0.1", false, 0)
+		id, _ := registry.Register(context.Background(), "SELECT 1", 1, "tok", "127.0.0.1")
 		registry.Complete(id, i)
 	}
 
@@ -121,7 +121,7 @@ func TestQueryManagement_ListHistory_WithLimit(t *testing.T) {
 func TestQueryManagement_GetQuery_Active(t *testing.T) {
 	app, registry := setupQueryManagementTest(t)
 
-	queryID, _ := registry.Register(context.Background(), "SELECT * FROM test", 1, "test-token", "127.0.0.1", false, 0)
+	queryID, _ := registry.Register(context.Background(), "SELECT * FROM test", 1, "test-token", "127.0.0.1")
 
 	req, _ := http.NewRequest("GET", "/api/v1/queries/"+queryID, nil)
 	resp, err := app.Test(req, -1)
@@ -136,7 +136,7 @@ func TestQueryManagement_GetQuery_Active(t *testing.T) {
 func TestQueryManagement_GetQuery_Completed(t *testing.T) {
 	app, registry := setupQueryManagementTest(t)
 
-	queryID, _ := registry.Register(context.Background(), "SELECT 1", 1, "test-token", "127.0.0.1", false, 0)
+	queryID, _ := registry.Register(context.Background(), "SELECT 1", 1, "test-token", "127.0.0.1")
 	registry.Complete(queryID, 5)
 
 	req, _ := http.NewRequest("GET", "/api/v1/queries/"+queryID, nil)
@@ -165,7 +165,7 @@ func TestQueryManagement_GetQuery_NotFound(t *testing.T) {
 func TestQueryManagement_CancelQuery(t *testing.T) {
 	app, registry := setupQueryManagementTest(t)
 
-	queryID, ctx := registry.Register(context.Background(), "SELECT slow()", 1, "test-token", "127.0.0.1", false, 0)
+	queryID, ctx := registry.Register(context.Background(), "SELECT slow()", 1, "test-token", "127.0.0.1")
 
 	req, _ := http.NewRequest("DELETE", "/api/v1/queries/"+queryID, nil)
 	resp, err := app.Test(req, -1)
@@ -206,7 +206,7 @@ func TestQueryManagement_CancelQuery_NotFound(t *testing.T) {
 func TestQueryManagement_CancelQuery_AlreadyCompleted(t *testing.T) {
 	app, registry := setupQueryManagementTest(t)
 
-	queryID, _ := registry.Register(context.Background(), "SELECT 1", 1, "test-token", "127.0.0.1", false, 0)
+	queryID, _ := registry.Register(context.Background(), "SELECT 1", 1, "test-token", "127.0.0.1")
 	registry.Complete(queryID, 1)
 
 	req, _ := http.NewRequest("DELETE", "/api/v1/queries/"+queryID, nil)
