@@ -55,6 +55,10 @@ type ingestFence struct {
 
 	fenced atomic.Bool
 	reason atomic.Value // string
+	// refusal is the error a refused write carries: the reason text and its
+	// class (contact or standby) stored together, so a write never pairs one
+	// state's text with another's class (#1268).
+	refusal atomic.Pointer[ingest.RefusalError]
 
 	mu          sync.Mutex
 	lostContact bool      // fenced for contact (as opposed to designation)
@@ -193,6 +197,11 @@ func (f *ingestFence) setLocked(reason string, contact bool) {
 	prev, _ := f.reason.Load().(string)
 	now := reason != ""
 	f.reason.Store(reason)
+	class := ingest.RefusalStandby
+	if contact {
+		class = ingest.RefusalContact
+	}
+	f.refusal.Store(&ingest.RefusalError{Reason: class, Text: reason})
 	f.fenced.Store(now)
 	// The alert gauge is for contact loss only: a standby writer refusing
 	// writes is its normal state, not an incident.
@@ -216,15 +225,88 @@ func (f *ingestFence) setLocked(reason string, contact bool) {
 	}
 }
 
+// inSteadyContact reports whether this writer is in contact with the Raft
+// leader now and is not recovering from a lost contact (barrier and exit hold
+// done): its view of the designation can be trusted to forward writes (#1270).
+// Stricter than evaluate (no voters/other-writers condition: a forward is
+// never needed for safety, so a doubt keeps the local 503). Without the
+// contact rule (no automatic failover) contact is not tracked and the FSM's
+// view is used as is; the primary re-checks its own gate on arrival.
+func (f *ingestFence) inSteadyContact() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.lostContact {
+		return false
+	}
+	if !f.contactRule || f.isLeader() {
+		return true
+	}
+	lc := f.lastContact()
+	return !lc.IsZero() && f.now().Sub(lc) <= f.fenceAfter
+}
+
+// WriteForwardTarget names the primary writer a write that reaches this
+// standby writer is forwarded to, instead of refusing it (#1270). It answers
+// only when this node may trust its view: a Pattern 1 writer in steady contact
+// with the leader, not held by a stream takeover gate (claimed, announcing, a
+// DELETE acknowledgement) — those keep their 503 — and the designated primary
+// is another node, healthy, with an API address. Never derived from a refusal
+// error, and counts nothing.
+func (c *Coordinator) WriteForwardTarget() (*Node, bool) {
+	if c.cfg.SharedStorageMode || c.raftNode == nil || c.localNode == nil || c.localNode.Role != RoleWriter {
+		return nil, false
+	}
+	// The designation first: on the primary (every write it takes) this is
+	// the only check that runs.
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return nil, false
+	}
+	d := fsm.PrimaryWriterIDFast()
+	if d == "" || d == c.localNode.ID {
+		return nil, false
+	}
+	if c.claimedExit.Load() || c.takeoverGateClosed() || c.deleteAckOwed() {
+		return nil, false
+	}
+	f := c.ingestFence.Load()
+	if f == nil || !f.inSteadyContact() {
+		return nil, false
+	}
+	n, ok := c.registry.Get(d)
+	if !ok || n.Role != RoleWriter || !n.IsHealthy() || n.APIAddress == "" {
+		return nil, false
+	}
+	return n, true
+}
+
 // gate is the ArrowBuffer ingest gate.
 func (f *ingestFence) gate() error {
 	if !f.fenced.Load() {
 		return nil
 	}
-	metrics.Get().IncIngestFencedWrites()
-	reason, _ := f.reason.Load().(string)
-	return fmt.Errorf("%w: %s", ingest.ErrIngestFenced, reason)
+	r := f.refusal.Load()
+	if r == nil { // fenced is stored after refusal; not reachable
+		return ingest.ErrIngestFenced
+	}
+	return fmt.Errorf("%w: %w", ingest.ErrIngestFenced, r)
 }
+
+// Refusal reasons, the label of arc_cluster_ingest_fenced_writes_total and
+// the key refusals are logged by (#1268); defined in ingest, which the API and
+// MQTT share. A standby writer refusing is its normal state; contact, claimed
+// and delete_ack on the primary are not.
+const (
+	RefusalContact       = ingest.RefusalContact
+	RefusalStandby       = ingest.RefusalStandby
+	RefusalClaimed       = ingest.RefusalClaimed
+	RefusalAnnouncing    = ingest.RefusalAnnouncing
+	RefusalNotDesignated = ingest.RefusalNotDesignated
+	RefusalDeleteAck     = ingest.RefusalDeleteAck
+)
+
+// IngestRefusalReason is ingest.RefusalReason.
+func IngestRefusalReason(err error) string { return ingest.RefusalReason(err) }
 
 // startIngestFenceLocked builds and runs the fence where a primary is elected:
 // Raft with local storage. The contact rule also needs automatic failover. The
@@ -285,23 +367,32 @@ func (c *Coordinator) startIngestFenceLocked() {
 // It admits everything until (and unless) the fence starts. Lock-free.
 func (c *Coordinator) IngestGate() func() error {
 	return func() error {
-		if c.claimedExit.Load() {
-			return fmt.Errorf("%w: %w", ingest.ErrIngestFenced, errTakeoverClaimed)
+		err := c.ingestRefusal()
+		if err != nil {
+			metrics.Get().IncIngestFencedWrites(IngestRefusalReason(err))
 		}
-		if c.takeoverGateClosed() {
-			return fmt.Errorf("%w: %w", ingest.ErrIngestFenced, errTakeoverAnnouncing)
-		}
-		if c.takeoverDesignationRefuses() {
-			return fmt.Errorf("%w: %w", ingest.ErrIngestFenced, errNotDesignated)
-		}
-		if c.deleteAckOwed() {
-			return fmt.Errorf("%w: %w", ingest.ErrIngestFenced, errDeleteAckPending)
-		}
-		if f := c.ingestFence.Load(); f != nil {
-			return f.gate()
-		}
-		return nil
+		return err
 	}
+}
+
+// ingestRefusal is IngestGate's check, uncounted.
+func (c *Coordinator) ingestRefusal() error {
+	if c.claimedExit.Load() {
+		return fmt.Errorf("%w: %w", ingest.ErrIngestFenced, errTakeoverClaimed)
+	}
+	if c.takeoverGateClosed() {
+		return fmt.Errorf("%w: %w", ingest.ErrIngestFenced, errTakeoverAnnouncing)
+	}
+	if c.takeoverDesignationRefuses() {
+		return fmt.Errorf("%w: %w", ingest.ErrIngestFenced, errNotDesignated)
+	}
+	if c.deleteAckOwed() {
+		return fmt.Errorf("%w: %w", ingest.ErrIngestFenced, errDeleteAckPending)
+	}
+	if f := c.ingestFence.Load(); f != nil {
+		return f.gate()
+	}
+	return nil
 }
 
 // OnIngestFenceChange registers fn to run (in its own goroutine) whenever the

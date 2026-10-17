@@ -47,7 +47,7 @@ func stagedRig(t *testing.T) *stagedRigT {
 	t.Cleanup(func() { _ = b.Close() })
 	c.storage = b
 	c.cfg.ReplicationEnabled = true
-	c.staged = stagedReplica{fetching: map[string]bool{}, wake: make(chan struct{}, 1), goneSince: map[string]time.Time{}}
+	c.staged = stagedReplica{fetching: map[string]bool{}, wake: make(chan struct{}, 1), finisherWake: make(chan struct{}, 1), finishing: map[string]bool{}, goneSince: map[string]time.Time{}}
 	c.staged.replicaReady.Store(true)
 	all := []string{raft.CapabilityCompactionCommit}
 	capNodes(t, c, map[string][]string{"raft-1": all, "writer-1": all, "writer-2": all,
@@ -635,5 +635,28 @@ func TestManifestHotFiles(t *testing.T) {
 	got := r.c.ManifestHotFiles("testdb", "cpu")
 	if len(got) != 1 || got[0].Path != a.Path {
 		t.Fatalf("got %+v", got)
+	}
+}
+
+// A staged output moved into place is recorded for what it holds, so the next
+// walk trusts it without hashing (#1182).
+func TestAdoptedStagedOutputIsRecorded(t *testing.T) {
+	r := stagedRig(t)
+	r.c.cfg.RaftDataDir = t.TempDir()
+	seen, err := openSeenLocal(r.c.cfg.RaftDataDir, r.c.cfg.ClusterName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(seen.close)
+	r.c.stale.seen.Store(seen)
+	r.c.stale.base = r.root
+	job := r.job("j1")
+	r.commitJob(job)
+	e, _ := r.c.raftNode.FSM().GetFile(job.Output.Path)
+	if ok, err := r.c.adoptStaged(context.Background(), e); !ok || err != nil {
+		t.Fatalf("adopt: %v %v", ok, err)
+	}
+	if rec, ok := seen.get(job.Output.Path); !ok || rec.sha != shaPrefix(e.SHA256) {
+		t.Fatalf("record %+v %v, want the output's checksum", rec, ok)
 	}
 }

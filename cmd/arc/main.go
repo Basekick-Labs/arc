@@ -261,6 +261,12 @@ func main() {
 		log.Fatal().Msg("Arc was built without -tags=duckdb_arrow; refusing to start. The Arrow query path is required: rebuild with `make build` (or `go build -tags=duckdb_arrow ./cmd/arc`).")
 	}
 
+	// The WAL reserve file (#676), before anything writes to the data volume
+	// (the staged restores below, SQLite, the registration journal, the WAL
+	// header): on a full volume it is released so this start has room, and
+	// with the WAL or its disk gate turned off it is removed.
+	prepareWALReserveAtBoot(cfg, logger.Get("wal"))
+
 	// Apply staged metadata restores BEFORE anything opens the SQLite
 	// databases (#635): the restore API only stages; the swap happens here,
 	// where no connection, pool, or sidecar can be live. The same paths are
@@ -997,6 +1003,7 @@ func main() {
 	// Initialize WAL writer (if enabled) - recovery happens after ArrowBuffer is ready
 	var walWriter *wal.Writer
 	var walRecovery *wal.Recovery
+	var walDisk *wal.DiskMonitor
 	if cfg.WAL.Enabled {
 		var err error
 		walWriter, err = wal.NewWriter(&wal.WriterConfig{
@@ -1016,12 +1023,27 @@ func main() {
 		// Prepare recovery (will run after ArrowBuffer is created)
 		walRecovery = wal.NewRecovery(cfg.WAL.Directory, logger.Get("wal"))
 
-		log.Info().
+		// WAL volume disk pressure (#676): armed before the first write.
+		walDisk = startWALDiskMonitor(cfg, walWriter)
+		if walDisk != nil {
+			shutdownCoordinator.Register("wal-disk-monitor", walDisk, shutdown.PriorityWAL)
+		}
+
+		walLog := log.Info().
 			Str("directory", cfg.WAL.Directory).
 			Str("sync_mode", cfg.WAL.SyncMode).
 			Int("max_size_mb", cfg.WAL.MaxSizeMB).
 			Int("max_age_seconds", cfg.WAL.MaxAgeSeconds).
-			Msg("WAL enabled")
+			Bool("disk_pressure_enabled", walDisk != nil)
+		if walDisk != nil {
+			reserve, offPoint := walDisk.Levels()
+			walLog = walLog.
+				Int("disk_min_free_mb_configured", cfg.WAL.DiskMinFreeMB).
+				Int64("disk_reserve_bytes", reserve).
+				Int64("disk_pressure_off_bytes", offPoint).
+				Int("max_directory_mb", cfg.WAL.MaxDirectoryMB)
+		}
+		walLog.Msg("WAL enabled")
 	} else {
 		log.Info().Msg("WAL is DISABLED - data durability relies on immediate Parquet flushes")
 	}
@@ -1036,6 +1058,9 @@ func main() {
 	if walWriter != nil {
 		arrowBuffer.SetWAL(walWriter)
 	}
+	if walDisk != nil {
+		arrowBuffer.SetWALDiskGate(walDisk)
+	}
 	// Every file this node flushes is announced to the cluster manifest
 	// through the registration outbox (#1206, #1209), including startup WAL
 	// recovery below and MQTT ingest, which flush before the coordinator is
@@ -1044,6 +1069,12 @@ func main() {
 	registrationOutbox := newRegistrationOutbox(cfg, licenseHasClustering(licenseClient), logger.Get("file-registrar"))
 	if registrationOutbox != nil {
 		arrowBuffer.SetFileRegistrar(registrationOutbox)
+		// On a shared object store the writer publishes what it has pending
+		// for the orphan sweep, which runs on another node (#1214). Set
+		// before the hand-off or an abandon, which both publish.
+		if cluster.IsSharedObjectStore(storageBackend) {
+			registrationOutbox.SetPendingPublisher(storageBackend, cluster.ResolveNodeID(cfg.Cluster.NodeID))
+		}
 		// Refused registrations are parked out of the query path (#1207
 		// S4b); a move a crash interrupted is finished here.
 		if lb, ok := storageBackend.(*storage.LocalBackend); ok {
@@ -1309,7 +1340,24 @@ func main() {
 			bytesTicker := time.NewTicker(15 * time.Second)
 			defer bytesTicker.Stop()
 			walLogger := logger.Get("wal-maintenance")
-			var lastHeldWarn time.Time
+			purgePass := &walPurgePass{writer: walWriter, logger: walLogger}
+
+			// Prompt purge (#676): the writer hints on every rotation and
+			// floor release, and the purge runs here, at most once a second
+			// with a trailing pass, so it never interleaves with the
+			// recovery pass below. The periodic tick stays as a backstop.
+			// The directory-size sample stays on its own ticker.
+			var purgeHint <-chan struct{}
+			if walWriter != nil {
+				purgeHint = walWriter.PurgeHint()
+			}
+			promptPurge := newWALPurgeLimiter(walPromptPurgeInterval, purgePass.prompt)
+			defer promptPurge.stop()
+			// One pass at start: files startup recovery retained, and flush
+			// proof it unpinned (#1222), need not wait for the first rotation.
+			if walWriter != nil {
+				promptPurge.hint()
+			}
 
 			for {
 				select {
@@ -1317,6 +1365,10 @@ func main() {
 					return
 				case <-bytesTicker.C:
 					updateWALDirectoryBytes()
+				case <-purgeHint:
+					promptPurge.hint()
+				case <-promptPurge.trailing():
+					promptPurge.fire()
 				case <-ticker.C:
 					if arrowBuffer.HasFlushFailure() {
 						// Storage failure detected — replay WAL files to recover data
@@ -1432,6 +1484,9 @@ func main() {
 							}
 						}
 						updateWALDirectoryBytes()
+						// Recovery may have deleted earlier process files
+						// that pinned this process's flush proof (#1222).
+						promptPurge.hint()
 					} else {
 						// Tracked files are reclaimed below the durable sequence
 						// floor. Files outside that floor remain for recovery; age
@@ -1447,16 +1502,7 @@ func main() {
 					// Files recovery retained for the registration hold
 					// (#1207 S4c) go once their batches are registered.
 					if walWriter != nil {
-						if _, err := walWriter.ReleaseRetained(); err != nil {
-							walLogger.Error().Err(err).Msg("Releasing retained WAL files failed")
-						}
-						held := walWriter.HeldFiles()
-						metrics.Get().SetWALHeldFiles(int64(held))
-						if held > 0 && time.Since(lastHeldWarn) >= 10*time.Minute {
-							lastHeldWarn = time.Now()
-							walLogger.Warn().Int("files", held).
-								Msg("WAL files are kept until the files their batches were flushed into are registered; the WAL grows while registrations cannot land (see arc_cluster_file_registration_oldest_pending_seconds)")
-						}
+						purgePass.releaseRetained()
 					}
 				}
 			}
@@ -1627,7 +1673,13 @@ func main() {
 		}
 
 		// Create subscription manager
-		mqttManager = mqtt.NewSubscriptionManager(mqttRepo, encryptor, arrowBuffer, logger.Get("mqtt"))
+		subscriptionManager := mqtt.NewSubscriptionManager(mqttRepo, encryptor, arrowBuffer, logger.Get("mqtt"))
+		mqttManager = subscriptionManager
+		// Subscriptions wait at the broker while the WAL volume is under disk
+		// pressure (#676), as while writes are fenced.
+		if walDisk != nil {
+			walDisk.OnChange(subscriptionManager.SetWALDiskPressure)
+		}
 
 		// Start manager (loads and starts auto_start subscriptions). On a
 		// cluster node it starts after the coordinator, so its writes pass the
@@ -1683,9 +1735,11 @@ func main() {
 	}
 	// Phase 4: completion-manifest directory used by the cluster-mode
 	// subprocess → parent handoff. Empty in OSS (nil gate is what disables
-	// the handoff inside job.go via clusterMode()). Populated only when
-	// clustering + peer replication are BOTH enabled — that's when readers
-	// actually need the Raft manifest update to pull the compacted file.
+	// the handoff inside job.go via clusterMode()). Set on every cluster
+	// node (completionDirFor): the watcher keeps the Raft manifest in step
+	// with compaction, which readers pulling the compacted file need under
+	// replication, and the DELETE scan set and the staged compaction commit
+	// need on shared storage too (#1207).
 	//
 	// Security: explicitly create the base TempDirectory with 0700 perms
 	// BEFORE the inner .completion/pending subdirs. os.MkdirAll would
@@ -1693,17 +1747,10 @@ func main() {
 	// letting a co-located attacker inject completion manifests before the
 	// inner dir's 0700 closes the window. This is a no-op when the dir
 	// already exists with correct perms.
-	completionDir := ""
-	if cfg.Cluster.Enabled && cfg.Cluster.ReplicationEnabled {
+	completionDir := completionDirFor(cfg)
+	if completionDir != "" {
 		if err := os.MkdirAll(cfg.Compaction.TempDirectory, 0o700); err != nil {
 			log.Fatal().Err(err).Str("dir", cfg.Compaction.TempDirectory).Msg("Failed to create compaction temp directory with 0700 perms")
-		}
-		// Honor an explicit compaction.completion_dir override if set;
-		// otherwise derive under {temp_directory}/.completion/pending.
-		if cfg.Compaction.CompletionDir != "" {
-			completionDir = cfg.Compaction.CompletionDir
-		} else {
-			completionDir = filepath.Join(cfg.Compaction.TempDirectory, ".completion", "pending")
 		}
 	}
 	if cfg.Compaction.Enabled {
@@ -2062,6 +2109,11 @@ func main() {
 					// received bytes. Must be set before Start — the puller is
 					// constructed inside Start when ReplicationEnabled is true.
 					clusterCoordinator.SetStorageBackend(storageBackend)
+					// The standby store's free-space reserve stays above the
+					// WAL disk gate's off-point (#676).
+					if walDisk != nil {
+						clusterCoordinator.SetWALDiskOffPoint(walDiskOffPoint(cfg))
+					}
 
 					// The cluster-wide compaction pause (#1087), wired BEFORE
 					// Start on every cluster node: a pause replayed from the
@@ -2115,6 +2167,7 @@ func main() {
 							completionWatcher = watcher
 							if compactionManager != nil {
 								watcher.SetStagedObservers(compactionManager.BeforeStagedCommit, compactionManager.FinishStaged)
+								watcher.SetStagedFinished(compactionManager.StagedFinished)
 								compactionManager.SetStagedCommit(clusterCoordinator.StagedCompactionMode,
 									clusterCoordinator.CompactionInputLookup, watcher.LocallyStagedInput)
 							}
@@ -2175,25 +2228,21 @@ func main() {
 						})
 						registrationOutbox.SetSendGate(clusterCoordinator.TakeoverSendGate())
 					}
+					// A DELETE in shared storage asks every node to flush its
+					// buffered rows of the scope first (#1265). Before Start, so
+					// no request finds the node without its buffer.
+					clusterCoordinator.SetDeleteScopeFlusher(deleteFlusher(arrowBuffer, walWriter))
 					if err := clusterCoordinator.Start(); err != nil {
 						log.Error().Err(err).Msg("Failed to start cluster coordinator - running in standalone mode")
 						arrowBuffer.SetIngestGate(nil)
 						clusterCoordinator = nil
 					} else {
-						// Two steps. The inbound replication stream applies entries
-						// through the ingest handler, so it must be gone before the
-						// Arrow buffer and WAL close (#853); those are components,
-						// every hook runs before any component, and PriorityIngest
-						// puts it with the other ingest paths. The coordinator
-						// itself is a COMPONENT: it owns Raft and must outlive the
-						// arrow-buffer flush and the file-registrar drain, which are
-						// components too (#1014). The schedulers that ask it whether
-						// they may run are hooks at PriorityScheduler, so they have
-						// already quiesced by the time any component runs.
-						shutdownCoordinator.RegisterHook("cluster-replication-receiver", func(context.Context) error {
-							clusterCoordinator.StopReplicationReceiver()
-							return nil
-						}, shutdown.PriorityIngest)
+						// The coordinator is a COMPONENT: it owns Raft and must
+						// outlive the arrow-buffer flush and the file-registrar
+						// drain, which are components too (#1014). The schedulers
+						// that ask it whether they may run are hooks at
+						// PriorityScheduler, so they have already quiesced by the
+						// time any component runs.
 						registerClusterCoordinatorShutdown(shutdownCoordinator, clusterCoordinator.Stop)
 
 						localNode := clusterCoordinator.GetLocalNode()
@@ -2290,18 +2339,6 @@ func main() {
 							}
 						}
 
-						// WAL replication stream. StartReplication starts nothing
-						// until the standby-writer stream lands (#888, #1207) and
-						// logs that itself; the file puller that feeds readers is
-						// started by the coordinator regardless.
-						if cfg.Cluster.ReplicationEnabled && walWriter != nil {
-							clusterCoordinator.SetWAL(walWriter)
-							clusterCoordinator.SetIngestBuffer(arrowBuffer)
-							if err := clusterCoordinator.StartReplication(); err != nil {
-								log.Warn().Err(err).Msg("Failed to start WAL replication")
-							}
-						}
-
 						// Wire up peer file replication (Enterprise Phase 1 + Phase 2).
 						//
 						// Phase 1 — the registrar is non-blocking: it enqueues file
@@ -2321,9 +2358,12 @@ func main() {
 						// component, so a hook here would stop before the buffer
 						// flushed — that was #1014):
 						//   arrow-buffer        (30) — final flush, enqueues each file
-						//   file-registrar      (31) — drains the queue into Raft
+						//   file-registrar      (31) — drains the queue into Raft, then
+						//                              publishes what is still pending
+						//                              (shared object store, #1214)
 						//   wal-purge           (35) — removes the WAL those files cover
-						//   cluster-coordinator (50) — puller.Stop(), then raftNode.Stop()
+						//   cluster-coordinator (50) — leave broadcast, puller.Stop(),
+						//                              then raftNode.Stop()
 						//
 						// Raft outlives the final flush, so the last files land in
 						// the manifest; registerClusterCoordinatorShutdown and
@@ -2335,6 +2375,12 @@ func main() {
 						case registrationOutbox != nil && clusterCoordinator.HasRaft():
 							registrationOutbox.HandOff(clusterCoordinator, storageBackend, clusterCoordinator.LocalNodeID())
 							registerFileRegistrarShutdown(shutdownCoordinator, registrationOutbox.Stop)
+							// The orphan sweep asks this node what it has pending
+							// registration (#1214).
+							clusterCoordinator.SetPendingRegistrations(registrationOutbox.PendingPaths)
+							// Nor does it leave the cluster at shutdown while files
+							// pending here are in no published list (#1214).
+							clusterCoordinator.SetLeaveGate(registrationOutbox.CoverForLeave)
 							log.Info().Msg("Cluster file manifest registration outbox started")
 							// #1207 S3: with cluster.wal_coverage, stream committed
 							// batches to standby writers and keep their copy. After
@@ -2360,6 +2406,12 @@ func main() {
 						}
 						// A reader or compactor gets no registrar: nothing it
 						// flushes should be announced (#888, #1206).
+
+						// The stale-local sweep (#1071) may run from here: a
+						// path waiting to register in this writer's outbox is
+						// never a stale copy. Nil elsewhere: nothing waits.
+						// It also reports what each flushed file holds (#1182).
+						clusterCoordinator.AttachStaleLocalOutbox(registrationOutbox)
 
 						// Phase 5: wire the dynamic compaction gate to the coordinator
 						// so CanCompact() checks the FSM's active compactor lease
@@ -2989,6 +3041,7 @@ func main() {
 			Index:        hubIndex,
 			Logger:       logger.Get("edgesync"),
 			RegisterFile: registerFile,
+			HoldPath:     edgeSyncHoldPath(clusterCoordinator),
 			RecordActivity: func(ctx context.Context, spokeID string, files, bytes int64) {
 				// Best-effort: a failed counter update must not fail a
 				// verified transfer, so this logs and returns.
@@ -3104,6 +3157,7 @@ func main() {
 				Index:        hubIndex,
 				Logger:       importLogger,
 				RegisterFile: collector.Register,
+				HoldPath:     edgeSyncHoldPath(clusterCoordinator),
 				RecordActivity: func(ctx context.Context, spokeID string, files, bytes int64) {
 					if err := spokeRegistry.RecordActivity(ctx, spokeID, files, bytes); err != nil {
 						importLogger.Warn().Err(err).Str("spoke_id", spokeID).
@@ -3162,6 +3216,7 @@ func main() {
 				HubID:         cfg.EdgeSync.HubID,
 				MaxFiles:      cfg.EdgeSync.Import.MaxFiles,
 				FlushManifest: flushManifest,
+				HoldPaths:     edgeSyncHoldPaths(clusterCoordinator),
 				Logger:        importLogger,
 			})
 			if err != nil {
@@ -3621,6 +3676,7 @@ func main() {
 		if router != nil {
 			msgpackHandler.SetRouter(router)
 			lineProtocolHandler.SetRouter(router)
+			importHandler.SetRouter(router)
 			tleHandler.SetRouter(router)
 			queryHandler.SetRouter(router)
 			log.Info().Msg("Cluster router wired to API handlers for request forwarding")
@@ -3921,7 +3977,7 @@ func main() {
 	}
 	// A DELETE flushes the rows acknowledged before it first, so it sees them
 	// in files (#1207 d1).
-	deleteHandler.SetFlusher(arrowBuffer)
+	deleteHandler.SetFlusher(deleteFlusher(arrowBuffer, walWriter))
 	deleteHandler.RegisterRoutes(server.GetApp())
 	if clusterCoordinator != nil {
 		deleteHandler.SetCoordinator(clusterCoordinator)
@@ -3941,7 +3997,7 @@ func main() {
 	// Register Databases handler
 	databasesHandler := api.NewDatabasesHandler(storageBackend, &cfg.Delete, authManager, logger.Get("databases"))
 	databasesHandler.SetFieldSchema(fieldSchemaRegistry)
-	databasesHandler.SetFlusher(arrowBuffer)
+	databasesHandler.SetFlusher(deleteFlusher(arrowBuffer, walWriter))
 	if registrationOutbox != nil {
 		databasesHandler.SetPendingRegistrations(registrationOutbox)
 	}
@@ -4243,6 +4299,19 @@ func main() {
 			// A committed compaction output moving into place here is not an
 			// orphan entry (#1207 d2a2a).
 			reconciler.SetHeldFilter(clusterCoordinator.CompactionOutputHeld)
+			reconciler.SetCompactionOwnedFilter(clusterCoordinator.CompactionOwns)
+			// On a shared object store the sweep runs on the active
+			// compactor, which has no outbox: what the writers have pending,
+			// asked of each and read from their published lists, is not an
+			// orphan, and a writer that cannot tell holds the sweep (#1214).
+			// The reconciler uses it only with BackendShared.
+			reconciler.SetRemotePendingSource(func(ctx context.Context) reconciliation.RemotePending {
+				paths, held := clusterCoordinator.PendingRegistrationsElsewhere(ctx)
+				return reconciliation.RemotePending{Paths: paths, Held: held}
+			})
+			// A compaction output manifest repair adopts is not an orphan
+			// either, whichever of the two gets to it first (#1214).
+			reconciler.SetAdoptableFilter(clusterCoordinator.AdoptableObject)
 		}
 		if err != nil {
 			log.Error().Err(err).Msg("Failed to create reconciler — feature disabled")
@@ -4627,6 +4696,13 @@ func main() {
 
 	// Register Tiering API handlers (always register, handlers check if manager is nil)
 	if tieringManager != nil {
+		if clusterCoordinator != nil {
+			// The manifest repair never registers, and the stale-local
+			// sweep never removes, a path tiering records as cold: a hot
+			// copy its delete missed (#1207, #1071). A metadata error
+			// answers cold: both then leave the path alone.
+			clusterCoordinator.SetColdPathCheck(tierColdCheck(tieringManager.GetMetadata().GetFile))
+		}
 		if retentionHandler != nil {
 			retentionHandler.SetTieringManager(tieringManager)
 		}
@@ -5158,31 +5234,16 @@ func createWALRecoveryCallback(arrowBuffer *ingest.ArrowBuffer, walLogger zerolo
 			return nil
 		}
 		for _, rec := range records {
-			// Extract measurement from recovered record
-			// WAL row format uses underscore-prefixed keys: _measurement, _database
-			measurement, _ := rec["_measurement"].(string)
-			if measurement == "" {
-				measurement, _ = rec["measurement"].(string)
-			}
-			if measurement == "" {
-				measurement, _ = rec["m"].(string)
-			}
+			database, measurement := ingest.WALRowTarget(rec)
 			if measurement == "" {
 				continue // Skip records without measurement
 			}
 
-			database, _ := rec["_database"].(string)
-			if database == "" {
-				database, _ = rec["database"].(string)
-			}
-			if database == "" {
-				database = "default"
-			}
-
-			// Build columnar record from recovered data
+			// Build columnar record from recovered data: the same columns
+			// WALRowsToColumns reads (target keys left out).
 			columns := make(map[string][]interface{})
 			for key, value := range rec {
-				if key == "_measurement" || key == "measurement" || key == "m" || key == "_database" || key == "database" {
+				if ingest.IsWALRowTargetKey(rec, key) {
 					continue
 				}
 				columns[key] = []interface{}{value}
@@ -5319,6 +5380,22 @@ func licenseHasClustering(lc *license.Client) bool {
 	return lic != nil && lic.HasFeature(license.FeatureClustering)
 }
 
+// completionDirFor is the compaction completion-manifest directory of a
+// cluster node, "" outside a cluster. Every cluster node gets one, whatever
+// its storage: until #1207 only replication did, so on shared storage no
+// watcher ran and compaction never updated the cluster manifest (outputs
+// unregistered, consumed inputs still listed). An explicit
+// compaction.completion_dir wins over {temp_directory}/.completion/pending.
+func completionDirFor(cfg *config.Config) string {
+	if !cfg.Cluster.Enabled {
+		return ""
+	}
+	if cfg.Compaction.CompletionDir != "" {
+		return cfg.Compaction.CompletionDir
+	}
+	return filepath.Join(cfg.Compaction.TempDirectory, ".completion", "pending")
+}
+
 // newRegistrationOutbox builds the outbox that announces this node's flushed
 // files to the cluster manifest (#1206, #1209), or returns nil where nothing
 // would ever drain it: no cluster, no clustering licence, or no Raft manifest.
@@ -5338,6 +5415,28 @@ func newRegistrationOutbox(cfg *config.Config, clusteringLicensed bool, logger z
 		return nil
 	}
 	return r
+}
+
+// The coordinator is what a DELETE asks to flush the other nodes (#1265).
+var _ api.PeerFlusher = (*cluster.Coordinator)(nil)
+
+// noWALDeleteFlusher is the ingest buffer of a node without a WAL as a
+// DELETE's flush sees it. A DELETE refuses while an earlier flush failure is
+// outstanding because those rows wait for WAL recovery, which would bring
+// them back after it. Without a WAL there is no recovery: the rows of a
+// failed flush are gone, and the latch, which only recovery clears, would
+// refuse every DELETE on this node, and in shared storage on every node,
+// until a restart.
+type noWALDeleteFlusher struct{ *ingest.ArrowBuffer }
+
+func (noWALDeleteFlusher) HasFlushFailure() bool { return false }
+
+// deleteFlusher is the buffer a DELETE flushes before it scans.
+func deleteFlusher(buffer *ingest.ArrowBuffer, walWriter *wal.Writer) cluster.DeleteScopeFlusher {
+	if walWriter == nil {
+		return noWALDeleteFlusher{buffer}
+	}
+	return buffer
 }
 
 // walCoverageHold returns the registration hold source for the WAL (#1207
@@ -5449,6 +5548,10 @@ func (a *tieringManifestAdapter) ManifestEntriesByDatabase(database string) []st
 		}
 	}
 	return paths
+}
+
+func (a *tieringManifestAdapter) CompactionOwns(path string) bool {
+	return a.coordinator.CompactionOwns(path)
 }
 
 func (a *tieringManifestAdapter) ManifestEntry(path string) (int64, bool) {
@@ -5668,6 +5771,16 @@ type backupClusterManifest struct {
 	coordinator *cluster.Coordinator
 }
 
+// StagedOutputKey and CompactionOwns: committed object-store compactions
+// (#1207 d2a2b), see backup.StagedOutputs.
+func (b *backupClusterManifest) StagedOutputKey(path string) (string, bool) {
+	return b.coordinator.StagedOutputKey(path)
+}
+
+func (b *backupClusterManifest) CompactionOwns(path string) bool {
+	return b.coordinator.CompactionOwns(path)
+}
+
 // errNoRaftManifest is returned by every write when the coordinator has no
 // Raft manifest, instead of the coordinator's own nil-success.
 var errNoRaftManifest = errors.New("cluster coordinator has no Raft file manifest (cluster.raft_data_dir unset)")
@@ -5732,7 +5845,13 @@ func (b *backupClusterManifest) PauseCompaction(ctx context.Context, reason stri
 // commits go through a watcher) and the watcher is nil, its construction
 // failed: the node then NEVER reports idle, because nothing can tell whether
 // a phase-2 commit is pending, and the restore times out naming it.
-func newCompactionQuiescer(coordinator *cluster.Coordinator, manager *compaction.Manager, watcher *compaction.CompletionWatcher, expectWatcher bool, logger zerolog.Logger) func(ctx context.Context) error {
+// quiescerCluster is the coordinator's side of the quiescer.
+type quiescerCluster interface {
+	CompactionPaused() bool
+	FinalizingCompactions() int
+}
+
+func newCompactionQuiescer(coordinator quiescerCluster, manager *compaction.Manager, watcher *compaction.CompletionWatcher, expectWatcher bool, logger zerolog.Logger) func(ctx context.Context) error {
 	return func(ctx context.Context) error {
 		if expectWatcher && watcher == nil {
 			return errors.New("compaction completion watcher not available on this node, so its pending compaction commits cannot be checked; the node will not acknowledge the pause")
@@ -5745,6 +5864,12 @@ func newCompactionQuiescer(coordinator *cluster.Coordinator, manager *compaction
 				return errors.New("the compaction pause ended before this node quiesced")
 			}
 			idle := manager == nil || !manager.IsCycleRunning()
+			// A committed object-store compaction drains through the pause:
+			// its finisher deletes input objects a restore may bring back
+			// (#1207 d2a2b). Any node's job counts, its compactor may be gone.
+			if idle && coordinator != nil && coordinator.FinalizingCompactions() > 0 {
+				idle = false
+			}
 			if idle {
 				if w := watcher; w != nil {
 					sourcesDeleted, outputWritten, err := w.PendingCommits()
@@ -5769,6 +5894,9 @@ func newCompactionQuiescer(coordinator *cluster.Coordinator, manager *compaction
 				detail := "a compaction cycle is still running"
 				if manager == nil || !manager.IsCycleRunning() {
 					detail = "sources_deleted completion manifests are still pending"
+					if coordinator != nil && coordinator.FinalizingCompactions() > 0 {
+						detail = "committed compactions are still being finished"
+					}
 				}
 				return fmt.Errorf("compaction did not quiesce before the deadline (%s): %w", detail, ctx.Err())
 			case <-ticker.C:
@@ -5910,5 +6038,31 @@ func applyManifestBatchWithRetry(ctx context.Context, apply func(context.Context
 			return err
 		case <-timer.C:
 		}
+	}
+}
+
+// edgeSyncHoldPath keeps a cluster node's stale-local sweep away from a path
+// edge sync is about to register (#1071); nil without a coordinator.
+func edgeSyncHoldPath(c *cluster.Coordinator) func(string) func() {
+	if c == nil {
+		return nil
+	}
+	return func(path string) func() { return c.HoldLocalPaths([]string{path}) }
+}
+
+// edgeSyncHoldPaths is edgeSyncHoldPath for a whole bundle import.
+func edgeSyncHoldPaths(c *cluster.Coordinator) func([]string) func() {
+	if c == nil {
+		return nil
+	}
+	return c.HoldLocalPaths
+}
+
+// tierColdCheck answers whether tiering records path as cold on this node; a
+// metadata error answers cold, so callers leave the path alone.
+func tierColdCheck(get func(ctx context.Context, path string) (*tiering.FileMetadata, error)) func(context.Context, string) bool {
+	return func(ctx context.Context, path string) bool {
+		f, err := get(ctx, path)
+		return err != nil || (f != nil && f.Tier == tiering.TierCold)
 	}
 }

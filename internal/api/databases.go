@@ -706,6 +706,39 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 			"error": "database deletion rejected: " + err.Error() + "; retry shortly",
 		})
 	}
+	// In shared storage the other nodes flush their buffered rows of the
+	// database first (#1265), under a deadline of their own: the request's
+	// storage deadline is spent by the local flush.
+	fctx, fcancel := h.storageContext(c, deletePeerFlushBudget)
+	unflushed, err := flushPeersBeforeDelete(fctx, h.coordinator, name, "", c.QueryBool("allow_unreachable"))
+	fcancel()
+	if err != nil {
+		c.Set(fiber.HeaderRetryAfter, "30")
+		body := fiber.Map{"error": "database deletion rejected: " + err.Error()}
+		if len(unflushed) > 0 {
+			body["unflushed_nodes"] = unflushed
+		}
+		return c.Status(fiber.StatusServiceUnavailable).JSON(body)
+	}
+	// The local flush may have spent the storage deadline: a new one from here.
+	cancel()
+	ctx, cancel = h.storageContext(c, h.requestTimeout)
+	// Before anything changes: another writer's flush still on its way to the
+	// manifest, deleted now, would be registered after it is gone (#1265). A
+	// retry finds it registered.
+	preListed, fresh, err := h.peerFlushesInFlight(ctx, name)
+	if err != nil {
+		h.logger.Error().Err(err).Str("database", name).Msg("Failed to list database files")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to list database files",
+		})
+	}
+	if len(fresh) > 0 {
+		c.Set(fiber.HeaderRetryAfter, "5")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": fmt.Sprintf("database deletion not run: %d file(s) another writer flushed are not registered in the cluster manifest yet (first: %s); retry shortly", len(fresh), fresh[0]),
+		})
+	}
 	var recordID uint64
 	if rec := recorderOf(h.coordinator); rec != nil {
 		if recordID, err = rec.RecordDelete(ctx, name, "", "", marks); err != nil {
@@ -734,6 +767,7 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 			"error": "Failed to list database files",
 		})
 	}
+	files = h.withoutLateFlushes(ctx, name, files, preListed)
 	var manifestEntries []*raft.FileEntry
 	if h.coordinator != nil && h.tieringManager == nil {
 		// The snapshot below is this node's FSM, which can trail the leader;
@@ -893,7 +927,7 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		Int("files_deleted", deletedCount).
 		Msg("Deleted database")
 
-	return c.JSON(fiber.Map{
+	resp := fiber.Map{
 		"message":       "Database '" + name + "' deleted successfully",
 		"files_deleted": deletedCount,
 		// Broken out because a single total cannot distinguish a hot sweep
@@ -901,7 +935,96 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		// part an operator wants to see (#1091).
 		"hot_files_deleted":  len(hotDeleted),
 		"cold_files_deleted": coldDeletedCount,
-	})
+	}
+	if len(unflushed) > 0 {
+		// allow_unreachable: the rows these nodes hold were left.
+		resp["unflushed_nodes"] = unflushed
+	}
+	return c.JSON(resp)
+}
+
+// deletePeerFlushBudget bounds the flush a database deletion asks of the
+// other nodes in shared storage (#1265): their flush, then the registration
+// of what they flushed.
+var deletePeerFlushBudget = 90 * time.Second
+
+// databaseFileHolder is the registration outbox's view of a file it holds.
+type databaseFileHolder interface {
+	HoldsRegistration(path string) bool
+}
+
+// unregisteredFlush reports a Parquet file of a shared object store no
+// manifest entry covers, no compaction owns, and younger than
+// unregisteredFreshAge: a writer's flush its outbox may register without
+// looking at it again (#1265).
+func (h *DatabasesHandler) unregisteredFlush(ctx context.Context, path string) bool {
+	if !strings.HasSuffix(strings.ToLower(path), ".parquet") {
+		return false
+	}
+	if reg, ok := h.coordinator.(interface {
+		GetFileEntry(path string) (*raft.FileEntry, bool)
+	}); ok {
+		if _, listed := reg.GetFileEntry(path); listed {
+			return false
+		}
+	}
+	if so, ok := h.coordinator.(interface{ CompactionOwns(path string) bool }); ok && so.CompactionOwns(path) {
+		return false
+	}
+	age, known := objectAge(ctx, h.storage, path)
+	return known && age < unregisteredFreshAge
+}
+
+// peerFlushesInFlight lists the database in shared storage (nil elsewhere)
+// and returns, of what it lists, the files another writer flushed that are
+// not registered yet. This node's own pending files are not among them: the
+// deletion withdraws those.
+func (h *DatabasesHandler) peerFlushesInFlight(ctx context.Context, name string) (listed map[string]bool, fresh []string, err error) {
+	if !peerFlushOn(h.coordinator) || !sharedManifest(h.coordinator) {
+		return nil, nil, nil
+	}
+	if err := h.coordinator.SyncManifest(ctx); err != nil {
+		h.logger.Warn().Err(err).Str("database", name).Msg("Could not sync the manifest before checking for unregistered files; using this node's view")
+	}
+	files, err := h.storage.List(ctx, name+"/")
+	if err != nil {
+		return nil, nil, err
+	}
+	holder, _ := h.pending.(databaseFileHolder)
+	listed = make(map[string]bool, len(files))
+	for _, f := range files {
+		listed[f] = true
+		if holder != nil && holder.HoldsRegistration(f) {
+			continue
+		}
+		if h.unregisteredFlush(ctx, f) {
+			fresh = append(fresh, f)
+		}
+	}
+	return listed, fresh, nil
+}
+
+// withoutLateFlushes leaves out of the deletion the unregistered flushes
+// that appeared since peerFlushesInFlight listed the database: rows written
+// while it ran, whose writer would register the file after it is gone.
+func (h *DatabasesHandler) withoutLateFlushes(ctx context.Context, name string, files []string, listed map[string]bool) []string {
+	if listed == nil {
+		return files
+	}
+	kept := files[:0:0]
+	var late []string
+	for _, f := range files {
+		if !listed[f] && h.unregisteredFlush(ctx, f) {
+			late = append(late, f)
+			continue
+		}
+		kept = append(kept, f)
+	}
+	if len(late) > 0 {
+		h.logger.Warn().Str("database", name).Int("files", len(late)).Strs("sample", late[:min(len(late), 5)]).
+			Msg("Database deletion left files flushed while it ran and not registered yet; they hold rows written during the deletion")
+	}
+	return kept
 }
 
 // Helper functions

@@ -109,8 +109,8 @@ func (c *SQLTransformCache) Get(sql string) (string, bool) {
 }
 
 // GetWithMetadata retrieves a cached transformed SQL and its caller-owned
-// metadata if it exists and hasn't expired. The metadata is copied so cache
-// entries remain immutable after publication.
+// metadata if present. The returned metadata is copied so cache entries remain
+// immutable after publication.
 func (c *SQLTransformCache) GetWithMetadata(sql string) (string, []string, bool) {
 	shard := c.shardFor(sql)
 
@@ -137,8 +137,8 @@ func (c *SQLTransformCache) Set(sql, transformed string) {
 	c.SetWithMetadata(sql, transformed, nil)
 }
 
-// SetWithMetadata stores transformed SQL with immutable metadata that must
-// remain associated with the transform on cache hits.
+// SetWithMetadata stores transformed SQL with immutable metadata that remains
+// associated with the transform on cache hits.
 func (c *SQLTransformCache) SetWithMetadata(sql, transformed string, metadata []string) {
 	shard := c.shardFor(sql)
 

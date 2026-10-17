@@ -15,7 +15,7 @@ import (
 // Verify that its hook and the compiled stub keep identical signatures,
 // and that the native source retains its essential lifecycle wiring.
 func TestArcxArrowSourceWiring(t *testing.T) {
-	load := func(path, name string) (*ast.FuncDecl, string) {
+	load := func(path string) (*ast.FuncDecl, string) {
 		t.Helper()
 
 		fset := token.NewFileSet()
@@ -26,7 +26,7 @@ func TestArcxArrowSourceWiring(t *testing.T) {
 
 		for _, decl := range file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Name.Name != name {
+			if !ok || fn.Name.Name != "tryArcxRouterArrow" {
 				continue
 			}
 
@@ -37,12 +37,12 @@ func TestArcxArrowSourceWiring(t *testing.T) {
 			return fn, signature.String()
 		}
 
-		t.Fatalf("%s missing from %s", name, path)
+		t.Fatalf("tryArcxRouterArrow missing from %s", path)
 		return nil, ""
 	}
 
-	real, realSignature := load("arcx_hook.go", "tryArcxRouterArrow")
-	_, stubSignature := load("arcx_hook_stub.go", "tryArcxRouterArrow")
+	real, realSignature := load("arcx_hook.go")
+	_, stubSignature := load("arcx_hook_stub.go")
 
 	if realSignature != stubSignature {
 		t.Fatalf(
@@ -80,19 +80,31 @@ func TestArcxArrowSourceWiring(t *testing.T) {
 		}
 	}
 
-	queryHook, _ := load("arcx_hook.go", "tryArcxRouter")
-	queryCalls := make(map[string]bool)
-	ast.Inspect(queryHook.Body, func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		if fn, ok := call.Fun.(*ast.SelectorExpr); ok {
-			queryCalls[fn.Sel.Name] = true
-		}
-		return true
-	})
-	if !queryCalls["checkEmittedQueryPermissions"] {
-		t.Error("native arcx query hook does not recheck the resolved scope")
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "arcx_hook.go", nil, parser.AllErrors)
+	if err != nil {
+		t.Fatalf("parse arcx_hook.go: %v", err)
 	}
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "tryArcxRouter" {
+			continue
+		}
+		found := false
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			if selector, ok := call.Fun.(*ast.SelectorExpr); ok && selector.Sel.Name == "checkEmittedQueryPermissions" {
+				found = true
+			}
+			return true
+		})
+		if !found {
+			t.Error("native arcx query hook does not recheck the resolved scope")
+		}
+		return
+	}
+	t.Error("tryArcxRouter missing from arcx_hook.go")
 }

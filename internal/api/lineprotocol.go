@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -212,15 +213,23 @@ func (h *LineProtocolHandler) handleWrite(c *fiber.Ctx, database string, precisi
 			goto localProcessing
 		}
 		if err != nil {
-			h.logger.Error().Err(err).Msg("Failed to route write request")
+			if !errors.Is(err, cluster.ErrWriteForwardUnavailable) && !errors.Is(err, cluster.ErrWriteForwardAmbiguous) {
+				h.logger.Error().Err(err).Msg("Failed to route write request")
+			}
 			h.totalErrors.Add(1)
-			return HandleRoutingError(c, err)
+			return respondWriteForwardError(c, err)
 		}
 
 		return CopyResponse(c, resp)
 	}
 
 localProcessing:
+	// A standby writer forwards the write to the primary instead of refusing
+	// it, when the cluster names one it can trust (#1270). Before anything is
+	// read or written here.
+	if handled, err := forwardStandbyWrite(h.router, c); handled {
+		return err
+	}
 	// Shared decompressRequest (in tle.go) handles gzip/zstd/uncompressed
 	// dispatch with a hard 100MB output cap. CRITICAL invariants kept by
 	// that helper:
@@ -264,6 +273,12 @@ localProcessing:
 		})
 	}
 
+	if !h.buffer.HasDecimalColumns() {
+		return h.writeTyped(c, body, database, precision)
+	}
+
+	// Decimal columns (ingest.decimal_columns) are converted by the buffer's
+	// typing from any value: records, then that typing.
 	// Parse line protocol with timestamp precision
 	records := h.parser.ParseBatchWithPrecision(body, precision)
 
@@ -271,6 +286,27 @@ localProcessing:
 		h.totalErrors.Add(1)
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "No valid records in request",
+		})
+	}
+
+	// A point with a tag or field named "time" is dropped, and the rest are
+	// written, as InfluxDB does: a field would silently replace the
+	// timestamp, a tag would fail the write part-way. The answer is then a
+	// "partial write" 400.
+	droppedTime := 0
+	kept := records[:0]
+	for _, rec := range records {
+		if _, found := ingest.LPRecordTimeKey(rec); found {
+			droppedTime++
+			continue
+		}
+		kept = append(kept, rec)
+	}
+	records = kept
+	if len(records) == 0 {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("partial write: %d points dropped: a tag or field named \"time\" (time is the timestamp)", droppedTime),
 		})
 	}
 
@@ -303,18 +339,26 @@ localProcessing:
 		}
 	}
 
-	// Refuse the whole request up front if writes are fenced (#1207), rather
-	// than part-way through the measurements below.
-	if err := h.buffer.CheckIngestGate(); err != nil {
+	// Refuse the whole request up front if writes are fenced (#1207) or the
+	// WAL volume is under disk pressure (#676), rather than part-way through
+	// the measurements below. The admitted context skips the per-call disk
+	// pressure check, so pressure starting mid-request cannot split it.
+	writeCtx, release, err := h.buffer.AdmitRequest(c.Context(), int64(len(body)))
+	if err != nil {
 		h.totalErrors.Add(1)
-		return respondIngestFenced(c, err)
+		return respondWriteRefused(c, err)
 	}
+	defer release()
 
 	// Write each measurement to the buffer
 	for measurement, record := range columnarByMeasurement {
-		err := h.buffer.WriteColumnarRecord(c.Context(), database, record)
+		err := h.buffer.WriteColumnarRecord(writeCtx, database, record)
 		if err != nil {
 			h.totalErrors.Add(1)
+			// Logged by reason, not as an ingest error (#1268).
+			if ingest.IsWriteRefusal(err) {
+				return respondWriteRefused(c, err)
+			}
 			metrics.Get().IncIngestErrors()
 			h.logger.Error().
 				Err(err).
@@ -329,9 +373,6 @@ localProcessing:
 			// refused, not lost: the record is still in the WAL. 503 so the client
 			// retries (elsewhere, during a rolling restart) instead of treating a
 			// shutdown race as a permanent server error.
-			if errors.Is(err, ingest.ErrIngestFenced) {
-				return respondIngestFenced(c, err)
-			}
 			if errors.Is(err, ingest.ErrBufferClosing) {
 				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 					"error": "Write rejected (server shutting down): " + err.Error(),
@@ -357,8 +398,116 @@ localProcessing:
 	m.IncIngestBytes(int64(len(body)))
 	m.IncIngestBatches()
 
+	if droppedTime > 0 {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("partial write: %d points dropped: a tag or field named \"time\" (time is the timestamp); the other points were written", droppedTime),
+		})
+	}
+
 	// InfluxDB returns 204 No Content on success
 	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// writeTyped writes a line-protocol body parsed straight into typed columns
+// (no per-line maps or boxed values). Each column is typed by its first value
+// in the body, as before. A point that cannot be written as one row (a `time`
+// key, two keys landing in one column, a value that does not fit its column's
+// type) is dropped, the rest are written, and the answer is a "partial write"
+// 400, as InfluxDB does.
+func (h *LineProtocolHandler) writeTyped(c *fiber.Ctx, body []byte, database, precision string) error {
+	batches, rows, drops, err := h.parser.ParseLPWrite(body, precision)
+	if err != nil {
+		h.totalErrors.Add(1)
+		metrics.Get().IncIngestErrors()
+		h.logger.Error().Err(err).Str("database", database).Msg("Failed to parse line protocol")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Write failed: " + err.Error()})
+	}
+	dropped := 0
+	for _, d := range drops {
+		dropped += d.Points
+	}
+
+	total := 0
+	measurements := make([]string, 0, len(batches))
+	for m, n := range rows {
+		total += n
+		measurements = append(measurements, m)
+	}
+	if total == 0 {
+		h.totalErrors.Add(1)
+		if dropped > 0 {
+			h.logDrops(database, drops)
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": partialWriteMessage(drops, dropped, false)})
+		}
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "No valid records in request"})
+	}
+	sort.Strings(measurements)
+
+	h.totalRecords.Add(int64(total))
+
+	if h.rbacManager != nil { // not license-gated; see CheckWritePermissions
+		if err := h.checkWritePermissions(c, database, measurements); err != nil {
+			h.totalErrors.Add(1)
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": err.Error()})
+		}
+	}
+	// Validate measurement names (prevent control chars that break S3 XML responses)
+	for _, m := range measurements {
+		if !isValidMeasurementName(m) {
+			h.totalErrors.Add(1)
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": fmt.Sprintf("invalid measurement name %q: must start with a letter and contain only alphanumeric characters, underscores, or hyphens", m),
+			})
+		}
+	}
+
+	// Refuse the whole request up front if writes are fenced (#1207) or the
+	// WAL volume is under disk pressure (#676); see the record path above.
+	writeCtx, release, err := h.buffer.AdmitRequest(c.Context(), int64(len(body)))
+	if err != nil {
+		h.totalErrors.Add(1)
+		return respondWriteRefused(c, err)
+	}
+	defer release()
+
+	for _, m := range measurements {
+		if err := h.buffer.WriteTypedColumnarDirect(writeCtx, database, m, batches[m], rows[m]); err != nil {
+			h.totalErrors.Add(1)
+			if ingest.IsWriteRefusal(err) {
+				return respondWriteRefused(c, err)
+			}
+			metrics.Get().IncIngestErrors()
+			h.logger.Error().Err(err).Str("database", database).Str("measurement", m).Int("records", rows[m]).Msg("Failed to write to Arrow buffer")
+			if errors.Is(err, ingest.ErrBufferClosing) {
+				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Write rejected (server shutting down): " + err.Error()})
+			}
+			if errors.Is(err, ingest.ErrSchemaChurnExceeded) {
+				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Write rejected (schema churn): " + err.Error()})
+			}
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Write failed: " + err.Error()})
+		}
+	}
+
+	m := metrics.Get()
+	m.IncLineProtocolRequests()
+	m.IncLineProtocolRecords(int64(total))
+	m.IncLineProtocolBytes(int64(len(body)))
+	m.IncIngestRecords(int64(total))
+	m.IncIngestBytes(int64(len(body)))
+	m.IncIngestBatches()
+
+	if dropped > 0 {
+		h.totalErrors.Add(1)
+		h.logDrops(database, drops)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": partialWriteMessage(drops, dropped, true)})
+	}
+	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// logDrops logs a write's dropped points (see logPointDrops).
+func (h *LineProtocolHandler) logDrops(database string, drops []ingest.LPDrop) {
+	logPointDrops(h.logger, "Line protocol", database, drops)
 }
 
 // Stats returns Line Protocol handler statistics

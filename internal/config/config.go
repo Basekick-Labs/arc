@@ -461,6 +461,28 @@ type WALConfig struct {
 	// (default: 1 MiB). Syncs run beside the writer (#1246), so this bounds how
 	// much written data a sync may leave behind, not the writer's throughput.
 	SyncBytes int64
+	// DiskPressureEnabled refuses live writes (503, retryable) while the WAL
+	// volume is low on free space, and keeps the WAL reserve file (#676).
+	// Default true; only acts with the WAL enabled.
+	DiskPressureEnabled bool
+	// DiskMinFreeMB is the free space below which live writes are refused.
+	// 0 (default) = max(512, 2 x max_size_mb); clamped to a fifth of the
+	// volume. Negative is rejected.
+	DiskMinFreeMB int
+	// MaxDirectoryMB caps the WAL directory's bytes, for a volume whose free
+	// space does not show the limit that applies (an emptyDir with a
+	// sizeLimit). 0 (default) = no cap. Negative is rejected.
+	MaxDirectoryMB int
+}
+
+// WALMinDirectoryMB is the least wal.max_directory_mb accepted for a
+// wal.max_size_mb (0 = the 100 MB default): four WAL files, the active one,
+// the two-file band the disk gate clears below, and one of margin (#676).
+func WALMinDirectoryMB(maxSizeMB int) int {
+	if maxSizeMB <= 0 {
+		maxSizeMB = 100
+	}
+	return 4 * maxSizeMB
 }
 
 type TelemetryConfig struct {
@@ -581,7 +603,7 @@ type SchedulerConfig struct {
 type ReconciliationConfig struct {
 	Enabled                   bool   // Off by default — explicit operator opt-in
 	Schedule                  string // Cron schedule (default: "17 4 * * *" = 04:17 daily)
-	GraceWindowSeconds        int    // Orphan storage files younger than this are NEVER deleted (default: 86400 = 24h)
+	GraceWindowSeconds        int    // Orphan storage files younger than this are NEVER deleted (default: 86400 = 24h; minimum 3600, a lower value is raised to it)
 	ClockSkewAllowanceSeconds int    // Added to grace window (default: 300 = 5m)
 	PerPrefixTimeoutSeconds   int    // Per-prefix List timeout (default: 300 = 5m)
 	MaxRunDurationSeconds     int    // Overall run timeout (default: 1800 = 30m)
@@ -753,17 +775,33 @@ type ClusterConfig struct {
 	RaftHeartbeatTimeout  int    // Raft heartbeat timeout in milliseconds (default: 500)
 	RaftSnapshotInterval  int    // Snapshot interval in seconds (default: 300)
 	RaftSnapshotThreshold int    // Number of logs before snapshot (default: 10000)
+	// RaftPreVote runs the Raft pre-vote round before an election (#1272): a
+	// writer that cannot hear the leader no longer raises its term and makes
+	// the healthy leader step down when it reaches it. Default true. Set false
+	// while rolling a cluster up from a release before 27.01.1, whose nodes do
+	// not answer pre-vote (see the upgrade notes).
+	RaftPreVote bool
 
 	// Request routing configuration (Phase 3)
 	RouteTimeout int // Timeout for forwarded requests in milliseconds (default: 5000)
-	RouteRetries int // Number of retries for failed forwards (default: 3)
+	// WriteForwardTimeoutMs bounds one write forwarded to a writer, upload
+	// and processing included (default 60000). Forwarded writes are never
+	// retried once sent (#1270); a write that times out after being sent is
+	// answered 504 (it may have been written).
+	WriteForwardTimeoutMs int
+	// ImportForwardTimeoutMs bounds one import (/api/v1/import/*) forwarded
+	// to a writer, upload and processing included (default 3600000, 0 = no
+	// bound). A backstop, not a deadline: a forward is not cancelled when its
+	// client gives up, so this is what frees the forwarding node from a writer
+	// that never answers (#1070).
+	ImportForwardTimeoutMs int
+	RouteRetries           int // Number of retries for failed forwards (default: 3)
 
-	// Replication configuration (Phase 3.3). ReplicationEnabled starts peer file
-	// replication; the live WAL replication stream is not started (#888, #1207).
-	ReplicationEnabled     bool // Enable peer file replication (default: false)
-	ReplicationLagLimit    int  // Max acceptable lag in milliseconds before health degrades (default: 5000)
-	ReplicationBufferSize  int  // Entry buffer size for replication queue (default: 10000)
-	ReplicationAckInterval int  // How often readers send acks in milliseconds (default: 100)
+	// ReplicationEnabled starts peer file replication. The WAL replication
+	// stream it once started too is gone (#888, #1181); its
+	// replication_lag_limit, replication_buffer_size and
+	// replication_ack_interval keys are ignored.
+	ReplicationEnabled bool // Enable peer file replication (default: false)
 
 	// Peer file replication configuration (Enterprise Phase 2)
 	// These gate and tune the background puller that replicates Parquet files
@@ -829,12 +867,25 @@ type ClusterConfig struct {
 	StreamTakeoverDepartedTTL time.Duration
 	// StandbyStoreMaxBytes caps the copy a standby writer keeps of what its
 	// primary streams, with WALCoverage on (#1207). Past it the standby stores
-	// nothing until trimming frees room.
+	// nothing until trimming frees room. 0 (default): a quarter of the WAL
+	// volume, at least 1 GiB and at most 32 GiB; negative: no cap (#1266).
 	StandbyStoreMaxBytes int64
 	// OriginStreamQueueBytes caps what a primary holds in memory for one
 	// standby writer that is not keeping up; past it that standby misses
 	// batches (a gap in its copy).
 	OriginStreamQueueBytes int64
+	// StaleLocalSweep removes a local replica this node saw registered once
+	// the cluster manifest no longer lists it, when the delete that should
+	// have removed it was missed: the node was down, or crashed with the
+	// unlink queued (#1071). Local storage with replication only. Default on.
+	// Off stops the removals only: the tracking behind them also records what
+	// each local copy holds, which the manifest walks judge copies by (#1182).
+	StaleLocalSweep bool
+	// StaleLocalSweepMaxFraction stops a sweep pass that would remove more
+	// than this fraction of the files the node tracks (and at least 1000):
+	// a manifest rolled back by an unsafe recovery must not take every local
+	// copy with it. Raise it to let a refused pass run. Default 0.5.
+	StaleLocalSweepMaxFraction float64
 
 	// Cluster security (Enterprise)
 	SharedSecret string // Shared secret for join authentication (HMAC-SHA256). All nodes must share the same value.
@@ -944,6 +995,11 @@ func Load() (*Config, error) {
 	departedTTL, err := time.ParseDuration(v.GetString("cluster.stream_takeover_departed_ttl"))
 	if err != nil || departedTTL < time.Minute {
 		return nil, fmt.Errorf("invalid cluster.stream_takeover_departed_ttl %q: must be a Go duration of at least 1m", v.GetString("cluster.stream_takeover_departed_ttl"))
+	}
+
+	// math.IsNaN via self-comparison: NaN would disable the breaker silently.
+	if f := v.GetFloat64("cluster.stale_local_sweep_max_fraction"); f != f || f <= 0 {
+		return nil, fmt.Errorf("invalid cluster.stale_local_sweep_max_fraction %v: must be a number above 0 (above 1 never refuses a pass)", v.Get("cluster.stale_local_sweep_max_fraction"))
 	}
 
 	scanTimeout, err := time.ParseDuration(v.GetString("tiered_storage.scan_timeout"))
@@ -1119,6 +1175,9 @@ func Load() (*Config, error) {
 			RecoveryBatchSize:       v.GetInt("wal.recovery_batch_size"),
 			BufferSize:              v.GetInt("wal.buffer_size"),
 			SyncBytes:               v.GetInt64("wal.sync_bytes"),
+			DiskPressureEnabled:     v.GetBool("wal.disk_pressure_enabled"),
+			DiskMinFreeMB:           v.GetInt("wal.disk_min_free_mb"),
+			MaxDirectoryMB:          v.GetInt("wal.max_directory_mb"),
 		},
 		Telemetry: TelemetryConfig{
 			Enabled:         v.GetBool("telemetry.enabled"),
@@ -1200,25 +1259,27 @@ func Load() (*Config, error) {
 			RecheckConcurrency:        v.GetInt("reconciliation.recheck_concurrency"),
 		},
 		Cluster: ClusterConfig{
-			Enabled:                   v.GetBool("cluster.enabled"),
-			NodeID:                    v.GetString("cluster.node_id"),
-			Role:                      v.GetString("cluster.role"),
-			ClusterName:               v.GetString("cluster.cluster_name"),
-			Seeds:                     parseStringSlice(v.GetString("cluster.seeds")),
-			CoordinatorAddr:           v.GetString("cluster.coordinator_addr"),
-			AdvertiseAddr:             v.GetString("cluster.advertise_addr"),
-			HealthCheckInterval:       v.GetInt("cluster.health_check_interval"),
-			IngestFenceAfterMs:        v.GetInt("cluster.ingest_fence_after_ms"),
-			WALCoverage:               v.GetBool("cluster.wal_coverage"),
-			StreamTakeover:            v.GetBool("cluster.stream_takeover"),
-			StreamTakeoverGrace:       takeoverGrace,
-			StreamTakeoverDepartedTTL: departedTTL,
-			StandbyStoreMaxBytes:      v.GetInt64("cluster.standby_store_max_bytes"),
-			OriginStreamQueueBytes:    v.GetInt64("cluster.origin_stream_queue_bytes"),
-			HealthCheckTimeout:        v.GetInt("cluster.health_check_timeout"),
-			UnhealthyThreshold:        v.GetInt("cluster.unhealthy_threshold"),
-			HeartbeatInterval:         v.GetInt("cluster.heartbeat_interval"),
-			HeartbeatTimeout:          v.GetInt("cluster.heartbeat_timeout"),
+			Enabled:                    v.GetBool("cluster.enabled"),
+			NodeID:                     v.GetString("cluster.node_id"),
+			Role:                       v.GetString("cluster.role"),
+			ClusterName:                v.GetString("cluster.cluster_name"),
+			Seeds:                      parseStringSlice(v.GetString("cluster.seeds")),
+			CoordinatorAddr:            v.GetString("cluster.coordinator_addr"),
+			AdvertiseAddr:              v.GetString("cluster.advertise_addr"),
+			HealthCheckInterval:        v.GetInt("cluster.health_check_interval"),
+			IngestFenceAfterMs:         v.GetInt("cluster.ingest_fence_after_ms"),
+			WALCoverage:                v.GetBool("cluster.wal_coverage"),
+			StreamTakeover:             v.GetBool("cluster.stream_takeover"),
+			StreamTakeoverGrace:        takeoverGrace,
+			StreamTakeoverDepartedTTL:  departedTTL,
+			StandbyStoreMaxBytes:       v.GetInt64("cluster.standby_store_max_bytes"),
+			OriginStreamQueueBytes:     v.GetInt64("cluster.origin_stream_queue_bytes"),
+			StaleLocalSweep:            v.GetBool("cluster.stale_local_sweep"),
+			StaleLocalSweepMaxFraction: v.GetFloat64("cluster.stale_local_sweep_max_fraction"),
+			HealthCheckTimeout:         v.GetInt("cluster.health_check_timeout"),
+			UnhealthyThreshold:         v.GetInt("cluster.unhealthy_threshold"),
+			HeartbeatInterval:          v.GetInt("cluster.heartbeat_interval"),
+			HeartbeatTimeout:           v.GetInt("cluster.heartbeat_timeout"),
 			// Raft configuration
 			RaftDataDir:           v.GetString("cluster.raft_data_dir"),
 			RaftBindAddr:          v.GetString("cluster.raft_bind_addr"),
@@ -1228,14 +1289,14 @@ func Load() (*Config, error) {
 			RaftHeartbeatTimeout:  v.GetInt("cluster.raft_heartbeat_timeout"),
 			RaftSnapshotInterval:  v.GetInt("cluster.raft_snapshot_interval"),
 			RaftSnapshotThreshold: v.GetInt("cluster.raft_snapshot_threshold"),
+			RaftPreVote:           v.GetBool("cluster.raft_pre_vote"),
 			// Routing configuration
-			RouteTimeout: v.GetInt("cluster.route_timeout"),
-			RouteRetries: v.GetInt("cluster.route_retries"),
+			RouteTimeout:           v.GetInt("cluster.route_timeout"),
+			WriteForwardTimeoutMs:  v.GetInt("cluster.write_forward_timeout_ms"),
+			ImportForwardTimeoutMs: v.GetInt("cluster.import_forward_timeout_ms"),
+			RouteRetries:           v.GetInt("cluster.route_retries"),
 			// Replication configuration
-			ReplicationEnabled:     v.GetBool("cluster.replication_enabled"),
-			ReplicationLagLimit:    v.GetInt("cluster.replication_lag_limit"),
-			ReplicationBufferSize:  v.GetInt("cluster.replication_buffer_size"),
-			ReplicationAckInterval: v.GetInt("cluster.replication_ack_interval"),
+			ReplicationEnabled: v.GetBool("cluster.replication_enabled"),
 			// Peer file replication (Enterprise Phase 2)
 			ReplicationPullWorkers:                   v.GetInt("cluster.replication_pull_workers"),
 			ReplicationQueueSize:                     v.GetInt("cluster.replication_queue_size"),
@@ -1325,6 +1386,22 @@ func Load() (*Config, error) {
 	}
 	if err := validateCompactionMemoryLimit(cfg.Compaction.MemoryLimit); err != nil {
 		return nil, err
+	}
+	if cfg.WAL.DiskMinFreeMB < 0 {
+		return nil, fmt.Errorf("invalid wal.disk_min_free_mb value: %d (must be >= 0; 0 = max(512, 2 x wal.max_size_mb))", cfg.WAL.DiskMinFreeMB)
+	}
+	if cfg.WAL.MaxDirectoryMB < 0 {
+		return nil, fmt.Errorf("invalid wal.max_directory_mb value: %d (must be >= 0; 0 = no cap)", cfg.WAL.MaxDirectoryMB)
+	}
+	// The cap must hold the active WAL file, the band the gate clears below
+	// and a file of margin, or the gate could never clear (#676).
+	if minDir := WALMinDirectoryMB(cfg.WAL.MaxSizeMB); cfg.WAL.MaxDirectoryMB > 0 && cfg.WAL.MaxDirectoryMB < minDir {
+		cfg.Warnings = append(cfg.Warnings, LoadWarning{
+			Key:     "wal.max_directory_mb",
+			Value:   strconv.Itoa(cfg.WAL.MaxDirectoryMB),
+			Message: fmt.Sprintf("wal.max_directory_mb is below four WAL files (4 x wal.max_size_mb = %d MB): raised to %d MB, or the WAL disk gate could never clear once on", minDir, minDir),
+		})
+		cfg.WAL.MaxDirectoryMB = minDir
 	}
 	if cfg.Compaction.Threads < 0 {
 		return nil, fmt.Errorf("invalid compaction.threads value: %d (must be >= 0; 0 = auto)", cfg.Compaction.Threads)
@@ -1907,6 +1984,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("wal.recovery_batch_size", 10000)     // Max records per recovery batch (rate limiting)
 	v.SetDefault("wal.buffer_size", 10000)             // Async write buffer size in entries
 	v.SetDefault("wal.sync_bytes", 1024*1024)          // Request a sync once this many bytes are unsynced
+	v.SetDefault("wal.disk_pressure_enabled", true)    // Refuse writes (503) while the WAL volume is low on space (#676)
+	v.SetDefault("wal.disk_min_free_mb", 0)            // 0 = max(512, 2 x max_size_mb), at most a fifth of the volume
+	v.SetDefault("wal.max_directory_mb", 0)            // 0 = no cap on the WAL directory's bytes
 
 	// Telemetry defaults
 	v.SetDefault("telemetry.enabled", true)                                               // Enabled by default (opt-out)
@@ -2016,16 +2096,15 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.raft_heartbeat_timeout", 500)    // 500ms heartbeat timeout
 	v.SetDefault("cluster.raft_snapshot_interval", 300)    // 5 minutes snapshot interval
 	v.SetDefault("cluster.raft_snapshot_threshold", 10000) // 10k logs before snapshot
+	v.SetDefault("cluster.raft_pre_vote", true)            // #1272; see Cluster.RaftPreVote
 
 	// Request routing defaults (Phase 3)
-	v.SetDefault("cluster.route_timeout", 5000) // 5 second timeout for forwards
-	v.SetDefault("cluster.route_retries", 3)    // 3 retries for failed forwards
+	v.SetDefault("cluster.route_timeout", 5000)                // 5 second timeout for forwards
+	v.SetDefault("cluster.write_forward_timeout_ms", 60000)    // #1270; see Cluster.WriteForwardTimeoutMs
+	v.SetDefault("cluster.import_forward_timeout_ms", 3600000) // #1070; see Cluster.ImportForwardTimeoutMs
+	v.SetDefault("cluster.route_retries", 3)                   // 3 retries for failed forwards
 
-	// WAL Replication defaults (Phase 3.3)
-	v.SetDefault("cluster.replication_enabled", false)     // Disabled by default
-	v.SetDefault("cluster.replication_lag_limit", 5000)    // 5 second lag limit
-	v.SetDefault("cluster.replication_buffer_size", 10000) // 10k entry buffer
-	v.SetDefault("cluster.replication_ack_interval", 100)  // 100ms ack interval
+	v.SetDefault("cluster.replication_enabled", false) // Disabled by default
 	// Peer file replication (Enterprise Phase 2)
 	v.SetDefault("cluster.replication_pull_workers", 4)          // 4 concurrent pullers
 	v.SetDefault("cluster.replication_queue_size", 1024)         // 1024-entry callback queue
@@ -2054,9 +2133,11 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.wal_coverage", false)      // experimental (#1207); see Cluster.WALCoverage
 	v.SetDefault("cluster.stream_takeover_grace", "60s")
 	v.SetDefault("cluster.stream_takeover_departed_ttl", "24h")
-	v.SetDefault("cluster.stream_takeover", false) // experimental (#1207 S4b); see Cluster.StreamTakeover
-	v.SetDefault("cluster.standby_store_max_bytes", int64(1<<30))
+	v.SetDefault("cluster.stream_takeover", false)            // experimental (#1207 S4b); see Cluster.StreamTakeover
+	v.SetDefault("cluster.standby_store_max_bytes", int64(0)) // 0 = a quarter of the WAL volume, min 1 GiB (#1266)
 	v.SetDefault("cluster.origin_stream_queue_bytes", int64(64<<20))
+	v.SetDefault("cluster.stale_local_sweep", true) // #1071
+	v.SetDefault("cluster.stale_local_sweep_max_fraction", 0.5)
 
 	// Cluster security defaults
 	v.SetDefault("cluster.shared_secret", "")

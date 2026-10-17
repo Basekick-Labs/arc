@@ -18,7 +18,7 @@ import (
 // it with the batches it had acknowledged, and the outbox applies live
 // records to the files it registers (delete_records_outbox.go).
 
-var errDeleteAckPending = errors.New("ingest paused: acknowledging a DELETE to the cluster (stream takeover); retry shortly")
+var errDeleteAckPending error = &ingest.RefusalError{Reason: RefusalDeleteAck, Text: "ingest paused: acknowledging a DELETE to the cluster (stream takeover); retry shortly"}
 
 // deleteAckEvery paces the acknowledgement loop; a record is acknowledged
 // within about one tick of applying here.
@@ -177,24 +177,35 @@ func (c *Coordinator) RecordDelete(ctx context.Context, database, measurement, w
 	return 0, nil
 }
 
-// MissingLocalFiles returns the hot manifest files of database (measurement
-// "" = all of it) this node does not have at their size: a DELETE run here
-// would not see their rows. Sorted.
+// MissingLocalFiles returns the hot manifest files under database/
+// (database/measurement/ when measurement is set: what a DELETE scans) this
+// node does not have at their size: a DELETE run here would not see their
+// rows. Sorted. On a shared object store a file whose object is gone is not
+// missing, it is gone: no node will ever have it (an output a finalizing
+// staged job still copies into place excepted) (#1207).
 func (c *Coordinator) MissingLocalFiles(ctx context.Context, database, measurement string) ([]string, error) {
 	if c == nil || c.raftNode == nil || c.storage == nil {
 		return nil, nil
 	}
+	prefix := database + "/"
+	if measurement != "" {
+		prefix += measurement + "/"
+	}
+	shared := c.SharedObjectStore()
 	var missing []string
 	for _, f := range c.raftNode.FSM().GetFilesByDatabase(database) {
-		if f.Tier != "" && f.Tier != "hot" {
+		if !raft.HotTier(f.Tier) || !strings.HasPrefix(f.Path, prefix) {
 			continue
 		}
-		if measurement != "" && f.Measurement != measurement {
-			continue
-		}
+		// Held first: an output copied into place and ended between a stat
+		// and the check would read as gone.
+		held := shared && c.CompactionOutputHeld(f.Path)
 		size, err := c.storage.StatFile(ctx, f.Path)
 		if err != nil {
 			return nil, err
+		}
+		if size < 0 && shared && !held {
+			continue
 		}
 		if size != f.SizeBytes {
 			missing = append(missing, f.Path)
@@ -214,7 +225,7 @@ func (c *Coordinator) ManifestHotFiles(database, measurement string) []raft.File
 	prefix := database + "/" + measurement + "/"
 	var out []raft.FileEntry
 	for _, f := range c.raftNode.FSM().GetFilesByDatabase(database) {
-		if (f.Tier == "" || f.Tier == "hot") && strings.HasPrefix(f.Path, prefix) {
+		if raft.HotTier(f.Tier) && strings.HasPrefix(f.Path, prefix) {
 			out = append(out, *f)
 		}
 	}

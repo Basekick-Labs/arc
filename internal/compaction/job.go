@@ -743,7 +743,7 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	// on the clock alone. The uploaded storage key derives from this basename
 	// (see Job.Run), so a collision here would silently overwrite a sibling
 	// batch's compacted output.
-	now := time.Now().UTC()
+	now := storage.NameTime(time.Now())
 	timestamp := now.Format("20060102_150405")
 	suffix := "compacted"
 	if j.Tier != "hourly" {

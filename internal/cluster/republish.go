@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -115,6 +116,9 @@ type republishCand struct {
 	rowLo    int
 	rowHi    int
 	rowTotal int
+	// piece is the parked piece a partial candidate stands for, so settle
+	// can ask the manifest again whether it is covered; nil for a whole batch.
+	piece *raft.CoveragePiece
 }
 
 func (c republishCand) matches(chunk uint16) bool { return c.chunk < 0 || c.chunk == int(chunk) }
@@ -252,7 +256,8 @@ func (rp *republisher) candidates(ctx context.Context, fsm *raft.ClusterFSM) map
 				if fsm.CoverageCovered(inst, f.Key, rawPiece(p), hour) {
 					continue
 				}
-				c := republishCand{hour: hour, chunk: -1, rowLo: p.RowLo, rowHi: p.RowHi, rowTotal: p.RowTotal}
+				piece := rawPiece(p)
+				c := republishCand{hour: hour, chunk: -1, rowLo: p.RowLo, rowHi: p.RowHi, rowTotal: p.RowTotal, piece: &piece}
 				if p.Chunks > 0 {
 					c.chunk = int(p.Chunk)
 				}
@@ -326,7 +331,7 @@ func (rp *republisher) republish(ctx context.Context, fsm *raft.ClusterFSM, cand
 		if fi, err := os.Stat(path); err == nil {
 			scanned += fi.Size()
 		}
-		err := wal.NewReader(path, rp.logger).ScanCovered(want, func(e *wal.Entry) error {
+		err := republishScanFile(path, rp.logger, want, func(e *wal.Entry) error {
 			c := e.Coverage
 			b := republishBatch{c.Instance, c.Key, c.CSeq}
 			sn := found[b]
@@ -351,6 +356,14 @@ func (rp *republisher) republish(ctx context.Context, fsm *raft.ClusterFSM, cand
 			bytes[g] += size
 			return nil
 		})
+		if errors.Is(err, fs.ErrNotExist) {
+			// Purged between the listing and the read, which the prompt WAL
+			// purge makes routine (#676). Not a gap in the scan: a file
+			// holding a parked batch nobody registered is kept by the
+			// registration hold, so a file that can go held none of the
+			// candidates.
+			continue
+		}
 		if err != nil {
 			complete = false
 			rp.logger.Warn().Err(err).Str("file", filepath.Base(path)).Msg("Reading a WAL file to republish parked batches failed")
@@ -359,7 +372,27 @@ func (rp *republisher) republish(ctx context.Context, fsm *raft.ClusterFSM, cand
 	for g := range batch {
 		flush(g)
 	}
-	rp.settle(cands, found, outcomes, complete)
+	rp.settle(fsm, cands, found, outcomes, complete)
+}
+
+// candsUncovered reports whether any of a batch's candidates is still
+// uncovered in the manifest.
+func candsUncovered(fsm *raft.ClusterFSM, inst uint64, key string, cseq uint64, cs []republishCand) bool {
+	if fsm == nil {
+		return true
+	}
+	for _, x := range cs {
+		if x.piece != nil {
+			if !fsm.CoverageCovered(inst, key, *x.piece, x.hour) {
+				return true
+			}
+			continue
+		}
+		if len(fsm.UncoveredBatches(inst, key, cseq, cseq, x.hour)) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // republishSeen is the chunks of one batch the WAL scan found.
@@ -393,7 +426,7 @@ func (sn *republishSeen) has(cs []republishCand) bool {
 // scan), and each (batch, hour) whose parked rows are all registered: every
 // record the candidates need answered Covered or NothingLeft in that hour,
 // or has no rows in it.
-func (rp *republisher) settle(cands map[uint64]map[string]map[uint64][]republishCand, found map[republishBatch]*republishSeen,
+func (rp *republisher) settle(fsm *raft.ClusterFSM, cands map[uint64]map[string]map[uint64][]republishCand, found map[republishBatch]*republishSeen,
 	outcomes map[republishRec]map[int64]ingest.ReplayOutcome, complete bool) {
 	for inst, byKey := range cands {
 		for key, byCSeq := range byKey {
@@ -401,7 +434,10 @@ func (rp *republisher) settle(cands map[uint64]map[string]map[uint64][]republish
 				b := republishBatch{inst, key, cseq}
 				sn := found[b]
 				if !sn.has(cs) {
-					if complete && !rp.missing[b] {
+					// Only for a batch still uncovered now: another writer can
+					// register it during the pass, and its WAL file then goes
+					// (#676 purges it at once), which is not a missing copy.
+					if complete && !rp.missing[b] && candsUncovered(fsm, inst, key, cseq, cs) {
 						rp.missing[b] = true
 						rp.logger.Error().Str("instance", fmt.Sprintf("%016x", inst)).Str("key", key).Uint64("batch", cseq).
 							Msg("A parked batch nobody registered has no complete WAL copy here; its rows stay parked")
@@ -577,6 +613,12 @@ func republishEntryBytes(e *wal.Entry) int {
 	return max(n, 1)
 }
 
+// republishScanFile reads a WAL file's covered entries. A variable so a test
+// can remove the file between the listing and the read, as the WAL purge does.
+var republishScanFile = func(path string, logger zerolog.Logger, match func(wal.Coverage) bool, fn func(*wal.Entry) error) error {
+	return wal.NewReader(path, logger).ScanCovered(match, fn)
+}
+
 // fileMayHold reports whether the WAL file at path holds a batch of the
 // candidates, from a summary of its covered entries read without decoding
 // them (kept while the file's size and time do not change).
@@ -588,13 +630,16 @@ func (rp *republisher) fileMayHold(path string, cands map[uint64]map[string]map[
 	sum, ok := rp.summaries[path]
 	if !ok || sum.size != fi.Size() || !sum.modTime.Equal(fi.ModTime()) {
 		sum = walSummary{size: fi.Size(), modTime: fi.ModTime(), spans: map[uint64]map[string]raft.Intervals{}}
-		err := wal.NewReader(path, rp.logger).ScanCovered(func(c wal.Coverage) bool {
+		err := republishScanFile(path, rp.logger, func(c wal.Coverage) bool {
 			if sum.spans[c.Instance] == nil {
 				sum.spans[c.Instance] = map[string]raft.Intervals{}
 			}
 			sum.spans[c.Instance][c.Key] = sum.spans[c.Instance][c.Key].Union(raft.Intervals{{c.CSeq, c.CSeq}})
 			return false
 		}, func(*wal.Entry) error { return nil })
+		if errors.Is(err, fs.ErrNotExist) {
+			return false // purged since the Stat above (#676); see republish
+		}
 		if err != nil {
 			return true // read it in full: the scan reports the error
 		}

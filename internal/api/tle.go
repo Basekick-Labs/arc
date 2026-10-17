@@ -123,15 +123,23 @@ func (h *TLEHandler) handleWrite(c *fiber.Ctx) error {
 			goto localProcessing
 		}
 		if err != nil {
-			h.logger.Error().Err(err).Msg("Failed to route write request")
+			if !errors.Is(err, cluster.ErrWriteForwardUnavailable) && !errors.Is(err, cluster.ErrWriteForwardAmbiguous) {
+				h.logger.Error().Err(err).Msg("Failed to route write request")
+			}
 			h.totalErrors.Add(1)
-			return HandleRoutingError(c, err)
+			return respondWriteForwardError(c, err)
 		}
 
 		return CopyResponse(c, resp)
 	}
 
 localProcessing:
+	// A standby writer forwards the write to the primary instead of refusing
+	// it, when the cluster names one it can trust (#1270). Before anything is
+	// read or written here.
+	if handled, err := forwardStandbyWrite(h.router, c); handled {
+		return err
+	}
 	// Shared decompressRequest helper (below) handles gzip/zstd/
 	// uncompressed dispatch with a hard 100MB output cap, the streaming
 	// LimitReader-bounded zstd path, and the defensive copy of fasthttp-
@@ -209,8 +217,20 @@ localProcessing:
 	}
 
 	// Write directly to the buffer (typed path — skips convertColumnsToTyped)
-	if err := h.buffer.WriteTypedColumnarDirect(c.Context(), database, measurement, batch, numRecords); err != nil {
+	// Admit the whole request, its size reserved against the WAL volume's
+	// free space (#676); a fence or disk pressure refuses it here.
+	writeCtx, release, aerr := h.buffer.AdmitRequest(c.Context(), int64(len(body)))
+	if aerr != nil {
 		h.totalErrors.Add(1)
+		return respondWriteRefused(c, aerr)
+	}
+	defer release()
+	if err := h.buffer.WriteTypedColumnarDirect(writeCtx, database, measurement, batch, numRecords); err != nil {
+		h.totalErrors.Add(1)
+		// Logged by reason, not as an ingest error (#1268).
+		if ingest.IsWriteRefusal(err) {
+			return respondWriteRefused(c, err)
+		}
 		metrics.Get().IncIngestErrors()
 		h.logger.Error().
 			Err(err).
@@ -222,9 +242,6 @@ localProcessing:
 		// refused, not lost: the record is still in the WAL. 503 so the client
 		// retries (elsewhere, during a rolling restart) instead of treating a
 		// shutdown race as a permanent server error.
-		if errors.Is(err, ingest.ErrIngestFenced) {
-			return respondIngestFenced(c, err)
-		}
 		if errors.Is(err, ingest.ErrBufferClosing) {
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 				"error": "Write rejected (server shutting down): " + err.Error(),

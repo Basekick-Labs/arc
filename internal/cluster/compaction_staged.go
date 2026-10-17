@@ -59,6 +59,10 @@ type stagedReplica struct {
 	// replicaReady: this node pulls staged outputs (its puller and replica
 	// loop run), so it advertises local replicas.
 	replicaReady atomic.Bool
+	// finisherWake runs the object finisher loop now; finishing: the jobs a
+	// finisher goroutine works on (#1207 d2a2b).
+	finisherWake chan struct{}
+	finishing    map[string]bool
 	// waitUntil: per compaction job, until when the delete worker waits for
 	// its staged copy to move into place (one wait per job, not per input).
 	waitUntil sync.Map
@@ -99,9 +103,19 @@ func (c *Coordinator) stagedMinHolders() int {
 }
 
 // StagedCompactionMode reports whether a compaction launched now is staged:
-// the cluster's compaction commit is on and storage is local.
+// the cluster's compaction commit is on and storage is local, or an object
+// store that copies objects in place (#1207 d2a2b).
 func (c *Coordinator) StagedCompactionMode() bool {
-	return c.CompactionCommitActive() && c.storage != nil && c.storage.Type() == "local"
+	if !c.CompactionCommitActive() || c.storage == nil {
+		return false
+	}
+	_, object := c.storage.(storage.ObjectCopier)
+	return c.storage.Type() == "local" || object
+}
+
+// stagedObject reports whether staged jobs here are object-store jobs.
+func (c *Coordinator) stagedObject() bool {
+	return IsSharedObjectStore(c.storage)
 }
 
 // CompactionInputLookup describes path as the cluster manifest lists it, for
@@ -166,12 +180,16 @@ func (s stagedCommitter) Stage(ctx context.Context, job compaction.StagedJob) (c
 	// every other registration has it; job.Output.Tier is the compaction
 	// tier ("hourly", "daily").
 	out := job.Output
+	minHolders := 0
+	if !job.Object {
+		minHolders = s.c.stagedMinHolders()
+	}
 	ins := make([]raft.CompactionInput, 0, len(job.Inputs))
 	for _, in := range job.Inputs {
 		ins = append(ins, raft.CompactionInput{Path: in.Path, SizeBytes: in.SizeBytes, SHA256: in.SHA256})
 	}
 	raw, err := json.Marshal(raft.StageCompactionPayload{
-		Job: job.JobID, Origin: s.c.localNode.ID, MinHolders: s.c.stagedMinHolders(), Now: time.Now().UTC(), Inputs: ins,
+		Job: job.JobID, Origin: s.c.localNode.ID, MinHolders: minHolders, Object: job.Object, Now: time.Now().UTC(), Inputs: ins,
 		Output: raft.FileEntry{Path: out.Path, SHA256: out.SHA256, SizeBytes: out.SizeBytes, Database: out.Database,
 			Measurement: out.Measurement, PartitionTime: out.PartitionTime, Tier: "hot", CreatedAt: out.CreatedAt},
 	})
@@ -189,7 +207,11 @@ func (s stagedCommitter) Commit(ctx context.Context, job compaction.StagedJob) (
 	}
 	// A commit retried after it applied (its reply lost) is the FSM's to
 	// recognise: it answers success for its own output.
-	return s.outcome(s.c.applyOrForward(ctx, &raft.Command{Type: raft.CommandCommitCompaction, Payload: raw}))
+	out, err := s.outcome(s.c.applyOrForward(ctx, &raft.Command{Type: raft.CommandCommitCompaction, Payload: raw}))
+	if job.Object && (out == compaction.StagedOK || out == compaction.StagedCommitted) {
+		s.c.wakeFinisher()
+	}
+	return out, err
 }
 
 func (s stagedCommitter) Abort(ctx context.Context, jobID, reason string) error {
@@ -197,14 +219,27 @@ func (s stagedCommitter) Abort(ctx context.Context, jobID, reason string) error 
 	if err != nil {
 		return err
 	}
-	return s.c.applyOrForward(ctx, &raft.Command{Type: raft.CommandAbortCompaction, Payload: raw})
+	sj, staged := s.c.raftNode.FSM().StagedCompactionByJob(jobID)
+	if err := s.c.applyOrForward(ctx, &raft.Command{Type: raft.CommandAbortCompaction, Payload: raw}); err != nil {
+		return err
+	}
+	if staged && sj.Object && !sj.Finalizing {
+		// The staged output of an object job is in the shared bucket:
+		// nobody else removes it (the sweep would, hours later).
+		_ = s.c.deleteStagedObject(ctx, raft.StagedCompactionKey(sj.Job, sj.Output.Path))
+	}
+	return nil
 }
 
 func (s stagedCommitter) Status(job compaction.StagedJob) compaction.StagedStatus {
 	fsm := s.c.raftNode.FSM()
 	var st compaction.StagedStatus
-	if sj, ok := fsm.StagedCompactionByJob(job.JobID); ok && !sj.Object && sj.Output.SHA256 == job.Output.SHA256 {
-		st.Staged, st.Holders, st.MinHolders = true, len(sj.Holders), sj.MinHolders
+	if sj, ok := fsm.StagedCompactionByJob(job.JobID); ok && sj.Object == job.Object && sj.Output.SHA256 == job.Output.SHA256 {
+		if sj.Finalizing {
+			st.Finalizing = true
+		} else {
+			st.Staged, st.Holders, st.MinHolders = true, len(sj.Holders), sj.MinHolders
+		}
 	}
 	if e, ok := fsm.GetFile(job.Output.Path); ok && e.CompactionJob == job.JobID && e.SHA256 == job.Output.SHA256 {
 		st.Committed = true
@@ -252,7 +287,7 @@ func (s stagedCommitter) ForcePull(job compaction.StagedJob) {
 func (s stagedCommitter) OwnStaged() []string {
 	var out []string
 	for _, sj := range s.c.raftNode.FSM().StagedCompactions() {
-		if sj.Origin == s.c.localNode.ID && !sj.Object && !sj.Finalizing {
+		if sj.Origin == s.c.localNode.ID && !sj.Finalizing {
 			out = append(out, sj.Job)
 		}
 	}
@@ -279,7 +314,7 @@ func (c *Coordinator) adoptStagedCopy(ctx context.Context, e *raft.FileEntry, pr
 	}
 	key := raft.StagedCompactionKey(e.CompactionJob, e.Path)
 	dir := compaction.StagedJobDir(e.CompactionJob)
-	if e.Tier != "" && e.Tier != "hot" {
+	if !raft.HotTier(e.Tier) {
 		// Moved to the cold tier since (tiering marks a file cold only once
 		// its cold copy is written): a hot copy here would read twice.
 		if !c.stagedLocalJob(e.CompactionJob) {
@@ -304,13 +339,16 @@ func (c *Coordinator) adoptStagedCopy(ctx context.Context, e *raft.FileEntry, pr
 	}
 	// Moved after the output left the manifest (a DELETE or retention
 	// removed it): not data any more.
-	if cur, ok := c.raftNode.FSM().GetFile(e.Path); !ok || cur.CompactionJob != e.CompactionJob || cur.SHA256 != e.SHA256 {
+	cur, ok := c.raftNode.FSM().GetFile(e.Path)
+	if !ok || cur.CompactionJob != e.CompactionJob || cur.SHA256 != e.SHA256 {
 		_ = c.storage.Delete(ctx, e.Path)
 		return false, errors.New("the output left the manifest while it moved into place")
 	}
 	if !c.stagedLocalJob(e.CompactionJob) {
 		_ = mover.RemoveAll(ctx, dir)
 	}
+	// This node's compactor wrote these bytes: what the path holds (#1182).
+	c.recordLocalContent(cur, "", cur.SHA256)
 	c.logger.Debug().Str("job", e.CompactionJob).Str("path", e.Path).Msg("Committed compaction output moved into place from its staged copy")
 	return true, nil
 }
@@ -546,24 +584,28 @@ func (c *Coordinator) sweepStagedDirs(ctx context.Context) {
 // waitStagedAdoption delays the unlink of a compaction input while this node
 // holds a staged copy of the job's output not yet moved into place, so local
 // reads do not lose the rows in between (bounded).
-func (c *Coordinator) waitStagedAdoption(reason string) {
+// It reports whether it waited at all (#1271: the caller then reads the
+// manifest again).
+func (c *Coordinator) waitStagedAdoption(reason string) (waited bool) {
 	job, ok := strings.CutPrefix(reason, "compaction:")
 	if !ok || job == "" || c.storage == nil {
-		return
+		return false
 	}
 	v, _ := c.staged.waitUntil.LoadOrStore(job, time.Now().Add(stagedDeleteWait))
 	deadline := v.(time.Time)
 	for time.Now().Before(deadline) {
 		ok, err := c.storage.Exists(c.ctx, compaction.StagedJobDir(job))
 		if err != nil || !ok {
-			return
+			return waited
 		}
+		waited = true
 		select {
 		case <-c.ctx.Done():
-			return
+			return waited
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
+	return waited
 }
 
 // stagedLeaderLoop, on the leader, aborts staged jobs whose compactor has
@@ -599,7 +641,7 @@ func (c *Coordinator) stagedLeaderLoop(ctx context.Context) {
 			}
 		}
 		for _, s := range staged {
-			if s.Object || s.Finalizing || c.originHealthy(s.Origin) {
+			if s.Finalizing || c.originHealthy(s.Origin) {
 				delete(c.staged.goneSince, s.Job)
 				continue
 			}
@@ -614,6 +656,11 @@ func (c *Coordinator) stagedLeaderLoop(ctx context.Context) {
 			raw, _ := json.Marshal(raft.AbortCompactionPayload{Job: s.Job, By: c.localNode.ID, Reason: "its compactor is gone"})
 			if err := c.raftNode.Apply(&raft.Command{Type: raft.CommandAbortCompaction, Payload: raw}, 5*time.Second); err == nil {
 				delete(c.staged.goneSince, s.Job)
+				if s.Object {
+					// Its staged output is in the shared bucket: nobody else
+					// removes it (the bucket sweep would, later).
+					_ = c.storage.Delete(ctx, raft.StagedCompactionKey(s.Job, s.Output.Path))
+				}
 				c.logger.Warn().Str("job", s.Job).Str("origin", s.Origin).Msg("Aborted a staged compaction: its compactor is gone")
 			}
 		}
@@ -624,9 +671,15 @@ func (c *Coordinator) stagedLeaderLoop(ctx context.Context) {
 // moving into place from its staged copy (the reconciler must not take its
 // absence for an orphan entry).
 func (c *Coordinator) CompactionOutputHeld(path string) bool {
-	e, ok := c.raftNode.FSM().GetFile(path)
+	fsm := c.raftNode.FSM()
+	e, ok := fsm.GetFile(path)
 	if !ok || e.CompactionJob == "" || c.storage == nil {
 		return false
+	}
+	// An object job's output is absent from its path until its finisher
+	// copies it there (#1207 d2a2b).
+	if sj, staged := fsm.StagedCompactionByJob(e.CompactionJob); staged && sj.Object && sj.Finalizing {
+		return true
 	}
 	ok, err := c.storage.Exists(c.ctx, raft.StagedCompactionKey(e.CompactionJob, e.Path))
 	return err == nil && ok

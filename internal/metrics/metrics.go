@@ -132,11 +132,11 @@ type Metrics struct {
 	// dbQueriesTotal and dbQueryErrorsTotal are NOT wired, deliberately.
 	//
 	// Counting them at the DuckDB wrapper (DuckDB.Query/QueryContext/Exec)
-	// misses the hot path: the query handler runs through
-	// query.ParallelExecutor, which holds the raw *sql.DB and never passes
-	// through those wrappers. A counter named "total" that silently omits most
-	// queries is the failure mode #801 was filed for, so it is better absent
-	// than partial. Use arc_query_requests_total / arc_query_errors_total,
+	// misses the hot path: shipped builds answer queries through
+	// DuckDB.ArrowQueryContext (and the arcx engine, when built), which never
+	// pass through those wrappers. A counter named "total" that silently
+	// omits most queries is the failure mode #801 was filed for, so it is
+	// better absent than partial. Use arc_query_requests_total / arc_query_errors_total,
 	// which are counted at every API entry point (#809).
 	dbQueriesTotal     atomic.Int64
 	dbQueryErrorsTotal atomic.Int64
@@ -178,6 +178,9 @@ type Metrics struct {
 	standbyStoreBlocked      atomic.Int64 // keys whose trim waits on files not yet here
 	standbyStoreReplaced     atomic.Int64 // bytes held for replaced primary instances
 	standbyStorePinned       atomic.Int64 // bytes the store may not evict (stream takeover)
+	standbyStoreCapped       atomic.Int64 // 1 while the store refuses batches at its cap (#1266)
+	standbyStoreLowSpace     atomic.Int64 // 1 while the store's volume is below its free-space reserve (#1266)
+	standbyStoreMaxBytes     atomic.Int64 // the store's effective cap, 0 = none (#1266)
 
 	streamClaimsEnabled  atomic.Int64 // 1 once stream claims are applied (#1207 S4a)
 	streamClaims         atomic.Int64 // stream claims held in the FSM
@@ -188,10 +191,17 @@ type Metrics struct {
 	walRecoveryTotal     atomic.Int64 // Successful WAL recovery operations
 	walRecoveryRecords   atomic.Int64 // Total records recovered from WAL
 	walDroppedEntries    atomic.Int64 // Entries dropped due to full WAL buffer
-	walFailedWrites      atomic.Int64 // Write failures to WAL file
+	walFailedWrites      atomic.Int64 // WAL entries lost to a failed write (#676)
+	walDiskFullWrites    atomic.Int64 // Of those, lost to ENOSPC or EDQUOT
+	walRecoveredWrites   atomic.Int64 // Failed WAL writes the retry on a new file recovered
 	walFailedSyncs       atomic.Int64 // WAL fsync/fdatasync failures
 	walOversizedPayloads atomic.Int64 // Payloads rejected for exceeding the single-entry cap even after chunking (#677)
 	walDirectoryBytes    atomic.Int64 // Current bytes occupied by every file in the WAL directory
+	// WAL volume disk pressure (#676)
+	walDiskPressure           atomic.Int64 // 1 while live writes are refused for the WAL volume's free space
+	walDiskFreeBytes          atomic.Int64 // Free bytes on the WAL volume at the last sample
+	walDiskPressureRejections atomic.Int64 // Live writes refused for WAL volume disk pressure
+	walDiskStatErrors         atomic.Int64 // Failed reads of the WAL volume's free space (the gate fails open)
 
 	// Cluster file registration outbox (#1209)
 	fileRegistrationsPending      atomic.Int64 // files flushed and not yet confirmed in the cluster manifest
@@ -199,11 +209,16 @@ type Metrics struct {
 	fileRegistrationsConfirmed    atomic.Int64 // files registered by the outbox
 	fileRegistrationJournalErrs   atomic.Int64 // registration journal write or fsync failures
 
+	// Reconciliation (#1214): 1 while the last run held its orphan-storage
+	// sweep because what other nodes have pending could not be established.
+	reconciliationStorageSweepHeld atomic.Int64
+
 	// Ingest fencing (#1207)
-	ingestFenced          atomic.Int64 // 1 while this writer refuses writes
-	ingestFencedWrites    atomic.Int64 // writes refused by the fence
-	walQuarantinedFiles   atomic.Int64 // WAL files isolated after repeated recovery failures
-	walQuarantineReleased atomic.Int64 // pending WAL entries released because their file was quarantined (#1225)
+	ingestFenced          atomic.Int64                           // 1 while this writer refuses writes
+	ingestFencedWrites    [len(IngestFencedReasons)]atomic.Int64 // live writes refused, by reason (#1268)
+	writesForwarded       [len(WriteForwardResults)]atomic.Int64 // writes forwarded to a writer, by result (#1270)
+	walQuarantinedFiles   atomic.Int64                           // WAL files isolated after repeated recovery failures
+	walQuarantineReleased atomic.Int64                           // pending WAL entries released because their file was quarantined (#1225)
 	// 1 while the last recovery pass left a file on disk for which at least one
 	// row range of a parent entry was handed off — the state an older binary
 	// would replay in full.
@@ -226,26 +241,6 @@ type Metrics struct {
 	queryMgmtCancelledTotal atomic.Int64 // Total queries cancelled via API
 	queryMgmtHistorySize    atomic.Int64 // Completed queries in history buffer (gauge)
 
-	// Replication metrics
-	replicationEntriesDroppedTotal atomic.Int64 // Total replication entries dropped due to full buffer
-	//
-	// There is deliberately no sequence-gap counter here (#810). A gap cannot
-	// occur silently on a replication connection: the receiver requires each
-	// checkpoint's LastSequence to equal exactly what it has applied, and both
-	// ends carry a cumulative SHA-256 over every payload, so a skipped entry
-	// diverges the hashes. Either check drops the connection
-	// (internal/cluster/replication/receiver.go). Failing closed at the
-	// receive path is strictly stronger than a counter scraped after the fact
-	// — the same shape as Kafka's OutOfOrderSequenceException or Raft's
-	// prevLogIndex rejection. The signal operators actually need here is
-	// replication LAG, which is the provider below (#819).
-
-	// The active writer supplies per-peer lag samples on demand at scrape
-	// time. No historical peer IDs or unbounded time series are retained in
-	// the collector.
-	replicationLagMu       sync.RWMutex
-	replicationLagProvider *replicationLagRegistration
-
 	// Cluster FSM security metrics (Enterprise only — only mutated when
 	// the Raft FSM is constructed, which is gated by cluster.enabled +
 	// Enterprise license. See internal/cluster/raft/fsm.go and
@@ -264,6 +259,26 @@ type Metrics struct {
 	// no backend can address. Those entries are dropped from their work set, so
 	// this counter is the only place the condition is aggregated.
 	storageInvalidPathQuarantinedTotal atomic.Int64
+	// compactionCopyFallbackTotal counts compaction outputs an object store
+	// refused to copy server-side, copied through the node instead;
+	// compactionFinishedTotal, committed object-store compactions their
+	// finisher ended; compactionWedgedTotal, those marked wedged for an
+	// operator (#1207 d2a2b).
+	compactionCopyFallbackTotal atomic.Int64
+	compactionFinishedTotal     atomic.Int64
+	compactionWedgedTotal       atomic.Int64
+	// manifestRepairDroppedTotal / manifestRepairAdoptedTotal: entries the
+	// shared-object-store manifest repair dropped (object gone) and objects
+	// it registered (compaction outputs the manifest never listed) (#1207).
+	manifestRepairDroppedTotal atomic.Int64
+	manifestRepairAdoptedTotal atomic.Int64
+	manifestRepairPending      atomic.Int64
+	// staleLocal*: the stale-local sweep's removals, tracked files and
+	// whether its breaker refused the last pass (#1071).
+	staleLocalUnlinkedTotal atomic.Int64
+	staleLocalTracked       atomic.Int64
+	staleLocalBlocked       atomic.Int64
+	staleLocalTrackingFail  atomic.Int64
 
 	// clusterLocalDeletePending is the number of manifest deletes a
 	// per-node-storage cluster node has been told about and has not yet
@@ -665,6 +680,19 @@ func (m *Metrics) SetStandbyStoreTrimState(lost, blocked, replacedBytes int64) {
 	m.standbyStoreReplaced.Store(replacedBytes)
 }
 func (m *Metrics) SetStandbyStorePinned(n int64) { m.standbyStorePinned.Store(n) }
+
+// SetStandbyStoreCapped, SetStandbyStoreLowSpace and SetStandbyStoreMaxBytes
+// report the standby store's cap state (#1266).
+func (m *Metrics) SetStandbyStoreCapped(v bool)    { m.standbyStoreCapped.Store(b2i(v)) }
+func (m *Metrics) SetStandbyStoreLowSpace(v bool)  { m.standbyStoreLowSpace.Store(b2i(v)) }
+func (m *Metrics) SetStandbyStoreMaxBytes(n int64) { m.standbyStoreMaxBytes.Store(n) }
+
+func b2i(v bool) int64 {
+	if v {
+		return 1
+	}
+	return 0
+}
 func (m *Metrics) SetStandbyStore(bytes, incomplete int64) {
 	m.standbyStoreBytes.Store(bytes)
 	m.standbyStoreIncomplete.Store(incomplete)
@@ -673,9 +701,39 @@ func (m *Metrics) IncWALRecoveryTotal()              { m.walRecoveryTotal.Add(1)
 func (m *Metrics) IncWALRecoveryRecords(count int64) { m.walRecoveryRecords.Add(count) }
 func (m *Metrics) IncWALDroppedEntries()             { m.walDroppedEntries.Add(1) }
 func (m *Metrics) IncWALFailedWrites()               { m.walFailedWrites.Add(1) }
+func (m *Metrics) IncWALDiskFullWrites()             { m.walDiskFullWrites.Add(1) }
+func (m *Metrics) IncWALRecoveredWrites()            { m.walRecoveredWrites.Add(1) }
 func (m *Metrics) IncWALFailedSyncs()                { m.walFailedSyncs.Add(1) }
 func (m *Metrics) IncWALOversizedPayloads()          { m.walOversizedPayloads.Add(1) }
 func (m *Metrics) SetWALDirectoryBytes(bytes int64)  { m.walDirectoryBytes.Store(bytes) }
+
+// SetWALDiskPressure records whether live writes are refused because the WAL
+// volume is low on free space (#676).
+func (m *Metrics) SetWALDiskPressure(on bool) {
+	if on {
+		m.walDiskPressure.Store(1)
+	} else {
+		m.walDiskPressure.Store(0)
+	}
+}
+func (m *Metrics) SetWALDiskFreeBytes(bytes int64) { m.walDiskFreeBytes.Store(bytes) }
+func (m *Metrics) IncWALDiskPressureRejections()   { m.walDiskPressureRejections.Add(1) }
+func (m *Metrics) IncWALDiskStatErrors()           { m.walDiskStatErrors.Add(1) }
+
+// SetReconciliationStorageSweepHeld records whether the last reconciliation
+// run held its orphan-storage sweep (#1214).
+func (m *Metrics) SetReconciliationStorageSweepHeld(held bool) {
+	v := int64(0)
+	if held {
+		v = 1
+	}
+	m.reconciliationStorageSweepHeld.Store(v)
+}
+
+// ReconciliationStorageSweepHeld reports the last value set.
+func (m *Metrics) ReconciliationStorageSweepHeld() bool {
+	return m.reconciliationStorageSweepHeld.Load() == 1
+}
 
 // File registration outbox (#1209).
 func (m *Metrics) SetFileRegistrationsPending(n int64) { m.fileRegistrationsPending.Store(n) }
@@ -694,8 +752,68 @@ func (m *Metrics) SetIngestFenced(fenced bool) {
 	}
 }
 
-// IncIngestFencedWrites counts a write refused by ingest fencing (#1207).
-func (m *Metrics) IncIngestFencedWrites() { m.ingestFencedWrites.Add(1) }
+// IncIngestFencedWrites counts a live write refused by the ingest gate (#1207),
+// under its reason (#1268).
+func (m *Metrics) IncIngestFencedWrites(reason string) {
+	for i, r := range IngestFencedReasons {
+		if r == reason {
+			m.ingestFencedWrites[i].Add(1)
+			return
+		}
+	}
+	m.ingestFencedWrites[len(IngestFencedReasons)-1].Add(1)
+}
+
+// WriteForwardResults are the result labels of
+// arc_cluster_writes_forwarded_total (#1270).
+var WriteForwardResults = [...]string{"ok", "refused", "error", "unavailable", "ambiguous"}
+
+// IncWritesForwarded counts one write this node forwarded to a writer, by
+// result: ok (2xx), refused (the writer's own fence refusal, 503), error (any
+// other answer), unavailable (nothing sent: nothing written), ambiguous (sent,
+// no answer: may have been written).
+func (m *Metrics) IncWritesForwarded(result string) {
+	for i, r := range WriteForwardResults {
+		if r == result {
+			m.writesForwarded[i].Add(1)
+			return
+		}
+	}
+}
+
+// WritesForwardedFor returns the forwarded writes counted under result.
+func (m *Metrics) WritesForwardedFor(result string) int64 {
+	for i, r := range WriteForwardResults {
+		if r == result {
+			return m.writesForwarded[i].Load()
+		}
+	}
+	return 0
+}
+
+// IngestFencedReasons are the reason labels of
+// arc_cluster_ingest_fenced_writes_total, in export order (#1268). They match
+// cluster's Refusal constants; anything else counts as "other", the last.
+var IngestFencedReasons = [...]string{"contact", "standby", "claimed", "announcing", "not_designated", "delete_ack", "other"} // ingest.Refusal*
+
+// IngestFencedWritesFor returns the refusals counted under reason ("other" for
+// an unknown one).
+func (m *Metrics) IngestFencedWritesFor(reason string) int64 {
+	for i, r := range IngestFencedReasons {
+		if r == reason {
+			return m.ingestFencedWrites[i].Load()
+		}
+	}
+	return m.ingestFencedWrites[len(IngestFencedReasons)-1].Load()
+}
+
+func (m *Metrics) ingestFencedWritesTotal() int64 {
+	var n int64
+	for i := range m.ingestFencedWrites {
+		n += m.ingestFencedWrites[i].Load()
+	}
+	return n
+}
 
 func (m *Metrics) fileRegistrationOldestPendingSeconds() float64 {
 	ns := m.fileRegistrationOldestPending.Load()
@@ -736,9 +854,6 @@ func (m *Metrics) SetQueryMgmtActiveQueries(n int64) { m.queryMgmtActiveQueries.
 func (m *Metrics) IncQueryMgmtCancelled()            { m.queryMgmtCancelledTotal.Add(1) }
 func (m *Metrics) SetQueryMgmtHistorySize(n int64)   { m.queryMgmtHistorySize.Store(n) }
 
-// Replication Metrics
-func (m *Metrics) IncReplicationEntriesDropped() { m.replicationEntriesDroppedTotal.Add(1) }
-
 // IncClusterManifestRejectedPaths increments the cluster FSM
 // path-rejection counter. Called from internal/cluster/raft/fsm.go
 // when ValidateManifestPath refuses a Register/Update/Restore path.
@@ -750,6 +865,34 @@ func (m *Metrics) IncClusterManifestRejectedPaths() { m.clusterManifestRejectedP
 // storage.ErrInvalidPath (#747). That error is permanent, so the alternative
 // to counting it here is a loop that retries the same key forever.
 func (m *Metrics) IncStorageInvalidPathQuarantined() { m.storageInvalidPathQuarantinedTotal.Add(1) }
+
+// IncCompactionCopyFallback, IncCompactionFinished, IncCompactionWedged: the
+// staged compaction commit on an object store (#1207 d2a2b).
+func (m *Metrics) IncCompactionCopyFallback() { m.compactionCopyFallbackTotal.Add(1) }
+func (m *Metrics) IncCompactionFinished()     { m.compactionFinishedTotal.Add(1) }
+func (m *Metrics) IncCompactionWedged()       { m.compactionWedgedTotal.Add(1) }
+
+// IncManifestRepairDropped, IncManifestRepairAdopted: the shared-object-store
+// manifest repair (#1207).
+func (m *Metrics) IncManifestRepairDropped() { m.manifestRepairDroppedTotal.Add(1) }
+func (m *Metrics) IncManifestRepairAdopted() { m.manifestRepairAdoptedTotal.Add(1) }
+
+// SetManifestRepairPending publishes the compaction outputs the last repair
+// left for a later run (its read budget reached).
+func (m *Metrics) SetManifestRepairPending(n int64) { m.manifestRepairPending.Store(n) }
+
+// IncStaleLocalUnlinked counts a local copy the stale-local sweep removed.
+func (m *Metrics) IncStaleLocalUnlinked() { m.staleLocalUnlinkedTotal.Add(1) }
+
+// SetStaleLocalTracked publishes how many local files the sweep tracks.
+func (m *Metrics) SetStaleLocalTracked(n int64) { m.staleLocalTracked.Store(n) }
+
+// SetStaleLocalBlocked publishes 1 while the sweep's breaker refuses passes.
+func (m *Metrics) SetStaleLocalBlocked(n int64) { m.staleLocalBlocked.Store(n) }
+
+// SetStaleLocalTrackingFailed publishes 1 while the sweep cannot track files
+// (its journal could not be opened or written).
+func (m *Metrics) SetStaleLocalTrackingFailed(n int64) { m.staleLocalTrackingFail.Store(n) }
 
 // SetClusterLocalDeletePending publishes how many manifest deletes are still
 // waiting for a local unlink on this node.
@@ -954,47 +1097,57 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"mqtt_reconnects":        m.mqttReconnects.Load(),
 
 		// WAL
-		"wal_records_preserved":            m.walRecordsPreserved.Load(),
-		"wal_registered_floor_lag":         m.walRegisteredFloorLag.Load(),
-		"wal_held_files":                   m.walHeldFiles.Load(),
-		"wal_parked_files":                 m.walParkedFiles.Load(),
-		"wal_parked_bytes":                 m.walParkedBytes.Load(),
-		"wal_coverage_lost":                m.walCoverageLost.Load(),
-		"origin_stream_sessions":           m.originStreamSessions.Load(),
-		"origin_stream_dropped":            m.originStreamDropped.Load(),
-		"standby_stream_connected":         m.standbyStreamConnected.Load(),
-		"standby_stream_entries":           m.standbyStreamEntries.Load(),
-		"standby_stream_gaps":              m.standbyStreamGaps.Load(),
-		"standby_store_bytes":              m.standbyStoreBytes.Load(),
-		"standby_store_incomplete_keys":    m.standbyStoreIncomplete.Load(),
-		"standby_store_trimmed_bytes":      m.standbyStoreTrimmedBytes.Load(),
-		"standby_store_dropped":            m.standbyStoreDropped.Load(),
-		"standby_store_evicted_bytes":      m.standbyStoreEvicted.Load(),
-		"standby_store_lost_records":       m.standbyStoreLost.Load(),
-		"standby_store_blocked_keys":       m.standbyStoreBlocked.Load(),
-		"standby_store_replaced_bytes":     m.standbyStoreReplaced.Load(),
-		"standby_store_pinned_bytes":       m.standbyStorePinned.Load(),
-		"stream_claims_enabled":            m.streamClaimsEnabled.Load(),
-		"stream_claims":                    m.streamClaims.Load(),
-		"stream_takeover_departed_writers": m.departedWriters.Load(),
-		"stream_takeover_oldest_claim_age": m.oldestClaimAge.Load(),
-		"stream_takeover_unpulled_files":   m.unpulledFiles.Load(),
-		"wal_coverage_refused":             m.walCoverageRefused.Load(),
-		"wal_recovery_total":               m.walRecoveryTotal.Load(),
-		"wal_recovery_records":             m.walRecoveryRecords.Load(),
-		"wal_dropped_entries":              m.walDroppedEntries.Load(),
-		"wal_failed_writes":                m.walFailedWrites.Load(),
-		"wal_failed_syncs":                 m.walFailedSyncs.Load(),
-		"wal_oversized_payloads":           m.walOversizedPayloads.Load(),
-		"wal_directory_bytes":              m.walDirectoryBytes.Load(),
-		"file_registrations_pending":       m.fileRegistrationsPending.Load(),
-		"file_registrations_confirmed":     m.fileRegistrationsConfirmed.Load(),
-		"file_registration_journal_errors": m.fileRegistrationJournalErrs.Load(),
-		"ingest_fenced":                    m.ingestFenced.Load(),
-		"ingest_fenced_writes":             m.ingestFencedWrites.Load(),
-		"wal_quarantined_files":            m.walQuarantinedFiles.Load(),
-		"wal_quarantine_released_entries":  m.walQuarantineReleased.Load(),
-		"wal_partial_row_recovery_pending": m.walPartialRowRecovery.Load(),
+		"wal_records_preserved":             m.walRecordsPreserved.Load(),
+		"wal_registered_floor_lag":          m.walRegisteredFloorLag.Load(),
+		"wal_held_files":                    m.walHeldFiles.Load(),
+		"wal_parked_files":                  m.walParkedFiles.Load(),
+		"wal_parked_bytes":                  m.walParkedBytes.Load(),
+		"wal_coverage_lost":                 m.walCoverageLost.Load(),
+		"origin_stream_sessions":            m.originStreamSessions.Load(),
+		"origin_stream_dropped":             m.originStreamDropped.Load(),
+		"standby_stream_connected":          m.standbyStreamConnected.Load(),
+		"standby_stream_entries":            m.standbyStreamEntries.Load(),
+		"standby_stream_gaps":               m.standbyStreamGaps.Load(),
+		"standby_store_bytes":               m.standbyStoreBytes.Load(),
+		"standby_store_incomplete_keys":     m.standbyStoreIncomplete.Load(),
+		"standby_store_trimmed_bytes":       m.standbyStoreTrimmedBytes.Load(),
+		"standby_store_dropped":             m.standbyStoreDropped.Load(),
+		"standby_store_evicted_bytes":       m.standbyStoreEvicted.Load(),
+		"standby_store_lost_records":        m.standbyStoreLost.Load(),
+		"standby_store_blocked_keys":        m.standbyStoreBlocked.Load(),
+		"standby_store_replaced_bytes":      m.standbyStoreReplaced.Load(),
+		"standby_store_pinned_bytes":        m.standbyStorePinned.Load(),
+		"standby_store_capped":              m.standbyStoreCapped.Load(),
+		"standby_store_low_space":           m.standbyStoreLowSpace.Load(),
+		"standby_store_max_bytes":           m.standbyStoreMaxBytes.Load(),
+		"stream_claims_enabled":             m.streamClaimsEnabled.Load(),
+		"stream_claims":                     m.streamClaims.Load(),
+		"stream_takeover_departed_writers":  m.departedWriters.Load(),
+		"stream_takeover_oldest_claim_age":  m.oldestClaimAge.Load(),
+		"stream_takeover_unpulled_files":    m.unpulledFiles.Load(),
+		"wal_coverage_refused":              m.walCoverageRefused.Load(),
+		"wal_recovery_total":                m.walRecoveryTotal.Load(),
+		"wal_recovery_records":              m.walRecoveryRecords.Load(),
+		"wal_dropped_entries":               m.walDroppedEntries.Load(),
+		"wal_failed_writes":                 m.walFailedWrites.Load(),
+		"wal_disk_full_writes":              m.walDiskFullWrites.Load(),
+		"wal_recovered_writes":              m.walRecoveredWrites.Load(),
+		"wal_failed_syncs":                  m.walFailedSyncs.Load(),
+		"wal_oversized_payloads":            m.walOversizedPayloads.Load(),
+		"wal_directory_bytes":               m.walDirectoryBytes.Load(),
+		"wal_disk_pressure":                 m.walDiskPressure.Load(),
+		"wal_disk_free_bytes":               m.walDiskFreeBytes.Load(),
+		"wal_disk_pressure_rejections":      m.walDiskPressureRejections.Load(),
+		"wal_disk_stat_errors":              m.walDiskStatErrors.Load(),
+		"file_registrations_pending":        m.fileRegistrationsPending.Load(),
+		"reconciliation_storage_sweep_held": m.reconciliationStorageSweepHeld.Load(),
+		"file_registrations_confirmed":      m.fileRegistrationsConfirmed.Load(),
+		"file_registration_journal_errors":  m.fileRegistrationJournalErrs.Load(),
+		"ingest_fenced":                     m.ingestFenced.Load(),
+		"ingest_fenced_writes":              m.ingestFencedWritesTotal(),
+		"wal_quarantined_files":             m.walQuarantinedFiles.Load(),
+		"wal_quarantine_released_entries":   m.walQuarantineReleased.Load(),
+		"wal_partial_row_recovery_pending":  m.walPartialRowRecovery.Load(),
 
 		// Decompression Pool
 
@@ -1009,12 +1162,19 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"query_mgmt_cancelled_total": m.queryMgmtCancelledTotal.Load(),
 		"query_mgmt_history_size":    m.queryMgmtHistorySize.Load(),
 
-		// Replication
-		"replication_entries_dropped_total": m.replicationEntriesDroppedTotal.Load(),
-
 		// Cluster FSM security (Enterprise)
 		"cluster_manifest_rejected_paths_total":  m.clusterManifestRejectedPathsTotal.Load(),
 		"storage_invalid_path_quarantined_total": m.storageInvalidPathQuarantinedTotal.Load(),
+		"compaction_copy_fallback_total":         m.compactionCopyFallbackTotal.Load(),
+		"compaction_finished_total":              m.compactionFinishedTotal.Load(),
+		"compaction_wedged_total":                m.compactionWedgedTotal.Load(),
+		"manifest_repair_dropped_total":          m.manifestRepairDroppedTotal.Load(),
+		"manifest_repair_adopted_total":          m.manifestRepairAdoptedTotal.Load(),
+		"manifest_repair_pending":                m.manifestRepairPending.Load(),
+		"stale_local_unlinked_total":             m.staleLocalUnlinkedTotal.Load(),
+		"stale_local_tracked":                    m.staleLocalTracked.Load(),
+		"stale_local_blocked":                    m.staleLocalBlocked.Load(),
+		"stale_local_tracking_failed":            m.staleLocalTrackingFail.Load(),
 		// Cluster local delete workers (per-node storage with replication)
 		"cluster_local_delete_pending":                  m.clusterLocalDeletePending.Load(),
 		"compaction_manifests_parked_unparseable_total": m.compactionManifestsParkedUnparseableTotal.Load(),
@@ -1440,7 +1600,7 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_standby_store_lost_records gauge\n"...)
 	b = appendMetric(b, "arc_standby_store_lost_records", float64(m.standbyStoreLost.Load()))
 
-	b = append(b, "# HELP arc_standby_store_blocked_keys Measurements whose trim waits on files not yet present on this standby\n"...)
+	b = append(b, "# HELP arc_standby_store_blocked_keys Measurements with registered batches this standby may not trim yet (a file holding them not here, its FSM behind, a claim, or an origin not heard from)\n"...)
 	b = append(b, "# TYPE arc_standby_store_blocked_keys gauge\n"...)
 	b = appendMetric(b, "arc_standby_store_blocked_keys", float64(m.standbyStoreBlocked.Load()))
 
@@ -1450,6 +1610,18 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_standby_store_pinned_bytes Bytes of the standby store kept for a possible stream takeover; not evicted at the cap\n"...)
 	b = append(b, "# TYPE arc_standby_store_pinned_bytes gauge\n"...)
 	b = appendMetric(b, "arc_standby_store_pinned_bytes", float64(m.standbyStorePinned.Load()))
+
+	b = append(b, "# HELP arc_standby_store_capped 1 while the standby store refuses batches at its cap (cluster.standby_store_max_bytes)\n"...)
+	b = append(b, "# TYPE arc_standby_store_capped gauge\n"...)
+	b = appendMetric(b, "arc_standby_store_capped", float64(m.standbyStoreCapped.Load()))
+
+	b = append(b, "# HELP arc_standby_store_low_space 1 while the standby store's volume is below its free-space reserve (batches not kept)\n"...)
+	b = append(b, "# TYPE arc_standby_store_low_space gauge\n"...)
+	b = appendMetric(b, "arc_standby_store_low_space", float64(m.standbyStoreLowSpace.Load()))
+
+	b = append(b, "# HELP arc_standby_store_max_bytes The standby store's effective cap in bytes (0 = no cap)\n"...)
+	b = append(b, "# TYPE arc_standby_store_max_bytes gauge\n"...)
+	b = appendMetric(b, "arc_standby_store_max_bytes", float64(m.standbyStoreMaxBytes.Load()))
 
 	b = append(b, "# HELP arc_cluster_stream_claims_enabled 1 once stream claims are enabled in the cluster\n"...)
 	b = append(b, "# TYPE arc_cluster_stream_claims_enabled gauge\n"...)
@@ -1484,9 +1656,15 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_wal_dropped_entries_total counter\n"...)
 	b = appendMetric(b, "arc_wal_dropped_entries_total", float64(m.walDroppedEntries.Load()))
 
-	b = append(b, "# HELP arc_wal_failed_writes_total WAL write failures\n"...)
+	b = append(b, "# HELP arc_wal_failed_writes_total WAL entries lost to a failed write (not written to any WAL file)\n"...)
 	b = append(b, "# TYPE arc_wal_failed_writes_total counter\n"...)
 	b = appendMetric(b, "arc_wal_failed_writes_total", float64(m.walFailedWrites.Load()))
+	b = append(b, "# HELP arc_wal_disk_full_writes_total WAL entries lost to a write that failed with ENOSPC or EDQUOT (a subset of arc_wal_failed_writes_total)\n"...)
+	b = append(b, "# TYPE arc_wal_disk_full_writes_total counter\n"...)
+	b = appendMetric(b, "arc_wal_disk_full_writes_total", float64(m.walDiskFullWrites.Load()))
+	b = append(b, "# HELP arc_wal_recovered_writes_total Failed WAL writes that succeeded on a new WAL file; nothing was lost\n"...)
+	b = append(b, "# TYPE arc_wal_recovered_writes_total counter\n"...)
+	b = appendMetric(b, "arc_wal_recovered_writes_total", float64(m.walRecoveredWrites.Load()))
 	b = append(b, "# HELP arc_wal_failed_syncs_total WAL fsync/fdatasync failures; each forces a rotation to a new WAL file\n"...)
 	b = append(b, "# TYPE arc_wal_failed_syncs_total counter\n"...)
 	b = appendMetric(b, "arc_wal_failed_syncs_total", float64(m.walFailedSyncs.Load()))
@@ -1498,6 +1676,23 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_dir_bytes Current bytes occupied by every file in the WAL directory\n"...)
 	b = append(b, "# TYPE arc_wal_dir_bytes gauge\n"...)
 	b = appendMetric(b, "arc_wal_dir_bytes", float64(m.walDirectoryBytes.Load()))
+
+	b = append(b, "# HELP arc_wal_disk_pressure 1 while live writes are refused (503) because the WAL volume is low on free space or the WAL directory is at wal.max_directory_mb\n"...)
+	b = append(b, "# TYPE arc_wal_disk_pressure gauge\n"...)
+	b = appendMetric(b, "arc_wal_disk_pressure", float64(m.walDiskPressure.Load()))
+	b = append(b, "# HELP arc_wal_disk_free_bytes Bytes available on the WAL volume at the last sample\n"...)
+	b = append(b, "# TYPE arc_wal_disk_free_bytes gauge\n"...)
+	b = appendMetric(b, "arc_wal_disk_free_bytes", float64(m.walDiskFreeBytes.Load()))
+	b = append(b, "# HELP arc_wal_disk_pressure_rejections_total Live writes refused for WAL volume disk pressure; nothing was written, clients retry\n"...)
+	b = append(b, "# TYPE arc_wal_disk_pressure_rejections_total counter\n"...)
+	b = appendMetric(b, "arc_wal_disk_pressure_rejections_total", float64(m.walDiskPressureRejections.Load()))
+	b = append(b, "# HELP arc_wal_disk_stat_errors_total Failed reads of the WAL volume's free space; the disk pressure gate fails open while they fail\n"...)
+	b = append(b, "# TYPE arc_wal_disk_stat_errors_total counter\n"...)
+	b = appendMetric(b, "arc_wal_disk_stat_errors_total", float64(m.walDiskStatErrors.Load()))
+
+	b = append(b, "# HELP arc_reconciliation_storage_sweep_held 1 while the last reconciliation run held its orphan-storage sweep because a node that can ingest did not answer, or a published pending-registration list could not be read; a node that stays down holds it until it returns or is removed from the cluster\n"...)
+	b = append(b, "# TYPE arc_reconciliation_storage_sweep_held gauge\n"...)
+	b = appendMetric(b, "arc_reconciliation_storage_sweep_held", float64(m.reconciliationStorageSweepHeld.Load()))
 
 	b = append(b, "# HELP arc_cluster_file_registrations_pending Flushed files not yet confirmed in the cluster manifest\n"...)
 	b = append(b, "# TYPE arc_cluster_file_registrations_pending gauge\n"...)
@@ -1515,9 +1710,17 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_cluster_ingest_fenced gauge\n"...)
 	b = appendMetric(b, "arc_cluster_ingest_fenced", float64(m.ingestFenced.Load()))
 
-	b = append(b, "# HELP arc_cluster_ingest_fenced_writes_total Writes refused by ingest fencing\n"...)
+	b = append(b, "# HELP arc_cluster_ingest_fenced_writes_total Live writes refused because this node may not accept ingest, by reason (gate refusals: a retried MQTT message or CQ write counts each attempt)\n"...)
 	b = append(b, "# TYPE arc_cluster_ingest_fenced_writes_total counter\n"...)
-	b = appendMetric(b, "arc_cluster_ingest_fenced_writes_total", float64(m.ingestFencedWrites.Load()))
+	for i, r := range IngestFencedReasons {
+		b = appendMetricWithLabel(b, "arc_cluster_ingest_fenced_writes_total", "reason", r, float64(m.ingestFencedWrites[i].Load()))
+	}
+
+	b = append(b, "# HELP arc_cluster_writes_forwarded_total Writes this node forwarded to a writer (a reader or compactor, or a standby writer forwarding to the primary), by result\n"...)
+	b = append(b, "# TYPE arc_cluster_writes_forwarded_total counter\n"...)
+	for i, r := range WriteForwardResults {
+		b = appendMetricWithLabel(b, "arc_cluster_writes_forwarded_total", "result", r, float64(m.writesForwarded[i].Load()))
+	}
 
 	b = append(b, "# HELP arc_cluster_file_registration_journal_errors_total File registration journal write or fsync failures\n"...)
 	b = append(b, "# TYPE arc_cluster_file_registration_journal_errors_total counter\n"...)
@@ -1565,25 +1768,6 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_query_mgmt_history_size gauge\n"...)
 	b = appendMetric(b, "arc_query_mgmt_history_size", float64(m.queryMgmtHistorySize.Load()))
 
-	// Replication metrics
-	lagSamples := m.replicationLagSamples()
-	b = append(b, "# HELP arc_replication_lag_entries Writer entries not yet acknowledged by each connected replication reader, including entries a full replication buffer dropped\n"...)
-	b = append(b, "# TYPE arc_replication_lag_entries gauge\n"...)
-	for _, sample := range lagSamples {
-		b = appendReplicationLagMetric(b, "arc_replication_lag_entries", sample.Peer, float64(sample.Entries))
-	}
-	b = append(b, "# HELP arc_replication_lag_seconds Age in seconds of the oldest unacknowledged WAL entry per connected replication reader; a lower bound once the reader is more than cluster.replication_buffer_size entries behind\n"...)
-	b = append(b, "# TYPE arc_replication_lag_seconds gauge\n"...)
-	for _, sample := range lagSamples {
-		if sample.HasSeconds {
-			b = appendReplicationLagMetric(b, "arc_replication_lag_seconds", sample.Peer, sample.Seconds)
-		}
-	}
-
-	b = append(b, "# HELP arc_replication_entries_dropped_total Total replication entries dropped due to full buffer\n"...)
-	b = append(b, "# TYPE arc_replication_entries_dropped_total counter\n"...)
-	b = appendMetric(b, "arc_replication_entries_dropped_total", float64(m.replicationEntriesDroppedTotal.Load()))
-
 	// Cluster FSM security metrics (Enterprise — see GHSA-f85q-mvg8-qf37)
 	b = append(b, "# HELP arc_cluster_manifest_rejected_paths_total Total manifest path proposals refused by the cluster FSM. Non-zero growth indicates a peer/snapshot/log entry proposed a path validation refused (URL scheme, absolute, parent-traversal, NUL, oversize).\n"...)
 	b = append(b, "# TYPE arc_cluster_manifest_rejected_paths_total counter\n"...)
@@ -1592,6 +1776,31 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_storage_invalid_path_quarantined_total Total entries dropped from a cleanup, reconciliation or replication work set because a storage key was permanently unusable. Non-zero growth means a stored key (compaction manifest, cluster manifest entry, edge-sync ledger row) names something no storage backend can address; the entry is no longer retried and needs operator action.\n"...)
 	b = append(b, "# TYPE arc_storage_invalid_path_quarantined_total counter\n"...)
 	b = appendMetric(b, "arc_storage_invalid_path_quarantined_total", float64(m.storageInvalidPathQuarantinedTotal.Load()))
+	b = appendMetric(b, "arc_compaction_copy_fallback_total", float64(m.compactionCopyFallbackTotal.Load()))
+	b = appendMetric(b, "arc_compaction_finished_total", float64(m.compactionFinishedTotal.Load()))
+	b = appendMetric(b, "arc_compaction_wedged_total", float64(m.compactionWedgedTotal.Load()))
+	b = append(b, "# HELP arc_manifest_repair_dropped_total Cluster manifest entries the shared object store repair dropped because their object is gone (#1207). Growth after the first repairs following an upgrade means something removes objects without updating the manifest.\n"...)
+	b = append(b, "# TYPE arc_manifest_repair_dropped_total counter\n"...)
+	b = appendMetric(b, "arc_manifest_repair_dropped_total", float64(m.manifestRepairDroppedTotal.Load()))
+	b = append(b, "# HELP arc_manifest_repair_adopted_total Compaction outputs in the shared object store the repair registered in the cluster manifest, which compaction never listed before #1207. Growth after the first repairs following an upgrade means compaction outputs are not being registered.\n"...)
+	b = append(b, "# TYPE arc_manifest_repair_adopted_total counter\n"...)
+	b = appendMetric(b, "arc_manifest_repair_adopted_total", float64(m.manifestRepairAdoptedTotal.Load()))
+	b = append(b, "# HELP arc_manifest_repair_pending Compaction outputs the last cluster manifest repair left for a later run (its read budget reached). Falls to zero as the repairs after an upgrade catch up.\n"...)
+	b = append(b, "# TYPE arc_manifest_repair_pending gauge\n"...)
+	b = appendMetric(b, "arc_manifest_repair_pending", float64(m.manifestRepairPending.Load()))
+
+	b = append(b, "# HELP arc_stale_local_unlinked_total Local copies this node removed because the cluster deleted them while the node missed the delete (down, or crashed with the unlink queued).\n"...)
+	b = append(b, "# TYPE arc_stale_local_unlinked_total counter\n"...)
+	b = appendMetric(b, "arc_stale_local_unlinked_total", float64(m.staleLocalUnlinkedTotal.Load()))
+	b = append(b, "# HELP arc_stale_local_tracked Local files this node saw registered and tracks for the stale-local sweep.\n"...)
+	b = append(b, "# TYPE arc_stale_local_tracked gauge\n"...)
+	b = appendMetric(b, "arc_stale_local_tracked", float64(m.staleLocalTracked.Load()))
+	b = append(b, "# HELP arc_stale_local_blocked 1 while the stale-local sweep refuses to run because it would remove more than cluster.stale_local_sweep_max_fraction of this node's files.\n"...)
+	b = append(b, "# TYPE arc_stale_local_blocked gauge\n"...)
+	b = appendMetric(b, "arc_stale_local_blocked", float64(m.staleLocalBlocked.Load()))
+	b = append(b, "# HELP arc_stale_local_tracking_failed 1 while this node cannot track its local files for the stale-local sweep (its journal in raft_data_dir could not be opened or written); copies whose delete it misses then stay until a restart.\n"...)
+	b = append(b, "# TYPE arc_stale_local_tracking_failed gauge\n"...)
+	b = appendMetric(b, "arc_stale_local_tracking_failed", float64(m.staleLocalTrackingFail.Load()))
 
 	b = append(b, "# HELP arc_cluster_local_delete_pending Manifest deletes this per-node-storage cluster node has been told about and has not yet unlinked locally. Returns to zero within a grace period of every burst; a value that keeps climbing means the delete workers cannot keep up with retention or a compaction backlog.\n"...)
 	b = append(b, "# TYPE arc_cluster_local_delete_pending gauge\n"...)

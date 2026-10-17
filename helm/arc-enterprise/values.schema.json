@@ -304,6 +304,17 @@
                 "fsync",
                 "async"
               ]
+            },
+            "diskPressureEnabled": {
+              "type": "boolean"
+            },
+            "diskMinFreeMB": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "maxDirectoryMB": {
+              "type": "integer",
+              "minimum": 0
             }
           }
         },

@@ -109,6 +109,10 @@ type backupRun struct {
 	byName map[string]*backupLeg
 	def    *backupLeg
 	index  *RunIndex
+	// sourceOf: a data file whose bytes are read from another key: the
+	// output of a committed compaction still waiting at its staged key
+	// (#1207 d2a2b).
+	sourceOf map[string]string
 }
 
 // backupLeg is one target's slice of a run.
@@ -649,6 +653,9 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	var stateFiles []storage.ObjectInfo
 	for _, obj := range objects {
 		switch {
+		case isStagedCompaction(obj.Path):
+			// A compaction output waiting for its commit is not data; a
+			// committed one is backed up at its own path (see stagedSource).
 		case isCompactionState(obj.Path):
 			stateFiles = append(stateFiles, obj)
 		case strings.HasSuffix(obj.Path, ".parquet"):
@@ -1316,7 +1323,17 @@ func (m *Manager) copyDataFiles(ctx context.Context, leg *backupLeg, files []sto
 			continue
 		}
 
-		written, sha, err := m.streamBackupFileSHA(ctx, leg.target, src, srcName, obj.Path, destPath)
+		srcPath := obj.Path
+		if k, ok := run.sourceOf[obj.Path]; ok {
+			srcPath = k
+		}
+		written, sha, err := m.streamBackupFileSHA(ctx, leg.target, src, srcName, srcPath, destPath)
+		if err != nil && srcPath != obj.Path && isSourceReadError(err) {
+			// The compaction finished meanwhile: its output is at its path
+			// now, and its staged copy gone (#1207 d2a2b).
+			srcPath = obj.Path
+			written, sha, err = m.streamBackupFileSHA(ctx, leg.target, src, srcName, srcPath, destPath)
+		}
 		if err != nil {
 			// Only a source-read failure is skippable — the file may have been
 			// deleted by compaction/retention between listing and copy. Anything
@@ -1326,7 +1343,7 @@ func (m *Manager) copyDataFiles(ctx context.Context, leg *backupLeg, files []sto
 			// For COLD, only when the object is verifiably gone: see the note
 			// on this function. An unreachable cold store must fail the run,
 			// not produce N skips and a green status.
-			if !isSourceReadError(err) || (tier == tierCold && !objectGone(ctx, src, obj.Path)) {
+			if !isSourceReadError(err) || (tier == tierCold && !objectGone(ctx, src, srcPath)) {
 				return skipped, fmt.Errorf("failed to back up %s: %w", obj.Path, err)
 			}
 			skipped++
@@ -1945,6 +1962,7 @@ func (m *Manager) recheckClusterManifest(ctx context.Context, run *backupRun, xc
 	late := map[*backupLeg][]storage.ObjectInfo{}
 	var lateCount int
 	var still []storage.ObjectInfo
+	var compactionInputs int
 	// Writes into the byPath map that every leg's sidecar aliases, so the row
 	// becomes visible to all of them. Correct — it is the manifest snapshot,
 	// not a per-leg set, and only the leg's files list decides what each sidecar
@@ -1972,6 +1990,12 @@ func (m *Manager) recheckClusterManifest(ctx context.Context, run *backupRun, xc
 		// so a run carrying a few such files could make its own restore
 		// refuse.
 		if _, carried := coldCarried[p]; carried {
+			continue
+		}
+		// An input of a committed object-store compaction: its rows are in
+		// the output, backed up from its staged copy below (#1207 d2a2b).
+		if so, ok := m.cluster.(StagedOutputs); ok && so.CompactionOwns(p) {
+			compactionInputs++
 			continue
 		}
 		still = append(still, obj)
@@ -2008,6 +2032,16 @@ func (m *Manager) recheckClusterManifest(ctx context.Context, run *backupRun, xc
 			addLate(storage.ObjectInfo{Path: p, Size: size}, e)
 			continue
 		}
+		// A committed object-store compaction whose output is not at its
+		// path yet: its bytes are at the staged key (#1207 d2a2b).
+		if key, size, ok := m.stagedSource(ctx, p); ok {
+			if run.sourceOf == nil {
+				run.sourceOf = map[string]string{}
+			}
+			run.sourceOf[p] = key
+			addLate(storage.ObjectInfo{Path: p, Size: size}, e)
+			continue
+		}
 		absent++
 		leg := run.legFor(p)
 		leg.manifest.ManifestOnlyFiles++
@@ -2037,6 +2071,10 @@ func (m *Manager) recheckClusterManifest(ctx context.Context, run *backupRun, xc
 			}
 			leg.dataSkipped += skipped
 		}
+	}
+	if compactionInputs > 0 {
+		m.logger.Info().Int("files", compactionInputs).
+			Msg("Inputs of committed compactions still in storage were not backed up: their rows are in the compactions' outputs, which were")
 	}
 	if len(still) > 0 {
 		var sample []string
@@ -2472,4 +2510,39 @@ func parseDBMeasurement(path string) (database, measurement string) {
 		return parts[0], "unknown"
 	}
 	return "unknown", "unknown"
+}
+
+// isStagedCompaction reports a key under the staged compaction root
+// (compaction.StagedRoot, spelled here so this package does not import
+// compaction).
+func isStagedCompaction(path string) bool {
+	return strings.HasPrefix(filepath.ToSlash(path), stagedCompactionRoot+"/")
+}
+
+const stagedCompactionRoot = "_compaction_staged"
+
+// StagedOutputs is a ClusterManifest that knows committed object-store
+// compactions (#1207 d2a2b): the key an output waits at until its finisher
+// copies it to its path, and the inputs such a job still owns.
+type StagedOutputs interface {
+	StagedOutputKey(path string) (key string, ok bool)
+	CompactionOwns(path string) bool
+}
+
+// stagedSource returns the staged key and size of a registered output that
+// is not at its path yet.
+func (m *Manager) stagedSource(ctx context.Context, path string) (string, int64, bool) {
+	so, ok := m.cluster.(StagedOutputs)
+	if !ok {
+		return "", 0, false
+	}
+	key, ok := so.StagedOutputKey(path)
+	if !ok {
+		return "", 0, false
+	}
+	size, err := m.dataStorage.StatFile(ctx, key)
+	if err != nil || size < 0 {
+		return "", 0, false
+	}
+	return key, size, true
 }

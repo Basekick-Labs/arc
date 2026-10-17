@@ -3,15 +3,17 @@ package cluster
 import (
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster/originstream"
 	"github.com/basekick-labs/arc/internal/cluster/protocol"
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/cluster/security"
+	"github.com/basekick-labs/arc/internal/diskspace"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/wal"
 )
@@ -32,7 +34,12 @@ type originStream struct {
 	done   chan struct{}
 
 	presentMu sync.Mutex
-	present   map[string]int64 // paths verified present locally, at their size
+	// Paths verified present locally at their size, by the last trim pass
+	// and the last drop check.
+	trimPresent, dropPresent map[string]int64
+
+	spaceDone chan struct{} // the free-space watcher exited
+
 }
 
 // StartOriginStream starts both sides. Call after Start, on a writer whose
@@ -68,19 +75,18 @@ func (c *Coordinator) StartOriginStream(walWriter *wal.Writer, buffer *ingest.Ar
 		return fmt.Errorf("the origin stream needs the storage backend")
 	}
 	root := filepath.Join(filepath.Dir(walWriter.CurrentFile()), "received")
-	store, err := originstream.OpenStore(root, c.cfg.StandbyStoreMaxBytes, c.logger.With().Str("component", "standby-store").Logger())
+	maxBytes := c.standbyStoreCap(filepath.Dir(root))
+	store, err := originstream.OpenStore(root, maxBytes, c.logger.With().Str("component", "standby-store").Logger())
 	if err != nil {
 		return err
 	}
-	if c.cfg.StandbyStoreMaxBytes <= 0 {
-		c.logger.Warn().Msg("cluster.standby_store_max_bytes is not positive: the standby store has no cap")
-	}
+
 	if c.cfg.StreamTakeover {
 		policy := &standbyEvictPolicy{c: c}
 		store.SetEvictable(policy.tier, policy.active)
 	}
 	fsm := c.raftNode.FSM()
-	st := &originStream{wal: walWriter, store: store, done: make(chan struct{}), present: map[string]int64{}}
+	st := &originStream{wal: walWriter, store: store, done: make(chan struct{})}
 	st.server = originstream.NewServer(c.cfg.OriginStreamQueueBytes, func() *originstream.Floors {
 		inst, keys, ok := buffer.RegistrationProgress()
 		if !ok {
@@ -106,6 +112,11 @@ func (c *Coordinator) StartOriginStream(walWriter *wal.Writer, buffer *ingest.Ar
 
 	ctx, cancel := context.WithCancel(c.ctx)
 	st.cancel = cancel
+	st.spaceDone = make(chan struct{})
+	go func() {
+		defer close(st.spaceDone)
+		c.watchStandbyStoreSpace(ctx, store, root)
+	}()
 	client := originstream.NewClient(originstream.ClientConfig{
 		Store:        store,
 		LocalNodeID:  c.localNode.ID,
@@ -127,19 +138,7 @@ func (c *Coordinator) StartOriginStream(walWriter *wal.Writer, buffer *ingest.Ar
 		buffer.SetClaimedBatch(fsm.ClaimedFromOrigin)
 	}
 	if c.cfg.StreamTakeover && outbox != nil {
-		cl := newClaimant(c, store, outbox, buffer, func(ctx context.Context, origin string, keys []string) bool {
-			tk := make([]originstream.TrimKey, len(keys))
-			for i, k := range keys {
-				tk[i] = originstream.TrimKey{Origin: origin, Key: k}
-			}
-			got := st.keysLocal(ctx, c, tk, func(originstream.TrimKey) bool { return false })
-			for _, k := range tk {
-				if !got[k] {
-					return false
-				}
-			}
-			return true
-		})
+		cl := newClaimant(c, store, outbox, buffer, st.instanceFilesLocal(c))
 		if dir := filepath.Dir(walWriter.CurrentFile()); walWriter.CurrentFile() != "" {
 			cl.republish = newRepublisher(c, outbox, buffer, dir, walWriter.TrackedInstance)
 			cl.republish.current = walWriter.CurrentFile
@@ -195,119 +194,146 @@ func (c *Coordinator) originStreamPrimaryWatch(ctx context.Context, st *originSt
 	}
 }
 
-// trimReady implements the standby trim guard, once per trim pass for every
-// key with segments to trim: this node's FSM has applied at least what the
-// primary had when it published its floors, and every current hot file of
-// the key's measurement is present here at its size. Compaction and DELETE
-// rewrites replace files, and their outputs are current, so a batch whose
-// file was rewritten is trimmed only once the rewrite is here too.
-//
-// Each database's files are listed once per pass. A file verified present
-// stays verified while it is in the manifest at the same size (files are
-// immutable); the cache keeps only paths still current.
+// trimReady implements the standby trim guard, once per trim pass, with one
+// request per (segment, key) to trim. A request is ready when this node's
+// FSM has applied at least what the primary had when it published its
+// floors, no claim or takeover may need the origin's records, and every
+// current hot file holding rows of the request's batches (by the files'
+// coverage, see raft.TrimFilesFor) is present here at its size (#1266).
+// Files holding other batches do not hold the trim back, so a standby whose
+// pulls lag still drops what its files already hold.
 func (st *originStream) trimReady(c *Coordinator) originstream.TrimReadiness {
-	return func(ctx context.Context, keys []originstream.TrimKey) map[originstream.TrimKey]bool {
+	return func(ctx context.Context, reqs []originstream.TrimRequest) []bool {
+		out := make([]bool, len(reqs))
 		fsm := c.raftNode.FSM()
 		if fsm == nil {
-			return map[originstream.TrimKey]bool{}
+			return out
 		}
+		// Read before the claims flag: a request this FSM is behind on is
+		// refused below, so the flag read after it is at least as new as the
+		// registrations the floors count.
 		applied := fsm.AppliedDone()
+		claims := fsm.StreamClaimsEnabled()
 		// An origin with an unfinished claim on one of its instances keeps
 		// every record (#1207): a claimant publishes from them, and a vanished
 		// file can make batches below the origin's floors claimable again.
 		// So does an origin this node does not hear from: it may be dead, and
 		// its records claimed once the grace ends; trimming them between the
 		// claimant reading what it holds and the claim applying would claim
-		// batches it no longer has. Per origin: a trim key does not name the
-		// instance.
+		// batches it no longer has.
 		held := map[string]bool{}
-		if fsm.StreamClaimsEnabled() {
+		if claims {
 			for _, st := range fsm.TakeoverInstanceStates() {
 				if st.Claimed && !st.ClaimDone && !st.ClaimRelease {
 					held[st.Origin] = true
 				}
 			}
 		}
-		return st.keysLocal(ctx, c, keys, func(k originstream.TrimKey) bool {
-			if applied < k.AppliedIndex || held[k.Origin] {
-				return true
+		healthy := map[string]bool{}
+		var qs []raft.TrimQuery
+		var qi []int // request index of each query
+		for i, r := range reqs {
+			// First: every check below reads this node's FSM, which must
+			// include every registration the floors count.
+			if applied < r.AppliedIndex {
+				continue
 			}
-			if fsm.StreamClaimsEnabled() && !c.originHealthy(k.Origin) {
-				return true
+			if !claims {
+				// Nothing claims from the copy. An instance that streamed
+				// before the flag turned on announces afterwards as not a
+				// fresh start, so it is untracked and never claimed either.
+				out[i] = true
+				continue
 			}
-			return false
-		})
+			ok, seen := healthy[r.Origin]
+			if !seen {
+				ok = c.originHealthy(r.Origin)
+				healthy[r.Origin] = ok
+			}
+			if held[r.Origin] || !ok {
+				continue
+			}
+			qs = append(qs, raft.TrimQuery{Instance: r.Instance, Key: r.Key, CSeqs: r.CSeqs})
+			qi = append(qi, i)
+		}
+		if len(qs) == 0 {
+			return out
+		}
+		tracked, files := fsm.TrimFilesFor(qs)
+		here := st.filesHere(ctx, c, &st.trimPresent, files)
+		for j, i := range qi {
+			// Untracked, removed or unknown: never claimed, so its batches
+			// need no file here.
+			out[i] = !tracked[j] || here[j]
+		}
+		return out
 	}
 }
 
-// keysLocal reports, per key not skipped, whether every current hot file of
-// the key's measurement is present here at its size. Compaction and DELETE
-// rewrites replace files, and their outputs are current, so a batch whose
-// file was rewritten counts only once the rewrite is here too.
-//
-// Each database's files are listed once per call. A file verified present
-// stays verified while it is in the manifest at the same size (files are
-// immutable); the cache keeps only paths still current.
-func (st *originStream) keysLocal(ctx context.Context, c *Coordinator, keys []originstream.TrimKey, skip func(originstream.TrimKey) bool) map[originstream.TrimKey]bool {
-	out := make(map[originstream.TrimKey]bool, len(keys))
-	fsm := c.raftNode.FSM()
-	if fsm == nil {
-		return out
-	}
-	type dbm struct{ db, measurement string }
-	wanted := map[dbm][]originstream.TrimKey{}
-	dbs := map[string]bool{}
-	for _, k := range keys {
-		db, m, ok := strings.Cut(k.Key, "/")
-		if !ok || skip(k) {
-			continue
+// instanceFilesLocal is the claimant's check before it drops a store copy it
+// no longer needs: every current hot file holding rows of the instance's
+// batches of those keys (by coverage, as for a trim) is here at its size.
+func (st *originStream) instanceFilesLocal(c *Coordinator) func(ctx context.Context, instance uint64, keys []string) bool {
+	return func(ctx context.Context, instance uint64, keys []string) bool {
+		fsm := c.raftNode.FSM()
+		if fsm == nil {
+			return false
 		}
-		wanted[dbm{db, m}] = append(wanted[dbm{db, m}], k)
-		dbs[db] = true
+		qs := make([]raft.TrimQuery, len(keys))
+		for i, k := range keys {
+			qs[i] = raft.TrimQuery{Instance: instance, Key: k, CSeqs: [][2]uint64{{0, math.MaxUint64}}}
+		}
+		tracked, files := fsm.TrimFilesFor(qs)
+		for j, ok := range st.filesHere(ctx, c, &st.dropPresent, files) {
+			if tracked[j] && !ok {
+				return false
+			}
+		}
+		return true
 	}
-	present := map[string]int64{}
+}
+
+// filesHere reports, per list, whether every file of it is present here at
+// its size. A file verified present stays verified while it is current at
+// the same size (files are immutable); *cache keeps only the paths of this
+// call.
+func (st *originStream) filesHere(ctx context.Context, c *Coordinator, cache *map[string]int64, lists [][]raft.TrimFile) []bool {
 	st.presentMu.Lock()
-	prev := st.present
+	prev := *cache
 	st.presentMu.Unlock()
-	for db := range dbs {
-		byMeasurement := map[string]bool{} // measurement -> every hot file present
-		for _, f := range fsm.GetFilesByDatabase(db) {
-			if f.Tier != "" && f.Tier != "hot" {
-				continue // in shared object storage, not on any node's disk
-			}
-			m := f.Measurement
-			if _, seen := byMeasurement[m]; !seen {
-				byMeasurement[m] = true
-			}
-			if _, care := wanted[dbm{db, m}]; !care || !byMeasurement[m] {
-				continue
-			}
-			if size, ok := prev[f.Path]; ok && size == f.SizeBytes {
-				present[f.Path] = size
-				continue
-			}
-			got, err := c.storage.StatFile(ctx, f.Path)
-			if err != nil || got != f.SizeBytes {
-				byMeasurement[m] = false
-				continue
-			}
-			present[f.Path] = got
+	present := map[string]int64{}
+	missing := map[string]bool{}
+	local := func(f raft.TrimFile) bool {
+		if size, ok := present[f.Path]; ok {
+			return size == f.SizeBytes
 		}
-		for key, ks := range wanted {
-			if key.db != db {
-				continue
-			}
-			ok, seen := byMeasurement[key.measurement]
-			if !seen {
-				ok = true // no current hot file: deleted or tiered, nothing to hold
-			}
-			for _, k := range ks {
-				out[k] = ok
+		if missing[f.Path] {
+			return false
+		}
+		if size, ok := prev[f.Path]; ok && size == f.SizeBytes {
+			present[f.Path] = size
+			return true
+		}
+		got, err := c.storage.StatFile(ctx, f.Path)
+		if err != nil || got != f.SizeBytes {
+			missing[f.Path] = true
+			return false
+		}
+		present[f.Path] = got
+		return true
+	}
+	out := make([]bool, len(lists))
+	for i, fs := range lists {
+		out[i] = true
+		for _, f := range fs {
+			if !local(f) {
+				out[i] = false
+				break
 			}
 		}
 	}
 	st.presentMu.Lock()
-	st.present = present
+	*cache = present
 	st.presentMu.Unlock()
 	return out
 }
@@ -404,5 +430,136 @@ func (c *Coordinator) stopOriginStream() {
 	case <-st.done:
 	case <-time.After(5 * time.Second):
 	}
+	if st.spaceDone != nil {
+		<-st.spaceDone // never touches a closed store
+	}
 	_ = st.store.Close()
+}
+
+// standbyStoreAutoShare and standbyStoreMinCap size the default standby store
+// cap: a quarter of the WAL volume, at least 1 GiB (#1266).
+const (
+	standbyStoreAutoShare  = 4
+	standbyStoreMinCap     = int64(1) << 30
+	standbyStoreMaxAutoCap = int64(32) << 30
+)
+
+// standbyStoreCap resolves cluster.standby_store_max_bytes: > 0 as given,
+// < 0 no cap, 0 (the default) a quarter of the filesystem holding dir (at
+// least 1 GiB). On a volume that does not enforce its size (k3s local-path,
+// hostPath, docker named volumes) the filesystem is the host's disk.
+func (c *Coordinator) standbyStoreCap(dir string) int64 {
+	switch v := c.cfg.StandbyStoreMaxBytes; {
+	case v > 0:
+		c.logger.Info().Int64("max_bytes", v).Msg("Standby store cap set by cluster.standby_store_max_bytes")
+		return v
+	case v < 0:
+		c.logger.Warn().Msg("cluster.standby_store_max_bytes is negative: the standby store has no cap")
+		return 0
+	}
+	total, _, err := diskSpace(dir)
+	if err != nil {
+		c.logger.Warn().Err(err).Int64("max_bytes", standbyStoreMinCap).Msg("Could not size the standby store cap from its volume; using 1 GiB")
+		return standbyStoreMinCap
+	}
+	// Capped at standbyStoreMaxAutoCap: a store at its cap is read whole at
+	// startup, and on a host disk a quarter can be hundreds of GiB.
+	capBytes := min(max(int64(total/standbyStoreAutoShare), standbyStoreMinCap), standbyStoreMaxAutoCap)
+	if standbyStoreReserve(total) >= total {
+		c.logger.Warn().Uint64("volume_bytes", total).
+			Msg("The WAL volume is smaller than the standby store's free-space reserve (2 GiB): with WAL coverage on, this standby keeps no copy of the primary's batches")
+	}
+	c.logger.Info().Uint64("volume_bytes", total).Int64("max_bytes", capBytes).
+		Msg("Standby store cap: a quarter of its volume (cluster.standby_store_max_bytes = 0)")
+	return capBytes
+}
+
+// Free-space reserve of the standby store's volume (#1266): below the
+// reserve the store stops keeping batches, so the WAL and the Parquet files
+// it shares the volume with keep their room; it resumes once a further
+// standbyStoreReserveResume is free. The store must give way BEFORE the WAL's
+// own disk gate (#676: off at its 512 MiB reserve plus two WAL files, ~712
+// MiB at defaults), or a standby fills the volume and is under disk pressure
+// the moment it is promoted: the 2 GiB floor keeps the reserve above it.
+const (
+	standbyStoreSpaceEvery    = 5 * time.Second
+	standbyStoreReserveMin    = uint64(2) << 30
+	standbyStoreReserveShare  = 10 // percent of the volume
+	standbyStoreReserveResume = uint64(1) << 30
+)
+
+// diskSpace is diskspace.Space; a var for tests.
+var diskSpace = diskspace.Space
+
+// lowSpaceNext is the reserve's state after a reading, with hysteresis.
+func lowSpaceNext(low bool, total, avail uint64) bool {
+	return lowSpaceNextAt(low, avail, standbyStoreReserve(total))
+}
+
+func lowSpaceNextAt(low bool, avail, reserve uint64) bool {
+	switch {
+	case !low && avail < reserve:
+		return true
+	case low && avail >= reserve+standbyStoreReserveResume:
+		return false
+	}
+	return low
+}
+
+func standbyStoreReserve(total uint64) uint64 {
+	return max(total/100*standbyStoreReserveShare, standbyStoreReserveMin)
+}
+
+// standbyStoreWALMargin is how far the store's reserve stays above the WAL
+// disk gate's off-point when that is set large (#676).
+const standbyStoreWALMargin = uint64(512) << 20
+
+// SetWALDiskOffPoint gives the standby store the WAL disk gate's off-point on
+// a volume of total bytes (wal.DiskPressureLevels, #676), so the store's
+// reserve stays above it whatever wal.disk_min_free_mb is: the store gives way
+// before the WAL gate turns on. At the WAL defaults (an off-point near 712
+// MiB) the 2 GiB floor already is, so nothing changes. Set before the origin
+// stream starts.
+func (c *Coordinator) SetWALDiskOffPoint(offPoint func(total uint64) uint64) {
+	c.walDiskOffPoint.Store(&offPoint)
+}
+
+// standbyLowSpaceNext is the store's low-space state after a reading, and the
+// reserve it was judged against.
+func (c *Coordinator) standbyLowSpaceNext(low bool, total, avail uint64) (bool, uint64) {
+	reserve := c.standbyReserve(total)
+	return lowSpaceNextAt(low, avail, reserve), reserve
+}
+
+// standbyReserve is the store's free-space reserve on a volume of total bytes.
+func (c *Coordinator) standbyReserve(total uint64) uint64 {
+	r := standbyStoreReserve(total)
+	if f := c.walDiskOffPoint.Load(); f != nil && *f != nil {
+		r = max(r, (*f)(total)+standbyStoreWALMargin)
+	}
+	return r
+}
+
+// watchStandbyStoreSpace checks the store's volume on its own tick.
+func (c *Coordinator) watchStandbyStoreSpace(ctx context.Context, store *originstream.Store, root string) {
+	t := time.NewTicker(standbyStoreSpaceEvery)
+	defer t.Stop()
+	low, warned := false, false
+	for {
+		total, avail, err := diskSpace(root)
+		switch {
+		case err == nil && total > 0:
+			var reserve uint64
+			low, reserve = c.standbyLowSpaceNext(low, total, avail)
+			store.SetLowSpace(low, avail, reserve)
+		case !warned:
+			warned = true
+			c.logger.Warn().Err(err).Msg("Cannot read the standby store volume's free space; its free-space reserve is not enforced")
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
 }

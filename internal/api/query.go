@@ -25,7 +25,6 @@ import (
 	"github.com/basekick-labs/arc/internal/license"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/pruning"
-	"github.com/basekick-labs/arc/internal/query"
 	"github.com/basekick-labs/arc/internal/queryregistry"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -51,8 +50,6 @@ type TableReference struct {
 	Database    string
 	Measurement string
 }
-
-type queryPermissionRefsCtxKey struct{}
 
 // Regex patterns for SHOW commands
 var (
@@ -685,8 +682,7 @@ type QueryHandler struct {
 	logger                  zerolog.Logger
 	authManager             *auth.AuthManager
 	rbacManager             RBACChecker
-	debugEnabled            bool // Cached check for debug logging to avoid repeated level checks
-	parallelExecutor        *query.ParallelExecutor
+	debugEnabled            bool          // Cached check for debug logging to avoid repeated level checks
 	queryTimeout            time.Duration // Query timeout (0 = no timeout)
 	disableClientDisconnect bool
 	slowQueryThreshold      time.Duration // Slow query WARN threshold (0 = disabled)
@@ -999,7 +995,6 @@ func NewQueryHandler(db *database.DuckDB, storage storage.Backend, logger zerolo
 		logger:             handlerLogger,
 		rbacManager:        nil,
 		debugEnabled:       handlerLogger.GetLevel() <= zerolog.DebugLevel,
-		parallelExecutor:   query.NewParallelExecutor(db.DB(), query.DefaultParallelConfig(), handlerLogger),
 		queryTimeout:       queryTimeout,
 		slowQueryThreshold: slowQueryThreshold,
 	}
@@ -1658,16 +1653,24 @@ func (h *QueryHandler) checkQueryPermissions(c *fiber.Ctx, sql, permission strin
 // `where` fragment resolves to "default", and it must pass "" here. Passing the
 // header there instead would check <header>/x while the query reads default/x.
 func (h *QueryHandler) checkQueryPermissionsForDefaultDB(c *fiber.Ctx, sql, permission, defaultDB string) error {
-	// If no RBAC manager, skip permission check (handled by basic auth middleware).
+	// If no RBAC manager, skip permission check (handled by basic auth middleware)
 	// Gated on the checker being WIRED, not on the license. Enforcement must
 	// survive a lapsed or revoked license: see the RBAC ENFORCEMENT MODEL note
 	// in internal/auth/rbac_manager.go. CheckPermission itself resolves the
 	// three cases (admin break-glass, memberships -> RBAC authoritative, no
 	// memberships -> coarse permissions), so a deployment without RBAC
 	// configured is unaffected.
-	if h.rbacManager == nil || auth.GetTokenInfo(c) == nil {
+	if h.rbacManager == nil {
 		return nil
 	}
+
+	// Get token info from context
+	tokenInfo := auth.GetTokenInfo(c)
+	if tokenInfo == nil {
+		// No token info means basic auth middleware allowed it (or auth disabled)
+		return nil
+	}
+
 	// Normalise SQL before extracting table references. This MUST match the
 	// normalisation that convertSQLToStoragePaths applies downstream, or the
 	// permission check and the executed query disagree on which tables are
@@ -1680,7 +1683,30 @@ func (h *QueryHandler) checkQueryPermissionsForDefaultDB(c *fiber.Ctx, sql, perm
 	//     table name can't hide a reference (SECURITY: RBAC bypass — the query
 	//     `SELECT * FROM /* x */ secret.cpu` would otherwise yield zero refs
 	//     here yet still execute against secret.cpu after the transform).
-	tableRefs := queryTableReferences(sql, defaultDB)
+	features := scanSQLFeatures(sql)
+	normalisedSQL, permMasks := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
+	normalisedSQL, _ = sqlutil.MaskFromKeywordsInFunctionBodies(normalisedSQL)
+	normalisedSQL = stripSQLComments(normalisedSQL, features.hasDashComment || features.hasBlockComment)
+
+	// Extract table references from the normalised SQL. The identifier-mask
+	// table rides along so quoted references are checked under their real
+	// names — the same resolution the query transform applies.
+	tableRefs := extractTableReferences(normalisedSQL, sqlutil.IdentifierNames(permMasks))
+
+	// Re-point bare "default" references at the database the TRANSFORM will
+	// resolve them against. Without this, a user with default.cpu:read could
+	// bypass RBAC and query sensitive_db.cpu by setting x-arc-database:
+	// sensitive_db — the check would use "default" while the transform used
+	// the header. defaultDB is supplied by the caller rather than read here,
+	// because the two callers get it from different places; see the doc
+	// comment above.
+	if defaultDB != "" {
+		for i := range tableRefs {
+			if tableRefs[i].Database == "default" {
+				tableRefs[i].Database = defaultDB
+			}
+		}
+	}
 	c.Locals(queryPermissionRefsCtxKey{}, append([]TableReference(nil), tableRefs...))
 	if len(tableRefs) == 0 {
 		// No tables referenced (e.g., SELECT 1+1)
@@ -1694,40 +1720,9 @@ func (h *QueryHandler) checkQueryPermissionsForDefaultDB(c *fiber.Ctx, sql, perm
 			Msg("Checking RBAC permissions for query")
 	}
 
-	return h.checkTableReferencePermissions(c, tableRefs, permission)
-}
-
-// queryTableReferences applies the shared query normalisation and resolves bare
-// table names against the database used by the transform.
-func queryTableReferences(sql, defaultDB string) []TableReference {
-	features := scanSQLFeatures(sql)
-	normalisedSQL, masks := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
-	normalisedSQL, _ = sqlutil.MaskFromKeywordsInFunctionBodies(normalisedSQL)
-	normalisedSQL = stripSQLComments(normalisedSQL, features.hasDashComment || features.hasBlockComment)
-	refs := extractTableReferences(normalisedSQL, sqlutil.IdentifierNames(masks))
-	if defaultDB != "" {
-		for i := range refs {
-			if refs[i].Database == "default" {
-				refs[i].Database = defaultDB
-			}
-		}
-	}
-	return refs
-}
-
-// checkTableReferencePermissions checks an explicit set of resolved table
-// references. It is also used after rewriting, when the paths actually emitted
-// by Arc may differ from the source-level references extracted before rewrite.
-func (h *QueryHandler) checkTableReferencePermissions(c *fiber.Ctx, refs []TableReference, permission string) error {
-	if h.rbacManager == nil || len(refs) == 0 {
-		return nil
-	}
-	tokenInfo := auth.GetTokenInfo(c)
-	if tokenInfo == nil {
-		return nil
-	}
-	reqs := make([]*auth.PermissionCheckRequest, len(refs))
-	for i, ref := range refs {
+	// Build batch request for all table references
+	reqs := make([]*auth.PermissionCheckRequest, len(tableRefs))
+	for i, ref := range tableRefs {
 		reqs[i] = &auth.PermissionCheckRequest{
 			TokenInfo:   tokenInfo,
 			Database:    ref.Database,
@@ -1735,10 +1730,14 @@ func (h *QueryHandler) checkTableReferencePermissions(c *fiber.Ctx, refs []Table
 			Permission:  permission,
 		}
 	}
+
+	// Batch check all permissions (single RBAC data load for same token)
 	results := h.rbacManager.CheckPermissionsBatch(reqs)
+
+	// Check for any denials
 	for i, result := range results {
-		ref := refs[i]
 		if !result.Allowed {
+			ref := tableRefs[i]
 			h.logger.Warn().
 				Str("database", ref.Database).
 				Str("measurement", ref.Measurement).
@@ -1748,22 +1747,25 @@ func (h *QueryHandler) checkTableReferencePermissions(c *fiber.Ctx, refs []Table
 				Msg("RBAC permission denied")
 			return fmt.Errorf("access denied: no %s permission for %s.%s", permission, ref.Database, ref.Measurement)
 		}
+
 		if h.debugEnabled {
 			h.logger.Debug().
-				Str("database", ref.Database).
-				Str("measurement", ref.Measurement).
+				Str("database", tableRefs[i].Database).
+				Str("measurement", tableRefs[i].Measurement).
 				Str("permission", permission).
 				Str("source", result.Source).
 				Msg("RBAC permission granted")
 		}
 	}
+
 	return nil
 }
 
-// checkEmittedQueryPermissions rechecks only references Arc's transformer
-// actually resolved that were absent from the source-level RBAC check. The
-// ordinary path adds no second permission-store lookup; only a disagreement
-// between the extractor and transformer incurs one.
+type queryPermissionRefsCtxKey struct{}
+
+// checkEmittedQueryPermissions checks transform-resolved scopes that were not
+// covered by the source-SQL permission check. This keeps the normal path to one
+// RBAC lookup while failing closed when extraction and transformation differ.
 func (h *QueryHandler) checkEmittedQueryPermissions(c *fiber.Ctx, permission string, emitted []TableReference) error {
 	if h.rbacManager == nil || auth.GetTokenInfo(c) == nil || len(emitted) == 0 {
 		return nil
@@ -1773,7 +1775,7 @@ func (h *QueryHandler) checkEmittedQueryPermissions(c *fiber.Ctx, permission str
 	for _, ref := range checkedRefs {
 		checked[ref.Database+"\x00"+ref.Measurement] = struct{}{}
 	}
-	missing := make([]TableReference, 0)
+	missing := make([]TableReference, 0, len(emitted))
 	for _, ref := range emitted {
 		key := ref.Database + "\x00" + ref.Measurement
 		if _, ok := checked[key]; !ok {
@@ -1781,7 +1783,27 @@ func (h *QueryHandler) checkEmittedQueryPermissions(c *fiber.Ctx, permission str
 			missing = append(missing, ref)
 		}
 	}
-	return h.checkTableReferencePermissions(c, missing, permission)
+	if len(missing) == 0 {
+		return nil
+	}
+
+	tokenInfo := auth.GetTokenInfo(c)
+	reqs := make([]*auth.PermissionCheckRequest, len(missing))
+	for i, ref := range missing {
+		reqs[i] = &auth.PermissionCheckRequest{
+			TokenInfo: tokenInfo, Database: ref.Database, Measurement: ref.Measurement, Permission: permission,
+		}
+	}
+	results := h.rbacManager.CheckPermissionsBatch(reqs)
+	for i, ref := range missing {
+		if i >= len(results) || results[i] == nil || !results[i].Allowed {
+			h.logger.Warn().Str("database", ref.Database).Str("measurement", ref.Measurement).
+				Str("permission", permission).Int64("token_id", tokenInfo.ID).
+				Msg("RBAC denied storage scope emitted by query transform")
+			return fmt.Errorf("access denied: no %s permission for %s.%s", permission, ref.Database, ref.Measurement)
+		}
+	}
+	return nil
 }
 
 // filterReadableMeasurementInfos is filterReadableMeasurements for the
@@ -2122,8 +2144,8 @@ localProcessing:
 		return respondError(c, fiber.StatusForbidden, err.Error(), timestamp, start)
 	}
 
-	// Convert SQL to storage paths and check for parallel execution opportunity
-	convertedSQL, parallelInfo, cached, emittedRefs, err := h.getTransformedSQLForParallelWithRefs(c.Context(), req.SQL, headerDB)
+	// Convert SQL to storage paths
+	convertedSQL, cached, emittedRefs, err := h.getTransformedSQLForQueryWithRefs(c.Context(), req.SQL, headerDB)
 	if err != nil {
 		m.IncQueryErrors()
 		return respondError(c, fiber.StatusBadRequest, err.Error(), timestamp, start)
@@ -2134,9 +2156,6 @@ localProcessing:
 	}
 
 	// arcx decline census (no-op stub in stock builds; no query text is emitted).
-	// MUST sit before the parallel dispatch below: parallel takes exactly the
-	// simple single-table queries arcx targets, so counting at the arcx hook in
-	// the else-branch would bias the census against the shapes worth building.
 	h.recordArcxShapeCensus(req.SQL, headerDB)
 
 	if h.debugEnabled {
@@ -2144,7 +2163,6 @@ localProcessing:
 			Str("original_sql", sqlutil.ForLog(req.SQL)).
 			Str("converted_sql", sqlutil.ForLog(convertedSQL)).
 			Bool("cache_hit", cached).
-			Bool("parallel", parallelInfo != nil).
 			Str("header_db", headerDB).
 			Msg("Executing query")
 	}
@@ -2162,18 +2180,13 @@ localProcessing:
 			tokenID = tokenInfo.ID
 			tokenName = tokenInfo.Name
 		}
-		isParallel := parallelInfo != nil && h.parallelExecutor != nil
-		partCount := 0
-		if isParallel {
-			partCount = len(parallelInfo.Paths)
-		}
 		queryID, queryCtx = h.queryRegistry.Register(
-			c.UserContext(), req.SQL, tokenID, tokenName, c.IP(), isParallel, partCount,
+			c.UserContext(), req.SQL, tokenID, tokenName, c.IP(),
 		)
 		c.Set("X-Arc-Query-ID", queryID)
 	}
 
-	// Compute effective timeout for both parallel and standard paths
+	// Compute effective timeout
 	effectiveTimeout := h.queryTimeout
 	if governanceTimeout > 0 {
 		effectiveTimeout = governanceTimeout
@@ -2182,425 +2195,224 @@ localProcessing:
 	// Check for profiling mode
 	profileMode := c.Get("x-arc-profile") == "true"
 
-	// Execute query - use parallel path if available
-	// (msgpack endpoint deliberately bypasses the parallel-partition
-	// executor: its response shape and per-partition merging is wired
-	// for JSON streaming. The msgpack experiment routes only through
-	// the standard Arrow dispatch below.)
-	if parallelInfo != nil && h.parallelExecutor != nil && !isMsgPackWire(c) {
-		// Parallel partition execution — use registry context if available
-		execCtx := c.UserContext()
-		if queryCtx != nil {
-			execCtx = queryCtx
-		}
-		var cancelTimeout context.CancelFunc
-		if effectiveTimeout > 0 {
-			execCtx, cancelTimeout = context.WithTimeout(execCtx, effectiveTimeout)
-			// Note: cancelTimeout is called inside the stream writer callback, not deferred here,
-			// because SetBodyStreamWriter runs asynchronously after this function returns.
-		}
-		if cancelTimeout == nil {
-			execCtx, cancelTimeout = context.WithCancel(execCtx)
-		}
-		recordDisconnect := h.watchQueryClientDisconnect(execCtx, c.Context().Conn(), queryID, cancelTimeout, metrics.DisconnectPathSQLJSON)
-		results, err := h.parallelExecutor.ExecutePartitioned(
-			execCtx,
-			parallelInfo.Paths,
-			parallelInfo.QueryTemplate,
-			parallelInfo.ReadParquetOptions,
-			parallelInfo.AnchorPath,
-		)
-		if err != nil {
-			// Read the cause before releasing the timeout context: cancelTimeout
-			// turns execCtx.Err() into Canceled for every failure, which filed a
-			// plain execution error as "already cancelled" and left the registry
-			// entry running forever (#309, found while giving the Arrow path the
-			// same dispositions).
-			ctxErr := execCtx.Err()
-			if cancelTimeout != nil {
-				cancelTimeout()
-			}
-			m.IncQueryErrors()
-			if h.queryRegistry != nil && queryID != "" {
-				if ctxErr == context.DeadlineExceeded {
-					h.queryRegistry.TimedOut(queryID)
-				} else if ctxErr == context.Canceled {
-					// Already marked as cancelled by Cancel() — no-op
-				} else {
-					h.queryRegistry.Fail(queryID, "Parallel query execution failed")
-				}
-			}
-			h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(req.SQL)).Msg("Parallel query execution failed")
-			return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
-				Success:         false,
-				Error:           err.Error(),
-				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
-				Timestamp:       timestamp,
-			})
-		}
+	// Execute the query (one DuckDB query; DuckDB reads the pruned partitions
+	// in parallel itself).
 
-		// CRITICAL: per-partition error inspection. ExecutePartitioned
-		// returns successfully even if individual partitions errored
-		// (PartitionResult.Error != nil). NewMergedRowIterator below
-		// would happily ignore errored partitions and return rows from
-		// the surviving ones, producing a 200 with `success:true` and
-		// silently dropping a fraction of the result. That is exactly
-		// the silent-data-loss class CLAUDE.md prohibits — fail loudly
-		// instead. See review/query-path-criticals C4.
-		var erroredPaths []string
-		var firstPartitionErr error
-		for _, r := range results {
-			if r.Error != nil {
-				erroredPaths = append(erroredPaths, r.Path)
-				if firstPartitionErr == nil {
-					firstPartitionErr = r.Error
-				}
-			}
+	// Create context with timeout if configured (0 = no timeout)
+	ctx := c.UserContext()
+	if queryCtx != nil {
+		ctx = queryCtx
+	}
+	var cancel context.CancelFunc
+	if effectiveTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, effectiveTimeout)
+		// Note: cancel is called inside the stream writer callback, not deferred here,
+		// because SetBodyStreamWriter runs asynchronously after this function returns.
+	}
+	if cancel == nil {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	recordDisconnect := h.watchQueryClientDisconnect(ctx, c.Context().Conn(), queryID, cancel, metrics.DisconnectPathSQLJSON)
+
+	// arcx router hook. Decides eligibility on the RAW req.SQL (date_trunc
+	// still intact, before rewriteDateTrunc's epoch rewrite) and, in serve
+	// mode, may serve the response from the arcx engine. In shadow mode (the
+	// default when built with -tags=arcx_engine) it compares arcx vs DuckDB
+	// off to the side and returns false, so the DuckDB dispatch below serves
+	// untouched. Without the tag this is a no-op stub — stock Arc is
+	// unaffected. See internal/arcxrouter + docs 2026-07-05-router-phase1.
+	// Build the governance/registry callbacks the arcx serve path needs to record the
+	// same success/rows/latency + registry completion as the DuckDB path (else arcx-served
+	// queries vanish from metrics and leak registry entries). Same closures as the DuckDB
+	// dispatch below (queryID is set above, before this hook).
+	var arcxOnComplete func(int)
+	var arcxOnFail func(string)
+	if h.queryRegistry != nil && queryID != "" {
+		arcxOnComplete = func(rc int) {
+			h.queryRegistry.RecordRowCap(queryID, reachedRowCap(governanceMaxRows, int64(rc)))
+			h.queryRegistry.Complete(queryID, rc)
 		}
-		if len(erroredPaths) > 0 {
-			// Close any rows that DID succeed before bailing.
-			for _, r := range results {
-				if r.Rows != nil {
-					r.Rows.Close()
-				}
-			}
-			if cancelTimeout != nil {
-				cancelTimeout()
-			}
-			m.IncQueryErrors()
-			if h.queryRegistry != nil && queryID != "" {
-				if execCtx.Err() == context.DeadlineExceeded {
-					h.queryRegistry.TimedOut(queryID)
-				} else {
-					h.queryRegistry.Fail(queryID, fmt.Sprintf("%d/%d partitions failed: %s",
-						len(erroredPaths), len(results),
-						sqlutil.SanitizeErrText(firstPartitionErr.Error())))
-				}
-			}
-			// Sample paths at log level — full list could be hundreds.
-			samplePaths := erroredPaths
-			if len(samplePaths) > 5 {
-				samplePaths = samplePaths[:5]
-			}
-			h.logger.Error().
-				Err(firstPartitionErr).
-				Int("errored_partitions", len(erroredPaths)).
-				Int("total_partitions", len(results)).
-				Strs("sample_paths", samplePaths).
-				Str("sql", sqlutil.ForLog(req.SQL)).
-				Msg("Parallel query: partition error(s) — failing whole request to avoid silent partial result")
-			return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
-				Success: false,
-				Error: fmt.Sprintf("parallel query: %d of %d partitions failed (first error: %v)",
-					len(erroredPaths), len(results), firstPartitionErr),
-				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
-				Timestamp:       timestamp,
-			})
-		}
-
-		// Create merged iterator
-		iter, err := query.NewMergedRowIterator(results, h.logger)
-		if err != nil {
-			// Close all results on error
-			for _, r := range results {
-				if r.Rows != nil {
-					r.Rows.Close()
-				}
-			}
-			if cancelTimeout != nil {
-				cancelTimeout()
-			}
-			m.IncQueryErrors()
-			if h.queryRegistry != nil && queryID != "" {
-				h.queryRegistry.Fail(queryID, "Failed to create merged iterator")
-			}
-			h.logger.Error().Err(err).Msg("Failed to create merged iterator")
-			return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
-				Success:         false,
-				Error:           err.Error(),
-				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
-				Timestamp:       timestamp,
-			})
-		}
-
-		columns = iter.Columns()
-
-		// Get column types from first successful partition for typed JSON serialization
-		var colTypes []colType
-		for _, r := range results {
-			if r.Error == nil && r.Rows != nil {
-				if ct, err := r.Rows.ColumnTypes(); err == nil {
-					colTypes = mapColumnTypes(ct)
-					break
-				}
-			}
-		}
-		if colTypes == nil {
-			// Fallback: treat all columns as strings
-			colTypes = make([]colType, len(columns))
-		}
-
-		// Capture token name before async callback (Fiber context not safe in callbacks)
-		tokenName := getTokenName(c)
-		tokenID := getTokenID(c)
-
-		// Stream typed JSON response directly to HTTP — no full-response buffering.
-		// streamCtx captures the timeout-aware context for per-row cancellation
-		// inside the streaming callback. The callback runs async after this
-		// handler returns; closing over execCtx is fine because cancelTimeout
-		// is fired inside the callback after streaming completes.
-		streamCtx := execCtx
-		c.Set("Content-Type", "application/json")
-		c.Context().SetBodyStreamWriter(h.safeStream("query_json_parallel", func() {
-			// A panic leaves the registry entry in "running" forever: the
-			// disposition calls below are skipped by the unwind and nothing
-			// reaps active entries (#717). Fail is a no-op if the normal
-			// path already disposed of it.
-			if h.queryRegistry != nil && queryID != "" {
-				h.queryRegistry.Fail(queryID, "stream writer panicked")
-			}
-		}, func(w *bufio.Writer) {
-			// One defer, in the original order: separate defers would run
-			// LIFO and cancel the timeout before the iterator is closed.
-			defer func() {
-				iter.Close()
-				if cancelTimeout != nil {
-					cancelTimeout()
-				}
-			}()
-			rowCount, streamErr := streamTypedJSONFunc(streamCtx, w, columns, colTypes, iter, governanceMaxRows, profile, start, timestamp)
-			w.Flush()
-
-			// Reported before the error branch below: a stream can reach the
-			// cap and then fail on the way out, and the envelope marks it
-			// capped either way, so the operator-side record has to fire on
-			// both paths or it would go missing in the one case where the
-			// result is both capped and truncated (#724).
-			h.logGovernanceRowCap("json", convertedSQL, tokenID, tokenName, governanceMaxRows, int64(rowCount))
-			// Same reasoning for the history entry (#728): recorded here,
-			// before the disposition below, so a result that reached the cap
-			// and then failed keeps the cap instead of losing it on the
-			// Fail/TimedOut path.
-			if h.queryRegistry != nil && queryID != "" {
-				h.queryRegistry.RecordRowCap(queryID, reachedRowCap(governanceMaxRows, int64(rowCount)))
-			}
-
-			// Record metrics after streaming completes. If the stream
-			// terminated mid-flight (Scan / Err / ctx cancel), record as
-			// a failure even though the JSON envelope was already sent —
-			// operators must see the partial-result signal. See C5.
-			if streamErr != nil {
-				m.IncQueryErrors()
-				if h.queryRegistry != nil && queryID != "" {
-					if errors.Is(streamErr, context.DeadlineExceeded) {
-						h.queryRegistry.TimedOut(queryID)
-					} else {
-						h.queryRegistry.Fail(queryID, sqlutil.SanitizeErrText(streamErr.Error()))
-					}
-				}
-				// Per-handler client-disconnect counter (#426).
-				if isClientError(streamErr) {
-					recordDisconnect()
-				}
-				// Warn for client-disconnect / context expiry (headers already
-				// committed, partial result was delivered). Error for genuine
-				// server-side failures (scanner, db iteration).
-				h.streamErrEvent(streamErr).Err(streamErr).
-					Int("rows_sent", rowCount).
-					Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
-					Msg("Query stream truncated after headers committed; client received partial result")
-				return
-			}
-			if h.queryRegistry != nil && queryID != "" {
-				h.queryRegistry.Complete(queryID, rowCount)
-			}
-			m.IncQuerySuccess()
-			m.IncQueryRows(int64(rowCount))
-			m.RecordQueryLatency(time.Since(start).Microseconds())
-
-			h.logger.Info().
-				Int("row_count", rowCount).
-				Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
-				Msg("Query completed")
-			h.logSlowQuery(convertedSQL, start, rowCount, tokenName)
-		}))
+		arcxOnFail = func(msg string) { h.queryRegistry.Fail(queryID, msg) }
+	}
+	if h.tryArcxRouter(c, ctx, cancel, start, req.SQL, headerDB, convertedSQL,
+		governanceMaxRows, arcxOnComplete, arcxOnFail) {
+		// The arcx serve path owns `cancel` (called inside its async stream writer),
+		// so do NOT cancel here — that would cancel the in-flight stream.
 		return nil
-	} else {
-		// Standard single-query execution
+	}
 
-		// Create context with timeout if configured (0 = no timeout)
-		ctx := c.UserContext()
-		if queryCtx != nil {
-			ctx = queryCtx
+	// Arrow-native path: bypasses database/sql row scanning entirely — reads typed
+	// values directly from DuckDB's internal Arrow columnar chunks.
+	//
+	// Wire-format selector: the msgpack endpoint
+	// (POST /api/v1/query/msgpack) sets c.Locals("wire_format", "msgpack")
+	// in its wrapper handler so this dispatch can route to the msgpack
+	// streamer instead of JSON. Unknown / missing values default to JSON.
+	// When the msgpack dispatch fails ("handled=false", e.g. driver
+	// doesn't implement Arrow), we return 501 instead of falling back
+	// to database/sql — the entire reason for the msgpack endpoint is
+	// the typed Arrow encode, and a Scan-based fallback would silently
+	// defeat that contract.
+	arrowDispatch := arrowJSONQueryFunc
+	isMsgPack := isMsgPackWire(c)
+	if isMsgPack {
+		arrowDispatch = arrowMsgPackQueryFunc
+	}
+	// When built without -tags=duckdb_arrow, arrowMsgPackQueryFunc
+	// is nil; the JSON path would silently fall through to the
+	// database/sql route, but a msgpack client must NOT receive
+	// JSON. Short-circuit to 501 here so the wire-format contract
+	// is preserved end-to-end.
+	if isMsgPack && arrowDispatch == nil {
+		if cancel != nil {
+			cancel()
 		}
-		var cancel context.CancelFunc
-		if effectiveTimeout > 0 {
-			ctx, cancel = context.WithTimeout(ctx, effectiveTimeout)
-			// Note: cancel is called inside the stream writer callback, not deferred here,
-			// because SetBodyStreamWriter runs asynchronously after this function returns.
-		}
-		if cancel == nil {
-			ctx, cancel = context.WithCancel(ctx)
-		}
-		recordDisconnect := h.watchQueryClientDisconnect(ctx, c.Context().Conn(), queryID, cancel, metrics.DisconnectPathSQLJSON)
-
-		// arcx router hook. Decides eligibility on the RAW req.SQL (date_trunc
-		// still intact, before rewriteDateTrunc's epoch rewrite) and, in serve
-		// mode, may serve the response from the arcx engine. In shadow mode (the
-		// default when built with -tags=arcx_engine) it compares arcx vs DuckDB
-		// off to the side and returns false, so the DuckDB dispatch below serves
-		// untouched. Without the tag this is a no-op stub — stock Arc is
-		// unaffected. See internal/arcxrouter + docs 2026-07-05-router-phase1.
-		// Build the governance/registry callbacks the arcx serve path needs to record the
-		// same success/rows/latency + registry completion as the DuckDB path (else arcx-served
-		// queries vanish from metrics and leak registry entries). Same closures as the DuckDB
-		// dispatch below (queryID is set above, before this hook).
-		var arcxOnComplete func(int)
-		var arcxOnFail func(string)
+		return respondError(c, fiber.StatusNotImplemented, "msgpack query path requires the duckdb_arrow build tag", timestamp, start)
+	}
+	if arrowDispatch != nil {
+		var onComplete func(int)
+		var onFail func(string)
+		var onTimeout func()
 		if h.queryRegistry != nil && queryID != "" {
-			arcxOnComplete = func(rc int) {
+			onComplete = func(rc int) {
 				h.queryRegistry.RecordRowCap(queryID, reachedRowCap(governanceMaxRows, int64(rc)))
 				h.queryRegistry.Complete(queryID, rc)
 			}
-			arcxOnFail = func(msg string) { h.queryRegistry.Fail(queryID, msg) }
+			onFail = func(msg string) { h.queryRegistry.Fail(queryID, msg) }
+			onTimeout = func() { h.queryRegistry.TimedOut(queryID) }
 		}
-		if h.tryArcxRouter(c, ctx, cancel, start, req.SQL, headerDB, convertedSQL,
-			governanceMaxRows, arcxOnComplete, arcxOnFail) {
-			// The arcx serve path owns `cancel` (called inside its async stream writer),
-			// so do NOT cancel here — that would cancel the in-flight stream.
+		_, handled := arrowDispatch(h, c, ctx, cancel, convertedSQL, profileMode, governanceMaxRows, start, timestamp, onComplete, onFail, onTimeout)
+		if handled {
+			// Arrow path handled the response — registry callbacks are invoked
+			// inside executeArrowJSONQuery / executeArrowMsgPackQuery (either
+			// directly for errors, or via the async stream writer callback
+			// for success).
 			return nil
 		}
-
-		// Arrow-native path: bypasses database/sql row scanning entirely — reads typed
-		// values directly from DuckDB's internal Arrow columnar chunks.
-		//
-		// Wire-format selector: the msgpack endpoint
-		// (POST /api/v1/query/msgpack) sets c.Locals("wire_format", "msgpack")
-		// in its wrapper handler so this dispatch can route to the msgpack
-		// streamer instead of JSON. Unknown / missing values default to JSON.
-		// When the msgpack dispatch fails ("handled=false", e.g. driver
-		// doesn't implement Arrow), we return 501 instead of falling back
-		// to database/sql — the entire reason for the msgpack endpoint is
-		// the typed Arrow encode, and a Scan-based fallback would silently
-		// defeat that contract.
-		arrowDispatch := arrowJSONQueryFunc
-		isMsgPack := isMsgPackWire(c)
 		if isMsgPack {
-			arrowDispatch = arrowMsgPackQueryFunc
-		}
-		// When built without -tags=duckdb_arrow, arrowMsgPackQueryFunc
-		// is nil; the JSON path would silently fall through to the
-		// database/sql route, but a msgpack client must NOT receive
-		// JSON. Short-circuit to 501 here so the wire-format contract
-		// is preserved end-to-end.
-		if isMsgPack && arrowDispatch == nil {
+			// No database/sql fallback for the msgpack endpoint — return 501.
 			if cancel != nil {
 				cancel()
 			}
 			return respondError(c, fiber.StatusNotImplemented, "msgpack query path requires the duckdb_arrow build tag", timestamp, start)
 		}
-		if arrowDispatch != nil {
-			var onComplete func(int)
-			var onFail func(string)
-			var onTimeout func()
-			if h.queryRegistry != nil && queryID != "" {
-				onComplete = func(rc int) {
-					h.queryRegistry.RecordRowCap(queryID, reachedRowCap(governanceMaxRows, int64(rc)))
-					h.queryRegistry.Complete(queryID, rc)
-				}
-				onFail = func(msg string) { h.queryRegistry.Fail(queryID, msg) }
-				onTimeout = func() { h.queryRegistry.TimedOut(queryID) }
-			}
-			_, handled := arrowDispatch(h, c, ctx, cancel, convertedSQL, profileMode, governanceMaxRows, start, timestamp, onComplete, onFail, onTimeout)
-			if handled {
-				// Arrow path handled the response — registry callbacks are invoked
-				// inside executeArrowJSONQuery / executeArrowMsgPackQuery (either
-				// directly for errors, or via the async stream writer callback
-				// for success).
-				return nil
-			}
-			if isMsgPack {
-				// No database/sql fallback for the msgpack endpoint — return 501.
-				if cancel != nil {
-					cancel()
-				}
-				return respondError(c, fiber.StatusNotImplemented, "msgpack query path requires the duckdb_arrow build tag", timestamp, start)
-			}
-			// handled=false means Arrow path declined (e.g., driver issue).
-			// Fall through to database/sql path.
+		// handled=false means Arrow path declined (e.g., driver issue).
+		// Fall through to database/sql path.
+	}
+
+	var rows *sql.Rows
+	var profileConn *sql.Conn // pinned connection for profiled queries — caller must close
+
+	if profileMode {
+		// Use profiled query to capture timing breakdown (with timeout support)
+		rows, profileConn, profile, err = h.db.QueryWithProfileContext(ctx, convertedSQL)
+	} else {
+		rows, err = h.db.QueryContext(ctx, convertedSQL)
+	}
+
+	if err != nil {
+		// The cause must be read before cancel() turns it into Canceled.
+		ctxErr := ctx.Err()
+		if cancel != nil {
+			cancel()
 		}
-
-		var rows *sql.Rows
-		var profileConn *sql.Conn // pinned connection for profiled queries — caller must close
-		var err error
-
-		if profileMode {
-			// Use profiled query to capture timing breakdown (with timeout support)
-			rows, profileConn, profile, err = h.db.QueryWithProfileContext(ctx, convertedSQL)
-		} else {
-			rows, err = h.db.QueryContext(ctx, convertedSQL)
-		}
-
-		if err != nil {
-			// Same ordering fix as the parallel path above: the cause must be read
-			// before cancel() turns it into Canceled.
-			ctxErr := ctx.Err()
-			if cancel != nil {
-				cancel()
-			}
-			// Check if this is a "no files found" error — treat as empty result, not an error.
-			// This happens when querying a measurement that has no data on storage yet
-			// (e.g., new measurement, or DuckDB's httpfs cache is stale).
-			if isNoFilesFoundError(err) && !h.missingAnchor(err) {
-				h.logger.Info().Str("sql", sqlutil.ForLog(req.SQL)).Msg("No files found for measurement, returning empty result")
-				m.IncQuerySuccess()
-				if h.queryRegistry != nil && queryID != "" {
-					h.queryRegistry.Complete(queryID, 0)
-				}
-				return c.JSON(QueryResponse{
-					Success:         true,
-					Columns:         []string{},
-					Data:            [][]interface{}{},
-					RowCount:        0,
-					ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
-					Timestamp:       timestamp,
-				})
-			}
-
-			m.IncQueryErrors()
-			// Check if it was a timeout
-			if effectiveTimeout > 0 && ctxErr == context.DeadlineExceeded {
-				m.IncQueryTimeouts()
-				if h.queryRegistry != nil && queryID != "" {
-					h.queryRegistry.TimedOut(queryID)
-				}
-				h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(req.SQL)).Dur("timeout", effectiveTimeout).Msg("Query timed out")
-				return c.Status(fiber.StatusGatewayTimeout).JSON(QueryResponse{
-					Success:         false,
-					Error:           "Query timed out",
-					ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
-					Timestamp:       timestamp,
-				})
-			}
+		// Check if this is a "no files found" error — treat as empty result, not an error.
+		// This happens when querying a measurement that has no data on storage yet
+		// (e.g., new measurement, or DuckDB's httpfs cache is stale).
+		if isNoFilesFoundError(err) && !h.missingAnchor(err) {
+			h.logger.Info().Str("sql", sqlutil.ForLog(req.SQL)).Msg("No files found for measurement, returning empty result")
+			m.IncQuerySuccess()
 			if h.queryRegistry != nil && queryID != "" {
-				if ctxErr == context.Canceled {
-					// Already marked as cancelled by Cancel() — no-op
-				} else {
-					h.queryRegistry.Fail(queryID, "Query execution failed")
-				}
+				h.queryRegistry.Complete(queryID, 0)
 			}
-			h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(req.SQL)).Msg("Query execution failed")
-			return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
-				Success:         false,
-				Error:           err.Error(),
+			return c.JSON(QueryResponse{
+				Success:         true,
+				Columns:         []string{},
+				Data:            [][]interface{}{},
+				RowCount:        0,
 				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 				Timestamp:       timestamp,
 			})
 		}
 
-		// Get column names
-		columns, err = rows.Columns()
-		if err != nil {
+		m.IncQueryErrors()
+		// Check if it was a timeout
+		if effectiveTimeout > 0 && ctxErr == context.DeadlineExceeded {
+			m.IncQueryTimeouts()
+			if h.queryRegistry != nil && queryID != "" {
+				h.queryRegistry.TimedOut(queryID)
+			}
+			h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(req.SQL)).Dur("timeout", effectiveTimeout).Msg("Query timed out")
+			return c.Status(fiber.StatusGatewayTimeout).JSON(QueryResponse{
+				Success:         false,
+				Error:           "Query timed out",
+				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+				Timestamp:       timestamp,
+			})
+		}
+		if h.queryRegistry != nil && queryID != "" {
+			if ctxErr == context.Canceled {
+				// Already marked as cancelled by Cancel() — no-op
+			} else {
+				h.queryRegistry.Fail(queryID, "Query execution failed")
+			}
+		}
+		h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(req.SQL)).Msg("Query execution failed")
+		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
+			Success:         false,
+			Error:           err.Error(),
+			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+			Timestamp:       timestamp,
+		})
+	}
+
+	// Get column names
+	columns, err = rows.Columns()
+	if err != nil {
+		rows.Close()
+		if profileConn != nil {
+			profileConn.Close()
+		}
+		if cancel != nil {
+			cancel()
+		}
+		m.IncQueryErrors()
+		h.logger.Error().Err(err).Msg("Failed to get column names")
+		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
+			Success:         false,
+			Error:           err.Error(),
+			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+			Timestamp:       timestamp,
+		})
+	}
+
+	// Get column types for typed JSON serialization
+	columnTypes, err := rows.ColumnTypes()
+	var colTypes []colType
+	if err == nil {
+		colTypes = mapColumnTypes(columnTypes)
+	} else {
+		// Fallback: treat all columns as strings
+		colTypes = make([]colType, len(columns))
+	}
+
+	// Capture token name before async callback (Fiber context not safe in callbacks)
+	tokenName := getTokenName(c)
+	tokenID := getTokenID(c)
+
+	// Stream typed JSON response directly to HTTP — no full-response buffering.
+	// streamCtx captures the timeout-aware context so per-row cancellation
+	// can fire inside the streaming callback. See C5.
+	streamCtx := ctx
+	c.Set("Content-Type", "application/json")
+	c.Context().SetBodyStreamWriter(h.safeStream("query_json", func() {
+		if h.queryRegistry != nil && queryID != "" {
+			h.queryRegistry.Fail(queryID, "stream writer panicked")
+		}
+	}, func(w *bufio.Writer) {
+		// One defer preserving the original order: rows first, then the
+		// pinned profiling connection, then the timeout context.
+		defer func() {
 			rows.Close()
 			if profileConn != nil {
 				profileConn.Close()
@@ -2608,110 +2420,65 @@ localProcessing:
 			if cancel != nil {
 				cancel()
 			}
+		}()
+		rowCount, streamErr := streamTypedJSONFunc(streamCtx, w, columns, colTypes, rows, governanceMaxRows, profile, start, timestamp)
+		w.Flush()
+
+		// Reported before the error branch below: a stream can reach the
+		// cap and then fail on the way out, and the envelope marks it
+		// capped either way, so the operator-side record has to fire on
+		// both paths or it would go missing in the one case where the
+		// result is both capped and truncated (#724).
+		h.logGovernanceRowCap("json", convertedSQL, tokenID, tokenName, governanceMaxRows, int64(rowCount))
+		// Same reasoning for the history entry (#728): recorded here,
+		// before the disposition below, so a result that reached the cap
+		// and then failed keeps the cap instead of losing it on the
+		// Fail/TimedOut path.
+		if h.queryRegistry != nil && queryID != "" {
+			h.queryRegistry.RecordRowCap(queryID, reachedRowCap(governanceMaxRows, int64(rowCount)))
+		}
+
+		// If the stream terminated mid-flight (Scan / Err / ctx
+		// cancel) record as failure even though the JSON envelope
+		// was already sent — operators must see the partial-result
+		// signal. See review/query-path-criticals C5.
+		if streamErr != nil {
 			m.IncQueryErrors()
-			h.logger.Error().Err(err).Msg("Failed to get column names")
-			return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
-				Success:         false,
-				Error:           err.Error(),
-				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
-				Timestamp:       timestamp,
-			})
-		}
-
-		// Get column types for typed JSON serialization
-		columnTypes, err := rows.ColumnTypes()
-		var colTypes []colType
-		if err == nil {
-			colTypes = mapColumnTypes(columnTypes)
-		} else {
-			// Fallback: treat all columns as strings
-			colTypes = make([]colType, len(columns))
-		}
-
-		// Capture token name before async callback (Fiber context not safe in callbacks)
-		tokenName := getTokenName(c)
-		tokenID := getTokenID(c)
-
-		// Stream typed JSON response directly to HTTP — no full-response buffering.
-		// streamCtx captures the timeout-aware context so per-row cancellation
-		// can fire inside the streaming callback. See C5.
-		streamCtx := ctx
-		c.Set("Content-Type", "application/json")
-		c.Context().SetBodyStreamWriter(h.safeStream("query_json", func() {
 			if h.queryRegistry != nil && queryID != "" {
-				h.queryRegistry.Fail(queryID, "stream writer panicked")
-			}
-		}, func(w *bufio.Writer) {
-			// One defer preserving the original order: rows first, then the
-			// pinned profiling connection, then the timeout context.
-			defer func() {
-				rows.Close()
-				if profileConn != nil {
-					profileConn.Close()
+				if errors.Is(streamErr, context.DeadlineExceeded) {
+					h.queryRegistry.TimedOut(queryID)
+				} else {
+					h.queryRegistry.Fail(queryID, sqlutil.SanitizeErrText(streamErr.Error()))
 				}
-				if cancel != nil {
-					cancel()
-				}
-			}()
-			rowCount, streamErr := streamTypedJSONFunc(streamCtx, w, columns, colTypes, rows, governanceMaxRows, profile, start, timestamp)
-			w.Flush()
-
-			// Reported before the error branch below: a stream can reach the
-			// cap and then fail on the way out, and the envelope marks it
-			// capped either way, so the operator-side record has to fire on
-			// both paths or it would go missing in the one case where the
-			// result is both capped and truncated (#724).
-			h.logGovernanceRowCap("json", convertedSQL, tokenID, tokenName, governanceMaxRows, int64(rowCount))
-			// Same reasoning for the history entry (#728): recorded here,
-			// before the disposition below, so a result that reached the cap
-			// and then failed keeps the cap instead of losing it on the
-			// Fail/TimedOut path.
-			if h.queryRegistry != nil && queryID != "" {
-				h.queryRegistry.RecordRowCap(queryID, reachedRowCap(governanceMaxRows, int64(rowCount)))
 			}
-
-			// If the stream terminated mid-flight (Scan / Err / ctx
-			// cancel) record as failure even though the JSON envelope
-			// was already sent — operators must see the partial-result
-			// signal. See review/query-path-criticals C5.
-			if streamErr != nil {
-				m.IncQueryErrors()
-				if h.queryRegistry != nil && queryID != "" {
-					if errors.Is(streamErr, context.DeadlineExceeded) {
-						h.queryRegistry.TimedOut(queryID)
-					} else {
-						h.queryRegistry.Fail(queryID, sqlutil.SanitizeErrText(streamErr.Error()))
-					}
-				}
-				// Per-handler client-disconnect counter (#426).
-				if isClientError(streamErr) {
-					recordDisconnect()
-				}
-				// Warn for client-disconnect / context expiry (headers already
-				// committed, partial result was delivered). Error for genuine
-				// server-side failures (scanner, db iteration).
-				h.streamErrEvent(streamErr).Err(streamErr).
-					Int("rows_sent", rowCount).
-					Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
-					Msg("Query stream truncated after headers committed; client received partial result")
-				return
+			// Per-handler client-disconnect counter (#426).
+			if isClientError(streamErr) {
+				recordDisconnect()
 			}
-
-			if h.queryRegistry != nil && queryID != "" {
-				h.queryRegistry.Complete(queryID, rowCount)
-			}
-			m.IncQuerySuccess()
-			m.IncQueryRows(int64(rowCount))
-			m.RecordQueryLatency(time.Since(start).Microseconds())
-
-			h.logger.Info().
-				Int("row_count", rowCount).
+			// Warn for client-disconnect / context expiry (headers already
+			// committed, partial result was delivered). Error for genuine
+			// server-side failures (scanner, db iteration).
+			h.streamErrEvent(streamErr).Err(streamErr).
+				Int("rows_sent", rowCount).
 				Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
-				Msg("Query completed")
-			h.logSlowQuery(convertedSQL, start, rowCount, tokenName)
-		}))
-		return nil
-	}
+				Msg("Query stream truncated after headers committed; client received partial result")
+			return
+		}
+
+		if h.queryRegistry != nil && queryID != "" {
+			h.queryRegistry.Complete(queryID, rowCount)
+		}
+		m.IncQuerySuccess()
+		m.IncQueryRows(int64(rowCount))
+		m.RecordQueryLatency(time.Since(start).Microseconds())
+
+		h.logger.Info().
+			Int("row_count", rowCount).
+			Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
+			Msg("Query completed")
+		h.logSlowQuery(convertedSQL, start, rowCount, tokenName)
+	}))
+	return nil
 }
 
 // isNoFilesFoundError checks if a DuckDB error is the "No files found" IO error.
@@ -3137,6 +2904,30 @@ var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join([]strin
 // TestDynamicSQLFunctionPattern_Family pins the set.
 var dynamicSQLFunctionPattern = regexp.MustCompile(`(?i)\b(query|query_table|json_execute_serialized_sql)\s*\(`)
 
+// rejectUserStorageReads keeps user-supplied filesystem readers and replacement
+// scans out of transformed SQL; only storage paths emitted by Arc are allowed.
+func rejectUserStorageReads(sql string) error {
+	ioNormalised := ioDenylistNormalise(sql)
+	if match := ioTableFunctionPattern.FindStringSubmatch(ioNormalised); match != nil {
+		return &SQLValidationError{Message: "File I/O function not allowed in user SQL: " + match[1] + "()"}
+	}
+	if match := dynamicSQLFunctionPattern.FindStringSubmatch(ioNormalised); match != nil {
+		return &SQLValidationError{Message: "Dynamic SQL function not allowed in user SQL: " + match[1] + "()"}
+	}
+
+	maskInput := backticksToDoubleQuotes(sql)
+	features := scanSQLFeatures(maskInput)
+	normalised, masks := sqlutil.MaskStringLiterals(maskInput, features.hasQuotes)
+	normalised = stripSQLComments(normalised, features.hasDashComment || features.hasBlockComment)
+	if stringLiteralInTablePosition(normalised) {
+		return &SQLValidationError{Message: "String literal not allowed in table position (replacement scans are disabled); reference a table by name"}
+	}
+	if name := invalidQuotedIdentifierInTablePosition(normalised, sqlutil.IdentifierNames(masks)); name != "" {
+		return &SQLValidationError{Message: "Quoted identifier in table position is not a valid database or measurement name (replacement scans are disabled): " + name}
+	}
+	return nil
+}
+
 // getTransformedSQL returns the transformed SQL with caching.
 // If headerDB is non-empty, uses the optimized path with that database for all tables.
 // Returns the transformed SQL and whether it was a cache hit.
@@ -3188,7 +2979,7 @@ func (h *QueryHandler) getTransformedSQLWithRefs(ctx context.Context, sql, heade
 	// Attach the storage-path collector. A name that cannot become a path is
 	// reported by the rewriters through ctx, since they run inside regexp
 	// replacement closures that can only return a string.
-	ctx, pathCollector := withStoragePathCollector(ctx)
+	ctx, pathFailure := withStoragePathFailure(ctx)
 
 	// Transform using appropriate method
 	var transformed string
@@ -3200,10 +2991,10 @@ func (h *QueryHandler) getTransformedSQLWithRefs(ctx context.Context, sql, heade
 
 	// Never cache, and never execute, SQL built around a rejected name: the
 	// transform leaves an empty path behind, which would read the backend root.
-	if pathCollector.err != nil {
-		return "", false, nil, pathCollector.err
+	if pathFailure.err != nil {
+		return "", false, nil, pathFailure.err
 	}
-	refs := storagePathReferences(pathCollector)
+	refs := storagePathReferences(pathFailure)
 
 	if !volatile.Volatile {
 		h.queryCache.SetWithMetadata(cacheKey, transformed, encodeStoragePathReferences(refs))
@@ -3211,44 +3002,40 @@ func (h *QueryHandler) getTransformedSQLWithRefs(ctx context.Context, sql, heade
 	return transformed, false, refs, nil
 }
 
-// getTransformedSQLForParallel returns the transformed SQL and parallel execution info.
-// This variant checks if the query can benefit from parallel partition scanning.
-// Only simple single-table queries with header DB can use parallel execution.
-// Returns (sql, parallel_info, cache_hit).
-func (h *QueryHandler) getTransformedSQLForParallel(ctx context.Context, sql string, headerDB string) (string, *ParallelQueryInfo, bool, error) {
-	transformed, info, cached, _, err := h.getTransformedSQLForParallelWithRefs(ctx, sql, headerDB)
-	return transformed, info, cached, err
+// getTransformedSQLForQuery returns the transformed SQL for a query. Simple
+// single-table queries with a header database take an uncached fast path
+// (their time-relative partition list must not outlive the request); the
+// rest go through the cached getTransformedSQL.
+func (h *QueryHandler) getTransformedSQLForQuery(ctx context.Context, sql string, headerDB string) (string, bool, error) {
+	transformed, cached, _, err := h.getTransformedSQLForQueryWithRefs(ctx, sql, headerDB)
+	return transformed, cached, err
 }
 
-func (h *QueryHandler) getTransformedSQLForParallelWithRefs(ctx context.Context, sql string, headerDB string) (string, *ParallelQueryInfo, bool, []TableReference, error) {
+func (h *QueryHandler) getTransformedSQLForQueryWithRefs(ctx context.Context, sql, headerDB string) (string, bool, []TableReference, error) {
+	if err := rejectUserStorageReads(sql); err != nil {
+		return "", false, nil, err
+	}
 	sqlLower := strings.ToLower(sql)
 
 	// Fast paths that don't support parallel execution
 	if strings.Contains(sqlLower, "read_parquet") {
-		transformed, cached, refs, err := h.getTransformedSQLWithRefs(ctx, sql, headerDB)
-		return transformed, nil, cached, refs, err
+		return sql, true, nil, nil
 	}
 	if !strings.Contains(sqlLower, "from") && !strings.Contains(sqlLower, "join") {
-		transformed, cached, refs, err := h.getTransformedSQLWithRefs(ctx, sql, headerDB)
-		return transformed, nil, cached, refs, err
+		return sql, true, nil, nil
 	}
 
-	// Parallel execution only supported for simple single-table queries with header DB
-	// Complex queries (JOINs, subqueries, CTEs) fall back to standard execution
+	// The fast path takes simple single-table queries with a header DB;
+	// complex queries (JOINs, subqueries, CTEs) take the cached path.
 	if headerDB == "" || !isSingleTableQuery(sqlLower) || containsSQLWord(sqlLower, "with") {
-		transformed, cached, refs, err := h.getTransformedSQLWithRefs(ctx, sql, headerDB)
-		return transformed, nil, cached, refs, err
+		return h.getTransformedSQLWithRefs(ctx, sql, headerDB)
 	}
 
 	// Bail to slow path for features the fast path can't handle. EXTRACT/
 	// SUBSTRING/TRIM/OVERLAY need the slow path's FROM-keyword mask.
 	features := scanSQLFeatures(sql)
 	if features.hasQuotes || features.hasDashComment || features.hasBlockComment || sqlutil.ContainsFromKeywordFunction(sql) {
-		transformed, cached, refs, err := h.getTransformedSQLWithRefs(ctx, sql, headerDB)
-		return transformed, nil, cached, refs, err
-	}
-	if err := rejectUserStorageReads(sql); err != nil {
-		return "", nil, false, nil, err
+		return h.getTransformedSQLWithRefs(ctx, sql, headerDB)
 	}
 
 	// Rewrite time functions if present
@@ -3258,13 +3045,12 @@ func (h *QueryHandler) getTransformedSQLForParallelWithRefs(ctx context.Context,
 		sqlLower = strings.ToLower(sql)
 	}
 
-	// Use parallel-aware conversion
-	ctx, pathCollector := withStoragePathCollector(ctx)
-	convertedSQL, parallelInfo := h.convertSingleTableQueryForParallel(ctx, sql, sqlLower, headerDB)
-	if pathCollector.err != nil {
-		return "", nil, false, nil, pathCollector.err
+	ctx, pathFailure := withStoragePathFailure(ctx)
+	convertedSQL := h.convertSingleTableQuery(ctx, sql, sqlLower, headerDB)
+	if pathFailure.err != nil {
+		return "", false, nil, pathFailure.err
 	}
-	return convertedSQL, parallelInfo, false, storagePathReferences(pathCollector), nil
+	return convertedSQL, false, storagePathReferences(pathFailure), nil
 }
 
 // convertSQLToStoragePaths converts table references to storage paths
@@ -3500,9 +3286,8 @@ func makeIdentResolver(identNames map[string]string) func(string) (string, bool)
 	}
 }
 
-// storagePathCollector carries per-transform state out of the SQL transform:
-// the first storage-path rejection and the database/measurement pairs whose
-// paths the transform resolved.
+// storagePathFailure carries the first storage-path rejection out of the SQL
+// transform.
 //
 // The transform runs inside regexp.ReplaceAllStringFunc closures, which can
 // only return a string, so a rejection deep inside one has no way back to the
@@ -3515,35 +3300,35 @@ func makeIdentResolver(identNames map[string]string) func(string) (string, bool)
 // `Success: true, RowCount: 0` AND counts m.IncQuerySuccess(), so a rejected
 // name would be reported to the client as a successful query over an empty
 // table. A name Arc cannot turn into a path is an error, not an empty result.
-type storagePathCollector struct {
+type storagePathFailure struct {
 	err     error
 	emitted map[string]TableReference
 }
 
 type storagePathCtxKey struct{}
 
-// withStoragePathCollector attaches per-transform storage-path state.
-func withStoragePathCollector(ctx context.Context) (context.Context, *storagePathCollector) {
-	f := &storagePathCollector{emitted: make(map[string]TableReference)}
+// withStoragePathFailure attaches a collector for storage-path rejections.
+func withStoragePathFailure(ctx context.Context) (context.Context, *storagePathFailure) {
+	f := &storagePathFailure{emitted: make(map[string]TableReference)}
 	return context.WithValue(ctx, storagePathCtxKey{}, f), f
 }
 
 // recordStoragePathFailure keeps the FIRST rejection. One malformed name can
 // match several rewriters, and the first is the one that names the cause.
 func recordStoragePathFailure(ctx context.Context, err error) {
-	if f, ok := ctx.Value(storagePathCtxKey{}).(*storagePathCollector); ok && f.err == nil {
+	if f, ok := ctx.Value(storagePathCtxKey{}).(*storagePathFailure); ok && f.err == nil {
 		f.err = err
 	}
 }
 
 func recordStoragePathEmission(ctx context.Context, database, measurement string) {
-	if f, ok := ctx.Value(storagePathCtxKey{}).(*storagePathCollector); ok {
+	if f, ok := ctx.Value(storagePathCtxKey{}).(*storagePathFailure); ok {
 		key := database + "\x00" + measurement
 		f.emitted[key] = TableReference{Database: database, Measurement: measurement}
 	}
 }
 
-func storagePathReferences(f *storagePathCollector) []TableReference {
+func storagePathReferences(f *storagePathFailure) []TableReference {
 	refs := make([]TableReference, 0, len(f.emitted))
 	for _, ref := range f.emitted {
 		refs = append(refs, ref)
@@ -3575,33 +3360,6 @@ func decodeStoragePathReferences(encoded []string) ([]TableReference, error) {
 		refs = append(refs, TableReference{Database: database, Measurement: measurement})
 	}
 	return refs, nil
-}
-
-// rejectUserStorageReads prevents user SQL from reaching execution with a
-// filesystem reader or replacement scan that the Arc transform did not emit.
-// The shared request validator already enforces this for HTTP callers; keeping
-// the check at the transform boundary makes the invariant hold for every
-// caller, including one that accidentally bypasses request validation.
-func rejectUserStorageReads(sql string) error {
-	ioNormalised := ioDenylistNormalise(sql)
-	if match := ioTableFunctionPattern.FindStringSubmatch(ioNormalised); match != nil {
-		return &SQLValidationError{Message: "File I/O function not allowed in user SQL: " + match[1] + "()"}
-	}
-	if match := dynamicSQLFunctionPattern.FindStringSubmatch(ioNormalised); match != nil {
-		return &SQLValidationError{Message: "Dynamic SQL function not allowed in user SQL: " + match[1] + "()"}
-	}
-
-	maskInput := backticksToDoubleQuotes(sql)
-	features := scanSQLFeatures(maskInput)
-	normalised, masks := sqlutil.MaskStringLiterals(maskInput, features.hasQuotes)
-	normalised = stripSQLComments(normalised, features.hasDashComment || features.hasBlockComment)
-	if stringLiteralInTablePosition(normalised) {
-		return &SQLValidationError{Message: "String literal not allowed in table position (replacement scans are disabled); reference a table by name"}
-	}
-	if name := invalidQuotedIdentifierInTablePosition(normalised, sqlutil.IdentifierNames(masks)); name != "" {
-		return &SQLValidationError{Message: "Quoted identifier in table position is not a valid database or measurement name (replacement scans are disabled): " + name}
-	}
-	return nil
 }
 
 // getStoragePath returns the storage path for a database.table, recording a
@@ -3660,20 +3418,6 @@ func quotePath(path string) string {
 // DuckDB handles projection pushdown internally when it sees which columns are actually used.
 func buildReadParquetOptions() string {
 	return "union_by_name=true"
-}
-
-// ParallelQueryInfo contains information for parallel partition execution.
-// When set, the query should be executed using the parallel executor.
-type ParallelQueryInfo struct {
-	// Paths contains the partition paths to execute in parallel
-	Paths []string
-	// QueryTemplate is the SQL with {PARTITION_PATH} placeholder
-	QueryTemplate string
-	// ReadParquetOptions are the options to pass to read_parquet
-	ReadParquetOptions string
-	// AnchorPath, when set, is listed before every partition path so each
-	// per-partition scan binds the measurement's full field schema (#914).
-	AnchorPath string
 }
 
 // replaceTableRefs rewrites every match of re in sql using fn.
@@ -3836,59 +3580,6 @@ func (h *QueryHandler) buildReadParquetExprForMeasurement(ctx context.Context, d
 	// Fall back to single-tier behavior (hot tier only)
 	path := h.getStoragePath(ctx, database, measurement)
 	return h.buildReadParquetExpr(ctx, path, originalSQL, keyword)
-}
-
-// buildReadParquetExprForParallel builds a read_parquet expression and returns
-// parallel execution info if the query can benefit from parallel partition scanning.
-// Returns (sql_expression, parallel_info) where parallel_info is non-nil if parallel is recommended.
-func (h *QueryHandler) buildReadParquetExprForParallel(ctx context.Context, path, originalSQL, keyword string) (string, *ParallelQueryInfo) {
-	options := buildReadParquetOptions()
-
-	// Attach a local volatility flag. NOTE: this SHADOWS any outer flag for
-	// the subtree (ctx.Value returns the innermost) — safe here only because
-	// this fast path's output is never stored in the SQL transform cache
-	// (the sole queryCache.Set lives in getTransformedSQL, which this path
-	// does not reach). The local flag's job: a file-time-expanded list must
-	// NOT be fanned out one-DuckDB-query-per-file by the parallel executor —
-	// its elements are individual small files, not hour partitions.
-	ctx, volatile := pruning.WithVolatileResult(ctx)
-	anchorDB, anchorMeas := h.extractDBMeasurementFromPath(path)
-	anchor := h.anchorFor(ctx, anchorDB, anchorMeas)
-
-	// Apply partition pruning
-	emptyExpr, optimizedPath, wasOptimized := h.pruneWithAnchor(ctx, path, originalSQL, keyword, anchor, options, anchorDB, anchorMeas)
-	if emptyExpr != "" {
-		// An anchor-only scan is one tiny file; never fanned out.
-		return emptyExpr, nil
-	}
-
-	if wasOptimized {
-		if pathList, ok := optimizedPath.([]string); ok {
-			// Check if parallel execution is recommended
-			if !volatile.Volatile && h.parallelExecutor != nil && h.parallelExecutor.ShouldUseParallel(len(pathList)) {
-				h.logger.Info().
-					Int("partition_count", len(pathList)).
-					Str("keyword", keyword).
-					Msg("Partition pruning: Using parallel execution")
-
-				// Return placeholder for template and parallel info
-				return keyword + " {PARTITION_PATH}", &ParallelQueryInfo{
-					Paths:              pathList,
-					ReadParquetOptions: options,
-					AnchorPath:         anchor,
-				}
-			}
-
-			// Fall back to standard array syntax if parallel not recommended
-			h.logger.Info().Int("partition_count", len(pathList)).Str("keyword", keyword).Msg("Partition pruning: Using targeted paths")
-			return readParquetExpr(keyword, anchor, pathList, options), nil
-		} else if pathStr, ok := optimizedPath.(string); ok {
-			h.logger.Info().Str("optimized_path", pathStr).Str("keyword", keyword).Msg("Partition pruning: Using optimized path")
-			return readParquetExpr(keyword, anchor, []string{pathStr}, options), nil
-		}
-	}
-
-	return readParquetExpr(keyword, anchor, []string{path}, options), nil
 }
 
 // shouldSkipTableConversion returns true if the table name should not be converted to a storage path
@@ -4256,66 +3947,6 @@ func (h *QueryHandler) convertSingleTableQuery(ctx context.Context, sql, sqlLowe
 	replacement := h.buildReadParquetExprForMeasurement(ctx, database, tableName, sql, "FROM")
 
 	return sql[:idx] + replacement + sql[end:]
-}
-
-// convertSingleTableQueryForParallel is a variant that returns parallel execution info.
-// Returns (converted_sql, parallel_info) where parallel_info is non-nil if parallel execution is recommended.
-func (h *QueryHandler) convertSingleTableQueryForParallel(ctx context.Context, sql, sqlLower, database string) (string, *ParallelQueryInfo) {
-	// Find "FROM table" position
-	idx := indexSQLTokenStart(sqlLower, "from ")
-	if idx < 0 {
-		return sql, nil
-	}
-
-	start := idx + 5
-	// Skip whitespace after FROM
-	for start < len(sql) && (sql[start] == ' ' || sql[start] == '\t' || sql[start] == '\n') {
-		start++
-	}
-
-	// Find table name end
-	end := start
-	for end < len(sql) && isIdentChar(sql[end]) {
-		end++
-	}
-
-	if end == start {
-		return sql, nil // No table found, return original
-	}
-
-	tableName := sql[start:end]
-	tableLower := strings.ToLower(tableName)
-
-	// Skip system tables
-	if shouldSkipTableConversion(tableLower) {
-		return sql, nil
-	}
-
-	// Check tiering first - if cold tier exists, use tiering-aware method (no parallel for multi-tier)
-	if h.tieringManager != nil {
-		router := h.tieringManager.GetRouter()
-		if router != nil {
-			tieredPaths := router.GetGlobPathsForQuery(database, tableName)
-			if _, hasCold := tieredPaths[tiering.TierCold]; hasCold {
-				// Use tiering-aware method - parallel not supported for multi-tier queries
-				replacement := h.buildMultiTierReadParquet(ctx, database, tableName, sql, tieredPaths, "FROM")
-				return sql[:idx] + replacement + sql[end:], nil
-			}
-		}
-	}
-
-	// Build replacement with parallel info (hot tier only)
-	path := h.getStoragePath(ctx, database, tableName)
-	replacement, parallelInfo := h.buildReadParquetExprForParallel(ctx, path, sql, "FROM")
-
-	convertedSQL := sql[:idx] + replacement + sql[end:]
-
-	// Store the template in parallel info if parallel execution is needed
-	if parallelInfo != nil {
-		parallelInfo.QueryTemplate = convertedSQL
-	}
-
-	return convertedSQL, parallelInfo
 }
 
 // convertSQLToStoragePathsWithHeaderDB converts table references to storage paths using
@@ -5639,7 +5270,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	if h.queryRegistry != nil && c.Method() != fiber.MethodHead {
 		var queryCtx context.Context
 		queryID, queryCtx = h.queryRegistry.Register(
-			baseCtx, sql, getTokenID(c), getTokenName(c), c.IP(), false, 0,
+			baseCtx, sql, getTokenID(c), getTokenName(c), c.IP(),
 		)
 		baseCtx = queryCtx
 		c.Set("X-Arc-Query-ID", queryID)

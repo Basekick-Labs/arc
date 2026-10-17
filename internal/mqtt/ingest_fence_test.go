@@ -5,8 +5,10 @@ package mqtt
 // acknowledge it and drop it.
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -75,8 +77,10 @@ func TestOnMessageDoesNotBlockOnAPersistentFence(t *testing.T) {
 	defer buf.Close()
 	buf.SetIngestGate(func() error { return fmt.Errorf("%w: test", ingest.ErrIngestFenced) })
 
+	var subLog, refusals bytes.Buffer
+	defer ingest.CaptureRefusalLog(zerolog.New(&refusals), time.Now)()
 	s := &Subscriber{id: "s", config: &Subscription{ID: "s", Name: "s", Database: "iot"},
-		arrowBuffer: buf, ctx: context.Background(), logger: zerolog.Nop()}
+		arrowBuffer: buf, ctx: context.Background(), logger: zerolog.New(&subLog)}
 	start := time.Now()
 	s.onMessage(nil, fakeMessage{topic: "sensors/a", payload: []byte(`{"m":"cpu","v":1}`)})
 	if took := time.Since(start); took > mqttFencedWait+time.Second {
@@ -84,5 +88,12 @@ func TestOnMessageDoesNotBlockOnAPersistentFence(t *testing.T) {
 	}
 	if s.messagesFailed.Load() != 1 {
 		t.Fatal("the refused message was not counted failed")
+	}
+	// #1268: logged by reason, not as an ERR per message.
+	if strings.Contains(subLog.String(), "Failed to process MQTT message") {
+		t.Fatalf("a fence refusal logged per message:\n%s", subLog.String())
+	}
+	if !strings.Contains(refusals.String(), `"source":"mqtt sensors/a"`) {
+		t.Fatalf("the refusal was not logged by reason:\n%s", refusals.String())
 	}
 }

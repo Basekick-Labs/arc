@@ -43,6 +43,12 @@ type NodeConfig struct {
 	SnapshotThreshold uint64
 	TrailingLogs      uint64
 
+	// PreVoteDisabled turns off the Raft pre-vote round (#1272). Off by
+	// default (pre-vote runs): a node that cannot hear the leader then keeps
+	// its term instead of raising it on every election timeout and forcing
+	// the leader to step down when it reaches it again.
+	PreVoteDisabled bool
+
 	Logger zerolog.Logger
 
 	// TLSConfig for encrypted Raft transport (nil = plain TCP)
@@ -152,6 +158,7 @@ func (n *Node) Start() error {
 
 	// Use zerolog adapter for raft's internal logging
 	raftConfig.Logger = newZerologAdapter(n.logger, "raft")
+	raftConfig.PreVoteDisabled = n.cfg.PreVoteDisabled
 
 	// Only override non-zero values to preserve sensible defaults
 	if n.cfg.ElectionTimeout > 0 {
@@ -459,12 +466,25 @@ func (n *Node) Apply(cmd *Command, timeout time.Duration) error {
 	// Check for application error
 	if resp := future.Response(); resp != nil {
 		if err, ok := resp.(error); ok {
-			return err
+			return &commandRefused{err}
 		}
 	}
 
 	return nil
 }
+
+// ErrCommandRefused matches (errors.Is) an error the FSM returned for a
+// committed command: the cluster state refused it, as opposed to Raft failing
+// to commit it (not leader, leadership lost, timeout). Retrying the same
+// command against the same state fails the same way (#1267).
+var ErrCommandRefused = errors.New("command refused by the cluster state")
+
+// commandRefused keeps the FSM's message as is and adds ErrCommandRefused.
+type commandRefused struct{ err error }
+
+func (e *commandRefused) Error() string        { return e.err.Error() }
+func (e *commandRefused) Unwrap() error        { return e.err }
+func (e *commandRefused) Is(target error) bool { return target == ErrCommandRefused }
 
 // AddVoter adds a voting member to the cluster.
 func (n *Node) AddVoter(nodeID, addr string, timeout time.Duration) error {

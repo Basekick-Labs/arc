@@ -20,7 +20,6 @@ import (
 	"github.com/basekick-labs/arc/internal/fieldschema"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/pruning"
-	"github.com/basekick-labs/arc/internal/query"
 	"github.com/basekick-labs/arc/internal/storage"
 )
 
@@ -81,12 +80,11 @@ func newFieldSchemaEnv(t *testing.T, opts fieldschema.Options, attachToIngest bo
 	t.Cleanup(func() { buf.Close() })
 
 	h := &QueryHandler{
-		db:               duck,
-		logger:           logger,
-		storage:          backend,
-		queryCache:       database.NewQueryCache(database.QueryCacheTTL, database.DefaultQueryCacheMaxSize),
-		pruner:           pruning.NewPartitionPruner(logger),
-		parallelExecutor: query.NewParallelExecutor(duck.DB(), query.DefaultParallelConfig(), logger),
+		db:         duck,
+		logger:     logger,
+		storage:    backend,
+		queryCache: database.NewQueryCache(database.QueryCacheTTL, database.DefaultQueryCacheMaxSize),
+		pruner:     pruning.NewPartitionPruner(logger),
 	}
 	h.SetFieldSchema(reg)
 	app := fiber.New(fiber.Config{DisableStartupMessage: true})
@@ -357,10 +355,10 @@ func TestFieldSchema_JoinAndSelfReferenceIssue914(t *testing.T) {
 
 func TestFieldSchema_ParallelPartitionsIssue914(t *testing.T) {
 	e := newFieldSchemaEnv(t, fieldschema.Options{}, true)
-	// Four hour partitions in the recent past: above MinPartitionsForParallel
-	// (3). The parallel executor is reached through the single-table fast
-	// path, which needs the database from the header, no string literals,
-	// and a time range the pruner can read (NOW() - INTERVAL n HOUR).
+	// Four hour partitions in the recent past, through the single-table fast
+	// path (database from the header, no string literals, a time range the
+	// pruner can read): one read_parquet list led by the anchor, so every
+	// column of the measurement binds (#914).
 	base := time.Now().UTC().Truncate(time.Hour)
 	for h := 0; h < 4; h++ {
 		cols := map[string]interface{}{"v": []int64{int64(h)}}
@@ -372,20 +370,19 @@ func TestFieldSchema_ParallelPartitionsIssue914(t *testing.T) {
 		e.write("sch", "par", base.Add(time.Duration(h-5)*time.Hour+30*time.Minute), cols)
 	}
 	sql := "SELECT v, late FROM par WHERE time >= NOW() - INTERVAL 6 HOUR AND time < NOW() - INTERVAL 1 HOUR ORDER BY v"
-	_, info, _, err := e.h.getTransformedSQLForParallel(context.Background(), sql, "sch")
+	tr, _, err := e.h.getTransformedSQLForQuery(context.Background(), sql, "sch")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info == nil || info.AnchorPath == "" || len(info.Paths) != 4 {
-		tr, _, _, _ := e.h.getTransformedSQLForParallel(context.Background(), sql, "sch")
-		t.Fatalf("expected a parallel plan with an anchor: %+v\ntransformed=%s", info, tr)
+	if strings.Count(tr, "read_parquet(") != 1 || strings.Contains(tr, "{PARTITION_PATH}") {
+		t.Fatalf("expected one read_parquet list: %s", tr)
 	}
 	out, status := e.queryDB(sql, "sch")
 	if status != 200 || !out.Success {
-		t.Fatalf("parallel query failed (%d): %s", status, out.Error)
+		t.Fatalf("query failed (%d): %s", status, out.Error)
 	}
 	if out.RowCount != 4 || out.Data[0][1] != nil || out.Data[3][1] == nil {
-		t.Fatalf("parallel: %+v", out.Data)
+		t.Fatalf("rows: %+v", out.Data)
 	}
 }
 

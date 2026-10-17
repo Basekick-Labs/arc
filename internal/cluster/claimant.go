@@ -110,6 +110,16 @@ type claimWork struct {
 	unrepublishable map[string]bool
 	unpulled        int
 	unpulledAt      time.Time // last check while files were missing
+	// lastProbed is when each missing file was last asked about: a check
+	// asks the oldest first, so every missing file is asked about in turn
+	// (#1269).
+	lastProbed map[string]time.Time
+	// justVanished: a check of this pass took files back. Their batches are
+	// replayed from the next pass (VanishedAt resets done), so this pass must
+	// not finish the claim. That the next pass sees the new VanishedAt rests on
+	// pass() starting with SyncManifest: a barrier after the delete, applied
+	// here before ClaimsBy is read.
+	justVanished bool
 }
 
 type claimBackoff struct {
@@ -122,9 +132,9 @@ type claimant struct {
 	store  claimantStore
 	outbox claimantOutbox
 	replay claimantReplayer
-	// filesLocal reports whether every current hot file of each key's
-	// measurement is here (the store copy may go).
-	filesLocal func(ctx context.Context, origin string, keys []string) bool
+	// filesLocal reports whether every current hot file holding rows of the
+	// instance's batches of those keys is here (the store copy may go).
+	filesLocal func(ctx context.Context, instance uint64, keys []string) bool
 	grace      time.Duration
 	now        func() time.Time
 	logger     zerolog.Logger
@@ -152,7 +162,7 @@ type instanceSeen struct {
 	at       time.Time
 }
 
-func newClaimant(c *Coordinator, store claimantStore, outbox claimantOutbox, replay claimantReplayer, filesLocal func(context.Context, string, []string) bool) *claimant {
+func newClaimant(c *Coordinator, store claimantStore, outbox claimantOutbox, replay claimantReplayer, filesLocal func(context.Context, uint64, []string) bool) *claimant {
 	grace := c.cfg.StreamTakeoverGrace
 	if grace <= 0 {
 		grace = defaultTakeoverGrace
@@ -585,7 +595,8 @@ func (cl *claimant) workFor(k raft.StreamClaim) *claimWork {
 	if w == nil || w.epoch != k.Epoch {
 		w = &claimWork{epoch: k.Epoch, done: map[recID]bool{}, chunks: map[recID]uint16{},
 			unreplayable: map[string]raft.Intervals{}, failed: map[recID]int{}, vanishedAt: k.VanishedAt,
-			local: map[string]int64{}, unknownSince: map[string]time.Time{}, unrepublishable: map[string]bool{}}
+			local: map[string]int64{}, unknownSince: map[string]time.Time{}, unrepublishable: map[string]bool{},
+			lastProbed: map[string]time.Time{}}
 		cl.work[k.Instance] = w
 	}
 	if w.vanishedAt != k.VanishedAt {
@@ -608,6 +619,18 @@ func (cl *claimant) replayClaim(ctx context.Context, fsm *raft.ClusterFSM, k raf
 	}
 	w := cl.workFor(k)
 	inst := fmt.Sprintf("%016x", k.Instance)
+
+	// Start looking for the origin's files nobody pulled now, not after the
+	// first replay round: their wait (twice the grace) runs while the rest
+	// of the claim replays (#1269). Finishing still needs them settled below.
+	if tracked {
+		w.justVanished = false
+		_ = cl.unpulledSettled(ctx, fsm, k, w)
+		if w.justVanished {
+			w.justVanished = false
+			return
+		}
+	}
 
 	// Files of this claim still on their way: their batches wait.
 	inflight := map[string]raft.Intervals{}
@@ -947,7 +970,7 @@ func (cl *claimant) finish(ctx context.Context, k raft.StreamClaim, w *claimWork
 }
 
 // dropStale removes store copies this node no longer needs, once every
-// current file of their keys is here: an instance this node finished a claim
+// current file holding rows of their batches is here: an instance this node finished a claim
 // of, one removed with its claim, and one of a writer it hears from but no
 // longer receives from (not the designated primary) with nothing claimable
 // left. A writer this node does not hear from keeps its copy: it may be
@@ -983,7 +1006,7 @@ func (cl *claimant) dropStale(ctx context.Context, fsm *raft.ClusterFSM, byID ma
 		for key := range k.Set {
 			keys = append(keys, key)
 		}
-		if !cl.filesLocal(ctx, info.Origin, keys) {
+		if !cl.filesLocal(ctx, info.Instance, keys) {
 			continue
 		}
 		if err := cl.store.DropInstance(info.Origin, info.Instance); err != nil {

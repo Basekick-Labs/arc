@@ -28,12 +28,14 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/audit"
 	"github.com/basekick-labs/arc/internal/cluster/raft"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
@@ -77,6 +79,11 @@ var (
 	// classify this as AbortLeaseLost without depending on log-string
 	// matching.
 	ErrGateRevoked = errors.New("reconciliation: gate revoked mid-run")
+	// ErrManifestNotSynced wraps a failed manifest barrier (#1214). Without
+	// it this node's manifest may trail the leader's, and a file the rest of
+	// the cluster registered meanwhile would look like an orphan, so the run
+	// stops before deleting anything.
+	ErrManifestNotSynced = errors.New("reconciliation: could not sync the manifest with the leader")
 )
 
 // Coordinator is the minimal interface the reconciler needs from the
@@ -100,7 +107,35 @@ type Coordinator interface {
 	// leader-forwards from non-leader callers (Phase 4) so the reconciler
 	// can run on any node without an extra "is leader?" check.
 	BatchFileOpsInManifest(ops []raft.BatchFileOp) error
+
+	// SyncManifest blocks until this node's manifest has applied everything
+	// the leader had committed when it was called (a leader barrier). Taken
+	// before each sweep (#1214): the manifest is read from this node's FSM,
+	// which can trail the leader for as long as it is cut off from it. An
+	// error wrapping raft.ErrBarrierUnsupported means the leader's build does
+	// not accept the barrier.
+	SyncManifest(ctx context.Context) error
 }
+
+// RemotePending is what the rest of the cluster says about files flushed and
+// not registered yet (#1214), for the orphan-storage sweep on a shared object
+// store: on the active compactor, which has no registration outbox of its
+// own, a writer's pending file is an unregistered object like any orphan.
+type RemotePending struct {
+	// Paths are pending registration somewhere: never orphans.
+	Paths map[string]struct{}
+	// Held names every source that could not be read (a writer that did not
+	// answer, answered that it does not know, or has more pending than it
+	// can report; a published pending list that could not be read). Any one
+	// holds the storage sweep for the run.
+	Held []string
+}
+
+// RemotePendingSource asks the cluster for every file pending registration,
+// whenever it was flushed: a flush time is the writer's clock and candidates
+// are aged by the store's, so an age filter on the writer's side could leave
+// out a candidate.
+type RemotePendingSource func(ctx context.Context) RemotePending
 
 // Config holds reconciler configuration.
 type Config struct {
@@ -119,8 +154,10 @@ type Config struct {
 	LocalNodeID string
 
 	// GraceWindow: orphan storage files younger than this are NEVER deleted.
-	// Default 24h. Protects in-flight writer flushes + Raft propose +
-	// replication races.
+	// Default 24h, floor MinGraceWindow (a shorter value is raised to it with
+	// a warning). Protects in-flight writer flushes + Raft propose +
+	// replication races, and gives manifest repair time to adopt a
+	// compaction output (#1214).
 	GraceWindow time.Duration
 
 	// ClockSkewAllowance is added to GraceWindow to absorb local-vs-storage
@@ -259,6 +296,14 @@ func (c Config) applyDefaults() Config {
 	return c
 }
 
+// MinGraceWindow is the shortest grace window the reconciler accepts (#1214).
+// A file a writer flushed is unregistered until its registration reaches the
+// manifest, and one whose writer is briefly cut off from the leader, or a
+// compaction output manifest repair has not adopted yet, is not an orphan.
+// Below an hour those races are routine; the remote pending checks cover a
+// longer outage.
+const MinGraceWindow = time.Hour
+
 // Tunable upper bounds. Exported as private constants because operators
 // who legitimately need to override them should be raising these in
 // source rather than via runtime config — both ceilings exist to defend
@@ -278,6 +323,12 @@ const (
 	AbortCtxCanceled      AbortReason = "ctx_canceled"
 	AbortManifestTooLarge AbortReason = "manifest_too_large"
 	AbortDisabled         AbortReason = "disabled"
+	// AbortManifestNotSynced: the manifest barrier failed (no leader, or it
+	// could not be reached in time), so the run deleted nothing (#1214).
+	AbortManifestNotSynced AbortReason = "manifest_not_synced"
+	// AbortLeaderBarrierUnsupported: the leader's build refuses the manifest
+	// barrier; the run deletes nothing until it is upgraded (#1214).
+	AbortLeaderBarrierUnsupported AbortReason = "leader_barrier_unsupported"
 	// AbortUnknown is the catch-all for errors that don't match a more
 	// specific reason. Audit consumers should treat it as "investigate"
 	// rather than rolling it into Raft dashboards.
@@ -306,9 +357,18 @@ type Run struct {
 	// SkippedPending counts orphan-storage candidates kept because this node
 	// flushed them and the manifest has not confirmed them yet (#1212).
 	SkippedPending int `json:"skipped_pending"`
-	// SkippedHeld counts orphan-manifest candidates kept because the file
-	// is moving into place here (a committed compaction output).
+	// SkippedHeld counts candidates a compaction commit still holds:
+	// orphan-manifest entries whose file is moving into place (a committed
+	// compaction output), and orphan-storage files a staged compaction owns
+	// (#1207 d2a2b).
 	SkippedHeld int `json:"skipped_held,omitempty"`
+	// SkippedPendingRemote counts orphan-storage candidates kept because
+	// another node reported them pending registration, or published them in
+	// its pending list on the shared store (#1214).
+	SkippedPendingRemote int `json:"skipped_pending_remote,omitempty"`
+	// SkippedAdoptable counts orphan-storage candidates kept because they are
+	// compaction outputs manifest repair registers (adopts) instead (#1214).
+	SkippedAdoptable int `json:"skipped_adoptable,omitempty"`
 
 	// SkippedTransient counts entries a sweep passed over because a storage
 	// call failed in a way that may succeed later (a throttle, a timeout, an
@@ -342,6 +402,15 @@ type Run struct {
 	// still pulling back files it originated cannot propose their deletion
 	// (#959). The orphan-manifest counts and samples are still reported.
 	ManifestSweepHeld bool `json:"manifest_sweep_held"`
+
+	// StorageSweepHeld is set when the orphan-storage sweep was withheld for
+	// this run because what is pending registration elsewhere could not be
+	// established (#1214): a node that can ingest did not answer, or a
+	// published pending list could not be read. StorageSweepHeldReason names
+	// them. The run still completes; the orphan-storage counts and samples
+	// are still reported.
+	StorageSweepHeld       bool   `json:"storage_sweep_held,omitempty"`
+	StorageSweepHeldReason string `json:"storage_sweep_held_reason,omitempty"`
 
 	// CapHit indicates the run stopped early because MaxDeletesPerRun was reached.
 	CapHit bool `json:"cap_hit"`
@@ -377,6 +446,16 @@ type Reconciler struct {
 	// (#1207 d2a2a): a committed compaction output still moving into place
 	// from its staged copy. Not an orphan.
 	isHeld atomic.Pointer[func(string) bool]
+	// isOwned reports a file a staged compaction owns: the input objects of
+	// a committed object-store job are unregistered but still the data until
+	// its finisher puts the output in place (#1207 d2a2b).
+	isOwned atomic.Pointer[func(string) bool]
+	// remotePending reports the files pending registration on other nodes
+	// (#1214); nil off a shared object store.
+	remotePending atomic.Pointer[RemotePendingSource]
+	// isAdoptable reports a compaction output manifest repair registers
+	// rather than an orphan (#1214).
+	isAdoptable atomic.Pointer[func(context.Context, string) bool]
 
 	// History is a small fixed-size ring buffer of recent runs. All
 	// access goes through mu. Layout: history is allocated to
@@ -409,6 +488,26 @@ func (r *Reconciler) SetHeldFilter(fn func(path string) bool) {
 	r.isHeld.Store(&fn)
 }
 
+// SetCompactionOwnedFilter keeps files a staged compaction owns out of the
+// orphan-storage sweep (#1207 d2a2b).
+func (r *Reconciler) SetCompactionOwnedFilter(fn func(path string) bool) {
+	r.isOwned.Store(&fn)
+}
+
+// SetRemotePendingSource keeps files pending registration on other nodes out
+// of the orphan-storage sweep, and holds the sweep when that set cannot be
+// established (#1214). For a shared object store, where one node sweeps
+// every writer's files.
+func (r *Reconciler) SetRemotePendingSource(fn RemotePendingSource) {
+	r.remotePending.Store(&fn)
+}
+
+// SetAdoptableFilter keeps compaction outputs that manifest repair registers
+// out of the orphan-storage sweep (#1214).
+func (r *Reconciler) SetAdoptableFilter(fn func(ctx context.Context, path string) bool) {
+	r.isAdoptable.Store(&fn)
+}
+
 func NewReconciler(
 	cfg Config,
 	coord Coordinator,
@@ -418,6 +517,14 @@ func NewReconciler(
 	logger zerolog.Logger,
 ) (*Reconciler, error) {
 	cfg = cfg.applyDefaults()
+	componentLogger := logger.With().Str("component", "reconciliation").Logger()
+	if cfg.GraceWindow < MinGraceWindow {
+		componentLogger.Warn().
+			Dur("configured", cfg.GraceWindow).
+			Dur("used", MinGraceWindow).
+			Msg("reconciliation.grace_window_seconds is below the minimum; the minimum is used")
+		cfg.GraceWindow = MinGraceWindow
+	}
 
 	if store == nil {
 		return nil, fmt.Errorf("reconciliation: storage backend is required")
@@ -438,7 +545,7 @@ func NewReconciler(
 		storage:     store,
 		gate:        gate,
 		auditLogger: auditLogger,
-		logger:      logger.With().Str("component", "reconciliation").Logger(),
+		logger:      componentLogger,
 	}, nil
 }
 
@@ -568,7 +675,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, dryRun bool) (*Run, error) {
 		"backend_kind": string(run.BackendKind),
 	})
 
-	// Step 1: snapshot the manifest.
+	// Step 1: sync with the leader, then snapshot the manifest.
+	if err := r.syncManifest(runCtx); err != nil {
+		r.markAborted(run, err)
+		r.finalizeRun(run)
+		return run, err
+	}
 	manifest, abortErr := r.snapshotManifest(runCtx)
 	if abortErr != nil {
 		r.markAborted(run, abortErr)
@@ -636,7 +748,32 @@ func (r *Reconciler) Reconcile(ctx context.Context, dryRun bool) (*Run, error) {
 	// held — manifest-before-storage ordering for the whole cycle. The cap
 	// flag may already be set by step 4, in which case sweepOrphanStorage
 	// short-circuits immediately on the first chunk.
-	if sweepErr := r.sweepOrphanStorage(runCtx, run, diff.orphanStorage, run.DryRun); sweepErr != nil {
+	//
+	// A run can last up to MaxRunDuration, so the manifest is synced with the
+	// leader again first, and what other nodes still have pending
+	// registration is collected (#1214). Both only when there is a candidate.
+	var remote map[string]struct{}
+	if len(diff.orphanStorage) > 0 {
+		if err := r.syncManifest(runCtx); err != nil {
+			r.markAborted(run, err)
+			r.finalizeRun(run)
+			return run, err
+		}
+		var held []string
+		remote, held = r.collectRemotePending(runCtx)
+		if len(held) > 0 {
+			run.StorageSweepHeld = true
+			run.StorageSweepHeldReason = strings.Join(held, "; ")
+			r.logger.Warn().
+				Str("run_id", run.ID).
+				Int("orphan_storage", run.OrphanStorageCount).
+				Str("reason", run.StorageSweepHeldReason).
+				Msg("Reconciliation: orphan-storage sweep held this run; files pending registration elsewhere could not be established, so no orphan file is deleted")
+			r.finalizeRun(run)
+			return run, nil
+		}
+	}
+	if sweepErr := r.sweepOrphanStorage(runCtx, run, diff.orphanStorage, remote, run.DryRun); sweepErr != nil {
 		r.markAborted(run, sweepErr)
 		r.finalizeRun(run)
 		return run, sweepErr
@@ -665,6 +802,34 @@ func fileEntriesToKeys(entries []*raft.FileEntry) []*ObjectKey {
 		})
 	}
 	return out
+}
+
+// syncManifest takes the leader barrier (#1214). Standalone has no manifest
+// to sync. A failure is wrapped in ErrManifestNotSynced, unless the run's own
+// context ended.
+func (r *Reconciler) syncManifest(ctx context.Context) error {
+	if r.cfg.BackendKind == BackendStandalone || r.coord == nil {
+		return nil
+	}
+	if err := r.coord.SyncManifest(ctx); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("%w: %w", ErrManifestNotSynced, err)
+	}
+	return nil
+}
+
+// collectRemotePending asks the cluster which files are pending registration
+// on other nodes. Every one, not only those past the grace window: see
+// RemotePendingSource.
+func (r *Reconciler) collectRemotePending(ctx context.Context) (map[string]struct{}, []string) {
+	src := r.remotePending.Load()
+	if src == nil || r.cfg.BackendKind != BackendShared {
+		return nil, nil
+	}
+	res := (*src)(ctx)
+	return res.Paths, res.Held
 }
 
 // snapshotManifest is step 1: read the manifest, build the path→entry map,
@@ -708,11 +873,19 @@ func (r *Reconciler) finalizeRun(run *Run) {
 		Int("skipped_grace", run.SkippedGrace).
 		Int("skipped_invalid_path", run.SkippedInvalidPath).
 		Bool("manifest_sweep_held", run.ManifestSweepHeld).
+		Bool("storage_sweep_held", run.StorageSweepHeld).
+		Int("skipped_pending_remote", run.SkippedPendingRemote).
+		Int("skipped_adoptable", run.SkippedAdoptable).
 		Dur("duration", duration)
 	if run.Aborted {
 		logEv = logEv.Str("abort_reason", string(run.AbortReason))
 	}
 	logEv.Msg("Reconciliation run completed")
+	// A completed run says whether the storage sweep was held; an aborted one
+	// leaves the last value, since it did not get as far as asking (#1214).
+	if !run.Aborted {
+		metrics.Get().SetReconciliationStorageSweepHeld(run.StorageSweepHeld)
+	}
 
 	// SIEM/dashboard consumers depend on these audit fields to tell
 	// "0 orphans found, all clean" apart from "blind walk produced 0
@@ -733,22 +906,28 @@ func (r *Reconciler) finalizeRun(run *Run) {
 			"walk_partial":         boolStr(run.WalkPartial),
 			"cap_hit":              boolStr(run.CapHit),
 			"manifest_sweep_held":  boolStr(run.ManifestSweepHeld),
+			"storage_sweep_held":   boolStr(run.StorageSweepHeld),
 			"duration_ms":          strconv.FormatInt(duration.Milliseconds(), 10),
 		})
 	} else {
 		r.emitAudit("reconcile.run_completed", run, map[string]string{
-			"run_id":               run.ID,
-			"backend_kind":         string(run.BackendKind),
-			"manifest_deletes":     strconv.Itoa(run.ManifestDeletes),
-			"storage_deletes":      strconv.Itoa(run.StorageDeletes),
-			"skipped_grace":        strconv.Itoa(run.SkippedGrace),
-			"skipped_recheck":      strconv.Itoa(run.SkippedRecheck),
-			"skipped_transient":    strconv.Itoa(run.SkippedTransient),
-			"skipped_invalid_path": strconv.Itoa(run.SkippedInvalidPath),
-			"walk_partial":         boolStr(run.WalkPartial),
-			"cap_hit":              boolStr(run.CapHit),
-			"manifest_sweep_held":  boolStr(run.ManifestSweepHeld),
-			"duration_ms":          strconv.FormatInt(duration.Milliseconds(), 10),
+			"run_id":                    run.ID,
+			"backend_kind":              string(run.BackendKind),
+			"manifest_deletes":          strconv.Itoa(run.ManifestDeletes),
+			"storage_deletes":           strconv.Itoa(run.StorageDeletes),
+			"skipped_grace":             strconv.Itoa(run.SkippedGrace),
+			"skipped_recheck":           strconv.Itoa(run.SkippedRecheck),
+			"skipped_pending":           strconv.Itoa(run.SkippedPending),
+			"skipped_pending_remote":    strconv.Itoa(run.SkippedPendingRemote),
+			"skipped_adoptable":         strconv.Itoa(run.SkippedAdoptable),
+			"skipped_transient":         strconv.Itoa(run.SkippedTransient),
+			"skipped_invalid_path":      strconv.Itoa(run.SkippedInvalidPath),
+			"walk_partial":              boolStr(run.WalkPartial),
+			"cap_hit":                   boolStr(run.CapHit),
+			"manifest_sweep_held":       boolStr(run.ManifestSweepHeld),
+			"storage_sweep_held":        boolStr(run.StorageSweepHeld),
+			"storage_sweep_held_reason": run.StorageSweepHeldReason,
+			"duration_ms":               strconv.FormatInt(duration.Milliseconds(), 10),
 		})
 	}
 
@@ -765,6 +944,10 @@ func (r *Reconciler) markAborted(run *Run, err error) {
 	switch {
 	case errors.Is(err, ErrManifestTooLarge):
 		run.AbortReason = AbortManifestTooLarge
+	case errors.Is(err, raft.ErrBarrierUnsupported):
+		run.AbortReason = AbortLeaderBarrierUnsupported
+	case errors.Is(err, ErrManifestNotSynced):
+		run.AbortReason = AbortManifestNotSynced
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		run.AbortReason = AbortCtxCanceled
 	case isLeaseLostError(err):
