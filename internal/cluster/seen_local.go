@@ -15,14 +15,23 @@ import (
 // files this node saw registered (#1071).
 const seenLocalJournal = "seen-local.log"
 
-const seenLocalHeader = "arc-seen-local v1 "
+// v2 (#1182): sha is what the file holds, no longer the checksum the manifest
+// listed when the file was seen. A v1 journal's records are loaded with the
+// checksum unknown: still removable by the sweep, hashed once by the walk.
+const (
+	seenLocalHeader   = "arc-seen-local v2 "
+	seenLocalHeaderV1 = "arc-seen-local v1 "
+)
 
 // seenRecord identifies the local file a path held when this node saw it
 // registered: the file must still be that one (size, mtime, inode) before the
 // stale-local sweep may remove it, and lsn is the manifest index of the
 // registration, so a manifest that has not applied that far yet never makes it
-// look unlisted. sha is the first 64 bits of the registered checksum: a later
-// registration with another one means the content changed.
+// look unlisted. sha is the first 64 bits of the checksum this node knows that
+// file holds (#1182): set when it pulled, wrote or hashed the file, kept while
+// the file stays the same one, and 0 when unknown. A manifest that lists
+// another checksum for the path while the file is unchanged means the copy is
+// stale. The evidence is as durable as the file's own rename.
 type seenRecord struct {
 	size  int64
 	mtime int64 // UnixNano
@@ -95,17 +104,27 @@ func (s *seenLocal) load() error {
 	defer f.Close()
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
-	first := true
+	first, v1 := true, false
 	for sc.Scan() {
 		line := sc.Text()
 		if first {
 			first = false
-			if line != seenLocalHeader+s.cluster {
+			switch line {
+			case seenLocalHeader + s.cluster:
+			case seenLocalHeaderV1 + s.cluster:
+				v1 = true
+			default:
 				return nil // another cluster's, or unreadable: start empty
 			}
 			continue
 		}
 		applySeenLine(s.set, line)
+	}
+	if v1 {
+		for p, r := range s.set {
+			r.sha = 0
+			s.set[p] = r
+		}
 	}
 	if err := sc.Err(); err != nil {
 		// A line too long to be ours ends the read; what came before stands.
@@ -229,6 +248,40 @@ func (s *seenLocal) add(path string, r seenRecord) {
 	}
 	s.set[path] = r
 	s.appendLocked(addLine(path, r))
+}
+
+// update replaces path's record with what fn returns from the current one,
+// under the set's lock, so fn decides from the record as it is. The caller's
+// stat is taken before the lock, so a walk can still write back an older file
+// identity with an unknown checksum after a pull recorded the new one; that
+// costs one hash on the next walk and never pairs the current file with a
+// wrong checksum. fn returning false writes nothing.
+func (s *seenLocal) update(path string, fn func(old seenRecord, ok bool) (seenRecord, bool)) {
+	if !journalablePath(path) {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failed != nil {
+		return
+	}
+	old, ok := s.set[path]
+	r, write := fn(old, ok)
+	if !write || (ok && old == r) {
+		return
+	}
+	s.set[path] = r
+	s.appendLocked(addLine(path, r))
+}
+
+// journalablePath: a path the journal's line format can hold.
+func journalablePath(path string) bool {
+	return !strings.ContainsAny(path, "\t\n")
+}
+
+// sameFile reports whether two records describe the same local file.
+func sameFile(a, b seenRecord) bool {
+	return a.size == b.size && a.mtime == b.mtime && a.ino == b.ino
 }
 
 // remove forgets path; a path not in the set writes nothing.

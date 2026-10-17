@@ -90,15 +90,7 @@ func TestWALDiskPressureNeverGatesReplay(t *testing.T) {
 		"WriteColumnarDirectReplayWithTagColumns": func(b *ArrowBuffer) error {
 			return b.WriteColumnarDirectReplayWithTagColumns(ctx, "db", "m", cols(), "", nil)
 		},
-		"WriteColumnarDirectNoWAL":           func(b *ArrowBuffer) error { return b.WriteColumnarDirectNoWAL(ctx, "db", "m", cols()) },
-		"WriteColumnarDirectNoWALWithHashes": func(b *ArrowBuffer) error { return b.WriteColumnarDirectNoWALWithHashes(ctx, "db", "m", cols(), nil) },
-		// The replication receiver's path (cluster coordinator).
-		"WriteColumnarDirectNoWALWithHashesAndTagColumns": func(b *ArrowBuffer) error {
-			return b.WriteColumnarDirectNoWALWithHashesAndTagColumns(ctx, "db", "m", cols(), nil, nil)
-		},
-		"WriteColumnarDirectNoWALWithTagColumns": func(b *ArrowBuffer) error {
-			return b.WriteColumnarDirectNoWALWithTagColumns(ctx, "db", "m", cols(), nil)
-		},
+		"WriteColumnarDirectNoWAL": func(b *ArrowBuffer) error { return b.WriteColumnarDirectNoWAL(ctx, "db", "m", cols()) },
 	}
 	for name, write := range paths {
 		t.Run(name, func(t *testing.T) {

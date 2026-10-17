@@ -37,10 +37,13 @@ type TrackedQuery struct {
 	// incomplete; it does not prove rows were dropped, since a query whose
 	// own LIMIT equals the cap reaches it with nothing lost. The entry's SQL
 	// is alongside, which is what distinguishes the two when reading history.
-	RowCap         int    `json:"row_cap,omitempty"`
-	Error          string `json:"error,omitempty"`
-	IsParallel     bool   `json:"is_parallel"`
-	PartitionCount int    `json:"partition_count,omitempty"`
+	RowCap int    `json:"row_cap,omitempty"`
+	Error  string `json:"error,omitempty"`
+	// IsParallel and PartitionCount are always false and 0 since queries are
+	// no longer split per hour partition (27.01.1); kept for API
+	// compatibility.
+	IsParallel     bool `json:"is_parallel"`
+	PartitionCount int  `json:"partition_count,omitempty"`
 }
 
 // activeEntry stores the tracked query plus its cancel func.
@@ -81,20 +84,18 @@ func NewRegistry(cfg *RegistryConfig, logger zerolog.Logger) *Registry {
 
 // Register registers a new active query. Returns the query ID and a
 // context derived from parentCtx that can be cancelled via Cancel().
-func (r *Registry) Register(parentCtx context.Context, sql string, tokenID int64, tokenName string, remoteAddr string, isParallel bool, partitionCount int) (string, context.Context) {
+func (r *Registry) Register(parentCtx context.Context, sql string, tokenID int64, tokenName string, remoteAddr string) (string, context.Context) {
 	queryID := uuid.New().String()[:12]
 	ctx, cancel := context.WithCancel(parentCtx)
 
 	query := &TrackedQuery{
-		ID:             queryID,
-		SQL:            sql,
-		TokenID:        tokenID,
-		TokenName:      tokenName,
-		RemoteAddr:     remoteAddr,
-		Status:         StatusRunning,
-		StartTime:      time.Now(),
-		IsParallel:     isParallel,
-		PartitionCount: partitionCount,
+		ID:         queryID,
+		SQL:        sql,
+		TokenID:    tokenID,
+		TokenName:  tokenName,
+		RemoteAddr: remoteAddr,
+		Status:     StatusRunning,
+		StartTime:  time.Now(),
 	}
 
 	r.mu.Lock()
@@ -104,7 +105,6 @@ func (r *Registry) Register(parentCtx context.Context, sql string, tokenID int64
 	r.logger.Debug().
 		Str("query_id", queryID).
 		Int64("token_id", tokenID).
-		Bool("parallel", isParallel).
 		Msg("Query registered")
 
 	return queryID, ctx

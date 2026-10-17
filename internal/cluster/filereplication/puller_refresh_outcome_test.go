@@ -186,7 +186,7 @@ func TestRefreshPendingGauge(t *testing.T) {
 // on a positive match. No checksum to compare against, or a context that is
 // done (LocalBackend.ReadTo does not watch it; the hasher's writer does),
 // downloads instead.
-func TestLocalCopyMatchesFailsClosed(t *testing.T) {
+func TestVerifyLocalCopyFailsClosed(t *testing.T) {
 	const path = "db/m/2026/10/12/00/closed.parquet"
 	body := []byte("same bytes on disk and in the manifest")
 	p, local, _ := newVerifyPuller(t, body)
@@ -194,16 +194,19 @@ func TestLocalCopyMatchesFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	entry := entryFor(path, body)
-	if !p.localCopyMatches(zerolog.Nop(), entry) {
+	if p.verifyLocalCopy(zerolog.Nop(), entry) != localCopyMatched {
 		t.Fatal("precondition: a matching copy must match")
 	}
 	noSum := *entry
 	noSum.SHA256 = ""
-	if p.localCopyMatches(zerolog.Nop(), &noSum) {
+	if p.verifyLocalCopy(zerolog.Nop(), &noSum) == localCopyMatched {
 		t.Fatal("an entry without a checksum was treated as matching")
 	}
 	p.Stop()
-	if p.localCopyMatches(zerolog.Nop(), entry) {
+	if got := p.verifyLocalCopy(zerolog.Nop(), entry); got != localCopyUnreadable {
+		t.Fatalf("a hash read on a stopped puller = %v, want unreadable", got)
+	}
+	if p.verifyLocalCopy(zerolog.Nop(), entry) == localCopyMatched {
 		t.Fatal("a hash read on a stopped puller was treated as matching")
 	}
 }

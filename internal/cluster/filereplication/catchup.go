@@ -42,7 +42,9 @@ type manifestWalkResult struct {
 // double-pulling) and the workers' backend checks; the one check it makes
 // itself is the disk presence of a self-origin entry when
 // RepullMissingSelfOrigin is on (otherwise such entries are skipped outright,
-// as enqueue does for the reactive path). All actual fetch work flows through
+// as enqueue does for the reactive path), and ObserveListed's verdict on the
+// local copy (#1182): a copy this node cannot vouch for is enqueued as a
+// forced refresh, hashed first when its content is unknown. All actual fetch work flows through
 // the same code path that Phase 2 reactive pulls use, which means the same
 // retry, backoff, checksum, and metrics behavior applies automatically.
 //
@@ -67,6 +69,21 @@ func (p *Puller) RunCatchUp(ctx context.Context, fetch func(cursor string, limit
 	defer p.reconciliationMu.Unlock()
 	p.walkManifest(ctx, fetch, true)
 }
+
+// ListedVerdict is ObserveListed's answer about the local copy of a listed
+// entry (#1182).
+type ListedVerdict uint8
+
+const (
+	// ListedTrusted: no copy at the manifest's size, or one this node knows
+	// holds the entry's checksum (or nothing to say: no tracking).
+	ListedTrusted ListedVerdict = iota
+	// ListedUnverified: a copy at the manifest's size whose content this node
+	// does not know (never seen pulled, written or hashed here).
+	ListedUnverified
+	// ListedStale: a copy at the manifest's size known to hold other bytes.
+	ListedStale
+)
 
 // selfOriginPresent reports whether a self-origin entry may be skipped by a
 // walk: always when the re-pull is off (this node is assumed to hold what it
@@ -252,9 +269,17 @@ func (p *Puller) walkManifest(ctx context.Context, fetch func(cursor string, lim
 			if entry == nil {
 				continue
 			}
+			verdict := ListedTrusted
 			if p.cfg.ObserveListed != nil {
-				p.cfg.ObserveListed(entry)
+				verdict = p.cfg.ObserveListed(entry)
 			}
+			// A copy this node cannot vouch for (#1182) is refreshed: hashed
+			// first when what it holds is unknown, downloaded when it is known
+			// to be other bytes. Never on a shared backend, where nothing is
+			// pulled over the writer's own object, nor for an entry with no
+			// checksum to compare with.
+			suspect := verdict != ListedTrusted && p.cfg.ForceContentRefresh && entry.SHA256 != "" &&
+				(entry.OriginNodeID != p.cfg.SelfNodeID || p.cfg.RepullMissingSelfOrigin)
 
 			// Backpressure: if the queue is above the high-water mark, sleep
 			// briefly to let workers drain.
@@ -284,7 +309,7 @@ func (p *Puller) walkManifest(ctx context.Context, fetch func(cursor string, lim
 			// originated files it no longer has, and they must come back from
 			// a peer's replica like any other entry (catch-up-tagged on the
 			// startup walk, so the query gate stays red until they are).
-			if entry.OriginNodeID == p.cfg.SelfNodeID && p.selfOriginPresent(entry) {
+			if !suspect && entry.OriginNodeID == p.cfg.SelfNodeID && p.selfOriginPresent(entry) {
 				p.totalSkippedSelf.Add(1)
 				if startup {
 					p.catchupSkippedLocal.Add(1)
@@ -301,7 +326,10 @@ func (p *Puller) walkManifest(ctx context.Context, fetch func(cursor string, lim
 			if startup {
 				source = enqueueSourceCatchUp
 			}
-			enqueueStatus := p.enqueue(entry, source, false)
+			if suspect {
+				p.totalSuspectListed.Add(1)
+			}
+			enqueueStatus := p.enqueueRequest(entry, source, suspect, verdict == ListedUnverified)
 
 			if startup {
 				switch enqueueStatus {

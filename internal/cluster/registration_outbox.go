@@ -85,6 +85,11 @@ type RegistrationOutbox struct {
 	clusterName string
 	logger      zerolog.Logger
 
+	// localWritten, when set, is told about each file this node just
+	// flushed, before it is announced: the evidence of what the local file
+	// holds (#1182).
+	localWritten atomic.Pointer[func(path, sha256 string)]
+
 	// syncMu serialises fsyncs and journal rewrites. Lock order: syncMu, then
 	// mu. Appends take only mu, so they never wait on a fsync.
 	syncMu sync.Mutex
@@ -456,6 +461,13 @@ func readJournalLine(br *bufio.Reader) ([]byte, error) {
 	}
 }
 
+// SetLocalWritten wires the hook told about each flushed file (#1182).
+func (r *RegistrationOutbox) SetLocalWritten(fn func(path, sha256 string)) {
+	if fn != nil {
+		r.localWritten.Store(&fn)
+	}
+}
+
 // RegisterFile implements ingest.FileRegistrar. It appends without fsyncing;
 // SyncRegistrations makes the append durable.
 func (r *RegistrationOutbox) RegisterFile(database, measurement, path string, partitionTime time.Time, sizeBytes int64, sha256 string) {
@@ -466,6 +478,9 @@ func (r *RegistrationOutbox) RegisterFile(database, measurement, path string, pa
 // with the coverage of the file's flush group (#1207), journaled with the
 // record. The file's outcome is reported through cov.Settle.
 func (r *RegistrationOutbox) RegisterCoveredFile(database, measurement, path string, partitionTime time.Time, sizeBytes int64, sha256 string, cov *ingest.GroupCoverage) {
+	if fn := r.localWritten.Load(); fn != nil {
+		(*fn)(path, sha256)
+	}
 	rec := journalRecord{
 		Version: journalRecordVersion, Op: journalOpAdd, ClusterName: r.clusterName,
 		Database: database, Measurement: measurement, Path: path,
