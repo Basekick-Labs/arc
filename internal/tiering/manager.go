@@ -1036,6 +1036,14 @@ func isBudgetExpiry(err error) bool {
 	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
 }
 
+const coldTierMetadataBatchSize = 1000
+
+// appendColdTierMetadataBatch bounds the metadata held between SQLite writes.
+func appendColdTierMetadataBatch(batch []FileMetadata, file FileMetadata) ([]FileMetadata, bool) {
+	batch = append(batch, file)
+	return batch, len(batch) >= coldTierMetadataBatchSize
+}
+
 // syncColdTierMetadata makes this node's metadata reflect what is in cold
 // storage. In a gated cluster — shared storage, or per-node storage with
 // file replication — only the primary writer migrates, but the query layer
@@ -1080,10 +1088,72 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 		unseen[f.Path] = true
 	}
 
-	synced, unparseable, quarantined := 0, 0, 0
+	synced := 0
+	quarantined := 0
+	touched := make(map[tierCacheScope]struct{})
+	defer m.metadata.invalidateTierCacheScopes(touched)
+	batch := make([]FileMetadata, 0, coldTierMetadataBatchSize)
+	flushBatch := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+
+		notWritten, batchScopes, err := m.metadata.recordColdFilesBatch(ctx, batch, time.Time{})
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			// Preserve the former per-file error handling if one bad row makes
+			// an atomic batch fail: record the rest and report only that row.
+			m.logger.Warn().Int("files", len(batch)).Err(err).Msg("Failed to record cold file batch, retrying files individually")
+			for _, file := range batch {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				migratedAt := time.Time{}
+				if file.MigratedAt != nil {
+					migratedAt = *file.MigratedAt
+				}
+				wrote, err := m.metadata.recordColdFile(ctx, &file, migratedAt)
+				if err != nil {
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						return ctxErr
+					}
+					m.logger.Warn().Str("path", file.Path).Err(err).Msg("Failed to record cold file, skipping")
+					continue
+				}
+				if !wrote {
+					quarantined++
+					continue
+				}
+				touched[tierCacheScope{database: file.Database, measurement: file.Measurement}] = struct{}{}
+				synced++
+				coldRows = append(coldRows, file)
+			}
+			return nil
+		}
+		for scope := range batchScopes {
+			touched[scope] = struct{}{}
+		}
+		quarantinedPaths := make(map[string]struct{}, len(notWritten))
+		for _, path := range notWritten {
+			quarantinedPaths[path] = struct{}{}
+		}
+		for _, file := range batch {
+			if _, ok := quarantinedPaths[file.Path]; ok {
+				// A quarantined row is already the record that this key is
+				// unusable. Do not count it or let the manifest sweep act on it.
+				quarantined++
+				continue
+			}
+			synced++
+			coldRows = append(coldRows, file)
+		}
+		return nil
+	}
+
+	unparseable := 0
 	for _, obj := range objects {
-		// Past the deadline every remaining upsert would fail and log; stop
-		// with what was recorded — the next cycle continues from there.
 		if err := ctx.Err(); err != nil {
 			return synced, coldRows, err
 		}
@@ -1113,29 +1183,23 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 			SizeBytes:     obj.Size,
 			CreatedAt:     obj.LastModified,
 		}
-		wrote, err := m.metadata.RecordColdFile(ctx, file, obj.LastModified)
-		if err != nil {
-			m.logger.Warn().Str("path", obj.Path).Err(err).Msg("Failed to record cold file, skipping")
-			continue
-		}
-		if !wrote {
-			// Quarantined (#1086 stage C added that guard). The row is
-			// already the record that this key is unusable, and before the
-			// guard every cycle re-upserted it for as long as the listing
-			// kept returning the object. Not counted as synced and not
-			// appended to coldRows: the sweep must not act on it either.
-			quarantined++
-			continue
-		}
-		synced++
-		// As recorded: the sweep needs the tier and the migration stamp.
 		migratedAt := obj.LastModified
 		if migratedAt.IsZero() {
 			migratedAt = time.Now()
 		}
 		file.Tier = TierCold
 		file.MigratedAt = &migratedAt
-		coldRows = append(coldRows, *file)
+		var full bool
+		batch, full = appendColdTierMetadataBatch(batch, *file)
+		if full {
+			if err := flushBatch(); err != nil {
+				return synced, coldRows, err
+			}
+			batch = batch[:0]
+		}
+	}
+	if err := flushBatch(); err != nil {
+		return synced, coldRows, err
 	}
 
 	if len(unseen) > 0 {
