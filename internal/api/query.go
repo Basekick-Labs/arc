@@ -1425,7 +1425,7 @@ func (h *QueryHandler) SetFileTimePruning(enabled bool, margin time.Duration) {
 func (h *QueryHandler) InvalidateCaches() {
 	h.pruner.InvalidateAllCaches()
 	h.queryCache.Invalidate()
-	h.logger.Info().Msg("Query caches invalidated (compaction or tier migration)")
+	h.logger.Info().Msg("Query caches invalidated (files removed or rewritten)")
 }
 
 // StartBackgroundWorkers spawns the long-lived goroutines the handler
@@ -2870,10 +2870,12 @@ func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, header
 		return sql, true, nil
 	}
 
-	// Build cache key - include header database if provided
-	cacheKey := sql
+	// Build cache key - include header database if provided, and the current
+	// hour: SQL pruned before an hour started is never served after it (the
+	// pruner leaves out hours that have not started and have no files).
+	cacheKey := strconv.FormatInt(h.pruner.LiveEpoch(), 10) + ":" + sql
 	if headerDB != "" {
-		cacheKey = headerDB + ":" + sql
+		cacheKey = headerDB + ":" + cacheKey
 	}
 
 	// Check cache

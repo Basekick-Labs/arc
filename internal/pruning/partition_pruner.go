@@ -288,10 +288,12 @@ func newPartitionCache(ttl time.Duration) *partitionCache {
 	}
 }
 
-// cacheKey generates a cache key from the original path and SQL query
-func (c *partitionCache) cacheKey(originalPath, sql string) string {
+// cacheKey generates a cache key from the original path, the SQL query and
+// the live epoch (the start of the current hour, see live_hours.go): a list
+// pruned before an hour started is never served after it.
+func (c *partitionCache) cacheKey(originalPath, sql string, epoch int64) string {
 	// Use hash of SQL to avoid storing full query text
-	h := fmt.Sprintf("%s:%x", originalPath, sha256.Sum256([]byte(sql)))
+	h := fmt.Sprintf("%s:%d:%x", originalPath, epoch, sha256.Sum256([]byte(sql)))
 	return h
 }
 
@@ -776,7 +778,7 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 	}
 
 	// Check partition cache first
-	cacheKey := p.partitionCache.cacheKey(originalPath, sql)
+	cacheKey := p.partitionCache.cacheKey(originalPath, sql, p.liveEpoch())
 	if result, optimized, ok := p.partitionCache.get(cacheKey); ok {
 		// A cached fallback verdict is exactly the stale-empty case the proof
 		// exists for: with wantProof, re-derive instead of trusting it.
@@ -828,13 +830,22 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 	generated := partitionPaths
 	existing, verified, hits := p.filterExistingPathsOpts(ctx, partitionPaths, basePath, 0)
 	partitionPaths = existing
+	// A live partition left out because it has no files yet makes the result
+	// valid only until that partition's first flush: never cached, here or
+	// by the SQL transform cache.
+	liveDropped := p.liveWindow().droppedLive(generated, existing)
+	if liveDropped {
+		markVolatile(ctx)
+	}
 	if len(partitionPaths) == 0 {
 		if wantProof && p.proveEmpty(ctx, basePath, database, measurement, sql, timeRange, generated, hits, verified) {
 			// Never cached: the next query must prove it again.
 			return originalPath, false, true
 		}
 		p.logger.Info().Msg("No data exists for time range, using fallback")
-		p.partitionCache.set(cacheKey, originalPath, false)
+		if !liveDropped {
+			p.partitionCache.set(cacheKey, originalPath, false)
+		}
 		return originalPath, false, false
 	}
 
@@ -860,7 +871,7 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 	// Cache the result — except when file-level expansion happened: an
 	// explicit file list is stale the moment the next flush lands, and the
 	// per-query re-glob it forces instead is a few ms.
-	if !fileExpanded {
+	if !fileExpanded && !liveDropped {
 		p.partitionCache.set(cacheKey, result, true)
 	}
 	return result, true, false
@@ -943,10 +954,12 @@ func (p *PartitionPruner) filterExistingLocalPaths(paths []string) []string {
 func (p *PartitionPruner) filterExistingLocalPathsOpts(paths []string, maxAge time.Duration) ([]string, bool, int) {
 	existingPaths := []string{}
 	hits := 0
+	live := p.liveWindow()
 
 	for _, pattern := range paths {
-		// Check cache first
-		if matches, ok := p.globCache.getFresh(pattern, maxAge); ok {
+		// Check cache first; a live partition's absence is never taken from
+		// it (the entry may predate the hour becoming live)
+		if matches, ok := p.globCache.getFresh(pattern, maxAge); ok && (len(matches) > 0 || !live.isLive(pattern)) {
 			hits++
 			if len(matches) > 0 {
 				existingPaths = append(existingPaths, pattern)
@@ -962,8 +975,11 @@ func (p *PartitionPruner) filterExistingLocalPathsOpts(paths []string, maxAge ti
 			continue
 		}
 
-		// Cache the result (even empty results to avoid repeated globs)
-		p.globCache.set(pattern, matches)
+		// Cache the result (even empty results to avoid repeated globs,
+		// except a live partition's: it can appear at the next flush)
+		if len(matches) > 0 || !live.isLive(pattern) {
+			p.globCache.set(pattern, matches)
+		}
 
 		if len(matches) > 0 {
 			existingPaths = append(existingPaths, pattern)
@@ -1014,12 +1030,17 @@ func (p *PartitionPruner) filterExistingRemotePathsOpts(ctx context.Context, pat
 	// We need to check if the hour directory exists
 	dirsToCheck := make(map[string]struct{})
 	pathToDir := make(map[string]string)
+	liveDirs := make(map[string]bool)
+	live := p.liveWindow()
 
 	for _, path := range paths {
 		// Remove the glob suffix to get the directory
 		dir := strings.TrimSuffix(path, "/*.parquet")
 		dirsToCheck[dir] = struct{}{}
 		pathToDir[path] = dir
+		if live.isLive(path) {
+			liveDirs[dir] = true
+		}
 	}
 
 	// Group directories by parent to minimize ListDirectories calls
@@ -1050,15 +1071,26 @@ func (p *PartitionPruner) filterExistingRemotePathsOpts(ctx context.Context, pat
 		cacheKey := "remote:parent:" + parentDir
 
 		if cached, ok := p.globCache.getFresh(cacheKey, maxAge); ok {
-			hits++
 			// Cache hit - rebuild set from cached slice
 			childSet := make(map[string]bool, len(cached))
 			for _, child := range cached {
 				childSet[child] = true
 			}
-			parentChildren[parentDir] = childSet
-			p.logger.Debug().Str("parent", parentDir).Int("children", len(childSet)).Msg("Using cached parent listing")
-			continue
+			// A live child missing from the cached listing may have
+			// appeared since: list again rather than remember its absence.
+			missingLive := false
+			for dir, info := range dirDetails {
+				if info.parent == parentDir && liveDirs[dir] && !childSet[info.target] {
+					missingLive = true
+					break
+				}
+			}
+			if !missingLive {
+				hits++
+				parentChildren[parentDir] = childSet
+				p.logger.Debug().Str("parent", parentDir).Int("children", len(childSet)).Msg("Using cached parent listing")
+				continue
+			}
 		}
 
 		// Cache miss - call ListDirectories once for this parent

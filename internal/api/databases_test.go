@@ -533,8 +533,10 @@ func TestDatabasesHandler_ListMeasurementsReservedRoots(t *testing.T) {
 
 // TestDatabasesHandler_Delete tests deleting a database
 func TestDatabasesHandler_Delete(t *testing.T) {
-	_, app, tmpDir := setupTestDatabasesHandler(t, true) // delete enabled
+	handler, app, tmpDir := setupTestDatabasesHandler(t, true) // delete enabled
 	defer os.RemoveAll(tmpDir)
+	invalidated := 0
+	handler.SetOnFilesRemoved(func() { invalidated++ })
 
 	// Create a database with data
 	ctx := context.Background()
@@ -570,6 +572,10 @@ func TestDatabasesHandler_Delete(t *testing.T) {
 		exists, _ := backend.Exists(ctx, "deletedb/measurement1/data1.parquet")
 		if exists {
 			t.Error("Expected database files to be deleted")
+		}
+		// Cached pruned lists naming the removed files are dropped.
+		if invalidated != 1 {
+			t.Errorf("query caches invalidated %d times, want 1", invalidated)
 		}
 	})
 }
@@ -733,6 +739,8 @@ func TestDatabasesHandler_DeleteKeepsMarkerWhenTierCleanupFails(t *testing.T) {
 		events:      &events,
 		cleanupErrs: []error{fmt.Errorf("cold object could not be deleted")},
 	})
+	invalidated := 0
+	handler.SetOnFilesRemoved(func() { invalidated++ })
 
 	req := httptest.NewRequest("DELETE", "/api/v1/databases/deletedb?confirm=true", nil)
 	resp, err := app.Test(req, testRequestTimeoutMS)
@@ -745,6 +753,10 @@ func TestDatabasesHandler_DeleteKeepsMarkerWhenTierCleanupFails(t *testing.T) {
 	}
 	if exists, err := backend.Exists(ctx, marker); err != nil || !exists {
 		t.Fatalf("marker after tier cleanup failure: exists=%v err=%v, want retained for retry", exists, err)
+	}
+	// A partial deletion removed files too: the query caches go.
+	if invalidated != 1 {
+		t.Fatalf("query caches invalidated %d times, want 1", invalidated)
 	}
 }
 

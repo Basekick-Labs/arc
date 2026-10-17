@@ -3824,6 +3824,134 @@ func main() {
 		}
 	}
 
+	// Query cache invalidation, after compaction, retention or DELETE removed files.
+	// After compaction deletes old parquet files, DuckDB's cache_httpfs still holds
+	// cached glob results (directory listings) pointing to deleted files, causing 404s.
+	// This callback clears all relevant caches in the parent process after each
+	// successful compaction job. See: https://github.com/Basekick-Labs/arc/issues/204
+	// Logged exactly once per process when cluster mode is up but
+	// cluster.shared_secret is empty — the per-compaction Warn would
+	// otherwise spam the log every compaction (hourly + daily).
+	var fanOutSkipLogOnce sync.Once
+
+	// Build a single shared *http.Client for the cache-invalidate
+	// fan-out so connection pooling actually reuses sockets across
+	// compactions. Only constructed when cluster mode is on —
+	// compaction itself works in OSS/standalone, but the fan-out
+	// path is cluster-only (the per-call `if clusterCoordinator
+	// != nil` guard inside the callback is what actually decides
+	// whether to send). We reuse the coordinator's already-loaded
+	// *tls.Config rather than re-reading cert/key/CA from disk;
+	// when cluster.tls_enabled is false the getter returns nil
+	// and the transport falls back to plaintext (or system roots
+	// if the URL is https://). No Client.Timeout: the per-request
+	// context.WithTimeout below is the policy bound; an extra
+	// Client.Timeout would be redundant dead config.
+	var clusterHTTPClient *http.Client
+	var clusterScheme string
+	if clusterCoordinator != nil {
+		clusterHTTPClient = &http.Client{
+			Transport: security.NewClusterHTTPTransport(clusterCoordinator.ClusterTLSConfig()),
+		}
+		clusterScheme = security.SchemeForServer(cfg.Server.TLSEnabled)
+		log.Info().
+			Str("scheme", clusterScheme).
+			Bool("cluster_tls", cfg.Cluster.TLSEnabled).
+			Msg("Cache-invalidate fan-out transport initialised")
+	}
+
+	invalidateQueryCaches := func() {
+		// Local invalidation
+		db.ClearHTTPCache()
+		queryHandler.InvalidateCaches()
+
+		// Distributed invalidation (enterprise clustering)
+		// Notify all query-capable nodes to clear their caches too
+		if clusterCoordinator != nil {
+			registry := clusterCoordinator.GetRegistry()
+			localNode := registry.Local()
+			if localNode == nil {
+				return
+			}
+
+			// Skip the HTTP fan-out entirely when no cluster shared
+			// secret is configured. The receiving end refuses every
+			// request in that state (see handleCacheInvalidate), so
+			// sending would be a waste. Wrapped in sync.Once so the
+			// operator sees the explanation exactly once at first
+			// invalidation, not on every subsequent run.
+			if cfg.Cluster.SharedSecret == "" {
+				fanOutSkipLogOnce.Do(func() {
+					log.Warn().Msg("cluster cache invalidation skipped: cluster.shared_secret is not configured; each node's local in-process invalidation already ran. Set cluster.shared_secret to enable fan-out.")
+				})
+				return
+			}
+
+			targets := registry.GetReaders()
+			targets = append(targets, registry.GetWriters()...)
+
+			for _, node := range targets {
+				if node.ID == localNode.ID {
+					continue
+				}
+				go func(n *cluster.Node) {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+
+					// Compute the HMAC once per request: a fresh nonce
+					// (32 random bytes, hex-encoded) binds the MAC to a
+					// single attempt; the timestamp binds it to a
+					// 5-minute freshness window. Receiver replay-checks
+					// (nonce, sender nodeID) against its NonceCache.
+					nonce, err := security.GenerateNonce()
+					if err != nil {
+						log.Warn().Err(err).Str("node_id", n.ID).Msg("Failed to generate nonce for cache invalidation")
+						return
+					}
+					ts := time.Now().Unix()
+					mac := security.ComputeCacheInvalidateHMAC(
+						cfg.Cluster.SharedSecret, nonce, localNode.ID, cfg.Cluster.ClusterName, ts,
+					)
+
+					// Build via *url.URL so an IPv6 literal in
+					// n.APIAddress (e.g. "[::1]:8000") survives
+					// unmangled. CacheInvalidatePath is a known-safe
+					// constant path, so we don't need to escape it.
+					peerURL := (&url.URL{
+						Scheme: clusterScheme,
+						Host:   n.APIAddress,
+						Path:   api.CacheInvalidatePath,
+					}).String()
+					req, err := http.NewRequestWithContext(ctx, http.MethodPost, peerURL, nil)
+					if err != nil {
+						log.Warn().Err(err).Str("node_id", n.ID).Msg("Failed to create cache invalidation request")
+						return
+					}
+					req.Header.Set("X-Arc-Node-ID", localNode.ID)
+					req.Header.Set("X-Arc-Cluster", cfg.Cluster.ClusterName)
+					req.Header.Set("X-Arc-Nonce", nonce)
+					req.Header.Set("X-Arc-Timestamp", strconv.FormatInt(ts, 10))
+					req.Header.Set("X-Arc-HMAC", mac)
+
+					resp, err := clusterHTTPClient.Do(req)
+					if err != nil {
+						log.Warn().Err(err).Str("node_id", n.ID).Str("address", n.APIAddress).
+							Msg("Failed to invalidate cache on remote node")
+						return
+					}
+					defer resp.Body.Close()
+					_, _ = io.Copy(io.Discard, resp.Body)
+					if resp.StatusCode != http.StatusNoContent {
+						log.Warn().Int("status", resp.StatusCode).Str("node_id", n.ID).
+							Msg("Unexpected status from cache invalidation")
+					} else {
+						log.Debug().Str("node_id", n.ID).Msg("Remote query caches invalidated")
+					}
+				}(node)
+			}
+		}
+	}
+
 	// Register Compaction handler (if compaction is enabled)
 	if compactionManager != nil {
 		// compactionAPIGate wraps the same gate value the schedulers consult,
@@ -3833,133 +3961,7 @@ func main() {
 		compactionHandler := api.NewCompactionHandler(compactionManager, hourlyScheduler, dailyScheduler, authManager, compactionAPIGate, logger.Get("compaction"))
 		compactionHandler.RegisterRoutes(server.GetApp())
 
-		// Wire post-compaction cache invalidation.
-		// After compaction deletes old parquet files, DuckDB's cache_httpfs still holds
-		// cached glob results (directory listings) pointing to deleted files, causing 404s.
-		// This callback clears all relevant caches in the parent process after each
-		// successful compaction job. See: https://github.com/Basekick-Labs/arc/issues/204
-		// Logged exactly once per process when cluster mode is up but
-		// cluster.shared_secret is empty — the per-compaction Warn would
-		// otherwise spam the log every compaction (hourly + daily).
-		var fanOutSkipLogOnce sync.Once
-
-		// Build a single shared *http.Client for the cache-invalidate
-		// fan-out so connection pooling actually reuses sockets across
-		// compactions. Only constructed when cluster mode is on —
-		// compaction itself works in OSS/standalone, but the fan-out
-		// path is cluster-only (the per-call `if clusterCoordinator
-		// != nil` guard inside the callback is what actually decides
-		// whether to send). We reuse the coordinator's already-loaded
-		// *tls.Config rather than re-reading cert/key/CA from disk;
-		// when cluster.tls_enabled is false the getter returns nil
-		// and the transport falls back to plaintext (or system roots
-		// if the URL is https://). No Client.Timeout: the per-request
-		// context.WithTimeout below is the policy bound; an extra
-		// Client.Timeout would be redundant dead config.
-		var clusterHTTPClient *http.Client
-		var clusterScheme string
-		if clusterCoordinator != nil {
-			clusterHTTPClient = &http.Client{
-				Transport: security.NewClusterHTTPTransport(clusterCoordinator.ClusterTLSConfig()),
-			}
-			clusterScheme = security.SchemeForServer(cfg.Server.TLSEnabled)
-			log.Info().
-				Str("scheme", clusterScheme).
-				Bool("cluster_tls", cfg.Cluster.TLSEnabled).
-				Msg("Post-compaction cache-invalidate fan-out transport initialised")
-		}
-
-		compactionManager.SetOnCompactionComplete(func() {
-			// Local invalidation
-			db.ClearHTTPCache()
-			queryHandler.InvalidateCaches()
-
-			// Distributed invalidation (enterprise clustering)
-			// Notify all query-capable nodes to clear their caches too
-			if clusterCoordinator != nil {
-				registry := clusterCoordinator.GetRegistry()
-				localNode := registry.Local()
-				if localNode == nil {
-					return
-				}
-
-				// Skip the HTTP fan-out entirely when no cluster shared
-				// secret is configured. The receiving end refuses every
-				// request in that state (see handleCacheInvalidate), so
-				// sending would be a waste. Wrapped in sync.Once so the
-				// operator sees the explanation exactly once at first
-				// compaction, not on every subsequent run.
-				if cfg.Cluster.SharedSecret == "" {
-					fanOutSkipLogOnce.Do(func() {
-						log.Warn().Msg("post-compaction cluster cache invalidation skipped: cluster.shared_secret is not configured; each node's local in-process invalidation already ran. Set cluster.shared_secret to enable fan-out.")
-					})
-					return
-				}
-
-				targets := registry.GetReaders()
-				targets = append(targets, registry.GetWriters()...)
-
-				for _, node := range targets {
-					if node.ID == localNode.ID {
-						continue
-					}
-					go func(n *cluster.Node) {
-						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-						defer cancel()
-
-						// Compute the HMAC once per request: a fresh nonce
-						// (32 random bytes, hex-encoded) binds the MAC to a
-						// single attempt; the timestamp binds it to a
-						// 5-minute freshness window. Receiver replay-checks
-						// (nonce, sender nodeID) against its NonceCache.
-						nonce, err := security.GenerateNonce()
-						if err != nil {
-							log.Warn().Err(err).Str("node_id", n.ID).Msg("Failed to generate nonce for cache invalidation")
-							return
-						}
-						ts := time.Now().Unix()
-						mac := security.ComputeCacheInvalidateHMAC(
-							cfg.Cluster.SharedSecret, nonce, localNode.ID, cfg.Cluster.ClusterName, ts,
-						)
-
-						// Build via *url.URL so an IPv6 literal in
-						// n.APIAddress (e.g. "[::1]:8000") survives
-						// unmangled. CacheInvalidatePath is a known-safe
-						// constant path, so we don't need to escape it.
-						peerURL := (&url.URL{
-							Scheme: clusterScheme,
-							Host:   n.APIAddress,
-							Path:   api.CacheInvalidatePath,
-						}).String()
-						req, err := http.NewRequestWithContext(ctx, http.MethodPost, peerURL, nil)
-						if err != nil {
-							log.Warn().Err(err).Str("node_id", n.ID).Msg("Failed to create cache invalidation request")
-							return
-						}
-						req.Header.Set("X-Arc-Node-ID", localNode.ID)
-						req.Header.Set("X-Arc-Cluster", cfg.Cluster.ClusterName)
-						req.Header.Set("X-Arc-Nonce", nonce)
-						req.Header.Set("X-Arc-Timestamp", strconv.FormatInt(ts, 10))
-						req.Header.Set("X-Arc-HMAC", mac)
-
-						resp, err := clusterHTTPClient.Do(req)
-						if err != nil {
-							log.Warn().Err(err).Str("node_id", n.ID).Str("address", n.APIAddress).
-								Msg("Failed to invalidate cache on remote node")
-							return
-						}
-						defer resp.Body.Close()
-						_, _ = io.Copy(io.Discard, resp.Body)
-						if resp.StatusCode != http.StatusNoContent {
-							log.Warn().Int("status", resp.StatusCode).Str("node_id", n.ID).
-								Msg("Unexpected status from cache invalidation")
-						} else {
-							log.Debug().Str("node_id", n.ID).Msg("Remote cache invalidated after compaction")
-						}
-					}(node)
-				}
-			}
-		})
+		compactionManager.SetOnCompactionComplete(invalidateQueryCaches)
 	}
 
 	// Register Delete handler
@@ -3970,6 +3972,7 @@ func main() {
 	// upload). Cross-handler reuse is fine because the filenames are unique
 	// via os.CreateTemp.
 	deleteHandler := api.NewDeleteHandler(db, storageBackend, &cfg.Delete, authManager, dbConfig.UploadDir, logger.Get("delete"))
+	deleteHandler.SetOnFilesRemoved(invalidateQueryCaches)
 	if registrationOutbox != nil {
 		// A rewrite of a file still pending registration is announced in its
 		// place (#1210).
@@ -3997,6 +4000,7 @@ func main() {
 	// Register Databases handler
 	databasesHandler := api.NewDatabasesHandler(storageBackend, &cfg.Delete, authManager, logger.Get("databases"))
 	databasesHandler.SetFieldSchema(fieldSchemaRegistry)
+	databasesHandler.SetOnFilesRemoved(invalidateQueryCaches)
 	databasesHandler.SetFlusher(deleteFlusher(arrowBuffer, walWriter))
 	if registrationOutbox != nil {
 		databasesHandler.SetPendingRegistrations(registrationOutbox)
@@ -4024,6 +4028,7 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize retention handler")
 		}
+		retentionHandler.SetOnFilesRemoved(invalidateQueryCaches)
 		retentionHandler.RegisterRoutes(server.GetApp())
 		if clusterCoordinator != nil {
 			retentionHandler.SetCoordinator(clusterCoordinator)

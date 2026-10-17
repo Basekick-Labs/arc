@@ -72,9 +72,14 @@ func TestOptimizeTablePathExpandedNeverCached(t *testing.T) {
 
 func TestOptimizeTablePathNonExpandedStillCached(t *testing.T) {
 	now := time.Now().UTC()
-	p, originalPath, sqlQ, dir := optimizeSetup(t, now)
+	p, originalPath, _, dir := optimizeSetup(t, now)
 	p.SetFileTimePruning(false, 0) // feature off → glob results, cached as before
 	mkfile(t, dir, fname("m", now.Add(-10*time.Second)))
+	// A range that ends with the current hour, which has a file: no live
+	// hour is missing, so the result is cacheable. (An open-ended range
+	// reaches future hours without files and is never cached.)
+	hour := now.Truncate(time.Hour)
+	sqlQ := "SELECT * FROM t WHERE time >= '" + hour.Format(time.RFC3339) + "' AND time < '" + hour.Add(time.Hour).Format(time.RFC3339) + "'"
 
 	if _, opt := p.OptimizeTablePath(context.Background(), originalPath, sqlQ); !opt {
 		t.Fatal("expected optimization")
