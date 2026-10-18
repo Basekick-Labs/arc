@@ -7,7 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	sqlutil "github.com/basekick-labs/arc/internal/sql"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,8 +19,10 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/basekick-labs/arc/internal/metrics"
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
+	"github.com/valyala/fasthttp"
 )
 
 // streamArrowIPCFunc indirects streamArrowIPC so tests can drive the
@@ -121,6 +123,33 @@ func poisonArrowStream(w *bufio.Writer, logger zerolog.Logger) {
 	}
 }
 
+func registerArrowResponseTrailers(header *fasthttp.ResponseHeader, logger zerolog.Logger) {
+	trailers := []struct {
+		name    string
+		message string
+	}{
+		{
+			name:    arrowStreamTruncatedTrailer,
+			message: "Failed to register Arrow truncation trailer; clients will not see the reason a stream was cut",
+		},
+		{
+			name:    arrowExecutionTimeTrailer,
+			message: "Failed to register Arrow execution-time trailer; clients will not see server-side timing",
+		},
+		{
+			name:    arrowRowsCappedTrailer,
+			message: "Failed to register Arrow row-cap trailer; clients will not see that a governance cap truncated the result",
+		},
+	}
+	for _, trailer := range trailers {
+		if err := header.AddTrailer(trailer.name); err != nil {
+			arrowTrailerWarnOnce.Do(func() {
+				logger.Warn().Err(err).Str("trailer", trailer.name).Msg(trailer.message)
+			})
+		}
+	}
+}
+
 // releaseArrowStreamResources frees everything the Arrow IPC response owns:
 // the DuckDB-backed reader, the pooled connection behind it, and the query
 // timeout context. Order matters — the reader's Release closes the result set
@@ -217,7 +246,7 @@ streamLoop:
 		default:
 		}
 
-		batch := reader.Record()
+		batch := reader.RecordBatch()
 		if batch == nil {
 			break
 		}
@@ -376,6 +405,123 @@ streamLoop:
 		logger.Warn().Err(err).Msg("Failed to close Arrow IPC writer")
 	}
 	return totalRows, streamErr
+}
+
+type contextArrowRecordReader struct {
+	array.RecordReader
+	ctx      context.Context
+	maxRows  int
+	rowsRead int64
+}
+
+func (r *contextArrowRecordReader) RecordBatch() arrow.RecordBatch {
+	record := r.RecordReader.RecordBatch()
+	if record != nil {
+		r.rowsRead += record.NumRows()
+	}
+	return record
+}
+
+func (r *contextArrowRecordReader) Err() error {
+	if err := r.RecordReader.Err(); err != nil {
+		return err
+	}
+	// Like the DuckDB streamer, reaching the cap is a successful end to the
+	// response; a deadline that expires after the capped batch must not turn
+	// that valid IPC stream into a truncated one.
+	if rowCapReached(r.maxRows, r.rowsRead) {
+		return nil
+	}
+	return r.ctx.Err()
+}
+
+// serveArcxArrowIPCResult hands an ArcX record reader to the same IPC streamer
+// used by DuckDB. Keeping the cap and trailer handling here lets the ArcX hook
+// use the tested streaming semantics without linking its private engine into
+// the ordinary test build.
+func (h *QueryHandler) serveArcxArrowIPCResult(
+	fctx *fasthttp.RequestCtx,
+	streamCtx context.Context,
+	cancel context.CancelFunc,
+	reader array.RecordReader,
+	governanceMaxRows int,
+	start time.Time,
+	onRows func(int64),
+	onDisconnect func(),
+	onComplete func(int),
+	onFail func(string),
+) {
+	schema := reader.Schema()
+	fctx.Response.Header.SetContentType("application/vnd.apache.arrow.stream")
+	registerArrowResponseTrailers(&fctx.Response.Header, h.logger)
+	trailers := newResponseTrailers()
+
+	var streamW *bufio.Writer
+	h.setBodyStreamWithTrailers(fctx, "arcx_serve_arrow_ipc", trailers, func() {
+		poisonArrowStream(streamW, h.logger)
+		trailers.setIfAbsent(arrowStreamTruncatedTrailer, "stream writer panicked")
+		trailers.setIfAbsent(
+			arrowExecutionTimeTrailer,
+			strconv.FormatInt(time.Since(start).Milliseconds(), 10),
+		)
+		if onFail != nil {
+			onFail("stream writer panicked")
+		}
+	}, func(w *bufio.Writer) {
+		streamW = w
+		defer func() {
+			if cancel != nil {
+				cancel()
+			}
+			runtime.KeepAlive(reader) // Keep ArcX's FFI-backed batches alive through the final read.
+		}()
+
+		m := metrics.Get()
+		rows, streamErr := streamArrowIPCFunc(
+			streamCtx, w, &contextArrowRecordReader{
+				RecordReader: reader,
+				ctx:          streamCtx,
+				maxRows:      governanceMaxRows,
+			},
+			schema, nil, false, "", governanceMaxRows, h.logger,
+		)
+		execMs := time.Since(start).Milliseconds()
+		trailers.set(arrowExecutionTimeTrailer, strconv.FormatInt(execMs, 10))
+		if onRows != nil {
+			onRows(rows)
+		}
+
+		if streamErr != nil {
+			m.IncQueryErrors()
+			if errors.Is(streamErr, context.DeadlineExceeded) {
+				m.IncQueryTimeouts()
+			}
+			if isClientError(streamErr) && onDisconnect != nil {
+				onDisconnect()
+			}
+			if !errors.Is(streamErr, errClientDisconnected) {
+				trailers.set(arrowStreamTruncatedTrailer, sqlutil.SanitizeErrText(streamErr.Error()))
+			}
+			if onFail != nil {
+				onFail(streamErr.Error())
+			}
+			h.streamErrEvent(streamErr).Err(streamErr).
+				Int64("rows_sent", rows).
+				Int64("execution_time_ms", execMs).
+				Msg("ArcX Arrow IPC stream truncated after headers committed")
+			return
+		}
+
+		if rowCapReached(governanceMaxRows, rows) {
+			trailers.set(arrowRowsCappedTrailer, strconv.Itoa(governanceMaxRows))
+		}
+		m.IncQuerySuccess()
+		m.IncQueryRows(rows)
+		m.RecordQueryLatency(time.Since(start).Microseconds())
+		if onComplete != nil {
+			onComplete(int(rows))
+		}
+	})
 }
 
 // executeQueryArrow handles POST /api/v1/query/arrow - returns Arrow IPC stream
@@ -582,6 +728,12 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// The arcx hook may install an asynchronous stream writer. A successful
 	// hand-off transfers ownership of cancel and registry disposition to it.
 	// A decline falls through to DuckDB with the SAME context and query ID.
+	arcxOnRows := func(rows int64) {
+		h.logGovernanceRowCap("arrow_ipc", convertedSQL, tokenID, tokenName, governanceMaxRows, rows)
+		if h.queryRegistry != nil && queryID != "" {
+			h.queryRegistry.RecordRowCap(queryID, reachedRowCap(governanceMaxRows, rows))
+		}
+	}
 	var arcxOnComplete func(int)
 	var arcxOnFail func(string)
 	if h.queryRegistry != nil && queryID != "" {
@@ -613,7 +765,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		}()
 		return arcxArrowDispatch(
 			h, c, ctx, cancel, req.SQL, headerDB, convertedSQL,
-			arcxOnComplete, arcxOnFail,
+			governanceMaxRows, arcxOnRows, recordDisconnect, arcxOnComplete, arcxOnFail,
 		)
 	}()
 	if arcxHandled {
@@ -695,33 +847,8 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	fctx := c.Context()
 	respHeader := &fctx.Response.Header
 
-	// Declare the execution-time trailer in the response head before
-	// SetBodyStreamWriter runs so the `Trailer:` response header is
-	// emitted before the chunked body starts. Clients that don't read
-	// trailers degrade gracefully to wall-clock timing. The Warn is
-	// sync.Once-gated against per-request log spam if a future fasthttp
-	// release ever rejects the trailer name.
-	if err := respHeader.AddTrailer(arrowStreamTruncatedTrailer); err != nil {
-		arrowTrailerWarnOnce.Do(func() {
-			h.logger.Warn().Err(err).Str("trailer", arrowStreamTruncatedTrailer).
-				Msg("Failed to register Arrow truncation trailer; clients will not see the reason a stream was cut")
-		})
-	}
-	if err := respHeader.AddTrailer(arrowExecutionTimeTrailer); err != nil {
-		arrowTrailerWarnOnce.Do(func() {
-			h.logger.Warn().Err(err).Str("trailer", arrowExecutionTimeTrailer).
-				Msg("Failed to register Arrow execution-time trailer; clients will not see server-side timing")
-		})
-	}
-	// Registered unconditionally rather than only when a cap applies: the
-	// registration has to happen here, before the body streams, and whether
-	// the cap is reached is not known until the stream ends.
-	if err := respHeader.AddTrailer(arrowRowsCappedTrailer); err != nil {
-		arrowTrailerWarnOnce.Do(func() {
-			h.logger.Warn().Err(err).Str("trailer", arrowRowsCappedTrailer).
-				Msg("Failed to register Arrow row-cap trailer; clients will not see that a governance cap truncated the result")
-		})
-	}
+	// Register before the body starts; the ArcX response uses the same helper.
+	registerArrowResponseTrailers(respHeader, h.logger)
 
 	// Trailer values are collected here and published from the connection
 	// goroutine when the body ends (#729). Setting them directly on respHeader
