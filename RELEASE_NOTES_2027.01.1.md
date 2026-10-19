@@ -1919,6 +1919,23 @@ running at once, `LIMIT 100000` was 29% faster and smaller queries unchanged.
 Encoded batches go to the client as soon as they are ready, and a cancelled
 query still sends every row it read before the cancellation.
 
+### MessagePack query responses are encoded on several cores too: up to 40% faster
+
+`/api/v1/query/msgpack` responses are columnar, so a column's values are cut
+into runs of about 16,000 rows (or 1 MB) that are encoded on the same encoder
+goroutines as JSON's batches and written in order. Small results (up to two
+batches) keep the single-goroutine encoder. Over loopback, against 2M rows of
+local Parquet:
+
+| query | 27.01.1 before | 27.01.1 |
+|---|---|---|
+| `LIMIT 1000000`, MessagePack | 67.1 ms | 39.6 ms |
+| `LIMIT 1000000`, MessagePack with zstd | 147 ms | 121 ms |
+| `LIMIT 100000`, MessagePack | 9.8 ms | 7.2 ms |
+| `LIMIT 10000`, MessagePack | 4.2 ms | 4.1 ms |
+
+Responses are byte-for-byte the same.
+
 ### Stream takeover publishes the rows of unpulled files in one go, not in waves ([#1269](https://github.com/Basekick-Labs/arc/issues/1269))
 
 When a primary writer dies with files nobody had pulled yet, the new primary

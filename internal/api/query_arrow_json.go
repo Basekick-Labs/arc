@@ -302,11 +302,11 @@ func streamArrowJSON(
 	enc := &jsonValueEncoder{}
 	var rowBuf []byte
 
-	// Parallel encoding (json_parallel.go), from the third batch on. Every
+	// Parallel encoding (encode_parallel.go), from the third batch on. Every
 	// job is waited for and its record released before this function
 	// returns, on every path, panics included: the caller frees the reader
 	// and its connection as soon as it returns.
-	var pipe *jsonEncodePipeline
+	var pipe *encodePipeline
 	defer func() {
 		if pipe != nil {
 			pipe.drain()
@@ -314,7 +314,7 @@ func streamArrowJSON(
 	}()
 	// writeJob writes a finished job's bytes and flushes them: the flush is
 	// the client-disconnect signal, once per batch.
-	writeJob := func(job *jsonEncodeJob) error {
+	writeJob := func(job *encodeJob) error {
 		defer job.finish()
 		if job.err != nil {
 			return job.err
@@ -390,8 +390,8 @@ batchLoop:
 		}
 
 		batches++
-		if pipe == nil && batches > jsonParallelAfterBatches {
-			pipe = &jsonEncodePipeline{}
+		if pipe == nil && batches > parallelEncodeAfterBatches {
+			pipe = &encodePipeline{}
 		}
 
 		stop := false
@@ -431,7 +431,7 @@ batchLoop:
 			if casted == nil {
 				batch.Retain()
 			}
-			job := &jsonEncodeJob{cols: cols, rows: n, comma: dispatched > 0, record: record}
+			job := &encodeJob{fill: jsonRowsFill(cols, n, dispatched > 0), rows: n, record: record}
 			dispatched += n
 			for pipe.full() {
 				if err := writeJob(pipe.next()); err != nil {
