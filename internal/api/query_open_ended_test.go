@@ -96,3 +96,19 @@ func TestQueryOpenEndedEmptyWindowReadsOnePartition(t *testing.T) {
 	e.write("sch", "quiet", now, map[string]interface{}{"new_col": []int64{3}})
 	require.Equal(t, 1, e.mustRows(sql).RowCount)
 }
+
+// With an incomplete anchor (files from before the registry) the empty
+// window keeps the whole measurement: one partition alone could not
+// advertise the columns only older files have.
+func TestQueryOpenEndedEmptyWindowIncompleteAnchorKeepsGlob(t *testing.T) {
+	e := newFieldSchemaEnv(t, fieldschema.Options{}, false)
+	now := time.Now().UTC()
+	e.write("sch", "legacy", now.Add(-30*time.Hour), map[string]interface{}{"old_only": []int64{1}})
+	e.buf.SetFieldSchema(e.reg)
+	e.write("sch", "legacy", now.Add(-5*time.Hour), map[string]interface{}{"recent": []int64{2}})
+	require.False(t, e.reg.IsComplete("sch", "legacy"))
+
+	out := e.mustRows("SELECT * FROM sch.legacy WHERE time > NOW() - INTERVAL '1 hour'")
+	require.Equal(t, 0, out.RowCount)
+	require.True(t, hasAll(out.Columns, "old_only", "recent"), "%v", out.Columns)
+}

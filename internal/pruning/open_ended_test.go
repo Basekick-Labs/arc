@@ -251,3 +251,76 @@ func TestOpenEndedListingErrorPrunerKeepsGeneratedRange(t *testing.T) {
 		t.Fatalf("got %v %v, want the generated range", ok, r)
 	}
 }
+
+// A remote tier under a bucket prefix finds its partitions past the assumed
+// end with backend-relative listings (the backend applies its prefix once).
+func TestOpenEndedRemoteTierKeepsFuturePartitions(t *testing.T) {
+	now := time.Now().UTC()
+	future := now.Add(5 * 24 * time.Hour)
+	dirs := map[string][]string{}
+	add := func(parent, child string) {
+		for _, c := range dirs[parent] {
+			if c == child {
+				return
+			}
+		}
+		dirs[parent] = append(dirs[parent], child)
+	}
+	for _, h := range []time.Time{now, future} {
+		y, m, d := h.Format("2006"), h.Format("01"), h.Format("02")
+		add("db/cpu/", y)
+		add("db/cpu/"+y+"/", m)
+		add("db/cpu/"+y+"/"+m+"/", d)
+		add("db/cpu/"+y+"/"+m+"/"+d+"/", h.Format("15"))
+	}
+	backend := &tierMock{mockS3Backend: &mockS3Backend{existingDirs: dirs}, files: map[string][]string{}}
+	p := livePruner(now)
+	tr := p.ExtractTimeRange("SELECT * FROM t WHERE time > NOW() - INTERVAL '1 hour'")
+	paths, outcome := p.PruneTierPaths(context.Background(), "s3://bucket/tenant1/db/cpu/**/*.parquet", "db", "cpu", tr, backend, false)
+	if outcome != TierPrunePruned || !hasRemoteHour(paths, future.Format("15")) {
+		t.Fatalf("outcome %v paths %v", outcome, paths)
+	}
+	for _, path := range paths {
+		if !strings.HasPrefix(path, "s3://bucket/tenant1/db/cpu/") {
+			t.Fatalf("path outside the tier root: %s", path)
+		}
+	}
+	for _, prefix := range backend.requested {
+		if !strings.HasPrefix(prefix, "db/cpu/") {
+			t.Fatalf("listing not backend-relative: %q", prefix)
+		}
+	}
+}
+
+// The newest partition's directory exists but holds no files (a delete left
+// it behind): the empty window keeps the unpruned glob rather than read a
+// glob that matches nothing.
+func TestOpenEndedEmptyWindowNewestDirWithoutFiles(t *testing.T) {
+	now := time.Now().UTC()
+	root := t.TempDir()
+	glob := filepath.Join(root, "db", "cpu") + "/**/*.parquet"
+	writeHour(t, root, now.Add(-30*time.Hour))
+	h := now.Add(-5 * time.Hour)
+	if err := os.MkdirAll(filepath.Join(root, "db", "cpu", h.Format("2006"), h.Format("01"), h.Format("02"), h.Format("15")), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx := WithCompleteSchemaAnchor(context.Background())
+	if r, ok := livePruner(now).OptimizeTablePath(ctx, glob, "SELECT * FROM t WHERE time > NOW() - INTERVAL '1 hour'"); ok || r != glob {
+		t.Fatalf("got %v %v, want the unpruned glob", ok, r)
+	}
+}
+
+// A window that starts ahead of the live hour does not generate it, so the
+// empty-window answer itself must keep the result out of the caches: the
+// next flush past the start has to be seen.
+func TestOpenEndedEmptyFutureWindowIsVolatile(t *testing.T) {
+	now := time.Now().UTC()
+	root := t.TempDir()
+	glob := filepath.Join(root, "db", "cpu") + "/**/*.parquet"
+	writeHour(t, root, now.Add(-5*time.Hour))
+	ctx, vol := WithVolatileResult(WithCompleteSchemaAnchor(context.Background()))
+	r, ok := livePruner(now).OptimizeTablePath(ctx, glob, "SELECT * FROM t WHERE time > NOW() + INTERVAL '3 hours'")
+	if !ok || len(asList(r)) != 1 || !vol.Volatile {
+		t.Fatalf("got %v %v volatile=%v", ok, r, vol.Volatile)
+	}
+}
