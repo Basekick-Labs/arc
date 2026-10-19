@@ -327,16 +327,17 @@ func TestOpenEndedEmptyFutureWindowIsVolatile(t *testing.T) {
 
 func TestIsStartOnlyTimeRange(t *testing.T) {
 	for sql, want := range map[string]bool{
-		"SELECT * FROM t WHERE time > NOW() - INTERVAL '1 hour'":                            true,
-		"SELECT * FROM t WHERE time >= '2026-10-19T00:00:00Z' AND host = 'a'":               true,
-		"SELECT * FROM t WHERE time > NOW() - INTERVAL '1 hour' AND time < NOW()":           false,
-		"SELECT * FROM t WHERE time < NOW()":                                                false,
-		"SELECT * FROM t WHERE time > NOW() - INTERVAL '1 hour' OR alarm = 1":               false,
-		"SELECT * FROM a JOIN b ON a.x = b.x WHERE a.time > NOW() - INTERVAL '1 hour'":      false,
-		"SELECT * FROM t WHERE x IN (SELECT x FROM u) AND time > NOW() - INTERVAL '1 hour'": false,
-		"SELECT * FROM t WHERE last_time > NOW() - INTERVAL '1 hour'":                       false,
-		"SELECT * FROM t WHERE time > CURRENT_TIMESTAMP - INTERVAL '1 hour'":                false,
-		"SELECT * FROM t WHERE time > NOW() - INTERVAL '1 hour' + INTERVAL '5 minutes'":     false,
+		"SELECT * FROM t WHERE time > NOW() - INTERVAL '1 hour'":                                 true,
+		"SELECT * FROM t WHERE time >= '2026-10-19T00:00:00Z' AND host = 'a'":                    true,
+		"SELECT * FROM t WHERE time > NOW() - INTERVAL '1 hour' AND time < NOW()":                false,
+		"SELECT * FROM t WHERE time >= '2026-10-19T00:00:00Z' AND time < '2026-10-20T00:00:00Z'": false,
+		"SELECT * FROM t WHERE time < NOW()":                                                     false,
+		"SELECT * FROM t WHERE time > NOW() - INTERVAL '1 hour' OR alarm = 1":                    false,
+		"SELECT * FROM a JOIN b ON a.x = b.x WHERE a.time > NOW() - INTERVAL '1 hour'":           false,
+		"SELECT * FROM t WHERE x IN (SELECT x FROM u) AND time > NOW() - INTERVAL '1 hour'":      false,
+		"SELECT * FROM t WHERE last_time > NOW() - INTERVAL '1 hour'":                            false,
+		"SELECT * FROM t WHERE time > CURRENT_TIMESTAMP - INTERVAL '1 hour'":                     false,
+		"SELECT * FROM t WHERE time > NOW() - INTERVAL '1 hour' + INTERVAL '5 minutes'":          false,
 	} {
 		if got := IsStartOnlyTimeRange(sql); got != want {
 			t.Errorf("%s: got %v want %v", sql, got, want)
