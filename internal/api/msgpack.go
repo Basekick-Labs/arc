@@ -46,10 +46,19 @@ var gzipReaderPool = sync.Pool{
 	// No New func - we create readers on-demand since gzip.NewReader requires valid data
 }
 
-// Pool for zstd decoders - zstd.Decoder is thread-safe and reusable
-// klauspost zstd is 3-5x faster than gzip for decompression
-var zstdDecoderPool = sync.Pool{
-	// No New func - we create decoders on-demand
+// Pools for zstd decoders, one per size cap: a decoder keeps the
+// WithDecoderMaxMemory it was created with, so a decoder made for a smaller
+// cap would reject a valid payload of a caller with a larger one, and one
+// made for a larger cap would let a smaller caller's limit be exceeded in
+// memory. The caps come from configuration, so there are only a few.
+var zstdDecoderPools sync.Map // int (cap) -> *sync.Pool
+
+func zstdDecoderPool(maxSize int) *sync.Pool {
+	if p, ok := zstdDecoderPools.Load(maxSize); ok {
+		return p.(*sync.Pool)
+	}
+	p, _ := zstdDecoderPools.LoadOrStore(maxSize, &sync.Pool{})
+	return p.(*sync.Pool)
 }
 
 // PooledBuffer wraps a decompression buffer that must be returned to pool after use

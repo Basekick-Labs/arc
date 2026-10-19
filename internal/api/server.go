@@ -175,6 +175,10 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 	// Security headers middleware (pass TLS flag for HSTS)
 	app.Use(securityHeaders(config.TLSEnabled))
 
+	// Compressed request bodies only where a handler decodes them bounded
+	// (request_encoding.go).
+	app.Use(rejectEncodedBodies)
+
 	// arcli installation ids for telemetry (see client_identity.go).
 	if config.ClientRecorder != nil {
 		app.Use(clientIdentity(config.ClientRecorder, config.AuthRequired))
