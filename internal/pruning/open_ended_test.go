@@ -3,6 +3,7 @@ package pruning
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -168,5 +169,85 @@ func TestOpenEndedListingErrorKeepsGeneratedRange(t *testing.T) {
 		if strings.Contains(path, now.Add(48*time.Hour).Format("2006/01/02")) {
 			t.Fatalf("a partition past the assumed end without a listing: %v", paths)
 		}
+	}
+}
+
+// More partitions past the assumed end than the cap: the unpruned glob
+// (correct, slow), never a list that silently stops at the cap. Tiers fall
+// back the same way.
+func TestOpenEndedTooManyFuturePartitions(t *testing.T) {
+	defer func(v int) { maxBeyondPartitions = v }(maxBeyondPartitions)
+	maxBeyondPartitions = 2
+	now := time.Now().UTC()
+	root := t.TempDir()
+	glob := filepath.Join(root, "db", "cpu") + "/**/*.parquet"
+	writeHour(t, root, now)
+	for i := 2; i <= 4; i++ {
+		writeHour(t, root, now.Add(time.Duration(i)*24*time.Hour))
+	}
+	sql := "SELECT * FROM t WHERE time > NOW() - INTERVAL '1 hour'"
+	if r, ok := livePruner(now).OptimizeTablePath(context.Background(), glob, sql); ok || r != glob {
+		t.Fatalf("got %v %v, want the unpruned glob", ok, r)
+	}
+	p := livePruner(now)
+	if paths, outcome := p.PruneTierPaths(context.Background(), glob, "db", "cpu", p.ExtractTimeRange(sql), nil, false); outcome != TierPruneFallback {
+		t.Fatalf("tier: got %v %v, want the fallback", outcome, paths)
+	}
+}
+
+// A day past the assumed end that daily compaction rewrote into the day
+// directory itself (no hour directories left) is read through its day glob.
+func TestOpenEndedFutureCompactedDay(t *testing.T) {
+	now := time.Now().UTC()
+	root := t.TempDir()
+	glob := filepath.Join(root, "db", "cpu") + "/**/*.parquet"
+	writeHour(t, root, now)
+	day := now.Add(5 * 24 * time.Hour)
+	dir := filepath.Join(root, "db", "cpu", day.Format("2006"), day.Format("01"), day.Format("02"))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "compacted.parquet"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r, ok := livePruner(now).OptimizeTablePath(context.Background(), glob, "SELECT * FROM t WHERE time > NOW() - INTERVAL '1 hour'")
+	want := filepath.Join(dir, "*.parquet")
+	found := false
+	for _, path := range asList(r) {
+		found = found || path == want
+	}
+	if !ok || !found {
+		t.Fatalf("compacted future day missing: %v %v", ok, r)
+	}
+}
+
+// failingRootRemote cannot list the measurement's root (its years); every
+// other listing works.
+type failingRootRemote struct{ countingRemote }
+
+func (f *failingRootRemote) ListDirectories(ctx context.Context, prefix string) ([]string, error) {
+	if prefix == "db/cpu/" {
+		return nil, errors.New("simulated listing failure")
+	}
+	return f.countingRemote.ListDirectories(ctx, prefix)
+}
+
+// The pruner keeps the generated range when the open-end listing fails: a
+// listing hiccup must not become a full scan.
+func TestOpenEndedListingErrorPrunerKeepsGeneratedRange(t *testing.T) {
+	now := time.Now().UTC()
+	y, m, d := now.Format("2006"), now.Format("01"), now.Format("02")
+	dirs := map[string][]string{
+		"db/cpu/" + y + "/":                     {m},
+		"db/cpu/" + y + "/" + m + "/":           {d},
+		"db/cpu/" + y + "/" + m + "/" + d + "/": {now.Format("15")},
+	}
+	remote := &failingRootRemote{countingRemote{mockS3Backend: mockS3Backend{existingDirs: dirs}, dayFiles: map[string][]string{}}}
+	p := livePruner(now)
+	p.SetStorageBackend(remote)
+	glob := "s3://bucket/db/cpu/**/*.parquet"
+	r, ok := p.OptimizeTablePath(context.Background(), glob, "SELECT * FROM t WHERE time > NOW() - INTERVAL '1 hour'")
+	if !ok || !hasRemoteHour(asList(r), now.Format("15")) {
+		t.Fatalf("got %v %v, want the generated range", ok, r)
 	}
 }

@@ -14,6 +14,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
+	"github.com/basekick-labs/arc/internal/fieldschema"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
@@ -68,4 +69,30 @@ func TestQueryOpenEndedRangeCountsFutureRows(t *testing.T) {
 	require.Equal(t, float64(3), count("SELECT COUNT(*) FROM db1.cpu WHERE time > NOW() - INTERVAL '1 hour'"), "rows beyond now+24h are missing")
 	require.Equal(t, float64(2), count("SELECT COUNT(*) FROM db1.cpu WHERE time > NOW() + INTERVAL '1 day'"))
 	require.Equal(t, float64(0), count("SELECT COUNT(*) FROM db1.cpu WHERE time > NOW() + INTERVAL '500 days'"))
+}
+
+// An open-ended window with no data reads the measurement's newest partition
+// behind the complete schema anchor, not the whole measurement; the anchor
+// still supplies every column, including those only older files have.
+func TestQueryOpenEndedEmptyWindowReadsOnePartition(t *testing.T) {
+	e := newFieldSchemaEnv(t, fieldschema.Options{}, true)
+	now := time.Now().UTC()
+	old, newest := now.Add(-30*time.Hour), now.Add(-5*time.Hour)
+	e.write("sch", "quiet", old, map[string]interface{}{"old_col": []int64{1}})
+	e.write("sch", "quiet", newest, map[string]interface{}{"new_col": []int64{2}})
+	require.True(t, e.reg.IsComplete("sch", "quiet"))
+
+	sql := "SELECT * FROM sch.quiet WHERE time > NOW() - INTERVAL '1 hour'"
+	tr := e.h.convertSQLToStoragePaths(context.Background(), sql)
+	require.Contains(t, tr, newest.Format("2006/01/02/15"), tr)
+	require.NotContains(t, tr, old.Format("2006/01/02/15"), tr)
+	require.NotContains(t, tr, "**", "whole-measurement glob: %s", tr)
+
+	out := e.mustRows(sql)
+	require.Equal(t, 0, out.RowCount)
+	require.True(t, hasAll(out.Columns, "time", "old_col", "new_col"), "%v", out.Columns)
+
+	// Data arriving in the window afterwards is seen (never cached).
+	e.write("sch", "quiet", now, map[string]interface{}{"new_col": []int64{3}})
+	require.Equal(t, 1, e.mustRows(sql).RowCount)
 }

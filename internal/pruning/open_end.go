@@ -33,8 +33,8 @@ import (
 
 // maxBeyondPartitions bounds the partitions added past the assumed end; with
 // more, the query reads the unpruned glob (correct, slow) rather than drop
-// rows.
-const maxBeyondPartitions = 10000
+// rows. A var for tests.
+var maxBeyondPartitions = 10000
 
 var errTooManyBeyond = errors.New("too many partitions past the assumed end")
 
