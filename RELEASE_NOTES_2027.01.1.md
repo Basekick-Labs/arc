@@ -15,6 +15,46 @@ data, is left out with a warning, and the write succeeds
 Contributed by [@efegokdemir](https://github.com/efegokdemir)
 in [#905](https://github.com/Basekick-Labs/arc/pull/905).
 
+## Security: a crafted request can no longer crash Arc or exhaust its memory
+
+**A crafted zstd write crashed Arc.** klauspost/compress, which Arc uses to
+decode zstd-compressed write requests, panics on a crafted 27 KB frame
+([GHSA-fpmh-frq8-7rj8](https://github.com/klauspost/compress/security/advisories/GHSA-fpmh-frq8-7rj8),
+affecting every release up to 1.20.1). Arc decoded those bodies on a goroutine
+of the decoder's own, where the panic could not be caught, so a single
+`POST` with `Content-Encoding: zstd` (or a zstd body without the header) to
+`/api/v1/write/msgpack`, `/api/v1/write/line-protocol`, `/write`,
+`/api/v2/write` or `/api/v1/write/tle` ended the process. Every release
+through 26.09.3 is affected; any client allowed to write, or anyone when auth
+is off, could do it. Arc now decodes request bodies on the request's own
+goroutine and answers `400` to a frame the decoder cannot handle, whatever
+the library version. (A zstd-compressed Parquet file uploaded to the import
+endpoint could hit the same panic; there it already failed only that request,
+with a `500`, and it is now answered `422` like any other corrupt file.)
+
+**A small compressed request could use gigabytes of memory.** Arc's HTTP
+framework decompresses a request body sent with `Content-Encoding` (gzip,
+deflate, br) without a size limit the first time a handler reads it: a 1 MB
+gzip body to `/api/v1/query` made the server allocate 3.4 GB. Only the write
+endpoints above decode compressed bodies, themselves and within their size
+limits; every other endpoint now answers `415` to a request with a
+`Content-Encoding` other than `identity` (in any of its header lines). None of
+Arc's clients send one there.
+
+**A tiny zstd frame could reserve half a gigabyte.** A zstd frame declares its
+window size and the decoder allocates it up front: a 10-byte frame declaring a
+512 MB window allocated 512 MB, and the pooled decoder kept it. Windows are
+now limited to 32 MB. zstd levels 1 to 20 stay within it (levels 1-19 use at
+most 8 MB); a body compressed with `--ultra` levels 21-22 or with `--long` is
+refused with an error naming the window. Arc's own clients and Telegraf
+compress at level 3 or with gzip. Decoders are also pooled per size limit, so
+a msgpack payload is no longer rejected because a decoder last served an
+endpoint with a smaller limit.
+
+Arc is now built with Go 1.26.9 and golang.org/x/net 0.60, which fix eleven
+vulnerabilities in Go's HTTP, TLS and template packages that `govulncheck`
+reports as reachable from Arc.
+
 ## Upgrade note: three configurations now refuse to start
 
 Read this before upgrading if you set `storage.local_path`,

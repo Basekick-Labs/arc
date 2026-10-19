@@ -1,8 +1,8 @@
 module github.com/basekick-labs/arc
 
-go 1.26
+go 1.26.0
 
-toolchain go1.26.6
+toolchain go1.26.9
 
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.1
@@ -29,15 +29,17 @@ require (
 	github.com/spf13/viper v1.18.2
 	github.com/stretchr/testify v1.12.1
 	github.com/valyala/fasthttp v1.51.0
-	golang.org/x/crypto v0.55.0
-	golang.org/x/sync v0.22.0
+	golang.org/x/crypto v0.57.0
+	golang.org/x/sync v0.23.0
 )
 
 require (
 	github.com/apache/iceberg-go v0.7.0
 	github.com/aws/smithy-go v1.28.1
 	github.com/hashicorp/go-msgpack/v2 v2.1.2
-	golang.org/x/sys v0.47.0
+	github.com/spf13/cast v1.6.0
+	github.com/vmihailenco/msgpack/v5 v5.4.1
+	golang.org/x/sys v0.48.0
 )
 
 require (
@@ -109,7 +111,6 @@ require (
 	github.com/sagikazarmark/slog-shim v0.1.0 // indirect
 	github.com/sourcegraph/conc v0.3.0 // indirect
 	github.com/spf13/afero v1.11.0 // indirect
-	github.com/spf13/cast v1.6.0 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/stretchr/objx v0.5.3 // indirect
 	github.com/subosito/gotenv v1.6.0 // indirect
@@ -129,7 +130,6 @@ require (
 	github.com/uptrace/bun/extra/bundebug v1.2.18 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/valyala/tcplisten v1.0.0 // indirect
-	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/zeebo/xxh3 v1.1.0 // indirect
 	go.etcd.io/bbolt v1.3.5 // indirect
@@ -140,9 +140,9 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/exp v0.0.0-20260603202125-055de637280b // indirect
-	golang.org/x/mod v0.38.0 // indirect
-	golang.org/x/net v0.58.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/mod v0.41.0 // indirect
+	golang.org/x/net v0.60.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260819154853-08b0e4226688 // indirect
 	google.golang.org/grpc v1.83.2 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect

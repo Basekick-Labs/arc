@@ -503,8 +503,39 @@ func forEachParquetBatch(ctx context.Context, fr *pqarrow.FileReader, columns []
 		return &importError{StatusCode: fiber.StatusUnprocessableEntity, Message: "failed to read parquet table", Err: err}
 	}
 	defer rr.Release()
+	return readParquetBatches(rr, fn)
+}
+
+// parquetBatchReader is the part of pqarrow.RecordReader the import reads.
+type parquetBatchReader interface {
+	Next() bool
+	RecordBatch() arrow.RecordBatch
+	Err() error
+}
+
+// readParquetBatches calls fn for each batch rr decodes. A panic while
+// decoding (rr.Next) is a corrupt file, answered like any other: the
+// uploaded bytes reach arrow-go's page decompressors on this goroutine, and
+// klauspost/compress zstd <= 1.20.1 panics on a crafted frame
+// (GHSA-fpmh-frq8-7rj8). A panic in fn is Arc's own and is not caught here.
+func readParquetBatches(rr parquetBatchReader, fn func(rec arrow.RecordBatch, firstRow int) error) error {
+	next := func() (ok bool, err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				ok, err = false, &importError{StatusCode: fiber.StatusUnprocessableEntity, Message: "failed to read parquet table", Err: fmt.Errorf("corrupt file: %v", r)}
+			}
+		}()
+		return rr.Next(), nil
+	}
 	firstRow := 0
-	for rr.Next() {
+	for {
+		ok, err := next()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			break
+		}
 		rec := rr.RecordBatch()
 		if err := fn(rec, firstRow); err != nil {
 			return err
