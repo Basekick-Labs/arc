@@ -156,6 +156,7 @@ Benchmark: Arc 27.01.1 (main at b4d98a31, October 2026), M3 Max, `query_suite` f
 | SELECT LIMIT 100K | 18.9 | 17.4 | 14.9 | 1.09x | **1.27x** |
 | SELECT LIMIT 500K | 43.9 | 38.9 | 27.5 | 1.13x | **1.60x** |
 | SELECT LIMIT 1M | 71.6 | **65.4** | **39.6** | 1.09x | **1.81x** |
+| Time Range (1h) LIMIT 10K — no rows in window¹ | 2.6 | 2.7 | 3.1 | 0.96x | 0.84x |
 | Time Range (7d) LIMIT 10K | 13.6 | 13.5 | 12.9 | 1.01x | 1.05x |
 | Time Bucket (1h, 7d) | 605 | 606 | 612 | 1.00x | 0.99x |
 | Date Trunc (day, 30d) | 605 | 609 | 608 | 0.99x | 1.00x |
@@ -166,6 +167,8 @@ Benchmark: Arc 27.01.1 (main at b4d98a31, October 2026), M3 Max, `query_suite` f
 - Arrow IPC: **25.3M rows/sec** (39.6ms)
 - MessagePack: **15.3M rows/sec** (65.4ms)
 - JSON: **14.0M rows/sec** (71.6ms)
+
+¹ The newest data is two hours old, so the window is empty. Arc 27.01.1 answers it from the newest partition alone (it filters to zero rows) instead of reading the whole measurement, as before (49 ms); measured on main at 2eecb2d1.
 
 **Notes on the table:** the wire-format differences show on response-heavy queries (≥100k rows) where encoding dominates the per-request wall time. For aggregations (Time Bucket, Date Trunc, GROUP BY) the response is a few rows and DuckDB execution is nearly all of the wall time; all three formats converge. Arrow IPC copies the engine's column buffers. Since 27.01.1 every format streams straight to the socket, and JSON and MessagePack are encoded on several cores (JSON by batch, MessagePack by column run, handed to encoder goroutines and written in order); MessagePack's typed columnar encoder keeps it ahead of JSON on large results.
 
