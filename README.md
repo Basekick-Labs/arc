@@ -143,19 +143,19 @@ Benefits:
 - **Faster queries** - scan 1 file vs 43 files
 - **Lower cloud costs** - less storage, fewer API calls
 
-### Query (May 2026)
+### Query (October 2026)
 
 Arc speaks three wire formats from the same query engine. **Arrow IPC** is the throughput leader for analytical clients (Grafana, pyarrow, polars) that can take an Arrow dependency — zero-copy from the engine's internal columnar buffers. **MessagePack** (columnar, stable as of 26.09.1) is the choice for clients that don't speak Arrow but want smaller bytes and faster decode than JSON — same envelope shape as JSON, native binary types for timestamps and binary columns. **JSON** stays the default for ergonomic compatibility.
 
-Benchmark: 393.7M-row `cpu` measurement, 5 iterations per query, M3 Max. Latency is p50 in milliseconds. The five SELECT-LIMIT rows were measured back-to-back in the same session so the three columns are apples-to-apples; the DuckDB-bound rows (Time Bucket, Date Trunc, GROUP BY) are dominated by query execution and converge across wire formats.
+Benchmark: M3 Max, 5 iterations per query, latency is p50 in milliseconds. The SELECT LIMIT rows were measured on Arc 27.01.1 (October 2026) against a 2.86B-row `mem` measurement, back-to-back in one session so the three columns are apples-to-apples; a LIMIT query reads only the first row groups, so the table's size does not change them. The COUNT(*) and DuckDB-bound rows (Time Range, Time Bucket, Date Trunc, GROUP BY) are from the May 2026 run on a 393.7M-row `cpu` measurement: they are dominated by query execution and converge across wire formats.
 
 | Query | JSON (ms) | MessagePack (ms) | Arrow IPC (ms) | msgpack vs JSON | Arrow vs JSON |
 |-------|----------:|-----------------:|---------------:|----------------:|--------------:|
 | COUNT(*) — 393.7M rows | 1.03 | 1.03 | 0.86 | 1.00x | 1.20x |
-| SELECT LIMIT 10K | 18.4 | 16.6 | 14.7 | 1.11x | 1.25x |
-| SELECT LIMIT 100K | 48.1 | 33.2 | 31.0 | **1.45x** | **1.55x** |
-| SELECT LIMIT 500K | 173.2 | 81.1 | 61.1 | **2.14x** | **2.84x** |
-| SELECT LIMIT 1M | 334.2 | **133.6** | **105.4** | **2.49x** | **3.17x** |
+| SELECT LIMIT 10K | 12.2 | 10.3 | 11.1 | 1.18x | 1.10x |
+| SELECT LIMIT 100K | 32.7 | 17.4 | 13.8 | **1.87x** | **2.36x** |
+| SELECT LIMIT 500K | 119.7 | 49.1 | 26.0 | **2.44x** | **4.61x** |
+| SELECT LIMIT 1M | 212.7 | **87.6** | **38.1** | **2.43x** | **5.58x** |
 | Time Range (7d) LIMIT 10K | 15.0 | 15.5 | 15.5 | 0.97x | 0.97x |
 | Time Bucket (1h, 7d) | 4.7 | 4.8 | 4.7 | 0.98x | 1.00x |
 | Date Trunc (day, 30d) | 416 | 415 | 413 | 1.00x | 1.01x |
@@ -163,12 +163,12 @@ Benchmark: 393.7M-row `cpu` measurement, 5 iterations per query, M3 Max. Latency
 | GROUP BY host + hour | 645 | 660 | 672 | 0.98x | 0.96x |
 
 **Best throughput on LIMIT 1M (1M-row payload, single connection):**
-- Arrow IPC: **9.49M rows/sec** (105.4ms)
-- MessagePack: **7.49M rows/sec** (133.6ms)
-- JSON: **2.99M rows/sec** (334.2ms)
+- Arrow IPC: **26.2M rows/sec** (38.1ms)
+- MessagePack: **11.4M rows/sec** (87.6ms)
+- JSON: **4.70M rows/sec** (212.7ms)
 - COUNT(*): **~382B rows/sec equivalent** (393.7M rows in 1.03ms — parquet footer reads, not a row scan)
 
-**Notes on the table:** the wire-format speedups manifest on response-heavy queries (≥100k rows) where encoding dominates the per-request wall time. For aggregations (Time Bucket, Date Trunc, GROUP BY) the response is tiny — a few rows — and DuckDB execution is 99%+ of the wall time; all three formats converge. The Arrow IPC win comes from a memcpy of the column buffer; the MessagePack endpoint walks each cell through a typed columnar encoder (one type-switch per column, not per row) and lands at ~78% of Arrow IPC's throughput while remaining decodable by any msgpack client without an Arrow dependency.
+**Notes on the table:** the wire-format speedups manifest on response-heavy queries (≥100k rows) where encoding dominates the per-request wall time. For aggregations (Time Bucket, Date Trunc, GROUP BY) the response is tiny — a few rows — and DuckDB execution is 99%+ of the wall time; all three formats converge. The Arrow IPC win comes from a memcpy of the column buffer; the MessagePack endpoint walks each cell through a typed columnar encoder (one type-switch per column, not per row) and lands at ~43% of Arrow IPC's throughput while remaining decodable by any msgpack client without an Arrow dependency. Since 27.01.1 every format streams straight to the socket (no intermediate pipe), which is what moved all three LIMIT 1M numbers.
 
 The MessagePack endpoint is **stable** as of 26.09.1: its response shape and type vocabulary are a published contract pinned by a golden test, so clients can bind to them. It's the best general-purpose format for a client not using Arrow directly — columnar, typed, and it accepts SHOW statements, which the Arrow endpoint doesn't. See the 26.09.1 release notes for the wire-format contract.
 
