@@ -1893,6 +1893,32 @@ changed. A client that goes away mid-response still stops the query at the
 next batch, and a response that is never sent (a `HEAD` request) cancels its
 query before releasing it.
 
+### JSON query responses are encoded on several cores: up to 4x faster
+
+Turning a result into JSON (floats and timestamps above all) was nearly the
+whole cost of a large JSON response, and it ran on one core. From a result's
+third batch on (about 4,000 rows), batches are encoded on other cores while
+the query goroutine reads the next ones, and written in order; timestamps
+reuse the formatted date and time of the second before. Over loopback,
+against 2M rows of local Parquet:
+
+| query | 27.01.1 before | 27.01.1 |
+|---|---|---|
+| `LIMIT 1000000`, JSON | 323 ms | 79 ms |
+| `LIMIT 1000000`, JSON with zstd | 600 ms | 406 ms |
+| `LIMIT 1000000`, JSON with gzip | 729 ms | 515 ms |
+| `LIMIT 100000`, JSON | 35.9 ms | 11.9 ms |
+| `LIMIT 10000`, JSON | 6.9 ms | 5.3 ms |
+| `COUNT(*)` | 0.96 ms | 0.94 ms |
+
+Responses are byte-for-byte the same, compressed ones included (compression
+itself still runs as one stream). Encoding takes at most GOMAXPROCS-1 extra
+goroutines across the whole process and at most four batches per query, and a
+core is held only while a batch is being encoded: with fourteen queries
+running at once, `LIMIT 100000` was 29% faster and smaller queries unchanged.
+Encoded batches go to the client as soon as they are ready, and a cancelled
+query still sends every row it read before the cancellation.
+
 ### Stream takeover publishes the rows of unpulled files in one go, not in waves ([#1269](https://github.com/Basekick-Labs/arc/issues/1269))
 
 When a primary writer dies with files nobody had pulled yet, the new primary
