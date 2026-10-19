@@ -343,3 +343,44 @@ func TestIsStartOnlyTimeRange(t *testing.T) {
 		}
 	}
 }
+
+// The over-cap fallback is cached like any fallback: a repeat does not walk
+// the listings again.
+func TestOpenEndedTooManyFuturePartitionsCached(t *testing.T) {
+	defer func(v int) { maxBeyondPartitions = v }(maxBeyondPartitions)
+	maxBeyondPartitions = 2
+	now := time.Now().UTC()
+	dirs := map[string][]string{}
+	add := func(parent, child string) {
+		for _, c := range dirs[parent] {
+			if c == child {
+				return
+			}
+		}
+		dirs[parent] = append(dirs[parent], child)
+	}
+	for i := 0; i <= 4; i++ {
+		h := now.Add(time.Duration(i) * 48 * time.Hour)
+		y, m, d := h.Format("2006"), h.Format("01"), h.Format("02")
+		add("db/cpu/", y)
+		add("db/cpu/"+y+"/", m)
+		add("db/cpu/"+y+"/"+m+"/", d)
+		add("db/cpu/"+y+"/"+m+"/"+d+"/", h.Format("15"))
+	}
+	remote := &countingRemote{mockS3Backend: mockS3Backend{existingDirs: dirs}, dayFiles: map[string][]string{}}
+	p := livePruner(now)
+	p.SetStorageBackend(remote)
+	glob := "s3://bucket/db/cpu/**/*.parquet"
+	sql := "SELECT * FROM t WHERE time > NOW() - INTERVAL '1 hour'"
+	if r, ok := p.OptimizeTablePath(context.Background(), glob, sql); ok || r != glob {
+		t.Fatalf("got %v %v, want the unpruned glob", ok, r)
+	}
+	calls := remote.listDirCalls + remote.listCalls
+	p.globCache = newGlobCache(GlobCacheTTL) // listings expire; the verdict must not
+	if r, ok := p.OptimizeTablePath(context.Background(), glob, sql); ok || r != glob {
+		t.Fatalf("repeat: got %v %v", ok, r)
+	}
+	if n := remote.listDirCalls + remote.listCalls; n != calls {
+		t.Fatalf("the repeat listed again (%d -> %d calls)", calls, n)
+	}
+}
