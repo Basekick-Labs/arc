@@ -31,8 +31,8 @@ func init() {
 // has been written (either success or error). If false, the caller should fall back
 // to the database/sql path.
 //
-// Note: When successful, metrics are recorded inside the async stream writer callback
-// (not by the caller) because SetBodyStreamWriter runs after the handler returns.
+// Note: When successful, metrics are recorded inside the stream writer callback
+// (not by the caller) because the stream writer runs after the handler returns.
 func executeArrowJSONQuery(
 	h *QueryHandler,
 	c *fiber.Ctx,
@@ -134,7 +134,7 @@ func executeArrowJSONQuery(
 	tokenID := getTokenID(c)
 
 	// Stream Arrow JSON response.
-	// SetBodyStreamWriter runs asynchronously — metrics are recorded in the callback.
+	// The stream writer runs after this returns — metrics are recorded in the callback.
 	streamCtx := ctx
 	c.Set("Content-Type", "application/json")
 	// Accept-Encoding negotiation must happen (and the header must be set)
@@ -147,7 +147,7 @@ func executeArrowJSONQuery(
 	if respEncoding != "" {
 		c.Set(fiber.HeaderContentEncoding, respEncoding)
 	}
-	c.Context().SetBodyStreamWriter(h.safeStream("query_arrow_json", func() {
+	h.setDirectBodyStream(c.Context(), cancel, nil, "query_arrow_json", func() {
 		// A panic skips the onComplete/onFail/onTimeout dispositions below,
 		// which would leave the query registered as running forever (#717).
 		if onFail != nil {
@@ -230,7 +230,7 @@ func executeArrowJSONQuery(
 			Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 			Msg("Arrow JSON query completed")
 		h.logSlowQuery(convertedSQL, start, rc, tokenName)
-	}))
+	})
 
 	// Return 0 — actual row count is only known after async streaming completes.
 	// Metrics are recorded in the callback above.

@@ -2157,7 +2157,7 @@ localProcessing:
 	if effectiveTimeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, effectiveTimeout)
 		// Note: cancel is called inside the stream writer callback, not deferred here,
-		// because SetBodyStreamWriter runs asynchronously after this function returns.
+		// because the stream writer runs after this function returns.
 	}
 	if cancel == nil {
 		ctx, cancel = context.WithCancel(ctx)
@@ -2355,7 +2355,7 @@ localProcessing:
 	// can fire inside the streaming callback. See C5.
 	streamCtx := ctx
 	c.Set("Content-Type", "application/json")
-	c.Context().SetBodyStreamWriter(h.safeStream("query_json", func() {
+	h.setDirectBodyStream(c.Context(), cancel, nil, "query_json", func() {
 		if h.queryRegistry != nil && queryID != "" {
 			h.queryRegistry.Fail(queryID, "stream writer panicked")
 		}
@@ -2427,7 +2427,7 @@ localProcessing:
 			Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 			Msg("Query completed")
 		h.logSlowQuery(convertedSQL, start, rowCount, tokenName)
-	}))
+	})
 	return nil
 }
 
@@ -5145,8 +5145,8 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	if effectiveTimeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, effectiveTimeout)
 		// cancel is invoked inside the stream writer callback (or on error
-		// paths below), not deferred here, because SetBodyStreamWriter runs
-		// asynchronously after this function returns.
+		// paths below), not deferred here, because the stream writer runs
+		// after this function returns.
 	}
 	if cancel == nil {
 		ctx, cancel = context.WithCancel(ctx)
@@ -5251,7 +5251,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	streamCtx := ctx
 	c.Set("Content-Type", "application/json")
 	streamStarted = true
-	c.Context().SetBodyStreamWriter(h.safeStream("query_measurement", func() {
+	h.setDirectBodyStream(c.Context(), cancel, nil, "query_measurement", func() {
 		// A recovered panic skips the dispositions below, which would leave
 		// the entry listed as running forever with nothing to reap it (#731,
 		// the shape #717 found elsewhere).
@@ -5316,6 +5316,6 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		if onComplete != nil {
 			onComplete(rowCount)
 		}
-	}))
+	})
 	return nil
 }

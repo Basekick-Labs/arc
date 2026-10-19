@@ -135,9 +135,9 @@ func (h *QueryHandler) tryArcxRouterArrow(
 	// Capture the fasthttp RequestCtx before the async callback; the pooled Fiber
 	// *Ctx is recycled after this handler returns (the UAF trap).
 	fctx := c.Context()
-	// safeStream: fasthttp runs this on a bare goroutine, so an unrecovered
-	// panic (an FFI reader fault, an encoder bug) would take the process down
-	// rather than fail the request (#717). The resources are released by the
+	// safeStream (applied by setDirectBodyStream): this runs after the handler
+	// returned, outside Fiber's recover, so an unrecovered panic (an FFI
+	// reader fault, an encoder bug) would not fail the request cleanly (#717). The resources are released by the
 	// deferred block below, which runs on the way out of a panic too. A
 	// registry disposition IS needed here now: query_arrow.go registers the
 	// query before it chooses an engine (#731), so a panicked stream has to
@@ -154,7 +154,7 @@ func (h *QueryHandler) tryArcxRouterArrow(
 
 	// A recovered panic must not leave a decodable but incomplete stream.
 	var streamW *bufio.Writer
-	h.setBodyStreamWithTrailers(fctx, "arcx_serve_arrow_ipc", trailers, func() {
+	h.setDirectBodyStream(fctx, cancel, trailers, "arcx_serve_arrow_ipc", func() {
 		poisonArrowStream(streamW, h.logger)
 		trailers.setIfAbsent(arrowStreamTruncatedTrailer, "stream writer panicked")
 		if onFail != nil {
@@ -267,8 +267,8 @@ func (h *QueryHandler) tryArcxRouterArrow(
 // an array.RecordReader and hand it to the same code the DuckDB Arrow path uses.
 //
 // MEMORY SAFETY: the record is arcx-owned and the router releases its reference as
-// soon as Run returns, but SetBodyStreamWriter runs the encode ASYNCHRONOUSLY
-// after return. So we Retain the record here and Release it inside the async
+// soon as Run returns, but the stream writer runs the encode after the
+// handler returns. So we Retain the record here and Release it inside the async
 // callback — owning the buffer lifetime across the async boundary. Without the
 // Retain, the arcx buffers would be freed while the encoder still reads them (the
 // use-after-free the design doc flags as the FFI cliff).
@@ -282,7 +282,7 @@ func (h *QueryHandler) tryArcxRouterArrow(
 // use-after-free (process-fatal, in-process cgo). The load-bearing guarantee is
 // runtime.KeepAlive(reader) as the LAST statement of each async callback. `cancel` is the
 // request's timeout cancel — owned here (called after the async writer finishes), not by
-// the caller, because SetBodyStreamWriter runs after the handler returns.
+// the caller, because the stream writer runs after the handler returns.
 func (h *QueryHandler) serveArcxResult(
 	c *fiber.Ctx,
 	streamCtx context.Context,
@@ -301,7 +301,7 @@ func (h *QueryHandler) serveArcxResult(
 	// execution_time_ms covers engine work, not just serialization.
 	timestamp := time.Now().UTC().Format(time.RFC3339)
 	// UAF trap (same class the Arrow-IPC path below documents): the pooled Fiber
-	// *Ctx is recycled once this handler returns, but SetBodyStreamWriter runs
+	// *Ctx is recycled once this handler returns, but the stream writer runs
 	// AFTER that — reading `c` inside the closure (getTokenName → UserValue on
 	// the released RequestCtx) segfaults the process. Capture every ctx-derived
 	// value the async writers need BEFORE committing the stream writer.
@@ -335,7 +335,7 @@ func (h *QueryHandler) serveArcxResult(
 			return true // we produced the (error) response
 		}
 		c.Set(fiber.HeaderContentType, msgpackContentType)
-		c.Context().SetBodyStreamWriter(h.safeStream("arcx_serve_msgpack", func() {
+		h.setDirectBodyStream(c.Context(), cancel, nil, "arcx_serve_msgpack", func() {
 			// A panic skips the dispositions below, leaving the query
 			// registered as running forever (#717).
 			if onFail != nil {
@@ -350,7 +350,8 @@ func (h *QueryHandler) serveArcxResult(
 					cancel()
 				}
 			}()
-			bw := bufio.NewWriterSize(w, 256*1024)
+			// w is the stream's pooled 256 KiB buffer (setDirectBodyStream).
+			bw := w
 			if _, serr := streamMsgPackFromBatches(streamCtx, bw, schema, batches, rowCount, governanceMaxRows, nil, start, timestamp); serr != nil {
 				h.logger.Warn().Err(serr).Msg("arcx serve: msgpack stream error after headers committed")
 			}
@@ -369,7 +370,7 @@ func (h *QueryHandler) serveArcxResult(
 			}
 			h.logGovernanceRowCap("msgpack", convertedSQL, tokenID, tokenName, governanceMaxRows, int64(rowCount))
 			h.logSlowQuery(convertedSQL, start, rowCount, tokenName)
-		}))
+		})
 		return true
 	}
 
@@ -378,7 +379,7 @@ func (h *QueryHandler) serveArcxResult(
 	// the row count; we check reader.Err() after it to catch a mid-stream engine error
 	// (else a truncated result serves as success — gotcha #4).
 	c.Set("Content-Type", "application/json")
-	c.Context().SetBodyStreamWriter(h.safeStream("arcx_serve_json", func() {
+	h.setDirectBodyStream(c.Context(), cancel, nil, "arcx_serve_json", func() {
 		// A panic skips the dispositions below, leaving the query registered
 		// as running forever (#717).
 		if onFail != nil {
@@ -436,7 +437,7 @@ func (h *QueryHandler) serveArcxResult(
 			h.logSlowQuery(convertedSQL, start, rc, tokenName)
 		}
 		w.Flush()
-	}))
+	})
 	return true
 }
 
