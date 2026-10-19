@@ -89,44 +89,60 @@ var (
 // WHERE clause is a conjunction containing bare bounds on the column named
 // time, with nothing after each literal. Conservative: any doubt is false.
 func IsExactTimeRange(sqlStr string) bool {
+	hasStart, hasEnd, ok := bareTimeBounds(sqlStr)
+	return ok && hasStart && hasEnd
+}
+
+// IsStartOnlyTimeRange reports whether sqlStr has the shape IsExactTimeRange
+// requires with a start bound and no end: the extracted start is the query's
+// real predicate for its only table, so a window with no rows is truly
+// empty (open_end.go).
+func IsStartOnlyTimeRange(sqlStr string) bool {
+	hasStart, hasEnd, ok := bareTimeBounds(sqlStr)
+	return ok && hasStart && !hasEnd
+}
+
+// bareTimeBounds is the shape check behind IsExactTimeRange and
+// IsStartOnlyTimeRange: ok when sqlStr is a single-table query whose WHERE
+// clause is a conjunction of bare, parseable bounds on the column named time,
+// and which kinds of bound it has.
+func bareTimeBounds(sqlStr string) (hasStart, hasEnd, ok bool) {
 	masked, masks := sql.MaskStringLiterals(sqlStr, sql.HasQuotes(sqlStr))
 	lower := strings.ToLower(masked)
 	if len(fromWordPattern.FindAllStringIndex(lower, -1)) != 1 || shapeWordPattern.MatchString(lower) {
-		return false
+		return false, false, false
 	}
 	if strings.Contains(lower, "(select") || strings.Contains(lower, "( select") {
-		return false
+		return false, false, false
 	}
 	m := whereClausePattern.FindStringSubmatch(masked)
 	if len(m) < 2 {
-		return false
+		return false, false, false
 	}
 	maskedWhere := m[1]
 	spaced := maskPlaceholder.ReplaceAllString(maskedWhere, " ~ ")
 	if forbiddenClauseWord.MatchString(spaced) {
-		return false
+		return false, false, false
 	}
 	// A "timestamp" column bound would be read by the extractor as a time
 	// bound; it is not the partition column.
 	if regexp.MustCompile(`(?i)\btimestamp\s*(>=|>|<=|<|between)`).MatchString(maskedWhere) {
-		return false
+		return false, false, false
 	}
 	where := sql.UnmaskStringLiterals(maskedWhere, masks)
 	bounds := exactBoundPattern.FindAllStringSubmatchIndex(where, -1)
 	if len(bounds) == 0 {
-		return false
+		return false, false, false
 	}
-	// Both ends must be stated: an end-only predicate makes the extractor
-	// assume a start, a start-only one makes it assume an end, and neither
-	// assumption is a fact about the data. Each literal must also be one
-	// the extractor parses, or it silently assumes that end as well.
-	hasStart, hasEnd := false, false
+	// Each literal must be one the extractor parses, or it silently assumes
+	// that end. (Which ends are stated is the caller's question: an assumed
+	// end or start is not a fact about the data.)
 	for _, b := range bounds {
 		if !afterBoundPattern.MatchString(where[b[1]:]) {
-			return false
+			return false, false, false
 		}
 		if !extractorReadsBound(where, b) {
-			return false
+			return false, false, false
 		}
 		switch where[b[4]:b[5]] {
 		case ">=", ">":
@@ -135,17 +151,14 @@ func IsExactTimeRange(sqlStr string) bool {
 			hasEnd = true
 		}
 	}
-	if !hasStart || !hasEnd {
-		return false
-	}
 	// Every comparison the extractor could read as a time bound must be one
 	// of the bare bounds found above: a column merely ending in "time", an
 	// equality, or an expression means the extracted range is not the whole
 	// predicate.
 	if len(anyTimeComparison.FindAllStringIndex(where, -1)) != len(bounds) {
-		return false
+		return false, false, false
 	}
-	return true
+	return hasStart, hasEnd, true
 }
 
 // extractorReadsBound reports whether the literal of one exactBoundPattern

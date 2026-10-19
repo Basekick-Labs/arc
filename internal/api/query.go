@@ -1245,6 +1245,12 @@ func (h *QueryHandler) SetEmptyRangeAnchorScan(enabled bool) {
 // anchor alone. Returns the read_parquet expression to use when that
 // happened, or "" with the pruner's usual result otherwise.
 func (h *QueryHandler) pruneWithAnchor(ctx context.Context, path, originalSQL, keyword, anchor, options, database, measurement string) (string, interface{}, bool) {
+	// The read puts the anchor in front of whatever partitions the pruner
+	// returns (readParquetExpr): with a complete one, an empty open-ended
+	// window may be answered from a single partition.
+	if anchor != "" && h.fieldSchema != nil && h.fieldSchema.IsComplete(database, measurement) {
+		ctx = pruning.WithCompleteSchemaAnchor(ctx)
+	}
 	if h.emptyRangeAnchor && anchor != "" && h.fieldSchema.IsComplete(database, measurement) {
 		optimized, was, empty := h.pruner.OptimizeTablePathVerdict(ctx, path, originalSQL)
 		if empty {
