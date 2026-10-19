@@ -349,19 +349,36 @@ func (h *QueryHandler) serveArcxResult(
 				if cancel != nil {
 					cancel()
 				}
+				// LAST: hold the FFI buffers past the final read (the
+				// encoder goroutines read the batches until the stream
+				// returns), as the JSON callback does.
+				runtime.KeepAlive(reader)
 			}()
 			// w is the stream's pooled 256 KiB buffer (setDirectBodyStream).
 			bw := w
-			if _, serr := streamMsgPackFromBatches(streamCtx, bw, schema, batches, rowCount, governanceMaxRows, nil, start, timestamp); serr != nil {
-				h.logger.Warn().Err(serr).Msg("arcx serve: msgpack stream error after headers committed")
-			}
+			_, serr := streamMsgPackFromBatches(streamCtx, bw, schema, batches, rowCount, governanceMaxRows, nil, start, timestamp)
 			bw.Flush()
 			w.Flush()
+			m := metrics.Get()
+			if serr != nil {
+				// As the arcx JSON callback: the success envelope is on the
+				// wire, so this is a truncated stream, counted as an error and
+				// logged at the stream error's level (an encoder panic is a
+				// server fault, not a Warn).
+				m.IncQueryErrors()
+				h.streamErrEvent(serr).Err(serr).
+					Int("rows_sent", rowCount).
+					Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
+					Msg("arcx serve: msgpack stream truncated after headers committed; client received partial result")
+				if onComplete != nil {
+					onComplete(rowCount)
+				}
+				return
+			}
 			// F1: emit the SAME metrics the DuckDB msgpack path does
 			// (query_msgpack.go). Without these, flipping to serve makes served
 			// queries vanish from dashboards — you cannot tell whether arcx is
 			// working, which is disqualifying for a production flip.
-			m := metrics.Get()
 			m.IncQuerySuccess()
 			m.IncQueryRows(int64(rowCount))
 			m.RecordQueryLatency(time.Since(start).Microseconds())

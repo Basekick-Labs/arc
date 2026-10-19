@@ -107,9 +107,9 @@ var executionTimeRE = regexp.MustCompile(`"execution_time_ms":[0-9.e+-]+`)
 // (0 keeps every batch on the stream goroutine).
 func encodeWith(t *testing.T, limit int64, reader array.RecordReader, maxRows int, w *bufio.Writer, ctx context.Context) (int, error) {
 	t.Helper()
-	orig := jsonEncoderLimit
-	jsonEncoderLimit = func() int64 { return limit }
-	defer func() { jsonEncoderLimit = orig }()
+	orig := encoderLimit
+	encoderLimit = func() int64 { return limit }
+	defer func() { encoderLimit = orig }()
 	return streamArrowJSON(ctx, w, reader, maxRows, nil, time.Now(), "2026-10-19T12:00:00Z")
 }
 
@@ -134,13 +134,13 @@ func runParallelCase(t *testing.T, limit int64, sizes []int, maxRows int, w func
 		bw = w(&out)
 	}
 	goroutines := runtime.NumGoroutine()
-	before := jsonEncodeHandoffs.Load()
+	before := encodeHandoffs.Load()
 	rows, err := encodeWith(t, limit, reader, maxRows, bw, context.Background())
 	_ = bw.Flush()
-	handoffs := jsonEncodeHandoffs.Load() - before
+	handoffs := encodeHandoffs.Load() - before
 	reader.Release()
 	checked.AssertSize(t, 0)
-	if n := jsonEncodersInUse.Load(); n != 0 {
+	if n := encodersInUse.Load(); n != 0 {
 		t.Fatalf("%d encoder slots still taken after the stream returned", n)
 	}
 	deadline := time.Now().Add(2 * time.Second)
@@ -151,7 +151,7 @@ func runParallelCase(t *testing.T, limit int64, sizes []int, maxRows int, w func
 		t.Fatalf("goroutines %d after the stream, %d before", g, goroutines)
 	}
 	// Valid JSON on every path: the "serial" baseline also goes through the
-	// pipeline once past jsonParallelAfterBatches (encoding inline), so
+	// pipeline once past parallelEncodeAfterBatches (encoding inline), so
 	// comparing the two alone cannot see a rule both get wrong.
 	if w == nil && !json.Valid(out.Bytes()) {
 		t.Fatalf("not valid JSON: %q", out.String()[:min(out.Len(), 300)])
@@ -290,7 +290,7 @@ func TestStreamArrowJSONParallelEncoderPanic(t *testing.T) {
 	_ = bw.Flush()
 	reader.Release()
 	alloc.AssertSize(t, 0)
-	if err == nil || !strings.Contains(err.Error(), "JSON encoder panicked") {
+	if err == nil || !strings.Contains(err.Error(), "encoder panicked") {
 		t.Fatalf("err %v", err)
 	}
 	if rows != 400 || !strings.Contains(out.String(), `"row_count":400`) || !strings.Contains(out.String(), `"truncated":true`) {
@@ -307,7 +307,7 @@ func appendInt(b []byte, n int) []byte {
 	return append(b, byte('0'+n%10))
 }
 
-// A result of up to jsonParallelAfterBatches batches is encoded on the stream
+// A result of up to parallelEncodeAfterBatches batches is encoded on the stream
 // goroutine alone: small results never pay for a hand-off.
 func TestStreamArrowJSONSmallResultStaysSerial(t *testing.T) {
 	run := runParallelCase(t, 8, []int{2048, 2048}, 0, nil, nil)
@@ -423,20 +423,20 @@ func TestStreamArrowJSONWritesReadyBatchesEarly(t *testing.T) {
 	}
 }
 
-// A query keeps at most jsonMaxInFlight batches handed out.
+// A query keeps at most encodeMaxInFlight batches handed out.
 func TestJSONEncodePipelineBound(t *testing.T) {
-	orig := jsonEncoderLimit
-	jsonEncoderLimit = func() int64 { return 0 }
-	defer func() { jsonEncoderLimit = orig }()
-	p := &jsonEncodePipeline{}
-	for i := 0; i < jsonMaxInFlight; i++ {
+	orig := encoderLimit
+	encoderLimit = func() int64 { return 0 }
+	defer func() { encoderLimit = orig }()
+	p := &encodePipeline{}
+	for i := 0; i < encodeMaxInFlight; i++ {
 		if p.full() {
 			t.Fatalf("full after %d jobs", i)
 		}
-		p.submit(&jsonEncodeJob{})
+		p.submit(&encodeJob{fill: func(b []byte) ([]byte, error) { return b, nil }})
 	}
-	if !p.full() || jsonMaxInFlight > 8 {
-		t.Fatalf("not full after %d jobs (bound %d)", jsonMaxInFlight, jsonMaxInFlight)
+	if !p.full() || encodeMaxInFlight > 8 {
+		t.Fatalf("not full after %d jobs (bound %d)", encodeMaxInFlight, encodeMaxInFlight)
 	}
 	p.drain()
 }
