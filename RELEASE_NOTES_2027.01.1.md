@@ -1314,10 +1314,14 @@ query path read the hour partitions only up to 24 hours from now:
 
 A range without an end now lists the measurement's directories, newest
 first, and also reads every partition that exists past 24 hours ahead, one
-path per hour, however far ahead. An empty window reads only the newest
-partition (it answers zero rows) instead of the whole measurement, when the
-measurement's schema anchor is complete (the anchor still supplies every
-column); otherwise it reads the whole measurement as before. More than
+path per hour, however far ahead; like other partition listings, one
+written after a query is seen by its repeats within about a minute. An
+empty window reads only the newest partition (it answers zero rows) instead
+of the whole measurement when the query reads one measurement with only
+`AND`-ed conditions (no JOIN, subquery, `OR` or `NOT`) and that
+measurement's schema anchor is complete (`query.stable_schema`, on by
+default; the anchor still supplies every column); otherwise it reads the
+whole measurement as before. More than
 10,000 partitions past 24 hours ahead read the whole measurement rather
 than leave rows out. Locally this costs a few directory reads per uncached
 query; on S3 and Azure, a few directory listings, cached like the existing
