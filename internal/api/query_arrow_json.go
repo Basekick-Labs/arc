@@ -9,9 +9,9 @@ import (
 	"errors"
 	"fmt"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
-	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -171,7 +171,8 @@ func executeArrowJSONQuery(
 		bw, isBufio := sink.(*bufio.Writer)
 		isWrapped := false
 		if !isBufio {
-			bw = bufio.NewWriterSize(sink, 64*1024)
+			bw = compressBufPool.Get().(*bufio.Writer)
+			bw.Reset(sink)
 			isWrapped = true
 		}
 		rc, streamErr := streamArrowJSON(streamCtx, bw, reader, governanceMaxRows, profile, start, timestamp)
@@ -180,6 +181,8 @@ func executeArrowJSONQuery(
 			if err := finishCompression(); err != nil && streamErr == nil {
 				streamErr = err
 			}
+			bw.Reset(nil)
+			compressBufPool.Put(bw)
 		}
 		w.Flush()
 
@@ -237,6 +240,10 @@ func executeArrowJSONQuery(
 	return 0, true
 }
 
+// compressBufPool holds the buffers in front of a compressed JSON response's
+// encoder (batching per-value writes before compression).
+var compressBufPool = sync.Pool{New: func() any { return bufio.NewWriterSize(nil, 64*1024) }}
+
 // streamArrowJSON writes a complete JSON query response from Arrow record
 // batches directly to a bufio.Writer. Values are read from typed Arrow column
 // arrays — no interface{} boxing, no Scan overhead.
@@ -285,10 +292,42 @@ func streamArrowJSON(
 	writeJSONStringArray(w, columns)
 	w.WriteString(`,"data":[`)
 
-	rowCount := 0
+	// rowCount is the rows on the wire (row_count); dispatched also counts
+	// rows handed to encoder workers and not written yet, and decides the
+	// leading comma and the row cap.
+	rowCount, dispatched := 0, 0
 	var streamErr error
 	capped := false
 
+	enc := &jsonValueEncoder{}
+	var rowBuf []byte
+
+	// Parallel encoding (json_parallel.go), from the third batch on. Every
+	// job is waited for and its record released before this function
+	// returns, on every path, panics included: the caller frees the reader
+	// and its connection as soon as it returns.
+	var pipe *jsonEncodePipeline
+	defer func() {
+		if pipe != nil {
+			pipe.drain()
+		}
+	}()
+	// writeJob writes a finished job's bytes and flushes them: the flush is
+	// the client-disconnect signal, once per batch.
+	writeJob := func(job *jsonEncodeJob) error {
+		defer job.finish()
+		if job.err != nil {
+			return job.err
+		}
+		_, _ = w.Write(job.buf)
+		rowCount += job.rows
+		if err := w.Flush(); err != nil {
+			return fmt.Errorf("stream flush failed at row %d: %w: %w", rowCount, errClientDisconnected, err)
+		}
+		return nil
+	}
+
+	batches := 0
 batchLoop:
 	for reader.Next() {
 		// Per-batch ctx check: a timeout firing or client disconnect
@@ -297,12 +336,20 @@ batchLoop:
 		// idiomatic Go cancellation pattern (gemini r1).
 		select {
 		case <-ctx.Done():
-			streamErr = fmt.Errorf("stream cancelled at row %d: %w", rowCount, ctx.Err())
+			// Batches already handed out are written first: the rows before
+			// the cancellation reach the client, as they did when every row
+			// was written as it was encoded.
+			for pipe != nil && streamErr == nil && len(pipe.pending) > 0 {
+				streamErr = writeJob(pipe.next())
+			}
+			if streamErr == nil {
+				streamErr = fmt.Errorf("stream cancelled at row %d: %w", rowCount, ctx.Err())
+			}
 			break batchLoop
 		default:
 		}
 
-		batch := reader.Record()
+		batch := reader.RecordBatch()
 		if batch == nil {
 			break
 		}
@@ -315,60 +362,112 @@ batchLoop:
 				streamErr = fmt.Errorf("decimal cast failed at row %d: %w", rowCount, err)
 				break batchLoop
 			}
-			batch = casted
+		}
+		encoded := batch
+		if casted != nil {
+			encoded = casted
 		}
 
-		nRows := int(batch.NumRows())
+		// The governance cap is decided here, for the batch as a whole: the
+		// rows to encode, and whether the cap stops the stream after them.
+		// A cap reached exactly at the end of a batch is only noticed at the
+		// next batch, as before (one more Next).
+		nRows := int(encoded.NumRows())
+		if governanceMaxRows > 0 && dispatched >= governanceMaxRows && nRows > 0 {
+			capped = true
+			if casted != nil {
+				casted.Release()
+			}
+			break
+		}
+		n := nRows
+		if governanceMaxRows > 0 && dispatched+n > governanceMaxRows {
+			n = governanceMaxRows - dispatched
+		}
 		cols := make([]arrow.Array, numCols)
 		for c := 0; c < numCols; c++ {
-			cols[c] = batch.Column(c)
+			cols[c] = encoded.Column(c)
+		}
+
+		batches++
+		if pipe == nil && batches > jsonParallelAfterBatches {
+			pipe = &jsonEncodePipeline{}
 		}
 
 		stop := false
-		for row := 0; row < nRows; row++ {
-			if governanceMaxRows > 0 && rowCount >= governanceMaxRows {
-				capped = true
-				stop = true
-				break
-			}
-
-			if rowCount > 0 {
-				w.WriteByte(',')
-			}
-
-			w.WriteByte('[')
-			for col := 0; col < numCols; col++ {
-				if col > 0 {
+		if pipe == nil {
+			for row := 0; row < n; row++ {
+				if dispatched > 0 {
 					w.WriteByte(',')
 				}
-				scratch = writeArrowValue(w, scratch, cols[col], row)
+				rowBuf = enc.appendRow(rowBuf[:0], cols, row)
+				w.Write(rowBuf)
+				dispatched++
+				rowCount++
+				if rowCount%jsonFlushInterval == 0 {
+					// Capture Flush error: fasthttp's RequestCtx.Done() only fires
+					// on server shutdown (not per-request client disconnect), so
+					// the bufio.Writer's error on the closed connection is our
+					// signal that the client has gone away. Breaking out of both
+					// nested loops stops DuckDB from draining the rest of the
+					// result set into a buffer nobody reads. The error is wrapped
+					// with errClientDisconnected so the caller can log at Warn
+					// (not Error) for this expected ops noise.
+					if err := w.Flush(); err != nil {
+						streamErr = fmt.Errorf("stream flush failed at row %d: %w: %w", rowCount, errClientDisconnected, err)
+						stop = true
+						break
+					}
+				}
 			}
-			w.WriteByte(']')
-
-			rowCount++
-
-			if rowCount%jsonFlushInterval == 0 {
-				// Capture Flush error: fasthttp's RequestCtx.Done() only fires
-				// on server shutdown (not per-request client disconnect), so
-				// the bufio.Writer's error on the closed connection is our
-				// signal that the client has gone away. Breaking out of both
-				// nested loops stops DuckDB from draining the rest of the
-				// result set into a buffer nobody reads. The error is wrapped
-				// with errClientDisconnected so the caller can log at Warn
-				// (not Error) for this expected ops noise.
-				if err := w.Flush(); err != nil {
-					streamErr = fmt.Errorf("stream flush failed at row %d: %w: %w", rowCount, errClientDisconnected, err)
+			if casted != nil {
+				casted.Release()
+			}
+		} else {
+			// The reader releases a batch at the next Next: the job holds a
+			// reference of its own until it is written. A decimal cast's
+			// record already holds the columns it shares with the batch.
+			record := encoded
+			if casted == nil {
+				batch.Retain()
+			}
+			job := &jsonEncodeJob{cols: cols, rows: n, comma: dispatched > 0, record: record}
+			dispatched += n
+			for pipe.full() {
+				if err := writeJob(pipe.next()); err != nil {
+					streamErr = err
 					stop = true
 					break
 				}
 			}
+			if stop {
+				job.finish()
+			} else {
+				pipe.submit(job)
+				// Write what is already encoded, without waiting: a slow
+				// query's rows reach the client as they are ready, not four
+				// batches later.
+				for !stop && pipe.ready() {
+					if err := writeJob(pipe.next()); err != nil {
+						streamErr = err
+						stop = true
+					}
+				}
+			}
 		}
-		if casted != nil {
-			casted.Release()
+		if n < nRows {
+			capped = true
+			stop = true
 		}
 		if stop {
 			break batchLoop
 		}
+	}
+
+	// Write what the workers still hold, in order (after an error, the
+	// deferred teardown only waits for them and releases).
+	for pipe != nil && streamErr == nil && len(pipe.pending) > 0 {
+		streamErr = writeJob(pipe.next())
 	}
 
 	if streamErr == nil && !capped {
@@ -432,88 +531,4 @@ batchLoop:
 	w.WriteByte('}')
 
 	return rowCount, streamErr
-}
-
-// writeArrowValue writes a single value from a typed Arrow column array.
-// No interface{} boxing — values are read directly from the array's typed accessor.
-func writeArrowValue(w *bufio.Writer, scratch []byte, col arrow.Array, row int) []byte {
-	if col.IsNull(row) {
-		w.WriteString("null")
-		return scratch
-	}
-
-	switch c := col.(type) {
-	case *array.Int64:
-		scratch = strconv.AppendInt(scratch[:0], c.Value(row), 10)
-		w.Write(scratch)
-	case *array.Int32:
-		scratch = strconv.AppendInt(scratch[:0], int64(c.Value(row)), 10)
-		w.Write(scratch)
-	case *array.Int16:
-		scratch = strconv.AppendInt(scratch[:0], int64(c.Value(row)), 10)
-		w.Write(scratch)
-	case *array.Int8:
-		scratch = strconv.AppendInt(scratch[:0], int64(c.Value(row)), 10)
-		w.Write(scratch)
-	case *array.Uint64:
-		scratch = strconv.AppendUint(scratch[:0], c.Value(row), 10)
-		w.Write(scratch)
-	case *array.Uint32:
-		scratch = strconv.AppendUint(scratch[:0], uint64(c.Value(row)), 10)
-		w.Write(scratch)
-	case *array.Uint16:
-		scratch = strconv.AppendUint(scratch[:0], uint64(c.Value(row)), 10)
-		w.Write(scratch)
-	case *array.Uint8:
-		scratch = strconv.AppendUint(scratch[:0], uint64(c.Value(row)), 10)
-		w.Write(scratch)
-	case *array.Float64:
-		v := c.Value(row)
-		if math.IsNaN(v) || math.IsInf(v, 0) {
-			w.WriteString("null")
-		} else {
-			scratch = strconv.AppendFloat(scratch[:0], v, 'f', -1, 64)
-			w.Write(scratch)
-		}
-	case *array.Float32:
-		v := float64(c.Value(row))
-		if math.IsNaN(v) || math.IsInf(v, 0) {
-			w.WriteString("null")
-		} else {
-			scratch = strconv.AppendFloat(scratch[:0], v, 'f', -1, 64)
-			w.Write(scratch)
-		}
-	case *array.Boolean:
-		if c.Value(row) {
-			w.WriteString("true")
-		} else {
-			w.WriteString("false")
-		}
-	case *array.Timestamp:
-		ts := c.Value(row)
-		unit := c.DataType().(*arrow.TimestampType).Unit
-		t := ts.ToTime(unit)
-		w.WriteByte('"')
-		scratch = t.UTC().AppendFormat(scratch[:0], time.RFC3339Nano)
-		w.Write(scratch)
-		w.WriteByte('"')
-	case *array.Date32:
-		d := c.Value(row)
-		t := d.ToTime()
-		w.WriteByte('"')
-		scratch = t.UTC().AppendFormat(scratch[:0], time.RFC3339Nano)
-		w.Write(scratch)
-		w.WriteByte('"')
-	case *array.String:
-		writeJSONString(w, scratch, c.Value(row))
-	case *array.LargeString:
-		writeJSONString(w, scratch, c.Value(row))
-	case *array.Binary:
-		writeJSONString(w, scratch, string(c.Value(row)))
-	default:
-		// Fallback: use ValueStr for any unhandled Arrow types
-		writeJSONString(w, scratch, col.ValueStr(row))
-	}
-
-	return scratch
 }

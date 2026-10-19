@@ -174,3 +174,32 @@ func BenchmarkQuery(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkQueryConcurrent runs many queries at once (b.RunParallel, one per
+// GOMAXPROCS by default): the per-request latency of a loaded server, where
+// parallel JSON encoding must not take cores from concurrent queries.
+func BenchmarkQueryConcurrent(b *testing.B) {
+	base := queryBenchSetup(b)
+	for _, q := range []struct{ name, sql string }{
+		{"count", "SELECT COUNT(*) FROM bench.cpu"},
+		{"limit10k", "SELECT * FROM bench.cpu LIMIT 10000"},
+		{"limit100k", "SELECT * FROM bench.cpu LIMIT 100000"},
+	} {
+		b.Run(q.name+"/json", func(b *testing.B) {
+			body := []byte(fmt.Sprintf(`{"sql": %q}`, q.sql))
+			client := &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: 64, DisableCompression: true}}
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					resp, err := client.Post(base+"/api/v1/query", "application/json", bytes.NewReader(body))
+					if err != nil {
+						b.Error(err)
+						return
+					}
+					_, _ = io.Copy(io.Discard, resp.Body)
+					resp.Body.Close()
+				}
+			})
+		})
+	}
+}
