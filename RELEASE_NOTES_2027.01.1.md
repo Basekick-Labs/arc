@@ -316,6 +316,29 @@ wrote them.
   WAL after a crash
   ([#1206](https://github.com/Basekick-Labs/arc/issues/1206)).
 
+## Upgrade note: HTTP server (fasthttp 1.76)
+
+Arc's HTTP server library moved from fasthttp 1.51 to 1.76. Two changes are
+visible to clients:
+
+- **An HTTP/1.1 request without a `Host` header is answered `400`** and the
+  connection closed. HTTP/1.1 requires the header and every common client
+  sends it (curl, Go, Python, Telegraf, Grafana); HTTP/1.0 requests, which
+  have no such rule, are still served. A hand-written client or health check
+  that sends a bare `GET /health HTTP/1.1` needs a `Host` line.
+- **Arrow IPC responses no longer send an empty trailer.** The
+  `Arc-Stream-Truncated` and `Arc-Rows-Capped` trailers are still announced in
+  the `Trailer` header of every `/api/v1/query/arrow` response, but each is
+  sent only when it has a value; before, an unset one was sent empty. The
+  client contract is unchanged: a non-empty value means the stream was
+  truncated, or capped. A client that checked for the trailer's presence
+  rather than its value has to check the value.
+
+`klauspost/compress` stays at 1.19.2: 1.20 (which fasthttp 1.76 asks for)
+encodes snappy on arm64 with new assembly that cut line-protocol ingest by
+about 14% and msgpack+gzip ingest by about 11% on Apple silicon, because every
+Parquet file Arc writes is snappy-compressed.
+
 ## New features
 
 ### Writer failover picks the standby with the lowest node id ([#1207](https://github.com/Basekick-Labs/arc/issues/1207))
@@ -1846,6 +1869,29 @@ on, half the bytes and allocations.
   answer is the same `400` partial write; MQTT logs them at Error and
   writes the rest.
 - Tag values are made valid UTF-8, as field values already were.
+
+### Query responses stream straight to the socket: Arrow up to 60% faster
+
+A query's response was encoded on a goroutine of its own into an in-memory
+pipe, and the connection copied the pipe to the socket 4 KB at a time,
+flushing the socket after every 4 KB. The encoder now runs on the connection
+itself and every batch it flushes goes out as one chunk, with no pipe, no copy
+and no second goroutine. Over loopback, against 2M rows of local Parquet:
+
+| query | endpoint | 26.09 | 27.01 |
+|---|---|---|---|
+| `LIMIT 1000000` | Arrow IPC | 80 ms | 32 ms |
+| `LIMIT 1000000` | MessagePack | 91 ms | 69 ms |
+| `LIMIT 1000000` | JSON | 394 ms | 326 ms |
+| `LIMIT 1000000` | JSON, gzip | 794 ms | 730 ms |
+| `LIMIT 100000` | Arrow IPC | 11.8 ms | 6.9 ms |
+| `LIMIT 100000` | MessagePack | 11.6 ms | 10.2 ms |
+| `COUNT(*)` | any | ~1.05 ms | ~0.98 ms |
+
+Responses are byte-for-byte the same; only their chunking on the wire
+changed. A client that goes away mid-response still stops the query at the
+next batch, and a response that is never sent (a `HEAD` request) cancels its
+query before releasing it.
 
 ### Stream takeover publishes the rows of unpulled files in one go, not in waves ([#1269](https://github.com/Basekick-Labs/arc/issues/1269))
 

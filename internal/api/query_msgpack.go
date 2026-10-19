@@ -21,7 +21,7 @@ import (
 )
 
 // The columnar streamer relies on the bufio.Writer's natural flush
-// behavior (its internal 4KiB buffer flushes when full as the encoder
+// behavior (the stream's 256 KiB buffer flushes when full as the encoder
 // writes primitives). Explicit per-column flushes added 7+ syscalls per
 // LIMIT 1M without measurable disconnect-detection benefit; the column
 // encoders below check ctx.Done() once per Arrow batch instead, which
@@ -217,7 +217,7 @@ func executeArrowMsgPackQuery(
 	if respEncoding != "" {
 		c.Set(fiber.HeaderContentEncoding, respEncoding)
 	}
-	c.Context().SetBodyStreamWriter(h.safeStream("query_msgpack", func() {
+	h.setDirectBodyStream(c.Context(), cancel, nil, "query_msgpack", func() {
 		// A panic skips the dispositions below, leaving the query registered
 		// as running forever (#717).
 		if onFail != nil {
@@ -236,15 +236,16 @@ func executeArrowMsgPackQuery(
 			}
 		}()
 
-		// Wrap the 4KiB-default bufio.Writer Fiber hands us with a
-		// 256 KiB layer. The msgpack encoder writes one primitive at a
-		// time (~9 bytes per int64), so on a 1M-row response the
-		// default bufio fills and flushes ~15k times — each flush is a
-		// channel-send to fasthttp's chunked-transfer goroutine. The
-		// larger buffer cuts that to ~250 sends. With compression
-		// negotiated, the pooled encoder sits between that buffer and w.
+		// w is the stream's pooled 256 KiB buffer (setDirectBodyStream);
+		// the msgpack encoder writes one primitive at a time (~9 bytes per
+		// int64) straight into it. With compression negotiated, the pooled
+		// encoder sits behind a 256 KiB buffer of its own, so it compresses
+		// whole blocks rather than single values.
 		sink, finishCompression := compressedSink(w, respEncoding)
-		bw := bufio.NewWriterSize(sink, 256*1024)
+		bw, isBufio := sink.(*bufio.Writer)
+		if !isBufio {
+			bw = bufio.NewWriterSize(sink, 256*1024)
+		}
 		rc, streamErr := streamMsgPackFromBatches(ctx, bw, schema, batches, rowCount, governanceMaxRows, profile, start, timestamp)
 		bw.Flush()
 		if err := finishCompression(); err != nil && streamErr == nil {
@@ -291,7 +292,7 @@ func executeArrowMsgPackQuery(
 			Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 			Msg("Arrow MsgPack query completed")
 		h.logSlowQuery(convertedSQL, start, rc, tokenName)
-	}))
+	})
 
 	return 0, true
 }
@@ -547,10 +548,9 @@ func streamMsgPackFromBatches(
 		if err := encodeColumn(ctx, enc, batches, colIdx); err != nil {
 			return rowCount, wrapMsgPackWriteErr(err)
 		}
-		// No explicit Flush per column. bufio.Writer flushes its 4KiB
-		// internal buffer automatically when full; for a multi-MB
-		// response that's already dozens of flushes triggered by the
-		// encode itself. The per-batch ctx check inside the column
+		// No explicit Flush per column. bufio.Writer flushes its 256 KiB
+		// buffer automatically when full; for a multi-MB response that's
+		// already several flushes triggered by the encode itself. The per-batch ctx check inside the column
 		// encoders handles disconnect detection. Saves 7+ syscalls
 		// per typical LIMIT 1M query.
 	}
