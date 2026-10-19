@@ -1297,6 +1297,32 @@ directory read locally, one directory listing on S3 or Azure. Hours that
 have not started yet are cached as absent, as before: rows stamped in the
 future show up within about two and a half minutes of their flush.
 
+### A range without an end returns rows stamped more than a day ahead, and an empty one no longer reads the whole measurement
+
+A time range with a start and no end (`time > NOW() - INTERVAL '1 hour'`,
+`time >= '2026-10-19T00:00:00Z'`) asks for every row from its start on. The
+query path read the hour partitions only up to 24 hours from now:
+
+- **Rows stamped later were left out.** Forecasts, schedules and devices
+  whose clocks run ahead write rows more than a day in the future; a query
+  without an end answered `200` without them. A range with an explicit end
+  was not affected.
+- **An empty window read every file.** When no partition existed from the
+  start on (a source that stopped sending, a dashboard watching the last
+  hour of it), the query read the whole measurement to answer zero rows, on
+  every refresh.
+
+A range without an end now lists the measurement's directories, newest
+first, and also reads every partition that exists past 24 hours ahead, one
+path per hour, however far ahead. An empty window reads only the newest
+partition (it answers zero rows) instead of the whole measurement, when the
+measurement's schema anchor is complete (the anchor still supplies every
+column); otherwise it reads the whole measurement as before. More than
+10,000 partitions past 24 hours ahead read the whole measurement rather
+than leave rows out. Locally this costs a few directory reads per uncached
+query; on S3 and Azure, a few directory listings, cached like the existing
+partition listings.
+
 ### In shared storage, a DELETE no longer leaves rows another writer has not flushed ([#1265](https://github.com/Basekick-Labs/arc/issues/1265))
 
 In shared storage (`cluster.shared_storage_mode`) every writer takes writes,

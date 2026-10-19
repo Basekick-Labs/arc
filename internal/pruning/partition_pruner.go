@@ -841,6 +841,7 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 		switch {
 		case errors.Is(err, errTooManyBeyond):
 			p.logger.Info().Msg("Too many partitions past the assumed end; using the unpruned glob")
+			p.partitionCache.set(cacheKey, originalPath, false)
 			return originalPath, false, false
 		case err != nil:
 			// The generated range alone, as before: a listing hiccup must
@@ -874,8 +875,11 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 		// start, so the newest one answers it (the time predicate filters
 		// it to no rows) instead of the whole measurement. Only with the
 		// complete schema anchor in front of the read, which supplies every
-		// column; never cached (the window's live hour has no files yet).
-		if newestGlob != "" && hasCompleteSchemaAnchor(ctx) {
+		// column, and only when the extracted start is the query's real
+		// predicate for its only table (a JOIN, subquery or OR applies it to
+		// rows it does not bound, and the newest partition would drop them);
+		// never cached (the window's live hour has no files yet).
+		if newestGlob != "" && hasCompleteSchemaAnchor(ctx) && IsStartOnlyTimeRange(sql) {
 			if have, _, _ := p.filterExistingPathsOpts(ctx, []string{newestGlob}, basePath, 0); len(have) == 1 {
 				markVolatile(ctx)
 				p.logger.Debug().Str("path", newestGlob).Msg("Empty open-ended window; reading the newest partition only")

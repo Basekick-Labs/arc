@@ -112,3 +112,27 @@ func TestQueryOpenEndedEmptyWindowIncompleteAnchorKeepsGlob(t *testing.T) {
 	require.Equal(t, 0, out.RowCount)
 	require.True(t, hasAll(out.Columns, "old_only", "recent"), "%v", out.Columns)
 }
+
+// The empty-window answer applies only where the extracted start is the
+// query's real predicate for its only table: a JOIN or subquery applies one
+// table's start to a dimension measurement whose newest partition does not
+// hold every row, and an OR admits rows outside the window.
+func TestQueryOpenEndedEmptyWindowNeedsTheWholePredicate(t *testing.T) {
+	e := newFieldSchemaEnv(t, fieldschema.Options{}, true)
+	now := time.Now().UTC()
+	e.write("sch", "hosts", now.Add(-30*time.Hour), map[string]interface{}{"hid": []int64{1}})
+	e.write("sch", "hosts", now.Add(-5*time.Hour), map[string]interface{}{"hid": []int64{2}})
+	e.write("sch", "cpu", now.Add(-5*time.Minute), map[string]interface{}{"hid": []int64{1}})
+	e.write("sch", "cpu", now.Add(-6*time.Minute), map[string]interface{}{"hid": []int64{2}})
+	e.write("sch", "ev", now.Add(-30*time.Hour), map[string]interface{}{"alarm": []int64{1}})
+	e.write("sch", "ev", now.Add(-5*time.Hour), map[string]interface{}{"alarm": []int64{0}})
+	for sql, want := range map[string]int{
+		"SELECT c.hid FROM sch.cpu c JOIN sch.hosts h ON c.hid = h.hid WHERE c.time > NOW() - INTERVAL '1 hour'":                          2,
+		"SELECT hid FROM sch.cpu WHERE hid IN (SELECT hid FROM sch.hosts) AND time > NOW() - INTERVAL '1 hour'":                           2,
+		"SELECT * FROM sch.ev WHERE time > NOW() - INTERVAL '1 hour' OR alarm = 1":                                                        1,
+		"SELECT * FROM sch.ev WHERE NOT (time < NOW() - INTERVAL '1 hour') AND time > NOW() - INTERVAL '1 hour'":                          0,
+		"WITH h AS (SELECT hid FROM sch.hosts) SELECT c.hid FROM sch.cpu c, h WHERE c.hid = h.hid AND c.time > NOW() - INTERVAL '1 hour'": 2,
+	} {
+		require.Equal(t, want, e.mustRows(sql).RowCount, sql)
+	}
+}
