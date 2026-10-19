@@ -3,6 +3,7 @@ package pruning
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -826,6 +827,33 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 		return originalPath, false, false
 	}
 
+	// A start-only range: add the partitions that exist past the assumed
+	// end, and remember the newest one for an empty window (open_end.go).
+	var newestGlob string
+	if timeRange.EndAssumed {
+		var lister dirLister
+		if strings.HasPrefix(basePath, "s3://") || strings.HasPrefix(basePath, "azure://") {
+			lister = p.remoteDirLister(basePath)
+		} else {
+			lister = localDirLister(basePath)
+		}
+		beyond, newest, err := discoverOpenEnd(ctx, lister, database, measurement, timeRange.End)
+		switch {
+		case errors.Is(err, errTooManyBeyond):
+			p.logger.Info().Msg("Too many partitions past the assumed end; using the unpruned glob")
+			return originalPath, false, false
+		case err != nil:
+			// The generated range alone, as before: a listing hiccup must
+			// not turn into a full scan.
+			p.logger.Debug().Err(err).Msg("Could not list partitions past the assumed end")
+		default:
+			partitionPaths = appendBeyond(partitionPaths, beyond, basePath, database, measurement)
+			if newest != nil && !newest.end().After(timeRange.Start) {
+				newestGlob = partGlob(basePath, database, measurement, *newest)
+			}
+		}
+	}
+
 	// Filter out non-existent paths (works for both local and S3/Azure storage)
 	generated := partitionPaths
 	existing, verified, hits := p.filterExistingPathsOpts(ctx, partitionPaths, basePath, 0)
@@ -841,6 +869,18 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 		if wantProof && p.proveEmpty(ctx, basePath, database, measurement, sql, timeRange, generated, hits, verified) {
 			// Never cached: the next query must prove it again.
 			return originalPath, false, true
+		}
+		// An empty start-only window: every partition is older than its
+		// start, so the newest one answers it (the time predicate filters
+		// it to no rows) instead of the whole measurement. Only with the
+		// complete schema anchor in front of the read, which supplies every
+		// column; never cached (the window's live hour has no files yet).
+		if newestGlob != "" && hasCompleteSchemaAnchor(ctx) {
+			if have, _, _ := p.filterExistingPathsOpts(ctx, []string{newestGlob}, basePath, 0); len(have) == 1 {
+				markVolatile(ctx)
+				p.logger.Debug().Str("path", newestGlob).Msg("Empty open-ended window; reading the newest partition only")
+				return newestGlob, true, false
+			}
 		}
 		p.logger.Info().Msg("No data exists for time range, using fallback")
 		if !liveDropped {

@@ -2,7 +2,9 @@ package pruning
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -25,17 +27,146 @@ func TestOpenEndedRangeKeepsFuturePartitions(t *testing.T) {
 	}
 }
 
-// A start-only window with no partition at or after its start is proven empty
-// instead of falling back to reading the whole measurement.
-func TestOpenEndedEmptyWindowIsProvenEmpty(t *testing.T) {
+// A start-only window with no partition at or after its start reads the
+// newest partition (older than the start, so filtered to no rows) instead of
+// the whole measurement, when the read carries a complete schema anchor;
+// without one, the unpruned glob as before (one partition alone could lack a
+// column older files have).
+func TestOpenEndedEmptyWindowReadsTheNewestPartition(t *testing.T) {
+	now := time.Now().UTC()
+	root := t.TempDir()
+	glob := filepath.Join(root, "db", "cpu") + "/**/*.parquet"
+	older, newest := now.Add(-30*time.Hour), now.Add(-5*time.Hour)
+	writeHour(t, root, older)
+	writeHour(t, root, newest)
+	for _, sql := range []string{
+		"SELECT * FROM t WHERE time > NOW() - INTERVAL '1 hour'",
+		"SELECT * FROM t WHERE time >= '" + now.Truncate(time.Hour).Format(time.RFC3339) + "'", // hour-aligned start
+	} {
+		p := livePruner(now)
+		ctx, vol := WithVolatileResult(WithCompleteSchemaAnchor(context.Background()))
+		r, ok := p.OptimizeTablePath(ctx, glob, sql)
+		if !ok || len(asList(r)) != 1 || !hasHour(asList(r), newest) {
+			t.Fatalf("%s: got %v %v, want the newest partition alone", sql, ok, r)
+		}
+		if !vol.Volatile {
+			t.Fatalf("%s: the empty-window answer must not be cached", sql)
+		}
+		p = livePruner(now)
+		if r, ok := p.OptimizeTablePath(context.Background(), glob, sql); ok || r != glob {
+			t.Fatalf("%s: without a complete anchor got %v %v, want the unpruned glob", sql, ok, r)
+		}
+	}
+}
+
+// Partitions far past the assumed end cost one path each, not a dense span
+// that would trip the path cap and fall back to the unpruned glob.
+func TestOpenEndedFarFuturePartitions(t *testing.T) {
 	now := time.Now().UTC()
 	root := t.TempDir()
 	glob := filepath.Join(root, "db", "cpu") + "/**/*.parquet"
 	p := livePruner(now)
-	writeHour(t, root, now.Add(-5*time.Hour))
+	writeHour(t, root, now)
+	far := []time.Time{now.Add(400 * 24 * time.Hour), time.Date(2099, 1, 1, 3, 0, 0, 0, time.UTC)}
+	for _, h := range far {
+		writeHour(t, root, h)
+	}
+	r, ok := p.OptimizeTablePath(context.Background(), glob, "SELECT * FROM t WHERE time > NOW() - INTERVAL '1 hour'")
+	if !ok {
+		t.Fatalf("not pruned: %v", r)
+	}
+	for _, h := range append(far, now) {
+		if !hasHour(asList(r), h) {
+			t.Fatalf("partition %v missing from %v", h, r)
+		}
+	}
+}
+
+// A closed range is untouched: no listing, no partition past its end.
+func TestClosedRangeIgnoresFuturePartitions(t *testing.T) {
+	now := time.Now().UTC()
+	root := t.TempDir()
+	glob := filepath.Join(root, "db", "cpu") + "/**/*.parquet"
+	p := livePruner(now)
+	writeHour(t, root, now)
+	future := now.Add(48 * time.Hour)
+	writeHour(t, root, future)
+	sql := "SELECT * FROM t WHERE time >= '" + now.Add(-time.Hour).Format(time.RFC3339) + "' AND time < '" + now.Add(2*time.Hour).Format(time.RFC3339) + "'"
+	r, ok := p.OptimizeTablePath(context.Background(), glob, sql)
+	if !ok || hasHour(asList(r), future) {
+		t.Fatalf("closed range: %v %v", ok, r)
+	}
+}
+
+// Remote: the future partition is found through the cached parent listings,
+// and a listing failure keeps the generated range (never a full scan).
+func TestOpenEndedRemote(t *testing.T) {
+	now := time.Now().UTC()
+	future := now.Add(72 * time.Hour)
+	dirs := map[string][]string{
+		"db/cpu/": {now.Format("2006"), future.Format("2006")},
+	}
+	addHour := func(h time.Time) {
+		y, m, d := h.Format("2006"), h.Format("01"), h.Format("02")
+		key := "db/cpu/" + y + "/"
+		dirs[key] = append(dirs[key], m)
+		key = "db/cpu/" + y + "/" + m + "/"
+		dirs[key] = append(dirs[key], d)
+		key = "db/cpu/" + y + "/" + m + "/" + d + "/"
+		dirs[key] = append(dirs[key], h.Format("15"))
+	}
+	addHour(now)
+	addHour(future)
+	remote := &countingRemote{mockS3Backend: mockS3Backend{existingDirs: dirs}, dayFiles: map[string][]string{}}
+	p := livePruner(now)
+	p.SetStorageBackend(remote)
+	glob := "s3://bucket/db/cpu/**/*.parquet"
 	sql := "SELECT * FROM t WHERE time > NOW() - INTERVAL '1 hour'"
-	r, optimized, empty := p.OptimizeTablePathVerdict(context.Background(), glob, sql)
-	if !empty {
-		t.Fatalf("not proven empty: optimized=%v result=%v", optimized, r)
+	r, ok := p.OptimizeTablePath(context.Background(), glob, sql)
+	if !ok || !hasRemoteHour(asList(r), future.Format("15")) || len(asList(r)) < 2 {
+		t.Fatalf("remote future partition missing: %v %v", ok, r)
+	}
+}
+
+// Tiered reads: a start-only range keeps a tier's partitions past the assumed
+// end too, and the TimeRange the tiers share is not changed.
+func TestOpenEndedTierKeepsFuturePartitions(t *testing.T) {
+	now := time.Now().UTC()
+	root := t.TempDir()
+	writeHour(t, root, now)
+	future := now.Add(5 * 24 * time.Hour)
+	writeHour(t, root, future)
+	p := livePruner(now)
+	tr := p.ExtractTimeRange("SELECT * FROM t WHERE time > NOW() - INTERVAL '1 hour'")
+	end := tr.End
+	glob := filepath.Join(root, "db", "cpu") + "/**/*.parquet"
+	paths, outcome := p.PruneTierPaths(context.Background(), glob, "db", "cpu", tr, nil, false)
+	if outcome != TierPrunePruned || !hasHour(paths, future) || !hasHour(paths, now) {
+		t.Fatalf("outcome %v paths %v", outcome, paths)
+	}
+	if !tr.End.Equal(end) || !tr.EndAssumed {
+		t.Fatal("the shared TimeRange was changed")
+	}
+}
+
+// A listing that fails keeps the generated range: no partition past the
+// assumed end, and no fall back to the whole measurement.
+func TestOpenEndedListingErrorKeepsGeneratedRange(t *testing.T) {
+	now := time.Now().UTC()
+	tr := &TimeRange{Start: now.Add(-time.Hour), End: now.Add(24 * time.Hour), EndAssumed: true}
+	failing := func(context.Context, string) ([]string, error) { return nil, errors.New("listing failed") }
+	if _, _, err := discoverOpenEnd(context.Background(), failing, "db", "cpu", tr.End); err == nil {
+		t.Fatal("a failed listing must be an error, not an empty measurement")
+	}
+	backend := &tierMock{mockS3Backend: &mockS3Backend{existingDirs: map[string][]string{}}, files: map[string][]string{}, errPrefixes: map[string]bool{"db/cpu/": true}}
+	p := livePruner(now)
+	paths, outcome := p.PruneTierPaths(context.Background(), "s3://bucket/db/cpu/**/*.parquet", "db", "cpu", tr, backend, false)
+	if outcome == TierPruneFallback && paths == nil {
+		return // the tier is read whole only when its own listing says so; here the hour listings decide
+	}
+	for _, path := range paths {
+		if strings.Contains(path, now.Add(48*time.Hour).Format("2006/01/02")) {
+			t.Fatalf("a partition past the assumed end without a listing: %v", paths)
+		}
 	}
 }

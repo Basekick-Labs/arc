@@ -13,6 +13,7 @@ package pruning
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
@@ -68,6 +69,25 @@ func (p *PartitionPruner) PruneTierPaths(ctx context.Context, tierGlob, database
 	if len(paths) == 0 {
 		// Range too wide for the path cap, or generation cancelled.
 		return nil, TierPruneFallback
+	}
+
+	// A start-only range: add the partitions that exist past the assumed
+	// end on this tier (open_end.go). timeRange is shared by the tiers and
+	// is not changed.
+	if timeRange.EndAssumed {
+		var lister dirLister
+		if strings.HasPrefix(tierGlob, "s3://") || strings.HasPrefix(tierGlob, "azure://") {
+			lister = p.tierDirLister(backend, rootURL)
+		} else {
+			lister = localDirLister(basePath)
+		}
+		beyond, _, err := discoverOpenEnd(ctx, lister, database, measurement, timeRange.End)
+		switch {
+		case errors.Is(err, errTooManyBeyond):
+			return nil, TierPruneFallback
+		case err == nil:
+			paths = appendBeyond(paths, beyond, basePath, database, measurement)
+		}
 	}
 
 	verified := true
