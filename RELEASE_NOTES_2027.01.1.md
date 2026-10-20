@@ -1247,6 +1247,14 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Query transformations check emitted storage scopes against RBAC ([#1261](https://github.com/Basekick-Labs/arc/pull/1261))
+
+Queries check database and measurement scopes resolved by the transform before
+execution, including cached transforms and ArcX dispatch. User-supplied file
+readers and replacement scans are also rejected at the transform boundary.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1261](https://github.com/Basekick-Labs/arc/pull/1261).
+
 ### Aggregates over several hours no longer return one result per hour on `/api/v1/query`
 
 Since 26.02.1, a JSON query with the database in the `x-arc-database`

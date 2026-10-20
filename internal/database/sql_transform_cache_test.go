@@ -36,6 +36,27 @@ func TestQueryCache_GetSet(t *testing.T) {
 	}
 }
 
+func TestQueryCache_MetadataRemainsAssociatedWithTransform(t *testing.T) {
+	cache := NewQueryCache(time.Minute, 100)
+	metadata := []string{"db1\x00cpu", "db2\x00mem"}
+	cache.SetWithMetadata("query", "transformed", metadata)
+	metadata[0] = "mutated\x00caller"
+
+	gotSQL, gotMetadata, ok := cache.GetWithMetadata("query")
+	if !ok || gotSQL != "transformed" {
+		t.Fatalf("GetWithMetadata = (%q, %v), want transformed cache hit", gotSQL, ok)
+	}
+	want := []string{"db1\x00cpu", "db2\x00mem"}
+	if fmt.Sprint(gotMetadata) != fmt.Sprint(want) {
+		t.Fatalf("metadata = %q, want %q", gotMetadata, want)
+	}
+	gotMetadata[1] = "mutated\x00reader"
+	_, again, ok := cache.GetWithMetadata("query")
+	if !ok || fmt.Sprint(again) != fmt.Sprint(want) {
+		t.Fatalf("cached metadata mutated by reader: got %q, want %q", again, want)
+	}
+}
+
 func TestQueryCache_Expiration(t *testing.T) {
 	cache := NewQueryCache(10*time.Millisecond, 100)
 

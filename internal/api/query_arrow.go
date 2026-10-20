@@ -526,10 +526,17 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// ArrowQueryContext: once either commits to a body stream the status
 	// code is already on the wire, and the only way left to report a failure is
 	// a trailer the client may not read.
-	convertedSQL, _, err := h.getTransformedSQL(c.Context(), req.SQL, headerDB)
+	convertedSQL, _, emittedRefs, err := h.getTransformedSQLWithRefs(c.Context(), req.SQL, headerDB)
 	if err != nil {
 		m.IncQueryErrors()
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   err.Error(),
+		})
+	}
+	if err := h.checkEmittedQueryPermissions(c, "read", emittedRefs); err != nil {
+		m.IncQueryErrors()
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 			"success": false,
 			"error":   err.Error(),
 		})
