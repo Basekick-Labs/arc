@@ -632,13 +632,15 @@ func stripSQLComments(sql string, hasComments bool) string {
 	for i < len(sql) {
 		// Check for single-line comment (--)
 		if i+1 < len(sql) && sql[i] == '-' && sql[i+1] == '-' {
-			// Skip until end of line or end of string
-			for i < len(sql) && sql[i] != '\n' {
+			// Skip until end of line or end of string. DuckDB ends a line
+			// comment at a carriage return as well as a newline: ending it
+			// only at `\n` hid `--x\r; CREATE ...` from every gate.
+			for i < len(sql) && sql[i] != '\n' && sql[i] != '\r' {
 				i++
 			}
-			// Keep the newline if present
+			// Keep the line break if present
 			if i < len(sql) {
-				result.WriteByte('\n')
+				result.WriteByte(sql[i])
 				i++
 			}
 			continue
@@ -781,7 +783,8 @@ var dangerousSQLPattern = regexp.MustCompile(`(?i)(?:` +
 	`|TRUNCATE\s+TABLE` +
 	`|ALTER\s+TABLE` +
 	`|CREATE\s+(?:TABLE|DATABASE|INDEX)` +
-	`|INSERT\s+INTO` +
+	`|INSERT\s+(?:OR\s+\w+\s+)?INTO` +
+	`|MERGE\s+INTO` +
 	`|UPDATE\s+\w+\s+SET)\b` +
 	// RCE / file-system / extension-loading class. Anchored at start
 	// with \b; the terminator is whatever the keyword's argument shape
@@ -2483,7 +2486,11 @@ func ValidateSQLRequest(sql string) error {
 	maskInput := backticksToDoubleQuotes(sql)
 	features := scanSQLFeatures(maskInput)
 	normalised, vMasks := sqlutil.MaskStringLiterals(maskInput, features.hasQuotes)
+	if features.hasBlockComment && hasNestedBlockComment(normalised) {
+		return &SQLValidationError{Message: "Nested block comments are not allowed"}
+	}
 	normalised = stripSQLComments(normalised, features.hasDashComment || features.hasBlockComment)
+	normalised = foldUnicodeSpace(normalised)
 
 	// SECURITY: reject multi-statement queries. A second statement smuggled
 	// behind a semicolon (`SHOW DATABASES; SELECT 1`) bypasses the anchored
@@ -2503,6 +2510,13 @@ func ValidateSQLRequest(sql string) error {
 
 	if dangerousSQLPattern.MatchString(normalised) {
 		return &SQLValidationError{Message: "Dangerous SQL operation not allowed"}
+	}
+
+	// SECURITY: read statements only (read_statements.go). The denylist above
+	// refuses the statements it names; this refuses every other statement
+	// that is not a read.
+	if !isReadStatement(normalised) {
+		return &SQLValidationError{Message: "Only read statements are allowed (SELECT, WITH, FROM, VALUES, PIVOT, UNPIVOT, SHOW, DESCRIBE, SUMMARIZE, EXPLAIN)"}
 	}
 
 	// SECURITY: reject the DuckDB filesystem-I/O table-function family in
@@ -2543,7 +2557,7 @@ func ValidateSQLRequest(sql string) error {
 	// (GHSA-93cm-2v4m-c56c review round 2). ioDenylistNormalise strips
 	// identifier quoting so quoted function names are exposed to the regex,
 	// while still masking single-quoted string literals.
-	ioCheckNormalised := ioDenylistNormalise(sql)
+	ioCheckNormalised := foldUnicodeSpace(ioDenylistNormalise(sql))
 	if m := ioTableFunctionPattern.FindStringSubmatch(ioCheckNormalised); m != nil {
 		return &SQLValidationError{Message: "File I/O function not allowed in user SQL: " + m[1] + "()"}
 	}
@@ -2553,6 +2567,12 @@ func ValidateSQLRequest(sql string) error {
 	// checked on the same normalised form.
 	if m := dynamicSQLFunctionPattern.FindStringSubmatch(ioCheckNormalised); m != nil {
 		return &SQLValidationError{Message: "Dynamic SQL function not allowed in user SQL: " + m[1] + "()"}
+	}
+
+	// Functions a SELECT can call to change or read state every user shares
+	// (logging, checkpoints, sequences, settings), checked on the same form.
+	if name := sideEffectFunction(ioCheckNormalised); name != "" {
+		return &SQLValidationError{Message: "Function not allowed in user SQL: " + name}
 	}
 
 	// SECURITY: reject a bare single-quoted string in table position — a

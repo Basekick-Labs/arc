@@ -790,6 +790,9 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	// otherwise open a spurious literal that hides whatever follows it.
 	maskInput := backticksToDoubleQuotes(where)
 	maskedWhere, masks := sqlutil.MaskStringLiterals(maskInput, sqlutil.HasQuotes(maskInput))
+	// DuckDB reads non-ASCII spaces as token separators; the keyword and
+	// function scans below only see ASCII ones (read_statements.go).
+	maskedWhere = foldUnicodeSpace(maskedWhere)
 	whereUpper := strings.ToUpper(strings.TrimSpace(maskedWhere))
 
 	// Remove "WHERE" prefix if present
@@ -828,6 +831,9 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	ioCheck = strings.NewReplacer(`"`, "", "`", "").Replace(ioCheck)
 	if m := dangerousIOFunctionPattern.FindStringSubmatch(ioCheck); m != nil {
 		return false, fmt.Errorf("WHERE clause contains forbidden file I/O function: %s()", m[1])
+	}
+	if name := sideEffectFunction(ioCheck); name != "" {
+		return false, fmt.Errorf("WHERE clause contains forbidden function: %s", name)
 	}
 
 	// SECURITY: reject a path literal standing in table position inside the

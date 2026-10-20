@@ -149,3 +149,24 @@ func TestValidateWhereClauseAcceptsIdentifiersContainingProcedurePrefixes(t *tes
 		t.Error("validateWhereClause accepted EXEC xp_cmdshell; the keyword check must still refuse it")
 	}
 }
+
+// A WHERE fragment cannot call the functions that change or read state every
+// user shares (read_statements.go).
+func TestValidateWhereClauseRejectsSideEffectFunctions(t *testing.T) {
+	h := &DeleteHandler{}
+	for _, where := range []string{
+		`EXISTS (FROM enable_logging(['QueryLog']))`,
+		`host = 'a' OR EXISTS (FROM duckdb_logs)`,
+		`v = nextval('s')`,
+		`host = current_setting('threads')`,
+		`host = "current_setting"('threads')`,
+		"EXISTS (FROM enable_logging (['QueryLog']))",
+	} {
+		if _, err := h.validateWhereClause(where); err == nil {
+			t.Errorf("validateWhereClause(%q) accepted unsafe input", where)
+		}
+	}
+	if _, err := h.validateWhereClause(`host = 'enable_logging(x)'`); err != nil {
+		t.Errorf("a function name inside a literal was refused: %v", err)
+	}
+}
