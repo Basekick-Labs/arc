@@ -35,6 +35,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/basekick-labs/arc/internal/arcxengine"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/pruning"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
@@ -44,6 +45,7 @@ import (
 // explicitly so query.go exposes no new exported methods.
 type Deps struct {
 	Storage storage.Backend
+	Pruner  *pruning.PartitionPruner
 	DB      OracleDB
 	Logger  zerolog.Logger
 	Metrics Metrics
@@ -271,10 +273,16 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 	basePath := local.GetBasePath()
 
 	prefix := d.Ctx.Database + "/" + d.Ctx.Measurement + "/"
-	entries, err := h.Storage.List(ctx, prefix)
-	if err != nil {
-		h.Logger.Warn().Err(err).Str("prefix", prefix).Msg("arcx: storage list failed; declining")
-		return "", false
+	entries, pruned := engineParquetEntries(
+		ctx, local, d.Shape, d.Ctx.Database, d.Ctx.Measurement, d.WhereText, d.Preds, h.Pruner,
+	)
+	if !pruned {
+		var err error
+		entries, err = h.Storage.List(ctx, prefix)
+		if err != nil {
+			h.Logger.Warn().Err(err).Str("prefix", prefix).Msg("arcx: storage list failed; declining")
+			return "", false
+		}
 	}
 	var arr strings.Builder
 	arr.WriteByte('[')
