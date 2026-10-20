@@ -55,6 +55,19 @@ Arc is now built with Go 1.26.9 and golang.org/x/net 0.60, which fix eleven
 vulnerabilities in Go's HTTP, TLS and template packages that `govulncheck`
 reports as reachable from Arc.
 
+## Security: the query API runs read statements only
+
+The query endpoints (`/api/v1/query` and its MessagePack, Arrow and estimate
+forms) and continuous queries now accept read statements only: `SELECT`,
+`WITH`, `FROM`, `VALUES`, `PIVOT`, `UNPIVOT`, `SHOW`, `DESCRIBE`, `SUMMARIZE`,
+and `EXPLAIN` of one of these. Any other statement is answered `400`. A few
+DuckDB functions that change or expose server-wide state are refused in
+queries and in `DELETE` predicates, and the checks Arc runs on query text now
+read it the way DuckDB does in more cases. A stored continuous query that is
+not a read statement fails its runs from this release.
+
+Thanks to [@rexpository](https://github.com/rexpository) for the report.
+
 ## Upgrade note: three configurations now refuse to start
 
 Read this before upgrading if you set `storage.local_path`,
