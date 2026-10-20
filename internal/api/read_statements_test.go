@@ -175,6 +175,8 @@ func TestValidateSQLRequest_LexerAgreesWithDuckDB(t *testing.T) {
 		"SELECT 1 --x\r; CREATE MACRO m() AS 1\n",
 		"SELECT 1 --x\r, * FROM read_parquet('/data/db2/x.parquet')",
 		"SELECT 1 /* a */ --x\r; USE memory",
+		"SELECT 1 --x\r, 'a--' AS s, * FROM read_parquet('/data/db2/x.parquet')",
+		"--x\r/* /* */ SELECT */ CREATE MACRO m() AS 1",
 	}
 	for _, q := range refused {
 		if err := ValidateSQLRequest(q); err == nil {
