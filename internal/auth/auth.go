@@ -1062,6 +1062,21 @@ func (am *AuthManager) ListTokens() ([]TokenInfo, error) {
 	return tokens, nil
 }
 
+// TokenForForward returns the token a peer asserted for a request it
+// forwarded here (#1305), or nil when it does not exist on this node yet, is
+// disabled or has expired: the checks VerifyToken applies to a presented
+// token, which a forwarded request no longer carries.
+func (am *AuthManager) TokenForForward(id int64) *TokenInfo {
+	info, err := am.GetTokenByID(id)
+	if err != nil || info == nil || !info.Enabled {
+		return nil
+	}
+	if info.ExpiresAt != nil && time.Now().After(*info.ExpiresAt) {
+		return nil
+	}
+	return info
+}
+
 // GetTokenByID returns token info by ID
 func (am *AuthManager) GetTokenByID(id int64) (*TokenInfo, error) {
 	var (

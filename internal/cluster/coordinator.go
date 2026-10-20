@@ -247,6 +247,9 @@ type Coordinator struct {
 	// the check.
 	nonceCache *security.NonceCache
 
+	// forwardNonces rejects a replayed forwarded-request identity (#1305).
+	forwardNonces *security.ForwardNonceCache
+
 	// forwardConn caches a single TCP connection to the current Raft
 	// leader for forwarding commands. Reused across calls to avoid
 	// per-command dial + TLS overhead. Lazily reconnected on error or
@@ -521,6 +524,9 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	// read from disk once at coordinator startup rather than once
 	// per consumer. Scheme is keyed off server.tls_enabled (the Fiber
 	// listener flag), not cluster TLS — the two flags are independent.
+	// Built with the router, before any request can be forwarded here: an
+	// assertion is checked against it from the first one (#1305).
+	c.forwardNonces = security.NewForwardNonceCache(security.ForwardIdentityTolerance)
 	c.router = NewRouter(&RouterConfig{
 		Timeout:   routeTimeout,
 		Retries:   cfg.Config.RouteRetries,
@@ -538,9 +544,12 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 			}
 			return c.designatedPrimaryWriterID()
 		},
-		StandbyWriteTarget: c.WriteForwardTarget,
-		WriteTimeout:       time.Duration(cfg.Config.WriteForwardTimeoutMs) * time.Millisecond,
-		ImportTimeout:      time.Duration(max(cfg.Config.ImportForwardTimeoutMs, 0)) * time.Millisecond,
+		StandbyWriteTarget:  c.WriteForwardTarget,
+		WriteTimeout:        time.Duration(cfg.Config.WriteForwardTimeoutMs) * time.Millisecond,
+		ImportTimeout:       time.Duration(max(cfg.Config.ImportForwardTimeoutMs, 0)) * time.Millisecond,
+		SharedSecret:        cfg.Config.SharedSecret,
+		ClusterName:         cfg.Config.ClusterName,
+		PeerForwardIdentity: c.peerForwardIdentity,
 	})
 
 	// Initialize writer failover manager (Phase 3) — requires license and Raft.

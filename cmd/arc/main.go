@@ -2637,6 +2637,11 @@ func main() {
 		// /api/v1/logs, by contrast, is NOT public — it is registered with admin
 		// auth below.
 		middlewareConfig.PublicPrefixes = append(middlewareConfig.PublicPrefixes, "/api/v1/metrics")
+		// A peer forwards a request with a signed identity instead of the
+		// caller's credential (#1305).
+		if clusterCoordinator != nil {
+			middlewareConfig.ForwardIdentity = api.ForwardIdentityVerifier(clusterCoordinator)
+		}
 		server.GetApp().Use(auth.NewMiddleware(middlewareConfig))
 
 		// Register the admin-authenticated logs route AFTER the auth
