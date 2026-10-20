@@ -130,6 +130,10 @@ func TestValidateSQLRequest_ReadStatementsBypasses(t *testing.T) {
 		"SELECT getvariable('x')",
 		"SELECT \"current_setting\"('threads')",
 		"SELECT CURRENT_SETTING ('threads')",
+		"SELECT * FROM read_parquet\u00a0('/data/other/x.parquet')",
+		"SELECT * FROM glob\u2003('/data/**')",
+		"SELECT * FROM query\u00a0('SELECT 1')",
+		"SELECT * FROM enable_logging\u00a0(['QueryLog'])",
 	}
 	for _, q := range refused {
 		if err := ValidateSQLRequest(q); err == nil {
