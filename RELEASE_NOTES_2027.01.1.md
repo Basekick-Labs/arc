@@ -1274,8 +1274,8 @@ unregistered by earlier versions are not picked up retroactively.
 
 ### The cold-tier storage backend closes during shutdown ([#1103](https://github.com/Basekick-Labs/arc/issues/1103))
 
-The S3 or Azure backend used by tiering is now closed after the tiering
-manager stops, releasing its resources during graceful shutdown.
+The S3 or Azure backend used by tiering is now closed with the other storage
+backends after the tiering manager stops.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1204](https://github.com/Basekick-Labs/arc/pull/1204).
 
