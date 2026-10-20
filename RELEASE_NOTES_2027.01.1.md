@@ -1341,6 +1341,26 @@ than leave rows out. Locally this costs a few directory reads per uncached
 query; on S3 and Azure, a few directory listings, cached like the existing
 partition listings.
 
+### A forwarded request no longer carries the caller's token to the peer ([#1305](https://github.com/Basekick-Labs/arc/issues/1305))
+
+In a cluster, a node that cannot serve a request itself forwards it to a
+peer: a write or import sent to a reader, compactor or standby writer goes
+to the writer, and a query sent to a compactor goes to a reader. The forward
+used to copy the caller's credential (`Authorization`, `x-api-key`, `Cookie`
+and the `?p=` parameter) to the peer, in clear text unless the cluster uses
+TLS. The forwarding node has already verified that token: it now removes the
+credential and sends the token's identity instead, signed with
+`cluster.shared_secret`. The peer accepts that identity only on the
+forwarded endpoints and only from a node of its own cluster, and checks the
+token's permissions and RBAC grants as before.
+
+Upgrade note: a node forwards this way only to peers running this release;
+older peers keep receiving the credential, so a rolling upgrade keeps
+working, and the credential stops crossing the hop once every node is
+upgraded. A cluster without Raft (where each node keeps its own tokens)
+forwards the credential as before. A node with authentication disabled
+cannot forward to a peer that has it enabled: the peer answers `401`.
+
 ### In shared storage, a DELETE no longer leaves rows another writer has not flushed ([#1265](https://github.com/Basekick-Labs/arc/issues/1265))
 
 In shared storage (`cluster.shared_storage_mode`) every writer takes writes,
