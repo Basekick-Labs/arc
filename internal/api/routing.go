@@ -189,11 +189,11 @@ func BuildHTTPRequest(c *fiber.Ctx) (*http.Request, error) {
 
 	// The token this node verified for the caller: the router asserts it to
 	// a peer instead of forwarding the caller's credential (#1305).
-	var tokenID int64
+	var tok cluster.ForwardToken
 	if info := auth.GetTokenInfo(c); info != nil {
-		tokenID = info.ID
+		tok = cluster.ForwardToken{ID: info.ID, Fingerprint: info.Fingerprint}
 	}
-	req = req.WithContext(cluster.WithForwardTokenID(req.Context(), tokenID))
+	req = req.WithContext(cluster.WithForwardToken(req.Context(), tok))
 
 	return req, nil
 }
@@ -219,14 +219,14 @@ var forwardedRoutes = map[string]bool{
 // ForwardIdentityChecker verifies a forwarded request's signed identity
 // (*cluster.Coordinator).
 type ForwardIdentityChecker interface {
-	VerifyForwardIdentity(values cluster.ForwardIdentityHeaderValues, method, requestURI string) (bool, int64, error)
+	VerifyForwardIdentity(values cluster.ForwardIdentityHeaderValues, method, requestURI string) (bool, cluster.ForwardToken, error)
 }
 
 // ForwardIdentityVerifier is the auth middleware's check of a forwarded
 // request's signed identity (auth.MiddlewareConfig.ForwardIdentity). The
 // request URI is the raw one received, which is what the peer signed.
-func ForwardIdentityVerifier(coord ForwardIdentityChecker) func(c *fiber.Ctx) (bool, int64, error) {
-	return func(c *fiber.Ctx) (bool, int64, error) {
+func ForwardIdentityVerifier(coord ForwardIdentityChecker) func(c *fiber.Ctx) (bool, int64, string, error) {
+	return func(c *fiber.Ctx) (bool, int64, string, error) {
 		values := func(name string) []string {
 			raw := c.Request().Header.PeekAll(name)
 			out := make([]string, len(raw))
@@ -235,14 +235,17 @@ func ForwardIdentityVerifier(coord ForwardIdentityChecker) func(c *fiber.Ctx) (b
 			}
 			return out
 		}
-		present, tokenID, err := coord.VerifyForwardIdentity(values, c.Method(), string(c.Request().RequestURI()))
+		// The request URI exactly as received (Header.RequestURI): the
+		// parsed form fasthttp rebuilds can differ from the bytes the peer
+		// signed.
+		present, tok, err := coord.VerifyForwardIdentity(values, c.Method(), string(c.Request().Header.RequestURI()))
 		if !present {
-			return false, 0, nil
+			return false, 0, "", nil
 		}
 		if err == nil && !forwardedRoutes[c.Method()+" "+path.Clean(c.Path())] {
 			err = security.ErrForwardIdentity
 		}
-		return true, tokenID, err
+		return true, tok.ID, tok.Fingerprint, err
 	}
 }
 

@@ -39,6 +39,7 @@ type fwdRig struct {
 	am       *auth.AuthManager
 	writeTok string
 	writeID  int64
+	writeFP  string
 	last     *seen
 	url      string
 }
@@ -80,19 +81,21 @@ func newFwdRig(t *testing.T) *fwdRig {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := &fwdRig{t: t, coord: coord, am: am, writeTok: tok, writeID: am.VerifyToken(tok).ID}
+	info := am.VerifyToken(tok)
+	r := &fwdRig{t: t, coord: coord, am: am, writeTok: tok, writeID: info.ID, writeFP: info.Fingerprint}
 
 	app := fiber.New(fiber.Config{DisableStartupMessage: true})
 	app.Use(auth.NewMiddleware(auth.MiddlewareConfig{
 		AuthManager: am,
-		ForwardIdentity: func(c *fiber.Ctx) (bool, int64, error) {
-			return coord.VerifyForwardIdentity(func(name string) []string {
+		ForwardIdentity: func(c *fiber.Ctx) (bool, int64, string, error) {
+			present, tok, err := coord.VerifyForwardIdentity(func(name string) []string {
 				var out []string
 				for _, v := range c.Request().Header.PeekAll(name) {
 					out = append(out, string(v))
 				}
 				return out
-			}, c.Method(), string(c.Request().RequestURI()))
+			}, c.Method(), string(c.Request().Header.RequestURI()))
+			return present, tok.ID, tok.Fingerprint, err
 		},
 	}))
 	record := func(c *fiber.Ctx) error {
@@ -160,7 +163,7 @@ func freeTCPAddr(t *testing.T) string {
 
 // clientRequest is a write as a client sends it to reader-A, every
 // credential carrier filled in, plus a spoofed assertion header.
-func (r *fwdRig) clientRequest(tokenID int64) *http.Request {
+func (r *fwdRig) clientRequest(tok ForwardToken) *http.Request {
 	req, _ := http.NewRequest("POST", "http://reader-a/api/v1/write/msgpack?db=a&p="+r.writeTok+"&z=1&u=me&b=2", bytes.NewReader([]byte("body")))
 	req.Header.Set("Authorization", "Bearer "+r.writeTok)
 	req.Header.Set("X-Api-Key", r.writeTok)
@@ -168,14 +171,14 @@ func (r *fwdRig) clientRequest(tokenID int64) *http.Request {
 	req.Header.Set("X-Arc-Database", "a")
 	req.Header.Set("Content-Type", "application/msgpack")
 	req.Header.Set(security.HeaderForwardTokenID, "1")
-	return req.WithContext(WithForwardTokenID(context.Background(), tokenID))
+	return req.WithContext(WithForwardToken(context.Background(), tok))
 }
 
 // A forward to a capable peer carries the signed identity and no credential:
 // the peer authenticates it as the caller's token, and never sees the token.
 func TestForwardIdentity_PeerSeesIdentityNotCredential(t *testing.T) {
 	r := newFwdRig(t)
-	resp, err := r.router.ForwardWriteTo(context.Background(), r.target, r.clientRequest(r.writeID))
+	resp, err := r.router.ForwardWriteTo(context.Background(), r.target, r.clientRequest(r.wtok()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,10 +206,10 @@ func TestForwardIdentity_PeerSeesIdentityNotCredential(t *testing.T) {
 // upgrade keeps forwarding; it gets no assertion headers either.
 func TestForwardIdentity_OlderPeerGetsCredential(t *testing.T) {
 	r := newFwdRig(t)
-	req := r.clientRequest(r.writeID)
+	req := r.clientRequest(r.wtok())
 	fwd, _ := http.NewRequest("POST", "http://writer-old/api/v1/write/msgpack?"+req.URL.RawQuery, nil)
 	fwd.Header = req.Header.Clone()
-	if err := r.router.signForward(fwd, &Node{ID: "writer-old"}, r.writeID); err != nil {
+	if err := r.router.signForward(fwd, &Node{ID: "writer-old"}, r.wtok()); err != nil {
 		t.Fatal(err)
 	}
 	if fwd.Header.Get("Authorization") == "" || !strings.Contains(fwd.URL.RawQuery, "p=") {
@@ -226,7 +229,7 @@ func TestForwardIdentity_EachAttemptSignedAfresh(t *testing.T) {
 	nonces := map[string]bool{}
 	for i := 0; i < 3; i++ {
 		fwd, _ := http.NewRequest("POST", r.url+"/api/v1/write/msgpack", nil)
-		if err := r.router.signForward(fwd, r.target, r.writeID); err != nil {
+		if err := r.router.signForward(fwd, r.target, r.wtok()); err != nil {
 			t.Fatal(err)
 		}
 		nonces[fwd.Header.Get(security.HeaderForwardNonce)] = true
@@ -238,12 +241,13 @@ func TestForwardIdentity_EachAttemptSignedAfresh(t *testing.T) {
 
 // signed returns a request to the receiver signed as from with the given
 // identity fields, ready to send.
-func (r *fwdRig) signed(from, target string, tokenID int64, mutate func(*http.Request)) *http.Request {
+func (r *fwdRig) signed(from, target string, tok ForwardToken, mutate func(*http.Request)) *http.Request {
 	req, _ := http.NewRequest("POST", r.url+"/api/v1/write/msgpack?db=a", bytes.NewReader([]byte("x")))
 	req.Header.Set("X-Arc-Database", "a")
 	rt := NewRouter(&RouterConfig{LocalNode: NewNode(from, from, RoleReader, fwdCluster), SharedSecret: fwdSecret, ClusterName: fwdCluster,
 		PeerForwardIdentity: func(string) bool { return true }, Registry: NewRegistry(&RegistryConfig{MaxNodes: 8, Logger: zerolog.Nop()}), Logger: zerolog.Nop()})
-	if err := rt.signForward(req, &Node{ID: target}, tokenID); err != nil {
+	req.Header.Set("X-Arc-Forwarded-By", from)
+	if err := rt.signForward(req, &Node{ID: target}, tok); err != nil {
 		r.t.Fatal(err)
 	}
 	if mutate != nil {
@@ -270,35 +274,38 @@ func TestForwardIdentity_Rejections(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	offID := r.am.VerifyToken(other).ID
+	offInfo := r.am.VerifyToken(other)
+	offID, offFP := offInfo.ID, offInfo.Fingerprint
 	if err := r.am.RevokeToken(context.Background(), offID); err != nil {
 		t.Fatal(err)
 	}
-	if code := send(t, r.signed("reader-A", "writer-W", r.writeID, nil)); code != 204 {
+	if code := send(t, r.signed("reader-A", "writer-W", r.wtok(), nil)); code != 204 {
 		t.Fatalf("baseline: %d", code)
 	}
 	cases := map[string]*http.Request{
-		"database changed":  r.signed("reader-A", "writer-W", r.writeID, func(q *http.Request) { q.Header.Set("X-Arc-Database", "b") }),
-		"measurement added": r.signed("reader-A", "writer-W", r.writeID, func(q *http.Request) { q.Header.Set("X-Arc-Measurement", "m") }),
-		"encoding added":    r.signed("reader-A", "writer-W", r.writeID, func(q *http.Request) { q.Header.Set("Content-Encoding", "gzip") }),
-		"query changed":     r.signed("reader-A", "writer-W", r.writeID, func(q *http.Request) { q.URL.RawQuery = "db=b" }),
-		"query reordered":   r.signed("reader-A", "writer-W", r.writeID, func(q *http.Request) { q.URL.RawQuery = "db=a&x=1" }),
-		"token changed":     r.signed("reader-A", "writer-W", r.writeID, func(q *http.Request) { q.Header.Set(security.HeaderForwardTokenID, strconv.FormatInt(r.writeID+1, 10)) }),
-		"duplicate mac": r.signed("reader-A", "writer-W", r.writeID, func(q *http.Request) {
+		"database changed":  r.signed("reader-A", "writer-W", r.wtok(), func(q *http.Request) { q.Header.Set("X-Arc-Database", "b") }),
+		"measurement added": r.signed("reader-A", "writer-W", r.wtok(), func(q *http.Request) { q.Header.Set("X-Arc-Measurement", "m") }),
+		"encoding added":    r.signed("reader-A", "writer-W", r.wtok(), func(q *http.Request) { q.Header.Set("Content-Encoding", "gzip") }),
+		"query changed":     r.signed("reader-A", "writer-W", r.wtok(), func(q *http.Request) { q.URL.RawQuery = "db=b" }),
+		"query reordered":   r.signed("reader-A", "writer-W", r.wtok(), func(q *http.Request) { q.URL.RawQuery = "db=a&x=1" }),
+		"token changed":     r.signed("reader-A", "writer-W", r.wtok(), func(q *http.Request) { q.Header.Set(security.HeaderForwardTokenID, strconv.FormatInt(r.writeID+1, 10)) }),
+		"duplicate mac": r.signed("reader-A", "writer-W", r.wtok(), func(q *http.Request) {
 			q.Header.Add(security.HeaderForwardHMAC, q.Header.Get(security.HeaderForwardHMAC))
 		}),
-		"duplicate database": r.signed("reader-A", "writer-W", r.writeID, func(q *http.Request) { q.Header.Add("X-Arc-Database", "b") }),
-		"missing nonce":      r.signed("reader-A", "writer-W", r.writeID, func(q *http.Request) { q.Header.Del(security.HeaderForwardNonce) }),
-		"other target":       r.signed("reader-A", "writer-old", r.writeID, nil),
-		"self as sender":     r.signed("writer-W", "writer-W", r.writeID, nil),
-		"unknown sender":     r.signed("ghost", "writer-W", r.writeID, nil),
-		"revoked token":      r.signed("reader-A", "writer-W", offID, nil),
-		"unknown token":      r.signed("reader-A", "writer-W", 999999, nil),
-		"no caller token":    r.signed("reader-A", "writer-W", 0, nil),
-		"wrong secret": r.signed("reader-A", "writer-W", r.writeID, func(q *http.Request) {
+		"fingerprint of another token":   r.signed("reader-A", "writer-W", ForwardToken{ID: r.writeID, Fingerprint: offFP}, nil),
+		"loop marker names another node": r.signed("reader-A", "writer-W", r.wtok(), func(q *http.Request) { q.Header.Set("X-Arc-Forwarded-By", "writer-old") }),
+		"duplicate database":             r.signed("reader-A", "writer-W", r.wtok(), func(q *http.Request) { q.Header.Add("X-Arc-Database", "b") }),
+		"missing nonce":                  r.signed("reader-A", "writer-W", r.wtok(), func(q *http.Request) { q.Header.Del(security.HeaderForwardNonce) }),
+		"other target":                   r.signed("reader-A", "writer-old", r.wtok(), nil),
+		"self as sender":                 r.signed("writer-W", "writer-W", r.wtok(), nil),
+		"unknown sender":                 r.signed("ghost", "writer-W", r.wtok(), nil),
+		"revoked token":                  r.signed("reader-A", "writer-W", ForwardToken{ID: offID, Fingerprint: offFP}, nil),
+		"unknown token":                  r.signed("reader-A", "writer-W", ForwardToken{ID: 999999, Fingerprint: r.writeFP}, nil),
+		"no caller token":                r.signed("reader-A", "writer-W", ForwardToken{}, nil),
+		"wrong secret": r.signed("reader-A", "writer-W", r.wtok(), func(q *http.Request) {
 			q.Header.Set(security.HeaderForwardHMAC, strings.Repeat("ab", 32))
 		}),
-		"stale": r.signed("reader-A", "writer-W", r.writeID, func(q *http.Request) {
+		"stale": r.signed("reader-A", "writer-W", r.wtok(), func(q *http.Request) {
 			q.Header.Set(security.HeaderForwardTimestamp, "1")
 		}),
 		"lone header with a valid credential": func() *http.Request {
@@ -314,7 +321,7 @@ func TestForwardIdentity_Rejections(t *testing.T) {
 		}
 	}
 	// Replay of an accepted request.
-	req := r.signed("reader-A", "writer-W", r.writeID, nil)
+	req := r.signed("reader-A", "writer-W", r.wtok(), nil)
 	h := req.Header.Clone()
 	if code := send(t, req); code != 204 {
 		t.Fatalf("first send: %d", code)
@@ -353,7 +360,7 @@ func TestForwardIdentity_QueryForwardSigned(t *testing.T) {
 	r := newFwdRig(t)
 	req, _ := http.NewRequest("POST", "http://compactor/api/v1/query", bytes.NewReader([]byte(`{"sql":"SELECT 1"}`)))
 	req.Header.Set("Authorization", "Bearer "+r.writeTok)
-	req = req.WithContext(WithForwardTokenID(context.Background(), r.writeID))
+	req = req.WithContext(WithForwardToken(context.Background(), r.wtok()))
 	resp, err := r.router.forwardRequest(context.Background(), r.target, req)
 	if err != nil {
 		t.Fatal(err)
@@ -372,10 +379,10 @@ func TestForwardIdentity_ExpiredTokenAndNoCaller(t *testing.T) {
 	if err := r.am.UpdateToken(context.Background(), r.writeID, nil, nil, nil, &past); err != nil {
 		t.Fatal(err)
 	}
-	if code := send(t, r.signed("reader-A", "writer-W", r.writeID, nil)); code != 401 {
+	if code := send(t, r.signed("reader-A", "writer-W", r.wtok(), nil)); code != 401 {
 		t.Fatalf("expired token: %d", code)
 	}
-	resp, err := http.DefaultClient.Do(r.signed("reader-A", "writer-W", 0, nil))
+	resp, err := http.DefaultClient.Do(r.signed("reader-A", "writer-W", ForwardToken{}, nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -394,3 +401,5 @@ func TestForwardIdentity_CapabilityAdvertised(t *testing.T) {
 		t.Fatalf("capabilities %v", c.localCapabilities())
 	}
 }
+
+func (r *fwdRig) wtok() ForwardToken { return ForwardToken{ID: r.writeID, Fingerprint: r.writeFP} }

@@ -31,7 +31,7 @@ type MiddlewareConfig struct {
 	// (#1305). present is false when the request carries none; when it
 	// does, the request is authenticated by it alone: err or a zero token ID
 	// is a 401, never a fallback to another credential.
-	ForwardIdentity func(c *fiber.Ctx) (present bool, tokenID int64, err error)
+	ForwardIdentity func(c *fiber.Ctx) (present bool, tokenID int64, fingerprint string, err error)
 }
 
 // DefaultMiddlewareConfig returns default middleware config
@@ -131,8 +131,8 @@ func NewMiddleware(config MiddlewareConfig) fiber.Handler {
 
 		// A request a peer forwarded: authenticated by its signed identity.
 		if config.ForwardIdentity != nil {
-			if present, tokenID, err := config.ForwardIdentity(c); present {
-				return authenticateForwarded(c, config, tokenID, err)
+			if present, tokenID, fingerprint, err := config.ForwardIdentity(c); present {
+				return authenticateForwarded(c, config, tokenID, fingerprint, err)
 			}
 		}
 
@@ -188,7 +188,7 @@ func NewMiddleware(config MiddlewareConfig) fiber.Handler {
 
 // authenticateForwarded finishes authenticating a forwarded request whose
 // identity check returned tokenID, err.
-func authenticateForwarded(c *fiber.Ctx, config MiddlewareConfig, tokenID int64, err error) error {
+func authenticateForwarded(c *fiber.Ctx, config MiddlewareConfig, tokenID int64, fingerprint string, err error) error {
 	reject := func(msg string) error {
 		metrics.Get().IncAuthFailures()
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"success": false, "error": msg})
@@ -199,7 +199,7 @@ func authenticateForwarded(c *fiber.Ctx, config MiddlewareConfig, tokenID int64,
 	if tokenID == 0 {
 		return reject("Forwarded without a caller identity: authentication is disabled on the forwarding node")
 	}
-	tokenInfo := config.AuthManager.TokenForForward(tokenID)
+	tokenInfo := config.AuthManager.TokenForForward(tokenID, fingerprint)
 	if tokenInfo == nil {
 		return reject("Invalid or expired token")
 	}

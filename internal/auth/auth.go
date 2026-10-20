@@ -70,6 +70,17 @@ type TokenInfo struct {
 	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
 	Enabled    bool       `json:"enabled"`
 	ExpiresAt  *time.Time `json:"expires_at"`
+	// Fingerprint identifies the token's stored hash (tokenFingerprint),
+	// never its secret. A forwarding node asserts it with the token's ID
+	// (#1305): an ID alone can name a different token on a node that kept a
+	// pre-26.06.1 local row at that ID (cluster_apply.go).
+	Fingerprint string `json:"-"`
+}
+
+// tokenFingerprint is the hex SHA-256 of a token's stored hash.
+func tokenFingerprint(tokenHash string) string {
+	sum := sha256.Sum256([]byte(tokenHash))
+	return hex.EncodeToString(sum[:])
 }
 
 // cacheEntry represents a cached token.
@@ -115,6 +126,7 @@ type AuthManager struct {
 	maxCacheSize int
 
 	cache          map[string]cacheEntry // cache key (sha256 of token) -> cached info
+	idCache        map[int64]cacheEntry  // token ID -> cached info, for forwarded requests (TokenForForward)
 	cacheMu        sync.RWMutex
 	cacheHits      atomic.Int64
 	cacheMisses    atomic.Int64
@@ -229,6 +241,7 @@ func NewAuthManager(dbPath string, cacheTTL time.Duration, maxCacheSize int, log
 		cacheTTL:     cacheTTL,
 		maxCacheSize: maxCacheSize,
 		cache:        make(map[string]cacheEntry),
+		idCache:      make(map[int64]cacheEntry),
 		shutdown:     make(chan struct{}),
 		lastUsedCh:   make(chan lastUsedUpdate, lastUsedBufferSize),
 		logger:       logger.With().Str("component", "auth").Logger(),
@@ -945,6 +958,7 @@ func (am *AuthManager) VerifyToken(token string) *TokenInfo {
 			Permissions: []string{}, // empty by default for RBAC-only tokens
 			CreatedAt:   createdAt,
 			Enabled:     enabled,
+			Fingerprint: tokenFingerprint(tokenHash),
 		}
 		if permissions.Valid && permissions.String != "" {
 			info.Permissions = strings.Split(permissions.String, ",")
@@ -1063,15 +1077,34 @@ func (am *AuthManager) ListTokens() ([]TokenInfo, error) {
 }
 
 // TokenForForward returns the token a peer asserted for a request it
-// forwarded here (#1305), or nil when it does not exist on this node yet, is
-// disabled or has expired: the checks VerifyToken applies to a presented
-// token, which a forwarded request no longer carries.
-func (am *AuthManager) TokenForForward(id int64) *TokenInfo {
-	info, err := am.GetTokenByID(id)
-	if err != nil || info == nil || !info.Enabled {
+// forwarded here (#1305), or nil when this node has no token with that ID and
+// fingerprint (not replicated yet, or a different token kept at that ID),
+// or it is disabled or expired: the checks VerifyToken applies to a presented
+// token, which a forwarded request no longer carries. Cached by ID like
+// VerifyToken's cache, cleared by the same InvalidateCache.
+func (am *AuthManager) TokenForForward(id int64, fingerprint string) *TokenInfo {
+	now := time.Now()
+	am.cacheMu.RLock()
+	entry, ok := am.idCache[id]
+	am.cacheMu.RUnlock()
+	info := entry.info
+	if !ok || now.After(entry.expiresAt) {
+		var err error
+		info, err = am.GetTokenByID(id)
+		if err != nil || info == nil {
+			return nil
+		}
+		am.cacheMu.Lock()
+		if len(am.idCache) >= am.maxCacheSize {
+			am.idCache = make(map[int64]cacheEntry)
+		}
+		am.idCache[id] = cacheEntry{info: info, expiresAt: now.Add(am.cacheTTL)}
+		am.cacheMu.Unlock()
+	}
+	if !info.Enabled || subtle.ConstantTimeCompare([]byte(info.Fingerprint), []byte(fingerprint)) != 1 {
 		return nil
 	}
-	if info.ExpiresAt != nil && time.Now().After(*info.ExpiresAt) {
+	if info.ExpiresAt != nil && now.After(*info.ExpiresAt) {
 		return nil
 	}
 	return info
@@ -1087,12 +1120,13 @@ func (am *AuthManager) GetTokenByID(id int64) (*TokenInfo, error) {
 		lastUsedAt  sql.NullTime
 		expiresAt   sql.NullTime
 		enabled     bool
+		tokenHash   string
 	)
 
 	err := am.db.QueryRow(`
-		SELECT name, description, permissions, created_at, last_used_at, expires_at, enabled
+		SELECT name, description, permissions, created_at, last_used_at, expires_at, enabled, token_hash
 		FROM api_tokens WHERE id = ?
-	`, id).Scan(&name, &description, &permissions, &createdAt, &lastUsedAt, &expiresAt, &enabled)
+	`, id).Scan(&name, &description, &permissions, &createdAt, &lastUsedAt, &expiresAt, &enabled, &tokenHash)
 
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1108,6 +1142,7 @@ func (am *AuthManager) GetTokenByID(id int64) (*TokenInfo, error) {
 		Permissions: []string{}, // empty by default for RBAC-only tokens
 		CreatedAt:   createdAt,
 		Enabled:     enabled,
+		Fingerprint: tokenFingerprint(tokenHash),
 	}
 	if permissions.Valid && permissions.String != "" {
 		info.Permissions = strings.Split(permissions.String, ",")
@@ -1547,6 +1582,7 @@ func (am *AuthManager) InvalidateCache() {
 	am.cacheMu.Lock()
 	cleared := len(am.cache)
 	am.cache = make(map[string]cacheEntry)
+	am.idCache = make(map[int64]cacheEntry)
 	am.cacheMu.Unlock()
 
 	am.logger.Info().Int("cleared", cleared).Msg("Token cache invalidated")

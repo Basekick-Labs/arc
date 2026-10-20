@@ -11,11 +11,11 @@ import (
 
 type acceptingChecker struct{}
 
-func (acceptingChecker) VerifyForwardIdentity(values cluster.ForwardIdentityHeaderValues, _, _ string) (bool, int64, error) {
+func (acceptingChecker) VerifyForwardIdentity(values cluster.ForwardIdentityHeaderValues, _, _ string) (bool, cluster.ForwardToken, error) {
 	if len(values("X-Arc-Forward-Hmac")) == 0 {
-		return false, 0, nil
+		return false, cluster.ForwardToken{}, nil
 	}
-	return true, 7, nil
+	return true, cluster.ForwardToken{ID: 7, Fingerprint: "f"}, nil
 }
 
 // A verified forwarded identity is accepted only on the routes a peer
@@ -24,7 +24,7 @@ func TestForwardIdentityVerifier_OnlyOnForwardedRoutes(t *testing.T) {
 	verify := ForwardIdentityVerifier(acceptingChecker{})
 	app := fiber.New()
 	app.All("/*", func(c *fiber.Ctx) error {
-		present, id, err := verify(c)
+		present, id, _, err := verify(c)
 		switch {
 		case !present:
 			return c.SendString("absent")
@@ -86,20 +86,20 @@ func TestBuildHTTPRequest_StripsForwardIdentityHeaders(t *testing.T) {
 // verified, which the router asserts to the peer.
 func TestBuildHTTPRequest_CarriesVerifiedTokenID(t *testing.T) {
 	app := fiber.New()
-	var got int64 = -1
+	var got cluster.ForwardToken
 	app.Post("/w", func(c *fiber.Ctx) error {
-		c.Locals("token_info", &auth.TokenInfo{ID: 42})
+		c.Locals("token_info", &auth.TokenInfo{ID: 42, Fingerprint: "fp"})
 		req, err := BuildHTTPRequest(c)
 		if err != nil {
 			return err
 		}
-		got = cluster.ForwardTokenID(req.Context())
+		got = cluster.ForwardTokenOf(req.Context())
 		return nil
 	})
 	if _, err := app.Test(httptest.NewRequest("POST", "/w", nil), -1); err != nil {
 		t.Fatal(err)
 	}
-	if got != 42 {
-		t.Fatalf("token id %d, want 42", got)
+	if got != (cluster.ForwardToken{ID: 42, Fingerprint: "fp"}) {
+		t.Fatalf("token %+v, want 42/fp", got)
 	}
 }

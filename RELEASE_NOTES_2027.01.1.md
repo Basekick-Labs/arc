@@ -1359,7 +1359,10 @@ older peers keep receiving the credential, so a rolling upgrade keeps
 working, and the credential stops crossing the hop once every node is
 upgraded. A cluster without Raft (where each node keeps its own tokens)
 forwards the credential as before. A node with authentication disabled
-cannot forward to a peer that has it enabled: the peer answers `401`.
+cannot forward to a peer that has it enabled: the peer answers `401`. The
+signed identity is valid for 30 seconds, so the clocks of a cluster's nodes
+must agree within that for forwarded requests to be accepted (joins already
+require 5 minutes).
 
 ### In shared storage, a DELETE no longer leaves rows another writer has not flushed ([#1265](https://github.com/Basekick-Labs/arc/issues/1265))
 

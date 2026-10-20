@@ -23,11 +23,11 @@ func TestForwardedIdentityHonoursRequiredPermission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	id := am.VerifyToken(tok).ID
+	info := am.VerifyToken(tok)
 	for perm, want := range map[string]int{"admin": 403, "write": 204} {
 		app := fiber.New()
 		app.Use(NewMiddleware(MiddlewareConfig{AuthManager: am, RequiredPermission: perm,
-			ForwardIdentity: func(*fiber.Ctx) (bool, int64, error) { return true, id, nil }}))
+			ForwardIdentity: func(*fiber.Ctx) (bool, int64, string, error) { return true, info.ID, info.Fingerprint, nil }}))
 		app.Post("/x", func(c *fiber.Ctx) error { return c.SendStatus(204) })
 		resp, err := app.Test(httptest.NewRequest("POST", "/x", nil), -1)
 		if err != nil {

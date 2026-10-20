@@ -20,10 +20,10 @@ import (
 // assertion and authorizes the request as that token (its permissions and
 // RBAC grants, which Raft replicates to every node under the same ID).
 //
-// The MAC binds everything the receiver acts on: who forwarded it and to
-// whom, the cluster, the token, the method and request URI as sent, the
-// database and measurement headers RBAC reads, and the content headers that
-// decide how the body is decoded. The body itself is not bound: imports
+// The MAC binds who forwarded it and to whom, the cluster, the token (ID
+// and fingerprint), the method and request URI as sent, the database and
+// measurement headers, and the content headers that decide how the body is
+// decoded. The body itself (a query's SQL, a write's rows) is not bound: imports
 // stream multi-gigabyte bodies that would have to be buffered to hash, and
 // substituting a body needs an active man-in-the-middle on the hop, which the
 // cluster's TLS settings address. A short tolerance with a replay cache keeps
@@ -46,6 +46,7 @@ const (
 	HeaderForwardTarget      = "X-Arc-Forward-Target"
 	HeaderForwardCluster     = "X-Arc-Forward-Cluster"
 	HeaderForwardTokenID     = "X-Arc-Forward-Token-Id"
+	HeaderForwardTokenFP     = "X-Arc-Forward-Token-Fp"
 	HeaderForwardTimestamp   = "X-Arc-Forward-Timestamp"
 	HeaderForwardNonce       = "X-Arc-Forward-Nonce"
 	HeaderForwardHMAC        = "X-Arc-Forward-Hmac"
@@ -54,16 +55,20 @@ const (
 
 // ForwardIdentityHeaders lists every assertion header.
 var ForwardIdentityHeaders = []string{
-	HeaderForwardNode, HeaderForwardTarget, HeaderForwardCluster, HeaderForwardTokenID,
+	HeaderForwardNode, HeaderForwardTarget, HeaderForwardCluster, HeaderForwardTokenID, HeaderForwardTokenFP,
 	HeaderForwardTimestamp, HeaderForwardNonce, HeaderForwardHMAC,
 }
 
 // ForwardIdentity is what a forwarding node asserts about a request.
 type ForwardIdentity struct {
-	NodeID     string // the forwarding node
-	TargetID   string // the node it is sent to
-	Cluster    string
-	TokenID    int64 // the caller's token; 0 when auth is off on the forwarder
+	NodeID   string // the forwarding node
+	TargetID string // the node it is sent to
+	Cluster  string
+	TokenID  int64 // the caller's token; 0 when auth is off on the forwarder
+	// TokenFP is the token's fingerprint (auth.TokenInfo.Fingerprint): the
+	// ID alone can name a different token on a node that kept a pre-26.06.1
+	// local row at that ID.
+	TokenFP    string
 	Method     string
 	RequestURI string // path and query exactly as sent
 	// Headers the receiver acts on.
@@ -77,7 +82,7 @@ type ForwardIdentity struct {
 
 func (f ForwardIdentity) fields() []string {
 	return []string{
-		f.NodeID, f.TargetID, f.Cluster, strconv.FormatInt(f.TokenID, 10),
+		f.NodeID, f.TargetID, f.Cluster, strconv.FormatInt(f.TokenID, 10), f.TokenFP,
 		f.Method, f.RequestURI, f.Database, f.Measurement, f.ContentType, f.ContentEncoding,
 		strconv.FormatInt(f.Timestamp, 10), f.Nonce,
 	}
@@ -120,8 +125,16 @@ const forwardNonceShards = 32
 
 type forwardNonceShard struct {
 	mu        sync.Mutex
-	cur, prev map[string]struct{}
+	cur, prev map[forwardNonceKey]struct{}
 	rotated   time.Time
+}
+
+// forwardNonceKey is a node's nonce: a 64-bit hash of the node ID and the
+// nonce's 32 bytes. Fixed size and pointer-free, so a cache of a million
+// entries is ~40 MB the garbage collector never scans.
+type forwardNonceKey struct {
+	node  uint64
+	nonce [32]byte
 }
 
 // NewForwardNonceCache builds a cache for MACs accepted within tolerance.
@@ -129,14 +142,15 @@ func NewForwardNonceCache(tolerance time.Duration) *ForwardNonceCache {
 	c := &ForwardNonceCache{ttl: 2*tolerance + time.Second, seed: maphash.MakeSeed(), now: time.Now}
 	now := c.now()
 	for i := range c.shards {
-		c.shards[i].cur = make(map[string]struct{})
+		c.shards[i].cur = make(map[forwardNonceKey]struct{})
 		c.shards[i].rotated = now
 	}
 	return c
 }
 
-// Track records a nonce and reports whether it is new. A nil cache reports
-// false, so a missing cache fails closed.
+// Track records a nonce and reports whether it is new. A nil cache, or a
+// nonce that is not 64 hex characters (GenerateNonce), reports false, so
+// either fails closed.
 //
 // Why every entry lives at least ttl: a shard rotates only on a Track at
 // least ttl after its previous rotation r, so cur only ever holds entries
@@ -148,8 +162,15 @@ func (c *ForwardNonceCache) Track(nodeID, nonce string) bool {
 	if c == nil {
 		return false
 	}
-	key := nodeID + "\x00" + nonce
-	s := &c.shards[maphash.String(c.seed, key)%forwardNonceShards]
+	var key forwardNonceKey
+	if len(nonce) != 64 {
+		return false
+	}
+	if _, err := hex.Decode(key.nonce[:], []byte(nonce)); err != nil {
+		return false
+	}
+	key.node = maphash.String(c.seed, nodeID)
+	s := &c.shards[(key.node^uint64(key.nonce[0]))%forwardNonceShards]
 	now := c.now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -159,7 +180,7 @@ func (c *ForwardNonceCache) Track(nodeID, nonce string) bool {
 		} else {
 			s.prev = s.cur
 		}
-		s.cur = make(map[string]struct{}, len(s.cur))
+		s.cur = make(map[forwardNonceKey]struct{}, len(s.cur))
 		s.rotated = now
 	}
 	if _, ok := s.cur[key]; ok {

@@ -20,23 +20,31 @@ const CapabilityForwardIdentity = "forward_identity_v1"
 
 type forwardTokenKey struct{}
 
-// WithForwardTokenID records, on the context of a request about to be
-// forwarded, the ID of the token the forwarding node verified for it; 0 when
-// auth is off. Carried in the context, not a header, so it cannot reach the
-// wire on a path that skips the router.
-func WithForwardTokenID(ctx context.Context, id int64) context.Context {
-	return context.WithValue(ctx, forwardTokenKey{}, id)
+// ForwardToken is the token the forwarding node verified for a request: its
+// ID and fingerprint (auth.TokenInfo); zero when auth is off.
+type ForwardToken struct {
+	ID          int64
+	Fingerprint string
 }
 
-func forwardTokenID(ctx context.Context) int64 {
-	id, _ := ctx.Value(forwardTokenKey{}).(int64)
-	return id
+// WithForwardToken records, on the context of a request about to be
+// forwarded, the token the forwarding node verified for it. Carried in the
+// context, not a header, so it cannot reach the wire on a path that skips
+// the router.
+func WithForwardToken(ctx context.Context, t ForwardToken) context.Context {
+	return context.WithValue(ctx, forwardTokenKey{}, t)
+}
+
+// ForwardTokenOf returns the token WithForwardToken recorded.
+func ForwardTokenOf(ctx context.Context) ForwardToken {
+	t, _ := ctx.Value(forwardTokenKey{}).(ForwardToken)
+	return t
 }
 
 // credentialHeaders are the request headers that can carry a caller's
 // credential (auth.ExtractTokenFromRequest reads Authorization and
 // X-Api-Key; Cookie is never read by Arc but is a credential by nature).
-var credentialHeaders = []string{"Authorization", "X-Api-Key", "Cookie", "Proxy-Authorization"}
+var credentialHeaders = []string{"Authorization", "X-Api-Key", "Cookie"}
 
 // credentialQueryParams are the query parameters that can carry one: `p` is
 // the InfluxDB 1.x token parameter Arc reads; `u` is its user name.
@@ -85,7 +93,7 @@ func removeForwardIdentityHeaders(h http.Header) {
 // a client sent are always removed; to a peer that authenticates forwarded
 // requests by identity, the caller's credential is removed and the signed
 // identity added. Called for every attempt, so a retry is signed afresh.
-func (r *Router) signForward(req *http.Request, node *Node, tokenID int64) error {
+func (r *Router) signForward(req *http.Request, node *Node, tok ForwardToken) error {
 	removeForwardIdentityHeaders(req.Header)
 	if r.cfg.PeerForwardIdentity == nil || r.cfg.SharedSecret == "" || !r.cfg.PeerForwardIdentity(node.ID) {
 		return nil
@@ -102,7 +110,8 @@ func (r *Router) signForward(req *http.Request, node *Node, tokenID int64) error
 		NodeID:          r.cfg.LocalNode.ID,
 		TargetID:        node.ID,
 		Cluster:         r.cfg.ClusterName,
-		TokenID:         tokenID,
+		TokenID:         tok.ID,
+		TokenFP:         tok.Fingerprint,
 		Method:          req.Method,
 		RequestURI:      req.URL.RequestURI(),
 		Database:        req.Header.Get("X-Arc-Database"),
@@ -116,6 +125,7 @@ func (r *Router) signForward(req *http.Request, node *Node, tokenID int64) error
 	req.Header.Set(security.HeaderForwardTarget, f.TargetID)
 	req.Header.Set(security.HeaderForwardCluster, f.Cluster)
 	req.Header.Set(security.HeaderForwardTokenID, strconv.FormatInt(f.TokenID, 10))
+	req.Header.Set(security.HeaderForwardTokenFP, f.TokenFP)
 	req.Header.Set(security.HeaderForwardTimestamp, strconv.FormatInt(f.Timestamp, 10))
 	req.Header.Set(security.HeaderForwardNonce, f.Nonce)
 	req.Header.Set(security.HeaderForwardHMAC, security.ComputeForwardIdentityHMAC(r.cfg.SharedSecret, f))
@@ -123,8 +133,9 @@ func (r *Router) signForward(req *http.Request, node *Node, tokenID int64) error
 }
 
 // peerForwardIdentity reports whether node authenticates forwarded requests
-// by identity. Needs Raft: a token's ID is its Raft log index, the same on
-// every node, and without Raft each node has its own tokens. A peer missing
+// by identity. Needs Raft: a token created through Raft has its log index as
+// ID on every node (the fingerprint catches a node that kept a different
+// local token at that ID); without Raft each node has its own tokens. A peer missing
 // from the FSM is treated as capable: the forward then fails closed (401) on
 // an older build instead of handing it the credential.
 func (c *Coordinator) peerForwardIdentity(nodeID string) bool {
@@ -151,7 +162,7 @@ type ForwardIdentityHeaderValues func(name string) []string
 // request a forwarded one: every header must then be present exactly once and
 // verify, or err is set; the caller answers 401 and never falls back to
 // another credential.
-func (c *Coordinator) VerifyForwardIdentity(values ForwardIdentityHeaderValues, method, requestURI string) (present bool, tokenID int64, err error) {
+func (c *Coordinator) VerifyForwardIdentity(values ForwardIdentityHeaderValues, method, requestURI string) (present bool, tok ForwardToken, err error) {
 	got := make(map[string]string, len(security.ForwardIdentityHeaders))
 	for _, h := range security.ForwardIdentityHeaders {
 		v := values(h)
@@ -163,31 +174,40 @@ func (c *Coordinator) VerifyForwardIdentity(values ForwardIdentityHeaderValues, 
 		}
 	}
 	if !present {
-		return false, 0, nil
+		return false, ForwardToken{}, nil
+	}
+	// The token fingerprint is empty when auth is off on the forwarder; every
+	// other header must carry a value.
+	if fp := values(security.HeaderForwardTokenFP); len(fp) == 1 && fp[0] == "" {
+		got[security.HeaderForwardTokenFP] = ""
 	}
 	if len(got) != len(security.ForwardIdentityHeaders) {
-		return true, 0, security.ErrForwardIdentity
+		return true, ForwardToken{}, security.ErrForwardIdentity
 	}
 	if c.raftNode == nil || c.cfg.SharedSecret == "" {
-		return true, 0, security.ErrForwardIdentity
+		return true, ForwardToken{}, security.ErrForwardIdentity
 	}
 	node := got[security.HeaderForwardNode]
+	// The loop marker names the same sender, so a peer can trust it.
+	if by := values("X-Arc-Forwarded-By"); len(by) != 1 || by[0] != node {
+		return true, ForwardToken{}, security.ErrForwardIdentity
+	}
 	if got[security.HeaderForwardCluster] != c.cfg.ClusterName ||
 		got[security.HeaderForwardTarget] != c.localNode.ID || node == c.localNode.ID {
-		return true, 0, security.ErrForwardIdentity
+		return true, ForwardToken{}, security.ErrForwardIdentity
 	}
 	// Only a member of this cluster forwards (the same gate as forward-apply).
 	fsm := c.raftNode.FSM()
 	if fsm == nil {
-		return true, 0, security.ErrForwardIdentity
+		return true, ForwardToken{}, security.ErrForwardIdentity
 	}
 	if _, ok := fsm.GetNode(node); !ok {
-		return true, 0, security.ErrForwardIdentity
+		return true, ForwardToken{}, security.ErrForwardIdentity
 	}
 	ts, err1 := strconv.ParseInt(got[security.HeaderForwardTimestamp], 10, 64)
 	tokenID, err2 := strconv.ParseInt(got[security.HeaderForwardTokenID], 10, 64)
 	if err1 != nil || err2 != nil || tokenID < 0 {
-		return true, 0, security.ErrForwardIdentity
+		return true, ForwardToken{}, security.ErrForwardIdentity
 	}
 	single := func(name string) string {
 		v := values(name)
@@ -198,7 +218,7 @@ func (c *Coordinator) VerifyForwardIdentity(values ForwardIdentityHeaderValues, 
 	}
 	for _, h := range []string{"X-Arc-Database", "X-Arc-Measurement", "Content-Type", "Content-Encoding"} {
 		if len(values(h)) > 1 {
-			return true, 0, security.ErrForwardIdentity
+			return true, ForwardToken{}, security.ErrForwardIdentity
 		}
 	}
 	f := security.ForwardIdentity{
@@ -206,6 +226,7 @@ func (c *Coordinator) VerifyForwardIdentity(values ForwardIdentityHeaderValues, 
 		TargetID:        c.localNode.ID,
 		Cluster:         c.cfg.ClusterName,
 		TokenID:         tokenID,
+		TokenFP:         got[security.HeaderForwardTokenFP],
 		Method:          method,
 		RequestURI:      requestURI,
 		Database:        single("X-Arc-Database"),
@@ -216,14 +237,11 @@ func (c *Coordinator) VerifyForwardIdentity(values ForwardIdentityHeaderValues, 
 		Nonce:           got[security.HeaderForwardNonce],
 	}
 	if security.ValidateForwardIdentityHMAC(c.cfg.SharedSecret, f, got[security.HeaderForwardHMAC], security.ForwardIdentityTolerance) != nil {
-		return true, 0, security.ErrForwardIdentity
+		return true, ForwardToken{}, security.ErrForwardIdentity
 	}
 	// After the MAC, so an unauthenticated sender cannot fill the cache.
 	if !c.forwardNonces.Track(node, f.Nonce) {
-		return true, 0, security.ErrForwardIdentity
+		return true, ForwardToken{}, security.ErrForwardIdentity
 	}
-	return true, tokenID, nil
+	return true, ForwardToken{ID: tokenID, Fingerprint: f.TokenFP}, nil
 }
-
-// ForwardTokenID returns the token ID WithForwardTokenID recorded, 0 if none.
-func ForwardTokenID(ctx context.Context) int64 { return forwardTokenID(ctx) }

@@ -398,7 +398,7 @@ func (r *Router) doForwardOnce(ctx context.Context, client *http.Client, node *N
 	forwardReq.Header.Set("X-Forwarded-For", originalReq.RemoteAddr)
 	forwardReq.Header.Set("X-Arc-Forwarded-By", r.cfg.LocalNode.ID)
 	forwardReq.Header.Set("X-Arc-Original-Host", originalReq.Host)
-	if err := r.signForward(forwardReq, node, forwardTokenID(originalReq.Context())); err != nil {
+	if err := r.signForward(forwardReq, node, ForwardTokenOf(originalReq.Context())); err != nil {
 		return nil, fmt.Errorf("failed to sign forward request: %w", err)
 	}
 	return client.Do(forwardReq)
@@ -588,7 +588,7 @@ func (r *Router) doForward(ctx context.Context, client *http.Client, node *Node,
 	forwardReq.Header.Set("X-Forwarded-For", originalReq.RemoteAddr)
 	forwardReq.Header.Set("X-Arc-Forwarded-By", r.cfg.LocalNode.ID)
 	forwardReq.Header.Set("X-Arc-Original-Host", originalReq.Host)
-	if err := r.signForward(forwardReq, node, forwardTokenID(originalReq.Context())); err != nil {
+	if err := r.signForward(forwardReq, node, ForwardTokenOf(originalReq.Context())); err != nil {
 		return nil, fmt.Errorf("failed to sign forward request: %w", err)
 	}
 
