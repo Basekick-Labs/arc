@@ -287,13 +287,14 @@ func TestForwardIdentity_Rejections(t *testing.T) {
 		"duplicate mac": r.signed("reader-A", "writer-W", r.writeID, func(q *http.Request) {
 			q.Header.Add(security.HeaderForwardHMAC, q.Header.Get(security.HeaderForwardHMAC))
 		}),
-		"missing nonce":   r.signed("reader-A", "writer-W", r.writeID, func(q *http.Request) { q.Header.Del(security.HeaderForwardNonce) }),
-		"other target":    r.signed("reader-A", "writer-old", r.writeID, nil),
-		"self as sender":  r.signed("writer-W", "writer-W", r.writeID, nil),
-		"unknown sender":  r.signed("ghost", "writer-W", r.writeID, nil),
-		"revoked token":   r.signed("reader-A", "writer-W", offID, nil),
-		"unknown token":   r.signed("reader-A", "writer-W", 999999, nil),
-		"no caller token": r.signed("reader-A", "writer-W", 0, nil),
+		"duplicate database": r.signed("reader-A", "writer-W", r.writeID, func(q *http.Request) { q.Header.Add("X-Arc-Database", "b") }),
+		"missing nonce":      r.signed("reader-A", "writer-W", r.writeID, func(q *http.Request) { q.Header.Del(security.HeaderForwardNonce) }),
+		"other target":       r.signed("reader-A", "writer-old", r.writeID, nil),
+		"self as sender":     r.signed("writer-W", "writer-W", r.writeID, nil),
+		"unknown sender":     r.signed("ghost", "writer-W", r.writeID, nil),
+		"revoked token":      r.signed("reader-A", "writer-W", offID, nil),
+		"unknown token":      r.signed("reader-A", "writer-W", 999999, nil),
+		"no caller token":    r.signed("reader-A", "writer-W", 0, nil),
 		"wrong secret": r.signed("reader-A", "writer-W", r.writeID, func(q *http.Request) {
 			q.Header.Set(security.HeaderForwardHMAC, strings.Repeat("ab", 32))
 		}),
