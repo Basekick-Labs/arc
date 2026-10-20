@@ -103,3 +103,31 @@ func TestBuildHTTPRequest_CarriesVerifiedTokenID(t *testing.T) {
 		t.Fatalf("token %+v, want 42/fp", got)
 	}
 }
+
+type uriRecorder struct{ uri string }
+
+func (u *uriRecorder) VerifyForwardIdentity(_ cluster.ForwardIdentityHeaderValues, _, uri string) (bool, cluster.ForwardToken, error) {
+	u.uri = uri
+	return false, cluster.ForwardToken{}, nil
+}
+
+// The identity is checked against the request URI as received, which is what
+// the peer signed, even after earlier middleware parsed the query (fasthttp
+// then rebuilds RequestURI() from the parsed form).
+func TestForwardIdentityVerifier_ChecksTheRawRequestURI(t *testing.T) {
+	rec := &uriRecorder{}
+	verify := ForwardIdentityVerifier(rec)
+	app := fiber.New()
+	app.Use(func(c *fiber.Ctx) error { _ = c.Query("db"); return c.Next() })
+	app.Post("/api/v1/write/msgpack", func(c *fiber.Ctx) error {
+		_, _, _, _ = verify(c)
+		return nil
+	})
+	const uri = "/api/v1/write/msgpack?db=a&s=a%20b&&c=%2B&e=%zz"
+	if _, err := app.Test(httptest.NewRequest("POST", uri, nil), -1); err != nil {
+		t.Fatal(err)
+	}
+	if rec.uri != uri {
+		t.Fatalf("checked %q, the peer signed %q", rec.uri, uri)
+	}
+}
