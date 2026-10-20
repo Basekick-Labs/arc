@@ -66,7 +66,8 @@ queries and in `DELETE` predicates, and the checks Arc runs on query text now
 read it the way DuckDB does in more cases. A stored continuous query that is
 not a read statement fails its runs from this release.
 
-Thanks to [@rexpository](https://github.com/rexpository) for the report.
+Full technical detail will accompany the corresponding security advisory once it
+is published. Responsibly reported by **[@rexpository](https://github.com/rexpository)**.
 
 ## Upgrade note: three configurations now refuse to start
 
