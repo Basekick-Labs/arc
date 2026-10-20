@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -284,6 +285,51 @@ func TestFlushOneBatchSkipsUnstoredColumn(t *testing.T) {
 	_, has := files[0].types["_x"]
 	require.False(t, has, "_x was stored")
 	require.Equal(t, []interface{}{1.0}, files[0].cols["v"])
+}
+
+func TestSyncFlushSplitsStringColumnsAcrossFiles(t *testing.T) {
+	r := newFlushRig(t, nil)
+	ctx := context.Background()
+	base := time.Date(2026, 10, 20, 10, 0, 0, 0, time.UTC).UnixMicro()
+	values := []string{"abc", "de", "klmn", "o", "pqrst"}
+	for i, value := range values {
+		record := &models.ColumnarRecord{
+			Measurement: "m",
+			Columnar:    true,
+			Columns: map[string][]interface{}{
+				"time":  {base + int64(i)},
+				"value": {int64(i)},
+				"text":  {value},
+			},
+		}
+		require.NoError(t, r.buf.WriteColumnarRecord(ctx, "db", record))
+	}
+
+	shard := r.buf.shards[0]
+	shard.mu.Lock()
+	err := r.buf.flushBufferLockedWithStringLimit(ctx, shard, "db/m", "db", "m", 5)
+	shard.mu.Unlock()
+	require.NoError(t, err)
+
+	files := r.files(t)
+	require.Len(t, files, 3, "the five rows should be grouped into three bounded string batches")
+	got := make(map[int64]string)
+	for _, file := range files {
+		textValues := file.cols["text"]
+		var textBytes int
+		for _, value := range textValues {
+			textBytes += len(value.(string))
+		}
+		require.LessOrEqual(t, textBytes, 5)
+		times := file.cols["time"]
+		for i, value := range textValues {
+			got[times[i].(int64)] = value.(string)
+		}
+	}
+	require.Len(t, got, len(values))
+	for i, value := range values {
+		require.Equal(t, value, got[base+int64(i)])
+	}
 }
 
 func writerColumns(rows int) map[string]interface{} {

@@ -3,7 +3,65 @@ package ingest
 import (
 	"context"
 	"testing"
+	"time"
 )
+
+func TestSplitFlushRecordsByStringColumnBytes(t *testing.T) {
+	b := &ArrowBuffer{}
+	records := []interface{}{
+		&TypedColumnBatch{Data: map[string]interface{}{"time": []int64{1}, "left": []string{"1234"}}, WALHashes: []string{"wal-1"}},
+		&TypedColumnBatch{Data: map[string]interface{}{"time": []int64{2}, "right": []string{"5678"}}, WALHashes: []string{"wal-2"}},
+	}
+	if parts := b.splitFlushRecordsByStringBytes("db/cpu", records, 5); parts != nil {
+		t.Fatalf("different string columns should not be added together: got %d parts", len(parts))
+	}
+
+	records = append(records, &TypedColumnBatch{Data: map[string]interface{}{"time": []int64{3}, "left": []string{"99"}}, WALHashes: []string{"wal-3"}})
+	parts := b.splitFlushRecordsByStringBytes("db/cpu", records, 5)
+	if len(parts) != 2 || parts[0].rows != 2 || parts[1].rows != 1 {
+		t.Fatalf("parts = %+v, want two parts with 2 and 1 rows", parts)
+	}
+	if len(parts[0].walHashes) != 2 || parts[0].walHashes[0] != "wal-1" || parts[0].walHashes[1] != "wal-2" || len(parts[1].walHashes) != 1 || parts[1].walHashes[0] != "wal-3" {
+		t.Fatalf("part WAL hashes = %v and %v", parts[0].walHashes, parts[1].walHashes)
+	}
+}
+
+func TestAsyncFlushSplitsStringColumnsAndKeepsCoverage(t *testing.T) {
+	reg := &coverageRegistrar{}
+	b, _ := newCoverageBuffer(t, 1000, reg)
+	base := time.Date(2026, 10, 20, 10, 0, 0, 0, time.UTC).UnixMicro()
+	values := []string{"abc", "de", "klmn", "o", "pqrst"}
+	records := make([]interface{}, 0, len(values))
+	for i, value := range values {
+		records = append(records, &TypedColumnBatch{
+			Data: map[string]interface{}{
+				"time":  []int64{base + int64(i)},
+				"value": []float64{float64(i)},
+				"text":  []string{value},
+			},
+			Coverage: []CoveragePiece{{Instance: 7, CSeq: uint64(i + 1)}},
+		})
+	}
+	group := b.newFlushGroup("db/cpu", records, nil)
+	if err := b.flushRecordsAsyncWithStringLimit(context.Background(), "db/cpu", "db", "cpu", records, len(values), nil, group, 5); err != nil {
+		t.Fatal(err)
+	}
+
+	files := reg.snapshot()
+	if len(files) != 3 {
+		t.Fatalf("registered %d files, want 3 bounded groups", len(files))
+	}
+	want := [][2]uint64{{1, 2}, {3, 4}, {5, 5}}
+	for i, file := range files {
+		ranges, partial, exact := file.cov.FilePieces()
+		if !exact || len(partial) != 0 || len(ranges) != 1 || ranges[0].Lo != want[i][0] || ranges[0].Hi != want[i][1] {
+			t.Fatalf("file %d coverage = ranges %v partial %v exact %v; want cseqs %v", i, ranges, partial, exact, want[i])
+		}
+		if file.cov.Files != 1 {
+			t.Fatalf("file %d belongs to a %d-file group, want 1", i, file.cov.Files)
+		}
+	}
+}
 
 // A flush puts batches another writer claimed and batches nobody claimed in
 // separate files, each with its own coverage.
