@@ -85,6 +85,9 @@ func newFwdRig(t *testing.T) *fwdRig {
 	r := &fwdRig{t: t, coord: coord, am: am, writeTok: tok, writeID: info.ID, writeFP: info.Fingerprint}
 
 	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	// Middleware ahead of auth that reads the query, as the server's own
+	// does: fasthttp then rebuilds RequestURI() from the parsed form.
+	app.Use(func(c *fiber.Ctx) error { _ = c.Query("db"); return c.Next() })
 	app.Use(auth.NewMiddleware(auth.MiddlewareConfig{
 		AuthManager: am,
 		ForwardIdentity: func(c *fiber.Ctx) (bool, int64, string, error) {
@@ -164,7 +167,7 @@ func freeTCPAddr(t *testing.T) string {
 // clientRequest is a write as a client sends it to reader-A, every
 // credential carrier filled in, plus a spoofed assertion header.
 func (r *fwdRig) clientRequest(tok ForwardToken) *http.Request {
-	req, _ := http.NewRequest("POST", "http://reader-a/api/v1/write/msgpack?db=a&p="+r.writeTok+"&z=1&u=me&b=2", bytes.NewReader([]byte("body")))
+	req, _ := http.NewRequest("POST", "http://reader-a/api/v1/write/msgpack?db=a&p="+r.writeTok+"&z=1&u=me&b=2&s=a%20b&&c=%2B", bytes.NewReader([]byte("body")))
 	req.Header.Set("Authorization", "Bearer "+r.writeTok)
 	req.Header.Set("X-Api-Key", r.writeTok)
 	req.Header.Set("Cookie", "session="+r.writeTok)
@@ -192,7 +195,7 @@ func TestForwardIdentity_PeerSeesIdentityNotCredential(t *testing.T) {
 	if r.last.authorization != "" || r.last.apiKey != "" || r.last.cookie != "" {
 		t.Fatalf("credential reached the peer: %+v", r.last)
 	}
-	if r.last.rawQuery != "db=a&z=1&b=2" {
+	if r.last.rawQuery != "db=a&z=1&b=2&s=a%20b&&c=%2B" {
 		t.Fatalf("query %q: credential parameters must go, the rest keep their order", r.last.rawQuery)
 	}
 	for k, v := range r.last.headers {

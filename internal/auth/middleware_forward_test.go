@@ -38,3 +38,44 @@ func TestForwardedIdentityHonoursRequiredPermission(t *testing.T) {
 		}
 	}
 }
+
+// The by-ID cache of forwarded tokens is cleared when a token changes and
+// expires like the token cache.
+func TestTokenForForward_CacheFollowsTokenChanges(t *testing.T) {
+	am, err := NewAuthManager(filepath.Join(t.TempDir(), "a.db"), 20*time.Millisecond, 10, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer am.Close()
+	tok, err := am.CreateToken(context.Background(), "w", "", "write", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := am.VerifyToken(tok)
+	if am.TokenForForward(info.ID, info.Fingerprint) == nil {
+		t.Fatal("valid token refused")
+	}
+	if am.TokenForForward(info.ID, "other") != nil {
+		t.Fatal("another fingerprint accepted")
+	}
+	// A change made behind the cache is seen once the entry expires.
+	if _, err := am.GetDB().Exec(`UPDATE api_tokens SET enabled = 0 WHERE id = ?`, info.ID); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(40 * time.Millisecond)
+	if am.TokenForForward(info.ID, info.Fingerprint) != nil {
+		t.Fatal("disabled token still served from the cache")
+	}
+	// A revocation through the manager is seen at once.
+	tok2, _ := am.CreateToken(context.Background(), "w2", "", "write", nil)
+	info2 := am.VerifyToken(tok2)
+	if am.TokenForForward(info2.ID, info2.Fingerprint) == nil {
+		t.Fatal("valid token refused")
+	}
+	if err := am.RevokeToken(context.Background(), info2.ID); err != nil {
+		t.Fatal(err)
+	}
+	if am.TokenForForward(info2.ID, info2.Fingerprint) != nil {
+		t.Fatal("revoked token still served from the cache")
+	}
+}
