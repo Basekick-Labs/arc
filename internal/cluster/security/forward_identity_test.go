@@ -81,3 +81,26 @@ func TestForwardNonceCache_RemembersForTheWholeWindow(t *testing.T) {
 		t.Fatal("a nil cache must fail closed")
 	}
 }
+
+// An entry added just before its shard rotates is remembered for a whole
+// ttl after the rotation, not dropped by the next one.
+func TestForwardNonceCache_EntryAddedBeforeRotation(t *testing.T) {
+	c := NewForwardNonceCache(ForwardIdentityTolerance)
+	t0 := time.Unix(1000, 0)
+	now := t0
+	c.now = func() time.Time { return now }
+	for i := range c.shards {
+		c.shards[i].rotated = t0
+	}
+	ttl := 2*ForwardIdentityTolerance + time.Second
+	now = t0.Add(ttl/2 - time.Millisecond)
+	if !c.Track("a", "x") {
+		t.Fatal("new")
+	}
+	for _, at := range []time.Duration{ttl/2 + time.Millisecond, ttl + time.Millisecond, ttl + ttl/2 - 2*time.Millisecond} {
+		now = t0.Add(at)
+		if c.Track("a", "x") {
+			t.Fatalf("forgotten at %v, seen at %v", at, ttl/2-time.Millisecond)
+		}
+	}
+}

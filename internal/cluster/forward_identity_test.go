@@ -3,6 +3,7 @@ package cluster
 import (
 	"bytes"
 	"context"
+	"io"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -94,7 +95,7 @@ func newFwdRig(t *testing.T) *fwdRig {
 			}, c.Method(), string(c.Request().RequestURI()))
 		},
 	}))
-	app.Post("/api/v1/write/msgpack", func(c *fiber.Ctx) error {
+	record := func(c *fiber.Ctx) error {
 		s := &seen{
 			authorization: c.Get("Authorization"),
 			apiKey:        c.Get("X-Api-Key"),
@@ -108,7 +109,9 @@ func newFwdRig(t *testing.T) *fwdRig {
 		c.Request().Header.VisitAll(func(k, v []byte) { s.headers.Add(string(k), string(v)) })
 		r.last = s
 		return c.SendStatus(fiber.StatusNoContent)
-	})
+	}
+	app.Post("/api/v1/write/msgpack", record)
+	app.Post("/api/v1/query", record)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -341,5 +344,52 @@ func TestForwardIdentity_UnknownPeerGetsIdentity(t *testing.T) {
 	noRaft := &Coordinator{cfg: &config.ClusterConfig{SharedSecret: fwdSecret}}
 	if noRaft.peerForwardIdentity("writer-W") {
 		t.Fatal("without Raft token IDs differ per node: forward the credential")
+	}
+}
+
+// A forwarded query (the retrying path) is signed too.
+func TestForwardIdentity_QueryForwardSigned(t *testing.T) {
+	r := newFwdRig(t)
+	req, _ := http.NewRequest("POST", "http://compactor/api/v1/query", bytes.NewReader([]byte(`{"sql":"SELECT 1"}`)))
+	req.Header.Set("Authorization", "Bearer "+r.writeTok)
+	req = req.WithContext(WithForwardTokenID(context.Background(), r.writeID))
+	resp, err := r.router.forwardRequest(context.Background(), r.target, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 204 || r.last.tokenID != r.writeID || r.last.authorization != "" {
+		t.Fatalf("status %d seen %+v", resp.StatusCode, r.last)
+	}
+}
+
+// An expired token and a forward from a node without auth are refused, the
+// latter saying why.
+func TestForwardIdentity_ExpiredTokenAndNoCaller(t *testing.T) {
+	r := newFwdRig(t)
+	past := time.Now().Add(-time.Hour)
+	if err := r.am.UpdateToken(context.Background(), r.writeID, nil, nil, nil, &past); err != nil {
+		t.Fatal(err)
+	}
+	if code := send(t, r.signed("reader-A", "writer-W", r.writeID, nil)); code != 401 {
+		t.Fatalf("expired token: %d", code)
+	}
+	resp, err := http.DefaultClient.Do(r.signed("reader-A", "writer-W", 0, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 401 || !strings.Contains(string(body), "authentication is disabled on the forwarding node") {
+		t.Fatalf("no caller: %d %s", resp.StatusCode, body)
+	}
+}
+
+// Every build advertises that it authenticates forwarded requests by
+// identity, so its peers stop sending it credentials.
+func TestForwardIdentity_CapabilityAdvertised(t *testing.T) {
+	c := &Coordinator{cfg: &config.ClusterConfig{}, localNode: NewNode("n", "n", RoleReader, "c"), logger: zerolog.Nop()}
+	if !hasCapability(c.localCapabilities(), CapabilityForwardIdentity) {
+		t.Fatalf("capabilities %v", c.localCapabilities())
 	}
 }
