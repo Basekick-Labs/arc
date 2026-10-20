@@ -162,3 +162,35 @@ func TestValidateSQLRequest_ReadStatementsBypasses(t *testing.T) {
 		}
 	}
 }
+
+// The masker and comment stripper read the text the way DuckDB does: a
+// non-ASCII identifier character before `$$` or `E'` keeps them part of the
+// identifier, and a carriage return ends a line comment.
+func TestValidateSQLRequest_LexerAgreesWithDuckDB(t *testing.T) {
+	refused := []string{
+		"SELECT 1 AS é$$, 2 AS x; CREATE MACRO m() AS 1; SELECT 3 AS y$$",
+		"SELECT 1 AS é$$, s FROM read_parquet('/data/db2/x.parquet') t, (SELECT 1 AS y$$) z",
+		"SELECT 1 AS 日$$; CREATE MACRO m() AS 1; SELECT 3 AS y$$",
+		"SELECT 1 --x\r; CREATE MACRO m() AS 1",
+		"SELECT 1 --x\r; CREATE MACRO m() AS 1\n",
+		"SELECT 1 --x\r, * FROM read_parquet('/data/db2/x.parquet')",
+		"SELECT 1 /* a */ --x\r; USE memory",
+	}
+	for _, q := range refused {
+		if err := ValidateSQLRequest(q); err == nil {
+			t.Errorf("accepted: %q", q)
+		}
+	}
+	accepted := []string{
+		"SELECT 1 --comment\r\n",
+		"SELECT 1 --comment\r",
+		"SELECT 'x' AS été",
+		"SELECT $$a$$ AS s",
+		"SELECT 1 AS a, $$x; CREATE$$ AS s",
+	}
+	for _, q := range accepted {
+		if err := ValidateSQLRequest(q); err != nil {
+			t.Errorf("refused %q: %v", q, err)
+		}
+	}
+}

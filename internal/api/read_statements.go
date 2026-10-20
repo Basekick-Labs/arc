@@ -168,7 +168,7 @@ func hasNestedBlockComment(masked string) bool {
 	for i := 0; i+1 < len(masked); i++ {
 		switch {
 		case masked[i] == '-' && masked[i+1] == '-':
-			for i < len(masked) && masked[i] != '\n' {
+			for i < len(masked) && masked[i] != '\n' && masked[i] != '\r' {
 				i++
 			}
 		case masked[i] == '/' && masked[i+1] == '*':

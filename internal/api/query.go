@@ -632,13 +632,15 @@ func stripSQLComments(sql string, hasComments bool) string {
 	for i < len(sql) {
 		// Check for single-line comment (--)
 		if i+1 < len(sql) && sql[i] == '-' && sql[i+1] == '-' {
-			// Skip until end of line or end of string
-			for i < len(sql) && sql[i] != '\n' {
+			// Skip until end of line or end of string. DuckDB ends a line
+			// comment at a carriage return as well as a newline: ending it
+			// only at `\n` hid `--x\r; CREATE ...` from every gate.
+			for i < len(sql) && sql[i] != '\n' && sql[i] != '\r' {
 				i++
 			}
-			// Keep the newline if present
+			// Keep the line break if present
 			if i < len(sql) {
-				result.WriteByte('\n')
+				result.WriteByte(sql[i])
 				i++
 			}
 			continue
