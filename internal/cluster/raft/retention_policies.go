@@ -206,6 +206,10 @@ type RetentionMirror struct {
 	Policies  []RetentionPolicyEntry
 	Floor     int64
 	SeededIDs map[int64]bool
+	// Seq is the highest ID this state has issued. A mirrored row above it
+	// is a policy this node's state has not caught up with yet (a restart
+	// from an older snapshot), not one the cluster deleted.
+	Seq int64
 }
 
 // RetentionMirrorState returns the retention state a mirror reconciles to.
@@ -216,7 +220,7 @@ func (f *ClusterFSM) RetentionMirrorState() RetentionMirror {
 	for id := range f.retentionSeededIDs {
 		ids[id] = true
 	}
-	return RetentionMirror{Policies: f.retentionPoliciesLocked(), Floor: f.retentionFloor, SeededIDs: ids}
+	return RetentionMirror{Policies: f.retentionPoliciesLocked(), Floor: f.retentionFloor, SeededIDs: ids, Seq: f.retentionSeq}
 }
 
 // PolicyAdoptChoiceFor returns kind's pending admin choice.

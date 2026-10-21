@@ -228,11 +228,15 @@ func (f *ClusterFSM) cqsLocked() []CQEntry {
 // CQMirror is what a node's CQ mirror reconciles to.
 type CQMirror struct {
 	CQs []CQEntry
+	// Seq is the highest ID this state has issued (see RetentionMirror.Seq).
+	Seq int64
 }
 
 // CQMirrorState returns the continuous queries a mirror reconciles to.
 func (f *ClusterFSM) CQMirrorState() CQMirror {
-	return CQMirror{CQs: f.CQs()}
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return CQMirror{CQs: f.cqsLocked(), Seq: f.cqSeq}
 }
 
 func copyCQ(e *CQEntry) CQEntry {

@@ -45,6 +45,7 @@ type CQClusterSource interface {
 	DeleteCQ(ctx context.Context, id int64) error
 	SetCQWatermark(ctx context.Context, id int64, from *time.Time, to time.Time) error
 	CQReadBarrier(ctx context.Context) error
+	CQMirrorState() raft.CQMirror
 	LocalNodeID() string
 }
 
@@ -609,7 +610,7 @@ func (h *ContinuousQueryHandler) MirrorClusterPolicies(ctx context.Context) erro
 		return nil
 	}
 	h.cl.mirrorMu.Lock()
-	err := h.reconcileCQMirror(ctx, src.ClusterCQs(), src.LocalNodeID())
+	err := h.reconcileCQMirror(ctx, src.CQMirrorState(), src.LocalNodeID())
 	h.cl.mirrorMu.Unlock()
 	h.syncJobs(src)
 	return err
@@ -629,7 +630,7 @@ func (h *ContinuousQueryHandler) ensureCQMirrored(ctx context.Context, id int64)
 	if err := h.sqliteDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM continuous_queries cq JOIN continuous_query_cluster_ids o ON o.id = cq.id WHERE cq.id = ?`, id).Scan(&n); err == nil && n == 1 {
 		return
 	}
-	if err := h.reconcileCQMirror(ctx, src.ClusterCQs(), src.LocalNodeID()); err != nil {
+	if err := h.reconcileCQMirror(ctx, src.CQMirrorState(), src.LocalNodeID()); err != nil {
 		h.logger.Warn().Err(err).Msg("Could not mirror the cluster's continuous queries before recording a run")
 	}
 }
@@ -651,7 +652,8 @@ func cqRowKey(e raft.CQEntry) string {
 // (owned IDs, sources rekeyed, everything else dormant with its history), in
 // one transaction on one connection, writing each CQ's watermark as the
 // cluster holds it.
-func (h *ContinuousQueryHandler) reconcileCQMirror(ctx context.Context, cqs []raft.CQEntry, self string) error {
+func (h *ContinuousQueryHandler) reconcileCQMirror(ctx context.Context, st raft.CQMirror, self string) error {
+	cqs := st.CQs
 	conn, err := h.sqliteDB.Conn(ctx)
 	if err != nil {
 		return err
@@ -749,6 +751,11 @@ func (h *ContinuousQueryHandler) reconcileCQMirror(ctx context.Context, cqs []ra
 		if _, ok := want[id]; ok && (owned[id] || (isSource && to == id)) {
 			continue
 		}
+		if owned[id] && id > st.Seq {
+			// A CQ this node's state has not caught up with yet (a restart
+			// from an older snapshot): left as it is, history included.
+			continue
+		}
 		switch {
 		case isSource && to != id:
 			if err := exec(`UPDATE continuous_query_executions SET query_id = ? WHERE query_id = ?`, to, id); err != nil {
@@ -832,7 +839,7 @@ func (h *ContinuousQueryHandler) reconcileCQMirror(ctx context.Context, cqs []ra
 		}
 	}
 	for id := range owned {
-		if _, ok := want[id]; !ok {
+		if _, ok := want[id]; !ok && id <= st.Seq {
 			if err := exec(`DELETE FROM continuous_query_cluster_ids WHERE id = ?`, id); err != nil {
 				return err
 			}

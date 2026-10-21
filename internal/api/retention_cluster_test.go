@@ -68,6 +68,7 @@ func (s *fsmSource) SetCQWatermark(_ context.Context, id int64, from *time.Time,
 }
 
 func (s *fsmSource) CQReadBarrier(context.Context) error { return s.barrierErr }
+func (s *fsmSource) CQMirrorState() raft.CQMirror        { return s.f.CQMirrorState() }
 
 func (s *fsmSource) seedCQ(entries ...raft.CQEntry) {
 	s.t.Helper()

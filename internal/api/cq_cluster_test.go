@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -518,5 +519,98 @@ func TestCQRunGivesUpWhenCancelled(t *testing.T) {
 		if _, err := r.h.acquireRun(cancelled, 1); err == nil {
 			t.Fatal("a cancelled run took the slot")
 		}
+	}
+}
+
+// bufSink is a raft snapshot sink into memory.
+type bufSink struct{ bytes.Buffer }
+
+func (b *bufSink) ID() string    { return "test" }
+func (b *bufSink) Cancel() error { return nil }
+func (b *bufSink) Close() error  { return nil }
+
+func snapshotOf(t *testing.T, f *raft.ClusterFSM) []byte {
+	t.Helper()
+	snap, err := f.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sink bufSink
+	if err := snap.Persist(&sink); err != nil {
+		t.Fatal(err)
+	}
+	return sink.Bytes()
+}
+
+// restoredSource is a cluster state restarted from an older snapshot.
+func restoredSource(t *testing.T, snap []byte) *fsmSource {
+	t.Helper()
+	s := &fsmSource{t: t, f: raft.NewClusterFSM(zerolog.Nop()), self: "n1"}
+	if err := s.f.Restore(io.NopCloser(bytes.NewReader(snap))); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// A node restarted from a snapshot older than a CQ's creation mirrors before
+// it catches up: the CQ is not in its state yet, but its ID is above anything
+// that state issued, so the mirror keeps it, history included, instead of
+// taking it for a deleted one.
+func TestCQMirrorBehindTheClusterKeepsNewerRows(t *testing.T) {
+	r := newCQRig(t)
+	r.src.seedCQ()
+	r.do(t, "POST", "/cq", cqBody)
+	old := snapshotOf(t, r.src.f)
+	r.do(t, "POST", "/cq", strings.Replace(cqBody, `"name":"q"`, `"name":"newer"`, 1))
+	if err := r.h.MirrorClusterPolicies(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.h.sqliteDB.Exec(`INSERT INTO continuous_query_executions (query_id, execution_id, status, start_time, end_time) VALUES (2, 'x', 'completed', 'a', 'b')`); err != nil {
+		t.Fatal(err)
+	}
+	r.h.SetClusterSource(restoredSource(t, old))
+	if err := r.h.MirrorClusterPolicies(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var rows, history int
+	r.h.sqliteDB.QueryRow(`SELECT COUNT(*) FROM continuous_queries WHERE id = 2`).Scan(&rows)
+	r.h.sqliteDB.QueryRow(`SELECT COUNT(*) FROM continuous_query_executions WHERE query_id = 2`).Scan(&history)
+	if rows != 1 || history != 1 {
+		t.Fatalf("the newer CQ's row %d and history %d were dropped by a state that had not caught up", rows, history)
+	}
+	// Caught up, then deleted for real: it goes.
+	r.h.SetClusterSource(r.src)
+	r.do(t, "DELETE", "/cq/2", "")
+	if err := r.h.MirrorClusterPolicies(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	r.h.sqliteDB.QueryRow(`SELECT COUNT(*) FROM continuous_query_executions WHERE query_id = 2`).Scan(&history)
+	if history != 0 {
+		t.Fatal("a deleted CQ's history stayed")
+	}
+}
+
+// The same for retention policies.
+func TestRetentionMirrorBehindTheClusterKeepsNewerRows(t *testing.T) {
+	r := newClusterRetentionRig(t)
+	r.src.seed(false, 1)
+	ctx := context.Background()
+	if err := r.src.CreateRetentionPolicy(ctx, raft.CreateRetentionPolicyPayload{Name: "a", Database: "db", RetentionDays: 9}); err != nil {
+		t.Fatal(err)
+	}
+	old := snapshotOf(t, r.src.f)
+	if err := r.src.CreateRetentionPolicy(ctx, raft.CreateRetentionPolicyPayload{Name: "b", Database: "db", RetentionDays: 9}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.h.MirrorClusterPolicies(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r.exec(t, `INSERT INTO retention_executions (policy_id, status) VALUES (2, 'completed')`)
+	r.h.SetClusterSource(restoredSource(t, old))
+	if err := r.h.MirrorClusterPolicies(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := r.count(t, `SELECT COUNT(*) FROM retention_executions WHERE policy_id = 2`) + r.count(t, `SELECT COUNT(*) FROM retention_policies WHERE id = 2`); n != 2 {
+		t.Fatalf("the newer policy's row and history were dropped (%d left)", n)
 	}
 }

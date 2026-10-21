@@ -104,6 +104,14 @@ func (c *Coordinator) ClusterCQByName(name string) (raft.CQEntry, bool) {
 	return raft.CQEntry{}, false
 }
 
+// CQMirrorState returns what this node's CQ mirror reconciles to.
+func (c *Coordinator) CQMirrorState() raft.CQMirror {
+	if fsm := c.fsmOrNil(); fsm != nil {
+		return fsm.CQMirrorState()
+	}
+	return raft.CQMirror{}
+}
+
 // ClusterCQs returns every continuous query in the cluster state.
 func (c *Coordinator) ClusterCQs() []raft.CQEntry {
 	if fsm := c.fsmOrNil(); fsm != nil {
