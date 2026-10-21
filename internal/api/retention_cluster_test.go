@@ -27,6 +27,10 @@ type fsmSource struct {
 	idx        uint64
 	self       string
 	collecting bool
+	// onGet, if set, runs before each RetentionPolicy read with the read's
+	// number (from 1).
+	onGet func(n int)
+	gets  int
 }
 
 func newFSMSource(t *testing.T, self string) *fsmSource {
@@ -71,6 +75,10 @@ func (s *fsmSource) RetentionPoliciesSeeded() bool {
 }
 func (s *fsmSource) RetentionPoliciesCollecting() bool { return s.collecting }
 func (s *fsmSource) RetentionPolicy(id int64) (raft.RetentionPolicyEntry, bool) {
+	s.gets++
+	if s.onGet != nil {
+		s.onGet(s.gets)
+	}
 	return s.f.RetentionPolicy(id)
 }
 func (s *fsmSource) RetentionPolicyByName(n string) (raft.RetentionPolicyEntry, bool) {
@@ -677,5 +685,30 @@ func TestRetentionRunStopsWhenThePolicyChanged(t *testing.T) {
 	}
 	if err := r.h.policyUnchanged(p2); err == nil {
 		t.Fatal("a run went on after its policy was deleted")
+	}
+}
+
+// A scheduled run whose policy changes after the run read it (here: between
+// its first read and the record of its start) stops before deleting, and the
+// run is recorded as failed.
+func TestRetentionExecutePolicyStopsWhenThePolicyChanged(t *testing.T) {
+	h, _ := setupTestRetentionHandler(t)
+	src := newFSMSource(t, "n1")
+	h.SetClusterSource(src)
+	src.seed(false, 1)
+	if err := src.CreateRetentionPolicy(context.Background(), raft.CreateRetentionPolicyPayload{Name: "p", Database: "db", RetentionDays: 30, IsActive: true}); err != nil {
+		t.Fatal(err)
+	}
+	src.onGet = func(n int) {
+		if n == 2 {
+			src.must(raft.CommandUpdateRetentionPolicy, raft.UpdateRetentionPolicyPayload{ID: 1, RetentionDays: intPtr(1)})
+		}
+	}
+	if _, err := h.ExecutePolicy(context.Background(), 1); err == nil || !strings.Contains(err.Error(), "changed before the run") {
+		t.Fatalf("run under a changed policy: %v", err)
+	}
+	var status string
+	if err := h.db.QueryRow(`SELECT status FROM retention_executions WHERE policy_id = 1`).Scan(&status); err != nil || status != "failed" {
+		t.Fatalf("recorded %q %v, want failed", status, err)
 	}
 }
