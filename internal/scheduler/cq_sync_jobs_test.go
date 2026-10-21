@@ -1,10 +1,13 @@
 package scheduler
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/api"
+	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/config"
 	"github.com/rs/zerolog"
 )
 
@@ -136,5 +139,24 @@ func TestTickOffPrimaryForgetsPendingWatermarks(t *testing.T) {
 	s.tick(&cqJob{cqID: 1, cqName: "a"})
 	if f.n != 1 {
 		t.Fatalf("forgot %d times, want once", f.n)
+	}
+}
+
+// The scheduler forgets the handler's pending watermarks: it is wired from
+// its configuration.
+func TestSchedulerWiresTheHandlersPendingForgetter(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "arc.db")
+	am, err := auth.NewAuthManager(dbPath, time.Minute, 10, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer am.Close()
+	h, err := api.NewContinuousQueryHandler(nil, nil, nil, &config.ContinuousQueryConfig{DBPath: dbPath}, am, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := NewCQScheduler(&CQSchedulerConfig{CQHandler: h, Logger: zerolog.Nop()})
+	if s.pendingForgetter == nil {
+		t.Fatal("the handler's pending watermarks are never forgotten")
 	}
 }
