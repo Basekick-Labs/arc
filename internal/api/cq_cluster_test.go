@@ -354,3 +354,65 @@ func TestCQClusterListFilters(t *testing.T) {
 		t.Fatalf("scheduler load %+v %v", active, err)
 	}
 }
+
+// One run of a CQ at a time: a second run waits for the first, and starts
+// from the watermark the first set.
+func TestCQRunsOfOneCQAreSerialized(t *testing.T) {
+	r := newCQRig(t)
+	r.src.seedCQ()
+	r.do(t, "POST", "/cq", cqBody)
+	entered := make(chan time.Time, 2)
+	release := make(chan struct{})
+	r.h.aggregateHook = func(_ context.Context, _ *ContinuousQuery, _ string, start time.Time) (int64, error) {
+		entered <- start
+		<-release
+		return 1, nil
+	}
+	done := make(chan error, 2)
+	go func() { _, err := r.h.ExecuteCQ(context.Background(), 1); done <- err }()
+	first := <-entered
+	time.Sleep(1100 * time.Millisecond)
+	go func() { _, err := r.h.ExecuteCQ(context.Background(), 1); done <- err }()
+	select {
+	case <-entered:
+		t.Fatal("a second run of the CQ started while the first ran")
+	case <-time.After(300 * time.Millisecond):
+	}
+	release <- struct{}{}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	second := <-entered
+	release <- struct{}{}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !second.After(first) {
+		t.Fatalf("second run started at %v, want where the first ended (it started at %v)", second, first)
+	}
+}
+
+// While the cluster collects the nodes' CQs, a local write answers 503; the
+// lister reads under the lock local writes take.
+func TestCQLocalWritesDuringTheCollect(t *testing.T) {
+	r := newCQRig(t)
+	r.src.collecting = true
+	if code, body := r.do(t, "POST", "/cq", cqBody); code != fiber.StatusServiceUnavailable || !strings.Contains(body["error"].(string), "being adopted") {
+		t.Fatalf("create while collecting: %d %v", code, body)
+	}
+	r.src.collecting = false
+	r.h.cl.localMu.Lock()
+	done := make(chan struct{})
+	go func() {
+		_, _ = r.h.LocalPolicyLister()(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+		r.h.cl.localMu.Unlock()
+		t.Fatal("the lister read the table while a local write held the lock")
+	case <-time.After(200 * time.Millisecond):
+	}
+	r.h.cl.localMu.Unlock()
+	<-done
+}

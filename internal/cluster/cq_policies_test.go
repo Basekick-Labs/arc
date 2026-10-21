@@ -155,6 +155,12 @@ func TestCQPoliciesEnableAndJoinGate(t *testing.T) {
 	if st := c.ClusterPoliciesStatus(); st.CQEnabled || len(st.CQBlocking) != 1 || st.CQBlocking[0] != "reader-1" {
 		t.Fatalf("status %+v", st)
 	}
+	if err := c.ChoosePolicyAdoption(raft.PolicyKindCQ, "writer-2", "h", "admin"); !errors.Is(err, ErrCQPoliciesNotEnabled) {
+		t.Fatalf("choice before the CQ flag: %v", err)
+	}
+	if _, err := c.CQCandidates(context.Background()); !errors.Is(err, ErrCQPoliciesNotEnabled) {
+		t.Fatalf("candidates before the CQ flag: %v", err)
+	}
 	capNodes(t, c, map[string][]string{"reader-1": all})
 	c.maybeEnableCQPolicies()
 	waitFSM(t, c.fsmOrNil().CQPoliciesEnabled)
@@ -205,6 +211,9 @@ func TestAdoptCQ(t *testing.T) {
 		t.Fatalf("not seeded: %+v", r.leader.ClusterPoliciesStatus())
 	}
 	waitFor(t, 10*time.Second, func() bool { return r.follower.CQPoliciesSeeded() }, "follower never saw the seed")
+	if _, err := r.follower.CQCandidates(context.Background()); !errors.Is(err, ErrNotLeaderForTopology) {
+		t.Fatalf("candidates on the follower: %v", err)
+	}
 	q, ok := r.follower.ClusterCQByName("q")
 	if !ok || q.LastProcessed == nil || !q.LastProcessed.Equal(*at(11)) {
 		t.Fatalf("follower reads %+v", q)

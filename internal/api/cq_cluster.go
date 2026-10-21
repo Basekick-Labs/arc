@@ -377,19 +377,17 @@ func (h *ContinuousQueryHandler) settlePending(ctx context.Context, src CQCluste
 		delete(h.cl.pending, id)
 		h.cl.runsMu.Unlock()
 	}
-	e, exists := src.ClusterCQ(id)
-	switch {
-	case !exists, watermarkEqual(e.LastProcessed, p.to):
-		drop()
-		return nil
-	case !watermarkSame(e.LastProcessed, p.from):
+	// Taken (the cluster holds p.to) or moved by anything else since (a
+	// manual reset, another primary): settled. Only a watermark still at
+	// p.from is proposed again.
+	if e, ok := src.ClusterCQ(id); !ok || !watermarkSame(e.LastProcessed, p.from) {
 		drop()
 		return nil
 	}
 	_ = src.SetCQWatermark(ctx, id, p.from, p.to)
 	// The outcome is read here, not from the propose's error: a forwarded
 	// propose returns nil when the wait for this node's apply timed out.
-	if e, ok := src.ClusterCQ(id); !ok || watermarkEqual(e.LastProcessed, p.to) || !watermarkSame(e.LastProcessed, p.from) {
+	if e, ok := src.ClusterCQ(id); !ok || !watermarkSame(e.LastProcessed, p.from) {
 		drop()
 		return nil
 	}

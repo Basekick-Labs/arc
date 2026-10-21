@@ -22,16 +22,11 @@ type CQScheduler struct {
 	licenseClient *license.Client
 	clusterGate   WriterGate
 	jobs          map[int64]*cqJob // CQ ID → job info
-	// desired and gen drive SyncJobs (#1324): the jobs the cluster's CQs
-	// call for, and a per-ID generation so a restart waiting for an old
-	// job to exit starts what is desired then, or nothing if it moved on.
-	desired map[int64]api.CQJobDef
-	gen     map[int64]uint64
-	mu      sync.RWMutex
-	wg      sync.WaitGroup
-	stopCh  chan struct{}
-	running bool
-	logger  zerolog.Logger
+	mu            sync.RWMutex
+	wg            sync.WaitGroup
+	stopCh        chan struct{}
+	running       bool
+	logger        zerolog.Logger
 }
 
 // cqJob represents a scheduled CQ job
@@ -59,8 +54,6 @@ func NewCQScheduler(cfg *CQSchedulerConfig) (*CQScheduler, error) {
 		licenseClient: cfg.LicenseClient,
 		clusterGate:   cfg.ClusterGate,
 		jobs:          make(map[int64]*cqJob),
-		desired:       make(map[int64]api.CQJobDef),
-		gen:           make(map[int64]uint64),
 		stopCh:        make(chan struct{}),
 		logger:        cfg.Logger.With().Str("component", "cq-scheduler").Logger(),
 	}
@@ -445,10 +438,10 @@ func cqJobInterval(intervalStr string) (time.Duration, error) {
 
 // SyncJobs makes the running jobs match defs, the cluster's continuous
 // queries (#1324): it starts the missing ones, stops the ones gone or
-// inactive, and restarts only a job whose interval changed. Every other job
-// keeps its ticker, so its phase is not reset. It never waits: a job being
-// replaced is restarted by a goroutine once the old one has exited, with
-// whatever is desired for it then.
+// inactive, and replaces only a job whose interval changed. Every other job
+// keeps its ticker, so its phase is not reset. It never waits for a stopped
+// job to exit: a replacement may start while the old goroutine finishes, and
+// the handler's per-CQ run lock keeps the two from running the CQ at once.
 func (s *CQScheduler) SyncJobs(defs []api.CQJobDef) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -461,46 +454,17 @@ func (s *CQScheduler) SyncJobs(defs []api.CQJobDef) {
 			want[d.ID] = d
 		}
 	}
-	s.desired = want
-	restarting := map[int64]bool{}
 	for id, job := range s.jobs {
-		d, ok := want[id]
-		if ok {
-			iv, err := cqJobInterval(d.Interval)
-			if err == nil && iv == job.interval {
+		if d, ok := want[id]; ok {
+			if iv, err := cqJobInterval(d.Interval); err == nil && iv == job.interval {
 				job.cqName = d.Name
 				continue
 			}
 		}
-		done := s.stopJobLocked(id)
-		s.gen[id]++
-		if !ok || done == nil {
-			continue
-		}
-		g := s.gen[id]
-		restarting[id] = true
-		go func(id int64, g uint64, done chan struct{}) {
-			<-done
-			s.mu.Lock()
-			defer s.mu.Unlock()
-			if !s.running || s.gen[id] != g {
-				return
-			}
-			if _, running := s.jobs[id]; running {
-				return
-			}
-			if d, ok := s.desired[id]; ok {
-				if err := s.startJob(d.ID, d.Name, d.Interval); err != nil {
-					s.logger.Warn().Err(err).Int64("cq_id", id).Msg("Failed to restart CQ job")
-				}
-			}
-		}(id, g, done)
+		s.stopJobLocked(id)
 	}
 	for id, d := range want {
 		if _, running := s.jobs[id]; running {
-			continue
-		}
-		if restarting[id] {
 			continue
 		}
 		if err := s.startJob(d.ID, d.Name, d.Interval); err != nil {

@@ -201,9 +201,12 @@ func TestClusterPoliciesEnableLoopEnablesRetention(t *testing.T) {
 	clusterPoliciesEnableEvery = 20 * time.Millisecond
 	t.Cleanup(func() { clusterPoliciesEnableEvery = prev })
 	c := originRig(t, "writer-1", RoleWriter)
-	capNodes(t, c, map[string][]string{"raft-1": cpRetList, "writer-1": cpRetList, "writer-2": cpRetList, "reader-1": cpRetList})
+	all := append(append([]string(nil), cpRetList...), raft.CapabilityClusterCQ)
+	capNodes(t, c, map[string][]string{"raft-1": all, "writer-1": all, "writer-2": all, "reader-1": all})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go c.clusterPoliciesEnableLoop(ctx)
-	waitFSM(t, func() bool { return c.ClusterPoliciesActive() && c.fsmOrNil().RetentionPoliciesEnabled() })
+	waitFSM(t, func() bool {
+		return c.ClusterPoliciesActive() && c.fsmOrNil().RetentionPoliciesEnabled() && c.fsmOrNil().CQPoliciesEnabled()
+	})
 }
