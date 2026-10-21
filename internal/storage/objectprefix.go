@@ -56,7 +56,11 @@ func ValidateObjectPrefix(prefix string) (string, error) {
 		case (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'):
 		case c == '/' || c == '-' || c == '_' || c == '.':
 		default:
-			return "", fmt.Errorf("storage prefix %q contains an unsupported character %q", prefix, c)
+			return "", fmt.Errorf(
+				"storage prefix %q contains an unsupported character %q; allowed characters are ASCII letters, digits, slash, hyphen, underscore, and period",
+				prefix,
+				c,
+			)
 		}
 	}
 	if !strings.HasSuffix(prefix, "/") {
