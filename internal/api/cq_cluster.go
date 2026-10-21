@@ -68,6 +68,27 @@ type cqCluster struct {
 type cqPending struct {
 	from *time.Time
 	to   time.Time
+	// database, measurement: the run's output, flushed before the
+	// watermark is proposed.
+	database, measurement string
+}
+
+// cqOutputFlusher flushes a run's buffered output to storage
+// (*ingest.ArrowBuffer).
+type cqOutputFlusher interface {
+	FlushScopeAndWait(ctx context.Context, database, measurement string) (map[string]uint64, error)
+}
+
+// flushOutput writes a run's buffered output to storage before its watermark
+// is proposed (taken from #1328). Once the cluster holds the watermark no
+// run covers that window again, so output still in this node's buffer (or
+// only in its WAL, off by default) would be lost with the node.
+func (h *ContinuousQueryHandler) flushOutput(ctx context.Context, database, measurement string) error {
+	if h.outputFlusher == nil {
+		return nil
+	}
+	_, err := h.outputFlusher.FlushScopeAndWait(ctx, database, measurement)
+	return err
 }
 
 // SetClusterSource makes continuous queries cluster-wide once the cluster
@@ -447,6 +468,10 @@ func (h *ContinuousQueryHandler) settlePending(ctx context.Context, src CQCluste
 		drop()
 		return nil
 	}
+	if err := h.flushOutput(ctx, p.database, p.measurement); err != nil {
+		h.logger.Warn().Err(err).Int64("query_id", id).Msg("The previous run's output is still not flushed; this run is skipped")
+		return errCQWatermarkPending
+	}
 	_ = src.SetCQWatermark(ctx, id, p.from, p.to)
 	// The outcome is read here, not from the propose's error: a forwarded
 	// propose returns nil when the wait for this node's apply timed out.
@@ -465,15 +490,23 @@ const (
 )
 
 // commitWatermark moves the CQ's watermark from the value the run read to the
-// run's end. The pending entry is set before the propose and cleared only when
-// this node's cluster state shows the outcome.
-func (h *ContinuousQueryHandler) commitWatermark(ctx context.Context, src CQClusterSource, id int64, from *time.Time, to time.Time) string {
+// run's end, once the run's output is flushed to storage. The pending entry is
+// set first and cleared only when this node's cluster state shows the
+// outcome: a flush or a propose that fails leaves it for the next run to
+// settle (skipping runs until it can), rather than recording a window whose
+// output could still be lost or writing the window again.
+func (h *ContinuousQueryHandler) commitWatermark(ctx context.Context, src CQClusterSource, id int64, from *time.Time, to time.Time, database, measurement string) string {
 	h.cl.runsMu.Lock()
 	if h.cl.pending == nil {
 		h.cl.pending = map[int64]cqPending{}
 	}
-	h.cl.pending[id] = cqPending{from: from, to: to}
+	h.cl.pending[id] = cqPending{from: from, to: to, database: database, measurement: measurement}
 	h.cl.runsMu.Unlock()
+	if err := h.flushOutput(ctx, database, measurement); err != nil {
+		h.logger.Warn().Err(err).Int64("query_id", id).
+			Msg("The continuous query's output is not flushed yet; its watermark waits, and the next run settles it first")
+		return cqWatermarkPending
+	}
 	err := src.SetCQWatermark(ctx, id, from, to)
 	e, ok := src.ClusterCQ(id)
 	if !ok || watermarkEqual(e.LastProcessed, to) || !watermarkSame(e.LastProcessed, from) {

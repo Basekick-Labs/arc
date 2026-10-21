@@ -63,6 +63,9 @@ type ContinuousQueryHandler struct {
 	logger      zerolog.Logger
 	// cl is the cluster-wide state (#1324), see cq_cluster.go.
 	cl cqCluster
+	// outputFlusher flushes a run's output before its watermark is proposed
+	// in a cluster (the ingest buffer; nil without one).
+	outputFlusher cqOutputFlusher
 	// aggregateHook replaces executeAggregation in tests; nil in production.
 	aggregateHook func(ctx context.Context, cq *ContinuousQuery, query string, start time.Time) (int64, error)
 }
@@ -241,6 +244,9 @@ func NewContinuousQueryHandler(db *database.DuckDB, storage storage.Backend, arr
 			sqliteDB.Close()
 		}
 		return nil, fmt.Errorf("failed to initialize CQ tables: %w", err)
+	}
+	if arrowBuffer != nil {
+		h.outputFlusher = arrowBuffer
 	}
 	if err := h.initClusterTables(); err != nil {
 		if ownsDB {
@@ -824,7 +830,7 @@ func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (
 		// The history is this node's; the watermark is the cluster's.
 		h.ensureCQMirrored(ctx, queryID)
 		h.recordExecution(queryID, executionID, "completed", startTime, endTime, nil, recordsWritten, executionDuration, "")
-		h.commitWatermark(ctx, src, queryID, readWatermark, endTime)
+		h.commitWatermark(ctx, src, queryID, readWatermark, endTime, cq.Database, cq.DestinationMeasurement)
 	} else if err := h.recordExecutionAndUpdateTime(queryID, executionID, startTime, endTime, recordsWritten, executionDuration); err != nil {
 		// Record successful execution and update last processed time atomically
 		h.logger.Error().Err(err).Str("query_name", cq.Name).Msg("Failed to record execution (data was written)")
@@ -1033,7 +1039,7 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 		// response says whether it took.
 		h.ensureCQMirrored(c.Context(), int64(queryID))
 		h.recordExecution(int64(queryID), executionID, "completed", startTime, endTime, nil, recordsWritten, executionDuration, "")
-		watermarkStatus = h.commitWatermark(c.Context(), src, int64(queryID), readWatermark, endTime)
+		watermarkStatus = h.commitWatermark(c.Context(), src, int64(queryID), readWatermark, endTime, cq.Database, cq.DestinationMeasurement)
 	} else if err := h.recordExecutionAndUpdateTime(int64(queryID), executionID, startTime, endTime, recordsWritten, executionDuration); err != nil {
 		// Record successful execution and update last processed time atomically
 		h.logger.Error().Err(err).Int("query_id", queryID).Msg("Failed to record execution")

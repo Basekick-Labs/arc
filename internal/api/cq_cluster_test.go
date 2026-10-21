@@ -628,3 +628,70 @@ func TestRetentionMirrorBehindTheClusterKeepsNewerRows(t *testing.T) {
 		t.Fatalf("the newer policy's row and history were dropped (%d left)", n)
 	}
 }
+
+// fakeFlusher records flushes and can fail them.
+type fakeFlusher struct {
+	calls  []string
+	fail   int
+	onCall func()
+}
+
+func (f *fakeFlusher) FlushScopeAndWait(_ context.Context, db, m string) (map[string]uint64, error) {
+	f.calls = append(f.calls, db+"/"+m)
+	if f.onCall != nil {
+		f.onCall()
+	}
+	if f.fail > 0 {
+		f.fail--
+		return nil, errors.New("flush failed")
+	}
+	return nil, nil
+}
+
+// A run's output is flushed to storage before its watermark is proposed:
+// once the cluster holds the watermark no run covers that window again, so
+// output still buffered on a primary that died would be lost (from #1328).
+// A failed flush proposes nothing; the next run flushes and settles first.
+func TestCQOutputFlushedBeforeTheWatermark(t *testing.T) {
+	r := newCQRig(t)
+	r.src.seedCQ()
+	r.do(t, "POST", "/cq", cqBody)
+	f := &fakeFlusher{}
+	f.onCall = func() {
+		if r.src.watermarkProposals != len(f.calls)-1 {
+			t.Errorf("flush %d came after the watermark propose", len(f.calls))
+		}
+	}
+	r.h.outputFlusher = f
+	if _, err := r.h.ExecuteCQ(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.calls) != 1 || f.calls[0] != "db/cpu_1h" || r.watermark(t, 1) == nil {
+		t.Fatalf("flushes %v, watermark %v", f.calls, r.watermark(t, 1))
+	}
+
+	// The flush fails: no watermark proposed, the next run is skipped while
+	// it still fails, then flushes, settles and runs.
+	w := r.watermark(t, 1)
+	f.onCall = nil
+	f.fail = 2
+	time.Sleep(1100 * time.Millisecond)
+	proposals := r.src.watermarkProposals
+	if _, err := r.h.ExecuteCQ(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if r.src.watermarkProposals != proposals || !r.watermark(t, 1).Equal(*w) {
+		t.Fatal("a watermark was proposed for output that was not flushed")
+	}
+	runs := len(r.runs)
+	if _, err := r.h.ExecuteCQ(context.Background(), 1); !errors.Is(err, errCQWatermarkPending) || len(r.runs) != runs {
+		t.Fatalf("run while the previous output is unflushed: %v (%d runs)", err, len(r.runs)-runs)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	if _, err := r.h.ExecuteCQ(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if !r.watermark(t, 1).After(*w) || len(r.runs) != runs+1 {
+		t.Fatalf("after the flush succeeded: watermark %v (was %v), %d new runs", r.watermark(t, 1), w, len(r.runs)-runs)
+	}
+}
