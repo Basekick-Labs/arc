@@ -1105,6 +1105,16 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 			unparseable++
 			continue
 		}
+		// A failed migration can leave a cold object beside its hot copy
+		// while the metadata still says hot. Preserve that copy for a
+		// database pinned to hot, including when its existence is uncertain.
+		// Without a local hot copy, still record the cold object: queries
+		// need its metadata to read data migrated before the pin.
+		if m.IsHotOnly(ctx, info.Database) {
+			if present, err := m.hotBackend.Exists(ctx, obj.Path); err != nil || present {
+				continue
+			}
+		}
 		file := &FileMetadata{
 			Path:          obj.Path,
 			Database:      info.Database,
