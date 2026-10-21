@@ -100,17 +100,38 @@ func TestRunCycleCleansFailedColdCopyForHotOnlyDatabase(t *testing.T) {
 	}
 }
 
-func TestHotOnlyCleanupPreservesColdMetadataRows(t *testing.T) {
+func TestHotOnlyCleanupPreservesColdMetadataRowsAfterFailedFlip(t *testing.T) {
 	m, hot, cold, cleanup := setupIntegrationTest(t, true)
 	defer cleanup()
 	ctx := context.Background()
 	path := gateDailyA
 	mustWrite(t, hot, path)
 	recordHotRow(t, m, path, manifestPartition)
-	if err := m.metadata.UpdateTier(ctx, path, TierCold); err != nil {
-		t.Fatalf("mark existing cold metadata row: %v", err)
+	if _, err := m.metadata.db.Exec(`CREATE TRIGGER fail_tier_flip BEFORE UPDATE OF tier ON tier_files BEGIN SELECT RAISE(ABORT, 'forced tier flip failure'); END`); err != nil {
+		t.Fatalf("create tier-flip failure trigger: %v", err)
 	}
-	mustWrite(t, cold, path)
+	if err := m.migrator.MigrateFile(ctx, candidateFor(path)); err == nil {
+		t.Fatal("MigrateFile succeeded despite the forced tier-flip failure")
+	}
+	if _, err := m.metadata.db.Exec(`DROP TRIGGER fail_tier_flip`); err != nil {
+		t.Fatalf("drop tier-flip failure trigger: %v", err)
+	}
+
+	coldSize, err := cold.StatFile(ctx, path)
+	if err != nil || coldSize < 0 {
+		t.Fatalf("cold object after failed migration = size %d, err %v; want present", coldSize, err)
+	}
+	manifest := &fakeManifest{hot: hot, entries: map[string]int64{path: coldSize}}
+	m.manifest = manifest
+	if _, _, err := m.syncColdTierMetadata(ctx); err != nil {
+		t.Fatalf("sync failed migration before hot-only pin: %v", err)
+	}
+	if got := fileMeta(t, m, path).Tier; got != TierCold {
+		t.Fatalf("tier after pre-pin sync = %s, want cold", got)
+	}
+	// Model the orphan reconciliation removing the hot manifest entry while
+	// the primary's local hot file remains after a failed hot delete/restart.
+	delete(manifest.entries, path)
 	if err := m.policies.Set(ctx, &DatabasePolicy{Database: "db1", HotOnly: true}); err != nil {
 		t.Fatalf("set hot-only policy: %v", err)
 	}
@@ -125,6 +146,9 @@ func TestHotOnlyCleanupPreservesColdMetadataRows(t *testing.T) {
 	}
 	if got := fileMeta(t, m, path).Tier; got != TierCold {
 		t.Fatalf("metadata tier after sync = %s, want cold", got)
+	}
+	if size, ok := manifest.ManifestEntry(path); ok || size != 0 {
+		t.Fatalf("hot manifest entry after simulated orphan reconciliation = (%d, %v), want absent", size, ok)
 	}
 	if faultyHot.existsCalls != 0 {
 		t.Errorf("hot existence checks = %d, want none for a cold row already in metadata", faultyHot.existsCalls)
