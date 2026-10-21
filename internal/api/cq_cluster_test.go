@@ -722,3 +722,12 @@ func TestCQMirrorDormantsSameNameButDifferentDefinition(t *testing.T) {
 		t.Fatalf("live %d (db %q), dormant %d, dormant history %d", live, db, dormant, dormantExec)
 	}
 }
+
+// The handler flushes runs through the ingest buffer it writes them to.
+func TestCQOutputFlusherIsTheIngestBuffer(t *testing.T) {
+	buf, _ := newDiskGatedBuffer(t, 1<<30)
+	h, _ := newCQHandlerWithQuery(t, buf)
+	if h.outputFlusher == nil {
+		t.Fatal("a run's output is never flushed before its watermark")
+	}
+}
