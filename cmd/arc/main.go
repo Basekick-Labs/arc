@@ -4299,13 +4299,13 @@ func main() {
 	// enabled, runs on cron with conservative grace window + blast cap.
 	var reconciliationScheduler *reconciliation.Scheduler
 	if cfg.Reconciliation.Enabled && clusterCoordinator != nil {
-		gate := newReconciliationClusterGate(clusterCoordinator, cfg.Storage.Backend, cfg.Cluster.ReplicationEnabled, cfg.Cluster.ReplicationCatchUpEnabled)
-		if !isSharedBackend(cfg.Storage.Backend) && cfg.Cluster.ReplicationEnabled && !cfg.Cluster.ReplicationCatchUpEnabled {
-			log.Warn().Msg("cluster.replication_catchup_enabled=false: the reconciler's orphan-manifest sweep is not held until file replication has converged on this node, and a node restored with an empty data disk does not pull back the files it originated. Keep reconciliation in dry run after such a restore, or re-enable the catch-up walker.")
+		gate, backendKind := newReconciliationTopology(clusterCoordinator, storageBackend, cfg.Cluster.ReplicationEnabled, cfg.Cluster.ReplicationCatchUpEnabled)
+		for _, msg := range reconciliationStartupWarnings(gate.shared, cfg.Cluster.ReplicationEnabled, cfg.Cluster.ReplicationCatchUpEnabled, clusterCoordinator.HasCompactorFailover()) {
+			log.Warn().Msg(msg)
 		}
 		recCfg := reconciliation.Config{
 			Enabled:     true,
-			BackendKind: reconciliationBackendKind(cfg.Storage.Backend),
+			BackendKind: backendKind,
 			// The coordinator's id, not the raw config value: it generates
 			// one when cluster.node_id is unset, and it is what every
 			// producer of OriginNodeID stamps into manifest entries. The raw
@@ -5739,6 +5739,12 @@ func (g icebergWriterGate) CanRun() bool { return g.inner.CanCompact() }
 //   - Shared storage (S3, Azure, MinIO): one node sweeps the bucket. Both
 //     halves gate on IsActiveCompactor — reuses the failover-managed
 //     compactor lease as a single-sweeper election with no new state.
+//     Without compactor failover nothing assigns that lease, so no node
+//     reconciles; reconciliationStartupWarnings says so at startup.
+//     Shared is decided from the BUILT backend (cluster.IsSharedObjectStore),
+//     the predicate the pending-registration publisher uses, never from the
+//     config spelling: a string list missed "azblob" and ran every node of
+//     such a cluster as BackendLocal against the one container.
 //   - Local storage: every node walks its own disk against the full
 //     manifest; inside the reconciler the per-file OriginNodeID scopes
 //     only the orphan-manifest direction to entries this node originated.
@@ -5757,7 +5763,7 @@ func (g icebergWriterGate) CanRun() bool { return g.inner.CanCompact() }
 // compile-time dependency on the cluster package.
 type reconciliationClusterGate struct {
 	coordinator reconciliationGateCoordinator
-	shared      bool // true for s3/azure backends — one-node-sweeps semantics
+	shared      bool // the built backend is a shared object store — one-node-sweeps semantics
 	// holdSweepUntilCaughtUp arms the local-storage manifest-sweep hold:
 	// file replication and its catch-up walker are both enabled.
 	holdSweepUntilCaughtUp bool
@@ -5771,12 +5777,39 @@ type reconciliationGateCoordinator interface {
 	GetRole() cluster.NodeRole
 }
 
-func newReconciliationClusterGate(c reconciliationGateCoordinator, backendKind string, replicationEnabled, catchUpEnabled bool) *reconciliationClusterGate {
+func newReconciliationClusterGate(c reconciliationGateCoordinator, shared, replicationEnabled, catchUpEnabled bool) *reconciliationClusterGate {
 	return &reconciliationClusterGate{
 		coordinator:            c,
-		shared:                 isSharedBackend(backendKind),
-		holdSweepUntilCaughtUp: !isSharedBackend(backendKind) && replicationEnabled && catchUpEnabled,
+		shared:                 shared,
+		holdSweepUntilCaughtUp: !shared && replicationEnabled && catchUpEnabled,
 	}
+}
+
+// newReconciliationTopology builds the reconciler's gate and backend kind from
+// the storage backend main.go actually constructed. Both come from one
+// decision so the gate and the reconciler can never disagree about whether
+// the store is shared.
+func newReconciliationTopology(c reconciliationGateCoordinator, backend storage.Backend, replicationEnabled, catchUpEnabled bool) (*reconciliationClusterGate, reconciliation.BackendKind) {
+	shared := cluster.IsSharedObjectStore(backend)
+	kind := reconciliation.BackendLocal
+	if shared {
+		kind = reconciliation.BackendShared
+	}
+	return newReconciliationClusterGate(c, shared, replicationEnabled, catchUpEnabled), kind
+}
+
+// reconciliationStartupWarnings lists what an operator must know about how
+// this node's reconciler is gated. The scheduler logs a gated tick only at
+// Debug, so a configuration that can never run has to be named here.
+func reconciliationStartupWarnings(shared, replicationEnabled, catchUpEnabled, hasCompactorFailover bool) []string {
+	var out []string
+	if shared && !hasCompactorFailover {
+		out = append(out, "reconciliation is enabled on shared storage, where it runs only on the node holding the compactor lease, and this cluster has no compactor failover to assign one: no node will reconcile. Enable cluster.failover_enabled (requires the writer_failover licence feature).")
+	}
+	if !shared && replicationEnabled && !catchUpEnabled {
+		out = append(out, "cluster.replication_catchup_enabled=false: the reconciler's orphan-manifest sweep is not held until file replication has converged on this node, and a node restored with an empty data disk does not pull back the files it originated. Keep reconciliation in dry run after such a restore, or re-enable the catch-up walker.")
+	}
+	return out
 }
 
 func (g *reconciliationClusterGate) ShouldRunStorageScan() bool {
@@ -5798,26 +5831,6 @@ func (g *reconciliationClusterGate) ShouldRunManifestSweep() bool {
 
 func (g *reconciliationClusterGate) Role() string {
 	return string(g.coordinator.GetRole())
-}
-
-// reconciliationBackendKind maps the config storage backend string to
-// the reconciliation package's typed BackendKind.
-func reconciliationBackendKind(backend string) reconciliation.BackendKind {
-	if isSharedBackend(backend) {
-		return reconciliation.BackendShared
-	}
-	return reconciliation.BackendLocal
-}
-
-// isSharedBackend reports whether the configured storage backend is
-// shared across cluster nodes (one source of truth on disk).
-func isSharedBackend(backend string) bool {
-	switch backend {
-	case "s3", "minio", "azure":
-		return true
-	default:
-		return false
-	}
 }
 
 // backupClusterManifest adapts the cluster coordinator to backup.ClusterManifest

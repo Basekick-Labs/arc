@@ -4198,6 +4198,12 @@ func (c *Coordinator) GetActiveCompactorID() string {
 	return c.raftFSM.GetActiveCompactorID()
 }
 
+// HasCompactorFailover reports whether this node runs the compactor failover
+// manager, the only thing that assigns the compactor lease when none is held.
+func (c *Coordinator) HasCompactorFailover() bool {
+	return c.compactorFailoverMgr != nil
+}
+
 // CompactorPreemptCooldown reports how long an operator assignment of the
 // compactor lease suppresses automatic preemption. Zero when this cluster has
 // no compactor failover manager, in which case nothing preempts anyway.
