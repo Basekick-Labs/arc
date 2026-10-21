@@ -113,6 +113,16 @@ type RouterConfig struct {
 	// included; 0 = no bound (#1070). A backstop far above any import's
 	// duration (cluster.import_forward_timeout_ms, default 1 h).
 	ImportTimeout time.Duration
+
+	// SharedSecret and ClusterName sign a forwarded request's identity
+	// (forward_identity.go).
+	SharedSecret string
+	ClusterName  string
+
+	// PeerForwardIdentity reports whether a peer authenticates forwarded
+	// requests by their signed identity; nil, or false for a peer, forwards
+	// the caller's credential as before (no Raft, or an older peer).
+	PeerForwardIdentity func(nodeID string) bool
 }
 
 // Router routes requests to appropriate nodes in the cluster.
@@ -388,6 +398,9 @@ func (r *Router) doForwardOnce(ctx context.Context, client *http.Client, node *N
 	forwardReq.Header.Set("X-Forwarded-For", originalReq.RemoteAddr)
 	forwardReq.Header.Set("X-Arc-Forwarded-By", r.cfg.LocalNode.ID)
 	forwardReq.Header.Set("X-Arc-Original-Host", originalReq.Host)
+	if err := r.signForward(forwardReq, node, ForwardTokenOf(originalReq.Context())); err != nil {
+		return nil, fmt.Errorf("failed to sign forward request: %w", err)
+	}
 	return client.Do(forwardReq)
 }
 
@@ -575,6 +588,9 @@ func (r *Router) doForward(ctx context.Context, client *http.Client, node *Node,
 	forwardReq.Header.Set("X-Forwarded-For", originalReq.RemoteAddr)
 	forwardReq.Header.Set("X-Arc-Forwarded-By", r.cfg.LocalNode.ID)
 	forwardReq.Header.Set("X-Arc-Original-Host", originalReq.Host)
+	if err := r.signForward(forwardReq, node, ForwardTokenOf(originalReq.Context())); err != nil {
+		return nil, fmt.Errorf("failed to sign forward request: %w", err)
+	}
 
 	// Execute the request
 	start := time.Now()
