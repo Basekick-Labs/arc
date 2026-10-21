@@ -199,6 +199,9 @@ const (
 	// CommandClaimFinisher: a node taking (or renewing) the lease to finish
 	// a committed object-store job (#1207 d2a2b).
 	CommandClaimFinisher
+	// CommandEnableClusterPolicies turns the cluster policies flag on, once,
+	// when every node supports it (#1324).
+	CommandEnableClusterPolicies
 )
 
 // Command represents a command to be applied to the FSM.
@@ -585,6 +588,9 @@ type FSMSnapshot struct {
 	// CompactionCommit: the flag and the staged jobs (#1207 d2). nil in an
 	// older snapshot, or before the flag was applied.
 	CompactionCommit *compactionCommitState `json:"compaction_commit,omitempty"`
+	// ClusterPolicies: the flag and the policies (#1324). nil in an older
+	// snapshot, or before the flag was applied.
+	ClusterPolicies *clusterPoliciesState `json:"cluster_policies,omitempty"`
 }
 
 // ClusterFSM implements the raft.FSM interface for cluster state management.
@@ -768,6 +774,8 @@ type ClusterFSM struct {
 	staged           map[string]*StagedCompaction
 	// stagedPaths: input and output paths of staged jobs -> job (derived).
 	stagedPaths map[string]string
+	// clusterPolicies is the #1324 flag. See cluster_policies.go.
+	clusterPolicies bool
 	// Staged-commit callbacks (#1207 d2a2a) and the events an apply queued
 	// for them, delivered once f.mu is released.
 	onCompactionStaged    func(StagedCompaction)
@@ -1251,6 +1259,8 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.applyCleanupCompaction(cmd.Payload)
 	case CommandClaimFinisher:
 		return f.applyClaimFinisher(cmd.Payload)
+	case CommandEnableClusterPolicies:
+		return f.applyEnableClusterPolicies(cmd.Payload)
 	case CommandDeleteFile:
 		return f.applyDeleteFile(cmd.Payload)
 	case CommandAssignCompactor:
@@ -2762,6 +2772,7 @@ func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 
 	return &fsmSnapshot{
 		compactionCommit: f.snapshotCompactionCommitLocked(),
+		clusterPolicies:  f.snapshotClusterPoliciesLocked(),
 		streamClaims:     claimsState,
 		// Raft does not call Apply and Snapshot concurrently, so the two
 		// counters agree here.
@@ -3126,6 +3137,7 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	f.takeover.gen = prevGen + 1
 	f.refreshUnackedDeletesLocked()
 	f.restoreCompactionCommitLocked(snapshot.CompactionCommit)
+	f.restoreClusterPoliciesLocked(snapshot.ClusterPolicies)
 	onCompactionPauseChanged := f.onCompactionPauseChanged
 	f.nodes = restoredNodes
 	f.barriers = restoredBarriers
@@ -3517,6 +3529,7 @@ type fsmSnapshot struct {
 	appliedIndex           uint64
 	streamClaims           *streamClaimsState
 	compactionCommit       *compactionCommitState
+	clusterPolicies        *clusterPoliciesState
 }
 
 // Persist writes the snapshot to the given sink.
@@ -3537,6 +3550,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 		AppliedIndex:           s.appliedIndex,
 		StreamClaims:           s.streamClaims,
 		CompactionCommit:       s.compactionCommit,
+		ClusterPolicies:        s.clusterPolicies,
 	}
 
 	data, err := json.Marshal(snapshot)
