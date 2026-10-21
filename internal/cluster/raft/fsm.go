@@ -202,6 +202,13 @@ const (
 	// CommandEnableClusterPolicies turns the cluster policies flag on, once,
 	// when every node supports it (#1324).
 	CommandEnableClusterPolicies
+	// CommandSetTieringPolicy / CommandDeleteTieringPolicy: a database's
+	// tiering policy, once tiering policies are seeded (#1324).
+	CommandSetTieringPolicy
+	CommandDeleteTieringPolicy
+	// CommandSeedPolicies: the leader installing a kind's adopted policies,
+	// once (#1324).
+	CommandSeedPolicies
 )
 
 // Command represents a command to be applied to the FSM.
@@ -774,8 +781,12 @@ type ClusterFSM struct {
 	staged           map[string]*StagedCompaction
 	// stagedPaths: input and output paths of staged jobs -> job (derived).
 	stagedPaths map[string]string
-	// clusterPolicies is the #1324 flag. See cluster_policies.go.
+	// clusterPolicies is the #1324 flag; policiesSeeded the kinds whose
+	// policies live here; tieringPolicies by database. See
+	// cluster_policies.go.
 	clusterPolicies bool
+	policiesSeeded  map[string]bool
+	tieringPolicies map[string]*TieringPolicyEntry
 	// Staged-commit callbacks (#1207 d2a2a) and the events an apply queued
 	// for them, delivered once f.mu is released.
 	onCompactionStaged    func(StagedCompaction)
@@ -863,6 +874,8 @@ func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 		takeover:                newTakeoverState(),
 		staged:                  map[string]*StagedCompaction{},
 		stagedPaths:             map[string]string{},
+		policiesSeeded:          map[string]bool{},
+		tieringPolicies:         map[string]*TieringPolicyEntry{},
 
 		logger: logger.With().Str("component", "cluster-fsm").Logger(),
 	}
@@ -1261,6 +1274,12 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.applyClaimFinisher(cmd.Payload)
 	case CommandEnableClusterPolicies:
 		return f.applyEnableClusterPolicies(cmd.Payload)
+	case CommandSetTieringPolicy:
+		return f.applySetTieringPolicy(cmd.Payload, log.Index)
+	case CommandDeleteTieringPolicy:
+		return f.applyDeleteTieringPolicy(cmd.Payload)
+	case CommandSeedPolicies:
+		return f.applySeedPolicies(cmd.Payload, log.Index)
 	case CommandDeleteFile:
 		return f.applyDeleteFile(cmd.Payload)
 	case CommandAssignCompactor:

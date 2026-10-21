@@ -3,8 +3,10 @@ package tiering
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/config"
@@ -45,6 +47,10 @@ type PolicyStore struct {
 	// per-database: a bump for an unrelated database only costs one extra
 	// DB query on the next Get for the skipped name.
 	gen uint64
+
+	// cluster is the cluster's copy of the policies, used instead of the
+	// local table once it holds them (#1324; see cluster_policies.go).
+	cluster atomic.Pointer[clusterSourceHolder]
 }
 
 // NewPolicyStore creates a new policy store
@@ -120,6 +126,12 @@ func (s *PolicyStore) loadCache() error {
 
 // Get retrieves a policy for a specific database
 func (s *PolicyStore) Get(ctx context.Context, database string) (*DatabasePolicy, error) {
+	if src := s.clusterSource(); src != nil {
+		if p, ok := src.Get(database); ok {
+			return p, nil
+		}
+		return nil, nil
+	}
 	s.mu.RLock()
 	policy, exists := s.cache[database]
 	gen := s.gen
@@ -187,6 +199,14 @@ func (s *PolicyStore) getFromDB(ctx context.Context, database string) (*Database
 
 // Set creates or updates a policy for a database
 func (s *PolicyStore) Set(ctx context.Context, policy *DatabasePolicy) error {
+	if src := s.clusterSource(); src != nil {
+		if err := src.Set(ctx, policy); err != nil {
+			return fmt.Errorf("failed to set policy: %w", err)
+		}
+		s.logger.Info().Str("database", policy.Database).Bool("hot_only", policy.HotOnly).
+			Msg("Tiering policy updated cluster-wide")
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -222,6 +242,17 @@ func (s *PolicyStore) Set(ctx context.Context, policy *DatabasePolicy) error {
 
 // Delete removes a policy for a database (reverts to global defaults)
 func (s *PolicyStore) Delete(ctx context.Context, database string) error {
+	if src := s.clusterSource(); src != nil {
+		if err := src.Delete(ctx, database); err != nil {
+			if errors.Is(err, ErrPolicyNotFound) {
+				return fmt.Errorf("policy not found for database: %s: %w", database, ErrPolicyNotFound)
+			}
+			return fmt.Errorf("failed to delete policy: %w", err)
+		}
+		s.logger.Info().Str("database", database).
+			Msg("Tiering policy deleted cluster-wide, reverting to global defaults")
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -233,7 +264,7 @@ func (s *PolicyStore) Delete(ctx context.Context, database string) error {
 
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("policy not found for database: %s", database)
+		return fmt.Errorf("policy not found for database: %s: %w", database, ErrPolicyNotFound)
 	}
 
 	// Remove from cache
@@ -249,6 +280,9 @@ func (s *PolicyStore) Delete(ctx context.Context, database string) error {
 
 // List returns all custom policies
 func (s *PolicyStore) List(ctx context.Context) ([]DatabasePolicy, error) {
+	if src := s.clusterSource(); src != nil {
+		return src.List(), nil
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 

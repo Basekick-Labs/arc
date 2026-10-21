@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -132,4 +133,73 @@ func (c *Coordinator) ClusterPoliciesStatus() ClusterPoliciesStatus {
 		st.Blocking = *b
 	}
 	return st
+}
+
+// policyProposeTimeout bounds one policy write, as proposeTimeout does for
+// auth writes.
+const policyProposeTimeout = 5 * time.Second
+
+// proposePolicy applies a policy command on the leader, or forwards it and
+// waits until this node has applied it, so the caller reads its own write.
+func (c *Coordinator) proposePolicy(ctx context.Context, cmdType raft.CommandType, payload interface{}) error {
+	if c == nil || c.raftNode == nil {
+		return errors.New("cluster policies: raft not initialized")
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	cmd := &raft.Command{Type: cmdType, Payload: raw}
+	if c.raftNode.IsLeader() {
+		return c.raftNode.Apply(cmd, policyProposeTimeout)
+	}
+	ctx, cancel := context.WithTimeout(ctx, policyProposeTimeout)
+	defer cancel()
+	return c.forwardAndWaitHere(ctx, cmd)
+}
+
+// PoliciesSeeded reports whether kind's policies live in the cluster state.
+// Until then they stay in each node's SQLite, as before #1324.
+func (c *Coordinator) PoliciesSeeded(kind string) bool {
+	if c == nil || c.raftNode == nil {
+		return false
+	}
+	fsm := c.raftNode.FSM()
+	return fsm != nil && fsm.ClusterPoliciesEnabled() && fsm.PoliciesSeeded(kind)
+}
+
+// TieringPolicy returns database's tiering policy from the cluster state.
+func (c *Coordinator) TieringPolicy(database string) (raft.TieringPolicyEntry, bool) {
+	if fsm := c.fsmOrNil(); fsm != nil {
+		return fsm.TieringPolicy(database)
+	}
+	return raft.TieringPolicyEntry{}, false
+}
+
+// TieringPolicies returns every tiering policy in the cluster state.
+func (c *Coordinator) TieringPolicies() []raft.TieringPolicyEntry {
+	if fsm := c.fsmOrNil(); fsm != nil {
+		return fsm.TieringPolicies()
+	}
+	return nil
+}
+
+// SetTieringPolicy creates or replaces database's tiering policy cluster-wide.
+func (c *Coordinator) SetTieringPolicy(ctx context.Context, database string, hotOnly bool, hotMaxAgeDays *int) error {
+	return c.proposePolicy(ctx, raft.CommandSetTieringPolicy, raft.SetTieringPolicyPayload{
+		Database: database, HotOnly: hotOnly, HotMaxAgeDays: hotMaxAgeDays, Now: time.Now().UTC(),
+	})
+}
+
+// DeleteTieringPolicy removes database's tiering policy cluster-wide. A
+// missing policy is raft.ErrPolicyNotFound (raft.IsPolicyNotFound).
+func (c *Coordinator) DeleteTieringPolicy(ctx context.Context, database string) error {
+	return c.proposePolicy(ctx, raft.CommandDeleteTieringPolicy, raft.DeleteTieringPolicyPayload{Database: database})
+}
+
+func (c *Coordinator) fsmOrNil() *raft.ClusterFSM {
+	if c == nil || c.raftNode == nil {
+		return nil
+	}
+	return c.raftNode.FSM()
 }

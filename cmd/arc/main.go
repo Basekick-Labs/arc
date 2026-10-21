@@ -4537,6 +4537,14 @@ func main() {
 						tieringDB.Close()
 					}
 				} else {
+					// Cluster-wide tiering policies (#1324): once the cluster
+					// has seeded them, every node reads and writes the same
+					// policies through Raft instead of its own table.
+					if clusterCoordinator != nil {
+						if src := cluster.NewTieringPolicySource(clusterCoordinator); src != nil {
+							tieringManager.GetPolicies().SetClusterSource(src)
+						}
+					}
 					// The startup tier scan runs in the background below, and
 					// it writes through the same SQLite handle the shutdown
 					// step may close. Its context and completion channel are

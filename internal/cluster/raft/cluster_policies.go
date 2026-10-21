@@ -2,8 +2,10 @@ package raft
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -24,10 +26,66 @@ import (
 // the policy commands.
 const CapabilityClusterPolicies = "cluster_policies_v1"
 
+// Policy kinds. Each is seeded once from the nodes' existing rows; until
+// then that kind stays in each node's own SQLite exactly as before.
+const (
+	PolicyKindTiering = "tiering"
+)
+
+// maxPolicyDatabaseLen bounds a policy's database name.
+const maxPolicyDatabaseLen = 256
+
+// TieringPolicyEntry is one database's tiering policy. ID is the log index
+// that created it.
+type TieringPolicyEntry struct {
+	ID            int64     `json:"id"`
+	Database      string    `json:"database"`
+	HotOnly       bool      `json:"hot_only"`
+	HotMaxAgeDays *int      `json:"hot_max_age_days,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+// SetTieringPolicyPayload creates or replaces a database's tiering policy.
+type SetTieringPolicyPayload struct {
+	Database      string    `json:"database"`
+	HotOnly       bool      `json:"hot_only"`
+	HotMaxAgeDays *int      `json:"hot_max_age_days,omitempty"`
+	Now           time.Time `json:"now"`
+}
+
+// DeleteTieringPolicyPayload removes a database's tiering policy.
+type DeleteTieringPolicyPayload struct {
+	Database string `json:"database"`
+}
+
+// SeedPoliciesPayload installs a kind's adopted policies, once. Proposed by
+// the leader only.
+type SeedPoliciesPayload struct {
+	Kind    string               `json:"kind"`
+	Tiering []TieringPolicyEntry `json:"tiering,omitempty"`
+	Now     time.Time            `json:"now"`
+}
+
+// ErrPolicyNotFound: a delete of a policy that does not exist.
+var ErrPolicyNotFound = errors.New("policy not found")
+
+// ErrPoliciesNotSeeded: a policy command for a kind not yet seeded. Until a
+// kind is seeded its policies live in each node's SQLite.
+var ErrPoliciesNotSeeded = errors.New("cluster policies are not in effect for this kind yet")
+
+// IsPolicyNotFound reports ErrPolicyNotFound, typed or as text (a refusal
+// forwarded from the leader arrives as text).
+func IsPolicyNotFound(err error) bool {
+	return err != nil && (errors.Is(err, ErrPolicyNotFound) || strings.Contains(err.Error(), ErrPolicyNotFound.Error()))
+}
+
 // clusterPoliciesState is the snapshot form of the flag and the policies. nil
 // in an older snapshot, or before the flag was applied.
 type clusterPoliciesState struct {
-	Enabled bool `json:"enabled"`
+	Enabled bool                  `json:"enabled"`
+	Seeded  []string              `json:"seeded,omitempty"`
+	Tiering []*TieringPolicyEntry `json:"tiering,omitempty"`
 }
 
 // EnableClusterPoliciesPayload turns the flag on; see
@@ -73,13 +131,188 @@ func (f *ClusterFSM) applyEnableClusterPolicies(payload []byte) interface{} {
 	return nil
 }
 
+// PoliciesSeeded reports whether kind has been seeded: its policies live here
+// from then on.
+func (f *ClusterFSM) PoliciesSeeded(kind string) bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.policiesSeeded[kind]
+}
+
+// TieringPolicy returns a copy of database's tiering policy.
+func (f *ClusterFSM) TieringPolicy(database string) (TieringPolicyEntry, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	e, ok := f.tieringPolicies[database]
+	if !ok {
+		return TieringPolicyEntry{}, false
+	}
+	return copyTieringPolicy(e), true
+}
+
+// TieringPolicies returns a copy of every tiering policy, by database.
+func (f *ClusterFSM) TieringPolicies() []TieringPolicyEntry {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.tieringPoliciesLocked()
+}
+
+func copyTieringPolicy(e *TieringPolicyEntry) TieringPolicyEntry {
+	c := *e
+	if e.HotMaxAgeDays != nil {
+		v := *e.HotMaxAgeDays
+		c.HotMaxAgeDays = &v
+	}
+	return c
+}
+
+// policyKindReadyLocked refuses a policy command before the flag is on or
+// before its kind is seeded.
+func (f *ClusterFSM) policyKindReadyLocked(kind string) error {
+	if !f.clusterPolicies {
+		return errors.New("cluster policies are not enabled")
+	}
+	if !f.policiesSeeded[kind] {
+		return fmt.Errorf("%w: %s", ErrPoliciesNotSeeded, kind)
+	}
+	return nil
+}
+
+func validPolicyDatabase(db string) error {
+	if db == "" || len(db) > maxPolicyDatabaseLen {
+		return fmt.Errorf("a database name of 1 to %d bytes is required", maxPolicyDatabaseLen)
+	}
+	return nil
+}
+
+func (f *ClusterFSM) applySetTieringPolicy(payload []byte, logIndex uint64) interface{} {
+	var p SetTieringPolicyPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal set tiering policy payload: %w", err)
+	}
+	if err := validPolicyDatabase(p.Database); err != nil {
+		return fmt.Errorf("set tiering policy: %w", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.policyKindReadyLocked(PolicyKindTiering); err != nil {
+		return fmt.Errorf("set tiering policy: %w", err)
+	}
+	e := &TieringPolicyEntry{
+		ID: int64(logIndex), Database: p.Database, HotOnly: p.HotOnly, HotMaxAgeDays: p.HotMaxAgeDays,
+		CreatedAt: p.Now, UpdatedAt: p.Now,
+	}
+	if prev, ok := f.tieringPolicies[p.Database]; ok {
+		// A replace keeps the policy's identity.
+		e.ID, e.CreatedAt = prev.ID, prev.CreatedAt
+	}
+	f.tieringPolicies[p.Database] = e
+	return nil
+}
+
+func (f *ClusterFSM) applyDeleteTieringPolicy(payload []byte) interface{} {
+	var p DeleteTieringPolicyPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal delete tiering policy payload: %w", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.policyKindReadyLocked(PolicyKindTiering); err != nil {
+		return fmt.Errorf("delete tiering policy: %w", err)
+	}
+	if _, ok := f.tieringPolicies[p.Database]; !ok {
+		return fmt.Errorf("delete tiering policy for %q: %w", p.Database, ErrPolicyNotFound)
+	}
+	delete(f.tieringPolicies, p.Database)
+	return nil
+}
+
+func (f *ClusterFSM) applySeedPolicies(payload []byte, logIndex uint64) interface{} {
+	var p SeedPoliciesPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal seed policies payload: %w", err)
+	}
+	if p.Kind != PolicyKindTiering {
+		return fmt.Errorf("seed policies: unknown kind %q", p.Kind)
+	}
+	seen := make(map[string]bool, len(p.Tiering))
+	for _, e := range p.Tiering {
+		if err := validPolicyDatabase(e.Database); err != nil {
+			return fmt.Errorf("seed policies: %w", err)
+		}
+		if seen[e.Database] {
+			return fmt.Errorf("seed policies: database %q listed twice", e.Database)
+		}
+		seen[e.Database] = true
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.clusterPolicies {
+		return errors.New("seed policies: cluster policies are not enabled")
+	}
+	if f.policiesSeeded[p.Kind] {
+		// Seeded once: a second seed (a leader change mid-seed) is a no-op.
+		return nil
+	}
+	for i := range p.Tiering {
+		e := p.Tiering[i]
+		c := copyTieringPolicy(&e)
+		c.ID = int64(logIndex)
+		if c.CreatedAt.IsZero() {
+			c.CreatedAt = p.Now
+		}
+		if c.UpdatedAt.IsZero() {
+			c.UpdatedAt = p.Now
+		}
+		f.tieringPolicies[c.Database] = &c
+	}
+	f.policiesSeeded[p.Kind] = true
+	f.logger.Info().Str("kind", p.Kind).Int("policies", len(p.Tiering)).Msg("Cluster policies seeded")
+	return nil
+}
+
 func (f *ClusterFSM) snapshotClusterPoliciesLocked() *clusterPoliciesState {
 	if !f.clusterPolicies {
 		return nil
 	}
-	return &clusterPoliciesState{Enabled: true}
+	st := &clusterPoliciesState{Enabled: true}
+	for kind, ok := range f.policiesSeeded {
+		if ok {
+			st.Seeded = append(st.Seeded, kind)
+		}
+	}
+	sort.Strings(st.Seeded)
+	for _, e := range f.tieringPoliciesLocked() {
+		c := e
+		st.Tiering = append(st.Tiering, &c)
+	}
+	return st
+}
+
+// tieringPoliciesLocked is TieringPolicies with f.mu already held.
+func (f *ClusterFSM) tieringPoliciesLocked() []TieringPolicyEntry {
+	out := make([]TieringPolicyEntry, 0, len(f.tieringPolicies))
+	for _, e := range f.tieringPolicies {
+		out = append(out, copyTieringPolicy(e))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Database < out[j].Database })
+	return out
 }
 
 func (f *ClusterFSM) restoreClusterPoliciesLocked(st *clusterPoliciesState) {
 	f.clusterPolicies = st != nil && st.Enabled
+	f.policiesSeeded = map[string]bool{}
+	f.tieringPolicies = map[string]*TieringPolicyEntry{}
+	if st == nil {
+		return
+	}
+	for _, kind := range st.Seeded {
+		f.policiesSeeded[kind] = true
+	}
+	for _, e := range st.Tiering {
+		if e != nil && e.Database != "" {
+			c := copyTieringPolicy(e)
+			f.tieringPolicies[c.Database] = &c
+		}
+	}
 }

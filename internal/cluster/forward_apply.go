@@ -671,7 +671,13 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		cmd.Type == clusterraft.CommandCleanupCompaction ||
 		cmd.Type == clusterraft.CommandClaimFinisher
 	isCompactionHeld := cmd.Type == clusterraft.CommandCompactionHeld
-	if !isManifest && !isAuth && !isRBAC && !isBarrier && !isPauseSet && !isPauseAck && !isTakeOver && !isCompaction && !isCompactionHeld {
+	// Policy definitions (#1324): same rule as the auth commands, any known
+	// authenticated peer (the admin check happened on the node that took
+	// the HTTP call). CommandSeedPolicies is leader-only and never accepted
+	// from a peer.
+	isPolicy := cmd.Type == clusterraft.CommandSetTieringPolicy ||
+		cmd.Type == clusterraft.CommandDeleteTieringPolicy
+	if !isManifest && !isAuth && !isRBAC && !isBarrier && !isPauseSet && !isPauseAck && !isTakeOver && !isCompaction && !isCompactionHeld && !isPolicy {
 		c.logger.Warn().
 			Str("requesting_node", req.NodeID).
 			Int("cmd_type", int(cmd.Type)).
