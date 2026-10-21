@@ -427,3 +427,26 @@ func TestAdoptPoliciesEndpointValidates(t *testing.T) {
 		}
 	}
 }
+
+// A retention database of its own (retention.db_path off the auth database)
+// opens with the auth database's settings: the history's foreign key is
+// enforced, which the mirror's rewrite depends on.
+func TestRetentionSeparateDBEnforcesForeignKeys(t *testing.T) {
+	dir := t.TempDir()
+	am, err := auth.NewAuthManager(filepath.Join(dir, "auth.db"), time.Minute, 10, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer am.Close()
+	h, err := NewRetentionHandler(nil, nil, &config.RetentionConfig{Enabled: true, DBPath: filepath.Join(dir, "retention.db")}, nil, am, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	if !h.ownsDB {
+		t.Fatal("the test needs a database of retention's own")
+	}
+	if _, err := h.db.Exec(`INSERT INTO retention_executions (policy_id, status) VALUES (42, 'completed')`); err == nil {
+		t.Fatal("an execution of a policy that does not exist was stored: foreign keys are off")
+	}
+}
