@@ -1414,51 +1414,6 @@ func (s *MetadataStore) GetRecentMigrations(ctx context.Context, limit int) ([]M
 	return records, nil
 }
 
-// GetLatestMigrationForFile returns the most recently started migration for a
-// path. Tiering uses it to distinguish a cold object left by a failed
-// migration from an unrelated cold object at the same key.
-func (s *MetadataStore) GetLatestMigrationForFile(ctx context.Context, path string) (*MigrationRecord, error) {
-	query := `
-		SELECT id, file_path, database, from_tier, to_tier, size_bytes, started_at, completed_at, error
-		FROM tier_migrations
-		WHERE file_path = ?
-		ORDER BY started_at DESC, id DESC
-		LIMIT 1
-	`
-
-	var record MigrationRecord
-	var fromTier, toTier string
-	var completedAt sql.NullTime
-	var errorMsg sql.NullString
-	err := s.db.QueryRowContext(ctx, query, path).Scan(
-		&record.ID,
-		&record.FilePath,
-		&record.Database,
-		&fromTier,
-		&toTier,
-		&record.SizeBytes,
-		&record.StartedAt,
-		&completedAt,
-		&errorMsg,
-	)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to get latest migration for %q: %w", path, err)
-	}
-
-	record.FromTier = TierFromString(fromTier)
-	record.ToTier = TierFromString(toTier)
-	if completedAt.Valid {
-		record.CompletedAt = &completedAt.Time
-	}
-	if errorMsg.Valid {
-		record.Error = errorMsg.String
-	}
-	return &record, nil
-}
-
 // CleanupOldMigrations deletes migration records older than retentionDays.
 // A retentionDays of 0 or less is a no-op (keep all records).
 // Uses s.db directly; SQLite handles locking between concurrent operations.
