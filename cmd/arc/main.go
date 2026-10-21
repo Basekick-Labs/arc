@@ -4170,6 +4170,13 @@ func main() {
 		}
 		if clusterCoordinator != nil {
 			cqHandler.SetCoordinator(clusterCoordinator)
+			// Cluster-wide continuous queries (#1324): the lister answers
+			// the cluster's adoption; the mirror keeps this node's tables
+			// equal to the cluster's once adopted and keeps every node's
+			// scheduler jobs on the cluster's CQs.
+			cqHandler.SetClusterSource(clusterCoordinator)
+			clusterCoordinator.SetLocalPolicyLister(clusterraft.PolicyKindCQ, cqHandler.LocalPolicyLister())
+			clusterCoordinator.RunPolicyMirror(clusterraft.PolicyKindCQ, cqHandler.MirrorClusterPolicies)
 		}
 		cqHandler.RegisterRoutes(server.GetApp())
 		shutdownCoordinator.RegisterHook("continuous-query", func(ctx context.Context) error {
@@ -4178,6 +4185,11 @@ func main() {
 		log.Info().Str("db_path", cfg.ContinuousQuery.DBPath).Msg("Continuous queries enabled")
 	} else {
 		log.Info().Msg("Continuous queries DISABLED")
+		if clusterCoordinator != nil {
+			// Runs none here, but its database may still hold continuous
+			// queries of when it did: they count in the cluster's adoption.
+			clusterCoordinator.SetLocalPolicyLister(clusterraft.PolicyKindCQ, api.CQTableLister(authManager, cfg.ContinuousQuery.DBPath))
+		}
 	}
 
 	// Shared-storage mode without a running cluster coordinator: every

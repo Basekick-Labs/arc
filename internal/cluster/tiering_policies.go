@@ -158,11 +158,18 @@ func (c *Coordinator) RunPolicyMirror(kind string, mirror func(ctx context.Conte
 	notify()
 	ctx := c.ctxOrBackground()
 	go func() {
+		// A periodic pass too: a continuous query's watermark moves without
+		// a signal (it changes at every run), and a change applied before
+		// the callback was registered is picked up. A pass with nothing to
+		// change writes nothing.
+		periodic := time.NewTicker(policyMirrorEvery)
+		defer periodic.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-signal:
+			case <-periodic.C:
 			}
 			if err := mirror(ctx); err != nil {
 				c.logger.Warn().Err(err).Str("kind", kind).Msg("Could not mirror the cluster's policies into this node's database; a backup taken now may carry older ones")

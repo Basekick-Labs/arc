@@ -398,8 +398,8 @@ func (f *ClusterFSM) applyChoosePolicyAdoption(payload []byte) interface{} {
 	}
 	// Tiering always seeds on its own (its merge never refuses): only
 	// retention waits for a choice.
-	if p.Kind != PolicyKindRetention || p.Node == "" || p.Hash == "" {
-		return fmt.Errorf("choose policy adoption: the retention kind, a node and a hash are required (kind %q)", p.Kind)
+	if (p.Kind != PolicyKindRetention && p.Kind != PolicyKindCQ) || p.Node == "" || p.Hash == "" {
+		return fmt.Errorf("choose policy adoption: the retention or cq kind, a node and a hash are required (kind %q)", p.Kind)
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -420,8 +420,8 @@ func (f *ClusterFSM) applyChoosePolicyAdoption(payload []byte) interface{} {
 // unique names, and with kept IDs, unique IDs below the floor. The day rules
 // are not re-checked: the leader seeds only rows that pass them.
 func validRetentionSeed(p *SeedPoliciesPayload) error {
-	if len(p.Tiering) > 0 {
-		return errors.New("tiering rows in a retention seed")
+	if len(p.Tiering) > 0 || len(p.CQ) > 0 {
+		return errors.New("tiering or continuous query rows in a retention seed")
 	}
 	if len(p.Retention) > MaxSeedRetentionPolicies {
 		return fmt.Errorf("%d retention policies exceed %d", len(p.Retention), MaxSeedRetentionPolicies)

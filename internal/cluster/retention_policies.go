@@ -81,8 +81,11 @@ func (c *Coordinator) policyKindActive(kind string) bool {
 	if fsm == nil || !fsm.ClusterPoliciesEnabled() {
 		return false
 	}
-	if kind == raft.PolicyKindRetention {
+	switch kind {
+	case raft.PolicyKindRetention:
 		return fsm.RetentionPoliciesEnabled()
+	case raft.PolicyKindCQ:
+		return fsm.CQPoliciesEnabled()
 	}
 	return true
 }
@@ -419,21 +422,30 @@ func (c *Coordinator) RetentionCandidates(ctx context.Context) (RetentionCandida
 // policies the cluster adopts; the leader's adoption loop acts on it. Leader
 // only, so the choice never travels the peer forwarding path.
 func (c *Coordinator) ChooseRetentionAdoption(node, hash, by string) error {
-	if !c.policyKindActive(raft.PolicyKindRetention) {
+	return c.ChoosePolicyAdoption(raft.PolicyKindRetention, node, hash, by)
+}
+
+// ChoosePolicyAdoption records an admin's choice of node whose policies of
+// kind (retention or cq) the cluster adopts. Leader only.
+func (c *Coordinator) ChoosePolicyAdoption(kind, node, hash, by string) error {
+	if !c.policyKindActive(kind) {
+		if kind == raft.PolicyKindCQ {
+			return ErrCQPoliciesNotEnabled
+		}
 		return ErrRetentionPoliciesNotEnabled
 	}
 	if !c.raftNode.IsLeader() {
 		return ErrNotLeaderForTopology
 	}
 	fsm := c.fsmOrNil()
-	if fsm.PoliciesSeeded(raft.PolicyKindRetention) {
+	if fsm.PoliciesSeeded(kind) {
 		return ErrPolicyAdoptionNotNeeded
 	}
 	if _, ok := fsm.GetNode(node); !ok {
 		return fmt.Errorf("%w: %q", ErrUnknownPolicyNode, node)
 	}
 	_, err := c.proposeLeader(raft.CommandChoosePolicyAdoption, raft.ChoosePolicyAdoptionPayload{
-		Kind: raft.PolicyKindRetention, Node: node, Hash: strings.TrimSpace(hash), By: by, Now: time.Now().UTC(),
+		Kind: kind, Node: node, Hash: strings.TrimSpace(hash), By: by, Now: time.Now().UTC(),
 	})
 	if err != nil {
 		return err

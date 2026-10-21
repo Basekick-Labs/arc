@@ -681,8 +681,26 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		cmd.Type == clusterraft.CommandDeleteTieringPolicy ||
 		cmd.Type == clusterraft.CommandCreateRetentionPolicy ||
 		cmd.Type == clusterraft.CommandUpdateRetentionPolicy ||
-		cmd.Type == clusterraft.CommandDeleteRetentionPolicy
-	if !isManifest && !isAuth && !isRBAC && !isBarrier && !isPauseSet && !isPauseAck && !isTakeOver && !isCompaction && !isCompactionHeld && !isPolicy {
+		cmd.Type == clusterraft.CommandDeleteRetentionPolicy ||
+		cmd.Type == clusterraft.CommandCreateCQ ||
+		cmd.Type == clusterraft.CommandUpdateCQ ||
+		cmd.Type == clusterraft.CommandDeleteCQ
+	// A continuous query's watermark is set by the primary writer, which in
+	// local-storage mode need not be the Raft leader. The FSM decides who
+	// may set it (applySetCQWatermark); refused here early are a watermark
+	// that speaks for another node, one whose shared-storage claim does not
+	// match this cluster's mode (the claim would otherwise open the FSM's
+	// no-designated-primary path in local mode), and any forwarded one in
+	// shared-storage mode, where the primary is the leader itself.
+	isWatermark := cmd.Type == clusterraft.CommandSetCQWatermark
+	if isWatermark {
+		if why := c.watermarkForwardRefusal(&cmd, req.NodeID); why != "" {
+			c.logger.Warn().Str("requesting_node", req.NodeID).Msg("ForwardApply rejected: " + why)
+			c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, why)
+			return
+		}
+	}
+	if !isManifest && !isAuth && !isRBAC && !isBarrier && !isPauseSet && !isPauseAck && !isTakeOver && !isCompaction && !isCompactionHeld && !isPolicy && !isWatermark {
 		c.logger.Warn().
 			Str("requesting_node", req.NodeID).
 			Int("cmd_type", int(cmd.Type)).
@@ -1120,4 +1138,23 @@ func (c *Coordinator) forwardAndWaitHere(ctx context.Context, cmd *clusterraft.C
 			Msg("Forwarded command committed but not yet applied on this node")
 	}
 	return nil
+}
+
+// watermarkForwardRefusal says why a forwarded CQ watermark is refused, or "".
+func (c *Coordinator) watermarkForwardRefusal(cmd *clusterraft.Command, sender string) string {
+	shared := c.cfg != nil && c.cfg.SharedStorageMode
+	if shared {
+		return "a continuous query watermark is set by the leader itself in shared-storage mode"
+	}
+	var p clusterraft.SetCQWatermarkPayload
+	if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+		return "unreadable continuous query watermark"
+	}
+	if p.Proposer != sender {
+		return "a continuous query watermark must be proposed by the node that sends it"
+	}
+	if p.Shared != shared {
+		return "the continuous query watermark's storage mode does not match the cluster's"
+	}
+	return ""
 }

@@ -226,6 +226,15 @@ const (
 	// CommandChoosePolicyAdoption: an admin choosing the node whose policies
 	// of a kind the cluster adopts. Leader only.
 	CommandChoosePolicyAdoption
+	// CommandEnableCQPolicies turns the continuous query flag on (#1324
+	// stage 3); CommandCreateCQ / CommandUpdateCQ / CommandDeleteCQ: the
+	// definitions; CommandSetCQWatermark: the primary's compare-and-set of a
+	// CQ's watermark.
+	CommandEnableCQPolicies
+	CommandCreateCQ
+	CommandUpdateCQ
+	CommandDeleteCQ
+	CommandSetCQWatermark
 )
 
 // Command represents a command to be applied to the FSM.
@@ -816,6 +825,10 @@ type ClusterFSM struct {
 	retentionSeq       int64
 	retentionFloor     int64
 	retentionSeededIDs map[int64]bool
+	// Continuous queries (#1324 stage 3), see cq_policies.go.
+	cqEnabled bool
+	cqs       map[int64]*CQEntry
+	cqSeq     int64
 	// policyAdoptChoice: an admin's pending choice of node, per kind.
 	policyAdoptChoice map[string]*PolicyAdoptChoice
 	// onPoliciesChanged: AddPoliciesChangedCallback.
@@ -915,6 +928,7 @@ func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 		retentionPolicies:       map[int64]*RetentionPolicyEntry{},
 		retentionSeededIDs:      map[int64]bool{},
 		policyAdoptChoice:       map[string]*PolicyAdoptChoice{},
+		cqs:                     map[int64]*CQEntry{},
 
 		logger: logger.With().Str("component", "cluster-fsm").Logger(),
 	}
@@ -1333,6 +1347,18 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.policiesChangedIfApplied(f.applyDeleteRetentionPolicy(cmd.Payload))
 	case CommandChoosePolicyAdoption:
 		return f.applyChoosePolicyAdoption(cmd.Payload)
+	case CommandEnableCQPolicies:
+		return f.applyEnableCQPolicies(cmd.Payload)
+	case CommandCreateCQ:
+		return f.policiesChangedIfApplied(f.applyCreateCQ(cmd.Payload))
+	case CommandUpdateCQ:
+		return f.policiesChangedIfApplied(f.applyUpdateCQ(cmd.Payload))
+	case CommandDeleteCQ:
+		return f.policiesChangedIfApplied(f.applyDeleteCQ(cmd.Payload))
+	case CommandSetCQWatermark:
+		// No mirror signal: a watermark moves at every run, and the mirrors
+		// pick it up on their periodic pass.
+		return f.applySetCQWatermark(cmd.Payload)
 	case CommandDeleteFile:
 		return f.applyDeleteFile(cmd.Payload)
 	case CommandAssignCompactor:
