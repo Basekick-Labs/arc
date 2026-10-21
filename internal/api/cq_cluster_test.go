@@ -569,8 +569,17 @@ func TestCQMirrorBehindTheClusterKeepsNewerRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.h.SetClusterSource(restoredSource(t, old))
-	if err := r.h.MirrorClusterPolicies(context.Background()); err != nil {
-		t.Fatal(err)
+	// Twice: a second pass, still behind, must not take the row for one the
+	// cluster never adopted either.
+	for i := 0; i < 2; i++ {
+		if err := r.h.MirrorClusterPolicies(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var dormant int
+	r.h.sqliteDB.QueryRow(`SELECT COUNT(*) FROM continuous_queries_dormant`).Scan(&dormant)
+	if dormant != 0 {
+		t.Fatal("the newer CQ went dormant")
 	}
 	var rows, history int
 	r.h.sqliteDB.QueryRow(`SELECT COUNT(*) FROM continuous_queries WHERE id = 2`).Scan(&rows)
@@ -607,8 +616,13 @@ func TestRetentionMirrorBehindTheClusterKeepsNewerRows(t *testing.T) {
 	}
 	r.exec(t, `INSERT INTO retention_executions (policy_id, status) VALUES (2, 'completed')`)
 	r.h.SetClusterSource(restoredSource(t, old))
-	if err := r.h.MirrorClusterPolicies(ctx); err != nil {
-		t.Fatal(err)
+	for i := 0; i < 2; i++ {
+		if err := r.h.MirrorClusterPolicies(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := r.count(t, `SELECT COUNT(*) FROM retention_policies_dormant`); n != 0 {
+		t.Fatal("the newer policy went dormant")
 	}
 	if n := r.count(t, `SELECT COUNT(*) FROM retention_executions WHERE policy_id = 2`) + r.count(t, `SELECT COUNT(*) FROM retention_policies WHERE id = 2`); n != 2 {
 		t.Fatalf("the newer policy's row and history were dropped (%d left)", n)
