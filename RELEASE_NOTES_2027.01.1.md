@@ -1252,6 +1252,8 @@ an unbounded operation.
 Validation errors now state the allowed prefix characters explicitly, so
 sanitized logs remain actionable even when the rejected value is masked.
 
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1326](https://github.com/Basekick-Labs/arc/pull/1326).
+
 ### Setting a database to `hot_only` reports existing cold files ([#1304](https://github.com/Basekick-Labs/arc/issues/1304))
 
 The tiering-policy response now reports how many non-quarantined cold files
