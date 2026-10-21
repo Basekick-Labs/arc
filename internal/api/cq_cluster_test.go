@@ -133,6 +133,9 @@ func TestCQClusterAPIAndRun(t *testing.T) {
 	if !r.runs[1].Equal(*w1) {
 		t.Fatalf("second run started at %v, want the cluster's watermark %v", r.runs[1], w1)
 	}
+	if w2 := r.watermark(t, 1); w2 == nil || !w2.After(*w1) {
+		t.Fatalf("the second run did not move the watermark past %v (now %v)", w1, w2)
+	}
 	if code, body := r.do(t, "GET", "/cq/1", ""); code != fiber.StatusOK || body["last_processed_time"] != r.watermark(t, 1).Format(time.RFC3339) || body["last_execution_status"] != "completed" {
 		t.Fatalf("get: %d %v", code, body)
 	}

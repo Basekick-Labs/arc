@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -63,6 +64,7 @@ type adoptRig struct {
 	leader, follower           *Coordinator
 	leaderStore, followerStore *tiering.PolicyStore
 	ln                         net.Listener
+	cqCollectSeen              atomic.Bool
 }
 
 func newAdoptRig(t *testing.T) *adoptRig {

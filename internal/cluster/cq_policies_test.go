@@ -193,8 +193,13 @@ func (r *adoptRig) enableCQ(t *testing.T, rows map[string]*CQLocalRows) {
 	}
 	waitFor(t, 10*time.Second, func() bool { return r.follower.fsmOrNil().CQPoliciesEnabled() }, "follower never saw the CQ flag")
 	for id, c := range map[string]*Coordinator{"L": r.leader, "F": r.follower} {
-		id := id
-		c.SetLocalPolicyLister(raft.PolicyKindCQ, func(context.Context) (json.RawMessage, error) { return json.Marshal(rows[id]) })
+		id, c := id, c
+		c.SetLocalPolicyLister(raft.PolicyKindCQ, func(context.Context) (json.RawMessage, error) {
+			if c.PolicyCollecting(raft.PolicyKindCQ) {
+				r.cqCollectSeen.Store(true)
+			}
+			return json.Marshal(rows[id])
+		})
 	}
 }
 
@@ -227,5 +232,8 @@ func TestAdoptCQ(t *testing.T) {
 	}
 	if st := r2.leader.ClusterPoliciesStatus().Kinds[raft.PolicyKindCQ]; !strings.Contains(st.LastError, "never run") || st.Collecting {
 		t.Fatalf("status %+v", st)
+	}
+	if r2.cqCollectSeen.Load() {
+		t.Fatal("a collect opened for a takeover the probe could tell would not happen")
 	}
 }
