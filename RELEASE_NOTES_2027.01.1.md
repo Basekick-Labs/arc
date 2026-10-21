@@ -729,9 +729,11 @@ Original fix proposed by [@abhicodes-007](https://github.com/abhicodes-007) in [
 
 ### Hot-only databases keep their hot metadata when a cold object is listed ([#1187](https://github.com/Basekick-Labs/arc/issues/1187))
 
-Cold metadata sync now skips objects belonging to databases pinned to the hot
-tier. A cold object left behind by a failed migration can no longer make the
-orphan sweep remove the hot copy.
+For a database pinned to the hot tier, cold metadata sync no longer records a
+cold object while this node still holds its hot copy (or cannot tell). A cold
+object left behind by a failed migration can no longer make the orphan sweep
+remove the hot copy. A cold object with no local hot copy, such as one
+migrated before the pin, is still recorded, so queries keep reading it.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1192](https://github.com/Basekick-Labs/arc/pull/1192).
 
