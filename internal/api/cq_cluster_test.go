@@ -322,3 +322,35 @@ func TestCQLocalPolicyLister(t *testing.T) {
 		t.Fatalf("rows %+v", rows)
 	}
 }
+
+// Once adopted, the list filters (and the scheduler's active-only load) read
+// the cluster's CQs.
+func TestCQClusterListFilters(t *testing.T) {
+	r := newCQRig(t)
+	r.src.seedCQ()
+	r.do(t, "POST", "/cq", cqBody)
+	r.do(t, "POST", "/cq", strings.Replace(strings.Replace(cqBody, `"name":"q"`, `"name":"other"`, 1), `"database":"db"`, `"database":"db2"`, 1))
+	r.do(t, "PUT", "/cq/2", `{"is_active":false}`)
+	count := func(path string) int {
+		resp, err := r.app.Test(httptest.NewRequest("GET", path, nil), -1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		return len(out)
+	}
+	if n := count("/cq"); n != 2 {
+		t.Fatalf("all: %d", n)
+	}
+	if n := count("/cq?database=db2"); n != 1 {
+		t.Fatalf("database filter: %d", n)
+	}
+	if n := count("/cq?is_active=true"); n != 1 {
+		t.Fatalf("active filter: %d", n)
+	}
+	active, err := r.h.GetActiveCQs()
+	if err != nil || len(active) != 1 || active[0].Name != "q" {
+		t.Fatalf("scheduler load %+v %v", active, err)
+	}
+}
