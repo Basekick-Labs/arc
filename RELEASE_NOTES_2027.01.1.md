@@ -336,6 +336,11 @@ When the policies are taken over:
   retention write answers `503`; retry it.
 - **History stays per node.** Execution history stays on the node that ran the
   policy. After a failover the new primary shows none until it runs it.
+- **Restoring a backup.** In a cluster, restoring `arc.db` from a backup no
+  longer restores retention policies: the cluster's policies win, and the
+  backup's own rows go to the dormant tables. A full disaster recovery onto a
+  fresh Raft cluster takes the restored policies over again, with new IDs,
+  because every node then holds the same rows.
 - **A restarted node waits.** A node whose own table already holds the
   cluster's policies answers retention requests with `503`, and runs nothing,
   until it has caught up with the cluster after a restart (seconds).
