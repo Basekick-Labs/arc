@@ -149,6 +149,10 @@ type Coordinator struct {
 	// clusterPolicies: the #1324 flag's join gate and blockers;
 	// policyListers read this node's own rows of each kind for adoption.
 	clusterPolicies clusterPoliciesGate
+	// retentionPolicies: the same for retention's own flag (#1324 stage 2).
+	retentionPolicies clusterPoliciesGate
+	// adoptMu serializes adoption passes: the loop's and an admin's nudge.
+	adoptMu         sync.Mutex
 	policyListersMu sync.Mutex
 	policyListers   map[string]LocalPolicyLister
 	// staged: the staged compaction commit, replica side (#1207 d2a2a).
@@ -4797,6 +4801,14 @@ func (c *Coordinator) LocalNodeID() string {
 		return ""
 	}
 	return c.localNode.ID
+}
+
+// LeaderID returns the current Raft leader's node ID, empty when unknown.
+func (c *Coordinator) LeaderID() string {
+	if c == nil || c.raftNode == nil {
+		return ""
+	}
+	return c.raftNode.LeaderID()
 }
 
 // LeaderAddr returns the address of the current Raft leader.

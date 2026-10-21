@@ -4037,6 +4037,12 @@ func main() {
 		retentionHandler.RegisterRoutes(server.GetApp())
 		if clusterCoordinator != nil {
 			retentionHandler.SetCoordinator(clusterCoordinator)
+			// Cluster-wide retention policies (#1324): the lister answers
+			// the cluster's adoption, the mirror keeps this node's table
+			// equal to the cluster's once adopted.
+			retentionHandler.SetClusterSource(clusterCoordinator)
+			clusterCoordinator.SetLocalPolicyLister(clusterraft.PolicyKindRetention, retentionHandler.LocalPolicyLister())
+			clusterCoordinator.RunPolicyMirror(clusterraft.PolicyKindRetention, retentionHandler.MirrorClusterPolicies)
 		}
 		shutdownCoordinator.RegisterHook("retention", func(ctx context.Context) error {
 			return retentionHandler.Close()
@@ -4044,6 +4050,12 @@ func main() {
 		log.Info().Str("db_path", cfg.Retention.DBPath).Msg("Retention policies enabled")
 	} else {
 		log.Info().Msg("Retention policies DISABLED")
+		if clusterCoordinator != nil {
+			// Retention runs nothing here, but this node's database may
+			// still hold the policies of when it did: they count in the
+			// cluster's adoption (their IDs above all).
+			clusterCoordinator.SetLocalPolicyLister(clusterraft.PolicyKindRetention, api.RetentionTableLister(authManager, cfg.Retention.DBPath))
+		}
 	}
 
 	// Iceberg export (opt-in). Publishes Arc's existing Parquet as Iceberg tables via a

@@ -674,9 +674,14 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	// Policy definitions (#1324): same rule as the auth commands, any known
 	// authenticated peer (the admin check happened on the node that took
 	// the HTTP call). CommandSeedPolicies is leader-only and never accepted
-	// from a peer.
+	// from a peer, and so is CommandChoosePolicyAdoption: an admin's choice
+	// that activates deleting policies is taken on the leader's own HTTP
+	// call only.
 	isPolicy := cmd.Type == clusterraft.CommandSetTieringPolicy ||
-		cmd.Type == clusterraft.CommandDeleteTieringPolicy
+		cmd.Type == clusterraft.CommandDeleteTieringPolicy ||
+		cmd.Type == clusterraft.CommandCreateRetentionPolicy ||
+		cmd.Type == clusterraft.CommandUpdateRetentionPolicy ||
+		cmd.Type == clusterraft.CommandDeleteRetentionPolicy
 	if !isManifest && !isAuth && !isRBAC && !isBarrier && !isPauseSet && !isPauseAck && !isTakeOver && !isCompaction && !isCompactionHeld && !isPolicy {
 		c.logger.Warn().
 			Str("requesting_node", req.NodeID).

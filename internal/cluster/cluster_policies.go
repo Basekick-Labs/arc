@@ -19,7 +19,9 @@ import (
 // server advertised it, and once it is on (or may be being proposed) a join
 // without it is refused before the node enters the Raft configuration.
 
-const clusterPoliciesEnableEvery = 10 * time.Second
+// clusterPoliciesEnableEvery spaces the enable loop's passes; a variable so
+// tests can shrink it.
+var clusterPoliciesEnableEvery = 10 * time.Second
 
 // clusterPoliciesGate serializes the join gate with the enable proposal.
 // inFlight (under mu) is set while an enable proposal may still commit (one
@@ -41,7 +43,13 @@ func (c *Coordinator) clusterPoliciesJoinGate(req interface {
 	g := &c.clusterPolicies
 	g.mu.Lock()
 	if hasCapability(req.GetCapabilities(), raft.CapabilityClusterPolicies) {
-		return "", g.mu.Unlock
+		// Retention's own flag gates the join too.
+		rWhy, rRelease := c.retentionPoliciesJoinGate(req)
+		if rWhy != "" {
+			g.mu.Unlock()
+			return rWhy, nil
+		}
+		return "", func() { rRelease(); g.mu.Unlock() }
 	}
 	enabled := fsm != nil && fsm.ClusterPoliciesEnabled()
 	if !enabled && g.inFlight {
@@ -71,6 +79,7 @@ func (c *Coordinator) clusterPoliciesEnableLoop(ctx context.Context) {
 			return
 		case <-t.C:
 			c.maybeEnableClusterPolicies()
+			c.maybeEnableRetentionPolicies()
 			c.maybeSeedPolicies(ctx)
 		}
 	}
@@ -121,6 +130,10 @@ type ClusterPoliciesStatus struct {
 	Enabled  bool                        `json:"enabled"`
 	Blocking []string                    `json:"blocking_nodes,omitempty"`
 	Kinds    map[string]PolicyKindStatus `json:"kinds,omitempty"`
+	// RetentionEnabled / RetentionBlocking: retention's own flag, and on the
+	// leader the nodes keeping it off.
+	RetentionEnabled  bool     `json:"retention_enabled"`
+	RetentionBlocking []string `json:"retention_blocking_nodes,omitempty"`
 }
 
 // PolicyKindStatus is one kind's adoption: seeded (the cluster holds it),
@@ -133,6 +146,8 @@ type PolicyKindStatus struct {
 	LastError  string     `json:"last_error,omitempty"`
 	Attempts   int        `json:"failed_attempts,omitempty"`
 	LastTry    *time.Time `json:"last_attempt,omitempty"`
+	// ChosenNode: an admin's pending choice of node to adopt from.
+	ChosenNode string `json:"chosen_node,omitempty"`
 }
 
 // ClusterPoliciesStatus reports the flag and, on the leader, the nodes keeping
@@ -147,9 +162,19 @@ func (c *Coordinator) ClusterPoliciesStatus() ClusterPoliciesStatus {
 		st.Blocking = *b
 	}
 	if fsm := c.fsmOrNil(); fsm != nil && st.Enabled {
+		st.RetentionEnabled = fsm.RetentionPoliciesEnabled()
+		if b := c.retentionPolicies.blockers.Load(); b != nil && !st.RetentionEnabled && c.raftNode.IsLeader() {
+			st.RetentionBlocking = *b
+		}
 		st.Kinds = map[string]PolicyKindStatus{}
 		for _, kind := range policyKinds {
+			if !c.policyKindActive(kind) {
+				continue
+			}
 			k := PolicyKindStatus{Seeded: fsm.PoliciesSeeded(kind)}
+			if ch, ok := fsm.PolicyAdoptChoiceFor(kind); ok {
+				k.ChosenNode = ch.Node
+			}
 			_, k.Collecting = fsm.PolicyCollecting(kind)
 			if a, ok := fsm.PolicyAwaitingAdoption(kind); ok {
 				at := a.At

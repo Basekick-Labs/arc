@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -136,4 +137,73 @@ func TestClusterPoliciesJoinThroughTheHandler(t *testing.T) {
 	if !ok || !st.Enabled {
 		t.Fatalf("/cluster status cluster_policies = %#v", c.Status()["cluster_policies"])
 	}
+}
+
+var cpRetList = []string{raft.CapabilityClusterPolicies, raft.CapabilityClusterRetention}
+
+// #1324 stage 2: retention has its own flag. A node on a build that knows
+// only tiering keeps it off (and is named), and once it is on such a build
+// can no longer join: it would refuse the retention commands and drop the
+// retention state from its snapshots.
+func TestRetentionPoliciesEnableAndJoinGate(t *testing.T) {
+	c := originRig(t, "writer-1", RoleWriter)
+	if !hasCapability(c.localCapabilities(), raft.CapabilityClusterRetention) {
+		t.Fatalf("capabilities %v lack %s", c.localCapabilities(), raft.CapabilityClusterRetention)
+	}
+	capNodes(t, c, map[string][]string{"raft-1": cpRetList, "writer-1": cpRetList, "writer-2": cpRetList, "reader-1": cpList})
+	c.maybeEnableClusterPolicies()
+	waitFSM(t, c.ClusterPoliciesActive)
+	c.maybeEnableRetentionPolicies()
+	if c.fsmOrNil().RetentionPoliciesEnabled() {
+		t.Fatal("retention enabled while reader-1 runs a tiering-only build")
+	}
+	if st := c.ClusterPoliciesStatus(); st.RetentionEnabled || len(st.RetentionBlocking) != 1 || st.RetentionBlocking[0] != "reader-1" {
+		t.Fatalf("status = %+v", st)
+	}
+	if _, ok := c.ClusterPoliciesStatus().Kinds[raft.PolicyKindRetention]; ok {
+		t.Fatal("status lists retention before its flag")
+	}
+	// Before the flag a tiering-only build may still join.
+	why, release := c.clusterPoliciesJoinGate(&protocol.JoinRequest{NodeID: "w9", Capabilities: cpList})
+	if why != "" {
+		t.Fatalf("refused before the retention flag: %s", why)
+	}
+	if c.retentionPolicies.mu.TryLock() {
+		t.Fatal("the retention gate released its lock before the join finished")
+	}
+	release()
+
+	capNodes(t, c, map[string][]string{"reader-1": cpRetList})
+	c.maybeEnableRetentionPolicies()
+	waitFSM(t, c.fsmOrNil().RetentionPoliciesEnabled)
+	if why, _ := c.clusterPoliciesJoinGate(&protocol.JoinRequest{NodeID: "w9", Capabilities: cpList}); !strings.Contains(why, "retention") {
+		t.Fatalf("a tiering-only build joined: %q", why)
+	}
+	for _, g := range []*clusterPoliciesGate{&c.clusterPolicies, &c.retentionPolicies} {
+		if !g.mu.TryLock() {
+			t.Fatal("a refused join left a gate locked")
+		}
+		g.mu.Unlock()
+	}
+	why, release = c.clusterPoliciesJoinGate(&protocol.JoinRequest{NodeID: "w9", Capabilities: cpRetList})
+	if why != "" {
+		t.Fatalf("a capable node refused: %s", why)
+	}
+	release()
+	if st := c.ClusterPoliciesStatus(); !st.RetentionEnabled || st.Kinds[raft.PolicyKindRetention].Seeded {
+		t.Fatalf("status = %+v", st)
+	}
+}
+
+// The enable loop turns on both flags: cluster policies, then retention's.
+func TestClusterPoliciesEnableLoopEnablesRetention(t *testing.T) {
+	prev := clusterPoliciesEnableEvery
+	clusterPoliciesEnableEvery = 20 * time.Millisecond
+	t.Cleanup(func() { clusterPoliciesEnableEvery = prev })
+	c := originRig(t, "writer-1", RoleWriter)
+	capNodes(t, c, map[string][]string{"raft-1": cpRetList, "writer-1": cpRetList, "writer-2": cpRetList, "reader-1": cpRetList})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.clusterPoliciesEnableLoop(ctx)
+	waitFSM(t, func() bool { return c.ClusterPoliciesActive() && c.fsmOrNil().RetentionPoliciesEnabled() })
 }
