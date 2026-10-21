@@ -404,9 +404,10 @@ func (f *ClusterFSM) applyDeleteCQ(payload []byte) interface{} {
 // applies to: in local-storage mode only the designated primary writer (so a
 // demoted primary, even one that is the Raft leader, is refused once its
 // demotion applied, and nobody is accepted between a demotion and the next
-// promotion); in shared-storage mode, where the FSM designates no primary and
-// the primary is the leader, a writer (the forward layer refuses a forwarded
-// one, so only the leader's own proposal gets here).
+// promotion); in shared-storage mode, where the primary is the leader, a
+// writer. Shared is stamped by the proposing leader from its own config, and
+// the forward layer refuses a forwarded watermark that claims it (or any
+// forwarded one in shared-storage mode).
 func (f *ClusterFSM) applySetCQWatermark(payload []byte) interface{} {
 	var p SetCQWatermarkPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
@@ -417,15 +418,15 @@ func (f *ClusterFSM) applySetCQWatermark(payload []byte) interface{} {
 	if err := f.policyKindReadyLocked(PolicyKindCQ); err != nil {
 		return fmt.Errorf("set continuous query watermark: %w", err)
 	}
-	if f.primaryWriterID != "" {
-		if p.Proposer != f.primaryWriterID {
-			return fmt.Errorf("set continuous query watermark from %q (primary %q): %w", p.Proposer, f.primaryWriterID, ErrCQWatermarkNotPrimary)
+	if p.Shared {
+		// Shared storage: the primary is the leader, and a designation the
+		// state may still carry (a cluster converted from local storage)
+		// means nothing. Only the leader's own proposal gets here.
+		if n, ok := f.nodes[p.Proposer]; !ok || n.Role != "writer" {
+			return fmt.Errorf("set continuous query watermark from %q (not a writer): %w", p.Proposer, ErrCQWatermarkNotPrimary)
 		}
-	} else {
-		n, ok := f.nodes[p.Proposer]
-		if !p.Shared || !ok || n.Role != "writer" {
-			return fmt.Errorf("set continuous query watermark from %q (no designated primary): %w", p.Proposer, ErrCQWatermarkNotPrimary)
-		}
+	} else if f.primaryWriterID == "" || p.Proposer != f.primaryWriterID {
+		return fmt.Errorf("set continuous query watermark from %q (primary %q): %w", p.Proposer, f.primaryWriterID, ErrCQWatermarkNotPrimary)
 	}
 	e, ok := f.cqs[p.ID]
 	if !ok {

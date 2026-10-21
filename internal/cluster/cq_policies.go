@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster/raft"
+	"github.com/basekick-labs/arc/internal/cluster/security"
 )
 
 // Continuous queries, cluster-wide (#1324 stage 3): the coordinator side. See
@@ -135,6 +136,38 @@ func (c *Coordinator) SetCQWatermark(ctx context.Context, id int64, from *time.T
 	return c.proposePolicy(ctx, raft.CommandSetCQWatermark, raft.SetCQWatermarkPayload{
 		Proposer: c.LocalNodeID(), Shared: c.cfg != nil && c.cfg.SharedStorageMode, ID: id, From: from, To: to,
 	})
+}
+
+// CQReadBarrier returns once this node has applied everything the leader had
+// committed when it was called, so a watermark read afterwards is not older
+// than one the cluster already holds. A run reads its watermark only after it
+// (a new leader, or a primary that was cut off, could otherwise run from a
+// stale one and aggregate a committed window again).
+func (c *Coordinator) CQReadBarrier(ctx context.Context) error {
+	if c.raftNode == nil {
+		return errors.New("raft not initialized")
+	}
+	if c.raftNode.IsLeader() {
+		return c.barrierWithin(policyProposeTimeout)
+	}
+	token, err := security.GenerateNonce()
+	if err != nil {
+		return err
+	}
+	raw, err := json.Marshal(raft.BarrierPayload{Token: token, NodeID: c.LocalNodeID()})
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, policyProposeTimeout)
+	defer cancel()
+	index, err := c.forwardApplyToLeaderIndex(ctx, &raft.Command{Type: raft.CommandBarrier, Payload: raw}, true)
+	if err != nil {
+		return err
+	}
+	if index == 0 {
+		return errors.New("the leader did not say where its barrier applied")
+	}
+	return c.waitAppliedHere(ctx, index)
 }
 
 // CQLocalRow is one of a node's own continuous queries, as it answers a

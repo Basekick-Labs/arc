@@ -36,6 +36,8 @@ type fsmSource struct {
 	dropWatermarks int
 	// watermarkProposals counts SetCQWatermark calls.
 	watermarkProposals int
+	// barrierErr is what CQReadBarrier answers.
+	barrierErr error
 }
 
 func (s *fsmSource) CQPoliciesSeeded() bool {
@@ -64,6 +66,8 @@ func (s *fsmSource) SetCQWatermark(_ context.Context, id int64, from *time.Time,
 	}
 	return s.apply(raft.CommandSetCQWatermark, raft.SetCQWatermarkPayload{Proposer: s.self, ID: id, From: from, To: to})
 }
+
+func (s *fsmSource) CQReadBarrier(context.Context) error { return s.barrierErr }
 
 func (s *fsmSource) seedCQ(entries ...raft.CQEntry) {
 	s.t.Helper()

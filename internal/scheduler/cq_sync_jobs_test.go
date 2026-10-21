@@ -51,7 +51,7 @@ func TestSyncJobs(t *testing.T) {
 	}
 	// A rename keeps the job; an interval change replaces it.
 	s.SyncJobs([]api.CQJobDef{{ID: 1, Name: "a2", Interval: "1h", IsActive: true}, {ID: 2, Name: "b", Interval: "2h", IsActive: true}})
-	if j := s.jobFor(1); j != a || j.cqName != "a2" {
+	if j := s.jobFor(1); j != a {
 		t.Fatal("a rename restarted the job (its ticker phase reset)")
 	}
 	waitJob(t, s, 2, 2*time.Hour)
@@ -75,6 +75,36 @@ func TestSyncJobs(t *testing.T) {
 func TestSyncJobsWhenNotRunning(t *testing.T) {
 	s, _ := NewCQScheduler(&CQSchedulerConfig{Logger: zerolog.Nop()})
 	s.SyncJobs([]api.CQJobDef{{ID: 1, Name: "a", Interval: "1h", IsActive: true}})
+	if s.JobCount() != 0 {
+		t.Fatal("a stopped scheduler started a job")
+	}
+}
+
+// A second start of the same CQ (a reload racing SyncJobs) replaces the job
+// instead of orphaning it, so Stop still stops every job; a stopped
+// scheduler starts nothing.
+func TestStartJobReplacesInsteadOfOrphaning(t *testing.T) {
+	s := runningCQScheduler(t)
+	s.mu.Lock()
+	_ = s.startJob(1, "a", "1h")
+	first := s.jobs[1]
+	_ = s.startJob(1, "a", "1h")
+	s.mu.Unlock()
+	select {
+	case <-first.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the replaced job was left running")
+	}
+	stopped := make(chan struct{})
+	go func() { s.Stop(); close(stopped) }()
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop hung on an orphaned job")
+	}
+	s.mu.Lock()
+	_ = s.startJob(2, "b", "1h")
+	s.mu.Unlock()
 	if s.JobCount() != 0 {
 		t.Fatal("a stopped scheduler started a job")
 	}

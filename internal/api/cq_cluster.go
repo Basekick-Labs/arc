@@ -44,6 +44,7 @@ type CQClusterSource interface {
 	UpdateCQ(ctx context.Context, p raft.UpdateCQPayload) error
 	DeleteCQ(ctx context.Context, id int64) error
 	SetCQWatermark(ctx context.Context, id int64, from *time.Time, to time.Time) error
+	CQReadBarrier(ctx context.Context) error
 	LocalNodeID() string
 }
 
@@ -53,11 +54,13 @@ type cqCluster struct {
 	src      CQClusterSource
 	localMu  sync.Mutex // this node's own writes vs the cluster's read of them
 	mirrorMu sync.Mutex
-	owned    bool // guarded by mirrorMu after construction; read via ownedFlag
+	owned    bool // guarded by mu; set once the mirror has run here
 
 	runsMu  sync.Mutex
-	runs    map[int64]*sync.Mutex // one run of a CQ at a time
-	pending map[int64]cqPending   // watermarks the cluster may not have taken
+	runs    map[int64]chan struct{} // one run of a CQ at a time (a 1-slot semaphore)
+	pending map[int64]cqPending     // watermarks the cluster may not have taken
+
+	scheduler CQSchedulerReloader // guarded by mu: the mirror worker reads it
 }
 
 // cqPending is a watermark compare-and-set whose outcome is unknown.
@@ -234,7 +237,10 @@ type CQJobDef struct {
 // so every node's jobs follow them (a node's ticks fire only while it is the
 // primary).
 func (h *ContinuousQueryHandler) syncJobs(src CQClusterSource) {
-	s, ok := h.scheduler.(interface{ SyncJobs([]CQJobDef) })
+	h.cl.mu.RLock()
+	sched := h.cl.scheduler
+	h.cl.mu.RUnlock()
+	s, ok := sched.(interface{ SyncJobs([]CQJobDef) })
 	if !ok || s == nil {
 		return
 	}
@@ -331,19 +337,75 @@ func (h *ContinuousQueryHandler) clusterDelete(c *fiber.Ctx, src CQClusterSource
 	return c.JSON(fiber.Map{"message": "Continuous query deleted successfully"})
 }
 
-// runLock serializes runs of one CQ (a scheduled run and a manual execute).
-func (h *ContinuousQueryHandler) runLock(id int64) *sync.Mutex {
+// acquireRun waits for the CQ's run slot (a scheduled run and a manual
+// execute take turns), or for ctx: a scheduled run whose job was stopped
+// gives up instead of running late with a cancelled context.
+func (h *ContinuousQueryHandler) acquireRun(ctx context.Context, id int64) (release func(), err error) {
+	h.cl.runsMu.Lock()
+	if h.cl.runs == nil {
+		h.cl.runs = map[int64]chan struct{}{}
+	}
+	slot, ok := h.cl.runs[id]
+	if !ok {
+		slot = make(chan struct{}, 1)
+		h.cl.runs[id] = slot
+	}
+	h.cl.runsMu.Unlock()
+	select {
+	case slot <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		<-slot
+		return nil, err
+	}
+	return func() { <-slot }, nil
+}
+
+// ForgetPendingWatermarks drops every unsettled watermark: called when this
+// node stops being the primary, so a later promotion never re-proposes one
+// over whatever the cluster did meanwhile (another primary's runs, a reset
+// that happened to land on the same value).
+func (h *ContinuousQueryHandler) ForgetPendingWatermarks() {
 	h.cl.runsMu.Lock()
 	defer h.cl.runsMu.Unlock()
-	if h.cl.runs == nil {
-		h.cl.runs = map[int64]*sync.Mutex{}
+	if len(h.cl.pending) > 0 {
+		h.cl.pending = map[int64]cqPending{}
 	}
-	m, ok := h.cl.runs[id]
-	if !ok {
-		m = &sync.Mutex{}
-		h.cl.runs[id] = m
+}
+
+// errCQSkippedDuringCollect: a run while the cluster reads the nodes' own
+// continuous queries; its watermark would land after the read and be lost.
+var errCQSkippedDuringCollect = errors.New("continuous queries are being adopted by the cluster; this run is skipped and the next one covers its window")
+
+// errCQReadBarrier: this node could not confirm it holds the cluster's latest
+// watermark.
+var errCQReadBarrier = errors.New("this node could not confirm it holds the cluster's latest watermark; this run is skipped")
+
+// prepareClusterRun is what a run does in a cluster before it reads its CQ:
+// while the nodes' CQs are being collected, skip; once adopted, catch up with
+// the leader (so the watermark read is not stale) and settle an unsettled
+// watermark. It returns the adopted source, or nil for a node-local run.
+func (h *ContinuousQueryHandler) prepareClusterRun(ctx context.Context, id int64) (CQClusterSource, error) {
+	src, err := h.readSource()
+	if err != nil {
+		return nil, err
 	}
-	return m
+	if src == nil {
+		if c := h.clusterSource(); c != nil && c.CQPoliciesCollecting() {
+			return nil, errCQSkippedDuringCollect
+		}
+		return nil, nil
+	}
+	if err := src.CQReadBarrier(ctx); err != nil {
+		h.logger.Warn().Err(err).Int64("query_id", id).Msg("Continuous query run skipped: could not catch up with the cluster")
+		return nil, fmt.Errorf("%w: %v", errCQReadBarrier, err)
+	}
+	if err := h.settlePending(ctx, src, id); err != nil {
+		return nil, err
+	}
+	return src, nil
 }
 
 // errCQWatermarkPending: the last run's watermark is still not taken by the
@@ -394,10 +456,17 @@ func (h *ContinuousQueryHandler) settlePending(ctx context.Context, src CQCluste
 	return errCQWatermarkPending
 }
 
+// Watermark outcomes of a run, as a manual execute reports them.
+const (
+	cqWatermarkSet     = "set"
+	cqWatermarkMoved   = "moved"
+	cqWatermarkPending = "pending"
+)
+
 // commitWatermark moves the CQ's watermark from the value the run read to the
 // run's end. The pending entry is set before the propose and cleared only when
 // this node's cluster state shows the outcome.
-func (h *ContinuousQueryHandler) commitWatermark(ctx context.Context, src CQClusterSource, id int64, from *time.Time, to time.Time) {
+func (h *ContinuousQueryHandler) commitWatermark(ctx context.Context, src CQClusterSource, id int64, from *time.Time, to time.Time) string {
 	h.cl.runsMu.Lock()
 	if h.cl.pending == nil {
 		h.cl.pending = map[int64]cqPending{}
@@ -413,11 +482,13 @@ func (h *ContinuousQueryHandler) commitWatermark(ctx context.Context, src CQClus
 		h.cl.runsMu.Unlock()
 		if ok && !watermarkEqual(e.LastProcessed, to) {
 			h.logger.Warn().Int64("query_id", id).Msg("The continuous query's watermark moved while it ran (a manual execute or another primary); keeping that one")
+			return cqWatermarkMoved
 		}
-		return
+		return cqWatermarkSet
 	}
 	h.logger.Warn().Err(err).Int64("query_id", id).
 		Msg("The cluster has not taken the continuous query's watermark yet; the next run settles it first")
+	return cqWatermarkPending
 }
 
 // lastProcessedOf parses a CQ's watermark as the API carries it.
@@ -544,13 +615,20 @@ func (h *ContinuousQueryHandler) MirrorClusterPolicies(ctx context.Context) erro
 	return err
 }
 
-func (h *ContinuousQueryHandler) ensureCQMirrored(ctx context.Context) {
+func (h *ContinuousQueryHandler) ensureCQMirrored(ctx context.Context, id int64) {
 	src := h.adoptedSource()
 	if src == nil {
 		return
 	}
 	h.cl.mirrorMu.Lock()
 	defer h.cl.mirrorMu.Unlock()
+	// The history row needs this CQ's row as the mirror wrote it; a full
+	// reconcile only when it is missing (the watermark in the row may lag,
+	// which the periodic pass catches up).
+	var n int
+	if err := h.sqliteDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM continuous_queries cq JOIN continuous_query_cluster_ids o ON o.id = cq.id WHERE cq.id = ?`, id).Scan(&n); err == nil && n == 1 {
+		return
+	}
 	if err := h.reconcileCQMirror(ctx, src.ClusterCQs(), src.LocalNodeID()); err != nil {
 		h.logger.Warn().Err(err).Msg("Could not mirror the cluster's continuous queries before recording a run")
 	}
@@ -594,6 +672,7 @@ func (h *ContinuousQueryHandler) reconcileCQMirror(ctx context.Context, cqs []ra
 		return err
 	}
 	local := map[int64]string{}
+	localName := map[int64]string{}
 	for rows.Next() {
 		var e raft.CQEntry
 		var tags, lpt sql.NullString
@@ -615,6 +694,7 @@ func (h *ContinuousQueryHandler) reconcileCQMirror(ctx context.Context, cqs []ra
 		}
 		e.CreatedAt, e.UpdatedAt = created.Time, updated.Time
 		local[e.ID] = cqRowKey(e)
+		localName[e.ID] = e.Name
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -701,13 +781,35 @@ func (h *ContinuousQueryHandler) reconcileCQMirror(ctx context.Context, cqs []ra
 		}
 		delete(local, id)
 	}
+	// A row whose name is unchanged is updated in place (the watermark moves
+	// at every run): the foreign key is not touched. A renamed row is deleted
+	// and inserted again, all deletes first, so two CQs that swapped names
+	// never collide on the unique name.
 	var rewrite []raft.CQEntry
 	for _, e := range cqs {
-		if k, ok := local[e.ID]; ok && k == cqRowKey(e) {
+		k, ok := local[e.ID]
+		if ok && k == cqRowKey(e) {
+			continue
+		}
+		if ok && localName[e.ID] == e.Name {
+			tags, _ := encodeTagColumns(e.TagColumns)
+			var lpt *string
+			if e.LastProcessed != nil {
+				s := e.LastProcessed.UTC().Format(time.RFC3339)
+				lpt = &s
+			}
+			if err := exec(`UPDATE continuous_queries SET description = ?, database = ?, source_measurement = ?, destination_measurement = ?,
+				query = ?, interval = ?, tag_columns = ?, retention_days = ?, delete_source_after_days = ?, is_active = ?,
+				last_processed_time = ?, created_at = ?, updated_at = ? WHERE id = ?`,
+				e.Description, e.Database, e.SourceMeasurement, e.DestinationMeasurement, e.Query, e.Interval, tags,
+				e.RetentionDays, e.DeleteSourceAfterDays, e.IsActive, lpt,
+				e.CreatedAt.UTC().Format(sqliteTimestamp), e.UpdatedAt.UTC().Format(sqliteTimestamp), e.ID); err != nil {
+				return err
+			}
 			continue
 		}
 		rewrite = append(rewrite, e)
-		if _, ok := local[e.ID]; ok {
+		if ok {
 			if err := exec(`DELETE FROM continuous_queries WHERE id = ?`, e.ID); err != nil {
 				return err
 			}
@@ -798,6 +900,9 @@ func (h *ContinuousQueryHandler) initClusterTables() error {
 		)`,
 		`CREATE TABLE IF NOT EXISTS continuous_query_cluster_ids (id INTEGER PRIMARY KEY)`,
 		`CREATE TABLE IF NOT EXISTS cq_cluster_state (name TEXT PRIMARY KEY, value TEXT)`,
+		// The history is looked up by CQ (and the foreign key checked by it)
+		// whenever a CQ row is deleted.
+		`CREATE INDEX IF NOT EXISTS idx_cq_executions_query_id ON continuous_query_executions (query_id)`,
 	} {
 		if _, err := h.sqliteDB.Exec(q); err != nil {
 			return fmt.Errorf("failed to create continuous query cluster table: %w", err)

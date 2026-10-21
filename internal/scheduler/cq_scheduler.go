@@ -214,6 +214,13 @@ func (s *CQScheduler) StartJobDirect(cqID int64, name, interval string, isActive
 
 // ReloadAll reloads all CQ schedules from the database
 func (s *CQScheduler) ReloadAll() error {
+	// Read the CQs first: a node that cannot read them yet (not caught up
+	// with the cluster, #1324) keeps the jobs it has rather than losing all.
+	cqs, err := s.cqHandler.GetActiveCQs()
+	if err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 
 	if !s.running {
@@ -244,12 +251,7 @@ func (s *CQScheduler) ReloadAll() error {
 		return nil
 	}
 
-	// Load and start all active CQs
-	cqs, err := s.cqHandler.GetActiveCQs()
-	if err != nil {
-		return err
-	}
-
+	// Start all active CQs read above
 	for _, cq := range cqs {
 		if err := s.startJob(cq.ID, cq.Name, cq.Interval); err != nil {
 			s.logger.Warn().
@@ -270,6 +272,14 @@ func (s *CQScheduler) ReloadAll() error {
 
 // startJob starts a job for a specific CQ (must be called with lock held)
 func (s *CQScheduler) startJob(cqID int64, cqName, intervalStr string) error {
+	// A stopped scheduler starts nothing (its WaitGroup may be waiting), and
+	// a job already running for the CQ is replaced, never orphaned: Reload*
+	// and SyncJobs can both reach here for the same CQ.
+	if !s.running {
+		return nil
+	}
+	s.stopJobLocked(cqID)
+
 	// Parse interval using Go duration format
 	interval, err := time.ParseDuration(intervalStr)
 	if err != nil {
@@ -325,6 +335,12 @@ func (s *CQScheduler) runJob(job *cqJob) {
 			// demotion) take effect without a restart. clusterGate is immutable
 			// after construction so no lock is needed here.
 			if s.clusterGate != nil && !s.clusterGate.IsPrimaryWriter() {
+				// Not the primary (any more): an unsettled watermark of
+				// this node must never be proposed after a later
+				// promotion over what the cluster did meanwhile (#1324).
+				if s.cqHandler != nil {
+					s.cqHandler.ForgetPendingWatermarks()
+				}
 				s.logger.Debug().
 					Str("role", s.clusterGate.Role()).
 					Int64("cq_id", job.cqID).
@@ -456,8 +472,9 @@ func (s *CQScheduler) SyncJobs(defs []api.CQJobDef) {
 	}
 	for id, job := range s.jobs {
 		if d, ok := want[id]; ok {
+			// A rename keeps the job (and its old name in its log lines
+			// until it restarts): the job reads nothing else of it.
 			if iv, err := cqJobInterval(d.Interval); err == nil && iv == job.interval {
-				job.cqName = d.Name
 				continue
 			}
 		}

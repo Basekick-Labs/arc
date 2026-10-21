@@ -101,9 +101,6 @@ func TestCQWatermarkCompareAndSet(t *testing.T) {
 	if res := x.apply(CommandSetCQWatermark, SetCQWatermarkPayload{Proposer: "w2", ID: 1, To: w1}); !errors.Is(asErr(res), ErrCQWatermarkNotPrimary) {
 		t.Fatalf("from a standby: %v", res)
 	}
-	if res := x.apply(CommandSetCQWatermark, SetCQWatermarkPayload{Proposer: "w2", Shared: true, ID: 1, To: w1}); !errors.Is(asErr(res), ErrCQWatermarkNotPrimary) {
-		t.Fatalf("a shared-storage claim with a designated primary: %v", res)
-	}
 	x.ok(CommandSetCQWatermark, SetCQWatermarkPayload{Proposer: "w1", ID: 1, To: w1})
 	got, _ := x.f.CQ(1)
 	if got.LastProcessed == nil || !got.LastProcessed.Equal(t0.Add(90*time.Minute)) {
@@ -134,6 +131,11 @@ func TestCQWatermarkCompareAndSet(t *testing.T) {
 		t.Fatalf("a reader in shared storage: %v", res)
 	}
 	x.ok(CommandSetCQWatermark, SetCQWatermarkPayload{Proposer: "w2", Shared: true, ID: 1, From: tp(t0), To: t1})
+	// In shared storage a designation the state still carries (converted
+	// from local storage) does not stop the leader: any writer proposal
+	// carrying Shared, which only the leader's own can.
+	x.ok(CommandPromoteWriter, PromoteWriterPayload{NodeID: "w3"})
+	x.ok(CommandSetCQWatermark, SetCQWatermarkPayload{Proposer: "w2", Shared: true, ID: 1, From: tp(t1), To: t1.Add(time.Hour)})
 }
 
 // A seed keeps or renumbers IDs like retention's, carries each CQ's

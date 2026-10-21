@@ -78,7 +78,15 @@ func (h *ContinuousQueryHandler) aggregate(ctx context.Context, cq *ContinuousQu
 // SetScheduler sets the CQ scheduler for reloading after updates.
 // Called after scheduler creation since it depends on the handler.
 func (h *ContinuousQueryHandler) SetScheduler(s CQSchedulerReloader) {
+	h.cl.mu.Lock()
 	h.scheduler = s
+	h.cl.scheduler = s
+	h.cl.mu.Unlock()
+	// Already adopted (a restart): hand it the cluster's CQs now, not at the
+	// mirror's next pass.
+	if src := h.adoptedSource(); src != nil {
+		h.syncJobs(src)
+	}
 }
 
 // SetCoordinator sets the cluster coordinator for writer-gate checks.
@@ -161,6 +169,11 @@ type ExecuteCQResponse struct {
 	DryRun                 bool    `json:"dry_run"`
 	ExecutedAt             string  `json:"executed_at"`
 	ExecutedQuery          string  `json:"executed_query,omitempty"`
+	// WatermarkStatus: in a cluster that adopted continuous queries, what a
+	// manual run did to last_processed_time: "set", "moved" (another run or
+	// primary moved it meanwhile; theirs is kept) or "pending" (the cluster
+	// has not taken it yet; the next run settles it).
+	WatermarkStatus string `json:"watermark_status,omitempty"`
 }
 
 // CQExecution represents an execution history record
@@ -727,21 +740,18 @@ func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (
 
 	// One run of a CQ at a time, scheduled or manual: each reads the
 	// watermark the previous one set.
-	lock := h.runLock(queryID)
-	lock.Lock()
-	defer lock.Unlock()
-
-	// In a cluster that adopted continuous queries (#1324) the definition and
-	// the watermark are the cluster's, and a watermark the cluster may not
-	// have taken is settled before this run.
-	src, err := h.readSource()
+	release, err := h.acquireRun(ctx, queryID)
 	if err != nil {
 		return nil, fmt.Errorf("execution skipped: %w", err)
 	}
-	if src != nil {
-		if err := h.settlePending(ctx, src, queryID); err != nil {
-			return nil, fmt.Errorf("execution skipped: %w", err)
-		}
+	defer release()
+
+	// In a cluster (#1324): skipped while the cluster collects the nodes'
+	// CQs; once adopted, the definition and the watermark are the cluster's,
+	// read after catching up with the leader and settling an unsettled one.
+	src, err := h.prepareClusterRun(ctx, queryID)
+	if err != nil {
+		return nil, fmt.Errorf("execution skipped: %w", err)
 	}
 
 	// Get query definition
@@ -800,7 +810,7 @@ func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (
 
 		// Record failed execution
 		if src != nil {
-			h.ensureCQMirrored(ctx)
+			h.ensureCQMirrored(ctx, queryID)
 		}
 		h.recordExecution(queryID, executionID, "failed", startTime, endTime, nil, 0, executionDuration, err.Error())
 
@@ -812,7 +822,7 @@ func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (
 
 	if src != nil {
 		// The history is this node's; the watermark is the cluster's.
-		h.ensureCQMirrored(ctx)
+		h.ensureCQMirrored(ctx, queryID)
 		h.recordExecution(queryID, executionID, "completed", startTime, endTime, nil, recordsWritten, executionDuration, "")
 		h.commitWatermark(ctx, src, queryID, readWatermark, endTime)
 	} else if err := h.recordExecutionAndUpdateTime(queryID, executionID, startTime, endTime, recordsWritten, executionDuration); err != nil {
@@ -878,21 +888,28 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 		})
 	}
 
-	// A real run holds the CQ's run lock, like a scheduled one: the two read
-	// and move the same watermark.
-	if !req.DryRun {
-		lock := h.runLock(int64(queryID))
-		lock.Lock()
-		defer lock.Unlock()
-	}
-	src, err := h.readSource()
-	if err != nil {
+	// The CQ must exist before it gets a run slot.
+	if _, err := h.getQuery(int64(queryID)); isCQWait(err) {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	} else if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Continuous query not found"})
 	}
-	if src != nil && !req.DryRun {
-		if err := h.settlePending(c.Context(), src, int64(queryID)); err != nil {
+	// A real run holds the CQ's run slot, like a scheduled one: the two read
+	// and move the same watermark.
+	var src CQClusterSource
+	if !req.DryRun {
+		release, err := h.acquireRun(c.Context(), int64(queryID))
+		if err != nil {
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
 		}
+		defer release()
+		if src, err = h.prepareClusterRun(c.Context(), int64(queryID)); err != nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+		}
+	} else if s, err := h.readSource(); err != nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	} else {
+		src = s
 	}
 
 	// Get query definition
@@ -992,7 +1009,7 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 
 		// Record failed execution
 		if src != nil {
-			h.ensureCQMirrored(c.Context())
+			h.ensureCQMirrored(c.Context(), int64(queryID))
 		}
 		h.recordExecution(int64(queryID), executionID, "failed", startTime, endTime, nil, 0, executionDuration, err.Error())
 
@@ -1008,13 +1025,15 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 
 	executionDuration := time.Since(start).Seconds()
 
+	watermarkStatus := ""
 	if src != nil {
 		// The watermark moves to this run's end, as it always has: forward,
 		// or back for an explicit end_time. A compare-and-set from the value
-		// read above, so it cannot undo a run that moved it meanwhile.
-		h.ensureCQMirrored(c.Context())
+		// read above, so it cannot undo a run that moved it meanwhile; the
+		// response says whether it took.
+		h.ensureCQMirrored(c.Context(), int64(queryID))
 		h.recordExecution(int64(queryID), executionID, "completed", startTime, endTime, nil, recordsWritten, executionDuration, "")
-		h.commitWatermark(c.Context(), src, int64(queryID), readWatermark, endTime)
+		watermarkStatus = h.commitWatermark(c.Context(), src, int64(queryID), readWatermark, endTime)
 	} else if err := h.recordExecutionAndUpdateTime(int64(queryID), executionID, startTime, endTime, recordsWritten, executionDuration); err != nil {
 		// Record successful execution and update last processed time atomically
 		h.logger.Error().Err(err).Int("query_id", queryID).Msg("Failed to record execution")
@@ -1039,6 +1058,7 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 		DestinationMeasurement: cq.DestinationMeasurement,
 		DryRun:                 false,
 		ExecutedAt:             time.Now().UTC().Format(time.RFC3339),
+		WatermarkStatus:        watermarkStatus,
 	})
 }
 

@@ -262,7 +262,9 @@ func TestCQMirror(t *testing.T) {
 	if dormant != 1 || dormantExec != 1 {
 		t.Fatalf("dormant %d %d", dormant, dormantExec)
 	}
-	if len(syncer.defs) != 1 || len(syncer.defs[0]) != 1 || syncer.defs[0][0].ID != 1 || syncer.defs[0][0].Interval != "1h" {
+	// Handed the cluster's CQs when it was set (already adopted) and again
+	// by the mirror.
+	if len(syncer.defs) != 2 || len(syncer.defs[1]) != 1 || syncer.defs[1][0].ID != 1 || syncer.defs[1][0].Interval != "1h" {
 		t.Fatalf("scheduler handed %+v", syncer.defs)
 	}
 }
@@ -418,4 +420,99 @@ func TestCQLocalWritesDuringTheCollect(t *testing.T) {
 	}
 	r.h.cl.localMu.Unlock()
 	<-done
+}
+
+// A run that cannot catch up with the leader is skipped: its watermark read
+// could be older than one the cluster already holds.
+func TestCQRunSkippedWithoutAReadBarrier(t *testing.T) {
+	r := newCQRig(t)
+	r.src.seedCQ()
+	r.do(t, "POST", "/cq", cqBody)
+	r.src.barrierErr = errors.New("no leader")
+	if _, err := r.h.ExecuteCQ(context.Background(), 1); !errors.Is(err, errCQReadBarrier) {
+		t.Fatalf("run without a barrier: %v", err)
+	}
+	if code, _ := r.do(t, "POST", "/cq/1/execute", `{}`); code != fiber.StatusServiceUnavailable {
+		t.Fatalf("manual run without a barrier: %d", code)
+	}
+	if len(r.runs) != 0 {
+		t.Fatal("a run aggregated without catching up")
+	}
+}
+
+// While the cluster collects the nodes' own CQs, a node-local run is skipped:
+// its watermark would land after the cluster read it, and be lost.
+func TestCQLocalRunSkippedDuringTheCollect(t *testing.T) {
+	r := newCQRig(t)
+	if _, err := r.h.sqliteDB.Exec(`INSERT INTO continuous_queries (id, name, database, source_measurement, destination_measurement, query, interval)
+		VALUES (1, 'q', 'db', 'cpu', 'o', 'SELECT 1 WHERE {start_time} < {end_time}', '1h')`); err != nil {
+		t.Fatal(err)
+	}
+	r.src.collecting = true
+	if _, err := r.h.ExecuteCQ(context.Background(), 1); !errors.Is(err, errCQSkippedDuringCollect) {
+		t.Fatalf("local run during the collect: %v", err)
+	}
+	r.src.collecting = false
+	if _, err := r.h.ExecuteCQ(context.Background(), 1); err != nil || len(r.runs) != 1 {
+		t.Fatalf("local run after the collect: %v (%d runs)", err, len(r.runs))
+	}
+}
+
+// A manual run says what it did to the watermark.
+func TestCQManualExecuteReportsTheWatermark(t *testing.T) {
+	r := newCQRig(t)
+	r.src.seedCQ()
+	r.do(t, "POST", "/cq", cqBody)
+	if code, body := r.do(t, "POST", "/cq/1/execute", `{}`); code != fiber.StatusOK || body["watermark_status"] != "set" {
+		t.Fatalf("manual run: %d %v", code, body)
+	}
+	r.h.aggregateHook = func(context.Context, *ContinuousQuery, string, time.Time) (int64, error) {
+		r.src.must(raft.CommandSetCQWatermark, raft.SetCQWatermarkPayload{Proposer: "n1", ID: 1, From: r.watermark(t, 1), To: time.Now().Add(-5 * time.Hour)})
+		return 1, nil
+	}
+	time.Sleep(1100 * time.Millisecond)
+	if code, body := r.do(t, "POST", "/cq/1/execute", `{}`); code != fiber.StatusOK || body["watermark_status"] != "moved" {
+		t.Fatalf("manual run whose watermark moved meanwhile: %d %v", code, body)
+	}
+}
+
+// Losing the primary role forgets unsettled watermarks: a later promotion
+// never proposes one over what the cluster did meanwhile.
+func TestCQForgetPendingWatermarks(t *testing.T) {
+	r := newCQRig(t)
+	r.src.seedCQ()
+	r.do(t, "POST", "/cq", cqBody)
+	r.src.dropWatermarks = 1
+	if _, err := r.h.ExecuteCQ(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	r.h.ForgetPendingWatermarks()
+	before := r.src.watermarkProposals
+	time.Sleep(1100 * time.Millisecond)
+	if _, err := r.h.ExecuteCQ(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if r.src.watermarkProposals != before+1 {
+		t.Fatalf("%d proposals, want only the run's own (the forgotten one re-proposed)", r.src.watermarkProposals-before)
+	}
+}
+
+// A run whose context is done before it gets the CQ's run slot gives up.
+func TestCQRunGivesUpWhenCancelled(t *testing.T) {
+	r := newCQRig(t)
+	release, err := r.h.acquireRun(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, err := r.h.acquireRun(ctx, 1); err == nil {
+		t.Fatal("got the run slot while another run held it")
+	}
+	release()
+	cancelled, cancel2 := context.WithCancel(context.Background())
+	cancel2()
+	if _, err := r.h.acquireRun(cancelled, 1); err == nil {
+		t.Fatal("a cancelled run took the slot")
+	}
 }
