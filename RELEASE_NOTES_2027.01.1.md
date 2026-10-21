@@ -1247,6 +1247,11 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Invalid object-store prefix diagnostics retain their allowed character set
+
+Validation errors now state the allowed prefix characters explicitly, so
+sanitized logs remain actionable even when the rejected value is masked.
+
 ### Setting a database to `hot_only` reports existing cold files ([#1304](https://github.com/Basekick-Labs/arc/issues/1304))
 
 The tiering-policy response now reports how many non-quarantined cold files
