@@ -59,13 +59,55 @@ type DeleteTieringPolicyPayload struct {
 	Database string `json:"database"`
 }
 
-// SeedPoliciesPayload installs a kind's adopted policies, once. Proposed by
-// the leader only.
+// SeedPoliciesPayload installs a kind's adopted policies, once, for the
+// collect at Epoch. Proposed by the leader only.
 type SeedPoliciesPayload struct {
 	Kind    string               `json:"kind"`
+	Epoch   uint64               `json:"epoch"`
 	Tiering []TieringPolicyEntry `json:"tiering,omitempty"`
 	Now     time.Time            `json:"now"`
 }
+
+// CollectPoliciesPayload opens a collect of a kind: until it ends (a seed, or
+// AwaitAdoption) no node takes a write of that kind into its own SQLite, so
+// the rows the leader reads from every node are the rows that exist. The
+// collect's epoch is its log index. Proposed by the leader only.
+type CollectPoliciesPayload struct {
+	Kind   string    `json:"kind"`
+	Leader string    `json:"leader"`
+	Now    time.Time `json:"now"`
+}
+
+// AwaitAdoptionPayload ends a collect that could not seed: Missing names the
+// nodes that did not answer. Writes of the kind go to each node's SQLite
+// again until the next collect. Proposed by the leader only.
+type AwaitAdoptionPayload struct {
+	Kind    string    `json:"kind"`
+	Epoch   uint64    `json:"epoch"`
+	Missing []string  `json:"missing,omitempty"`
+	Now     time.Time `json:"now"`
+}
+
+// PolicyCollect is an open collect of a kind.
+type PolicyCollect struct {
+	Kind   string    `json:"kind"`
+	Epoch  uint64    `json:"epoch"`
+	Leader string    `json:"leader"`
+	At     time.Time `json:"at"`
+}
+
+// PolicyAwaiting is a kind whose last collect could not seed.
+type PolicyAwaiting struct {
+	Kind    string    `json:"kind"`
+	Missing []string  `json:"missing,omitempty"`
+	At      time.Time `json:"at"`
+}
+
+// maxAwaitingMissing bounds the nodes an AwaitAdoption names.
+const maxAwaitingMissing = 256
+
+// knownPolicyKind reports a kind this build can seed.
+func knownPolicyKind(kind string) bool { return kind == PolicyKindTiering }
 
 // ErrPolicyNotFound: a delete of a policy that does not exist.
 var ErrPolicyNotFound = errors.New("policy not found")
@@ -83,9 +125,11 @@ func IsPolicyNotFound(err error) bool {
 // clusterPoliciesState is the snapshot form of the flag and the policies. nil
 // in an older snapshot, or before the flag was applied.
 type clusterPoliciesState struct {
-	Enabled bool                  `json:"enabled"`
-	Seeded  []string              `json:"seeded,omitempty"`
-	Tiering []*TieringPolicyEntry `json:"tiering,omitempty"`
+	Enabled    bool                  `json:"enabled"`
+	Seeded     []string              `json:"seeded,omitempty"`
+	Tiering    []*TieringPolicyEntry `json:"tiering,omitempty"`
+	Collecting []*PolicyCollect      `json:"collecting,omitempty"`
+	Awaiting   []*PolicyAwaiting     `json:"awaiting,omitempty"`
 }
 
 // EnableClusterPoliciesPayload turns the flag on; see
@@ -227,12 +271,81 @@ func (f *ClusterFSM) applyDeleteTieringPolicy(payload []byte) interface{} {
 	return nil
 }
 
+// PolicyCollecting returns kind's open collect.
+func (f *ClusterFSM) PolicyCollecting(kind string) (PolicyCollect, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	c, ok := f.policyCollecting[kind]
+	if !ok {
+		return PolicyCollect{}, false
+	}
+	return *c, true
+}
+
+// PolicyAwaitingAdoption returns kind's state when its last collect could not
+// seed.
+func (f *ClusterFSM) PolicyAwaitingAdoption(kind string) (PolicyAwaiting, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	a, ok := f.policyAwaiting[kind]
+	if !ok {
+		return PolicyAwaiting{}, false
+	}
+	c := *a
+	c.Missing = append([]string(nil), a.Missing...)
+	return c, true
+}
+
+func (f *ClusterFSM) applyCollectPolicies(payload []byte, logIndex uint64) interface{} {
+	var p CollectPoliciesPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal collect policies payload: %w", err)
+	}
+	if !knownPolicyKind(p.Kind) || p.Leader == "" {
+		return fmt.Errorf("collect policies: a known kind and the leader are required (kind %q)", p.Kind)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.clusterPolicies {
+		return errors.New("collect policies: cluster policies are not enabled")
+	}
+	if f.policiesSeeded[p.Kind] {
+		return nil
+	}
+	// A newer collect replaces an open one (a leader that changed mid-collect
+	// starts over): the older one can no longer seed.
+	f.policyCollecting[p.Kind] = &PolicyCollect{Kind: p.Kind, Epoch: logIndex, Leader: p.Leader, At: p.Now}
+	delete(f.policyAwaiting, p.Kind)
+	return nil
+}
+
+func (f *ClusterFSM) applyAwaitAdoption(payload []byte) interface{} {
+	var p AwaitAdoptionPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("failed to unmarshal await adoption payload: %w", err)
+	}
+	if len(p.Missing) > maxAwaitingMissing {
+		p.Missing = p.Missing[:maxAwaitingMissing]
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c, ok := f.policyCollecting[p.Kind]
+	if !ok || c.Epoch != p.Epoch {
+		return fmt.Errorf("await adoption: no open collect of %q at epoch %d", p.Kind, p.Epoch)
+	}
+	delete(f.policyCollecting, p.Kind)
+	missing := append([]string(nil), p.Missing...)
+	sort.Strings(missing)
+	f.policyAwaiting[p.Kind] = &PolicyAwaiting{Kind: p.Kind, Missing: missing, At: p.Now}
+	return nil
+}
+
 func (f *ClusterFSM) applySeedPolicies(payload []byte, logIndex uint64) interface{} {
 	var p SeedPoliciesPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return fmt.Errorf("failed to unmarshal seed policies payload: %w", err)
 	}
-	if p.Kind != PolicyKindTiering {
+	if !knownPolicyKind(p.Kind) {
 		return fmt.Errorf("seed policies: unknown kind %q", p.Kind)
 	}
 	seen := make(map[string]bool, len(p.Tiering))
@@ -254,6 +367,11 @@ func (f *ClusterFSM) applySeedPolicies(payload []byte, logIndex uint64) interfac
 		// Seeded once: a second seed (a leader change mid-seed) is a no-op.
 		return nil
 	}
+	// Only the open collect's own rows: an older leader's seed, from rows
+	// read before a newer collect, is refused.
+	if c, ok := f.policyCollecting[p.Kind]; !ok || c.Epoch != p.Epoch {
+		return fmt.Errorf("seed policies: no open collect of %q at epoch %d", p.Kind, p.Epoch)
+	}
 	for i := range p.Tiering {
 		e := p.Tiering[i]
 		c := copyTieringPolicy(&e)
@@ -267,6 +385,8 @@ func (f *ClusterFSM) applySeedPolicies(payload []byte, logIndex uint64) interfac
 		f.tieringPolicies[c.Database] = &c
 	}
 	f.policiesSeeded[p.Kind] = true
+	delete(f.policyCollecting, p.Kind)
+	delete(f.policyAwaiting, p.Kind)
 	f.logger.Info().Str("kind", p.Kind).Int("policies", len(p.Tiering)).Msg("Cluster policies seeded")
 	return nil
 }
@@ -286,6 +406,17 @@ func (f *ClusterFSM) snapshotClusterPoliciesLocked() *clusterPoliciesState {
 		c := e
 		st.Tiering = append(st.Tiering, &c)
 	}
+	for _, c := range f.policyCollecting {
+		cc := *c
+		st.Collecting = append(st.Collecting, &cc)
+	}
+	sort.Slice(st.Collecting, func(i, j int) bool { return st.Collecting[i].Kind < st.Collecting[j].Kind })
+	for _, a := range f.policyAwaiting {
+		ac := *a
+		ac.Missing = append([]string(nil), a.Missing...)
+		st.Awaiting = append(st.Awaiting, &ac)
+	}
+	sort.Slice(st.Awaiting, func(i, j int) bool { return st.Awaiting[i].Kind < st.Awaiting[j].Kind })
 	return st
 }
 
@@ -303,8 +434,23 @@ func (f *ClusterFSM) restoreClusterPoliciesLocked(st *clusterPoliciesState) {
 	f.clusterPolicies = st != nil && st.Enabled
 	f.policiesSeeded = map[string]bool{}
 	f.tieringPolicies = map[string]*TieringPolicyEntry{}
+	f.policyCollecting = map[string]*PolicyCollect{}
+	f.policyAwaiting = map[string]*PolicyAwaiting{}
 	if st == nil {
 		return
+	}
+	for _, c := range st.Collecting {
+		if c != nil && c.Kind != "" {
+			cc := *c
+			f.policyCollecting[c.Kind] = &cc
+		}
+	}
+	for _, a := range st.Awaiting {
+		if a != nil && a.Kind != "" {
+			ac := *a
+			ac.Missing = append([]string(nil), a.Missing...)
+			f.policyAwaiting[a.Kind] = &ac
+		}
 	}
 	for _, kind := range st.Seeded {
 		f.policiesSeeded[kind] = true

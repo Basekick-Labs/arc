@@ -4543,6 +4543,7 @@ func main() {
 					if clusterCoordinator != nil {
 						if src := cluster.NewTieringPolicySource(clusterCoordinator); src != nil {
 							tieringManager.GetPolicies().SetClusterSource(src)
+							clusterCoordinator.SetLocalPolicyLister(clusterraft.PolicyKindTiering, cluster.TieringLocalLister(tieringManager.GetPolicies()))
 						}
 					}
 					// The startup tier scan runs in the background below, and

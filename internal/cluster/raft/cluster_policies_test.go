@@ -69,6 +69,13 @@ func TestClusterPoliciesSnapshot(t *testing.T) {
 
 func intp(v int) *int { return &v }
 
+// seed opens a collect of tiering and seeds it with entries.
+func (x *tkFSM) seed(entries ...TieringPolicyEntry) {
+	x.t.Helper()
+	x.ok(CommandCollectPolicies, CollectPoliciesPayload{Kind: PolicyKindTiering, Leader: "w1", Now: t0})
+	x.ok(CommandSeedPolicies, SeedPoliciesPayload{Kind: PolicyKindTiering, Epoch: x.idx, Tiering: entries, Now: t0})
+}
+
 // cpFSM: takeoverFSM with cluster policies enabled.
 func cpFSM(t *testing.T) *tkFSM {
 	t.Helper()
@@ -98,13 +105,11 @@ func TestTieringPolicyCommandsNeedFlagAndSeed(t *testing.T) {
 // mid-seed) changes nothing.
 func TestSeedPoliciesOnce(t *testing.T) {
 	x := cpFSM(t)
-	x.ok(CommandSeedPolicies, SeedPoliciesPayload{Kind: PolicyKindTiering, Now: t0, Tiering: []TieringPolicyEntry{
-		{Database: "db1", HotOnly: true}, {Database: "db2", HotMaxAgeDays: intp(30)},
-	}})
+	x.seed(TieringPolicyEntry{Database: "db1", HotOnly: true}, TieringPolicyEntry{Database: "db2", HotMaxAgeDays: intp(30)})
 	if !x.f.PoliciesSeeded(PolicyKindTiering) {
 		t.Fatal("not seeded")
 	}
-	x.ok(CommandSeedPolicies, SeedPoliciesPayload{Kind: PolicyKindTiering, Now: t0, Tiering: []TieringPolicyEntry{{Database: "db9"}}})
+	x.ok(CommandSeedPolicies, SeedPoliciesPayload{Kind: PolicyKindTiering, Epoch: x.idx - 1, Now: t0, Tiering: []TieringPolicyEntry{{Database: "db9"}}})
 	got := x.f.TieringPolicies()
 	if len(got) != 2 || got[0].Database != "db1" || !got[0].HotOnly || got[1].HotMaxAgeDays == nil || *got[1].HotMaxAgeDays != 30 {
 		t.Fatalf("policies after a second seed: %+v", got)
@@ -114,8 +119,10 @@ func TestSeedPoliciesOnce(t *testing.T) {
 	}
 	x.refused(CommandSeedPolicies, SeedPoliciesPayload{Kind: "nope", Now: t0})
 	x2 := cpFSM(t)
-	x2.refused(CommandSeedPolicies, SeedPoliciesPayload{Kind: PolicyKindTiering, Now: t0, Tiering: []TieringPolicyEntry{{Database: "a"}, {Database: "a"}}})
-	x2.refused(CommandSeedPolicies, SeedPoliciesPayload{Kind: PolicyKindTiering, Now: t0, Tiering: []TieringPolicyEntry{{Database: ""}}})
+	x2.ok(CommandCollectPolicies, CollectPoliciesPayload{Kind: PolicyKindTiering, Leader: "w1", Now: t0})
+	ep := x2.idx
+	x2.refused(CommandSeedPolicies, SeedPoliciesPayload{Kind: PolicyKindTiering, Epoch: ep, Now: t0, Tiering: []TieringPolicyEntry{{Database: "a"}, {Database: "a"}}})
+	x2.refused(CommandSeedPolicies, SeedPoliciesPayload{Kind: PolicyKindTiering, Epoch: ep, Now: t0, Tiering: []TieringPolicyEntry{{Database: ""}}})
 	if x2.f.PoliciesSeeded(PolicyKindTiering) {
 		t.Fatal("a refused seed marked the kind seeded")
 	}
@@ -125,7 +132,7 @@ func TestSeedPoliciesOnce(t *testing.T) {
 // a delete of a missing policy is ErrPolicyNotFound.
 func TestTieringPolicySetAndDelete(t *testing.T) {
 	x := cpFSM(t)
-	x.ok(CommandSeedPolicies, SeedPoliciesPayload{Kind: PolicyKindTiering, Now: t0})
+	x.seed()
 	x.ok(CommandSetTieringPolicy, SetTieringPolicyPayload{Database: "db1", HotOnly: true, Now: t0})
 	first, ok := x.f.TieringPolicy("db1")
 	if !ok || !first.HotOnly || first.ID == 0 {
@@ -164,7 +171,7 @@ func TestTieringPolicySetAndDelete(t *testing.T) {
 // unseeded and empty.
 func TestClusterPoliciesSnapshotCarriesPolicies(t *testing.T) {
 	x := cpFSM(t)
-	x.ok(CommandSeedPolicies, SeedPoliciesPayload{Kind: PolicyKindTiering, Now: t0, Tiering: []TieringPolicyEntry{{Database: "db1", HotOnly: true}}})
+	x.seed(TieringPolicyEntry{Database: "db1", HotOnly: true})
 	x.ok(CommandSetTieringPolicy, SetTieringPolicyPayload{Database: "db2", HotMaxAgeDays: intp(3), Now: t0})
 	snap, err := x.f.Snapshot()
 	if err != nil {
@@ -196,5 +203,80 @@ func TestClusterPoliciesSnapshotCarriesPolicies(t *testing.T) {
 	}
 	if f2.PoliciesSeeded(PolicyKindTiering) || len(f2.TieringPolicies()) != 0 {
 		t.Fatal("restore of an older snapshot kept policies")
+	}
+}
+
+// A seed is accepted only for the open collect: not without one, not for an
+// older one a newer collect replaced, and not after AwaitAdoption closed it.
+func TestSeedNeedsTheOpenCollect(t *testing.T) {
+	x := cpFSM(t)
+	x.refused(CommandSeedPolicies, SeedPoliciesPayload{Kind: PolicyKindTiering, Epoch: 1, Now: t0})
+	x.ok(CommandCollectPolicies, CollectPoliciesPayload{Kind: PolicyKindTiering, Leader: "w1", Now: t0})
+	first := x.idx
+	if c, ok := x.f.PolicyCollecting(PolicyKindTiering); !ok || c.Epoch != first || c.Leader != "w1" {
+		t.Fatalf("collect: %+v %v", c, ok)
+	}
+	x.ok(CommandCollectPolicies, CollectPoliciesPayload{Kind: PolicyKindTiering, Leader: "w2", Now: t0})
+	second := x.idx
+	x.refused(CommandSeedPolicies, SeedPoliciesPayload{Kind: PolicyKindTiering, Epoch: first, Now: t0})
+	x.refused(CommandAwaitAdoption, AwaitAdoptionPayload{Kind: PolicyKindTiering, Epoch: first, Now: t0})
+	x.ok(CommandAwaitAdoption, AwaitAdoptionPayload{Kind: PolicyKindTiering, Epoch: second, Missing: []string{"w3", "r1"}, Now: t0})
+	if _, ok := x.f.PolicyCollecting(PolicyKindTiering); ok {
+		t.Fatal("collect still open after AwaitAdoption")
+	}
+	if a, ok := x.f.PolicyAwaitingAdoption(PolicyKindTiering); !ok || len(a.Missing) != 2 || a.Missing[0] != "r1" {
+		t.Fatalf("awaiting: %+v %v", a, ok)
+	}
+	x.refused(CommandSeedPolicies, SeedPoliciesPayload{Kind: PolicyKindTiering, Epoch: second, Now: t0})
+	// The next collect clears the awaiting state, and its seed closes it.
+	x.seed(TieringPolicyEntry{Database: "db1"})
+	if _, ok := x.f.PolicyAwaitingAdoption(PolicyKindTiering); ok {
+		t.Fatal("awaiting state left after the seed")
+	}
+	if _, ok := x.f.PolicyCollecting(PolicyKindTiering); ok {
+		t.Fatal("collect left open after the seed")
+	}
+	// Once seeded a collect changes nothing.
+	x.ok(CommandCollectPolicies, CollectPoliciesPayload{Kind: PolicyKindTiering, Leader: "w1", Now: t0})
+	if _, ok := x.f.PolicyCollecting(PolicyKindTiering); ok {
+		t.Fatal("a collect opened on a seeded kind")
+	}
+	x.refused(CommandCollectPolicies, CollectPoliciesPayload{Kind: "nope", Leader: "w1", Now: t0})
+	x.refused(CommandCollectPolicies, CollectPoliciesPayload{Kind: PolicyKindTiering, Now: t0})
+	y := takeoverFSM(t)
+	y.refused(CommandCollectPolicies, CollectPoliciesPayload{Kind: PolicyKindTiering, Leader: "w1", Now: t0})
+}
+
+// An open collect and an awaiting kind survive a snapshot.
+func TestClusterPoliciesSnapshotCarriesCollectState(t *testing.T) {
+	x := cpFSM(t)
+	x.ok(CommandCollectPolicies, CollectPoliciesPayload{Kind: PolicyKindTiering, Leader: "w1", Now: t0})
+	ep := x.idx
+	snap, _ := x.f.Snapshot()
+	var buf bytes.Buffer
+	if err := snap.Persist(&testSnapshotSink{Writer: &buf}); err != nil {
+		t.Fatal(err)
+	}
+	f2 := newTestFSM()
+	if err := f2.Restore(io.NopCloser(bytes.NewReader(buf.Bytes()))); err != nil {
+		t.Fatal(err)
+	}
+	if c, ok := f2.PolicyCollecting(PolicyKindTiering); !ok || c.Epoch != ep {
+		t.Fatalf("restored collect: %+v %v", c, ok)
+	}
+	x.ok(CommandAwaitAdoption, AwaitAdoptionPayload{Kind: PolicyKindTiering, Epoch: ep, Missing: []string{"w3"}, Now: t0})
+	snap, _ = x.f.Snapshot()
+	buf.Reset()
+	if err := snap.Persist(&testSnapshotSink{Writer: &buf}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f2.Restore(io.NopCloser(bytes.NewReader(buf.Bytes()))); err != nil {
+		t.Fatal(err)
+	}
+	if a, ok := f2.PolicyAwaitingAdoption(PolicyKindTiering); !ok || len(a.Missing) != 1 {
+		t.Fatalf("restored awaiting: %+v %v", a, ok)
+	}
+	if _, ok := f2.PolicyCollecting(PolicyKindTiering); ok {
+		t.Fatal("restored a closed collect")
 	}
 }

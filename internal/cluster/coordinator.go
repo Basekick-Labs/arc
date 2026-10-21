@@ -146,8 +146,11 @@ type Coordinator struct {
 	streamClaimsBlockers atomic.Pointer[[]string]
 	// compactionCommit: the #1207 d2 flag's join gate and blockers.
 	compactionCommit compactionCommitGate
-	// clusterPolicies: the #1324 flag's join gate and blockers.
+	// clusterPolicies: the #1324 flag's join gate and blockers;
+	// policyListers read this node's own rows of each kind for adoption.
 	clusterPolicies clusterPoliciesGate
+	policyListersMu sync.Mutex
+	policyListers   map[string]LocalPolicyLister
 	// staged: the staged compaction commit, replica side (#1207 d2a2a).
 	staged               stagedReplica
 	repair               manifestRepairState // shared object store manifest repair (#1207)
@@ -1956,6 +1959,9 @@ func (c *Coordinator) handlePeerConnection(conn net.Conn) {
 
 	case protocol.MsgFlushScopeRequest:
 		c.handleFlushScopeRequest(conn, msg.Payload.(*protocol.FlushScopeRequest))
+
+	case protocol.MsgLocalPoliciesQuery:
+		c.handleLocalPoliciesQuery(conn, msg.Payload.(*protocol.LocalPoliciesQuery))
 
 	case protocol.MsgFetchFile:
 		// The fetch handler streams the body for the lifetime of the

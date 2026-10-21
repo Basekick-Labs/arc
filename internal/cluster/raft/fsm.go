@@ -209,6 +209,11 @@ const (
 	// CommandSeedPolicies: the leader installing a kind's adopted policies,
 	// once (#1324).
 	CommandSeedPolicies
+	// CommandCollectPolicies / CommandAwaitAdoption: the leader opening a
+	// collect of a kind's rows from every node, and closing one that could
+	// not seed (#1324).
+	CommandCollectPolicies
+	CommandAwaitAdoption
 )
 
 // Command represents a command to be applied to the FSM.
@@ -787,6 +792,10 @@ type ClusterFSM struct {
 	clusterPolicies bool
 	policiesSeeded  map[string]bool
 	tieringPolicies map[string]*TieringPolicyEntry
+	// policyCollecting / policyAwaiting: kinds with an open collect, and
+	// kinds whose last collect could not seed.
+	policyCollecting map[string]*PolicyCollect
+	policyAwaiting   map[string]*PolicyAwaiting
 	// Staged-commit callbacks (#1207 d2a2a) and the events an apply queued
 	// for them, delivered once f.mu is released.
 	onCompactionStaged    func(StagedCompaction)
@@ -876,6 +885,8 @@ func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 		stagedPaths:             map[string]string{},
 		policiesSeeded:          map[string]bool{},
 		tieringPolicies:         map[string]*TieringPolicyEntry{},
+		policyCollecting:        map[string]*PolicyCollect{},
+		policyAwaiting:          map[string]*PolicyAwaiting{},
 
 		logger: logger.With().Str("component", "cluster-fsm").Logger(),
 	}
@@ -1280,6 +1291,10 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.applyDeleteTieringPolicy(cmd.Payload)
 	case CommandSeedPolicies:
 		return f.applySeedPolicies(cmd.Payload, log.Index)
+	case CommandCollectPolicies:
+		return f.applyCollectPolicies(cmd.Payload, log.Index)
+	case CommandAwaitAdoption:
+		return f.applyAwaitAdoption(cmd.Payload)
 	case CommandDeleteFile:
 		return f.applyDeleteFile(cmd.Payload)
 	case CommandAssignCompactor:

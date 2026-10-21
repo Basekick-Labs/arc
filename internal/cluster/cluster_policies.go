@@ -71,6 +71,7 @@ func (c *Coordinator) clusterPoliciesEnableLoop(ctx context.Context) {
 			return
 		case <-t.C:
 			c.maybeEnableClusterPolicies()
+			c.maybeSeedPolicies(ctx)
 		}
 	}
 }
@@ -117,8 +118,19 @@ func (c *Coordinator) ClusterPoliciesActive() bool {
 
 // ClusterPoliciesStatus is the /cluster status view.
 type ClusterPoliciesStatus struct {
-	Enabled  bool     `json:"enabled"`
-	Blocking []string `json:"blocking_nodes,omitempty"`
+	Enabled  bool                        `json:"enabled"`
+	Blocking []string                    `json:"blocking_nodes,omitempty"`
+	Kinds    map[string]PolicyKindStatus `json:"kinds,omitempty"`
+}
+
+// PolicyKindStatus is one kind's adoption: seeded (the cluster holds it),
+// collecting (local writes refused for seconds), or awaiting adoption with
+// the nodes that did not answer the last collect.
+type PolicyKindStatus struct {
+	Seeded     bool      `json:"seeded"`
+	Collecting bool      `json:"collecting,omitempty"`
+	Missing    []string  `json:"missing_nodes,omitempty"`
+	LastTry    time.Time `json:"last_attempt,omitempty"`
 }
 
 // ClusterPoliciesStatus reports the flag and, on the leader, the nodes keeping
@@ -131,6 +143,17 @@ func (c *Coordinator) ClusterPoliciesStatus() ClusterPoliciesStatus {
 	st.Enabled = c.ClusterPoliciesActive()
 	if b := c.clusterPolicies.blockers.Load(); b != nil && !st.Enabled && c.raftNode.IsLeader() {
 		st.Blocking = *b
+	}
+	if fsm := c.fsmOrNil(); fsm != nil && st.Enabled {
+		st.Kinds = map[string]PolicyKindStatus{}
+		for _, kind := range policyKinds {
+			k := PolicyKindStatus{Seeded: fsm.PoliciesSeeded(kind)}
+			_, k.Collecting = fsm.PolicyCollecting(kind)
+			if a, ok := fsm.PolicyAwaitingAdoption(kind); ok {
+				k.Missing, k.LastTry = a.Missing, a.At
+			}
+			st.Kinds[kind] = k
+		}
 	}
 	return st
 }

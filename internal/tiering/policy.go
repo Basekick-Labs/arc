@@ -3,7 +3,6 @@ package tiering
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -200,14 +199,19 @@ func (s *PolicyStore) getFromDB(ctx context.Context, database string) (*Database
 // Set creates or updates a policy for a database
 func (s *PolicyStore) Set(ctx context.Context, policy *DatabasePolicy) error {
 	if src := s.clusterSource(); src != nil {
-		if err := src.Set(ctx, policy); err != nil {
-			return fmt.Errorf("failed to set policy: %w", err)
-		}
-		s.logger.Info().Str("database", policy.Database).Bool("hot_only", policy.HotOnly).
-			Msg("Tiering policy updated cluster-wide")
-		return nil
+		return s.setInCluster(ctx, src, policy)
 	}
 	s.mu.Lock()
+	// Re-checked under the lock a collect's read of this table takes: the
+	// cluster may have seeded the policies, or opened a collect, while this
+	// call waited for it (#1324).
+	if src, refuse := s.localWriteLocked(); refuse != nil || src != nil {
+		s.mu.Unlock()
+		if refuse != nil {
+			return refuse
+		}
+		return s.setInCluster(ctx, src, policy)
+	}
 	defer s.mu.Unlock()
 
 	query := `
@@ -243,17 +247,16 @@ func (s *PolicyStore) Set(ctx context.Context, policy *DatabasePolicy) error {
 // Delete removes a policy for a database (reverts to global defaults)
 func (s *PolicyStore) Delete(ctx context.Context, database string) error {
 	if src := s.clusterSource(); src != nil {
-		if err := src.Delete(ctx, database); err != nil {
-			if errors.Is(err, ErrPolicyNotFound) {
-				return fmt.Errorf("policy not found for database: %s: %w", database, ErrPolicyNotFound)
-			}
-			return fmt.Errorf("failed to delete policy: %w", err)
-		}
-		s.logger.Info().Str("database", database).
-			Msg("Tiering policy deleted cluster-wide, reverting to global defaults")
-		return nil
+		return s.deleteInCluster(ctx, src, database)
 	}
 	s.mu.Lock()
+	if src, refuse := s.localWriteLocked(); refuse != nil || src != nil {
+		s.mu.Unlock()
+		if refuse != nil {
+			return refuse
+		}
+		return s.deleteInCluster(ctx, src, database)
+	}
 	defer s.mu.Unlock()
 
 	query := `DELETE FROM tiering_policies WHERE database = ?`

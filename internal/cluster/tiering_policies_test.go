@@ -26,8 +26,11 @@ func enableClusterPolicies(t *testing.T, c *Coordinator) {
 
 func seedTiering(t *testing.T, c *Coordinator, entries ...raft.TieringPolicyEntry) {
 	t.Helper()
-	raw, _ := json.Marshal(raft.SeedPoliciesPayload{Kind: raft.PolicyKindTiering, Tiering: entries, Now: time.Now().UTC()})
-	if err := c.raftNode.Apply(&raft.Command{Type: raft.CommandSeedPolicies, Payload: raw}, 5*time.Second); err != nil {
+	epoch, err := c.proposeLeader(raft.CommandCollectPolicies, raft.CollectPoliciesPayload{Kind: raft.PolicyKindTiering, Leader: "raft-1", Now: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.proposeLeader(raft.CommandSeedPolicies, raft.SeedPoliciesPayload{Kind: raft.PolicyKindTiering, Epoch: epoch, Tiering: entries, Now: time.Now().UTC()}); err != nil {
 		t.Fatal(err)
 	}
 }

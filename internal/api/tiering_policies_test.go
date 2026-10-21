@@ -184,3 +184,47 @@ func TestSetHotOnlyPolicyDoesNotUpdateWhenColdFileCountFails(t *testing.T) {
 		t.Fatalf("cold file count called %d times, want 1", manager.coldCalls)
 	}
 }
+
+// collectingSource is a cluster that is collecting the nodes' policies.
+type collectingSource struct{}
+
+func (collectingSource) Seeded() bool                                       { return false }
+func (collectingSource) Collecting() bool                                   { return true }
+func (collectingSource) Get(string) (*tiering.DatabasePolicy, bool)         { return nil, false }
+func (collectingSource) List() []tiering.DatabasePolicy                     { return nil }
+func (collectingSource) Set(context.Context, *tiering.DatabasePolicy) error { return nil }
+func (collectingSource) Delete(context.Context, string) error               { return nil }
+
+// #1324: while the cluster collects the nodes' policies a write answers 503
+// (retry), and a delete of a missing policy is still 404.
+func TestTieringPolicyWritesDuringACollect(t *testing.T) {
+	app, manager := newTieringPoliciesTestApp(t, 0, nil)
+	app.Delete("/api/v1/tiering/policies/:database", (&TieringPoliciesHandler{manager: manager, logger: zerolog.Nop()}).DeletePolicy)
+
+	del := func() int {
+		resp, err := app.Test(httptest.NewRequest(http.MethodDelete, "/api/v1/tiering/policies/nope", nil), 1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := del(); code != fiber.StatusNotFound {
+		t.Fatalf("delete of a missing policy = %d, want 404", code)
+	}
+
+	manager.policies.SetClusterSource(collectingSource{})
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/tiering/policies/db1", strings.NewReader(`{"hot_max_age_days":3}`))
+	req.Header.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSON)
+	resp, err := app.Test(req, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != fiber.StatusServiceUnavailable {
+		t.Fatalf("set during a collect = %d, want 503", resp.StatusCode)
+	}
+	if code := del(); code != fiber.StatusServiceUnavailable {
+		t.Fatalf("delete during a collect = %d, want 503", code)
+	}
+}

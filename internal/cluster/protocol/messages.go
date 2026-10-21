@@ -1,6 +1,9 @@
 package protocol
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // MessageType identifies the type of cluster protocol message.
 type MessageType uint8
@@ -84,7 +87,49 @@ const (
 	// the unknown type, which the asker treats as no answer.
 	MsgFlushScopeRequest MessageType = 0x52
 	MsgFlushScopeReply   MessageType = 0x53
+
+	// Local policies (#1324): before the cluster takes over a policy kind,
+	// the leader asks every node for the rows of that kind in its own
+	// SQLite. Sent only once cluster policies are enabled, so every node
+	// knows the type.
+	MsgLocalPoliciesQuery MessageType = 0x54
+	MsgLocalPoliciesReply MessageType = 0x55
 )
+
+// LocalPoliciesQuery asks a node for its own rows of a policy kind, once its
+// FSM has applied the collect at Epoch (a log index).
+// HMAC: security.ComputeLocalPoliciesQueryHMAC.
+type LocalPoliciesQuery struct {
+	NodeID      string `json:"node_id"`
+	ClusterName string `json:"cluster_name"`
+	Kind        string `json:"kind"`
+	Epoch       uint64 `json:"epoch"`
+	Nonce       string `json:"nonce"`
+	Timestamp   int64  `json:"timestamp"`
+	HMAC        string `json:"hmac"`
+}
+
+// Local policies reply statuses.
+const (
+	// LocalPoliciesOK: Policies is every row of the kind on the node.
+	LocalPoliciesOK = "ok"
+	// LocalPoliciesFailed: the node could not read its rows, or had not
+	// applied the collect in time.
+	LocalPoliciesFailed = "failed"
+	// LocalPoliciesRefused: the query failed authentication or validation.
+	LocalPoliciesRefused = "refused"
+)
+
+// LocalPoliciesReply answers a LocalPoliciesQuery, bound to its nonce, kind
+// and epoch, over a digest of Policies: security.ComputeLocalPoliciesReplyHMAC.
+// Policies is the kind's rows as JSON.
+type LocalPoliciesReply struct {
+	NodeID    string          `json:"node_id"`
+	Status    string          `json:"status"`
+	Policies  json.RawMessage `json:"policies,omitempty"`
+	Timestamp int64           `json:"timestamp"`
+	HMAC      string          `json:"hmac"`
+}
 
 // PendingRegistrationsQuery asks a node for the files it flushed that the
 // cluster manifest does not list yet, whenever they were flushed.
@@ -213,6 +258,10 @@ func (m MessageType) String() string {
 		return "FlushScopeRequest"
 	case MsgFlushScopeReply:
 		return "FlushScopeReply"
+	case MsgLocalPoliciesQuery:
+		return "LocalPoliciesQuery"
+	case MsgLocalPoliciesReply:
+		return "LocalPoliciesReply"
 	case MsgReplicateSync:
 		return "ReplicateSync"
 	case MsgReplicateSyncAck:
