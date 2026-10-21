@@ -63,6 +63,16 @@ type ContinuousQueryHandler struct {
 	logger      zerolog.Logger
 	// cl is the cluster-wide state (#1324), see cq_cluster.go.
 	cl cqCluster
+	// aggregateHook replaces executeAggregation in tests; nil in production.
+	aggregateHook func(ctx context.Context, cq *ContinuousQuery, query string, start time.Time) (int64, error)
+}
+
+// aggregate runs a CQ's aggregation (executeAggregation, or the test hook).
+func (h *ContinuousQueryHandler) aggregate(ctx context.Context, cq *ContinuousQuery, query string, start, end time.Time) (int64, error) {
+	if h.aggregateHook != nil {
+		return h.aggregateHook(ctx, cq, query, start)
+	}
+	return h.executeAggregation(ctx, cq, query, start, end)
 }
 
 // SetScheduler sets the CQ scheduler for reloading after updates.
@@ -776,7 +786,7 @@ func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (
 		Msg("Executing scheduled continuous query")
 
 	// Execute the aggregation query using DuckDB
-	recordsWritten, err := h.executeAggregation(ctx, cq, executedQuery, startTime, endTime)
+	recordsWritten, err := h.aggregate(ctx, cq, executedQuery, startTime, endTime)
 	if err != nil && ingest.IsWriteRefusal(err) {
 		// Writes are refused (fenced, or WAL volume disk pressure, #676): the
 		// run is skipped, not failed. No execution row, which would be one
@@ -976,7 +986,7 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 	// manual execute over a very wide range can't run unbounded.
 	ctx, cancel := context.WithTimeout(c.Context(), 10*time.Minute)
 	defer cancel()
-	recordsWritten, err := h.executeAggregation(ctx, cq, executedQuery, startTime, endTime)
+	recordsWritten, err := h.aggregate(ctx, cq, executedQuery, startTime, endTime)
 	if err != nil {
 		executionDuration := time.Since(start).Seconds()
 
