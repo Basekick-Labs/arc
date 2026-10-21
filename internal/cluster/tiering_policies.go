@@ -3,6 +3,11 @@ package cluster
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/basekick-labs/arc/internal/cluster/protocol"
 
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/tiering"
@@ -51,16 +56,35 @@ func (s *TieringPolicySource) List() []tiering.DatabasePolicy {
 
 // Set implements tiering.ClusterPolicySource.
 func (s *TieringPolicySource) Set(ctx context.Context, p *tiering.DatabasePolicy) error {
-	return s.c.SetTieringPolicy(ctx, p.Database, p.HotOnly, p.HotMaxAgeDays)
+	return classifyPolicyError(s.c.SetTieringPolicy(ctx, p.Database, p.HotOnly, p.HotMaxAgeDays))
 }
 
 // Delete implements tiering.ClusterPolicySource.
 func (s *TieringPolicySource) Delete(ctx context.Context, database string) error {
-	err := s.c.DeleteTieringPolicy(ctx, database)
+	return classifyPolicyError(s.c.DeleteTieringPolicy(ctx, database))
+}
+
+// classifyPolicyError sorts a policy write's error for the API: a missing
+// policy, a policy the cluster state refused (invalid, not worth retrying),
+// or anything else, which is the cluster not taking writes right now
+// (retry). A refusal reaches a follower as the leader's text, so it is
+// recognised by the apply-failed code and the FSM's own prefix.
+func classifyPolicyError(err error) error {
+	if err == nil {
+		return nil
+	}
 	if raft.IsPolicyNotFound(err) {
 		return tiering.ErrPolicyNotFound
 	}
-	return err
+	refused := errors.Is(err, raft.ErrCommandRefused)
+	var fr *ForwardRejectedError
+	if errors.As(err, &fr) && fr.Code == protocol.ForwardCodeApplyFailed && strings.Contains(fr.Message, "tiering policy") {
+		refused = true
+	}
+	if refused {
+		return fmt.Errorf("%w: %v", tiering.ErrInvalidPolicy, err)
+	}
+	return fmt.Errorf("%w: %v", tiering.ErrClusterUnavailable, err)
 }
 
 func tieringPolicyFromEntry(e raft.TieringPolicyEntry) tiering.DatabasePolicy {
@@ -71,20 +95,64 @@ func tieringPolicyFromEntry(e raft.TieringPolicyEntry) tiering.DatabasePolicy {
 }
 
 // TieringLocalLister reads this node's own tiering policies for adoption,
-// under the store's write lock (tiering.PolicyStore.LocalPolicies).
-func TieringLocalLister(store *tiering.PolicyStore) LocalPolicyLister {
+// under the store's write lock (tiering.PolicyStore.LocalPolicies), with the
+// default an unset hot_max_age_days means here.
+func TieringLocalLister(store *tiering.PolicyStore, defaultHotMaxAgeDays int) LocalPolicyLister {
 	return func(ctx context.Context) (json.RawMessage, error) {
 		policies, err := store.LocalPolicies(ctx)
 		if err != nil {
 			return nil, err
 		}
-		entries := make([]raft.TieringPolicyEntry, 0, len(policies))
+		rows := TieringLocalRows{DefaultHotMaxAgeDays: defaultHotMaxAgeDays, Policies: make([]raft.TieringPolicyEntry, 0, len(policies))}
 		for _, p := range policies {
-			entries = append(entries, raft.TieringPolicyEntry{
+			rows.Policies = append(rows.Policies, raft.TieringPolicyEntry{
 				Database: p.Database, HotOnly: p.HotOnly, HotMaxAgeDays: p.HotMaxAgeDays,
 				CreatedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt,
 			})
 		}
-		return json.Marshal(entries)
+		return json.Marshal(rows)
 	}
+}
+
+// MirrorTieringPolicies keeps store's own table equal to the cluster's tiering
+// policies once they are seeded, so a backup of this node's database carries
+// them (#1324). It runs on a worker: the FSM only signals it, and the worker
+// rewrites the table from the FSM's current state, so bursts coalesce and the
+// FSM goroutine never waits on SQLite. It mirrors once at start, which covers
+// a restart and a snapshot installed before the worker existed.
+func (c *Coordinator) MirrorTieringPolicies(store *tiering.PolicyStore) {
+	fsm := c.fsmOrNil()
+	if fsm == nil || store == nil {
+		return
+	}
+	signal := make(chan struct{}, 1)
+	notify := func() {
+		select {
+		case signal <- struct{}{}:
+		default:
+		}
+	}
+	fsm.SetPoliciesChangedCallback(notify)
+	notify()
+	ctx := c.ctxOrBackground()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-signal:
+			}
+			if !c.PoliciesSeeded(raft.PolicyKindTiering) {
+				continue
+			}
+			entries := c.TieringPolicies()
+			policies := make([]tiering.DatabasePolicy, 0, len(entries))
+			for _, e := range entries {
+				policies = append(policies, tieringPolicyFromEntry(e))
+			}
+			if err := store.MirrorClusterPolicies(ctx, policies); err != nil {
+				c.logger.Warn().Err(err).Msg("Could not mirror the cluster's tiering policies into this node's database; a backup taken now may carry older ones")
+			}
+		}
+	}()
 }

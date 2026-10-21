@@ -35,6 +35,14 @@ type ClusterPolicySource interface {
 // ErrPolicyNotFound: a delete of a database with no custom policy.
 var ErrPolicyNotFound = errors.New("policy not found")
 
+// ErrInvalidPolicy: the cluster refused the policy itself (a database name
+// too long, say). Not worth retrying.
+var ErrInvalidPolicy = errors.New("invalid tiering policy")
+
+// ErrClusterUnavailable: the cluster could not take the write right now (no
+// leader, leadership changing, the leader unreachable). Retry.
+var ErrClusterUnavailable = errors.New("the cluster could not take the tiering policy write right now; retry")
+
 // ErrPoliciesBeingAdopted: a write while the cluster takes over the nodes'
 // own policies. It lasts seconds; retry.
 var ErrPoliciesBeingAdopted = errors.New("tiering policies are being adopted by the cluster; retry in a few seconds")
@@ -69,11 +77,15 @@ func (s *PolicyStore) localWriteLocked() (ClusterPolicySource, error) {
 	if h == nil {
 		return nil, nil
 	}
-	if h.src.Seeded() {
-		return h.src, nil
-	}
+	// Collecting first: a seed ends the collect and marks the kind seeded in
+	// one apply, so if it lands between the two reads, Seeded sees it. In the
+	// other order the write could read "not seeded", then "not collecting",
+	// and land in this table after the seed, where nothing reads it.
 	if h.src.Collecting() {
 		return nil, ErrPoliciesBeingAdopted
+	}
+	if h.src.Seeded() {
+		return h.src, nil
 	}
 	return nil, nil
 }
@@ -107,4 +119,40 @@ func (s *PolicyStore) LocalPolicies(ctx context.Context) ([]DatabasePolicy, erro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.listFromDB(ctx)
+}
+
+// MirrorClusterPolicies replaces this node's table with the cluster's
+// policies (#1324). The cluster's copy is the one every read uses once seeded;
+// the table is kept equal to it so a backup of this node's database, and a
+// restore of it onto a standalone node or a fresh cluster, carries the
+// current policies.
+func (s *PolicyStore) MirrorClusterPolicies(ctx context.Context, policies []DatabasePolicy) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("mirror tiering policies: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tiering_policies`); err != nil {
+		return fmt.Errorf("mirror tiering policies: %w", err)
+	}
+	for _, p := range policies {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO tiering_policies (database, hot_only, hot_max_age_days, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
+			p.Database, p.HotOnly, p.HotMaxAgeDays, p.CreatedAt.UTC(), p.UpdatedAt.UTC()); err != nil {
+			return fmt.Errorf("mirror tiering policies: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("mirror tiering policies: %w", err)
+	}
+	// The cache is the local table's; keep it equal too.
+	s.cache = make(map[string]*DatabasePolicy, len(policies))
+	for i := range policies {
+		p := policies[i]
+		s.cache[p.Database] = &p
+	}
+	s.gen++
+	return nil
 }

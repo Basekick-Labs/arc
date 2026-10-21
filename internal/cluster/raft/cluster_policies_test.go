@@ -280,3 +280,60 @@ func TestClusterPoliciesSnapshotCarriesCollectState(t *testing.T) {
 		t.Fatal("restored a closed collect")
 	}
 }
+
+// Every policy gets its own ID, seeded or set, and the numbering survives a
+// snapshot.
+func TestTieringPolicyIDsAreUnique(t *testing.T) {
+	x := cpFSM(t)
+	x.seed(TieringPolicyEntry{Database: "a"}, TieringPolicyEntry{Database: "b"})
+	x.ok(CommandSetTieringPolicy, SetTieringPolicyPayload{Database: "c", Now: t0})
+	ids := map[int64]bool{}
+	for _, e := range x.f.TieringPolicies() {
+		if e.ID == 0 || ids[e.ID] {
+			t.Fatalf("duplicate or zero id in %+v", x.f.TieringPolicies())
+		}
+		ids[e.ID] = true
+	}
+	snap, _ := x.f.Snapshot()
+	var buf bytes.Buffer
+	if err := snap.Persist(&testSnapshotSink{Writer: &buf}); err != nil {
+		t.Fatal(err)
+	}
+	f2 := newTestFSM()
+	if err := f2.Restore(io.NopCloser(bytes.NewReader(buf.Bytes()))); err != nil {
+		t.Fatal(err)
+	}
+	applyCmd(t, f2, 1000, CommandSetTieringPolicy, SetTieringPolicyPayload{Database: "d", Now: t0})
+	d, _ := f2.TieringPolicy("d")
+	if ids[d.ID] {
+		t.Fatalf("a policy set after a restore reused id %d", d.ID)
+	}
+}
+
+// An attempt that never opened a collect is recorded without an epoch, but
+// cannot speak for an open one; attempts count up until the seed.
+func TestAwaitAdoptionWithoutACollect(t *testing.T) {
+	x := cpFSM(t)
+	x.ok(CommandAwaitAdoption, AwaitAdoptionPayload{Kind: PolicyKindTiering, Missing: []string{"r1"}, LastError: "unreachable", Now: t0})
+	x.ok(CommandAwaitAdoption, AwaitAdoptionPayload{Kind: PolicyKindTiering, Missing: []string{"r1"}, LastError: "unreachable", Now: t0})
+	if a, _ := x.f.PolicyAwaitingAdoption(PolicyKindTiering); a.Attempts != 2 || a.LastError != "unreachable" {
+		t.Fatalf("awaiting = %+v", a)
+	}
+	x.ok(CommandCollectPolicies, CollectPoliciesPayload{Kind: PolicyKindTiering, Leader: "w1", Now: t0})
+	x.refused(CommandAwaitAdoption, AwaitAdoptionPayload{Kind: PolicyKindTiering, Now: t0})
+	if _, ok := x.f.PolicyCollecting(PolicyKindTiering); !ok {
+		t.Fatal("an epoch-less await closed the open collect")
+	}
+	x.refused(CommandAwaitAdoption, AwaitAdoptionPayload{Kind: "nope", Now: t0})
+}
+
+// The FSM bounds a seed itself, not only the leader.
+func TestSeedBoundedInTheFSM(t *testing.T) {
+	x := cpFSM(t)
+	x.ok(CommandCollectPolicies, CollectPoliciesPayload{Kind: PolicyKindTiering, Leader: "w1", Now: t0})
+	many := make([]TieringPolicyEntry, MaxSeedTieringPolicies+1)
+	for i := range many {
+		many[i].Database = fmt.Sprintf("db%d", i)
+	}
+	x.refused(CommandSeedPolicies, SeedPoliciesPayload{Kind: PolicyKindTiering, Epoch: x.idx, Tiering: many, Now: t0})
+}

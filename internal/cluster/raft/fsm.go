@@ -796,6 +796,10 @@ type ClusterFSM struct {
 	// kinds whose last collect could not seed.
 	policyCollecting map[string]*PolicyCollect
 	policyAwaiting   map[string]*PolicyAwaiting
+	// tieringPolicySeq numbers tiering policies (their IDs).
+	tieringPolicySeq int64
+	// onPoliciesChanged: SetPoliciesChangedCallback.
+	onPoliciesChanged atomic.Pointer[func()]
 	// Staged-commit callbacks (#1207 d2a2a) and the events an apply queued
 	// for them, delivered once f.mu is released.
 	onCompactionStaged    func(StagedCompaction)
@@ -1286,11 +1290,11 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 	case CommandEnableClusterPolicies:
 		return f.applyEnableClusterPolicies(cmd.Payload)
 	case CommandSetTieringPolicy:
-		return f.applySetTieringPolicy(cmd.Payload, log.Index)
+		return f.policiesChangedIfApplied(f.applySetTieringPolicy(cmd.Payload))
 	case CommandDeleteTieringPolicy:
-		return f.applyDeleteTieringPolicy(cmd.Payload)
+		return f.policiesChangedIfApplied(f.applyDeleteTieringPolicy(cmd.Payload))
 	case CommandSeedPolicies:
-		return f.applySeedPolicies(cmd.Payload, log.Index)
+		return f.policiesChangedIfApplied(f.applySeedPolicies(cmd.Payload))
 	case CommandCollectPolicies:
 		return f.applyCollectPolicies(cmd.Payload, log.Index)
 	case CommandAwaitAdoption:
@@ -3319,6 +3323,7 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	if pauseChanged && onCompactionPauseChanged != nil {
 		onCompactionPauseChanged(restoredPause.Active, restoredPause.Generation)
 	}
+	f.firePoliciesChanged()
 
 	// Last, after the restored state is in place: a reader that sees the
 	// index must also see what it covers.

@@ -102,3 +102,28 @@ func TestPolicyStore_LocalPoliciesWaitsForAWriteInProgress(t *testing.T) {
 		t.Fatalf("collect read %+v, want the write that was in progress", rows)
 	}
 }
+
+// A seed that lands between the write's two reads of the cluster state (it
+// ends the collect and marks the kind seeded in one apply) sends the write to
+// the cluster, never to the local table.
+func TestPolicyStore_SeedBetweenTheTwoReadsGoesToTheCluster(t *testing.T) {
+	store, cleanup := setupTestPolicyStore(t)
+	defer cleanup()
+	src := &fakeSource{}
+	src.collecting = func() bool {
+		// The collect was open; the seed applies right after this read.
+		src.seeded.Store(true)
+		return false
+	}
+	store.SetClusterSource(src)
+	// Not seeded at the unlocked check, so the write takes the lock.
+	if err := store.Set(context.Background(), &DatabasePolicy{Database: "db1"}); err != nil {
+		t.Fatal(err)
+	}
+	src.mu.Lock()
+	n := len(src.sets)
+	src.mu.Unlock()
+	if n != 1 {
+		t.Fatal("the write went to the local table after the seed")
+	}
+}

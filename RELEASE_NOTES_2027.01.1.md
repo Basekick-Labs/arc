@@ -261,19 +261,30 @@ commit, the flag stays on, and a node running an earlier release can no longer
 join. Roll back the same way: never one node in place.
 
 Right after that, the cluster takes over the tiering policies each node holds
-in its own database. For a few seconds a tiering policy write answers `503`;
-retry it. Every node must answer:
+in its own database. During the takeover a tiering policy write answers `503`
+for up to a few seconds; retry it.
 
-- If a node is down, the cluster keeps the policies on each node, exactly as
-  before, and tries again every 30 seconds.
-- `cluster_policies.kinds.tiering.missing_nodes` names the nodes it is waiting
-  for. A node that is gone for good must be removed from the cluster before
-  the policies can be adopted.
+Every node must answer, or nothing is taken over:
+
+- The leader first checks that it can reach every node. If one is down, it
+  takes nothing over, so writes are never held, and the policies stay on each
+  node exactly as before.
+- It tries again after 30 seconds, doubling the wait after each failed attempt
+  up to 10 minutes.
+- `cluster_policies.kinds.tiering` shows `missing_nodes`, `last_error` and
+  `failed_attempts`.
+- A node that is gone for good must be removed from the cluster before the
+  policies can be taken over.
 
 The policies are merged in the direction that moves less data. A database that
-is `hot_only` on any node stays `hot_only`. Otherwise it keeps the longest
-`hot_max_age_days` any node set. After the takeover every node reports the same
-policies, and `GET /api/v1/tiering/policies` lists them all from any node.
+is `hot_only` on any node stays `hot_only`. Otherwise it keeps the longest hot
+age any node applied to it: the policy's `hot_max_age_days`, or that node's
+`default_hot_max_age_days` where the policy left it unset. Afterwards:
+
+- every node reports the same policies;
+- `GET /api/v1/tiering/policies` lists them all from any node;
+- every node keeps its own `tiering_policies` table equal to them, so a backup
+  of any node carries the current policies.
 
 ## Upgrade note: the live WAL replication stream is removed ([#888](https://github.com/Basekick-Labs/arc/issues/888), [#1181](https://github.com/Basekick-Labs/arc/issues/1181))
 
@@ -1293,10 +1304,19 @@ applies cluster-wide, every node reports the same policies, and a new primary
 applies them. A standalone node is unchanged. The upgrade note above explains
 how a cluster takes over the policies each node already holds.
 
-A write forwarded to the leader also returns only once the node that
-forwarded it has applied the change. This covers a token or RBAC change made
-on a follower too. Before, reading it back on that node right away could
-briefly miss it.
+Status codes for `PUT` and `DELETE /api/v1/tiering/policies/{database}`:
+
+| Status | When |
+|---|---|
+| `503` | The cluster cannot take the write right now (no leader, or the policies are being taken over). Retry. |
+| `400` | The policy is invalid, for example a database name longer than 256 bytes. |
+| `404` | `DELETE` of a database with no policy. |
+| `500` | `DELETE` hit a database error. It used to answer `404` for any error. |
+
+A token or RBAC change made on a follower is forwarded to the leader. It now
+returns only once the follower that forwarded it has applied the change, up to
+the write's timeout, so reading it back on that node sees it. Before, the read
+could briefly miss it.
 
 ### Aggregates over several hours no longer return one result per hour on `/api/v1/query`
 

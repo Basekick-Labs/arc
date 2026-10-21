@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -18,10 +19,10 @@ import (
 
 func TestMergeTieringPolicies(t *testing.T) {
 	t1, t2 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
-	got := mergeTieringPolicies(map[string][]raft.TieringPolicyEntry{
-		"a": {{Database: "db1", HotMaxAgeDays: intPtr(7), CreatedAt: t2, UpdatedAt: t2}, {Database: "db3"}},
-		"b": {{Database: "db1", HotOnly: true, HotMaxAgeDays: intPtr(3), CreatedAt: t1, UpdatedAt: t1}, {Database: "db2", HotMaxAgeDays: intPtr(30)}},
-		"c": {{Database: "db1", HotMaxAgeDays: intPtr(14)}, {Database: "db3"}},
+	got := mergeTieringPolicies(map[string]TieringLocalRows{
+		"a": {DefaultHotMaxAgeDays: 7, Policies: []raft.TieringPolicyEntry{{Database: "db1", HotMaxAgeDays: intPtr(7), CreatedAt: t2, UpdatedAt: t2}, {Database: "db3"}}},
+		"b": {DefaultHotMaxAgeDays: 7, Policies: []raft.TieringPolicyEntry{{Database: "db1", HotOnly: true, HotMaxAgeDays: intPtr(3), CreatedAt: t1, UpdatedAt: t1}, {Database: "db2", HotMaxAgeDays: intPtr(30)}}},
+		"c": {DefaultHotMaxAgeDays: 7, Policies: []raft.TieringPolicyEntry{{Database: "db1", HotMaxAgeDays: intPtr(14)}, {Database: "db3"}}},
 	})
 	if len(got) != 3 {
 		t.Fatalf("merged: %+v", got)
@@ -35,6 +36,24 @@ func TestMergeTieringPolicies(t *testing.T) {
 	}
 	if db3.HotMaxAgeDays != nil {
 		t.Fatalf("db3 = %+v: unset everywhere stays unset", db3)
+	}
+}
+
+// An unset age means the node's own default: a node whose default is longer
+// than another node's explicit age keeps its data hot longer, so the merge
+// takes the default.
+func TestMergeTieringPolicies_UnsetAgeIsTheNodesDefault(t *testing.T) {
+	got := mergeTieringPolicies(map[string]TieringLocalRows{
+		"a": {DefaultHotMaxAgeDays: 30, Policies: []raft.TieringPolicyEntry{{Database: "db"}}},
+		"b": {DefaultHotMaxAgeDays: 7, Policies: []raft.TieringPolicyEntry{{Database: "db", HotMaxAgeDays: intPtr(7)}}},
+	})
+	if len(got) != 1 || got[0].HotMaxAgeDays == nil || *got[0].HotMaxAgeDays != 30 {
+		t.Fatalf("merged = %+v, want 30 (node a's default), not b's 7", got)
+	}
+	// A node that answered "none" (tiering off) contributes nothing.
+	seed, err := mergePolicyAnswers(raft.PolicyKindTiering, map[string]json.RawMessage{"x": json.RawMessage("null")})
+	if err != nil || len(seed.Tiering) != 0 {
+		t.Fatalf("empty answer: %+v %v", seed, err)
 	}
 }
 
@@ -99,8 +118,14 @@ func newAdoptRig(t *testing.T) *adoptRig {
 		s *tiering.PolicyStore
 	}{{r.leader, r.leaderStore}, {r.follower, r.followerStore}} {
 		p.s.SetClusterSource(NewTieringPolicySource(p.c))
-		p.c.SetLocalPolicyLister(raft.PolicyKindTiering, TieringLocalLister(p.s))
+		p.c.SetLocalPolicyLister(raft.PolicyKindTiering, TieringLocalLister(p.s, 7))
 	}
+	r.serve(ln)
+	return r
+}
+
+// serve answers collects on ln as the follower.
+func (r *adoptRig) serve(ln net.Listener) {
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -119,7 +144,16 @@ func newAdoptRig(t *testing.T) *adoptRig {
 			}(conn)
 		}
 	}()
-	return r
+}
+
+// moveFollower points the leader at a new listener for the follower.
+func (r *adoptRig) moveFollower(t *testing.T, ln net.Listener) {
+	t.Helper()
+	n := NewNode("F", "F", RoleReader, "test-cluster")
+	n.Address = ln.Addr().String()
+	if err := r.leader.registry.Register(n); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // #1324: the leader collects every node's own tiering policies, merges them,
@@ -163,7 +197,6 @@ func TestAdoptPolicies_SilentNodeDoesNotSeed(t *testing.T) {
 	if err := r.followerStore.Set(ctx, &tiering.DatabasePolicy{Database: "pinned", HotOnly: true}); err != nil {
 		t.Fatal(err)
 	}
-	addr := r.ln.Addr().String()
 	_ = r.ln.Close()
 	prev := policyAdoptRetry
 	policyAdoptRetry = 0
@@ -174,37 +207,22 @@ func TestAdoptPolicies_SilentNodeDoesNotSeed(t *testing.T) {
 		t.Fatal("seeded without the follower's answer: its hot_only pin would be dropped")
 	}
 	st := r.leader.ClusterPoliciesStatus().Kinds[raft.PolicyKindTiering]
-	if st.Collecting || len(st.Missing) != 1 || st.Missing[0] != "F" {
-		t.Fatalf("status = %+v, want F named and the collect closed", st)
+	if st.Collecting || len(st.Missing) != 1 || st.Missing[0] != "F" || st.Attempts != 1 || st.LastError != "unreachable before the collect" {
+		t.Fatalf("status = %+v, want F named, found unreachable before any collect opened", st)
 	}
 	waitFor(t, 10*time.Second, func() bool { return !r.follower.PolicyCollecting(raft.PolicyKindTiering) }, "follower still sees the collect")
 	if err := r.followerStore.Set(ctx, &tiering.DatabasePolicy{Database: "later", HotMaxAgeDays: intPtr(5)}); err != nil {
 		t.Fatalf("a local write after the collect closed: %v", err)
 	}
 
-	// The follower answers again.
-	ln, err := net.Listen("tcp", addr)
+	// The follower answers again, on a new address.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Skipf("could not re-listen on %s: %v", addr, err)
+		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func(conn net.Conn) {
-				defer conn.Close()
-				msg, err := protocol.ReceiveMessage(conn, 5*time.Second)
-				if err == nil {
-					if q, ok := msg.Payload.(*protocol.LocalPoliciesQuery); ok {
-						r.follower.handleLocalPoliciesQuery(conn, q)
-					}
-				}
-			}(conn)
-		}
-	}()
+	r.serve(ln)
+	r.moveFollower(t, ln)
 	r.leader.maybeSeedPolicies(ctx)
 	if !r.leader.PoliciesSeeded(raft.PolicyKindTiering) {
 		t.Fatalf("not seeded once the follower answered: %+v", r.leader.ClusterPoliciesStatus())
@@ -268,5 +286,147 @@ func TestLocalPoliciesQuery_Refusals(t *testing.T) {
 	}
 	if rep := ask("L", "another-secret-of-32-bytes-long!!"); rep.Status != protocol.LocalPoliciesRefused {
 		t.Fatalf("query with a bad MAC: %s", rep.Status)
+	}
+}
+
+// A node that accepts the connection but never answers holds the collect
+// only until the query times out; the collect then closes and names it.
+func TestAdoptPolicies_HungNodeClosesTheCollect(t *testing.T) {
+	r := newAdoptRig(t)
+	ctx := context.Background()
+	prev := policyQueryTimeout
+	policyQueryTimeout = 500 * time.Millisecond
+	t.Cleanup(func() { policyQueryTimeout = prev })
+	_ = r.ln.Close()
+	hung, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = hung.Close() })
+	go func() {
+		for {
+			conn, err := hung.Accept()
+			if err != nil {
+				return
+			}
+			go func() { time.Sleep(5 * time.Second); conn.Close() }()
+		}
+	}()
+	r.moveFollower(t, hung)
+	start := time.Now()
+	r.leader.maybeSeedPolicies(ctx)
+	if el := time.Since(start); el > 4*time.Second {
+		t.Fatalf("the collect stayed open %v", el)
+	}
+	st := r.leader.ClusterPoliciesStatus().Kinds[raft.PolicyKindTiering]
+	if st.Seeded || st.Collecting || len(st.Missing) != 1 || st.LastError != "no answer to the collect" {
+		t.Fatalf("status = %+v", st)
+	}
+}
+
+// A node that has not registered its policies yet (still starting) cannot
+// answer: the collect waits for it rather than dropping its policies.
+func TestAdoptPolicies_NodeWithoutAListerHoldsTheCollect(t *testing.T) {
+	r := newAdoptRig(t)
+	ctx := context.Background()
+	if err := r.followerStore.Set(ctx, &tiering.DatabasePolicy{Database: "pinned", HotOnly: true}); err != nil {
+		t.Fatal(err)
+	}
+	r.follower.SetLocalPolicyLister(raft.PolicyKindTiering, nil)
+	r.leader.maybeSeedPolicies(ctx)
+	if r.leader.PoliciesSeeded(raft.PolicyKindTiering) {
+		t.Fatal("seeded while the follower could not read its policies: its pin would be dropped")
+	}
+	if st := r.leader.ClusterPoliciesStatus().Kinds[raft.PolicyKindTiering]; len(st.Missing) != 1 || st.Missing[0] != "F" {
+		t.Fatalf("status = %+v", st)
+	}
+	// A node that does not run tiering says so explicitly, and seeds.
+	r.follower.SetLocalPolicyLister(raft.PolicyKindTiering, EmptyPolicyLister)
+	prev := policyAdoptRetry
+	policyAdoptRetry = 0
+	t.Cleanup(func() { policyAdoptRetry = prev })
+	r.leader.maybeSeedPolicies(ctx)
+	if !r.leader.PoliciesSeeded(raft.PolicyKindTiering) {
+		t.Fatalf("not seeded with an explicit empty answer: %+v", r.leader.ClusterPoliciesStatus())
+	}
+}
+
+// Once seeded, every node's own table follows the cluster's policies, so a
+// backup of its database carries them.
+func TestMirrorTieringPolicies(t *testing.T) {
+	r := newAdoptRig(t)
+	ctx := context.Background()
+	if err := r.followerStore.Set(ctx, &tiering.DatabasePolicy{Database: "pinned", HotOnly: true}); err != nil {
+		t.Fatal(err)
+	}
+	r.leader.MirrorTieringPolicies(r.leaderStore)
+	r.follower.MirrorTieringPolicies(r.followerStore)
+	r.leader.maybeSeedPolicies(ctx)
+	if !r.leader.PoliciesSeeded(raft.PolicyKindTiering) {
+		t.Fatal("not seeded")
+	}
+	waitFor(t, 10*time.Second, func() bool { return r.follower.PoliciesSeeded(raft.PolicyKindTiering) }, "follower never saw the seed")
+	// Written on the leader (this rig's leader does not take forwards).
+	if err := r.leaderStore.Set(ctx, &tiering.DatabasePolicy{Database: "later", HotMaxAgeDays: intPtr(9)}); err != nil {
+		t.Fatal(err)
+	}
+	inTable := func(s *tiering.PolicyStore) map[string]tiering.DatabasePolicy {
+		rows, err := s.LocalPolicies(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]tiering.DatabasePolicy{}
+		for _, p := range rows {
+			out[p.Database] = p
+		}
+		return out
+	}
+	for name, s := range map[string]*tiering.PolicyStore{"leader": r.leaderStore, "follower": r.followerStore} {
+		waitFor(t, 10*time.Second, func() bool {
+			rows := inTable(s)
+			later, ok := rows["later"]
+			return len(rows) == 2 && rows["pinned"].HotOnly && ok && later.HotMaxAgeDays != nil && *later.HotMaxAgeDays == 9
+		}, name+"'s table does not follow the cluster's policies")
+	}
+	if err := r.leaderStore.Delete(ctx, "later"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 10*time.Second, func() bool { _, ok := inTable(r.followerStore)["later"]; return !ok }, "a cluster delete left the row in the follower's table")
+}
+
+func TestNewTieringPolicySourceWithoutRaft(t *testing.T) {
+	if NewTieringPolicySource(nil) != nil || NewTieringPolicySource(&Coordinator{}) != nil {
+		t.Fatal("a node without Raft got a cluster policy source")
+	}
+}
+
+func TestClassifyPolicyError(t *testing.T) {
+	cases := []struct {
+		err  error
+		want error
+	}{
+		{fmt.Errorf("x: %w", raft.ErrPolicyNotFound), tiering.ErrPolicyNotFound},
+		{&ForwardRejectedError{Code: protocol.ForwardCodeApplyFailed, Message: "delete tiering policy for \"x\": policy not found"}, tiering.ErrPolicyNotFound},
+		{fmt.Errorf("apply: %w", raft.ErrCommandRefused), tiering.ErrInvalidPolicy},
+		{&ForwardRejectedError{Code: protocol.ForwardCodeApplyFailed, Message: "set tiering policy: a database name of 1 to 256 bytes is required"}, tiering.ErrInvalidPolicy},
+		{&ForwardRejectedError{Code: protocol.ForwardCodeApplyFailed, Message: "failed to apply command: leadership lost"}, tiering.ErrClusterUnavailable},
+		{ErrNoLeaderKnown, tiering.ErrClusterUnavailable},
+	}
+	for _, c := range cases {
+		if got := classifyPolicyError(c.err); !errors.Is(got, c.want) {
+			t.Errorf("%v -> %v, want %v", c.err, got, c.want)
+		}
+	}
+	if classifyPolicyError(nil) != nil {
+		t.Error("nil not nil")
+	}
+}
+
+func TestAdoptBackoff(t *testing.T) {
+	if adoptBackoff(1) != policyAdoptRetry || adoptBackoff(2) != 2*policyAdoptRetry || adoptBackoff(3) != 4*policyAdoptRetry {
+		t.Fatalf("backoff %v %v %v", adoptBackoff(1), adoptBackoff(2), adoptBackoff(3))
+	}
+	if adoptBackoff(50) != policyAdoptRetryMax {
+		t.Fatalf("uncapped: %v", adoptBackoff(50))
 	}
 }

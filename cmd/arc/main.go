@@ -4543,7 +4543,8 @@ func main() {
 					if clusterCoordinator != nil {
 						if src := cluster.NewTieringPolicySource(clusterCoordinator); src != nil {
 							tieringManager.GetPolicies().SetClusterSource(src)
-							clusterCoordinator.SetLocalPolicyLister(clusterraft.PolicyKindTiering, cluster.TieringLocalLister(tieringManager.GetPolicies()))
+							clusterCoordinator.SetLocalPolicyLister(clusterraft.PolicyKindTiering, cluster.TieringLocalLister(tieringManager.GetPolicies(), cfg.TieredStorage.DefaultHotMaxAgeDays))
+							clusterCoordinator.MirrorTieringPolicies(tieringManager.GetPolicies())
 						}
 					}
 					// The startup tier scan runs in the background below, and
@@ -4700,6 +4701,13 @@ func main() {
 				}
 			}
 		}
+	} else if clusterCoordinator != nil {
+		// Tiering is off here, so this node holds no tiering policy that
+		// ever applied: it answers the cluster's collect with none (#1324).
+		// A node whose tiering manager failed to start registers nothing
+		// and so holds the collect until it is fixed, rather than having
+		// its policies dropped.
+		clusterCoordinator.SetLocalPolicyLister(clusterraft.PolicyKindTiering, cluster.EmptyPolicyLister)
 	}
 
 	// A replicating local-storage cluster node reads a daily file that

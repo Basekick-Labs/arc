@@ -35,26 +35,33 @@ type LocalPolicyLister func(ctx context.Context) (json.RawMessage, error)
 
 // Tunables, variables so tests can shrink them.
 var (
-	// policyQueryTimeout bounds one node's answer to a collect.
-	policyQueryTimeout = 15 * time.Second
+	// policyQueryTimeout bounds one node's answer to a collect, and so how
+	// long local writes of the kind are refused when a node hangs.
+	policyQueryTimeout = 8 * time.Second
 	// policyApplyWait bounds how long a node waits to apply the collect
 	// before answering.
-	policyApplyWait = 10 * time.Second
-	// policyAdoptRetry spaces collects of a kind that could not seed.
-	policyAdoptRetry = 30 * time.Second
+	policyApplyWait = 5 * time.Second
+	// policyProbeTimeout bounds the reachability check of each node before
+	// a collect opens.
+	policyProbeTimeout = 2 * time.Second
+	// policyAdoptRetry spaces adoption attempts of a kind that could not
+	// seed; it doubles with each failed attempt, up to policyAdoptRetryMax.
+	policyAdoptRetry    = 30 * time.Second
+	policyAdoptRetryMax = 10 * time.Minute
 	// policyReplyBudget bounds the rows one answer carries (under the
 	// protocol's frame cap).
 	policyReplyBudget = 900 * 1024
 )
 
-// maxSeedTieringPolicies bounds the tiering policies one seed installs.
-const maxSeedTieringPolicies = 10000
-
 // policyKinds are the kinds this build adopts, in order.
 var policyKinds = []string{raft.PolicyKindTiering}
 
+// EmptyPolicyLister answers that this node holds no policies of a kind: for a
+// node that does not run it (tiering disabled).
+func EmptyPolicyLister(context.Context) (json.RawMessage, error) { return json.RawMessage("null"), nil }
+
 // SetLocalPolicyLister installs the reader of this node's own rows of kind.
-// Without one the node answers that it has none: it does not run that kind.
+// Until one is installed the node cannot answer a collect, which then waits.
 func (c *Coordinator) SetLocalPolicyLister(kind string, fn LocalPolicyLister) {
 	c.policyListersMu.Lock()
 	defer c.policyListersMu.Unlock()
@@ -105,7 +112,12 @@ func (c *Coordinator) localPoliciesAnswer(ctx context.Context, kind string, epoc
 	}
 	fn := c.policyLister(kind)
 	if fn == nil {
-		return protocol.LocalPoliciesOK, json.RawMessage("[]")
+		// Not "none": a node that has not finished starting registers its
+		// lister late, and an empty answer from it would drop its policies
+		// for good. A node that does not run the kind registers an empty
+		// lister explicitly (EmptyPolicyLister).
+		c.logger.Warn().Str("kind", kind).Msg("Policy collect: this node's policies are not readable yet")
+		return protocol.LocalPoliciesFailed, nil
 	}
 	rows, err := fn(ctx)
 	if err != nil {
@@ -241,7 +253,7 @@ func (c *Coordinator) maybeSeedPolicies(ctx context.Context) {
 		if fsm.PoliciesSeeded(kind) {
 			continue
 		}
-		if a, ok := fsm.PolicyAwaitingAdoption(kind); ok && time.Since(a.At) < policyAdoptRetry {
+		if a, ok := fsm.PolicyAwaitingAdoption(kind); ok && time.Since(a.At) < adoptBackoff(a.Attempts) {
 			continue
 		}
 		if err := c.adoptPolicies(ctx, kind); err != nil {
@@ -250,10 +262,61 @@ func (c *Coordinator) maybeSeedPolicies(ctx context.Context) {
 	}
 }
 
+// adoptBackoff is the wait after attempts consecutive failed adoptions.
+func adoptBackoff(attempts int) time.Duration {
+	d := policyAdoptRetry
+	for i := 1; i < attempts && d < policyAdoptRetryMax; i++ {
+		d *= 2
+	}
+	return min(d, policyAdoptRetryMax)
+}
+
+// unreachableNodes returns the FSM nodes, other than this one, this node
+// cannot connect to. Checked before a collect opens, so a node that is down
+// costs no window of refused writes.
+func (c *Coordinator) unreachableNodes(ctx context.Context) []string {
+	fsm := c.fsmOrNil()
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var out []string
+	for _, n := range fsm.GetAllNodes() {
+		if n.ID == c.localNode.ID {
+			continue
+		}
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			addr := c.leaderCoordinatorAddress(id)
+			ok := false
+			if addr != "" {
+				d := net.Dialer{Timeout: policyProbeTimeout}
+				if conn, err := d.DialContext(ctx, "tcp", addr); err == nil {
+					_ = conn.Close()
+					ok = true
+				}
+			}
+			if !ok {
+				mu.Lock()
+				out = append(out, id)
+				mu.Unlock()
+			}
+		}(n.ID)
+	}
+	wg.Wait()
+	sort.Strings(out)
+	return out
+}
+
 // adoptPolicies runs one collect of kind and seeds it, or closes it naming
 // the nodes that did not answer.
 func (c *Coordinator) adoptPolicies(ctx context.Context, kind string) error {
 	fsm := c.fsmOrNil()
+	if down := c.unreachableNodes(ctx); len(down) > 0 {
+		if _, err := c.proposeLeader(raft.CommandAwaitAdoption, raft.AwaitAdoptionPayload{Kind: kind, Missing: down, LastError: "unreachable before the collect", Now: time.Now().UTC()}); err != nil {
+			return fmt.Errorf("record unreachable nodes: %w", err)
+		}
+		return fmt.Errorf("nodes unreachable: %v", down)
+	}
 	epoch, err := c.proposeLeader(raft.CommandCollectPolicies, raft.CollectPoliciesPayload{Kind: kind, Leader: c.localNode.ID, Now: time.Now().UTC()})
 	if err != nil {
 		return fmt.Errorf("open collect: %w", err)
@@ -293,7 +356,10 @@ func (c *Coordinator) adoptPolicies(ctx context.Context, kind string) error {
 	}
 	sort.Strings(missing)
 	var seed raft.SeedPoliciesPayload
-	if len(missing) == 0 {
+	lastError := ""
+	if len(missing) > 0 {
+		lastError = "no answer to the collect"
+	} else {
 		rows := make(map[string]json.RawMessage, len(answers))
 		for id, a := range answers {
 			rows[id] = a.rows
@@ -301,14 +367,14 @@ func (c *Coordinator) adoptPolicies(ctx context.Context, kind string) error {
 		seed, err = mergePolicyAnswers(kind, rows)
 		if err != nil {
 			c.logger.Warn().Err(err).Str("kind", kind).Msg("Policy collect: the nodes' policies cannot be merged")
-			missing = []string{"(merge: " + err.Error() + ")"}
+			lastError = "merge: " + err.Error()
 		}
 	}
-	if len(missing) > 0 {
-		if _, err := c.proposeLeader(raft.CommandAwaitAdoption, raft.AwaitAdoptionPayload{Kind: kind, Epoch: epoch, Missing: missing, Now: time.Now().UTC()}); err != nil {
+	if lastError != "" {
+		if _, err := c.proposeLeader(raft.CommandAwaitAdoption, raft.AwaitAdoptionPayload{Kind: kind, Epoch: epoch, Missing: missing, LastError: lastError, Now: time.Now().UTC()}); err != nil {
 			return fmt.Errorf("close collect: %w", err)
 		}
-		return fmt.Errorf("nodes did not answer: %v", missing)
+		return fmt.Errorf("%s %v", lastError, missing)
 	}
 	seed.Kind, seed.Epoch, seed.Now = kind, epoch, time.Now().UTC()
 	if _, err := c.proposeLeader(raft.CommandSeedPolicies, seed); err != nil {
@@ -319,23 +385,30 @@ func (c *Coordinator) adoptPolicies(ctx context.Context, kind string) error {
 	return nil
 }
 
+// TieringLocalRows is one node's answer for the tiering kind: its rows, and
+// the default an unset hot_max_age_days means on that node.
+type TieringLocalRows struct {
+	DefaultHotMaxAgeDays int                       `json:"default_hot_max_age_days"`
+	Policies             []raft.TieringPolicyEntry `json:"policies"`
+}
+
 // mergePolicyAnswers merges every node's rows of kind into one seed.
 func mergePolicyAnswers(kind string, rows map[string]json.RawMessage) (raft.SeedPoliciesPayload, error) {
 	switch kind {
 	case raft.PolicyKindTiering:
-		perNode := map[string][]raft.TieringPolicyEntry{}
+		perNode := map[string]TieringLocalRows{}
 		for id, raw := range rows {
-			var entries []raft.TieringPolicyEntry
-			if len(raw) > 0 {
-				if err := json.Unmarshal(raw, &entries); err != nil {
+			var r TieringLocalRows
+			if len(raw) > 0 && string(raw) != "null" {
+				if err := json.Unmarshal(raw, &r); err != nil {
 					return raft.SeedPoliciesPayload{}, fmt.Errorf("node %s: %w", id, err)
 				}
 			}
-			perNode[id] = entries
+			perNode[id] = r
 		}
 		merged := mergeTieringPolicies(perNode)
-		if len(merged) > maxSeedTieringPolicies {
-			return raft.SeedPoliciesPayload{}, fmt.Errorf("%d tiering policies exceed the %d one seed installs", len(merged), maxSeedTieringPolicies)
+		if len(merged) > raft.MaxSeedTieringPolicies {
+			return raft.SeedPoliciesPayload{}, fmt.Errorf("%d tiering policies exceed the %d one seed installs", len(merged), raft.MaxSeedTieringPolicies)
 		}
 		return raft.SeedPoliciesPayload{Tiering: merged}, nil
 	default:
@@ -344,42 +417,56 @@ func mergePolicyAnswers(kind string, rows map[string]json.RawMessage) (raft.Seed
 }
 
 // mergeTieringPolicies merges the nodes' tiering policies by database, in the
-// direction that moves less data: hot_only on any node wins, and otherwise
-// the longest hot_max_age_days set on any node (unset only when unset
-// everywhere). Nothing is deleted by a tiering policy, so the union is safe.
-func mergeTieringPolicies(perNode map[string][]raft.TieringPolicyEntry) []raft.TieringPolicyEntry {
-	byDB := map[string]*raft.TieringPolicyEntry{}
-	for _, entries := range perNode {
-		for _, e := range entries {
+// direction that moves less data. hot_only on any node wins. Otherwise the
+// age is the longest any node holding a policy for the database applied: its
+// own hot_max_age_days, or, unset, that node's default. A database whose
+// policy leaves the age unset on every node stays unset (each node goes on
+// using its default). Nothing is deleted by a tiering policy, so the union is
+// safe.
+func mergeTieringPolicies(perNode map[string]TieringLocalRows) []raft.TieringPolicyEntry {
+	type acc struct {
+		e        raft.TieringPolicyEntry
+		explicit bool
+		age      int
+	}
+	byDB := map[string]*acc{}
+	for _, node := range perNode {
+		for _, e := range node.Policies {
 			if e.Database == "" {
 				continue
+			}
+			age, explicit := node.DefaultHotMaxAgeDays, false
+			if e.HotMaxAgeDays != nil {
+				age, explicit = *e.HotMaxAgeDays, true
 			}
 			m, ok := byDB[e.Database]
 			if !ok {
 				c := e
-				if e.HotMaxAgeDays != nil {
-					v := *e.HotMaxAgeDays
-					c.HotMaxAgeDays = &v
-				}
-				byDB[e.Database] = &c
+				c.HotMaxAgeDays = nil
+				byDB[e.Database] = &acc{e: c, explicit: explicit, age: age}
 				continue
 			}
-			m.HotOnly = m.HotOnly || e.HotOnly
-			if e.HotMaxAgeDays != nil && (m.HotMaxAgeDays == nil || *e.HotMaxAgeDays > *m.HotMaxAgeDays) {
-				v := *e.HotMaxAgeDays
-				m.HotMaxAgeDays = &v
+			m.e.HotOnly = m.e.HotOnly || e.HotOnly
+			m.explicit = m.explicit || explicit
+			if age > m.age {
+				m.age = age
 			}
-			if !e.CreatedAt.IsZero() && (m.CreatedAt.IsZero() || e.CreatedAt.Before(m.CreatedAt)) {
-				m.CreatedAt = e.CreatedAt
+			if !e.CreatedAt.IsZero() && (m.e.CreatedAt.IsZero() || e.CreatedAt.Before(m.e.CreatedAt)) {
+				m.e.CreatedAt = e.CreatedAt
 			}
-			if e.UpdatedAt.After(m.UpdatedAt) {
-				m.UpdatedAt = e.UpdatedAt
+			if e.UpdatedAt.After(m.e.UpdatedAt) {
+				m.e.UpdatedAt = e.UpdatedAt
 			}
 		}
 	}
 	out := make([]raft.TieringPolicyEntry, 0, len(byDB))
-	for _, e := range byDB {
-		out = append(out, *e)
+	for _, m := range byDB {
+		e := m.e
+		if m.explicit {
+			v := m.age
+			e.HotMaxAgeDays = &v
+		}
+		out = append(out, e)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Database < out[j].Database })
 	return out

@@ -35,6 +35,10 @@ const (
 // maxPolicyDatabaseLen bounds a policy's database name.
 const maxPolicyDatabaseLen = 256
 
+// MaxSeedTieringPolicies bounds the tiering policies one seed installs (a few
+// MB at the longest names, in one entry the leader proposes itself).
+const MaxSeedTieringPolicies = 10000
+
 // TieringPolicyEntry is one database's tiering policy. ID is the log index
 // that created it.
 type TieringPolicyEntry struct {
@@ -78,14 +82,18 @@ type CollectPoliciesPayload struct {
 	Now    time.Time `json:"now"`
 }
 
-// AwaitAdoptionPayload ends a collect that could not seed: Missing names the
-// nodes that did not answer. Writes of the kind go to each node's SQLite
-// again until the next collect. Proposed by the leader only.
+// AwaitAdoptionPayload records an adoption attempt that could not seed:
+// Missing names the nodes that did not answer, LastError why it failed
+// otherwise. With the Epoch of the open collect it also ends that collect
+// (writes of the kind go to each node's SQLite again); with Epoch zero it
+// records an attempt that never opened one (a node unreachable before it).
+// Proposed by the leader only.
 type AwaitAdoptionPayload struct {
-	Kind    string    `json:"kind"`
-	Epoch   uint64    `json:"epoch"`
-	Missing []string  `json:"missing,omitempty"`
-	Now     time.Time `json:"now"`
+	Kind      string    `json:"kind"`
+	Epoch     uint64    `json:"epoch"`
+	Missing   []string  `json:"missing,omitempty"`
+	LastError string    `json:"last_error,omitempty"`
+	Now       time.Time `json:"now"`
 }
 
 // PolicyCollect is an open collect of a kind.
@@ -96,12 +104,19 @@ type PolicyCollect struct {
 	At     time.Time `json:"at"`
 }
 
-// PolicyAwaiting is a kind whose last collect could not seed.
+// PolicyAwaiting is a kind whose last adoption attempt could not seed.
+// Attempts counts the consecutive failed attempts (the leader backs off on
+// it).
 type PolicyAwaiting struct {
-	Kind    string    `json:"kind"`
-	Missing []string  `json:"missing,omitempty"`
-	At      time.Time `json:"at"`
+	Kind      string    `json:"kind"`
+	Missing   []string  `json:"missing,omitempty"`
+	LastError string    `json:"last_error,omitempty"`
+	Attempts  int       `json:"attempts"`
+	At        time.Time `json:"at"`
 }
+
+// maxAwaitingError bounds an AwaitAdoption's error text.
+const maxAwaitingError = 512
 
 // maxAwaitingMissing bounds the nodes an AwaitAdoption names.
 const maxAwaitingMissing = 256
@@ -126,6 +141,7 @@ func IsPolicyNotFound(err error) bool {
 // in an older snapshot, or before the flag was applied.
 type clusterPoliciesState struct {
 	Enabled    bool                  `json:"enabled"`
+	TieringSeq int64                 `json:"tiering_seq,omitempty"`
 	Seeded     []string              `json:"seeded,omitempty"`
 	Tiering    []*TieringPolicyEntry `json:"tiering,omitempty"`
 	Collecting []*PolicyCollect      `json:"collecting,omitempty"`
@@ -173,6 +189,23 @@ func (f *ClusterFSM) applyEnableClusterPolicies(payload []byte) interface{} {
 	f.clusterPolicies = true
 	f.logger.Info().Int("nodes", len(f.nodes)).Msg("Cluster policies enabled")
 	return nil
+}
+
+// SetPoliciesChangedCallback installs a function called, without the FSM's
+// lock, after any policy changes: a set, a delete, a seed, or a snapshot
+// restore. It runs on the FSM goroutine and must not block (signal a worker).
+func (f *ClusterFSM) SetPoliciesChangedCallback(cb func()) {
+	if cb == nil {
+		f.onPoliciesChanged.Store(nil)
+		return
+	}
+	f.onPoliciesChanged.Store(&cb)
+}
+
+func (f *ClusterFSM) firePoliciesChanged() {
+	if cb := f.onPoliciesChanged.Load(); cb != nil {
+		(*cb)()
+	}
 }
 
 // PoliciesSeeded reports whether kind has been seeded: its policies live here
@@ -229,7 +262,7 @@ func validPolicyDatabase(db string) error {
 	return nil
 }
 
-func (f *ClusterFSM) applySetTieringPolicy(payload []byte, logIndex uint64) interface{} {
+func (f *ClusterFSM) applySetTieringPolicy(payload []byte) interface{} {
 	var p SetTieringPolicyPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return fmt.Errorf("failed to unmarshal set tiering policy payload: %w", err)
@@ -243,12 +276,15 @@ func (f *ClusterFSM) applySetTieringPolicy(payload []byte, logIndex uint64) inte
 		return fmt.Errorf("set tiering policy: %w", err)
 	}
 	e := &TieringPolicyEntry{
-		ID: int64(logIndex), Database: p.Database, HotOnly: p.HotOnly, HotMaxAgeDays: p.HotMaxAgeDays,
+		Database: p.Database, HotOnly: p.HotOnly, HotMaxAgeDays: p.HotMaxAgeDays,
 		CreatedAt: p.Now, UpdatedAt: p.Now,
 	}
 	if prev, ok := f.tieringPolicies[p.Database]; ok {
 		// A replace keeps the policy's identity.
 		e.ID, e.CreatedAt = prev.ID, prev.CreatedAt
+	} else {
+		f.tieringPolicySeq++
+		e.ID = f.tieringPolicySeq
 	}
 	f.tieringPolicies[p.Database] = e
 	return nil
@@ -315,7 +351,6 @@ func (f *ClusterFSM) applyCollectPolicies(payload []byte, logIndex uint64) inter
 	// A newer collect replaces an open one (a leader that changed mid-collect
 	// starts over): the older one can no longer seed.
 	f.policyCollecting[p.Kind] = &PolicyCollect{Kind: p.Kind, Epoch: logIndex, Leader: p.Leader, At: p.Now}
-	delete(f.policyAwaiting, p.Kind)
 	return nil
 }
 
@@ -324,29 +359,50 @@ func (f *ClusterFSM) applyAwaitAdoption(payload []byte) interface{} {
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return fmt.Errorf("failed to unmarshal await adoption payload: %w", err)
 	}
+	if !knownPolicyKind(p.Kind) {
+		return fmt.Errorf("await adoption: unknown kind %q", p.Kind)
+	}
 	if len(p.Missing) > maxAwaitingMissing {
 		p.Missing = p.Missing[:maxAwaitingMissing]
 	}
+	if len(p.LastError) > maxAwaitingError {
+		p.LastError = p.LastError[:maxAwaitingError]
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	c, ok := f.policyCollecting[p.Kind]
-	if !ok || c.Epoch != p.Epoch {
-		return fmt.Errorf("await adoption: no open collect of %q at epoch %d", p.Kind, p.Epoch)
+	if f.policiesSeeded[p.Kind] {
+		return nil
 	}
-	delete(f.policyCollecting, p.Kind)
+	if p.Epoch != 0 {
+		c, ok := f.policyCollecting[p.Kind]
+		if !ok || c.Epoch != p.Epoch {
+			return fmt.Errorf("await adoption: no open collect of %q at epoch %d", p.Kind, p.Epoch)
+		}
+		delete(f.policyCollecting, p.Kind)
+	} else if _, open := f.policyCollecting[p.Kind]; open {
+		// Without an epoch it cannot speak for an open collect.
+		return fmt.Errorf("await adoption: a collect of %q is open", p.Kind)
+	}
 	missing := append([]string(nil), p.Missing...)
 	sort.Strings(missing)
-	f.policyAwaiting[p.Kind] = &PolicyAwaiting{Kind: p.Kind, Missing: missing, At: p.Now}
+	attempts := 1
+	if prev, ok := f.policyAwaiting[p.Kind]; ok {
+		attempts = prev.Attempts + 1
+	}
+	f.policyAwaiting[p.Kind] = &PolicyAwaiting{Kind: p.Kind, Missing: missing, LastError: p.LastError, Attempts: attempts, At: p.Now}
 	return nil
 }
 
-func (f *ClusterFSM) applySeedPolicies(payload []byte, logIndex uint64) interface{} {
+func (f *ClusterFSM) applySeedPolicies(payload []byte) interface{} {
 	var p SeedPoliciesPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return fmt.Errorf("failed to unmarshal seed policies payload: %w", err)
 	}
 	if !knownPolicyKind(p.Kind) {
 		return fmt.Errorf("seed policies: unknown kind %q", p.Kind)
+	}
+	if len(p.Tiering) > MaxSeedTieringPolicies {
+		return fmt.Errorf("seed policies: %d tiering policies exceed %d", len(p.Tiering), MaxSeedTieringPolicies)
 	}
 	seen := make(map[string]bool, len(p.Tiering))
 	for _, e := range p.Tiering {
@@ -375,7 +431,8 @@ func (f *ClusterFSM) applySeedPolicies(payload []byte, logIndex uint64) interfac
 	for i := range p.Tiering {
 		e := p.Tiering[i]
 		c := copyTieringPolicy(&e)
-		c.ID = int64(logIndex)
+		f.tieringPolicySeq++
+		c.ID = f.tieringPolicySeq
 		if c.CreatedAt.IsZero() {
 			c.CreatedAt = p.Now
 		}
@@ -395,7 +452,7 @@ func (f *ClusterFSM) snapshotClusterPoliciesLocked() *clusterPoliciesState {
 	if !f.clusterPolicies {
 		return nil
 	}
-	st := &clusterPoliciesState{Enabled: true}
+	st := &clusterPoliciesState{Enabled: true, TieringSeq: f.tieringPolicySeq}
 	for kind, ok := range f.policiesSeeded {
 		if ok {
 			st.Seeded = append(st.Seeded, kind)
@@ -436,9 +493,11 @@ func (f *ClusterFSM) restoreClusterPoliciesLocked(st *clusterPoliciesState) {
 	f.tieringPolicies = map[string]*TieringPolicyEntry{}
 	f.policyCollecting = map[string]*PolicyCollect{}
 	f.policyAwaiting = map[string]*PolicyAwaiting{}
+	f.tieringPolicySeq = 0
 	if st == nil {
 		return
 	}
+	f.tieringPolicySeq = st.TieringSeq
 	for _, c := range st.Collecting {
 		if c != nil && c.Kind != "" {
 			cc := *c
@@ -461,4 +520,12 @@ func (f *ClusterFSM) restoreClusterPoliciesLocked(st *clusterPoliciesState) {
 			f.tieringPolicies[c.Database] = &c
 		}
 	}
+}
+
+// policiesChangedIfApplied announces a policy change when the command applied.
+func (f *ClusterFSM) policiesChangedIfApplied(res interface{}) interface{} {
+	if res == nil {
+		f.firePoliciesChanged()
+	}
+	return res
 }
