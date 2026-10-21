@@ -124,3 +124,42 @@ func TestForwardApply_PolicyCommands(t *testing.T) {
 		t.Fatalf("forwarded seed: %+v, want refused", ack)
 	}
 }
+
+// Retention definitions are forwardable like tiering's; an admin's adoption
+// choice never is: it activates deleting policies, so it is taken on the
+// leader's own HTTP call only.
+func TestForwardApply_RetentionCommands(t *testing.T) {
+	c := originRig(t, "writer-1", RoleWriter)
+	c.raftFSM = c.raftNode.FSM()
+	capNodes(t, c, map[string][]string{"raft-1": cpRetList, "writer-1": cpRetList, "writer-2": cpRetList, "reader-1": cpRetList})
+	c.maybeEnableClusterPolicies()
+	waitFSM(t, c.ClusterPoliciesActive)
+	c.maybeEnableRetentionPolicies()
+	waitFSM(t, c.fsmOrNil().RetentionPoliciesEnabled)
+	epoch, err := c.proposeLeader(raft.CommandCollectPolicies, raft.CollectPoliciesPayload{Kind: raft.PolicyKindRetention, Leader: "raft-1", Now: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.proposeLeader(raft.CommandSeedPolicies, raft.SeedPoliciesPayload{Kind: raft.PolicyKindRetention, Epoch: epoch, RetentionFloor: 1, Now: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	fwd := func(typ raft.CommandType, p any) *protocol.ForwardApplyAck {
+		raw, _ := json.Marshal(p)
+		return forwardOnce(t, c, "reader-1", &raft.Command{Type: typ, Payload: raw})
+	}
+	if ack := fwd(raft.CommandCreateRetentionPolicy, raft.CreateRetentionPolicyPayload{Name: "p", Database: "db", RetentionDays: 9, Now: time.Now().UTC()}); ack.Status != "ok" {
+		t.Fatalf("create from a reader: %+v", ack)
+	}
+	if ack := fwd(raft.CommandUpdateRetentionPolicy, raft.UpdateRetentionPolicyPayload{ID: 1, RetentionDays: intPtr(10)}); ack.Status != "ok" {
+		t.Fatalf("update from a reader: %+v", ack)
+	}
+	if p, _ := c.RetentionPolicy(1); p.RetentionDays != 10 {
+		t.Fatalf("forwarded writes not applied: %+v", p)
+	}
+	if ack := fwd(raft.CommandDeleteRetentionPolicy, raft.DeleteRetentionPolicyPayload{ID: 1}); ack.Status != "ok" {
+		t.Fatalf("delete from a reader: %+v", ack)
+	}
+	if ack := fwd(raft.CommandChoosePolicyAdoption, raft.ChoosePolicyAdoptionPayload{Kind: raft.PolicyKindRetention, Node: "writer-2", Hash: "h"}); ack.Status != "error" || ack.Code != protocol.ForwardCodeInvalidCommand {
+		t.Fatalf("forwarded adoption choice: %+v, want refused", ack)
+	}
+}

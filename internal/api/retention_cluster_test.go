@@ -196,6 +196,9 @@ func TestRetentionAPIOnceAdopted(t *testing.T) {
 	if code, body := r.do(t, "PUT", "/retention/50", `{"is_active":true}`); code != fiber.StatusOK || body["is_active"] != true || body["measurement"] != "cpu" || body["buffer_days"].(float64) != 2 {
 		t.Fatalf("partial update: %d %v", code, body)
 	}
+	if code, body := r.do(t, "PUT", "/retention/50", `{"measurement":null}`); code != fiber.StatusOK || body["measurement"] != nil {
+		t.Fatalf("measurement null did not widen the policy to the database: %d %v", code, body)
+	}
 	if code, body := r.do(t, "PUT", "/retention/50", `{"buffer_days":40}`); code != fiber.StatusBadRequest || !strings.Contains(body["error"].(string), "greater than buffer_days") {
 		t.Fatalf("buffer above stored retention: %d %v", code, body)
 	}
@@ -264,6 +267,9 @@ func TestRetentionRunReadsTheClusterPolicy(t *testing.T) {
 	p, err := r.h.GetPolicy(10)
 	if err != nil || p.RetentionDays != 90 {
 		t.Fatalf("run reads %+v %v, want the cluster's 90 days", p, err)
+	}
+	if err := r.src.CreateRetentionPolicy(context.Background(), raft.CreateRetentionPolicyPayload{Name: "off", Database: "db", RetentionDays: 3}); err != nil {
+		t.Fatal(err)
 	}
 	active, _ := r.h.GetActivePolicies()
 	if len(active) != 1 || active[0].ID != 10 || active[0].RetentionDays != 90 {
@@ -449,4 +455,24 @@ func TestRetentionSeparateDBEnforcesForeignKeys(t *testing.T) {
 	if _, err := h.db.Exec(`INSERT INTO retention_executions (policy_id, status) VALUES (42, 'completed')`); err == nil {
 		t.Fatal("an execution of a policy that does not exist was stored: foreign keys are off")
 	}
+}
+
+// The lister reads under the lock local writes take, so a write is either in
+// the cluster's read of the table or refused by its collect.
+func TestRetentionLocalPolicyListerTakesTheWriteLock(t *testing.T) {
+	r := newClusterRetentionRig(t)
+	r.h.localMu.Lock()
+	done := make(chan struct{})
+	go func() {
+		_, _ = r.h.LocalPolicyLister()(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+		r.h.localMu.Unlock()
+		t.Fatal("the lister read the table while a local write held the lock")
+	case <-time.After(200 * time.Millisecond):
+	}
+	r.h.localMu.Unlock()
+	<-done
 }

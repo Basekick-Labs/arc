@@ -286,6 +286,59 @@ age any node applied to it: the policy's `hot_max_age_days`, or that node's
 - every node that runs tiering keeps its own `tiering_policies` table equal to
   them, so a backup of such a node carries the current policies.
 
+## Upgrade note: cluster-wide retention policies ([#1324](https://github.com/Basekick-Labs/arc/issues/1324))
+
+Retention has its own flag, `cluster_policies.retention_enabled` in
+`GET /api/v1/cluster`. A cluster turns it on by itself once every node runs
+this release; until then `retention_blocking_nodes` names the nodes still on
+an earlier one. Like the tiering flag it stays on, and a node running an
+earlier release can no longer join. Roll back the whole cluster, never one
+node in place.
+
+Then the leader reads every node's own retention policies. A retention policy
+deletes data, so the leader takes them over by itself only when:
+
+- every node answers;
+- no policy name has two different definitions on two nodes;
+- every active policy has already run on some node. Inactive policies are
+  taken over as they are.
+
+A policy that never ran is never activated without an admin choosing it: it
+may have been created on a node that never runs retention.
+
+Otherwise nothing changes: each node keeps its own policies and the primary
+runs its own, as before. `cluster_policies.kinds.retention.last_error` says
+why, and the leader checks again after 30 seconds, doubling the wait up to 10
+minutes. To choose a node's policies, an admin calls, on the Raft leader:
+
+- `GET /api/v1/cluster/policies`: every node's own policies, with a hash of
+  each node's set;
+- `POST /api/v1/cluster/policies/adopt` with
+  `{"kind": "retention", "node": "<id>", "hash": "<hash>"}`. The policies are
+  taken over only if the node still holds exactly the ones the hash names.
+
+Both are admin-only; any other node answers `409` with the leader's ID.
+
+When the policies are taken over:
+
+- **IDs.** Policies that all come from one node, whose IDs no other node uses,
+  keep their IDs. Otherwise every policy gets a new ID above any ID a node
+  held, and the old IDs answer `404`. An old ID never names a different
+  policy.
+- **The other nodes' policies.** A policy the cluster did not take over is
+  moved, with its execution history, to `retention_policies_dormant` and
+  `retention_executions_dormant` in that node's database. It never runs again.
+- **Writes wait a few seconds.** While the leader reads the nodes' policies, a
+  retention write answers `503`; retry it.
+- **History stays per node.** Execution history stays on the node that ran the
+  policy. After a failover the new primary shows none until it runs it.
+- **Backups carry them.** Every node that runs retention keeps its own
+  `retention_policies` table equal to the cluster's policies.
+
+A retention database of its own (`retention.db_path` set to a file other
+than the auth database) now opens like the auth database: foreign keys on,
+WAL journal, and a 5-second busy timeout.
+
 ## Upgrade note: the live WAL replication stream is removed ([#888](https://github.com/Basekick-Labs/arc/issues/888), [#1181](https://github.com/Basekick-Labs/arc/issues/1181))
 
 This applies to clusters where readers or compactors run with both
@@ -1317,6 +1370,32 @@ A token or RBAC change made on a follower is forwarded to the leader. It now
 returns only once the follower that forwarded it has applied the change, up to
 the write's timeout, so reading it back on that node sees it. Before, the read
 could briefly miss it.
+
+### A retention policy created on any node runs, and survives a failover ([#1324](https://github.com/Basekick-Labs/arc/issues/1324))
+
+In a cluster, each node kept its own retention policies, while only the
+primary writer runs retention. So:
+
+- A policy created on a reader, or on any node other than the primary, was
+  stored and answered `201`, but never ran.
+- After a failover, the new primary ran only its own policies. A policy that
+  had been deleting data stopped, and one that had never run could start.
+
+Retention policies now live in the cluster state. A policy written on any node
+applies cluster-wide, every node reports the same policies, and every run,
+scheduled or manual, reads the policy as the cluster holds it when the run
+starts. A new primary runs the same policies. A standalone node is unchanged.
+The upgrade note above explains how a cluster takes over the policies each
+node already holds.
+
+Status codes for `POST`, `PUT` and `DELETE /api/v1/retention`:
+
+| Status | When |
+|---|---|
+| `202` | `POST` only: the cluster took the policy, but this node has not applied it yet. List the policies to see it. |
+| `400` | The policy is invalid, its name is taken, or `retention_days` is not greater than `buffer_days`. |
+| `404` | No such policy. |
+| `503` | The cluster cannot take the write right now (no leader, or the policies are being taken over). Retry. |
 
 ### Aggregates over several hours no longer return one result per hour on `/api/v1/query`
 

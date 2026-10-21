@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -286,5 +287,29 @@ func TestAdoptRetention_StaleCollectIsReplaced(t *testing.T) {
 	}
 	if st := r.leader.ClusterPoliciesStatus().Kinds[raft.PolicyKindRetention]; !strings.Contains(st.LastError, "never run") {
 		t.Fatalf("status %+v", st)
+	}
+}
+
+// Before retention's own flag is on (a node still on a tiering-only build),
+// the adoption loop leaves retention alone: no node is asked for its rows
+// and nothing is recorded.
+func TestAdoptRetention_NotBeforeItsFlag(t *testing.T) {
+	r := newAdoptRig(t)
+	var calls atomic.Int32
+	for _, c := range []*Coordinator{r.leader, r.follower} {
+		c.SetLocalPolicyLister(raft.PolicyKindRetention, func(context.Context) (json.RawMessage, error) {
+			calls.Add(1)
+			return json.RawMessage(`{"policies":[]}`), nil
+		})
+	}
+	r.leader.maybeSeedPolicies(context.Background())
+	if n := calls.Load(); n != 0 {
+		t.Fatalf("%d retention listers called before the flag", n)
+	}
+	if _, ok := r.leader.fsmOrNil().PolicyAwaitingAdoption(raft.PolicyKindRetention); ok {
+		t.Fatal("retention adoption recorded before its flag")
+	}
+	if !r.leader.PoliciesSeeded(raft.PolicyKindTiering) {
+		t.Fatal("tiering did not seed")
 	}
 }

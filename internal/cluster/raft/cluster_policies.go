@@ -409,6 +409,9 @@ func (f *ClusterFSM) applyAwaitAdoption(payload []byte) interface{} {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if !f.policyKindEnabledLocked(p.Kind) {
+		return fmt.Errorf("await adoption: %s policies are not enabled", p.Kind)
+	}
 	if f.policiesSeeded[p.Kind] {
 		return nil
 	}

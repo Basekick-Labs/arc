@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -192,4 +193,17 @@ func TestRetentionPoliciesEnableAndJoinGate(t *testing.T) {
 	if st := c.ClusterPoliciesStatus(); !st.RetentionEnabled || st.Kinds[raft.PolicyKindRetention].Seeded {
 		t.Fatalf("status = %+v", st)
 	}
+}
+
+// The enable loop turns on both flags: cluster policies, then retention's.
+func TestClusterPoliciesEnableLoopEnablesRetention(t *testing.T) {
+	prev := clusterPoliciesEnableEvery
+	clusterPoliciesEnableEvery = 20 * time.Millisecond
+	t.Cleanup(func() { clusterPoliciesEnableEvery = prev })
+	c := originRig(t, "writer-1", RoleWriter)
+	capNodes(t, c, map[string][]string{"raft-1": cpRetList, "writer-1": cpRetList, "writer-2": cpRetList, "reader-1": cpRetList})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.clusterPoliciesEnableLoop(ctx)
+	waitFSM(t, func() bool { return c.ClusterPoliciesActive() && c.fsmOrNil().RetentionPoliciesEnabled() })
 }

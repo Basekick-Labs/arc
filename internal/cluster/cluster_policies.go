@@ -19,7 +19,9 @@ import (
 // server advertised it, and once it is on (or may be being proposed) a join
 // without it is refused before the node enters the Raft configuration.
 
-const clusterPoliciesEnableEvery = 10 * time.Second
+// clusterPoliciesEnableEvery spaces the enable loop's passes; a variable so
+// tests can shrink it.
+var clusterPoliciesEnableEvery = 10 * time.Second
 
 // clusterPoliciesGate serializes the join gate with the enable proposal.
 // inFlight (under mu) is set while an enable proposal may still commit (one
