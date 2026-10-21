@@ -369,8 +369,11 @@ endpoints as retention: `GET /api/v1/cluster/policies?kind=cq` and
 `503` while the queries are read, and a restarted node's wait work as for
 retention policies.
 
-Each run of a continuous query on the primary now writes one Raft entry, its
-window's end.
+Once the cluster has adopted continuous queries, each run on the primary
+(scheduled or manual) writes its window's end to the cluster: one Raft entry,
+two when the primary is not the Raft leader (it first confirms it holds the
+latest watermark). A manual run's response says what happened to the
+watermark in `watermark_status`.
 
 A continuous query database of its own (`continuous_query.db_path` set to a
 file other than the auth database) now opens like the auth database: foreign
@@ -1449,9 +1452,9 @@ In a cluster, each node kept its own continuous queries and their
 Continuous queries and their `last_processed_time` now live in the cluster
 state. Every node's scheduler follows them, and the primary records each run's
 window end in the cluster before that query's next run, so a new primary
-continues where the old one stopped. If the primary dies after writing a run's
-output and before the cluster recorded its end, the new primary writes that one
-window again; a primary that cannot reach the cluster skips that query's runs
+continues where the old one stopped. If the primary dies, or is
+demoted, after writing a run's output and before the cluster recorded its end,
+the new primary writes that one window again; a primary that cannot reach the cluster skips that query's runs
 until it can, so it never grows past one window. A standalone node is
 unchanged.
 
