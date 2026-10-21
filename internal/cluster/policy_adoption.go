@@ -53,15 +53,19 @@ var (
 	policyReplyBudget = 900 * 1024
 	// policyMirrorRetry spaces a failed mirror's next attempt.
 	policyMirrorRetry = 5 * time.Second
+	// policyMirrorEvery spaces the mirrors' periodic passes.
+	policyMirrorEvery = time.Minute
 )
 
 // policyKinds are the kinds this build adopts, in order.
-var policyKinds = []string{raft.PolicyKindTiering, raft.PolicyKindRetention}
+var policyKinds = []string{raft.PolicyKindTiering, raft.PolicyKindRetention, raft.PolicyKindCQ}
 
 // probesFirst reports kinds whose merge can refuse the rows (retention): the
 // leader reads every node's rows with a read-only probe first and opens a
 // collect, with its window of refused writes, only when the merge would seed.
-func probesFirst(kind string) bool { return kind == raft.PolicyKindRetention }
+func probesFirst(kind string) bool {
+	return kind == raft.PolicyKindRetention || kind == raft.PolicyKindCQ
+}
 
 // EmptyPolicyLister answers that this node holds no policies of a kind: for a
 // node that does not run it (tiering disabled).
@@ -399,7 +403,7 @@ func (c *Coordinator) adoptPolicies(ctx context.Context, kind string) error {
 	if _, err := c.proposeLeader(raft.CommandSeedPolicies, seed); err != nil {
 		return fmt.Errorf("seed: %w", err)
 	}
-	ev := c.logger.Info().Str("kind", kind).Int("nodes", len(answers)).Int("policies", len(seed.Tiering)+len(seed.Retention))
+	ev := c.logger.Info().Str("kind", kind).Int("nodes", len(answers)).Int("policies", len(seed.Tiering)+len(seed.Retention)+len(seed.CQ))
 	if choice != nil {
 		ev = ev.Str("chosen_node", choice.Node).Str("chosen_by", choice.By)
 	}
@@ -470,6 +474,20 @@ type TieringLocalRows struct {
 // mergePolicyAnswers merges every node's rows of kind into one seed.
 func mergePolicyAnswers(kind string, rows map[string]json.RawMessage, choice *raft.PolicyAdoptChoice) (raft.SeedPoliciesPayload, error) {
 	switch kind {
+	case raft.PolicyKindCQ:
+		perNode := make(map[string]CQLocalRows, len(rows))
+		for id, raw := range rows {
+			r, err := decodeCQRows(raw)
+			if err != nil {
+				return raft.SeedPoliciesPayload{}, fmt.Errorf("node %s: %w", id, err)
+			}
+			perNode[id] = r
+		}
+		seed, why := planCQSeed(perNode, choice)
+		if why != "" {
+			return raft.SeedPoliciesPayload{}, errors.New(why)
+		}
+		return seed, nil
 	case raft.PolicyKindRetention:
 		perNode := make(map[string]RetentionLocalRows, len(rows))
 		for id, raw := range rows {

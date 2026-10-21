@@ -31,12 +31,60 @@ type fsmSource struct {
 	// number (from 1).
 	onGet func(n int)
 	gets  int
+	// dropWatermarks makes that many SetCQWatermark proposals not reach the
+	// cluster (a timed-out propose: no error, nothing applied).
+	dropWatermarks int
+	// watermarkProposals counts SetCQWatermark calls.
+	watermarkProposals int
+	// barrierErr is what CQReadBarrier answers.
+	barrierErr error
+}
+
+func (s *fsmSource) CQPoliciesSeeded() bool {
+	return s.f.CQPoliciesEnabled() && s.f.PoliciesSeeded(raft.PolicyKindCQ)
+}
+func (s *fsmSource) CQPoliciesCollecting() bool                    { return s.collecting }
+func (s *fsmSource) ClusterCQ(id int64) (raft.CQEntry, bool)       { return s.f.CQ(id) }
+func (s *fsmSource) ClusterCQByName(n string) (raft.CQEntry, bool) { return s.f.CQByName(n) }
+func (s *fsmSource) ClusterCQs() []raft.CQEntry                    { return s.f.CQs() }
+func (s *fsmSource) CreateCQ(_ context.Context, p raft.CreateCQPayload) error {
+	p.Now = time.Now().UTC()
+	return s.apply(raft.CommandCreateCQ, p)
+}
+func (s *fsmSource) UpdateCQ(_ context.Context, p raft.UpdateCQPayload) error {
+	p.Now = time.Now().UTC()
+	return s.apply(raft.CommandUpdateCQ, p)
+}
+func (s *fsmSource) DeleteCQ(_ context.Context, id int64) error {
+	return s.apply(raft.CommandDeleteCQ, raft.DeleteCQPayload{ID: id})
+}
+func (s *fsmSource) SetCQWatermark(_ context.Context, id int64, from *time.Time, to time.Time) error {
+	s.watermarkProposals++
+	if s.dropWatermarks > 0 {
+		s.dropWatermarks--
+		return nil
+	}
+	return s.apply(raft.CommandSetCQWatermark, raft.SetCQWatermarkPayload{Proposer: s.self, ID: id, From: from, To: to})
+}
+
+func (s *fsmSource) CQReadBarrier(context.Context) error { return s.barrierErr }
+func (s *fsmSource) CQMirrorState() raft.CQMirror        { return s.f.CQMirrorState() }
+
+func (s *fsmSource) seedCQ(entries ...raft.CQEntry) {
+	s.t.Helper()
+	s.must(raft.CommandCollectPolicies, raft.CollectPoliciesPayload{Kind: raft.PolicyKindCQ, Leader: s.self})
+	s.must(raft.CommandSeedPolicies, raft.SeedPoliciesPayload{Kind: raft.PolicyKindCQ, Epoch: s.idx, CQ: entries, CQFloor: 1, Now: time.Now().UTC()})
 }
 
 func newFSMSource(t *testing.T, self string) *fsmSource {
 	s := &fsmSource{t: t, f: raft.NewClusterFSM(zerolog.Nop()), self: self}
-	s.must(raft.CommandEnableClusterPolicies, raft.EnableClusterPoliciesPayload{})
-	s.must(raft.CommandEnableRetentionPolicies, raft.EnableRetentionPoliciesPayload{})
+	// This node is the cluster's only node and its primary writer.
+	s.must(raft.CommandAddNode, raft.AddNodePayload{Node: raft.NodeInfo{ID: self, Role: "writer", State: "healthy"}})
+	s.must(raft.CommandPromoteWriter, raft.PromoteWriterPayload{NodeID: self})
+	nodes := []string{self}
+	s.must(raft.CommandEnableClusterPolicies, raft.EnableClusterPoliciesPayload{Nodes: nodes})
+	s.must(raft.CommandEnableRetentionPolicies, raft.EnableRetentionPoliciesPayload{Nodes: nodes})
+	s.must(raft.CommandEnableCQPolicies, raft.EnableCQPoliciesPayload{Nodes: nodes})
 	return s
 }
 

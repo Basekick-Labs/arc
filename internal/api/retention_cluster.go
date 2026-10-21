@@ -539,6 +539,12 @@ func (h *RetentionHandler) reconcileMirror(ctx context.Context, st raft.Retentio
 		if _, ok := want[id]; ok && (owned[id] || (isSource && to == id)) {
 			continue // the cluster's row; rewritten below if it differs
 		}
+		if owned[id] && id > st.Seq {
+			// A policy this node's state has not caught up with yet (a
+			// restart from an older snapshot): left as it is, history
+			// included. Taking it for a deleted one lost its history.
+			continue
+		}
 		switch {
 		case isSource && to != id:
 			if err := exec(`UPDATE retention_executions SET policy_id = ? WHERE policy_id = ?`, to, id); err != nil {
@@ -591,7 +597,7 @@ func (h *RetentionHandler) reconcileMirror(ctx context.Context, st raft.Retentio
 	}
 	// The IDs the mirror holds are now exactly the cluster's.
 	for id := range owned {
-		if _, ok := want[id]; !ok {
+		if _, ok := want[id]; !ok && id <= st.Seq {
 			if err := exec(`DELETE FROM retention_cluster_ids WHERE id = ?`, id); err != nil {
 				return err
 			}

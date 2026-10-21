@@ -76,8 +76,12 @@ type SeedPoliciesPayload struct {
 	// RetentionFloor, above every ID any node holds.
 	Retention        []RetentionPolicyEntry `json:"retention,omitempty"`
 	RetentionKeepIDs bool                   `json:"retention_keep_ids,omitempty"`
-	RetentionFloor   int64                  `json:"retention_floor,omitempty"`
-	Now              time.Time              `json:"now"`
+	// CQ, CQKeepIDs, CQFloor: the adopted continuous queries, as Retention.
+	CQ             []CQEntry `json:"cq,omitempty"`
+	CQKeepIDs      bool      `json:"cq_keep_ids,omitempty"`
+	CQFloor        int64     `json:"cq_floor,omitempty"`
+	RetentionFloor int64     `json:"retention_floor,omitempty"`
+	Now            time.Time `json:"now"`
 }
 
 // CollectPoliciesPayload opens a collect of a kind: until it ends (a seed, or
@@ -136,7 +140,7 @@ const maxAwaitingMissing = 256
 
 // knownPolicyKind reports a kind this build can seed.
 func knownPolicyKind(kind string) bool {
-	return kind == PolicyKindTiering || kind == PolicyKindRetention
+	return kind == PolicyKindTiering || kind == PolicyKindRetention || kind == PolicyKindCQ
 }
 
 // policyKindEnabledLocked reports whether kind may be collected and seeded:
@@ -145,6 +149,9 @@ func knownPolicyKind(kind string) bool {
 func (f *ClusterFSM) policyKindEnabledLocked(kind string) bool {
 	if !f.clusterPolicies {
 		return false
+	}
+	if kind == PolicyKindCQ {
+		return f.cqEnabled
 	}
 	if kind == PolicyKindRetention {
 		return f.retentionEnabled
@@ -181,6 +188,10 @@ type clusterPoliciesState struct {
 	RetentionSeededIDs []int64                 `json:"retention_seeded_ids,omitempty"`
 	Retention          []*RetentionPolicyEntry `json:"retention,omitempty"`
 	Choices            []*PolicyAdoptChoice    `json:"choices,omitempty"`
+	// Continuous queries (stage 3). Written only once their flag is on.
+	CQEnabled bool       `json:"cq_enabled,omitempty"`
+	CQSeq     int64      `json:"cq_seq,omitempty"`
+	CQs       []*CQEntry `json:"cqs,omitempty"`
 }
 
 // EnableClusterPoliciesPayload turns the flag on; see
@@ -455,12 +466,19 @@ func (f *ClusterFSM) applySeedPolicies(payload []byte) interface{} {
 	if len(p.Tiering) > MaxSeedTieringPolicies {
 		return fmt.Errorf("seed policies: %d tiering policies exceed %d", len(p.Tiering), MaxSeedTieringPolicies)
 	}
-	if p.Kind == PolicyKindRetention {
+	switch p.Kind {
+	case PolicyKindRetention:
 		if err := validRetentionSeed(&p); err != nil {
 			return fmt.Errorf("seed policies: %w", err)
 		}
-	} else if len(p.Retention) > 0 {
-		return fmt.Errorf("seed policies: retention rows in a %s seed", p.Kind)
+	case PolicyKindCQ:
+		if err := validCQSeed(&p); err != nil {
+			return fmt.Errorf("seed policies: %w", err)
+		}
+	default:
+		if len(p.Retention) > 0 || len(p.CQ) > 0 {
+			return fmt.Errorf("seed policies: retention or continuous query rows in a %s seed", p.Kind)
+		}
 	}
 	seen := make(map[string]bool, len(p.Tiering))
 	for _, e := range p.Tiering {
@@ -502,11 +520,14 @@ func (f *ClusterFSM) applySeedPolicies(payload []byte) interface{} {
 	if p.Kind == PolicyKindRetention {
 		f.seedRetentionLocked(&p)
 	}
+	if p.Kind == PolicyKindCQ {
+		f.seedCQLocked(&p)
+	}
 	f.policiesSeeded[p.Kind] = true
 	delete(f.policyCollecting, p.Kind)
 	delete(f.policyAwaiting, p.Kind)
 	delete(f.policyAdoptChoice, p.Kind)
-	f.logger.Info().Str("kind", p.Kind).Int("policies", len(p.Tiering)+len(p.Retention)).Msg("Cluster policies seeded")
+	f.logger.Info().Str("kind", p.Kind).Int("policies", len(p.Tiering)+len(p.Retention)+len(p.CQ)).Msg("Cluster policies seeded")
 	return nil
 }
 
@@ -537,6 +558,7 @@ func (f *ClusterFSM) snapshotClusterPoliciesLocked() *clusterPoliciesState {
 	}
 	sort.Slice(st.Awaiting, func(i, j int) bool { return st.Awaiting[i].Kind < st.Awaiting[j].Kind })
 	f.snapshotRetentionLocked(st)
+	f.snapshotCQLocked(st)
 	return st
 }
 
@@ -558,6 +580,7 @@ func (f *ClusterFSM) restoreClusterPoliciesLocked(st *clusterPoliciesState) {
 	f.policyAwaiting = map[string]*PolicyAwaiting{}
 	f.tieringPolicySeq = 0
 	f.restoreRetentionLocked(st)
+	f.restoreCQLocked(st)
 	if st == nil {
 		return
 	}

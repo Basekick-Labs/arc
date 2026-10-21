@@ -206,6 +206,10 @@ type RetentionMirror struct {
 	Policies  []RetentionPolicyEntry
 	Floor     int64
 	SeededIDs map[int64]bool
+	// Seq is the highest ID this state has issued. A mirrored row above it
+	// is a policy this node's state has not caught up with yet (a restart
+	// from an older snapshot), not one the cluster deleted.
+	Seq int64
 }
 
 // RetentionMirrorState returns the retention state a mirror reconciles to.
@@ -216,7 +220,7 @@ func (f *ClusterFSM) RetentionMirrorState() RetentionMirror {
 	for id := range f.retentionSeededIDs {
 		ids[id] = true
 	}
-	return RetentionMirror{Policies: f.retentionPoliciesLocked(), Floor: f.retentionFloor, SeededIDs: ids}
+	return RetentionMirror{Policies: f.retentionPoliciesLocked(), Floor: f.retentionFloor, SeededIDs: ids, Seq: f.retentionSeq}
 }
 
 // PolicyAdoptChoiceFor returns kind's pending admin choice.
@@ -398,8 +402,8 @@ func (f *ClusterFSM) applyChoosePolicyAdoption(payload []byte) interface{} {
 	}
 	// Tiering always seeds on its own (its merge never refuses): only
 	// retention waits for a choice.
-	if p.Kind != PolicyKindRetention || p.Node == "" || p.Hash == "" {
-		return fmt.Errorf("choose policy adoption: the retention kind, a node and a hash are required (kind %q)", p.Kind)
+	if (p.Kind != PolicyKindRetention && p.Kind != PolicyKindCQ) || p.Node == "" || p.Hash == "" {
+		return fmt.Errorf("choose policy adoption: the retention or cq kind, a node and a hash are required (kind %q)", p.Kind)
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -420,8 +424,8 @@ func (f *ClusterFSM) applyChoosePolicyAdoption(payload []byte) interface{} {
 // unique names, and with kept IDs, unique IDs below the floor. The day rules
 // are not re-checked: the leader seeds only rows that pass them.
 func validRetentionSeed(p *SeedPoliciesPayload) error {
-	if len(p.Tiering) > 0 {
-		return errors.New("tiering rows in a retention seed")
+	if len(p.Tiering) > 0 || len(p.CQ) > 0 {
+		return errors.New("tiering or continuous query rows in a retention seed")
 	}
 	if len(p.Retention) > MaxSeedRetentionPolicies {
 		return fmt.Errorf("%d retention policies exceed %d", len(p.Retention), MaxSeedRetentionPolicies)
