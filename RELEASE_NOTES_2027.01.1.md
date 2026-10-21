@@ -1373,6 +1373,41 @@ an unbounded operation.
 
 ## Bug fixes
 
+### A cluster on `storage.backend = "azblob"` reconciles its container as shared storage
+
+`azblob` is an accepted spelling of the Azure backend. The orphan reconciler
+decided whether storage was shared from the configured name. Its list knew
+`azure` but not `azblob`, so a cluster configured with `azblob` reconciled as if
+every node had its own disk:
+
+- Every node ran the storage scan and the manifest sweep against the one
+  container, instead of only the active compactor.
+- The check that keeps files other writers have flushed but not yet registered
+  ([#1214](https://github.com/Basekick-Labs/arc/issues/1214)) was off. Only
+  the grace window protected those files.
+- A node with file replication on and catch-up off logged a warning about
+  restoring an empty data disk, which does not apply to shared storage.
+
+With `reconciliation.manifest_only_dry_run = false`, several nodes could delete
+from the container without that check.
+
+The reconciler now decides from the backend Arc actually built, using the same
+rule as the pending-registration publisher. An `azblob` cluster is reconciled exactly
+like an `azure` one. Runs, `GET /api/v1/reconciliation/status` and audit events
+now report `backend_kind: "shared"` instead of `"local"`. During a rolling
+upgrade, nodes still on the old version keep sweeping as before. Keep
+`reconciliation.manifest_only_dry_run = true` until every node is upgraded.
+
+On shared storage, reconciliation runs only on the node that holds the
+compactor lease. Compactor failover (`cluster.failover_enabled = true`, a Raft
+data directory and the `writer_failover` licence feature) is what assigns
+that lease and moves it off a failed node. Without it, no node reconciles on
+`s3`, `minio`, `azure` or `azblob`, unless a lease is still held from an
+earlier failover-enabled run. Until now that showed only in debug logs; a node
+without compactor failover now logs a warning at startup. An `azblob` cluster
+without failover moves from "every node reconciles" to "no node reconciles".
+Enable compactor failover to keep reconciliation running.
+
 ### Setting a database to `hot_only` reports existing cold files ([#1304](https://github.com/Basekick-Labs/arc/issues/1304))
 
 The tiering-policy response now reports how many non-quarantined cold files
