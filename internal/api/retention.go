@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -66,6 +67,9 @@ type RetentionHandler struct {
 	cluster   RetentionClusterSource
 	localMu   sync.Mutex
 	mirrorMu  sync.Mutex
+	// clusterOwned: this node's table has been the cluster's mirror (the
+	// retention_cluster_state marker), so its own rows are never run again.
+	clusterOwned atomic.Bool
 }
 
 // RetentionPolicy represents a retention policy
@@ -453,6 +457,19 @@ func (h *RetentionHandler) initTables() error {
 	if err != nil {
 		return fmt.Errorf("failed to create retention_executions_dormant table: %w", err)
 	}
+	// The cluster mirror's own bookkeeping (#1324): the IDs it holds for the
+	// cluster, and the marker that this table is the cluster's.
+	if _, err = h.db.Exec(`CREATE TABLE IF NOT EXISTS retention_cluster_ids (id INTEGER PRIMARY KEY)`); err != nil {
+		return fmt.Errorf("failed to create retention_cluster_ids table: %w", err)
+	}
+	if _, err = h.db.Exec(`CREATE TABLE IF NOT EXISTS retention_cluster_state (name TEXT PRIMARY KEY, value TEXT)`); err != nil {
+		return fmt.Errorf("failed to create retention_cluster_state table: %w", err)
+	}
+	var owned int
+	if err := h.db.QueryRow(`SELECT COUNT(*) FROM retention_cluster_state WHERE name = 'owned'`).Scan(&owned); err != nil {
+		return fmt.Errorf("failed to read retention_cluster_state: %w", err)
+	}
+	h.clusterOwned.Store(owned > 0)
 
 	h.logger.Info().Msg("Retention policy tables initialized")
 	return nil
@@ -532,7 +549,7 @@ func (h *RetentionHandler) handleCreate(c *fiber.Ctx) error {
 	if adopted != nil {
 		return h.clusterCreate(c, adopted, &req)
 	}
-	if errors.Is(err, errRetentionBeingAdopted) {
+	if errors.Is(err, errRetentionBeingAdopted) || errors.Is(err, errRetentionNotCaughtUp) {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
 	}
 
@@ -565,6 +582,9 @@ func (h *RetentionHandler) handleCreate(c *fiber.Ctx) error {
 // handleList returns all retention policies
 func (h *RetentionHandler) handleList(c *fiber.Ctx) error {
 	policies, err := h.getPolicies()
+	if errors.Is(err, errRetentionNotCaughtUp) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	}
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to list retention policies")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -583,6 +603,9 @@ func (h *RetentionHandler) handleGet(c *fiber.Ctx) error {
 	}
 
 	policy, err := h.getPolicy(int64(policyID))
+	if errors.Is(err, errRetentionNotCaughtUp) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	}
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Retention policy not found"})
 	}
@@ -655,7 +678,7 @@ func (h *RetentionHandler) handleUpdate(c *fiber.Ctx) error {
 	if adopted != nil {
 		return h.clusterUpdate(c, adopted, int64(policyID), &req)
 	}
-	if errors.Is(err, errRetentionBeingAdopted) {
+	if errors.Is(err, errRetentionBeingAdopted) || errors.Is(err, errRetentionNotCaughtUp) {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
 	}
 
@@ -710,7 +733,7 @@ func (h *RetentionHandler) handleDelete(c *fiber.Ctx) error {
 	if adopted != nil {
 		return h.clusterDelete(c, adopted, int64(policyID))
 	}
-	if errors.Is(err, errRetentionBeingAdopted) {
+	if errors.Is(err, errRetentionBeingAdopted) || errors.Is(err, errRetentionNotCaughtUp) {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
 	}
 	if err != nil {
@@ -773,6 +796,12 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 
 	// Record execution start
 	executionID := h.recordExecutionStart(policyID, cutoffDate)
+	if err := h.policyUnchanged(policy); err != nil {
+		if executionID > 0 {
+			h.recordExecutionComplete(executionID, "failed", 0, float64(time.Since(start).Milliseconds()), err.Error())
+		}
+		return nil, fmt.Errorf("retention policy %d: %w", policyID, err)
+	}
 
 	// Execute retention for each measurement
 	var totalDeleted int64
@@ -867,7 +896,9 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 
 // GetActivePolicies returns all active retention policies (used by scheduler)
 func (h *RetentionHandler) GetActivePolicies() ([]RetentionPolicy, error) {
-	if src := h.adoptedSource(); src != nil {
+	if src, err := h.readSource(); err != nil {
+		return nil, err
+	} else if src != nil {
 		return h.clusterPolicies(src, true)
 	}
 	rows, err := h.db.Query(`
@@ -943,6 +974,9 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 
 	// Get policy
 	policy, err := h.getPolicy(int64(policyID))
+	if errors.Is(err, errRetentionNotCaughtUp) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	}
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Retention policy not found"})
 	}
@@ -979,6 +1013,12 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 	var executionID int64
 	if !req.DryRun {
 		executionID = h.recordExecutionStart(int64(policyID), cutoffDate)
+		if err := h.policyUnchanged(policy); err != nil {
+			if executionID > 0 {
+				h.recordExecutionComplete(executionID, "failed", 0, float64(time.Since(start).Milliseconds()), err.Error())
+			}
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": err.Error()})
+		}
 	}
 
 	// Execute retention for each measurement
@@ -1114,7 +1154,9 @@ func (h *RetentionHandler) handleGetExecutions(c *fiber.Ctx) error {
 // cluster's, never a row of this node's own: every run reads it here, so a
 // mirror that has not caught up cannot change what a run deletes.
 func (h *RetentionHandler) getPolicy(policyID int64) (*RetentionPolicy, error) {
-	if src := h.adoptedSource(); src != nil {
+	if src, err := h.readSource(); err != nil {
+		return nil, err
+	} else if src != nil {
 		return h.clusterPolicy(src, policyID)
 	}
 	row := h.db.QueryRow(`
@@ -1146,7 +1188,9 @@ func (h *RetentionHandler) getPolicy(policyID int64) (*RetentionPolicy, error) {
 
 // getPolicies retrieves all policies
 func (h *RetentionHandler) getPolicies() ([]RetentionPolicy, error) {
-	if src := h.adoptedSource(); src != nil {
+	if src, err := h.readSource(); err != nil {
+		return nil, err
+	} else if src != nil {
 		return h.clusterPolicies(src, false)
 	}
 	rows, err := h.db.Query(`
@@ -1469,6 +1513,30 @@ func (h *RetentionHandler) getFileMaxTimeAndRowCount(ctx context.Context, filePa
 	}
 
 	return maxTime.UTC(), rowCount, nil
+}
+
+// errPolicyChangedBeforeRun: the policy a run read changed (or went) before
+// the run deleted anything.
+var errPolicyChangedBeforeRun = errors.New("the policy changed before the run started deleting (the cluster adopted retention policies, or the policy was edited); the next run uses the current policy")
+
+// policyUnchanged re-reads the policy a run read before its discovery, just
+// before it deletes: a run that straddles the cluster's adoption (or an edit)
+// must not delete under a definition that is no longer the policy.
+func (h *RetentionHandler) policyUnchanged(p *RetentionPolicy) error {
+	now, err := h.getPolicy(p.ID)
+	if err != nil || !now.IsActive || now.Name != p.Name || now.Database != p.Database ||
+		measurementKeyOf(now.Measurement) != measurementKeyOf(p.Measurement) ||
+		now.RetentionDays != p.RetentionDays || now.BufferDays != p.BufferDays {
+		return errPolicyChangedBeforeRun
+	}
+	return nil
+}
+
+func measurementKeyOf(m *string) string {
+	if m == nil {
+		return ""
+	}
+	return *m
 }
 
 // recordExecutionStart records the start of an execution

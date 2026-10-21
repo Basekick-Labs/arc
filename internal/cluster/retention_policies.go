@@ -157,7 +157,8 @@ func (c *Coordinator) AddPoliciesChangedCallback(fn func()) {
 }
 
 // RetentionLocalRow is one of a node's own retention policies, as it answers
-// a collect: the definition and how often this node ran it.
+// a collect: the definition, and how many runs of it completed on this node
+// since it was last changed.
 type RetentionLocalRow struct {
 	ID            int64     `json:"id"`
 	Name          string    `json:"name"`
@@ -174,6 +175,9 @@ type RetentionLocalRow struct {
 // RetentionLocalRows is one node's answer for the retention kind.
 type RetentionLocalRows struct {
 	Policies []RetentionLocalRow `json:"policies"`
+	// MaxIssuedID is the highest ID the node ever issued, deleted policies
+	// included: a client may still hold any of them.
+	MaxIssuedID int64 `json:"max_issued_id,omitempty"`
 }
 
 // RetentionRowsHash identifies a node's retention definitions (IDs included,
@@ -232,11 +236,15 @@ func contentOf(r RetentionLocalRow) retentionContent {
 // same policies; otherwise every policy is numbered above the highest ID any
 // node holds, so no old ID names a different policy.
 func planRetentionSeed(perNode map[string]RetentionLocalRows, choice *raft.PolicyAdoptChoice) (raft.SeedPoliciesPayload, string) {
+	// issued is, per node, the highest ID it ever handed out.
 	var maxID int64
-	for _, n := range perNode {
+	issued := make(map[string]int64, len(perNode))
+	for id, n := range perNode {
+		issued[id] = n.MaxIssuedID
 		for _, r := range n.Policies {
-			maxID = max(maxID, r.ID)
+			issued[id] = max(issued[id], r.ID)
 		}
+		maxID = max(maxID, issued[id])
 	}
 	type acc struct {
 		row     RetentionLocalRow
@@ -315,12 +323,14 @@ func planRetentionSeed(perNode map[string]RetentionLocalRows, choice *raft.Polic
 		kept[a.sources[0].ID] = true
 	}
 	if seed.RetentionKeepIDs {
+		// No other node may ever have handed out a kept ID, even for a
+		// policy it has since deleted: a client of that node could hold it.
 		for _, id := range nodes {
 			if id == sourceNode {
 				continue
 			}
-			for _, r := range perNode[id].Policies {
-				if kept[r.ID] {
+			for k := range kept {
+				if k <= issued[id] {
 					seed.RetentionKeepIDs = false
 				}
 			}

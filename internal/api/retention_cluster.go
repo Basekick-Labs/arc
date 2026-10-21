@@ -63,6 +63,28 @@ func (h *RetentionHandler) adoptedSource() RetentionClusterSource {
 	return nil
 }
 
+// errRetentionNotCaughtUp: this node's table is the cluster's (a mirror ran
+// here), but its cluster state has not caught up since it started: its own
+// rows may be stale, so retention waits rather than run or change them.
+var errRetentionNotCaughtUp = errors.New("this node has not caught up with the cluster's retention policies yet; retry in a few seconds")
+
+// readSource says where retention policies are read from: the cluster state
+// (src), this node's own table (nil, nil), or neither yet
+// (errRetentionNotCaughtUp).
+func (h *RetentionHandler) readSource() (RetentionClusterSource, error) {
+	src := h.clusterSource()
+	if src == nil {
+		return nil, nil
+	}
+	if src.RetentionPoliciesSeeded() {
+		return src, nil
+	}
+	if h.clusterOwned.Load() {
+		return nil, errRetentionNotCaughtUp
+	}
+	return nil, nil
+}
+
 // errRetentionBeingAdopted: a local write during the cluster's collect.
 var errRetentionBeingAdopted = errors.New("retention policies are being adopted by the cluster; retry in a few seconds")
 
@@ -80,6 +102,9 @@ func (h *RetentionHandler) localWrite(fn func() error) (adopted RetentionCluster
 		}
 		if src.RetentionPoliciesSeeded() {
 			return src, nil
+		}
+		if h.clusterOwned.Load() {
+			return nil, errRetentionNotCaughtUp
 		}
 	}
 	return nil, fn()
@@ -319,9 +344,16 @@ func dsnSep(path string) string {
 // listLocalRetention reads a node's own retention policies, with how often
 // each ran, as it answers the cluster's adoption.
 func listLocalRetention(ctx context.Context, db *sql.DB) (json.RawMessage, error) {
+	// A run counts as evidence only if it completed under the definition as
+	// it is now: a run of an earlier definition (an edit since, or a toggle
+	// back to active) says nothing about this one. Both timestamps are
+	// SQLite's CURRENT_TIMESTAMP text, so they compare as text.
 	rows, err := db.QueryContext(ctx, `
 		SELECT rp.id, rp.name, rp.database, rp.measurement, rp.retention_days, rp.buffer_days, rp.is_active,
-			rp.created_at, rp.updated_at, (SELECT COUNT(*) FROM retention_executions re WHERE re.policy_id = rp.id)
+			rp.created_at, rp.updated_at,
+			(SELECT COUNT(*) FROM retention_executions re WHERE re.policy_id = rp.id
+				AND re.status IN ('completed', 'completed_with_errors')
+				AND re.execution_time >= COALESCE(rp.updated_at, rp.created_at, ''))
 		FROM retention_policies rp ORDER BY rp.id`)
 	if err != nil {
 		return nil, err
@@ -352,6 +384,13 @@ func listLocalRetention(ctx context.Context, db *sql.DB) (json.RawMessage, error
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	// The highest ID this table ever issued, deleted ones included
+	// (AUTOINCREMENT never reuses them): the cluster numbers above it.
+	var seq sql.NullInt64
+	if err := db.QueryRowContext(ctx, `SELECT seq FROM sqlite_sequence WHERE name = 'retention_policies'`).Scan(&seq); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	out.MaxIssuedID = seq.Int64
 	if len(out.Policies) > raft.MaxSeedRetentionPolicies {
 		return nil, fmt.Errorf("%d retention policies exceed the %d the cluster adopts", len(out.Policies), raft.MaxSeedRetentionPolicies)
 	}
@@ -401,14 +440,23 @@ const sqliteTimestamp = "2006-01-02 15:04:05"
 // connection; on the shared auth database, a second statement outside it
 // would wait for this one's connection forever).
 //
-// A row the cluster does not hold is, by its ID:
-//   - a source of a seeded policy on this node: its execution history moves
-//     to the policy's new ID, and the row goes;
-//   - a policy the cluster held and deleted (seeded, or at or above the
-//     seed's floor): it goes with its history, as a delete always did;
-//   - otherwise a row from before the seed that the cluster did not adopt:
+// The mirror records the IDs it holds for the cluster (retention_cluster_ids),
+// and decides by them, never by an ID's range. A local row is:
+//   - the cluster's: an ID the mirror holds, or this node's own row a seeded
+//     policy was built from with the same ID. It is rewritten to match and
+//     keeps its history;
+//   - this node's own row a seeded policy was built from under another ID:
+//     its history moves to the policy's ID, and the row goes;
+//   - a cluster policy since deleted (an ID the mirror held): it goes with
+//     its history, as a delete always did;
+//   - anything else (a row from before the seed the cluster did not adopt, a
+//     row restored from an old backup, a row of a node that joined later):
 //     it moves, with its history, to the dormant tables. It never runs again
-//     and nothing is lost.
+//     and nothing is lost. A cluster policy with its ID is then written anew.
+//
+// The first reconcile also marks this node's table as the cluster's, so a
+// restart that has not caught up with the cluster yet refuses retention
+// rather than running this node's own rows (see readSource).
 func (h *RetentionHandler) reconcileMirror(ctx context.Context, st raft.RetentionMirror, self string) error {
 	conn, err := h.db.Conn(ctx)
 	if err != nil {
@@ -441,19 +489,40 @@ func (h *RetentionHandler) reconcileMirror(ctx context.Context, st raft.Retentio
 	if err := rows.Err(); err != nil {
 		return err
 	}
+	owned := map[int64]bool{}
+	idRows, err := tx.QueryContext(ctx, `SELECT id FROM retention_cluster_ids`)
+	if err != nil {
+		return err
+	}
+	for idRows.Next() {
+		var id int64
+		if err := idRows.Scan(&id); err != nil {
+			idRows.Close()
+			return err
+		}
+		owned[id] = true
+	}
+	idRows.Close()
+	if err := idRows.Err(); err != nil {
+		return err
+	}
+	var marked int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM retention_cluster_state WHERE name = 'owned'`).Scan(&marked); err != nil {
+		return err
+	}
 
 	want := make(map[int64]raft.RetentionPolicyEntry, len(st.Policies))
-	movedTo := map[int64]int64{} // this node's source row -> the seeded policy
+	sourced := map[int64]int64{} // this node's row a seeded policy was built from -> the policy
 	for _, e := range st.Policies {
 		want[e.ID] = e
 		for _, s := range e.Sources {
-			if s.Node == self && s.ID != e.ID {
-				movedTo[s.ID] = e.ID
+			if s.Node == self {
+				sourced[s.ID] = e.ID
 			}
 		}
 	}
 
-	changed := false
+	changed := marked == 0
 	exec := func(q string, args ...interface{}) error {
 		changed = true
 		_, err := tx.ExecContext(ctx, q, args...)
@@ -466,15 +535,16 @@ func (h *RetentionHandler) reconcileMirror(ctx context.Context, st raft.Retentio
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	dormant := 0
 	for _, id := range ids {
-		if _, ok := want[id]; ok {
-			continue
+		to, isSource := sourced[id]
+		if _, ok := want[id]; ok && (owned[id] || (isSource && to == id)) {
+			continue // the cluster's row; rewritten below if it differs
 		}
-		switch to, moved := movedTo[id]; {
-		case moved:
+		switch {
+		case isSource && to != id:
 			if err := exec(`UPDATE retention_executions SET policy_id = ? WHERE policy_id = ?`, to, id); err != nil {
 				return err
 			}
-		case st.SeededIDs[id] || id >= st.Floor:
+		case owned[id]:
 			if err := exec(`DELETE FROM retention_executions WHERE policy_id = ?`, id); err != nil {
 				return err
 			}
@@ -495,6 +565,7 @@ func (h *RetentionHandler) reconcileMirror(ctx context.Context, st raft.Retentio
 		if err := exec(`DELETE FROM retention_policies WHERE id = ?`, id); err != nil {
 			return err
 		}
+		delete(local, id)
 	}
 	// Rewrite every row that differs: deleted first, then inserted, so two
 	// policies that swapped names never collide on the unique name.
@@ -518,12 +589,31 @@ func (h *RetentionHandler) reconcileMirror(ctx context.Context, st raft.Retentio
 			return err
 		}
 	}
+	// The IDs the mirror holds are now exactly the cluster's.
+	for id := range owned {
+		if _, ok := want[id]; !ok {
+			if err := exec(`DELETE FROM retention_cluster_ids WHERE id = ?`, id); err != nil {
+				return err
+			}
+		}
+	}
+	for id := range want {
+		if !owned[id] {
+			if err := exec(`INSERT INTO retention_cluster_ids (id) VALUES (?)`, id); err != nil {
+				return err
+			}
+		}
+	}
 	if !changed {
 		return nil
+	}
+	if err := exec(`INSERT OR IGNORE INTO retention_cluster_state (name, value) VALUES ('owned', '1')`); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	h.clusterOwned.Store(true)
 	if dormant > 0 {
 		h.logger.Warn().Int("dormant", dormant).
 			Msg("Retention policies this node held that the cluster did not adopt were moved to retention_policies_dormant; they no longer run")

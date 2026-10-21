@@ -517,3 +517,165 @@ func TestRetentionTableLister(t *testing.T) {
 		t.Fatalf("rows of a disabled node: %+v", got)
 	}
 }
+
+// A node whose table has been the cluster's mirror, restarted before its
+// cluster state caught up, neither runs nor changes its own rows: they may be
+// stale (or restored from a backup). It answers 503 until it catches up.
+func TestRetentionWaitsForTheClusterAfterARestart(t *testing.T) {
+	r := newClusterRetentionRig(t)
+	r.src.seed(false, 1)
+	if err := r.src.CreateRetentionPolicy(context.Background(), raft.CreateRetentionPolicyPayload{Name: "p", Database: "db", RetentionDays: 30, IsActive: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.h.MirrorClusterPolicies(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// The restart: the same database, a cluster state that has not applied
+	// the seed yet.
+	h2, err := NewRetentionHandler(nil, nil, r.h.config, nil, r.h.authManager, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	behind := newFSMSource(t, "n1")
+	h2.SetClusterSource(behind)
+	r.h = h2
+	r.app = fiber.New()
+	r.app.Get("/retention", h2.handleList)
+	r.app.Get("/retention/:id", h2.handleGet)
+	r.app.Post("/retention", h2.handleCreate)
+	r.app.Put("/retention/:id", h2.handleUpdate)
+	r.app.Delete("/retention/:id", h2.handleDelete)
+	for _, c := range []struct{ method, path, body string }{
+		{"GET", "/retention", ""}, {"GET", "/retention/1", ""}, {"POST", "/retention", `{"name":"x","database":"db","retention_days":3}`},
+		{"PUT", "/retention/1", `{"is_active":false}`}, {"DELETE", "/retention/1", ""},
+	} {
+		if code, body := r.do(t, c.method, c.path, c.body); code != fiber.StatusServiceUnavailable {
+			t.Fatalf("%s %s before catching up: %d %v", c.method, c.path, code, body)
+		}
+	}
+	if _, err := h2.GetActivePolicies(); err == nil {
+		t.Fatal("the scheduler got this node's own rows before it caught up")
+	}
+	if _, err := h2.ExecutePolicy(context.Background(), 1); err == nil {
+		t.Fatal("a run read this node's own row before it caught up")
+	}
+	// Caught up: the cluster's policy again.
+	behind.seed(false, 1)
+	if err := behind.CreateRetentionPolicy(context.Background(), raft.CreateRetentionPolicyPayload{Name: "p", Database: "db", RetentionDays: 30, IsActive: true}); err != nil {
+		t.Fatal(err)
+	}
+	if code, body := r.do(t, "GET", "/retention/1", ""); code != fiber.StatusOK || body["name"] != "p" {
+		t.Fatalf("after catching up: %d %v", code, body)
+	}
+}
+
+// Evidence that a policy ran counts only completed runs of its current
+// definition: a run before the last change, or a failed one, does not.
+func TestRetentionListerEvidenceIsTheCurrentDefinition(t *testing.T) {
+	r := newClusterRetentionRig(t)
+	r.exec(t, `INSERT INTO retention_policies (id, name, database, retention_days, buffer_days, is_active, created_at, updated_at)
+		VALUES (1, 'edited', 'db', 3, 0, 1, '2026-01-01 00:00:00', '2026-06-01 00:00:00'),
+		       (2, 'failed', 'db', 3, 0, 1, '2026-01-01 00:00:00', '2026-01-01 00:00:00'),
+		       (3, 'ran', 'db', 3, 0, 1, '2026-01-01 00:00:00', '2026-01-01 00:00:00')`)
+	r.exec(t, `INSERT INTO retention_executions (policy_id, execution_time, status) VALUES
+		(1, '2026-05-01 00:00:00', 'completed'),
+		(2, '2026-02-01 00:00:00', 'failed'), (2, '2026-02-02 00:00:00', 'running'),
+		(3, '2026-02-01 00:00:00', 'completed_with_errors')`)
+	raw, err := r.h.LocalPolicyLister()(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows cluster.RetentionLocalRows
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]int64{}
+	for _, p := range rows.Policies {
+		got[p.Name] = p.Executions
+	}
+	if got["edited"] != 0 || got["failed"] != 0 || got["ran"] != 1 {
+		t.Fatalf("evidence %v", got)
+	}
+	// The highest ID ever issued counts, deleted ones included.
+	r.exec(t, `INSERT INTO retention_policies (id, name, database, retention_days) VALUES (40, 'gone', 'db', 3)`)
+	r.exec(t, `DELETE FROM retention_policies WHERE id = 40`)
+	raw, _ = r.h.LocalPolicyLister()(context.Background())
+	_ = json.Unmarshal(raw, &rows)
+	if rows.MaxIssuedID != 40 {
+		t.Fatalf("max issued ID %d, want 40", rows.MaxIssuedID)
+	}
+}
+
+// The mirror decides by the IDs it holds, never by an ID's range: a row it
+// never wrote is kept dormant with its history, even when its ID is above
+// the seed's floor or equals a cluster policy's.
+func TestRetentionMirrorKeepsRowsItNeverWrote(t *testing.T) {
+	r := newClusterRetentionRig(t)
+	r.src.seed(false, 5)
+	if err := r.src.CreateRetentionPolicy(context.Background(), raft.CreateRetentionPolicyPayload{Name: "cluster", Database: "db", RetentionDays: 30, IsActive: true}); err != nil {
+		t.Fatal(err)
+	}
+	// Rows that appeared after the seed without the mirror: one with the
+	// cluster policy's ID, one above the floor.
+	r.localPolicy(t, 5, "stranger", 2)
+	r.localPolicy(t, 9, "above-floor", 1)
+	if err := r.h.MirrorClusterPolicies(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := r.count(t, `SELECT COUNT(*) FROM retention_policies_dormant WHERE name IN ('stranger', 'above-floor')`); n != 2 {
+		t.Fatalf("%d of the rows the mirror never wrote are dormant, want 2", n)
+	}
+	if n := r.count(t, `SELECT COUNT(*) FROM retention_executions_dormant`); n != 3 {
+		t.Fatalf("%d history rows dormant, want 3", n)
+	}
+	if n := r.count(t, `SELECT COUNT(*) FROM retention_executions WHERE policy_id = 5`); n != 0 {
+		t.Fatal("the stranger's history now belongs to the cluster policy")
+	}
+	if n := r.count(t, `SELECT COUNT(*) FROM retention_policies WHERE id = 5 AND name = 'cluster'`); n != 1 {
+		t.Fatal("the cluster policy was not written")
+	}
+	// Deleted cluster-wide: the mirror's own row goes with its history.
+	r.exec(t, `INSERT INTO retention_executions (policy_id, status) VALUES (5, 'completed')`)
+	if err := r.src.DeleteRetentionPolicy(context.Background(), 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.h.MirrorClusterPolicies(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := r.count(t, `SELECT COUNT(*) FROM retention_policies`) + r.count(t, `SELECT COUNT(*) FROM retention_executions`); n != 0 {
+		t.Fatalf("a cluster delete left %d rows", n)
+	}
+	if n := r.count(t, `SELECT COUNT(*) FROM retention_policies_dormant`); n != 2 {
+		t.Fatalf("a cluster delete changed the dormant rows: %d", n)
+	}
+}
+
+// A run re-reads its policy before deleting: a policy that changed or went
+// since the run read it stops the run.
+func TestRetentionRunStopsWhenThePolicyChanged(t *testing.T) {
+	r := newClusterRetentionRig(t)
+	r.src.seed(false, 1)
+	if err := r.src.CreateRetentionPolicy(context.Background(), raft.CreateRetentionPolicyPayload{Name: "p", Database: "db", RetentionDays: 30, IsActive: true}); err != nil {
+		t.Fatal(err)
+	}
+	p, err := r.h.GetPolicy(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.h.policyUnchanged(p); err != nil {
+		t.Fatalf("unchanged policy: %v", err)
+	}
+	if err := r.src.UpdateRetentionPolicy(context.Background(), raft.UpdateRetentionPolicyPayload{ID: 1, RetentionDays: intPtr(3)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.h.policyUnchanged(p); err == nil {
+		t.Fatal("a run went on under a definition that is no longer the policy")
+	}
+	p2, _ := r.h.GetPolicy(1)
+	if err := r.src.DeleteRetentionPolicy(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.h.policyUnchanged(p2); err == nil {
+		t.Fatal("a run went on after its policy was deleted")
+	}
+}

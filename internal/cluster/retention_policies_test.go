@@ -105,9 +105,9 @@ func TestPlanRetentionSeedChoice(t *testing.T) {
 	if len(seed.Retention) != 2 || seed.Retention[0].Name != "p1" || seed.Retention[0].RetentionDays != 30 {
 		t.Fatalf("seed %+v", seed.Retention)
 	}
-	// b's ID 9 is above a's: the floor clears every node's IDs, and a's IDs
-	// (3, 4) are used by no other node, so they are kept.
-	if seed.RetentionFloor != 10 || !seed.RetentionKeepIDs {
+	// b's ID 9 is above a's: the floor clears every node's IDs, and b may
+	// once have issued a's 3 and 4, so they are renumbered.
+	if seed.RetentionFloor != 10 || seed.RetentionKeepIDs {
 		t.Fatalf("floor %d keep %v", seed.RetentionFloor, seed.RetentionKeepIDs)
 	}
 
@@ -355,4 +355,26 @@ func TestRunPolicyMirrorRetriesAfterAnError(t *testing.T) {
 		return nil
 	})
 	waitFor(t, 5*time.Second, func() bool { return calls.Load() >= 3 }, "the failed mirror was never retried")
+}
+
+// The floor and the kept IDs account for every ID a node ever issued, deleted
+// policies included: a client may still hold one.
+func TestPlanRetentionSeedCountsIssuedIDs(t *testing.T) {
+	seed, why := planRetentionSeed(map[string]RetentionLocalRows{
+		"a": rset(rrow(3, "p1", 30, true, 2)),
+		"b": {MaxIssuedID: 12},
+	}, nil)
+	if why != "" {
+		t.Fatal(why)
+	}
+	if seed.RetentionFloor != 13 || seed.RetentionKeepIDs {
+		t.Fatalf("floor %d keep %v: b once issued ID 3, so a's 3 must not be kept", seed.RetentionFloor, seed.RetentionKeepIDs)
+	}
+	seed, _ = planRetentionSeed(map[string]RetentionLocalRows{
+		"a": {Policies: []RetentionLocalRow{rrow(3, "p1", 30, true, 2)}, MaxIssuedID: 8},
+		"b": {MaxIssuedID: 2},
+	}, nil)
+	if seed.RetentionFloor != 9 || !seed.RetentionKeepIDs || seed.Retention[0].ID != 3 {
+		t.Fatalf("floor %d keep %v %+v", seed.RetentionFloor, seed.RetentionKeepIDs, seed.Retention)
+	}
 }

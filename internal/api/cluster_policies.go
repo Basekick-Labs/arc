@@ -75,6 +75,6 @@ func (h *ClusterHandler) handleAdoptPolicies(c *fiber.Ctx) error {
 	h.logger.Info().Str("node", req.Node).Str("by", by).Msg("Retention policy adoption chosen")
 	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
 		"success": true,
-		"message": "the leader adopts the node's retention policies if it still holds exactly these; GET /api/v1/cluster shows the outcome under cluster_policies",
+		"message": "the leader adopts the node's retention policies if it still holds exactly these; every other node's own retention policies then stop running and are kept as dormant rows. GET /api/v1/cluster shows the outcome under cluster_policies",
 	})
 }
