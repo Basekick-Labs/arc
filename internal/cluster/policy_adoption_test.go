@@ -51,7 +51,7 @@ func TestMergeTieringPolicies_UnsetAgeIsTheNodesDefault(t *testing.T) {
 		t.Fatalf("merged = %+v, want 30 (node a's default), not b's 7", got)
 	}
 	// A node that answered "none" (tiering off) contributes nothing.
-	seed, err := mergePolicyAnswers(raft.PolicyKindTiering, map[string]json.RawMessage{"x": json.RawMessage("null")})
+	seed, err := mergePolicyAnswers(raft.PolicyKindTiering, map[string]json.RawMessage{"x": json.RawMessage("null")}, nil)
 	if err != nil || len(seed.Tiering) != 0 {
 		t.Fatalf("empty answer: %+v %v", seed, err)
 	}

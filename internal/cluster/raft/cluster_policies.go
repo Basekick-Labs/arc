@@ -29,7 +29,8 @@ const CapabilityClusterPolicies = "cluster_policies_v1"
 // Policy kinds. Each is seeded once from the nodes' existing rows; until
 // then that kind stays in each node's own SQLite exactly as before.
 const (
-	PolicyKindTiering = "tiering"
+	PolicyKindTiering   = "tiering"
+	PolicyKindRetention = "retention"
 )
 
 // maxPolicyDatabaseLen bounds a policy's database name.
@@ -69,7 +70,14 @@ type SeedPoliciesPayload struct {
 	Kind    string               `json:"kind"`
 	Epoch   uint64               `json:"epoch"`
 	Tiering []TieringPolicyEntry `json:"tiering,omitempty"`
-	Now     time.Time            `json:"now"`
+	// Retention: the adopted retention policies, each with the node rows it
+	// was built from. RetentionKeepIDs keeps their IDs (one source node, no
+	// other node using any of them); otherwise every policy is numbered from
+	// RetentionFloor, above every ID any node holds.
+	Retention        []RetentionPolicyEntry `json:"retention,omitempty"`
+	RetentionKeepIDs bool                   `json:"retention_keep_ids,omitempty"`
+	RetentionFloor   int64                  `json:"retention_floor,omitempty"`
+	Now              time.Time              `json:"now"`
 }
 
 // CollectPoliciesPayload opens a collect of a kind: until it ends (a seed, or
@@ -122,7 +130,22 @@ const maxAwaitingError = 512
 const maxAwaitingMissing = 256
 
 // knownPolicyKind reports a kind this build can seed.
-func knownPolicyKind(kind string) bool { return kind == PolicyKindTiering }
+func knownPolicyKind(kind string) bool {
+	return kind == PolicyKindTiering || kind == PolicyKindRetention
+}
+
+// policyKindEnabledLocked reports whether kind may be collected and seeded:
+// tiering with the flag, retention once its own flag is on too (a build
+// without retention support can no longer be in the cluster).
+func (f *ClusterFSM) policyKindEnabledLocked(kind string) bool {
+	if !f.clusterPolicies {
+		return false
+	}
+	if kind == PolicyKindRetention {
+		return f.retentionEnabled
+	}
+	return true
+}
 
 // ErrPolicyNotFound: a delete of a policy that does not exist.
 var ErrPolicyNotFound = errors.New("policy not found")
@@ -146,6 +169,13 @@ type clusterPoliciesState struct {
 	Tiering    []*TieringPolicyEntry `json:"tiering,omitempty"`
 	Collecting []*PolicyCollect      `json:"collecting,omitempty"`
 	Awaiting   []*PolicyAwaiting     `json:"awaiting,omitempty"`
+	// Retention (stage 2). Written only once its own flag is on.
+	RetentionEnabled   bool                    `json:"retention_enabled,omitempty"`
+	RetentionSeq       int64                   `json:"retention_seq,omitempty"`
+	RetentionFloor     int64                   `json:"retention_floor,omitempty"`
+	RetentionSeededIDs []int64                 `json:"retention_seeded_ids,omitempty"`
+	Retention          []*RetentionPolicyEntry `json:"retention,omitempty"`
+	Choices            []*PolicyAdoptChoice    `json:"choices,omitempty"`
 }
 
 // EnableClusterPoliciesPayload turns the flag on; see
@@ -191,20 +221,29 @@ func (f *ClusterFSM) applyEnableClusterPolicies(payload []byte) interface{} {
 	return nil
 }
 
-// SetPoliciesChangedCallback installs a function called, without the FSM's
-// lock, after any policy changes: a set, a delete, a seed, or a snapshot
-// restore. It runs on the FSM goroutine and must not block (signal a worker).
-func (f *ClusterFSM) SetPoliciesChangedCallback(cb func()) {
+// AddPoliciesChangedCallback adds a function called, without the FSM's lock,
+// after any policy changes: a set, a delete, a seed, or a snapshot restore.
+// It runs on the FSM goroutine and must not block (signal a worker). Each
+// kind's mirror adds its own.
+func (f *ClusterFSM) AddPoliciesChangedCallback(cb func()) {
 	if cb == nil {
-		f.onPoliciesChanged.Store(nil)
 		return
 	}
-	f.onPoliciesChanged.Store(&cb)
+	f.onPoliciesChangedMu.Lock()
+	defer f.onPoliciesChangedMu.Unlock()
+	var next []func()
+	if cur := f.onPoliciesChanged.Load(); cur != nil {
+		next = append(next, *cur...)
+	}
+	next = append(next, cb)
+	f.onPoliciesChanged.Store(&next)
 }
 
 func (f *ClusterFSM) firePoliciesChanged() {
-	if cb := f.onPoliciesChanged.Load(); cb != nil {
-		(*cb)()
+	if cbs := f.onPoliciesChanged.Load(); cbs != nil {
+		for _, cb := range *cbs {
+			cb()
+		}
 	}
 }
 
@@ -342,8 +381,8 @@ func (f *ClusterFSM) applyCollectPolicies(payload []byte, logIndex uint64) inter
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if !f.clusterPolicies {
-		return errors.New("collect policies: cluster policies are not enabled")
+	if !f.policyKindEnabledLocked(p.Kind) {
+		return fmt.Errorf("collect policies: %s policies are not enabled", p.Kind)
 	}
 	if f.policiesSeeded[p.Kind] {
 		return nil
@@ -390,6 +429,8 @@ func (f *ClusterFSM) applyAwaitAdoption(payload []byte) interface{} {
 		attempts = prev.Attempts + 1
 	}
 	f.policyAwaiting[p.Kind] = &PolicyAwaiting{Kind: p.Kind, Missing: missing, LastError: p.LastError, Attempts: attempts, At: p.Now}
+	// An admin's choice is tried once: whatever stopped it, they look again.
+	delete(f.policyAdoptChoice, p.Kind)
 	return nil
 }
 
@@ -404,6 +445,13 @@ func (f *ClusterFSM) applySeedPolicies(payload []byte) interface{} {
 	if len(p.Tiering) > MaxSeedTieringPolicies {
 		return fmt.Errorf("seed policies: %d tiering policies exceed %d", len(p.Tiering), MaxSeedTieringPolicies)
 	}
+	if p.Kind == PolicyKindRetention {
+		if err := validRetentionSeed(&p); err != nil {
+			return fmt.Errorf("seed policies: %w", err)
+		}
+	} else if len(p.Retention) > 0 {
+		return fmt.Errorf("seed policies: retention rows in a %s seed", p.Kind)
+	}
 	seen := make(map[string]bool, len(p.Tiering))
 	for _, e := range p.Tiering {
 		if err := validPolicyDatabase(e.Database); err != nil {
@@ -416,8 +464,8 @@ func (f *ClusterFSM) applySeedPolicies(payload []byte) interface{} {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if !f.clusterPolicies {
-		return errors.New("seed policies: cluster policies are not enabled")
+	if !f.policyKindEnabledLocked(p.Kind) {
+		return fmt.Errorf("seed policies: %s policies are not enabled", p.Kind)
 	}
 	if f.policiesSeeded[p.Kind] {
 		// Seeded once: a second seed (a leader change mid-seed) is a no-op.
@@ -441,10 +489,14 @@ func (f *ClusterFSM) applySeedPolicies(payload []byte) interface{} {
 		}
 		f.tieringPolicies[c.Database] = &c
 	}
+	if p.Kind == PolicyKindRetention {
+		f.seedRetentionLocked(&p)
+	}
 	f.policiesSeeded[p.Kind] = true
 	delete(f.policyCollecting, p.Kind)
 	delete(f.policyAwaiting, p.Kind)
-	f.logger.Info().Str("kind", p.Kind).Int("policies", len(p.Tiering)).Msg("Cluster policies seeded")
+	delete(f.policyAdoptChoice, p.Kind)
+	f.logger.Info().Str("kind", p.Kind).Int("policies", len(p.Tiering)+len(p.Retention)).Msg("Cluster policies seeded")
 	return nil
 }
 
@@ -474,6 +526,7 @@ func (f *ClusterFSM) snapshotClusterPoliciesLocked() *clusterPoliciesState {
 		st.Awaiting = append(st.Awaiting, &ac)
 	}
 	sort.Slice(st.Awaiting, func(i, j int) bool { return st.Awaiting[i].Kind < st.Awaiting[j].Kind })
+	f.snapshotRetentionLocked(st)
 	return st
 }
 
@@ -494,6 +547,7 @@ func (f *ClusterFSM) restoreClusterPoliciesLocked(st *clusterPoliciesState) {
 	f.policyCollecting = map[string]*PolicyCollect{}
 	f.policyAwaiting = map[string]*PolicyAwaiting{}
 	f.tieringPolicySeq = 0
+	f.restoreRetentionLocked(st)
 	if st == nil {
 		return
 	}

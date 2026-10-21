@@ -54,7 +54,12 @@ var (
 )
 
 // policyKinds are the kinds this build adopts, in order.
-var policyKinds = []string{raft.PolicyKindTiering}
+var policyKinds = []string{raft.PolicyKindTiering, raft.PolicyKindRetention}
+
+// probesFirst reports kinds whose merge can refuse the rows (retention): the
+// leader reads every node's rows with a read-only probe first and opens a
+// collect, with its window of refused writes, only when the merge would seed.
+func probesFirst(kind string) bool { return kind == raft.PolicyKindRetention }
 
 // EmptyPolicyLister answers that this node holds no policies of a kind: for a
 // node that does not run it (tiering disabled).
@@ -93,8 +98,12 @@ func (c *Coordinator) PolicyCollecting(kind string) bool {
 }
 
 // localPoliciesAnswer reads this node's rows of kind once its FSM has applied
-// the collect at epoch and it is still open.
+// the collect at epoch and it is still open. Epoch zero is a read-only probe:
+// the rows as they are now, with no collect.
 func (c *Coordinator) localPoliciesAnswer(ctx context.Context, kind string, epoch uint64) (string, json.RawMessage) {
+	if epoch == 0 {
+		return c.readLocalPolicies(ctx, kind)
+	}
 	waitCtx, cancel := context.WithTimeout(ctx, policyApplyWait)
 	err := c.waitAppliedHere(waitCtx, epoch)
 	cancel()
@@ -110,6 +119,11 @@ func (c *Coordinator) localPoliciesAnswer(ctx context.Context, kind string, epoc
 		c.logger.Warn().Str("kind", kind).Uint64("epoch", epoch).Msg("Policy collect: that collect is no longer open")
 		return protocol.LocalPoliciesFailed, nil
 	}
+	return c.readLocalPolicies(ctx, kind)
+}
+
+// readLocalPolicies runs kind's lister.
+func (c *Coordinator) readLocalPolicies(ctx context.Context, kind string) (string, json.RawMessage) {
 	fn := c.policyLister(kind)
 	if fn == nil {
 		// Not "none": a node that has not finished starting registers its
@@ -143,7 +157,7 @@ func (c *Coordinator) handleLocalPoliciesQuery(conn net.Conn, q *protocol.LocalP
 	case c.cfg.SharedSecret == "":
 		refuse("cluster.shared_secret not configured")
 		return
-	case q.HMAC == "" || q.Nonce == "" || q.NodeID == "" || q.Timestamp == 0 || q.Epoch == 0:
+	case q.HMAC == "" || q.Nonce == "" || q.NodeID == "" || q.Timestamp == 0:
 		refuse("missing fields")
 		return
 	case q.ClusterName != c.cfg.ClusterName:
@@ -250,10 +264,11 @@ func (c *Coordinator) maybeSeedPolicies(ctx context.Context) {
 		return
 	}
 	for _, kind := range policyKinds {
-		if fsm.PoliciesSeeded(kind) {
+		if !c.policyKindActive(kind) || fsm.PoliciesSeeded(kind) {
 			continue
 		}
-		if a, ok := fsm.PolicyAwaitingAdoption(kind); ok && time.Since(a.At) < adoptBackoff(a.Attempts) {
+		_, chosen := fsm.PolicyAdoptChoiceFor(kind)
+		if a, ok := fsm.PolicyAwaitingAdoption(kind); ok && !chosen && time.Since(a.At) < adoptBackoff(a.Attempts) {
 			continue
 		}
 		if err := c.adoptPolicies(ctx, kind); err != nil {
@@ -317,14 +332,77 @@ func (c *Coordinator) adoptPolicies(ctx context.Context, kind string) error {
 		}
 		return fmt.Errorf("nodes unreachable: %v", down)
 	}
+	var choice *raft.PolicyAdoptChoice
+	if ch, ok := fsm.PolicyAdoptChoiceFor(kind); ok {
+		choice = &ch
+	}
+	_, stale := fsm.PolicyCollecting(kind)
+	if probesFirst(kind) && choice == nil && !stale {
+		// Probe first: a merge that would refuse the rows (nodes that
+		// disagree, a policy that never ran) must not cost a window of
+		// refused writes at every retry. A collect left open (a leader that
+		// died mid-collect) is replaced by a new one at once instead: only
+		// a collect can close it.
+		answers := c.queryAllNodes(ctx, kind, 0)
+		missing, rows := splitAnswers(answers)
+		why := ""
+		if len(missing) > 0 {
+			why = "no answer to the probe"
+		} else if _, err := mergePolicyAnswers(kind, rows, nil); err != nil {
+			why = err.Error()
+		}
+		if why != "" {
+			if _, err := c.proposeLeader(raft.CommandAwaitAdoption, raft.AwaitAdoptionPayload{Kind: kind, Missing: missing, LastError: why, Now: time.Now().UTC()}); err != nil {
+				return fmt.Errorf("record probe: %w", err)
+			}
+			return fmt.Errorf("%s %v", why, missing)
+		}
+	}
 	epoch, err := c.proposeLeader(raft.CommandCollectPolicies, raft.CollectPoliciesPayload{Kind: kind, Leader: c.localNode.ID, Now: time.Now().UTC()})
 	if err != nil {
 		return fmt.Errorf("open collect: %w", err)
 	}
+	answers := c.queryAllNodes(ctx, kind, epoch)
+	missing, rows := splitAnswers(answers)
+	for _, id := range missing {
+		c.logger.Warn().Err(answers[id].err).Str("kind", kind).Str("node_id", id).Msg("Policy collect: no answer from node")
+	}
+	var seed raft.SeedPoliciesPayload
+	lastError := ""
+	if len(missing) > 0 {
+		lastError = "no answer to the collect"
+	} else {
+		seed, err = mergePolicyAnswers(kind, rows, choice)
+		if err != nil {
+			c.logger.Warn().Err(err).Str("kind", kind).Msg("Policy collect: the nodes' policies cannot be merged")
+			lastError = "merge: " + err.Error()
+		}
+	}
+	if lastError != "" {
+		if _, err := c.proposeLeader(raft.CommandAwaitAdoption, raft.AwaitAdoptionPayload{Kind: kind, Epoch: epoch, Missing: missing, LastError: lastError, Now: time.Now().UTC()}); err != nil {
+			return fmt.Errorf("close collect: %w", err)
+		}
+		return fmt.Errorf("%s %v", lastError, missing)
+	}
+	seed.Kind, seed.Epoch, seed.Now = kind, epoch, time.Now().UTC()
+	if _, err := c.proposeLeader(raft.CommandSeedPolicies, seed); err != nil {
+		return fmt.Errorf("seed: %w", err)
+	}
+	ev := c.logger.Info().Str("kind", kind).Int("nodes", len(answers)).Int("policies", len(seed.Tiering)+len(seed.Retention))
+	if choice != nil {
+		ev = ev.Str("chosen_node", choice.Node).Str("chosen_by", choice.By)
+	}
+	ev.Msg("Cluster policies seeded from the nodes' own policies")
+	return nil
+}
+
+// queryAllNodes asks every FSM node, this one included, for its rows of kind:
+// for the collect at epoch, or with epoch zero a read-only probe.
+func (c *Coordinator) queryAllNodes(ctx context.Context, kind string, epoch uint64) map[string]policyAnswer {
 	answers := map[string]policyAnswer{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	for _, n := range fsm.GetAllNodes() {
+	for _, n := range c.fsmOrNil().GetAllNodes() {
 		wg.Add(1)
 		go func(id string) {
 			defer wg.Done()
@@ -346,43 +424,29 @@ func (c *Coordinator) adoptPolicies(ctx context.Context, kind string) error {
 		}(n.ID)
 	}
 	wg.Wait()
+	return answers
+}
 
+// splitAnswers returns the nodes that did not answer, sorted, and the rows of
+// those that did.
+func splitAnswers(answers map[string]policyAnswer) ([]string, map[string]json.RawMessage) {
 	var missing []string
+	rows := make(map[string]json.RawMessage, len(answers))
 	for id, a := range answers {
 		if a.err != nil {
-			c.logger.Warn().Err(a.err).Str("kind", kind).Str("node_id", id).Msg("Policy collect: no answer from node")
 			missing = append(missing, id)
+			continue
 		}
+		rows[id] = a.rows
 	}
 	sort.Strings(missing)
-	var seed raft.SeedPoliciesPayload
-	lastError := ""
-	if len(missing) > 0 {
-		lastError = "no answer to the collect"
-	} else {
-		rows := make(map[string]json.RawMessage, len(answers))
-		for id, a := range answers {
-			rows[id] = a.rows
-		}
-		seed, err = mergePolicyAnswers(kind, rows)
-		if err != nil {
-			c.logger.Warn().Err(err).Str("kind", kind).Msg("Policy collect: the nodes' policies cannot be merged")
-			lastError = "merge: " + err.Error()
-		}
-	}
-	if lastError != "" {
-		if _, err := c.proposeLeader(raft.CommandAwaitAdoption, raft.AwaitAdoptionPayload{Kind: kind, Epoch: epoch, Missing: missing, LastError: lastError, Now: time.Now().UTC()}); err != nil {
-			return fmt.Errorf("close collect: %w", err)
-		}
-		return fmt.Errorf("%s %v", lastError, missing)
-	}
-	seed.Kind, seed.Epoch, seed.Now = kind, epoch, time.Now().UTC()
-	if _, err := c.proposeLeader(raft.CommandSeedPolicies, seed); err != nil {
-		return fmt.Errorf("seed: %w", err)
-	}
-	c.logger.Info().Str("kind", kind).Int("nodes", len(answers)).Int("tiering_policies", len(seed.Tiering)).
-		Msg("Cluster policies seeded from every node's own policies")
-	return nil
+	return missing, rows
+}
+
+// nudgeAdoption runs an adoption pass now (an admin's choice) rather than at
+// the next tick.
+func (c *Coordinator) nudgeAdoption() {
+	go c.maybeSeedPolicies(c.ctxOrBackground())
 }
 
 // TieringLocalRows is one node's answer for the tiering kind: its rows, and
@@ -393,8 +457,22 @@ type TieringLocalRows struct {
 }
 
 // mergePolicyAnswers merges every node's rows of kind into one seed.
-func mergePolicyAnswers(kind string, rows map[string]json.RawMessage) (raft.SeedPoliciesPayload, error) {
+func mergePolicyAnswers(kind string, rows map[string]json.RawMessage, choice *raft.PolicyAdoptChoice) (raft.SeedPoliciesPayload, error) {
 	switch kind {
+	case raft.PolicyKindRetention:
+		perNode := make(map[string]RetentionLocalRows, len(rows))
+		for id, raw := range rows {
+			r, err := decodeRetentionRows(raw)
+			if err != nil {
+				return raft.SeedPoliciesPayload{}, fmt.Errorf("node %s: %w", id, err)
+			}
+			perNode[id] = r
+		}
+		seed, why := planRetentionSeed(perNode, choice)
+		if why != "" {
+			return raft.SeedPoliciesPayload{}, errors.New(why)
+		}
+		return seed, nil
 	case raft.PolicyKindTiering:
 		perNode := map[string]TieringLocalRows{}
 		for id, raw := range rows {

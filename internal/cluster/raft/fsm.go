@@ -214,6 +214,18 @@ const (
 	// not seed (#1324).
 	CommandCollectPolicies
 	CommandAwaitAdoption
+	// CommandEnableRetentionPolicies turns retention's own flag on, once,
+	// when every node supports cluster-wide retention policies (#1324 stage
+	// 2). A command of its own, so a build without it refuses it as unknown.
+	CommandEnableRetentionPolicies
+	// CommandCreateRetentionPolicy / CommandUpdateRetentionPolicy /
+	// CommandDeleteRetentionPolicy: retention policies, once seeded.
+	CommandCreateRetentionPolicy
+	CommandUpdateRetentionPolicy
+	CommandDeleteRetentionPolicy
+	// CommandChoosePolicyAdoption: an admin choosing the node whose policies
+	// of a kind the cluster adopts. Leader only.
+	CommandChoosePolicyAdoption
 )
 
 // Command represents a command to be applied to the FSM.
@@ -798,8 +810,17 @@ type ClusterFSM struct {
 	policyAwaiting   map[string]*PolicyAwaiting
 	// tieringPolicySeq numbers tiering policies (their IDs).
 	tieringPolicySeq int64
-	// onPoliciesChanged: SetPoliciesChangedCallback.
-	onPoliciesChanged atomic.Pointer[func()]
+	// Retention policies (#1324 stage 2), see retention_policies.go.
+	retentionEnabled   bool
+	retentionPolicies  map[int64]*RetentionPolicyEntry
+	retentionSeq       int64
+	retentionFloor     int64
+	retentionSeededIDs map[int64]bool
+	// policyAdoptChoice: an admin's pending choice of node, per kind.
+	policyAdoptChoice map[string]*PolicyAdoptChoice
+	// onPoliciesChanged: AddPoliciesChangedCallback.
+	onPoliciesChanged   atomic.Pointer[[]func()]
+	onPoliciesChangedMu sync.Mutex
 	// Staged-commit callbacks (#1207 d2a2a) and the events an apply queued
 	// for them, delivered once f.mu is released.
 	onCompactionStaged    func(StagedCompaction)
@@ -891,6 +912,9 @@ func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 		tieringPolicies:         map[string]*TieringPolicyEntry{},
 		policyCollecting:        map[string]*PolicyCollect{},
 		policyAwaiting:          map[string]*PolicyAwaiting{},
+		retentionPolicies:       map[int64]*RetentionPolicyEntry{},
+		retentionSeededIDs:      map[int64]bool{},
+		policyAdoptChoice:       map[string]*PolicyAdoptChoice{},
 
 		logger: logger.With().Str("component", "cluster-fsm").Logger(),
 	}
@@ -1299,6 +1323,16 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.applyCollectPolicies(cmd.Payload, log.Index)
 	case CommandAwaitAdoption:
 		return f.applyAwaitAdoption(cmd.Payload)
+	case CommandEnableRetentionPolicies:
+		return f.applyEnableRetentionPolicies(cmd.Payload)
+	case CommandCreateRetentionPolicy:
+		return f.policiesChangedIfApplied(f.applyCreateRetentionPolicy(cmd.Payload))
+	case CommandUpdateRetentionPolicy:
+		return f.policiesChangedIfApplied(f.applyUpdateRetentionPolicy(cmd.Payload))
+	case CommandDeleteRetentionPolicy:
+		return f.policiesChangedIfApplied(f.applyDeleteRetentionPolicy(cmd.Payload))
+	case CommandChoosePolicyAdoption:
+		return f.applyChoosePolicyAdoption(cmd.Payload)
 	case CommandDeleteFile:
 		return f.applyDeleteFile(cmd.Payload)
 	case CommandAssignCompactor:

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -57,6 +58,14 @@ type RetentionHandler struct {
 	licenseClient  *license.Client // nil when auth/licensing is disabled
 	authManager    *auth.AuthManager
 	logger         zerolog.Logger
+
+	// Cluster-wide retention (#1324), see retention_cluster.go. cluster is
+	// the cluster state once wired; localMu serializes this node's own
+	// writes with the cluster's read of them; mirrorMu serializes the mirror.
+	clusterMu sync.RWMutex
+	cluster   RetentionClusterSource
+	localMu   sync.Mutex
+	mirrorMu  sync.Mutex
 }
 
 // RetentionPolicy represents a retention policy
@@ -261,8 +270,11 @@ func NewRetentionHandler(storage storage.Backend, duckdb *database.DuckDB, cfg *
 			return nil, fmt.Errorf("failed to create directory for retention DB: %w", err)
 		}
 
-		// Open SQLite database for policy metadata
-		opened, err := sql.Open("sqlite3", cfg.DBPath)
+		// Open SQLite database for policy metadata, with the auth database's
+		// settings: the execution history's foreign key is enforced, and a
+		// writer waits for the lock rather than failing at once (the cluster
+		// mirror writes this database in the background, #1324).
+		opened, err := sql.Open("sqlite3", cfg.DBPath+"?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=ON")
 		if err != nil {
 			return nil, fmt.Errorf("failed to open retention database: %w", err)
 		}
@@ -402,6 +414,43 @@ func (h *RetentionHandler) initTables() error {
 		return fmt.Errorf("failed to create retention_executions table: %w", err)
 	}
 
+	// Dormant rows (#1324): this node's own policies the cluster did not
+	// adopt, and their history. Kept, never run.
+	_, err = h.db.Exec(`
+		CREATE TABLE IF NOT EXISTS retention_policies_dormant (
+			dormant_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			policy_id INTEGER NOT NULL,
+			name TEXT NOT NULL,
+			database TEXT NOT NULL,
+			measurement TEXT,
+			retention_days INTEGER NOT NULL,
+			buffer_days INTEGER,
+			is_active BOOLEAN,
+			created_at TIMESTAMP,
+			updated_at TIMESTAMP,
+			dormant_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create retention_policies_dormant table: %w", err)
+	}
+	_, err = h.db.Exec(`
+		CREATE TABLE IF NOT EXISTS retention_executions_dormant (
+			dormant_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			execution_id INTEGER NOT NULL,
+			policy_id INTEGER NOT NULL,
+			execution_time TIMESTAMP,
+			status TEXT,
+			deleted_count INTEGER,
+			cutoff_date TIMESTAMP,
+			execution_duration_ms FLOAT,
+			error_message TEXT
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create retention_executions_dormant table: %w", err)
+	}
+
 	h.logger.Info().Msg("Retention policy tables initialized")
 	return nil
 }
@@ -469,10 +518,20 @@ func (h *RetentionHandler) handleCreate(c *fiber.Ctx) error {
 	// defaults this endpoint has always applied (0 and false) rather than the
 	// column defaults: flipping is_active to the schema's TRUE would make a
 	// policy created by an existing client start deleting data.
-	result, err := h.db.Exec(`
+	var result sql.Result
+	adopted, err := h.localWrite(func() (err error) {
+		result, err = h.db.Exec(`
 		INSERT INTO retention_policies (name, database, measurement, retention_days, buffer_days, is_active)
 		VALUES (?, ?, ?, ?, ?, ?)
 	`, req.Name.Value, req.Database.Value, measurementColumn(req.Measurement), req.RetentionDays.Value, req.BufferDays.Value, req.IsActive.Value)
+		return err
+	})
+	if adopted != nil {
+		return h.clusterCreate(c, adopted, &req)
+	}
+	if errors.Is(err, errRetentionBeingAdopted) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	}
 
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint") {
@@ -562,16 +621,40 @@ func (h *RetentionHandler) handleUpdate(c *fiber.Ctx) error {
 	if len(args) == 0 {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "no fields to update"})
 	}
+	var (
+		result sql.Result
+		rows   int64
+		exists int
+		lookup error
+	)
 
 	// retention_days > buffer_days spans two columns, and a body may carry
 	// either one alone, so it is checked against the values the row will hold
 	// — the body's where it carries one, the stored one where it does not — in
 	// the same statement that writes them, so no concurrent PUT can slip in
 	// between a read and the write. A stored NULL buffer reads as 0.
-	result, err := h.db.Exec(
-		"UPDATE retention_policies SET "+assignments+", updated_at = CURRENT_TIMESTAMP"+
-			" WHERE id = ? AND COALESCE(?, retention_days) > COALESCE(?, buffer_days, 0)",
-		append(args, policyID, req.RetentionDays.ptr(), req.BufferDays.ptr())...)
+	adopted, err := h.localWrite(func() (err error) {
+		result, err = h.db.Exec(
+			"UPDATE retention_policies SET "+assignments+", updated_at = CURRENT_TIMESTAMP"+
+				" WHERE id = ? AND COALESCE(?, retention_days) > COALESCE(?, buffer_days, 0)",
+			append(args, policyID, req.RetentionDays.ptr(), req.BufferDays.ptr())...)
+		if err != nil {
+			return err
+		}
+		if rows, _ = result.RowsAffected(); rows == 0 {
+			// Either no such policy, or the row's values would break the
+			// retention/buffer rule; told apart below, read under the same
+			// lock as the write.
+			lookup = h.db.QueryRow("SELECT 1 FROM retention_policies WHERE id = ?", policyID).Scan(&exists)
+		}
+		return nil
+	})
+	if adopted != nil {
+		return h.clusterUpdate(c, adopted, int64(policyID), &req)
+	}
+	if errors.Is(err, errRetentionBeingAdopted) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	}
 
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint") {
@@ -585,13 +668,8 @@ func (h *RetentionHandler) handleUpdate(c *fiber.Ctx) error {
 		})
 	}
 
-	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		// Either no such policy, or the row's values would break the
-		// retention/buffer rule; tell them apart.
-		var exists int
-		err := h.db.QueryRow("SELECT 1 FROM retention_policies WHERE id = ?", policyID).Scan(&exists)
-		switch {
+		switch err := lookup; {
 		case errors.Is(err, sql.ErrNoRows):
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Retention policy not found"})
 		case err != nil:
@@ -618,11 +696,20 @@ func (h *RetentionHandler) handleDelete(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid policy ID"})
 	}
 
-	// Delete execution history first
-	_, _ = h.db.Exec("DELETE FROM retention_executions WHERE policy_id = ?", policyID)
-
-	// Delete policy
-	result, err := h.db.Exec("DELETE FROM retention_policies WHERE id = ?", policyID)
+	var result sql.Result
+	adopted, err := h.localWrite(func() (err error) {
+		// Delete execution history first
+		_, _ = h.db.Exec("DELETE FROM retention_executions WHERE policy_id = ?", policyID)
+		// Delete policy
+		result, err = h.db.Exec("DELETE FROM retention_policies WHERE id = ?", policyID)
+		return err
+	})
+	if adopted != nil {
+		return h.clusterDelete(c, adopted, int64(policyID))
+	}
+	if errors.Is(err, errRetentionBeingAdopted) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	}
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to delete retention policy")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -777,6 +864,9 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 
 // GetActivePolicies returns all active retention policies (used by scheduler)
 func (h *RetentionHandler) GetActivePolicies() ([]RetentionPolicy, error) {
+	if src := h.adoptedSource(); src != nil {
+		return h.clusterPolicies(src, true)
+	}
 	rows, err := h.db.Query(`
 		SELECT
 			rp.id, rp.name, rp.database, rp.measurement, rp.retention_days, rp.buffer_days, rp.is_active,
@@ -1016,7 +1106,14 @@ func (h *RetentionHandler) handleGetExecutions(c *fiber.Ctx) error {
 }
 
 // getPolicy retrieves a single policy by ID
+//
+// Once the cluster holds retention policies (#1324) the policy is the
+// cluster's, never a row of this node's own: every run reads it here, so a
+// mirror that has not caught up cannot change what a run deletes.
 func (h *RetentionHandler) getPolicy(policyID int64) (*RetentionPolicy, error) {
+	if src := h.adoptedSource(); src != nil {
+		return h.clusterPolicy(src, policyID)
+	}
 	row := h.db.QueryRow(`
 		SELECT
 			rp.id, rp.name, rp.database, rp.measurement, rp.retention_days, rp.buffer_days, rp.is_active,
@@ -1046,6 +1143,9 @@ func (h *RetentionHandler) getPolicy(policyID int64) (*RetentionPolicy, error) {
 
 // getPolicies retrieves all policies
 func (h *RetentionHandler) getPolicies() ([]RetentionPolicy, error) {
+	if src := h.adoptedSource(); src != nil {
+		return h.clusterPolicies(src, false)
+	}
 	rows, err := h.db.Query(`
 		SELECT
 			rp.id, rp.name, rp.database, rp.measurement, rp.retention_days, rp.buffer_days, rp.is_active,
@@ -1370,6 +1470,8 @@ func (h *RetentionHandler) getFileMaxTimeAndRowCount(ctx context.Context, filePa
 
 // recordExecutionStart records the start of an execution
 func (h *RetentionHandler) recordExecutionStart(policyID int64, cutoffDate time.Time) int64 {
+	// The history's foreign key needs this node's row of a cluster policy.
+	h.ensureMirrored(context.Background())
 	result, err := h.db.Exec(`
 		INSERT INTO retention_executions (policy_id, execution_time, status, cutoff_date)
 		VALUES (?, CURRENT_TIMESTAMP, 'running', ?)

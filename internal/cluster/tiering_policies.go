@@ -121,8 +121,29 @@ func TieringLocalLister(store *tiering.PolicyStore, defaultHotMaxAgeDays int) Lo
 // FSM goroutine never waits on SQLite. It mirrors once at start, which covers
 // a restart and a snapshot installed before the worker existed.
 func (c *Coordinator) MirrorTieringPolicies(store *tiering.PolicyStore) {
+	if store == nil {
+		return
+	}
+	c.RunPolicyMirror("tiering", func(ctx context.Context) error {
+		if !c.PoliciesSeeded(raft.PolicyKindTiering) {
+			return nil
+		}
+		entries := c.TieringPolicies()
+		policies := make([]tiering.DatabasePolicy, 0, len(entries))
+		for _, e := range entries {
+			policies = append(policies, tieringPolicyFromEntry(e))
+		}
+		return store.MirrorClusterPolicies(ctx, policies)
+	})
+}
+
+// RunPolicyMirror runs mirror on a worker after every policy change applied
+// here (and a snapshot restore), and once at start, which covers a restart
+// and a snapshot installed before the worker existed. The FSM only signals
+// the worker, so bursts coalesce and the FSM goroutine never waits on SQLite.
+func (c *Coordinator) RunPolicyMirror(kind string, mirror func(ctx context.Context) error) {
 	fsm := c.fsmOrNil()
-	if fsm == nil || store == nil {
+	if fsm == nil || mirror == nil {
 		return
 	}
 	signal := make(chan struct{}, 1)
@@ -132,7 +153,7 @@ func (c *Coordinator) MirrorTieringPolicies(store *tiering.PolicyStore) {
 		default:
 		}
 	}
-	fsm.SetPoliciesChangedCallback(notify)
+	fsm.AddPoliciesChangedCallback(notify)
 	notify()
 	ctx := c.ctxOrBackground()
 	go func() {
@@ -142,16 +163,8 @@ func (c *Coordinator) MirrorTieringPolicies(store *tiering.PolicyStore) {
 				return
 			case <-signal:
 			}
-			if !c.PoliciesSeeded(raft.PolicyKindTiering) {
-				continue
-			}
-			entries := c.TieringPolicies()
-			policies := make([]tiering.DatabasePolicy, 0, len(entries))
-			for _, e := range entries {
-				policies = append(policies, tieringPolicyFromEntry(e))
-			}
-			if err := store.MirrorClusterPolicies(ctx, policies); err != nil {
-				c.logger.Warn().Err(err).Msg("Could not mirror the cluster's tiering policies into this node's database; a backup taken now may carry older ones")
+			if err := mirror(ctx); err != nil {
+				c.logger.Warn().Err(err).Str("kind", kind).Msg("Could not mirror the cluster's policies into this node's database; a backup taken now may carry older ones")
 			}
 		}
 	}()
