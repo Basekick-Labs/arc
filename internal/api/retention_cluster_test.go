@@ -476,3 +476,44 @@ func TestRetentionLocalPolicyListerTakesTheWriteLock(t *testing.T) {
 	r.h.localMu.Unlock()
 	<-done
 }
+
+// A node with retention disabled still answers the cluster with the policies
+// its database holds from when retention ran there; no table, or no file, is
+// no policies.
+func TestRetentionTableLister(t *testing.T) {
+	ctx := context.Background()
+	decode := func(raw json.RawMessage, err error) []cluster.RetentionLocalRow {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var rows cluster.RetentionLocalRows
+		if err := json.Unmarshal(raw, &rows); err != nil {
+			t.Fatal(err)
+		}
+		return rows.Policies
+	}
+	r := newClusterRetentionRig(t)
+	r.localPolicy(t, 7, "old", 2)
+	shared := r.h.db
+	dir := t.TempDir()
+	am, err := auth.NewAuthManager(filepath.Join(dir, "arc.db"), time.Minute, 10, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer am.Close()
+	if got := decode(RetentionTableLister(am, filepath.Join(dir, "arc.db"))(ctx)); len(got) != 0 {
+		t.Fatalf("auth database without a retention table: %+v", got)
+	}
+	if got := decode(RetentionTableLister(nil, filepath.Join(dir, "missing.db"))(ctx)); len(got) != 0 {
+		t.Fatalf("missing file: %+v", got)
+	}
+	var path string
+	if err := shared.QueryRow(`SELECT file FROM pragma_database_list WHERE name = 'main'`).Scan(&path); err != nil {
+		t.Fatal(err)
+	}
+	got := decode(RetentionTableLister(nil, path)(ctx))
+	if len(got) != 1 || got[0].ID != 7 || got[0].Executions != 2 {
+		t.Fatalf("rows of a disabled node: %+v", got)
+	}
+}

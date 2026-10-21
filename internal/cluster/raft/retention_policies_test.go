@@ -182,9 +182,15 @@ func TestChoosePolicyAdoption(t *testing.T) {
 	if c, ok := x.f.PolicyAdoptChoiceFor(PolicyKindRetention); !ok || c.Node != "w2" || c.Hash != "h" {
 		t.Fatalf("choice %+v %v", c, ok)
 	}
-	x.ok(CommandAwaitAdoption, AwaitAdoptionPayload{Kind: PolicyKindRetention, LastError: "changed", Now: t0})
+	// An attempt that did not act on the choice (it started before it) leaves
+	// it pending; the attempt that acted on it ends it.
+	x.ok(CommandAwaitAdoption, AwaitAdoptionPayload{Kind: PolicyKindRetention, LastError: "never ran", Now: t0})
+	if _, ok := x.f.PolicyAdoptChoiceFor(PolicyKindRetention); !ok {
+		t.Fatal("an attempt that never saw the choice ended it")
+	}
+	x.ok(CommandAwaitAdoption, AwaitAdoptionPayload{Kind: PolicyKindRetention, LastError: "changed", ChoiceNode: "w2", ChoiceHash: "h", Now: t0})
 	if _, ok := x.f.PolicyAdoptChoiceFor(PolicyKindRetention); ok {
-		t.Fatal("an await left the choice pending")
+		t.Fatal("the attempt that acted on the choice left it pending")
 	}
 	x.ok(CommandChoosePolicyAdoption, ChoosePolicyAdoptionPayload{Kind: PolicyKindRetention, Node: "w2", Hash: "h", Now: t0})
 	x.seedRetention(false, 1)

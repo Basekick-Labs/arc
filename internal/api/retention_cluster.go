@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/gofiber/fiber/v2"
@@ -268,44 +270,92 @@ func (h *RetentionHandler) LocalPolicyLister() cluster.LocalPolicyLister {
 	return func(ctx context.Context) (json.RawMessage, error) {
 		h.localMu.Lock()
 		defer h.localMu.Unlock()
-		rows, err := h.db.QueryContext(ctx, `
-			SELECT rp.id, rp.name, rp.database, rp.measurement, rp.retention_days, rp.buffer_days, rp.is_active,
-				rp.created_at, rp.updated_at, (SELECT COUNT(*) FROM retention_executions re WHERE re.policy_id = rp.id)
-			FROM retention_policies rp ORDER BY rp.id`)
-		if err != nil {
-			return nil, err
-		}
-		defer rows.Close()
-		out := cluster.RetentionLocalRows{Policies: []cluster.RetentionLocalRow{}}
-		for rows.Next() {
-			var r cluster.RetentionLocalRow
-			var measurement sql.NullString
-			var buffer sql.NullInt64
-			var active sql.NullBool
-			var created, updated sql.NullTime
-			if err := rows.Scan(&r.ID, &r.Name, &r.Database, &measurement, &r.RetentionDays, &buffer, &active,
-				&created, &updated, &r.Executions); err != nil {
-				// Not skipped: a row missing from the answer would be dropped
-				// by the adoption.
-				return nil, fmt.Errorf("read retention policy row: %w", err)
-			}
-			if measurement.Valid && measurement.String != "" {
-				m := measurement.String
-				r.Measurement = &m
-			}
-			r.BufferDays = int(buffer.Int64)
-			r.IsActive = active.Valid && active.Bool
-			r.CreatedAt, r.UpdatedAt = created.Time.UTC(), updated.Time.UTC()
-			out.Policies = append(out.Policies, r)
-		}
-		if err := rows.Err(); err != nil {
-			return nil, err
-		}
-		if len(out.Policies) > raft.MaxSeedRetentionPolicies {
-			return nil, fmt.Errorf("%d retention policies exceed the %d the cluster adopts", len(out.Policies), raft.MaxSeedRetentionPolicies)
-		}
-		return json.Marshal(out)
+		return listLocalRetention(ctx, h.db)
 	}
+}
+
+// RetentionTableLister answers the cluster's adoption on a node where
+// retention is disabled: it runs nothing, but its database may still hold the
+// policies (and history) of when it did, and those must count. Left out, the
+// cluster could keep IDs that this node's own rows also use, and an old ID
+// here would name a different policy once retention is turned back on. The
+// table is read from the auth database, or from retention.db_path when that
+// file exists; no table is no policies.
+func RetentionTableLister(authManager *auth.AuthManager, dbPath string) cluster.LocalPolicyLister {
+	return func(ctx context.Context) (json.RawMessage, error) {
+		var db *sql.DB
+		if authManager != nil && authManager.SharesDBPath(dbPath) {
+			db = authManager.GetDB()
+		} else {
+			if _, err := os.Stat(dbPath); errors.Is(err, os.ErrNotExist) {
+				return json.Marshal(cluster.RetentionLocalRows{Policies: []cluster.RetentionLocalRow{}})
+			}
+			opened, err := sql.Open("sqlite3", dbPath+dsnSep(dbPath)+"mode=ro&_busy_timeout=5000")
+			if err != nil {
+				return nil, err
+			}
+			defer opened.Close()
+			db = opened
+		}
+		var n int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'retention_policies'`).Scan(&n); err != nil {
+			return nil, err
+		}
+		if n == 0 {
+			return json.Marshal(cluster.RetentionLocalRows{Policies: []cluster.RetentionLocalRow{}})
+		}
+		return listLocalRetention(ctx, db)
+	}
+}
+
+// dsnSep is the separator before DSN options appended to path.
+func dsnSep(path string) string {
+	if strings.Contains(path, "?") {
+		return "&"
+	}
+	return "?"
+}
+
+// listLocalRetention reads a node's own retention policies, with how often
+// each ran, as it answers the cluster's adoption.
+func listLocalRetention(ctx context.Context, db *sql.DB) (json.RawMessage, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT rp.id, rp.name, rp.database, rp.measurement, rp.retention_days, rp.buffer_days, rp.is_active,
+			rp.created_at, rp.updated_at, (SELECT COUNT(*) FROM retention_executions re WHERE re.policy_id = rp.id)
+		FROM retention_policies rp ORDER BY rp.id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := cluster.RetentionLocalRows{Policies: []cluster.RetentionLocalRow{}}
+	for rows.Next() {
+		var r cluster.RetentionLocalRow
+		var measurement sql.NullString
+		var buffer sql.NullInt64
+		var active sql.NullBool
+		var created, updated sql.NullTime
+		if err := rows.Scan(&r.ID, &r.Name, &r.Database, &measurement, &r.RetentionDays, &buffer, &active,
+			&created, &updated, &r.Executions); err != nil {
+			// Not skipped: a row missing from the answer would be dropped
+			// by the adoption.
+			return nil, fmt.Errorf("read retention policy row: %w", err)
+		}
+		if measurement.Valid && measurement.String != "" {
+			m := measurement.String
+			r.Measurement = &m
+		}
+		r.BufferDays = int(buffer.Int64)
+		r.IsActive = active.Valid && active.Bool
+		r.CreatedAt, r.UpdatedAt = created.Time.UTC(), updated.Time.UTC()
+		out.Policies = append(out.Policies, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(out.Policies) > raft.MaxSeedRetentionPolicies {
+		return nil, fmt.Errorf("%d retention policies exceed the %d the cluster adopts", len(out.Policies), raft.MaxSeedRetentionPolicies)
+	}
+	return json.Marshal(out)
 }
 
 // MirrorClusterPolicies makes this node's own table equal the cluster's

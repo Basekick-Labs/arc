@@ -51,6 +51,8 @@ var (
 	// policyReplyBudget bounds the rows one answer carries (under the
 	// protocol's frame cap).
 	policyReplyBudget = 900 * 1024
+	// policyMirrorRetry spaces a failed mirror's next attempt.
+	policyMirrorRetry = 5 * time.Second
 )
 
 // policyKinds are the kinds this build adopts, in order.
@@ -263,6 +265,10 @@ func (c *Coordinator) maybeSeedPolicies(ctx context.Context) {
 	if fsm == nil || !fsm.ClusterPoliciesEnabled() || !c.raftNode.IsLeader() || c.localNode == nil {
 		return
 	}
+	// One pass at a time: two would replace each other's collects, and one
+	// could end the admin's choice the other was about to act on.
+	c.adoptMu.Lock()
+	defer c.adoptMu.Unlock()
 	for _, kind := range policyKinds {
 		if !c.policyKindActive(kind) || fsm.PoliciesSeeded(kind) {
 			continue
@@ -379,7 +385,12 @@ func (c *Coordinator) adoptPolicies(ctx context.Context, kind string) error {
 		}
 	}
 	if lastError != "" {
-		if _, err := c.proposeLeader(raft.CommandAwaitAdoption, raft.AwaitAdoptionPayload{Kind: kind, Epoch: epoch, Missing: missing, LastError: lastError, Now: time.Now().UTC()}); err != nil {
+		await := raft.AwaitAdoptionPayload{Kind: kind, Epoch: epoch, Missing: missing, LastError: lastError, Now: time.Now().UTC()}
+		if choice != nil {
+			// This attempt acted on the admin's choice: it ends it.
+			await.ChoiceNode, await.ChoiceHash = choice.Node, choice.Hash
+		}
+		if _, err := c.proposeLeader(raft.CommandAwaitAdoption, await); err != nil {
 			return fmt.Errorf("close collect: %w", err)
 		}
 		return fmt.Errorf("%s %v", lastError, missing)

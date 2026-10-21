@@ -25,8 +25,10 @@ func (h *ClusterHandler) clusterPoliciesError(c *fiber.Ctx, err error) error {
 	case errors.Is(err, cluster.ErrNotLeaderForTopology):
 		status = fiber.StatusConflict
 		msg = "run this on the Raft leader"
-	case errors.Is(err, cluster.ErrPolicyAdoptionNotNeeded):
+	case errors.Is(err, cluster.ErrPolicyAdoptionNotNeeded), errors.Is(err, cluster.ErrRetentionPoliciesNotEnabled):
 		status = fiber.StatusConflict
+	case errors.Is(err, cluster.ErrUnknownPolicyNode):
+		status = fiber.StatusBadRequest
 	}
 	return c.Status(status).JSON(fiber.Map{"success": false, "error": msg, "leader": h.coordinator.LeaderID()})
 }

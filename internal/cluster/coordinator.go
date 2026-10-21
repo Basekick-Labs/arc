@@ -151,8 +151,10 @@ type Coordinator struct {
 	clusterPolicies clusterPoliciesGate
 	// retentionPolicies: the same for retention's own flag (#1324 stage 2).
 	retentionPolicies clusterPoliciesGate
-	policyListersMu   sync.Mutex
-	policyListers     map[string]LocalPolicyLister
+	// adoptMu serializes adoption passes: the loop's and an admin's nudge.
+	adoptMu         sync.Mutex
+	policyListersMu sync.Mutex
+	policyListers   map[string]LocalPolicyLister
 	// staged: the staged compaction commit, replica side (#1207 d2a2a).
 	staged               stagedReplica
 	repair               manifestRepairState // shared object store manifest repair (#1207)

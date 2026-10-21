@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster/protocol"
 
@@ -165,6 +166,8 @@ func (c *Coordinator) RunPolicyMirror(kind string, mirror func(ctx context.Conte
 			}
 			if err := mirror(ctx); err != nil {
 				c.logger.Warn().Err(err).Str("kind", kind).Msg("Could not mirror the cluster's policies into this node's database; a backup taken now may carry older ones")
+				// Try again without waiting for the next policy change.
+				time.AfterFunc(policyMirrorRetry, notify)
 			}
 		}
 	}()

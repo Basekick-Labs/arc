@@ -4051,9 +4051,10 @@ func main() {
 	} else {
 		log.Info().Msg("Retention policies DISABLED")
 		if clusterCoordinator != nil {
-			// A node that runs no retention holds no policies the cluster
-			// should adopt: its rows never ran here.
-			clusterCoordinator.SetLocalPolicyLister(clusterraft.PolicyKindRetention, cluster.EmptyPolicyLister)
+			// Retention runs nothing here, but this node's database may
+			// still hold the policies of when it did: they count in the
+			// cluster's adoption (their IDs above all).
+			clusterCoordinator.SetLocalPolicyLister(clusterraft.PolicyKindRetention, api.RetentionTableLister(authManager, cfg.Retention.DBPath))
 		}
 	}
 

@@ -313,3 +313,46 @@ func TestAdoptRetention_NotBeforeItsFlag(t *testing.T) {
 		t.Fatal("tiering did not seed")
 	}
 }
+
+// Adoption passes run one at a time: an admin's nudge waits for the loop's
+// pass instead of racing it.
+func TestAdoptionPassesAreSerialized(t *testing.T) {
+	r := newAdoptRig(t)
+	r.leader.adoptMu.Lock()
+	done := make(chan struct{})
+	go func() { r.leader.maybeSeedPolicies(context.Background()); close(done) }()
+	select {
+	case <-done:
+		r.leader.adoptMu.Unlock()
+		t.Fatal("a second adoption pass ran while one held the lock")
+	case <-time.After(300 * time.Millisecond):
+	}
+	r.leader.adoptMu.Unlock()
+	<-done
+	if err := r.leader.ChooseRetentionAdoption("nope", "h", "admin"); !errors.Is(err, ErrRetentionPoliciesNotEnabled) {
+		t.Fatalf("choice before the retention flag: %v", err)
+	}
+	r.enableRetention(t, map[string]*RetentionLocalRows{"L": {}, "F": {Policies: []RetentionLocalRow{rrow(1, "p", 9, true, 0)}}})
+	if err := r.leader.ChooseRetentionAdoption("nope", "h", "admin"); !errors.Is(err, ErrUnknownPolicyNode) {
+		t.Fatalf("choice of an unknown node: %v", err)
+	}
+}
+
+// A mirror that fails is tried again without waiting for a policy change.
+func TestRunPolicyMirrorRetriesAfterAnError(t *testing.T) {
+	prev := policyMirrorRetry
+	policyMirrorRetry = 20 * time.Millisecond
+	t.Cleanup(func() { policyMirrorRetry = prev })
+	r := newAdoptRig(t)
+	var calls atomic.Int32
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.follower.ctx = ctx
+	r.follower.RunPolicyMirror("retention", func(context.Context) error {
+		if calls.Add(1) < 3 {
+			return errors.New("database is locked")
+		}
+		return nil
+	})
+	waitFor(t, 5*time.Second, func() bool { return calls.Load() >= 3 }, "the failed mirror was never retried")
+}

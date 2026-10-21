@@ -344,6 +344,12 @@ func planRetentionSeed(perNode map[string]RetentionLocalRows, choice *raft.Polic
 // ErrPolicyAdoptionNotNeeded: an adoption choice for a kind already seeded.
 var ErrPolicyAdoptionNotNeeded = errors.New("the cluster already holds these policies")
 
+// ErrRetentionPoliciesNotEnabled: cluster-wide retention is not on yet.
+var ErrRetentionPoliciesNotEnabled = errors.New("cluster-wide retention policies are not enabled yet: every node must run a release that supports them")
+
+// ErrUnknownPolicyNode: an adoption choice naming a node not in the cluster.
+var ErrUnknownPolicyNode = errors.New("no such node in the cluster")
+
 // RetentionCandidates is GET /api/v1/cluster/policies: each node's own
 // retention policies, read live, with the hash an adoption choice names.
 type RetentionCandidates struct {
@@ -366,7 +372,7 @@ type RetentionNodeSet struct {
 func (c *Coordinator) RetentionCandidates(ctx context.Context) (RetentionCandidates, error) {
 	var out RetentionCandidates
 	if !c.policyKindActive(raft.PolicyKindRetention) {
-		return out, errors.New("cluster-wide retention policies are not enabled yet: every node must run a release that supports them")
+		return out, ErrRetentionPoliciesNotEnabled
 	}
 	if !c.raftNode.IsLeader() {
 		return out, ErrNotLeaderForTopology
@@ -404,13 +410,17 @@ func (c *Coordinator) RetentionCandidates(ctx context.Context) (RetentionCandida
 // only, so the choice never travels the peer forwarding path.
 func (c *Coordinator) ChooseRetentionAdoption(node, hash, by string) error {
 	if !c.policyKindActive(raft.PolicyKindRetention) {
-		return errors.New("cluster-wide retention policies are not enabled yet: every node must run a release that supports them")
+		return ErrRetentionPoliciesNotEnabled
 	}
 	if !c.raftNode.IsLeader() {
 		return ErrNotLeaderForTopology
 	}
-	if c.fsmOrNil().PoliciesSeeded(raft.PolicyKindRetention) {
+	fsm := c.fsmOrNil()
+	if fsm.PoliciesSeeded(raft.PolicyKindRetention) {
 		return ErrPolicyAdoptionNotNeeded
+	}
+	if _, ok := fsm.GetNode(node); !ok {
+		return fmt.Errorf("%w: %q", ErrUnknownPolicyNode, node)
 	}
 	_, err := c.proposeLeader(raft.CommandChoosePolicyAdoption, raft.ChoosePolicyAdoptionPayload{
 		Kind: raft.PolicyKindRetention, Node: node, Hash: strings.TrimSpace(hash), By: by, Now: time.Now().UTC(),

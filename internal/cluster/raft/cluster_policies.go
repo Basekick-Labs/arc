@@ -97,11 +97,16 @@ type CollectPoliciesPayload struct {
 // records an attempt that never opened one (a node unreachable before it).
 // Proposed by the leader only.
 type AwaitAdoptionPayload struct {
-	Kind      string    `json:"kind"`
-	Epoch     uint64    `json:"epoch"`
-	Missing   []string  `json:"missing,omitempty"`
-	LastError string    `json:"last_error,omitempty"`
-	Now       time.Time `json:"now"`
+	Kind      string   `json:"kind"`
+	Epoch     uint64   `json:"epoch"`
+	Missing   []string `json:"missing,omitempty"`
+	LastError string   `json:"last_error,omitempty"`
+	// ChoiceNode / ChoiceHash: the admin's choice this attempt acted on, which
+	// it ends. An attempt that did not act on a choice leaves a pending one
+	// alone (it may have been made while the attempt ran).
+	ChoiceNode string    `json:"choice_node,omitempty"`
+	ChoiceHash string    `json:"choice_hash,omitempty"`
+	Now        time.Time `json:"now"`
 }
 
 // PolicyCollect is an open collect of a kind.
@@ -433,7 +438,9 @@ func (f *ClusterFSM) applyAwaitAdoption(payload []byte) interface{} {
 	}
 	f.policyAwaiting[p.Kind] = &PolicyAwaiting{Kind: p.Kind, Missing: missing, LastError: p.LastError, Attempts: attempts, At: p.Now}
 	// An admin's choice is tried once: whatever stopped it, they look again.
-	delete(f.policyAdoptChoice, p.Kind)
+	if c, ok := f.policyAdoptChoice[p.Kind]; ok && p.ChoiceNode != "" && c.Node == p.ChoiceNode && c.Hash == p.ChoiceHash {
+		delete(f.policyAdoptChoice, p.Kind)
+	}
 	return nil
 }
 

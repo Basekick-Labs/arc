@@ -273,8 +273,11 @@ func NewRetentionHandler(storage storage.Backend, duckdb *database.DuckDB, cfg *
 		// Open SQLite database for policy metadata, with the auth database's
 		// settings: the execution history's foreign key is enforced, and a
 		// writer waits for the lock rather than failing at once (the cluster
-		// mirror writes this database in the background, #1324).
-		opened, err := sql.Open("sqlite3", cfg.DBPath+"?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=ON")
+		// mirror writes this database in the background, #1324). Transactions
+		// take the write lock when they begin: a read-then-write transaction
+		// that started deferred would fail outright, not wait, when another
+		// connection wrote in between.
+		opened, err := sql.Open("sqlite3", cfg.DBPath+dsnSep(cfg.DBPath)+"_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=ON&_txlock=immediate")
 		if err != nil {
 			return nil, fmt.Errorf("failed to open retention database: %w", err)
 		}
@@ -1470,7 +1473,9 @@ func (h *RetentionHandler) getFileMaxTimeAndRowCount(ctx context.Context, filePa
 
 // recordExecutionStart records the start of an execution
 func (h *RetentionHandler) recordExecutionStart(policyID int64, cutoffDate time.Time) int64 {
-	// The history's foreign key needs this node's row of a cluster policy.
+	// The history's foreign key needs this node's row of a cluster policy. A
+	// run of a policy deleted cluster-wide after the run read it finds no row
+	// and goes unrecorded, as a run of a policy deleted locally always did.
 	h.ensureMirrored(context.Background())
 	result, err := h.db.Exec(`
 		INSERT INTO retention_executions (policy_id, execution_time, status, cutoff_date)
