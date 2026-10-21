@@ -13,14 +13,20 @@ import (
 
 // TieringPoliciesHandler handles tiering policy API operations
 type TieringPoliciesHandler struct {
-	manager       *tiering.Manager
+	manager       tieringPolicyManager
 	authManager   *auth.AuthManager
 	licenseClient *license.Client
 	logger        zerolog.Logger
 }
 
+type tieringPolicyManager interface {
+	GetPolicies() *tiering.PolicyStore
+	CountColdFilesForDatabase(ctx context.Context, database string) (int64, error)
+	GetEffectivePolicy(ctx context.Context, database string) *tiering.EffectivePolicy
+}
+
 // NewTieringPoliciesHandler creates a new tiering policies handler
-func NewTieringPoliciesHandler(manager *tiering.Manager, authManager *auth.AuthManager, licenseClient *license.Client, logger zerolog.Logger) *TieringPoliciesHandler {
+func NewTieringPoliciesHandler(manager tieringPolicyManager, authManager *auth.AuthManager, licenseClient *license.Client, logger zerolog.Logger) *TieringPoliciesHandler {
 	return &TieringPoliciesHandler{
 		manager:       manager,
 		authManager:   authManager,
@@ -113,6 +119,25 @@ func (h *TieringPoliciesHandler) SetPolicy(c *fiber.Ctx) error {
 		HotMaxAgeDays: req.HotMaxAgeDays,
 	}
 
+	var coldFiles fiber.Map
+	if req.HotOnly {
+		// Count before the policy write so a metadata error cannot leave the
+		// policy changed while the operator receives a failed response. This is
+		// deliberately a node-local observation, not a cluster-wide total.
+		coldCount, err := h.manager.CountColdFilesForDatabase(ctx, database)
+		if err != nil {
+			h.logger.Error().Err(err).Str("database", database).Msg("Failed to count existing cold files")
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to count existing cold files",
+			})
+		}
+		coldFiles = fiber.Map{
+			"recorded_before_update": coldCount,
+			"scope":                  "node_local_metadata",
+			"note":                   "hot_only affects future tiering only; it does not restore existing cold files.",
+		}
+	}
+
 	if err := h.manager.GetPolicies().Set(ctx, policy); err != nil {
 		h.logger.Error().Err(err).Str("database", database).Msg("Failed to set tiering policy")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -125,11 +150,15 @@ func (h *TieringPoliciesHandler) SetPolicy(c *fiber.Ctx) error {
 		Bool("hot_only", req.HotOnly).
 		Msg("Tiering policy updated")
 
-	return c.Status(fiber.StatusOK).JSON(fiber.Map{
+	response := fiber.Map{
 		"message":  "Policy updated successfully",
 		"database": database,
 		"policy":   policy,
-	})
+	}
+	if req.HotOnly {
+		response["cold_files"] = coldFiles
+	}
+	return c.Status(fiber.StatusOK).JSON(response)
 }
 
 // DeletePolicy removes the custom policy for a database (reverts to global defaults)

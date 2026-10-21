@@ -762,6 +762,22 @@ func (s *MetadataStore) CountFilesInTierByDatabase(ctx context.Context, tier Tie
 	return counts, nil
 }
 
+// CountFilesInTierForDatabase counts the non-quarantined rows for one database
+// and tier. Unlike CountFilesInTierByDatabase, this avoids scanning and
+// grouping every database when a caller only needs one database's count.
+func (s *MetadataStore) CountFilesInTierForDatabase(ctx context.Context, database string, tier Tier) (int64, error) {
+	var count int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM tier_files
+		WHERE database = ? AND tier = ? AND quarantined_at IS NULL
+	`, database, string(tier)).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count files in tier for database: %w", err)
+	}
+	return count, nil
+}
+
 // GetFilesOlderThan retrieves files in a tier older than the specified age.
 // Quarantined rows are excluded: this is the migration candidate query, and a
 // quarantined file is one tiering has established it can never act on (#758).

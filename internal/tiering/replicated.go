@@ -205,6 +205,15 @@ func (m *Manager) CountColdFilesByDatabase(ctx context.Context) (map[string]int6
 	return m.metadata.CountFilesInTierByDatabase(ctx, TierCold)
 }
 
+// CountColdFilesForDatabase reports this node's non-quarantined cold rows for
+// one database. In a cluster, this is not a cluster-wide count.
+func (m *Manager) CountColdFilesForDatabase(ctx context.Context, database string) (int64, error) {
+	if m == nil || m.metadata == nil {
+		return 0, nil
+	}
+	return m.metadata.CountFilesInTierForDatabase(ctx, database, TierCold)
+}
+
 // ColdBackend is the cold-tier store, or nil when this node has none (#1086
 // stage C). It is how a backup reads cold objects and how a restore writes
 // them back. Implements backup.ColdSource together with the two below.

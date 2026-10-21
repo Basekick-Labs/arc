@@ -1247,6 +1247,15 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Setting a database to `hot_only` reports existing cold files ([#1304](https://github.com/Basekick-Labs/arc/issues/1304))
+
+The tiering-policy response now reports how many non-quarantined cold files
+this node's metadata has recorded for the database. It also clarifies that
+`hot_only` affects future tiering and does not restore files already in cold
+storage.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1311](https://github.com/Basekick-Labs/arc/pull/1311).
+
 ### Aggregates over several hours no longer return one result per hour on `/api/v1/query`
 
 Since 26.02.1, a JSON query with the database in the `x-arc-database`
