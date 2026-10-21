@@ -1450,9 +1450,11 @@ In a cluster, each node kept its own continuous queries and their
   old one, it aggregated those windows again.
 
 Continuous queries and their `last_processed_time` now live in the cluster
-state. Every node's scheduler follows them, and the primary records each run's
-window end in the cluster before that query's next run, so a new primary
-continues where the old one stopped. If the primary dies, or is
+state. Every node's scheduler follows them, and the primary flushes each run's
+output to storage and then records the window's end in the cluster before that
+query's next run, so a new primary continues where the old one stopped, and a
+recorded window's output is never only in the old primary's memory. (The
+flush before the record comes from @jallegri's #1328.) If the primary dies, or is
 demoted, after writing a run's output and before the cluster recorded its end,
 the new primary writes that one window again; a primary that cannot reach the cluster skips that query's runs
 until it can, so it never grows past one window. A standalone node is
