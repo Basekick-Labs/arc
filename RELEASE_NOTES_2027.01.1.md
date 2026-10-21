@@ -300,8 +300,8 @@ deletes data, so the leader takes them over by itself only when:
 
 - every node answers;
 - no policy name has two different definitions on two nodes;
-- every active policy has already run on some node. Inactive policies are
-  taken over as they are.
+- every active policy has already completed a run on some node since it was
+  last changed. Inactive policies are taken over as they are.
 
 A policy that never ran is never activated without an admin choosing it: it
 may have been created on a node that never runs retention.
@@ -325,10 +325,10 @@ retention ran there.
 
 When the policies are taken over:
 
-- **IDs.** Policies that all come from one node, whose IDs no other node uses,
-  keep their IDs. Otherwise every policy gets a new ID above any ID a node
-  held, and the old IDs answer `404`. An old ID never names a different
-  policy.
+- **IDs.** Policies that all come from one node keep their IDs, as long as no
+  other node ever issued those IDs. Otherwise every policy gets a new ID above
+  any ID a node held, and the old IDs answer `404`. An old ID never names a
+  different policy.
 - **The other nodes' policies.** A policy the cluster did not take over is
   moved, with its execution history, to `retention_policies_dormant` and
   `retention_executions_dormant` in that node's database. It never runs again.
@@ -336,6 +336,9 @@ When the policies are taken over:
   retention write answers `503`; retry it.
 - **History stays per node.** Execution history stays on the node that ran the
   policy. After a failover the new primary shows none until it runs it.
+- **A restarted node waits.** A node whose own table already holds the
+  cluster's policies answers retention requests with `503`, and runs nothing,
+  until it has caught up with the cluster after a restart (seconds).
 - **Backups carry them.** Every node that runs retention keeps its own
   `retention_policies` table equal to the cluster's policies.
 
