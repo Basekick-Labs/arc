@@ -351,6 +351,31 @@ A retention database of its own (`retention.db_path` set to a file other
 than the auth database) now opens like the auth database: foreign keys on,
 WAL journal, and a 5-second busy timeout.
 
+## Upgrade note: cluster-wide continuous queries ([#1324](https://github.com/Basekick-Labs/arc/issues/1324))
+
+Continuous queries have their own flag, `cluster_policies.cq_enabled` in
+`GET /api/v1/cluster`, turned on by the cluster once every node runs this
+release (the leader's `cq_blocking_nodes` names the rest). Like the other
+policy flags it stays on: roll back the whole cluster, never one node in place.
+
+Then the leader reads every node's own continuous queries and takes them over
+by itself when every node answers, no name has two definitions, and every
+active query has completed a run on some node. Each query keeps the newest
+`last_processed_time` any node holds for the same definition. Otherwise
+nothing changes until an admin chooses a node's queries, with the same
+endpoints as retention: `GET /api/v1/cluster/policies?kind=cq` and
+`POST /api/v1/cluster/policies/adopt` with `"kind": "cq"`. IDs, dormant tables
+(`continuous_queries_dormant`, `continuous_query_executions_dormant`), the
+`503` while the queries are read, and a restarted node's wait work as for
+retention policies.
+
+Each run of a continuous query on the primary now writes one Raft entry, its
+window's end.
+
+A continuous query database of its own (`continuous_query.db_path` set to a
+file other than the auth database) now opens like the auth database: foreign
+keys on, WAL journal, and a 5-second busy timeout.
+
 ## Upgrade note: the live WAL replication stream is removed ([#888](https://github.com/Basekick-Labs/arc/issues/888), [#1181](https://github.com/Basekick-Labs/arc/issues/1181))
 
 This applies to clusters where readers or compactors run with both
@@ -1408,6 +1433,32 @@ Status codes for `POST`, `PUT` and `DELETE /api/v1/retention`:
 | `400` | The policy is invalid (including a name, database or measurement longer than 256 bytes), its name is taken, or `retention_days` is not greater than `buffer_days`. |
 | `404` | No such policy. |
 | `503` | The cluster cannot take the write right now (no leader, or the policies are being taken over). Retry. |
+
+### A continuous query created on any node runs, and continues across a failover ([#1324](https://github.com/Basekick-Labs/arc/issues/1324))
+
+In a cluster, each node kept its own continuous queries and their
+`last_processed_time`, while only the primary writer runs them. So:
+
+- A query created on any node other than the primary answered `201` but never
+  ran. An update made on another node never reached the primary's schedule.
+- After a failover the new primary ran only its own queries, from its own
+  `last_processed_time`. With none, its first run covered only the last hour,
+  and the data since the old primary's last run was never aggregated. With an
+  old one, it aggregated those windows again.
+
+Continuous queries and their `last_processed_time` now live in the cluster
+state. Every node's scheduler follows them, and the primary records each run's
+window end in the cluster before that query's next run, so a new primary
+continues where the old one stopped. If the primary dies after writing a run's
+output and before the cluster recorded its end, the new primary writes that one
+window again; a primary that cannot reach the cluster skips that query's runs
+until it can, so it never grows past one window. A standalone node is
+unchanged.
+
+A manual `POST /api/v1/continuous_queries/{id}/execute` with an `end_time` more
+than a minute in the future now answers `400`. The run's end becomes
+`last_processed_time`, and a future one made every later run fail until the
+clock caught up.
 
 ### Aggregates over several hours no longer return one result per hour on `/api/v1/query`
 
