@@ -5739,8 +5739,9 @@ func (g icebergWriterGate) CanRun() bool { return g.inner.CanCompact() }
 //   - Shared storage (S3, Azure, MinIO): one node sweeps the bucket. Both
 //     halves gate on IsActiveCompactor — reuses the failover-managed
 //     compactor lease as a single-sweeper election with no new state.
-//     Without compactor failover nothing assigns that lease, so no node
-//     reconciles; reconciliationStartupWarnings says so at startup.
+//     Without compactor failover nothing assigns or moves that lease, so
+//     unless one is already held no node reconciles;
+//     reconciliationStartupWarnings says so at startup.
 //     Shared is decided from the BUILT backend (cluster.IsSharedObjectStore),
 //     the predicate the pending-registration publisher uses, never from the
 //     config spelling: a string list missed "azblob" and ran every node of
@@ -5804,7 +5805,7 @@ func newReconciliationTopology(c reconciliationGateCoordinator, backend storage.
 func reconciliationStartupWarnings(shared, replicationEnabled, catchUpEnabled, hasCompactorFailover bool) []string {
 	var out []string
 	if shared && !hasCompactorFailover {
-		out = append(out, "reconciliation is enabled on shared storage, where it runs only on the node holding the compactor lease, and this cluster has no compactor failover to assign one: no node will reconcile. Enable cluster.failover_enabled (requires the writer_failover licence feature).")
+		out = append(out, "reconciliation is enabled on shared storage, where it runs only on the node holding the compactor lease, and this node runs no compactor failover to assign or move that lease. Unless a lease is already held from an earlier failover-enabled run, no node will reconcile. Compactor failover needs cluster.failover_enabled, a Raft data directory and the writer_failover licence feature.")
 	}
 	if !shared && replicationEnabled && !catchUpEnabled {
 		out = append(out, "cluster.replication_catchup_enabled=false: the reconciler's orphan-manifest sweep is not held until file replication has converged on this node, and a node restored with an empty data disk does not pull back the files it originated. Keep reconciliation in dry run after such a restore, or re-enable the catch-up walker.")

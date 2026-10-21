@@ -1392,15 +1392,19 @@ With `reconciliation.manifest_only_dry_run = false`, several nodes could delete
 from the container without that check.
 
 The reconciler now decides from the backend Arc actually built, using the same
-rule as the rest of the cluster code. An `azblob` cluster is reconciled exactly
+rule as the pending-registration publisher. An `azblob` cluster is reconciled exactly
 like an `azure` one. Runs, `GET /api/v1/reconciliation/status` and audit events
-now report `backend_kind: "shared"` instead of `"local"`.
+now report `backend_kind: "shared"` instead of `"local"`. During a rolling
+upgrade, nodes still on the old version keep sweeping as before. Keep
+`reconciliation.manifest_only_dry_run = true` until every node is upgraded.
 
 On shared storage, reconciliation runs only on the node that holds the
-compactor lease. Only compactor failover (`cluster.failover_enabled = true`,
-with the `writer_failover` licence feature) assigns that lease. Without it no
-node reconciles, on `s3`, `minio`, `azure` or `azblob`. Until now that showed
-only in debug logs; Arc now logs a warning at startup. An `azblob` cluster
+compactor lease. Compactor failover (`cluster.failover_enabled = true`, a Raft
+data directory and the `writer_failover` licence feature) is what assigns
+that lease and moves it off a failed node. Without it, no node reconciles on
+`s3`, `minio`, `azure` or `azblob`, unless a lease is still held from an
+earlier failover-enabled run. Until now that showed only in debug logs; a node
+without compactor failover now logs a warning at startup. An `azblob` cluster
 without failover moves from "every node reconciles" to "no node reconciles".
 Enable compactor failover to keep reconciliation running.
 

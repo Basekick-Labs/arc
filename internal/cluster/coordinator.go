@@ -4199,7 +4199,8 @@ func (c *Coordinator) GetActiveCompactorID() string {
 }
 
 // HasCompactorFailover reports whether this node runs the compactor failover
-// manager, the only thing that assigns the compactor lease when none is held.
+// manager. Without it nothing assigns a first compactor lease or moves one
+// off a failed node; a lease already in the FSM stays where it is.
 func (c *Coordinator) HasCompactorFailover() bool {
 	return c.compactorFailoverMgr != nil
 }
