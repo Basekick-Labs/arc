@@ -1009,6 +1009,43 @@ func (s *MetadataStore) UpdateTier(ctx context.Context, path string, newTier Tie
 	return nil
 }
 
+// UpdateTierIfCurrent changes a row only if it still has expectedTier. It is
+// used by cleanup paths whose object-store action is based on a metadata
+// snapshot; a concurrent migration must be able to invalidate that decision.
+func (s *MetadataStore) UpdateTierIfCurrent(ctx context.Context, path string, expectedTier, newTier Tier) (bool, error) {
+	var database, measurement string
+	lookupQuery := `SELECT database, measurement FROM tier_files WHERE path = ?`
+	err := s.db.QueryRowContext(ctx, lookupQuery, path).Scan(&database, &measurement)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("failed to load file metadata before conditional tier update: %w", err)
+	}
+
+	var migratedAt any
+	if newTier == TierCold {
+		migratedAt = time.Now().UTC()
+	}
+	query := `
+		UPDATE tier_files
+		SET tier = ?, migrated_at = ?
+		WHERE path = ? AND tier = ? AND quarantined_at IS NULL
+	`
+	result, err := s.db.ExecContext(ctx, query, string(newTier), migratedAt, path, string(expectedTier))
+	if err != nil {
+		return false, fmt.Errorf("failed to conditionally update tier: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to read conditional tier update result: %w", err)
+	}
+	if rows == 0 {
+		return false, nil
+	}
+	if database != "" && measurement != "" {
+		s.invalidateTierCache(database, measurement)
+	}
+	return true, nil
+}
+
 // DeleteFile removes a file from the metadata store
 func (s *MetadataStore) DeleteFile(ctx context.Context, path string) error {
 	// Get database/measurement for cache invalidation before delete
@@ -1375,6 +1412,51 @@ func (s *MetadataStore) GetRecentMigrations(ctx context.Context, limit int) ([]M
 	}
 
 	return records, nil
+}
+
+// GetLatestMigrationForFile returns the most recently started migration for a
+// path. Tiering uses it to distinguish a cold object left by a failed
+// migration from an unrelated cold object at the same key.
+func (s *MetadataStore) GetLatestMigrationForFile(ctx context.Context, path string) (*MigrationRecord, error) {
+	query := `
+		SELECT id, file_path, database, from_tier, to_tier, size_bytes, started_at, completed_at, error
+		FROM tier_migrations
+		WHERE file_path = ?
+		ORDER BY started_at DESC, id DESC
+		LIMIT 1
+	`
+
+	var record MigrationRecord
+	var fromTier, toTier string
+	var completedAt sql.NullTime
+	var errorMsg sql.NullString
+	err := s.db.QueryRowContext(ctx, query, path).Scan(
+		&record.ID,
+		&record.FilePath,
+		&record.Database,
+		&fromTier,
+		&toTier,
+		&record.SizeBytes,
+		&record.StartedAt,
+		&completedAt,
+		&errorMsg,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get latest migration for %q: %w", path, err)
+	}
+
+	record.FromTier = TierFromString(fromTier)
+	record.ToTier = TierFromString(toTier)
+	if completedAt.Valid {
+		record.CompletedAt = &completedAt.Time
+	}
+	if errorMsg.Valid {
+		record.Error = errorMsg.String
+	}
+	return &record, nil
 }
 
 // CleanupOldMigrations deletes migration records older than retentionDays.
