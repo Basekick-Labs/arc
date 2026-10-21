@@ -183,7 +183,7 @@ func TestAdoptPolicies_SeedsFromEveryNode(t *testing.T) {
 			t.Errorf("%s: db2 = %+v (a policy only the follower held was dropped)", name, eff)
 		}
 	}
-	if st := r.leader.ClusterPoliciesStatus().Kinds[raft.PolicyKindTiering]; !st.Seeded || st.Collecting || len(st.Missing) != 0 {
+	if st := r.leader.ClusterPoliciesStatus().Kinds[raft.PolicyKindTiering]; !st.Seeded || st.Collecting || len(st.Missing) != 0 || st.LastTry != nil {
 		t.Fatalf("status = %+v", st)
 	}
 }

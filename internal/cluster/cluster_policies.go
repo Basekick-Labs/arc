@@ -127,12 +127,12 @@ type ClusterPoliciesStatus struct {
 // collecting (local writes refused for seconds), or awaiting adoption with
 // the nodes that did not answer the last collect.
 type PolicyKindStatus struct {
-	Seeded     bool      `json:"seeded"`
-	Collecting bool      `json:"collecting,omitempty"`
-	Missing    []string  `json:"missing_nodes,omitempty"`
-	LastError  string    `json:"last_error,omitempty"`
-	Attempts   int       `json:"failed_attempts,omitempty"`
-	LastTry    time.Time `json:"last_attempt,omitempty"`
+	Seeded     bool       `json:"seeded"`
+	Collecting bool       `json:"collecting,omitempty"`
+	Missing    []string   `json:"missing_nodes,omitempty"`
+	LastError  string     `json:"last_error,omitempty"`
+	Attempts   int        `json:"failed_attempts,omitempty"`
+	LastTry    *time.Time `json:"last_attempt,omitempty"`
 }
 
 // ClusterPoliciesStatus reports the flag and, on the leader, the nodes keeping
@@ -152,7 +152,8 @@ func (c *Coordinator) ClusterPoliciesStatus() ClusterPoliciesStatus {
 			k := PolicyKindStatus{Seeded: fsm.PoliciesSeeded(kind)}
 			_, k.Collecting = fsm.PolicyCollecting(kind)
 			if a, ok := fsm.PolicyAwaitingAdoption(kind); ok {
-				k.Missing, k.LastError, k.Attempts, k.LastTry = a.Missing, a.LastError, a.Attempts, a.At
+				at := a.At
+				k.Missing, k.LastError, k.Attempts, k.LastTry = a.Missing, a.LastError, a.Attempts, &at
 			}
 			st.Kinds[kind] = k
 		}
