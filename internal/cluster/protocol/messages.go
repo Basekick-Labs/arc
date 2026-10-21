@@ -459,6 +459,13 @@ type ForwardApplyRequest struct {
 	Nonce       string `json:"nonce"`
 	Timestamp   int64  `json:"timestamp"`
 	HMAC        string `json:"hmac"`
+	// WantIndex asks the leader for the applied command's log index in the
+	// ack, so the requester can wait until its own FSM has applied it
+	// (#1324). Sent only once cluster policies are enabled, which means every
+	// node understands it. Not covered by the request MAC: flipping it only
+	// makes the ack fail validation, which an on-path attacker can cause by
+	// dropping the ack anyway.
+	WantIndex bool `json:"want_index,omitempty"`
 }
 
 // ForwardApplyAck is the leader's response. Status="ok" means the Raft
@@ -473,6 +480,9 @@ type ForwardApplyAck struct {
 	Status string           `json:"status"`          // "ok" or "error"
 	Code   ForwardApplyCode `json:"code,omitempty"`  // machine-readable error category
 	Error  string           `json:"error,omitempty"` // human-readable detail
+	// Index is the applied command's log index, on a success ack to a
+	// request with WantIndex (#1324). Signed when present.
+	Index uint64 `json:"index,omitempty"`
 	// Authentication (present when shared_secret is configured). Signed by
 	// the responder over the REQUEST's nonce plus every field above, so the
 	// requester validates with the nonce it generated and needs no nonce
