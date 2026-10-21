@@ -56,12 +56,14 @@ var (
 )
 
 // policyKinds are the kinds this build adopts, in order.
-var policyKinds = []string{raft.PolicyKindTiering, raft.PolicyKindRetention}
+var policyKinds = []string{raft.PolicyKindTiering, raft.PolicyKindRetention, raft.PolicyKindCQ}
 
 // probesFirst reports kinds whose merge can refuse the rows (retention): the
 // leader reads every node's rows with a read-only probe first and opens a
 // collect, with its window of refused writes, only when the merge would seed.
-func probesFirst(kind string) bool { return kind == raft.PolicyKindRetention }
+func probesFirst(kind string) bool {
+	return kind == raft.PolicyKindRetention || kind == raft.PolicyKindCQ
+}
 
 // EmptyPolicyLister answers that this node holds no policies of a kind: for a
 // node that does not run it (tiering disabled).
@@ -354,6 +356,11 @@ func (c *Coordinator) adoptPolicies(ctx context.Context, kind string) error {
 		why := ""
 		if len(missing) > 0 {
 			why = "no answer to the probe"
+		} else if kind == raft.PolicyKindCQ {
+			_, err := mergeCQAnswers(rows, nil)
+			if err != nil {
+				why = err.Error()
+			}
 		} else if _, err := mergePolicyAnswers(kind, rows, nil); err != nil {
 			why = err.Error()
 		}
@@ -374,11 +381,16 @@ func (c *Coordinator) adoptPolicies(ctx context.Context, kind string) error {
 		c.logger.Warn().Err(answers[id].err).Str("kind", kind).Str("node_id", id).Msg("Policy collect: no answer from node")
 	}
 	var seed raft.SeedPoliciesPayload
+	var cqSeed raft.SeedCQPayload
 	lastError := ""
 	if len(missing) > 0 {
 		lastError = "no answer to the collect"
 	} else {
-		seed, err = mergePolicyAnswers(kind, rows, choice)
+		if kind == raft.PolicyKindCQ {
+			cqSeed, err = mergeCQAnswers(rows, choice)
+		} else {
+			seed, err = mergePolicyAnswers(kind, rows, choice)
+		}
 		if err != nil {
 			c.logger.Warn().Err(err).Str("kind", kind).Msg("Policy collect: the nodes' policies cannot be merged")
 			lastError = "merge: " + err.Error()
@@ -396,10 +408,21 @@ func (c *Coordinator) adoptPolicies(ctx context.Context, kind string) error {
 		return fmt.Errorf("%s %v", lastError, missing)
 	}
 	seed.Kind, seed.Epoch, seed.Now = kind, epoch, time.Now().UTC()
-	if _, err := c.proposeLeader(raft.CommandSeedPolicies, seed); err != nil {
-		return fmt.Errorf("seed: %w", err)
+	var seedErr error
+	if kind == raft.PolicyKindCQ {
+		cqSeed.Epoch, cqSeed.Now = epoch, time.Now().UTC()
+		_, seedErr = c.proposeLeader(raft.CommandSeedCQ, cqSeed)
+	} else {
+		_, seedErr = c.proposeLeader(raft.CommandSeedPolicies, seed)
 	}
-	ev := c.logger.Info().Str("kind", kind).Int("nodes", len(answers)).Int("policies", len(seed.Tiering)+len(seed.Retention))
+	if seedErr != nil {
+		return fmt.Errorf("seed: %w", seedErr)
+	}
+	count := len(seed.Tiering) + len(seed.Retention)
+	if kind == raft.PolicyKindCQ {
+		count = len(cqSeed.Entries)
+	}
+	ev := c.logger.Info().Str("kind", kind).Int("nodes", len(answers)).Int("policies", count)
 	if choice != nil {
 		ev = ev.Str("chosen_node", choice.Node).Str("chosen_by", choice.By)
 	}

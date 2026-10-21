@@ -4159,7 +4159,10 @@ func main() {
 
 	// Register Continuous Query handler
 	var cqHandler *api.ContinuousQueryHandler
-	if cfg.ContinuousQuery.Enabled {
+	// A cluster node still needs a CQ inventory reader and a local mirror when
+	// its scheduler/API feature is disabled. Otherwise it advertises the Raft
+	// capability but cannot participate in safe local-policy adoption.
+	if cfg.ContinuousQuery.Enabled || clusterCoordinator != nil {
 		var err error
 		cqHandler, err = api.NewContinuousQueryHandler(db, storageBackend, arrowBuffer, &cfg.ContinuousQuery, authManager, logger.Get("cq"))
 		if err == nil {
@@ -4170,12 +4173,21 @@ func main() {
 		}
 		if clusterCoordinator != nil {
 			cqHandler.SetCoordinator(clusterCoordinator)
+			cqHandler.SetClusterSource(clusterCoordinator)
+			clusterCoordinator.SetLocalPolicyLister(clusterraft.PolicyKindCQ, cqHandler.LocalPolicyLister)
+			clusterCoordinator.RunPolicyMirror(clusterraft.PolicyKindCQ, cqHandler.MirrorClusterCQs)
 		}
-		cqHandler.RegisterRoutes(server.GetApp())
+		if cfg.ContinuousQuery.Enabled {
+			cqHandler.RegisterRoutes(server.GetApp())
+		}
 		shutdownCoordinator.RegisterHook("continuous-query", func(ctx context.Context) error {
 			return cqHandler.Close()
 		}, shutdown.PriorityDatabase)
-		log.Info().Str("db_path", cfg.ContinuousQuery.DBPath).Msg("Continuous queries enabled")
+		if cfg.ContinuousQuery.Enabled {
+			log.Info().Str("db_path", cfg.ContinuousQuery.DBPath).Msg("Continuous queries enabled")
+		} else {
+			log.Info().Msg("Continuous queries disabled; cluster inventory/mirror remains active")
+		}
 	} else {
 		log.Info().Msg("Continuous queries DISABLED")
 	}

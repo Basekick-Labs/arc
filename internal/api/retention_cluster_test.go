@@ -429,7 +429,7 @@ func TestAdoptPoliciesEndpointValidates(t *testing.T) {
 	h := NewClusterHandler(&cluster.Coordinator{}, nil, nil, zerolog.Nop())
 	app := fiber.New()
 	h.RegisterRoutes(app)
-	for _, body := range []string{`{"kind":"tiering","node":"a","hash":"h"}`, `{"kind":"retention","hash":"h"}`, `{"kind":"retention","node":"a"}`, `nope`} {
+	for _, body := range []string{`{"kind":"tiering","node":"a","hash":"h"}`, `{"kind":"continuous_queries","node":"a"}`, `{"kind":"retention","hash":"h"}`, `{"kind":"retention","node":"a"}`, `nope`} {
 		req := httptest.NewRequest("POST", "/api/v1/cluster/policies/adopt", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := app.Test(req, -1)
@@ -439,6 +439,21 @@ func TestAdoptPoliciesEndpointValidates(t *testing.T) {
 		if resp.StatusCode != fiber.StatusBadRequest {
 			t.Fatalf("%s: %d", body, resp.StatusCode)
 		}
+	}
+}
+
+func TestCQAdoptionCandidatesRouteIsRecognized(t *testing.T) {
+	h := NewClusterHandler(&cluster.Coordinator{}, nil, nil, zerolog.Nop())
+	app := fiber.New()
+	h.RegisterRoutes(app)
+	req := httptest.NewRequest("GET", "/api/v1/cluster/policies?kind=continuous_queries", nil)
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != fiber.StatusConflict {
+		t.Fatalf("CQ candidates status=%d, want conflict while the cluster CQ flag is off", resp.StatusCode)
 	}
 }
 

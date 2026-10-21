@@ -84,6 +84,9 @@ func (c *Coordinator) policyKindActive(kind string) bool {
 	if kind == raft.PolicyKindRetention {
 		return fsm.RetentionPoliciesEnabled()
 	}
+	if kind == raft.PolicyKindCQ {
+		return fsm.CQEnabled()
+	}
 	return true
 }
 

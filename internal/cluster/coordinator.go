@@ -151,6 +151,8 @@ type Coordinator struct {
 	clusterPolicies clusterPoliciesGate
 	// retentionPolicies: the same for retention's own flag (#1324 stage 2).
 	retentionPolicies clusterPoliciesGate
+	// cqPolicies gates activation and joins for CQ state (#1324 stage 3).
+	cqPolicies clusterPoliciesGate
 	// adoptMu serializes adoption passes: the loop's and an admin's nudge.
 	adoptMu         sync.Mutex
 	policyListersMu sync.Mutex

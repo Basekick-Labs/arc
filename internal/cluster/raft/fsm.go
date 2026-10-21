@@ -226,6 +226,13 @@ const (
 	// CommandChoosePolicyAdoption: an admin choosing the node whose policies
 	// of a kind the cluster adopts. Leader only.
 	CommandChoosePolicyAdoption
+	// Continuous query definitions and durable watermarks (#1324 stage 3).
+	CommandEnableCQ
+	CommandSeedCQ
+	CommandCreateCQ
+	CommandUpdateCQ
+	CommandDeleteCQ
+	CommandCompleteCQ
 )
 
 // Command represents a command to be applied to the FSM.
@@ -583,6 +590,7 @@ type RotateTokenPayload struct {
 type FSMSnapshot struct {
 	Nodes             map[string]*NodeInfo  `json:"nodes"`
 	PrimaryWriterID   string                `json:"primary_writer_id,omitempty"`
+	PrimaryEpoch      uint64                `json:"primary_epoch,omitempty"`
 	ActiveCompactorID string                `json:"active_compactor_id,omitempty"`
 	Files             map[string]*FileEntry `json:"files,omitempty"`  // File manifest (peer replication)
 	Tokens            map[int64]*TokenEntry `json:"tokens,omitempty"` // Cluster-wide auth tokens (Phase A)
@@ -816,6 +824,14 @@ type ClusterFSM struct {
 	retentionSeq       int64
 	retentionFloor     int64
 	retentionSeededIDs map[int64]bool
+	// Continuous queries (#1324 stage 3); absent from older snapshots.
+	cqEnabled    bool
+	cqSeeded     bool
+	cqPolicies   map[int64]*CQPolicyEntry
+	cqSeq        int64
+	cqFloor      int64
+	cqSeededIDs  map[int64]bool
+	primaryEpoch uint64
 	// policyAdoptChoice: an admin's pending choice of node, per kind.
 	policyAdoptChoice map[string]*PolicyAdoptChoice
 	// onPoliciesChanged: AddPoliciesChangedCallback.
@@ -914,6 +930,8 @@ func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 		policyAwaiting:          map[string]*PolicyAwaiting{},
 		retentionPolicies:       map[int64]*RetentionPolicyEntry{},
 		retentionSeededIDs:      map[int64]bool{},
+		cqPolicies:              map[int64]*CQPolicyEntry{},
+		cqSeededIDs:             map[int64]bool{},
 		policyAdoptChoice:       map[string]*PolicyAdoptChoice{},
 
 		logger: logger.With().Str("component", "cluster-fsm").Logger(),
@@ -1208,6 +1226,9 @@ func (f *ClusterFSM) TokenCount() int {
 // setPrimaryLocked assigns the designated primary and its lock-free mirror.
 // Every assignment goes through it. Caller holds f.mu.
 func (f *ClusterFSM) setPrimaryLocked(id string) {
+	if f.primaryWriterID != id {
+		f.primaryEpoch++
+	}
 	f.primaryWriterID = id
 	f.primaryFast.Store(id)
 }
@@ -1333,6 +1354,18 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.policiesChangedIfApplied(f.applyDeleteRetentionPolicy(cmd.Payload))
 	case CommandChoosePolicyAdoption:
 		return f.applyChoosePolicyAdoption(cmd.Payload)
+	case CommandEnableCQ:
+		return f.policiesChangedIfApplied(f.applyEnableCQ(cmd.Payload))
+	case CommandSeedCQ:
+		return f.policiesChangedIfApplied(f.applySeedCQ(cmd.Payload))
+	case CommandCreateCQ:
+		return f.policiesChangedIfApplied(f.applyCreateCQ(cmd.Payload))
+	case CommandUpdateCQ:
+		return f.policiesChangedIfApplied(f.applyUpdateCQ(cmd.Payload))
+	case CommandDeleteCQ:
+		return f.policiesChangedIfApplied(f.applyDeleteCQ(cmd.Payload))
+	case CommandCompleteCQ:
+		return f.policiesChangedIfApplied(f.applyCompleteCQ(cmd.Payload))
 	case CommandDeleteFile:
 		return f.applyDeleteFile(cmd.Payload)
 	case CommandAssignCompactor:
@@ -2853,6 +2886,7 @@ func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 		barriers:               barriers,
 		compactionPause:        compactionPause,
 		primaryWriterID:        f.primaryWriterID,
+		primaryEpoch:           f.primaryEpoch,
 		activeCompactorID:      f.activeCompactorID,
 		files:                  files,
 		tokens:                 tokens,
@@ -3215,6 +3249,9 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	f.barriers = restoredBarriers
 	f.barrierOrder = restoredOrder
 	f.setPrimaryLocked(snapshot.PrimaryWriterID)
+	if snapshot.PrimaryEpoch > f.primaryEpoch {
+		f.primaryEpoch = snapshot.PrimaryEpoch
+	}
 	f.activeCompactorID = snapshot.ActiveCompactorID
 	f.files = restoredFiles
 	// Rebuild the database → files secondary index from the restored files
@@ -3587,6 +3624,7 @@ func (f *ClusterFSM) FileCount() int {
 type fsmSnapshot struct {
 	nodes             map[string]*NodeInfo
 	primaryWriterID   string
+	primaryEpoch      uint64
 	activeCompactorID string
 	files             map[string]*FileEntry
 	tokens            map[int64]*TokenEntry
@@ -3610,6 +3648,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 	snapshot := FSMSnapshot{
 		Nodes:                  s.nodes,
 		PrimaryWriterID:        s.primaryWriterID,
+		PrimaryEpoch:           s.primaryEpoch,
 		ActiveCompactorID:      s.activeCompactorID,
 		Files:                  s.files,
 		Tokens:                 s.tokens,

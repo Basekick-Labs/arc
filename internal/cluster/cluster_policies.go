@@ -49,7 +49,13 @@ func (c *Coordinator) clusterPoliciesJoinGate(req interface {
 			g.mu.Unlock()
 			return rWhy, nil
 		}
-		return "", func() { rRelease(); g.mu.Unlock() }
+		qWhy, qRelease := c.cqPoliciesJoinGate(req)
+		if qWhy != "" {
+			rRelease()
+			g.mu.Unlock()
+			return qWhy, nil
+		}
+		return "", func() { qRelease(); rRelease(); g.mu.Unlock() }
 	}
 	enabled := fsm != nil && fsm.ClusterPoliciesEnabled()
 	if !enabled && g.inFlight {
@@ -80,6 +86,7 @@ func (c *Coordinator) clusterPoliciesEnableLoop(ctx context.Context) {
 		case <-t.C:
 			c.maybeEnableClusterPolicies()
 			c.maybeEnableRetentionPolicies()
+			c.maybeEnableCQPolicies()
 			c.maybeSeedPolicies(ctx)
 		}
 	}
@@ -134,6 +141,8 @@ type ClusterPoliciesStatus struct {
 	// leader the nodes keeping it off.
 	RetentionEnabled  bool     `json:"retention_enabled"`
 	RetentionBlocking []string `json:"retention_blocking_nodes,omitempty"`
+	CQEnabled         bool     `json:"continuous_queries_enabled"`
+	CQBlocking        []string `json:"continuous_queries_blocking_nodes,omitempty"`
 }
 
 // PolicyKindStatus is one kind's adoption: seeded (the cluster holds it),
@@ -165,6 +174,10 @@ func (c *Coordinator) ClusterPoliciesStatus() ClusterPoliciesStatus {
 		st.RetentionEnabled = fsm.RetentionPoliciesEnabled()
 		if b := c.retentionPolicies.blockers.Load(); b != nil && !st.RetentionEnabled && c.raftNode.IsLeader() {
 			st.RetentionBlocking = *b
+		}
+		st.CQEnabled = fsm.CQEnabled()
+		if b := c.cqPolicies.blockers.Load(); b != nil && !st.CQEnabled && c.raftNode.IsLeader() {
+			st.CQBlocking = *b
 		}
 		st.Kinds = map[string]PolicyKindStatus{}
 		for _, kind := range policyKinds {

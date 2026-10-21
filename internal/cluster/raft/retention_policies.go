@@ -396,10 +396,10 @@ func (f *ClusterFSM) applyChoosePolicyAdoption(payload []byte) interface{} {
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return fmt.Errorf("failed to unmarshal choose policy adoption payload: %w", err)
 	}
-	// Tiering always seeds on its own (its merge never refuses): only
-	// retention waits for a choice.
-	if p.Kind != PolicyKindRetention || p.Node == "" || p.Hash == "" {
-		return fmt.Errorf("choose policy adoption: the retention kind, a node and a hash are required (kind %q)", p.Kind)
+	// Tiering always seeds on its own (its merge never refuses). Retention and
+	// continuous queries may need an explicit choice when nodes disagree.
+	if (p.Kind != PolicyKindRetention && p.Kind != PolicyKindCQ) || p.Node == "" || p.Hash == "" {
+		return fmt.Errorf("choose policy adoption: a choice-requiring kind, node and hash are required (kind %q)", p.Kind)
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()

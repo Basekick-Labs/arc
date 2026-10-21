@@ -10,10 +10,12 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/fieldschema"
@@ -43,6 +45,24 @@ type CQCoordinator interface {
 	Role() string
 }
 
+// CQClusterSource is the Raft authority once the cluster adopts CQs.
+type CQClusterSource interface {
+	CQEnabled() bool
+	CQsSeeded() bool
+	CQCollecting() bool
+	CQReadBarrier(context.Context) error
+	CQ(int64) (raft.CQPolicyEntry, bool)
+	CQByName(string) (raft.CQPolicyEntry, bool)
+	CQs() []raft.CQPolicyEntry
+	CreateCQ(context.Context, raft.CreateCQPayload) error
+	UpdateCQ(context.Context, raft.UpdateCQPayload) error
+	DeleteCQ(context.Context, raft.DeleteCQPayload) error
+	CompleteCQ(context.Context, raft.CompleteCQPayload) error
+	CQMirrorState() raft.CQMirror
+	PrimaryEpoch() uint64
+	LocalNodeID() string
+}
+
 // ContinuousQueryHandler handles continuous query operations
 type ContinuousQueryHandler struct {
 	db          *database.DuckDB
@@ -56,11 +76,18 @@ type ContinuousQueryHandler struct {
 	// ownsDB records whether this handler opened sqliteDB itself. When CQ
 	// shares the auth database (the default), the handle is borrowed and Close
 	// must leave it to its owner.
-	ownsDB      bool
-	authManager *auth.AuthManager
-	scheduler   CQSchedulerReloader
-	coordinator CQCoordinator
-	logger      zerolog.Logger
+	ownsDB           bool
+	authManager      *auth.AuthManager
+	scheduler        CQSchedulerReloader
+	coordinator      CQCoordinator
+	logger           zerolog.Logger
+	cqClusterMu      sync.RWMutex
+	cqCluster        CQClusterSource
+	cqLocalMu        sync.Mutex
+	cqMirrorMu       sync.Mutex
+	cqMirrorHash     string
+	cqExecutionLocks sync.Map // map[int64]*sync.Mutex
+	cqClusterOwned   atomic.Bool
 }
 
 // SetScheduler sets the CQ scheduler for reloading after updates.
@@ -75,9 +102,21 @@ func (h *ContinuousQueryHandler) SetCoordinator(c CQCoordinator) {
 	h.coordinator = c
 }
 
+func (h *ContinuousQueryHandler) SetClusterSource(src CQClusterSource) {
+	h.cqClusterMu.Lock()
+	h.cqCluster = src
+	h.cqClusterMu.Unlock()
+}
+func (h *ContinuousQueryHandler) clusterSource() CQClusterSource {
+	h.cqClusterMu.RLock()
+	defer h.cqClusterMu.RUnlock()
+	return h.cqCluster
+}
+
 // ContinuousQuery represents a continuous query definition
 type ContinuousQuery struct {
 	ID                     int64   `json:"id"`
+	Version                uint64  `json:"version,omitempty"`
 	Name                   string  `json:"name"`
 	Description            *string `json:"description"`
 	Database               string  `json:"database"`
@@ -420,6 +459,8 @@ func validateCQSourceMeasurement(name string) error {
 
 // handleCreate creates a new continuous query
 func (h *ContinuousQueryHandler) handleCreate(c *fiber.Ctx) error {
+	h.cqLocalMu.Lock()
+	defer h.cqLocalMu.Unlock()
 	if !h.config.Enabled {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 			"error": "Continuous queries are disabled",
@@ -460,6 +501,33 @@ func (h *ContinuousQueryHandler) handleCreate(c *fiber.Ctx) error {
 	isActive := true
 	if req.IsActive.Set {
 		isActive = req.IsActive.Value
+	}
+	clusterSource, sourceErr := h.localCQWriteSource()
+	if sourceErr != nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": sourceErr.Error()})
+	}
+	if clusterSource != nil {
+		entry := raft.CQPolicyEntry{Name: req.Name.Value, Description: req.Description.ptr(), Database: req.Database.Value, SourceMeasurement: req.SourceMeasurement.Value, DestinationMeasurement: req.DestinationMeasurement.Value, Query: req.Query.Value, Interval: req.Interval.Value, TagColumns: append([]string(nil), req.TagColumns.Value...), RetentionDays: req.RetentionDays.ptr(), DeleteSourceAfterDays: req.DeleteSourceAfterDays.ptr(), IsActive: isActive}
+		if err := raft.ValidateCQEntrySize(entry); err != nil {
+			return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": err.Error()})
+		}
+		if err := clusterSource.CreateCQ(c.UserContext(), raft.CreateCQPayload{Entry: entry}); err != nil {
+			return h.cqClusterWriteError(c, err)
+		}
+		if err := h.mirrorClusterCQs(c.UserContext()); err != nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "continuous query committed but local mirror is not ready; retry the read"})
+		}
+		e, ok := clusterSource.CQByName(req.Name.Value)
+		if !ok {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "continuous query committed but has not applied locally; retry"})
+		}
+		q := cqEntryToAPI(e)
+		if h.scheduler != nil && q.IsActive {
+			if err := h.scheduler.StartJobDirect(q.ID, q.Name, q.Interval, true); err != nil {
+				h.logger.Warn().Err(err).Int64("query_id", q.ID).Msg("Failed to start CQ job after create")
+			}
+		}
+		return c.Status(fiber.StatusCreated).JSON(q)
 	}
 
 	// Insert query
@@ -506,11 +574,17 @@ func (h *ContinuousQueryHandler) handleCreate(c *fiber.Ctx) error {
 
 // handleList returns all continuous queries
 func (h *ContinuousQueryHandler) handleList(c *fiber.Ctx) error {
+	if src := h.clusterSource(); src != nil && src.CQEnabled() && !src.CQsSeeded() {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": errCQNotCaughtUp.Error()})
+	}
 	database := c.Query("database")
 	isActiveStr := c.Query("is_active")
 
 	queries, err := h.getQueries(database, isActiveStr)
 	if err != nil {
+		if errors.Is(err, errCQNotCaughtUp) || errors.Is(err, errCQAdopting) {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+		}
 		h.logger.Error().Err(err).Msg("Failed to list continuous queries")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to list continuous queries",
@@ -522,6 +596,9 @@ func (h *ContinuousQueryHandler) handleList(c *fiber.Ctx) error {
 
 // handleGet returns a single continuous query
 func (h *ContinuousQueryHandler) handleGet(c *fiber.Ctx) error {
+	if src := h.clusterSource(); src != nil && src.CQEnabled() && !src.CQsSeeded() {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": errCQNotCaughtUp.Error()})
+	}
 	queryID, err := c.ParamsInt("id")
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid query ID"})
@@ -529,6 +606,9 @@ func (h *ContinuousQueryHandler) handleGet(c *fiber.Ctx) error {
 
 	cq, err := h.getQuery(int64(queryID))
 	if err != nil {
+		if errors.Is(err, errCQNotCaughtUp) || errors.Is(err, errCQAdopting) {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+		}
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Continuous query not found"})
 	}
 
@@ -537,6 +617,8 @@ func (h *ContinuousQueryHandler) handleGet(c *fiber.Ctx) error {
 
 // handleUpdate updates an existing continuous query
 func (h *ContinuousQueryHandler) handleUpdate(c *fiber.Ctx) error {
+	h.cqLocalMu.Lock()
+	defer h.cqLocalMu.Unlock()
 	queryID, err := c.ParamsInt("id")
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid query ID"})
@@ -596,6 +678,43 @@ func (h *ContinuousQueryHandler) handleUpdate(c *fiber.Ctx) error {
 	if len(args) == 0 {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "no fields to update"})
 	}
+	clusterSource, sourceErr := h.localCQWriteSource()
+	if sourceErr != nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": sourceErr.Error()})
+	}
+	if clusterSource != nil {
+		current, err := h.getQuery(int64(queryID))
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Continuous query not found"})
+			}
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+		}
+		entry := cqUpdatedEntry(current, &req)
+		if err := raft.ValidateCQEntrySize(entry); err != nil {
+			return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": err.Error()})
+		}
+		if err := clusterSource.UpdateCQ(c.UserContext(), raft.UpdateCQPayload{ID: int64(queryID), ExpectedVersion: current.Version, Entry: entry}); err != nil {
+			return h.cqClusterWriteError(c, err)
+		}
+		if err := h.mirrorClusterCQs(c.UserContext()); err != nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "continuous query committed but local mirror is not ready; retry the read"})
+		}
+		if h.scheduler != nil {
+			if all, ok := h.scheduler.(interface{ ReloadAll() error }); ok {
+				if err := all.ReloadAll(); err != nil {
+					h.logger.Warn().Err(err).Msg("Failed to reload CQ schedules after cluster update")
+				}
+			} else if err := h.scheduler.ReloadCQ(int64(queryID)); err != nil {
+				h.logger.Warn().Err(err).Int("query_id", queryID).Msg("Failed to reload CQ schedule after cluster update")
+			}
+		}
+		cq, err := h.getQuery(int64(queryID))
+		if err != nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "continuous query committed but is not readable yet"})
+		}
+		return c.JSON(cq)
+	}
 	result, err := h.sqliteDB.Exec(
 		"UPDATE continuous_queries SET "+assignments+", updated_at = CURRENT_TIMESTAMP WHERE id = ?",
 		append(args, queryID)...)
@@ -635,9 +754,38 @@ func (h *ContinuousQueryHandler) handleUpdate(c *fiber.Ctx) error {
 
 // handleDelete deletes a continuous query
 func (h *ContinuousQueryHandler) handleDelete(c *fiber.Ctx) error {
+	h.cqLocalMu.Lock()
+	defer h.cqLocalMu.Unlock()
 	queryID, err := c.ParamsInt("id")
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid query ID"})
+	}
+	clusterSource, sourceErr := h.localCQWriteSource()
+	if sourceErr != nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": sourceErr.Error()})
+	}
+	if clusterSource != nil {
+		current, err := h.getQuery(int64(queryID))
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Continuous query not found"})
+			}
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+		}
+		if err := clusterSource.DeleteCQ(c.UserContext(), raft.DeleteCQPayload{ID: int64(queryID), ExpectedVersion: current.Version}); err != nil {
+			return h.cqClusterWriteError(c, err)
+		}
+		if err := h.mirrorClusterCQs(c.UserContext()); err != nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "continuous query committed but local mirror is not ready; retry the read"})
+		}
+		if h.scheduler != nil {
+			if all, ok := h.scheduler.(interface{ ReloadAll() error }); ok {
+				if err := all.ReloadAll(); err != nil {
+					h.logger.Warn().Err(err).Msg("Failed to reload CQ schedules after cluster delete")
+				}
+			}
+		}
+		return c.JSON(fiber.Map{"message": "Continuous query deleted successfully"})
 	}
 
 	// Delete execution history first
@@ -665,6 +813,12 @@ func (h *ContinuousQueryHandler) handleDelete(c *fiber.Ctx) error {
 // ExecuteCQ executes a continuous query by ID programmatically (used by scheduler)
 // Returns the execution response and any error
 func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (*ExecuteCQResponse, error) {
+	if src := h.clusterSource(); src != nil {
+		if !src.CQsSeeded() {
+			return nil, errCQNotCaughtUp
+		}
+		return h.executeClusterCQ(ctx, src, queryID)
+	}
 	start := time.Now()
 
 	// Get query definition
@@ -754,6 +908,78 @@ func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (
 	}, nil
 }
 
+// executeClusterCQ runs only on the current primary writer. It captures the
+// current definition and watermark from Raft, waits for the destination's
+// buffered output to reach storage, then commits the watermark with a version
+// and primary-epoch fence.
+func (h *ContinuousQueryHandler) executeClusterCQ(ctx context.Context, src CQClusterSource, queryID int64) (*ExecuteCQResponse, error) {
+	lockValue, _ := h.cqExecutionLocks.LoadOrStore(queryID, &sync.Mutex{})
+	runLock := lockValue.(*sync.Mutex)
+	runLock.Lock()
+	defer runLock.Unlock()
+	if err := src.CQReadBarrier(ctx); err != nil {
+		return nil, fmt.Errorf("continuous query read barrier: %w", err)
+	}
+	if h.coordinator != nil && !h.coordinator.IsPrimaryWriter() {
+		return nil, fmt.Errorf("continuous query execution rejected: node role %q is not primary writer", h.coordinator.Role())
+	}
+	authorityEpoch := src.PrimaryEpoch()
+	executor := src.LocalNodeID()
+	entry, ok := src.CQ(queryID)
+	if !ok {
+		return nil, fmt.Errorf("continuous query not found")
+	}
+	cq := cqEntryToAPI(entry)
+	if !cq.IsActive {
+		return nil, fmt.Errorf("continuous query is not active")
+	}
+	start := time.Now()
+	var startTime time.Time
+	var expectedStart time.Time
+	if cq.LastProcessedTime != nil {
+		startTime, _ = time.Parse(time.RFC3339Nano, *cq.LastProcessedTime)
+		startTime = startTime.UTC()
+		expectedStart = startTime
+	} else {
+		startTime = start.UTC().Add(-time.Hour)
+	}
+	endTime := time.Now().UTC()
+	if !startTime.Before(endTime) {
+		return nil, fmt.Errorf("start_time must be before end_time")
+	}
+	executedQuery := strings.ReplaceAll(cq.Query, "{start_time}", fmt.Sprintf("'%s'", startTime.Format(time.RFC3339)))
+	executedQuery = strings.ReplaceAll(executedQuery, "{end_time}", fmt.Sprintf("'%s'", endTime.Format(time.RFC3339)))
+	executionID := fmt.Sprintf("cq-sched-%s", uuid.New().String()[:8])
+	h.logger.Info().Str("query_name", cq.Name).Str("execution_id", executionID).Time("start_time", startTime).Time("end_time", endTime).Msg("Executing cluster continuous query")
+	recordsWritten, err := h.executeAggregation(ctx, &cq, executedQuery, startTime, endTime)
+	duration := time.Since(start).Seconds()
+	if err != nil {
+		if ingest.IsWriteRefusal(err) {
+			h.logSkippedRun(cq.Name, err)
+			return nil, fmt.Errorf("execution skipped: %w", err)
+		}
+		h.recordExecution(queryID, executionID, "failed", startTime, endTime, nil, 0, duration, err.Error())
+		return nil, fmt.Errorf("execution failed: %w", err)
+	}
+	if h.arrowBuffer == nil {
+		return nil, fmt.Errorf("continuous query output buffer is not configured")
+	}
+	if _, err := h.arrowBuffer.FlushScopeAndWait(ctx, cq.Database, cq.DestinationMeasurement); err != nil {
+		h.recordExecution(queryID, executionID, "failed", startTime, endTime, nil, 0, duration, err.Error())
+		return nil, fmt.Errorf("continuous query output flush failed; watermark was not advanced: %w", err)
+	}
+	if err := src.CompleteCQ(ctx, raft.CompleteCQPayload{ID: queryID, Version: entry.Version, AuthorityEpoch: authorityEpoch, Executor: executor, ExpectedStart: expectedStart, End: endTime}); err != nil {
+		return nil, fmt.Errorf("continuous query output was flushed but its watermark fence rejected completion; retry from the stored watermark: %w", err)
+	}
+	if err := h.MirrorClusterCQs(ctx); err != nil {
+		h.logger.Warn().Err(err).Int64("query_id", queryID).Msg("CQ watermark committed but local SQLite mirror is delayed")
+	}
+	// Execution history is diagnostic and local. The Raft watermark above is
+	// the completion authority and must not depend on this SQLite write.
+	h.recordExecution(queryID, executionID, "completed", startTime, endTime, nil, recordsWritten, duration, "")
+	return &ExecuteCQResponse{QueryID: queryID, QueryName: cq.Name, ExecutionID: executionID, Status: "completed", StartTime: startTime.Format(time.RFC3339), EndTime: endTime.Format(time.RFC3339), RecordsRead: nil, RecordsWritten: recordsWritten, ExecutionTimeSeconds: duration, DestinationMeasurement: cq.DestinationMeasurement, DryRun: false, ExecutedAt: time.Now().UTC().Format(time.RFC3339)}, nil
+}
+
 // GetActiveCQs returns all active continuous queries (used by scheduler)
 func (h *ContinuousQueryHandler) GetActiveCQs() ([]ContinuousQuery, error) {
 	return h.getQueries("", "true")
@@ -785,6 +1011,21 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "Invalid request body: " + err.Error(),
 		})
+	}
+	if src := h.clusterSource(); src != nil && !src.CQsSeeded() && !req.DryRun {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": errCQNotCaughtUp.Error()})
+	}
+	if src := h.adoptedCQSource(); src != nil && !req.DryRun {
+		if (req.StartTime != nil && *req.StartTime != "") || (req.EndTime != nil && *req.EndTime != "") {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "cluster continuous queries advance only from their committed watermark; omit start_time and end_time"})
+		}
+		ctx, cancel := context.WithTimeout(c.UserContext(), 10*time.Minute)
+		defer cancel()
+		resp, err := h.ExecuteCQ(ctx, int64(queryID))
+		if err != nil {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": err.Error()})
+		}
+		return c.JSON(resp)
 	}
 
 	// Get query definition
@@ -1296,6 +1537,18 @@ func (h *ContinuousQueryHandler) handleGetExecutions(c *fiber.Ctx) error {
 
 // getQuery retrieves a single query by ID
 func (h *ContinuousQueryHandler) getQuery(queryID int64) (*ContinuousQuery, error) {
+	if src := h.adoptedCQSource(); src != nil {
+		queries, err := h.clusterQueries(src, "", "")
+		if err != nil {
+			return nil, err
+		}
+		for i := range queries {
+			if queries[i].ID == queryID {
+				return &queries[i], nil
+			}
+		}
+		return nil, sql.ErrNoRows
+	}
 	row := h.sqliteDB.QueryRow(`
 		SELECT
 			cq.id, cq.name, cq.description, cq.database, cq.source_measurement, cq.destination_measurement,
@@ -1334,6 +1587,9 @@ func (h *ContinuousQueryHandler) getQuery(queryID int64) (*ContinuousQuery, erro
 
 // getQueries retrieves all queries with optional filters
 func (h *ContinuousQueryHandler) getQueries(database, isActiveStr string) ([]ContinuousQuery, error) {
+	if src := h.adoptedCQSource(); src != nil {
+		return h.clusterQueries(src, database, isActiveStr)
+	}
 	query := `
 		SELECT
 			cq.id, cq.name, cq.description, cq.database, cq.source_measurement, cq.destination_measurement,

@@ -31,6 +31,7 @@ const CapabilityClusterPolicies = "cluster_policies_v1"
 const (
 	PolicyKindTiering   = "tiering"
 	PolicyKindRetention = "retention"
+	PolicyKindCQ        = "continuous_queries"
 )
 
 // maxPolicyDatabaseLen bounds a policy's database name.
@@ -136,7 +137,7 @@ const maxAwaitingMissing = 256
 
 // knownPolicyKind reports a kind this build can seed.
 func knownPolicyKind(kind string) bool {
-	return kind == PolicyKindTiering || kind == PolicyKindRetention
+	return kind == PolicyKindTiering || kind == PolicyKindRetention || kind == PolicyKindCQ
 }
 
 // policyKindEnabledLocked reports whether kind may be collected and seeded:
@@ -148,6 +149,9 @@ func (f *ClusterFSM) policyKindEnabledLocked(kind string) bool {
 	}
 	if kind == PolicyKindRetention {
 		return f.retentionEnabled
+	}
+	if kind == PolicyKindCQ {
+		return f.cqEnabled
 	}
 	return true
 }
@@ -181,6 +185,12 @@ type clusterPoliciesState struct {
 	RetentionSeededIDs []int64                 `json:"retention_seeded_ids,omitempty"`
 	Retention          []*RetentionPolicyEntry `json:"retention,omitempty"`
 	Choices            []*PolicyAdoptChoice    `json:"choices,omitempty"`
+	CQEnabled          bool                    `json:"cq_enabled,omitempty"`
+	CQSeeded           bool                    `json:"cq_seeded,omitempty"`
+	CQSeq              int64                   `json:"cq_seq,omitempty"`
+	CQFloor            int64                   `json:"cq_floor,omitempty"`
+	CQSeededIDs        []int64                 `json:"cq_seeded_ids,omitempty"`
+	CQPolicies         []*CQPolicyEntry        `json:"cq_policies,omitempty"`
 }
 
 // EnableClusterPoliciesPayload turns the flag on; see
@@ -537,6 +547,15 @@ func (f *ClusterFSM) snapshotClusterPoliciesLocked() *clusterPoliciesState {
 	}
 	sort.Slice(st.Awaiting, func(i, j int) bool { return st.Awaiting[i].Kind < st.Awaiting[j].Kind })
 	f.snapshotRetentionLocked(st)
+	st.CQEnabled, st.CQSeeded, st.CQSeq, st.CQFloor = f.cqEnabled, f.cqSeeded, f.cqSeq, f.cqFloor
+	for id := range f.cqSeededIDs {
+		st.CQSeededIDs = append(st.CQSeededIDs, id)
+	}
+	sort.Slice(st.CQSeededIDs, func(i, j int) bool { return st.CQSeededIDs[i] < st.CQSeededIDs[j] })
+	for _, e := range f.cqEntriesLocked() {
+		c := e
+		st.CQPolicies = append(st.CQPolicies, &c)
+	}
 	return st
 }
 
@@ -557,11 +576,23 @@ func (f *ClusterFSM) restoreClusterPoliciesLocked(st *clusterPoliciesState) {
 	f.policyCollecting = map[string]*PolicyCollect{}
 	f.policyAwaiting = map[string]*PolicyAwaiting{}
 	f.tieringPolicySeq = 0
+	f.cqEnabled, f.cqSeeded, f.cqSeq, f.cqFloor = false, false, 0, 0
+	f.cqPolicies, f.cqSeededIDs = map[int64]*CQPolicyEntry{}, map[int64]bool{}
 	f.restoreRetentionLocked(st)
 	if st == nil {
 		return
 	}
 	f.tieringPolicySeq = st.TieringSeq
+	f.cqEnabled, f.cqSeeded, f.cqSeq, f.cqFloor = st.CQEnabled, st.CQSeeded, st.CQSeq, st.CQFloor
+	for _, id := range st.CQSeededIDs {
+		f.cqSeededIDs[id] = true
+	}
+	for _, e := range st.CQPolicies {
+		if e != nil {
+			c := copyCQ(*e)
+			f.cqPolicies[c.ID] = &c
+		}
+	}
 	for _, c := range st.Collecting {
 		if c != nil && c.Kind != "" {
 			cc := *c
