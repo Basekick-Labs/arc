@@ -3,7 +3,9 @@ package raft
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
+	"strings"
 	"testing"
 	"time"
 )
@@ -206,4 +208,16 @@ func TestCQWatermarkDoesNotSignalTheMirrors(t *testing.T) {
 	if fired != 1 {
 		t.Fatalf("a watermark change signalled the mirrors (%d)", fired)
 	}
+}
+
+// The FSM refuses a seed over the byte limit too (ported from #1328).
+func TestCQSeedByteLimit(t *testing.T) {
+	x := cqFSM(t)
+	x.ok(CommandCollectPolicies, CollectPoliciesPayload{Kind: PolicyKindCQ, Leader: "w1", Now: t0})
+	var entries []CQEntry
+	for i := 0; i < 14; i++ {
+		entries = append(entries, CQEntry{Name: fmt.Sprintf("q%d", i), Database: "d", SourceMeasurement: "s", DestinationMeasurement: "o",
+			Query: strings.Repeat("x", 60<<10), Interval: "1h"})
+	}
+	x.refused(CommandSeedPolicies, SeedPoliciesPayload{Kind: PolicyKindCQ, Epoch: x.idx, CQ: entries, CQFloor: 1, Now: t0})
 }

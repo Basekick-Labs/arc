@@ -376,6 +376,13 @@ func planCQSeed(perNode map[string]CQLocalRows, choice *raft.PolicyAdoptChoice) 
 		}
 		seed.CQ = append(seed.CQ, e)
 	}
+	// One Raft entry, proposed by the leader: refused here rather than by
+	// the FSM, so the reason reaches the status (from #1328).
+	if raw, err := json.Marshal(seed); err != nil {
+		return raft.SeedPoliciesPayload{}, fmt.Sprintf("could not encode the continuous query seed: %v", err)
+	} else if len(raw) > raft.MaxSeedCQPayloadBytes {
+		return raft.SeedPoliciesPayload{}, fmt.Sprintf("the continuous query seed is %d bytes, above the %d-byte Raft forwarding limit; reduce the number or size of definitions", len(raw), raft.MaxSeedCQPayloadBytes)
+	}
 	return seed, ""
 }
 

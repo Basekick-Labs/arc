@@ -695,3 +695,30 @@ func TestCQOutputFlushedBeforeTheWatermark(t *testing.T) {
 		t.Fatalf("after the flush succeeded: watermark %v (was %v), %d new runs", r.watermark(t, 1), w, len(r.runs)-runs)
 	}
 }
+
+// A local CQ the cluster did not adopt, with the same name as a cluster CQ but
+// another definition, goes dormant with its history; the cluster's CQ takes
+// the name (ported from #1328).
+func TestCQMirrorDormantsSameNameButDifferentDefinition(t *testing.T) {
+	r := newCQRig(t)
+	if _, err := r.h.sqliteDB.Exec(`INSERT INTO continuous_queries (id, name, database, source_measurement, destination_measurement, query, interval)
+		VALUES (9, 'q', 'other', 'mem', 'mem_1h', 'SELECT 2', '5m')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.h.sqliteDB.Exec(`INSERT INTO continuous_query_executions (query_id, execution_id, status, start_time, end_time) VALUES (9, 'x', 'completed', 'a', 'b')`); err != nil {
+		t.Fatal(err)
+	}
+	r.src.seedCQ()
+	r.do(t, "POST", "/cq", cqBody) // the cluster's "q"
+	if err := r.h.MirrorClusterPolicies(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var live, dormant, dormantExec int
+	var db string
+	r.h.sqliteDB.QueryRow(`SELECT COUNT(*), MAX(database) FROM continuous_queries WHERE name = 'q'`).Scan(&live, &db)
+	r.h.sqliteDB.QueryRow(`SELECT COUNT(*) FROM continuous_queries_dormant WHERE query_id = 9 AND database = 'other'`).Scan(&dormant)
+	r.h.sqliteDB.QueryRow(`SELECT COUNT(*) FROM continuous_query_executions_dormant WHERE query_id = 9`).Scan(&dormantExec)
+	if live != 1 || db != "db" || dormant != 1 || dormantExec != 1 {
+		t.Fatalf("live %d (db %q), dormant %d, dormant history %d", live, db, dormant, dormantExec)
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -235,5 +236,23 @@ func TestAdoptCQ(t *testing.T) {
 	}
 	if r2.cqCollectSeen.Load() {
 		t.Fatal("a collect opened for a takeover the probe could tell would not happen")
+	}
+}
+
+// A seed too large for one Raft entry under the forwarding limit is refused
+// with the reason, not proposed (ported from #1328).
+func TestPlanCQSeedRespectsRaftForwardingSizeLimit(t *testing.T) {
+	var rows []CQLocalRow
+	for i := int64(1); i <= 14; i++ {
+		r := cqrow(i, fmt.Sprintf("large-%d", i), "1h", false, 0, nil)
+		r.Query = strings.Repeat("x", 60<<10)
+		rows = append(rows, r)
+	}
+	_, why := planCQSeed(map[string]CQLocalRows{"a": {Policies: rows, MaxIssuedID: 14}}, nil)
+	if !strings.Contains(why, "forwarding limit") {
+		t.Fatalf("oversized seed: %q", why)
+	}
+	if _, why := planCQSeed(map[string]CQLocalRows{"a": {Policies: rows[:2], MaxIssuedID: 2}}, nil); why != "" {
+		t.Fatalf("a small seed refused: %q", why)
 	}
 }

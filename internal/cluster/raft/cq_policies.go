@@ -34,6 +34,12 @@ const PolicyKindCQ = "cq"
 // policies.
 const MaxSeedCQs = 1000
 
+// MaxSeedCQPayloadBytes bounds a CQ seed's encoded size. A command reaches
+// the leader as JSON with its payload base64-encoded, under the coordinator
+// protocol's 1 MiB frame, and a seed of many large definitions would also be
+// one oversized Raft entry. (From #1328.)
+const MaxSeedCQPayloadBytes = 700 << 10
+
 // Bounds the FSM applies to a CQ's fields; the API applies its full rules.
 const (
 	maxCQNameLen     = 256
@@ -457,6 +463,11 @@ func validCQSeed(p *SeedPoliciesPayload) error {
 	}
 	if p.CQFloor < 1 {
 		return errors.New("a continuous query seed needs a floor of at least 1")
+	}
+	if raw, err := json.Marshal(p); err != nil {
+		return err
+	} else if len(raw) > MaxSeedCQPayloadBytes {
+		return fmt.Errorf("a continuous query seed of %d bytes exceeds %d", len(raw), MaxSeedCQPayloadBytes)
 	}
 	names := make(map[string]bool, len(p.CQ))
 	ids := make(map[int64]bool, len(p.CQ))
