@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -139,6 +140,12 @@ func (h *TieringPoliciesHandler) SetPolicy(c *fiber.Ctx) error {
 	}
 
 	if err := h.manager.GetPolicies().Set(ctx, policy); err != nil {
+		switch {
+		case errors.Is(err, tiering.ErrPoliciesBeingAdopted), errors.Is(err, tiering.ErrClusterUnavailable):
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+		case errors.Is(err, tiering.ErrInvalidPolicy):
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
 		h.logger.Error().Err(err).Str("database", database).Msg("Failed to set tiering policy")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to set tiering policy",
@@ -175,9 +182,17 @@ func (h *TieringPoliciesHandler) DeletePolicy(c *fiber.Ctx) error {
 	}
 
 	if err := h.manager.GetPolicies().Delete(ctx, database); err != nil {
+		switch {
+		case errors.Is(err, tiering.ErrPolicyNotFound):
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": err.Error()})
+		case errors.Is(err, tiering.ErrPoliciesBeingAdopted), errors.Is(err, tiering.ErrClusterUnavailable):
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+		case errors.Is(err, tiering.ErrInvalidPolicy):
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
 		h.logger.Error().Err(err).Str("database", database).Msg("Failed to delete tiering policy")
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-			"error": err.Error(),
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to delete tiering policy",
 		})
 	}
 

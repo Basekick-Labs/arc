@@ -199,6 +199,21 @@ const (
 	// CommandClaimFinisher: a node taking (or renewing) the lease to finish
 	// a committed object-store job (#1207 d2a2b).
 	CommandClaimFinisher
+	// CommandEnableClusterPolicies turns the cluster policies flag on, once,
+	// when every node supports it (#1324).
+	CommandEnableClusterPolicies
+	// CommandSetTieringPolicy / CommandDeleteTieringPolicy: a database's
+	// tiering policy, once tiering policies are seeded (#1324).
+	CommandSetTieringPolicy
+	CommandDeleteTieringPolicy
+	// CommandSeedPolicies: the leader installing a kind's adopted policies,
+	// once (#1324).
+	CommandSeedPolicies
+	// CommandCollectPolicies / CommandAwaitAdoption: the leader opening a
+	// collect of a kind's rows from every node, and closing one that could
+	// not seed (#1324).
+	CommandCollectPolicies
+	CommandAwaitAdoption
 )
 
 // Command represents a command to be applied to the FSM.
@@ -585,6 +600,9 @@ type FSMSnapshot struct {
 	// CompactionCommit: the flag and the staged jobs (#1207 d2). nil in an
 	// older snapshot, or before the flag was applied.
 	CompactionCommit *compactionCommitState `json:"compaction_commit,omitempty"`
+	// ClusterPolicies: the flag and the policies (#1324). nil in an older
+	// snapshot, or before the flag was applied.
+	ClusterPolicies *clusterPoliciesState `json:"cluster_policies,omitempty"`
 }
 
 // ClusterFSM implements the raft.FSM interface for cluster state management.
@@ -768,6 +786,20 @@ type ClusterFSM struct {
 	staged           map[string]*StagedCompaction
 	// stagedPaths: input and output paths of staged jobs -> job (derived).
 	stagedPaths map[string]string
+	// clusterPolicies is the #1324 flag; policiesSeeded the kinds whose
+	// policies live here; tieringPolicies by database. See
+	// cluster_policies.go.
+	clusterPolicies bool
+	policiesSeeded  map[string]bool
+	tieringPolicies map[string]*TieringPolicyEntry
+	// policyCollecting / policyAwaiting: kinds with an open collect, and
+	// kinds whose last collect could not seed.
+	policyCollecting map[string]*PolicyCollect
+	policyAwaiting   map[string]*PolicyAwaiting
+	// tieringPolicySeq numbers tiering policies (their IDs).
+	tieringPolicySeq int64
+	// onPoliciesChanged: SetPoliciesChangedCallback.
+	onPoliciesChanged atomic.Pointer[func()]
 	// Staged-commit callbacks (#1207 d2a2a) and the events an apply queued
 	// for them, delivered once f.mu is released.
 	onCompactionStaged    func(StagedCompaction)
@@ -855,6 +887,10 @@ func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 		takeover:                newTakeoverState(),
 		staged:                  map[string]*StagedCompaction{},
 		stagedPaths:             map[string]string{},
+		policiesSeeded:          map[string]bool{},
+		tieringPolicies:         map[string]*TieringPolicyEntry{},
+		policyCollecting:        map[string]*PolicyCollect{},
+		policyAwaiting:          map[string]*PolicyAwaiting{},
 
 		logger: logger.With().Str("component", "cluster-fsm").Logger(),
 	}
@@ -1251,6 +1287,18 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.applyCleanupCompaction(cmd.Payload)
 	case CommandClaimFinisher:
 		return f.applyClaimFinisher(cmd.Payload)
+	case CommandEnableClusterPolicies:
+		return f.applyEnableClusterPolicies(cmd.Payload)
+	case CommandSetTieringPolicy:
+		return f.policiesChangedIfApplied(f.applySetTieringPolicy(cmd.Payload))
+	case CommandDeleteTieringPolicy:
+		return f.policiesChangedIfApplied(f.applyDeleteTieringPolicy(cmd.Payload))
+	case CommandSeedPolicies:
+		return f.policiesChangedIfApplied(f.applySeedPolicies(cmd.Payload))
+	case CommandCollectPolicies:
+		return f.applyCollectPolicies(cmd.Payload, log.Index)
+	case CommandAwaitAdoption:
+		return f.applyAwaitAdoption(cmd.Payload)
 	case CommandDeleteFile:
 		return f.applyDeleteFile(cmd.Payload)
 	case CommandAssignCompactor:
@@ -2762,6 +2810,7 @@ func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 
 	return &fsmSnapshot{
 		compactionCommit: f.snapshotCompactionCommitLocked(),
+		clusterPolicies:  f.snapshotClusterPoliciesLocked(),
 		streamClaims:     claimsState,
 		// Raft does not call Apply and Snapshot concurrently, so the two
 		// counters agree here.
@@ -3126,6 +3175,7 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	f.takeover.gen = prevGen + 1
 	f.refreshUnackedDeletesLocked()
 	f.restoreCompactionCommitLocked(snapshot.CompactionCommit)
+	f.restoreClusterPoliciesLocked(snapshot.ClusterPolicies)
 	onCompactionPauseChanged := f.onCompactionPauseChanged
 	f.nodes = restoredNodes
 	f.barriers = restoredBarriers
@@ -3273,6 +3323,7 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	if pauseChanged && onCompactionPauseChanged != nil {
 		onCompactionPauseChanged(restoredPause.Active, restoredPause.Generation)
 	}
+	f.firePoliciesChanged()
 
 	// Last, after the restored state is in place: a reader that sees the
 	// index must also see what it covers.
@@ -3517,6 +3568,7 @@ type fsmSnapshot struct {
 	appliedIndex           uint64
 	streamClaims           *streamClaimsState
 	compactionCommit       *compactionCommitState
+	clusterPolicies        *clusterPoliciesState
 }
 
 // Persist writes the snapshot to the given sink.
@@ -3537,6 +3589,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 		AppliedIndex:           s.appliedIndex,
 		StreamClaims:           s.streamClaims,
 		CompactionCommit:       s.compactionCommit,
+		ClusterPolicies:        s.clusterPolicies,
 	}
 
 	data, err := json.Marshal(snapshot)

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -182,5 +183,93 @@ func TestSetHotOnlyPolicyDoesNotUpdateWhenColdFileCountFails(t *testing.T) {
 	}
 	if manager.coldCalls != 1 {
 		t.Fatalf("cold file count called %d times, want 1", manager.coldCalls)
+	}
+}
+
+// collectingSource is a cluster that is collecting the nodes' policies.
+type collectingSource struct{}
+
+func (collectingSource) Seeded() bool                                       { return false }
+func (collectingSource) Collecting() bool                                   { return true }
+func (collectingSource) Get(string) (*tiering.DatabasePolicy, bool)         { return nil, false }
+func (collectingSource) List() []tiering.DatabasePolicy                     { return nil }
+func (collectingSource) Set(context.Context, *tiering.DatabasePolicy) error { return nil }
+func (collectingSource) Delete(context.Context, string) error               { return nil }
+
+// #1324: while the cluster collects the nodes' policies a write answers 503
+// (retry), and a delete of a missing policy is still 404.
+func TestTieringPolicyWritesDuringACollect(t *testing.T) {
+	app, manager := newTieringPoliciesTestApp(t, 0, nil)
+	app.Delete("/api/v1/tiering/policies/:database", (&TieringPoliciesHandler{manager: manager, logger: zerolog.Nop()}).DeletePolicy)
+
+	del := func() int {
+		resp, err := app.Test(httptest.NewRequest(http.MethodDelete, "/api/v1/tiering/policies/nope", nil), 1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := del(); code != fiber.StatusNotFound {
+		t.Fatalf("delete of a missing policy = %d, want 404", code)
+	}
+
+	manager.policies.SetClusterSource(collectingSource{})
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/tiering/policies/db1", strings.NewReader(`{"hot_max_age_days":3}`))
+	req.Header.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSON)
+	resp, err := app.Test(req, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != fiber.StatusServiceUnavailable {
+		t.Fatalf("set during a collect = %d, want 503", resp.StatusCode)
+	}
+	if code := del(); code != fiber.StatusServiceUnavailable {
+		t.Fatalf("delete during a collect = %d, want 503", code)
+	}
+}
+
+// seededSource is a seeded cluster whose writes fail with err.
+type seededSource struct{ err error }
+
+func (seededSource) Seeded() bool                                         { return true }
+func (seededSource) Collecting() bool                                     { return false }
+func (seededSource) Get(string) (*tiering.DatabasePolicy, bool)           { return nil, false }
+func (seededSource) List() []tiering.DatabasePolicy                       { return nil }
+func (s seededSource) Set(context.Context, *tiering.DatabasePolicy) error { return s.err }
+func (s seededSource) Delete(context.Context, string) error               { return s.err }
+
+// A policy the cluster refuses is 400; a cluster that cannot take the write
+// now is 503 (retry), for set and delete alike.
+func TestTieringPolicyWritesClusterErrors(t *testing.T) {
+	for _, c := range []struct {
+		err  error
+		want int
+	}{
+		{fmt.Errorf("%w: too long", tiering.ErrInvalidPolicy), fiber.StatusBadRequest},
+		{fmt.Errorf("%w: no leader", tiering.ErrClusterUnavailable), fiber.StatusServiceUnavailable},
+	} {
+		app, manager := newTieringPoliciesTestApp(t, 0, nil)
+		app.Delete("/api/v1/tiering/policies/:database", (&TieringPoliciesHandler{manager: manager, logger: zerolog.Nop()}).DeletePolicy)
+		manager.policies.SetClusterSource(seededSource{err: c.err})
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/tiering/policies/db1", strings.NewReader(`{"hot_only":false}`))
+		req.Header.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSON)
+		resp, err := app.Test(req, 1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != c.want {
+			t.Errorf("set with %v = %d, want %d", c.err, resp.StatusCode, c.want)
+		}
+		resp, err = app.Test(httptest.NewRequest(http.MethodDelete, "/api/v1/tiering/policies/db1", nil), 1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != c.want {
+			t.Errorf("delete with %v = %d, want %d", c.err, resp.StatusCode, c.want)
+		}
 	}
 }

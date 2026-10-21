@@ -253,6 +253,39 @@ earlier release on a node, remove the node from the cluster, wipe its data
 directory, and join it fresh. To roll back the whole cluster, restore it from a
 backup taken before the upgrade.
 
+## Upgrade note: cluster-wide tiering policies ([#1324](https://github.com/Basekick-Labs/arc/issues/1324))
+
+A cluster turns on cluster policies by itself once every node runs this
+release (`cluster_policies.enabled` in `GET /api/v1/cluster`). Like compaction
+commit, the flag stays on, and a node running an earlier release can no longer
+join. Roll back the same way: never one node in place.
+
+Right after that, the cluster takes over the tiering policies each node holds
+in its own database. During the takeover a tiering policy write answers `503`
+for up to a few seconds; retry it.
+
+Every node must answer, or nothing is taken over:
+
+- The leader first checks that it can reach every node. If one is down, it
+  takes nothing over, so writes are never held, and the policies stay on each
+  node exactly as before.
+- It tries again after 30 seconds, doubling the wait after each failed attempt
+  up to 10 minutes.
+- `cluster_policies.kinds.tiering` shows `missing_nodes`, `last_error` and
+  `failed_attempts`.
+- A node that is gone for good must be removed from the cluster before the
+  policies can be taken over.
+
+The policies are merged in the direction that moves less data. A database that
+is `hot_only` on any node stays `hot_only`. Otherwise it keeps the longest hot
+age any node applied to it: the policy's `hot_max_age_days`, or that node's
+`default_hot_max_age_days` where the policy left it unset. Afterwards:
+
+- every node reports the same policies;
+- `GET /api/v1/tiering/policies` lists them all from any node;
+- every node that runs tiering keeps its own `tiering_policies` table equal to
+  them, so a backup of such a node carries the current policies.
+
 ## Upgrade note: the live WAL replication stream is removed ([#888](https://github.com/Basekick-Labs/arc/issues/888), [#1181](https://github.com/Basekick-Labs/arc/issues/1181))
 
 This applies to clusters where readers or compactors run with both
@@ -1255,6 +1288,35 @@ this node's metadata has recorded for the database. It also clarifies that
 storage.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1311](https://github.com/Basekick-Labs/arc/pull/1311).
+
+### A tiering policy set on any node applies, and survives a failover ([#1324](https://github.com/Basekick-Labs/arc/issues/1324))
+
+In a cluster, each node kept its own tiering policies, while only the primary
+writer migrates files to cold storage. So:
+
+- A policy set on a reader, or on any node other than the primary, was stored
+  and reported with `200` but never applied.
+- After a failover, the new primary ignored every policy that had been set on
+  the old one. Databases pinned `hot_only` started moving to cold storage.
+
+Tiering policies now live in the cluster state. A policy set on any node
+applies cluster-wide, every node reports the same policies, and a new primary
+applies them. A standalone node is unchanged. The upgrade note above explains
+how a cluster takes over the policies each node already holds.
+
+Status codes for `PUT` and `DELETE /api/v1/tiering/policies/{database}`:
+
+| Status | When |
+|---|---|
+| `503` | The cluster cannot take the write right now (no leader, or the policies are being taken over). Retry. |
+| `400` | The policy is invalid, for example a database name longer than 256 bytes. |
+| `404` | `DELETE` of a database with no policy. |
+| `500` | `DELETE` hit a database error. It used to answer `404` for any error. |
+
+A token or RBAC change made on a follower is forwarded to the leader. It now
+returns only once the follower that forwarded it has applied the change, up to
+the write's timeout, so reading it back on that node sees it. Before, the read
+could briefly miss it.
 
 ### Aggregates over several hours no longer return one result per hour on `/api/v1/query`
 

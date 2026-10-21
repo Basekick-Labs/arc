@@ -4537,6 +4537,16 @@ func main() {
 						tieringDB.Close()
 					}
 				} else {
+					// Cluster-wide tiering policies (#1324): once the cluster
+					// has seeded them, every node reads and writes the same
+					// policies through Raft instead of its own table.
+					if clusterCoordinator != nil {
+						if src := cluster.NewTieringPolicySource(clusterCoordinator); src != nil {
+							tieringManager.GetPolicies().SetClusterSource(src)
+							clusterCoordinator.SetLocalPolicyLister(clusterraft.PolicyKindTiering, cluster.TieringLocalLister(tieringManager.GetPolicies(), cfg.TieredStorage.DefaultHotMaxAgeDays))
+							clusterCoordinator.MirrorTieringPolicies(tieringManager.GetPolicies())
+						}
+					}
 					// The startup tier scan runs in the background below, and
 					// it writes through the same SQLite handle the shutdown
 					// step may close. Its context and completion channel are
@@ -4691,6 +4701,13 @@ func main() {
 				}
 			}
 		}
+	} else if clusterCoordinator != nil {
+		// Tiering is off here, so this node holds no tiering policy that
+		// ever applied: it answers the cluster's collect with none (#1324).
+		// A node whose tiering manager failed to start registers nothing
+		// and so holds the collect until it is fixed, rather than having
+		// its policies dropped.
+		clusterCoordinator.SetLocalPolicyLister(clusterraft.PolicyKindTiering, cluster.EmptyPolicyLister)
 	}
 
 	// A replicating local-storage cluster node reads a daily file that

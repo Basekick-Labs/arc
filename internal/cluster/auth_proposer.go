@@ -100,7 +100,7 @@ func (p *CoordinatorAuthProposer) Propose(ctx context.Context, cmdType uint8, pa
 	// #451 round-4).
 	mergedCtx, mergedCancel := mergeContexts(ctx, forwardCtx)
 	defer mergedCancel()
-	if err := p.coord.forwardApplyToLeader(mergedCtx, cmd); err != nil {
+	if err := p.coord.forwardAndWaitHere(mergedCtx, cmd); err != nil {
 		return wrapApplyError(err)
 	}
 	return nil

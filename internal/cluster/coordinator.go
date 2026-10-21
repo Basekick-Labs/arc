@@ -146,6 +146,11 @@ type Coordinator struct {
 	streamClaimsBlockers atomic.Pointer[[]string]
 	// compactionCommit: the #1207 d2 flag's join gate and blockers.
 	compactionCommit compactionCommitGate
+	// clusterPolicies: the #1324 flag's join gate and blockers;
+	// policyListers read this node's own rows of each kind for adoption.
+	clusterPolicies clusterPoliciesGate
+	policyListersMu sync.Mutex
+	policyListers   map[string]LocalPolicyLister
 	// staged: the staged compaction commit, replica side (#1207 d2a2a).
 	staged               stagedReplica
 	repair               manifestRepairState // shared object store manifest repair (#1207)
@@ -799,6 +804,7 @@ func (c *Coordinator) Start() error {
 	}
 	if c.raftNode != nil {
 		go c.compactionCommitEnableLoop(c.ctx)
+		go c.clusterPoliciesEnableLoop(c.ctx)
 	}
 	// The staged compaction commit on an object store (#1207 d2a2b): the
 	// leader aborts jobs of a compactor that is gone, and committed jobs are
@@ -1954,6 +1960,9 @@ func (c *Coordinator) handlePeerConnection(conn net.Conn) {
 	case protocol.MsgFlushScopeRequest:
 		c.handleFlushScopeRequest(conn, msg.Payload.(*protocol.FlushScopeRequest))
 
+	case protocol.MsgLocalPoliciesQuery:
+		c.handleLocalPoliciesQuery(conn, msg.Payload.(*protocol.LocalPoliciesQuery))
+
 	case protocol.MsgFetchFile:
 		// The fetch handler streams the body for the lifetime of the
 		// response and closes the connection itself via defer. Hand off
@@ -2155,10 +2164,20 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 			c.sendJoinError(conn, req, ccWhy)
 			return
 		}
+		cpWhy, cpRelease := c.clusterPoliciesJoinGate(req)
+		if cpWhy != "" {
+			ccRelease()
+			release()
+			c.logger.Error().Str("node_id", req.NodeID).Str("role", req.Role).Str("reason", cpWhy).
+				Msg("Join refused: the node does not support cluster policies")
+			c.sendJoinError(conn, req, cpWhy)
+			return
+		}
 		joinGateReleased := false
 		releaseGate := func() {
 			if !joinGateReleased {
 				joinGateReleased = true
+				cpRelease()
 				ccRelease()
 				release()
 			}
@@ -3046,6 +3065,7 @@ func (c *Coordinator) Status() map[string]interface{} {
 	if c.raftNode != nil {
 		status["stream_claims"] = c.StreamClaimsStatus()
 		status["compaction_commit"] = c.CompactionCommitStatus()
+		status["cluster_policies"] = c.ClusterPoliciesStatus()
 	}
 	// The stale-local sweep's last pass (#1071), where it runs.
 	if st := c.StaleLocalStatus(); st != nil {

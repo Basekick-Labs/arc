@@ -45,10 +45,12 @@ func (am *AuthManager) getProposer() RaftProposer {
 // onTokenXxx callback on the leader; follower applies happen
 // asynchronously within the usual <50ms Raft replication window).
 //
-// On the proposer node itself (whether leader or follower), the
-// callback has already fired by the time this returns — so the local
-// SQLite materialise is done. The caller can rely on a subsequent
-// VerifyToken on this node seeing the new state.
+// On the leader the callback has fired by the time this returns, so the
+// local SQLite materialise is done. A follower forwards to the leader, whose
+// ack used to arrive before the follower's own FSM applied the command; the
+// proposer now waits for that apply here, once cluster policies are enabled
+// (every node then reports the index, #1324). Before that, a VerifyToken on
+// a follower right after its own write may briefly miss it.
 func (am *AuthManager) proposeCommand(ctx context.Context, cmdType uint8, payload interface{}) error {
 	p := am.getProposer()
 	if p == nil {
