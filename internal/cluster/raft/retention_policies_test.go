@@ -41,6 +41,7 @@ func TestRetentionPoliciesNeedTheirOwnFlag(t *testing.T) {
 	x.ok(CommandEnableClusterPolicies, EnableClusterPoliciesPayload{Nodes: allNodes, Now: t0})
 	x.refused(CommandCollectPolicies, CollectPoliciesPayload{Kind: PolicyKindRetention, Leader: "w1", Now: t0})
 	x.refused(CommandChoosePolicyAdoption, ChoosePolicyAdoptionPayload{Kind: PolicyKindRetention, Node: "w1", Hash: "h"})
+	x.refused(CommandAwaitAdoption, AwaitAdoptionPayload{Kind: PolicyKindRetention, LastError: "x", Now: t0})
 	x.refused(CommandEnableRetentionPolicies, EnableRetentionPoliciesPayload{Nodes: []string{"w1", "w2", "w3"}, Now: t0})
 	if x.f.RetentionPoliciesEnabled() {
 		t.Fatal("enabled with a node missing")
