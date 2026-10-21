@@ -109,3 +109,32 @@ func TestStartJobReplacesInsteadOfOrphaning(t *testing.T) {
 		t.Fatal("a stopped scheduler started a job")
 	}
 }
+
+// Start starts a job for every CQ it loaded: the scheduler is running before
+// its jobs start (startJob starts nothing on a stopped one).
+func TestStartStartsTheLoadedJobs(t *testing.T) {
+	s, _ := NewCQScheduler(&CQSchedulerConfig{Logger: zerolog.Nop()})
+	t.Cleanup(s.Stop)
+	s.mu.Lock()
+	s.startLoadedLocked([]api.ContinuousQuery{{ID: 1, Name: "a", Interval: "1h"}, {ID: 2, Name: "b", Interval: "5m"}})
+	s.mu.Unlock()
+	if s.JobCount() != 2 || !s.IsRunning() {
+		t.Fatalf("%d jobs, running %v; want 2 and running", s.JobCount(), s.IsRunning())
+	}
+}
+
+type fakeForgetter struct{ n int }
+
+func (f *fakeForgetter) ForgetPendingWatermarks() { f.n++ }
+
+// A tick on a node that is not the primary forgets its unsettled watermarks.
+func TestTickOffPrimaryForgetsPendingWatermarks(t *testing.T) {
+	gate := &mockCQClusterGate{role: "writer"}
+	s, _ := NewCQScheduler(&CQSchedulerConfig{Logger: zerolog.Nop(), ClusterGate: gate})
+	f := &fakeForgetter{}
+	s.pendingForgetter = f
+	s.tick(&cqJob{cqID: 1, cqName: "a"})
+	if f.n != 1 {
+		t.Fatalf("forgot %d times, want once", f.n)
+	}
+}

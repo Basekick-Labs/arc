@@ -22,11 +22,13 @@ type CQScheduler struct {
 	licenseClient *license.Client
 	clusterGate   WriterGate
 	jobs          map[int64]*cqJob // CQ ID → job info
-	mu            sync.RWMutex
-	wg            sync.WaitGroup
-	stopCh        chan struct{}
-	running       bool
-	logger        zerolog.Logger
+	// pendingForgetter is the handler's ForgetPendingWatermarks (#1324).
+	pendingForgetter interface{ ForgetPendingWatermarks() }
+	mu               sync.RWMutex
+	wg               sync.WaitGroup
+	stopCh           chan struct{}
+	running          bool
+	logger           zerolog.Logger
 }
 
 // cqJob represents a scheduled CQ job
@@ -58,6 +60,9 @@ func NewCQScheduler(cfg *CQSchedulerConfig) (*CQScheduler, error) {
 		logger:        cfg.Logger.With().Str("component", "cq-scheduler").Logger(),
 	}
 
+	if cfg.CQHandler != nil {
+		s.pendingForgetter = cfg.CQHandler
+	}
 	s.logger.Info().Msg("CQ scheduler initialized")
 	return s, nil
 }
@@ -92,6 +97,15 @@ func (s *CQScheduler) Start() error {
 		return err
 	}
 
+	s.startLoadedLocked(cqs)
+	return nil
+}
+
+// startLoadedLocked marks the scheduler running and starts a job per CQ.
+// Running first: startJob starts nothing on a scheduler that is not running.
+// Caller holds s.mu.
+func (s *CQScheduler) startLoadedLocked(cqs []api.ContinuousQuery) {
+	s.running = true
 	for _, cq := range cqs {
 		if err := s.startJob(cq.ID, cq.Name, cq.Interval); err != nil {
 			s.logger.Warn().
@@ -102,13 +116,9 @@ func (s *CQScheduler) Start() error {
 			continue
 		}
 	}
-
-	s.running = true
 	s.logger.Info().
 		Int("active_cqs", len(s.jobs)).
 		Msg("CQ scheduler started")
-
-	return nil
 }
 
 // Stop stops all CQ jobs and the scheduler
@@ -322,38 +332,43 @@ func (s *CQScheduler) runJob(job *cqJob) {
 	for {
 		select {
 		case <-job.ticker.C:
-			// Check license before each execution
-			if s.licenseClient == nil || !s.licenseClient.CanUseCQScheduler() {
-				s.logger.Warn().
-					Int64("cq_id", job.cqID).
-					Str("cq_name", job.cqName).
-					Msg("Valid enterprise license required, skipping CQ execution")
-				continue
-			}
-
-			// Cluster gate: checked on every tick so role transitions (failover,
-			// demotion) take effect without a restart. clusterGate is immutable
-			// after construction so no lock is needed here.
-			if s.clusterGate != nil && !s.clusterGate.IsPrimaryWriter() {
-				// Not the primary (any more): an unsettled watermark of
-				// this node must never be proposed after a later
-				// promotion over what the cluster did meanwhile (#1324).
-				if s.cqHandler != nil {
-					s.cqHandler.ForgetPendingWatermarks()
-				}
-				s.logger.Debug().
-					Str("role", s.clusterGate.Role()).
-					Int64("cq_id", job.cqID).
-					Str("cq_name", job.cqName).
-					Msg("CQ tick skipped: node is not primary writer")
-				continue
-			}
-
-			s.executeJob(job)
+			s.tick(job)
 		case <-job.stopCh:
 			return
 		}
 	}
+}
+
+// tick is one tick of a job: primary gate, licence, run.
+func (s *CQScheduler) tick(job *cqJob) {
+	// Cluster gate: checked on every tick so role transitions (failover,
+	// demotion) take effect without a restart. clusterGate is immutable
+	// after construction so no lock is needed here.
+	if s.clusterGate != nil && !s.clusterGate.IsPrimaryWriter() {
+		// Not the primary (any more): an unsettled watermark of this node
+		// must never be proposed after a later promotion over what the
+		// cluster did meanwhile (#1324).
+		if s.pendingForgetter != nil {
+			s.pendingForgetter.ForgetPendingWatermarks()
+		}
+		s.logger.Debug().
+			Str("role", s.clusterGate.Role()).
+			Int64("cq_id", job.cqID).
+			Str("cq_name", job.cqName).
+			Msg("CQ tick skipped: node is not primary writer")
+		return
+	}
+
+	// Check license before each execution
+	if s.licenseClient == nil || !s.licenseClient.CanUseCQScheduler() {
+		s.logger.Warn().
+			Int64("cq_id", job.cqID).
+			Str("cq_name", job.cqName).
+			Msg("Valid enterprise license required, skipping CQ execution")
+		return
+	}
+
+	s.executeJob(job)
 }
 
 // executeJob executes a single CQ

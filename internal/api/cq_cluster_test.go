@@ -512,7 +512,11 @@ func TestCQRunGivesUpWhenCancelled(t *testing.T) {
 	release()
 	cancelled, cancel2 := context.WithCancel(context.Background())
 	cancel2()
-	if _, err := r.h.acquireRun(cancelled, 1); err == nil {
-		t.Fatal("a cancelled run took the slot")
+	// With the slot free and ctx done, select may pick either; the run must
+	// give up every time.
+	for i := 0; i < 20; i++ {
+		if _, err := r.h.acquireRun(cancelled, 1); err == nil {
+			t.Fatal("a cancelled run took the slot")
+		}
 	}
 }
