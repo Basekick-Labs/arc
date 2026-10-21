@@ -283,8 +283,8 @@ age any node applied to it: the policy's `hot_max_age_days`, or that node's
 
 - every node reports the same policies;
 - `GET /api/v1/tiering/policies` lists them all from any node;
-- every node keeps its own `tiering_policies` table equal to them, so a backup
-  of any node carries the current policies.
+- every node that runs tiering keeps its own `tiering_policies` table equal to
+  them, so a backup of such a node carries the current policies.
 
 ## Upgrade note: the live WAL replication stream is removed ([#888](https://github.com/Basekick-Labs/arc/issues/888), [#1181](https://github.com/Basekick-Labs/arc/issues/1181))
 
