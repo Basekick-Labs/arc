@@ -290,8 +290,8 @@ age any node applied to it: the policy's `hot_max_age_days`, or that node's
 
 Retention has its own flag, `cluster_policies.retention_enabled` in
 `GET /api/v1/cluster`. A cluster turns it on by itself once every node runs
-this release; until then `retention_blocking_nodes` names the nodes still on
-an earlier one. Like the tiering flag it stays on, and a node running an
+this release; until then the leader's `retention_blocking_nodes` names the
+nodes still on an earlier one. Like the tiering flag it stays on, and a node running an
 earlier release can no longer join. Roll back the whole cluster, never one
 node in place.
 
@@ -317,7 +317,11 @@ minutes. To choose a node's policies, an admin calls, on the Raft leader:
   `{"kind": "retention", "node": "<id>", "hash": "<hash>"}`. The policies are
   taken over only if the node still holds exactly the ones the hash names.
 
-Both are admin-only; any other node answers `409` with the leader's ID.
+Both are admin-only; once `retention_enabled` is on, any other node answers
+`409` with the leader's ID. `POST` answers `202`, and
+`cluster_policies.kinds.retention` shows the outcome. A node where retention is
+disabled counts too: its database may still hold the policies of when
+retention ran there.
 
 When the policies are taken over:
 
@@ -1393,7 +1397,7 @@ Status codes for `POST`, `PUT` and `DELETE /api/v1/retention`:
 | Status | When |
 |---|---|
 | `202` | `POST` only: the cluster took the policy, but this node has not applied it yet. List the policies to see it. |
-| `400` | The policy is invalid, its name is taken, or `retention_days` is not greater than `buffer_days`. |
+| `400` | The policy is invalid (including a name, database or measurement longer than 256 bytes), its name is taken, or `retention_days` is not greater than `buffer_days`. |
 | `404` | No such policy. |
 | `503` | The cluster cannot take the write right now (no leader, or the policies are being taken over). Retry. |
 
