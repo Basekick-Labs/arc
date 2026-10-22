@@ -18,13 +18,17 @@ import (
 
 func pagPath(i int) string { return fmt.Sprintf("db/m/2026/04/11/14/f%05d.parquet", i) }
 
+// registerPath reports with t.Error so it can run off the test goroutine.
 func registerPath(t *testing.T, f *ClusterFSM, idx uint64, path string, size int64) {
 	t.Helper()
 	if res := applyCmd(t, f, idx, CommandRegisterFile, RegisterFilePayload{File: makeFileEntry(path, "db", "m", size)}); res != nil {
-		t.Fatalf("register %s: %v", path, res)
+		t.Errorf("register %s: %v", path, res)
 	}
 }
 
+// walkAll walks the manifest and checks a walk never repeats or goes back:
+// paths strictly ascend, whichever snapshot each page used. Reports with
+// t.Error so it can run off the test goroutine.
 func walkAll(t *testing.T, f *ClusterFSM, limit int, between func(page int)) []string {
 	t.Helper()
 	var got []string
@@ -32,9 +36,13 @@ func walkAll(t *testing.T, f *ClusterFSM, limit int, between func(page int)) []s
 	for page := 0; page < 10000; page++ {
 		files, next, err := f.GetFilesPaginated(cursor, limit)
 		if err != nil {
-			t.Fatal(err)
+			t.Error(err)
+			return got
 		}
 		for _, e := range files {
+			if len(got) > 0 && e.Path <= got[len(got)-1] {
+				t.Errorf("walk went back or repeated: %s after %s", e.Path, got[len(got)-1])
+			}
 			got = append(got, e.Path)
 		}
 		if next == "" {
@@ -45,8 +53,8 @@ func walkAll(t *testing.T, f *ClusterFSM, limit int, between func(page int)) []s
 			between(page)
 		}
 	}
-	t.Fatal("walk did not end")
-	return nil
+	t.Error("walk did not end")
+	return got
 }
 
 // countingSorter counts rebuilds.
@@ -263,4 +271,30 @@ func TestManifestWalkConcurrentWithApplies(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	close(stop)
 	wg.Wait()
+}
+
+// Deleting keys changes the key set too: the next walk rebuilds, and does
+// not page through the deleted paths.
+func TestManifestWalkRebuildsAfterDeletesOnly(t *testing.T) {
+	f := NewClusterFSM(zerolog.Nop())
+	for i := 0; i < 30; i++ {
+		registerPath(t, f, uint64(i+1), pagPath(i), 10)
+	}
+	sorts := countingSorter(f)
+	walkAll(t, f, 10, nil)
+	for i := 0; i < 20; i++ {
+		if res := applyCmd(t, f, uint64(100+i), CommandDeleteFile, DeleteFilePayload{Path: pagPath(i)}); res != nil {
+			t.Fatal(res)
+		}
+	}
+	walkAll(t, f, 10, nil)
+	if n := sorts.Load(); n != 2 {
+		t.Fatalf("%d sorts, want a rebuild after deletes alone", n)
+	}
+	f.keysMu.Lock()
+	cached := len(f.keysCache)
+	f.keysMu.Unlock()
+	if cached != 10 {
+		t.Errorf("snapshot holds %d keys after the rebuild, want the 10 left", cached)
+	}
 }

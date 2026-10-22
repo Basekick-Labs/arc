@@ -1463,7 +1463,13 @@ The walk now never takes the write lock:
 
 Files registered during a walk are listed by the next walk. Replication picks
 them up from the registration as before. Files a Raft snapshot install brings
-in are still listed by the walk in progress.
+in are listed by the walk in progress if they sort after its position, and
+otherwise by the next walk.
+
+A page of `GET /api/v1/cluster/files?cursor=…` can now be empty while
+`next_cursor` is not: its files were deleted after the walk's first page.
+Keep paging until `next_cursor` is empty; an empty page does not mean the
+end.
 
 The workaround of raising `replication_reconciliation_interval_seconds` during
 heavy loads is no longer needed.

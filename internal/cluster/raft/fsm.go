@@ -1585,7 +1585,7 @@ func (f *ClusterFSM) applyAckCompactionPause(payload []byte) interface{} {
 }
 
 // applyBarrier records the barrier token at the index it was applied. No
-// callbacks, no manifest change, keysCache untouched.
+// callbacks, no manifest change, keysGen untouched.
 func (f *ClusterFSM) applyBarrier(payload []byte, logIndex uint64) interface{} {
 	var p BarrierPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
@@ -3391,7 +3391,9 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	}
 	// A restore replaces the key set wholesale and announces none of the
 	// keys it adds through onFileRegistered: only a manifest walk finds
-	// them, so a walk in progress must see them too (keysRestoreGen).
+	// them. keysRestoreGen makes a walk in progress rebuild on its next
+	// page, so it reaches the restored keys that sort after its cursor; the
+	// ones before it wait for the next walk, as they always did.
 	f.keysGen++
 	f.keysRestoreGen++
 	f.authQuarantined = quarantinedAuthIDs(&snapshot, restoredTokens, restoredOrgs, restoredTeams, restoredRoles, restoredMPerms, restoredMemberships)
@@ -3680,7 +3682,8 @@ func (f *ClusterFSM) FileDatabases() []string {
 // the snapshot it finds, so a walk sorts the manifest at most once instead
 // of on nearly every page under ingest. A Restore forces a rebuild on any
 // page, because the keys a snapshot install adds are announced to no
-// callback and only a walk finds them.
+// callback and only a walk finds them (those after the cursor; the rest
+// wait for the next walk).
 //
 // Cursor stability: the cursor is the last path string of the previous
 // page. A key deleted since the snapshot is skipped (entries are read
