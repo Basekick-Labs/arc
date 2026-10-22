@@ -1433,6 +1433,43 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Queries no longer count a compaction's rows twice
+
+Compaction writes its output into the partition and then deletes the files
+it merged. A query that ran in between read both, so it counted every row of
+that compaction twice. This happened with default settings, including OSS
+standalone, on JSON, Arrow and msgpack queries.
+- **How long:** normally milliseconds to seconds (longer on S3 with many
+  inputs). If deleting an input failed, it lasted until the next compaction
+  cycle recovered the job, up to an hour, or until the first cycle after a
+  restart.
+- **Permanent through continuous queries:** a continuous query that ran
+  inside the window wrote the doubled aggregate back to storage.
+
+**The fix:**
+- Arc now tracks each compaction whose output and inputs can both be in
+  storage. It does so from before the output is written until its inputs are
+  known to be gone. After a restart, the jobs are rebuilt from the
+  compaction's recovery manifests before any query is served.
+- Once a compaction's output is in storage, queries, continuous queries and
+  the arcx engine leave its inputs out, because the output holds their rows.
+  This holds until the inputs are deleted, including after a failed delete
+  or a restart.
+- Outside those windows nothing changes. While a compaction is open, queries
+  on that measurement are not cached, so a read planned before the output
+  appeared is never served after it. With `query.enable_s3_cache` on, DuckDB's
+  object-store listing cache is dropped when an output is first seen.
+
+**Limitations:**
+- With shared storage (several nodes, one bucket), only the node running the
+  compaction knows about it. Queries on other nodes can still see the window.
+  A follow-up release covers them.
+- One short race remains, as before: a query planned just before the output
+  is written can still read both sides, if its read lists the files after
+  the upload and before the inputs are deleted (normally milliseconds).
+  Leaving the output out of such a query would instead lose the job's rows
+  when the inputs are deleted first, which is worse.
+
 ### A cached query no longer misses an hour its relative end has just reached
 
 Arc caches a query's pruned plan for up to 60 seconds, keyed by the current

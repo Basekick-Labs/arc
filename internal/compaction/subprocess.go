@@ -85,8 +85,12 @@ type SubprocessJobConfig struct {
 	// not a user-facing field — matches the plain tag on completion.go's twin.
 	PartitionTime time.Time `json:"partition_time"`
 	// Staged commit (#1207 d2a2a): see JobConfig.Staged.
-	Staged bool                   `json:"staged,omitempty"`
-	Inputs map[string]StagedInput `json:"inputs,omitempty"`
+	// OutputName is the output's file name, chosen by the parent so it can
+	// register the job (OpenJobs) before the output can exist. Empty from
+	// an older parent: the job names it as before.
+	OutputName string                 `json:"output_name,omitempty"`
+	Staged     bool                   `json:"staged,omitempty"`
+	Inputs     map[string]StagedInput `json:"inputs,omitempty"`
 }
 
 // SubprocessJobResult is returned by the subprocess via stdout as JSON.
@@ -107,6 +111,11 @@ type SubprocessJobResult struct {
 	// left in place under ParentFinalizesManifest; empty otherwise. The
 	// parent deletes it after receipt marking commits.
 	ManifestPath string `json:"manifest_path,omitempty"`
+	// SourcesDeleted: every consumed input was deleted. Until then queries
+	// must not read the output and the inputs together (OpenJobs). False
+	// from an older subprocess, which keeps the parent's entry until the
+	// manifest is gone.
+	SourcesDeleted bool `json:"sources_deleted,omitempty"`
 }
 
 // SubprocessCredentials are the storage secrets a compaction subprocess needs
@@ -239,29 +248,7 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 	manifestManager := NewManifestManager(backend, logger)
 
 	// Create and run job
-	job := NewJob(&JobConfig{
-		Database:        config.Database,
-		Measurement:     config.Measurement,
-		PartitionPath:   config.PartitionPath,
-		Files:           config.Files,
-		StorageBackend:  backend,
-		Tier:            config.Tier,
-		BatchNumber:     config.BatchNumber,
-		TempDirectory:   config.TempDirectory,
-		SortKeys:        config.SortKeys,
-		Logger:          logger,
-		DB:              db,
-		ManifestManager: manifestManager,
-		// Phase 4: thread cluster-mode fields through to the job. When
-		// CompletionDir is empty (OSS / standalone), clusterMode() is
-		// false and the completion-manifest writes are no-ops.
-		JobID:                   config.JobID,
-		CompletionDir:           config.CompletionDir,
-		PartitionTime:           config.PartitionTime,
-		ParentFinalizesManifest: config.ParentFinalizesManifest,
-		Staged:                  config.Staged,
-		Inputs:                  config.Inputs,
-	})
+	job := NewJob(subprocessJobConfig(config, backend, logger, db, manifestManager))
 
 	// Use signal-aware context so the subprocess can cancel DuckDB queries
 	// when the parent kills it via SIGTERM (from exec.CommandContext).
@@ -269,21 +256,7 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 	defer stop()
 	err = job.Run(ctx)
 
-	result := &SubprocessJobResult{
-		Success:        err == nil,
-		FilesCompacted: job.FilesCompacted,
-		BytesBefore:    job.BytesBefore,
-		BytesAfter:     job.BytesAfter,
-		// The storage key of the output (empty when the job produced none).
-		// The parent's compacted-output observer keys the edge sync ledger
-		// on this; the temp path would never match a storage listing.
-		OutputFile:      job.OutputStorageKey,
-		CompactedInputs: job.CompactedInputKeys(),
-		ManifestPath:    job.RetainedManifestPath(),
-	}
-	if err != nil {
-		result.Error = err.Error()
-	}
+	result := subprocessResult(job, err)
 
 	logger.Info().
 		Bool("success", result.Success).
@@ -637,4 +610,55 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 	// Default: treat unknown errors as potentially recoverable once
 	// This allows one retry for transient issues
 	return true, "unknown"
+}
+
+// subprocessJobConfig is the Job a subprocess runs for config. Every field
+// the parent sends is carried here, OutputName included (OpenJobs relies on
+// the job writing the output under the name the parent registered).
+func subprocessJobConfig(config *SubprocessJobConfig, backend storage.Backend, logger zerolog.Logger, db *sql.DB, manifestManager *ManifestManager) *JobConfig {
+	return &JobConfig{
+		Database:        config.Database,
+		Measurement:     config.Measurement,
+		PartitionPath:   config.PartitionPath,
+		Files:           config.Files,
+		StorageBackend:  backend,
+		Tier:            config.Tier,
+		BatchNumber:     config.BatchNumber,
+		TempDirectory:   config.TempDirectory,
+		SortKeys:        config.SortKeys,
+		Logger:          logger,
+		DB:              db,
+		ManifestManager: manifestManager,
+		// Phase 4: thread cluster-mode fields through to the job. When
+		// CompletionDir is empty (OSS / standalone), clusterMode() is
+		// false and the completion-manifest writes are no-ops.
+		JobID:                   config.JobID,
+		CompletionDir:           config.CompletionDir,
+		PartitionTime:           config.PartitionTime,
+		ParentFinalizesManifest: config.ParentFinalizesManifest,
+		Staged:                  config.Staged,
+		Inputs:                  config.Inputs,
+		OutputName:              config.OutputName,
+	}
+}
+
+// subprocessResult is what the subprocess reports for job after Run.
+func subprocessResult(job *Job, err error) *SubprocessJobResult {
+	result := &SubprocessJobResult{
+		Success:        err == nil,
+		FilesCompacted: job.FilesCompacted,
+		BytesBefore:    job.BytesBefore,
+		BytesAfter:     job.BytesAfter,
+		// The storage key of the output (empty when the job produced none).
+		// The parent's compacted-output observer keys the edge sync ledger
+		// on this; the temp path would never match a storage listing.
+		OutputFile:      job.OutputStorageKey,
+		CompactedInputs: job.CompactedInputKeys(),
+		ManifestPath:    job.RetainedManifestPath(),
+		SourcesDeleted:  job.sourcesDeleted,
+	}
+	if err != nil {
+		result.Error = err.Error()
+	}
+	return result
 }

@@ -154,6 +154,9 @@ type Job struct {
 	staged bool
 	inputs map[string]StagedInput
 
+	// outputName, when set, is the output file name the parent chose.
+	outputName string
+
 	// OutputStorageKey is the storage-relative key of the compacted output,
 	// set once the output name is fixed (before upload). Empty for jobs that
 	// produce no output (all sources vanished, or no time column).
@@ -211,6 +214,9 @@ type JobConfig struct {
 	// describes every file of Files as the cluster manifest lists it.
 	Staged bool
 	Inputs map[string]StagedInput
+	// OutputName is the output file name the parent chose (OpenJobs);
+	// empty names it here, as before.
+	OutputName string
 
 	// JobID, if set, overrides the auto-generated JobID. Phase 4 uses this
 	// so the parent (which spawns the subprocess) and the subprocess agree
@@ -270,6 +276,7 @@ func NewJob(cfg *JobConfig) *Job {
 		logger:                  cfg.Logger.With().Str("job_id", jobID).Logger(),
 		db:                      cfg.DB,
 		manifestManager:         cfg.ManifestManager,
+		outputName:              cfg.OutputName,
 	}
 }
 
@@ -743,14 +750,7 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 	// on the clock alone. The uploaded storage key derives from this basename
 	// (see Job.Run), so a collision here would silently overwrite a sibling
 	// batch's compacted output.
-	now := storage.NameTime(time.Now())
-	timestamp := now.Format("20060102_150405")
-	suffix := "compacted"
-	if j.Tier != "hourly" {
-		suffix = j.Tier
-	}
-	outputFile := filepath.Join(tempDir, fmt.Sprintf("%s_%s_%d_b%d_%s.parquet",
-		j.Measurement, timestamp, now.UnixNano(), j.BatchNumber, suffix))
+	outputFile := filepath.Join(tempDir, j.outputFileName())
 
 	// Use the shared DuckDB connection instead of creating a new one
 	// This prevents memory retention from DuckDB's jemalloc not releasing memory on Close()
@@ -1433,4 +1433,26 @@ func canonicalManifestDatabase(database string) string {
 		return rest
 	}
 	return database
+}
+
+// CompactionOutputName is a compaction output's file name:
+// {measurement}_{YYYYMMDD}_{HHMMSS}_{unixnano}_b{batch}_{suffix}.parquet, the
+// suffix "compacted" for the hourly tier and the tier name otherwise.
+func CompactionOutputName(measurement, tier string, batch int, at time.Time) string {
+	now := storage.NameTime(at)
+	suffix := "compacted"
+	if tier != "hourly" {
+		suffix = tier
+	}
+	return fmt.Sprintf("%s_%s_%d_b%d_%s.parquet",
+		measurement, now.Format("20060102_150405"), now.UnixNano(), batch, suffix)
+}
+
+// outputFileName is the output's file name: the parent's choice when it made
+// one (OpenJobs registered it), else named here.
+func (j *Job) outputFileName() string {
+	if j.outputName != "" {
+		return j.outputName
+	}
+	return CompactionOutputName(j.Measurement, j.Tier, j.BatchNumber, time.Now())
 }
