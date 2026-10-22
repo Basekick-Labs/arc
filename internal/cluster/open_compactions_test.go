@@ -142,6 +142,21 @@ func TestOpenTombstonesAFinishedObjectJob(t *testing.T) {
 	if !r.c.OpenAny(openPrefix) {
 		t.Fatal("a tombstoned job does not keep reads volatile")
 	}
+	age := func(d time.Duration) {
+		r.c.open.mu.Lock()
+		j := r.c.open.seen["j1"]
+		j.gone = time.Now().Add(-d)
+		r.c.open.seen["j1"] = j
+		r.c.open.mu.Unlock()
+	}
+	// Late in the tombstone: still left out.
+	age(objectSeenTombstone - time.Second)
+	if got := r.c.OpenExcludedFor(ctx, openPrefix); !sameSet(got, inputs) {
+		t.Fatalf("late in the tombstone: excluded %v, want %v", got, inputs)
+	}
+	if objectSeenTombstone <= 10*time.Second {
+		t.Fatalf("tombstone %v does not outlive DuckDB's 10 s glob cache", objectSeenTombstone)
+	}
 	r.c.open.mu.Lock()
 	j := r.c.open.seen["j1"]
 	j.gone = time.Now().Add(-objectSeenTombstone - time.Second)
