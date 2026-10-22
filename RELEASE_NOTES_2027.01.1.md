@@ -167,8 +167,8 @@ write is checked.
 **What clients see.** A client that has been sending, say, a field `Time`
 (pandas DataFrames often have one) got its writes accepted until now. They
 were accepted, and they broke the measurement later. Now those points are
-dropped with a `400`. The answer is Arc's partial-write answer, which line
-protocol has given for an exact `time` key since 26.09.
+dropped with a `400`. The answer is the same partial-write answer line protocol
+gives for a key named exactly `time`.
 
 **Existing measurements.** The measurement's field schema no longer lists
 these names, so reads of time ranges without such files work again. It is
