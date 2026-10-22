@@ -34,6 +34,10 @@ type timeBounds struct {
 	// exact: every top-level AND term that mentions the time column was read
 	// as a bound, so the bounds are the query's whole time predicate.
 	exact bool
+	// proofSafe: every bound is a literal or now() plus or minus an
+	// interval, and no end is inclusive: the shapes the empty-range proof
+	// and the open-ended shortcut were built and tested for.
+	proofSafe bool
 }
 
 var (
@@ -68,31 +72,36 @@ func scanTimeBounds(sqlStr string) (timeBounds, bool) {
 	if !ok {
 		return timeBounds{}, false
 	}
+	// One trailing statement terminator is allowed by the query API.
+	masked = strings.TrimRight(strings.TrimSpace(masked), ";")
 	// A quoted identifier spelling the time column reads as the column.
 	for ph, name := range sql.IdentifierNames(masks) {
 		if strings.EqualFold(name, "time") {
 			masked = strings.ReplaceAll(masked, ph, "time")
 		}
 	}
+	masked = separateTokens(masked)
+	// Every position below is taken in this one string: the FROM inside
+	// EXTRACT(… FROM …) and similar is masked here, and changes its length.
 	shape, _ := sql.MaskFromKeywordsInFunctionBodies(masked)
 	if len(fromWord.FindAllStringIndex(shape, -1)) != 1 || structuralWord.MatchString(shape) ||
 		subSelect.MatchString(shape) || len(whereWord.FindAllStringIndex(shape, -1)) != 1 {
 		return timeBounds{}, false
 	}
-	loc := whereWord.FindStringIndex(masked)
-	if loc == nil {
+	f := fromWord.FindStringIndex(shape)
+	loc := whereWord.FindStringIndex(shape)
+	// The WHERE must follow the FROM (a FILTER (WHERE …) before it is a
+	// second WHERE and refused above, but never slice on that assumption),
+	// and a comma join (FROM a, b) is a second table without a JOIN keyword.
+	if f == nil || loc == nil || f[1] > loc[0] || hasTopLevelComma(shape[f[1]:loc[0]]) {
 		return timeBounds{}, false
 	}
-	// A comma join (FROM a, b) is a second table without a JOIN keyword.
-	if f := fromWord.FindStringIndex(shape); f == nil || f[1] > loc[0] || hasTopLevelComma(shape[f[1]:loc[0]]) {
-		return timeBounds{}, false
-	}
-	terms, ok := topLevelConjuncts(masked[loc[1]:])
+	terms, ok := topLevelConjuncts(shape[loc[1]:])
 	if !ok {
 		return timeBounds{}, false
 	}
 	literals := literalValues(masks)
-	b := timeBounds{exact: true}
+	b := timeBounds{exact: true, proofSafe: true}
 	b.addTerms(terms, literals)
 	if b.start == nil && b.end == nil {
 		return timeBounds{}, false
@@ -105,7 +114,7 @@ func scanTimeBounds(sqlStr string) (timeBounds, bool) {
 func (b *timeBounds) addTerms(terms []string, literals map[string]string) {
 	for _, term := range terms {
 		term = trimOuterParens(term)
-		lo, hi, isBound := readBoundTerm(term, literals)
+		lo, hi, isBound, safe := readBoundTerm(term, literals)
 		if !isBound {
 			if inner, ok := topLevelConjuncts(term); ok && len(inner) > 1 {
 				b.addTerms(inner, literals)
@@ -115,6 +124,9 @@ func (b *timeBounds) addTerms(terms []string, literals map[string]string) {
 				b.exact = false
 			}
 			continue
+		}
+		if !safe {
+			b.proofSafe = false
 		}
 		if lo != nil && (b.start == nil || lo.After(*b.start)) {
 			b.start = lo
@@ -129,15 +141,15 @@ func (b *timeBounds) addTerms(terms []string, literals map[string]string) {
 // it returns is exclusive: an inclusive end (<=, BETWEEN) is moved one
 // microsecond (Arc's timestamp precision) past its literal, so the hour it
 // falls on is read.
-func readBoundTerm(term string, literals map[string]string) (lo, hi *time.Time, ok bool) {
+func readBoundTerm(term string, literals map[string]string) (lo, hi *time.Time, ok, proofSafe bool) {
 	if m := betweenRHS.FindStringSubmatch(term); m != nil {
 		a, okA := operandTime(m[1:6], literals)
 		z, okZ := operandTime(m[6:11], literals)
 		if !okA || !okZ {
-			return nil, nil, false
+			return nil, nil, false, false
 		}
 		z = z.Add(time.Microsecond)
-		return &a, &z, true
+		return &a, &z, true, false
 	}
 	var op string
 	var opnd []string
@@ -146,21 +158,32 @@ func readBoundTerm(term string, literals map[string]string) (lo, hi *time.Time, 
 	} else if m := lhsOpCol.FindStringSubmatch(term); m != nil {
 		opnd, op = m[1:6], flipOp(m[6])
 	} else {
-		return nil, nil, false
+		return nil, nil, false, false
 	}
 	t, okT := operandTime(opnd, literals)
 	if !okT {
-		return nil, nil, false
+		return nil, nil, false, false
 	}
+	safe := operandProofSafe(opnd)
 	switch op {
 	case ">=", ">":
-		return &t, nil, true
+		return &t, nil, true, safe
 	case "<=":
 		t = t.Add(time.Microsecond)
-		return nil, &t, true
+		return nil, &t, true, false
 	default: // "<"
-		return nil, &t, true
+		return nil, &t, true, safe
 	}
+}
+
+// operandProofSafe: a literal, or now() with an interval (not
+// CURRENT_TIMESTAMP, not a bare now()).
+func operandProofSafe(m []string) bool {
+	whole := strings.ToLower(strings.TrimSpace(m[0]))
+	if strings.HasPrefix(whole, "__str_") || strings.HasPrefix(whole, "timestamp") {
+		return true
+	}
+	return strings.HasPrefix(whole, "now") && m[1] != ""
 }
 
 func flipOp(op string) string {
@@ -183,7 +206,9 @@ func operandTime(m []string, literals map[string]string) (time.Time, bool) {
 	if strings.HasPrefix(whole, "__STR_") || strings.HasPrefix(strings.ToLower(whole), "timestamp") {
 		ph := placeholderIn(whole)
 		lit, ok := literals[ph]
-		if !ok {
+		if !ok || utcOffsetSuffix.MatchString(lit) {
+			// An explicit offset: DuckDB's TIMESTAMP cast drops it where this
+			// parser applies it, so the two would disagree by the offset.
 			return time.Time{}, false
 		}
 		t, err := parseDateTime(lit)
@@ -210,6 +235,25 @@ func operandTime(m []string, literals map[string]string) (time.Time, bool) {
 }
 
 var placeholderPattern = regexp.MustCompile(`__STR_\d+__`)
+
+var (
+	// numberThenLetter: DuckDB ends a numeric literal at the first letter
+	// that cannot continue it, so "1OR" is the number 1 then OR.
+	numberThenLetter = regexp.MustCompile(`(^|[^A-Za-z0-9_.])(\d+(?:\.\d+)?)([A-Za-df-zA-DF-Z_])`)
+	anyPlaceholder   = regexp.MustCompile(`__(?:STR|IDENT)_\d+__`)
+)
+
+// separateTokens puts a space around each masked literal and between a
+// number and a letter that follows it, so keyword boundaries are where
+// DuckDB's lexer puts them ('y'OR and 1OR are both followed by an OR).
+func separateTokens(s string) string {
+	s = anyPlaceholder.ReplaceAllString(s, " $0 ")
+	return numberThenLetter.ReplaceAllString(s, "$1$2 $3")
+}
+
+// utcOffsetSuffix is a +hh, +hhmm or +hh:mm (or minus) offset after a clock
+// time (never the day of a date-only literal).
+var utcOffsetSuffix = regexp.MustCompile(`\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?\s*[+-]\d{2}(?::?\d{2})?$`)
 
 func placeholderIn(s string) string { return placeholderPattern.FindString(s) }
 
@@ -243,7 +287,7 @@ func stripMaskedComments(s string) (string, bool) {
 	for i := 0; i < len(s); {
 		switch {
 		case strings.HasPrefix(s[i:], "--"):
-			j := strings.IndexByte(s[i:], '\n')
+			j := strings.IndexAny(s[i:], "\n\r") // as DuckDB, and sql.MaskStringLiterals
 			if j < 0 {
 				return b.String(), true
 			}
@@ -264,75 +308,108 @@ func stripMaskedComments(s string) (string, bool) {
 	return b.String(), true
 }
 
+// nesting tracks how deep a scan is inside brackets and CASE … END, the
+// constructs whose AND, OR and commas are not top-level.
+type nesting struct{ depth int }
+
+// step advances over s[i] (and returns how many bytes it consumed: a whole
+// word, so a keyword is seen once). lower is s with ASCII letters lowered.
+func (n *nesting) step(lower string, i int) int {
+	switch c := lower[i]; {
+	case c == '(' || c == '[' || c == '{':
+		n.depth++
+	case c == ')' || c == ']' || c == '}':
+		n.depth--
+	case isWordByte(c) && (i == 0 || !isWordByte(lower[i-1])):
+		e := i
+		for e < len(lower) && isWordByte(lower[e]) {
+			e++
+		}
+		switch lower[i:e] {
+		case "case":
+			n.depth++
+		case "end":
+			n.depth--
+		}
+		return e - i
+	}
+	return 1
+}
+
+// asciiLower lowers ASCII letters only, keeping every byte where it was, so
+// indexes into the result index the input (strings.ToLower may change the
+// length of non-ASCII text).
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + 'a' - 'A'
+		}
+	}
+	return string(b)
+}
+
+// wordAt reports the whole word w at lower[i].
+func wordAt(lower string, i int, w string) bool {
+	if !strings.HasPrefix(lower[i:], w) || (i > 0 && isWordByte(lower[i-1])) {
+		return false
+	}
+	e := i + len(w)
+	return e >= len(lower) || !isWordByte(lower[e])
+}
+
 // topLevelConjuncts splits a WHERE clause (starting just after the keyword)
 // into its top-level AND terms, stopping at the first clause keyword at
-// paren depth 0. The AND of a BETWEEN stays inside its term. ok is false for
-// a top-level OR, or unbalanced parentheses.
+// depth 0. The AND of a BETWEEN stays inside its term. ok is false for a
+// top-level OR, or unbalanced nesting.
 func topLevelConjuncts(clause string) ([]string, bool) {
 	var terms []string
-	depth, start := 0, 0
+	lower := asciiLower(clause)
+	var n nesting
+	start, end := 0, len(clause)
 	betweenOpen := false
-	lower := strings.ToLower(clause)
-	isWordAt := func(i int, w string) bool {
-		if !strings.HasPrefix(lower[i:], w) {
-			return false
-		}
-		if i > 0 && isWordByte(lower[i-1]) {
-			return false
-		}
-		e := i + len(w)
-		return e >= len(lower) || !isWordByte(lower[e])
-	}
-	end := len(clause)
-	for i := 0; i < len(clause); i++ {
-		c := clause[i]
-		switch {
-		case c == '(':
-			depth++
-		case c == ')':
-			depth--
-			if depth < 0 {
-				end = i // the WHERE of an enclosing parenthesis ends here
+	for i := 0; i < len(clause); {
+		top := n.depth == 0
+		if top && (i == 0 || !isWordByte(lower[i-1])) {
+			switch {
+			case whereEndWord.MatchString(lower[i:]):
+				end = i
 				goto done
+			case wordAt(lower, i, "or"):
+				return nil, false
+			case wordAt(lower, i, "between"):
+				betweenOpen = true
+			case wordAt(lower, i, "and"):
+				if betweenOpen {
+					betweenOpen = false
+				} else {
+					terms = append(terms, strings.TrimSpace(clause[start:i]))
+					start = i + len("and")
+				}
 			}
-		case depth == 0 && (i == 0 || !isWordByte(lower[i-1])) && whereEndWord.MatchString(lower[i:]):
-			end = i
-			goto done
-		case depth == 0 && isWordAt(i, "or"):
+		}
+		i += n.step(lower, i)
+		if n.depth < 0 {
 			return nil, false
-		case depth == 0 && isWordAt(i, "between"):
-			betweenOpen = true
-		case depth == 0 && isWordAt(i, "and"):
-			if betweenOpen {
-				betweenOpen = false
-				continue
-			}
-			terms = append(terms, strings.TrimSpace(clause[start:i]))
-			start = i + len("and")
 		}
 	}
 done:
-	if depth > 0 {
+	if n.depth != 0 {
 		return nil, false
 	}
 	terms = append(terms, strings.TrimSpace(clause[start:end]))
 	return terms, true
 }
 
-// hasTopLevelComma reports a comma outside parentheses.
+// hasTopLevelComma reports a comma outside brackets and CASE … END.
 func hasTopLevelComma(s string) bool {
-	depth := 0
-	for i := 0; i < len(s); i++ {
-		switch s[i] {
-		case '(':
-			depth++
-		case ')':
-			depth--
-		case ',':
-			if depth == 0 {
-				return true
-			}
+	lower := asciiLower(s)
+	var n nesting
+	for i := 0; i < len(s); {
+		if n.depth == 0 && s[i] == ',' {
+			return true
 		}
+		i += n.step(lower, i)
 	}
 	return false
 }
@@ -359,6 +436,9 @@ func trimOuterParens(s string) string {
 					return s // the first paren closes before the end: (a) op (b)
 				}
 			}
+		}
+		if depth != 0 {
+			return s
 		}
 		s = s[1 : len(s)-1]
 	}

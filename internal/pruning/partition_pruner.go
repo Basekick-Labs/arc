@@ -391,7 +391,7 @@ type TimeRange struct {
 	Start time.Time
 	End   time.Time
 	// StartAssumed marks a range whose Start was not extracted from the query
-	// but assumed (an end-only predicate defaults Start to 2020-01-01). A
+	// but assumed (an end-only predicate defaults Start to the 1970 partition floor). A
 	// consumer pruning storage that can legitimately hold data older than the
 	// assumption (a cold archive tier) must not trust Start for exclusion.
 	StartAssumed bool
@@ -410,6 +410,10 @@ func evaluateRelativeTime(amount string, unit string, isAddition bool) (time.Tim
 	n, err := strconv.Atoi(amount)
 	if err != nil {
 		return time.Time{}, err
+	}
+	// Far past any data and far from overflowing a time.Duration.
+	if n > 1_000_000 {
+		return time.Time{}, fmt.Errorf("interval amount %d too large", n)
 	}
 
 	// For subtraction, make n negative
@@ -432,10 +436,24 @@ func evaluateRelativeTime(amount string, unit string, isAddition bool) (time.Tim
 	case "week":
 		return now.AddDate(0, 0, n*7), nil
 	case "month":
-		return now.AddDate(0, n, 0), nil
+		// DuckDB clamps to the target month's last day (Mar 31 - 1 month is
+		// Feb 28); Go's AddDate normalises past it (Mar 3), a later start.
+		return addMonthsClamped(now, n), nil
 	default:
 		return time.Time{}, fmt.Errorf("unknown time unit: %s", unit)
 	}
+}
+
+// addMonthsClamped adds n months the way DuckDB does: the day of month is
+// kept, or clamped to the last day of the target month.
+func addMonthsClamped(t time.Time, n int) time.Time {
+	first := time.Date(t.Year(), t.Month(), 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), t.Location()).AddDate(0, n, 0)
+	last := first.AddDate(0, 1, -1).Day()
+	day := t.Day()
+	if day > last {
+		day = last
+	}
+	return first.AddDate(0, 0, day-1)
 }
 
 // NewPartitionPruner creates a new partition pruner
@@ -456,16 +474,13 @@ func (p *PartitionPruner) SetStorageBackend(backend storage.Backend) {
 	p.storage = backend
 }
 
-// ExtractTimeRange extracts time range from WHERE clause
-//
-// Supports patterns like:
-// - time >= '2024-03-15' AND time < '2024-03-16'
-// - time BETWEEN '2024-03-15' AND '2024-03-16'
-// - time > '2024-03-15 10:00:00'
-// - time >= '2024-03-15T10:00:00Z'
-// - time > NOW() - INTERVAL '20 days'
-// - time >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
-// - time < NOW() + INTERVAL '1 week'
+// ExtractTimeRange returns the time range every row of the query lies in, or
+// nil. See time_bounds.go for the rule; in short, bounds come only from the
+// top-level AND terms of a single-table query's one WHERE clause that are a
+// bare comparison of the time column (time, "time", alias.time, (time)) with
+// a literal ('…', '…'::timestamp, TIMESTAMP '…'), now()/CURRENT_TIMESTAMP
+// plus or minus one interval, or a BETWEEN; either operand order. An
+// inclusive end is returned one microsecond past its literal.
 func (p *PartitionPruner) ExtractTimeRange(sqlStr string) *TimeRange {
 	b, ok := scanTimeBounds(sqlStr)
 	if !ok {

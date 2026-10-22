@@ -171,3 +171,92 @@ func TestTimeRangeIntersectsBounds(t *testing.T) {
 		t.Fatalf("range %+v, want 10:00..11:00", tr)
 	}
 }
+
+// Shapes from the deep review, each wrong (or a panic) on an earlier
+// version of the scanner.
+func TestTimeRangeReviewShapes(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+	for name, q := range map[string]string{
+		// ANDs inside CASE … END, brackets and braces are not top-level.
+		"CASE with AND":   "SELECT * FROM db.cpu WHERE CASE WHEN host='a' THEN v > 0 AND time >= '2024-06-01' AND v < 100 ELSE true END",
+		"list with AND":   "SELECT * FROM db.cpu WHERE [v > 0 AND time >= '2024-06-01'][1]",
+		"struct with AND": "SELECT * FROM db.cpu WHERE {'a': v > 0 AND time >= '2024-06-01'}.a",
+		// A line comment ends at \r as well as \n.
+		"CR-ended comment": "SELECT * FROM db.cpu WHERE time >= '2024-06-01' --x\rOR true",
+		// A masked in-function FROM must not shift the comma-join window.
+		"EXTRACT plus comma join": "SELECT EXTRACT(hour FROM c.time) h FROM cpu_long_measurement_name c, mem m WHERE c.time >= '2024-06-01'",
+		// DuckDB ends a number or a literal before a keyword glued to it.
+		"number glued to OR":  "SELECT * FROM db.cpu WHERE time >= '2024-06-01' AND v=1OR v=2",
+		"literal glued to OR": "SELECT * FROM db.cpu WHERE time >= '2024-06-01' AND host='x'OR host='y'",
+		// DuckDB's TIMESTAMP cast drops an explicit offset; the parser
+		// applies it.
+		"offset under cast":   "SELECT * FROM db.cpu WHERE time < '2024-06-01T10:00:00+02:00'::timestamp",
+		"offset bare literal": "SELECT * FROM db.cpu WHERE time >= '2024-06-01 10:00:00-05'",
+		// An interval far past any data.
+		"overflowing interval": "SELECT * FROM db.cpu WHERE time > now() - interval '99999999999 hours'",
+	} {
+		if tr := p.ExtractTimeRange(q); tr != nil && !tr.StartAssumed {
+			t.Errorf("%s: range %v..%v, want none", name, tr.Start, tr.End)
+		}
+	}
+	// No panic on input whose lowercase is a different length, or on a
+	// FILTER (WHERE …) before the FROM.
+	for _, q := range []string{
+		"SELECT * FROM db.cpu WHERE Kelvin = 1 AND time >= '2024-06-01'",
+		"SELECT * FROM db.cpu WHERE \xff\xfe = 1 AND time >= '2024-06-01'",
+		"SELECT count(*) FILTER (WHERE time >= '2024-06-01') FROM db.cpu",
+	} {
+		_ = p.ExtractTimeRange(q)
+		_ = IsExactTimeRange(q)
+	}
+	// Still pruned: a trailing terminator, EXTRACT(… FROM time) in the
+	// select list, and Grafana's form gets the exact-shape shortcuts.
+	for _, q := range []string{
+		"SELECT * FROM db.cpu WHERE time >= '2024-06-01' AND time < '2024-06-02';",
+		"SELECT EXTRACT(hour FROM time) h, count(*) FROM db.cpu WHERE time >= '2024-06-01' AND time < '2024-06-02' GROUP BY h",
+	} {
+		if tr := p.ExtractTimeRange(q); tr == nil || tr.StartAssumed || tr.EndAssumed {
+			t.Errorf("not pruned: %q (%+v)", q, tr)
+		}
+	}
+	if !IsExactTimeRange("SELECT * FROM db.cpu WHERE (time) >= '2024-06-01T00:00:00Z' AND (time) < '2024-06-02T00:00:00Z'") {
+		t.Error("Grafana's $__timeFilter form is not an exact range")
+	}
+}
+
+// A month interval ends where DuckDB ends it: Mar 31 minus one month is
+// Feb 28 (29), not Mar 3.
+func TestAddMonthsClamped(t *testing.T) {
+	for _, tc := range []struct{ from, want string }{
+		{"2026-03-31 10:00:00", "2026-02-28 10:00:00"},
+		{"2024-03-31 10:00:00", "2024-02-29 10:00:00"},
+		{"2026-01-31 00:00:00", "2025-12-31 00:00:00"},
+		{"2026-05-15 12:30:00", "2026-04-15 12:30:00"},
+	} {
+		if got := addMonthsClamped(mustT(t, tc.from), -1); !got.Equal(mustT(t, tc.want)) {
+			t.Errorf("%s - 1 month = %v, want %s", tc.from, got, tc.want)
+		}
+	}
+}
+
+// FuzzTimeBounds: no input may panic the scanner or the exact-shape check.
+func FuzzTimeBounds(f *testing.F) {
+	for _, s := range []string{
+		"SELECT * FROM db.cpu WHERE time >= '2024-06-01' AND time < '2024-06-02'",
+		"SELECT * FROM db.cpu WHERE Kelvin = 1 AND time >= '2024-06-01'",
+		"SELECT count(*) FILTER (WHERE time >= 'x') FROM t",
+		"SELECT * FROM t WHERE (time) >= 'a' AND ((b) AND c)) OR (",
+		"SELECT * FROM t WHERE CASE WHEN a THEN b END AND time > now() - INTERVAL 5 MINUTE",
+		"SELECT * FROM t WHERE time BETWEEN '1' AND",
+	} {
+		f.Add(s)
+	}
+	p := NewPartitionPruner(zerolog.Nop())
+	f.Fuzz(func(t *testing.T, s string) {
+		_ = p.ExtractTimeRange(s)
+		_, _, _ = bareTimeBounds(s)
+		_ = trimOuterParens(s)
+		_, _ = topLevelConjuncts(s)
+		_ = hasTopLevelComma(s)
+	})
+}
