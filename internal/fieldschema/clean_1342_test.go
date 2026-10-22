@@ -105,3 +105,40 @@ func TestKnownColumnFolds(t *testing.T) {
 		t.Fatalf("folds[temp] = %q", got)
 	}
 }
+
+// A file schema carrying such names never reaches a new anchor.
+func TestNewAnchorFromADirtyFileIsClean(t *testing.T) {
+	r, b, _ := newTestRegistry(t, Options{})
+	ctx := context.Background()
+	if err := r.Ensure(ctx, "db", "m", fields("time", tTsTZ, "Time", tFloat, "v", tFloat), nil); err != nil {
+		t.Fatal(err)
+	}
+	data, err := b.Read(ctx, AnchorKey("db", "m"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, _ := DecodeAnchor(data)
+	if names(stored) != "time,v" {
+		t.Fatalf("anchor = %s", names(stored))
+	}
+}
+
+// The known spellings are published when an anchor is loaded from storage
+// (a restart), not only when this process writes one.
+func TestKnownColumnFoldsAfterLoad(t *testing.T) {
+	r, b, _ := newTestRegistry(t, Options{})
+	ctx := context.Background()
+	data, err := EncodeAnchor(Normalize(fields("time", tTsTZ, "Temp", tFloat), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Write(ctx, AnchorKey("db", "m"), data); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := r.Fields(ctx, "db", "m"); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.KnownColumnFolds("db", "m")["temp"]; got != "Temp" {
+		t.Fatalf("folds[temp] = %q after a load", got)
+	}
+}
