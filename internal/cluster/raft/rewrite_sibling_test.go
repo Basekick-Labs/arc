@@ -56,7 +56,8 @@ func TestHasRewriteSibling(t *testing.T) {
 	if err := fsm2.Restore(io.NopCloser(&buf)); err != nil {
 		t.Fatal(err)
 	}
-	if !fsm2.HasRewriteSibling(rw1) {
+	// The original's only way to find its registered rewrite is the index.
+	if !fsm2.HasRewriteSibling(orig) {
 		t.Fatal("restored: a registered rewrite is not found")
 	}
 }

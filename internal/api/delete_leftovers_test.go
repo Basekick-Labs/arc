@@ -512,6 +512,11 @@ func TestClusterRemovesOnlyProvablyOlderLeftovers(t *testing.T) {
 	if !r.exists(inflight) || !r.exists(inflightBase) || !r.exists(rw) {
 		t.Fatal("removed a file with fewer rows than its listed member, or a listed one")
 	}
+	// Same rows as the listed copy: not provably older.
+	r.parquet(old, "h1")
+	if n := r.h.removeLeftovers(context.Background(), "db", "cpu"); n != 0 || !r.exists(old) {
+		t.Fatalf("removed %d copies with as many rows as the listed one", n)
+	}
 	// Commit off: nothing removed.
 	r.parquet(old, "h0", "h1")
 	coord.cas = false
