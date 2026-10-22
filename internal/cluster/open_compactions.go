@@ -235,12 +235,12 @@ func (c *Coordinator) objectExcluded(ctx context.Context, prefix string) []strin
 				(*fn)()
 			}
 		}
-		holds := c.staged.holds
+		hold := stagedCommitter{c: c}.HoldsRegistration
 		for _, in := range s.Inputs {
 			if e, ok := fsm.GetFile(in.Path); ok && e.SHA256 != in.SHA256 {
 				continue
 			}
-			if holds != nil && holds(in.Path) {
+			if hold(in.Path) {
 				continue
 			}
 			out = append(out, in.Path)
