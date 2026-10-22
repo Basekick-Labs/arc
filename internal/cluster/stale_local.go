@@ -409,6 +409,7 @@ func (c *Coordinator) TracksLocalCopies() bool {
 
 // forgetLocal drops path from the set (its copy was removed).
 func (c *Coordinator) forgetLocal(path string) {
+	c.forgetLocalDeleted(path)
 	if seen := c.stale.seen.Load(); seen != nil {
 		seen.remove(path)
 	}
