@@ -196,7 +196,7 @@ func (h *DeleteHandler) RewriteForRecords(ctx context.Context, relativePath stri
 		return cluster.DeleteRewriteResult{Left: before}, nil
 	}
 	where := cluster.CombineDeleteWheres(bound)
-	count := fmt.Sprintf(`SELECT COUNT(*), COUNT(*) FILTER (WHERE NOT (%s)) FROM %s`, where, source)
+	count := fmt.Sprintf(`SELECT COUNT(*), COUNT(*) FILTER (WHERE NOT COALESCE((%s), false)) FROM %s`, where, source)
 	if err := h.db.DB().QueryRowContext(ctx, count).Scan(&before, &after); err != nil {
 		return cluster.DeleteRewriteResult{}, fmt.Errorf("count rows matching DELETE records: %w", err)
 	}

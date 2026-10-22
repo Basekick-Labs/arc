@@ -562,3 +562,32 @@ func TestUnreadableFamilyFailsClosed(t *testing.T) {
 		t.Fatal("scanned a family whose members could not be counted")
 	}
 }
+
+// A row the clause cannot decide (NULL) is not matched, so the rewrite keeps
+// it: `WHERE NOT (w)` dropped it without counting it deleted.
+func TestRewriteKeepsRowsTheClauseCannotDecide(t *testing.T) {
+	r := newLeftoverRig(t)
+	old := leftoverHour + "cpu_20261007_204851_558252000.parquet"
+	full := filepath.Join(r.root, old)
+	if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.db.DB().Exec(fmt.Sprintf("COPY (SELECT * FROM (VALUES ('a', 1), (NULL, 2), ('b', 3)) AS v(host, v)) TO '%s' (FORMAT PARQUET)", full)); err != nil {
+		t.Fatal(err)
+	}
+	n, err := r.h.rewriteFileWithoutDeletedRows(context.Background(), full, old, "host <> 'a'", "")
+	if err != nil || n != 1 {
+		t.Fatalf("deleted %d (%v), want 1", n, err)
+	}
+	files := r.files()
+	if len(files) != 1 {
+		t.Fatalf("files %v", files)
+	}
+	var rows int
+	if err := r.db.DB().QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM read_parquet('%s')", filepath.Join(r.root, files[0]))).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 2 {
+		t.Fatalf("rewrite holds %d rows, want 2 (the NULL host is not deleted)", rows)
+	}
+}

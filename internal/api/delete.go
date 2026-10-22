@@ -1127,12 +1127,15 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 	db := h.db.DB()
 
 	// Optimized: Single query to count both total rows and rows to keep
-	// Uses COUNT(*) FILTER to get conditional count in one scan
+	// Uses COUNT(*) FILTER to get conditional count in one scan. A row the
+	// clause cannot decide (NULL, e.g. host <> 'a' on a NULL host) is not
+	// matched, as the scan counts it, so it is kept: NOT on its own would
+	// drop it from the rewrite without counting it deleted.
 	var rowsBefore, rowsAfter int64
 	countQuery := fmt.Sprintf(`
 		SELECT
 			COUNT(*) as total,
-			COUNT(*) FILTER (WHERE NOT (%s)) as remaining
+			COUNT(*) FILTER (WHERE NOT COALESCE((%s), false)) as remaining
 		FROM %s`,
 		whereClause, sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(queryPath)))
 
@@ -1292,7 +1295,7 @@ func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, relative
 	// database-wide setting is false.
 	copyQuery := fmt.Sprintf(`
 		COPY (
-			SELECT * FROM %s WHERE NOT (%s)
+			SELECT * FROM %s WHERE NOT COALESCE((%s), false)
 		) TO %s (
 			FORMAT PARQUET,
 			COMPRESSION ZSTD,
@@ -1380,7 +1383,7 @@ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath,
 	// database-wide setting is false.
 	copyQuery := fmt.Sprintf(`
 		COPY (
-			SELECT * FROM %s WHERE NOT (%s)
+			SELECT * FROM %s WHERE NOT COALESCE((%s), false)
 		) TO %s (
 			FORMAT PARQUET,
 			COMPRESSION ZSTD,
