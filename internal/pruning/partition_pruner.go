@@ -13,7 +13,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
@@ -173,48 +172,6 @@ var (
 	// Pattern to extract WHERE clause from SQL
 	// Using [\s\S]+? instead of .+? to match across newlines
 	whereClausePattern = regexp.MustCompile(`(?i)\bWHERE\b\s+([\s\S]+?)(?:\bGROUP BY\b|\bORDER BY\b|\bLIMIT\b|$)`)
-
-	// Patterns for start time extraction
-	startTimePatterns = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)time\s*>=\s*'([^']+)'`),
-		regexp.MustCompile(`(?i)time\s*>\s*'([^']+)'`),
-		regexp.MustCompile(`(?i)timestamp\s*>=\s*'([^']+)'`),
-		regexp.MustCompile(`(?i)timestamp\s*>\s*'([^']+)'`),
-	}
-
-	// Patterns for end time extraction
-	endTimePatterns = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)time\s*<\s*'([^']+)'`),
-		regexp.MustCompile(`(?i)time\s*<=\s*'([^']+)'`),
-		regexp.MustCompile(`(?i)timestamp\s*<\s*'([^']+)'`),
-		regexp.MustCompile(`(?i)timestamp\s*<=\s*'([^']+)'`),
-	}
-
-	// Pattern for BETWEEN clause
-	betweenPattern = regexp.MustCompile(`(?i)time\s+BETWEEN\s+'([^']+)'\s+AND\s+'([^']+)'`)
-
-	// Patterns for relative time expressions (NOW() +/- INTERVAL)
-	// These capture: (1) the numeric amount, (2) the time unit, and detect +/- via separate patterns.
-	//
-	// Two branches per direction, deliberately NOT one pattern with optional
-	// quotes (that widening shipped two silent wrong-pruning bugs in review:
-	// a compound interval like '1 day 12 hours' matched its '1 day' prefix,
-	// and interval-looking text inside string literals matched):
-	//   - quoted branch: SQL-standard INTERVAL '300 seconds' — closing quote
-	//     REQUIRED right after the unit, so compound intervals cannot match a
-	//     prefix; runs against the unmasked clause (unchanged from before).
-	//   - unquoted branch: DuckDB-native INTERVAL 300 SECOND — \s+ after
-	//     INTERVAL and \b after the unit (no interval2/identifier matches);
-	//     runs against the MASKED clause, so literal contents can never match.
-	relativeStartSubtractPattern = regexp.MustCompile(`(?i)time\s*>=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
-	relativeStartAddPattern      = regexp.MustCompile(`(?i)time\s*>=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
-	relativeEndSubtractPattern   = regexp.MustCompile(`(?i)time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
-	relativeEndAddPattern        = regexp.MustCompile(`(?i)time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s*'(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)'`)
-
-	relativeStartSubtractUnquotedPattern = regexp.MustCompile(`(?i)time\s*>=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)\b`)
-	relativeStartAddUnquotedPattern      = regexp.MustCompile(`(?i)time\s*>=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)\b`)
-	relativeEndSubtractUnquotedPattern   = regexp.MustCompile(`(?i)time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*-\s*INTERVAL\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)\b`)
-	relativeEndAddUnquotedPattern        = regexp.MustCompile(`(?i)time\s*<=?\s*(?:NOW\s*\(\s*\)|CURRENT_TIMESTAMP)\s*\+\s*INTERVAL\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)\b`)
 
 	// Pattern to parse storage paths.
 	//
@@ -434,7 +391,7 @@ type TimeRange struct {
 	Start time.Time
 	End   time.Time
 	// StartAssumed marks a range whose Start was not extracted from the query
-	// but assumed (an end-only predicate defaults Start to 2020-01-01). A
+	// but assumed (an end-only predicate defaults Start to the 1970 partition floor). A
 	// consumer pruning storage that can legitimately hold data older than the
 	// assumption (a cold archive tier) must not trust Start for exclusion.
 	StartAssumed bool
@@ -450,9 +407,18 @@ type TimeRange struct {
 // unit: the time unit (e.g., "days", "hours")
 // isAddition: true for NOW() + INTERVAL, false for NOW() - INTERVAL
 func evaluateRelativeTime(amount string, unit string, isAddition bool) (time.Time, error) {
+	return evaluateRelativeTimeAt(time.Now().UTC(), amount, unit, isAddition)
+}
+
+// evaluateRelativeTimeAt is evaluateRelativeTime from a given now.
+func evaluateRelativeTimeAt(now time.Time, amount string, unit string, isAddition bool) (time.Time, error) {
 	n, err := strconv.Atoi(amount)
 	if err != nil {
 		return time.Time{}, err
+	}
+	// Far past any data and far from overflowing a time.Duration.
+	if n > 1_000_000 {
+		return time.Time{}, fmt.Errorf("interval amount %d too large", n)
 	}
 
 	// For subtraction, make n negative
@@ -460,7 +426,6 @@ func evaluateRelativeTime(amount string, unit string, isAddition bool) (time.Tim
 		n = -n
 	}
 
-	now := time.Now().UTC()
 	unit = strings.ToLower(strings.TrimSuffix(unit, "s")) // normalize: days -> day
 
 	switch unit {
@@ -475,10 +440,24 @@ func evaluateRelativeTime(amount string, unit string, isAddition bool) (time.Tim
 	case "week":
 		return now.AddDate(0, 0, n*7), nil
 	case "month":
-		return now.AddDate(0, n, 0), nil
+		// DuckDB clamps to the target month's last day (Mar 31 - 1 month is
+		// Feb 28); Go's AddDate normalises past it (Mar 3), a later start.
+		return addMonthsClamped(now, n), nil
 	default:
 		return time.Time{}, fmt.Errorf("unknown time unit: %s", unit)
 	}
+}
+
+// addMonthsClamped adds n months the way DuckDB does: the day of month is
+// kept, or clamped to the last day of the target month.
+func addMonthsClamped(t time.Time, n int) time.Time {
+	first := time.Date(t.Year(), t.Month(), 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), t.Location()).AddDate(0, n, 0)
+	last := first.AddDate(0, 1, -1).Day()
+	day := t.Day()
+	if day > last {
+		day = last
+	}
+	return first.AddDate(0, 0, day-1)
 }
 
 // NewPartitionPruner creates a new partition pruner
@@ -499,132 +478,31 @@ func (p *PartitionPruner) SetStorageBackend(backend storage.Backend) {
 	p.storage = backend
 }
 
-// ExtractTimeRange extracts time range from WHERE clause
-//
-// Supports patterns like:
-// - time >= '2024-03-15' AND time < '2024-03-16'
-// - time BETWEEN '2024-03-15' AND '2024-03-16'
-// - time > '2024-03-15 10:00:00'
-// - time >= '2024-03-15T10:00:00Z'
-// - time > NOW() - INTERVAL '20 days'
-// - time >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
-// - time < NOW() + INTERVAL '1 week'
+// ExtractTimeRange returns the time range every row of the query lies in, or
+// nil. See time_bounds.go for the rule; in short, bounds come only from the
+// top-level AND terms of a single-table query's one WHERE clause that are a
+// bare comparison of the time column (time, "time", alias.time, (time)) with
+// a literal ('…', '…'::timestamp, TIMESTAMP '…'), now()/CURRENT_TIMESTAMP
+// plus or minus one interval, or a BETWEEN; either operand order. An
+// inclusive end is returned one microsecond past its literal.
 func (p *PartitionPruner) ExtractTimeRange(sqlStr string) *TimeRange {
-	// Check if WHERE clause exists
-	if !strings.Contains(strings.ToUpper(sqlStr), "WHERE") {
+	b, ok := scanTimeBounds(sqlStr)
+	if !ok {
 		return nil
 	}
-
-	// Mask string literals to prevent regex from matching GROUP BY/ORDER BY/LIMIT inside strings
-	// e.g., "WHERE message LIKE '%GROUP BY%'" should not stop at the literal GROUP BY
-	maskedSQL, masks := sql.MaskStringLiterals(sqlStr, sql.HasQuotes(sqlStr))
-
-	// Extract WHERE clause boundaries using masked SQL
-	matches := whereClausePattern.FindStringSubmatch(maskedSQL)
-	if len(matches) < 2 {
-		return nil
-	}
-
-	// Get the masked WHERE clause, then unmask it to get actual time values
-	maskedWhereClause := matches[1]
-	whereClause := sql.UnmaskStringLiterals(maskedWhereClause, masks)
-	// The clause was just deliberately UNMASKED for analysis, so mask it for the
-	// log. Truncating before masking is safe: a cut mid-literal leaves it
-	// unterminated, and ForLog masks unterminated literals to the end.
-	p.logger.Debug().Str("where_clause", sql.ForLog(whereClause[:min(200, len(whereClause))])).Msg("Analyzing WHERE clause")
-
-	var startTime, endTime *time.Time
-
-	// Try pre-compiled start time patterns
-	for _, re := range startTimePatterns {
-		if match := re.FindStringSubmatch(whereClause); match != nil {
-			if t, err := parseDateTime(match[1]); err == nil {
-				startTime = &t
-				p.logger.Debug().Time("start_time", t).Msg("Found start time")
-				break
-			}
-		}
-	}
-
-	// Try pre-compiled end time patterns
-	for _, re := range endTimePatterns {
-		if match := re.FindStringSubmatch(whereClause); match != nil {
-			if t, err := parseDateTime(match[1]); err == nil {
-				endTime = &t
-				p.logger.Debug().Time("end_time", t).Msg("Found end time")
-				break
-			}
-		}
-	}
-
-	// Try BETWEEN pattern
-	if match := betweenPattern.FindStringSubmatch(whereClause); match != nil {
-		if t1, err1 := parseDateTime(match[1]); err1 == nil {
-			if t2, err2 := parseDateTime(match[2]); err2 == nil {
-				startTime = &t1
-				endTime = &t2
-				p.logger.Debug().
-					Time("start_time", t1).
-					Time("end_time", t2).
-					Msg("Found BETWEEN range")
-			}
-		}
-	}
-
-	// Try relative time patterns if not found yet. Quoted patterns run
-	// against the unmasked clause (a quoted interval IS a string literal);
-	// unquoted patterns run against the MASKED clause so interval-looking
-	// text inside string literals (e.g. a log-search LIKE) can never match.
-	// matchRelative tries one (pattern, clause, isAddition) combination.
-	matchRelative := func(re *regexp.Regexp, clause string, isAddition bool, kind string) *time.Time {
-		if match := re.FindStringSubmatch(clause); match != nil {
-			if t, err := evaluateRelativeTime(match[1], match[2], isAddition); err == nil {
-				p.logger.Debug().Time("time", t).Str("expression", kind).Msg("Found relative time bound")
-				return &t
-			}
-		}
-		return nil
-	}
-	if startTime == nil {
-		startTime = matchRelative(relativeStartSubtractPattern, whereClause, false, "NOW() - INTERVAL")
-	}
-	if startTime == nil {
-		startTime = matchRelative(relativeStartAddPattern, whereClause, true, "NOW() + INTERVAL")
-	}
-	if startTime == nil {
-		startTime = matchRelative(relativeStartSubtractUnquotedPattern, maskedWhereClause, false, "NOW() - INTERVAL (unquoted)")
-	}
-	if startTime == nil {
-		startTime = matchRelative(relativeStartAddUnquotedPattern, maskedWhereClause, true, "NOW() + INTERVAL (unquoted)")
-	}
-
-	if endTime == nil {
-		endTime = matchRelative(relativeEndSubtractPattern, whereClause, false, "NOW() - INTERVAL")
-	}
-	if endTime == nil {
-		endTime = matchRelative(relativeEndAddPattern, whereClause, true, "NOW() + INTERVAL")
-	}
-	if endTime == nil {
-		endTime = matchRelative(relativeEndSubtractUnquotedPattern, maskedWhereClause, false, "NOW() - INTERVAL (unquoted)")
-	}
-	if endTime == nil {
-		endTime = matchRelative(relativeEndAddUnquotedPattern, maskedWhereClause, true, "NOW() + INTERVAL (unquoted)")
-	}
-
-	// Build time range
-	if startTime != nil && endTime != nil {
-		return &TimeRange{Start: *startTime, End: *endTime}
-	} else if startTime != nil {
+	switch {
+	case b.start != nil && b.end != nil:
+		return &TimeRange{Start: *b.start, End: *b.end}
+	case b.start != nil:
 		// Only start time - assume query up to "now + 1 day"
 		end := time.Now().UTC().Add(24 * time.Hour)
-		return &TimeRange{Start: *startTime, End: end, EndAssumed: true}
-	} else if endTime != nil {
-		// Only end time - assume from beginning of data
-		start := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
-		return &TimeRange{Start: start, End: *endTime, StartAssumed: true}
+		return &TimeRange{Start: *b.start, End: end, EndAssumed: true}
+	default:
+		// Only an end: the data may start at the partition floor. A range
+		// this wide exceeds the path cap and falls back to the unpruned
+		// glob, which is correct; assuming 2020 dropped older rows.
+		return &TimeRange{Start: minPartitionDate, End: *b.end, StartAssumed: true}
 	}
-
-	return nil
 }
 
 // GeneratePartitionPaths generates list of partition paths for the given time range

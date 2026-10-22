@@ -1373,6 +1373,58 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Time-filtered queries no longer return too few rows, and Grafana panels are pruned again
+
+Arc reads the time range from a query's WHERE clause and reads only the hour
+partitions inside it. The old reader took the first `time >= …` it found
+anywhere in the first WHERE and applied it to every table. With default
+settings, these queries returned too few rows, with `success: true`:
+
+- a bound joined with **OR** or under **NOT**: `time >= X OR host = 'a'` lost
+  the older `host = 'a'` rows, and `NOT (time >= X)` returned nothing;
+- a column whose name merely ends in `time` (`downtime`, `end_time`), or a
+  column named `timestamp`, read as the time column;
+- **arithmetic after the bound**: `time >= '…'::timestamp - INTERVAL '3
+  hours'` and `now() - INTERVAL '1 day' - INTERVAL '6 hours'` read only the
+  first part;
+- an **inclusive end on an hour boundary**: `time <= '10:00:00'` and
+  `BETWEEN … AND '10:00:00'` left out the 10:00 hour;
+- an **end-only** range (`time < '2024-01-01'`) left out everything before
+  2020;
+- a **commented-out** bound (`-- AND time >= …`), or one in **QUALIFY**;
+- **JOINs** (including `FROM a, b`), **UNION**, **CTEs** and **subqueries**:
+  one table's bound was applied to every table, or a subquery's bound to the
+  outer query;
+- `now() - INTERVAL '1 month'` on the 29th to the 31st started up to three
+  days later than DuckDB's own result (Mar 31 minus a month is Feb 28, not
+  Mar 3);
+- a literal with an explicit UTC offset under a `::timestamp` cast, which
+  DuckDB reads without the offset.
+
+A range is now read only from the query's single WHERE clause, and only from
+its top-level `AND` terms that are exactly a comparison of `time` with a
+literal, with `now()` / `CURRENT_TIMESTAMP` plus or minus one interval, or a
+`BETWEEN`. Other terms are ignored, which only widens the range. A top-level
+`OR`, a join, a UNION, a CTE or a subquery means no range: the query reads
+the whole measurement, correctly but without pruning.
+
+Accepted spellings:
+- the column as `time`, `"time"`, `alias.time` or Grafana's `(time)`;
+- the literal as `'…'`, `'…'::timestamp` or `TIMESTAMP '…'`;
+- the reversed form `'…' <= time`;
+- one trailing `;`.
+
+A literal with an explicit offset (`+02:00`) gives no range.
+
+An end-only range (`time < X`) no longer prunes. It reads the whole
+measurement, which is correct where the old 2020 assumption was not.
+
+**Grafana panels are pruned again.** Since grafana-arc-datasource 1.4.0,
+`$__timeFilter` writes `(time) >= '…' AND (time) < '…'`. Arc did not recognise
+that form, so every Grafana panel read its whole measurement. It is now
+recognised for partition pruning, the empty-range answer and the open-ended
+shortcut.
+
 ### A query no longer answers empty when an hour it reads is removed while it runs
 
 Arc narrows a time-filtered query to the hour partitions that exist and hands
