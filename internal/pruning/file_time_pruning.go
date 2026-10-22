@@ -2,7 +2,9 @@ package pruning
 
 import (
 	"context"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -92,16 +94,20 @@ func MarkVolatile(ctx context.Context) { markVolatile(ctx) }
 // Startup-only: the fields are read unlocked by concurrent queries, so this
 // must not be called while the handler is serving.
 func (p *PartitionPruner) SetFileTimePruning(enabled bool, margin time.Duration) {
-	if margin < 0 {
+	if margin < minFileTimeMargin {
 		// A negative margin would move the cutoff ABOVE the query's lower
-		// bound and prune files that certainly contain in-range rows.
+		// bound and prune files that certainly contain in-range rows; one
+		// under a second would rely on sub-second agreement between the
+		// flush clock and the rows' stamps that nothing guarantees.
 		p.logger.Warn().
 			Dur("configured_margin", margin).
-			Msg("file_time_pruning margin is negative; clamping to 0")
-		margin = 0
+			Dur("minimum", minFileTimeMargin).
+			Msg("file_time_pruning margin is below the minimum; raising it")
+		margin = minFileTimeMargin
 	}
-	p.fileTimePruning = enabled
-	p.fileTimeMargin = margin
+	// Margin first: a reader that sees the flag on must see the margin set.
+	p.fileTimeMargin.Store(int64(margin))
+	p.fileTimePruning.Store(enabled)
 	if enabled {
 		p.logger.Info().
 			Dur("margin", margin).
@@ -138,21 +144,43 @@ func parseFileTime(name string) (time.Time, bool) {
 	if err != nil {
 		return time.Time{}, false
 	}
+	// The last token is the flush time's nanoseconds within its second
+	// (generateStoragePath, %09d). Without it a file flushed at hh:mm:ss.9
+	// read as hh:mm:ss.0 and could be dropped for a start inside that second.
+	if len(nanos) == 9 {
+		n, _ := strconv.Atoi(nanos)
+		ts = ts.Add(time.Duration(n))
+	}
 	return ts, true
 }
 
-// applyFileTimePruning expands the boundary-hour glob into an explicit file
+// minFileTimeMargin is the smallest margin the pruner accepts.
+const minFileTimeMargin = time.Second
+
+// applyFileTimePruning is fileTimePass without the eligibility flag.
+func (p *PartitionPruner) applyFileTimePruning(ctx context.Context, paths []string, timeRange *TimeRange) ([]string, bool) {
+	out, expanded, _ := p.fileTimePass(ctx, paths, timeRange)
+	return out, expanded
+}
+
+// fileTimePass expands the boundary-hour glob into an explicit file
 // list with provably-out-of-range files removed. Returns the (possibly
 // modified) path list and whether it was modified; when modified, the result
 // is volatile (never cache it) and the context is marked accordingly.
 // Remote (s3://, azure://) paths are never touched.
-func (p *PartitionPruner) applyFileTimePruning(ctx context.Context, paths []string, timeRange *TimeRange) ([]string, bool) {
-	if !p.fileTimePruning || timeRange == nil || len(paths) == 0 {
-		return paths, false
+//
+// eligible reports a pass that looked at the live hour's files, whether or
+// not it changed the list. Its result is volatile either way: a declined pass
+// (every file in range, too many kept) can expand on the next query, so it is
+// not cached by the pruner, and the context is marked for the SQL transform
+// cache.
+func (p *PartitionPruner) fileTimePass(ctx context.Context, paths []string, timeRange *TimeRange) (out []string, expanded, eligible bool) {
+	if !p.fileTimePruning.Load() || timeRange == nil || timeRange.StartAssumed || len(paths) == 0 {
+		return paths, false, false
 	}
 	boundary := timeRange.Start.UTC().Truncate(time.Hour)
 	if !boundary.Equal(p.nowFn().UTC().Truncate(time.Hour)) {
-		return paths, false
+		return paths, false, false
 	}
 
 	// The boundary-hour glob ends in .../YYYY/MM/DD/HH/*.parquet, built by
@@ -172,7 +200,7 @@ func (p *PartitionPruner) applyFileTimePruning(ctx context.Context, paths []stri
 		}
 	}
 	if idx < 0 {
-		return paths, false
+		return paths, false, false
 	}
 
 	// Fresh glob, never the TTL globCache: a cached expansion would hide
@@ -180,39 +208,56 @@ func (p *PartitionPruner) applyFileTimePruning(ctx context.Context, paths []stri
 	// feature must not introduce.
 	files, err := filepath.Glob(paths[idx])
 	if err != nil || len(files) == 0 {
-		return paths, false
+		return paths, false, false
 	}
+	markVolatile(ctx)
+	m := metrics.Get()
+	m.IncFileTimePruningPass(len(files))
 
-	cutoff := timeRange.Start.UTC().Add(-p.fileTimeMargin)
+	cutoff := timeRange.Start.UTC().Add(-time.Duration(p.fileTimeMargin.Load()))
 	kept := make([]string, 0, len(files))
+	anomalous := 0
 	for _, f := range files {
 		ft, ok := parseFileTime(f)
 		// Keep when: name unparseable (fail open); anomalous placement
 		// (parsed time before the directory's own hour — only
 		// future-stamped data creates that, and it may hold in-range
 		// rows); or flush time within the margin-padded range.
-		if !ok || ft.Before(boundary) || !ft.Before(cutoff) {
+		switch {
+		case ok && ft.Before(boundary):
+			anomalous++
+			kept = append(kept, f)
+		case !ok || !ft.Before(cutoff):
 			kept = append(kept, f)
 		}
 	}
+	m.AddFileTimePruningAnomalousKept(anomalous)
 
-	if len(kept) == len(files) || len(kept) > maxExpandedFiles {
-		return paths, false
-	}
-	if len(kept) == 0 && len(paths) == 1 {
+	switch {
+	case len(kept) == len(files):
+		m.IncFileTimePruningNothingDropped()
+		return paths, false, true
+	case len(kept) > maxExpandedFiles:
+		m.IncFileTimePruningCapFallback()
+		return paths, false, true
+	case len(kept) == 0 && len(paths) == 1:
 		// Fail safe: never empty the whole path set.
-		return paths, false
+		m.IncFileTimePruningZeroSurvivors()
+		return paths, false, true
 	}
+	if len(kept) == 0 {
+		m.IncFileTimePruningZeroSurvivors()
+	}
+	m.IncFileTimePruningExpanded(len(files) - len(kept))
 
-	out := make([]string, 0, len(paths)-1+len(kept))
+	out = make([]string, 0, len(paths)-1+len(kept))
 	out = append(out, paths[:idx]...)
 	out = append(out, kept...)
 	out = append(out, paths[idx+1:]...)
-	markVolatile(ctx)
 	p.logger.Debug().
 		Int("dir_files", len(files)).
 		Int("kept", len(kept)).
 		Time("cutoff", cutoff).
 		Msg("File-level time pruning expanded the live-hour glob")
-	return out, true
+	return out, true, true
 }

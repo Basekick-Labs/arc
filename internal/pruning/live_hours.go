@@ -2,6 +2,7 @@ package pruning
 
 import (
 	"regexp"
+	"strconv"
 	"time"
 )
 
@@ -51,6 +52,21 @@ func (p *PartitionPruner) liveEpoch() int64 {
 // transformed with pruned paths keys its entries by it, so SQL pruned before
 // an hour started is never served after it.
 func (p *PartitionPruner) LiveEpoch() int64 { return p.liveEpoch() }
+
+// CacheEpoch keys a cached pruning of sql: the current hour, and the hours
+// its range starts and ends in. The current hour alone is not enough: a
+// relative end (time < now() - INTERVAL '10 minutes') crosses into a new hour
+// partway through the current one, and an entry cached just before it did
+// would leave that hour out for the rest of its TTL.
+func (p *PartitionPruner) CacheEpoch(sql string) string {
+	tr := p.ExtractTimeRange(sql)
+	if tr == nil {
+		return strconv.FormatInt(p.liveEpoch(), 10)
+	}
+	return strconv.FormatInt(p.liveEpoch(), 10) + ":" +
+		strconv.FormatInt(tr.Start.Truncate(time.Hour).Unix(), 10) + ":" +
+		strconv.FormatInt(tr.End.Truncate(time.Hour).Unix(), 10)
+}
 
 // SetClock replaces the pruner's clock. Tests only.
 func (p *PartitionPruner) SetClock(now func() time.Time) { p.nowFn = now }

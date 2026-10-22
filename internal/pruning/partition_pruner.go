@@ -249,9 +249,9 @@ func newPartitionCache(ttl time.Duration) *partitionCache {
 // cacheKey generates a cache key from the original path, the SQL query and
 // the live epoch (the start of the current hour, see live_hours.go): a list
 // pruned before an hour started is never served after it.
-func (c *partitionCache) cacheKey(originalPath, sql string, epoch int64) string {
+func (c *partitionCache) cacheKey(originalPath, sql string, epoch string) string {
 	// Use hash of SQL to avoid storing full query text
-	h := fmt.Sprintf("%s:%d:%x", originalPath, epoch, sha256.Sum256([]byte(sql)))
+	h := fmt.Sprintf("%s:%s:%x", originalPath, epoch, sha256.Sum256([]byte(sql)))
 	return h
 }
 
@@ -369,8 +369,9 @@ type PartitionPruner struct {
 
 	// File-level time pruning (see file_time_pruning.go). nowFn is
 	// injectable for tests; production always uses time.Now.
-	fileTimePruning bool
-	fileTimeMargin  time.Duration
+	// Atomic so a configuration reload can change them while queries run.
+	fileTimePruning atomic.Bool
+	fileTimeMargin  atomic.Int64 // time.Duration
 	nowFn           func() time.Time
 
 	// cleanupStarted ensures StartCleanup spawns at most one janitor
@@ -657,7 +658,7 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 	}
 
 	// Check partition cache first
-	cacheKey := p.partitionCache.cacheKey(originalPath, sql, p.liveEpoch())
+	cacheKey := p.partitionCache.cacheKey(originalPath, sql, p.CacheEpoch(sql))
 	if result, optimized, ok := p.partitionCache.get(cacheKey); ok {
 		// A cached fallback verdict is exactly the stale-empty case the proof
 		// exists for: with wantProof, re-derive instead of trusting it.
@@ -775,7 +776,7 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 	// modifies the set, the result is volatile (an explicit file list goes
 	// stale the moment the next flush lands) and must not be cached here
 	// or by the SQL transform cache (the context flag carries that).
-	partitionPaths, fileExpanded := p.applyFileTimePruning(ctx, partitionPaths, timeRange)
+	partitionPaths, fileExpanded, fileEligible := p.fileTimePass(ctx, partitionPaths, timeRange)
 
 	var result interface{}
 	if len(partitionPaths) == 1 {
@@ -790,10 +791,13 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 		result = partitionPaths
 	}
 
-	// Cache the result — except when file-level expansion happened: an
-	// explicit file list is stale the moment the next flush lands, and the
-	// per-query re-glob it forces instead is a few ms.
-	if !fileExpanded && !liveDropped {
+	// Cache the result — except when file-level pruning looked at the live
+	// hour: an explicit file list is stale the moment the next flush lands,
+	// and a declined pass (every file in range, too many kept) can expand on
+	// the next query once older files fall out of the range. The per-query
+	// re-glob this costs is a few ms. fileExpanded implies fileEligible.
+	_ = fileExpanded
+	if !fileEligible && !liveDropped {
 		p.partitionCache.set(cacheKey, result, true)
 	}
 	return result, true, false

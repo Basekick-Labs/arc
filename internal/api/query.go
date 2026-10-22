@@ -2983,10 +2983,12 @@ func (h *QueryHandler) getTransformedSQL(ctx context.Context, sql string, header
 		return sql, true, nil
 	}
 
-	// Build cache key - include header database if provided, and the current
-	// hour: SQL pruned before an hour started is never served after it (the
-	// pruner leaves out hours that have not started and have no files).
-	cacheKey := strconv.FormatInt(h.pruner.LiveEpoch(), 10) + ":" + sql
+	// Build cache key - include header database if provided, the current
+	// hour and the hours the query's range starts and ends in: SQL pruned
+	// before an hour started is never served after it (the pruner leaves out
+	// hours that have not started and have no files), including an hour a
+	// relative end has just reached (CacheEpoch).
+	cacheKey := h.pruner.CacheEpoch(sql) + ":" + sql
 	if headerDB != "" {
 		cacheKey = headerDB + ":" + cacheKey
 	}
