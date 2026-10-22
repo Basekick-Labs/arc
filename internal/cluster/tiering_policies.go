@@ -157,6 +157,8 @@ func (c *Coordinator) RunPolicyMirror(kind string, mirror func(ctx context.Conte
 	fsm.AddPoliciesChangedCallback(notify)
 	notify()
 	ctx := c.ctxOrBackground()
+	// Read once, here: the loop outlives whoever started it.
+	retry := policyMirrorRetry
 	go func() {
 		// A periodic pass too: a continuous query's watermark moves without
 		// a signal (it changes at every run), and a change applied before
@@ -174,7 +176,7 @@ func (c *Coordinator) RunPolicyMirror(kind string, mirror func(ctx context.Conte
 			if err := mirror(ctx); err != nil {
 				c.logger.Warn().Err(err).Str("kind", kind).Msg("Could not mirror the cluster's policies into this node's database; a backup taken now may carry older ones")
 				// Try again without waiting for the next policy change.
-				time.AfterFunc(policyMirrorRetry, notify)
+				time.AfterFunc(retry, notify)
 			}
 		}
 	}()

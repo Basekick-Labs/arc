@@ -394,7 +394,7 @@ func (c *Coordinator) deletedCopiesImplausible(seen *seenLocal, fsm *raft.Cluste
 	tripped := deleted >= staleLocalBreakerMin && float64(deleted) > frac*float64(tracked)
 	if s.exportBreaker.Swap(tripped) != tripped && tripped {
 		c.logger.Error().Int("deleted", deleted).Int("tracked", tracked).Float64("max_fraction", frac).
-			Msg("Iceberg export keeps this node's files the manifest no longer lists: there are more than cluster.stale_local_sweep_max_fraction allows, which a manifest rolled back by a recovery looks like. Copies left behind by deletes can be published next to the files holding their rows until this clears")
+			Msg("Iceberg export and queries keep this node's files the manifest no longer lists: there are more than cluster.stale_local_sweep_max_fraction allows, which a manifest rolled back by a recovery looks like. Copies left behind by deletes can be published, and read, next to the files holding their rows until this clears")
 	}
 	s.exportBreakerAt.Store(now)
 	return tripped
@@ -409,6 +409,7 @@ func (c *Coordinator) TracksLocalCopies() bool {
 
 // forgetLocal drops path from the set (its copy was removed).
 func (c *Coordinator) forgetLocal(path string) {
+	c.forgetLocalDeleted(path)
 	if seen := c.stale.seen.Load(); seen != nil {
 		seen.remove(path)
 	}

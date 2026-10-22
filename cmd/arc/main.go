@@ -3671,20 +3671,31 @@ func main() {
 	if cfg.Query.FileTimePruning {
 		queryHandler.SetFileTimePruning(true, time.Duration(cfg.Query.FileTimePruningMarginSeconds)*time.Second)
 	}
+	// Reads count each compaction's rows once while its output and inputs are
+	// both readable: this node's own legacy jobs (seeded from surviving
+	// manifests before any query is served), and in a cluster the staged jobs
+	// and this node's pending local deletes, on every node whether or not it
+	// compacts.
+	var compactionJobs, clusterOpen api.OpenCompactions
 	if compactionManager != nil {
-		// Reads count each compaction's rows once while its output and inputs
-		// are both in storage; seeded from surviving manifests before any
-		// query is served.
 		syncCtx, syncCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		compactionManager.SyncOpenJobs(syncCtx)
 		syncCancel()
-		queryHandler.SetOpenCompactions(compactionManager.OpenJobs)
+		compactionJobs = compactionManager.OpenJobs
 		if cfg.Query.EnableS3Cache {
 			// A listing cached before a job's output appeared would lack it
 			// while its inputs are already left out of reads.
 			compactionManager.OpenJobs.SetOnOutputSeen(db.ClearHTTPCache)
 		}
 	}
+	if clusterCoordinator != nil {
+		clusterOpen = clusterOpenCompactions{clusterCoordinator}
+		if cfg.Query.EnableS3Cache {
+			clusterCoordinator.SetOnObjectOutputSeen(db.ClearHTTPCache)
+		}
+	}
+	openCompactions := api.CombineOpenCompactions(compactionJobs, clusterOpen)
+	queryHandler.SetOpenCompactions(openCompactions)
 	queryHandler.RegisterRoutes(server.GetApp())
 	// Start the handler's background workers (currently the partition
 	// pruner cache janitor — sweeps expired globCache / partitionCache
@@ -4201,9 +4212,7 @@ func main() {
 		cqHandler, err = api.NewContinuousQueryHandler(db, storageBackend, arrowBuffer, &cfg.ContinuousQuery, authManager, logger.Get("cq"))
 		if err == nil {
 			cqHandler.SetFieldSchema(fieldSchemaRegistry)
-			if compactionManager != nil {
-				cqHandler.SetOpenCompactions(compactionManager.OpenJobs)
-			}
+			cqHandler.SetOpenCompactions(openCompactions)
 		}
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize continuous query handler")
@@ -6185,3 +6194,12 @@ func tierColdCheck(get func(ctx context.Context, path string) (*tiering.FileMeta
 		return err != nil || (f != nil && f.Tier == tiering.TierCold)
 	}
 }
+
+// clusterOpenCompactions adapts the cluster coordinator to api.OpenCompactions.
+type clusterOpenCompactions struct{ c *cluster.Coordinator }
+
+func (o clusterOpenCompactions) ExcludedFor(ctx context.Context, prefix string) []string {
+	return o.c.OpenExcludedFor(ctx, prefix)
+}
+func (o clusterOpenCompactions) Open(prefix string) bool { return o.c.OpenAny(prefix) }
+func (o clusterOpenCompactions) Generation() uint64      { return o.c.OpenGeneration() }

@@ -86,6 +86,9 @@ var deleteStopDrainBound = 10 * time.Second
 const deletePendingWarnAt = 10_000
 
 type Coordinator struct {
+	// open is what reads must leave out while a compaction's output and
+	// inputs are both readable (open_compactions.go).
+	open          openState
 	cfg           *config.ClusterConfig
 	licenseClient *license.Client
 	registry      *Registry
@@ -4423,10 +4426,12 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// (drops on full queue) so this is safe.
 		puller.Enqueue(entry)
 		c.noteLocalRegistered(entry.Path)
+		c.forgetLocalDeleted(entry.Path)
 	}
 	onContentChanged := func(entry *raft.FileEntry) {
 		puller.EnqueueContentChanged(entry)
 		c.noteLocalRegistered(entry.Path)
+		c.forgetLocalDeleted(entry.Path)
 	}
 	onDelete := func(path string, reason string) {
 		// Phase 4: the callback runs synchronously from applyDeleteFile on
@@ -4461,6 +4466,9 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// catch-up walk, but a local delete that is dropped is a replica
 		// the manifest no longer lists and nothing walks — it stayed on
 		// disk forever, and every read here read the file twice.
+		// Until the unlink, reads leave the copy out once that is safe
+		// (open_compactions.go).
+		c.noteLocalDeleted(path, reason)
 		c.enqueueLocalDelete(path, reason)
 	}
 
