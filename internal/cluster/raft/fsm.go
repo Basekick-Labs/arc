@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/hashicorp/raft"
 	"github.com/rs/zerolog"
 )
@@ -3566,6 +3567,23 @@ func (f *ClusterFSM) GetFilesByDatabase(database string) []*FileEntry {
 		}
 	}
 	return files
+}
+
+// HasRewriteSibling reports whether the manifest lists another member of
+// path's rewrite family (storage.RewriteFamily): a file a row DELETE
+// rewrote, or rewrote from. A scan of the database's files.
+func (f *ClusterFSM) HasRewriteSibling(path string) bool {
+	family := storage.RewriteFamily(path)
+	stem := strings.TrimSuffix(family, ".parquet")
+	db, _, _ := strings.Cut(path, "/")
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	for p := range f.filesByDB[db] {
+		if p != path && strings.HasPrefix(p, stem) && storage.RewriteFamily(p) == family {
+			return true
+		}
+	}
+	return false
 }
 
 // FileDatabases returns the databases the manifest lists files of, sorted.

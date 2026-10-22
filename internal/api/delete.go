@@ -511,6 +511,15 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	}
 
 	if len(affected) == 0 && rec == nil {
+		if !req.DryRun && h.coordinator == nil {
+			// Nothing to rewrite, but a leftover the scan left out (it may
+			// hold the only rows that matched) is still removed.
+			h.rewriteMu.Lock()
+			if h.removeLeftovers(ctx, req.Database, req.Measurement) > 0 {
+				h.filesRemoved()
+			}
+			h.rewriteMu.Unlock()
+		}
 		// findAffectedFiles scanned parquet files via read_parquet — clear the cache even though
 		// no rows matched, to avoid accumulating metadata for files that may later be deleted.
 		h.db.ClearHTTPCache()
@@ -588,6 +597,9 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	h.rewriteMu.Lock()
 	defer h.rewriteMu.Unlock()
 	h.recordID = 0
+	// Standalone: remove what earlier DELETEs replaced and could not remove,
+	// before rewriting anything (the scan left them out).
+	h.removeLeftovers(ctx, req.Database, req.Measurement)
 	if rec != nil {
 		// Recorded before the rewrite: rows of its scope that reach a file
 		// from now on are rewritten without the matching ones. Then the
@@ -920,6 +932,18 @@ func (h *DeleteHandler) findAffectedFiles(ctx context.Context, database, measure
 		})
 	}
 
+	// Files an earlier DELETE replaced and could not remove are never read
+	// into a new file (delete_leftovers.go).
+	parquetFiles, left := h.leftoverFiles(ctx, parquetFiles)
+	if len(left) > 0 {
+		sample := make([]string, 0, min(len(left), 5))
+		for _, l := range left[:min(len(left), 5)] {
+			sample = append(sample, l.path)
+		}
+		h.logger.Warn().Int("files", len(left)).Strs("sample", sample).
+			Msg("Delete leaves out files an earlier DELETE replaced and could not remove; queries read their rows twice until they are removed")
+	}
+
 	// With compaction commit on (#1207 d2), the files the cluster lists, or
 	// this node is still registering, are the DELETE's (scanSet): anything
 	// else in storage is not data yet (a compaction output before its commit)
@@ -1105,6 +1129,11 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 	}
 
 	deleted := rowsBefore - rowsAfter
+	if deleted == 0 {
+		// Nothing matches now (a clause on now() that matched at the scan):
+		// a rewrite would be the same rows under another name.
+		return 0, nil
+	}
 
 	// If all rows would be deleted, remove the file entirely.
 	if rowsAfter == 0 {
@@ -1160,7 +1189,7 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 			}
 		}
 
-		if err := h.storage.Delete(ctx, relativePath); err != nil {
+		if err := storage.DeleteWithRetry(ctx, h.storage, relativePath); err != nil {
 			// Manifest is already committed — storage failure is transient (network
 			// blip, file already gone). Log as Warn and return the deleted count;
 			// the Phase 5 reconciler at /api/v1/reconciliation cleans up the
@@ -1205,8 +1234,20 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 			return rewroteDeleted, err
 		}
 	} else {
-		if err := h.storage.Delete(ctx, relativePath); err != nil {
+		// Recorded first: if the removal fails, or the process stops before
+		// it, the drainer and every later DELETE know relativePath is
+		// replaced (delete_leftovers.go).
+		jerr := h.journalRetired(ctx, relativePath, rewrittenPath)
+		if jerr != nil {
+			h.logger.Warn().Err(jerr).Str("file", relativePath).Msg("Could not record a file this DELETE replaced before removing it")
+		}
+		if err := storage.DeleteWithRetry(ctx, h.storage, relativePath); err != nil {
+			h.logger.Error().Err(err).Str("file", relativePath).Str("new_file", rewrittenPath).Bool("recorded", jerr == nil).
+				Msg("Rewrote the file but could not remove the old one; queries read its surviving rows twice until it is removed")
 			return rewroteDeleted, fmt.Errorf("failed to delete superseded rewritten file %q: %w", relativePath, err)
+		}
+		if jerr == nil {
+			h.clearRetired(ctx, relativePath)
 		}
 	}
 	if err := h.recordRewriteTiering(ctx, relativePath, rewrittenPath, s3Result); err != nil {
@@ -1469,7 +1510,7 @@ func (h *DeleteHandler) replaceManifestAfterRewrite(ctx context.Context, oldPath
 			cleanup()
 			return errors.Join(errManifestFailure, fmt.Errorf("register the rewrite of %s: %w", filepath.Base(oldPath), err))
 		}
-		if err := h.storage.Delete(ctx, oldPath); err != nil {
+		if err := storage.DeleteWithRetry(ctx, h.storage, oldPath); err != nil {
 			h.logger.Error().Err(err).Str("file", oldPath).Str("new_file", newPath).
 				Msg("Rewrite registered but failed to delete the superseded object; it may remain visible to glob queries until cleanup succeeds")
 			return fmt.Errorf("rewrite registered but failed to delete superseded object %q: %w", oldPath, err)
@@ -1509,7 +1550,7 @@ func (h *DeleteHandler) replaceManifestAfterRewrite(ctx context.Context, oldPath
 				// Rewritten with this DELETE: no second pass for its record.
 				st.SetDeleteSeen(newPath, h.recordID)
 			}
-			if err := h.storage.Delete(ctx, oldPath); err != nil {
+			if err := storage.DeleteWithRetry(ctx, h.storage, oldPath); err != nil {
 				return fmt.Errorf("failed to delete superseded pending rewrite %q: %w", oldPath, err)
 			}
 			return nil
@@ -1553,7 +1594,7 @@ func (h *DeleteHandler) replaceManifestAfterRewrite(ctx context.Context, oldPath
 			Str("file", oldPath).
 			Str("new_file", newPath).
 			Msg("Rewritten source is absent from the manifest; new file is not registered and will not replicate; deleting the superseded storage object (reconciliation may later remove the orphan)")
-		if err := h.storage.Delete(ctx, oldPath); err != nil {
+		if err := storage.DeleteWithRetry(ctx, h.storage, oldPath); err != nil {
 			return fmt.Errorf("failed to delete unmanifested superseded rewrite %q: %w", oldPath, err)
 		}
 		return nil
@@ -1611,7 +1652,7 @@ func (h *DeleteHandler) replaceManifestAfterRewrite(ctx context.Context, oldPath
 	// directly on the node that performed the rewrite; this is required for
 	// standalone mode and for clusters with replication disabled, where no
 	// manifest-delete worker is running.
-	if err := h.storage.Delete(ctx, oldPath); err != nil {
+	if err := storage.DeleteWithRetry(ctx, h.storage, oldPath); err != nil {
 		h.logger.Error().Err(err).Str("file", oldPath).Str("new_file", newPath).
 			Msg("Manifest committed but failed to delete superseded rewrite; the old object may remain visible to glob queries until cleanup succeeds")
 		return fmt.Errorf("manifest committed but failed to delete superseded rewrite %q: %w", oldPath, err)
