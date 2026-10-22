@@ -10,9 +10,11 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/rs/zerolog"
@@ -121,6 +123,9 @@ type entry struct {
 	// for foldsFor (KnownColumnFolds, #1342).
 	folds    map[string]string
 	foldsFor *arrow.Schema
+	// dirty: the stored anchor holds fields Clean drops (#1342); the next
+	// publish rewrites it even when nothing else changed.
+	dirty bool
 }
 
 // maxEntries bounds the registry's memory against clients naming measurements
@@ -261,6 +266,16 @@ func (r *Registry) loadStored(ctx context.Context, e *entry) error {
 	}
 	e.absent = false
 	e.complete = complete
+	if cleaned, removed := Clean(stored); len(removed) > 0 {
+		stored = Normalize(cleaned, nil)
+		e.dirty = true
+		r.logger.Warn().
+			Str("anchor", k).
+			Strs("fields", quoteNames(removed)).
+			Msg("Field schema anchor holds field names Arc cannot read back; they are left out of every query (#1342)")
+	} else {
+		e.dirty = false
+	}
 	merged, _, conflicts := Merge(stored, e.schema)
 	r.logConflicts(e, conflicts)
 	e.schema = merged
@@ -346,7 +361,7 @@ func (r *Registry) EnsureFile(ctx context.Context, database, measurement string,
 	if e.pending != nil {
 		incoming, _, _ = Merge(e.pending, incoming)
 	}
-	if e.schema != nil && !e.absent && Covers(e.schema, incoming) && now.Sub(e.verifiedAt) < r.opts.VerifyTTL {
+	if e.schema != nil && !e.absent && !e.dirty && Covers(e.schema, incoming) && now.Sub(e.verifiedAt) < r.opts.VerifyTTL {
 		return nil
 	}
 	var hint *bool
@@ -439,7 +454,7 @@ func (r *Registry) publishLocked(ctx context.Context, e *entry, incoming *arrow.
 	case stored == nil && completeHint == nil:
 		complete = r.measurementHasNoFiles(ctx, e.database, e.measurement)
 	}
-	if stored != nil && complete == e.complete && Fingerprint(stored) == Fingerprint(merged) {
+	if stored != nil && !e.dirty && complete == e.complete && Fingerprint(stored) == Fingerprint(merged) {
 		return nil
 	}
 	e.complete = complete
@@ -454,6 +469,7 @@ func (r *Registry) publishLocked(ctx context.Context, e *entry, incoming *arrow.
 		return fmt.Errorf("fieldschema: write %s: %w", k, err)
 	}
 	e.absent = false
+	e.dirty = false
 	r.logger.Info().
 		Str("database", e.database).
 		Str("measurement", e.measurement).
@@ -993,4 +1009,17 @@ func duckDBDescribe(db *sql.DB) describeFunc {
 		}
 		return out, rows.Err()
 	}
+}
+
+// quoteNames is names for a log field, an invalid byte escaped.
+func quoteNames(names []string) []string {
+	out := make([]string, len(names))
+	for i, n := range names {
+		if utf8.ValidString(n) {
+			out[i] = n
+		} else {
+			out[i] = strconv.Quote(n)
+		}
+	}
+	return out
 }
