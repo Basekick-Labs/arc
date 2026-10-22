@@ -121,3 +121,53 @@ func TestIcebergWalkLeavesOutDeletedLocalCopies(t *testing.T) {
 		t.Fatalf("walk = %v, want only the compaction output", got)
 	}
 }
+
+// A different file written at a path since the one seen registered was
+// deleted is not that copy: it stays in the export, as the sweep keeps it.
+func TestLocalCopyDeletedOnlyTheFileSeenRegistered(t *testing.T) {
+	r := staleRig(t)
+	key := staleHour + "replaced.parquet"
+	r.register(key, "rows")
+	r.pass()
+	r.unregisterAs(key, "retention")
+	if !r.c.LocalCopyDeleted(key) {
+		t.Fatal("the deleted copy is not reported")
+	}
+	r.write(key, "another file, not registered yet")
+	if r.c.LocalCopyDeleted(key) {
+		t.Fatal("a different file at the path reads as the deleted copy")
+	}
+}
+
+// Too many deleted copies to believe (a manifest rolled back in a recovery
+// looks like this): the export keeps them all, by the sweep's own rule, and
+// also while the sweep itself reports its breaker tripped.
+func TestLocalCopyDeletedBreaker(t *testing.T) {
+	r := staleRig(t)
+	oldMin, oldEvery := staleLocalBreakerMin, staleExportBreakerEvery
+	staleLocalBreakerMin, staleExportBreakerEvery = 2, 0
+	t.Cleanup(func() { staleLocalBreakerMin, staleExportBreakerEvery = oldMin, oldEvery })
+	a, b, c := staleHour+"a.parquet", staleHour+"b.parquet", staleHour+"c.parquet"
+	r.register(a, "rows a")
+	r.register(b, "rows b")
+	r.register(c, "rows c")
+	r.pass()
+	r.unregisterAs(a, "retention")
+	if !r.c.LocalCopyDeleted(a) {
+		t.Fatal("one deleted copy of three is under the breaker and must be reported")
+	}
+	r.unregisterAs(b, "retention")
+	if r.c.LocalCopyDeleted(a) || r.c.LocalCopyDeleted(b) {
+		t.Fatal("two of three deleted (over half, at the minimum): the breaker must keep them")
+	}
+
+	r2 := staleRig(t)
+	key := staleHour + "x.parquet"
+	r2.register(key, "rows")
+	r2.pass()
+	r2.unregisterAs(key, "retention")
+	r2.c.setStaleStatus(StaleLocalStatus{Blocked: true})
+	if r2.c.LocalCopyDeleted(key) {
+		t.Fatal("reported a deleted copy while the sweep's breaker is tripped")
+	}
+}

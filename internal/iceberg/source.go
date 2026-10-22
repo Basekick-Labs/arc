@@ -74,7 +74,8 @@ func (s *StorageWalkSource) SetPendingOutputs(fn func(ctx context.Context, prefi
 // its rows, and external readers see them twice. The check runs per key after
 // the listing, the #638 ordering: an output in the listing was moved into
 // place after this node applied its commit, so its inputs already read as
-// deleted. nil (standalone, or no tracking) excludes nothing.
+// deleted. nil (standalone) excludes nothing, and so does the lookup on a
+// cluster node that does not track its local copies.
 func (s *StorageWalkSource) SetDeletedHere(fn func(path string) bool) {
 	s.deletedHere = fn
 }
@@ -350,8 +351,8 @@ func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([
 
 // statSize returns the file's current byte size, which the reconciler needs
 // for a file rewritten at its own path (#633). Since #1073 the delete API's
-// partial-match branch publishes a fresh path instead, but restores, imports
-// and edge-sync still write a known path, and only the size tells that
+// partial-match branch publishes a fresh path instead, but restores and
+// edge-sync still write a known path, and only the size tells that
 // content apart from what the Iceberg manifest describes.
 // present=false means the file is gone. Local files are stat'ed directly; any
 // other backend answers through StatFile (Iceberg export is local-only, so

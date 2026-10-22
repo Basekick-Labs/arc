@@ -1394,8 +1394,12 @@ until it expires.
 
 The export now leaves out any file the node saw registered that the manifest
 no longer lists. It uses the journal the stale-local sweep keeps, so it also
-covers copies left by a crash. Files a writer has flushed but not yet
-registered are not affected.
+covers copies left by a crash. It follows the sweep's own rules:
+- Only the exact file seen registered is left out. A different file written
+  at the same path since, and new flushes not yet registered, still export.
+- When the manifest has dropped more of the node's files than
+  `cluster.stale_local_sweep_max_fraction` allows (a manifest rolled back by a
+  recovery looks like this), the export keeps them all and logs an error.
 
 In return, a file the cluster deleted can disappear from the table slightly
 before the file holding its rows appears. On the compacting node that gap is
