@@ -8,9 +8,10 @@ import (
 	"strings"
 )
 
-// DeleteRetiredRoot holds the standalone DELETE's retired journal: one JSON
-// object per file a row DELETE replaced with its rewrite and has not removed
-// yet (internal/api delete_leftovers.go). A reserved root
+// DeleteRetiredRoot holds the DELETE journal: one JSON object per file a row
+// DELETE replaces with its rewrite and has not removed yet (internal/api
+// delete_leftovers.go): standalone, and on a cluster the rewrites whose
+// manifest change is not settled yet. A reserved root
 // (IsReservedRootDir), so no database walker reads it as data.
 const DeleteRetiredRoot = "_delete_retired"
 
@@ -24,13 +25,21 @@ func RetiredKey(path string) string {
 // stored under its own path's key, naming a parquet file under a database,
 // counts: anything else is not trusted to hide a file.
 func ParseRetired(key string, data []byte) (string, bool) {
+	p, _, ok := ParseRetiredRecord(key, data)
+	return p, ok
+}
+
+// ParseRetiredRecord is ParseRetired, also returning the file that replaces
+// it ("" when the record does not say).
+func ParseRetiredRecord(key string, data []byte) (path, replacedBy string, ok bool) {
 	var rec struct {
-		Path string `json:"path"`
+		Path       string `json:"path"`
+		ReplacedBy string `json:"replaced_by"`
 	}
 	if json.Unmarshal(data, &rec) != nil || !retiredPathValid(rec.Path) || RetiredKey(rec.Path) != key {
-		return "", false
+		return "", "", false
 	}
-	return rec.Path, true
+	return rec.Path, rec.ReplacedBy, true
 }
 
 func retiredPathValid(p string) bool {

@@ -3625,6 +3625,26 @@ func (f *ClusterFSM) HasRewriteSibling(path string) bool {
 	return false
 }
 
+// RewriteSiblings returns the registered members of path's rewrite family
+// other than path, with their entries.
+func (f *ClusterFSM) RewriteSiblings(path string) []FileEntry {
+	family := storage.RewriteFamily(path)
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	var out []FileEntry
+	if family != path {
+		if e, ok := f.files[family]; ok {
+			out = append(out, *e)
+		}
+	}
+	for p := range f.rewritesByFamily[family] {
+		if e, ok := f.files[p]; ok && p != path {
+			out = append(out, *e)
+		}
+	}
+	return out
+}
+
 // indexRewriteLocked adds path to rewritesByFamily if it is a rewrite.
 // Caller holds f.mu.
 func (f *ClusterFSM) indexRewriteLocked(path string) {

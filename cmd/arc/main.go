@@ -3694,7 +3694,24 @@ func main() {
 			clusterCoordinator.SetOnObjectOutputSeen(db.ClearHTTPCache)
 		}
 	}
-	openCompactions := api.CombineOpenCompactions(compactionJobs, clusterOpen)
+	// Standalone: a file a row DELETE replaced is left out of reads while it
+	// is still in storage next to its replacement (seeded from the DELETE
+	// journal before any query is served).
+	var retiredReads *api.RetiredReads
+	var retiredOpen api.OpenCompactions
+	if clusterCoordinator == nil {
+		retiredReads = api.NewRetiredReads(storageBackend)
+		seedCtx, seedCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := retiredReads.Seed(seedCtx); err != nil {
+			log.Warn().Err(err).Msg("Could not read the DELETE journal at start; files it names are read until removed")
+		}
+		seedCancel()
+		if cfg.Query.EnableS3Cache {
+			retiredReads.SetOnSeen(db.ClearHTTPCache)
+		}
+		retiredOpen = retiredReads
+	}
+	openCompactions := api.CombineOpenCompactions(compactionJobs, clusterOpen, retiredOpen)
 	queryHandler.SetOpenCompactions(openCompactions)
 	queryHandler.RegisterRoutes(server.GetApp())
 	// Start the handler's background workers (currently the partition
@@ -4033,16 +4050,18 @@ func main() {
 		// rewrite (#1207 d1).
 		clusterCoordinator.SetDeleteRewriter(deleteHandler.RewriteForRecords)
 	} else {
-		// Standalone: remove files a DELETE replaced and could not remove at
-		// the time (its retired journal), at start and every minute, whether
-		// or not DELETE is enabled now.
-		retiredCtx, retiredCancel := context.WithCancel(context.Background())
-		shutdownCoordinator.RegisterHook("delete-retired-drainer", func(_ context.Context) error {
-			retiredCancel()
-			return nil
-		}, shutdown.PriorityHTTPServer)
-		deleteHandler.StartRetiredDrainer(retiredCtx)
+		deleteHandler.SetRetiredReads(retiredReads)
 	}
+	// Settle the DELETE journal (files a DELETE replaced and could not
+	// remove, rewrites whose manifest change had an unknown outcome) at start
+	// and every minute, whether or not DELETE is enabled now. On a shared
+	// object store only the primary writer acts, decided at every tick.
+	retiredCtx, retiredCancel := context.WithCancel(context.Background())
+	shutdownCoordinator.RegisterHook("delete-retired-drainer", func(_ context.Context) error {
+		retiredCancel()
+		return nil
+	}, shutdown.PriorityHTTPServer)
+	deleteHandler.StartRetiredDrainer(retiredCtx)
 	if cfg.Delete.Enabled {
 		log.Info().
 			Int("confirmation_threshold", cfg.Delete.ConfirmationThreshold).
@@ -4404,7 +4423,7 @@ func main() {
 			})
 			// A compaction output manifest repair adopts is not an orphan
 			// either, whichever of the two gets to it first (#1214).
-			reconciler.SetAdoptableFilter(clusterCoordinator.AdoptableObject)
+			reconciler.SetAdoptableFilter(clusterCoordinator.ReconcilerKeeps)
 		}
 		if err != nil {
 			log.Error().Err(err).Msg("Failed to create reconciler — feature disabled")

@@ -3,12 +3,15 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/cluster"
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 )
@@ -38,8 +41,7 @@ import (
 //     on, the DELETE removes one only when it is provably the older copy
 //     (removeLeftovers); otherwise it is only left out.
 
-// deleteRetiredRoot holds the standalone retired journal
-// (storage.DeleteRetiredRoot).
+// deleteRetiredRoot holds the DELETE journal (storage.DeleteRetiredRoot).
 const deleteRetiredRoot = storage.DeleteRetiredRoot
 
 // retiredRecordVersion is written on every record.
@@ -49,11 +51,12 @@ const retiredRecordVersion = 1
 // make it fail).
 var deleteReplaced = storage.DeleteWithRetry
 
-// retiredDrainEvery spaces the standalone drainer's passes.
+// retiredDrainEvery spaces the drainer's passes.
 var retiredDrainEvery = time.Minute
 
-// retiredRecord names a file a DELETE replaced (ReplacedBy was in storage
-// when it was written) that is still to be removed.
+// retiredRecord names a file a DELETE replaces and its rewrite. Standalone
+// it is written once the rewrite is in storage; on a cluster before the
+// manifest change (retiredAction settles it).
 type retiredRecord struct {
 	Version    int       `json:"v"`
 	Path       string    `json:"path"`
@@ -164,13 +167,32 @@ func (h *DeleteHandler) clusterLeftovers(ctx context.Context, files []fileInfo) 
 	} else {
 		return files, nil, nil
 	}
-	kept, left := h.clusterClassify(files)
+	kept, left := h.clusterClassify(files, h.journaledPaths(ctx))
 	return kept, left, nil
+}
+
+// journaledPaths reads the files the retired journal names, for the cluster
+// classification. A journal that cannot be read names none (Warn).
+func (h *DeleteHandler) journaledPaths(ctx context.Context) map[string]bool {
+	recs, err := h.retiredRecords(ctx)
+	if err != nil {
+		h.logger.Warn().Err(err).Msg("Could not read the retired-file journal")
+		return nil
+	}
+	out := make(map[string]bool, len(recs))
+	for _, r := range recs {
+		out[r.Path] = true
+	}
+	return out
 }
 
 // clusterClassify is clusterLeftovers on a manifest the caller just caught
 // up (scanSet classifies right after its own sync).
-func (h *DeleteHandler) clusterClassify(files []fileInfo) ([]fileInfo, []leftover) {
+//
+// A file the retired journal names and the manifest does not list is a
+// leftover even with no listed family member left (its replacement since
+// compacted or tiered away): it is never scanned, so never adopted again.
+func (h *DeleteHandler) clusterClassify(files []fileInfo, journaled map[string]bool) ([]fileInfo, []leftover) {
 	holder, _ := h.pending.(registrationHolder)
 	held := func(p string) bool { return holder != nil && holder.HoldsRegistration(p) }
 	registered := func(p string) bool {
@@ -207,6 +229,9 @@ func (h *DeleteHandler) clusterClassify(files []fileInfo) ([]fileInfo, []leftove
 		if !isLeftover && siblings != nil && siblings.HasRewriteSibling(p) {
 			isLeftover = true
 		}
+		if !isLeftover && journaled[p] {
+			isLeftover = true
+		}
 		if !isLeftover {
 			kept = append(kept, f)
 			continue
@@ -217,19 +242,21 @@ func (h *DeleteHandler) clusterClassify(files []fileInfo) ([]fileInfo, []leftove
 }
 
 func (h *DeleteHandler) standaloneLeftovers(ctx context.Context, files []fileInfo) ([]fileInfo, []leftover, error) {
-	retired := map[string]bool{}
+	retired := map[string]retiredRecord{}
 	if recs, err := h.retiredRecords(ctx); err != nil {
 		h.logger.Warn().Err(err).Msg("Could not read the retired-file journal; leftovers are found by their rewrite family only")
 	} else {
 		for _, r := range recs {
-			retired[r.Path] = true
+			retired[r.Path] = r
 		}
 	}
 	byPath := make(map[string]fileInfo, len(files))
 	var paths []string
 	var left []leftover
 	for _, f := range files {
-		if retired[f.relativePath] {
+		// Standalone records are written once the rewrite is in storage:
+		// the file is the old copy (retiredAction).
+		if _, ok := retired[f.relativePath]; ok {
 			left = append(left, leftover{path: f.relativePath, journaled: true})
 			continue
 		}
@@ -435,11 +462,221 @@ func (h *DeleteHandler) listParquet(ctx context.Context, database, measurement s
 	return out, nil
 }
 
-// DrainRetired removes the files the standalone retired journal names (each
-// one replaced by a DELETE rewrite) and clears their records. It returns how
-// many it removed.
+// A record names a file a DELETE rewrite replaces (Path) and its rewrite
+// (ReplacedBy).
+//
+//   - Standalone: written once the rewrite is in storage, so Path is always
+//     the old copy: the drainer removes it.
+//   - Cluster: written before the manifest change (an intent), so it is
+//     settled by the manifest (retiredAction). Path is removed once the
+//     manifest no longer lists it and a registered member of its family is
+//     in storage at its registered size. A rewrite the manifest still does
+//     not list rewriteAmbiguityDelay after this node first saw the record is
+//     removed (the change never applied, or was refused), whatever became
+//     of Path.
+
+// retiredAction is what to do with one record.
+type retiredAction int
+
+const (
+	retiredKeep      retiredAction = iota // not decidable now
+	retiredRemoveOld                      // remove Path, clear the record
+	retiredRevert                         // remove ReplacedBy, clear the record
+	retiredClear                          // clear the record only
+)
+
+// Tunables, variables so tests can shrink them.
+var (
+	// rewriteFinishTimeout bounds the work after a rewrite is in storage
+	// (record, manifest, removals), which outlives the request.
+	rewriteFinishTimeout = 2 * time.Minute
+	// rewriteAmbiguityDelay: how long a record whose manifest change has
+	// not shown is left alone (a forwarded proposal can still apply).
+	rewriteAmbiguityDelay = 5 * time.Minute
+)
+
+// rewriteSiblingEntries lists the registered members of a file's rewrite
+// family (the coordinator, from the FSM index).
+type rewriteSiblingEntries interface {
+	RewriteSiblings(path string) []raft.FileEntry
+}
+
+// journalIntent writes the record for a cluster rewrite before its manifest
+// change. Without it an unknown outcome could never be settled, so a failure
+// stops the rewrite before the manifest changes.
+func (h *DeleteHandler) journalIntent(ctx context.Context, old, new string) error {
+	if err := h.journalRetired(ctx, old, new); err != nil {
+		return fmt.Errorf("record the file this DELETE replaces: %w", err)
+	}
+	return nil
+}
+
+// settlePriorIntent: a record for old already names another rewrite (an
+// earlier DELETE whose manifest change had an unknown outcome). Writing a new
+// record would orphan that rewrite. It returns nil when the new rewrite may
+// proceed (no other rewrite pending, or it was removed), and an error
+// (retryable) while the earlier change may still apply. The caller holds
+// rewriteMu.
+func (h *DeleteHandler) settlePriorIntent(ctx context.Context, old, new string) error {
+	data, err := h.storage.Read(ctx, retiredKey(old))
+	if err != nil {
+		if storage.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("read the record of %s: %w", filepath.Base(old), err)
+	}
+	var rec retiredRecord
+	if json.Unmarshal(data, &rec) != nil || rec.ReplacedBy == "" || rec.ReplacedBy == new {
+		return nil
+	}
+	if n, err := h.storage.StatFile(ctx, rec.ReplacedBy); err == nil && n < 0 {
+		return nil
+	}
+	if _, listed := h.coordinator.GetFileEntry(rec.ReplacedBy); listed {
+		return fmt.Errorf("%w: %s (an earlier rewrite of it is registered)", errFileChanged, filepath.Base(old))
+	}
+	holder, _ := h.pending.(registrationHolder)
+	owner, _ := h.coordinator.(compactionOwner)
+	busy := (holder != nil && holder.HoldsRegistration(rec.ReplacedBy)) || (owner != nil && owner.CompactionOwns(rec.ReplacedBy))
+	if busy || h.firstSeenAge(rec) < rewriteAmbiguityDelay {
+		return fmt.Errorf("%w: %s (an earlier rewrite of it is still settling)", errNotRegisteredYet, filepath.Base(old))
+	}
+	if err := deleteReplaced(ctx, h.storage, rec.ReplacedBy); err != nil {
+		return fmt.Errorf("%w: %s (remove an earlier rewrite that never took: %v)", errNotRegisteredYet, filepath.Base(old), err)
+	}
+	h.forgetSeen(rec)
+	h.logger.Warn().Str("file", old).Str("removed", rec.ReplacedBy).
+		Msg("Removed an earlier rewrite that never reached the manifest before rewriting the file again")
+	return nil
+}
+
+// firstSeenAge is how long this node has known rec (its own clock: the
+// writer's may disagree).
+func (h *DeleteHandler) firstSeenAge(rec retiredRecord) time.Duration {
+	key := rec.Path + "\x00" + rec.ReplacedBy
+	h.retiredSeenMu.Lock()
+	defer h.retiredSeenMu.Unlock()
+	if h.retiredSeen == nil {
+		h.retiredSeen = map[string]time.Time{}
+	}
+	at, ok := h.retiredSeen[key]
+	if !ok {
+		at = time.Now()
+		h.retiredSeen[key] = at
+	}
+	return time.Since(at)
+}
+
+func (h *DeleteHandler) forgetSeen(rec retiredRecord) {
+	h.retiredSeenMu.Lock()
+	delete(h.retiredSeen, rec.Path+"\x00"+rec.ReplacedBy)
+	h.retiredSeenMu.Unlock()
+}
+
+// rewriteCommitted reports whether a manifest change that returned an error
+// applied anyway: on the manifest caught up with the leader, new is
+// registered with sha and old is not.
+func (h *DeleteHandler) rewriteCommitted(ctx context.Context, old, new, sha string) bool {
+	s, ok := h.coordinator.(manifestSyncer)
+	if !ok || s.SyncManifest(ctx) != nil {
+		return false
+	}
+	e, ok := h.coordinator.GetFileEntry(new)
+	if !ok || (sha != "" && e.SHA256 != sha) {
+		return false
+	}
+	_, oldListed := h.coordinator.GetFileEntry(old)
+	return !oldListed
+}
+
+// ambiguousRewrite leaves a rewrite whose manifest change has an unknown
+// outcome as it is: the old file, the rewrite and the record stay, and the
+// drainer settles it once the manifest says (removing the rewrite only
+// rewriteAmbiguityDelay later). Removing the rewrite now would lose its rows
+// if the change still applies.
+func (h *DeleteHandler) ambiguousRewrite(old, new string, err error) error {
+	h.logger.Error().Err(err).Str("file", old).Str("new_file", new).
+		Msg("The manifest change of a DELETE rewrite has an unknown outcome; both files and the record are kept, and the retired-file drainer settles it")
+	return errors.Join(errManifestFailure, fmt.Errorf("replace rewritten file in manifest (outcome unknown, settled later): %w", err))
+}
+
+// retiredAction decides what to do with rec. The caller holds rewriteMu and,
+// on a cluster, caught up with the manifest.
+func (h *DeleteHandler) retiredAction(ctx context.Context, rec retiredRecord) retiredAction {
+	size, err := h.storage.StatFile(ctx, rec.Path)
+	if err != nil {
+		return retiredKeep
+	}
+	if h.coordinator == nil {
+		// Written once the rewrite was in storage: rec.Path is the old copy
+		// whatever happened to the rewrite since.
+		if size < 0 {
+			return retiredClear
+		}
+		return retiredRemoveOld
+	}
+	holder, _ := h.pending.(registrationHolder)
+	owner, _ := h.coordinator.(compactionOwner)
+	busy := func(p string) bool {
+		return (holder != nil && holder.HoldsRegistration(p)) || (owner != nil && owner.CompactionOwns(p))
+	}
+	if busy(rec.Path) {
+		return retiredKeep
+	}
+	_, oldListed := h.coordinator.GetFileEntry(rec.Path)
+	_, newListed := h.coordinator.GetFileEntry(rec.ReplacedBy)
+	if !newListed {
+		rsize, err := h.storage.StatFile(ctx, rec.ReplacedBy)
+		if err != nil {
+			return retiredKeep
+		}
+		if rsize < 0 {
+			// The rewrite is gone (it took and moved on: compacted,
+			// rewritten again). An unlisted old file stays recorded, so it
+			// is never scanned or registered again.
+			if !oldListed && size >= 0 {
+				return retiredKeep
+			}
+			return retiredClear
+		}
+		// The change never applied (or was refused): once it cannot apply
+		// any more, the rewrite goes, whatever became of the old file (a
+		// compaction or another DELETE may have taken it meanwhile).
+		if h.firstSeenAge(rec) < rewriteAmbiguityDelay || busy(rec.ReplacedBy) {
+			return retiredKeep
+		}
+		return retiredRevert
+	}
+	if oldListed {
+		return retiredKeep // both listed: nothing this record can decide
+	}
+	if size < 0 {
+		return retiredClear
+	}
+	if sibs, ok := h.coordinator.(rewriteSiblingEntries); ok {
+		for _, e := range sibs.RewriteSiblings(rec.Path) {
+			if n, err := h.storage.StatFile(ctx, e.Path); err == nil && n == e.SizeBytes {
+				return retiredRemoveOld
+			}
+		}
+	}
+	return retiredKeep
+}
+
+// drainHere: standalone, a cluster on local storage (this node's own
+// records), or the primary writer of a shared object store (the records are
+// shared).
+func (h *DeleteHandler) drainHere() bool {
+	if h.coordinator == nil || !cluster.IsSharedObjectStore(h.storage) {
+		return true
+	}
+	return h.coordinator.IsPrimaryWriter()
+}
+
+// DrainRetired settles the retired journal (retiredAction) and returns how
+// many replaced files it removed.
 func (h *DeleteHandler) DrainRetired(ctx context.Context) int {
-	if h.coordinator != nil {
+	if !h.drainHere() {
 		return 0
 	}
 	recs, err := h.retiredRecords(ctx)
@@ -447,26 +684,62 @@ func (h *DeleteHandler) DrainRetired(ctx context.Context) int {
 		h.logger.Warn().Err(err).Msg("Could not read the retired-file journal")
 		return 0
 	}
+	if len(recs) == 0 {
+		return 0
+	}
+	if h.coordinator != nil {
+		s, ok := h.coordinator.(manifestSyncer)
+		if !ok || s.SyncManifest(ctx) != nil {
+			return 0
+		}
+	}
 	removed := 0
 	for _, r := range recs {
 		if ctx.Err() != nil {
 			break
 		}
-		// The lock per record: a DELETE waits for one removal, not a pass.
+		// The lock per record: a DELETE waits for one decision, not a pass.
 		h.rewriteMu.Lock()
-		err := deleteReplaced(ctx, h.storage, r.Path)
-		if err == nil {
-			h.clearRetired(ctx, r.Path)
-		}
-		h.rewriteMu.Unlock()
-		if err != nil {
-			h.logger.Warn().Err(err).Str("file", r.Path).Str("replaced_by", r.ReplacedBy).
-				Msg("Still cannot remove a file a DELETE replaced; queries read its rows twice until it is removed")
+		// Read again under the lock: a restore or a DELETE may have changed
+		// or cleared it since the listing.
+		if cur, ok := h.currentRecord(ctx, r.Path); !ok || cur.ReplacedBy != r.ReplacedBy {
+			h.rewriteMu.Unlock()
 			continue
 		}
-		removed++
-		h.logger.Info().Str("file", r.Path).Str("replaced_by", r.ReplacedBy).
-			Msg("Removed a file a DELETE replaced and could not remove at the time")
+		var derr error
+		act := h.retiredAction(ctx, r)
+		switch act {
+		case retiredRemoveOld:
+			if derr = deleteReplaced(ctx, h.storage, r.Path); derr == nil {
+				h.clearRetired(ctx, r.Path)
+				h.reads.remove(r.Path)
+				h.forgetSeen(r)
+				removed++
+			}
+		case retiredRevert:
+			if derr = deleteReplaced(ctx, h.storage, r.ReplacedBy); derr == nil {
+				h.clearRetired(ctx, r.Path)
+				h.forgetSeen(r)
+			}
+		case retiredClear:
+			h.clearRetired(ctx, r.Path)
+			h.reads.remove(r.Path)
+			h.forgetSeen(r)
+		}
+		h.rewriteMu.Unlock()
+		switch {
+		case derr != nil:
+			h.logger.Warn().Err(derr).Str("file", r.Path).Str("replaced_by", r.ReplacedBy).
+				Msg("Could not settle a file a DELETE replaced; queries may read its rows twice until it is")
+		case act == retiredRemoveOld:
+			h.logger.Info().Str("file", r.Path).Str("replaced_by", r.ReplacedBy).
+				Msg("Removed a file a DELETE replaced and could not remove at the time")
+		case act == retiredRevert:
+			h.logger.Warn().Str("file", r.Path).Str("removed", r.ReplacedBy).
+				Msg("A DELETE rewrite never reached the manifest; removed the rewrite, the original stays")
+		case act == retiredClear:
+			h.logger.Info().Str("file", r.Path).Msg("Cleared a retired-file record with nothing left to do")
+		}
 	}
 	if removed > 0 {
 		h.filesRemoved()
@@ -475,11 +748,8 @@ func (h *DeleteHandler) DrainRetired(ctx context.Context) int {
 }
 
 // StartRetiredDrainer runs DrainRetired now and every retiredDrainEvery
-// until ctx ends. Standalone only (a cluster's DELETE does not journal).
+// until ctx ends (drainHere decides, at every tick, whether this node does).
 func (h *DeleteHandler) StartRetiredDrainer(ctx context.Context) {
-	if h.coordinator != nil {
-		return
-	}
 	go func() {
 		t := time.NewTicker(retiredDrainEvery)
 		defer t.Stop()
@@ -505,4 +775,17 @@ func (h *DeleteHandler) logLeftovers(left []leftover) {
 	}
 	h.logger.Warn().Int("files", len(left)).Strs("sample", sample).
 		Msg("Delete leaves out files an earlier DELETE replaced and could not remove; queries read their rows twice until they are removed")
+}
+
+// currentRecord reads old's record as it is now.
+func (h *DeleteHandler) currentRecord(ctx context.Context, old string) (retiredRecord, bool) {
+	data, err := h.storage.Read(ctx, retiredKey(old))
+	if err != nil {
+		return retiredRecord{}, false
+	}
+	var rec retiredRecord
+	if json.Unmarshal(data, &rec) != nil {
+		return retiredRecord{}, false
+	}
+	return rec, true
 }

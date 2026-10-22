@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster/raft"
+	"github.com/basekick-labs/arc/internal/storage"
 )
 
 // A compaction output a row DELETE rewrote, whose old object is still in the
@@ -38,5 +39,51 @@ func TestRepairDoesNotAdoptARewriteLeftover(t *testing.T) {
 	}
 	if _, ok := r.c.raftNode.FSM().GetFile(repairOutput); ok {
 		t.Fatal("the repair registered the leftover")
+	}
+}
+
+// A compaction output the DELETE journal names is never adopted; the
+// reconciler keeps it too (it is the drainer's), rather than removing it as
+// an orphan.
+func TestJournaledObjectIsNeitherAdoptedNorAnOrphan(t *testing.T) {
+	r := objectRig(t)
+	ctx := context.Background()
+	r.register("listed.parquet")
+	r.writeOld(repairOutput, "the old rows")
+	if !r.c.AdoptableObject(ctx, repairOutput) {
+		t.Fatal("precondition: adoptable")
+	}
+	if err := r.store.Write(ctx, storage.RetiredKey(repairOutput), []byte(`{"v":1,"path":"`+repairOutput+`","replaced_by":"x"}`)); err != nil {
+		t.Fatal(err)
+	}
+	r.c.retiredJournal.mu.Lock()
+	r.c.retiredJournal.at = time.Time{} // drop the cached view
+	r.c.retiredJournal.mu.Unlock()
+	if r.c.AdoptableObject(ctx, repairOutput) {
+		t.Fatal("a journaled object is adoptable")
+	}
+	if !r.c.ReconcilerKeeps(ctx, repairOutput) {
+		t.Fatal("the reconciler would remove a journaled object as an orphan")
+	}
+	if r.c.ReconcilerKeeps(ctx, stHour+"stray.parquet") {
+		t.Fatal("the reconciler keeps an unrelated unlisted object")
+	}
+}
+
+// Until the DELETE journal has been read, nothing is adopted and nothing is
+// an orphan (it may name any unlisted object).
+func TestUnreadJournalFailsClosed(t *testing.T) {
+	r := objectRig(t)
+	ctx := context.Background()
+	r.register("listed.parquet")
+	r.writeOld(repairOutput, "the old rows")
+	r.c.retiredJournal.mu.Lock()
+	r.c.retiredJournal.at, r.c.retiredJournal.known = time.Now(), false
+	r.c.retiredJournal.mu.Unlock()
+	if r.c.AdoptableObject(ctx, repairOutput) {
+		t.Fatal("adopted with the journal unread")
+	}
+	if !r.c.ReconcilerKeeps(ctx, stHour+"stray.parquet") {
+		t.Fatal("an orphan with the journal unread")
 	}
 }

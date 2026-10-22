@@ -347,7 +347,7 @@ type Manager struct {
 	// cluster manifest lists it; locallyStaged reports an input of a job this
 	// node staged and the cluster has not seen yet.
 	stagedMode func() bool
-	// retired: the standalone DELETE journal's files (storage.ReadRetired),
+	// retired: the DELETE journal's files (storage.ReadRetired),
 	// read at most every retiredTTL (filterRewriteLeftovers).
 	retiredMu     sync.Mutex
 	retired       map[string]bool
@@ -734,7 +734,7 @@ func (m *Manager) filterRewriteLeftovers(candidate Candidate, tier Tier) (Candid
 // journal may be.
 const retiredTTL = 30 * time.Second
 
-// retiredFiles returns the files the standalone DELETE journal names, read
+// retiredFiles returns the files the DELETE journal names, read
 // at most every retiredTTL. A journal that cannot be read gives the last
 // view (none at first): the family rule still applies.
 func (m *Manager) retiredFiles() map[string]bool {

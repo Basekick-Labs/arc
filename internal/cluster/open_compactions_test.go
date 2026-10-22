@@ -273,8 +273,50 @@ func TestOpenLocalDeleteReasons(t *testing.T) {
 	r.c.open.mu.Lock()
 	n := len(r.c.open.localDeleted)
 	r.c.open.mu.Unlock()
-	if n != 2 {
-		t.Fatalf("tracking %d deletes, want 2", n)
+	// delete-rewrite is tracked too: excluded only once its rewrite is here
+	// (TestOpenExcludesARewrittenFileOnceItsRewriteIsHere).
+	if n != 3 {
+		t.Fatalf("tracking %d deletes, want 3", n)
+	}
+}
+
+// A DELETE rewrite's old file is left out once a registered member of its
+// rewrite family is in storage at its registered size; only the stat is
+// cached, so a member that leaves the manifest stops the exclusion.
+func TestOpenExcludesARewrittenFileOnceItsRewriteIsHere(t *testing.T) {
+	r := staleRig(t)
+	ctx := context.Background()
+	var hooks atomic.Int32
+	r.c.SetOnObjectOutputSeen(func() { hooks.Add(1) })
+	old := staleHour + "cpu_1.parquet"
+	rw := staleHour + "cpu_1_rewrite_5.parquet"
+	r.write(old, "all the rows")
+	r.c.noteLocalDeleted(old, "delete-rewrite")
+	if got := r.c.OpenExcludedFor(ctx, openPrefix); len(got) != 0 {
+		t.Fatalf("no rewrite yet: excluded %v", got)
+	}
+	// Registered but not here yet (a reader still pulling it).
+	e := raft.FileEntry{Path: rw, SHA256: strings.Repeat("b", 64), SizeBytes: int64(len("the kept rows")), Database: "testdb",
+		Measurement: "cpu", OriginNodeID: "writer-1", Tier: "hot", CreatedAt: time.Now()}
+	if err := r.c.raftNode.RegisterFile(e, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.c.OpenExcludedFor(ctx, openPrefix); len(got) != 0 {
+		t.Fatalf("rewrite registered, not here: excluded %v", got)
+	}
+	r.write(rw, "the kept rows")
+	if got := r.c.OpenExcludedFor(ctx, openPrefix); !sameSet(got, []string{old}) {
+		t.Fatalf("rewrite here: excluded %v", got)
+	}
+	r.c.OpenExcludedFor(ctx, openPrefix)
+	if hooks.Load() != 1 {
+		t.Fatalf("hook ran %d times, want 1", hooks.Load())
+	}
+	// The rewrite leaves the manifest (removed by something that does not
+	// account for its rows): the old file is read again.
+	r.unregister(rw)
+	if got := r.c.OpenExcludedFor(ctx, openPrefix); len(got) != 0 {
+		t.Fatalf("rewrite unregistered: excluded %v", got)
 	}
 }
 
@@ -435,5 +477,56 @@ func TestOpenCommitMovesTheGeneration(t *testing.T) {
 	}
 	if !r.c.OpenAny(openPrefix) || r.c.OpenGeneration() == g1 {
 		t.Fatal("the commit did not make reads volatile and move the generation")
+	}
+}
+
+// On a shared backend the delete callback records only a DELETE rewrite's
+// old file (every node reads it until the handler removes it); other
+// reasons are removed at once by their caller.
+func TestSharedBackendRecordsOnlyRewrites(t *testing.T) {
+	origin := startHangingOrigin(t)
+	c, _ := newManifestDeleteRig(t, origin.addr())
+	reg := func(p string) {
+		e := raft.FileEntry{Path: p, SHA256: strings.Repeat("a", 64), SizeBytes: 4, Database: "testdb",
+			Measurement: "cpu", OriginNodeID: manifestDeleteOrigin, Tier: "hot", CreatedAt: time.Now()}
+		if err := c.raftNode.RegisterFile(e, 5*time.Second); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ret, rw := staleHour+"ret.parquet", staleHour+"rw.parquet"
+	reg(ret)
+	reg(rw)
+	if err := c.raftNode.DeleteFile(ret, "retention:1", 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.raftNode.DeleteFile(rw, "delete-rewrite", 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	c.open.mu.Lock()
+	_, gotRet := c.open.localDeleted[ret]
+	_, gotRw := c.open.localDeleted[rw]
+	c.open.mu.Unlock()
+	if gotRet || !gotRw {
+		t.Fatalf("recorded retention %v, rewrite %v; want only the rewrite", gotRet, gotRw)
+	}
+}
+
+// A registered family member at another size than registered is not the
+// rewrite: the old file is still read.
+func TestOpenRewriteSiblingMustBeAtItsSize(t *testing.T) {
+	r := staleRig(t)
+	ctx := context.Background()
+	old := staleHour + "cpu_2.parquet"
+	rw := staleHour + "cpu_2_rewrite_5.parquet"
+	r.write(old, "all the rows")
+	r.c.noteLocalDeleted(old, "delete-rewrite")
+	e := raft.FileEntry{Path: rw, SHA256: strings.Repeat("b", 64), SizeBytes: int64(len("the kept rows")), Database: "testdb",
+		Measurement: "cpu", OriginNodeID: "writer-1", Tier: "hot", CreatedAt: time.Now()}
+	if err := r.c.raftNode.RegisterFile(e, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	r.write(rw, "a partial")
+	if got := r.c.OpenExcludedFor(ctx, openPrefix); len(got) != 0 {
+		t.Fatalf("sibling at another size: excluded %v", got)
 	}
 }

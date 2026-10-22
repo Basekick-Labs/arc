@@ -88,7 +88,14 @@ const deletePendingWarnAt = 10_000
 type Coordinator struct {
 	// open is what reads must leave out while a compaction's output and
 	// inputs are both readable (open_compactions.go).
-	open          openState
+	open openState
+	// retiredJournal caches the DELETE journal for adoption (manifest_repair.go).
+	retiredJournal struct {
+		mu    sync.Mutex
+		at    time.Time
+		paths map[string]bool
+		known bool
+	}
 	cfg           *config.ClusterConfig
 	licenseClient *license.Client
 	registry      *Registry
@@ -4454,6 +4461,13 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// don't — they're already deleted cluster-wide by the compactor's
 		// StorageBackend.Delete in deleteOldFiles.
 		if backend.Type() != "local" {
+			// Every node reads the shared object, so every node leaves a
+			// DELETE rewrite's old file out of reads once its rewrite is
+			// there (open_compactions.go), until the handler removes it.
+			// Only that reason: others are removed at once, by their caller.
+			if reason == deleteRewriteReason {
+				c.noteLocalDeleted(path, reason)
+			}
 			c.logger.Debug().
 				Str("path", path).
 				Str("reason", reason).
