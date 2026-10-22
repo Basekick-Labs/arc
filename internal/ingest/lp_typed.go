@@ -490,9 +490,6 @@ func (b *lpBuilder) add(p *lpPoint) error {
 // point before any of it is written, so a dropped point leaves no partial
 // row and sets no column's type.
 func (b *lpBuilder) fits(p *lpPoint, m *lpMeasurement) bool {
-	if !b.namesFit(p, m) {
-		return false
-	}
 	if column, clash := pointColumnClash(p); clash {
 		b.drop(p.measurement, column, LPDropSameColumn, LPKindNone, nil)
 		return false
@@ -506,18 +503,32 @@ func (b *lpBuilder) fits(p *lpPoint, m *lpMeasurement) bool {
 		}
 		return LPKindNone, false
 	}
+	// A column the measurement does not have yet must have a name Arc can
+	// read back (#1342). One already in m passed when it was added, so the
+	// steady state pays nothing beyond the kind lookup it already does.
+	b.newCols = b.newCols[:0]
 	for _, t := range p.tags {
-		if k, ok := kindOf(t.Key); ok && k != LPKindString {
+		k, ok := kindOf(t.Key)
+		if !ok {
+			if !b.newColumnName(p, t.Key, t.Key) {
+				return false
+			}
+			continue
+		}
+		if k != LPKindString {
 			b.drop(p.measurement, t.Key, LPDropKind, k, t.Value)
 			return false
 		}
 	}
 	for i, f := range p.fields {
+		column := p.cols[i]
+		k, ok := kindOf(column)
+		if !ok && !b.newColumnName(p, f.Key, column) {
+			return false
+		}
 		if f.Value == nil {
 			continue // a NULL fits any column
 		}
-		column := p.cols[i]
-		k, ok := kindOf(column)
 		if !ok {
 			k = LPKindOf(f.Value) // a new column: its first value must fit it too
 		}
@@ -526,51 +537,34 @@ func (b *lpBuilder) fits(p *lpPoint, m *lpMeasurement) bool {
 			return false
 		}
 	}
-	return true
+	return len(b.newCols) == 0 || b.newColumnsFit(p, m)
 }
 
-// namesFit checks the names of p's columns the measurement does not have yet
-// (#1342): a column already in m was checked when it was added, so a
-// steady-state write pays a map lookup per key and nothing more. A name that
-// is not valid UTF-8, one that is "time" in any letter case, and one that
-// differs only in letter case from another column (of this write or, via
-// known, of the measurement's earlier writes) drops the point.
-func (b *lpBuilder) namesFit(p *lpPoint, m *lpMeasurement) bool {
-	has := func(column string) bool { return m != nil && m.cols[column] != nil }
-	b.newCols = b.newCols[:0]
-	check := func(key, column string) bool {
-		if has(column) {
-			return true
-		}
-		switch ColumnNameProblem(key) {
-		case "":
-		case ColumnNameTimeAlike:
-			col := key
-			if key == "time" {
-				col = ""
-			}
-			b.drop(p.measurement, col, LPDropTime, LPKindNone, nil)
-			return false
-		default:
-			b.drop(p.measurement, key, LPDropName, LPKindNone, nil)
-			return false
-		}
+// newColumnName checks the name of a column the measurement does not have
+// yet (key is the tag or field key it comes from): not valid UTF-8, or "time"
+// in any letter case, drops the point. An acceptable one is queued for
+// newColumnsFit.
+func (b *lpBuilder) newColumnName(p *lpPoint, key, column string) bool {
+	switch ColumnNameProblem(key) {
+	case "":
 		b.newCols = append(b.newCols, column)
 		return true
-	}
-	for _, t := range p.tags {
-		if !check(t.Key, t.Key) {
-			return false
+	case ColumnNameTimeAlike:
+		col := key
+		if key == "time" {
+			col = ""
 		}
+		b.drop(p.measurement, col, LPDropTime, LPKindNone, nil)
+	default:
+		b.drop(p.measurement, key, LPDropName, LPKindNone, nil)
 	}
-	for i, f := range p.fields {
-		if !check(f.Key, p.cols[i]) {
-			return false
-		}
-	}
-	if len(b.newCols) == 0 {
-		return true
-	}
+	return false
+}
+
+// newColumnsFit drops the point when one of its new columns differs only in
+// letter case from another column: of the measurement in this write, of the
+// point itself, or (via known) of the measurement's earlier writes.
+func (b *lpBuilder) newColumnsFit(p *lpPoint, m *lpMeasurement) bool {
 	known := b.knownColumns(p.measurement)
 	var batch map[string]string
 	if m != nil {
