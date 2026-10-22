@@ -309,7 +309,8 @@ func (j *Job) Run(ctx context.Context) error {
 
 	// Phase 4: write an initial completion manifest in writing_output state.
 	// This marks the job as in-progress so CleanupOrphanedCompletionManifests
-	// can sweep it if the subprocess crashes before reaching output_written.
+	// can sweep it if the subprocess crashes before reaching output_written;
+	// the parent also drops it once this process exits (#1343).
 	if j.clusterMode() {
 		m := &CompletionManifest{
 			JobID:         j.JobID,
@@ -1270,13 +1271,9 @@ func (j *Job) complete() error {
 		compressionRatio = (1 - float64(j.BytesAfter)/float64(j.BytesBefore)) * 100
 	}
 
-	// Record metrics
-	m := metrics.Get()
-	m.IncCompactionJobs()
-	m.IncCompactionSuccess()
-	m.IncCompactionFilesCompacted(int64(j.FilesCompacted))
-	m.IncCompactionBytesRead(j.BytesBefore)
-	m.IncCompactionBytesWritten(j.BytesAfter)
+	// No metrics here: a Job runs only in the compaction subprocess, whose
+	// registry nothing scrapes. The parent counts the outcome from the
+	// result (Manager.compactPartition, #1343).
 
 	j.logger.Info().
 		Int("files_compacted", j.FilesCompacted).
@@ -1303,10 +1300,7 @@ func (j *Job) fail(err error) error {
 		j.DurationSeconds = now.Sub(*j.StartedAt).Seconds()
 	}
 
-	// Record metrics
-	m := metrics.Get()
-	m.IncCompactionJobs()
-	m.IncCompactionFailed()
+	// Counted by the parent from the result; see complete (#1343).
 
 	j.logger.Error().Err(err).Msg("Compaction job failed")
 

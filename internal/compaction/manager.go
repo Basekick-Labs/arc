@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
@@ -1146,9 +1147,9 @@ func (m *Manager) subprocessJob(candidate Candidate, jobID string) *SubprocessJo
 		StorageType:   m.StorageBackend.Type(),
 		StorageConfig: m.StorageBackend.ConfigJSON(),
 		// Phase 4: cluster-mode fields. CompletionDir is empty in OSS
-		// (Manager.CompletionDir is never set), so the subprocess's
-		// clusterMode() returns false and no completion manifest is
-		// written — behavior is byte-identical to pre-Phase-4.
+		// (cmd/arc sets it only in cluster mode, completionDirFor), so the
+		// subprocess's clusterMode() returns false and no completion
+		// manifest is written.
 		JobID:         jobID,
 		CompletionDir: m.CompletionDir,
 		PartitionTime: candidate.PartitionTime,
@@ -1271,8 +1272,16 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 	// metadata + query caches for it would cost every in-flight query a cold
 	// re-read — every cycle, for a partition that skips every cycle.
 	jobSucceeded := err == nil && result != nil && result.Success
-	jobInterrupted := ctx.Err() != nil && errors.Is(err, ctx.Err())
+	// Interrupted: the parent's context ended the attempt. Either the child
+	// was killed for it, or it got the same stop signal itself (a service
+	// manager stopping the whole process group) and reported a failure.
+	jobInterrupted := !jobSucceeded && ctx.Err() != nil
 	shouldInvalidateCache := jobSucceeded && result.FilesCompacted > 0
+
+	// The job ran in the subprocess, whose metrics registry nothing scrapes:
+	// its outcome, and the storage I/O it did, are counted here (#1343).
+	countJobOutcome(result, jobSucceeded, jobInterrupted)
+	m.dropDeadCompletionRecord(ctx, candidate, config)
 
 	m.mu.Lock()
 	if jobSucceeded {
@@ -1330,13 +1339,7 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 		if jobSucceeded {
 			m.logger.Debug().Str("job_id", config.JobID).Msg("Compaction output staged; observers run at its commit")
 		}
-		if err != nil {
-			return err
-		}
-		if result != nil && !result.Success {
-			return errors.New(result.Error)
-		}
-		return nil
+		return attemptError(ctx, err, result, jobInterrupted)
 	}
 	if jobSucceeded && result != nil {
 		m.notifyCompactedOutput(result.OutputFile)
@@ -1371,13 +1374,26 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 	}
 
 	// Return error if subprocess failed
-	if err != nil {
-		return err
+	return attemptError(ctx, err, result, jobInterrupted)
+}
+
+// attemptError is what compactPartition returns for an attempt. An
+// interrupted one always wraps ctx's error, even when the subprocess
+// reported its own failure after receiving the same stop signal: the cycle
+// tells an interrupted batch from a failed one by errors.Is(err,
+// ctx.Err()) and must agree with how the attempt was counted (#1343), and
+// must not split a batch the shutdown cut short.
+func attemptError(ctx context.Context, err error, result *SubprocessJobResult, interrupted bool) error {
+	if err == nil && result != nil && !result.Success {
+		err = errors.New(result.Error)
 	}
-	if result != nil && !result.Success {
-		return errors.New(result.Error)
+	if interrupted && err != nil && !errors.Is(err, ctx.Err()) {
+		return fmt.Errorf("%v: %w", err, ctx.Err())
 	}
-	return nil
+	if interrupted && err == nil {
+		return ctx.Err()
+	}
+	return err
 }
 
 // compactFilesAdaptively attempts compaction with adaptive batch sizing.
@@ -2992,4 +3008,86 @@ func (m *Manager) registerOpenJob(candidate Candidate, jobID, outputName string)
 	}
 	m.OpenJobs.register(output, manifestPath, candidate.Files)
 	return output
+}
+
+// countJobOutcome counts one compaction attempt in this process's metrics
+// (#1343): the job ran in a subprocess, whose own registry nothing scrapes.
+// Attempts, as in Stats: a batch retried at half size is two. A staged job
+// counts as succeeded once its output is staged, before the cluster commits
+// it. A subprocess that died without a result (crash, OOM, kill) is failed
+// (or interrupted, with the cycle cancelled), which the subprocess itself
+// could never count.
+func countJobOutcome(result *SubprocessJobResult, succeeded, interrupted bool) {
+	mt := metrics.Get()
+	mt.IncCompactionJobs()
+	switch {
+	case succeeded:
+		mt.IncCompactionSuccess()
+		mt.IncCompactionFilesCompacted(int64(result.FilesCompacted))
+		mt.IncCompactionBytesRead(result.BytesBefore)
+		mt.IncCompactionBytesWritten(result.BytesAfter)
+	case interrupted:
+		mt.IncCompactionInterrupted()
+	default:
+		mt.IncCompactionFailed()
+	}
+	if result != nil {
+		mt.AddChildCounters(result.Metrics)
+	}
+}
+
+// completionRecordCheckTimeout bounds the storage check dropDeadCompletionRecord
+// makes, on a context that outlives the (possibly cancelled) cycle.
+const completionRecordCheckTimeout = 10 * time.Second
+
+// dropDeadCompletionRecord removes the completion record of an attempt that
+// ended without getting past writing_output (#1343). The subprocess writes
+// the record first (Job.Run) and moves it on as it gets further; a failed or
+// killed attempt left it in place until a restart, read by the watcher on
+// every poll and, on a staged node, keeping the job's staged directory "in
+// use" (HasStagedJob) so nothing swept a failed job's output.
+//
+// It runs after runJobInSubprocess returned, so the subprocess has exited,
+// and only drops a record that re-reads as this job's writing_output.
+// Another state belongs to the watcher. A legacy job's record is kept while
+// its crash-recovery manifest exists: recovery advances that record (though
+// it rebuilds one if it is missing, as the startup sweep relies on). A staged
+// job writes no such manifest. Any doubt keeps the record; nothing here
+// changes how the attempt is counted or what compactPartition returns.
+func (m *Manager) dropDeadCompletionRecord(ctx context.Context, candidate Candidate, config *SubprocessJobConfig) {
+	if config == nil || config.CompletionDir == "" {
+		return
+	}
+	path := filepath.Join(config.CompletionDir, config.JobID+".json")
+	// A subprocess killed inside writeCompletionManifest's rename leaves its
+	// temporary file, which nothing else removes. Nothing else can be
+	// writing it: the job id is unique and the subprocess has exited.
+	_ = os.Remove(path + ".tmp")
+	rec, err := readCompletionManifest(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			m.logger.Debug().Err(err).Str("path", path).Msg("Completion record unreadable after the job; left for the startup sweep")
+		}
+		return
+	}
+	if rec.JobID != config.JobID || rec.State != CompletionStateWritingOutput {
+		return
+	}
+	if !config.Staged {
+		if m.ManifestManager == nil {
+			return
+		}
+		manifestPath := m.ManifestManager.GenerateManifestPath(candidate.Tier, candidate.Database, candidate.PartitionPath, config.JobID)
+		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), completionRecordCheckTimeout)
+		exists, err := m.ManifestManager.backend.Exists(cctx, manifestPath)
+		cancel()
+		if err != nil || exists {
+			return // recovery owns the record, or we cannot tell
+		}
+	}
+	if err := deleteCompletionManifest(path); err != nil {
+		m.logger.Debug().Err(err).Str("path", path).Msg("Could not remove a finished job's completion record; left for the startup sweep")
+		return
+	}
+	m.logger.Debug().Str("job_id", config.JobID).Msg("Removed the completion record of a job that ended before writing its output")
 }
