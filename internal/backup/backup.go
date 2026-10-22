@@ -664,6 +664,21 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 			icebergMetaFiles = append(icebergMetaFiles, obj)
 		}
 	}
+	// A file a row DELETE replaced and could not remove (the standalone
+	// retired journal) is not data: its replacement holds every row it still
+	// had to keep. Backing it up would bring both back on a restore, with
+	// nothing recording which is the old one.
+	if retired := m.retiredByDelete(ctx, objectLister, objects, sc.empty()); len(retired) > 0 {
+		kept := parquetFiles[:0]
+		for _, obj := range parquetFiles {
+			if !retired[obj.Path] {
+				kept = append(kept, obj)
+			}
+		}
+		m.logger.Info().Int("files", len(parquetFiles)-len(kept)).
+			Msg("Backup leaves out files a DELETE replaced and has not removed yet")
+		parquetFiles = kept
+	}
 	// A scoped backup carries no Iceberg metadata (#1084): the namespace
 	// directories are not listed at all, and the catalog that would make a
 	// stray metadata file useful is never copied with it. The classifier
@@ -2496,6 +2511,45 @@ func (m *Manager) copyStateFiles(ctx context.Context, leg *backupLeg) (int64, er
 
 // isCompactionState reports whether a key is compaction's crash-recovery
 // state: a manifest or a parked manifest under _compaction_state/.
+// deleteRetiredDir is the standalone DELETE's retired journal.
+const deleteRetiredDir = storage.DeleteRetiredRoot
+
+// retiredByDelete returns the files the retired journal names. An unscoped
+// backup's listing already holds the journal; a scoped one lists it. A
+// journal that cannot be read leaves them in the backup, as before.
+func (m *Manager) retiredByDelete(ctx context.Context, lister storage.ObjectLister, listed []storage.ObjectInfo, whole bool) map[string]bool {
+	var objs []storage.ObjectInfo
+	if whole {
+		for _, o := range listed {
+			if strings.HasPrefix(o.Path, deleteRetiredDir+"/") {
+				objs = append(objs, o)
+			}
+		}
+	} else {
+		var err error
+		if objs, err = lister.ListObjects(ctx, deleteRetiredDir+"/"); err != nil {
+			return nil
+		}
+	}
+	if len(objs) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(objs))
+	for _, o := range objs {
+		if !strings.HasSuffix(o.Path, ".json") {
+			continue
+		}
+		data, err := m.dataStorage.Read(ctx, o.Path)
+		if err != nil {
+			continue
+		}
+		if p, ok := storage.ParseRetired(o.Path, data); ok {
+			out[p] = true
+		}
+	}
+	return out
+}
+
 func isCompactionState(path string) bool {
 	return strings.HasPrefix(filepath.ToSlash(path), compactionStateDir+"/")
 }

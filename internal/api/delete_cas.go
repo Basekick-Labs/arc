@@ -77,13 +77,20 @@ type registrationHolder interface {
 // read again on each poll so a file it stops listing meanwhile is no longer
 // waited for. Still missing, it stops the DELETE with errUnreachableFiles
 // unless opts.allowUnreachable; it is returned as unreachable either way.
-func (h *DeleteHandler) scanSet(ctx context.Context, database, measurement string, listed []fileInfo, opts scanOpts) ([]fileInfo, map[string]string, []string, error) {
+func (h *DeleteHandler) scanSet(ctx context.Context, database, measurement string, listed []fileInfo, opts scanOpts, leftovers *int) ([]fileInfo, map[string]string, []string, error) {
 	c, ok := h.coordinator.(compactionCommitter)
 	if !ok {
 		return listed, nil, nil, nil
 	}
 	if err := c.SyncManifest(ctx); err != nil {
 		return nil, nil, nil, fmt.Errorf("%w: %v", errManifestNotSynced, err)
+	}
+	// Leftovers of earlier DELETEs, judged on the manifest just synced
+	// (delete_leftovers.go): left out before sharedUnlisted could adopt one.
+	listed, left := h.clusterClassify(listed)
+	h.logLeftovers(left)
+	if leftovers != nil {
+		*leftovers = len(left)
 	}
 	manifest := hotByPath(c.ManifestHotFiles(database, measurement))
 	// A listed file is complete (local storage stages writes under a name

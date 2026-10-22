@@ -346,7 +346,12 @@ type Manager struct {
 	// and storage is local); inputLookup describes a candidate as the
 	// cluster manifest lists it; locallyStaged reports an input of a job this
 	// node staged and the cluster has not seen yet.
-	stagedMode    func() bool
+	stagedMode func() bool
+	// retired: the standalone DELETE journal's files (storage.ReadRetired),
+	// read at most every retiredTTL (filterRewriteLeftovers).
+	retiredMu     sync.Mutex
+	retired       map[string]bool
+	retiredAt     time.Time
 	inputLookup   InputLookup
 	locallyStaged func(path string) bool
 
@@ -679,11 +684,79 @@ func (m *Manager) dropPending(objects []string) []string {
 	return kept
 }
 
+// filterRewriteLeftovers drops every member of a rewrite family
+// (storage.RewriteFamily) with more than one member in the candidate: a row
+// DELETE rewrote the file and its old copy is still in storage, and
+// compacting them together would put the surviving rows in the output twice,
+// for good. They wait until the DELETE side removes the old copy. A staged
+// job compacts only files the cluster manifest lists, which never holds
+// both, so it is left alone. The tier's MinFiles is re-checked on the rest.
+func (m *Manager) filterRewriteLeftovers(candidate Candidate, tier Tier) (Candidate, bool) {
+	m.mu.Lock()
+	mode := m.stagedMode
+	m.mu.Unlock()
+	if mode != nil && mode() {
+		return candidate, true
+	}
+	families := storage.RewriteFamilies(candidate.Files)
+	retired := m.retiredFiles()
+	kept := make([]string, 0, len(candidate.Files))
+	for _, f := range candidate.Files {
+		// A file the DELETE journal names stays out even alone: its
+		// replacement may be gone (rewritten again, deleted whole) while the
+		// journal still waits to remove it.
+		if _, ok := families[storage.RewriteFamily(f)]; !ok && !retired[f] {
+			kept = append(kept, f)
+		}
+	}
+	if len(kept) == len(candidate.Files) {
+		return candidate, true
+	}
+	m.logger.Warn().
+		Str("partition", candidate.PartitionPath).
+		Str("tier", candidate.Tier).
+		Int("files", len(candidate.Files)-len(kept)).
+		Msg("Files a DELETE rewrote whose old copy is still in storage are not compacted until it is removed; queries read their rows twice meanwhile")
+	if len(kept) < tier.GetMinFiles() {
+		return candidate, false
+	}
+	candidate.Files = kept
+	candidate.FileCount = len(kept)
+	return candidate, true
+}
+
 // filterPending drops candidate files still pending cluster registration and
 // re-applies the tier's MinFiles to what remains (#1212). Compacting a pending
 // file races its registration: the drain can register a source after
 // compaction dropped it from the manifest, leaving an entry for a file about
 // to be deleted.
+// retiredTTL bounds how stale filterRewriteLeftovers' view of the DELETE
+// journal may be.
+const retiredTTL = 30 * time.Second
+
+// retiredFiles returns the files the standalone DELETE journal names, read
+// at most every retiredTTL. A journal that cannot be read gives the last
+// view (none at first): the family rule still applies.
+func (m *Manager) retiredFiles() map[string]bool {
+	if m.StorageBackend == nil {
+		return nil
+	}
+	m.retiredMu.Lock()
+	defer m.retiredMu.Unlock()
+	if time.Since(m.retiredAt) < retiredTTL {
+		return m.retired
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if r, err := storage.ReadRetired(ctx, m.StorageBackend); err == nil {
+		m.retired = r
+	} else {
+		m.logger.Warn().Err(err).Msg("Could not read the DELETE journal; files it names may be compacted this cycle")
+	}
+	m.retiredAt = time.Now()
+	return m.retired
+}
+
 func (m *Manager) filterPending(candidate Candidate, tier Tier) (Candidate, bool) {
 	kept := m.dropPending(candidate.Files)
 	if len(kept) == len(candidate.Files) {
@@ -1976,6 +2049,14 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 						m.logger.Debug().
 							Str("partition", candidate.PartitionPath).
 							Msg("Skipping candidate: all files are tracked by manifests")
+						continue
+					}
+
+					// A file a DELETE rewrote whose old copy is still in
+					// storage is not compacted: the output
+					// would hold its rows twice.
+					filteredCandidate, shouldProcess = m.filterRewriteLeftovers(filteredCandidate, tier)
+					if !shouldProcess {
 						continue
 					}
 

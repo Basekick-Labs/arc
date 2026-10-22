@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/hashicorp/raft"
 	"github.com/rs/zerolog"
 )
@@ -669,6 +670,11 @@ type ClusterFSM struct {
 	// the primary `files` map on register/delete to avoid O(N) scans when
 	// filtering by database.
 	filesByDB map[string]map[string]struct{}
+	// rewritesByFamily: registered row-DELETE rewrites by their family
+	// (storage.RewriteFamily), for HasRewriteSibling. Added on every insert
+	// and dropped on delete; a stale member is harmless (checked against
+	// files).
+	rewritesByFamily map[string]map[string]struct{}
 	// keysCache is a sorted snapshot of f.files keys, used by
 	// GetFilesPaginated to avoid sorting the full key set on every page.
 	// Set to nil on any manifest mutation to trigger a rebuild on the
@@ -1946,6 +1952,7 @@ func (f *ClusterFSM) applyRegisterFileLocked(p RegisterFilePayload, logIndex uin
 		}
 	}
 	f.files[entry.Path] = &entry
+	f.indexRewriteLocked(entry.Path)
 	// Maintain the database → files secondary index
 	idx, ok := f.filesByDB[entry.Database]
 	if !ok {
@@ -2022,6 +2029,7 @@ func (f *ClusterFSM) applyDeleteFileLocked(p DeleteFilePayload) func() {
 		f.takeoverNoteVanishedLocked(*existing)
 	}
 	delete(f.files, p.Path)
+	f.unindexRewriteLocked(p.Path)
 	if existed {
 		f.noteStagedOutputGoneLocked(p.Path, p.Reason)
 		// Remove from the database → files secondary index
@@ -2135,6 +2143,7 @@ func (f *ClusterFSM) applyUpdateFileLocked(p UpdateFilePayload, logIndex uint64)
 		}
 	}
 	f.files[entry.Path] = &entry
+	f.indexRewriteLocked(entry.Path)
 	if entry.Database != "" {
 		idx, ok := f.filesByDB[entry.Database]
 		if !ok {
@@ -3277,7 +3286,9 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	f.files = restoredFiles
 	// Rebuild the database → files secondary index from the restored files
 	f.filesByDB = make(map[string]map[string]struct{}, len(f.files))
+	f.rewritesByFamily = nil
 	for path, entry := range f.files {
+		f.indexRewriteLocked(path)
 		idx, ok := f.filesByDB[entry.Database]
 		if !ok {
 			idx = make(map[string]struct{})
@@ -3566,6 +3577,55 @@ func (f *ClusterFSM) GetFilesByDatabase(database string) []*FileEntry {
 		}
 	}
 	return files
+}
+
+// HasRewriteSibling reports whether the manifest lists another member of
+// path's rewrite family (storage.RewriteFamily): a file a row DELETE
+// rewrote, or rewrote from.
+func (f *ClusterFSM) HasRewriteSibling(path string) bool {
+	family := storage.RewriteFamily(path)
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if family != path {
+		if _, ok := f.files[family]; ok {
+			return true
+		}
+	}
+	for p := range f.rewritesByFamily[family] {
+		if _, ok := f.files[p]; ok && p != path {
+			return true
+		}
+	}
+	return false
+}
+
+// indexRewriteLocked adds path to rewritesByFamily if it is a rewrite.
+// Caller holds f.mu.
+func (f *ClusterFSM) indexRewriteLocked(path string) {
+	family := storage.RewriteFamily(path)
+	if family == path {
+		return
+	}
+	if f.rewritesByFamily == nil {
+		f.rewritesByFamily = make(map[string]map[string]struct{})
+	}
+	m := f.rewritesByFamily[family]
+	if m == nil {
+		m = make(map[string]struct{})
+		f.rewritesByFamily[family] = m
+	}
+	m[path] = struct{}{}
+}
+
+// unindexRewriteLocked drops path from rewritesByFamily. Caller holds f.mu.
+func (f *ClusterFSM) unindexRewriteLocked(path string) {
+	family := storage.RewriteFamily(path)
+	if m := f.rewritesByFamily[family]; m != nil {
+		delete(m, path)
+		if len(m) == 0 {
+			delete(f.rewritesByFamily, family)
+		}
+	}
 }
 
 // FileDatabases returns the databases the manifest lists files of, sorted.

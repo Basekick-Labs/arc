@@ -1490,6 +1490,87 @@ standalone and every cluster node, on JSON, Arrow and msgpack queries.
   Leaving the output out of such a query would instead lose the job's rows
   when the inputs are deleted first, which is worse.
 
+### A retried DELETE no longer leaves the surviving rows in two files
+
+A row DELETE writes each affected file again without the deleted rows, then
+removes the old file. If removing the old file failed, it stayed in storage
+next to the new one, and queries counted its rows twice. That much is a
+window (see the limitations). What made it permanent:
+- **Retrying the DELETE:** the old file still had the matching rows, so the
+  retry wrote it again. Two files then held the surviving rows, and every
+  later DELETE rewrote both. On a shared object store cluster, the retry also
+  registered the second copy in the cluster manifest.
+- **Compaction:** standalone compaction, and cluster compaction with
+  compaction commit off, merged the old file and its replacement into one
+  output with the rows twice.
+- **The manifest repair** (shared object store clusters) registered a
+  compaction output a DELETE had rewritten whose old copy was still in the
+  bucket, so nothing ever removed it.
+
+**The fix:**
+- A DELETE retries removing the file it replaced a few times before giving
+  up, and so does the registration outbox when it rewrites a pending file.
+- Every rewrite of a file is named after it, so the DELETE can find the old
+  copy: of the copies of one file, the one with the fewest rows is the
+  current one (each rewrite only removes rows).
+- **Standalone:**
+  - Before removing the replaced file, the DELETE records it in the storage
+    backend (`_delete_retired/`). Arc removes recorded files at start and
+    every minute, so a failed removal is finished without a retry, after a
+    restart too.
+  - A later DELETE on the measurement leaves out and removes any older copy
+    it finds, recorded or not.
+  - A backup leaves out recorded files, so a restore does not bring both
+    copies back.
+- **Clusters:** the DELETE first catches up with the cluster manifest. It
+  then leaves out a file the manifest does not list while another copy of
+  the same file is listed or still being registered.
+  - With compaction commit on (a cluster turns it on once every node
+    supports it), the DELETE also
+    removes such a file when it is provably the older copy: the listed copy
+    is in storage at its registered size and has fewer rows.
+  - The manifest repair no longer registers such a file. When the
+    reconciler is enabled and acting (`reconciliation.enabled`, with
+    `reconciliation.manifest_only_dry_run = false`), it removes the file as
+    an orphan.
+- Compaction (outside staged compaction, which compacts only files the
+  cluster manifest lists) skips every copy of a file while more than one is
+  in storage, and any file the standalone record names.
+- A DELETE whose clause no longer matches anything when it rewrites a file
+  (a clause on `now()`) leaves the file as it is instead of writing the same
+  rows under a new name.
+
+**Limitations:**
+- Queries still read both copies until the old one is removed. On
+  standalone that is up to a minute, if the record was written; if writing
+  the record failed too (likely in the same storage outage), the copy stays
+  until a DELETE runs on that measurement. On a cluster with compaction
+  commit off, it stays until the reconciler removes it.
+- While both copies are in storage, compaction skips that file.
+- Pairs of copies left by earlier versions (both rewrites of the bug above)
+  hold the same rows: neither can be told apart, so both are kept, read and
+  rewritten together. A DELETE on them warns. Remove one by hand.
+- Standalone with tiering: if a recorded copy moves to the cold tier before
+  it is removed, it stays there.
+- On a shared object store cluster, an old copy whose replacement was later
+  compacted, tiered or deleted away is no longer recognised as one: a later
+  DELETE that matches it, or the manifest repair, can register it again.
+  Removing the old copy durably at the time is the next fix in this series.
+- On a shared object store cluster with tiering, an old copy whose
+  replacement is only in the cold tier is left out of every DELETE and not
+  removed: a DELETE leaves its matching rows in place (and logs a warning)
+  until it is removed by hand or by the reconciler.
+
+### A DELETE no longer drops rows its clause cannot decide
+
+A row DELETE rewrote each file keeping the rows where `NOT (clause)` held. A
+row where the clause is NULL (for example `host <> 'a'` on a row with no
+`host`) fails that test too, so it was dropped from the rewritten file
+without being counted or matched: rows nobody asked to delete were lost. The
+rewrite now keeps every row the clause does not match, the same rows the
+DELETE counts as matched, on standalone and clusters, and for DELETE records
+applied to pending files.
+
 ### A cached query no longer misses an hour its relative end has just reached
 
 Arc caches a query's pruned plan for up to 60 seconds, keyed by the current

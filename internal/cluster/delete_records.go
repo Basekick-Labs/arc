@@ -11,6 +11,7 @@ import (
 
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/ingest"
+	"github.com/basekick-labs/arc/internal/storage"
 )
 
 // DELETE records, the coordinator's side (#1207 d1): the primary records a
@@ -61,7 +62,9 @@ func (c *Coordinator) startDeleteRecords(ctx context.Context, buffer *ingest.Arr
 			Records:  fsm.DeleteRecordsFor,
 			Settle:   c.proposeSettleDeleted,
 			Instance: instance,
-			Remove:   c.storage.Delete,
+			Remove: func(ctx context.Context, path string) error {
+				return storage.DeleteWithRetry(ctx, c.storage, path)
+			},
 		}
 		if rw := c.deleteRewriter.Load(); rw != nil {
 			h.Rewrite = *rw

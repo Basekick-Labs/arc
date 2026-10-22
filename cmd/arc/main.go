@@ -4032,6 +4032,16 @@ func main() {
 		// DELETE records are applied to pending files with the DELETE's own
 		// rewrite (#1207 d1).
 		clusterCoordinator.SetDeleteRewriter(deleteHandler.RewriteForRecords)
+	} else {
+		// Standalone: remove files a DELETE replaced and could not remove at
+		// the time (its retired journal), at start and every minute, whether
+		// or not DELETE is enabled now.
+		retiredCtx, retiredCancel := context.WithCancel(context.Background())
+		shutdownCoordinator.RegisterHook("delete-retired-drainer", func(_ context.Context) error {
+			retiredCancel()
+			return nil
+		}, shutdown.PriorityHTTPServer)
+		deleteHandler.StartRetiredDrainer(retiredCtx)
 	}
 	if cfg.Delete.Enabled {
 		log.Info().
