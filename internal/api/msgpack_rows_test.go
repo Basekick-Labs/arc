@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/Basekick-Labs/msgpack/v6"
+	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
@@ -99,4 +100,29 @@ func TestMsgPackRowsGenericPathPartialWrite(t *testing.T) {
 	require.Contains(t, out, "the other points were written")
 	rows, _ := r.stored(t)
 	require.Equal(t, map[string]int64{"cpu": 1}, rows)
+}
+
+// #1342: a row whose names Arc could not read back is dropped (partial
+// write); a columnar item is dropped whole and the other items written.
+func TestMsgPackDropsUnstorableNames(t *testing.T) {
+	r, post := newMsgPackRowsRig(t)
+	status, out := post([]interface{}{
+		row("cpu", 1700000000, map[string]interface{}{"v": 1.5}, nil),
+		row("cpu", 1700000001, map[string]interface{}{"Time": 2.5}, nil),
+	})
+	require.Equal(t, http.StatusBadRequest, status, out)
+	require.Contains(t, out, "partial write: 1 points dropped")
+	rows, _ := r.stored(t)
+	require.Equal(t, map[string]int64{"cpu": 1}, rows)
+
+	r2, post2 := newMsgPackRowsRig(t)
+	status, out = post2(map[string]interface{}{"batch": []interface{}{
+		map[string]interface{}{"m": "a", "columns": map[string]interface{}{"time": []interface{}{int64(1700000000000)}, "v": []interface{}{1.0}}},
+		map[string]interface{}{"m": "b", "columns": map[string]interface{}{"time": []interface{}{int64(1700000000000), int64(1700000000001)}, "Temp": []interface{}{1.0, 2.0}, "temp": []interface{}{3.0, 4.0}}},
+	}})
+	require.Equal(t, http.StatusBadRequest, status, out)
+	require.Contains(t, out, "partial write: 2 points dropped")
+	require.Contains(t, out, ingest.ColumnNameCaseTwin)
+	rows, _ = r2.stored(t)
+	require.Equal(t, map[string]int64{"a": 1}, rows)
 }
