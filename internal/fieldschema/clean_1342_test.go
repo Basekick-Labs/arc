@@ -211,3 +211,29 @@ func TestCleaningKeepsTheAnchorOrder(t *testing.T) {
 		t.Fatalf("fields = %v", got)
 	}
 }
+
+// A twin in the cached schema (from a process that cached it before #1342
+// cleaning) is dropped when the stored anchor is merged back in on a load.
+func TestLoadCleansACachedTwin(t *testing.T) {
+	r, b, _ := newTestRegistry(t, Options{})
+	ctx := context.Background()
+	data, _ := EncodeAnchor(Normalize(fields("time", tTsTZ, "Temp", tFloat), nil))
+	if err := b.Write(ctx, AnchorKey("db", "m"), data); err != nil {
+		t.Fatal(err)
+	}
+	e := r.entry("db", "m")
+	e.mu.Lock()
+	e.schema = fields("time", tTsTZ, "temp", tFloat)
+	e.mu.Unlock()
+	fs, _, err := r.Fields(ctx, "db", "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, f := range fs {
+		got = append(got, f.Name)
+	}
+	if strings.Join(got, ",") != "time,Temp" {
+		t.Fatalf("fields = %v", got)
+	}
+}
