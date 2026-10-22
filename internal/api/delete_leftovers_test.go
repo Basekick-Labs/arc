@@ -542,3 +542,18 @@ func TestCASScanLeavesTheLeftoverOutAfterItsSync(t *testing.T) {
 		t.Fatalf("synced %d times, want 1", coord.syncs)
 	}
 }
+
+// A family member whose footer cannot be read stops the scan: scanning the
+// family whole is what rewrote a leftover a second time.
+func TestUnreadableFamilyFailsClosed(t *testing.T) {
+	r := newLeftoverRig(t)
+	old := leftoverHour + "cpu_20261007_204851_558252000.parquet"
+	rw := leftoverHour + "cpu_20261007_204851_558252000_rewrite_100.parquet"
+	r.parquet(old, "h0", "h1")
+	if err := os.WriteFile(filepath.Join(r.root, rw), []byte("not parquet"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := r.h.findAffectedFiles(context.Background(), "db", "cpu", "host = 'h0'", scanOpts{}); err == nil {
+		t.Fatal("scanned a family whose members could not be counted")
+	}
+}
