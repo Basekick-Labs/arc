@@ -109,3 +109,54 @@ func TestTimeRangeNeverNarrowerThanTheQuery(t *testing.T) {
 		t.Errorf("end-only range %+v, want an assumed start at the partition floor", tr)
 	}
 }
+
+// Each guard of the scanner, on a query that reads a too-narrow range without
+// it (the structural shapes above are covered by more than one guard).
+func TestTimeRangeGuards(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+	for name, q := range map[string]string{
+		// AND binds tighter than OR: (time >= X AND host='a') OR host='b'.
+		"top-level OR after AND": "SELECT * FROM db.cpu WHERE time >= '2026-10-20 10:00:00' AND host = 'a' OR host = 'b'",
+		// A comment's text is not masked, so only an unquoted interval in it
+		// could read as a bound.
+		"commented unquoted interval":       "SELECT * FROM db.cpu WHERE host = 'a'\n-- AND time > now() - INTERVAL 5 MINUTE\n",
+		"block-commented unquoted interval": "SELECT * FROM db.cpu WHERE host = 'a' /* AND time > now() - INTERVAL 5 MINUTE */",
+		// QUALIFY filters window results, not the rows read.
+		"QUALIFY with AND": "SELECT * FROM db.cpu WHERE host = 'a' QUALIFY host = 'b' AND time >= '2026-10-20 10:00:00'",
+		"HAVING with AND":  "SELECT host FROM db.cpu WHERE host <> 'z' GROUP BY host HAVING count(*) > 1 AND max(time) >= '2026-10-20 10:00:00'",
+	} {
+		if tr := p.ExtractTimeRange(q); tr != nil {
+			t.Errorf("%s: range %v..%v, want none", name, tr.Start, tr.End)
+		}
+	}
+}
+
+// exact is false when a term mentions the time column without being a bare
+// bound: the bounds found are then not the query's whole time predicate.
+func TestTimeRangeExactness(t *testing.T) {
+	for q, want := range map[string]bool{
+		"SELECT * FROM db.cpu WHERE time >= '2026-10-20 10:00:00' AND time < '2026-10-20 11:00:00' AND host = 'a'":                         true,
+		"SELECT * FROM db.cpu WHERE time >= '2026-10-20 10:00:00' AND date_trunc('hour', time) = '2026-10-20 10:00:00'":                    false,
+		"SELECT * FROM db.cpu WHERE time >= '2026-10-20 10:00:00' AND time < '2026-10-20 11:00:00' AND NOT (time = '2026-10-20 10:30:00')": false,
+	} {
+		b, ok := scanTimeBounds(q)
+		if !ok || b.exact != want {
+			t.Errorf("exact=%v ok=%v for %q, want exact=%v", b.exact, ok, q, want)
+		}
+	}
+}
+
+// The exact-shape check behind the empty-range proof and the open-ended
+// shortcut reads through the scanner: a commented-out or QUALIFY bound is not
+// part of the query's range.
+func TestExactShapeIgnoresCommentsAndQualify(t *testing.T) {
+	for _, q := range []string{
+		"SELECT * FROM cpu WHERE time >= '2026-02-01' /* AND time < '2026-02-02' */",
+		"SELECT * FROM cpu WHERE time >= '2026-02-01'\n-- AND time < '2026-02-02'\n",
+		"SELECT * FROM cpu WHERE time >= '2026-02-01' QUALIFY time < '2026-02-02'",
+	} {
+		if IsExactTimeRange(q) {
+			t.Errorf("IsExactTimeRange true for %q: its end is not part of the WHERE", q)
+		}
+	}
+}
