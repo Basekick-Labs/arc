@@ -81,6 +81,7 @@ func TestTimeRangeNeverNarrowerThanTheQuery(t *testing.T) {
 		"SELECT * FROM db.cpu WHERE host = 'a' QUALIFY time >= '2026-10-20 10:00:00'",
 		"SELECT * FROM db.cpu WHERE (time >= '2026-10-20 10:00:00' OR time < '2026-10-20 08:00:00')",
 		"SELECT * FROM db.cpu c JOIN db.mem m ON true WHERE c.time >= '2026-10-20 10:00:00'",
+		"SELECT * FROM db.cpu c, db.mem m WHERE c.time >= '2026-10-20 10:00:00'",
 		"SELECT time FROM db.cpu WHERE time >= '2026-10-20 10:00:00' UNION ALL SELECT time FROM db.mem",
 		"WITH m AS (SELECT * FROM db.mem) SELECT * FROM db.cpu, m WHERE cpu.time >= '2026-10-20 10:00:00'",
 		"SELECT * FROM db.mem WHERE time < (SELECT max(time) FROM db.cpu WHERE time >= '2026-10-20 11:00:00')",
@@ -135,6 +136,7 @@ func TestTimeRangeGuards(t *testing.T) {
 // bound: the bounds found are then not the query's whole time predicate.
 func TestTimeRangeExactness(t *testing.T) {
 	for q, want := range map[string]bool{
+		"SELECT * FROM db.cpu WHERE time >= '2026-10-20 10:00:00' AND time < '2026-10-20 11:00:00' AND downtime > 5":                       true,
 		"SELECT * FROM db.cpu WHERE time >= '2026-10-20 10:00:00' AND time < '2026-10-20 11:00:00' AND host = 'a'":                         true,
 		"SELECT * FROM db.cpu WHERE time >= '2026-10-20 10:00:00' AND date_trunc('hour', time) = '2026-10-20 10:00:00'":                    false,
 		"SELECT * FROM db.cpu WHERE time >= '2026-10-20 10:00:00' AND time < '2026-10-20 11:00:00' AND NOT (time = '2026-10-20 10:30:00')": false,
@@ -151,9 +153,9 @@ func TestTimeRangeExactness(t *testing.T) {
 // part of the query's range.
 func TestExactShapeIgnoresCommentsAndQualify(t *testing.T) {
 	for _, q := range []string{
-		"SELECT * FROM cpu WHERE time >= '2026-02-01' /* AND time < '2026-02-02' */",
-		"SELECT * FROM cpu WHERE time >= '2026-02-01'\n-- AND time < '2026-02-02'\n",
-		"SELECT * FROM cpu WHERE time >= '2026-02-01' QUALIFY time < '2026-02-02'",
+		"SELECT * FROM cpu WHERE time >= '2026-02-01' AND host = 'x' /* AND time < '2026-02-02' */",
+		"SELECT * FROM cpu WHERE time >= '2026-02-01' AND host = 'x' -- AND time < '2026-02-02'",
+		"SELECT * FROM cpu WHERE time >= '2026-02-01' AND host = 'x' QUALIFY time < '2026-02-02'",
 	} {
 		if IsExactTimeRange(q) {
 			t.Errorf("IsExactTimeRange true for %q: its end is not part of the WHERE", q)

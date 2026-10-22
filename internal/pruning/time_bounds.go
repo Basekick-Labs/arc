@@ -83,6 +83,10 @@ func scanTimeBounds(sqlStr string) (timeBounds, bool) {
 	if loc == nil {
 		return timeBounds{}, false
 	}
+	// A comma join (FROM a, b) is a second table without a JOIN keyword.
+	if f := fromWord.FindStringIndex(shape); f == nil || f[1] > loc[0] || hasTopLevelComma(shape[f[1]:loc[0]]) {
+		return timeBounds{}, false
+	}
 	terms, ok := topLevelConjuncts(masked[loc[1]:])
 	if !ok {
 		return timeBounds{}, false
@@ -313,6 +317,24 @@ done:
 	}
 	terms = append(terms, strings.TrimSpace(clause[start:end]))
 	return terms, true
+}
+
+// hasTopLevelComma reports a comma outside parentheses.
+func hasTopLevelComma(s string) bool {
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func isWordByte(c byte) bool {

@@ -110,7 +110,8 @@ func bareTimeBounds(sqlStr string) (hasStart, hasEnd, ok bool) {
 	// The scanner first: it strips comments and ends the WHERE at QUALIFY or
 	// HAVING, which the shape regexes below do not, so a commented-out or
 	// QUALIFY bound read as the query's range here.
-	if sb, sok := scanTimeBounds(sqlStr); !sok || !sb.exact {
+	sb, sok := scanTimeBounds(sqlStr)
+	if !sok || !sb.exact {
 		return false, false, false
 	}
 	masked, masks := sql.MaskStringLiterals(sqlStr, sql.HasQuotes(sqlStr))
@@ -164,7 +165,9 @@ func bareTimeBounds(sqlStr string) (hasStart, hasEnd, ok bool) {
 	if len(anyTimeComparison.FindAllStringIndex(where, -1)) != len(bounds) {
 		return false, false, false
 	}
-	return hasStart, hasEnd, true
+	// Which ends are stated is the scanner's answer: the shape regexes above
+	// also count a bound in a comment or a QUALIFY clause.
+	return hasStart && sb.start != nil, hasEnd && sb.end != nil, true
 }
 
 // extractorReadsBound reports whether the literal of one exactBoundPattern
