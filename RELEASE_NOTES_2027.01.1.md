@@ -1121,7 +1121,9 @@ the write still acknowledged. What admission should do instead is
 
 When rebuilding metadata from a large cold bucket, sync now writes bounded
 batches and invalidates each database/measurement cache once, rather than once
-per object. Per-object timestamps are preserved.
+per object. It reads only cold paths and sizes during reconciliation, then
+loads manifest rows after the object listing is released. Per-object timestamps
+are preserved.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1197](https://github.com/Basekick-Labs/arc/pull/1197).
 

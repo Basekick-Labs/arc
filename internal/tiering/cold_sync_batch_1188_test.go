@@ -79,12 +79,16 @@ func TestSyncColdTierMetadataBatchesCacheInvalidationAndKeepsObjectTimestamps(t 
 	before := m.metadata.tierCacheGen
 	m.metadata.tierCacheMu.RUnlock()
 
-	synced, rows, err := m.syncColdTierMetadata(ctx)
+	synced, err := m.syncColdTierMetadata(ctx)
 	if err != nil {
 		t.Fatalf("syncColdTierMetadata: %v", err)
 	}
 	if synced != len(objects) {
 		t.Fatalf("synced = %d, want %d", synced, len(objects))
+	}
+	rows, err := m.metadata.GetFilesInTier(ctx, TierCold)
+	if err != nil {
+		t.Fatalf("GetFilesInTier: %v", err)
 	}
 	if len(rows) != len(objects) {
 		t.Fatalf("cold rows = %d, want %d", len(rows), len(objects))
@@ -159,12 +163,19 @@ func TestSyncColdTierMetadataContinuesAfterABatchWriteErrorAndInvalidatesOncePer
 		t.Fatalf("create test trigger: %v", err)
 	}
 
-	synced, rows, err := m.syncColdTierMetadata(ctx)
+	synced, err := m.syncColdTierMetadata(ctx)
 	if err != nil {
 		t.Fatalf("syncColdTierMetadata: %v", err)
 	}
-	if synced != len(objects)-1 || len(rows) != len(objects)-1 {
-		t.Fatalf("syncColdTierMetadata = (%d synced, %d rows), want %d valid rows", synced, len(rows), len(objects)-1)
+	if synced != len(objects)-1 {
+		t.Fatalf("syncColdTierMetadata synced = %d, want %d valid rows", synced, len(objects)-1)
+	}
+	rows, err := m.metadata.GetFilesInTier(ctx, TierCold)
+	if err != nil {
+		t.Fatalf("GetFilesInTier: %v", err)
+	}
+	if len(rows) != len(objects)-1 {
+		t.Fatalf("cold rows = %d, want %d valid rows", len(rows), len(objects)-1)
 	}
 	for _, path := range []string{objects[0].Path, objects[coldTierMetadataBatchSize-1].Path, objects[coldTierMetadataBatchSize].Path, objects[coldTierMetadataBatchSize+1].Path} {
 		if got, err := m.metadata.GetFile(ctx, path); err != nil || got == nil || got.Tier != TierCold {
@@ -222,13 +233,12 @@ func TestSyncColdTierMetadataCancellationInvalidatesCommittedAndFallbackWrites(t
 
 	type syncResult struct {
 		synced int
-		rows   []FileMetadata
 		err    error
 	}
 	done := make(chan syncResult, 1)
 	go func() {
-		synced, rows, err := m.syncColdTierMetadata(ctx)
-		done <- syncResult{synced: synced, rows: rows, err: err}
+		synced, err := m.syncColdTierMetadata(ctx)
+		done <- syncResult{synced: synced, err: err}
 	}()
 
 	firstFallbackPath := objects[coldTierMetadataBatchSize].Path

@@ -927,23 +927,28 @@ func (m *Manager) LastScan() (*ScanResult, time.Time) {
 	return &snapshot, m.lastScanAt
 }
 
-// scanTiers is ScanTiers that also hands back the cold rows the sync worked
-// from (those it loaded plus those it recorded), so the primary's manifest
-// sweep in the same cycle does not load them a third time.
+// scanTiers is ScanTiers that also hands back cold rows for the primary's
+// manifest sweep. It loads those rows after the cold object listing completes
+// so both full slices are not retained at the same time.
 func (m *Manager) scanTiers(ctx context.Context) (*ScanResult, []FileMetadata, error) {
 	result := &ScanResult{}
 	var coldRows []FileMetadata
 	var coldSyncErr error
 	if m.coldTierUsable() {
-		synced, rows, err := m.syncColdTierMetadata(ctx)
+		synced, err := m.syncColdTierMetadata(ctx)
 		result.ColdSynced = synced
-		coldRows = rows
 		coldSyncErr = err
 		if err != nil {
 			// The hot scan still matters on its own: the primary migrates
 			// from hot rows and every node routes reads from them.
 			result.ColdSyncFailed = true
 			m.logger.Warn().Err(err).Msg("Cold tier metadata sync failed, continuing with hot scan")
+		} else {
+			coldRows, coldSyncErr = m.metadata.GetFilesInTier(ctx, TierCold)
+			if coldSyncErr != nil {
+				result.ColdSyncFailed = true
+				m.logger.Warn().Err(coldSyncErr).Msg("Failed to load cold tier rows, continuing with hot scan")
+			}
 		}
 	}
 	hot, err := m.ScanAndRegisterFiles(ctx)
@@ -1004,35 +1009,25 @@ func appendColdTierMetadataBatch(batch []FileMetadata, file FileMetadata) ([]Fil
 // Rows are only ever added or flipped to cold. A cold row whose object is
 // gone is reported, never reverted, for the same reason the hot scan never
 // downgrades (#683): the object may be mid-move, and a hot copy is still
-// read through the hot glob. Returns how many rows changed and the cold rows
-// it worked from — those loaded plus those recorded — for the manifest
-// sweep.
-func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata, error) {
+// read through the hot glob. Returns how many rows changed; the caller loads
+// cold rows for the manifest sweep after this object listing has been released.
+func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 	lister, ok := m.coldBackend.(storage.ObjectLister)
 	if !ok {
-		return 0, nil, fmt.Errorf("cold backend does not support ListObjects")
+		return 0, fmt.Errorf("cold backend does not support ListObjects")
 	}
 	objects, err := lister.ListObjects(ctx, "")
 	if err != nil {
-		return 0, nil, fmt.Errorf("failed to list cold objects: %w", err)
+		return 0, fmt.Errorf("failed to list cold objects: %w", err)
 	}
 
 	// One query for the cold row set, as the hot scan does. Skipping rows
 	// that are already cold is what keeps this pass from writing at all in
 	// steady state: every write invalidates the tier cache a query-serving
 	// node is using.
-	coldRows, err := m.metadata.GetFilesInTier(ctx, TierCold)
+	unseen, err := m.metadata.ColdFilePathsAndSizes(ctx, TierCold)
 	if err != nil {
-		return 0, nil, fmt.Errorf("failed to load cold tier paths: %w", err)
-	}
-	unseen := make(map[string]bool, len(coldRows))
-	for _, f := range coldRows {
-		// A quarantined row's key is one no backend will list (#758), so
-		// it would show up as "missing" on every node, every cycle.
-		if f.QuarantinedAt != nil {
-			continue
-		}
-		unseen[f.Path] = true
+		return 0, fmt.Errorf("failed to load cold tier paths: %w", err)
 	}
 
 	synced := 0
@@ -1075,7 +1070,6 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 				}
 				touched[tierCacheScope{database: file.Database, measurement: file.Measurement}] = struct{}{}
 				synced++
-				coldRows = append(coldRows, file)
 			}
 			return nil
 		}
@@ -1094,7 +1088,6 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 				continue
 			}
 			synced++
-			coldRows = append(coldRows, file)
 		}
 		return nil
 	}
@@ -1102,7 +1095,7 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 	unparseable := 0
 	for _, obj := range objects {
 		if err := ctx.Err(); err != nil {
-			return synced, coldRows, err
+			return synced, err
 		}
 		if !strings.HasSuffix(obj.Path, ".parquet") {
 			continue
@@ -1110,7 +1103,7 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 		if first, _, _ := strings.Cut(obj.Path, "/"); storage.IsReservedRootDir(first) {
 			continue
 		}
-		if unseen[obj.Path] {
+		if _, ok := unseen[obj.Path]; ok {
 			delete(unseen, obj.Path)
 			continue
 		}
@@ -1140,13 +1133,13 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 		batch, full = appendColdTierMetadataBatch(batch, *file)
 		if full {
 			if err := flushBatch(); err != nil {
-				return synced, coldRows, err
+				return synced, err
 			}
 			batch = batch[:0]
 		}
 	}
 	if err := flushBatch(); err != nil {
-		return synced, coldRows, err
+		return synced, err
 	}
 
 	if len(unseen) > 0 {
@@ -1170,7 +1163,7 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 		Int("unparseable", unparseable).
 		Int("quarantined_skipped", quarantined).
 		Msg("Cold tier metadata sync completed")
-	return synced, coldRows, nil
+	return synced, nil
 }
 
 // ScanAndRegisterFiles scans the hot tier storage and registers all existing parquet files
