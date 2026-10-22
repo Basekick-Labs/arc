@@ -1582,11 +1582,6 @@ window (see the limitations). What made it permanent:
   rows under a new name.
 
 **Limitations:**
-- Queries still read both copies until the old one is removed. On
-  standalone that is up to a minute, if the record was written; if writing
-  the record failed too (likely in the same storage outage), the copy stays
-  until a DELETE runs on that measurement. On a cluster with compaction
-  commit off, it stays until the reconciler removes it.
 - While both copies are in storage, compaction skips that file.
 - Pairs of copies left by earlier versions (both rewrites of the bug above)
   hold the same rows: neither can be told apart, so both are kept, read and
@@ -1594,13 +1589,71 @@ window (see the limitations). What made it permanent:
 - Standalone with tiering: if a recorded copy moves to the cold tier before
   it is removed, it stays there.
 - On a shared object store cluster, an old copy whose replacement was later
-  compacted, tiered or deleted away is no longer recognised as one: a later
-  DELETE that matches it, or the manifest repair, can register it again.
-  Removing the old copy durably at the time is the next fix in this series.
+  compacted, tiered or deleted away while the copy was still in the bucket:
+  - is never registered again or rewritten (the record keeps it out);
+  - is not removed either, since nothing proves it is old any more;
+  - is read until removed by hand.
 - On a shared object store cluster with tiering, an old copy whose
   replacement is only in the cold tier is left out of every DELETE and not
   removed: a DELETE leaves its matching rows in place (and logs a warning)
   until it is removed by hand or by the reconciler.
+
+### Queries no longer count a DELETE's surviving rows twice while it rewrites a file
+
+A row DELETE writes each affected file again without the deleted rows, then
+removes the old file. Between the two, every query read both: the surviving
+rows twice, and the deleted rows again. Normally this lasts milliseconds; if
+removing the old file failed, it lasted until something removed it. Reads
+now leave the old file out once its replacement is in storage.
+- **Standalone:** from the moment the replacement is written. After a
+  restart, reads start from the DELETE's record of the file.
+- **Clusters (both storage patterns):** every node does the same once the
+  cluster manifest has dropped the old file and a registered copy of the
+  same file is in storage at its registered size.
+- With `query.enable_s3_cache` on, DuckDB's object-store listing cache is
+  dropped the first time the replacement is seen.
+
+**The DELETE's record of a replaced file, on clusters too:**
+- The DELETE writes the record before it changes the cluster manifest. It
+  lives in the storage backend (`_delete_retired/`, in the shared bucket on
+  an object store).
+- Each node settles its own records every minute. On a shared object store
+  only the primary writer does, checked every time.
+- A record is only acted on when it is safe:
+  - The old file is removed once the manifest no longer lists it and a
+    listed copy of it is in storage at its registered size (standalone: once
+    its replacement is in storage).
+  - A rewrite whose manifest change never applied is removed, and the
+    original kept, 5 minutes after it was recorded.
+- The manifest repair never registers a file a record names, and the
+  reconciler does not treat one as an orphan.
+- A restore clears the record of every file it restores, and a backup leaves
+  a recorded file out only while its replacement is in the same backup.
+
+**Two ways a cluster DELETE could lose rows, fixed:**
+- When the manifest change returned an error whose outcome is unknown (a
+  forwarded change that timed out, leadership lost after it was proposed),
+  the DELETE removed its rewrite. If the change applied anyway, the manifest
+  listed a file that no longer existed and the old file was gone too. The
+  DELETE now keeps both files and its record (it still answers with an
+  error), and the record is settled once the manifest shows the outcome.
+- A file the node's own manifest did not list (with compaction commit off)
+  was removed with its rewrite left unregistered, even when the node's
+  manifest was only behind. The DELETE now catches up with the cluster
+  manifest first, and treats the file as unlisted only if it still is.
+
+**Limitations:**
+- The window between a replacement's upload and the manifest change that
+  registers it remains, on every node of a cluster: for that moment reads
+  see both files. Normally milliseconds.
+- A node whose manifest lags behind the cluster reads both copies until it
+  catches up.
+- On a cluster with local storage, a node still unlinks its copy of the old
+  file 500 ms after the manifest drops it, even if its copy of the
+  replacement has not arrived. Until it does, that node reads neither. Fixed
+  in a follow-up.
+- When compaction takes the replacement, the old file, if still in storage,
+  is read again until removed (its rows are not lost).
 
 ### A DELETE no longer drops rows its clause cannot decide
 
