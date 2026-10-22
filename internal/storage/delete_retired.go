@@ -8,9 +8,10 @@ import (
 	"strings"
 )
 
-// DeleteRetiredRoot holds the standalone DELETE's retired journal: one JSON
-// object per file a row DELETE replaced with its rewrite and has not removed
-// yet (internal/api delete_leftovers.go). A reserved root
+// DeleteRetiredRoot holds the DELETE journal: one JSON object per file a row
+// DELETE replaces with its rewrite and has not removed yet (internal/api
+// delete_leftovers.go): standalone, and on a cluster the rewrites whose
+// manifest change is not settled yet. A reserved root
 // (IsReservedRootDir), so no database walker reads it as data.
 const DeleteRetiredRoot = "_delete_retired"
 

@@ -66,6 +66,7 @@ func TestDrainHereOnASharedStoreIsThePrimary(t *testing.T) {
 // the rewrite, never the original.
 func TestDrainerRevertsARewriteThatNeverTook(t *testing.T) {
 	r := newJournalRig(t)
+	setAmbiguityDelay(t, 0)
 	r.record(rewriteAmbiguityDelay + time.Minute)
 	r.h.DrainRetired(context.Background())
 	if !r.exists(r.old) || r.exists(r.new) || len(r.retired()) != 0 {
@@ -94,20 +95,6 @@ func TestStandaloneRewriteFeedsTheReadSource(t *testing.T) {
 	}
 	if r2.h.reads.Open("db/cpu/") {
 		t.Fatal("entry kept after the old file was removed")
-	}
-}
-
-// A journaled file whose replacement is not here is the current file: the
-// DELETE scans it.
-func TestUnsafeRecordStillScanned(t *testing.T) {
-	r := newLeftoverRig(t)
-	old := leftoverHour + "cpu_20261007_204851_558252000.parquet"
-	r.parquet(old, "h0", "h1")
-	if err := r.h.journalRetired(context.Background(), old, old+".never"); err != nil {
-		t.Fatal(err)
-	}
-	if got := r.scan("host = 'h0'"); len(got) != 1 || got[0] != old {
-		t.Fatalf("scanned %v", got)
 	}
 }
 

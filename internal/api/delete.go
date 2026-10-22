@@ -184,8 +184,12 @@ type DeleteHandler struct {
 	rewriteMu sync.Mutex
 	// reads (standalone) leaves replaced files out of reads until they are
 	// gone (retired_reads.go); nil on a cluster.
-	reads  *RetiredReads
-	logger zerolog.Logger
+	reads *RetiredReads
+	// retiredSeen: when this node first saw each journal record (the
+	// ambiguity delay runs on this node's clock, delete_leftovers.go).
+	retiredSeenMu sync.Mutex
+	retiredSeen   map[string]time.Time
+	logger        zerolog.Logger
 	// flusher is the ingest buffer: a DELETE flushes the rows acknowledged
 	// before it first (nil on nodes that do not ingest).
 	flusher DeleteFlusher
@@ -1541,7 +1545,16 @@ func (h *DeleteHandler) replaceManifestAfterRewrite(reqCtx context.Context, oldP
 			return errors.Join(errManifestFailure, fmt.Errorf("register the rewrite of %s: %w", filepath.Base(oldPath), err))
 		}
 		// The intent, before the manifest changes (delete_leftovers.go).
-		h.journalIntent(ctx, oldPath, newPath)
+		if err := h.settlePriorIntent(ctx, oldPath, newPath); err != nil {
+			if cerr := h.storage.Delete(ctx, newPath); cerr != nil {
+				h.logger.Warn().Err(cerr).Str("file", newPath).Msg("Failed to clean up a rewrite that was not announced")
+			}
+			return err
+		}
+		if err := h.journalIntent(ctx, oldPath, newPath); err != nil {
+			cleanup()
+			return errors.Join(errManifestFailure, err)
+		}
 		if _, err = so.AdoptRewrite(ctx, newPath, size, sha); err != nil {
 			switch {
 			case h.rewriteCommitted(ctx, oldPath, newPath, sha):
@@ -1693,8 +1706,22 @@ func (h *DeleteHandler) replaceManifestAfterRewrite(reqCtx context.Context, oldP
 		return fmt.Errorf("%w: marshal replacement delete: %v", errManifestFailure, err)
 	}
 
-	// The intent, before the manifest changes (delete_leftovers.go).
-	h.journalIntent(ctx, oldPath, newPath)
+	// The intent, before the manifest changes (delete_leftovers.go): an
+	// earlier rewrite of the same file still settling is settled first, or
+	// this one waits.
+	cleanupNew := func() {
+		if cerr := h.storage.Delete(ctx, newPath); cerr != nil {
+			h.logger.Warn().Err(cerr).Str("file", newPath).Msg("Failed to clean up unregistered rewrite")
+		}
+	}
+	if err := h.settlePriorIntent(ctx, oldPath, newPath); err != nil {
+		cleanupNew()
+		return err
+	}
+	if err := h.journalIntent(ctx, oldPath, newPath); err != nil {
+		cleanupNew()
+		return errors.Join(errManifestFailure, err)
+	}
 	if err := h.coordinator.BatchFileOpsInManifest([]raft.BatchFileOp{
 		{Type: raft.CommandRegisterFile, Payload: registerPayload},
 		{Type: raft.CommandDeleteFile, Payload: deletePayload},

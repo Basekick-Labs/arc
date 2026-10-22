@@ -206,7 +206,7 @@ func (c *Coordinator) AdoptableObject(ctx context.Context, path string) bool {
 	// file it was rewritten from), or the DELETE journal names it: it is a
 	// leftover the DELETE could not remove (or a rewrite still being
 	// settled), and registering it would count its rows twice, for good.
-	if c.HasRewriteSibling(path) || c.retiredByDelete(ctx, path) {
+	if journaled, known := c.retiredByDelete(ctx, path); c.HasRewriteSibling(path) || journaled || !known {
 		return false
 	}
 	c.repair.mu.Lock()
@@ -230,7 +230,8 @@ func (c *Coordinator) HasRewriteSibling(path string) bool {
 // drainer's (it may still be the current copy while its rewrite settles);
 // neither is an orphan to remove.
 func (c *Coordinator) ReconcilerKeeps(ctx context.Context, path string) bool {
-	return c.AdoptableObject(ctx, path) || c.retiredByDelete(ctx, path)
+	journaled, known := c.retiredByDelete(ctx, path)
+	return journaled || !known || c.AdoptableObject(ctx, path)
 }
 
 // retiredJournalTTL bounds how stale the cached view of the DELETE journal
@@ -238,21 +239,33 @@ func (c *Coordinator) ReconcilerKeeps(ctx context.Context, path string) bool {
 const retiredJournalTTL = 30 * time.Second
 
 // retiredByDelete reports whether the DELETE journal (storage.ReadRetired)
-// names path, from a view refreshed at most every retiredJournalTTL. A
-// journal that cannot be read gives the last view.
-func (c *Coordinator) retiredByDelete(ctx context.Context, path string) bool {
+// names path, from a view refreshed at most every retiredJournalTTL (read
+// outside the lock). known is false until a read has succeeded: callers
+// then fail closed (nothing is adopted, nothing is an orphan).
+func (c *Coordinator) retiredByDelete(ctx context.Context, path string) (journaled, known bool) {
 	if c == nil || c.storage == nil {
-		return false
+		return false, true
+	}
+	c.retiredJournal.mu.Lock()
+	stale := time.Since(c.retiredJournal.at) >= retiredJournalTTL
+	if stale {
+		c.retiredJournal.at = time.Now() // one reader per refresh
+	}
+	c.retiredJournal.mu.Unlock()
+	if stale {
+		r, err := storage.ReadRetired(ctx, c.storage)
+		c.retiredJournal.mu.Lock()
+		if err == nil {
+			c.retiredJournal.paths, c.retiredJournal.known = r, true
+		} else {
+			c.retiredJournal.at = time.Time{}
+			c.logger.Warn().Err(err).Msg("Could not read the DELETE journal; unlisted objects are neither adopted nor treated as orphans until it can be read")
+		}
+		c.retiredJournal.mu.Unlock()
 	}
 	c.retiredJournal.mu.Lock()
 	defer c.retiredJournal.mu.Unlock()
-	if time.Since(c.retiredJournal.at) >= retiredJournalTTL {
-		if r, err := storage.ReadRetired(ctx, c.storage); err == nil {
-			c.retiredJournal.paths = r
-		}
-		c.retiredJournal.at = time.Now()
-	}
-	return c.retiredJournal.paths[path]
+	return c.retiredJournal.paths[path], c.retiredJournal.known
 }
 
 // RewriteSiblings returns the registered members of path's rewrite family

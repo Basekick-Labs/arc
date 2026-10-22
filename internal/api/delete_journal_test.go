@@ -210,16 +210,23 @@ func (r *journalRig) record(age time.Duration) retiredRecord {
 	return rec
 }
 
+func setAmbiguityDelay(t *testing.T, d time.Duration) {
+	t.Helper()
+	prev := rewriteAmbiguityDelay
+	rewriteAmbiguityDelay = d
+	t.Cleanup(func() { rewriteAmbiguityDelay = prev })
+}
+
 func TestRetiredActionOnACluster(t *testing.T) {
 	ctx := context.Background()
 	r := newJournalRig(t)
 	rec := r.record(time.Minute)
-	// L listed, R not, too recent: keep (a forwarded change may still apply).
-	if a := r.h.retiredAction(ctx, rec); a != retiredKeep {
+	// L listed, R not, first seen just now: keep (a forwarded change may
+	// still apply; the delay runs on this node's clock, not the record's).
+	if a := r.h.retiredAction(ctx, r.record(time.Hour)); a != retiredKeep {
 		t.Fatalf("recent and unsettled: %v", a)
 	}
-	// Old enough: the rewrite never took, revert.
-	rec = r.record(rewriteAmbiguityDelay + time.Minute)
+	setAmbiguityDelay(t, 0)
 	if a := r.h.retiredAction(ctx, rec); a != retiredRevert {
 		t.Fatalf("unsettled after the delay: %v", a)
 	}
@@ -240,6 +247,66 @@ func TestRetiredActionOnACluster(t *testing.T) {
 	if a := r.h.retiredAction(ctx, rec); a != retiredKeep {
 		t.Fatalf("sibling not at size: %v", a)
 	}
+	// The rewrite took and moved on (unregistered, gone): the unlisted old
+	// file stays recorded, never cleared into a lone unrecorded file.
+	delete(r.coord.files, r.new)
+	_ = os.Remove(filepath.Join(r.root, r.new))
+	if a := r.h.retiredAction(ctx, rec); a != retiredKeep {
+		t.Fatalf("rewrite gone, old unlisted: %v", a)
+	}
+	// ...and with the old file listed, the record is simply stale.
+	r.coord.files[r.old] = raft.FileEntry{Path: r.old}
+	if a := r.h.retiredAction(ctx, rec); a != retiredClear {
+		t.Fatalf("rewrite gone, old listed: %v", a)
+	}
+}
+
+// The review's blocker: a retry after an unknown outcome must not orphan the
+// first rewrite. While the first change may still apply, the retry waits;
+// after the delay the first rewrite is removed and the retry proceeds.
+func TestRetryAfterAnUnknownOutcomeSettlesTheFirstRewrite(t *testing.T) {
+	r := newJournalRig(t)
+	r.coord.batchErr = errors.New("forward to leader: context deadline exceeded")
+	if err := r.replace(); !errors.Is(err, errManifestFailure) {
+		t.Fatalf("first: %v", err)
+	}
+	first := r.new
+	r.coord.batchErr = nil
+	r.new = leftoverHour + "cpu_20261007_204851_558252000_rewrite_200.parquet"
+	r.parquet(r.new, "h1", "h2")
+	if err := r.replace(); !errors.Is(err, errNotRegisteredYet) {
+		t.Fatalf("retry while the first may apply: %v", err)
+	}
+	if !r.exists(first) || r.exists(r.new) {
+		t.Fatal("retry while settling: the first rewrite was removed or the second kept")
+	}
+	setAmbiguityDelay(t, 0)
+	r.parquet(r.new, "h1", "h2")
+	if err := r.replace(); err != nil {
+		t.Fatalf("retry after the delay: %v", err)
+	}
+	if r.exists(first) || r.exists(r.old) || !r.exists(r.new) || len(r.retired()) != 0 {
+		t.Fatalf("first %v old %v new %v journal %v", r.exists(first), r.exists(r.old), r.exists(r.new), r.retired())
+	}
+}
+
+// Without its record an unknown outcome could never be settled: a record
+// that cannot be written stops the rewrite before the manifest changes.
+func TestIntentRecordFailureStopsTheRewrite(t *testing.T) {
+	r := newJournalRig(t)
+	if err := os.MkdirAll(filepath.Join(r.root, deleteRetiredRoot), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(r.root, deleteRetiredRoot), 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(r.root, deleteRetiredRoot), 0o700) })
+	if err := r.replace(); !errors.Is(err, errManifestFailure) {
+		t.Fatalf("err %v", err)
+	}
+	if r.coord.batches != 0 || !r.exists(r.old) || r.exists(r.new) {
+		t.Fatalf("batches %d old %v new %v", r.coord.batches, r.exists(r.old), r.exists(r.new))
+	}
 }
 
 func TestDrainerOnASharedStoreNeedsThePrimary(t *testing.T) {
@@ -256,8 +323,8 @@ func TestDrainerOnASharedStoreNeedsThePrimary(t *testing.T) {
 	}
 }
 
-// Standalone: a record is only acted on once its replacement (or a later,
-// smaller member) is here; otherwise the file it names is the current one.
+// Standalone: a record is written once its rewrite is in storage, so the
+// file it names is the old copy, whatever happened to the rewrite since.
 func TestRetiredActionStandalone(t *testing.T) {
 	ctx := context.Background()
 	r := newLeftoverRig(t)
@@ -265,23 +332,12 @@ func TestRetiredActionStandalone(t *testing.T) {
 	rw := leftoverHour + "cpu_20261007_204851_558252000_rewrite_100.parquet"
 	r.parquet(old, "h0", "h1", "h2")
 	rec := retiredRecord{Path: old, ReplacedBy: rw, At: time.Now()}
-	if a := r.h.retiredAction(ctx, rec); a != retiredClear {
-		t.Fatalf("replacement never landed: %v", a)
-	}
-	later := leftoverHour + "cpu_20261007_204851_558252000_rewrite_200.parquet"
-	r.parquet(later, "h1")
 	if a := r.h.retiredAction(ctx, rec); a != retiredRemoveOld {
-		t.Fatalf("a later, smaller rewrite is here: %v", a)
+		t.Fatalf("old here, rewrite since gone: %v", a)
 	}
-	_ = os.Remove(filepath.Join(r.root, later))
-	bigger := leftoverHour + "cpu_20261007_204851_558252000_rewrite_50.parquet"
-	r.parquet(bigger, "h0", "h1", "h2", "h3")
+	_ = os.Remove(filepath.Join(r.root, old))
 	if a := r.h.retiredAction(ctx, rec); a != retiredClear {
-		t.Fatalf("only a member with more rows: %v", a)
-	}
-	r.parquet(rw, "h1", "h2")
-	if a := r.h.retiredAction(ctx, rec); a != retiredRemoveOld {
-		t.Fatalf("replacement here: %v", a)
+		t.Fatalf("old gone: %v", a)
 	}
 }
 
@@ -291,6 +347,7 @@ func TestRetiredReadsSource(t *testing.T) {
 	old := leftoverHour + "cpu_20261007_204851_558252000.parquet"
 	rw := leftoverHour + "cpu_20261007_204851_558252000_rewrite_100.parquet"
 	r.parquet(old, "h0", "h1")
+	r.parquet(rw, "h1")
 	src := NewRetiredReads(r.backend)
 	hooks := 0
 	src.SetOnSeen(func() { hooks++ })
@@ -299,10 +356,6 @@ func TestRetiredReadsSource(t *testing.T) {
 	if src.Generation() == g0 || !src.Open("db/cpu/") || src.Open("db/mem/") {
 		t.Fatal("generation / Open")
 	}
-	if got := src.ExcludedFor(ctx, "db/cpu/"); len(got) != 0 {
-		t.Fatalf("replacement not here yet: excluded %v", got)
-	}
-	r.parquet(rw, "h1")
 	if got := src.ExcludedFor(ctx, "db/cpu/"); len(got) != 1 || got[0] != old || hooks != 1 {
 		t.Fatalf("excluded %v hooks %d", got, hooks)
 	}
@@ -310,13 +363,8 @@ func TestRetiredReadsSource(t *testing.T) {
 	if hooks != 1 {
 		t.Fatal("hook ran again")
 	}
-	// Seeded from the journal, only with the replacement here.
+	// Seeded from the journal.
 	if err := r.h.journalRetired(ctx, old, rw); err != nil {
-		t.Fatal(err)
-	}
-	other := leftoverHour + "cpu_20261007_210000_000000000.parquet"
-	r.parquet(other, "h1")
-	if err := r.h.journalRetired(ctx, other, other+".missing"); err != nil {
 		t.Fatal(err)
 	}
 	seeded := NewRetiredReads(r.backend)

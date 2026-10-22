@@ -69,3 +69,21 @@ func TestJournaledObjectIsNeitherAdoptedNorAnOrphan(t *testing.T) {
 		t.Fatal("the reconciler keeps an unrelated unlisted object")
 	}
 }
+
+// Until the DELETE journal has been read, nothing is adopted and nothing is
+// an orphan (it may name any unlisted object).
+func TestUnreadJournalFailsClosed(t *testing.T) {
+	r := objectRig(t)
+	ctx := context.Background()
+	r.register("listed.parquet")
+	r.writeOld(repairOutput, "the old rows")
+	r.c.retiredJournal.mu.Lock()
+	r.c.retiredJournal.at, r.c.retiredJournal.known = time.Now(), false
+	r.c.retiredJournal.mu.Unlock()
+	if r.c.AdoptableObject(ctx, repairOutput) {
+		t.Fatal("adopted with the journal unread")
+	}
+	if !r.c.ReconcilerKeeps(ctx, stHour+"stray.parquet") {
+		t.Fatal("an orphan with the journal unread")
+	}
+}

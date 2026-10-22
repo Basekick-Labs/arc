@@ -1623,8 +1623,15 @@ now leave the old file out once its replacement is in storage.
   - The old file is removed once the manifest no longer lists it and a
     listed copy of it is in storage at its registered size (standalone: once
     its replacement is in storage).
-  - A rewrite whose manifest change never applied is removed, and the
-    original kept, 5 minutes after it was recorded.
+  - A rewrite the manifest still does not list about 5 minutes after the
+    settling node first saw its record is removed (its change never
+    applied or was refused); the original is kept.
+  - If the rewrite took and has since moved on (compacted, rewritten
+    again) while the old file was still in storage, the record stays, so
+    the old file is never scanned or registered again.
+- A DELETE that cannot write its record first does not change the manifest
+  (it answers with an error). A DELETE retried while an earlier rewrite of
+  the same file is still settling answers 503 until it is settled.
 - The manifest repair never registers a file a record names, and the
   reconciler does not treat one as an orphan.
 - A restore clears the record of every file it restores, and a backup leaves
@@ -1648,6 +1655,12 @@ now leave the old file out once its replacement is in storage.
   see both files. Normally milliseconds.
 - A node whose manifest lags behind the cluster reads both copies until it
   catches up.
+- On a shared object store cluster, a node that restarts reads both copies
+  of a file whose old copy is still in the bucket, until the primary
+  writer's drainer removes it (about a minute).
+- Standalone: if writing the record failed too (likely in the same storage
+  outage that stopped the removal), reads after a restart see both copies
+  until a DELETE runs on that measurement.
 - On a cluster with local storage, a node still unlinks its copy of the old
   file 500 ms after the manifest drops it, even if its copy of the
   replacement has not arrived. Until it does, that node reads neither. Fixed

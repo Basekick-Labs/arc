@@ -16,10 +16,11 @@ import (
 // failed, until the drainer removes it. It is an OpenCompactions source
 // (CombineOpenCompactions).
 //
-// An entry is excluded once its replacement is in storage (the replacement
-// holds every row the DELETE kept), and dropped once the old file is gone.
-// At start it is seeded from the retired journal, so a restart does not
-// reopen the window.
+// An entry is added once the replacement is in storage (the replacement
+// holds every row the DELETE kept), so it is excluded at once, and dropped
+// once the old file is gone. At start it is seeded from the retired journal
+// (standalone records are written once the replacement is in storage), so a
+// restart does not reopen the window.
 type RetiredReads struct {
 	store   storage.Backend
 	mu      sync.Mutex
@@ -39,15 +40,16 @@ func NewRetiredReads(store storage.Backend) *RetiredReads {
 	return &RetiredReads{store: store, entries: map[string]*retiredRead{}}
 }
 
-// SetOnSeen sets what runs the first time an entry's replacement is seen
-// (drop DuckDB's object-store listing cache when it is on).
+// SetOnSeen sets what runs the first time an entry is left out of a read
+// (drop DuckDB's object-store listing cache when it is on: a listing cached
+// before the replacement landed would lack it).
 func (r *RetiredReads) SetOnSeen(fn func()) {
 	if r != nil && fn != nil {
 		r.onSeen.Store(&fn)
 	}
 }
 
-// Seed adds the journal's records whose replacement is in storage.
+// Seed adds the journal's records.
 func (r *RetiredReads) Seed(ctx context.Context) error {
 	keys, err := r.store.List(ctx, storage.DeleteRetiredRoot+"/")
 	if err != nil {
@@ -58,17 +60,11 @@ func (r *RetiredReads) Seed(ctx context.Context) error {
 		if err != nil {
 			continue
 		}
-		old, ok := storage.ParseRetired(k, data)
+		old, by, ok := storage.ParseRetiredRecord(k, data)
 		if !ok {
 			continue
 		}
-		var rec retiredRecord
-		if json := parseRetiredRecord(data, &rec); !json || rec.ReplacedBy == "" {
-			continue
-		}
-		if n, err := r.store.StatFile(ctx, rec.ReplacedBy); err == nil && n >= 0 {
-			r.add(old, rec.ReplacedBy)
-		}
+		r.add(old, by)
 	}
 	return nil
 }
@@ -92,8 +88,7 @@ func (r *RetiredReads) remove(old string) {
 	r.mu.Unlock()
 }
 
-// ExcludedFor returns the replaced files under prefix whose replacement is
-// in storage.
+// ExcludedFor returns the replaced files under prefix still in storage.
 func (r *RetiredReads) ExcludedFor(ctx context.Context, prefix string) []string {
 	type cand struct {
 		old string
@@ -117,12 +112,8 @@ func (r *RetiredReads) ExcludedFor(ctx context.Context, prefix string) []string 
 				continue
 			}
 		}
-		first := false
-		if !e.seen {
-			if n, err := r.store.StatFile(ctx, e.replacedBy); err == nil && n >= 0 {
-				e.seen, first = true, true
-			}
-		}
+		first := !e.seen
+		e.seen = true
 		r.mu.Lock()
 		if cur := r.entries[c.old]; cur != nil && cur.replacedBy == e.replacedBy {
 			*cur = e
@@ -133,9 +124,7 @@ func (r *RetiredReads) ExcludedFor(ctx context.Context, prefix string) []string 
 				(*fn)()
 			}
 		}
-		if e.seen {
-			out = append(out, c.old)
-		}
+		out = append(out, c.old)
 	}
 	return out
 }

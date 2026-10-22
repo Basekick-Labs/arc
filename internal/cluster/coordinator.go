@@ -94,6 +94,7 @@ type Coordinator struct {
 		mu    sync.Mutex
 		at    time.Time
 		paths map[string]bool
+		known bool
 	}
 	cfg           *config.ClusterConfig
 	licenseClient *license.Client
