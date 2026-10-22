@@ -110,7 +110,7 @@ func (r *RetiredReads) ExcludedFor(ctx context.Context, prefix string) []string 
 	var out []string
 	for _, c := range cands {
 		e := c.e
-		if time.Since(e.goneCheckedAt) >= goneCheckEvery {
+		if time.Since(e.goneCheckedAt) >= retiredGoneCheckEvery {
 			e.goneCheckedAt = time.Now()
 			if n, err := r.store.StatFile(ctx, c.old); err == nil && n < 0 {
 				r.remove(c.old)
@@ -155,6 +155,6 @@ func (r *RetiredReads) Open(prefix string) bool {
 // Generation moves whenever an entry is added.
 func (r *RetiredReads) Generation() uint64 { return r.gen.Load() }
 
-// goneCheckEvery bounds how often an entry's "old file already gone" stat
-// runs.
-const goneCheckEvery = 2 * time.Second
+// retiredGoneCheckEvery bounds how often an entry's "old file already gone"
+// stat runs (a variable so tests can shrink it).
+var retiredGoneCheckEvery = 2 * time.Second
