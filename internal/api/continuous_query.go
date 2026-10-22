@@ -51,6 +51,9 @@ type ContinuousQueryHandler struct {
 	// lastSkipLogNano samples logSkippedRun (#676).
 	lastSkipLogNano atomic.Int64
 	fieldSchema     *fieldschema.Registry // optional, #914
+	// openCompactions: compaction jobs whose output and inputs can both be in
+	// storage (optional; see wrapOpenCompactions).
+	openCompactions OpenCompactions
 	config          *config.ContinuousQueryConfig
 	sqliteDB        *sql.DB
 	// ownsDB records whether this handler opened sqliteDB itself. When CQ
@@ -195,6 +198,9 @@ type CQExecution struct {
 }
 
 // NewContinuousQueryHandler creates a new continuous query handler
+// SetOpenCompactions wires the compaction jobs a source read must account for.
+func (h *ContinuousQueryHandler) SetOpenCompactions(oc OpenCompactions) { h.openCompactions = oc }
+
 func NewContinuousQueryHandler(db *database.DuckDB, storage storage.Backend, arrowBuffer *ingest.ArrowBuffer, cfg *config.ContinuousQueryConfig, authManager *auth.AuthManager, logger zerolog.Logger) (*ContinuousQueryHandler, error) {
 	// continuous_query.db_path defaults to the auth database. When it resolves
 	// to the same file, borrow the auth manager's handle rather than opening a
@@ -1236,6 +1242,9 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 				readParquetExpr = sqlutil.ReadParquetList([]string{sqlutil.QuoteStringLiteral(anchor), sqlutil.QuoteStringLiteral(measurementPath)}, "union_by_name=true")
 			}
 		}
+		// A run during a compaction's output-then-delete window would write
+		// the doubled aggregate back for good: read each job's rows once.
+		readParquetExpr = wrapOpenCompactions(ctx, h.openCompactions, h.storage, readParquetExpr, cq.Database, cq.SourceMeasurement)
 		wrappedQuery = wrapSourceMeasurement(query, cq.Database, cq.SourceMeasurement, readParquetExpr)
 	}
 

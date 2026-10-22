@@ -1826,7 +1826,9 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 	// single-tier schedulers.
 	if m.ManifestManager != nil {
 		recovered, err := m.recoverOrphanedManifests(ctx, recoveryScope{Databases: recoveryDatabases, Measurement: filterMeasurement})
-		m.SyncOpenJobs(ctx)
+		// After recovery deleted what it could: a finished job whose
+		// manifest is gone is over.
+		m.OpenJobs.pruneFinished(ctx)
 		if recovered > 0 {
 			m.mu.Lock()
 			m.totalManifestsRecov += recovered
@@ -2868,8 +2870,9 @@ func (m *Manager) JobHistory(limit int, cycleID int64) (page JobHistoryPage) {
 // SyncOpenJobs makes OpenJobs agree with the crash-recovery manifests in
 // storage: a job whose manifest survived (a failed delete, a crash, an
 // earlier process) still has inputs beside its output; a finished one whose
-// manifest is gone is over. Called at startup before queries are served, and
-// after each cycle's recovery.
+// manifest is gone is over. Called at startup, before queries are served;
+// each cycle then drops finished jobs whose manifest recovery removed
+// (OpenJobs.pruneFinished).
 func (m *Manager) SyncOpenJobs(ctx context.Context) {
 	if m == nil || m.ManifestManager == nil {
 		return

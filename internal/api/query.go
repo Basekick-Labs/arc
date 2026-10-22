@@ -1439,19 +1439,36 @@ func (h *QueryHandler) openCompactionsGeneration() uint64 {
 // "filename": DuckDB refuses that option on a file that has such a column.
 const openCompactionFileColumn = "__arc_file"
 
-// excludeOpenCompactions makes a read count a compaction's rows once. A
-// legacy compaction puts its output in the partition before deleting its
-// inputs, so a read between the two sees both; a continuous query in that
-// window writes the doubled aggregate back. For each such job on this
-// measurement, compaction.OpenJobs names the side to leave out: the output
-// while it is absent (it may appear before DuckDB lists the directory), the
-// inputs once it is there. The excluded files are still opened: DuckDB does
-// not skip a file by its name column. The result is volatile.
+// excludeOpenCompactions is wrapOpenCompactions with this handler's
+// registry and storage.
 func (h *QueryHandler) excludeOpenCompactions(ctx context.Context, expr, database, measurement string) string {
-	if h.openCompactions == nil || database == "" || measurement == "" {
+	return wrapOpenCompactions(ctx, h.openCompactions, h.storage, expr, database, measurement)
+}
+
+// openCompactionExclusions is the storage keys a read of database.measurement
+// must leave out (wrapOpenCompactions), for readers that list files
+// themselves (the arcx router).
+func (h *QueryHandler) openCompactionExclusions(ctx context.Context, prefix string) []string {
+	if h.openCompactions == nil {
+		return nil
+	}
+	return h.openCompactions.ExcludedFor(ctx, prefix)
+}
+
+// wrapOpenCompactions makes a read count a compaction's rows once. A legacy
+// compaction puts its output in the partition before deleting its inputs, so
+// a read between the two sees both; a continuous query in that window writes
+// the doubled aggregate back. For each such job on this measurement,
+// compaction.OpenJobs names the side to leave out: the output while it is
+// absent (it may appear before DuckDB lists the directory), the inputs once
+// it is there. expr contains one read_parquet(...) call and ends with it.
+// The excluded files are still opened: DuckDB does not skip a file by its
+// name column. The result is volatile.
+func wrapOpenCompactions(ctx context.Context, oc OpenCompactions, backend storage.Backend, expr, database, measurement string) string {
+	if oc == nil || backend == nil || database == "" || measurement == "" {
 		return expr
 	}
-	keys := h.openCompactions.ExcludedFor(ctx, database+"/"+measurement+"/")
+	keys := oc.ExcludedFor(ctx, database+"/"+measurement+"/")
 	if len(keys) == 0 {
 		return expr
 	}
@@ -1461,7 +1478,7 @@ func (h *QueryHandler) excludeOpenCompactions(ctx context.Context, expr, databas
 	}
 	quoted := make([]string, 0, len(keys))
 	for _, k := range keys {
-		uri, err := storage.ObjectURI(h.storage, k)
+		uri, err := storage.ObjectURI(backend, k)
 		if err != nil {
 			continue
 		}

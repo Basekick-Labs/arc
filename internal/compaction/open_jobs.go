@@ -114,6 +114,39 @@ func (a *OpenJobs) sync(manifests map[string]*Manifest) {
 	}
 }
 
+// pruneFinished drops finished jobs whose manifest no longer exists: their
+// inputs were deleted (by recovery, after a failed delete). One existence
+// check per finished job, so a cycle lists nothing.
+func (a *OpenJobs) pruneFinished(ctx context.Context) {
+	a.mu.Lock()
+	var check []*openJob
+	for _, j := range a.jobs {
+		if !j.running {
+			check = append(check, j)
+		}
+	}
+	a.mu.Unlock()
+	changed := false
+	for _, j := range check {
+		if j.manifestPath == "" {
+			continue
+		}
+		exists, err := a.backend.Exists(ctx, j.manifestPath)
+		if err != nil || exists {
+			continue
+		}
+		a.mu.Lock()
+		if cur, ok := a.jobs[j.output]; ok && cur == j && !cur.running {
+			delete(a.jobs, j.output)
+			changed = true
+		}
+		a.mu.Unlock()
+	}
+	if changed {
+		a.gen.Add(1)
+	}
+}
+
 // ExcludedFor returns the storage keys under prefix ("db/measurement/") that
 // a read must leave out, so it sees each active job's rows once. Empty in the
 // common case of no job on that measurement.
