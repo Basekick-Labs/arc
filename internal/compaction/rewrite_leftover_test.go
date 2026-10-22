@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 	"testing"
+
+	"github.com/basekick-labs/arc/internal/storage"
 )
 
 // A file a DELETE rewrote whose old copy is still in storage is not
@@ -17,7 +19,7 @@ func TestCompactionCycleLeavesRewriteLeftoversOut(t *testing.T) {
 		find: func(context.Context, string, string) ([]Candidate, error) {
 			return []Candidate{
 				{Database: "db", Measurement: "cpu", PartitionPath: "big", Tier: "hourly",
-					Files: []string{"h/a.parquet", "h/b.parquet", "h/x.parquet", "h/x_rewrite_5.parquet"}, FileCount: 4},
+					Files: []string{"h/a.parquet", "h/b.parquet", "h/x.parquet", "h/x_rewrite_5.parquet", "db/cpu/h/lone.parquet"}, FileCount: 5},
 				{Database: "db", Measurement: "cpu", PartitionPath: "small", Tier: "hourly",
 					Files: []string{"g/c.parquet", "g/y.parquet", "g/y_rewrite_7.parquet"}, FileCount: 3},
 			}, nil
@@ -30,6 +32,11 @@ func TestCompactionCycleLeavesRewriteLeftoversOut(t *testing.T) {
 		batches = append(batches, c)
 		mu.Unlock()
 		return nil
+	}
+	// A file the standalone DELETE journal names stays out even alone.
+	lone := "db/cpu/h/lone.parquet"
+	if err := manager.StorageBackend.Write(context.Background(), storage.RetiredKey(lone), []byte(`{"v":1,"path":"`+lone+`"}`)); err != nil {
+		t.Fatal(err)
 	}
 	run := func() {
 		batches = nil

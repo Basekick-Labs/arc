@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -2512,10 +2511,8 @@ func (m *Manager) copyStateFiles(ctx context.Context, leg *backupLeg) (int64, er
 
 // isCompactionState reports whether a key is compaction's crash-recovery
 // state: a manifest or a parked manifest under _compaction_state/.
-// deleteRetiredDir is the standalone DELETE's retired journal
-// (internal/api delete_leftovers.go): one JSON object per file a DELETE
-// replaced and has not removed yet.
-const deleteRetiredDir = "_delete_retired"
+// deleteRetiredDir is the standalone DELETE's retired journal.
+const deleteRetiredDir = storage.DeleteRetiredRoot
 
 // retiredByDelete returns the files the retired journal names. An unscoped
 // backup's listing already holds the journal; a scoped one lists it. A
@@ -2546,16 +2543,8 @@ func (m *Manager) retiredByDelete(ctx context.Context, lister storage.ObjectList
 		if err != nil {
 			continue
 		}
-		var rec struct {
-			Path string `json:"path"`
-		}
-		// Only a record stored under its own path's key (as the DELETE
-		// writes it) may leave a file out of the backup.
-		if json.Unmarshal(data, &rec) == nil && strings.HasSuffix(rec.Path, ".parquet") {
-			sum := sha256.Sum256([]byte(rec.Path))
-			if o.Path == deleteRetiredDir+"/"+hex.EncodeToString(sum[:16])+".json" {
-				out[rec.Path] = true
-			}
+		if p, ok := storage.ParseRetired(o.Path, data); ok {
+			out[p] = true
 		}
 	}
 	return out

@@ -1535,7 +1535,7 @@ window (see the limitations). What made it permanent:
     an orphan.
 - Compaction (outside staged compaction, which compacts only files the
   cluster manifest lists) skips every copy of a file while more than one is
-  in storage.
+  in storage, and any file the standalone record names.
 - A DELETE whose clause no longer matches anything when it rewrites a file
   (a clause on `now()`) leaves the file as it is instead of writing the same
   rows under a new name.
@@ -1553,7 +1553,23 @@ window (see the limitations). What made it permanent:
 - Standalone with tiering: if a recorded copy moves to the cold tier before
   it is removed, it stays there.
 - On a shared object store cluster, an old copy whose replacement was later
-  compacted or tiered away is no longer recognised as one.
+  compacted, tiered or deleted away is no longer recognised as one: a later
+  DELETE that matches it, or the manifest repair, can register it again.
+  Removing the old copy durably at the time is the next fix in this series.
+- On a shared object store cluster with tiering, an old copy whose
+  replacement is only in the cold tier is left out of every DELETE and not
+  removed: a DELETE leaves its matching rows in place (and logs a warning)
+  until it is removed by hand or by the reconciler.
+
+### A DELETE no longer drops rows its clause cannot decide
+
+A row DELETE rewrote each file keeping the rows where `NOT (clause)` held. A
+row where the clause is NULL (for example `host <> 'a'` on a row with no
+`host`) fails that test too, so it was dropped from the rewritten file
+without being counted or matched: rows nobody asked to delete were lost. The
+rewrite now keeps every row the clause does not match, the same rows the
+DELETE counts as matched, on standalone and clusters, and for DELETE records
+applied to pending files.
 
 ### A cached query no longer misses an hour its relative end has just reached
 

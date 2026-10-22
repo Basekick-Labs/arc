@@ -275,21 +275,6 @@ func TestRewriteMatchingNothingKeepsTheFile(t *testing.T) {
 	}
 }
 
-func TestRetiredPathValid(t *testing.T) {
-	for p, want := range map[string]bool{
-		"db/cpu/2026/x.parquet":               true,
-		"db/x.parquet":                        false,
-		"_delete_retired/x.parquet/y.parquet": false,
-		"db/cpu/../x.parquet":                 false,
-		"/db/cpu/x.parquet":                   false,
-		"db/cpu/x.json":                       false,
-		"db//x.parquet":                       false,
-	} {
-		if got := retiredPathValid(p); got != want {
-			t.Errorf("retiredPathValid(%q) = %v, want %v", p, got, want)
-		}
-	}
-}
 
 // Cluster: an unlisted member is left out (never rewritten, never adopted)
 // while another member of its family is listed in the manifest or held by

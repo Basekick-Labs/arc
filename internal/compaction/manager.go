@@ -347,6 +347,11 @@ type Manager struct {
 	// cluster manifest lists it; locallyStaged reports an input of a job this
 	// node staged and the cluster has not seen yet.
 	stagedMode    func() bool
+	// retired: the standalone DELETE journal's files (storage.ReadRetired),
+	// read at most every retiredTTL (filterRewriteLeftovers).
+	retiredMu sync.Mutex
+	retired   map[string]bool
+	retiredAt time.Time
 	inputLookup   InputLookup
 	locallyStaged func(path string) bool
 
@@ -694,14 +699,18 @@ func (m *Manager) filterRewriteLeftovers(candidate Candidate, tier Tier) (Candid
 		return candidate, true
 	}
 	families := storage.RewriteFamilies(candidate.Files)
-	if len(families) == 0 {
-		return candidate, true
-	}
+	retired := m.retiredFiles()
 	kept := make([]string, 0, len(candidate.Files))
 	for _, f := range candidate.Files {
-		if _, ok := families[storage.RewriteFamily(f)]; !ok {
+		// A file the DELETE journal names stays out even alone: its
+		// replacement may be gone (rewritten again, deleted whole) while the
+		// journal still waits to remove it.
+		if _, ok := families[storage.RewriteFamily(f)]; !ok && !retired[f] {
 			kept = append(kept, f)
 		}
+	}
+	if len(kept) == len(candidate.Files) {
+		return candidate, true
 	}
 	m.logger.Warn().
 		Str("partition", candidate.PartitionPath).
@@ -721,6 +730,33 @@ func (m *Manager) filterRewriteLeftovers(candidate Candidate, tier Tier) (Candid
 // file races its registration: the drain can register a source after
 // compaction dropped it from the manifest, leaving an entry for a file about
 // to be deleted.
+// retiredTTL bounds how stale filterRewriteLeftovers' view of the DELETE
+// journal may be.
+const retiredTTL = 30 * time.Second
+
+// retiredFiles returns the files the standalone DELETE journal names, read
+// at most every retiredTTL. A journal that cannot be read gives the last
+// view (none at first): the family rule still applies.
+func (m *Manager) retiredFiles() map[string]bool {
+	if m.StorageBackend == nil {
+		return nil
+	}
+	m.retiredMu.Lock()
+	defer m.retiredMu.Unlock()
+	if time.Since(m.retiredAt) < retiredTTL {
+		return m.retired
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if r, err := storage.ReadRetired(ctx, m.StorageBackend); err == nil {
+		m.retired = r
+	} else {
+		m.logger.Warn().Err(err).Msg("Could not read the DELETE journal; files it names may be compacted this cycle")
+	}
+	m.retiredAt = time.Now()
+	return m.retired
+}
+
 func (m *Manager) filterPending(candidate Candidate, tier Tier) (Candidate, bool) {
 	kept := m.dropPending(candidate.Files)
 	if len(kept) == len(candidate.Files) {

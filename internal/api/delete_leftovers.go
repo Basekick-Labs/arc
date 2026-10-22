@@ -2,8 +2,6 @@ package api
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
@@ -40,10 +38,9 @@ import (
 //     on, the DELETE removes one only when it is provably the older copy
 //     (removeLeftovers); otherwise it is only left out.
 
-// deleteRetiredRoot holds the standalone retired journal: one object per
-// source a DELETE replaced and could not remove yet. A reserved root
-// (storage.IsReservedRootDir), so no database walker reads it.
-const deleteRetiredRoot = "_delete_retired"
+// deleteRetiredRoot holds the standalone retired journal
+// (storage.DeleteRetiredRoot).
+const deleteRetiredRoot = storage.DeleteRetiredRoot
 
 // retiredRecordVersion is written on every record.
 const retiredRecordVersion = 1
@@ -64,10 +61,7 @@ type retiredRecord struct {
 	At         time.Time `json:"at"`
 }
 
-func retiredKey(path string) string {
-	sum := sha256.Sum256([]byte(path))
-	return deleteRetiredRoot + "/" + hex.EncodeToString(sum[:16]) + ".json"
-}
+func retiredKey(path string) string { return storage.RetiredKey(path) }
 
 // journalRetired records that old is replaced by new and still to be
 // removed. Written after new is in storage, before old's removal.
@@ -108,30 +102,13 @@ func (h *DeleteHandler) retiredRecords(ctx context.Context) ([]retiredRecord, er
 			return nil, err
 		}
 		var r retiredRecord
-		if err := json.Unmarshal(data, &r); err != nil || !retiredPathValid(r.Path) || retiredKey(r.Path) != k {
+		if _, ok := storage.ParseRetired(k, data); !ok || json.Unmarshal(data, &r) != nil {
 			h.logger.Warn().Str("record", k).Msg("Ignoring a retired-file record that does not name a data file")
 			continue
 		}
 		out = append(out, r)
 	}
 	return out, nil
-}
-
-// retiredPathValid: a parquet file under a database, no traversal.
-func retiredPathValid(p string) bool {
-	if !strings.HasSuffix(p, ".parquet") || strings.HasPrefix(p, "/") || strings.Contains(p, "\\") {
-		return false
-	}
-	parts := strings.Split(p, "/")
-	if len(parts) < 3 || storage.IsReservedRootDir(parts[0]) {
-		return false
-	}
-	for _, s := range parts {
-		if s == "" || s == "." || s == ".." {
-			return false
-		}
-	}
-	return true
 }
 
 // rewriteSiblings is the coordinator's view of a file's rewrite family in
