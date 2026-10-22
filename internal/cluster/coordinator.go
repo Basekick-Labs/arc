@@ -218,7 +218,8 @@ type Coordinator struct {
 	// nudges a parked worker; deleteStop, closed by Stop, is the only way a
 	// worker exits, so a stop drains everything that is pending (a DELETE
 	// rewrite's old file waiting for its rewrite is not pending: it stays on
-	// disk and the next start re-derives it, rewrite_unlink.go).
+	// disk and the next start re-derives it from the stale-local journal,
+	// without which nothing waits, rewrite_unlink.go).
 	// deleteInFlight counts the entries a worker has taken and not yet
 	// unlinked, so the gauge and the stop-bound Error report what is still
 	// on disk, not just what is still untaken.
@@ -228,10 +229,14 @@ type Coordinator struct {
 	// deferred: unlinks of a DELETE rewrite's old file waiting for the
 	// rewrite to arrive (rewrite_unlink.go), under deletePendingMu.
 	deferred deferredUnlinks
-	// deleteStopping: the workers are draining; nothing is deferred.
+	// deleteStopping: the workers are draining; nothing is deferred (a
+	// rewrite's old file whose rewrite is not here is kept on disk instead).
 	deleteStopping atomic.Bool
-	deleteWake     chan struct{}
-	deleteStop     chan struct{}
+	// deferredLoggedAt rate-limits the long-deferred summary, under
+	// deletePendingMu.
+	deferredLoggedAt time.Time
+	deleteWake       chan struct{}
+	deleteStop       chan struct{}
 	// deleteWg is per Start: Stop's wait is bounded, and a WaitGroup that a
 	// later Start reused while that wait was still parked would panic.
 	deleteWg *sync.WaitGroup
@@ -4509,6 +4514,9 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// (open_compactions.go).
 		c.noteLocalDeleted(path, reason)
 		c.enqueueLocalDelete(path, reason)
+		// A rewrite leaving the manifest (compacted, removed) lets the
+		// unlinks waiting for it go ahead (rewrite_unlink.go).
+		c.wakeDeferredFamilyAsync(path)
 	}
 
 	// The content-change callback goes in first: the FSM fires it right after

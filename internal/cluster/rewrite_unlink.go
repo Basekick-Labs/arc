@@ -2,8 +2,11 @@ package cluster
 
 import (
 	"context"
+	"strconv"
+	"strings"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 )
@@ -24,10 +27,13 @@ import (
 //
 // A deferred unlink is re-queued when the puller lands a file of the family
 // (recordPulledFileInTiering), by a sweep every deferredUnlinkSweepEvery, or
-// at once if it became ready while it was being deferred. It is never
-// dropped for age: unlinking early trades correct reads for disk. A stop
-// leaves deferred copies on disk; the next start re-derives them from the
-// stale-local journal (rederiveRewriteUnlinks).
+// at once if it became ready while it was being deferred, or when a member of
+// its family leaves the manifest. It is never dropped for age: unlinking
+// early trades correct reads for disk. Deferral needs the stale-local journal
+// (rewriteJournalRunning): a stop keeps the waiting copies, and copies whose
+// rewrite is not here yet, on disk, and the next start re-derives them from
+// the journal (rederiveRewriteUnlinks). While a copy waits, queries on its
+// measurement are not cached (open_compactions.go OpenAny).
 
 // deferredUnlinkSweepEvery spaces the deferred set's readiness sweep (a
 // variable so tests can shrink it).
@@ -100,7 +106,7 @@ func (c *Coordinator) rewriteArrived(ctx context.Context, path string) bool {
 // holds, while compaction commit is on (otherwise legacy compaction lists
 // storage and could take the lone copy), and never while stopping.
 func (c *Coordinator) deferRewriteUnlink(ctx context.Context, item deleteRequest) bool {
-	if item.reason != deleteRewriteReason || c.deleteStopping.Load() || !c.StagedCompactionMode() {
+	if item.reason != deleteRewriteReason || !c.StagedCompactionMode() || !c.rewriteJournalRunning() {
 		return false
 	}
 	if n, err := c.storage.StatFile(ctx, item.path); err != nil || n < 0 {
@@ -108,6 +114,10 @@ func (c *Coordinator) deferRewriteUnlink(ctx context.Context, item deleteRequest
 	}
 	if c.rewriteArrived(ctx, item.path) {
 		return false
+	}
+	if c.deleteStopping.Load() {
+		// Stopping: kept on disk, not parked; the next start re-derives it.
+		return true
 	}
 	c.deletePendingMu.Lock()
 	since := time.Now()
@@ -123,6 +133,26 @@ func (c *Coordinator) deferRewriteUnlink(ctx context.Context, item deleteRequest
 		c.requeueDeferred(item.path)
 	}
 	return true
+}
+
+// rewriteJournalRunning: the stale-local journal is open, so a copy kept
+// across a restart is found again (rederiveRewriteUnlinks). Without it a
+// kept copy would be left on disk with nothing tracking it.
+func (c *Coordinator) rewriteJournalRunning() bool {
+	seen := c.stale.seen.Load()
+	return seen != nil && seen.err() == nil
+}
+
+// wakeDeferredFamilyAsync: a member of path's family left the manifest; its
+// deferred unlinks may go ahead now. Off the caller's path (the FSM delete
+// callback), and only when the family has any.
+func (c *Coordinator) wakeDeferredFamilyAsync(path string) {
+	c.deletePendingMu.Lock()
+	_, any := c.deferred.byFamily[storage.RewriteFamily(path)]
+	c.deletePendingMu.Unlock()
+	if any {
+		go c.wakeDeferredFamily(path)
+	}
 }
 
 // requeueDeferred moves path from the deferred set back to the pending list
@@ -195,26 +225,71 @@ func (c *Coordinator) sweepDeferredUnlinks(stop <-chan struct{}) {
 				c.requeueDeferred(p)
 			}
 		}
+		c.logDeferredUnlinks()
+	}
+}
+
+// deferredUnlinkLogEvery spaces the summary of long-deferred unlinks.
+const deferredUnlinkLogEvery = 5 * time.Minute
+
+// logDeferredUnlinks warns, at most every deferredUnlinkLogEvery, when some
+// unlink has waited longer than that for its rewrite (a value of the gauge
+// that does not fall), naming the oldest.
+func (c *Coordinator) logDeferredUnlinks() {
+	c.deletePendingMu.Lock()
+	var oldest string
+	var since time.Time
+	for p, u := range c.deferred.items {
+		if oldest == "" || u.since.Before(since) {
+			oldest, since = p, u.since
+		}
+	}
+	count := len(c.deferred.items)
+	due := oldest != "" && time.Since(since) > deferredUnlinkLogEvery && time.Since(c.deferredLoggedAt) > deferredUnlinkLogEvery
+	if due {
+		c.deferredLoggedAt = time.Now()
+	}
+	c.deletePendingMu.Unlock()
+	if due {
+		c.logger.Warn().Int("deferred", count).Str("oldest", oldest).Time("since", since).
+			Msg("Removals of files DELETE rewrites replaced are still waiting for their rewrites to arrive on this node; these files are read meanwhile (the DELETE is not visible here yet)")
 	}
 }
 
 // rederiveRewriteUnlinks: after a restart the deferred set is empty, but the
-// copies it held are still on disk. Every copy this node saw registered,
-// that the manifest no longer lists and that has a registered rewrite
-// sibling, is a DELETE rewrite's old file whose unlink never ran: track it
-// for reads and queue its unlink (deferred again if the rewrite is still not
-// here).
-func (c *Coordinator) rederiveRewriteUnlinks(seen *seenLocal) {
-	if seen == nil || c.raftNode == nil {
-		return
+// copies it held are still on disk. A copy this node saw registered (and
+// whose registration this node has applied), that the manifest no longer
+// lists, and that is OLDER than every registered member of its rewrite family
+// is a DELETE rewrite's old file whose unlink never ran: track it for reads
+// and queue its unlink (deferred again if the rewrite is still not here).
+//
+// Only on a manifest caught up with the leader: a node booting behind its
+// journal lists the old file and not yet the rewrite, which would look the
+// same with the roles swapped; the "older than every member" rule refuses
+// that shape too. It reports whether it ran (the stale-local pass retries
+// until it does).
+func (c *Coordinator) rederiveRewriteUnlinks(ctx context.Context, seen *seenLocal) bool {
+	if seen == nil || seen.err() != nil || c.raftNode == nil {
+		return false
 	}
 	fsm := c.raftNode.FSM()
 	if fsm == nil {
-		return
+		return false
 	}
+	sctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	err := c.SyncManifest(sctx)
+	cancel()
+	if err != nil {
+		return false
+	}
+	applied := fsm.AppliedDone()
 	n := 0
-	for p := range seen.unlisted(fsm.HasFile) {
-		if !fsm.HasRewriteSibling(p) {
+	for p, r := range seen.unlisted(fsm.HasFile) {
+		if r.lsn > applied || c.CompactionOwns(p) {
+			continue
+		}
+		sibs := fsm.RewriteSiblings(p)
+		if len(sibs) == 0 || !olderThanAll(p, sibs) {
 			continue
 		}
 		if _, ok := localIdentity(c.stalePath(p)); !ok {
@@ -227,4 +302,31 @@ func (c *Coordinator) rederiveRewriteUnlinks(seen *seenLocal) {
 	if n > 0 {
 		c.logger.Info().Int("files", n).Msg("Queued the unlinks of files DELETE rewrites replaced that a previous run left on disk")
 	}
+	return true
+}
+
+// olderThanAll: path comes before every registered member of its family in
+// the rewrite chain (the original, or a rewrite with a smaller stamp).
+func olderThanAll(path string, sibs []raft.FileEntry) bool {
+	mine := rewriteStamp(path)
+	for _, e := range sibs {
+		if rewriteStamp(e.Path) <= mine {
+			return false
+		}
+	}
+	return true
+}
+
+// rewriteStamp is the `_rewrite_<n>` stamp of path, 0 for the original.
+func rewriteStamp(path string) uint64 {
+	family := storage.RewriteFamily(path)
+	if family == path {
+		return 0
+	}
+	stem := strings.TrimSuffix(family, ".parquet")
+	n, err := strconv.ParseUint(strings.TrimSuffix(strings.TrimPrefix(path, stem+"_rewrite_"), ".parquet"), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
 }

@@ -1777,15 +1777,19 @@ there in that window stored the shortfall.
 - A node now keeps its copy of the old file until a registered copy of the
   rewrite is on its disk at its registered size. The removal waits on the
   side: the delete workers are never blocked by it.
-- Reads keep counting the old file while it waits. Once the rewrite lands,
-  the old file is left out of reads and removed.
+- Reads on that node keep counting the old file while it waits: the
+  node answers as before the DELETE (the deleted rows included) until the
+  rewrite arrives, rather than missing the file's rows. Once the rewrite
+  lands, the old file is left out of reads and removed. Queries on that
+  measurement are not cached while a file waits.
 - The old file is removed at once if the manifest no longer lists any
   rewrite of it (its rows went elsewhere or were deleted), and kept if the
   manifest lists the file itself again.
 - There is no time limit. A copy waits as long as its rewrite has not
   arrived; removing it earlier would trade correct answers for disk space.
-- After a restart, the copies a previous run left waiting are found again
-  from the node's record of the files it has seen registered.
+- A node that stops keeps such copies on disk. After the restart, once
+  the node has caught up with the cluster manifest, they are found again
+  from its record of the files it has seen registered.
 - The stale-local sweep and the Iceberg export treat a waiting copy as the
   node's own data.
 - New gauge `arc_cluster_local_delete_deferred`: removals waiting for their
@@ -1798,8 +1802,9 @@ there in that window stored the shortfall.
   hold the compaction's output yet.
 - A node that catches up through a snapshot install removes the files the
   snapshot dropped without waiting.
-- With the stale-local sweep off (`cluster.stale_local_sweep = false`), a
-  copy left waiting by a previous run is not found again at start.
+- A node without that record does not keep copies waiting, and removes
+  the old file as before. That covers `cluster.replication_catchup_enabled
+  = false`, no Raft data directory, or a record that cannot be opened.
 
 ### A DELETE no longer drops rows its clause cannot decide
 

@@ -26,6 +26,15 @@ type rewriteUnlinkRig struct {
 func newRewriteUnlinkRig(t *testing.T) *rewriteUnlinkRig {
 	t.Helper()
 	r := stagedRig(t)
+	// The stale-local journal is what finds a kept copy again after a
+	// restart: deferral needs it.
+	r.c.cfg.RaftDataDir = t.TempDir()
+	seen, err := openSeenLocal(r.c.cfg.RaftDataDir, r.c.cfg.ClusterName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(seen.close)
+	r.c.stale.seen.Store(seen)
 	old := stHour + "cpu_1.parquet"
 	rw := stHour + "cpu_1_rewrite_5.parquet"
 	r.write(old, "all the rows")
@@ -95,11 +104,21 @@ func TestRewriteUnlinkDoesNotWaitWithoutCause(t *testing.T) {
 		}
 	})
 	t.Run("stopping", func(t *testing.T) {
+		// Not parked, and kept on disk: the next start re-derives it.
 		r := newRewriteUnlinkRig(t)
 		r.c.deleteStopping.Store(true)
 		r.unlink()
-		if r.exists(r.old) || r.c.unlinkDeferred(r.old) {
-			t.Fatal("deferred during the stop drain")
+		if !r.exists(r.old) || r.c.unlinkDeferred(r.old) {
+			t.Fatalf("stopping: exists %v deferred %v", r.exists(r.old), r.c.unlinkDeferred(r.old))
+		}
+	})
+	t.Run("no journal", func(t *testing.T) {
+		// Nothing could find a kept copy again after a restart.
+		r := newRewriteUnlinkRig(t)
+		r.c.stale.seen.Store(nil)
+		r.unlink()
+		if r.exists(r.old) {
+			t.Fatal("deferred without the stale-local journal")
 		}
 	})
 	t.Run("other reason", func(t *testing.T) {
@@ -164,7 +183,12 @@ func TestDeferredCopyIsStillTheNodesCopy(t *testing.T) {
 	rw := staleHour + "cpu_1_rewrite_5.parquet"
 	r.register(old, "all the rows")
 	r.pass()
-	r.register(rw, "the kept rows") // registered and, here, on disk
+	// Registered, not on this node yet: the state a deferral is in.
+	e := raft.FileEntry{Path: rw, SHA256: "x", SizeBytes: 13, Database: "testdb", Measurement: "cpu",
+		OriginNodeID: "writer-1", Tier: "hot", CreatedAt: time.Now()}
+	if err := r.c.raftNode.RegisterFile(e, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
 	r.unregisterAs(old, deleteRewriteReason)
 	r.c.noteLocalDeleted(old, deleteRewriteReason)
 	r.c.deletePendingMu.Lock()
@@ -201,7 +225,7 @@ func TestRewriteUnlinksRederivedAtStart(t *testing.T) {
 	}
 	r.unregisterAs(old, deleteRewriteReason)
 	r.unregisterAs(plain, "retention:1")
-	r.c.rederiveRewriteUnlinks(r.c.stale.seen.Load())
+	r.c.rederiveRewriteUnlinks(context.Background(), r.c.stale.seen.Load())
 	r.c.deletePendingMu.Lock()
 	var pend []string
 	for _, d := range r.c.deletePending {
@@ -298,4 +322,80 @@ func TestStaleLocalStartRederivesRewriteUnlinks(t *testing.T) {
 		}
 		return false
 	})
+}
+
+// A node booting behind its journal lists the old file and not yet its
+// rewrite: the rewrite must not be taken for a leftover (only a path older
+// than every listed member of its family is re-derived).
+func TestRederiveSkipsALaggingBootShape(t *testing.T) {
+	r := staleRig(t)
+	x := staleHour + "cpu_1.parquet"
+	rw := staleHour + "cpu_1_rewrite_5.parquet"
+	r.register(x, "all the rows")
+	r.register(rw, "kept")
+	r.pass()
+	r.unregisterAs(rw, "lag-sim") // the FSM's view while behind: R unlisted, X listed
+	if !r.c.rederiveRewriteUnlinks(context.Background(), r.c.stale.seen.Load()) {
+		t.Fatal("did not run")
+	}
+	r.c.deletePendingMu.Lock()
+	n := len(r.c.deletePending)
+	r.c.deletePendingMu.Unlock()
+	if n != 0 {
+		t.Fatalf("queued %d unlinks for a rewrite newer than the listed file", n)
+	}
+	if rewriteStamp(rw) != 5 || rewriteStamp(x) != 0 {
+		t.Fatal("rewriteStamp")
+	}
+}
+
+// A rewrite leaving the manifest wakes the unlinks waiting for it, through
+// the real delete callback.
+func TestRewriteLeavingTheManifestWakesItsFamily(t *testing.T) {
+	r := newRewriteUnlinkRig(t)
+	r.unlink()
+	if !r.c.unlinkDeferred(r.old) {
+		t.Fatal("precondition: deferred")
+	}
+	r.c.wakeDeferredFamilyAsync(r.rw) // with the rewrite still listed: stays
+	time.Sleep(50 * time.Millisecond)
+	if !r.c.unlinkDeferred(r.old) {
+		t.Fatal("woken while its rewrite is listed and not here")
+	}
+	if err := r.c.raftNode.DeleteFile(r.rw, "compaction:j1", 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	r.c.wakeDeferredFamilyAsync(r.rw)
+	waitFSM(t, func() bool { return !r.c.unlinkDeferred(r.old) })
+}
+
+// A rewrite that lands just before its wake: the read side finds it on its
+// own (rate-limited), so the old copy and the rewrite are not both read.
+func TestDeferredCopyLeftOutOnceTheRewriteLands(t *testing.T) {
+	r := staleRig(t)
+	ctx := context.Background()
+	old := staleHour + "cpu_1.parquet"
+	rw := staleHour + "cpu_1_rewrite_5.parquet"
+	r.register(old, "all the rows")
+	r.pass()
+	e := raft.FileEntry{Path: rw, SHA256: "x", SizeBytes: int64(len("the kept rows")), Database: "testdb", Measurement: "cpu",
+		OriginNodeID: "writer-1", Tier: "hot", CreatedAt: time.Now()}
+	if err := r.c.raftNode.RegisterFile(e, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	r.unregisterAs(old, deleteRewriteReason)
+	r.c.noteLocalDeleted(old, deleteRewriteReason)
+	r.c.deletePendingMu.Lock()
+	r.c.deferred.add(old, deferredUnlink{reason: deleteRewriteReason, since: time.Now()})
+	r.c.deletePendingMu.Unlock()
+	if got := r.c.OpenExcludedFor(ctx, openPrefix); len(got) != 0 {
+		t.Fatalf("rewrite not here: excluded %v", got)
+	}
+	r.write(rw, "the kept rows")
+	r.c.open.mu.Lock()
+	r.c.open.localDeleted[old].siblingCheckedAt = time.Time{} // the rate limit elapsed
+	r.c.open.mu.Unlock()
+	if got := r.c.OpenExcludedFor(ctx, openPrefix); len(got) != 1 || got[0] != old {
+		t.Fatalf("rewrite landed before its wake: excluded %v", got)
+	}
 }

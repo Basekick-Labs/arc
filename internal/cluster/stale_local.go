@@ -79,7 +79,9 @@ type staleLocalState struct {
 	// failed to: the startup walk waits for it, so it never runs without the
 	// evidence it judges local copies by (#1182).
 	opened chan struct{}
-	wg     sync.WaitGroup
+	// rederived: rederiveRewriteUnlinks has run since the journal opened.
+	rederived atomic.Bool
+	wg        sync.WaitGroup
 
 	// exportBreaker is LocalCopyDeleted's breaker state, recomputed at
 	// exportBreakerAt (UnixNano) at most every staleExportBreakerEvery.
@@ -300,8 +302,9 @@ func (c *Coordinator) staleLocalRun(ctx context.Context) {
 		return
 	}
 	s.seen.Store(seen)
-	// Unlinks of DELETE rewrites' old files a previous run deferred.
-	c.rederiveRewriteUnlinks(seen)
+	// Unlinks of DELETE rewrites' old files a previous run kept; the passes
+	// retry until it runs (it needs a manifest caught up with the leader).
+	s.rederived.Store(c.rederiveRewriteUnlinks(ctx, seen))
 	s.markOpened()
 	t := time.NewTicker(s.every)
 	defer t.Stop()
@@ -635,6 +638,9 @@ func (c *Coordinator) staleLocalPass(ctx context.Context) {
 		return
 	}
 	c.expireWritten(now)
+	if !s.rederived.Load() {
+		s.rederived.Store(c.rederiveRewriteUnlinks(ctx, seen))
+	}
 	if !c.cfg.StaleLocalSweep {
 		// Removals off: still drop the records of files gone from the disk,
 		// which the candidate scan below would have done.
