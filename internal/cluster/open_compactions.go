@@ -59,7 +59,23 @@ type localDelete struct {
 	output     string
 	outputSize int64
 	resolvedAt time.Time
+	// A DELETE rewrite's old file: the registered family member seen in
+	// storage at its registered size (only the stat is cached; the
+	// registration is checked on every read).
+	sibling     string
+	siblingSize int64
+	// goneCheckedAt rate-limits the "copy already gone" stat.
+	goneCheckedAt time.Time
 }
+
+// deleteRewriteReason is the manifest delete reason of the file a row
+// DELETE rewrote (internal/api); it must stay this exact string, which the
+// FSM also matches (raft.OutputGoneAccounted).
+const deleteRewriteReason = "delete-rewrite"
+
+// goneCheckEvery bounds how often a pending entry's "already gone" stat runs
+// (on an object store it is a request per read).
+const goneCheckEvery = 2 * time.Second
 
 const localResolveEvery = 5 * time.Second
 
@@ -79,11 +95,11 @@ func (c *Coordinator) SetOnObjectOutputSeen(fn func()) {
 }
 
 // excludableReason: a delete whose local copy reads may leave out before its
-// unlink (localDeleteExcludable says when). Other reasons (a DELETE rewrite's
-// old file, a snapshot drop, a repair) are not tracked: the copy is read until
-// the unlink, as before, and a mass drop costs reads nothing.
+// unlink (localDeleteExcludable says when). Other reasons (a snapshot drop, a
+// repair) are not tracked: the copy is read until the unlink, as before, and
+// a mass drop costs reads nothing.
 func excludableReason(reason string) bool {
-	return strings.HasPrefix(reason, "compaction:") || strings.HasPrefix(reason, "retention:") || reason == "delete"
+	return strings.HasPrefix(reason, "compaction:") || strings.HasPrefix(reason, "retention:") || reason == "delete" || reason == deleteRewriteReason
 }
 
 // noteLocalDeleted records a manifest delete this node must still unlink.
@@ -111,9 +127,14 @@ func (c *Coordinator) forgetLocalDeleted(path string) {
 
 // localDeleteExcludable reports whether a local copy deleted for d.reason may
 // be left out of reads now: a compaction input once the job's output is
-// registered and on this node's disk, a retention or whole-file DELETE
-// removal at once (its rows are gone).
-func (c *Coordinator) localDeleteExcludable(ctx context.Context, fsm *raft.ClusterFSM, d localDelete) (localDelete, bool) {
+// registered and on this node's disk; a DELETE rewrite's old file once a
+// registered member of its rewrite family (which holds every row the DELETE
+// kept) is in storage at its registered size; a retention or whole-file
+// DELETE removal at once (its rows are gone).
+func (c *Coordinator) localDeleteExcludable(ctx context.Context, fsm *raft.ClusterFSM, path string, d localDelete) (localDelete, bool) {
+	if d.reason == deleteRewriteReason {
+		return c.rewriteSiblingReadable(ctx, fsm, path, d)
+	}
 	job, ok := strings.CutPrefix(d.reason, "compaction:")
 	if !ok {
 		return d, true
@@ -278,11 +299,15 @@ func (c *Coordinator) localExcluded(ctx context.Context, fsm *raft.ClusterFSM, p
 		}
 		// A copy already gone (the stale sweep, an operator) needs nothing,
 		// and its entry would keep reads uncached.
-		if size, err := c.storage.StatFile(ctx, p); err == nil && size < 0 {
-			c.forgetLocalDeleted(p)
-			continue
+		d := dels[i]
+		if time.Since(d.goneCheckedAt) >= goneCheckEvery {
+			d.goneCheckedAt = time.Now()
+			if size, err := c.storage.StatFile(ctx, p); err == nil && size < 0 {
+				c.forgetLocalDeleted(p)
+				continue
+			}
 		}
-		d, ok := c.localDeleteExcludable(ctx, fsm, dels[i])
+		d, ok := c.localDeleteExcludable(ctx, fsm, p, d)
 		if d != dels[i] {
 			c.open.mu.Lock()
 			if cur := c.open.localDeleted[p]; cur != nil && cur.reason == d.reason {
@@ -295,4 +320,32 @@ func (c *Coordinator) localExcluded(ctx context.Context, fsm *raft.ClusterFSM, p
 		}
 	}
 	return out
+}
+
+// rewriteSiblingReadable: a registered member of path's rewrite family is in
+// storage at its registered size. The stat of the member seen is cached;
+// whether it is still registered is not (a member that left the manifest is
+// looked for again). The first sighting drops DuckDB's object-store listing
+// cache: a listing cached before the member landed would have path without
+// it.
+func (c *Coordinator) rewriteSiblingReadable(ctx context.Context, fsm *raft.ClusterFSM, path string, d localDelete) (localDelete, bool) {
+	sibs := fsm.RewriteSiblings(path)
+	if d.sibling != "" {
+		for _, e := range sibs {
+			if e.Path == d.sibling && e.SizeBytes == d.siblingSize {
+				return d, true
+			}
+		}
+		d.sibling, d.siblingSize = "", 0
+	}
+	for _, e := range sibs {
+		if size, err := c.storage.StatFile(ctx, e.Path); err == nil && size == e.SizeBytes {
+			d.sibling, d.siblingSize = e.Path, e.SizeBytes
+			if fn := c.open.onOutputSeen.Load(); fn != nil {
+				(*fn)()
+			}
+			return d, true
+		}
+	}
+	return d, false
 }

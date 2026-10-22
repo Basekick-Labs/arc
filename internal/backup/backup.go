@@ -669,9 +669,15 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	// had to keep. Backing it up would bring both back on a restore, with
 	// nothing recording which is the old one.
 	if retired := m.retiredByDelete(ctx, objectLister, objects, sc.empty()); len(retired) > 0 {
+		// Only while its replacement is in this backup: a record is an
+		// intent, written before the replacement may exist.
+		present := make(map[string]bool, len(parquetFiles))
+		for _, obj := range parquetFiles {
+			present[obj.Path] = true
+		}
 		kept := parquetFiles[:0]
 		for _, obj := range parquetFiles {
-			if !retired[obj.Path] {
+			if by, ok := retired[obj.Path]; !ok || !present[by] {
 				kept = append(kept, obj)
 			}
 		}
@@ -2517,7 +2523,7 @@ const deleteRetiredDir = storage.DeleteRetiredRoot
 // retiredByDelete returns the files the retired journal names. An unscoped
 // backup's listing already holds the journal; a scoped one lists it. A
 // journal that cannot be read leaves them in the backup, as before.
-func (m *Manager) retiredByDelete(ctx context.Context, lister storage.ObjectLister, listed []storage.ObjectInfo, whole bool) map[string]bool {
+func (m *Manager) retiredByDelete(ctx context.Context, lister storage.ObjectLister, listed []storage.ObjectInfo, whole bool) map[string]string {
 	var objs []storage.ObjectInfo
 	if whole {
 		for _, o := range listed {
@@ -2534,7 +2540,7 @@ func (m *Manager) retiredByDelete(ctx context.Context, lister storage.ObjectList
 	if len(objs) == 0 {
 		return nil
 	}
-	out := make(map[string]bool, len(objs))
+	out := make(map[string]string, len(objs))
 	for _, o := range objs {
 		if !strings.HasSuffix(o.Path, ".json") {
 			continue
@@ -2543,8 +2549,8 @@ func (m *Manager) retiredByDelete(ctx context.Context, lister storage.ObjectList
 		if err != nil {
 			continue
 		}
-		if p, ok := storage.ParseRetired(o.Path, data); ok {
-			out[p] = true
+		if p, by, ok := storage.ParseRetiredRecord(o.Path, data); ok && by != "" {
+			out[p] = by
 		}
 	}
 	return out

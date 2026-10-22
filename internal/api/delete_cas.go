@@ -87,7 +87,7 @@ func (h *DeleteHandler) scanSet(ctx context.Context, database, measurement strin
 	}
 	// Leftovers of earlier DELETEs, judged on the manifest just synced
 	// (delete_leftovers.go): left out before sharedUnlisted could adopt one.
-	listed, left := h.clusterClassify(listed)
+	listed, left := h.clusterClassify(listed, h.journaledPaths(ctx))
 	h.logLeftovers(left)
 	if leftovers != nil {
 		*leftovers = len(left)

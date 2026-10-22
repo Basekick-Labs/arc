@@ -203,9 +203,10 @@ func (c *Coordinator) AdoptableObject(ctx context.Context, path string) bool {
 		return false
 	}
 	// A row DELETE rewrote it and the manifest lists the rewrite (or the
-	// file it was rewritten from): it is a leftover the DELETE could not
-	// remove, and registering it would count its rows twice, for good.
-	if c.HasRewriteSibling(path) {
+	// file it was rewritten from), or the DELETE journal names it: it is a
+	// leftover the DELETE could not remove (or a rewrite still being
+	// settled), and registering it would count its rows twice, for good.
+	if c.HasRewriteSibling(path) || c.retiredByDelete(ctx, path) {
 		return false
 	}
 	c.repair.mu.Lock()
@@ -222,6 +223,49 @@ func (c *Coordinator) HasRewriteSibling(path string) bool {
 	}
 	fsm := c.raftNode.FSM()
 	return fsm != nil && fsm.HasRewriteSibling(path)
+}
+
+// ReconcilerKeeps is the reconciler's filter for unlisted objects: adoptable
+// ones are the repair's, and a file the DELETE journal names is the
+// drainer's (it may still be the current copy while its rewrite settles);
+// neither is an orphan to remove.
+func (c *Coordinator) ReconcilerKeeps(ctx context.Context, path string) bool {
+	return c.AdoptableObject(ctx, path) || c.retiredByDelete(ctx, path)
+}
+
+// retiredJournalTTL bounds how stale the cached view of the DELETE journal
+// may be.
+const retiredJournalTTL = 30 * time.Second
+
+// retiredByDelete reports whether the DELETE journal (storage.ReadRetired)
+// names path, from a view refreshed at most every retiredJournalTTL. A
+// journal that cannot be read gives the last view.
+func (c *Coordinator) retiredByDelete(ctx context.Context, path string) bool {
+	if c == nil || c.storage == nil {
+		return false
+	}
+	c.retiredJournal.mu.Lock()
+	defer c.retiredJournal.mu.Unlock()
+	if time.Since(c.retiredJournal.at) >= retiredJournalTTL {
+		if r, err := storage.ReadRetired(ctx, c.storage); err == nil {
+			c.retiredJournal.paths = r
+		}
+		c.retiredJournal.at = time.Now()
+	}
+	return c.retiredJournal.paths[path]
+}
+
+// RewriteSiblings returns the registered members of path's rewrite family
+// other than path.
+func (c *Coordinator) RewriteSiblings(path string) []raft.FileEntry {
+	if c == nil || c.raftNode == nil {
+		return nil
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return nil
+	}
+	return fsm.RewriteSiblings(path)
 }
 
 // ErrNotAdoptable: the object is gone, changed while it was read, or not one
