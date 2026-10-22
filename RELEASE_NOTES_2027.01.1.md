@@ -1760,12 +1760,46 @@ now leave the old file out once its replacement is in storage.
 - Standalone: if writing the record failed too (likely in the same storage
   outage that stopped the removal), reads after a restart see both copies
   until a DELETE runs on that measurement.
-- On a cluster with local storage, a node still unlinks its copy of the old
-  file 500 ms after the manifest drops it, even if its copy of the
-  replacement has not arrived. Until it does, that node reads neither. Fixed
-  in a follow-up.
 - When compaction takes the replacement, the old file, if still in storage,
   is read again until removed (its rows are not lost).
+
+### A cluster node no longer loses a DELETE rewrite's rows while the rewrite is on its way
+
+On a cluster with local storage, every node removes its copy of a file a
+row DELETE rewrote 500 ms after the cluster manifest drops it. The node
+receives the rewrite only when its pull completes, which can take seconds,
+or until the next reconciliation walk (5 minutes) when the pull queue was
+full. Until then that node had neither copy, so its queries were missing
+every row the DELETE kept from that file. A continuous query that ran
+there in that window stored the shortfall.
+
+**The fix:**
+- A node now keeps its copy of the old file until a registered copy of the
+  rewrite is on its disk at its registered size. The removal waits on the
+  side: the delete workers are never blocked by it.
+- Reads keep counting the old file while it waits. Once the rewrite lands,
+  the old file is left out of reads and removed.
+- The old file is removed at once if the manifest no longer lists any
+  rewrite of it (its rows went elsewhere or were deleted), and kept if the
+  manifest lists the file itself again.
+- There is no time limit. A copy waits as long as its rewrite has not
+  arrived; removing it earlier would trade correct answers for disk space.
+- After a restart, the copies a previous run left waiting are found again
+  from the node's record of the files it has seen registered.
+- The stale-local sweep and the Iceberg export treat a waiting copy as the
+  node's own data.
+- New gauge `arc_cluster_local_delete_deferred`: removals waiting for their
+  rewrite. It rises while pulls are slow; a value that never falls means the
+  rewrites are not arriving.
+
+**Limitations:**
+- If the rewrite is compacted before it reaches the node, the old file is
+  removed when the rewrite leaves the manifest, even if the node does not
+  hold the compaction's output yet.
+- A node that catches up through a snapshot install removes the files the
+  snapshot dropped without waiting.
+- With the stale-local sweep off (`cluster.stale_local_sweep = false`), a
+  copy left waiting by a previous run is not found again at start.
 
 ### A DELETE no longer drops rows its clause cannot decide
 
