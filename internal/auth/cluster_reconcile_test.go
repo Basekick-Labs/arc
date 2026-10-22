@@ -220,7 +220,7 @@ func TestReconcileOnARebuiltHistoryDeletesNothing(t *testing.T) {
 	}
 }
 
-// The first transaction (revokes) commits even when the second cannot begin.
+// The first transaction (revokes) stays committed when the second fails.
 func TestReconcileRevokesSurviveAFailedSecondTransaction(t *testing.T) {
 	am := openAuthAt(t, filepath.Join(t.TempDir(), "auth.db"))
 	defer am.Close()
@@ -229,14 +229,17 @@ func TestReconcileRevokesSurviveAFailedSecondTransaction(t *testing.T) {
 	a.Enabled = false
 
 	ctx, cancel := context.WithCancel(context.Background())
-	reconcileBetweenTransactions = cancel
-	defer func() { reconcileBetweenTransactions = nil }()
+	reconcileBeforeSecondCommit = cancel
+	defer func() { reconcileBeforeSecondCommit = nil }()
 	_, err := ReconcileClusterState(ctx, am.db, ClusterAuthState{
 		Tokens:       []ClusterTokenEntry{a, clusterEntry(102, "c", "hc")},
 		AppliedIndex: 1000, Term: 1,
 	}, zerolog.Nop())
 	if err == nil {
 		t.Fatal("want the second transaction's error")
+	}
+	if _, ok := readToken(t, am, 102); ok {
+		t.Fatal("the second transaction committed: the seam did not fail it, so this test proves nothing")
 	}
 	if r, _ := readToken(t, am, 100); r.enabled {
 		t.Error("the revoke was rolled back with the failed second transaction")

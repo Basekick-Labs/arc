@@ -203,10 +203,6 @@ func ReconcileClusterState(ctx context.Context, db *sql.DB, st ClusterAuthState,
 		return nil, fmt.Errorf("reconcile: commit deletes and updates: %w", err)
 	}
 
-	if reconcileBetweenTransactions != nil {
-		reconcileBetweenTransactions()
-	}
-
 	// Transaction 2: renames through temporary names, then inserts.
 	tx2, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -218,6 +214,9 @@ func ReconcileClusterState(ctx context.Context, db *sql.DB, st ClusterAuthState,
 	if err := recordHistory(tx2, st.Term, st.AppliedIndex); err != nil {
 		r.log.Error().Err(err).Msg("Cluster auth reconcile: could not record the Raft history it ran at")
 	}
+	if reconcileBeforeSecondCommit != nil {
+		reconcileBeforeSecondCommit()
+	}
 	if err := tx2.Commit(); err != nil {
 		return r.report, fmt.Errorf("reconcile: commit inserts: %w", err)
 	}
@@ -225,9 +224,9 @@ func ReconcileClusterState(ctx context.Context, db *sql.DB, st ClusterAuthState,
 	return r.report, nil
 }
 
-// reconcileBetweenTransactions is a test seam: it runs after the first
-// transaction commits and before the second begins.
-var reconcileBetweenTransactions func()
+// reconcileBeforeSecondCommit is a test seam: it runs just before the second
+// transaction (renames, inserts) commits.
+var reconcileBeforeSecondCommit func()
 
 var allReconcileTables = []string{TableMemberships, TableMeasurementPermissions, TableRoles, TableTeams, TableOrganizations, TableTokens}
 
