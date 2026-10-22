@@ -259,6 +259,22 @@ type Metrics struct {
 	// no backend can address. Those entries are dropped from their work set, so
 	// this counter is the only place the condition is aggregated.
 	storageInvalidPathQuarantinedTotal atomic.Int64
+
+	// File-level time pruning (query.file_time_pruning, #659). A pass is a
+	// query whose range starts in the current hour on a local backend; the
+	// rest say what the pass did. nothingDropped and capFallback are the
+	// evidence for the margin and cap defaults.
+	fileTimePruningPasses         atomic.Int64
+	fileTimePruningExpanded       atomic.Int64
+	fileTimePruningFilesListed    atomic.Int64
+	fileTimePruningFilesDropped   atomic.Int64
+	fileTimePruningNothingDropped atomic.Int64
+	fileTimePruningCapFallback    atomic.Int64
+	fileTimePruningZeroSurvivors  atomic.Int64
+	fileTimePruningAnomalousKept  atomic.Int64
+	// ingestFutureStampedRows: rows stamped more than the file-time pruning
+	// margin past their flush, in its hour.
+	ingestFutureStampedRows atomic.Int64
 	// compactionCopyFallbackTotal counts compaction outputs an object store
 	// refused to copy server-side, copied through the node instead;
 	// compactionFinishedTotal, committed object-store compactions their
@@ -866,6 +882,39 @@ func (m *Metrics) IncClusterManifestRejectedPaths() { m.clusterManifestRejectedP
 // to counting it here is a loop that retries the same key forever.
 func (m *Metrics) IncStorageInvalidPathQuarantined() { m.storageInvalidPathQuarantinedTotal.Add(1) }
 
+// IncFileTimePruningPass records a file-time pruning pass over files listed.
+func (m *Metrics) IncFileTimePruningPass(files int) {
+	m.fileTimePruningPasses.Add(1)
+	m.fileTimePruningFilesListed.Add(int64(files))
+}
+
+// IncFileTimePruningExpanded records a pass that dropped files from the list.
+func (m *Metrics) IncFileTimePruningExpanded(dropped int) {
+	m.fileTimePruningExpanded.Add(1)
+	m.fileTimePruningFilesDropped.Add(int64(dropped))
+}
+
+// IncFileTimePruningNothingDropped records a pass with every file in range.
+func (m *Metrics) IncFileTimePruningNothingDropped() { m.fileTimePruningNothingDropped.Add(1) }
+
+// IncFileTimePruningCapFallback records a pass that kept too many files to list.
+func (m *Metrics) IncFileTimePruningCapFallback() { m.fileTimePruningCapFallback.Add(1) }
+
+// IncFileTimePruningZeroSurvivors records a pass that kept no file.
+func (m *Metrics) IncFileTimePruningZeroSurvivors() { m.fileTimePruningZeroSurvivors.Add(1) }
+
+// AddIngestFutureStampedRows records rows stamped more than the file-time
+// pruning margin past their flush, in its hour.
+func (m *Metrics) AddIngestFutureStampedRows(n int) { m.ingestFutureStampedRows.Add(int64(n)) }
+
+// AddFileTimePruningAnomalousKept records files kept because their name time
+// is before their directory's hour (future-stamped rows).
+func (m *Metrics) AddFileTimePruningAnomalousKept(n int) {
+	if n > 0 {
+		m.fileTimePruningAnomalousKept.Add(int64(n))
+	}
+}
+
 // IncCompactionCopyFallback, IncCompactionFinished, IncCompactionWedged: the
 // staged compaction commit on an object store (#1207 d2a2b).
 func (m *Metrics) IncCompactionCopyFallback() { m.compactionCopyFallbackTotal.Add(1) }
@@ -1163,18 +1212,27 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"query_mgmt_history_size":    m.queryMgmtHistorySize.Load(),
 
 		// Cluster FSM security (Enterprise)
-		"cluster_manifest_rejected_paths_total":  m.clusterManifestRejectedPathsTotal.Load(),
-		"storage_invalid_path_quarantined_total": m.storageInvalidPathQuarantinedTotal.Load(),
-		"compaction_copy_fallback_total":         m.compactionCopyFallbackTotal.Load(),
-		"compaction_finished_total":              m.compactionFinishedTotal.Load(),
-		"compaction_wedged_total":                m.compactionWedgedTotal.Load(),
-		"manifest_repair_dropped_total":          m.manifestRepairDroppedTotal.Load(),
-		"manifest_repair_adopted_total":          m.manifestRepairAdoptedTotal.Load(),
-		"manifest_repair_pending":                m.manifestRepairPending.Load(),
-		"stale_local_unlinked_total":             m.staleLocalUnlinkedTotal.Load(),
-		"stale_local_tracked":                    m.staleLocalTracked.Load(),
-		"stale_local_blocked":                    m.staleLocalBlocked.Load(),
-		"stale_local_tracking_failed":            m.staleLocalTrackingFail.Load(),
+		"cluster_manifest_rejected_paths_total":   m.clusterManifestRejectedPathsTotal.Load(),
+		"storage_invalid_path_quarantined_total":  m.storageInvalidPathQuarantinedTotal.Load(),
+		"file_time_pruning_passes_total":          m.fileTimePruningPasses.Load(),
+		"file_time_pruning_expanded_total":        m.fileTimePruningExpanded.Load(),
+		"file_time_pruning_files_listed_total":    m.fileTimePruningFilesListed.Load(),
+		"file_time_pruning_files_dropped_total":   m.fileTimePruningFilesDropped.Load(),
+		"file_time_pruning_nothing_dropped_total": m.fileTimePruningNothingDropped.Load(),
+		"file_time_pruning_cap_fallback_total":    m.fileTimePruningCapFallback.Load(),
+		"file_time_pruning_zero_survivors_total":  m.fileTimePruningZeroSurvivors.Load(),
+		"file_time_pruning_anomalous_kept_total":  m.fileTimePruningAnomalousKept.Load(),
+		"ingest_future_stamped_rows_total":        m.ingestFutureStampedRows.Load(),
+		"compaction_copy_fallback_total":          m.compactionCopyFallbackTotal.Load(),
+		"compaction_finished_total":               m.compactionFinishedTotal.Load(),
+		"compaction_wedged_total":                 m.compactionWedgedTotal.Load(),
+		"manifest_repair_dropped_total":           m.manifestRepairDroppedTotal.Load(),
+		"manifest_repair_adopted_total":           m.manifestRepairAdoptedTotal.Load(),
+		"manifest_repair_pending":                 m.manifestRepairPending.Load(),
+		"stale_local_unlinked_total":              m.staleLocalUnlinkedTotal.Load(),
+		"stale_local_tracked":                     m.staleLocalTracked.Load(),
+		"stale_local_blocked":                     m.staleLocalBlocked.Load(),
+		"stale_local_tracking_failed":             m.staleLocalTrackingFail.Load(),
 		// Cluster local delete workers (per-node storage with replication)
 		"cluster_local_delete_pending":                  m.clusterLocalDeletePending.Load(),
 		"compaction_manifests_parked_unparseable_total": m.compactionManifestsParkedUnparseableTotal.Load(),
@@ -1776,6 +1834,25 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_storage_invalid_path_quarantined_total Total entries dropped from a cleanup, reconciliation or replication work set because a storage key was permanently unusable. Non-zero growth means a stored key (compaction manifest, cluster manifest entry, edge-sync ledger row) names something no storage backend can address; the entry is no longer retried and needs operator action.\n"...)
 	b = append(b, "# TYPE arc_storage_invalid_path_quarantined_total counter\n"...)
 	b = appendMetric(b, "arc_storage_invalid_path_quarantined_total", float64(m.storageInvalidPathQuarantinedTotal.Load()))
+
+	for _, c := range []struct {
+		name, help string
+		v          int64
+	}{
+		{"arc_query_file_time_pruning_passes_total", "Table reads whose range starts in the current hour that file-level time pruning listed (query.file_time_pruning); each pass ends as one of expanded, nothing_dropped, cap_fallback, or zero_survivors with a single path.", m.fileTimePruningPasses.Load()},
+		{"arc_query_file_time_pruning_expanded_total", "File-time pruning passes that left files out of the live-hour read.", m.fileTimePruningExpanded.Load()},
+		{"arc_query_file_time_pruning_files_listed_total", "Live-hour files listed by file-time pruning passes.", m.fileTimePruningFilesListed.Load()},
+		{"arc_query_file_time_pruning_files_dropped_total", "Live-hour files left out of reads by file-time pruning.", m.fileTimePruningFilesDropped.Load()},
+		{"arc_query_file_time_pruning_nothing_dropped_total", "File-time pruning passes where every live-hour file was in range (the margin covers the files listed).", m.fileTimePruningNothingDropped.Load()},
+		{"arc_query_file_time_pruning_cap_fallback_total", "File-time pruning passes that kept too many files to list and read the whole hour.", m.fileTimePruningCapFallback.Load()},
+		{"arc_query_file_time_pruning_zero_survivors_total", "File-time pruning passes that kept no live-hour file: with the hour as the only path the glob is kept (fail safe); with other paths the hour is dropped and the pass also counts as expanded.", m.fileTimePruningZeroSurvivors.Load()},
+		{"arc_query_file_time_pruning_anomalous_kept_total", "Live-hour files kept because their name time is before their hour (rows stamped ahead of the flushing node's clock).", m.fileTimePruningAnomalousKept.Load()},
+		{"arc_ingest_future_stamped_rows_total", "Rows stamped more than query.file_time_pruning_margin_seconds past their flush, in the flush's hour: with file-level time pruning on, a query can miss them until the hour closes.", m.ingestFutureStampedRows.Load()},
+	} {
+		b = append(b, "# HELP "+c.name+" "+c.help+"\n"...)
+		b = append(b, "# TYPE "+c.name+" counter\n"...)
+		b = appendMetric(b, c.name, float64(c.v))
+	}
 	b = appendMetric(b, "arc_compaction_copy_fallback_total", float64(m.compactionCopyFallbackTotal.Load()))
 	b = appendMetric(b, "arc_compaction_finished_total", float64(m.compactionFinishedTotal.Load()))
 	b = appendMetric(b, "arc_compaction_wedged_total", float64(m.compactionWedgedTotal.Load()))
