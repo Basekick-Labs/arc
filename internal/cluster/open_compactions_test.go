@@ -510,3 +510,23 @@ func TestSharedBackendRecordsOnlyRewrites(t *testing.T) {
 		t.Fatalf("recorded retention %v, rewrite %v; want only the rewrite", gotRet, gotRw)
 	}
 }
+
+// A registered family member at another size than registered is not the
+// rewrite: the old file is still read.
+func TestOpenRewriteSiblingMustBeAtItsSize(t *testing.T) {
+	r := staleRig(t)
+	ctx := context.Background()
+	old := staleHour + "cpu_2.parquet"
+	rw := staleHour + "cpu_2_rewrite_5.parquet"
+	r.write(old, "all the rows")
+	r.c.noteLocalDeleted(old, "delete-rewrite")
+	e := raft.FileEntry{Path: rw, SHA256: strings.Repeat("b", 64), SizeBytes: int64(len("the kept rows")), Database: "testdb",
+		Measurement: "cpu", OriginNodeID: "writer-1", Tier: "hot", CreatedAt: time.Now()}
+	if err := r.c.raftNode.RegisterFile(e, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	r.write(rw, "a partial")
+	if got := r.c.OpenExcludedFor(ctx, openPrefix); len(got) != 0 {
+		t.Fatalf("sibling at another size: excluded %v", got)
+	}
+}
