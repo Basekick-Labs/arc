@@ -51,3 +51,17 @@ func (f *fakeOpenCompactionsPlain) ExcludedFor(_ context.Context, prefix string)
 	return out
 }
 func (f *fakeOpenCompactionsPlain) Generation() uint64 { return 1 }
+
+// A continuous query reads its source through the same exclusion.
+func TestContinuousQuerySourceReadExcludesOpenCompactions(t *testing.T) {
+	b, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &ContinuousQueryHandler{storage: b}
+	h.SetOpenCompactions(&fakeOpenCompactionsPlain{keys: []string{"db/m/2026/10/20/10/a.parquet"}})
+	got := h.sourceRead(context.Background(), &ContinuousQuery{Database: "db", SourceMeasurement: "m"}, "/x/db/m/**/*.parquet")
+	if !strings.Contains(got, "WHERE __arc_file NOT IN (") || !strings.Contains(got, "a.parquet") {
+		t.Fatalf("continuous query source read %q does not leave the open compaction's files out", got)
+	}
+}

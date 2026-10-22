@@ -198,6 +198,25 @@ type CQExecution struct {
 }
 
 // NewContinuousQueryHandler creates a new continuous query handler
+// sourceRead is the read_parquet expression a continuous query reads its
+// source measurement through.
+func (h *ContinuousQueryHandler) sourceRead(ctx context.Context, cq *ContinuousQuery, measurementPath string) string {
+	// Escape single quotes: DuckDB read_parquet() paths cannot be
+	// parameterized, so the path is interpolated into a SQL string literal.
+	expr := sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(measurementPath), "union_by_name=true")
+	// A continuous query reads a narrow, recent window: exactly the range in
+	// which a field absent from the newest files fails to bind. List the
+	// measurement's schema anchor first (#914).
+	if h.fieldSchema != nil {
+		if anchor, ok := h.fieldSchema.Resolve(ctx, cq.Database, cq.SourceMeasurement); ok {
+			expr = sqlutil.ReadParquetList([]string{sqlutil.QuoteStringLiteral(anchor), sqlutil.QuoteStringLiteral(measurementPath)}, "union_by_name=true")
+		}
+	}
+	// A run during a compaction's output-then-delete window would write the
+	// doubled aggregate back for good: read each job's rows once.
+	return wrapOpenCompactions(ctx, h.openCompactions, h.storage, expr, cq.Database, cq.SourceMeasurement)
+}
+
 // SetOpenCompactions wires the compaction jobs a source read must account for.
 func (h *ContinuousQueryHandler) SetOpenCompactions(oc OpenCompactions) { h.openCompactions = oc }
 
@@ -1231,21 +1250,7 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	// Skip if the source measurement name matches a CTE name (it's a virtual table reference)
 	wrappedQuery := query
 	if !cteNames[strings.ToLower(cq.SourceMeasurement)] {
-		// Escape single quotes: DuckDB read_parquet() paths cannot be
-		// parameterized, so the path is interpolated into a SQL string literal.
-		readParquetExpr := sqlutil.ReadParquet(sqlutil.QuoteStringLiteral(measurementPath), "union_by_name=true")
-		// A continuous query reads a narrow, recent window: exactly the
-		// range in which a field absent from the newest files fails to
-		// bind. List the measurement's schema anchor first (#914).
-		if h.fieldSchema != nil {
-			if anchor, ok := h.fieldSchema.Resolve(ctx, cq.Database, cq.SourceMeasurement); ok {
-				readParquetExpr = sqlutil.ReadParquetList([]string{sqlutil.QuoteStringLiteral(anchor), sqlutil.QuoteStringLiteral(measurementPath)}, "union_by_name=true")
-			}
-		}
-		// A run during a compaction's output-then-delete window would write
-		// the doubled aggregate back for good: read each job's rows once.
-		readParquetExpr = wrapOpenCompactions(ctx, h.openCompactions, h.storage, readParquetExpr, cq.Database, cq.SourceMeasurement)
-		wrappedQuery = wrapSourceMeasurement(query, cq.Database, cq.SourceMeasurement, readParquetExpr)
+		wrappedQuery = wrapSourceMeasurement(query, cq.Database, cq.SourceMeasurement, h.sourceRead(ctx, cq, measurementPath))
 	}
 
 	h.logger.Debug().Str("query", sqlutil.ForLog(wrappedQuery)).Msg("Executing wrapped query")

@@ -107,6 +107,20 @@ func TestQueryCountsAnOpenCompactionOnce(t *testing.T) {
 		out, _ := io.ReadAll(resp.Body)
 		return resp.StatusCode, out
 	}
+	countDB := func(sql, db string) float64 {
+		body, _ := json.Marshal(map[string]string{"sql": sql})
+		req, _ := http.NewRequest(http.MethodPost, "http://"+ln.Addr().String()+"/api/v1/query", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-arc-database", db)
+		resp, err := client.Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		out, _ := io.ReadAll(resp.Body)
+		var r struct{ Data [][]interface{} }
+		require.NoError(t, json.Unmarshal(out, &r), string(out))
+		n, _ := r.Data[0][0].(float64)
+		return n
+	}
 	count := func(sql string) float64 {
 		code, out := status("/api/v1/query", sql)
 		require.Equal(t, 200, code, string(out))
@@ -132,6 +146,11 @@ func TestQueryCountsAnOpenCompactionOnce(t *testing.T) {
 		code, out := status(route, "SELECT COUNT(*) FROM db1.m")
 		require.Equal(t, 200, code, "%s: %s", route, string(out))
 	}
+	// The header-database path builds its read per measurement.
+	require.Equal(t, float64(2), countDB("SELECT COUNT(*) FROM m", "db1"))
+	oc.set()
+	require.Equal(t, float64(4), countDB("SELECT COUNT(*) FROM m", "db1"), "precondition for the header path")
+	oc.set(inKeys...)
 	// A file column in the data does not collide with the exclusion's.
 	require.Equal(t, float64(2), count("SELECT COUNT(*) FROM db1.m WHERE v = 1"))
 }

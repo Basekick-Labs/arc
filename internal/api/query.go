@@ -3618,6 +3618,13 @@ func (h *QueryHandler) buildReadParquetExprRaw(ctx context.Context, path, origin
 // This is the tiering-aware version used by the fast path that takes database and measurement
 // separately instead of a pre-constructed path, allowing proper tiering metadata lookup.
 func (h *QueryHandler) buildReadParquetExprForMeasurement(ctx context.Context, database, measurement, originalSQL, keyword string) string {
+	return h.excludeOpenCompactions(ctx, h.buildReadParquetExprForMeasurementRaw(ctx, database, measurement, originalSQL, keyword), database, measurement)
+}
+
+// buildReadParquetExprForMeasurementRaw is buildReadParquetExprForMeasurement
+// without the open compaction exclusions (applied once, by the caller, to
+// either tier layout).
+func (h *QueryHandler) buildReadParquetExprForMeasurementRaw(ctx context.Context, database, measurement, originalSQL, keyword string) string {
 	// Check if tiering is enabled and cold tier is configured
 	if h.tieringManager != nil {
 		router := h.tieringManager.GetRouter()
@@ -3631,14 +3638,14 @@ func (h *QueryHandler) buildReadParquetExprForMeasurement(ctx context.Context, d
 					Str("database", database).
 					Str("measurement", measurement).
 					Msg("Tiering enabled: building multi-tier query (fast path)")
-				return h.excludeOpenCompactions(ctx, h.buildMultiTierReadParquet(ctx, database, measurement, originalSQL, tieredPaths, keyword), database, measurement)
+				return h.buildMultiTierReadParquet(ctx, database, measurement, originalSQL, tieredPaths, keyword)
 			}
 		}
 	}
 
 	// Fall back to single-tier behavior (hot tier only)
 	path := h.getStoragePath(ctx, database, measurement)
-	return h.buildReadParquetExpr(ctx, path, originalSQL, keyword)
+	return h.buildReadParquetExprRaw(ctx, path, originalSQL, keyword)
 }
 
 // shouldSkipTableConversion returns true if the table name should not be converted to a storage path

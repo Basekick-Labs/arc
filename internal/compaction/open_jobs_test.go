@@ -35,8 +35,12 @@ func TestOpenJobsExcludesOneSide(t *testing.T) {
 	out := "db/m/2026/10/20/10/m_x_b1_compacted.parquet"
 	man := "_compaction_state/hourly/db/job1.json"
 	in1, in2, bad := "db/m/2026/10/20/10/a.parquet", "db/m/2026/10/20/10/b.parquet", "db/m/2026/10/20/10/corrupt.parquet"
+	before := o.Generation()
 	o.register(out, man, []string{in1, in2, bad})
 	g0 := o.Generation()
+	if g0 == before {
+		t.Fatal("registering a job did not change the generation; a cached read would miss it")
+	}
 
 	if got := excluded(o, "db/m/"); len(got) != 1 || got[0] != out {
 		t.Fatalf("output absent: excluded %v, want the output", got)
