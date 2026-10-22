@@ -336,9 +336,14 @@ func TestClusterLeftoverIsLeftOut(t *testing.T) {
 	r.parquet(pend, "h1")
 	r.parquet(pendOld, "h0", "h1")
 	r.parquet(pendRw, "h1")
-	coord := &leftoverCoordinator{listed: map[string]bool{rw: true}}
+	// Held (being registered) while another member is listed: kept.
+	heldOld := leftoverHour + "cpu_20261007_211000_000000000.parquet"
+	heldRw := leftoverHour + "cpu_20261007_211000_000000000_rewrite_3.parquet"
+	r.parquet(heldOld, "h1")
+	r.parquet(heldRw, "h1")
+	coord := &leftoverCoordinator{listed: map[string]bool{rw: true, heldOld: true}}
 	r.h.coordinator = coord
-	r.h.pending = leftoverHolder{held: map[string]bool{pend: true, pendRw: true}}
+	r.h.pending = leftoverHolder{held: map[string]bool{pend: true, pendRw: true, heldRw: true}}
 
 	files, err := r.h.listParquet(context.Background(), "db", "cpu")
 	if err != nil {
@@ -354,7 +359,7 @@ func TestClusterLeftoverIsLeftOut(t *testing.T) {
 	}
 	sort.Strings(keptPaths)
 	sort.Strings(leftPaths)
-	wantKept := []string{rw, pend, pendRw}
+	wantKept := []string{rw, pend, pendRw, heldOld, heldRw}
 	sort.Strings(wantKept)
 	wantLeft := []string{old, pendOld}
 	sort.Strings(wantLeft)
@@ -372,5 +377,49 @@ func TestClusterLeftoverIsLeftOut(t *testing.T) {
 	// Nothing is removed on a cluster.
 	if n := r.h.removeLeftovers(context.Background(), "db", "cpu"); n != 0 || !r.exists(old) {
 		t.Fatal("a cluster DELETE removed an unlisted file")
+	}
+}
+
+// The member that holds a leftover's rows is gone by the time the leftover
+// would be removed (removed meanwhile): the leftover is then the last member
+// and stays.
+func TestRemoveLeftoversNeverRemovesTheLastMember(t *testing.T) {
+	r := newLeftoverRig(t)
+	orig := leftoverHour + "cpu_20261007_204851_558252000.parquet"
+	r1 := leftoverHour + "cpu_20261007_204851_558252000_rewrite_100.parquet"
+	r2 := leftoverHour + "cpu_20261007_204851_558252000_rewrite_200.parquet"
+	r.parquet(orig, "h0", "h1", "h1", "h2")
+	r.parquet(r1, "h1", "h1", "h2")
+	r.parquet(r2, "h1", "h1")
+	prev := deleteReplaced
+	t.Cleanup(func() { deleteReplaced = prev })
+	deleteReplaced = func(ctx context.Context, b storage.Backend, path string) error {
+		if path == orig {
+			// Something else removes the current member at the same time.
+			_ = os.Remove(filepath.Join(r.root, r2))
+		}
+		return prev(ctx, b, path)
+	}
+	r.h.removeLeftovers(context.Background(), "db", "cpu")
+	if !r.exists(r1) {
+		t.Fatalf("removed the last member of the family: %v", r.files())
+	}
+}
+
+// A journal record stored under another file's key is not trusted.
+func TestRetiredRecordUnderTheWrongKeyIsIgnored(t *testing.T) {
+	r := newLeftoverRig(t)
+	victim := leftoverHour + "cpu_20261007_204851_558252000.parquet"
+	r.parquet(victim, "h1")
+	data := []byte(`{"v":1,"path":"` + victim + `","replaced_by":"x"}`)
+	if err := r.backend.Write(context.Background(), deleteRetiredRoot+"/forged.json", data); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.retired(); len(got) != 0 {
+		t.Fatalf("trusted a record under the wrong key: %v", got)
+	}
+	r.h.DrainRetired(context.Background())
+	if !r.exists(victim) {
+		t.Fatal("drained a file named by a record under the wrong key")
 	}
 }
