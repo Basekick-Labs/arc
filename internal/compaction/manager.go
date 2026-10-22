@@ -684,6 +684,43 @@ func (m *Manager) dropPending(objects []string) []string {
 // file races its registration: the drain can register a source after
 // compaction dropped it from the manifest, leaving an entry for a file about
 // to be deleted.
+// filterRewriteLeftovers drops every member of a rewrite family
+// (storage.RewriteFamily) with more than one member in the candidate: a row
+// DELETE rewrote the file and its old copy is still in storage, and
+// compacting them together would put the surviving rows in the output twice,
+// for good. They wait until the DELETE side removes the old copy. A staged
+// job compacts only files the cluster manifest lists, which never holds
+// both, so it is left alone. The tier's MinFiles is re-checked on the rest.
+func (m *Manager) filterRewriteLeftovers(candidate Candidate, tier Tier) (Candidate, bool) {
+	m.mu.Lock()
+	mode := m.stagedMode
+	m.mu.Unlock()
+	if mode != nil && mode() {
+		return candidate, true
+	}
+	families := storage.RewriteFamilies(candidate.Files)
+	if len(families) == 0 {
+		return candidate, true
+	}
+	kept := make([]string, 0, len(candidate.Files))
+	for _, f := range candidate.Files {
+		if _, ok := families[storage.RewriteFamily(f)]; !ok {
+			kept = append(kept, f)
+		}
+	}
+	m.logger.Warn().
+		Str("partition", candidate.PartitionPath).
+		Str("tier", candidate.Tier).
+		Int("files", len(candidate.Files)-len(kept)).
+		Msg("Files a DELETE rewrote whose old copy is still in storage are not compacted until it is removed; queries read their rows twice meanwhile")
+	if len(kept) < tier.GetMinFiles() {
+		return candidate, false
+	}
+	candidate.Files = kept
+	candidate.FileCount = len(kept)
+	return candidate, true
+}
+
 func (m *Manager) filterPending(candidate Candidate, tier Tier) (Candidate, bool) {
 	kept := m.dropPending(candidate.Files)
 	if len(kept) == len(candidate.Files) {
@@ -1976,6 +2013,14 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 						m.logger.Debug().
 							Str("partition", candidate.PartitionPath).
 							Msg("Skipping candidate: all files are tracked by manifests")
+						continue
+					}
+
+					// A file a DELETE rewrote whose old copy is still in
+					// storage is not compacted: the output
+					// would hold its rows twice.
+					filteredCandidate, shouldProcess = m.filterRewriteLeftovers(filteredCandidate, tier)
+					if !shouldProcess {
 						continue
 					}
 
