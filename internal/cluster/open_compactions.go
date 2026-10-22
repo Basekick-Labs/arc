@@ -72,9 +72,20 @@ func (c *Coordinator) SetOnObjectOutputSeen(fn func()) {
 	}
 }
 
+// excludableReason: a delete whose local copy reads may leave out before its
+// unlink (localDeleteExcludable says when). Other reasons (a DELETE rewrite's
+// old file, a snapshot drop, a repair) are not tracked: the copy is read until
+// the unlink, as before, and a mass drop costs reads nothing.
+func excludableReason(reason string) bool {
+	return strings.HasPrefix(reason, "compaction:") || strings.HasPrefix(reason, "retention:") || reason == "delete"
+}
+
 // noteLocalDeleted records a manifest delete this node must still unlink.
 // Called from the FSM delete callback: map work only.
 func (c *Coordinator) noteLocalDeleted(path, reason string) {
+	if !excludableReason(reason) {
+		return
+	}
 	c.open.mu.Lock()
 	c.open.init()
 	c.open.localDeleted[path] = reason
