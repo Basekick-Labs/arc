@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-func TestRunCycleDoesNotSyncColdMetadataForHotOnlyDatabase(t *testing.T) {
+func TestRunCycleCleansRedundantColdCopyForHotOnlyDatabase(t *testing.T) {
 	m, hot, cold, cleanup := setupIntegrationTest(t, true)
 	defer cleanup()
 
@@ -35,8 +35,11 @@ func TestRunCycleDoesNotSyncColdMetadataForHotOnlyDatabase(t *testing.T) {
 	} else if !exists {
 		t.Error("runCycle removed the hot copy of a hot-only database")
 	}
-	if result, _ := m.LastScan(); result == nil || result.ColdSynced != 0 {
-		t.Errorf("cold sync result = %+v, want no cold rows synced", result)
+	if exists, err := cold.Exists(ctx, path); err != nil || exists {
+		t.Errorf("redundant cold object exists = %v, err = %v; want removed", exists, err)
+	}
+	if result, _ := m.LastScan(); result == nil || result.ColdSynced != 1 {
+		t.Errorf("cold sync result = %+v, want one redundant cold copy cleaned", result)
 	}
 }
 
@@ -69,6 +72,36 @@ func TestColdSyncRecordsPrePinColdObjectForHotOnlyDatabase(t *testing.T) {
 	}
 	if result, _ := m.LastScan(); result == nil || result.ColdSynced != 1 {
 		t.Errorf("cold sync result = %+v, want one cold row synced", result)
+	}
+}
+
+func TestColdSyncKeepsUnregisteredHotOnlyFileHot(t *testing.T) {
+	m, hot, cold, cleanup := setupIntegrationTest(t, true)
+	defer cleanup()
+
+	ctx := context.Background()
+	path := gateDailyA
+	m.coldBackend = &coldLister{mockBackend: cold, lastModified: time.Now().UTC().Add(-time.Hour)}
+	mustWrite(t, hot, path)
+	mustWrite(t, cold, path)
+	if err := m.policies.Set(ctx, &DatabasePolicy{Database: "db1", HotOnly: true}); err != nil {
+		t.Fatalf("set hot-only policy: %v", err)
+	}
+	if f, err := m.metadata.GetFile(ctx, path); err != nil || f != nil {
+		t.Fatalf("initial row = %+v, err = %v; want no row", f, err)
+	}
+
+	for i := 0; i < 3; i++ {
+		if err := m.runCycle(ctx); err != nil {
+			t.Fatalf("runCycle %d: %v", i+1, err)
+		}
+	}
+
+	if got := fileMeta(t, m, path).Tier; got != TierHot {
+		t.Fatalf("tier after reconciliation = %s, want hot", got)
+	}
+	if exists, err := hot.Exists(ctx, path); err != nil || !exists {
+		t.Fatalf("hot copy after reconciliation = %v, err = %v; want preserved", exists, err)
 	}
 }
 

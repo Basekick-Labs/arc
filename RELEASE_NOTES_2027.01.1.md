@@ -1539,6 +1539,31 @@ than a minute in the future now answers `400`. The run's end becomes
 `last_processed_time`, and a future one made every later run fail until the
 clock caught up.
 
+### A `hot_only` database no longer keeps a cold copy left by a failed migration ([#1324](https://github.com/Basekick-Labs/arc/issues/1324))
+
+A hot-to-cold migration that copied a file to the cold tier, then failed
+before marking it cold, left two copies of the file. After the database was
+pinned `hot_only`, nothing removed the cold one, which kept costing storage.
+
+On the primary writer, the cold-tier sync now deletes such a cold copy, but
+only when every one of these holds:
+
+- the file's metadata still says hot;
+- the hot copy exists;
+- the cluster manifest lists the file at the same size;
+- the cold object is the same size.
+
+A copy already recorded as cold is left alone, and so is any file whose hot
+copy cannot be confirmed. A failed delete is retried on the next cycle, and the
+sync carries on with the other files. Query caches are refreshed after a
+removal.
+
+On a reader whose replica of the hot file has not arrived yet, the cold copy
+stays recorded so queries still find the rows. Once the hot copy arrives and
+the cold object is gone, the reader marks the file hot again.
+
+Contributed by [@jallegri](https://github.com/jallegri) in [#1329](https://github.com/Basekick-Labs/arc/pull/1329).
+
 ### Aggregates over several hours no longer return one result per hour on `/api/v1/query`
 
 Since 26.02.1, a JSON query with the database in the `x-arc-database`

@@ -1009,6 +1009,43 @@ func (s *MetadataStore) UpdateTier(ctx context.Context, path string, newTier Tie
 	return nil
 }
 
+// UpdateTierIfCurrent changes a row only if it still has expectedTier. It is
+// used by cleanup paths whose object-store action is based on a metadata
+// snapshot; a concurrent migration must be able to invalidate that decision.
+func (s *MetadataStore) UpdateTierIfCurrent(ctx context.Context, path string, expectedTier, newTier Tier) (bool, error) {
+	var database, measurement string
+	lookupQuery := `SELECT database, measurement FROM tier_files WHERE path = ?`
+	err := s.db.QueryRowContext(ctx, lookupQuery, path).Scan(&database, &measurement)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("failed to load file metadata before conditional tier update: %w", err)
+	}
+
+	var migratedAt any
+	if newTier == TierCold {
+		migratedAt = time.Now().UTC()
+	}
+	query := `
+		UPDATE tier_files
+		SET tier = ?, migrated_at = ?
+		WHERE path = ? AND tier = ? AND quarantined_at IS NULL
+	`
+	result, err := s.db.ExecContext(ctx, query, string(newTier), migratedAt, path, string(expectedTier))
+	if err != nil {
+		return false, fmt.Errorf("failed to conditionally update tier: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to read conditional tier update result: %w", err)
+	}
+	if rows == 0 {
+		return false, nil
+	}
+	if database != "" && measurement != "" {
+		s.invalidateTierCache(database, measurement)
+	}
+	return true, nil
+}
+
 // DeleteFile removes a file from the metadata store
 func (s *MetadataStore) DeleteFile(ctx context.Context, path string) error {
 	// Get database/measurement for cache invalidation before delete
