@@ -305,6 +305,17 @@ func (c *Coordinator) rederiveRewriteUnlinks(ctx context.Context, seen *seenLoca
 	return true
 }
 
+// tryRederiveRewriteUnlinks runs rederiveRewriteUnlinks unless it has run or
+// is running.
+func (c *Coordinator) tryRederiveRewriteUnlinks(ctx context.Context, seen *seenLocal) {
+	s := &c.stale
+	if s.rederived.Load() || !s.rederiving.CompareAndSwap(false, true) {
+		return
+	}
+	defer s.rederiving.Store(false)
+	s.rederived.Store(c.rederiveRewriteUnlinks(ctx, seen))
+}
+
 // olderThanAll: path comes before every registered member of its family in
 // the rewrite chain (the original, or a rewrite with a smaller stamp).
 func olderThanAll(path string, sibs []raft.FileEntry) bool {
