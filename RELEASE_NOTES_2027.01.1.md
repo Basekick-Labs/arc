@@ -1508,19 +1508,31 @@ window (see the limitations). What made it permanent:
   bucket, so nothing ever removed it.
 
 **The fix:**
-- Removing the replaced file is retried a few times before the DELETE gives
-  up, everywhere a DELETE or the registration outbox removes one.
-- **Standalone:** the DELETE first records the file it replaced in the
-  storage backend (`_delete_retired/`). Arc removes recorded files at start
-  and every minute, so a failed removal is finished without a retry, after a
-  restart too. A later DELETE on the measurement also removes them, and
-  leaves out any older copy of a file it finds by name: every rewrite of a
-  file is named after it, and the copy with the fewest rows is the current
-  one.
-- **Clusters:** a DELETE leaves out a file the manifest does not list while
-  another copy of the same file is listed or still being registered. It does
-  not remove it. The manifest repair no longer registers such a file, so
-  the reconciler, when enabled, removes it as an orphan.
+- A DELETE retries removing the file it replaced a few times before giving
+  up, and so does the registration outbox when it rewrites a pending file.
+- Every rewrite of a file is named after it, so the DELETE can find the old
+  copy: of the copies of one file, the one with the fewest rows is the
+  current one (each rewrite only removes rows).
+- **Standalone:**
+  - Before removing the replaced file, the DELETE records it in the storage
+    backend (`_delete_retired/`). Arc removes recorded files at start and
+    every minute, so a failed removal is finished without a retry, after a
+    restart too.
+  - A later DELETE on the measurement leaves out and removes any older copy
+    it finds, recorded or not.
+  - A backup leaves out recorded files, so a restore does not bring both
+    copies back.
+- **Clusters:** the DELETE first catches up with the cluster manifest. It
+  then leaves out a file the manifest does not list while another copy of
+  the same file is listed or still being registered.
+  - With compaction commit on (a cluster turns it on once every node
+    supports it), the DELETE also
+    removes such a file when it is provably the older copy: the listed copy
+    is in storage at its registered size and has fewer rows.
+  - The manifest repair no longer registers such a file. When the
+    reconciler is enabled and acting (`reconciliation.enabled`, with
+    `reconciliation.manifest_only_dry_run = false`), it removes the file as
+    an orphan.
 - Compaction (outside staged compaction, which compacts only files the
   cluster manifest lists) skips every copy of a file while more than one is
   in storage.
@@ -1529,12 +1541,19 @@ window (see the limitations). What made it permanent:
   rows under a new name.
 
 **Limitations:**
-- Queries still read both copies until the old one is removed: up to a
-  minute on standalone. On a cluster, the copy stays until the reconciler
-  removes it, or for good when the reconciler is off. Removing it durably on
-  clusters is the next fix in this series.
-- On a shared object store cluster, an old copy whose replacement was
-  later compacted or tiered away is no longer recognised as one.
+- Queries still read both copies until the old one is removed. On
+  standalone that is up to a minute, if the record was written; if writing
+  the record failed too (likely in the same storage outage), the copy stays
+  until a DELETE runs on that measurement. On a cluster with compaction
+  commit off, it stays until the reconciler removes it.
+- While both copies are in storage, compaction skips that file.
+- Pairs of copies left by earlier versions (both rewrites of the bug above)
+  hold the same rows: neither can be told apart, so both are kept, read and
+  rewritten together. A DELETE on them warns. Remove one by hand.
+- Standalone with tiering: if a recorded copy moves to the cold tier before
+  it is removed, it stays there.
+- On a shared object store cluster, an old copy whose replacement was later
+  compacted or tiered away is no longer recognised as one.
 
 ### A cached query no longer misses an hour its relative end has just reached
 

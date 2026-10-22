@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/cluster/raft"
@@ -295,12 +296,28 @@ func TestRetiredPathValid(t *testing.T) {
 // the outbox; it is not removed (the manifest decides).
 type leftoverCoordinator struct {
 	rewriteManifestCoordinator
-	listed map[string]bool
+	listed  map[string]bool
+	sizes   map[string]int64
+	syncs   int
+	syncErr error
+	cas     bool
+	owned   map[string]bool
 }
+
+func (c *leftoverCoordinator) SyncManifest(context.Context) error {
+	c.syncs++
+	return c.syncErr
+}
+func (c *leftoverCoordinator) CompactionCommitActive() bool { return c.cas }
+func (c *leftoverCoordinator) WaitLocalFiles(context.Context, string, string, time.Duration) ([]string, error) {
+	return nil, nil
+}
+func (c *leftoverCoordinator) ManifestHotFiles(string, string) []raft.FileEntry { return nil }
+func (c *leftoverCoordinator) CompactionOwns(p string) bool                     { return c.owned[p] }
 
 func (c *leftoverCoordinator) GetFileEntry(p string) (*raft.FileEntry, bool) {
 	if c.listed[p] {
-		return &raft.FileEntry{Path: p}, true
+		return &raft.FileEntry{Path: p, SizeBytes: c.sizes[p]}, true
 	}
 	return nil, false
 }
@@ -349,7 +366,10 @@ func TestClusterLeftoverIsLeftOut(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	kept, left := r.h.leftoverFiles(context.Background(), files)
+	kept, left, err := r.h.leftoverFiles(context.Background(), files)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var keptPaths, leftPaths []string
 	for _, f := range kept {
 		keptPaths = append(keptPaths, f.relativePath)
@@ -368,7 +388,7 @@ func TestClusterLeftoverIsLeftOut(t *testing.T) {
 	}
 	// An unlisted file with no listed or held sibling is scanned as before.
 	delete(coord.listed, rw)
-	_, left = r.h.leftoverFiles(context.Background(), files)
+	_, left, _ = r.h.leftoverFiles(context.Background(), files)
 	for _, l := range left {
 		if l.path == old {
 			t.Fatal("an unlisted file with no listed sibling was left out")
@@ -421,5 +441,81 @@ func TestRetiredRecordUnderTheWrongKeyIsIgnored(t *testing.T) {
 	r.h.DrainRetired(context.Background())
 	if !r.exists(victim) {
 		t.Fatal("drained a file named by a record under the wrong key")
+	}
+}
+
+// The cluster classification reads the manifest as the leader has it: it
+// syncs first, and a failed sync stops a compare-and-set DELETE (a lagging
+// manifest takes the current file for a leftover) or, without compaction
+// commit, scans everything as before.
+func TestClusterLeftoversSyncFirst(t *testing.T) {
+	r := newLeftoverRig(t)
+	old := leftoverHour + "cpu_20261007_204851_558252000.parquet"
+	rw := leftoverHour + "cpu_20261007_204851_558252000_rewrite_100.parquet"
+	r.parquet(old, "h0", "h1")
+	r.parquet(rw, "h1")
+	coord := &leftoverCoordinator{listed: map[string]bool{rw: true}}
+	r.h.coordinator = coord
+	files, _ := r.h.listParquet(context.Background(), "db", "cpu")
+	if _, left, err := r.h.leftoverFiles(context.Background(), files); err != nil || len(left) != 1 || coord.syncs != 1 {
+		t.Fatalf("left %v err %v syncs %d", left, err, coord.syncs)
+	}
+	coord.syncErr = errors.New("no leader")
+	if kept, left, err := r.h.leftoverFiles(context.Background(), files); err != nil || len(left) != 0 || len(kept) != 2 {
+		t.Fatalf("commit off, sync failed: kept %d left %v err %v", len(kept), left, err)
+	}
+	coord.cas = true
+	if _, _, err := r.h.leftoverFiles(context.Background(), files); !errors.Is(err, errManifestNotSynced) {
+		t.Fatalf("commit on, sync failed: %v", err)
+	}
+}
+
+// With compaction commit on, a cluster DELETE removes a leftover that is
+// provably older than a listed member: that member is here at its registered
+// size and has fewer rows. Never a file with fewer rows (a rewrite still
+// being committed), one a compaction owns, or one whose listed member is
+// not here at its size.
+func TestClusterRemovesOnlyProvablyOlderLeftovers(t *testing.T) {
+	r := newLeftoverRig(t)
+	old := leftoverHour + "cpu_20261007_204851_558252000.parquet"
+	rw := leftoverHour + "cpu_20261007_204851_558252000_rewrite_100.parquet"
+	inflight := leftoverHour + "cpu_20261007_220000_000000000_rewrite_9.parquet"
+	inflightBase := leftoverHour + "cpu_20261007_220000_000000000.parquet"
+	r.parquet(old, "h0", "h1")
+	r.parquet(rw, "h1")
+	r.parquet(inflightBase, "h0", "h1")
+	r.parquet(inflight, "h1") // a newer rewrite another node is committing
+	size := func(p string) int64 {
+		fi, err := os.Stat(filepath.Join(r.root, p))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fi.Size()
+	}
+	coord := &leftoverCoordinator{cas: true, listed: map[string]bool{rw: true, inflightBase: true},
+		sizes: map[string]int64{rw: size(rw), inflightBase: size(inflightBase)}, owned: map[string]bool{}}
+	r.h.coordinator = coord
+
+	coord.owned[old] = true
+	if n := r.h.removeLeftovers(context.Background(), "db", "cpu"); n != 0 {
+		t.Fatalf("removed %d with the leftover owned by a compaction", n)
+	}
+	delete(coord.owned, old)
+	coord.sizes[rw] = 1
+	if n := r.h.removeLeftovers(context.Background(), "db", "cpu"); n != 0 {
+		t.Fatalf("removed %d while the listed member is not here at its size", n)
+	}
+	coord.sizes[rw] = size(rw)
+	if n := r.h.removeLeftovers(context.Background(), "db", "cpu"); n != 1 || r.exists(old) {
+		t.Fatalf("removed %d; old exists %v", n, r.exists(old))
+	}
+	if !r.exists(inflight) || !r.exists(inflightBase) || !r.exists(rw) {
+		t.Fatal("removed a file with fewer rows than its listed member, or a listed one")
+	}
+	// Commit off: nothing removed.
+	r.parquet(old, "h0", "h1")
+	coord.cas = false
+	if n := r.h.removeLeftovers(context.Background(), "db", "cpu"); n != 0 {
+		t.Fatalf("removed %d with compaction commit off", n)
 	}
 }

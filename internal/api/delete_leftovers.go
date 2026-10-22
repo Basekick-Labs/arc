@@ -35,10 +35,10 @@ import (
 //     (removeLeftovers), and the drainer removes journaled ones even when no
 //     DELETE runs.
 //   - Cluster: a file the manifest does not list and the outbox does not
-//     hold, while another member of its family is listed or held. It is only
-//     left out: whether it is a leftover or a rewrite still being committed
-//     is the manifest's to say, and a staged commit (the DELETE rewrite as a
-//     staged compaction) is what removes it durably.
+//     hold, while another member of its family is listed or held, judged on
+//     the manifest after catching up with the leader. With compaction commit
+//     on, the DELETE removes one only when it is provably the older copy
+//     (removeLeftovers); otherwise it is only left out.
 
 // deleteRetiredRoot holds the standalone retired journal: one object per
 // source a DELETE replaced and could not remove yet. A reserved root
@@ -140,25 +140,53 @@ type rewriteSiblings interface {
 	HasRewriteSibling(path string) bool
 }
 
+// manifestSyncer catches this node up with the cluster manifest.
+type manifestSyncer interface {
+	SyncManifest(ctx context.Context) error
+}
+
+// compactionOwner reports a path a staged compaction owns.
+type compactionOwner interface {
+	CompactionOwns(path string) bool
+}
+
 // leftover is a scanned file a DELETE leaves out.
 type leftover struct {
 	path string
 	// journaled: the retired journal names it. Otherwise keeper is the
-	// family member that holds its rows (standalone) or is listed.
+	// family member that holds its rows: in a cluster, a listed member in
+	// the same listing ("" when only the manifest knows of one, or one is
+	// held), which removal needs.
 	journaled bool
 	keeper    string
 }
 
 // leftoverFiles splits files into those a DELETE scans and the leftovers it
 // leaves out (see the top of this file).
-func (h *DeleteHandler) leftoverFiles(ctx context.Context, files []fileInfo) ([]fileInfo, []leftover) {
+func (h *DeleteHandler) leftoverFiles(ctx context.Context, files []fileInfo) ([]fileInfo, []leftover, error) {
 	if h.coordinator != nil {
-		return h.clusterLeftovers(files)
+		return h.clusterLeftovers(ctx, files)
 	}
 	return h.standaloneLeftovers(ctx, files)
 }
 
-func (h *DeleteHandler) clusterLeftovers(files []fileInfo) ([]fileInfo, []leftover) {
+// clusterLeftovers decides on the manifest as the leader has it: a node
+// whose manifest lags would take the current file for a leftover (the
+// rewrite registered elsewhere, not here yet) and the leftover for the
+// current file. Without compaction commit a sync that fails leaves every
+// file scanned, as before; with it the DELETE stops, as its scan would.
+func (h *DeleteHandler) clusterLeftovers(ctx context.Context, files []fileInfo) ([]fileInfo, []leftover, error) {
+	if s, ok := h.coordinator.(manifestSyncer); ok {
+		if err := s.SyncManifest(ctx); err != nil {
+			if casActive(h.coordinator) {
+				return nil, nil, fmt.Errorf("%w: %v", errManifestNotSynced, err)
+			}
+			h.logger.Warn().Err(err).Msg("Could not catch up with the cluster manifest; files an earlier DELETE replaced are not told apart this time")
+			return files, nil, nil
+		}
+	} else {
+		return files, nil, nil
+	}
 	holder, _ := h.pending.(registrationHolder)
 	held := func(p string) bool { return holder != nil && holder.HoldsRegistration(p) }
 	registered := func(p string) bool {
@@ -179,26 +207,32 @@ func (h *DeleteHandler) clusterLeftovers(files []fileInfo) ([]fileInfo, []leftov
 			kept = append(kept, f)
 			continue
 		}
-		keeper := ""
+		keeper, isLeftover := "", false
 		for _, m := range families[storage.RewriteFamily(p)] {
-			if m != p && held(m) {
-				keeper = m
+			if m == p {
+				continue
+			}
+			if registered(m) {
+				keeper, isLeftover = m, true
 				break
 			}
+			if held(m) {
+				isLeftover = true
+			}
 		}
-		if keeper == "" && siblings != nil && siblings.HasRewriteSibling(p) {
-			keeper = storage.RewriteFamily(p)
+		if !isLeftover && siblings != nil && siblings.HasRewriteSibling(p) {
+			isLeftover = true
 		}
-		if keeper == "" {
+		if !isLeftover {
 			kept = append(kept, f)
 			continue
 		}
 		left = append(left, leftover{path: p, keeper: keeper})
 	}
-	return kept, left
+	return kept, left, nil
 }
 
-func (h *DeleteHandler) standaloneLeftovers(ctx context.Context, files []fileInfo) ([]fileInfo, []leftover) {
+func (h *DeleteHandler) standaloneLeftovers(ctx context.Context, files []fileInfo) ([]fileInfo, []leftover, error) {
 	retired := map[string]bool{}
 	if recs, err := h.retiredRecords(ctx); err != nil {
 		h.logger.Warn().Err(err).Msg("Could not read the retired-file journal; leftovers are found by their rewrite family only")
@@ -219,46 +253,46 @@ func (h *DeleteHandler) standaloneLeftovers(ctx context.Context, files []fileInf
 		paths = append(paths, f.relativePath)
 	}
 	families := storage.RewriteFamilies(paths)
-	if len(families) > 0 {
-		var members []fileInfo
-		for _, ms := range families {
-			for _, m := range ms {
-				members = append(members, byPath[m])
-			}
+	names := make([]string, 0, len(families))
+	for family := range families {
+		names = append(names, family)
+	}
+	sort.Strings(names)
+	for _, family := range names {
+		ms := families[family]
+		sort.Strings(ms)
+		members := make([]fileInfo, len(ms))
+		for i, m := range ms {
+			members[i] = byPath[m]
 		}
+		// One family at a time: a footer that cannot be read stops the
+		// DELETE (scanning that family whole is what made the leftover a
+		// second copy), and costs no other family anything.
 		rows, err := h.rowCounts(ctx, members)
 		if err != nil {
-			h.logger.Warn().Err(err).Msg("Could not count the rows of files with more than one rewrite in storage; scanning them all")
-			families = nil
+			return nil, nil, fmt.Errorf("count the rows of %s and its rewrites: %w", family, err)
 		}
-		for family, ms := range families {
-			sort.Strings(ms)
-			least, keeper, tied := int64(-1), "", false
-			for _, m := range ms {
-				n, ok := rows[m]
-				if !ok {
-					least = -2 // a member not counted: leave the family as it is
-					break
-				}
-				switch {
-				case least < 0 || n < least:
-					least, keeper, tied = n, m, false
-				case n == least:
-					tied = true
-				}
+		least, keeper, tied := int64(-1), "", false
+		for _, m := range ms {
+			n, ok := rows[m]
+			if !ok {
+				return nil, nil, fmt.Errorf("count the rows of %s: no count for %s", family, m)
 			}
-			if least == -2 {
-				continue
+			switch {
+			case least < 0 || n < least:
+				least, keeper, tied = n, m, false
+			case n == least:
+				tied = true
 			}
-			if tied {
-				h.logger.Warn().Str("family", family).Strs("files", ms).
-					Msg("Rewrites of one file hold the same number of rows; none is known to be the current one, so all are scanned")
-			}
-			for _, m := range ms {
-				if rows[m] > least {
-					left = append(left, leftover{path: m, keeper: keeper})
-					delete(byPath, m)
-				}
+		}
+		if tied {
+			h.logger.Warn().Str("family", family).Strs("files", ms).
+				Msg("Rewrites of one file hold the same number of rows; none is known to be the current one, so all are scanned")
+		}
+		for _, m := range ms {
+			if rows[m] > least {
+				left = append(left, leftover{path: m, keeper: keeper})
+				delete(byPath, m)
 			}
 		}
 	}
@@ -268,7 +302,7 @@ func (h *DeleteHandler) standaloneLeftovers(ctx context.Context, files []fileInf
 			kept = append(kept, f)
 		}
 	}
-	return kept, left
+	return kept, left, nil
 }
 
 // rowCounts reads each file's row count from its footer.
@@ -299,7 +333,7 @@ func (h *DeleteHandler) rowCounts(ctx context.Context, files []fileInfo) (map[st
 		rel, ok := byQuery[name]
 		if !ok {
 			for q, r := range byQuery {
-				if strings.HasSuffix(name, filepath.Base(q)) && filepath.Base(name) == filepath.Base(q) {
+				if filepath.Base(name) == filepath.Base(q) {
 					rel, ok = r, true
 					break
 				}
@@ -312,12 +346,18 @@ func (h *DeleteHandler) rowCounts(ctx context.Context, files []fileInfo) (map[st
 	return out, rows.Err()
 }
 
-// removeLeftovers removes the standalone leftovers of database/measurement,
-// classified again from a fresh listing. The caller holds rewriteMu (no
-// rewrite runs meanwhile) and is not a dry run. A removal that fails leaves
-// the file out of this DELETE's scan anyway.
+// removeLeftovers removes the leftovers of database/measurement, classified
+// again from a fresh listing. The caller holds rewriteMu (no rewrite runs
+// meanwhile), is the primary writer, and is not a dry run. A removal that
+// fails leaves the file out of this DELETE's scan anyway.
+//
+// In a cluster only with compaction commit on (a synced, compare-and-set
+// manifest), and only a leftover that is provably older than a listed
+// member: that member is in storage at its registered size and holds
+// strictly fewer rows. A rewrite another node is still committing has fewer
+// rows than the file it replaces, so it is never the one removed.
 func (h *DeleteHandler) removeLeftovers(ctx context.Context, database, measurement string) int {
-	if h.coordinator != nil {
+	if h.coordinator != nil && !casActive(h.coordinator) {
 		return 0
 	}
 	files, err := h.listParquet(ctx, database, measurement)
@@ -325,7 +365,14 @@ func (h *DeleteHandler) removeLeftovers(ctx context.Context, database, measureme
 		h.logger.Warn().Err(err).Msg("Could not list files to remove leftovers of earlier DELETEs")
 		return 0
 	}
-	_, left := h.standaloneLeftovers(ctx, files)
+	_, left, err := h.leftoverFiles(ctx, files)
+	if err != nil {
+		h.logger.Warn().Err(err).Msg("Could not tell files an earlier DELETE replaced apart; none removed")
+		return 0
+	}
+	if h.coordinator != nil {
+		left = h.provablyOlder(ctx, files, left)
+	}
 	removed := 0
 	for _, l := range left {
 		if !l.journaled {
@@ -347,6 +394,41 @@ func (h *DeleteHandler) removeLeftovers(ctx context.Context, database, measureme
 			Msg("Removed a file an earlier DELETE replaced and could not remove")
 	}
 	return removed
+}
+
+// provablyOlder keeps the cluster leftovers removeLeftovers may remove (see
+// there).
+func (h *DeleteHandler) provablyOlder(ctx context.Context, files []fileInfo, left []leftover) []leftover {
+	byPath := make(map[string]fileInfo, len(files))
+	for _, f := range files {
+		byPath[f.relativePath] = f
+	}
+	owner, _ := h.coordinator.(compactionOwner)
+	holder, _ := h.pending.(registrationHolder)
+	var out []leftover
+	for _, l := range left {
+		if l.keeper == "" || (owner != nil && owner.CompactionOwns(l.path)) || (holder != nil && holder.HoldsRegistration(l.path)) {
+			continue
+		}
+		e, ok := h.coordinator.GetFileEntry(l.keeper)
+		if !ok {
+			continue
+		}
+		if size, err := h.storage.StatFile(ctx, l.keeper); err != nil || size != e.SizeBytes {
+			continue
+		}
+		rows, err := h.rowCounts(ctx, []fileInfo{byPath[l.path], byPath[l.keeper]})
+		if err != nil {
+			continue
+		}
+		lr, okL := rows[l.path]
+		kr, okK := rows[l.keeper]
+		if !okL || !okK || lr <= kr {
+			continue
+		}
+		out = append(out, l)
+	}
+	return out
 }
 
 // listParquet lists the parquet files of database/measurement.
@@ -376,8 +458,6 @@ func (h *DeleteHandler) DrainRetired(ctx context.Context) int {
 	if h.coordinator != nil {
 		return 0
 	}
-	h.rewriteMu.Lock()
-	defer h.rewriteMu.Unlock()
 	recs, err := h.retiredRecords(ctx)
 	if err != nil {
 		h.logger.Warn().Err(err).Msg("Could not read the retired-file journal")
@@ -385,12 +465,21 @@ func (h *DeleteHandler) DrainRetired(ctx context.Context) int {
 	}
 	removed := 0
 	for _, r := range recs {
-		if err := deleteReplaced(ctx, h.storage, r.Path); err != nil {
+		if ctx.Err() != nil {
+			break
+		}
+		// The lock per record: a DELETE waits for one removal, not a pass.
+		h.rewriteMu.Lock()
+		err := deleteReplaced(ctx, h.storage, r.Path)
+		if err == nil {
+			h.clearRetired(ctx, r.Path)
+		}
+		h.rewriteMu.Unlock()
+		if err != nil {
 			h.logger.Warn().Err(err).Str("file", r.Path).Str("replaced_by", r.ReplacedBy).
 				Msg("Still cannot remove a file a DELETE replaced; queries read its rows twice until it is removed")
 			continue
 		}
-		h.clearRetired(ctx, r.Path)
 		removed++
 		h.logger.Info().Str("file", r.Path).Str("replaced_by", r.ReplacedBy).
 			Msg("Removed a file a DELETE replaced and could not remove at the time")

@@ -679,11 +679,6 @@ func (m *Manager) dropPending(objects []string) []string {
 	return kept
 }
 
-// filterPending drops candidate files still pending cluster registration and
-// re-applies the tier's MinFiles to what remains (#1212). Compacting a pending
-// file races its registration: the drain can register a source after
-// compaction dropped it from the manifest, leaving an entry for a file about
-// to be deleted.
 // filterRewriteLeftovers drops every member of a rewrite family
 // (storage.RewriteFamily) with more than one member in the candidate: a row
 // DELETE rewrote the file and its old copy is still in storage, and
@@ -721,6 +716,11 @@ func (m *Manager) filterRewriteLeftovers(candidate Candidate, tier Tier) (Candid
 	return candidate, true
 }
 
+// filterPending drops candidate files still pending cluster registration and
+// re-applies the tier's MinFiles to what remains (#1212). Compacting a pending
+// file races its registration: the drain can register a source after
+// compaction dropped it from the manifest, leaving an entry for a file about
+// to be deleted.
 func (m *Manager) filterPending(candidate Candidate, tier Tier) (Candidate, bool) {
 	kept := m.dropPending(candidate.Files)
 	if len(kept) == len(candidate.Files) {

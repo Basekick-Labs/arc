@@ -511,7 +511,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	}
 
 	if len(affected) == 0 && rec == nil {
-		if !req.DryRun && h.coordinator == nil {
+		if !req.DryRun && (h.coordinator == nil || casActive(h.coordinator)) {
 			// Nothing to rewrite, but a leftover the scan left out (it may
 			// hold the only rows that matched) is still removed.
 			h.rewriteMu.Lock()
@@ -597,8 +597,9 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	h.rewriteMu.Lock()
 	defer h.rewriteMu.Unlock()
 	h.recordID = 0
-	// Standalone: remove what earlier DELETEs replaced and could not remove,
-	// before rewriting anything (the scan left them out).
+	// Remove what earlier DELETEs replaced and could not remove, before
+	// rewriting anything (the scan left them out; removeLeftovers says
+	// which, per mode).
 	h.removeLeftovers(ctx, req.Database, req.Measurement)
 	if rec != nil {
 		// Recorded before the rewrite: rows of its scope that reach a file
@@ -934,7 +935,10 @@ func (h *DeleteHandler) findAffectedFiles(ctx context.Context, database, measure
 
 	// Files an earlier DELETE replaced and could not remove are never read
 	// into a new file (delete_leftovers.go).
-	parquetFiles, left := h.leftoverFiles(ctx, parquetFiles)
+	parquetFiles, left, err := h.leftoverFiles(ctx, parquetFiles)
+	if err != nil {
+		return nil, nil, err
+	}
 	if len(left) > 0 {
 		sample := make([]string, 0, min(len(left), 5))
 		for _, l := range left[:min(len(left), 5)] {

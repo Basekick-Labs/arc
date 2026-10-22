@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -663,6 +664,21 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 		case isIcebergMetadata(obj.Path):
 			icebergMetaFiles = append(icebergMetaFiles, obj)
 		}
+	}
+	// A file a row DELETE replaced and could not remove (the standalone
+	// retired journal) is not data: its replacement holds every row it still
+	// had to keep. Backing it up would bring both back on a restore, with
+	// nothing recording which is the old one.
+	if retired := m.retiredByDelete(ctx, objectLister); len(retired) > 0 {
+		kept := parquetFiles[:0]
+		for _, obj := range parquetFiles {
+			if !retired[obj.Path] {
+				kept = append(kept, obj)
+			}
+		}
+		m.logger.Info().Int("files", len(parquetFiles)-len(kept)).
+			Msg("Backup leaves out files a DELETE replaced and has not removed yet")
+		parquetFiles = kept
 	}
 	// A scoped backup carries no Iceberg metadata (#1084): the namespace
 	// directories are not listed at all, and the catalog that would make a
@@ -2496,6 +2512,42 @@ func (m *Manager) copyStateFiles(ctx context.Context, leg *backupLeg) (int64, er
 
 // isCompactionState reports whether a key is compaction's crash-recovery
 // state: a manifest or a parked manifest under _compaction_state/.
+// deleteRetiredDir is the standalone DELETE's retired journal
+// (internal/api delete_leftovers.go): one JSON object per file a DELETE
+// replaced and has not removed yet.
+const deleteRetiredDir = "_delete_retired"
+
+// retiredByDelete returns the files the retired journal names. A journal
+// that cannot be read leaves them in the backup, as before.
+func (m *Manager) retiredByDelete(ctx context.Context, lister storage.ObjectLister) map[string]bool {
+	objs, err := lister.ListObjects(ctx, deleteRetiredDir+"/")
+	if err != nil || len(objs) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(objs))
+	for _, o := range objs {
+		if !strings.HasSuffix(o.Path, ".json") {
+			continue
+		}
+		data, err := m.dataStorage.Read(ctx, o.Path)
+		if err != nil {
+			continue
+		}
+		var rec struct {
+			Path string `json:"path"`
+		}
+		// Only a record stored under its own path's key (as the DELETE
+		// writes it) may leave a file out of the backup.
+		if json.Unmarshal(data, &rec) == nil && strings.HasSuffix(rec.Path, ".parquet") {
+			sum := sha256.Sum256([]byte(rec.Path))
+			if o.Path == deleteRetiredDir+"/"+hex.EncodeToString(sum[:16])+".json" {
+				out[rec.Path] = true
+			}
+		}
+	}
+	return out
+}
+
 func isCompactionState(path string) bool {
 	return strings.HasPrefix(filepath.ToSlash(path), compactionStateDir+"/")
 }
