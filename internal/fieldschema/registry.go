@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -88,7 +89,7 @@ type Registry struct {
 	describe describeFunc
 	now      func() time.Time
 
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	entries map[string]*entry
 
 	queue   chan *entry
@@ -119,9 +120,11 @@ type entry struct {
 	refreshing        bool      // background re-read of the stored anchor in flight
 	retryAfter        time.Time // backend error: do not re-issue the lookup before this
 
-	// folds is schema's field names keyed by their ASCII-lowered form, built
-	// for foldsFor (KnownColumnFolds, #1342).
-	folds    map[string]string
+	// folds is schema's field names keyed by their ASCII-lowered form
+	// (KnownColumnFolds, #1342), republished by publishFolds whenever schema
+	// changes, so ingest reads it without the entry's lock: a lookup that
+	// waited for, or gave up on, a busy entry would cost or skip the check.
+	folds    atomic.Pointer[map[string]string]
 	foldsFor *arrow.Schema
 	// dirty: the stored anchor holds fields Clean drops (#1342); the next
 	// publish rewrites it even when nothing else changed.
@@ -246,6 +249,7 @@ func (r *Registry) loadStored(ctx context.Context, e *entry) error {
 		e.loadedAt = r.now()
 		e.absent = true
 		e.schema = nil
+		e.publishFolds()
 		return nil
 	}
 	data, err := r.backend.Read(ctx, k)
@@ -262,6 +266,7 @@ func (r *Registry) loadStored(ctx context.Context, e *entry) error {
 		r.logger.Warn().Err(err).Str("anchor", k).Msg("Stored field schema anchor cannot be decoded; ignoring it")
 		e.absent = true
 		e.schema = nil
+		e.publishFolds()
 		return nil
 	}
 	e.absent = false
@@ -279,6 +284,7 @@ func (r *Registry) loadStored(ctx context.Context, e *entry) error {
 	merged, _, conflicts := Merge(stored, e.schema)
 	r.logConflicts(e, conflicts)
 	e.schema = merged
+	e.publishFolds()
 	return nil
 }
 
@@ -432,6 +438,7 @@ func (r *Registry) publishLocked(ctx context.Context, e *entry, incoming *arrow.
 	e.schema = nil
 	if err := r.loadStored(ctx, e); err != nil {
 		e.schema = cached
+		e.publishFolds()
 		e.pending, _, _ = Merge(e.pending, incoming)
 		r.logger.Warn().Err(err).Msg("Field schema anchor unavailable; will retry on the next flush")
 		return err
@@ -446,6 +453,7 @@ func (r *Registry) publishLocked(ctx context.Context, e *entry, incoming *arrow.
 	merged, _, c2 := Merge(base, incoming)
 	r.logConflicts(e, append(c1, c2...))
 	e.schema = merged
+	e.publishFolds()
 	e.verifiedAt = r.now()
 	complete := e.complete
 	switch {
@@ -624,28 +632,37 @@ func (r *Registry) KnownColumnFolds(database, measurement string) map[string]str
 	if !r.Enabled() {
 		return nil
 	}
-	r.mu.Lock()
+	r.mu.RLock()
 	e := r.entries[key(database, measurement)]
-	r.mu.Unlock()
-	if e == nil || !e.mu.TryLock() {
+	r.mu.RUnlock()
+	if e == nil {
 		return nil
 	}
-	defer e.mu.Unlock()
+	if f := e.folds.Load(); f != nil {
+		return *f
+	}
+	return nil
+}
+
+// publishFolds republishes e.folds for e.schema. Caller holds e.mu.
+func (e *entry) publishFolds() {
+	if e.foldsFor == e.schema {
+		return
+	}
+	e.foldsFor = e.schema
 	if e.schema == nil {
-		return nil
+		e.folds.Store(nil)
+		return
 	}
-	if e.foldsFor != e.schema {
-		folds := make(map[string]string, e.schema.NumFields())
-		for _, f := range e.schema.Fields() {
-			// An anchor from before #1342 can hold two spellings; the one
-			// listed first is the measurement's.
-			if k := asciiLower(f.Name); folds[k] == "" {
-				folds[k] = f.Name
-			}
+	folds := make(map[string]string, e.schema.NumFields())
+	for _, f := range e.schema.Fields() {
+		// An anchor from before #1342 can hold two spellings; the one listed
+		// first is the measurement's.
+		if k := asciiLower(f.Name); folds[k] == "" {
+			folds[k] = f.Name
 		}
-		e.folds, e.foldsFor = folds, e.schema
 	}
-	return e.folds
+	e.folds.Store(&folds)
 }
 
 // asciiLower lower-cases ASCII letters only, as DuckDB folds identifiers.
@@ -694,6 +711,7 @@ func (r *Registry) DeleteDatabase(ctx context.Context, database string) error {
 			os.Remove(e.localPath)
 		}
 		e.schema = nil
+		e.publishFolds()
 		e.mu.Unlock()
 	}
 	return errs
