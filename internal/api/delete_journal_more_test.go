@@ -119,3 +119,37 @@ func TestClusterLoneJournaledFileIsLeftOut(t *testing.T) {
 		t.Fatalf("lone journaled file not left out: %v", left)
 	}
 }
+
+// The drainer reads each record again under the lock: one a restore (or a
+// DELETE) cleared since the listing is not acted on.
+func TestDrainerRereadsTheRecordUnderTheLock(t *testing.T) {
+	r := newLeftoverRig(t)
+	a := leftoverHour + "cpu_20261007_204851_000000001.parquet"
+	b := leftoverHour + "cpu_20261007_204851_000000002.parquet"
+	r.parquet(a, "h1")
+	r.parquet(b, "h1")
+	ctx := context.Background()
+	for _, p := range []string{a, b} {
+		if err := r.h.journalRetired(ctx, p, p+".x"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prev := deleteReplaced
+	t.Cleanup(func() { deleteReplaced = prev })
+	deleteReplaced = func(ctx context.Context, bk storage.Backend, path string) error {
+		// Whichever is drained first, the other's record is cleared
+		// meanwhile (a restore putting it back as data).
+		for _, other := range []string{a, b} {
+			if other != path {
+				_ = bk.Delete(ctx, retiredKey(other))
+			}
+		}
+		return prev(ctx, bk, path)
+	}
+	if n := r.h.DrainRetired(ctx); n != 1 {
+		t.Fatalf("drained %d, want 1", n)
+	}
+	if r.exists(a) == r.exists(b) {
+		t.Fatalf("a %v b %v: exactly one should remain (the one whose record was cleared)", r.exists(a), r.exists(b))
+	}
+}
