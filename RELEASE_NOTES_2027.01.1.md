@@ -1373,6 +1373,36 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Queries no longer count a compaction's rows twice
+
+Compaction writes its output into the partition and then deletes the files
+it merged. A query that ran in between read both, so it counted every row of
+that compaction twice. This happened with default settings, including OSS
+standalone, on JSON, Arrow and msgpack queries.
+- **How long:** normally milliseconds to seconds (longer on S3 with many
+  inputs). If deleting an input failed, it lasted until the next compaction
+  cycle recovered the job, up to an hour, or until the first cycle after a
+  restart.
+- **Permanent through continuous queries:** a continuous query that ran
+  inside the window wrote the doubled aggregate back to storage.
+
+**The fix:**
+- Arc now tracks each compaction whose output and inputs can both be in
+  storage. It does so from before the output is written until its inputs are
+  known to be gone. After a restart, the jobs are rebuilt from the
+  compaction's recovery manifests before any query is served.
+- Queries, continuous queries and the arcx engine read exactly one side of
+  each such job. Before the output exists they read the inputs; once it
+  exists, they read the output.
+- Outside those windows nothing changes.
+
+**Limitations:**
+- With shared storage (several nodes, one bucket), only the node running the
+  compaction knows about it. Queries on other nodes can still see the window.
+  A follow-up release covers them.
+- A query planned just before a compaction started and executed after its
+  output appeared can still see the window once.
+
 ### A cached query no longer misses an hour its relative end has just reached
 
 Arc caches a query's pruned plan for up to 60 seconds, keyed by the current
