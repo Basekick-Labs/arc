@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -60,9 +61,9 @@ func TestFlushCountsAndRateLimitsFutureStamps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var logs bytes.Buffer
+	logs := &lockedBuffer{}
 	b := NewArrowBuffer(&config.IngestConfig{MaxBufferSize: 100000, MaxBufferAgeMS: 600000, Compression: "snappy",
-		FlushWorkers: 1, FlushQueueSize: 4, ShardCount: 1, DataPageVersion: "2.0"}, backend, zerolog.New(&logs))
+		FlushWorkers: 1, FlushQueueSize: 4, ShardCount: 1, DataPageVersion: "2.0"}, backend, zerolog.New(logs))
 	defer b.Close()
 	b.SetFutureStampMargin(time.Second)
 	ahead := now.Add(10 * time.Minute)
@@ -95,4 +96,22 @@ func TestFlushCountsAndRateLimitsFutureStamps(t *testing.T) {
 	if n := strings.Count(out, "Rows stamped more than query.file_time_pruning_margin_seconds"); n != 1 {
 		t.Errorf("margin warning logged %d times over two flushes, want 1", n)
 	}
+}
+
+// lockedBuffer is a log sink the flush workers write while the test reads.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
 }
