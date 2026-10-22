@@ -1471,10 +1471,6 @@ func wrapOpenCompactions(ctx context.Context, oc OpenCompactions, backend storag
 	if len(keys) == 0 {
 		return expr
 	}
-	i := strings.Index(expr, "read_parquet(")
-	if i < 0 || !strings.HasSuffix(expr, ")") {
-		return expr
-	}
 	quoted := make([]string, 0, len(keys))
 	for _, k := range keys {
 		uri, err := storage.ObjectURI(backend, k)
@@ -1483,13 +1479,11 @@ func wrapOpenCompactions(ctx context.Context, oc OpenCompactions, backend storag
 		}
 		quoted = append(quoted, sqlutil.QuoteStringLiteral(uri))
 	}
-	if len(quoted) == 0 {
-		return expr
+	wrapped := sqlutil.ExcludeFiles(expr, openCompactionFileColumn, quoted)
+	if wrapped != expr {
+		pruning.MarkVolatile(ctx)
 	}
-	pruning.MarkVolatile(ctx)
-	return expr[:i] + "(SELECT * EXCLUDE (" + openCompactionFileColumn + ") FROM " +
-		expr[i:len(expr)-1] + ", filename='" + openCompactionFileColumn + "') WHERE " +
-		openCompactionFileColumn + " NOT IN (" + strings.Join(quoted, ", ") + "))"
+	return wrapped
 }
 
 // SetFileTimePruning enables file-level time pruning on the partition pruner
