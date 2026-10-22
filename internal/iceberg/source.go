@@ -40,7 +40,10 @@ type StorageWalkSource struct {
 	// pendingOutputs, when set, names compaction outputs whose sources still
 	// exist; they are excluded from the file set (#638).
 	pendingOutputs func(ctx context.Context, prefix string) (map[string]struct{}, error)
-	logger         zerolog.Logger
+	// deletedHere, when set, reports a listed file the cluster has deleted
+	// while this node's copy is still on disk; it is excluded too.
+	deletedHere func(path string) bool
+	logger      zerolog.Logger
 
 	// namespaceExpander, when set, returns the top-level directories that are
 	// edge-sync spoke namespaces rather than databases (#634). A hub stores
@@ -59,6 +62,21 @@ type StorageWalkSource struct {
 // raws it replaces (#638). nil means no compaction state to consult.
 func (s *StorageWalkSource) SetPendingOutputs(fn func(ctx context.Context, prefix string) (map[string]struct{}, error)) {
 	s.pendingOutputs = fn
+}
+
+// SetDeletedHere installs the cluster's view of local copies it has deleted
+// (cluster.Coordinator.LocalCopyDeleted). On a local-storage cluster a delete
+// reaches this node's disk after the manifest: a staged compaction moves its
+// output into place before the inputs are unlinked (#1207), a DELETE rewrite's
+// new path is pulled before the old one is unlinked, and an unlink can fail or
+// be lost to a crash until the stale-local sweep removes the copy. Without
+// this, a pass in between publishes the deleted file next to the one holding
+// its rows, and external readers see them twice. The check runs per key after
+// the listing, the #638 ordering: an output in the listing was moved into
+// place after this node applied its commit, so its inputs already read as
+// deleted. nil (standalone, or no tracking) excludes nothing.
+func (s *StorageWalkSource) SetDeletedHere(fn func(path string) bool) {
+	s.deletedHere = fn
 }
 
 // SetNamespaceExpander installs edge-sync spoke-namespace expansion (#634).
@@ -281,13 +299,17 @@ func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([
 	}
 	var files []FileRef
 	var local []string
-	excluded := 0
+	excluded, deleted := 0, 0
 	for _, p := range paths {
 		if !isDataFile(p) {
 			continue
 		}
 		if _, skip := pending[filepath.ToSlash(p)]; skip {
 			excluded++
+			continue
+		}
+		if s.deletedHere != nil && s.deletedHere(filepath.ToSlash(p)) {
+			deleted++
 			continue
 		}
 		uri, err := s.resolver.Resolve(p)
@@ -319,13 +341,18 @@ func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([
 		s.logger.Debug().Str("database", m.Database).Str("measurement", m.Measurement).Int("excluded", excluded).
 			Msg("Iceberg reconcile: compaction outputs still replacing their sources are left out of this pass")
 	}
+	if deleted > 0 {
+		s.logger.Debug().Str("database", m.Database).Str("measurement", m.Measurement).Int("deleted", deleted).
+			Msg("Iceberg reconcile: files the cluster deleted, still on this node's disk, are left out of this pass")
+	}
 	return files, local, nil
 }
 
 // statSize returns the file's current byte size, which the reconciler needs
-// because a file rewritten in place keeps its path (#633): the delete API's
-// partial-match branch renames a smaller file over the original, and only the
-// size tells that content apart from what the Iceberg manifest describes.
+// for a file rewritten at its own path (#633). Since #1073 the delete API's
+// partial-match branch publishes a fresh path instead, but restores, imports
+// and edge-sync still write a known path, and only the size tells that
+// content apart from what the Iceberg manifest describes.
 // present=false means the file is gone. Local files are stat'ed directly; any
 // other backend answers through StatFile (Iceberg export is local-only, so
 // that branch only serves wrapped backends in tests).

@@ -322,6 +322,36 @@ func (c *Coordinator) noteLocalRegistered(path string) {
 	}
 }
 
+// LocalCopyDeleted reports a file this node saw registered that the cluster
+// manifest no longer lists: a local copy waiting for its unlink, or one whose
+// unlink failed or was lost to a crash. Its rows are gone or live in another
+// file (a staged compaction's output, a DELETE rewrite's new path), so an
+// export must not publish it next to them. False where tracking does not run,
+// before the journal is open, for a path never seen, and while this node has
+// not yet applied the path's registration (its absence then says nothing).
+func (c *Coordinator) LocalCopyDeleted(path string) bool {
+	seen := c.stale.seen.Load()
+	if seen == nil || seen.err() != nil || c.raftNode == nil {
+		return false
+	}
+	r, ok := seen.get(path)
+	if !ok {
+		return false
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil || r.lsn > fsm.AppliedDone() {
+		return false
+	}
+	return !fsm.HasFile(path)
+}
+
+// TracksLocalCopies reports whether this node keeps the journal
+// LocalCopyDeleted reads: local storage with replication and its catch-up
+// walk on, and a Raft data directory.
+func (c *Coordinator) TracksLocalCopies() bool {
+	return c.staleLocalEnabled()
+}
+
 // forgetLocal drops path from the set (its copy was removed).
 func (c *Coordinator) forgetLocal(path string) {
 	if seen := c.stale.seen.Load(); seen != nil {
