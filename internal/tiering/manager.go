@@ -1043,6 +1043,32 @@ func appendColdTierMetadataBatch(batch []FileMetadata, file FileMetadata) ([]Fil
 	return batch, len(batch) >= coldTierMetadataBatchSize
 }
 
+const coldTierManifestRecoveryTimeout = 30 * time.Second
+
+// loadColdRowsForManifest preserves the rows already committed when a scan is
+// cancelled during the final metadata read. The caller still receives the
+// cancellation error, but can pass the persisted rows to the manifest sweep.
+func (m *Manager) loadColdRowsForManifest(ctx context.Context) ([]FileMetadata, error) {
+	rows, err := m.metadata.GetFilesInTier(ctx, TierCold)
+	if err == nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return rows, ctxErr
+		}
+		return rows, err
+	}
+	if ctx.Err() == nil {
+		return nil, err
+	}
+
+	recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), coldTierManifestRecoveryTimeout)
+	defer cancel()
+	rows, loadErr := m.metadata.GetFilesInTier(recoveryCtx, TierCold)
+	if loadErr != nil {
+		return nil, errors.Join(err, fmt.Errorf("failed to reload cold tier rows after cancellation: %w", loadErr))
+	}
+	return rows, ctx.Err()
+}
+
 // syncColdTierMetadata makes this node's metadata reflect what is in cold
 // storage. In a gated cluster — shared storage, or per-node storage with
 // file replication — only the primary writer migrates, but the query layer
@@ -1090,8 +1116,8 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 		objects = nil
 		cleaned = nil
 		unseen = nil
-		rows, rowsErr := m.metadata.GetFilesInTier(context.WithoutCancel(ctx), TierCold)
-		if rowsErr != nil {
+		rows, rowsErr := m.loadColdRowsForManifest(ctx)
+		if rowsErr != nil && !errors.Is(syncErr, rowsErr) {
 			return synced, nil, errors.Join(syncErr, fmt.Errorf("failed to load cold tier rows for manifest: %w", rowsErr))
 		}
 		return synced, rows, syncErr
@@ -1223,8 +1249,11 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 	objectCount := len(objects)
 	objects = nil
 	cleaned = nil
-	coldRows, err := m.metadata.GetFilesInTier(ctx, TierCold)
+	coldRows, err := m.loadColdRowsForManifest(ctx)
 	if err != nil {
+		if ctx.Err() != nil {
+			return synced, coldRows, err
+		}
 		return synced, nil, fmt.Errorf("failed to load cold tier rows for manifest: %w", err)
 	}
 

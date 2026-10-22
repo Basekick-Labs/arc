@@ -270,6 +270,16 @@ func TestSyncColdTierMetadataCancellationInvalidatesCommittedAndFallbackWrites(t
 	if len(result.rows) == 0 {
 		t.Fatal("cancelled sync returned no rows for the manifest sweep")
 	}
+	foundFallbackRow := false
+	for _, row := range result.rows {
+		if row.Path == firstFallbackPath {
+			foundFallbackRow = true
+			break
+		}
+	}
+	if !foundFallbackRow {
+		t.Fatalf("cancelled sync manifest rows do not include committed fallback row %q", firstFallbackPath)
+	}
 	if row, err := m.metadata.GetFile(context.Background(), firstFallbackPath); err != nil || row == nil || row.Tier != TierCold {
 		t.Fatalf("first fallback row = (%+v, %v), want a persisted cold row", row, err)
 	}
@@ -282,5 +292,40 @@ func TestSyncColdTierMetadataCancellationInvalidatesCommittedAndFallbackWrites(t
 	m.metadata.tierCacheMu.RUnlock()
 	if got := after - before; got != 2 {
 		t.Errorf("tier cache generation advanced %d times for 2 touched scopes before cancellation; want one invalidation per scope", got)
+	}
+}
+
+func TestLoadColdRowsForManifestAfterCancellation(t *testing.T) {
+	m, _, _, cleanup := setupIntegrationTest(t, true)
+	defer cleanup()
+
+	file := FileMetadata{
+		Path:          "db1/cpu/2024/03/15/cpu_manifest_daily.parquet",
+		Database:      "db1",
+		Measurement:   "cpu",
+		PartitionTime: time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC),
+		Tier:          TierCold,
+	}
+	wrote, err := m.metadata.recordColdFile(context.Background(), &file, time.Time{})
+	if err != nil || !wrote {
+		t.Fatalf("record cold row = (%t, %v), want a persisted row", wrote, err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// The ordinary read cannot return rows with a cancelled context. The
+	// manifest loader must preserve the rows committed before cancellation.
+	cancelledRows, cancelledErr := m.metadata.GetFilesInTier(ctx, TierCold)
+	if !errors.Is(cancelledErr, context.Canceled) || len(cancelledRows) != 0 {
+		t.Fatalf("GetFilesInTier with cancelled context = (%d rows, %v), want (0 rows, context.Canceled)", len(cancelledRows), cancelledErr)
+	}
+
+	rows, err := m.loadColdRowsForManifest(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("loadColdRowsForManifest error = %v, want context.Canceled", err)
+	}
+	if len(rows) != 1 || rows[0].Path != file.Path {
+		t.Fatalf("loadColdRowsForManifest rows = %+v, want the persisted row %q", rows, file.Path)
 	}
 }
