@@ -888,7 +888,7 @@ type ScanResult struct {
 	FilesRegistered int `json:"files_registered"`
 	FilesSkipped    int `json:"files_skipped"`
 	Errors          int `json:"errors"`
-	// ColdSynced counts rows the cold-tier sync added or flipped to cold.
+	// ColdSynced counts cold-tier metadata changes and redundant cold objects removed.
 	// Always zero without a usable cold tier (see ScanTiers).
 	ColdSynced int `json:"cold_synced"`
 	// ColdSyncFailed is set when the cold tier could not be listed; the
@@ -1113,29 +1113,17 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, []FileMetadata
 			unparseable++
 			continue
 		}
-		// Keep hot-only rows hot. Failed migration artifacts are handled in a
-		// separate primary-only pass so readers never delete shared objects.
+		// A cold object for a hot-only database is queryable only when its
+		// hot copy is absent. Preserve the current behavior for unregistered
+		// objects too: cold sync runs before the hot scan, so this row may not
+		// exist yet even when the hot copy is present.
 		if m.IsHotOnly(ctx, info.Database) {
-			existing, getErr := m.metadata.GetFile(ctx, obj.Path)
-			if getErr != nil {
-				m.logger.Warn().Err(getErr).Str("path", obj.Path).Msg("Could not inspect hot-only cold object; preserving it")
-				delete(unseen, obj.Path)
-				continue
-			}
-			if existing != nil && existing.Tier == TierHot {
-				hotExists, existsErr := m.hotBackend.Exists(ctx, obj.Path)
+			if present, existsErr := m.hotBackend.Exists(ctx, obj.Path); existsErr != nil || present {
 				if existsErr != nil {
 					m.logger.Warn().Err(existsErr).Str("path", obj.Path).Msg("Could not verify local hot copy for a hot-only cold object; preserving it")
-					delete(unseen, obj.Path)
-					continue
 				}
-				if hotExists {
-					delete(unseen, obj.Path)
-					continue
-				}
-				// A reader can have a hot metadata row before its replicated
-				// hot file arrives. Record the cold copy so queries still see it;
-				// the missing-object pass promotes the row once the hot copy lands.
+				delete(unseen, obj.Path)
+				continue
 			}
 		}
 		file := &FileMetadata{
@@ -1274,6 +1262,8 @@ func (m *Manager) cleanupHotOnlyColdCopies(ctx context.Context, objects []storag
 		if !hotExists || !m.IsHotOnly(ctx, info.Database) || m.roleGated() || m.heldByCompaction(file.Path) {
 			continue
 		}
+		// runCycle holds cycleRunning across this pass, so migration cannot
+		// change the hot metadata row between this check and the cold delete.
 		if err := m.coldBackend.Delete(ctx, object.Path); err != nil {
 			m.logger.Warn().Err(err).Str("path", object.Path).Msg("Could not remove redundant hot-only cold object; retrying next cycle")
 			continue
