@@ -1433,6 +1433,41 @@ an unbounded operation.
 
 ## Bug fixes
 
+### A manifest walk no longer stalls Raft applies during heavy ingest ([#1341](https://github.com/Basekick-Labs/arc/issues/1341))
+
+**Enterprise clusters with file replication.** The periodic manifest walk
+(`cluster.replication_reconciliation_interval_seconds`, default 5 minutes),
+the startup catch-up and the paginated `GET /api/v1/cluster/files` read the
+manifest in 1,000-entry pages over a sorted list of every file path. Two things
+made that expensive under ingest:
+
+- The sorted list was rebuilt whenever any file was registered, updated or
+  deleted, so a walk re-sorted it on nearly every page.
+- Each rebuild ran under the Raft FSM's write lock: about 260 ms at 1.07M files,
+  on each of roughly 1,070 pages.
+
+Every Raft apply waited behind it: file registrations, compaction commits,
+deletes, token and RBAC changes. Under sustained heavy ingest the walk held
+that lock for minutes at a time. On 26.09.x, registrations failed outright
+in those windows, and their files were never replicated. On main the outbox
+retried them, but ingest registration and compaction commits still stalled,
+and compaction batches logged `raft: manifest apply failed`.
+
+The walk now never takes the write lock:
+
+- It copies the paths under the read lock: about 9 ms at 1.07M files.
+- It sorts them with no lock held.
+- It does this once per walk, and only when files were added or removed since
+  the last sort. A content update of an existing file triggers no re-sort.
+- In the measurement, an apply arriving mid-sort waited under a microsecond.
+
+Files registered during a walk are listed by the next walk. Replication picks
+them up from the registration as before. Files a Raft snapshot install brings
+in are still listed by the walk in progress.
+
+The workaround of raising `replication_reconciliation_interval_seconds` during
+heavy loads is no longer needed.
+
 ### Queries no longer count a compaction's rows twice
 
 Compaction writes its output into the partition and then deletes the files
