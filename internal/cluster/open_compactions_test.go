@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster/raft"
+	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/rs/zerolog"
 )
 
 // Reads count a staged compaction's rows once (open_compactions.go).
@@ -245,22 +247,48 @@ func TestOpenForgetsLocalDeletes(t *testing.T) {
 	}
 }
 
-// The unlink path wires it: the FSM delete callback records the delete.
+// Through the production wiring (startFilePullerLocked's delete callback and
+// the delete workers): a manifest delete is left out of reads at once, and
+// forgotten when the worker unlinks the copy.
 func TestOpenDeleteCallbackRecordsAndWorkerForgets(t *testing.T) {
-	r := staleRig(t)
+	origin := startHangingOrigin(t)
+	root := t.TempDir()
+	b, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	c := newManifestDeleteRigWithBackend(t, origin.addr(), b, zerolog.Nop())
 	ctx := context.Background()
 	key := staleHour + "cb.parquet"
-	r.register(key, "rows")
-	r.c.noteLocalDeleted(key, "retention:3")
-	if got := r.c.OpenExcludedFor(ctx, openPrefix); !sameSet(got, []string{key}) {
-		t.Fatalf("excluded %v", got)
+	full := filepath.Join(root, key)
+	if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+		t.Fatal(err)
 	}
-	r.c.unlinkOne(deleteRequest{path: key, reason: "retention:3"}, nil)
-	if r.exists(key) {
-		t.Fatal("not unlinked")
+	if err := os.WriteFile(full, []byte("rows"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	if r.c.OpenAny(openPrefix) {
-		t.Fatal("the unlink did not forget the delete")
+	e := raft.FileEntry{Path: key, SHA256: strings.Repeat("a", 64), SizeBytes: 4, Database: "testdb",
+		Measurement: "cpu", OriginNodeID: manifestDeleteOrigin, Tier: "hot", CreatedAt: time.Now()}
+	if err := c.raftNode.RegisterFile(e, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.raftNode.DeleteFile(key, "retention:3", 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	// The callback ran inside the apply; the worker waits deleteGrace.
+	if got := c.OpenExcludedFor(ctx, openPrefix); !sameSet(got, []string{key}) {
+		t.Fatalf("right after the delete applied: excluded %v", got)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for c.OpenAny(openPrefix) && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if c.OpenAny(openPrefix) {
+		t.Fatal("the worker's unlink did not forget the delete")
+	}
+	if _, err := os.Stat(full); !os.IsNotExist(err) {
+		t.Fatalf("not unlinked: %v", err)
 	}
 }
 
