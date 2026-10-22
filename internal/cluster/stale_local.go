@@ -300,6 +300,8 @@ func (c *Coordinator) staleLocalRun(ctx context.Context) {
 		return
 	}
 	s.seen.Store(seen)
+	// Unlinks of DELETE rewrites' old files a previous run deferred.
+	c.rederiveRewriteUnlinks(seen)
 	s.markOpened()
 	t := time.NewTicker(s.every)
 	defer t.Stop()
@@ -353,7 +355,9 @@ func (c *Coordinator) LocalCopyDeleted(path string) bool {
 		return false
 	}
 	fsm := c.raftNode.FSM()
-	if fsm == nil || r.lsn > fsm.AppliedDone() || fsm.HasFile(path) {
+	// A copy whose unlink waits for its rewrite is still this node's only
+	// copy of the rows (rewrite_unlink.go).
+	if fsm == nil || r.lsn > fsm.AppliedDone() || fsm.HasFile(path) || c.unlinkDeferred(path) {
 		return false
 	}
 	// The sweep's own rule: only the file seen registered, never another one
@@ -709,7 +713,7 @@ func (c *Coordinator) staleCandidates(ctx context.Context, seen *seenLocal, now 
 			delete(s.firstUnlisted, p)
 			continue
 		}
-		if r.lsn > applied || (pending != nil && pending(p)) || c.CompactionOwns(p) ||
+		if r.lsn > applied || (pending != nil && pending(p)) || c.CompactionOwns(p) || c.unlinkDeferred(p) ||
 			(cold != nil && cold(ctx, p)) {
 			delete(s.firstUnlisted, p)
 			continue
@@ -758,7 +762,7 @@ func (c *Coordinator) unlinkStale(ctx context.Context, path string) bool {
 			s.endUnlink(path)
 		}
 	}()
-	if c.raftNode.FSM().HasFile(path) || c.CompactionOwns(path) {
+	if c.raftNode.FSM().HasFile(path) || c.CompactionOwns(path) || c.unlinkDeferred(path) {
 		return false
 	}
 	if fn := s.pending.Load(); fn != nil && (*fn)(path) {

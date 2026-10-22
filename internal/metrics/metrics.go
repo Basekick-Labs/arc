@@ -305,6 +305,11 @@ type Metrics struct {
 	// period of every burst; a value that keeps climbing means the delete
 	// workers cannot keep up with retention or a compaction backlog.
 	clusterLocalDeletePending atomic.Int64
+	// clusterLocalDeleteDeferred is the number of local unlinks of a file a
+	// row DELETE rewrote that wait for the rewrite to arrive on this node
+	// (normal while pulls are slow; a value that never falls means the
+	// rewrites are not arriving).
+	clusterLocalDeleteDeferred atomic.Int64
 
 	// compactionManifestsParkedUnparseableTotal counts crash-recovery
 	// manifests recovery parked because their body did not decode (#926): a
@@ -1006,6 +1011,10 @@ func (m *Metrics) SetStaleLocalTrackingFailed(n int64) { m.staleLocalTrackingFai
 // waiting for a local unlink on this node.
 func (m *Metrics) SetClusterLocalDeletePending(n int64) { m.clusterLocalDeletePending.Store(n) }
 
+// SetClusterLocalDeleteDeferred publishes how many local unlinks wait for a
+// DELETE rewrite to arrive on this node.
+func (m *Metrics) SetClusterLocalDeleteDeferred(n int64) { m.clusterLocalDeleteDeferred.Store(n) }
+
 // IncCompactionManifestParkedUnparseable records one crash-recovery manifest
 // parked because its body could not be decoded (#926). Call it after the
 // park succeeded; a park that fails transiently is retried next cycle and
@@ -1315,6 +1324,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"stale_local_tracking_failed":             m.staleLocalTrackingFail.Load(),
 		// Cluster local delete workers (per-node storage with replication)
 		"cluster_local_delete_pending":                  m.clusterLocalDeletePending.Load(),
+		"cluster_local_delete_deferred":                 m.clusterLocalDeleteDeferred.Load(),
 		"compaction_manifests_parked_unparseable_total": m.compactionManifestsParkedUnparseableTotal.Load(),
 		"storage_unaddressable_files":                   m.storageUnaddressableFiles.Load(),
 		"backup_skipped_files":                          m.backupSkippedFiles.Load(),
@@ -1985,6 +1995,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_cluster_local_delete_pending Manifest deletes this per-node-storage cluster node has been told about and has not yet unlinked locally. Returns to zero within a grace period of every burst; a value that keeps climbing means the delete workers cannot keep up with retention or a compaction backlog.\n"...)
 	b = append(b, "# TYPE arc_cluster_local_delete_pending gauge\n"...)
 	b = appendMetric(b, "arc_cluster_local_delete_pending", float64(m.clusterLocalDeletePending.Load()))
+
+	b = append(b, "# HELP arc_cluster_local_delete_deferred Local unlinks of files a row DELETE rewrote that wait for the rewrite to arrive on this node, so reads here never miss its rows. Rises while pulls are slow and returns to zero as they land; a value that never falls means the rewrites are not arriving.\n"...)
+	b = append(b, "# TYPE arc_cluster_local_delete_deferred gauge\n"...)
+	b = appendMetric(b, "arc_cluster_local_delete_deferred", float64(m.clusterLocalDeleteDeferred.Load()))
 
 	b = append(b, "# HELP arc_compaction_manifests_parked_unparseable_total Total compaction crash-recovery manifests parked under the .quarantined suffix because their body could not be decoded. Growth means a manifest stopped blocking compaction without being completed; the parked file name gives the tier, database and job, and that partition should be checked for a zero-length _compacted output or for duplicate rows.\n"...)
 	b = append(b, "# TYPE arc_compaction_manifests_parked_unparseable_total counter\n"...)

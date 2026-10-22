@@ -329,6 +329,11 @@ func (c *Coordinator) localExcluded(ctx context.Context, fsm *raft.ClusterFSM, p
 // cache: a listing cached before the member landed would have path without
 // it.
 func (c *Coordinator) rewriteSiblingReadable(ctx context.Context, fsm *raft.ClusterFSM, path string, d localDelete) (localDelete, bool) {
+	// Its unlink waits for the rewrite, which is not here (rewrite_unlink.go):
+	// read it, and stat nothing.
+	if c.unlinkDeferred(path) {
+		return d, false
+	}
 	sibs := fsm.RewriteSiblings(path)
 	if d.sibling != "" {
 		for _, e := range sibs {

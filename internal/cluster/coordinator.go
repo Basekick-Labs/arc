@@ -223,8 +223,13 @@ type Coordinator struct {
 	deletePending   []deleteRequest
 	deletePendingMu sync.Mutex
 	deleteInFlight  atomic.Int64
-	deleteWake      chan struct{}
-	deleteStop      chan struct{}
+	// deferred: unlinks of a DELETE rewrite's old file waiting for the
+	// rewrite to arrive (rewrite_unlink.go), under deletePendingMu.
+	deferred deferredUnlinks
+	// deleteStopping: the workers are draining; nothing is deferred.
+	deleteStopping atomic.Bool
+	deleteWake     chan struct{}
+	deleteStop     chan struct{}
 	// deleteWg is per Start: Stop's wait is bounded, and a WaitGroup that a
 	// later Start reused while that wait was still parked would panic.
 	deleteWg *sync.WaitGroup
@@ -1145,6 +1150,12 @@ func (c *Coordinator) startDeleteWorkers() {
 	c.deletePendingMu.Unlock()
 	c.deleteStop = stop
 	c.deleteWg = wg
+	c.deleteStopping.Store(false)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c.sweepDeferredUnlinks(stop)
+	}()
 	for i := 0; i < deleteWorkerCount; i++ {
 		wg.Add(1)
 		go c.runDeleteWorker(stop, wake, wg, relisted)
@@ -1158,6 +1169,9 @@ func (c *Coordinator) startDeleteWorkers() {
 // when the disk itself is not answering. The waiting goroutine and the
 // stuck worker outlive the return until that Delete comes back.
 func (c *Coordinator) stopDeleteWorkers(stop chan struct{}, wg *sync.WaitGroup) {
+	// The drain unlinks what is pending and defers nothing; deferred copies
+	// stay on disk and the next start re-derives them (rewrite_unlink.go).
+	c.deleteStopping.Store(true)
 	close(stop)
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()
@@ -1250,6 +1264,8 @@ func (c *Coordinator) tierRecorderSnapshot() TierRecorder {
 // tiering, so this return value is what distinguishes the two.
 func (c *Coordinator) recordPulledFileInTiering(path string, sizeBytes int64) bool {
 	c.noteLocalRegistered(path)
+	// A DELETE rewrite landing lets its old file's unlink go ahead.
+	c.wakeDeferredFamily(path)
 	r := c.tierRecorderSnapshot()
 	if r == nil {
 		return false
@@ -1330,6 +1346,11 @@ func (c *Coordinator) unlinkOne(item deleteRequest, relisted func(string) (bool,
 			c.logKeptRelistedPath(item, refresh)
 			return
 		}
+	}
+	// A DELETE rewrite's old file stays until its rewrite is here, or this
+	// node would read neither (rewrite_unlink.go).
+	if c.deferRewriteUnlink(context.Background(), item) {
+		return
 	}
 	// A compaction input stays readable until this node's staged copy of
 	// the output is in place (#1207 d2a2a; bounded).
@@ -4434,11 +4455,13 @@ func (c *Coordinator) startFilePullerLocked() error {
 		puller.Enqueue(entry)
 		c.noteLocalRegistered(entry.Path)
 		c.forgetLocalDeleted(entry.Path)
+		c.dropDeferred(entry.Path)
 	}
 	onContentChanged := func(entry *raft.FileEntry) {
 		puller.EnqueueContentChanged(entry)
 		c.noteLocalRegistered(entry.Path)
 		c.forgetLocalDeleted(entry.Path)
+		c.dropDeferred(entry.Path)
 	}
 	onDelete := func(path string, reason string) {
 		// Phase 4: the callback runs synchronously from applyDeleteFile on
