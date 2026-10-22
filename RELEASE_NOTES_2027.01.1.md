@@ -1392,11 +1392,15 @@ and off by default.
   second could be left out of a query that started earlier in the same
   second. Name times are now read to the nanosecond.
 - **`query.file_time_pruning_margin_seconds` has a minimum of 1 second.**
-  A lower value is raised to 1, with a warning.
+  A value of 0 or less is raised to 1, with a warning.
 - **A live-hour plan is no longer cached when file pruning declines to act.**
   This covers the cases where every file is in range or too many are kept.
   Before, such a plan stayed cached for 60 seconds and the next queries
-  skipped the pruning.
+  skipped the pruning. With the feature on, every query whose range starts
+  in the current hour now lists that hour's directory, which takes a few
+  milliseconds. When more than 1000 files are in range, the query lists them
+  and then reads the whole hour anyway. The `cap_fallback` counter shows how
+  often that happens.
 - **New counters** on `/metrics` (and in the JSON snapshot) show what the
   feature does on a given workload:
   - `arc_query_file_time_pruning_passes_total`
@@ -1411,10 +1415,11 @@ and off by default.
   feature is on. It counts rows stamped more than the margin after their
   flush and still in the flush's hour. These are the only rows file pruning
   can hide, until their hour closes. A warning names the measurement, at
-  most once a minute.
+  most once a minute per measurement.
 - **The "more than 1 hour in future" ingest warning now checks a batch's
   latest timestamp, not its earliest.** It is also logged even when the same
-  batch holds data more than 7 days old.
+  batch holds data more than 7 days old, and at most once a minute per
+  measurement.
 
 To turn the feature off, set `query.file_time_pruning = false` and restart.
 
