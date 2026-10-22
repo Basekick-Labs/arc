@@ -107,6 +107,12 @@ func IsStartOnlyTimeRange(sqlStr string) bool {
 // clause is a conjunction of bare, parseable bounds on the column named time,
 // and which kinds of bound it has.
 func bareTimeBounds(sqlStr string) (hasStart, hasEnd, ok bool) {
+	// The scanner first: it strips comments and ends the WHERE at QUALIFY or
+	// HAVING, which the shape regexes below do not, so a commented-out or
+	// QUALIFY bound read as the query's range here.
+	if sb, sok := scanTimeBounds(sqlStr); !sok || !sb.exact {
+		return false, false, false
+	}
 	masked, masks := sql.MaskStringLiterals(sqlStr, sql.HasQuotes(sqlStr))
 	lower := strings.ToLower(masked)
 	if len(fromWordPattern.FindAllStringIndex(lower, -1)) != 1 || shapeWordPattern.MatchString(lower) {

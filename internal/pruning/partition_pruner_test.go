@@ -114,7 +114,9 @@ func TestExtractTimeRange(t *testing.T) {
 			name:      "BETWEEN clause",
 			sql:       "SELECT * FROM cpu WHERE time BETWEEN '2024-03-15' AND '2024-03-16'",
 			wantStart: "2024-03-15",
-			wantEnd:   "2024-03-16",
+			// BETWEEN includes its end: the range runs one microsecond past it
+			// so the partition starting at the end is read.
+			wantEnd: "2024-03-16T00:00:00.000001Z",
 		},
 		{
 			name:      "only start time",
