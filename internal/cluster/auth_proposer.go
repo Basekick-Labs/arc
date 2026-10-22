@@ -262,3 +262,37 @@ func ToAuthTokenMembershipEntry(e *raft.TokenMembershipEntry) auth.ClusterTokenM
 		LSN:               e.LSN,
 	}
 }
+
+// ToAuthClusterState converts the FSM's auth snapshot for
+// auth.ReconcileClusterState (#1336). includeRBAC is false where the node has
+// no RBAC manager; term is 0 for a snapshot install.
+func ToAuthClusterState(s raft.AuthSnapshot, includeRBAC bool, term uint64) auth.ClusterAuthState {
+	st := auth.ClusterAuthState{
+		IncludeRBAC:  includeRBAC,
+		Quarantined:  s.Quarantined,
+		AppliedIndex: s.AppliedIndex,
+		Term:         term,
+	}
+	for i := range s.Tokens {
+		st.Tokens = append(st.Tokens, ToAuthTokenEntry(&s.Tokens[i]))
+	}
+	if !includeRBAC {
+		return st
+	}
+	for i := range s.Organizations {
+		st.Organizations = append(st.Organizations, ToAuthOrganizationEntry(&s.Organizations[i]))
+	}
+	for i := range s.Teams {
+		st.Teams = append(st.Teams, ToAuthTeamEntry(&s.Teams[i]))
+	}
+	for i := range s.Roles {
+		st.Roles = append(st.Roles, ToAuthRoleEntry(&s.Roles[i]))
+	}
+	for i := range s.MeasurementPermissions {
+		st.MeasurementPermissions = append(st.MeasurementPermissions, ToAuthMeasurementPermissionEntry(&s.MeasurementPermissions[i]))
+	}
+	for i := range s.TokenMemberships {
+		st.Memberships = append(st.Memberships, ToAuthTokenMembershipEntry(&s.TokenMemberships[i]))
+	}
+	return st
+}
