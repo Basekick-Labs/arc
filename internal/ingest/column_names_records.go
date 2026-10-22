@@ -20,13 +20,19 @@ func FilterRecordNames(records interface{}, known KnownColumns) (interface{}, []
 	f := NewRecordNameFilter(known)
 	switch r := records.(type) {
 	case []interface{}:
-		kept := r[:0:0]
-		for _, item := range r {
+		var kept []interface{} // allocated at the first drop
+		for i, item := range r {
 			if f.Keep(item) {
-				kept = append(kept, item)
+				if kept != nil {
+					kept = append(kept, item)
+				}
+				continue
+			}
+			if kept == nil {
+				kept = append(make([]interface{}, 0, len(r)), r[:i]...)
 			}
 		}
-		if len(f.Drops()) == 0 {
+		if kept == nil {
 			return records, nil, 0
 		}
 		return kept, f.Drops(), len(r) - len(kept)
@@ -54,6 +60,7 @@ func (r *RecordNameFilter) Keep(item interface{}) bool { return r.f.ok(item) }
 func (r *RecordNameFilter) Drops() []LPDrop { return r.f.drops }
 
 type recordNameFilter struct {
+	dropAt  map[lpDropKey]int // index into drops
 	known   KnownColumns
 	knownBy map[string]map[string]string
 	folds   map[string]map[string]string // measurement -> fold -> spelling, of records kept
@@ -150,13 +157,15 @@ func (f *recordNameFilter) ok(item interface{}) bool {
 }
 
 func (f *recordNameFilter) drop(measurement, column, reason string, rows int) {
-	for i := range f.drops {
-		d := &f.drops[i]
-		if d.Measurement == measurement && d.Column == column && d.Reason == reason {
-			d.Points += rows
-			return
-		}
+	k := lpDropKey{measurement, column, reason}
+	if i, ok := f.dropAt[k]; ok {
+		f.drops[i].Points += rows
+		return
 	}
+	if f.dropAt == nil {
+		f.dropAt = map[lpDropKey]int{}
+	}
+	f.dropAt[k] = len(f.drops)
 	f.drops = append(f.drops, LPDrop{Measurement: measurement, Column: column, Reason: reason, Points: rows})
 }
 

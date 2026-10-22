@@ -1,8 +1,12 @@
 package ingest
 
 import (
+	"fmt"
 	"sort"
+	"strings"
 	"testing"
+	"time"
+	"unicode/utf8"
 
 	"github.com/basekick-labs/arc/pkg/models"
 )
@@ -150,5 +154,35 @@ func TestStripRecordNamesKeepsTheReading(t *testing.T) {
 	}
 	if len(drops) != 2 {
 		t.Errorf("drops = %v", drops)
+	}
+}
+
+func TestTruncateColumnName(t *testing.T) {
+	long := strings.Repeat("é", 300) // 600 bytes
+	got := TruncateColumnName(long)
+	if len(got) > maxShownNameBytes+len("…") || !utf8.ValidString(got) {
+		t.Fatalf("len %d valid %v", len(got), utf8.ValidString(got))
+	}
+	if TruncateColumnName("short") != "short" {
+		t.Fatal("short name changed")
+	}
+}
+
+// A line ending in a twin of its first field, with many fields, is refused in
+// linear time: the point's new columns are checked through a map.
+func TestLPWriteWidePointTwinIsLinear(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("cpu ")
+	for i := 0; i < 20000; i++ {
+		fmt.Fprintf(&b, "F%d=1i,", i)
+	}
+	b.WriteString("f0=1i 1\n")
+	start := time.Now()
+	_, _, drops, err := NewLineProtocolParser().ParseLPWrite([]byte(b.String()), "ns")
+	if err != nil || len(drops) != 1 {
+		t.Fatalf("drops %v err %v", drops, err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("a 20000-field point took %v", d) // quadratic took ~3s here
 	}
 }

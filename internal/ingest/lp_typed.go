@@ -399,9 +399,10 @@ type lpBuilder struct {
 	nullCols map[string]map[string]struct{}
 	// known gives each measurement's stored column spellings (#1342), asked
 	// once per measurement; knownBy caches the answer.
-	known   KnownColumns
-	knownBy map[string]map[string]string
-	newCols []string // fits' scratch
+	known    KnownColumns
+	knownBy  map[string]map[string]string
+	newCols  []string          // fits' scratch: the point's new columns
+	newFolds map[string]string // fits' scratch: their folds, cleared per point
 }
 
 func newLPBuilder(kinds map[string]map[string]LPKind, hint int) *lpBuilder {
@@ -472,6 +473,9 @@ func (b *lpBuilder) add(p *lpPoint) error {
 		name := p.cols[i]
 		if f.Value == nil {
 			b.nullColumn(p.measurement, name) // a NULL: the row's cell stays empty
+			if k := FoldColumnName(name); m.folds[k] == "" {
+				m.folds[k] = name // a later twin of a NULL-only column is one too (#1342)
+			}
 			continue
 		}
 		c, err := col(name, false, f.Value)
@@ -570,18 +574,21 @@ func (b *lpBuilder) newColumnsFit(p *lpPoint, m *lpMeasurement) bool {
 	if m != nil {
 		batch = m.folds
 	}
-	for i, c := range b.newCols {
+	if b.newFolds == nil {
+		b.newFolds = map[string]string{}
+	}
+	clear(b.newFolds)
+	for _, c := range b.newCols {
 		if _, twin := ColumnCaseTwin(c, batch, known); twin {
 			b.drop(p.measurement, c, LPDropCase, LPKindNone, nil)
 			return false
 		}
 		f := FoldColumnName(c)
-		for _, o := range b.newCols[:i] {
-			if o != c && FoldColumnName(o) == f {
-				b.drop(p.measurement, c, LPDropCase, LPKindNone, nil)
-				return false
-			}
+		if o, ok := b.newFolds[f]; ok && o != c {
+			b.drop(p.measurement, c, LPDropCase, LPKindNone, nil)
+			return false
 		}
+		b.newFolds[f] = c
 	}
 	return true
 }

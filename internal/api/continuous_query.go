@@ -1406,7 +1406,7 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	// alias, rather than breaking the destination measurement (#1342).
 	if _, drops, _ := ingest.FilterRecordNames(record, h.arrowBuffer.KnownColumns(cq.Database)); len(drops) > 0 {
 		return 0, fmt.Errorf("output column %q of measurement %q cannot be stored: %s; rename it in the query (AS ...)",
-			ingest.QuoteColumnName(drops[0].Column), cq.DestinationMeasurement, drops[0].Reason)
+			ingest.TruncateColumnName(drops[0].Column), cq.DestinationMeasurement, drops[0].Reason)
 	}
 	if err := h.arrowBuffer.WriteColumnarRecord(ctx, cq.Database, record); err != nil {
 		return 0, fmt.Errorf("failed to write records: %w", err)

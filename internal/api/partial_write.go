@@ -60,7 +60,7 @@ func partialWriteMessage(drops []ingest.LPDrop, dropped int, wroteRest bool) str
 			break
 		}
 		if d.Column != "" {
-			fmt.Fprintf(&b, " %d in %q column %q: %s;", d.Points, d.Measurement, d.Column, d.Reason)
+			fmt.Fprintf(&b, " %d in %q column %q: %s;", d.Points, d.Measurement, ingest.TruncateColumnName(d.Column), d.Reason)
 		} else {
 			fmt.Fprintf(&b, " %d in %q: %s;", d.Points, d.Measurement, d.Reason)
 		}

@@ -110,10 +110,10 @@ func scanLPImport(upload *importUpload, precision, filter string, isDecimal func
 					return nil
 				}
 				if p := ingest.ColumnNameProblem(key); p != "" {
-					return refuse("measurement %q has a key %q that cannot be stored: %s", l.Measurement, ingest.QuoteColumnName(key), p)
+					return refuse("measurement %q has a key %q that cannot be stored: %s", l.Measurement, ingest.TruncateColumnName(key), p)
 				}
 				if other, twin := ingest.ColumnCaseTwin(column, mfolds, stored[l.Measurement]); twin {
-					return refuse("measurement %q has columns %q and %q, which differ only in letter case; rename one of them", l.Measurement, other, column)
+					return refuse("measurement %q has columns %q and %q, which differ only in letter case; rename one of them", l.Measurement, ingest.TruncateColumnName(other), ingest.TruncateColumnName(column))
 				}
 				mfolds[ingest.FoldColumnName(column)] = column
 				return nil

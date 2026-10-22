@@ -2410,9 +2410,6 @@ func (b *ArrowBuffer) writeColumnarDirectWithHashes(ctx context.Context, databas
 			Strs("columns", quoteColumnNames(dropped)).
 			Int("rows", numRecords).
 			Msg("Replayed WAL entry: dropped columns whose names cannot be stored; the rows are written without them")
-		if len(columns) == 1 { // only time is left
-			return nil
-		}
 	}
 
 	record := &models.ColumnarRecord{

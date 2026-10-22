@@ -240,7 +240,7 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 	// Validation pass: everything that would fail the import is refused
 	// here, before a row is written. It keeps only the measurements and the
 	// kind of each field, not the rows.
-	scan, ierr := scanLPImport(upload, precision, measurementFilter, h.arrowBuffer.IsDecimalColumn, h.arrowBuffer.KnownColumns(database))
+	scan, ierr := scanLPImport(upload, precision, measurementFilter, h.arrowBuffer.IsDecimalColumn, writableKnownColumns(c, h.rbacManager, database, h.arrowBuffer.KnownColumns(database)))
 	if ierr != nil {
 		h.totalErrors.Add(1)
 		return h.importErrorResponse(c, ierr)

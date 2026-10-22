@@ -312,13 +312,16 @@ localProcessing:
 
 	// Decode MessagePack. Typed row-format decoding drops points it cannot
 	// write (line protocol's rules) and reports them; the rest are written.
-	// The columns a measurement already has, for refusing a case twin (#1342):
-	// keyed by the database the write goes to, as resolved below.
+	// The columns a measurement already has, for refusing a case twin
+	// (#1342), for the database the write goes to (the header, as read again
+	// and validated below; an invalid name is refused there before any answer
+	// that depends on this), and only for measurements the token may write.
 	knownDB := c.Get("x-arc-database")
 	if knownDB == "" {
 		knownDB = "default"
 	}
-	known := h.arrowBuffer.KnownColumns(strings.Clone(knownDB))
+	knownDB = strings.Clone(knownDB)
+	known := writableKnownColumns(c, h.rbacManager, knownDB, h.arrowBuffer.KnownColumns(knownDB))
 	records, recordCount, drops, err := h.decoder.DecodeWithDropsKnown(payload, known)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to decode MessagePack")

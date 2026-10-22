@@ -272,7 +272,7 @@ func (r *Registry) loadStored(ctx context.Context, e *entry) error {
 	e.absent = false
 	e.complete = complete
 	if cleaned, removed := Clean(stored); len(removed) > 0 {
-		stored = Normalize(cleaned, nil)
+		stored = cleaned // order kept: the anchor was written in anchor order
 		e.dirty = true
 		r.logger.Warn().
 			Str("anchor", k).
@@ -283,6 +283,9 @@ func (r *Registry) loadStored(ctx context.Context, e *entry) error {
 	}
 	merged, _, conflicts := Merge(stored, e.schema)
 	r.logConflicts(e, conflicts)
+	// Each side is clean on its own, but a merge can still pair two spellings
+	// ("Temp" stored, "temp" cached from a file): clean the result too.
+	merged, _ = Clean(merged)
 	e.schema = merged
 	e.publishFolds()
 	return nil
@@ -451,6 +454,7 @@ func (r *Registry) publishLocked(ctx context.Context, e *entry, incoming *arrow.
 		base, _, c1 = Merge(stored, cached)
 	}
 	merged, _, c2 := Merge(base, incoming)
+	merged, _ = Clean(merged) // a merge can pair two spellings; see loadStored
 	r.logConflicts(e, append(c1, c2...))
 	e.schema = merged
 	e.publishFolds()
@@ -623,11 +627,11 @@ func (r *Registry) Fields(ctx context.Context, database, measurement string) ([]
 
 // KnownColumnFolds is the measurement's registered field names keyed by their
 // ASCII-lowered form (fold -> stored spelling), for ingest to refuse a new
-// column that differs from a known one only in letter case (#1342). It never
-// blocks on I/O and never creates an entry: a measurement whose anchor is not
-// in memory, or whose entry is busy (a load or a bootstrap holds its lock),
-// answers nil, and ingest then checks the write against itself only. The
-// map is shared; callers must not modify it.
+// column that differs from a known one only in letter case (#1342). It takes
+// no entry lock, never blocks on I/O and never creates an entry: it answers
+// the folds last published for the entry's schema, or nil for a measurement
+// whose anchor is not in memory yet, and ingest then checks the write
+// against itself only. The map is shared; callers must not modify it.
 func (r *Registry) KnownColumnFolds(database, measurement string) map[string]string {
 	if !r.Enabled() {
 		return nil
@@ -667,13 +671,18 @@ func (e *entry) publishFolds() {
 
 // asciiLower lower-cases ASCII letters only, as DuckDB folds identifiers.
 func asciiLower(s string) string {
-	b := []byte(s)
-	for i, c := range b {
-		if c >= 'A' && c <= 'Z' {
-			b[i] = c + ('a' - 'A')
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c >= 'A' && c <= 'Z' {
+			b := []byte(s)
+			for j := i; j < len(b); j++ {
+				if c := b[j]; c >= 'A' && c <= 'Z' {
+					b[j] = c + ('a' - 'A')
+				}
+			}
+			return string(b)
 		}
 	}
-	return string(b)
+	return s
 }
 
 // DeleteDatabase removes every stored anchor of a database and forgets them
@@ -871,7 +880,10 @@ func (r *Registry) runBootstrap(parent context.Context, e *entry) {
 		park("no field with a mappable type")
 		return
 	}
-	incoming := Normalize(arrow.NewSchema(fields, nil), nil)
+	// DESCRIBE renames the second of two names equal ignoring case
+	// ("temp_1"): drop those renames before the schema is used (#1342).
+	described, _ := CleanDescribed(arrow.NewSchema(fields, nil))
+	incoming := Normalize(described, nil)
 	// The anchor is complete only when every file was sampled and every
 	// field mapped; a partial sample may miss a column older files carry.
 	complete := sampledAll && allMapped

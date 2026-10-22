@@ -296,7 +296,7 @@ localProcessing:
 	// So is a point with a name Arc cannot read back (#1342): one that is not
 	// valid UTF-8, "time" in another letter case, or one differing only in
 	// letter case from another column of the measurement.
-	names := ingest.NewRecordNameFilter(h.buffer.KnownColumns(database))
+	names := ingest.NewRecordNameFilter(writableKnownColumns(c, h.rbacManager, database, h.buffer.KnownColumns(database)))
 	var timeDrops map[string]int
 	kept := records[:0]
 	for _, rec := range records {
@@ -434,7 +434,7 @@ localProcessing:
 // type) is dropped, the rest are written, and the answer is a "partial write"
 // 400, as InfluxDB does.
 func (h *LineProtocolHandler) writeTyped(c *fiber.Ctx, body []byte, database, precision string) error {
-	batches, rows, drops, err := h.parser.ParseLPWriteKnown(body, precision, h.buffer.KnownColumns(database))
+	batches, rows, drops, err := h.parser.ParseLPWriteKnown(body, precision, writableKnownColumns(c, h.rbacManager, database, h.buffer.KnownColumns(database)))
 	if err != nil {
 		h.totalErrors.Add(1)
 		metrics.Get().IncIngestErrors()

@@ -126,3 +126,19 @@ func TestMsgPackDropsUnstorableNames(t *testing.T) {
 	rows, _ = r2.stored(t)
 	require.Equal(t, map[string]int64{"a": 1}, rows)
 }
+
+// A twin of a column that so far had only NULLs is refused point by point,
+// not by dropping the whole measurement batch.
+func TestMsgPackRowsTwinOfANullOnlyColumn(t *testing.T) {
+	r, post := newMsgPackRowsRig(t)
+	status, out := post([]interface{}{
+		row("cpu", 1700000000, map[string]interface{}{"Temp": nil, "v": 1.0}, nil),
+		row("cpu", 1700000001, map[string]interface{}{"temp": 2.0, "v": 2.0}, nil),
+		row("cpu", 1700000002, map[string]interface{}{"v": 3.0}, nil),
+	})
+	require.Equal(t, http.StatusBadRequest, status, out)
+	require.Contains(t, out, "partial write: 1 points dropped")
+	require.Contains(t, out, "the other points were written")
+	rows, _ := r.stored(t)
+	require.Equal(t, map[string]int64{"cpu": 2}, rows)
+}

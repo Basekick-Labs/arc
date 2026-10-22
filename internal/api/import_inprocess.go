@@ -781,13 +781,13 @@ func importColumnNameError(name string, folds, stored map[string]string) *import
 	if p := ingest.ColumnNameProblem(name); p != "" && name != "time" {
 		return &importError{
 			StatusCode: fiber.StatusBadRequest,
-			Message:    fmt.Sprintf("column name %q cannot be stored: %s; rename the column", ingest.QuoteColumnName(name), p),
+			Message:    fmt.Sprintf("column name %q cannot be stored: %s; rename the column", ingest.TruncateColumnName(name), p),
 		}
 	}
 	if other, twin := ingest.ColumnCaseTwin(name, folds, stored); twin {
 		return &importError{
 			StatusCode: fiber.StatusBadRequest,
-			Message:    fmt.Sprintf("column name %q differs only in letter case from %q of this measurement; rename one of them", name, other),
+			Message:    fmt.Sprintf("column name %q differs only in letter case from %q of this measurement; rename one of them", ingest.TruncateColumnName(name), ingest.TruncateColumnName(other)),
 		}
 	}
 	folds[ingest.FoldColumnName(name)] = name

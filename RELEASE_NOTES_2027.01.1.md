@@ -170,13 +170,25 @@ were accepted, and they broke the measurement later. Now those points are
 dropped with a `400`. The answer is the same partial-write answer line protocol
 gives for a key named exactly `time`.
 
-**Existing measurements.** The measurement's field schema no longer lists
-these names, so reads of time ranges without such files work again. It is
-rewritten on the next flush. Files already written with such a column are
-not rewritten: reads and compaction of the hours they hold still fail. They
-leave with retention, or with the database when it is deleted. An edge-sync
-spoke on an older release can still send such files to its hub; upgrade
-spokes first.
+A case-twin refusal is answered only for measurements the token may
+write. For any other measurement, the check looks at the request alone, so
+an answer cannot reveal which columns that measurement already has.
+
+**Existing measurements.**
+- **Field schema:** the measurement's field schema no longer lists these
+  names, so reads of time ranges without such files work again. The stored
+  schema is rewritten on the next flush.
+- **Mixed versions:** during a rolling upgrade, a node still on an older
+  release can write the old names back. The upgraded nodes then rewrite the
+  schema again, every few minutes, until every node is upgraded.
+- **Files already on disk:** files written with such a column are not
+  rewritten. Reads and compaction of the hours they hold still fail. Arc
+  cannot export them either, because the bad column breaks every query that
+  touches those files. They leave with retention, or with the database when
+  it is deleted. Before that, rewriting them takes a tool that reads the
+  Parquet files directly and renames the column, then an import of the result.
+- **Edge sync:** a spoke on an older release can still send such files to
+  its hub; upgrade spokes first.
 
 ## Upgrade note: three configurations now refuse to start
 

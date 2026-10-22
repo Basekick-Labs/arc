@@ -287,40 +287,51 @@ func Fingerprint(s *arrow.Schema) string {
 //   - a name equal to "time" ignoring ASCII case, other than "time" itself;
 //   - of names equal ignoring ASCII case, every one after the first in field
 //     order: union_by_name reads them as one column anyway;
-//   - a "<name>_<digits>" that DuckDB's DESCRIBE made up for the second of
-//     two such names (bootstrap reads it from files): its <name> differs only
-//     in letter case from another field. "cpu_1" next to "cpu" is a field.
+//   - "time_<digits>" next to a time-like name: the real time column, as
+//     DuckDB's DESCRIBE renames it when "Time" comes first (no ingest path
+//     ever wrote "time_<n>" next to such a name).
 //
 // It never leaves a schema that dropped a time-like name without "time":
-// when DuckDB renamed the real time column ("Time" first, then "time_1"),
-// that column is put back as "time", so a query of the anchor alone still
-// binds time.
+// the renamed real time column is put back as "time", so a query of the
+// anchor alone still binds time. Field order is otherwise kept.
 func Clean(schema *arrow.Schema) (*arrow.Schema, []string) {
+	return clean(schema, false)
+}
+
+// CleanDescribed is Clean for a schema DuckDB's DESCRIBE produced (bootstrap):
+// there, every "<name>_<digits>" whose <name> has another spelling is a
+// rename DuckDB made, not a field, and is dropped too. Elsewhere "cpu_1" next
+// to "Cpu" is a field of its own.
+func CleanDescribed(schema *arrow.Schema) (*arrow.Schema, []string) {
+	return clean(schema, true)
+}
+
+func clean(schema *arrow.Schema, described bool) (*arrow.Schema, []string) {
 	if schema == nil {
 		return nil, nil
 	}
 	fields := schema.Fields()
-	spell := map[string]string{} // fold -> spellings present, first wins
+	// Distinct valid spellings per fold, for "has another spelling".
+	spellings := make(map[string]int, len(fields))
+	present := make(map[string]bool, len(fields))
 	for _, f := range fields {
-		if !utf8.ValidString(f.Name) {
+		if !utf8.ValidString(f.Name) || present[f.Name] {
 			continue
 		}
-		if k := asciiLower(f.Name); spell[k] == "" {
-			spell[k] = f.Name
-		}
+		present[f.Name] = true
+		spellings[asciiLower(f.Name)]++
 	}
 	hasOtherSpelling := func(name string) bool {
-		for _, f := range fields {
-			if f.Name != name && asciiLower(f.Name) == asciiLower(name) && utf8.ValidString(f.Name) {
-				return true
-			}
+		n := spellings[asciiLower(name)]
+		if present[name] {
+			n--
 		}
-		return false
+		return n > 0
 	}
 	var removed []string
 	var realTime *arrow.Field
 	hasTime, timeLike := false, false
-	keptFold := map[string]bool{}
+	keptFold := make(map[string]bool, len(fields))
 	out := make([]arrow.Field, 0, len(fields))
 	for _, f := range fields {
 		name := f.Name
@@ -335,9 +346,9 @@ func Clean(schema *arrow.Schema) (*arrow.Schema, []string) {
 			timeLike = true
 			continue
 		}
-		if base, ok := dedupArtifactBase(name); ok && hasOtherSpelling(base) {
+		if base, ok := dedupArtifactBase(name); ok && (described || asciiLower(base) == TimeColumn) && hasOtherSpelling(base) {
 			removed = append(removed, name)
-			if base == TimeColumn && realTime == nil {
+			if asciiLower(base) == TimeColumn && realTime == nil {
 				c := f
 				realTime = &c
 			}

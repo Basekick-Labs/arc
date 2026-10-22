@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 )
@@ -28,7 +29,9 @@ func TestCleanDropsUnreadableNames(t *testing.T) {
 		{fields("Time", tFloat, "time_1", tTsTZ, "v", tFloat), "time,v"},
 		{fields("time", tTsTZ, "Time", tFloat, "v", tFloat), "time,v"},
 		{fields("time", tTsTZ, "Temp", tFloat, "temp", tFloat), "time,Temp"},
-		{fields("time", tTsTZ, "Temp", tFloat, "temp_1", tFloat), "time,Temp"}, // DESCRIBE's rename of temp
+		{fields("time", tTsTZ, "Temp", tFloat, "temp_1", tFloat), "time,Temp,temp_1"}, // a field, outside DESCRIBE
+		{fields("time", tTsTZ, "Cpu", tFloat, "cpu_1", tFloat), "time,Cpu,cpu_1"},
+		{fields("Time", tFloat, "time_2", tTsTZ, "v", tFloat), "time,v"},
 		{fields("time", tTsTZ, "cpu", tFloat, "cpu_1", tFloat), "time,cpu,cpu_1"},
 		{fields("time", tTsTZ, "t\xb0", tFloat, "v", tFloat), "time,v"},
 		{fields("TIME", tFloat, "v", tFloat), "time,v"},
@@ -38,6 +41,13 @@ func TestCleanDropsUnreadableNames(t *testing.T) {
 		if names(got) != c.want {
 			t.Errorf("Clean(%s) = %s, want %s", names(c.in), names(got), c.want)
 		}
+	}
+	// DESCRIBE output: its "<name>_<n>" renames go too.
+	if got, _ := CleanDescribed(fields("time", tTsTZ, "Temp", tFloat, "temp_1", tFloat)); names(got) != "time,Temp" {
+		t.Errorf("CleanDescribed = %s, want time,Temp", names(got))
+	}
+	if got, _ := CleanDescribed(fields("time", tTsTZ, "cpu", tFloat, "cpu_1", tFloat)); names(got) != "time,cpu,cpu_1" {
+		t.Errorf("CleanDescribed kept no real field: %s", names(got))
 	}
 	got, _ := Clean(fields("Time", tFloat, "time_1", tTsTZ))
 	if !arrow.TypeEqual(got.Field(0).Type, tTsTZ) {
@@ -140,5 +150,64 @@ func TestKnownColumnFoldsAfterLoad(t *testing.T) {
 	}
 	if got := r.KnownColumnFolds("db", "m")["temp"]; got != "Temp" {
 		t.Fatalf("folds[temp] = %q after a load", got)
+	}
+}
+
+// A merge can pair two spellings that were each clean on their own: the
+// anchor keeps the stored one and is not rewritten on every reload.
+func TestMergedTwinNeverReachesTheAnchor(t *testing.T) {
+	r, b, now := newTestRegistry(t, Options{})
+	ctx := context.Background()
+	data, err := EncodeAnchor(Normalize(fields("time", tTsTZ, "Temp", tFloat), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Write(ctx, AnchorKey("db", "m"), data); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Ensure(ctx, "db", "m", fields("time", tTsTZ, "temp", tFloat), nil); err != nil {
+		t.Fatal(err)
+	}
+	data, _ = b.Read(ctx, AnchorKey("db", "m"))
+	stored, _ := DecodeAnchor(data)
+	if names(stored) != "time,Temp" {
+		t.Fatalf("stored anchor = %s", names(stored))
+	}
+	counting := &countingBackend{Backend: b}
+	r.backend = counting
+	*now = now.Add(time.Hour) // past every TTL: reloads
+	if err := r.Ensure(ctx, "db", "m", fields("time", tTsTZ, "Temp", tFloat), nil); err != nil {
+		t.Fatal(err)
+	}
+	if counting.writes != 0 {
+		t.Fatalf("anchor rewritten %d times after a reload", counting.writes)
+	}
+}
+
+// Cleaning a dirty anchor keeps its order (tags were sorted ahead of fields
+// when it was written; metadata is not stored).
+func TestCleaningKeepsTheAnchorOrder(t *testing.T) {
+	r, b, _ := newTestRegistry(t, Options{})
+	ctx := context.Background()
+	dirty := arrow.NewSchema([]arrow.Field{
+		{Name: "time", Type: tTsTZ, Nullable: true},
+		{Name: "zone", Type: tStr, Nullable: true},
+		{Name: "a", Type: tFloat, Nullable: true},
+		{Name: "Time", Type: tFloat, Nullable: true},
+	}, nil)
+	data, _ := EncodeAnchor(dirty)
+	if err := b.Write(ctx, AnchorKey("db", "m"), data); err != nil {
+		t.Fatal(err)
+	}
+	fs, _, err := r.Fields(ctx, "db", "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, f := range fs {
+		got = append(got, f.Name)
+	}
+	if strings.Join(got, ",") != "time,zone,a" {
+		t.Fatalf("fields = %v", got)
 	}
 }

@@ -57,3 +57,15 @@ func TestClaimedReplayDropsUnstorableColumns(t *testing.T) {
 		require.Contains(t, s.batch.Data, "value")
 	}
 }
+
+// An entry whose only other column is dropped still writes its rows, as the
+// claimed replay of the same entry does: every replica writes the same file.
+func TestWALReplayEntryLeftWithOnlyTime(t *testing.T) {
+	r := newFlushRig(t, nil)
+	ts := int64(1760000000000000)
+	require.NoError(t, r.buf.WriteColumnarDirectReplay(context.Background(), "d", "m",
+		map[string][]interface{}{"time": {ts}, "Time": {1.0}}, ""))
+	files := r.files(t)
+	require.Len(t, files, 1)
+	require.Len(t, files[0].cols["time"], 1)
+}

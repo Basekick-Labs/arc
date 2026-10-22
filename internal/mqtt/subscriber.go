@@ -459,6 +459,9 @@ func (s *Subscriber) resume() {
 // logged: a device sends it in every message.
 const nameWarnEvery = 10 * time.Minute
 
+// maxNameWarnsPerMessage bounds the dropped-name warnings one message logs.
+const maxNameWarnsPerMessage = 10
+
 // nameWarnDue reports whether key's warning may be logged now.
 func (s *Subscriber) nameWarnDue(key string) bool {
 	s.nameWarnMu.Lock()
@@ -486,8 +489,11 @@ func (s *Subscriber) processMessage(ctx context.Context, topic string, payload [
 		// A tag or field whose name Arc could not read back is removed and
 		// the rest of the reading kept (#1342): there is no client to answer,
 		// and a device's "Time" key must not cost every message.
-		for _, d := range ingest.StripRecordNames(records, s.arrowBuffer.KnownColumns(database)) {
-			if !s.nameWarnDue(d.Measurement + "\x00" + d.Column) {
+		for i, d := range ingest.StripRecordNames(records, s.arrowBuffer.KnownColumns(database)) {
+			if i == maxNameWarnsPerMessage {
+				break // one message cannot flood the log with distinct names
+			}
+			if !s.nameWarnDue(d.Measurement + "\x00" + ingest.TruncateColumnName(d.Column)) {
 				continue
 			}
 			s.logger.Warn().
@@ -514,7 +520,7 @@ func (s *Subscriber) processMessage(ctx context.Context, topic string, payload [
 					s.logger.Error().
 						Str("topic", topic).
 						Str("measurement", d.Measurement).
-						Str("column", d.Column).
+						Str("column", ingest.QuoteColumnName(d.Column)).
 						Str("reason", d.Reason).
 						Int("points_dropped", d.Points).
 						Msg("MQTT points dropped (partial write)")
