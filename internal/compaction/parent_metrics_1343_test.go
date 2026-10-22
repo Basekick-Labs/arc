@@ -143,3 +143,14 @@ func TestDeadCompletionRecordIsDropped(t *testing.T) {
 		})
 	}
 }
+
+// A record removed between the watcher's listing and its read (the parent
+// dropped a finished job's record) is gone, not an apply error.
+func TestWatcherSkipsARecordRemovedSinceTheListing(t *testing.T) {
+	dir := t.TempDir()
+	w := newTestWatcher(t, dir, &fakeBridge{})
+	w.applyOne(context.Background(), filepath.Join(dir, "gone.json"))
+	if n := w.applyErrors.Load(); n != 0 {
+		t.Fatalf("applyErrors = %d for a removed record", n)
+	}
+}
