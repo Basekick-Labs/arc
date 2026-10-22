@@ -290,6 +290,25 @@ func TestOpenDeleteCallbackRecordsAndWorkerForgets(t *testing.T) {
 	if _, err := os.Stat(full); !os.IsNotExist(err) {
 		t.Fatalf("not unlinked: %v", err)
 	}
+
+	// Listed again before the unlink: read again at once.
+	again := staleHour + "again.parquet"
+	if err := os.WriteFile(filepath.Join(root, again), []byte("rows"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.Path = again
+	if err := c.raftNode.RegisterFile(e, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.raftNode.DeleteFile(again, "delete", 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.raftNode.RegisterFile(e, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.OpenExcludedFor(ctx, openPrefix); len(got) != 0 {
+		t.Fatalf("registered again: excluded %v", got)
+	}
 }
 
 // When the deletes look like a rolled-back manifest (the stale-local
