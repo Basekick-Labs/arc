@@ -8,6 +8,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 )
 
 // Queries count a cluster compaction's rows once (the cluster side of #1337).
@@ -25,42 +27,46 @@ import (
 //
 // In between a read sees the output and its inputs. The coordinator names the
 // inputs to leave out (OpenExcludedFor) once their output can be read, from
-// two sources: the FSM's staged jobs for object stores (known on every node
-// from the staging, long before the copy), and, on local storage, the files
-// this node was told to delete that are still on its disk. The same set
-// covers retention's and DELETE's whole-file removals still waiting for their
-// unlink.
-
-// objectSeenTombstone is how long an object job's inputs stay excluded after
-// the job leaves the FSM: longer than DuckDB's object-store glob cache (10 s),
-// so a listing cached before the deletes is not read whole afterwards.
-const objectSeenTombstone = 15 * time.Second
+// two sources: the FSM's committed object jobs (known on every node from the
+// commit, before the copy), and, on local storage, the files this node was
+// told to delete that are still on its disk. The same set covers retention's
+// and DELETE's whole-file removals still waiting for their unlink.
+//
+// Nothing is kept once an object job leaves the FSM: its inputs are deleted
+// by then, and a listing DuckDB cached before the deletes (query.
+// enable_s3_cache) fails on a missing file whether or not it is left out.
 
 // openState is the coordinator's view of open compactions.
 type openState struct {
 	mu sync.Mutex
 	// localDeleted: files this node's manifest deleted, still waiting for
-	// their local unlink, with the delete reason.
-	localDeleted map[string]string
-	// seen: object jobs whose output has been seen at its final key, with
-	// their inputs (kept for the tombstone after the job leaves the FSM).
-	seen map[string]seenObjectJob
+	// their local unlink.
+	localDeleted map[string]*localDelete
+	// seen: committed object jobs whose output has been seen at its final
+	// key (the hook runs once per job; the key is not checked again).
+	seen map[string]bool
 	gen  atomic.Uint64
 	// onOutputSeen runs the first time an object job's output is seen (drop
 	// DuckDB's object-store listing cache when it is on).
 	onOutputSeen atomic.Pointer[func()]
 }
 
-type seenObjectJob struct {
-	output string
-	inputs []string
-	gone   time.Time // when the job left the FSM; zero while it is there
+// localDelete is one pending local unlink. For a compaction input, output is
+// the job's registered output once found (resolved at most every
+// localResolveEvery while it is not: the lookup can scan the manifest).
+type localDelete struct {
+	reason     string
+	output     string
+	outputSize int64
+	resolvedAt time.Time
 }
+
+const localResolveEvery = 5 * time.Second
 
 func (s *openState) init() {
 	if s.localDeleted == nil {
-		s.localDeleted = map[string]string{}
-		s.seen = map[string]seenObjectJob{}
+		s.localDeleted = map[string]*localDelete{}
+		s.seen = map[string]bool{}
 	}
 }
 
@@ -81,14 +87,16 @@ func excludableReason(reason string) bool {
 }
 
 // noteLocalDeleted records a manifest delete this node must still unlink.
-// Called from the FSM delete callback: map work only.
+// Called from the FSM delete callback: map work only. The generation moves
+// so a plan cached before cannot be served now; leaving the set needs no
+// move, since reads under a pending delete are never cached.
 func (c *Coordinator) noteLocalDeleted(path, reason string) {
 	if !excludableReason(reason) {
 		return
 	}
 	c.open.mu.Lock()
 	c.open.init()
-	c.open.localDeleted[path] = reason
+	c.open.localDeleted[path] = &localDelete{reason: reason}
 	c.open.mu.Unlock()
 	c.open.gen.Add(1)
 }
@@ -97,39 +105,37 @@ func (c *Coordinator) noteLocalDeleted(path, reason string) {
 // it again.
 func (c *Coordinator) forgetLocalDeleted(path string) {
 	c.open.mu.Lock()
-	_, ok := c.open.localDeleted[path]
-	if ok {
-		delete(c.open.localDeleted, path)
-	}
+	delete(c.open.localDeleted, path)
 	c.open.mu.Unlock()
-	if ok {
-		c.open.gen.Add(1)
-	}
 }
 
-// localDeleteExcludable reports whether a local copy deleted for reason may be
-// left out of reads now: a compaction input once its output is on this node's
-// disk, a retention or whole-file DELETE removal at once (its rows are gone).
-// Anything else (a DELETE rewrite's old file, a snapshot drop) is read until
-// its unlink, as before.
-func (c *Coordinator) localDeleteExcludable(ctx context.Context, reason string) bool {
-	switch {
-	case strings.HasPrefix(reason, "compaction:"):
-		job := strings.TrimPrefix(reason, "compaction:")
-		fsm := c.raftNode.FSM()
-		if fsm == nil {
-			return false
-		}
-		out, ok := fsm.FileByCompactionJob(job)
-		if !ok {
-			return false
-		}
-		size, err := c.storage.StatFile(ctx, out.Path)
-		return err == nil && size >= 0
-	case strings.HasPrefix(reason, "retention:"), reason == "delete":
-		return true
+// localDeleteExcludable reports whether a local copy deleted for d.reason may
+// be left out of reads now: a compaction input once the job's output is
+// registered and on this node's disk, a retention or whole-file DELETE
+// removal at once (its rows are gone).
+func (c *Coordinator) localDeleteExcludable(ctx context.Context, fsm *raft.ClusterFSM, d localDelete) (localDelete, bool) {
+	job, ok := strings.CutPrefix(d.reason, "compaction:")
+	if !ok {
+		return d, true
 	}
-	return false
+	if d.output == "" && time.Since(d.resolvedAt) >= localResolveEvery {
+		d.resolvedAt = time.Now()
+		if s, ok := fsm.StagedCompactionByJob(job); ok {
+			d.output, d.outputSize = s.Output.Path, s.Output.SizeBytes
+		} else if e, ok := fsm.FileByCompactionJob(job); ok {
+			d.output, d.outputSize = e.Path, e.SizeBytes
+		}
+	}
+	if d.output == "" {
+		return d, false
+	}
+	// Still the job's output: anything else under that path (a DELETE
+	// rewrite, a later compaction) has its own accounting.
+	if e, ok := fsm.GetFile(d.output); !ok || e.CompactionJob != job {
+		return d, false
+	}
+	size, err := c.storage.StatFile(ctx, d.output)
+	return d, err == nil && size == d.outputSize
 }
 
 // OpenExcludedFor returns the storage keys under prefix ("db/measurement/")
@@ -138,24 +144,25 @@ func (c *Coordinator) OpenExcludedFor(ctx context.Context, prefix string) []stri
 	if c == nil || c.raftNode == nil || c.storage == nil {
 		return nil
 	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return nil
+	}
 	var out []string
-	out = append(out, c.objectExcluded(ctx, prefix)...)
-	out = append(out, c.localExcluded(ctx, prefix)...)
+	out = append(out, c.objectExcluded(ctx, fsm, prefix)...)
+	out = append(out, c.localExcluded(ctx, fsm, prefix)...)
 	return out
 }
 
-// OpenAny reports whether a read under prefix must not be cached: an object
-// job or a pending local delete there can change what it leaves out.
+// OpenAny reports whether a read under prefix must not be cached: a
+// committed object job or a pending local delete there can change what it
+// leaves out.
 func (c *Coordinator) OpenAny(prefix string) bool {
 	if c == nil || c.raftNode == nil {
 		return false
 	}
-	if fsm := c.raftNode.FSM(); fsm != nil {
-		for _, s := range fsm.StagedCompactions() {
-			if s.Object && strings.HasPrefix(s.Output.Path, prefix) {
-				return true
-			}
-		}
+	if fsm := c.raftNode.FSM(); fsm != nil && fsm.FinalizingObjectUnder(prefix) {
+		return true
 	}
 	c.open.mu.Lock()
 	defer c.open.mu.Unlock()
@@ -164,147 +171,126 @@ func (c *Coordinator) OpenAny(prefix string) bool {
 			return true
 		}
 	}
-	for _, j := range c.open.seen {
-		if strings.HasPrefix(j.output, prefix) {
-			return true
-		}
-	}
 	return false
 }
 
-// OpenGeneration changes whenever the set of open compactions or pending
-// local deletes changes (a cache of SQL built without them keys on it).
+// OpenGeneration changes whenever an object job stages, commits or leaves,
+// or a local delete is recorded (a cache of SQL built without them keys on
+// it).
 func (c *Coordinator) OpenGeneration() uint64 {
 	if c == nil || c.raftNode == nil {
 		return 0
 	}
 	h := fnv.New64a()
 	if fsm := c.raftNode.FSM(); fsm != nil {
-		for _, s := range fsm.StagedCompactions() {
-			if !s.Object {
-				continue
-			}
-			h.Write([]byte(s.Job))
-			if s.Finalizing {
-				h.Write([]byte{1})
-			}
-			if s.Finalized {
-				h.Write([]byte{2})
-			}
-		}
+		h.Write([]byte(strconv.FormatUint(fsm.ObjectStagedSignature(), 10)))
 	}
+	h.Write([]byte{0})
 	h.Write([]byte(strconv.FormatUint(c.open.gen.Load(), 10)))
 	return h.Sum64()
 }
 
-// objectExcluded: the inputs of every object job under prefix whose output is
-// at its final key. Known from the staging on every node, so a reader whose
-// FSM lags the commit still knows the job. An input the manifest lists again
-// with other content, or a writer still holds for registration, is kept.
-func (c *Coordinator) objectExcluded(ctx context.Context, prefix string) []string {
-	fsm := c.raftNode.FSM()
-	if fsm == nil {
-		return nil
+// objectExcluded: the inputs of every committed object job under prefix
+// whose output is registered by the job and at its final key. Known from the
+// commit on every node, so a reader whose FSM lags the finisher still knows
+// the job. A job whose output left the manifest (it is being reverted, or
+// its remover deletes the inputs too) leaves nothing out; nor does an input
+// the manifest lists again or this node's outbox holds, as the finisher
+// keeps those (deleteObjectInputs).
+func (c *Coordinator) objectExcluded(ctx context.Context, fsm *raft.ClusterFSM, prefix string) []string {
+	jobs := fsm.FinalizingObjectJobsUnder(prefix)
+	c.open.mu.Lock()
+	c.open.init()
+	if len(c.open.seen) > 0 {
+		live := make(map[string]bool, len(jobs))
+		for _, s := range fsm.FinalizingObjectJobsUnder("") {
+			live[s.Job] = true
+		}
+		for job := range c.open.seen {
+			if !live[job] {
+				delete(c.open.seen, job)
+			}
+		}
 	}
-	now := time.Now()
-	present := map[string]bool{}
+	c.open.mu.Unlock()
 	var out []string
-	for _, s := range fsm.StagedCompactions() {
-		if !s.Object || !strings.HasPrefix(s.Output.Path, prefix) {
+	hold := stagedCommitter{c: c}.HoldsRegistration
+	for _, s := range jobs {
+		if e, ok := fsm.GetFile(s.Output.Path); !ok || e.CompactionJob != s.Job || e.SHA256 != s.Output.SHA256 {
 			continue
 		}
-		present[s.Job] = true
 		c.open.mu.Lock()
-		c.open.init()
-		_, seen := c.open.seen[s.Job]
+		seen := c.open.seen[s.Job]
 		c.open.mu.Unlock()
 		if !seen {
 			size, err := c.storage.StatFile(ctx, s.Output.Path)
-			if err != nil || size < 0 {
+			if err != nil || size != s.Output.SizeBytes {
 				continue
-			}
-			inputs := make([]string, 0, len(s.Inputs))
-			for _, in := range s.Inputs {
-				inputs = append(inputs, in.Path)
 			}
 			c.open.mu.Lock()
-			c.open.seen[s.Job] = seenObjectJob{output: s.Output.Path, inputs: inputs}
+			first := !c.open.seen[s.Job]
+			c.open.seen[s.Job] = true
 			c.open.mu.Unlock()
-			c.open.gen.Add(1)
-			if fn := c.open.onOutputSeen.Load(); fn != nil {
-				(*fn)()
+			if first {
+				c.open.gen.Add(1)
+				if fn := c.open.onOutputSeen.Load(); fn != nil {
+					(*fn)()
+				}
 			}
 		}
-		hold := stagedCommitter{c: c}.HoldsRegistration
 		for _, in := range s.Inputs {
-			if e, ok := fsm.GetFile(in.Path); ok && e.SHA256 != in.SHA256 {
-				continue
-			}
-			if hold(in.Path) {
+			if fsm.HasFile(in.Path) || hold(in.Path) {
 				continue
 			}
 			out = append(out, in.Path)
-		}
-	}
-	// Jobs that left the FSM: tombstone their inputs a while, then forget.
-	c.open.mu.Lock()
-	changed := false
-	for job, j := range c.open.seen {
-		if present[job] || !strings.HasPrefix(j.output, prefix) {
-			continue
-		}
-		if j.gone.IsZero() {
-			j.gone = now
-			c.open.seen[job] = j
-		}
-		if now.Sub(j.gone) > objectSeenTombstone {
-			delete(c.open.seen, job)
-			changed = true
-			continue
-		}
-		out = append(out, j.inputs...)
-	}
-	c.open.mu.Unlock()
-	if changed {
-		c.open.gen.Add(1)
-		if fn := c.open.onOutputSeen.Load(); fn != nil {
-			(*fn)()
 		}
 	}
 	return out
 }
 
 // localExcluded: this node's copies the manifest deleted that may be left out
-// now (localDeleteExcludable). Stops when the deletes look implausible (the
-// stale-local breaker): over-counting is the safe direction.
-func (c *Coordinator) localExcluded(ctx context.Context, prefix string) []string {
+// now (localDeleteExcludable). A path the manifest lists again is dropped
+// (a snapshot can re-list it without a register callback). Stops when the
+// deletes look implausible (the stale-local breaker): over-counting is the
+// safe direction.
+func (c *Coordinator) localExcluded(ctx context.Context, fsm *raft.ClusterFSM, prefix string) []string {
 	c.open.mu.Lock()
 	var cands []string
-	var reasons []string
-	for p, r := range c.open.localDeleted {
+	var dels []localDelete
+	for p, d := range c.open.localDeleted {
 		if strings.HasPrefix(p, prefix) {
 			cands = append(cands, p)
-			reasons = append(reasons, r)
+			dels = append(dels, *d)
 		}
 	}
 	c.open.mu.Unlock()
 	if len(cands) == 0 {
 		return nil
 	}
-	if seen := c.stale.seen.Load(); seen != nil && seen.err() == nil {
-		if fsm := c.raftNode.FSM(); fsm != nil && c.deletedCopiesImplausible(seen, fsm) {
-			return nil
-		}
+	if seen := c.stale.seen.Load(); seen != nil && seen.err() == nil && c.deletedCopiesImplausible(seen, fsm) {
+		return nil
 	}
 	var out []string
 	for i, p := range cands {
+		if fsm.HasFile(p) {
+			c.forgetLocalDeleted(p)
+			continue
+		}
 		// A copy already gone (the stale sweep, an operator) needs nothing,
 		// and its entry would keep reads uncached.
 		if size, err := c.storage.StatFile(ctx, p); err == nil && size < 0 {
 			c.forgetLocalDeleted(p)
 			continue
 		}
-		if c.localDeleteExcludable(ctx, reasons[i]) {
+		d, ok := c.localDeleteExcludable(ctx, fsm, dels[i])
+		if d != dels[i] {
+			c.open.mu.Lock()
+			if cur := c.open.localDeleted[p]; cur != nil && cur.reason == d.reason {
+				*cur = d
+			}
+			c.open.mu.Unlock()
+		}
+		if ok {
 			out = append(out, p)
 		}
 	}

@@ -91,8 +91,9 @@ func TestOpenExcludesObjectInputsOnceTheOutputIsThere(t *testing.T) {
 	}
 }
 
-// An input the manifest lists again with other content, or one a writer
-// still holds for registration, is a different file now: it is read.
+// An input the manifest lists again (a restore, a new write reusing the
+// path), or one a writer still holds for registration, is another file now:
+// it is read, as the finisher keeps it.
 func TestOpenKeepsAnObjectInputThatIsAnotherFileNow(t *testing.T) {
 	r := objectRig(t)
 	ctx := context.Background()
@@ -100,13 +101,13 @@ func TestOpenKeepsAnObjectInputThatIsAnotherFileNow(t *testing.T) {
 	a, b := job.Inputs[0].Path, job.Inputs[1].Path
 	r.copyToFinal(job.StagedKey, job.Output.Path)
 
-	e := raft.FileEntry{Path: a, SHA256: strings.Repeat("e", 64), SizeBytes: 3, Database: "testdb",
+	e := raft.FileEntry{Path: a, SHA256: job.Inputs[0].SHA256, SizeBytes: job.Inputs[0].SizeBytes, Database: "testdb",
 		Measurement: "cpu", OriginNodeID: "writer-1", Tier: "hot", CreatedAt: time.Now()}
 	if err := r.c.raftNode.RegisterFile(e, 5*time.Second); err != nil {
 		t.Fatal(err)
 	}
 	if got := r.c.OpenExcludedFor(ctx, openPrefix); !sameSet(got, []string{b}) {
-		t.Fatalf("re-registered input: excluded %v, want only %s", got, b)
+		t.Fatalf("re-registered input (same content): excluded %v, want only %s", got, b)
 	}
 	r.c.staged.holds = func(p string) bool { return p == b }
 	if got := r.c.OpenExcludedFor(ctx, openPrefix); len(got) != 0 {
@@ -114,11 +115,44 @@ func TestOpenKeepsAnObjectInputThatIsAnotherFileNow(t *testing.T) {
 	}
 }
 
+// The output left the manifest after it was seen (an operator removed it,
+// so the finisher reverts the job and registers the inputs again): from that
+// apply on, nothing is left out, on every node.
+func TestOpenStopsExcludingWhenTheOutputLeavesTheManifest(t *testing.T) {
+	r := objectRig(t)
+	ctx := context.Background()
+	job := r.objectJob("j1")
+	r.copyToFinal(job.StagedKey, job.Output.Path)
+	if got := r.c.OpenExcludedFor(ctx, openPrefix); len(got) != 2 {
+		t.Fatalf("output seen: excluded %v", got)
+	}
+	if err := r.c.raftNode.DeleteFile(job.Output.Path, "operator", 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := r.staged("j1"); !ok {
+		t.Fatal("job left the FSM with its output; the window this test pins is gone")
+	}
+	if got := r.c.OpenExcludedFor(ctx, openPrefix); len(got) != 0 {
+		t.Fatalf("output gone from the manifest: excluded %v (the inputs hold the only rows)", got)
+	}
+}
+
+// A file at the output key that is not the output (size differs) opens no
+// window.
+func TestOpenNeedsTheOutputsSize(t *testing.T) {
+	r := objectRig(t)
+	ctx := context.Background()
+	job := r.objectJob("j1")
+	r.write(job.Output.Path, "something else entirely")
+	if got := r.c.OpenExcludedFor(ctx, openPrefix); len(got) != 0 {
+		t.Fatalf("foreign object at the output key: excluded %v", got)
+	}
+}
+
 // The real finisher: inside its window (the output copied, the inputs not
-// yet deleted) a read leaves the inputs out; after the job leaves the FSM
-// they stay excluded a while (a listing cached before the deletes), then are
-// forgotten.
-func TestOpenTombstonesAFinishedObjectJob(t *testing.T) {
+// yet deleted) a read leaves the inputs out; once the job leaves the FSM
+// nothing is left out and reads are cacheable again.
+func TestOpenThroughTheFinisher(t *testing.T) {
 	r := objectRig(t)
 	ctx := context.Background()
 	var hooks atomic.Int32
@@ -136,44 +170,20 @@ func TestOpenTombstonesAFinishedObjectJob(t *testing.T) {
 	if _, ok := r.staged("j1"); ok {
 		t.Fatal("job still in the FSM after the finisher")
 	}
-	if got := r.c.OpenExcludedFor(ctx, openPrefix); !sameSet(got, inputs) {
-		t.Fatalf("tombstone: excluded %v, want %v", got, inputs)
-	}
-	if !r.c.OpenAny(openPrefix) {
-		t.Fatal("a tombstoned job does not keep reads volatile")
-	}
-	age := func(d time.Duration) {
-		r.c.open.mu.Lock()
-		j := r.c.open.seen["j1"]
-		j.gone = time.Now().Add(-d)
-		r.c.open.seen["j1"] = j
-		r.c.open.mu.Unlock()
-	}
-	// Late in the tombstone: still left out.
-	age(objectSeenTombstone - time.Second)
-	if got := r.c.OpenExcludedFor(ctx, openPrefix); !sameSet(got, inputs) {
-		t.Fatalf("late in the tombstone: excluded %v, want %v", got, inputs)
-	}
-	if objectSeenTombstone <= 10*time.Second {
-		t.Fatalf("tombstone %v does not outlive DuckDB's 10 s glob cache", objectSeenTombstone)
-	}
-	r.c.open.mu.Lock()
-	j := r.c.open.seen["j1"]
-	j.gone = time.Now().Add(-objectSeenTombstone - time.Second)
-	r.c.open.seen["j1"] = j
-	r.c.open.mu.Unlock()
-	g := r.c.OpenGeneration()
 	if got := r.c.OpenExcludedFor(ctx, openPrefix); len(got) != 0 {
-		t.Fatalf("after the tombstone: excluded %v", got)
+		t.Fatalf("after the job: excluded %v", got)
 	}
 	if r.c.OpenAny(openPrefix) {
-		t.Fatal("reads still volatile after the tombstone")
+		t.Fatal("reads still volatile after the job")
 	}
-	if r.c.OpenGeneration() == g {
-		t.Fatal("generation unchanged when the tombstone expired")
+	r.c.open.mu.Lock()
+	n := len(r.c.open.seen)
+	r.c.open.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d seen jobs kept after the job left", n)
 	}
-	if hooks.Load() != 2 {
-		t.Fatalf("hook ran %d times, want 2 (seen, forgotten)", hooks.Load())
+	if hooks.Load() != 1 {
+		t.Fatalf("hook ran %d times, want 1", hooks.Load())
 	}
 }
 
@@ -204,6 +214,30 @@ func TestOpenExcludesALocalCompactionInputOnceTheOutputIsLocal(t *testing.T) {
 	r.c.noteLocalDeleted(other, "compaction:nope")
 	if got := r.c.OpenExcludedFor(ctx, openPrefix); !sameSet(got, []string{in}) {
 		t.Fatalf("unknown job: excluded %v", got)
+	}
+	// The output left the manifest: the input is read again.
+	if err := r.c.raftNode.DeleteFile(job.Output.Path, "operator", 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.c.OpenExcludedFor(ctx, openPrefix); len(got) != 0 {
+		t.Fatalf("output gone: excluded %v", got)
+	}
+}
+
+// A pending delete whose path the manifest lists again with no register
+// callback (a snapshot install) is read, and dropped.
+func TestOpenReadsAPathListedAgainWithoutACallback(t *testing.T) {
+	r := staleRig(t)
+	ctx := context.Background()
+	key := staleHour + "back.parquet"
+	r.write(key, "rows")
+	r.c.noteLocalDeleted(key, "delete")
+	r.register(key, "rows") // no callbacks are wired on this rig
+	if got := r.c.OpenExcludedFor(ctx, openPrefix); len(got) != 0 {
+		t.Fatalf("listed again: excluded %v", got)
+	}
+	if r.c.OpenAny(openPrefix) {
+		t.Fatal("entry kept after the path was listed again")
 	}
 }
 
@@ -254,9 +288,14 @@ func TestOpenForgetsLocalDeletes(t *testing.T) {
 	if got := r.c.OpenExcludedFor(ctx, openPrefix); len(got) != 0 {
 		t.Fatalf("excluded %v", got)
 	}
-	if r.c.OpenGeneration() == g {
-		t.Fatal("generation unchanged when a vanished copy was forgotten")
+	if r.c.OpenGeneration() != g {
+		t.Fatal("forgetting moved the generation: every cached plan is dropped for nothing")
 	}
+	r.c.noteLocalDeleted(staleHour+"new.parquet", "delete")
+	if r.c.OpenGeneration() == g {
+		t.Fatal("a new pending delete did not move the generation")
+	}
+	r.c.forgetLocalDeleted(staleHour + "new.parquet")
 	if r.c.OpenAny(openPrefix) {
 		t.Fatal("reads still volatile with nothing pending")
 	}
