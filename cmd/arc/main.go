@@ -2764,6 +2764,17 @@ func main() {
 						}
 					},
 				)
+				// Both callback sets are wired: from here a snapshot install
+				// reconciles the local tables, and once this node has caught
+				// up with the leader they are reconciled for everything
+				// applied before the callbacks existed (#1336).
+				authReconcileCtx, authReconcileCancel := context.WithCancel(context.Background())
+				shutdownCoordinator.RegisterHook("cluster-auth-reconcile-cancel", func(context.Context) error {
+					authReconcileCancel()
+					return nil
+				}, 5)
+				startAuthReconcile(authReconcileCtx, fsm, clusterCoordinator, authManager.GetDB(), authManager, rbacManager,
+					authReconcileRetry, logger.Get("auth-reconcile"))
 				rbacProposer := cluster.NewCoordinatorAuthProposer(clusterCoordinator)
 				if rbacProposer != nil {
 					rbacManager.SetRaftProposer(rbacProposer)

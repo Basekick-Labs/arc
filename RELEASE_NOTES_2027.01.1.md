@@ -69,6 +69,66 @@ not a read statement fails its runs from this release.
 Full technical detail will accompany the corresponding security advisory once it
 is published. Responsibly reported by **[@rexpository](https://github.com/rexpository)**.
 
+## Security: a cluster node that took a Raft snapshot no longer keeps revoked tokens ([#1336](https://github.com/Basekick-Labs/arc/issues/1336))
+
+**Enterprise clusters with auth enabled.** Each node checks API tokens and
+RBAC grants against its own SQLite, which followed the replicated auth state
+only through per-command callbacks. Two paths skipped them:
+
+- **A Raft snapshot install.** A node that was down or partitioned long
+  enough to need one, or one that joined after the leader had snapshotted,
+  never applied the token and RBAC changes the snapshot covered.
+- **Startup.** Entries applied before the callbacks were wired at boot
+  never reached SQLite. For RBAC that window included the wait for a leader.
+
+On such a node, until the same token changed again:
+
+- tokens revoked or deleted elsewhere still authenticated;
+- a rotated token kept accepting its old secret, and rejected the new one;
+- tokens created elsewhere were rejected;
+- a removed team membership, role or measurement permission still granted
+  access.
+
+Every other node was correct. Every release since 26.06.1 is affected.
+
+Each node now rewrites its local auth and RBAC rows from the replicated state
+after every snapshot install, and once at startup after it has caught up with
+the leader. Until it has caught up, it retries every 15 s; reconciling against
+the snapshot it booted from would bring back what was revoked since.
+
+**What changes for operators**
+
+- Only rows the node wrote from the replicated state are changed or removed
+  (`raft_materialised`, a new column on `api_tokens` and the five `rbac_*`
+  tables). The cluster's apply commands now also act only on those rows: a
+  legacy or standalone-created row that happens to share an ID with a
+  replicated token is no longer revoked, renamed or rotated by it.
+- Legacy rows (pre-26.06.1, or created while a node ran standalone) are left
+  in place and reported at `Warn` on every restart. See
+  [Upgrading pre-26.06.1 API tokens](operations/pre-26.06.1-token-upgrade.md).
+- A token disabled on this node but enabled in the cluster stays disabled:
+  the cluster has no re-enable command, so this only happens after a local
+  revoke while the node ran standalone. A token *deleted* on a node while it
+  ran standalone comes back on its next reconcile if the cluster still has it:
+  revoke or delete it through the cluster instead. Organizations and teams
+  follow the cluster both ways, because their update command carries
+  `enabled`.
+- A Raft wiped and re-bootstrapped with the auth database kept is detected:
+  nothing is deleted, the old cluster rows become local-only, and an `Error`
+  log says so.
+- Until a node's first reconcile, the cluster's RBAC updates and deletes reach
+  any row at the ID, as before. From then on only rows the reconcile has
+  matched to the cluster's state. Team-membership removal always applies: it
+  is keyed by the token and team, which name the same grant whatever the
+  row's ID.
+- The new column is added at startup. A database file Arc cannot write to
+  now fails startup there, not at the first token write.
+- New metrics: `arc_cluster_auth_reconcile_total`,
+  `arc_cluster_auth_reconcile_failed_total`,
+  `arc_cluster_auth_reconcile_local_rows`,
+  `arc_cluster_auth_reconcile_collisions` and
+  `arc_cluster_auth_reconcile_kept_rows`.
+
 ## Upgrade note: three configurations now refuse to start
 
 Read this before upgrading if you set `storage.local_path`,

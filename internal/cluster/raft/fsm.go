@@ -639,6 +639,23 @@ type ClusterFSM struct {
 	applyStarted atomic.Uint64
 	applyDone    atomic.Uint64
 
+	// authMatMu serialises everything that writes the FSM's auth and RBAC
+	// state into the local SQLite: the 18 apply callbacks and the reconcile
+	// (#1336). Without it a reconcile could copy the maps, lose a race to an
+	// apply's callback, and write the older copy over the newer row. Always
+	// taken before f.mu, never while holding it.
+	authMatMu sync.Mutex
+	// authReconciler rewrites the local auth and RBAC tables from a copy of
+	// the FSM (#1336). Set under f.mu; nil until cmd/arc wires it, so the
+	// restore NewRaft performs at boot never reaches it.
+	authReconciler func(AuthSnapshot)
+	// authQuarantined holds the auth and RBAC ids the last snapshot restore
+	// refused, per table. Under f.mu.
+	authQuarantined map[string]map[int64]bool
+	// authReconcileCopied is a test seam: it runs in ReconcileAuthNow after the
+	// copy is taken and before the reconciler writes it.
+	authReconcileCopied func()
+
 	mu              sync.RWMutex
 	nodes           map[string]*NodeInfo
 	primaryWriterID string       // ID of the current primary writer node
@@ -2548,6 +2565,9 @@ func (f *ClusterFSM) applyCreateToken(payload []byte, logIndex uint64) interface
 		Uint64("lsn", entry.LSN).
 		Msg("Token created in cluster auth state")
 
+	// Serialised with the reconcile against SQLite (#1336).
+	f.authMatMu.Lock()
+	defer f.authMatMu.Unlock()
 	if callback != nil {
 		entryCopy := entry
 		callback(&entryCopy)
@@ -2625,6 +2645,9 @@ func (f *ClusterFSM) applyUpdateToken(payload []byte, logIndex uint64) interface
 		Uint64("lsn", logIndex).
 		Msg("Token updated in cluster auth state")
 
+	// Serialised with the reconcile against SQLite (#1336).
+	f.authMatMu.Lock()
+	defer f.authMatMu.Unlock()
 	if callback != nil {
 		callback(&updated)
 	}
@@ -2654,6 +2677,9 @@ func (f *ClusterFSM) applyRevokeToken(payload []byte, logIndex uint64) interface
 
 	metrics.Get().IncClusterAuthApplyRevoke()
 	f.logger.Info().Int64("token_id", p.ID).Uint64("lsn", logIndex).Msg("Token revoked in cluster auth state")
+	// Serialised with the reconcile against SQLite (#1336).
+	f.authMatMu.Lock()
+	defer f.authMatMu.Unlock()
 	if callback != nil {
 		callback(p.ID)
 	}
@@ -2737,6 +2763,9 @@ func (f *ClusterFSM) applyDeleteToken(payload []byte, logIndex uint64) interface
 		logEvt = logEvt.Int("cascaded_memberships", cascadedMemberships)
 	}
 	logEvt.Msg("Token deleted from cluster auth state")
+	// Serialised with the reconcile against SQLite (#1336).
+	f.authMatMu.Lock()
+	defer f.authMatMu.Unlock()
 	if callback != nil {
 		callback(p.ID)
 	}
@@ -2790,6 +2819,9 @@ func (f *ClusterFSM) applyRotateToken(payload []byte, logIndex uint64) interface
 
 	metrics.Get().IncClusterAuthApplyRotate()
 	f.logger.Info().Int64("token_id", p.ID).Uint64("lsn", logIndex).Msg("Token rotated in cluster auth state")
+	// Serialised with the reconcile against SQLite (#1336).
+	f.authMatMu.Lock()
+	defer f.authMatMu.Unlock()
 	if callback != nil {
 		callback(p.ID, p.NewHash, p.NewPrefix, logIndex)
 	}
@@ -3327,6 +3359,16 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		teamSet[id] = struct{}{}
 	}
 	f.keysCache = nil // invalidate sorted-key cache after snapshot restore
+	f.authQuarantined = quarantinedAuthIDs(&snapshot, restoredTokens, restoredOrgs, restoredTeams, restoredRoles, restoredMPerms, restoredMemberships)
+	// A snapshot install never fires the per-command auth callbacks, so the
+	// local SQLite would keep every token and grant the snapshot changed
+	// (#1336). Copied here, under the lock that installed it.
+	authReconciler := f.authReconciler
+	var authSnap AuthSnapshot
+	if authReconciler != nil {
+		authSnap = f.authSnapshotLocked()
+		authSnap.AppliedIndex = snapshot.AppliedIndex
+	}
 	onNodeAdded := f.onNodeAdded
 	onNodeRemoved := f.onNodeRemoved
 	onFileDeleted := f.onFileDeleted
@@ -3384,6 +3426,17 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		onCompactionPauseChanged(restoredPause.Active, restoredPause.Generation)
 	}
 	f.firePoliciesChanged()
+	// The reconcile runs here, on the FSM goroutine, so no apply can race it.
+	// Only a runtime InstallSnapshot gets this far with a reconciler set, and
+	// such a snapshot is always newer than anything this node materialised:
+	// it cannot roll SQLite back. It reports its own failures and must never
+	// fail the restore — a failed restore fails the install, and the node
+	// would never catch up.
+	if authReconciler != nil {
+		f.authMatMu.Lock()
+		authReconciler(authSnap)
+		f.authMatMu.Unlock()
+	}
 
 	// Last, after the restored state is in place: a reader that sees the
 	// index must also see what it covers.
@@ -3668,3 +3721,150 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 
 // Release is called when the snapshot is no longer needed.
 func (s *fsmSnapshot) Release() {}
+
+// AuthSnapshot is a deep copy of the FSM's auth and RBAC state, handed to the
+// reconciler that rewrites a node's local SQLite from it (#1336).
+type AuthSnapshot struct {
+	Tokens                 []TokenEntry
+	Organizations          []OrganizationEntry
+	Teams                  []TeamEntry
+	Roles                  []RoleEntry
+	MeasurementPermissions []MeasurementPermissionEntry
+	TokenMemberships       []TokenMembershipEntry
+	// Quarantined holds, per SQLite table name, the ids the last snapshot
+	// restore refused.
+	Quarantined map[string]map[int64]bool
+	// AppliedIndex is the FSM's applied index the copy reflects.
+	AppliedIndex uint64
+}
+
+// SQLite table names used as Quarantined keys; they match internal/auth.
+const (
+	authTableTokens                 = "api_tokens"
+	authTableOrganizations          = "rbac_organizations"
+	authTableTeams                  = "rbac_teams"
+	authTableRoles                  = "rbac_roles"
+	authTableMeasurementPermissions = "rbac_measurement_permissions"
+	authTableMemberships            = "rbac_token_memberships"
+)
+
+// SetAuthReconciler installs fn, which a snapshot restore calls with the
+// restored auth state and ReconcileAuthNow calls with the current one. fn
+// runs with the auth callbacks held off and must not call into the FSM, the
+// coordinator or Raft.
+func (f *ClusterFSM) SetAuthReconciler(fn func(AuthSnapshot)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.authReconciler = fn
+}
+
+// ReconcileAuthNow hands the reconciler a copy of the current auth state. It
+// holds the auth callbacks off while the copy is written, so an apply that
+// lands meanwhile writes its change after the copy, never before. Call it only
+// once the FSM has caught up with the leader: at boot it holds the last local
+// snapshot, older than what SQLite already has. Returns false when no
+// reconciler is set.
+func (f *ClusterFSM) ReconcileAuthNow() bool {
+	f.authMatMu.Lock()
+	defer f.authMatMu.Unlock()
+	f.mu.RLock()
+	fn := f.authReconciler
+	var snap AuthSnapshot
+	if fn != nil {
+		snap = f.authSnapshotLocked()
+	}
+	seam := f.authReconcileCopied
+	f.mu.RUnlock()
+	if fn == nil {
+		return false
+	}
+	snap.AppliedIndex = f.applyDone.Load()
+	if seam != nil {
+		seam()
+	}
+	fn(snap)
+	return true
+}
+
+// authSnapshotLocked deep-copies the auth and RBAC maps. Caller holds f.mu.
+func (f *ClusterFSM) authSnapshotLocked() AuthSnapshot {
+	snap := AuthSnapshot{
+		Tokens:                 make([]TokenEntry, 0, len(f.tokens)),
+		Organizations:          make([]OrganizationEntry, 0, len(f.organizations)),
+		Teams:                  make([]TeamEntry, 0, len(f.teams)),
+		Roles:                  make([]RoleEntry, 0, len(f.roles)),
+		MeasurementPermissions: make([]MeasurementPermissionEntry, 0, len(f.measurementPermissions)),
+		TokenMemberships:       make([]TokenMembershipEntry, 0, len(f.tokenMemberships)),
+		Quarantined:            make(map[string]map[int64]bool, len(f.authQuarantined)),
+	}
+	for _, e := range f.tokens {
+		snap.Tokens = append(snap.Tokens, *e)
+	}
+	for _, e := range f.organizations {
+		snap.Organizations = append(snap.Organizations, *e)
+	}
+	for _, e := range f.teams {
+		snap.Teams = append(snap.Teams, *e)
+	}
+	for _, e := range f.roles {
+		snap.Roles = append(snap.Roles, *e)
+	}
+	for _, e := range f.measurementPermissions {
+		snap.MeasurementPermissions = append(snap.MeasurementPermissions, *e)
+	}
+	for _, e := range f.tokenMemberships {
+		snap.TokenMemberships = append(snap.TokenMemberships, *e)
+	}
+	for table, ids := range f.authQuarantined {
+		cp := make(map[int64]bool, len(ids))
+		for id := range ids {
+			cp[id] = true
+		}
+		snap.Quarantined[table] = cp
+	}
+	return snap
+}
+
+// quarantinedAuthIDs lists, per table, the snapshot entries Restore refused.
+func quarantinedAuthIDs(snapshot *FSMSnapshot, tokens map[int64]*TokenEntry, orgs map[int64]*OrganizationEntry,
+	teams map[int64]*TeamEntry, roles map[int64]*RoleEntry, perms map[int64]*MeasurementPermissionEntry,
+	members map[int64]*TokenMembershipEntry) map[string]map[int64]bool {
+	q := map[string]map[int64]bool{}
+	add := func(table string, id int64) {
+		if q[table] == nil {
+			q[table] = map[int64]bool{}
+		}
+		q[table][id] = true
+	}
+	for id := range snapshot.Tokens {
+		if _, ok := tokens[id]; !ok {
+			add(authTableTokens, id)
+		}
+	}
+	for id := range snapshot.Organizations {
+		if _, ok := orgs[id]; !ok {
+			add(authTableOrganizations, id)
+		}
+	}
+	for id := range snapshot.Teams {
+		if _, ok := teams[id]; !ok {
+			add(authTableTeams, id)
+		}
+	}
+	for id := range snapshot.Roles {
+		if _, ok := roles[id]; !ok {
+			add(authTableRoles, id)
+		}
+	}
+	for id := range snapshot.MeasurementPermissions {
+		if _, ok := perms[id]; !ok {
+			add(authTableMeasurementPermissions, id)
+		}
+	}
+	for id := range snapshot.TokenMemberships {
+		if _, ok := members[id]; !ok {
+			add(authTableMemberships, id)
+		}
+	}
+	return q
+}

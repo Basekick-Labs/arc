@@ -11,6 +11,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -5336,6 +5337,34 @@ func (c *Coordinator) SyncManifest(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	return c.waitForManifestSync(ctx, c.raftNode, timeout)
+}
+
+// SyncManifestWithin is SyncManifest with the caller's budget instead of
+// replication.catch_up_barrier_timeout_ms. The auth reconcile (#1336) retries
+// until it syncs, so a barrier budget an operator tuned down for catch-up
+// must not be able to keep it from ever succeeding.
+func (c *Coordinator) SyncManifestWithin(ctx context.Context, timeout time.Duration) error {
+	if c.raftNode == nil {
+		return errors.New("raft not available")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return c.waitForManifestSync(ctx, c.raftNode, timeout)
+}
+
+// RaftTerm is the current Raft term, 0 when Raft is not running. A term
+// never decreases within one Raft history, which is what lets the auth
+// reconcile tell a rebuilt cluster from the one it last saw (#1336).
+func (c *Coordinator) RaftTerm() uint64 {
+	if c.raftNode == nil {
+		return 0
+	}
+	term, err := strconv.ParseUint(c.raftNode.Stats()["term"], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return term
 }
 
 // IsTransientLeaderError reports whether a manifest apply failed only because
