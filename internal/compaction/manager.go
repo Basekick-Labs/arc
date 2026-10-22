@@ -1339,13 +1339,7 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 		if jobSucceeded {
 			m.logger.Debug().Str("job_id", config.JobID).Msg("Compaction output staged; observers run at its commit")
 		}
-		if err != nil {
-			return err
-		}
-		if result != nil && !result.Success {
-			return errors.New(result.Error)
-		}
-		return nil
+		return attemptError(ctx, err, result, jobInterrupted)
 	}
 	if jobSucceeded && result != nil {
 		m.notifyCompactedOutput(result.OutputFile)
@@ -1380,13 +1374,26 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 	}
 
 	// Return error if subprocess failed
-	if err != nil {
-		return err
+	return attemptError(ctx, err, result, jobInterrupted)
+}
+
+// attemptError is what compactPartition returns for an attempt. An
+// interrupted one always wraps ctx's error, even when the subprocess
+// reported its own failure after receiving the same stop signal: the cycle
+// tells an interrupted batch from a failed one by errors.Is(err,
+// ctx.Err()) and must agree with how the attempt was counted (#1343), and
+// must not split a batch the shutdown cut short.
+func attemptError(ctx context.Context, err error, result *SubprocessJobResult, interrupted bool) error {
+	if err == nil && result != nil && !result.Success {
+		err = errors.New(result.Error)
 	}
-	if result != nil && !result.Success {
-		return errors.New(result.Error)
+	if interrupted && err != nil && !errors.Is(err, ctx.Err()) {
+		return fmt.Errorf("%v: %w", err, ctx.Err())
 	}
-	return nil
+	if interrupted && err == nil {
+		return ctx.Err()
+	}
+	return err
 }
 
 // compactFilesAdaptively attempts compaction with adaptive batch sizing.
@@ -3053,7 +3060,8 @@ func (m *Manager) dropDeadCompletionRecord(ctx context.Context, candidate Candid
 	}
 	path := filepath.Join(config.CompletionDir, config.JobID+".json")
 	// A subprocess killed inside writeCompletionManifest's rename leaves its
-	// temporary file, which nothing else removes. The job id is unique.
+	// temporary file, which nothing else removes. Nothing else can be
+	// writing it: the job id is unique and the subprocess has exited.
 	_ = os.Remove(path + ".tmp")
 	rec, err := readCompletionManifest(path)
 	if err != nil {

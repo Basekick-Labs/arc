@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"github.com/basekick-labs/arc/internal/metrics"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -17,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 

@@ -114,6 +114,9 @@ func TestDeadCompletionRecordIsDropped(t *testing.T) {
 		{"writing_output, staged", CompletionStateWritingOutput, true, false, false},
 		{"writing_output, recovery manifest survives", CompletionStateWritingOutput, false, true, true},
 		{"output_written", CompletionStateOutputWritten, false, false, true},
+		// A staged job writes no crash-recovery manifest: a manifest at its
+		// path is not one, and the record still goes.
+		{"writing_output, staged, a manifest at its path", CompletionStateWritingOutput, true, true, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			backend := localBackend(t)
@@ -152,5 +155,29 @@ func TestWatcherSkipsARecordRemovedSinceTheListing(t *testing.T) {
 	w.applyOne(context.Background(), filepath.Join(dir, "gone.json"))
 	if n := w.applyErrors.Load(); n != 0 {
 		t.Fatalf("applyErrors = %d for a removed record", n)
+	}
+}
+
+// An interrupted attempt returns ctx's error even when the subprocess
+// reported its own failure: the cycle classifies by errors.Is(err, ctx.Err()).
+func TestInterruptedAttemptReturnsTheContextError(t *testing.T) {
+	m := activeJobsRig(t, localBackend(t))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var got error
+	old := runJobInSubprocess
+	t.Cleanup(func() { runJobInSubprocess = old })
+	files := []string{"db/cpu/2026/10/13/10/a.parquet", "db/cpu/2026/10/13/10/b.parquet"}
+	for _, f := range files {
+		if err := m.StorageBackend.Write(context.Background(), f, []byte("1")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runJobInSubprocess = func(context.Context, *SubprocessJobConfig, zerolog.Logger) (*SubprocessJobResult, error) {
+		return &SubprocessJobResult{Success: false, Error: "context canceled by SIGTERM"}, nil
+	}
+	got = m.compactPartition(ctx, Candidate{Database: "db", Measurement: "cpu", PartitionPath: "cpu/2026/10/13/10", Files: files, BatchNumber: 1, Tier: "hourly"}, jobAttribution{})
+	if !errors.Is(got, context.Canceled) {
+		t.Fatalf("err = %v, want it to wrap context.Canceled", got)
 	}
 }

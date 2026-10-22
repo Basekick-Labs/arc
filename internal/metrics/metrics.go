@@ -1581,7 +1581,7 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_compaction_jobs_interrupted_total counter\n"...)
 	b = appendMetric(b, "arc_compaction_jobs_interrupted_total", float64(m.compactionJobsInterrupted.Load()))
 
-	b = append(b, "# HELP arc_compaction_files_compacted_total Input files consumed by successful compaction attempts\n"...)
+	b = append(b, "# HELP arc_compaction_files_compacted_total Input files compacted by successful compaction attempts (a staged job: before the cluster commits it)\n"...)
 	b = append(b, "# TYPE arc_compaction_files_compacted_total counter\n"...)
 	b = appendMetric(b, "arc_compaction_files_compacted_total", float64(m.compactionFilesCompacted.Load()))
 

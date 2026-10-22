@@ -1527,8 +1527,10 @@ which fired all the time, now means something.
 Also, a failed job's `writing_output` record in the compaction completion
 directory is removed once its subprocess exits, unless crash recovery still
 needs it. These records used to stay until a restart. On a node with staged
-compaction, they also kept the failed job's staged output from ever being
-swept.
+compaction on local storage, they also kept the failed job's staged output
+from ever being swept. The JSON metrics (`/api/v1/metrics`) also gain
+`jobs_interrupted`. A subprocess that is killed reports nothing, so the
+storage I/O it did before it died is not counted.
 
 ### A manifest walk no longer stalls Raft applies during heavy ingest ([#1341](https://github.com/Basekick-Labs/arc/issues/1341))
 

@@ -309,7 +309,8 @@ func (j *Job) Run(ctx context.Context) error {
 
 	// Phase 4: write an initial completion manifest in writing_output state.
 	// This marks the job as in-progress so CleanupOrphanedCompletionManifests
-	// can sweep it if the subprocess crashes before reaching output_written.
+	// can sweep it if the subprocess crashes before reaching output_written;
+	// the parent also drops it once this process exits (#1343).
 	if j.clusterMode() {
 		m := &CompletionManifest{
 			JobID:         j.JobID,

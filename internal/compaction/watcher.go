@@ -408,8 +408,9 @@ func (w *CompletionWatcher) applyOne(ctx context.Context, path string) {
 
 	// writing_output manifests are still in progress inside the subprocess.
 	// The watcher ignores them until the subprocess advances the state.
-	// Orphan cleanup for stuck writing_output is handled separately by
-	// Manager.CleanupOrphanedCompletionManifests at startup.
+	// Orphan cleanup for stuck writing_output is handled separately: the
+	// parent drops a finished job's record once its subprocess exited
+	// (#1343), and Manager.CleanupOrphanedCompletionManifests at startup.
 	if manifest.State == CompletionStateStaged {
 		w.applyStaged(ctx, path, manifest)
 		return
