@@ -1,6 +1,9 @@
 package ingest
 
 import (
+	"errors"
+	"fmt"
+	"sort"
 	"strconv"
 	"unicode/utf8"
 )
@@ -93,4 +96,52 @@ func ColumnCaseTwin(name string, batch, known map[string]string) (string, bool) 
 		return other, true
 	}
 	return "", false
+}
+
+// dropUnstorableColumns removes from replayed columns (a WAL entry, a claimed
+// or republished stream record, written by a binary from before #1342) every
+// column ColumnNameProblem refuses, and returns their names, sorted. The rows
+// and their other columns are kept: the data was accepted once, and only the
+// column could never be read back. Names differing only in letter case are
+// left alone here: which of two to drop is a choice the write that sent them
+// made, and replay must write what every replica of the entry writes.
+func dropUnstorableColumns(columns map[string][]interface{}) []string {
+	var dropped []string
+	for name := range columns {
+		if name == "time" {
+			continue
+		}
+		if ColumnNameProblem(name) != "" {
+			dropped = append(dropped, name)
+		}
+	}
+	sort.Strings(dropped)
+	for _, name := range dropped {
+		delete(columns, name)
+	}
+	return dropped
+}
+
+// quoteColumnNames is names through QuoteColumnName, for a log field.
+func quoteColumnNames(names []string) []string {
+	out := make([]string, len(names))
+	for i, n := range names {
+		out[i] = QuoteColumnName(n)
+	}
+	return out
+}
+
+// ErrUnstorableColumnName is returned by the buffer for a column whose name
+// ColumnNameProblem refuses that reached it (#1342): every ingest path drops
+// or refuses such names first, so it means a path that does not.
+var ErrUnstorableColumnName = errors.New("column name cannot be stored")
+
+func unstorableColumnError(measurement, name string) error {
+	if name == "time" {
+		return nil
+	}
+	if p := ColumnNameProblem(name); p != "" {
+		return fmt.Errorf("%w: measurement %q column %s: %s", ErrUnstorableColumnName, measurement, strconv.Quote(name), p)
+	}
+	return nil
 }
