@@ -51,6 +51,9 @@ func (f *fakeOpenCompactionsPlain) ExcludedFor(_ context.Context, prefix string)
 	return out
 }
 func (f *fakeOpenCompactionsPlain) Generation() uint64 { return 1 }
+func (f *fakeOpenCompactionsPlain) Open(prefix string) bool {
+	return len(f.ExcludedFor(context.Background(), prefix)) > 0
+}
 
 // A continuous query reads its source through the same exclusion.
 func TestContinuousQuerySourceReadExcludesOpenCompactions(t *testing.T) {

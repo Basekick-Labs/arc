@@ -1395,7 +1395,10 @@ standalone, on JSON, Arrow and msgpack queries.
   the arcx engine leave its inputs out, because the output holds their rows.
   This holds until the inputs are deleted, including after a failed delete
   or a restart.
-- Outside those windows nothing changes.
+- Outside those windows nothing changes. While a compaction is open, queries
+  on that measurement are not cached, so a read planned before the output
+  appeared is never served after it. With `query.enable_s3_cache` on, DuckDB's
+  object-store listing cache is dropped when an output is first seen.
 
 **Limitations:**
 - With shared storage (several nodes, one bucket), only the node running the

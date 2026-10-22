@@ -27,6 +27,7 @@ import (
 type fakeOpenCompactions struct {
 	mu   sync.Mutex
 	keys []string
+	open bool // a job is open with nothing to leave out yet (output absent)
 	gen  uint64
 }
 
@@ -40,6 +41,17 @@ func (f *fakeOpenCompactions) ExcludedFor(_ context.Context, prefix string) []st
 		}
 	}
 	return out
+}
+
+func (f *fakeOpenCompactions) Open(prefix string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, k := range f.keys {
+		if len(k) >= len(prefix) && k[:len(prefix)] == prefix {
+			return true
+		}
+	}
+	return f.open
 }
 
 func (f *fakeOpenCompactions) Generation() uint64 {
@@ -151,6 +163,21 @@ func TestQueryCountsAnOpenCompactionOnce(t *testing.T) {
 	oc.set()
 	require.Equal(t, float64(4), countDB("SELECT COUNT(*) FROM m", "db1"), "precondition for the header path")
 	oc.set(inKeys...)
+	// A job open with its output not yet in storage leaves nothing out, and
+	// the read must not be cached: when the output appears (nothing else
+	// changes, not the generation), the next read must leave the inputs out.
+	oc.set()
+	oc.mu.Lock()
+	oc.open = true
+	oc.mu.Unlock()
+	require.Equal(t, float64(4), count("SELECT COUNT(*) FROM db1.m"), "an open job with no output yet reads as main does")
+	oc.mu.Lock()
+	oc.keys = inKeys // the output appeared; same generation
+	oc.mu.Unlock()
+	require.Equal(t, float64(2), count("SELECT COUNT(*) FROM db1.m"), "a read planned while a job was open was served from cache")
+	oc.mu.Lock()
+	oc.open = false
+	oc.mu.Unlock()
 	// A file column in the data does not collide with the exclusion's.
 	require.Equal(t, float64(2), count("SELECT COUNT(*) FROM db1.m WHERE v = 1"))
 }

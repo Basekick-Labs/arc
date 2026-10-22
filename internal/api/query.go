@@ -1422,6 +1422,7 @@ func (h *QueryHandler) SetQueryRegistry(registry *queryregistry.Registry) {
 // OpenCompactions is what the query layer needs from compaction.OpenJobs.
 type OpenCompactions interface {
 	ExcludedFor(ctx context.Context, prefix string) []string
+	Open(prefix string) bool
 	Generation() uint64
 }
 
@@ -1467,7 +1468,14 @@ func wrapOpenCompactions(ctx context.Context, oc OpenCompactions, backend storag
 	if oc == nil || backend == nil || database == "" || measurement == "" {
 		return expr
 	}
-	keys := oc.ExcludedFor(ctx, database+"/"+measurement+"/")
+	prefix := database + "/" + measurement + "/"
+	if !oc.Open(prefix) {
+		return expr
+	}
+	// An open job on this measurement: whatever this read leaves out now,
+	// its output can appear before the next one, so it is never cached.
+	pruning.MarkVolatile(ctx)
+	keys := oc.ExcludedFor(ctx, prefix)
 	if len(keys) == 0 {
 		return expr
 	}
@@ -1479,11 +1487,7 @@ func wrapOpenCompactions(ctx context.Context, oc OpenCompactions, backend storag
 		}
 		quoted = append(quoted, sqlutil.QuoteStringLiteral(uri))
 	}
-	wrapped := sqlutil.ExcludeFiles(expr, openCompactionFileColumn, quoted)
-	if wrapped != expr {
-		pruning.MarkVolatile(ctx)
-	}
-	return wrapped
+	return sqlutil.ExcludeFiles(expr, openCompactionFileColumn, quoted)
 }
 
 // SetFileTimePruning enables file-level time pruning on the partition pruner

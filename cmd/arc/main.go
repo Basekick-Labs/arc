@@ -3668,6 +3668,11 @@ func main() {
 		compactionManager.SyncOpenJobs(syncCtx)
 		syncCancel()
 		queryHandler.SetOpenCompactions(compactionManager.OpenJobs)
+		if cfg.Query.EnableS3Cache {
+			// A listing cached before a job's output appeared would lack it
+			// while its inputs are already left out of reads.
+			compactionManager.OpenJobs.SetOnOutputSeen(db.ClearHTTPCache)
+		}
 	}
 	queryHandler.RegisterRoutes(server.GetApp())
 	// Start the handler's background workers (currently the partition

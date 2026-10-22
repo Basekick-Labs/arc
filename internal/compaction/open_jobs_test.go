@@ -221,3 +221,23 @@ func TestRegisterOpenJobUsesTheJobsManifestPath(t *testing.T) {
 		t.Fatalf("registered manifest %q, the job writes %q", got, want)
 	}
 }
+
+// The hook runs once per job, the first time its output is seen.
+func TestOpenJobsOnOutputSeenOnce(t *testing.T) {
+	o, b := openJobsRig(t)
+	ctx := context.Background()
+	out := "db/m/2026/10/20/10/m_v_b1_compacted.parquet"
+	calls := 0
+	o.SetOnOutputSeen(func() { calls++ })
+	o.register(out, "_compaction_state/hourly/db/job6.json", []string{"db/m/2026/10/20/10/a.parquet"})
+	o.ExcludedFor(ctx, "db/m/")
+	if calls != 0 {
+		t.Fatal("hook ran before the output existed")
+	}
+	_ = b.Write(ctx, out, []byte("parquet"))
+	o.ExcludedFor(ctx, "db/m/")
+	o.ExcludedFor(ctx, "db/m/")
+	if calls != 1 {
+		t.Fatalf("hook ran %d times, want once", calls)
+	}
+}

@@ -36,6 +36,18 @@ type OpenJobs struct {
 	mu      sync.Mutex
 	jobs    map[string]*openJob // by output key
 	gen     atomic.Uint64
+	// onOutputSeen runs the first time a job's output is seen in storage: a
+	// cached listing taken before it would lack the output while the inputs
+	// are already left out (SetOnOutputSeen).
+	onOutputSeen atomic.Pointer[func()]
+}
+
+// SetOnOutputSeen sets what runs the first time a job's output is seen in
+// storage (main.go: drop DuckDB's object-store listing cache when it is on).
+func (a *OpenJobs) SetOnOutputSeen(fn func()) {
+	if a != nil && fn != nil {
+		a.onOutputSeen.Store(&fn)
+	}
 }
 
 type openJob struct {
@@ -44,6 +56,7 @@ type openJob struct {
 	candidates   []string // the parent's input list (a superset of what the output holds)
 	inputs       []string // the manifest's input list, once read
 	running      bool     // the subprocess has not reported yet
+	seen         bool     // its output has been seen in storage
 }
 
 // NewOpenJobs returns an empty registry over backend.
@@ -143,6 +156,23 @@ func (a *OpenJobs) pruneFinished(ctx context.Context) {
 	}
 }
 
+// Open reports whether any job under prefix is open. A read planned while one
+// is must not be cached: its output can appear (and its inputs become ones to
+// leave out) without anything else changing.
+func (a *OpenJobs) Open(prefix string) bool {
+	if a == nil {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for out := range a.jobs {
+		if strings.HasPrefix(out, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // ExcludedFor returns the storage keys under prefix ("db/measurement/") that
 // a read must leave out so it sees each open job's rows once: the inputs of
 // every job whose output is in storage. Empty in the common case.
@@ -164,6 +194,15 @@ func (a *OpenJobs) ExcludedFor(ctx context.Context, prefix string) []string {
 		if err != nil || size < 0 {
 			// Absent (or unknown): read as main does; see the type comment.
 			continue
+		}
+		a.mu.Lock()
+		first := !j.seen
+		j.seen = true
+		a.mu.Unlock()
+		if first {
+			if fn := a.onOutputSeen.Load(); fn != nil {
+				(*fn)()
+			}
 		}
 		out = append(out, a.inputsOf(ctx, j)...)
 	}
