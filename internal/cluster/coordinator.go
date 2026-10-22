@@ -216,7 +216,9 @@ type Coordinator struct {
 	// at most the manifest churn of the time the workers are stuck; the
 	// Warn at deletePendingWarnAt makes that visible. deleteWake (one slot)
 	// nudges a parked worker; deleteStop, closed by Stop, is the only way a
-	// worker exits, so a stop drains everything that is pending.
+	// worker exits, so a stop drains everything that is pending (a DELETE
+	// rewrite's old file waiting for its rewrite is not pending: it stays on
+	// disk and the next start re-derives it, rewrite_unlink.go).
 	// deleteInFlight counts the entries a worker has taken and not yet
 	// unlinked, so the gauge and the stop-bound Error report what is still
 	// on disk, not just what is still untaken.
