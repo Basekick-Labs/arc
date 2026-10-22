@@ -2,6 +2,7 @@ package api
 
 import (
 	"fmt"
+	"github.com/basekick-labs/arc/internal/ingest"
 
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/gofiber/fiber/v2"
@@ -49,4 +50,29 @@ func CheckWritePermissions(c *fiber.Ctx, rbacManager RBACChecker, logger zerolog
 	}
 
 	return nil
+}
+
+// writableKnownColumns is known limited to the measurements the request's
+// token may write (#1342). A case-twin refusal depends on the columns a
+// measurement already has, so without this a token could learn, from the
+// answer, whether a measurement it may not write has a column of some name.
+// For a measurement it may not write the check sees only the request
+// itself; RBAC then refuses the request as before.
+func writableKnownColumns(c *fiber.Ctx, rbacManager RBACChecker, database string, known ingest.KnownColumns) ingest.KnownColumns {
+	if known == nil || rbacManager == nil {
+		return known
+	}
+	tokenInfo := auth.GetTokenInfo(c)
+	if tokenInfo == nil {
+		return known
+	}
+	return func(measurement string) map[string]string {
+		res := rbacManager.CheckPermission(&auth.PermissionCheckRequest{
+			TokenInfo: tokenInfo, Database: database, Measurement: measurement, Permission: "write",
+		})
+		if !res.Allowed {
+			return nil
+		}
+		return known(measurement)
+	}
 }

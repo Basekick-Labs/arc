@@ -295,7 +295,7 @@ func (h *ImportHandler) importCSV(c *fiber.Ctx, database, measurement string, up
 	if ierr != nil {
 		return nil, ierr
 	}
-	timeIdx, ierr := validateImportHeader(header, opts.timeColumn)
+	timeIdx, ierr := validateImportHeader(header, opts.timeColumn, h.knownFolds(database, measurement))
 	if ierr != nil {
 		return nil, ierr
 	}
@@ -571,7 +571,7 @@ func (h *ImportHandler) importParquet(ctx fiberContext, database, measurement st
 	for i := 0; i < schema.NumFields(); i++ {
 		header[i] = schema.Field(i).Name
 	}
-	timeFieldIdx, herr := validateImportHeader(header, opts.timeColumn)
+	timeFieldIdx, herr := validateImportHeader(header, opts.timeColumn, h.knownFolds(database, measurement))
 	if herr != nil {
 		return nil, herr
 	}
@@ -720,9 +720,14 @@ func (h *ImportHandler) importPreamble(c *fiber.Ctx) (string, string, error) {
 //   - a literal "time" column colliding with a renamed non-"time" time_column.
 //
 // Returns the index of timeColumn in the header on success.
-func validateImportHeader(header []string, timeColumn string) (int, *importError) {
+func validateImportHeader(header []string, timeColumn string, known ...map[string]string) (int, *importError) {
 	timeIdx := -1
 	seen := make(map[string]struct{}, len(header))
+	folds := make(map[string]string, len(header))
+	var stored map[string]string
+	if len(known) > 0 {
+		stored = known[0]
+	}
 	for i, name := range header {
 		if name == "" {
 			return -1, &importError{
@@ -745,6 +750,8 @@ func validateImportHeader(header []string, timeColumn string) (int, *importError
 		seen[name] = struct{}{}
 		if name == timeColumn {
 			timeIdx = i
+		} else if ierr := importColumnNameError(name, folds, stored); ierr != nil {
+			return -1, ierr
 		}
 	}
 	if timeIdx == -1 {
@@ -764,6 +771,27 @@ func validateImportHeader(header []string, timeColumn string) (int, *importError
 		}
 	}
 	return timeIdx, nil
+}
+
+// importColumnNameError refuses a column Arc could not read back (#1342):
+// not valid UTF-8, "time" in another letter case, or one differing only in
+// letter case from another column of the file (folds) or of the measurement
+// (stored). The file's time column is exempt: it is renamed "time".
+func importColumnNameError(name string, folds, stored map[string]string) *importError {
+	if p := ingest.ColumnNameProblem(name); p != "" && name != "time" {
+		return &importError{
+			StatusCode: fiber.StatusBadRequest,
+			Message:    fmt.Sprintf("column name %q cannot be stored: %s; rename the column", ingest.TruncateColumnName(name), p),
+		}
+	}
+	if other, twin := ingest.ColumnCaseTwin(name, folds, stored); twin {
+		return &importError{
+			StatusCode: fiber.StatusBadRequest,
+			Message:    fmt.Sprintf("column name %q differs only in letter case from %q of this measurement; rename one of them", ingest.TruncateColumnName(name), ingest.TruncateColumnName(other)),
+		}
+	}
+	folds[ingest.FoldColumnName(name)] = name
+	return nil
 }
 
 // csvColumnKind is what a CSV column's cells allow: the narrowest native type
@@ -1433,4 +1461,12 @@ func importBufferStatus(err error) int {
 		return fiber.StatusServiceUnavailable
 	}
 	return fiber.StatusInternalServerError
+}
+
+// knownFolds is the measurement's stored column spellings (#1342), or nil.
+func (h *ImportHandler) knownFolds(database, measurement string) map[string]string {
+	if known := h.arrowBuffer.KnownColumns(database); known != nil {
+		return known(measurement)
+	}
+	return nil
 }

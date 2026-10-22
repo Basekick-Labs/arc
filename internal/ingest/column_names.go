@@ -1,0 +1,167 @@
+package ingest
+
+import (
+	"errors"
+	"fmt"
+	"sort"
+	"strconv"
+	"unicode/utf8"
+)
+
+// Field and tag names Arc refuses at ingest (#1342).
+//
+// A name Arc writes into a Parquet schema must be one it can read back.
+// Three kinds cannot:
+//
+//   - a name that is not valid UTF-8: compaction, SELECT * and pyarrow fail
+//     with "Invalid unicode";
+//   - a name equal to "time" ignoring ASCII case ("Time", "TIME"): DuckDB
+//     binds identifiers case-insensitively, and a file's columns are in map
+//     order, so in some files `time` binds to the other column (compaction
+//     finds no time column, the DELETE count's cast fails);
+//   - two names of one measurement equal ignoring ASCII case ("Temp" and
+//     "temp"): in one file DuckDB renames the second (temp_1); across files
+//     union_by_name merges them into whichever comes first.
+//
+// The folding is ASCII only, as DuckDB's identifier folding and compaction's
+// column keys are: "TİME" or "ｔｉｍｅ" are names of their own to both.
+
+// FoldColumnName is name with ASCII letters lower-cased. It allocates only
+// when name has an upper-case ASCII letter.
+func FoldColumnName(name string) string {
+	for i := 0; i < len(name); i++ {
+		if c := name[i]; c >= 'A' && c <= 'Z' {
+			b := []byte(name)
+			for j := i; j < len(b); j++ {
+				if c := b[j]; c >= 'A' && c <= 'Z' {
+					b[j] = c + ('a' - 'A')
+				}
+			}
+			return string(b)
+		}
+	}
+	return name
+}
+
+// isTimeName reports whether name is "time" ignoring ASCII case.
+func isTimeName(name string) bool {
+	return len(name) == 4 && FoldColumnName(name) == "time"
+}
+
+// Reasons a name is refused.
+const (
+	ColumnNameNotUTF8   = "a tag or field name that is not valid UTF-8"
+	ColumnNameTimeAlike = "a tag or field named \"time\" in any letter case (time is the timestamp)"
+	ColumnNameCaseTwin  = "a tag or field name that differs only in letter case from another of the measurement"
+)
+
+// ColumnNameProblem is why name cannot be a tag or field column, or "".
+// The timestamp column itself is not a tag or field and never asked about.
+func ColumnNameProblem(name string) string {
+	if !utf8.ValidString(name) {
+		return ColumnNameNotUTF8
+	}
+	if isTimeName(name) {
+		return ColumnNameTimeAlike
+	}
+	return ""
+}
+
+// QuoteColumnName is name for a message or log line: as is when it is valid
+// UTF-8, otherwise Go-quoted, so an invalid byte is shown escaped and never
+// written raw.
+func QuoteColumnName(name string) string {
+	name = TruncateColumnName(name)
+	if utf8.ValidString(name) {
+		return name
+	}
+	return strconv.Quote(name)
+}
+
+// maxShownNameBytes bounds a client-sent name echoed in an answer or a log.
+const maxShownNameBytes = 256
+
+// TruncateColumnName is name cut to maxShownNameBytes (whole runes when it
+// is valid UTF-8), with "…" when cut: no length limit applies to names, and
+// an answer or log line must not echo an arbitrarily long one.
+func TruncateColumnName(name string) string {
+	if len(name) <= maxShownNameBytes {
+		return name
+	}
+	cut := maxShownNameBytes
+	if utf8.ValidString(name) {
+		for cut > 0 && !utf8.RuneStart(name[cut]) {
+			cut--
+		}
+	}
+	return name[:cut] + "…"
+}
+
+// KnownColumns returns, for a measurement, the spelling each column name the
+// measurement already has is stored under, keyed by its FoldColumnName: the
+// names of earlier batches, which a new column must not differ from only in
+// letter case. nil when unknown. Must not block on I/O: it is asked on every
+// write.
+type KnownColumns func(measurement string) map[string]string
+
+// ColumnCaseTwin reports whether a new column name differs only in letter
+// case from a name in batch (fold -> spelling, this write's columns) or in
+// known (stored columns), and the spelling it collides with.
+func ColumnCaseTwin(name string, batch, known map[string]string) (string, bool) {
+	f := FoldColumnName(name)
+	if other, ok := batch[f]; ok && other != name {
+		return other, true
+	}
+	if other, ok := known[f]; ok && other != name {
+		return other, true
+	}
+	return "", false
+}
+
+// dropUnstorableColumns removes from replayed columns (a WAL entry, a claimed
+// or republished stream record, written by a binary from before #1342) every
+// column ColumnNameProblem refuses, and returns their names, sorted. The rows
+// and their other columns are kept: the data was accepted once, and only the
+// column could never be read back. Names differing only in letter case are
+// left alone here: which of two to drop is a choice the write that sent them
+// made, and replay must write what every replica of the entry writes.
+func dropUnstorableColumns(columns map[string][]interface{}) []string {
+	var dropped []string
+	for name := range columns {
+		if name == "time" {
+			continue
+		}
+		if ColumnNameProblem(name) != "" {
+			dropped = append(dropped, name)
+		}
+	}
+	sort.Strings(dropped)
+	for _, name := range dropped {
+		delete(columns, name)
+	}
+	return dropped
+}
+
+// quoteColumnNames is names through QuoteColumnName, for a log field.
+func quoteColumnNames(names []string) []string {
+	out := make([]string, len(names))
+	for i, n := range names {
+		out[i] = QuoteColumnName(n)
+	}
+	return out
+}
+
+// ErrUnstorableColumnName is returned by the buffer for a column whose name
+// ColumnNameProblem refuses that reached it (#1342): every ingest path drops
+// or refuses such names first, so it means a path that does not.
+var ErrUnstorableColumnName = errors.New("column name cannot be stored")
+
+func unstorableColumnError(measurement, name string) error {
+	if name == "time" {
+		return nil
+	}
+	if p := ColumnNameProblem(name); p != "" {
+		return fmt.Errorf("%w: measurement %q column %s: %s", ErrUnstorableColumnName, measurement, strconv.Quote(name), p)
+	}
+	return nil
+}

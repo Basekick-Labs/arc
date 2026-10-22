@@ -129,6 +129,67 @@ the snapshot it booted from would bring back what was revoked since.
   `arc_cluster_auth_reconcile_collisions` and
   `arc_cluster_auth_reconcile_kept_rows`.
 
+## Upgrade note: tag and field names Arc cannot read back are refused ([#1342](https://github.com/Basekick-Labs/arc/issues/1342))
+
+Ingest used to store three kinds of names that Arc could not read back.
+Once one reached a measurement, compaction of the measurement failed (`no
+'time' column`), `SELECT *` failed with `Invalid unicode`, the DELETE API
+failed with `Unimplemented type for cast (DOUBLE -> TIMESTAMP WITH TIME
+ZONE)`, and pyarrow and other external readers failed too:
+
+- **A name that is not valid UTF-8**, such as a Latin-1 `°` (`0xB0`) from a
+  migration tool.
+- **A name equal to `time` ignoring case**, such as a field `Time` or a tag
+  `TIME`. DuckDB matches column names without regard to case. In files where
+  that column came before Arc's own `time` column, `time` resolved to it.
+- **Two names of one measurement that differ only in case**, such as `Temp`
+  and `temp`. DuckDB reads them as one column, so one spelling's data shows up
+  under the other.
+
+These names are now refused everywhere a write enters Arc:
+
+| Path | What happens |
+|---|---|
+| Line protocol (`/write`, `/api/v2/write`, `/api/v1/write/line-protocol`) and msgpack rows | The point is dropped and the rest are written, as for a key named exactly `time` today. The answer is a partial-write `400` naming the measurement, the name and the reason. |
+| msgpack columnar | The item is dropped whole (its names belong to all its rows) and the other items are written. Partial-write `400`. |
+| CSV, Parquet and LP imports | The file is refused with a `400` before anything is written. A CSV's own time column may be called `Time` (as in Grafana's CSV export); it is renamed to `time`. |
+| MQTT | The reading is kept and only the offending key is dropped, with a warning at most once every 10 minutes per name. Tasmota's `SENSOR` messages carry a `"Time"` key, which is now dropped while the rest of the reading is stored. |
+| Continuous queries | A run whose output has such a column fails with an error naming it. A query that aliases a column `AS Time` now fails every run; rename the alias. |
+| WAL replay and standby or stream replay | A column an older binary accepted under such a name is dropped, and the rows and their other columns are written. Logged at `Error`. |
+
+For two names that differ only in case, the check covers both the write
+itself and the measurement's existing columns, as recorded in its field
+schema (`query.stable_schema`). The spelling the measurement already has
+wins. The comparison against existing columns uses the schema in memory, so
+right after a restart, until the measurement's schema is loaded, only the
+write is checked.
+
+**What clients see.** A client that has been sending, say, a field `Time`
+(pandas DataFrames often have one) got its writes accepted until now. They
+were accepted, and they broke the measurement later. Now those points are
+dropped with a `400`. The answer is the same partial-write answer line protocol
+gives for a key named exactly `time`.
+
+A case-twin refusal is answered only for measurements the token may
+write. For any other measurement, the check looks at the request alone, so
+an answer cannot reveal which columns that measurement already has.
+
+**Existing measurements.**
+- **Field schema:** the measurement's field schema no longer lists these
+  names, so reads of time ranges without such files work again. The stored
+  schema is rewritten on the next flush.
+- **Mixed versions:** during a rolling upgrade, a node still on an older
+  release can write the old names back. The upgraded nodes then rewrite the
+  schema again, every few minutes, until every node is upgraded.
+- **Files already on disk:** files written with such a column are not
+  rewritten. Reads and compaction of the hours they hold still fail. Arc
+  cannot export them either, because the bad column breaks every query that
+  touches those files. They leave with retention, or with the database when
+  it is deleted. Before that, rewriting them takes a tool that reads the
+  Parquet files directly and renames the column, then an import of the result.
+- **Edge sync:** a spoke on an older release can still send such files to
+  its hub; upgrade spokes first.
+
 ## Upgrade note: three configurations now refuse to start
 
 Read this before upgrading if you set `storage.local_path`,

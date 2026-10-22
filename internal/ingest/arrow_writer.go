@@ -1948,6 +1948,28 @@ type FieldSchemaRegistrar interface {
 	EnsureFile(ctx context.Context, database, measurement string, schema *arrow.Schema, tagColumns []string, storageKey string) error
 }
 
+// columnFoldsSource is implemented by a registrar that can tell, without
+// I/O, which column spellings a measurement already has (#1342).
+type columnFoldsSource interface {
+	KnownColumnFolds(database, measurement string) map[string]string
+}
+
+// KnownColumns is, for database, the spelling each stored column of a
+// measurement has (see KnownColumns), from the field schema registry; nil
+// when there is no registry that can answer.
+func (b *ArrowBuffer) KnownColumns(database string) KnownColumns {
+	if b == nil {
+		return nil
+	}
+	src, ok := b.fieldSchema.(columnFoldsSource)
+	if !ok || src == nil {
+		return nil
+	}
+	return func(measurement string) map[string]string {
+		return src.KnownColumnFolds(database, measurement)
+	}
+}
+
 // SetFieldSchema installs the field schema registrar (#914).
 func (b *ArrowBuffer) SetFieldSchema(r FieldSchemaRegistrar) {
 	b.fieldSchema = r
@@ -2379,6 +2401,16 @@ func (b *ArrowBuffer) writeColumnarDirectWithHashes(ctx context.Context, databas
 		return fmt.Errorf("normalize replayed timestamps for %s: %w", measurement, err)
 	}
 	sanitizeColumnarStrings(columns)
+	// A column a binary from before #1342 accepted under a name Arc cannot
+	// read back would break the measurement: drop the column, keep the rows.
+	if dropped := dropUnstorableColumns(columns); len(dropped) > 0 {
+		b.logger.Error().
+			Str("database", database).
+			Str("measurement", measurement).
+			Strs("columns", quoteColumnNames(dropped)).
+			Int("rows", numRecords).
+			Msg("Replayed WAL entry: dropped columns whose names cannot be stored; the rows are written without them")
+	}
 
 	record := &models.ColumnarRecord{
 		Measurement: measurement,
@@ -3075,6 +3107,14 @@ func (b *ArrowBuffer) writeColumnarInternal(ctx context.Context, database string
 }
 
 func (b *ArrowBuffer) writeColumnarInternalWithWALHashes(ctx context.Context, database string, record *models.ColumnarRecord, skipWAL bool, inheritedWALHashes []string) error {
+	// Every ingest path refuses these names before here (#1342); this is the
+	// backstop, before any WAL work, so a path that misses the check fails
+	// the write instead of storing a column nothing can read back.
+	for name := range record.Columns {
+		if err := unstorableColumnError(record.Measurement, name); err != nil {
+			return err
+		}
+	}
 	// Create buffer key: database/measurement
 	// OPTIMIZATION: String concatenation is faster than fmt.Sprintf (no reflection)
 	bufferKey := database + "/" + record.Measurement
@@ -3363,6 +3403,12 @@ func (b *ArrowBuffer) writeTypedColumnarInternal(ctx context.Context, database, 
 // encoded as row entries (encodeTypedWALRows), NULL cells left out.
 // The typed msgpack decode path always supplies rawPayload.
 func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measurement string, typedColumns *TypedColumnBatch, numRecords int, rawPayload []byte, skipWAL bool) error {
+	// The #1342 backstop; see writeColumnarInternalWithWALHashes.
+	for name := range typedColumns.Data {
+		if err := unstorableColumnError(measurement, name); err != nil {
+			return err
+		}
+	}
 	bufferKey := database + "/" + measurement
 	if len(rawPayload) > 0 {
 		// The payload's size, but at least 8 bytes a cell: a NULL is one

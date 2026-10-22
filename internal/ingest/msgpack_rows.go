@@ -32,7 +32,7 @@ type msgRow struct {
 
 // tryDecodeRowsTyped decodes a row-format payload; ok false sends it to the
 // generic path.
-func (d *MessagePackDecoder) tryDecodeRowsTyped(data []byte) (recs []interface{}, rows int, drops []LPDrop, ok bool) {
+func (d *MessagePackDecoder) tryDecodeRowsTyped(data []byte, known KnownColumns) (recs []interface{}, rows int, drops []LPDrop, ok bool) {
 	var items [][]byte
 	switch c := data[0]; {
 	case isArrayCode(c):
@@ -106,6 +106,7 @@ func (d *MessagePackDecoder) tryDecodeRowsTyped(data []byte) (recs []interface{}
 		}
 	}
 	b := newLPBuilder(nil, min(len(decoded), lpMaxColumnHint))
+	b.known = known
 	var pt lpPoint
 	for i := range decoded {
 		r := &decoded[i]
